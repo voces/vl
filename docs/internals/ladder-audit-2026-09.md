@@ -560,9 +560,11 @@ arm. REACHED, and user-visible in the editor. — CLOSED (#2219).**
 > `tests/module_gate_agreement_test.ts` **extracts each mirrored copy's arm set from its own
 > source** (`cliLineStartsKwBrace(line, "kw")` / `strip_prefix("kw")`) and requires it to
 > equal the shared module's `MODULE_LINE_KEYWORDS`, asserts neither TS consumer re-defines a
-> twin, asserts no fifth copy has appeared, requires both template scans to keep their
-> comment/quote/`${` anchors, and refuses the stale sentence tree-wide. The behavioural table
-> is shared (`tests/support/moduleGateCases.ts`, 15 rows) and re-run by three executors:
+> twin, asserts no fifth copy has appeared, requires both hole scans to keep their
+> comment/quote/`\{` anchors — in BOTH quoted forms since plain strings began to
+> interpolate, which is what the `holes` flag and the STRING-arm anchor pin — and refuses
+> the stale sentence tree-wide. The behavioural table
+> is shared (`tests/support/moduleGateCases.ts`, 21 rows) and re-run by three executors:
 > the pure TS gate, the native `vl check` (`tests/vl_module_gate_test.ts`, which exercises
 > the Rust host's gate and `cliNeedsModules` in series), and the seed-backed LSP checker.
 > After: `export { helper } from "./nope"` reports the diagnostic in the LSP, at every

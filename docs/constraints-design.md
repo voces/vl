@@ -71,7 +71,8 @@ Fields are data; UFCS is call-site sugar. Today nothing bridges them.
 
 **Where interpolation's stringify binds is already ruled, and now SHIPPED** — and it is
 deliberately the opposite answer: a string literal's meaning must not depend on imports,
-so template literals bind ABSOLUTELY to std's renderer (owner ruling 2026-09-01; the
+so interpolation holes bind ABSOLUTELY to std's renderer — in a plain `"v=\{x}"` exactly as
+in a backtick `` `v=\{x}` ``, one hole syntax for both since 2026-09-01 (owner ruling 2026-09-01; the
 builtin is GONE and `std:fmt`'s export carries the name — executed the same day — and
 the bound name is one constant, `TPL_RENDER_EXPORT` in `driver.vl`), eventually to the
 derived `show<T>`. As built, the hole's call names an identifier no program can spell and

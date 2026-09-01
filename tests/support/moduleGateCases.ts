@@ -93,10 +93,18 @@ export const GATE_CASES: readonly GateCase[] = [
     arms: false,
     native: "skip",
   },
-  // — template holes: the second construct that arms the loop —
+  // — interpolation holes `\{…}`: the second construct that arms the loop.
+  //   The trigger lives in the ESCAPE namespace, so it is legal in BOTH quoted
+  //   forms and the gate has to scan both. `${` is no longer a trigger anywhere.
   {
     name: "template with an i32 hole",
-    source: "const x = 5\nprint(`v=${x}`)\n",
+    source: "const x = 5\nprint(`v=\\{x}`)\n",
+    arms: true,
+    native: "clean",
+  },
+  {
+    name: "PLAIN STRING with an i32 hole (the arm plain-string interpolation added)",
+    source: 'const x = 5\nprint("v=\\{x}")\n',
     arms: true,
     native: "clean",
   },
@@ -107,8 +115,32 @@ export const GATE_CASES: readonly GateCase[] = [
     native: "clean",
   },
   {
+    name: "a literal brace in a string is NOT a hole (the deciding property)",
+    source: 'print("{plain}")\n',
+    arms: false,
+    native: "clean",
+  },
+  {
+    name: "an escaped backslash before a brace is not a hole",
+    source: 'print("\\\\{x}")\n',
+    arms: false,
+    native: "clean",
+  },
+  {
+    name: "`${` in a template is ordinary text now, so it does not arm",
+    source: "print(`v=${x}`)\n",
+    arms: false,
+    native: "clean",
+  },
+  {
     name: "a backtick in a `//` comment is not a template",
     source: "// a ` backtick in prose, and a ${ too\nprint(1)\n",
+    arms: false,
+    native: "clean",
+  },
+  {
+    name: "a `\\{` in a `//` comment is not a hole",
+    source: "// prose with a \\{hole} in it\nprint(1)\n",
     arms: false,
     native: "clean",
   },
@@ -117,6 +149,12 @@ export const GATE_CASES: readonly GateCase[] = [
     source: 'print("${not_a_hole}")\n',
     arms: false,
     native: "clean",
+  },
+  {
+    name: "a CHAR literal never arms — `'\\{'` could not hold a hole",
+    source: "print('\\{')\n",
+    arms: false,
+    native: "skip",
   },
   {
     name: "no modules at all",

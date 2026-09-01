@@ -142,6 +142,14 @@ monaco.languages.setMonarchTokensProvider(VL_LANGUAGE_ID, {
       // single-line form; a multiline template falls back to no colour until the
       // semantic-token provider answers, which is the same degradation every
       // other construct here has.
+      //
+      // INTERPOLATION HOLES need no rule of their own in either literal: the
+      // trigger is `\{`, so the `\\.` alternative already carries it and the whole
+      // literal paints as one string. That is a deliberate degradation, not an
+      // omission — the semantic-token provider splits a holed literal into its
+      // parts (class 5) with the hole's own tokens keeping their real classes, and
+      // semantic tokens win over Monarch. Re-entering a hole here would need a
+      // brace-depth state machine to know which `}` closes it.
       [/`(?:[^`\\]|\\.)*`/, "string"],
       [/\b\d[\d_]*(?:\.\d[\d_]*)?\b/, "number"],
       [

@@ -992,7 +992,7 @@ Deno.test({ name: "wasm-checker: a template with an i32 hole checks clean (std:f
   // The reader knows NOTHING about std — `withStd` serves `std:fmt` (and the
   // `std:str` it imports) from the embedded map.
   const diags = await checker.check(
-    "const x = 5\nprint(`v=${x}`)\n",
+    "const x = 5\nprint(`v=\\{x}`)\n",
     "/proj/main.vl",
     noSiblings,
   );
@@ -1010,23 +1010,23 @@ Deno.test({ name: "wasm-checker: a template with an i32 hole checks clean (std:f
   // asserted, because this test used to use `f64` as its OUT-of-domain case and
   // the widening is what flipped it.
   const f64 = await checker.check(
-    "const f = 1.5\nprint(`v=${f}`)\n",
+    "const f = 1.5\nprint(`v=\\{f}`)\n",
     "/proj/main.vl",
     noSiblings,
   );
   if (f64.length !== 0) {
     throw new Error(`expected clean, got: ${f64.map((d) => d.message).join("; ")}`);
   }
-  // An out-of-domain hole is a TEMPLATE-shaped diagnostic, positioned at the
+  // An out-of-domain hole is a HOLE-shaped diagnostic, positioned at the
   // hole — the span the editor squiggles. A record is outside the domain at any
   // width: it has no rendering at all, and will not get one from a number
   // renderer.
   const bad = await checker.check(
-    "const p = { x: 1 }\nprint(`v=${p}`)\n",
+    "const p = { x: 1 }\nprint(`v=\\{p}`)\n",
     "/proj/main.vl",
     noSiblings,
   );
-  const hit = bad.find((d) => d.message.includes("a template hole is"));
+  const hit = bad.find((d) => d.message.includes("an interpolation hole is"));
   if (hit === undefined) {
     throw new Error(
       `expected a template-domain diagnostic, got: ${bad.map((d) => d.message).join("; ")}`,
@@ -1037,11 +1037,55 @@ Deno.test({ name: "wasm-checker: a template with an i32 hole checks clean (std:f
       `expected the hole's own span at 1:11, got ${JSON.stringify(hit.range)}`,
     );
   }
-  // The range is the HOLE, one character wide — not the template token it sits
+  // The range is the HOLE, one character wide — not the literal token it sits
   // in, which may span lines and whose end would land off its own line.
   if (hit.range.end.line !== 1 || hit.range.end.character !== 12) {
     throw new Error(
       `expected a one-character range ending at 1:12, got ${JSON.stringify(hit.range)}`,
+    );
+  }
+
+  // THE PLAIN-STRING SPELLING OF ALL OF IT. The editor's gate is a TEXTUAL scan
+  // run before any lexing, so a `"…"` hole is a second thing it has to see — and
+  // if it does not, the symptom is an "undeclared identifier" on a program the
+  // CLI compiles cleanly, which is the divergence shape this whole test exists
+  // for. Same three rows, same geometry (`\{` is two characters, as `${` was).
+  const sHole = await checker.check(
+    'const x = 5\nprint("v=\\{x}")\n',
+    "/proj/main.vl",
+    noSiblings,
+  );
+  if (sHole.length !== 0) {
+    throw new Error(
+      `a plain-string hole must check clean, got: ${sHole.map((d) => d.message).join("; ")}`,
+    );
+  }
+  // A brace in a string is DATA and must NOT arm the loop or split the literal.
+  const braces = await checker.check(
+    'print("{plain} and ${x}")\n',
+    "/proj/main.vl",
+    noSiblings,
+  );
+  if (braces.length !== 0) {
+    throw new Error(
+      `a literal brace must stay data, got: ${braces.map((d) => d.message).join("; ")}`,
+    );
+  }
+  const sBad = await checker.check(
+    'const p = { x: 1 }\nprint("v=\\{p}")\n',
+    "/proj/main.vl",
+    noSiblings,
+  );
+  const sHit = sBad.find((d) => d.message.includes("an interpolation hole is"));
+  if (sHit === undefined) {
+    throw new Error(
+      `expected the hole-domain diagnostic in a plain string, got: ` +
+        sBad.map((d) => d.message).join("; "),
+    );
+  }
+  if (sHit.range.start.line !== 1 || sHit.range.start.character !== 11) {
+    throw new Error(
+      `expected the hole's own span at 1:11, got ${JSON.stringify(sHit.range)}`,
     );
   }
 });

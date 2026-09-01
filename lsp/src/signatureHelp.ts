@@ -28,12 +28,15 @@
 //
 //   f("a, b|c")        cursor in a STRING → the string is one token, its commas
 //                      are not separators: argument 0.
-//   f(`v=${g(1, |2)}`) cursor in a template HOLE → a template is ALSO one token,
-//                      but a hole is expression source. The scan re-enters the
-//                      hole (`scanTemplate`'s hole spans) and answers about `g`,
-//                      argument 1 — the call the user is actually inside.
-//   f(`text ${x}|`)    cursor in template TEXT, not a hole → nothing is being
-//                      called there; the template is argument 0 of `f`.
+//   f(`v=\{g(1, |2)}`) cursor in an interpolation HOLE → the literal is ALSO one
+//                      token, but a hole is expression source. The scan re-enters
+//                      the hole (the scanners' hole spans) and answers about `g`,
+//                      argument 1 — the call the user is actually inside. BOTH
+//                      quoted forms interpolate, so `f("v=\{g(1, |2)}")` answers
+//                      identically; the literal's opening delimiter picks the
+//                      scanner and nothing else here changes.
+//   f(`text \{x}|`)    cursor in literal TEXT, not a hole → nothing is being
+//                      called there; the literal is argument 0 of `f`.
 //
 // ── MID-EDIT INPUT IS THE NORMAL CASE ────────────────────────────────────────
 // The scan stops AT the cursor and reads the group stack it has open, rather
@@ -50,6 +53,7 @@
 import {
   type LexPos,
   type LexToken,
+  scanStringLiteral,
   scanTemplate,
   type TemplateHole,
   tokenize,
@@ -165,17 +169,21 @@ const lineStarts = (text: string): number[] => {
 };
 
 /**
- * The `${…}` hole of the template at `templateStart` that contains `offset`, or
- * undefined when the offset is in the template's TEXT. Containment is inclusive
- * at both ends: `${|x}` and `${x|}` are both inside the hole.
+ * The `\{…}` hole of the interpolated literal at `litStart` that contains
+ * `offset`, or undefined when the offset is in the literal's TEXT. Containment is
+ * inclusive at both ends: `\{|x}` and `\{x|}` are both inside the hole.
+ *
+ * The opening delimiter picks the scanner: a `"` string and a `` ` `` template
+ * hold the same holes, and both scanners collect the same spans.
  */
 const holeAround = (
   text: string,
-  templateStart: number,
+  litStart: number,
   offset: number,
 ): TemplateHole | undefined => {
   const holes: TemplateHole[] = [];
-  scanTemplate(text, templateStart, holes);
+  if (text[litStart] === "`") scanTemplate(text, litStart, holes);
+  else scanStringLiteral(text, litStart, holes);
   return holes.find((h) => offset >= h.start && offset <= h.end);
 };
 
@@ -224,19 +232,20 @@ const callSiteInSlice = (
     // Everything from the cursor rightward is the user's future, not their call.
     if (start >= offset) break;
     if (offsetOf(t.end) > offset) {
-      // The cursor is strictly INSIDE this token. A template's holes are real
-      // expression source, so re-enter the one the cursor is in; every other
-      // token (a string, a comment, a number) is opaque and the answer is
-      // whatever group stack was open when it started.
-      if (t.kind === "str" && text[start] === "`") {
+      // The cursor is strictly INSIDE this token. An interpolated literal's holes
+      // are real expression source, so re-enter the one the cursor is in — in
+      // EITHER quoted form, since both interpolate. Every other token (a char
+      // literal, a comment, a number) is opaque and the answer is whatever group
+      // stack was open when it started.
+      if (t.kind === "str" && (text[start] === "`" || text[start] === '"')) {
         const hole = holeAround(text, start, offset);
         if (hole !== undefined) {
           const inner = callSiteInSlice(
             text.slice(hole.start, hole.end),
             offset - hole.start,
           );
-          // A hole with no call in it (`f(\`${x|}\`)`) falls back to the call the
-          // template is an argument of — the stack below still has it.
+          // A hole with no call in it (`f(\`\{x|}\`)`) falls back to the call the
+          // literal is an argument of — the stack below still has it.
           if (inner !== undefined) {
             return { ...inner, nameStart: inner.nameStart + hole.start };
           }

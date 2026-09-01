@@ -2016,9 +2016,96 @@ braced blocks reach too (`if c { 1 } else { 2 }` in value position is the same c
 formats parse-clean files, so it simply stops seeing the unbraced input; nothing became
 unreachable.
 
+## ONE hole syntax, `\{expr}`, in BOTH quoted forms — the trigger lives in the escape namespace (owner, 2026-09-01, "OK do `\{`")
+
+**`"v=\{x} done"` interpolates, and so does `` `v=\{x} done` ``.** Plain double-quoted strings
+gained holes; backtick templates MIGRATED theirs from `${` to `\{` the same day, six days after
+templates shipped. There is now one hole spelling, one desugar, one renderer and one refusal for
+both literal forms — and `$` is an ordinary character again, with `\$` retired.
+
+### Why the trigger is an ESCAPE and not a brace
+
+The interesting choice was not *whether* plain strings interpolate but **what a bare `{` means
+inside one**, and the two live answers in industry split exactly there:
+
+* **Kotlin/Scala/Ruby/JS put the trigger in the TEXT namespace** (`$`, `#{`, `${`). Every literal
+  that wants the trigger character as data has to escape it, forever, in every string ever
+  written afterwards. The tax is small per literal and permanent in aggregate.
+* **Swift puts it in the ESCAPE namespace** (`\(expr)`). A backslash inside a string literal was
+  ALREADY the escape opener, and `\(` was already an error — so adding interpolation to plain
+  strings cost Swift nothing at all, and `(` stayed data.
+
+VL takes Swift's placement and the owner's brace spelling. **The zero tax is by CONSTRUCTION,
+not by luck**: the trigger is a sequence that was already a hard error, so there is no string
+whose meaning could change, and `{` stays data in every string forever. That property is worth
+more than the sigil's shape, which is why the spelling being `\{` rather than `\(` costs nothing.
+
+**Measured, and the measurement is smaller than the one the proposal carried.** On the tree this
+landed against: **119 of 32,071** double-quoted VL string literals carry a literal `{` (10,312
+`.vl` files; a literal-extracting scan, so comments, char literals and templates are excluded —
+`grep` over lines would count all three). The figure
+quoted while ruling was 4,821, which does not reproduce under any population that could be
+constructed here (literals with `{` or `}`: 189; `{` occurrences inside literals: 121; literals
+with `{` across `.vl`+`.ts`+`.rs`+`.md`+`.json`: 996). **The ruling does not depend on the
+number** — a `{` trigger's tax is permanent and applies to every JSON, wasm-text and
+format-specifier literal not yet written, while the escape-namespace tax is zero by construction
+— but the number in the argument should be the one that reproduces, so it is recorded here as
+119 with its population named.
+
+**And `${` in a double-quoted string was already ZERO tree-wide**, so nothing rode on it either.
+
+### The pre-1.0 licence, and why the template migration was cheap
+
+Templates were six days old (#2188) and the ONLY `${` users in the tree were their own fixtures.
+Migrating them cost one mechanical pass over eleven files. **A one-day-old feature is the
+cheapest moment a break will ever be**, and holding two hole syntaxes — `${` in backticks, `\{`
+in strings — to avoid it would have been the permanent cost: two spellings to learn, two to
+document, two the grammars and the four textual module gates each have to scan for.
+
+After the migration `${` is ordinary text in a template, and **no hint or lint marks it**. That
+is a decision, not an omission: it does not become an error, it becomes a legal program, and
+minting a diagnostic for a legal program to warn about a six-day-old spelling is speculative.
+Measured before deciding — ZERO `${` remain in tree. `\$` is different and DOES get a targeted
+sentence (``\$` is not an escape — write `$` (an interpolation hole is `\{…}`)`), because it
+becomes an ERROR either way and the only question was the wording.
+
+### One scanner, one escape decoder — the discipline the template entry claimed, now load-bearing
+
+`scanQuoted` already served `"`, `'` and `` ` ``. It gains ONE predicate — `holes = quote is `"`
+or `` ` `` `` — and the `\{` test sits in front of the escape arm, so `\{` never reaches
+`decodeSimpleEscape` and `\\{` is an escaped backslash before an ordinary brace. **The `"` call
+site gains the split-run arm the backtick call site already had**, and a fourth stack (`gTplQuote`)
+records each open run's delimiter so the `}` arm resumes in the mode the run opened in and the
+unterminated report names the literal the author actually opened. A holed string mints the same
+`TEMPLATE_HEAD`/`MID`/`TAIL` kinds a template does, so **nothing past the lexer learned that a
+second literal form exists** — the parser's desugar, the absolute binding, `binTpl`'s verbatim
+reprint, the hole domain, the refusal and the nesting rules are all untouched code serving twice
+the surface. Proved by byte identity rather than by reading: `print("v=\{x}")`,
+`` print(`v=\{x}`) `` and the hand-written `import { toString } from "std:fmt"` +
+`print("v=" + x.toString())` are all **17,089 bytes, one sha**.
+
+The kinds keep their `TEMPLATE_` spelling and the module gate keeps the name `cliHasTplHole`.
+Both now undersell what they cover, and both are kept deliberately: the gate is mirrored
+character for character in three languages under a guard that anchors on the declaration, and the
+kinds are a closed token vocabulary threaded through the parser, the semantic-token classifier
+and the printer. Renaming buys a word and touches every mirror; the headers carry the contract
+instead, and the guard's anchors now name the `"` arm explicitly so a gate that only scanned
+backticks fails by name.
+
+### What did NOT move: multiline
+
+**A raw newline in a `"…"` string is still the end of the literal.** That is the one rule the two
+grammars still disagree about, and it is the reason `tpl` survives as a separate predicate beside
+`holes`. Only the TEXT parts are governed by it: a HOLE is expression context in both forms, so
+`"v=\{\n x + 1\n}"` parses, exactly as the template spelling does.
+
 ## A template literal's stringifier is bound ABSOLUTELY, never by scope pickup (owner, 2026-09-01)
 
-**`` `v=${x}` `` renders `x` through `std:fmt`'s integer/boolean renderer no matter what the
+*(Spellings updated when the hole trigger moved to `\{` — see the entry above. Everything this
+entry says about BINDING is unchanged, and it now covers `"v=\{x}"` too, which is the same
+construct reached from a different delimiter.)*
+
+**`` `v=\{x}` `` renders `x` through `std:fmt`'s integer/boolean renderer no matter what the
 file imports, declares, or shadows.** A hole is not a call the user wrote and does not
 resolve like one: the parser desugars it to a call naming `$tpl$render`, an identifier no
 program can spell (`$` is not an identifier character), and the module merge rewrites that
@@ -2043,7 +2130,7 @@ produces — for any module holding a hole. That emptiness is the whole no-pollu
 fetched, ordered, parsed and merged by the machinery an author's own import uses while `toStr`
 stays undeclared, a user-declared `toStr` still renames to its own `$mN`, and completion (which
 filters on the entry's imports) never offers it. Verified by byte identity rather than by
-reading: `` print(`v=${x}`) `` compiles byte-identically to `import { toStr } from "std:fmt"` +
+reading: `` print(`v=\{x}`) `` compiles byte-identically to `import { toStr } from "std:fmt"` +
 `print("v=" + x.toStr())`, and a module that already imports `toStr` and also interpolates is
 byte-identical to its hand-written twin — one merge, not two.
 
@@ -2062,12 +2149,12 @@ renderer.
 expected)`) and the refusal's own SENTENCE are read off that parameter type, so the two cannot
 disagree and neither can go stale. That is not a hypothetical: this was written against
 `i32 | i64 | boolean`, serde Stage 0's `renderF64` widened the renderer to include `f64` days
-later, and `` `v=${1.5}` `` began printing `1.5` **with no template-side edit** — the fixture
+later, and `` `v=\{1.5}` `` began printing `1.5` **with no template-side edit** — the fixture
 that had pinned the f64 refusal flipped to pinning the widening instead. A hard-coded list is a
 citation with a date on it; this one would already have been wrong.
 
 Anything outside the domain gets a TEMPLATE-shaped refusal AT THE HOLE'S SPAN
-(``a template hole is `string` or i32 | i64 | boolean | f64 — this one is P``), never
+(``an interpolation hole is `string` or i32 | i64 | boolean | f64 — this one is P``), never
 `argument 1: expected …, got P`. The generic message would name a call the
 author never wrote, over a parameter list they cannot see. The type-directed choice — deliver
 directly, render, or refuse — is made at the ONE line in `checkCallNode` where the hole's type
@@ -2078,14 +2165,15 @@ and no second lowering exists to disagree with it.
 
 Both fall out of the scanner rather than being added to it, which is why neither is refused.
 A hole ends at the `}` at THAT hole's own brace depth, so a template inside a hole simply
-pushes its own row on the stack — `` `a${ `b${x}c` }d` `` prints `ab1cd`. And a hole is
+pushes its own row on the stack — `` `a\{ `b\{x}c` }d` `` prints `ab1cd`. And a hole is
 EXPRESSION context, so `"…"` inside one is scanned by the ordinary string scanner, where a
-backtick is an ordinary character: `` `${"nested ` backtick in string"}` `` needs no escape and
+backtick is an ordinary character: `` `\{"nested ` backtick in string"}` `` needs no escape and
 does not get one. Escaping it would have meant one grammar's delimiter reaching into another's
 literal, which is the rule TS and JS also decline to make.
 
-Only the template's own TEXT parts escape a delimiter, and there the two escapes are ``\` ``
-and `\$`. Every other escape is the string escape set, shared and unchanged — asserted as
+Only the template's own TEXT parts escape a delimiter, and there the one escape is ``\` ``
+(`\$` was the second until the entry above moved the hole trigger into the escape namespace and
+made `$` ordinary again). Every other escape is the string escape set, shared and unchanged — asserted as
 such (`` `\t` == "\t" ``, `` `\u{1F600}` == "\u{1F600}" ``) rather than transcribed, and
 implemented as a purely LEXICAL part→`"…"` rewrite so no second escape decoder exists to drift
 from the lexer's.

@@ -43,18 +43,24 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   place** — DONE #2199 (ruled 2026-09-01, shipped the same day). Default scope, all six
   emit/classify/collect arms and `emitToString` are gone; `std:fmt` exports `toString`;
   every in-tree caller migrated; both retired spellings get a targeted import hint.
-- **Template literals / interpolation — SHIPPED #2188.** Backtick strings, additive,
-  desugared in the parser to concat over `std:fmt`'s renderer bound ABSOLUTELY via a
-  compiler-injected bare import edge plus an unspellable rename row. Two remainders,
-  both measured: a STRING-only hole still pulls `std:fmt`+`std:str` because the host
-  closes the module graph before any type exists — the fix is whole-program DCE, not a
-  template-specific drop; and an `f32` hole reaches the pre-existing
+- **String interpolation — SHIPPED #2188 (templates), EXTENDED and UNIFIED the same
+  week (plain strings + the `\{` migration).** ONE hole syntax, `\{expr}`, in BOTH
+  quoted forms: `"v=\{x}"` and `` `v=\{x}` `` are the same construct, desugared in the
+  parser to concat over `std:fmt`'s renderer bound ABSOLUTELY via a compiler-injected
+  bare import edge plus an unspellable rename row. The trigger sits in the ESCAPE
+  namespace (Swift's `\(` placement, the owner's brace spelling), which is what makes it
+  additive at zero permanent cost — `{` is data in every string forever, and `"a\{b"`
+  was a hard lex error before. `${` is ordinary text now and `\$` is retired; multiline
+  stays backtick-only. Two remainders, both measured and both UNCHANGED by the
+  extension: a STRING-only hole still pulls `std:fmt`+`std:str` because the host closes
+  the module graph before any type exists — the fix is whole-program DCE, not a
+  literal-form-specific drop; and an `f32` hole reaches the pre-existing
   `emitProgram: union atom has no value box` floor at the SAME spelling a hand-written
-  `x.toStr()` does (`scripts/capability-probes/f32-into-f64-union-arm.vl` owns it — the
-  template is a second door, not a second defect). The hole domain needs no scheduling:
+  `x.toString()` does (`scripts/capability-probes/f32-into-f64-union-arm.vl` owns it —
+  the hole is a second door, not a second defect). The hole domain needs no scheduling:
   it is read off the renderer, and picked up `f64` from serde Stage 0 with no edit.
-  **The `toStr` → `toString` rename above is a ONE-LINE edit here**
-  (`TPL_RENDER_EXPORT` in `driver.vl`) — it is already isolated.
+  The `toStr` → `toString` rename above was the one-line edit it was advertised as
+  (`TPL_RENDER_EXPORT` in `driver.vl`).
 - **`else` requires braces** — DONE #2165; recorded here only because the ruling predates
   the entry above and the DECISIONS entry is the durable home.
 - **Driver lossless-recovery flag — STAGE 1 DONE #2210** (ruled 2026-09-01, shipped the
