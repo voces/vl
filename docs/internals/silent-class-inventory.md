@@ -23872,7 +23872,7 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
 
 ### D985 — `is string` against a self-referential container union with `null`
 
-**loud emit reject · clause 2 · was a silent miscompile until the root was found; the soundness half is fixed and the capability half is not · `scripts/capability-probes/json-tree-is-plain-arm.vl`**
+**closed · was check-clean invalid wasm, then a loud emit reject · clause 1 then clause 2 · `tests/cases/types/json-value-tree-is-ladder.vl`**
 
     type J = null | string | J[]
     function f(j: J) {
@@ -24088,7 +24088,7 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
 
 ### D982 — a JSON value tree: `is` against a SELF-REFERENTIAL array arm is refused, and only when the union also has a `null` arm
 
-**loud emit reject · was a loud check reject · owner-scheduled (a JSON value tree is the shape serde Stage 1 hangs on) · clause 2 · `scripts/capability-probes/json-tree-is-container-arm.vl`**
+**closed · was a loud check reject, then a loud emit reject · owner-scheduled (a JSON value tree is the shape serde Stage 1 hangs on) · clause 2 · `tests/cases/types/json-value-tree-is-ladder.vl`**
 
     type J = null | string | J[]
     function f(j: J) {
@@ -24143,23 +24143,23 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   table has no interned arm for the self-referential container spelling; that is the half
   still to build. Reverted rather than merged.
 
-* **THE REMAINING WORK IS A REP, AND HERE IS THE EXACT CHAIN.** With the union registered
-  (#2221) both witnesses reach ONE loud refusal: the parameter ladder in `emit_sections.vl`,
-  because `nodeTyIsUnionish(p.parType)` is false. Fixing that predicate alone is a REGRESSION,
-  not progress — the param then passes the gate and lowers as `i32`, and the module is
-  check-clean invalid wasm. Measured, not assumed; that is why it is not in the tree.
-
-  The lowering side asks a different question and every step of it answers "not a union" for
-  the one-member wrapper:
+* **CLOSED BY UNWRAPPING A ONE-MEMBER UNION IN TWO PREDICATES.** `type J = null | string |
+  J[]` interns as `TyUnion[ TyNullable(rest) ]` — the `null` folded into the niche, the alias
+  left as a ONE-MEMBER wrapper around it. The non-recursive spelling `null | string | i32`
+  interns as a BARE `TyNullable` and reaches the nullable branch of `nodeTyIsUnionAlias`,
+  which is exactly why that one always worked and this one never did. `isValueUnionBox`
+  requires two or more members, so the wrapper answered "not a union" all the way down:
 
       vtKindOfParam -> vtKindOfType -> retUnionFlag -> nodeTyIsUnionAlias -> isValueUnionBox
 
-  So closing D982/D985 means teaching `isValueUnionBox` (and whatever interns the arms) about a
-  union that normalises to one member wrapping a `TyNullable` — AND making the value actually
-  BE boxed at the call site, with the `is` dispatching on its tag. That is a rep build, not a
-  predicate fix, and the capability-matrix rule applies in full: build the lowering, wire every
-  delivery position, THEN narrow the parameter gate. Narrowing first is exactly the
-  clause-2-into-clause-1 trade this file keeps recording.
+  **BOTH predicates were required, and that is the lesson of the earlier attempts.**
+  `nodeTyIsUnionish` is the parameter GATE and `nodeTyIsUnionAlias` is the LOWERING. Fixing
+  only the gate admits the parameter and then lowers it as `i32` — check-clean invalid wasm,
+  which an earlier revert had measured and correctly refused to ship. Fixing only the
+  lowering leaves the gate refusing. They have to agree, and neither alone is progress.
+
+  No new rep was needed after all: the shape already had one, and four predicates simply
+  could not see through a wrapper the non-recursive spelling never wears.
 
 * **THE MAP ARM IS NOW ON THE SAME FOOTING AS THE ARRAY ARM.** #2223 had to hold
   self-referential MAP arms transparent because registering one hit [D984](#d984)'s unbounded
