@@ -2098,7 +2098,9 @@ only the legality did, and the `else` arm was routed through `parseBracedBody` u
 This paragraph is kept as the record of the split: the recovery question and the language
 question really were separable, and answering them in that order cost one call site.)**
 
-*It does not make a later TYPE error appear.* `checkSrc`/`compileSrc`/`lintSrc` in
+*It does not make a later TYPE error appear.* **(SUPERSEDED the next day — see "A recovered
+parse is TYPECHECKED" below. The measurement in this paragraph is what the ruling was made on,
+so it is kept verbatim.)** `checkSrc`/`compileSrc`/`lintSrc` in
 `compiler/driver.vl` all return at `P.diags.length > 0` — the checker never runs on a file that
 had any parse diagnostic. So `if c print(1)` followed by `const n: i32 = "hi"` still reports
 only the parse diagnostic. That gate predates this change, and **lifting it globally was tried
@@ -2119,6 +2121,80 @@ owner's call, not this change's.
 
 Later PARSE errors do surface, which is what makes the recovery worth having: the arm is exactly
 one statement, never a scan, so the cursor lands back on the statement boundary.
+
+## A recovered parse IS typechecked — the gate quantifies over EVERY diagnostic
+
+**Stage 1 of the lossless-recovery flag. `checkSrc`/`checkSrcSym`/`compileSrc`/`lintSrc`/
+`lintGraph`/`modCompile` run the checker past parse diagnostics IFF EVERY parse diagnostic in
+the file carries a per-diagnostic LOSSLESS flag; exactly one recovery site sets it. Emit never
+proceeds past any parse diagnostic.** (owner ruling 2026-09-01, "seems straightforward"; #TBD)
+
+The paragraph above states the problem and refuses to solve it: the bail keys on *any* parse
+diagnostic, and an unbraced-body recovery is provably lossless. The refusal was right about the
+DANGER and wrong about the only available shape — it assumed the choice was between the bail and
+lifting it. The third option is to make the diagnostic itself say which kind it is.
+
+**The flag is a sparse index-keyed column beside `P.diags`** (`dgLossless` in `compiler/ast.vl`),
+the same shape as the driver's `vcDg*` tokenless-diag table, and it is reset from the same
+`vcDgReset` the seven pipeline entry points already call in lockstep with `P.diags = []`.
+**Sparse and not dense on purpose**: a dense column would have to be pushed by every
+`P.diags.push` in the tree, and the site that forgot would mis-key every later entry. Absent
+means "not known to be lossless", which is the safe default and therefore the right answer for a
+site that has never heard of the table. (The stale-entry direction is the dangerous one — the
+LSP re-enters `checkSrc` per keystroke on one instance — which is why the reset lives in the
+one home rather than at seven call sites.)
+
+**Exactly one site sets it: `parseBracedBody`'s unbraced-body recovery** (#2115/#2165 — `if`,
+`else if`, `while`, `for`, `else`). Its arm is handed to `parseStmt` exactly as a braced body
+would have been, so no token is dropped and none invented; a type error read off that AST is
+about the program the user wrote. `parseBlock`'s fall-through is NOT marked, because
+`expectClose`'s skip-to-closer drops tokens. The `then`-removal recovery in `parseIf` is
+arguably lossless too and is deliberately left unmarked — it was not in the ruled set, and it is
+the cheapest stage-2 candidate.
+
+**The quantifier is ALL, and that is what makes it safe by construction.** One lossy diagnostic
+anywhere in the file restores the old bail for the whole file, so the five phantoms cannot
+appear: they each need the checker to run on a file whose only diagnostics are lossy.
+
+**EMIT is not gated on the flag and never proceeds past a parse diagnostic.** A recovered program
+CHECKS; it does not BUILD. `vl build`/`vl run` keep rc 1, write no module, and print the same
+parse message — the only difference is that the type errors found on the way now ride with it.
+`formatSrc` also keeps the ANY reading, and for a different reason: `vl fmt -w` writes its output
+back over the file, so printing a recovered AST would silently re-spell the mistake as the braced
+form and erase the diagnostic with it.
+
+**The five phantoms, re-derived rather than quoted** (the paragraph above names a `(1 +`
+truncation that no corpus case has ever held — its two messages come from a hand probe, and the
+count is the part that reproduced). Lifting the bail wholesale on 2026-09-01 fails exactly five
+corpus cases, each inventing the message beside it:
+
+| case | phantom |
+| --- | --- |
+| `parser/call-missing-comma-recovers.vl` | `wrong number of arguments: expected 2, got 1` |
+| `functions/trailing-comma-illegal.vl` | `wrong number of arguments: expected 0, got 1` |
+| `objects/error-equality-not-overloadable.vl` | `redeclared ==`, `redeclared !=` |
+| `index/operator-unannotated-self.vl` | `cannot index non-array Box` |
+| `parser/coalesce-logical-mix-error.vl` | `operator '&&' expects boolean operands` |
+
+Each is pinned in `tests/vl_lossless_recovery_test.ts` by the message that must NOT appear, and
+the suite was validated in BOTH directions — sabotage the gate to never block and two tests fail;
+sabotage it to always block and five fail. The RESET has its own control and needs one: delete
+`dgLosslessReset()` from `vcDgReset` and every gate stays green except the one test written for
+it (`tests/lsp_lossless_recovery_wasm_test.ts`, "the flag column does not leak across checks on
+one instance"), which then reports the real `wrong number of arguments` phantom on the second
+check of a single wasm instance. Nothing else in the tree re-enters the driver twice with a
+lossless file first, which is exactly the sequence an editor types. **Stage 2 converts the lossy skip sites one at a time,
+each conversion making a recovery faithful and then deleting its pin deliberately.** Widening the
+gate without making the recovery faithful is what the pins exist to stop.
+
+**Ordering was not a decision this change had to make.** The driver's stream is parse-then-type
+(`diagCount` reads `P.diags` before `T.diags`) and `vl run`/`vl build` print it that way; the
+`vl check` report has stable-sorted every tier by `(line, col)` since long before this, so parse
+and type diagnostics simply interleave by position with ties keeping stream order. The sink
+already merged three sources; it now merges four.
+
+Measured: distilled corpus **zero cells moved** (the corpus is parse-clean, so the gate is
+unreachable from it), all eleven gates green, 349/349 filed witnesses as filed.
 
 ## Which channel owns a NARROWED argument's type at a monomorphization pin
 
