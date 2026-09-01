@@ -300,7 +300,7 @@ Deno.test({
   // the SAME disjunction the call-arg diagnostic names — the hole itself renders as
   // an uninformative `_`.
   const guarded = "function foobar(v) {\n" +
-    "  if v is { foo: string } then return v.foo\n" +
+    "  if v is { foo: string } { return v.foo }\n" +
     "  return v.bar\n" +
     "}\n" +
     'print(foobar({ foo: "foo" }))\n';

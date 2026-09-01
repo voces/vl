@@ -1845,6 +1845,30 @@ block-terminator languages (Python/Lua/Ruby) where `else if` would force an extr
 VL's `{}` blocks make it redundant. One form means no parser ambiguity and no formatter
 surface-recovery for the chain keyword.
 
+## `then` removed — braces are the one branch spelling (owner, 2026-08-31)
+
+`if cond then stmt` / `if c then a else b` was never designed: it arrived as host-parity
+sugar in 654722e3 (June 2026, the "parser/lexer sugar tail"), the TS compiler it mirrored
+is retired, and the tree had ZERO organic uses — std/ and compiler/ never wrote it, and
+its only producer was `vl fmt` itself, which canonicalized simple if-EXPRESSIONS into the
+`then` spelling. Braces already covered both of its positions (`if c { s }` statements and
+`print(if c { 7 } else { 8 })` expressions, both verified running before the removal), so
+the keyword was a second spelling of a form the grammar already had — the same shape as
+`elseif` above, plus a soft-keyword ambiguity (`then` doubled as an ordinary identifier)
+the parser and every editor surface had to carry.
+
+Removed in one go, ordered so no intermediate tree is broken: (1) fmt flips to braced
+rendering while the parser still accepts `then` — which also fixed a standing formatter
+bug (a `then`-spelled `else if` chain made fmt emit an empty `else ` clause and refuse its
+own output); (2) the tree migrates mechanically on the new fmt (45 fixture files, 2 TS
+tests; the distilled corpus and the filed Repro blocks held zero `then` programs); (3) the
+parser arm drops. Old code is not stranded on a generic "expected `{`": an `if` condition
+followed by the identifier `then` refuses with `` `then` was removed — wrap the branch in
+braces: `if cond { … }` `` and recovery-parses the old shape so every occurrence in a file
+reports. `then` remains a perfectly good identifier (the lexer soft-keyword
+fixtures now double as that regression's coverage), and the contextual soft-keyword set is
+five: `as` `from` `in` `step` `to`.
+
 ## Which channel owns a NARROWED argument's type at a monomorphization pin
 
 **The pin's own NAME owns it, and the checker's recorded type on the argument node is

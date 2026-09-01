@@ -118,7 +118,7 @@ monaco.languages.register({
 monaco.languages.setMonarchTokensProvider(VL_LANGUAGE_ID, {
   defaultToken: "",
   keywords: [
-    "fn", "function", "if", "then", "else", "elseif", "while", "for", "to",
+    "fn", "function", "if", "else", "elseif", "while", "for", "to",
     "step", "in", "const", "let", "return", "is", "await", "break", "continue",
     "from", "type", "import", "export", "as", "true", "false", "null",
   ],
