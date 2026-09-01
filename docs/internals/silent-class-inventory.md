@@ -24288,6 +24288,15 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   fe. That is the parallel-table hazard this repo already knows: a recorded index with no row
   behind it.
 
+  **CAVEAT ON THE TWO PROBES ABOVE — they cannot both be right, and the instrument is why.**
+  `if ffe >= 0 { return true }` makes the witness run, yet `fRetKind[ffe]` matches **none** of
+  `VKind`'s 31 members and `ffe < fRetKind.length` holds. That is impossible for a single
+  in-bounds read, so the two probes are **not isolating the same call**: `exprString` runs over
+  many expressions, and a `return true` that fires on any Member call with a found `fe` is not
+  evidence about the print ARGUMENT specifically. Treat "the fe is found" as unproven for this
+  call until a probe distinguishes them — key it on the enclosing function and the argument
+  node, not on the property name. The measurements are real; the attribution is not.
+
   **So the fix is upstream of `exprString` entirely** — record a field lambda's return kind
   when the object literal is collected — and the whole "pin the param's type" line of attack,
   three retractions deep, was never on the path. Those experiments are kept above only so
