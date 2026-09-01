@@ -23819,9 +23819,22 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
      `narrowed union atom has no value box` to a plain type mismatch. The bystander mints the
      value boxes; without it they do not exist.
 
-  So the missing site is the COLLECTOR: a mono clone's inferred union return never mints the
-  atom value boxes, and every later stage is reading a box that was never interned. Same
-  clone-invisible-to-a-name-table root as (1), one pass earlier.
+  5. **AND THE COLLECTOR IS NOT NAME-KEYED, which corrects (4)'s first reading.** `collectU`'s
+     inferred-return loop walks `inferRetCount()` — EVERY recorded row, by index, not by name —
+     and calls `registerInlineUnion` on each. So a clone being absent from a name table cannot
+     be why its boxes are unminted. The likelier truth is that the ROW ITSELF IS NEVER
+     RECORDED for a function with an un-annotated parameter, which puts the site in the
+     CHECKER rather than the collector.
+
+  Two controls sharpen that: an un-annotated parameter with a NON-union inferred return runs
+  (`if b { return 1 } 2`), and an un-annotated parameter that is USED in the return runs
+  (`if b { return 1 } b`). It is specifically the un-annotated parameter WITH a value-union
+  return whose row goes missing.
+
+  So the site is: record an inferred-return row for a function whose parameter is a hole. Every
+  stage downstream — the collector's registration, the signature, the return boxing — already
+  reads that row correctly once it exists, which is why three fixes aimed at those stages all
+  failed.
 
 ---
 
