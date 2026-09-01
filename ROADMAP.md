@@ -37,6 +37,50 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
 
 ## Next (highest leverage)
 
+### Ruled and sequenced (owner decisions already made, waiting only on order)
+
+- **Kill the ambient builtin `toString`; rename std:fmt's `toStr` → `toString` in its
+  place** (ruled 2026-09-01). Sequenced BEHIND serde Stage 0B's merge so the rename does
+  not move under the f64-arm work. One PR: default-scope removal (`driver.vl` blPush +
+  the emit special cases), std rename + in-tree importer migration, a targeted
+  moved-to-std hint on the undeclared name, DECISIONS entry recording the naming choice.
+- **`else` requires braces** — DONE #2165; recorded here only because the ruling predates
+  the entry above and the DECISIONS entry is the durable home.
+
+### Awaiting owner rulings (durable list; each row names its doc)
+
+- **Template literals / interpolation** — recommended design: additive backtick strings,
+  `` `v=${x}` `` desugaring at parse time to concat over std's `toString` bound
+  ABSOLUTELY (compiler-injected import, never scope pickup — every surveyed language
+  binds interpolation to a canonical protocol; Rust's absolute-path macro expansion is
+  the model). Holes start at `toString`'s domain, widen with serde Stage 2's `show<T>`.
+  Sized: parser + desugar + fmt, smaller than either Stage 0 half. Blocked on: go/no-go.
+- **Constraints / nameable bounds** — `docs/constraints-design.md` (2026-09-01): Phase 1
+  concepts (`type Showable = { toString(self): string }`, `<T: Showable>`,
+  declaration-checked — also the root fix for D952's wordless refusal), Phase 2
+  UFCS-satisfaction-at-instantiation-scope. Blocked on: Phase 1 go/no-go + its OQ-1..5.
+- **Track-caller intrinsic** (test failures at the `expect` line, not the `it` line) —
+  a std:test-visible callsite mechanism (Rust `#[track_caller]` / Swift `#line` shaped).
+  Small compiler intrinsic, language-surface decision. The editor-side cheap half is D9
+  slot 12 and needs no ruling.
+- **`vl test --trace` inline run values** (which `is` arm fired, what a binding held) —
+  an emitter flag instrumenting USER programs (never the compiler — seed-poisoning
+  hazard doesn't apply) logging `(site, value)` pairs; extension renders decorations
+  after a run. Wallaby/Quokka-class feature; real work, bounded. Blocked on: appetite.
+- **Driver lossless-recovery flag** — report "parse error + later type error" together.
+  Measured cost recorded in DECISIONS.md beside the `then` entry: lifting the bail today
+  invents 5 phantom-error corpus cases from lossy recoveries; doing it right wants a
+  per-site lossless flag. Low priority.
+- **`vl compile` → standalone executable** — parked from the CLI overhaul (#2080) until
+  wanted; no design written.
+- **D971 — capturing lambda at two types** (filed by the compile-goal session): the last
+  capability probe; needs a calling convention for by-name calls to lifted closures.
+  Explicitly an owner decision per its row in the inventory.
+- **serde OQ-1..OQ-7** (`docs/serde-design.md` §Open questions) — none block Stage 0
+  (in flight); Stage 1/2 scheduling wants OQ-1 (surface spelling) and OQ-2 (union
+  ordering) settled first.
+
+
 > **Destringify types — CLOSED, nothing to schedule.** Verified 2026-08-25 against the programme's
 > own standing check (`docs/internals/destringify-types-program.md` § "How to verify"): both greps
 > pass. Do not re-open it from a stale call-site census; run that check first.
@@ -1763,8 +1807,14 @@ seed from current `compiler/*.vl` in ~40s.*
   10. ⬜ Signature help (bridge grade today; clean grade wants one native export)
   11. ⬜ Doc-comment-aware hover/completion (needs the one native doc-text export;
      the D7 linkifier host side already exists)
+  12. ⬜ Test-failure anchor, cheap half — when a test body contains exactly ONE
+     `expect(...)` call, attach the failure TestMessage at that call's line instead of
+     the `it(...)` line (discovery already tokenizes the body; TestMessage takes a
+     Location). Multiple expects keep today's anchor. The REAL fix is the track-caller
+     intrinsic — an owner ruling, listed under "Awaiting owner rulings" in §Next.
   Not queued (and why, in one line each): workspace symbols (rides on 3's plumbing —
-  fold in when 3 lands), inline values / DAP (no debugger yet), notebooks/monikers/
+  fold in when 3 lands), DAP (no debugger yet; the `vl test --trace` inline-values idea
+  is a separate pending ruling in §Next, not debugger-gated), notebooks/monikers/
   call-hierarchy (n/a per survey until asked for by use).
 
 - 🟡 **D1. Hover types.** REMAINING: flow-narrowed receiver types; Map/Set members (when B6a fully lands).
