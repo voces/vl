@@ -1739,14 +1739,20 @@ seed from current `compiler/*.vl` in ~40s.*
      collapse into it), and a FUNCTION-BINDING hover that zips the decl's parameter
      names with `TyFunc.fnParamTypes` (`it(name: string, body: () => void) => void`) —
      types are structural and carry no names by design, so the names come from the
-     declaration; the same data feeds 9 (signature help)
-  6. ⬜ Rename symbol (+prepare) — `referencesAt`/`crossFileReferences`; its own PR
+     declaration; the same data feeds 10 (signature help)
+  6. ⬜ Flow-narrowed hover types (D1's standing remainder, re-reported from live use
+     2026-08-31: hover inside `if result is string { … }` still shows the full union) —
+     needs per-OCCURRENCE type retention in the native symbol pass (`symRetainType` keeps
+     one type per binding, last write wins; narrowing is flow-sensitive), then hover
+     prefers the occurrence's type over the binding's. Native work; pairs with 5's
+     render pathway.
+  7. ⬜ Rename symbol (+prepare) — `referencesAt`/`crossFileReferences`; its own PR
      (write-path feature, alias/import edges need care)
-  7. ⬜ **Testing API: per-test click-to-run** — `vl test <file> -t <substring>` suffices
+  8. ⬜ **Testing API: per-test click-to-run** — `vl test <file> -t <substring>` suffices
      (no CLI change); TestController over CodeLens per the survey's assessment
-  8. ⬜ Folding ranges + language-config indentation/on-enter rules
-  9. ⬜ Signature help (bridge grade today; clean grade wants one native export)
-  10. ⬜ Doc-comment-aware hover/completion (needs the one native doc-text export;
+  9. ⬜ Folding ranges + language-config indentation/on-enter rules
+  10. ⬜ Signature help (bridge grade today; clean grade wants one native export)
+  11. ⬜ Doc-comment-aware hover/completion (needs the one native doc-text export;
      the D7 linkifier host side already exists)
   Not queued (and why, in one line each): workspace symbols (rides on 3's plumbing —
   fold in when 3 lands), inline values / DAP (no debugger yet), notebooks/monikers/
