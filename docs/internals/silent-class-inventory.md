@@ -23354,6 +23354,52 @@ Repro (now RUNS, printing `7`):
     // vl check rc 0; runs, prints 7.
 
 ---
+### D954 — [CLOSED 2026-09-01] a UNION whose last member is an array read as an ARRAY: one type, two spellings, two answers
+
+**closed as `runs` · was check-clean invalid wasm · `type mismatch: expected (ref $type), found (ref $type)` · ZERO corpus cells, so the capability probe was the measurement · found by ablating `scripts/capability-probes/generic-field-list-member-union.vl`, whose own comment mis-scoped it · fixture `tests/cases/types/union-field-array-last-member.vl`**
+
+`nameIsArray` was a pure two-character SUFFIX test. The two characters it looked at belong to
+the last MEMBER of a union, not to the whole name, so `string | i32[]` classified as a list
+type everywhere the emitter asks that question — 66 call sites across seven files.
+
+* **THE TWO SPELLINGS OF ONE TYPE DISAGREED.** `{ a: string | i32[] }` stored a string ref
+  into a list-typed field: check-clean INVALID WASM. `{ a: i32[] | string }` — the same type,
+  members swapped — minted the union box and ran. That asymmetry is what identified the suffix
+  test as the culprit; a defect in the union machinery would not care about member order.
+
+* **THE MAP GRAMMAR ALREADY GUARDED THE IDENTICAL HAZARD, one member position over, and the
+  array grammar simply never got it.** `nameIsMapMemberUnion`'s header: a name that starts
+  with `{[` and has 2+ top-level atoms "is a variant BOX, not a bare map: it must NOT be
+  classified as a map local / return / value / field / list element". This row is that
+  sentence with `[]` for `{[`.
+
+* **THE PROBE'S OWN COMMENT WAS WRONG ABOUT THE RECIPE, and running the plainest program its
+  sentence forbids is what showed it.** It reads "A generic struct FIELD holding a union with
+  a LIST member … The bare store is the whole recipe" and files the shape under generics. The
+  generic is SCENERY: the non-generic `type B = { a: string | i32[] }` with `const e: B = { a:
+  "s" }` is check-clean invalid wasm on master, two lines and no generic anywhere. Same
+  correction the CLAUDE.md rule about refusal scopes makes, one instrument over — a probe's
+  comment is a measurement with a date on it, not a definition.
+
+* **SCOPE, MEASURED RATHER THAN ARGUED.** The defect needs a struct FIELD: the same union as a
+  plain local (`const v: string | i32[] = "s"`) and as a parameter both RUN on master. And the
+  fix does not cross the line it must not: `(i32 | string)[]` is still an array, because its
+  `|` sits inside the parens where `unionMemberCount`'s depth-aware scan does not see it —
+  which is why the guard asks the top-level atom COUNT and not whether a `|` occurs.
+
+* **66 CALL SITES, ZERO BEHAVIOUR MOVED.** Distilled corpus 0 movement; a stdout dual-run over
+  all 4,620 running cells against a `git archive origin/master` control is byte-identical. The
+  grammar was only ever wrong for a name no corpus cell contains.
+
+Repro (now RUNS; on master, check rc 0 and the module is invalid):
+
+    type B = { a: string | i32[] }
+    const e: B = { a: "s" }
+    print(1)
+    // vl check rc 0; runs, prints 1.
+    // Swapping the members (`i32[] | string`) ran on master — same type, other spelling.
+
+---
 
 ### D791 — [CLOSED 2026-08-31] READ-ONLY COVARIANCE is lowered by an element-CONVERTING COPY, licensed by a whole-program write scan — D661B's refusal was about the WRITABLE side only
 
@@ -27489,9 +27535,9 @@ Repro (check-clean invalid wasm):
   the closure's environment — the same instance-collision family as D941/D942, reached
   through the capture instead of a call or a field read.
 
-### D944 — widening a generic T into a union refuses for EVERY array T, and the refusal's sentence describes a different arm
+### D944 — [CLOSED 2026-09-01] widening a generic T into a union refuses for EVERY array T, and the refusal's sentence describes a different arm
 
-**loud emit reject · `emitProgram: only i32[] arrays and struct/union element arrays are supported` · fires for `T = i32[]`, `T = string[]` and `T = Circle[]` alike — including the two kinds the sentence says ARE supported — from `const aw: i32 | i64 | f64 | boolean | string | T = v` in a generic body (the D933-fixture spelling one T-kind over) · struct T widens fine (D933's close), array T refuses at emit per instance, so a module with ONE array instantiation of a widening helper refuses even when the array value would fall through every arm at runtime · reproduces on the pre-#2081 compiler: STANDING · found 2026-08-31; it is why `std:test` v2 renders by direct `is` on the raw parameter instead of the widen-and-narrow the D93x rows probed**
+**closed as `runs` · the filed witness prints `other`, and so do the `string[]` and `f64[]` spellings · CLOSED BY AN EARLIER LANDING, NOT BY A CHANGE AIMED AT IT: it already ran on master before D954 touched anything, so the row had simply gone stale — caught by `check-filed-witnesses.py`, which is what that gate is for · was a loud emit reject, `emitProgram: only i32[] arrays and struct/union element arrays are supported`, firing for `T = i32[]`, `T = string[]` and `T = Circle[]` alike — including the two kinds the sentence says ARE supported — from `const aw: i32 | i64 | f64 | boolean | string | T = v` in a generic body (the D933-fixture spelling one T-kind over) · struct T widens fine (D933's close), array T refuses at emit per instance, so a module with ONE array instantiation of a widening helper refuses even when the array value would fall through every arm at runtime · reproduces on the pre-#2081 compiler: STANDING · found 2026-08-31; it is why `std:test` v2 renders by direct `is` on the raw parameter instead of the widen-and-narrow the D93x rows probed**
 
 Repro (loud emit reject):
 
