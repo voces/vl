@@ -116,9 +116,10 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     // A multi-char char literal is a LEX error (folded into the parse stage);
-    // the lexer anchors it at line 1, col 12 (0-based) — the closing quote —
-    // shown 1-based as [1:13].
-    await assertPositioned("let c = 'ab'\n", "parse", ": error [1:13] ");
+    // the lexer anchors it at line 1, col 8 (0-based) — the literal's OPENING
+    // quote (`diagAt`, not the scanner's one-past position) — shown 1-based
+    // as [1:9].
+    await assertPositioned("let c = 'ab'\n", "parse", ": error [1:9] ");
   },
 });
 
