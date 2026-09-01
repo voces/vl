@@ -18,6 +18,7 @@ import {
   prefixWithUnderscoreFix,
   quickFixesForDiagnostic,
   removeBindingFix,
+  removeExpressionFix,
   removeImportFix,
 } from "../lsp/src/codeActions.ts";
 
@@ -219,6 +220,51 @@ Deno.test("unused-function dispatches ONLY the `_`-prefix fix", () => {
     applyEdit(src, fixes[0].edits[0]) ===
       "function _dead(n: i32): i32 {\n  return n\n}\n",
     `applied: ${JSON.stringify(applyEdit(src, fixes[0].edits[0]))}`,
+  );
+});
+
+// --- removeExpressionFix: unused-pure-expression (remove the statement) ------
+
+Deno.test("removeExpressionFix deletes the no-effect statement's line", () => {
+  // The motivating shape: a stray `3` ahead of the real work. The diagnostic is
+  // anchored on the expression's line (line 1, indented two columns).
+  const src = "function f() {\n  3\n  print(1)\n}\n";
+  const fix = removeExpressionFix(src, rangeOf(1, 2, 3));
+  assert(fix !== null, "fix produced");
+  assert(fix!.title === "Remove this expression", `title: ${fix!.title}`);
+  assert(fix!.isPreferred !== true, "remove-expression is not preferred (destructive)");
+  assert(
+    applyEdit(src, fix!.edits[0]) === "function f() {\n  print(1)\n}\n",
+    `applied: ${JSON.stringify(applyEdit(src, fix!.edits[0]))}`,
+  );
+});
+
+Deno.test("removeExpressionFix on the file's last line deletes its content", () => {
+  const src = "print(1)\n1 + 2";
+  const fix = removeExpressionFix(src, rangeOf(1, 0, 5));
+  assert(fix !== null, "fix produced");
+  assert(
+    applyEdit(src, fix!.edits[0]) === "print(1)\n",
+    `applied: ${JSON.stringify(applyEdit(src, fix!.edits[0]))}`,
+  );
+});
+
+Deno.test("unused-pure-expression dispatches ONLY the remove-expression fix", () => {
+  const src = "function f() {\n  3\n  print(1)\n}\n";
+  const fixes = quickFixesForDiagnostic(
+    src,
+    "unused-pure-expression",
+    rangeOf(1, 2, 3),
+  );
+  assert(fixes.length === 1, `expected exactly one fix, got ${fixes.length}`);
+  assert(
+    fixes[0].title === "Remove this expression",
+    `unexpected fix title: ${fixes[0].title}`,
+  );
+  // No `_`-prefix fix: there is no binding to mark intentionally unused.
+  assert(
+    !fixes.some((f) => f.title === "Prefix with `_`"),
+    "a no-effect expression must NOT offer a `_`-prefix fix",
   );
 });
 

@@ -1270,6 +1270,7 @@ export const createWasmChecker = (
     "unused-function",
     "constant-condition",
     "unreachable-code",
+    "unused-pure-expression",
   ]);
 
   // Lint diagnostics ride the same seed as the Stage-1+ exports; an older seed
