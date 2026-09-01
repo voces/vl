@@ -1740,12 +1740,15 @@ seed from current `compiler/*.vl` in ~40s.*
      names with `TyFunc.fnParamTypes` (`it(name: string, body: () => void) => void`) —
      types are structural and carry no names by design, so the names come from the
      declaration; the same data feeds 10 (signature help)
-  6. ⬜ Flow-narrowed hover types (D1's standing remainder, re-reported from live use
-     2026-08-31: hover inside `if result is string { … }` still shows the full union) —
-     needs per-OCCURRENCE type retention in the native symbol pass (`symRetainType` keeps
-     one type per binding, last write wins; narrowing is flow-sensitive), then hover
-     prefers the occurrence's type over the binding's. Native work; pairs with 5's
-     render pathway.
+  6. ⬜ Flow-narrowed types at a position — hover AND member completion (D1's standing
+     remainder, both surfaces re-reported from live use 2026-08-31: hover inside
+     `if result is string { … }` shows the full union, and `result.` inside an
+     `is IoError` arm offers NOTHING — measured: `memberCompletionsAt` on the narrowed
+     receiver returns `[]` while a plain `IoError` receiver returns msg/code) — needs
+     per-OCCURRENCE type retention in the native symbol pass (`symRetainType` keeps one
+     type per binding, last write wins; narrowing is flow-sensitive); hover prefers the
+     occurrence's type, and the member-completion receiver resolution reads the same
+     store. One native change, two surfaces. Pairs with 5's render pathway.
   7. ⬜ Rename symbol (+prepare) — `referencesAt`/`crossFileReferences`; its own PR
      (write-path feature, alias/import edges need care)
   8. ⬜ **Testing API: per-test click-to-run** — `vl test <file> -t <substring>` suffices
