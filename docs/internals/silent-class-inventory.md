@@ -29403,3 +29403,100 @@ Repro (runs today and must keep running — as D1006, the defect is in the NEXT 
     print(t)
     // PRINTS 3 — and leaves `fnUsesMapVals` true, so the next `print(1)` compiled on this
     // instance is 162 bytes instead of 147.
+
+---
+
+### D1008 — a `u8[]` STRUCT FIELD has no rep: the packed byte list ships at every VALUE position and at no CONTAINER position
+
+**loud emit reject · check rc 0 · `emitProgram: struct field type `u8[]` has no struct-field rep` · the ONE scalar list that cannot be a field — `i32[]` / `i64[]` / `f64[]` / `boolean[]` / `string[]` fields all run · `u8[]` runs at global, parameter, return, binding and capture · pinned LOUD by `tests/cases/arrays/error-u8-struct-field-unsupported.vl` and its generic-alias twin since #1829, but never filed as the clause-2 gap it is · surfaced by the serde critique panel: it is the VLB decoder's own cursor shape**
+
+The refusal is deliberate and old — the fixture that pins it says why: without it a `u8[]`
+field took `fieldCodeOfSpelling`'s ref-list code and the emitter interned a ref-list wrapper
+for a one-byte backing, check-clean invalid wasm. Making it loud was right. Leaving it loud is
+a **clause-2 violation**: `vl check` accepts the program, the design permits it (a `u8[]` is
+an ordinary value everywhere else), and the emitter declines. The fixture keeps the refusal
+honest; this row is what makes it a gap somebody owes.
+
+* **ABLATED, not inferred from the sentence.** Six element types in the same two-field
+  struct, same literal, same `print(c.pos + c.buf.length)`: `i32[]` 9, `i64[]` 9, `f64[]` 9,
+  `boolean[]` 8, `string[]` 8 — all RUN. Only `u8[]` refuses. And `u8[]` at the other
+  positions — a module global, a parameter, a return — each print `2` for a two-element
+  list. So the gap is exactly one cell of the position matrix: the packed byte backing has a
+  local/global/param/return rep and no struct-field code.
+
+* **THE SITE.** `compiler/emit_classify.vl:19835-19858`: the union-ARM arms fire first
+  (D734/D761), then the general sentence that substitutes the field's rendered type. The
+  fixture header (`tests/cases/arrays/error-u8-struct-field-unsupported.vl`) enumerates the
+  container positions that share the missing backing — struct field, map value, ref-list
+  element / `u8[][]`. The `T[] | null` niche it also listed has since landed (D979).
+
+* **WHY IT MATTERS NOW.** `docs/serde-design.md`'s VLB decoder is a cursor over bytes; the
+  natural spelling is `type Cur = { buf: u8[], pos: i32 }`, and that is the program below.
+  Three critique docs (`serde-critique-{consistency,crosslang,perf}.md`) each independently
+  hit it, and `serde-critique-synthesis.md` routes it here. Until it closes the decoder's
+  cursor has to be a pair of locals threaded by hand, or a `string` (same `(array (mut i8))`
+  heap type, different rep ladder) — both are workarounds for a missing field code, not
+  designs.
+
+* **WHAT CLOSING IT NEEDS.** The struct table's field-kind ladder gets a packed-`u8` rung —
+  the type-section field type, the construct, the read, the write, struct equality, the
+  optional chain — wired at EVERY delivery before the gate narrows (the D965 order). The
+  generic-alias spelling (`type Box<T> = { v: T }` at `Box<u8[]>`, `gaeEnsure`) refuses
+  word-for-word today and must close in the same change; `string-rep-measurements.md`
+  (§"the `u8[]` generic arm") records the arm that becomes reachable when it does.
+
+Repro (loud emit reject):
+
+    type Cur = { buf: u8[], pos: i32 }
+    const c: Cur = { buf: [1, 2, 3], pos: 0 }
+    print(c.pos)
+
+---
+
+### D1009 — `J | null` is not assignable to `J` when `null` is already a member of `J`: a map read of a null-bearing recursive union cannot reach a callee typed `J`
+
+**loud check reject · `argument 1: expected J, got J | null` · `null` IS a member of `J` (`type J = null | f64 | J[]`), so `J | null` and `J` denote the same set and the check should be a no-op · the read is the map's ordinary `V | null` miss sentinel · found by the serde critique panel's JSON-tree probe the day #2244 landed D982/D985: the `is` ladder now works, and THIS is what stands between it and `render(v[k])` · workaround: bind the read and narrow on `== null` first — that spelling runs and prints `{"a":[1,null,"x"],"b":null,"c":{"deep":2.5}}`**
+
+The JSON value tree `type Json = null | boolean | f64 | string | Json[] | { [string]: Json }`
+builds and runs at every `is` arm since #2244. Rendering an object member is
+`render(v[k])`, and `v[k]` on a `{ [string]: Json }` has type `Json | null` — the miss
+sentinel. That should be `Json`: `null` is one of `Json`'s own members, and a union with a
+member it already has is the same union. The checker refuses it, so every consumer of a
+null-bearing recursive union's map has to bind and narrow by hand before calling anything.
+
+* **ABLATED.** Replace `J` by a non-recursive `null | f64` and the same call is... also
+  worth measuring, but the row is filed at the recursive alias because that is where the
+  serde plan lives. The `null` member is load-bearing: `type J = f64 | J[]` with a map read
+  narrowed by `if c == null` runs (that is `json6.vl`'s shape, and it ran before #2244).
+* **SIBLING:** D1010 — the same membership fact, refused at the array-literal ELEMENT
+  boundary instead of the top level. One `null ∈ J` predicate may close both; grade them
+  separately.
+
+Repro (loud check reject):
+
+    type J = null | f64 | J[]
+    function f(v: J): f64 { if v == null { return 0.0 } if v is f64 { return v } return 1.0 }
+    const m: { [string]: J } = Map()
+    m["a"] = 2.0
+    print(f(m["a"]))
+
+---
+
+### D1010 — a null-bearing array literal `[1.0, null]` cannot reach a recursive union whose element arm admits `null`: `(f64 | null)[]` is refused where `f64[]` is accepted
+
+**loud check reject · `cannot assign (f64 | null)[] to 'c' of type J` · with `type J = null | f64 | J[]`, the literal's element type `f64 | null` is a subset of `J`'s members, and `[1.0, 2.0]` (element type `f64`) IS accepted at the same three destinations — binding, map write, argument — so the element-widening test admits `f64 → J` and refuses `null → J` · the annotated spelling `const arr: J[] = [1.0, null]` runs · sibling of D1009**
+
+Three destinations, same literal, same alias: `const c: J = [1.0, null]` refuses;
+`m["a"] = [1.0, null]` into `{ [string]: J }` refuses (`cannot assign (f64 | null)[] to J |
+null`); `g([1.0, null])` against `g(v: J)` refuses (`expected J, got (f64 | null)[]`). Swap
+the `null` for `2.0` and all three run. So the array-literal-to-union widening walks the
+literal's element union and admits `f64` against `J`'s arms but not `null` — the one member
+that is spelled in the alias by the keyword rather than by a type name. Annotating the
+literal (`const arr: J[] = [1.0, null]`) sidesteps it, which is the D962/D969 shape: an
+annotation pins the element type and the check never has to decide membership.
+
+Repro (loud check reject):
+
+    type J = null | f64 | J[]
+    const c: J = [1.0, null]
+    print(1)
