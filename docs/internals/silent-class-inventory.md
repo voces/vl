@@ -23938,16 +23938,26 @@ and the refusal turns into a miscompile:
   probed with `tErr` at `monoSubstAnnNode` and at the `fnRetExprOf` rung, neither fires for
   this program.
 
-* **SO EVERY KNOWN WRITER OF `fn.fnRet` IS ELIMINATED, and that is the finding to hand on.**
-  `grep '\.fnRet = '` over `compiler/` yields exactly 17 sites: one void pin, fourteen
-  `synthTypeRefTy` rungs in `emit_rewrite.synthRetAnnots`, and two `TyFunc` writes in
-  `typecheck` that set a TYPE's `fnRet`, not the AST node's. All fourteen were probed
-  unfiltered and none fires; both `emit_mono` `nret` paths were probed and neither fires. Yet
-  the emitter reports `fn=[pick] fnRet=17 name=[string]` — the real function, a real node.
-  **Either the pin happens through an alias of the FuncDecl that `grep` does not catch, or node
-  17 is `pick`'s ORIGINAL parsed return and the premise that it starts at -1 is wrong.** The
-  cheapest next probe settles which: print `fn.fnRet` for `pick` at the START of the collect
-  pass, before any rewrite runs.
+* **SO EVERY KNOWN WRITER OF `fn.fnRet` IS ELIMINATED — but the INTERPRETATION filed with that
+  first is wrong, and this is the correction.** Two instrument errors were in the way:
+
+  the first probe of `emit_rewrite.synthRetAnnots` used **`tErr`, the CHECKER's channel**, which
+  does not surface during the emit phase — so "none fires" was measuring nothing. Re-probed with
+  `emitFail` (correct for that phase, built cleanly), none fires *for real*.
+
+  **And the control tells the story: `pick4(b: boolean)` — annotated param, INFERRED return —
+  gets no pin either, yet reaches the emitter with a correct `fnRet` and RUNS.** So a
+  non-negative `fn.fnRet` on an un-annotated function is NORMAL, not evidence of a pin. The
+  premise this row chased for several rounds — that an un-annotated return starts at `-1` and
+  something must have written it — **is false.**
+
+  What is actually true, and is the whole remaining question: the checker's `TyFunc` for `pick`
+  renders `i32 | string` (measured), while the AST's `fn.fnRet` node renders `string`; for
+  `pick4` the same node renders the union. Both functions have an inferred return and differ
+  only in whether the PARAM is annotated. **So find what populates `FuncDecl.fnRet` for an
+  un-annotated return and why an un-annotated PARAM degrades it from the join to one arm's
+  type** — and note that `grep '\.fnRet = '` does NOT find it, so it is written through an
+  alias or by a shared node constructor.
 
 * **A NOTE ON THE OTHER SIDE, from the emitter's own comment at the `retUnionFlag` rung:** when
   the functype and the body move to the box, the CALL-RESULT classifier (`computeRetInference`
