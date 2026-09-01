@@ -131,6 +131,80 @@ Deno.test({
   assertEquals(names, [], "a non-receiver position resolves no members");
 });
 
+// ---- flow-narrowed receivers -------------------------------------------------
+// The receiver's type is resolved through the SAME per-occurrence store hover reads
+// (`symOccQueryTy`), so a receiver under an `is`/null guard offers the narrowed arm's
+// members. On the DECLARED `string | IoError` the scan finds neither a struct nor a
+// string and offers nothing — which is what it did at every spelling before.
+
+Deno.test({
+  name: "wasm-member-completion: a receiver narrowed by `is` offers that arm's fields",
+  ignore,
+}, async () => {
+  // Repaired (dot stripped): `r` is a bare expression on line 3 at col 4.
+  const src = "type IoError = { msg: string, code: i32 }\n" +
+    "function f(r: string | IoError) {\n" +
+    "  if r is IoError {\n" +
+    "    r\n" +
+    "  }\n" +
+    "  return 0\n" +
+    "}\n" +
+    'print(f("x"))\n';
+  const names = await memberNames(src, 3, 4);
+  assertEquals(names.sort(), ["code", "msg"], "the narrowed arm's fields");
+});
+
+Deno.test({
+  name: "wasm-member-completion: the ELSE arm's narrowing offers the other member",
+  ignore,
+}, async () => {
+  // `else` after `is string` narrows to `IoError` — the checker's own negative
+  // narrowing, which the query layer reads rather than re-derives.
+  const src = "type IoError = { msg: string, code: i32 }\n" +
+    "function f(r: string | IoError) {\n" +
+    "  if r is string {\n" +
+    "    print(r)\n" +
+    "  } else {\n" +
+    "    r\n" +
+    "  }\n" +
+    "  return 0\n" +
+    "}\n" +
+    'print(f("x"))\n';
+  const names = await memberNames(src, 5, 4);
+  assertEquals(names.sort(), ["code", "msg"], "the else arm's fields");
+});
+
+Deno.test({
+  name: "wasm-member-completion: a null-guarded receiver offers the struct's fields",
+  ignore,
+}, async () => {
+  const src = "type P = { x: i32, y: i32 }\n" +
+    "function f(p: P | null) {\n" +
+    "  if p != null {\n" +
+    "    p\n" +
+    "  }\n" +
+    "  return 0\n" +
+    "}\n" +
+    "print(f(null))\n";
+  const names = await memberNames(src, 3, 4);
+  assertEquals(names.sort(), ["x", "y"], "fields through a null guard");
+});
+
+Deno.test({
+  name: "wasm-member-completion: an un-narrowed union receiver still offers nothing",
+  ignore,
+}, async () => {
+  // The control for the three above: OUTSIDE any guard the declared union has no
+  // member-bearing core, so the scan is empty — unchanged by the narrowing work.
+  const src = "type IoError = { msg: string, code: i32 }\n" +
+    "function f(r: string | IoError) {\n" +
+    "  r\n" +
+    "  return 0\n" +
+    "}\n" +
+    'print(f("x"))\n';
+  assertEquals(await memberNames(src, 2, 2), [], "a bare union receiver has no members");
+});
+
 // ---- the pure host conversion (no seed needed) ------------------------------
 
 // ---- kill-TS: native builtin completions (the TS `defaultScope` source) -------

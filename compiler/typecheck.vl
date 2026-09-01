@@ -213,6 +213,7 @@ import {
   symOccDecl,
   symOccIsDecl,
   symOccTok,
+  symOccTy,
   symVisEC,
   symVisEL,
   symVisKind,
@@ -3426,6 +3427,7 @@ export function initChecker() {
   symOccTok = []
   symOccDecl = []
   symOccIsDecl = []
+  symOccTy = []
   // Token-membership set mirroring `symOccTok` — reset in lockstep (see `symOccHasTok`).
   symOccTokSet = Map()
   symDeclScope = []
@@ -6331,6 +6333,9 @@ function symDecl(name: string, declNode: i32, ty: i32, kind: i32) {
   symOccRecordTok(tok)
   symOccDecl.push(declNode)
   symOccIsDecl.push(1)
+  // A DECLARATION is never narrowed — it is the binding, and its type is the one
+  // `symRetainType` just banked. (See `symOccTy` in check_state.)
+  symOccTy.push(-1)
   0
 }
 
@@ -6386,6 +6391,7 @@ function symDeclInOuter(name: string, declNode: i32, ty: i32, kind: i32) {
   symOccRecordTok(tok)
   symOccDecl.push(declNode)
   symOccIsDecl.push(1)
+  symOccTy.push(-1) // a declaration is never narrowed (see `symDecl`)
   0
 }
 
@@ -6404,7 +6410,23 @@ function symResolve(name: string) {
 // Record a USE occurrence of the identifier node `useNode` (its anchor token IS
 // the identifier). Resolves to its binding through the decl-scope chain; a name
 // with no tracked binding records nothing (no go-to-def target).
-function symUse(useNode: i32, name: string) {
+//
+// `curTy` is the type the `Ident` check arm just resolved for this very use — the
+// checker's OWN answer, which inside a guarded arm has already come through the
+// narrowing shadow `applyNarrows` declared. It is retained per occurrence
+// (`symOccTy`) so a position query can render the NARROWED type where the binding's
+// single retained type cannot: `symBindType` is one slot per binding, last write
+// wins, and `result` is a `string` in one arm and an `IoError` in the next.
+//
+// STORED ONLY UNDER A LIVE NARROWING SHADOW. `narDeclaredTy(name, -1)` is the
+// checker's own record that this name is currently shadowed by a narrowing (guard
+// or assignment kind) at the depth `lookup` just answered from — the same bank
+// `applyNarrows` writes and `popScope` unwinds. Gating on it rather than on a bare
+// `curTy != retained` keeps every un-narrowed use storing -1, so a binding whose
+// retained type is REFINED LATER (an unannotated function's, overwritten by
+// demand-inference at its `symRetainType` re-write) still hovers as its final
+// type rather than freezing whatever was in scope at the first walk.
+function symUse(useNode: i32, name: string, curTy: i32) {
   if symEnabled == 0 { return 0 }
   const decl = symResolve(name)
   if decl < 0 { return 0 }
@@ -6415,6 +6437,11 @@ function symUse(useNode: i32, name: string) {
   symOccRecordTok(tok)
   symOccDecl.push(decl)
   symOccIsDecl.push(0)
+  let occTy = -1
+  if curTy >= 0 {
+    if narDeclaredTy(name, -1) >= 0 { occTy = curTy }
+  }
+  symOccTy.push(occTy)
   0
 }
 
@@ -25774,7 +25801,9 @@ function checkNodeReal(ix: i32) {
       tErr("undeclared identifier '" + n.identName + "'", ix)
       return TY_ERR
     }
-    if symEnabled != 0 { symUse(ix, n.identName) }
+    // `ty` is this use's type as the checker resolved it — narrowed when the use
+    // sits inside a guarded arm. Threaded in so the occurrence retains it.
+    if symEnabled != 0 { symUse(ix, n.identName, ty) }
     // Definite-assignment read gate: a bare-name READ of a still-unassigned
     // binding is "used before assigned". The LHS of a plain `=` is a WRITE, not a
     // read (the `BinExpr` `=` arm marks it as `daWriteTarget` before evaluating
