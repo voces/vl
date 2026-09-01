@@ -16,6 +16,23 @@ VL = os.path.join(ROOT, "scripts", "vl-host", "target", "release", "vl")
 SEED = os.path.join(ROOT, "build", "vl-compiler.wasm")
 
 
+def matches(want, out):
+    """Does `out` satisfy the header's `Should print ...` contract?
+
+    Three spellings, because a probe's contract is prose and the grader should read the
+    prose rather than force every probe into one shape: a bare substring ("2"), "X twice"
+    (the same value on two lines), and "X then Y then Z" (a sequence of lines). Without the
+    last one a probe whose contract is two DIFFERENT values graded GAP while running
+    correctly — `u8-list-nullable-return` printed `1\n0` against a header saying `1 then 0`.
+    """
+    w = want.strip()
+    if " then " in w:
+        parts = [p.strip() for p in w.split(" then ")]
+        lines = [l.strip() for l in out.strip().splitlines()]
+        return lines == parts
+    return w.replace(" twice", "") in out
+
+
 def expected(path):
     """The `Should print ...` line in the probe's header, as the contract it is graded on."""
     for line in open(path, encoding="utf-8"):
@@ -47,7 +64,7 @@ def main():
         want = expected(p)
         out = run.stdout.strip()
         if run.returncode == 0:
-            ok = want is None or want.replace(" twice", "") in out
+            ok = want is None or matches(want, out)
             (now if ok else still).append((fn, "RUNS but output %r, header says %r"
                                            % (out, want) if not ok else "runs"))
         else:

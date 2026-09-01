@@ -23829,6 +23829,52 @@ Repro (check rc 0, invalid wasm):
     // vl check rc 0; vl run -> failed to compile: wasm[0]::function[4]::p2
 
 ---
+### D979 — `u8[] | null` had no NICHE: the packed byte list was the one scalar list absent from the family
+
+**closed for every position but one — the pin `error-u8-nullable-union-unsupported.vl` converts to a runs fixture · a TAIL-return function beside a bare-null GLOBAL is the residue, and V8 catches it where the native host does not · found by serde stage 0, whose base64 decoder ships `u8[] | Base64Error` instead**
+
+A two-member `T[] | null` is not a box — it is a NICHE: the wrapper ref made nullable, with
+`ref.null` for the null member and no tag. That rep is a per-backing VKind, and `u8[]` was the
+one scalar list with no member, so `u8[] | null` floored with `emitProgram: bare null needs a
+struct-typed context` — a message that reads like an internal invariant and so was invisible to
+`--sites`.
+
+* **THE OLD PIN NAMED ITS OWN FIX.** Its header read: "the `nulf32list` slice again — a VKind
+  member, a nullable wrapper valtype, the build/read/push arms and the `nulScalarListKind`
+  rung". That is exactly what landed, and the pin is now a runs fixture rather than a deleted
+  one.
+
+* **THE VKIND UNION ENUMERATED THE SITES.** Adding `"nulu8list"` to `VKind` turned every
+  exhaustive `match` into a compiler error naming its own file and line — a far better
+  instrument than grepping the 27 `nulf32list` occurrences, and it found the two valtype
+  ladders immediately.
+
+* **THE RESIDUE IS ONE COMBINATION, and V8 is what sees it.** A TAIL-return `u8[] | null`
+  function BESIDE a bare-null `u8[] | null` global produces a module the native host runs and
+  V8 rejects: `local.set[0] expected (ref null 5), found (ref 9)`. **Each half is fine alone**
+  — the tail-return function runs, the bare-null global runs, and the two together outside the
+  fixture harness also pass. So the remaining disagreement is a wrapper-heap lookup on one path,
+  and the engine split is the tell: **grade a rep change under BOTH engines, because `vl run`
+  accepted what the test harness's `WebAssembly.instantiate` refused.**
+
+* **AND THE PROBE RUNNER COULD NOT SPELL THE CONTRACT.** `u8-list-nullable-return` printed
+  `1\n0` against a header saying `1 then 0` and graded GAP while running correctly. The runner
+  now reads a `X then Y` sequence as well as a bare substring and `X twice`.
+
+Repro (runs, prints `2`):
+
+    function readFile(ok: boolean): u8[] | null {
+      if ok {
+        const b: u8[] = [1, 2]
+        return b
+      }
+      null
+    }
+    const r = readFile(true)
+    if r != null { print(r.length) } else { print(-1) }
+    // PRINTS 2
+
+---
 ### D978 — an `f32` delivered into a union whose only float arm is `f64`: the coerce ladder never asked which arm stores it
 
 **closed — the ladder now asks the union · found by std:fmt's `toStr` growing an `f64` arm (serde stage 0), which made this reachable from the most-used export in std**
