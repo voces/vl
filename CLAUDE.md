@@ -233,6 +233,15 @@ which refuses by hand and costs the scoreboard nothing. Each ZERO row in `--site
 hand-written probe, and none will arrive on its own. Do not read a rising `runs` as the whole
 answer.
 
+**AND A LITERAL'S ZERO ROW DOES NOT CLEAR WHEN YOU CLOSE PART OF ITS DOMAIN.** `--sites` counts
+REFUSAL SITES, not gaps closed. D937 built the five sites an inferred nullable-MAP return needs
+and the literal count did not move by one — correctly, because the same literal still refuses
+every non-`i32`-valued map, and *should*. Read that as the site narrowing, not as the fix
+failing. **`scripts/capability-probes/run.py` is the finer instrument** and it did move (1/6 →
+2/6): one probe per gap, graded `RUNS` / `check refuses` / `emit refuses` / `SILENT`. Add a
+probe when you find a gap, and grade a capability change on the probe runner AND `--sites`,
+never on `--sites` alone.
+
 **COUNT MESSAGE LITERALS, NEVER GREP-MATCHING LINES.** This number was hand-derived three times
 and was wrong all three: 40 (grepped lines, comments included), 26 (lines carrying a quote),
 then 23 with a 13-invisible split from fingerprinting each source line against the corpus. That
