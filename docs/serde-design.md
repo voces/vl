@@ -181,18 +181,22 @@ Facts that constrain the design, each verified this session:
    | `null` | `T[]` | any | emit-refuse | check-refuse |
    | `null` | any | `{[string]: T}` | emit-refuse | check-refuse |
 
-   **ROOT CAUSE, found same day — ONE mechanism, not three (D982 corrected, D983,
-   D984, D985, all filed and merged).** The emit-side VARIANT TABLE IS EMPTY for a union
-   with `null` + a self-referential container arm — the failing lookup prints
-   `wanted [J[]] have` with nothing after "have". The no-`null` spelling interns its
-   arms normally; `null` + self-reference suppresses arm interning wholesale, so EVERY
-   `is` against that union is unlowerable: D982's loud check refusal and D985's silent
-   invalid wasm are two faces of the missing table, and the fix lands in the INTERNING.
-   (The tempting one-line checker change — `assignableGo` bails on a `TyNullable` source
-   above the union arm — was found and deliberately NOT shipped: it converts clause 2
-   into clause 2, the order CLAUDE.md forbids.) D984 is the separate no-`null` map-arm
-   compiler trap below, with opposite null polarity, so neither witness can see the
-   other.
+   **The "one mechanism, empty variant table" explanation was filed and RETRACTED the
+   same day (#2213)** — the table is empty for the WORKING spelling too, by design
+   (interning is gated on `isStructAtom`, so `string`/`boolean`/`J[]` never intern in
+   ANY spelling), and the probe that suggested otherwise was taken under an
+   experimental patch while its "control" was a stale overwritten witness file — two
+   instrument traps this repo has names for, self-reported. **What is MEASURED and
+   stands: three separate walls, one silent** — D985 check-clean invalid wasm at both
+   container kinds, D982's loud check refusal, D984's compiler trap. The check-side
+   cause of the loud one is understood (`assignableGo` bails on a `TyNullable` source
+   above the union arm) with a one-line fix deliberately NOT shipped — it would convert
+   a loud refusal into a silent-adjacent emit refusal, the order CLAUDE.md forbids. The
+   EMIT-side cause is open, with one negative fact to steer the next probe: the
+   "`is` names a type that is not a union variant" refusal path is NOT reached for any
+   of the three spellings on master — the non-struct-arm lowering goes somewhere else.
+   D984 has opposite null polarity to D982 (a `null` arm masks the trap), so neither
+   witness can see the other.
 
    **Mechanism 1 — the `null` + self-referential-CONTAINER refusal (filed D982).** With a
    `null` arm, a self-referential arm makes `is string` an emit refusal and `is <that arm>`
