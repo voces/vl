@@ -578,7 +578,7 @@ let holeMapTys: i32[] = []
 // ALTERNATIVE hole constraints contributed by an `is` GUARD over the hole itself:
 //
 //     function foobar(v) {
-//       if v is {foo: string} then return v.foo
+//       if v is {foo: string} { return v.foo }
 //       return v.bar
 //     }
 //
@@ -599,7 +599,7 @@ let holeMapTys: i32[] = []
 //     DIVERGES (a `return`/`break`/`continue` guard clause) and the tail is
 //     therefore unreachable for an argument that satisfies the alternative.
 // Fields demanded strictly INSIDE the `if` (its else arm) are never required: the
-// guard being true means that arm did not run. So `if v is T then return v.foo` /
+// guard being true means that arm did not run. So `if v is T { return v.foo }` /
 // `return v.bar` accepts `{foo: string}` while `print(v.zap)` ahead of the guard,
 // or a non-diverging then-branch, keeps the complement's fields required.
 let holeAltNames: string[] = []
@@ -2348,7 +2348,7 @@ let inferRetIdx: {[string]: i32} = Map()
 // ident/expression arm). Captured DURING the check (scope live), keyed by node index.
 let inferLetIx: i32[] = []
 let inferLetTy: string[] = []
-// The NICHE analogue of `inferLetIx`: an un-annotated `const x = if c then "hi" else
+// The NICHE analogue of `inferLetIx`: an un-annotated `const x = if c { "hi" } else
 // null` infers `string | null`, which is a niche ref rep (`ref.null $sTypeIdx`), NOT a
 // value-union box — so `valueUnionRetName` renders "" and the `inferLetIx` table skips
 // it. Record such bindings by LetDecl NODE INDEX so the emitter's `letIsNulString`
@@ -2357,7 +2357,7 @@ let inferLetTy: string[] = []
 let inferLetNulStrIx: i32[] = []
 // The `boolean | null` companion of `inferLetNulStrIx` — the other niche scalar
 // nullable (an i32 0/1 with sentinel 2 = null). Same recording discipline: an
-// un-annotated `const x = if c then true else null` by LetDecl NODE INDEX, so the
+// un-annotated `const x = if c { true } else { null }` by LetDecl NODE INDEX, so the
 // emitter classifies the slot as the niche i32 rep and reuses the annotated lowering.
 let inferLetNulBoolIx: i32[] = []
 let bodyChecked: {[string]: boolean} = Map()
@@ -2680,6 +2680,60 @@ function isValBindLambda(nodeIx: i32) {
   let i = 0
   while i < valBindLambda.length {
     if valBindLambda[i] == nodeIx { return true }
+    i = i + 1
+  }
+  false
+}
+
+// VOID-CONTEXT DISCARD (DECISIONS: void contexts discard implicit tail values).
+//
+// The two node ledgers below are the checker→emitter channel for the void-discard
+// rule, and both are keyed on the CONTEXT being void — never on a tail's shape
+// (a bare-tail callee with a NON-void return keeps returning its value; the guard
+// fixtures `functions/nonvoid-bare-tail-value-*.vl` pin that keying).
+//
+// `voidCtxLambdaNodes`: lambda LITERAL nodes checked against an expected
+// `(…) => void` (a `cb: () => void` argument, an annotated binding/field/return).
+// Such a lambda ADOPTS the void return: its body is checked under `curRet = void`
+// — so an explicit `return expr` inside it is the ordinary
+// `return type mismatch: expected void, got …` anchored AT the return — and a
+// value-bearing tail is accepted and DISCARDED. The emitter reads the ledger in
+// `synthRetAnnots` and pins the lambda's `fnRet` to `void`, which is what routes
+// its functype to 0 results (`>v`) and its tail through the statement/drop path.
+let voidCtxLambdaNodes: i32[] = []
+function noteVoidCtxLambda(nodeIx: i32) {
+  if !listHasI32(voidCtxLambdaNodes, nodeIx) { voidCtxLambdaNodes.push(nodeIx) }
+  0
+}
+export function lambdaVoidAdoptedAt(nodeIx: i32) {
+  listHasI32(voidCtxLambdaNodes, nodeIx)
+}
+
+// `voidCoerceValNodes`: expression nodes (paren-peeled Idents naming a MODULE-scope
+// `function` declaration) whose `(P…) => T` VALUE was granted wholesale coercion into
+// an expected `(P…) => void` slot (`fnValVoidCoerce`). The emitter mints one VOID TWIN
+// per coerced target (`synthVoidTwins`) and swaps the closure build at exactly these
+// nodes, so the value called through the void slot really has a `()`-result functype.
+// Parallel `voidCoerceValNames` carries the target's name for the twin mint.
+let voidCoerceValNodes: i32[] = []
+let voidCoerceValNames: string[] = []
+function noteVoidCoerceVal(nodeIx: i32, name: string) {
+  if !listHasI32(voidCoerceValNodes, nodeIx) {
+    voidCoerceValNodes.push(nodeIx)
+    voidCoerceValNames.push(name)
+  }
+  0
+}
+export function voidCoerceValAt(nodeIx: i32) {
+  listHasI32(voidCoerceValNodes, nodeIx)
+}
+export function voidCoerceValCount() { voidCoerceValNodes.length }
+export function voidCoerceValNameAt(i: i32) { voidCoerceValNames[i] }
+
+function listHasI32(xs: i32[], v: i32) {
+  let i = 0
+  while i < xs.length {
+    if xs[i] == v { return true }
     i = i + 1
   }
   false
@@ -3175,6 +3229,9 @@ export function initChecker() {
   cbExpRetNode = []
   cbExpRetTy = []
   valBindLambda = []
+  voidCtxLambdaNodes = []
+  voidCoerceValNodes = []
+  voidCoerceValNames = []
   T.tys = []
   T.scopes = []
   T.diags = []
@@ -7098,7 +7155,7 @@ function joinTys(a: i32, b: i32) {
   let res = kept[0]
   if kept.length > 1 {
     res = mkUnionTy(kept)
-    // A joined litunion alias (`if c then k1 else k2`, `k ?? "a"` — both sides
+    // A joined litunion alias (`if c { k1 } else { k2 }`, `k ?? "a"` — both sides
     // the same alias / a member of it) re-mints the alias as a COPY; the
     // subset gate inside the stamp rejects a join that widened PAST it (b1).
     noteLitUnionCopy(res, a)
@@ -7115,7 +7172,7 @@ function joinTys(a: i32, b: i32) {
 // one side and DROPS the other. A function whose returns join a guard-narrowed value
 // with a hole-derived field —
 //     function foobar(v) {
-//       if v is {foo: string} then return v.foo   // `string`
+//       if v is {foo: string} { return v.foo }   // `string`
 //       return v.bar                              // `?fld.bar.?foobar.0`
 //     }
 // — then advertised plain `string` to EVERY call site while the emitter lowered the
@@ -8035,6 +8092,58 @@ function arrLitJoinUnionElem(srcExpr: i32, dtix: i32): boolean {
   if de is TyUnion { return false }
   true
 }
+// The FUNCTION-VALUE → VOID-SLOT grant (see its call site in `assignableExpr`).
+// True — and the seam RECORDED for the emitter's twin mint — exactly when:
+//   • `dstTy` is a `TyFunc` whose RETURN is `void` (the void-ness comes from the
+//     EXPECTED type object, never from the source's body or tail);
+//   • `srcTy` is a CONCRETE `TyFunc` (no holes — a generic value is decided by
+//     `genericFnAssignable`, not this) with a resolved NON-void return;
+//   • the param lists match pairwise under the same `fnSlotAssignable` rule the
+//     `assignable` TyFunc arm applies (rep-invariant — no numeric widening, no
+//     nullability drift);
+//   • `srcExpr` paren-peels to an Ident naming a registered MODULE-SCOPE
+//     `function` declaration that is NOT shadowed by any nearer binding
+//     (`lookupDepth == 0`) — the set `synthVoidTwins` can mint a capture-free
+//     void twin for. A shadowing local/param keeps the mismatch: its runtime
+//     value is not the declaration, so no twin could stand in for it.
+function fnValVoidCoerce(srcExpr: i32, srcTy: i32, dstTy: i32) {
+  if srcExpr < 0 || srcTy < 0 || dstTy < 0 { return false }
+  const d = T.tys[dstTy]
+  if !(d is TyFunc) { return false }
+  if !isVoidTy(d.fnRet) { return false }
+  const s = T.tys[srcTy]
+  if !(s is TyFunc) { return false }
+  if fnTyHasHole(srcTy) { return false }
+  // The source's return must be RESOLVED and non-void: a `-2` pending return is
+  // still being inferred, and a void source needs no coercion (plain assignable).
+  if s.fnRet < 0 { return false }
+  if isVoidTy(s.fnRet) { return false }
+  const sp = s.fnParamTypes
+  const dp = d.fnParamTypes
+  if sp.length != dp.length { return false }
+  let i = 0
+  while i < sp.length {
+    if !fnSlotAssignable(dp[i], sp[i]) { return false }
+    i = i + 1
+  }
+  // The expression form: a paren-peeled Ident naming an unshadowed module-scope
+  // `function` declaration.
+  let u = srcExpr
+  let done = false
+  while !done {
+    const pn = P.nodes[u]
+    if pn is Paren { u = pn.parInner } else { done = true }
+  }
+  const en = P.nodes[u]
+  if en is Ident {
+    if (fnDeclIx[en.identName] ?? -1) < 0 { return false }
+    if lookupDepth(en.identName) != 0 { return false }
+    if !inferQuiet { noteVoidCoerceVal(u, en.identName) }
+    return true
+  }
+  false
+}
+
 export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   // (A GENERIC function value meeting a CONCRETE function type is decided by instantiation inside
   // `assignable`'s `TyFunc` case — `genericFnAssignable` — so it governs nested positions like an
@@ -8119,6 +8228,20 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   // recurses through `assignableExpr` per field, which re-applies the brand rule to
   // every field value. A wrongly-branded variable inside a literal still rejects.
   if nomLitAdopts(srcExpr, srcTy, dstTy) { return true }
+  // FUNCTION-VALUE → VOID SLOT (DECISIONS: void contexts discard implicit tail
+  // values, clause 3). A `(P…) => T` VALUE is assignable where `(P…) => void` is
+  // expected — the wholesale coercion that keeps "extract the inline lambda to a
+  // named function" from breaking the call that worked. Keyed on the EXPECTED
+  // type's return being void (never on anything about the source's body), and
+  // granted only for a paren-peeled Ident naming an UNSHADOWED module-scope
+  // `function` declaration with a concrete signature — exactly the set the
+  // emitter can mint a VOID TWIN for (`synthVoidTwins`): the twin has the same
+  // params, a `: void` return, and a body that calls the original and discards,
+  // so the value called through the void slot carries a genuine `()`-result
+  // functype (a raw swap of nothing would `call_indirect`-trap on the result
+  // arity). Other function values — params, locals, fields, generic templates —
+  // keep today's mismatch: they have no name a capture-free twin can call.
+  if fnValVoidCoerce(srcExpr, srcTy, dstTy) { return true }
   // A `u8` STORAGE SLOT — an array element, the only position `u8` is legal in
   // (`TY_U8`) — accepts any `i32` VALUE, because that is what the storage is: one byte
   // written by `array.set`, which TRUNCATES to the low 8 bits, and read by
@@ -22789,7 +22912,32 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   // recorded by the pass-1 hoist under the same name; a NESTED one has no hoist
   // and is recorded here, which is also the point it becomes callable.
   if n.fnName != "" { declareFnDeclNode(n.fnName, fnIx) }
-  const inferring = n.fnRet < 0
+  let inferring = n.fnRet < 0
+  // VOID-CONTEXT LAMBDA ADOPTION (DECISIONS: void contexts discard implicit tail
+  // values). An un-annotated lambda LITERAL whose contextual expected RETURN is
+  // `void` (`g(() => { … tail })` against `cb: () => void`, an annotated binding /
+  // field / return position — every one routes through `seedExpected`) is checked
+  // as if it were annotated `: void`, NOT inferred: `n.fnRet` is -1, so the
+  // `!inferring` ladder below resolves `ret` to its `TY_VOID` default without ever
+  // reading an annotation node. That one flip buys the whole decided semantics from
+  // machinery that already exists:
+  //   • an explicit `return expr` in the body is checked under `curRet = void` and
+  //     fails as `return type mismatch: expected void, got …` ANCHORED AT the
+  //     return — the same arm, message and anchor the named `function f(): void
+  //     { return 7 }` spelling has always produced;
+  //   • a value-bearing TAIL is exempt from the trailing-expression mismatch (the
+  //     `!isVoidTy(ret)` gate below) — accepted, and DISCARDED by the emitter;
+  //   • the lambda's type is `(params) => void`, so the argument compare passes
+  //     with no assignability change for literals.
+  // The adoption is keyed on the CONTEXT's expected return being void — never on
+  // the tail's shape — and recorded for the emitter (`lambdaVoidAdoptedAt`), whose
+  // `synthRetAnnots` pins `fnRet` so the functype result really is `()`.
+  if inferring && n.fnName == "" {
+    if isVoidTy(cbExpectedRetFor(fnIx)) {
+      inferring = false
+      noteVoidCtxLambda(fnIx)
+    }
+  }
   // The infer-stack KEY: a named function uses its name (so self-recursion is detected); an
   // ANONYMOUS lambda has no name, so key it by NODE INDEX — else two nested anonymous lambdas
   // (`(a) => (b) => …`) both key on "" and the inner falsely trips the recursive-cycle guard
@@ -22919,17 +23067,21 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   let ret = -2
   if !inferring {
     ret = TY_VOID
-    const rtn = P.nodes[n.fnRet]
-    if rtn is TypeRef {
-      ret = resolveAnnotAt(rtn.tyName, n.fnTyParams, n.fnRet)
-      if ret < 0 {
-        tErr(unknownTyText(rtn.tyName), n.fnRet)
-        ret = TY_ERR
-      }
-      // Record the resolved return type on the RETURN-ANNOTATION node so the emitter can
-      // classify it structurally from the `Ty` arena rather than re-parsing `tyNameOf` — C1.
-      if !inferQuiet && ret >= 0 {
-        if n.fnRet < nodeTyIx.length { nodeTyIx[n.fnRet] = ret }
+    // A VOID-adopted lambda has NO annotation node (`n.fnRet` is -1) — the guard
+    // leaves `ret` at the `TY_VOID` default, which IS its adopted return.
+    if n.fnRet >= 0 {
+      const rtn = P.nodes[n.fnRet]
+      if rtn is TypeRef {
+        ret = resolveAnnotAt(rtn.tyName, n.fnTyParams, n.fnRet)
+        if ret < 0 {
+          tErr(unknownTyText(rtn.tyName), n.fnRet)
+          ret = TY_ERR
+        }
+        // Record the resolved return type on the RETURN-ANNOTATION node so the emitter can
+        // classify it structurally from the `Ty` arena rather than re-parsing `tyNameOf` — C1.
+        if !inferQuiet && ret >= 0 {
+          if n.fnRet < nodeTyIx.length { nodeTyIx[n.fnRet] = ret }
+        }
       }
     }
     // `f` is hoisted in the outer scope (checkProgram pre-pass), but re-declaring
@@ -28272,7 +28424,7 @@ export function inferRetTyIxAt(i: i32) {
   inferRetTyIx[i]
 }
 
-// The emitter reads this to classify an un-annotated binding (`const x = if c then v
+// The emitter reads this to classify an un-annotated binding (`const x = if c { v }
 // else null`) from its inferred value-union TYPE name (keyed by LetDecl node index),
 // rather than re-deriving it from the initializer expression. "" when the binding is
 // not an inferred value union. Iteration mirrors the inferred-return table so the
@@ -33025,7 +33177,7 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
   // un-annotated binding had no assignability check, and `assignableExpr(void, T)` is
   // lenient — so a void binding slipped past `vl check` and CRASHED codegen. Reject it
   // here with a clear, source-located message, poisoning `initTy` to suppress cascades.
-  // EXCEPT an if-EXPRESSION init (`const x = if c then 5`), the provisional-void form
+  // EXCEPT an if-EXPRESSION init (`const x = if c { 5 }`), the provisional-void form
   // `voidSlotExemptExpr` names: a statement-if is context-free `void`, but the if-binding
   // inference below resolves it to `T | null` (the else-less false path is the implicit
   // `null`) — that path owns it. The exemption lives in that one predicate, shared with
@@ -33114,7 +33266,7 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
     // Export an un-annotated IF-EXPRESSION binding's INFERRED value-union type (by
     // node index) for the emitter, so it lowers like an annotated nullable/value-union
     // binding even when an arm is one the emitter can't statically classify (an ident
-    // `if c then v else null`). Niches/non-unions render "" and are skipped — the
+    // `if c { v } else { null }`). Niches/non-unions render "" and are skipped — the
     // emitter's existing paths handle those. Mirrors the inferred-RETURN export.
     //
     // GATED to an if-expression init: the emitter's SOLE consumer is `nliInferIfLet`
@@ -33861,7 +34013,7 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
   const daThenDiverges = daBranchDiverges(n.ifThen)
   // `is`-GUARD ALTERNATIVES over an un-annotated-param HOLE. A then-narrow that
   // refines a HOLE binding is not an extra field demand — it is an ALTERNATIVE the
-  // body handles on its own branch (`if v is {foo: string} then return v.foo`). The
+  // body handles on its own branch (`if v is {foo: string} { return v.foo }`). The
   // narrowed binding shadows the hole for the whole then-branch, so those uses never
   // grow the demanded shape; without recording them the shape would carry the
   // COMPLEMENT path's fields alone and reject the argument the guard accepts.
@@ -33919,7 +34071,7 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
   if ifTail && n.ifElse >= 0 {
     if thenTy != TY_VOID && thenTy != TY_ERR {
       // The then-arm's implicit-return value is guarded exactly like an explicit
-      // `return` inside it (`if v is T then v.foo else v.bar`).
+      // `return` inside it (`if v is T { v.foo } else { v.bar }`).
       if guardedRet { guardAltStack.push(guardRows[guardRows.length - 1]) }
       noteInferredRet(thenTy)
       if guardedRet { guardAltStack.pop() }

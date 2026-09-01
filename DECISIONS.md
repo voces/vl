@@ -10,6 +10,31 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 
 ## Types & semantics
 
+- **VOID CONTEXTS DISCARD IMPLICIT TAIL VALUES; AN EXPLICIT `return expr` STAYS AN ERROR,
+  ANCHORED AT THE RETURN** (2026-08-31). VL is expression-oriented and effectively
+  semicolon-less at line ends — `fmt` normalizes semicolons away — so there is no Rust-style
+  statement/tail lever to silence a trailing value, and without discard every void callback
+  ending in a value-bearing call (`g(() => { xs.pop() })`-shaped code) failed with no
+  idiomatic fix. So a function literal checked against an expected `(…) => void`, and a
+  declared-void body, both accept a value-bearing tail and DROP it. `return expr` stays
+  strict because it states an intent the compiler should hold the author to, and its
+  diagnostic anchors at the return (`return type mismatch: expected void, got T`), never at
+  the call's closing token. The discard is keyed on the CONTEXT's return type being void —
+  never on the tail's shape — so a bare-tail callee with a non-void return keeps returning
+  its value (`tests/cases/functions/nonvoid-bare-tail-value-*.vl` pin the keying).
+- **FUNCTION VALUES COERCE WHOLESALE INTO VOID SLOTS, AND THE LITERAL/VALUE ASYMMETRY IS
+  CHOSEN** (2026-08-31). `(P…) => T` is assignable where `(P…) => void` is expected
+  (TS/Kotlin-adapted-reference precedent) — otherwise extracting an inline lambda to a named
+  function would break the call that worked. So a named `(): i32` function with explicit
+  returns coerces as a VALUE while the same body written INLINE errors on its explicit
+  return: deliberate, not accidental — the literal is being written against the void context
+  and the compiler holds its author to the stated intent; the value already exists for its
+  own callers and is merely being adapted. Wasm makes the adaptation real: a `>v` `$fnsig`
+  call signature-checks a 0-result functype, so the emitter mints a capture-free VOID TWIN
+  per coerced target (`synthVoidTwins`) rather than granting a rep-less variance. The grant
+  is scoped to what a twin can stand in for — a paren-peeled Ident naming an unshadowed
+  module-scope `function` with a concrete signature; params, locals, fields and generic
+  templates keep the mismatch (no name a capture-free twin could call).
 - **A SHAPE→ROW RESOLVER AND THE LITERAL→ROW MATCHER ARE ONE QUESTION, SO A WIDENING ONE
   SIDE ACCEPTS THE OTHER HAS TO NAME** (2026-08-31, silent-class-inventory D733 / D702's filed
   residue). `structIndexOfObjCtx` builds `{ r: 7 }` at a declared `type Circle = { r: i64 }` —
@@ -1819,6 +1844,30 @@ corpus vs 571 `else if`). A dedicated `elseif`/`elif` keyword only earns its kee
 block-terminator languages (Python/Lua/Ruby) where `else if` would force an extra `end`;
 VL's `{}` blocks make it redundant. One form means no parser ambiguity and no formatter
 surface-recovery for the chain keyword.
+
+## `then` removed — braces are the one branch spelling (owner, 2026-08-31)
+
+`if cond then stmt` / `if c then a else b` was never designed: it arrived as host-parity
+sugar in 654722e3 (June 2026, the "parser/lexer sugar tail"), the TS compiler it mirrored
+is retired, and the tree had ZERO organic uses — std/ and compiler/ never wrote it, and
+its only producer was `vl fmt` itself, which canonicalized simple if-EXPRESSIONS into the
+`then` spelling. Braces already covered both of its positions (`if c { s }` statements and
+`print(if c { 7 } else { 8 })` expressions, both verified running before the removal), so
+the keyword was a second spelling of a form the grammar already had — the same shape as
+`elseif` above, plus a soft-keyword ambiguity (`then` doubled as an ordinary identifier)
+the parser and every editor surface had to carry.
+
+Removed in one go, ordered so no intermediate tree is broken: (1) fmt flips to braced
+rendering while the parser still accepts `then` — which also fixed a standing formatter
+bug (a `then`-spelled `else if` chain made fmt emit an empty `else ` clause and refuse its
+own output); (2) the tree migrates mechanically on the new fmt (45 fixture files, 2 TS
+tests; the distilled corpus and the filed Repro blocks held zero `then` programs); (3) the
+parser arm drops. Old code is not stranded on a generic "expected `{`": an `if` condition
+followed by the identifier `then` refuses with `` `then` was removed — wrap the branch in
+braces: `if cond { … }` `` and recovery-parses the old shape so every occurrence in a file
+reports. `then` remains a perfectly good identifier (the lexer soft-keyword
+fixtures now double as that regression's coverage), and the contextual soft-keyword set is
+five: `as` `from` `in` `step` `to`.
 
 ## Which channel owns a NARROWED argument's type at a monomorphization pin
 

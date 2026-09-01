@@ -1054,7 +1054,8 @@ export const memberCompletionsFromWasm = (
 //   function if else while for const let return is await break continue
 //   import export type true false null
 // Soft keywords (recognized by text in parser.ts via `atSoft`):
-//   as from in step to then
+//   as from in step to
+// (`then` was removed from the language on 2026-08-31 — see DECISIONS.md.)
 const VL_HARD_KEYWORDS: readonly string[] = [
   "function",
   "if",
@@ -1082,12 +1083,11 @@ const VL_SOFT_KEYWORDS: readonly string[] = [
   "in",
   "step",
   "to",
-  "then",
 ];
 
 /**
  * Keyword completions for VL: all hard keywords (reserved by the lexer) plus
- * the contextual soft keywords (`as`, `from`, `in`, `step`, `to`, `then`).
+ * the contextual soft keywords (`as`, `from`, `in`, `step`, `to`).
  * Each item carries `kind: "keyword"` so `server.ts` maps it to
  * `CompletionItemKind.Keyword`. These are returned as plain text items (no
  * `insertText`); clients filter the list against the typed prefix, so the full
@@ -1330,4 +1330,134 @@ export const stdAutoImportCompletions = (
     }
   }
   return out;
+};
+
+// ---- organize imports (source.organizeImports) -------------------------------
+//
+// The per-statement rewrite behind the `source.organizeImports` code action.
+// Semantics follow `vl fmt`'s canon, NOT TS's statement-reordering: fmt SORTS a
+// statement's specifiers alphabetically and PRESERVES the order of the
+// statements themselves, so organize does too — each import statement is
+// rewritten in place (never merged with or moved past another), spelled by the
+// real formatter when one is supplied so the result is exactly what fmt keeps.
+//
+// The design invariant is IDEMPOTENCE: a statement whose canonical spelling it
+// already has, with no unused specifiers, yields NO edit — so on a clean file
+// organize produces no edits at all, and `editor.codeActionsOnSave` is
+// byte-stable (the server returns no action rather than an empty one).
+
+/** Convert a 0-based LSP position to a char offset in `source` (clamped). */
+const posToOffset = (
+  source: string,
+  pos: { line: number; character: number },
+): number => {
+  let offset = 0;
+  for (let line = 0; line < pos.line; line++) {
+    const nl = source.indexOf("\n", offset);
+    if (nl < 0) return source.length;
+    offset = nl + 1;
+  }
+  return Math.min(offset + pos.character, source.length);
+};
+
+/**
+ * The edits that organize the imports of `source`:
+ *
+ *   - a specifier covered by an `unusedRanges` entry (the `unused-import` lint
+ *     diagnostics' ranges — each starts inside exactly one specifier, whether
+ *     it flags a plain name or an `x as y` alias) is dropped whole;
+ *   - a statement with NO surviving specifier is deleted line-wise, trailing
+ *     newline included, so no blank residue remains (`removeImportFix`'s
+ *     deletion behaviour);
+ *   - a statement whose surviving specifiers spell differently from the
+ *     canonical form — unused dropped, specifiers fmt-sorted, whitespace
+ *     normalised, a multi-line statement collapsed — is REPLACED by that form,
+ *     spelled by `formatImport` (the seed's `formatSrc`) or an alphabetical
+ *     hand-sort fallback;
+ *   - a statement already canonical with nothing unused yields no edit.
+ *
+ * One edit per statement, computed against `source`, so the edits are disjoint
+ * by construction and applicable as a single `WorkspaceEdit`. An empty result
+ * means the file is already organized (the caller offers no action).
+ */
+export const organizeImportEdits = (
+  source: string,
+  unusedRanges: LspRange[],
+  formatImport?: (stmt: string) => string | undefined,
+): CompletionEdit[] => {
+  const unusedOffsets = unusedRanges.map((r) => posToOffset(source, r.start));
+  const edits: CompletionEdit[] = [];
+  // Statement-spanning scan (`[^}]*` crosses newlines, keeping a multi-line
+  // import whole) — the same shape `importInsertionEdit` walks. A bare
+  // side-effect import (`import "…"`) has no specifiers and is never touched.
+  const stmtRe = /import\s*\{([^}]*)\}\s*from\s*"([^"]*)"/g;
+  for (let m = stmtRe.exec(source); m !== null; m = stmtRe.exec(source)) {
+    const stmtStart = m.index;
+    const stmtEnd = m.index + m[0].length;
+    const list = m[1];
+    const listStart = stmtStart + m[0].indexOf("{") + 1;
+
+    // Comma-split the specifier list into content spans (absolute offsets) —
+    // specifiers are flat (`name` / `name as local`), so a comma split is
+    // exact. An all-whitespace segment (trailing comma) yields no specifier.
+    const specs: { start: number; end: number; text: string }[] = [];
+    const pushSeg = (from: number, to: number): void => {
+      let s = from;
+      let e = to;
+      while (s < e && /\s/.test(list[s])) s++;
+      while (e > s && /\s/.test(list[e - 1])) e--;
+      if (e > s) {
+        specs.push({
+          start: listStart + s,
+          end: listStart + e,
+          text: list.slice(s, e).replace(/\s+/g, " "),
+        });
+      }
+    };
+    let segStart = 0;
+    for (let i = 0; i < list.length; i++) {
+      if (list[i] === ",") {
+        pushSeg(segStart, i);
+        segStart = i + 1;
+      }
+    }
+    pushSeg(segStart, list.length);
+    if (specs.length === 0) continue; // `import {} from "…"` — nothing to organize
+
+    // A diagnostic's start sits inside exactly one specifier's content span
+    // (the lint points at the specifier — its source name or alias local).
+    const surviving = specs.filter(
+      (sp) => !unusedOffsets.some((o) => o >= sp.start && o <= sp.end),
+    );
+
+    if (surviving.length === 0) {
+      // Nothing left to import: delete the statement's whole line span,
+      // trailing newline included (to column 0 of the next line, or to the end
+      // of the last line when the file ends on the statement).
+      const startLine = offsetToPos(source, stmtStart).line;
+      const afterNl = source.indexOf("\n", stmtEnd);
+      const end = afterNl >= 0
+        ? { line: offsetToPos(source, afterNl).line + 1, character: 0 }
+        : offsetToPos(source, source.length);
+      edits.push({
+        range: { start: { line: startLine, character: 0 }, end },
+        newText: "",
+      });
+      continue;
+    }
+
+    const names = surviving.map((sp) => sp.text);
+    const stmt = `import { ${names.join(", ")} } from "${m[2]}"`;
+    const canonical = (formatImport?.(stmt + "\n") ??
+      `import { ${[...names].sort().join(", ")} } from "${m[2]}"`).trimEnd();
+    if (canonical === m[0]) continue; // already canonical, nothing unused
+    edits.push({
+      range: {
+        start: offsetToPos(source, stmtStart),
+        end: offsetToPos(source, stmtEnd),
+      },
+      newText: canonical,
+    });
+  }
+  return edits;
 };

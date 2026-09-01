@@ -200,6 +200,35 @@ export const removeImportFix = (
 };
 
 /**
+ * Quick-fix for an `unused-pure-expression` diagnostic: remove the no-effect
+ * expression statement's whole physical line. Same single-line model as
+ * `removeBindingFix` (an idiomatic VL expression statement is one line); the
+ * diagnostic is anchored on the expression's line, so deleting that line —
+ * including its trailing newline — removes the statement. Returns `null` when
+ * the line is out of range. Like the other deleting fixes it is NOT
+ * `isPreferred`: Auto Fix never silently removes code.
+ */
+export const removeExpressionFix = (
+  source: string,
+  range: LspRange,
+): QuickFix | null => {
+  const lines = splitLines(source);
+  const line = range.start.line;
+  if (line < 0 || line >= lines.length) return null;
+  const end: LspPosition = line + 1 < lines.length
+    ? { line: line + 1, character: 0 }
+    : { line, character: lines[line].length };
+  return {
+    title: "Remove this expression",
+    kind: "quickfix",
+    edits: [{
+      range: { start: { line, character: 0 }, end },
+      newText: "",
+    }],
+  };
+};
+
+/**
  * Quick-fix for a `prefer-const` diagnostic: a never-reassigned `let` should be
  * `const`. We find the `let` keyword on the diagnostic's line and replace it with
  * `const`. This works regardless of whether the diagnostic range points at the
@@ -325,6 +354,12 @@ export const quickFixesForDiagnostic = (
     case "prefer-const": {
       const fix = letToConstFix(source, range);
       return fix ? [fix] : [];
+    }
+    case "unused-pure-expression": {
+      // The statement does nothing, so removal is the whole fix — but it deletes
+      // code, so it is offered non-preferred (like the other deleting fixes).
+      const remove = removeExpressionFix(source, range);
+      return remove ? [remove] : [];
     }
     default:
       return [];

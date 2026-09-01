@@ -142,6 +142,7 @@ import {
   hasNewline,
   indentStr,
   isBlankLine,
+  isBlockNode,
   isBracedBlock,
   isCloseBraceLine,
   isLeafStmt,
@@ -1197,7 +1198,7 @@ function emitBlockBody(blockIx: i32, indent: i32) {
   0
 }
 
-// Emit a synthesized one-statement body (a bare `then`/loop body) at `indent`.
+// Emit a synthesized one-statement body (a bare loop/fn body) at `indent`.
 function emitBareBody(blockIx: i32, indent: i32) {
   const n = P.nodes[blockIx]
   if n is Block {
@@ -1250,49 +1251,26 @@ function emitLoopBody(head: string, body: i32, indent: i32, headerLine: i32) {
 }
 
 function emitIf(ix: i32, node: IfStmt, indent: i32) {
-  // An `if … else if … [else]` chain whose every branch is a brace block renders
-  // as a clause sequence (one line if it fits, else one clause per line).
+  // An `if … else if … [else]` chain renders as a clause sequence (one clause
+  // per line, or the block layout).
   const didChain = emitIfChain(ix, node, indent)
   if didChain { return 0 }
-  const thenIsBlock = isBracedBlock(node.ifThen)
-  const elsePresent = node.ifElse >= 0
-  let elseBlock = false
-  if elsePresent { elseBlock = isBracedBlock(node.ifElse) }
-  const allBlocks = thenIsBlock && (!elsePresent || elseBlock)
-  if allBlocks {
-    const oneLine = collapseSingleIf(ix, node, indent)
-    if oneLine.length > 0 {
-      emitLine(indent, oneLine)
-      return 0
-    }
-    emitCondHead(indent, "if ", node.ifCond, " {")
-    emitBlockBody(node.ifThen, indent)
-    if elsePresent {
-      emitLine(indent, "} else {")
-      emitBlockBody(node.ifElse, indent)
-    }
-    closingBrace(indent, stopLineOf(ix))
+  // Every branch renders BRACED — a branch parsed from the bare single-statement
+  // sugar (a synthesized one-statement Block, `pos < 0`) folds to the same
+  // one-line `if cond { stmt }` a braced source does. There is no `then`
+  // spelling: the keyword was removed (see DECISIONS.md, 2026-08-31).
+  const oneLine = collapseSingleIf(ix, node, indent)
+  if oneLine.length > 0 {
+    emitLine(indent, oneLine)
     return 0
   }
-  // Inline (`then` / `else <stmt>`) form: a non-block branch prints inline.
-  if thenIsBlock {
-    emitCondHead(indent, "if ", node.ifCond, " {")
-    emitBlockBody(node.ifThen, indent)
-    closingBrace(indent, stopLineOf(node.ifThen))
-  } else {
-    const cond2 = expr(node.ifCond, indent, 0)
-    const body = bareBodyInline(node.ifThen, indent)
-    emitLine(indent, "if " + cond2 + " then " + body)
+  emitCondHead(indent, "if ", node.ifCond, " {")
+  emitBlockBody(node.ifThen, indent)
+  if node.ifElse >= 0 {
+    emitLine(indent, "} else {")
+    emitBlockBody(node.ifElse, indent)
   }
-  if elsePresent {
-    if elseBlock {
-      emitLine(indent, "else {")
-      emitBlockBody(node.ifElse, indent)
-      closingBrace(indent, stopLineOf(node.ifElse))
-    } else {
-      emitLine(indent, "else " + bareBodyInline(node.ifElse, indent))
-    }
-  }
+  closingBrace(indent, stopLineOf(ix))
   0
 }
 
@@ -1404,13 +1382,15 @@ function emitIfChain(ix: i32, node: IfStmt, indent: i32) {
       walking = false
     }
   }
+  // A clause body is a Block whether the source braced it or the bare
+  // single-statement sugar synthesized it (`pos < 0`) — both render braced.
   let i = 0
   while i < bodyIxs.length {
-    if !isBracedBlock(bodyIxs[i]) { return false }
+    if !isBlockNode(bodyIxs[i]) { return false }
     i = i + 1
   }
   if hasElse {
-    if !isBracedBlock(elseBodyIx) { return false }
+    if !isBlockNode(elseBodyIx) { return false }
   }
   // Per-clause inline layout: when no comment falls inside the chain and EVERY
   // clause body is a single simple statement whose `if c { x }` line fits, render
@@ -2228,23 +2208,24 @@ function arrowHeader(node: FuncDecl, reserved: i32) {
 }
 
 function ifExpr(ix: i32, node: IfStmt, indent: i32) {
-  // An `if` as an expression value: single-line `if c then a else b` when every
-  // branch is a simple expression AND no comment lives inside the expression (a
-  // comment cannot ride the inline `then`/`else` form — keep it anchored by
-  // falling through to the verbatim slice); else fall back to the source slice.
+  // An `if` as an expression value: single-line braced-inline
+  // `if c { a } else { b }` when every branch is a simple expression AND no
+  // comment lives inside the expression (a comment cannot ride the inline form —
+  // keep it anchored by falling through to the verbatim slice); else fall back
+  // to the source slice.
   const hasCmt = commentInCharSpan(nodePos(ix), nodeEndOf(ix))
   let elseOk = node.ifElse < 0
   if !elseOk { elseOk = branchIsSimple(node.ifElse) || elseIsIf(node.ifElse) }
   if !hasCmt && branchIsSimple(node.ifThen) && elseOk {
     const cond = expr(node.ifCond, indent, 0)
     const thenE = bareBodyInline(node.ifThen, indent)
-    let parts = "if " + cond + " then " + thenE
+    let parts = "if " + cond + " { " + thenE + " }"
     if node.ifElse >= 0 {
       const e = P.nodes[node.ifElse]
       if e is IfStmt {
         parts = parts + " " + elseIfExpr(node.ifElse, indent)
       } else {
-        parts = parts + " else " + bareBodyInline(node.ifElse, indent)
+        parts = parts + " else { " + bareBodyInline(node.ifElse, indent) + " }"
       }
     }
     return parts
@@ -2258,13 +2239,13 @@ function elseIfExpr(ix: i32, indent: i32) {
   if n is IfStmt {
     const cond = expr(n.ifCond, indent, 0)
     const thenE = bareBodyInline(n.ifThen, indent)
-    let parts = "else if " + cond + " then " + thenE
+    let parts = "else if " + cond + " { " + thenE + " }"
     if n.ifElse >= 0 {
       const e = P.nodes[n.ifElse]
       if e is IfStmt {
         parts = parts + " " + elseIfExpr(n.ifElse, indent)
       } else {
-        parts = parts + " else " + bareBodyInline(n.ifElse, indent)
+        parts = parts + " else { " + bareBodyInline(n.ifElse, indent) + " }"
       }
     }
     return parts

@@ -304,7 +304,7 @@ Deno.test({
   // the SAME disjunction the call-arg diagnostic names — the hole itself renders as
   // an uninformative `_`.
   const guarded = "function foobar(v) {\n" +
-    "  if v is { foo: string } then return v.foo\n" +
+    "  if v is { foo: string } { return v.foo }\n" +
     "  return v.bar\n" +
     "}\n" +
     'print(foobar({ foo: "foo" }))\n';
@@ -519,6 +519,25 @@ Deno.test({ name: "wasm-checker: lint surfaces a rule with code, non-error sever
   if (pc.range.start.line !== 0) throw new Error(`expected line 0, got ${pc.range.start.line}`);
   if (pc.range.end.character <= pc.range.start.character) {
     throw new Error(`expected a non-empty range, got ${JSON.stringify(pc.range)}`);
+  }
+});
+
+Deno.test({ name: "wasm-checker: lint surfaces unused-pure-expression, tagged unnecessary, final statement exempt", ignore }, () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // The motivating shape: a stray pure literal ahead of the real work fires; the
+  // block-tail `0` (the function's value) and the call statement do not.
+  const src = "function f() {\n  3\n  print(1)\n  0\n}\nf()\n";
+  const diags = checker.lint(src);
+  const hits = diags.filter((d) => d.code === "unused-pure-expression");
+  if (hits.length !== 1) {
+    throw new Error(`expected exactly one unused-pure-expression, got: ${JSON.stringify(diags)}`);
+  }
+  const d = hits[0];
+  if (d.severity !== "warning") throw new Error(`expected warning, got ${d.severity}`);
+  if (d.range.start.line !== 1) throw new Error(`expected line 1 (the \`3\`), got ${d.range.start.line}`);
+  // The span is dead code — editors grey it via the `unnecessary` tag.
+  if (!d.tags || !d.tags.includes("unnecessary")) {
+    throw new Error(`expected the unnecessary tag, got ${JSON.stringify(d.tags)}`);
   }
 });
 

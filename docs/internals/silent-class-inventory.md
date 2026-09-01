@@ -26849,3 +26849,48 @@ Repro (now runs, printing `7` — `wasm trap: cast failure` on master):
   every un-narrowed code-16 read there holds one atom. Over the probe battery: **6 / 3**.
 
 Fixture: `tests/cases/types/coalesce-merged-row-tag-dispatch.vl`.
+
+
+### D945 — a CONSUMED void-typed closure VALUE is invalid wasm in its two ref containers, and the void-tail acceptance routes two more spellings onto it
+
+**check-clean invalid wasm · PRE-EXISTING (byte-identical failure on the pre-void-coercion seed — the coercion landing changed which SPELLINGS reach it, not the defect) · 2 hand-witnessed spellings moved loud→silent by that landing (the price, recorded here per the refused-candidate rule) · 0 corpus cells (no void-callback axis exists; the derived corpus cannot see this family)**
+
+Repro (check rc 0; `Error: failed to compile: wasm[0]::function[6]` at instantiation):
+
+    function mk(): () => void {
+      return () => {
+        print(35)
+      }
+    }
+    const m = mk()
+    m()
+    print(36)
+
+* **The family is CONSUMPTION of a void closure value, not its creation.** Three containers,
+  measured: RETURN position (above); a `(() => void)[]` ELEMENT bound then called
+  (`const arr: (() => void)[] = [hv]; const c0 = arr[0]; c0()` — invalid wasm at
+  `function[7]`); and the indexed-call STATEMENT `arr[0]()`, which is a pre-existing LOUD
+  emit refusal — the one honest exit the family has. A void closure value that is only
+  built and passed as an argument works (the void-coercion landing's own fixtures pin it).
+* **THE PRICE THE VOID-COERCION LANDING PAID, recorded here so nobody pays it twice
+  unknowingly:** two spellings that were loud type errors before the coercion now
+  check-clean onto this family's invalid wasm — a value-tail lambda in return position
+  (`return () => { print(35)\n 9.5 }`) and a `(() => void)[]` literal holding a coerced
+  named `(): i32` function beside a value-tail lambda. Both are the GENUINELY-void
+  spellings' neighbors; the genuinely-void spellings were already silent here, which is
+  what proves the root predates the coercion (A/B'd on the pre-coercion seed).
+* The fix owes the consumption sites (return-slot and element reads of a void-sig
+  closure) the same functype treatment the coercion's `synthVoidTwins` gave argument
+  passing — the twin exists, these reads don't route through it.
+
+### D946 — [CLOSED 2026-08-31] a `: void` RETURN ANNOTATION was invisible to the emitter — an effect-only body TRAPPED and a ref tail was invalid wasm
+
+**closed as `runs` · was: runtime trap (`unreachable` padding) for an effect-only `: void` body, check-clean invalid wasm for a ref-valued tail · closed INSIDE the void-coercion landing as its prerequisite (`retVoidAnnFlag` → `fRetVoid`: nothing had ever mapped the annotation to the emitter's void flag, so `: void`-annotated named functions were unusable since the annotation existed)**
+
+Repro (now runs, printing `3` — the ref-tail spelling was check-clean invalid wasm, and the effect-only sibling `function h(): void { print(9) }` printed then trapped):
+
+    function f(): void { "hello" }
+    function g2(): void { [1, 2] }
+    f()
+    g2()
+    print(3)
