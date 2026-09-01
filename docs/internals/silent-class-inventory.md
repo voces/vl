@@ -23802,9 +23802,26 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   that reports gaps a program actually reaches. When the two disagree, the probe is right.
   Do not read `--sites` reaching zero as clause 2 being met.
 
-* **WHAT WOULD ACTUALLY CLOSE THIS ROW'S OWN GAP** is the un-annotated parameter's union return
-  reaching the same rep the annotated spelling already uses — the inference-path shape D937,
-  D956 and D957 all have, one more type over.
+* **WHAT WOULD ACTUALLY CLOSE THIS ROW'S OWN GAP, narrowed to one site by four measurements.**
+  It is NOT the inference-path shape D937/D956/D957 have, which was the first guess.
+
+  1. **The signature is already right and the RETURNS are not.** Disassembled, `pick` comes out
+     `(result (ref $box))` while its `return`s push a bare `i32.const 1` and a raw string ref.
+     `emitOneFuncType` reads `fRetKind` and gets `union`; the return side reads
+     `inferRetNameOf(fn.fnName)` and gets "" — a mono CLONE carries a minted name the checker
+     never saw.
+  2. **Adding `buildFnMap`'s node-keyed fallback (`inferRetRowByNode`) to the return side does
+     NOT fix it.** Built and reverted.
+  3. **Nor does forcing `retUNm` outright.** Also built and reverted — so `retUNm` is not the
+     lever, which rules out the whole return-boxing theory.
+  4. **The failure is at the READ, and a bystander proves it.** Put an unrelated
+     `function other(b: boolean): i32 | string` in the same module and the error CHANGES, from
+     `narrowed union atom has no value box` to a plain type mismatch. The bystander mints the
+     value boxes; without it they do not exist.
+
+  So the missing site is the COLLECTOR: a mono clone's inferred union return never mints the
+  atom value boxes, and every later stage is reading a box that was never interned. Same
+  clone-invisible-to-a-name-table root as (1), one pass earlier.
 
 ---
 
