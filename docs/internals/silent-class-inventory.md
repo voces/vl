@@ -22810,9 +22810,9 @@ Repro (now RUNS, printing `7`, `7`, `3`):
 
 ---
 
-### D936 — the fn-value decline is NOT NEUTRAL: no box is minted and the default then resolves by FIELD NAME onto the narrow row
+### D936 — [CLOSED 2026-09-01 by D939 + D948] the fn-value decline is NOT NEUTRAL: no box is minted and the default then resolves by FIELD NAME onto the narrow row
 
-**check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` · 1 cell still OPEN (`distilled/named/d925_fn_value_two_targets`); the row was filed with TWO, and D939 took the callback-parameter one · was not a regression when filed · TWO candidate fixes were built and MEASURED and are REVERTED, and the third — the one that worked — is D939**
+**closed as `runs` — BOTH cells: D939 took the callback-parameter one, D948 the two-target one · was check-clean invalid wasm, `type mismatch: expected i32, found (ref $type)` · was not a regression when filed · TWO candidate fixes were built and MEASURED and are REVERTED, and this row is why the third and fourth were aimed where they were**
 
 D925 recorded these two as "THE BOUNDS" without a mechanism. This is the mechanism, and it is
 not the one the bound implies.
@@ -23087,6 +23087,58 @@ Repro (check rc 0; the module validates and the program TRAPS):
     rd()
     // vl check rc 0 (with a hint recommending exactly this deletion);
     // vl run -> wasm trap: indirect call type mismatch. SHOULD PRINT 1 then 7.
+
+---
+### D948 — [CLOSED 2026-09-01] a binding that may hold TWO known functions is still an attributable call site, and moving one return row moves the whole set
+
+**closed as `runs` · was check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` · 1 cell (`distilled/named/d925_fn_value_two_targets`), the second and last of D936's two · distilled corpus: `runs -> not-runs` ZERO, `-> silent` ZERO, 2 classes forward (this and D939's, graded together) · fixture `tests/cases/types/coalesce-callee-two-fn-value-targets.vl`**
+
+D939 closed the callback-PARAMETER spelling by resolving a single target. This is the other
+half of D936, and it needed a different shape of answer.
+
+* **THE READER WANTED A NAME; THE QUESTION IS MEMBERSHIP.** `anonLeafFnValueTarget` answers
+  only for a binding written with ONE function name, because every caller was spelling
+  `anonLeafCalleeFnName(...) == fname`. The question they actually need is weaker — is the set
+  of functions this call can reach fully KNOWN — and a set of two known functions is as
+  attributable as a set of one. `anonLeafFnValueNames` asks that; `anonLeafCallMayTarget` is
+  the membership form, and the three argument readers now use it.
+
+* **AND THE RETURN ROWS ARE COUPLED, which is the half that is not a reader at all.** One
+  binding holds one wasm signature. Moving `src`'s return row while `other`'s stays narrow
+  leaves `let f = src; f = other` unable to hold both — invalid wasm, and precisely the cell.
+  `anonLeafCoMoveFnRets` moves the siblings.
+
+* **THE RECURSION IS BOUNDED BY THE MARK IT SETS, not by a second visited set.** The co-move
+  calls back into `anonLeafMarkRetMoved` for each sibling, which co-moves again; the guard is
+  that the second visit finds the row already marked and stops. Stated because this file has
+  twice paid for an unguarded resolver (D934, D939) and the third one is bounded by a
+  structure that was already there — measured: self-compile 10.1s, unchanged.
+
+* **`other` IS LOAD-BEARING in the witness.** Delete the reassignment and the binding has one
+  target, which is D925's case and already worked. The PAIR is what makes the set bigger than
+  one, so a single-target fixture would grade this change as a no-op.
+
+* **A NUMBERING NOTE, since it cost a rename.** This shipped under `D941` in its first draft
+  and collided with a row filed in parallel on another branch. Reserved ranges are the standing
+  discipline; a fetch immediately before filing is the cheap check that catches the rest.
+
+Repro (now RUNS, printing `7`):
+
+    function src(p: {r: i32}): {r: i32} | null {
+      p
+    }
+    function other(p: {r: i32}): {r: i32} | null {
+      p
+    }
+    function rd(n: i32) {
+      let f = src
+      if n > 0 { f = other }
+      const h = f({ r: 9 })
+      const g1 = src({ r: 7 }) ?? { r: "s" }
+      print(g1.r)
+    }
+    rd(0)
+    // vl check rc 0; runs, prints 7.
 
 ---
 
