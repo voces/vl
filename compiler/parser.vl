@@ -66,6 +66,7 @@ import {
   TS_LITNUM,
   TS_LITSTR,
   TS_MAP,
+  TS_METHOD,
   TS_NAME,
   TS_NEG,
   TS_NULL,
@@ -73,7 +74,9 @@ import {
   TS_PAREN,
   TS_UNION,
   setAnnTs,
+  setDeclBound,
   setDeclGp,
+  setFnTpBound,
   setUdTs,
   tsKind,
   tsLeaf,
@@ -551,6 +554,46 @@ function parseTypeIsect() {
   name
 }
 
+// A METHOD MEMBER's tail, shared by the two grammars that read a `{ … }` member
+// list: `parseTypeAtom`'s inline object arm and `parseTypeDecl`'s declaration
+// body. The caller has already consumed the member NAME and holds the spelling
+// mark it was taken before; this consumes `( argument types ) : result`.
+//
+// The parameters listed are the CALL's arguments and the receiver is implicit —
+// there is no `self` (ruled 2026-09-01; `docs/constraints-design.md` OQ-1). That
+// is not a shorthand for a UFCS signature: a zero-ary closure FIELD satisfies
+// `{ f(): string }` and takes no receiver at all, so writing the receiver into
+// the bound would describe only one of the two witnesses.
+//
+// Renders to the synthetic name segment `f(A,B):R` and leaves ONE `TS_METHOD`
+// root on the spelling stack — kids = the argument types, then the RESULT last,
+// which is `TS_FUNC`'s layout and what `ast.tsToName` writes back.
+function parseMethodMemberTail(fname: string, fm: i32) {
+  advance() // "("
+  let inner = ""
+  if peekKind() != "RPAREN" {
+    inner = parseTypeName()
+    let pmore = peekKind() == "COMMA"
+    while pmore {
+      advance() // ","
+      if peekKind() == "RPAREN" {
+        pmore = false // tolerated trailing comma, as the function-type arm allows
+      } else {
+        inner = inner + "," + parseTypeName()
+        pmore = peekKind() == "COMMA"
+      }
+    }
+  }
+  expectClose("RPAREN")
+  expect("COLON")
+  // The result extends as far RIGHT as it can, exactly as a function type's does
+  // (`(i32) => i32 | null`): `{ find(): Circle | null }` is a method returning a
+  // nullable, not a nullable method.
+  const retName = parseTypeName()
+  tsMk(TS_METHOD, fname, fm)
+  fname + "(" + inner + "):" + retName
+}
+
 // One type "atom": a map `{[K]:V}`, the `null` type, a LITERAL type (`"a"`,
 // `0`, `1.5` — host `StringLiteral`/`IntegerLiteral`/`RealLiteral`), a
 // parenthesized group `(A | B)`, a prefix negation `!A` (A4), or a bare name —
@@ -656,6 +699,13 @@ function parseTypeAtom() {
       // An INLINE OBJECT type `{ x: i32, y: string }` (an anonymous structural
       // annotation, e.g. a `{ x: i32 } | null` return). Encoded as the synthetic
       // name `"{x:i32,y:string}"`; the checker splits it back into a TyObj.
+      //
+      // A member may also be a METHOD (`{ toString(): string }`, constraints phase
+      // 1) — the same production, discriminated by the `(` where a `:` would be.
+      // The spelling is FREE: before this both `{f(): string}` and `{f(self):
+      // string}` were parse errors at the `(` in every type position (measured
+      // 2026-09-01). Only a BOUND can consume one; `typecheck.nameToTyReal` refuses
+      // a method member in value position with a sentence.
       name = "{"
       let first = true
       let fgoing = peekKind() != "RBRACE"
@@ -667,8 +717,21 @@ function parseTypeAtom() {
         } else {
           expect("IDENT")
         }
+        let ftyName = ""
+        if peekKind() == "LPAREN" {
+          if !first { name = name + "," }
+          name = name + parseMethodMemberTail(fname, fm)
+          first = false
+          if peekKind() == "COMMA" {
+            advance()
+            fgoing = peekKind() != "RBRACE"
+          } else {
+            fgoing = false
+          }
+          continue
+        }
         expect("COLON")
-        const ftyName = parseTypeName()
+        ftyName = parseTypeName()
         tsMk(TS_FIELD, fname, fm)
         if !first { name = name + "," }
         name = name + fname + ":" + ftyName
@@ -1637,12 +1700,44 @@ function parseTypeDecl(flatAt: i32) {
   // declaration adds no spelling node here.
   const fNames: string[] = []
   const fRoots: i32[] = []
+  // EVERY member in source order — the BOUND body, assembled into a spelling tree
+  // below and ONLY when a method member was actually seen, so an ordinary `type X =
+  // { … }` pays three pushes per field and mints no node. A separate column from
+  // `fRoots`, which is the FIELD list (1:1 with `fNames`, for the `& … | …`
+  // re-encode); a method member contributes no field.
+  const mNames: string[] = []
+  const mRoots: i32[] = []
+  const mIsMethod: boolean[] = []
+  let sawMethod = false
   skipNewlines() // a multiline `{` puts the first field on the next line
   let going = peekKind() != "RBRACE"
   while going {
-    const fp0 = peekTok().start  // the field's name token
+    const fp0 = peekTok().start // the field's name token
     let fname = ""
     if peekKind() == "IDENT" { fname = advance().text } else { expect("IDENT") }
+    // A METHOD member (`toString(): string`) — constraints phase 1, the same
+    // production `parseTypeAtom`'s inline object arm reads, so the two spellings
+    // of one bound cannot drift. It declares a CALL, not a field, so it pushes no
+    // `FieldDef`: the declaration is minted with the fields it has (usually none)
+    // and the whole body travels as the bound annotation assembled below.
+    if peekKind() == "LPAREN" {
+      const mm = tsMark()
+      if synth != "" { synth = synth + "," }
+      synth = synth + parseMethodMemberTail(fname, mm)
+      mNames.push(fname)
+      mRoots.push(tsPop())
+      mIsMethod.push(true)
+      sawMethod = true
+      skipNewlines()
+      if peekKind() == "COMMA" {
+        advance()
+        skipNewlines()
+        going = peekKind() != "RBRACE"
+      } else {
+        going = false
+      }
+      continue
+    }
     expect("COLON")
     const typ0 = peekTok().start // the field type's leading token
     const ftyName = parseTypeName()
@@ -1652,6 +1747,9 @@ function parseTypeDecl(flatAt: i32) {
     fields.push(mkFieldDef(fname, ftyIx, fp0))
     fNames.push(fname)
     fRoots.push(froot)
+    mNames.push(fname)
+    mRoots.push(froot)
+    mIsMethod.push(false)
     if synth != "" { synth = synth + "," }
     synth = synth + fname + ":" + ftyName
     skipNewlines()               // a field may be followed by a NEWLINE before the `,`/`}`
@@ -1664,6 +1762,54 @@ function parseTypeDecl(flatAt: i32) {
     }
   }
   expectClose("RBRACE")
+  // A BOUND ALIAS — `type Showable = { toString(): string }` (constraints phase 1).
+  // A body with a method member declares a CALL CONTRACT, not a layout, so it exits
+  // here rather than continuing into the struct/`&`/`|` machinery below: none of
+  // those compose with it (`Showable & {n: i32}` would have to mean intersecting a
+  // contract with a shape, which phase 1 does not define), and a `[]` suffix would
+  // be an array of a thing that has no values.
+  //
+  // What is minted is an EMPTY-field `TypeDecl` — the exact shape `type E = {}` has
+  // today, so nothing downstream meets a construct it has not already seen — plus
+  // the whole body as ONE object annotation on the `declBound*` side table. `<T:
+  // Showable>` and `<T: { toString(): string }>` therefore reach the identical
+  // spelling tree, and `typecheck` has one decoder rather than two.
+  if sawMethod {
+    if (
+      atTypeCont("LBRACK") ||
+      peekKind() == "AMPERSAND" ||
+      peekKind() == "PIPE"
+    ) {
+      P.diags.push(
+        {
+          msg: "a bound (a type with method members) cannot be combined with `&`, `|` or `[]` — it constrains a type parameter and has no values of its own",
+          at: P.pos,
+        },
+      )
+    }
+    const bKids: i32[] = []
+    let bk = 0
+    while bk < mRoots.length {
+      if mIsMethod[bk] {
+        bKids.push(mRoots[bk])
+      } else {
+        const oneKid: i32[] = []
+        oneKid.push(mRoots[bk])
+        bKids.push(tsMkKids(TS_FIELD, mNames[bk], oneKid))
+      }
+      bk = bk + 1
+    }
+    const bRoot = tsMkKids(TS_OBJ, "", bKids)
+    const bAnn = mkTypeRef("{" + synth + "}", p0)
+    setAnnTs(bAnn, bRoot)
+    const noFields: i32[] = []
+    if isFlat { flatNeedsRecord(name, nameTok) }
+    const bix = mkTypeDecl(name, noFields, p0, isNew, 0)
+    setDeclBound(bix, bAnn)
+    if gpBase != "" { setDeclGp(bix, gpBase, gpNames) }
+    mkDeclNameTok(bix, nameTok)
+    return bix
+  }
   // D188 — AN ARRAY SUFFIX ON A `{ … }` BODY, WHICH WAS SILENTLY DROPPED. `type L =
   // {n: i32}[]` reached here with `[` `]` still on the stream, no continuation arm
   // claimed them, and the declaration was completed as the plain STRUCT `{n: i32}`;
@@ -2295,12 +2441,27 @@ function parseFuncHead(requireName: boolean) {
   }
   // Generic type parameters `<T, U>` (declaration position only — no ambiguity
   // with the `<` comparison operator here). Names collected for the checker.
+  //
+  // A parameter may carry a BOUND — `<T: Showable>` or `<T: { toString(): string }>`
+  // (constraints phase 1, OQ-4 as ruled). The bound is parsed by the ORDINARY
+  // annotation producer, so an alias name, an inline object and a method-member
+  // literal all arrive the same way and the module merge renames it through
+  // `modRwType` like every other `TypeRef`. The bounds are banked against the
+  // `FuncDecl` node once it exists — `parseFuncTail` mints it — so they travel as
+  // parallel columns rather than as a widened node.
   const typarams: string[] = []
+  const tpBoundIxs: i32[] = []
+  const tpBoundAnns: i32[] = []
   if peekKind() == "LT" {
     advance() // "<"
     let tgoing = peekKind() == "IDENT"
     while tgoing {
       typarams.push(advance().text)
+      if peekKind() == "COLON" {
+        advance() // ":"
+        tpBoundIxs.push(typarams.length - 1)
+        tpBoundAnns.push(parseType())
+      }
       if peekKind() == "COMMA" {
         advance()
         tgoing = peekKind() == "IDENT"
@@ -2310,7 +2471,27 @@ function parseFuncHead(requireName: boolean) {
     }
     expectClose("GT") // ">"
   }
-  parseFuncTail(name, typarams, nameTok, p0)
+  parseFuncTailBounded(name, typarams, tpBoundIxs, tpBoundAnns, nameTok, p0)
+}
+
+// `parseFuncTail`, plus the bound bank. Split so the four other `parseFuncTail`
+// callers (lambdas, methods, the flat forms) keep their signature: none of them
+// can carry a `<T: B>` list, so none of them has a bank to write.
+function parseFuncTailBounded(
+  name: string,
+  typarams: string[],
+  tpBoundIxs: i32[],
+  tpBoundAnns: i32[],
+  nameTok: i32,
+  p0: i32,
+) {
+  const fix = parseFuncTail(name, typarams, nameTok, p0)
+  let bi = 0
+  while bi < tpBoundIxs.length {
+    setFnTpBound(fix, tpBoundIxs[bi], tpBoundAnns[bi])
+    bi = bi + 1
+  }
+  fix
 }
 
 function parseFunc() { parseFuncHead(true) }

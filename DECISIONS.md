@@ -1078,6 +1078,49 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
     also rejecting the read-only pass.
 
 
+- **BOUNDS ARE ANNOTATIONS, AND THE CHECKER'S OWN COLUMN WAS REFUSED ON A MEASUREMENT**
+  (2026-09-01, constraints phase 1). A `<T: Showable>` bound is stored as a `TypeRef` NODE
+  index on two sparse side tables in `ast.vl`, not as a checker-recorded shape — because
+  `silent-class-inventory` D976 measured that the column the checker writes for an inferred
+  parameter shape does NOT survive into emit, and a bound must (the monomorphizer re-resolves
+  each instance's member calls). An annotation survives, and three existing mechanisms then
+  carry the feature for free: the module merge renames it through `modRwType`, its spelling
+  tree writes back through `tsToName`, and `vl fmt` recovers it verbatim from source.
+- **SATISFACTION IS THE EXISTING CALL RESOLUTION, ASKED AT BOUND-CHECK TIME** (2026-09-01).
+  `{ m(A): R }` means "`x.m(a)` type-checks with result R" — field first, then a UFCS free
+  function — so no second satisfaction judgment exists to disagree with the first. A method
+  member is stored as the plain function type of the CALL (`(A) => R`, no receiver slot),
+  which is why a zero-ary closure field satisfies a method bound by ordinary assignability
+  and a UFCS-satisfied value does not satisfy a field bound: the directionality falls out of
+  the representation instead of being enforced anywhere. Measured on the pre-change seed:
+  `x.toString()` inside a generic body already checked, monomorphized and RAN — the emitter
+  needed nothing, and the whole feature is the judgement the emitter never asked for.
+- **A BOUND IS NOT A TYPE, AND THAT IS A DESIGN RULE WITH A SENTENCE** (2026-09-01). A bound
+  alias registers in its own table, never in `cUserTypes`, so it has no arena entry to be
+  spelled with in value position; `{ m(): R }` there would be an existential needing dynamic
+  dispatch, which monomorphized VL has deliberately not built. Both annotation routes (the
+  rendered-name arm and the spelling-tree arm) raise the identical refusal, because a design
+  rule enforced on one route only is one a re-render walks around.
+- **COHERENCE KEYS ON `tyToStr`, BECAUSE THE TYPE ARENA HAS NO IDENTITY TO KEY ON**
+  (2026-09-01). The plan said "key by interned identity, never by rendered spelling". `addTy`
+  appends unconditionally — `mkArrayTy(TY_I32)` twice gives two indices for one type, and the
+  only dedupe is `annotNameMemo`, keyed on SPELLING and bypassed whenever a type-param
+  environment is live. So the key is `tyToStr`, the CHECKER's renderer, whose contract is that
+  `tyEq` is exactly its string equality and which folds nominality in. It is not `canon`, the
+  emit-side spelling-dependent renderer that warning was about.
+- **BOUNDS CHAIN BY SUBSUMPTION, NOT BY DEFERRAL** (2026-09-01). Every other generic-body
+  constraint in the checker defers to the call-site pin; a bound must not. When the argument
+  is another generic's type parameter there is no instantiation type, but the demand is still
+  decidable — does the caller's bound grant what the callee's needs — and deferring instead
+  left `describe<T: Showable>` relayed through an unbounded `twice<U>` as check-clean invalid
+  wasm. Deciding it statically also puts the error on the declaration that is wrong.
+- **A BOUND HAS NO `Self`; IT NAMES THE TYPE PARAMETER IN SCOPE** (2026-09-01). A bound's
+  member types are ordinary annotations resolved where the bound is USED, with the function's
+  type parameters live, so `{ eq(T): boolean }` already means "takes another one of me". The
+  consequence is accepted rather than papered over: a bound ALIAS body resolves in its own
+  scope, so an alias naming `T` fits `<T: …>` and not `<U: …>`, and the refusal hands over the
+  inline spelling. F-bounded generic bound aliases are not in phase 1.
+
 ## An object literal a union arm's field-name set MATCHES is not thereby a union BOX — and the row it gets is gated on the OWNER, not on the literal
 
 `collectAnonShapes` mints an anonymous struct row for every object literal that names no

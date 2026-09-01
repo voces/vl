@@ -133,6 +133,7 @@ import {
   TS_LITNUM,
   TS_LITSTR,
   TS_MAP,
+  TS_METHOD,
   TS_NAME,
   TS_NEG,
   TS_NULL,
@@ -142,8 +143,11 @@ import {
   annTsOf,
   clearAnnTs,
   clearUdTs,
+  declBoundOf,
   declGpBaseOf,
   declGpParamsOf,
+  fnHasTpBound,
+  fnTpBoundOf,
   tsKidCount,
   tsKidStart,
   tsKids,
@@ -556,6 +560,55 @@ let gaParamCount: i32[] = []
 // argument types while the alias body resolves (`applyGenAlias`).
 let tpEnvNames: string[] = []
 let tpEnvTys: i32[] = []
+
+// ── constraints phase 1: the BOUND environment and the coherence ledger ──────
+// `cBoundDecls` — every `type Showable = { toString(): string }` in the program,
+// name → the declaration's bound-body annotation node. Registered in pass 0a
+// INSTEAD of `cUserTypes`: a bound constrains a type parameter and has no values,
+// so it is not a type, and `declaredTyOfName` turns a value-position use into a
+// sentence rather than into a struct nobody can build.
+let cBoundDecls: {[string]: i32} = Map()
+
+// `tpBound*` — the bounds live while a bounded body is checked, pushed beside the
+// `tpEnv` stack by `checkFuncDeclNode` and popped with it. A SEPARATE stack rather
+// than a third `tpEnv` column on purpose: `tpEnv` is pushed from four places and
+// only ONE of them (the body) can host a member access on a `T`, so aligning a
+// third column at the other three would be alignment risk bought for nothing.
+let tpBoundNames: string[] = []
+let tpBoundAnns: i32[] = []
+
+// The bound annotation live for type-parameter `name`, or -1 — innermost wins, so
+// a nested generic's `<T>` shadows an enclosing one exactly as `tpEnvTyOfName` does.
+function tpBoundOfName(name: string) {
+  let i = tpBoundNames.length - 1
+  while i >= 0 {
+    if tpBoundNames[i] == name { return tpBoundAnns[i] }
+    i = i - 1
+  }
+  -1
+}
+
+// ── the coherence ledger (OQ-3 as ruled) ────────────────────────────────────
+// VL compiles WHOLE-PROGRAM, which is what lets satisfaction be judged in each
+// instantiation site's own scope AND still be coherent: every site is visible to
+// one compiler run, so a disagreement can be named instead of legislated away by
+// an orphan rule. One row per (generic function, instantiation type, bound member)
+// that some site resolved; a second site resolving the same key to a DIFFERENT
+// witness is the refusal, and it names both sites.
+//
+// THE KEY IS `tyToStr`, NOT AN ARENA INDEX, and that is a correction to the plan
+// this was built from. The checker's type arena is APPEND-ONLY — `addTy` pushes
+// unconditionally, so `mkArrayTy(TY_I32)` twice yields two indices for one type
+// and there is no hash-consing to key on. `tyToStr` is the checker's canonical
+// renderer and `tyEq`'s exact string equivalent (that equivalence is `tyEq`'s
+// documented contract), and it folds nominality in, so a newtype keys apart from
+// its base. It is NOT `canon`/`tyToEmitName`, the emit-side spelling-dependent
+// renderer CLAUDE.md warns about; that one runs a phase later and answers a
+// different question.
+let cohKeys: string[] = []
+let cohWitness: string[] = []
+let cohSiteLine: i32[] = []
+let cohSiteCol: i32[] = []
 
 // DEMANDED HOLE SHAPES (host: `getChildType` pins an `Infer<Unknown>` to a
 // GROWING `{…}` object): a member access on an inference-hole param
@@ -3260,6 +3313,13 @@ export function initChecker() {
   annotClash = Map()
   tpEnvNames = []
   tpEnvTys = []
+  cBoundDecls = Map()
+  tpBoundNames = []
+  tpBoundAnns = []
+  cohKeys = []
+  cohWitness = []
+  cohSiteLine = []
+  cohSiteCol = []
   bgSrcStack = []
   bgDstStack = []
   stSeenStack = []
@@ -9156,7 +9216,43 @@ function tpEnvTyOfName(name: string) {
 // its member, not a one-variant union box. The parser accepts a bare `type N = A` as a one-member
 // union, but a union of one is just that one type, so resolve to the member (`x: Id` is a plain
 // `i32`, usable with `+`; before this it was the box → "operator + not defined" / invalid wasm).
+// THE ONE WORDING for a method member written where a VALUE type belongs, raised
+// by both annotation routes (the rendered-name arm of `nameToTyReal` and the
+// spelling-tree arm of `tsToTyReal`). `member` is the member's own text as the
+// author spelled it (`toString():string`), so the sentence quotes their file.
+//
+// It is a DESIGN refusal, not a capability gap, and the wording says which: a
+// method member demands that a CALL work, a value type describes what a value
+// CARRIES, and bridging the two needs the dynamic dispatch VL has deliberately not
+// built. The remedy clause names both real options rather than only the bound —
+// an author who wanted a stored closure wrote the wrong one of two spellings, and
+// `docs/constraints-design.md` OQ-1 records that they are a real pair.
+function methodInValuePosMsg(member: string) {
+  "a method member `" +
+    member +
+    "` may only appear in a BOUND — it demands that a call type-checks, which is not something a value carries. For a stored closure write the field form `name: (…) => R`; to constrain a type parameter write `<T: { " +
+    member +
+    " }>`"
+}
+
 function declaredTyOfName(name: string) {
+  // A BOUND in VALUE position. It is a design refusal and not a capability gap:
+  // `{ toString(): string }` as a parameter type would be an existential needing
+  // dynamic dispatch, and everything in VL monomorphizes (see
+  // `docs/constraints-design.md` §"Explicitly avoided" — trait objects are out).
+  // The sentence names the position it IS legal in, because the author who wrote
+  // it here almost certainly meant a bound.
+  if cBoundDecls.has(name) {
+    tErr(
+      "`" +
+        name +
+        "` is a BOUND, not a type — it declares method members, which constrain a type parameter and have no values. Use it as a constraint: `function f<T: " +
+        name +
+        ">(x: T)`",
+      annotDiagAt,
+    )
+    return TY_ERR
+  }
   if cUserTypes.has(name) {
     // ORDER-INDEPENDENCE, at the one entry point every route to a declared type comes
     // through (`tsLeafTy` and `nameToTyReal`'s last rung both bottom out here). Pass 0a
@@ -9909,6 +10005,16 @@ function tsToTyReal(ix: i32) {
     let fi = 0
     while fi < cnt {
       const fdIx = tsKids[start + fi]
+      // A METHOD member in VALUE position — the TREE route's half of the refusal
+      // `nameToTyReal`'s brace arm raises. Both routes reach one wording, for the
+      // reason the two arms exist at all: an annotation resolves through the tree
+      // when the parser recorded one and through the rendered name when it did
+      // not, and a design rule enforced on one route only is a rule that a
+      // re-render can walk around.
+      if tsKind[fdIx] == TS_METHOD {
+        tErr(methodInValuePosMsg(tsToName(fdIx)), annotDiagAt)
+        return TY_ERR
+      }
       if tsKind[fdIx] == TS_FIELD {
         if tsText[fdIx].length > 0 {
           const fdTy = tsToTy(tsKids[tsKidStart[fdIx]])
@@ -10129,6 +10235,22 @@ function nameToTyReal(name: string) {
       const field = name.slice(fstart, fend)
       if field.length > 0 {
         const colonAt = tyTopIndexOf(field, ':', 0, 0)
+        // A METHOD MEMBER in VALUE position (`function f(x: { m(): string })`).
+        // The parser accepts the spelling everywhere so that a bound reads the
+        // same wherever it is written; only a BOUND can consume one, and the
+        // refusal belongs here rather than in the grammar because the grammar
+        // cannot see which position it is in. Same design rule as the alias arm
+        // in `declaredTyOfName` — a callability demand has no layout.
+        if colonAt > 1 {
+          if field[colonAt - 1] == ')' {
+            tErr(methodInValuePosMsg(field), annotDiagAt)
+            // TY_ERR, not -1: the sentence above IS the diagnosis, and -1 makes
+            // the caller append `unknown type '{toString():string}'` — a second
+            // voice for one mistake, and a misleading one (the type is perfectly
+            // well known, it is just not a value type).
+            return TY_ERR
+          }
+        }
         if colonAt > 0 {
           // Both halves of the FIELD-COLON cut at their home (`tyname.fieldTypeTextOf` /
           // `fieldNameOf`, W14), given the TOP-LEVEL colon this arm just found. The three
@@ -21519,6 +21641,558 @@ function orderNamedCallArgs(
   ordered
 }
 
+// ── constraints phase 1: bounds ─────────────────────────────────────────────
+// The whole feature is a VALIDATION layer over machinery that already lowers, and
+// that is the measurement it was built on rather than an aspiration. On the
+// 2026-09-01 seed, BEFORE any of this existed:
+//
+//   type Circle = { r: f64 }
+//   function toString(self: Circle): string { "C" }
+//   function describe<T>(x: T): string { "<" + x.toString() + ">" }
+//   print(describe({ r: 1.0 }))            // prints <C>
+//
+// already checked, monomorphized and ran — and so did the same body over
+// `std:fmt`'s imported `toString` at `i32`. The emitter re-resolves a member call
+// against the SUBSTITUTED receiver (`emit_rewrite.drwWalk`: struct field first,
+// then a `self`-function), so an instance's `x.m(…)` needs nothing from us.
+//
+// What did NOT work is exactly what a bound fixes. The same generic at a type with
+// no `toString` was `vl check`-clean INVALID WASM (`describe({ s: 2.0 })` —
+// a clause-1 cell, filed D1001), and a zero-ary closure FIELD witness could not be
+// called in the body at all (the field-precedence test at the dispatch site reads
+// `TyObj` only, and a `T` receiver is a `TyVar`). So: the body resolves against the
+// BOUND, the instantiation site resolves against the ARGUMENT, and the two must
+// agree — which is the whole of phase 1.
+
+// The spelling root of the bound `annIx` names: an inline object literal directly,
+// or one hop through a bound-alias NAME. -1 when the annotation is not a bound.
+//
+// One hop, not a chain: a bound alias's body is always a `TS_OBJ` (the parser only
+// banks a `declBound` row for a `{ … }` body with a method member in it), so there
+// is nothing for a second hop to reach. `type S2 = Showable` is NOT a bound alias —
+// it parses as a one-member union alias — and naming it in a bound position is
+// refused by `boundMembersOf`'s caller with a sentence.
+function boundObjRootOf(annIx: i32) {
+  if annIx < 0 { return -1 }
+  const root = annTsOf(annIx)
+  if root < 0 { return -1 }
+  if tsKind[root] == TS_OBJ { return root }
+  if tsKind[root] == TS_NAME {
+    const hit = cBoundDecls[tsText[root]] ?? -1
+    if hit >= 0 { return annTsOf(hit) }
+  }
+  -1
+}
+
+// The bound's members, as three parallel columns filled in source order:
+//   names[i]    — the member's name
+//   tys[i]      — the CALL's function type for a method (`(A) => R`), or the
+//                 field's declared type for a colon member
+//   isMethod[i] — which of the two it is
+//
+// The method's type is a plain `TyFunc` over the ARGUMENTS the bound lists, with
+// no receiver slot, because that is precisely the call the bound demands: `x.m(a)`
+// must type-check with the declared result. A zero-ary closure FIELD of the same
+// type therefore satisfies a method bound by construction (`{f: () => string}`
+// makes `x.f()` work), while the converse does not hold — a UFCS-satisfied value
+// carries no closure and cannot satisfy a colon member. That directionality is the
+// ruled semantics (`docs/constraints-design.md` OQ-1), and it falls out of using
+// one type for both rather than being enforced anywhere.
+//
+// Resolution runs under whatever `tpEnv` is live, so a self-referential member
+// (`{ eq(T): boolean }`) resolves `T` to the type parameter in scope: the opaque
+// `TyVar` while the BODY is checked, the concrete instantiation type at a CALL.
+// There is no separate self-type spelling, and phase 1 deliberately adds none.
+function boundMembersOf(
+  root: i32,
+  names: string[],
+  tys: i32[],
+  isMethod: boolean[],
+) {
+  if root < 0 { return 0 }
+  const start = tsKidStart[root]
+  const cnt = tsKidCount[root]
+  let i = 0
+  while i < cnt {
+    const kid = tsKids[start + i]
+    const k = tsKind[kid]
+    if k == TS_METHOD {
+      const ks = tsKidStart[kid]
+      const kc = tsKidCount[kid]
+      const ptys: i32[] = []
+      let p = 0
+      while p < kc - 1 {
+        ptys.push(tsToTy(tsKids[ks + p]))
+        p = p + 1
+      }
+      names.push(tsText[kid])
+      tys.push(mkFuncTy(ptys, tsToTy(tsKids[ks + kc - 1])))
+      isMethod.push(true)
+    } else if k == TS_FIELD {
+      names.push(tsText[kid])
+      tys.push(tsToTy(tsKids[tsKidStart[kid]]))
+      isMethod.push(false)
+    }
+    i = i + 1
+  }
+  0
+}
+
+// How a bound names itself in a diagnostic: the alias name when the author wrote
+// one, else the literal they wrote. Never the synthetic re-render — a reader
+// searching for the sentence should find the text in their own file.
+function boundText(annIx: i32) {
+  if annIx < 0 { return "" }
+  const t = P.nodes[annIx]
+  if t is TypeRef { return t.tyName }
+  ""
+}
+
+// The member list a bound offers, rendered for a diagnostic: `toString(), n`.
+function boundMemberList(root: i32) {
+  const bn: string[] = []
+  const bt: i32[] = []
+  const bm: boolean[] = []
+  boundMembersOf(root, bn, bt, bm)
+  let out = ""
+  let i = 0
+  while i < bn.length {
+    if i > 0 { out = out + ", " }
+    out = out + bn[i]
+    if bm[i] { out = out + "()" }
+    i = i + 1
+  }
+  out
+}
+
+// ── the WITNESS: satisfaction IS the existing call resolution ────────────────
+// Nothing new is invented at the call. `x.m(a)` under a bound resolves by exactly
+// the order every method call in the language already uses — a FIELD of the
+// receiver first, then a free `self`-function in scope — asked at bound-check
+// time against the instantiation type. `witnessOf` answers with a stable STRING
+// naming which one won, because that string is both the coherence key's value and
+// the words the disagreement diagnostic prints:
+//
+//   "field"           — a member of the concrete type satisfies the call
+//   "<mangled name>"  — the merged symbol of the `self`-function that does
+//   ""                — nothing does; the caller raises the unsatisfied refusal
+//
+// The mangled name is what makes the answer honest across modules: the merge
+// renames a module-local `toString` to `toString$m1`, so two sites that resolve to
+// two different modules' functions produce two different witness strings even
+// though the SOURCE spelling at both sites is `toString`.
+function witnessOf(memberName: string, wantTy: i32, concTy: i32) {
+  if concTy < 0 || wantTy < 0 { return "" }
+  const ct = T.tys[concTy]
+  if ct is TyObj {
+    const ft = objFieldType(ct, memberName)
+    if ft >= 0 {
+      if assignable(ft, wantTy) { return "field" }
+      return ""
+    }
+  }
+  const mangled = ufcsAliasOf(memberName)
+  const fnTy = lookup(mangled)
+  if fnTy < 0 { return "" }
+  const ft2 = T.tys[fnTy]
+  if ft2 is TyFunc {
+    const wt = T.tys[wantTy]
+    if wt is TyFunc {
+      // The receiver occupies slot 0 and the bound's arguments fill the rest —
+      // the arity `ufcsCallTy` enforces, asked here of a type rather than of a
+      // node so it can be asked before any call exists.
+      if ft2.fnParamTypes.length != wt.fnParamTypes.length + 1 { return "" }
+      if !assignable(concTy, ft2.fnParamTypes[0]) { return "" }
+      let i = 0
+      while i < wt.fnParamTypes.length {
+        if !assignable(wt.fnParamTypes[i], ft2.fnParamTypes[i + 1]) {
+          return ""
+        }
+        i = i + 1
+      }
+      // A callee whose return is still PENDING (-2) has not been inferred yet;
+      // force it, exactly as `ufcsCallTy` does, so a std export written without a
+      // return annotation (`std:fmt`'s `toString`) is measured and not guessed.
+      let retTy = ft2.fnRet
+      if retTy == (-2) {
+        if !onInferStack(mangled) {
+          const dIx = fnDeclIx[mangled] ?? -1
+          if dIx >= 0 {
+            checkNode(dIx)
+            const re = T.tys[lookup(mangled)]
+            if re is TyFunc { retTy = re.fnRet }
+          }
+        }
+      }
+      if !assignable(retTy, wt.fnRet) { return "" }
+      return mangled
+    }
+  }
+  ""
+}
+
+// Record this site's witness for (generic, instantiation type, member) and refuse
+// a DISAGREEMENT, naming both sites and both witnesses. Returns true when the row
+// is coherent (including the first time it is written).
+function cohRecord(
+  who: string,
+  tyKey: string,
+  memberName: string,
+  wit: string,
+  ix: i32,
+) {
+  const key = who + "#" + tyKey + "#" + memberName
+  let i = 0
+  while i < cohKeys.length {
+    if cohKeys[i] == key {
+      if cohWitness[i] == wit { return true }
+      tErr(
+        "incoherent bound: `" +
+          who +
+          "` instantiated at `" +
+          tyKey +
+          "` resolves `" +
+          memberName +
+          "` to `" +
+          cohWitness[i] +
+          "` at line " +
+          i32ToStr(cohSiteLine[i]) +
+          ":" +
+          i32ToStr(cohSiteCol[i] + 1) +
+          " and to `" +
+          wit +
+          "` here — one generic at one type must have ONE witness across the whole program",
+        ix,
+      )
+      return false
+    }
+    i = i + 1
+  }
+  cohKeys.push(key)
+  cohWitness.push(wit)
+  let ln = 0
+  let co = 0
+  if ix >= 0 && ix < nodeToks.length {
+    const tk = nodeToks[ix]
+    if tk >= 0 && tk < P.toks.length {
+      ln = P.toks[tk].line
+      co = P.toks[tk].col
+    }
+  }
+  cohSiteLine.push(ln)
+  cohSiteCol.push(co)
+  true
+}
+
+// SUBSUMPTION: does the bound live on `srcTp` (the caller's own type parameter)
+// grant everything the callee's bound `dstAnn` demands? Every member of the
+// callee's bound must appear in the caller's with an assignable type and the same
+// kind — a colon member is a layout demand and a method member is a callability
+// demand, and a method does not satisfy a field (nothing is stored).
+//
+// A caller parameter with NO bound grants nothing, and that is the common case
+// worth a good sentence: it is the relay that used to miscompile.
+function checkBoundSubsumes(
+  srcTp: string,
+  dstTp: string,
+  dstAnn: i32,
+  who: string,
+  ix: i32,
+) {
+  const dstRoot = boundObjRootOf(dstAnn)
+  if dstRoot < 0 { return 0 }
+  const dn: string[] = []
+  const dt: i32[] = []
+  const dm: boolean[] = []
+  boundMembersOf(dstRoot, dn, dt, dm)
+  const srcAnn = tpBoundOfName(srcTp)
+  const srcRoot = boundObjRootOf(srcAnn)
+  const sn: string[] = []
+  const st: i32[] = []
+  const sm: boolean[] = []
+  boundMembersOf(srcRoot, sn, st, sm)
+  let d = 0
+  while d < dn.length {
+    let ok = false
+    let s = 0
+    while s < sn.length {
+      if sn[s] == dn[d] && sm[s] == dm[d] {
+        if st[s] >= 0 && dt[d] >= 0 {
+          if assignable(st[s], dt[d]) { ok = true }
+        }
+      }
+      s = s + 1
+    }
+    if !ok {
+      let has = "`" + srcTp + "` is unbounded"
+      if srcAnn >= 0 {
+        has = "`" +
+          srcTp +
+          "`'s bound `" +
+          boundText(srcAnn) +
+          "` grants `" +
+          boundMemberList(srcRoot) +
+          "`"
+      }
+      let want = dn[d]
+      if dm[d] { want = dn[d] + "()" }
+      tErr(
+        "`" +
+          who +
+          "` needs `" +
+          dstTp +
+          ": " +
+          boundText(dstAnn) +
+          "`, which demands `" +
+          want +
+          "` — but " +
+          has +
+          ". Add it to `" +
+          srcTp +
+          "`'s bound",
+        ix,
+      )
+      return 0
+    }
+    d = d + 1
+  }
+  0
+}
+
+// THE INSTANTIATION-SITE CHECK. `who` is the callee's source name, `declIx` its
+// `FuncDecl`, and `bNames`/`bTys` the bindings `bindGenWalk` just solved. For each
+// BOUNDED type parameter that the call actually bound, resolve every bound member
+// against the concrete type in THIS site's scope and refuse what nothing satisfies.
+//
+// The bound's own member types resolve with the parameter bound to the CONCRETE
+// type, which is what makes `{ eq(T): boolean }` mean "eq takes another one of me"
+// at each instantiation without any self-type machinery.
+function checkBoundsAtCall(
+  who: string,
+  declIx: i32,
+  bNames: string[],
+  bTys: i32[],
+  ix: i32,
+) {
+  if declIx < 0 { return 0 }
+  if !fnHasTpBound(declIx) { return 0 }
+  const dn = P.nodes[declIx]
+  if !(dn is FuncDecl) { return 0 }
+  let k = 0
+  while k < dn.fnTyParams.length {
+    const bAnn = fnTpBoundOf(declIx, k)
+    if bAnn >= 0 {
+      const tpName = dn.fnTyParams[k]
+      let conc = -1
+      let bi = 0
+      while bi < bNames.length {
+        if bNames[bi] == tpName { conc = bTys[bi] }
+        bi = bi + 1
+      }
+      // CHAINING: the argument is another generic's type PARAMETER, not a type
+      // (`function twice<U: Showable>(y: U) { describe(y) }`). There is no
+      // instantiation type here to resolve a witness against, and deferring to
+      // the outer pin is the wrong answer — the outer call is where `U` becomes
+      // concrete, but the DEMAND is knowable now: `U`'s own bound either grants
+      // what `T`'s bound needs or it does not. So it is decided by SUBSUMPTION,
+      // statically, which is how Rust, Haskell and C++20 concepts all decide it
+      // and is what makes the error land on the declaration that is wrong rather
+      // than on some caller three modules away.
+      //
+      // The design doc says bounds "chain through nested bounded generics for
+      // free". They do at EMIT — the inner instantiation happens inside the outer
+      // instance, where the substitution has already run. What is NOT free is the
+      // CHECK, and the measurement is `describe<T: Showable>` relayed through an
+      // UNBOUNDED `twice<U>`: before this, `twice(2.0)` was `vl check`-clean
+      // INVALID WASM, because the inner bound was deferred to a pin that never
+      // asks. Subsumption is what closes it.
+      if conc >= 0 {
+        const ct0 = T.tys[conc]
+        if ct0 is TyVar {
+          if ct0.tvName.length > 0 {
+            if ct0.tvName[0] != '?' {
+              checkBoundSubsumes(ct0.tvName, tpName, bAnn, who, ix)
+              k = k + 1
+              continue
+            }
+          }
+        }
+      }
+      if conc >= 0 && !tyHasHole(conc) {
+        const root = boundObjRootOf(bAnn)
+        if root < 0 {
+          tErr(
+            "`" +
+              boundText(bAnn) +
+              "` is not a bound — a bound is a type with method members (`type " +
+              boundText(bAnn) +
+              " = { m(): R }`) or an inline `{ m(): R }`",
+            ix,
+          )
+        } else {
+          // Bind the parameter to the CONCRETE type while the bound's member
+          // types resolve, so a self-referential member means what it says here.
+          tpEnvNames.push(tpName)
+          tpEnvTys.push(conc)
+          const bn: string[] = []
+          const bt: i32[] = []
+          const bm: boolean[] = []
+          boundMembersOf(root, bn, bt, bm)
+          tpEnvNames.pop()
+          tpEnvTys.pop()
+          const tyKey = tyToStr(conc)
+          let m = 0
+          while m < bn.length {
+            let wit = ""
+            // An unresolved member type is the alias-self-reference case, and it
+            // is reported at the DECLARATION (the body's own use raised it) — the
+            // call site skips rather than adding a second voice for one mistake.
+            if bt[m] < 0 {
+              m = m + 1
+              continue
+            }
+            if bm[m] {
+              wit = witnessOf(bn[m], bt[m], conc)
+            } else {
+              // A COLON member is a layout demand and stays one: the value must
+              // carry the field, which is ordinary structural assignability.
+              const ct = T.tys[conc]
+              if ct is TyObj {
+                const ft = objFieldType(ct, bn[m])
+                if ft >= 0 {
+                  if assignable(ft, bt[m]) { wit = "field" }
+                }
+              }
+            }
+            if wit == "" {
+              let what = bn[m]
+              if bm[m] { what = bn[m] + "(): " + tyToStr(retOfFuncTy(bt[m])) }
+              tErr(
+                tyKey +
+                  " does not satisfy `" +
+                  boundText(bAnn) +
+                  "`: no `" +
+                  what +
+                  "` — the bound needs a field of that type or a `" +
+                  bn[m] +
+                  "(self: " +
+                  tyKey +
+                  ", …)` function in scope at this call",
+                ix,
+              )
+            } else {
+              cohRecord(who, tyKey, bn[m], wit, ix)
+            }
+            m = m + 1
+          }
+        }
+      }
+    }
+    k = k + 1
+  }
+  0
+}
+
+// The result type of a `TyFunc`, or `TY_ERR` — the one place a bound member's
+// declared result is read out for a message.
+function retOfFuncTy(tyIx: i32) {
+  if tyIx < 0 { return TY_ERR }
+  const t = T.tys[tyIx]
+  if t is TyFunc { return t.fnRet }
+  TY_ERR
+}
+
+// THE STRICT BODY (OQ-5 as ruled). Inside `function f<T: B>(x: T)`, a member use
+// on `x` resolves against B's members and NOTHING else. `memTy` answers the member
+// read's type, `-1` when the bound has no such member (the caller then raises the
+// refusal that names B).
+//
+// An UNBOUNDED `<T>` never reaches here — `tpBoundOfName` answers -1 and every
+// caller takes its existing path — so today's behaviour is preserved exactly, which
+// is what the ruling asked for. Operator use is untouched in both cases: the
+// implicit `HD_BINOP` machinery that makes `dbl<T>(x: T) { x + x }` run at i32, f64
+// and string is a different mechanism and phase 1 adds no operator bounds (OQ-2).
+function boundMemberTy(tvName: string, prop: string, wantCall: boolean) {
+  const bAnn = tpBoundOfName(tvName)
+  if bAnn < 0 { return -1 }
+  const root = boundObjRootOf(bAnn)
+  if root < 0 { return -1 }
+  const bn: string[] = []
+  const bt: i32[] = []
+  const bm: boolean[] = []
+  boundMembersOf(root, bn, bt, bm)
+  let i = 0
+  while i < bn.length {
+    if bn[i] == prop {
+      // The member is THERE and its own annotation did not resolve — distinct
+      // from "no such member", and it gets `BOUND_UNRESOLVED` rather than -1 so
+      // the caller says which of the two happened. Feeding the -1 onward would be
+      // worse than a bad message: `assignable` reads a negative side as "accept
+      // anything", so an unresolved bound would silently accept every argument.
+      if bt[i] < 0 { return BOUND_UNRESOLVED }
+      // A METHOD member is a call and only a call: `x.m` without parentheses has
+      // no value to read (there is no closure to hand back — the witness may be a
+      // free function). A FIELD member serves both spellings, since a field IS a
+      // value and calling it is calling the closure it holds.
+      if bm[i] && !wantCall { return -1 }
+      return bt[i]
+    }
+    i = i + 1
+  }
+  -1
+}
+
+// `boundMemberTy`'s third answer: the member EXISTS but its own annotation did not
+// resolve. Kept apart from -1 ("no such member") because the two need different
+// sentences and only one of them is the author's spelling mistake.
+const BOUND_UNRESOLVED = -2
+
+// A bound member whose OWN annotation does not resolve in the scope that reads it.
+// The live case is a self-referential member in an ALIAS bound (`type Eq = { eq(T):
+// boolean }`): the alias body resolves in the ALIAS's scope, and `T` there is an
+// ordinary type name, not the using function's parameter. Phase 1 does not add
+// F-bounded generic bound aliases (`type Eq<S> = { eq(S): boolean }` + `<T: Eq<T>>`),
+// so a self-reference is spelled INLINE, which the message says.
+function boundMemberUnknownMsg(tvName: string, prop: string) {
+  const bAnn = tpBoundOfName(tvName)
+  "the bound member `" +
+    prop +
+    "` on `" +
+    tvName +
+    "` names a type that does not resolve here — a bound alias body resolves in its OWN scope, so it cannot name `" +
+    tvName +
+    "`. Spell a self-referential member inline: `<" +
+    tvName +
+    ": { " +
+    prop +
+    "(" +
+    tvName +
+    "): … }>` (the bound as written is `" +
+    boundText(bAnn) +
+    "`)"
+}
+
+// The refusal a strict body raises, naming the bound and what it offers. Returns
+// "" when the receiver is not a bounded type parameter, so the caller keeps its
+// existing (unbounded) answer.
+function boundMemberFloorMsg(tvName: string, prop: string) {
+  const bAnn = tpBoundOfName(tvName)
+  if bAnn < 0 { return "" }
+  const root = boundObjRootOf(bAnn)
+  if root < 0 { return "" }
+  const offers = boundMemberList(root)
+  let has = "nothing"
+  if offers.length > 0 { has = "`" + offers + "`" }
+  "no `" +
+    prop +
+    "` on `" +
+    tvName +
+    "` — its bound `" +
+    boundText(bAnn) +
+    "` grants " +
+    has
+}
+
 function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
   // A UFCS callee names a free `self`-function by its SOURCE name. The module
   // merge mangles such functions (`shout` → `shout$m1`) but leaves the call's
@@ -22450,6 +23124,66 @@ function checkCallNode(n: Call, ix: i32) {
     if urt is TyObj {
       if objFieldType(urt, cfn.memProp) >= 0 { ufcsHasField = true }
     }
+    // A BOUNDED type parameter as the receiver (OQ-5, strict bodies). The bound
+    // answers, and only the bound: the arguments are checked against the members
+    // it declared and the result is the one it promised. There is no dispatch here
+    // and nothing is resolved — the WITNESS is chosen at each instantiation site
+    // (`checkBoundsAtCall`) and baked by the monomorphizer, which is what makes the
+    // body's answer stable while the witness varies per site.
+    if urt is TyVar {
+      const bcTy = boundMemberTy(urt.tvName, cfn.memProp, true)
+      if bcTy == BOUND_UNRESOLVED {
+        tErr(boundMemberUnknownMsg(urt.tvName, cfn.memProp), ix)
+        return TY_ERR
+      }
+      if bcTy >= 0 {
+        const bcT = T.tys[bcTy]
+        if bcT is TyFunc {
+          const bcArgs = n.callArgs
+          if bcArgs.length != bcT.fnParamTypes.length {
+            tErr(
+              "`" +
+                cfn.memProp +
+                "` on `" +
+                urt.tvName +
+                "` expects " +
+                i32ToStr(bcT.fnParamTypes.length) +
+                " arguments, got " +
+                i32ToStr(bcArgs.length),
+              ix,
+            )
+            return TY_ERR
+          }
+          let bca = 0
+          while bca < bcArgs.length {
+            const bcat = checkNode(bcArgs[bca])
+            const bcWant = bcT.fnParamTypes[bca]
+            // An UNRESOLVED member type (`-1`) is a bound whose own annotation
+            // named something this scope has no answer for. Reported once, at the
+            // call, rather than fed to `assignable` — which reads a negative side
+            // as "accept anything" and would silently pass every argument.
+            if bcWant < 0 {
+              tErr(boundMemberUnknownMsg(urt.tvName, cfn.memProp), ix)
+              return TY_ERR
+            }
+            if !assignableExpr(bcArgs[bca], bcat, bcWant) {
+              argMismatchErr(bca + 1, bcWant, bcat, bcArgs[bca])
+            }
+            bca = bca + 1
+          }
+          if bcT.fnRet < 0 {
+            tErr(boundMemberUnknownMsg(urt.tvName, cfn.memProp), ix)
+            return TY_ERR
+          }
+          return bcT.fnRet
+        }
+      }
+      const bcMsg = boundMemberFloorMsg(urt.tvName, cfn.memProp)
+      if bcMsg != "" {
+        tErr(bcMsg, ix)
+        return TY_ERR
+      }
+    }
     if !ufcsHasField {
       const uu = ufcsCallTy(cfn.memProp, recvTy, n, ix)
       if uu >= 0 { return uu }
@@ -22936,6 +23670,13 @@ function checkCallNode(n: Call, ix: i32) {
       // — correctly, since a `T` pinned to a collection has it — and this is the first
       // position that knows which rep `T` became. (`silent-class-inventory` D651 / D691.)
       validateMemCstrs(bNames, bTys, ix, cstrCallee, cstrWho)
+      // And the BOUNDS the callee declared, judged HERE — in this site's own scope,
+      // against the types this site bound. It sits with the deferred-constraint
+      // validators because it is the same shape of question they answer (a body
+      // gate that is vacuous under a `TyVar` and decidable only at the pin), but it
+      // is not deferred: a bound is written down at the declaration, so there is
+      // nothing to record on the way in, only something to check on the way out.
+      checkBoundsAtCall(cstrWho, cstrCallee, bNames, bTys, ix)
       // The escaped-join reject is the FALLBACK, not an additional voice: when this
       // same site already reported a precise operand/argument-flow diagnostic, that
       // one names the actual mismatch and the join report would only repeat it in
@@ -23757,6 +24498,13 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   while tpBody < n.fnTyParams.length {
     tpEnvNames.push(n.fnTyParams[tpBody])
     tpEnvTys.push(mkTyVar(n.fnTyParams[tpBody]))
+    // …and the parameter's BOUND, for the same span (OQ-5, strict bodies). A row
+    // is pushed even when the parameter is UNBOUNDED (-1) so the two stacks stay
+    // one-to-one with `fnTyParams` and the pop below is symmetric — and so that an
+    // unbounded `<T>` SHADOWS an enclosing bounded `T` rather than inheriting its
+    // bound, which is what `tpEnv`'s own innermost-wins rule already means.
+    tpBoundNames.push(n.fnTyParams[tpBody])
+    tpBoundAnns.push(fnTpBoundOf(fnIx, tpBody))
     tpBody = tpBody + 1
   }
   // Definite-assignment: a function body is its OWN flow context — it runs at
@@ -23966,6 +24714,8 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   while tpPop < n.fnTyParams.length {
     tpEnvNames.pop()
     tpEnvTys.pop()
+    tpBoundNames.pop()
+    tpBoundAnns.pop()
     tpPop = tpPop + 1
   }
   if cstrOwnerPushed { cstrOwnerStack.pop() }
@@ -25608,6 +26358,17 @@ function checkProgramNode(n: Program) {
       }
     }
     if sd0 is TypeDecl {
+      // A BOUND ALIAS (`type Showable = { toString(): string }`) registers in
+      // `cBoundDecls` and NOT in `cUserTypes` — it constrains a type parameter and
+      // has no values, so giving it a type-arena entry would make it spellable in
+      // value position, which is the trait-object design the doc explicitly rules
+      // out. `declaredTyOfName` turns such a use into a sentence instead.
+      const bAnn0 = declBoundOf(stmts[t0])
+      if bAnn0 >= 0 {
+        cBoundDecls[sd0.tdName] = bAnn0
+        t0 = t0 + 1
+        continue
+      }
       // A GENERIC alias (`type Box<T> = …` — the parser folds the params into
       // the declared name "Box<T>") registers in the generic-alias registry,
       // NOT in `cUserTypes`: it has no concrete type until applied. Pass 0b
@@ -35361,6 +36122,27 @@ function checkMemberNode(n: Member, ix: i32) {
     // programs that work — but it is only half an answer: the other seven have none, and
     // without the constraint they reach the emitter, whose floor can name a rep it cannot
     // classify and not a rule the language has. `memCstrTy`'s header has the whole shape.
+    // A BOUNDED type parameter reads its members from its BOUND and from nothing
+    // else (OQ-5). This is also D952's root fix: the empty `[ERROR]:` that arm
+    // produced was `memberFloorMsg`'s `TyVar` rung returning "", and a bounded
+    // receiver now has a real answer to give — either the member's type, or a
+    // sentence naming the bound and what it grants.
+    //
+    // Checked BEFORE `.length`, because a bound that declares `length` means its
+    // own member: inside `f<T: { length: string }>` the author said the field is a
+    // string, and answering `i32` from the collection rung would be the bound
+    // being overruled by a builtin the bound did not mention.
+    const bmTy = boundMemberTy(ot.tvName, n.memProp, false)
+    if bmTy == BOUND_UNRESOLVED {
+      tErr(boundMemberUnknownMsg(ot.tvName, n.memProp), ix)
+      return TY_ERR
+    }
+    if bmTy >= 0 { return symMem(ix, bmTy) }
+    const bmMsg = boundMemberFloorMsg(ot.tvName, n.memProp)
+    if bmMsg != "" {
+      tErr(bmMsg, ix)
+      return TY_ERR
+    }
     if n.memProp == "length" {
       noteMemCstr(objTy, n.memProp, ix)
       return symMem(ix, TY_I32)

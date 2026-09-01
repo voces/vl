@@ -10,6 +10,12 @@
 > (operator bounds) stays deferred: the owner's instinct that operator members ride the
 > same call shape (`{ "+"(other: self): self }`) is recorded as the direction, with the
 > self-type reference as its one open spelling question — reopen when a real API needs it.
+>
+> **SHIPPED 2026-09-01 — §7 is the record.** Read it before quoting anything above it: §7.5
+> lists three things the plan did not know, two of which change what a sentence in §4/§6
+> means (UFCS satisfaction is judged where the generic BODY is written, not at the
+> instantiation site; and coherence, though enforced, is unreachable on today's dispatch
+> layer). §1's measurements are dated and were re-run at the landing; they still hold.
 
 Owner questions (2026-09-01, verbatim in intent): *should VL have a trait-like mechanism as
 part of a type contract — something like `{toString(self): string}`, satisfied by UFCS? We
@@ -275,3 +281,146 @@ what VL needs, and the WasmGC note above marks the only revisit trigger.
 * **OQ-5 — declaration-checking strictness**: may a bounded body use ONLY what bounds
   grant (proposed — it is what makes the errors good), or do bounds merely add to
   inference?
+
+## 7. SHIPPED — constraints phase 1 (2026-09-01)
+
+Everything in the header ruling block landed. This section records what was built, what was
+MEASURED that the plan above did not know, and the four things that are deliberately still
+open. Every number here was run on the seed built from this change; re-run before quoting.
+
+### 7.1 What exists now
+
+```vl
+type Showable = { toString(): string }
+function describe<T: Showable>(x: T): string { "<" + x.toString() + ">" }
+```
+
+* **Method members** parse in every type-literal position — the declaration body
+  (`parseTypeDecl`) and the inline atom (`parseTypeAtom`) share one `parseMethodMemberTail`,
+  so the two spellings of a bound cannot drift. Only a BOUND may consume one; a method member
+  in value position is a design refusal with a sentence (§7.3).
+* **Bounds** attach as `<T: Showable>` or `<T: { toString(): string }>`, and may name the type
+  parameters in scope (`<T: { eq(T): boolean }>`).
+* **Satisfaction is the existing call resolution**, asked at bound-check time: a FIELD of the
+  instantiation type first, then a UFCS free function. Nothing new is invented at the call.
+* **Strict bodies**: inside `f<T: B>`, member use on `x: T` resolves against B and nothing
+  else. An UNBOUNDED `<T>` keeps exactly today's behaviour, pinned by
+  `tests/cases/constraints/unbounded-type-param-unchanged.vl`.
+* **Operator bounds stay deferred (OQ-2)** and the implicit operator machinery is untouched:
+  `dbl<T>(x: T){x+x}` still runs at i32, f64 and string, in the same pin file.
+
+### 7.2 The architecture, and the measurement that chose it
+
+**Bounds ride the ANNOTATION path end to end.** A bound is stored as a `TypeRef` node index on
+two sparse side tables in `ast.vl` — `fnTpBound*` (function node, parameter index, annotation)
+and `declBound*` (declaration node, annotation) — modelled on `declGp*`, linear-scanned for its
+reason (a bound is a handful per program), and cleared in `tsReset`.
+
+The alternative was the checker's own recorded column, and it was refused on a measurement made
+the same week: `silent-class-inventory` D976 records that the column the checker writes for an
+inferred parameter shape does NOT survive into emit. A bound has to survive into emit, because
+the monomorphizer re-resolves each instance's member calls. An annotation does survive — it is
+present at parse, needs no inference, and the module merge already renames it (`modRwType`),
+its spelling tree already writes back (`tsToName`), and `vl fmt` already recovers it verbatim
+from source. Three existing mechanisms carried the feature instead of one new one.
+
+**The emitter needed NOTHING.** This is the measurement that shrank the whole landing, made on
+the 2026-09-01 seed before a line was written: `function describe<T>(x: T): string { "<" +
+x.toString() + ">" }` with a free `toString(self: Circle)` in scope ALREADY checked,
+monomorphized and ran, and so did the same body over `std:fmt`'s imported `toString` at `i32`.
+`emit_rewrite.drwWalk` resolves a member call against the receiver — struct field first, then a
+`self`-function — so an instance's `x.m(…)` was never the problem. What was missing was the
+JUDGEMENT, in both directions: nothing checked that the instantiation type could satisfy the
+call (D1001), and a bounded body could not name a member at all (D952).
+
+**Coherence keys on `tyToStr`, not on an arena index — a correction to the plan.** The plan
+said "key instantiation types by arena/interned identity, never by rendered spelling". Measured:
+the checker's type arena is APPEND-ONLY. `addTy` pushes unconditionally, so `mkArrayTy(TY_I32)`
+called twice yields two indices for one type; only the primitives and named user types are
+canonical, and the sole dedupe is `annotNameMemo`, keyed on annotation SPELLING and explicitly
+bypassed whenever a type-parameter environment is live. There is no interned identity to key
+on. The right key is `tyToStr` — the CHECKER's canonical renderer, whose documented contract is
+that `tyEq(a,b)` is exactly `tyToStr(a) == tyToStr(b)` decided structurally, and which folds
+nominality in so a newtype keys apart from its base. It is NOT `canon`/`tyToEmitName`, the
+emit-side spelling-dependent renderer CLAUDE.md warns about; that one runs a phase later and
+answers a different question.
+
+**Bounds chain by SUBSUMPTION, not by deferral — the plan's "for free" was half right.** §6
+OQ-3 says bounds chain through nested bounded generics for free. They do at EMIT. They did not
+at CHECK, and the witness is `describe<T: Showable>` relayed through an unbounded `twice<U>`:
+`twice(2.0)` was `vl check`-clean invalid wasm, because the inner call's "instantiation type"
+is still a type variable and deferring it hands the question to a pin that never asks. The
+demand IS knowable there — `U`'s bound either grants what `T`'s bound needs or it does not —
+so it is decided statically, which also puts the error on the declaration that is wrong rather
+than on a caller three modules away. Fixtures: `bound-chains-through-generic.vl` and
+`error-bound-chain-unbounded-relay.vl`.
+
+### 7.3 Refusals, all with wording
+
+| situation | message |
+|---|---|
+| unsatisfied instantiation | ``{s: f64} does not satisfy `Showable`: no `toString(): string` — the bound needs a field of that type or a `toString(self: {s: f64}, …)` function in scope at this call`` |
+| strict-body violation | ``no `foo` on `T` — its bound `Showable` grants `toString()``` |
+| bound alias in value position | ``` `Showable` is a BOUND, not a type — it declares method members, which constrain a type parameter and have no values. Use it as a constraint: `function f<T: Showable>(x: T)` ``` |
+| inline method member in value position | ``a method member `toString():string` may only appear in a BOUND — it demands that a call type-checks, which is not something a value carries…`` |
+| unbounded relay | ``` `describe` needs `T: Showable`, which demands `toString()` — but `U` is unbounded. Add it to `U`'s bound ``` |
+| alias bound naming a foreign parameter | ``the bound member `eq` on `U` names a type that does not resolve here — a bound alias body resolves in its OWN scope…`` |
+
+The value-position pair is a DESIGN refusal, not a capability gap: a method member demands that
+a call work, a value type describes what a value carries, and bridging them needs the dynamic
+dispatch §4 "Explicitly avoided" rules out. Both annotation ROUTES raise the identical sentence
+(the rendered-name arm of `nameToTyReal` and the spelling-tree arm of `tsToTyReal`), because a
+design rule enforced on one route only is a rule a re-render walks around.
+
+### 7.4 Self-reference: no new syntax, and the rule that follows
+
+A bound's member types are ORDINARY ANNOTATIONS resolved where the bound is USED, with the
+function's type parameters live. So `{ eq(T): boolean }` means "eq takes another one of me"
+because `T` is the parameter in scope — there is no `Self` keyword and phase 1 adds none.
+
+The consequence is stated rather than hidden: a bound ALIAS body resolves in its own scope, so
+`type Eq = { eq(T): boolean }` works for `<T: Eq>` and refuses for `<U: Eq>`, with a message
+that hands over the inline spelling. F-bounded generic bound aliases (`type Eq<S> = { eq(S):
+boolean }` with `<T: Eq<T>>`) are not in phase 1; the inline form covers the same ground.
+
+### 7.5 Measured, and NOT as the plan expected
+
+* **UFCS satisfaction is judged where the GENERIC BODY is written, not at the instantiation
+  site.** The ruling says "in scope at the instantiation site". The dispatch layer does not
+  work that way and did not before this change: the module merge builds ONE global
+  plain-to-mangled UFCS alias per member node (`driver.modSelfFnTarget`), resolved against the
+  rename map of the module that OWNS the node. Measured both ways — a generic in a dep whose
+  witness is imported only by the entry fails, at the bounded spelling with a sentence and at
+  the unbounded spelling with D952's empty message; and `x.toString()` cannot reach a
+  `self`-function in a module the caller did not import (`no field 'toString' on Circle`),
+  which is a live, deliberate scope rule. The practical rule for a library generic is therefore
+  **the generic's own module imports its witnesses**, which is the shape `showlib.vl` +
+  `std:fmt` takes and which runs. Making satisfaction genuinely per-site needs witness-keyed
+  dispatch through monomorphization; that is phase 2's price, not a bug in phase 1.
+* **Whole-program coherence is enforced and, on today's dispatch layer, NOT REACHABLE.** The
+  ledger is built (one row per generic × instantiation type × bound member, refusing a
+  disagreement and naming both sites), and no program can currently violate it: with `T` fixed
+  the type either carries the field or it does not, and the UFCS half already collapsed to one
+  witness per property name program-wide before the checker sees it. Reported as measured
+  rather than demonstrated. The ledger stays because it is the enforcement point the ruling
+  asks for and it is what must already exist the day dispatch becomes per-site.
+* **A closure-FIELD witness loses to a same-named `self`-function inside a generic body, and
+  the result is invalid wasm** — `silent-class-inventory` D1002, pre-existing, reproducible
+  with no constraints syntax. `dispatchRewrite` runs BEFORE `monomorphize` (a declared ordering
+  in `emit_sections.vl`), so the member call is rewritten once for every instance while the
+  receiver is still a type parameter. The field witness works whenever no `self`-function of
+  that name is in scope, which is what `bound-field-witness.vl` pins.
+
+### 7.6 Still open
+
+* **OQ-2, operator bounds** — unchanged, and the implicit machinery still carries them.
+* **Phase 2, per-site UFCS satisfaction** — needs the dispatch decision to move past
+  monomorphization (the same change D1002 wants).
+* **D1004 / D1005** — the UNBOUNDED half of the empty diagnostic and of the unsatisfied
+  instantiation. Both are closed for a bounded parameter and both stay open by ruling.
+* **LSP bound-member completion and hover on `x: T`** — a fast-follow, deliberately not in
+  scope. One line on what it needs: `check_query`'s member-completion path reads the receiver's
+  `TyObj` fields, so a `TyVar` receiver yields nothing; it needs the same
+  `tpBoundOfName` → `boundObjRootOf` → `boundMembersOf` walk the checker now has, with the
+  bound environment kept live past the body check (today it is pushed and popped inside
+  `checkFuncDeclNode`) or re-derived from `fnTpBoundOf` at the query's enclosing function.
