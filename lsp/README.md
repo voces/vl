@@ -5,7 +5,8 @@ The `vital-vscode` extension. It bundles a VSCode language client
 ([`src/server.ts`](./src/server.ts)) and provides diagnostics, type-aware hover
 and completion, go-to-definition, find references, inlay hints, formatting,
 quick-fixes, semantic highlighting, and a **Run Current File** command for `.vl`
-files.
+files, plus **per-test click-to-run** (VS Code's Testing API — gutter run icons
+and a Test Explorer tree) for `*.test.vl` files.
 
 The server type-checks via the TypeScript compiler core by default, or via the
 self-hosted compiler wasm seed — selectable with the `vital.checker` setting
@@ -27,6 +28,14 @@ self-hosted compiler wasm seed — selectable with the `vital.checker` setting
   native `vl` binary (`vl run`), resolved from the `vital.compilerPath` setting
   (relative paths are against the project root) or `vl` on the PATH; that path is
   optional and only used by the run command, not by diagnostics.
+- The **Testing API** integration (`tests.createTestController`) uses the same
+  binary and cwd resolution, spawning `vl test <file> [-t <describe > it path>]`
+  per clicked item. Test discovery is a host-side source scan
+  ([`src/testDiscovery.ts`](./src/testDiscovery.ts)) — a test's name is a string
+  literal, which the checker's token surface deliberately omits, and the runner
+  itself discovers by *instantiating* the module, which an editor must not do
+  per keystroke. That module is pure (no `vscode`) and unit-tested by
+  [`tests/lsp_test_discovery_test.ts`](../tests/lsp_test_discovery_test.ts).
 
 ## Build & install (run from the repo root)
 
