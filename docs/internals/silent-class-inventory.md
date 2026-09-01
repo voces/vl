@@ -29548,3 +29548,36 @@ Repro (loud check reject):
     type J = null | f64 | J[]
     const c: J = [1.0, null]
     print(1)
+
+---
+
+### D1011 — `print(x)` and `toString(x)` disagree on an f64 exact tie: the host's sink breaks shortest-digit ties to ODD, the spec and `std:fmt` to EVEN
+
+**check-clean silently wrong · `print(2023347301156851.3)` prints `…851.3`; `toString(x)` and the `\{x}` hole print `…851.2` · the value is exactly `2023347301156851.25` (bits `4835952189745799117`), whose two 17-digit candidates are equidistant, and ECMA-262 `Number::toString` step 5 — the rule every VL renderer is defined against — takes the EVEN last digit · 14 of 50,000 pseudo-random doubles, every one an exact tie (measured 2026-09-01, `scripts/vl-host/src/main.rs` `js_number_to_string`) · NOT a compiler defect: the host's `__print_f64__` re-formats Rust's `{:e}` and inherits its tie-break · pinned by bit pattern in `tests/vl_std_float_text_test.ts` · found by the serde critique panel (consistency §6, perf §4); vl-de asked for it as a row, not a fallout-table line**
+
+Two renderers for one value is the class that yields "it printed differently in the test
+than in the app", and serde makes it three: `show<T>` / the JSON renderer will ride
+`std:fmt`'s `toString`, which is correct here (Burger–Dybvig with the spec's final-digit
+choice, agrees with V8 on 50,000 of 50,000). `print`'s f64 arm is the odd one out, and it
+is the arm users reach for first.
+
+* **WHERE.** `js_number_to_string` in `scripts/vl-host/src/main.rs` — its own doc comment
+  carries the measurement and the fix recipe: the four LAYOUT rows (`-0`, `1e21`, `1e-7`,
+  `Infinity`) are already handled; the DIGIT STRING is inherited from `{:e}`, and the fix is
+  a shortest-with-ties-to-even producer (`for k in 1..=17 { format!("{:.*e}", k - 1, v) }`,
+  first `k` that round-trips — verify Rust's exact-precision rounding is half-to-even
+  first). Not a fifth layout arm.
+* **WHO.** A host change, so the shared-cargo-target rule applies (CLAUDE.md): build with an
+  isolated `--target-dir`, and the shared binary is rebuilt as a coordinator step after the
+  merge. The pinning test lists the divergent set, so the fix flips a test rather than
+  passing unnoticed; flip the pin in the same change.
+* **THE OWNER'S STANDING RULE** is that `print` rides the renderer. Binding the f64 arm to
+  `std:fmt` (or making the host produce the same digits) before `show<T>` lands is the cheap
+  moment; after it there are three implementations to keep agreeing.
+
+Repro (check-clean silently wrong):
+
+    const x: f64 = 2023347301156851.3
+    print(x)
+    // PRINTS 2023347301156851.3
+    // the spec, `toString(x)` from std:fmt, and the `\{x}` hole all say 2023347301156851.2
