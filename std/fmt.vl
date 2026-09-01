@@ -29,13 +29,30 @@
 // NO import before and needs `import { toString } from "std:fmt"` now. std has
 // no deprecation story, so the compiler pays for the break with a targeted
 // refusal instead — `typecheck.stdFmtMovedNote` appends the import line to the
-// undeclared-identifier message for BOTH `toString` and the old `toStr`
-// spelling, following the `then`-removal precedent (#2094).
+// undeclared-identifier message AND to the member-access-on-a-scalar sentence,
+// for BOTH `toString` and the old `toStr` spelling (four assertions in
+// `tests/cases/tostring/moved-to-std-hint.vl`; the `toStr` note carries an
+// expiry, `toString`'s does not), following the `then`-removal precedent
+// (#2094).
 //
 // WHAT IS WRITTEN HERE is the number rendering — `toString` over the two integer
 // widths, boolean, and (new) `f64` — plus `parseF64`, the inverse. The f64
 // halves are the interesting ones and their whole design is in the
 // `f64 ↔ TEXT` block below; read that before touching them.
+//
+// THE NAME IS BORROWED AND THE DOMAIN IS NOT. In the six languages cited above
+// `toString` is defined on every value; here it is exactly `i32 | i64 |
+// boolean | f64`. Measured 2026-09-01: `"abc".toString()` → `no method
+// '.toString' on string`, `[1,2].toString()` → `… on array i32[]`,
+// `p.toString()` on a struct → `no field 'toString' on Point`. A string
+// identity arm is deliberately absent — `s.toString()` is `s`, and an arm that
+// does nothing invites the name to grow into a universal renderer VL has no
+// overloading or traits to deliver (the derived `show<T>` is that future,
+// serde stage 2). And because the namespace is flat, a file that declares its
+// own `toString` cannot also import this one: that is a HARD refusal
+// (`Duplicate binding "toString"` —
+// `tests/cases/tostring/import-and-declare-collide.vl`), and
+// `import { toString as … }` is the escape.
 //
 // WHAT IS NOT, ON THE NUMERIC SIDE: `f32`, in either direction, and any radix
 // but ten. Neither is "later here"; both are a different computation.
@@ -102,14 +119,17 @@
 // formatting import stays small — buys the bytes back by paying in the hazard
 // above.
 //
-// AND THAT NUMBER IS THE `none` RUNG. THE SAME PROGRAM IS **1,041 bytes at `-O`
-// and 542 at `-O3`** (measured 2026-09-01, same build). Binaryen's DCE finds
-// what the VL pipeline does not, so an OPTIMIZED consumer of this module pays
-// almost nothing for the parts it does not call; the 17,062 is what an
-// unoptimized build carries. Quote the rung with the number — reading 17 KB as
-// the standing cost of importing `std:fmt` overstates it by 31x, and the same
-// correction applies to every "importing `std:fmt` costs …" claim in the tree
-// (`std:utf8`'s header carries the before/after at all three rungs).
+// AND THAT NUMBER IS THE `none` RUNG — AND THE PROBE IS CONSTANT-FOLDABLE. The
+// same program is 1,041 bytes at `-O` and 542 at `-O3`, but at `-O3` the module
+// holds exactly ONE function (`wasm-dis p.wasm | grep -c '^ (func'` → 1):
+// binaryen evaluated `toString(42)` at compile time, so 542 prices the FOLD,
+// not the renderer. With the value not compile-time known (a loop-accumulated
+// one), `-O3` is 652 for the i32 arm, 5,164 once the f64 arm is live, and
+// 7,806 with `parseF64` live too (2026-09-01, same build). DCE does find what
+// the VL pipeline does not — but quote the rung AND what the program reaches:
+// the standing cost is ~0.6 KB for integer rendering and ~5 KB once a float is
+// rendered, and the same correction applies to every "importing `std:fmt`
+// costs …" claim in the tree (`std:utf8`'s header carries all three rungs).
 //
 // `padLeft` IS THE ONE NAME THAT DID NOT MOVE VERBATIM. `std:str` spells it
 // `padStart`, matching `padEnd` beside it and the JS pair both are modelled on;
@@ -368,13 +388,18 @@ export function padLeft(self: string, width: i32, fill: string) {
 //     from the repo root — note VL_STD, without which the host resolves std:
 //     from the BINARY's own checkout and silently measures the wrong tree:
 //       VL_STD=$PWD/std scripts/vl-host/target/release/vl build p.vl -o p.wasm
+//       # optimized rungs (wasm-opt is NOT on PATH — CLAUDE.md):
+//       VL_WASM_OPT=./node_modules/.bin/wasm-opt VL_STD=$PWD/std \
+//         scripts/vl-host/target/release/vl build p.vl -O3 -o p.wasm
 //       # p.vl:  import { toString } from "std:fmt"
 //       #        const n = 42
 //       #        print(n.toString())
 //
 // The formatter cannot move: a flat namespace has one `toString`, so the f64 arm
 // and everything under it are in this module by construction. That makes the
-// parser's own 2,822 bytes the entire question, and paying them buys the pair
+// parser's own 2,822 bytes (at the `none` rung — at `-O3` the unused parser costs
+// nothing measurable, which strengthens this answer) the entire question, and
+// paying them buys the pair
 // staying in one place — a reader who found `toString` finds its inverse beside it,
 // and the exact-arithmetic helpers have one home rather than being exported from
 // here to be reachable there. The real fix is whole-program dead-code

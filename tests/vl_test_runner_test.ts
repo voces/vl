@@ -47,7 +47,11 @@ const runTest = async (
     args: ["test", target, "--compiler", COMPILER, ...extraArgs],
     stdout: "piped",
     stderr: "piped",
-    env: { RUST_BACKTRACE: "0", NO_COLOR: "1", ...extraEnv },
+    // VL_STD pins std to THIS tree: without it the host resolves std: from the
+    // BINARY's checkout (the main repo), and a branch that changes a std export
+    // silently grades against the wrong std — measured live when the toString
+    // rename's template constant met the main repo's still-toStr std here.
+    env: { RUST_BACKTRACE: "0", NO_COLOR: "1", VL_STD: `${ROOT}/std`, ...extraEnv },
   }).output();
   return {
     code,
@@ -106,6 +110,9 @@ Deno.test({
     expectHas(r.err, "expected 7 to equal 8");
     // Strings render quoted so `"4"` and `4` are distinguishable.
     expectHas(r.err, 'expected "left" to equal "right"');
+    // the renderer-agreement pin: std:test's private i64 renderer must produce
+    // the same digits std:fmt's toString does at i64 min (see fail.test.vl)
+    expectHas(r.err, "expected -9223372036854775808 to equal 1");
     // `fail(msg)` is the no-matcher escape hatch.
     expectHas(r.err, "no branch reached");
     // A failing test's own output is captured and shown beneath it.
@@ -207,7 +214,7 @@ Deno.test({
     // Every other file still ran.
     expectHas(r.err, "ok   adds");
     expectHas(r.err, "ok   still runs after two traps");
-    expectHas(r.err, "6 files · 15 passed · 11 failed · 1 skipped");
+    expectHas(r.err, "6 files · 15 passed · 12 failed · 1 skipped");
   },
 });
 

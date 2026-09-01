@@ -2051,7 +2051,9 @@ from the lexer's.
 
 A template whose holes are ALL strings still pulls `std:fmt` (and the `std:str` it imports):
 17,120 bytes against 1,920. The renderer is merged but never CALLED — byte-identical to an
-import-and-never-call control — so this is dead weight, not a wrong lowering. It is
+import-and-never-call control — so this is dead weight, not a wrong lowering (and at the
+`-O3` rung binaryen's DCE erases it entirely: the string-hole template is 198 bytes against
+200 for the `+` concat it replaces — the "dead weight" claim holds only at the `none` rung). It is
 unavoidable *here* because the injection decision is made at TOKEN level: every host closes
 the module graph from a textual scan before any lexing happens, so nothing at that moment
 knows a hole's type. The fix is whole-program dead-code elimination, which `std/fmt.vl`'s own
