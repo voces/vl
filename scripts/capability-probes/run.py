@@ -78,13 +78,24 @@ def main():
                           r"[^\n\"]{0,54}", err)
             if chk.returncode != 0:
                 where = "check refuses"          # clause 2: the checker owns the diagnosis
-            elif re.search(r"Invalid input WebAssembly|WebAssembly translation error", err):
-                where = "SILENT (check rc 0)"    # clause 1: worse, and easy to misread as emit
+            elif re.search(r"wasm backtrace|call stack exhausted", err):
+                # THE COMPILER ITSELF TRAPPED. Not a refusal at all -- no diagnosis was
+                # produced and no module was written. It used to land in the `emit refuses`
+                # fallback, which reads as an orderly decision the compiler never made.
+                where = "COMPILER TRAP (check rc 0)"
+            elif re.search(r"Invalid input WebAssembly|WebAssembly translation error"
+                           r"|failed to parse WebAssembly", err):
+                # clause 1: worse, and easy to misread as emit. `failed to parse` is the
+                # same outcome as the other two reached by a different host path -- a probe
+                # was graded `emit refuses` on its absence, with the DETAIL line then
+                # printing "Checked 1 file, no errors", which is the symptom of a SILENT
+                # cell and not of a refusal. Classify by what happened to the MODULE.
+                where = "SILENT (check rc 0)"
             else:
                 where = "emit refuses"
             inv = re.search(r"(Invalid input WebAssembly code[^\n]{0,60}|"
                             r"type mismatch: expected [^\n]{0,48})", err)
-            if where.startswith("SILENT"):
+            if where.startswith("SILENT") or where.startswith("COMPILER TRAP"):
                 # The validator's own sentence, not the clean `vl check` output that
                 # precedes it -- "Checked 1 file, no errors" is the SYMPTOM, not the detail.
                 detail = inv.group(0) if inv else (lines[-1][:70] if lines else err[:70])
