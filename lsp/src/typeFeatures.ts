@@ -509,7 +509,23 @@ export type Completion = {
    * identifier/keyword items whose `name` is the insert text.
    */
   insertText?: string;
+  /**
+   * Secondary label text (LSP `labelDetails.description`, rendered right-
+   * aligned on the suggestion row). Auto-import items carry the providing
+   * module key (`std:test`) here so the user sees where the name comes from.
+   */
+  description?: string;
+  /**
+   * Extra workspace edits applied alongside the insertion (LSP
+   * `additionalTextEdits`). Auto-import items carry the import-statement
+   * rewrite here; `server.ts` also deprioritizes such items (`sortText`) so
+   * in-scope names rank first.
+   */
+  extraEdits?: CompletionEdit[];
 };
+
+/** One extra edit a completion applies on accept (`additionalTextEdits`). */
+export type CompletionEdit = { range: LspRange; newText: string };
 
 /**
  * The compact inline type annotation shown on a completion's label row, via the
@@ -887,4 +903,140 @@ export const snippetCompletions = (afterDot: boolean): Completion[] => {
       insertText: "return ${0}",
     },
   ];
+};
+
+// ---- std auto-import completions ---------------------------------------------
+//
+// Completion items for std-module exports that are NOT in scope: accepting one
+// inserts the name AND rewrites the import statement (`extraEdits`), so the
+// program stays check-clean. The import rewrite must land where `vl fmt` keeps
+// it — fmt SORTS a statement's specifiers alphabetically (and preserves the
+// order of the statements themselves) — so the rewritten statement is spelled
+// by the real formatter when the caller supplies one (`formatImport`, wired to
+// the seed's `formatSrc` so the placement can't drift from fmt), with an
+// alphabetical hand-sort as the seedless fallback.
+
+/** Convert a char offset in `source` to a 0-based LSP position. */
+const offsetToPos = (
+  source: string,
+  offset: number,
+): { line: number; character: number } => {
+  let line = 0;
+  let lineStart = 0;
+  for (let i = 0; i < offset; i++) {
+    if (source[i] === "\n") {
+      line++;
+      lineStart = i + 1;
+    }
+  }
+  return { line, character: offset - lineStart };
+};
+
+const escapeRegExp = (s: string): string =>
+  s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * The edit that makes `name` (exported by the module at `moduleKey`) imported
+ * in `source`:
+ *   - an existing `import { … } from "<moduleKey>"` (single- or multi-line) is
+ *     REPLACED by the same statement with `name` merged into its specifiers,
+ *     spelled by `formatImport` (fmt-sorted) or an alphabetical fallback;
+ *   - otherwise a new `import { name } from "<moduleKey>"` line lands after the
+ *     LAST import statement (fmt preserves statement order and does not force a
+ *     blank line), or at the very top when the file has none.
+ * `undefined` when the statement already binds `name` (plain or as an alias
+ * source) — nothing to do.
+ */
+export const importInsertionEdit = (
+  source: string,
+  moduleKey: string,
+  name: string,
+  formatImport?: (stmt: string) => string | undefined,
+): CompletionEdit | undefined => {
+  const existing = new RegExp(
+    `import\\s*\\{([^}]*)\\}\\s*from\\s*"${escapeRegExp(moduleKey)}"`,
+  ).exec(source);
+  if (existing !== null) {
+    const specs = existing[1].split(",").map((s) => s.trim()).filter((s) =>
+      s.length > 0
+    );
+    // Already bound here — exactly, or as the source half of an `as` alias.
+    if (specs.some((s) => s === name || s.startsWith(`${name} `))) {
+      return undefined;
+    }
+    const stmt = `import { ${[...specs, name].join(", ")} } from "${moduleKey}"`;
+    const newText = (formatImport?.(stmt + "\n") ??
+      `import { ${[...specs, name].sort().join(", ")} } from "${moduleKey}"`)
+      .trimEnd();
+    return {
+      range: {
+        start: offsetToPos(source, existing.index),
+        end: offsetToPos(source, existing.index + existing[0].length),
+      },
+      newText,
+    };
+  }
+  // No import of this module yet: a fresh statement after the last import (the
+  // statement-spanning regex keeps a multi-line import intact — a line scan for
+  // `^import` would split one).
+  const anyImport = /import\s*(\{[^}]*\}\s*from\s*)?"[^"]*"/g;
+  let lastEnd = -1;
+  for (let m = anyImport.exec(source); m !== null; m = anyImport.exec(source)) {
+    lastEnd = m.index + m[0].length;
+  }
+  const stmt = `import { ${name} } from "${moduleKey}"`;
+  if (lastEnd < 0) {
+    return {
+      range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } },
+      newText: stmt + "\n",
+    };
+  }
+  const after = offsetToPos(source, lastEnd);
+  const insertAt = { line: after.line + 1, character: 0 };
+  // A last import that the file ends on without a newline: append below it.
+  if (source.indexOf("\n", lastEnd) < 0) {
+    return { range: { start: after, end: after }, newText: "\n" + stmt };
+  }
+  return { range: { start: insertAt, end: insertAt }, newText: stmt + "\n" };
+};
+
+/** One std-module export the auto-import pass may offer. */
+export type StdExportCandidate = {
+  name: string;
+  kind: CompletionKind;
+  detail?: string;
+};
+
+/**
+ * Auto-import completion items over `stdExports` (module key → exports, from
+ * the server's cached per-module surface scan): every export whose name is not
+ * already in scope (`inScope`) yields ONE item — first module wins on a name
+ * two modules export — carrying the providing module key as `description` and
+ * the import rewrite as `extraEdits`. Modules are visited in sorted-key order
+ * so the winner is deterministic.
+ */
+export const stdAutoImportCompletions = (
+  source: string,
+  stdExports: Map<string, StdExportCandidate[]>,
+  inScope: (name: string) => boolean,
+  formatImport?: (stmt: string) => string | undefined,
+): Completion[] => {
+  const out: Completion[] = [];
+  const offered = new Set<string>();
+  for (const key of [...stdExports.keys()].sort()) {
+    for (const exp of stdExports.get(key) ?? []) {
+      if (inScope(exp.name) || offered.has(exp.name)) continue;
+      const edit = importInsertionEdit(source, key, exp.name, formatImport);
+      if (edit === undefined) continue; // imported but not in scope; defensive
+      offered.add(exp.name);
+      out.push({
+        name: exp.name,
+        kind: exp.kind,
+        detail: exp.detail,
+        description: key,
+        extraEdits: [edit],
+      });
+    }
+  }
+  return out;
 };

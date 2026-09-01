@@ -69,8 +69,11 @@ import {
   SEMANTIC_TOKEN_LEGEND,
   semanticTokensDataFromWasm,
   snippetCompletions,
+  stdAutoImportCompletions,
+  type StdExportCandidate,
   typeLabelDetail,
 } from "./typeFeatures.ts";
+import { STD_SOURCES } from "../../std/embedded.ts";
 
 // The language id the extension registers (`package.json` → contributes.languages,
 // id `vital`, scope `source.vital`). Used as the markdown fence info string so
@@ -723,7 +726,58 @@ const toCompletionItem = (
     item.insertText = c.insertText;
     item.insertTextFormat = InsertTextFormat.Snippet;
   }
+  // Auto-import items: the providing module on the label row, the import
+  // rewrite on accept, and a sortText demotion so in-scope names rank first
+  // (`~` collates after every identifier start char).
+  if (c.description !== undefined) {
+    item.labelDetails = { ...item.labelDetails, description: c.description };
+  }
+  if (c.extraEdits !== undefined) {
+    item.additionalTextEdits = c.extraEdits.map((e) => TextEdit.replace(e.range, e.newText));
+    item.sortText = `~${c.name}`;
+  }
   return item;
+};
+
+// ---- std auto-import completion source ---------------------------------------
+//
+// Per-std-module export surfaces (name/kind/type) for `stdAutoImportCompletions`.
+// Sources are read through the SAME reader precedence the checker uses (the
+// workspace's own `std/` wins over the embedded map, so dogfooding offers what
+// the checker will actually accept), and cached by module source text so a
+// workspace std edit refreshes its entry. Types come from one `scopeAt` over the
+// module itself (its own decls, rendered unmangled), matched to the surface's
+// export list.
+const stdExportCache = new Map<string, { src: string; exports: StdExportCandidate[] }>();
+const SCOPE_KINDS = ["variable", "parameter", "function"] as const;
+const stdExportsForCompletion = async (): Promise<Map<string, StdExportCandidate[]>> => {
+  const out = new Map<string, StdExportCandidate[]>();
+  if (wasmChecker === undefined) return out;
+  for (const key of Object.keys(STD_SOURCES)) {
+    const src = (await workspaceReader(key)) ?? STD_SOURCES[key];
+    const cached = stdExportCache.get(key);
+    if (cached !== undefined && cached.src === src) {
+      out.set(key, cached.exports);
+      continue;
+    }
+    const surface = wasmChecker.moduleSurface(src, key);
+    const lastLine = src.split("\n").length - 1;
+    const scope = await wasmChecker
+      .scopeAt(src, key, workspaceReader, lastLine, 0)
+      .catch(() => []);
+    const byName = new Map(scope.map((b) => [b.name, b]));
+    const exports: StdExportCandidate[] = surface.exports.map((e) => {
+      const b = byName.get(e.name);
+      return {
+        name: e.name,
+        kind: b !== undefined ? SCOPE_KINDS[b.kind] ?? "function" : "function",
+        detail: b !== undefined && b.type !== "" ? b.type : undefined,
+      };
+    });
+    stdExportCache.set(key, { src, exports });
+    out.set(key, exports);
+  }
+  return out;
 };
 
 // The identifier `[A-Za-z_][A-Za-z0-9_]*` immediately to the LEFT of `character`
@@ -832,7 +886,16 @@ connection.onCompletion(async (params): Promise<CompletionItem[]> => {
   const identifiers = [...byName.values()].map((c) => toCompletionItem(c));
   const keywords = keywordCompletions(false).map((c) => toCompletionItem(c));
   const snippets = snippetCompletions(false).map((c) => toCompletionItem(c));
-  return [...identifiers, ...keywords, ...snippets];
+  // std exports NOT in scope, offered with an import-statement rewrite on
+  // accept (`additionalTextEdits`) — spelled by the seed's own formatter so the
+  // rewritten import is exactly what `vl fmt` keeps.
+  const autoImports = stdAutoImportCompletions(
+    text,
+    await stdExportsForCompletion(),
+    (name) => byName.has(name),
+    (stmt) => wasmChecker?.formatSrc?.(stmt),
+  ).map((c) => toCompletionItem(c));
+  return [...identifiers, ...autoImports, ...keywords, ...snippets];
 });
 
 // Document formatting (D4): rewrite the whole document through the self-hosted
