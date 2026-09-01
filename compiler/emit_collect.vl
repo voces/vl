@@ -7141,18 +7141,28 @@ function anonLeafJoinAnnTy(lhs: i32): i32 {
   // call's atom" — and gated on the reader here it is licenced by construction: the read has
   // succeeded, so every literal the callee hands back is a member and its return row is marked.
   //
-  // WHAT IT BUYS IS THE FAMILY WITH NO LITERAL AT ALL. An empty callee body has no return path
-  // to refuse, and a parameter every call site passes `null` to answers through D891's arm — in
-  // both the set is the DEFAULT's atom alone, `atoms.length < 2` ends the rung, and the pair
-  // falls to D804's `i32`/`string` corner as check-clean invalid wasm. The callee's declared
-  // return names the missing atom exactly. Where the reader DID hand back literals this is a
-  // no-op: the checker made those literals agree with the annotation, so the atom is already in
-  // the set and the dedup below drops it.
+  // WHAT IT BUYS IS THE FAMILY WITH NO LITERAL AT ALL, AND THAT IS ALSO ITS FIRST GATE. An
+  // empty callee body has no return path to refuse, and a parameter every call site passes
+  // `null` to answers through D891's arm — in both the set is the DEFAULT's atom alone,
+  // `atoms.length < 2` ends the rung, and the pair falls to D804's `i32`/`string` corner as
+  // check-clean invalid wasm. The callee's declared return names the missing atom exactly.
+  //
+  // A CALLEE THAT DID HAND BACK A LITERAL STANDS DOWN, and the reason is NOT that the arm would
+  // be a no-op there. It shipped once on exactly that reasoning — "the checker made those
+  // literals agree with the annotation, so the atom is already in the set and the dedup drops
+  // it" — and stamping `anonLeafAnnTy` for a CALL operand arms a SECOND reader that has nothing
+  // to do with atoms: D873's post-mint `anonLeafCarrierRowOf`. With D901's fold in the tree the
+  // family's mint is a plain scalar row rather than a box, and that rung then pointed the
+  // CALLEE's declared `{r: f64}` return row at the row the DEFAULT literal had just minted —
+  // `src` emitted `struct.new $i32row (f64.const 1.5)`, `expected i32, found f64`. Measured:
+  // ungated, this arm cost the three `d892_box_*_f64_i32` cells and `d901_fold_f32_dest`, all
+  // four `runs` on master. Where the reader answered, the LITERALS are the family.
   if ln is Call {
     const rlits: i32[] = []
     const rfns: string[] = []
     const rpars: i32[] = []
     if !anonLeafCalleeRead(ln.callFn, rlits, rfns, rpars, 0) { return 0 - 1 }
+    if rlits.length > 0 { return 0 - 1 }
     const cf = unwrapParen(ln.callFn)
     if cf < 0 { return 0 - 1 }
     const cfn = P.nodes[cf]
@@ -7238,6 +7248,53 @@ function anonLeafAnnAtomOf(tyIx: i32, fname: string): string {
     i = i + 1
   }
   ""
+}
+
+// D911 — MAY AN ANNOTATION'S atom JOIN A SET OF VALUE ATOMS? Only when it does not WIDEN the
+// family past every value in it, and the direction is the whole rule.
+//
+// An annotation atom describes a value that is ABSENT — that is the only reason this rung reads
+// one (D872: `let a: {r: i32} | null = null` has no second literal at all). The atoms beside it
+// come from values that will actually be BUILT. So the two directions are not symmetric:
+//
+//   NARROWER annotation, wider value (`a: {r: i32} | null` … `?? { r: 1.5 }`) — D901's fold
+//       answers `f64`, which is the atom the one real literal already has, and it builds there
+//       unchanged. That is `d862_ann_only_atom_f64` and `d872_module_ann_only_f64`, and they run.
+//   WIDER annotation, narrower value (`a: {r: f64} | null` … `?? { r: 7 }`) — the fold answers
+//       `f64` too, and now the row is a type NO value in the family has: the int literal has to
+//       widen into it and does not. `expected f64, found i32`, ON MASTER — this arm's own
+//       IDENT half has had that defect since D872, and the same shape one atom over
+//       (`a: {r: f32} | null`) is not a fold edge at all, so a two-atom BOX mints where the
+//       family has one value and the read is a `wasm trap: cast failure`, also on master.
+//
+// So the gate is a WIDTH comparison and not a "is it numeric" one, and it closes two shapes
+// master gets wrong as well as keeping D912's CALL arm from creating a third. A NON-numeric
+// annotation atom is a real disagreement no join folds and always joins — which is D912's own
+// population, an `i32` or `f64` return beside a `string` default. So is any atom set with no
+// numeric value in it to widen past.
+//
+// The lattice is `typecheck.numWidensName`'s, flattened to a rank because only the comparison
+// is needed: `i32` widens into everything, `f32` and `i64` into `f64` and into nothing else.
+function anonLeafAtomWidth(atom: string): i32 {
+  if atom == "i32" { return 0 }
+  if atom == "i64" { return 1 }
+  if atom == "f32" { return 1 }
+  if atom == "f64" { return 2 }
+  0 - 1
+}
+
+function anonLeafAnnAtomJoins(annAtom: string, atoms: string[]): boolean {
+  const aw = anonLeafAtomWidth(annAtom)
+  if aw < 0 { return true }
+  let best = 0 - 1
+  let i = 0
+  while i < atoms.length {
+    const w = anonLeafAtomWidth(atoms[i])
+    if w > best { best = w }
+    i = i + 1
+  }
+  if best < 0 { return true }
+  aw <= best
 }
 
 // D884 — MAY `atom` JOIN THE ATOMS ALREADY IN THE SET?
@@ -8763,7 +8820,10 @@ function anonLeafPolyUnionSetOpen(ow: i32, fname: string, val: i32): string {
   // byte-identical.
   const annAtom = anonLeafAnnAtomOf(anonLeafAnnTyOf(ow), fname)
   if annAtom != "" {
-    if anonLeafAtomAdmits(annAtom, atoms) {
+    if (
+      anonLeafAtomAdmits(annAtom, atoms) &&
+      anonLeafAnnAtomJoins(annAtom, atoms)
+    ) {
       let seenA = false
       let ak = 0
       while ak < atoms.length {

@@ -25796,7 +25796,7 @@ Repro (now runs, printing `5`):
 
 ### D911 — [CLOSED 2026-08-31] the four argument CARRIERS D891's call-site reader could not name, and the name-as-a-value guard was wider than its own reason
 
-**closed as `runs` · was check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` · a CLAUSE-1 close, 4 cells (`distilled/named/d891_bound_arg_is_ident`, `_bound_named_arg`, `_bound_nested_arg`, `_bound_fn_as_value`) · ABLATED family 33 hand-written probes, six rungs, each one load-bearing on its own · corpus `cmp` **2,489 modules · 2,039 identical · 0 DIFFER · 0 LOST** · distilled corpus `runs → not-runs` ZERO, `→ silent` ZERO**
+**closed as `runs` · was check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` · a CLAUSE-1 close, 4 cells (`distilled/named/d891_bound_arg_is_ident`, `_bound_named_arg`, `_bound_nested_arg`, `_bound_fn_as_value`) · ABLATED family 42 hand-written probes, TWELVE rungs, each one load-bearing on its own · measured against master `3f2ebc40` (which carries D901/D902) — the first cut was measured against `5c0224de` and cost four of D901's cells, see D918 · corpus `cmp` **2,491 modules · 2,041 identical · 0 DIFFER · 0 LOST** · distilled corpus `runs → not-runs` ZERO, `→ silent` ZERO**
 
 Repro (now runs, printing `7`):
 
@@ -25865,30 +25865,35 @@ Repro (now runs, printing `7`):
   `5c0224de`, rebuilt here rather than quoted: **`d4396c4e963741f1d4b310f028ac71b4`, 1,580,471
   bytes**, byte-identical to the seed `agent-setup.sh` produces from master.
 
-  | rung | what it is | runs/33 | reverts |
-  |---|---|---|---|
-  | all ten (shipped) | | **26** | corpus `cmp` 0 DIFFER · 0 LOST |
-  | strip-all (master) | | 4 | — |
-  | −the bound-value IDENT arm (D913) | | 22 | 4 |
-  | −the SELF-PASS skip (D914) | | 24 | 2 |
-  | −`orderArgsByParamNames` at the call site | a NAMED argument | 24 | 2 |
-  | −the CALL arm on an argument | a NESTED argument | 23 | 3 |
-  | −the arg-IDENT reader | | 21 | 5 |
-  | −the narrowed name-as-value guard | | 24 | 2 |
-  | −the callee-return annotation atom (D912) | | 21 | 5 |
-  | −the KIND gate at the two return-row sites | | 23 | 3 |
-  | −the fall-through-null supersede | | 22 | 4 |
-  | −the `$fnsig` result slot (D915) | | 24 | 2 |
+  | rung | what it is | runs/42 | reverts | `runs` lost vs master |
+  |---|---|---|---|---|
+  | all twelve (shipped) | | **35** | corpus `cmp` 0 DIFFER · 0 LOST | 0 |
+  | strip-all (master) | | 11 | 24 | — |
+  | −the bound-value IDENT arm (D913) | | 31 | 4 | 0 |
+  | −the SELF-PASS skip (D914) | | 33 | 2 | 0 |
+  | −`orderArgsByParamNames` at the call site | a NAMED argument | 33 | 2 | 0 |
+  | −the CALL arm on an argument | a NESTED argument | 32 | 3 | 0 |
+  | −the arg-IDENT reader | | 30 | 5 | 0 |
+  | −the narrowed name-as-value guard | | 33 | 2 | 0 |
+  | −the callee-return annotation atom (D912) | | 30 | 5 | 0 |
+  | −the KIND gate at the two return-row sites | | 32 | 3 | 0 |
+  | −the fall-through-null supersede | | 31 | 4 | 0 |
+  | −the `$fnsig` result slot (D915) | | 33 | 2 | 0 |
+  | −the literal-bearing-callee stand-down (D918) | | 33 | 2 | **2** |
+  | −the annotation-atom WIDTH gate (D918) | | 30 | 5 | **3** |
 
-  `runs` LOST versus master: **ZERO in every row of that table.**
+  `runs` LOST versus master is ZERO in every row EXCEPT the last two, and that is exactly what
+  those two rungs are: they are not capability, they are the interlock between D912 and D901's
+  fold, and the ablation is what says so. See D918.
 
-* **COUNTERS, reach AND ans, and every guard fires.** Over the 33 probes: the bound-value ident
+* **COUNTERS, reach AND ans, and every guard fires.** Over the 42 probes: the bound-value ident
   arm 18/16, the self-pass 18/4, the named-argument binding 4/4, the call-valued argument 8/6,
-  the arg-ident reader 14/12, the function-value test 6/4, the callee-annotation atom 33/28, the
-  two return-row kind gates 6/3 each, the fall-through null 5/4, the `$fnsig` result slot 43/20.
-  Over `tests/cases` + `std` (2,043 reporting) every `ans` is zero outside this landing's own
-  four fixtures — the `$fnsig` slot is ASKED 2,925 times and moves 23, all of them here — which
-  is why `cmp` is 0 DIFFER.
+  the arg-ident reader 14/12, the function-value test 6/4, the callee-annotation atom 37/10, the
+  two return-row kind gates 6/3 each, the fall-through null 8/4, the `$fnsig` result slot 43/20,
+  the literal-bearing-callee stand-down 22, the width gate 16 offered / 6 refused.
+  Over `tests/cases` + `std` (2,045 reporting) every `ans` is zero outside this landing's own
+  four fixtures — the `$fnsig` slot is ASKED 2,921 times and moves 23, the width gate is offered
+  39 atoms and refuses **0** — which is why `cmp` is 0 DIFFER.
 
 * **REAL DISASSEMBLY** (`./node_modules/.bin/wasm-dis`, binaryen 130), on
   `d891_bound_nested_arg`. Master: `mk` is `(func (result (ref $0)))` over
@@ -25898,25 +25903,27 @@ Repro (now runs, printing `7`):
   merged. Here `mk` is `(func (result (ref $1)))` and returns `struct.new $1`: the SIGNATURE and
   the RETURNED VALUE moved together, which is the pair the kind gate covers.
 
-* **MEASURED, all seven instruments, against master `5c0224de`.** Corpus byte-identity:
-  **2,489 modules · 2,039 identical · 0 DIFFER · 0 LOST · 450 not buildable by the base.**
-  Distilled corpus: **28 cells `check-clean invalid wasm` → `runs`**, `runs → not-runs`
+* **MEASURED, all seven instruments, against master `3f2ebc40`.** Corpus byte-identity:
+  **2,491 modules · 2,041 identical · 0 DIFFER · 0 LOST · 450 not buildable by the base.**
+  Distilled corpus: **30 cells `check-clean invalid wasm` → `runs`**, `runs → not-runs`
   **ZERO**, `→ silent` **ZERO**, one cell (`d911_arg_ident_narrow_use`) silent→silent with a
-  different message. `tests/cases` + `std`: **2,039 → 2,043 of 2,489 building in 4.6 s at
+  different message. `tests/cases` + `std`: **2,041 → 2,045 of 2,491 building in 5.1 s at
   `JOBS=6`**, set difference exactly this landing's four fixtures, 0 LOST. Shared-instance probe:
-  `distilled/cells` **1,477 · 0 differ** and `distilled/named` **6,036 · 0 differ**, before AND
-  after. D411's 103-cell grid 103 → 103 `runs`, 0 movement; D661's 211-cell grid 211 → 211
+  `distilled/cells` **1,477 · 0 differ**, `distilled/named` **6,011 → 6,048 · 0 differ**,
+  `tests/cases/types` **200 → 204 · 0 differ**, `tests/cases/unions` **230 · 0 differ**, before
+  AND after. D411's 103-cell grid 103 → 103 `runs`, 0 movement; D661's 211-cell grid 211 → 211
   `runs`; `d791_push_alias` still REFUSES; `d875_assign_call` still prints `7`;
   `d884_litunion_beside_str` still runs; `d892_box_param_boolean_i32` still prints `true`;
-  `d891_module_scope` still runs. Fixture:
-  `tests/cases/types/coalesce-default-row-argument-carriers.vl`.
+  `d891_module_scope` still runs; every one of D901/D902's five cells grades as master does.
+  Fixture: `tests/cases/types/coalesce-merged-row-argument-carriers.vl`.
 
-* **THE SCOREBOARD, WITH ITS POPULATION NAMED.** On the corpus master shipped (7,483 cells) the
-  total against the goal was **15**. This landing ADDS 30 cells to `named/` — 27 hand-written
-  carriers and bounds plus D915's three — so the corpus is 7,513 and both numbers are measured
-  on the bigger question: master **41** against the goal, here **13**, `runs` 4,528 → 4,556
-  (60.27% → 60.64%). The 13 are: 7 named refutation bounds (below), D892's 3 traps and D804's 3
-  recorded `boolean|null` declines.
+* **THE SCOREBOARD, WITH ITS POPULATION NAMED.** On the corpus master shipped (7,515 cells) the
+  total against the goal was **9**. This landing ADDS 37 cells to `named/` — 27 hand-written
+  carriers and bounds, D915's three and D918's seven — so the corpus is 7,525 and both numbers
+  are measured on the bigger question: master **38** against the goal, here **8**, `runs`
+  4,543 → 4,573 (60.37% → 60.77%). The 8 are the 7 named refutation bounds below plus
+  `d903_map_join_read_i32_f64`, which D901's own row filed OPEN and which this landing does not
+  touch.
 
 * **THE SEVEN BOUNDS THAT REMAIN, each a filed cell, and they are SEVEN MECHANISMS and not one
   message.** `d911_arg_ident_narrow_use` (D916), `d911_fn_value_called` (a program with any
@@ -25931,7 +25938,7 @@ Repro (now runs, printing `7`):
 
 ### D912 — [CLOSED 2026-08-31] the `??` family with NO LITERAL AT ALL: the CALLEE'S DECLARED RETURN is the atom, and the reader is what licences it
 
-**closed as `runs` · was check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` · a CLAUSE-1 close, 3 cells (`distilled/named/d893_*`) · ABLATED: two rungs, and each alone reverts a strict subset of the other's cells · corpus `cmp` 0 DIFFER · 0 LOST · `runs → not-runs` ZERO**
+**closed as `runs` · was check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` · a CLAUSE-1 close, 3 cells (`distilled/named/d893_*`) · ABLATED: FOUR rungs — the atom, the fall-through-null owner, and the two GATES D918 records · corpus `cmp` 0 DIFFER · 0 LOST · `runs → not-runs` ZERO**
 
 Repro (now runs, printing `s`):
 
@@ -25966,6 +25973,14 @@ Repro (now runs, printing `s`):
   rather than the disassembly is what showed it: `wasm-dis` renders both `d0 00` and `d0 01` as
   `ref.null none`, and the difference between them is the narrow row and the merged one.
   Ablating this line alone reverts four of the five probes and nothing else.
+
+* **AND IT TAKES TWO GATES THAT ARE NOT ABOUT ATOMS AT ALL — see D918.** Stamping
+  `anonLeafAnnTy` for a CALL operand arms `anonLeafCarrierRowOf`, D873's post-mint rung, which
+  with D901's fold in the tree pointed the CALLEE's declared row at the row the DEFAULT literal
+  had just minted; and an annotation atom WIDER than every value in the family makes the fold
+  answer a type no value has. Ungated, this arm cost four of D901's `runs` cells and three more
+  compositions nobody had written. `rlits.length > 0` and `anonLeafAnnAtomJoins` are the two
+  gates, and the ablation grades each at 2 and 3 `runs` cells respectively.
 
 * **THE BOUND is `d912_ann_named_ret`**: `type R = {r: i32}` with `: R | null` is a spelling
   `anonLeafAnnAtomOf` declines — it reads the SHAPE off the annotation text
@@ -26132,3 +26147,70 @@ Repro (check-clean invalid wasm):
 * **`d911_narrow_sibling_param` IS THE CONTROL AND IT RUNS**: a same-shaped parameter fed by a
   literal that is NOT a family member keeps the narrow row, on master and here alike.
 
+
+---
+
+### D918 — [CLOSED 2026-08-31] an ANNOTATION atom describes a value that is ABSENT, so it may not WIDEN the family — and the direction is the whole rule
+
+**closed as `runs` · was check-clean invalid wasm (`type mismatch: expected f64, found i32`) and `trap_loads` (`wasm trap: cast failure`) · a CLAUSE-1 close, 2 cells master gets wrong (`distilled/named/d918_ident_ann_wider_f64`, `d918_ident_ann_wider_f32`) plus 5 that state the rule · found as a CROSS-PR INTERACTION: D912's first cut was measured against `5c0224de` and #2070 (D901/D902) landed in between, so the two were only ever in one tree after the rebase · ABLATED: two gates, 2 and 3 `runs` cells, and they are the ONLY rungs of this landing whose removal loses a `runs` cell versus master**
+
+Repro (now runs, printing `7` — check-clean invalid wasm on master `3f2ebc40`):
+
+    function rd() {
+      let a: { r: f64 } | null = null
+      const g1 = a ?? { r: 7 }
+      print(g1.r)
+    }
+    rd()
+    // D918: now RUNS and prints 7.
+
+* **D872 READS AN ANNOTATION FOR THE ATOM NO LITERAL SUPPLIES, and D901 then made that a
+  DIRECTIONAL question.** `joinTys` is `assignable`-driven and `numWidensName` makes the
+  int-to-wider edges lossless, so a numeric PAIR is one type to the checker and D901's fold
+  collapses the set to a single atom. An annotation atom is the one thing in the set that
+  describes a value nothing will build. The two directions are therefore not symmetric:
+
+  | | fold answers | who builds there | result |
+  |---|---|---|---|
+  | `a: {r: i32} \| null` … `?? { r: 1.5 }` | `f64` | the real literal, unchanged | **runs** |
+  | `a: {r: f64} \| null` … `?? { r: 7 }` | `f64` | an int literal that never widens | `expected f64, found i32` |
+  | `a: {r: f32} \| null` … `?? { r: 7 }` | — (f32 is no fold edge) | a two-atom BOX over one value | `wasm trap: cast failure` |
+
+  The first row is `d918_ident_ann_narrower`, and `d862_ann_only_atom_f64` /
+  `d872_module_ann_only_f64` are the same shape — they run on master and must keep running.
+  Rows two and three are `d918_ident_ann_wider_f64` and `_wider_f32`, and they do NOT run on
+  master: this is D872's own IDENT arm, and the defect has been there since it shipped.
+
+* **`anonLeafAnnAtomJoins` IS A WIDTH COMPARISON, not a "is it numeric" one, and the first
+  version of this gate WAS the numeric one — it cost `d862`/`d872` their `runs`.** The lattice
+  is `numWidensName`'s, flattened to a rank because only the comparison is needed
+  (`i32` 0, `i64`/`f32` 1, `f64` 2): an annotation atom joins when it is no wider than the widest
+  VALUE atom present, and always joins when either side has no numeric in it at all — which is
+  D912's own population, an `i32` or `f64` return beside a `string` default.
+
+* **AND THE SECOND GATE IS NOT ABOUT ATOMS AT ALL.** Stamping `anonLeafAnnTy` for a CALL operand
+  also arms `anonLeafCarrierRowOf`, D873's post-mint supersede. With D901's fold the family's
+  mint is a plain scalar row rather than a box, and that rung then pointed the CALLEE's declared
+  `{r: f64}` return row at the row the DEFAULT literal had just minted — `src` emitting
+  `struct.new $i32row (f64.const 1.5)`, `expected i32, found f64`. `rlits.length > 0` stands the
+  arm down for any callee that handed back a literal, which is every case where the literals are
+  the family anyway.
+
+* **THE PRICE, MEASURED CELL BY CELL, and it is why the set is kept whole.** Ungated against
+  master `3f2ebc40`: `d892_box_direct_f64_i32`, `d892_box_binding_f64_i32`,
+  `d892_box_param_f64_i32` (runs → check-clean invalid wasm) and `d901_fold_f32_dest`
+  (runs → `trap_loads`) — all four D901's own, and `d901_fold_f32_dest` is that row's explicitly
+  named price pin. With only the literal gate: `d918_empty_body_fold_f64`,
+  `d918_null_arg_fold_f64` (runs → `expected f64, found i32`) and `d918_empty_body_f32_dest`
+  (runs → cast failure). `d918_empty_body_fold_i64` is the control that survived BOTH bad cuts
+  and says the fold EDGE, not the width alone, is what the box question turns on.
+
+* **A DERIVED RULE CANNOT FIND THIS SET, which is the standing reason `named/` exists.** Five of
+  the seven RUN on master and two do not; on today's compiler all seven run, and nothing reading
+  current behaviour can tell which of them a candidate would break. What makes them worth keeping
+  is what two specific refused cuts DID to them.
+
+* **AND THE PROCESS FACT IS THE POINT.** Both changes are correct alone. Grading a branch
+  against its OWN baseline cannot see this by construction — the four cells did not exist on
+  `5c0224de`. Grading against MASTER's baseline after a rebase is what caught it, and this is
+  the first cross-PR interaction of the campaign.
