@@ -23790,6 +23790,48 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   invalid wasm.
 
 ---
+### D972 — two clause-2 gaps the `--sites` ZERO rows were hiding, now each with a probe
+
+**loud emit rejects conceding capability · found 2026-09-01 by hand-probing the `--sites` list after all nine existing capability probes passed · `scripts/capability-probes/union-eq-non-binding-operand.vl` and `struct-union-equality.vl` are the measurements**
+
+With the nine filed probes all green, the only remaining clause-2 evidence was the raw literal
+count, which the scoreboard itself calls a lower bound. Writing a program per ZERO row turns
+that assertion back into a measurement. Of the rows probed, most are **unreachable at the
+plainest spelling their sentence forbids** — struct `==`, `?? over a string|null call result`,
+`?? over a string|null union field`, `literal is` over a non-binding union, an array-of-map
+union arm, width subtyping and the captured-variable message all RUN. Two are real:
+
+* **`==` OVER A NON-BINDING UNION VALUE — the lowering exists and only the second READ is in
+  the way.** `const u = mk(true); u == 1` runs and prints `true`; `mk(true) == 1` refuses.
+  `emitUnionConcreteEq` calls `emitExpr(body, boxIx, fnIx)` TWICE — the tag, then the payload —
+  and `unionEqOperandOk` (Ident / NumLit / StrLit / Member / Index) exists to require an
+  operand that survives that. **This is D960's shape exactly**, closed there by evaluating once
+  into a slot.
+
+  **A STASH WAS ATTEMPTED AND REVERTED, and its first failure is the useful part:**
+  `sharedFieldRecvSlot()` is ALREADY CLAIMED by the operand's own emission, so the stash
+  compiled to `(local.set $1 (local.get $1))` — the operand assigning itself. Giving it a
+  private `liBack` code (13, typed `(ref null $uBoxIdx)`) fixed that and it still traps, so
+  there is a second holder of state across those two reads that the disassembly has not yet
+  named. Start by finding what else the compare leaves live between the tag read and the
+  payload read.
+
+* **`==` OVER A STRUCT UNION — genuinely a missing lowering, not an unreached one.** `A | B` of
+  two shapes refuses at BOTH spellings (bound and not), while struct `==` over a single
+  declared shape runs and value-union `==` runs. It needs a tag dispatch over the variant arms
+  with a per-arm struct compare underneath; nothing in the tree does that today.
+
+Repro (loud emit reject):
+
+    function mk(c: boolean): i32 | string {
+      if c { return 1 }
+      "s"
+    }
+
+    print(mk(true) == 1)
+    // vl check rc 0; vl run -> emit error:
+    // emitProgram: union `==` over a non-binding union value is not supported yet
+
 ### D971 — a CAPTURING lambda at two types: the refusal described a calling convention the emitter does not use
 
 **closed by DELETING the refusal — a lifted capturing instance already takes the env as its leading param, and `emitDirectCall` already pushes it · the last of the nine capability probes**

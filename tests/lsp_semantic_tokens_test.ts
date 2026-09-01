@@ -188,6 +188,27 @@ Deno.test({
 });
 
 Deno.test({
+  name: "wasm-lexical: a scientific float literal is ONE number token, whole span",
+  ignore,
+}, () => {
+  const checker = loadWasmChecker(SEED, () => {})!;
+  // The exponent is part of the LEXEME, so the editor must colour `1.5e-7` as one
+  // number rather than a number followed by an identifier and a minus — which is
+  // what a `-`-splitting lexer would hand the highlighter.
+  const src = "let a = 1.5e-7\nlet b = 2E+10\n";
+  const lex = checker.lexicalTokensAt(src);
+  const at = new Map(lex.map((t) => [`${t.line}:${t.char}`, t]));
+  const a = at.get("0:8");
+  assertEquals([a?.tokenClass, a?.length], [2, 6], "`1.5e-7` one number token");
+  const b = at.get("1:8");
+  assertEquals([b?.tokenClass, b?.length], [2, 5], "`2E+10` one number token");
+  // No stray token inside either lexeme (a split would put one at the sign).
+  if (lex.some((t) => t.line === 0 && t.char > 8 && t.char < 14)) {
+    throw new Error("the exponent must not lex as separate tokens");
+  }
+});
+
+Deno.test({
   name: "wasm-lexical: every operator kind the lexer emits is coloured",
   ignore,
 }, () => {
