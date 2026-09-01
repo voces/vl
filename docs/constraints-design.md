@@ -163,13 +163,50 @@ what VL needs, and the WasmGC note above marks the only revisit trigger.
 
 ## 6. Open questions for the owner
 
-* **OQ-1 — method-member syntax**: `{ toString(self): string }` (proposed — the `self`
-  name is the discriminator) vs a keyword (`{ method toString: … }`).
+* **OQ-1 — method-member syntax, EXPANDED after owner probing (2026-09-01).**
+  How other languages spell a method requirement: Rust `fn to_string(&self) -> String`
+  (explicit self, and its presence is SEMANTIC — `fn new() -> Self` without self is an
+  associated function); Python `typing.Protocol` `def __str__(self) -> str` (explicit
+  self, structural setting — VL's nearest cousin); Go `String() string` (implicit
+  receiver — unambiguous only because Go interfaces may ONLY contain methods and fields
+  can never satisfy one); Swift `func toString() -> String` (implicit); TypeScript
+  `{ toString(): string }` (method syntax EXISTS but is semantically identical to the
+  property form — in JS a method IS a property, so TS's distinction is cosmetic; VL's
+  would be real, because UFCS functions are NOT fields); C++20 concepts
+  `requires(T x) { { x.toString() } -> same_as<string>; }` (no field/method distinction
+  at all — the bound is an EXPRESSION that must compile).
+
+  **What `self` actually buys — the call contract, not who satisfies (measured).** The
+  owner asked: a value can carry a `toString` FIELD of the same type as the UFCS
+  function, so is the distinction real? The call shapes answer it:
+  - field `toString: () => string` (zero-ary): `x.toString()` works — the closure
+    carries its data by capture, no receiver passed;
+  - UFCS free `toString(self: X): string`: `x.toString()` works — receiver fed as arg 1;
+  - field of the UFCS function's EXACT type `(X) => string`: `x.toString()` does NOT
+    work (zero args into a unary closure) — its spelling is `x.toString(x)`. So the
+    "same type" field never collides on the call expression; the true twin is the
+    ZERO-ary field. And when both a zero-ary field and a UFCS function exist, **the
+    field wins** (probed 2026-09-01: prints `field`). The colon form is therefore a
+    LAYOUT demand (the value physically carries a closure — construction and any future
+    serde walk see it); the `self` form is a CALLABILITY demand (nothing stored).
+
+  **The cleanest semantics — and a coupling this exposes**: define the method-member
+  bound the C++-concepts way: "`x.toString()` type-checks with result `string`, under
+  the resolution rules every call already uses (field first, then UFCS in scope)". No
+  new satisfaction judgment, no ambiguity — the bound defers to existing call
+  semantics. The catch, stated honestly: UFCS-in-scope satisfaction IS Phase 2's
+  scope-relativity, so under expression semantics the method form is only useful once
+  OQ-3 is accepted — in a fields-only Phase 1 it would be satisfiable solely by
+  zero-ary closure fields, which nobody writes for `toString`. So the real choice is:
+  ship Phase 1 as field bounds + operator demands + good errors and add the method form
+  WITH Phase 2, or accept expression-based (scope-relative) satisfaction from day one.
+  OQ-1 and OQ-3 are one decision wearing two numbers.
 * **OQ-2 — operator bounds**: deferred above; reopen when a real API needs to export a
   generic whose operator demand should be documentation-stable.
 * **OQ-3 — accept Phase 2's scope-relative satisfaction?** The alternative (fields only)
   keeps bounds scope-independent but excludes UFCS, which is how std itself is written.
-* **OQ-4 — bound spelling**: `<T: Showable>` (proposed) vs `x: T & Showable`.
+* **OQ-4 — bound spelling**: RULED (owner, 2026-09-01, "OQ-4 seems reasonable") —
+  `<T: Showable>`.
 * **OQ-5 — declaration-checking strictness**: may a bounded body use ONLY what bounds
   grant (proposed — it is what makes the errors good), or do bounds merely add to
   inference?

@@ -46,6 +46,12 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   moved-to-std hint on the undeclared name, DECISIONS entry recording the naming choice.
 - **`else` requires braces** — DONE #2165; recorded here only because the ruling predates
   the entry above and the DECISIONS entry is the durable home.
+- **Colored `print`** — ruled in principle 2026-09-01 with one hard constraint (ANSI must
+  never leak into pipes/files/copies): Node's split — bare strings always raw, rendered
+  values colored, escapes emitted only by the TTY-detected sink, `NO_COLOR`/`--color`
+  honored, renderer strings stay ANSI-free forever. Full policy + staging in
+  `docs/serde-design.md` §"Print, templates, and color". Stage C0 (primitive coloring,
+  host-side, small) can land any time; composite coloring rides serde Stage 2.
 
 ### Awaiting owner rulings (durable list; each row names its doc)
 
