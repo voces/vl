@@ -272,6 +272,7 @@ export const planFileRun = (
 //     FAIL <scope-qualified name>
 //     skip <scope-qualified name>
 //            <failure text>            7 spaces, one line each, under a FAIL
+//              at <file>:<line>:<col>  9 — std:test's own second line (see below)
 //            --- captured output ---
 //            <the test's stdout>
 //     no tests                         2 spaces, when the filter matched none
@@ -291,6 +292,22 @@ export const planFileRun = (
 
 export type TestOutcome = "passed" | "failed" | "skipped";
 
+/**
+ * Where the failing `expect(...)` was WRITTEN — `std:test`'s track-caller line,
+ * parsed back off the report. `file` is the caller's module key, spelled exactly
+ * as the `vl test` target was (absolute for an absolute target); `line`/`col` are
+ * 1-based, anchored on the `expect` token itself.
+ *
+ * It is a location, not a chain: `std:test`'s `CallerLoc` is one hop, and a
+ * helper that forwards its own `caller` reports its CALLER — so a location in a
+ * DIFFERENT file than the test is normal and correct, not a parse error.
+ */
+export interface FailureLocation {
+  file: string;
+  line: number;
+  col: number;
+}
+
 export interface TestReportResult {
   /** The file header this line appeared under, or null if none preceded it. */
   file: string | null;
@@ -298,6 +315,8 @@ export interface TestReportResult {
   outcome: TestOutcome;
   /** The indented block under a FAIL (failure text + any captured output). */
   message?: string;
+  /** The `at <file>:<line>:<col>` line `std:test` appends to an `expect` failure. */
+  location?: FailureLocation;
 }
 
 export interface TestReportFileError {
@@ -336,6 +355,103 @@ const STATUS: Record<string, TestOutcome> = {
   "ok  ": "passed",
   FAIL: "failed",
   skip: "skipped",
+};
+
+// `std:test` renders a failed `expect` as two lines — the assertion sentence, then
+// `  at <file>:<line>:<col>`.
+//
+// ANCHORING IS NOT WHAT MAKES THIS READABLE; BEING LAST IS. The sentence ends in
+// a RENDERED OPERAND, which is arbitrary user text, and a MULTI-LINE one puts a
+// perfectly anchored forgery inside the sentence — measured,
+// `expect("x\n  at /forged/file.vl:99:99\n").toEqual("y")` produces two lines
+// matching this regex. `std:test` appends its own line last and owns the
+// prohibition on appending anything after it; this end takes the last match.
+const AT = /^ {2}at (.+):(\d+):(\d+)$/;
+
+// The report's own sentinel. Everything past it is the test's stdout, which can
+// contain anything at all — including a line shaped like the one above — so the
+// scan stops here rather than reading the whole block.
+const CAPTURED = "--- captured output ---";
+
+/**
+ * The `expect` location in one failure block, or undefined (a `fail(msg)`, a raw
+ * trap, or a `<compile>` error carries none).
+ *
+ * The LAST match before the captured-output sentinel wins: `std:test` appends its
+ * line after the assertion sentence, so a location the author's own message
+ * happened to contain is the earlier one.
+ */
+export const failureLocation = (
+  message: string,
+): FailureLocation | undefined => {
+  let found: FailureLocation | undefined;
+  for (const line of message.split("\n")) {
+    if (line === CAPTURED) break;
+    const m = AT.exec(line);
+    if (m !== null) {
+      found = { file: m[1], line: Number(m[2]), col: Number(m[3]) };
+    }
+  }
+  return found;
+};
+
+// ---- the failure anchor ------------------------------------------------------
+//
+// D9 slot 12 asked for a HEURISTIC: when a test body holds exactly one
+// `expect(...)`, anchor the failure at that call. This supersedes it and was
+// never built, because the runner now REPORTS the position and the heuristic's
+// two blind spots are structural rather than fixable — a body with two expects
+// had to fall back to the `it` line, and a failure inside a HELPER is not in the
+// test body at all, so no scan of that body could find it.
+
+/** A reported failure position in editor coordinates, resolved to a real file. */
+export interface FailureAnchor {
+  /** Absolute path of the file the message anchors in. */
+  file: string;
+  /**
+   * True when that is the very file `vl test` was pointed at. The caller needs
+   * this because an unsaved buffer runs from a MIRROR beside the original, so
+   * the target's path must map back to the document rather than to a dotfile the
+   * user never opened.
+   */
+  isTarget: boolean;
+  /** 0-based line — `std:test` counts from 1, editors from 0. */
+  line: number;
+  /** 0-based column. */
+  col: number;
+}
+
+/**
+ * Resolve one reported location against the run that produced it. `cwd` is where
+ * `vl test` was spawned and `target` is the path it was handed.
+ *
+ * **Every module key in a report is spelled relative to the CWD**, not to the
+ * entry file's directory — measured 2026-09-01 with the two deliberately
+ * different: `vl test sub/hop.test.vl` from the parent reports the entry as
+ * `sub/hop.test.vl` AND a helper beside it as `sub/helper.vl`. So resolving the
+ * key and the target the same way, against `cwd`, is what makes `isTarget` mean
+ * what it says. (The extension always hands `vl test` an ABSOLUTE path, so its
+ * own keys are absolute and the resolution is a no-op there; the relative case
+ * is a hand-run CLI, and is the one this has to get right on purpose.)
+ *
+ * `resolve` is INJECTED — `path.resolve` from the caller — because joining and
+ * absoluteness are platform questions (a Windows drive letter, a backslash) and
+ * this module deliberately imports nothing: it is loaded by Deno tests under the
+ * root config, where a `node:` builtin does not type-check.
+ */
+export const failureAnchor = (
+  loc: FailureLocation,
+  cwd: string,
+  target: string,
+  resolve: (base: string, rel: string) => string,
+): FailureAnchor => {
+  const file = resolve(cwd, loc.file);
+  return {
+    file,
+    isTarget: file === resolve(cwd, target),
+    line: Math.max(0, loc.line - 1),
+    col: Math.max(0, loc.col - 1),
+  };
 };
 
 export const parseTestReport = (text: string): ParsedTestReport => {
@@ -389,7 +505,13 @@ export const parseTestReport = (text: string): ParsedTestReport => {
         if (outcome === "failed") {
           block = {
             lines: [],
-            commit: (message) => record.message = message,
+            // The message is kept WHOLE, location line included: it is what the
+            // Test Explorer's peek shows, and a lossless parse is the property
+            // this parser has always had. `location` is extracted beside it.
+            commit: (message) => {
+              record.message = message;
+              record.location = failureLocation(message);
+            },
           };
         }
         continue;

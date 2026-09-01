@@ -43,6 +43,8 @@ import { type SeedOriginInfo, seedStatusView } from "./typeFeatures.ts";
 import {
   type DiscoveredTest,
   discoverTests,
+  failureAnchor,
+  type FailureLocation,
   parseTestReport,
   planFileRun,
   type RunTarget,
@@ -614,6 +616,39 @@ const runTests = async (
 };
 
 /**
+ * What a `std:test` failure location has to be resolved AGAINST. The module key
+ * `std:test` reports is spelled exactly as the `vl test` target was, so it is
+ * resolved the way the child would have resolved it: against the cwd the child
+ * was spawned in.
+ */
+interface RunPaths {
+  /** The cwd `vl test` ran in. */
+  cwd: string;
+  /** The path handed to `vl test` — the dirty MIRROR when the buffer is unsaved. */
+  target: string;
+  /** The document that path stands for: what the mirror must map back to. */
+  uri: Uri;
+}
+
+/**
+ * A reported `expect` location as an editor Location — the anchor that
+ * SUPERSEDES the `it`-line heuristic (D9 slot 12).
+ *
+ * Two cases, and the second is the one the heuristic could never have served: a
+ * location in the file under test resolves to the test document, and a location
+ * in ANOTHER file — a helper that called `expect` without forwarding its own
+ * `caller` — resolves to that file and anchors there. The deciding is in
+ * `testDiscovery.ts` so it is unit-testable; only the vscode types are here.
+ */
+const anchorLocation = (paths: RunPaths, loc: FailureLocation): Location => {
+  const at = failureAnchor(loc, paths.cwd, paths.target, path.resolve);
+  return new Location(
+    at.isTarget ? paths.uri : Uri.file(at.file),
+    new Position(at.line, at.col),
+  );
+};
+
+/**
  * The runner's report onto the item tree. Results are matched by the
  * scope-qualified path — the one string `vltRegister`, the report and `-t` all
  * agree on — so a result for a test OUTSIDE the request (a substring filter is
@@ -628,6 +663,7 @@ const applyReport = (
   enqueued: readonly TestItem[],
   reported: Set<string>,
   text: string,
+  paths: RunPaths,
 ): void => {
   const parsed = parseTestReport(text);
 
@@ -674,7 +710,12 @@ const applyReport = (
     else if (result.outcome === "skipped") run.skipped(item);
     else {
       const message = new TestMessage(result.message ?? "test failed");
-      if (item.uri !== undefined && item.range !== undefined) {
+      // The `expect` site when the runner reported one; otherwise the `it` line,
+      // which is still the best answer for a `fail(msg)`, a raw trap, or an
+      // older runner whose report carries no location at all.
+      if (result.location !== undefined) {
+        message.location = anchorLocation(paths, result.location);
+      } else if (item.uri !== undefined && item.range !== undefined) {
         message.location = new Location(item.uri, item.range);
       }
       run.failed(item, message);
@@ -786,7 +827,11 @@ const runOneFile = async (
       // so nothing the report says can be lost to a classification miss.
       say(outcome.text);
       const before = reported.size;
-      applyReport(run, say, file, leaves, enqueued, reported, outcome.text);
+      applyReport(run, say, file, leaves, enqueued, reported, outcome.text, {
+        cwd: vl.cwd,
+        target,
+        uri,
+      });
       if (outcome.code !== 0 && reported.size === before) {
         say(
           `  note: \`vl test\` exited ${outcome.code} without a report this ` +

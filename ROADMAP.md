@@ -111,6 +111,33 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   (dispatch is rewritten before monomorphization, so a closure-field witness loses to a
   same-named `self`-function), D1004/D1005 (the unbounded halves), and LSP bound-member
   completion/hover on `x: T`.
+- **Track-caller — DONE 2026-09-01 (#2235).** Both halves have shipped. The std side is
+  three things and no compiler change: `export type CallerLoc = { file: string, line: i32,
+  col: i32 }` in `std:test`, `expect<T>(value: T, caller: CallerLoc = __callsite__)`, and a
+  second line on the failure message reading `  at <file>:<line>:<col>`. The editor payoff is
+  D9 slot 12, which this SUPERSEDES rather than completes — the heuristic queued there was
+  never written. What the landing measured, all of it new:
+  - the alias satisfies the intrinsic with **no compiler change**, confirmed both ways (a
+    user-declared alias of the same three fields takes `__callsite__` too);
+  - the extra parameter survives monomorphization at **14 of 14** receiver classes — i32,
+    i64, f64, boolean, string, struct, `i32[]`, `string[]`, `Circle[]`, a literal union, a
+    value union, and nullable i32/i64/f64 — every one reporting an exact position;
+  - **one hop, measured four ways**: a helper that forwards its own `caller` reports its
+    CALLER, one that does not reports its own `expect` (in the helper's FILE), a GENERIC
+    helper forwards correctly at two instantiations, and an explicit `CallerLoc` literal is
+    just an argument;
+  - the anchor is the `expect` token at every spelling — `expect(x).toEqual(y)`,
+    `expect(x).not().toEqual(y)` and the non-UFCS `toEqual(expect(x), y)` all report the
+    `expect(`, never the `.toEqual` and never the `it` line;
+  - cost: **+325 bytes** (5,873 → 6,198) on a one-assertion module unoptimized, and
+    **byte-identical at `-O3`** (596 bytes both ways — Heap2Local scalarizes the struct, the
+    DECISIONS finding for `__callsite__` reproduced through std); ~11 ns per PASSING assertion
+    (10M iterations: ~0.33 s → ~0.44 s), which is the receipt copy plus the call-site
+    `struct.new`.
+  Deliberately NOT in it, and each is a separate surface decision rather than a rider:
+  `fail(msg)` takes no location (its argument is the author's own sentence), `it`/`describe`
+  keep their signatures (a registration site is not an assertion site), and the
+  `--strip-locations` opt-out below is still the recommendation and not the state.
 - **Track-caller — expanded brief (owner asked for more detail, 2026-09-01).** The
   mechanism: a magic parameter TYPE — a std `CallerLoc` (module key + line + col; the
   compiler holds all three at any call site) whose trailing parameter is SYNTHESIZED at
@@ -174,16 +201,17 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   **HALF ONE IS DONE AND TRACK-CALLER IS UNBLOCKED (#2225).** Default arguments v1 shipped
   complete — see B15a — including the `__callsite__` intrinsic itself, typed structurally
   against `{ file: string, line: i32, col: i32 }` so a std `type CallerLoc = { file: string,
-  line: i32, col: i32 }` satisfies it with NO compiler change. What remains is the std side
-  and nothing else: alias `CallerLoc`, give `expect` the trailing
-  `caller: CallerLoc = __callsite__`, and render the location in the failure message. **That
-  change is `std:test`-only and needs a `std-api-reviewer` pass** (an altered export). Two
-  facts the defaults landing measured that this follow-up inherits: the location's `file` is
-  the CALLER's module KEY (`""` for a single-source compile with no module table — a
-  `vl test` run always has one), and the position is the CALLEE's own anchor token, which is
+  line: i32, col: i32 }` satisfies it with NO compiler change. **THE STD SIDE HAS SINCE
+  SHIPPED TOO — see the DONE row at the top of this group (#2235)**; what this paragraph
+  described as remaining is done, and the editor anchor with it. Two facts the defaults
+  landing measured that the follow-up inherited, both confirmed by it: the location's `file`
+  is the CALLER's module KEY (`""` for a single-source compile with no module table — a
+  `vl test` run always has one, and a file importing `std:test` is a module table by
+  construction, measured), and the position is the CALLEE's own anchor token, which is
   the `expect` line the row exists to report. The `--strip-locations` opt-out and the
   uniform-on decision are NOT built and are still the recommendation, not the state. The
-  editor-side single-expect anchor is D9 slot 12 and needs no ruling.
+  editor-side single-expect anchor was D9 slot 12; it needed no ruling and was never built —
+  this superseded it.
 - **`vl test --trace` inline run values** — RULED low priority (owner, 2026-09-01,
   "low prio I guess"): keep parked; an emitter flag instrumenting USER programs (never
   the compiler) logging `(site, value)` pairs, extension renders decorations after a
@@ -771,8 +799,9 @@ in-language GC knobs.
   + configurable globs; files parallel by default / in-file serial, opt-in fresh-instance
   `it.concurrent`; per-test capture, failure-first reporting). **v1 lands BEFORE the std expansion,
   not with std-design slice 4** — the charter's sequencing is superseded (see the promotion note under
-  Next); chartered follow-ups: compiler-injected call sites, generic `expect<T>` + structural diffs,
-  power-`assert` rewriting. New behavioral tests switch to `*.test.vl` at v1 (directive-corpus
+  Next); chartered follow-ups: ~~compiler-injected call sites~~ **DONE — track-caller (#2235),
+  through default arguments rather than an attribute, and `expect`-only**; ~~generic
+  `expect<T>`~~ **DONE (#2104)** + structural diffs, power-`assert` rewriting. New behavioral tests switch to `*.test.vl` at v1 (directive-corpus
   growth stops; conversion waits for the TS-tier teardown).
 - 🟡 **Error-handling design** — RULED and PARTLY BUILT: `docs/error-handling-design.md`
   (errors-as-values via unions — `T | null` for absence, `T | E` with a structural `IoError`
@@ -1948,11 +1977,18 @@ seed from current `compiler/*.vl` in ~40s.*
      and param-name inlay hints at call sites are now unblocked by the same family
   11. ⬜ Doc-comment-aware hover/completion (needs the one native doc-text export;
      the D7 linkifier host side already exists)
-  12. ⬜ Test-failure anchor, cheap half — when a test body contains exactly ONE
-     `expect(...)` call, attach the failure TestMessage at that call's line instead of
-     the `it(...)` line (discovery already tokenizes the body; TestMessage takes a
-     Location). Multiple expects keep today's anchor. The REAL fix is the track-caller
-     intrinsic — an owner ruling, listed under "Awaiting owner rulings" in §Next.
+  12. ✅ Test-failure anchor — #2235 — **SUPERSEDED BY THE REAL FIX, and the cheap half was
+     never built.** The queued heuristic was: when a test body holds exactly ONE
+     `expect(...)`, anchor the failure TestMessage at that call instead of the `it(...)`
+     line, with multiple expects keeping today's anchor. Track-caller landed first, so the
+     runner now REPORTS the position (`std:test`'s `at <file>:<line>:<col>` line) and
+     `testDiscovery.ts` parses it into a `FailureLocation`/`FailureAnchor` the extension
+     turns into `TestMessage.location`. Two things the heuristic could not have done, both
+     pinned: a body with SEVERAL expects anchors at the one that actually failed, and a
+     failure inside a HELPER — a `expect` reached through a function the body called —
+     anchors in the helper's own FILE, which no scan of the test body could ever have found.
+     The `it`-line fallback is kept for the failures that carry no location by construction
+     (`fail(msg)`, a raw trap, `<compile>`)
   Not queued (and why, in one line each): workspace symbols (rides on 3's plumbing —
   fold in when 3 lands), DAP (no debugger yet; the `vl test --trace` inline-values idea
   is a separate pending ruling in §Next, not debugger-gated), notebooks/monikers/

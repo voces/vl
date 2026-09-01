@@ -159,6 +159,7 @@ core/list.test.vl
     ok   grows past capacity        (1.2ms)
     FAIL pops in LIFO order         (0.4ms)
          FAIL list push/pop > pops in LIFO order: expected 7, got 8
+           at core/list.test.vl:31:5
          --- captured output ---
          debug: cap=8 len=9
 12 files · 87 passed · 1 failed · 2 skipped   (0.9s)
@@ -210,6 +211,9 @@ file FAILs and the run continues), 2 usage — consistent with the binary today.
   the git queries are one host command primitive.
 - `path.test.vl:42` line targeting and `--failed-first` ride the
   compiler-injected call-site work (below) and the JSON event stream — v2.
+  **Half-unblocked 2026-09-01**: track-caller shipped, so a failure now REPORTS
+  its `file:line:col`. Accepting one as a FILTER is still unbuilt, and is now the
+  only thing between here and the ExUnit workflow.
 
 ## What v1 needs, by component
 
@@ -233,11 +237,24 @@ file FAILs and the run continues), 2 usage — consistent with the binary today.
 
 ## Chartered follow-ups (not v1)
 
-1. **Compiler-injected call sites** — the `#[track_caller]` analog: `it`/
-   `expect` receive an implicit `file:line` argument stamped by the compiler.
-   The survey's highest-leverage finding (every framework without failure
-   locations regrets it; VL owns both compilers, no macros needed). Unlocks
-   `path:line` targeting and clickable failures.
+1. **Compiler-injected call sites — SHIPPED 2026-09-01, and the mechanism is not
+   the one chartered here.** The charter said an IMPLICIT `file:line` argument
+   stamped onto `it`/`expect`. What landed is TRACK-CALLER: `std:test` exports
+   `type CallerLoc = { file: string, line: i32, col: i32 }` and `expect` takes a
+   trailing **visible** `caller: CallerLoc = __callsite__`, filled by default
+   arguments v1. Three deliberate departures from the charter's wording:
+   * **Visible, not implicit.** Swift/C++20/C# all put it in the signature and
+     only Rust hides it, at the cost of attribute machinery and fn-pointer shims
+     (ROADMAP §Next's track-caller row carries the survey). The visible parameter
+     is also what makes a wrapper's forwarding ORDINARY code rather than a
+     transitivity rule.
+   * **`expect` only, not `it`.** A registration site is not an assertion site;
+     `it`/`describe` keep their signatures, and `fail(msg)` takes no location.
+   * **Clickable failures: DONE. `path:line` targeting: NOT.** The position is
+     REPORTED (a second report line, `  at <file>:<line>:<col>`, which the
+     VS Code extension turns into `TestMessage.location`); it is not yet ACCEPTED
+     as a filter, so the two things this item bundled have come apart and only
+     one of them is closed.
 2. **Generic `expect<T>`** + structural diff rendering via `std:fmt` (gated
    on generic exports — std-design slice 2; structural `==` over
    structs/lists already works in both compilers). Matcher quality IS diff
