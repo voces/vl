@@ -23934,13 +23934,20 @@ and the refusal turns into a miscompile:
   still reports `fnRet=17 name=[string] uflag=0` (against the control's
   `fnRet=2 name=[i32|string] uflag=1`). So node 17 is minted somewhere else.
 
-  **The remaining candidates are `emit_mono`'s two `nret` paths**, and the second one has
-  exactly the wrong shape for this: it reads `fnRetExprOf(fnIx)` — the return EXPRESSION,
-  singular — and pins `tyToEmitName` of its substituted type. That is the same mistake D626
-  named ("an inferred return read its empty `[]` off the return EXPRESSION"), one rung over. It
-  is gated on `tyHasTyVar(rty)`, which a bare `"s"` should fail, so either the gate admits more
-  than it reads like or the first path (line ~1848, `monoSubstAnnNode`) is the writer. **Probe
-  those two before anything else** — that is now the only unexplored branch.
+  `emit_mono`'s two `nret` paths were the next candidates and **both are also ruled out** —
+  probed with `tErr` at `monoSubstAnnNode` and at the `fnRetExprOf` rung, neither fires for
+  this program.
+
+* **SO EVERY KNOWN WRITER OF `fn.fnRet` IS ELIMINATED, and that is the finding to hand on.**
+  `grep '\.fnRet = '` over `compiler/` yields exactly 17 sites: one void pin, fourteen
+  `synthTypeRefTy` rungs in `emit_rewrite.synthRetAnnots`, and two `TyFunc` writes in
+  `typecheck` that set a TYPE's `fnRet`, not the AST node's. All fourteen were probed
+  unfiltered and none fires; both `emit_mono` `nret` paths were probed and neither fires. Yet
+  the emitter reports `fn=[pick] fnRet=17 name=[string]` — the real function, a real node.
+  **Either the pin happens through an alias of the FuncDecl that `grep` does not catch, or node
+  17 is `pick`'s ORIGINAL parsed return and the premise that it starts at -1 is wrong.** The
+  cheapest next probe settles which: print `fn.fnRet` for `pick` at the START of the collect
+  pass, before any rewrite runs.
 
 * **A NOTE ON THE OTHER SIDE, from the emitter's own comment at the `retUnionFlag` rung:** when
   the functype and the body move to the box, the CALL-RESULT classifier (`computeRetInference`
