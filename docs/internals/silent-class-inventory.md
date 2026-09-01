@@ -23912,15 +23912,23 @@ and the refusal turns into a miscompile:
   `pick` takes the trailing **`arm=else`** (a plain `emitExpr`, which does not). Everything
   downstream follows from `retUNm` being `""`.
 
-* **AND OPENING THE A20 GATE DOES NOT MAKE `inferRetNameOf` ANSWER — verified with the gate
-  demonstrably applied.** With the `!generic` param test relaxed for a concrete-union return
-  (patch present in the tree, three occurrences), `pick` STILL takes `arm=else`. So the gate is
-  not what suppresses the recording: **`recordInferRet` is never reached for this function even
-  when the gate admits it.** The remaining fork is the one directly below the gate —
-  `isClassifiableRetName(recNm)` → else → `valueUnionRetName(er)` → else →
-  `structUnionRetName(er, …)`. **Determine which of those three answers for `pick`'s `er`, and
-  why it yields nothing; that is the whole remaining question** and it is three `emitFail`
-  probes away.
+* **ROOT CAUSE — the inferred return is PINNED TO `string`, the TAIL's type, not to the join.**
+  Measured end to end with `tErr` / `emitFail` probes on pristine seeds:
+
+  the CHECKER computes the join correctly — `tyToStructStr(er)` is `i32 | string` and
+  `valueUnionRetName(er)` is `i32|string`, so A20's fork does have a name to record. But by
+  emit time `fn.fnRet` is no longer `< 0`: `emit_rewrite`'s inferred-return PIN ladder has
+  synthesized a TypeRef, and for `pick` it pins **`string`** with `retUnionFlag == 0`, while
+  the annotated control pins `i32|string` with `retUnionFlag == 1`. So `emitReturnValue` takes
+  `arm=else` and emits the raw value, while the FUNCTYPE — computed from `criClassify`, a
+  different producer — says `(result (ref $box))`. **That disagreement is the whole defect**,
+  and every earlier symptom on this row is downstream of it.
+
+  So the A20 gate is a red herring for this witness (the emitter never reads
+  `inferRetNameOf` here — `fn.fnRet >= 0` by then), and so is `retUNm`. **The fix belongs in
+  the pin: it must use the recorded JOIN, not the tail value's type.** The ladder is
+  `emit_rewrite.vl` around the `fn.fnRet = synthTypeRefTy(ctx, -1, ctxTy)` rungs; find which
+  rung claims `pick` and why its `ctx` is the tail's `string`.
 
 * **A NOTE ON THE OTHER SIDE, from the emitter's own comment at the `retUnionFlag` rung:** when
   the functype and the body move to the box, the CALL-RESULT classifier (`computeRetInference`
