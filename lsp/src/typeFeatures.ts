@@ -1054,7 +1054,8 @@ export const memberCompletionsFromWasm = (
 //   function if else while for const let return is await break continue
 //   import export type true false null
 // Soft keywords (recognized by text in parser.ts via `atSoft`):
-//   as from in step to then
+//   as from in step to
+// (`then` was removed from the language on 2026-08-31 — see DECISIONS.md.)
 const VL_HARD_KEYWORDS: readonly string[] = [
   "function",
   "if",
@@ -1082,12 +1083,11 @@ const VL_SOFT_KEYWORDS: readonly string[] = [
   "in",
   "step",
   "to",
-  "then",
 ];
 
 /**
  * Keyword completions for VL: all hard keywords (reserved by the lexer) plus
- * the contextual soft keywords (`as`, `from`, `in`, `step`, `to`, `then`).
+ * the contextual soft keywords (`as`, `from`, `in`, `step`, `to`).
  * Each item carries `kind: "keyword"` so `server.ts` maps it to
  * `CompletionItemKind.Keyword`. These are returned as plain text items (no
  * `insertText`); clients filter the list against the typed prefix, so the full
