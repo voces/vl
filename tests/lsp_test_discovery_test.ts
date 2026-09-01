@@ -1,0 +1,474 @@
+// D9 slot 8 — the pure half of the VS Code Testing API integration
+// (`lsp/src/testDiscovery.ts`): the `describe`/`it`/`itSkip` scanner, the `-t`
+// filter plan, and the `vl test` report parser.
+//
+// Pure by construction — no `vscode`, no seed, no child process — so this file
+// runs in the `ci` job under `deno task test` and needs no `ci-native` wiring
+// (`ci_seed_coverage_test.ts` classifies a test as seed-backed only if it names
+// `vl-compiler.wasm` AND gates on its presence; this one does neither).
+//
+// The report fixtures below are the runner's REAL output, captured from
+// `vl test` on 2026-09-01 (seed 5446e243, `dist/vl` of the same build) rather
+// than retyped from cli.vl — a paraphrased witness is a different program.
+
+import {
+  discoverTests,
+  filterFor,
+  flattenTests,
+  leafPaths,
+  parseTestReport,
+  planFileRun,
+  type RunTarget,
+  selectedPaths,
+  stripAnsi,
+  substringPaths,
+} from "../lsp/src/testDiscovery.ts";
+
+const eq = (got: unknown, want: unknown, what: string): void => {
+  const g = JSON.stringify(got);
+  const w = JSON.stringify(want);
+  if (g !== w) throw new Error(`${what}\n  want ${w}\n  got  ${g}`);
+};
+
+// ---- discovery ---------------------------------------------------------------
+
+Deno.test("discovery: nested describes build the runner's own ` > ` paths", () => {
+  const src = `import { describe, expect, it, itSkip, toEqual } from "std:test"
+
+describe("outer", () => {
+  it("adds", () => {
+    expect(1 + 1).toEqual(2)
+  })
+  describe("inner", () => {
+    it("fails here", () => {
+      expect(3).toEqual(4)
+    })
+    itSkip("skipped one", () => {
+      expect(1).toEqual(2)
+    })
+  })
+})
+
+it("top level", () => {
+  expect("x").toEqual("x")
+})
+`;
+  const tree = discoverTests(src);
+  eq(tree.map((n) => n.kind), ["describe", "it"], "top-level kinds");
+  eq(
+    leafPaths(tree),
+    [
+      "outer > adds",
+      "outer > inner > fails here",
+      "outer > inner > skipped one",
+      "top level",
+    ],
+    "registered paths, in registration order",
+  );
+  eq(
+    flattenTests(tree).map((n) => n.kind),
+    ["describe", "it", "describe", "it", "itSkip", "it"],
+    "every node, depth-first",
+  );
+  // `describe` scopes are NOT registered names — only its leaves are.
+  eq(tree[0].path, "outer", "a describe's path is the prefix it contributes");
+});
+
+Deno.test("discovery: an `it`'s range starts on its own line (the gutter icon)", () => {
+  const src = `import { it } from "std:test"\n\nit("adds", () => {\n})\n`;
+  const [node] = discoverTests(src);
+  eq(node.range.start, { line: 2, character: 0 }, "range starts at the `it`");
+  // The range ends at the closing quote of the name, so the selection covers
+  // `it("adds"` and nothing of the body.
+  eq(node.range.end, { line: 2, character: 9 }, "range ends after the name");
+});
+
+Deno.test("discovery: the formatter's one-line form nests correctly", () => {
+  // `vl fmt`'s trailing-lambda exception hugs `it("name", () => { … })`, so a
+  // whole suite can live on one line. Paren depth — not brace depth — is what
+  // closes the describe.
+  const src =
+    `describe("a", () => { it("b", () => {}) }); it("c", () => {}); describe("d", () => { describe("e", () => { it("f", () => {}) }) })`;
+  eq(
+    leafPaths(discoverTests(src)),
+    ["a > b", "c", "d > e > f"],
+    "one-line describes close at their own `)`",
+  );
+});
+
+Deno.test("discovery: a name may hold braces, quotes and escapes", () => {
+  const src = [
+    `it("a } brace {", () => {})`,
+    `it("a \\"quoted\\" name", () => {})`,
+    `it("tab\\there", () => {})`,
+    `it("hex \\x41 and \\u0042 and \\u{1F600}", () => {})`,
+    `it("unknown \\q escape", () => {})`,
+    `it("continued \\`,
+    `line", () => {})`,
+  ].join("\n");
+  eq(
+    leafPaths(discoverTests(src)),
+    [
+      "a } brace {",
+      'a "quoted" name',
+      "tab\there",
+      "hex A and B and \u{1F600}",
+      "unknown q escape",
+      "continued line",
+    ],
+    "decoded exactly as compiler/lexer.vl decodes them",
+  );
+});
+
+Deno.test("discovery: a name holding a brace does not swallow the next test", () => {
+  // The failure mode a brace-depth scanner has: `"{"` opens a phantom scope.
+  const src = `describe("with { brace", () => {\n  it("inside", () => {})\n})\nit("after", () => {})\n`;
+  eq(
+    leafPaths(discoverTests(src)),
+    ["with { brace > inside", "after"],
+    "the sibling after the describe stays at file scope",
+  );
+});
+
+Deno.test("discovery: `it` that is not a registration call is ignored", () => {
+  const src = [
+    `function it(name: string, body: () => void) {}`, // a declaration
+    `const it = 3`, // a binding
+    `suite.it("member call")`, // somebody else's `it`
+    `xs[it]("indexed")`, // an index, then a call
+    `it(name, () => {})`, // a dynamic name — invisible to a static scan
+    `it("real", () => {})`, // the only registration here
+  ].join("\n");
+  eq(
+    leafPaths(discoverTests(src)),
+    ["real"],
+    "only `ident ( \"literal\"` registers",
+  );
+});
+
+Deno.test("discovery: commented-out tests do not register", () => {
+  const src = [
+    `// it("dead", () => {})`,
+    `it("live", () => {}) // it("trailing", () => {})`,
+    `/// it("doc comment", () => {})`,
+    `describe("scope", () => {`,
+    `  // it("dead inside", () => {})`,
+    `  it("live inside", () => {})`,
+    `})`,
+  ].join("\n");
+  eq(
+    leafPaths(discoverTests(src)),
+    ["live", "scope > live inside"],
+    "`//` and `///` comments are skipped whole",
+  );
+});
+
+Deno.test("discovery: a char literal holding a quote does not derail the scan", () => {
+  const src = `const q = '"'\nit("after the char literal", () => {})\n`;
+  eq(
+    leafPaths(discoverTests(src)),
+    ["after the char literal"],
+    "`'\"'` is a char literal, not the start of a string",
+  );
+});
+
+Deno.test("discovery: an unterminated string does not hang or mis-scope", () => {
+  const src = `it("unterminated\nit("after", () => {})\n`;
+  // The unterminated literal ends at the newline (as it does in the lexer), so
+  // the next line is scanned normally.
+  eq(leafPaths(discoverTests(src)), ["after"], "the scan recovers at the newline");
+  eq(discoverTests("").length, 0, "an empty source discovers nothing");
+});
+
+Deno.test("discovery: a describe body ending early does not orphan later tests", () => {
+  // Unbalanced parens (a file mid-edit). The open describe stays open — the
+  // honest answer for a source that does not parse — but nothing crashes.
+  const src = `describe("open", () => {\n  it("inside", () => {})\n`;
+  eq(leafPaths(discoverTests(src)), ["open > inside"], "mid-edit source scans");
+});
+
+// ---- the `-t` plan -----------------------------------------------------------
+
+const ALL = [
+  "outer > adds",
+  "outer > inner > fails here",
+  "outer > inner > skipped one",
+  "top level",
+];
+
+Deno.test("plan: one `it` runs under its own full path", () => {
+  const specs = planFileRun(ALL, [{
+    path: "outer > inner > fails here",
+    kind: "it",
+  }]);
+  eq(specs.length, 1, "one spawn");
+  eq(specs[0].filter, "outer > inner > fails here", "the `-t` argument");
+  eq(specs[0].targetPaths, ["outer > inner > fails here"], "what it means");
+  eq(specs[0].extraPaths, [], "nothing else matches that substring");
+});
+
+Deno.test("plan: a `describe` runs under `<path> > `, not the bare path", () => {
+  const specs = planFileRun(ALL, [{ path: "outer > inner", kind: "describe" }]);
+  eq(specs[0].filter, "outer > inner > ", "the separator anchors the scope");
+  eq(
+    specs[0].targetPaths,
+    ["outer > inner > fails here", "outer > inner > skipped one"],
+    "every leaf beneath it",
+  );
+  eq(specs[0].extraPaths, [], "and nothing above it");
+});
+
+Deno.test("plan: the trailing separator excludes a same-named sibling `it`", () => {
+  // `describe("a")` and a top-level `it("a")` both spell "a". `-t "a"` would run
+  // both; `-t "a > "` runs only the describe's leaves. This is the whole reason
+  // the describe candidate is the longer string.
+  const all = ["a > one", "a", "b"];
+  const bare = substringPaths(all, "a");
+  eq(bare, ["a > one", "a"], "the bare path over-runs");
+  const { filter, extraPaths } = filterFor(all, { path: "a", kind: "describe" });
+  eq(filter, "a > ", "the separator wins");
+  eq(extraPaths, [], "the sibling `it` is excluded");
+  // And running that sibling `it` is the ambiguous direction — see below.
+  eq(
+    selectedPaths(all, { path: "a", kind: "it" }),
+    ["a"],
+    "the `it` means only itself",
+  );
+});
+
+Deno.test("plan: an ambiguous `it` name reports what its filter over-runs", () => {
+  // `-t` is a SUBSTRING filter (`cliContains`), and an `it` has no handle longer
+  // than its own path — so this run is genuinely generous, and says so.
+  const all = ["adds", "outer > adds", "other"];
+  const specs = planFileRun(all, [{ path: "adds", kind: "it" }]);
+  eq(specs[0].filter, "adds", "the only available handle");
+  eq(specs[0].targetPaths, ["adds"], "what was clicked");
+  eq(specs[0].extraPaths, ["outer > adds"], "what comes along, reported not dropped");
+});
+
+Deno.test("plan: requesting every test drops `-t` entirely", () => {
+  const targets: RunTarget[] = ALL.map((path) => ({ path, kind: "it" }));
+  const specs = planFileRun(ALL, targets);
+  eq(specs.length, 1, "one whole-file spawn");
+  eq(specs[0].filter, undefined, "no filter at all");
+  eq(specs[0].targetPaths, ALL, "covering the file");
+  // The file-item request (no targets named) is the same run.
+  eq(planFileRun(ALL, []), specs, "an empty request is the whole file");
+});
+
+Deno.test("plan: a requested describe absorbs its requested descendants", () => {
+  const specs = planFileRun(ALL, [
+    { path: "outer", kind: "describe" },
+    { path: "outer > inner", kind: "describe" },
+    { path: "outer > adds", kind: "it" },
+  ]);
+  eq(specs.length, 1, "one spawn, not three");
+  eq(specs[0].filter, "outer > ", "the outermost requested scope");
+});
+
+Deno.test("plan: two unrelated roots are two spawns", () => {
+  const specs = planFileRun(ALL, [
+    { path: "outer > adds", kind: "it" },
+    { path: "top level", kind: "it" },
+  ]);
+  eq(specs.length, 2, "one spawn per root");
+  eq(
+    specs.map((s) => s.filter),
+    ["outer > adds", "top level"],
+    "each under its own filter",
+  );
+});
+
+Deno.test("plan: a duplicated name yields both registrations as targets", () => {
+  // Two `it("dup")` in one scope register the same path twice; the report emits
+  // two lines for it. Nothing here may silently pick one.
+  const all = ["dup", "dup"];
+  eq(
+    selectedPaths(all, { path: "dup", kind: "it" }),
+    ["dup", "dup"],
+    "both registrations",
+  );
+});
+
+// ---- the report parser -------------------------------------------------------
+
+// Captured verbatim from `vl test <file>` (exit 1).
+const REPORT = [
+  "/tmp/vlt/sample.test.vl",
+  "  ok   outer > adds",
+  "  FAIL outer > inner > fails here",
+  "       expected 3 to equal 4",
+  "       --- captured output ---",
+  "       a program print",
+  "  skip outer > inner > skipped one",
+  "  ok   top level",
+  "1 file · 2 passed · 1 failed · 1 skipped",
+  "",
+].join("\n");
+
+Deno.test("parse: the runner's report maps onto paths, outcomes and messages", () => {
+  const r = parseTestReport(REPORT);
+  eq(
+    r.results.map((x) => [x.path, x.outcome]),
+    [
+      ["outer > adds", "passed"],
+      ["outer > inner > fails here", "failed"],
+      ["outer > inner > skipped one", "skipped"],
+      ["top level", "passed"],
+    ],
+    "every status line",
+  );
+  eq(
+    r.results[1].message,
+    "expected 3 to equal 4\n--- captured output ---\na program print",
+    "the indented block, de-indented and kept whole",
+  );
+  eq(r.results[0].message, undefined, "a passing test carries no message");
+  eq(
+    r.results[0].file,
+    "/tmp/vlt/sample.test.vl",
+    "results carry their file header",
+  );
+  eq(
+    r.summary,
+    { files: 1, passed: 2, failed: 1, skipped: 1 },
+    "the summary line",
+  );
+  eq(r.unmatched, [], "nothing unclassified");
+  eq(r.fileErrors, [], "no file-level failure");
+});
+
+Deno.test("parse: a summary without skips still parses", () => {
+  const r = parseTestReport("f.vl\n  ok   a\n1 file · 1 passed · 0 failed\n");
+  eq(r.summary, { files: 1, passed: 1, failed: 0, skipped: 0 }, "skipped = 0");
+});
+
+Deno.test("parse: `<compile>` is a FILE error, never a test result", () => {
+  // Captured verbatim from `vl test tests/fixtures/vl-test`.
+  const text = [
+    "/x/broken.test.vl",
+    "  FAIL <compile>",
+    "       type error",
+    "       /x/broken.test.vl: error [9:10] undeclared identifier 'noSuchName'",
+    "1 file · 0 passed · 1 failed",
+  ].join("\n");
+  const r = parseTestReport(text);
+  eq(r.results, [], "no test owns a compile failure");
+  eq(r.fileErrors.length, 1, "one file error");
+  eq(r.fileErrors[0].label, "<compile>", "the runner's sentinel");
+  eq(r.fileErrors[0].file, "/x/broken.test.vl", "attributed to its file");
+  eq(
+    r.fileErrors[0].message,
+    "type error\n/x/broken.test.vl: error [9:10] undeclared identifier 'noSuchName'",
+    "the whole diagnostic block",
+  );
+});
+
+Deno.test("parse: `<file top level>` is a file error too", () => {
+  const r = parseTestReport(
+    "/x/t.test.vl\n  FAIL <file top level>\n       wasm trap: unreachable\n",
+  );
+  eq(r.fileErrors[0].label, "<file top level>", "the second sentinel");
+  eq(r.fileErrors[0].message, "wasm trap: unreachable", "its message");
+  eq(r.results, [], "and no test results");
+});
+
+Deno.test("parse: `no tests` names the file the filter missed", () => {
+  const r = parseTestReport(
+    "/x/t.test.vl\n  no tests\n1 file · 0 passed · 0 failed\n",
+  );
+  eq(r.emptyFiles, ["/x/t.test.vl"], "the filter matched nothing there");
+  eq(r.results, [], "and produced no results");
+});
+
+Deno.test("parse: captured output that looks like a status line is not one", () => {
+  // A program under test printing `  ok   fake` lands at NINE columns inside the
+  // failing test's block; a real status line has exactly two.
+  const text = [
+    "/x/t.test.vl",
+    "  FAIL real",
+    "       expected 1 to equal 2",
+    "       --- captured output ---",
+    "         ok   fake",
+    "         FAIL also fake",
+    "  ok   next",
+    "1 file · 1 passed · 1 failed",
+  ].join("\n");
+  const r = parseTestReport(text);
+  eq(
+    r.results.map((x) => x.path),
+    ["real", "next"],
+    "two results, not four",
+  );
+  eq(
+    r.results[0].message,
+    "expected 1 to equal 2\n--- captured output ---\n  ok   fake\n  FAIL also fake",
+    "the fakes stay inside the message, at their own indent",
+  );
+});
+
+Deno.test("parse: an empty captured line survives inside a message", () => {
+  const text = [
+    "/x/t.test.vl",
+    "  FAIL real",
+    "       first",
+    "       ",
+    "       third",
+    "  ok   next",
+  ].join("\n");
+  const r = parseTestReport(text);
+  eq(r.results[0].message, "first\n\nthird", "the blank line is preserved");
+});
+
+Deno.test("parse: ANSI colour is stripped before classification", () => {
+  const esc = "\u001b";
+  const text = [
+    `${esc}[1m/x/t.test.vl${esc}[0m`,
+    `  ${esc}[32mok  ${esc}[0m a > b`,
+    `  ${esc}[31mFAIL${esc}[0m c`,
+    `       boom`,
+    `${esc}[31m1 file · 1 passed · 1 failed${esc}[0m`,
+  ].join("\n");
+  eq(stripAnsi(`${esc}[31mx${esc}[0m`), "x", "the stripper itself");
+  const r = parseTestReport(text);
+  eq(
+    r.results.map((x) => [x.path, x.outcome]),
+    [["a > b", "passed"], ["c", "failed"]],
+    "coloured lines classify identically",
+  );
+  eq(r.results[1].message, "boom", "and their blocks survive");
+  eq(r.summary?.failed, 1, "as does the summary");
+});
+
+Deno.test("parse: a multi-file report attributes each result to its own file", () => {
+  const text = [
+    "/x/a.test.vl",
+    "  ok   one",
+    "/x/b.test.vl",
+    "  ok   two",
+    "2 files · 2 passed · 0 failed",
+  ].join("\n");
+  const r = parseTestReport(text);
+  eq(
+    r.results.map((x) => [x.file, x.path]),
+    [["/x/a.test.vl", "one"], ["/x/b.test.vl", "two"]],
+    "headers scope the lines beneath them",
+  );
+});
+
+Deno.test("parse: lines the report does not own come back verbatim", () => {
+  // An indented line with no failing test above it belongs to nobody — it is
+  // handed to the run's output rather than guessed at.
+  const r = parseTestReport("/x/t.test.vl\n       stray indented line\n  ok   a\n");
+  eq(r.unmatched, ["       stray indented line"], "verbatim, indent included");
+  eq(r.results.map((x) => x.path), ["a"], "and the real line still parses");
+});
+
+Deno.test("parse: empty input is an empty report, not a crash", () => {
+  const r = parseTestReport("");
+  eq(
+    [r.results.length, r.fileErrors.length, r.unmatched.length, r.summary],
+    [0, 0, 0, null],
+    "nothing in, nothing out",
+  );
+});

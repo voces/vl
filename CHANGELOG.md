@@ -515,6 +515,8 @@ see **`DECISIONS.md`**.
 
 ## LSP / editor (Track D)
 
+- **D9 slot 8: per-test click-to-run (VS Code Testing API)** — Test Explorer + gutter arrows over `vl test <file> -t <substring>`, zero CLI/server/compiler changes. Discovery is a tokenizer over VL's real grammar (paren-depth nesting; `xs[it]("x")`, member calls, dynamic names, brace-holding names all ignored correctly — each a test); `-t`'s substring semantics are measured per request (describe runs under the strictly-longer `"<path> > "`, a contained `it` name surfaces its extra matches onto their own items with a note); the output parser pins the runner's column contract so a program printing `  ok fake` cannot forge a result; dirty buffers mirror beside the file (dotfile, cleaned in `finally`) so relative imports resolve. 29 pure tests + an end-to-end smoke against the real bundle and real `vl` binary. (#2112)
+
 - **D0 Diagnostics on change.**
 - **D1 Hover types** — `onHover` resolves cursor via D2 symbol table + `receiver.member` (object fields, array/list/string members via `typeFromExpression`/`listMemberType`/field); rendered via `stringifyType`.
 - **D2 Go-to-definition / find-references** — symbol/binding table (`compiler/symbols.ts`); `textDocument/definition` + `textDocument/references`; locals, params, function decls, type aliases, single-document. → `DECISIONS.md`

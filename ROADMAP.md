@@ -1752,8 +1752,9 @@ seed from current `compiler/*.vl` in ~40s.*
      store. One native change, two surfaces. Pairs with 5's render pathway.
   7. ✅ Rename symbol (+prepare) — #2103 — `referencesAt`/`crossFileReferences`; its own PR
      (write-path feature, alias/import edges need care)
-  8. ⬜ **Testing API: per-test click-to-run** — `vl test <file> -t <substring>` suffices
-     (no CLI change); TestController over CodeLens per the survey's assessment
+  8. ✅ Testing API: per-test click-to-run — #2112 — TestController + tokenizer-based
+     discovery (`lsp/src/testDiscovery.ts`); `-t` substring ambiguity measured and
+     surfaced, dirty buffers mirrored beside the file so relative imports resolve
   9. ⬜ Folding ranges + language-config indentation/on-enter rules
   10. ⬜ Signature help (bridge grade today; clean grade wants one native export)
   11. ⬜ Doc-comment-aware hover/completion (needs the one native doc-text export;
