@@ -23141,11 +23141,11 @@ Repro (now RUNS, printing `7`):
     // vl check rc 0; runs, prints 7.
 
 ---
-### D950 — at a NULLABLE generic instantiation every `is` arm answers TRUE: a silently wrong value, and the root D947 recorded as a price
+### D950 — [CLOSED 2026-09-01] at a NULLABLE generic instantiation every `is` arm answers TRUE: a silently wrong value, and the root D947 recorded as a price
 
-**check-clean silently wrong: `vl check` rc 0, the module validates, the program RUNS and prints the wrong answer · reproduces on master · ZERO corpus cells for the witness itself, but it is the ROOT of the three `d947_price_*` cells the corpus does carry · a fix was attempted, MEASURED and REVERTED — see the three placements that did not fire**
+**closed as `runs` · was `check-clean silently wrong` (this witness) and `check-clean invalid wasm` (the three `d947_price_*` cells, which now RUN and print `ok`) · the SAME fix closes D942 · `goal-scoreboard.py` clause 1 **4 -> 1**, `runs` **4,616 / 7,564 (61.03%) -> 4,619 / 7,564 (61.07%)**, total against the goal **4 -> 1** · dual-run vs a git-archive master fixpoint over all 7,564 corpus cells: **3 differ / 7,564**, and all three are the d947 price cells moving invalid-wasm -> runs · `regress.py`: 0 `runs -> not-runs`, 0 `-> silent`, 3 other movement · FOUR placements were tried before this one — they are kept below**
 
-Repro (check rc 0; RUNS and prints `1`, where `0` is the only correct answer):
+Repro (now runs, printing `0`):
 
     function f<T>(v: T): i32 {
       if v is boolean { return 1 }
@@ -23156,27 +23156,57 @@ Repro (check rc 0; RUNS and prints `1`, where `0` is the only correct answer):
       null
     }
     print(f(mk(true)))
-    // PRINTS 1
-    // vl check rc 0; runs. SHOULD PRINT 0 — a `string | null` is never a boolean.
+    // PRINTS 0
+    // vl check rc 0; runs. A `string | null` is never a boolean.
 
-* **IT IS NOT ONE BAD ARM, THE LADDER IS DEGENERATE.** Each arm was measured ALONE at
-  `T = string | null`, against the same value: `is boolean` -> fires, `is f64` -> fires,
-  `is string` -> fires. Three mutually exclusive tests all answering true on one value is not
-  a wrong predicate, it is no predicate. The value is the string `"x"`, so only the third is
-  right.
+* **THE MECHANISM, READ OFF THE DISASSEMBLY AND NOT OFF A MESSAGE.** At
+  `T = string | null` all three of `v is boolean`, `v is f64` and `v is string` emitted the
+  BYTE-IDENTICAL condition — `(if (i32.eqz (ref.is_null (local.get $0))) …)`, a bare non-null
+  test wearing a type test's clothes. Three mutually exclusive tests answering TRUE on one
+  non-null value is not a wrong predicate, it is no predicate, and the disassembly is what says
+  so: there is no tag read anywhere in the function to have got wrong.
 
-* **THE CONTROLS SAY IT IS THE NULLABLE, AND ONLY AT A GENERIC.** `T = string` decides
-  correctly (prints 0); `T = i32 | null` decides correctly (prints 0); the NON-generic
-  spelling of the same test (`function f(v: string | null)`) does not compile at all — a loud
-  refusal. So the defect needs the generic instantiation AND a nullable whose base is a REF.
+* **THE DECISION IS MADE IN `emitIs`'s TWO NICHE ARMS, and the bug is a PREMISE THAT DOES NOT
+  SURVIVE MONOMORPHIZATION.** Both arms lower `recv is X` to the receiver's own null test, and
+  both headers state why that is sound: *"the checker already proved the tested shape is the
+  sole non-null member."* At the DECLARATION the receiver is `T`, so the checker must accept
+  `v is boolean` beside `v is string` — it is the INSTANCE that makes one of them impossible,
+  and the instance is not a thing the checker ever saw. The arms claimed the receiver anyway.
+  Which arm owns a given witness is a rep question, not a spelling one: `Circle | null` is
+  claimed by the FIRST arm (`exprNullableRefNiche`, ahead of every box path), while
+  `string | null` and `boolean | null` fall to the LATE arm that sits immediately in front of
+  `monoStaticIsResult` — which is why the fourth attempt below moved one of the three cells.
+
+* **THE FIX RESTORES THE PREMISE AS A CHECKED PRECONDITION** (`nulNicheIsTestImpossible` in
+  `compiler/wasmEmit.vl`, called from both arms). It is ONE-SIDED by construction: the tested
+  type must be one of the six VALUE primitives (`isTestValuePrimName` — read off `isVarTyIxOf`,
+  the type the CHECKER banked at the node, so no spelling is re-parsed) AND the receiver's
+  niche must name its sole non-null member's rep class (`nulNicheBaseClass` — the emitter's own
+  `fnIx`-SCOPED classifiers, so it answers per INSTANCE). A mismatch folds to `i32.const 0`,
+  which D932's `emittedCondConst` then prunes the dead arm on — the reason a folded guard
+  cannot miscompile the body it guards, and the reason the three `d947_price_*` cells stop
+  being invalid wasm rather than merely answering `false`. Anything either half cannot name
+  leaves the ladder exactly as it was.
+
+* **THE CONTROLS SAY IT IS THE NULLABLE, AND ONLY AT A GENERIC** — all three unchanged by the
+  fix. `T = string` decides correctly (prints 0); `T = i32 | null` decides correctly (prints 0,
+  a value-union BOX taking the tag compare); the NON-generic spelling
+  (`function f(v: string | null)`) is a loud check reject, ``is` check type 'boolean' is not a
+  variant of string | null` — which is exactly the proof the checker's is doing at a concrete
+  spelling and cannot do through a `T`.
+
+* **THE FULL PER-ARM GRID, MEASURED AFTER THE FIX** (`is boolean` / `is f64` / `is string` /
+  `is i32` / `is null`, at each of `string | null`, `boolean | null` and `Circle | null`, with
+  a present value and with a null): every one of the 30 cells now answers correctly — exactly
+  one TRUE per column, the base arm for a present value and `is null` for a null.
 
 * **IT EXPLAINS D947's THREE CELLS EXACTLY, which were filed as a price with no mechanism.**
   `std:test`'s `expect` opens with `if value is boolean { isBool = true; boolVal = value }`.
-  At `T = string | null` that arm fires and assigns a STRING into a `boolean` field —
-  `type mismatch: expected i32, found (ref $type)`, which is precisely what those cells show.
-  The price is not "expect cannot take a nullable"; it is this.
+  At `T = string | null` that arm fired and assigned a STRING into a `boolean` field —
+  `type mismatch: expected i32, found (ref $type)`, which is precisely what those cells showed.
+  The price was not "expect cannot take a nullable"; it was this. All three now print `ok`.
 
-* **THREE PLACEMENTS WERE TRIED AND NONE FIRED, which is the useful half of this row.**
+* **FOUR PLACEMENTS WERE TRIED BEFORE THIS ONE, and they are the useful half of this row.**
   (1) Refining `monoStaticIsResult`'s blanket `nodeTyIsNullable(nd.isObj) { return -1 }` to
   decide FALSE for a primitive-vs-primitive mismatch: the gate is never reached, because at a
   monomorphized clone the receiver node still carries `T` (a `TyVar`), not the instance's
@@ -23184,13 +23214,22 @@ Repro (check rc 0; RUNS and prints `1`, where `0` is the only correct answer):
   instance type through `monoArgTyName` instead: its cascade classifies a `string | null` by
   the member it reps as, so the name is available, but the ladder returns before reaching the
   compare. (3) Disabling `exprUnion(nd.isObj, fnIx)`'s decline, on the theory that the
-  emitter's rep classification was routing it to the runtime path: the witness still prints 1,
-  so that line is not the one either. The decision is being made somewhere else, and the next
-  attempt should start by finding WHERE rather than by proposing a rule.
+  emitter's rep classification was routing it to the runtime path: the witness still printed 1,
+  so that line was not the one either. (4) Gating the FIRST niche arm alone on "(tested type is
+  a primitive) AND (`monoArgTyName` of the receiver is a DIFFERENT primitive)" — measured
+  against a git-archive master control: it moved `d947_price_nulcircle` to `runs` and left
+  `nulstr` and `nulbool` UNMOVED (a different arm owns those), and it OVER-FIRED, reddening
+  `tests/cases/soundness/narrowing-is-null-sound.vl` and `tests/cases/types/nullable.vl`,
+  because `monoArgTyName` is not instance-scoped and folded legitimate non-generic tests to
+  false. The shipped fix keeps that attempt's shape and replaces its receiver channel with the
+  `fnIx`-scoped rep classifiers; both canaries are inert under it for a second reason too —
+  their tested types are `null` and `{ x: i32 }`, and the tested-type half declines every
+  spelling that is not one of the six value primitives before a receiver is looked at.
 
-* **THE OUTCOME CLASS IS WORSE THAN WHAT D947 RECORDS.** Those cells are invalid wasm, which
-  the engine refuses; this witness RUNS. A wrong answer that validates and executes is the
-  shape that reaches a user as a bug in their own code.
+* **THE OUTCOME CLASS WAS WORSE THAN WHAT D947 RECORDED.** Those cells were invalid wasm, which
+  the engine refuses; this witness RAN. A wrong answer that validates and executes is the shape
+  that reaches a user as a bug in their own code — which is why the fix is graded on `runs` and
+  on a byte-for-byte dual run, not on the refusal going away.
 
 ---
 ### D951 — `is T` against the TYPE PARAMETER itself: check-clean, then a loud emit reject, and the owner has ruled it should WORK
@@ -27318,11 +27357,11 @@ Repro (loud emit reject):
 * Blocked the natural factoring of `std:test` v2's matchers; the shipped module inlines the
   failure path instead (std/test.vl header, "HOW A GENERIC VALUE GETS RENDERED").
 
-### D942 — `is string` on a value read from a generic struct FIELD answers TRUE for a struct T
+### D942 — [CLOSED 2026-09-01 by D950's fix] `is string` on a value read from a generic struct FIELD answers TRUE for a struct T
 
-**check-clean silently wrong value · D931's close (the boolean field tag) covered the VALUE-rep discrimination and this is the REF-vs-REF residue: a `T = Circle` instance reads `self.actual` and `a is string` FIRES · same wrong answer through the widened-union spelling (`const aw: i32|i64|f64|boolean|string|T = self.actual` prints `string` for a Circle receipt while the SAME widen over a RAW T parameter — D933's fixture shape — prints correctly) · with more arms in the instance the same confusion emits invalid wasm instead (`expected f64, found (ref null $type)` beside an `is f64` arm; `expected i32, found (ref $type)` beside the concat in an `is string` arm body), so one mechanism grades as two outcomes · reproduces on the pre-#2081 compiler byte-identically: STANDING, a regression of nothing · found 2026-08-31 assembling the generic `std:test`**
+**closed as `runs` · was `check-clean silently wrong value` · SAME MECHANISM AS D950 and closed by the same two lines: the generic FIELD read classifies as a nullable REF NICHE, so `emitIs`'s first niche arm lowered `a is string` to the receiver's non-null test and every tested type answered TRUE · the ablation is the D950 grid one rep over — at `T = Circle` master answered TRUE to ALL FOUR of `is string` / `is boolean` / `is i32` / `is f64` on one value, and after the fix all four answer `other` while the `T = string` / `boolean` / `i32` / `f64` rows are BYTE-IDENTICAL to master · both other shapes the row records close with it: the widened-union spelling now prints `other` for a Circle receipt, and the multi-arm instance that emitted `expected f64, found (ref null $type)` now RUNS · ZERO corpus cells, which is why the 7,564-cell dual run did not see it — the row's own witness is the instrument that did**
 
-Repro (check-clean silently wrong value):
+Repro (now runs, printing `other`):
 
     type Expectation<T> = { actual: T, negated: boolean }
     type Circle = { r: i32 }
@@ -27340,21 +27379,22 @@ Repro (check-clean silently wrong value):
     const c1: Circle = { r: 1 }
     print(probe(expect(c1)))
     // vl check rc 0; runs, exit 0.
-    // PRINTS string
-    // SHOULD PRINT other
+    // PRINTS other
 
-* **THE SAME DISPATCH OVER A RAW PARAMETER IS CORRECT FOR EVERY T MEASURED** — atoms, structs,
-  `i32[]`, `string[]`, `Circle[]` all answer right when the `is` ladder reads a raw `v: T`
-  param, or `toEqual`'s own `expected: T` beside the carrier. The wrong answer needs the
-  value to have crossed the generic FIELD read. That asymmetry is what `std:test` v2 is
-  built on: every T-dependent fact is computed from the raw parameter inside `expect` and
-  stored in the receipt.
-* **A SINGLE instantiation is enough** — `probe(expect(c1))` alone, with zero string
-  instances anywhere in the module, still fires the string arm. This is per-instance code
-  the emitter fails to prune (D932's fix prunes the same ladder when the value is a raw
-  param), a fold of ref-repped Ts onto one behaviour.
-* **`toBeTrue`'s `a is boolean` on the FIELD is in the same family** (invalid wasm for a
-  struct receiver until std:test moved the boolean fact into the receipt).
+* **THE SAME DISPATCH OVER A RAW PARAMETER WAS CORRECT FOR EVERY T MEASURED** — atoms, structs,
+  `i32[]`, `string[]`, `Circle[]` all answered right when the `is` ladder read a raw `v: T`
+  param, or `toEqual`'s own `expected: T` beside the carrier. The wrong answer needed the
+  value to have crossed the generic FIELD read, and that asymmetry is the mechanism stated
+  plainly: the raw param does not classify as a nullable ref niche and the field read does, so
+  only the field read reached the arm that answers every `is` with a non-null test. `std:test`
+  v2 was built around the asymmetry — every T-dependent fact computed from the raw parameter
+  inside `expect` and stored in the receipt — and that design is still the right one, but it is
+  no longer load-bearing for correctness.
+* **A SINGLE instantiation was enough** — `probe(expect(c1))` alone, with zero string
+  instances anywhere in the module, still fired the string arm. It was never a fold ACROSS
+  instances: one instance's own guard was lowered as a null test.
+* **`toBeTrue`'s `a is boolean` on the FIELD was in the same family** (invalid wasm for a
+  struct receiver until std:test moved the boolean fact into the receipt) and closes with it.
 
 ### D943 — a generic struct holding BOTH a T field and a closure capturing the T value: the second ref instantiation emits invalid wasm
 
@@ -27447,8 +27487,14 @@ Repro (loud emit reject):
   `boolean|string`, `i32|null` all measured). A union with a NON-atom member goes PAST this
   refusal into deeper standing defects: `string | i32[]` is check-clean invalid wasm at the
   bare generic-struct-field store (19-line std-free witness, `expected (ref $type), found
-  (ref $type)` in `expect`), and `Circle | null` emits invalid wasm through the receipt
+  (ref $type)` in `expect`), and `Circle | null` emitted invalid wasm through the receipt
   chain (bare field store alone RUNS there, so its mechanism is a different, un-ablated
   family — that count is a message count). Under v1 both were LOUD check refusals (not
   members of the receiver union), so for those two shapes the generic surface traded a
   check refusal for a silent one — recorded as a price, not fixed here.
+  **UPDATE 2026-09-01 — the NULLABLE half of that price is paid back and the other half is
+  not.** D950 named the mechanism behind the three `d947_price_*` cells (`expect`'s
+  `if value is boolean` lowered to a bare non-null test at every nullable instantiation) and
+  its fix moves all three to `runs` printing `ok` — `nulstr`, `nulbool` and `nulcircle`. The
+  `string | i32[]` shape is UNCHANGED, byte-identical against a git-archive master control:
+  it is a different family, exactly as this bullet said, and it is still open.
