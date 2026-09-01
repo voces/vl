@@ -23,14 +23,18 @@
 //   1. `vital.compilerWasm`          explicit; a stated path is honoured or fails
 //   2. `$VL_COMPILER_WASM`           same variable the CLI reads
 //   3. <workspace>/build/…           the compiler repo's own dev loop
-//   4. `vl seed`                     an installed CLI's seed — VERSION-MATCHED
-//   5. the extension's bundled copy  always works, zero configuration
+//   4. the extension's bundled copy  built from the SAME tree as this server
+//   5. `vl seed`                     an installed CLI's seed — the fallback for
+//                                    a bundle shipped without one
 //
-// Rung 4 is the one worth the most and the reason `vl seed` exists: the seed and
-// the language are ONE artifact, so a project's own `vl` has the right one, while
-// a bundled copy is only as current as the extension. A mismatched pair is worse
-// than a missing one — the checker's `speaksAbi` refuses it, correctly, but only
-// after every message would have been mis-decoded.
+// Rungs 4 and 5 swapped on 2026-08-31, from a live failure: an installed CLI's
+// embedded seed was ABI-compatible but BEHAVIORALLY stale (pre-scopeAt-filter),
+// `speaksAbi` rightly accepted it — it answers "can I decode you", not "are you
+// current" — and completion silently regressed in every non-checkout workspace.
+// The server and its bundled seed ship as one artifact, so the bundle wins; the
+// residual tension (a project's `vl` tracks the PROJECT's language version,
+// which diagnostics ideally follow) needs a comparable version stamp in the
+// seed, not a rung order.
 
 import { execFileSync } from "node:child_process";
 import { readFileSync, statSync } from "node:fs";

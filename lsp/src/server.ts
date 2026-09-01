@@ -1008,21 +1008,29 @@ connection.onInitialize((params) => {
       path: join(root, "build", "vl-compiler.wasm"),
     });
   }
-  // Ask an installed CLI for the seed it would use. ONE spawn, at startup — and it
-  // is the only rung that keeps the seed version-matched to the project's own `vl`,
-  // which matters because the seed and the language are one artifact.
+  // Shipped beside the server bundle. Ranked ABOVE `vl seed`: the server and its
+  // bundled seed are built from ONE tree and ship as ONE artifact, and server
+  // features increasingly assume the seed's BEHAVIOR (the scopeAt module filter
+  // was the first live case: an installed CLI's embedded seed was ABI-compatible
+  // but pre-filter, `speaksAbi` rightly accepted it, and completion silently
+  // regressed — staleness is drift, not a protocol break, so no guard catches
+  // it). The tension is real and unresolved by ordering alone: `vl seed` tracks
+  // the PROJECT's language version (diagnostic fidelity), the bundle tracks the
+  // EXTENSION's features — a comparable version stamp in the seed is the actual
+  // answer; until then the artifact that ships with this code wins.
+  seedSources.push({
+    kind: "path",
+    label: "bundled seed",
+    path: join(dirname(fileURLToPath(import.meta.url)), "vl-compiler.wasm"),
+  });
+  // Ask an installed CLI for the seed it would use — the rung for a bundle that
+  // shipped WITHOUT a seed (CI-built, or an older packaging). ONE spawn, at
+  // startup.
   seedSources.push({
     kind: "exec",
     label: "`vl seed`",
     cmd: opts.compilerPath || "vl",
     args: ["seed"],
-  });
-  // Shipped beside the server bundle: the rung that makes the extension work with
-  // no configuration at all. Last, so any of the above still wins.
-  seedSources.push({
-    kind: "path",
-    label: "bundled seed",
-    path: join(dirname(fileURLToPath(import.meta.url)), "vl-compiler.wasm"),
   });
 
   wasmChecker = loadWasmChecker(
