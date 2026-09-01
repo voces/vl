@@ -253,7 +253,7 @@ vl — the VL toolchain: compile, run, check, format and test VL programs
                     terminal, or TERM=dumb)
 
 A bare `vl` is reserved for a future REPL and exits 2.
-Run {c}vl help <command>{r} (or `vl <command> --help`) for details on one command.
+Run `{c}vl help <command>{r}` (or `vl <command> --help`) for details on one command.
 "
     );
 }
