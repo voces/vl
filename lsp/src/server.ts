@@ -668,7 +668,7 @@ connection.languages.semanticTokens.on(
         })
       : [];
     const lexical = wasmChecker.lexicalTokensAt(text);
-    return { data: semanticTokensDataFromWasm(idents, lexical, members) };
+    return { data: semanticTokensDataFromWasm(idents, lexical, members, text) };
   },
 );
 

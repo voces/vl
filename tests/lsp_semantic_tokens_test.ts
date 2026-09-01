@@ -234,3 +234,37 @@ Deno.test({
   // member slice — no TS AST walk.
   assertEquals(find(3, 12)?.type, "property", "`a` member");
 });
+
+// ---- the arrow fuse: `=>` renders as ONE keyword token, not two plain ops ----
+// The lexer emits `=` and `>` as two one-char operator tokens; themes leave the
+// operator scope at default foreground, so the arrow rendered white. With the
+// source supplied, the assembly fuses the pair into one keyword-class token
+// (the TS convention — its arrow is scoped keyword-ish). Without the source
+// (the playground's current call shape) the old two-token form is preserved.
+
+Deno.test({ name: "wasm-lexical: `=>` fuses to one keyword token when source is supplied", ignore }, () => {
+  const checker = loadWasmChecker(SEED, () => {})!;
+  const src = "const f = (a: i32) => a + 1\n";
+  const lexical = checker.lexicalTokensAt(src);
+  const fused = decode(semanticTokensDataFromWasm([], lexical, [], src));
+  const arrow = fused.find((t) => t.line === 0 && t.char === 19);
+  if (arrow === undefined || arrow.type !== "keyword" || arrow.length !== 2) {
+    throw new Error(`expected one 2-char keyword token at 0:19, got ${JSON.stringify(arrow)}`);
+  }
+  if (fused.some((t) => t.line === 0 && t.char === 20)) {
+    throw new Error("the second half of the arrow must be consumed by the fuse");
+  }
+  // Back-compat: no source → the two operator chars survive unfused.
+  const unfused = decode(semanticTokensDataFromWasm([], lexical, []));
+  const half = unfused.find((t) => t.line === 0 && t.char === 20);
+  if (half === undefined || half.type !== "operator") {
+    throw new Error(`sourceless call must keep the old shape, got ${JSON.stringify(half)}`);
+  }
+  // A real `>=` comparison must NOT fuse (lexeme check, not class adjacency).
+  const cmp = checker.lexicalTokensAt("const b = 1 >= 2\n");
+  const cmpFused = decode(semanticTokensDataFromWasm([], cmp, [], "const b = 1 >= 2\n"));
+  const ge = cmpFused.filter((t) => t.line === 0 && t.char >= 12 && t.char <= 13);
+  if (ge.some((t) => t.type === "keyword")) {
+    throw new Error(`\`>=\` must stay operator-classed, got ${JSON.stringify(ge)}`);
+  }
+});
