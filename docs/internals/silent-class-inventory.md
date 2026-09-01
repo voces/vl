@@ -24275,6 +24275,24 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   ObjLit scan does not find the lambda's `fe`. That pair is the next thing to separate, and
   both halves are one forced-return A/B each.
 
+  **THE fe IS FOUND; THE RETURN KIND IS THE DECLINE.** Forced-return A/B inside that arm:
+  `if ffe >= 0 { return true }` makes both witnesses print `ok`. So `fieldClosureFeOfRecv`
+  ANSWERS for a hole-param receiver — every earlier note blaming it, `paramStructIndex`, or
+  the missing param annotation was wrong. What fails is the next line, `fRetKind[ffe] == "str"`.
+
+  **AND `fRetKind[ffe]` IS NOT A SENSIBLE KIND.** Tested by forced return, one build each: it
+  is **not** `i32`, `str`, `closure`, `struct`, `nulstr`, `union`, `list`, `reflist`, `map`,
+  `strlist` or `variant`. For a lambda whose body is the string literal `"ok"` there is no
+  correct answer left in `VKind`, which points at the fe never being REGISTERED in that
+  parallel table — a field lambda is not a top-level function, and `fRetKind` is indexed by
+  fe. That is the parallel-table hazard this repo already knows: a recorded index with no row
+  behind it.
+
+  **So the fix is upstream of `exprString` entirely** — record a field lambda's return kind
+  when the object literal is collected — and the whole "pin the param's type" line of attack,
+  three retractions deep, was never on the path. Those experiments are kept above only so
+  nobody re-runs them.
+
   **A probe cannot use `emitFail` on this cell.** The emit SUCCEEDS — it produces an invalid
   module rather than refusing — so recorded failures are dropped and the probe reads as never
   fired. Use a behavioural A/B (poison a return value and watch a working cell break), which
