@@ -23853,35 +23853,43 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   function type when the receiver is a hole. So the checker's answer is not parked on either
   the call node or the callee node.
 
-  **THE MISSING INPUT IS NOW PROVEN, WITH A POSITIVE CONTROL: the param node carries no
-  recorded type.** The chain emit needs is `paramStructIndex` -> `paramStructIndexRaw` ->
-  `fieldClosureFeOf`, and it is fed by `synthParamAnnots`, which pins `p.parType` from
-  `recordedParamPinName`. Three facts, each measured by A/B against a rebuilt compiler:
+  **THE CHECKER'S ANSWER DOES NOT SURVIVE INTO EMIT — that is the defect, and it is now
+  measured rather than inferred.** A full fix was built and it does not work, which is the
+  useful part: it rules out the two readings that looked most likely.
 
-  1. **The pin machinery works.** Forcing `recordedParamPinName` to return the resolvable-but-
-     wrong `"i32"` whenever it answers at all BREAKS a nominal-struct hole param
-     (`struct S {n: i32}` / `function p(x) { print(x.n) }` -> `type error`). That is the
-     positive control the earlier eliminations lacked.
-  2. **It returns `""` for an anonymous shape.** The same poison leaves BOTH shape cells
-     untouched, so no pin is minted for `{s: string}` or `{f: ()=>string}`. The plain-field
-     cell runs by a different route entirely, which is why it looked like evidence of a pin
-     and is not.
-  3. **The renderer is not the blocker.** `tyToEmitName` spells shapes space-free and spells a
-     function type as `()=>ret` (typecheck.vl's `TyFunc` arm), and a return pin already banks
-     exactly that spelling. But `tyToEmitName(nodeTyIxOf(paramNode))` renders **empty** here —
-     added as a fallback, it never fires.
+  What the chain needs is `paramStructIndex` -> `paramStructIndexRaw` -> `fieldClosureFeOf`,
+  fed by `synthParamAnnots` pinning `p.parType` from `recordedParamPinName`. Measured, each
+  by A/B against a rebuilt compiler:
 
-  So the checker resolves the call (`const v: i32 = x.f()` reports *cannot assign string to
-  'v' of type i32*, and a bad field reports the demanded shape `{nope: _}`) and then writes
-  that shape onto no node the emitter reads. **The fix is checker-side: record the resolved
-  demanded shape on the hole param.** Every emitter-side reader tried — nine now — declines for
-  this one reason, and no tenth will do better.
+  1. **The pin machinery works.** Forcing `recordedParamPinName` to return a resolvable-but-
+     wrong `"i32"` breaks a nominal-struct hole param outright (`type error`). Positive
+     control.
+  2. **It returns `""` for an anonymous shape**, and the same poison leaves both shape cells
+     byte-identical. The plain-field cell runs by another route and is not evidence of a pin.
+  3. **`solveUnannotParams` runs but solves nothing here.** A `tErr` probe fires during
+     `vl check`; the entry for `?p.0` is `-1`. The body constrains the param only to a
+     DEMANDED SHAPE, which the code deliberately refuses to adopt (it is a lower bound —
+     adopting one previously broke a working relay program).
+  4. **The only place the real type appears is the ARGUMENT site**, and it is already
+     substituted there: at `noteArgCstr` the expected type prints `{f: () => string}`, not a
+     `TyVar`. `assignableExpr`'s flow hook never fires for it, because a hole DESTINATION
+     accepts anything so no assignability check is made.
+  5. **Publishing it onto the param node does not reach the emitter.** Capturing the argument
+     type keyed by callee name and index, then writing `nodeTyIx[paramNode]` after the
+     statement loop, demonstrably lands (`hn=?p.0 sv=51`). At emit the same node still renders
+     EMPTY — with a `tyToEmitName(nodeTyIxOf(pIx))` fallback added and poisoned to fire on any
+     non-empty render, the output is byte-identical. A counter global incremented in
+     `solveUnannotParams` also reads zero when consulted from `synthParamAnnots`.
 
-  Field-type sweep, un-annotated receiver throughout: plain `i32` runs, plain `string` runs,
-  closure returning **i32** runs (i32 is the cell DEFAULT, so this passes by luck), closure
-  returning **string** is the defect, and READING the closure field without calling is a
-  separate loud reject. Disassembly of the string cell shows the result local typed `i32`
-  un-annotated against `(ref $3)` annotated.
+  So the write is LOST between the phases, not merely unrenderable — the discriminator that
+  separates those two was run, and it says lost. **The next step is to find which channel
+  DOES carry a node type from check into emit** (nominal params arrive intact, so one exists)
+  and publish onto that, rather than to look for another type source or another reader.
+
+  Field sweep, un-annotated receiver: plain `i32` runs, plain `string` runs, closure returning
+  **i32** runs (i32 is the cell DEFAULT, so it passes by luck), closure returning **string** is
+  the defect, closure field READ is a separate loud reject. Disassembly shows the result local
+  typed `i32` un-annotated against `(ref $3)` annotated.
 
 * **AND D980 IS ITS NEIGHBOUR, NOT ITS TWIN.** The tail-position cell (`x.f()` as a function's
   last expression) traps with or WITHOUT the annotation and is closed separately; this row's
