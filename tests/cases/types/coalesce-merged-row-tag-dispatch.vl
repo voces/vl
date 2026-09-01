@@ -1,0 +1,77 @@
+// @run
+// @log 7
+// @log 1.5
+// @log 41
+// @log 0
+// @warning Unused variable `g5`
+// THE WARNING IS DECLARED, NOT DELETED: the i32|string BOUND at the end must NOT read its
+// merged field back, because reading it is what this row's own fix does not reach. That is
+// also the blind spot `d927_map_join_no_read` pins.
+// CONTRACT (must-RUN): D927 — the read side of D804's merged box, and the campaign's last TRAP.
+//
+// `emitUnionFieldNarrowUnbox`'s `mAtom == ""` arm asked `memReadBoxedAtomKind` for the ONE atom
+// the payload was stored as. That is the right answer for an ADOPTION (D209 — the box is the
+// adoption's rep and the checker never widened the value) and for a WIDENED store (D291 — the
+// field's declared member is i64, so the store widened and boxed at i64 while the checker still
+// types the read i32). It is the wrong answer for a `??`-MERGED row, which boxes each family
+// member at its OWN atom: `c["k1"] = {m: 7}` beside `(c)["k1"] ?? {m: 1.5}` puts an `i32` in at
+// one site and an `f64` at the other, `unionStoreAtomKind` answers `f64` for both, and the read
+// cast an i32 payload to `(ref $vbF64)` — `wasm trap: cast failure` on a `vl check` rc 0
+// program.
+//
+// NO NEW ENCODER AND NO `br_on_cast`. D903's row priced this as needing "a reserved
+// `(ref null $uBox)` scratch local or a `br_on_cast` on the payload, which this emitter has no
+// encoder for yet". The second is TRUE — the GC opcode table in `emit_bytes.vl` has twelve
+// sub-opcodes and neither `br_on_cast` nor `ref.test` — and it was never one of the two
+// options, because the box discriminates on a TAG FIELD and not on a type test.
+// `emitPrintValueUnion` and the shared-union-field dispatch already write exactly that chain,
+// and `sharedFieldRecvSlot` is a zero-argument call whose lazy-frame slot is already typed
+// `(ref null $uBox)`.
+//
+// ONLY WHERE EVERY ARM REACHES THE CHECKER'S ATOM, which is what leaves the families that
+// already run untouched: an `i32|string` box read as `i32` has no conversion for its string arm
+// and takes today's single cast unchanged (`distilled/named/d927_map_join_read_i32_string`),
+// while `i32|f64` and `i32|i64` convert both. `d927_map_join_no_read` is the cell that hid this
+// for a whole family — a `??`-merge that does not read its merged field back is not evidence
+// about the merged field.
+//
+// A MINT-SIDE ALTERNATIVE WAS MEASURED AND REFUSED. Folding the container-indexed join (two
+// lines: drop `anonLeafJoinLhsIndexed`'s conjunct, admit code 17 in `shapeFieldTypeCompatK`'s
+// lenient ladder) closes the same cell and loses `d833_genpin_i32_f64`, which RUNS on master.
+// One `runs` cell lost is the veto term; both `d833` cells run here.
+
+// ---- the i32/f64 pair, read back through the map carrier ----
+function rd() {
+  const c = Map()
+  c["k1"] = { m: 7 }
+  const g5 = (c)["k1"] ?? { m: 1.5 }
+  print(g5.m)
+}
+rd() // 7
+
+// ---- the DEFAULT arm of the same dispatch: a key the map does not hold ----
+function rm() {
+  const c = Map()
+  c["k1"] = { n: 7 }
+  const g5 = (c)["k9"] ?? { n: 1.5 }
+  print(g5.n)
+}
+rm() // 1.5
+
+// ---- the i32/i64 pair, a second cell master traps on ----
+function ri() {
+  const c = Map()
+  c["k1"] = { o: 41 }
+  const g5 = (c)["k1"] ?? { o: 9000000000 }
+  print(g5.o)
+}
+ri() // 41
+
+// ---- the BOUND: an i32/string box has no conversion for its string arm ----
+function rs() {
+  const c = Map()
+  c["k1"] = { q: 7 }
+  const g5 = (c)["k1"] ?? { q: "s" }
+  print(0)
+}
+rs() // 0

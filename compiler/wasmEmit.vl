@@ -632,6 +632,7 @@ import {
   memberUnionFieldNameRead,
   memIsNarrowed,
   memReadBoxedAtomKind,
+  memReadBoxedAtomKinds,
   memReadUnboxAtomKind,
   memNarrowVariantIndex,
   mfCallbackCloKey,
@@ -5394,9 +5395,37 @@ function emitUnionFieldNarrowUnbox(memIx: i32, fnIx: i32) {
     // (`memReadBoxedAtomKind`), then NARROW it back to what the consumers were typed
     // against. The two are one function's two answers, so they cannot disagree, and the
     // widening is invertible for exactly the values the checker's atom admits.
+    //
+    // D927 — AND A `??`-MERGED BOX GENUINELY HOLDS TWO, SO NO SINGLE `bk` IS RIGHT. Both
+    // paragraphs above assume the payload went in at ONE atom, which is true of an adoption
+    // (D209) and of a widened store (D291) and false of D804's merged row: `c["k1"] = {m: 7}`
+    // beside `(c)["k1"] ?? {m: 1.5}` boxes an `i32` at one site and an `f64` at the other, and
+    // `unionStoreAtomKind` answers `f64` for both — so the read cast an `i32` payload to
+    // `(ref $vbF64)` and TRAPPED on a `vl check` rc 0 program (`d903_map_join_read_i32_f64`).
+    // Dispatch on the tag the box already carries and convert each arm to the checker's atom.
+    //
+    // NO NEW ENCODER AND NO `br_on_cast`. D903's row priced this as needing "a reserved
+    // `(ref null $uBox)` scratch local or a `br_on_cast` on the payload, which this emitter has
+    // no encoder for yet" — the second is true (the GC opcode table in `emit_bytes.vl` has
+    // twelve sub-opcodes and neither `br_on_cast` nor `ref.test`) and it is not one of the two
+    // options, because the box discriminates on a TAG FIELD and not on a type test. The chain
+    // below is `emitPrintValueUnion`'s, arm for arm, and `sharedFieldRecvSlot` is a zero-argument
+    // call whose lazy-frame slot is already typed `(ref null $uBox)`.
+    //
+    // ONLY WHERE EVERY ARM CAN REACH THE CHECKER'S ATOM, which is what keeps this inert on the
+    // families that already run. An `i32|string` box read as `i32` has no conversion for its
+    // string arm — that is D804's own population and it takes today's single cast unchanged —
+    // while `i32|f64` read as `f64` converts both. One arm, or an atom set this cannot name, is
+    // also today's path exactly.
     const ck = memReadUnboxAtomKind(memIx, fnIx)
     if ck < 0 { return 0 }
     const bk = memReadBoxedAtomKind(memIx, fnIx)
+    const bks: i32[] = []
+    if memReadBoxedAtomKinds(memIx, fnIx, bks) {
+      if bks.length > 1 && atomKindsAllConvertible(bks, ck) {
+        return emitUnionFieldTagDispatch(bks, ck)
+      }
+    }
     if emitUnboxToAtomKind(bk) < 0 { return -1 }
     return emitNarrowStoredAtomKind(bk, ck)
   }
@@ -5405,6 +5434,110 @@ function emitUnionFieldNarrowUnbox(memIx: i32, fnIx: i32) {
   // same two arms); `vbHeapIdxOfAtom` re-derived it a second time here, and
   // `mAtom == "string"` was code 2 asked in spelling form.
   emitUnboxToAtomKind(valueAtomKind(mAtom))
+}
+
+// D927 — THE TAG-DISPATCHED UNBOX: one arm per atom the box can hold, each converted to the
+// checker's atom `ck`, in `splitUnionAtoms` order with the LAST arm as the unconditional
+// fall-through. The box is on the stack when this is entered (the caller emitted the receiver
+// and the `struct.get` that produced it), so it is stashed ONCE — each arm reads it twice, and
+// re-emitting a receiver per arm is the measured bug `sharedFieldRecvSlot` exists for.
+function emitUnionFieldTagDispatch(kinds: i32[], ck: i32) {
+  const slot = sharedFieldRecvSlot()
+  fbLocalSet(slot)
+  let i = 0
+  while i < kinds.length - 1 {
+    fbLocalGet(slot)
+    fbStructGet(uBoxIdx, 0) // field 0: tag
+    fbI32Const(scalarTagOfKind(kinds[i]))
+    fbI32Bin(70) // 0x46 i32.eq
+    fbIfForAtomKind(ck)
+    ctrlEnter()
+    fbLocalGet(slot)
+    if emitUnboxToAtomKind(kinds[i]) < 0 { return -1 }
+    if emitConvertAtomKind(kinds[i], ck) < 0 { return -1 }
+    fbElse()
+    i = i + 1
+  }
+  fbLocalGet(slot)
+  if emitUnboxToAtomKind(kinds[kinds.length - 1]) < 0 { return -1 }
+  if emitConvertAtomKind(kinds[kinds.length - 1], ck) < 0 { return -1 }
+  let e = 0
+  while e < kinds.length - 1 {
+    fbEnd()
+    ctrlLeave()
+    e = e + 1
+  }
+  0
+}
+
+// D927 — the `if` blocktype for a value-atom KIND, the atom-side twin of
+// `fbIfForSharedField`'s field-code one. Two spellers rather than one because the two callers
+// hold two different vocabularies — a field CODE there, a `valueAtomKind` here — and deriving
+// one from the other was what let `mAtom == "string"` be code 2 asked in spelling form.
+function fbIfForAtomKind(k: i32) {
+  if k == 2 {
+    return fbIfRef(sTypeIdx) // string header ref
+  }
+  if k == 3 {
+    return fbIf(126) // i64
+  }
+  if k == 4 {
+    return fbIf(124) // f64
+  }
+  if k == 5 {
+    return fbIf(125) // f32
+  }
+  fbIf(127) // i32 / boolean
+}
+
+// D927 — CAN A PAYLOAD BOXED AT `from` BE DELIVERED AT `to`? The predicate half of
+// `emitConvertAtomKind`, asked BEFORE any byte is written so the dispatch can stand down
+// whole rather than fail in the middle of an arm. `emitNarrowStoredAtomKind`'s four
+// narrowings and their five widening inverses; a string or boolean arm converts to nothing
+// and to nothing but itself.
+function atomKindConvertible(from: i32, to: i32): boolean {
+  if from == to { return true }
+  if from == 0 { return to == 3 || to == 4 || to == 5 }
+  if from == 3 { return to == 0 || to == 4 }
+  if from == 4 { return to == 0 }
+  if from == 5 { return to == 0 || to == 4 }
+  false
+}
+
+// D927 — every arm of the box, or the dispatch does not run.
+function atomKindsAllConvertible(kinds: i32[], to: i32): boolean {
+  let i = 0
+  while i < kinds.length {
+    if !atomKindConvertible(kinds[i], to) { return false }
+    i = i + 1
+  }
+  true
+}
+
+// D927 — the conversion itself. The NARROWING half is `emitNarrowStoredAtomKind`'s, reached
+// through it so the two cannot drift; the WIDENING half is the direction that function refuses
+// by design, because until a box held two atoms nothing ever needed it.
+function emitConvertAtomKind(from: i32, to: i32) {
+  if from == to { return 0 }
+  if from == 0 {
+    if to == 3 {
+      fbI64ExtendI32S()
+      return 0
+    }
+    if to == 4 {
+      fbF64ConvertI32S()
+      return 0
+    }
+    if to == 5 {
+      fbF32ConvertI32S()
+      return 0
+    }
+  }
+  if from == 3 && to == 4 {
+    fbF64ConvertI64S()
+    return 0
+  }
+  emitNarrowStoredAtomKind(from, to)
 }
 
 // D291 — the INVERSE of the store's widening: a payload that was boxed at kind `from`

@@ -6920,6 +6920,8 @@ function collectAnonShapes() {
   // this shape never reaches, so leaving the rung inert there keeps it byte-identical) and
   // before the mint loop, so the row column is a snapshot the loop's own appends cannot move.
   anonLeafJoinedMark()
+  // D924 — AND THE FAMILY MEMBER'S *OTHER* DESTINATION. See `anonLeafNarrowUseMark`.
+  anonLeafNarrowUseMark()
   let ai = 0
   while ai < P.nodes.length {
     const an = P.nodes[ai]
@@ -6955,6 +6957,206 @@ function collectAnonShapes() {
     ai = ai + 1
   }
   0
+}
+
+// D924 — THE FAMILY MEMBER'S *OTHER* DESTINATION: an EIGHTH owner of the merged row.
+//
+// EVERY READER SINCE D804 MAKES A LITERAL A FAMILY MEMBER, AND A MEMBER IS BUILT AT THE MERGED
+// ROW. Nothing until now asked where else that value goes. `const q = {r: 7}; src(q) ?? {r:"s"};
+// keep(q)` hands the very same value to a SECOND callee whose parameter is annotated with the
+// NARROW shape, so the argument arrives as `(ref $merged)` where the functype says
+// `(ref $narrow)` — check-clean invalid wasm, and on master too (with a different sentence).
+// That is `d911_arg_ident_narrow_use`, filed as D916, and its row called the answer "a
+// per-DESTINATION coercion, which is a rung of its own". It is not a coercion: the parameter is
+// a SLOT, and D891 already built the machinery for moving one (`anonLeafParamMoved` →
+// `anonLeafParamRowOf`). This marks the slots that receive a member, and the seventh owner's
+// own redirect does the rest.
+//
+// THE POSITION HAS TO BE *ALL* MEMBERS, WHICH IS WHAT KEEPS THE CONTROL RUNNING. A slot fed by
+// a member at one call site and by an ordinary literal at another cannot be at both rows, and
+// moving it would break the ordinary one — `d911_narrow_sibling_param` is exactly that program
+// and it RUNS on master. So a position qualifies only when every call site delivers a member
+// (or `null`, which is valid at every row) and at least one really does. Where it does not, the
+// mark is not taken and the program compiles precisely as it does today.
+//
+// THE SAME FIVE REFUTATIONS D891's CALL-SITE READER MAKES, and for its reasons exactly: a
+// generic callee (the annotation is cloned per instance), two functions of one name (no single
+// slot), the name used as a value where the program can call one (`call_ref` passes arguments
+// no name scan sees), and a call whose arguments do not bind to this arity.
+//
+// AND IT EARLY-OUTS ON "IS THERE A FAMILY AT ALL", which is not tidiness: every rung below is a
+// whole-arena scan and they nest, so an ungated pass is quadratic in the node count for every
+// program in the language. The compiler's own source has no live `?? { … }` — the mark array is
+// all zeros — and the ungated first cut of this pass took the seed's self-compile from 50
+// seconds to past ten minutes. One O(n) read of the marks buys that back, and every program
+// that HAS a family is small enough for the scans that follow.
+function anonLeafNarrowUseMark() {
+  let famAny = false
+  let mi = 0
+  while mi < anonLeafJoined.length {
+    if anonLeafJoined[mi] == 1 { famAny = true }
+    mi = mi + 1
+  }
+  if !famAny { return 0 }
+  // Hoisted out of the declaration loop: the answer is a property of the PROGRAM, and asking it
+  // per function made the pass cubic.
+  const indirect = anonLeafAnyIndirectCall()
+  let fi = 0
+  while fi < P.nodes.length {
+    const fd = P.nodes[fi]
+    if fd is FuncDecl {
+      if fd.fnTyParams.length == 0 && fd.fnParams.length > 0 {
+        if anonLeafOneDeclNamed(fd.fnName) {
+          const pNames: string[] = []
+          let pj = 0
+          while pj < fd.fnParams.length {
+            const pnj = P.nodes[fd.fnParams[pj]]
+            if pnj is Param {
+              pNames.push(pnj.parName)
+            } else {
+              pNames.push("")
+            }
+            pj = pj + 1
+          }
+          let anyValue = false
+          let vi = 0
+          while vi < P.nodes.length {
+            const vn = P.nodes[vi]
+            if vn is Ident {
+              if vn.identName == fd.fnName {
+                if !anonLeafIsCalleePos(vi) { anyValue = true }
+              }
+            }
+            vi = vi + 1
+          }
+          let ok = true
+          if anyValue {
+            if indirect { ok = false }
+          }
+          if ok {
+            let pk = 0
+            while pk < fd.fnParams.length {
+              if anonLeafSlotAllMembers(fd.fnName, pNames, pk) {
+                while anonLeafParamMoved.length <= fd.fnParams[pk] {
+                  anonLeafParamMoved.push(0)
+                }
+                anonLeafParamMoved[fd.fnParams[pk]] = 1
+              }
+              pk = pk + 1
+            }
+          }
+        }
+      }
+    }
+    fi = fi + 1
+  }
+  0
+}
+
+// D924 — IS `nm` DECLARED EXACTLY ONCE? `anonLeafParamArgsOk`'s `decls != 1` refutation, split
+// out because the narrow-use pass asks it of a declaration rather than of a read.
+function anonLeafOneDeclNamed(nm: string): boolean {
+  let n = 0
+  let i = 0
+  while i < P.nodes.length {
+    const d = P.nodes[i]
+    if d is FuncDecl {
+      if d.fnName == nm { n = n + 1 }
+    }
+    i = i + 1
+  }
+  n == 1
+}
+
+// D924 — DOES EVERY CALL SITE DELIVER A `??` FAMILY MEMBER at parameter position `pos`?
+//
+// `null` counts as delivered (`ref.null` is valid at every row) but does not COUNT as the one
+// real member the mark needs, so a slot every caller passes `null` to is not moved.
+function anonLeafSlotAllMembers(
+  fname: string,
+  pNames: string[],
+  pos: i32,
+): boolean {
+  let member = false
+  let ci = 0
+  while ci < P.nodes.length {
+    const cn = P.nodes[ci]
+    if cn is Call {
+      const cf = unwrapParen(cn.callFn)
+      if cf >= 0 {
+        const cfn = P.nodes[cf]
+        if cfn is Ident {
+          // D925 — THROUGH THE BINDING HOP TOO, so a call spelled `f(…)` over `const f =
+          // src` is the call site it is. See `anonLeafCalleeFnName`.
+          if anonLeafCalleeFnName(cn.callFn) == fname {
+            const slots = orderArgsByParamNames(
+              pNames,
+              cn.callArgs,
+              cn.callArgNames,
+            )
+            if slots.length != pNames.length { return false }
+            if pos >= slots.length { return false }
+            if slots[pos] < 0 { return false }
+            const av = unwrapParen(slots[pos])
+            if av < 0 { return false }
+            const avn = P.nodes[av]
+            if avn is NullLit { 0 }
+            else if anonLeafDeliversMember(av) { member = true }
+            else { return false }
+          }
+        }
+      }
+    }
+    ci = ci + 1
+  }
+  member
+}
+
+// D924 — IS THE ARGUMENT NODE `av` A FAMILY MEMBER, or a binding that only ever holds one?
+//
+// The two delivery forms D911's own argument reader recognises, asked in the other direction:
+// there the question was "which literals reach this slot", here it is "is every literal that
+// reaches it already at the merged row". A binding with no write at all, or one write this
+// cannot name, is not a member — the mark is refused and nothing moves.
+function anonLeafDeliversMember(av: i32): boolean {
+  const avn = P.nodes[av]
+  if avn is ObjLit { return anonLeafInJoin(av) }
+  if avn is Ident {
+    let hits = 0
+    let li = 0
+    while li < P.nodes.length {
+      const lnn = P.nodes[li]
+      let w = 0 - 1
+      if lnn is LetDecl {
+        if lnn.letName == avn.identName { w = unwrapParen(lnn.letInit) }
+      }
+      if lnn is BinExpr {
+        if lnn.binOp == "=" {
+          const tgt = unwrapParen(lnn.binLeft)
+          if tgt >= 0 {
+            const tn = P.nodes[tgt]
+            if tn is Ident {
+              if tn.identName == avn.identName { w = unwrapParen(lnn.binRight) }
+            }
+          }
+        }
+      }
+      if w >= 0 {
+        const wn = P.nodes[w]
+        if wn is NullLit {
+          0
+        } else if wn is ObjLit {
+          if !anonLeafInJoin(w) { return false }
+          hits = hits + 1
+        } else {
+          return false
+        }
+      }
+      li = li + 1
+    }
+    return hits > 0
+  }
+  false
 }
 
 // D833 — MARK EVERY OBJECT LITERAL A `??` JOINS INTO ONE VALUE, and record the row its join was
@@ -7238,7 +7440,13 @@ function anonLeafAnnAtomOf(tyIx: i32, fname: string): string {
     }
     k = k + 1
   }
-  if !nameIsShapeSpanEnds(shape) { return "" }
+  // D922 — A DECLARED NAME IS THE SAME SHAPE, WRITTEN DOWN ONCE. `type R = {r: i32}` with
+  // `: R | null` spells the identical operand as the inline `{r: i32} | null` this arm already
+  // reads, and declining it was `d912_ann_named_ret`. The fields come off the DECLARATION's own
+  // `FieldDef` nodes rather than off the spelling, because there is no spelling to split — and
+  // the atom is then `anonLeafAtomOfText` of the field's type NAME, the same six-plus-one
+  // vocabulary, so a set this contributes to is still one `nameFieldCode` can code.
+  if !nameIsShapeSpanEnds(shape) { return anonLeafDeclFieldAtom(shape, fname) }
   const fnames: string[] = []
   const ftexts: string[] = []
   shapeInnerFieldSplit(groupInnerOf(shape), fnames, ftexts)
@@ -7248,6 +7456,43 @@ function anonLeafAnnAtomOf(tyIx: i32, fname: string): string {
     i = i + 1
   }
   ""
+}
+
+// D922 — THE ATOM A DECLARED STRUCT TYPE spells at field `fname`, or "".
+//
+// REFUSES ON DISAGREEMENT rather than taking the first, for `anonLeafJoinAnnTy`'s reason: two
+// declarations of one name give the operand no single declared type, so the rung declines and
+// the family is its literals. A GENERIC declaration (`type Box<T>`) is not a match either — its
+// `tdName` carries the parameter span, so the plain-name compare never fires on one, and the
+// atom it would spell is per-instance rather than declared.
+function anonLeafDeclFieldAtom(shape: string, fname: string): string {
+  if shape == "" { return "" }
+  let hit = ""
+  let seen = false
+  let i = 0
+  while i < P.nodes.length {
+    const s = P.nodes[i]
+    if s is TypeDecl {
+      if s.tdName == shape {
+        if seen { return "" }
+        seen = true
+        let fi = 0
+        while fi < s.tdFields.length {
+          if s.tdFields[fi] >= 0 {
+            const fd = P.nodes[s.tdFields[fi]]
+            if fd is FieldDef {
+              if fd.fdName == fname {
+                hit = anonLeafAtomOfText(tyNameOf(fd.fdType))
+              }
+            }
+          }
+          fi = fi + 1
+        }
+      }
+    }
+    i = i + 1
+  }
+  hit
 }
 
 // D911 — MAY AN ANNOTATION'S atom JOIN A SET OF VALUE ATOMS? Only when it does not WIDEN the
@@ -7431,8 +7676,20 @@ function anonLeafJoinCallee(callFn: i32, mem: i32[]) {
 // frame that pushed it is being read, so its return row is in `fns` and will be marked — a
 // self-call hands back that same row, contributes no literal nobody has seen, and refuting it
 // cost `src(n): S|null { if n <= 0 { return {r: 0} }; src(n - 1) }` its merge
-// (`d885_self_recursive_ret`). The depth cap is the second, independent bound and the only one
-// a fresh name meets.
+// (`d885_self_recursive_ret`).
+//
+// D921 — AND `fns` IS THE WHOLE BOUND: THE DEPTH CAP WAS A SECOND ONE THAT REFUSED PROGRAMS.
+// The header used to read "the depth cap is the second, independent bound and the only one a
+// fresh name meets", and `depth > 1` was that cap. It is not a bound at all, it is a REFUSAL
+// with a number in it: every recursive entry to this reader goes through the `fns` gate above
+// (`anonLeafRetPathOk`'s Call arm, `anonLeafBoundValOk`'s Call arm and
+// `anonLeafParamArgsOk`'s call-valued-argument arm all call THIS function), a name already on
+// the path answers without re-reading, and each fresh name is pushed exactly once — so the
+// number of frames a single read can open is the number of DISTINCT function names in the
+// program, whatever `depth` says. What the cap actually did was decline `src(mk())` where
+// `mk`'s own body hands back another call: two frames, one more than the number allowed.
+// That is `d911_nested_arg_two_frames`, and `depth` is kept only because it is what a future
+// COST bound would count.
 function anonLeafCalleeRead(
   callFn: i32,
   lits: i32[],
@@ -7440,7 +7697,7 @@ function anonLeafCalleeRead(
   pars: i32[],
   depth: i32,
 ): boolean {
-  if depth > 1 { return false }
+  if depth < 0 { return false }
   const c = unwrapParen(callFn)
   if c < 0 { return false }
   const cn = P.nodes[c]
@@ -7478,6 +7735,48 @@ function anonLeafCalleeRead(
     return seen
   }
   false
+}
+
+// D926 — CARRY A `??` OWNER MARK ONTO A MONOMORPHIZED CLONE'S NODE.
+//
+// BOTH MARKS ARE ARENA-NODE KEYED AND THE MONOMORPHIZER MINTS NEW NODES. `collectAnonShapes`
+// is pass 3 and `monomorphize` is pass 16, so every mark is final by the time an instance is
+// built — but `monoMakeInstance` calls `mkParam` and `mkFunc`, and every reader of the marks
+// (`emitOneFuncType`, `emitFuncCode`, `paramStructIdxOf`, `anonLeafRetRowOf`) resolves through
+// the POST-mono declaration. The mark was therefore silently dropped for any callee mono
+// clones, and the two sites had drifted to opposite wrong answers about it:
+//
+//   * `anonLeafParamArgsOk` refused a callee with `fnTyParams` OUTRIGHT — the refusal
+//     `d911_generic_callee` pins. It is not the right test either way: `monoIsGenericDecl`
+//     clones for an UN-ANNOTATED parameter too, and `function src(p: {r: i32}, t)` has an
+//     empty `fnTyParams`, is marked, is cloned, and is CHECK-CLEAN INVALID WASM on master
+//     (`d926_hole_param_clone`).
+//   * `anonLeafMarkRetMoved` had no such guard at all, so a GENERIC callee returning a literal
+//     into a `??` marks a `FuncDecl` that mono then replaces — also check-clean invalid wasm on
+//     master, and unfiled until now (`d926_generic_ret_clone`).
+//
+// CARRYING THE MARK CLOSES ALL THREE and needs no guard, because `anonLeafSupersedeOf` is a
+// bounds-checked identity outside the family: an instance whose parameter annotation was
+// RE-SYNTHESISED per pin resolves to a row the merge never touched and the redirect is a no-op.
+// Only a parameter whose pinned row IS the family's narrow row moves — which for a concrete
+// annotation like `p: {r: i32}` is the same arena type node, shared with the original.
+export function anonLeafCarryParamMark(origIx: i32, newIx: i32) {
+  if origIx < 0 || newIx < 0 { return 0 }
+  if origIx >= anonLeafParamMoved.length { return 0 }
+  if anonLeafParamMoved[origIx] != 1 { return 0 }
+  while anonLeafParamMoved.length <= newIx { anonLeafParamMoved.push(0) }
+  anonLeafParamMoved[newIx] = 1
+  0
+}
+
+// D926 — the return-row twin. See `anonLeafCarryParamMark`.
+export function anonLeafCarryRetMark(origIx: i32, newIx: i32) {
+  if origIx < 0 || newIx < 0 { return 0 }
+  if origIx >= anonLeafRetMoved.length { return 0 }
+  if anonLeafRetMoved[origIx] != 1 { return 0 }
+  while anonLeafRetMoved.length <= newIx { anonLeafRetMoved.push(0) }
+  anonLeafRetMoved[newIx] = 1
+  0
 }
 
 // D871 — every `FuncDecl` named `nm` has its return row follow the merge. Split out of
@@ -7719,7 +8018,15 @@ function anonLeafParamArgsOk(
     const fd = P.nodes[fi]
     if fd is FuncDecl {
       if fd.fnBody == body {
-        if fd.fnTyParams.length > 0 { return false }
+        // D926 — THE GENERIC REFUSAL IS GONE, AND IT WAS NEVER THE RIGHT TEST. It read
+        // `fd.fnTyParams.length > 0 { return false }` on the stated reason that "the
+        // monomorphizer clones the param's type per instance, so the annotation this marks
+        // is not the slot any instance emits". The clone is real; the mark not surviving it
+        // is what was wrong, and it is fixed where it happens (`anonLeafCarryParamMark`).
+        // The predicate was also strictly narrower than the cloning one
+        // (`monoIsGenericDecl` clones for an UN-ANNOTATED parameter too), so it declined
+        // `d911_generic_callee` while letting `d926_hole_param_clone` through to invalid
+        // wasm — a guard that was neither necessary nor sufficient for its own reason.
         fname = fd.fnName
         let pj = 0
         while pj < fd.fnParams.length {
@@ -7795,7 +8102,9 @@ function anonLeafParamArgsOk(
       if cf >= 0 {
         const cfn = P.nodes[cf]
         if cfn is Ident {
-          if cfn.identName == fname {
+          // D925 — THROUGH THE BINDING HOP TOO, so a call spelled `f(…)` over `const f =
+          // src` is the call site it is. See `anonLeafCalleeFnName`.
+          if anonLeafCalleeFnName(cn.callFn) == fname {
             // D911 — BOUND BY NAME THEN POSITIONALLY, through the one binder the checker and
             // the emitter share. Refusing every named argument outright (`src(p: { r: 7 })`)
             // was `d891_bound_named_arg`: the position this loop reads is the SOURCE one, and
@@ -7925,8 +8234,21 @@ function anonLeafFrameRebinds(root: i32, nm: string): boolean {
 // is STRICT where that one is lenient for `anonLeafJoinCallee`'s reason: a write this cannot
 // name is a value that reaches the moved parameter slot at the row the merge left behind.
 //
-// `body` is -1 on purpose: a bound value that is itself an identifier has no frame to resolve
-// against here, so it refutes rather than half-reading a chain.
+// D921 — `body` IS THE BINDING SITE'S OWN FRAME, and it used to be -1.
+//
+// The header sentence it replaces read "`body` is -1 on purpose: a bound value that is itself
+// an identifier has no frame to resolve against here, so it refutes rather than half-reading a
+// chain". There IS a frame and it is not the one this scan is standing in: an argument's name
+// resolves in the caller, and a value written to that name resolves in the frame holding THAT
+// WRITE — which is `anonLeafFrameBodyOf` of the binding node, not of the call site and not of
+// the callee. `const q = z; src(q)` inside `rd(z: {r:i32})` is the shape: `q`'s write lives in
+// `rd`, `z` is `rd`'s own parameter, and D891's arm then reads `rd`'s call sites for it. That
+// is `d911_arg_ident_unnameable`, and it composes two rungs that were already here rather than
+// adding a reader.
+//
+// A MODULE-SCOPE binding still answers -1 and still refutes, which is a real bound and not an
+// oversight: `anonLeafRetIdentOk` resolves against a function's bindings and a parameter list,
+// and module scope has neither. `d921_arg_ident_module_chain` is that cell.
 function anonLeafArgIdentOk(
   nm: string,
   out: i32[],
@@ -7944,7 +8266,7 @@ function anonLeafArgIdentOk(
         if (
           !anonLeafBoundValOk(
             lnn.letInit,
-            0 - 1,
+            anonLeafFrameBodyOf(li),
             out,
             hits,
             fns,
@@ -7967,7 +8289,7 @@ function anonLeafArgIdentOk(
               if (
                 !anonLeafBoundValOk(
                   lnn.binRight,
-                  0 - 1,
+                  anonLeafFrameBodyOf(li),
                   out,
                   hits,
                   fns,
@@ -7988,6 +8310,24 @@ function anonLeafArgIdentOk(
   hits.length > 0
 }
 
+// D921 — THE BODY BLOCK OF THE INNERMOST `FuncDecl` CONTAINING `n`, or -1 at module scope.
+//
+// `anonLeafInFrame` stops at a nested declaration, so the frames it tests PARTITION the arena
+// and the first `FuncDecl` whose body contains `n` is the innermost one — the same containment
+// the self-pass arm uses, asked in the other direction.
+function anonLeafFrameBodyOf(n: i32): i32 {
+  if n < 0 { return 0 - 1 }
+  let i = 0
+  while i < P.nodes.length {
+    const fd = P.nodes[i]
+    if fd is FuncDecl {
+      if anonLeafInFrame(fd.fnBody, n) { return fd.fnBody }
+    }
+    i = i + 1
+  }
+  0 - 1
+}
+
 // D911 — COULD ANY CALL IN THIS PROGRAM GO THROUGH A FUNCTION VALUE? The question the
 // name-as-value guard is really asking, and the only one that makes a function value dangerous
 // to this rung: with no `call_ref` anywhere, a funcref can be built and bound and still never
@@ -8001,6 +8341,15 @@ function anonLeafArgIdentOk(
 // name resolve to a `FuncDecl`".
 //
 // Asked ONLY where a function value was actually found, so a program without one pays nothing.
+//
+// D925 — AND A CALL THROUGH A BINDING THIS CAN RESOLVE IS NOT ONE OF THEM. The sentence above
+// is about arguments a name scan cannot SEE, and `const f = src; f({r: 9})` puts its argument at
+// a call site as plainly as `src({r: 9})` does — the callee is spelled with one name-hop, and
+// the hop is a `LetDecl` the same scan already reads. Refusing it was `d911_fn_value_called`, a
+// refusal whose stated reason the program does not contain (D911's own words for the guard this
+// one sits behind, one hop further out). A name bound to something that is NOT one function —
+// a parameter, two different functions, a value the scan cannot name — is still dangerous and
+// still counts.
 function anonLeafAnyIndirectCall(): boolean {
   let ci = 0
   while ci < P.nodes.length {
@@ -8010,7 +8359,9 @@ function anonLeafAnyIndirectCall(): boolean {
       if cf < 0 { return true }
       const cfn = P.nodes[cf]
       if cfn is Ident {
-        if anonLeafNameIsBound(cfn.identName) { return true }
+        if anonLeafNameIsBound(cfn.identName) {
+          if anonLeafCalleeFnName(cn.callFn) == "" { return true }
+        }
       } else {
         return true
       }
@@ -8018,6 +8369,68 @@ function anonLeafAnyIndirectCall(): boolean {
     ci = ci + 1
   }
   false
+}
+
+// D925 — THE FUNCTION A CALL'S CALLEE POSITION NAMES, through at most one binding hop, or "".
+//
+// A bare identifier that a `FuncDecl` declares is itself; otherwise the identifier is a value,
+// and it names a function only when EVERY write to it is that same function's name. One hop and
+// no more: `const g = f` where `f` is itself a binding is a chain this does not follow, and it
+// answers "" so both callers refuse exactly as they do today.
+function anonLeafCalleeFnName(callFn: i32): string {
+  const cf = unwrapParen(callFn)
+  if cf < 0 { return "" }
+  const cfn = P.nodes[cf]
+  if cfn is Ident {
+    if anonLeafOneDeclNamed(cfn.identName) { return cfn.identName }
+    return anonLeafFnValueTarget(cfn.identName)
+  }
+  ""
+}
+
+// D925 — THE ONE FUNCTION NAME `nm` IS EVER BOUND TO, or "". A `Param` named `nm` refutes
+// outright: its value is whatever the caller passed, which is not at any write this can read.
+function anonLeafFnValueTarget(nm: string): string {
+  let hit = ""
+  let hits = 0
+  let i = 0
+  while i < P.nodes.length {
+    const n = P.nodes[i]
+    if n is Param {
+      if n.parName == nm { return "" }
+    }
+    let w = 0 - 1
+    if n is LetDecl {
+      if n.letName == nm { w = unwrapParen(n.letInit) }
+    }
+    if n is BinExpr {
+      if n.binOp == "=" {
+        const tgt = unwrapParen(n.binLeft)
+        if tgt >= 0 {
+          const tn = P.nodes[tgt]
+          if tn is Ident {
+            if tn.identName == nm { w = unwrapParen(n.binRight) }
+          }
+        }
+      }
+    }
+    if w >= 0 {
+      const wn = P.nodes[w]
+      if wn is Ident {
+        if !anonLeafOneDeclNamed(wn.identName) { return "" }
+        if hits > 0 {
+          if hit != wn.identName { return "" }
+        }
+        hit = wn.identName
+        hits = hits + 1
+      } else {
+        return ""
+      }
+    }
+    i = i + 1
+  }
+  if hits == 0 { return "" }
+  hit
 }
 
 // D911 — IS `nm` BOUND TO A VALUE anywhere in the program (a `LetDecl` or a `Param`)? The
