@@ -81,6 +81,7 @@ import {
   isBoolLitExpr,
   isInferLetNulBool,
   isInferLetNulStr,
+  isNumIntrinsicName,
   isParentElseTyIxOf,
   isParentTyIxOf,
   isTopLevelFuncTypeName,
@@ -4350,11 +4351,46 @@ export function capScan(ix: i32, bound: string[], caps: string[]) {
     // `toString` / `fromCodePoint(s)` / `Map` / `Set` — which are deliberately NOT on the
     // reservation list (a program may define its own `print`, so the checker does not
     // reserve the name) and therefore cannot be folded into it.
+    // A THIRD LIST, and it is the one that had drifted. The NUMERIC-OPCODE intrinsics
+    // (`f64bits` / `f64fromBits` / `clz` / `floor` / `abs` / `divU` / … —
+    // `typecheck.isNumIntrinsicName`) are lowered at the call site exactly like the dunder
+    // family, but they are on NEITHER list above, so their names rode the capture list and
+    // `emitCaptureRead` floored on them: `emitProgram: the numeric intrinsic 'f64bits' is
+    // mistaken for a captured variable here`. That refusal fires for a call from an
+    // ORDINARY TOP-LEVEL FUNCTION as soon as the program contains any function value
+    // anywhere — three lines reproduce it — so it made `std:fmt`'s f64 arm unusable
+    // alongside a comparator lambda or `std:test`.
+    //
+    // THE GUARD IS THE DIFFERENCE FROM THE OTHER TWO LISTS, and it is why this is not one
+    // more `skipCallee = true`. A numeric intrinsic is NOT a reserved name — `typecheck`'s
+    // `numIntrShadowed` lets a program's own declaration or in-scope binding win, and then
+    // `clz(x)` is an ordinary call through an ordinary value that MUST be captured. So the
+    // exemption is conditioned on nothing in scope binding the spelling, which is exactly
+    // the condition under which the emitter writes the opcode: not bound in this frame,
+    // not a collected function, not a module global, and not bound by an enclosing frame
+    // (the same `parentBindingFrameOf` question `capRecord` asks one screen up).
+    //
+    // A SEPARATE, PRE-EXISTING DEFECT LIVES NEXT DOOR and this deliberately does not touch
+    // it: a LOCAL closure named after an intrinsic still lowers as the OPCODE at its call
+    // site, so `const clz = (x: i32) => x + 100` inside a function, called from a nested
+    // lambda, prints 30 (the opcode) rather than 106. Measured A/B against a master-built
+    // seed — both print 30, so the guard above changes nothing there. Keeping the capture
+    // recorded is what leaves the env correct for the day that dispatch is fixed; a bare
+    // `skipCallee = true` would have to be un-done then.
     let skipCallee = false
     const cal = P.nodes[unwrapParen(n.callFn)]
     if cal is Ident {
       if isBuiltinFnName(cal.identName) { skipCallee = true }
       if nameIsEmitterIntrinsic(cal.identName) { skipCallee = true }
+      if isNumIntrinsicName(cal.identName) {
+        let shadowed = capIsBound(bound, cal.identName)
+        if fnIndexOf(cal.identName) >= 0 { shadowed = true }
+        if globalIndexOf(cal.identName) >= 0 { shadowed = true }
+        if parentBindingFrameOf(capFrame, cal.identName) >= 0 {
+          shadowed = true
+        }
+        if !shadowed { skipCallee = true }
+      }
     }
     if !skipCallee { capScan(n.callFn, bound, caps) }
     const args = n.callArgs

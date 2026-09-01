@@ -1,12 +1,60 @@
-// `std:fmt` — pure-VL formatting helpers over the intrinsic floor
-// (docs/std-design.md D4 item 1). The exported helpers take a `self` first
-// parameter, so they read as UFCS methods on the receiver (`n.toStr()`,
-// `parts.join(sep)`). f64→string (shortest round-trip, Ryu-class) is
-// deliberately absent — `print` keeps covering floats.
+// `std:fmt` — pure-VL number formatting AND number parsing over the intrinsic
+// floor (docs/internals/std-design.md D4 item 1). The exported helpers take a
+// `self` first parameter, so they read as UFCS methods on the receiver
+// (`n.toStr()`, `"1.5".parseF64()`, `parts.join(sep)`).
 //
-// WHAT IS STILL WRITTEN HERE is the number rendering: `toStr` over the two
-// integer widths and boolean, digit by digit, in the negative range so i64 min
-// survives.
+// THE NAME `toStr` IS ABOUT TO BECOME `toString` — owner ruling, 2026-09-01:
+// the ambient compiler builtin `toString` is being retired and this module's
+// export takes its place. That lands in a FOLLOW-UP change, because the rename
+// touches the compiler's default scope, its emit special-cases and every
+// in-tree importer, and none of that should move underneath the float
+// algorithms below. Nothing in this file names its own export in a string, so
+// the rename stays one `export` line plus importers.
+//
+// Measured 2026-09-01, for the rename's reviewer: the builtin's domain is
+// `i32 | boolean` — a STRICT SUBSET of this export's `i32 | i64 | boolean |
+// f64` (`toString(n)` on an i64 and `toString(1.5)` both refuse today) — so no
+// program loses a capability and the rename is purely additive at the type
+// level. And `n.toString()` refuses today (`member access '.toString' on
+// non-object i32`) because builtins are not `self`-first, so the rename also
+// BUYS the UFCS spelling — the actual user-facing win. The one break it
+// carries: `toString(42)` compiles with NO import today and will need
+// `import { toString } from "std:fmt"` after; std has no deprecation story, so
+// that break ships once, here, deliberately.
+//
+// WHAT IS WRITTEN HERE is the number rendering — `toStr` over the two integer
+// widths, boolean, and (new) `f64` — plus `parseF64`, the inverse. The f64
+// halves are the interesting ones and their whole design is in the
+// `f64 ↔ TEXT` block below; read that before touching them.
+//
+// WHAT IS NOT, ON THE NUMERIC SIDE: `f32`, in either direction, and any radix
+// but ten. Neither is "later here"; both are a different computation.
+//
+//   `f32` HAS NO ARM AND SHOULD NOT GET A WRAPPER. An f32's shortest rendering
+//   is shorter than its widened f64's — `0.1` against `0.10000000149011612` —
+//   so it is Burger–Dybvig with 24-bit-significand boundaries, not `toStr` of
+//   the widened value, and reading one back needs f32-nearest rounding rather
+//   than f64-nearest then a narrowing. `docs/serde-design.md` stage 0 carries
+//   it as the remaining half.
+//
+//   THAT ABSENCE HAS A DIAGNOSTIC PRICE AND IT IS THE F64 ARM'S FAULT, so it
+//   is stated rather than left to be hit. An `f32` widens losslessly into the
+//   `f64` arm, so the checker now ACCEPTS `x.toStr()` over an `f32` binding
+//   where it used to refuse it cleanly (`member access '.toStr' on non-object
+//   f32`); the emitter then floors with `emitProgram: union atom has no value
+//   box`. Measured 2026-09-01, both spellings. The hole is the COMPILER's and
+//   predates this module — three std-free lines reproduce it, and it refuses
+//   identically on a master-built seed — but it was unreachable from `toStr`
+//   until the f64 arm existed. Pinned by
+//   `scripts/capability-probes/f32-into-f64-union-arm.vl`, whose header argues
+//   the end state is to BOX the widened value rather than to re-narrow the
+//   checker: the widening is lossless, so clause 2 says the program must
+//   build. When it does, an `f32` will render as the f64 it became, which is
+//   why an f32 arm is still owed after that.
+//
+//   RADIX: `toStr` is decimal only. Hex, binary and octal renderings are a
+//   different function family with their own case and padding questions, and
+//   nothing in the tree asks for one.
 //
 // WHAT IS NOT is the string manipulation. `split`, `join`, `repeat` and
 // `padLeft` used to have their implementations in this file; they now live in
@@ -28,17 +76,21 @@
 // whether their `join` was O(n) or O(n²). One implementation, one home, and
 // this module keeps the names its importers already spell.
 //
-// WHAT THE MOVE COSTS, MEASURED. There is no cross-module dead-code
-// elimination, so a program that imports ONLY `toStr` now emits `std:str` too:
-// `import { toStr } from "std:fmt"` + one `n.toStr()` builds to 5,540 bytes
-// where it used to build to 2,850. That is a real regression and it is recorded
-// here rather than left to be discovered, but it is a symptom of the missing
-// DCE and not of the module shape — the same program already carried this
-// module's own unused `split`/`join`/`repeat` before the move, for the same
-// reason. The fix is whole-program dead-code elimination, which nothing in the
-// pipeline does today; the alternative — two implementations of `split`, so
-// that a formatting import stays small — buys the bytes back by paying in the
-// hazard above.
+// WHAT THE MOVE COSTS, MEASURED — AND THE NUMBER MOVES WHENEVER THIS FILE
+// GROWS, so it is dated. There is no cross-module dead-code elimination, so a
+// program that imports ONLY `toStr` emits `std:str` too AND every byte of the
+// f64 halves below. `import { toStr } from "std:fmt"` + one `n.toStr()` on an
+// i32, built to wasm on 2026-09-01: **17,062 bytes** — 2,850 before the
+// `std:str` move, 7,548 before the f64 half, and the breakdown of the last
+// 9,514 is in the `f64 ↔ TEXT` header, where it is the argument for `parseF64`
+// living here. That is a real regression and it is recorded here rather than
+// left to be discovered, but it is a symptom of the missing DCE and not of the
+// module shape — the same program already carried this module's own unused
+// `split`/`join`/`repeat` before the move, for the same reason. The fix is
+// whole-program dead-code elimination, which nothing in the pipeline does
+// today; the alternative — two implementations of `split`, so that a
+// formatting import stays small — buys the bytes back by paying in the hazard
+// above.
 //
 // `padLeft` IS THE ONE NAME THAT DID NOT MOVE VERBATIM. `std:str` spells it
 // `padStart`, matching `padEnd` beside it and the JS pair both are modelled on;
@@ -89,11 +141,19 @@ function renderI64(n: i64) {
   out
 }
 
-// Decimal rendering of an integer via its receiver: `n.toStr()` over an i32
-// or i64 binding. One union receiver covers both widths (UFCS resolves by
-// `self`+arity; the value boxes in, `is`-narrows out); i32 widens losslessly
-// into the shared i64 renderer. The boolean arm renders true/false.
-export function toStr(self: i32 | i64 | boolean) {
+// Decimal rendering of a number via its receiver: `n.toStr()` over an i32, an
+// i64 or an f64 binding. One union receiver covers every width (UFCS resolves
+// by `self`+arity; the value boxes in, `is`-narrows out); i32 widens
+// losslessly into the shared i64 renderer. The boolean arm renders true/false.
+//
+// The f64 arm is the whole `f64 ↔ TEXT` section below, and it is a SEPARATE
+// arm of this same union rather than a separate exported name because a flat
+// namespace has room for exactly one `toStr` and a reader who has learned
+// `n.toStr()` should not have to learn a second spelling to render a float.
+// Measured, so it is not an assumption: a four-arm receiver `is`-narrows and
+// monomorphizes per arm on this compiler — `f64bits` inside the `is f64`
+// branch reads the narrowed f64, no boxing artefact survives.
+export function toStr(self: i32 | i64 | boolean | f64) {
   if self is boolean {
     if self { return "true" }
     return "false"
@@ -102,6 +162,7 @@ export function toStr(self: i32 | i64 | boolean) {
     const wide: i64 = self
     return renderI64(wide)
   }
+  if self is f64 { return renderF64(self) }
   return renderI64(self)
 }
 
@@ -113,4 +174,877 @@ export function toStr(self: i32 | i64 | boolean) {
 // `padEnd` twin, which has no name here).
 export function padLeft(self: string, width: i32, fill: string) {
   return padStart(self, width, fill)
+}
+
+// ── f64 ↔ TEXT ──────────────────────────────────────────────────────────────
+//
+// Serde stage 0 (`docs/serde-design.md` §Recommendation). Until this landed VL
+// could not render or read a float at all: `"v=" + 0.1` was
+// `operator '+' is not defined for string and f64`, and there was no parser
+// anywhere in std. The shortest-round-trip printer that `print(0.1 + 0.2)` uses
+// lives in the HOST's print sink, not in VL, so its result was never available
+// as a VL string value. `docs/internals/std-design.md` D4 item 1 deferred this
+// ("Ryu-class … explicitly DEFERRED — `print` keeps covering floats"); that
+// deferral is now spent, and the paragraph there says so.
+//
+// ── THE STYLE IS ECMAScript `Number::toString`, radix 10, and that is a SPEC,
+// not a preference. Two independent reasons pick it. (1) It is what the two
+// hosts' print sinks already claim to implement — `scripts/vl-host/src/main.rs`
+// names the clause and `tests/support/runWasm.ts` / `playground/src/runtime.ts`
+// sink through JS `String(v)` literally — so `print(x.toStr())` and `print(x)`
+// are meant to be indistinguishable, and any other choice would make VL print
+// a float two ways. (2) `String(v)` IS shortest-round-trip by specification, so
+// the rule is pinned by a document rather than by an implementation.
+//
+// The rule, restated because the layout half is easy to get wrong: let `s` be
+// the SHORTEST digit string (k digits, no radix point) and `n` the exponent
+// with value = 0.s × 10^n. Then
+//
+//     k ≤ n ≤ 21   → the digits, then n−k zeros            ("100")
+//     0 < n ≤ 21   → a radix point n digits in             ("1.5")
+//     −6 < n ≤ 0   → "0." then −n zeros then the digits    ("0.000001")
+//     otherwise    → exponential, exponent always signed   ("1e+21", "1e-7")
+//
+// and the specials: NaN → "NaN", ±∞ → "Infinity"/"-Infinity", and BOTH zeros →
+// "0". Among equally short digit strings the spec takes the one closest to the
+// value, and on an exact tie **the one whose last digit is even**.
+//
+// ── THE HOST'S `print` DISAGREES AT EXACT TIES, and it is the host that is
+// wrong. Measured 2026-09-01 over 50,000 pseudo-random bit patterns: this
+// module's rendering equals JS `String(v)` on 50,000 of 50,000, while the Rust
+// host's `print` disagrees with JS on 14 of them — always an exact decimal tie,
+// always rounding AWAY from even where the spec rounds to even. Smallest
+// witness: the double with bits 4835952189745799117 is exactly
+// 2023347301156851.25, so "…851.2" and "…851.3" are equidistant 17-digit
+// candidates; the spec (and V8, and this module) print `2023347301156851.2`,
+// the Rust host prints `2023347301156851.3`. The cause is that
+// `js_number_to_string` re-formats digits it gets from Rust's `{:e}`, and
+// Rust's shortest-formatter breaks that tie the other way; its own doc comment
+// enumerates four Rust-vs-JS FORMATTING differences and does not know about
+// this DIGIT one. Consequence: the same VL program prints differently under the
+// two hosts for those values — a cross-host divergence that predates this
+// module. This file follows the spec and the V8 host; the divergence is pinned
+// by `tests/vl_std_float_text_test.ts` so it flips loudly when the host is
+// fixed.
+//
+// ── ROUND TRIP: `parseF64(x.toStr())` is bit-identical to `x` for every finite
+// f64 EXCEPT −0, and returns a NaN for NaN. Both exceptions are the style's,
+// not the algorithm's: the spec renders −0 as `"0"`, so the sign is gone before
+// the parser sees it (JS `Number(String(-0))` is `+0` for the same reason), and
+// NaN renders as `"NaN"` which carries no payload. Measured over the same
+// 50,000 vectors: 50,000 of 50,000 round-trip under that rule, 0 exceptions.
+//
+// ── THE ALGORITHMS, and why these rather than Ryū.
+//
+// FORMATTING is Steele & White / Burger–Dybvig free-format printing over exact
+// rational arithmetic: the value is held as R/S with the two half-ulp
+// boundaries M+ and M−, all four exact big integers, and digits are generated
+// until the emitted prefix already identifies the value uniquely within
+// (v−M−, v+M+). Correctness is by construction rather than by table: no digit
+// is emitted that the interval does not force, and the loop cannot stop early
+// because stopping IS the interval test. Boundary inclusivity follows
+// round-to-nearest-EVEN — an even significand owns its boundaries, an odd one
+// does not — and the final digit takes the spec's closest-then-even rule.
+//
+// Ryū was the alternative and was NOT taken. Ryū is faster, but it needs ~1,240
+// 64-bit table constants (two 128-bit power-of-five tables) and 64×64→128
+// multiplication synthesised from 32-bit halves, and its correctness argument
+// is "the table bounds were proven elsewhere". This one needs no table at all,
+// no 128-bit multiply (limbs are 32 bits inside an i64, so every partial
+// product fits with room), and its correctness argument is one paragraph of
+// exact arithmetic that a reader can check against the code. A std module with
+// no deprecation story should be the one that can be re-derived. The price is
+// speed, and it is MEASURED rather than guessed — 100,000 iterations each, wall
+// clock, minus the same program with the loop body removed:
+//
+//     rendering a random double        ~25 µs   (the 17-digit case; a short one
+//                                                stops the digit loop sooner)
+//     parsing on the fast path         < 1 µs   ("0.1")
+//     parsing on the exact path        ~22 µs   ("2.2250738585072012e-308")
+//
+// Ryū would be roughly two orders faster at rendering. If a consumer ever names
+// a throughput requirement it drops in behind this same signature; until one
+// does, the table-free version is the one that can be checked by reading it.
+//
+// PARSING is Clinger's fast path over an exact fallback. When the significand
+// has ≤ 15 digits and the decimal exponent is within ±22, both operands are
+// exactly representable and one IEEE multiply or divide is one correctly
+// rounded rounding — that is Clinger's theorem, and it covers `"0.1"` and most
+// human-written numbers. Otherwise the value is held EXACTLY as num/den (big
+// integers), the binary exponent is chosen from the bit lengths so the quotient
+// lands in [2^52, 2^53), and a 55-step binary long division produces that
+// quotient plus its exact remainder. Rounding compares 2·remainder against the
+// divisor: greater rounds up, equal is a true tie broken to even, less rounds
+// down. Nothing about that is approximate, so it is correct at every halfway
+// case by construction.
+//
+// SIGNIFICANT DIGITS ARE CAPPED AT 800, with a `truncated` flag. That is the
+// classic bound (767 digits suffice to separate any decimal from a double's
+// rounding boundary; Go's `strconv` uses 800 for the same reason) plus slack:
+// beyond it, dropped digits cannot move the comparison EXCEPT by turning an
+// exact tie into a value strictly above it, which is exactly what the flag
+// does. Without the cap a megabyte of digits would be a megabyte of big
+// integer, which is a denial-of-service surface for the JSON reader this is
+// being built for.
+//
+// ── THE GRAMMAR `parseF64` ACCEPTS is closed under `toStr` — every string this
+// module can PRODUCE parses back — and it is JSON's number grammar plus
+// Infinity/NaN, NOT VL's literal grammar. Precisely:
+//
+//     "-"? ( "Infinity" | digits ("." digits)? ([eE] [+-]? digits)? )
+//     "NaN"
+//
+// VL's literals are a strict superset in one direction: digit separators are
+// legal VL (`1_000.5` and `1_0e1_0` both run — measured) and are REFUSED here,
+// because a separator is a source-code affordance and this parser reads DATA.
+// Deliberate exclusions: a leading "+", leading or trailing whitespace, a bare
+// "1." or ".5" (VL's lexer refuses both — measured), "0x10" (a VL INTEGER
+// literal, never a float one), digit separators, and "-NaN". A caller with a
+// scruffier dialect trims and rewrites first; std does not guess.
+// Leading zeros ARE accepted ("007", "0.5"), matching every strtod and costing
+// nothing. If user-defined casts (error-handling-design.md §Future extensions
+// (b), open) ever land, `s as f64` is a two-line delegation to THIS function,
+// not a second parser — and the null channel is precisely what makes
+// `s as? f64` read correctly. One float parser in the tree either way.
+//
+// ── `f64 | null` IS THE CHANNEL, and the reason it is not `f64 | ParseError`
+// is that there is nothing to put in one. `error-handling-design.md` rules
+// `T | null` for absence and `T | E` for "a failure with information the caller
+// needs — an errno, a message, a parse position". A position would be honest
+// only if a prefix could succeed, and it cannot: `parseF64` consumes the WHOLE
+// string or fails, so the only fact is "this string denotes no f64", which the
+// null already says. That is also where every mainstream float parser landed —
+// Rust's `ParseFloatError` carries no position, Go's echoes the input, JS
+// answers `NaN` — and the closest VL precedent is `Map[k]`, absence rather than
+// diagnosis.
+//
+// `std:base64`, landing in the same slice, answers `u8[] | Base64Error`
+// instead, and the two are not a drift: a base64 blob is long, machine-made
+// and has four distinguishable ways to be wrong, so an offset and a kind
+// locate a truncated transfer; a float literal is one token with one way to be
+// wrong. (That module's header also records that `u8[] | null` does not lower
+// on this compiler, which settled it there independently.)
+//
+// ── OUT OF RANGE IS NOT A PARSE FAILURE. Overflow answers ±Infinity and
+// underflow answers ±0 — never null. `null` is the SYNTAX channel and nothing
+// else, so `"1e400"` (a perfectly well-formed number that no f64 represents)
+// answers `Infinity` exactly as `strtod`, `Number()` and Rust's `parse` all do,
+// and a caller who wants overflow rejected tests the result. Reading a range
+// error out of the same null that means "not a number" would have been a second
+// meaning on one channel — the ambiguity `error-handling-design.md` exists to
+// prevent.
+//
+// ── WHY `parseF64` LIVES HERE AND NOT IN A `std:num`, MEASURED. The header's
+// missing-DCE paragraph applies again and the split does not pay. Same probe as
+// that measurement — `import { toStr } from "std:fmt"` plus one `n.toStr()` on
+// an i32, built to wasm:
+//
+//     before the f64 half               7,548 bytes
+//     + the f64 FORMATTER              14,256   (+6,708 — forced: it IS `toStr`)
+//     + the PARSER                     17,062   (+2,806)
+//
+//     The endpoints are exact (probe below, re-run 2026-09-01); the two
+//     sub-rungs were measured before a 16-byte fmt.vl edit, so their SPLIT is
+//     indicative while their sum is pinned by the endpoints. The probe, run
+//     from the repo root — note VL_STD, without which the host resolves std:
+//     from the BINARY's own checkout and silently measures the wrong tree:
+//       VL_STD=$PWD/std scripts/vl-host/target/release/vl build p.vl -o p.wasm
+//       # p.vl:  import { toStr } from "std:fmt"
+//       #        const n = 42
+//       #        print(n.toStr())
+//
+// The formatter cannot move: a flat namespace has one `toStr`, so the f64 arm
+// and everything under it are in this module by construction. That makes the
+// parser's own 2,822 bytes the entire question, and paying them buys the pair
+// staying in one place — a reader who found `toStr` finds its inverse beside it,
+// and the exact-arithmetic helpers have one home rather than being exported from
+// here to be reachable there. The real fix is whole-program dead-code
+// elimination, which this header already names; a second module would buy 2.8 KB
+// back by splitting a symmetric pair across two files forever.
+
+// ── exact big naturals ──────────────────────────────────────────────────────
+//
+// Little-endian limbs of 32 bits each, held in an `i64[]` so that a limb×small
+// product has room: (2^32−1) × 10^9 is 4.29e18, inside i64's 9.22e18, which is
+// why every multiplier below is capped at 10^9 and why no 128-bit multiply is
+// needed anywhere in this file.
+//
+// HIGH ZERO LIMBS ARE LEFT IN PLACE rather than trimmed, because `.pop()` on an
+// `i64[]` does not lower on this compiler. `i32[]` and `string[]` pop and run;
+// an `i64[]` PARAMETER refuses loudly (`emitProgram: .pop receiver is not a
+// list`) and an `i64[]` LOCAL is worse — `vl check` rc 0 and then invalid wasm,
+// in three lines with nothing else in the program. Both arms are pinned by
+// `scripts/capability-probes/i64-list-pop.vl`. `bnLen` is the consequence:
+// every operation reads up to the highest non-zero limb rather than to
+// `.length`. Delete it the day that probe runs; nothing else here depends on it.
+
+const BN_MASK: i64 = 4294967295
+
+// The number of limbs that carry value — the index of the highest non-zero
+// limb, plus one. Zero is length 0.
+function bnLen(a: i64[]): i32 {
+  let i = a.length - 1
+  while i >= 0 && a[i] == 0 { i = i - 1 }
+  i + 1
+}
+
+function bnIsZero(a: i64[]): boolean { bnLen(a) == 0 }
+
+// A fresh big natural holding `v`, which must not be negative.
+function bnFromI64(v: i64): i64[] {
+  const out: i64[] = []
+  let x = v
+  while x > 0 {
+    out.push(x & BN_MASK)
+    x = x >>> 32
+  }
+  out
+}
+
+function bnCopy(a: i64[]): i64[] {
+  const out: i64[] = []
+  let i = 0
+  while i < a.length {
+    out.push(a[i])
+    i = i + 1
+  }
+  out
+}
+
+// -1, 0 or 1 as `a` is less than, equal to, or greater than `b`.
+function bnCmp(a: i64[], b: i64[]): i32 {
+  const la = bnLen(a)
+  const lb = bnLen(b)
+  if la != lb {
+    if la < lb { return -1 }
+    return 1
+  }
+  let i = la - 1
+  while i >= 0 {
+    if a[i] != b[i] {
+      if a[i] < b[i] { return -1 }
+      return 1
+    }
+    i = i - 1
+  }
+  0
+}
+
+// `a += b`, in place.
+function bnAddInto(a: i64[], b: i64[]) {
+  let carry: i64 = 0
+  let i = 0
+  while i < b.length || carry != 0 {
+    if i >= a.length { a.push(0) }
+    let s = a[i] + carry
+    if i < b.length { s = s + b[i] }
+    a[i] = s & BN_MASK
+    carry = s >>> 32
+    i = i + 1
+  }
+}
+
+// `a -= b`, in place. The caller guarantees `a >= b`; a smaller `a` would
+// borrow off the top and produce a garbage value rather than trapping, so
+// every call site here is preceded by a `bnCmp`.
+function bnSubInto(a: i64[], b: i64[]) {
+  let borrow: i64 = 0
+  let i = 0
+  while i < a.length {
+    let d = a[i] - borrow
+    if i < b.length { d = d - b[i] }
+    if d < 0 {
+      d = d + 4294967296
+      borrow = 1
+    } else {
+      borrow = 0
+    }
+    a[i] = d
+    i = i + 1
+  }
+}
+
+// `a *= m`, in place. `m` must be at most 10^9 — see the limb-width note above.
+function bnMulSmall(a: i64[], m: i64) {
+  let carry: i64 = 0
+  let i = 0
+  while i < a.length {
+    const p = a[i] * m + carry
+    a[i] = p & BN_MASK
+    carry = p >>> 32
+    i = i + 1
+  }
+  while carry != 0 {
+    a.push(carry & BN_MASK)
+    carry = carry >>> 32
+  }
+}
+
+// 10^n for n in 0..=18, which is every n this file asks for.
+function pow10i64(n: i32): i64 {
+  let p: i64 = 1
+  let i = 0
+  while i < n {
+    p = p * 10
+    i = i + 1
+  }
+  p
+}
+
+// `a *= 10^k`, in place, in 10^9 chunks so the per-limb product stays in range.
+function bnMulPow10(a: i64[], k: i32) {
+  if bnIsZero(a) { return }
+  let n = k
+  while n >= 9 {
+    bnMulSmall(a, 1000000000)
+    n = n - 9
+  }
+  if n > 0 { bnMulSmall(a, pow10i64(n)) }
+}
+
+// `a <<= bits`, in place. The sub-limb shift runs first so the whole-limb move
+// only ever relocates finished limbs.
+function bnShlInto(a: i64[], bits: i32) {
+  if bnIsZero(a) { return }
+  const whole = bits / 32
+  const rem = bits % 32
+  if rem > 0 {
+    let carry: i64 = 0
+    let i = 0
+    while i < a.length {
+      const v = (a[i] << rem) | carry
+      a[i] = v & BN_MASK
+      carry = v >>> 32
+      i = i + 1
+    }
+    if carry != 0 { a.push(carry) }
+  }
+  if whole > 0 {
+    let j = 0
+    while j < whole {
+      a.push(0)
+      j = j + 1
+    }
+    let i = a.length - 1
+    while i >= whole {
+      a[i] = a[i - whole]
+      i = i - 1
+    }
+    let z = 0
+    while z < whole {
+      a[z] = 0
+      z = z + 1
+    }
+  }
+}
+
+// `a >>= 1`, in place.
+function bnShr1(a: i64[]) {
+  let i = a.length - 1
+  let carry: i64 = 0
+  while i >= 0 {
+    const v = a[i] | (carry << 32)
+    a[i] = v >>> 1
+    carry = v & 1
+    i = i - 1
+  }
+}
+
+function bnBitLen(a: i64[]): i32 {
+  const n = bnLen(a)
+  if n == 0 { return 0 }
+  return (n - 1) * 32 + ((64 - clz(a[n - 1])) as i32)
+}
+
+// The big natural spelled by `d`, a list of decimal digit VALUES (0..=9).
+// Nine digits at a time, so the multiplier stays inside `bnMulSmall`'s range.
+function bnFromDigits(d: i32[]): i64[] {
+  const out = bnFromI64(0)
+  let i = 0
+  while i < d.length {
+    let chunk: i64 = 0
+    let c = 0
+    while c < 9 && i < d.length {
+      const dv: i64 = d[i]
+      chunk = chunk * 10 + dv
+      i = i + 1
+      c = c + 1
+    }
+    bnMulSmall(out, pow10i64(c))
+    bnAddInto(out, bnFromI64(chunk))
+  }
+  out
+}
+
+// floor(a / b), leaving the exact remainder in `a`. Shift-and-subtract from
+// the top, so the loop runs once per QUOTIENT bit rather than once per bit of
+// `a`; the caller arranges a quotient of at most ~55 bits, which is what makes
+// the i64 result and the loop bound safe.
+function bnDivMod(a: i64[], b: i64[]): i64 {
+  if bnCmp(a, b) < 0 { return 0 }
+  const shift = bnBitLen(a) - bnBitLen(b)
+  const d = bnCopy(b)
+  bnShlInto(d, shift)
+  let q: i64 = 0
+  let i = shift
+  while i >= 0 {
+    q = q << 1
+    if bnCmp(a, d) >= 0 {
+      bnSubInto(a, d)
+      q = q + 1
+    }
+    bnShr1(d)
+    i = i - 1
+  }
+  q
+}
+
+// ── f64 → text ──────────────────────────────────────────────────────────────
+
+// The shortest digit string that identifies a value, with the exponent that
+// places it: value = 0.d[0]d[1]… × 10^n.
+type DecDigits = { d: i32[], n: i32 }
+
+// `r + mp` against `s`, with the comparison inclusive when the significand is
+// even (round-to-nearest-even hands an even significand its own boundaries).
+function upperTest(r: i64[], mp: i64[], s: i64[], inclusive: boolean): boolean {
+  const t = bnCopy(r)
+  bnAddInto(t, mp)
+  const c = bnCmp(t, s)
+  if inclusive { return c >= 0 }
+  c > 0
+}
+
+// Burger–Dybvig over exact rationals. `x` must be finite and strictly positive.
+function shortestDigits(x: f64): DecDigits {
+  const bits = f64bits(x)
+  const be = ((bits >>> 52) & 2047) as i32
+  const frac = bits & 4503599627370495
+  let m = frac
+  let e = -1074
+  if be != 0 {
+    m = frac + 4503599627370496
+    e = be - 1075
+  }
+  const evenB = (m & 1) == 0
+  // The gap BELOW is half the gap above exactly when the significand sits at
+  // the bottom of a binade and there is a binade below it to fall into — so
+  // `frac == 0` and an exponent above the subnormal one. Get this wrong and
+  // powers of two render one digit too long.
+  const smaller = frac == 0 && be > 1
+
+  const r = bnFromI64(m)
+  const s = bnFromI64(1)
+  const mp = bnFromI64(1)
+  const mm = bnFromI64(1)
+  if e >= 0 {
+    if smaller {
+      bnShlInto(r, e + 2)
+      bnShlInto(s, 2)
+      bnShlInto(mp, e + 1)
+      bnShlInto(mm, e)
+    } else {
+      bnShlInto(r, e + 1)
+      bnShlInto(s, 1)
+      bnShlInto(mp, e)
+      bnShlInto(mm, e)
+    }
+  } else {
+    if smaller {
+      bnShlInto(r, 2)
+      bnShlInto(s, 2 - e)
+      bnShlInto(mp, 1)
+    } else {
+      bnShlInto(r, 1)
+      bnShlInto(s, 1 - e)
+    }
+  }
+
+  // `n` is the smallest integer with value + M+ ≤ 10^n. The float estimate is
+  // deliberately biased LOW (log10(2) times the binary magnitude, minus one),
+  // so the fixup below only ever climbs — which makes the result independent
+  // of how tight the estimate is, and stops at the first n that qualifies, so
+  // it is the minimal one.
+  const bl = 64 - (clz(m) as i32)
+  let k = ((floor(((bl + e - 1) as f64) * 0.3010299956639812)) as i32) - 1
+  if k >= 0 {
+    bnMulPow10(s, k)
+  } else {
+    bnMulPow10(r, 0 - k)
+    bnMulPow10(mp, 0 - k)
+    bnMulPow10(mm, 0 - k)
+  }
+  while upperTest(r, mp, s, evenB) {
+    bnMulSmall(s, 10)
+    k = k + 1
+  }
+
+  // One digit per turn: scale by ten, take the quotient by repeated
+  // subtraction (it is 0..=9 by construction, so at most nine of them), then
+  // ask whether the interval still needs another digit. `low` means the
+  // remainder is already inside the lower boundary, `high` that adding one to
+  // this digit lands inside the upper one; either alone terminates, and both
+  // together take the closer of the two with the spec's even tie-break.
+  //
+  // The 25-digit bound is a floor, not a policy: a double never needs more
+  // than 17, and a hypothetical 25th digit would still name the right value —
+  // just not the shortest one.
+  const digits: i32[] = []
+  let done = false
+  while !done && digits.length < 25 {
+    bnMulSmall(r, 10)
+    bnMulSmall(mp, 10)
+    bnMulSmall(mm, 10)
+    let d = 0
+    while bnCmp(r, s) >= 0 {
+      bnSubInto(r, s)
+      d = d + 1
+    }
+    const cLow = bnCmp(r, mm)
+    let low = cLow < 0
+    if evenB { low = cLow <= 0 }
+    const high = upperTest(r, mp, s, evenB)
+    if low && high {
+      const t = bnCopy(r)
+      bnMulSmall(t, 2)
+      const c = bnCmp(t, s)
+      if c > 0 { d = d + 1 }
+      else if c == 0 && (d % 2) != 0 { d = d + 1 }
+      digits.push(d)
+      done = true
+    } else if low {
+      digits.push(d)
+      done = true
+    } else if high {
+      digits.push(d + 1)
+      done = true
+    } else {
+      digits.push(d)
+    }
+  }
+
+  // A terminating `d + 1` can carry out of 9. The scaling above is chosen so
+  // this should not be reachable, and it is handled anyway because the failure
+  // mode if it ever were would be a silently wrong digit rather than a crash.
+  let ci = digits.length - 1
+  let carrying = true
+  while carrying && ci >= 0 {
+    if digits[ci] != 10 {
+      carrying = false
+    } else {
+      digits[ci] = 0
+      if ci == 0 {
+        digits[0] = 1
+        k = k + 1
+        carrying = false
+      } else {
+        digits[ci - 1] = digits[ci - 1] + 1
+        ci = ci - 1
+      }
+    }
+  }
+  while digits.length > 1 && digits[digits.length - 1] == 0 { digits.pop() }
+
+  { d: digits, n: k }
+}
+
+// The four-way layout of ECMA-262 `Number::toString` step 5, over a digit list
+// and its exponent. See the rule table in this section's header.
+function layoutDec(d: i32[], n: i32): string {
+  const k = d.length
+  const buf: i32[] = []
+  if k <= n && n <= 21 {
+    let i = 0
+    while i < k {
+      buf.push(48 + d[i])
+      i = i + 1
+    }
+    let z = 0
+    while z < n - k {
+      buf.push(48)
+      z = z + 1
+    }
+    return fromCodePoints(buf)
+  }
+  if n > 0 && n <= 21 {
+    let i = 0
+    while i < n {
+      buf.push(48 + d[i])
+      i = i + 1
+    }
+    buf.push(46)
+    while i < k {
+      buf.push(48 + d[i])
+      i = i + 1
+    }
+    return fromCodePoints(buf)
+  }
+  if n > -6 && n <= 0 {
+    buf.push(48)
+    buf.push(46)
+    let z = 0
+    while z < 0 - n {
+      buf.push(48)
+      z = z + 1
+    }
+    let i = 0
+    while i < k {
+      buf.push(48 + d[i])
+      i = i + 1
+    }
+    return fromCodePoints(buf)
+  }
+  buf.push(48 + d[0])
+  if k > 1 {
+    buf.push(46)
+    let i = 1
+    while i < k {
+      buf.push(48 + d[i])
+      i = i + 1
+    }
+  }
+  const ex = n - 1
+  if ex >= 0 {
+    const up: i64 = ex
+    return fromCodePoints(buf) + "e+" + renderI64(up)
+  }
+  const down: i64 = 0 - ex
+  fromCodePoints(buf) + "e-" + renderI64(down)
+}
+
+// `toStr`'s f64 arm. The sign is read off the BIT PATTERN rather than by
+// comparing with zero, because `-0.0 < 0.0` is false and the exponent/fraction
+// split is already in hand.
+function renderF64(x: f64): string {
+  const bits = f64bits(x)
+  const be = ((bits >>> 52) & 2047) as i32
+  const frac = bits & 4503599627370495
+  if be == 2047 {
+    if frac != 0 { return "NaN" }
+    if bits < 0 { return "-Infinity" }
+    return "Infinity"
+  }
+  // Both zeros render "0" — the spec's rule, and the reason -0 does not
+  // survive a round trip through text.
+  if be == 0 && frac == 0 { return "0" }
+  const dd = shortestDigits(abs(x))
+  const body = layoutDec(dd.d, dd.n)
+  if bits < 0 { return "-" + body }
+  body
+}
+
+// ── text → f64 ──────────────────────────────────────────────────────────────
+
+const ONE64: i64 = 1
+// 0x8000_0000_0000_0000. Spelled as a shift because i64 min has no decimal
+// literal: its magnitude overflows a positive i64 before any minus applies.
+const SIGN_BIT: i64 = ONE64 << 63
+const BITS_INF: i64 = 9218868437227405312
+const BITS_NAN: i64 = 9221120237041090560
+const TWO53: i64 = 9007199254740992
+const MAX_SIG_DIGITS = 800
+
+function withSign(v: f64, neg: boolean): f64 {
+  if neg { return f64fromBits(f64bits(v) | SIGN_BIT) }
+  v
+}
+
+function isDigitByte(c: i32): boolean { c >= 48 && c <= 57 }
+
+// 10^e, exactly, for e in 0..=22 — the range over which a power of ten is
+// representable as an f64 (10^22 = 2^22 · 5^22 and 5^22 < 2^53). Each step is
+// a product of two exactly representable values whose result is exactly
+// representable, so IEEE rounding is a no-op. Callers must not exceed 22.
+function pow10f(e: i32): f64 {
+  let p = 1.0
+  let i = 0
+  while i < e {
+    p = p * 10.0
+    i = i + 1
+  }
+  p
+}
+
+// The f64 nearest to the number `self` spells, or `null` when `self` is not a
+// number in this module's grammar. See the `f64 ↔ TEXT` header for the grammar,
+// for why the failure channel is `null` rather than an error struct, and for
+// why an out-of-range number answers ±Infinity or ±0 rather than failing.
+//
+// Correctly rounded for EVERY accepted input, halfway cases included: the fast
+// path is exact-operands-single-rounding and the slow path is exact integer
+// arithmetic with the tie broken to even. Measured 2026-09-01 against the
+// ECMAScript oracle (`Number(s)`, itself specified as correctly rounded):
+// **205,844 inputs, 0 disagreements** — 200,000 pseudo-random decimals across
+// the whole exponent range and 5,844 adversarial ones, the adversarial set
+// being exact midpoints between adjacent doubles, those midpoints ±1 ulp of
+// decimal, midpoints with a 900-digit zero tail (the truncation path) and with
+// a 1 past it, and the subnormal boundary. `tests/vl_std_float_text_test.ts`
+// carries 3,391 of those plus 33 grammar rejections as the standing gate; the
+// full campaign is a re-runnable measurement, not a merge gate.
+export function parseF64(self: string): f64 | null {
+  const n = self.length
+  if n == 0 { return null }
+  let i = 0
+  let neg = false
+  if self[0] == 45 {
+    neg = true
+    i = 1
+  }
+  if i >= n { return null }
+  const c0 = self[i]
+  if c0 == 73 {
+    if self.slice(i, n) != "Infinity" { return null }
+    return withSign(f64fromBits(BITS_INF), neg)
+  }
+  if c0 == 78 {
+    // "NaN" only, unsigned: the renderer never produces a sign on it and VL
+    // has no such literal, so "-NaN" would be a spelling nothing else uses.
+    if neg { return null }
+    if self != "NaN" { return null }
+    return f64fromBits(BITS_NAN)
+  }
+
+  // `digs` collects SIGNIFICANT digits (leading zeros contribute only to the
+  // exponent) and `exp10` is the power of ten the digit string is multiplied
+  // by. Digits past the cap move `exp10` when they are integer places and set
+  // `truncated` when they are non-zero — see the 800-digit note in the header.
+  const digs: i32[] = []
+  let exp10 = 0
+  let truncated = false
+  const istart = i
+  while i < n && isDigitByte(self[i]) {
+    const d = self[i] - 48
+    // A LEADING zero of the integer part contributes nothing at all — not a
+    // significant digit, and not a place either, so `"007"` is `7` with the
+    // exponent untouched.
+    if digs.length > 0 || d != 0 {
+      if digs.length < MAX_SIG_DIGITS {
+        digs.push(d)
+      } else {
+        // Past the cap an integer digit is still a PLACE, so it moves the
+        // exponent; only a non-zero one moves the value.
+        exp10 = exp10 + 1
+        if d != 0 { truncated = true }
+      }
+    }
+    i = i + 1
+  }
+  if i == istart { return null }
+  if i < n && self[i] == 46 {
+    i = i + 1
+    const fstart = i
+    while i < n && isDigitByte(self[i]) {
+      const d = self[i] - 48
+      // Every fraction digit is a place, INCLUDING the leading zeros of
+      // `"0.0012"` — they move the exponent without becoming significant.
+      // Past the cap the exponent must NOT move (the place is already accounted
+      // for by the digits that were kept), so only truncation is recorded.
+      if digs.length >= MAX_SIG_DIGITS {
+        if d != 0 { truncated = true }
+      } else {
+        if digs.length > 0 || d != 0 { digs.push(d) }
+        exp10 = exp10 - 1
+      }
+      i = i + 1
+    }
+    if i == fstart { return null }
+  }
+  if i < n && (self[i] == 101 || self[i] == 69) {
+    i = i + 1
+    let es = 1
+    if i < n && self[i] == 43 {
+      i = i + 1
+    } else if i < n && self[i] == 45 {
+      es = -1
+      i = i + 1
+    }
+    const estart = i
+    let ev = 0
+    while i < n && isDigitByte(self[i]) {
+      // Saturating: any exponent past a million is already decided by the
+      // range gate below, and letting it run would overflow the i32.
+      if ev < 1000000 { ev = ev * 10 + (self[i] - 48) }
+      i = i + 1
+    }
+    if i == estart { return null }
+    exp10 = exp10 + es * ev
+  }
+  // Trailing anything — a unit, a stray digit separator, whitespace — is a
+  // rejection rather than a partial parse.
+  if i != n { return null }
+
+  if digs.length == 0 { return withSign(0.0, neg) }
+  // The magnitude gate, before any big integer exists: the value lies in
+  // [10^(dmag-1), 10^dmag), the largest f64 is under 10^309 and anything below
+  // 10^-350 is far under half the smallest subnormal.
+  const dmag = exp10 + digs.length
+  if dmag > 310 { return withSign(f64fromBits(BITS_INF), neg) }
+  if dmag < -350 { return withSign(0.0, neg) }
+
+  // Clinger's fast path: both operands exact, one rounding.
+  if digs.length <= 15 && exp10 >= -22 && exp10 <= 22 {
+    let acc: i64 = 0
+    let j = 0
+    while j < digs.length {
+      const dv: i64 = digs[j]
+      acc = acc * 10 + dv
+      j = j + 1
+    }
+    let v = acc as f64
+    if exp10 > 0 { v = v * pow10f(exp10) }
+    if exp10 < 0 { v = v / pow10f(0 - exp10) }
+    return withSign(v, neg)
+  }
+
+  // The exact path. value = num / den, both integers, no rounding yet.
+  const num = bnFromDigits(digs)
+  const den = bnFromI64(1)
+  if exp10 > 0 { bnMulPow10(num, exp10) }
+  if exp10 < 0 { bnMulPow10(den, 0 - exp10) }
+
+  // Choose the binary exponent so the quotient has 53 bits. The bit-length
+  // difference brackets log2(num/den) within one, so the quotient lands in
+  // [2^52, 2^54) and at most a couple of corrections are needed; -1074 is the
+  // floor because no double has a smaller exponent, and a quotient under 2^52
+  // there is exactly what a subnormal is.
+  let e2 = bnBitLen(num) - bnBitLen(den) - 53
+  if e2 < -1074 { e2 = -1074 }
+  let q: i64 = 0
+  let rem = bnFromI64(0)
+  let dn = bnFromI64(0)
+  let settled = false
+  while !settled {
+    if e2 + 1075 >= 2047 { return withSign(f64fromBits(BITS_INF), neg) }
+    rem = bnCopy(num)
+    dn = bnCopy(den)
+    if e2 > 0 { bnShlInto(dn, e2) }
+    if e2 < 0 { bnShlInto(rem, 0 - e2) }
+    q = bnDivMod(rem, dn)
+    if q >= TWO53 { e2 = e2 + 1 } else { settled = true }
+  }
+
+  // Round to nearest, ties to even — except that a truncated tail means the
+  // true value is strictly above the tie, so it rounds up.
+  const t = bnCopy(rem)
+  bnMulSmall(t, 2)
+  const c = bnCmp(t, dn)
+  let up = false
+  if c > 0 {
+    up = true
+  } else if c == 0 {
+    if truncated { up = true }
+    else if (q & 1) != 0 { up = true }
+  }
+  if up { q = q + 1 }
+  if q >= TWO53 {
+    q = q / 2
+    e2 = e2 + 1
+  }
+  if e2 + 1075 >= 2047 { return withSign(f64fromBits(BITS_INF), neg) }
+  // One expression for both classes: with q in [2^52, 2^53) the carry out of
+  // the significand IS the exponent field's low bit, and with e2 pinned at
+  // -1074 the term vanishes and q lands in the fraction field, which is the
+  // subnormal encoding.
+  const be2: i64 = e2 + 1074
+  return withSign(f64fromBits((be2 << 52) + q), neg)
 }

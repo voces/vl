@@ -1660,6 +1660,29 @@ fn report_rep_shadow(inst: &Instance, store: &mut Store<()>, path: &str) -> Resu
 ///
 /// The digits come from `{:e}` (`<d>[.<ddd>]e<exp>`), whose mantissa is that same
 /// shortest representation and whose exponent is the spec's `n - 1`.
+///
+/// ⚠ AND THAT LAST SENTENCE IS THE NEXT ONE THAT WAS TRUE OF THE CORPUS AND FALSE OF
+/// THE RULE. This function is a RE-FORMAT, so it inherits whatever `{:e}` chose, and
+/// `{:e}`'s shortest representation is not always JS's. ECMA-262 `Number::toString`
+/// step 5 takes the shortest digit string, then the one CLOSEST to the value, and on
+/// an exact tie the one whose last digit is EVEN; Rust's shortest formatter breaks
+/// that tie the other way. Measured 2026-09-01 over 50,000 pseudo-random doubles
+/// against V8: **14 disagreements, every one an exact tie**. Smallest witness: bits
+/// `4835952189745799117`, exactly 2023347301156851.25, whose two 17-digit candidates
+/// `…851.2` and `…851.3` are equidistant — V8 prints the even one, this prints the odd
+/// one. So the same VL program prints differently under the two hosts for those values,
+/// which is exactly what the table above exists to prevent.
+///
+/// THE FIX IS NOT A FIFTH LAYOUT ARM — the four rows above are layout and this is the
+/// DIGIT STRING, so it needs a shortest-with-ties-to-even producer. Cheapest correct
+/// route: `for k in 1..=17 { let s = format!("{:.*e}", k - 1, v); if s.parse::<f64>()
+/// == Ok(v) { take it } }` — exact-precision formatting rounds correctly, so the first
+/// `k` that round-trips is the shortest digit string under the spec's rule. VERIFY
+/// Rust's exact-precision rounding is half-to-EVEN before relying on that.
+/// `std:fmt`'s `toStr` already implements the rule in pure VL (Burger–Dybvig with the
+/// spec's final digit choice) and agrees with V8 on 50,000 of 50,000;
+/// `tests/vl_std_float_text_test.ts` pins the divergent set by bit pattern, so fixing
+/// this flips a test rather than passing unnoticed.
 fn js_number_to_string(v: f64) -> String {
     if v.is_nan() {
         return "NaN".to_string();
@@ -2284,11 +2307,12 @@ fn instantiate_program(
     linker.func_wrap("imports", "__print_i32__", move |v: i32| s(&v.to_string()))?;
     let s = sink.clone();
     linker.func_wrap("imports", "__print_i64__", move |v: i64| s(&v.to_string()))?;
-    // f64: rendered through `js_number_to_string`, which IS JS `String(v)` — the JS
-    // hosts (`tests/support/runWasm.ts`, `playground/src/runtime.ts`) sink through
-    // `String(v)`, so a corpus `@log` line has to read the same under either. Display
+    // f64: rendered through `js_number_to_string`, which is JS `String(v)` EXCEPT AT AN
+    // EXACT DECIMAL TIE — the JS hosts (`tests/support/runWasm.ts`,
+    // `playground/src/runtime.ts`) sink through `String(v)`, so a corpus `@log` line has
+    // to read the same under either, and at 14 values in 50,000 it does not. Display
     // alone diverges on negative zero, on magnitudes outside 1e-7..1e21, and on the
-    // infinities; see that function. (Slice 3.)
+    // infinities; see that function, whose doc comment carries the tie defect. (Slice 3.)
     let s = sink.clone();
     linker.func_wrap("imports", "__print_f64__", move |v: f64| {
         s(&js_number_to_string(v))
