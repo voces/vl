@@ -245,8 +245,8 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   Still open in that section: OQ-2/OQ-3/OQ-4 (full briefs with recommendations, awaiting a
   ruling) and OQ-11. Engineering fallout filed: D1008 (`u8[]` struct field, clause 2),
   D1009/D1010 (`null` membership in a recursive union at the checker — stage 1 ships around
-  both with one-line workarounds), D1011 (filed by the concurrent §Approach 1 pass; not yet
-  in `silent-class-inventory.md` as of this edit — grep before quoting it), plus the routing table in the
+  both with one-line workarounds), D1011 (host `print` of an f64 breaks a halfway tie
+  to odd where `toString` and the spec round to even; host-side, #2248), plus the routing table in the
   synthesis (print≠toString f64, `type Dec<T> = (Lex) => T`, `parseI64`, `fromUtf8` view,
   seeded string hash, stage clause table).
 
