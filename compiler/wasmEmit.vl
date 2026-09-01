@@ -775,6 +775,7 @@ import {
   vtKindOfType,
   widenDstBackSlot,
   widenSrcWrapSlot,
+  unionEqStashSlot,
   widenScalarBackSlot,
   widenScalarWrapSlot,
   widenTmpSlot,
@@ -5510,11 +5511,17 @@ function emitUnionConcreteEq(
   isNe: boolean,
   fnIx: i32,
 ) {
-  if !unionEqOperandOk(boxIx) {
-    return emitFail(
-      "emitProgram: union `==` over a non-binding union value is not supported yet",
-    )
-  }
+  // D972 — A NON-RE-READABLE OPERAND IS STASHED AT ITS FIRST READ, not refused. This compare
+  // reads the box up to three times — the no-arm fold, the TAG, and the PAYLOAD inside the
+  // tag-matched arm — which is the whole content of `unionEqOperandOk` (Ident / NumLit /
+  // StrLit / Member / Index). A CALL operand is not re-readable, so `mk(true) == 1` refused
+  // while `const u = mk(true); u == 1` ran and printed the right answer.
+  //
+  // TEED AT THE FIRST READ rather than pre-emitted at the top: the operand must be evaluated
+  // where the original code evaluated it, so any context the surrounding lowering seeds is
+  // still in force. Pre-emitting it ahead of the gates traps.
+  const eqStash = unionEqStashSlot()
+  const eqOnce = !unionEqOperandOk(boxIx)
   const uname = unionNameOfExpr(boxIx, fnIx)
   // D-VALUNION / D-SETONCE: the union's interned member set, resolved ONCE — the
   // value-union gate below reads its banked member codes instead of re-splitting the
@@ -5566,11 +5573,13 @@ function emitUnionConcreteEq(
   }
   // tag == tagOf(atom), gating the payload compare.
   if emitExpr(body, boxIx, fnIx) < 0 { return -1 }
+  if eqOnce { fbLocalTee(eqStash) }
   fbStructGet(uBoxIdx, 0) // 0xfb 0x02 <box ht> field 0: tag
   fbI32Const(scalarTagOfKind(eak))
   fbI32Bin(70)            // 0x46 i32.eq
   fbIf(127)               // 0x04 if, 0x7f i32 result blocktype
-  if emitExpr(body, boxIx, fnIx) < 0 { return -1 }
+  if eqOnce { fbLocalGet(eqStash) }
+  else if emitExpr(body, boxIx, fnIx) < 0 { return -1 }
   fbStructGet(uBoxIdx, 1) // 0xfb 0x02 <box ht> field 1: value (anyref)
   if emitUnionPayloadUnbox(body, eak) < 0 { return -1 }
   if emitUnionEqOther(body, otherIx, eak, fnIx) < 0 { return -1 }
