@@ -24143,6 +24143,13 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   table has no interned arm for the self-referential container spelling; that is the half
   still to build. Reverted rather than merged.
 
+* **THE MAP ARM IS NOW ON THE SAME FOOTING AS THE ARRAY ARM.** #2223 had to hold
+  self-referential MAP arms transparent because registering one hit [D984](#d984)'s unbounded
+  recursion; with that bounded, the clause is lifted and both container kinds reach the same
+  single loud emit refusal. The two refutation pins from that regression
+  (`self-recursive-map-arm-with-null-declares.vl`, `json-value-tree-declares.vl`) still print
+  `ok`, which is what makes lifting it safe to check rather than to hope.
+
 * **THE SCOPE IS A SELF-REFERENTIAL CONTAINER ARM, NOT AN ARRAY ARM** (28-cell factorial grid
   over null × array-arm × map-arm × test, run by vl-b7's serde agent and spot-checked here).
   With `null`, the MAP arm reproduces this row's pattern identically. Grade any fix on both
