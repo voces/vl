@@ -231,6 +231,31 @@ Deno.test({
         }`,
       );
     }
+
+    // the WRITING-end pin for the joint invariant std/test.vl declares it
+    // owns: for an expect failure, the location line is the LAST line of the
+    // failure text (before any captured-output block) — appending anything
+    // after it in vltFail turns this red, where the frozen-string parser
+    // fixture cannot.
+    const anchoredBlock = r.err
+      .split("\n\n")
+      .find((b) => b.includes("renders i64 min"));
+    if (anchoredBlock === undefined) {
+      throw new Error("the i64-min failure block is missing from the report");
+    }
+    const failBody = anchoredBlock.split("--- captured output ---")[0];
+    const tail = failBody
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0);
+    const last = tail[tail.length - 1];
+    if (!/^at .+:\d+:\d+$/.test(last)) {
+      throw new Error(
+        `the location line must be LAST in a failure; got tail: ${
+          JSON.stringify(last)
+        }`,
+      );
+    }
   },
 });
 

@@ -3769,7 +3769,7 @@ argument does not extend to `caller`: it is a concrete `CallerLoc` at every inst
 it is carried RAW in the receipt and rendered only on the failure path. The pass path pays one
 struct copy and nothing else.
 
-Measured, 2026-09-01: **+525 bytes** unoptimized on a one-assertion module (5,873 → 6,398),
+Measured, 2026-09-01: **+325 bytes** unoptimized on a one-assertion module (5,873 → 6,198),
 **byte-identical at `-O3`** (596 both ways — Heap2Local scalarizes the struct, which reproduces
 the `__callsite__` cost finding above through std), and **~11 ns per PASSING assertion**
 (10M iterations, ~0.33 s → ~0.44 s) for the receipt copy plus the call site's `struct.new`.

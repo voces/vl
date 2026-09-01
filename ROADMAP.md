@@ -129,7 +129,7 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   - the anchor is the `expect` token at every spelling — `expect(x).toEqual(y)`,
     `expect(x).not().toEqual(y)` and the non-UFCS `toEqual(expect(x), y)` all report the
     `expect(`, never the `.toEqual` and never the `it` line;
-  - cost: **+525 bytes** (5,873 → 6,398) on a one-assertion module unoptimized, and
+  - cost: **+325 bytes** (5,873 → 6,198) on a one-assertion module unoptimized, and
     **byte-identical at `-O3`** (596 bytes both ways — Heap2Local scalarizes the struct, the
     DECISIONS finding for `__callsite__` reproduced through std); ~11 ns per PASSING assertion
     (10M iterations: ~0.33 s → ~0.44 s), which is the receipt copy plus the call-site
