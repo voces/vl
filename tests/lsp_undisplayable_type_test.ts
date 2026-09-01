@@ -252,7 +252,7 @@ Deno.test({
   );
   assertEquals(
     await hoverAtFnName(checker, unionSrc),
-    "(boolean) => string | i32",
+    "(b: boolean) => string | i32",
     "resolvable union hover survives",
   );
 
@@ -273,7 +273,7 @@ Deno.test({
   assertEquals(await inlayLabels(checker, addSrc), [": i32"], "all-resolving params");
   assertEquals(
     await hoverAtFnName(checker, addSrc),
-    "(i32, i32) => i32",
+    "(a: i32, b: i32) => i32",
     "all-resolving hover",
   );
 });

@@ -194,3 +194,31 @@ Deno.test("memberCompletionsFromWasm: maps method/field kinds and drops empty de
   assertEquals(out[1], { name: "dist", kind: "function", detail: "() => f64" });
   assertEquals(out[2], { name: "bare", kind: "variable", detail: undefined });
 });
+
+Deno.test({
+  name: "wasm-member-completion: a dep-nominal field detail demangles (Pair, not Pair$m1)",
+  ignore,
+}, async () => {
+  // D9 slot 5: the detail renders through the user pathway (`tyToStrUser`), so a
+  // field whose type is a DEP module's nominal shows its source name — the merge's
+  // internal `Pair$m1` leaked here before the pathway existed.
+  const checker = loadWasmChecker(SEED, () => {})!;
+  const util = [
+    "export type Pair = { a: i32, b: i32 }",
+    "export type Box = { inner: Pair }",
+    "export function mkBox(): Box { { inner: { a: 1, b: 2 } } }",
+    "",
+  ].join("\n");
+  // Repaired (dot stripped) source: `b` is a bare expression on line 2 (0-based).
+  const entry = 'import { mkBox } from "./util"\nconst b = mkBox()\nb\nprint(1)\n';
+  const members = await checker.memberCompletionsAt(
+    entry,
+    "/proj/main.vl",
+    (key: string) => (key.endsWith("util.vl") ? util : undefined),
+    2,
+    0,
+  );
+  const inner = members.find((m) => m.name === "inner");
+  if (inner === undefined) throw new Error(`expected an inner field, got ${JSON.stringify(members)}`);
+  assertEquals(inner.detail, "Pair", "the detail is the demangled source name");
+});
