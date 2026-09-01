@@ -227,7 +227,7 @@ Deno.test({
 
 Deno.test({
   name:
-    "vl-test: ONE HOP — a forwarding helper reports its caller, a plain one reports itself",
+    "vl-test: ONE HOP, and every spelling anchors at the `expect` that failed",
   ignore: !ENABLED,
   fn: async () => {
     // The semantics the owner ruled on: a `CallerLoc` is one location, never a
@@ -240,69 +240,99 @@ Deno.test({
     // fixtures' aggregate `N files · P passed · F failed` pin is shared with
     // every other case in this file, and this claim needs a helper module beside
     // the test rather than another entry in that count.
+    // Both sources are LINE ARRAYS and every expected position is DERIVED from
+    // them (`posOf` below), never counted by hand — an off-by-two in a hand
+    // count is a test that fails for a reason that has nothing to do with the
+    // compiler, which is exactly the noise a position pin must not add.
+    const helperSrc = [
+      'import { CallerLoc, expect, toEqual } from "std:test"',
+      "",
+      "export function forwards(v: i32, caller: CallerLoc = __callsite__) {",
+      "  expect(v, caller).toEqual(1)",
+      "}",
+      "",
+      "export function keepsItself(v: i32) {",
+      "  expect(v).toEqual(1)",
+      "}",
+    ];
+    const testSrc = [
+      'import { expect, it, not, toEqual } from "std:test"',
+      'import { forwards, keepsItself } from "./helper"',
+      "",
+      'it("forwarded", () => {',
+      "  forwards(2)",
+      "})",
+      "",
+      'it("kept", () => {',
+      "  keepsItself(2)",
+      "})",
+      "",
+      // The SPELLING grid. Both must report the `expect` token: the location
+      // belongs to the ASSERTION, and `expect(` is where an assertion starts —
+      // never the `.toEqual`, never the `.not()`. That follows from the location
+      // riding on the RECEIPT rather than on each matcher, which is the reason
+      // the matchers did not grow a parameter of their own.
+      'it("negated", () => {',
+      "  expect(1).not().toEqual(1)",
+      "})",
+      "",
+      'it("non-ufcs", () => {',
+      "  toEqual(expect(3), 4)",
+      "})",
+    ];
+    /** The 1-based line/col of `needle` in `src` — the runner's own coordinates. */
+    const posOf = (src: string[], needle: string, token: string) => {
+      const line = src.findIndex((l) => l.includes(needle));
+      if (line < 0) throw new Error(`no line holding ${JSON.stringify(needle)}`);
+      return { line: line + 1, col: src[line].indexOf(token) + 1 };
+    };
+
     const dir = await Deno.makeTempDir({ prefix: "vl_test_caller_" });
     try {
-      await Deno.writeTextFile(
-        `${dir}/helper.vl`,
-        'import { CallerLoc, expect, toEqual } from "std:test"\n' +
-          "\n" +
-          "export function forwards(v: i32, caller: CallerLoc = __callsite__) {\n" +
-          "  expect(v, caller).toEqual(1)\n" +
-          "}\n" +
-          "\n" +
-          "export function keepsItself(v: i32) {\n" +
-          "  expect(v).toEqual(1)\n" +
-          "}\n",
-      );
-      await Deno.writeTextFile(
-        `${dir}/hop.test.vl`,
-        'import { it } from "std:test"\n' +
-          'import { forwards, keepsItself } from "./helper"\n' +
-          "\n" +
-          'it("forwarded", () => {\n' +
-          "  forwards(2)\n" +
-          "})\n" +
-          "\n" +
-          'it("kept", () => {\n' +
-          "  keepsItself(2)\n" +
-          "})\n",
-      );
+      await Deno.writeTextFile(`${dir}/helper.vl`, helperSrc.join("\n") + "\n");
+      await Deno.writeTextFile(`${dir}/hop.test.vl`, testSrc.join("\n") + "\n");
       const r = await runTest(`${dir}/hop.test.vl`);
       const parsed = parseTestReport(r.err);
       const at = (path: string) =>
         JSON.stringify(parsed.results.find((x) => x.path === path)?.location);
+      const want = (file: string, src: string[], needle: string, token: string) =>
+        JSON.stringify({ file, ...posOf(src, needle, token) });
+      const check = (path: string, wanted: string, why: string) => {
+        if (at(path) !== wanted) {
+          throw new Error(
+            `${why}\n  want ${wanted}\n  got  ${at(path)}\n${r.err}`,
+          );
+        }
+      };
 
-      // `forwards(2)` is line 5 of hop.test.vl, column 3.
-      const forwarded = JSON.stringify({
-        file: `${dir}/hop.test.vl`,
-        line: 5,
-        col: 3,
-      });
-      if (at("forwarded") !== forwarded) {
-        throw new Error(
-          `a forwarded caller must name the HELPER'S CALLER\n  want ${forwarded}` +
-            `\n  got  ${at("forwarded")}\n${r.err}`,
-        );
-      }
-      // `expect(v).toEqual(1)` is line 8 of helper.vl, column 3 — another file.
-      const kept = JSON.stringify({
-        file: `${dir}/helper.vl`,
-        line: 8,
-        col: 3,
-      });
-      if (at("kept") !== kept) {
-        throw new Error(
-          `an unforwarded caller must name the helper's own expect\n  want ${kept}` +
-            `\n  got  ${at("kept")}\n${r.err}`,
-        );
-      }
+      const test = `${dir}/hop.test.vl`;
+      check(
+        "forwarded",
+        want(test, testSrc, "forwards(2)", "forwards"),
+        "a forwarded caller must name the HELPER'S CALLER",
+      );
+      check(
+        "kept",
+        want(`${dir}/helper.vl`, helperSrc, "expect(v).toEqual(1)", "expect"),
+        "an unforwarded caller must name the helper's own expect, in ITS file",
+      );
+      check(
+        "negated",
+        want(test, testSrc, "expect(1).not()", "expect"),
+        "the not() chain must anchor at the expect, not the .not() or .toEqual",
+      );
+      check(
+        "non-ufcs",
+        want(test, testSrc, "toEqual(expect(3)", "expect"),
+        "the non-UFCS spelling must anchor at the NESTED expect, not the toEqual",
+      );
 
-      // And the editor resolves that second one into the helper file, not the
+      // And the editor resolves the helper's one into the helper FILE, not the
       // test file — `isTarget` false is what tells the extension to open it.
       const anchor = failureAnchor(
         parsed.results.find((x) => x.path === "kept")!.location!,
         dir,
-        `${dir}/hop.test.vl`,
+        test,
       );
       if (anchor.isTarget || anchor.file !== `${dir}/helper.vl`) {
         throw new Error(
