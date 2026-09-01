@@ -24229,10 +24229,23 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   not build at all; between D976 and D987 it took whichever literal was DECLARED first; now it
   takes whichever ARGUMENT arrives first. One shape per function runs in every order.
 
-* The fix is per-CALL resolution, which means either monomorphising the hole function per
-  receiver shape or keying the field lookup on the call node rather than the function. Worth
-  checking first whether the monomorphiser already makes distinct instances here and the
-  emitter is simply reading the template.
+* **THE MONOMORPHISER DOES NOT SPLIT IT — checked, so nobody re-checks.** The emitted module
+  carries ONE `hole` (`(param $0 structref) (param $1 (ref $0))`) beside the two lambdas
+  (`(result (ref $3))` and `(result i32)`). Both receivers share a struct row, so one
+  `call_indirect` type is emitted for both and whichever receiver it did not pick traps.
+
+* **TWO FIXES TRIED AND REVERTED, both following an existing pattern, neither moving the
+  witness.** `adoptedFieldCompat` discriminates a NESTED STRUCT field (code 15) by name via
+  `nestedStructNamesCompat`, and accepts any two CLOSURE fields (code 14) without comparing
+  anything. Adding a code-14 comparison changes nothing because `sFieldElemNameAt` is EMPTY
+  for a closure field; adding a code-14 arm to `shapeFieldElemName` to populate it changes
+  nothing either. So the field is not reaching those sites as code 14 — establish what code it
+  actually carries before trying a third variation on this theme.
+
+* The real fix is per-CALL resolution: monomorphise the hole function per receiver shape, or
+  give the two shapes distinct struct rows so they cannot share a `call_indirect` type. The
+  row-splitting route is the one the code is shaped for, but only once the code question above
+  is answered.
 
 ### D987 — a module carrying BOTH a string-returning and a non-string closure field of the same layout
 
