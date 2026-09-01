@@ -22,6 +22,7 @@ import {
   inferRetRungIsScalarListRet,
   inferRetRungIsStructElemList,
   inferRetTyIxByNode,
+  lambdaVoidAdoptedAt,
   litUnionAliasNameOfTy,
   mkArrayTy,
   nameIsLitUnionType,
@@ -39,6 +40,9 @@ import {
   recordNodeTyFrom,
   tyIsLitUnion,
   tyToEmitName,
+  voidCoerceValAt,
+  voidCoerceValCount,
+  voidCoerceValNameAt,
 } from "./typecheck"
 import {
   ArrayLit,
@@ -71,11 +75,14 @@ import {
   fillArgDefaults,
   hasNamedArgs,
   mkArrayLit,
+  mkBlock,
   mkCall,
+  mkFunc,
   mkIdent,
   mkIndex,
   mkMember,
   mkNum,
+  mkParam,
   orderArgsByParamNames,
   paramDefaultOf,
   ufcsAliasOf,
@@ -90,7 +97,16 @@ import {
   nullablePartOf,
 } from "./emit_base"
 import { fnIndexOfInScopeChain } from "./emit_collect"
-import { fnStmts, fnValUsed, startStmts, unNames, unTyIx } from "./emit_state"
+import {
+  fRetVoid,
+  fnDispNames,
+  fnParent,
+  fnStmts,
+  fnValUsed,
+  startStmts,
+  unNames,
+  unTyIx,
+} from "./emit_state"
 import {
   drwFieldClosure,
   exprIsClosure,
@@ -570,6 +586,21 @@ export function synthRetAnnots() {
     const fn = P.nodes[lamIx]
     if fn is FuncDecl {
       if fn.fnRet < 0 {
+        // VOID-CONTEXT LAMBDA (the checker's `lambdaVoidAdoptedAt` ledger): the lambda
+        // was checked against an expected `(…) => void` and ADOPTED the void return —
+        // pin `fnRet` to a synthesized `void` TypeRef so `buildFnMap#2`'s
+        // `retVoidAnnFlag` seed classifies it (functype `()`-result, `$fnsig` key `>v`,
+        // tail routed through the statement/drop path), and every mono clone inherits
+        // the pin (`nret = fnRet`). `fRetVoid` is also set NOW for the passes that run
+        // between this pin and the `buildFnMap#2` rebuild. Claimed before the
+        // inferred-return pin ladder below: a void-adopted lambda records no
+        // inferred-return row, so the two writers are disjoint by construction.
+        if lambdaVoidAdoptedAt(lamIx) {
+          fn.fnRet = synthTypeRefTy("void", -1, -1)
+          if fe < fRetVoid.length { fRetVoid[fe] = 1 }
+          fe = fe + 1
+          continue
+        }
         const ctx = inferRetNameByNode(lamIx)
         if ctx != "" {
           const ctxTy = inferRetTyIxByNode(lamIx)
@@ -1521,6 +1552,128 @@ export function captureBoxRewrite(_stmts: i32[]) {
       if boxed.length > 0 { fn.fnBody = cboxWalk(fn.fnBody, boxed) }
     }
     fe = fe + 1
+  }
+  0
+}
+
+// ── synthVoidTwins — the VOID TWIN mint for coerced function VALUES ─────────────
+//
+// The emitter half of the `(P…) => T` → `(P…) => void` wholesale value coercion
+// (DECISIONS: void contexts discard implicit tail values, clause 3; the checker
+// half is `fnValVoidCoerce`). A coerced value is CALLED through a `>v` `$fnsig`
+// (0 results), and `call_indirect` signature-checks the callee — so the closure
+// built at the coercion seam must reference a function whose OWN functype has 0
+// results. The original cannot be that function (its other callers want the
+// value), so this pass mints ONE capture-free VOID TWIN per coerced target:
+// same name-referenced params, a synthesized `: void` return, a body that calls
+// the original and (via the void statement path) discards. The closure-build
+// swap happens node-keyed at `emitExpr`'s Ident value arm (`voidTwinForNode`).
+//
+// Runs POST-monomorphization (fnStmts positions are final — a pre-mono mint
+// would store twin positions the renumbering invalidates) and BEFORE
+// `buildFnMap#2`, whose `retVoidAnnFlag` seed classifies the twins void.
+// Targets are TOP-LEVEL declarations only, matched by (name, `fnParent < 0`) —
+// the same set the checker's grant admits (`fnDeclIx` + unshadowed), so the two
+// gates cannot disagree on nested/shadowing namesakes.
+let voidTwinTargetFe: i32[] = []
+let voidTwinFe: i32[] = []
+
+// The twin minted for target `fe`, or -1.
+function voidTwinOfTarget(fe: i32) {
+  let i = 0
+  while i < voidTwinTargetFe.length {
+    if voidTwinTargetFe[i] == fe { return voidTwinFe[i] }
+    i = i + 1
+  }
+  -1
+}
+
+// The twin to SWAP IN at expression node `nodeIx` resolving to function `fe`, or -1.
+// Both keys must agree: the node is one the checker granted the coercion at, AND the
+// emit-side scope resolution landed on the very target a twin was minted for. Either
+// alone is not enough — a same-named nested function, or an uncoerced use of the same
+// function elsewhere, must keep the original closure.
+export function voidTwinForNode(nodeIx: i32, fe: i32) {
+  if !voidCoerceValAt(nodeIx) { return -1 }
+  voidTwinOfTarget(fe)
+}
+
+// The TOP-LEVEL function named `name` (`fnParent < 0`), or -1 — the emit-side twin
+// of the checker's `fnDeclIx` gate (top-level declarations only, duplicates are a
+// checker error).
+function topLevelFnByName(name: string) {
+  let i = 0
+  while i < fnStmts.length {
+    if i < fnParent.length {
+      if fnParent[i] < 0 {
+        const fn = P.nodes[fnStmts[i]]
+        if fn is FuncDecl {
+          if fn.fnName == name { return i }
+        }
+      }
+    }
+    i = i + 1
+  }
+  -1
+}
+
+export function synthVoidTwins(_stmts: i32[]) {
+  voidTwinTargetFe = []
+  voidTwinFe = []
+  const nSeams = voidCoerceValCount()
+  let i = 0
+  while i < nSeams {
+    const name = voidCoerceValNameAt(i)
+    const target = topLevelFnByName(name)
+    if target >= 0 && voidTwinOfTarget(target) < 0 {
+      const tfn = P.nodes[fnStmts[target]]
+      if tfn is FuncDecl {
+        // The checker's grant already excluded generics (`fnTyHasHole`) and
+        // non-declarations; these emit-side re-checks fail CLOSED — an unmintable
+        // target simply gets no twin, and the un-swapped closure keeps today's
+        // behaviour at the call.
+        if tfn.fnTyParams.length == 0 {
+          let mintable = true
+          const nps: i32[] = []
+          const argIds: i32[] = []
+          let pj = 0
+          while pj < tfn.fnParams.length {
+            const pn = P.nodes[tfn.fnParams[pj]]
+            if pn is Param {
+              if pn.parType < 0 { mintable = false }
+              // Fresh Param nodes SHARING the original's annotation node, so the
+              // twin's param valtypes — and with them its `$fnsig` param tokens —
+              // byte-match the original's (only the result differs: `>v`).
+              nps.push(mkParam(pn.parName, pn.parType, -1, 0, pn.pos))
+              argIds.push(mkIdent(pn.parName, tfn.pos))
+            } else {
+              mintable = false
+            }
+            pj = pj + 1
+          }
+          if mintable {
+            const noTyParams: string[] = []
+            const callIx = mkCall(mkIdent(name, tfn.pos), argIds, tfn.pos)
+            const bodyIx = mkBlock([callIx], tfn.pos)
+            const twin = mkFunc(
+              "__voidtw_" + name,
+              noTyParams,
+              nps,
+              synthTypeRefTy("void", -1, -1),
+              bodyIx,
+              tfn.pos,
+            )
+            fnStmts.push(twin)
+            fnParent.push(-1)
+            fnDispNames.push("")
+            fnValUsed = true
+            voidTwinTargetFe.push(target)
+            voidTwinFe.push(fnStmts.length - 1)
+          }
+        }
+      }
+    }
+    i = i + 1
   }
   0
 }

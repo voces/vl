@@ -721,6 +721,7 @@ import {
   sharedFieldRecvSlot,
   sharedUnionFieldPlan,
   sigKeyPinPayload,
+  sigKeyRetIsVoid,
   sigParamCoerceKind,
   sigParamKindAt,
   sigParamSlotAt,
@@ -797,6 +798,7 @@ import {
   monoPinnedSigsOf,
 } from "./emit_mono"
 import { fnIndexOfInScopeChain } from "./emit_collect"
+import { voidTwinForNode } from "./emit_rewrite"
 // THE TYPE-NAME GRAMMAR'S LEAF — and this is the edge that never existed. `tyname.vl`'s
 // own header has recorded since phase 1 that its nine importers are the import SET and not
 // the set that NEEDS the grammar, naming this file as the tenth consumer: `emitIs` and
@@ -17764,6 +17766,22 @@ export function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
       }
       return emitFail("emitProgram: bare return is not supported")
     }
+    // VOID-CONTEXT DISCARD, the explicit-return leg: a `return <expr>` inside a
+    // VOID function evaluates the expression for effect, discards, and returns
+    // nothing. Unreachable from source under a DECLARED `: void` (the checker's
+    // `return type mismatch: expected void, got …` owns that spelling); what
+    // reaches it is a `synthVoidTwins` twin, whose shared body is a checker-valid
+    // NON-void body being lowered under the twin's void functype. Routed through
+    // `emitStmt` — not a bare `emitExpr` + `drop` — so the statement ladder's
+    // void-aware drop rules decide per shape what (if anything) is on the stack.
+    const rvPos = fnStmtsPosOf(fnIx)
+    if rvPos >= 0 && rvPos < fRetVoid.length {
+      if fRetVoid[rvPos] == 1 {
+        if emitStmt(body, s.retArg, fnIx) < 0 { return -1 }
+        fbReturn() // 0x0f return (void: nothing pushed)
+        return 0
+      }
+    }
     // Seed the return context + emit the value (struct / list / union / nullable /
     // widening) and terminate the exit, via the shared helper.
     return emitReturnExit(body, s.retArg, fnIx)
@@ -18240,10 +18258,20 @@ function emitCallStmt(body: i32[], s: Call, stmtIx: i32, fnIx: i32) {
     // `call_ref` it; drop the result unless the field's function is void.
     if exprIsClosure(s.callFn, fnIx) {
       if emitCallRef(body, stmtIx, fnIx) < 0 { return -1 }
-      const mcFe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
-      let mcVoid = false
-      if mcFe >= 0 {
-        if fRetVoid[mcFe] == 1 { mcVoid = true }
+      // The DROP decision follows the SIG THE CALL WAS EMITTED AT (the same
+      // `cloCallSigKey` `emitCallRef` just resolved): a `>v` key left NOTHING on
+      // the stack, so dropping is invalid wasm no matter what the field's rep
+      // function returns. Asked FIRST because the rep-function fallback below is
+      // wrong exactly when the two disagree — a `(): T` value coerced into a
+      // `() => void` field slot (`fnValVoidCoerce`) resolves a NON-void `mcFe`
+      // while the call was emitted at `>v` (measured: `hd2.on()` over
+      // `{ on: h2 }` with `h2(): string` dropped an empty stack).
+      let mcVoid = sigKeyRetIsVoid(cloCallSigKey(stmtIx, fnIx))
+      if !mcVoid {
+        const mcFe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
+        if mcFe >= 0 {
+          if fRetVoid[mcFe] == 1 { mcVoid = true }
+        }
       }
       if !mcVoid {
         fbDrop() // 0x1a drop (discard the unused result)
@@ -18996,9 +19024,22 @@ export function emitFuncBody(body: i32[], blockIx: i32, fnIx: i32) {
     // A guard `if` (no else, then-branch always returns) narrows the REST of the
     // body to the guard's complement (the host's post-early-return flow narrowing).
     const savedGuardTop = narrowTop
+    // VOID-CONTEXT DISCARD: in a VOID function — declared `: void`, a void-adopted
+    // lambda (`synthRetAnnots`' pin), or a `synthVoidTwins` twin — a value-bearing
+    // tail is NOT the function's result: it lowers through the ordinary STATEMENT
+    // path (`emitStmt`), which evaluates it for effect and `drop`s what it leaves,
+    // for every rep (i32/i64/f64, string/array/struct refs, calls). Keyed on the
+    // FUNCTION's void classification (`fRetVoid`, seeded from the declared/pinned
+    // return type) — NEVER on the tail's shape: a non-void bare-tail function keeps
+    // routing to `emitReturnExit` (guard fixtures `nonvoid-bare-tail-value-*.vl`).
+    let bodyIsVoid = false
+    const vfPos = fnStmtsPosOf(fnIx)
+    if vfPos >= 0 && vfPos < fRetVoid.length {
+      if fRetVoid[vfPos] == 1 { bodyIsVoid = true }
+    }
     let i = 0
     while i < n {
-      const isLast = i == n - 1
+      const isLast = i == n - 1 && !bodyIsVoid
       if isLast && stmtIsTailValue(stmts[i], fnIx) {
         // Implicit return: seed the return context + push the value (so a trailing
         // `null` / nullable value boxes or sentinels exactly like `return e`), then
@@ -20262,7 +20303,18 @@ function emitIdentNode(body: i32[], e: Ident, exprIx: i32, fnIx: i32) {
     // captures live in the enclosing frame `fnIx`). Scope-aware so a nested function
     // sharing a name with another maker's nested function resolves to THIS frame's.
     const fe = fnIndexOfInScopeSid(isid, e.identName, fnIx)
-    if fe >= 0 { return emitClosureValue(body, fe, fnIx) }
+    if fe >= 0 {
+      // VOID-COERCED VALUE SEAM: this very node was granted the `(P…) => T` →
+      // `(P…) => void` coercion by the checker (`fnValVoidCoerce`), and the scope
+      // walk above resolved it to the function a VOID TWIN was minted for — build
+      // the TWIN's closure instead, so the `>v`-sig call through the void slot
+      // signature-checks against a genuine `()`-result functype. Node-keyed AND
+      // target-keyed (`voidTwinForNode`); any other use of the same function —
+      // or a shadowing resolution — keeps the original closure.
+      const vtw = voidTwinForNode(exprIx, fe)
+      if vtw >= 0 { return emitClosureValue(body, vtw, fnIx) }
+      return emitClosureValue(body, fe, fnIx)
+    }
     // Not a local — a module global? Read it with `global.get` (0x23 <globalidx>).
     const gIdx = globalIndexOfSid(isid)
     if gIdx >= 0 {
