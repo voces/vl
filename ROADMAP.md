@@ -82,14 +82,18 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
 
 ### Awaiting owner rulings (durable list; each row names its doc)
 
-- **Constraints / nameable bounds — RULED 2026-09-01 ("accept expression semantics from
-  day one"), moving to build.** `docs/constraints-design.md` carries the shipped package
-  in its header ruling block: `{ toString(): string }` call-shape members, `<T: Showable>`
-  bounds, expression satisfaction (field-first-then-UFCS at the instantiation site),
-  whole-program coherence, strict bodies. Also the root fix for D952's wordless refusal.
-  Sequencing: coordinating with the compile-goal session's D976 fix (the checker column
-  recording a param's resolved demanded shape is the natural substrate for recorded
-  bounds); implementation launches behind that answer.
+- **Constraints / nameable bounds — DONE 2026-09-01 (#2217).** Shipped whole:
+  `{ toString(): string }` call-shape members, `<T: Showable>` and inline bounds,
+  expression satisfaction (field first, then UFCS), strict bodies, whole-program
+  coherence, and bound chaining by subsumption. `docs/constraints-design.md` §7 is the
+  record — read §7.5 first, it lists what the plan did not know. Root fix for D952's
+  wordless refusal at the BOUNDED spelling, and it closed D1001 (an unsatisfied
+  instantiation was check-clean invalid wasm). The D976 substrate was NOT used and the
+  reason is measured: the checker's inferred-shape column does not survive into emit, so
+  bounds ride the ANNOTATION path instead. Follow-ups filed rather than folded in: D1002
+  (dispatch is rewritten before monomorphization, so a closure-field witness loses to a
+  same-named `self`-function), D1004/D1005 (the unbounded halves), and LSP bound-member
+  completion/hover on `x: T`.
 - **Track-caller — expanded brief (owner asked for more detail, 2026-09-01).** The
   mechanism: a magic parameter TYPE — a std `CallerLoc` (module key + line + col; the
   compiler holds all three at any call site) whose trailing parameter is SYNTHESIZED at

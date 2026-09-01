@@ -1664,3 +1664,61 @@ Deno.test({
     }
   },
 });
+
+// ── constraints phase 1: bounds survive formatting ───────────────────────────
+// `vl fmt` reprints a function header from the AST, and until this pin the type
+// parameter list was reprinted from `fnTyParams` alone — a `string[]` of bare
+// names with no room for a bound. So `function describe<T: Showable>(…)` came
+// back as `function describe<T>(…)`: a SILENT downgrade at rc 0 that turns a
+// bounded generic into an unbounded one, changing what the body may do and what
+// its call sites must satisfy. Exactly the shape of the `flat`-modifier hazard
+// above, one construct later.
+//
+// The bound is recovered VERBATIM from source (`recoverType`, the same slice every
+// other annotation in the header uses), so an inline literal keeps the author's
+// spacing rather than the parser's synthetic re-render — which is why the second
+// case asserts the spaces inside the braces.
+//
+// It cannot live in tests/cases: `tests/` is excluded from the `vl fmt --check`
+// gate and cases_wasm_test.ts has no `@fmt` directive (the D-FMTDECL pin above).
+Deno.test({
+  name: "vl-fmt: a type-parameter BOUND survives formatting (alias, inline, multi-param)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const src = [
+      "type Showable = { toString(): string }",
+      "function a<T: Showable>(x: T): string { x.toString() }",
+      "function b<T: { toString(): string }>(x: T): string { x.toString() }",
+      "function c<A: Showable, B>(x: A, y: B): string { x.toString() }",
+      'print("ok")',
+      "",
+    ].join("\n");
+    const r = await run([], src);
+    if (r.code !== 0) {
+      throw new Error(`vl fmt rejected valid source (rc ${r.code}):\n${r.err}`);
+    }
+    for (
+      const want of [
+        "type Showable = { toString(): string }",
+        "function a<T: Showable>(",
+        "function b<T: { toString(): string }>(",
+        "function c<A: Showable, B>(",
+      ]
+    ) {
+      if (!r.out.includes(want)) {
+        throw new Error(`fmt lost \`${want}\`:\n${r.out}`);
+      }
+    }
+    // A dropped bound is the SILENT failure this pin exists for — an unbounded
+    // reprint is still valid VL, so only an explicit absence check catches it.
+    if (/function a<T>\(/.test(r.out) || /function c<A, B>\(/.test(r.out)) {
+      throw new Error(`fmt DROPPED a bound (silent downgrade):\n${r.out}`);
+    }
+    const r2 = await run([], r.out);
+    if (r2.code !== 0 || r2.out !== r.out) {
+      throw new Error(
+        `not idempotent (rc ${r2.code}):\n--- once ---\n${r.out}\n--- twice ---\n${r2.out}`,
+      );
+    }
+  },
+});

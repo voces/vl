@@ -23281,13 +23281,32 @@ Repro (check rc 0; the EMITTER refuses):
 
 ---
 
-### D952 — member access on a DECLARED type parameter refuses with an EMPTY diagnostic: `[ERROR]:` and a caret, no sentence
+### D952 — [PARTLY CLOSED 2026-09-01] member access on a DECLARED type parameter refused with an EMPTY diagnostic: `[ERROR]:` and a caret, no sentence
 
-**loud check reject with NO MESSAGE · the diagnostic renders as `[ERROR]: ` followed by the source line and a caret, and nothing else · ZERO corpus cells · reproduces on master · a diagnostic defect INDEPENDENT of the ruling on opaque-`T` member access**
+**BOUNDED half is now a loud check reject naming the bound (constraints phase 1) · the UNBOUNDED half stays open and is D1004 · was a loud check reject with NO MESSAGE · ZERO corpus cells · a diagnostic defect INDEPENDENT of the ruling on opaque-`T` member access**
 
 Whatever the language decides about reading a field off an opaque type parameter, a refusal
 with no sentence is wrong on its own terms: the reader is told the position and nothing about
 the problem, and no wording exists to be searched for, quoted, or improved.
+
+* **THE MECHANISM, now that it has been read rather than inferred.** `memberFloorMsg`'s
+  `TyVar` rung returns `""` (`typecheck.vl`), and `tErrPush` does not guard an empty `msg` —
+  it dedupes on `(node, message)` and pushes. So the empty string reaches the renderer intact.
+  The `?.` twin was never blank (`checkOptMemberNode` writes its own sentences), which proves
+  the ingredients for a real sentence were present all along: `tyToStr` renders a declared
+  `TyVar` as `T`.
+
+* **CLOSED FOR A BOUNDED PARAMETER (constraints phase 1).** `function f<T: Showable>(x: T)`
+  with `x.foo` now says *"no `foo` on `T` — its bound `Showable` grants `toString()`"*: the
+  bound is named, and so is everything it grants, which is the whole of what the reader needs.
+  That is the doc's stated payoff — closing this hole "with a real message instead of a
+  wordless refusal" — and it is pinned by
+  `tests/cases/constraints/error-strict-body-member-not-in-bound.vl`.
+
+* **STILL OPEN FOR AN UNBOUNDED `<T>`, deliberately.** The ruling is that an unbounded `<T>`
+  keeps exactly today's behaviour everywhere, so the empty message survives on that spelling
+  and is filed as its own row (D1004) rather than silently carried here. It is a message fix
+  with no design question left in it.
 
 * **THE UN-ANNOTATED SPELLING RUNS, which is what makes the empty message actively
   misleading.** `function getN(x): i32 { x.n }` infers the demanded shape and works; only the
@@ -23299,14 +23318,14 @@ the problem, and no wording exists to be searched for, quoted, or improved.
   capability the owner has asked for; this row is about a message. Even if opaque-`T` member
   access stays refused for ever, the refusal has to say something.
 
-Repro (check rc 1, message empty):
+Repro (check rc 1, message names the bound):
 
-    function getN<T>(x: T): i32 {
-      x.n
+    type Showable = { toString(): string }
+    function getN<T: Showable>(x: T): string {
+      x.foo
     }
     print(getN({ n: 1 }))
-    // vl check -> "[ERROR]: " with a caret under `.n` and no sentence.
-    // The un-annotated `function getN(x): i32 { x.n }` runs and prints 1.
+    // vl check -> no `foo` on `T` — its bound `Showable` grants `toString()`
 
 ---
 ### D953 — [CLOSED 2026-09-01] the merged row NESTED one layer down: four rungs, and D923 named three of them
@@ -28880,3 +28899,177 @@ Repro (runs, prints `o`):
     const u: i32 | string = 4
     print(f(u))
     // PRINTS o
+
+---
+### D1001 — [CLOSED 2026-09-01] an unsatisfied generic instantiation was check-clean INVALID WASM, because the body's own gate is vacuous under a `TyVar`
+
+**now a loud check reject naming the bound · was check-clean invalid wasm (`type mismatch: expected (ref $type), found (ref $type)`) · ZERO corpus cells (the census has no UFCS-in-a-generic axis) · fixed by constraints phase 1 · fixture `tests/cases/constraints/error-bound-unsatisfied-at-call.vl`**
+
+Two instantiations of one generic, one of which has no witness. The first runs; the second
+mints an instance whose `x.toString()` was already rewritten to a `self`-function that cannot
+take its argument, and nothing refuses it.
+
+* **THE MECHANISM IS `assignable`'s `TyVar` SHORT-CIRCUIT, and it is symmetric.** `assignable`
+  answers TRUE for a `TyVar` on EITHER side (`typecheck.vl`, the two rungs at the top of the
+  function). `ufcsCallTy`'s receiver gate is `assignable(recvTy, params[0])`, so inside a
+  generic body a free `self`-function is selected by NAME ALONE — the receiver never has to
+  fit anything. The body's check is therefore vacuous by construction, and unlike the argument
+  positions the RECEIVER recorded no deferred constraint, so no pin re-asked it.
+
+* **IT IS THE CLAUSE-1 CASE, NOT A CAPABILITY GAP.** The correctly-typed instantiation runs;
+  only the unsatisfied one miscompiles. So the fix is not "support more", it is "refuse the
+  one that cannot work", which is what an instantiation-site bound check does.
+
+* **THE UNBOUNDED SPELLING IS STILL OPEN — see D1005.** Phase 1 rules that an unbounded `<T>`
+  keeps today's behaviour, so this closes only for a parameter that carries a bound. Counting
+  it as closed for the whole family would be exactly the message-count-wearing-a-mechanism's-
+  clothes mistake this file's header warns about.
+
+Repro (now a loud check reject naming the bound; was check-clean invalid wasm):
+
+    type Circle = { r: f64 }
+    type Showable = { toString(): string }
+    function toString(self: Circle): string {
+      if self.r > 0.0 { return "C" }
+      "c"
+    }
+    function describe<T: Showable>(x: T): string { "<" + x.toString() + ">" }
+    print(describe({ r: 1.0 }))
+    print(describe({ s: 2.0 }))
+    // vl check -> {s: f64} does not satisfy `Showable`: no `toString(): string`
+
+---
+### D1002 — a monomorphized member call is UFCS-rewritten BEFORE the instance exists, so a closure-FIELD witness is check-clean invalid wasm whenever a same-named `self`-function is in scope
+
+**check-clean invalid wasm · `type mismatch: expected (ref $type), found (ref $type)` · ZERO corpus cells · reproduces on master with NO constraints syntax · PRE-EXISTING: the unbounded twin fails identically**
+
+The field-versus-UFCS precedence the checker applies (a callable field wins) and the one the
+emitter applies inside a generic body are decided at different times, and the emitter's is
+decided too early to be right.
+
+* **THE ORDERING IS DECLARED, not incidental.** `emit_sections.vl` states
+  `"monomorphize > dispatchRewrite …"` — the dispatch rewrite runs FIRST. So `drwWalk` meets
+  `x.m()` while `x` is still a type parameter: `structIndexOfExpr` finds no struct row, the
+  `si < 0` arm falls to `!exprIsClosure(...)`, a matching `self`-function exists, and the call
+  is rewritten to a direct call ONCE, for every instance the generic will ever have. An
+  instantiation whose type carries `m` as a closure field then calls the free function with a
+  struct it cannot take.
+
+* **ABLATED, three ingredients, all required.** (1) the receiver is a generic type parameter —
+  the non-generic spelling `b.toString()` with both present prints `fld`, correctly; (2) a
+  `self`-function of that name is in scope where the GENERIC BODY is written — remove the
+  import and the same program runs, using the field; (3) the instantiation type carries the
+  name as a closure field. It is NOT a module-boundary defect: single-file reproduces.
+
+* **THE DISASSEMBLY NAMES THE BRANCH.** `wasm-dis` of the failing instance shows
+  `(call $27 (ref.null none) (local.get $1))` — the direct call, with the raw struct in the
+  argument slot — where the field witness would have been an indirect call through the
+  closure. The checker had resolved `field`; the emitter had already resolved UFCS.
+
+* **THE FIX IS THE ORDERING, and it is its own change.** Deciding member dispatch per MINTED
+  INSTANCE (or deferring the decision past monomorphization) is a monomorphizer change with an
+  explicit ordering constraint to renegotiate, so it is not folded into the constraints
+  landing. Constraints phase 1 makes the checker's answer right; this row is the emitter's.
+
+Repro (check rc 0, then invalid wasm — and the same without any bound):
+
+    import { toString } from "std:fmt"
+    type Boxed = { r: f64, toString: () => string }
+    function describeU<T>(x: T): string { "<" + x.toString() + ">" }
+    const b: Boxed = { r: 1.0, toString: () => "fld" }
+    print(describeU(b))
+    // vl check -> rc 0; vl run -> Invalid input WebAssembly code, type mismatch
+    // Delete the std:fmt import and the same program prints <fld>.
+
+---
+### D1003 — [CLOSED 2026-09-01] the plain-to-mangled UFCS alias table was reset only on the MODULE path, so a single-file compile inherited the previous program's rows
+
+**closed · was a stale-state leak visible only on a REUSED compiler instance (the case suite's shared module, and the LSP server) · surfaced as D952's empty `[ERROR]:` at a member call in a program that compiles clean from the CLI**
+
+`ufcsAliasFrom`/`ufcsAliasTo` (`ast.vl`) bridge a member call's plain property to the merged
+symbol the module rename produced. `ufcsAliasReset()` was called from exactly one place — the
+module-merge pipeline, before `modCollectSelfFns`. A single-file compile never reset it.
+
+* **THE CLI CANNOT SEE IT AND TWO REAL CONSUMERS CAN.** One process per compile means the
+  table is always empty when a CLI run starts. `tests/cases_wasm_test.ts` shares one wasm
+  instance across ~2,500 cases, and the LSP server compiles on every keystroke — both reuse
+  the instance, so a module-using program poisons every later single-file one that names the
+  same property.
+
+* **FOUND BY A FIXTURE THAT PASSED ALONE AND FAILED BESIDE ITS NEIGHBOURS**, which is the only
+  way this shape shows up: `constraints/unbounded-type-param-unchanged.vl` graded clean under
+  `--filter` and reported an unexpected empty error in a full run, because
+  `constraints/bound-std-fmt-tostring.vl` had just left a `toString` row in the table.
+
+* **THE FIX IS THE HOME, not the call site.** The reset moved into `ast.tsReset()`, beside the
+  spelling arena and the other per-program side tables it already clears, so all six compile
+  entry points get it and a seventh cannot forget.
+
+Repro (runs today and must keep running — a REFUTATION PIN; the leak needs a reused instance,
+which the case suite provides and a single CLI run cannot):
+
+    type Circle = { r: f64 }
+    function toString(self: Circle): string {
+      if self.r > 0.0 { return "C" }
+      "c"
+    }
+    function loose<T>(x: T): string { "<" + x.toString() + ">" }
+    print(loose({ r: 1.0 }))
+    // PRINTS <C>
+
+---
+### D1004 — the EMPTY member-access diagnostic survives on an UNBOUNDED `<T>` (D952's remaining half)
+
+**loud check reject with NO MESSAGE · ZERO corpus cells · reproduces on master · a message defect with no design question left in it**
+
+D952's bounded half closed with constraints phase 1: a bounded parameter names its bound and
+what the bound grants. An unbounded `<T>` keeps its pre-existing path by ruling, and that path
+still ends at `memberFloorMsg`'s `TyVar` rung returning `""`.
+
+* **THE WORDING IS THE WHOLE FIX and it does not need the language to decide anything.** The
+  `?.` twin already prints `member access '?.n' on non-object T`, so `tyToStr` renders the
+  parameter and a sentence is one string away. What it should SAY is the open part: an
+  unbounded parameter grants nothing, so the actionable clause is "add a bound" — which now
+  exists as a spelling.
+
+* **DO NOT CLOSE IT BY MAKING UNBOUNDED `<T>` STRICT.** That is a language change the owner
+  has not ruled, and `tests/cases/constraints/unbounded-type-param-unchanged.vl` is the pin
+  that says so.
+
+Repro (check rc 1, message empty):
+
+    function getN<T>(x: T): i32 {
+      x.n
+    }
+    print(getN({ n: 1 }))
+    // vl check -> "[ERROR]: " with a caret under `.n` and no sentence.
+
+---
+### D1005 — an unsatisfied instantiation of an UNBOUNDED generic is still check-clean invalid wasm (D1001's remaining half)
+
+**check-clean invalid wasm · `type mismatch: expected (ref $type), found (ref $type)` · ZERO corpus cells · reproduces on master · the UNBOUNDED spelling of the hole constraints phase 1 fixed for bounded parameters**
+
+The mechanism is D1001's, verbatim: `assignable` answers TRUE for a `TyVar` on either side, so
+`ufcsCallTy` selects a free `self`-function by NAME alone inside a generic body, and the
+receiver's fit is never re-asked at the pin.
+
+* **THE MISSING PIECE IS A DEFERRED RECEIVER CONSTRAINT**, and its home already exists.
+  `memCstr` records `.length` / `x[i]` on a `T` and `validateMemCstrs` re-asks it under each
+  call's substitution; the UFCS RECEIVER records nothing. Adding that row is the shape of the
+  fix, and it would close this without any bound syntax.
+
+* **A BOUND IS THE OTHER ANSWER, and it is the better one for library code** — the refusal
+  then names the contract instead of a substituted type — but it cannot be the only one while
+  an unbounded `<T>` remains legal.
+
+Repro (check rc 0, then invalid wasm):
+
+    type Circle = { r: f64 }
+    function toString(self: Circle): string {
+      if self.r > 0.0 { return "C" }
+      "c"
+    }
+    function describeU<T>(x: T): string { "<" + x.toString() + ">" }
+    print(describeU({ r: 1.0 }))
+    print(describeU({ s: 2.0 }))
+    // vl check -> rc 0; vl run -> Invalid input WebAssembly code, type mismatch

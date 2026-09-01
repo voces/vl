@@ -525,6 +525,13 @@ export const TS_LITSTR = 11 // a string-literal type — tsText keeps the QUOTED
 export const TS_LITNUM = 12 // a numeric-literal type — tsText is the raw lexeme
 export const TS_NULL = 13   // the `null` type
 export const TS_ERR = 14    // the `expect("IDENT")` recovery leaf (the parser's `""` name)
+// `m(A, B): R` — a METHOD member of a type literal (constraints phase 1). tsText
+// is the member's name; the kids are the CALL's argument types, then the RESULT
+// last — `TS_FUNC`'s layout, because a method member IS a call shape with the
+// receiver left implicit (`docs/constraints-design.md`, OQ-1 as ruled). It is a
+// sibling of `TS_FIELD`, not a flavour of it: `{f: () => string}` demands that the
+// value CARRY a closure, `{f(): string}` demands only that `x.f()` type-check.
+export const TS_METHOD = 15
 
 // ── the synthesized-annotation PIN KINDS (census W11) ────────────────────────
 // An emitter-SYNTHESIZED `TypeRef` (`synthTypeRef`) sometimes carries a name the
@@ -747,6 +754,85 @@ export function declGpParamsOf(nodeIx: i32): string[] {
   out
 }
 
+// ── constraints phase 1: BOUNDS, kept where annotations are kept ─────────────
+// Two tables, both sparse and linear-scanned for `declGp*`'s reason (a bound is a
+// handful per program, and the corpus has none at all).
+//
+// Both store an ANNOTATION NODE INDEX, never a rendered name, and that is the
+// architectural point rather than a storage preference. A declared bound IS an
+// annotation — present at parse, no inference — so it rides the path that already
+// works end to end: the module merge renames it through `modRwType` like every
+// other `TypeRef`, its spelling tree is the one `tsToName` writes back, and the
+// checker resolves it with the same `nameToTy` every parameter type uses. The
+// measured alternative is what forced this: `docs/internals/silent-class-inventory.md`
+// D976 records that the column the CHECKER writes for an inferred parameter shape
+// does not survive into emit. A bound must survive into emit (the monomorphizer
+// re-resolves each instance's member calls against the substituted receiver), so
+// it goes where annotations go.
+//
+// `fnTpBound*` — one row per BOUNDED type parameter of a `FuncDecl`. Unbounded
+// parameters get no row, which is what keeps `<T>` behaving exactly as it does
+// today: `fnTpBoundOf` answers -1 and every consumer takes its existing path.
+export let fnTpBoundFn: i32[] = []
+export let fnTpBoundIx: i32[] = []
+export let fnTpBoundAnn: i32[] = []
+
+export function setFnTpBound(fnIx: i32, k: i32, annIx: i32) {
+  fnTpBoundFn.push(fnIx)
+  fnTpBoundIx.push(k)
+  fnTpBoundAnn.push(annIx)
+  0
+}
+
+// The bound annotation node on type parameter `k` of the `FuncDecl` at `fnIx`, or
+// -1 when that parameter is unbounded (or the node is not a function).
+export function fnTpBoundOf(fnIx: i32, k: i32) {
+  let i = 0
+  while i < fnTpBoundFn.length {
+    if fnTpBoundFn[i] == fnIx && fnTpBoundIx[i] == k { return fnTpBoundAnn[i] }
+    i = i + 1
+  }
+  -1
+}
+
+// Does this function declare ANY bounded type parameter? The cheap gate every
+// consumer takes before doing bound work, so an unbounded generic pays one scan.
+export function fnHasTpBound(fnIx: i32) {
+  let i = 0
+  while i < fnTpBoundFn.length {
+    if fnTpBoundFn[i] == fnIx { return true }
+    i = i + 1
+  }
+  false
+}
+
+// `declBound*` — one row per BOUND ALIAS declaration (`type Showable = { toString():
+// string }`, i.e. a `type` whose body carries at least one METHOD member). The row
+// holds the whole body as ONE synthetic-object annotation node, so `<T: Showable>`
+// and `<T: { toString(): string }>` reach the identical spelling tree and one
+// decoder serves both. The declaration node itself is minted with an EMPTY field
+// list — a bound is not a value type and has no fields to lay out (see
+// `typecheck.declaredTyOfName`, which turns a value-position use into a sentence).
+export let declBoundNode: i32[] = []
+export let declBoundAnn: i32[] = []
+
+export function setDeclBound(nodeIx: i32, annIx: i32) {
+  declBoundNode.push(nodeIx)
+  declBoundAnn.push(annIx)
+  0
+}
+
+// The bound-body annotation node of the declaration at `nodeIx`, or -1 when it is
+// an ordinary type declaration.
+export function declBoundOf(nodeIx: i32) {
+  let i = 0
+  while i < declBoundNode.length {
+    if declBoundNode[i] == nodeIx { return declBoundAnn[i] }
+    i = i + 1
+  }
+  -1
+}
+
 // The module merge renames a declaration's base segment (`Box` → `Box$m1`) and
 // writes the result back into `tdName`/`udName`. The BANK is a second copy of
 // that segment, so it moves with it — the same lockstep `modRwType` keeps
@@ -896,6 +982,23 @@ export function tsReset() {
   declGpStart = []
   declGpCount = []
   declGpName = []
+  fnTpBoundFn = []
+  fnTpBoundIx = []
+  fnTpBoundAnn = []
+  declBoundNode = []
+  declBoundAnn = []
+  // D1003 — THE PLAIN→MANGLED UFCS ALIAS TABLE BELONGS TO ONE PROGRAM TOO, and
+  // until this line it was reset ONLY on the module-merge path (`driver`, before
+  // `modCollectSelfFns`). A single-file compile that followed a MODULE compile on
+  // the same instance inherited the previous program's rows, so `ufcsAliasOf`
+  // answered with a mangled name no function in the new program declares and the
+  // UFCS lookup missed — surfacing as D952's EMPTY `[ERROR]:` at the member call.
+  //
+  // Invisible from the CLI (one process per compile) and reproducible in the two
+  // places that reuse an instance: `tests/cases_wasm_test.ts`'s shared module, and
+  // the LSP server, which compiles on every keystroke. Found by a `tests/cases`
+  // file that passed alone and failed beside its neighbours.
+  ufcsAliasReset()
   0
 }
 
@@ -925,11 +1028,18 @@ export function tsToName(ix: i32): string {
     return "{[" + tsText[ix] + "]:" + tsToName(tsKids[start]) + "}"
   }
   if k == TS_FIELD { return tsText[ix] + ":" + tsToName(tsKids[start]) }
-  if k == TS_APP || k == TS_PAREN || k == TS_OBJ || k == TS_FUNC {
-    // The comma-joined child list. `TS_FUNC` holds its RETURN as the LAST kid
-    // (`parseTypeAtom`'s contract), so the join stops one short of it.
+  if (
+    k == TS_APP ||
+    k == TS_PAREN ||
+    k == TS_OBJ ||
+    k == TS_FUNC ||
+    k == TS_METHOD
+  ) {
+    // The comma-joined child list. `TS_FUNC` and `TS_METHOD` hold their RESULT as
+    // the LAST kid (`parseTypeAtom` / `parseMethodMemberTail`'s contract), so the
+    // join stops one short of it.
     let last = cnt
-    if k == TS_FUNC { last = cnt - 1 }
+    if k == TS_FUNC || k == TS_METHOD { last = cnt - 1 }
     let inner = ""
     let i = 0
     while i < last {
@@ -940,6 +1050,9 @@ export function tsToName(ix: i32): string {
     if k == TS_APP { return tsText[ix] + "<" + inner + ">" }
     if k == TS_PAREN { return "(" + inner + ")" }
     if k == TS_OBJ { return "{" + inner + "}" }
+    if k == TS_METHOD {
+      return tsText[ix] + "(" + inner + "):" + tsToName(tsKids[start + cnt - 1])
+    }
     return "(" + inner + ")=>" + tsToName(tsKids[start + cnt - 1])
   }
   // `TS_UNION` / `TS_ISECT` — the members joined by their own separator.
