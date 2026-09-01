@@ -89,7 +89,7 @@ parameter lists as structured data (only rendered type strings), declaration *bo
 | Hover | **partial** | Types everywhere | Doc prose needs a native export; verbosity stepper blocked on LSP 3.18. |
 | Completion | **have** | Scope/member/std-auto-import | — |
 | Completion resolve | missing | Lazier, richer items | Marginal — items are cheap; only worth it if doc text arrives (see §6). |
-| Signature help | **missing** | Param names/types while typing a call — a top gap for a typed language | *Partial* fit: `scopeAt`/`hoverTypeAt` render the callee's fn type as a string; host must re-parse it and track the active arg. Clean version wants one native export (§6). |
+| Signature help | **have** | Param names/types while typing a call — a top gap for a typed language | Shipped (D9.10) at the CLEAN grade, so the bridge's string re-parse was never written: the `sig*` export family (§7's "Signature table") returns the callee's parameters as data, and the host contributes only the lexical half (`lsp/src/signatureHelp.ts` — which call, which argument, over the shared tokenizer). UFCS drops `self` in the checker, so argument N is parameter N at both spellings. GAP: a BUILTIN callee (`print`, `xs.push`, `s.slice`) has no parameter table — the same absence that leaves member hover dark on them. |
 | Go to definition | **have** | Incl. cross-file + std | — |
 | Go to type definition | **missing** | Jump from a value to its `type Foo = …` decl | `typeAliasAt` returns the rendered *body*, not a location → needs a native export. |
 | Go to implementation | n/a | — | VL has no interfaces/traits to implement. |
@@ -113,7 +113,7 @@ parameter lists as structured data (only rendered type strings), declaration *bo
 | Semantic tokens | **have** (full) | — | Delta/range variants unneeded at measured latency. |
 | Linked editing | n/a | — | No paired tags/constructs to co-edit. |
 | Monikers | n/a | — | No cross-repo index ecosystem to key into. |
-| Inlay hints | **have** | Inferred types | Param-name hints at call sites would additionally need param names as data (same export as signature help). |
+| Inlay hints | **partial** | Inferred types | Param-name hints at call sites are still unbuilt, but no longer blocked: the `sig*` family they wanted shipped with signature help (D9.10). |
 | Inline values | n/a (until DAP) | Variable values shown while debugging | Meaningless without a debugger. |
 | Diagnostics: pull model | missing | Client-scheduled diagnostics | Push works fine at VL's check latency; migrate only if a client demands it. |
 | Notebooks | n/a | — | No notebook story for VL. |
@@ -229,14 +229,29 @@ occasionally generous. Optional hardening later, not a blocker: a `--json` repor
    understands the code. Sketch: one handler, `referencesAt` verbatim, mapped to
    `DocumentHighlight[]`. Served by: `referencesAt` alone. Ship in the same PR as rename.
 
-5. **Signature help.** What: param names/types + active-parameter highlight inside a call.
-   Why VL: types are the language's pitch, and today they vanish exactly at the moment of
-   calling a function; with UFCS (`expect(x).toEqual(…)`) knowing the `self`-shifted
-   signature matters even more. Sketch (two grades): *bridge* — take the callee's rendered
-   fn type from `scopeAt`/`hoverTypeAt`/`memberCompletionsAt` and re-parse
-   `(a: i32, b: string) -> T` host-side, tracking the active comma; *clean* — one native
-   export (§6) returning the param table structurally. The bridge works today; the string
-   re-parse is the acknowledged debt.
+5. **Signature help.** SHIPPED (D9.10). What: param names/types + active-parameter
+   highlight inside a call. Why VL: types are the language's pitch, and today they vanish
+   exactly at the moment of calling a function; with UFCS (`expect(x).toEqual(…)`) knowing
+   the `self`-shifted signature matters even more. Sketch was two grades: *bridge* — take
+   the callee's rendered fn type from `scopeAt`/`hoverTypeAt`/`memberCompletionsAt` and
+   re-parse `(a: i32, b: string) -> T` host-side, tracking the active comma; *clean* — one
+   native export (§6) returning the param table structurally.
+   **What it cost, against the sketch:** the clean grade was the CHEAPER of the two, so the
+   bridge's "acknowledged debt" was never incurred. `fnSigStr` (the hover render, #2105)
+   already zips the decl's parameter names against `TyFunc.fnParamTypes`; `sigAt` is the
+   same zip kept in columns instead of concatenated — ~90 lines of `check_query.vl` reading
+   `symOcc*`/`symBind*`/`symMem*` and recording nothing. A host-side re-parse would have had
+   to parse VL's type grammar to know that the comma in `(cmp: (i32, i32) => i32, xs: i32[])`
+   is not a separator, which is more code than the export and wrong more often.
+   Three things the sketch did not picture: the UFCS `self` row is dropped in the CHECKER
+   (so no caller applies an offset, and `shout("x", 2)` vs `"x".shout(2)` differ correctly);
+   a template HOLE is expression source inside one opaque `str` token, so the counter
+   re-enters it via `scanTemplate`'s hole spans; and the checker needs a PARSEABLE buffer to
+   have a symbol table at all, so an unclosed `(` — which the counter reads fine — yields
+   nothing until the closers are appended (`repairedSource`, tried only after the buffer as
+   written comes back empty). Every BALANCED mid-edit shape already worked unrepaired,
+   measured 2026-09-01: an empty argument list, a trailing comma, and a wrong-arity call
+   (a check error does not stop the symbol pass).
 
 6. **Code lens: export reference counts + run lenses.** What: "`N refs`" above each
    `export`, "Run" on runnable files, "Run tests" above a `*.test.vl` (complements, not
@@ -297,7 +312,9 @@ Honestly cheap (no native export, no new analysis):
   `registerProposedFeatures()` before `start()`.
 
 Cheap but *bridge-grade* (works via rendered-string re-parsing, flagged as debt):
-**signature help** off `scopeAt`/`memberCompletionsAt` type strings.
+**signature help** off `scopeAt`/`memberCompletionsAt` type strings. — WITHDRAWN (D9.10):
+the clean grade cost less than the bridge would have, so the re-parse was never written.
+See §5 for the measurement.
 
 ---
 
@@ -311,9 +328,14 @@ every existing capability (`typeof exp.x === "function"` probe, degrade on old s
   prose, completion docs, and the dormant D7 linkifier.
 - **Go-to-type-definition** — `typeDeclAt(line,col)` → decl-name span of the `type` alias
   behind the binding's (possibly inferred) type, in its declaring module.
-- **Signature table** — `sigAt(line,col)` → param count; `sigParamName*/Type*(i)`,
-  `sigRet*`: the callee's params as data, not a rendered string. Unblocks clean signature
-  help + param-name inlay hints at call sites.
+- **Signature table** — SHIPPED (D9.10), spelled exactly as sketched: `sigAt(line,col)` →
+  param count (−1 = nothing callable, 0 = a real zero-parameter signature);
+  `sigParamName*/Type*(i)`, `sigRet*`. The callee's params as data, not a rendered string.
+  Unblocked clean signature help; **param-name inlay hints at call sites are still unbuilt
+  and now need no new export** — they read this same family. A BUILTIN callee is the one
+  gap left in it: the checker types `print`/`xs.push`/`s.slice` in its call arms without
+  recording a signature, so closing it means growing the builtin table a parameter column,
+  not adding a second resolver.
 - **Declaration body extents** — `symBodyEndLine/Col(occ)` for decl occurrences: turns the
   flat outline into a nested one and fixes breadcrumbs ("which function am I in").
 - **Call edges** — `callCount()` / `callFrom*/To*(i)`: caller→callee pairs for call

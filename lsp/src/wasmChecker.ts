@@ -60,6 +60,17 @@ export type WasmOccurrence = {
  * maps `bindKind` onto its semantic-token legend and keeps its own lexical pass
  * for keywords/operators/literals/comments + member walk for properties.
  */
+/**
+ * One resolved callee signature from the native `sig*` family (D9.10): the
+ * parameters as DATA, plus the rendered return type. `name` is "" when the
+ * checker has no declaration to take it from — a function-typed value's `TyFunc`
+ * carries parameter types but no names, by design.
+ */
+export type WasmSignature = {
+  params: { name: string; type: string }[];
+  ret: string;
+};
+
 export type WasmToken = {
   line: number; // 0-based
   char: number; // 0-based
@@ -291,6 +302,25 @@ export type WasmChecker = {
     line: number,
     character: number,
   ) => Promise<string | undefined>;
+  /**
+   * Signature help (D9.10): the parameter table of the function whose NAME is at
+   * (line, character) — the CLEAN grade the survey's §6 "Signature table" names,
+   * so the host never re-parses a rendered `(a: i32, b: string) => T` back into
+   * fields. undefined when nothing there is callable or the seed predates the
+   * export; a zero-parameter function returns `{ params: [], ret }`, which is a
+   * signature and not an absence.
+   *
+   * A UFCS member call (`x.f(a)` over a free `function f(self, a)`) comes back
+   * with its `self` row already dropped, so argument index N is `params[N]` at
+   * both spellings and no caller applies an offset.
+   */
+  signatureAt: (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+    line: number,
+    character: number,
+  ) => Promise<WasmSignature | undefined>;
   /**
    * Type-alias hover (kill-TS): the rendered type of the user `type` NAME (a
    * struct/union alias) under the cursor — its decl name or a use in an
@@ -830,6 +860,37 @@ export const createWasmChecker = (
     const len = exp.memberTypeStrAt(line + 1, character);
     if (len <= 0) return undefined;
     return readString(len, (j) => exp.memberTypeStrCharAt(j));
+  };
+
+  const signatureAt = async (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+    line: number,
+    character: number,
+  ): Promise<WasmSignature | undefined> => {
+    const exp = instantiate();
+    if (exp === undefined || !speaksAbi(exp) || !hasSymbols(exp) ||
+      typeof exp.sigAt !== "function") {
+      return undefined;
+    }
+    await prepare(exp, source, entryKey, read);
+    exp.checkSrcSym();
+    // -1 is "nothing callable here"; 0 is a real zero-parameter signature, so
+    // the sign is the only thing that separates them.
+    const count = exp.sigAt(line + 1, character);
+    if (count < 0) return undefined;
+    const params: { name: string; type: string }[] = [];
+    for (let i = 0; i < count; i++) {
+      params.push({
+        name: readString(exp.sigParamNameLen(i), (j) => exp.sigParamNameCharAt(i, j)),
+        type: readString(exp.sigParamTypeLen(i), (j) => exp.sigParamTypeCharAt(i, j)),
+      });
+    }
+    return {
+      params,
+      ret: readString(exp.sigRetLen(), (j) => exp.sigRetCharAt(j)),
+    };
   };
 
   const typeAliasAt = async (
@@ -1434,6 +1495,7 @@ export const createWasmChecker = (
     referencesInEntry,
     hoverTypeAt,
     memberTypeAt,
+    signatureAt,
     typeAliasAt,
     tokensAt,
     memberTokensAt,

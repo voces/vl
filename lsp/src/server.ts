@@ -25,6 +25,7 @@ import {
   Range,
   ResponseError,
   SemanticTokens,
+  SignatureHelp,
   SymbolKind,
   TextDocuments,
   TextDocumentSyncKind,
@@ -94,6 +95,11 @@ import {
 import { STD_SOURCES } from "../../std/embedded.ts";
 import { invalidNewNameReason, planRenameAt, renameEdits } from "./rename.ts";
 import { foldingRanges, type VlFoldingKind } from "./folding.ts";
+import {
+  callSiteAt,
+  repairedSource,
+  signatureLabel,
+} from "./signatureHelp.ts";
 
 // The language id the extension registers (`package.json` → contributes.languages,
 // id `vital`, scope `source.vital`). Used as the markdown fence info string so
@@ -627,6 +633,70 @@ connection.onFoldingRanges((params): FoldingRange[] | null => {
     if (r.kind !== undefined) range.kind = foldingKindMap[r.kind];
     return range;
   });
+});
+
+// Signature help (D9.10): the callee's parameters while typing a call, with the
+// argument under the cursor highlighted.
+//
+// TWO HALVES, EACH ANSWERING WHAT ONLY IT CAN. `callSiteAt` (host, lexical) finds
+// WHICH call the cursor is inside and which argument — a question about
+// half-typed source, where the checker sees a parse error and the answer has to
+// survive an unclosed paren. `signatureAt` (native, D9.10's one new export)
+// answers WHAT that callee's parameters are, as data. The survey's bridge grade
+// would have re-parsed a rendered `(a: i32, b: string) => T` here; it does not,
+// because the clean grade shipped with it (see `signatureHelp.ts`).
+//
+// The checker drops a UFCS call's `self` row, so `activeArgument` indexes
+// `params` directly at both spellings — `shout("x", 2)` highlights `self` at
+// argument 0, `"x".shout(2)` highlights `n`.
+connection.onSignatureHelp(async (params): Promise<SignatureHelp | null> => {
+  const document = documents.get(params.textDocument.uri);
+  if (!document) return null;
+  if (wasmChecker?.signatureAt === undefined) return null;
+  const text = document.getText();
+  const site = callSiteAt(text, params.position.line, params.position.character);
+  if (site === undefined) return null;
+  const ask = (source: string) =>
+    wasmChecker!
+      .signatureAt(
+        source,
+        entryKeyOf(params.textDocument.uri),
+        workspaceReader,
+        site.callee.line,
+        site.callee.character,
+      )
+      .catch((err) => {
+        connection.console.log(`[wasm-symbols] signatureAt failed: ${err}`);
+        return undefined;
+      });
+  // The buffer AS WRITTEN first. Only when that has no answer is the missing-`)`
+  // repair worth a second check — the closers the scan is holding say nothing
+  // about whether the document needs them (`f("a"|, 1)` is already balanced).
+  let sig = await ask(text);
+  if (sig === undefined) {
+    const repaired = repairedSource(
+      text,
+      params.position.line,
+      params.position.character,
+      site,
+    );
+    if (repaired !== undefined) sig = await ask(repaired);
+  }
+  if (sig === undefined) return null;
+  const { label, parameters } = signatureLabel(site.name, sig);
+  return {
+    signatures: [{
+      label,
+      // The protocol addresses a parameter by its OFFSET PAIR into the label, not
+      // by repeating its text — the same substring can occur twice in one
+      // signature (`(a: i32, b: i32)`) and the client must highlight the right one.
+      parameters: parameters.map(([start, end]) => ({ label: [start, end] })),
+    }],
+    activeSignature: 0,
+    // Left UNCLAMPED on purpose: typing a fourth argument to a three-parameter
+    // function highlights nothing, which is the honest render of "too many".
+    activeParameter: site.activeArgument,
+  };
 });
 
 // ---- rename symbol (+prepare) (D9.7) ----------------------------------------
@@ -1504,6 +1574,13 @@ connection.onInitialize((params) => {
       // and refuses non-renameable positions before the client opens the box.
       renameProvider: { prepareProvider: true },
       hoverProvider: true,
+      // Signature help (D9.10). `(` opens the popup and `,` moves the active
+      // parameter; `)` RETRIGGERS rather than triggers, so closing an inner call
+      // hands the popup back to the outer one instead of opening a new session.
+      signatureHelpProvider: {
+        triggerCharacters: ["(", ","],
+        retriggerCharacters: [")"],
+      },
       inlayHintProvider: true,
       semanticTokensProvider: {
         legend: SEMANTIC_TOKEN_LEGEND,

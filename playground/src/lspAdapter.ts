@@ -44,6 +44,12 @@ import {
   foldingRanges as computeFoldingRanges,
   type VlFoldingRange,
 } from "../../lsp/src/folding.ts";
+import {
+  callSiteAt,
+  repairedSource,
+  type SigLabel,
+  signatureLabel,
+} from "../../lsp/src/signatureHelp.ts";
 import type { WasmChecker } from "../../lsp/src/wasmChecker.ts";
 import type { ModuleReader } from "../../compiler/coreTypes.ts";
 import {
@@ -301,6 +307,53 @@ export const format = (source: string): string | undefined =>
  */
 export const foldingRanges = (source: string): VlFoldingRange[] =>
   computeFoldingRanges(source);
+
+// ---- signature help (D9.10) -------------------------------------------------
+
+/** A resolved signature plus the argument the cursor is in. */
+export type SignatureHelpResult = SigLabel & {
+  /** 0-based; may point past the last parameter, which highlights nothing. */
+  activeParameter: number;
+};
+
+/**
+ * The signature of the call at `pos`, mirroring `server.ts`'s `onSignatureHelp`:
+ * the lexical half (`callSiteAt` — which call, which argument) is the shared
+ * pure module, the parameter table comes from the checker's `sigAt`. Null when
+ * the cursor is not inside an argument list, the callee is not callable, or the
+ * seed hasn't loaded.
+ */
+export const signatureHelp = async (
+  text: string,
+  pos: LspPosition,
+  entryKey: string = DEFAULT_ENTRY,
+): Promise<SignatureHelpResult | null> => {
+  if (checker === undefined) return null;
+  const site = callSiteAt(text, pos.line, pos.character);
+  if (site === undefined) return null;
+  const ask = (source: string) =>
+    checker!
+      .signatureAt(
+        source,
+        entryKey,
+        reader,
+        site.callee.line,
+        site.callee.character,
+      )
+      .catch(() => undefined);
+  // Buffer as written first, then the missing-`)` repair — `server.ts`'s order,
+  // and for the reason documented at `repairedSource`.
+  let sig = await ask(text);
+  if (sig === undefined) {
+    const repaired = repairedSource(text, pos.line, pos.character, site);
+    if (repaired !== undefined) sig = await ask(repaired);
+  }
+  if (sig === undefined) return null;
+  return {
+    ...signatureLabel(site.name, sig),
+    activeParameter: site.activeArgument,
+  };
+};
 
 // ---- quick-fixes (code actions / B17) --------------------------------------
 
