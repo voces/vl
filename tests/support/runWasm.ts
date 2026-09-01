@@ -157,6 +157,13 @@ export const runWasm = async (wasm: Uint8Array): Promise<RunResult> => {
       imports: {
         // Direct value sinks for the `print(x)` builtin. A wasm i64 arrives as a
         // JS bigint; the rest as numbers. Booleans render as `true`/`false`.
+        //
+        // NO COLOR HERE, DELIBERATELY (Stage C0's twin; see the native host's
+        // `Palette`). The native sink colors a rendered VALUE when stdout is a
+        // terminal; this harness has no stdout at all — `logs` is an array a test
+        // compares against expected strings — so there is nothing to gate on and
+        // nothing that could leak. Keeping it plain is also what makes the two
+        // hosts' output comparable, which several suites depend on.
         __print_i32__: (v: number) => logs.push(String(v)),
         __print_i64__: (v: bigint) => logs.push(v.toString()),
         __print_f32__: (v: number) => logs.push(String(v)),

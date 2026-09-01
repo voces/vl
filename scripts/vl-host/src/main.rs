@@ -64,6 +64,15 @@ use wasmtime::*;
 // `dumb`. There is deliberately NO global "colorize stdout" switch: `vl seed`'s
 // stdout is raw wasm bytes that one stray escape byte would corrupt, so styling
 // is something each printer opts into, never a wrapper every byte passes through.
+// `--color=always|never|auto` overrides the ambient rule (`ColorChoice`), and is
+// resolved HERE for every subcommand — including the ones whose rendering lives
+// in VL, which receive the answer as a synthetic argv entry (`cli_pump`).
+//
+// A RUNNING PROGRAM'S OWN `print` OUTPUT IS COLORED TOO (`Palette`), under the
+// same gate and Node's split: a rendered VALUE (number, boolean) is wrapped, a
+// bare string is not. The escape is added by the print IMPORT, the last place
+// before stdout that still knows the value's type — never inside a VL string,
+// so a template hole, a serialized payload and a log file cannot capture one.
 
 /// Whether ANSI styling may reach a stream. `stream_is_terminal` is the caller's
 /// `is_terminal()` on the SPECIFIC stream being written — stdout for help,
@@ -99,6 +108,95 @@ impl Style {
     fn stderr() -> Style {
         use std::io::IsTerminal;
         Style::of(std::io::stderr().is_terminal())
+    }
+}
+
+/// `--color=<when>`: the CLI's override of the ambient `color_ok` rule. `Auto` is
+/// the default and means "ask `color_ok`"; the two explicit arms are an override
+/// in the NO_COLOR spec's own sense — the spec asks software to honour the
+/// variable "when it is not overridden by a command-line option" — so
+/// `--color=always` colours a pipe with `NO_COLOR` set, which is what makes it
+/// usable for `… | less -R` and for capturing a demo.
+#[derive(Clone, Copy)]
+enum ColorChoice {
+    Always,
+    Never,
+    Auto,
+}
+
+impl ColorChoice {
+    /// `always` / `never` / `auto`, or `None` for anything else — a caller turns
+    /// that into its own usage error, because silently reading an unrecognised
+    /// `--color=purple` as "never" is a flag that lies about what it did.
+    fn parse(v: &str) -> Option<ColorChoice> {
+        match v {
+            "always" => Some(ColorChoice::Always),
+            "never" => Some(ColorChoice::Never),
+            "auto" => Some(ColorChoice::Auto),
+            _ => None,
+        }
+    }
+    /// The resolved yes/no for one stream.
+    fn resolve(self, stream_is_terminal: bool) -> bool {
+        match self {
+            ColorChoice::Always => true,
+            ColorChoice::Never => false,
+            ColorChoice::Auto => color_ok(stream_is_terminal),
+        }
+    }
+}
+
+/// The ANSI a `print` of a RENDERED VALUE is wrapped in, resolved once per process
+/// and handed to `instantiate_program`. Empty strings when colour is off, so the
+/// print imports pay one `is_empty()` and no allocation.
+///
+/// THE PALETTE IS NODE'S, MEASURED RATHER THAN INVENTED. `util.inspect.styles` on
+/// node v24.11.1 is `{number: 'yellow', bigint: 'yellow', boolean: 'yellow',
+/// null: 'bold', undefined: 'grey', string: 'green', …}` and `util.inspect.colors`
+/// gives yellow as `[33, 39]` — the OPEN/CLOSE pair, not `[0m`, so a colour reset
+/// never cancels a bold the surrounding shell set. Confirmed on a pty:
+/// `console.log(5)` emits `ESC[33m5ESC[39m`, `console.log(true)` the same, and
+/// `console.log("s")` emits `s` with no escape at all. That last one is the whole
+/// split this stage implements: VL's string prints go through
+/// `__print_char__`/`__print_str_flush__`, which never touch this type.
+///
+/// `null: 'bold'` is recorded for Stage C2; VL has no null print sink today (the
+/// per-type import family is i32/i64/f32/f64/bool/char), so there is nothing here
+/// to colour yet.
+#[derive(Clone, Copy)]
+struct Palette {
+    /// `(open, close)` around a rendered number or boolean.
+    value: (&'static str, &'static str),
+}
+
+impl Palette {
+    /// No escape can ever be produced. The value every capture sink gets: `vl
+    /// test` (whose captured output is pushed CHARACTER BY CHARACTER into a VL
+    /// string for the reporter — an escape there would be an escape inside a VL
+    /// string value, which the ruling forbids outright) and `vl run --batch`
+    /// (whose `.out` files are compared byte-for-byte by the corpus).
+    const OFF: Palette = Palette { value: ("", "") };
+
+    fn of(on: bool) -> Palette {
+        if on {
+            Palette {
+                value: ("\x1b[33m", "\x1b[39m"),
+            }
+        } else {
+            Palette::OFF
+        }
+    }
+
+    /// Hand one RENDERED VALUE to `sink`, wrapped when colour is on. Only the
+    /// numeric and boolean print imports call this; the string family does not,
+    /// so a bare string prints raw on a terminal exactly as it does in a pipe.
+    fn emit(self, sink: &impl Fn(&str), rendered: &str) {
+        let (open, close) = self.value;
+        if open.is_empty() {
+            sink(rendered);
+        } else {
+            sink(&format!("{open}{rendered}{close}"));
+        }
     }
 }
 
@@ -250,7 +348,8 @@ vl — the VL toolchain: compile, run, check, format and test VL programs
                     then ./build/vl-compiler.wasm; then the embedded seed)
   {c}VL_STD{r}            VL's std/ directory (the ONLY candidate when set)
   {c}NO_COLOR{r}          Disable ANSI color (also off when the stream is not a
-                    terminal, or TERM=dumb)
+                    terminal, or TERM=dumb). `run`, `check`, `fmt` and `test`
+                    take `--color=always|never|auto`, which overrides it
 
 A bare `vl` is reserved for a future REPL and exits 2.
 Run `{c}vl help <command>{r}` (or `vl <command> --help`) for details on one command.
@@ -287,6 +386,10 @@ program verbatim — the only way to pass one that starts with `-`.
                        failure, <name>.err; exits 0 unless the batch itself
                        cannot run
   {c}--out-dir{r} <dir>      (--batch) Where the per-case .out/.err files land
+  {c}--color={r}<when>       always | never | auto (default). Colors PRINTED VALUES
+                       — numbers and booleans, never a bare string — and only
+                       when stdout is a terminal; --batch output is never
+                       colored
   {c}-O, -O3, --names, --wat, --no-validate{r}
                        Accepted for symmetry with `vl build`; no effect here
                        (run compiles in memory and writes no artifact)
@@ -296,12 +399,15 @@ program verbatim — the only way to pass one that starts with `-`.
                       refcount | none
   {c}VL_COMPILER_WASM{r}    Compiler seed path (when --compiler is not given)
   {c}VL_STD{r}              VL's std/ directory (the only candidate when set)
+  {c}NO_COLOR{r}            Disable ANSI in printed values (also off when stdout is
+                      not a terminal, or TERM=dumb); --color= overrides it
 
 {b}Exit:{r} 0 the program ran; 1 compile or runtime failure; 2 usage error.
 
 {b}Examples:{r}
   vl run main.vl one two            {d}the program sees arguments `one`, `two`{r}
   vl run main.vl -- --verbose       {d}`--verbose` reaches the program{r}
+  vl run main.vl --color=always | less -R
   echo 'print(6 * 7)' | vl run
 "
         ),
@@ -354,6 +460,8 @@ every .vl file under it.
   {c}--no-validate{r}       (with --codegen) skip the engine's verdict
   {c}--fix{r}               Apply safe autofixes, writing files in place
   {c}--exclude{r} <glob>    Skip matching paths (repeatable; also --exclude=<glob>)
+  {c}--color={r}<when>      always | never | auto (default: color iff stdout is a
+                      terminal); an explicit value overrides NO_COLOR
   {c}--compiler{r} <wasm>   Compiler seed to use (see `vl help seed`)
 
 {b}Environment:{r}
@@ -380,6 +488,7 @@ prints the formatted source to stdout and writes nothing.
 {b}Flags:{r}
   {c}-w, --write{r}         Write the result back in place
   {c}--check{r}             Write nothing; exit 1 if anything would change (CI gate)
+  {c}--color={r}<when>      always | never | auto (default), as in `vl help check`
   {c}--compiler{r} <wasm>   Compiler seed to use (see `vl help seed`)
 
 {b}Exit:{r} 0 clean; 1 --check found drift; 2 unreadable input or usage error;
@@ -406,6 +515,8 @@ tests continue in a fresh instance.
   {c}-t{r} <name>           Only tests whose name contains <name> (also -t=<name>)
   {c}--jobs{r} <N>          Worker threads (default: one per core; also --jobs=<N>)
   {c}--exclude{r} <glob>    Skip matching files (repeatable; also --exclude=<glob>)
+  {c}--color={r}<when>      always | never | auto (default), for the RUNNER's own
+                      report; a test's captured output is always plain
   {c}--compiler{r} <wasm>   Compiler seed to use (see `vl help seed`)
 
 {b}Environment:{r}
@@ -1836,9 +1947,10 @@ fn trap_explanation(trap: Trap) -> Option<&'static str> {
 
 /// Instantiate an emitted VL program with the host print-import family and run it
 /// (top-level statements run via the wasm start function). Print output streams to
-/// stdout as it arrives.
-fn run_program(engine: &Engine, bytes: &[u8]) -> Result<()> {
-    run_program_with(engine, bytes, |line| println!("{line}"))
+/// stdout as it arrives, coloured per `palette` — which `run_cmd` resolves from
+/// `--color` and stdout's own `isatty`, so a redirected `vl run` is escape-free.
+fn run_program(engine: &Engine, bytes: &[u8], palette: Palette) -> Result<()> {
+    run_program_with(engine, bytes, |line| println!("{line}"), palette)
 }
 
 /// `run_program` with the print destination injected: every print import emits one
@@ -1849,12 +1961,13 @@ fn run_program_with(
     engine: &Engine,
     bytes: &[u8],
     sink: impl Fn(&str) + Send + Sync + Clone + 'static,
+    palette: Palette,
 ) -> Result<()> {
     let module = Module::new(engine, bytes)?;
     // The instance is dropped: `vl run` runs the start function (the program's top
     // level) and exits. `vl test` needs the instance back to call exports on it, so
     // it goes through `instantiate_program` directly.
-    let _ = instantiate_program(engine, &module, sink)?;
+    let _ = instantiate_program(engine, &module, sink, palette)?;
     Ok(())
 }
 
@@ -2347,19 +2460,31 @@ fn register_fs_imports(
 /// Clone + 'static` so a test worker can point it at that worker's own capture
 /// buffer, which is what makes per-test output attribution structural rather than
 /// console-patching (each instance runs one test at a time).
+///
+/// `palette` is where ANSI enters — and the ONLY place a program's own output can
+/// acquire it. It reaches the per-type VALUE imports (i32/i64/f32/f64/bool) and
+/// not the string family, which is Node's split: `console.log(5)` colours,
+/// `console.log("s")` does not. Every capture sink passes `Palette::OFF`, so a
+/// redirected, batched or `vl test`-captured program is escape-free by
+/// construction rather than by a downstream strip.
 fn instantiate_program(
     engine: &Engine,
     module: &Module,
     sink: impl Fn(&str) + Send + Sync + Clone + 'static,
+    palette: Palette,
 ) -> Result<(Store<()>, Instance)> {
     let chars: Arc<Mutex<Vec<u8>>> = Arc::default();
     let mut store = Store::new(engine, ());
     let mut linker = Linker::new(engine);
 
     let s = sink.clone();
-    linker.func_wrap("imports", "__print_i32__", move |v: i32| s(&v.to_string()))?;
+    linker.func_wrap("imports", "__print_i32__", move |v: i32| {
+        palette.emit(&s, &v.to_string())
+    })?;
     let s = sink.clone();
-    linker.func_wrap("imports", "__print_i64__", move |v: i64| s(&v.to_string()))?;
+    linker.func_wrap("imports", "__print_i64__", move |v: i64| {
+        palette.emit(&s, &v.to_string())
+    })?;
     // f64: rendered through `js_number_to_string`, which is JS `String(v)` EXCEPT AT AN
     // EXACT DECIMAL TIE — the JS hosts (`tests/support/runWasm.ts`,
     // `playground/src/runtime.ts`) sink through `String(v)`, so a corpus `@log` line has
@@ -2368,19 +2493,26 @@ fn instantiate_program(
     // infinities; see that function, whose doc comment carries the tie defect. (Slice 3.)
     let s = sink.clone();
     linker.func_wrap("imports", "__print_f64__", move |v: f64| {
-        s(&js_number_to_string(v))
+        palette.emit(&s, &js_number_to_string(v))
     })?;
     // f32: widen to f64 first, because that is what the JS hosts see — a wasm f32
     // arrives as a JS number, i.e. its exact f64 value — then render by the same rule.
     // (Slice 5.)
     let s = sink.clone();
     linker.func_wrap("imports", "__print_f32__", move |v: f32| {
-        s(&js_number_to_string(v as f64))
+        palette.emit(&s, &js_number_to_string(v as f64))
     })?;
+    // Node colours `true`/`false` with the SAME yellow it gives numbers
+    // (`util.inspect.styles.boolean === 'yellow'`), so this shares `Palette::value`
+    // rather than inventing a second entry.
     let s = sink.clone();
     linker.func_wrap("imports", "__print_bool__", move |v: i32| {
-        s(if v != 0 { "true" } else { "false" })
+        palette.emit(&s, if v != 0 { "true" } else { "false" })
     })?;
+    // NO PALETTE BELOW THIS LINE. `__print_char__`/`__print_str_flush__` carry a
+    // VL `string` value's own bytes; a bare string prints raw on a terminal
+    // exactly as it does in a pipe, and the renderer's output can therefore never
+    // pick up an escape on its way through a template hole or a log file.
     let c = chars.clone();
     // STAGE 2c: the argument is a UTF-8 **byte**, not a code point. The guest streams a
     // string's storage bytes verbatim, so the host does no transcoding at all — where it
@@ -2452,6 +2584,16 @@ fn run_batch(args: &[String]) -> Result<()> {
                 i += 1;
             }
             "--batch" => {}
+            // ACCEPTED AND INERT, and validated anyway. A `.out` file is a machine
+            // artifact the corpus compares byte-for-byte, so batch output is never
+            // coloured whatever this says — but a caller who spells the flag wrong
+            // still hears about it, rather than having `--color=purple` pass as
+            // silently as `--color=always` does.
+            a if a.starts_with("--color=") => {
+                if ColorChoice::parse(&a["--color=".len()..]).is_none() {
+                    bail!("vl run --batch: `{a}` — --color takes always, never, or auto");
+                }
+            }
             a if !a.starts_with('-') => files.push(a.to_string()),
             other => bail!("vl run --batch: unknown flag `{other}`"),
         }
@@ -2509,7 +2651,10 @@ fn run_batch(args: &[String]) -> Result<()> {
                 let inst = pre.instantiate(&mut store)?;
                 compile_vl_instance(&mut store, &inst, &source, f, "compileSrc", true)?
             };
-            run_program_with(&run_engine, &bytes, sink.clone())
+            // `Palette::OFF`, and NOT the resolved one: a `.out` file is a machine
+            // artifact the corpus compares byte-for-byte, so `--batch` output stays
+            // escape-free even under `--color=always`.
+            run_program_with(&run_engine, &bytes, sink.clone(), Palette::OFF)
         })();
         std::fs::write(format!("{out_dir}/{name}.out"), captured.lock().unwrap().as_bytes())?;
         let err_path = format!("{out_dir}/{name}.err");
@@ -2743,10 +2888,11 @@ fn compile_and_run(
     source: &str,
     source_path: &str,
     run_engine: &Engine,
+    palette: Palette,
 ) -> Result<()> {
     let compile_engine = gc_engine(Collector::Null)?;
     let bytes = compile_vl(&compile_engine, compiler, source, source_path, "compileSrc", true)?;
-    run_program(run_engine, &bytes)
+    run_program(run_engine, &bytes, palette)
 }
 
 /// The value of a value-taking `vl run` flag, or a usage error when the flag ended the
@@ -2782,7 +2928,7 @@ fn arg_error(msg: &str, token: Option<&str>) -> ! {
     }
     eprintln!(
         "note: `vl run` itself takes -e <source>, --compiler <wasm>, --batch, \
--O/-O3, --names, --wat, --no-validate."
+--color=<when>, -O/-O3, --names, --wat, --no-validate."
     );
     eprintln!("note: `vl help run` shows the full flag list.");
     std::process::exit(2);
@@ -2810,6 +2956,8 @@ fn run_cmd(args: &[String]) -> Result<()> {
     }
     let mut compiler: Option<String> = None;
     let mut inline: Option<String> = None;
+    // `auto` unless the caller says otherwise — see `ColorChoice`.
+    let mut color = ColorChoice::Auto;
     // Positionals in order, before the file/argument split is made. The split cannot
     // be made DURING the walk because it depends on `-e`, which may arrive later:
     // with a `-e` snippet there is no source file, so `vl run -e <src> a b` has TWO
@@ -2834,6 +2982,18 @@ fn run_cmd(args: &[String]) -> Result<()> {
             // that is what they have always been on this path — turning a spelling
             // that runs today into an error is the thing this change is avoiding.
             "-O" | "-O3" | "--names" | "--wat" | "--no-validate" => {}
+            // `--color=<when>`, the `=` spelling only — the same one `vl check`
+            // takes, and the one that cannot swallow the source file the way a
+            // space-separated value would (`vl run --color p.vl`). A bare
+            // `--color` therefore falls through to the unknown-flag arm, which
+            // names the accepted spellings.
+            a if a.starts_with("--color=") => match ColorChoice::parse(&a["--color=".len()..]) {
+                Some(c) => color = c,
+                None => arg_error(
+                    &format!("`{a}` — --color takes always, never, or auto"),
+                    None,
+                ),
+            },
             a if !a.starts_with('-') => positional.push(a.to_string()),
             // THE `_ => {}` THIS REPLACES. An unrecognised dash-led token used to be
             // consumed and discarded with no diagnostic and no exit code, which made
@@ -2873,6 +3033,10 @@ fn run_cmd(args: &[String]) -> Result<()> {
         "       `vl help run` shows the full flag list",
     );
     let run_engine = gc_engine(run_collector()?)?;
+    // The program's print output goes to THIS process's stdout, so stdout is the
+    // stream the auto rule asks about — a `vl run p.vl > log` is escape-free even
+    // when stderr is still a terminal.
+    let palette = Palette::of(color.resolve(std::io::stdout().is_terminal()));
 
     // A file argument (no `-e`): a prebuilt wasm runs directly; else it's source.
     if inline.is_none() {
@@ -2880,13 +3044,13 @@ fn run_cmd(args: &[String]) -> Result<()> {
             let raw = std::fs::read(f)
                 .map_err(|e| Error::from(e).context(format!("reading `{f}`")))?;
             if raw.starts_with(b"\0asm") {
-                return run_program(&run_engine, &raw);
+                return run_program(&run_engine, &raw, palette);
             }
             let source = String::from_utf8(raw).map_err(|e| {
                 Error::from(e)
                     .context(format!("`{f}` is neither UTF-8 VL source nor a wasm module"))
             })?;
-            return compile_and_run(&compiler, &source, f, &run_engine);
+            return compile_and_run(&compiler, &source, f, &run_engine, palette);
         }
     }
 
@@ -2907,7 +3071,7 @@ fn run_cmd(args: &[String]) -> Result<()> {
         eprintln!("{USAGE}");
         std::process::exit(2);
     }
-    compile_and_run(&compiler, &source, "source.vl", &run_engine)
+    compile_and_run(&compiler, &source, "source.vl", &run_engine, palette)
 }
 
 // ── `vl test` — the runner's MECHANISM half (docs/internals/vl-test-design.md) ──
@@ -3035,7 +3199,9 @@ fn collect_test_file(engine: &Engine, file: &TestFile) -> TestRegistry {
             ))
         }
     };
-    let (mut store, inst) = match instantiate_program(engine, &module, |_| {}) {
+    // Collection DISCARDS output (the registration pass should print nothing), so
+    // there is no stream to colour.
+    let (mut store, inst) = match instantiate_program(engine, &module, |_| {}, Palette::OFF) {
         Ok(pair) => pair,
         Err(e) => return failed(trap_text(&e)),
     };
@@ -3121,7 +3287,14 @@ fn run_test_file(
             b.push('\n');
         }
     };
-    let mut live = match instantiate_program(engine, module, sink.clone()) {
+    // `Palette::OFF` IS LOAD-BEARING, not a default. A failing test's captured
+    // output is pushed CHARACTER BY CHARACTER into a VL string (`out_push`, at
+    // CMD_TEST_RUN) for the VL reporter to lay out — so an escape here would be an
+    // escape living inside a VL string value, which the ruling forbids, and it
+    // would land inside the reporter's own styling rather than beside it. The
+    // runner's summary colours itself from the host-resolved `--color` the pump
+    // injects; program output stays plain text.
+    let mut live = match instantiate_program(engine, module, sink.clone(), Palette::OFF) {
         Ok(pair) => pair,
         Err(e) => return bail_all(&trap_text(&e)),
     };
@@ -3197,7 +3370,7 @@ fn run_test_file(
                 ));
                 // Re-instantiate for the next test. A failure here is terminal for
                 // the rest of THIS file only.
-                match instantiate_program(engine, module, sink.clone()) {
+                match instantiate_program(engine, module, sink.clone(), Palette::OFF) {
                     Ok(pair) => live = pair,
                     Err(e) => {
                         let msg = format!("re-instantiating after a trap: {}", trap_text(&e));
@@ -3589,7 +3762,28 @@ fn cli_pump(args: &[String]) -> Result<()> {
     // TTY + NO_COLOR + TERM is host mechanism; the VL formatter can't probe isatty,
     // so the resolved decision rides in as a synthetic `--color=always|never`
     // argument. Same per-stream gate the help screens use (`color_ok`).
-    let color = color_ok(std::io::stdout().is_terminal());
+    //
+    // A CALLER'S OWN `--color=` IS AN OVERRIDE, and used not to be one: the
+    // synthetic argument is appended AFTER user argv and the VL parser takes the
+    // last one it sees, so `vl check --color=always | less -R` resolved to
+    // `never`. Resolving here — the one place that knows both the flag and the
+    // isatty — is what makes `--color` mean the same thing on `run`, `check`,
+    // `fmt` and `test`. An unrecognised value is a usage error rather than a
+    // silent "never" (`cliParseArgs` still reads its own copy leniently; it now
+    // only ever sees `always` or `never`).
+    let mut choice = ColorChoice::Auto;
+    for a in args {
+        if let Some(v) = a.strip_prefix("--color=") {
+            match ColorChoice::parse(v) {
+                Some(c) => choice = c,
+                None => {
+                    eprintln!("vl: `{a}` — --color takes always, never, or auto");
+                    std::process::exit(2);
+                }
+            }
+        }
+    }
+    let color = choice.resolve(std::io::stdout().is_terminal());
 
     let arg_reset = inst.get_typed_func::<(), i32>(&mut store, "cliArgReset")?;
     let arg_push = inst.get_typed_func::<i32, i32>(&mut store, "cliArgPush")?;

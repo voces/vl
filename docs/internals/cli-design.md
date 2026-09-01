@@ -281,6 +281,22 @@ passes `--color=auto|always|never` resolution into argv (it knows `isatty` +
 `NO_COLOR`), and the VL formatter honors the resolved flag — keeping the
 TTY-detection (mechanism) in the host and the ANSI rendering (policy) in VL.
 
+**A caller's own `--color=` is an override, and is resolved in the host.** The
+synthetic argument is appended AFTER user argv and `cliParseArgs` takes the last
+one it sees, so `vl check --color=always | less -R` used to resolve to `never` —
+the flag was accepted and then overruled. `ColorChoice` in the host now folds the
+two together before either is sent: `always`/`never` win over the isatty rule (and
+over `NO_COLOR`, which the NO_COLOR spec asks to honor only "when it is not
+overridden by a command-line option"), `auto` is the default and asks `color_ok`.
+An unrecognized value is exit 2 rather than a silent "never". The VL side is
+unchanged and still only ever sees `always` or `never`.
+
+The same flag reaches `vl run`, where it gates a running program's own `print`
+output — see docs/serde-design.md §"Print, templates, and color", Stage C0. That
+is the one path where escapes are produced by the HOST rather than by VL: the
+per-type print imports know a value's type, which is what makes Node's split
+(`console.log(5)` colors, `console.log("s")` does not) expressible at all.
+
 ## `check --json` — machine-readable diagnostics
 
 `vl check <path> --json` replaces the pretty/concise stderr rendering with **one
