@@ -73,6 +73,17 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   suite pins are the standing regression floor; widening the gate without making the
   recovery faithful is exactly what they exist to stop. DECISIONS.md §"A recovered parse
   IS typechecked" is the durable home.
+- **Width subtyping — RULED (owner, 2026-09-01): the non-prefix refusal is a GAP, closed
+  the Roc way** — shape-monomorphization of narrow-typed consumers (offsets constant per
+  caller shape; zero runtime cost; paid in instance count — the variant-count tradeoff
+  the monomorphization notes already track, with WasmGC-subtyping collapse as the future
+  escape). The storage caveat stands: only FUNCTION-parameter width monomorphizes free;
+  non-prefix STORAGE (a narrow-typed container holding wide values) pays boxing/adapters
+  under any scheme. Owner's rider, recorded: watch for hidden perf traps — the implicit
+  lossless numeric conversions were embraced without pricing them, and this must not
+  repeat silently; the mitigation is an INSTRUMENT, not hesitation (a per-build instance
+  report making mono growth visible — filed as part of the implementation's grading).
+  Compiler-side work; the compile-goal session's surface.
 - **Colored `print`** — ruled in principle 2026-09-01 with one hard constraint (ANSI must
   never leak into pipes/files/copies): Node's split — bare strings always raw, rendered
   values colored, escapes emitted only by the TTY-detected sink, `NO_COLOR`/`--color`

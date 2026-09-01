@@ -366,6 +366,20 @@ correctly; the same marker at the top of `emitReturnExit` reads zero even for a 
 provably calls it. Where the marker reads zero for a case you know fires, the instrument is
 wrong, not the code — use a counter global or a distinctive `emitFail`.
 
+## AGENTS NEVER BUILD INTO THE SHARED CARGO TARGET
+
+`scripts/vl-host/target` is symlinked into every worktree, so `cargo build` from any of
+them REPLACES the live binary every session runs. Measured 2026-09-01, twice in one hour:
+an in-flight agent's migrated module gate made master's template fixtures stop merging
+`std:fmt` (four ci-native reds mis-attributed to an innocent merge), and a concurrent
+gate run died mid-suite on the binary being rebuilt under it. Rules: an agent editing
+`scripts/vl-host/src` builds with an ISOLATED `--target-dir` (or repoints its worktree's
+`target` symlink at scratch) and probes that path explicitly; the SHARED binary is
+rebuilt only as a coordinator step after the change MERGES. And when restoring it, force
+the rebuild — `rm target/release/vl && touch src/main.rs` first — because cargo's
+fingerprint can say `Finished` while leaving a clobbered artifact in place; verify
+BEHAVIORALLY (run a program the change affects), never by timestamp.
+
 ## `vl` resolves `std:` from the EXE's checkout — a worktree probe measures the WRONG std
 
 The host walks ancestors of the BINARY, and every agent worktree symlinks
