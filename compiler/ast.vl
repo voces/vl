@@ -467,6 +467,79 @@ export function declNameTokOf(nodeIx: i32) {
   -1
 }
 
+// ── Parameter-DEFAULT side tables (default arguments v1) ─────────────────────
+// Two sidecars, both PARALLEL to `P.nodes`, grown lazily and bounds-checked on
+// read — the same contract `nodeToks` / `declNameTok` keep. Both are reset by
+// `paramDefaultTablesReset` immediately before each `checkProgram`, so a
+// re-parsed arena never reads the previous program's marks.
+//
+// `callSiteLoc[callIx]` — the `__callsite__` VALUE minted for the call at
+// `callIx`: an `ObjLit` `{ file: "<module key>", line: N, col: M }` built from
+// that call's OWN anchor token. Minted by `csPreMintLocs` (driver.vl) BEFORE
+// `checkProgram` sizes `nodeTyIx`, which is the whole reason it is a pre-pass
+// and not a rewrite: a node minted after that sizing reads its type back as -1
+// forever (D969's recorded cost), and this one has to be typed, repped and
+// collected like any other object literal. Every OTHER default is a shared node
+// — a literal or a module `const` means the same thing at every call site — and
+// `__callsite__` is the one form that does not, so it is the one form that is
+// minted per site.
+//
+// `defaultGlobalRef[identIx]` — 1 when this `Ident` is a parameter default that
+// resolved to a MODULE-SCOPE `const` at the DECLARATION. The mark is what makes
+// "names in a default resolve in the declaration's scope" true rather than
+// hoped-for: the checker and the emitter both skip the local scope for a marked
+// node, so a caller-local binding that happens to share the const's name cannot
+// capture the substituted reference.
+export let callSiteLoc: i32[] = []
+export let defaultGlobalRef: i32[] = []
+
+// The spelling of the call-site intrinsic. Legal ONLY as a parameter default
+// value; anywhere else it is an ordinary (undeclared) identifier, and the
+// checker says so by name.
+export const CALLSITE_NAME = "__callsite__"
+
+export function paramDefaultTablesReset() {
+  callSiteLoc = []
+  defaultGlobalRef = []
+  0
+}
+
+export function setCallSiteLoc(callIx: i32, locIx: i32) {
+  if callIx < 0 { return 0 }
+  while callSiteLoc.length <= callIx { callSiteLoc.push(-1) }
+  callSiteLoc[callIx] = locIx
+  0
+}
+
+export function callSiteLocOf(callIx: i32) {
+  if callIx >= 0 && callIx < callSiteLoc.length { return callSiteLoc[callIx] }
+  -1
+}
+
+export function markDefaultGlobalRef(nodeIx: i32) {
+  if nodeIx < 0 { return 0 }
+  while defaultGlobalRef.length <= nodeIx { defaultGlobalRef.push(0) }
+  defaultGlobalRef[nodeIx] = 1
+  0
+}
+
+export function isDefaultGlobalRef(nodeIx: i32) {
+  if nodeIx >= 0 && nodeIx < defaultGlobalRef.length {
+    return defaultGlobalRef[nodeIx] == 1
+  }
+  false
+}
+
+// Is `dIx` the `__callsite__` intrinsic — the one default form whose value is
+// per-CALL-SITE rather than per-declaration? The parser leaves it as a plain
+// `Ident`; nothing declares that name, so this spelling test is exact.
+export function paramDefaultIsCallsite(dIx: i32) {
+  if dIx < 0 || dIx >= P.nodes.length { return false }
+  const d = P.nodes[dIx]
+  if d is Ident { return d.identName == CALLSITE_NAME }
+  false
+}
+
 // The END char offset (one-past-last) of the source `P.nodes[nodeIx]` spans — the
 // STOP offset of the LAST token consumed when the node was built (its `nodeToks`
 // anchor). Paired with the node's `pos` (its START offset), this is the
@@ -1563,15 +1636,23 @@ export function paramDefaultOf(pIx: i32) {
 // -1 when the list came out complete.
 //
 // The default's arena node is SHARED by every call site that omits the argument
-// rather than cloned. Defaults are literals (the checker's rule), so they carry
-// no per-occurrence state: their emitted valtype comes from the parameter they
-// land on and their walk is idempotent.
-export function fillArgDefaults(slots: i32[], dParams: i32[]) {
+// rather than cloned. A literal and a module-scope `const` carry no
+// per-occurrence state — their emitted valtype comes from the parameter they
+// land on and their walk is idempotent — so sharing is exact for both.
+//
+// `__callsite__` IS the exception, and `callIx` is why this takes the call node:
+// its value is the CALL's own position, so the slot takes the per-site `ObjLit`
+// `csPreMintLocs` banked on that call. A call with no banked location (a shape
+// the pre-pass did not reach) leaves the slot UNFILLED and is reported as the
+// arity error it is, rather than silently substituting the marker.
+export function fillArgDefaults(slots: i32[], dParams: i32[], callIx: i32) {
   let i = 0
   while i < slots.length {
     if slots[i] < 0 {
       let d = -1
       if i < dParams.length { d = paramDefaultOf(dParams[i]) }
+      if d < 0 { return i }
+      if paramDefaultIsCallsite(d) { d = callSiteLocOf(callIx) }
       if d < 0 { return i }
       slots[i] = d
     }

@@ -79,8 +79,15 @@ import {
   dgLosslessReset,
   fnTpBoundOf,
   i32ToStr,
+  mkFieldInit,
+  mkNum,
+  mkObjLit,
   mkProgram,
+  mkStr,
   nodeToks,
+  paramDefaultIsCallsite,
+  paramDefaultTablesReset,
+  setCallSiteLoc,
   setDeclGpBase,
   tplHole,
   tsKidCount,
@@ -166,6 +173,8 @@ import {
   symScopeTypeLen,
   symSetEnabled,
   symSigAt,
+  symSigParamDefaultCharAt,
+  symSigParamDefaultLen,
   symSigParamNameCharAt,
   symSigParamNameLen,
   symSigParamTypeCharAt,
@@ -620,6 +629,7 @@ export function compileSrc(): i32 {
   vcLoadToks(vcSource())
   const root = parseProgram()
   if vcParseBlocked() { return 1 }
+  csPreMintLocs()
   checkProgram(root)
   // EMIT NEVER PROCEEDS PAST A PARSE DIAGNOSTIC, lossless or not. A recovered
   // file's diagnostics are still ERRORS — `vl build`/`vl run` keep rc 1 and the
@@ -745,6 +755,7 @@ export function checkSrc(): i32 {
   vcLoadToks(vcSource())
   const root = parseProgram()
   if vcParseBlocked() { return 1 }
+  csPreMintLocs()
   checkProgram(root)
   // A lossless-recovered file reports BOTH streams and keeps rc 1 — the parse
   // mistake is still the headline error, the type errors ride with it.
@@ -1044,6 +1055,7 @@ export function checkSrcSym(): i32 {
   vcLoadToks(vcSource())
   const root = parseProgram()
   if vcParseBlocked() { return 1 }
+  csPreMintLocs()
   checkProgram(root)
   // Lossless recovery: the symbol tables ARE populated for the rc-1 result too,
   // so hover / go-to-def / find-refs keep answering across a missing brace.
@@ -1080,6 +1092,115 @@ export function modOfTok(tok: i32): i32 {
   }
   best
 }
+// ── `__callsite__`: mint one location value per CALL, before the checker runs ─
+//
+// Parameter defaults are CALL-SITE SUGAR — the declaration's expression is
+// substituted into each call that omits the argument — and every form v1 allows
+// but one means the same thing at every site, so every form but one can share a
+// single arena node. `__callsite__` is the exception: its value IS the site.
+//
+// WHY A PRE-PASS AND NOT A REWRITE. `nodeTyIx` is sized to the arena at
+// `checkProgram` entry, so a node minted later reads its type back as -1 forever
+// (D969's recorded cost, and the reason `parseTemplate` desugars in the PARSER).
+// These nodes have to be typed, repped, collected and lowered like any other
+// object literal, so they are minted BEFORE that sizing — the same discipline
+// the template desugar follows, moved to the earliest point that knows a call
+// site exists at all. The checker then splices the banked node into the omitted
+// slot (`fillArgDefaults`), and from there nothing downstream knows this
+// argument was synthesized.
+//
+// USAGE-GATED: a program that declares no `__callsite__` default mints nothing
+// and banks nothing, so the arena — and therefore every byte the emitter writes
+// — is identical to before this pass existed.
+//
+// The value is the SHAPE the track-caller follow-up will alias in std:
+// `{ file: string, line: i32, col: i32 }`. `file` is the module KEY (the merged
+// program's own name for the file); `line`/`col` are 1-based, matching what a
+// diagnostic prints for the same token.
+function csAnyCallsiteDefault(): boolean {
+  let i = 0
+  while i < P.nodes.length {
+    const n = P.nodes[i]
+    if n is Param {
+      if paramDefaultIsCallsite(n.parDefault) { return true }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// `s` as a STRING-LITERAL LEXEME — quotes kept, `"` and `\` escaped. `StrLit`
+// carries the RAW lexeme (`wasmEmit`'s `decodeStr` resolves the escapes), so a
+// synthesized literal has to be built in that same currency.
+function csStrLexeme(s: string): string {
+  const buf: i32[] = []
+  buf.push(34)
+  for cp in s {
+    if cp == 34 || cp == 92 { buf.push(92) }
+    buf.push(cp)
+  }
+  buf.push(34)
+  fromCodePoints(buf)
+}
+
+// The module KEY owning the token at `tok` — the merged program's name for the
+// file. A single-source compile has no module table and answers "", which is the
+// honest reading: nothing in that pipeline knows the entry's path (the CLI
+// prints one it holds host-side, and never tells the compiler).
+function csFileOfTok(tok: i32): string {
+  if modKeys.length == 0 { return "" }
+  const m = modOfTok(tok)
+  if m < 0 || m >= modKeys.length { return "" }
+  modKeys[m]
+}
+
+export function csPreMintLocs(): i32 {
+  paramDefaultTablesReset()
+  if !csAnyCallsiteDefault() { return 0 }
+  // Snapshot the length FIRST — minting appends, and the nodes appended are not
+  // themselves calls.
+  const n0 = P.nodes.length
+  let i = 0
+  while i < n0 {
+    const n = P.nodes[i]
+    if n is Call {
+      let ln = 0
+      let co = 0
+      let file = ""
+      // THE CALLEE'S OWN ANCHOR TOKEN — `where` in `where(1)`, `f` in `x.f(1)`
+      // — which is what a reader means by "the call site" and what Swift's
+      // `#line` / Rust's `Location::caller()` report for the same call.
+      //
+      // NOT `tokIndexAt(n.pos)`, and the reason is worth recording: that binary
+      // search assumes `P.toks[i].start` ascends, and in MODULE mode the merged
+      // stream APPENDS each module's tokens with that module's own offsets, so
+      // `start` restarts at every module boundary and the search silently
+      // misses. Measured — every call in a module build fell to the fallback.
+      // `nodeToks` is a per-node index into the merged stream and has no such
+      // assumption.
+      let tk = -1
+      if n.callFn >= 0 && n.callFn < nodeToks.length { tk = nodeToks[n.callFn] }
+      if tk < 0 {
+        if i < nodeToks.length { tk = nodeToks[i] }
+      }
+      if tk >= 0 && tk < P.toks.length {
+        ln = P.toks[tk].line
+        co = P.toks[tk].col + 1
+        file = csFileOfTok(tk)
+      }
+      const fields: i32[] = []
+      fields.push(mkFieldInit("file", mkStr(csStrLexeme(file), -1), -1))
+      fields.push(mkFieldInit("line", mkNum(i32ToStr(ln), -1), -1))
+      fields.push(mkFieldInit("col", mkNum(i32ToStr(co), -1), -1))
+      // The `ObjLit` keeps the CALL's position so a type error on this argument
+      // points at the call the author wrote, not at nowhere.
+      setCallSiteLoc(i, mkObjLit(fields, n.pos))
+    }
+    i = i + 1
+  }
+  0
+}
+
 export function symOccModuleAt(i: i32): i32 {
   const tok = symOccTokAt(i)
   if tok < 0 { return 0 }
@@ -1216,6 +1337,13 @@ export function sigParamNameCharAt(i: i32, j: i32): i32 {
 export function sigParamTypeLen(i: i32): i32 { symSigParamTypeLen(i) }
 export function sigParamTypeCharAt(i: i32, j: i32): i32 {
   symSigParamTypeCharAt(i, j)
+}
+// The parameter's DEFAULT VALUE as source text, zero length when it has none —
+// what makes a defaulted parameter render as `b: i32 = 10` and therefore READ as
+// optional in an editor that has no flag for optionality.
+export function sigParamDefaultLen(i: i32): i32 { symSigParamDefaultLen(i) }
+export function sigParamDefaultCharAt(i: i32, j: i32): i32 {
+  symSigParamDefaultCharAt(i, j)
 }
 export function sigRetLen(): i32 { symSigRetLen() }
 export function sigRetCharAt(j: i32): i32 { symSigRetCharAt(j) }
@@ -2978,6 +3106,7 @@ function modCompile(emit: i32): i32 {
     o3 = o3 + 1
   }
   const merged = mkProgram(allStmts, -1) // synthesized merged-module root (no source token)
+  csPreMintLocs()
   checkProgram(merged)
   // A lossless-recovered graph CHECKS but never BUILDS — same rule as
   // `compileSrc`, and the rc stays 1 so `vl build` behaves exactly as before.
@@ -3411,6 +3540,15 @@ function modRwFunc(ix: i32): i32 {
       if p is Param {
         modShadow.push(p.parName)
         modRwType(p.parType)
+        // A parameter DEFAULT is an expression of the DECLARING module, and a
+        // module-scope `const` default is the only form that carries a name — so
+        // it renames exactly like any other reference to that const (`K` →
+        // `K$mN`). This is what makes "a default's names resolve in the
+        // DECLARATION's scope" true across the merge rather than by luck: the
+        // entry module's own `K` is a different mangled name, so it cannot
+        // capture a dependency's default. (`__callsite__` is undeclared and
+        // renames to itself; a literal has no name to rename.)
+        if p.parDefault >= 0 { modRwExpr(p.parDefault) }
       }
       pi = pi + 1
     }

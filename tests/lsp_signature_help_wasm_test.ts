@@ -406,3 +406,65 @@ Deno.test({
     throw new Error(`want the dep's source names, got ${label}`);
   }
 });
+
+
+Deno.test("signature-help: a DEFAULTED parameter renders its default", () => {
+  // The protocol has no per-parameter "optional" flag, so the rendered default
+  // is how optionality is communicated — and the default sits INSIDE that
+  // parameter's offset pair, so the client highlights `punct: string = "!"`
+  // whole when the cursor is on argument 1. That is what the reader needs: the
+  // value that lands if they stop typing.
+  const { label, parameters } = signatureLabel("greet", {
+    params: [
+      { name: "name", type: "string", dflt: "" },
+      { name: "punct", type: "string", dflt: '"!"' },
+    ],
+    ret: "string",
+  });
+  if (label !== 'greet(name: string, punct: string = "!") => string') {
+    throw new Error(`want the default rendered, got ${JSON.stringify(label)}`);
+  }
+  const slice = (i: number) => label.slice(parameters[i][0], parameters[i][1]);
+  if (slice(1) !== 'punct: string = "!"') {
+    throw new Error(
+      `want the default inside the offsets, got ${JSON.stringify(slice(1))}`,
+    );
+  }
+});
+
+Deno.test({
+  name:
+    "signature-help(wasm): defaults reach the label — literal, module const, and `__callsite__`",
+  ignore,
+}, async () => {
+  // The three forms v1 admits, each rendered as the author wrote it. The module
+  // `const` arm is the one with a trap in it: the merged arena spells it
+  // `SEP$m1` in a multi-module program, so the native side demangles before
+  // handing it over — the same `demangleName` every other user-facing query
+  // takes. Single-file here, where the two spellings coincide.
+  const src = [
+    'const SEP = "-"',
+    'function greet(name: string, punct: string = "!") { name + punct }',
+    "function pad(n: i32, w: i32 = 3, s: string = SEP) { s }",
+    "function at(t: string, c: { file: string, line: i32, col: i32 } = __callsite__) { t + c.file }",
+    "function main() {",
+    '  greet("a")',
+    "  pad(1)",
+    '  at("x")',
+    "}",
+  ].join("\n");
+  const one = await helpAt(src, 5, 9);
+  if (one !== 'greet(name: string, punct: string = "!") => string @name: string') {
+    throw new Error(`want the literal default rendered, got ${one}`);
+  }
+  const two = await helpAt(src, 6, 6);
+  if (two !== "pad(n: i32, w: i32 = 3, s: string = SEP) => string @n: i32") {
+    throw new Error(`want the const default rendered, got ${two}`);
+  }
+  const three = await helpAt(src, 7, 5);
+  const wantThree =
+    "at(t: string, c: {file: string, line: i32, col: i32} = __callsite__) => string @t: string";
+  if (three !== wantThree) {
+    throw new Error(`want the intrinsic rendered, got ${three}`);
+  }
+});

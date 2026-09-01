@@ -1215,9 +1215,11 @@ and needs nothing from vl beyond scalar exports.
   > supported by codegen"). So a container-variance answer is not schedulable as a
   > checker change. **If the brand pattern above covers your case, this row needs no vl
   > work at all — say so if it does not.**
-- ~~**Default/optional params** (B15a): API ergonomics only.~~ **SHIPPED** — `p: T = <literal>`
-  and `p?: T` (sugar for `p: T | null = null`). Direct calls only: a function VALUE keeps its full
-  arity, and UFCS (`o.f(a)`) still matches a `self`-function by exact arity.
+- ~~**Default/optional params** (B15a): API ergonomics only.~~ **SHIPPED, and v1 is now COMPLETE**
+  — `p: T = <literal>`, `p: T = <module-scope const>`, `p: CallerLoc = __callsite__`, and `p?: T`
+  (sugar for `p: T | null = null`). **UFCS takes the same arity range as the plain spelling**
+  (`o.f(a)` and `f(o, a)` are the same call, defaults included); a function VALUE still keeps its
+  full arity, by design, since a value call has no declaration to read a default from.
 - **SIMD over Buffer**: explicitly unlocked by the P0 tier (v128 only
   addresses linear memory — the WasmGC ceiling). Future pathing/hash kernels;
   not requested now. Same for engine-level threads/atomics: webcraft's
