@@ -513,6 +513,52 @@ export const documentHighlightsFromRefs = (
     kind: decl !== undefined && sameLspRange(range, decl) ? "write" : "read",
   }));
 
+// ---- status-bar seed indicator (D9.2) ---------------------------------------
+//
+// The seed ladder is the extension's number-one operational hazard: a stale or
+// missing seed degrades every feature to empty results, which renders exactly
+// like a clean file, and the answer ("which rung won?") used to live only in
+// the output channel. The server forwards `loadWasmChecker`'s origin callback
+// as a `vital/seedOrigin` notification; the extension renders it in one
+// status-bar item per window. This helper is the RENDERING — pure, so the
+// text/tooltip/degraded-state contract is testable without a VS Code host.
+
+/** The `vital/seedOrigin` payload: the winning rung, or null when NO seed loaded. */
+export type SeedOriginInfo = { label: string; detail: string; bytes: number };
+
+/** What the status bar shows. `degraded` → warning background + icon. */
+export type SeedStatusView = { text: string; tooltip: string; degraded: boolean };
+
+/** A byte count → a human size for the tooltip (`1.6 MiB` / `312 KiB`). */
+const humanBytes = (bytes: number): string =>
+  bytes >= 1024 * 1024
+    ? `${(bytes / (1024 * 1024)).toFixed(1)} MiB`
+    : `${Math.max(1, Math.round(bytes / 1024))} KiB`;
+
+/**
+ * Render a seed origin (or its absence) for the status bar. The degraded state
+ * is the one this feature exists for: NO seed means diagnostics, hover,
+ * completion and navigation are all silently empty, so it gets the `$(warning)`
+ * icon and a warning background rather than blending in.
+ */
+export const seedStatusView = (origin: SeedOriginInfo | null): SeedStatusView =>
+  origin === null
+    ? {
+      text: "$(warning) vl: no seed",
+      tooltip: "No VL compiler seed loaded — diagnostics, hover, completion " +
+        "and navigation are disabled. Put `vl` on PATH or set " +
+        "`vital.compilerWasm`; the Vital output channel lists every location " +
+        "tried.",
+      degraded: true,
+    }
+    : {
+      text: `vl: ${origin.label}`,
+      tooltip: `VL compiler seed — ${origin.label}\n${origin.detail} (${
+        humanBytes(origin.bytes)
+      })`,
+      degraded: false,
+    };
+
 // ---- completion (D3) --------------------------------------------------------
 
 /**

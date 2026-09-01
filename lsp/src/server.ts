@@ -48,6 +48,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   loadWasmChecker,
+  type SeedOrigin,
   type SeedSource,
   type WasmChecker,
   type WasmImportedSource,
@@ -1016,6 +1017,38 @@ connection.onCodeAction((params): CodeAction[] => {
 
 documents.listen(connection);
 
+// ---- status-bar seed indicator (D9.2) ---------------------------------------
+//
+// Which seed-ladder rung won is the first question of every "the extension is
+// doing nothing" debugging session, and it used to live only in the output
+// channel. Forward `loadWasmChecker`'s origin callback to the client as a
+// custom notification; `extension.ts` renders it in a status-bar item (see
+// `seedStatusView` in typeFeatures.ts). Payload: `SeedOrigin` (label + detail
+// path/command + byte count), or `null` when NO seed loaded — the degraded
+// state the survey calls out as previously invisible.
+//
+// Timing: the origin callback fires inside `onInitialize` (the ladder resolves
+// synchronously), but a server may not send notifications before the client's
+// `initialized` handshake — so the latest origin is cached and flushed on
+// `onInitialized`. A later re-fire (the winning rung's mtime moved and the
+// lazy reload picked a rung, possibly the same one) sends immediately.
+const SEED_ORIGIN_NOTIFICATION = "vital/seedOrigin";
+let clientInitialized = false;
+let seedOriginKnown = false;
+let lastSeedOrigin: SeedOrigin | undefined;
+const sendSeedOrigin = (): void => {
+  if (!clientInitialized || !seedOriginKnown) return;
+  connection
+    .sendNotification(SEED_ORIGIN_NOTIFICATION, lastSeedOrigin ?? null)
+    .catch((err) => {
+      connection.console.log(`[seed-origin] notify failed: ${err}`);
+    });
+};
+connection.onInitialized(() => {
+  clientInitialized = true;
+  sendSeedOrigin();
+});
+
 connection.onInitialize((params) => {
   workspaceFolder = params.rootUri;
   // The workspace's `std/` dir (for the withStd precedence). No existence
@@ -1098,6 +1131,11 @@ connection.onInitialize((params) => {
     (msg) => connection.console.log(msg),
     getStdDir,
     (origin) => {
+      // Cache + forward the winning rung (or the no-seed state) to the client's
+      // status bar (D9.2) — see SEED_ORIGIN_NOTIFICATION above.
+      lastSeedOrigin = origin;
+      seedOriginKnown = true;
+      sendSeedOrigin();
       // SAY SO WHEN THERE IS NO CHECKER. Every handler returns an empty result
       // without one, which renders identically to a clean file — that is what made
       // the missing-seed case cost a debugging session rather than a glance.

@@ -133,7 +133,7 @@ parameter lists as structured data (only rendered type strings), declaration *bo
 | Terminal links | n/a | — | VS Code already auto-links `path:line:col` in terminals. |
 | Tree views | n/a | — | Test Explorer covers the one tree worth having; a module-graph tree is speculation. |
 | Webviews | n/a | — | The browser playground already exists outside VS Code; no in-editor webview earns its keep. |
-| Status bar | **missing** | Which seed the LSP loaded (path + rung) at a glance | `loadWasmChecker` already knows its origin; surface it via a custom LSP notification + status bar item. The seed-ladder staleness class of bugs (documented at length in `server.ts`) becomes visible instead of a debugging session. |
+| Status bar | **have** | Which seed the LSP loaded (path + rung) at a glance | Shipped (D9.2): `vital/seedOrigin` notification (origin payload or null) → one status-bar item per window; the no-seed state renders with a warning background instead of staying invisible. |
 | Custom editors | n/a | — | No non-text VL artifacts to edit. |
 | Notebook controllers | n/a | — | As above. |
 | Walkthroughs | missing | Onboarding checklist (install `vl`, open a file, run a test) | Pure manifest work; worth one afternoon when the extension is published, not before. |
