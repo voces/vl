@@ -23636,12 +23636,22 @@ Repro (now RUNS, printing `true` then `false`):
   `nullBoxTag()` is `scalarTagOfKind(nullValKind())` = `uVariants.length + 6`, and the working
   hand-written module (no variants declared) compares against a literal `6`. They agree.
 
-* **COPY THE SHAPE THE WORKING FORM ACTUALLY USES.** Disassembled, the hand-written
-  `const v = mk(b); if v != null { return v }; "d"` does NOT use a block with `br_if`. It
-  binds the operand to a LOCAL (`local.set $1`), tests
-  `i32.ne (struct.get $box 0 (local.get $1)) (i32.const 6)`, and `return`s the local from
-  inside an `if`. So the shape that is known to validate is local-based — which brings back
-  the reservation question the re-readable arm was trying to avoid.
+* **THE `if`-SHAPED ARM WAS THEN BUILT TOO, AND ITS BYTES ARE RIGHT — the problem is one
+  layer out.** Copying the hand-written form's branch (`i32.ne` on the tag, then an `if` whose
+  RESULT is the box via `fbIfRef(uBoxIdx)`, value in the then-arm, `emitUnionCoerce`d default
+  in the else-arm) emits exactly what it should. Disassembled, the arm is
+  `(if (result (ref $box)) (i32.ne (struct.get $box 0 (local.get $1)) (i32.const 6)) (then
+  (local.get $1)) (else (struct.new $box …)))` — correct on both branches. And that whole
+  correct expression is then wrapped in ANOTHER `struct.new $box …` by the return path. The
+  consumer RE-BOXES an already-boxed value, and THAT is the type mismatch.
+
+* **SO THE RESIDUE IS THE `??` NODE'S RESULT CLASSIFICATION, not its lowering.** This is
+  precisely the hazard `emit_rewrite`'s `??` header documents: *"every consumer classifier —
+  `exprString`, `exprIsLitAtom`, the print-import chooser, the local-cell ladder — dispatches
+  on the `??` NODE"*, and there it cost 62 silent failures on a 9,126-cell sweep when a
+  lowering changed without them. A `??` that now yields a union BOX has to be visible as such
+  to every consumer that asks what the node produces; until it is, the emit arm is correct
+  bytes in the wrong envelope. That is the work, and it is bigger than the arm.
 
 * **AND THE TEMP LOCAL IS NOT FREE, which makes it TWO sites rather than one.** This emitter
   does not mint locals on demand: a scratch slot is RESERVED ahead of emission by
