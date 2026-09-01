@@ -111,7 +111,7 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   (dispatch is rewritten before monomorphization, so a closure-field witness loses to a
   same-named `self`-function), D1004/D1005 (the unbounded halves), and LSP bound-member
   completion/hover on `x: T`.
-- **Track-caller — DONE 2026-09-01 (#TBD).** Both halves have shipped. The std side is
+- **Track-caller — DONE 2026-09-01 (#2235).** Both halves have shipped. The std side is
   three things and no compiler change: `export type CallerLoc = { file: string, line: i32,
   col: i32 }` in `std:test`, `expect<T>(value: T, caller: CallerLoc = __callsite__)`, and a
   second line on the failure message reading `  at <file>:<line>:<col>`. The editor payoff is
@@ -202,7 +202,7 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   complete — see B15a — including the `__callsite__` intrinsic itself, typed structurally
   against `{ file: string, line: i32, col: i32 }` so a std `type CallerLoc = { file: string,
   line: i32, col: i32 }` satisfies it with NO compiler change. **THE STD SIDE HAS SINCE
-  SHIPPED TOO — see the DONE row at the top of this group (#TBD)**; what this paragraph
+  SHIPPED TOO — see the DONE row at the top of this group (#2235)**; what this paragraph
   described as remaining is done, and the editor anchor with it. Two facts the defaults
   landing measured that the follow-up inherited, both confirmed by it: the location's `file`
   is the CALLER's module KEY (`""` for a single-source compile with no module table — a
@@ -799,7 +799,7 @@ in-language GC knobs.
   + configurable globs; files parallel by default / in-file serial, opt-in fresh-instance
   `it.concurrent`; per-test capture, failure-first reporting). **v1 lands BEFORE the std expansion,
   not with std-design slice 4** — the charter's sequencing is superseded (see the promotion note under
-  Next); chartered follow-ups: ~~compiler-injected call sites~~ **DONE — track-caller (#TBD),
+  Next); chartered follow-ups: ~~compiler-injected call sites~~ **DONE — track-caller (#2235),
   through default arguments rather than an attribute, and `expect`-only**; ~~generic
   `expect<T>`~~ **DONE (#2104)** + structural diffs, power-`assert` rewriting. New behavioral tests switch to `*.test.vl` at v1 (directive-corpus
   growth stops; conversion waits for the TS-tier teardown).
@@ -1977,7 +1977,7 @@ seed from current `compiler/*.vl` in ~40s.*
      and param-name inlay hints at call sites are now unblocked by the same family
   11. ⬜ Doc-comment-aware hover/completion (needs the one native doc-text export;
      the D7 linkifier host side already exists)
-  12. ✅ Test-failure anchor — #TBD — **SUPERSEDED BY THE REAL FIX, and the cheap half was
+  12. ✅ Test-failure anchor — #2235 — **SUPERSEDED BY THE REAL FIX, and the cheap half was
      never built.** The queued heuristic was: when a test body holds exactly ONE
      `expect(...)`, anchor the failure TestMessage at that call instead of the `it(...)`
      line, with multiple expects keeping today's anchor. Track-caller landed first, so the
