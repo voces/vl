@@ -332,6 +332,7 @@ import {
   annRlSlot,
   anonLeafEmitPhase,
   anonLeafJoined,
+  anonLeafParamMoved,
   anonLeafRetMoved,
   anonLeafSupersede,
   arrLitCommitName,
@@ -4542,7 +4543,9 @@ export function captureValStructIdx(fe: i32, name: string) {
   const b = parentBindingOf(fe, name)
   if b < 0 { return -1 }
   const bn = P.nodes[b]
-  if bn is Param { return annValtypeSlotOf(bn.parType) }
+  // D891 — a CAPTURED parameter whose slot the `??` merge moved reads its env field at the
+  // merged row too. The third resolver of the same owner; see `anonLeafParamRowOf`.
+  if bn is Param { return anonLeafParamRowOf(b, annValtypeSlotOf(bn.parType)) }
   if bn is LetDecl {
     if bn.letType >= 0 { return annValtypeSlotOf(bn.letType) }
     if bn.letInit >= 0 {
@@ -18029,8 +18032,30 @@ export function vtKindOfParam(paramIx: i32): VKind {
 // param-shaped question; every kind-to-table pairing lives in the one home.
 export function paramStructIdxOf(paramIx: i32) {
   const p = P.nodes[paramIx]
-  if p is Param { return annValtypeSlotOf(p.parType) }
+  if p is Param {
+    return anonLeafParamRowOf(paramIx, annValtypeSlotOf(p.parType))
+  }
   -1
+}
+
+// D891 — THE ROW A `??`-MOVED PARAMETER'S SLOT SELECTS, once the mint is over. The SEVENTH
+// owner of the merged row, and the only one that reads an ANNOTATION rather than a value:
+// `annValtypeSlotOf` resolves `p: {r: i32}` to the narrow field-set row no matter what the
+// `??` did with the value that reaches it.
+//
+// GATED ON THE PARAM NODE'S OWN MARK, never on the row. `anonLeafSupersedeOf` is keyed by
+// struct-table row and a merge's narrow row is a FIELD-SET row, so an ungated redirect here
+// would move every same-shaped parameter in the program — `anonLeafRetMoved`'s witness one
+// position over. `anonLeafJoinCallee` marks exactly the params whose call-site arguments the
+// reader actually made members. Applied outside every memo and behind the phase flag, for
+// `anonLeafJoinRowOf`'s reason: `collectAnonShapes` needs the pre-merge answer.
+export function anonLeafParamRowOf(paramIx: i32, si: i32): i32 {
+  if !anonLeafEmitPhase { return si }
+  if si < 0 { return si }
+  if paramIx < 0 { return si }
+  if paramIx >= anonLeafParamMoved.length { return si }
+  if anonLeafParamMoved[paramIx] != 1 { return si }
+  anonLeafSupersedeOf(si)
 }
 
 // THE ONE HOME for "which interned table slot does this type ANNOTATION's `fbValtype`
@@ -27129,7 +27154,27 @@ export function letObjLitVariantIdx(letIx: i32) {
 
 // The struct table index of the param `name` of function `fnIx` (from its annotation),
 // or -1.
+//
+// D891 — THE SAME SEVENTH OWNER, ASKED AT AN EXPRESSION POSITION. `structIndexOfExpr`'s `Ident`
+// arm resolves a parameter's own layout through the ladder below, NOT through
+// `paramStructIdxOf` — so a param whose slot the merge moved kept the narrow row for every
+// `p.field` read INSIDE the callee while its functype said otherwise, and the module did not
+// even PARSE (`d891_param_read_inside`; binaryen: `invalid type on stack`). One owner, two
+// resolvers: the redirect goes on both or the two disagree by construction.
 function paramStructIndex(fnIx: i32, name: string) {
+  // THE `fnIx < 0` GUARD IS FIRST AND IT IS LOAD-BEARING: at module scope there is no enclosing
+  // function and `fnParamNodeOf` indexes `P.nodes[-1]` — a COMPILER trap (`out of bounds array
+  // access`), measured on `d891_module_scope` the moment the wrapper went in ungated. The raw
+  // body below opens with the same guard, for the same reason.
+  if fnIx < 0 { return -1 }
+  return anonLeafParamRowOf(
+    fnParamNodeOf(fnIx, name),
+    paramStructIndexRaw(fnIx, name),
+  )
+}
+
+// The un-redirected answer: the annotation's own row, through the three-rung ladder below.
+function paramStructIndexRaw(fnIx: i32, name: string) {
   if fnIx < 0 {
     return -1 // module-scope initializer (no enclosing function)
   }
