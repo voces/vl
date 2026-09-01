@@ -23593,6 +23593,50 @@ Repro (now RUNS, printing `true` then `false`):
     // vl check rc 0; runs, prints true then false.
 
 ---
+### D960 — `??` over a nullable VALUE-UNION box: the manual expansion of the same program RUNS, so this is sugar over a lowering that already exists
+
+**loud emit reject conceding capability — `emitProgram: `??` over this nullable value is not supported yet — narrow it first` — after `vl check` returns 0, so a clause-2 violation by construction · ZERO corpus cells; `scripts/capability-probes/coalesce-over-nullable-union.vl` is the measurement · TWO ROUTES WERE INVESTIGATED AND BOTH ARE DEAD ENDS — recorded so the next attempt starts past them**
+
+`mk() ?? "d"` where `mk` returns `string | i32 | null` refuses. Write the same thing by hand —
+`const v = mk(b)` / `if v != null { return v }` / `"d"` — and it RUNS and prints `d`.
+
+* **EVERY PIECE THE SUGAR NEEDS ALREADY WORKS, measured one at a time.** `v == null` over this
+  rep runs and answers correctly. `if v != null { … }` narrows and the narrowed value is
+  usable. The default `"d"` boxes into the union and the function returns `string | i32`
+  cleanly. So the capability is not missing — only the `??` dispatch does not reach it.
+
+* **DEAD END 1 — `emitCoalesceNulRef` does not apply.** It lowers with `br_on_non_null`, which
+  needs a nullable REF. Disassembled, this rep's null is a TAG: the box is
+  `(struct (field i32) (field anyref))` and `v == null` compiles to
+  `i32.eq (struct.get $box 0) <nullTag>`. There is no `ref.null` to branch on.
+
+* **DEAD END 2 — IT CANNOT BE A REWRITE, and the reason is one-evaluation.** The `??` rewrite
+  layer already folds the non-nullable case, and its header explains at length why a rewrite
+  beats an emit arm there (consumers dispatch on the `??` NODE; an emit-only identity produced
+  right bytes and wrong type, measured at 62 silent failures on a 9,126-cell sweep). That
+  argument does NOT carry here: desugaring `a ?? d` into `if a != null { a } else { d }`
+  evaluates `a` TWICE, and the existing lowerings all go to trouble to evaluate the left
+  operand once. A rewrite would need to introduce a temp binding, which an expression rewrite
+  at that layer cannot do.
+
+* **SO THE SHAPE OF THE FIX IS NAMED: an emit arm with a TEMP LOCAL.** Evaluate the left
+  operand once into a local, `i32.eq` its tag against the null tag, and select — the block's
+  type being the box, so the default arm has to box through `emitUnionCoerce` exactly as the
+  hand-written `return "d"` already does. That is new emit bytes rather than a redirect, which
+  is why it is filed rather than attempted at the end of a long session: this area has already
+  produced three measured regressions today (D955's 15 lost classes, D957's two).
+
+Repro (check rc 0; the EMITTER refuses):
+
+    function mk(b: boolean): string | i32 | null {
+      if b { return "s" }
+      null
+    }
+    print(mk(false) ?? "d")
+    // vl check rc 0; vl run -> emitProgram: `??` over this nullable value is not supported yet
+    // SHOULD PRINT d. The hand-written if/else over the same value prints d today.
+
+---
 
 ### D791 — [CLOSED 2026-08-31] READ-ONLY COVARIANCE is lowered by an element-CONVERTING COPY, licensed by a whole-program write scan — D661B's refusal was about the WRITABLE side only
 
