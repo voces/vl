@@ -540,7 +540,7 @@ same stale "Mirrors the Rust host's module gate" comment); A3's keyword split
 `const match = 1` refuses and `const new = 1` prints `1`); A8's absence of any test naming
 either token function.
 
-**A1 and A3 are CLOSED as of 2026-09-01 (#TBD)** — their rows below carry the detail and the
+**A1 and A3 are CLOSED as of 2026-09-01 (#2219)** — their rows below carry the detail and the
 guards. The measurements in this section describe the tree as of the audit and are kept as
 filed; read a row's own CLOSED note before quoting its numbers. Two corrections the fixes
 owe this file: A3's "over-claims `new`" was wrong (`new` is a real CONTEXTUAL keyword and the
@@ -550,9 +550,9 @@ the parser rather than the lists. A1's "two TS copies may live in different bund
 a real obstacle: `lsp/src/wasmChecker.ts` already serves both the LSP and the playground.
 
 **A1 · The module-arming gate — 4 implementations in 3 languages, 2 missing the `export {`
-arm. REACHED, and user-visible in the editor. — CLOSED (#TBD).**
+arm. REACHED, and user-visible in the editor. — CLOSED (#2219).**
 
-> **CLOSED 2026-09-01 (#TBD).** The two TS copies are now ONE leaf module,
+> **CLOSED 2026-09-01 (#2219).** The two TS copies are now ONE leaf module,
 > `compiler/moduleGate.ts` (zero imports), imported by `lsp/src/wasmChecker.ts` — which
 > serves the VS Code LSP *and* the browser playground, so the "different bundles" worry was
 > not one — and by `tests/cases_wasm_test.ts`. The VL and Rust copies cannot import
@@ -616,9 +616,9 @@ re-spelling of `valueAtomKind`'s `arrElemNameRaw` cascade; one shared
 `elemNameToAtomCode(elemName)` retires both.
 
 **A3 · The keyword vocabulary — 5 independently maintained lists, and a live LSP rename
-bug. REACHED. — CLOSED (#TBD).**
+bug. REACHED. — CLOSED (#2219).**
 
-> **CLOSED 2026-09-01 (#TBD).** All five lists now reconcile against sets DERIVED from the
+> **CLOSED 2026-09-01 (#2219).** All five lists now reconcile against sets DERIVED from the
 > compiler by `tests/keyword_vocabulary_test.ts`: **19 hard** from `lexer.vl`'s `keywordKind`
 > (its `return "KIND"` arms, with each derived spelling required to be evidenced in the same
 > body, so the "TokKind is the spelling uppercased" convention is enforced rather than
@@ -733,7 +733,7 @@ live statement-position construct. Correctly shared by `parseImport` and `modSca
    twin's silence is typed differently from its answers — that convention is already in the
    tree twice and it is what makes the arena/name split safe.
 2. ~~**Export the lexer's keyword vocabulary across the wasm ABI.**~~ **A3's bug is CLOSED
-   (#TBD) and this candidate is DOWNGRADED, not taken.** The five lists reconcile under a
+   (#2219) and this candidate is DOWNGRADED, not taken.** The five lists reconcile under a
    pure derivation guard (`tests/keyword_vocabulary_test.ts`) instead. The reason the ABI
    move is not the answer here, and `printDomainStr`'s was: **two of the four consumers
    cannot call the seed.** The TextMate grammar is JSON the editor reads before any server
@@ -742,7 +742,7 @@ live statement-position construct. Correctly shared by `parseImport` and `modSca
    and once it exists it covers all five for the cost of one file. The ABI export is still
    the better end state for the LSP's lists (derived beats checked) and is now a cleanup, not
    a bug fix.
-3. ~~**One module-arming predicate, exported from the seed.**~~ **A1 is CLOSED (#TBD) by the
+3. ~~**One module-arming predicate, exported from the seed.**~~ **A1 is CLOSED (#2219) by the
    audit's own second option** — one shared TS helper (`compiler/moduleGate.ts`) that the LSP,
    the playground and the corpus oracle import — plus a source-extraction guard over the VL
    and Rust copies. The seed-ABI variant stays unbuilt and probably should: the gate must
