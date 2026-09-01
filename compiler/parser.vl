@@ -197,6 +197,46 @@ function isSyncKind(k: TokKind) {
   k == "NEWLINE" || k == "SEMI" || k == "RBRACE" || k == "EOF"
 }
 
+// Whether the token kind plausibly STARTS a statement. The mirror image of
+// `isSyncKind`: those are the points a mis-parse recovers AT, these are the
+// tokens a recovery can resume FROM — the gate on `parseBracedBody`'s unbraced-
+// body recovery below. Membership is the union of `isStmtKeyword` and the
+// leading tokens of `parsePrimary` / `parseUnary`, minus two deliberate
+// exclusions:
+//   • `{` — a braced body is the ORDINARY path, so it never reaches the gate;
+//   • `else` — an `if` whose then-branch is missing outright (`if c else { … }`)
+//     is not an unbraced body, and gets the plain `expected `{`` diagnostic.
+// Everything else a body position can face — `)`, `,`, `=`, `await`, a NEWLINE,
+// EOF — is not a statement start, so `if c }` and a truncated `if c` keep the
+// existing behaviour instead of inventing an arm out of a closer.
+//
+// THREE MEMBERS ARE UNREACHABLE FROM A BODY POSITION and are still listed,
+// because the predicate answers about STATEMENTS, not about this one caller.
+// Measured over one `if` body per member: `(`, `[` and `-` never arrive, since
+// the CONDITION's expression parse has already consumed them as a call, an
+// index and a subtraction (`if c (x)` is `c(x)`, `if c -x` is `c - x`). There
+// is no unbraced body to recover there — the tokens belong to the condition —
+// so the gate is simply never asked. Dropping them would encode one caller's
+// precedence accident into a general predicate.
+function startsStmt(k: TokKind) {
+  if isStmtKeyword(k) { return true }
+  k == "IDENT" ||
+    k == "NUMBER" ||
+    k == "STRING" ||
+    k == "CHAR" ||
+    k == "TRUE" ||
+    k == "FALSE" ||
+    k == "NULL" ||
+    k == "MATCH" ||
+    k == "LPAREN" ||
+    k == "LBRACK" ||
+    k == "BANG" ||
+    k == "MINUS" ||
+    k == "TILDE" ||
+    k == "PLUSPLUS" ||
+    k == "MINUSMINUS"
+}
+
 // The kind TAG as text — the ONE place a `TokKind` atom is turned back into its
 // spelling. Every renderer goes through here so the atom→string materialisation
 // (a chain over the whole 68-member vocabulary) is emitted ONCE, in a function
@@ -2167,6 +2207,43 @@ function parseFuncHead(requireName: boolean) {
 
 function parseFunc() { parseFuncHead(true) }
 
+// The recovered arm: exactly ONE statement, wrapped in a SYNTHESIZED Block
+// (`-1` = no `{` source token). Every consumer downstream — the checker, the
+// printer, the LSP — then sees the shape the BRACED form would have produced,
+// so nothing past the parser needs to know a body was recovered. Also the
+// `else <stmt>` sugar's wrapper, which is the same construction.
+function oneStmtBlock(): i32 {
+  const one: i32[] = []
+  one.push(parseStmt())
+  mkBlock(one, -1)
+}
+
+// A body that REQUIRES braces (`if` / `while` / `for` — `else` is the one arm
+// where a bare statement is legal, and it does not come through here), with
+// BOUNDED recovery for the unbraced form.
+//
+// Without it a single missing brace CASCADES: `expect("LBRACE")` diagnoses and
+// leaves the cursor put, `parseBlock` then swallows the rest of the file as the
+// body, and its `expectClose` reports a second, phantom `expected `}` but found
+// end of input`. One mistake, two diagnostics, and the second one names a
+// position the user never wrote. So when the offending token plausibly STARTS a
+// statement, take it as the body: emit ONE diagnostic anchored on that token
+// (`msg` names the construct and shows the braced spelling, the shape the
+// `then`-removal refusal uses) and parse exactly one statement as the arm. The
+// recovery is bounded by `parseStmt` itself — one statement, never a scan — so
+// a real error further down the file still surfaces from its own position.
+//
+// The gate is `startsStmt`, so a closer or a truncated construct is NOT
+// recovered: `if c }` and `if c` at end of input keep the plain `expected `{``
+// diagnostic, where inventing an arm would be a guess rather than a reading.
+function parseBracedBody(msg: string): i32 {
+  if peekKind() != "LBRACE" && startsStmt(peekKind()) {
+    P.diags.push({ msg: msg, at: P.pos })
+    return oneStmtBlock()
+  }
+  parseBlock()
+}
+
 // `"if" expr block ("else" (ifStmt | block | stmt))?`
 // Serves statement AND expression position (the host's `parseIf` is reached from
 // `parsePrimary`); a non-block else branch wraps in a one-statement Block so
@@ -2188,12 +2265,10 @@ function parseIf() {
         at: P.pos,
       },
     )
-    advance()                // the stranded "then"
-    const one: i32[] = []
-    one.push(parseStmt())
-    thenB = mkBlock(one, -1) // recovery: the old one-stmt wrapper
+    advance()              // the stranded "then"
+    thenB = oneStmtBlock() // recovery: the old one-stmt wrapper
   } else {
-    thenB = parseBlock()
+    thenB = parseBracedBody("an `if` body requires braces: `if cond { … }`")
   }
   let els = -1
   // The `else` may sit on a new line after the then-block's `}` (`}` NEWLINE
@@ -2229,10 +2304,9 @@ function parseIf() {
       els = parseBlock()
     } else {
       // `else <stmt>` — the single-statement form (`if b { 5 } else 6`); the
-      // one statement (host: `parseStatement`) wraps as the else-block.
-      const eone: i32[] = []
-      eone.push(parseStmt())
-      els = mkBlock(eone, -1) // synthesized one-stmt wrapper (no `{`)
+      // one statement (host: `parseStatement`) wraps as the else-block. LEGAL,
+      // not a recovery: no diagnostic, unlike the required-brace bodies above.
+      els = oneStmtBlock()
     }
   }
   mkIf(cond, thenB, els, p0)
@@ -2417,7 +2491,9 @@ function parseWhile(label: string) {
   const p0 = peekTok().start // the `while` keyword
   advance()                  // "while"
   const cond = parseExpr()
-  const body = parseBlock()
+  const body = parseBracedBody(
+    "a `while` body requires braces: `while cond { … }`",
+  )
   mkWhile(cond, body, label, p0)
 }
 
@@ -2452,12 +2528,16 @@ function parseFor(label: string) {
       advance() // "step"
       step = parseExpr()
     }
-    const rbody = parseBlock()
+    const rbody = parseBracedBody(
+      "a `for` body requires braces: `for v in … { … }`",
+    )
     const frix = mkForRange(v, first, to, step, rbody, label, p0)
     mkDeclNameTok(frix, vTok)
     return frix
   }
-  const ibody = parseBlock()
+  const ibody = parseBracedBody(
+    "a `for` body requires braces: `for v in … { … }`",
+  )
   const fiix = mkForIn(v, first, ibody, label, p0)
   mkDeclNameTok(fiix, vTok)
   fiix

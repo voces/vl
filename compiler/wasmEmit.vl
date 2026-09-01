@@ -50,6 +50,7 @@ import {
   tyLitMemberTexts,
   tyLitUnionAliasIx,
   tyNumLitMemberTexts,
+  tyPrimNameOf,
   tyRenderSoftensLits,
   tySame,
   tyToEmitName,
@@ -2789,6 +2790,99 @@ function litMembershipRecvOk(recvIx: i32, fnIx: i32) {
   exprNullableString(recvIx, fnIx)
 }
 
+// ── D950: a nullable NICHE's `is` is a NULL TEST, and only the niche's own member may ask it
+//
+// Both niche arms of `emitIs` lower `recv is X` to the receiver's null test, on the premise
+// their headers state — "the checker already proved the tested shape is the sole non-null
+// member". THAT PREMISE DOES NOT SURVIVE MONOMORPHIZATION. At the declaration the receiver is
+// `T`, so the checker must accept `v is boolean` beside `v is string`; only the INSTANCE makes
+// one of them impossible, and the instance is not a thing the checker ever saw. So at
+// `T = string | null` all three of `v is boolean`, `v is f64` and `v is string` disassembled to
+// the identical `(i32.eqz (ref.is_null (local.get $0)))` — three mutually exclusive tests
+// answering TRUE on one non-null value, which is not a wrong predicate but no predicate.
+//
+// The two functions below restore the premise as a CHECKED precondition rather than an assumed
+// one: the null test is emitted only where the tested type still can be the niche's member, and
+// every other tested type folds to `i32.const 0`, which D932's `emittedCondConst` then prunes
+// the dead arm on — the reason a folded guard cannot miscompile the body it guards.
+
+// The PRIMITIVE the tested type of an `is` denotes, when it denotes one of the six VALUE
+// primitives; "" for everything else — a struct shape, a list, a map, a closure, a literal, a
+// union, and the four non-value spellings (`null` / `void` / `never` / `u8`), none of which a
+// niche member can be confused with and one of which (`null`) is the niche test itself. `ity`
+// is the type the CHECKER banked at the `is` node (`isVarTyIxOf`), so no spelling is re-parsed.
+//
+// The call is repeated per arm rather than bound once on purpose: `tyPrimNameOf` returns a
+// `PrimName | null`, and `<call> == "<atom>"` is `tyIsPrimNamed`'s own idiom — the shape the
+// arena side already proves out — while a bound nullable-litunion local would be a new rep
+// question asked inside the very ladder this change is repairing. Six arena reads, one branch
+// each.
+function isTestValuePrimName(ity: i32) {
+  if ity < 0 { return "" }
+  if tyPrimNameOf(ity) == "i32" { return "i32" }
+  if tyPrimNameOf(ity) == "i64" { return "i64" }
+  if tyPrimNameOf(ity) == "f32" { return "f32" }
+  if tyPrimNameOf(ity) == "f64" { return "f64" }
+  if tyPrimNameOf(ity) == "boolean" { return "boolean" }
+  if tyPrimNameOf(ity) == "string" { return "string" }
+  ""
+}
+
+// The rep CLASS of the sole non-null member of the nullable niche `recvIx` reps as IN THIS
+// INSTANCE: "boolean" / "string" for the two niches whose member is a primitive, "#ref" for
+// every niche whose member is a reference shape (a struct, a union variant, a map, a closure, a
+// list, a distinct-backing scalar list, a ref array), and "" for a receiver the `is` niche
+// ladder does not claim at all.
+//
+// THE ARMS ARE `emitNulIsNullTest`'S OWN, in its order minus the two that `nicheOnly` drops (a
+// value-union BOX and an optional chain carry several non-null members, so "not null"
+// identifies none of them) and the litunion `emitIs`'s own `nulOk` excludes. A class claimed
+// here that the ladder does not claim would fold a guard the ladder then emits as a runtime
+// test — so this list and that one are one list, and adding a rep to either means adding it to
+// both.
+//
+// AND IT IS THE EMITTER'S REP CLASSIFIERS, NOT A NAME. `monoArgTyName` names a nullable value
+// by its NON-NULL base through a cascade that is not scoped to a mono instance, and a fourth
+// attempt at this defect keyed on it: `tests/cases/soundness/narrowing-is-null-sound.vl` and
+// `tests/cases/types/nullable.vl` both broke, because it folded a legitimate non-generic test
+// to false. These classifiers are `fnIx`-scoped, so they answer per INSTANCE — the property the
+// name cascade does not have — and the tested-type side above declines every spelling those two
+// canaries use (`is null`, `is { x: i32 }`) before a receiver is even looked at.
+//
+// The two PRIMITIVE niches are asked ahead of the ref group deliberately: a receiver both
+// groups would claim is answered by the narrower name, which can only make the mismatch test
+// below stricter than the ref answer would.
+function nulNicheBaseClass(recvIx: i32, fnIx: i32) {
+  if exprNulBool(recvIx, fnIx) { return "boolean" }
+  if exprNullableString(recvIx, fnIx) { return "string" }
+  if (
+    exprNullableRefNiche(recvIx, fnIx) ||
+    exprNullableMap(recvIx, fnIx) ||
+    exprNulClosure(recvIx, fnIx) ||
+    exprNullableList(recvIx, fnIx) ||
+    exprNulScalarListKind(recvIx, fnIx) != null ||
+    exprNullableRefArray(recvIx, fnIx)
+  ) {
+    return "#ref"
+  }
+  ""
+}
+
+// True when the tested type `ity` provably CANNOT be the sole non-null member of the nullable
+// niche `recvIx` reps as — so `recv is <ity>` is statically FALSE, and the niche's null test
+// would answer TRUE for every present value of a type it was never about.
+//
+// ONE-SIDED BY CONSTRUCTION: both halves have to be positively known before anything is
+// decided, so a tested type this does not recognise and a receiver whose rep it cannot name
+// both leave the ladder exactly as it was.
+function nulNicheIsTestImpossible(recvIx: i32, ity: i32, fnIx: i32) {
+  const pTest = isTestValuePrimName(ity)
+  if pTest == "" { return false }
+  const base = nulNicheBaseClass(recvIx, fnIx)
+  if base == "" { return false }
+  base != pTest
+}
+
 // Lower a type guard `recv is Variant` onto `body` as the box-tag compare (mirroring
 // `toWasm.ts`): evaluate the receiver (a union box), `struct.get $box 0` (the tag), then
 // `i32.const tagOf(Variant)` and `i32.eq` — leaving a 0/1 i32 (an `if` condition).
@@ -2803,6 +2897,12 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
   const nd0 = P.nodes[isIx]
   if nd0 is IsExpr {
     if exprNullableRefNiche(nd0.isObj, fnIx) {
+      // D950 — the arm's premise, CHECKED. A `Circle | null` instance of `g<T>(v: T)` reaches
+      // here for `v is boolean` too, and its member is no primitive at all.
+      if nulNicheIsTestImpossible(nd0.isObj, isVarTyIxOf(isIx), fnIx) {
+        fbI32Const(0)
+        return 0
+      }
       const nst = emitNulIsNullTest(
         body,
         nd0.isObj,
@@ -3283,6 +3383,14 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
       if tyIsLitUnion(isVarTyIxOf(isIx)) { nulOk = false }
     }
     if nulOk {
+      // D950 — the same premise, checked for the reps this arm claims: the `string | null` ref
+      // niche and the `boolean | null` sentinel. At `T = string | null` this is the line that
+      // turns `v is boolean` and `v is f64` from the receiver's non-null test into the constant
+      // FALSE they are, leaving `v is string` the one arm that still asks the null question.
+      if nulNicheIsTestImpossible(nd0.isObj, isVarTyIxOf(isIx), fnIx) {
+        fbI32Const(0)
+        return 0
+      }
       const nt = emitNulIsNullTest(
         body,
         nd0.isObj,
