@@ -23806,6 +23806,50 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   invalid wasm.
 
 ---
+### D984 — a self-referential MAP arm with no `null` traps the COMPILER at the declaration alone
+
+**compiler trap · found by vl-b7's serde grid, reproduced here · clause 1 (the trap is the compiler's, not the program's)**
+
+    type T = string | {[string]: T}
+    print("ok")
+
+* **THE DECLARATION IS THE WHOLE WITNESS.** No `is`, no binding, no value of type `T`. Adding
+  `print("ok")` only gives the module a statement to emit.
+
+* **A `null` ARM MASKS IT** — `type T = string | null | {[string]: T}` runs and prints `ok`.
+  That is why the owner's `Json` spelling never showed this one, and why it must be graded
+  separately from [D982](#d982): the two defects have OPPOSITE null polarity, so a witness
+  carrying `null` cannot see this and a witness without it cannot see D982.
+
+* **DIRECT self-reference is required.** Mutual recursion runs: `type A = string | {[string]: B}`
+  with `type B = string | A[]` prints `ok`. The key type is irrelevant (`{[i32]: T}` traps).
+  The array arm is scenery — `string | {[string]: J}` traps exactly as `string | J[] | {[string]: J}`
+  does.
+
+* **THE OUTCOME CLASS DIFFERS BY SEED VINTAGE**, so grade on the trap, not its text: here it
+  surfaces as `0: <unknown>!<wasm function 4121>`; on vl-b7's seed as `wasm trap: call stack
+  exhausted` with the backtrace looping compiler frames 1823/1799/2400. Both are unbounded
+  recursion in the emitter.
+
+### D983 — `return [1, 2, 3]` from a function annotated `u8[] | null` is check-clean invalid wasm
+
+**check-clean invalid wasm · found by vl-b7's serde grid, reproduced here · clause 1**
+
+    function g(): u8[] | null {
+      return [1, 2, 3]
+    }
+    const r = g()
+    if r is u8[] { print(r[0]) }
+
+* `vl check` reports `Checked 1 file, no errors.` and the build fails at
+  `wasm[0]::function[4]::g`.
+
+* **A D979-ADJACENT SPELLING ITS CLOSE MISSED.** D979 covered the tail-return of a nullable
+  `u8[]`; this is the same annotation reached by an ARRAY LITERAL return, which the fix's
+  fixture never wrote. The general lesson is already filed — a fixture that annotates every
+  destination cannot see the missing-annotation defect — and this is its sibling: a fixture
+  that returns a NAMED value cannot see the literal-return defect.
+
 ### D982 — a JSON value tree: `is` against a SELF-REFERENTIAL array arm is refused, and only when the union also has a `null` arm
 
 **loud check reject · owner-scheduled (a JSON value tree is the shape serde Stage 1 hangs on) · clause 2**
@@ -23837,26 +23881,36 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   So neither self-reference alone nor a `null` arm alone is enough — `type R = string | R[]`
   with `if r is R[]` runs today. It takes both.
 
-* **THE TWO SPELLINGS ARE DIFFERENT `Ty` ROWS, and `assignable` fails BOTH directions.** A
-  probe on the guard in `checkIsExprNode` prints `assignable=no widenNotVariant=no chk=(string
-  | J[] | null)[] base=string | J[]`, and per-arm: arm 1 is `J[]` at row 41 while `chkTy` is
-  row 49. The `is` spelling mints an EXPANDED element (`string | J[] | null`) where the
-  declaration's arm holds the alias. `nameToTy` is not hash-consed — the same observation
-  `synthParamAnnots` records for its own site — so the two spellings never land on one row.
+* **MECHANISM, PROVEN — AND THE FIRST FILING OF THIS ROW HAD IT WRONG.** That version said
+  the `is` spelling mints a fresh row while the arm holds the alias, and named row identity
+  as the cause. Row identity is NOT the difference: in the WORKING spelling the `is` row is
+  fresh too. Probing element rows (indices only) shows the real split:
 
-* **`assignable` ALREADY HAS A COINDUCTIVE GUARD**, so "recursion is unhandled" is the wrong
-  reading: it pushes each `(src, dst)` pair and returns true on a repeat. The guard does not
-  fire here because the pair differs at every level — one side keeps unrolling.
+  | | chk element | arm element |
+  | --- | --- | --- |
+  | `boolean \| string \| J[]` (runs) | row 40, `TyUnion` | row 40, `TyUnion` — **same row** |
+  | `null \| string \| J[]` (refused) | row 43, **`TyNullable`** | row 40, `TyUnion` |
 
-* **OPEN: why the `null` arm specifically flips it.** With no `null` the outer type is a
-  `TyUnion` and `is J[]` appears to reach the arm's own row (`src == dst` short-circuits);
-  with `null` it is a `TyNullable`, `checkIsExprNode` strips to `ot.nInner`, and the re-resolved
-  `J[]` is a fresh expansion. That is the reading the rows above fit, and it is NOT yet proven
-  — prove it before fixing it.
+  With a `null` arm, re-resolving `J` at the `is` site normalises it to a `TyNullable`, while
+  the declaration's array arm holds a one-member `TyUnion` **whose single member is that very
+  row 43**. Arrays compare covariantly through `assignable(sTail.aElem, d.aElem)`, so the
+  question asked is `assignable(TyNullable 43, TyUnion 40)` — and `assignableGo` answers it
+  with `if s is TyNullable { return false }`, which sits ABOVE the `d is TyUnion` arm that
+  would have found row 43 in the member list. **A nullable source is never offered the
+  destination union's arms.** That is the whole defect.
 
-  **Careful with the probe**: `tyToStr` on the recursive ELEMENT does not terminate. A probe
-  that renders `aElem` hangs the compiler build; print row INDICES for elements, names only for
-  whole arms.
+* **THE ONE-LINE CHECKER FIX WORKS AND MUST NOT SHIP ALONE.** Letting a `TyNullable` source
+  try the destination union's members makes `vl check` accept the witness — and emit then
+  refuses it with `emitProgram: `is` names a type that is not a union variant`. That is a
+  clause-2 violation replacing a clause-2 violation, and it is exactly the order CLAUDE.md
+  forbids: **build the lowering, wire every delivery, THEN narrow the gate.** The variant
+  table has no interned arm for the self-referential container spelling; that is the half
+  still to build. Reverted rather than merged.
+
+* **THE SCOPE IS A SELF-REFERENTIAL CONTAINER ARM, NOT AN ARRAY ARM** (28-cell factorial grid
+  over null × array-arm × map-arm × test, run by vl-b7's serde agent and spot-checked here).
+  With `null`, the MAP arm reproduces this row's pattern identically. Grade any fix on both
+  container kinds, not just `J[]`.
 
 * **A SECOND, SEPARATE DEFECT SITS BEHIND IT.** `string | J[] | {[string]: J}` — array arm and
   map arm together, no `null` — passes `check` and then fails at run with
