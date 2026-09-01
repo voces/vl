@@ -23995,13 +23995,30 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   array-interposition row is the most useful of these: whatever recurses descends map values
   and does NOT descend array elements.
 
-* **SEVEN CANDIDATES ELIMINATED BY MEASUREMENT, so nobody re-walks them.** `registerInlineUnion`
-  (depth-capped: no effect — and the cap revealed that a NAME re-entry guard never fires,
-  because each step EXPANDS the spelling rather than repeating it), `rtGo` / `rtOfMap` (both
-  memoise with `rtByTyPut` BEFORE recursing, which is exactly the cycle-breaking the array
-  arm relies on), and five counter-instrumented at once — `rlCanonLitUnionAtoms`,
-  `internShapeDeepTy`, `mvArmSigOfName`, `internArmShapeAt`, `collectTyReachRegister` — none
-  of which reached 300 frames. `tyToStrAt` is also out: it already carries a depth cap.
+* **AN ELIMINATION LIST WAS FILED HERE AND IS RETRACTED — the instrument was wrong twice.**
+  It claimed seven candidates ruled out by counter probes. Both halves of that method fail:
+
+  1. **The counters were MONOTONIC, not nesting counters.** "This function was called more
+     than 40 times" is a statement about frequency, not about recursion depth, so neither a
+     hit nor a miss says anything about which function is looping. One candidate did trip its
+     counter and was briefly reported as found; it is merely called often.
+  2. **`refresh-compiler.sh` REFUSES TO INSTALL a compiler that fails its sanity program**,
+     and says so only in the middle of its output. A probe that `emitFail`s on ordinary code
+     is therefore discarded — the old seed stays, the next measurement runs against an
+     UNINSTRUMENTED compiler, and the result reads as "the probe never fired". Check the
+     `refreshed …` line, not the exit code.
+
+  Two instrument facts worth keeping, both established by validating the channel before
+  trusting a null result: **`emitFail` IS observable** from compiler code (the refresh's own
+  sanity step prints it), and **`print` is NOT** — a `print` inside `compiler/*.vl` reaches no
+  stdout, so every probe written that way measures nothing.
+
+  What still stands, because it came from behaviour rather than from a probe: `rtGo` /
+  `rtOfMap` memoise with `rtByTyPut` BEFORE recursing, which is the cycle-breaking the array
+  arm relies on; `tyToStrAt` already carries a depth cap; and a NAME re-entry guard on
+  `registerInlineUnion` cannot work, because each lap EXPANDS the spelling rather than
+  repeating it. A nesting bound of 64 on `collectTyReachRegister` also changes nothing, which
+  does rule that one out as the looping frame.
 
 * **THE NEXT INSTRUMENT SHOULD BE THE FUNCTION INDEX, not another guess.** The backtrace names
   a three-frame cycle by wasm function index; mapping those indices through the import count
