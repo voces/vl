@@ -23790,6 +23790,44 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   invalid wasm.
 
 ---
+### D975 — a USER function named like a builtin miscompiles from the NAME alone; all six builtin names collide
+
+**closed for four of the six — `print`, `toString`, `fromCodePoint`, `fromCodePoints` now resolve to the user's function · `Map` / `Set` keep a residue, filed below · reported by the owner while exploring the constraints design, minimized by vl-b7, verified here**
+
+`const b = { foo: "ok" }` beside `function toString(self: { foo: string }) { self.foo }` and
+`print(b.toString())` was `vl check` rc 0 and INVALID WASM; the identical program with the
+function renamed `myShow` printed `ok`.
+
+* **THE ARMS' OWN COMMENT ALREADY HAD THE FIX IN IT.** They are matched BEFORE the `fnIndexOf`
+  lookup "which would fail (unknown function)" — true of a REAL builtin, and exactly the test
+  that separates the two. What they actually asked was the raw SPELLING, so a user's call was
+  routed into the builtin.
+
+* **IT IS THE SET'S BUG, NOT ONE NAME'S — measured.** A UFCS method named `print`, `toString`,
+  `fromCodePoint`, `fromCodePoints`, `Map` or `Set` ALL produced check-clean invalid wasm; a
+  control named `myShow` ran. Reporting only the reported name would have fixed a sixth of it.
+
+* **`Map` / `Set` KEEP A RESIDUE.** Their constructor arm is guarded now too, and
+  `const r = b.Map()` still miscompiles: the checker infers `r` as `string` correctly, so the
+  remaining site is the emitter's BINDING classification (the `letIsMap` rung reading a
+  `Map`-named callee), not the call. The other four are closed and pinned.
+
+* **AND THE QUEUED toString-RENAME MUST CONVERT THIS ROW, NOT CLOSE IT.** That change deletes
+  the builtin, which would make this witness evaporate without the pattern being fixed. The
+  pattern is "an emit special case keyed on the raw name rather than on what it resolved to";
+  the row should become a REFUTATION PIN — the witness must keep RUNNING — so the next by-name
+  special case is caught by the standing gate.
+
+Repro (runs, prints `ok`):
+
+    const b = { foo: "ok" }
+    function toString(self: { foo: string }) {
+      self.foo
+    }
+    print(b.toString())
+    // PRINTS ok
+
+---
 ### D972 — probing the `--sites` ZERO rows: seven false alarms, and `==` over a non-binding union closed
 
 **closed for the non-binding operand — teed at its first read instead of refused · the struct-union half stays open with a probe · seven other ZERO rows turned out unreachable at the plainest spelling their sentence forbids**

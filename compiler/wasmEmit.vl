@@ -14315,11 +14315,20 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
   if c is Call {
     const callee = P.nodes[c.callFn]
     if callee is Ident {
-      // `toString(x)` is a compiler builtin: an i32 renders its decimal digits, a
-      // BOOLEAN-classified argument the literal text "true"/"false" — both as a fresh
-      // string (array of code points). This and the builtin arms below are matched
-      // BEFORE the `fnIndexOf` lookup, which would fail ("unknown function").
-      if callee.identName == "toString" {
+      // D975 — A USER FUNCTION OF THE SAME NAME WINS, and the arms below have to ask. They
+      // are matched BEFORE the `fnIndexOf` lookup because for a REAL builtin that lookup
+      // fails ("unknown function") — but the test they used was the raw SPELLING, so a
+      // program that declares `function toString(self: {foo: string})` had its own call
+      // routed into the builtin: `vl check` rc 0 and INVALID WASM
+      // (`expected i32, found (ref $type)`), and the same program with the function renamed
+      // ran. Measured across the whole builtin set — `print`, `toString`, `fromCodePoint`,
+      // `fromCodePoints`, `Map`, `Set` — ALL SIX collide, so this is the set's bug and not
+      // one name's.
+      //
+      // Asking whether the callee RESOLVES is what the comment above already assumed: a
+      // builtin resolves to nothing, so `fnIndexOfSid >= 0` means the user owns the name.
+      const userOwnsName = fnIndexOfSid(sidOfNode(c.callFn)) >= 0
+      if !userOwnsName && callee.identName == "toString" {
         return emitToString(body, callIx, fnIx)
       }
       // `fromCodePoints(xs)` (H2): bulk string construction — one call into the shared
@@ -14341,7 +14350,7 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
       // check-clean invalid wasm (§2.7 L2: "every recorded defect here was a missing arm,
       // never a stale one"). The NAME restriction stays for the same reason — the wrapper is
       // still read twice, once for `backing` and once for `len`.
-      if callee.identName == "fromCodePoints" {
+      if !userOwnsName && callee.identName == "fromCodePoints" {
         if !aUsed || !lUsed {
           return emitFail(
             "emitProgram: fromCodePoints but array/list types not collected",
@@ -14377,7 +14386,7 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
       // the encoder is deliberate: a second, inlined width-and-shift ladder here is exactly
       // the "one fact, two writings" shape that produces a silent disagreement (`'é'` from
       // `fromCodePoint(233)` not equal to the literal `"é"`).
-      if callee.identName == "fromCodePoint" {
+      if !userOwnsName && callee.identName == "fromCodePoint" {
         if !aUsed {
           return emitFail(
             "emitProgram: fromCodePoint but array type not collected",
@@ -14400,7 +14409,7 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
       // true/false), anything else i32-ish calls `__print_i32__` (import 0).
       // Strings are a later slice. The call yields NOTHING (void import) — the
       // statement path knows not to drop.
-      if callee.identName == "print" {
+      if !userOwnsName && callee.identName == "print" {
         if c.callArgs.length != 1 {
           return emitFail("emitProgram: print takes exactly one argument")
         }
@@ -21564,8 +21573,14 @@ function emitCallNode(body: i32[], e: Call, exprIx: i32, fnIx: i32) {
   // IDENTICAL empty-map construction.
   const callee = P.nodes[e.callFn]
   if callee is Ident {
-    if callee.identName == "Map" || callee.identName == "Set" {
-      return emitMapNew(body)
+    // D975 — a USER function named `Map` / `Set` owns its own name here too, for the reason
+    // the `toString` arm gives: the test was the raw SPELLING, so `b.Map()` over a declared
+    // `function Map(self: …)` built a fresh MAP instead of calling it (`vl check` rc 0,
+    // invalid wasm). A real constructor resolves to no function, so the lookup separates them.
+    if fnIndexOfSid(sidOfNode(e.callFn)) < 0 {
+      if callee.identName == "Map" || callee.identName == "Set" {
+        return emitMapNew(body)
+      }
     }
   }
   // G8: a map `m.has(k)` member-call yields a 0/1 i32 (linear scan).
