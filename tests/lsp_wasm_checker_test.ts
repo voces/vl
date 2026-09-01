@@ -915,3 +915,72 @@ Deno.test({ name: "wasm-symbols: a lambda-bound value and a function-typed param
     throw new Error(`expected run's named signature, got ${JSON.stringify(fnDecl)}`);
   }
 });
+
+// ── template literals through the EDITOR path ────────────────────────────────
+// The server re-checks on every keystroke, and a template hole's renderer is a
+// `std:fmt` export — so the editor path has to arm the module fetch loop for a
+// file with no `import` line in it at all. `needsModules` in `wasmChecker.ts` is
+// that arming test, and it must agree with the Rust host's and the compiler's.
+//
+// Without it the loop never runs, `std:fmt` is never committed, and the injected
+// reference resolves to nothing: an "undeclared identifier" on a program the CLI
+// compiles cleanly — the worst shape of divergence, since it only appears in the
+// editor.
+Deno.test({ name: "wasm-checker: a template with an i32 hole checks clean (std:fmt is fetched)", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // The reader knows NOTHING about std — `withStd` serves `std:fmt` (and the
+  // `std:str` it imports) from the embedded map.
+  const diags = await checker.check(
+    "const x = 5\nprint(`v=${x}`)\n",
+    "/proj/main.vl",
+    noSiblings,
+  );
+  if (diags.length !== 0) {
+    throw new Error(`expected clean, got: ${diags.map((d) => d.message).join("; ")}`);
+  }
+  // A hole-less template needs no renderer and stays on the single-source path.
+  const plain = await checker.check("print(`plain`)\n", "/proj/main.vl", noSiblings);
+  if (plain.length !== 0) {
+    throw new Error(`expected clean, got: ${plain.map((d) => d.message).join("; ")}`);
+  }
+  // A NUMERIC hole is in the domain whatever its width — the domain is the
+  // renderer's declared parameter, and `f64` joined it when serde Stage 0's
+  // `renderF64` landed, with no template-side change. Checked here rather than
+  // asserted, because this test used to use `f64` as its OUT-of-domain case and
+  // the widening is what flipped it.
+  const f64 = await checker.check(
+    "const f = 1.5\nprint(`v=${f}`)\n",
+    "/proj/main.vl",
+    noSiblings,
+  );
+  if (f64.length !== 0) {
+    throw new Error(`expected clean, got: ${f64.map((d) => d.message).join("; ")}`);
+  }
+  // An out-of-domain hole is a TEMPLATE-shaped diagnostic, positioned at the
+  // hole — the span the editor squiggles. A record is outside the domain at any
+  // width: it has no rendering at all, and will not get one from a number
+  // renderer.
+  const bad = await checker.check(
+    "const p = { x: 1 }\nprint(`v=${p}`)\n",
+    "/proj/main.vl",
+    noSiblings,
+  );
+  const hit = bad.find((d) => d.message.includes("a template hole is"));
+  if (hit === undefined) {
+    throw new Error(
+      `expected a template-domain diagnostic, got: ${bad.map((d) => d.message).join("; ")}`,
+    );
+  }
+  if (hit.range.start.line !== 1 || hit.range.start.character !== 11) {
+    throw new Error(
+      `expected the hole's own span at 1:11, got ${JSON.stringify(hit.range)}`,
+    );
+  }
+  // The range is the HOLE, one character wide — not the template token it sits
+  // in, which may span lines and whose end would land off its own line.
+  if (hit.range.end.line !== 1 || hit.range.end.character !== 12) {
+    throw new Error(
+      `expected a one-character range ending at 1:12, got ${JSON.stringify(hit.range)}`,
+    );
+  }
+});

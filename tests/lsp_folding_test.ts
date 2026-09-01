@@ -111,6 +111,31 @@ Deno.test("folding: a brace inside a string does not swallow a real block", () =
   eq(folds(src), [[0, 2]], "the real block still folds");
 });
 
+Deno.test("folding: a template literal's braces and holes open no region", () => {
+  // A template is scanned WHOLE by `vlLex` — text parts, `${…}` holes, nested
+  // strings and nested templates included — so nothing inside one is structure.
+  // A hole's braces are balanced by construction; a fold region over them would
+  // be a region the author cannot see the ends of.
+  const src = [
+    "const a = `{`", //                      0
+    "const b = `${ {x: 1}.x }`", //          1
+    'const c = `${ "a ` b" }`', //           2
+    "log(a)", //                             3
+  ].join("\n");
+  eq(folds(src), [], "template content is text, not structure");
+});
+
+Deno.test("folding: a multi-line template does not swallow the block around it", () => {
+  const src = [
+    "function f() {", //   0
+    "  const s = `line", // 1
+    "  } still text`", //   2
+    "  log(s)", //          3
+    "}", //                 4
+  ].join("\n");
+  eq(folds(src), [[0, 3]], "the `}` inside the template closes nothing");
+});
+
 Deno.test("folding: a closer inside a comment closes nothing", () => {
   const src = [
     "function f() {", //  0
@@ -359,8 +384,14 @@ const config: LanguageConfiguration = JSON.parse(
 Deno.test("language-config: the pairs the extension already shipped are intact", () => {
   eq(config.comments.lineComment, "//", "line comment");
   eq(config.brackets, [["{", "}"], ["[", "]"], ["(", ")"]], "brackets");
-  eq(config.autoClosingPairs.length, 5, "auto-closing pairs");
-  eq(config.surroundingPairs.length, 5, "surrounding pairs");
+  // Six: the three brackets, `"`, `'`, and the backtick a TEMPLATE literal opens.
+  eq(config.autoClosingPairs.length, 6, "auto-closing pairs");
+  eq(config.surroundingPairs.length, 6, "surrounding pairs");
+  for (const p of ["autoClosingPairs", "surroundingPairs"] as const) {
+    if (!config[p].some((x) => x.open === "`" && x.close === "`")) {
+      throw new Error(`${p} is missing the template-literal backtick pair`);
+    }
+  }
 });
 
 Deno.test("language-config: VL has no block comment, so nothing may describe one", () => {

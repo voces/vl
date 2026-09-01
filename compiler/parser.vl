@@ -41,7 +41,7 @@
 // The AST data layer (`compiler/ast.vl`): the token type, the global parser state
 // `P`, and the arena `mk*` constructors. The parser's own `advance`/`peekTok`
 // cursor primitives stay PRIVATE to this module.
-import { TokKind } from "./lexer"
+import { TokKind, tplPartStrLex } from "./lexer"
 import { isBinOpFuncName, mkMatch } from "./ast"
 import { BinExpr, Ident, P, Tok, mkDeclNameTok } from "./ast"
 // The free INDEX-OPERATOR declaration-name encoding (B14) — the parser is where
@@ -85,12 +85,14 @@ import {
 } from "./ast"
 import {
   AsMode,
+  TPL_RENDER_LOCAL,
   mkArrayLit,
   mkAsExpr,
   mkBinary,
   mkBlock,
   mkBool,
   mkBreak,
+  mkCall,
   mkCallN,
   mkChar,
   mkCompoundAssign,
@@ -119,6 +121,8 @@ import {
   mkProgram,
   mkReturn,
   mkStr,
+  mkTplConcat,
+  mkTplHole,
   mkTypeDecl,
   mkTypeRef,
   mkUnary,
@@ -223,6 +227,8 @@ function startsStmt(k: TokKind) {
   k == "IDENT" ||
     k == "NUMBER" ||
     k == "STRING" ||
+    k == "TEMPLATE" ||
+    k == "TEMPLATE_HEAD" ||
     k == "CHAR" ||
     k == "TRUE" ||
     k == "FALSE" ||
@@ -738,6 +744,7 @@ function parsePrimary() {
   const k = peekKind()
   if k == "NUMBER" { return mkNum(advance().text, p0) }
   if k == "STRING" { return mkStr(advance().text, p0) }
+  if k == "TEMPLATE" || k == "TEMPLATE_HEAD" { return parseTemplate(p0) }
   if k == "CHAR" { return mkChar(advance().text, p0) }
   if k == "TRUE" {
     advance()
@@ -807,6 +814,107 @@ function parsePrimary() {
   )
   advance()
   mkErr("expr", P.pos, p0)
+}
+
+// A backtick TEMPLATE LITERAL, DESUGARED HERE into the string concatenation it
+// means: `` `v=${x} ok` `` becomes `"v=" + <render>(x) + " ok"`.
+//
+// WHY THE DESUGAR IS HERE AND NOT A `TemplateLit` NODE KIND. Three measurements
+// decided it, in this order:
+//   1. `format.vl` recovers a literal from its SOURCE SPAN (`literalSlice` →
+//      `sliceNode`), not by re-printing the AST. A no-hole template is a
+//      `StrLit` whose span is the whole `` `…` `` and round-trips byte-for-byte
+//      with no formatter change at all; a template with holes needs only the
+//      `binTpl` marker on the root `+`, which is the shape `binCompound`
+//      already established for `a += b`.
+//   2. `nodeTyIx` is sized to the arena at `checkProgram` entry, so a node
+//      minted by a LATER desugar reads its type back as -1 forever (D969 is the
+//      recorded cost). Minting the whole chain in the parser puts every node
+//      inside the checker's own numbering, so the concat, the render call and
+//      the hole are typed and repped by the ordinary machinery.
+//   3. A new `Node` variant would need an `is` arm in nine files' dispatch
+//      chains, each of whose catch-alls fails SILENTLY, to buy nothing that (1)
+//      and (2) do not already give.
+// The type-directed half of the lowering — a `string` hole is delivered
+// directly, everything else goes through the renderer — survives intact: it is
+// the checker's, at the one place the hole's type is known (`checkCallNode`).
+//
+// The renderer is named `TPL_RENDER_LOCAL`, which no program can spell. It is
+// NOT a scope lookup: see that constant's header.
+function parseTemplate(p0: i32) {
+  const t0 = advance()
+  // No hole: one `TEMPLATE` token, and the string literal it becomes keeps the
+  // template's own span, so `vl fmt` reprints the author's bytes for free.
+  if t0.kind == "TEMPLATE" { return mkStr(tplPartStrLex(t0.text), p0) }
+
+  // The concat operands, in order: the leading text part, then per hole a render
+  // call and (unless it is empty) the text part after it. An EMPTY part is
+  // dropped — `` `${a}${b}` `` is `"" + r(a) + r(b)`, not four `+`s over three
+  // empty strings — except the leading one, which stays so the result is a
+  // `string` concatenation and the root is always a `+` to mark.
+  const ops: i32[] = []
+  ops.push(mkStr(tplPartStrLex(t0.text), -1))
+  let going = true
+  while going {
+    const holePos = peekTok().start
+    const hk = peekKind()
+    let hole = -1
+    if hk == "TEMPLATE_MID" || hk == "TEMPLATE_TAIL" {
+      // `${}` — the delimiters with nothing between them. Reported HERE rather
+      // than left to "expected an expression but found TEMPLATE_TAIL", which
+      // names a token the author never typed.
+      P.diags.push(
+        { msg: "a template hole `${}` needs an expression", at: P.pos },
+      )
+      hole = mkErr("template hole", P.pos, holePos)
+    } else {
+      hole = parseExpr()
+    }
+    mkTplHole(hole)
+    const args: i32[] = []
+    args.push(hole)
+    ops.push(mkCall(mkIdent(TPL_RENDER_LOCAL, holePos), args, holePos))
+    // The hole's expression must end AT the closing `}` — the lexer only mints a
+    // MID/TAIL there. Anything else is leftover input; skip to the next
+    // delimiter so one bad hole does not swallow the rest of the file.
+    let k2 = peekKind()
+    if k2 != "TEMPLATE_MID" && k2 != "TEMPLATE_TAIL" && k2 != "EOF" {
+      P.diags.push(
+        {
+          msg: "expected `}` to close the template hole but found " + kindTag(k2),
+          at: P.pos,
+        },
+      )
+      while k2 != "TEMPLATE_MID" && k2 != "TEMPLATE_TAIL" && k2 != "EOF" {
+        advance()
+        k2 = peekKind()
+      }
+    }
+    if k2 == "EOF" {
+      // The input ran out inside the hole; the lexer already reported the
+      // unterminated template at its opening backtick.
+      going = false
+    } else {
+      const part = advance()
+      const lex = tplPartStrLex(part.text)
+      if lex != "\"\"" { ops.push(mkStr(lex, -1)) }
+      if part.kind == "TEMPLATE_TAIL" { going = false }
+    }
+  }
+
+  // Folded AFTER the closing token is consumed, so every `+` anchors at it and
+  // the ROOT's `[pos, nodeEndOf)` is the template's own source span.
+  let acc = ops[0]
+  let i = 1
+  while i < ops.length {
+    if i == ops.length - 1 {
+      acc = mkTplConcat(acc, ops[i], p0)
+    } else {
+      acc = mkBinary("+", acc, ops[i], p0)
+    }
+    i = i + 1
+  }
+  acc
 }
 
 // The per-argument NAMES of the argument list parseArgs LAST completed ("" =

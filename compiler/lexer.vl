@@ -9,6 +9,10 @@ import { cpCount } from "./strutil"
 //   - integer / real number literals (`12`, `3.14`, `1.5e-7`),
 //   - char literals `'a'` and string literals `"..."`, both with the shared
 //     escape grammar `\n \t \r \\ \" \' \0 \b \f \v \xXX \uXXXX \u{…}`,
+//   - backtick TEMPLATE literals `` `text${expr}text` `` — scanned as a SPLIT
+//     token run (`TEMPLATE_HEAD` / `TEMPLATE_MID` / `TEMPLATE_TAIL`, or a lone
+//     `TEMPLATE` when there is no hole) with the hole EXPRESSIONS lexed as
+//     ordinary tokens in between, the JS-lexer shape,
 //   - the full one- and two-char operator / punctuation set,
 //   - `//` line comments and `///` doc comments (retained as trivia in
 //     `gComments`, not emitted into the token stream),
@@ -45,6 +49,10 @@ export type TokKind = ""
   | "NUMBER"
   | "STRING"
   | "CHAR"
+  | "TEMPLATE"
+  | "TEMPLATE_HEAD"
+  | "TEMPLATE_MID"
+  | "TEMPLATE_TAIL"
   | "NEWLINE"
   | "EOF"
   | "ERROR"
@@ -185,6 +193,27 @@ let gLine = 1
 let gCol = 0
 export let gDiags: Diag[] = []
 let gComments: Comment[] = []
+
+// ---- template-literal scanner state --------------------------------------
+// A template is CONTEXT-SENSITIVE: the `}` that ends a hole is spelled exactly
+// like the `}` that closes a block, so the scanner has to know which one it is
+// looking at. It does, from two numbers: the `{` nesting depth (`gBrace`) and,
+// per OPEN hole, the depth that hole started at (`gTplBrace`). A `}` resumes the
+// template iff the depth matches the innermost open hole's — every deeper `}`
+// is an ordinary closer. Templates therefore NEST for free (a hole may hold
+// another template; each pushes its own row), and the stack is the whole reason
+// no re-lexing or bracket-matching pre-pass is needed.
+//
+// `gTplOpenLine`/`gTplOpenCol`/`gTplOpenPos` are parallel to `gTplBrace`: the
+// position of the template's OPENING BACKTICK, kept so an unterminated template
+// reports there rather than at the `}` of whichever part ran off the end. The
+// char OFFSET rides along because a SPAN needs it — see `tplLineEndCol`.
+let gTplStop = 0 // why the last part stopped: 0 = closing backtick, 1 = `${`, 2 = ran out of input
+let gTplOpenLine: i32[] = []
+let gTplOpenCol: i32[] = []
+let gTplOpenPos: i32[] = []
+let gTplBrace: i32[] = []
+let gBrace = 0
 
 // ---- character classes (char literals) -----------------------------------
 
@@ -575,6 +604,14 @@ export function scanQuoted(quote: i32) {
   // there (not wherever scanning stopped) keeps a missing quote a local error.
   const openLine = gLine
   const openCol = gCol
+  // TEMPLATE MODE — `quote == '`'`. Three rules differ and nothing else does:
+  // a raw newline is CONTENT (templates are multiline, as in JS), a `${` ENDS
+  // the part (recorded in `gTplStop`, since VL functions return one value), and
+  // ``\` ``/`\$` join the escape set. The "opening quote" it consumes is a
+  // backtick for a HEAD/whole template and a `}` for a MID/TAIL part — one
+  // scanner for all four, which is what keeps the escape grammar single-sourced.
+  const tpl = quote == '`'
+  if tpl { gTplStop = 2 }
   advance() // opening quote
   let value = ""
   let closed = false
@@ -585,7 +622,16 @@ export function scanQuoted(quote: i32) {
     // The newline is left in the input (it becomes an ordinary NEWLINE token),
     // so one missing quote yields a single local error at the opening quote
     // instead of masking every later error up to EOF.
-    if ch == '\n' || ch == '\r' { break }
+    if !tpl && (ch == '\n' || ch == '\r') { break }
+    if tpl && ch == '$' && peek2() == '{' {
+      value = value + gSrc.slice(runStart, gPos)
+      advance() // $
+      advance() // {
+      runStart = gPos
+      closed = true
+      gTplStop = 1
+      break
+    }
     if ch == '\\' {
       value = value + gSrc.slice(runStart, gPos)
       // Escape diagnostics anchor at the backslash, not the scan position
@@ -598,6 +644,15 @@ export function scanQuoted(quote: i32) {
         break
       }
       const e = peek()
+      // The two TEMPLATE-ONLY escapes: a template's delimiters. Handled before
+      // `decodeSimpleEscape` so the `"` grammar is unchanged — ``"\`"`` keeps
+      // warning "Unknown escape sequence" exactly as it did.
+      if tpl && (e == '`' || e == '$') {
+        advance() // the escaped delimiter
+        value = value + fromCodePoint(e)
+        runStart = gPos
+        continue
+      }
       // \xXX — two hex digits.
       if e == 'x' {
         if isHex(peek2()) && isHex(peekN(2)) {
@@ -694,21 +749,110 @@ export function scanQuoted(quote: i32) {
       advance() // closing quote
       runStart = gPos
       closed = true
+      if tpl { gTplStop = 0 }
       break
     }
     advance()
   }
   value = value + gSrc.slice(runStart, gPos)
   if !closed {
+    // A template's own "unterminated" report is the CALLER's — only the caller
+    // knows where the opening BACKTICK was (a MID/TAIL part opens at a `}`, a
+    // whole template away), and only the caller can measure a span for a literal
+    // that may be MULTILINE. `gTplStop` carries the verdict there.
+    //
     // Spans the opening quote through whatever the scan reached (the raw newline
     // that broke the loop, or EOF) — the whole run the reader has to look at.
-    if quote == '\'' {
+    // That is sound for `"` and `'` precisely because a raw newline terminates
+    // them, so `gCol` is still on `openLine`; it is NOT sound for a template,
+    // which is why the template arm above leaves without reporting.
+    if tpl {
+      gTplStop = 2
+    } else if quote == '\'' {
       diagSpan("Unterminated char literal", openLine, openCol, gCol)
     } else {
       diagSpan("Unterminated string literal", openLine, openCol, gCol)
     }
   }
   value
+}
+
+// The `"`-quoted STRING LEXEME that means what template part `raw` means — the
+// one bridge between the two literal grammars, and a purely LEXICAL rewrite (no
+// decode/re-encode round trip, so no second escape decoder exists to drift from
+// `scanQuoted`'s).
+//
+// `raw` is a part's verbatim source lexeme, delimiters included: `` `a${ ``,
+// `}b${`, `}c` ``, or a whole `` `d` ``. One leading char is always a delimiter
+// (a backtick or a `}`); the trailing one is a backtick (1 char) or a `${` (2).
+//
+// THE TWO GRAMMARS SHARE THEIR ESCAPE SET, which is what makes the rewrite a
+// copy almost everywhere: `\n`, `\xNN`, `\u{…}`, `\\` and the rest are the same
+// sequence on both sides and are copied WHOLE (the escaped character included,
+// so a `\\` can never be re-read as an escape opener). Exactly four characters
+// differ, and each has one rule:
+//   ``\` `` and `\$` — template-only escapes; the bare character is ordinary
+//                      inside `"`, so the backslash is DROPPED.
+//   `"`             — ordinary inside a template, a terminator inside `"`, so
+//                     it gains a backslash.
+//   a raw newline / CR — content inside a template (multiline), a terminator
+//                     inside `"`, so it becomes `\n` / `\r`.
+// A backslash-newline (line continuation) is copied by the escape arm above and
+// never reaches the newline rule, so it keeps meaning "drop both".
+//
+// Built from RUNS (`[runStart, i)` slices) rather than character by character:
+// `.length` is a BYTE count since Stage 2c, so a multi-byte character must be
+// copied by SLICE — re-minting it through `fromCodePoint` would re-encode a
+// single byte of it as its own code point.
+export function tplPartStrLex(raw: string): string {
+  const n = raw.length
+  const q = "\""
+  if n < 1 { return q + q }
+  let stop = n
+  if raw[n - 1] == '`' { stop = n - 1 }
+  else if n >= 2 && raw[n - 2] == '$' && raw[n - 1] == '{' { stop = n - 2 }
+  const start = 1
+  if stop <= start { return q + q }
+  let out = q
+  let runStart = start
+  let i = start
+  while i < stop {
+    const ch = raw[i]
+    if ch == '\\' {
+      if i + 1 >= stop {
+        // A dangling backslash — reachable only from an unterminated template,
+        // which is already a lex error. Dropped so the lexeme this returns is
+        // still well-formed for the parse that recovers past it.
+        out = out + raw.slice(runStart, i)
+        i = i + 1
+        runStart = i
+      } else {
+        const e = raw[i + 1]
+        if e == '`' || e == '$' {
+          out = out + raw.slice(runStart, i) + raw.slice(i + 1, i + 2)
+          i = i + 2
+          runStart = i
+        } else {
+          i = i + 2
+        }
+      }
+    } else if ch == '"' {
+      out = out + raw.slice(runStart, i) + "\\\""
+      i = i + 1
+      runStart = i
+    } else if ch == '\n' {
+      out = out + raw.slice(runStart, i) + "\\n"
+      i = i + 1
+      runStart = i
+    } else if ch == '\r' {
+      out = out + raw.slice(runStart, i) + "\\r"
+      i = i + 1
+      runStart = i
+    } else {
+      i = i + 1
+    }
+  }
+  out + raw.slice(runStart, stop) + q
 }
 
 // ---- main scanner --------------------------------------------------------
@@ -726,6 +870,16 @@ export function tokenize(source: string): LexResult {
   gDiags = fresh
   const freshC: Comment[] = []
   gComments = freshC
+  gTplStop = 0
+  const freshTL: i32[] = []
+  gTplOpenLine = freshTL
+  const freshTC: i32[] = []
+  gTplOpenCol = freshTC
+  const freshTP: i32[] = []
+  gTplOpenPos = freshTP
+  const freshTB: i32[] = []
+  gTplBrace = freshTB
+  gBrace = 0
 
   const toks: Tok[] = []
 
@@ -739,6 +893,13 @@ export function tokenize(source: string): LexResult {
     if c == '\r' || c == '\n' {
       if c == '\r' && peek2() == '\n' { advance() }
       advance()
+      // SUPPRESSED INSIDE A TEMPLATE HOLE, at the hole's own brace depth. A hole
+      // is an EXPRESSION, so a newline there can never be the statement
+      // terminator NEWLINE means everywhere else — emitting one would end the
+      // hole's expression mid-way. Dropping it is what lets a hole span lines.
+      // A newline INSIDE a `{ … }` nested in the hole is deeper than the hole's
+      // depth and keeps its NEWLINE: a block there really does hold statements.
+      if atTplHoleDepth() { continue }
       toks.push(mkTok("NEWLINE", "", startPos, startLine, startCol))
       continue
     }
@@ -926,6 +1087,58 @@ export function tokenize(source: string): LexResult {
       continue
     }
 
+    // Template literal — the OPENING backtick. A template with no hole is one
+    // `TEMPLATE` token; one with holes opens a `TEMPLATE_HEAD` and pushes a row
+    // onto the hole stack, which the `}` arm below closes.
+    if c == '`' {
+      const tv = scanQuoted('`')
+      if gTplStop == 1 {
+        gTplOpenLine.push(startLine)
+        gTplOpenCol.push(startCol)
+        gTplOpenPos.push(startPos)
+        gTplBrace.push(gBrace)
+        toks.push(mkTok("TEMPLATE_HEAD", tv, startPos, startLine, startCol))
+      } else {
+        if gTplStop == 2 {
+          diagSpan(
+            "Unterminated template literal",
+            startLine,
+            startCol,
+            tplLineEndCol(startPos, startCol),
+          )
+        }
+        toks.push(mkTok("TEMPLATE", tv, startPos, startLine, startCol))
+      }
+      continue
+    }
+
+    // `{` / `}` — intercepted ahead of the operator tables so the brace DEPTH is
+    // tracked (see the template-scanner state block). A `}` at the innermost
+    // open hole's depth is not a closer at all: it RESUMES the template.
+    if c == '{' {
+      gBrace = gBrace + 1
+      advance()
+      toks.push(mkTok("LBRACE", "", startPos, startLine, startCol))
+      continue
+    }
+    if c == '}' {
+      if atTplHoleDepth() {
+        const tv2 = scanQuoted('`') // consumes the `}` as this part's opener
+        if gTplStop == 1 {
+          toks.push(mkTok("TEMPLATE_MID", tv2, startPos, startLine, startCol))
+        } else {
+          if gTplStop == 2 { tplOpenDiag() }
+          tplOpenPop()
+          toks.push(mkTok("TEMPLATE_TAIL", tv2, startPos, startLine, startCol))
+        }
+        continue
+      }
+      gBrace = gBrace - 1
+      advance()
+      toks.push(mkTok("RBRACE", "", startPos, startLine, startCol))
+      continue
+    }
+
     // Three-char operator (`>>>`) — longest match first.
     //
     // The three no-match tests below run for EVERY token in the input. A
@@ -966,6 +1179,65 @@ export function tokenize(source: string): LexResult {
     toks.push(mkTok("ERROR", "", startPos, startLine, startCol))
   }
 
+  // Input ran out INSIDE a hole (`` `a${x ``): no part ever scanned to EOF, so
+  // nothing above reported it. One diagnostic per still-open template.
+  while gTplOpenLine.length > 0 {
+    tplOpenDiag()
+    tplOpenPop()
+  }
+
   toks.push(mkTok("EOF", "", gPos, gLine, gCol))
   { tokens: toks, diags: gDiags, comments: gComments }
+}
+
+function tplLineEndCol(pos: i32, col: i32) {
+  let p = pos
+  while p < gSrc.length && gSrc[p] != '\n' && gSrc[p] != '\r' { p = p + 1 }
+  col + (p - pos)
+}
+
+// True when the scanner sits inside a template HOLE at that hole's own brace
+// depth — the test that tells a hole-closing `}` from a block-closing one, and
+// the same test that suppresses NEWLINE there.
+function atTplHoleDepth() {
+  if gTplBrace.length == 0 { return false }
+  gBrace == gTplBrace[gTplBrace.length - 1]
+}
+
+// Report the innermost open template as unterminated, AT ITS OPENING BACKTICK.
+function tplOpenDiag() {
+  const oi = gTplOpenLine.length - 1
+  if oi >= 0 {
+    diagSpan(
+      "Unterminated template literal",
+      gTplOpenLine[oi],
+      gTplOpenCol[oi],
+      tplLineEndCol(gTplOpenPos[oi], gTplOpenCol[oi]),
+    )
+  }
+  gDiags.length
+}
+
+// The 0-based EXCLUSIVE end column of the source line the character at offset
+// `pos` (column `col`) sits on — `col` plus the characters left before the line
+// break.
+//
+// A TEMPLATE IS THE ONE LITERAL THAT SPANS LINES, so the "whole run" span
+// `scanQuoted` hands `"` and `'` is not expressible for it: `diagSpan`'s columns
+// are one pair on ONE line by construction, and that is sound for a quoted
+// literal only because a raw newline terminates one. The honest span for an
+// unterminated template is therefore its FIRST line — it opens here and does not
+// close before the line ends — which is exactly the run a reader scans for the
+// missing backtick. Reported at the OPENING backtick either way, so a
+// multi-line template still points at the character that needs fixing.
+
+// Close the innermost open template (the three stacks move together).
+function tplOpenPop() {
+  if gTplOpenLine.length > 0 {
+    gTplOpenLine.pop()
+    gTplOpenCol.pop()
+    gTplOpenPos.pop()
+    gTplBrace.pop()
+  }
+  0
 }

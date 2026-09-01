@@ -52,11 +52,15 @@ argument 1: expected {toStr: (Circle) => string}, got Circle
 
 Fields are data; UFCS is call-site sugar. Today nothing bridges them.
 
-**Where interpolation's stringify binds is already ruled** and is deliberately the
-opposite answer: a string literal's meaning must not depend on imports, so template
-literals (when built) bind ABSOLUTELY to std's `toString` (owner ruling 2026-09-01:
-builtin killed, std `toStr` renamed into the vacancy), eventually to the derived
-`show<T>`. Bounds, by contrast, may be scope-relative — §4 argues why.
+**Where interpolation's stringify binds is already ruled, and now SHIPPED** — and it is
+deliberately the opposite answer: a string literal's meaning must not depend on imports,
+so template literals bind ABSOLUTELY to std's renderer (owner ruling 2026-09-01; the
+builtin is killed and std `toStr` is renamed into the vacancy in a queued follow-up, and
+the bound name is one constant, `TPL_RENDER_EXPORT` in `driver.vl`), eventually to the
+derived `show<T>`. As built, the hole's call names an identifier no program can spell and
+the module merge rewrites it onto the merged symbol — see DECISIONS.md, "A template
+literal's stringifier is bound ABSOLUTELY". Bounds, by contrast, may be scope-relative —
+§4 argues why.
 
 ## 2. Survey — how other languages hold this space
 

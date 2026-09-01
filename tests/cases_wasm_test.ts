@@ -260,6 +260,52 @@ const hasImports = (source: string): boolean =>
   });
 
 /**
+ * True when `source` holds a backtick template literal with a `${…}` hole — the
+ * second construct that arms the module fetch loop, because a hole desugars to a
+ * call into `std:fmt`.
+ *
+ * A REAL SCAN, not a bare backtick test: a backtick in a `//` comment is ordinary
+ * (2,409 corpus files carry one) and must not move a program off the single-source
+ * path. Comments and quoted literals are skipped; a hole-less plain template needs
+ * no renderer and does not arm the loop. Kept identical to `cliHasTplHole`
+ * (`compiler/cli_util.vl`), `has_template_hole` (`scripts/vl-host/src/main.rs`)
+ * and this function's twin in the other file — the four must agree, or the guest
+ * asks for a module nobody fetches.
+ */
+const hasTemplateHole = (source: string): boolean => {
+  const n = source.length;
+  let i = 0;
+  while (i < n) {
+    const c = source[i];
+    if (c === "/" && source[i + 1] === "/") {
+      while (i < n && source[i] !== "\n") i++;
+    } else if (c === '"' || c === "'") {
+      i++;
+      while (i < n && source[i] !== c) {
+        if (source[i] === "\\") i++;
+        i++;
+      }
+      i++;
+    } else if (c === "`") {
+      i++;
+      while (i < n && source[i] !== "`") {
+        if (source[i] === "\\") i++;
+        else if (source[i] === "$" && source[i + 1] === "{") return true;
+        i++;
+      }
+      i++;
+    } else {
+      i++;
+    }
+  }
+  return false;
+};
+
+/** The module pipeline's arming test: an import edge, or a template hole. */
+const needsModules = (source: string): boolean =>
+  hasImports(source) || hasTemplateHole(source);
+
+/**
  * Read a module source for the fetch loop. Keys are absolute filesystem paths,
  * except `std:NAME` which maps to `<repo>/std/NAME.vl` (slash segments are
  * subdirectories) — the same mapping the Rust host and the LSP reader apply.
@@ -312,7 +358,7 @@ const driveCase = (
   isModule: boolean,
 ): { rc: number; diags: WasmDiag[]; bytes?: Uint8Array; redun: LintDiag[] } => {
   exp.modReset();
-  if (isModule || hasImports(src)) {
+  if (isModule || needsModules(src)) {
     const commit = (key: string, source: string | undefined) => {
       pushString(exp.modKeyPush, key);
       if (source !== undefined) pushString(exp.modSrcPush, source);

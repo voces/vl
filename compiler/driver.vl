@@ -65,6 +65,7 @@ import {
 import { TokKind, tokenize } from "./lexer"
 import {
   P,
+  TPL_RENDER_LOCAL,
   TS_APP,
   TS_MAP,
   TS_NAME,
@@ -77,6 +78,7 @@ import {
   mkProgram,
   nodeToks,
   setDeclGpBase,
+  tplHole,
   tsKidCount,
   tsKidStart,
   tsKids,
@@ -565,6 +567,7 @@ export function compileSrc(): i32 {
   nodeToks = []
   tsReset()
   declNameTok = []
+  tplHole = []
   vcDgReset()
   W.bytes = []
   emitErr = ""
@@ -682,6 +685,7 @@ export function checkSrc(): i32 {
   nodeToks = []
   tsReset()
   declNameTok = []
+  tplHole = []
   vcDgReset()
   fnNames = []
   fnIndices = []
@@ -726,6 +730,7 @@ export function lintSrc(): i32 {
   nodeToks = []
   tsReset()
   declNameTok = []
+  tplHole = []
   vcDgReset()
   vcLoadToks(vcSource())
   const root = parseProgram()
@@ -811,6 +816,7 @@ export function lintGraph(): i32 {
       nodeToks = []
       tsReset()
       declNameTok = []
+      tplHole = []
       vcDgReset()
       vcLoadToksMod(m)
       const root = parseProgram()
@@ -864,6 +870,7 @@ export function formatSrc(): i32 {
   nodeToks = []
   tsReset()
   declNameTok = []
+  tplHole = []
   vcDgReset()
   const src = vcSource()
   // Lex once, feeding tokens into the parser AND the formatter's comment table
@@ -933,6 +940,7 @@ export function formatSrc(): i32 {
   nodeToks = []
   tsReset()
   declNameTok = []
+  tplHole = []
   vcDgReset()
   vcLoadToks(vcFmtOut)
   if P.diags.length == 0 { parseProgram() }
@@ -963,6 +971,7 @@ export function checkSrcSym(): i32 {
   nodeToks = []
   tsReset()
   declNameTok = []
+  tplHole = []
   vcDgReset()
   fnNames = []
   fnIndices = []
@@ -1355,7 +1364,16 @@ export function builtinTypeCharAt(i: i32, j: i32): i32 { blType[i][j] }
 // TextMate grammar so its finer escape scopes survive), and structural punctuation
 // — are dropped (class < 0). The host maps the class onto its token-type legend.
 //
+// TEMPLATE literals are the ONE literal that does get a class, and the reason is
+// the exception above: a template is not one token. Its text runs arrive as
+// `TEMPLATE` / `TEMPLATE_HEAD` / `TEMPLATE_MID` / `TEMPLATE_TAIL` with the hole
+// EXPRESSIONS lexed in between, so leaving them to TextMate would colour a hole's
+// identifiers as string content. Class 5 paints exactly the text parts and the
+// `${` / `}` delimiters that ride on them; every token inside a hole keeps the
+// colour it would have anywhere else.
+//
 //   class: 0 = keyword  1 = operator  2 = number  3 = boolean  4 = comment
+//          5 = string (template parts + hole delimiters only)
 let lexCls: i32[] = []
 let lexLine: i32[] = []
 let lexCol: i32[] = []
@@ -1367,6 +1385,14 @@ let lexLen: i32[] = []
 // rather than the host's older guesses, so every operator the lexer emits colours.
 function lexClassOf(kind: TokKind): i32 {
   if kind == "NUMBER" { return 2 }
+  if (
+    kind == "TEMPLATE" ||
+    kind == "TEMPLATE_HEAD" ||
+    kind == "TEMPLATE_MID" ||
+    kind == "TEMPLATE_TAIL"
+  ) {
+    return 5
+  }
   if kind == "TRUE" || kind == "FALSE" || kind == "NULL" { return 3 }
   if (
     kind == "FUNCTION" ||
@@ -1614,9 +1640,27 @@ export function diagEndCol(i: i32): i32 {
     }
   }
   if at >= 0 && at < P.toks.length {
-    return P.toks[at].col + P.toks[at].text.length
+    return P.toks[at].col + tokFirstLineLen(P.toks[at].text)
   }
   diagCol(i)
+}
+
+// The lexeme's length UP TO its first line break — the width a `col + len` end
+// column may honestly claim.
+//
+// `col + text.length` is the whole width only while a token cannot span lines,
+// and TEMPLATE literals can (a raw newline is content in one, the JS rule). An
+// unclamped end column for a multi-line template runs past the end of its own
+// line and lands wherever the arithmetic falls, on a line the span never names —
+// a nonsense range for the CLI's caret and for the LSP's. Clamping to the first
+// line is the same answer `diagSpan` reaches on the lexer side, and for the same
+// reason: a span here is ONE column pair on ONE line by construction, so the
+// most it can describe is where the construct starts and how far it runs before
+// the line ends. Every other token is single-line and this is the identity.
+function tokFirstLineLen(text: string) {
+  let i = 0
+  while i < text.length && text[i] != '\n' && text[i] != '\r' { i = i + 1 }
+  i
 }
 // The diagnostic's stable CATEGORY code, "" when it has none. A TYPE diagnostic
 // carries "unsupported-lowering" when the program is type-valid but uses a
@@ -2087,10 +2131,17 @@ function modScan(m: i32, src: string): i32 {
     modScanTokEnd = modCacheTokKind.length
   }
   let depth = 0
+  let sawTplHole = false
   let i = 0
   while i < toks.length {
     const k = toks[i].kind
-    if k == "LBRACE" {
+    if k == "TEMPLATE_HEAD" {
+      // A template with at least one HOLE. Its desugared render call names a
+      // `std:fmt` export, so this module needs `std:fmt` in the merged program —
+      // recorded below as a bare edge, after the real imports are scanned.
+      sawTplHole = true
+      i = i + 1
+    } else if k == "LBRACE" {
       depth = depth + 1
       i = i + 1
     } else if k == "RBRACE" {
@@ -2359,8 +2410,57 @@ function modScan(m: i32, src: string): i32 {
       i = i + 1
     }
   }
+  // ── THE INJECTED IMPORT ────────────────────────────────────────────────────
+  // A module holding a template hole gets a `std:fmt` dependency it never wrote.
+  // It is the SAME row shape a bare `import "std:fmt"` pushes (driver.vl's
+  // names-less arm above) — one edge, `impName`/`impLocal` both EMPTY — and that
+  // emptiness is the entire no-pollution mechanism:
+  //   · the host's fetch loop reads `impKey`, so `std:fmt` (and transitively
+  //     `std:str`) is fetched, ordered, parsed and merged with no host change;
+  //   · `modBuildRename` only mints a rename row for `impLocal != ""`, so NO
+  //     user-visible binding is created — `toStr` stays undeclared in this
+  //     module, a user's own `toStr` still renames to its own `$mN`, and
+  //     completion (which filters on the entry's imports) never offers it.
+  // The renderer is reached instead through the unspellable `TPL_RENDER_LOCAL`
+  // rename row, minted beside this edge in `modBuildRename`.
+  //
+  // NOT PUSHED FROM `std:fmt` ITSELF: a self-edge would be an import cycle. std
+  // uses no template today (measured), so the guard is a floor, not a policy.
+  //
+  // EVERY imp* COLUMN IS PUSHED, including the ones a synthetic row has nothing
+  // to say about. They are POSITIONAL side tables — row `i` of one is row `i` of
+  // all of them — so a column skipped here does not leave this row's entry
+  // missing, it shifts every LATER row's specifier span and char flag onto the
+  // wrong import. The neutral values are the "no span" pair (`impSpecEnd` equal
+  // to `impSpecCol`, which is how `modVisit` reads "point, not span") and `0` for
+  // `impSpecChar` (this specifier is not a char literal, and never can be).
+  if sawTplHole && modKeys[m] != TPL_RENDER_MODULE {
+    impMod.push(m)
+    impSpec.push(TPL_RENDER_MODULE)
+    impKey.push(TPL_RENDER_MODULE)
+    impName.push("")
+    impLocal.push("")
+    impNameLine.push(1)
+    impNameCol.push(0)
+    impSpecLine.push(1)
+    impSpecCol.push(0)
+    impSpecEnd.push(0)
+    impSpecChar.push(0)
+  }
   0
 }
+// ── where a template hole's renderer comes from ──────────────────────────────
+// A template binds ABSOLUTELY: `` `n=${x}` `` means the same thing in every file
+// regardless of what that file imports, so the renderer is named here and never
+// looked up in the user's scope (DECISIONS.md, owner ruling 2026-09-01 — a
+// string literal's meaning must not depend on imports).
+//
+// THESE TWO LINES ARE THE WHOLE BINDING. The queued `toStr` → `toString` rename
+// (ROADMAP § Ruled and sequenced — the ambient builtin is killed and std:fmt's
+// `toStr` moves into the vacancy) is a one-line edit to `TPL_RENDER_EXPORT`.
+const TPL_RENDER_MODULE = "std:fmt"
+const TPL_RENDER_EXPORT = "toStr"
+
 function modIndexOfKey(key: string): i32 {
   let i = 0
   while i < modKeys.length {
@@ -2943,6 +3043,18 @@ function modBuildRename(m: i32, root: i32): i32 {
       }
     }
     ij = ij + 1
+  }
+  // The TEMPLATE RENDERER's row — the far half of the injected import. It is an
+  // ordinary rename row and therefore takes the identical path an author's own
+  // `import { toStr } from "std:fmt"` takes, `modMergedTargetOf`'s re-export
+  // chase included; what makes it non-pollution is only its `from` key, which no
+  // program can spell. Minted for EVERY module (a dep may hold a template too)
+  // whenever `std:fmt` is in the table at all — including when the author
+  // imported it themselves, which is why the same module is never merged twice:
+  // `modKeys` is the registry and both edges resolve to the one row.
+  const fm = modIndexOfKey(TPL_RENDER_MODULE)
+  if fm >= 0 {
+    modRenamePush(TPL_RENDER_LOCAL, modMergedTargetOf(fm, TPL_RENDER_EXPORT))
   }
   0
 }

@@ -85,7 +85,8 @@ Deno.test({
     expectHas(r.err, "ok   negates");
     // `itSkip` is collected and reported, never run — if it RAN it would fail.
     expectHas(r.err, "skip is skipped and never runs");
-    expectHas(r.err, "1 file · 6 passed · 0 failed · 1 skipped");
+    expectHas(r.err, "ok   interpolates a template");
+    expectHas(r.err, "1 file · 7 passed · 0 failed · 1 skipped");
   },
 });
 
@@ -206,7 +207,7 @@ Deno.test({
     // Every other file still ran.
     expectHas(r.err, "ok   adds");
     expectHas(r.err, "ok   still runs after two traps");
-    expectHas(r.err, "6 files · 14 passed · 11 failed · 1 skipped");
+    expectHas(r.err, "6 files · 15 passed · 11 failed · 1 skipped");
   },
 });
 

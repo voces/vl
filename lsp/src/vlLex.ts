@@ -12,8 +12,16 @@
 //   • `"…"` strings and `'…'` char literals sharing one escape set
 //     (`\n \t \r \\ \" \' \0 \b \f \v \xXX \uXXXX \u{…}`, plus
 //     backslash-newline line continuation, unknown escapes kept verbatim).
-//   • no interpolation, so a string is one opaque token and a brace inside it
-//     is text.
+//   • backtick TEMPLATE literals, scanned WHOLE — delimiters, text parts,
+//     `${…}` holes and all — and emitted as one `str` token. The whole point is
+//     that a brace, quote or backtick anywhere inside one is invisible to the
+//     consumers: a hole's `{ … }` is balanced by construction, so folding must
+//     not see it as a region, and a hole's `"…"` must not derail the string
+//     scan. Templates NEST (a hole may hold another), which is why the scan is a
+//     small state machine and not an `indexOf`.
+//   • no interpolation OF THE TEXT: a template's `str` value is its raw inner
+//     source, escapes undecoded, since no consumer reads a template's value for
+//     anything but a test name.
 //
 // Positions are 0-based LSP coordinates (`line` / `character`). `\r` is
 // whitespace, so a CRLF document tokenizes identically to an LF one — the
@@ -31,7 +39,8 @@ export interface LexPos {
 
 /**
  * `ident` — an identifier or keyword.
- * `str` — a TERMINATED double-quoted string; `s` is its DECODED value.
+ * `str` — a TERMINATED double-quoted string (`s` is its DECODED value), or a
+ *   TERMINATED backtick template (`s` is its raw inner source).
  * `comment` — a `//` or `///` line comment; `s` is the text as written,
  *   `//` included and any trailing `\r` excluded.
  * `punct` — everything else, one character at a time, EXCEPT a numeric run
@@ -178,6 +187,51 @@ export const scanStringLiteral = (source: string, from: number): StringScan => {
 };
 
 /**
+ * Scans the backtick template opening at `source[from]`, returning the index one
+ * past its closing backtick.
+ *
+ * The state machine is the lexer's (`compiler/lexer.vl`): in TEXT, a backslash
+ * escapes the next character, `` ` `` closes and `${` opens a hole; in a HOLE,
+ * braces nest, `"` / `'` literals are skipped whole (a backtick inside one is
+ * ordinary — the hole is expression context), and a nested template recurses.
+ * A newline is content on both sides, so the caller must count line breaks from
+ * the consumed slice rather than assume there are none.
+ */
+export const scanTemplate = (
+  source: string,
+  from: number,
+): { next: number; terminated: boolean } => {
+  let i = from + 1;
+  while (i < source.length) {
+    const c = source[i];
+    if (c === "\\") {
+      i += 2;
+      continue;
+    }
+    if (c === "`") return { next: i + 1, terminated: true };
+    if (c === "$" && source[i + 1] === "{") {
+      i += 2;
+      let depth = 0;
+      while (i < source.length) {
+        const h = source[i];
+        if (h === "}" && depth === 0) {
+          i++;
+          break;
+        }
+        if (h === "{") depth++;
+        else if (h === "}") depth--;
+        else if (h === '"' || h === "'") i = scanStringLiteral(source, i).next - 1;
+        else if (h === "`") i = scanTemplate(source, i).next - 1;
+        i++;
+      }
+      continue;
+    }
+    i++;
+  }
+  return { next: source.length, terminated: false };
+};
+
+/**
  * Every token that matters, in order. Whitespace is dropped; comments are
  * dropped unless `opts.comments`. A TERMINATED char literal is dropped too (it
  * can never be a name and it can hold a `"` that would otherwise derail the
@@ -223,6 +277,31 @@ export const tokenize = (
         });
       }
       i = stop;
+      continue;
+    }
+    if (c === "`") {
+      const start = posAt(i);
+      const scan = scanTemplate(source, i);
+      const raw = source.slice(i, scan.next);
+      // A template is multiline by design, so its own newlines move the cursor.
+      const nl = raw.lastIndexOf("\n");
+      if (nl >= 0) {
+        for (let k = 0; k < raw.length; k++) if (raw[k] === "\n") line++;
+        lineStart = i + nl + 1;
+      }
+      const end = posAt(scan.next);
+      if (scan.terminated) {
+        toks.push({
+          kind: "str",
+          s: source.slice(i + 1, scan.next - 1),
+          start,
+          end,
+        });
+      } else {
+        // Unterminated: emit the opening backtick so the scan makes progress.
+        toks.push({ kind: "punct", s: c, start, end });
+      }
+      i = scan.next;
       continue;
     }
     if (c === '"' || c === "'") {

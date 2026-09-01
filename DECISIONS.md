@@ -1918,6 +1918,93 @@ braced blocks reach too (`if c { 1 } else { 2 }` in value position is the same c
 formats parse-clean files, so it simply stops seeing the unbraced input; nothing became
 unreachable.
 
+## A template literal's stringifier is bound ABSOLUTELY, never by scope pickup (owner, 2026-09-01)
+
+**`` `v=${x}` `` renders `x` through `std:fmt`'s integer/boolean renderer no matter what the
+file imports, declares, or shadows.** A hole is not a call the user wrote and does not
+resolve like one: the parser desugars it to a call naming `$tpl$render`, an identifier no
+program can spell (`$` is not an identifier character), and the module merge rewrites that
+onto the merged `toStr$mN` through an ordinary rename row.
+
+**The rejected alternative is scope pickup** — resolving `toStr` in the user's scope, the way
+UFCS resolves `x.toStr()`. It reads as the more "VL" answer, and it is wrong for one reason
+that outweighs the consistency: *a string literal's meaning would then depend on the file's
+import list.* Two files with identical source text and different imports would print different
+things; deleting an unused-looking import would silently change a message; and a local
+`function toStr(self: i32) { "USER" }` would hijack every template in the file without a word
+from the compiler. Every surveyed language binds interpolation to a canonical protocol —
+Rust's `format!` expands to absolute `::core::fmt` paths precisely so a `use` cannot reach it —
+and `docs/constraints-design.md` §1 records the same answer from the other side: *bounds* may
+be scope-relative, interpolation may not.
+
+**Absolute binding is not free, and the price is an injected import.** Calling a std function
+from lowered code requires that function to be IN the merged program, so `modScan` pushes a
+BARE `std:fmt` edge — `impName` and `impLocal` both empty, the exact row a bare `import "…"`
+produces — for any module holding a hole. That emptiness is the whole no-pollution mechanism:
+`modBuildRename` mints a user-visible binding only for `impLocal != ""`, so the module is
+fetched, ordered, parsed and merged by the machinery an author's own import uses while `toStr`
+stays undeclared, a user-declared `toStr` still renames to its own `$mN`, and completion (which
+filters on the entry's imports) never offers it. Verified by byte identity rather than by
+reading: `` print(`v=${x}`) `` compiles byte-identically to `import { toStr } from "std:fmt"` +
+`print("v=" + x.toStr())`, and a module that already imports `toStr` and also interpolates is
+byte-identical to its hand-written twin — one merge, not two.
+
+**The bound name lives in ONE constant** (`TPL_RENDER_EXPORT` in `driver.vl`) because the owner
+has already ruled that `toStr` is renamed to `toString` once the ambient builtin is killed
+(ROADMAP § Ruled and sequenced). That rename is a one-line edit here.
+
+### The hole domain at launch, and why `f64` is absent
+
+`string`, plus whatever the RENDERER's declared parameter admits. A `string` hole is delivered
+DIRECTLY, because the renderer does not accept one and widening it to would box every
+interpolated string into a union to hand it straight back; everything else goes through the
+renderer.
+
+**The domain is not spelled in the compiler.** Both the admission test (`assignable(at,
+expected)`) and the refusal's own SENTENCE are read off that parameter type, so the two cannot
+disagree and neither can go stale. That is not a hypothetical: this was written against
+`i32 | i64 | boolean`, serde Stage 0's `renderF64` widened the renderer to include `f64` days
+later, and `` `v=${1.5}` `` began printing `1.5` **with no template-side edit** — the fixture
+that had pinned the f64 refusal flipped to pinning the widening instead. A hard-coded list is a
+citation with a date on it; this one would already have been wrong.
+
+Anything outside the domain gets a TEMPLATE-shaped refusal AT THE HOLE'S SPAN
+(``a template hole is `string` or i32 | i64 | boolean | f64 — this one is P``), never
+`argument 1: expected …, got P`. The generic message would name a call the
+author never wrote, over a parameter list they cannot see. The type-directed choice — deliver
+directly, render, or refuse — is made at the ONE line in `checkCallNode` where the hole's type
+first exists, so the in-domain path is byte-for-byte the path a hand-written `x.toStr()` takes
+and no second lowering exists to disagree with it.
+
+### Nesting is allowed; a backtick inside a hole's string needs no escape
+
+Both fall out of the scanner rather than being added to it, which is why neither is refused.
+A hole ends at the `}` at THAT hole's own brace depth, so a template inside a hole simply
+pushes its own row on the stack — `` `a${ `b${x}c` }d` `` prints `ab1cd`. And a hole is
+EXPRESSION context, so `"…"` inside one is scanned by the ordinary string scanner, where a
+backtick is an ordinary character: `` `${"nested ` backtick in string"}` `` needs no escape and
+does not get one. Escaping it would have meant one grammar's delimiter reaching into another's
+literal, which is the rule TS and JS also decline to make.
+
+Only the template's own TEXT parts escape a delimiter, and there the two escapes are ``\` ``
+and `\$`. Every other escape is the string escape set, shared and unchanged — asserted as
+such (`` `\t` == "\t" ``, `` `\u{1F600}` == "\u{1F600}" ``) rather than transcribed, and
+implemented as a purely LEXICAL part→`"…"` rewrite so no second escape decoder exists to drift
+from the lexer's.
+
+### The cost that is recorded rather than fixed
+
+A template whose holes are ALL strings still pulls `std:fmt` (and the `std:str` it imports):
+17,120 bytes against 1,920. The renderer is merged but never CALLED — byte-identical to an
+import-and-never-call control — so this is dead weight, not a wrong lowering. It is
+unavoidable *here* because the injection decision is made at TOKEN level: every host closes
+the module graph from a textual scan before any lexing happens, so nothing at that moment
+knows a hole's type. The fix is whole-program dead-code elimination, which `std/fmt.vl`'s own
+header already names as the missing piece for the identical symptom (`import { toStr }` alone
+costs 17,062 bytes where it used to cost 2,850 — that module's header dates and
+breaks down the number). A template-specific module-drop would be a
+second, narrower mechanism for the same problem.
+
 ## An unbraced body is RECOVERED, not cascaded — and the gate is `startsStmt`
 
 **One mistake, one diagnostic, and the parse continues with a usable AST.** (owner directive,

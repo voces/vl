@@ -87,6 +87,7 @@ import {
   Program,
   RetStmt,
   StrLit,
+  TPL_RENDER_LOCAL,
   TypeDecl,
   TypeRef,
   Unary,
@@ -96,6 +97,8 @@ import {
   mkBlock,
   mkIf,
   mkNum,
+  mkParen,
+  nodeIsTplHole,
 } from "./ast"
 import {
   P,
@@ -18457,6 +18460,68 @@ function firstValueRetIn(ix: i32): i32 {
   -1
 }
 
+// A TEMPLATE HOLE's delivery, decided by the hole's TYPE. Returns true when the
+// call is finished with (the caller yields `string`), false to let the ordinary
+// argument check run.
+//
+// Three answers, and each is a design commitment worth naming:
+//
+//   `string`  — DELIVERED DIRECTLY. The renderer is a number/boolean renderer
+//               and does not take a string; widening it to would box every
+//               interpolated string into a union to hand it straight back. So
+//               the render call is REPLACED IN PLACE by a `Paren` around the
+//               hole and the concatenation sees the string itself. In-place
+//               because the surrounding `+` chain already holds this arena
+//               index, and `Paren` because it is transparent to every later pass
+//               (checker, emitter, classifiers) by construction.
+//
+//   in domain — false, "carry on". The value then travels the SAME path a
+//               hand-written `x.toStr()` travels — the union box, the rep
+//               choice, the monomorphized callee — because it IS that path. No
+//               second lowering exists to disagree with it.
+//
+//   otherwise — a TEMPLATE-shaped refusal at the HOLE's own span, naming the
+//               domain. `argMismatchErr` would say "argument 1: expected …, got
+//               f64" about a call the author never wrote and a parameter list
+//               they cannot see.
+//
+// THE DOMAIN IS READ OFF THE RENDERER, NEVER SPELLED HERE — both the test
+// (`assignable(at, expected)`) and the SENTENCE come from `expected`, the
+// declared parameter type of whatever `std:fmt` export `TPL_RENDER_EXPORT`
+// names. A hard-coded list is a citation with a date on it, and this one would
+// already be stale: it read "`string`, `i32`, `i64` or `boolean`" and serde
+// Stage 0's `renderF64` widened the renderer to f64 in the same week, which the
+// template side picked up with no edit at all. That is the property worth
+// keeping, so the message states it rather than restating it.
+//
+// A hole that is ALREADY erroring (`TyErr`) or still a hole passes through: it
+// reported for itself, or the generic machinery will.
+function tplHoleHandled(
+  callIx: i32,
+  callPos: i32,
+  holeIx: i32,
+  at: i32,
+  expected: i32,
+) {
+  if isStringTy(at) {
+    P.nodes[callIx] = P.nodes[mkParen(holeIx, callPos)]
+    return true
+  }
+  if at < 0 { return false }
+  const t = T.tys[at]
+  if t is TyErr { return false }
+  if tyIsHole(at) { return false }
+  if assignable(at, expected) { return false }
+  tErr(
+    "a template hole is `string` or " +
+      tyToStr(expected) +
+      " — this one is " +
+      tyToStr(at),
+    holeIx,
+  )
+  true
+}
+
 // Report an `argument N: expected …, got …` mismatch — ONE home for the wording
 // AND the anchor policy, shared by the general call path and the UFCS one.
 //
@@ -22702,6 +22767,12 @@ function checkCallNode(n: Call, ix: i32) {
       // (without this `x` stays a `TyVar` and the monomorphizer can't concretize the lambda).
       seedExpected(args[i], substTyDeep(params[i], bNames, bTys))
       const at = checkNode(args[i])
+      // A TEMPLATE HOLE meeting its injected renderer. This line is the first
+      // moment the hole's type exists, which is why the type-directed half of
+      // the template lowering lives here and not in the parser's desugar.
+      if nodeIsTplHole(args[i]) {
+        if tplHoleHandled(ix, n.pos, args[i], at, params[i]) { return TY_STR }
+      }
       // Bind every TyVar reachable in the expected param position from the
       // argument's shape (first use wins), then check the argument against the
       // SUBSTITUTED expected type — a later disagreeing use errors here.
@@ -26139,6 +26210,22 @@ function checkNodeReal(ix: i32) {
   } else if n is Ident {
     const ty = lookup(n.identName)
     if ty < 0 {
+      // THE TEMPLATE RENDERER'S FLOOR. `$tpl$render` is minted by the parser and
+      // rewritten to the merged `toStr$mN` by `modBuildRename`; reaching here
+      // means `std:fmt` never entered the module graph, which can only happen if
+      // a host's textual module-mode gate disagreed with the lexer about what a
+      // template hole is (`cliHasTplHole` and its Rust/TS twins). Named, because
+      // `undeclared identifier '$tpl$render'` points at a name the author cannot
+      // have written and gives them nothing to act on. No program should reach
+      // it — measured agreement across nine gate/lexer cases — and if one does,
+      // the gate is the bug.
+      if n.identName == TPL_RENDER_LOCAL {
+        tErr(
+          "internal: a template hole's renderer was not merged — `std:fmt` is missing from this program's module graph",
+          ix,
+        )
+        return TY_ERR
+      }
       tErr("undeclared identifier '" + n.identName + "'", ix)
       return TY_ERR
     }

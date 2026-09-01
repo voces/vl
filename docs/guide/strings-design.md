@@ -1049,11 +1049,16 @@ the best fit for the 63% scanning case, but it is a language-surface feature nee
 its own design pass. Does not gate anything here. *Owner call: worth a design pass, or
 is re-slicing enough?*
 
-**OQ-2 — string building, interpolation, and formatting.** The perf half is **done**
-(B7b fusion, §Mutability). The ergonomic halves remain: an explicit builder type for
-cases fusion cannot see, interpolation syntax (`f"Hello {name}"` or
-`` `Hello ${name}` ``), and a `std:fmt`. *Recommendation: interpolation is the highest
-ergonomic value now that fusion covers the perf trap; `std:fmt` can back it.*
+**OQ-2 — string building, interpolation, and formatting. INTERPOLATION IS SHIPPED
+(2026-09-01), `std:fmt` exists; the builder remains.** The perf half was already done
+(B7b fusion, §Mutability). The spelling ruled and built is `` `Hello ${name}` ``, and
+`std:fmt` does back it — but not by scope lookup: a hole binds ABSOLUTELY to std's
+renderer through a compiler-injected import, so a template's meaning does not depend on
+the file's imports (DECISIONS.md, "A template literal's stringifier is bound
+ABSOLUTELY"). The hole domain is `string` plus whatever `std:fmt`'s renderer takes,
+read off its declared parameter rather than spelled in the compiler — so serde
+Stage 0's f64 arm widened it with no template-side edit. *Remaining: an explicit
+builder type for cases fusion cannot see.*
 
 **OQ-3 — the core-vs-`std` line for the method surface. RESOLVED (owner ruling): the 15
 names STAY IN `std:str`.** Not promoted to compiler intrinsics. Three reasons, in order

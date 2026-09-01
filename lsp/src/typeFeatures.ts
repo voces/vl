@@ -195,6 +195,10 @@ const LEX_CLASS_TOKEN_TYPE: Record<number, number> = {
   2: TT.number,
   3: TT.boolean,
   4: TT.comment,
+  // Template literals only — a `"` string still carries no class, so the
+  // TextMate grammar keeps its finer escape scopes there. See the driver's
+  // `lexClassOf` for why a template cannot be left to the grammar.
+  5: TT.string,
 };
 
 const lexicalTokensFromExternal = (

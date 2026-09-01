@@ -1327,6 +1327,52 @@ impl StrOut {
 /// the module fetch loop when it has imports, then `srcReset` + `srcPush`. Leaves
 /// the instance ready for a `checkSrc` / `compileSrc` / `lintSrc` call. Used by
 /// `compile_vl` (build/run); `check` drives its own module fetch from VL via the
+/// True when `source` holds a backtick template literal that has a `${…}` hole.
+///
+/// Skips `//` comments and `"…"` / `'…'` literals so a backtick written in prose
+/// — the common case in this repo's own sources — never arms the module fetch
+/// loop. A hole-less `` `plain` `` needs no `std:fmt` renderer and is left on the
+/// single-source path. Byte-oriented: every character it tests is ASCII, and a
+/// multi-byte UTF-8 sequence's continuation bytes are all >= 0x80.
+fn has_template_hole(source: &str) -> bool {
+    let b = source.as_bytes();
+    let n = b.len();
+    let mut i = 0;
+    while i < n {
+        match b[i] {
+            b'/' if i + 1 < n && b[i + 1] == b'/' => {
+                while i < n && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            q @ (b'"' | b'\'') => {
+                i += 1;
+                while i < n && b[i] != q {
+                    if b[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'`' => {
+                i += 1;
+                while i < n && b[i] != b'`' {
+                    if b[i] == b'\\' {
+                        i += 1;
+                    } else if b[i] == b'$' && i + 1 < n && b[i + 1] == b'{' {
+                        return true;
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    false
+}
+
 /// command-queue pump.
 fn stage_program(store: &mut Store<()>, inst: &Instance, source: &str, source_path: &str) -> Result<()> {
     let src_reset = inst.get_typed_func::<(), i32>(&mut *store, "srcReset")?;
@@ -1343,6 +1389,13 @@ fn stage_program(store: &mut Store<()>, inst: &Instance, source: &str, source_pa
     // diagnostic fires inside the wasm instead of an infinite re-request).
     // A re-export (`export { … } from "…"`) is a module dependency too, so it must
     // also arm the fetch loop — gate on a leading `import {` OR `export {`.
+    // A TEMPLATE LITERAL WITH A HOLE also arms it: the hole desugars to a call
+    // into `std:fmt`, which the compiler can only reach through this loop. The
+    // same predicate lives in `compiler/cli_util.vl` (`cliHasTplHole`),
+    // `lsp/src/wasmChecker.ts` and `tests/cases_wasm_test.ts`, and its header
+    // there records why it is a real scan rather than `contains('`')`: a backtick
+    // in a `//` comment is ordinary (2,409 corpus files carry one) and must not
+    // move a program off the single-source path.
     let has_imports = source.lines().any(|l| {
         let t = l.trim_start();
         let imp = t
@@ -1354,7 +1407,7 @@ fn stage_program(store: &mut Store<()>, inst: &Instance, source: &str, source_pa
             .map(|rest| rest.trim_start().starts_with('{'))
             .unwrap_or(false);
         imp || reexp
-    });
+    }) || has_template_hole(source);
     // Set when the module fetch loop stages the program: `compileSrc`/`checkSrc`
     // then run the module pipeline off the module table and never read the
     // single-source buffer, so pushing the entry source AGAIN through the

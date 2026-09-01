@@ -289,3 +289,58 @@ Deno.test({ name: "wasm-lexical: `=>` fuses to one keyword token when source is 
     throw new Error(`\`>=\` must stay operator-classed, got ${JSON.stringify(ge)}`);
   }
 });
+
+// ---- template literals: the text parts colour as string, the holes do not ----
+// A template is NOT one token — its text runs arrive as four lexer kinds with
+// the hole EXPRESSIONS lexed in between — so leaving it to the TextMate grammar
+// would paint a hole's identifiers as string content. `lexClassOf` gives the
+// four template kinds class 5 (string), which covers exactly the text parts and
+// the `${` / `}` delimiters riding on them; everything inside a hole keeps the
+// colour it would have anywhere else.
+//
+// The spans are what this pins. For `const s = `v=${x} ok``:
+//   col 10 `` `v=${ `` — 5 chars, string      (HEAD: backtick + text + `${`)
+//   col 15 `x`         — the hole, NOT string (the symbol slice owns it)
+//   col 16 `} ok``     — 5 chars, string      (TAIL: `}` + text + backtick)
+
+Deno.test({ name: "wasm-lexical: a template's parts are string-classed, its hole is not", ignore }, () => {
+  const checker = loadWasmChecker(SEED, () => {})!;
+  const src = "const x = 1\nconst s = `v=${x} ok`\n";
+  const lexical = checker.lexicalTokensAt(src);
+  const toks = decode(semanticTokensDataFromWasm([], lexical, [], src));
+  const at = (line: number, char: number) =>
+    toks.find((t) => t.line === line && t.char === char);
+
+  const head = at(1, 10);
+  if (head === undefined || head.type !== "string" || head.length !== 5) {
+    throw new Error(`expected a 5-char string token at 1:10, got ${JSON.stringify(head)}`);
+  }
+  const tail = at(1, 16);
+  if (tail === undefined || tail.type !== "string" || tail.length !== 5) {
+    throw new Error(`expected a 5-char string token at 1:16, got ${JSON.stringify(tail)}`);
+  }
+  // The hole's `x` must not be swallowed by either part: no string token starts
+  // at its column, and no string token spans it.
+  const holeString = toks.find((t) =>
+    t.type === "string" && t.line === 1 && t.char <= 15 && t.char + t.length > 15
+  );
+  if (holeString !== undefined) {
+    throw new Error(`the hole must not be string-classed, got ${JSON.stringify(holeString)}`);
+  }
+
+  // A hole-less template is one token covering the whole literal.
+  const plain = checker.lexicalTokensAt("const p = `abc`\n");
+  const plainToks = decode(semanticTokensDataFromWasm([], plain, [], "const p = `abc`\n"));
+  const whole = plainToks.find((t) => t.line === 0 && t.char === 10);
+  if (whole === undefined || whole.type !== "string" || whole.length !== 5) {
+    throw new Error(`expected a 5-char string token at 0:10, got ${JSON.stringify(whole)}`);
+  }
+
+  // A `"` string still carries NO class — it is the TextMate grammar's, whose
+  // finer escape scopes would be lost to a flat semantic token.
+  const dq = checker.lexicalTokensAt('const q = "abc"\n');
+  const dqToks = decode(semanticTokensDataFromWasm([], dq, [], 'const q = "abc"\n'));
+  if (dqToks.some((t) => t.type === "string")) {
+    throw new Error(`a "" string must stay unclassed, got ${JSON.stringify(dqToks)}`);
+  }
+});
