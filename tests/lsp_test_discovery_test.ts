@@ -603,13 +603,23 @@ Deno.test("anchor: a Windows-style drive path survives the colon split", () => {
   );
 });
 
+// `failureAnchor` takes its resolver as a PARAMETER — joining and absoluteness
+// are platform questions, and `testDiscovery.ts` imports nothing so it stays
+// loadable under this file's own (root) deno config. A POSIX stub is all these
+// cases need; the extension passes `node:path`'s `path.resolve`.
+const posixResolve = (base: string, rel: string): string =>
+  rel.startsWith("/") ? rel : `${base}/${rel}`;
+
 Deno.test("anchor: a location resolves against the cwd the runner ran in", () => {
-  // `std:test` spells `file` exactly as the `vl test` target was spelled, so both
-  // sides are resolved the same way before they are compared.
+  // EVERY module key is spelled relative to the CWD — the entry's and a helper's
+  // alike (measured 2026-09-01 with cwd and entry directory deliberately
+  // different: `vl test sub/hop.test.vl` from the parent reports `sub/hop.test.vl`
+  // AND `sub/helper.vl`). So both sides resolve the same way before comparison.
   const rel = failureAnchor(
     { file: "hop.test.vl", line: 15, col: 3 },
     "/w/tc",
     "hop.test.vl",
+    posixResolve,
   );
   eq(
     rel,
@@ -620,11 +630,24 @@ Deno.test("anchor: a location resolves against the cwd the runner ran in", () =>
     { file: "helper.vl", line: 10, col: 3 },
     "/w/tc",
     "hop.test.vl",
+    posixResolve,
   );
   eq(
     helper,
     { file: "/w/tc/helper.vl", isTarget: false, line: 9, col: 2 },
     "a helper file anchors in ITS file, not the test's",
+  );
+  // A nested target: the key carries the same `sub/` prefix the target does, so
+  // the two still resolve equal. This is the shape the cwd measurement took.
+  eq(
+    failureAnchor(
+      { file: "sub/hop.test.vl", line: 5, col: 3 },
+      "/w",
+      "sub/hop.test.vl",
+      posixResolve,
+    ).isTarget,
+    true,
+    "a target under a subdirectory is still the target",
   );
   // The absolute spelling the extension actually uses.
   eq(
@@ -632,6 +655,7 @@ Deno.test("anchor: a location resolves against the cwd the runner ran in", () =>
       { file: "/w/tc/hop.test.vl", line: 1, col: 1 },
       "/w",
       "/w/tc/hop.test.vl",
+      posixResolve,
     ),
     { file: "/w/tc/hop.test.vl", isTarget: true, line: 0, col: 0 },
     "absolute target, absolute key, still the target",
@@ -646,6 +670,7 @@ Deno.test("anchor: an unsaved buffer's MIRROR still counts as the target", () =>
     { file: "/w/.t.vital-dirty.vl", line: 5, col: 3 },
     "/w",
     "/w/.t.vital-dirty.vl",
+    posixResolve,
   );
   eq(at.isTarget, true, "the mirror is the target");
 });

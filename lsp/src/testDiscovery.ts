@@ -44,13 +44,6 @@
 // exactly its own call's parentheses, which is true of every brace style
 // including the formatter's one-liner.
 
-// `node:path` (spelled with the prefix, so the ROOT deno.json — which does not
-// carry lsp/deno.json's `"path"` mapping — resolves it too) is the ONE runtime
-// import here, for the failure-anchor resolution at the bottom. The constraint
-// this module keeps is that it never imports `vscode`; that is what makes all of
-// it Deno-testable, and a builtin does not cost it.
-import * as path from "node:path";
-
 import type { LspRange } from "./typeFeatures.ts";
 import { type LexToken, tokenize } from "./vlLex.ts";
 
@@ -426,20 +419,32 @@ export interface FailureAnchor {
 
 /**
  * Resolve one reported location against the run that produced it. `cwd` is where
- * `vl test` was spawned and `target` is the path it was handed: `std:test` spells
- * `file` exactly as the target was spelled (absolute for an absolute target,
- * `x.test.vl` for a relative one — measured 2026-09-01), so resolving both the
- * same way is what makes the comparison meaningful.
+ * `vl test` was spawned and `target` is the path it was handed.
+ *
+ * **Every module key in a report is spelled relative to the CWD**, not to the
+ * entry file's directory — measured 2026-09-01 with the two deliberately
+ * different: `vl test sub/hop.test.vl` from the parent reports the entry as
+ * `sub/hop.test.vl` AND a helper beside it as `sub/helper.vl`. So resolving the
+ * key and the target the same way, against `cwd`, is what makes `isTarget` mean
+ * what it says. (The extension always hands `vl test` an ABSOLUTE path, so its
+ * own keys are absolute and the resolution is a no-op there; the relative case
+ * is a hand-run CLI, and is the one this has to get right on purpose.)
+ *
+ * `resolve` is INJECTED — `path.resolve` from the caller — because joining and
+ * absoluteness are platform questions (a Windows drive letter, a backslash) and
+ * this module deliberately imports nothing: it is loaded by Deno tests under the
+ * root config, where a `node:` builtin does not type-check.
  */
 export const failureAnchor = (
   loc: FailureLocation,
   cwd: string,
   target: string,
+  resolve: (base: string, rel: string) => string,
 ): FailureAnchor => {
-  const file = path.resolve(cwd, loc.file);
+  const file = resolve(cwd, loc.file);
   return {
     file,
-    isTarget: file === path.resolve(cwd, target),
+    isTarget: file === resolve(cwd, target),
     line: Math.max(0, loc.line - 1),
     col: Math.max(0, loc.col - 1),
   };

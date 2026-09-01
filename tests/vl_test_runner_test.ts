@@ -26,6 +26,14 @@
 // unit half of the same pair).
 import { failureAnchor, parseTestReport } from "../lsp/src/testDiscovery.ts";
 
+/**
+ * The resolver `failureAnchor` takes as a parameter (the extension passes
+ * `node:path`'s). Every path this suite hands it is already absolute, so joining
+ * is the only case, and a POSIX join is what this runner's own paths are.
+ */
+const resolve = (base: string, rel: string): string =>
+  rel.startsWith("/") ? rel : `${base}/${rel}`;
+
 const exists = (p: string): boolean => {
   try {
     Deno.statSync(p);
@@ -200,6 +208,7 @@ Deno.test({
       result.location!,
       ROOT,
       `${FIXTURES}/fail.test.vl`,
+      resolve,
     );
     if (!at.isTarget) {
       throw new Error(`the anchor left the file under test: ${at.file}`);
@@ -333,6 +342,7 @@ Deno.test({
         parsed.results.find((x) => x.path === "kept")!.location!,
         dir,
         test,
+        resolve,
       );
       if (anchor.isTarget || anchor.file !== `${dir}/helper.vl`) {
         throw new Error(

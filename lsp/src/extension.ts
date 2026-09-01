@@ -641,7 +641,7 @@ interface RunPaths {
  * `testDiscovery.ts` so it is unit-testable; only the vscode types are here.
  */
 const anchorLocation = (paths: RunPaths, loc: FailureLocation): Location => {
-  const at = failureAnchor(loc, paths.cwd, paths.target);
+  const at = failureAnchor(loc, paths.cwd, paths.target, path.resolve);
   return new Location(
     at.isTarget ? paths.uri : Uri.file(at.file),
     new Position(at.line, at.col),
