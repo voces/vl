@@ -1724,6 +1724,34 @@ seed from current `compiler/*.vl` in ~40s.*
 ## Track D — LSP / editor experience (`lsp/src/server.ts`)
 *Mostly independent; benefits from Track A. AST nodes carry source spans (Track G).*
 
+- ⬜ **D9. Editor-surface queue** — the ordered work-through of
+  `docs/internals/editor-surface-survey.md` (2026-08-31; the full LSP 3.17 + VS Code surface
+  graded against the shipped extension and the `WasmChecker` capabilities — statuses,
+  feasibility notes, and the detail live THERE; this list is the order, not the spec).
+  Worked serially, one worktree agent per item, gates + PR each; quick wins first:
+  1. ⬜ Document highlights (`referencesAt` verbatim, ~20 lines)
+  2. ⬜ Status-bar seed indicator (`onOrigin` already reports the winning rung)
+  3. ⬜ Document symbols — flat outline (`tokensAt` + `moduleSurface`; nesting needs a
+     body-extent export later)
+  4. ⬜ Code lens: export reference counts (`lastUseMap` is already computed every save)
+  5. ⬜ Hover polish — ONE user-facing type-render pathway in the query layer owning
+     `$mN` demangling (hover/inlay/member/alias leak it today; scopeAt's inline wraps
+     collapse into it), and a FUNCTION-BINDING hover that zips the decl's parameter
+     names with `TyFunc.fnParamTypes` (`it(name: string, body: () => void) => void`) —
+     types are structural and carry no names by design, so the names come from the
+     declaration; the same data feeds 9 (signature help)
+  6. ⬜ Rename symbol (+prepare) — `referencesAt`/`crossFileReferences`; its own PR
+     (write-path feature, alias/import edges need care)
+  7. ⬜ **Testing API: per-test click-to-run** — `vl test <file> -t <substring>` suffices
+     (no CLI change); TestController over CodeLens per the survey's assessment
+  8. ⬜ Folding ranges + language-config indentation/on-enter rules
+  9. ⬜ Signature help (bridge grade today; clean grade wants one native export)
+  10. ⬜ Doc-comment-aware hover/completion (needs the one native doc-text export;
+     the D7 linkifier host side already exists)
+  Not queued (and why, in one line each): workspace symbols (rides on 3's plumbing —
+  fold in when 3 lands), inline values / DAP (no debugger yet), notebooks/monikers/
+  call-hierarchy (n/a per survey until asked for by use).
+
 - 🟡 **D1. Hover types.** REMAINING: flow-narrowed receiver types; Map/Set members (when B6a fully lands).
 - 🟡 **D3. Autocomplete.** REMAINING: wiring a completion provider into the Monaco playground (E).
 - 🟡 **D4. Formatter.** REMAINING:
