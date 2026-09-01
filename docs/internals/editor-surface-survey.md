@@ -95,7 +95,7 @@ parameter lists as structured data (only rendered type strings), declaration *bo
 | Go to implementation | n/a | — | VL has no interfaces/traits to implement. |
 | Go to declaration | n/a | — | No decl/def split in VL. |
 | Find references | **have** | Cross-file, capped crawl | — |
-| Document highlights | **missing** | All same-file occurrences light up under the cursor | **Fully served by `referencesAt`** — a ~20-line handler. |
+| Document highlights | **have** | All same-file occurrences light up under the cursor | Shipped (D9.1): `referencesAt` verbatim + a `definitionAt` pairing to mark the decl as the Write occurrence. |
 | Document symbols | **missing** | Outline view, breadcrumbs, Ctrl+Shift+O | Flat list served by `tokensAt` (decl-flagged, kinds) + `moduleSurface`; `type` decls need a small host-side scan (not in the token slice); *nesting* needs body extents → native export. Flat is still a big discoverability win. |
 | Workspace symbols | **missing** | Ctrl+T "open any exported symbol by name" | Served by `moduleSurface` over `enumerateWorkspaceFiles` — the unused-export pass already runs exactly this crawl; add a name index. |
 | Code actions | **partial** | 4 lint quick-fixes | More fixes = more lint codes; machinery is done. No refactoring-tier actions (extract fn etc. — needs AST edits the surface doesn't expose). |

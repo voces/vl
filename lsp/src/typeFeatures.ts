@@ -476,6 +476,43 @@ export const inlayHintsFromWasm = (
   return hints;
 };
 
+// ---- document highlights ----------------------------------------------------
+//
+// `textDocument/documentHighlight`: every same-file occurrence of the symbol
+// under the cursor lights up on cursor rest. The occurrence set is
+// `referencesAt` verbatim (the survey's "cheapest genuine polish item"); the
+// only shaping is the per-occurrence KIND — the LSP distinguishes a Write
+// (the declaration) from a Read (a use). The checker's `referencesAt` returns
+// bare ranges without the decl flag, so the host pairs it with `definitionAt`
+// (one extra query at the same cursor) and marks the occurrence matching the
+// declaring span as the write.
+
+/** LSP-neutral highlight kind; `server.ts` maps to `DocumentHighlightKind`. */
+export type HighlightKind = "read" | "write";
+
+/** One document highlight: an occurrence span + read/write classification. */
+export type DocumentHighlightSpan = { range: LspRange; kind: HighlightKind };
+
+const sameLspRange = (a: LspRange, b: LspRange): boolean =>
+  a.start.line === b.start.line && a.start.character === b.start.character &&
+  a.end.line === b.end.line && a.end.character === b.end.character;
+
+/**
+ * Shape a reference set into document highlights: the occurrence whose span
+ * equals `decl` (the binding's declaring span, from `definitionAt`) is a
+ * `write`, every other a `read`. With no known declaration (`decl` undefined —
+ * e.g. a seed predating `defAt`) every occurrence is a `read`: the kind is
+ * decoration, and "all reads" renders correctly while "wrong write" would not.
+ */
+export const documentHighlightsFromRefs = (
+  refs: LspRange[],
+  decl: LspRange | undefined,
+): DocumentHighlightSpan[] =>
+  refs.map((range) => ({
+    range,
+    kind: decl !== undefined && sameLspRange(range, decl) ? "write" : "read",
+  }));
+
 // ---- completion (D3) --------------------------------------------------------
 
 /**

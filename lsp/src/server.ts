@@ -7,6 +7,8 @@ import {
   Diagnostic,
   DiagnosticSeverity,
   DiagnosticTag,
+  DocumentHighlight,
+  DocumentHighlightKind,
   Hover,
   InlayHint,
   InlayHintKind,
@@ -59,7 +61,9 @@ import {
   type CompletionKind,
   displayableType,
   docMarkdown,
+  documentHighlightsFromRefs,
   type DocRefResolver,
+  type HighlightKind,
   inlayHintsFromWasm,
   isDisplayableType,
   keywordCompletions,
@@ -478,6 +482,58 @@ connection.onReferences(async (params): Promise<Location[] | null> => {
   }
   return null;
 });
+
+// Document highlights (D9.1): every same-file occurrence of the symbol under
+// the cursor lights up on cursor rest — `referencesAt` verbatim (the survey's
+// cheapest polish item), single-file by design (highlights only ever apply to
+// the current document, so the cross-module crawl `onReferences` falls back to
+// has no business here). The declaration renders as a Write, uses as Reads:
+// `referencesAt` returns bare ranges, so the decl is identified by one extra
+// `definitionAt` at the same cursor (~0.1–1.3 ms — same budget as the
+// reference query itself); if that rung is unavailable every occurrence
+// degrades to Read (see `documentHighlightsFromRefs`). No checker → null.
+const highlightKindMap: Record<HighlightKind, DocumentHighlightKind> = {
+  read: DocumentHighlightKind.Read,
+  write: DocumentHighlightKind.Write,
+};
+connection.onDocumentHighlight(
+  async (params): Promise<DocumentHighlight[] | null> => {
+    const doc = documents.get(params.textDocument.uri);
+    if (!doc) return null;
+    if (wasmChecker?.referencesAt === undefined) return null;
+    const text = doc.getText();
+    const entryKey = entryKeyOf(params.textDocument.uri);
+    const refs = await wasmChecker
+      .referencesAt(
+        text,
+        entryKey,
+        workspaceReader,
+        params.position.line,
+        params.position.character,
+        true, // the declaration is an occurrence to light up too
+      )
+      .catch((err) => {
+        connection.console.log(`[wasm-symbols] referencesAt failed: ${err}`);
+        return [] as WasmRange[];
+      });
+    if (refs.length === 0) return null;
+    const decl = wasmChecker.definitionAt !== undefined
+      ? await wasmChecker
+        .definitionAt(
+          text,
+          entryKey,
+          workspaceReader,
+          params.position.line,
+          params.position.character,
+        )
+        .catch(() => undefined)
+      : undefined;
+    return documentHighlightsFromRefs(refs, decl).map((h) => ({
+      range: h.range,
+      kind: highlightKindMap[h.kind],
+    }));
+  },
+);
 
 // Extract the identifier `[A-Za-z_][A-Za-z0-9_]*` straddling `character` on
 // `line`, or null if the cursor isn't on a word. We scan outward from the
@@ -1069,6 +1125,7 @@ connection.onInitialize((params) => {
       },
       definitionProvider: true,
       referencesProvider: true,
+      documentHighlightProvider: true,
       documentFormattingProvider: true,
       codeActionProvider: {
         codeActionKinds: [CodeActionKind.QuickFix],
