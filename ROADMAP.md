@@ -1735,7 +1735,7 @@ seed from current `compiler/*.vl` in ~40s.*
      `type` decls; nesting still needs a body-extent export later)
   4. ✅ Code lens: export reference counts (`lastUseMap`, no new crawl; locations
      resolve lazily on click)
-  5. ⬜ Hover polish — ONE user-facing type-render pathway in the query layer owning
+  5. ✅ Hover polish — #2105 — — ONE user-facing type-render pathway in the query layer owning
      `$mN` demangling (hover/inlay/member/alias leak it today; scopeAt's inline wraps
      collapse into it), and a FUNCTION-BINDING hover that zips the decl's parameter
      names with `TyFunc.fnParamTypes` (`it(name: string, body: () => void) => void`) —
