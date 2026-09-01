@@ -579,9 +579,48 @@ split):
   literals, serde, and log files can never capture an escape code. At Stage 2 this falls
   out naturally: the derive's walk is an event stream, the plain string builder is one
   consumer, the colorizing TTY sink is another.
-- **Stage C0 (can land any time, host-side, small)**: the print sink already knows each
-  primitive's type (per-type host imports) — color primitives under the policy above.
-  **Stage C2**: composite coloring rides the Stage 2 event walk.
+- **Stage C0 — SHIPPED (host-side; `Palette` in `scripts/vl-host/src/main.rs`).** The
+  print imports know each primitive's type, so the escape is applied there — the last
+  point before stdout that still knows a value's type, and the only place a program's
+  output can acquire one. Measured behaviour, one row per clause of the policy, pinned by
+  `tests/vl_print_color_test.ts`:
+
+  | invocation | escapes |
+  | --- | --- |
+  | `vl run m.vl \| xxd \| grep -c 1b` | **0** |
+  | `vl run m.vl` on a pty (`TERM=xterm`) | 8 — `ESC[33m5ESC[39m` per value |
+  | pty + `NO_COLOR=1` / pty + `TERM=dumb` | 0 / 0 |
+  | pipe + `--color=always` / pty + `--color=never` | 8 / 0 |
+  | `NO_COLOR=1` + `--color=always` | 8 — an explicit flag overrides the variable |
+  | `print("42")` under `--color=always` | 0 — a string is never colored |
+  | `"n = " + toString(n)` under `--color=always` | 0 — the renderer's strings stay pure |
+  | `--batch` `.out`, and `vl test`'s relayed output | 0 / 0 |
+
+  **The palette is Node's, measured rather than chosen**: `util.inspect.styles` on node
+  v24.11.1 gives `number`/`bigint`/`boolean` = `yellow` and `util.inspect.colors.yellow`
+  = `[33, 39]` — the open/close PAIR, not `[0m`, so a reset never cancels a bold the
+  surrounding shell set. On a pty `console.log(5)` emits `ESC[33m5ESC[39m` and
+  `console.log("s")` emits `s`; VL's i32/i64/f32/f64/boolean sinks now do the same, and
+  its string sinks (`__print_char__`/`__print_str_flush__`) do not. **One correction to
+  the sentence above**: Node renders `null` in **bold** (`[1, 22]`) and `undefined` in
+  grey — not dim/grey for null. Nothing is colored for it yet, because VL's print import
+  family has no null sink; the measurement is recorded for Stage C2.
+
+  Two details the implementation settled. **`--color` is resolved in the host for every
+  subcommand**, not just `run`: `cli_pump` appends its answer as a synthetic argv entry
+  for the VL formatter, and a caller's own `--color=` used to lose to it (the VL parser
+  takes the last one it sees), so `vl check --color=always | less -R` resolved to
+  `never`. It is now an override everywhere, and an unrecognized value is exit 2 rather
+  than a silent "never". And **`vl test` relays a failing test's captured output plain**
+  while coloring its own report: that output is pushed character by character into a VL
+  string for the reporter, so an escape in it would be an escape inside a VL string
+  value — the thing this section forbids — as well as a double-wrap.
+
+  **Stage C2**: composite coloring rides the Stage 2 event walk. The two TS print-sink
+  twins (`tests/support/runWasm.ts`, `playground/src/runtime.ts`) are a documented
+  deferral, not an oversight: neither has a stdout to test for a terminal — one pushes
+  into an array a test compares, the other into the DOM, where an escape renders as
+  literal garbage. A colored playground wants spans, built off the same type split.
 
 ## Cycles (owner ruling, 2026-09-01)
 

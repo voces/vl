@@ -50,6 +50,13 @@ export const runWasmBytes = async (wasm: Uint8Array): Promise<string[]> => {
       },
       // Direct value sinks for `print(x)`. A wasm i64 arrives as a JS bigint; the
       // rest as numbers. Booleans render as `true`/`false`.
+      //
+      // NO COLOR HERE, DELIBERATELY (Stage C0's twin; see the native host's
+      // `Palette`). The native sink wraps a rendered VALUE in ANSI when stdout is a
+      // terminal — this one has no terminal to ask about, and its `logs` land in
+      // the DOM, where an escape sequence renders as literal garbage rather than as
+      // color. If the playground ever wants colored output it wants SPANS, built
+      // from the same type split this family already provides.
       __print_i32__: (v: number) => logs.push(String(v)),
       __print_i64__: (v: bigint) => logs.push(v.toString()),
       __print_f32__: (v: number) => logs.push(String(v)),
