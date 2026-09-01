@@ -105,10 +105,25 @@ Deno.test("auto-import: a file with no imports gets one at the very top", () => 
   const src = 'print("hi")\n';
   const edit = importInsertionEdit(src, "std:test", "it");
   if (edit === undefined) throw new Error("expected an edit");
+  // The insertion lands directly above a statement, so it carries the blank
+  // line fmt guarantees between the import block and the first statement.
   assert(
-    edit.newText === 'import { it } from "std:test"\n' &&
+    edit.newText === 'import { it } from "std:test"\n\n' &&
       edit.range.start.line === 0 && edit.range.start.character === 0,
     `top insertion; got ${JSON.stringify(edit)}`,
+  );
+});
+
+Deno.test("auto-import: a new import directly above a statement carries the blank line", () => {
+  // No blank after the import block (pre-fmt source): the inserted line lands
+  // above `it(...)`, so it must bring the blank line with it to stay fmt-stable.
+  const src = 'import { it } from "std:test"\nit("x", () => {})\n';
+  const edit = importInsertionEdit(src, "std:fmt", "pad");
+  if (edit === undefined) throw new Error("expected an edit");
+  assert(
+    edit.newText === 'import { pad } from "std:fmt"\n\n' &&
+      edit.range.start.line === 1 && edit.range.start.character === 0,
+    `insert with blank; got ${JSON.stringify(edit)}`,
   );
 });
 
