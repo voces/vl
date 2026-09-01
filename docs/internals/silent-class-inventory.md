@@ -23894,7 +23894,20 @@ STORAGE differs refuses.
 * **SO THE BUILD IS THREE SITES, none of them research:** the loop (mirror
   `emitRefListWidenTop`, convert instead of box), the checker's
   `containerElemClassDiffers` refusal (admit the pair the copy can serve, gated on the write
-  scan), and the delivery site that calls it — `emitRefListWidenSite`'s scalar twin.
+  scan), and the delivery — `emitRefListWidenSite`'s scalar twin.
+
+* **THE DELIVERY BOUNDARIES ARE ENUMERABLE, not a design question.** `emitRefListWidenSite`
+  has EIGHT callers, and they are the complete list of positions where a container delivery
+  can widen: `emitDirectCall` (the argument position this probe uses), `emitReturnValue`,
+  `emitLetDeclStmt`, the assignment boundary, the struct-FIELD boundary, the nested-list
+  ELEMENT boundary, the map-VALUE boundary, and the global-init boundary in `emit_sections`.
+  A scalar twin either mirrors those eight or — better — the existing site gains a scalar arm,
+  so the two families cannot drift about which positions widen.
+
+* **AND THE CHECKER GATE IS LOAD-BEARING, measured rather than assumed.** Disabling
+  `containerElemClassDiffers`'s refusal alone, with no copy built, yields invalid wasm for
+  both the empty-literal and the non-empty case. So the refusal is doing real work and the
+  order is: build the loop, wire the delivery, THEN narrow the gate.
 
 Repro (check rc 0 is NOT reached — the CHECKER refuses):
 
