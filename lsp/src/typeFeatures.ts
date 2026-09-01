@@ -513,6 +513,100 @@ export const documentHighlightsFromRefs = (
     kind: decl !== undefined && sameLspRange(range, decl) ? "write" : "read",
   }));
 
+// ---- document symbols: flat outline (D9.3) ----------------------------------
+//
+// `textDocument/documentSymbol` as a FLAT list — the survey's shipped grade
+// (nesting needs a declaration-body-extent export the seed doesn't have; do
+// not fake it with brace counting). Sources, per the survey's sketch:
+//   - functions: every decl-flagged identifier of binding kind 2 (`tokensAt`);
+//   - module-level `let`/`const`: decl-flagged kind-0 identifiers whose line
+//     starts with the declaration itself (a fmt-indented local never does);
+//   - `type` aliases: a host-side line scan — type names are deliberately not
+//     in the token slice;
+//   - the exported flag: `moduleSurface().exports` names (types additionally
+//     read their own `export` prefix — the alias may not ride the surface).
+// Parameters and function-local bindings are excluded: an outline is a map of
+// the module, not a dump of every binding.
+
+/** LSP-neutral outline kind; `server.ts` maps to `SymbolKind`. */
+export type OutlineSymbolKind = "function" | "variable" | "constant" | "type";
+
+/** One flat outline entry. Position is the NAME span (0-based, LSP). */
+export type OutlineSymbol = {
+  name: string;
+  kind: OutlineSymbolKind;
+  line: number; // 0-based
+  char: number; // 0-based
+  length: number;
+  exported: boolean;
+};
+
+// A module-level value declaration: the text before the binding name on its
+// line is exactly the declaration prefix. Anchored at the LINE START — a local
+// inside a function body is indented (fmt guarantees it), a `for` loop
+// variable is preceded by `for `, and both rightly fail this.
+const MODULE_DECL_PREFIX = /^(export\s+)?(let|const)\s+$/;
+
+// A `type` alias declaration line: `type Name = …`, optionally exported.
+const TYPE_DECL_LINE = /^(export\s+)?type\s+([A-Za-z_][A-Za-z0-9_]*)/;
+
+/**
+ * The flat document-symbol outline for `source`: functions + module-level
+ * variables from the checker's decl-flagged identifier tokens, `type` aliases
+ * from a line scan, sorted by position. `exportedNames` (from `moduleSurface`)
+ * marks the exported entries; a degraded surface (empty set) just leaves every
+ * flag false rather than dropping symbols.
+ */
+export const flatDocumentSymbols = (
+  idents: IdentToken[],
+  source: string,
+  exportedNames: ReadonlySet<string>,
+): OutlineSymbol[] => {
+  const lines = source.split("\n");
+  const out: OutlineSymbol[] = [];
+  for (const t of idents) {
+    if (!t.isDecl || t.length <= 0) continue;
+    const lineText = lines[t.line] ?? "";
+    const name = lineText.slice(t.char, t.char + t.length);
+    if (name.length !== t.length) continue; // span off the line's end; defensive
+    let kind: OutlineSymbolKind;
+    if (t.bindKind === 2) {
+      kind = "function";
+    } else if (t.bindKind === 0) {
+      const m = MODULE_DECL_PREFIX.exec(lineText.slice(0, t.char));
+      if (m === null) continue; // a local / loop binding — not outline material
+      kind = m[2] === "const" ? "constant" : "variable";
+    } else {
+      continue; // parameters
+    }
+    out.push({
+      name,
+      kind,
+      line: t.line,
+      char: t.char,
+      length: t.length,
+      exported: exportedNames.has(name),
+    });
+  }
+  // `type` aliases: not in the token slice, so scanned from the source. The
+  // name starts where the matched prefix ends.
+  for (let i = 0; i < lines.length; i++) {
+    const m = TYPE_DECL_LINE.exec(lines[i]);
+    if (m === null) continue;
+    const name = m[2];
+    out.push({
+      name,
+      kind: "type",
+      line: i,
+      char: m[0].length - name.length,
+      length: name.length,
+      exported: m[1] !== undefined || exportedNames.has(name),
+    });
+  }
+  out.sort((a, b) => a.line - b.line || a.char - b.char);
+  return out;
+};
+
 // ---- status-bar seed indicator (D9.2) ---------------------------------------
 //
 // The seed ladder is the extension's number-one operational hazard: a stale or

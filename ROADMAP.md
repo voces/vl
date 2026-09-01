@@ -1731,8 +1731,8 @@ seed from current `compiler/*.vl` in ~40s.*
   Worked serially, one worktree agent per item, gates + PR each; quick wins first:
   1. ✅ Document highlights (`referencesAt` verbatim + `definitionAt` to mark the decl Write)
   2. ✅ Status-bar seed indicator (`vital/seedOrigin` notification → one item per window)
-  3. ⬜ Document symbols — flat outline (`tokensAt` + `moduleSurface`; nesting needs a
-     body-extent export later)
+  3. ✅ Document symbols — flat outline (`tokensAt` + `moduleSurface` + a host scan for
+     `type` decls; nesting still needs a body-extent export later)
   4. ⬜ Code lens: export reference counts (`lastUseMap` is already computed every save)
   5. ⬜ Hover polish — ONE user-facing type-render pathway in the query layer owning
      `$mN` demangling (hover/inlay/member/alias leak it today; scopeAt's inline wraps

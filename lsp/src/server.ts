@@ -9,6 +9,7 @@ import {
   DiagnosticTag,
   DocumentHighlight,
   DocumentHighlightKind,
+  DocumentSymbol,
   Hover,
   InlayHint,
   InlayHintKind,
@@ -18,6 +19,7 @@ import {
   ProposedFeatures,
   Range,
   SemanticTokens,
+  SymbolKind,
   TextDocuments,
   TextDocumentSyncKind,
   TextEdit,
@@ -64,12 +66,14 @@ import {
   docMarkdown,
   documentHighlightsFromRefs,
   type DocRefResolver,
+  flatDocumentSymbols,
   type HighlightKind,
   inlayHintsFromWasm,
   isDisplayableType,
   keywordCompletions,
   type LspRange,
   memberCompletionsFromWasm,
+  type OutlineSymbolKind,
   scopeCompletionsFromBindings,
   SEMANTIC_TOKEN_LEGEND,
   semanticTokensDataFromWasm,
@@ -533,6 +537,55 @@ connection.onDocumentHighlight(
       range: h.range,
       kind: highlightKindMap[h.kind],
     }));
+  },
+);
+
+// Document symbols (D9.3): the FLAT outline — Outline view, breadcrumbs,
+// Ctrl+Shift+O. Functions + module-level `let`/`const` come from the checker's
+// decl-flagged identifier tokens (`tokensAt`), `type` aliases from the host
+// line scan, the exported flag from `moduleSurface` — all assembled by
+// `flatDocumentSymbols`. Flat is the shipped grade: nesting needs a
+// declaration-body-extent export the seed doesn't have (survey §6/§7), so
+// `range` and `selectionRange` are both the NAME span rather than a guessed
+// body. No checker → null.
+const outlineKindMap: Record<OutlineSymbolKind, SymbolKind> = {
+  function: SymbolKind.Function,
+  variable: SymbolKind.Variable,
+  constant: SymbolKind.Constant,
+  // VL types are structural objects, not nominal classes — same mapping as
+  // completion's `type` items.
+  type: SymbolKind.Struct,
+};
+connection.onDocumentSymbol(
+  async (params): Promise<DocumentSymbol[] | null> => {
+    const doc = documents.get(params.textDocument.uri);
+    if (!doc) return null;
+    if (wasmChecker?.tokensAt === undefined) return null;
+    const text = doc.getText();
+    const entryKey = entryKeyOf(params.textDocument.uri);
+    const idents = await wasmChecker
+      .tokensAt(text, entryKey, workspaceReader)
+      .catch((err) => {
+        connection.console.log(`[wasm-symbols] tokensAt failed: ${err}`);
+        return [] as WasmToken[];
+      });
+    const exportedNames = new Set(
+      wasmChecker.moduleSurface(text, entryKey).exports.map((e) => e.name),
+    );
+    return flatDocumentSymbols(idents, text, exportedNames).map((s) => {
+      const range = {
+        start: { line: s.line, character: s.char },
+        end: { line: s.line, character: s.char + s.length },
+      };
+      const sym: DocumentSymbol = {
+        name: s.name,
+        kind: outlineKindMap[s.kind],
+        range,
+        selectionRange: range,
+      };
+      if (s.exported) sym.detail = "export";
+      return sym;
+    });
   },
 );
 
@@ -1164,6 +1217,7 @@ connection.onInitialize((params) => {
       definitionProvider: true,
       referencesProvider: true,
       documentHighlightProvider: true,
+      documentSymbolProvider: true,
       documentFormattingProvider: true,
       codeActionProvider: {
         codeActionKinds: [CodeActionKind.QuickFix],

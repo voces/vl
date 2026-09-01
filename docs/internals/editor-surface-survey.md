@@ -96,7 +96,7 @@ parameter lists as structured data (only rendered type strings), declaration *bo
 | Go to declaration | n/a | — | No decl/def split in VL. |
 | Find references | **have** | Cross-file, capped crawl | — |
 | Document highlights | **have** | All same-file occurrences light up under the cursor | Shipped (D9.1): `referencesAt` verbatim + a `definitionAt` pairing to mark the decl as the Write occurrence. |
-| Document symbols | **missing** | Outline view, breadcrumbs, Ctrl+Shift+O | Flat list served by `tokensAt` (decl-flagged, kinds) + `moduleSurface`; `type` decls need a small host-side scan (not in the token slice); *nesting* needs body extents → native export. Flat is still a big discoverability win. |
+| Document symbols | **partial** | Outline view, breadcrumbs, Ctrl+Shift+O | Shipped flat (D9.3): `tokensAt` decls (functions + module-level values) + host scan for `type` decls + `moduleSurface` exported flags. REMAINDER: *nesting* needs body extents → native export (§7), so breadcrumbs show the file's symbols but not "which function am I in". |
 | Workspace symbols | **missing** | Ctrl+T "open any exported symbol by name" | Served by `moduleSurface` over `enumerateWorkspaceFiles` — the unused-export pass already runs exactly this crawl; add a name index. |
 | Code actions | **partial** | 4 lint quick-fixes | More fixes = more lint codes; machinery is done. No refactoring-tier actions (extract fn etc. — needs AST edits the surface doesn't expose). |
 | Code lens | **missing** | Inline "run test" / "N references" / "run file" | Reference counts for exports are **already computed** (`lastUseMap`); test lenses = the discovery scan from §4. |
