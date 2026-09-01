@@ -286,9 +286,10 @@ rather than the one that is expensive, data-dependent, and merely *less* wrong.
 - **`s[i]` is O(1) and yields the code point; `.length` is the code-point count.**
   Verified: `"héllo→".length` is `6`, `s[1]` is `233`, and `for c in s` yields
   `104, 233, 108, 108, 111, 8594`.
-- **The method surface is six operations** — `slice`, `indexOf`, `includes`,
-  `charCodeAt`, `fromCodePoint`, `toString` — plus `+`, `==`, `.length`, `s[i]`, and
-  `for cp in s`. There is no `split`, `join`, `trim`, `replace`, `startsWith`,
+- **The method surface is five operations** — `slice`, `indexOf`, `includes`,
+  `charCodeAt`, `fromCodePoint` — plus `+`, `==`, `.length`, `s[i]`, and
+  `for cp in s`. (It was six until 2026-09-01: `toString` was an ambient builtin
+  and is `std:fmt`'s export now — owner ruling, DECISIONS.md.) There is no `split`, `join`, `trim`, `replace`, `startsWith`,
   `endsWith`, `toUpper`, `toLower`, or padding. (§Methods — this is the largest
   user-facing gap in the whole area, and it is rep-independent.)
 - **Host boundaries transcode per element.** `__print_string__` streams char codes one
@@ -844,9 +845,10 @@ guarantee — but today no such optimization exists for strings.
 > `tests/cases/strings/slice-member-tail.vl` and works. An explicit `return` is the
 > workaround.
 
-VL's entire string method surface in the CORE is **six operations**: `slice`,
-`indexOf`, `includes`, `charCodeAt`, `fromCodePoint`, `toString` — plus `+`, `==`,
-`.length`, `s[i]`, and `for cp in s`.
+VL's entire string method surface in the CORE is **five operations**: `slice`,
+`indexOf`, `includes`, `charCodeAt`, `fromCodePoint` — plus `+`, `==`,
+`.length`, `s[i]`, and `for cp in s`. (Six until 2026-09-01, when the ambient
+`toString` builtin was retired in favour of `std:fmt`'s export.)
 
 **You could not split a string in VL** before `std:str`. No `split`, `join`, `trim`,
 `replace`, `startsWith`, `endsWith`, `padStart`/`padEnd`, `repeat`,

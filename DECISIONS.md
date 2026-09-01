@@ -1567,8 +1567,9 @@ it worked.
   bare free functions, and shadowable.** A std function needs a body; these have
   only an opcode, so `std/` cannot hold them. Bare over dunder because the rule
   the builtin surface actually follows is *raw-floor machinery is dunder, safe
-  total functions are bare* (`print`/`toString`/`fromCodePoint` vs
-  `__trap__`/`__store_i32__`). Shadowable because `min`/`max`/`abs` are the names
+  total functions are bare* (`print`/`fromCodePoint` vs
+  `__trap__`/`__store_i32__`; `toString` was in that list until 2026-09-01, when
+  it left the builtin surface entirely for `std:fmt` — see the entry below). Shadowable because `min`/`max`/`abs` are the names
   programs most often define themselves, and an intrinsic that captured such a
   call would silently kill the user's function. Width comes from the operands
   under the binary operators' rule, not from a second declaration — VL has no
