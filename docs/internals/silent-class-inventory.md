@@ -23141,6 +23141,58 @@ Repro (now RUNS, printing `7`):
     // vl check rc 0; runs, prints 7.
 
 ---
+### D950 — at a NULLABLE generic instantiation every `is` arm answers TRUE: a silently wrong value, and the root D947 recorded as a price
+
+**check-clean silently wrong: `vl check` rc 0, the module validates, the program RUNS and prints the wrong answer · reproduces on master · ZERO corpus cells for the witness itself, but it is the ROOT of the three `d947_price_*` cells the corpus does carry · a fix was attempted, MEASURED and REVERTED — see the three placements that did not fire**
+
+Repro (check rc 0; RUNS and prints `1`, where `0` is the only correct answer):
+
+    function f<T>(v: T): i32 {
+      if v is boolean { return 1 }
+      0
+    }
+    function mk(c: boolean): string | null {
+      if c { return "x" }
+      null
+    }
+    print(f(mk(true)))
+    // PRINTS 1
+    // vl check rc 0; runs. SHOULD PRINT 0 — a `string | null` is never a boolean.
+
+* **IT IS NOT ONE BAD ARM, THE LADDER IS DEGENERATE.** Each arm was measured ALONE at
+  `T = string | null`, against the same value: `is boolean` -> fires, `is f64` -> fires,
+  `is string` -> fires. Three mutually exclusive tests all answering true on one value is not
+  a wrong predicate, it is no predicate. The value is the string `"x"`, so only the third is
+  right.
+
+* **THE CONTROLS SAY IT IS THE NULLABLE, AND ONLY AT A GENERIC.** `T = string` decides
+  correctly (prints 0); `T = i32 | null` decides correctly (prints 0); the NON-generic
+  spelling of the same test (`function f(v: string | null)`) does not compile at all — a loud
+  refusal. So the defect needs the generic instantiation AND a nullable whose base is a REF.
+
+* **IT EXPLAINS D947's THREE CELLS EXACTLY, which were filed as a price with no mechanism.**
+  `std:test`'s `expect` opens with `if value is boolean { isBool = true; boolVal = value }`.
+  At `T = string | null` that arm fires and assigns a STRING into a `boolean` field —
+  `type mismatch: expected i32, found (ref $type)`, which is precisely what those cells show.
+  The price is not "expect cannot take a nullable"; it is this.
+
+* **THREE PLACEMENTS WERE TRIED AND NONE FIRED, which is the useful half of this row.**
+  (1) Refining `monoStaticIsResult`'s blanket `nodeTyIsNullable(nd.isObj) { return -1 }` to
+  decide FALSE for a primitive-vs-primitive mismatch: the gate is never reached, because at a
+  monomorphized clone the receiver node still carries `T` (a `TyVar`), not the instance's
+  nullable — the same clone-provenance hazard D926 and D949 both record. (2) Reading the
+  instance type through `monoArgTyName` instead: its cascade classifies a `string | null` by
+  the member it reps as, so the name is available, but the ladder returns before reaching the
+  compare. (3) Disabling `exprUnion(nd.isObj, fnIx)`'s decline, on the theory that the
+  emitter's rep classification was routing it to the runtime path: the witness still prints 1,
+  so that line is not the one either. The decision is being made somewhere else, and the next
+  attempt should start by finding WHERE rather than by proposing a rule.
+
+* **THE OUTCOME CLASS IS WORSE THAN WHAT D947 RECORDS.** Those cells are invalid wasm, which
+  the engine refuses; this witness RUNS. A wrong answer that validates and executes is the
+  shape that reaches a user as a bug in their own code.
+
+---
 
 ### D791 — [CLOSED 2026-08-31] READ-ONLY COVARIANCE is lowered by an element-CONVERTING COPY, licensed by a whole-program write scan — D661B's refusal was about the WRITABLE side only
 
