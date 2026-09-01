@@ -1,4 +1,4 @@
-// `std:test` v1 — the in-language testing surface (docs/std-design.md D5), in two
+// `std:test` v2 — the in-language testing surface (docs/std-design.md D5), in two
 // halves over the intrinsic floor:
 //
 //   1. REGISTRATION — jest-shaped `describe`/`it`/`beforeEach`/`afterEach`. Calling
@@ -21,11 +21,48 @@
 //
 // Under bare `vl run` a green file exits 0 and a red one aborts, with no runner.
 //
-// `expect` takes a VALUE UNION over the comparable atoms, so ONE entry point covers
-// every value kind — the value boxes into the union and `is`-narrows back out.
-// (`toBe` referential identity is reserved for the future `===`, ROADMAP A15;
-// `toThrow`/`toBeNull` wait on the error model / `null` in the value union —
-// std-design OD6.)
+// `expect` is GENERIC — `expect<T>(value: T)` builds an `Expectation<T>` — so ONE
+// entry point covers every `==`-comparable value, not an enumerated union of
+// atoms. v1 hard-coded `i32 | i64 | f64 | boolean | string`; v2 keeps those five
+// and adds everything the language can already compare — measured on this tree
+// through `expect(...).toEqual(...)` itself, not a proxy: structs, `i32[]`,
+// `string[]`, struct arrays (`Circle[]`), pass and fail sides both. `.toEqual`
+// compares with the SAME `==` the operands get outside a test, so what is
+// assertable is exactly what is comparable, per T, at compile time. ONE BEHAVIOUR
+// MOVED (an approved delta, recorded here): a cross-variant pair —
+// `expect(4).toEqual("4")` — was runtime-unequal under the v1 union and is now a
+// COMPILE-TIME refusal, because no single T fits both operands; that is `==`'s own
+// design (a cross-type compare never typechecks), and the union's runtime answer
+// was the deviation. (`toBe` referential identity is reserved for the future
+// `===`, ROADMAP A15; `toThrow`/`toBeNull` wait on the error model / `null`
+// handling — std-design OD6.)
+//
+// HOW A GENERIC VALUE GETS RENDERED — THE RECEIPT, AND WHY IT IS EAGER. The five
+// atoms keep v1's rendering byte-for-byte (`expected 7 to equal 8`,
+// `expected "left" to equal "right"`, quoted strings, `<f64>` + the printed-echo
+// pair); any other T renders as the sentinel `"<value>"` — honest, not pretty;
+// field-level rendering waits on reflection. Every T-dependent fact about the
+// received value — its rendered form, whether it is a boolean and which one,
+// whether it is an f64 needing the echo — is computed ONCE, inside `expect`,
+// from the RAW parameter, and stored in the `Expectation` (a receipt). The
+// matchers then decide and report from the receipt alone; the only places they
+// touch T at all are the `==` itself and the same raw-parameter dispatch over
+// `toEqual`'s own `expected` argument.
+//
+// That boundary is a MEASURED constraint of today's monomorphizer, not taste.
+// Three natural spellings each fail on this tree, witnesses in the D941 family
+// (docs/internals/silent-class-inventory.md): a generic show helper called from a
+// matcher (generic-to-generic argument passing from a generic-returned origin)
+// refuses or emits invalid wasm; `is`-dispatch on the CARRIER FIELD
+// (`self.actual`) mis-answers `is string` on a struct T and miscompiles beside
+// f64 arms; a closure capturing the generic value emits invalid wasm. Dispatch on
+// a RAW generic parameter is the one spelling that answers correctly for every T
+// measured, so that is where all dispatch lives. The cost of eager: v1 built
+// nothing on the pass path, v2 renders `shown` once per `expect` call (a digit
+// loop + concat for the widest atom). That deviation is chosen: the lazy
+// spellings are the miscompiling ones, and correctness of the message is what
+// this module exists to guarantee. When the D941 family closes, `shown` can move
+// back to failure-time without any surface change.
 //
 // ── ONE VL RULE GOVERNS THIS FILE'S SHAPE ──────────────────────────────────────
 // A function's result type is its TAIL statement's, and a test BODY is typed
@@ -153,20 +190,72 @@ function vltInScope(hook: string, test: string) {
 
 // ── assertion ───────────────────────────────────────────────────────────────────
 
-type Expectation = {
-  actual: i32 | i64 | f64 | boolean | string,
-  negated: boolean
+// The RECEIPT (see the header): the value at its own type, plus every T-dependent
+// fact the matchers will need, computed once in `expect` from the raw parameter.
+//   shown    — the failure-message rendering (v1's exact atom forms; `"<value>"`
+//              for a non-atom T)
+//   isBool / boolVal — `toBeTrue`/`toBeFalse` decide from these, so a non-boolean
+//              receiver keeps v1's semantics (compiles, fails at runtime)
+//   hasEcho / echo   — an f64's digits, printed on failure because the message
+//              renders f64 as `<f64>` (std-design D4 defers f64→string)
+type Expectation<T> = {
+  actual: T,
+  negated: boolean,
+  shown: string,
+  isBool: boolean,
+  boolVal: boolean,
+  hasEcho: boolean,
+  echo: f64
 }
 
-// `expect(value)` — the receiver for the matchers.
-export function expect(value: i32 | i64 | f64 | boolean | string): Expectation {
-  return { actual: value, negated: false }
+// `expect(value)` — the receiver for the matchers. T is inferred from the
+// argument, so a call site reads exactly as it did under the v1 union. The
+// `is`-dispatch here is over the RAW parameter — the one placement today's
+// monomorphizer answers correctly for every T (see the header); each non-atom
+// instantiation prunes the atom arms and keeps the `"<value>"` defaults.
+export function expect<T>(value: T): Expectation<T> {
+  let shown = "<value>"
+  let isBool = false
+  let boolVal = false
+  let hasEcho = false
+  let echo = 0.0
+  if value is string { shown = "\"" + value + "\"" }
+  if value is boolean {
+    isBool = true
+    boolVal = value
+    if value { shown = "true" } else { shown = "false" }
+  }
+  if value is i32 { shown = vltI64Str(value as i64) }
+  if value is i64 { shown = vltI64Str(value) }
+  if value is f64 {
+    shown = "<f64>"
+    hasEcho = true
+    echo = value
+  }
+  return {
+    actual: value,
+    negated: false,
+    shown: shown,
+    isBool: isBool,
+    boolVal: boolVal,
+    hasEcho: hasEcho,
+    echo: echo,
+  }
 }
 
 // Inverts the pass/fail sense: `expect(5).not().toEqual(6)` passes. Returns a
-// fresh `Expectation` (the receiver is a value; no aliasing).
-export function not(self: Expectation): Expectation {
-  return { actual: self.actual, negated: !self.negated }
+// fresh `Expectation` (the receiver is a value; no aliasing) carrying the same
+// receipt.
+export function not<T>(self: Expectation<T>): Expectation<T> {
+  return {
+    actual: self.actual,
+    negated: !self.negated,
+    shown: self.shown,
+    isBool: self.isBool,
+    boolVal: self.boolVal,
+    hasEcho: self.hasEcho,
+    echo: self.echo,
+  }
 }
 
 // Record the rendered message and abort the test. The runner catches the trap,
@@ -213,97 +302,71 @@ function vltI64Str(v: i64) {
   out
 }
 
-// How a value reads in a failure message. Strings are quoted so `"4"` and `4` are
-// distinguishable at a glance (they are unequal — a cross-variant `==` is false).
-// f64 has no pure-VL renderer yet (std-design D4 defers shortest-round-trip
-// f64→string), so it renders as its type and `vltEcho` streams the real value
-// through `print` instead — the runner captures that as the test's output.
-function vltShow(v: i32 | i64 | f64 | boolean | string): string {
-  if v is string { return "\"" + v + "\"" }
-  if v is boolean {
-    if v { return "true" }
-    return "false"
-  }
-  if v is i32 {
-    const wide = v as i64
-    return vltI64Str(wide)
-  }
-  if v is i64 { return vltI64Str(v) }
-  "<f64>"
-}
-
-// The f64 half of the rendering story: print the value so the captured output
-// carries the digits the message cannot. A no-op for every other variant.
-function vltEcho(v: i32 | i64 | f64 | boolean | string) {
-  if v is f64 { print(v) }
-}
-
-// Render + abort. Reached ONLY on failure, which is why the matchers hand over
-// their operands instead of a pre-built string: a passing assertion must not pay
-// for a message nobody reads (a table-driven suite runs millions of them).
+// Assemble the failure message from ALREADY-RENDERED strings and abort. Reached
+// ONLY on failure. Non-generic on purpose: everything T-shaped was resolved by
+// the callers, so this is one shared body, not one per instantiation.
 // `kind`: 0 = toEqual, 1 = toBeTrue, 2 = toBeFalse.
-function vltReport(
-  self: Expectation,
-  kind: i32,
-  expected: i32 | i64 | f64 | boolean | string,
-) {
-  const a = self.actual
+function vltFail(shownA: string, negated: boolean, kind: i32, shownE: string) {
   let tail = "be true"
-  if kind == 0 {
-    vltEcho(a)
-    vltEcho(expected)
-    tail = "equal " + vltShow(expected)
-  }
+  if kind == 0 { tail = "equal " + shownE }
   if kind == 2 { tail = "be false" }
   let sense = "to "
-  if self.negated { sense = "not to " }
-  vltAbort("expected " + vltShow(a) + " " + sense + tail)
+  if negated { sense = "not to " }
+  vltAbort("expected " + shownA + " " + sense + tail)
 }
 
-// Aborts unless `ok` agrees with the current sense (`negated`). Factored so every
-// matcher shares one pass/fail decision — and so each matcher's TAIL is this void
-// call, which is what types a test body as `() => void`.
-function vltAdjudicate(
-  self: Expectation,
-  ok: boolean,
-  kind: i32,
-  expected: i32 | i64 | f64 | boolean | string,
-) {
-  if self.negated {
-    if ok { vltReport(self, kind, expected) }
-  } else {
-    if !ok { vltReport(self, kind, expected) }
-  }
-}
-
-// `.toEqual` — structural equality, jest semantics. The union `==` compares the two
-// values' live variants (a cross-variant pair, `expect(4).toEqual("4")`, is
-// unequal). `self.actual` binds to a local first: union `==` requires binding
-// operands, not a raw field read.
-export function toEqual(
-  self: Expectation,
-  expected: i32 | i64 | f64 | boolean | string,
-) {
+// `.toEqual` — equality at T's own `==`, jest semantics: value equality per
+// element/field wherever the language defines it. Both operands are T, so a
+// cross-variant pair (`expect(4).toEqual("4")`) refuses at compile time — see the
+// header. `self.actual` binds to a local first: `==` requires binding operands,
+// not a raw field read. The failure path renders `expected` from the raw
+// parameter (never from a field — the header's placement rule) and echoes f64
+// operands in v1's order: actual first, expected second, message last.
+export function toEqual<T>(self: Expectation<T>, expected: T) {
   const a = self.actual
   const ok = a == expected
-  vltAdjudicate(self, ok, 0, expected)
+  let bad = !ok
+  if self.negated { bad = ok }
+  if bad {
+    if self.hasEcho { print(self.echo) }
+    let shownE = "<value>"
+    if expected is string { shownE = "\"" + expected + "\"" }
+    if expected is boolean {
+      if expected { shownE = "true" } else { shownE = "false" }
+    }
+    if expected is i32 { shownE = vltI64Str(expected as i64) }
+    if expected is i64 { shownE = vltI64Str(expected) }
+    if expected is f64 {
+      shownE = "<f64>"
+      print(expected)
+    }
+    vltFail(self.shown, self.negated, 0, shownE)
+  }
+  vltDone()
 }
 
 // `.toBeTrue` — the receiver holds boolean `true`. A non-boolean receiver is
-// never true (the `is` arm simply does not fire).
-export function toBeTrue(self: Expectation) {
-  const a = self.actual
+// never true (its receipt has `isBool = false`), so `expect(5).toBeTrue()` still
+// compiles and still fails at runtime with `expected 5 to be true` — v1's
+// semantics, kept.
+export function toBeTrue<T>(self: Expectation<T>) {
   let ok = false
-  if a is boolean { ok = a }
-  vltAdjudicate(self, ok, 1, a)
+  if self.isBool { ok = self.boolVal }
+  let bad = !ok
+  if self.negated { bad = ok }
+  if bad { vltFail(self.shown, self.negated, 1, self.shown) }
+  vltDone()
 }
 
-// `.toBeFalse` — the receiver holds boolean `false`.
-export function toBeFalse(self: Expectation) {
-  const a = self.actual
+// `.toBeFalse` — the receiver holds boolean `false`. Non-boolean receivers fail
+// at runtime, as in `toBeTrue`.
+export function toBeFalse<T>(self: Expectation<T>) {
   let ok = false
-  if a is boolean { ok = !a }
-  vltAdjudicate(self, ok, 2, a)
+  if self.isBool { ok = !self.boolVal }
+  let bad = !ok
+  if self.negated { bad = ok }
+  if bad { vltFail(self.shown, self.negated, 2, self.shown) }
+  vltDone()
 }
 
 // Fail the running test outright with `msg` — the escape hatch for a condition no
