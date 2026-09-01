@@ -203,6 +203,21 @@ family. It costs seconds per cell: the minimiser is a thirty-line greedy loop, a
 Corollary for a row's headline: **cite the number you ABLATED, not the number that shares a
 sentence.** If the mechanism count is not yet known, say the message count is a message count.
 
+## A FIXTURE THAT ANNOTATES EVERY DESTINATION CANNOT SEE THE MISSING-ANNOTATION DEFECT
+
+**Write the un-annotated spelling of a fix's own witness before believing the fix.** D962 closed
+`??` over a nullable value-union box by desugaring it, and pinned three cells — all of them
+routed through an annotated `function pick(): string | i32`. The annotation is what makes the
+desugared `if` land somewhere that already knows the value is a box. Remove it and the same
+three cells are **check-clean invalid wasm**: the fix traded a clause-2 loud refusal for a
+clause-1 miscompile, and the fixture could not show it (D969).
+
+This is the general shape, not one slip. An annotation pins a cell's rep, so any defect whose
+ingredient is *inference doing the pinning instead* is invisible to a fixture that annotates.
+The same applies to `@hint redundant type annotation` — a hint saying the annotation is
+redundant is the checker agreeing about the TYPE, and says nothing about whether the two
+spellings agree about the REP.
+
 ## A CAPABILITY GAP HAS A POSITION MATRIX — narrowing the checker first ships clause-1 bugs
 
 A refusal that names a capability (`no element-converting copy exists`) is usually enforced in

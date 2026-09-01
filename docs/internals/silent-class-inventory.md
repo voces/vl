@@ -23861,6 +23861,50 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   invalid wasm.
 
 ---
+### D969 — D962 traded a LOUD refusal for a SILENT miscompile on the UN-ANNOTATED destination, and its fixture covered only the annotated one
+
+**check-clean invalid wasm · a clause-1 REGRESSION introduced by a clause-2 fix, measured 2026-09-01 against a `git archive c557ed18~1` control**
+
+D962 desugars `x ?? d` over a nullable value-union box into `if x != null { x } else { d }`.
+That is right, and on the shape its fixture pins it is a real win. On the other shape it is a
+loss, and the gate could not see it because the corpus has no cell for either:
+
+| destination | pre-D962 | master today |
+|---|---|---|
+| ANNOTATED (`function pick(): string \| i32 { … t ?? "d" }`) | loud emit reject | **runs** |
+| UN-ANNOTATED (`const v = t ?? "d"`) | loud emit reject | **check-clean invalid wasm** |
+
+* **THE FIXTURE IS THE REASON IT SHIPPED.** `tests/cases/expressions/coalesce-nullable-union-box.vl`
+  routes every cell through `function pick(b, n): string | i32`, so the annotation pins the
+  cell and the desugared `if` lands in a destination that already knows it is a box. Remove the
+  annotation and the same three cells miscompile. **A fixture that annotates every destination
+  cannot see a defect whose ingredient is the missing annotation.**
+
+* **AND `loud → silent` IS PRECISELY THE TRADE THE GATE DOES NOT BLOCK.** `regress.py` refuses
+  on `runs → not-runs` and prints everything else, for a reason this repo argued carefully and
+  still holds. This row is the counter-example worth keeping beside it: the movement was
+  invisible not because the criterion is wrong but because **no corpus cell has this shape at
+  all**, so nothing was printed either.
+
+* **TWO CLASSIFIER FIXES THAT LOOK RIGHT AND DO NOT MOVE IT — measured, both reverted.**
+  (1) A checker-typed net on `exprUnion`'s `??` arm (`nodeTyIsPureLitUnion` / `nodeTyIsNulScalarBox`
+  / `nodeTyIsUnion`), mirroring the `Call` branch's own ladder. (2) An `IfStmt` arm on
+  `exprUnion` classifying an if-expression by its THEN arm's tail value, which is what the
+  desugared node actually is. Neither changed the outcome, in a function-local binding or a
+  module-global one. **So the cell's rep is not being decided by `letIsUnion` → `exprUnion`,
+  and the next attempt should find the real decider before writing a classifier arm.**
+
+Repro (check rc 0, invalid wasm):
+
+    function mk(b: boolean): string | i32 | null {
+      if b { return "s" }
+      null
+    }
+    const t = mk(true)
+    const v = t ?? "d"
+    print(v)
+    // vl check rc 0; vl run -> Invalid input WebAssembly code: expected i32, found (ref $type)
+
 ### D968 — `print` of a `!= null`-narrowed union with TWO OR MORE non-null members was check-clean invalid wasm
 
 **closed — the box plan declined every NARROWED receiver, and a narrow that leaves two or more arms leaves a box · found 2026-09-01 by hand off the `coalesce-over-nullable-union` probe, and INVISIBLE TO THE SCOREBOARD: clause 1 read 0 because no corpus cell has this shape, which is exactly the "runs can reach 100% with the goal unmet" case**
