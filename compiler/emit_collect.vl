@@ -383,6 +383,7 @@ import {
   anonFieldElemName,
   anonLeafFoldBlocked,
   anonLeafServingRow,
+  anonLeafSupersedeOf,
   armLayoutContested,
   arrElemIsClosureTy,
   arrElemNominalOfTy,
@@ -6955,13 +6956,22 @@ function collectAnonShapes() {
       // row and the scan's answer moves with it.
       const narrowSi = structIndexOfObj(ai)
       const mf = anonLeafMergeField(ai, narrowSi)
+      // D953 — AND A LITERAL WHOSE NESTED FIELD'S VALUE IS A FAMILY MEMBER. `anonLeafMergeField`
+      // asks whether THIS literal's own row is narrower than the join IT belongs to; this asks
+      // the same question one layer down, about a literal that belongs to no join itself and
+      // merely CARRIES one. Without it the carrier keeps a row whose nested field names the
+      // narrow inner, and the value it builds cannot be handed to a callee whose return row has
+      // already moved — `d913_ret_binding_of_field`.
+      const nmf = anonLeafNestedMergedField(ai)
       if (
-        (narrowSi < 0 || mf != "") &&
+        (narrowSi < 0 || mf != "" || nmf != "") &&
         (objVariantName(ai) == "" || anonNestNeedsRow(ai, nestOwner))
       ) {
         const rowsBefore = sNames.length
         anonMintRowFor(ai)
-        if mf != "" { anonLeafRecordSupersede(narrowSi, sNames.length - 1) }
+        if mf != "" || nmf != "" {
+          anonLeafRecordSupersede(narrowSi, sNames.length - 1)
+        }
         // D872/D873 — AND THE ROW THE `??`'s LEFT OPERAND'S OWN CARRIER NAMES. With ONE row per
         // field set that is `narrowSi` again and this records nothing new; with a second
         // same-fieldset row it is the OTHER one, and it is the row the binding's cell
@@ -9065,6 +9075,67 @@ function anonLeafBoundValOk(
     hits.push(v)
     return true
   }
+  // D953 — A FIELD READ OF A PARAMETER, projected through the parameter's own call sites.
+  //
+  // D923 built this reader, measured it, and DELETED it — correctly, because a reader without
+  // its owner moves a return row while the value handed back is still built narrow. The owner
+  // is now here (`anonMintRowFor`'s nested-field companion name), so the pair ships together,
+  // which is D891's precedent stated as a rule.
+  //
+  // THE BASE IS READ INTO A SCRATCH, and that is the whole care in this arm. The base literal
+  // (`{ r: { r: 7 } }`) does NOT itself move — only the field it carries does — so its owners
+  // must not be published into `out`, or a slot moves with no member behind it. `bOut` is
+  // discarded; only the PROJECTION reaches the family.
+  if vn is Member {
+    const mo = unwrapParen(vn.memObj)
+    if mo >= 0 {
+      const mon = P.nodes[mo]
+      if mon is Ident {
+        const pIx = anonLeafParamNodeOf(body, mon.identName)
+        if pIx >= 0 {
+          // THE OWNERS GO TO A SCRATCH, THE PARAMS DO NOT. D923's caution is about `out`:
+          // the base literal itself does not move, so publishing its owners would move a slot
+          // with no member behind it. The PARAM is the opposite case — its slot has to follow
+          // the carrier's new row (`paramStructIdxFinal` redirects only a MARKED param), and
+          // that is D923's third rung. So `bOut` is discarded and `pars` is the caller's.
+          const bOut: i32[] = []
+          const bFns: string[] = []
+          if !anonLeafParamArgsOk(body, pIx, bOut, bFns, pars, depth) {
+            return false
+          }
+          pars.push(pIx)
+          let ai2 = 0
+          while ai2 < bOut.length {
+            const al = P.nodes[bOut[ai2]]
+            if al is ObjLit {
+              let found = 0 - 1
+              let fj = 0
+              while fj < al.objFields.length {
+                const fn2 = P.nodes[al.objFields[fj]]
+                if fn2 is FieldInit {
+                  if fn2.fiName == vn.memProp {
+                    found = unwrapParen(fn2.fiValue)
+                  }
+                }
+                fj = fj + 1
+              }
+              if found < 0 { return false }
+              const fv = P.nodes[found]
+              if fv is ObjLit { out.push(found) }
+              else if fv is NullLit { 0 }
+              else { return false }
+            } else {
+              return false
+            }
+            ai2 = ai2 + 1
+          }
+          hits.push(v)
+          return true
+        }
+      }
+    }
+    return false
+  }
   if vn is Ident {
     // D934 — a MODULE-SCOPE binding has no frame, and `anonLeafRetIdentOk` resolves against a
     // frame's bindings and parameter list. The by-name whole-arena scan is the right scope for
@@ -9154,6 +9225,38 @@ function anonLeafFamRowOf(n: i32): i32 {
   if n < 0 { return 0 - 1 }
   if n >= anonLeafFamRow.length { return 0 - 1 }
   anonLeafFamRow[n]
+}
+
+// D953 — THE FIELD at which `ow`'s own nested value is a `??` family member whose row has
+// MOVED, or "". The carrier's half of `anonLeafMergeField`: that one asks whether the literal's
+// row is narrower than the join the literal belongs to, and answers "" for a literal that
+// belongs to no join. A carrier belongs to none — `{ r: { r: 7 } }` is not a `??` operand — and
+// still has to follow, because the inner literal it holds is a member and builds at the merged
+// row now.
+function anonLeafNestedMergedField(ow: i32): string {
+  const o = P.nodes[ow]
+  if o is ObjLit {
+    let i = 0
+    while i < o.objFields.length {
+      const f = P.nodes[o.objFields[i]]
+      if f is FieldInit {
+        const fv = unwrapParen(f.fiValue)
+        if fv >= 0 {
+          const fvn = P.nodes[fv]
+          if fvn is ObjLit {
+            if anonLeafInJoin(fv) {
+              const ns = structIndexOfObj(fv)
+              if ns >= 0 {
+                if anonLeafSupersedeOf(ns) != ns { return f.fiName }
+              }
+            }
+          }
+        }
+      }
+      i = i + 1
+    }
+  }
+  ""
 }
 
 // D833 — THE FIELD at which the row `narrowSi` already claiming `ow` is NARROWER than the `??`
@@ -9323,7 +9426,38 @@ function anonMintRowFor(objIx: i32) {
         } else if leafCode >= 0 {
           elemNames.push("") // a bare niche (code 20) records no companion
         } else {
-          elemNames.push(anonFieldElemName(f.fiValue, code))
+          // D953 — A NESTED FIELD WHOSE VALUE IS A `??` FAMILY MEMBER NAMES THE MERGED ROW.
+          //
+          // Two arms above already handle a joined nested field: D672 where two OWNER
+          // literals disagree at it, and D804's leaf twin where the joined literals disagree
+          // at a SCALAR. This is the third and the one neither reaches — ONE owner whose
+          // field VALUE is itself a member of a `??` family, which is `{ r: { r: 7 } }`
+          // flowing into `src(): {r: i32} | null` beside `?? { r: "s" }`.
+          //
+          // The companion name is what `sFieldTgtStructIdx` later resolves the field's target
+          // row from, so naming the narrow row here is what made the call site build
+          // `struct.new $outer (struct.new $inner_i32 …)` while `src`'s result had already
+          // moved to the merged row. D923 recorded the reader for this and DELETED it because
+          // "the owner is one layer out"; the owner is this line.
+          //
+          // NOT A REDIRECT AT `sFieldTgtStructIdx`, which D923 measured and rejected: that is
+          // the one home for every nested-struct field's target, so superseding there moves
+          // EVERY `{r: i32}`-typed nested field in the program, including a second
+          // `{r: {r: 3}}` whose inner is no family member. Naming it per LITERAL, at the mint
+          // that is already building this literal's own row, is the same answer scoped to the
+          // one owner that earned it.
+          let nestNm = anonFieldElemName(f.fiValue, code)
+          if code == 15 {
+            const nv = unwrapParen(f.fiValue)
+            if anonLeafInJoin(nv) {
+              const narrowSi = structIndexOfObj(nv)
+              const mergedSi = anonLeafSupersedeOf(narrowSi)
+              if mergedSi >= 0 && mergedSi != narrowSi {
+                if mergedSi < sNames.length { nestNm = sNames[mergedSi] }
+              }
+            }
+          }
+          elemNames.push(nestNm)
         }
         elemKeys.push(anonFieldElemKeyI32(f.fiValue, code))
       } else {
