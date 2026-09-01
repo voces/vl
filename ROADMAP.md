@@ -87,9 +87,23 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   knows the site even when the callee is dynamic); cost is three constant-folded scalars
   per opted-in call. The sharp edge: `(i32) => void` and `(i32, CallerLoc) => void` are
   DIFFERENT types, so a marked function is not a drop-in where an unmarked fn value is
-  expected (matchers are never taken as values in practice). DECISIONS: (a) adopt the
+  expected (matchers are never taken as values in practice). WASM-TRACE LANE, asked and answered
+  (2026-09-01): standards exist — the name section (today's trap output already shows
+  `vl!takes` via wasmtime symbolizing it), DWARF-for-wasm (devtools/wasmtime
+  source-level), the spec's frame-text convention, the EH proposal — but they are
+  host-mediated CRASH forensics in engine-dependent formats; none can put a position in
+  `expect`'s own message string. Rust ships BOTH lanes (DWARF panics + track_caller)
+  because they answer different questions; a future DWARF emission is a separate
+  debugger-scale item this does not preclude. MODE FLAG, asked and answered: per-mode
+  defaults (on for test, flag for run/build) make `CallerLoc` — a READABLE value — mean
+  different things per mode, which the dual-run bar itself would flag as divergence;
+  recommended instead: synthesis uniformly ON everywhere (one semantics, reproducible
+  messages) + an explicit `--strip-locations` opt-OUT for release (size + the real
+  concern, source-structure leakage in shipped binaries — Rust's remap-path precedent),
+  documented as output-changing like `--color=always`. DECISIONS: (a) adopt the
   param-type mechanism; (b) allow `CallerLoc` in function types; (c) accept the
-  not-a-drop-in consequence. Recommended: yes to all three. The editor-side single-expect
+  not-a-drop-in consequence; (d) uniform-on + `--strip-locations` over per-mode
+  defaults. Recommended: yes to all four. The editor-side single-expect
   anchor is D9 slot 12 and needs no ruling.
 - **`vl test --trace` inline run values** — RULED low priority (owner, 2026-09-01,
   "low prio I guess"): keep parked; an emitter flag instrumenting USER programs (never
