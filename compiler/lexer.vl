@@ -9,10 +9,17 @@ import { cpCount } from "./strutil"
 //   - integer / real number literals (`12`, `3.14`, `1.5e-7`),
 //   - char literals `'a'` and string literals `"..."`, both with the shared
 //     escape grammar `\n \t \r \\ \" \' \0 \b \f \v \xXX \uXXXX \u{…}`,
-//   - backtick TEMPLATE literals `` `text${expr}text` `` — scanned as a SPLIT
-//     token run (`TEMPLATE_HEAD` / `TEMPLATE_MID` / `TEMPLATE_TAIL`, or a lone
-//     `TEMPLATE` when there is no hole) with the hole EXPRESSIONS lexed as
-//     ordinary tokens in between, the JS-lexer shape,
+//   - INTERPOLATION HOLES, spelled `\{expr}` and legal in BOTH quoted forms —
+//     `"v=\{x}"` and `` `v=\{x}` `` are the same construct. A literal holding
+//     one is scanned as a SPLIT token run (`TEMPLATE_HEAD` / `TEMPLATE_MID` /
+//     `TEMPLATE_TAIL`) with the hole EXPRESSIONS lexed as ordinary tokens in
+//     between, the JS-lexer shape; a literal holding none stays ONE token
+//     (`STRING` or `TEMPLATE`). The run kinds keep their `TEMPLATE_` spelling
+//     because the machinery is one and it was built for templates — both forms
+//     mint them, and every consumer treats them identically.
+//   - backtick TEMPLATE literals `` `text` `` — the multiline form: a raw
+//     newline is CONTENT there and a terminator inside `"`, which is the ONLY
+//     rule the two literal grammars still disagree about,
 //   - the full one- and two-char operator / punctuation set,
 //   - `//` line comments and `///` doc comments (retained as trivia in
 //     `gComments`, not emitted into the token stream),
@@ -194,25 +201,34 @@ let gCol = 0
 export let gDiags: Diag[] = []
 let gComments: Comment[] = []
 
-// ---- template-literal scanner state --------------------------------------
-// A template is CONTEXT-SENSITIVE: the `}` that ends a hole is spelled exactly
-// like the `}` that closes a block, so the scanner has to know which one it is
-// looking at. It does, from two numbers: the `{` nesting depth (`gBrace`) and,
-// per OPEN hole, the depth that hole started at (`gTplBrace`). A `}` resumes the
-// template iff the depth matches the innermost open hole's — every deeper `}`
-// is an ordinary closer. Templates therefore NEST for free (a hole may hold
-// another template; each pushes its own row), and the stack is the whole reason
-// no re-lexing or bracket-matching pre-pass is needed.
+// ---- interpolated-literal scanner state ----------------------------------
+// An interpolated literal is CONTEXT-SENSITIVE: the `}` that ends a hole is
+// spelled exactly like the `}` that closes a block, so the scanner has to know
+// which one it is looking at. It does, from two numbers: the `{` nesting depth
+// (`gBrace`) and, per OPEN hole, the depth that hole started at (`gTplBrace`). A
+// `}` resumes the literal iff the depth matches the innermost open hole's —
+// every deeper `}` is an ordinary closer. Interpolated literals therefore NEST
+// for free (a hole may hold another; each pushes its own row), and the stack is
+// the whole reason no re-lexing or bracket-matching pre-pass is needed.
 //
 // `gTplOpenLine`/`gTplOpenCol`/`gTplOpenPos` are parallel to `gTplBrace`: the
-// position of the template's OPENING BACKTICK, kept so an unterminated template
+// position of the literal's OPENING DELIMITER, kept so an unterminated one
 // reports there rather than at the `}` of whichever part ran off the end. The
 // char OFFSET rides along because a SPAN needs it — see `tplLineEndCol`.
-let gTplStop = 0 // why the last part stopped: 0 = closing backtick, 1 = `${`, 2 = ran out of input
+//
+// `gTplQuote` is the run's DELIMITER (`"` or `` ` ``), and it is what makes ONE
+// split-run machinery serve both literal forms: the `}` arm resumes the run in
+// the mode it opened in (a `"` run still refuses a raw newline; a backtick run
+// still takes one as content), and the unterminated report names the literal the
+// author actually opened. Without it a `"a\{x}` and a `` `a\{x} `` would have to
+// be two scanners with two escape decoders — the split the template entry was
+// built to avoid.
+let gTplStop = 0 // why the last part stopped: 0 = closing delimiter, 1 = `\{`, 2 = ran out of input
 let gTplOpenLine: i32[] = []
 let gTplOpenCol: i32[] = []
 let gTplOpenPos: i32[] = []
 let gTplBrace: i32[] = []
+let gTplQuote: i32[] = []
 let gBrace = 0
 
 // ---- character classes (char literals) -----------------------------------
@@ -617,14 +633,23 @@ export function scanQuoted(quote: i32) {
   // there (not wherever scanning stopped) keeps a missing quote a local error.
   const openLine = gLine
   const openCol = gCol
-  // TEMPLATE MODE — `quote == '`'`. Three rules differ and nothing else does:
-  // a raw newline is CONTENT (templates are multiline, as in JS), a `${` ENDS
-  // the part (recorded in `gTplStop`, since VL functions return one value), and
-  // ``\` ``/`\$` join the escape set. The "opening quote" it consumes is a
-  // backtick for a HEAD/whole template and a `}` for a MID/TAIL part — one
-  // scanner for all four, which is what keeps the escape grammar single-sourced.
+  // TEMPLATE MODE — `quote == '`'`. Exactly TWO rules differ from `"` and
+  // nothing else does: a raw newline is CONTENT (templates are multiline, as in
+  // JS, and that is the one thing the `"` form still refuses), and ``\` `` joins
+  // the escape set because a backtick is the delimiter there.
+  //
+  // HOLE MODE — `"` and `` ` ``, never `'`. A `\{` ENDS the part (recorded in
+  // `gTplStop`, since VL functions return one value); the "opening quote" the
+  // scan consumes is the literal's own delimiter for a HEAD/whole run and a `}`
+  // for a MID/TAIL part. ONE scanner for all of it, which is what keeps the
+  // escape grammar single-sourced across two literal forms and four part kinds.
+  //
+  // A char literal is deliberately NOT in hole mode: `'\{'` keeps its
+  // "Unknown escape sequence", because a char literal is one code point and a
+  // hole could never be one.
   const tpl = quote == '`'
-  if tpl { gTplStop = 2 }
+  const holes = tpl || quote == '"'
+  if holes { gTplStop = 2 }
   advance() // opening quote
   let value = ""
   let closed = false
@@ -636,9 +661,17 @@ export function scanQuoted(quote: i32) {
     // so one missing quote yields a single local error at the opening quote
     // instead of masking every later error up to EOF.
     if !tpl && (ch == '\n' || ch == '\r') { break }
-    if tpl && ch == '$' && peek2() == '{' {
+    // A HOLE OPENS. The trigger lives in the ESCAPE NAMESPACE — `\{`, not `${`
+    // — and that is what makes interpolation additive to the `"` form at zero
+    // cost: `{` stays an ordinary character in every string forever (4,821
+    // in-tree literals carry one), while `"a\{b"` was an "Unknown escape
+    // sequence" error before this and so had no meaning to break. Tested BEFORE
+    // the escape arm below, so `\{` never reaches `decodeSimpleEscape`; `\\{` is
+    // therefore a literal backslash followed by a literal brace, since the first
+    // backslash is consumed by the `\\` escape and the `{` is read as text.
+    if holes && ch == '\\' && peek2() == '{' {
       value = value + gSrc.slice(runStart, gPos)
-      advance() // $
+      advance() // backslash
       advance() // {
       runStart = gPos
       closed = true
@@ -657,10 +690,17 @@ export function scanQuoted(quote: i32) {
         break
       }
       const e = peek()
-      // The two TEMPLATE-ONLY escapes: a template's delimiters. Handled before
+      // The ONE template-only escape: a template's own delimiter. Handled before
       // `decodeSimpleEscape` so the `"` grammar is unchanged — ``"\`"`` keeps
       // warning "Unknown escape sequence" exactly as it did.
-      if tpl && (e == '`' || e == '$') {
+      //
+      // `\$` USED TO BE THE OTHER ONE and is RETIRED: with the hole trigger in
+      // the escape namespace, `$` is an ordinary character in a template again
+      // and needs no escape, so keeping `\$` would be a second spelling for
+      // "the character `$`" that only one of the two literal forms accepted —
+      // exactly the grammar split this change exists to close. It falls through
+      // to the unknown-escape arm below, which names it.
+      if tpl && e == '`' {
         advance() // the escaped delimiter
         value = value + fromCodePoint(e)
         runStart = gPos
@@ -749,7 +789,24 @@ export function scanQuoted(quote: i32) {
       const dec = decodeSimpleEscape(e)
       if dec == "" {
         // Unknown escape: keep the char after the backslash verbatim, and warn.
-        diagAt("Unknown escape sequence", escLine, escCol)
+        //
+        // `\$` gets its own sentence — and gets it in BOTH literal forms, so no
+        // second escape grammar appears. It is the one spelling this change
+        // RETIRED (it was a template escape for the week `${` was the hole
+        // trigger), so the generic message would leave a reader with working
+        // code from six days ago no idea what happened. `${` needs no such arm:
+        // it does not become an error, it becomes ordinary text, and inventing a
+        // diagnostic for a legal program to warn about a week-old spelling is
+        // speculative — measured, ZERO `${` remain in tree after the migration.
+        if e == '$' {
+          diagAt(
+            "`\\$` is not an escape — write `$` (an interpolation hole is `\\{…}`)",
+            escLine,
+            escCol,
+          )
+        } else {
+          diagAt("Unknown escape sequence", escLine, escCol)
+        }
         runStart = gPos - 1
       } else {
         value = value + dec
@@ -762,29 +819,30 @@ export function scanQuoted(quote: i32) {
       advance() // closing quote
       runStart = gPos
       closed = true
-      if tpl { gTplStop = 0 }
+      if holes { gTplStop = 0 }
       break
     }
     advance()
   }
   value = value + gSrc.slice(runStart, gPos)
   if !closed {
-    // A template's own "unterminated" report is the CALLER's — only the caller
-    // knows where the opening BACKTICK was (a MID/TAIL part opens at a `}`, a
-    // whole template away), and only the caller can measure a span for a literal
-    // that may be MULTILINE. `gTplStop` carries the verdict there.
+    // AN INTERPOLABLE LITERAL'S "unterminated" REPORT IS THE CALLER'S — only the
+    // caller knows where the OPENING DELIMITER was (a MID/TAIL part opens at a
+    // `}`, a whole literal away), and only the caller can measure a span for a
+    // literal that may be MULTILINE. `gTplStop` carries the verdict there, and
+    // `gTplQuote` tells the caller which literal to name.
     //
-    // Spans the opening quote through whatever the scan reached (the raw newline
-    // that broke the loop, or EOF) — the whole run the reader has to look at.
-    // That is sound for `"` and `'` precisely because a raw newline terminates
-    // them, so `gCol` is still on `openLine`; it is NOT sound for a template,
-    // which is why the template arm above leaves without reporting.
-    if tpl {
+    // A char literal still reports HERE, spanning the opening quote through
+    // whatever the scan reached (the raw newline that broke the loop, or EOF) —
+    // the whole run the reader has to look at. That is sound for `'` precisely
+    // because a raw newline terminates it, so `gCol` is still on `openLine`.
+    // For a `"` run the caller re-derives the identical span (see the `"` arm in
+    // `tokenize`): the scan stopped either at that newline or at EOF, so
+    // `openCol`..`gCol` and the caller's `openCol`..`gCol` are the same pair.
+    if holes {
       gTplStop = 2
-    } else if quote == '\'' {
-      diagSpan("Unterminated char literal", openLine, openCol, gCol)
     } else {
-      diagSpan("Unterminated string literal", openLine, openCol, gCol)
+      diagSpan("Unterminated char literal", openLine, openCol, gCol)
     }
   }
   value
@@ -795,21 +853,30 @@ export function scanQuoted(quote: i32) {
 // decode/re-encode round trip, so no second escape decoder exists to drift from
 // `scanQuoted`'s).
 //
-// `raw` is a part's verbatim source lexeme, delimiters included: `` `a${ ``,
-// `}b${`, `}c` ``, or a whole `` `d` ``. One leading char is always a delimiter
-// (a backtick or a `}`); the trailing one is a backtick (1 char) or a `${` (2).
+// `raw` is a part's verbatim source lexeme, delimiters included: `` `a\{ ``,
+// `}b\{`, `}c` ``, `"a\{`, `}c"`, or a whole `` `d` `` / `"d"`. One leading char
+// is always a delimiter (the literal's own quote, or a `}`); the trailing one is
+// that quote (1 char) or a `\{` (2).
+//
+// IT IS DELIMITER-AGNOSTIC ON PURPOSE — both literal forms mint the same part
+// kinds and both reach here, so one rewrite serves `"a\{x}b"` and `` `a\{x}b` ``
+// alike. The only place the form is even visible is the trailing-delimiter test,
+// which accepts either quote.
 //
 // THE TWO GRAMMARS SHARE THEIR ESCAPE SET, which is what makes the rewrite a
 // copy almost everywhere: `\n`, `\xNN`, `\u{…}`, `\\` and the rest are the same
 // sequence on both sides and are copied WHOLE (the escaped character included,
-// so a `\\` can never be re-read as an escape opener). Exactly four characters
+// so a `\\` can never be re-read as an escape opener). Exactly three characters
 // differ, and each has one rule:
-//   ``\` `` and `\$` — template-only escapes; the bare character is ordinary
-//                      inside `"`, so the backslash is DROPPED.
+//   ``\` ``         — the template-only escape; a backtick is ordinary inside
+//                     `"`, so the backslash is DROPPED.
 //   `"`             — ordinary inside a template, a terminator inside `"`, so
 //                     it gains a backslash.
 //   a raw newline / CR — content inside a template (multiline), a terminator
 //                     inside `"`, so it becomes `\n` / `\r`.
+// (`\$` was the fourth until the hole trigger moved into the escape namespace.
+// It is no longer an escape in EITHER grammar, so it is copied whole like any
+// other unknown escape and decodes to `$` on both sides.)
 // A backslash-newline (line continuation) is copied by the escape arm above and
 // never reaches the newline rule, so it keeps meaning "drop both".
 //
@@ -821,9 +888,13 @@ export function tplPartStrLex(raw: string): string {
   const n = raw.length
   const q = "\""
   if n < 1 { return q + q }
+  // The trailing delimiter: the literal's own quote (1 char) or a hole-opening
+  // `\{` (2). A part that ends with NEITHER came from an unterminated literal —
+  // already a lex error — and keeps everything, which is what leaves the
+  // recovery lexeme well-formed.
   let stop = n
-  if raw[n - 1] == '`' { stop = n - 1 }
-  else if n >= 2 && raw[n - 2] == '$' && raw[n - 1] == '{' { stop = n - 2 }
+  if raw[n - 1] == '`' || raw[n - 1] == '"' { stop = n - 1 }
+  else if n >= 2 && raw[n - 2] == '\\' && raw[n - 1] == '{' { stop = n - 2 }
   const start = 1
   if stop <= start { return q + q }
   let out = q
@@ -841,7 +912,7 @@ export function tplPartStrLex(raw: string): string {
         runStart = i
       } else {
         const e = raw[i + 1]
-        if e == '`' || e == '$' {
+        if e == '`' {
           out = out + raw.slice(runStart, i) + raw.slice(i + 1, i + 2)
           i = i + 2
           runStart = i
@@ -892,6 +963,8 @@ export function tokenize(source: string): LexResult {
   gTplOpenPos = freshTP
   const freshTB: i32[] = []
   gTplBrace = freshTB
+  const freshTQ: i32[] = []
+  gTplQuote = freshTQ
   gBrace = 0
 
   const toks: Tok[] = []
@@ -1093,10 +1166,24 @@ export function tokenize(source: string): LexResult {
       continue
     }
 
-    // String literal `"..."`.
+    // String literal `"..."` — and, since the hole trigger `\{` lives in the
+    // ESCAPE namespace, the same split-run opener a backtick is. A string with
+    // no hole is one `STRING` token and nothing downstream changes for it; one
+    // with a hole opens a `TEMPLATE_HEAD` and rides the identical machinery.
     if c == '"' {
       const value = scanQuoted('"')
-      toks.push(mkTok("STRING", value, startPos, startLine, startCol))
+      if gTplStop == 1 {
+        tplOpenPush(startLine, startCol, startPos, '"')
+        toks.push(mkTok("TEMPLATE_HEAD", value, startPos, startLine, startCol))
+      } else {
+        // The span `scanQuoted` used to report for itself: the scan stopped at a
+        // raw newline (still on `startLine`) or at EOF, so `gCol` is the honest
+        // exclusive end either way.
+        if gTplStop == 2 {
+          diagSpan("Unterminated string literal", startLine, startCol, gCol)
+        }
+        toks.push(mkTok("STRING", value, startPos, startLine, startCol))
+      }
       continue
     }
 
@@ -1106,10 +1193,7 @@ export function tokenize(source: string): LexResult {
     if c == '`' {
       const tv = scanQuoted('`')
       if gTplStop == 1 {
-        gTplOpenLine.push(startLine)
-        gTplOpenCol.push(startCol)
-        gTplOpenPos.push(startPos)
-        gTplBrace.push(gBrace)
+        tplOpenPush(startLine, startCol, startPos, '`')
         toks.push(mkTok("TEMPLATE_HEAD", tv, startPos, startLine, startCol))
       } else {
         if gTplStop == 2 {
@@ -1136,7 +1220,10 @@ export function tokenize(source: string): LexResult {
     }
     if c == '}' {
       if atTplHoleDepth() {
-        const tv2 = scanQuoted('`') // consumes the `}` as this part's opener
+        // Resumed in the mode the run OPENED in — a `"` run still refuses a raw
+        // newline, a backtick run still takes one as content. This is the one
+        // read of `gTplQuote` that makes one machinery serve two literal forms.
+        const tv2 = scanQuoted(gTplQuote[gTplQuote.length - 1]) // the `}` is this part's opener
         if gTplStop == 1 {
           toks.push(mkTok("TEMPLATE_MID", tv2, startPos, startLine, startCol))
         } else {
@@ -1217,12 +1304,26 @@ function atTplHoleDepth() {
   gBrace == gTplBrace[gTplBrace.length - 1]
 }
 
-// Report the innermost open template as unterminated, AT ITS OPENING BACKTICK.
+// Open a split run: the four stacks move together, and `quote` is the
+// delimiter the `}` arm resumes in and the unterminated report names.
+function tplOpenPush(line: i32, col: i32, pos: i32, quote: i32) {
+  gTplOpenLine.push(line)
+  gTplOpenCol.push(col)
+  gTplOpenPos.push(pos)
+  gTplBrace.push(gBrace)
+  gTplQuote.push(quote)
+  0
+}
+
+// Report the innermost open run as unterminated, AT ITS OPENING DELIMITER —
+// naming the literal the AUTHOR opened, which is the only one they can fix.
 function tplOpenDiag() {
   const oi = gTplOpenLine.length - 1
   if oi >= 0 {
+    let what = "Unterminated string literal"
+    if gTplQuote[oi] == '`' { what = "Unterminated template literal" }
     diagSpan(
-      "Unterminated template literal",
+      what,
       gTplOpenLine[oi],
       gTplOpenCol[oi],
       tplLineEndCol(gTplOpenPos[oi], gTplOpenCol[oi]),
@@ -1244,13 +1345,14 @@ function tplOpenDiag() {
 // missing backtick. Reported at the OPENING backtick either way, so a
 // multi-line template still points at the character that needs fixing.
 
-// Close the innermost open template (the three stacks move together).
+// Close the innermost open run (the four stacks move together).
 function tplOpenPop() {
   if gTplOpenLine.length > 0 {
     gTplOpenLine.pop()
     gTplOpenCol.pop()
     gTplOpenPos.pop()
     gTplBrace.pop()
+    gTplQuote.pop()
   }
   0
 }

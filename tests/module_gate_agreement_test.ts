@@ -76,8 +76,21 @@ Deno.test("module-gate: the shared TS gate answers every row of the table", () =
     "the re-export row must arm through hasImports, not through the template scan",
   );
   assert(
-    hasTemplateHole("print(`v=${x}`)\n") && !hasImports("print(`v=${x}`)\n"),
+    hasTemplateHole("print(`v=\\{x}`)\n") && !hasImports("print(`v=\\{x}`)\n"),
     "the template row must arm through hasTemplateHole, not through the import scan",
+  );
+  // BOTH quoted forms interpolate, so both must arm — the plain-string half is
+  // the one a `${`-era gate would silently miss, and missing it is SILENT.
+  assert(
+    hasTemplateHole('print("v=\\{x}")\n') && !hasImports('print("v=\\{x}")\n'),
+    "a hole in a PLAIN STRING must arm through hasTemplateHole too — the trigger " +
+      "is `\\{` in the escape namespace, which is legal in `\"…\"` as well as in a template",
+  );
+  // And the property the whole spelling was chosen for: a literal `{` in a
+  // string is DATA, forever. 4,821 in-tree literals depend on it.
+  assert(
+    !hasTemplateHole('print("{plain}")\n') && !hasTemplateHole('print("${x}")\n'),
+    "a bare `{` (or a `${`) in a string must never arm module mode",
   );
 });
 
@@ -179,25 +192,38 @@ Deno.test("module-gate: scripts/vl-host/src/main.rs arms exactly the shared keyw
   );
 });
 
-// ── 4. the template half stays a REAL scan in both mirrored copies ────────────
+// ── 4. the hole half stays a REAL scan, in BOTH literal forms, in both copies ──
 //
 // `contains("`")` would arm module mode for the 2,409 corpus files with a
-// backtick in a comment, moving programs that have nothing to do with templates
-// off the single-source path. These anchors are what separates the real scan from
-// that shortcut; they are the same three ingredients in both languages.
+// backtick in a comment, moving programs that have nothing to do with
+// interpolation off the single-source path. These anchors are what separates the
+// real scan from that shortcut.
+//
+// SINCE PLAIN STRINGS INTERPOLATE, the scan has a second thing to get right and
+// the anchors say so: the `\{` test must appear inside the DOUBLE-QUOTE arm as
+// well as the backtick arm, gated by a flag that keeps the CHAR arm out. A gate
+// that only looked in backticks would answer `false` for `print("v=\{x}")` — and
+// a gate that answers `false` where the compiler answers `true` fails SILENTLY,
+// which is the whole reason this file exists.
 
-Deno.test("module-gate: both mirrored template scans skip comments and literals", () => {
+Deno.test("module-gate: both mirrored hole scans skip comments and scan BOTH literal forms", () => {
   const checks: [string, string, [string, string][]][] = [
     [CLI_UTIL, "export function cliHasTplHole(", [
       ["a `//` comment skip", "s[i + 1] == '/'"],
       ["a double-quote literal skip", `c == '"'`],
       ["a single-quote literal skip", "c == '\\''"],
-      ["the `${` hole test", "s[i + 1] == '{'"],
+      ["the quoted-form hole flag (`\"` interpolates, `'` does not)", `const holes = c == '"'`],
+      ["the `\\{` hole test in the STRING arm", "if holes && i + 1 < n && s[i + 1] == '{'"],
+      ["the `\\{` hole test in the TEMPLATE arm", "if i + 1 < n && s[i + 1] == '{'"],
+      ["the escaped-character skip (so `\\\\{` is not a hole)", "if s[i] == '\\\\'"],
     ]],
     [MAIN_RS, "fn has_template_hole(", [
       ["a `//` comment skip", "b[i + 1] == b'/'"],
       ["a quote literal skip", `q @ (b'"' | b'\\'')`],
-      ["the `${` hole test", "b'{'"],
+      ["the quoted-form hole flag (`\"` interpolates, `'` does not)", `let holes = q == b'"'`],
+      ["the `\\{` hole test in the STRING arm", "if holes && i + 1 < n && b[i + 1] == b'{'"],
+      ["the `\\{` hole test in the TEMPLATE arm", "if i + 1 < n && b[i + 1] == b'{'"],
+      ["the escaped-character skip (so `\\\\{` is not a hole)", "if b[i] == b'\\\\'"],
     ]],
   ];
   for (const [rel, header, anchors] of checks) {
@@ -206,9 +232,9 @@ Deno.test("module-gate: both mirrored template scans skip comments and literals"
       assert(
         body.includes(needle),
         `${rel} \`${header.replace(/[({].*$/, "")}\` lost ${what} (${JSON.stringify(needle)}). ` +
-          `The template gate is a REAL SCAN, not \`contains("\`")\`: a backtick in a ` +
-          `\`//\` comment is ordinary (2,409 corpus files carry one) and must not arm ` +
-          `module mode.`,
+          `The hole gate is a REAL SCAN over BOTH quoted forms, not \`contains("\`")\`: ` +
+          `a backtick in a \`//\` comment is ordinary (2,409 corpus files carry one) and ` +
+          `must not arm module mode, while \`print("v=\\{x}")\` MUST.`,
       );
     }
   }

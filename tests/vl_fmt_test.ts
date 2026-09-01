@@ -1596,50 +1596,66 @@ Deno.test({
   },
 });
 
-// ── template literals reprint VERBATIM ────────────────────────────────────────
-// A template desugars in the PARSER into the concatenation it means, so without
-// the faithful-surface marker on the root `+` the formatter would print
-// `"v=" + $tpl$render(x)` — a name no program can even spell. The rule it
-// follows instead is the string literal's: the bytes between the delimiters are
-// DATA, so they come back exactly as written, holes and all.
+// ── interpolated literals reprint VERBATIM ───────────────────────────────────
+// An interpolated literal desugars in the PARSER into the concatenation it
+// means, so without the faithful-surface marker on the root `+` the formatter
+// would print `"v=" + $tpl$render(x)` — a name no program can even spell. The
+// rule it follows instead is the string literal's: the bytes between the
+// delimiters are DATA, so they come back exactly as written, holes and all.
 //
-// The three shapes that could each go wrong on their own:
-//   · a hole-less template, which is a plain `StrLit` and needs no marker;
-//   · a template with holes, whose root `+` carries the marker;
-//   · a template as an OPERAND of a real `+` chain, where the chain flattener
-//     would otherwise flatten straight through the template's own `+`.
+// BOTH QUOTED FORMS interpolate (`"v=\{x}"` and `` `v=\{x}` ``) and both reach
+// the same marker, so both are pinned here — a holed `"…"` is the shape that
+// would regress silently, since a hole-LESS string never leaves the plain
+// `StrLit` path and would keep passing.
+//
+// The shapes that could each go wrong on their own:
+//   · a hole-less literal, which is a plain `StrLit` and needs no marker;
+//   · a literal with holes, whose root `+` carries the marker;
+//   · a literal as an OPERAND of a real `+` chain, where the chain flattener
+//     would otherwise flatten straight through the literal's own `+`;
+//   · a literal whose text carries a BARE `{` or `${`, which is data now and
+//     forever and must not acquire an escape on the way out.
 //
 // It lives here and not in tests/cases because the fmt gate never sees
 // tests/cases (the #1278 lesson) — a formatting rule pinned only there is not
 // pinned at all.
 Deno.test({
-  name: "vl-fmt: a template literal reprints its own bytes, holes and all",
+  name: "vl-fmt: an interpolated literal reprints its own bytes, holes and all",
   ignore: !ENABLED,
   fn: async () => {
     const src = [
       "const x = 5",
       "const plain = `no holes`",
-      "const one = `v=${x} done`",
-      "const spaced = `${ x + 1 }`",
-      'const chained = "a" + `b${x}c` + "d"',
-      'const esc = `\\` and \\${ and " and \\\\`',
+      "const one = `v=\\{x} done`",
+      "const spaced = `\\{ x + 1 }`",
+      'const chained = "a" + `b\\{x}c` + "d"',
+      'const esc = `\\` and \\\\{ and " and \\\\`',
       "const multi = `line1",
       "  line2`",
+      'const sHole = "v=\\{x} done"',
+      'const sSpaced = "\\{ x + 1 }"',
+      'const sChained = "a" + "b\\{x}c" + "d"',
+      'const sBrace = "{plain} and ${x}"',
       "print(plain + one + spaced + chained + esc + multi)",
+      "print(sHole + sSpaced + sChained + sBrace)",
       "",
     ].join("\n");
     const r = await run([], src);
     if (r.code !== 0) {
       throw new Error(`vl fmt rejected valid source (rc ${r.code}):\n${r.err}`);
     }
-    // Every template's own bytes must survive, character for character.
+    // Every literal's own bytes must survive, character for character.
     const literals = [
       "`no holes`",
-      "`v=${x} done`",
-      "`${ x + 1 }`",
-      "`b${x}c`",
-      '`\\` and \\${ and " and \\\\`',
+      "`v=\\{x} done`",
+      "`\\{ x + 1 }`",
+      "`b\\{x}c`",
+      '`\\` and \\\\{ and " and \\\\`',
       "`line1\n  line2`",
+      '"v=\\{x} done"',
+      '"\\{ x + 1 }"',
+      '"b\\{x}c"',
+      '"{plain} and ${x}"',
     ];
     for (const lit of literals) {
       if (!r.out.includes(lit)) {
@@ -1653,8 +1669,10 @@ Deno.test({
     if (r.out.includes("$tpl$")) {
       throw new Error(`fmt printed the desugared render call:\n${r.out}`);
     }
-    if (r.out.includes('"v="')) {
-      throw new Error(`fmt printed a template as a concatenation:\n${r.out}`);
+    if (r.out.includes('"v=" +')) {
+      throw new Error(
+        `fmt printed an interpolated literal as a concatenation:\n${r.out}`,
+      );
     }
     const r2 = await run([], r.out);
     if (r2.code !== 0 || r2.out !== r.out) {

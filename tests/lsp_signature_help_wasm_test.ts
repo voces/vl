@@ -76,12 +76,18 @@ const COUNTER_CASES: [string, string, string][] = [
   ["a char literal holding a comma", "f(a, ',', |b)", "f/2"],
   ["unterminated string swallows its commas", 'f("a, b|', "f/0"],
 
-  // Templates: one token to the tokenizer, expression source inside a hole.
-  ["inside a template hole", "f(`v=${g(1, |2)}`)", "g/1"],
+  // Interpolated literals: one token to the tokenizer, expression source inside
+  // a hole. BOTH quoted forms interpolate, so both re-enter — a `"` hole that
+  // did not would silently answer about the wrong call.
+  ["inside a template hole", "f(`v=\\{g(1, |2)}`)", "g/1"],
   ["template TEXT is not a call", "f(`a, b|c`)", "f/0"],
-  ["a hole with no call falls out to the template's call", "f(`${x|}`)", "f/0"],
-  ["a nested template's hole", "f(`${g(`${h(1, |2)}`)}`)", "h/1"],
+  ["a hole with no call falls out to the literal's call", "f(`\\{x|}`)", "f/0"],
+  ["a nested template's hole", "f(`\\{g(`\\{h(1, |2)}`)}`)", "h/1"],
   ["a comma in template text is not a separator", "f(`a, b`, |x)", "f/1"],
+  ["inside a PLAIN STRING hole", 'f("v=\\{g(1, |2)}")', "g/1"],
+  ["a string hole holding a string", 'f("v=\\{g("a", |2)}")', "g/1"],
+  ["a plain-string hole inside a template hole", 'f(`\\{g("\\{h(1, |2)}")}`)', "h/1"],
+  ["a brace in string TEXT opens no hole", 'f("{a, b|c}")', "f/0"],
 
   // Member spellings.
   ["member call", "x.f(|1)", ".f/0"],
@@ -225,7 +231,7 @@ const SRC = [
   "  nil()", // 12
   "  const h: Handler = { cb: (v: i32) => v }", // 13
   "  h.cb(1)", // 14
-  '  print(`v=${greet("q", 3)}`)', // 15
+  '  print(`v=\\{greet("q", 3)}`)', // 15
   "}", // 16
 ].join("\n");
 
@@ -332,7 +338,7 @@ Deno.test({
   name: "signature-help(wasm): a call inside a template hole resolves",
   ignore,
 }, async () => {
-  // The template is ONE token to the tokenizer; the hole is re-entered as source.
+  // The literal is ONE token to the tokenizer; the hole is re-entered as source.
   const got = await helpAt(SRC, 15, 25);
   if (got !== "greet(name: string, times: i32) => string @times: i32") {
     throw new Error(`want the hole's call, got ${got}`);

@@ -12,13 +12,19 @@
 //   • `"…"` strings and `'…'` char literals sharing one escape set
 //     (`\n \t \r \\ \" \' \0 \b \f \v \xXX \uXXXX \u{…}`, plus
 //     backslash-newline line continuation, unknown escapes kept verbatim).
-//   • backtick TEMPLATE literals, scanned WHOLE — delimiters, text parts,
-//     `${…}` holes and all — and emitted as one `str` token. The whole point is
-//     that a brace, quote or backtick anywhere inside one is invisible to the
-//     consumers: a hole's `{ … }` is balanced by construction, so folding must
-//     not see it as a region, and a hole's `"…"` must not derail the string
-//     scan. Templates NEST (a hole may hold another), which is why the scan is a
-//     small state machine and not an `indexOf`.
+//   • INTERPOLATION HOLES `\{…}`, legal in a `"…"` string AND in a backtick
+//     template — one trigger, one state machine (`scanHole`), reached from both
+//     literal scanners. A `"` inside a hole is not the string's terminator, so
+//     `scanStringLiteral` HAS to know about holes: without it `"a\{f("x")}b"`
+//     ends its scan at the wrong quote and every later token in the file is
+//     misread.
+//   • backtick TEMPLATE literals, scanned WHOLE — delimiters, text parts, holes
+//     and all — and emitted as one `str` token. The whole point is that a brace,
+//     quote or backtick anywhere inside one is invisible to the consumers: a
+//     hole's `{ … }` is balanced by construction, so folding must not see it as
+//     a region, and a hole's `"…"` must not derail the string scan. Interpolated
+//     literals NEST (a hole may hold another), which is why the scan is a small
+//     state machine and not an `indexOf`.
 //   • no interpolation OF THE TEXT: a template's `str` value is its raw inner
 //     source, escapes undecoded, since no consumer reads a template's value for
 //     anything but a test name.
@@ -126,9 +132,26 @@ export interface StringScan {
   lastBreak: number;
 }
 
-/** Scans the literal opening at `source[from]` (a `"` or `'`). */
-export const scanStringLiteral = (source: string, from: number): StringScan => {
+/**
+ * Scans the literal opening at `source[from]` (a `"` or `'`).
+ *
+ * A `"` literal INTERPOLATES: `\{` opens a hole, which is skipped whole via
+ * {@link scanHole} and contributes its raw source to `value`. That is not a
+ * nicety — a hole is expression context, so it can contain a `"`, and a scanner
+ * that did not know about holes would take that quote as this literal's
+ * terminator and misread the rest of the document. A `'` char literal does not
+ * interpolate (one code point could not hold a hole), matching `compiler/lexer.vl`.
+ *
+ * `holes`, when given, collects this literal's OWN hole spans in source order —
+ * see {@link scanTemplate} for what a consumer does with them.
+ */
+export const scanStringLiteral = (
+  source: string,
+  from: number,
+  holes?: TemplateHole[],
+): StringScan => {
   const quote = source[from];
+  const interpolates = quote === '"';
   let value = "";
   let i = from + 1;
   let lineBreaks = 0;
@@ -140,6 +163,8 @@ export const scanStringLiteral = (source: string, from: number): StringScan => {
     }
     if (c === "\n") {
       // An unescaped newline ends the literal in the lexer too (unterminated).
+      // A hole's newlines are NOT this rule's business — a hole is an expression
+      // and may span lines — and they are consumed by `scanHole` below.
       return { value, next: i, terminated: false, lineBreaks, lastBreak };
     }
     if (c !== "\\") {
@@ -149,6 +174,19 @@ export const scanStringLiteral = (source: string, from: number): StringScan => {
     }
     const e = source[i + 1];
     if (e === undefined) break;
+    if (interpolates && e === "{") {
+      const hole = scanHole(source, i, holes);
+      // A hole may span lines; the caller tracks position from these.
+      for (let k = i; k < hole.next; k++) {
+        if (source[k] === "\n") {
+          lineBreaks++;
+          lastBreak = k;
+        }
+      }
+      value += source.slice(i, hole.next);
+      i = hole.next;
+      continue;
+    }
     if (e === "\n") {
       // Line continuation: the backslash and the newline both disappear.
       lineBreaks++;
@@ -190,7 +228,7 @@ export const scanStringLiteral = (source: string, from: number): StringScan => {
   return { value, next: source.length, terminated: false, lineBreaks, lastBreak };
 };
 
-/** A `${…}` hole's CONTENT span — offsets into the source, `${` and `}` excluded. */
+/** A `\{…}` hole's CONTENT span — offsets into the source, `\{` and `}` excluded. */
 export interface TemplateHole {
   start: number;
   /** Exclusive. The source end for an unterminated hole (mid-edit). */
@@ -198,23 +236,60 @@ export interface TemplateHole {
 }
 
 /**
+ * Scans the interpolation hole opening at `source[from]` (the backslash of a
+ * `\{`), returning the index one past its closing `}`.
+ *
+ * ONE state machine for BOTH literal forms — a hole in `"…"` and a hole in
+ * `` `…` `` are the same construct, so a second copy here would be a second
+ * answer to "is this `}` the closer?". Braces nest; `"` / `'` literals are
+ * skipped whole (a delimiter inside one is ordinary — the hole is expression
+ * context, and a nested string may itself interpolate, which is why the string
+ * scanner is the one called rather than an `indexOf`); a nested template
+ * recurses. A newline is ordinary inside a hole, so the caller must count line
+ * breaks from the consumed slice rather than assume there are none.
+ */
+export const scanHole = (
+  source: string,
+  from: number,
+  holes?: TemplateHole[],
+): { next: number; closed: boolean } => {
+  let i = from + 2; // past `\{`
+  const holeStart = i;
+  let closed = false;
+  let depth = 0;
+  while (i < source.length) {
+    const h = source[i];
+    if (h === "}" && depth === 0) {
+      i++;
+      closed = true;
+      break;
+    }
+    if (h === "{") depth++;
+    else if (h === "}") depth--;
+    else if (h === '"' || h === "'") i = scanStringLiteral(source, i).next - 1;
+    else if (h === "`") i = scanTemplate(source, i).next - 1;
+    i++;
+  }
+  holes?.push({ start: holeStart, end: closed ? i - 1 : source.length });
+  return { next: i, closed };
+};
+
+/**
  * Scans the backtick template opening at `source[from]`, returning the index one
  * past its closing backtick.
  *
  * The state machine is the lexer's (`compiler/lexer.vl`): in TEXT, a backslash
- * escapes the next character, `` ` `` closes and `${` opens a hole; in a HOLE,
- * braces nest, `"` / `'` literals are skipped whole (a backtick inside one is
- * ordinary — the hole is expression context), and a nested template recurses.
- * A newline is content on both sides, so the caller must count line breaks from
- * the consumed slice rather than assume there are none.
+ * escapes the next character, `` ` `` closes and `\{` opens a hole. `${` is
+ * ordinary text — the hole trigger moved into the escape namespace when plain
+ * strings learned to interpolate, so that one spelling serves both forms.
  *
  * `holes`, when given, collects this template's OWN hole spans in source order —
  * the state machine already knows where each one begins and ends, and signature
- * help needs exactly that to re-enter a hole as expression source (a template is
- * one opaque `str` token to `tokenize`, so a call written inside one is
- * invisible without it). A hole nested in an inner template is NOT collected:
- * that template is itself one token of the outer hole's source, so the consumer
- * recurses rather than flattening.
+ * help needs exactly that to re-enter a hole as expression source (an
+ * interpolated literal is one opaque `str` token to `tokenize`, so a call written
+ * inside one is invisible without it). A hole nested in an inner literal is NOT
+ * collected: that literal is itself one token of the outer hole's source, so the
+ * consumer recurses rather than flattening.
  */
 export const scanTemplate = (
   source: string,
@@ -225,31 +300,16 @@ export const scanTemplate = (
   while (i < source.length) {
     const c = source[i];
     if (c === "\\") {
+      // `\{` opens a hole; every other backslash escapes the next character —
+      // which is what makes `\\{` an escaped backslash before an ordinary brace.
+      if (source[i + 1] === "{") {
+        i = scanHole(source, i, holes).next;
+        continue;
+      }
       i += 2;
       continue;
     }
     if (c === "`") return { next: i + 1, terminated: true };
-    if (c === "$" && source[i + 1] === "{") {
-      i += 2;
-      const holeStart = i;
-      let closed = false;
-      let depth = 0;
-      while (i < source.length) {
-        const h = source[i];
-        if (h === "}" && depth === 0) {
-          i++;
-          closed = true;
-          break;
-        }
-        if (h === "{") depth++;
-        else if (h === "}") depth--;
-        else if (h === '"' || h === "'") i = scanStringLiteral(source, i).next - 1;
-        else if (h === "`") i = scanTemplate(source, i).next - 1;
-        i++;
-      }
-      holes?.push({ start: holeStart, end: closed ? i - 1 : source.length });
-      continue;
-    }
     i++;
   }
   return { next: source.length, terminated: false };

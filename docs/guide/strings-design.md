@@ -1053,7 +1053,10 @@ is re-slicing enough?*
 
 **OQ-2 — string building, interpolation, and formatting. INTERPOLATION IS SHIPPED
 (2026-09-01), `std:fmt` exists; the builder remains.** The perf half was already done
-(B7b fusion, §Mutability). The spelling ruled and built is `` `Hello ${name}` ``, and
+(B7b fusion, §Mutability). The spelling ruled and built is `\{name}` — in a plain
+`"Hello \{name}"` as well as in a backtick `` `Hello \{name}` ``, one hole syntax for both
+quoted forms (owner, 2026-09-01, "OK do `\{`"; the trigger sits in the ESCAPE namespace so a
+bare `{` stays data in every string forever). Backticks add MULTILINE and nothing else. And
 `std:fmt` does back it — but not by scope lookup: a hole binds ABSOLUTELY to std's
 renderer through a compiler-injected import, so a template's meaning does not depend on
 the file's imports (DECISIONS.md, "A template literal's stringifier is bound

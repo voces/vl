@@ -1457,9 +1457,15 @@ fn has_template_hole(source: &str) -> bool {
                 }
             }
             q @ (b'"' | b'\'') => {
+                // `"` interpolates, `'` does not: a char literal is one code
+                // point and could not hold a hole.
+                let holes = q == b'"';
                 i += 1;
                 while i < n && b[i] != q {
                     if b[i] == b'\\' {
+                        if holes && i + 1 < n && b[i + 1] == b'{' {
+                            return true;
+                        }
                         i += 1;
                     }
                     i += 1;
@@ -1470,9 +1476,10 @@ fn has_template_hole(source: &str) -> bool {
                 i += 1;
                 while i < n && b[i] != b'`' {
                     if b[i] == b'\\' {
+                        if i + 1 < n && b[i + 1] == b'{' {
+                            return true;
+                        }
                         i += 1;
-                    } else if b[i] == b'$' && i + 1 < n && b[i + 1] == b'{' {
-                        return true;
                     }
                     i += 1;
                 }
@@ -1500,11 +1507,12 @@ fn stage_program(store: &mut Store<()>, inst: &Instance, source: &str, source_pa
     // diagnostic fires inside the wasm instead of an infinite re-request).
     // A re-export (`export { … } from "…"`) is a module dependency too, so it must
     // also arm the fetch loop — gate on a leading `import {` OR `export {`.
-    // A TEMPLATE LITERAL WITH A HOLE also arms it: the hole desugars to a call
-    // into `std:fmt`, which the compiler can only reach through this loop. Its
-    // scan is real rather than `contains('`')` because a backtick in a `//`
-    // comment is ordinary (2,409 corpus files carry one) and must not move a
-    // program off the single-source path.
+    // AN INTERPOLATION HOLE `\{…}` also arms it — in EITHER quoted form, a
+    // `"…"` string or a `` `…` `` template: the hole desugars to a call into
+    // `std:fmt`, which the compiler can only reach through this loop. Its scan
+    // is real rather than `contains('`')` because a backtick in a `//` comment
+    // is ordinary (2,409 corpus files carry one) and must not move a program off
+    // the single-source path.
     //
     // FOUR IMPLEMENTATIONS, THREE LANGUAGES, and they must agree — a host that
     // does not arm the loop leaves the guest asking for a module nobody fetches,

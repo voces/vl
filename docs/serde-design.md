@@ -321,9 +321,12 @@ Facts that constrain the design, each verified this session:
    - **String assembly is no longer the pain it was.** `"v=" + 0.1` is still
      `operator '+' is not defined for string and f64` **(RUN 2026-09-01)**, but **template
      literals exist** and their holes bind absolutely to the canonical stringifier:
-     `` `f64=${x} i32=${n} i64=${i} bool=${b}` `` renders all four widths with no import and
-     no concat **(RUN 2026-09-01)**. Anywhere below that reasons about hand-built strings
-     being quadratic or awkward, a template is now the spelling — and the absolute binding
+     `"f64=\{x} i32=\{n} i64=\{i} bool=\{b}"` renders all four widths with no import and
+     no concat **(RUN 2026-09-01)**. A PLAIN string is enough — `\{…}` is one hole syntax
+     across both quoted forms since 2026-09-01, and backticks add multiline and nothing
+     else, so the JSON spellings below need no delimiter change and their bare braces stay
+     data. Anywhere below that reasons about hand-built strings
+     being quadratic or awkward, interpolation is now the spelling — and the absolute binding
      (`DECISIONS.md`, "A template literal's stringifier is bound ABSOLUTELY") is the precedent
      OQ-1 leans on.
 7. **i64 is a real 64-bit integer end to end.** `9007199254740993` (2^53 + 1) prints
@@ -625,7 +628,7 @@ function str(lx: Lex): string | null {          // one token, typed
 function num(lx: Lex): f64 | null { /* … slice to ',' or '}', then */ parseF64(/* … */) }
 
 function encode(c: Config): string {            // a template, not concat
-  `{"name":"${c.name}","ratio":${toString(c.ratio)},"retries":${toString(c.retries)}}`
+  `{"name":"\{c.name}","ratio":\{toString(c.ratio)},"retries":\{toString(c.retries)}}`
 }
 function decode(src: string): Config | null {   // built AT the destination shape
   const lx: Lex = { src: src, pos: 0 }
@@ -1011,7 +1014,7 @@ stringifier — ~~std's integer/boolean renderer today, its f64 arm at Stage 0B~
 `i32 | i64 | boolean | f64` renderer as of 2026-09-01, the f64 arm LANDED**, and the derived
 `show<T>` at Stage 2 — so **objects/maps/sets/arrays/unions become spellable in a template
 hole and printable the moment the derive lands, with zero new template or print work**.
-The widening is already visible at the hole: `` `f64=${x} i32=${n} i64=${i} bool=${b}` ``
+The widening is already visible at the hole: `` `f64=\{x} i32=\{n} i64=\{i} bool=\{b}` ``
 renders all four widths with no import **(RUN 2026-09-01)**, and it did not do that
 yesterday — which is the chain working exactly as this section claims it would.
 D711's ruling ("`print([1,2,3])` has no defined output") is not overturned early: it is
@@ -1741,7 +1744,7 @@ const x = 0.1
 const n = 42
 const i: i64 = 9007199254740993
 const b = true
-print(`f64=${x} i32=${n} i64=${i} bool=${b}`)
+print(`f64=\{x} i32=\{n} i64=\{i} bool=\{b}`)
 //   → f64=0.1 i32=42 i64=9007199254740993 bool=true
 // while `const s: string = "v=" + x` is still
 //   operator '+' is not defined for string and f64
@@ -1836,7 +1839,7 @@ function num(lx: Lex): f64 | null {
 }
 
 function encode(c: Config): string {
-  `{"name":"${c.name}","ratio":${toString(c.ratio)},"retries":${toString(c.retries)}}`
+  `{"name":"\{c.name}","ratio":\{toString(c.ratio)},"retries":\{toString(c.retries)}}`
 }
 
 function decode(src: string): Config | null {

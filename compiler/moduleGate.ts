@@ -73,15 +73,24 @@ export const hasImports = (source: string): boolean =>
   source.split("\n").some(lineIsImport);
 
 /**
- * True when `source` holds a backtick template literal with a `${…}` hole — the
- * second construct that arms the module fetch loop, because a hole desugars to a
- * call into `std:fmt`, and `std:fmt` reaches the compiler only through the loop.
+ * True when `source` holds an INTERPOLATION HOLE `\{…}` — in EITHER quoted form,
+ * a `"…"` string or a `` `…` `` template. The second construct that arms the
+ * module fetch loop, because a hole desugars to a call into `std:fmt`, and
+ * `std:fmt` reaches the compiler only through the loop.
+ *
+ * The name undersells it (it predates plain-string interpolation) and is kept
+ * because it is mirrored character for character in three languages under a guard
+ * that anchors on the declaration. This doc comment is the contract.
  *
  * A REAL SCAN, not a bare backtick test: a backtick in a `//` comment is ordinary
  * (2,409 corpus files carry one) and must not move a program off the single-source
- * path. Comments and quoted literals are skipped; a hole-less plain template needs
- * no renderer and does not arm the loop. Kept identical to `cliHasTplHole`
- * (`compiler/cli_util.vl`) and `has_template_hole` (`scripts/vl-host/src/main.rs`).
+ * path. Comments are skipped; a hole-less plain literal of either form needs no
+ * renderer and does not arm the loop. The `\{` test lives INSIDE the literal
+ * scans — `\{` in code is not lexable at all, and `\\{` inside a literal is an
+ * escaped backslash then an ordinary brace, so the backslash arm must look at the
+ * next character before deciding. A char literal never arms: `'\{'` could not hold
+ * a hole. Kept identical to `cliHasTplHole` (`compiler/cli_util.vl`) and
+ * `has_template_hole` (`scripts/vl-host/src/main.rs`).
  */
 export const hasTemplateHole = (source: string): boolean => {
   const n = source.length;
@@ -91,17 +100,23 @@ export const hasTemplateHole = (source: string): boolean => {
     if (c === "/" && source[i + 1] === "/") {
       while (i < n && source[i] !== "\n") i++;
     } else if (c === '"' || c === "'") {
+      const holes = c === '"';
       i++;
       while (i < n && source[i] !== c) {
-        if (source[i] === "\\") i++;
+        if (source[i] === "\\") {
+          if (holes && source[i + 1] === "{") return true;
+          i++;
+        }
         i++;
       }
       i++;
     } else if (c === "`") {
       i++;
       while (i < n && source[i] !== "`") {
-        if (source[i] === "\\") i++;
-        else if (source[i] === "$" && source[i + 1] === "{") return true;
+        if (source[i] === "\\") {
+          if (source[i + 1] === "{") return true;
+          i++;
+        }
         i++;
       }
       i++;
