@@ -24143,6 +24143,24 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   table has no interned arm for the self-referential container spelling; that is the half
   still to build. Reverted rather than merged.
 
+* **THE REMAINING WORK IS A REP, AND HERE IS THE EXACT CHAIN.** With the union registered
+  (#2221) both witnesses reach ONE loud refusal: the parameter ladder in `emit_sections.vl`,
+  because `nodeTyIsUnionish(p.parType)` is false. Fixing that predicate alone is a REGRESSION,
+  not progress — the param then passes the gate and lowers as `i32`, and the module is
+  check-clean invalid wasm. Measured, not assumed; that is why it is not in the tree.
+
+  The lowering side asks a different question and every step of it answers "not a union" for
+  the one-member wrapper:
+
+      vtKindOfParam -> vtKindOfType -> retUnionFlag -> nodeTyIsUnionAlias -> isValueUnionBox
+
+  So closing D982/D985 means teaching `isValueUnionBox` (and whatever interns the arms) about a
+  union that normalises to one member wrapping a `TyNullable` — AND making the value actually
+  BE boxed at the call site, with the `is` dispatching on its tag. That is a rep build, not a
+  predicate fix, and the capability-matrix rule applies in full: build the lowering, wire every
+  delivery position, THEN narrow the parameter gate. Narrowing first is exactly the
+  clause-2-into-clause-1 trade this file keeps recording.
+
 * **THE MAP ARM IS NOW ON THE SAME FOOTING AS THE ARRAY ARM.** #2223 had to hold
   self-referential MAP arms transparent because registering one hit [D984](#d984)'s unbounded
   recursion; with that bounded, the clause is lifted and both container kinds reach the same
