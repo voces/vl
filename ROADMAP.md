@@ -44,6 +44,18 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   not move under the f64-arm work. One PR: default-scope removal (`driver.vl` blPush +
   the emit special cases), std rename + in-tree importer migration, a targeted
   moved-to-std hint on the undeclared name, DECISIONS entry recording the naming choice.
+- **Template literals / interpolation — SHIPPED #TBD.** Backtick strings, additive,
+  desugared in the parser to concat over `std:fmt`'s renderer bound ABSOLUTELY via a
+  compiler-injected bare import edge plus an unspellable rename row. Two remainders,
+  both measured: a STRING-only hole still pulls `std:fmt`+`std:str` because the host
+  closes the module graph before any type exists — the fix is whole-program DCE, not a
+  template-specific drop; and an `f32` hole reaches the pre-existing
+  `emitProgram: union atom has no value box` floor at the SAME spelling a hand-written
+  `x.toStr()` does (`scripts/capability-probes/f32-into-f64-union-arm.vl` owns it — the
+  template is a second door, not a second defect). The hole domain needs no scheduling:
+  it is read off the renderer, and picked up `f64` from serde Stage 0 with no edit.
+  **The `toStr` → `toString` rename above is a ONE-LINE edit here**
+  (`TPL_RENDER_EXPORT` in `driver.vl`) — it is already isolated.
 - **`else` requires braces** — DONE #2165; recorded here only because the ruling predates
   the entry above and the DECISIONS entry is the durable home.
 - **Colored `print`** — ruled in principle 2026-09-01 with one hard constraint (ANSI must
@@ -55,12 +67,6 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
 
 ### Awaiting owner rulings (durable list; each row names its doc)
 
-- **Template literals / interpolation** — recommended design: additive backtick strings,
-  `` `v=${x}` `` desugaring at parse time to concat over std's `toString` bound
-  ABSOLUTELY (compiler-injected import, never scope pickup — every surveyed language
-  binds interpolation to a canonical protocol; Rust's absolute-path macro expansion is
-  the model). Holes start at `toString`'s domain, widen with serde Stage 2's `show<T>`.
-  Sized: parser + desugar + fmt, smaller than either Stage 0 half. Blocked on: go/no-go.
 - **Constraints / nameable bounds** — `docs/constraints-design.md` (2026-09-01): Phase 1
   concepts (`type Showable = { toString(self): string }`, `<T: Showable>`,
   declaration-checked — also the root fix for D952's wordless refusal), Phase 2

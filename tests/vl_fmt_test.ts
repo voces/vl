@@ -1595,3 +1595,72 @@ Deno.test({
     }
   },
 });
+
+// ── template literals reprint VERBATIM ────────────────────────────────────────
+// A template desugars in the PARSER into the concatenation it means, so without
+// the faithful-surface marker on the root `+` the formatter would print
+// `"v=" + $tpl$render(x)` — a name no program can even spell. The rule it
+// follows instead is the string literal's: the bytes between the delimiters are
+// DATA, so they come back exactly as written, holes and all.
+//
+// The three shapes that could each go wrong on their own:
+//   · a hole-less template, which is a plain `StrLit` and needs no marker;
+//   · a template with holes, whose root `+` carries the marker;
+//   · a template as an OPERAND of a real `+` chain, where the chain flattener
+//     would otherwise flatten straight through the template's own `+`.
+//
+// It lives here and not in tests/cases because the fmt gate never sees
+// tests/cases (the #1278 lesson) — a formatting rule pinned only there is not
+// pinned at all.
+Deno.test({
+  name: "vl-fmt: a template literal reprints its own bytes, holes and all",
+  ignore: !ENABLED,
+  fn: async () => {
+    const src = [
+      "const x = 5",
+      "const plain = `no holes`",
+      "const one = `v=${x} done`",
+      "const spaced = `${ x + 1 }`",
+      'const chained = "a" + `b${x}c` + "d"',
+      'const esc = `\\` and \\${ and " and \\\\`',
+      "const multi = `line1",
+      "  line2`",
+      "print(plain + one + spaced + chained + esc + multi)",
+      "",
+    ].join("\n");
+    const r = await run([], src);
+    if (r.code !== 0) {
+      throw new Error(`vl fmt rejected valid source (rc ${r.code}):\n${r.err}`);
+    }
+    // Every template's own bytes must survive, character for character.
+    const literals = [
+      "`no holes`",
+      "`v=${x} done`",
+      "`${ x + 1 }`",
+      "`b${x}c`",
+      '`\\` and \\${ and " and \\\\`',
+      "`line1\n  line2`",
+    ];
+    for (const lit of literals) {
+      if (!r.out.includes(lit)) {
+        throw new Error(
+          `fmt did not reproduce ${JSON.stringify(lit)} verbatim:\n${r.out}`,
+        );
+      }
+    }
+    // The desugar must not surface: neither the injected renderer's name nor a
+    // concatenation standing in for a template.
+    if (r.out.includes("$tpl$")) {
+      throw new Error(`fmt printed the desugared render call:\n${r.out}`);
+    }
+    if (r.out.includes('"v="')) {
+      throw new Error(`fmt printed a template as a concatenation:\n${r.out}`);
+    }
+    const r2 = await run([], r.out);
+    if (r2.code !== 0 || r2.out !== r.out) {
+      throw new Error(
+        `not idempotent (rc ${r2.code}):\n--- once ---\n${r.out}\n--- twice ---\n${r2.out}`,
+      );
+    }
+  },
+});

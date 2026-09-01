@@ -86,16 +86,22 @@ export type WasmMemberToken = {
  * One classified lexical token from the wasm lexical pass (kill-TS) — the native
  * counterpart of the host's TS `tokenize` + `lexicalTokenType` + comment scan.
  * `tokenClass` is a stable small enum the host maps onto its semantic-token
- * legend: 0=keyword, 1=operator, 2=number, 3=boolean, 4=comment. Identifiers
- * (owned by the symbol slice), strings (left to the TextMate grammar), and
- * structural punctuation carry no class and are not emitted. Position is 0-based
- * line, 0-based char (LSP).
+ * legend: 0=keyword, 1=operator, 2=number, 3=boolean, 4=comment, 5=string.
+ * Identifiers (owned by the symbol slice), `"` strings (left to the TextMate
+ * grammar, whose finer escape scopes survive) and structural punctuation carry no
+ * class and are not emitted. Position is 0-based line, 0-based char (LSP).
+ *
+ * Class 5 is emitted for TEMPLATE literals only, and the reason is that a
+ * template is not one token: its text runs arrive as four kinds with the hole
+ * EXPRESSIONS lexed in between, so a grammar rule spanning `` ` `` to `` ` ``
+ * would paint a hole's identifiers as string content. Class 5 covers exactly the
+ * text parts and the `${` / `}` delimiters riding on them.
  */
 export type WasmLexicalToken = {
   line: number; // 0-based
   char: number; // 0-based
   length: number;
-  tokenClass: number; // 0=keyword 1=operator 2=number 3=boolean 4=comment
+  tokenClass: number; // 0=keyword 1=operator 2=number 3=boolean 4=comment 5=string
 };
 
 /** {@link WasmLexicalToken.tokenClass} values, for the host's legend mapping. */
@@ -104,6 +110,7 @@ export const WASM_LEX_OPERATOR = 1;
 export const WASM_LEX_NUMBER = 2;
 export const WASM_LEX_BOOLEAN = 3;
 export const WASM_LEX_COMMENT = 4;
+export const WASM_LEX_STRING = 5;
 
 /**
  * One in-scope binding from the wasm scope-at-position pass — a
@@ -483,6 +490,52 @@ const hasImports = (source: string): boolean =>
   });
 
 /**
+ * True when `source` holds a backtick template literal with a `${…}` hole — the
+ * second construct that arms the module fetch loop, because a hole desugars to a
+ * call into `std:fmt`.
+ *
+ * A REAL SCAN, not a bare backtick test: a backtick in a `//` comment is ordinary
+ * (2,409 corpus files carry one) and must not move a program off the single-source
+ * path. Comments and quoted literals are skipped; a hole-less plain template needs
+ * no renderer and does not arm the loop. Kept identical to `cliHasTplHole`
+ * (`compiler/cli_util.vl`), `has_template_hole` (`scripts/vl-host/src/main.rs`)
+ * and this function's twin in the other file — the four must agree, or the guest
+ * asks for a module nobody fetches.
+ */
+const hasTemplateHole = (source: string): boolean => {
+  const n = source.length;
+  let i = 0;
+  while (i < n) {
+    const c = source[i];
+    if (c === "/" && source[i + 1] === "/") {
+      while (i < n && source[i] !== "\n") i++;
+    } else if (c === '"' || c === "'") {
+      i++;
+      while (i < n && source[i] !== c) {
+        if (source[i] === "\\") i++;
+        i++;
+      }
+      i++;
+    } else if (c === "`") {
+      i++;
+      while (i < n && source[i] !== "`") {
+        if (source[i] === "\\") i++;
+        else if (source[i] === "$" && source[i + 1] === "{") return true;
+        i++;
+      }
+      i++;
+    } else {
+      i++;
+    }
+  }
+  return false;
+};
+
+/** The module pipeline's arming test: an import edge, or a template hole. */
+const needsModules = (source: string): boolean =>
+  hasImports(source) || hasTemplateHole(source);
+
+/**
  * Build a checker over a seed `instantiate`r — the environment-agnostic core of
  * the LSP-on-wasm path. `instantiate` returns the live driver {@link Exports}
  * (or undefined when the seed is unavailable — every method then degrades to a
@@ -511,7 +564,7 @@ export const createWasmChecker = (
     read: ModuleReader,
   ): Promise<void> => {
     exp.modReset();
-    if (hasImports(source)) {
+    if (needsModules(source)) {
       // `std:` keys resolve through the host's reader wrapper (the Node loader's
       // `withStd`: workspace `std/` dir first, then the embedded map — same
       // precedence as the TS checker's workspace reader, so the two agree about

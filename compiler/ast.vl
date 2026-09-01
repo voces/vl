@@ -81,12 +81,20 @@ export type Unary = { unOp: string, unArg: i32, pos: i32 } // !x  -x
 // (the host's `compoundOperator`) the printer reads to reprint the written form
 // without re-scanning tokens. Typecheck/emit ignore it (they read the desugared
 // `binLeft`/`binRight`).
+// `binTpl` is the second faithful-surface marker beside `binCompound`: 1 marks
+// the ROOT `+` of the concatenation a backtick TEMPLATE literal desugared to, so
+// the printer reprints the template's own source bytes instead of the concat.
+// Its span covers the whole template (the node is built after the closing
+// backtick is consumed, so `pos` .. `nodeEndOf` is `` ` `` .. `` ` ``), which is
+// all `format.vl` needs. Typecheck/emit ignore it, exactly as they ignore
+// `binCompound`.
 export type BinExpr = {
   binOp: string,
   binLeft: i32,
   binRight: i32,
   pos: i32,
   binCompound: string,
+  binTpl: i32,
 } // a + b,  a = b,  a += b
 // A call `f(a, b)` / `f(a: 2, b: 1)`. `callArgs` are the argument VALUE nodes in
 // SOURCE order; `callArgNames` is the parallel per-argument NAME list ("" = a
@@ -989,8 +997,70 @@ export function mkBinary(op: string, left: i32, right: i32, pos: i32) {
     binRight: right,
     pos: pos,
     binCompound: "",
+    binTpl: 0,
   }
   addNode(n)
+}
+
+// ── the template renderer's LOCAL NAME (the injected import's near half) ─────
+// The identifier a template hole's desugared call names. It is deliberately
+// UNSPELLABLE — `$` is not an identifier character (`lexer.isIdStart`), so no
+// user program can declare it, shadow it, or reference it — which is the whole
+// mechanism behind "a template's meaning does not depend on the user's imports"
+// (DECISIONS.md, owner ruling 2026-09-01). The module merge rewrites it to the
+// merged `toStr$mN` through an ordinary rename row, so it never reaches the
+// checker's scope and never appears in hover or completion.
+//
+// The FAR half — which std export it denotes — is `TPL_RENDER_EXPORT` in
+// `driver.vl`, and that is the ONE line the queued `toStr` → `toString` rename
+// touches.
+export const TPL_RENDER_LOCAL = "$tpl$render"
+
+// The ROOT `+` of a template literal's concatenation — `mkBinary` plus the
+// faithful-surface marker the printer reads (see `BinExpr.binTpl`).
+export function mkTplConcat(left: i32, right: i32, pos: i32) {
+  const n: Node = {
+    binOp: "+",
+    binLeft: left,
+    binRight: right,
+    pos: pos,
+    binCompound: "",
+    binTpl: 1,
+  }
+  addNode(n)
+}
+
+// ── template holes (the parser's record of what a `${…}` was) ────────────────
+// PARALLEL to `P.nodes`, grown lazily, bounds-checked on read — the `nodeToks` /
+// `declNameTok` contract. `1` marks a node that IS a template hole's expression.
+//
+// WHY A SIDE TABLE AND NOT A NODE KIND: the hole is an ORDINARY expression and
+// every pass should treat it as one. The single consumer is the checker's
+// argument-mismatch report, which owes a template hole a sentence about
+// templates rather than about the call the user never wrote — and the mark has
+// to survive the module merge's identifier rewrite, which a callee NAME does
+// not. (A `TemplateLit` node kind was the alternative and is strictly worse
+// here: it would need an `is` arm in nine files' dispatch chains, each with a
+// catch-all that fails SILENTLY, to buy nothing the desugar does not already
+// give — `format.vl` recovers the surface from the source span either way.)
+export let tplHole: i32[] = []
+
+// Mark `nodeIx` as a template hole's expression. Bounds-guarded on the WRITE
+// too, not only the read: every caller passes a constructor's result and so
+// cannot pass a negative, but a `tplHole[-1] = 1` would be an out-of-bounds
+// TRAP inside the compiler — no diagnostic, no position — and this table is not
+// worth that risk.
+export function mkTplHole(nodeIx: i32) {
+  if nodeIx < 0 { return 0 }
+  while tplHole.length <= nodeIx { tplHole.push(0) }
+  tplHole[nodeIx] = 1
+  0
+}
+
+// True when `nodeIx` is the expression of a `${…}` hole.
+export function nodeIsTplHole(nodeIx: i32) {
+  if nodeIx < 0 || nodeIx >= tplHole.length { return false }
+  tplHole[nodeIx] == 1
 }
 
 // A compound assignment `target op= value`, desugared to `target = (target op
@@ -1010,6 +1080,7 @@ export function mkCompoundAssign(
     binRight: inner,
     pos: pos,
     binCompound: op,
+    binTpl: 0,
   }
   addNode(n)
 }
@@ -1028,6 +1099,7 @@ export function mkPreIncr(incr: string, target: i32, pos: i32) {
     binRight: inner,
     pos: pos,
     binCompound: incr,
+    binTpl: 0,
   }
   addNode(n)
 }

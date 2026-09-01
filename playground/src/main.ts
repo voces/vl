@@ -127,6 +127,11 @@ monaco.languages.setMonarchTokensProvider(VL_LANGUAGE_ID, {
       [/\/\/.*$/, "comment"],
       [/"(?:[^"\\]|\\.)*"/, "string"],
       [/'(?:[^'\\]|\\.)*'/, "string"],
+      // A backtick TEMPLATE. Monarch is line-oriented, so this covers the
+      // single-line form; a multiline template falls back to no colour until the
+      // semantic-token provider answers, which is the same degradation every
+      // other construct here has.
+      [/`(?:[^`\\]|\\.)*`/, "string"],
       [/\b\d[\d_]*(?:\.\d[\d_]*)?\b/, "number"],
       [
         /[a-zA-Z_]\w*/,
@@ -146,6 +151,7 @@ monaco.languages.setLanguageConfiguration(VL_LANGUAGE_ID, {
     { open: "(", close: ")" },
     { open: '"', close: '"' },
     { open: "'", close: "'" },
+    { open: "`", close: "`" },
   ],
 });
 
