@@ -23897,12 +23897,25 @@ loss, and the gate could not see it because the corpus has no cell for either:
   | `exprUnion` given an `IfStmt` arm (the desugared node's real shape), forced true | no change |
   | `letIsUnion` forced true for a `??` init AND for an `IfStmt` init | no change |
 
+  | `nodeTyCarry` — hand the `??`'s checked type to the synthesized `if` | no change |
+  | that carry PLUS an `IfStmt` arm on `exprUnion` reading it | no change |
+
   Tried in both the module-global and the function-local spelling. **So the cell's rep is not
-  decided by `letIsUnion` → `exprUnion` at all, and a classifier arm is the wrong fix.** The
-  next attempt starts at the emitted VALUE — the desugared `if`'s two arms — not at the
-  binding: the THEN arm yields the box and the ELSE arm yields a raw default, and nothing
-  coerces the ELSE into the box. An ANNOTATED destination works because the annotation seeds
-  that coercion; that is the same fact the table above records, read from the other end.
+  decided by `letIsUnion` → `exprUnion`, and a classifier arm is not the fix.**
+
+* **THE BYTES SAY WHY — TWO scalar decisions, not one.** Built with `--no-validate` and read
+  with `wasm-dis`, the function holds `(local $1 i32)` for the cell, and the initializer is
+  `(local.set $1 (if (result i32) (i32.ne (struct.get ...) (i32.const 6)) (then (local.get
+  $0)) (else (global.get $global$1))))`. The cell's valtype AND the if-expression's result
+  BLOCKTYPE both came out `i32`, while the THEN arm pushes the box and the ELSE arm pushes a
+  string ref. A fix that moves only the cell leaves an `(if (result i32))` with ref arms —
+  still invalid — so whatever the real decider is, it must move both, and **a candidate has to
+  be graded by DISASSEMBLING, not by the binding's declared kind.**
+
+* **AND THE LADDER'S FIRST RUNG IS NOT THE CLAIMANT, checked rather than assumed.**
+  `letInitIsLitAtom` reaches `exprIsLitAtom`, whose `??` arm fires only for a FUSED MAP READ
+  left operand (`fusedMapReadRecvIx >= 0`); an Ident operand declines it. So the binding is not
+  being taken early by the litunion rung either.
 
 Repro (check rc 0, invalid wasm):
 
