@@ -23894,6 +23894,29 @@ and the refusal turns into a miscompile:
   site does not land in the function body at all. The marker is measuring the writer's target
   buffer, not reachability. Use a counter global or a distinctive `emitFail` there instead.
 
+* **THE EMITTER IS THE VOID-DISCARD LEG — found, and it answers this row's open question.**
+  Marking the `fRetVoid[rvPos] == 1` arm of `emitStmt`'s `RetStmt` case counts **2 for
+  `pick(b)` and 0 for the annotated control**. So `pick` is classified VOID while its functype
+  is the union box, and its returns take the discard path — `emitStmt` the operand, then a bare
+  `fbReturn()`, which leaves the pushed i32 as the result. That is exactly the
+  `(return (i32.const 1))` under `(result (ref $box))` in the disassembly.
+
+* **BUT THE FLAG'S ORIGIN IS STILL UNEXPLAINED, and `computeVoidFns` appears not to be it.**
+  Its only path to `fRetVoid[i] = 1` is gated on `!blockHasValuedReturn(fn.fnBody)`, and that
+  helper DOES recurse into an `if` (`ifChainHasValuedReturn`), so `if b { return 1 }` should
+  make it false and leave the function non-void. Declaring void or non-void neighbours before
+  and after `pick` shifts nothing, so it is not an off-by-one position read either. **The next
+  attempt should establish where `fRetVoid` becomes 1 for this function before changing
+  anything** — the other writer is `emit_rewrite`'s void-adopted-lambda pin, and a
+  `buildFnMap#2` rebuild re-seeds the column from `retVoidAnnFlag` after `computeVoidFns` runs.
+
+* **AND GUARDING THE LEG IS NOT SUFFICIENT ON ITS OWN — measured, reverted.** Adding
+  `&& fRetKind[rvPos] != "union"` re-routes the returns to `emitReturnExit`/`emitReturnValue`
+  and converts the miscompile into the loud "no value box" refusal, which is a real
+  improvement in kind but not `runs`. Combining it with the A20 gate relaxation does NOT
+  finish the job either: the probe stays invalid wasm and the `relay` control goes from loud to
+  silent. So at least one more site is involved beyond the leg and the gate.
+
 Repro (check rc 0, invalid wasm):
 
     const by: i32 | string = 7
