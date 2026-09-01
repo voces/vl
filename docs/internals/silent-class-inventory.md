@@ -23956,7 +23956,7 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
 
 ### D984 — a self-referential MAP arm with no `null` traps the COMPILER at the declaration alone
 
-**compiler trap · found by vl-b7's serde grid, reproduced here · clause 1 (the trap is the compiler's, not the program's)**
+**closed · was a compiler trap · found by vl-b7's serde grid, reproduced and fixed here · clause 1 · `tests/cases/types/self-recursive-map-arm-declares.vl`**
 
     type T = string | {[string]: T}
     print("ok")
@@ -23995,47 +23995,29 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   array-interposition row is the most useful of these: whatever recurses descends map values
   and does NOT descend array elements.
 
-* **AN ELIMINATION LIST WAS FILED HERE AND IS RETRACTED — the instrument was wrong twice.**
-  It claimed seven candidates ruled out by counter probes. Both halves of that method fail:
+* **THE CYCLE, AND HOW IT WAS FOUND.** `mvShapeOfMapNameArmTy` -> `mvShapeOfValNameArmTy` ->
+  `mvValRowOfShape`, stepping through `mapValNameOf` — the map's VALUE — which for
+  `type T = string | {[string]: T}` is `T` again. **Each lap EXPANDS the spelling rather than
+  repeating it**, so a name-keyed re-entry guard can never fire; only a nesting bound can. The
+  cycle steps through map values and NOT array elements, which is exactly why
+  `string | {[string]: T[]}` always ran.
 
-  1. **The counters were MONOTONIC, not nesting counters.** "This function was called more
-     than 40 times" is a statement about frequency, not about recursion depth, so neither a
-     hit nor a miss says anything about which function is looping. One candidate did trip its
-     counter and was briefly reported as found; it is merely called often.
-  2. **`refresh-compiler.sh` REFUSES TO INSTALL a compiler that fails its sanity program**,
-     and says so only in the middle of its output. A probe that `emitFail`s on ordinary code
-     is therefore discarded — the old seed stays, the next measurement runs against an
-     UNINSTRUMENTED compiler, and the result reads as "the probe never fired". Check the
-     `refreshed …` line, not the exit code.
+  **It was found from the BACKTRACE's function indices, after reading candidate source failed
+  twelve times.** The compiler wasm has ZERO imports, so the printed index is the defined
+  index directly. Signatures alone narrowed it — `(string, i32)`, `(string, i32, i32, i32)`,
+  `(string)` — and the identification came from a CONSTANT: the innermost frame compares a
+  transform of its argument against a three-byte global, `105 51 50`, which is `"i32"`. One
+  grep for `== "i32"` gives `nameIsI32KeyedMap`, whose only `(string, i32)` caller opens with
+  exactly that call. **Fingerprint a frame by the data it touches, not by what it looks like
+  it should be.**
 
-  Two instrument facts worth keeping, both established by validating the channel before
-  trusting a null result: **`emitFail` IS observable** from compiler code (the refresh's own
-  sanity step prints it), and **`print` is NOT** — a `print` inside `compiler/*.vl` reaches no
-  stdout, so every probe written that way measures nothing.
+* **THE FIX IS A NESTING BOUND THAT DEGRADES RATHER THAN REFUSES.** `-1` is already this
+  function's "no shape here" answer and the caller already handles it —
+  `mvShapeOfMapNameArmTy` falls back to `mapMonoShapeOfKey(ki)`. So past 32 laps the walk
+  returns the mono shape, which is the right answer for a value whose shape cannot be finitely
+  enumerated. Direct and MUTUAL map recursion both run now.
 
-  What still stands, because it came from behaviour rather than from a probe: `rtGo` /
-  `rtOfMap` memoise with `rtByTyPut` BEFORE recursing, which is the cycle-breaking the array
-  arm relies on; `tyToStrAt` already carries a depth cap; and a NAME re-entry guard on
-  `registerInlineUnion` cannot work, because each lap EXPANDS the spelling rather than
-  repeating it. A nesting bound of 64 on `collectTyReachRegister` also changes nothing, which
-  does rule that one out as the looping frame.
-
-* **TWELVE CANDIDATES ELIMINATED WITH A SOUND INSTRUMENT — nesting counters, on builds
-  verified to have installed.** Wrapped as `f(...) { if n > 40 { fail }; n = n + 1; const r =
-  fGo(...); n = n - 1; r }`, which measures DEPTH rather than call frequency:
-  `registerInlineUnion`, `collectTyMembersReach`, `collectTyReachRegister`, `internArmShapeAt`,
-  `internShapeDeepTy`, `mvArmSigOfName`, `mvDeepArmOfTy`, `mvDeepDeclOfTy`,
-  `rlCanonLitUnionAtoms`, `tyMentionsFunc`, `tyReachesFuncD`, `collectTyReachCloSigs`. None
-  nests past 40. `rtGo`/`rtOfMap` and `tyToStrAt` are out on structure (memoise-before-recurse
-  and an existing depth cap).
-
-* **THE MASS-WRAP SHORTCUT DOES NOT WORK, and the reason is worth knowing before trying it.**
-  Wrapping every function in a module mechanically requires each one's RETURN TYPE, and VL
-  infers most of them — defaulting the annotation-less ones to `i32` makes 189 wrappers return
-  `i32 | string` and the module stops type-checking. A wrapper needs the real type, so a
-  whole-module sweep needs the checker's answer, not a regex's guess.
-
-* **THE NEXT INSTRUMENT SHOULD BE THE FUNCTION INDEX
+* **AN ELIMINATION LIST WAS FILED HERE AND IS RETRACTED
 
 ### D983 — a `u8[] | null` destination fed by an ARRAY LITERAL: the cell was the packed wrapper, the value the shared i32 backing
 
