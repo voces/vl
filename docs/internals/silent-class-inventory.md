@@ -23872,6 +23872,15 @@ and the refusal turns into a miscompile:
   witness. Fixing either alone moves the program between clause 2 and clause 1 rather than to
   `runs` — which is exactly what the bystander demonstrates from the other side.
 
+* **`retUNm` IS NOT THE LEVER EITHER — hardcoded, and the returns still do not box.** With the
+  gate forced open AND `retUNm` set to the literal `"i32 | string"` at `emitReturnValue`'s
+  inferred-return rung, the disassembly is unchanged: `(return (i32.const 1))` raw under a
+  `(result (ref $box))` functype. So these returns are not being emitted through that rung at
+  all. **The two candidates are the RETURN SINK (`fnUsesUnionSink`, predicted per function by
+  `fnUnionRetSinkOk` at `emit_sections`) and `emitReturnValue` itself** — establish which one
+  writes those two instructions before changing anything, because three levers that looked
+  right (the gate, the recorded spelling, the `retUNm` delivery) have each moved nothing.
+
 Repro (check rc 0, invalid wasm):
 
     const by: i32 | string = 7
