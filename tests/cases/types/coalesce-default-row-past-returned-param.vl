@@ -1,0 +1,101 @@
+// @run
+// @log 7
+// @log 107
+// @log 9
+// @log 7
+// @log 7
+// @log 207
+// @log 1
+// @log 307
+// CONTRACT (must-RUN): D804's merged row reaches a `??` whose left operand is a call to a
+// callee that hands back a PARAMETER. This file was `xfail-coalesce-default-row-past-returned-
+// param.vl` and asserted `@no-instantiate`; D891 closed it and the name lost its prefix.
+//
+// THE LITERALS ARE AT THE CALL SITES. Every earlier carrier in this line put the literal and
+// the reader in ONE frame: D871 read the callee's returned literal, D882 a returned binding,
+// D883 a returned call, D886 the two composed. A parameter has no binding in the frame that
+// returned it — `anonLeafRetIdentOk`'s scan finds nothing — and the values that reach it are
+// the ARGUMENTS at every call site, one frame OUT. `anonLeafParamArgsOk` reads them.
+//
+// AND THE PARAMETER'S SLOT IS A SEVENTH OWNER OF THE MERGED ROW. Moving the argument literal
+// alone is the same disagreement one position over: the callee's `local.get 0` stays
+// `(ref $narrow)` under a `(result (ref null $merged))`. Measured, not argued — with the
+// reader in and no owner, sixteen of this family's cells only move their invalid-wasm OFFSET
+// and the `?? { r: null }` corner trades a loud emit reject for check-clean invalid wasm. The
+// slot comes from the ANNOTATION (`annValtypeSlotOf`), which no earlier owner touches, and it
+// is read at THREE resolvers that had to move together: `paramStructIdxOf` (the functype and
+// the `$fnsig` token), `paramStructIndex` (`structIndexOfExpr`'s `Ident` arm — `p.r` INSIDE
+// the callee) and `captureValStructIdx` (a closure that captures the parameter). Removing the
+// second alone reddens the `p.r` read; removing the third alone reddens the capture.
+//
+// THE MARK IS PER-PARAM AND THAT IS `anonLeafRetMoved`'S LESSON, NOT CAUTION: the row a merge
+// supersedes is a FIELD-SET row, so an ungated redirect at `paramStructIdxOf` would move every
+// `{r: i32}` parameter in the program. `nope` below is exactly that hazard and it prints its
+// own narrow value beside the family.
+//
+// FIVE REFUTATIONS bound the reader, each because a call site it cannot see passes an argument
+// it cannot move: a GENERIC callee (the monomorphizer clones the annotation), TWO declarations
+// of one name, the name used as a VALUE, a NAMED argument, and an argument that is neither an
+// object literal nor `null`. `distilled/named/d891_bound_*` pins all four that are expressible
+// here; a `null` argument is not a refutation, for `ref.null`'s reason.
+
+// ---- the callee hands back its PARAMETER; the literal is at the call site ----
+function src(p: { r: i32 }): { r: i32 } | null { p }
+
+function rd() {
+  const g1 = src({ r: 7 }) ?? { r: "s" }
+  print(g1.r)
+}
+rd() // 7
+
+// ---- the `null` corner: master's loud `bare null needs a struct-typed context` ----
+function rn() {
+  const g1 = src({ r: 107 }) ?? { r: null }
+  if g1.r != null { print(g1.r) } else { print(0) }
+}
+rn() // 107
+
+// ---- a parameter REASSIGNED in the body has BOTH sources, and the incoming one counts ----
+function srca(p: { r: i32 }): { r: i32 } | null {
+  p = { r: 9 }
+  p
+}
+
+function ra() {
+  const g1 = srca({ r: 3 }) ?? { r: "s" }
+  print(g1.r)
+}
+ra() // 9
+
+// ---- `p.field` read INSIDE the callee, at the merged row ----
+function srcr(p: { r: i32 }): { r: i32 } | null {
+  print(p.r)
+  p
+}
+
+function rr() {
+  const g1 = srcr({ r: 7 }) ?? { r: "s" }
+  print(g1.r)
+}
+rr() // 7, 7
+
+// ---- one more frame out: the parameter is handed back through a second callee ----
+function inner(q: { r: i32 }): { r: i32 } | null { q }
+
+function outer(): { r: i32 } | null { inner({ r: 207 }) }
+
+function ro() {
+  const g1 = outer() ?? { r: "s" }
+  print(g1.r)
+}
+ro() // 207
+
+// ---- THE HAZARD: a same-shaped parameter the reader never read keeps the NARROW row ----
+function nope(x: { r: i32 }) { print(x.r) }
+
+function rh() {
+  nope({ r: 1 })
+  const g1 = src({ r: 307 }) ?? { r: "s" }
+  print(g1.r)
+}
+rh() // 1, 307

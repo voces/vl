@@ -201,6 +201,7 @@ import {
   anonLeafAnnTy,
   anonLeafFamRow,
   anonLeafJoined,
+  anonLeafParamMoved,
   anonLeafRetMoved,
   anonLeafSupersede,
   armPreludeBlocks,
@@ -7293,7 +7294,11 @@ function anonLeafJoinCallee(callFn: i32, mem: i32[]) {
   // the whole read succeeds.
   const lits: i32[] = []
   const fns: string[] = []
-  if !anonLeafCalleeRead(callFn, lits, fns, 0) { return 0 }
+  // D891 — the third half of the scratch, for the same reason: a returned PARAMETER marks the
+  // param's own slot as an owner of the merged row, and a mark published under an outer
+  // refutation is a slot that follows a merge with no member behind it.
+  const pars: i32[] = []
+  if !anonLeafCalleeRead(callFn, lits, fns, pars, 0) { return 0 }
   let ri = 0
   while ri < lits.length {
     anonLeafJoinBound(lits[ri], mem)
@@ -7305,6 +7310,13 @@ function anonLeafJoinCallee(callFn: i32, mem: i32[]) {
   while fj < fns.length {
     anonLeafMarkRetMoved(fns[fj])
     fj = fj + 1
+  }
+  // D891 — AND THE PARAMETERS whose slot the merge moves. See `anonLeafParamMoved`.
+  let pj = 0
+  while pj < pars.length {
+    while anonLeafParamMoved.length <= pars[pj] { anonLeafParamMoved.push(0) }
+    anonLeafParamMoved[pars[pj]] = 1
+    pj = pj + 1
   }
   0
 }
@@ -7324,6 +7336,7 @@ function anonLeafCalleeRead(
   callFn: i32,
   lits: i32[],
   fns: string[],
+  pars: i32[],
   depth: i32,
 ): boolean {
   if depth > 1 { return false }
@@ -7344,7 +7357,17 @@ function anonLeafCalleeRead(
       if fd is FuncDecl {
         if fd.fnName == cn.identName {
           seen = true
-          if !anonLeafCalleeRets(fd.fnBody, lits, true, fd.fnBody, fns, depth) {
+          if (
+            !anonLeafCalleeRets(
+              fd.fnBody,
+              lits,
+              true,
+              fd.fnBody,
+              fns,
+              pars,
+              depth,
+            )
+          ) {
             return false
           }
         }
@@ -7386,13 +7409,16 @@ function anonLeafCalleeRets(
   tail: boolean,
   body: i32,
   fns: string[],
+  pars: i32[],
   depth: i32,
 ): boolean {
   if ix < 0 { return true }
   const n = P.nodes[ix]
   if n is FuncDecl { return true }
   if n is RetStmt {
-    if !anonLeafRetPathOk(n.retArg, out, body, fns, depth) { return false }
+    if !anonLeafRetPathOk(n.retArg, out, body, fns, pars, depth) {
+      return false
+    }
   }
   if n is Block {
     if tail {
@@ -7403,6 +7429,7 @@ function anonLeafCalleeRets(
             out,
             body,
             fns,
+            pars,
             depth,
           )
         ) {
@@ -7414,7 +7441,7 @@ function anonLeafCalleeRets(
   const kids = nodeChildren(ix)
   let i = 0
   while i < kids.length {
-    if !anonLeafCalleeRets(kids[i], out, false, body, fns, depth) {
+    if !anonLeafCalleeRets(kids[i], out, false, body, fns, pars, depth) {
       return false
     }
     i = i + 1
@@ -7441,6 +7468,7 @@ function anonLeafRetPathOk(
   out: i32[],
   body: i32,
   fns: string[],
+  pars: i32[],
   depth: i32,
 ): boolean {
   if argIx < 0 { return true }
@@ -7453,9 +7481,11 @@ function anonLeafRetPathOk(
     return true
   }
   if an is Ident {
-    return anonLeafRetIdentOk(an.identName, body, out, fns, depth)
+    return anonLeafRetIdentOk(an.identName, body, out, fns, pars, depth)
   }
-  if an is Call { return anonLeafCalleeRead(an.callFn, out, fns, depth + 1) }
+  if an is Call {
+    return anonLeafCalleeRead(an.callFn, out, fns, pars, depth + 1)
+  }
   false
 }
 
@@ -7473,11 +7503,195 @@ function anonLeafRetIdentOk(
   body: i32,
   out: i32[],
   fns: string[],
+  pars: i32[],
   depth: i32,
 ): boolean {
   const hits: i32[] = []
-  if !anonLeafBindScan(body, nm, out, hits, fns, depth) { return false }
+  if !anonLeafBindScan(body, nm, out, hits, fns, pars, depth) { return false }
+  // D891 — AND A PARAMETER, whose sources are the ARGUMENTS at every call site. Asked BESIDE
+  // the binding scan and not instead of it: `function src(p: S|null) { p = { r: 9 }; p }` has
+  // both, and reading only the assignment moves the return row while the param's incoming
+  // value keeps the narrow one (that is `d891_param_reassigned`, check-clean invalid wasm on
+  // master). Where the arm answers it is authoritative — a param with no readable call site
+  // refutes the whole callee even when the body also assigns it.
+  const pp = anonLeafParamNodeOf(body, nm)
+  if pp >= 0 { return anonLeafParamArgsOk(body, pp, out, pars) }
   hits.length > 0
+}
+
+// D891 — THE `Param` NODE named `nm` of the function whose body block is `body`, or -1.
+//
+// `body` is the callee frame's own `fnBody`, carried unchanged through the read, so the owning
+// `FuncDecl` is the one arena node whose `fnBody` is exactly it. A nested declaration's body is
+// a different block, and `anonLeafCalleeRets` never descends into one, so the match is unique.
+function anonLeafParamNodeOf(body: i32, nm: string): i32 {
+  if body < 0 { return 0 - 1 }
+  let fi = 0
+  while fi < P.nodes.length {
+    const fd = P.nodes[fi]
+    if fd is FuncDecl {
+      if fd.fnBody == body {
+        let pi = 0
+        while pi < fd.fnParams.length {
+          const pn = P.nodes[fd.fnParams[pi]]
+          if pn is Param {
+            if pn.parName == nm { return fd.fnParams[pi] }
+          }
+          pi = pi + 1
+        }
+        return 0 - 1
+      }
+    }
+    fi = fi + 1
+  }
+  0 - 1
+}
+
+// D891 — A RETURNED PARAMETER: THE LITERALS THAT REACH IT ARE THE ARGUMENTS AT EVERY CALL SITE,
+// and marking the param's slot as an owner of the merged row is the other half.
+//
+// `anonLeafRetIdentOk` resolves a returned name against the BINDINGS of the frame that returned
+// it, and a parameter has none — the scan finds nothing and, before this arm, the read refuted
+// as a whole (`d888_ret_param`, check-clean invalid wasm). The sources are one frame OUT rather
+// than one frame in, which is why no earlier reader reached them: the callee is already found
+// by name over the whole arena, so its CALLERS are reachable the same way.
+//
+// EVERY CALL SITE HAS TO BE VISIBLE, and the arm refutes rather than half-reading:
+//
+//   * a GENERIC callee — the monomorphizer clones the param's type per instance, so the
+//     annotation this marks is not the slot any instance emits;
+//   * TWO functions of the same name — a call by name reaches both and neither owns the args;
+//   * the name used as a VALUE (`const f = src`, `map(src)`) — a `call_ref` through a function
+//     value passes an argument no name scan can see;
+//   * a NAMED argument (`src(p: …)`) — the position this arm reads is the source one, and
+//     `orderArgsByParamNames` is what reorders it;
+//   * an argument that is neither an object literal nor `null`, or a call site that does not
+//     pass this position at all;
+//   * NO call site at all — a slot moved with nothing to match it is the disagreement this
+//     exists to prevent, not an empty win.
+//
+// A `null` argument is not an unnameable path, for `anonLeafRetPathOk`'s reason: `ref.null` is
+// valid at every row. A parameter DEFAULT is read on the same three-way split (a literal is a
+// member, a `null` is neither, anything else refutes) — it is the one source that is not at a
+// call site.
+//
+// NO `fns` / `depth`: this arm reads ARGUMENTS, and an argument is a literal or a refutation —
+// it never opens another frame, so neither the visited set nor the depth cap has anything to
+// bound. A future rung that follows a call-valued argument (D895's shape) takes them back.
+function anonLeafParamArgsOk(
+  body: i32,
+  pIx: i32,
+  out: i32[],
+  pars: i32[],
+): boolean {
+  // The owning declaration, its name and this param's POSITION — one scan, because a second
+  // declaration of the same name makes the position meaningless.
+  let fname = ""
+  let pos = 0 - 1
+  let decls = 0
+  let fi = 0
+  while fi < P.nodes.length {
+    const fd = P.nodes[fi]
+    if fd is FuncDecl {
+      if fd.fnBody == body {
+        if fd.fnTyParams.length > 0 { return false }
+        fname = fd.fnName
+        let pj = 0
+        while pj < fd.fnParams.length {
+          if fd.fnParams[pj] == pIx { pos = pj }
+          pj = pj + 1
+        }
+      }
+    }
+    fi = fi + 1
+  }
+  if fname == "" { return false }
+  if pos < 0 { return false }
+  let fk = 0
+  while fk < P.nodes.length {
+    const fq = P.nodes[fk]
+    if fq is FuncDecl {
+      if fq.fnName == fname { decls = decls + 1 }
+    }
+    fk = fk + 1
+  }
+  if decls != 1 { return false }
+  // The param's own DEFAULT, on the three-way split.
+  const pn = P.nodes[pIx]
+  if pn is Param {
+    if pn.parDefault >= 0 {
+      const dv = unwrapParen(pn.parDefault)
+      if dv < 0 { return false }
+      const dn = P.nodes[dv]
+      if dn is ObjLit { out.push(dv) }
+      else if dn is NullLit { 0 }
+      else { return false }
+    }
+  }
+  // THE NAME AS A VALUE refutes: an `Ident` spelling `fname` that is not the callee of a call
+  // is a function value, and the arguments a `call_ref` passes are not at any call site this
+  // can read.
+  let vi = 0
+  while vi < P.nodes.length {
+    const vn = P.nodes[vi]
+    if vn is Ident {
+      if vn.identName == fname {
+        if !anonLeafIsCalleePos(vi) { return false }
+      }
+    }
+    vi = vi + 1
+  }
+  // Every call site's argument at this position.
+  let seen = false
+  let ci = 0
+  while ci < P.nodes.length {
+    const cn = P.nodes[ci]
+    if cn is Call {
+      const cf = unwrapParen(cn.callFn)
+      if cf >= 0 {
+        const cfn = P.nodes[cf]
+        if cfn is Ident {
+          if cfn.identName == fname {
+            let nk = 0
+            while nk < cn.callArgNames.length {
+              if cn.callArgNames[nk] != "" { return false }
+              nk = nk + 1
+            }
+            if pos >= cn.callArgs.length { return false }
+            const av = unwrapParen(cn.callArgs[pos])
+            if av < 0 { return false }
+            const avn = P.nodes[av]
+            if avn is ObjLit {
+              out.push(av)
+              seen = true
+            } else if avn is NullLit {
+              seen = true
+            } else {
+              return false
+            }
+          }
+        }
+      }
+    }
+    ci = ci + 1
+  }
+  if !seen { return false }
+  pars.push(pIx)
+  true
+}
+
+// Is the arena node `n` the CALLEE position of some call? The reverse of `Call.callFn`, asked
+// of an identifier so `anonLeafParamArgsOk` can tell `src(x)` from `const f = src`.
+function anonLeafIsCalleePos(n: i32): boolean {
+  let ci = 0
+  while ci < P.nodes.length {
+    const cn = P.nodes[ci]
+    if cn is Call {
+      if unwrapParen(cn.callFn) == n { return true }
+    }
+    ci = ci + 1
+  }
+  false
 }
 
 // The subtree scan behind `anonLeafRetIdentOk`: every `const nm = …` and every `nm = …` in this
@@ -7488,6 +7702,7 @@ function anonLeafBindScan(
   out: i32[],
   hits: i32[],
   fns: string[],
+  pars: i32[],
   depth: i32,
 ): boolean {
   if ix < 0 { return true }
@@ -7495,7 +7710,9 @@ function anonLeafBindScan(
   if n is FuncDecl { return true }
   if n is LetDecl {
     if n.letName == nm {
-      if !anonLeafBoundValOk(n.letInit, out, hits, fns, depth) { return false }
+      if !anonLeafBoundValOk(n.letInit, out, hits, fns, pars, depth) {
+        return false
+      }
     }
   }
   if n is BinExpr {
@@ -7505,7 +7722,7 @@ function anonLeafBindScan(
         const tn = P.nodes[tgt]
         if tn is Ident {
           if tn.identName == nm {
-            if !anonLeafBoundValOk(n.binRight, out, hits, fns, depth) {
+            if !anonLeafBoundValOk(n.binRight, out, hits, fns, pars, depth) {
               return false
             }
           }
@@ -7516,7 +7733,9 @@ function anonLeafBindScan(
   const kids = nodeChildren(ix)
   let i = 0
   while i < kids.length {
-    if !anonLeafBindScan(kids[i], nm, out, hits, fns, depth) { return false }
+    if !anonLeafBindScan(kids[i], nm, out, hits, fns, pars, depth) {
+      return false
+    }
     i = i + 1
   }
   true
@@ -7532,6 +7751,7 @@ function anonLeafBoundValOk(
   out: i32[],
   hits: i32[],
   fns: string[],
+  pars: i32[],
   depth: i32,
 ): boolean {
   const v = unwrapParen(rhs)
@@ -7547,7 +7767,9 @@ function anonLeafBoundValOk(
     return true
   }
   if vn is Call {
-    if !anonLeafCalleeRead(vn.callFn, out, fns, depth + 1) { return false }
+    if !anonLeafCalleeRead(vn.callFn, out, fns, pars, depth + 1) {
+      return false
+    }
     hits.push(v)
     return true
   }
@@ -7563,6 +7785,7 @@ function anonLeafTailPathOk(
   out: i32[],
   body: i32,
   fns: string[],
+  pars: i32[],
   depth: i32,
 ): boolean {
   if ix < 0 { return true }
@@ -7575,7 +7798,7 @@ function anonLeafTailPathOk(
   if n is ForIn { return true }
   if n is Block { return true }
   if n is FuncDecl { return true }
-  anonLeafRetPathOk(ix, out, body, fns, depth)
+  anonLeafRetPathOk(ix, out, body, fns, pars, depth)
 }
 
 // One `lhs = rhs` statement: append `rhs` to `mem` when it is an object literal stored into
@@ -8774,6 +8997,7 @@ export function collectS(stmts: i32[]) {
   anonLeafJoined = []
   anonLeafFamRow = []
   anonLeafAnnTy = []
+  anonLeafParamMoved = []
   anonLeafRetMoved = []
   anonLeafSupersede = []
   // The struct-row NAME index keys THIS table's spellings — reset it with the table, or

@@ -25307,11 +25307,11 @@ Repro (now runs, printing `7` then `0`):
 
 ---
 
-### D888 — a returned PARAMETER: the literals are at the CALL SITES, and the parameter's slot is a SEVENTH owner
+### D888 — [CLOSED 2026-08-31 by D891] a returned PARAMETER: the literals are at the CALL SITES, and the parameter's slot is a SEVENTH owner
 
-**check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` · 1 cell (`distilled/named/d888_ret_param`, `tests/cases/types/xfail-coalesce-default-row-past-returned-param.vl`), OPEN · IDENTICAL on master, so it is not a regression — it is the delivery form D882/D883/D885/D886's reader still declines, and it is the ONE cell `goal-scoreboard.py` scores against the goal**
+**closed as `runs` by D891 · was check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` · a CLAUSE-1 close, and the LAST cell `goal-scoreboard.py` scored against the goal · THE ROW'S OWN DIAGNOSIS BELOW IS RIGHT IN BOTH HALVES and was measured rather than taken on trust — see D891's reader-only ablation**
 
-Repro (check-clean invalid wasm):
+Repro (now runs, printing `0`):
 
     function src(p: {r: i32}): {r: i32} | null {
       p
@@ -25321,10 +25321,6 @@ Repro (check-clean invalid wasm):
       print(0)
     }
     rd()
-    // vl check rc 0 (one unused-variable warning); vl run ->
-    //   failed to compile: wasm[0]::function[5]::rd … type mismatch: expected i32,
-    //   found (ref $type)
-    // SHOULD PRINT 0.
 
 * **FOUND BY WRITING THE PROGRAM, not by a grid or a corpus cell.** It is the fourth thing a
   callee can hand back — after a literal, a binding and a call — and it was the only one left
@@ -25344,3 +25340,272 @@ Repro (check-clean invalid wasm):
   and the thing that READS it resolves the wrong one. D882 answered it for the literal by moving
   the redirect to the resolver every literal goes through. A parameter's slot does not go through
   that resolver, which is exactly why it is left.
+
+---
+
+### D891 — [CLOSED 2026-08-31] the parameter's SLOT is the seventh owner, and the READER ALONE BUYS ZERO
+
+**closed as `runs` · was check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` · a CLAUSE-1 close, and the LAST cell against the goal (`goal-scoreboard.py` total 1 → 0) · ABLATED family 30 hand-written probes + a 48-cell box-read grid, four rungs, mechanism-minimal witness 6 lines / 110 bytes · corpus `cmp` **2,485 modules · 2,038 identical · 0 DIFFER · 0 LOST** · distilled corpus 1 class → `runs`, **`runs → not-runs` ZERO, `→ silent` ZERO***
+
+Repro (now runs, printing `7`):
+
+    function src(p: {r: i32}): {r: i32} | null {
+      p
+    }
+    function rd() {
+      const g1 = src({ r: 7 }) ?? { r: "s" }
+      print(g1.r)
+    }
+    rd()
+
+* **"A SEVENTH OWNER, NOT AN EIGHTH READER" HELD UP, AND IT IS MEASURED RATHER THAN ASSERTED.**
+  D888's row states the diagnosis; the way to grade a diagnosis is to build the thing it says
+  will not work. `readeronly` — the call-site argument reader with every owner stripped — scores
+  **4 `runs` of 30, the same count as master, and it is not the same compiler**: sixteen cells
+  move only the OFFSET in their `Invalid input WebAssembly code at offset N` line, and
+  `d891_null_default` trades master's loud `bare null needs a struct-typed context` for
+  check-clean invalid wasm. The reader alone buys nothing and pays a loud→silent, exactly one
+  position over, exactly as filed.
+
+* **THE OWNER IS A PER-PARAM MARK AND IT IS READ AT THREE RESOLVERS.** `anonLeafParamMoved` is
+  written by `anonLeafJoinCallee` at COMMIT, beside `anonLeafRetMoved`, and read through one
+  helper (`anonLeafParamRowOf`) at:
+  `paramStructIdxOf` (the functype's param valtype and the `$fnsig` param token),
+  `paramStructIndex` (`structIndexOfExpr`'s `Ident` arm — a `p.field` read INSIDE the callee),
+  and `captureValStructIdx` (a closure that captures the parameter).
+  It is a MARK and not a row redirect for `anonLeafRetMoved`'s reason: the row a merge supersedes
+  is a FIELD-SET row, so an ungated `anonLeafSupersedeOf` at `paramStructIdxOf` moves every
+  same-shaped parameter in the program. `d891_sibling_narrow_param` is that hazard and it prints
+  its own narrow value beside the family.
+
+* **A COMPILER TRAP I CAUSED AND CAUGHT, and it is a cell.** The `paramStructIndex` wrapper called
+  `fnParamNodeOf(fnIx, name)` before resolving, and at MODULE SCOPE `fnIx` is -1 — `P.nodes[-1]`,
+  `wasm trap: out of bounds array access`, the COMPILER dying rather than the program. The
+  original body guarded `fnIx < 0` on its first line and the wrapper had to as well.
+  `d891_module_scope` is the pin; it reddened in the intermediate build and nothing else did.
+
+* **THE READER REFUTES ON FIVE THINGS, each because a call site it cannot see passes an argument
+  it cannot move.** A GENERIC callee (the monomorphizer clones the annotation per instance, so
+  the node this marks is not the slot any instance emits); TWO declarations of one name; the name
+  used as a VALUE (`const f = src` — a `call_ref` argument is at no call site); a NAMED argument
+  (the position read here is the SOURCE one and `orderArgsByParamNames` is what reorders it); an
+  argument that is neither an object literal nor `null`, or a call site not passing this position
+  at all. NO call site at all also refutes: a slot moved with nothing to match it is the
+  disagreement, not an empty win. Counters over the probe battery: **reach=28, ans=23** — every
+  guard fires. `distilled/named/d891_bound_*` pins four of the five.
+
+* **A `null` ARGUMENT IS NOT AN UNNAMEABLE PATH** (`ref.null` is valid at every row), and a
+  parameter DEFAULT is read on the same three-way split as a returned expression — a literal is a
+  member, a `null` is neither, anything else refutes. It is the one source that is not at a call
+  site.
+
+* **A PARAMETER REASSIGNED IN THE BODY WAS A DEFECT ON MASTER AND THE ARM IS ADDITIVE, NOT
+  ALTERNATIVE.** `{ p = { r: 9 }; p }` already reached the merge on master — `anonLeafBindScan`
+  finds the assignment — and the param's slot stayed narrow, which is check-clean invalid wasm
+  with the `expected (ref $type), found (ref $type)` sentence. So the param arm is asked BESIDE
+  the binding scan rather than only when the scan is empty. `d891_param_reassigned` and
+  `d891_param_reassigned_cond` grade both halves; the conditional one prints the INCOMING value
+  on the branch that does not assign.
+
+* **THE ABLATION, over the 30 graded probes.** Strip-all is master's own `compiler/` at
+  `a57d6390`, rebuilt here rather than quoted: **`b53f54794c593303d1b8b7c115e2c735`, 1,577,723
+  bytes**, and its grade differs from master's on **0 of 30** cells including the messages.
+
+  | rung | what it is | runs/30 | what moves |
+  |---|---|---|---|
+  | all four (shipped) | | **21** | corpus `cmp` 0 DIFFER · 0 LOST |
+  | strip-all (master) | | 4 | — |
+  | −the call-site reader | the join never sees a parameter | 4 | all 17 revert, 0 message differs from master |
+  | −the param SLOT (`paramStructIdxOf`) | | 4 | all 17 revert, **16 keep only a new offset and 1 goes loud→silent** |
+  | −the EXPRESSION resolver (`paramStructIndex`) | `p.field` inside the callee | 20 | 1 (`d891_param_read_inside`) |
+  | −the CAPTURE resolver (`captureValStructIdx`) | | 20 | 1 (`d891_param_captured`) |
+  | reader only (no owner at all) | the "eighth reader" | **4** | **0 cells bought, 1 loud→silent paid** |
+
+  `runs` LOST versus master: **ZERO in every row of that table.**
+
+* **THE STOCK MINIMISER FOLLOWS THE SENTENCE AND DELETED THE MECHANISM.**
+  `scripts/silent-sweep/minimise-cell.py` reduces the cell to
+  `function src(p: {r: i32}): {r: i32} | null {}` — an EMPTY body — because the validator sentence
+  survives the removal of the very `p` the row is about. That program is unmoved by this landing
+  and is filed as D893. The MECHANISM-minimal witness (keep a line removed only while master is
+  silent AND the candidate runs) is **6 lines, 110 bytes**, and it is the filed repro without its
+  `print`. CLAUDE.md's "a validator sentence is not a mechanism", one more instance.
+
+* **REAL DISASSEMBLY** (`./node_modules/.bin/wasm-dis`, binaryen 130), on the repro. Master:
+  `(type $5 (func (param (ref $0)) (result (ref null $0))))` over
+  `(type $0 (struct (field (mut i32))))`, the argument built as `struct.new $0 (i32.const 7)` and
+  the default as `struct.new $0 (global.get $global$0)` — a string header into an i32 field, which
+  is the `expected i32, found (ref $type)` the engine refuses. Here the functype is
+  `(func (param (ref $1)) (result (ref null $1)))` over the merged
+  `(type $1 (struct (field (mut (ref $2)))))` whose field is the box
+  `(type $2 (struct (field i32) (field anyref)))`: **the PARAM moved, which is the whole row**.
+  The call site builds `struct.new $1 (struct.new $2 (i32.const 0) (struct.new $3 (i32.const 7)))`
+  — tag 0 — and the default builds tag 2 with the string. `$0` is still in the module, unchanged,
+  for every narrow destination.
+
+* **MEASURED, all seven instruments, against master `a57d6390`.** Corpus byte-identity:
+  **2,485 modules · 2,038 identical · 0 DIFFER · 0 LOST · 447 not buildable by the base.**
+  Distilled corpus: **1 class `check-clean invalid wasm` → `runs`**, `runs → not-runs` **ZERO**,
+  `→ silent` **ZERO**. `tests/cases` + `std`: **2,038 → 2,039 of 2,485 building in 4.3 s at
+  `JOBS=6`**, set difference exactly this row's fixture, 0 LOST. Shared-instance probe
+  (`scripts/shared-instance-probe.ts`): `distilled/cells` **1,477 · 0 differ** and
+  `distilled/named` **5,929 · 0 differ**, before AND after. Counters: the arm is reached **once**
+  and answers **once** across all of `tests/cases`+`std` (2,107 programs reporting) and once
+  across the whole distilled corpus (4,462 reporting) — which is why `cmp` is 0 DIFFER.
+  D411's 103-cell grid 103 → 103 `runs`, 0 movement; D661's 211-cell grid 211 → 211 `runs`;
+  `d791_push_alias` still REFUSES; `d875_assign_call` still prints `7`;
+  `d884_litunion_beside_str` still runs. Fixture:
+  `tests/cases/types/coalesce-default-row-past-returned-param.vl` (was the `xfail-` file).
+
+* **THE SCOREBOARD, WITH ITS POPULATION NAMED — and the two numbers say different things.**
+  On the corpus master SHIPPED (7,406 cells): `runs` 4,461 / 7,406 (60.23%), against the goal
+  **1**; the candidate scores **0** on that same population, which is what closing the last cell
+  means. This landing then ADDS 77 cells to `named/` — the 48-cell box-read grid and 29
+  hand-written programs — so the corpus is 7,483 and the after-number is measured on a bigger
+  question: `runs` **4,524 / 7,483 (60.46%)**, against the goal **15**.
+
+  Graded cell for cell, master scores **42 of those 77 against the goal** (32 check-clean invalid
+  wasm, 7 loud emit rejects, 2 loads-then-traps and 1 `runs but wrong value`) — so on the 7,483-
+  cell population it is **43 → 15**, and the 28 closed are D888's cell plus 27 of the new ones.
+  Every remaining 15 is filed: 4 are D891's own refutation BOUNDS, 3 are D893, 1 D894, 1 D895,
+  3 are D892's trap and 3 are D804's recorded `boolean|null` decline. **14 of the 15 reproduce
+  outcome-for-outcome on master**; the one that moved is `d892_box_param_i32_f64`, check-clean
+  invalid wasm → loads-then-traps, which is the third carrier's instance of a trap master already
+  has at the other two.
+
+---
+
+### D892 — a `??`-merged BOX read at the `i32` / `f64` atom pair loads then traps, at EVERY carrier
+
+**loads then traps · `wasm trap: cast failure` · 3 cells (`distilled/named/d892_box_direct_i32_f64`, `_binding_i32_f64`, `_param_i32_f64`) of a 48-cell grid, OPEN · PRE-EXISTING: the first two reproduce on master `a57d6390`'s own seed, so this is NOT D891's doing — D891 adds the third carrier's instance of the same defect (`_param_i32_f64` was check-clean invalid wasm on master and is the ONE cell in the whole landing that moved silent → trap), which is why the grid is kept whole in `named/`**
+
+Repro (loads then traps, on master and here alike):
+
+    function src(): {r: i32} | null {
+      { r: 7 }
+    }
+    function rd() {
+      const g1 = src() ?? { r: 1.5 }
+      print(g1.r)
+    }
+    rd()
+
+* **THE GRID IS CARRIER × ATOM PAIR AND IT SPLITS ON THE PAIR, NOT ON THE CARRIER.** 48 cells:
+  carrier ∈ {the literal directly, a returned binding, a returned parameter} × A ∈ {i32, string,
+  f64, boolean} × B ∈ {i32, string, f64, boolean, null}, A ≠ B, each READING the field back.
+  Master: `runs` 32, check-clean invalid wasm 8, loud emit reject 6, **loads-then-traps 2**. Here:
+  `runs` 42, loud emit reject 3, loads-then-traps 3. Every one of master's 8 silent and 6 loud
+  cells is a `param` carrier and closes; the pair that traps is `A=i32, B=f64` and it traps at
+  all three carriers.
+
+* **DROPPING THE READ HIDES IT.** `print(0)` instead of `print(g1.r)` and the same program RUNS
+  on master — which is why D871's row recorded the `?? { r: 1.5 }` twin as running: it was
+  measured at the no-read shape. The defect is in the box READ, not in the mint.
+
+* **AND MASTER IS SILENTLY WRONG ONE CELL OVER.** `d892_box_param_boolean_i32` RUNS on master and
+  prints **`1`** for a boolean field, while master's own `d892_box_direct_boolean_i32` prints
+  `true`. D891 makes the parameter carrier agree with the other two. A `runs but wrong value` that
+  no filed row had, found by reading the grid rather than the headline.
+
+* **THE 3 LOUD EMIT REJECTS LEFT ARE THE `boolean|null` DECLINE**, recorded in D804's own header:
+  code 21 records no companion column and an `#anon` row carrying it interns no map-value slot.
+  That is a separate rung and it is not this row.
+
+---
+
+### D893 — a family with NO literal at all: the CALLEE'S OWN RETURN ANNOTATION is the atom nobody reads
+
+**check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` · 3 cells (`distilled/named/d893_null_arg_only`, `d893_empty_body_callee`, `d893_empty_body_param`), OPEN · IDENTICAL on master, so it is not a regression · it is what `scripts/silent-sweep/minimise-cell.py` reduces D888's cell to, which is why D891's row says the sentence is not the mechanism**
+
+Repro (check-clean invalid wasm):
+
+    function src(): {r: i32} | null {
+    }
+    function rd() {
+      const g1 = src() ?? { r: "s" }
+      print(0)
+    }
+    rd()
+    // vl check rc 0; vl run -> type mismatch: expected i32, found (ref $type)
+    // SHOULD PRINT 0.
+
+* **THE READER ANSWERS AND CONTRIBUTES NOTHING.** An empty body has no return path to refuse, so
+  `anonLeafCalleeRead` succeeds with an empty literal list; a parameter every call site passes
+  `null` to (`d893_null_arg_only`) does the same through D891's arm. The set is then the DEFAULT's
+  atom alone, `atoms.length < 2` ends `anonLeafPolyUnionSetOpen`, no row mints, and the pair falls
+  to D804's `A=i32 B=string` corner.
+
+* **THE MISSING ATOM IS THE CALLEE'S DECLARED RETURN, and D872 already refused to read one.**
+  `{r: i32} | null` names `i32` perfectly. D872's `anonLeafAnnAtomOf` reads exactly that atom off
+  the `??` LEFT OPERAND's declared type — and its header records, measured, that taking it for a
+  CALL operand turned a loud reject into check-clean invalid wasm, because the reader is what
+  licences a call's atom. This row is the same question asked of the CALLEE's annotation rather
+  than the operand's, and it needs the same interlock D891 built: an atom taken from the callee's
+  return must move the callee's return row AND every value that reaches it.
+
+* **THE DECLARED TWIN RUNS**, which is what makes this a capability gap rather than a rule:
+  `type R = { r: i32 | null }` with the same `??` prints on master.
+
+---
+
+### D894 — a returned BINDING whose value is a PARAMETER: D882 and D891 composed, and neither half reaches it
+
+**check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` · 1 cell (`distilled/named/d894_ret_binding_of_param`), OPEN · IDENTICAL on master, so it is not a regression · found by writing the program**
+
+Repro (check-clean invalid wasm):
+
+    function src(p: {r: i32}): {r: i32} | null {
+      const v = p
+      v
+    }
+    function rd() {
+      const g1 = src({ r: 7 }) ?? { r: "s" }
+      print(g1.r)
+    }
+    rd()
+    // vl check rc 0; vl run -> type mismatch: expected i32, found (ref $type)
+    // SHOULD PRINT 7.
+
+* **`anonLeafBoundValOk` SPLITS A BOUND VALUE THREE WAYS AND AN IDENTIFIER IS NOT ONE OF THEM.**
+  A literal is a member, a `null` is neither, a CALL is the next frame (D886), and everything
+  else refutes — so D891's parameter arm is never reached through a binding. Dropping the
+  binding (`{ p }`) runs; keeping it and passing a literal through a LOCAL rather than the
+  parameter (`{ const v = { r: 7 }; v }`) also runs, which is D882.
+
+* **IT IS D886's SHAPE ONE DELIVERY FORM OVER.** D886 is `{ const v = mid(); v }` and it closed
+  by giving `anonLeafBoundValOk` a CALL arm. This needs an IDENT arm, which needs `body` threaded
+  into that function so the name can be resolved against the frame's own parameters — the same
+  argument that carries `body` through `anonLeafCalleeRets` today.
+
+---
+
+### D895 — a SELF-PASSED parameter refutes the whole callee, and it is D885's argument one position over
+
+**check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` · 1 cell (`distilled/named/d895_self_pass_param`), OPEN · IDENTICAL on master, so it is not a regression · found by writing the program**
+
+Repro (check-clean invalid wasm):
+
+    function src(n: i32, p: {r: i32}): {r: i32} | null {
+      if n <= 0 { return p }
+      src(n - 1, p)
+    }
+    function rd() {
+      const g1 = src(2, { r: 5 }) ?? { r: "s" }
+      print(g1.r)
+    }
+    rd()
+    // vl check rc 0; vl run -> type mismatch: expected i32, found (ref $type)
+    // SHOULD PRINT 5.
+
+* **THE CALL-SITE SCAN SEES AN IDENTIFIER AND REFUSES.** `anonLeafParamArgsOk` requires every
+  argument at the parameter's position to be an object literal or `null`; the recursive call
+  passes `p` itself, so the scan refutes and the whole callee is declined. Unrolling the
+  recursion away (`function src(p) { p }`) runs, and so does a self-call that passes a LITERAL.
+
+* **D885 MADE THE SAME CALL ON THE OTHER SIDE AND ANSWERED RATHER THAN REFUTING.** There the
+  visited set hit a name already on the path and it was sound to answer, because that frame's
+  return row is already being moved. A self-pass is the argument twin: the value handed on is the
+  very parameter whose slot the merge is moving, so it contributes nothing new and skipping it is
+  sound. It is filed rather than shipped because SHADOWING has to be excluded first — a local
+  `const p = …` in the same body makes the identifier a different binding, and the reader would
+  then be moving a slot no value reaches.
