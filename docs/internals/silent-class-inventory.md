@@ -23193,6 +23193,67 @@ Repro (check rc 0; RUNS and prints `1`, where `0` is the only correct answer):
   shape that reaches a user as a bug in their own code.
 
 ---
+### D951 — `is T` against the TYPE PARAMETER itself: check-clean, then a loud emit reject, and the owner has ruled it should WORK
+
+**loud emit reject · `emitProgram: `is` names a type that is not a union variant` · `vl check` returns 0, so this is a clause-2 violation BY CONSTRUCTION — either the program is legal and should compile, or it is illegal and the CHECKER owed the diagnosis · ZERO corpus cells · reproduces on master · filed beside D950 deliberately: both are answered by the same mono-`is` ladder**
+
+**THIS IS A DESIGN MANDATE, NOT AN INFERRED ONE.** The owner's words, on being shown the
+refusal: *"can we do `is T` rather than having to do like `is T<string | boolean | i64>`
+(spelling out the full type)"* — inside a generic body, test a value against the instantiated
+parameter itself instead of enumerating its concrete arms. So this is not a candidate for
+narrowing the refusal's wording; the capability is wanted.
+
+* **THE LOWERING EXISTS IN PRINCIPLE.** Under monomorphization `T` is CONCRETE per instance,
+  so `y is T` is the same question every other per-instance `is` asks — the one D950 is
+  currently un-breaking. The natural first customer is the `T | null` → `is T` non-null
+  narrowing in the witness below, which is the shape the request came from.
+
+* **SEQUENCING: AFTER D950, and for a stated reason rather than politeness.** A correct
+  `is T` at a NULLABLE instantiation depends on the per-arm answers D950 is repairing — at
+  `T | null` the tested type IS the niche's base, which is exactly the case D950's degenerate
+  lowering gets wrong in the other direction. Landing `is T` first would build on an arm that
+  answers true unconditionally.
+
+Repro (check rc 0; the EMITTER refuses):
+
+    function pick<T>(x: T, y: T | null): T {
+      if y is T { return y }
+      x
+    }
+    print(pick(1, 2))
+    // vl check rc 0; vl run -> emitProgram: `is` names a type that is not a union variant
+    // SHOULD PRINT 2.
+
+---
+
+### D952 — member access on a DECLARED type parameter refuses with an EMPTY diagnostic: `[ERROR]:` and a caret, no sentence
+
+**loud check reject with NO MESSAGE · the diagnostic renders as `[ERROR]: ` followed by the source line and a caret, and nothing else · ZERO corpus cells · reproduces on master · a diagnostic defect INDEPENDENT of the ruling on opaque-`T` member access**
+
+Whatever the language decides about reading a field off an opaque type parameter, a refusal
+with no sentence is wrong on its own terms: the reader is told the position and nothing about
+the problem, and no wording exists to be searched for, quoted, or improved.
+
+* **THE UN-ANNOTATED SPELLING RUNS, which is what makes the empty message actively
+  misleading.** `function getN(x): i32 { x.n }` infers the demanded shape and works; only the
+  DECLARED `<T>` spelling refuses. So the author's most likely next move — deleting the type
+  parameter — silently changes the program's meaning, with no diagnostic text to suggest
+  otherwise or to warn them.
+
+* **IT IS NOT THE SAME QUESTION AS D951 and should not be closed by assuming so.** D951 is a
+  capability the owner has asked for; this row is about a message. Even if opaque-`T` member
+  access stays refused for ever, the refusal has to say something.
+
+Repro (check rc 1, message empty):
+
+    function getN<T>(x: T): i32 {
+      x.n
+    }
+    print(getN({ n: 1 }))
+    // vl check -> "[ERROR]: " with a caret under `.n` and no sentence.
+    // The un-annotated `function getN(x): i32 { x.n }` runs and prints 1.
+
+---
 
 ### D791 — [CLOSED 2026-08-31] READ-ONLY COVARIANCE is lowered by an element-CONVERTING COPY, licensed by a whole-program write scan — D661B's refusal was about the WRITABLE side only
 
