@@ -206,3 +206,73 @@ Deno.test({
     });
   },
 });
+
+// The SPAN half of the schema: `endCol` is exclusive, so `endCol - col` is the
+// caret width. A TOKENLESS diagnostic — a lex error, a module-resolution error —
+// has no token anchor for `diagEndCol` to derive a width from, so every one of
+// them rendered as a single-column caret however much source it was about. The
+// cases below carry their own end, and are why the side table grew a column.
+Deno.test({
+  name: "check --json: a char-literal length error spans the whole literal",
+  ignore: !ENABLED,
+  fn: async () => {
+    await withDir(async (dir) => {
+      // source, message fragment, 1-based col, 1-based EXCLUSIVE endCol
+      const cases: [string, string, number, number][] = [
+        ["let c = 'xy'\n", "exactly one character", 9, 13],
+        ["let c = ''\n", "Empty char literal", 9, 11],
+        // Unterminated: the opening quote through the end of the line.
+        ["let c = 'ab\n", "Unterminated char literal", 9, 12],
+      ];
+      for (const [src, frag, col, endCol] of cases) {
+        const file = `${dir}/lex.vl`;
+        await Deno.writeTextFile(file, src);
+        const { out } = await run(["check", file, "--json"]);
+        const d = parseDiags(out).find((x) => x.message.includes(frag));
+        if (!d) throw new Error(`no diagnostic matching "${frag}": ${out}`);
+        if (d.line !== 1 || d.col !== col || d.endCol !== endCol) {
+          throw new Error(
+            `expected [1:${col}, ${endCol}) for "${frag}", got ` +
+              `[${d.line}:${d.col}, ${d.endCol}): ${out}`,
+          );
+        }
+      }
+    });
+  },
+});
+
+Deno.test({
+  name:
+    "check --json: a char-quoted import specifier spans it and steals nothing",
+  ignore: !ENABLED,
+  fn: async () => {
+    await withDir(async (dir) => {
+      const file = `${dir}/imp.vl`;
+      // The bait on line 2 is what the unbounded specifier walk used to adopt as
+      // this import's specifier — it must appear in no message.
+      await Deno.writeTextFile(
+        file,
+        'import { readTextFile } from \'std:fs\'\nprint("the story")\n',
+      );
+      const { code, out } = await run(["check", file, "--json"]);
+      if (code !== 1) throw new Error(`expected exit 1, got ${code}: ${out}`);
+      const diags = parseDiags(out).filter((d) => d.severity === "error");
+      if (diags.length !== 1) {
+        throw new Error(`expected exactly one error, got: ${out}`);
+      }
+      const d = diags[0];
+      if (!d.message.includes('write "std:fs"')) {
+        throw new Error(`expected the re-quote suggestion, got: ${out}`);
+      }
+      if (d.message.includes("the story")) {
+        throw new Error(`the import stole a later string literal: ${out}`);
+      }
+      // `'std:fs'` sits at 1-based col 30 and is 8 characters wide.
+      if (d.line !== 1 || d.col !== 30 || d.endCol !== 38) {
+        throw new Error(
+          `expected [1:30, 38), got [${d.line}:${d.col}, ${d.endCol}): ${out}`,
+        );
+      }
+    });
+  },
+});

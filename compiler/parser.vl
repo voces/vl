@@ -2604,7 +2604,7 @@ function parseBlock() {
 // The statement-leading keywords: a `{` whose first token (after newlines) is
 // one of these is a BLOCK, never an object literal (mirrors the host's
 // `STATEMENT_KEYWORDS` set, consulted by `looksLikeObject`).
-function isStmtKeyword(kind: TokKind) {
+export function isStmtKeyword(kind: TokKind) {
   kind == "LET" ||
     kind == "CONST" ||
     kind == "RETURN" ||
@@ -2769,6 +2769,28 @@ export function parseStmt() {
   parseExpr()
 }
 
+// THE SENTENCE for a char-quoted module specifier (`from 'std:fs'`), in ONE home
+// because the parser and the driver's token-level `modScan` both have to say it —
+// two scanners over one statement drifting apart is the whole of the defect that
+// made a char-quoted specifier adopt the next string literal in the file.
+// `raw` is the char literal's RAW LEXEME, quotes included — the suggestion is
+// built from the source text rather than the decoded value so an escape survives
+// it verbatim (`'a\tb'` suggests `"a\tb"`, not a literal tab), and so both callers
+// can pass the one thing they both have.
+//
+// It names the SPELLING, not the resolution. `'std:fs'` resolves to no module for
+// a reason that has nothing to do with module paths: single quotes are a char
+// literal, which is one code point (an i32), and a specifier is a string — so the
+// whole repair is the quote character, and "unsupported specifier" would send the
+// reader to look for a module that is sitting right there.
+export function importSpecCharMsg(raw: string): string {
+  let inner = raw
+  if inner.length >= 2 { inner = inner.slice(1, inner.length - 1) }
+  "An import specifier is a string — single quotes are a char literal; write \"" +
+    inner +
+    "\""
+}
+
 // Parse an `import { a, b as c, … } from "path"` (or `import x from "path"`)
 // statement into an `ImportDecl` node, the cursor on the leading `import`.
 // Import BINDING stays the module front end's job (the driver's token-level
@@ -2781,7 +2803,9 @@ export function parseStmt() {
 // instead of silently swallowing code up to the next unrelated string literal.
 // Only brace-list names are recorded (`a` / `a as b`, each with its NAME
 // token); a bare `import x from "path"` records no names — a pure graph edge,
-// exactly `modScan`'s reading.
+// exactly `modScan`'s reading. A CHAR literal in the path position is a
+// specifier — the wrong quotes, not a missing path — and gets its own sentence
+// (`importSpecCharMsg`) rather than `malformed import`.
 function parseImport(): i32 {
   const kwAt = P.pos // the `import` keyword, anchor for the diagnostic
   const p0 = peekTok().start
@@ -2805,6 +2829,14 @@ function parseImport(): i32 {
         }
       }
       path = raw
+      found = true
+      going = false
+    } else if k == "CHAR" && depth == 0 {
+      // A CHAR literal where the path belongs — the statement HAS a specifier
+      // (so this is not the `malformed import` case), it is just spelled with the
+      // wrong quotes. Report it here and stop: this is the specifier.
+      P.diags.push({ msg: importSpecCharMsg(peekTok().text), at: P.pos })
+      advance()
       found = true
       going = false
     } else if k == "EOF" {
@@ -2871,6 +2903,12 @@ function skipModuleClause(what: string) {
     const k = peekKind()
     if k == "STRING" {
       advance() // the path literal — the statement ends here
+      found = true
+      going = false
+    } else if k == "CHAR" && depth == 0 {
+      // A char-quoted path — `parseImport`'s arm, at the re-export spelling.
+      P.diags.push({ msg: importSpecCharMsg(peekTok().text), at: P.pos })
+      advance()
       found = true
       going = false
     } else if k == "EOF" {

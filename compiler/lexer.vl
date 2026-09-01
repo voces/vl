@@ -112,10 +112,21 @@ export type TokKind = ""
 // A lexer diagnostic: a message plus the 1-based line / 0-based column where it
 // was raised. Positions are kept numeric and rendered (with `toString`) at the
 // harness, mirroring the structured `VLDiagnostic` the TS lexer pushes.
+//
+// `endCol` is the 0-based EXCLUSIVE end column of the offending SPAN, on the same
+// line as `col` (`endCol - col` is the caret width the CLI draws, and the LSP
+// range's end). A lex diag carries no token anchor, so `diagEndCol` has nothing to
+// derive a width from and every one of these used to render as a single-column
+// caret; a literal that IS the offence (`'xy'`) has to carry its own end. `col`
+// means "no span" — the point rendering, which is right for a diagnostic about one
+// character (a stray `_`, a bad escape) and is what `diag`/`diagAt` supply.
+// A quoted literal never spans lines (a raw newline terminates it), so one column
+// pair covers every span this type carries.
 type Diag = {
   msg: string,
   line: i32,
-  col: i32
+  col: i32,
+  endCol: i32
 }
 
 // A lexed token.
@@ -269,7 +280,7 @@ export function advance() {
 // Record a diagnostic at the current position. Returns the diagnostic count
 // (VL has no `void`; functions infer their return type).
 export function diag(msg: string) {
-  gDiags.push({ msg: msg, line: gLine, col: gCol })
+  gDiags.push({ msg: msg, line: gLine, col: gCol, endCol: gCol })
   gDiags.length
 }
 
@@ -277,7 +288,16 @@ export function diag(msg: string) {
 // for reports that anchor at a construct's START (an opening quote, a
 // backslash) after the scanner has already moved past it.
 function diagAt(msg: string, line: i32, col: i32) {
-  gDiags.push({ msg: msg, line: line, col: col })
+  gDiags.push({ msg: msg, line: line, col: col, endCol: col })
+  gDiags.length
+}
+
+// `diagAt` with a SPAN: the report covers `[col, endCol)` on `line` rather than
+// rendering as a point. For a diagnostic whose subject is a whole lexeme the
+// scanner has just consumed — a char literal of the wrong length, an unterminated
+// quote — where `gCol` is already sitting one past it.
+function diagSpan(msg: string, line: i32, col: i32, endCol: i32) {
+  gDiags.push({ msg: msg, line: line, col: col, endCol: endCol })
   gDiags.length
 }
 
@@ -680,10 +700,12 @@ export function scanQuoted(quote: i32) {
   }
   value = value + gSrc.slice(runStart, gPos)
   if !closed {
+    // Spans the opening quote through whatever the scan reached (the raw newline
+    // that broke the loop, or EOF) — the whole run the reader has to look at.
     if quote == '\'' {
-      diagAt("Unterminated char literal", openLine, openCol)
+      diagSpan("Unterminated char literal", openLine, openCol, gCol)
     } else {
-      diagAt("Unterminated string literal", openLine, openCol)
+      diagSpan("Unterminated string literal", openLine, openCol, gCol)
     }
   }
   value
@@ -877,15 +899,19 @@ export function tokenize(source: string): LexResult {
       // the seed rung and by a byte-rep one thereafter.
       const cpn = cpCount(value)
       if cpn != 1 {
-        // Anchor at the OPENING QUOTE (the scanner already sits one past the
-        // literal), the exact case `diagAt`'s contract names.
+        // Span the WHOLE literal, opening quote through closing quote: the
+        // scanner already sits one past it, so `startCol` is the open quote and
+        // `gCol` is the exclusive end. The offence is the literal's LENGTH, so a
+        // one-column caret at the open quote (what anchoring alone gave) points
+        // at the one character that is not the problem.
         if cpn == 0 {
-          diagAt("Empty char literal", startLine, startCol)
+          diagSpan("Empty char literal", startLine, startCol, gCol)
         } else {
-          diagAt(
+          diagSpan(
             "Char literal must contain exactly one character",
             startLine,
             startCol,
+            gCol,
           )
         }
       }
