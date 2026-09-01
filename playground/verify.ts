@@ -245,9 +245,12 @@ const verifyCacheBusting = async (): Promise<void> => {
   if (page.length === 0) fail("playground/dist/index.html is empty");
 
   // Every LOCAL reference the page makes must be content-addressed and present.
+  // A data: URI is not a fetchable asset — its bytes ARE the reference, so
+  // hashing is meaningless for it (the inline SVG favicon, #2171, is the case
+  // that surfaced this: the classifier predates data: URIs, #1162).
   const refs = [...page.matchAll(/(?:src|href)="([^"]+)"/g)]
     .map((m) => m[1])
-    .filter((r) => !/^https?:/.test(r));
+    .filter((r) => !/^https?:/.test(r) && !/^data:/.test(r));
   if (refs.length === 0) fail("dist/index.html references no local assets at all");
   for (const ref of refs) {
     if (!isHashedAsset(ref)) fail(`dist/index.html references an un-hashed asset: ${ref}`);
