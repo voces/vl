@@ -349,6 +349,7 @@ import {
   uFieldCount,
   uFieldNames,
   uFieldStart,
+  uFieldTypes,
   uSinkFired,
   uTags,
   uVarHeap,
@@ -776,6 +777,8 @@ import {
   widenDstBackSlot,
   widenSrcWrapSlot,
   unionEqStashSlot,
+  unionEqArmSlot,
+  unionEqStashSlot2,
   widenScalarBackSlot,
   widenScalarWrapSlot,
   widenTmpSlot,
@@ -5605,6 +5608,133 @@ function emitUnionConcreteEq(
 // over the SHARED non-null arms, bottoming out at bare tag equality (covers the
 // `null` arm and any non-shared arm: distinct tags ⇒ unequal, equal null tags
 // ⇒ equal). The right payload's unbox short-circuits on ITS tag too.
+// D973 — `==` over a STRUCT UNION (`A | B` of declared shapes), both operands the same set.
+// Tags unequal means different arms and therefore unequal; tags equal selects ONE arm, and
+// that arm's fields are compared through the variant table.
+//
+// WHY NOT `emitStructEqRec`, which already does field-wise struct compares: it is keyed on a
+// STRUCT-TABLE row, and `emit_state`'s own header says that table is EMPTY when a union is
+// declared — "the union path owns the struct `type`s instead (its variant table)". Measured:
+// `sHeapIdx.length` is 0 for this program. The arms' fields live in `uFieldNames` /
+// `uFieldTypes`, so the compare reads them there.
+//
+// Returns 0 when it emitted and -1 when it DECLINES, so an arm set it cannot serve keeps the
+// caller's loud message rather than becoming a bad lowering.
+function emitStructUnionEq(
+  body: i32[],
+  lIx: i32,
+  rIx: i32,
+  isNe: boolean,
+  uname: string,
+  fnIx: i32,
+) {
+  const arms: string[] = []
+  splitUnionAtoms(unionMemberSetOf(uname), arms)
+  if arms.length < 2 { return -1 }
+  const vis: i32[] = []
+  let i = 0
+  while i < arms.length {
+    const vi = variantIndexOf(arms[i])
+    if vi < 0 { return -1 }
+    if vi >= uVarHeap.length { return -1 }
+    if vi >= uTags.length { return -1 }
+    if vi >= uFieldStart.length { return -1 }
+    if vi >= uFieldCount.length { return -1 }
+    if !variantFieldsComparable(vi) { return -1 }
+    vis.push(vi)
+    i = i + 1
+  }
+  const sl = unionEqStashSlot()
+  const sr = unionEqStashSlot2()
+  if emitExpr(body, lIx, fnIx) < 0 { return -1 }
+  fbLocalSet(sl)
+  if emitExpr(body, rIx, fnIx) < 0 { return -1 }
+  fbLocalSet(sr)
+  // TAGS FIRST: two different arms are never equal, and the tag IS the arm.
+  fbLocalGet(sl)
+  fbStructGet(uBoxIdx, 0)
+  fbLocalGet(sr)
+  fbStructGet(uBoxIdx, 0)
+  fbI32Bin(70) // 0x46 i32.eq
+  fbIf(127)    // 0x04 if, i32 result
+  ctrlEnter()
+  // Then one arm per tag; the last is the fall-through, so N arms need N-1 tests.
+  let a = 0
+  while a < vis.length - 1 {
+    fbLocalGet(sl)
+    fbStructGet(uBoxIdx, 0)
+    fbI32Const(uTags[vis[a]])
+    fbI32Bin(70)
+    fbIf(127)
+    ctrlEnter()
+    if emitVariantArmEq(body, sl, sr, vis[a]) < 0 { return -1 }
+    fbElse()
+    a = a + 1
+  }
+  if emitVariantArmEq(body, sl, sr, vis[vis.length - 1]) < 0 { return -1 }
+  let e = 0
+  while e < vis.length - 1 {
+    fbEnd()
+    ctrlLeave()
+    e = e + 1
+  }
+  fbElse() // tags differ
+  fbI32Const(0)
+  fbEnd()
+  ctrlLeave()
+  if isNe { fbI32Eqz() }
+  0
+}
+
+// Can every field of variant `vi` be compared by this lowering? Codes 0 (i32 / boolean) and
+// 3 (string) only — a ref, list or map field would need the recursive machinery the struct
+// table carries, and declining keeps the caller's loud refusal for those.
+function variantFieldsComparable(vi: i32): boolean {
+  const start = uFieldStart[vi]
+  const cnt = uFieldCount[vi]
+  let j = 0
+  while j < cnt {
+    if start + j >= uFieldTypes.length { return false }
+    const c = uFieldTypes[start + j]
+    if c != 0 && c != 3 { return false }
+    j = j + 1
+  }
+  true
+}
+
+// One arm: cast both payloads to the arm's variant heap, park them, and AND the fields.
+function emitVariantArmEq(body: i32[], sl: i32, sr: i32, vi: i32) {
+  const al = unionEqArmSlot(vi)
+  const ar = unionEqArmSlot(vi + 1024)
+  fbLocalGet(sl)
+  fbStructGet(uBoxIdx, 1)
+  fbRefCast(uVarHeap[vi])
+  fbLocalSet(al)
+  fbLocalGet(sr)
+  fbStructGet(uBoxIdx, 1)
+  fbRefCast(uVarHeap[vi])
+  fbLocalSet(ar)
+  const start = uFieldStart[vi]
+  const cnt = uFieldCount[vi]
+  fbI32Const(1)
+  let j = 0
+  while j < cnt {
+    const c = uFieldTypes[start + j]
+    fbLocalGet(al)
+    fbStructGet(uVarHeap[vi], j)
+    fbLocalGet(ar)
+    fbStructGet(uVarHeap[vi], j)
+    if c == 3 {
+      if emitStrEqCore(body) < 0 { return -1 }
+    } else {
+      fbI32Bin(70) // 0x46 i32.eq
+    }
+    fbI32Bin(113) // 0x71 i32.and
+    j = j + 1
+  }
+  0
+}
+
 function emitUnionUnionEq(
   body: i32[],
   lIx: i32,
@@ -5612,13 +5742,21 @@ function emitUnionUnionEq(
   isNe: boolean,
   fnIx: i32,
 ) {
+  const lname = unionNameOfExpr(lIx, fnIx)
+  const rname = unionNameOfExpr(rIx, fnIx)
+  // D973 — THE STRUCT-UNION PATH IS TRIED BEFORE THE RE-READABILITY GATE, because it does not
+  // need it: it evaluates each operand ONCE into its own slot and reads the slots. The gate
+  // exists for the value-union lowering below, which re-reads both sides per arm.
+  if lname != "" && lname == rname {
+    if !isValueUnionOfSet(msSetOfText(lname), lname) {
+      if emitStructUnionEq(body, lIx, rIx, isNe, lname, fnIx) == 0 { return 0 }
+    }
+  }
   if !unionEqOperandOk(lIx) || !unionEqOperandOk(rIx) {
     return emitFail(
       "emitProgram: union `==` over a non-binding union value is not supported yet",
     )
   }
-  const lname = unionNameOfExpr(lIx, fnIx)
-  const rname = unionNameOfExpr(rIx, fnIx)
   // D-SETONCE: BOTH operands' member sets are resolved ONCE, here, and every later
   // reader takes the id. Master resolved `lname` twice (this gate re-split the
   // rendering, then `msSetOfText` below) and `rname` twice (the gate, then
@@ -5626,6 +5764,10 @@ function emitUnionUnionEq(
   const lsid = msSetOfText(lname)
   const rsid = msSetOfText(rname)
   if !isValueUnionOfSet(lsid, lname) || !isValueUnionOfSet(rsid, rname) {
+    // D973 — A STRUCT UNION COMPARES BY TAG, THEN BY THE ARM'S FIELDS. It rides the SAME
+    // `{tag, payload}` box a value union does (`struct.get $box 0`, then `ref.cast` to
+    // `uVarHeap[vi]` — disassembled), so the dispatch is the one the value-union compare
+    // already uses; only the per-arm field compare had to be written.
     return emitFail(
       "emitProgram: `==` over a struct union is not supported yet",
     )

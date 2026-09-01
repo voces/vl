@@ -23817,26 +23817,24 @@ turns that assertion back into a measurement.
   of the function, ahead of the gates, where the surrounding lowering's context is not yet in
   force. **Evaluate where the original code evaluated, then tee.**
 
-* **THE STRUCT-UNION HALF STAYS OPEN, and an attempt sharpened WHY.** `A | B` of two shapes
-  refuses at both spellings, while struct `==` over one declared shape runs and value-union
-  `==` runs. `scripts/capability-probes/struct-union-equality.vl` is the standing measurement.
+* **THE STRUCT-UNION HALF IS CLOSED TOO (D973), and the reason it took three builds is worth
+  the space.** `A | B` of declared shapes rides the SAME `{tag, payload}` box a value union
+  does (disassembled), so the dispatch is the value union's: tags unequal means different arms
+  and therefore unequal, tags equal selects ONE arm.
 
-  The dispatch was built and reverted, and it got further than the row expected: a struct union
-  rides the SAME `{tag, payload}` box a value union does (disassembled), so tag-compare then
-  per-arm cast is straightforward, and `emitStructEqRec` already accepts a pre-stashed operand
-  pair through its `-2` / `-3` sentinels. Three things had to be learned on the way — the
-  refusal that fires for `u == v` is `emitUnionUnionEq`'s, not `emitUnionConcreteEq`'s;
-  `structIdxOfElemName` answers -1 for an arm because arms are registered as VARIANTS; and the
-  row can instead be found by matching `sHeapIdx` against `uVarHeap[vi]` (D280: an arm and its
-  declared twin are one heap).
+  Three things had to be found. The refusal that fires for `u == v` is **`emitUnionUnionEq`'s**,
+  not `emitUnionConcreteEq`'s. `structIdxOfElemName` answers -1 for an arm, because arms
+  register as VARIANTS. And the obvious repair — recover the struct row by matching `sHeapIdx`
+  against `uVarHeap[vi]` — **cannot work, because `sHeapIdx.length` is ZERO**: `emit_state`'s
+  own header says the struct table stays empty when a union is declared, since the union path
+  owns the types. So `emitStructEqRec` was the wrong tool, and the compare reads the arms'
+  fields from `uFieldNames` / `uFieldTypes` instead.
 
-  **AND THAT LAST ONE IS WHERE IT STOPS: `sHeapIdx.length` is ZERO.** `emit_state`'s own
-  header says so — "when a UNION is declared, the union path owns the struct `type`s instead
-  (its variant table) and this table stays empty". So the per-arm field-wise compare has no row
-  to run through, and `emitStructEqRec` is keyed on a table struct unions never populate.
-  **The real prerequisite is a variant-keyed field compare (or struct rows minted for variant
-  arms), not the dispatch** — which is a bigger change than this row first implied, and an
-  owner-facing one since it touches how declared unions register their arms.
+  **IT IS TRIED BEFORE THE RE-READABILITY GATE**, because it does not need one: it evaluates
+  each operand once into its own slot. That gate exists for the value-union lowering, which
+  re-reads both sides per arm — so `mk3(3) == mk3(3)` works here while the same spelling needed
+  D972's tee on the value-union path. Fields of code 0 (i32 / boolean) and 3 (string) are
+  compared; a ref / list / map field DECLINES and keeps the loud refusal.
 
 Repro (runs, prints `true`):
 
