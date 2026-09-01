@@ -23957,53 +23957,40 @@ Repro (runs, prints `s`):
     if t != null { print(t) }
     // PRINTS s
 
-### D966 — `__array_new__`'s ref-fill "long tail" was one arm, and it is now open at every ANNOTATED spelling
+### D966 — `__array_new__`'s ref-fill "long tail" was one arm, and its residue was one hardcoded element KIND
 
-**closed at the ANNOTATED spelling — all four ref fills (nested list, string list, map, closure) deliver through the kind-3 arm and RUN · the un-annotated spelling keeps a loud residue whose single cause, enrolment, the body names by line**
+**closed at every spelling except a CLOSURE fill (still a loud reject) — the kind-3 arm serves any ref element, and the intern now derives the element's kind instead of assuming the struct one**
 
 The emitter tested six predicates on the fill — object literal, closure, array, ref-array,
 string-array, map — and refused if any held, under a comment calling them a "long tail". They
 are the same six the kind-3 arm can already serve.
 
 * **KIND 3 IS NOT A STRUCT ARM.** It resolves `refListSlotOfExpr(callIx)` — the ref-list slot
-  of the CALL's own type — and reads the backing/wrapper pair off `rlBackIdx`/`rlWrapIdx`. That
-  is generic over every ref ELEMENT. The one struct-specific thing in it, `anElemStructIdx`, is
-  a `pendingStructIdx` seed an ObjLit fill needs and every other ref fill leaves at -1. So the
-  six-line widening in `arrNewIntrKind` is the whole change, and a nested list, a string list,
-  a map and a closure fill each RUN with it.
+  of the CALL's own type — and reads the backing/wrapper pair off `rlBackIdx`/`rlWrapIdx`,
+  which is generic over every ref ELEMENT. The one struct-specific thing in it,
+  `anElemStructIdx`, is a `pendingStructIdx` seed an ObjLit fill needs and every other ref fill
+  leaves at its -1 default.
 
-* **THE REFUSAL WAS STANDING IN FRONT OF THE LOWERING, not protecting a missing one** — the
-  same shape as the thirteen gaps closed before it. What it was really standing in front of is
-  narrower and is still open: an UN-annotated binding has no interned row for the result.
+* **THE RESIDUE WAS THE INTERN, AND IT WAS ONE HARDCODED ARGUMENT.**
+  `rlInternName(refListElemNameOfExpr(i, -1), 1)` pinned every ref fill to element kind 1, the
+  STRUCT element — correct while the arm only ran for structs. Widened, a nested-list element
+  got a row whose rep is the raw BACKING array where the annotated path carries the list
+  WRAPPER. **`ensureRefElemTy` is the type-CARRYING intern** and derives the kind from the
+  element itself; every caller that gets this right passes a type, and this one passed a name.
 
-* **AND THE REMAINING GAP IS ONE LINE, NAMED.** `refListElemNameOfExpr` answers `""` for a
-  non-struct fill, so nothing is enrolled. With the destination ANNOTATED the annotation
-  interns the row and everything works — which is what proves the lowering complete.
-  `tyNameOf(nodeTyIxOf(fill))` is the obvious missing name and is **NOT** it: measured, with
-  the parallel-table read already bounded, it traps the compiler on the annotated path too.
+* **THE MESSAGE COULD NOT HAVE FOUND IT.** The failure was
+  `expected (ref null $type), found (ref $type)`, whose heap-type names the validator ELIDES —
+  it reads like a nullability slip. Diffing the annotated and un-annotated disassemblies showed
+  exactly one difference, the element scratch local: `(ref $0)` versus `(ref $3)`.
 
-* **`tyToEmitName(nodeTyIxOf(fill))` IS THE RIGHT NAME AND THE INTERN IS THE REMAINING GAP —
-  narrowed to one wrong heap type, by disassembly.** With that name the annotated spellings
-  keep running and the struct fill is untouched; the un-annotated case fails as
-  `expected (ref null $type), found (ref $type)`, whose heap-type names the validator ELIDES.
-  Disassembling both and diffing shows exactly one difference:
-
-  the element scratch local is `(ref $0)` un-annotated and `(ref $3)` annotated — **`$0` is the
-  raw BACKING array and `$3` is the list WRAPPER**. So the row interned for the element carries
-  the backing where the annotated path carries the wrapper; the name is right and the REP the
-  intern picks for it is not.
-
-  **`ensureRefElemTy(elemName, ty)` is almost certainly the missing call**: it is the
-  type-CARRYING intern, and its kind-9 arm exists precisely to hand a nested array's row down
-  to its inner element instead of re-resolving the spelling. Every caller that gets this right
-  passes a type (`arrLitElemHintTy`, `sFieldElemTyIxRow`, `uFieldElemTyIxRow`, …); the
-  `__array_new__` path passes only a name. Start there, and grade by diffing the two
-  disassemblies rather than by the message, which cannot name the two rows.
+* **A CLOSURE FILL STILL REFUSES, loudly.** `__array_new__(2, f)` over a lambda is the one
+  spelling the widening does not reach; it keeps the clean reject rather than miscompiling, and
+  it is the remaining residue on this row.
 
 Repro (runs, prints `7`):
 
     const s: i32[] = [7]
-    const xs: i32[][] = __array_new__(3, s)
+    const xs = __array_new__(3, s)
     print(xs[0][0])
     // PRINTS 7
 
