@@ -181,6 +181,36 @@ Facts that constrain the design, each verified this session:
    | `null` | `T[]` | any | emit-refuse | check-refuse |
    | `null` | any | `{[string]: T}` | emit-refuse | check-refuse |
 
+   **THE STANDING ROOT (2026-09-01, late — #2221/#2223, both merged, family still OPEN
+   on D984).** The real skip was found with a discriminating probe (`unNames` holds `[J]`
+   for `boolean | string | J[]` and `[]` for `null | string | J[]`, narrowing correct in
+   BOTH): a `null` arm normalises into the nullable niche, `isTransparentAlias` then
+   calls the whole declaration a transparent alias, and the union is never REGISTERED —
+   D982's "not a variant" and D985's silent unboxing loss are both downstream of a
+   declaration that was skipped, not of any use-site logic. #2221 gated the predicate —
+   and SHIPPED A `runs → not-runs`: the un-gating removed a MASK over an unrelated
+   unbounded recursion (registering a self-referential MAP arm walks
+   `registerInlineUnion → registerMapValUnion → registerInlineUnion` by name, no depth
+   bound), so the two DECLARATIONS that had merely worked — this doc's own `Json`
+   spelling among them — began trapping the compiler. Caught after merge (eleven gates
+   stayed green: no fixture had ever used the spelling, because until then it was an
+   uninteresting program that worked), fixed in #2223: array arms stay un-transparent
+   (the D982/D985 soundness half holds), MAP arms stay transparent until D984's
+   recursion is bounded, and **D984 is the blocking item for the whole family, not a
+   sibling of it** — it was the thing the mask was over. Both recovered declarations
+   are refutation pins in `tests/cases/types/` so re-lifting the map clause trips a
+   fixture instead of shipping. The 28-cell grid gets re-run when the family closes.
+
+   Two instrument rules this family earned, for the appendix and for anyone probing it:
+   (1) **"why doesn't X know it's a union" — ask `unNames` FIRST**: a use site losing a
+   property can mean the DECLARATION was skipped, not that the use-site logic is wrong;
+   the narrowing/unboxing audit that preceded this find was time spent downstream of a
+   registration that never happened. (2) **When you change a predicate that gates
+   behaviour, test the programs taking the OTHER branch** — a two-column A/B over the
+   predicate's own domain, graded against a compiler built from the commit BEFORE the
+   change, never against memory of what used to work. #2221 tested everything it meant
+   to fix and nothing the predicate had been protecting.
+
    **The "one mechanism, empty variant table" explanation was filed and RETRACTED the
    same day (#2213)** — the table is empty for the WORKING spelling too, by design
    (interning is gated on `isStructAtom`, so `string`/`boolean`/`J[]` never intern in
