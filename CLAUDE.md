@@ -231,6 +231,16 @@ one reading `this program is type-valid but cannot build`) — **24** on 2026-09
 direction that hides: a capability gap moved into the checker stops looking like a gap, the
 program compiles no better than before, and the script counts it the same as an emit-side one.
 
+**AND THE NUMBER IS A LOWER BOUND, NOT THE POPULATION (D964).** The filter finds refusals whose
+WORDING admits a capability gap, and a refusal is not obliged to admit one:
+`emitProgram: narrowed union atom has no value box` reads like an internal invariant, fires on
+a `vl check`-clean program, and is a clause-2 violation the count never saw. Measured: **405**
+distinct `emitFail` literals in `compiler/*.vl`, of which **13** match the filter — the rest are
+mostly unreachable defensive floors, and a floor no check-clean program can reach is NOT a
+violation. So the true site count sits in `[23, 405]` and **only a WITNESS settles which**.
+`scripts/capability-probes/run.py` is therefore the instrument and `--sites` is the headline:
+when they disagree the probe is right, and **`--sites` reaching zero is not clause 2 being met**.
+
 **AND THE PHRASE LIST ITSELF NEEDS AUDITING — it was reporting HALF.** Until D958 the predicate
 matched four phrasings and found 12 literals; the compiler carried **12 more** that concede the
 same thing in the other WORD ORDER (`not supported YET` rather than `not YET supported`), plus
