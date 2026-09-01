@@ -617,22 +617,110 @@ Three concrete approaches. They are not mutually exclusive — the recommendatio
 
 ### Approach 1 — `std:json`: hand-written codecs, no compiler change
 
-**Mechanism.** A `std:json` module in ordinary VL: an escaping writer over a `u8[]`
-builder (the `fromCodePoints`-once idiom — per-append string concat is measured quadratic,
-`docs/guide/strings-design.md` §Mutability), and a **pull lexer** handing typed tokens
-(`nextString()`, `nextNumber()`, `expect('{')` …) rather than a parsed value tree —
-because the idiomatic `Json` union tree is not emittable today (fact 5,
-**(RUN 2026-09-01)**; the gate narrowed to self-reference but the tree's defining feature
-IS the self-reference, so the pull-lexer plan is unchanged).
-Per-type codecs are then hand-written free functions:
-`circleToJson(c: Circle): string`, `circleFromJson(lex: JsonLexer): Circle | JsonError`.
-Errors follow `std:fs`'s ruled shape — `T | JsonError` with a
-`{ at: i32, msg: string }`-class struct — and the module becomes the second measurement
-of the `as`-propagation boilerplate, the way `std:fs` was the first.
+> **RE-DERIVED 2026-09-01 from a POSITION matrix** (appendix, round 3). The premise this
+> section rested on is refuted; every claim below was executed against a self-refreshed seed.
 
-**Type fidelity.** Only as good as the hand code, and the format caps it: `i64` must go
-as a decimal string by convention (protobuf's JSON mapping), `f32` needs
-shortest-for-f32 rendering (`0.1` — note the f64-shortest rendering of a widened f32 is
+**Mechanism.** ~~an escaping writer over a `u8[]` builder … and a **pull lexer** handing typed
+tokens (`nextString()`, `nextNumber()`, `expect('{')` …) rather than a parsed value tree —
+because the idiomatic `Json` union tree is not emittable today (fact 5); the gate narrowed to
+self-reference but the tree's defining feature IS the self-reference, so the pull-lexer plan is
+unchanged~~ **— refuted 2026-09-01. The value tree BUILDS, and the pull lexer was never a
+forced move.**
+
+`type Json = null | boolean | f64 | string | Json[] | { [string]: Json }` is delivered,
+narrowed and read back at **8 of the 10 positions measured, over all six arms** — **51 of 60
+cells RUN (RUN 2026-09-01)**. Fact 5's 28-cell grid held POSITION fixed at module `const`;
+`scripts/capability-probes/` held it fixed at *parameter*; that is the whole reason the two
+instruments disagreed, and #2244 removed the one arm (`null`) the parameter position still
+refused. Adding POSITION as the axis is CLAUDE.md's own prescription ("a capability gap has a
+position matrix"), and it is what neither instrument had.
+
+So stage 1 is the shape the owner ruled (decision G, `docs/internals/serde-critique-synthesis.md`):
+**a `Json` value tree, a recursive-descent parser over a `string`, and a renderer.** A
+token-level pull API is still worth exporting — it is the schemaless escape hatch for a
+document too large or too foreign to materialise — but it is a *second* entry point, not the
+shape the module is forced into. Per-type codecs sit **above** the tree as ordinary functions
+(`circleFromJson(v: Json): Circle | JsonError`), which is what makes them composable at all
+(see "the tax", below). Errors follow `std:fs`'s ruled shape — `T | JsonError` with a
+`{ at: i32, msg: string }`-class struct — and the module is still the second measurement of
+the `as`-propagation boilerplate, the way `std:fs` was the first.
+
+**The whole module round-trips today.** 171 lines of ordinary VL — escaping renderer,
+recursive-descent parser, `\"` / `\\` / `\n` escapes both ways, `parseF64` for numbers —
+parse and render `{"a":[1,null,"x"],"b":true,"c":{"deep":2.5}}` **byte-identically**, plus
+`[]`, `{}`, `null`, `[1e3,-2.5,0]` → `[1000,-2.5,0]` **(RUN 2026-09-01**, whole program inlined
+in the appendix**)**. On a generated 1,049-byte document it is semantically equal to the input,
+preserves key order, is idempotent under a second render, and is 1,001 bytes because VL's
+shortest-round-trip `f64` writes `0` where Python writes `0.0`. Cost: `vl build` of the module
+**0.067 s** → a 22,729-byte wasm; the marginal parse+render of that 1 KB document is
+**~0.24 ms** (min-of-7 wall, 1 / 100 / 1000 iterations: 0.178 / 0.208 / 0.424 s, against
+0.015 s for `print(1)`). No workaround was needed that is not named below.
+
+**The position matrix.** Six arms × ten delivery positions; each cell prints a value proving
+the arm round-tripped (`arr:2.5`, `map:k=2.5`, …), never merely that it compiled.
+
+| position | null | boolean | f64 | string | `Json[]` | `{[string]: Json}` |
+| --- | --- | --- | --- | --- | --- | --- |
+| module `const` | RUNS | RUNS | RUNS | RUNS | RUNS | RUNS |
+| parameter (`is`-narrowed) | RUNS | RUNS | RUNS | RUNS | RUNS | RUNS |
+| return, annotated | RUNS | RUNS | RUNS | RUNS | RUNS | RUNS |
+| return, INFERRED | check | check | check | check | check | check |
+| struct field | RUNS | RUNS | RUNS | RUNS | RUNS | RUNS |
+| array element | RUNS | RUNS | RUNS | RUNS | RUNS | RUNS |
+| map value read (`m[k]`) | RUNS | RUNS | RUNS | RUNS | RUNS | RUNS |
+| closure capture | RUNS | RUNS | RUNS | RUNS | RUNS | RUNS |
+| array literal → `Json`, bare | RUNS | RUNS | RUNS | **SILENT** | emit | emit |
+| array literal → `Json[]`, annotated | RUNS | RUNS | RUNS | RUNS | RUNS | RUNS |
+
+**RUNS 51 · check-refuse 6 · emit-refuse 2 · check-clean invalid wasm 1 · trap 0.**
+
+The nine non-RUNS cells are two rows, and both are the same shape: **an annotation is what pins
+the rep, and the un-annotated spelling is where the residue lives** (CLAUDE.md's D962/D969
+rule — "a fixture that annotates every destination cannot see the missing-annotation defect").
+Annotating the array literal `Json[]` moves the whole bottom row to RUNS; annotating the return
+moves the whole `ret_inf` row to RUNS.
+
+**Residues that constrain the implementation.** Filed and unfiled, each with the spelling that
+gets past it. None is a design rule; every one is a clause-1 or clause-2 violation.
+
+| residue | verbatim | spelling that runs |
+| --- | --- | --- |
+| **D1009** — `Json \| null` ↛ `Json` | `argument 1: expected Json, got Json \| null` | bind the map read, narrow on `== null`, then call |
+| **D1010** — null-bearing literal | `cannot assign (f64 \| string \| null)[] to 'c' of type Json` | `const arr: Json[] = [1.0, null, "x"]` |
+| **NEW (a)** — inferred union return | `'g' infers the union return type Json — type-valid, but an inferred return of this shape is not yet supported by codegen; annotate the return type` | annotate every parser function `: Json` |
+| **NEW (b)** — bare `[…]` of strings at a `Json` destination | check rc 0, then `type mismatch: expected (ref $type), found (ref $type)` — **check-clean invalid wasm** | `const a: Json[] = ["x"]` |
+| **NEW (c)** — bare NESTED `[…]` at a `Json` destination | `emitProgram: array value does not match any array member of the union (leaf-scalar widening across a nested array is unsupported)` — at binding, argument *and* map-write | annotate the literal `Json[]` |
+| **NEW (d)** — bare `[…]` holding a map | `emitProgram: a union arm that is an array-of-map is not yet supported — use a named element type` | annotate the literal `Json[]` |
+| **NEW (e)** — `const e = v[0]` on a narrowed array arm, when the union also has a self-referential MAP arm | `emitProgram: map op receiver is not a map` | `for e in v { … }`, or hand `v[i]` straight to a call |
+| **NEW (f)** — `print` of a local re-bound from an `is`-narrowed REF arm | check rc 0, then `type mismatch: expected i32, found (ref $type)` — **check-clean invalid wasm**; sibling of the closed D968 | print the narrowed value directly, or annotate the rebind |
+| **NEW (g)** — an `is` narrowing on a struct-FIELD or ARRAY-ELEMENT receiver | four messages, one mechanism: `unsupported for-in iterable` · `narrowed union field atom has no value box` · `index access but array type not collected` · `callee is not a function name` | hoist the read into a local **before** the `if` |
+
+Two of these bear on the *design*, not just the implementation. (g) is why a recursive walker
+must hoist before it narrows — which is the natural spelling anyway, so the cost is a sentence
+in the module header. And (b)/(c)/(d) together say the same thing as D1010: **the un-annotated
+array literal is the one delivery position the tree does not carry**, so `std:json`'s parser
+builds every array through an annotated `let a: Json[] = []` and pushes into it. Dropping that
+one annotation from the working parser is check-clean invalid wasm (measured).
+
+**The per-type tax is smaller than the old sketch made it look.** The struck text below argued
+"one hand-written line per field, per type, forever". That was an artifact of a sketch with no
+abstraction (the cross-language critique's F10 steelman: Elm and Gleam decoders are combinators,
+not scaffolding). Over a value tree the combinators are ordinary functions and they run:
+`field(v, "r")`, `num(…)`, `str(…)`, composed into `decodeCircle(v: Json): Circle`, prints
+`2.5/c1` **(RUN 2026-09-01)** — and a first-class `const dec: (Json) => f64 = num` runs too.
+What is still refused is only the *alias* `type Dec<T> = (Json) => T`
+(`unknown type 'T' within '(Json)=>T' in union 'Dec<T>'`), which costs the combinator style
+nothing today because the inline spelling works. The residual tax is real but it is per-TYPE,
+not per-FIELD-per-type, and it is the boilerplate stage 2 deletes.
+
+**Type fidelity.** Only as good as the hand code, and the format caps it: ~~`i64` must go as a
+decimal string by convention (protobuf's JSON mapping)~~ **REVERSED by owner ruling B
+(2026-09-01): `i64` is ALWAYS a JSON number.** VL's reader is type-directed and therefore exact,
+`i64 | string` stays derivable (the string rule made it ambiguous), and a human config reads `3`
+rather than `"3"`; a JavaScript consumer loses precision above 2^53 and is told so in the
+module header. The reader side needs `parseI64`/`parseI32` in `std:fmt` — landing separately;
+today `parseF64` is the only number path and it funnels `9007199254740993` to `…992`. `f32`
+needs shortest-for-f32 rendering (`0.1` — note the f64-shortest rendering of a widened f32 is
 the unreadable `0.10000000149011612`, which is what `toString` over an `f32` gives today
 **(RUN 2026-09-01)**), `NaN`/`Infinity` must be an encode-time *error* (a silent `null` is
 the quiet lie this repo rejects elsewhere), `u8[]` needs base64 —
@@ -644,18 +732,23 @@ unspellable in hand code anyway — refusal by omission.
 **Prerequisites** ~~, measured missing~~ **— MET, 2026-09-01.** The old text called
 `f64`/`f32` ↔ string "the *only* hard part of this whole approach" and measured it absent.
 It is present: `std:fmt`'s `toString` f64 arm and `parseF64` (fact 6), the lexer's
-scientific-notation fix (#2173), and `std:base64`. **The remaining half is `f32` ↔ string
-alone** — the same Burger–Dybvig core with 24-bit-significand boundaries plus f32-nearest
-rounding on the way in, not a wrapper over the f64 pair (`std/fmt.vl`'s header argues this
-at length). A v1 that renders `f32` as its widened f64 is honest-but-ugly and round-trips
-correctly; it just prints `0.10000000149011612` where a reader expects `0.1`.
+scientific-notation fix (#2173), and `std:base64`. **The remaining halves are `f32` ↔ string
+and `parseI64`/`parseI32`** — the `f32` pair is the same Burger–Dybvig core with
+24-bit-significand boundaries plus f32-nearest rounding on the way in, not a wrapper over the
+f64 pair (`std/fmt.vl`'s header argues this at length). A v1 that renders `f32` as its widened
+f64 is honest-but-ugly and round-trips correctly; it just prints `0.10000000149011612` where a
+reader expects `0.1`.
 
-**The sketch below RUNS on today's seed**, which is the strongest form this claim has had:
-Approach 1 is no longer an estimate.
+~~**The sketch below RUNS on today's seed**, which is the strongest form this claim has had:
+Approach 1 is no longer an estimate.~~ **Superseded 2026-09-01: the whole module runs, not a
+spine of it. The flat-record sketch is kept because its `decode` body is the boilerplate
+measurement stage 2 exists to delete — but read it as the SCHEMA layer sitting on top of the
+value tree, not as the parser.**
 
 ```vl
 // MEASURED, not illustrative: this round-trips on the 2026-09-01 seed.
-// Appendix probe `a1b.vl` is the whole program; this is its spine.
+// Appendix ROUND 2's probe `a1b.vl` is the whole program; this is its spine.
+// (The value-tree parser+renderer this section now recommends is in ROUND 3.)
 import { toString, parseF64 } from "std:fmt"
 
 type Config = { name: string, ratio: f64, retries: i32 }
@@ -689,28 +782,35 @@ function decode(src: string): Config | null {   // built AT the destination shap
 
 Two things the sketch shows that prose did not. **The template literal carries the whole
 writer** — no `u8[]` builder, no quadratic concat, and holes render `f64`/`i64` directly —
-so the `fromCodePoints`-once idiom above is now an optimisation rather than a necessity.
-And **`decode`'s body is the tax**: three fields, one hand-written key/colon/value/comma
-sequence each, and it does not tolerate reordering, absence, or unknown keys until someone
-writes that too. That is the boilerplate stage 2 exists to delete, and it is now measurable
-rather than asserted.
+so the `fromCodePoints`-once idiom is an optimisation rather than a necessity. (The appendix's
+value-tree renderer uses `out = out + …` for legibility and is quadratic at document scale;
+`join`-not-`+=` is the ruled fix and belongs in the module header.) And **`decode`'s body is
+the schema tax**: three fields, one hand-written key/colon/value/comma sequence each, and it
+does not tolerate reordering, absence, or unknown keys until someone writes that too — ~~that
+is the boilerplate stage 2 exists to delete~~ **it is the boilerplate stage 2 deletes, and the
+combinator measurement above is the honest size of it: per-type, not per-field-per-type.**
 
 **Fit.** (a) host IO/config: good — this is the approach's whole constituency. (b)
 message passing: poor — slow, text, and every message type hand-coded twice. (c)
 pause/restore: no.
 
 **Evolution.** Manual and therefore flexible: a hand decoder tolerates missing fields via
-`T | null` and unknown fields by skipping tokens. **Determinism:** achievable (VL maps
-iterate in insertion order, so even map encoding is reproducible) but not a property
-anyone enforces — it lives in each hand codec. **Security:** hand-written decoders are
-the classic bug surface; the lexer can centralize depth limits, length caps, strict UTF-8
-(`std:utf8`'s strict default), and duplicate-key rejection, but every per-type decoder
-re-decides what to do with absence and excess.
+`T | null` and unknown fields by skipping tokens — and with a value tree, unknown fields
+survive a round trip *for free*, which the pull-lexer plan could not offer. **Determinism:**
+achievable (VL maps iterate in insertion order — the appendix's 1 KB round trip preserves key
+order, measured) but not a property anyone enforces; it lives in each hand codec.
+**Security:** hand-written decoders are the classic bug surface, and the value tree moves the
+choke point to ONE parser: depth limits, length caps, strict UTF-8 (`std:utf8`'s strict
+default) and duplicate-key policy are centralizable there, where the per-type decoders above
+the tree only re-decide absence and excess.
 
-**Honest summary.** Cheap to start, unbounded to live with — the per-type tax is paid
-forever, by hand, per format. Its real value is (i) config files *now*, and (ii) being
+**Honest summary.** ~~Cheap to start, unbounded to live with — the per-type tax is paid
+forever, by hand, per format.~~ **Cheap to start and cheaper to live with than the pull-lexer
+version was: the tree is one parser plus one renderer, and the tax that remains is per-type
+schema code above it.** Its real value is (i) config files *now*, and (ii) being
 the measurement instrument that tells the derive what boilerplate to delete —
-the same role `std:fs` played for `as`.
+the same role `std:fs` played for `as`. What it still cannot do is anything shape-generic:
+`decodeCircle` is written by hand, and that is exactly what Approach 2 removes.
 
 ### Approach 2 — compiler-derived codecs per monomorphized shape (the deriving-Show cousin)
 
@@ -2276,3 +2376,446 @@ constraints ruling (`docs/constraints-design.md`), the template-literal absolute
 the `toString` rename (`DECISIONS.md`, `std/fmt.vl`'s header), all external format and
 engine-capability claims (spec knowledge as of writing; the wasmtime/Wizer capability
 statements should be re-verified before anything is scheduled against them).
+
+### Round 3 — 2026-09-01 (the POSITION matrix)
+
+Why this round exists: §Approach 1's premise (fact 5's "the tree's defining feature IS the
+self-reference, so the pull-lexer plan is unchanged") was refuted, and the two instruments that
+should have caught it disagreed because **each held POSITION fixed** — the 28-cell grid at
+module `const`, `scripts/capability-probes/` at *parameter* (`docs/internals/serde-critique-consistency.md`
+§1/§2). This round adds POSITION as the axis. Seed self-refreshed from this worktree's
+`compiler/` before the first probe; every invocation is
+`VL_STD=$PWD/std scripts/vl-host/target/release/vl {check,run} <probe> --compiler build/vl-compiler.wasm`.
+
+**Six arms × ten delivery positions = 60 cells. RUNS 51 · check-refuse 6 · emit-refuse 2 ·
+check-clean invalid wasm 1 · trap 0.** Every cell prints a value proving the arm round-tripped
+(`null`, `true`, `f64:2.5`, `str:x`, `arr:2.5`, `map:k=2.5`), and a cell that compiled but
+printed something else would have graded `WRONG-OUTPUT` (none did).
+
+| position | null | boolean | f64 | string | `Json[]` | `{[string]: Json}` |
+| --- | --- | --- | --- | --- | --- | --- |
+| module `const` | RUNS | RUNS | RUNS | RUNS | RUNS | RUNS |
+| parameter (`is`-narrowed) | RUNS | RUNS | RUNS | RUNS | RUNS | RUNS |
+| return, annotated | RUNS | RUNS | RUNS | RUNS | RUNS | RUNS |
+| return, INFERRED | check | check | check | check | check | check |
+| struct field | RUNS | RUNS | RUNS | RUNS | RUNS | RUNS |
+| array element | RUNS | RUNS | RUNS | RUNS | RUNS | RUNS |
+| map value read (`m[k]`) | RUNS | RUNS | RUNS | RUNS | RUNS | RUNS |
+| closure capture | RUNS | RUNS | RUNS | RUNS | RUNS | RUNS |
+| array literal → `Json`, bare | RUNS | RUNS | RUNS | **SILENT** | emit | emit |
+| array literal → `Json[]`, annotated | RUNS | RUNS | RUNS | RUNS | RUNS | RUNS |
+
+Two conventions the matrix depends on, both measured rather than assumed. **The delivered value
+is hoisted into a local before the `is` ladder wherever the read expression is not an
+identifier** (field, element, map read) — because a narrowing applied *to* a field or element
+read does not reach the emitter at all (residue (g) below), which is a separate defect from
+delivery and would otherwise have coloured three whole rows. And **the map-read `null` cell
+proves a stored `null` is not a miss** (`m.has("q")` → `true`; a miss → `false`).
+
+Every cell is this template, one arm and one position substituted:
+
+```vl
+// cells2/field__map.vl — the struct-FIELD position at the self-referential MAP arm.
+import { toString } from "std:fmt"
+type Json = null | boolean | f64 | string | Json[] | { [string]: Json }
+const mv: { [string]: Json } = Map()
+mv["k"] = 2.5
+type Node = { v: Json }
+const n: Node = { v: mv }
+const q = n.v                                  // hoist: the narrowing needs an identifier
+if q is { [string]: Json } {
+  for k in q.keys() {
+    const c = q[k]
+    if c is f64 { print("map:" + k + "=" + toString(c)) } else { print("NO-c") }
+  }
+} else { print("NO") }
+// RUNS → map:k=2.5
+```
+
+```vl
+// cells2/mapread__null.vl — the one cell whose proof needs a second question.
+import { toString } from "std:fmt"
+type Json = null | boolean | f64 | string | Json[] | { [string]: Json }
+const m: { [string]: Json } = Map()
+m["q"] = null
+const q = m["q"]
+if q == null { if m.has("q") { print("null") } else { print("MISS") } } else { print("NO") }
+// RUNS → null   (i.e. the stored null, not the miss sentinel)
+```
+
+**The `std:json`-shaped round trip, whole.** Parses and renders
+`{"a":[1,null,"x"],"b":true,"c":{"deep":2.5}}` byte-identically, plus escapes, `[]`, `{}`,
+`null`, and `[1e3,-2.5,0]` → `[1000,-2.5,0]`. `vl check` rc 0 (ten hints/infos, no errors);
+`vl run` rc 0.
+
+```vl
+// The smallest real `std:json`-shaped program the value tree admits on the
+// 2026-09-01 seed: parse a JSON document into `Json`, render it back.
+import { toString, parseF64 } from "std:fmt"
+
+type Json = null | boolean | f64 | string | Json[] | { [string]: Json }
+type Lex = { src: string, pos: i32 }
+
+// ---------------------------------------------------------------- render
+function esc(s: string): string {
+  let buf: i32[] = []
+  let i = 0
+  while i < s.length {
+    const ch = s[i]
+    if ch == '"' { buf.push('\\') buf.push('"') }
+    else if ch == '\\' { buf.push('\\') buf.push('\\') }
+    else if ch == '\n' { buf.push('\\') buf.push('n') }
+    else { buf.push(ch) }
+    i = i + 1
+  }
+  fromCodePoints(buf)
+}
+
+function render(v: Json): string {
+  if v == null { return "null" }
+  if v is boolean {
+    if v { return "true" }
+    return "false"
+  }
+  if v is f64 { return toString(v) }
+  if v is string { return "\"" + esc(v) + "\"" }
+  if v is Json[] {
+    let out = "["
+    let first = true
+    for e in v {
+      if !first { out = out + "," }
+      out = out + render(e)
+      first = false
+    }
+    return out + "]"
+  }
+  if v is { [string]: Json } {
+    let out = "{"
+    let first = true
+    for k in v.keys() {
+      if !first { out = out + "," }
+      out = out + "\"" + esc(k) + "\":"
+      const c = v[k]                       // D1009: `render(v[k])` is a check reject
+      if c == null { out = out + "null" } else { out = out + render(c) }
+      first = false
+    }
+    return out + "}"
+  }
+  "null"
+}
+
+// ---------------------------------------------------------------- parse
+function at(lx: Lex): i32 {
+  if lx.pos < lx.src.length { lx.src[lx.pos] } else { 0 }
+}
+
+function ws(lx: Lex) {
+  while at(lx) == ' ' || at(lx) == '\n' || at(lx) == '\t' || at(lx) == '\r' {
+    lx.pos = lx.pos + 1
+  }
+}
+
+function eat(lx: Lex, ch: i32): boolean {
+  ws(lx)
+  if at(lx) == ch {
+    lx.pos = lx.pos + 1
+    return true
+  }
+  false
+}
+
+function isNum(c: i32): boolean {
+  (c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E'
+}
+
+function pstring(lx: Lex): string {   // the opening quote is already eaten
+  let buf: i32[] = []
+  while lx.pos < lx.src.length {
+    const ch = lx.src[lx.pos]
+    if ch == '"' {
+      lx.pos = lx.pos + 1
+      return fromCodePoints(buf)
+    }
+    if ch == '\\' {
+      lx.pos = lx.pos + 1
+      const e = lx.src[lx.pos]
+      if e == 'n' { buf.push('\n') }
+      else if e == '"' { buf.push('"') }
+      else if e == '\\' { buf.push('\\') }
+      else { buf.push(e) }
+      lx.pos = lx.pos + 1
+    } else {
+      buf.push(ch)
+      lx.pos = lx.pos + 1
+    }
+  }
+  fromCodePoints(buf)
+}
+
+function pvalue(lx: Lex): Json {       // the annotation is load-bearing: residue (a)
+  ws(lx)
+  const ch = at(lx)
+  if ch == '{' {
+    lx.pos = lx.pos + 1
+    const m: { [string]: Json } = Map()
+    ws(lx)
+    if at(lx) == '}' {
+      lx.pos = lx.pos + 1
+      return m
+    }
+    let more = true
+    while more {
+      if eat(lx, '"') {
+        const k = pstring(lx)
+        if eat(lx, ':') { m[k] = pvalue(lx) }
+      }
+      more = eat(lx, ',')
+    }
+    eat(lx, '}')
+    return m
+  }
+  if ch == '[' {
+    lx.pos = lx.pos + 1
+    let a: Json[] = []                 // the annotation is load-bearing: residue (b)
+    ws(lx)
+    if at(lx) == ']' {
+      lx.pos = lx.pos + 1
+      return a
+    }
+    let more = true
+    while more {
+      a.push(pvalue(lx))
+      more = eat(lx, ',')
+    }
+    eat(lx, ']')
+    return a
+  }
+  if ch == '"' {
+    lx.pos = lx.pos + 1
+    return pstring(lx)
+  }
+  if ch == 't' { lx.pos = lx.pos + 4
+    return true }
+  if ch == 'f' { lx.pos = lx.pos + 5
+    return false }
+  if ch == 'n' { lx.pos = lx.pos + 4
+    return null }
+  const s = lx.pos
+  while lx.pos < lx.src.length && isNum(at(lx)) { lx.pos = lx.pos + 1 }
+  const n = parseF64(lx.src.slice(s, lx.pos))
+  if n == null { return null }
+  n
+}
+
+function parse(src: string): Json {
+  const lx: Lex = { src: src, pos: 0 }
+  pvalue(lx)
+}
+
+// ---------------------------------------------------------------- round trip
+const doc = "{\"a\":[1,null,\"x\"],\"b\":true,\"c\":{\"deep\":2.5}}"
+print(render(parse(doc)))
+print(render(parse("{\"esc\":\"q\\\"b\\\\c\\nd\"}")))
+print(render(parse("[]")))
+print(render(parse("{}")))
+print(render(parse("null")))
+print(render(parse("[1e3,-2.5,0]")))
+// {"a":[1,null,"x"],"b":true,"c":{"deep":2.5}}
+// {"esc":"q\"b\\c\nd"}
+// []
+// {}
+// null
+// [1000,-2.5,0]
+```
+
+On a generated 1,049-byte document (24 members, each a 4-element array holding an f64, a
+`null`, a string and a nested object) the same program is **semantically equal to the input,
+preserves key order, and is idempotent** (`render(parse(a)) == a` → `true`); its output is
+1,001 bytes because VL's shortest-round-trip `f64` writes `0` where Python writes `0.0`.
+Timing, min-of-7 wall on a loaded box: `vl run` of the module at 1 / 100 / 1000 round trips
+= **0.178 / 0.208 / 0.424 s**, so the marginal cost of one 1 KB parse+render is **~0.24 ms**;
+`print(1)` is 0.015 s and `vl build` of the module is **0.067 s** → a 22,729-byte wasm.
+
+**Four spellings the round-trip program had to avoid — each is the same program with one
+substitution, so each is a paste.** (Applied to the whole program above.)
+
+```vl
+// w1 — D1009. Replace the map arm's bind-and-narrow with the direct call:
+//   out = out + render(v[k])
+// → check reject: argument 1: expected Json, got Json | null
+
+// w2 — index the narrowed array arm and hand it STRAIGHT to a call: RUNS.
+//   while i < v.length { out = out + render(v[i]) … }
+// (residue (e) only fires when the index result is BOUND and re-narrowed — see below)
+
+// w3 — drop `pvalue`'s return annotation (`function pvalue(lx: Lex) {`):
+// → check reject: push: cannot add {[string]: Json} | Json[] | string | boolean | f64 | null
+//                       to Json[]
+
+// w4 — build the array arm with a bare literal (`let a = []`):
+// → check rc 0, then Invalid input WebAssembly code at offset 19912:
+//   type mismatch: expected i32, found (ref $type)      ← check-clean invalid wasm
+```
+
+**The residues, minimised.** Each is the smallest program that still shows it; the control that
+runs is beside it. `vl check` returns 0 for every one of these.
+
+```vl
+// (a) INFERRED union return — an existing counted capability literal.
+import { toString } from "std:fmt"
+type Json = null | boolean | f64 | string | Json[] | { [string]: Json }
+function g() {
+  const t: Json = 2.5
+  return t
+}
+const v = g()
+if v is f64 { print("f64:" + toString(v)) } else { print("NO") }
+// → check reject: 'g' infers the union return type Json — type-valid, but an inferred
+//   return of this shape is not yet supported by codegen; annotate the return type
+// CONTROL: `function g(): Json { 2.5 }` → RUNS, prints f64:2.5.  (All six arms refuse alike.)
+```
+
+```vl
+// (b) a bare array literal of STRINGS at a recursive-union destination — SILENT.
+type K = string | K[]
+const c: K = ["x"]
+if c is K[] { for e in c { if e is string { print(e) } } }
+// → check rc 0; run: Invalid input WebAssembly code at offset 350:
+//   type mismatch: expected (ref $type), found (ref $type)
+// CONTROLS: `const a: K[] = ["x"]` then `const c: K = a` → RUNS, prints x.
+//           `if c is K[] { print(c.length) }` on the BARE literal → RUNS, prints 1,
+//           so the array exists and only the ELEMENT's rep is wrong.
+//           f64, boolean and null elements all RUN on the bare literal.
+```
+
+```vl
+// (c) a bare NESTED array literal at a `Json` destination — loud, at three boundaries.
+type Json = null | boolean | f64 | string | Json[] | { [string]: Json }
+const c: Json = [[2.5]]
+print(1)
+// → check rc 0; emitProgram: array value does not match any array member of the union
+//   (leaf-scalar widening across a nested array is unsupported)
+// Same message at the ARGUMENT boundary (`f([[2.5]])` against `f(v: Json)`) and at the
+// MAP-WRITE boundary (`m["a"] = [[2.5]]`).
+// CONTROL: `const a: Json[] = [[2.5]]` then `const c: Json = a` → RUNS.
+```
+
+```vl
+// (d) a bare array literal holding a MAP at a `Json` destination.
+type Json = null | boolean | f64 | string | Json[] | { [string]: Json }
+const mv: { [string]: Json } = Map()
+mv["k"] = 2.5
+const c: Json = [mv]
+print(1)
+// → check rc 0; emitProgram: a union arm that is an array-of-map is not yet supported
+//   — use a named element type
+// CONTROL: `const a: Json[] = [mv]` then `const c: Json = a` → RUNS.
+```
+
+```vl
+// (e) indexing a narrowed self-referential ARRAY arm INTO A LOCAL, when the union also
+//     carries a self-referential MAP arm.
+type K = f64 | K[] | { [string]: K }
+const v: K = [2.5]
+if v is K[] {
+  const e = v[0]
+  if e is f64 { print(e) }
+}
+// → check rc 0; emitProgram: map op receiver is not a map
+// ABLATION — each of these RUNS and prints 2.5 (or 1):
+//   `for e in v { if e is f64 { print(e) } }`            (iteration, not indexing)
+//   `print(v.length)`                                    (the other array op)
+//   `g(v[0])` against `function g(x: K)`                 (index result → argument, not a local)
+//   `type K = f64 | K[]`                                 (drop the map arm)
+//   `type K = f64 | K[] | { [string]: f64 }`             (make the map arm non-recursive)
+// Fires identically at const, parameter and function-local positions.
+```
+
+```vl
+// (f) `print` of a local RE-BOUND from an `is`-narrowed REF arm — SILENT.
+//     Sibling of the closed D968, which fixed `print` of the narrowed RECEIVER.
+type K = f64 | string
+const v: K = "x"
+if v is string {
+  const a = v
+  print(a)
+}
+// → check rc 0; run: Invalid input WebAssembly code at offset 312:
+//   type mismatch: expected i32, found (ref $type)
+// ABLATION — each of these RUNS:
+//   `print(v)` (no rebind) · `const a: string = v` (annotated) · `print(a + "y")` ·
+//   `s(a)` against `function s(t: string)` · `type K = f64 | i32` (scalar arm) ·
+//   `if v != null` over `type K = null | string` (a != null narrow)
+// `let a = v` behaves identically to `const`. Over the full six-arm `Json` the string arm
+// is SILENT and the f64 and boolean arms RUN; over `type K = f64 | K[]` the recursive
+// array arm is SILENT too (`print(a.length)`), while the recursive MAP arm RUNS
+// (`print(g.size)`).
+```
+
+```vl
+// (g) an `is` narrowing applied to a struct-FIELD or ARRAY-ELEMENT receiver never
+//     reaches the emitter. FOUR messages, one mechanism.
+type K = f64 | K[]
+type N = { v: K }
+const n: N = { v: [2.5] }
+if n.v is K[] { for e in n.v { if e is f64 { print(e) } } }
+// → check rc 0; emitProgram: unsupported for-in iterable
+//
+// The other three arms of the same mechanism:
+//   `type K = f64 | f64[]`, same shape          → emitProgram: narrowed union field atom
+//                                                  has no value box
+//   `if n.v is K[] { const e = n.v[0] … }`      → emitProgram: index access but array type
+//                                                  not collected
+//   the MAP arm, `for k in n.v.keys()`          → emitProgram: callee is not a function name
+//   an ARRAY-ELEMENT receiver, `if xs[0] is K[] { for e in xs[0] … }`
+//                                              → emitProgram: unsupported for-in iterable
+//
+// WORKAROUND, and it is the whole fix at the call site — hoist, then narrow:
+//   const q = n.v
+//   if q is K[] { for e in q { if e is f64 { print(e) } } }        → RUNS, prints 2.5
+// CONTROL: the same field with NO union (`type N = { v: f64[] }`) → RUNS at both spellings,
+// so it is the narrowing that is lost, not the field read.
+```
+
+**D1010, re-run verbatim on the six-arm tree** — `const c: Json = [1.0, null, "x"]` →
+`cannot assign (f64 | string | null)[] to 'c' of type Json`; `const arr: Json[] = [1.0, null, "x"]`
+runs. Consistent with the row as filed.
+
+**Combinators over the value tree run** — the cross-language critique's F10 steelman, which is
+what makes "one hand-written line per field, per type, forever" an artifact of the old sketch
+rather than a property of the language:
+
+```vl
+import { toString } from "std:fmt"
+type Json = null | boolean | f64 | string | Json[] | { [string]: Json }
+type Circle = { r: f64, tag: string }
+
+function field(v: Json, k: string): Json {
+  if v is { [string]: Json } {
+    const c = v[k]
+    if c == null { return null }
+    return c
+  }
+  null
+}
+function num(v: Json): f64 { if v is f64 { return v } 0.0 }
+function str(v: Json): string { if v is string { return v } "" }
+function decodeCircle(v: Json): Circle {
+  { r: num(field(v, "r")), tag: str(field(v, "tag")) }
+}
+
+const m: { [string]: Json } = Map()
+m["r"] = 2.5
+m["tag"] = "c1"
+const c = decodeCircle(m)
+print(toString(c.r) + "/" + c.tag)              // 2.5/c1
+
+const dec: (Json) => f64 = num                  // a first-class decoder value: RUNS
+print(toString(dec(2.5)))                       // 2.5
+// The ALIAS spelling is what is refused, and only it:
+//   type Dec<T> = (Json) => T
+//   → unknown type 'T' within '(Json)=>T' in union 'Dec<T>'
+```
+
+Not re-run in this round and inherited unchanged from round 2: the `f32`-widening and
+`std:base64` lines in §Approach 1's fidelity paragraph, and everything outside §Approach 1.
