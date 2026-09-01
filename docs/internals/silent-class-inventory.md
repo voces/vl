@@ -24179,9 +24179,34 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   its own row once this one is closed; do not fold them together on the strength of both
   involving `J[]`.
 
+### D988 — ONE hole-param function called with two different receiver shapes resolves per-FUNCTION, not per-call
+
+**loads then traps · clause 1 · the residue [D987](#d987)'s fix does not reach**
+
+    const s = { f: () => "ok" }
+    const b = { f: () => 7 }
+    function hole(z) {
+      print(z.f())
+    }
+    hole(s)
+    hole(b)
+
+* D987 disambiguated a hole param's receiver by resolving the CALL-SITE ARGUMENT — but it
+  takes the FIRST call site it finds for that function. With one function called twice at
+  different shapes, both calls get the first argument's lambda, so the second traps.
+
+* **A STRICT IMPROVEMENT ON WHAT WAS THERE, not a new defect.** Before D976 this module did
+  not build at all; between D976 and D987 it took whichever literal was DECLARED first; now it
+  takes whichever ARGUMENT arrives first. One shape per function runs in every order.
+
+* The fix is per-CALL resolution, which means either monomorphising the hole function per
+  receiver shape or keying the field lookup on the call node rather than the function. Worth
+  checking first whether the monomorphiser already makes distinct instances here and the
+  emitter is simply reading the template.
+
 ### D987 — a module carrying BOTH a string-returning and a non-string closure field of the same layout
 
-**loads then traps · clause 1 · split out of [D976](#d976); it was check-clean invalid wasm before that fix and is broken on both sides of it**
+**closed · was loads-then-traps, and check-clean invalid wasm before [D976](#d976) · clause 1 · `tests/cases/closures/closure-field-twin-layout-string-first.vl` and its `-numeric-first` twin**
 
     const s = { f: () => "ok" }
     const b = { f: () => 7 }
