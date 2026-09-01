@@ -12,6 +12,8 @@ import {
   DocumentHighlight,
   DocumentHighlightKind,
   DocumentSymbol,
+  FoldingRange,
+  FoldingRangeKind,
   Hover,
   InlayHint,
   InlayHintKind,
@@ -91,6 +93,7 @@ import {
 } from "./typeFeatures.ts";
 import { STD_SOURCES } from "../../std/embedded.ts";
 import { invalidNewNameReason, planRenameAt, renameEdits } from "./rename.ts";
+import { foldingRanges, type VlFoldingKind } from "./folding.ts";
 
 // The language id the extension registers (`package.json` → contributes.languages,
 // id `vital`, scope `source.vital`). Used as the markdown fence info string so
@@ -602,6 +605,29 @@ connection.onDocumentSymbol(
     });
   },
 );
+
+// Folding ranges (D9.9): bracketed blocks, multi-line paren/bracket groups,
+// `//` comment runs and the leading import block — computed by `foldingRanges`
+// over the shared host tokenizer, so a brace inside a string or a comment never
+// opens a region.
+//
+// THE ONE HANDLER THAT WORKS WITH NO SEED. Folding is lexical end to end (the
+// survey's "syntactic: brace scan + comment spans"), so it neither reads
+// `wasmChecker` nor awaits anything — an editor with a missing or broken seed
+// still folds. Every other handler above returns null in that state.
+const foldingKindMap: Record<VlFoldingKind, FoldingRangeKind> = {
+  comment: FoldingRangeKind.Comment,
+  imports: FoldingRangeKind.Imports,
+};
+connection.onFoldingRanges((params): FoldingRange[] | null => {
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc) return null;
+  return foldingRanges(doc.getText()).map((r) => {
+    const range: FoldingRange = { startLine: r.startLine, endLine: r.endLine };
+    if (r.kind !== undefined) range.kind = foldingKindMap[r.kind];
+    return range;
+  });
+});
 
 // ---- rename symbol (+prepare) (D9.7) ----------------------------------------
 //
@@ -1462,6 +1488,9 @@ connection.onInitialize((params) => {
       referencesProvider: true,
       documentHighlightProvider: true,
       documentSymbolProvider: true,
+      // Folding ranges (D9.9) — purely lexical, so it is served even with no
+      // compiler seed.
+      foldingRangeProvider: true,
       documentFormattingProvider: true,
       codeActionProvider: {
         codeActionKinds: [

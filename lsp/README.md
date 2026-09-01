@@ -36,6 +36,17 @@ self-hosted compiler wasm seed — selectable with the `vital.checker` setting
   itself discovers by *instantiating* the module, which an editor must not do
   per keystroke. That module is pure (no `vscode`) and unit-tested by
   [`tests/lsp_test_discovery_test.ts`](../tests/lsp_test_discovery_test.ts).
+- **Folding** ([`src/folding.ts`](./src/folding.ts)) and test discovery share ONE host-side
+  tokenizer, [`src/vlLex.ts`](./src/vlLex.ts) — VL's real lexical grammar (`//` and `///`
+  line comments, no block comment; `"…"`/`'…'` with the lexer's escape set). Folding is
+  therefore lexical end to end and reads no seed: it is the only server capability that
+  still works when the compiler wasm fails to load.
+- **Editor ergonomics that are not LSP at all** live in
+  [`language-configuration.json`](./language-configuration.json) — brackets, auto-closing
+  and surrounding pairs, `indentationRules`, and the `onEnterRules` that continue a `//` or
+  `///` comment block (and stop on an empty one). There is deliberately no block-comment
+  rule: VL's lexer has no block comment, so the pair would auto-close into a syntax error.
+  Both are asserted by [`tests/lsp_folding_test.ts`](../tests/lsp_folding_test.ts).
 
 ## Build & install (run from the repo root)
 
