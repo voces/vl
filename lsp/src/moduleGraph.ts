@@ -106,6 +106,53 @@ async (key: string): Promise<string | undefined> => {
   return STD_SOURCES[key];
 };
 
+// ---- vl-std: URIs for embedded std sources -----------------------------------
+//
+// A `std:` module key names no filesystem path, so a cross-file location into a
+// std module (go-to-definition on a std export) can't be a `file://` URI — the
+// old `pathToUri("std:test")` produced a bogus `file://std%3Atest` the editor
+// errored on. Instead, std locations use a dedicated `vl-std:` scheme whose
+// content the EXTENSION serves from the same generated embedded map the checker
+// reads (`std/embedded.ts`, via a TextDocumentContentProvider in
+// `extension.ts`): a read-only tab with the real std source, at ranges that
+// can't drift because both bundles are generated from the same tree.
+
+/** URI scheme for embedded std sources (`extension.ts` registers the provider). */
+export const VL_STD_SCHEME = "vl-std";
+
+/** `std:NAME` module key → `vl-std:/NAME.vl` (the content provider's URI form). */
+export const stdKeyToUri = (key: string): string =>
+  `${VL_STD_SCHEME}:/${key.slice("std:".length)}.vl`;
+
+/** `vl-std:` URI path (`/NAME.vl`) → the `std:NAME` embedded-map key. */
+export const stdUriPathToKey = (path: string): string =>
+  `std:${path.replace(/^\//, "").replace(/\.vl$/, "")}`;
+
+/**
+ * The URI a cross-file location at module `key` should open.
+ *
+ * A non-`std:` key IS a filesystem path → `file://`. A `std:` key's source came
+ * from {@link withStd}'s read precedence, and the URI mirrors it exactly so the
+ * document a jump opens is byte-for-byte the source the checker resolved the
+ * position against: the workspace's own `std/NAME.vl` when it exists
+ * (dogfooding in the compiler repo — the real, editable file), else a
+ * `vl-std:` URI served read-only from the embedded map. `exists` is injectable
+ * so tests can avoid the real filesystem.
+ */
+export const crossFileUriOf = (
+  key: string,
+  getStdDir?: () => string | undefined,
+  exists: (path: string) => boolean = defaultExists,
+): string => {
+  if (!key.startsWith("std:")) return pathToUri(key);
+  const stdDir = getStdDir?.();
+  if (stdDir !== undefined) {
+    const workspacePath = `${stdDir}/${key.slice("std:".length)}.vl`;
+    if (exists(workspacePath)) return pathToUri(workspacePath);
+  }
+  return stdKeyToUri(key);
+};
+
 // ---- workspace ModuleReader -------------------------------------------------
 
 /**
@@ -320,6 +367,19 @@ const defaultIsDir = (path: string): boolean => {
   try {
     const fs = loadFsExt();
     return fs ? fs.statSync(path).isDirectory() : false;
+  } catch {
+    return false;
+  }
+};
+
+// Does `path` exist on disk? (`crossFileUriOf`'s default `exists` — declared
+// after `loadFsExt`, referenced lazily via the default-parameter expression.)
+const defaultExists = (path: string): boolean => {
+  try {
+    const fs = loadFsExt();
+    if (!fs) return false;
+    fs.statSync(path);
+    return true;
   } catch {
     return false;
   }

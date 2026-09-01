@@ -21,6 +21,9 @@ import {
   TransportKind,
 } from "vscode-languageclient/node";
 
+import { STD_SOURCES } from "../../std/embedded.ts";
+import { stdUriPathToKey, VL_STD_SCHEME } from "./moduleGraph.ts";
+
 let defaultClient: LanguageClient;
 const clients: Map<string, LanguageClient> = new Map();
 
@@ -207,6 +210,21 @@ export const activate = (context: ExtensionContext) => {
   const outputChannel: OutputChannel = Window.createOutputChannel("vital");
 
   registerRunCommand(context);
+
+  // Serve `vl-std:/NAME.vl` documents from the generated embedded std map, so a
+  // cross-file location into a `std:` module (go-to-definition / peek on a std
+  // export) opens a read-only tab holding the real std source. The server emits
+  // these URIs (`crossFileUriOf`) whenever the workspace has no `std/NAME.vl`
+  // of its own; extension and server are bundled from the same tree, so this
+  // map is byte-for-byte the source the checker resolved the range against.
+  // The `.vl` suffix keys the tab to the `vital` language for highlighting.
+  context.subscriptions.push(
+    Workspace.registerTextDocumentContentProvider(VL_STD_SCHEME, {
+      provideTextDocumentContent: (uri: Uri): string =>
+        STD_SOURCES[stdUriPathToKey(uri.path)] ??
+          `// ${uri.path.slice(1)} is not an embedded std module in this build.`,
+    }),
+  );
 
   const didOpenTextDocument = (document: TextDocument) => {
     // We are only interested in language mode text

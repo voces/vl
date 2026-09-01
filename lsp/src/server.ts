@@ -30,10 +30,10 @@ import {
   buildUnusedExportUseMap,
   crossFileReferences,
   type CrossFileSource,
+  crossFileUriOf,
   detectProjectRoot,
   enumerateWorkspaceFiles,
   makeWorkspaceReader,
-  pathToUri,
   type UnusedExportUseMap,
   unusedExportHints,
   uriToPath,
@@ -122,13 +122,16 @@ let workspaceFolder: string | null;
 let wasmChecker: WasmChecker | undefined;
 
 // Shape a native `WasmImportedSource` (1-based line, 0-based col, exported-name
-// length) onto the host's `CrossFileSource` (0-based LSP range + `file://` URI),
-// the form go-to-definition and the doc-xref resolver consume.
+// length) onto the host's `CrossFileSource` (0-based LSP range + URI), the form
+// go-to-definition and the doc-xref resolver consume. The URI is `file://` for
+// a path key; a `std:` key maps to the workspace's own `std/` file when one
+// exists, else a `vl-std:` URI the extension serves from the embedded map
+// (`crossFileUriOf` — mirrors `withStd`'s read precedence).
 const toCrossFileSource = (s: WasmImportedSource): CrossFileSource => {
   const line = s.line > 0 ? s.line - 1 : 0;
   return {
     key: s.key,
-    uri: pathToUri(s.key),
+    uri: crossFileUriOf(s.key, getStdDir),
     range: {
       start: { line, character: s.col },
       end: { line, character: s.col + s.length },
