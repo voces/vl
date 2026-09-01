@@ -23843,9 +23843,18 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
      remains**, and dropping the gate alone is a REGRESSION — a loud reject becomes silent
      invalid wasm, which is exactly what that paragraph's `relay` witness warns about.
 
-  So: the gate is over-broad, the row is the first of at least three sites, and the honest
-  order is to find the third BEFORE touching the gate — because the gate is the only thing
-  currently keeping this shape loud.
+  7. **AND `retUNm` IS RULED OUT EVEN WITH THE ROW RECORDED.** With the param gate dropped
+     (so the row exists and the boxes mint) AND `retUNm` forced to a literal `"i32|string"`,
+     the disassembly is UNCHANGED: `(result (ref $box))` over `return (i32.const 1)` and
+     `return (global.get $str)`. The returns never reach the union coercion at all, so the
+     third site is not in `emitReturnValue`'s union arm — it is wherever these particular
+     returns ARE lowered, which is not the path `retUNm` gates.
+
+  So, after six measurements: the gate is over-broad, the row is necessary, `retUNm` is not
+  the lever, and the third site is somewhere neither the signature nor the return-coercion
+  layer. The honest order is to find it BEFORE touching the gate — the gate is the only thing
+  currently keeping this shape loud, and removing it first trades a loud reject for silent
+  invalid wasm.
 
 ---
 
