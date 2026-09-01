@@ -57,6 +57,22 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   (`TPL_RENDER_EXPORT` in `driver.vl`) — it is already isolated.
 - **`else` requires braces** — DONE #2165; recorded here only because the ruling predates
   the entry above and the DECISIONS entry is the durable home.
+- **Driver lossless-recovery flag — STAGE 1 DONE #TBD** (ruled 2026-09-01, shipped the
+  same day). A file whose EVERY parse diagnostic is a lossless recovery's is typechecked
+  and linted anyway, so "missing brace" and "type error four lines down" are reported
+  together — the LSP stops blanking all type feedback the moment a body is half-written.
+  Sparse index-keyed column beside `P.diags` (`dgLossless`, `compiler/ast.vl`), set by the
+  ONE site that provably preserves the program (`parseBracedBody`'s unbraced-body arm);
+  `vcParseBlocked` in `driver.vl` gates six pipeline entry points on it. Emit still never
+  proceeds past a parse diagnostic (a recovered program checks, it does not build), and
+  `formatSrc` keeps the ANY reading because `fmt -w` would otherwise re-spell the mistake.
+  **STAGE 2 is the remainder and needs no further ruling**: convert the lossy skip sites
+  one at a time — `expectClose`'s skip-to-closer first, then the `then`-removal arm, which
+  is already single-statement — each conversion making a recovery faithful and then
+  deleting its pin from `tests/vl_lossless_recovery_test.ts`. The five phantom cases that
+  suite pins are the standing regression floor; widening the gate without making the
+  recovery faithful is exactly what they exist to stop. DECISIONS.md §"A recovered parse
+  IS typechecked" is the durable home.
 - **Colored `print`** — ruled in principle 2026-09-01 with one hard constraint (ANSI must
   never leak into pipes/files/copies): Node's split — bare strings always raw, rendered
   values colored, escapes emitted only by the TTY-detected sink, `NO_COLOR`/`--color`
@@ -141,30 +157,6 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   "low prio I guess"): keep parked; an emitter flag instrumenting USER programs (never
   the compiler) logging `(site, value)` pairs, extension renders decorations after a
   run. Revisit when the test-debugging story matters more than new surface.
-- **Driver lossless-recovery — expanded brief (owner asked for more detail,
-  2026-09-01).** TODAY: any parse diagnostic bails before typecheck, so one
-  temporarily-unbalanced line kills ALL type feedback for the file while typing (the
-  LSP compiles per keystroke — this is the real motivation). MEASURED HAZARD of just
-  lifting the bail: five phantom errors from lossy recoveries (`f(1 2)` parses to a
-  hole-free `f(1)` → "wrong number of arguments" about a program the user never wrote;
-  a mis-parsed overload → "redeclared =="). Fiction, confidently stated — recorded in
-  DECISIONS.md with the numbers. STAGE 1 (the go/no-go): a per-diagnostic LOSSLESS flag
-  set only by recovery sites that provably preserve the program — the #2115/#2165
-  single-statement-arm recoveries qualify by construction (the arm IS the statement);
-  driver rule: typecheck proceeds iff EVERY parse diagnostic in the file is
-  lossless-flagged. Zero phantom risk by construction (fiction only came from lossy
-  sites, which still bail). Cost: a flag column, one driver condition, fixtures.
-  Coverage: the flagged shapes are the common mid-typing BRACE states; an unclosed
-  paren mid-expression stays bailed until stage 2. STAGE 2 (follow-the-measurement, no
-  ruling now): convert lossy sites one at a time, eventually via error NODES with
-  poison semantics (the rustc/clang/Roslyn/tsc mechanism — the poison type silences
-  derived complaints); the five phantom cases become the standing regression suite,
-  forbidden to typecheck until their sites convert. ALTERNATIVE considered and NOT
-  recommended: serve type diagnostics from the last good parse (positions drift as you
-  type; new errors masked). Every modern reference compiler reports parse+type together
-  (Roslyn full-fidelity trees, tsc's checker on any tree, rustc/clang error nodes, Go
-  per-statement recovery); VL's first-error bail is the batch-era outlier. Recommended:
-  go on stage 1. Blocked on: that word.
 - **`vl compile` → standalone executable** — RULED low priority (owner, 2026-09-01):
   parked from the CLI overhaul (#2080); no design written, none owed until revisited.
 - ~~D971~~ — RESOLVED without a ruling, hours after this ledger was written (the

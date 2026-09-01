@@ -274,9 +274,11 @@ Deno.test({
 
 // The recovered arm is exactly ONE statement — never a scan — so the cursor
 // lands back on the statement boundary and later, independent errors still
-// report from their own positions. (Typecheck-tier errors after a parse error
-// stay suppressed: `checkSrc` in compiler/driver.vl returns at
-// `P.diags.length > 0`, a pre-existing gate this change does not touch.)
+// report from their own positions. (The `for x 0 to 3` mis-parse below is a
+// LOSSY recovery, so this file still bails before the checker — one unflagged
+// parse diagnostic restores the old rule for the whole file. A file whose parse
+// diagnostics are ALL lossless is typechecked anyway; that is stage 1 of the
+// lossless-recovery flag, pinned in tests/vl_lossless_recovery_test.ts.)
 Deno.test({
   name: "unbraced body: later independent errors still surface",
   ignore: !ENABLED,
