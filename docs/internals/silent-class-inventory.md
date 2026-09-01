@@ -23853,12 +23853,35 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   function type when the receiver is a hole. So the checker's answer is not parked on either
   the call node or the callee node.
 
-  **What remains is to find where the checker DID record it.** It type-checks the program, so
-  `x.f()` is known to be a `string` somewhere — the field's type reached through the hole's
-  resolved binding, not through either node's own `nodeTyIx` entry. That is the last
-  unexplored place, and it is worth instrumenting the CHECKER (with `tErr`, which surfaces
-  there) rather than guessing another emitter-side reader. Note that D980's neighbouring fix
-  could use `fieldClosureFeOfRecv` only because its fixture ANNOTATES.
+  **THE MISSING INPUT IS NOW PROVEN, WITH A POSITIVE CONTROL: the param node carries no
+  recorded type.** The chain emit needs is `paramStructIndex` -> `paramStructIndexRaw` ->
+  `fieldClosureFeOf`, and it is fed by `synthParamAnnots`, which pins `p.parType` from
+  `recordedParamPinName`. Three facts, each measured by A/B against a rebuilt compiler:
+
+  1. **The pin machinery works.** Forcing `recordedParamPinName` to return the resolvable-but-
+     wrong `"i32"` whenever it answers at all BREAKS a nominal-struct hole param
+     (`struct S {n: i32}` / `function p(x) { print(x.n) }` -> `type error`). That is the
+     positive control the earlier eliminations lacked.
+  2. **It returns `""` for an anonymous shape.** The same poison leaves BOTH shape cells
+     untouched, so no pin is minted for `{s: string}` or `{f: ()=>string}`. The plain-field
+     cell runs by a different route entirely, which is why it looked like evidence of a pin
+     and is not.
+  3. **The renderer is not the blocker.** `tyToEmitName` spells shapes space-free and spells a
+     function type as `()=>ret` (typecheck.vl's `TyFunc` arm), and a return pin already banks
+     exactly that spelling. But `tyToEmitName(nodeTyIxOf(paramNode))` renders **empty** here —
+     added as a fallback, it never fires.
+
+  So the checker resolves the call (`const v: i32 = x.f()` reports *cannot assign string to
+  'v' of type i32*, and a bad field reports the demanded shape `{nope: _}`) and then writes
+  that shape onto no node the emitter reads. **The fix is checker-side: record the resolved
+  demanded shape on the hole param.** Every emitter-side reader tried — nine now — declines for
+  this one reason, and no tenth will do better.
+
+  Field-type sweep, un-annotated receiver throughout: plain `i32` runs, plain `string` runs,
+  closure returning **i32** runs (i32 is the cell DEFAULT, so this passes by luck), closure
+  returning **string** is the defect, and READING the closure field without calling is a
+  separate loud reject. Disassembly of the string cell shows the result local typed `i32`
+  un-annotated against `(ref $3)` annotated.
 
 * **AND D980 IS ITS NEIGHBOUR, NOT ITS TWIN.** The tail-position cell (`x.f()` as a function's
   last expression) traps with or WITHOUT the annotation and is closed separately; this row's
