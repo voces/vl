@@ -28166,12 +28166,26 @@ which costs an agent-task to rediscover:
   can read it before its box is minted and look exactly like a dead one. D950 was reverted for
   that read after it turned fifteen running corpus classes into non-running ones.
 
-* **AND `valueAtomKind(tyNameOf(member))` IS NOT THE SET KEY EITHER.** The natural
-  order-independent test — walk the member set, compare each arm's value-atom ABI code against
-  the narrowed atom's — reports `i64 | string` as having NO i64 arm. Built as
-  `unionHasAtomKind`, it silently killed the LIVE arm: `f(w)` over `const w: i64 | string = 9`
-  runs on master and TRAPS under the candidate. Whatever identifies an arm here, it is not
-  that composition, and a candidate must be graded against a union that DOES hold the atom.
+* **AND A MEMBER-SET WALK IS NOT THE TEST EITHER — two versions, and the second REFUTES the
+  first attempt's diagnosis.** The natural order-independent test walks the member set and
+  compares each arm's value-atom ABI code against the narrowed atom's. Built as a boolean
+  (`unionHasAtomKind`) it silently killed the LIVE arm: `f(w)` over `const w: i64 | string = 9`
+  runs on master and TRAPS under the candidate. That was first filed as "the composition
+  `valueAtomKind(tyNameOf(member))` is wrong". **A second attempt shows that was not the
+  cause**, and the corrected facts are:
+
+  It was rebuilt with THREE states (1 yes / 0 no / **2 don't know**), canonicalising the name
+  through `unionMemberSetOf` first, since `unionArmMemberTys` declines outright on a
+  non-canonical spelling and its `false` had been read as "no such arm" — eliding only on a
+  definite 0. It STILL kills the live arm, and **with a single instance**
+  (`const w: i64 | string = 9`, no second call), so **monomorphization is not the cause**:
+  that was the obvious next hypothesis, since a name-keyed table cannot see a mono clone, and
+  it is ruled out. Meanwhile the DEAD single instance (`i32 | string`) does NOT elide at all —
+  it keeps the loud refusal. So the predicate's two answers are **inverted** relative to what
+  the shapes call for, and that is unexplained. **The next attempt should print what
+  `unionNameOfIdentSid` actually returns inside the arm before writing any predicate over
+  it** — both attempts here assumed it names the binding's full union, and nothing has
+  confirmed that.
 
 * **THE BARE-READ SPELLING IS NOT PART OF THIS ROW.** `if x is i64 { return "L" }` — a dead arm
   that never reads `x` — runs on master. Only a read of the narrowed value refuses, which is
