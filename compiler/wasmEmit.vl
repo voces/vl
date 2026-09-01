@@ -2,6 +2,7 @@ import {
   EqCmpKind,
   binPlusIsListByTy,
   covarRootName,
+  covarValueWriteState,
   eqCoreKindOfTyToken,
   flattenVariantsInto,
   fsArgIsU8List,
@@ -772,6 +773,8 @@ import {
   vtKindOfType,
   widenDstBackSlot,
   widenSrcWrapSlot,
+  widenScalarBackSlot,
+  widenScalarWrapSlot,
   widenTmpSlot,
 } from "./emit_classify"
 import { sidOfNode } from "./symbols"
@@ -1425,6 +1428,16 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32) {
           exprEmittedRefListSlot(valIx, fnIx),
           pendingListSlot,
         )
+      }
+      // THE SCALAR DUAL (D965) — `{ xs: e }` over a `type W = { xs: f64[] }`. The field's
+      // wasm-type CODE is the destination kind: 4 `i32[]`, 25 `f64[]`, 26 `i64[]`,
+      // 27 `f32[]` (`fbFieldType`'s ladder), and every other code declines.
+      if scode == 4 || scode == 25 || scode == 26 || scode == 27 {
+        let sfk: VKind = "list"
+        if scode == 25 { sfk = "f64list" }
+        if scode == 26 { sfk = "i64list" }
+        if scode == 27 { sfk = "f32list" }
+        emitScalarListWidenSite(body, valIx, fnIx, sfk)
       }
       if scode == 15 { pendingStructIdx = savedPSI }
       if scode == 19 {
@@ -6587,6 +6600,17 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
               exprEmittedRefListSlot(elems[i], fnIx),
               nestInnerSlot,
             )
+          }
+          // THE SCALAR DUAL (D965) — `[e]` of an `f64[][]` over an `i32[]` element. The
+          // element's own nest code is the destination kind: 4 `i32[]`, 7 `f64[]`,
+          // 8 `i64[]`, 10 `f32[]` — the same ladder the `elCtx.listKind` seeding above
+          // reads, one column over.
+          if elemNest == 4 || elemNest == 7 || elemNest == 8 || elemNest == 10 {
+            let nse: VKind = "i32"
+            if elemNest == 7 { nse = "f64" }
+            if elemNest == 8 { nse = "i64" }
+            if elemNest == 10 { nse = "f32" }
+            emitScalarListWidenSiteElem(body, elems[i], fnIx, nse)
           }
         }
         pendingVariantIdx = -1
@@ -14731,6 +14755,12 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
           pendingListKind = 0
           pendingListSlot = 0
           pendingMapSlot = -1
+          // THE SCALAR DUAL (D965) at the GLOBAL-ASSIGNMENT boundary — `b = e` where both
+          // names are module globals. A NINTH boundary, and distinct from the global INIT
+          // one: the init copy lives in `emit_sections` because a const global's
+          // initializer is a wasm constexpr, while a re-assignment is ordinary code and
+          // lowers here. `globalCellKind` is the destination cell's own kind.
+          emitScalarListWidenSite(body, a.binRight, fnIx, gaKind)
           return emitUserGlobalSet(gIdx) // 0x24 global.set, or a promoted `local.set`
         }
         return emitFail(
@@ -14889,6 +14919,13 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
         exprEmittedRefListSlot(a.binRight, fnIx),
         exprEmittedRefListSlot(a.binLeft, fnIx),
       )
+      // THE SCALAR DUAL (D965) — `b = e` over a `let b: f64[]`. The destination is an
+      // EXPRESSION here, not an annotation or a cell column, so its element kind comes
+      // from classifying the LHS — the same classifier the source side uses.
+      const asgDE = scalarListElemKind(a.binLeft, fnIx)
+      if asgDE != null {
+        emitScalarListWidenSiteElem(body, a.binRight, fnIx, asgDE)
+      }
       fbLocalSet(idx) // 0x21 local.set
       return 0
     }
@@ -16553,6 +16590,111 @@ function emitRefListWidenTop(_body: i32[], srcSlot: i32, dstSlot: i32) {
   0
 }
 
+// THE SCALAR SIBLING OF `emitRefListWidenTop` (D965). Same loop, a numeric CONVERT where
+// the ref version boxes.
+//
+// THE PAIR SET IS NOT OPEN-ENDED AND IS NOT A "FAMILY": it is exactly the three lossless
+// widenings VL's scalar assignability admits between two list element types, measured over
+// the full 6x6 element grid (`i32`/`i64`/`f32`/`f64`/`boolean`/`u8`, source and
+// destination). Every OTHER pair in that grid is a DESIGN rejection — `argument 1: expected
+// f32[], got i32[]` — and so is outside clause 2 entirely; only these three reach the
+// element-storage refusal that concedes the program is type-valid:
+//
+//   i32 -> i64   0xac i64.extend_i32_s
+//   i32 -> f64   0xb7 f64.convert_i32_s
+//   f32 -> f64   0xbb f64.promote_f32
+//
+// Returns the convert opcode, or -1 when the pair is not one this copy serves. Callers
+// treat -1 as "decline", never as an error: it is also how a same-kind delivery (the
+// overwhelmingly common case) says there is nothing to do.
+// The scratch slots' `liKinds` column is `MfKind`, whose `u8` names the PACKED backing
+// that `VKind`'s `u8list` names the list of. Every other element kind spells the same.
+function scalarElemMfKind(k: VKind): MfKind {
+  if k == "f64" { return "f64" }
+  if k == "i64" { return "i64" }
+  if k == "f32" { return "f32" }
+  if k == "u8list" { return "u8" }
+  "i32"
+}
+
+export function scalarWidenConvOp(srcKind: VKind, dstKind: VKind): i32 {
+  if srcKind == "i32" {
+    if dstKind == "i64" { return 172 }
+    if dstKind == "f64" { return 183 }
+    return -1
+  }
+  if srcKind == "f32" {
+    if dstKind == "f64" { return 187 }
+  }
+  -1
+}
+
+function emitScalarListWidenTop(_body: i32[], srcKind: VKind, dstKind: VKind) {
+  const op = scalarWidenConvOp(srcKind, dstKind)
+  if op < 0 {
+    return emitFail(
+      "emitProgram: scalar-list widening asked for an element pair with no convert",
+    )
+  }
+  const srcWrap = scalarListWrap(srcKind)
+  const srcBack = scalarListBack(srcKind)
+  const dstWrap = scalarListWrap(dstKind)
+  const dstBack = scalarListBack(dstKind)
+  const sL = widenScalarWrapSlot(scalarElemMfKind(srcKind))
+  const dL = widenScalarBackSlot(scalarElemMfKind(dstKind))
+  const iL = widenTmpSlot(0)
+  const nL = widenTmpSlot(1)
+  // src = <stack>, evaluated ONCE by the caller.
+  fbLocalSet(sL)
+  // n = src.len  (field 1 of the shared `{ backing, len, cap }` wrapper; `struct.get`
+  // accepts a nullable ref and traps on null, so the nullable frame slot needs no
+  // recover here).
+  fbLocalGet(sL)
+  fbStructGet(srcWrap, 1)
+  fbLocalSet(nL)
+  // back = array.new_default <dstBack> n  — the destination element's ZERO, which is
+  // the right fill for every pair above (they are all numeric).
+  fbLocalGet(nL)
+  fbArrayNewDefault(dstBack)
+  fbLocalSet(dL)
+  fbI32Const(0)
+  fbLocalSet(iL)
+  // block { loop { if i >= n br 1; back[i] = conv(src.back[i]); i++; br 0 } }
+  fbBlock(64)
+  ctrlEnter()
+  fbLoop(64)
+  ctrlEnter()
+  fbLocalGet(iL)
+  fbLocalGet(nL)
+  fbI32Bin(78) // 0x4e i32.ge_s
+  fbBrIf(1)
+  fbLocalGet(dL)
+  fbLocalGet(iL)
+  fbLocalGet(sL)
+  fbStructGet(srcWrap, 0) // the source backing
+  fbLocalGet(iL)
+  fbArrayGet(srcBack) // yields the element in the SOURCE's rep
+  wU8(op) // ...and this is the one byte that makes it the destination's
+  fbArraySet(dstBack)
+  fbLocalGet(iL)
+  fbI32Const(1)
+  fbI32Bin(106) // 0x6a i32.add
+  fbLocalSet(iL)
+  fbBr(0)
+  fbEnd()
+  ctrlLeave()
+  fbEnd()
+  ctrlLeave()
+  // { backing, len, cap } — field 0 is a NON-null ref, so the nullable frame slot
+  // recovers here and only here. `cap == len`: the copy is exact-sized.
+  fbLocalGet(dL)
+  wU8(212) // 0xd4 ref.as_non_null
+  fbLocalGet(nL)
+  fbLocalGet(nL)
+  fbStructNew(dstWrap)
+  0
+}
+
 // The DELIVERY-SITE half: a value just emitted at ref-list slot `srcSlot` is being
 // delivered into a `dstSlot` destination. Widen it in place when the pair is widenable
 // AND the whole-program write scan licenses it; otherwise leave the stack untouched and
@@ -16570,6 +16712,58 @@ export function emitRefListWidenSite(
 ): boolean {
   if !rlWidenAllowed(covarRootName(srcIx), srcSlot, dstSlot) { return false }
   if emitRefListWidenTop(body, srcSlot, dstSlot) < 0 { return false }
+  true
+}
+
+// The LIST kind a destination annotation classifies as (`vtKindOfType`: "list",
+// "f64list", …) reduced to the ELEMENT kind the `scalarList*` family keys on. `""` for
+// anything that is not a scalar list — a ref list, a string list, a map, a non-container.
+// `u8list` answers with its own list kind for the reason `scalarListElemKind` records:
+// its element VALUE kind (i32) does not identify its packed backing.
+function scalarListElemOfListKind(k: VKind): VKind | null {
+  if k == "list" { return "i32" }
+  if k == "f64list" { return "f64" }
+  if k == "i64list" { return "i64" }
+  if k == "f32list" { return "f32" }
+  if k == "u8list" { return "u8list" }
+  null
+}
+
+// The SCALAR delivery site (D965) — `emitRefListWidenSite`'s twin, asked at the same
+// boundaries and declining on the same terms. Three gates, in cost order: the pair must
+// be one of the three the copy serves, both sides must classify as scalar lists, and
+// D821's per-VALUE write scan must say DEFINITELY-unwritten.
+//
+// THE LICENCE IS THE REF SITE'S AND FOR ITS REASON. A converting copy is a SNAPSHOT: the
+// destination is a different array, so a write through either name after the delivery is
+// invisible to the other. `covarValueWriteState(...) == 0` is a definite "nothing writes
+// this value"; an UNKNOWN (2) declines, because a copy taken on a guess is a silently
+// wrong program and not merely an invalid one.
+export function emitScalarListWidenSite(
+  body: i32[],
+  srcIx: i32,
+  fnIx: i32,
+  dstListKind: VKind,
+): boolean {
+  const de = scalarListElemOfListKind(dstListKind)
+  if de == null { return false }
+  emitScalarListWidenSiteElem(body, srcIx, fnIx, de)
+}
+
+// The same site keyed by the destination's ELEMENT kind rather than its list kind, for
+// the two boundaries that have the destination as an EXPRESSION (the assignment's LHS)
+// or as a nested element rather than as an annotation or a cell column.
+export function emitScalarListWidenSiteElem(
+  body: i32[],
+  srcIx: i32,
+  fnIx: i32,
+  de: VKind,
+): boolean {
+  const sk = scalarListElemKind(srcIx, fnIx)
+  if sk == null { return false }
+  if scalarWidenConvOp(sk, de) < 0 { return false }
+  if covarValueWriteState(covarRootName(srcIx)) != 0 { return false }
+  if emitScalarListWidenTop(body, sk, de) < 0 { return false }
   true
 }
 
@@ -17092,8 +17286,10 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
   // Reading the functype's own source is what keeps the widened value and the declared
   // result in agreement by construction.
   let retRlSlot = -1
+  let retSLKind: VKind | null = null
   if fn is FuncDecl {
     if fn.fnRet >= 0 {
+      retSLKind = vtKindOfType(fn.fnRet)
       if vtKindOfType(fn.fnRet) == "reflist" {
         retRlSlot = tyAnnRefListSlot(fn.fnRet)
       }
@@ -17472,6 +17668,12 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
       exprEmittedRefListSlot(retArg, fnIx),
       retRlSlot,
     )
+  }
+  // THE SCALAR DUAL (D965) — `return e` from a `(): f64[]`. Read off the ANNOTATION for
+  // the reason `retRlSlot` is: the functype's own source is what keeps the widened value
+  // and the declared result in agreement by construction.
+  if retSLKind != null {
+    emitScalarListWidenSite(body, retArg, fnIx, retSLKind)
   }
   pendingStructIdx = -1
   pendingVariantIdx = -1
@@ -18303,6 +18505,9 @@ function emitLetDeclStmt(body: i32[], s: LetDecl, stmtIx: i32, fnIx: i32) {
       localStructIdx[slot],
     )
   }
+  // THE SCALAR DUAL (D965) — `const b: f64[] = e` over an `i32[]`. The cell's own kind IS
+  // the destination list kind, so this needs no second derivation.
+  emitScalarListWidenSite(body, s.letInit, fnIx, localIsRef[slot])
   fbLocalSet(idx) // 0x21 local.set
   // Bind `name → slot` in the current emit-time frame AFTER emitting the init (so the
   // init resolved any same-named OUTER binding), making this binding live for the rest
@@ -21495,6 +21700,11 @@ function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
     // widening (D791) — the same `tyAnnRefListSlot` the build seed below reads, kept
     // because the seed is cleared before the argument's widening can be asked.
     let cParamRlSlot = -1
+    // The SCALAR-list dual of `cParamRlSlot` (D965) — the param's own list kind, so an
+    // argument whose element STORAGE differs (`i32[]` into an `f64[]` param) can take the
+    // converting copy at this boundary. `""` for every non-scalar-list param, which is
+    // what makes the delivery below cost nothing in the ordinary case.
+    let cParamSLKind: VKind | null = null
     if cFn is FuncDecl {
       const cParams = cFn.fnParams
       if i < cParams.length {
@@ -21576,6 +21786,7 @@ function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
           if vtKindOfParam(cParams[i]) == "reflist" {
             cParamRlSlot = tyAnnRefListSlot(cp.parType)
           }
+          cParamSLKind = vtKindOfParam(cParams[i])
         }
         // An i64 param position lowers an integer-literal argument as `i64.const`.
         if vtKindOfParam(cParams[i]) == "i64" { pendingI64 = true }
@@ -21706,6 +21917,11 @@ function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
             exprEmittedRefListSlot(args[i], fnIx),
             cParamRlSlot,
           )
+        }
+        // THE SCALAR DUAL (D965) — `take_f(xs: f64[])` called with an `i32[]`. Same
+        // boundary, same licence, a numeric convert instead of a box.
+        if cParamSLKind != null {
+          emitScalarListWidenSite(body, args[i], fnIx, cParamSLKind)
         }
         pendingVariantIdx = -1
         // A nullable-REP value (a null-narrowed `S | null` param/local, or a

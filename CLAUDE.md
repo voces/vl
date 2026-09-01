@@ -203,6 +203,25 @@ family. It costs seconds per cell: the minimiser is a thirty-line greedy loop, a
 Corollary for a row's headline: **cite the number you ABLATED, not the number that shares a
 sentence.** If the mechanism count is not yet known, say the message count is a message count.
 
+## A CAPABILITY GAP HAS A POSITION MATRIX — narrowing the checker first ships clause-1 bugs
+
+A refusal that names a capability (`no element-converting copy exists`) is usually enforced in
+ONE place — the checker — and served, once built, in MANY: every syntactic position where the
+value can be delivered. Lifting the refusal is therefore not the last step, it is the step that
+converts a loud refusal into **silent invalid wasm at every position you did not wire**.
+
+D965 is the worked instance. With the converting loop built and the ARGUMENT boundary wired,
+the narrowed gate admitted six more positions — binding, return, assignment, struct-field,
+nested-element, global-init — and every one produced check-clean invalid wasm. The order that
+caught it is: **build the lowering, wire every delivery, THEN narrow the gate.**
+
+**Enumerate the positions by finding the SIBLING's callers, then verify by running them.**
+`emitRefListWidenSite` had eight callers and reading them looked like the complete list. It was
+not: global ASSIGNMENT (`b = e` between two module globals) lowers through `emitAssign`'s
+`global.set` arm, which the ref family never hooked either. A nine-row position matrix — one
+tiny program per position, each printing a value that proves the conversion actually happened
+(`b[0] / 2.0` → `1.5`, not `1`) — found it in one run. Reading the call sites did not.
+
 ## The goal is `runs`, and making a failure LOUD does not move it
 
 Standing bar: **every program the language design permits compiles and runs correctly.** Two
