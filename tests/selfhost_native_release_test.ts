@@ -463,8 +463,18 @@ const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3: ShapeP
     // grew a hoist prologue. That is the one line of this re-record that is a cost rather
     // than an accounting change, and it is the trade the prologue buys — the hoist takes the
     // header reads OUT of the per-code-point loop.
-    O: { bytes: 2037, fns: 4, allocs: 22, indirect: 0, refEq: 1 },
-    O3: { bytes: 1926, fns: 4, allocs: 21, indirect: 0, refEq: 1 },
+    //
+    // 2026-09-01, the `toString` ruling: the ambient builtin this benchmark used to build
+    // its keys with was retired, so `main.vl` now imports `std:fmt` and the module carries
+    // that whole module's code. `-O` moves 2037 -> 7769 bytes, fns 4 -> 16, allocs 22 -> 91;
+    // `-O3` moves 1926 -> 2147, fns 4 -> 5, allocs 22 -> 46. **The two rungs disagree on
+    // purpose and that is the useful part**: VL has no cross-module DCE, so `-O` carries
+    // every byte of `std:fmt`, and binaryen's DCE at `-O3` removes almost all of it. Read
+    // the `-O3` row as this benchmark's real shape and the `-O` row as the cost of the
+    // missing pipeline DCE. The pin still fires exactly on any codegen move — it is an
+    // equality test — it just has more of std in it now.
+    O: { bytes: 7769, fns: 16, allocs: 91, indirect: 0, refEq: 1 },
+    O3: { bytes: 2147, fns: 5, allocs: 46, indirect: 0, refEq: 1 },
   },
   // MAP PROBE WITHOUT THE STRING COST. i32 keys, so this isolates the bucket walk and the
   // `?? -1` sentinel path from hashing and content compare — the two rows differ by exactly
@@ -489,8 +499,14 @@ const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3: ShapeP
     // ELEMENT level (a header, no `array.new_default` and no `array.copy`). The site COUNT
     // still rose because a header is a `struct.new` the counter sees; what fell is the bytes
     // copied per slice, which this table cannot see and `bench/run.sh` can.
-    O: { bytes: 2662, fns: 5, allocs: 30, indirect: 0, refEq: 1 },
-    O3: { bytes: 2595, fns: 5, allocs: 30, indirect: 0, refEq: 1 },
+    //
+    // 2026-09-01, the `toString` ruling: `main.vl` builds its vocabulary with `toString`,
+    // which is `std:fmt`'s export now rather than an ambient builtin, so the module carries
+    // `std:fmt`. `-O` 2662 -> 3383 bytes, fns 5 -> 6, allocs 30 -> 51; `-O3` 2595 -> 2890,
+    // fns 5 (held), allocs 30 -> 50. See `collections/map-string` above for why the two
+    // rungs move by different amounts.
+    O: { bytes: 3383, fns: 6, allocs: 51, indirect: 0, refEq: 1 },
+    O3: { bytes: 2890, fns: 5, allocs: 50, indirect: 0, refEq: 1 },
   },
   // ARRAY ELEMENT WRITE + READ, 400M of each, with the allocation hoisted out of the steady
   // state by construction. `fns: 1` is the load-bearing pin: every element accessor has been

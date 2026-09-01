@@ -223,10 +223,22 @@ Deno.test({
       throw new Error(`expected \`${t}\` as a type builtin, got ${JSON.stringify(byName.get(t))}`);
     }
   }
-  for (const f of ["print", "toString", "fromCodePoint", "fromCodePoints", "Map", "Set"]) {
+  for (const f of ["print", "fromCodePoint", "fromCodePoints", "Map", "Set"]) {
     if (byName.get(f)?.kind !== 1) {
       throw new Error(`expected \`${f}\` as a function builtin, got ${JSON.stringify(byName.get(f))}`);
     }
+  }
+  // `toString` IS NOT ONE OF THEM ANY MORE — it was an ambient builtin over
+  // `i32 | boolean` until 2026-09-01 and is `std:fmt`'s export now (owner ruling).
+  // Asserted as an ABSENCE, not just dropped from the list above: offering it here
+  // would complete a name that does not resolve without `import { toString } from
+  // "std:fmt"`, which is worse than not offering it.
+  if (byName.has("toString")) {
+    throw new Error(
+      `\`toString\` is std:fmt's export, not a builtin — it must not be completed ambiently, got ${
+        JSON.stringify(byName.get("toString"))
+      }`,
+    );
   }
   // `print`'s rendered signature is the set the pipeline actually admits, not a
   // placeholder: exactly one argument, of a type with a printable runtime rep, and a

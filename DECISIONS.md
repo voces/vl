@@ -1869,6 +1869,60 @@ reports. `then` remains a perfectly good identifier (the lexer soft-keyword
 fixtures now double as that regression's coverage), and the contextual soft-keyword set is
 five: `as` `from` `in` `step` `to`.
 
+## `toString` is std's name, not the compiler's — the ambient builtin is retired (owner, 2026-09-01)
+
+VL had TWO number renderers with two names. `toString(x)` was a compiler BUILTIN: in scope
+with no import, typed `(i32 | boolean) => string` in `driver.vl`'s default-scope list, and
+lowered inline by `emitToString` into the string-op scratch frame. `std:fmt` exported
+`toStr(self: i32 | i64 | boolean | f64)`, pure VL, reached by an import and readable as a
+UFCS method. The ruling: **there is one, it is std's, and it is spelled `toString`.**
+
+**Why `toString` and not `toStr`.** It is the cross-language-conventional spelling — Java,
+C#, JavaScript, Kotlin, Scala and Dart all write the word out, and Rust's `to_string` is the
+same word in its own casing. Nothing in VL abbreviates a name to save five characters, and
+the abbreviation only ever existed because the full spelling was TAKEN by the builtin. With
+the builtin retired the vacancy is real, and a std name is close to permanent — this was the
+cheapest moment it will ever be to pick the better one.
+
+**Why the builtin goes rather than both staying.** Two names for one operation is the flat-
+namespace hazard `std:fmt`'s own header argues at length about `split`, one level up: a
+reader who learned `toString(42)` and a reader who learned `n.toStr()` are writing different
+programs for the same thing, and neither spelling can be recommended without qualification.
+Worse, the builtin was the WEAKER of the two — its domain `i32 | boolean` is a strict subset
+of the export's `i32 | i64 | boolean | f64` — so the name everyone reaches for first was the
+one that refused an i64 and a float.
+
+**Three measurements settled it, on the pre-rename compiler, and they are kept in
+`std/fmt.vl`'s header rather than here** because that is the file a future reader will be
+holding. (1) The builtin's domain is a strict subset, so **no program loses a capability** —
+`toString(n)` over an i64 and `toString(1.5)` both refused before. (2) Builtins are not
+`self`-first, so `n.toString()` refused (`member access '.toString' on non-object i32`); the
+rename BUYS the UFCS spelling, and that is the actual user-facing win rather than a tidying.
+(3) The one break: `toString(42)` compiled with NO import and now needs
+`import { toString } from "std:fmt"`.
+
+**That break ships once, deliberately, with a targeted refusal.** std has no deprecation
+story, so the compiler pays instead: `typecheck.stdFmtMovedNote` appends the import line to
+the undeclared-identifier message for BOTH retired spellings, and to the member-access
+sentence on a scalar receiver, where the migrating spelling actually lands. This is the
+`then`-removal precedent above — a spelling the language removed earns a refusal that names
+its replacement, because the generic one strands a reader who has no reason to suspect a
+rename. `toStr`'s note is the one with an expiry (it buys a release of muscle-memory);
+`toString`'s should outlive it, since the builtin was import-free and its absence is the
+surprising half.
+
+**What was NOT done, and why.** The builtin's lowering is DELETED, not kept as a fast path
+behind the std name. A hidden intrinsic that fires only for `i32` would make `n.toString()`
+mean two different programs depending on the receiver's width, and the whole point of the
+ruling is one meaning. The cost is real and recorded — `bench/strings/int-format` measured
+the pure-VL renderer at 5.7x the builtin — but it is now a LIBRARY-QUALITY item on a path
+with a name, which is a better place for it than a compiler special case nobody can profile
+or improve in VL. And the three std modules that render a number inside an error message
+(`utf8`, `fs`, `args`) IMPORT `std:fmt` rather than each keeping a private renderer: that
+costs a `std:utf8` consumer 3,670 → 18,556 bytes with no cross-module DCE, and the
+alternative is three copies of a decimal loop that must agree about i32 min forever. Same
+ruling as `split`: one implementation beats smaller output, and DCE is the fix.
+
 ## `else` takes a block or an `if` — the brace is required (owner, 2026-09-01)
 
 **"make brace on else required."** `else <stmt>` is removed. An `else` is followed by a brace

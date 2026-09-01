@@ -55,6 +55,7 @@ if (GATED && !ENABLED) console.warn("[vl-std-args] skipped — missing vl binary
 // `cpLen()`, and printing both is what keeps the test able to tell them apart: a module
 // that treated the argv bytes as code points would report 9 for BOTH.
 const ECHO = `import { programArgs } from "std:args"
+import { toString } from "std:fmt"
 import { Utf8Error } from "std:utf8"
 
 const args = programArgs()

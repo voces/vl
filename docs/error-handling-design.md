@@ -135,7 +135,7 @@ export function read(path: string): string | IoError {
 function loadConfig(path: string): string {
   const raw = fs.read(path)
   if raw is IoError {
-    print("config unreadable (errno " + raw.code.toStr() + "): " + raw.msg)
+    print("config unreadable (errno " + raw.code.toString() + "): " + raw.msg)
     return "{}"                 // fall back to defaults
   }
   return raw                    // `raw` narrowed to `string` here

@@ -19761,20 +19761,24 @@ is a table index plus a captured environment; there is no name and no source. An
 an invented token or a lie about identity. This is the cell that shows the family is not one
 mechanism away from working.
 
-**5. The precedent is one builtin over.** `toString` — the other value-rendering builtin, also
-with no VL-spellable type — refuses out-of-domain arguments with a plain type error and no
-concession: `toString expects an i32 or boolean, got string`. That is now `print`'s sentence
-shape too.
+**5. The precedent WAS one builtin over.** `toString` — the other value-rendering builtin, also
+with no VL-spellable type — refused out-of-domain arguments with a plain type error and no
+concession (`toString expects an i32 or boolean, got string`), and that is `print`'s sentence
+shape. The precedent has since gone one better: `toString` is not a builtin at all any more
+(2026-09-01, owner ruling), it is `std:fmt`'s export with a REAL declared signature, and an
+out-of-domain argument to it is now an ordinary `argument 1: expected i32 | i64 | boolean |
+f64, got string`. The reasoning below — that a renderer belongs in std, in VL, reviewable —
+is the same reasoning that moved it.
 
 **6. The composite renderer belongs in std, where it can be written in VL and reviewed.** It
 already works today:
 
-    import { toStr } from "std:fmt"
+    import { toString } from "std:fmt"
     import { join } from "std:str"
     const xs = [1, 2, 3]
     const parts: string[] = []
     let i = 0
-    while i < xs.length { parts.push(xs[i].toStr()); i = i + 1 }
+    while i < xs.length { parts.push(xs[i].toString()); i = i + 1 }
     print("[" + parts.join(", ") + "]")
     // prints: [1, 2, 3]
 
@@ -23938,11 +23942,66 @@ Repro (runs, prints `2`):
     a.pop()
     print(a.length)
     // PRINTS 2
+### D981 — in a module that IMPORTS, an `if`-EXPRESSION arm sees no module scope at all
+
+**loud check reject on a legal program (clause 2) · PRE-EXISTING, not caused by the change that found it · found 2026-09-01 while migrating the corpus off the retired `toString` builtin · confirmed on the pre-change compiler with the pre-change std, so it is not the rename's**
+
+Add ONE import to a file and every `if`-EXPRESSION arm in it stops resolving module-scope
+names — functions, `const`, `let`, and the imported names themselves. `vl check` refuses a
+program that compiled and ran the line before the import was added.
+
+    import { toString } from "std:fmt"
+
+    function f(x: i32) { return x }
+    function g(e: i32) {
+      return if e > 0 { f(e) > 0 } else { false }
+    }
+    print(g(5))
+    // undeclared identifier 'f'
+
+* **THE ABLATION, seven programs, and it is the ARM that is the ingredient — not the call.**
+  Delete the import and the same file RUNS (`true`). Keep the import and rewrite the arm as a
+  STATEMENT `if` (`if e > 0 { return f(e) > 0 }`) and it RUNS. A `while` body under the same
+  import RUNS. So the family is exactly *`if`-expression arm* + *the module was merged*.
+
+* **IT IS NOT ABOUT CALLS, AND NOT ABOUT WHICH ARM.** A module-scope `const K = 7` read in a
+  then-arm is `undeclared identifier 'K'`; so is a module-scope `let`. The ELSE arm fails the
+  same way. A top-level `const v = if 1 > 0 { f(3) } else { 0 }` fails. A lambda written into
+  an arm fails on the name it closes over. What still resolves inside an arm is the enclosing
+  function's own PARAMETERS — `if e > 0 { e > 0 }` runs — which locates this in the merged
+  program's scope CHAIN for that node, not in the checker's identifier lookup.
+
+* **IT IS NOT THE RENAME'S — measured both ways.** Run the witness with `toStr` (std's
+  pre-rename spelling) against the MAIN checkout's compiler, the one that still carries the
+  ambient `toString` builtin: same `undeclared identifier 'f'`. The rename only made it
+  REACHABLE from the corpus, by giving 50 test programs an import they did not have.
+
+* **THE PRICE IT ALREADY CHARGED.** `tests/cases/unions/short-circuit-operand-narrowing.vl`
+  is built out of `return if …` arms — that is its subject — so migrating it to
+  `import { toString } from "std:fmt"` broke it. It carries a local boolean renderer instead
+  and stays import-free, with a comment naming this row, so the file keeps measuring
+  short-circuit narrowing rather than measuring D976.
+
+* **A NEIGHBOUR, NOT A DUPLICATE.** `docs/internals/perf-landscape.md` §8.1 already files
+  *"importing anything from `std:fmt` breaks a function with an annotated array return whose
+  body holds a multi-element array literal"* (`object literal matches no union variant`, emit
+  side, `vl check` clean). Different phase, different message, same trigger — a merge. Worth
+  checking whether one root serves both before either is scheduled.
+
+Repro (check refuses):
+
+    import { toString } from "std:fmt"
+
+    function f(x: i32) { return x }
+    function g(e: i32) {
+      return if e > 0 { f(e) > 0 } else { false }
+    }
+    print(g(5))
 
 ---
 ### D975 — a USER function named like a builtin miscompiles from the NAME alone; all six builtin names collide
 
-**closed for four of the six — `print`, `toString`, `fromCodePoint`, `fromCodePoints` now resolve to the user's function · `Map` / `Set` keep a residue, filed below · reported by the owner while exploring the constraints design, minimized by vl-b7, verified here**
+**A REFUTATION PIN: it runs today and must keep running · CONVERTED 2026-09-01 by the `toString` rename, which DELETED the collision surface this row's own witness names · the fix (four of six names resolving to the user's function) landed in #2185; `Map` / `Set` keep the residue filed below · reported by the owner while exploring the constraints design, minimized by vl-b7**
 
 `const b = { foo: "ok" }` beside `function toString(self: { foo: string }) { self.foo }` and
 `print(b.toString())` was `vl check` rc 0 and INVALID WASM; the identical program with the
@@ -23962,11 +24021,21 @@ function renamed `myShow` printed `ok`.
   remaining site is the emitter's BINDING classification (the `letIsMap` rung reading a
   `Map`-named callee), not the call. The other four are closed and pinned.
 
-* **AND THE QUEUED toString-RENAME MUST CONVERT THIS ROW, NOT CLOSE IT.** That change deletes
-  the builtin, which would make this witness evaporate without the pattern being fixed. The
-  pattern is "an emit special case keyed on the raw name rather than on what it resolved to";
-  the row should become a REFUTATION PIN — the witness must keep RUNNING — so the next by-name
-  special case is caught by the standing gate.
+* **THE toString-RENAME CONVERTED THIS ROW RATHER THAN CLOSING IT (2026-09-01).** That change
+  deleted the ambient builtin, so `toString` is no longer one of the names an emit arm tests
+  for and this witness would have evaporated with the defect unproven. The PATTERN — "an emit
+  special case keyed on the raw name rather than on what it resolved to" — is what the row is
+  about, and it is alive: `Map` / `Set` still carry it below. So the witness is now a
+  REFUTATION PIN, and it must keep RUNNING; if it ever stops, someone has re-introduced a
+  by-raw-name special case for a name std owns.
+
+* **THE SHADOWING QUESTION HAS A LANGUAGE-LEVEL ANSWER, AND IT IS NEITHER.** Measured
+  2026-09-01: a module that both `import { toString } from "std:fmt"` AND declares its own
+  `function toString(…)` is a HARD PARSE ERROR — `Duplicate binding "toString": module
+  <file> both imports and declares it — rename one (`as` on the import)`. So there is no
+  precedence rule to get wrong: the import and the declaration cannot coexist, and a file
+  that declares its own (this witness) simply never imports std's. That is why the repro
+  below has no import line, and why adding one would change what it measures.
 
 Repro (runs, prints `ok`):
 
