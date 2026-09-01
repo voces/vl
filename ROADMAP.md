@@ -1734,13 +1734,19 @@ seed from current `compiler/*.vl` in ~40s.*
   3. ⬜ Document symbols — flat outline (`tokensAt` + `moduleSurface`; nesting needs a
      body-extent export later)
   4. ⬜ Code lens: export reference counts (`lastUseMap` is already computed every save)
-  5. ⬜ Rename symbol (+prepare) — `referencesAt`/`crossFileReferences`; its own PR
+  5. ⬜ Hover polish — ONE user-facing type-render pathway in the query layer owning
+     `$mN` demangling (hover/inlay/member/alias leak it today; scopeAt's inline wraps
+     collapse into it), and a FUNCTION-BINDING hover that zips the decl's parameter
+     names with `TyFunc.fnParamTypes` (`it(name: string, body: () => void) => void`) —
+     types are structural and carry no names by design, so the names come from the
+     declaration; the same data feeds 9 (signature help)
+  6. ⬜ Rename symbol (+prepare) — `referencesAt`/`crossFileReferences`; its own PR
      (write-path feature, alias/import edges need care)
-  6. ⬜ **Testing API: per-test click-to-run** — `vl test <file> -t <substring>` suffices
+  7. ⬜ **Testing API: per-test click-to-run** — `vl test <file> -t <substring>` suffices
      (no CLI change); TestController over CodeLens per the survey's assessment
-  7. ⬜ Folding ranges + language-config indentation/on-enter rules
-  8. ⬜ Signature help (bridge grade today; clean grade wants one native export)
-  9. ⬜ Doc-comment-aware hover/completion (needs the one native doc-text export;
+  8. ⬜ Folding ranges + language-config indentation/on-enter rules
+  9. ⬜ Signature help (bridge grade today; clean grade wants one native export)
+  10. ⬜ Doc-comment-aware hover/completion (needs the one native doc-text export;
      the D7 linkifier host side already exists)
   Not queued (and why, in one line each): workspace symbols (rides on 3's plumbing —
   fold in when 3 lands), inline values / DAP (no debugger yet), notebooks/monikers/
