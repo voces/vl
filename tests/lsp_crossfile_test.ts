@@ -13,11 +13,16 @@
 import type { ModuleReader } from "../compiler/coreTypes.ts";
 import {
   crossFileReferences,
+  crossFileUriOf,
   detectProjectRoot,
   enumerateWorkspaceFiles,
   type OpenDocument,
   pathToUri,
+  stdKeyToUri,
+  stdUriPathToKey,
+  VL_STD_SCHEME,
 } from "../lsp/src/moduleGraph.ts";
+import { STD_SOURCES } from "../std/embedded.ts";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
 
 const assert = (cond: boolean, msg: string): void => {
@@ -350,4 +355,57 @@ Deno.test({ name: "regression: single-file find-refs (no exports) unchanged with
     refs === undefined,
     "a non-exported local must still defer to single-file even with diskFiles",
   );
+});
+
+// ---- (8) std cross-file URIs (`vl-std:` scheme) ------------------------------
+//
+// A `std:` module key has no filesystem path; `crossFileUriOf` maps it to the
+// workspace's own `std/NAME.vl` when one exists (dogfooding), else to a
+// `vl-std:` URI the extension's content provider serves from the embedded map.
+// Regression: `pathToUri("std:test")` produced `file://std%3Atest`, which the
+// editor errored on for go-to-definition on any std export.
+
+Deno.test("std URIs: stdKeyToUri/stdUriPathToKey round-trip every embedded module", () => {
+  const keys = Object.keys(STD_SOURCES);
+  assert(keys.length > 0, "the embedded map must not be empty");
+  for (const key of keys) {
+    const uri = stdKeyToUri(key);
+    assert(
+      uri.startsWith(`${VL_STD_SCHEME}:/`) && uri.endsWith(".vl"),
+      `stdKeyToUri(${key}) must be ${VL_STD_SCHEME}:/NAME.vl; got ${uri}`,
+    );
+    // `Uri.parse(uri).path` in the extension is the part after the scheme.
+    const path = uri.slice(`${VL_STD_SCHEME}:`.length);
+    const back = stdUriPathToKey(path);
+    assert(back === key, `round-trip of ${key} via ${uri} gave ${back}`);
+  }
+});
+
+Deno.test("crossFileUriOf: a plain path key is a file:// URI", () => {
+  const uri = crossFileUriOf("/proj/util.vl", undefined, () => false);
+  assert(
+    uri === pathToUri("/proj/util.vl"),
+    `expected ${pathToUri("/proj/util.vl")}; got ${uri}`,
+  );
+});
+
+Deno.test("crossFileUriOf: a std key with no workspace std dir is a vl-std: URI", () => {
+  const uri = crossFileUriOf("std:test", undefined, () => {
+    throw new Error("exists() must not be consulted without a std dir");
+  });
+  assert(uri === "vl-std:/test.vl", `expected vl-std:/test.vl; got ${uri}`);
+});
+
+Deno.test("crossFileUriOf: the workspace's own std file wins when it exists", () => {
+  const exists = (p: string): boolean => p === "/ws/std/test.vl";
+  const uri = crossFileUriOf("std:test", () => "/ws/std", exists);
+  assert(
+    uri === pathToUri("/ws/std/test.vl"),
+    `expected the workspace std file URI; got ${uri}`,
+  );
+});
+
+Deno.test("crossFileUriOf: a std dir WITHOUT the module falls through to vl-std:", () => {
+  const uri = crossFileUriOf("std:test", () => "/ws/std", () => false);
+  assert(uri === "vl-std:/test.vl", `expected vl-std:/test.vl; got ${uri}`);
 });

@@ -7,6 +7,8 @@
 // they self-ignore, the same convention as the rest of the wasm suite.
 
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
+import { crossFileUriOf, withStd } from "../lsp/src/moduleGraph.ts";
+import { STD_SOURCES } from "../std/embedded.ts";
 
 const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
 const seedExists = (() => {
@@ -74,5 +76,40 @@ Deno.test({
   }
   if (names.some((n) => n.includes("$"))) {
     throw new Error(`a mangled name leaked into completion: ${JSON.stringify(names)}`);
+  }
+});
+
+Deno.test({
+  name: "wasm-crossfile: a std import resolves to the embedded module's export decl (vl-std URI)",
+  ignore,
+}, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // The server reads std through `withStd` (no workspace std dir here → the
+  // embedded map). `expect` is a std:test export.
+  const stdEntry = 'import { expect } from "std:test"\nexpect(1)\n';
+  const sources = await checker.importedNameSources(
+    stdEntry,
+    "/proj/main.vl",
+    withStd(() => undefined),
+  );
+  const src = sources.expect;
+  if (src === undefined) throw new Error("expected `expect` to resolve into std:test");
+  if (src.key !== "std:test") {
+    throw new Error(`expected key std:test, got ${JSON.stringify(src.key)}`);
+  }
+  // Range fidelity: the decl position must spell `expect` in the SAME source the
+  // vl-std content provider serves (the embedded map) — that is the contract
+  // that makes the provider's tab open at the right line and column.
+  const declLine = STD_SOURCES["std:test"].split("\n")[src.line - 1] ?? "";
+  const atDecl = declLine.slice(src.col, src.col + src.length);
+  if (atDecl !== "expect") {
+    throw new Error(
+      `decl position (line ${src.line}, col ${src.col}) spells ${JSON.stringify(atDecl)} in the embedded source, not "expect"`,
+    );
+  }
+  // And the key maps to the provider's URI form (no workspace std dir).
+  const uri = crossFileUriOf(src.key, undefined, () => false);
+  if (uri !== "vl-std:/test.vl") {
+    throw new Error(`expected vl-std:/test.vl, got ${JSON.stringify(uri)}`);
   }
 });
