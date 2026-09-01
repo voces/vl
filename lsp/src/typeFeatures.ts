@@ -224,14 +224,50 @@ const lexicalTokensFromExternal = (
  * {@link semanticTokensDataFromIdentifiers} (an identifier classification at a
  * position wins over a lexical/member one there).
  */
+/**
+ * Fuse the lexer's two one-char operator tokens spelling `=>` into ONE
+ * keyword-class token, when `source` is supplied to check the lexemes. The
+ * arrow reads as a binder, not arithmetic — TS scopes it keyword-ish
+ * (`storage.type.function.arrow`) and themes leave plain operators at default
+ * foreground, which is why `=>` rendered white. One-line revert: drop the call.
+ */
+const fuseArrowTokens = (
+  tokens: ClassifiedToken[],
+  source: string,
+): ClassifiedToken[] => {
+  const lines = source.split("\n");
+  const out: ClassifiedToken[] = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const a = tokens[i];
+    const b = tokens[i + 1];
+    if (
+      b !== undefined &&
+      a.tokenType === TT.operator && b.tokenType === TT.operator &&
+      a.length === 1 && b.length === 1 &&
+      a.line === b.line && b.char === a.char + 1 &&
+      lines[a.line]?.slice(a.char, a.char + 2) === "=>"
+    ) {
+      out.push({ ...a, length: 2, tokenType: TT.keyword });
+      i++;
+      continue;
+    }
+    out.push(a);
+  }
+  return out;
+};
+
 export const semanticTokensDataFromWasm = (
   idents: IdentToken[],
   lexical: ExtLexicalToken[],
   extMembers: ExtMemberToken[],
+  source?: string,
 ): number[] => {
   const identTokens = identTokensByPos(idents);
   const merged: ClassifiedToken[] = [...identTokens.values()];
-  for (const t of lexicalTokensFromExternal(lexical)) {
+  const lex = source !== undefined
+    ? fuseArrowTokens(lexicalTokensFromExternal(lexical), source)
+    : lexicalTokensFromExternal(lexical);
+  for (const t of lex) {
     if (!identTokens.has(`${t.line}:${t.char}`)) merged.push(t);
   }
   for (const t of memberTokensFromExternal(extMembers)) {
