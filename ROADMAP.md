@@ -74,30 +74,51 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   Sequencing: coordinating with the compile-goal session's D976 fix (the checker column
   recording a param's resolved demanded shape is the natural substrate for recorded
   bounds); implementation launches behind that answer.
-- **Track-caller intrinsic** (test failures at the `expect` line, not the `it` line) —
-  a std:test-visible callsite mechanism (Rust `#[track_caller]` / Swift `#line` shaped).
-  Small compiler intrinsic, language-surface decision. The editor-side cheap half is D9
-  slot 12 and needs no ruling.
+- **Track-caller — expanded brief (owner asked for more detail, 2026-09-01).** The
+  mechanism: a magic parameter TYPE — a std `CallerLoc` (module key + line + col; the
+  compiler holds all three at any call site) whose trailing parameter is SYNTHESIZED at
+  each call site when the caller omits it. Survey: Rust `#[track_caller]` (attribute +
+  hidden Location + fn-pointer shims), Swift `#line`/C++ `source_location` (magic DEFAULT
+  ARGUMENTS — needs default args, a far bigger VL feature), JS stack parsing (no wasm
+  stacks), Zig `@src()` (callee-side, wrong thing). Three clean properties: NO
+  transitivity machinery (synthesis is a default; a wrapper forwards its own `caller`
+  EXPLICITLY — ordinary code); indirect calls are honest if `CallerLoc` is legal in
+  function TYPES (the call site's own location is synthesized — the compiler always
+  knows the site even when the callee is dynamic); cost is three constant-folded scalars
+  per opted-in call. The sharp edge: `(i32) => void` and `(i32, CallerLoc) => void` are
+  DIFFERENT types, so a marked function is not a drop-in where an unmarked fn value is
+  expected (matchers are never taken as values in practice). DECISIONS: (a) adopt the
+  param-type mechanism; (b) allow `CallerLoc` in function types; (c) accept the
+  not-a-drop-in consequence. Recommended: yes to all three. The editor-side single-expect
+  anchor is D9 slot 12 and needs no ruling.
 - **`vl test --trace` inline run values** — RULED low priority (owner, 2026-09-01,
   "low prio I guess"): keep parked; an emitter flag instrumenting USER programs (never
   the compiler) logging `(site, value)` pairs, extension renders decorations after a
   run. Revisit when the test-debugging story matters more than new surface.
-- **Driver lossless-recovery flag** — report "parse error + later type error" together.
-  Decision brief (2026-09-01): every modern reference compiler does this (Roslyn
-  full-fidelity trees, TypeScript's checker running on any tree, rustc/clang error
-  nodes + poisoned types, Go per-statement recovery) — the shared mechanism is an
-  ERROR NODE that both marks the recovered region and SILENCES derived errors; VL's
-  first-error bail is the batch-era outlier. Measured hazard (DECISIONS.md): lifting
-  the bail wholesale invents 5 phantom errors from lossy recoveries (`f(1 2)` parses
-  hole-free to `f(1)`). RECOMMENDED staging that removes the gamble: (1) per-site
-  lossless flag on the existing #2115/#2165 recovery arms (provably lossless — the arm
-  is the statement, nothing dropped) and lift the bail ONLY for files whose every parse
-  diagnostic is lossless-flagged — zero phantom risk by construction, and the LSP stops
-  losing ALL type feedback the moment one parse error exists mid-typing (the real
-  payoff; the server compiles per keystroke); (2) convert lossy skip sites one at a
-  time, each conversion widening the files that keep type feedback. No poison-type
-  plumbing needed until stage 2's tail. Priority: medium — an editor-experience
-  multiplier. Blocked on: owner go for stage 1.
+- **Driver lossless-recovery — expanded brief (owner asked for more detail,
+  2026-09-01).** TODAY: any parse diagnostic bails before typecheck, so one
+  temporarily-unbalanced line kills ALL type feedback for the file while typing (the
+  LSP compiles per keystroke — this is the real motivation). MEASURED HAZARD of just
+  lifting the bail: five phantom errors from lossy recoveries (`f(1 2)` parses to a
+  hole-free `f(1)` → "wrong number of arguments" about a program the user never wrote;
+  a mis-parsed overload → "redeclared =="). Fiction, confidently stated — recorded in
+  DECISIONS.md with the numbers. STAGE 1 (the go/no-go): a per-diagnostic LOSSLESS flag
+  set only by recovery sites that provably preserve the program — the #2115/#2165
+  single-statement-arm recoveries qualify by construction (the arm IS the statement);
+  driver rule: typecheck proceeds iff EVERY parse diagnostic in the file is
+  lossless-flagged. Zero phantom risk by construction (fiction only came from lossy
+  sites, which still bail). Cost: a flag column, one driver condition, fixtures.
+  Coverage: the flagged shapes are the common mid-typing BRACE states; an unclosed
+  paren mid-expression stays bailed until stage 2. STAGE 2 (follow-the-measurement, no
+  ruling now): convert lossy sites one at a time, eventually via error NODES with
+  poison semantics (the rustc/clang/Roslyn/tsc mechanism — the poison type silences
+  derived complaints); the five phantom cases become the standing regression suite,
+  forbidden to typecheck until their sites convert. ALTERNATIVE considered and NOT
+  recommended: serve type diagnostics from the last good parse (positions drift as you
+  type; new errors masked). Every modern reference compiler reports parse+type together
+  (Roslyn full-fidelity trees, tsc's checker on any tree, rustc/clang error nodes, Go
+  per-statement recovery); VL's first-error bail is the batch-era outlier. Recommended:
+  go on stage 1. Blocked on: that word.
 - **`vl compile` → standalone executable** — RULED low priority (owner, 2026-09-01):
   parked from the CLI overhaul (#2080); no design written, none owed until revisited.
 - ~~D971~~ — RESOLVED without a ruling, hours after this ledger was written (the
