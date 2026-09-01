@@ -23552,6 +23552,47 @@ Repro (check rc 0 for the four distinct-backing leaves; the refusal names itself
     // SHOULD PRINT 2. The annotated ": i64[] | null" spelling runs today.
 
 ---
+### D959 — [CLOSED 2026-09-01] `==` across two declared types of the SAME shape: one wasm type, one VL type, and only the emitter disagreed
+
+**closed as `runs` · was a loud emit reject conceding capability (`emitProgram: struct equality is not supported yet`) after `vl check` returned 0 — a clause-2 violation by construction · ZERO corpus cells · found by auditing the phrase list in D958, which surfaced this literal as newly-counted · fixture `tests/cases/objects/struct-eq-same-shape-two-names.vl`**
+
+`type Circle = {r: i32}` beside `type Circle2 = {r: i32}` gets two struct-table rows.
+`binEqStructRow` required the operands to resolve to the SAME row, so `a == b` across the two
+names reached the refusal — on a program the checker had already accepted.
+
+* **THE CHECKER COULD NOT HAVE OWNED IT INSTEAD, and the control proves that rather than
+  asserting it.** `Circle == Dot` with DIFFERENT shapes is already a loud CHECK reject, and so
+  is `1 == "a"`. So the type system is doing its job at this operator; the only thing refusing
+  a legal program was the emitter. VL is structurally typed — `types/struct-union-same-shape.vl`
+  states the rule — so same-shape names are one type and the compare is meaningful.
+
+* **THE FIX IS THE SAFETY PROPERTY ITSELF, MEASURED.** Disassembled, a module declaring both
+  types carries exactly ONE `(struct (field (mut i32)))`: the two rows share a heap index. So
+  the test is `sHeapIdx[lsi] == sHeapIdx[rsi]`, not a field-list comparison — equal fields are
+  what MAKE the heap types equal, but the heap index is what `emitStructEq` actually reads
+  through, so asking it directly cannot drift from what the compare emits.
+
+* **THE REFUSAL KEEPS ITS OTHER CELLS.** `error-arm-struct-equality-mixed.vl` — one union arm
+  against one standalone struct — has genuinely different heap types and still refuses, which
+  is the boundary the row's own header describes ("rather than guessing which table's heap
+  type to read the other side through").
+
+* **BOTH VALUES ARE PINNED, because a fix that returned reference identity would pass a
+  one-value fixture.** `{r: 1} == {r: 1}` is `true` across the two names; `{r: 1} == {r: 2}` is
+  `false`.
+
+Repro (now RUNS, printing `true` then `false`):
+
+    type Circle = { r: i32 }
+    type Circle2 = { r: i32 }
+    function same(a: Circle, b: Circle2): boolean {
+      a == b
+    }
+    print(same({ r: 1 }, { r: 1 }))
+    print(same({ r: 1 }, { r: 2 }))
+    // vl check rc 0; runs, prints true then false.
+
+---
 
 ### D791 — [CLOSED 2026-08-31] READ-ONLY COVARIANCE is lowered by an element-CONVERTING COPY, licensed by a whole-program write scan — D661B's refusal was about the WRITABLE side only
 
