@@ -22582,6 +22582,101 @@ Repro (now runs, printing `0`):
 
 ---
 
+### D931 — a generic value carried in a generic STRUCT FIELD loses its type identity to the field's LAYOUT, and the program prints the wrong answer
+**check-clean SILENTLY WRONG VALUE — the worst outcome class in the scoreboard's vocabulary, and the first `runs but wrong value` cell filed since D832 · found 2026-09-01 by the vl-99 tooling session's generic-`expect` agent, re-verified here against master's own seed before filing · monomorphization keys carrier instances by LAYOUT, so `Expectation<boolean>` collapses onto `Expectation<i32>` · 15 lines, no closure, no union declaration, no `??`**
+
+Repro (prints `i32` twice; the first line SHOULD print `boolean`):
+
+    type Expectation<T> = { actual: T, negated: boolean }
+
+    function expect<T>(value: T): Expectation<T> {
+      return { actual: value, negated: false }
+    }
+
+    function tag<T>(self: Expectation<T>): string {
+      const aw: i32 | i64 | f64 | boolean | string | T = self.actual
+      if aw is boolean { return "boolean" }
+      if aw is i32 { return "i32" }
+      "other"
+    }
+
+    const _forceI32 = tag(expect(5))
+    print(tag(expect(true)))
+    // vl check rc 0, runs, exit 0. SHOULD PRINT boolean.
+    // PRINTS i32
+
+* **`_forceI32` IS LOAD-BEARING, not scenery.** The collapse needs BOTH instances to exist —
+  it is `Expectation<boolean>` landing on `Expectation<i32>`'s layout key — so the repro
+  instantiates both and prints only one. Delete the binding and there is nothing to collide
+  with and the program prints `boolean` correctly. It is written this way because the grader
+  compares the whole of stdout against a single `// PRINTS` line, and a two-line witness
+  cannot be expressed in one.
+* **THE CONTROL IS ONE STRUCTURAL STEP AWAY AND IT IS CORRECT.** `d931_ctl_raw_param.vl`
+  passes the value as a RAW PARAMETER instead of through the carrier struct and prints
+  `boolean` then `i32`, correctly. So the `is` ladder, the widened annotation and the six-arm
+  union are all fine; what is lost is the instance identity, and it is lost at the FIELD.
+* **WHY THIS IS THE WORST CLASS.** `vl check` returns 0, the module builds, the program runs
+  to completion and exits 0. Every instrument in this repo except a value comparison reports
+  success. The corpus grades it `runs`; only the `@log` expectation catches it, which is why
+  the cell is in `named/` with its answer pinned rather than left to the derived corpus.
+* **IT IS DIRECTLY ON THE GOAL'S TERMS.** Clause 1 is "if `vl check` accepts it, it builds and
+  runs CORRECTLY" — a wrong answer is a soundness violation, not a capability gap, and it does
+  not become one by being quiet.
+* Fixing this plus D932 is what a fully generic `std:test` `expect` needs; the tooling session
+  reports the design already probed working at roughly sixty lines.
+
+### D932 — an `is`-arm BODY is emitted in instances where the guard is statically false, and the arm uses the narrowed value
+**check-clean invalid wasm · found 2026-09-01 with D931, re-verified here · `soundness.md` promises the narrowing is decided statically, and the DECIDING works — what does not exist is arm-body PRUNING · seven lines, hole-generic, no annotation anywhere**
+
+Repro:
+
+    function show(v): string {
+      if v is string { return "\"" + v + "\"" }
+      return "other"
+    }
+
+    print(show("hi"))
+    print(show(5))
+    // vl check rc 0; vl run:
+    //   Invalid input WebAssembly code at offset 388: type mismatch: expected (ref $type)
+    // SHOULD PRINT "hi" (quoted) then other.
+
+* **THE DECIDING HALF ALREADY WORKS**, which is what makes this a pruning gap rather than a
+  narrowing one: `d932_ctl_const_arms.vl` has the same shape with arms that do not USE the
+  narrowed value and it runs. The `i32` instance is emitted with a body that concatenates a
+  string it can never hold.
+* The explicit-`<T>` twin behaves the same, so this is not about inference.
+
+### D933 — generic widening plus a second REF type as `T`: a narrowed use of the other ref arm extracts the wrong heap type
+**check-clean invalid wasm · found 2026-09-01 with D931/D932 · `expected (ref $type), found (ref $type)` at offset 358 with `T = Circle` · TWO controls, both running, isolate it to the narrowed USE**
+
+Repro:
+
+    type Circle = { r: i32 }
+
+    function tag<T>(v: T): string {
+      const aw: i32 | string | T = v
+      if aw is string { return "\"" + aw + "\"" }
+      "o"
+    }
+
+    const c: Circle = { r: 3 }
+    print(tag(c))
+    print(tag("hi"))
+    // vl check rc 0; vl run:
+    //   Invalid input WebAssembly code at offset 358: type mismatch:
+    //   expected (ref $type), found (ref $type)
+    // SHOULD PRINT o then "hi" (quoted).
+
+* **BOTH CONTROLS RUN, and they bracket the defect from opposite sides.**
+  `d933_ctl_const_arms.vl` — the same widening with six CONSTANT arms, no narrowed use —
+  runs. `d933_ctl_direct.vl` — the same narrowed use written DIRECTLY, without the generic —
+  runs. So neither the widening nor the use is the defect on its own; it is the pair.
+* Same family as D932 (a narrowed use inside a generic instance) but a different rung: D932's
+  arm is statically dead and emitted anyway, while D933's arm is live and extracts the wrong
+  heap type. Do not assume one fix serves both — verify, and if it does, say so.
+
+
 ## 6. Coverage gaps — axes not built, and why
 
 Stated plainly rather than reported as a silent zero.
