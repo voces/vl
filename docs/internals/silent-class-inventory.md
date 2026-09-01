@@ -23861,6 +23861,44 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   invalid wasm.
 
 ---
+### D966 — `__array_new__`'s ref-fill "long tail" was one arm, and it is now open at every ANNOTATED spelling
+
+**closed at the ANNOTATED spelling — all four ref fills (nested list, string list, map, closure) deliver through the kind-3 arm and RUN · the un-annotated spelling keeps a loud residue whose single cause, enrolment, the body names by line**
+
+The emitter tested six predicates on the fill — object literal, closure, array, ref-array,
+string-array, map — and refused if any held, under a comment calling them a "long tail". They
+are the same six the kind-3 arm can already serve.
+
+* **KIND 3 IS NOT A STRUCT ARM.** It resolves `refListSlotOfExpr(callIx)` — the ref-list slot
+  of the CALL's own type — and reads the backing/wrapper pair off `rlBackIdx`/`rlWrapIdx`. That
+  is generic over every ref ELEMENT. The one struct-specific thing in it, `anElemStructIdx`, is
+  a `pendingStructIdx` seed an ObjLit fill needs and every other ref fill leaves at -1. So the
+  six-line widening in `arrNewIntrKind` is the whole change, and a nested list, a string list,
+  a map and a closure fill each RUN with it.
+
+* **THE REFUSAL WAS STANDING IN FRONT OF THE LOWERING, not protecting a missing one** — the
+  same shape as the thirteen gaps closed before it. What it was really standing in front of is
+  narrower and is still open: an UN-annotated binding has no interned row for the result.
+
+* **AND THE REMAINING GAP IS ONE LINE, NAMED.** `refListElemNameOfExpr` answers `""` for a
+  non-struct fill, so nothing is enrolled. With the destination ANNOTATED the annotation
+  interns the row and everything works — which is what proves the lowering complete.
+  `tyNameOf(nodeTyIxOf(fill))` is the obvious missing name and is **NOT** it: measured, with
+  the parallel-table read already bounded, it traps the compiler on the annotated path too. So
+  the intern path needs more than a spelling, and that line is where the next attempt starts.
+
+* **A LATENT COMPILER OOB WENT WITH IT.** `rlBackIdx[anSlot]` / `rlWrapIdx[anSlot]` were read
+  with no bound on `anSlot`. Unreachable while the arm only ran for structs; an OOB trap in the
+  COMPILER the moment it widened. Bounded now, and the guard is what returns the clean refusal
+  to the un-annotated case.
+
+Repro (runs, prints `7`):
+
+    const s: i32[] = [7]
+    const xs: i32[][] = __array_new__(3, s)
+    print(xs[0][0])
+    // PRINTS 7
+
 ### D965 — the SCALAR element-converting copy: BUILT, and the pair set is exactly three
 
 **now runs — `i32[]` -> `i64[]`, `i32[]` -> `f64[]` and `f32[]` -> `f64[]` deliver through a
