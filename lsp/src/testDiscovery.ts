@@ -34,16 +34,18 @@
 // A line regex gets `it("}")`, `// it("dead")` and `describe("a\"b")` wrong, and
 // gets the one-line form `vl fmt` produces (`it("x", () => { … })` on a single
 // line) wrong in the other direction. So this tokenizes properly over VL's
-// actual lexical grammar (compiler/lexer.vl): `//` line comments only — there is
-// no block comment — `"…"` strings and `'…'` char literals sharing one escape
-// set (`\n \t \r \\ \" \' \0 \b \f \v \xXX \uXXXX \u{…}`, plus backslash-newline
-// line continuation, unknown escapes kept verbatim), and no interpolation.
+// actual lexical grammar, via `vlLex.ts` — the shared host-side tokenizer this
+// file originally carried inline, lifted out when folding (D9 slot 9) became
+// its second consumer. Comments are DROPPED here (the default): the scan reads
+// token adjacency (`it` then `(`), and a comment token between them would break
+// that reading rather than inform it.
 //
 // Scope nesting tracks PAREN depth, not brace depth: a `describe`'s extent is
 // exactly its own call's parentheses, which is true of every brace style
 // including the formatter's one-liner.
 
 import type { LspRange } from "./typeFeatures.ts";
+import { type LexToken, tokenize } from "./vlLex.ts";
 
 // ---- the discovered tree -----------------------------------------------------
 
@@ -71,229 +73,6 @@ const REGISTRARS: Record<string, TestKind> = {
   itSkip: "itSkip",
 };
 
-// ---- tokenizer ---------------------------------------------------------------
-
-interface Pos {
-  line: number;
-  character: number;
-}
-
-interface Tok {
-  k: "ident" | "str" | "punct";
-  /** The identifier text, the DECODED string value, or the punctuation run. */
-  s: string;
-  start: Pos;
-  end: Pos;
-}
-
-const CH_0 = 48, CH_9 = 57;
-const CH_A = 65, CH_Z = 90, CH_a = 97, CH_z = 122;
-const CH_UNDERSCORE = 95, CH_DOLLAR = 36;
-
-const isDigit = (c: number): boolean => c >= CH_0 && c <= CH_9;
-const isIdentStart = (c: number): boolean =>
-  (c >= CH_A && c <= CH_Z) || (c >= CH_a && c <= CH_z) ||
-  c === CH_UNDERSCORE || c === CH_DOLLAR;
-const isIdentPart = (c: number): boolean => isIdentStart(c) || isDigit(c);
-
-// The single-character escapes, exactly compiler/lexer.vl's set. An escape NOT
-// in here keeps the escaped character verbatim (the lexer warns and does the
-// same), so `\q` decodes to `q`.
-const SIMPLE_ESCAPES: Record<string, string> = {
-  n: "\n",
-  t: "\t",
-  r: "\r",
-  "\\": "\\",
-  '"': '"',
-  "'": "'",
-  "0": "\0",
-  b: "\b",
-  f: "\f",
-  v: "\v",
-};
-
-const hexValue = (source: string, from: number, count: number): number => {
-  let v = 0;
-  for (let i = 0; i < count; i++) {
-    const d = parseInt(source[from + i] ?? "", 16);
-    if (Number.isNaN(d)) return -1;
-    v = v * 16 + d;
-  }
-  return v;
-};
-
-const fromCode = (code: number): string => {
-  if (code < 0 || code > 0x10ffff) return "";
-  try {
-    return String.fromCodePoint(code);
-  } catch {
-    return "";
-  }
-};
-
-interface StringScan {
-  /** Decoded value; meaningless when `terminated` is false. */
-  value: string;
-  /** Index one past the closing quote (or past where the scan gave up). */
-  next: number;
-  terminated: boolean;
-  /** Newlines consumed by line continuations, for position tracking. */
-  lineBreaks: number;
-  /** Index of the last newline consumed, or -1. */
-  lastBreak: number;
-}
-
-/** Scans the literal opening at `source[from]` (a `"` or `'`). */
-const scanStringLiteral = (source: string, from: number): StringScan => {
-  const quote = source[from];
-  let value = "";
-  let i = from + 1;
-  let lineBreaks = 0;
-  let lastBreak = -1;
-  while (i < source.length) {
-    const c = source[i];
-    if (c === quote) {
-      return { value, next: i + 1, terminated: true, lineBreaks, lastBreak };
-    }
-    if (c === "\n") {
-      // An unescaped newline ends the literal in the lexer too (unterminated).
-      return { value, next: i, terminated: false, lineBreaks, lastBreak };
-    }
-    if (c !== "\\") {
-      value += c;
-      i++;
-      continue;
-    }
-    const e = source[i + 1];
-    if (e === undefined) break;
-    if (e === "\n") {
-      // Line continuation: the backslash and the newline both disappear.
-      lineBreaks++;
-      lastBreak = i + 1;
-      i += 2;
-      continue;
-    }
-    if (e === "x") {
-      const v = hexValue(source, i + 2, 2);
-      if (v >= 0) {
-        value += fromCode(v);
-        i += 4;
-        continue;
-      }
-    } else if (e === "u") {
-      if (source[i + 2] === "{") {
-        const close = source.indexOf("}", i + 3);
-        if (close > i + 2 && close - (i + 3) <= 6) {
-          const v = hexValue(source, i + 3, close - (i + 3));
-          if (v >= 0) {
-            value += fromCode(v);
-            i = close + 1;
-            continue;
-          }
-        }
-      } else {
-        const v = hexValue(source, i + 2, 4);
-        if (v >= 0) {
-          value += fromCode(v);
-          i += 6;
-          continue;
-        }
-      }
-    }
-    // A simple escape, or an unknown one kept verbatim.
-    value += SIMPLE_ESCAPES[e] ?? e;
-    i += 2;
-  }
-  return { value, next: source.length, terminated: false, lineBreaks, lastBreak };
-};
-
-/**
- * Every token that matters, in order. Whitespace and `//` comments are dropped;
- * a char literal is dropped too (it can never be a test name and it can hold a
- * `"` that would otherwise derail the string scan). EVERY other character
- * becomes a punct token — a cheap way to guarantee that "identifier immediately
- * followed by `(`" really means a call, so `xs[it]("x")` cannot be mistaken for
- * one.
- */
-const tokenize = (source: string): Tok[] => {
-  const toks: Tok[] = [];
-  let i = 0;
-  let line = 0;
-  let lineStart = 0;
-  const posAt = (idx: number): Pos => ({
-    line,
-    character: idx - lineStart,
-  });
-  while (i < source.length) {
-    const c = source[i];
-    if (c === "\n") {
-      line++;
-      i++;
-      lineStart = i;
-      continue;
-    }
-    if (c === " " || c === "\t" || c === "\r" || c === "\f" || c === "\v") {
-      i++;
-      continue;
-    }
-    if (c === "/" && source[i + 1] === "/") {
-      const nl = source.indexOf("\n", i);
-      i = nl < 0 ? source.length : nl;
-      continue;
-    }
-    if (c === '"' || c === "'") {
-      const start = posAt(i);
-      const scan = scanStringLiteral(source, i);
-      if (scan.lineBreaks > 0) {
-        line += scan.lineBreaks;
-        lineStart = scan.lastBreak + 1;
-      }
-      const end = posAt(scan.next);
-      if (c === '"' && scan.terminated) {
-        toks.push({ k: "str", s: scan.value, start, end });
-      } else if (!scan.terminated) {
-        // Unterminated: emit nothing, but do not rescan the same characters.
-        toks.push({ k: "punct", s: c, start, end });
-      }
-      i = scan.next;
-      continue;
-    }
-    const code = source.charCodeAt(i);
-    if (isIdentStart(code)) {
-      const from = i;
-      while (i < source.length && isIdentPart(source.charCodeAt(i))) i++;
-      toks.push({
-        k: "ident",
-        s: source.slice(from, i),
-        start: posAt(from),
-        end: posAt(i),
-      });
-      continue;
-    }
-    if (isDigit(code)) {
-      // A numeric run is one opaque token — never a call target, and keeping it
-      // whole stops `1.0` from emitting a `.` that would gate a later ident.
-      const from = i;
-      while (i < source.length) {
-        const cc = source.charCodeAt(i);
-        if (isIdentPart(cc)) i++;
-        else if (source[i] === "." && isDigit(source.charCodeAt(i + 1))) i++;
-        else break;
-      }
-      toks.push({
-        k: "punct",
-        s: source.slice(from, i),
-        start: posAt(from),
-        end: posAt(i),
-      });
-      continue;
-    }
-    toks.push({ k: "punct", s: c, start: posAt(i), end: posAt(i + 1) });
-    i++;
-  }
-  return toks;
-};
-
 // ---- discovery ---------------------------------------------------------------
 
 interface Frame {
@@ -310,7 +89,7 @@ export const discoverTests = (source: string): DiscoveredTest[] => {
   let depth = 0;
   for (let i = 0; i < toks.length; i++) {
     const t = toks[i];
-    if (t.k === "punct") {
+    if (t.kind === "punct") {
       if (t.s === "(") depth++;
       else if (t.s === ")") {
         if (depth > 0) depth--;
@@ -320,18 +99,18 @@ export const discoverTests = (source: string): DiscoveredTest[] => {
       }
       continue;
     }
-    if (t.k !== "ident") continue;
+    if (t.kind !== "ident") continue;
     const kind = REGISTRARS[t.s];
     if (kind === undefined) continue;
     // A member call (`suite.it("x")`) is somebody else's `it`.
     const prev = toks[i - 1];
-    if (prev !== undefined && prev.k === "punct" && prev.s === ".") continue;
+    if (prev !== undefined && prev.kind === "punct" && prev.s === ".") continue;
     // A registration is `name ( "literal"` and nothing else: a declaration
     // (`function it(name: string …)`) and a dynamic name both fail here.
     const open = toks[i + 1];
     const arg = toks[i + 2];
-    if (open === undefined || open.k !== "punct" || open.s !== "(") continue;
-    if (arg === undefined || arg.k !== "str") continue;
+    if (open === undefined || open.kind !== "punct" || open.s !== "(") continue;
+    if (arg === undefined || arg.kind !== "str") continue;
     const scope = stack.length > 0 ? stack[stack.length - 1].node.path : "";
     const node: DiscoveredTest = {
       kind,

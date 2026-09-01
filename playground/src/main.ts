@@ -446,6 +446,26 @@ monaco.languages.registerCompletionItemProvider(VL_LANGUAGE_ID, {
   },
 });
 
+// --- folding range provider --------------------------------------------------
+//
+// The only provider here that is not seed-backed: `lsp.foldingRanges` is a
+// token scan, so it works before the checker loads and while it is failing to.
+// Monaco's `FoldingRange` is 1-based and inclusive on both ends, so both lines
+// shift by one from the LSP form the adapter speaks.
+const FOLDING_KIND: Record<string, monaco.languages.FoldingRangeKind> = {
+  comment: monaco.languages.FoldingRangeKind.Comment,
+  imports: monaco.languages.FoldingRangeKind.Imports,
+};
+
+monaco.languages.registerFoldingRangeProvider(VL_LANGUAGE_ID, {
+  provideFoldingRanges: (model) =>
+    lsp.foldingRanges(model.getValue()).map((r) => ({
+      start: r.startLine + 1,
+      end: r.endLine + 1,
+      kind: r.kind === undefined ? undefined : FOLDING_KIND[r.kind],
+    })),
+});
+
 // --- theme management --------------------------------------------------------
 //
 // Tri-state: AUTO (follow OS) by default; clicking pins an explicit override;

@@ -1755,7 +1755,11 @@ seed from current `compiler/*.vl` in ~40s.*
   8. ✅ Testing API: per-test click-to-run — #2112 — TestController + tokenizer-based
      discovery (`lsp/src/testDiscovery.ts`); `-t` substring ambiguity measured and
      surfaced, dirty buffers mirrored beside the file so relative imports resolve
-  9. ⬜ Folding ranges + language-config indentation/on-enter rules
+  9. ✅ Folding ranges + language-config indentation/on-enter rules — #TBD — blocks,
+     paren/bracket groups, `//` runs and the leading import block, off the shared host
+     tokenizer (`lsp/src/vlLex.ts`, lifted out of `testDiscovery.ts`) — so it is SEED-FREE,
+     the one handler that survives a missing seed; plus `indentationRules` + `//`/`///`
+     on-enter continuation (no block-comment rule — VL has none)
   10. ⬜ Signature help (bridge grade today; clean grade wants one native export)
   11. ⬜ Doc-comment-aware hover/completion (needs the one native doc-text export;
      the D7 linkifier host side already exists)
