@@ -128,8 +128,15 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   downstream (call sites, explicit forwarding in wrappers, failure output, the
   fn-value edge) is byte-identical between the two spellings. Sequencing: behind
   constraints Phase 1's merge (two concurrent typecheck features is the measured
-  rebase-pain ceiling). BLOCKED ON: the owner's one-word ruling on default arguments
-  v1. The editor-side single-expect anchor is D9 slot 12 and needs no ruling.
+  rebase-pain ceiling). RULED (owner, 2026-09-01, "let's do A — schedule in
+  defaults, then we can do tracking"): DEFAULT ARGUMENTS v1 at the scope above, then
+  track-caller as their first customer (`expect(value: T, caller: CallerLoc =
+  __callsite__)`). One-hop semantics confirmed with the owner: a CallerLoc is one
+  location, never a chain (the chain is the parked trace lane); std may later thread a
+  breadcrumb parent field as a library pattern, no language addition. SCHEDULED behind
+  the constraints-Phase-1 and lossless-recovery merges (both in flight — parser/checker
+  churn ceiling). The editor-side single-expect anchor is D9 slot 12 and needs no
+  ruling.
 - **`vl test --trace` inline run values** — RULED low priority (owner, 2026-09-01,
   "low prio I guess"): keep parked; an emitter flag instrumenting USER programs (never
   the compiler) logging `(site, value)` pairs, extension renders decorations after a
