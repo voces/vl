@@ -7114,7 +7114,7 @@ function anonLeafSlotAllMembers(
         if cfn is Ident {
           // D925 — THROUGH THE BINDING HOP TOO, so a call spelled `f(…)` over `const f =
           // src` is the call site it is. See `anonLeafCalleeFnName`.
-          if anonLeafCalleeFnName(cn.callFn) == fname {
+          if anonLeafCallMayTarget(cn.callFn, fname) {
             const slots = orderArgsByParamNames(
               pNames,
               cn.callArgs,
@@ -7169,7 +7169,7 @@ function anonLeafSlotEnrolMembers(
       if cf >= 0 {
         const cfn = P.nodes[cf]
         if cfn is Ident {
-          if anonLeafCalleeFnName(cn.callFn) == fname {
+          if anonLeafCallMayTarget(cn.callFn, fname) {
             const slots = orderArgsByParamNames(
               pNames,
               cn.callArgs,
@@ -8015,17 +8015,25 @@ export function anonLeafCarryRetMark(origIx: i32, newIx: i32) {
 // D871 — every `FuncDecl` named `nm` has its return row follow the merge. Split out of
 // `anonLeafJoinCallee` because a nested read names more than one function.
 function anonLeafMarkRetMoved(nm: string) {
+  let already = false
   let mi = 0
   while mi < P.nodes.length {
     const md = P.nodes[mi]
     if md is FuncDecl {
       if md.fnName == nm {
         while anonLeafRetMoved.length <= mi { anonLeafRetMoved.push(0) }
+        if anonLeafRetMoved[mi] == 1 { already = true }
         anonLeafRetMoved[mi] = 1
       }
     }
     mi = mi + 1
   }
+  // D948 — AND EVERY FUNCTION THIS ONE SHARES A BINDING WITH. One binding holds one wasm
+  // signature, so a moved return row that some other function is also written to leaves that
+  // binding unable to hold both. Guarded on `already` because the co-move calls back into
+  // this function for each sibling: the second visit finds the mark set and stops, which is
+  // the whole of the recursion's bound.
+  if !already { anonLeafCoMoveFnRets(nm) }
   0
 }
 
@@ -8337,7 +8345,7 @@ function anonLeafParamArgsOk(
         if cfn is Ident {
           // D925 — THROUGH THE BINDING HOP TOO, so a call spelled `f(…)` over `const f =
           // src` is the call site it is. See `anonLeafCalleeFnName`.
-          if anonLeafCalleeFnName(cn.callFn) == fname {
+          if anonLeafCallMayTarget(cn.callFn, fname) {
             // D911 — BOUND BY NAME THEN POSITIONALLY, through the one binder the checker and
             // the emitter share. Refusing every named argument outright (`src(p: { r: 7 })`)
             // was `d891_bound_named_arg`: the position this loop reads is the SOURCE one, and
@@ -8620,7 +8628,12 @@ function anonLeafAnyIndirectCall(): boolean {
       const cfn = P.nodes[cf]
       if cfn is Ident {
         if anonLeafNameIsBound(cfn.identName) {
-          if anonLeafCalleeFnName(cn.callFn) == "" { return true }
+          if anonLeafCalleeFnName(cn.callFn) == "" {
+            // D948 — a binding whose every write is a known function is ATTRIBUTABLE even
+            // when it names more than one; `anonLeafCallMayTarget` reads it for each.
+            const kn: string[] = []
+            if !anonLeafFnValueNames(cfn.identName, kn) { return true }
+          }
         }
       } else {
         return true
@@ -8629,6 +8642,225 @@ function anonLeafAnyIndirectCall(): boolean {
     ci = ci + 1
   }
   false
+}
+
+// D939 — THE ONE FUNCTION EVERY CALLER PASSES TO THE PARAMETER NAMED `nm`, or "".
+//
+// Deliberately narrow, because the name is all this is given and a name does not scope: it
+// answers only when EXACTLY ONE `Param` in the program carries the name, so there is no
+// question which parameter is meant, and when every call site of its owning function passes
+// the SAME single function at that position. Anything else — two parameters sharing a name, a
+// caller passing something that is not a plain function name, a call site whose arguments do
+// not line up, or no call site at all — answers "" and refuses exactly as before.
+const anonLeafParamFnBusy: string[] = []
+
+function anonLeafParamFnTarget(nm: string): string {
+  // D939 — THE RE-ENTRY GUARD, and it is not defensive: this asks
+  // `anonLeafCalleeFnName` of every call site, which asks `anonLeafFnValueTarget`, which asks
+  // THIS — a cycle with no call frame between the two hops for a depth cap to count. Without
+  // it `d925_fn_value_param_callback` exhausted the COMPILER's own stack (measured: a trap
+  // inside the compiler, not a refusal). Exactly D934's lesson one resolver over, and the
+  // second time this file has paid it, so the guard is minted at the entry rather than
+  // threaded through the callee.
+  let bi = 0
+  while bi < anonLeafParamFnBusy.length {
+    if anonLeafParamFnBusy[bi] == nm { return "" }
+    bi = bi + 1
+  }
+  anonLeafParamFnBusy.push(nm)
+  const ans = anonLeafParamFnTargetGo(nm)
+  anonLeafParamFnBusy.pop()
+  ans
+}
+
+function anonLeafParamFnTargetGo(nm: string): string {
+  // The unique `Param` with this name, and the declaration that owns it.
+  let pIx = 0 - 1
+  let owner = 0 - 1
+  let pos = 0 - 1
+  let seen = 0
+  let fi = 0
+  while fi < P.nodes.length {
+    const fd = P.nodes[fi]
+    if fd is FuncDecl {
+      let pj = 0
+      while pj < fd.fnParams.length {
+        const pn = P.nodes[fd.fnParams[pj]]
+        if pn is Param {
+          if pn.parName == nm {
+            seen = seen + 1
+            pIx = fd.fnParams[pj]
+            owner = fi
+            pos = pj
+          }
+        }
+        pj = pj + 1
+      }
+    }
+    fi = fi + 1
+  }
+  if seen != 1 || pIx < 0 || owner < 0 || pos < 0 { return "" }
+  const od = P.nodes[owner]
+  if od is FuncDecl {
+    if !anonLeafOneDeclNamed(od.fnName) { return "" }
+    const pNames: string[] = []
+    let pk = 0
+    while pk < od.fnParams.length {
+      const pnk = P.nodes[od.fnParams[pk]]
+      if pnk is Param { pNames.push(pnk.parName) } else { pNames.push("") }
+      pk = pk + 1
+    }
+    let hit = ""
+    let hits = 0
+    let ci = 0
+    while ci < P.nodes.length {
+      const cn = P.nodes[ci]
+      if cn is Call {
+        if anonLeafCalleeFnName(cn.callFn) == od.fnName {
+          const slots = orderArgsByParamNames(
+            pNames,
+            cn.callArgs,
+            cn.callArgNames,
+          )
+          if slots.length != pNames.length { return "" }
+          if pos >= slots.length { return "" }
+          const av = unwrapParen(slots[pos])
+          if av < 0 { return "" }
+          const avn = P.nodes[av]
+          if avn is Ident {
+            if !anonLeafOneDeclNamed(avn.identName) { return "" }
+            if hits > 0 {
+              if hit != avn.identName { return "" }
+            }
+            hit = avn.identName
+            hits = hits + 1
+          } else {
+            return ""
+          }
+        }
+      }
+      ci = ci + 1
+    }
+    if hits == 0 { return "" }
+    return hit
+  }
+  ""
+}
+
+// D948 — EVERY FUNCTION A BINDING MAY HOLD, or false when it may hold something else.
+//
+// `anonLeafFnValueTarget` answers only for a binding written with ONE function name, because
+// its callers need A name. This answers the weaker question its callers actually need — "is
+// the set of functions this call can reach FULLY KNOWN" — and a set of two known functions is
+// as attributable as a set of one. `let f = src; if n > 0 { f = other }` is that set.
+//
+// A `Param` refutes here (its value is the caller's, and D939's resolver is the arm for that);
+// so does a write that is not a plain identifier, or one naming something no single `FuncDecl`
+// declares. Names are appended without dedup — every caller only asks membership.
+function anonLeafFnValueNames(nm: string, out: string[]): boolean {
+  let found = false
+  let i = 0
+  while i < P.nodes.length {
+    const n = P.nodes[i]
+    if n is Param {
+      if n.parName == nm { return false }
+    }
+    let w = 0 - 1
+    if n is LetDecl {
+      if n.letName == nm { w = unwrapParen(n.letInit) }
+    }
+    if n is BinExpr {
+      if n.binOp == "=" {
+        const tgt = unwrapParen(n.binLeft)
+        if tgt >= 0 {
+          const tn = P.nodes[tgt]
+          if tn is Ident {
+            if tn.identName == nm { w = unwrapParen(n.binRight) }
+          }
+        }
+      }
+    }
+    if w >= 0 {
+      const wn = P.nodes[w]
+      if wn is Ident {
+        if !anonLeafOneDeclNamed(wn.identName) { return false }
+        out.push(wn.identName)
+        found = true
+      } else {
+        return false
+      }
+    }
+    i = i + 1
+  }
+  found
+}
+
+// D948 — COULD THIS CALL SITE REACH THE FUNCTION NAMED `fname`?
+//
+// The membership form of `anonLeafCalleeFnName == fname`, which every argument reader in this
+// file was spelling. A call through a binding that may hold TWO known functions is a call site
+// of BOTH, and reading it for only the one the binding happens to name first is how
+// `d925_fn_value_two_targets` had a source no reader saw.
+function anonLeafCallMayTarget(callFn: i32, fname: string): boolean {
+  if fname == "" { return false }
+  if anonLeafCalleeFnName(callFn) == fname { return true }
+  const cf = unwrapParen(callFn)
+  if cf < 0 { return false }
+  const cfn = P.nodes[cf]
+  if cfn is Ident {
+    if anonLeafOneDeclNamed(cfn.identName) { return false }
+    const names: string[] = []
+    if !anonLeafFnValueNames(cfn.identName, names) { return false }
+    let i = 0
+    while i < names.length {
+      if names[i] == fname { return true }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// D948 — THE OTHER FUNCTIONS `nm` SHARES A BINDING WITH: their return rows are COUPLED to its.
+//
+// One binding holds one wasm signature. Moving `src`'s return row while `other`'s stays narrow
+// gives `let f = src; f = other` two functions it cannot both hold — invalid wasm, and exactly
+// what `d925_fn_value_two_targets` was. So a merge that moves one moves the whole set.
+function anonLeafCoMoveFnRets(nm: string) {
+  let i = 0
+  while i < P.nodes.length {
+    const n = P.nodes[i]
+    let bn = ""
+    if n is LetDecl { bn = n.letName }
+    if n is BinExpr {
+      if n.binOp == "=" {
+        const tgt = unwrapParen(n.binLeft)
+        if tgt >= 0 {
+          const tn = P.nodes[tgt]
+          if tn is Ident { bn = tn.identName }
+        }
+      }
+    }
+    if bn != "" {
+      const names: string[] = []
+      if anonLeafFnValueNames(bn, names) {
+        let hasNm = false
+        let j = 0
+        while j < names.length {
+          if names[j] == nm { hasNm = true }
+          j = j + 1
+        }
+        if hasNm {
+          let k = 0
+          while k < names.length {
+            if names[k] != nm { anonLeafMarkRetMoved(names[k]) }
+            k = k + 1
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  0
 }
 
 // D925 — THE FUNCTION A CALL'S CALLEE POSITION NAMES, through at most one binding hop, or "".
@@ -8657,7 +8889,12 @@ function anonLeafFnValueTarget(nm: string): string {
   while i < P.nodes.length {
     const n = P.nodes[i]
     if n is Param {
-      if n.parName == nm { return "" }
+      // D939 — A CALLBACK PARAMETER IS RESOLVABLE WHEN ITS OWN CALL SITES AGREE, which is
+      // D891's rung one frame further out: a parameter's sources are the ARGUMENTS at every
+      // call site of the function that declares it. The sentence this replaces read "a `Param`
+      // named `nm` refutes outright: its value is whatever the caller passed" — true of a
+      // parameter in general, and not of one whose every caller passes the same function name.
+      if n.parName == nm { return anonLeafParamFnTarget(nm) }
     }
     let w = 0 - 1
     if n is LetDecl {
