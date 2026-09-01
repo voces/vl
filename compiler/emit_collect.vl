@@ -7036,7 +7036,12 @@ function anonLeafNarrowUseMark() {
           if ok {
             let pk = 0
             while pk < fd.fnParams.length {
-              if anonLeafSlotAllMembers(fd.fnName, pNames, pk) {
+              // D935 — OR A SLOT THIS CAN MAKE all-members, by enrolling the plain literals
+              // beside the family ones. See `anonLeafSlotEnrolMembers`.
+              if (
+                anonLeafSlotAllMembers(fd.fnName, pNames, pk) ||
+                anonLeafSlotEnrolMembers(fd.fnName, pNames, pk)
+              ) {
                 while anonLeafParamMoved.length <= fd.fnParams[pk] {
                   anonLeafParamMoved.push(0)
                 }
@@ -7110,6 +7115,213 @@ function anonLeafSlotAllMembers(
     ci = ci + 1
   }
   member
+}
+
+// D935 — A SLOT THAT RECEIVES *SOME* FAMILY MEMBERS: ENROL THE REST RATHER THAN DECLINE.
+//
+// `anonLeafSlotAllMembers` refuses the moment one call site hands the slot a literal that is
+// not already at the merged row, and refusing is the right answer for a slot this cannot make
+// uniform. But it is the WRONG answer when the odd argument is a bare object literal, because
+// declining does not un-widen the members: `keep(q)` still passes a moved `q` into a slot that
+// kept the narrow row, and the module is invalid wasm rather than a refusal. That is
+// `d924_narrow_use_mixed_sites` — and note that NEITHER call site is a defect on its own, only
+// the pair, which is why every single-site reader in this family walked past it.
+//
+// So the literal joins the family instead. It is enrolled at the members' own row and
+// annotation — `anonLeafJoinedMark`'s three arrays, written exactly as a `??`'s own member is —
+// and only when its field NAMES match a member's exactly. That last test is what keeps this
+// from widening a shape the merge never covered: the param annotation admits both arguments,
+// but the family row can be wider than the annotation, and a literal missing one of its fields
+// would be enrolled at a row it cannot fill.
+function anonLeafSlotEnrolMembers(
+  fname: string,
+  pNames: string[],
+  pos: i32,
+): boolean {
+  const members: i32[] = []
+  const plain: i32[] = []
+  let ci = 0
+  while ci < P.nodes.length {
+    const cn = P.nodes[ci]
+    if cn is Call {
+      const cf = unwrapParen(cn.callFn)
+      if cf >= 0 {
+        const cfn = P.nodes[cf]
+        if cfn is Ident {
+          if anonLeafCalleeFnName(cn.callFn) == fname {
+            const slots = orderArgsByParamNames(
+              pNames,
+              cn.callArgs,
+              cn.callArgNames,
+            )
+            if slots.length != pNames.length { return false }
+            if pos >= slots.length { return false }
+            if slots[pos] < 0 { return false }
+            const av = unwrapParen(slots[pos])
+            if av < 0 { return false }
+            const avn = P.nodes[av]
+            if avn is NullLit { 0 }
+            else if anonLeafDeliversMember(av) { members.push(av) }
+            else if avn is ObjLit { plain.push(av) }
+            else if anonLeafIdentAllObjLits(av, plain) { 0 }
+            else { return false }
+          }
+        }
+      }
+    }
+    ci = ci + 1
+  }
+  if members.length == 0 { return false }
+  if plain.length == 0 { return false }
+  // THE SHAPE TO MATCH AGAINST is a member's own literal — through the binding hop when the
+  // member is an identifier, which is the ordinary case and was `d924_narrow_use_mixed_sites`
+  // itself: there the family member reaching the slot is `q`, never a literal at the call site.
+  let shape = 0 - 1
+  let mi = 0
+  while mi < members.length {
+    if shape < 0 { shape = anonLeafMemberLit(members[mi]) }
+    mi = mi + 1
+  }
+  if shape < 0 { return false }
+  let pi = 0
+  while pi < plain.length {
+    if !anonLeafSameFieldNames(shape, plain[pi]) { return false }
+    pi = pi + 1
+  }
+  // Every check has passed, so the writes happen together — a partial enrolment would leave
+  // exactly the split this exists to close.
+  let wi = 0
+  while wi < plain.length {
+    const w = plain[wi]
+    if w >= 0 && w < anonLeafJoined.length {
+      anonLeafJoined[w] = 1
+      if anonLeafFamRow[w] < 0 { anonLeafFamRow[w] = anonLeafFamRowOf(shape) }
+      if anonLeafAnnTy[w] < 0 { anonLeafAnnTy[w] = anonLeafAnnTyOf(shape) }
+    }
+    wi = wi + 1
+  }
+  true
+}
+
+// D935 — AN IDENTIFIER ARGUMENT WHOSE EVERY WRITE IS A PLAIN OBJECT LITERAL: append those
+// literals to `plain` and answer true.
+//
+// The binding hop of the enrolment, and the ordinary spelling of it: `const z = { r: 3 };
+// keep(z)` is the same call site as `keep({ r: 3 })` with a name in the way, and
+// `anonLeafDeliversMember` answers false for it because the write is not yet joined. Without
+// this arm the whole slot declines and the members stay widened beside a narrow slot — the
+// defect `anonLeafSlotEnrolMembers` exists to close, reached by a different spelling.
+//
+// A name with NO write, or one write this cannot see, answers false: enrolling the literals it
+// DOES name would move the slot's row while that unseen value keeps the old one.
+function anonLeafIdentAllObjLits(av: i32, plain: i32[]): boolean {
+  const avn = P.nodes[av]
+  if avn is Ident {
+    const lits: i32[] = []
+    let li = 0
+    while li < P.nodes.length {
+      const lnn = P.nodes[li]
+      let w = 0 - 1
+      if lnn is LetDecl {
+        if lnn.letName == avn.identName { w = unwrapParen(lnn.letInit) }
+      }
+      if lnn is BinExpr {
+        if lnn.binOp == "=" {
+          const tgt = unwrapParen(lnn.binLeft)
+          if tgt >= 0 {
+            const tn = P.nodes[tgt]
+            if tn is Ident {
+              if tn.identName == avn.identName { w = unwrapParen(lnn.binRight) }
+            }
+          }
+        }
+      }
+      if w >= 0 {
+        const wn = P.nodes[w]
+        if wn is NullLit { 0 }
+        else if wn is ObjLit { lits.push(w) }
+        else { return false }
+      }
+      li = li + 1
+    }
+    if lits.length == 0 { return false }
+    let ki = 0
+    while ki < lits.length {
+      plain.push(lits[ki])
+      ki = ki + 1
+    }
+    return true
+  }
+  false
+}
+
+// D935 — THE OBJECT LITERAL A FAMILY MEMBER DELIVERS: itself, or the one written to its name.
+//
+// `anonLeafDeliversMember` has already proved every write of an identifier member is a joined
+// literal, so the first one found is representative and the scan does not re-check them.
+function anonLeafMemberLit(av: i32): i32 {
+  if av < 0 { return 0 - 1 }
+  const avn = P.nodes[av]
+  if avn is ObjLit { return av }
+  if avn is Ident {
+    let li = 0
+    while li < P.nodes.length {
+      const lnn = P.nodes[li]
+      let w = 0 - 1
+      if lnn is LetDecl {
+        if lnn.letName == avn.identName { w = unwrapParen(lnn.letInit) }
+      }
+      if lnn is BinExpr {
+        if lnn.binOp == "=" {
+          const tgt = unwrapParen(lnn.binLeft)
+          if tgt >= 0 {
+            const tn = P.nodes[tgt]
+            if tn is Ident {
+              if tn.identName == avn.identName { w = unwrapParen(lnn.binRight) }
+            }
+          }
+        }
+      }
+      if w >= 0 {
+        const wn = P.nodes[w]
+        if wn is ObjLit { return w }
+      }
+      li = li + 1
+    }
+  }
+  0 - 1
+}
+
+// D935 — DO TWO OBJECT LITERALS NAME THE SAME FIELDS, in any order?
+function anonLeafSameFieldNames(a: i32, b: i32): boolean {
+  const an = P.nodes[a]
+  const bn = P.nodes[b]
+  if an is ObjLit {
+    if bn is ObjLit {
+      if an.objFields.length != bn.objFields.length { return false }
+      let i = 0
+      while i < an.objFields.length {
+        const af = P.nodes[an.objFields[i]]
+        if af is FieldInit {
+          let found = false
+          let j = 0
+          while j < bn.objFields.length {
+            const bf = P.nodes[bn.objFields[j]]
+            if bf is FieldInit {
+              if bf.fiName == af.fiName { found = true }
+            }
+            j = j + 1
+          }
+          if !found { return false }
+        } else {
+          return false
+        }
+        i = i + 1
+      }
+      return true
+    }
+  }
+  false
 }
 
 // D924 — IS THE ARGUMENT NODE `av` A FAMILY MEMBER, or a binding that only ever holds one?
@@ -8246,9 +8458,10 @@ function anonLeafFrameRebinds(root: i32, nm: string): boolean {
 // is `d911_arg_ident_unnameable`, and it composes two rungs that were already here rather than
 // adding a reader.
 //
-// A MODULE-SCOPE binding still answers -1 and still refutes, which is a real bound and not an
-// oversight: `anonLeafRetIdentOk` resolves against a function's bindings and a parameter list,
-// and module scope has neither. `d921_arg_ident_module_chain` is that cell.
+// D934 — A MODULE-SCOPE binding used to answer -1 and refute, and that was NOT a real bound.
+// The sentence here read "`anonLeafRetIdentOk` resolves against a function's bindings and a
+// parameter list, and module scope has neither" — true, and the wrong resolver to have asked.
+// See `anonLeafArgIdentSeen`. `d921_arg_ident_module_chain` was that cell.
 function anonLeafArgIdentOk(
   nm: string,
   out: i32[],
@@ -8256,8 +8469,34 @@ function anonLeafArgIdentOk(
   pars: i32[],
   depth: i32,
 ): boolean {
-  const hits: i32[] = []
   const ids: string[] = []
+  anonLeafArgIdentSeen(nm, out, fns, pars, depth, ids)
+}
+
+// D934 — THE SAME SCAN, CARRYING THE NAME-VISITED SET, so a module-scope chain can re-enter it.
+//
+// `anonLeafBoundValOk`'s ident arm resolves a bound name against a FRAME, and a module-scope
+// binding has none — that is what refuted `d921_arg_ident_module_chain`. But this scan never
+// needed a frame: it resolves by NAME over the whole arena, which is exactly the scope a
+// module-level name resolves in. So the missing rung was not a reader, it was the recursion
+// back into this function, and the recursion needs D911's visited set to be SHARED rather than
+// minted per call — `const a = b` / `const b = a` at module scope is a cycle the depth cap does
+// not bound, for the same reason an ident chain opens no call frame.
+function anonLeafArgIdentSeen(
+  nm: string,
+  out: i32[],
+  fns: string[],
+  pars: i32[],
+  depth: i32,
+  ids: string[],
+): boolean {
+  let vi = 0
+  while vi < ids.length {
+    if ids[vi] == nm { return true }
+    vi = vi + 1
+  }
+  ids.push(nm)
+  const hits: i32[] = []
   let li = 0
   while li < P.nodes.length {
     const lnn = P.nodes[li]
@@ -8569,6 +8808,16 @@ function anonLeafBoundValOk(
     return true
   }
   if vn is Ident {
+    // D934 — a MODULE-SCOPE binding has no frame, and `anonLeafRetIdentOk` resolves against a
+    // frame's bindings and parameter list. The by-name whole-arena scan is the right scope for
+    // that name, so it answers here instead of refuting.
+    if body < 0 {
+      if !anonLeafArgIdentSeen(vn.identName, out, fns, pars, depth, ids) {
+        return false
+      }
+      hits.push(v)
+      return true
+    }
     if !anonLeafRetIdentOk(vn.identName, body, out, fns, pars, depth, ids) {
       return false
     }
