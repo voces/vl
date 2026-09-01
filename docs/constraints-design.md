@@ -203,8 +203,41 @@ what VL needs, and the WasmGC note above marks the only revisit trigger.
   OQ-1 and OQ-3 are one decision wearing two numbers.
 * **OQ-2 — operator bounds**: deferred above; reopen when a real API needs to export a
   generic whose operator demand should be documentation-stable.
-* **OQ-3 — accept Phase 2's scope-relative satisfaction?** The alternative (fields only)
-  keeps bounds scope-independent but excludes UFCS, which is how std itself is written.
+* **OQ-3 — accept Phase 2's scope-relative satisfaction? EXPANDED after owner probing
+  (2026-09-01, the boundary question).** First, the spelling system that covers the
+  owner's three demands (field / capability / EITHER), built on measured call shapes:
+  **colon = the data exists** (`{ toString: () => string }` — the value carries a
+  closure, called with nothing fed in; the self-typed variant `{ toString: (T) =>
+  string }` is also a field, its call spelled `x.toString(x)`); **self = the call
+  works** (`{ toString(self): string }` — C++-concepts expression semantics: 
+  `x.toString()` checks with result `string` under the resolution order every call
+  already uses, field first then UFCS — measured). The self form IS the either-form; a
+  UFCS-only demand has no constructible use (why forbid a field that makes the same
+  call work?), so two spellings cover the space. Note the syntax is free: `(self: T)`
+  inside a function type does not parse today, so the named-self spelling collides
+  with nothing.
+
+  **Does a UFCS capability ride a context across boundaries? No.** Under
+  monomorphization the witness is captured AT INSTANTIATION and baked into the minted
+  instance — nothing travels at runtime. Bounds chain through nested bounded generics
+  for free (the inner instantiation happens inside the outer instance, where the bound
+  is in force — Rust/Haskell dictionary chaining, minus the dictionaries). The chain
+  breaks exactly where a vtable-less design must: **the capability never travels with
+  the value** — store the struct, hand it to unbounded code elsewhere, and nothing
+  carries toString there. Traveling-with-the-value is what the FIELD form is for;
+  that asymmetry is why both spellings exist.
+
+  **Which scope is consulted at instantiation** — three precedents: call-site scope
+  (Scala implicits: flexible, notoriously confusing, instances keyed by witness so one
+  value can behave differently per file); global one-impl-per-type (Rust/Haskell:
+  unambiguous, needs orphan-rule discipline, and "per type" is fuzzy for structural
+  types); the type's home module (Go-flavored ADL: coherent, but structural types have
+  no home module). **RECOMMENDED: call-site resolution + whole-program coherence.** VL
+  compiles whole-program — the one thing Rust lacks and the reason the orphan rule
+  exists there — so VL can resolve each instantiation in its own scope AND refuse (or
+  warn) at merge time if two instantiations of one generic at one T carry DIFFERENT
+  witnesses, naming both sites. Scala's flexibility, Rust's guarantee, enforced by the
+  compilation model instead of a declaration rule.
 * **OQ-4 — bound spelling**: RULED (owner, 2026-09-01, "OQ-4 seems reasonable") —
   `<T: Showable>`.
 * **OQ-5 — declaration-checking strictness**: may a bounded body use ONLY what bounds
