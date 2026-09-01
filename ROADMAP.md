@@ -1750,7 +1750,7 @@ seed from current `compiler/*.vl` in ~40s.*
      type per binding, last write wins; narrowing is flow-sensitive); hover prefers the
      occurrence's type, and the member-completion receiver resolution reads the same
      store. One native change, two surfaces. Pairs with 5's render pathway.
-  7. ⬜ Rename symbol (+prepare) — `referencesAt`/`crossFileReferences`; its own PR
+  7. ✅ Rename symbol (+prepare) — #2103 — `referencesAt`/`crossFileReferences`; its own PR
      (write-path feature, alias/import edges need care)
   8. ⬜ **Testing API: per-test click-to-run** — `vl test <file> -t <substring>` suffices
      (no CLI change); TestController over CodeLens per the survey's assessment
