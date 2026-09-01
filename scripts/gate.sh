@@ -37,6 +37,15 @@ run() { NAMES+=("$1"); STARTS+=("$(date +%s.%N)"); shift
 run "deno task test"           deno task test
 run "ci-native"                env SELFHOST_NATIVE_ALIGN=1 bash -c \
                                  'deno test -A --no-check --parallel tests/selfhost_native_*_test.ts tests/vl_*_test.ts'
+# The ci-native JOB also runs an EXPLICIT list of seed-backed editor suites that
+# match neither glob above (ci.yml's "Editor features on the wasm compiler"
+# step). Measured gap, 2026-09-01: nine local gates were green while master's
+# ci-native was red on exactly those files (#2104×#2105). The list is extracted
+# FROM ci.yml at run time so the two can never drift — ci_seed_coverage_test.ts
+# guards ci.yml's side of the contract — and an empty extraction fails loudly
+# rather than silently passing.
+run "lsp suites (ci list)"     env SELFHOST_NATIVE_ALIGN=1 bash -c \
+                                 'L=$(awk "/Editor features on the wasm compiler/{f=1; next} f && /- name:/{exit} f{print}" .github/workflows/ci.yml | grep -oE "tests/[a-zA-Z0-9_]+\.ts" | sort -u); [ -n "$L" ] || { echo "no lsp suite list extracted from ci.yml" >&2; exit 1; }; deno test -A --no-check --parallel $L'
 run "native-fixpoint"          bash scripts/native-fixpoint.sh
 run "lint-self + fmt"          bash scripts/lint-self.sh
 run "deno lint"                deno lint
