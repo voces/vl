@@ -299,7 +299,7 @@ Deno.test({
   // The owner's function WITHOUT the annotation — a supported VL idiom that runs
   // (`tests/cases/inference/hole-is-guard-return-join.vl`).
   const src =
-    `function foobar(v) {\n  if v is { foo: string } then return v.foo\n  return v.bar\n}\nprint(foobar({ bar: 42 }))\n`;
+    `function foobar(v) {\n  if v is { foo: string } { return v.foo }\n  return v.bar\n}\nprint(foobar({ bar: 42 }))\n`;
   assertEquals(
     (await checker.check(src, "/tmp/x.vl", noSiblings)).length,
     0,
