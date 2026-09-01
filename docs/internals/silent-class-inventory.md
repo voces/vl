@@ -23790,6 +23790,45 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   invalid wasm.
 
 ---
+### D976 — a closure-valued FIELD called on a HOLE-typed parameter: the call lowers correctly and `print` picks the wrong import
+
+**check-clean invalid wasm · reported by the owner, minimized by vl-b7, verified here · `scripts/capability-probes/hole-param-closure-field-call.vl` is the standing measurement**
+
+    const a = { f: () => "ok" }
+    function p2(x) { print(x.f()) }
+    p2(a)
+
+* **THE CALL IS RIGHT; ONLY THE IMPORT CHOICE IS WRONG — read off the bytes, not guessed.**
+  The disassembly shows `call_indirect (type $6)` returning `(ref $3)`, a string, and then
+  `call $fimport$0` — `__print_i32__`. The failure is
+  `expected i32, found (ref $type)`. So the closure-field call through a hole receiver lowers
+  correctly and the print DISPATCH cannot see that its argument is a string.
+
+* **FIVE-CELL ABLATION.** Annotating the param runs. A NON-closure field runs. The same call at
+  top level with no param runs. Reading the field WITHOUT calling it is a LOUD emit reject —
+  an adjacent gap, not this one. Only the three ingredients together are silent.
+
+* **AND THE OBVIOUS SITE IS NOT THE SITE.** `emitCall`'s `print` arm — the one carrying the
+  `exprString` test and the `__print_i32__` fallback — is NEVER REACHED for a print statement:
+  probed at the arm's entry, it fires for no program, including ones that fail for other
+  reasons. A checker-typed net added beside `exprString` therefore changed nothing. **Find
+  what actually emits a `print` STATEMENT before touching any print classifier.**
+
+* **AN INSTRUMENT NOTE THAT COST TWO BUILDS HERE.** `emitFail` RECORDS and does not halt, so a
+  probe built on it is silent on any program that goes on to compile — a "control that must
+  fire" has to be a program that fails anyway. Even then it showed nothing here, which is what
+  makes the arm's non-reachability a positive result rather than an absent one.
+
+Repro (check rc 0, invalid wasm):
+
+    const a = { f: () => "ok" }
+    function p2(x) {
+      print(x.f())
+    }
+    p2(a)
+    // vl check rc 0; vl run -> failed to compile: wasm[0]::function[4]::p2
+
+---
 ### D977 — `.pop()` on the SCALAR-LIST family: no arm, and a discarded pop lands as invalid wasm
 
 **closed — `i64[]`, `f64[]`, `f32[]` and `u8[]` now pop through the same shape the i32 default uses · found by std:fmt's exact big-integer arithmetic (serde stage 0), which carried a `bnLen` scan because it could not trim high zero limbs**
