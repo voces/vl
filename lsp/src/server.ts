@@ -76,6 +76,7 @@ import {
   keywordCompletions,
   type LspRange,
   memberCompletionsFromWasm,
+  organizeImportEdits,
   type OutlineSymbolKind,
   refCountLensTitle,
   scopeCompletionsFromBindings,
@@ -1041,37 +1042,73 @@ connection.onDocumentFormatting((params): TextEdit[] => {
   return [{ range: fullRange, newText: formatted }];
 });
 
-// Quick-fixes (code actions) for lint diagnostics (B17). The editor passes the
-// diagnostics overlapping the cursor/selection in `params.context.diagnostics`;
-// we key off each diagnostic's stable `code` and precise `range` to compute
-// plain text edits (see `codeActions.ts`), then wrap them in `CodeAction` +
-// `WorkspaceEdit` envelopes. We also fold in cached `vital` diagnostics on an
-// overlapping line, so a fix is still offered when the cursor sits off the
-// diagnostic's exact range. Only `vital`-sourced lint diagnostics with a known
-// code yield actions; everything else is ignored.
+// Quick-fixes (code actions) for lint diagnostics (B17) + organize imports
+// (D9). The editor passes the diagnostics overlapping the cursor/selection in
+// `params.context.diagnostics`; we key off each diagnostic's stable `code` and
+// precise `range` to compute plain text edits (see `codeActions.ts`), then wrap
+// them in `CodeAction` + `WorkspaceEdit` envelopes. We also fold in cached
+// `vital` diagnostics on an overlapping line, so a fix is still offered when
+// the cursor sits off the diagnostic's exact range. Only `vital`-sourced lint
+// diagnostics with a known code yield actions; everything else is ignored.
+//
+// `context.only` is honoured per the LSP kind hierarchy (a filter matches a
+// kind equal to it or nested under it), so an `editor.codeActionsOnSave`
+// request for `source.organizeImports` gets exactly the organize action and a
+// plain lightbulb request gets everything.
+const kindMatchesOnly = (kind: string, only: string[] | undefined): boolean =>
+  only === undefined ||
+  only.some((k) => kind === k || kind.startsWith(k + "."));
+
 connection.onCodeAction((params): CodeAction[] => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return [];
   const source = doc.getText();
   const uri = params.textDocument.uri;
-
-  const cached = (diagnosticsByUri.get(uri) ?? []).map(toLspDiagnostic);
-  const diagnostics = fixableDiagnosticsForRange(
-    params.context.diagnostics,
-    cached,
-    params.range,
-  );
+  const only = params.context.only;
 
   const actions: CodeAction[] = [];
-  for (const diag of diagnostics) {
-    const fixes = quickFixesForDiagnostic(source, diag.code, diag.range);
-    for (const fix of fixes) {
+  if (kindMatchesOnly(CodeActionKind.QuickFix, only)) {
+    const cached = (diagnosticsByUri.get(uri) ?? []).map(toLspDiagnostic);
+    const diagnostics = fixableDiagnosticsForRange(
+      params.context.diagnostics,
+      cached,
+      params.range,
+    );
+    for (const diag of diagnostics) {
+      const fixes = quickFixesForDiagnostic(source, diag.code, diag.range);
+      for (const fix of fixes) {
+        actions.push({
+          title: fix.title,
+          kind: CodeActionKind.QuickFix,
+          diagnostics: [diag],
+          isPreferred: fix.isPreferred,
+          edit: { changes: { [uri]: fix.edits } },
+        });
+      }
+    }
+  }
+
+  // Organize imports: per-STATEMENT rewrite aligned with `vl fmt`'s canon —
+  // unused specifiers dropped (from the lint tier, re-run against the
+  // request-time text so a stale cache can't misplace an edit), survivors
+  // fmt-sorted via the seed's own formatter, a specifier-less statement's line
+  // deleted whole. Statements are never merged or reordered (fmt preserves
+  // statement order). No edits — the file is already organized — means NO
+  // action: an empty organize on every save is noise.
+  if (kindMatchesOnly(CodeActionKind.SourceOrganizeImports, only)) {
+    const unused = (wasmChecker?.lint(source) ?? [])
+      .filter((d) => d.code === "unused-import")
+      .map((d) => d.range);
+    const edits = organizeImportEdits(
+      source,
+      unused,
+      (stmt) => wasmChecker?.formatSrc?.(stmt),
+    );
+    if (edits.length > 0) {
       actions.push({
-        title: fix.title,
-        kind: CodeActionKind.QuickFix,
-        diagnostics: [diag],
-        isPreferred: fix.isPreferred,
-        edit: { changes: { [uri]: fix.edits } },
+        title: "Organize imports",
+        kind: CodeActionKind.SourceOrganizeImports,
+        edit: { changes: { [uri]: edits } },
       });
     }
   }
@@ -1323,7 +1360,10 @@ connection.onInitialize((params) => {
       documentSymbolProvider: true,
       documentFormattingProvider: true,
       codeActionProvider: {
-        codeActionKinds: [CodeActionKind.QuickFix],
+        codeActionKinds: [
+          CodeActionKind.QuickFix,
+          CodeActionKind.SourceOrganizeImports,
+        ],
       },
       // Export reference-count lenses (D9.4); locations resolve on click.
       codeLensProvider: { resolveProvider: true },
