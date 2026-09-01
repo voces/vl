@@ -22812,7 +22812,7 @@ Repro (now RUNS, printing `7`, `7`, `3`):
 
 ### D936 — the fn-value decline is NOT NEUTRAL: no box is minted and the default then resolves by FIELD NAME onto the narrow row
 
-**check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` · 2 cells (`distilled/named/d925_fn_value_param_callback`, `d925_fn_value_two_targets`), OPEN · reproduces identically on master, so it is not a regression · TWO candidate fixes were built and MEASURED and are REVERTED**
+**check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` · 1 cell still OPEN (`distilled/named/d925_fn_value_two_targets`); the row was filed with TWO, and D939 took the callback-parameter one · was not a regression when filed · TWO candidate fixes were built and MEASURED and are REVERTED, and the third — the one that worked — is D939**
 
 D925 recorded these two as "THE BOUNDS" without a mechanism. This is the mechanism, and it is
 not the one the bound implies.
@@ -22849,23 +22849,31 @@ not the one the bound implies.
   callee returns on the way in. That is a new emit path, not a reader, which is why no reader
   in this eleven-close family reaches it.
 
-Repro (check-clean invalid wasm, on master and here alike):
+* **WHAT D939 SETTLED, AND WHAT IT LEFT.** The callback-parameter spelling closes because a
+  parameter's function target IS resolvable when every caller of its owning function passes the
+  same function — D891's rung one frame out, not box-at-the-join. The bullet above stands for
+  the remaining cell: `let f = src; if n > 0 { f = other }` writes TWO different functions to
+  one binding, so no single target exists to resolve and both callees' return rows would have
+  to move together. THAT one still wants the boxing path.
+
+Repro — the REMAINING cell (`d925_fn_value_two_targets`), check-clean invalid wasm:
 
     function src(p: {r: i32}): {r: i32} | null {
       p
     }
-    function apply(cb: ({r: i32}) => {r: i32} | null): i32 {
-      const v = cb({ r: 9 })
-      1
+    function other(p: {r: i32}): {r: i32} | null {
+      p
     }
-    function rd() {
-      print(apply(src))
+    function rd(n: i32) {
+      let f = src
+      if n > 0 { f = other }
+      const h = f({ r: 9 })
       const g1 = src({ r: 7 }) ?? { r: "s" }
       print(g1.r)
     }
-    rd()
+    rd(0)
     // vl check rc 0; vl run -> type mismatch: expected i32, found (ref $type)
-    // SHOULD PRINT 1 then 7.
+    // SHOULD PRINT 7.
 
 ---
 ### D937 — [CLOSED 2026-09-01] the inferred NULLABLE-MAP return: five sites, and a PRIORITY LADDER that let the non-null fact overwrite the nullable one
@@ -22978,6 +22986,107 @@ Repro (now a LOUD check reject, was check-clean invalid wasm):
     print(take(w))
     // vl check: an object of type OW cannot flow into ON: they agree on field names but
     // differ INSIDE a field, and a struct field is mutable — …
+
+---
+### D939 — [CLOSED 2026-09-01] a callback PARAMETER's function target is resolvable when its own callers agree, and the guard that refused it was D891's rung one frame short
+
+**closed as `runs` · was check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` · 1 cell (`distilled/named/d925_fn_value_param_callback`), the first of D936's two · distilled corpus: `runs -> not-runs` ZERO, `-> silent` ZERO, 1 class forward · fixture `tests/cases/types/coalesce-callee-param-fn-value.vl`**
+
+`anonLeafParamArgsOk`'s function-value guard stands down whenever the program contains a call it
+cannot attribute. `anonLeafFnValueTarget`'s header read *"a `Param` named `nm` refutes outright:
+its value is whatever the caller passed"* — true of a parameter in general, and not of one whose
+every caller passes the SAME function name. That is D891's own rung one frame further out: a
+parameter's sources are the arguments at every call site of the function that declares it.
+
+* **THE DECLINE WAS NOT NEUTRAL — that is D936's finding and why this was a clause-1 cell rather
+  than a refusal.** With the read declined the `??` family kept ONE member, its atom set was a
+  single atom, no union box was minted, and the default `{r: "s"}` then resolved by field NAME
+  onto the narrow `{r: i32}` row: a string ref stored into an i32 field.
+
+* **THE RE-ENTRY GUARD IS LOAD-BEARING AND WAS MEASURED IN THE ORDER THAT PROVES IT** — the
+  first cut had none, and this exact program exhausted the COMPILER's own stack (a trap inside
+  the compiler, not a refusal). The resolver asks `anonLeafCalleeFnName` of every call site,
+  which asks `anonLeafFnValueTarget`, which asks the resolver again — a cycle with no call frame
+  between the hops for the depth cap to count. Exactly D934's lesson one resolver over, and the
+  SECOND time this file has paid it, which is why the guard is minted at the entry rather than
+  threaded through the callee.
+
+* **DELIBERATELY NARROW, because a name does not scope.** The resolver is given a name and
+  nothing else, so it answers only when EXACTLY ONE `Param` in the program carries it. Two
+  parameters sharing a name, a caller passing something that is not a plain function name, a
+  call site whose arguments do not line up, or no call site at all — each answers "" and refuses
+  exactly as before.
+
+* **WHAT IT DOES NOT CLOSE.** `d925_fn_value_two_targets` writes TWO different functions to one
+  binding, so there is no single target to resolve and both callees' return rows would have to
+  move together. That one still wants the boxing path D936 names; it stays open on D936.
+
+Repro (now RUNS, printing `1` then `7`):
+
+    function src(p: {r: i32}): {r: i32} | null {
+      p
+    }
+    function apply(cb: ({r: i32}) => {r: i32} | null): i32 {
+      const v = cb({ r: 9 })
+      1
+    }
+    function rd() {
+      print(apply(src))
+      const g1 = src({ r: 7 }) ?? { r: "s" }
+      print(g1.r)
+    }
+    rd()
+    // vl check rc 0; runs, prints 1 then 7.
+
+---
+### D940 — an UN-ANNOTATED function passed as a value builds and TRAPS: `indirect call type mismatch`, and the hint calls the annotation that saves it redundant
+
+**loads then traps: `vl check` returns 0, the module VALIDATES, and the program traps at run time with `wasm trap: indirect call type mismatch` · reproduces identically on master, so it is not a regression · ZERO corpus cells · found incidentally while writing D939's fixture, by DELETING an annotation a hint had just called redundant**
+
+D939's fixture carries `function apply(cb: …): i32`. `vl check` emits
+*"redundant type annotation: `apply` is inferred as `i32` — remove it to lean on inference"*.
+Remove it and the program stops working — not with a refusal, and not with an invalid module,
+but with a runtime trap.
+
+* **THE HINT IS ABOUT INFERENCE AND THE ANNOTATION IS ABOUT THE LOWERING, and nothing connects
+  them.** The inferred type really is `i32`, so the hint is not lying about what it checked. It
+  is the ADVICE that is wrong: acting on it turns a working program into a trapping one. A hint
+  that a user can follow into a trap is worse than no hint, because it is the compiler telling
+  them to do it.
+
+* **IT IS THE WORST OUTCOME CLASS IN THE INVENTORY'S VOCABULARY.** Not a refusal, not an invalid
+  module the engine rejects up front — a module that loads and then traps, which is the shape
+  that reaches a user as a mystery. The trap is `indirect call type mismatch`, so the function
+  VALUE's signature and the `call_ref` site disagree; the annotated form pins a signature that
+  the inferred form leaves free to differ.
+
+* **THE FIX IS NOT OBVIOUSLY THE ANNOTATION'S END.** Either the un-annotated function's value
+  signature must be pinned the way the annotation pins it, or the hint must stop firing where
+  removing the annotation changes the lowering. The second is cheaper and is a real bound: a
+  hint that cannot be safely followed should not be offered. Both are unscoped here — this row
+  records the witness and the measurement, not a chosen repair.
+
+* **HOW IT WAS FOUND IS THE REUSABLE PART.** `docs` has a standing rule that a load-bearing
+  annotation gets a DECLARED hint rather than a deletion. This is the case that rule exists for,
+  caught by doing the wrong thing first and watching the fixture trap.
+
+Repro (check rc 0; the module validates and the program TRAPS):
+
+    function src(p: {r: i32}): {r: i32} | null {
+      p
+    }
+    function apply(cb: ({r: i32}) => {r: i32} | null) {
+      const _v = cb({ r: 9 })
+      1
+    }
+    function rd() {
+      print(apply(src))
+      const g1 = src({ r: 7 }) ?? { r: "s" }
+      print(g1.r)
+    }
+    rd()
+    // vl check rc 0 (with a hint recommending exactly this deletion);
+    // vl run -> wasm trap: indirect call type mismatch. SHOULD PRINT 1 then 7.
 
 ---
 
