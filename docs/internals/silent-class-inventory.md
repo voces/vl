@@ -24191,6 +24191,29 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
     print(s.f())
     hole(b)
 
+* **IT IS DECLARATION-ORDER SENSITIVE, AND THE RULE IS EXACT: the hole-param call takes the
+  FIRST-DECLARED object literal's lambda**, whichever receiver it actually gets. Four cells,
+  one variable:
+
+  | declaration order | hole param receives | outcome |
+  | --- | --- | --- |
+  | string first | numeric | **traps** — took the string lambda |
+  | numeric first | numeric | runs |
+  | string first | string | runs |
+  | numeric first | string | **traps** — took the numeric lambda |
+
+  So it is right exactly when declaration order happens to match the receiver. `fieldClosureFeOf`
+  scans nodes for an ObjLit whose struct index matches and returns the FIRST one's field `fe`;
+  `{f: () => string}` and `{f: () => i32}` collapse to the same struct row, so the scan cannot
+  tell them apart.
+
+* **DO NOT "FIX" THIS BY REFUSING WHEN AMBIGUOUS.** Two of the four cells above RUN today, and
+  a refusal on ambiguity turns them into `runs -> not-runs` — the one thing the gate exists to
+  stop. The fix has to DISAMBIGUATE: resolve the receiver's actual object literal (through the
+  call-site argument for a hole param), or give the two shapes distinct struct rows by folding
+  the closure field's RESULT type into the row identity, the way code 15 already discriminates
+  nested structs through `sFieldElemName` / `nestedStructNamesCompat`.
+
 * **THE TWIN-LAYOUT HAZARD, and it is real.** `{f: () => string}` and `{f: () => i32}`
   collapse to the SAME layout heap type, so `fieldClosureFeOf` — which scans object literals
   for one with a matching struct index — can resolve the WRONG lambda's `fe`. The guard in
