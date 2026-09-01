@@ -153,10 +153,20 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   track-caller as their first customer (`expect(value: T, caller: CallerLoc =
   __callsite__)`). One-hop semantics confirmed with the owner: a CallerLoc is one
   location, never a chain (the chain is the parked trace lane); std may later thread a
-  breadcrumb parent field as a library pattern, no language addition. SCHEDULED behind
-  the constraints-Phase-1 and lossless-recovery merges (both in flight — parser/checker
-  churn ceiling). The editor-side single-expect anchor is D9 slot 12 and needs no
-  ruling.
+  breadcrumb parent field as a library pattern, no language addition.
+  **HALF ONE IS DONE AND TRACK-CALLER IS UNBLOCKED (#TBD).** Default arguments v1 shipped
+  complete — see B15a — including the `__callsite__` intrinsic itself, typed structurally
+  against `{ file: string, line: i32, col: i32 }` so a std `type CallerLoc = { file: string,
+  line: i32, col: i32 }` satisfies it with NO compiler change. What remains is the std side
+  and nothing else: alias `CallerLoc`, give `expect` the trailing
+  `caller: CallerLoc = __callsite__`, and render the location in the failure message. **That
+  change is `std:test`-only and needs a `std-api-reviewer` pass** (an altered export). Two
+  facts the defaults landing measured that this follow-up inherits: the location's `file` is
+  the CALLER's module KEY (`""` for a single-source compile with no module table — a
+  `vl test` run always has one), and the position is the CALLEE's own anchor token, which is
+  the `expect` line the row exists to report. The `--strip-locations` opt-out and the
+  uniform-on decision are NOT built and are still the recommendation, not the state. The
+  editor-side single-expect anchor is D9 slot 12 and needs no ruling.
 - **`vl test --trace` inline run values** — RULED low priority (owner, 2026-09-01,
   "low prio I guess"): keep parked; an emitter flag instrumenting USER programs (never
   the compiler) logging `(site, value)` pairs, extension renders decorations after a
@@ -449,8 +459,9 @@ binding~~ **DONE** (`match cmd { Move{x, y} => … }`, punned fields; renaming +
 measured and deferred — B21 item 1); literal-union compact representation (A16) — **DESIGNED
 AND FILED**, its allocation rationale refuted by measurement and its correctness half (81 of 244
 cells) blocked on three owner rulings; readonly
-fields / A9 variance; ~~default params (B15a)~~ **DONE** (direct calls only — a function value and
-a UFCS receiver keep exact arity); SIMD over Buffer (unlocked by P0, not requested yet);
+fields / A9 variance; ~~default params (B15a)~~ **DONE** (direct calls AND the UFCS spelling, which
+took the same arity range in v1's completion; a function VALUE keeps exact arity, by design);
+SIMD over Buffer (unlocked by P0, not requested yet);
 keep emitting a names section on non-`-O` builds.
 
 **Non-asks, deliberate — do not build these for them:** exceptions/async (our `T|E` + trap model is
@@ -1480,26 +1491,37 @@ in-language GC knobs.
   annotating `k`'s parameter does not move it while annotating `o`'s does. Also open: an inline
   object shape that COINCIDES with a declared alias's shape is a separate emitter limit
   ("binding's inline-shape type has an unsupported field"), unrelated to generics.
-- 🟡 **B15a. Optional params + default values.** v1 SHIPPED as filed — **direct-call-site sugar
-  only**, and **defaults subsume optionals** (`p?: T` is desugared in the PARSER to
-  `p: T | null = null`; only a surface marker survives, for the printer). A call omitting trailing
-  arguments — or, named, skipping a middle one — is normalized to full arity before mono/collect,
-  so the callee's signature, the monomorphizer's instance keying and the `$fnsig` closure ABI are
-  all untouched. **The sequencing note ("after the rep Phase-2 `$fnsig` interning wave") was NOT
-  live and is retired**: `fnSigKeyOf` keys off the DECLARATION's parameter list, never a call
-  site's argument count, and the rewrite classifies its callee with the same
+- ✅ **B15a. Optional params + default values — v1 COMPLETE (#TBD), ruled 2026-09-01.** Nothing
+  open. **Direct-call-site sugar**, and **defaults subsume optionals** (`p?: T` is desugared in the
+  PARSER to `p: T | null = null`; only a surface marker survives, for the printer). A call omitting
+  trailing arguments — or, named, skipping a middle one — is normalized to full arity before
+  mono/collect, so the callee's signature, the monomorphizer's instance keying and the `$fnsig`
+  closure ABI are all untouched. **The sequencing note ("after the rep Phase-2 `$fnsig` interning
+  wave") was NOT live and is retired**: `fnSigKeyOf` keys off the DECLARATION's parameter list,
+  never a call site's argument count, and the rewrite classifies its callee with the same
   `fnIndexOfInScopeChain` `emitCall` uses — so a function VALUE keeps full arity (`const kv = k;
-  kv(1)` is still an arity error, pinned). Four rules close the leaks, each pinned by a reject
-  case: a default must be a **literal** (it is emitted in the CALLER's frame, so an earlier-param
-  reference / a call / an allocation are rejections, not surprises); must be **annotated** (a hole
-  and a default stay disjoint, which is what keeps mono out of it); defaults are **trailing-only**;
-  and a defaulted parameter's annotation may not name the function's own **type parameter**.
-  REMAINING: **UFCS** keeps EXACT arity — `scale(5, 2)` takes the default, `5.scale(2)` does not —
-  because the receiver-injecting rewrite is what decides whether a member call is a method call at
-  all, so widening it changes DISPATCH rather than argument filling (`error-default-param-ufcs-arity.vl`).
-  Also open by the same literal rule: a default that is a module-level `const`. Intrinsics don't
-  wait on this — `__trap__(msg?)` (error-handling-design.md) is bespoke checker arity, like
-  existing builtins.
+  kv(1)` is still an arity error, pinned).
+  **THE SEMANTICS, and everything else follows from it: a default expression comes from the
+  DECLARATION and its NAMES RESOLVE THERE; only its EVALUATION POSITION is the call site.**
+  The admitted set is exactly the three forms for which that sentence needs no machinery — a
+  **literal**; a **module-scope `const`** (resolved against the module frame, then MARKED so no
+  caller-local of the same name can capture the substituted reference, and renamed by the merge so
+  a dependency's default takes ITS module's binding); and **`__callsite__`**, a
+  `{ file: string, line: i32, col: i32 }` value legal in no other position. `const` and not `let`,
+  so declaration-time and call-time evaluation stay indistinguishable and v1 owes no answer about
+  which it meant. Three more rules, each pinned by a reject case: a default must be **annotated**
+  (a hole and a default stay disjoint, which is what keeps mono out of it); defaults are
+  **trailing-only**; and a defaulted parameter's annotation may not name the function's own **type
+  parameter**.
+  **The two things that closed here rather than shipping as remainders.** UFCS took the same
+  ARITY RANGE the plain spelling takes — `5.scale(2)` == `scale(5, 2)` — because the earlier
+  reading ("widening the receiver-injecting rewrite changes DISPATCH") is true and is not a reason
+  to leave two spellings of one call disagreeing; both halves now read the declaration's range
+  (`ufcsCallTy`, `drwSelfFnOf`) so they cannot drift. And `__callsite__` is the one default whose
+  NODE is per-site, minted by a usage-gated pre-pass BEFORE `checkProgram` sizes `nodeTyIx` — the
+  D969 placement rule, the same one `parseTemplate` follows.
+  Intrinsics don't wait on this — `__trap__(msg?)` (error-handling-design.md) is bespoke checker
+  arity, like existing builtins. `DECISIONS.md` §"Default arguments v1".
 - ⬜ **B16. Redeclaration / overloading.** Current: same-scope redeclaration errors; nested shadowing
   allowed (uniquified in codegen) — INCLUDING a block-scoped local that shadows a PARAMETER, which
   codegen ignored outright until the live lexical binding was made to outrank the param in both

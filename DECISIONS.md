@@ -3445,3 +3445,162 @@ compiler accepts". A refusal relabelled as a design rule is exactly the drift.
 `scripts/silent-sweep/d741/gen741.py`'s 123 cells are in `distilled/named/`, 46 of them
 running. Any future candidate for (a)–(d) re-grades against them in one command and has to say
 which of the 46 it costs.
+
+## Default arguments v1: the expression is the DECLARATION's, the evaluation position is the CALL's (owner, 2026-09-01)
+
+**"let's do A — schedule in defaults, then we can do tracking."** Default arguments ship as a
+general feature and track-caller becomes their first customer, rather than a `CallerLoc` magic
+TYPE fusing a general mechanism and one special case into a single rule. ROADMAP §Next's
+track-caller row carries the survey that reached this: Swift, C++20 and C# all express the
+callsite magic through default arguments plus one intrinsic, and only Rust hides it — at the
+cost of attribute machinery and fn-pointer shims.
+
+Trailing defaults, annotation-required, literal-only shipped earlier under B15a. **v1 completes
+it**: a module-scope `const` and the `__callsite__` intrinsic join the admitted set, and UFCS
+stops disagreeing with the plain spelling about arity.
+
+### The semantics, in one sentence, because everything else follows from it
+
+**A default expression comes from the DECLARATION and its names resolve THERE; only its
+EVALUATION POSITION is the call site.**
+
+Both halves are load-bearing and they pull in opposite directions, which is why the sentence
+has to say both. Resolution at the declaration is what makes a dependency's
+`join2(a, b, sep = SEP)` take *its* `SEP` when the entry module declares a different one —
+otherwise a library's default would mean whatever the consumer happened to name a binding.
+Evaluation at the call site is what makes `__callsite__` possible at all: a value that IS the
+call's position cannot be computed at the declaration, and Swift/C++'s `#line` /
+`source_location::current()` are the same trade.
+
+**The three admitted forms are exactly the forms for which that sentence needs no machinery.**
+
+* **A LITERAL** has no names, so there is nothing to resolve.
+* **A MODULE-SCOPE `const`** has one name, resolved against the module frame
+  (`isModuleScopeConst` — the module frame specifically, not the scope chain, so the callee's
+  own parameters and locals cannot answer) and then MARKED
+  (`ast.markDefaultGlobalRef`). The mark is the mechanism: the checker's `Ident` arm and the
+  emitter's `emitIdentNode` both consult it before consulting the caller's locals, so a
+  caller-local sharing the const's name cannot capture the substituted reference. Across
+  modules the merge already gives it for free — `SEP` becomes `SEP$mN` and the entry's `SEP`
+  is a different name — once the merge walks parameter defaults at all, which it did not
+  before (`modRwFunc`).
+* **`__callsite__`**, which is not an expression and is legal in no other position.
+
+**`const` and not `let`, deliberately.** An immutable module binding has the same value at every
+call site, so "evaluated at the declaration" and "evaluated at the call" cannot be told apart
+and v1 owes no answer about which it meant. A `let` can change between two calls, which would
+make the question real and answerable only by deciding something this feature is trying not to
+decide. Everything else — a call, an allocation, a reference to an earlier parameter — stays
+out for the reason B15a gave: it would have to be evaluated inside the callee, and a callee
+that evaluates its own defaults must know which arguments were omitted, which is an ABI change
+rather than sugar.
+
+### The fixed-arity compatibility argument, unchanged and restated
+
+Defaults are CALL-SITE SUGAR. A call omitting trailing arguments is normalized to the callee's
+full arity before monomorphization and before signature collection, so the wasm signature always
+carries every parameter, `fnSigKeyOf` keys off the DECLARATION's parameter list, the `$fnsig`
+closure ABI never sees arity variance, and **no overload resolution enters the language**: a
+k-argument call maps to exactly one function. A function VALUE therefore keeps its FULL
+signature — `const kv = k; kv(1)` is an arity error, pinned — which is the same edge the
+rejected `CallerLoc`-type design had, so the spelling choice cost nothing there.
+
+### `__callsite__` is the ONE default whose node is minted per call site
+
+Every other admitted form means the same thing at every call, so every other form SHARES one
+arena node. `__callsite__` cannot, so `driver.csPreMintLocs` mints one
+`{ file, line, col }` object literal per CALL and banks it; `ast.fillArgDefaults` substitutes
+the banked node for the marker at both the checker's padding and the emitter's rewrite, keyed
+on the same Call node so the two cannot disagree.
+
+**It is a PRE-PASS, run at the top of every `checkProgram` caller, and that placement is the
+whole design.** `nodeTyIx` is sized to the arena at `checkProgram` entry, so a node minted later
+reads its type back as -1 forever — D969's recorded cost, and the reason `parseTemplate`
+desugars in the PARSER rather than in a rewrite. Minting before the sizing puts these nodes
+inside the checker's own numbering, so they are typed, collected and lowered by the ordinary
+machinery and **nothing downstream knows the argument was synthesized**. The alternative
+considered and rejected was cloning at `emit_rewrite` with a hand-carried type: it needs the
+object literal's shape registration to survive a type the checker never computed, which is the
+same class of blindness D969 named.
+
+The pass is USAGE-GATED — a program declaring no `__callsite__` default mints nothing, banks
+nothing, and emits byte-identical wasm. Measured: 2,045 corpus programs compile byte-for-byte
+identically against a `git archive` control of the pre-change tree.
+
+**The anchor is the CALLEE's own token** (`where` in `where(1)`, `f` in `x.f(1)`), which is what
+Swift's `#line` and Rust's `Location::caller()` report for the same call. It is read through
+`nodeToks`, NOT `fmt_util.tokIndexAt`: that binary search assumes `P.toks[i].start` ascends, and
+the module merge APPENDS each module's tokens with that module's own offsets, so `start` restarts
+at every boundary and the search silently misses — measured, every call in a module build fell
+through to the fallback before this was fixed. `file` is the module KEY; a single-source compile
+with no module table answers `""`, because nothing in that pipeline knows the entry's path.
+
+**The TYPE is checked structurally at the declaration**, against
+`{ file: string, line: i32, col: i32 }` — so the track-caller follow-up's
+`type CallerLoc = { file: string, line: i32, col: i32 }` satisfies it with no compiler change,
+and the compiler never learns the std name. Checking it at the declaration rather than only at
+the call is what keeps a library's mistake out of a consumer's diagnostics.
+
+### What a `__callsite__` call costs, disassembled
+
+Unoptimized, one omitted `__callsite__` argument is a `struct.new` of two `i32.const`
+immediates and a `global.get` of the interned file string, built in the CALLER's frame — so
+the per-site cost is the allocation plus three constants, and the string is shared by every
+site in the module. **At `-O3` it is nothing**: `wasm-opt --closed-world -O3 --gufa -O3`
+inlines the callee, Heap2Local scalarizes the struct (it never escapes), and a two-call probe
+folds to two `i32.const` and a 66-byte module. The ROADMAP row's estimate ("three
+constant-folded scalars per opted-in call") is therefore right about the optimized build and
+understated the unoptimized one by an allocation, which is the honest way round.
+
+### UFCS took the arity RANGE, which B15a had left as a dispatch rule wearing other clothes
+
+B15a shipped with `scale(5, 2)` taking the default and `5.scale(2)` refusing
+(`member access '.scale' on non-object i32`), on the argument that the receiver-injecting
+rewrite decides whether a member call is a method call AT ALL, so widening it changes DISPATCH.
+That is true and it is not a reason to leave the two spellings disagreeing about the same call.
+Both halves now read the declaration's range — `ufcsCallTy`'s gate in the checker and
+`drwSelfFnOf`'s in the rewrite — so they cannot drift, and the emit-side fill runs after the
+receiver is injected and needs no UFCS-specific arm.
+
+**And putting the two halves side by side found that they had ALREADY drifted, on a different
+axis.** `drwSelfFnOf` has always required the first parameter to be NAMED `self`;
+`ufcsCallTy` asked only whether the receiver is assignable to parameter 0. So
+`function pair(a: i32, b: i32)` made `5.pair(2)` `vl check`-clean and then
+`emitProgram: callee is not a function name` at build — measured identical on the
+pre-defaults compiler, so it is not this change's doing, but widening UFCS to the arity range
+would have widened its reach to the defaulted spelling. The checker asks the `self` question
+now (`declFirstParamIsSelf`).
+
+**That is clause 2's second horn, not a capability gap relabelled.** UFCS in VL *is* the
+`self`-function rule, so `5.pair(2)` is a program the DESIGN forbids — and an illegal program
+is one the checker owed the diagnosis for. The refusal falls through to the caller's existing
+member-access message, which names the receiver and the property the author wrote
+(`member access '.pair' on non-object i32`), rather than an emitter sentence about callee
+shape. Zero corpus movement, and no program that ran before stops running: reaching the
+emitter's rewrite required the `self` name, which is exactly what the checker now requires.
+
+### Two things the feature broke elsewhere, both found by running it
+
+* **A module `const` named only by a default read as "Unused variable".** `lint.bindScan` never
+  walked parameter defaults. It does now, and it walks them BEFORE binding the parameters —
+  the order is the rule, not a convenience: a default's names resolve in the ENCLOSING scope,
+  and scanning after the binds would attribute `function f(K: i32, b: i32 = K)`'s use to the
+  parameter, which is the reading the checker refuses.
+* **Top-level binding PROMOTION (G2c) became unsound for a const a default names.** The
+  reachability analysis asks "is this NODE reached from the top-level region", and one shared
+  default node sits in a top-level call (marked) and in a nested function's call (not marked,
+  and invisible to a node-keyed scan) at once — so the binding was promoted to a start-function
+  local and then read from a function body. `emitUserGlobalGet` caught it as a build error,
+  which is the loud floor rather than the answer. `computeGlobalPromotion` now vetoes promotion
+  for any const a default names, marked or not: the conservative side this analysis is built to
+  fail towards, costing the promotion of exactly those consts.
+
+### What v1 deliberately does not do
+
+Function TYPES are unchanged — a default is a property of a DECLARATION, not of an arrow type,
+so `(i32) => void` gains no optional-parameter spelling and an indirect call passes every
+argument. Templates with literal-only holes are not admitted as defaults: `` `a${1}b` ``
+desugars in the parser into a concatenation with a call to the renderer in it, so admitting it
+would admit a CALL through the back door, and the whole literal rule exists to keep calls out.
+And no default expression is evaluated more than the call sites that omit it — there is no
+memoization question, because there is nothing to memoize.

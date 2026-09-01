@@ -92,6 +92,13 @@ export interface SigParam {
   /** "" when the name is not knowable (a function-typed value carries none). */
   name: string;
   type: string;
+  /**
+   * The parameter's DEFAULT VALUE as source text, "" when it has none.
+   *
+   * Optional on this interface because a seed predating parameter defaults
+   * cannot report it, and every such signature renders exactly as it did before.
+   */
+  dflt?: string;
 }
 
 /** A signature the checker resolved: its parameter table and return type. */
@@ -317,13 +324,20 @@ export const repairedSource = (
  * how the protocol wants a `ParameterInformation` addressed (an offset pair into
  * the signature label, not a repeat of the text). A parameter whose name the
  * checker could not supply renders as its type alone.
+ *
+ * A DEFAULTED parameter renders `b: i32 = 10`, and the default is INSIDE that
+ * parameter's offset pair — the client highlights the whole `b: i32 = 10` when
+ * the cursor is on argument 1, which is what the reader needs to see: the value
+ * that lands if they stop typing. There is no per-parameter "optional" flag in
+ * the protocol, so the rendered default IS how optionality is communicated.
  */
 export const signatureLabel = (name: string, sig: SigParts): SigLabel => {
   const parameters: [number, number][] = [];
   let label = `${name}(`;
   sig.params.forEach((p, i) => {
     if (i > 0) label += ", ";
-    const text = p.name === "" ? p.type : `${p.name}: ${p.type}`;
+    const head = p.name === "" ? p.type : `${p.name}: ${p.type}`;
+    const text = p.dflt ? `${head} = ${p.dflt}` : head;
     parameters.push([label.length, label.length + text.length]);
     label += text;
   });

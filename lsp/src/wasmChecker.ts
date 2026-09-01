@@ -73,7 +73,14 @@ export type WasmOccurrence = {
  * carries parameter types but no names, by design.
  */
 export type WasmSignature = {
-  params: { name: string; type: string }[];
+  /**
+   * `dflt` is the parameter's default value as source text, `""` when it has
+   * none — so a signature renders as `b: i32 = 10` and a defaulted parameter
+   * reads as optional, which the protocol has no flag for. It is `""` for every
+   * parameter against a seed older than the `sigParamDefault*` exports, which is
+   * exactly the pre-defaults render.
+   */
+  params: { name: string; type: string; dflt: string }[];
   ret: string;
 };
 
@@ -833,11 +840,20 @@ export const createWasmChecker = (
     // the sign is the only thing that separates them.
     const count = exp.sigAt(line + 1, character);
     if (count < 0) return undefined;
-    const params: { name: string; type: string }[] = [];
+    const params: { name: string; type: string; dflt: string }[] = [];
     for (let i = 0; i < count; i++) {
       params.push({
         name: readString(exp.sigParamNameLen(i), (j) => exp.sigParamNameCharAt(i, j)),
         type: readString(exp.sigParamTypeLen(i), (j) => exp.sigParamTypeCharAt(i, j)),
+        // Feature-detected, like every other export this bridge grew: a seed
+        // predating parameter defaults has no such export, and "" is precisely
+        // the render that seed's signatures had.
+        dflt: typeof exp.sigParamDefaultLen === "function"
+          ? readString(
+            exp.sigParamDefaultLen(i),
+            (j) => exp.sigParamDefaultCharAt(i, j),
+          )
+          : "",
       });
     }
     return {

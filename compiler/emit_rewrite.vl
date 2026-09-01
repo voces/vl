@@ -74,7 +74,9 @@ import {
   Unary,
   UnionDecl,
   WhileStmt,
+  callSiteLocOf,
   fillArgDefaults,
+  fnRequiredArity,
   hasNamedArgs,
   mkArrayLit,
   mkBinary,
@@ -89,6 +91,7 @@ import {
   mkNum,
   mkParam,
   orderArgsByParamNames,
+  paramDefaultIsCallsite,
   paramDefaultOf,
   ufcsAliasOf,
 } from "./ast"
@@ -147,16 +150,24 @@ import {
 // shape; field-closure calls use the member-call machinery. Usage-gated: a
 // program with none of these shapes rewrites nothing (byte-identical bytes).
 
-// The `fnStmts` index of a free `self`-function `name` of `argc` total params
-// (first param NAMED `self`), or -1 — the host's UFCS reachability rule, so a
-// non-`self` function is NOT a method (objects/self-method-pollution.vl).
+// The `fnStmts` index of a free `self`-function `name` reachable at `argc` total
+// params (first param NAMED `self`), or -1 — the host's UFCS reachability rule,
+// so a non-`self` function is NOT a method (objects/self-method-pollution.vl).
+//
+// `argc` is matched against the ARITY RANGE, not the exact length: a UFCS call
+// takes trailing defaults exactly as the direct spelling does (`5.scale(2)` ==
+// `scale(5, 2)`), and `drwFillDefaults` — which runs right after the receiver is
+// injected — is what fills the omitted tail. The checker admits the same range
+// (`ufcsCallTy`), so the two agree by construction; a mismatch here would be the
+// rewrite disagreeing with the type it was checked against.
 export function drwSelfFnOf(name: string, argc: i32) {
   const fe = fnIndexOf(name)
   if fe < 0 { return -1 }
   const fn = P.nodes[fnStmts[fe]]
   if fn is FuncDecl {
     const ps = fn.fnParams
-    if ps.length != argc { return -1 }
+    if argc > ps.length { return -1 }
+    if argc < fnRequiredArity(ps) { return -1 }
     if ps.length > 0 {
       const p0 = P.nodes[ps[0]]
       if p0 is Param {
@@ -220,7 +231,7 @@ function drwFillDefaults(ix: i32, ctx: i32) {
           // No gap: leave the call exactly as it was, so every named call that
           // works today keeps taking the emitter's own reorder path.
           if !gap { return 0 }
-          if fillArgDefaults(ordered, ps) >= 0 { return 0 }
+          if fillArgDefaults(ordered, ps, ix) >= 0 { return 0 }
           const noNames: string[] = []
           n.callArgs = ordered
           n.callArgNames = noNames
@@ -229,7 +240,13 @@ function drwFillDefaults(ix: i32, ctx: i32) {
         if args.length >= ps.length { return 0 }
         let i = args.length
         while i < ps.length {
-          const d = paramDefaultOf(ps[i])
+          let d = paramDefaultOf(ps[i])
+          if d < 0 { return 0 }
+          // `__callsite__` is the one default whose value is the SITE, so it
+          // takes the per-call node `csPreMintLocs` banked rather than the
+          // declaration's marker — the same substitution the checker made when
+          // it typed this call, keyed on the same Call node.
+          if paramDefaultIsCallsite(d) { d = callSiteLocOf(ix) }
           if d < 0 { return 0 }
           args.push(d)
           i = i + 1

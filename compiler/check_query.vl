@@ -2,7 +2,21 @@
 // occurrences / def / refs / hover (`sym*`), redundant-type reports (`redun*`), inlay
 // hints. Reads `check_state` + the checker's `T`/types, never drives checking.
 
-import { FuncDecl, P, Param, declNameTokOf, nodeToks } from "./ast"
+import {
+  BoolLit,
+  CharLit,
+  FuncDecl,
+  Ident,
+  NullLit,
+  NumLit,
+  P,
+  Param,
+  StrLit,
+  Unary,
+  declNameTokOf,
+  nodeToks,
+  paramDefaultOf,
+} from "./ast"
 import {
   SYM_MEM_METHOD,
   inlayCol,
@@ -29,6 +43,7 @@ import {
   scopeResRaw,
   scopeResTok,
   scopeResType,
+  sigParDefault,
   sigParName,
   sigParType,
   sigRet,
@@ -688,10 +703,40 @@ export function symMemberScanIsFn(i: i32) {
 
 // One parameter row. The type renders through the USER pathway like every other
 // string leaving this file.
-function sigPush(nm: string, ty: i32) {
+function sigPush(nm: string, ty: i32, dflt: string) {
   sigParName.push(nm)
   sigParType.push(tyToStrUser(ty))
+  sigParDefault.push(dflt)
   0
+}
+
+// A parameter DEFAULT as source text, or "" when the parameter has none.
+//
+// A LOCAL RENDERER, not `format.vl`'s `expr`: the formatter is a LATER layer
+// (it imports this one's neighbours, not the other way round), and the whole set
+// v1 admits is four leaf shapes plus a sign. That set is closed by the checker's
+// own rule (`paramDefaultIsLiteral`), so the ladder cannot silently fall short
+// of the language — a form this does not know is a form the checker refuses.
+// The `Ident` arm DEMANGLES, because a module `const` default reads `SEP$m1` in
+// the merged arena and `SEP` in the file the user is looking at.
+function sigDefaultText(pIx: i32): string {
+  const dIx = paramDefaultOf(pIx)
+  if dIx < 0 { return "" }
+  const d = P.nodes[dIx]
+  if d is NumLit { return d.numText }
+  if d is StrLit { return d.strText }
+  if d is CharLit { return d.charText }
+  if d is BoolLit {
+    if d.boolVal == 1 { return "true" }
+    return "false"
+  }
+  if d is NullLit { return d.nullKw }
+  if d is Ident { return demangleName(d.identName) }
+  if d is Unary {
+    const inner = P.nodes[d.unArg]
+    if inner is NumLit { return d.unOp + inner.numText }
+  }
+  ""
 }
 // Fill the table from function type `ty`, naming the parameters off `declNode`'s
 // `FuncDecl` when there is one and it agrees on arity (`fnSigStr`'s defensive
@@ -707,6 +752,7 @@ function sigFill(declNode: i32, ty: i32, skip: i32) {
   const pts = t.fnParamTypes
   if skip > pts.length { return -1 }
   const names: string[] = []
+  const dflts: string[] = []
   if declNode >= 0 && declNode < P.nodes.length {
     const nd = P.nodes[declNode]
     if nd is FuncDecl {
@@ -715,6 +761,9 @@ function sigFill(declNode: i32, ty: i32, skip: i32) {
         while i < nd.fnParams.length {
           const pn = P.nodes[nd.fnParams[i]]
           if pn is Param { names.push(pn.parName) } else { names.push("") }
+          // Same arity gate as the names, and for the same reason: a
+          // disagreeing pair would attach parameter k+1's default to argument k.
+          dflts.push(sigDefaultText(nd.fnParams[i]))
           i = i + 1
         }
       }
@@ -724,7 +773,9 @@ function sigFill(declNode: i32, ty: i32, skip: i32) {
   while k < pts.length {
     let nm = ""
     if k < names.length { nm = names[k] }
-    sigPush(nm, pts[k])
+    let df = ""
+    if k < dflts.length { df = dflts[k] }
+    sigPush(nm, pts[k], df)
     k = k + 1
   }
   sigRet = tyToStrUser(t.fnRet)
@@ -803,6 +854,7 @@ function sigIdentAt(line: i32, col: i32) {
 export function symSigAt(line: i32, col: i32) {
   sigParName = []
   sigParType = []
+  sigParDefault = []
   sigRet = ""
   const occ = symOccAt(line, col)
   if occ >= 0 { return sigFill(symOccDecl[occ], symOccQueryTy(occ), 0) }
@@ -834,6 +886,14 @@ export function symSigParamTypeLen(i: i32) {
 export function symSigParamTypeCharAt(i: i32, j: i32) {
   if i < 0 || i >= sigParType.length { return 0 }
   sigParType[i][j]
+}
+export function symSigParamDefaultLen(i: i32) {
+  if i < 0 || i >= sigParDefault.length { return 0 }
+  sigParDefault[i].length
+}
+export function symSigParamDefaultCharAt(i: i32, j: i32) {
+  if i < 0 || i >= sigParDefault.length { return 0 }
+  sigParDefault[i][j]
 }
 export function symSigRetLen() { sigRet.length }
 export function symSigRetCharAt(j: i32) { sigRet[j] }
