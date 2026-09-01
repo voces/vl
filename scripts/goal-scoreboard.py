@@ -72,8 +72,25 @@ LOUD = ("loud check reject", "loud emit reject")
 # capability gaps: the type system permits the program and the backend cannot lower it.
 # Kept as the compiler's own words rather than a curated list, so a new gap is counted the
 # day it is written instead of the day someone remembers to add it here.
+# D958 — THE PHRASE LIST WAS ITSELF UNAUDITED, and it was reporting HALF the population.
+# The four phrases below caught 12 literals; the compiler carries 12 MORE that concede exactly
+# the same thing in the other word order — "not supported YET" rather than "not YET supported"
+# — plus "not yet implemented" and "not yet callable". Measured, not estimated: adding these
+# three took the count from 12 to 24, and two of the newly-counted were verified by witness as
+# `vl check` rc 0 followed by an emit refusal, i.e. clause-2 violations by construction.
+#
+# This is the "COUNT MESSAGE LITERALS, NEVER GREP-MATCHING LINES" discipline one level up. That
+# section records the number being hand-derived wrong three times and fixed by counting
+# literals instead of lines; the literal COUNT was then right and the PREDICATE deciding which
+# literals to count was never checked against the source it reads.
+#
+# Deliberately NOT added: bare "unsupported" and "are not supported". Those appear in internal
+# invariant failures (`emitNullForRet: unsupported nullable return rep`) and in genuine DESIGN
+# rules (`Map`/`Set` keys must be `string` or `i32`), neither of which concedes that a legal
+# program was refused. A phrase earns a place here only if it admits the program is fine.
 CONCEDES = re.compile(
-    r"no lowering|not yet supported|not supported by codegen|type-valid but cannot build",
+    r"no lowering|not yet supported|not supported by codegen|type-valid but cannot build"
+    r"|not supported yet|not yet implemented|not yet callable",
     re.I)
 
 

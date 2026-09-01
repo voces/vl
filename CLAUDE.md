@@ -226,13 +226,25 @@ corpus baseline and prints `runs` plus both clauses' violations, instantly, with
 On 2026-08-30: **runs 3,704 / 7,021 (52.76%)**, clause 1 **92**, clause 2 **314** emit rejects
 and **45** check rejects that concede type-validity — **451 cells against the goal**. It also
 counts the distinct MESSAGE LITERALS in `compiler/*.vl` that concede the program is type-valid
-(`has no lowering`, `not yet supported by codegen`, one reading `this program is type-valid but
-cannot build`) — **14**, most in `typecheck.vl`. That is the direction that hides: a capability
-gap moved into the checker stops looking like a gap, the program compiles no better than
-before, and the script counts it the same as an emit-side one.
+(`has no lowering`, `not yet supported by codegen`, `not supported yet`, `not yet implemented`,
+one reading `this program is type-valid but cannot build`) — **24** on 2026-09-01. That is the
+direction that hides: a capability gap moved into the checker stops looking like a gap, the
+program compiles no better than before, and the script counts it the same as an emit-side one.
+
+**AND THE PHRASE LIST ITSELF NEEDS AUDITING — it was reporting HALF.** Until D958 the predicate
+matched four phrasings and found 12 literals; the compiler carried **12 more** that concede the
+same thing in the other WORD ORDER (`not supported YET` rather than `not YET supported`), plus
+`not yet implemented` and `not yet callable`. Two of the newly-counted were verified by witness
+as `vl check` rc 0 followed by an emit refusal. This is the literal-counting discipline one
+level up: the COUNT was fixed three times, and the predicate deciding *which* literals to count
+was never checked against the source it reads. **When this number matters, re-derive the phrase
+list from the tree** — `grep -hoE '"[^"]{12,}"' compiler/*.vl` filtered against the current
+regex shows what it is missing. Do NOT widen it to bare `unsupported` or `are not supported`:
+those appear in internal invariant failures and in genuine DESIGN rules, and a phrase earns a
+place only if it admits the refused program was legal.
 
 **AND `runs` CAN REACH 100% WITH THE GOAL UNMET — the script says by how much.** The corpus is
-generated over fixed axes, so it scores only the gaps it has a program for. **9 of the 14
+generated over fixed axes, so it scores only the gaps it has a program for. **All 24
 literals are reached by NO corpus cell** — the element-widening container copy among them,
 which refuses by hand and costs the scoreboard nothing. Each ZERO row in `--sites` needs a
 hand-written probe, and none will arrive on its own. Do not read a rising `runs` as the whole
