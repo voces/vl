@@ -19,6 +19,13 @@
 #   scripts/gate.sh --no-build   # reuse build/vl-compiler.wasm as it stands
 set -u
 cd "$(dirname "$0")/.."
+# Pin std: to THE TREE BEING GRADED. The host resolves std: from the BINARY's
+# checkout, and a worktree's binary is a symlink to the main repo's — so without
+# this, every gate that shells the CLI grades a std-touching branch against the
+# WRONG std (measured 2026-09-01: the toString rename's lint-self failed on
+# "toString is not exported" read from the main repo's pre-rename std, while the
+# same command with VL_STD pinned passed). Callers may still override.
+export VL_STD="${VL_STD:-$PWD/std}"
 LOGS="${TMPDIR:-/tmp}/vl-gate.$$"; mkdir -p "$LOGS"
 : "${JOBS:=4}"; : "${DENO_JOBS:=4}"; export JOBS DENO_JOBS
 
