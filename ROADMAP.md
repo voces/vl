@@ -44,7 +44,7 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   not move under the f64-arm work. One PR: default-scope removal (`driver.vl` blPush +
   the emit special cases), std rename + in-tree importer migration, a targeted
   moved-to-std hint on the undeclared name, DECISIONS entry recording the naming choice.
-- **Template literals / interpolation — SHIPPED #2187.** Backtick strings, additive,
+- **Template literals / interpolation — SHIPPED #2188.** Backtick strings, additive,
   desugared in the parser to concat over `std:fmt`'s renderer bound ABSOLUTELY via a
   compiler-injected bare import edge plus an unspellable rename row. Two remainders,
   both measured: a STRING-only hole still pulls `std:fmt`+`std:str` because the host
