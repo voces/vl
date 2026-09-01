@@ -3713,10 +3713,17 @@ module, and a `std:test`-local non-exported alias.
 * **A new module is the speculative surface a version-locked std cannot take back.** One
   three-field alias with one consumer does not earn a module key, and a module key is the most
   permanent thing this repo mints.
-* **Non-exported does not work, for a reason the feature itself creates.** The one-hop rule
-  says a wrapper forwards its own `caller` EXPLICITLY. That wrapper has to NAME the type in a
-  signature. Leaving it unexported would make every test helper re-spell three fields — which
-  is precisely the "invisible rule about a type name" the defaults ruling rejected.
+* **Non-exported still COMPILES — and that is the problem.** It would be easy to write that
+  the forwarding helper cannot be spelled without the export. It can: measured 2026-09-01, a
+  user's own `type MyLoc = { file: string, line: i32, col: i32 }` in another module takes
+  `__callsite__`, forwards into `expect(v, caller)`, and reports the caller exactly, with
+  `CallerLoc` never imported. What the export buys is DISCOVERABILITY, not capability — the
+  one-hop rule says a wrapper forwards its own `caller` explicitly, and leaving the type
+  unexported would make every test helper re-spell three fields against an unwritten contract,
+  which is precisely the "invisible rule about a type name" the defaults ruling rejected. That
+  is an admission under D2's language-story clause and it should be claimed as exactly that,
+  not as a necessity. (The refutable version of this paragraph survived one review draft; a
+  claim that dies to a ten-second probe does not belong in the permanent record.)
 
 **The structural check is what makes this reversible, and that is the load-bearing part.**
 `__callsite__` is typed against `{ file: string, line: i32, col: i32 }` at the DECLARATION, so
@@ -3733,9 +3740,21 @@ type rather than a competing one. A wrong choice here is cheap in a way most std
 **Why a line and not a suffix: the sentence ends in a RENDERED OPERAND.** That operand is
 arbitrary user text — `expect("at a.vl:1:1").toEqual("x")` renders it verbatim — so a machine
 reader sniffing the tail of the sentence is parsing a field whose neighbours it does not
-control. A dedicated line is matched ANCHORED, which is what `lsp/src/testDiscovery.ts` does,
-and the scan additionally stops at the `--- captured output ---` sentinel because a program
-under test can print anything at all, that shape included.
+control, with no separator to search back from.
+
+**But being on its own line is NOT what makes it readable, and the first draft of this entry
+said it was.** A multi-line operand renders a fully ANCHORED forgery inside the sentence —
+measured, `expect("x\n  at /forged/file.vl:99:99\n").toEqual("y")` produces two lines matching
+the reader's own regex. The real invariant is **the location line is LAST**, which
+`lsp/src/testDiscovery.ts` relies on (last match before the `--- captured output ---`
+sentinel — the scan stops there because a program under test can print anything, that shape
+included) and which **`std:test` owns**, because std is the end that chooses to append it. A
+line added after the location — a hint, a structural diff — silently re-anchors every failure
+in the editor, so std's header carries that prohibition at the emitting site rather than here.
+
+**A joint invariant across two modules has to be written down at the end that can break it.**
+That is the general form, and this one nearly shipped with its justification pointing at the
+reader instead of the writer.
 
 **Why the sentence is byte-identical to v2: every existing pin stays a PREFIX match.** The
 runner suite's message assertions — the renderer-agreement i64-min pin included — needed no
@@ -3762,3 +3781,12 @@ assertion — and `it`/`describe` keep their signatures, because a registration 
 assertion site. One surface at a time; both are separate decisions to make on their own rather
 than riders on this one, and the editor keeps its `it`-line fallback for exactly the failures
 that carry no location by construction.
+
+**The deferral costs nothing structurally, which is the point of having built defaults first.**
+A trailing default is ADDITIVE, so `fail(msg, caller: CallerLoc = __callsite__)` can land later
+without breaking a caller — the version-locked-std relief the defaults ruling was justified on,
+collected here on its first surface. What the deferral does cost, and the header says so at
+`fail`: the second line is a wire format an author can WRITE, and `fail("…\n  at /not/real.vl:1:1")`
+reaches the editor as a location into a file that does not exist (measured). That is an argument
+for closing the gap, not for distrusting the format — today an author who wants a located custom
+assertion has no alternative to hand-building one.

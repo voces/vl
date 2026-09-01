@@ -21,7 +21,9 @@
 //
 // Under bare `vl run` a green file exits 0 and a red one aborts, with no runner.
 //
-// `expect` is GENERIC — `expect<T>(value: T)` builds an `Expectation<T>` — so ONE
+// `expect` is GENERIC — `expect<T>(value: T, caller: CallerLoc = __callsite__)`
+// builds an `Expectation<T>`; the trailing `caller` is the track-caller
+// parameter and is normally omitted (its own section below) — so ONE
 // entry point covers every `==`-comparable value, not an enumerated union of
 // atoms. v1 hard-coded `i32 | i64 | f64 | boolean | string`; v2 keeps those five
 // and adds everything the language can already compare — measured on this tree
@@ -77,12 +79,17 @@
 // matchers then decide and report from the receipt alone; the only places they
 // touch T at all are the `==` itself and the same raw-parameter dispatch over
 // `toEqual`'s own `expected` argument. The receipt's fields (`shown` / `isBool`
-// / `boolVal` / `hasEcho` / `echo`) are IMPLEMENTATION, not surface —
+// / `boolVal` / `hasEcho` / `echo` / `caller`) are IMPLEMENTATION, not surface —
 // `Expectation` is not exported, so no SIGNATURE outside this module can name
 // the type, but the fields DO read through inference (`expect(5).shown` prints
-// `5`, measured 2026-08-31). Treat them as unstable by convention, not
+// `5`, measured 2026-08-31; `expect(5).caller.line` prints its line, measured
+// 2026-09-01). Treat them as unstable by convention, not
 // unreachable: they are expected to change (collapse back to lazy,
-// failure-time rendering) when the D941 family closes.
+// failure-time rendering) when the D941 family closes. **`caller` is the field
+// most likely to be leaned on** — it is the first one that is genuinely useful
+// outside this module — and it is exactly as unstable as the rest: the supported
+// way to obtain a location is `__callsite__` in your OWN signature, not a read
+// off somebody's receipt.
 //
 // That boundary is a MEASURED constraint of today's monomorphizer, not taste.
 // The spellings that FAIL on this tree have witnesses in the D941 family
@@ -185,10 +192,32 @@
 // none of that applies and it is rendered only on the failure path. A passing
 // `expect` therefore pays one struct copy into the receipt and nothing else.
 //
+// The number, to the standard the eager-receipt paragraph above sets. Ten million
+// passing `expect(7).toEqual(7)`, 2026-09-01, `VL_STD` pinned on both arms:
+// ~0.33s before / ~0.44s after on an idle box — **~11 ns per passing assertion**,
+// the receipt copy plus the call site's `struct.new`. Re-measured independently
+// on a LOADED box the same day it was 0.68–0.71s vs 0.70–0.75s, i.e. inside the
+// noise, so 11 ns is the conservative reading and not the optimistic one. SIZE:
+// +525 bytes unoptimized on a one-assertion module (5,873 → 6,398) and
+// **byte-identical at `-O3`** (596 both ways — `wasm-opt --closed-world -O3
+// --gufa -O3`, where Heap2Local scalarizes the never-escaping struct). That
+// reproduces, through std, the cost DECISIONS measured for `__callsite__` itself.
+//
 // `fail(msg)` does NOT take a location in this version — one surface at a time,
 // and its argument is the author's own sentence rather than a rendered assertion.
 // `it`/`describe` likewise keep their signatures; a registration site is not an
-// assertion site.
+// assertion site. **The deferral is cheap by exactly the mechanism this change
+// introduced**: a trailing default is ADDITIVE, so `fail(msg, caller: CallerLoc =
+// __callsite__)` can land later without breaking one caller — which is the
+// structural relief the defaults ruling gave a std with no deprecation story.
+//
+// Until it does, know what `fail` can do: the second-line format is a wire
+// format an author can WRITE, and std does not vouch for it there. Measured
+// 2026-09-01, `fail("something broke\n  at /not/real.vl:1:1")` reaches the
+// editor as a location, and the editor will try to open a file that does not
+// exist. That is the strongest argument for closing this gap rather than a
+// reason to distrust the format — an author who wants a located custom assertion
+// currently has no alternative to hand-building one.
 
 // A CALL SITE, as a value. `file` is the caller's module key; `line`/`col` are
 // 1-based and point at the callee's own token.
@@ -484,13 +513,33 @@ function vltLocStr(loc: CallerLoc) {
 // the callers, so this is one shared body, not one per instantiation.
 // `kind`: 0 = toEqual, 1 = toBeTrue, 2 = toBeFalse.
 //
-// The location rides on its OWN LINE, `"\n  at <file>:<line>:<col>"`, and the
-// assertion sentence above it is byte-identical to what v2 shipped. Both halves
-// of that are deliberate. A suffix on the sentence would put a machine-read field
-// at the end of a line whose earlier content is arbitrary user text (a rendered
-// string operand can contain anything, `at x.vl:1:1` included); a dedicated line
-// is matched anchored, which is what the extension's report parser does. And
-// leaving the sentence alone keeps every existing message pin a PREFIX match
+// The location rides on its OWN LINE, `"\n  at <file>:<line>:<col>"`, and it is
+// the LAST line of the message. Both of those are load-bearing, and the second
+// one more than it looks.
+//
+// **THIS MODULE OWNS THE INVARIANT "THE LOCATION LINE IS LAST", AND NOTHING MAY
+// BE APPENDED AFTER IT.** Being on its own line is NOT what makes it readable —
+// a rendered operand is arbitrary user text and can contain a perfectly anchored
+// forgery. Measured 2026-09-01:
+//
+//   expect("x\n  at /forged/file.vl:99:99\n").toEqual("y")
+//   →  expected "x
+//        at /forged/file.vl:99:99
+//      " to equal "y"
+//        at /real/path.test.vl:4:3
+//
+// Two lines match, and the reader gets the right one ONLY because
+// `lsp/src/testDiscovery.ts` takes the LAST match before the captured-output
+// sentinel. That is a joint invariant across two modules and this is the end
+// that decides it: a future line appended here — a hint, a diff — silently
+// re-anchors every failure in the editor. Add such a line BEFORE the location,
+// never after.
+//
+// (A suffix on the sentence would be worse still, not better: it puts a
+// machine-read field at the end of a line whose earlier content is that same
+// user text, with no separator to search back from.)
+//
+// And leaving the sentence alone keeps every existing message pin a PREFIX match
 // rather than a rewrite — `tests/vl_test_runner_test.ts` needed no edit to its
 // message assertions, only new ones for the location.
 function vltFail(

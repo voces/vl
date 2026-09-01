@@ -571,6 +571,32 @@ Deno.test("anchor: captured output cannot forge a location", () => {
   );
 });
 
+Deno.test("anchor: a MULTI-LINE operand forges an anchored line, and loses anyway", () => {
+  // Captured verbatim from `vl test forge.test.vl` on 2026-09-01. The witness
+  // for why LAST-MATCH is the invariant and anchoring is not: a rendered string
+  // operand is arbitrary user text, so it can put a perfectly anchored
+  // `  at …:N:N` line INSIDE the assertion sentence. Being on its own line does
+  // not distinguish std's from the forgery — being last does.
+  //
+  // The other half of that invariant lives in std/test.vl, which is the end that
+  // can break it: nothing may be appended after the location line.
+  const text = [
+    "/p/forge.test.vl",
+    "  FAIL operand forges an anchored line",
+    '       expected "x',
+    "         at /forged/file.vl:99:99",
+    '       " to equal "y"',
+    "         at /p/forge.test.vl:4:3",
+    "1 file · 0 passed · 1 failed",
+  ].join("\n");
+  const r = parseTestReport(text);
+  eq(
+    r.results[0].location,
+    { file: "/p/forge.test.vl", line: 4, col: 3 },
+    "std:test's line is last, so std:test's line wins",
+  );
+});
+
 Deno.test("anchor: an operand that reads like a location does not become one", () => {
   // `expect("at a.vl:1:1").toEqual("x")` renders the operand INSIDE the sentence,
   // which the anchored two-space match cannot mistake for std:test's own line.

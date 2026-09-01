@@ -358,10 +358,14 @@ const STATUS: Record<string, TestOutcome> = {
 };
 
 // `std:test` renders a failed `expect` as two lines — the assertion sentence, then
-// `  at <file>:<line>:<col>` — so the location is matched ANCHORED at its own
-// line rather than sniffed off the tail of the sentence. That is why std chose a
-// separate line: the sentence ends in a RENDERED OPERAND, which is arbitrary user
-// text and can perfectly well read `at x.vl:1:1`.
+// `  at <file>:<line>:<col>`.
+//
+// ANCHORING IS NOT WHAT MAKES THIS READABLE; BEING LAST IS. The sentence ends in
+// a RENDERED OPERAND, which is arbitrary user text, and a MULTI-LINE one puts a
+// perfectly anchored forgery inside the sentence — measured,
+// `expect("x\n  at /forged/file.vl:99:99\n").toEqual("y")` produces two lines
+// matching this regex. `std:test` appends its own line last and owns the
+// prohibition on appending anything after it; this end takes the last match.
 const AT = /^ {2}at (.+):(\d+):(\d+)$/;
 
 // The report's own sentinel. Everything past it is the test's stdout, which can
