@@ -26954,3 +26954,133 @@ Repro (now runs, printing `3` — the ref-tail spelling was check-clean invalid 
     f()
     g2()
     print(3)
+
+### D941 — a generic-typed PARAMETER forwarded as an ARGUMENT to a second generic function refuses at monomorphize
+
+**loud emit reject · `emitProgram: monomorphize: unsupported argument type for `e` in a call to `inner`` · found 2026-08-31 assembling the generic `std:test` (the factored matcher chain toEqual → adjudicate → report is exactly this shape) · reproduces byte-identically on the pre-#2081 compiler (`d4af1c9e` source self-compiled), so it is a STANDING gap, a regression of nothing · the same forward RUNS when the top-level origin is an annotated literal (`const e1: Expectation<i32> = { … }` then `outer(e1)`), and a CHAIN of top-level generic calls (`expect(5).not().toEqual(6)`) runs too — the refusing cell is a generic-typed PARAM re-passed inside a generic BODY when the call site's T was inferred from a generic call's RETURN**
+
+Repro (loud emit reject):
+
+    type Expectation<T> = { actual: T, negated: boolean }
+
+    function expect<T>(value: T): Expectation<T> {
+      return { actual: value, negated: false }
+    }
+
+    function inner<T>(e: Expectation<T>): string {
+      if e.negated { return "n" }
+      "p"
+    }
+
+    function outer<T>(e: Expectation<T>): string {
+      return inner(e)
+    }
+
+    print(outer(expect(5)))
+    // vl check rc 0; vl run -> emit error:
+    // emitProgram: monomorphize: unsupported argument type for `e` in a call to `inner`
+    // SHOULD PRINT p
+
+* **THE ANNOTATION AT THE TOP-LEVEL CALL SITE IS THE DECIDING INPUT, measured both ways.**
+  The same chain with `const e: Expectation<string> = expect("hi")` between runs; the
+  un-annotated `const e = expect(…)` binding refuses the same way as the inline spelling.
+  So the monomorphizer loses the instantiated concrete type somewhere between a generic
+  RETURN and the next call's inference, and every hop past the first is built on the loss.
+* **RAW T FORWARDS ARE FINE** — `f<T>(v: T) { g(v) }` with the same origins runs for every T
+  tried (atoms, arrays) — the refusal needs the generic STRUCT carrier as the argument. The
+  raw-forward twin has its own wrong-CODE family: D943's closure and D942's field reads.
+* Blocked the natural factoring of `std:test` v2's matchers; the shipped module inlines the
+  failure path instead (std/test.vl header, "HOW A GENERIC VALUE GETS RENDERED").
+
+### D942 — `is string` on a value read from a generic struct FIELD answers TRUE for a struct T
+
+**check-clean silently wrong value · D931's close (the boolean field tag) covered the VALUE-rep discrimination and this is the REF-vs-REF residue: a `T = Circle` instance reads `self.actual` and `a is string` FIRES · same wrong answer through the widened-union spelling (`const aw: i32|i64|f64|boolean|string|T = self.actual` prints `string` for a Circle receipt while the SAME widen over a RAW T parameter — D933's fixture shape — prints correctly) · with more arms in the instance the same confusion emits invalid wasm instead (`expected f64, found (ref null $type)` beside an `is f64` arm; `expected i32, found (ref $type)` beside the concat in an `is string` arm body), so one mechanism grades as two outcomes · reproduces on the pre-#2081 compiler byte-identically: STANDING, a regression of nothing · found 2026-08-31 assembling the generic `std:test`**
+
+Repro (check-clean silently wrong value):
+
+    type Expectation<T> = { actual: T, negated: boolean }
+    type Circle = { r: i32 }
+
+    function expect<T>(value: T): Expectation<T> {
+      return { actual: value, negated: false }
+    }
+
+    function probe<T>(self: Expectation<T>): string {
+      const a = self.actual
+      if a is string { return "string" }
+      "other"
+    }
+
+    const c1: Circle = { r: 1 }
+    print(probe(expect(c1)))
+    // vl check rc 0; runs, exit 0.
+    // PRINTS string
+    // SHOULD PRINT other
+
+* **THE SAME DISPATCH OVER A RAW PARAMETER IS CORRECT FOR EVERY T MEASURED** — atoms, structs,
+  `i32[]`, `string[]`, `Circle[]` all answer right when the `is` ladder reads a raw `v: T`
+  param, or `toEqual`'s own `expected: T` beside the carrier. The wrong answer needs the
+  value to have crossed the generic FIELD read. That asymmetry is what `std:test` v2 is
+  built on: every T-dependent fact is computed from the raw parameter inside `expect` and
+  stored in the receipt.
+* **A SINGLE instantiation is enough** — `probe(expect(c1))` alone, with zero string
+  instances anywhere in the module, still fires the string arm. This is per-instance code
+  the emitter fails to prune (D932's fix prunes the same ladder when the value is a raw
+  param), a fold of ref-repped Ts onto one behaviour.
+* **`toBeTrue`'s `a is boolean` on the FIELD is in the same family** (invalid wasm for a
+  struct receiver until std:test moved the boolean fact into the receipt).
+
+### D943 — a generic struct holding BOTH a T field and a closure capturing the T value: the second ref instantiation emits invalid wasm
+
+**check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` in `mk$1` · needs all three ingredients, ablated: drop the `actual: T` field and it runs; drop the closure and it runs (that is D942's shape); drop the FIRST (i32) instantiation and the string instance alone runs · reproduces on the pre-#2081 compiler (there the invalid function is the lambda itself), STANDING · found 2026-08-31 probing a LAZY rendering closure for `std:test` v2 — the eager receipt is what shipped instead**
+
+Repro (check-clean invalid wasm):
+
+    type Box<T> = { actual: T, show: () => string }
+
+    function mk<T>(value: T): Box<T> {
+      return {
+        actual: value,
+        show: () => {
+          if value is string { return "s" }
+          "o"
+        },
+      }
+    }
+
+    const b = mk(5)
+    const f = b.show
+    print(f())
+    const b2 = mk("x")
+    const f2 = b2.show
+    print(f2())
+    // vl check rc 0; vl run -> failed to compile: wasm[0]::function[N]::mk$1
+    // type mismatch: expected i32, found (ref $type)
+    // SHOULD PRINT o then s
+
+* The second instance (`mk$1`, `T = string`) carries the first instance's scalar layout into
+  the closure's environment — the same instance-collision family as D941/D942, reached
+  through the capture instead of a call or a field read.
+
+### D944 — widening a generic T into a union refuses for EVERY array T, and the refusal's sentence describes a different arm
+
+**loud emit reject · `emitProgram: only i32[] arrays and struct/union element arrays are supported` · fires for `T = i32[]`, `T = string[]` and `T = Circle[]` alike — including the two kinds the sentence says ARE supported — from `const aw: i32 | i64 | f64 | boolean | string | T = v` in a generic body (the D933-fixture spelling one T-kind over) · struct T widens fine (D933's close), array T refuses at emit per instance, so a module with ONE array instantiation of a widening helper refuses even when the array value would fall through every arm at runtime · reproduces on the pre-#2081 compiler: STANDING · found 2026-08-31; it is why `std:test` v2 renders by direct `is` on the raw parameter instead of the widen-and-narrow the D93x rows probed**
+
+Repro (loud emit reject):
+
+    function tag<T>(v: T): string {
+      const aw: i32 | i64 | f64 | boolean | string | T = v
+      if aw is i32 { return "i32" }
+      "other"
+    }
+
+    print(tag([1, 2, 3]))
+    // vl check rc 0; vl run -> emit error:
+    // emitProgram: only i32[] arrays and struct/union element arrays are supported
+    // SHOULD PRINT other
+
+* **THE DIRECT-`is` TWIN RUNS AND ANSWERS RIGHT for every array T** (`if v is i32 { … }` with
+  no widened local prints `<value>` for `i32[]`, `string[]` and `Circle[]`), so the
+  capability the widen was carrying is expressible today; the union LOCAL is what has no
+  rep. Per this repo's message discipline: the sentence describes the arm that fired, and
+  the plainest program the sentence permits (`i32[]` into the union) also refuses.
