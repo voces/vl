@@ -23886,13 +23886,23 @@ loss, and the gate could not see it because the corpus has no cell for either:
   invisible not because the criterion is wrong but because **no corpus cell has this shape at
   all**, so nothing was printed either.
 
-* **TWO CLASSIFIER FIXES THAT LOOK RIGHT AND DO NOT MOVE IT — measured, both reverted.**
-  (1) A checker-typed net on `exprUnion`'s `??` arm (`nodeTyIsPureLitUnion` / `nodeTyIsNulScalarBox`
-  / `nodeTyIsUnion`), mirroring the `Call` branch's own ladder. (2) An `IfStmt` arm on
-  `exprUnion` classifying an if-expression by its THEN arm's tail value, which is what the
-  desugared node actually is. Neither changed the outcome, in a function-local binding or a
-  module-global one. **So the cell's rep is not being decided by `letIsUnion` → `exprUnion`,
-  and the next attempt should find the real decider before writing a classifier arm.**
+* **THE BINDING CLASSIFIER IS NOT THE LEVER — four probes, each forced to the answer the
+  "obvious" fix would produce, and NONE of them moved the outcome.** All reverted; recorded so
+  the next attempt does not re-spend them:
+
+  | probe | result |
+  |---|---|
+  | `exprUnion`'s `??` arm given the `Call` branch's checker-typed net | no change |
+  | `exprUnion`'s `??` arm forced to `return true` | no change |
+  | `exprUnion` given an `IfStmt` arm (the desugared node's real shape), forced true | no change |
+  | `letIsUnion` forced true for a `??` init AND for an `IfStmt` init | no change |
+
+  Tried in both the module-global and the function-local spelling. **So the cell's rep is not
+  decided by `letIsUnion` → `exprUnion` at all, and a classifier arm is the wrong fix.** The
+  next attempt starts at the emitted VALUE — the desugared `if`'s two arms — not at the
+  binding: the THEN arm yields the box and the ELSE arm yields a raw default, and nothing
+  coerces the ELSE into the box. An ANNOTATED destination works because the annotation seeds
+  that coercion; that is the same fact the table above records, read from the other end.
 
 Repro (check rc 0, invalid wasm):
 
