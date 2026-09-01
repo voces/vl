@@ -4249,7 +4249,6 @@ export function emitUnionCoerce(
   let unionName = unionNameIn
   const ums = unionMemberSetOf(unionName)
   if ums != "" { unionName = ums }
-  if exprUnion(exprIx, fnIx) { return emitExpr(body, exprIx, fnIx) }
   const bareIx = unwrapParen(exprIx)
   const bare = P.nodes[bareIx]
   // An if-EXPRESSION join (`return if c { catVal } else { dogVal }`): each arm is a distinct
@@ -4257,7 +4256,16 @@ export function emitUnionCoerce(
   // a single numeric blocktype — emit a value-typed `if` whose result IS the union box,
   // union-coercing each arm. Without this the join defaults to an i32 blocktype over ref arms
   // (invalid wasm — a pre-existing gap that hits named functions too).
+  //
+  // D969 — AHEAD OF THE `exprUnion` RAW-PASS BELOW, and the order is the whole fix. An
+  // if-expression that IS already a union value hit the raw-pass first and was emitted by
+  // `emitExpr`, which picks the join's blocktype from the arms' scalar ladder: `(if (result
+  // i32))` with two REF arms. The two questions were fighting — the binding needs
+  // `exprUnion` true to get a BOX cell, and the raw-pass reads that same true as "nothing to
+  // do here". Only this arm knows the blocktype has to be the box, so it must be asked first.
+  // Raw-passing is right for every other union value; it is never right for an `if`.
   if bare is IfStmt { return emitUnionIfValue(body, unionName, bareIx, fnIx) }
+  if exprUnion(exprIx, fnIx) { return emitExpr(body, exprIx, fnIx) }
   if bare is NullLit {
     fbI32Const(nullBoxTag())
     fbRefNullNone() // the payload slot is unread under the null tag
@@ -18340,6 +18348,18 @@ function emitLetDeclStmt(body: i32[], s: LetDecl, stmtIx: i32, fnIx: i32) {
     if slotKind == "union" {
       if letUNm != "" { nulNm = letUNm }
       else if s.letType >= 0 { nulNm = tyNameOf(s.letType) }
+      // D969 — AN UN-ANNOTATED BINDING HAS NO NAME TO BOX WITH, and that is the whole of
+      // the D962 regression. Both sources above are ANNOTATION sources; with neither,
+      // `nulNm` stayed "" and `nulRep` stayed -1, so this arm DECLINED and the init fell
+      // to the generic emit — which picks a join blocktype from the arms' scalar ladder
+      // and produced `(if (result i32))` over two REF arms: `vl check` rc 0, invalid wasm.
+      // Pre-D962 the same program was a loud refusal, so the desugaring traded a clause-2
+      // refusal for a clause-1 miscompile, and its fixture could not see it because every
+      // cell in it is annotated.
+      //
+      // The INIT knows the name the annotation would have given. Asked last so no
+      // annotated spelling changes: those two rungs answer first and identically.
+      if nulNm == "" { nulNm = unionNameOfExpr(s.letInit, fnIx) }
       if nulNm != "" { nulRep = 0 }
     } else if slotKind == "nulstr" {
       nulRep = 1
@@ -20005,7 +20025,23 @@ function emitPrintUnionArm(body: i32[], slot: i32, k: i32) {
 // partition the box exactly as the shared-field member chain's do.
 function emitPrintValueUnion(body: i32[], argIx: i32, kinds: i32[], fnIx: i32) {
   const slot = sharedFieldRecvSlot()
-  if emitExpr(body, argIx, fnIx) < 0 { return -1 }
+  // D969 — AN IF-EXPRESSION ARGUMENT MUST BE COERCED, NOT PLAIN-EMITTED. `emitExpr` picks an
+  // if's result blocktype from the arms' scalar ladder, so `print(t ?? "d")` — which the D962
+  // desugaring turns into an `if` — pushed `(if (result i32))` over two REF arms into this
+  // box slot: `vl check` rc 0, invalid wasm. `emitUnionCoerce` routes an `if` to
+  // `emitUnionIfValue`, whose blocktype IS the box and whose arms each coerce.
+  const puIf = P.nodes[unwrapParen(argIx)]
+  let puDone = false
+  if puIf is IfStmt {
+    const puNm = unionNameOfExpr(argIx, fnIx)
+    if puNm != "" {
+      if emitUnionCoerce(body, puNm, argIx, fnIx) < 0 { return -1 }
+      puDone = true
+    }
+  }
+  if !puDone {
+    if emitExpr(body, argIx, fnIx) < 0 { return -1 }
+  }
   fbLocalSet(slot)
   let i = 0
   while i < kinds.length - 1 {

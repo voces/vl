@@ -23861,63 +23861,52 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   invalid wasm.
 
 ---
-### D969 — D962 traded a LOUD refusal for a SILENT miscompile on the UN-ANNOTATED destination, and its fixture covered only the annotated one
+### D969 — D962 traded a LOUD refusal for a SILENT miscompile on the UN-ANNOTATED destination; closed, and the two questions were FIGHTING
 
-**check-clean invalid wasm · a clause-1 REGRESSION introduced by a clause-2 fix, measured 2026-09-01 against a `git archive c557ed18~1` control**
+**closed — an un-annotated `??` binding now boxes and the desugared `if` carries the box blocktype · the regression was found by hand off the `coalesce-over-nullable-union` probe and was INVISIBLE TO THE SCOREBOARD, which read clause 1 = 0 throughout because no corpus cell has the shape**
 
 D962 desugars `x ?? d` over a nullable value-union box into `if x != null { x } else { d }`.
-That is right, and on the shape its fixture pins it is a real win. On the other shape it is a
-loss, and the gate could not see it because the corpus has no cell for either:
+On the shape its fixture pins that is a real win; on the other shape it was a loss:
 
-| destination | pre-D962 | master today |
-|---|---|---|
-| ANNOTATED (`function pick(): string \| i32 { … t ?? "d" }`) | loud emit reject | **runs** |
-| UN-ANNOTATED (`const v = t ?? "d"`) | loud emit reject | **check-clean invalid wasm** |
+| destination | pre-D962 | after D962 | now |
+|---|---|---|---|
+| ANNOTATED (`function pick(): string \| i32`) | loud emit reject | runs | runs |
+| UN-ANNOTATED (`const v = t ?? "d"`) | loud emit reject | **check-clean invalid wasm** | runs |
 
-* **THE FIXTURE IS THE REASON IT SHIPPED.** `tests/cases/expressions/coalesce-nullable-union-box.vl`
-  routes every cell through `function pick(b, n): string | i32`, so the annotation pins the
-  cell and the desugared `if` lands in a destination that already knows it is a box. Remove the
-  annotation and the same three cells miscompile. **A fixture that annotates every destination
-  cannot see a defect whose ingredient is the missing annotation.**
+* **THE FIXTURE IS THE REASON IT SHIPPED.** `coalesce-nullable-union-box.vl` routes every cell
+  through `function pick(b, n): string | i32`, so the annotation pins the cell and seeds the
+  coercion. Remove the annotation and the same three cells miscompile. **A fixture that
+  annotates every destination cannot see a defect whose ingredient is the missing annotation**
+  — now a standing note in `CLAUDE.md`, because the shape is general.
 
-* **AND `loud → silent` IS PRECISELY THE TRADE THE GATE DOES NOT BLOCK.** `regress.py` refuses
-  on `runs → not-runs` and prints everything else, for a reason this repo argued carefully and
-  still holds. This row is the counter-example worth keeping beside it: the movement was
-  invisible not because the criterion is wrong but because **no corpus cell has this shape at
-  all**, so nothing was printed either.
+* **A SYNTHESIZING REWRITE IS TYPE-BLINDING, NOT JUST NODE-ERASING.** `mkIf` mints a node the
+  checker never saw, so `nodeTyIx` has no entry and every consumer asking the arena what the
+  expression IS got -1. `nodeTyCarry(dst, src)` hands the coalesce's join to the `if`; the
+  desugaring is meaning-preserving, so that type is exactly right.
 
-* **THE BINDING CLASSIFIER IS NOT THE LEVER — four probes, each forced to the answer the
-  "obvious" fix would produce, and NONE of them moved the outcome.** All reverted; recorded so
-  the next attempt does not re-spend them:
+* **AND THE TWO QUESTIONS WERE FIGHTING — this is the part worth keeping.** The binding needs
+  `exprUnion` TRUE to get a box cell. `emitUnionCoerce`'s first rung read that same TRUE as
+  "already a union, nothing to do" and raw-passed to `emitExpr`, which picks an if's blocktype
+  from the arms' SCALAR ladder — `(if (result i32))` over two ref arms. So each half of the fix
+  disabled the other, and either alone looks like no progress. **Ordering the `IfStmt` arm
+  ahead of the raw-pass is what lets both be true at once**: raw-passing is right for every
+  other union value and never right for an `if`.
 
-  | probe | result |
-  |---|---|
-  | `exprUnion`'s `??` arm given the `Call` branch's checker-typed net | no change |
-  | `exprUnion`'s `??` arm forced to `return true` | no change |
-  | `exprUnion` given an `IfStmt` arm (the desugared node's real shape), forced true | no change |
-  | `letIsUnion` forced true for a `??` init AND for an `IfStmt` init | no change |
+* **FOUR SITES, and each was found by DISASSEMBLING rather than by the run outcome.** Six
+  earlier probes were recorded here as "no change" and that was wrong — they were graded on
+  the error message, which never moves while EITHER the cell or the blocktype is still scalar.
+  Under `wasm-dis` the forced-`letIsUnion` probe had in fact already fixed the cell
+  (`(local $1 (ref $0))`) with only the blocktype left. The sites: `nodeTyCarry` in the
+  desugar; an `IfStmt` arm on `exprUnion` (the cell) and on `unionNameOfExpr` (the name the
+  box consumers key on, mirroring the `AsExpr` arm's own rendering); the `IfStmt`-before-
+  raw-pass reorder in `emitUnionCoerce`; the un-annotated name source in `emitLetDeclStmt`;
+  and an if-argument coerce in `emitPrintValueUnion` for the bare `print(t ?? "d")`.
 
-  | `nodeTyCarry` — hand the `??`'s checked type to the synthesized `if` | no change |
-  | that carry PLUS an `IfStmt` arm on `exprUnion` reading it | no change |
+* **THE CALL-OPERAND HALF STAYS OPEN under D960** — `exprReReadable` declines a call, so the
+  `??` survives and keeps the emitter's loud refusal. That is a clause-2 residue, not a
+  clause-1 one, and `scripts/capability-probes/coalesce-over-nullable-union.vl` is its witness.
 
-  Tried in both the module-global and the function-local spelling. **So the cell's rep is not
-  decided by `letIsUnion` → `exprUnion`, and a classifier arm is not the fix.**
-
-* **THE BYTES SAY WHY — TWO scalar decisions, not one.** Built with `--no-validate` and read
-  with `wasm-dis`, the function holds `(local $1 i32)` for the cell, and the initializer is
-  `(local.set $1 (if (result i32) (i32.ne (struct.get ...) (i32.const 6)) (then (local.get
-  $0)) (else (global.get $global$1))))`. The cell's valtype AND the if-expression's result
-  BLOCKTYPE both came out `i32`, while the THEN arm pushes the box and the ELSE arm pushes a
-  string ref. A fix that moves only the cell leaves an `(if (result i32))` with ref arms —
-  still invalid — so whatever the real decider is, it must move both, and **a candidate has to
-  be graded by DISASSEMBLING, not by the binding's declared kind.**
-
-* **AND THE LADDER'S FIRST RUNG IS NOT THE CLAIMANT, checked rather than assumed.**
-  `letInitIsLitAtom` reaches `exprIsLitAtom`, whose `??` arm fires only for a FUSED MAP READ
-  left operand (`fusedMapReadRecvIx >= 0`); an Ident operand declines it. So the binding is not
-  being taken early by the litunion rung either.
-
-Repro (check rc 0, invalid wasm):
+Repro (runs, prints `s`):
 
     function mk(b: boolean): string | i32 | null {
       if b { return "s" }
@@ -23926,7 +23915,7 @@ Repro (check rc 0, invalid wasm):
     const t = mk(true)
     const v = t ?? "d"
     print(v)
-    // vl check rc 0; vl run -> Invalid input WebAssembly code: expected i32, found (ref $type)
+    // PRINTS s
 
 ### D968 — `print` of a `!= null`-narrowed union with TWO OR MORE non-null members was check-clean invalid wasm
 
