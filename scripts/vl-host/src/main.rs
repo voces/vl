@@ -6,6 +6,11 @@
 //                                    (`--` ends host parsing; the rest is the program's)
 //   vl fmt   [path] [-w|--check]     format source (stdout / write / CI gate); stdin when no path
 //   vl test  [path] [-t <name>]      discover `*.test.vl`, run them in parallel, report
+//   vl seed  [--out|--path]          write the resolved compiler seed (raw wasm) to stdout/file
+//   vl help  [<command>]             the overview / one command's help (also --help, -h)
+//
+// A bare `vl` is RESERVED for a future REPL: it prints a short hint to stderr and
+// exits 2, so no tooling grows to depend on bare-`vl` output before the REPL lands.
 //
 // The wasm validator lives in wasmtime, and the compiler is a VL program inside the
 // guest with no engine of its own — so telling a valid module from an invalid one is
@@ -31,10 +36,419 @@
 use std::sync::{Arc, Mutex};
 use wasmtime::*;
 
-fn usage() -> ! {
-    eprintln!("usage: vl <build|check|run|fmt|test|seed> <file.vl> [-o out.wasm] [-O|-O3] [--wat] [--no-validate] [-w|--check] [-t name] [--jobs N] [--compiler vl-compiler.wasm]");
-    eprintln!("       vl run <file.vl> [args...] [-- args...]   arguments after `--` reach the program verbatim");
+// ── self-discovery: help, version, usage errors ───────────────────────────────
+//
+// The shape follows the reference CLIs (deno, rustc, node, python3):
+//
+//   vl                      a SHORT hint on stderr, exit 2. Bare `vl` is reserved
+//                           for a future REPL, so nothing may grow to depend on
+//                           its output — but it still EXECUTES, which is all the
+//                           LSP extension's spawn probe requires
+//                           (lsp/src/extension.ts: `spawnSync(vl, [])`, any exit).
+//   vl --help | -h | help   the overview on stdout, exit 0: synopsis, commands
+//                           grouped by purpose with one-line summaries, a footer
+//                           pointing at `vl help <command>`.
+//   vl help <cmd>
+//   vl <cmd> --help | -h    that command's help on stdout, exit 0: synopsis,
+//                           flags with defaults, examples, environment variables.
+//   vl --version | -V       one version line on stdout, exit 0.
+//   unknown command/topic   one stderr line naming the offender + a `vl --help`
+//                           pointer (and a did-you-mean when one is close), exit 2.
+//
+// Exit 2 is this CLI's usage-error code everywhere (`arg_error` below,
+// `cliUsageErr` in compiler/cli.vl); 1 means the program or its compilation
+// failed, and an unusable command line never got that far.
+//
+// COLOR IS GATED PER STREAM, at the moment of printing: ANSI reaches a stream
+// only when that stream is a terminal, `NO_COLOR` is unset, and `TERM` is not
+// `dumb`. There is deliberately NO global "colorize stdout" switch: `vl seed`'s
+// stdout is raw wasm bytes that one stray escape byte would corrupt, so styling
+// is something each printer opts into, never a wrapper every byte passes through.
+
+/// Whether ANSI styling may reach a stream. `stream_is_terminal` is the caller's
+/// `is_terminal()` on the SPECIFIC stream being written — stdout for help,
+/// stderr for usage errors — so a piped stdout with a terminal stderr colors the
+/// error and not the pipe.
+fn color_ok(stream_is_terminal: bool) -> bool {
+    stream_is_terminal
+        && std::env::var_os("NO_COLOR").is_none()
+        && std::env::var_os("TERM").map_or(true, |t| t != "dumb")
+}
+
+/// The ANSI fragments one printer uses, resolved for one stream. All-empty when
+/// color is off, so the format strings below need no branching.
+struct Style {
+    bold: &'static str,
+    cmd: &'static str, // command and flag names
+    dim: &'static str,
+    reset: &'static str,
+}
+
+impl Style {
+    fn of(stream_is_terminal: bool) -> Style {
+        if color_ok(stream_is_terminal) {
+            Style { bold: "\x1b[1m", cmd: "\x1b[36m", dim: "\x1b[2m", reset: "\x1b[0m" }
+        } else {
+            Style { bold: "", cmd: "", dim: "", reset: "" }
+        }
+    }
+    fn stdout() -> Style {
+        use std::io::IsTerminal;
+        Style::of(std::io::stdout().is_terminal())
+    }
+    fn stderr() -> Style {
+        use std::io::IsTerminal;
+        Style::of(std::io::stderr().is_terminal())
+    }
+}
+
+/// The subcommands `vl` knows, for existence checks and did-you-mean.
+const COMMANDS: &[&str] = &["run", "build", "check", "fmt", "test", "seed", "help"];
+
+/// The flags of `cmd` that TAKE A VALUE, so a help scan never mistakes a flag's
+/// value for `--help` (`vl run -e --help` compiles the snippet `--help`).
+fn value_flags(cmd: &str) -> &'static [&'static str] {
+    match cmd {
+        "run" => &["-e", "--compiler", "--out-dir"],
+        "build" => &["-o", "--compiler"],
+        "check" => &["--compiler", "--severity", "--exclude"],
+        "fmt" => &["--compiler"],
+        "test" => &["--compiler", "-t", "--jobs", "--exclude"],
+        "seed" => &["--out", "--compiler"],
+        _ => &[],
+    }
+}
+
+/// Whether `rest` (the args after the subcommand) asks for help: a `-h`/`--help`
+/// that is not a value-taking flag's value and sits before any literal `--`
+/// (everything after `--` belongs to the program). `stop_at_positional` is set
+/// for `vl run`, where tokens after the source file are the PROGRAM's — there
+/// `vl run p.vl --help` keeps its existing exit-2 diagnostic, which already
+/// explains how to pass `--help` through.
+fn wants_help(rest: &[String], cmd: &str, stop_at_positional: bool) -> bool {
+    let values = value_flags(cmd);
+    let mut i = 0;
+    while i < rest.len() {
+        let a = rest[i].as_str();
+        if a == "--" {
+            return false;
+        }
+        if a == "-h" || a == "--help" {
+            return true;
+        }
+        if values.contains(&a) {
+            i += 1; // skip the flag's value
+        } else if stop_at_positional && !a.starts_with('-') {
+            return false;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// `vl --version` / `-V`. The host ABI generation rides along because a
+/// host/seed mismatch is the version question users actually hit (see
+/// `check_seed_abi`).
+fn version_line() -> String {
+    format!("vl {} (host ABI {HOST_ABI})", env!("CARGO_PKG_VERSION"))
+}
+
+/// Bare `vl`: a SHORT stderr hint — the most common commands and where the full
+/// list lives — never the overview (bare `vl` is reserved for a future REPL, and
+/// a rich bare-`vl` screen is exactly what tooling would start scraping).
+fn bare_usage_hint() -> ! {
+    let s = Style::stderr();
+    let (c, d, r) = (s.cmd, s.dim, s.reset);
+    eprintln!("vl: no command given {d}(a bare `vl` is reserved for a future REPL){r}");
+    eprintln!();
+    eprintln!("  {c}vl run{r} <file.vl>    compile and run a program");
+    eprintln!("  {c}vl check{r} [path]     typecheck and report diagnostics");
+    eprintln!("  {c}vl --help{r}           list every command");
     std::process::exit(2);
+}
+
+/// Levenshtein distance, for the did-you-mean below. Six candidate commands and
+/// short strings: the O(len²) table is at most a few dozen cells.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut cur = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur.push((prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1));
+        }
+        prev = cur;
+    }
+    prev[b.len()]
+}
+
+/// The closest known command within edit distance 2 — `vl chekc` suggests
+/// `check`. Deliberately not a fuzzier matcher: two edits catches the typo
+/// shapes people make (transposition, one wrong/missing letter) and nothing a
+/// suggestion would mislead on.
+fn suggest_command(bad: &str) -> Option<&'static str> {
+    COMMANDS
+        .iter()
+        .map(|c| (edit_distance(bad, c), *c))
+        .filter(|(d, _)| *d <= 2)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, c)| c)
+}
+
+/// Unknown subcommand: one line naming the offender, a did-you-mean when one is
+/// close, and the `vl --help` pointer. Stderr, exit 2.
+fn unknown_command(bad: &str) -> ! {
+    let s = Style::stderr();
+    let (c, r) = (s.cmd, s.reset);
+    match suggest_command(bad) {
+        Some(fix) => eprintln!("vl: unknown command `{bad}` — did you mean `{c}{fix}{r}`?"),
+        None => eprintln!("vl: unknown command `{bad}`"),
+    }
+    eprintln!("    run `{c}vl --help{r}` for the list of commands");
+    std::process::exit(2);
+}
+
+/// `vl --help` / `-h` / `vl help`: the overview. Stdout, exit 0. Commands are
+/// grouped by purpose, one line each; details live in `vl help <command>`.
+fn print_overview() {
+    let s = Style::stdout();
+    let (b, c, d, r) = (s.bold, s.cmd, s.dim, s.reset);
+    print!(
+        "\
+vl — the VL toolchain: compile, run, check, format and test VL programs
+
+{b}Usage:{r} vl <command> [options] [path]
+
+{b}Execute:{r}
+  {c}run{r}      Compile a program in memory and run it
+             {d}vl run main.vl  |  vl run main.vl -- --prog-flag  |  echo 'print(1)' | vl run{r}
+  {c}build{r}    Compile a file to a WebAssembly module and validate it
+             {d}vl build main.vl -o main.wasm  |  vl build main.vl -O3{r}
+
+{b}Develop:{r}
+  {c}check{r}    Typecheck a file or directory; print diagnostics
+             {d}vl check  |  vl check src/main.vl --severity info{r}
+  {c}fmt{r}      Format VL source (stdin→stdout, write in place, or CI gate)
+             {d}vl fmt -w main.vl  |  vl fmt --check src/{r}
+  {c}test{r}     Discover *.test.vl files and run them in parallel
+             {d}vl test  |  vl test src/ -t parser{r}
+
+{b}Toolchain:{r}
+  {c}seed{r}     Write the resolved compiler seed (raw wasm bytes) to stdout
+             {d}vl seed --out vl-compiler.wasm  |  vl seed --path{r}
+  {c}help{r}     Show this overview, or one command's help
+             {d}vl help run{r}
+
+{b}Options:{r}
+  {c}-h, --help{r}     Show this overview
+  {c}-V, --version{r}  Print version and host ABI
+
+{b}Environment:{r}
+  {c}VL_COMPILER_WASM{r}  Compiler seed path (a `--compiler` flag wins; then this;
+                    then ./build/vl-compiler.wasm; then the embedded seed)
+  {c}VL_STD{r}            VL's std/ directory (the ONLY candidate when set)
+  {c}NO_COLOR{r}          Disable ANSI color (also off when the stream is not a
+                    terminal, or TERM=dumb)
+
+A bare `vl` is reserved for a future REPL and exits 2.
+Run `{c}vl help <command>{r}` (or `vl <command> --help`) for details on one command.
+"
+    );
+}
+
+/// `vl help <cmd>` / `vl <cmd> --help`: one command's help. Stdout, exit 0.
+/// The flag lists document the parser as it IS — including accepted-but-inert
+/// spellings — rather than an aspiration; each block names its parser of record.
+fn print_command_help(cmd: &str) {
+    let s = Style::stdout();
+    let (b, c, d, r) = (s.bold, s.cmd, s.dim, s.reset);
+    match cmd {
+        // Parser of record: `run_cmd` / `run_batch` below.
+        "run" => print!(
+            "\
+{c}vl run{r} — compile a VL program in memory and run it
+
+{b}Usage:{r} vl run <file.vl> [args...] [-- args...]
+       vl run -e <source>
+       vl run <module.wasm>       {d}a prebuilt module runs directly{r}
+       ... | vl run               {d}source on stdin (when piped){r}
+       vl run --batch --out-dir <dir> <file.vl>...
+
+Program arguments follow the source file; everything after `--` reaches the
+program verbatim — the only way to pass one that starts with `-`.
+
+{b}Flags:{r}
+  {c}-e{r} <source>          Run an inline snippet instead of a file
+  {c}--compiler{r} <wasm>    Compiler seed to use (see `vl help seed`)
+  {c}--batch{r}              Run many files in one process (the fuzz loop's shape);
+                       requires --out-dir. Per input, writes <name>.out and, on
+                       failure, <name>.err; exits 0 unless the batch itself
+                       cannot run
+  {c}--out-dir{r} <dir>      (--batch) Where the per-case .out/.err files land
+  {c}-O, -O3, --names, --wat, --no-validate{r}
+                       Accepted for symmetry with `vl build`; no effect here
+                       (run compiles in memory and writes no artifact)
+
+{b}Environment:{r}
+  {c}VL_GC{r}               Collector for the program: auto (default) | tracing |
+                      refcount | none
+  {c}VL_COMPILER_WASM{r}    Compiler seed path (when --compiler is not given)
+  {c}VL_STD{r}              VL's std/ directory (the only candidate when set)
+
+{b}Exit:{r} 0 the program ran; 1 compile or runtime failure; 2 usage error.
+
+{b}Examples:{r}
+  vl run main.vl one two            {d}the program sees arguments `one`, `two`{r}
+  vl run main.vl -- --verbose       {d}`--verbose` reaches the program{r}
+  echo 'print(6 * 7)' | vl run
+"
+        ),
+        // Parser of record: `build_cmd` below.
+        "build" => print!(
+            "\
+{c}vl build{r} — compile a file to a WebAssembly module, then validate it
+
+{b}Usage:{r} vl build <file.vl> [-o <out.wasm>] [flags]
+
+{b}Flags:{r}
+  {c}-o{r} <out.wasm>       Output path (default: the input with `.wasm`)
+  {c}-O{r}                  Optimize with wasm-opt — the shrink rung (one -O pass)
+  {c}-O3{r}                 The release profile (closed-world + -O3; melts union
+                      boxes). Wins over -O when both are given. Both rungs
+                      require binaryen's wasm-opt and fail loudly without it
+  {c}--names{r}             Embed the wasm \"name\" section (legible trap backtraces)
+  {c}--wat{r}               Also write a .wat disassembly beside the module
+                      (binaryen's wasm-dis; skipped with a note when absent)
+  {c}--no-validate{r}       Skip validating the written module
+  {c}--compiler{r} <wasm>   Compiler seed to use (see `vl help seed`)
+
+{b}Environment:{r}
+  {c}VL_WASM_OPT{r} / {c}VL_WASM_DIS{r}   Explicit binaryen tool paths (else PATH)
+  {c}VL_COMPILER_WASM{r}, {c}VL_STD{r}    As in `vl help run`
+
+{b}Exit:{r} 0 wrote a valid module; 1 compile/optimize/validate failure; 2 usage.
+
+{b}Examples:{r}
+  vl build main.vl                  {d}writes main.wasm{r}
+  vl build main.vl -O3 -o app.wasm --wat
+"
+        ),
+        // Parser of record: cliParseArgs in compiler/cli.vl (inside the seed).
+        "check" => print!(
+            "\
+{c}vl check{r} — typecheck; print diagnostics
+
+{b}Usage:{r} vl check [path] [flags]      {d}default path: the current directory{r}
+
+A single file checks its whole resolved module graph; a directory walks
+every .vl file under it.
+
+{b}Flags:{r}
+  {c}--severity{r} <s>      Gate the exit code at error | warning | info | hint
+                      (default error; also spelled --severity=<s>)
+  {c}--concise{r}           One line per diagnostic
+  {c}--json{r}              JSON diagnostics (machine output: never colored)
+  {c}--codegen{r}           Also run the emitter and VALIDATE the emitted module
+  {c}--no-validate{r}       (with --codegen) skip the engine's verdict
+  {c}--fix{r}               Apply safe autofixes, writing files in place
+  {c}--exclude{r} <glob>    Skip matching paths (repeatable; also --exclude=<glob>)
+  {c}--compiler{r} <wasm>   Compiler seed to use (see `vl help seed`)
+
+{b}Environment:{r}
+  {c}VL_COMPILER_WASM{r}, {c}VL_STD{r}   As in `vl help run`
+  {c}NO_COLOR{r}                   Disable ANSI in diagnostics
+
+{b}Exit:{r} 0 clean; 1 diagnostics at or above the gate; 2 usage error.
+
+{b}Examples:{r}
+  vl check
+  vl check src/main.vl --severity info --concise
+"
+        ),
+        // Parser of record: cliParseArgs in compiler/cli.vl (inside the seed).
+        "fmt" => print!(
+            "\
+{c}vl fmt{r} — format VL source
+
+{b}Usage:{r} vl fmt [path] [flags]        {d}no path: format stdin to stdout{r}
+
+One path per run: a file formats that file, a directory walks it. The default
+prints the formatted source to stdout and writes nothing.
+
+{b}Flags:{r}
+  {c}-w, --write{r}         Write the result back in place
+  {c}--check{r}             Write nothing; exit 1 if anything would change (CI gate)
+  {c}--compiler{r} <wasm>   Compiler seed to use (see `vl help seed`)
+
+{b}Exit:{r} 0 clean; 1 --check found drift; 2 unreadable input or usage error;
+      3 internal formatter bug (the formatted output failed to re-parse).
+
+{b}Examples:{r}
+  vl fmt -w main.vl
+  vl fmt --check src/
+  vl fmt < main.vl
+"
+        ),
+        // Parser of record: cliParseArgs in compiler/cli.vl (inside the seed).
+        "test" => print!(
+            "\
+{c}vl test{r} — discover *.test.vl files and run them in parallel
+
+{b}Usage:{r} vl test [path] [flags]       {d}default path: the current directory{r}
+
+Files run concurrently; tests within one file run serially in one instance,
+so they can share setup. A trapping test fails alone — the file's remaining
+tests continue in a fresh instance.
+
+{b}Flags:{r}
+  {c}-t{r} <name>           Only tests whose name contains <name> (also -t=<name>)
+  {c}--jobs{r} <N>          Worker threads (default: one per core; also --jobs=<N>)
+  {c}--exclude{r} <glob>    Skip matching files (repeatable; also --exclude=<glob>)
+  {c}--compiler{r} <wasm>   Compiler seed to use (see `vl help seed`)
+
+{b}Environment:{r}
+  {c}VL_TEST_TRACE{r}=1     Print per-file scheduling stamps to stderr
+  {c}VL_COMPILER_WASM{r}, {c}VL_STD{r}   As in `vl help run`
+
+{b}Exit:{r} 0 all selected tests passed; 1 any failure; 2 usage error.
+
+{b}Examples:{r}
+  vl test
+  vl test src/ -t parser --jobs 4
+"
+        ),
+        // Parser of record: `seed_cmd` below. stdout here is a BYTE CONTRACT —
+        // the LSP seed ladder pipes it straight into WebAssembly.Module.
+        "seed" => print!(
+            "\
+{c}vl seed{r} — write the resolved compiler seed (raw wasm bytes) to stdout
+
+The seed is the compiler itself, resolved first-hit-wins: `--compiler <path>`,
+then $VL_COMPILER_WASM, then ./build/vl-compiler.wasm, then the copy embedded
+in a release binary. The seed and the language are one artifact — this command
+is how an editor asks an installed `vl` for the seed that matches it.
+
+{b}Usage:{r} vl seed > vl-compiler.wasm
+       vl seed --out <path>       {d}write to a file; prints nothing{r}
+       vl seed --path             {d}print where the seed comes from: a
+                                  filesystem path, or the literal `embedded`{r}
+
+{b}Flags:{r}
+  {c}--out{r} <path>        Write the seed to <path> (parent dirs are created)
+  {c}--path{r}              Print the source instead of the bytes
+  {c}--compiler{r} <wasm>   Resolve this seed instead
+
+stdout carries the raw module and NOTHING else — no banner, no newline; and
+writing it to a terminal is refused with the redirect spelled out. Failure is
+a non-zero exit, never a zero-exit empty stdout.
+
+{b}Exit:{r} 0 bytes/paths delivered; 1 failure (unreadable seed, tty stdout).
+"
+        ),
+        _ => print_overview(),
+    }
 }
 
 /// A `std/` directory is VL's own if it holds the modules `std/` is required to
@@ -2293,6 +2707,7 @@ fn arg_error(msg: &str, token: Option<&str>) -> ! {
         "note: `vl run` itself takes -e <source>, --compiler <wasm>, --batch, \
 -O/-O3, --names, --wat, --no-validate."
     );
+    eprintln!("note: `vl help run` shows the full flag list.");
     std::process::exit(2);
 }
 
@@ -2377,7 +2792,8 @@ fn run_cmd(args: &[String]) -> Result<()> {
     const USAGE: &str = concat!(
         "usage: vl run <file.vl> [args...] [-- args...] | -e <source> | < stdin\n",
         "       a program argument that looks like a flag goes after `--`: ",
-        "vl run <file.vl> -- -v",
+        "vl run <file.vl> -- -v\n",
+        "       `vl help run` shows the full flag list",
     );
     let run_engine = gc_engine(run_collector()?)?;
 
@@ -3093,9 +3509,10 @@ fn cli_pump(args: &[String]) -> Result<()> {
     })?;
     let (mut store, inst) = load_compiler(&engine, &compiler)?;
 
-    // TTY + NO_COLOR is host mechanism; the VL formatter can't probe isatty, so the
-    // resolved decision rides in as a synthetic `--color=always|never` argument.
-    let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    // TTY + NO_COLOR + TERM is host mechanism; the VL formatter can't probe isatty,
+    // so the resolved decision rides in as a synthetic `--color=always|never`
+    // argument. Same per-stream gate the help screens use (`color_ok`).
+    let color = color_ok(std::io::stdout().is_terminal());
 
     let arg_reset = inst.get_typed_func::<(), i32>(&mut store, "cliArgReset")?;
     let arg_push = inst.get_typed_func::<i32, i32>(&mut store, "cliArgPush")?;
@@ -3379,31 +3796,86 @@ fn main() {
 
 fn real_main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    // `fmt`, `run`, and `check` have their own arg shapes (optional/absent file,
-    // flags, stdin), so they're dispatched before the positional `<cmd> <input>`.
-    if args.get(1).map(|s| s == "fmt").unwrap_or(false) {
-        // The subcommand rides as argv[0] so the VL program dispatches on it.
-        return cli_pump(&args[1..]);
+    match args.get(1).map(String::as_str) {
+        // Bare `vl` is reserved for a future REPL — see the self-discovery block.
+        None => bare_usage_hint(),
+        Some("--help") | Some("-h") => {
+            print_overview();
+            Ok(())
+        }
+        Some("--version") | Some("-V") => {
+            println!("{}", version_line());
+            Ok(())
+        }
+        Some("help") => match args.get(2).map(String::as_str) {
+            None | Some("help") => {
+                print_overview();
+                Ok(())
+            }
+            Some(topic) if COMMANDS.contains(&topic) => {
+                print_command_help(topic);
+                Ok(())
+            }
+            Some(topic) => {
+                let s = Style::stderr();
+                let (c, r) = (s.cmd, s.reset);
+                match suggest_command(topic) {
+                    Some(fix) => eprintln!(
+                        "vl: no help for `{topic}` — did you mean `{c}vl help {fix}{r}`?"
+                    ),
+                    None => eprintln!("vl: no help for `{topic}`"),
+                }
+                eprintln!("    run `{c}vl --help{r}` for the list of commands");
+                std::process::exit(2);
+            }
+        },
+        // `fmt`, `check` and `test` share the in-wasm CLI pump; the subcommand
+        // rides as argv[0] so the VL program dispatches on it.
+        Some(cmd @ ("fmt" | "check" | "test")) => {
+            if wants_help(&args[2..], cmd, false) {
+                print_command_help(cmd);
+                return Ok(());
+            }
+            cli_pump(&args[1..])
+        }
+        Some("run") => {
+            // `stop_at_positional`: after the source file, tokens are the
+            // PROGRAM's territory — `vl run p.vl --help` keeps its exit-2
+            // diagnostic, which already explains `--`.
+            if wants_help(&args[2..], "run", true) {
+                print_command_help("run");
+                return Ok(());
+            }
+            run_cmd(&args[2..])
+        }
+        Some("seed") => {
+            if wants_help(&args[2..], "seed", false) {
+                print_command_help("seed");
+                return Ok(());
+            }
+            seed_cmd(&args[2..])
+        }
+        Some("build") => {
+            if wants_help(&args[2..], "build", false) {
+                print_command_help("build");
+                return Ok(());
+            }
+            build_cmd(&args)
+        }
+        Some(other) => unknown_command(other),
     }
-    if args.get(1).map(|s| s == "run").unwrap_or(false) {
-        return run_cmd(&args[2..]);
-    }
-    if args.get(1).map(|s| s == "check").unwrap_or(false) {
-        // The subcommand rides as argv[0] so the VL program dispatches on it.
-        return cli_pump(&args[1..]);
-    }
-    if args.get(1).map(|s| s == "seed").unwrap_or(false) {
-        return seed_cmd(&args[2..]);
-    }
-    if args.get(1).map(|s| s == "test").unwrap_or(false) {
-        // `vl test [path]` — same pump, three more commands (docs/internals/vl-test-design.md).
-        return cli_pump(&args[1..]);
-    }
-    if args.len() < 3 {
-        usage();
-    }
-    let cmd = args[1].as_str();
-    let input = args[2].as_str();
+}
+
+/// `vl build` — see the header comment and `vl help build`. Takes the FULL argv
+/// (flags are scanned across the whole command line, as they always were).
+fn build_cmd(args: &[String]) -> Result<()> {
+    let Some(input) = args.get(2).map(String::as_str) else {
+        let s = Style::stderr();
+        let (c, r) = (s.cmd, s.reset);
+        eprintln!("vl build: missing the <file.vl> input");
+        eprintln!("    usage: vl build <file.vl> [-o out.wasm]  —  see {c}vl help build{r}");
+        std::process::exit(2);
+    };
     let flag = |name: &str| -> Option<String> {
         args.iter()
             .position(|a| a == name)
@@ -3412,8 +3884,6 @@ fn real_main() -> Result<()> {
     };
     let compiler = resolve_compiler(flag("--compiler"));
 
-    // Read the source lazily: a `vl run <file.wasm>` input is a binary module, not
-    // UTF-8, so we must not slurp it as a string up front.
     let read_source = || {
         std::fs::read_to_string(input)
             .map_err(|e| Error::from(e).context(format!("reading `{input}`")))
@@ -3422,50 +3892,45 @@ fn real_main() -> Result<()> {
     // only the user program's own execution gets a real (DRC) collector.
     let compile_engine = gc_engine(Collector::Null)?;
 
-    match cmd {
-        "build" => {
-            let out = flag("-o").unwrap_or_else(|| {
-                input.strip_suffix(".vl").unwrap_or(input).to_string() + ".wasm"
-            });
-            // `--names` embeds a wasm "name" custom section (legible trap backtraces).
-            let names = args.iter().any(|a| a == "--names");
-            let bytes = compile_vl(
-                &compile_engine,
-                &compiler,
-                &read_source()?,
-                input,
-                "compileSrc",
-                names,
-            )?;
-            std::fs::write(&out, &bytes)?;
-            // Optimize the written module in place (wasm-opt, when present). Two
-            // rungs, and `-O3` WINS when both are given — it is a superset of `-O`'s
-            // effect on every measured shape, so running `-O` first would only cost a
-            // process spawn. `-O3` is the release profile (`RELEASE_PASSES`), not a
-            // bare binaryen level.
-            if args.iter().any(|a| a == "-O3") {
-                optimize_in_place(&out, "-O3", RELEASE_PASSES)?;
-            } else if args.iter().any(|a| a == "-O") {
-                optimize_in_place(&out, "-O", OPT_PASSES)?;
-            }
-            let len = std::fs::metadata(&out)
-                .map(|m| m.len())
-                .unwrap_or(bytes.len() as u64);
-            println!("wrote {out} ({len} bytes)");
-            // `--wat`: also write a `.wat` text dump beside the module (wasm-dis,
-            // when present). Reflects the `-O`-optimized module if both are given.
-            if args.iter().any(|a| a == "--wat") {
-                let wat = format!("{}.wat", out.strip_suffix(".wasm").unwrap_or(&out));
-                disassemble_to_wat(&out, &wat)?;
-            }
-            // The written module must be a module the engine will ACCEPT — see
-            // `validate_written_module`. Runs LAST so `--wat` still dumps a broken
-            // module (that dump is how an emit bug gets diagnosed).
-            if !args.iter().any(|a| a == "--no-validate") {
-                validate_written_module(&compile_engine, &out)?;
-            }
-        }
-        _ => usage(),
+    let out = flag("-o").unwrap_or_else(|| {
+        input.strip_suffix(".vl").unwrap_or(input).to_string() + ".wasm"
+    });
+    // `--names` embeds a wasm "name" custom section (legible trap backtraces).
+    let names = args.iter().any(|a| a == "--names");
+    let bytes = compile_vl(
+        &compile_engine,
+        &compiler,
+        &read_source()?,
+        input,
+        "compileSrc",
+        names,
+    )?;
+    std::fs::write(&out, &bytes)?;
+    // Optimize the written module in place (wasm-opt, when present). Two
+    // rungs, and `-O3` WINS when both are given — it is a superset of `-O`'s
+    // effect on every measured shape, so running `-O` first would only cost a
+    // process spawn. `-O3` is the release profile (`RELEASE_PASSES`), not a
+    // bare binaryen level.
+    if args.iter().any(|a| a == "-O3") {
+        optimize_in_place(&out, "-O3", RELEASE_PASSES)?;
+    } else if args.iter().any(|a| a == "-O") {
+        optimize_in_place(&out, "-O", OPT_PASSES)?;
+    }
+    let len = std::fs::metadata(&out)
+        .map(|m| m.len())
+        .unwrap_or(bytes.len() as u64);
+    println!("wrote {out} ({len} bytes)");
+    // `--wat`: also write a `.wat` text dump beside the module (wasm-dis,
+    // when present). Reflects the `-O`-optimized module if both are given.
+    if args.iter().any(|a| a == "--wat") {
+        let wat = format!("{}.wat", out.strip_suffix(".wasm").unwrap_or(&out));
+        disassemble_to_wat(&out, &wat)?;
+    }
+    // The written module must be a module the engine will ACCEPT — see
+    // `validate_written_module`. Runs LAST so `--wat` still dumps a broken
+    // module (that dump is how an emit bug gets diagnosed).
+    if !args.iter().any(|a| a == "--no-validate") {
+        validate_written_module(&compile_engine, &out)?;
     }
     Ok(())
 }

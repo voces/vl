@@ -489,6 +489,7 @@ see **`DECISIONS.md`**.
 
 ## CLI (Track C)
 
+- **Self-discovery overhaul — subcommand help, reserved bare `vl`, per-stream color** — bare `vl` prints a 3-line hint (exit 2, reserved for a future REPL); `vl --help` is a deno-style grouped overview (stdout, exit 0 — it exited 2 before); `vl help <cmd>` ≡ `vl <cmd> --help` per-command screens; unknown commands get did-you-mean (edit distance ≤2); `vl --version`. Color gated per stream on TTY + `NO_COLOR` + `TERM=dumb`, with no global stdout wrap (`vl seed` byte-cleanliness verified exactly, and independently re-verified by the seed-ladder's owner across all five rungs). Closed a pre-existing trap: `vl seed --help` dumped 1.5 MB of raw wasm to a piped stdout at exit 0. (#2080)
 - **C1 Headless `compile(source) → { ast, wasm, diagnostics }`** (`compiler/compile.ts`), shared by LSP, test runner, and CLI.
 - **C2 `vl run`** — compile + run a file / `-e` snippet / stdin (`deno task run`).
 - **C3 `vl build <file> [-o out.wasm] [--wat]`** — emit wasm bytes (+ optional `.wat`).
