@@ -34,6 +34,19 @@
 > checkout and every agent worktree symlinks `scripts/vl-host/target` to the main repo's, so
 > a probe run without it measures the wrong `std` while the Deno gates stay honest
 > (CLAUDE.md). Every measurement in this refresh was taken with it set.
+>
+> **CRITIQUED 2026-09-01 by a three-lens panel, and fact 5 is refuted.** Three independent
+> critiques — language consistency (`docs/internals/serde-critique-consistency.md`),
+> cross-language comparison (`serde-critique-crosslang.md`), performance
+> (`serde-critique-perf.md`) — and a coordinator's synthesis with every load-bearing claim
+> re-run (`serde-critique-synthesis.md`). The architecture survives all three lenses; what
+> fails is narrower: **the JSON value tree RUNS today** (six arms including `null`, as of
+> #2244 — §Approach 1's premise that the self-reference forces a pull lexer is false and the
+> section wants re-deriving with a POSITION axis); the OQ list is missing the
+> **unknown-field policy**, which decides OQ-7's ambiguity predicate; the cycle seen-set is
+> O(n²) and unpriced; and two clause-2 refusals (`u8[]` struct field — D1008; ref-keyed
+> `Map`) sit on the plan's own critical path. **Seven decisions (A–G) await the owner** in
+> the synthesis; nothing below has been rewritten to anticipate them.
 
 ---
 

@@ -226,6 +226,20 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
 - **serde OQ-1..OQ-7** (`docs/serde-design.md` §Open questions) — none block Stage 0
   (in flight); Stage 1/2 scheduling wants OQ-1 (surface spelling) and OQ-2 (union
   ordering) settled first.
+  **CRITIQUED 2026-09-01** — three-lens panel (consistency / cross-language / performance)
+  + synthesis, `docs/internals/serde-critique-synthesis.md`. Architecture holds; **seven
+  owner decisions A–G** are open there: (A) unknown-field policy and its three siblings
+  (case, duplicate keys, `null` vs omitted — recommended reject / exact / reject / always
+  emit `null`); (B) i64 on the wire (recommended: always a JSON number, add
+  `parseI64`/`parseI32`); (C) untagged refusal rule = first-token or required-key-set
+  distinguishable (recommended adopt); (D) cycles — static acyclic-shape predicate + depth
+  cap (recommended), reference-identity keys ruled separately; (E) VLB 8-byte shape
+  fingerprint header (recommended yes); (F) reopen OQ-6, newtypes transparent
+  (recommended); (G) stage 1 = value tree + parser, re-derive §Approach 1 with a POSITION
+  axis. Engineering fallout filed: D1008 (`u8[]` struct field, clause 2), D1009/D1010
+  (`null` membership in a recursive union at the checker), plus the routing table in the
+  synthesis (print≠toString f64, `type Dec<T> = (Lex) => T`, `parseI64`, `fromUtf8` view,
+  seeded string hash, stage clause table).
 
 
 > **Destringify types — CLOSED, nothing to schedule.** Verified 2026-08-25 against the programme's
