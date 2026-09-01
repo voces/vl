@@ -57,7 +57,7 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   (`TPL_RENDER_EXPORT` in `driver.vl`) — it is already isolated.
 - **`else` requires braces** — DONE #2165; recorded here only because the ruling predates
   the entry above and the DECISIONS entry is the durable home.
-- **Driver lossless-recovery flag — STAGE 1 DONE #TBD** (ruled 2026-09-01, shipped the
+- **Driver lossless-recovery flag — STAGE 1 DONE #2210** (ruled 2026-09-01, shipped the
   same day). A file whose EVERY parse diagnostic is a lossless recovery's is typechecked
   and linted anyway, so "missing brace" and "type error four lines down" are reported
   together — the LSP stops blanking all type feedback the moment a body is half-written.
