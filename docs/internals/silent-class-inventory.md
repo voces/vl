@@ -23829,6 +23829,45 @@ Repro (check rc 0, invalid wasm):
     // vl check rc 0; vl run -> failed to compile: wasm[0]::function[4]::p2
 
 ---
+### D980 — a closure-FIELD call in TAIL position lowered as a statement and trapped
+
+**closed — `stmtIsTailValue` now admits a closure-field call · reported by the owner while exploring the constraints design, minimized by vl-b7 · the third witness in that corner, and the one that separates POSITION from ANNOTATION**
+
+`function p(x: { f: () => string }): string { x.f() }` traps; `return x.f()` runs. The
+annotation is not the ingredient — the POSITION is.
+
+* **THE TAIL LOWERED AS A STATEMENT.** `stmtIsTailValue` returned false for EVERY member
+  callee, so the tail expression became `drop` then `unreachable` under a
+  `(result (ref $string))` functype. That is why the failure is a run-time trap rather than a
+  load error: the module is well-formed, the function just never returns.
+
+* **THE GRID IS WHAT MADE IT LEGIBLE, and it holds THREE distinct outcomes** — which is why
+  fixing any single cell first would have looked complete. Measured over
+  {un-annotated, annotated} x {`print(x.f())`, `return x.f()`, tail `x.f()`, `const v = x.f()`}:
+  the tail cell TRAPS in both rows; the un-annotated `print` and `const` cells are check-clean
+  INVALID WASM (D976, still open); everything else runs.
+
+* **NARROW ON PURPOSE, and the wide version was measured.** Admitting every member call whose
+  checker type is non-void breaks `xs.push(1)` and std/array's in-place helpers: they are tail
+  member calls in VOID functions, and claiming them puts a result on the stack under a
+  `()`-result functype (`type error in return[0]`). Two further gates — excluding the mutating
+  method names, then also requiring the enclosing function to be non-void — each still failed
+  the same fixtures. The closure-FIELD test is the one that does not overreach.
+
+* **AND V8 CAUGHT WHAT THE HOST DID NOT, again.** Both wide attempts passed `vl run` on the
+  witness and failed only in `cases_wasm_test.ts`'s `WebAssembly.instantiate` — the same engine
+  split D979 recorded one row earlier.
+
+Repro (runs, prints `ok`):
+
+    const a = { f: () => "ok" }
+    function tailCall(x: { f: () => string }): string {
+      x.f()
+    }
+    print(tailCall(a))
+    // PRINTS ok
+
+---
 ### D979 — `u8[] | null` had no NICHE: the packed byte list was the one scalar list absent from the family
 
 **closed for every position but one — the pin `error-u8-nullable-union-unsupported.vl` converts to a runs fixture · a TAIL-return function beside a bare-null GLOBAL is the residue, and V8 catches it where the native host does not · found by serde stage 0, whose base64 decoder ships `u8[] | Base64Error` instead**
