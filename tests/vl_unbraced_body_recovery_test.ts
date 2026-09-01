@@ -1,6 +1,8 @@
 // UNBRACED-BODY RECOVERY — one mistake, ONE diagnostic, and the parse continues.
 //
-// `if` / `while` / `for` bodies require braces. An unbraced one used to CASCADE:
+// `if` / `while` / `for` / `else` bodies require braces (`else` joined them on
+// 2026-09-01 — DECISIONS.md; it used to accept a bare statement, and a bare
+// expression in value position). An unbraced one used to CASCADE:
 // `expect("LBRACE")` diagnosed and left the cursor put, `parseBlock` swallowed the
 // rest of the file as the body, and its `expectClose` reported a second, phantom
 // `expected `}` but found end of input` on a line the user never wrote (three
@@ -170,6 +172,41 @@ const ONE: OneCase[] = [
     col: 12,
     endCol: 17,
   },
+  // `else` — the three spellings that were LEGAL until 2026-09-01. Each is now
+  // one diagnostic on the arm's first token, from the same `parseBracedBody`.
+  {
+    name: "else-call",
+    src: "const c = false\nif c { print(1) } else print(2)\n",
+    message: "an `else` body requires braces: `else { … }`",
+    line: 2,
+    col: 24,
+    endCol: 29,
+  },
+  {
+    name: "else-assign",
+    src: "const c = false\nlet x = 0\nif c { x = 1 } else x = 2\nprint(x)\n",
+    message: "an `else` body requires braces: `else { … }`",
+    line: 3,
+    col: 21,
+    endCol: 22,
+  },
+  {
+    name: "else-value", // value position: the bare EXPRESSION arm
+    src: "const c = false\nconst x = if c { 1 } else 2\nprint(x)\n",
+    message: "an `else` body requires braces: `else { … }`",
+    line: 2,
+    col: 27,
+    endCol: 28,
+  },
+  {
+    name: "else-return", // a statement KEYWORD arm, on its own line
+    src:
+      "function f(v: i32) {\n  if v > 0 { return 1 }\n  else return 2\n}\nprint(f(-1))\n",
+    message: "an `else` body requires braces: `else { … }`",
+    line: 3,
+    col: 8,
+    endCol: 14,
+  },
 ];
 
 Deno.test({
@@ -313,6 +350,26 @@ Deno.test({
           src: "const c = true\nif c\n",
           want: "expected `{` but found end of line",
         },
+        // `else` lands on the SAME arm as its `if` twin above — measured
+        // identical (message, count and span shape) for `)`, `}` and EOL.
+        {
+          name: "else-rbrace",
+          src: "const c = true\nfunction f() {\n  if c { print(1) } else }\n}\n",
+          want: "expected `{` but found `}`",
+        },
+        {
+          name: "else-rparen",
+          src: "const c = true\nfunction f() {\n  if c { print(1) } else )\n}\n",
+          want: "expected `{` but found `)`",
+        },
+        {
+          // `else` at end of line was ALREADY a parse error before the ruling
+          // (`expected an expression but found NEWLINE`) — the body has to sit
+          // on the `else`'s own line. Only the WORDING moved, onto the family's.
+          name: "else-eol",
+          src: "const c = true\nif c { print(1) } else\n",
+          want: "expected `{` but found end of line",
+        },
       ];
       for (const c of cases) {
         const { diags } = await diagsOf(dir, c.name, c.src);
@@ -333,41 +390,50 @@ Deno.test({
   },
 });
 
-// `else` PERMITS an unbraced statement — legal syntax, not a recovery. It must
-// stay diagnostic-free, run correctly, and keep normalizing to braced under
-// `vl fmt`. (A design ruling on requiring braces there is the owner's, pending;
-// this pins today's behaviour so a change to it is deliberate.)
+// The BRACED spellings the ruling leaves alone. `else if` is the one that
+// matters: a chain is an `if` in the else slot, not an unbraced body, so it must
+// stay diagnostic-free in BOTH positions — a rule written as "the token after
+// `else` must be `{`" would have broken every chain in the tree. The object
+// literal is the other edge: `else { a: 2 }` is braced, and `looksLikeObject`
+// (not the brace rule) is what decides it reads as a value rather than a block.
 Deno.test({
-  name: "else: an unbraced branch stays legal, runs, and fmt braces it",
+  name: "else: `else if`, a block, and a braced object literal stay legal",
   ignore: !ENABLED,
   fn: async () => {
     await withDir(async (dir) => {
-      const cases: {
-        name: string;
-        src: string;
-        stdout: string;
-        formatted: string;
-      }[] = [
+      const cases: { name: string; src: string; stdout: string }[] = [
         {
-          name: "else-call",
-          src: "const c = false\nif c { print(1) } else print(2)\n",
+          name: "else-block",
+          src: "const c = false\nif c { print(1) } else { print(2) }\n",
           stdout: "2\n",
-          formatted: "const c = false\nif c { print(1) } else { print(2) }\n",
         },
         {
-          name: "else-assign",
+          name: "else-empty-block", // `{}` is a block here, not an object
+          src: "const c = true\nif c { print(1) } else {}\n",
+          stdout: "1\n",
+        },
+        {
+          name: "else-if-statement",
           src:
-            "const c = false\nlet x = 0\nif c { x = 1 } else x = 2\nprint(x)\n",
+            "const c = false\nconst d = true\nif c { print(1) } else if d { print(2) } else { print(3) }\n",
           stdout: "2\n",
-          formatted:
-            "const c = false\nlet x = 0\nif c { x = 1 } else { x = 2 }\nprint(x)\n",
         },
         {
-          name: "else-value",
-          src: "const c = false\nconst x = if c { 1 } else 2\nprint(x)\n",
+          name: "else-if-value",
+          src:
+            "const c = false\nconst d = true\nconst x = if c { 1 } else if d { 2 } else { 3 }\nprint(x)\n",
           stdout: "2\n",
-          formatted:
-            "const c = false\nconst x = if c { 1 } else { 2 }\nprint(x)\n",
+        },
+        {
+          name: "else-object-literal",
+          src:
+            "const c = false\nconst o = if c { { a: 1 } } else { a: 2 }\nprint(o.a)\n",
+          stdout: "2\n",
+        },
+        {
+          name: "else-on-its-own-line", // `}` NEWLINE `else {` — the block form
+          src: "const c = false\nif c { print(1) }\nelse { print(2) }\n",
+          stdout: "2\n",
         },
       ];
       for (const c of cases) {
@@ -387,14 +453,48 @@ Deno.test({
             } at exit ${ran.code}: ${ran.err}`,
           );
         }
-        const fmt = await run(["fmt", file]);
-        if (fmt.code !== 0 || fmt.out !== c.formatted) {
+      }
+    });
+  },
+});
+
+// An unbraced `else` is bounded the same way the other arms are: the arm is ONE
+// statement, so a later independent error still reports from its own position.
+// (Before the ruling this file was diagnostic-free and ran — the `else print(2)`
+// line was legal sugar and `vl fmt` normalized it to braced.)
+Deno.test({
+  name: "else: unbraced arm recovers and later errors still surface",
+  ignore: !ENABLED,
+  fn: async () => {
+    await withDir(async (dir) => {
+      const { diags } = await diagsOf(
+        dir,
+        "else-continues",
+        "const c = false\nif c { print(1) } else print(2)\nfor x 0 to 3 { print(x) }\nlet o = { x: 1 }\no.x++\n",
+      );
+      const want = [
+        "an `else` body requires braces: `else { … }`",
+        "expected `in` in for-loop",
+        "postfix `++` target must be an identifier",
+      ];
+      if (diags.length !== want.length) {
+        throw new Error(
+          `want ${want.length} diagnostics, got ${diags.length}: ${
+            fmtDiags(diags)
+          }`,
+        );
+      }
+      for (let i = 0; i < want.length; i++) {
+        if (diags[i].message !== want[i]) {
           throw new Error(
-            `${c.name}: want fmt output ${JSON.stringify(c.formatted)}, got ${
-              JSON.stringify(fmt.out)
-            } at exit ${fmt.code}: ${fmt.err}`,
+            `diagnostic ${i}: want ${JSON.stringify(want[i])}, got ${
+              JSON.stringify(diags[i].message)
+            }`,
           );
         }
+      }
+      if (diags[0].line !== 2 || diags[1].line !== 3 || diags[2].line !== 5) {
+        throw new Error(`want lines 2, 3, 5; got ${fmtDiags(diags)}`);
       }
     });
   },
