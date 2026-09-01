@@ -52,6 +52,7 @@ import {
   f32LitOverflows,
   f64LitOverflows,
   intLexemeIsExactF32,
+  numLexIsFloat,
 } from "./emit_bignum"
 import {
   ArrayLit,
@@ -2046,9 +2047,10 @@ function litMemberTy(name: string) {
   // bound is the `name.length == 0` early return two lines up, not the home's: the home
   // carries none.
   if nameIsQuotedLeaf(name) { return mkLitTy("str", groupInnerOf(name)) }
-  // A NUMERIC-LITERAL type (`0`, `1.5`): int vs float by the `.`.
+  // A NUMERIC-LITERAL type (`0`, `1.5`, `1e3`): int vs float by the LEXEME's own
+  // shape (a `.` or a scientific exponent — `numLexIsFloat`, the one home).
   if name[0] >= '0' && name[0] <= '9' {
-    if hasDot(name) { return mkLitTy("flt", name) }
+    if numLexIsFloat(name) { return mkLitTy("flt", name) }
     return mkLitTy("int", name)
   }
   -1
@@ -2841,7 +2843,7 @@ function objLitWidenFields(
       if fv < 0 { return false }
       const fvn = P.nodes[fv]
       if fvn is NumLit {
-        if hasDot(fvn.numText) { return false }
+        if numLexIsFloat(fvn.numText) { return false }
         if !intLexemeFitsI32(fvn.numText) { return false }
         recNodes.push(fv)
         recTys.push(dty)
@@ -5542,7 +5544,7 @@ function litTyOfExpr(ix: i32) {
     return mkLitTy("str", raw.slice(1, raw.length - 1))
   }
   if e is NumLit {
-    if hasDot(e.numText) { return mkLitTy("flt", e.numText) }
+    if numLexIsFloat(e.numText) { return mkLitTy("flt", e.numText) }
     return mkLitTy("int", e.numText)
   }
   -1
@@ -7066,7 +7068,8 @@ function exprIsBrandAdoptingLiteral(ix: i32) {
   false
 }
 
-// Is the EXPRESSION at `ix` (peeling parens) a float `.` NUMBER literal? A float
+// Is the EXPRESSION at `ix` (peeling parens) a FLOAT NUMBER literal — one spelled
+// with a `.` (`1.5`) or with a scientific exponent (`1e3`, `1.5e-7`)? A float
 // literal is polymorphic across the float types: it types f64 by default but
 // re-encodes EXACTLY into an f32 slot, so a float literal flowing into an `f32`
 // binding/operand is accepted (the demote that a general f64 value would need is
@@ -7088,7 +7091,7 @@ function isFloatLitExpr(ix: i32) {
   // encode ±infinity), so it gets no f32 grant — it takes the normal
   // f64-value-into-f32 lossy-demote rejection at the flow site.
   if e is NumLit {
-    if !hasDot(e.numText) { return false }
+    if !numLexIsFloat(e.numText) { return false }
     return !f32LitOverflows(e.numText)
   }
   false
@@ -7098,7 +7101,7 @@ function isFloatLitExpr(ix: i32) {
 // value f32 holds EXACTLY (`intLexemeIsExactF32`)? The integer half of the contextual-
 // f32-literal rule, and it takes the OTHER of the two principled designs on purpose:
 //
-//   - a `.` literal is CONTEXT-TYPED (`isFloatLitExpr`) — it is f32 from birth and
+//   - a FLOAT literal is CONTEXT-TYPED (`isFloatLitExpr`) — it is f32 from birth and
 //     rounds ONCE, because an exactness gate would reject `0.1`, `0.2`, `3.14` and
 //     every other useful constant, leaving the feature with nothing to admit;
 //   - an integer literal is EXACTNESS-GATED — it denotes an exact integer, so silently
@@ -7123,7 +7126,7 @@ function isExactF32IntLitExpr(ix: i32) {
     if e.unOp == "-" { return isExactF32IntLitExpr(e.unArg) }
   }
   if e is NumLit {
-    if hasDot(e.numText) { return false }
+    if numLexIsFloat(e.numText) { return false }
     return intLexemeIsExactF32(e.numText)
   }
   false
@@ -8301,7 +8304,7 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
       const u8e = P.nodes[srcExpr]
       if u8e is Paren { return assignableExpr(u8e.parInner, srcTy, dstTy) }
       if u8e is NumLit {
-        if hasDot(u8e.numText) { return false }
+        if numLexIsFloat(u8e.numText) { return false }
         if u8LexValue(u8e.numText) > 255 {
           if !inferQuiet {
             tErr(
@@ -8574,17 +8577,6 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   false
 }
 
-// Does `s` contain a "." (so a number literal is a float)? Indexing a string
-// yields the i32 char CODE, so the comparison is against the char literal `'.'`.
-function hasDot(s: string) {
-  let i = 0
-  while i < s.length {
-    if s[i] == '.' { return true }
-    i = i + 1
-  }
-  false
-}
-
 // Does the non-negative integer LEXEME `t` (decimal / `0x` hex / `0b` binary /
 // `0o` octal, `_` separators skipped) fit the i32 range [0, 2147483647]? Ports
 // the host's `defaultIntegerType` magnitude rule (typecheck.ts): an un-annotated
@@ -8717,7 +8709,7 @@ function isNegI32MinLit(ix: i32) {
   const e = P.nodes[ix]
   if e is Paren { return isNegI32MinLit(e.parInner) }
   if e is NumLit {
-    if hasDot(e.numText) { return false }
+    if numLexIsFloat(e.numText) { return false }
     return intLexemeIs2Pow31(e.numText)
   }
   false
@@ -9863,7 +9855,7 @@ function tsToTyReal(ix: i32) {
   }
   // A NUMERIC-LITERAL type (`0`, `1.5`): int vs float by the `.` in the LEXEME.
   if k == TS_LITNUM {
-    if hasDot(tsText[ix]) { return mkLitTy("flt", tsText[ix]) }
+    if numLexIsFloat(tsText[ix]) { return mkLitTy("flt", tsText[ix]) }
     return mkLitTy("int", tsText[ix])
   }
   if k == TS_NULL { return TY_NULL }
@@ -25649,7 +25641,7 @@ function checkProgramNode(n: Program) {
           // still order-dependent — it carries no manifest type to hoist.)
           const initN = P.nodes[sm.letInit]
           if initN is NumLit {
-            if hasDot(initN.numText) { mty = TY_F64 }
+            if numLexIsFloat(initN.numText) { mty = TY_F64 }
             else if intLexemeFitsI32(initN.numText) { mty = TY_I32 }
             else { mty = TY_I64 }
           } else if initN is StrLit {
@@ -25907,7 +25899,7 @@ function checkNodeReal(ix: i32) {
     // A literal with a "." is f64. An integer literal defaults to the NARROWEST
     // type that holds it exactly — i32 if its magnitude fits, else i64 — the
     // host's `defaultIntegerType` rule (`intLexemeFitsI32`).
-    if hasDot(n.numText) {
+    if numLexIsFloat(n.numText) {
       // A literal whose magnitude rounds past the largest finite double names a
       // value f64 cannot represent — and VL has no infinity spelling to encode
       // it honestly, so it is an ERROR (silent ±inf would be a lossy implicit

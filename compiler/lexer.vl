@@ -6,7 +6,7 @@ import { cpCount } from "./strutil"
 // string / char grammar and escape set — but is idiomatic VL, not a
 // transliteration. It scans:
 //   - identifiers and keywords,
-//   - integer / real number literals (`12`, `3.14`),
+//   - integer / real number literals (`12`, `3.14`, `1.5e-7`),
 //   - char literals `'a'` and string literals `"..."`, both with the shared
 //     escape grammar `\n \t \r \\ \" \' \0 \b \f \v \xXX \uXXXX \u{…}`,
 //   - the full one- and two-char operator / punctuation set,
@@ -761,8 +761,9 @@ export function tokenize(source: string): LexResult {
     }
 
     // Number. Hex `0x`/`0X` (digits `[0-9a-fA-F]`) and binary `0b`/`0B` (digits
-    // `[01]`) integer forms, plus decimal `[0-9]+ ('.' [0-9]+)?` — the fractional
-    // part is taken only when a digit follows the dot, so `a.5` / `p.x` keep `.` as
+    // `[01]`) integer forms, plus decimal
+    // `[0-9]+ ('.' [0-9]+)? ([eE] [+-]? [0-9]+)?` — the fractional part is taken
+    // only when a digit follows the dot, so `a.5` / `p.x` keep `.` as
     // a separate DOT. The NUMBER token's `text` is the RAW source lexeme (via
     // `mkTok`'s span slice), including any `0x`/`0b` prefix; `parseI32` decodes the
     // base from that prefix. This mirrors the host scanner's hex/binary base set
@@ -811,9 +812,47 @@ export function tokenize(source: string): LexResult {
           advance()
         }
       }
-      // A misplaced separator (doubled `1__0`, trailing `1_`) — a `_` left here
-      // sits at the start, end, or against another `_`, never between digits.
-      if peek() == '_' {
+      // SCIENTIFIC NOTATION — `e`/`E`, an optional sign, then a decimal digit run
+      // with the same `_`-between-digits rule. `1e3`, `1.5e-7`, `2E+10`, `1e0`.
+      //
+      // Only the DECIMAL arm reaches here: a radix literal returned above, so the
+      // `e` of `0x1e5` is a hex digit and is never read as an exponent marker. And
+      // the mantissa grammar is UNCHANGED — VL has no bare `.5` or `1.` float, so
+      // `.5e3` is still DOT + `5e3` (a parse error at the DOT, as `.5` already was)
+      // and `1.e3` is still `1` + DOT + `e3` (member access, as `1.e3` already was).
+      // Measured on the pre-change compiler; the exponent is a SPELLING of the
+      // existing float literal, not a new mantissa grammar.
+      //
+      // Taken EAGERLY: once an `e`/`E` follows the mantissa the literal is committed
+      // to being a float, so `1e` / `1e+` / `1e_5` report AT THE LITERAL instead of
+      // splitting into a NUMBER plus a stray identifier that the PARSER then blames
+      // (`expected `)` but found `e``). The recovery consumes the identifier run for
+      // the same reason `scanRadix` does — one clear lex error, no cascade.
+      let expBad = false
+      if peek() == 'e' || peek() == 'E' {
+        advance() // 'e' / 'E'
+        if peek() == '+' || peek() == '-' { advance() }
+        // The bool goes through a local first — the shape `scanRadix`'s header
+        // records for every `if` over a boolean call in this file.
+        const eDigit = isDigit(peek())
+        if eDigit {
+          while (
+            gPos < gSrc.length &&
+            (isDigit(peek()) || (peek() == '_' && isDigit(peek2())))
+          ) {
+            advance()
+          }
+        } else {
+          diag("float exponent has no digits after `e`")
+          expBad = true
+          while gPos < gSrc.length && isIdPart(peek()) { advance() }
+        }
+      }
+      // A misplaced separator (doubled `1__0`, trailing `1_`, `1e5_`) — a `_` left
+      // here sits at the start, end, or against another `_`, never between digits.
+      // Skipped when the exponent already reported: its recovery ate the id run, so
+      // a `_` here would be a SECOND diagnostic for one broken literal.
+      if !expBad && peek() == '_' {
         diag("`_` may only separate digits in a numeric literal")
         while gPos < gSrc.length && isIdPart(peek()) { advance() }
       }

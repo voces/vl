@@ -9,6 +9,45 @@
 // final divide to decide round-to-nearest-ties-to-even. (Slice 3.)
 export let gDivRemNonzero = false
 
+// THE ONE HOME of "is this lexeme plain DECIMAL?" — no `0x`/`0X` hex, `0b`/`0B`
+// binary or `0o`/`0O` octal prefix. Two questions read it: whether a literal can
+// re-encode directly as an `f64.const`/`f32.const` (the emitter's constexpr path),
+// and whether an `e`/`E` in the lexeme is an EXPONENT MARKER or a hex digit.
+// Moved here from `emit_base` so the second reader — this file — can ask it without
+// an upward import; `emit_base` re-exports nothing, its importer took the direct one.
+export function numLexIsDecimal(t: string) {
+  if t.length >= 2 && t[0] == '0' {
+    const p = t[1]
+    if p == 'x' || p == 'X' || p == 'b' || p == 'B' || p == 'o' || p == 'O' {
+      return false
+    }
+  }
+  true
+}
+// THE ONE HOME of "does this `NumLit` lexeme denote a FLOAT?" — it carries a `.`
+// (`1.5`) or a scientific EXPONENT (`1e3`, `2E+10`, `1.5e-7`). The two are SPELLINGS
+// of one literal kind, not two kinds: both default to f64, both are context-typed
+// into an `f32` slot, and both encode through `f64Bytes`/`f32Bytes`.
+//
+// It was written out TWICE before the exponent existed — `typecheck.hasDot` and
+// `emit_base.numTextIsFloat`, both a bare `.`-scan — so adding a second float
+// spelling would have had to be remembered in both, and a checker that called `1e3`
+// an integer while the emitter called it a float is exactly the check/emit
+// disagreement that produces check-clean invalid wasm. One home, one answer.
+//
+// A RADIX lexeme is excluded by construction: `0x1e5` is an INTEGER whose `e` is a
+// hex digit. (The lexer never produces a radix lexeme with a `.` or an exponent —
+// this guard is what makes the predicate total over lexemes rather than trusting it.)
+export function numLexIsFloat(t: string) {
+  if !numLexIsDecimal(t) { return false }
+  let i = 0
+  while i < t.length {
+    const c = t[i]
+    if c == '.' || c == 'e' || c == 'E' { return true }
+    i = i + 1
+  }
+  false
+}
 // Does the non-negative integer LEXEME `t` (a `NumLit.numText`: decimal / hex /
 // binary / octal, `_` separators skipped) fit the i32 range [0, 2147483647]?
 // Mirrors the checker's `intLexemeFitsI32` (the host `defaultIntegerType`
@@ -400,6 +439,33 @@ export function parseI32(text: string) {
 // backstop read it, so the overflow judgement has ONE implementation (the same
 // alignment + rounding that encodes the bytes) and cannot drift.
 export let gIeeeOverflow = false
+// The ±0 encoding of a format `nbytes` wide: every byte zero but the sign bit (bit 7
+// of the high byte). Used by the mantissa-is-zero arm AND by the underflow clamp.
+function ieeeZeroBytes(neg: boolean, nbytes: i32) {
+  const z: i32[] = []
+  let zi = 0
+  while zi < nbytes {
+    z.push(0)
+    zi = zi + 1
+  }
+  if neg { z[nbytes - 1] = 0x80 }
+  z
+}
+// The ±infinity encoding: exponent ALL ONES, fraction 0. Byte-for-byte what the packer
+// at the bottom of `ieeeBytes` produces from `qs = []` + `biased = 2*bias + 1` — the
+// clamp arm exists so a literal whose magnitude is beyond ANY reach (`1e400`,
+// `1e1000000`) never builds the 10^exp bignum just to be thrown away.
+function ieeeInfBytes(neg: boolean, nbytes: i32) {
+  const z = ieeeZeroBytes(neg, nbytes)
+  if nbytes == 8 {
+    z[6] = 0xf0 // biased 2047: low 4 exponent bits in the high nibble
+    z[7] = z[7] | 0x7f
+  } else {
+    z[2] = 0x80 // biased 255: the low exponent bit
+    z[3] = z[3] | 0x7f
+  }
+  z
+}
 // Encode the decimal literal `text` as its little-endian IEEE-754 bytes (i32[]). Shared by
 // `f64Bytes`/`f32Bytes`, parameterized over the format: `sigBits` significand bits (53 / 24),
 // `bias` exponent bias (1023 / 127), `nbytes` output width (8 / 4). The subtle, error-prone
@@ -443,11 +509,17 @@ function ieeeBytes(text: string, sigBits: i32, bias: i32, nbytes: i32) {
       i = i + 2
     }
   }
-  // Parse mantissa digits (ignoring `.` and `_`), counting fractional digits.
+  // Parse mantissa digits (ignoring `.` and `_`), counting fractional digits and
+  // SIGNIFICANT digits (from the first nonzero on — that is the count that bounds
+  // `mant` between 10^(sig-1) and 10^sig, which the range clamp below needs).
   let mant: i32[] = []
   mant.push(0)
   let frac = 0
   let dot = false
+  let sig = 0
+  let seenNz = false
+  let expv = 0
+  let expNeg = false
   while i < text.length {
     const c = text[i]
     if c == '_' {
@@ -455,6 +527,36 @@ function ieeeBytes(text: string, sigBits: i32, bias: i32, nbytes: i32) {
     } else if c == '.' {
       dot = true
       i = i + 1
+    } else if base == 10 && (c == 'e' || c == 'E') {
+      // SCIENTIFIC EXPONENT (`1e3`, `1.5e-7`, `2E+10`). It scales the SAME exact
+      // rational the plain spelling builds — `mant * 10^(exp - frac)` — so the
+      // single round-to-nearest below still happens once, on the exact value. There
+      // is no `mantissa * 10^exp` in f64 anywhere, which is the classic way this
+      // goes one ULP wrong (`1e23` composed by repeated multiplication).
+      //
+      // Guarded on `base == 10`: in a radix lexeme `e` is a hex DIGIT (`0x1e5`), and
+      // the lexer never emits an exponent on one.
+      //
+      // `expv` SATURATES at 10^8. It is only ever compared against a digit count
+      // (the clamp below), and every literal past that bound is decided the same way
+      // it is at the bound, so saturating costs no accuracy and keeps the fold inside
+      // i32. The digits are the lexer's (`[+-]? [0-9] ([0-9]|_)*`).
+      i = i + 1
+      if i < text.length {
+        if text[i] == '-' {
+          expNeg = true
+          i = i + 1
+        } else if text[i] == '+' {
+          i = i + 1
+        }
+      }
+      while i < text.length {
+        const ec = text[i]
+        if ec != '_' {
+          if expv <= 100000000 { expv = expv * 10 + (ec - '0') }
+        }
+        i = i + 1
+      }
     } else {
       let d = 0
       if c >= '0' && c <= '9' { d = c - '0' }
@@ -462,29 +564,48 @@ function ieeeBytes(text: string, sigBits: i32, bias: i32, nbytes: i32) {
       else { d = c - 'A' + 10 }
       mant = bigMulSmall(mant, base)
       mant = bigAddSmall(mant, d)
+      if d != 0 { seenNz = true }
+      if seenNz { sig = sig + 1 }
       if dot { frac = frac + 1 }
       i = i + 1
     }
   }
-  if bigIsZero(mant) {
-    // +/- zero: all bytes 0 except the sign in the top bit of the high byte.
-    const z: i32[] = []
-    let zi = 0
-    while zi < nbytes {
-      z.push(0)
-      zi = zi + 1
-    }
-    if neg { z[nbytes - 1] = 0x80 }
-    return z
+  // +/- zero: `0`, `0.000`, and `0e999999` alike — the exponent cannot rescue a zero
+  // mantissa, so this stays AHEAD of the range clamp.
+  if bigIsZero(mant) { return ieeeZeroBytes(neg, nbytes) }
+  // The literal's decimal exponent: value = mant * 10^dexp, with `mant` an integer.
+  // The plain spelling is the `expv == 0` case (`dexp = -frac`), so both spellings
+  // reach the identical num/den below.
+  let dexp = 0 - frac
+  if expNeg { dexp = dexp - expv } else { dexp = dexp + expv }
+  // RANGE CLAMP — a magnitude no format can reach, decided WITHOUT building 10^|dexp|.
+  // `mant` is in [10^(sig-1), 10^sig), so value is in [10^(sig-1+dexp), 10^(sig+dexp)).
+  // At or past 10^400 every format overflows (f64 max ~1.8e308, f32 max ~3.4e38); below
+  // 10^-400 every format rounds to zero (the smallest f64 subnormal is ~4.9e-324, and
+  // half of it — the round-to-zero threshold — is ~2.5e-324). The bound is deliberately
+  // slack: everything BETWEEN is decided exactly by the encoder, so the clamp changes no
+  // answer, it only stops `1e1000000` from allocating a 3.3-million-bit denominator.
+  if sig + dexp - 1 >= 400 {
+    gIeeeOverflow = true
+    return ieeeInfBytes(neg, nbytes)
   }
-  // value = mant / 10^frac. Build numerator and denominator bignums.
+  if sig + dexp <= -400 { return ieeeZeroBytes(neg, nbytes) }
+  // value = mant * 10^dexp, as an exact num/den pair: a negative exponent scales the
+  // DENOMINATOR (the old `10^frac`), a positive one the NUMERATOR.
   let num = mant
   let den: i32[] = []
   den.push(1)
   let fk = 0
-  while fk < frac {
-    den = bigMulSmall(den, 10)
-    fk = fk + 1
+  if dexp < 0 {
+    while fk < 0 - dexp {
+      den = bigMulSmall(den, 10)
+      fk = fk + 1
+    }
+  } else {
+    while fk < dexp {
+      num = bigMulSmall(num, 10)
+      fk = fk + 1
+    }
   }
   // value = (num/den) * 2^exp. Align so floor(num/den) has exactly `sigBits + 1` bits, then
   // round the guard bit plus the remainder (sticky) down to a `sigBits`-bit significand.
@@ -628,10 +749,20 @@ export function f64Bytes(text: string) { ieeeBytes(text, 53, 1023, 8) }
 // `DataView.setFloat32` for 2.5/5.0/4.0/6.5/0.1/3.14/etc.
 export function f32Bytes(text: string) { ieeeBytes(text, 24, 127, 4) }
 
-// The count of significant INTEGER digits of a decimal float lexeme (digits before
-// the `.`, `_` separators skipped, leading zeros skipped). The cheap magnitude
-// prescreen for the overflow predicates: overflow needs the boundary digit count
-// (309 for f64, 39 for f32) — VL has no exponent syntax, so magnitude IS digits.
+// The count of significant INTEGER digits a decimal literal's magnitude needs —
+// digits before the `.` (`_` separators skipped, leading zeros skipped), SHIFTED by
+// the scientific exponent when the lexeme carries one. The cheap magnitude prescreen
+// for the overflow predicates: overflow needs the boundary digit count (309 for f64,
+// 39 for f32), and with an exponent the magnitude is `digits + exp`, not digits.
+//
+// **The exponent shift is what keeps the prescreen SOUND.** Without it `1e400` reports
+// ONE integer digit, sails past `< 309`, and `f64LitOverflows` answers false for a
+// literal that is infinity — turning a clean checker rejection into an `emitFail`
+// backstop deeper in the pipeline. Measured on the plain spelling before the exponent
+// existed; the scan below is the same walk with the `e` arm added.
+//
+// A shift below zero clamps to 0 (`1.5e-7` has no integer digits): the callers only
+// ever compare UPWARD against a boundary.
 function decIntDigits(t: string) {
   let i = 0
   if t.length > 0 {
@@ -639,19 +770,57 @@ function decIntDigits(t: string) {
   }
   let n = 0
   let seen = false
+  let dot = false
   while i < t.length {
     const c = t[i]
-    if c == '.' { return n }
-    if c != '_' {
+    if c == 'e' || c == 'E' {
+      const shifted = n + decExpValue(t, i + 1)
+      if shifted < 0 { return 0 }
+      return shifted
+    }
+    if c == '.' {
+      dot = true
+    } else if c != '_' {
       // A non-decimal lexeme (hex/binary/octal `0x…`) never reaches the decimal
-      // encoder's range — report 0 digits so the predicates pass it through.
+      // encoder's range — report 0 digits so the predicates pass it through. The
+      // `0x` prefix's `x` is caught here, ahead of any `e` in its digits.
       if c < '0' || c > '9' { return 0 }
-      if c != '0' { seen = true }
-      if seen { n = n + 1 }
+      if !dot {
+        if c != '0' { seen = true }
+        if seen { n = n + 1 }
+      }
     }
     i = i + 1
   }
   n
+}
+
+// The SIGNED value of the exponent digits of `t` starting at `at` (just past the
+// `e`/`E`): an optional `+`/`-` then a `_`-separated digit run. Saturates at 10^8 —
+// the callers compare it against a digit count, so any larger exponent decides the
+// same way the bound does. Shares the lexer's exponent grammar with `ieeeBytes`.
+function decExpValue(t: string, at: i32) {
+  let i = at
+  let eneg = false
+  if i < t.length {
+    if t[i] == '-' {
+      eneg = true
+      i = i + 1
+    } else if t[i] == '+' {
+      i = i + 1
+    }
+  }
+  let v = 0
+  while i < t.length {
+    const c = t[i]
+    if c != '_' {
+      if c < '0' || c > '9' { return 0 }
+      if v <= 100000000 { v = v * 10 + (c - '0') }
+    }
+    i = i + 1
+  }
+  if eneg { return 0 - v }
+  v
 }
 
 // True if the decimal literal `text` rounds to ±infinity as an f64 — i.e. the
