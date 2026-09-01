@@ -23498,6 +23498,60 @@ Repro (now RUNS, printing `v` then `none`):
     // vl check rc 0; runs, prints v then none.
 
 ---
+### D957 — the inferred nullable SCALAR LIST: four leaves measured WORKING and backed out, because the return-site seed leaks into two other null contexts
+
+**loud check reject conceding type-validity — `… is not yet supported by codegen; annotate the return type` — for `i64[] | null`, `f64[] | null`, `f32[] | null` and `string[] | null` · the i32-backed family refuses one stage later, at emit · ZERO corpus cells · A FIX WAS BUILT, ALL FOUR LEAVES MEASURED RUNNING, AND REVERTED: it broke a pinned fixture, and in its wider form produced invalid wasm**
+
+D956's map widening and D937 before it are the same four-site shape, and it applies here
+almost cleanly: the four `nul*list` VKinds already exist, `nulScalarListWrapHeap` already maps
+each to its wrapper heap, and **every annotated twin lowers and runs today**. Four sites —
+renderer arm, `buildFnMap` classifier, `retKindPri` tier, return-site seed, plus
+`exprNulScalarListKind`'s caller fallback — made all four leaves print correctly, both
+branches.
+
+* **IT WAS REVERTED FOR TWO MEASURED REASONS, and both are about the SEED rather than the
+  capability.**
+
+  1. **The i32-BACKED family needs a fifth site and is worse without it.** `i32[]`,
+     `boolean[]` and litunion arrays share one `nullist` kind, and
+     `exprNulScalarListKind`'s caller fallback answers only for the DISTINCT-backing kinds.
+     Classify a `nullist` return without extending that arm and the caller's binding stays
+     non-null: the program becomes check-clean INVALID WASM, strictly worse than the loud
+     emit reject it replaced. Backed out on its own before the rest.
+
+  2. **The seed leaks into an assignment-as-implicit-return.**
+     `tests/cases/functions/tail-assign-coercing-global.vl` broke with
+     `global.set expected (ref null 0), found ref.null of type (ref null 10)`. For a function
+     whose last statement is an ASSIGNMENT, `criClassify` reads `fRetKind` from the TARGET
+     CELL (`globalCellKind`) — so a nullable-scalar-list target makes the return-site seed
+     type a null that belongs to the global, not to the return. The nulmap seed D937 shipped
+     has the same shape and does not hit this, which is why it was invisible until a list
+     kind reached the same column.
+
+* **SO THE MISSING PIECE IS NAMED, and it is not the renderer.** The seed has to know it is
+  typing the RETURN's own null rather than whatever null comes next, and `fRetKind` alone does
+  not carry that — for an assignment tail it is describing a cell. Either the seed is scoped to
+  a genuine `return null` / tail-`null`, or the assignment-tail case is excluded where
+  `fRetKind` is read.
+
+* **THE CORPUS DID NOT CATCH EITHER ONE** — 0 movement, 0 runs lost, on both cuts. Both were
+  caught by `deno task test`'s fixtures. A capability with no corpus cell has no corpus
+  protection either, which is the same asymmetry `--sites` exists to report.
+
+Repro (check rc 0 for the four distinct-backing leaves; the refusal names itself):
+
+    function pick(c: boolean) {
+      if c { return null }
+      const m: i64[] = [1, 2]
+      m
+    }
+    const r = pick(false)
+    if r != null { print((r).length) } else { print(0) }
+    // vl check -> pick infers the nullable return type i64[] | null — type-valid, but an
+    // inferred return of this shape is not yet supported by codegen; annotate the return type
+    // SHOULD PRINT 2. The annotated ": i64[] | null" spelling runs today.
+
+---
 
 ### D791 — [CLOSED 2026-08-31] READ-ONLY COVARIANCE is lowered by an element-CONVERTING COPY, licensed by a whole-program write scan — D661B's refusal was about the WRITABLE side only
 
