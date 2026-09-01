@@ -85,11 +85,16 @@ const createClient = (
     outputChannel: outputChannel,
     initializationOptions: {
       compilerWasm: config.get<string>("compilerWasm", ""),
+      // The server's seed ladder execs `vl seed` through this (its rung 5);
+      // without it the ladder always ran `vl` from PATH and the setting only
+      // steered the Run command — found by the editor-surface survey.
+      compilerPath: config.get<string>("compilerPath", ""),
     },
   };
   const client = new LanguageClient("Vital", serverOptions, clientOptions);
   client.start();
-  client.registerProposedFeatures();
+  // (A `registerProposedFeatures()` call used to sit AFTER `start()` — dead by
+  // ordering, and no proposed LSP feature is in use; removed rather than moved.)
   return client;
 };
 
