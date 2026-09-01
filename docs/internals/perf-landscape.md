@@ -736,10 +736,18 @@ whole gap to deno. `-O3` recovers only 1.23x, by inlining one leg. Same defect a
 
 > Unmoved. Nothing has shipped against it.
 
-Two findings. (1) The builtin `toString(i32)` is 1.28x behind V8's `String(v)` — modest. (2) Much
-worse: `stdfmt.vl`, which uses `std:fmt`'s pure-VL `toStr()`, measures **4477 ms — 5.3x slower than
-the builtin.** `toStr` is the **only** option for `i64`, which the builtin refuses, so **any i64
-formatting pays that 5.3x on a path users cannot avoid.**
+Two findings, both DATED 2026-08 and one of them now describing a spelling VL no longer has.
+(1) The builtin `toString(i32)` is 1.28x behind V8's `String(v)` — modest. (2) Much worse:
+`stdfmt.vl`, which uses `std:fmt`'s pure-VL `toStr()`, measures **4477 ms — 5.3x slower than
+the builtin.** `toStr` was the **only** option for `i64`, which the builtin refused, so **any
+i64 formatting paid that 5.3x on a path users could not avoid.**
+
+> **RE-READ THIS ROW BEFORE QUOTING IT (2026-09-01).** The ambient `toString(i32)` builtin was
+> RETIRED by owner ruling and `std:fmt`'s pure-VL renderer took its name, so finding (1) has no
+> subject any more and finding (2) is now the ONLY path — `main.vl` is what `stdfmt.vl` was, and
+> the variant is deleted. The 5.3x did not go away, it became unconditional: what used to be the
+> i64-only tax is now the tax on every width. That makes this the sharpest remaining
+> library-quality item in the suite, and it needs a re-run before its numbers are cited again.
 
 ---
 
@@ -1110,7 +1118,7 @@ absolutes) and they do not appear in `bench/results/summary.md`.
 | benchmark | idiomatic | variant | ratio | the "hack" | ruling |
 |---|--:|--:|--:|---|---|
 | `algorithms/lambda-hot` | 2155.7 | opt 240.1 | **8.98x** | *stop using a lambda* — lift the body to a named top-level function | **not a language-design defect**: there is no VL spelling of a lambda that avoids it. Closes entirely with P2. |
-| `strings/int-format` | 845.1 | stdfmt 4477.5 | **5.3x** (inverse) | the *idiomatic library* path is the slow one | `std:fmt`'s `toStr()` is 5.3x the builtin, and is the **only** option for i64. Library-quality defect on an unavoidable path. |
+| `strings/int-format` | 845.1 | stdfmt 4477.5 | **5.3x** (inverse) | the *idiomatic library* path is the slow one | `std:fmt`'s renderer is 5.3x the builtin it has since REPLACED (2026-09-01 ruling — the builtin is gone and the variant with it), so the 5.3x is now unconditional rather than i64-only. Library-quality defect on an unavoidable path; numbers need a re-run. |
 | `arith/i32-accum` | 320.0 | opt 155.8 | **2.05x** | hand-unrolled 4-accumulator loop | the simplest loop in the suite has a 2x hand-optimisation available. `-O3` recovers only 1.11x. |
 | `arith/intdivmod` | 483.6 | opt 238.3 | **2.03x** | `const q = i / d; sum + q + (i - q * d)` | P6. `-O3` recovers nothing (1.02x). deno is equally unfused (2.489 ns/iter), so VL merely *ties* JS here. |
 | `recursion/tailcall` | 1202.5 | opt 594.5 | **2.02x** | hand-written accumulator loop | P1 matches `opt.vl` **exactly**, so after the fix no contortion is needed at all. |
@@ -1257,7 +1265,7 @@ recorded here so they are not lost; each is reproducible as written.
 |---|---|---|
 | **Bare map read bound to a local, then narrowed with `!= null`, for an i32-keyed or i32-valued map.** Blocked the idiomatic hit/miss spelling in three benchmarks (`map-string`, `map-i32`, `word-freq`), all rewritten to a `?? -1` sentinel. Works for `{[string]: string}` and `{[string]: Struct}`; the plain-i32 value type is the gap `tests/cases/maps/bare-read-narrow-nullable-mono-map.vl` does not reach. | `const m: {[string]: i32} = Map()` … `const v = m["a"]` … `if v != null { print(v) }` | `emit error: emitProgram: bare null needs a struct-typed context` — while `vl check` on the same file reports **`Checked 1 file, no errors.`** |
 | **A bare `return` (no value) in a void function.** Blocked the natural spelling of heapsort's sift-down early exit; all four languages were restructured to a `cont` flag to preserve equivalence. Note the diagnostic points at the **function** (1:9), not at the `return`. | `function f(x: i32) { if x > 0 { return } print(x) }` | `emit error: emitProgram: bare return is not supported` — `vl check` exits 0 |
-| **Importing anything from `std:fmt`** breaks a function with an annotated array return whose body holds a multi-element array literal with non-literal field initialisers. Cost the idiomatic number formatter in `nbody` and `spectralnorm`; both carry a longhand digit renderer instead. Removing the import makes it emit; removing the return annotation does not help. | `import { toStr } from "std:fmt"` + `function makeBodies(): Body[] { const bodies: Body[] = [{x:0.0,…}, {x:1.0,…}] return bodies }` | `emit error: emitProgram: object literal matches no union variant` — `vl check`: `Found 0 errors, 1 warning.`, exit 0 |
+| **Importing anything from `std:fmt`** breaks a function with an annotated array return whose body holds a multi-element array literal with non-literal field initialisers. Cost the idiomatic number formatter in `nbody` and `spectralnorm`; both carry a longhand digit renderer instead. Removing the import makes it emit; removing the return annotation does not help. **A SECOND import-triggered family was found on 2026-09-01 and filed as inventory D981** — in a module that imports, an `if`-EXPRESSION arm resolves no module-scope name at all (`undeclared identifier`, CHECK side). Different phase and different message, same trigger; worth asking whether one root serves both. | `import { toString } from "std:fmt"` + `function makeBodies(): Body[] { const bodies: Body[] = [{x:0.0,…}, {x:1.0,…}] return bodies }` | `emit error: emitProgram: object literal matches no union variant` — `vl check`: `Found 0 errors, 1 warning.`, exit 0 |
 | **A numeric intrinsic is not callable from any function in a module that uses function values.** This makes float algorithms and closures **mutually exclusive in one module**, which is why `nbody` and `spectralnorm` have no higher-order variant — the two `*-closures` benchmarks were dropped as inexpressible. | `function work(a: f64) { sqrt(a) }` + `const f = (v: i32) => v * 2` in the same module | `emit error: the numeric intrinsic 'sqrt' is mistaken for a captured variable here — it is not yet callable from a lambda, nor from a named function in a module that uses function values` |
 
 > Four separate `vl check`-clean emit failures found by writing 46 ordinary programs. This is

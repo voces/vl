@@ -144,8 +144,8 @@ Deno.test({
 // THE PRINT DOMAIN IS A RULE, AND THAT IS THE ASSERTION. `print` takes one value of
 // `(i32 | i64 | f32 | f64 | boolean | string)` (`typecheck.printDomainStr`, which
 // `driver.builtinScan` also renders as the LSP completion detail). A CONTAINER is outside
-// that domain, so it is refused the way `toString expects an i32 or boolean, got string` is
-// refused — a plain type error with NO category code, because the language has never said
+// that domain, so it is refused as an ordinary out-of-domain argument — a plain type error
+// with NO category code, because the language has never said
 // what `print([1, 2, 3])` OUTPUTS (D711).
 //
 // ITS OLD TWIN IS GONE, AND THE ASYMMETRY IS THE LESSON. A boxed VALUE UNION is INSIDE the

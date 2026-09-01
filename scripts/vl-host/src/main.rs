@@ -1732,7 +1732,7 @@ fn report_rep_shadow(inst: &Instance, store: &mut Store<()>, path: &str) -> Resu
 /// == Ok(v) { take it } }` — exact-precision formatting rounds correctly, so the first
 /// `k` that round-trips is the shortest digit string under the spec's rule. VERIFY
 /// Rust's exact-precision rounding is half-to-EVEN before relying on that.
-/// `std:fmt`'s `toStr` already implements the rule in pure VL (Burger–Dybvig with the
+/// `std:fmt`'s `toString` already implements the rule in pure VL (Burger–Dybvig with the
 /// spec's final digit choice) and agrees with V8 on 50,000 of 50,000;
 /// `tests/vl_std_float_text_test.ts` pins the divergent set by bit pattern, so fixing
 /// this flips a test rather than passing unnoticed.

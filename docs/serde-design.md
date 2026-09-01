@@ -89,7 +89,7 @@ Facts that constrain the design, each verified this session:
    (a `Tree` with `kids: Tree[]` runs **(RUN)**). A `std:json` v1 therefore cannot be
    value-tree-shaped without rep work; it can be event/token-shaped, or nominal-tree-shaped.
 6. **VL cannot render or read a float.** `toString` accepts only `i32 | boolean`
-   **(RUN)**; `std:fmt`'s `toStr` adds `i64`. `print(0.1 + 0.2)` gives
+   **(RUN)**; `std:fmt`'s `toString` adds `i64`. `print(0.1 + 0.2)` gives
    `0.30000000000000004` — shortest-round-trip — but that formatter lives in the **host's
    print sink**, not in VL, and there is no string→number parser anywhere in std. Two
    asymmetries to not rediscover later: the printer emits `1e+40` for large values while
@@ -493,12 +493,12 @@ Staged, sized honestly:
   program contained a function value ANYWHERE. `f64bits` has no substitute in pure VL, so
   the f64 arm was unusable beside a comparator lambda or `std:test` until that was fixed.
   Stage 1 should budget for the same kind of one-line-but-blocking gap rather than assume
-  the std tier is closed. `toStr` gained an **f64 arm** and `parseF64(self:
+  the std tier is closed. `toString` gained an **f64 arm** and `parseF64(self:
   string): f64 | null` is its inverse; the design, the correctness arguments and the
   measurements are in `std/fmt.vl`'s `f64 ↔ TEXT` header, and the grading is
   `tests/vl_std_float_text_test.ts`. Four decisions that bind the rest of this document:
   - **The style is ECMA-262 `Number::toString`, radix 10** — the rule the two hosts' print
-    sinks already claim, so `print(x.toStr())` and `print(x)` are the same characters, and
+    sinks already claim, so `print(x.toString())` and `print(x)` are the same characters, and
     a spec rather than a preference. Every JSON/text rendering below inherits it.
   - **The formatter is Burger–Dybvig over exact big integers, not Ryū.** No tables, no
     128-bit multiply (32-bit limbs inside an i64 leave room for every partial product), and
@@ -513,7 +513,7 @@ Staged, sized honestly:
     means only "not a number in the grammar". A JSON reader inherits that split.
 
   **Two things fact 6 said that are now measured differently.** `-0.0` printing as `0` is
-  not a print-path defect, it is ECMA-262's own rule and `toStr` reproduces it — so −0 does
+  not a print-path defect, it is ECMA-262's own rule and `toString` reproduces it — so −0 does
   not survive a text round trip in EITHER direction, which is a reason stage 2's VLB
   encodes float BITS rather than text. And the Rust host's `print` is **not** exactly JS
   `String(v)`: it re-formats digits from Rust's `{:e}`, which breaks an exact decimal tie

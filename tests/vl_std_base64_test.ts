@@ -123,7 +123,7 @@ if txt is IoError {
 
 const DECODE_SRC = (dir: string) => `import { Base64Error, decodeBase64 } from "std:base64"
 import { IoError, readTextFile } from "std:fs"
-import { toStr } from "std:fmt"
+import { toString } from "std:fmt"
 
 function hexOf(b: u8[]): string {
   const out: i32[] = []
@@ -149,7 +149,7 @@ if txt is IoError {
     const s = txt.slice(start + 1, end)
     const r = decodeBase64(s)
     if r is Base64Error {
-      print("ERR " + r.kind + " " + r.at.toStr())
+      print("ERR " + r.kind + " " + r.at.toString())
     } else {
       print("OK " + hexOf(r))
     }

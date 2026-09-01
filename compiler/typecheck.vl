@@ -19054,7 +19054,43 @@ function memberFloorMsg(objTy: i32, prop: string) {
     }
   }
   if ot is TyVar { return "" }
-  "member access '." + prop + "' on non-object " + tyToStr(objTy)
+  // The receiver is a scalar, so `.toString` / `.toStr` on it is almost certainly the
+  // MIGRATION and not a typo — `stdFmtMovedNote` says which import brings the name back.
+  // Deliberately only on THIS arm: a struct missing a `.toString` field is a different
+  // mistake, and `std:fmt`'s `toString` would not serve it.
+  "member access '." +
+    prop +
+    "' on non-object " +
+    tyToStr(objTy) +
+    stdFmtMovedNote(prop)
+}
+
+// The two spellings a program can reach for and no longer find, and the one import that
+// answers both — appended to whatever sentence the lookup failed with, "" for every other
+// name.
+//
+// `toString` was an AMBIENT BUILTIN until 2026-09-01 (`toString(42)` needed no import) and
+// `toStr` was `std:fmt`'s export name until the same change renamed it to `toString`
+// (owner ruling; DECISIONS.md). Both spellings therefore stop resolving on the same day,
+// in code that was correct the day before, and both are one import away from working.
+//
+// This follows the `then`-removal precedent (#2094): a spelling the language REMOVED earns
+// a refusal that names its replacement, because the generic one ("undeclared identifier")
+// strands a reader who has no reason to suspect a rename. It is a NOTE on the existing
+// diagnostic rather than a second one — one position, one message — and it is keyed on the
+// spelling alone, so it costs a string compare and nothing else.
+//
+// `toStr`'s note is the one with an expiry: it buys a release of muscle-memory and can go
+// once nothing in the wild spells it. `toString`'s should outlive it — the builtin was
+// import-free, so its absence is the surprising half.
+function stdFmtMovedNote(name: string) {
+  if name == "toString" {
+    return " — `toString` is not a builtin any more, it is `std:fmt`'s: add `import { toString } from \"std:fmt\"`"
+  }
+  if name == "toStr" {
+    return " — `toStr` was renamed to `toString`: add `import { toString } from \"std:fmt\"`"
+  }
+  ""
 }
 
 // THE INDEX ARM'S OWN SENTENCE, on the same terms — "" when `recv[i]` resolves or defers,
@@ -22465,8 +22501,8 @@ function checkCallNode(n: Call, ix: i32) {
         // A DOMAIN rejection, and it is asked FIRST — the order is the ruling. `print`
         // takes one value of `printDomainStr()`; an array, a struct, a map/set, a function
         // value, or any of those behind `| null` (or inside a union) is not one, and `tErr`
-        // (no `unsupported-lowering` code) is what says so — the same shape as `toString
-        // expects an i32 or boolean, got string`. The language has never defined what
+        // (no `unsupported-lowering` code) is what says so — an ordinary domain error,
+        // not a capability admission. The language has never defined what
         // `print([1, 2, 3])` OUTPUTS, so there is no lowering to be missing;
         // `tyPrintsAsRef`'s header carries the measurement and D711 the ruling.
         //
@@ -22507,20 +22543,10 @@ function checkCallNode(n: Call, ix: i32) {
       }
       return mkMapTy(-1, -1, 0)
     }
-    // `toString(x)` is a builtin: an i32 (decimal digits) or boolean ("true" /
-    // "false") renders as a string.
-    if cfn.identName == "toString" {
-      const targs = n.callArgs
-      if targs.length != 1 {
-        tErr("toString expects 1 argument, got " + i32ToStr(targs.length), ix)
-      } else {
-        const t0 = checkNode(targs[0])
-        if !assignable(t0, TY_I32) && !assignable(t0, TY_BOOL) {
-          tErr("toString expects an i32 or boolean, got " + tyToStr(t0), ix)
-        }
-      }
-      return TY_STR
-    }
+    // `toString(x)` USED TO BE A BUILTIN ARM HERE, over `i32 | boolean`. It is
+    // `std:fmt`'s export now (owner ruling 2026-09-01, DECISIONS.md), so the name
+    // resolves — or does not — through the ordinary scope, and an un-imported use gets
+    // the migration hint `undeclaredIdentMsg` appends. Nothing replaces this arm.
     // `fromCodePoints(xs)` is a builtin: an `i32[]` of code points -> a string,
     // in one bulk copy (the amortized alternative to per-char concat).
     if cfn.identName == "fromCodePoints" {
@@ -26211,7 +26237,7 @@ function checkNodeReal(ix: i32) {
     const ty = lookup(n.identName)
     if ty < 0 {
       // THE TEMPLATE RENDERER'S FLOOR. `$tpl$render` is minted by the parser and
-      // rewritten to the merged `toStr$mN` by `modBuildRename`; reaching here
+      // rewritten to the merged `toString$mN` by `modBuildRename`; reaching here
       // means `std:fmt` never entered the module graph, which can only happen if
       // a host's textual module-mode gate disagreed with the lexer about what a
       // template hole is (`cliHasTplHole` and its Rust/TS twins). Named, because
@@ -26226,7 +26252,13 @@ function checkNodeReal(ix: i32) {
         )
         return TY_ERR
       }
-      tErr("undeclared identifier '" + n.identName + "'", ix)
+      tErr(
+        "undeclared identifier '" +
+          n.identName +
+          "'" +
+          stdFmtMovedNote(n.identName),
+        ix,
+      )
       return TY_ERR
     }
     // `ty` is this use's type as the checker resolved it — narrowed when the use
@@ -26781,11 +26813,11 @@ function printRefRefusal(pt: i32): string {
 // round-trip in emitted wasm. `std:fmt`'s header already declines that work in the other
 // direction ("f64→string … deliberately absent — `print` keeps covering floats").
 //
-// So this refuses on the plain `tErr` channel, in `toString`'s words — `toString expects an
-// i32 or boolean, got string` — and NOT on `tErrUnsupported`. The earlier verdict
+// So this refuses on the plain `tErr` channel — an argument outside a declared domain —
+// and NOT on `tErrUnsupported`. The earlier verdict
 // (`destringify-types-program.md`, reason 4) put it on the capability channel because
-// "`print` has no declared type … so this cannot be an ordinary assignability error"; the
-// tree refutes that one builtin over, and `printDomainStr` is now the declared type.
+// "`print` has no declared type … so this cannot be an ordinary assignability error";
+// `printDomainStr` is now the declared type, which refutes it.
 //
 // The SIBLING gate `tyPrintsAsUnionBox` is a genuine capability gap and deliberately keeps
 // its concession: every arm of `i32 | string` is INSIDE the domain, so the missing piece is

@@ -39,15 +39,15 @@ which silently changes the program's meaning).
 **A structural spelling exists for function-typed FIELDS, and UFCS does not satisfy it.**
 
 ```vl
-function render(x: { toStr: (Circle) => string }): string { x.toStr({ r: 1.0 }) }
+function render(x: { toString: (Circle) => string }): string { x.toString({ r: 1.0 }) }
 ```
 
 parses and checks (function types take unnamed parameters — `(self: i32)` inside a type is
 a parse error at the `:`). But it means a real closure **field**. With a free
-`toStr(self: Circle)` in scope, `render(c)` refuses:
+`toString(self: Circle)` in scope, `render(c)` refuses:
 
 ```
-argument 1: expected {toStr: (Circle) => string}, got Circle
+argument 1: expected {toString: (Circle) => string}, got Circle
 ```
 
 Fields are data; UFCS is call-site sugar. Today nothing bridges them.
@@ -55,7 +55,7 @@ Fields are data; UFCS is call-site sugar. Today nothing bridges them.
 **Where interpolation's stringify binds is already ruled, and now SHIPPED** — and it is
 deliberately the opposite answer: a string literal's meaning must not depend on imports,
 so template literals bind ABSOLUTELY to std's renderer (owner ruling 2026-09-01; the
-builtin is killed and std `toStr` is renamed into the vacancy in a queued follow-up, and
+builtin is GONE and `std:fmt`'s export carries the name — executed the same day — and
 the bound name is one constant, `TPL_RENDER_EXPORT` in `driver.vl`), eventually to the
 derived `show<T>`. As built, the hole's call names an identifier no program can spell and
 the module merge rewrites it onto the merged symbol — see DECISIONS.md, "A template
@@ -78,7 +78,7 @@ literal's stringifier is bound ABSOLUTELY". Bounds, by contrast, may be scope-re
   rules) make satisfaction scope-independent — imports gate only method *syntax*. The
   machinery's payoff is dynamic dispatch and global reasoning; the cost is impl ceremony
   and coherence law. Monomorphized VL needs neither payoff today.
-* **TypeScript**: structural on fields — exactly VL's `{toStr: fn}` position — and TS also
+* **TypeScript**: structural on fields — exactly VL's `{toString: fn}` position — and TS also
   refuses to let free functions satisfy interfaces. Its extension answer (declaration
   merging, prototype patching) is widely regretted.
 * **Swift protocols**: nominal conformance with retroactive extensions — and the known

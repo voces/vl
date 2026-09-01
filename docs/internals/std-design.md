@@ -129,7 +129,7 @@ intrinsics. For Phase 2 the compiler does not import std (a program that
 imports nothing compiles byte-identically to today — the H3 back-compat
 invariant). May the COMPILER use std later? Other languages say yes: rustc
 uses core/std, Go's compiler uses its stdlib — and VL's compiler is just a VL
-program, so `wasmEmit.vl` importing `std:fmt`'s `toStr` instead of carrying
+program, so `wasmEmit.vl` importing `std:fmt`'s `toString` instead of carrying
 its own `i32ToStr` is the DRY end-state. What it costs: std sources join the
 seed assembly + the fixpoint surface (every std edit perturbs the seed), and
 the bootstrap gains an ordering rule (std must compile without importing
@@ -275,7 +275,10 @@ matcher surface (`expect<T>`, eventually) and all collections gate on it, and
 the rename walker is the riskiest code in the module bridge — land it alone.
 
 1. **`std:fmt` v1** — pure-VL `toStr` for i32/i64/boolean (the `i32ToStr`
-   technique), `padLeft`/`repeat`/`join`-class helpers. ~~f64→string (shortest
+   technique), `padLeft`/`repeat`/`join`-class helpers. **THE EXPORT IS SPELLED
+   `toString` SINCE 2026-09-01** — the ambient compiler builtin of that name was
+   retired by owner ruling and this export took it (DECISIONS.md); `toStr` below
+   is the v1 spelling, kept because this list records what each slice shipped. ~~f64→string (shortest
    round-trip, Ryu-class) explicitly DEFERRED — `print` keeps covering floats.~~
    **THAT DEFERRAL IS SPENT (2026-09-01).** `toStr` has an f64 arm and `parseF64`
    is beside it, landed as serde stage 0 (`docs/serde-design.md`

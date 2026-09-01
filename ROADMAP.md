@@ -40,10 +40,9 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
 ### Ruled and sequenced (owner decisions already made, waiting only on order)
 
 - **Kill the ambient builtin `toString`; rename std:fmt's `toStr` → `toString` in its
-  place** (ruled 2026-09-01). Sequenced BEHIND serde Stage 0B's merge so the rename does
-  not move under the f64-arm work. One PR: default-scope removal (`driver.vl` blPush +
-  the emit special cases), std rename + in-tree importer migration, a targeted
-  moved-to-std hint on the undeclared name, DECISIONS entry recording the naming choice.
+  place** — DONE #TBD (ruled 2026-09-01, shipped the same day). Default scope, all six
+  emit/classify/collect arms and `emitToString` are gone; `std:fmt` exports `toString`;
+  every in-tree caller migrated; both retired spellings get a targeted import hint.
 - **Template literals / interpolation — SHIPPED #2188.** Backtick strings, additive,
   desugared in the parser to concat over `std:fmt`'s renderer bound ABSOLUTELY via a
   compiler-injected bare import edge plus an unspellable rename row. Two remainders,

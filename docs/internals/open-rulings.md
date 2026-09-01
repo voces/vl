@@ -209,7 +209,7 @@ Genuine decisions, none of them urgent. Several will be forced by a later slice 
 
 **Cost if taken.** Unpriced. Rough shape from the tree: `format(...)` is std-only (std/fmt.vl already exists and already does i32/i64/boolean rendering); a builder type is std plus possibly emitter support to beat the shipped fusion; interpolation is lexer + parser + emit, the only one touching the grammar.
 
-**Cost of waiting.** No correctness or perf cost — the O(n²) loop is fused (B7b) and `s = s + e` stays the idiom. What stays absent is any formatting surface at all: a program building a message today writes `+` chains with `std:fmt.toStr`, and `trim`/`replace` have no home. Interpolation is the one option with a one-way cost, so waiting is cheap for it specifically.
+**Cost of waiting.** No correctness or perf cost — the O(n²) loop is fused (B7b) and `s = s + e` stays the idiom. What stays absent is any formatting surface at all: a program building a message today writes `+` chains with `std:fmt.toString`, and `trim`/`replace` have no home. Interpolation is the one option with a one-way cost, so waiting is cheap for it specifically.
 
 <details><summary>verification</summary>
 

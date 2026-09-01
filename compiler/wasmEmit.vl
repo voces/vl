@@ -10513,155 +10513,6 @@ function pushStrScrElem(body: i32[], n: i32, t: i32) {
   0
 }
 
-// Lower `toString(x)` onto `body`, leaving a fresh string ref on the stack. An i32
-// renders its decimal digits (a negative value gets a leading '-'); a BOOLEAN-
-// classified argument renders the literal text "true" / "false". Uses the string-op
-// scratch frame (Out = the built string; I0 = remaining value, I1 = sign flag,
-// I2 = digit count, I3 = count copy, then the write cursor) — `exprHasStrOp`
-// reserves the frame for any `toString(..)` call. The argument is evaluated FULLY
-// before the first scratch write (nested-op-safe, like every string op).
-function emitToString(body: i32[], callIx: i32, fnIx: i32) {
-  const c = P.nodes[callIx]
-  if c is Call {
-    if c.callArgs.length != 1 {
-      return emitFail("emitProgram: toString takes exactly one argument")
-    }
-    if !aUsed {
-      return emitFail("emitProgram: toString but array type not collected")
-    }
-    const argIx = c.callArgs[0]
-    if exprIsBool(argIx, fnIx) {
-      // Typed `select`: build BOTH literal strings, then pick by the condition.
-      // (An if/else that `local.set`s a NON-defaultable ref local does not count
-      // as initialization past the `end`, so the branchless select is the valid
-      // shape — and both allocations are tiny constants.)
-      fbI32Const(116) // 't'
-      fbI32Const(114) // 'r'
-      fbI32Const(117) // 'u'
-      fbI32Const(101) // 'e'
-      fbArrayNewFixed(sBackIdx, 4)
-      fbI32Const(0)
-      fbI32Const(4)
-      fbStrNew()      // the whole-backing view "true"
-      fbI32Const(102) // 'f'
-      fbI32Const(97)  // 'a'
-      fbI32Const(108) // 'l'
-      fbI32Const(115) // 's'
-      fbI32Const(101) // 'e'
-      fbArrayNewFixed(sBackIdx, 5)
-      fbI32Const(0)
-      fbI32Const(5)
-      fbStrNew()      // the whole-backing view "false"
-      if emitExpr(body, argIx, fnIx) < 0 { return -1 }
-      wU8(28)         // 0x1c select_t
-      wU8(1)          // one valtype
-      wU8(100)        // 0x64 (ref ht) — non-null string ref
-      wSLEB(sTypeIdx)
-      return 0
-    }
-    // The value rides in NEGATIVE space (a positive x negates to -x) so i32 MIN
-    // needs no overflowing flip; digits come from the negative remainder.
-    // I0 = x; I1 = (x < 0)
-    if emitExpr(body, argIx, fnIx) < 0 { return -1 }
-    setStrScrI(body, 0)
-    pushStrScrI(body, 0)
-    fbI32Const(0)
-    fbI32Bin(72) // 0x48 i32.lt_s
-    setStrScrI(body, 1)
-    // if I0 > 0 { I0 = 0 - I0 }  — now I0 <= 0
-    pushStrScrI(body, 0)
-    fbI32Const(0)
-    fbI32Bin(74)  // 0x4a i32.gt_s
-    fbIf(64)
-    fbI32Const(0)
-    pushStrScrI(body, 0)
-    fbI32Bin(107) // 0x6b i32.sub
-    setStrScrI(body, 0)
-    fbEnd()
-    // digit count: I3 = I0; I2 = 1; while I3 <= -10 { I3 = I3 / 10; I2 = I2 + 1 }
-    pushStrScrI(body, 0)
-    setStrScrI(body, 3)
-    fbI32Const(1)
-    setStrScrI(body, 2)
-    fbBlock(64)   // 0x02 block, void
-    fbLoop(64)    // 0x03 loop, void
-    pushStrScrI(body, 3)
-    fbI32Const(-10)
-    fbI32Bin(74)  // i32.gt_s — exit when I3 > -10
-    fbBrIf(1)
-    pushStrScrI(body, 3)
-    fbI32Const(10)
-    fbI32Bin(109) // 0x6d i32.div_s (truncates toward zero)
-    setStrScrI(body, 3)
-    pushStrScrI(body, 2)
-    fbI32Const(1)
-    fbI32Bin(106) // 0x6a i32.add
-    setStrScrI(body, 2)
-    fbBr(0)
-    fbEnd()       // end loop
-    fbEnd()       // end block
-    // Out = array.new_default (len = I2 + I1) — the BACKING; the header is wrapped
-    // around it at the end, when the digits are in.
-    pushStrScrI(body, 2)
-    pushStrScrI(body, 1)
-    fbI32Bin(106) // i32.add
-    fbArrayNewDefault(sBackIdx)
-    fbLocalSet(strScratchBase + 2)
-    // if I1 { Out[0] = '-' }
-    pushStrScrI(body, 1)
-    fbIf(64)
-    pushStrScrRef(body, 2)
-    fbI32Const(0)
-    fbI32Const(45) // '-'
-    fbArraySet(sBackIdx)
-    fbEnd()
-    // write cursor I3 = I1 + I2 - 1 (the last index)
-    pushStrScrI(body, 1)
-    pushStrScrI(body, 2)
-    fbI32Bin(106) // i32.add
-    fbI32Const(1)
-    fbI32Bin(107) // i32.sub
-    setStrScrI(body, 3)
-    // do { Out[I3] = 48 - (I0 % 10); I0 = I0 / 10; I3 = I3 - 1 } while I0 != 0
-    // (a do-while so the value 0 still writes its single '0' digit; the remainder
-    // of the negative-space value is <= 0, so SUBTRACTING it yields the digit)
-    fbBlock(64)
-    fbLoop(64)
-    pushStrScrRef(body, 2)
-    pushStrScrI(body, 3)
-    fbI32Const(48) // '0'
-    pushStrScrI(body, 0)
-    fbI32Const(10)
-    fbI32Bin(111)  // 0x6f i32.rem_s (negative for a negative I0)
-    fbI32Bin(107)  // 0x6b i32.sub — 48 - (-d) = 48 + d
-    fbArraySet(sBackIdx)
-    pushStrScrI(body, 0)
-    fbI32Const(10)
-    fbI32Bin(109)  // i32.div_s
-    setStrScrI(body, 0)
-    pushStrScrI(body, 3)
-    fbI32Const(1)
-    fbI32Bin(107)  // i32.sub
-    setStrScrI(body, 3)
-    pushStrScrI(body, 0)
-    fbI32Eqz()     // 0x45 — exit when I0 == 0
-    fbBrIf(1)
-    fbBr(0)
-    fbEnd()        // end loop
-    fbEnd()        // end block
-    // The header over the exact-fit backing: start 0, len = sign + digits (I1 + I2, both
-    // still live — only I0 and I3 move in the write loop above).
-    pushStrScrRef(body, 2) // the built BACKING
-    fbI32Const(0)
-    pushStrScrI(body, 1)
-    pushStrScrI(body, 2)
-    fbI32Bin(106)          // i32.add — the length written
-    fbStrNew()
-    return 0
-  }
-  emitFail("emitProgram: expected a toString call")
-}
-
 // Lower a string concatenation `a + b` onto `body`, leaving the new string ref on
 // the stack. Allocate a fresh `(array i32)` of `len(a)+len(b)` (`array.new_default`,
 // which zero-inits — every slot is then overwritten), `array.copy` a's code points
@@ -14333,15 +14184,15 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
       // routed into the builtin: `vl check` rc 0 and INVALID WASM
       // (`expected i32, found (ref $type)`), and the same program with the function renamed
       // ran. Measured across the whole builtin set — `print`, `toString`, `fromCodePoint`,
-      // `fromCodePoints`, `Map`, `Set` — ALL SIX collide, so this is the set's bug and not
-      // one name's.
+      // `fromCodePoints`, `Map`, `Set` — ALL SIX collided, so this is the set's bug and not
+      // one name's. (`toString` has since LEFT the set — it is `std:fmt`'s export now — so
+      // the name that NAMED the defect is no longer one of the five this guards. That is
+      // exactly why D975 stays filed, as a refutation pin over a user-declared `toString`:
+      // the collision surface for that spelling is gone and must not come back.)
       //
       // Asking whether the callee RESOLVES is what the comment above already assumed: a
       // builtin resolves to nothing, so `fnIndexOfSid >= 0` means the user owns the name.
       const userOwnsName = fnIndexOfSid(sidOfNode(c.callFn)) >= 0
-      if !userOwnsName && callee.identName == "toString" {
-        return emitToString(body, callIx, fnIx)
-      }
       // `fromCodePoints(xs)` (H2): bulk string construction — one call into the shared
       // `__utf8_enc__` helper, which UTF-8-ENCODES the list's live code points into an
       // exact-fit backing and wraps a whole-backing header around it.
@@ -21619,7 +21470,7 @@ function emitCallNode(body: i32[], e: Call, exprIx: i32, fnIx: i32) {
   const callee = P.nodes[e.callFn]
   if callee is Ident {
     // D975 — a USER function named `Map` / `Set` owns its own name here too, for the reason
-    // the `toString` arm gives: the test was the raw SPELLING, so `b.Map()` over a declared
+    // `emitCall`'s header gives: the test was the raw SPELLING, so `b.Map()` over a declared
     // `function Map(self: …)` built a fresh MAP instead of calling it (`vl check` rc 0,
     // invalid wasm). A real constructor resolves to no function, so the lookup separates them.
     if fnIndexOfSid(sidOfNode(e.callFn)) < 0 {

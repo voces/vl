@@ -1,4 +1,4 @@
-// `std:fmt`'s f64 halves — `toStr` over an f64 receiver and `parseF64` — graded
+// `std:fmt`'s f64 halves — `toString` over an f64 receiver and `parseF64` — graded
 // against the ECMAScript oracle, which is not a metaphor: `String(v)` IS the
 // shortest-round-trip rendering of a double and `Number(s)` IS its correctly
 // rounded parse, both by specification, so this file runs the real V8 the same
@@ -145,19 +145,19 @@ function* xorshift64(seed: bigint): Generator<bigint> {
 // ── 1. render: identity with the oracle, and the round trip ─────────────────
 
 // Four lines per vector: the bit pattern, what the HOST's `print` makes of the
-// value, what `toStr` makes of it, and the bits `parseF64` gives back.
-const RENDER_SRC = () => `import { parseF64, toStr } from "std:fmt"
+// value, what `toString` makes of it, and the bits `parseF64` gives back.
+const RENDER_SRC = () => `import { parseF64, toString } from "std:fmt"
 ${PRELUDE}
 function emit(b: i64) {
   const x = f64fromBits(b)
-  print(b.toStr())
+  print(b.toString())
   print(x)
-  print(x.toStr())
-  const back = parseF64(x.toStr())
+  print(x.toString())
+  const back = parseF64(x.toString())
   if back is null {
     print("NULL")
   } else {
-    print(f64bits(back).toStr())
+    print(f64bits(back).toString())
   }
 }
 
@@ -199,13 +199,13 @@ const rows = async (): Promise<RenderRow[]> => {
 };
 
 Deno.test({
-  // The spec claim, and the whole point of the f64 arm: `x.toStr()` is the
+  // The spec claim, and the whole point of the f64 arm: `x.toString()` is the
   // ECMAScript `Number::toString` of `x`, character for character, for every
   // class of double — the two zeros, both infinities, a NaN, the smallest
   // subnormal, the subnormal/normal boundary, the largest finite, the
   // positional/exponential switchover at 1e21 and 1e-7, and 5,000 pseudo-random
   // bit patterns on top.
-  name: "std:fmt: toStr(f64) equals JS String(v) on every vector",
+  name: "std:fmt: toString(f64) equals JS String(v) on every vector",
   ignore: !ENABLED,
   fn: async () => {
     const rs = await rows();
@@ -219,7 +219,7 @@ Deno.test({
     }
     if (bad.length > 0) {
       throw new Error(
-        `toStr disagrees with String(v) on ${bad.length}/${rs.length}:\n  ` +
+        `toString disagrees with String(v) on ${bad.length}/${rs.length}:\n  ` +
           bad.slice(0, 10).join("\n  "),
       );
     }
@@ -232,7 +232,7 @@ Deno.test({
   // before the parser sees it (JS `Number(String(-0))` is `+0` for the same
   // reason), and a NaN renders "NaN", which carries no payload — it must come
   // back A NaN, not the same one.
-  name: "std:fmt: parseF64(toStr(x)) is bit-identical to x (-0 → +0, NaN → a NaN)",
+  name: "std:fmt: parseF64(toString(x)) is bit-identical to x (-0 → +0, NaN → a NaN)",
   ignore: !ENABLED,
   fn: async () => {
     const rs = await rows();
@@ -262,7 +262,7 @@ Deno.test({
 });
 
 Deno.test({
-  // `print(x.toStr())` and `print(x)` are meant to be indistinguishable — the
+  // `print(x.toString())` and `print(x)` are meant to be indistinguishable — the
   // Rust host's `js_number_to_string` says so in as many words. They are, for
   // every vector EXCEPT an exact decimal tie, where the HOST is the one that
   // deviates from the spec it cites: it re-formats digits it gets from Rust's
@@ -276,7 +276,7 @@ Deno.test({
   // This is a PIN, not a tolerance: the divergent set is listed, so fixing the
   // host flips this test rather than silently widening the allowance. When it
   // flips, delete the list and assert equality outright.
-  name: "std:fmt: print(x) matches toStr(x) except at the host's known tie bug",
+  name: "std:fmt: print(x) matches toString(x) except at the host's known tie bug",
   ignore: !ENABLED,
   fn: async () => {
     const rs = await rows();
@@ -286,7 +286,7 @@ Deno.test({
       // Whichever way the host went, the module followed the spec — checked in
       // the first test; here we only care that a divergence is the host's.
       if (r.host !== r.vl && r.vl !== String(toF64(r.bits))) {
-        throw new Error(`bits=${r.bits}: toStr also left the spec (${r.vl})`);
+        throw new Error(`bits=${r.bits}: toString also left the spec (${r.vl})`);
       }
     }
     // Measured, 2026-09-01, over these exact vectors. The value appears TWICE
@@ -301,7 +301,7 @@ Deno.test({
     const want = PINNED.join(",");
     if (got !== want) {
       throw new Error(
-        `the host/toStr divergence set moved.\n  want: ${want}\n  got:  ${got}\n` +
+        `the host/toString divergence set moved.\n  want: ${want}\n  got:  ${got}\n` +
           `If the Rust host's tie-break was fixed, this test should now assert ` +
           `equality on every vector and drop the pinned list.`,
       );
@@ -462,7 +462,7 @@ const REJECTS = [
 
 // Every case is prefixed with `>` in the side file so that the EMPTY string is
 // a line rather than nothing; the probe slices the marker off.
-const PARSE_SRC = (dir: string) => `import { parseF64, toStr } from "std:fmt"
+const PARSE_SRC = (dir: string) => `import { parseF64, toString } from "std:fmt"
 import { IoError, readTextFile } from "std:fs"
 
 const txt = readTextFile("${dir}/cases.txt")
@@ -478,7 +478,7 @@ if txt is IoError {
     if v is null {
       print("NULL")
     } else {
-      print(f64bits(v).toStr())
+      print(f64bits(v).toString())
     }
     start = end + 1
   }

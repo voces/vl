@@ -1,50 +1,77 @@
 // `std:fmt` — pure-VL number formatting AND number parsing over the intrinsic
 // floor (docs/internals/std-design.md D4 item 1). The exported helpers take a
 // `self` first parameter, so they read as UFCS methods on the receiver
-// (`n.toStr()`, `"1.5".parseF64()`, `parts.join(sep)`).
+// (`n.toString()`, `"1.5".parseF64()`, `parts.join(sep)`).
 //
-// THE NAME `toStr` IS ABOUT TO BECOME `toString` — owner ruling, 2026-09-01:
-// the ambient compiler builtin `toString` is being retired and this module's
-// export takes its place. That lands in a FOLLOW-UP change, because the rename
-// touches the compiler's default scope, its emit special-cases and every
-// in-tree importer, and none of that should move underneath the float
-// algorithms below. Nothing in this file names its own export in a string, so
-// the rename stays one `export` line plus importers.
+// THE EXPORT WAS CALLED `toStr` UNTIL 2026-09-01, AND THE COMPILER CARRIED AN
+// AMBIENT BUILTIN CALLED `toString`. Owner ruling, executed in that change: the
+// builtin is retired and this export takes its name. `toString` is the
+// cross-language-conventional spelling (Java, C#, JS, Kotlin, Scala, Dart all
+// spell it in full; Rust's `to_string` is the same word), and after the ruling
+// there is exactly ONE of it in the language, at the std surface, reached by an
+// ordinary import. DECISIONS.md carries the ruling; what follows is the
+// measurement trail that settled it, kept because a reader asking "why is this
+// not a builtin?" is asking about these three facts.
 //
-// Measured 2026-09-01, for the rename's reviewer: the builtin's domain is
-// `i32 | boolean` — a STRICT SUBSET of this export's `i32 | i64 | boolean |
-// f64` (`toString(n)` on an i64 and `toString(1.5)` both refuse today) — so no
-// program loses a capability and the rename is purely additive at the type
-// level. And `n.toString()` refuses today (`member access '.toString' on
-// non-object i32`) because builtins are not `self`-first, so the rename also
-// BUYS the UFCS spelling — the actual user-facing win. The one break it
-// carries: `toString(42)` compiles with NO import today and will need
-// `import { toString } from "std:fmt"` after; std has no deprecation story, so
-// that break ships once, here, deliberately.
+// (1) NO CAPABILITY WAS LOST. The builtin's domain was `i32 | boolean` — a
+// STRICT SUBSET of this export's `i32 | i64 | boolean | f64`; measured
+// 2026-09-01 on the pre-rename compiler, `toString(n)` over an i64 and
+// `toString(1.5)` both refused. Every program the builtin served, this export
+// serves, and two widths more.
 //
-// WHAT IS WRITTEN HERE is the number rendering — `toStr` over the two integer
+// (2) THE RENAME BOUGHT THE UFCS SPELLING, which is the actual user-facing win.
+// Builtins are not `self`-first, so `n.toString()` refused on the pre-rename
+// compiler (`member access '.toString' on non-object i32`) while `n.toStr()`
+// worked. After it, `n.toString()` is the method spelling and `toString(n)` the
+// free-function one, both reaching the same function.
+//
+// (3) THE ONE BREAK, shipped deliberately and once: `toString(42)` compiled with
+// NO import before and needs `import { toString } from "std:fmt"` now. std has
+// no deprecation story, so the compiler pays for the break with a targeted
+// refusal instead — `typecheck.stdFmtMovedNote` appends the import line to the
+// undeclared-identifier message AND to the member-access-on-a-scalar sentence,
+// for BOTH `toString` and the old `toStr` spelling (four assertions in
+// `tests/cases/tostring/moved-to-std-hint.vl`; the `toStr` note carries an
+// expiry, `toString`'s does not), following the `then`-removal precedent
+// (#2094).
+//
+// WHAT IS WRITTEN HERE is the number rendering — `toString` over the two integer
 // widths, boolean, and (new) `f64` — plus `parseF64`, the inverse. The f64
 // halves are the interesting ones and their whole design is in the
 // `f64 ↔ TEXT` block below; read that before touching them.
+//
+// THE NAME IS BORROWED AND THE DOMAIN IS NOT. In the six languages cited above
+// `toString` is defined on every value; here it is exactly `i32 | i64 |
+// boolean | f64`. Measured 2026-09-01: `"abc".toString()` → `no method
+// '.toString' on string`, `[1,2].toString()` → `… on array i32[]`,
+// `p.toString()` on a struct → `no field 'toString' on Point`. A string
+// identity arm is deliberately absent — `s.toString()` is `s`, and an arm that
+// does nothing invites the name to grow into a universal renderer VL has no
+// overloading or traits to deliver (the derived `show<T>` is that future,
+// serde stage 2). And because the namespace is flat, a file that declares its
+// own `toString` cannot also import this one: that is a HARD refusal
+// (`Duplicate binding "toString"` —
+// `tests/cases/tostring/import-and-declare-collide.vl`), and
+// `import { toString as … }` is the escape.
 //
 // WHAT IS NOT, ON THE NUMERIC SIDE: `f32`, in either direction, and any radix
 // but ten. Neither is "later here"; both are a different computation.
 //
 //   `f32` HAS NO ARM AND SHOULD NOT GET A WRAPPER. An f32's shortest rendering
 //   is shorter than its widened f64's — `0.1` against `0.10000000149011612` —
-//   so it is Burger–Dybvig with 24-bit-significand boundaries, not `toStr` of
+//   so it is Burger–Dybvig with 24-bit-significand boundaries, not `toString` of
 //   the widened value, and reading one back needs f32-nearest rounding rather
 //   than f64-nearest then a narrowing. `docs/serde-design.md` stage 0 carries
 //   it as the remaining half.
 //
 //   THAT ABSENCE HAS A DIAGNOSTIC PRICE AND IT IS THE F64 ARM'S FAULT, so it
 //   is stated rather than left to be hit. An `f32` widens losslessly into the
-//   `f64` arm, so the checker now ACCEPTS `x.toStr()` over an `f32` binding
-//   where it used to refuse it cleanly (`member access '.toStr' on non-object
+//   `f64` arm, so the checker now ACCEPTS `x.toString()` over an `f32` binding
+//   where it used to refuse it cleanly (`member access '.toString' on non-object
 //   f32`); the emitter then floors with `emitProgram: union atom has no value
 //   box`. Measured 2026-09-01, both spellings. The hole is the COMPILER's and
 //   predates this module — three std-free lines reproduce it, and it refuses
-//   identically on a master-built seed — but it was unreachable from `toStr`
+//   identically on a master-built seed — but it was unreachable from `toString`
 //   until the f64 arm existed. Pinned by
 //   `scripts/capability-probes/f32-into-f64-union-arm.vl`, whose header argues
 //   the end state is to BOX the widened value rather than to re-narrow the
@@ -52,7 +79,7 @@
 //   build. When it does, an `f32` will render as the f64 it became, which is
 //   why an f32 arm is still owed after that.
 //
-//   RADIX: `toStr` is decimal only. Hex, binary and octal renderings are a
+//   RADIX: `toString` is decimal only. Hex, binary and octal renderings are a
 //   different function family with their own case and padding questions, and
 //   nothing in the tree asks for one.
 //
@@ -70,16 +97,16 @@
 // THE MOVE WAS NOT TIDINESS. VL has no namespace import, so every export lands
 // in the importer's flat top-level scope and a name declared twice across two
 // imported modules is a HARD PARSE ERROR. Two modules each carrying their own
-// `split` would mean a file could import `toStr` and `split` from `std:fmt`, or
-// `trim` and `split` from `std:str`, but never `toStr` and `trim` and `split` —
+// `split` would mean a file could import `toString` and `split` from `std:fmt`, or
+// `trim` and `split` from `std:str`, but never `toString` and `trim` and `split` —
 // and whichever module the caller reached for would have silently decided
 // whether their `join` was O(n) or O(n²). One implementation, one home, and
 // this module keeps the names its importers already spell.
 //
 // WHAT THE MOVE COSTS, MEASURED — AND THE NUMBER MOVES WHENEVER THIS FILE
 // GROWS, so it is dated. There is no cross-module dead-code elimination, so a
-// program that imports ONLY `toStr` emits `std:str` too AND every byte of the
-// f64 halves below. `import { toStr } from "std:fmt"` + one `n.toStr()` on an
+// program that imports ONLY `toString` emits `std:str` too AND every byte of the
+// f64 halves below. `import { toString } from "std:fmt"` + one `n.toString()` on an
 // i32, built to wasm on 2026-09-01: **17,062 bytes** — 2,850 before the
 // `std:str` move, 7,548 before the f64 half, and the breakdown of the last
 // 9,514 is in the `f64 ↔ TEXT` header, where it is the argument for `parseF64`
@@ -91,6 +118,18 @@
 // today; the alternative — two implementations of `split`, so that a
 // formatting import stays small — buys the bytes back by paying in the hazard
 // above.
+//
+// AND THAT NUMBER IS THE `none` RUNG — AND THE PROBE IS CONSTANT-FOLDABLE. The
+// same program is 1,041 bytes at `-O` and 542 at `-O3`, but at `-O3` the module
+// holds exactly ONE function (`wasm-dis p.wasm | grep -c '^ (func'` → 1):
+// binaryen evaluated `toString(42)` at compile time, so 542 prices the FOLD,
+// not the renderer. With the value not compile-time known (a loop-accumulated
+// one), `-O3` is 652 for the i32 arm, 5,164 once the f64 arm is live, and
+// 7,806 with `parseF64` live too (2026-09-01, same build). DCE does find what
+// the VL pipeline does not — but quote the rung AND what the program reaches:
+// the standing cost is ~0.6 KB for integer rendering and ~5 KB once a float is
+// rendered, and the same correction applies to every "importing `std:fmt`
+// costs …" claim in the tree (`std:utf8`'s header carries all three rungs).
 //
 // `padLeft` IS THE ONE NAME THAT DID NOT MOVE VERBATIM. `std:str` spells it
 // `padStart`, matching `padEnd` beside it and the JS pair both are modelled on;
@@ -141,19 +180,19 @@ function renderI64(n: i64) {
   out
 }
 
-// Decimal rendering of a number via its receiver: `n.toStr()` over an i32, an
+// Decimal rendering of a number via its receiver: `n.toString()` over an i32, an
 // i64 or an f64 binding. One union receiver covers every width (UFCS resolves
 // by `self`+arity; the value boxes in, `is`-narrows out); i32 widens
 // losslessly into the shared i64 renderer. The boolean arm renders true/false.
 //
 // The f64 arm is the whole `f64 ↔ TEXT` section below, and it is a SEPARATE
 // arm of this same union rather than a separate exported name because a flat
-// namespace has room for exactly one `toStr` and a reader who has learned
-// `n.toStr()` should not have to learn a second spelling to render a float.
+// namespace has room for exactly one `toString` and a reader who has learned
+// `n.toString()` should not have to learn a second spelling to render a float.
 // Measured, so it is not an assumption: a four-arm receiver `is`-narrows and
 // monomorphizes per arm on this compiler — `f64bits` inside the `is f64`
 // branch reads the narrowed f64, no boxing artefact survives.
-export function toStr(self: i32 | i64 | boolean | f64) {
+export function toString(self: i32 | i64 | boolean | f64) {
   if self is boolean {
     if self { return "true" }
     return "false"
@@ -191,7 +230,7 @@ export function padLeft(self: string, width: i32, fill: string) {
 // not a preference. Two independent reasons pick it. (1) It is what the two
 // hosts' print sinks already claim to implement — `scripts/vl-host/src/main.rs`
 // names the clause and `tests/support/runWasm.ts` / `playground/src/runtime.ts`
-// sink through JS `String(v)` literally — so `print(x.toStr())` and `print(x)`
+// sink through JS `String(v)` literally — so `print(x.toString())` and `print(x)`
 // are meant to be indistinguishable, and any other choice would make VL print
 // a float two ways. (2) `String(v)` IS shortest-round-trip by specification, so
 // the rule is pinned by a document rather than by an implementation.
@@ -227,7 +266,7 @@ export function padLeft(self: string, width: i32, fill: string) {
 // by `tests/vl_std_float_text_test.ts` so it flips loudly when the host is
 // fixed.
 //
-// ── ROUND TRIP: `parseF64(x.toStr())` is bit-identical to `x` for every finite
+// ── ROUND TRIP: `parseF64(x.toString())` is bit-identical to `x` for every finite
 // f64 EXCEPT −0, and returns a NaN for NaN. Both exceptions are the style's,
 // not the algorithm's: the spec renders −0 as `"0"`, so the sign is gone before
 // the parser sees it (JS `Number(String(-0))` is `+0` for the same reason), and
@@ -287,7 +326,7 @@ export function padLeft(self: string, width: i32, fill: string) {
 // integer, which is a denial-of-service surface for the JSON reader this is
 // being built for.
 //
-// ── THE GRAMMAR `parseF64` ACCEPTS is closed under `toStr` — every string this
+// ── THE GRAMMAR `parseF64` ACCEPTS is closed under `toString` — every string this
 // module can PRODUCE parses back — and it is JSON's number grammar plus
 // Infinity/NaN, NOT VL's literal grammar. Precisely:
 //
@@ -336,11 +375,11 @@ export function padLeft(self: string, width: i32, fill: string) {
 //
 // ── WHY `parseF64` LIVES HERE AND NOT IN A `std:num`, MEASURED. The header's
 // missing-DCE paragraph applies again and the split does not pay. Same probe as
-// that measurement — `import { toStr } from "std:fmt"` plus one `n.toStr()` on
+// that measurement — `import { toString } from "std:fmt"` plus one `n.toString()` on
 // an i32, built to wasm:
 //
 //     before the f64 half               7,548 bytes
-//     + the f64 FORMATTER              14,256   (+6,708 — forced: it IS `toStr`)
+//     + the f64 FORMATTER              14,256   (+6,708 — forced: it IS `toString`)
 //     + the PARSER                     17,062   (+2,806)
 //
 //     The endpoints are exact (probe below, re-run 2026-09-01); the two
@@ -349,14 +388,19 @@ export function padLeft(self: string, width: i32, fill: string) {
 //     from the repo root — note VL_STD, without which the host resolves std:
 //     from the BINARY's own checkout and silently measures the wrong tree:
 //       VL_STD=$PWD/std scripts/vl-host/target/release/vl build p.vl -o p.wasm
-//       # p.vl:  import { toStr } from "std:fmt"
+//       # optimized rungs (wasm-opt is NOT on PATH — CLAUDE.md):
+//       VL_WASM_OPT=./node_modules/.bin/wasm-opt VL_STD=$PWD/std \
+//         scripts/vl-host/target/release/vl build p.vl -O3 -o p.wasm
+//       # p.vl:  import { toString } from "std:fmt"
 //       #        const n = 42
-//       #        print(n.toStr())
+//       #        print(n.toString())
 //
-// The formatter cannot move: a flat namespace has one `toStr`, so the f64 arm
+// The formatter cannot move: a flat namespace has one `toString`, so the f64 arm
 // and everything under it are in this module by construction. That makes the
-// parser's own 2,822 bytes the entire question, and paying them buys the pair
-// staying in one place — a reader who found `toStr` finds its inverse beside it,
+// parser's own 2,822 bytes (at the `none` rung — at `-O3` the unused parser costs
+// nothing measurable, which strengthens this answer) the entire question, and
+// paying them buys the pair
+// staying in one place — a reader who found `toString` finds its inverse beside it,
 // and the exact-arithmetic helpers have one home rather than being exported from
 // here to be reachable there. The real fix is whole-program dead-code
 // elimination, which this header already names; a second module would buy 2.8 KB
@@ -812,7 +856,7 @@ function layoutDec(d: i32[], n: i32): string {
   fromCodePoints(buf) + "e-" + renderI64(down)
 }
 
-// `toStr`'s f64 arm. The sign is read off the BIT PATTERN rather than by
+// `toString`'s f64 arm. The sign is read off the BIT PATTERN rather than by
 // comparing with zero, because `-0.0 < 0.0` is false and the exponent/fraction
 // split is already in hand.
 function renderF64(x: f64): string {
