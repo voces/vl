@@ -48,6 +48,7 @@ import {
   tyIsLitUnion,
   tyIsLitUnionArray,
   tyIsLitUnionOrLit,
+  tyIsNulValueUnionBox,
   tyLitMemberTexts,
   tyLitUnionAliasIx,
   tyNumLitMemberTexts,
@@ -23324,6 +23325,41 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
       const defCtx = expCtxHere()
       defCtx.structIdx = csi
       return emitCoalesceNulRef(body, e, sHeapIdx[csi], defCtx, fnIx)
+    }
+  }
+  // D960 — `??` OVER A NULLABLE VALUE-UNION BOX WHOSE OPERAND CANNOT BE RE-READ. The
+  // RE-READABLE spelling never arrives here: `emit_rewrite` desugars it to an `if` (D962),
+  // which is right because a rewrite leaves no `??` node for the consumer classifiers to
+  // disagree about. A CALL operand cannot take that route — the desugaring names the operand
+  // twice — so it needs a real emit arm, and this is it: stash the box ONCE, branch on its
+  // tag, and give the `if` the BOX as its result type so both arms agree.
+  //
+  // WHY THE TWO EARLIER EMIT ARMS FAILED, and why this one does not. D962 recorded that the
+  // second arm emitted a perfectly correct `(if (result (ref $box)) …)` and the RETURN PATH
+  // wrapped it in a SECOND `struct.new $box`. That is the same fighting pair D969 untangled:
+  // the consumer double-boxes precisely because `exprUnion` answers FALSE for this node, so
+  // every box-typed position thinks it still has to coerce. Teaching `unionNameOfExpr` (and
+  // through it `exprUnion`) to answer for a `??` whose checked type is a value union is the
+  // other half of this arm, and neither half works alone.
+  if tyIsNulValueUnionBox(nodeTyIxOf(e.binLeft)) {
+    const coNm = unionNameOfExpr(exprIx, fnIx)
+    if coNm != "" {
+      const coSlot = sharedFieldRecvSlot()
+      if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
+      fbLocalSet(coSlot)
+      fbLocalGet(coSlot)
+      fbStructGet(uBoxIdx, 0) // field 0: tag
+      fbI32Const(nullBoxTag())
+      fbI32Bin(71) // 0x47 i32.ne  -> present?
+      fbIfRefNul(uBoxIdx, false) // if (result (ref $uBox))
+      ctrlEnter()
+      fbLocalGet(coSlot)
+      wU8(212) // 0xd4 ref.as_non_null — the stash cell is nullable, the block type is not
+      fbElse()
+      if emitUnionCoerce(body, coNm, e.binRight, fnIx) < 0 { return -1 }
+      fbEnd()
+      ctrlLeave()
+      return 0
     }
   }
   // WHAT REACHES HERE IS A NULLABLE LEFT OPERAND WHOSE REP HAS NO `??` LOWERING — not
