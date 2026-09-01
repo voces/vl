@@ -63,10 +63,10 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   a std:test-visible callsite mechanism (Rust `#[track_caller]` / Swift `#line` shaped).
   Small compiler intrinsic, language-surface decision. The editor-side cheap half is D9
   slot 12 and needs no ruling.
-- **`vl test --trace` inline run values** (which `is` arm fired, what a binding held) —
-  an emitter flag instrumenting USER programs (never the compiler — seed-poisoning
-  hazard doesn't apply) logging `(site, value)` pairs; extension renders decorations
-  after a run. Wallaby/Quokka-class feature; real work, bounded. Blocked on: appetite.
+- **`vl test --trace` inline run values** — RULED low priority (owner, 2026-09-01,
+  "low prio I guess"): keep parked; an emitter flag instrumenting USER programs (never
+  the compiler) logging `(site, value)` pairs, extension renders decorations after a
+  run. Revisit when the test-debugging story matters more than new surface.
 - **Driver lossless-recovery flag** — report "parse error + later type error" together.
   Measured cost recorded in DECISIONS.md beside the `then` entry: lifting the bail today
   invents 5 phantom-error corpus cases from lossy recoveries; doing it right wants a
