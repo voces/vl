@@ -23894,12 +23894,26 @@ and the refusal turns into a miscompile:
   site does not land in the function body at all. The marker is measuring the writer's target
   buffer, not reachability. Use a counter global or a distinctive `emitFail` there instead.
 
-* **THE EMITTER IS THE VOID-DISCARD LEG — found, and it answers this row's open question.**
-  Marking the `fRetVoid[rvPos] == 1` arm of `emitStmt`'s `RetStmt` case counts **2 for
-  `pick(b)` and 0 for the annotated control**. So `pick` is classified VOID while its functype
-  is the union box, and its returns take the discard path — `emitStmt` the operand, then a bare
-  `fbReturn()`, which leaves the pushed i32 as the result. That is exactly the
-  `(return (i32.const 1))` under `(result (ref $box))` in the disassembly.
+* **RETRACTED: "the emitter is the void-discard leg" WAS A POISONED-SEED ARTIFACT.** That claim
+  was filed here off a byte-marker count (2 for `pick`, 0 for the control) taken on a build
+  whose SEED was itself an instrumented compiler — the hazard this repo documents in
+  `CLAUDE.md`, walked into while chasing this row. Re-measured from a pristine seed with the
+  reliable instrument (a distinctive `emitFail`, which the row itself recommends over a byte
+  marker), the truth is the opposite:
+
+  `computeVoidFns` NEVER marks `pick` void; the `fRetVoid[rvPos] == 1` discard leg does NOT
+  fire for either shape; and `emitReturnValue` DOES run for both (`pick` fnIx=18, the control
+  fnIx=10). **Every byte-marker count previously filed on this row should be treated as
+  unmeasured.**
+
+* **AND THE BOXING IS NOT IN THE TAIL CHAIN AT ALL — the sharpest fact this row has.** Probing
+  every arm of `emitReturnValue`'s `retF32 / retF64 / retI64 / retVi / retUNm` ladder with
+  `emitFail` shows **none of them fires — for EITHER shape**, including the annotated control
+  that boxes correctly. So the working path boxes somewhere EARLIER in `emitReturnValue` (the
+  seeds around `nodeTyIsStringPrim` / `retNulStringFlag` / `retLitUnionInline` / the
+  `fn.fnRet < 0` rungs), and `retUNm` is not the mechanism at all — which is why hardcoding it
+  changed nothing. **The next attempt should find what the control hits before that ladder and
+  ask why `pick` misses it**, and should not spend any more effort on `retUNm` or the A20 gate.
 
 * **BUT THE FLAG'S ORIGIN IS STILL UNEXPLAINED, and `computeVoidFns` appears not to be it.**
   Its only path to `fRetVoid[i] = 1` is gated on `!blockHasValuedReturn(fn.fnBody)`, and that
