@@ -23980,7 +23980,7 @@ program that compiled and ran the line before the import was added.
   is built out of `return if …` arms — that is its subject — so migrating it to
   `import { toString } from "std:fmt"` broke it. It carries a local boolean renderer instead
   and stays import-free, with a comment naming this row, so the file keeps measuring
-  short-circuit narrowing rather than measuring D976.
+  short-circuit narrowing rather than measuring D981.
 
 * **A NEIGHBOUR, NOT A DUPLICATE.** `docs/internals/perf-landscape.md` §8.1 already files
   *"importing anything from `std:fmt` breaks a function with an annotated array return whose
