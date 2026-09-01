@@ -23861,39 +23861,39 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   invalid wasm.
 
 ---
-### D968 — `print` of a `!= null`-narrowed union with TWO OR MORE non-null members is check-clean invalid wasm
+### D968 — `print` of a `!= null`-narrowed union with TWO OR MORE non-null members was check-clean invalid wasm
 
-**check-clean invalid wasm · found 2026-09-01 by hand while grading the `coalesce-over-nullable-union` probe · INVISIBLE TO THE SCOREBOARD: clause 1 reads 0 because no corpus cell has this shape, which is what the "runs can reach 100% with the goal unmet" note warns about**
+**closed — the box plan declined every NARROWED receiver, and a narrow that leaves two or more arms leaves a box · found 2026-09-01 by hand off the `coalesce-over-nullable-union` probe, and INVISIBLE TO THE SCOREBOARD: clause 1 read 0 because no corpus cell has this shape, which is exactly the "runs can reach 100% with the goal unmet" case**
 
 `function mk(b): string | i32 | null` bound to a local, narrowed with `!= null`, then printed.
-`vl check` returns 0 and the module does not validate.
+`vl check` returned 0 and the module did not validate:
+`expected i32, found (ref $type)` — the box reaching `__print_i32__`.
 
-* **FOUR INGREDIENTS, AND REMOVING ANY ONE MAKES IT RUN.** The table is the family — the
-  message (a bare wasm translation error) says nothing, and the `??` spelling it was found
-  under is not an ingredient at all:
+* **FOUR INGREDIENTS, AND REMOVING ANY ONE MADE IT RUN.** The message is a bare wasm
+  translation error and says nothing, so the ablation is the family: one non-null member ran;
+  no null arm ran; no binding ran; reading into a union BINDING instead of `print` ran; reading
+  as an ARGUMENT instead ran; narrowing to ONE atom before `print` ran. Only all four together
+  failed.
 
-  | ablation | outcome |
-  |---|---|
-  | all four | **check-clean invalid wasm** |
-  | one non-null member (`string \| null`) | runs |
-  | no null arm (`string \| i32`, no narrow) | runs |
-  | no binding (direct call, tested not read) | runs |
-  | read into a union BINDING instead of `print` | runs |
-  | read as an ARGUMENT instead of `print` | runs |
-  | narrowed to ONE atom before `print` | runs |
+* **THE GATE WAS `narrowVariantFor(name) == ""`.** `printUnionRecvIsBox` declined the tag-
+  dispatch plan for ANY narrowed receiver. That is right for a narrow to ONE arm — `if t is
+  string { print(t) }` leaves the value at the string's own rep, not in a box — and wrong for a
+  `!= null` narrow, which drops one ARM while the remaining two still ride the box. The
+  question is not "is this narrowed" but "how many arms are left": one, not a box; two or more,
+  still a box, and the tag dispatch is exactly what prints it.
 
-* **SO IT IS NOT THE NARROW AND IT IS NOT THE UNION** — both of those are fine on their own,
-  and `print` of a plain `string | i32` (declared, or returned from a call) runs. It is `print`
-  reading a value whose DECLARED type was nullable and whose narrowed type is still a
-  multi-member box: the `!= null` strips the null at the TYPE level while the value keeps its
-  nullable-union rep, and `print`'s dispatch reads it as the non-nullable one.
+* **AND THE FALL-THROUGH'S OWN GUARD COULD NOT SEE IT.** `printUnionArmsUnrenderable` exists to
+  turn precisely this fall-through into a loud reject, and it stayed silent — because the shape
+  is perfectly renderable. The plan was never asked. A guard that catches "my shape, and I
+  cannot do it" does not catch "never offered the shape".
 
-* **THE `??` SPELLING IS THE SAME DEFECT WEARING A SECOND OUTCOME.** `const v = t ?? "d"` over
-  the same `t` is also check-clean invalid wasm, and the DIRECT spelling `mk(true) ?? "d"` is
-  the `coalesce-over-nullable-union` capability probe's loud emit reject. One mechanism, three
-  sentences — which is why the probe's own message was the wrong place to start.
+* **THE `??` SPELLING IS A DIFFERENT MECHANISM — corrected here after the fix.** This row first
+  claimed `t ?? "d"` was the same defect wearing a second outcome. It is not: with `print`
+  fixed, `const v = t ?? "d"` over the same `t` is STILL check-clean invalid wasm, and
+  `mk(true) ?? "d"` is still the probe's loud emit reject. Two mechanisms that shared a
+  witness. The `??` half stays open and belongs to D960.
 
-Repro (check rc 0, invalid wasm):
+Repro (runs, prints `s`):
 
     function mk(b: boolean): string | i32 | null {
       if b { return "s" }
@@ -23901,7 +23901,7 @@ Repro (check rc 0, invalid wasm):
     }
     const t = mk(true)
     if t != null { print(t) }
-    // vl check rc 0; vl run -> Error: failed to compile: WebAssembly translation error
+    // PRINTS s
 
 ### D966 — `__array_new__`'s ref-fill "long tail" was one arm, and it is now open at every ANNOTATED spelling
 
