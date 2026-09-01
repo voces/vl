@@ -28104,6 +28104,28 @@ Repro (loud emit reject):
 
 **loud emit reject · `emitProgram: narrowed union atom has no value box` · found 2026-08-31 as std:test v2's review blocker: `expect(parse("4")).toEqual(4)` over `parse(s: string): i32 | string` RAN under v1 and refused under v2, because v1's five-atom receiver union minted every scalar value box just by existing and generic v2 minted only what the user's module declared · the box registry is MODULE-WIDE (`markValueUnionAtoms` marks `vb*Used` per registered value union's members; `emitUnionUnboxTail` refuses at `vbHeapIdxOfKind < 0`), so the SAME arm validates the moment any union in the module carries the atom — std/test.vl routes around it with a private five-atom alias (`VltAtomReps`), which is why the expect-level spelling no longer reproduces while this std-free witness still does · a 30-cell arm-by-union grid (scratch method, five ladder arms x six two-member unions) refused in exactly the cells {arm READS the narrowed value} x {arm atom's box unminted}, boolean riding i32's box (`boolean` arm over `f64 | string` refuses, over `i32 | string` runs)**
 
+**THE `unreachable` FIX IS RIGHT AND ITS OBVIOUS SET TEST IS WRONG — measured 2026-09-01,
+candidate reverted.** The arm is constant-false at this instance, so the honest lowering is
+`unreachable` (polymorphic on the stack, and a TRAP rather than a bad read if the test ever
+fired) instead of refusing the whole program. Three things that attempt established, each of
+which costs an agent-task to rediscover:
+
+* **`vbHeapIdxOfKind(ak) < 0` MUST NOT BE THE DEADNESS TEST.** It is the same answer nearly
+  always and it is the D950 trap: the box registry is populated DURING emission, so a LIVE arm
+  can read it before its box is minted and look exactly like a dead one. D950 was reverted for
+  that read after it turned fifteen running corpus classes into non-running ones.
+
+* **AND `valueAtomKind(tyNameOf(member))` IS NOT THE SET KEY EITHER.** The natural
+  order-independent test — walk the member set, compare each arm's value-atom ABI code against
+  the narrowed atom's — reports `i64 | string` as having NO i64 arm. Built as
+  `unionHasAtomKind`, it silently killed the LIVE arm: `f(w)` over `const w: i64 | string = 9`
+  runs on master and TRAPS under the candidate. Whatever identifies an arm here, it is not
+  that composition, and a candidate must be graded against a union that DOES hold the atom.
+
+* **THE BARE-READ SPELLING IS NOT PART OF THIS ROW.** `if x is i64 { return "L" }` — a dead arm
+  that never reads `x` — runs on master. Only a read of the narrowed value refuses, which is
+  what the row's title says and what a candidate must not mistake for progress.
+
 Repro (loud emit reject):
 
     function istr(v: i64) {
