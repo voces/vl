@@ -42,9 +42,11 @@ import {
   fixableDiagnosticsForRange,
   quickFixesForDiagnostic,
 } from "./codeActions.ts";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   loadWasmChecker,
+  type SeedSource,
   type WasmChecker,
   type WasmImportedSource,
   type WasmMemberToken,
@@ -907,13 +909,71 @@ connection.onInitialize((params) => {
   // there is no longer a TS checker to select.)
   const opts = (params.initializationOptions ?? {}) as {
     compilerWasm?: string;
+    compilerPath?: string;
   };
   const root = params.rootUri ? uriToPath(params.rootUri) : "";
-  const wasmPath = opts.compilerWasm || join(root, "build", "vl-compiler.wasm");
+  // THE SEED LADDER — see `wasmCheckerNode.ts` for why this is a ladder and not a
+  // path. In short: the old single default was `<workspace>/build/vl-compiler.wasm`,
+  // a gitignored artifact of the compiler repo, so the extension silently did
+  // nothing in every project that is not this one. These rungs mirror the CLI's own
+  // `--compiler → $VL_COMPILER_WASM → ./build/… → embedded` resolution and add the
+  // two an editor needs.
+  const seedSources: SeedSource[] = [];
+  if (opts.compilerWasm) {
+    seedSources.push({
+      kind: "path",
+      label: "vital.compilerWasm",
+      path: opts.compilerWasm,
+      explicit: true,
+    });
+  }
+  if (process.env.VL_COMPILER_WASM) {
+    seedSources.push({
+      kind: "path",
+      label: "$VL_COMPILER_WASM",
+      path: process.env.VL_COMPILER_WASM,
+      explicit: true,
+    });
+  }
+  if (root) {
+    seedSources.push({
+      kind: "path",
+      label: "workspace build/",
+      path: join(root, "build", "vl-compiler.wasm"),
+    });
+  }
+  // Ask an installed CLI for the seed it would use. ONE spawn, at startup — and it
+  // is the only rung that keeps the seed version-matched to the project's own `vl`,
+  // which matters because the seed and the language are one artifact.
+  seedSources.push({
+    kind: "exec",
+    label: "`vl seed`",
+    cmd: opts.compilerPath || "vl",
+    args: ["seed"],
+  });
+  // Shipped beside the server bundle: the rung that makes the extension work with
+  // no configuration at all. Last, so any of the above still wins.
+  seedSources.push({
+    kind: "path",
+    label: "bundled seed",
+    path: join(dirname(fileURLToPath(import.meta.url)), "vl-compiler.wasm"),
+  });
+
   wasmChecker = loadWasmChecker(
-    wasmPath,
+    seedSources,
     (msg) => connection.console.log(msg),
     getStdDir,
+    (origin) => {
+      // SAY SO WHEN THERE IS NO CHECKER. Every handler returns an empty result
+      // without one, which renders identically to a clean file — that is what made
+      // the missing-seed case cost a debugging session rather than a glance.
+      if (origin !== undefined) return;
+      connection.window.showWarningMessage(
+        "Vital: no compiler seed found, so diagnostics, go-to-definition and hover " +
+          "are disabled. Put `vl` on PATH, or set `vital.compilerWasm`. " +
+          "(The server log lists every location tried.)",
+      );
+    },
   );
   return {
     capabilities: {
