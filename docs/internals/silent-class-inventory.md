@@ -1,5 +1,12 @@
 # Silent-class inventory — a measured rebuild of the queue
 
+> **D-NUMBER RESERVATIONS** (blocks of 20, claimed HERE before minting — a reservation
+> that lives in an agent's memory instead of this file is how D976/D978 each got minted
+> twice on 2026-09-01):
+> RESERVED D981–D1000 — the compile-goal session (vl-de). D981 grandfathered to the
+> tooling session inside this block.
+> RESERVED D1001–D1020 — the tooling session (vl-b7).
+
 Every row below was produced by generating a program, running it, and grading the **run
 value** against an expectation computed independently of the compiler. Nothing here is
 inherited from an earlier filing. Where an earlier filing is contradicted, the
