@@ -23400,6 +23400,56 @@ Repro (now RUNS; on master, check rc 0 and the module is invalid):
     // Swapping the members (`i32[] | string`) ran on master — same type, other spelling.
 
 ---
+### D955 — the dead union-atom arm: the FOLD is right and PROVEN, and no sound predicate for it exists yet — four candidates measured and reverted
+
+**loud emit reject · `emitProgram: narrowed union atom has no value box` · `vl check` returns 0, so this is a clause-2 violation by construction · ZERO corpus cells; `scripts/capability-probes/dead-union-atom-arm-read.vl` is the measurement · A FIX WAS BUILT, PROVEN CORRECT IN PLACEMENT, AND REVERTED because every predicate tried was wrong — the last one LOST 15 RUNNING CLASSES**
+
+`x is i64` where this instance pins `T = i32 | string` is constant-false. The tag-compare path
+emits a correct runtime test that always answers 0 — and correct is not enough, because the
+arm BEHIND it still emits, and its narrowed read asks for an i64 out of a box no module ever
+minted. Folding the test to a CONSTANT is what lets D932's `emittedCondConst` prune the dead
+arm, exactly as D950 does one receiver-rep over.
+
+* **THE PLACEMENT IS SETTLED, and that half should not be re-derived.** The fold must sit at
+  the HEAD of `emitIs`, before the tag-compare path. `monoStaticIsResult` — the obvious home —
+  is unreachable for a union receiver, and says so in its own header: *"Union-typed operands
+  took the tag-compare paths above"*. Proven by isolation: forcing the head-of-`emitIs` guard
+  unconditionally true makes the probe print `o`, the correct answer.
+
+* **FOUR PREDICATES, ALL WRONG, ALL MEASURED.** (1) `nodeTyIxOf(recv)` — at a monomorphized
+  clone the receiver node still carries `T`, a `TyVar`, so it answers about the DECLARATION.
+  (2) `monoArgPinTyIx` — takes its annotation channel only for FUNCTION types and otherwise
+  falls back to that same own-type. (3) A new unfiltered `monoInstanceTyIx` reading the
+  clone's rewritten annotation directly — answers nothing for a union receiver either. (4)
+  **The emitter's own `vbHeapIdxOfKind`** — "has this module minted a value box for the tested
+  atom", which reads sound (no box means nothing of that atom was ever boxed, so no union box
+  can hold one) and is NOT: the box table is populated DURING emission, so a test emitted
+  before its atom's box is minted folds false incorrectly. That candidate lost **15 running
+  classes** and turned `stri32_tounion_list_none` from `7` into `0` — a silently wrong value,
+  caught by the corpus grade on its blocking criterion.
+
+* **SO THE MISSING PIECE IS NAMED: an order-independent, per-INSTANCE type for a union
+  receiver at a mono clone.** Not the declaration's `T`, and not a table that fills as
+  emission proceeds. D950's fix needed the same thing one rep over and got it from
+  `nulNicheBaseClass`'s fnIx-scoped classifiers; the union receiver has no equivalent, and
+  building one is the work this row is waiting on.
+
+Repro (check rc 0; the EMITTER refuses):
+
+    function istr(v: i64) {
+      if v == 0 { return "0" }
+      "n"
+    }
+    function f<T>(x: T): string {
+      if x is i64 { return istr(x) }
+      "o"
+    }
+    const u: i32 | string = 4
+    print(f(u))
+    // vl check rc 0; vl run -> emitProgram: narrowed union atom has no value box
+    // SHOULD PRINT o.
+
+---
 
 ### D791 — [CLOSED 2026-08-31] READ-ONLY COVARIANCE is lowered by an element-CONVERTING COPY, licensed by a whole-program write scan — D661B's refusal was about the WRITABLE side only
 
