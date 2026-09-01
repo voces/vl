@@ -205,6 +205,23 @@ what VL needs, and the WasmGC note above marks the only revisit trigger.
   ship Phase 1 as field bounds + operator demands + good errors and add the method form
   WITH Phase 2, or accept expression-based (scope-relative) satisfaction from day one.
   OQ-1 and OQ-3 are one decision wearing two numbers.
+
+  **SPELLING REVISED after a second owner probe (2026-09-01): drop `self` — the form
+  is `{ toString(): string }`.** Two measurements force it. (1) VALUE literals already
+  have a method shorthand: `{ f() { "ok" } }` parses, runs, and is field-equivalent
+  (parser.vl's object-literal arm; measured — it satisfies a `{ f: () => string }`
+  annotation). (2) TYPE literals accept only the colon form today — both
+  `{ f(): string }` and `{ f(self): string }` refuse, so the parens spelling is free
+  syntax. Given (1), the type-side method form should mirror the value shorthand's
+  CALL SHAPE: parameters listed are the call's arguments, the receiver is implicit —
+  which is also exactly Go's interface spelling (`String() string`). The `(self)`
+  variant would wrongly imply the satisfier must take a self parameter, which the
+  zero-ary field satisfier does not. Under expression semantics the pairing is
+  coherent and directional: every colon/shorthand FIELD satisfies the method bound
+  (the bound is the supertype — "the call works"), while a UFCS-satisfied value does
+  not satisfy a field bound. So: `{ f: () => string }` = the data exists;
+  `{ f(): string }` = the call works. Same discriminator, one token shorter, and it
+  types the shorthand people already write.
 * **OQ-2 — operator bounds**: deferred above; reopen when a real API needs to export a
   generic whose operator demand should be documentation-stable.
 * **OQ-3 — accept Phase 2's scope-relative satisfaction? EXPANDED after owner probing
