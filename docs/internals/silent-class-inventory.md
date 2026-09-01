@@ -23624,6 +23624,25 @@ Repro (now RUNS, printing `true` then `false`):
   type being the box, so the default arm has to box through `emitUnionCoerce` exactly as the
   hand-written `return "d"` already does.
 
+* **THE NAIVE BLOCK+`br_if` ARM WAS BUILT AND IS WRONG — measured, so the next attempt can
+  skip it.** For a RE-READABLE left operand the arm needs no scratch at all: push the operand,
+  push it again for the tag, `i32.ne` against the null tag, `br_if 0` out of a
+  `(ref $uBoxIdx)` block, else `drop` and `emitUnionCoerce` the default. That compiles, the
+  arm fires, and every witness comes out `type mismatch: expected i32, found (ref $type)` —
+  including the forms with no `print` in the way, so it is the lowering and not a consumer
+  classifying the `??` node.
+
+* **THE TAG CONSTANT IS NOT THE BUG, which was the first suspicion and is ruled out.**
+  `nullBoxTag()` is `scalarTagOfKind(nullValKind())` = `uVariants.length + 6`, and the working
+  hand-written module (no variants declared) compares against a literal `6`. They agree.
+
+* **COPY THE SHAPE THE WORKING FORM ACTUALLY USES.** Disassembled, the hand-written
+  `const v = mk(b); if v != null { return v }; "d"` does NOT use a block with `br_if`. It
+  binds the operand to a LOCAL (`local.set $1`), tests
+  `i32.ne (struct.get $box 0 (local.get $1)) (i32.const 6)`, and `return`s the local from
+  inside an `if`. So the shape that is known to validate is local-based — which brings back
+  the reservation question the re-readable arm was trying to avoid.
+
 * **AND THE TEMP LOCAL IS NOT FREE, which makes it TWO sites rather than one.** This emitter
   does not mint locals on demand: a scratch slot is RESERVED ahead of emission by
   `emit_classify`'s scan (the `setStrScrI` family, and
