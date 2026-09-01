@@ -23861,6 +23861,48 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   invalid wasm.
 
 ---
+### D968 — `print` of a `!= null`-narrowed union with TWO OR MORE non-null members is check-clean invalid wasm
+
+**check-clean invalid wasm · found 2026-09-01 by hand while grading the `coalesce-over-nullable-union` probe · INVISIBLE TO THE SCOREBOARD: clause 1 reads 0 because no corpus cell has this shape, which is what the "runs can reach 100% with the goal unmet" note warns about**
+
+`function mk(b): string | i32 | null` bound to a local, narrowed with `!= null`, then printed.
+`vl check` returns 0 and the module does not validate.
+
+* **FOUR INGREDIENTS, AND REMOVING ANY ONE MAKES IT RUN.** The table is the family — the
+  message (a bare wasm translation error) says nothing, and the `??` spelling it was found
+  under is not an ingredient at all:
+
+  | ablation | outcome |
+  |---|---|
+  | all four | **check-clean invalid wasm** |
+  | one non-null member (`string \| null`) | runs |
+  | no null arm (`string \| i32`, no narrow) | runs |
+  | no binding (direct call, tested not read) | runs |
+  | read into a union BINDING instead of `print` | runs |
+  | read as an ARGUMENT instead of `print` | runs |
+  | narrowed to ONE atom before `print` | runs |
+
+* **SO IT IS NOT THE NARROW AND IT IS NOT THE UNION** — both of those are fine on their own,
+  and `print` of a plain `string | i32` (declared, or returned from a call) runs. It is `print`
+  reading a value whose DECLARED type was nullable and whose narrowed type is still a
+  multi-member box: the `!= null` strips the null at the TYPE level while the value keeps its
+  nullable-union rep, and `print`'s dispatch reads it as the non-nullable one.
+
+* **THE `??` SPELLING IS THE SAME DEFECT WEARING A SECOND OUTCOME.** `const v = t ?? "d"` over
+  the same `t` is also check-clean invalid wasm, and the DIRECT spelling `mk(true) ?? "d"` is
+  the `coalesce-over-nullable-union` capability probe's loud emit reject. One mechanism, three
+  sentences — which is why the probe's own message was the wrong place to start.
+
+Repro (check rc 0, invalid wasm):
+
+    function mk(b: boolean): string | i32 | null {
+      if b { return "s" }
+      null
+    }
+    const t = mk(true)
+    if t != null { print(t) }
+    // vl check rc 0; vl run -> Error: failed to compile: WebAssembly translation error
+
 ### D966 — `__array_new__`'s ref-fill "long tail" was one arm, and it is now open at every ANNOTATED spelling
 
 **closed at the ANNOTATED spelling — all four ref fills (nested list, string list, map, closure) deliver through the kind-3 arm and RUN · the un-annotated spelling keeps a loud residue whose single cause, enrolment, the body names by line**
