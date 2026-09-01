@@ -483,13 +483,24 @@ execution snapshot, no zero-copy promises in the GC tier.**
 
 Staged, sized honestly:
 
-- **Stage 0 — prerequisites, std-only, no compiler change.** `f64`/`f32` ↔ string:
-  shortest-round-trip formatting and correctly-rounded parsing in pure VL (`std:fmt`
-  growth or `std:num`) — the one genuinely hard algorithm in this whole program, needed
-  by *every* text story including diagnostics, and missing today (measured). Fix the
-  lexer's inability to read scientific notation so VL's own float rendering is
-  re-parseable (independent language bug surfaced by this survey). `std:base64` (small).
-  Every export here is a `std:*` addition → `std-api-reviewer` per CLAUDE.md.
+- **Stage 0 — prerequisites.** `f64`/`f32` ↔ string: shortest-round-trip formatting and
+  correctly-rounded parsing in pure VL (`std:fmt` growth or `std:num`) — the one genuinely
+  hard algorithm in this whole program, needed by *every* text story including diagnostics,
+  and missing today (measured). `std:base64` (small). Every export here is a `std:*`
+  addition → `std-api-reviewer` per CLAUDE.md.
+
+  **The lexer half is DONE (2026-09-01).** Scientific notation lexes end to end:
+  `digits ('.' digits)? ([eE] [+-]? digits)?`, `_` separators throughout, exponent and all.
+  It is a SPELLING of the float literal VL already had — same node, f64 by default, same
+  contextual-f32 grant — so `1e3` reaches every position `1000.0` does, and `vl fmt` keeps
+  the author's bytes. The mantissa grammar did NOT widen: VL still has no bare `.5` or
+  `1.`, so `.5e3` and `1.e3` mean what they meant before. Values are correctly rounded —
+  the exponent scales the same exact bignum rational the plain spelling builds
+  (`mant * 10^(exp - fracDigits)`), so there is exactly one rounding and no
+  `mantissa * 10^exp` product in f64 anywhere; verified against CPython's `strtod` on 396
+  literals plus `1e23`, `8.98846567431158e307`, `2.2250738585072011e-308`, `5e-324` and
+  `1.7976931348623157e308`. That closes the *re-parseability* half of the round trip; the
+  formatting half (VL's own shortest-round-trip renderer) is still Stage 0 work.
 - **Stage 1 — `std:json` v1, std-only.** Escaping writer + pull lexer + hand codecs for
   the types the repo itself needs (config-file class). Deliberately minimal: it is the
   boilerplate *measurement* for stage 2 (the `std:fs`→`as` playbook) and the day-one
