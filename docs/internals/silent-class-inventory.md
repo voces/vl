@@ -24250,6 +24250,18 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   `structIndexOfObjCtx` interns a literal — a field-NAME-set match would explain every
   measurement here.
 
+* **THE LIVE COMPARISON IS NAMED, and it is not the one three fixes attacked.**
+  `structIndexOfObjCtxGo` matches an object literal to a struct row by field NAME plus a
+  per-field code: `sFieldTypeAt(si, mfi)` against `anonFieldCode(f.fiValue)`. `anonFieldCode`
+  derives one code from the value's type and a lambda collapses to the single closure code
+  whatever it returns — so `{f: () => string}` and `{f: () => i32}` match here, memoised
+  through `structIndexOfObjCtxMemo`. `adoptedFieldCompat` (three attempts) is a DIFFERENT
+  matcher on a path this witness never takes.
+
+  Splitting the rows therefore needs two coordinated edits: the row must RECORD the closure's
+  result when it is created, and this loop must COMPARE it. Neither exists today —
+  `sFieldElemNameAt` is empty for a closure field, measured.
+
 * The real fix is per-CALL resolution: monomorphise the hole function per receiver shape, or
   give the two shapes distinct struct rows so they cannot share a `call_indirect` type. The
   row-splitting route is the one the code is shaped for, but only once the code question above
