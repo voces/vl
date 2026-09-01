@@ -762,15 +762,19 @@ Deno.test({ name: "wasm-symbols: scopeAt respects block scope (an inner binding 
 // The user's live case: a std:test import whose return type is the dep-declared
 // `Expectation` (rendered `Expectation$m1` before the pathway).
 //
-// TEMPORARY RETARGET (#2104 cross-PR interaction, found as a red master —
-// each PR was green on its own base): std:test v2 made `Expectation` generic,
-// and an instantiation currently renders STRUCTURALLY — a 7-field receipt dump
-// in hover/inlay/completion, which is a REGRESSION being fixed forward, not a
-// contract. Until the nameable render is restored, the std-side assertions
-// pin only the properties this file exists to prove ($-free renders, named
-// parameters); exact spellings stay pinned on the local-dep fixture below.
-// WHEN THE NOMINAL RENDER RETURNS, restore the four exact `Expectation` pins
-// this comment replaced (see the #2104/#2105 interaction postmortem).
+// THE RETARGET IS PARTLY LIFTED (D949). std:test v2 made `Expectation` generic, and an
+// INSTANTIATION briefly rendered structurally — a 7-field receipt dump in hover, inlay and
+// completion, which was a regression and not a contract. `Expectation<i32>` is pinned exactly
+// again at all three, and it is strictly better than the pre-v2 `Expectation`: the argument is
+// part of what the reader wants.
+//
+// THE TWO `expect` SIGNATURE PINS STAY PROPERTY-SHAPED, and that is a real bound rather than
+// leftover caution. Those render the UNINSTANTIATED generic, whose argument is a `TyVar`, and
+// `genAppNameOfTy` declines an application it cannot spell — its own stated rule, shared with
+// the emit-side name-faithful renderer where a var-named argument would be wrong. Rendering
+// `Expectation<T>` for a reader is desirable and is NOT what this pathway may decide alone; it
+// needs a user-only mode on that renderer. Until then these pin $-freeness and named
+// parameters, which is what this file exists to prove.
 const STD_HOVER_FIXTURE = 'import { expect } from "std:test"\nconst e = expect(1)\nprint(1)\n';
 
 // A local dep with a nominal type, a struct member OF that type, and an entry
@@ -797,8 +801,8 @@ const demangleRead = (key: string) => (key.endsWith("util.vl") ? DEMANGLE_UTIL :
 Deno.test({ name: "wasm-symbols: hover demangles a dep-nominal type (Expectation, not Expectation$m1)", ignore }, async () => {
   const checker = loadWasmChecker(SEED, log)!;
   const eTy = await checker.hoverTypeAt(STD_HOVER_FIXTURE, "/proj/main.vl", noSiblings, 1, 6);
-  if (!eTy || eTy.includes("$")) {
-    throw new Error(`expected a $-free render for e, got ${JSON.stringify(eTy)}`);
+  if (eTy !== "Expectation<i32>") {
+    throw new Error(`expected Expectation<i32> for e, got ${JSON.stringify(eTy)}`);
   }
   const bTy = await checker.hoverTypeAt(DEMANGLE_ENTRY, "/proj/main.vl", demangleRead, 1, 6);
   if (bTy !== "Box") throw new Error(`expected Box for b, got ${JSON.stringify(bTy)}`);
@@ -814,8 +818,8 @@ Deno.test({ name: "wasm-symbols: inlay hints demangle (dep nominals AND the entr
   const checker = loadWasmChecker(SEED, log)!;
   const std = await checker.inlayHintsAt(STD_HOVER_FIXTURE, "/proj/main.vl", noSiblings);
   const eHint = std.find((h) => h.line === 2 && h.kind === 0);
-  if (!eHint || eHint.type.includes("$")) {
-    throw new Error(`expected a $-free hint for e, got ${JSON.stringify(std)}`);
+  if (!eHint || eHint.type !== "Expectation<i32>") {
+    throw new Error(`expected an Expectation<i32> hint, got ${JSON.stringify(std)}`);
   }
   const dep = await checker.inlayHintsAt(DEMANGLE_ENTRY, "/proj/main.vl", demangleRead);
   const types = dep.map((h) => h.type);
@@ -844,8 +848,8 @@ Deno.test({ name: "wasm-symbols: completion details demangle through the shared 
   // detail (not just the name, which lsp_crossfile_wasm_test.ts already pins).
   const scope = await checker.scopeAt(STD_HOVER_FIXTURE, "/proj/main.vl", noSiblings, 2, 0);
   const e = scope.find((b) => b.name === "e");
-  if (!e || e.type === "" || e.type.includes("$")) {
-    throw new Error(`expected a $-free detail for e, got ${JSON.stringify(e)}`);
+  if (!e || e.type !== "Expectation<i32>") {
+    throw new Error(`expected e: Expectation<i32> in completion, got ${JSON.stringify(e)}`);
   }
   const ex = scope.find((b) => b.name === "expect");
   if (!ex || ex.type.includes("$") || !ex.type.includes("=>")) {
