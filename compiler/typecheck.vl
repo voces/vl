@@ -13433,6 +13433,23 @@ function unionAliasMembersFaithful(ty: i32) {
 // parameter-position field read this predicate exists to make work — to convert three
 // loud emit rejects into three loud check rejects, so the render's dropped struct name
 // is filed against the emitter rather than bought here.
+// Does this union list a MAP directly among its members? Used to hold self-referential map
+// arms transparent until `registerInlineUnion`'s name recursion is bounded (D984).
+function innerUnionHasMapMember(ty: i32): boolean {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    const ms = t.uMembers
+    let i = 0
+    while i < ms.length {
+      const m = T.tys[ms[i]]
+      if m is TyMap { return true }
+      i = i + 1
+    }
+  }
+  false
+}
+
 function nulAliasMemberFaithful(ty: i32) {
   if ty < 0 { return false }
   const t = T.tys[ty]
@@ -13453,7 +13470,21 @@ function nulAliasMemberFaithful(ty: i32) {
     if it is TyUnion {
       if it.uMembers.length > 1 {
         if !tyIsLitUnion(t.nInner) {
-          if tyReachesSelf(ty) { return false }
+          if tyReachesSelf(ty) {
+            // …EXCEPT THROUGH A MAP ARM, and this clause is a REGRESSION FIX. Registering a
+            // self-referential MAP arm walks `registerInlineUnion` -> `registerMapValUnion`
+            // -> `registerInlineUnion` by NAME with no depth bound and exhausts the wasm
+            // stack (D984). A `null` arm used to mask that by keeping the alias transparent,
+            // so the declaration was never registered; un-gating transparency without
+            // fixing the recursion took `type T = string | null | {[string]: T}` and the
+            // owner's own `Json` spelling from RUNNING to a compiler trap. Neither had a
+            // fixture, which is why eleven gates stayed green.
+            //
+            // Self-referential ARRAY arms have no such loop and stay un-transparent — that
+            // is what D982/D985 need. Lift this clause when D984's recursion is bounded, not
+            // before.
+            if !innerUnionHasMapMember(t.nInner) { return false }
+          }
         }
       }
     }
