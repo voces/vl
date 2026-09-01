@@ -23899,6 +23899,36 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   destination cannot see the missing-annotation defect — and this is its sibling: a fixture
   that returns a NAMED value cannot see the literal-return defect.
 
+* **THREE SPELLINGS, AND THE DISASSEMBLY NAMES THE MISMATCH EXACTLY.** Module global
+  (`const g: u8[] | null = [7, 8]`), local binding, and the literal return above all report
+  `Checked 1 file, no errors` and then `type mismatch: expected (ref null $type), found (ref
+  $type)`. Under `wasm-dis` the local is declared `(ref null $5)` — the PACKED-byte wrapper,
+  correctly derived from `nulu8list` — while the value is built `struct.new $3` over
+  `array.new_fixed $0`, the shared i32 list. **Two heap types for one value.** The cell's type
+  is right and the CONSTRUCTION is wrong, so this is a literal-lowering gap, not a rep gap.
+
+* **SEVEN MISSING `nulu8list` ARMS EXIST AND ARE NOT THE CAUSE — both halves matter.** A
+  survey found `isNulScalarListFieldCode` reading `c == 31 || 32 || 33 || 34` while both
+  siblings directly above it mint and decode **35**; six more sites take the same shape
+  (`emit_collect.vl` two predicate ladders and two `ba8Used` flag ladders, `wasmEmit.vl` an
+  element-kind pick and one predicate ladder). All seven are real omissions from when the
+  kind was added. **Adding all seven changes none of the three witnesses**, and the rebuilt
+  compiler is byte-identical — the compiler's own source contains no `u8[] | null`, so
+  nothing exercises them. They are worth fixing on their own evidence, with a counter ladder
+  to prove liveness; they are not this row.
+
+* **THE ORDERING TRAP THAT LOOKS LIKE THE ANSWER AND ISN'T.** `letIsNulList` ->
+  `retNulListFlag` -> `nodeTyIsNulI32List` returns TRUE for `u8[] | null`, because `u8`'s
+  elements read as `i32`, and it sits ABOVE the `nulScalarListKindOfNode` arm in both global
+  ladders. That is a genuine latent collision — the other four nullable scalar lists have
+  distinct element prims and never hit it. **Reordering both ladders also changes none of the
+  three witnesses.** So the binding's KIND was never the problem; consistent with the
+  disassembly, which shows the cell already correctly typed.
+
+  **Look at the literal's destination, not the binding's kind.** Something decides an
+  `ArrayLit` builds the shared i32 wrapper, and the non-null spelling (`const g: u8[] = [5, 6]`,
+  which RUNS) is the control that shows the same decision made correctly one annotation away.
+
 ### D982 — a JSON value tree: `is` against a SELF-REFERENTIAL array arm is refused, and only when the union also has a `null` arm
 
 **loud check reject · owner-scheduled (a JSON value tree is the shape serde Stage 1 hangs on) · clause 2**
