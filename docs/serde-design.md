@@ -158,6 +158,14 @@ Facts that constrain the design, each verified this session:
    self-referential `{[string]: T}`) × test (`is string` / `is T[]` / `is {[string]: T}`),
    base arm `string` throughout. Outcome classes kept distinct and never merged into
    "fails". **RUNS 12 · check-refuse 6 · emit-refuse 5 · COMPILER TRAP 7.**
+   **CORRECTED SAME DAY (D985): the with-`null` `is string` cells graded emit-refuse
+   above are actually CHECK-CLEAN INVALID WASM** — `vl check` prints "Checked 1 file, no
+   errors" and the build fails at `wasm[0]::function[4]` — measured twice by the
+   compile-goal session, once against an origin/master-built compiler, both container
+   kinds. This grid's harness classified by STDERR SHAPE, which cannot tell "emit
+   refused" from "emit succeeded and produced garbage": **run the module** before
+   trusting an outcome class. Grade any fix on `is string` (the silent face), not only
+   `is <arm>` (the loud one).
 
    | null | array arm | map arm | `is string` | `is <the self arm>` |
    | --- | --- | --- | --- | --- |
@@ -172,6 +180,19 @@ Facts that constrain the design, each verified this session:
    | `null` | — / `i32[]` | — / `{[string]: i32}` | **RUNS** (4 cells) | n/a |
    | `null` | `T[]` | any | emit-refuse | check-refuse |
    | `null` | any | `{[string]: T}` | emit-refuse | check-refuse |
+
+   **ROOT CAUSE, found same day — ONE mechanism, not three (D982 corrected, D983,
+   D984, D985, all filed and merged).** The emit-side VARIANT TABLE IS EMPTY for a union
+   with `null` + a self-referential container arm — the failing lookup prints
+   `wanted [J[]] have` with nothing after "have". The no-`null` spelling interns its
+   arms normally; `null` + self-reference suppresses arm interning wholesale, so EVERY
+   `is` against that union is unlowerable: D982's loud check refusal and D985's silent
+   invalid wasm are two faces of the missing table, and the fix lands in the INTERNING.
+   (The tempting one-line checker change — `assignableGo` bails on a `TyNullable` source
+   above the union arm — was found and deliberately NOT shipped: it converts clause 2
+   into clause 2, the order CLAUDE.md forbids.) D984 is the separate no-`null` map-arm
+   compiler trap below, with opposite null polarity, so neither witness can see the
+   other.
 
    **Mechanism 1 — the `null` + self-referential-CONTAINER refusal (filed D982).** With a
    `null` arm, a self-referential arm makes `is string` an emit refusal and `is <that arm>`
