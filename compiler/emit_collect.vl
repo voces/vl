@@ -379,6 +379,7 @@ import {
   anonFieldCode,
   anonFieldElemKeyI32,
   anonFieldElemName,
+  anonLeafFoldBlocked,
   anonLeafServingRow,
   armLayoutContested,
   arrElemIsClosureTy,
@@ -8299,6 +8300,87 @@ function anonLeafPolyUnionSet(ow: i32, fname: string, val: i32): string {
   set
 }
 
+// D901 — IS THE `??` THAT JOINS THIS FAMILY READING A CONTAINER? Then the merged row has a
+// SECOND consumer wanting a different field type, and the box is the only rep that serves both.
+//
+// The map value slot is keyed by the CHECKER's value type, and the fold does not move that:
+// `c["k1"] = { r: 7 }` beside `(c)["k0"] ?? { r: 1.5 }` leaves the map's values `{r: i32}`
+// while the `??` result is `{r: f64}`. One row cannot hold one field at two codes, and
+// D804/D833's whole argument is that the BOX is what lets it — so where a container read is
+// the left operand the fold stands down and master's box stays. Measured both ways:
+// `d833_none_i32_f64` lost its mv slot outright and `d833_genpin_i32_f64` built the `??`
+// default's `f64.const` into the map's own i32 row (`expected i32, found f64`) — two `runs`
+// cells, and this gate is what keeps them.
+//
+// The scan is `anonLeafOwnersJoined`'s, arm for arm, so the two cannot disagree about WHICH
+// `??` names this family — the gate has to be asked of the same join the set was built from.
+function anonLeafJoinLhsIndexed(
+  ow: i32,
+  fname: string,
+  owAtom: string,
+): boolean {
+  let qi = 0
+  while qi < P.nodes.length {
+    const qn = P.nodes[qi]
+    if qn is BinExpr {
+      if qn.binOp == "??" {
+        let names = false
+        const d = unwrapParen(qn.binRight)
+        if d == ow { names = true }
+        if d >= 0 {
+          const dn = P.nodes[d]
+          if dn is ObjLit {
+            if anonObjFieldSetEq(d, ow) {
+              if anonLeafAtomName(objFieldVal(d, fname)) != owAtom {
+                names = true
+              }
+            }
+          }
+        }
+        if names {
+          const lh = P.nodes[unwrapParen(qn.binLeft)]
+          if lh is Index { return true }
+        }
+      }
+    }
+    qi = qi + 1
+  }
+  false
+}
+
+// D901 — THE ONE ATOM THE CHECKER'S JOIN LEAVES, or "" when the set really is a union.
+//
+// `joinTys` is `assignable`-driven, so a PAIR on the lossless widening lattice
+// (`typecheck.numWidensName`) is ONE type to the checker and not a union at all: `{r: i32}`
+// joined with `{r: f64}` is `{r: f64}`, and `g1.r` type-checks as `f64`. The mint built a
+// `{tag, payload}` box over `i32|f64` anyway, and a box nothing agrees is a box is a
+// mint/read DISAGREEMENT: the reader follows the CHECKER, unboxes the f64 arm with an
+// UNCONDITIONAL `ref.cast`, and the value that arrives is the i32 one — `wasm trap: cast
+// failure` at run time on a `vl check` rc 0 program. Fold it and the field is a plain f64
+// that `emitObj`'s own code-17 arm widens the int literal into, exactly as a DECLARED
+// `{r: f64}` field does.
+//
+// EXACTLY TWO ATOMS, ONE OF THEM `i32`, AND THE FOLD IS ONLY EVER OFF `i32` — not the whole
+// lattice, and that bound is a MEASURED `runs`-lost cell rather than caution. `f32→f64` is a
+// lattice edge too, and folding it broke `function src(): {r: f32} | null { { r: 2.5 } }`
+// beside `?? { r: 7 }`, which RUNS on master: the atom column reads a bare float literal as
+// `f64` unconditionally (`anonLeafAtomName` has no destination to consult), so in an f32
+// destination the set is `f64|i32|f32` and the widest atom is NOT the checker's answer —
+// which is `f32`, because the literals conform to the annotation. `Invalid input WebAssembly
+// code … expected f32, found f64`. The `i32` edges have no such hazard: nothing else in the
+// atom vocabulary reads as `i32`, so an `i32` atom is an int literal and the wider partner is
+// what the checker names. A set of three or more keeps master's box, whatever it holds.
+function anonLeafFoldedAtom(atoms: string[]): string {
+  if atoms.length != 2 { return "" }
+  if atoms[0] == "i32" {
+    if atoms[1] == "i64" || atoms[1] == "f64" { return atoms[1] }
+  }
+  if atoms[1] == "i32" {
+    if atoms[0] == "i64" || atoms[0] == "f64" { return atoms[0] }
+  }
+  ""
+}
+
 // The MERGED MEMBER SET itself, with no question asked about who already holds it — the half
 // `anonLeafMergeField` needs before it can look for a holder, and the half the caller above
 // needs after. See `anonLeafPolyUnionSet` for the gates.
@@ -8362,6 +8444,18 @@ function anonLeafPolyUnionSetOpen(ow: i32, fname: string, val: i32): string {
   }
   if atoms.length < 2 { return "" }
   if !anonLeafOwnersJoined(ow, fname, owAtom) { return "" }
+  // D901 — A PAIR THE CHECKER'S JOIN FOLDS TO ONE TYPE IS NOT A UNION, and minting a box
+  // over it is what traps. See `anonLeafFoldedAtom` for the bound and the `runs`-lost cell
+  // that set it.
+  const folded = anonLeafFoldedAtom(atoms)
+  if folded != "" {
+    if (
+      !anonLeafJoinLhsIndexed(ow, fname, owAtom) &&
+      !anonLeafFoldBlocked(ow, fname, 0, nameFieldCode(folded))
+    ) {
+      return folded
+    }
+  }
   // `null` LAST, so the set reads the way the declared spelling of the same shape does
   // (`{ r: i32 | null }`) and two literals minting in either order key ONE set.
   let out = ""
@@ -8388,19 +8482,24 @@ function anonLeafPolyUnionSetOpen(ow: i32, fname: string, val: i32): string {
 // could have written, and "a union of atoms" is NOT the same rep question as "code 16".
 // Measured: minting 16 for `string|null` put a `{tag, value}` box behind consumers reading
 // the code-20 NICHE and turned that pair's loud reject into CHECK-CLEAN INVALID WASM — the
-// one trade worth vetoing. `boolean|null` is the code-21 sentinel for the same reason.
+// one trade worth vetoing.
 //
-// Only the two codes whose COMPANION column this mint can fill are admitted: 16 records the
-// set in `sFieldElemName`, 20 is a bare niche that records "". Anything else — a litunion
-// niche (30), a nullable list, a shape this rung has no atom vocabulary for — answers -1 and
-// the field keeps the code `anonFieldCode` gave it.
+// The codes whose COMPANION column this mint can fill are admitted: 16 records the set in
+// `sFieldElemName`, 20 is a bare niche that records "", 30 records the non-null alias, and
+// the plain scalars record nothing. Anything else — a nullable list, a shape this rung has
+// no atom vocabulary for — answers -1 and the field keeps the code `anonFieldCode` gave it.
 //
-// `boolean|null` (code 21) IS SPELLABLE HERE AND IS STILL DECLINED, measured. The row mints
-// fine and the DECLARED twin of the same program runs (`type R = { r: boolean | null }`), but
-// an `#anon` row carrying a code-21 field interns no map-value slot — the pair then trades
-// its `bare null needs a struct-typed context` for `unsupported map value type`, one loud
-// reject for another and a less informative one. The mv-slot rep is a separate rung; until
-// it exists this arm keeps master's message exactly.
+// D902 — `boolean|null` (code 21) WAS DECLINED HERE AND IS NOW ADMITTED, and the reason it
+// was declined turned out to be one line elsewhere. D804 measured the trade exactly right:
+// an `#anon` row carrying a code-21 field interned no map-value slot, so the pair swapped
+// `bare null needs a struct-typed context` for `unsupported map value type`, one loud reject
+// for another. What made that "a separate rung" was the assumption that the mv layer could
+// not tell a boolean field from an i32 one — true of `fieldCodeWidensElem`, which is handed
+// two CODES and where the refusal stands, and false of `shapeFieldTypeCompatK`, which is
+// handed the field's TEXT. With the boolean spelling admitted there the map witness RUNS.
+// D804's other claim is corrected by D902's row: the DECLARED twin does NOT run at this
+// shape — `type R = { r: boolean | null }` beside `?? { r: null }` took the same loud reject
+// on master, so this was never a mint-only gap.
 function anonLeafPolyFieldCode(set: string): i32 {
   const c = nameFieldCode(set)
   if c == 16 || c == 20 { return c }
@@ -8408,9 +8507,22 @@ function anonLeafPolyFieldCode(set: string): i32 {
   // non-null alias name, exactly the recording `pushFieldRow`'s declared path makes
   // (`fieldRecElemName`'s code-30 arm). It joins 16 and 20 on the same test the header
   // states — admitted because the column can be filled, not because the code is nullable.
-  // The `boolean|null` sentinel (21) still declines: it records no companion and an `#anon`
-  // row carrying it interns no map-value slot, which is the measured trade below.
   if c == 30 { return c }
+  // D901 — AND THE TWO PLAIN SCALAR CODES A FOLDED SET CAN SPELL. `anonLeafFoldedAtom` drops
+  // the atom the checker's join absorbs, so a two-atom family on the widening lattice arrives
+  // here as ONE atom — and only ever as the WIDER end of an edge, which is `i64` (23) or `f64`
+  // (17). They are admitted for the reason 16/20/30 are: this mint can fill the field's
+  // recording completely — a plain scalar records no companion, and `emitObj`'s own f64/i64
+  // arms already widen an int literal at the construction boundary. Codes 0/3/24 are NOT
+  // admitted: nothing widens INTO i32, boolean, string or f32, so the fold cannot produce them
+  // and a set that spells one is a single-atom family the `atoms.length < 2` gate already ended.
+  if c == 17 || c == 23 { return c }
+  // D902 — AND 21, THE `boolean | null` SENTINEL: the `null` operand of a `??`-joined pair
+  // has no rep at all without it (`bare null needs a struct-typed context`), because the
+  // field falls back to `anonFieldCode`'s plain boolean and `emitObj`'s code-21 seed for
+  // `pendingNulBool` never fires. See the header for the mv-slot trade that used to make
+  // this a worse deal than the reject.
+  if c == 21 { return c }
   -1
 }
 
