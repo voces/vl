@@ -11,6 +11,17 @@
 // algorithms below. Nothing in this file names its own export in a string, so
 // the rename stays one `export` line plus importers.
 //
+// Measured 2026-09-01, for the rename's reviewer: the builtin's domain is
+// `i32 | boolean` — a STRICT SUBSET of this export's `i32 | i64 | boolean |
+// f64` (`toString(n)` on an i64 and `toString(1.5)` both refuse today) — so no
+// program loses a capability and the rename is purely additive at the type
+// level. And `n.toString()` refuses today (`member access '.toString' on
+// non-object i32`) because builtins are not `self`-first, so the rename also
+// BUYS the UFCS spelling — the actual user-facing win. The one break it
+// carries: `toString(42)` compiles with NO import today and will need
+// `import { toString } from "std:fmt"` after; std has no deprecation story, so
+// that break ships once, here, deliberately.
+//
 // WHAT IS WRITTEN HERE is the number rendering — `toStr` over the two integer
 // widths, boolean, and (new) `f64` — plus `parseF64`, the inverse. The f64
 // halves are the interesting ones and their whole design is in the
@@ -69,9 +80,9 @@
 // GROWS, so it is dated. There is no cross-module dead-code elimination, so a
 // program that imports ONLY `toStr` emits `std:str` too AND every byte of the
 // f64 halves below. `import { toStr } from "std:fmt"` + one `n.toStr()` on an
-// i32, built to wasm on 2026-09-01: **17,078 bytes** — 2,850 before the
+// i32, built to wasm on 2026-09-01: **17,062 bytes** — 2,850 before the
 // `std:str` move, 7,548 before the f64 half, and the breakdown of the last
-// 9,530 is in the `f64 ↔ TEXT` header, where it is the argument for `parseF64`
+// 9,514 is in the `f64 ↔ TEXT` header, where it is the argument for `parseF64`
 // living here. That is a real regression and it is recorded here rather than
 // left to be discovered, but it is a symptom of the missing DCE and not of the
 // module shape — the same program already carried this module's own unused
@@ -276,18 +287,25 @@ export function padLeft(self: string, width: i32, fill: string) {
 // integer, which is a denial-of-service surface for the JSON reader this is
 // being built for.
 //
-// ── THE GRAMMAR `parseF64` ACCEPTS is closed under `toStr`: every string this
-// module can PRODUCE parses back, and every VL float LITERAL parses. Precisely:
+// ── THE GRAMMAR `parseF64` ACCEPTS is closed under `toStr` — every string this
+// module can PRODUCE parses back — and it is JSON's number grammar plus
+// Infinity/NaN, NOT VL's literal grammar. Precisely:
 //
 //     "-"? ( "Infinity" | digits ("." digits)? ([eE] [+-]? digits)? )
 //     "NaN"
 //
-// Deliberate exclusions, each because it is neither producible nor a literal:
-// a leading "+", leading or trailing whitespace, a bare "1." or ".5" (VL's
-// lexer refuses both — measured), "0x10", digit separators, and "-NaN". A
-// caller with a scruffier dialect trims and rewrites first; std does not guess.
+// VL's literals are a strict superset in one direction: digit separators are
+// legal VL (`1_000.5` and `1_0e1_0` both run — measured) and are REFUSED here,
+// because a separator is a source-code affordance and this parser reads DATA.
+// Deliberate exclusions: a leading "+", leading or trailing whitespace, a bare
+// "1." or ".5" (VL's lexer refuses both — measured), "0x10" (a VL INTEGER
+// literal, never a float one), digit separators, and "-NaN". A caller with a
+// scruffier dialect trims and rewrites first; std does not guess.
 // Leading zeros ARE accepted ("007", "0.5"), matching every strtod and costing
-// nothing.
+// nothing. If user-defined casts (error-handling-design.md §Future extensions
+// (b), open) ever land, `s as f64` is a two-line delegation to THIS function,
+// not a second parser — and the null channel is precisely what makes
+// `s as? f64` read correctly. One float parser in the tree either way.
 //
 // ── `f64 | null` IS THE CHANNEL, and the reason it is not `f64 | ParseError`
 // is that there is nothing to put in one. `error-handling-design.md` rules
@@ -323,7 +341,17 @@ export function padLeft(self: string, width: i32, fill: string) {
 //
 //     before the f64 half               7,548 bytes
 //     + the f64 FORMATTER              14,256   (+6,708 — forced: it IS `toStr`)
-//     + the PARSER                     17,078   (+2,822)
+//     + the PARSER                     17,062   (+2,806)
+//
+//     The endpoints are exact (probe below, re-run 2026-09-01); the two
+//     sub-rungs were measured before a 16-byte fmt.vl edit, so their SPLIT is
+//     indicative while their sum is pinned by the endpoints. The probe, run
+//     from the repo root — note VL_STD, without which the host resolves std:
+//     from the BINARY's own checkout and silently measures the wrong tree:
+//       VL_STD=$PWD/std scripts/vl-host/target/release/vl build p.vl -o p.wasm
+//       # p.vl:  import { toStr } from "std:fmt"
+//       #        const n = 42
+//       #        print(n.toStr())
 //
 // The formatter cannot move: a flat namespace has one `toStr`, so the f64 arm
 // and everything under it are in this module by construction. That makes the

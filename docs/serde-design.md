@@ -525,9 +525,10 @@ Staged, sized honestly:
   **STILL OPEN in stage 0.** `f32` ↔ string: an f32's shortest rendering is shorter than
   its widened f64's (`0.1` vs `0.10000000149011612`), so it is a different boundary
   computation and not a wrapper — the same Burger–Dybvig core with 24-bit significand
-  parameters, plus the f32-nearest rounding on the way in. Fix the
-  lexer's inability to read scientific notation so VL's own float rendering is
-  re-parseable (independent language bug surfaced by this survey).
+  parameters, plus the f32-nearest rounding on the way in.
+  ~~Fix the lexer's inability to read scientific notation~~ **LANDED 2026-09-01**
+  (#2173) — `1e3`/`1.5e-7`/`2E+10` end to end, correctly rounded, so VL's own float
+  rendering is re-parseable as source.
   ~~`std:base64` (small)~~ **LANDED 2026-09-01** — RFC 4648 §4, standard alphabet, padded,
   `encodeBase64(self: u8[]): string` / `decodeBase64(self: string): u8[] | Base64Error`,
   strict about non-canonical trailing bits so decode-then-encode is an exact identity. Note
