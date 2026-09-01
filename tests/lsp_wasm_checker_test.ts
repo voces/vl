@@ -69,7 +69,7 @@ Deno.test({ name: "wasm-checker: a type error carries a message and a non-empty 
 
 Deno.test({ name: "wasm-checker: an emitter-capability rejection surfaces its stable code", ignore }, async () => {
   const checker = loadWasmChecker(SEED, log)!;
-  // Type-valid, but codegen cannot lower an INFERRED nullable-MAP return — raised on the
+  // Type-valid, but codegen cannot lower an INFERRED nullable distinct-backing LIST return — raised on the
   // distinct channel whose `unsupported-lowering` code rides the
   // `diagCodeLen`/`diagCodeByte` ABI into `VLDiagnostic.code`. (The annotated
   // `: {[string]: i32} | null` spelling of the same function lowers and runs, which is what
@@ -80,17 +80,19 @@ Deno.test({ name: "wasm-checker: an emitter-capability rejection surfaces its st
   // an inferred nullable-STRUCT return until D887 recorded that shape's row and gave the A20
   // pass and `emitReturnValue` the arms the annotated path already had. Any still-open
   // capability gap serves; what this asserts is the CHANNEL, not the gap.
-  // D937 CLOSED the i32-valued spelling, so the witness has moved a THIRD time — by one word,
-  // to a `string`-valued map. The five sites D937 wired are restricted to the i32-valued mono
-  // shape (that is the shape whose slot is the mono default), so every other value type still
-  // floors on this exact channel with the message unchanged.
+  // D956 CLOSED THE MAP ENTIRELY, so the witness has moved a FOURTH time — to `i64[] | null`.
+  // D937 took the i32-valued map and this comment then pinned a `string`-valued one; D956 took
+  // every value type, because the restriction it rested on had already expired. What still
+  // floors on this channel is the DISTINCT-BACKING scalar list — `i64[]`, `f64[]`, `f32[]`,
+  // `string[]` — whose inferred nullable return has no renderer arm. The annotated twin of
+  // each one runs, so it is a capability gap and the witness will move a fifth time.
   // `scripts/capability-probes/inferred-nullable-container-return.vl` is the standing probe
   // for the closed half; when the rest closes, this witness moves again.
   const diags = await checker.check(
     [
       "function pick(c: boolean) {",
       "  if c { return null }",
-      "  const m: {[string]: string} = Map()",
+      "  const m: i64[] = [1]",
       "  m",
       "}",
       "function go() {",
