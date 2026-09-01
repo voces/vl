@@ -23964,11 +23964,17 @@ and the refusal turns into a miscompile:
   measured nothing) and none fires, so `mkFunc` receives `-1`.
 
   `synthRetAnnots` IS called (validated the same way), yet none of its fourteen non-void
-  `fn.fnRet = synthTypeRefTy(...)` rungs fires either. **THE PIPELINE BISECT IS THE NEXT STEP
-  AND IT IS ONE PROBE:** dump `pick`'s `fn.fnRet` at the ENTRY and EXIT of `synthRetAnnots`. If
-  it is already 17 on entry, the writer runs before it; if it changes across the call, a rung
-  that `grep '\.fnRet = '` does not match is doing it. Everything else on this row is already
-  eliminated, so that one measurement should finish the diagnosis.
+  `fn.fnRet = synthTypeRefTy(...)` rungs fires either.
+
+* **HALF THE BISECT IS DONE: `pick`'s `fn.fnRet` is STILL `-1` on ENTRY to `synthRetAnnots`.**
+  So the `string` pin lands at or after that pass, not before it — which, with all fourteen of
+  its rungs silent, means the writer is **downstream of `synthRetAnnots`** and is not any
+  `.fnRet = ` assignment `grep` can see.
+
+  The other half is blocked by the instrument, and the workaround is worth recording: `emitFail`
+  ABORTS the build at its first firing, so an ENTRY probe and an EXIT probe cannot both report
+  in one run — the EXIT line simply never appears. Run them as two separate builds, or use a
+  counter that only fires on the second visit.
 
 * **A NOTE ON THE OTHER SIDE, from the emitter's own comment at the `retUnionFlag` rung:** when
   the functype and the body move to the box, the CALL-RESULT classifier (`computeRetInference`
