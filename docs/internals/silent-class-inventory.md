@@ -420,6 +420,11 @@ wasm → trap; within a class, flat-across-many-reps before single-rep.
 
 ---
 
+<!-- RESERVED D981–D1000 — the clause-1/clause-2 goal session (nullret worktree).
+     RESERVED D1001–D1020 — vl-b7.
+     Claim a block by adding a line here BEFORE minting numbers from it. Reservations kept
+     in an agent's head collided three times in one day; the file is the only shared place. -->
+
 ### D1 — [CLOSED 2026-08-25] a struct field whose type is an alias declared LATER in the file resolves to the wrong rep
 **CLOSED 2026-08-25 — the repro now RUNS. Was: check-clean SILENTLY WRONG VALUE · 2 cells + 1 invalid wasm + 30 loud check rejects, of 45 in the `fwd` leg (12 correct)**
 
@@ -23824,6 +23829,19 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   probed at the arm's entry, it fires for no program, including ones that fail for other
   reasons. A checker-typed net added beside `exprString` therefore changed nothing. **Find
   what actually emits a `print` STATEMENT before touching any print classifier.**
+
+* **THE BINDING CELL IS A SECOND SITE, and `letIsString` is not it either.** `const v = x.f()`
+  types the cell `i32` while the `call_indirect` returns `(ref $string)` — the same disagreement
+  the `print` cell has, one consumer over. Adding a checker-typed net to `letIsString`
+  (`nodeTyIsStringPrim(d.letInit)` after `exprString`) changes nothing, and an `emitFail` probe
+  inside it never fires: **an earlier rung of `collectLocals`' ladder claims this binding
+  first.** Find which rung before writing another classifier arm — the ladder is ordered and
+  the first match wins, which is the same thing that made D970 look like three different
+  defects.
+
+* **AND D980 IS ITS NEIGHBOUR, NOT ITS TWIN.** The tail-position cell (`x.f()` as a function's
+  last expression) traps with or WITHOUT the annotation and is closed separately; this row's
+  cells need the annotation ABSENT. Position is D980's axis; the CONSUMER is this one's.
 
 * **AN INSTRUMENT NOTE THAT COST TWO BUILDS HERE.** `emitFail` RECORDS and does not halt, so a
   probe built on it is silent on any program that goes on to compile — a "control that must
