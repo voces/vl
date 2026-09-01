@@ -23828,13 +23828,28 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   the family's worst member: [D982](#d982) refuses loudly and [D984](#d984) traps the
   compiler, but this one compiles clean and hands back a broken module.
 
-* **WHY IT WAS MISSED, AND THE INSTRUMENT LESSON.** The emit-side variant table is EMPTY for
-  this union — probing the failing lookup prints `wanted [J[]] have` with nothing after it,
-  where the no-`null` spelling interns its arms normally. So `null` plus a self-referential
-  container arm suppresses arm interning wholesale, and every `is` against that union is
-  then unlowerable; D982's refusal is the loud face of the same missing table. **Grade a fix
-  on `is string`, not only on `is J[]`** — the loud arm is the one that draws attention and
-  the silent arm is the one that ships.
+* **A RETRACTED ROOT CAUSE, KEPT HERE BECAUSE THE MISTAKE IS REUSABLE.** This row first said
+  the emit-side variant table is EMPTY for this union and that `null` plus a self-referential
+  container "suppresses arm interning wholesale". **That is wrong.** The table is empty for the
+  WORKING spelling too, and by design: interning is gated on `isStructAtom`, which is
+  `isDeclaredStructName(a) || nameIsShapeSpanEnds(a)` — so `string`, `boolean` and `J[]` never
+  intern in any spelling, and an empty table cannot be what separates the two.
+
+  Two process errors produced it, both cheap to avoid:
+
+  1. **The one probe that printed `wanted [J[]] have` (nothing) was taken with [D982](#d982)'s
+     CHECKER FIX APPLIED** — the only configuration in which `is J[]` reaches that emitFail at
+     all. I then read it as a fact about master. A measurement taken under an experimental
+     patch describes the patch.
+  2. **The comparison against the working union was never actually run.** `/tmp/j.vl` had been
+     overwritten by an earlier loop with the NON-recursive spelling, so the "control" was a
+     different program — the [run-the-repro-verbatim](#) trap, self-inflicted. Distinct
+     witnesses now live in distinct files.
+
+  **The emit-side cause of this row is therefore NOT yet identified.** What is known: the
+  refusal path carrying `is` names a type that is not a union variant`is not reached for any
+  of the three spellings on master — the lowering for a non-struct arm goes somewhere else,
+  and that somewhere is where to look next.
 
 * A neighbouring grid classified this cell as an emit refusal rather than invalid wasm.
   Re-measured here twice, against master and against a probe build: it is invalid wasm. Where
