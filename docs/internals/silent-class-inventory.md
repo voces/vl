@@ -24255,10 +24255,25 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   "lost across the phase boundary" reading came from testing only the anonymous shape, whose
   name renders `""` for reasons that have nothing to do with phases.
 
-  **So the pin is necessary and NOT sufficient.** With `tn` non-empty and the pin firing, the
-  emitted module is byte-for-byte what it was: still `__print_i32__`. Whatever declines is
-  DOWNSTREAM of `paramStructIndex`, and the publish alone is not worth shipping — it changes
-  behaviour and fixes nothing, which is the bar this file keeps failing to hold to.
+  **`exprString` IS THE WHOLE SITE — forcing it settles it.** Making `exprString` return
+  `true` for a Call whose callee is a Member with this field makes BOTH witnesses print `ok`,
+  named and anonymous alike. So nothing downstream of the classification is wrong: the print
+  dispatch at `if exprString(c.callArgs[0], fnIx) { return emitPrintStrExpr(…) }` is the only
+  decision that has to change, and every earlier note pointing "downstream of
+  `paramStructIndex`" was pointing at nothing.
+
+  **The declining rung is `fieldClosureFeOfRecv` inside that arm**, which for an Ident
+  receiver looks for a local `let` and then a global `let` of that NAME — a param is neither —
+  and then falls to `fieldClosureFeOf(structIndexOfExpr(recv, fnIx), prop)`.
+  `structIndexOfExpr` -> `paramStructIndex` -> `paramStructIndexRaw` requires
+  `p.parType >= 0`, which a hole param does not have.
+
+  **AND THE PIN ALONE DOES NOT REPAIR THAT CHAIN, even forced to the nominal name.** With the
+  publish in place AND `recordedParamPinName` forced to return `"S"` — the exact name the
+  working annotated spelling carries — the module is still unchanged. So either
+  `structIndexByName` does not answer for a `type S = {…}` alias, or `fieldClosureFeOf`'s
+  ObjLit scan does not find the lambda's `fe`. That pair is the next thing to separate, and
+  both halves are one forced-return A/B each.
 
   **A probe cannot use `emitFail` on this cell.** The emit SUCCEEDS — it produces an invalid
   module rather than refusing — so recorded failures are dropped and the probe reads as never
