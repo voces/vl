@@ -2170,7 +2170,7 @@ one statement, never a scan, so the cursor lands back on the statement boundary.
 **Stage 1 of the lossless-recovery flag. `checkSrc`/`checkSrcSym`/`compileSrc`/`lintSrc`/
 `lintGraph`/`modCompile` run the checker past parse diagnostics IFF EVERY parse diagnostic in
 the file carries a per-diagnostic LOSSLESS flag; exactly one recovery site sets it. Emit never
-proceeds past any parse diagnostic.** (owner ruling 2026-09-01, "seems straightforward"; #TBD)
+proceeds past any parse diagnostic.** (owner ruling 2026-09-01, "seems straightforward"; #2217)
 
 The paragraph above states the problem and refuses to solve it: the bail keys on *any* parse
 diagnostic, and an unbraced-body recovery is provably lossless. The refusal was right about the
@@ -2921,7 +2921,7 @@ lines was not.
 spellings" — has a mirror, and the mirror needs a different layer.** `xs.indexOf(nd)` at
 `T = string | null` was `vl check` rc 0 over a module the engine refuses while the identical
 `a == b` written directly ran and was correct. Same sentence as D35, opposite sign: not a
-refusal the pin dropped, an ACCEPTANCE it dropped. (D42, #TBD)
+refusal the pin dropped, an ACCEPTANCE it dropped. (D42, #2217)
 
 `binEqNulNiche` decides whether a `==` needs the null-guarded lowering, and it asked one
 channel: the type the CHECKER banked on the operand node. `monoCloneBody` rebuilds only an
@@ -3005,7 +3005,7 @@ was doing something different and worse: stating a rule at the pin that existed 
 spelling.** "Any two arrays are a list concat" is not what the emitter does — there is exactly
 ONE concat core, `emitListConcatI`, the i32 backing — so `Circle[] + Circle[]` was
 check-clean invalid wasm through a generic, and written directly it fell past the list arm into
-the NUMERIC tail and emitted `i32.add` over two refs. (D44, #TBD)
+the NUMERIC tail and emitted `i32.add` over two refs. (D44, #2217)
 
 `concatRefusal` is the one home, read by `checkBinary`'s concat arm, by `binOpDefinedFor` and by
 the emitter's floor (`binConcatHasNoLowering`, the `+` twin of `binEqHasNoLowering`). Three
@@ -3050,7 +3050,7 @@ returns on the equality arm before the operator-dispatch tail and `drwDispatchOp
 `==`/`!=` at the emitter, so the structural compare ran and the program printed the answer the
 declaration was written to change. Meanwhile `eqRefusals` ended its refusal with
 `— define a `==` operator for it`. **A `vl check`-clean WRONG VALUE, with a diagnostic
-prescribing the thing that produces it.** (D46, #TBD)
+prescribing the thing that produces it.** (D46, #2217)
 
 **Rejected rather than implemented, and the deciding measurement is who the diagnostic's
 customer is.** The clause fires on a CONTAINER — `K[]`, `Circle[]` — and a container's compare

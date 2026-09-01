@@ -82,7 +82,7 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
 
 ### Awaiting owner rulings (durable list; each row names its doc)
 
-- **Constraints / nameable bounds — DONE 2026-09-01 (#TBD).** Shipped whole:
+- **Constraints / nameable bounds — DONE 2026-09-01 (#2217).** Shipped whole:
   `{ toString(): string }` call-shape members, `<T: Showable>` and inline bounds,
   expression satisfaction (field first, then UFCS), strict bodies, whole-program
   coherence, and bound chaining by subsumption. `docs/constraints-design.md` §7 is the
