@@ -23861,69 +23861,49 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   invalid wasm.
 
 ---
-### D965 — the SCALAR element-converting copy: specified, not attempted, and the "scratch reservation" blocker it was costed at DOES NOT EXIST
+### D965 — the SCALAR element-converting copy: BUILT, and the pair set is exactly three
 
-**loud check reject conceding capability — `not yet supported by codegen — a container's wasm type is fixed by its element's storage, so these are unrelated types and no element-converting copy exists` · ZERO corpus cells; `scripts/capability-probes/element-widening-copy.vl` is the measurement · NOT ATTEMPTED — this row is a specification, written after the one unknown that made it look expensive turned out to be false**
+**now runs — `i32[]` -> `i64[]`, `i32[]` -> `f64[]` and `f32[]` -> `f64[]` deliver through a
+converting copy at all NINE boundaries · closed by the `emitScalarListWidenTop` loop, its
+delivery site and a narrowed `containerElemClassDiffers`**
 
-`const e = []` reaching both `take_i(xs: i32[])` and `take_f(xs: f64[])` refuses. The gap is
-exact and was measured: ONE destination runs, TWO destinations with the SAME element storage
-run, two separate literals run — only one binding reaching two destinations whose element
-STORAGE differs refuses.
+D791 built this for REF elements and it was the template: read the source's `len`, allocate a
+default-filled destination backing, walk it, `struct.new` the wrapper. The scalar sibling is
+that loop with a numeric CONVERT where the boxing is.
 
-* **D791 BUILT THIS FOR REF ELEMENTS AND IT IS THE TEMPLATE.** `emitRefListWidenTop` reads the
-  source's `len`, allocates a default-filled destination backing, walks it boxing each element,
-  and `struct.new`s the wrapper. The scalar sibling is that loop with a numeric CONVERT where
-  the boxing is (`f64.convert_i32_s` and its family) — the message's own claim that "no
-  element-converting copy exists" has been half false since D791.
+* **THE PAIR SET IS THREE, AND THAT IS A MEASUREMENT, NOT A SCOPE DECISION.** The row was
+  filed saying `f64.convert_i32_s` "and its family", which reads open-ended. Grading the full
+  6x6 element grid (`i32`/`i64`/`f32`/`f64`/`boolean`/`u8`, source and destination) settles
+  it: **exactly three of the thirty pairs reach the capability refusal**, and all twenty-seven
+  others are already DESIGN rejections at plain assignability (`argument 1: expected f32[],
+  got i32[]`) and were never clause-2 violations. So the build is three opcodes — `0xac`,
+  `0xb7`, `0xbb` — and there is no tail.
 
-* **THE BLOCKER IT WAS COSTED AT IS NOT REAL, and this is the reason to write the row.** An
-  earlier scoping of `??` (D960) established that this emitter does not mint locals on demand —
-  a scratch slot is RESERVED ahead of emission — and that cost was carried over to here. It
-  does not apply: `widenSrcWrapSlot` / `widenDstBackSlot` / `widenTmpSlot` push onto `liKinds`
-  **during lowering**, and the header says why a pre-pass could not do it — *"a pre-pass cannot
-  answer 'does this delivery widen' at all, because the answer depends on the ref-list slot the
-  DESTINATION resolved and on the whole-program write scan, neither of which exists before the
-  tables are interned."* The kinds a scalar copy needs are the kinds already handed out: two
-  `"ref"` (source wrapper, destination backing) and two `"i32"` (`i`, `n`). New back-codes
-  (11, 12) key them apart from the ref family's 8/9/10.
+* **NINE BOUNDARIES, NOT EIGHT — the enumeration in the spec was one short.** `emitRefListWidenSite`
+  has eight callers and the spec took them for the complete set of delivery positions. It
+  missed **global ASSIGNMENT** (`b = e` where both names are module globals), which lowers
+  through `emitAssign`'s `global.set` arm and not through the global-INIT copy in
+  `emit_sections`. It was found by running the position matrix, not by reading: the
+  eight-site build left it check-clean INVALID WASM.
 
-* **THE LICENCE IS ALREADY BUILT TOO.** D821's per-VALUE write scan is the `Writable` half, and
-  its header records why the rep-scoped predicate it replaced was wrong. A scalar copy needs
-  the same licence and nothing new.
+* **AND NARROWING THE CHECKER FIRST WOULD HAVE SHIPPED SIX CLAUSE-1 BUGS.** With the loop
+  built and only the argument boundary wired, the narrowed refusal admitted binding, return,
+  assignment, struct-field, nested-element and global-init — every one of them invalid wasm.
+  The order the spec insisted on (loop, delivery, THEN the gate) is what caught it, and the
+  position matrix is the instrument: **run every position, not the one the witness uses.**
 
-* **SO THE BUILD IS THREE SITES, none of them research:** the loop (mirror
-  `emitRefListWidenTop`, convert instead of box), the checker's
-  `containerElemClassDiffers` refusal (admit the pair the copy can serve, gated on the write
-  scan), and the delivery — `emitRefListWidenSite`'s scalar twin.
+* **THE LICENCE IS D821'S WRITE SCAN, UNCHANGED.** A converting copy is a SNAPSHOT: the
+  destination is a different array, so a write through either name is invisible to the other.
+  `covarValueWriteState(...) == 0` — a definite "nothing writes this value" — is required, and
+  an UNKNOWN keeps the refusal. `const e: i32[] = [3, 4]; const b: f64[] = e; e.push(9)`
+  correctly still refuses.
 
-* **THE DELIVERY BOUNDARIES ARE ENUMERABLE, not a design question.** `emitRefListWidenSite`
-  has EIGHT callers, and they are the complete list of positions where a container delivery
-  can widen: `emitDirectCall` (the argument position this probe uses), `emitReturnValue`,
-  `emitLetDeclStmt`, the assignment boundary, the struct-FIELD boundary, the nested-list
-  ELEMENT boundary, the map-VALUE boundary, and the global-init boundary in `emit_sections`.
-  A scalar twin either mirrors those eight or — better — the existing site gains a scalar arm,
-  so the two families cannot drift about which positions widen.
+Repro (runs, prints `1.5`):
 
-* **AND THE CHECKER GATE IS LOAD-BEARING, measured rather than assumed.** Disabling
-  `containerElemClassDiffers`'s refusal alone, with no copy built, yields invalid wasm for
-  both the empty-literal and the non-empty case. So the refusal is doing real work and the
-  order is: build the loop, wire the delivery, THEN narrow the gate.
-
-Repro (check rc 0 is NOT reached — the CHECKER refuses):
-
-    function take_i(xs: i32[]): i32 {
-      xs.length
-    }
-    function take_f(xs: f64[]): i32 {
-      xs.length
-    }
-    const e = []
-    print(take_i(e) + take_f(e))
-    // vl check -> a value of type i32[] flowing into f64[] changes how the ELEMENT is stored:
-    // type-valid (the element type widens) but not yet supported by codegen
-    // SHOULD PRINT 0.
-
----
+    const e: i32[] = [3, 4]
+    const b: f64[] = e
+    print(b[0] / 2.0)
+    // PRINTS 1.5
 
 ### D791 — [CLOSED 2026-08-31] READ-ONLY COVARIANCE is lowered by an element-CONVERTING COPY, licensed by a whole-program write scan — D661B's refusal was about the WRITABLE side only
 
