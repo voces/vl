@@ -23926,9 +23926,21 @@ and the refusal turns into a miscompile:
 
   So the A20 gate is a red herring for this witness (the emitter never reads
   `inferRetNameOf` here — `fn.fnRet >= 0` by then), and so is `retUNm`. **The fix belongs in
-  the pin: it must use the recorded JOIN, not the tail value's type.** The ladder is
-  `emit_rewrite.vl` around the `fn.fnRet = synthTypeRefTy(ctx, -1, ctxTy)` rungs; find which
-  rung claims `pick` and why its `ctx` is the tail's `string`.
+  whatever writes that pin: it must use the recorded JOIN, not one return's type.**
+
+* **AND IT IS NOT `emit_rewrite`'s PIN LADDER — all fourteen non-void rungs probed, none
+  fires.** Instrumenting every `fn.fnRet = synthTypeRefTy(...)` in `synthRetAnnots` with a
+  `tErr`, unfiltered by function name, produces NO output for this program, while the emitter
+  still reports `fnRet=17 name=[string] uflag=0` (against the control's
+  `fnRet=2 name=[i32|string] uflag=1`). So node 17 is minted somewhere else.
+
+  **The remaining candidates are `emit_mono`'s two `nret` paths**, and the second one has
+  exactly the wrong shape for this: it reads `fnRetExprOf(fnIx)` — the return EXPRESSION,
+  singular — and pins `tyToEmitName` of its substituted type. That is the same mistake D626
+  named ("an inferred return read its empty `[]` off the return EXPRESSION"), one rung over. It
+  is gated on `tyHasTyVar(rty)`, which a bare `"s"` should fail, so either the gate admits more
+  than it reads like or the first path (line ~1848, `monoSubstAnnNode`) is the writer. **Probe
+  those two before anything else** — that is now the only unexplored branch.
 
 * **A NOTE ON THE OTHER SIDE, from the emitter's own comment at the `retUnionFlag` rung:** when
   the functype and the body move to the box, the CALL-RESULT classifier (`computeRetInference`
