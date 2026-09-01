@@ -49,7 +49,12 @@ run "lsp suites (ci list)"     env SELFHOST_NATIVE_ALIGN=1 bash -c \
 # Root deno.json excludes lsp/ and every suite runs --no-check, so a type error
 # in lsp/src/*.ts is invisible to all the other gates (esbuild strips types
 # without checking). Mirrors ci.yml's "Type-check (lsp)" step.
-run "lsp typecheck"            deno check --config lsp/deno.json lsp/src/*.ts
+# --node-modules-dir=none: resolve the mapped npm deps from deno's own cache,
+# never from node_modules — the check then grades identically in CI (npm ci
+# layout), the main checkout, and agent worktrees (node_modules symlinked or
+# absent). Measured 2026-09-01: byonm graded three different answers across
+# those three layouts under deno 2.9.6's nearest-manifest rule.
+run "lsp typecheck"            deno check --node-modules-dir=none --config lsp/deno.json lsp/src/*.ts
 run "native-fixpoint"          bash scripts/native-fixpoint.sh
 run "lint-self + fmt"          bash scripts/lint-self.sh
 run "deno lint"                deno lint
