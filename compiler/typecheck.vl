@@ -16010,6 +16010,10 @@ let shapeAdaptSrcExpr = -1
 // above does not say which, since both bank a pair. Set on every claim, beside the pair,
 // so the two can never disagree.
 let shapeAdaptElemPair = false
+// D938 — the claimed pair is a NESTED WIDTH pair (agreeing field names, differing inside a
+// field). Selects the design-refusal wording instead of a capability concession; see
+// `objShapeAdapterlessErr`.
+let shapeAdaptWidthField = false
 
 // The expression at `ix` with `(…)` peeled — the syntactic form, for the constructor
 // exemption in `objShapeAdapterless`. -1 stays -1.
@@ -17201,6 +17205,72 @@ function objFieldNameOrder(names: string[]): i32[] {
   ord
 }
 
+// D938 — IS `srcExpr` A NAME BOUND, WITHOUT AN ANNOTATION, TO AN OBJECT LITERAL?
+//
+// The provenance axis D622's paragraph names, at the one spelling `ctorExprOf` does not
+// reach. An UN-ANNOTATED binding has no pinned wasm type of its own — the emitter is free to
+// lay it out at the shape it flows into, which is the rebuild that makes the nested width
+// pair sound, and `objects/object-shape-unannotated-literal-rebuilt.vl` is the pin. An
+// ANNOTATED source (`const w: OW = …`) has a type it must keep, so the destination is a
+// SECOND view of one object and the pair is the unsound one.
+//
+// Measured rather than argued: on master the un-annotated spelling RUNS and the annotated one
+// is the silent invalid-wasm cell this row closes.
+function srcIsUnannotatedObjBinding(srcExpr: i32): boolean {
+  if srcExpr < 0 { return false }
+  const e = P.nodes[srcExpr]
+  if e is Paren { return srcIsUnannotatedObjBinding(e.parInner) }
+  if e is Ident {
+    let i = 0
+    while i < P.nodes.length {
+      const n = P.nodes[i]
+      if n is LetDecl {
+        if n.letName == e.identName {
+          if n.letType >= 0 { return false }
+          if n.letInit < 0 { return false }
+          const ivn = P.nodes[n.letInit]
+          if ivn is ObjLit { return true }
+          return false
+        }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// D938 — DOES SOME SHARED FIELD NAME CARRY A WIDTH PAIR of object shapes?
+//
+// Asked only of a pair whose field NAMES already agree, so the question is exactly whether
+// the two disagree THROUGH a field: the source's field type has more fields than the
+// destination's, in the width relation the direct flow lifts. At a `direct` value position
+// that lift is free; one level down inside a MUTABLE struct field it is not available at all
+// (WasmGC field invariance), and a checker that stayed silent handed the validator a program
+// it had already accepted.
+//
+// Equal field types answer false, so the ordinary case costs one `tyEq` per field.
+function objFieldWidthPair(src: i32, dst: i32): boolean {
+  const s = T.tys[src]
+  const d = T.tys[dst]
+  if s is TyObj {
+    if d is TyObj {
+      const dnames = d.objFieldNames
+      const dtys = d.objFieldTypes
+      let i = 0
+      while i < dnames.length {
+        const sft = objFieldType(s, dnames[i])
+        if sft >= 0 && dtys[i] >= 0 {
+          if !tyEq(sft, dtys[i]) {
+            if objWidthPrefix(sft, dtys[i]) { return true }
+          }
+        }
+        i = i + 1
+      }
+    }
+  }
+  false
+}
+
 // `direct` — is the destination a slot a `(ref $src)` can be WRITTEN INTO as it stands?
 // True at a value flow (a binding, an argument, a return, a store into a field or element
 // whose declared type IS `dst`), where a declared WasmGC supertype makes the reference fit.
@@ -17328,7 +17398,39 @@ function objShapeAdapterless(
       // types-only refusal reddens. So the verdict turns on the source's PROVENANCE, the
       // axis this function's header already names, and not on the two types. Filed with
       // its witness as its own row (D622).
-      if objFieldNameSetsEq(src, dst) { return false }
+      if objFieldNameSetsEq(src, dst) {
+        // D938 — EXCEPT WHERE A FIELD PAIR IS ITSELF A WIDTH PAIR AND THE SOURCE IS NOT A
+        // REBUILT LITERAL. The paragraph above calls this case UNSOUND rather than
+        // unsupported and then declines to withdraw it, because withdrawing it on the TYPES
+        // would redden the un-annotated literal, which is correct. The axis it names as the
+        // right one is the source's PROVENANCE, and that axis is available right here —
+        // `litShapeDropSrcExpr(cx)` is the same test the width lift below already makes.
+        //
+        // WasmGC is what settles it: a struct's mutable field is INVARIANT, so no `(sub)`
+        // edge between `{n: Wide}` and `{n: Narrow}` exists to declare, and the engine
+        // refuses the module on a program `vl check` accepted — the validator catching a
+        // type-system hole by accident. That is a clause-1 SOUNDNESS violation, and unlike
+        // the direct width flow it cannot be closed by making it run: there is no sound
+        // lowering to build, only a refusal owed.
+        //
+        // The rebuilt literal keeps running for the reason the paragraph gives — `emitObj`
+        // builds it AT the destination shape, so no second view of the object exists and
+        // there is nothing to write through. `objects/object-shape-unannotated-literal-rebuilt.vl`
+        // is what holds that half.
+        if (
+          !litShapeDropSrcExpr(cx) &&
+          !srcIsUnannotatedObjBinding(srcExpr) &&
+          objFieldWidthPair(src, dst)
+        ) {
+          shapeAdaptSrcTy = src
+          shapeAdaptDstTy = dst
+          shapeAdaptSrcExpr = cx
+          shapeAdaptElemPair = false
+          shapeAdaptWidthField = true
+          return true
+        }
+        return false
+      }
       // THE WIDTH LIFT (D622). A `Wide` flowing into a `Narrow` whose fields are the first
       // of `Wide`'s, in the canonical layout order and with identical types, needs no
       // conversion at all: `emitTypeSection` declares `(type $Wide (sub $Narrow …))` and
@@ -17348,6 +17450,7 @@ function objShapeAdapterless(
       shapeAdaptDstTy = dst
       shapeAdaptSrcExpr = cx
       shapeAdaptElemPair = false
+      shapeAdaptWidthField = false
       return true
     }
     return false
@@ -17388,6 +17491,8 @@ function objShapeAdapterless(
         shapeAdaptDstTy = dst
         shapeAdaptSrcExpr = cx
         shapeAdaptElemPair = true
+        shapeAdaptWidthField = false
+        shapeAdaptWidthField = false
         return true
       }
       return false
@@ -17407,6 +17512,8 @@ function objShapeAdapterless(
         shapeAdaptDstTy = dst
         shapeAdaptSrcExpr = cx
         shapeAdaptElemPair = true
+        shapeAdaptWidthField = false
+        shapeAdaptWidthField = false
         return true
       }
       if containerElemClassDiffers(s.mVal, d.mVal) {
@@ -17414,6 +17521,8 @@ function objShapeAdapterless(
         shapeAdaptDstTy = dst
         shapeAdaptSrcExpr = cx
         shapeAdaptElemPair = true
+        shapeAdaptWidthField = false
+        shapeAdaptWidthField = false
         return true
       }
       return false
@@ -17498,6 +17607,30 @@ function objShapeAdapterlessErr(srcExpr: i32, src: i32, dst: i32) {
   // no field is dropped, the two shapes may be the same shape, and "construct the value at
   // the destination shape" points at an object that is not what changed. What changed is
   // how the ELEMENT is stored, so the message names that and the container it fixes.
+  // D938 — THE NESTED WIDTH PAIR IS NOT A CAPABILITY GAP AND MUST NOT BE WORDED AS ONE.
+  // Every other wording here concedes the program is type-valid and blames codegen, which is
+  // the clause-2 sentence the standing goal counts. This case is different in kind: a struct's
+  // MUTABLE field is INVARIANT in WasmGC, so there is no subtype edge to declare and no sound
+  // lowering to build — a write through the narrower view would leave the original holding a
+  // value of the wrong type. The refusal is owed by the type system, so it goes on the plain
+  // `tErr` channel and says what is actually wrong.
+  if shapeAdaptWidthField {
+    tErr(
+      "an object of type " +
+        tyToStr(sT) +
+        " cannot flow into " +
+        tyToStr(dT) +
+        through +
+        ": they agree on field names but differ INSIDE a field, and a struct field is " +
+        "mutable — writing through the narrower view would leave the original holding a " +
+        "value of the wrong type, so the two are unrelated by design and not by a missing " +
+        "lowering. Give the source exactly " +
+        tyToStr(dT) +
+        "'s field types, or read the field out and rebuild",
+      srcExpr,
+    )
+    return 0
+  }
   if shapeAdaptElemPair {
     tErrUnsupported(
       "a value of type " +
