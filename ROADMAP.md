@@ -154,7 +154,7 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   __callsite__)`). One-hop semantics confirmed with the owner: a CallerLoc is one
   location, never a chain (the chain is the parked trace lane); std may later thread a
   breadcrumb parent field as a library pattern, no language addition.
-  **HALF ONE IS DONE AND TRACK-CALLER IS UNBLOCKED (#TBD).** Default arguments v1 shipped
+  **HALF ONE IS DONE AND TRACK-CALLER IS UNBLOCKED (#2225).** Default arguments v1 shipped
   complete — see B15a — including the `__callsite__` intrinsic itself, typed structurally
   against `{ file: string, line: i32, col: i32 }` so a std `type CallerLoc = { file: string,
   line: i32, col: i32 }` satisfies it with NO compiler change. What remains is the std side
@@ -1491,7 +1491,7 @@ in-language GC knobs.
   annotating `k`'s parameter does not move it while annotating `o`'s does. Also open: an inline
   object shape that COINCIDES with a declared alias's shape is a separate emitter limit
   ("binding's inline-shape type has an unsupported field"), unrelated to generics.
-- ✅ **B15a. Optional params + default values — v1 COMPLETE (#TBD), ruled 2026-09-01.** Nothing
+- ✅ **B15a. Optional params + default values — v1 COMPLETE (#2225), ruled 2026-09-01.** Nothing
   open. **Direct-call-site sugar**, and **defaults subsume optionals** (`p?: T` is desugared in the
   PARSER to `p: T | null = null`; only a surface marker survives, for the printer). A call omitting
   trailing arguments — or, named, skipping a middle one — is normalized to full arity before
