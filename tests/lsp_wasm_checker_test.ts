@@ -328,6 +328,96 @@ Deno.test({
   }
 });
 
+// A binding's hover type is FLOW-SENSITIVE: inside `if r is string { … }` the very
+// same `r` is a `string`, and `symBindType` (one slot per binding, last write wins)
+// cannot hold that as well as the declared union. The checker's own narrowed type is
+// retained per OCCURRENCE (`symOccTy`), and hover prefers it.
+const NARROW_SRC = "type IoError = { msg: string, code: i32 }\n" +
+  "function f(r: string | IoError) {\n" +
+  "  if r is string {\n" +
+  "    print(r)\n" +
+  "  } else {\n" +
+  "    print(r.msg)\n" +
+  "  }\n" +
+  "  const after = r\n" +
+  "  return 0\n" +
+  "}\n" +
+  'print(f("x"))\n';
+
+Deno.test({
+  name: "wasm-symbols: hover inside an `is` arm shows the NARROWED type",
+  ignore,
+}, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // Line 3 `    print(r)` — the `r` at col 10 sits under `if r is string`.
+  const then = await checker.hoverTypeAt(NARROW_SRC, "/tmp/x.vl", noSiblings, 3, 10);
+  if (then !== "string") {
+    throw new Error(`expected string in the is-string arm, got ${JSON.stringify(then)}`);
+  }
+  // Line 5 `    print(r.msg)` — the NEGATIVE arm narrows to the other member. This is
+  // the checker's own `else`-arm narrowing, not one the query layer invents.
+  const els = await checker.hoverTypeAt(NARROW_SRC, "/tmp/x.vl", noSiblings, 5, 10);
+  if (els !== "IoError") {
+    throw new Error(`expected IoError in the else arm, got ${JSON.stringify(els)}`);
+  }
+});
+
+Deno.test({
+  name: "wasm-symbols: hover OUTSIDE the arms still shows the declared union",
+  ignore,
+}, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const want = "string | IoError";
+  // The parameter's own declaration (line 1, col 11) — a decl is never narrowed.
+  const decl = await checker.hoverTypeAt(NARROW_SRC, "/tmp/x.vl", noSiblings, 1, 11);
+  if (decl !== want) {
+    throw new Error(`expected ${want} at the param decl, got ${JSON.stringify(decl)}`);
+  }
+  // The guard's OWN receiver (line 2 `  if r is string {`, col 5): the narrowing is
+  // not in force yet at the operand being tested.
+  const guard = await checker.hoverTypeAt(NARROW_SRC, "/tmp/x.vl", noSiblings, 2, 5);
+  if (guard !== want) {
+    throw new Error(`expected ${want} at the guard operand, got ${JSON.stringify(guard)}`);
+  }
+  // RE-WIDENED after the `if` closes (line 7 `  const after = r`, col 16) — `popScope`
+  // unwound the narrowing shadow, so the declared union is the answer again.
+  const after = await checker.hoverTypeAt(NARROW_SRC, "/tmp/x.vl", noSiblings, 7, 16);
+  if (after !== want) {
+    throw new Error(`expected ${want} after the if, got ${JSON.stringify(after)}`);
+  }
+});
+
+Deno.test({
+  name: "wasm-symbols: a nullable guard narrows hover, a function binding is untouched",
+  ignore,
+}, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // `if s != null` is the same bare-name shadow mechanism as `is`.
+  const nul = "function f(s: string | null) {\n" +
+    "  if s != null {\n" +
+    "    print(s)\n" +
+    "  }\n" +
+    "  return 0\n" +
+    "}\n" +
+    'print(f("x"))\n';
+  const inside = await checker.hoverTypeAt(nul, "/tmp/x.vl", noSiblings, 2, 10);
+  if (inside !== "string") {
+    throw new Error(`expected string inside the null guard, got ${JSON.stringify(inside)}`);
+  }
+  const at = await checker.hoverTypeAt(nul, "/tmp/x.vl", noSiblings, 0, 11);
+  if (at !== "string | null") {
+    throw new Error(`expected the declared nullable, got ${JSON.stringify(at)}`);
+  }
+  // A FUNCTION binding still renders as its NAMED signature — `fnSigStr` is only
+  // skipped for an occurrence that actually carries a narrowing, and a function
+  // name never does.
+  const fn = "function add(a: i32, b: i32) {\n  a + b\n}\nprint(add(1, 2))\n";
+  const use = await checker.hoverTypeAt(fn, "/tmp/x.vl", noSiblings, 3, 6);
+  if (use !== "(a: i32, b: i32) => i32") {
+    throw new Error(`expected the named signature at a fn use, got ${JSON.stringify(use)}`);
+  }
+});
+
 Deno.test({ name: "wasm-symbols: typeAliasAt renders a user type name (decl + use)", ignore }, async () => {
   const checker = loadWasmChecker(SEED, log)!;
   // `type Pt = { x: i32 }` on line 0 (name at col 5); `let p: Pt = …` on line 1

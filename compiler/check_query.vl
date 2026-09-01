@@ -41,6 +41,7 @@ import {
   symOccDecl,
   symOccIsDecl,
   symOccTok,
+  symOccTy,
   symVisEC,
   symVisEL,
   symVisKind,
@@ -101,6 +102,24 @@ export function symOccIsDeclAt(i: i32) {
 export function symOccKindAt(i: i32) {
   if i >= 0 && i < symOccDecl.length { return symBindKindOf(symOccDecl[i]) }
   -1
+}
+// The FLOW-NARROWED type retained at occurrence `i`, or -1 when that use sat under
+// no narrowing (or the index is out of range). Bounds-safe so an older recording
+// that never filled the column degrades to "not narrowed".
+export function symOccNarrowTy(i: i32) {
+  if i < 0 || i >= symOccTy.length { return -1 }
+  symOccTy[i]
+}
+// The TYPE to answer a position query with for occurrence `i`: its flow-narrowed
+// type when one was in force there, else the retained type of the binding it
+// resolves to. THE ONE PLACE the narrowed-vs-declared choice is made, so hover and
+// member completion cannot disagree about what `result` is inside an `is` arm.
+// -1 when neither is known.
+export function symOccQueryTy(i: i32) {
+  const nt = symOccNarrowTy(i)
+  if nt >= 0 { return nt }
+  if i < 0 || i >= symOccDecl.length { return -1 }
+  bindTypeOf(symOccDecl[i])
 }
 export function symOccTokOf(i: i32) {
   if i >= 0 && i < symOccTok.length { return symOccTok[i] }
@@ -255,14 +274,21 @@ function fnSigStr(declNode: i32, ty: i32) {
 // `T.tys` persists for the whole check, so the retained index renders even after
 // the binding's scope closed (hover-types). A FuncDecl-declared binding renders
 // as its NAMED signature (`fnSigStr` above); everything else as the bare type.
+//
+// A use under a FLOW NARROWING renders the narrowed type: hovering `result` inside
+// `if result is string { … }` says `string`, not the declared `string | IoError`.
+// The named-signature path is skipped for such a use — `fnSigStr` zips the DECL's
+// parameter names against the binding's own type, which is not what is in force
+// here — so a narrowed occurrence renders bare.
 export function symTypeStrAt(line: i32, col: i32) {
   const occ = symOccAt(line, col)
   if occ < 0 { return "" }
-  const decl = symOccDecl[occ]
-  const ty = bindTypeOf(decl)
+  const ty = symOccQueryTy(occ)
   if ty < 0 { return "" }
-  const sig = fnSigStr(decl, ty)
-  if sig != "" { return sig }
+  if symOccNarrowTy(occ) < 0 {
+    const sig = fnSigStr(symOccDecl[occ], ty)
+    if sig != "" { return sig }
+  }
   tyToStrUser(ty)
 }
 export function inlayPush(k: i32, occ: i32, ty: i32) {
@@ -577,13 +603,12 @@ export function symMemberScanAt(line: i32, col: i32) {
   memcIsFn = []
   const occ = symOccAt(line, col)
   if occ < 0 { return 0 }
-  const binding = symOccDecl[occ]
-  let ty = -1
-  let i = 0
-  while i < symBindNode.length {
-    if symBindNode[i] == binding { ty = symBindType[i] }
-    i = i + 1
-  }
+  // The SAME choice hover makes (`symOccQueryTy`): a receiver under a flow
+  // narrowing offers the NARROWED arm's members. `result.` inside `if result is
+  // IoError { … }` offers `msg`/`code`; on the declared `string | IoError` the
+  // scan below finds neither a `TyObj` nor a `string` and offers nothing, which is
+  // what it used to do at both spellings.
+  let ty = symOccQueryTy(occ)
   if ty < 0 { return 0 }
   ty = memcSoften(ty)
   if ty < 0 { return 0 }

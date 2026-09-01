@@ -1741,7 +1741,7 @@ seed from current `compiler/*.vl` in ~40s.*
      names with `TyFunc.fnParamTypes` (`it(name: string, body: () => void) => void`) —
      types are structural and carry no names by design, so the names come from the
      declaration; the same data feeds 10 (signature help)
-  6. ⬜ Flow-narrowed types at a position — hover AND member completion (D1's standing
+  6. ✅ Flow-narrowed types at a position — #2108 — — hover AND member completion (D1's standing
      remainder, both surfaces re-reported from live use 2026-08-31: hover inside
      `if result is string { … }` shows the full union, and `result.` inside an
      `is IoError` arm offers NOTHING — measured: `memberCompletionsAt` on the narrowed
