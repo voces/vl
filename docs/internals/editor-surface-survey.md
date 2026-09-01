@@ -99,7 +99,7 @@ parameter lists as structured data (only rendered type strings), declaration *bo
 | Document symbols | **partial** | Outline view, breadcrumbs, Ctrl+Shift+O | Shipped flat (D9.3): `tokensAt` decls (functions + module-level values) + host scan for `type` decls + `moduleSurface` exported flags. REMAINDER: *nesting* needs body extents → native export (§7), so breadcrumbs show the file's symbols but not "which function am I in". |
 | Workspace symbols | **missing** | Ctrl+T "open any exported symbol by name" | Served by `moduleSurface` over `enumerateWorkspaceFiles` — the unused-export pass already runs exactly this crawl; add a name index. |
 | Code actions | **partial** | 4 lint quick-fixes | More fixes = more lint codes; machinery is done. No refactoring-tier actions (extract fn etc. — needs AST edits the surface doesn't expose). |
-| Code lens | **missing** | Inline "run test" / "N references" / "run file" | Reference counts for exports are **already computed** (`lastUseMap`); test lenses = the discovery scan from §4. |
+| Code lens | **partial** | Inline "run test" / "N references" / "run file" | Shipped (D9.4): "N refs" per export off `lastUseMap` (no new crawl; locations resolve on click via the reference machinery, through the `vital.showReferences` client shim). REMAINDER: run/test lenses = the discovery scan from §4. |
 | Document links | **missing** | Ctrl+click an import specifier's path | `moduleSurface.imports` has keys but no spans; a host-side scan of `import … from "…"` lines suffices — no native work. |
 | Document colors | n/a | — | No color literals in VL. |
 | Formatting (document) | **have** | `vl fmt` on save | — |
@@ -143,10 +143,10 @@ parameter lists as structured data (only rendered type strings), declaration *bo
 | Quick diff / SCM | n/a | — | Git's problem, already solved. |
 | Chat / LM APIs | n/a | — | Out of scope for a language extension today. |
 
-**Counts** (this survey's rows, not the protocol spec's): LSP layer — 9 have, 3 partial,
-15 missing, 9 n/a. VS Code layer — 1 partial, 4 missing-worth-doing (Testing API, status
-bar, task provider, language-config rules) + 1 missing-later (walkthrough), 1 missing-large
-(DAP), 9 n/a.
+**Counts** (this survey's rows, not the protocol spec's; updated as D9 items land): LSP
+layer — 10 have, 5 partial, 12 missing, 9 n/a. VS Code layer — 1 have (status bar, D9.2),
+1 partial, 3 missing-worth-doing (Testing API, task provider, language-config rules) + 1
+missing-later (walkthrough), 1 missing-large (DAP), 9 n/a.
 
 ---
 

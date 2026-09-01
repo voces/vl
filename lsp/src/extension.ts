@@ -6,7 +6,10 @@ import { spawnSync } from "node:child_process";
 import {
   commands as Commands,
   ExtensionContext,
+  Location,
   OutputChannel,
+  Position,
+  Range,
   StatusBarAlignment,
   StatusBarItem,
   Terminal,
@@ -241,11 +244,56 @@ const registerRunCommand = (context: ExtensionContext) => {
   context.subscriptions.push(Commands.registerCommand("vital.runFile", run));
 };
 
+// The wire shape of one reference location in a server-sent command argument
+// (LSP `Location`, plain JSON — classes don't survive the connection).
+type WireLocation = {
+  uri: string;
+  range: {
+    start: { line: number; character: number };
+    end: { line: number; character: number };
+  };
+};
+
+// The click-through behind the export reference-count code lens (D9.4). The
+// server can't target `editor.action.showReferences` directly — its arguments
+// must be real `Uri`/`Position`/`Location` instances, and the LSP wire delivers
+// plain JSON — so the lens command points here and this shim revives the values
+// (the standard pattern; rust-analyzer ships the same shim).
+const registerShowReferences = (context: ExtensionContext) => {
+  context.subscriptions.push(
+    Commands.registerCommand(
+      "vital.showReferences",
+      (
+        uri: string,
+        position: { line: number; character: number },
+        locations: WireLocation[],
+      ) =>
+        Commands.executeCommand(
+          "editor.action.showReferences",
+          Uri.parse(uri),
+          new Position(position.line, position.character),
+          (locations ?? []).map((l) =>
+            new Location(
+              Uri.parse(l.uri),
+              new Range(
+                l.range.start.line,
+                l.range.start.character,
+                l.range.end.line,
+                l.range.end.character,
+              ),
+            )
+          ),
+        ),
+    ),
+  );
+};
+
 export const activate = (context: ExtensionContext) => {
   const module = context.asAbsolutePath(path.join("dist", "server.mjs"));
   const outputChannel: OutputChannel = Window.createOutputChannel("vital");
 
   registerRunCommand(context);
+  registerShowReferences(context);
 
   // Serve `vl-std:/NAME.vl` documents from the generated embedded std map, so a
   // cross-file location into a `std:` module (go-to-definition / peek on a std

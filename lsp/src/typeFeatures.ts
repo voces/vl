@@ -607,6 +607,70 @@ export const flatDocumentSymbols = (
   return out;
 };
 
+// ---- code lens: export reference counts (D9.4) -------------------------------
+//
+// One lens per EXPORT declaration — "N refs", cross-module + same-file — read
+// from the use-map the unused-export workspace pass already computes on every
+// save (`lastUseMap` in server.ts). No new crawl: the lens layer only SHAPES
+// data the save pass maintains; the reference LOCATIONS (for the click-through
+// peek) are computed lazily in `codeLens/resolve`, so rendering lenses costs
+// one `moduleSurface` and a map lookup.
+
+/** One export decl to consider for a lens (native 1-based line, 0-based col). */
+export type ExportDeclForLens = {
+  name: string;
+  declLine: number;
+  declCol: number;
+};
+
+/** One shaped lens: the export's name span (0-based, LSP) + its total count. */
+export type ExportRefLens = {
+  name: string;
+  line: number; // 0-based
+  char: number; // 0-based
+  length: number;
+  count: number; // cross + local
+};
+
+/**
+ * Shape the export-reference-count lenses for a file: each export named in
+ * `counts` (the file's slice of the workspace use-map) gets one lens carrying
+ * `cross + local`. `counts` undefined — no workspace pass has run yet — yields
+ * no lenses rather than counts invented from nothing; an export missing from
+ * the map (added since the last pass) is likewise skipped, so a lens never
+ * shows a stale zero for a symbol the pass has not yet seen. First decl wins
+ * on a duplicate name, mirroring `unusedExportHints`.
+ */
+export const exportRefLenses = (
+  exports: ExportDeclForLens[],
+  counts: ReadonlyMap<string, ExportRefCountsForLens> | undefined,
+): ExportRefLens[] => {
+  if (counts === undefined) return [];
+  const out: ExportRefLens[] = [];
+  const seen = new Set<string>();
+  for (const e of exports) {
+    if (seen.has(e.name)) continue;
+    seen.add(e.name);
+    const c = counts.get(e.name);
+    if (c === undefined) continue;
+    out.push({
+      name: e.name,
+      line: e.declLine > 0 ? e.declLine - 1 : 0,
+      char: e.declCol,
+      length: e.name.length,
+      count: c.cross + c.local,
+    });
+  }
+  return out;
+};
+
+/** The use-map's per-export counts (structurally `ExportRefCounts`). */
+export type ExportRefCountsForLens = { cross: number; local: number };
+
+/** The lens title: `0 refs` / `1 ref` / `N refs`. */
+export const refCountLensTitle = (count: number): string =>
+  `${count} ref${count === 1 ? "" : "s"}`;
+
 // ---- status-bar seed indicator (D9.2) ---------------------------------------
 //
 // The seed ladder is the extension's number-one operational hazard: a stale or

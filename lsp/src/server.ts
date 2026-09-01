@@ -1,6 +1,8 @@
 import {
   CodeAction,
   CodeActionKind,
+  CodeLens,
+  CodeLensRefreshRequest,
   CompletionItem,
   CompletionItemKind,
   createConnection,
@@ -66,6 +68,7 @@ import {
   docMarkdown,
   documentHighlightsFromRefs,
   type DocRefResolver,
+  exportRefLenses,
   flatDocumentSymbols,
   type HighlightKind,
   inlayHintsFromWasm,
@@ -74,6 +77,7 @@ import {
   type LspRange,
   memberCompletionsFromWasm,
   type OutlineSymbolKind,
+  refCountLensTitle,
   scopeCompletionsFromBindings,
   SEMANTIC_TOKEN_LEGEND,
   semanticTokensDataFromWasm,
@@ -282,6 +286,12 @@ const runUnusedExportPass = async (): Promise<void> => {
       diagnostics: [...cached, ...hints].map(toLspDiagnostic),
     });
   }
+
+  // The export-reference-count lenses (D9.4) read this map, so a fresh map
+  // means every visible lens count may have moved — ask the client to re-query
+  // them. Best-effort: a client without `workspace/codeLens/refresh` support
+  // still re-queries on its own edit/save heuristics.
+  connection.sendRequest(CodeLensRefreshRequest.type).catch(() => {});
 };
 
 documents.onDidChangeContent(async (event) => {
@@ -1068,6 +1078,99 @@ connection.onCodeAction((params): CodeAction[] => {
   return actions;
 });
 
+// ---- code lens: export reference counts (D9.4) -------------------------------
+//
+// One lens per EXPORT declaration in the open file: "N refs" (cross-module +
+// same-file), read from `lastUseMap` — the use-map the unused-export workspace
+// pass ALREADY computes on every save. Rendering a lens therefore costs one
+// `moduleSurface` + a map lookup, no crawl; before the first pass has run (or
+// for an export added since it ran) there is simply no lens yet rather than an
+// invented count, and `runUnusedExportPass` requests a client-side lens
+// refresh whenever the map is rebuilt.
+//
+// The click-through is wired in `codeLens/resolve` — the expensive part
+// (reference LOCATIONS, via the same capped cross-file crawl find-references
+// uses) is paid on click, not on render. The resolved command is the
+// extension-side `vital.showReferences`, which revives the JSON-serialized
+// arguments into real `Uri`/`Position`/`Location` values and forwards to
+// `editor.action.showReferences` (the LSP wire strips classes, so the built-in
+// command can't be targeted directly — the standard shim, same as
+// rust-analyzer's).
+
+/** What a lens carries from compute to resolve (`CodeLens.data`, JSON-safe). */
+type RefLensData = {
+  uri: string;
+  name: string;
+  line: number; // 0-based decl-name line
+  character: number; // 0-based decl-name col
+  title: string;
+};
+
+connection.onCodeLens((params): CodeLens[] => {
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc || wasmChecker === undefined) return [];
+  const entryKey = entryKeyOf(params.textDocument.uri);
+  const surface = wasmChecker.moduleSurface(doc.getText(), entryKey);
+  return exportRefLenses(surface.exports, lastUseMap.get(entryKey)).map(
+    (l): CodeLens => ({
+      range: {
+        start: { line: l.line, character: l.char },
+        end: { line: l.line, character: l.char + l.length },
+      },
+      data: {
+        uri: params.textDocument.uri,
+        name: l.name,
+        line: l.line,
+        character: l.char,
+        title: refCountLensTitle(l.count),
+      } satisfies RefLensData,
+    }),
+  );
+});
+
+connection.onCodeLensResolve(async (lens): Promise<CodeLens> => {
+  const data = lens.data as RefLensData | undefined;
+  if (data === undefined) return lens;
+  // The locations behind the count: the same cross-file machinery as
+  // find-references, driven from the export's decl (`crossFileReferences`
+  // resolves the canonical export and unions per-candidate occurrences — the
+  // entry file's own uses included). A closed document / degraded checker
+  // resolves to an empty peek rather than an error.
+  const doc = documents.get(data.uri);
+  let locations: { uri: string; range: Range }[] = [];
+  if (doc && wasmChecker !== undefined) {
+    const entryKey = entryKeyOf(data.uri);
+    const openDocs = documents.all().map((d) => ({ uri: d.uri, text: d.getText() }));
+    const crawlRoot = workspaceFolder
+      ? uriToPath(workspaceFolder)
+      : detectProjectRoot(entryKey);
+    const refs = await crossFileReferences(
+      data.name,
+      doc.getText(),
+      entryKey,
+      openDocs,
+      workspaceReader,
+      wasmChecker,
+      true,
+      enumerateWorkspaceFiles(crawlRoot),
+    ).catch((err) => {
+      connection.console.log(`[code-lens] reference crawl failed: ${err}`);
+      return undefined;
+    });
+    if (refs !== undefined) locations = refs;
+  }
+  lens.command = {
+    title: data.title,
+    command: "vital.showReferences",
+    arguments: [
+      data.uri,
+      { line: data.line, character: data.character },
+      locations,
+    ],
+  };
+  return lens;
+});
+
 documents.listen(connection);
 
 // ---- status-bar seed indicator (D9.2) ---------------------------------------
@@ -1222,6 +1325,8 @@ connection.onInitialize((params) => {
       codeActionProvider: {
         codeActionKinds: [CodeActionKind.QuickFix],
       },
+      // Export reference-count lenses (D9.4); locations resolve on click.
+      codeLensProvider: { resolveProvider: true },
       hoverProvider: true,
       inlayHintProvider: true,
       semanticTokensProvider: {
