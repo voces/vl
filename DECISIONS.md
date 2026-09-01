@@ -1869,6 +1869,55 @@ reports. `then` remains a perfectly good identifier (the lexer soft-keyword
 fixtures now double as that regression's coverage), and the contextual soft-keyword set is
 five: `as` `from` `in` `step` `to`.
 
+## `else` takes a block or an `if` — the brace is required (owner, 2026-09-01)
+
+**"make brace on else required."** `else <stmt>` is removed. An `else` is followed by a brace
+block or by another `if`, the Rust / Go rule — so `else print(2)`, `else x = 2`, and in value
+position `const x = if c { 1 } else 2` are parse diagnostics rather than sugar.
+
+This is the `then` removal's other half, and the argument is the same one. After `then` went,
+every branch in the grammar took a brace block except this one, which still accepted a bare
+statement — a second spelling of a form the grammar already had, kept alive by nothing but its
+own history. The asymmetry was also load-bearing in the wrong direction: `if c print(1)` had
+just become a diagnostic while `else print(1)` on the next line stayed silent, so the rule a
+user inferred from the first message was contradicted by the second line of the same file.
+
+**The cost was measured, not assumed, and it is not zero.** `compiler/` and `std/` write no
+unbraced `else` — nor could they quietly acquire one, since `lint-self.sh` runs `vl fmt --check`
+over both and fmt has always normalized the form to braced, which is also why every formatted
+file in the tree is already compliant. The distilled corpus moved **0 of 7,564 cells** (2,061
+representatives + 5,503 curated), which is what the generated-then-formatted pipeline predicts.
+But `tests/` is excluded from fmt-check by construction — it is the deliberately-malformed
+fixture corpus — and **six sites in five fixtures did write it**: `conditionals/
+tail-if-else-value.vl` (two), `functions/recursion.vl`, `inference/hole-is-guard-alternative.vl`,
+`inference/hole-is-guard-return-join.vl`, `soundness/hole-is-guard-return-join-reject.vl`, plus
+`parser/then-removed.vl`, whose `else 8` was incidental to what that fixture pins. All migrated
+mechanically, in place, line-count-preserving. A grep that reads only the fmt-checked half of
+the tree reports zero here and is wrong by six.
+
+**Old code is not stranded**, and the recovery is not a new one: the `else` arm now calls the
+same `parseBracedBody` the other three bodies use, so an unbraced `else` costs exactly ONE
+diagnostic — `` an `else` body requires braces: `else { … }` ``, anchored on the offending
+statement's first token — and the parse continues with the statement taken as the arm. The
+`startsStmt` gate comes with it, which makes `else` behave IDENTICALLY to its `if` twin on
+every non-statement-start: `else }`, `else )` and an `else` at end of line now give the same
+message, count and span shape as `if c }`, `if c )` and `if c` do (measured pairwise). The last
+of those is a wording change on a path that already failed — `else` at end of line was never
+legal, and used to read `expected an expression but found NEWLINE`.
+
+**Two braced forms are deliberately untouched, and a rule spelled "the token after `else` must
+be `{`" would have broken both.** `else if` is an `if` in the else slot, not a body, and stays
+silent in statement and value position alike — it is 571 uses in the tree. And `else { a: 2 }`
+in value position is an OBJECT LITERAL: it is braced, so the rule is satisfied, and which of the
+two readings applies is `looksLikeObject`'s question, not the brace rule's. `vl fmt` renders it
+as the unambiguous `else { { a: 2 } }`.
+
+**fmt keeps no dead path from this.** It never had one specific to the sugar: an unbraced `else`
+was printed by `bareBodyInline`, the general "render a one-statement Block inline" helper, which
+braced blocks reach too (`if c { 1 } else { 2 }` in value position is the same call). fmt only
+formats parse-clean files, so it simply stops seeing the unbraced input; nothing became
+unreachable.
+
 ## An unbraced body is RECOVERED, not cascaded — and the gate is `startsStmt`
 
 **One mistake, one diagnostic, and the parse continues with a usable AST.** (owner directive,
@@ -1899,7 +1948,11 @@ precedence accident.
 *It does not touch `else`.* An unbraced `else` branch is LEGAL syntax (`if c { 1 } else 2`
 parses, runs, and `vl fmt` normalizes it to braced) and goes through the same
 one-statement wrapper WITHOUT a diagnostic. Whether braces should be required there is a
-language question, not a recovery question, and it is the owner's to rule on.
+language question, not a recovery question, and it is the owner's to rule on. **(Ruled the
+next day — see `else` takes a block or an `if` above. The recovery substrate did not change;
+only the legality did, and the `else` arm was routed through `parseBracedBody` unmodified.
+This paragraph is kept as the record of the split: the recovery question and the language
+question really were separable, and answering them in that order cost one call site.)**
 
 *It does not make a later TYPE error appear.* `checkSrc`/`compileSrc`/`lintSrc` in
 `compiler/driver.vl` all return at `P.diags.length > 0` — the checker never runs on a file that
