@@ -23729,7 +23729,7 @@ Repro (now RUNS, printing `3`, `7`):
 ---
 ### D964 — the capability-literal count is a LOWER BOUND, not the population: a reachable clause-2 violation whose message never says "not supported"
 
-**loud emit reject after `vl check` rc 0 — `emitProgram: narrowed union atom has no value box` — so a clause-2 violation by construction, and INVISIBLE to `goal-scoreboard.py` because its wording concedes nothing · ZERO corpus cells · probe `scripts/capability-probes/unannotated-param-union-return.vl` · reproduces on master**
+**closed by D970 — the probe `scripts/capability-probes/unannotated-param-union-return.vl` now RUNS · the LOWER-BOUND lesson below stands unchanged and is the reason this gap was found at all**
 
     function pick(b) {
       if b { return 1 }
@@ -23814,192 +23814,41 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   invalid wasm.
 
 ---
-### D970 — an inferred value-union return whose param is un-annotated: LOUD alone, check-clean invalid wasm the moment any other union mints the same box
+### D970 — an inferred value-union return whose param is un-annotated: the monomorphizer minted the annotation from ONE return
 
-**check-clean invalid wasm · found 2026-09-01 while attempting D964's probe · a second clause-1 violation the scoreboard reads as 0, because no corpus cell carries the shape**
+**closed — the instance's return annotation is no longer minted when the body returns two different CONCRETE types, and A20 records the join for that case · this also closes D964's probe**
 
-`function pick(b) { if b { return 1 }; "s" }` refuses loudly on its own
-(`narrowed union atom has no value box`, D964's probe). Add ANY other value union to the module
-and the refusal turns into a miscompile:
+`function pick(b) { if b { return 1 }; "s" }` refused alone, and became **check-clean invalid
+wasm** the moment any other value union in the module minted the same i32 box — adding
+`const by: i32 | string = 7` beside it is enough, and `i32 | boolean` does it too, since the
+box registry is module-wide (D947).
 
-    const by: i32 | string = 7
-    function pick(b) {
-      if b { return 1 }
-      "s"
-    }
-    print(pick(true))
-    print(by)
-    // vl check rc 0; vl run -> Invalid input WebAssembly code: expected (ref $type), found i32
+* **ROOT CAUSE: `emit_mono` minted the instance's `fnRet` from `fnRetExprOf` — the return
+  EXPRESSION, SINGULAR.** For a two-return body it named the TAIL (`string`) while the
+  functype, computed independently by `criClassify`, said the union box — so the returns went
+  out unboxed under a box result. **The same mistake D626 named, one rung over.**
 
-* **THE BYSTANDER ONLY HAS TO MINT THE SAME BOX.** `i32 | boolean` does it too — the registry
-  is module-wide (D947), so any union carrying the i32 atom makes the narrowed read validate
-  and exposes what was behind the refusal.
+* **THE FIX IS TWO SITES AND EACH NEEDS THE OTHER.** The mint declines when the body returns
+  two different CONCRETE types (`monoRetJoinDisagrees`), which leaves `fnRet = -1`; and A20's
+  `!generic` gate then admits exactly that shape so the return NAME is recorded for
+  `emitReturnValue` to box with. The mint fix alone leaves the old refusal; the gate fix alone
+  regresses the deferred-join family.
 
-* **FOUR INGREDIENTS, and removing any one makes it run or refuse loudly:** the bystander
-  union, the UN-ANNOTATED param, the returns JOINING to a union, and the return being INFERRED.
-  Annotate the param — runs. Annotate the return — runs. Make both returns `i32` — runs. Drop
-  the bystander — back to the loud refusal.
+* **"CONCRETE" IS LOAD-BEARING IN BOTH PREDICATES, and it is what protects the case the gate's
+  own comment was written for.** `pick(a, b, c) { if a { return b }; c }` returns two type
+  VARIABLES — per-call-site, not a join over the body's literals — and admitting it turns
+  `relay(x) { pick(x, "s", true) }` from a loud refusal into invalid wasm. Both predicates skip
+  a return whose type carries a `TyVar`, and `relay` stays loud.
 
-* **THE BYTES NAME IT EXACTLY.** `(func $0 (param $0 i32) (result (ref $4)))` with
-  `(return (i32.const 1))` and `(return (global.get $global$0))` — **the functype committed to
-  the box and NEITHER return coerces.** `criClassify` had already classified the result as the
-  box while A20's `!generic` gate skipped recording the return NAME, so `emitReturnValue`'s
-  `retUNm` stayed `""`. One half of the pair knows, the other does not — D969's shape again.
+* **THE INSTRUMENT DISCIPLINE THIS ROW COST, kept because it earned the fix.** Four claims were
+  filed here and later refuted — a poisoned-seed byte count, a mis-applied ladder probe, a
+  `tErr` probe in the emit phase (the checker's channel, which never surfaces), and "no arm
+  fires" read without a control. **What finally worked: one probe per build, `emitFail` for the
+  emit phase, and always a control that MUST make the instrument fire** — `pick4(b: boolean)`
+  overturned three conclusions in a single build. The writer was then found by firing on the
+  first pass where `fnRet` was already set.
 
-* **AND BOTH HALVES OF THE GATE'S PARAM TEST ARE LOAD-BEARING, measured, both reverted.** The
-  natural fix is to let a merely UN-ANNOTATED param through while still skipping a genuine
-  deferred join, on the theory that `pick`'s join is over its own body's literals. Relaxing the
-  `TyVar` test alone turns the gate's own witness — `relay(x) { return pick(x, "s", true) }` —
-  from a loud refusal into invalid wasm; relaxing the `tyIsDeferredJoin` test does the same. So
-  `relay` has a `TyVar` param too, and **"the return is a concrete union" does NOT separate the
-  two cases.** The split has to distinguish a join over the body's OWN literals from a join
-  over a CALLEE's per-call-site result, and nothing tried here does that.
-
-* **THE EMITTER HALF IS SEPARATELY UNFINISHED, and the search is now narrowed to one place.**
-  With the gate forced open the box IS minted — the loud "no value box" refusal disappears —
-  but the returns STILL do not box, and the functype/body are unchanged in the disassembly. Two
-  candidate causes were named and one is now RULED OUT: canonicalising the recorded name at the
-  read (`unionMemberSetOf(im)` before `isValueUnionName`) changes nothing, so it is not a
-  spelling mismatch between `valueUnionRetName`'s bare-`|` join and the registry's canonical
-  form. **`inferRetNameOf(fn.fnName)` is simply answering `""`**, which means `recordInferRet`
-  is never reached even with `!generic` satisfied — so the next attempt starts at
-  `valueUnionRetName(er)` / `retAtomsCheap(er)` and the `isClassifiableRetName` fork above it,
-  NOT at the read and NOT at the gate.
-
-* **AND THE BOX IS MINTED BY A DIFFERENT PATH THAN THE NAME**, which is the structural fact
-  behind all of it: opening the gate mints the box without recording a name, so the "no value
-  box" refusal and the unboxed-return miscompile are two independent failures wearing one
-  witness. Fixing either alone moves the program between clause 2 and clause 1 rather than to
-  `runs` — which is exactly what the bystander demonstrates from the other side.
-
-* **`retUNm` IS NOT THE LEVER EITHER — hardcoded, and the returns still do not box.** With the
-  gate forced open AND `retUNm` set to the literal `"i32 | string"` at `emitReturnValue`'s
-  inferred-return rung, the disassembly is unchanged: `(return (i32.const 1))` raw under a
-  `(result (ref $box))` functype.
-
-* **BECAUSE `emitReturnValue` NEVER RUNS FOR THIS FUNCTION — counted, not inferred, and the
-  discriminator is the RETURN annotation rather than the param.** A `wU8(0)` marker at the top
-  of `emitReturnValue`, counted in the disassembly:
-
-  `pick(b)` (both inferred) — **0 markers**; `pick2(b: boolean): i32 | string` — 2;
-  `pick3(b): i32 | string` (un-annotated PARAM, annotated return) — 2.
-
-  So an un-annotated param is fine and the un-annotated RETURN is what diverts the returns
-  away from the whole `emitReturnExit` → `emitReturnValue` path. That is where the next attempt
-  should look, and it is a different place from every lever tried so far.
-
-* **AND A BYTE MARKER IS THE WRONG INSTRUMENT ONE LEVEL UP — do not repeat this.** The obvious
-  follow-up is to mark `emitReturnExit` the same way and see whether IT runs. It reads 0 for
-  BOTH shapes, including the control that reads 2 at `emitReturnValue`, so a `wU8` at that
-  site does not land in the function body at all. The marker is measuring the writer's target
-  buffer, not reachability. Use a counter global or a distinctive `emitFail` there instead.
-
-* **RETRACTED: "the emitter is the void-discard leg" WAS A POISONED-SEED ARTIFACT.** That claim
-  was filed here off a byte-marker count (2 for `pick`, 0 for the control) taken on a build
-  whose SEED was itself an instrumented compiler — the hazard this repo documents in
-  `CLAUDE.md`, walked into while chasing this row. Re-measured from a pristine seed with the
-  reliable instrument (a distinctive `emitFail`, which the row itself recommends over a byte
-  marker), the truth is the opposite:
-
-  `computeVoidFns` NEVER marks `pick` void; the `fRetVoid[rvPos] == 1` discard leg does NOT
-  fire for either shape; and `emitReturnValue` DOES run for both (`pick` fnIx=18, the control
-  fnIx=10). **Every byte-marker count previously filed on this row should be treated as
-  unmeasured.**
-
-* **THE DISCRIMINATOR IS `emitReturnValue`'s ARM, and it is `retUNm` after all** — an earlier
-  probe of this ladder was mis-applied and read "no arm fires"; re-run correctly with
-  `emitFail`, the annotated control takes **`arm=union`** (`emitUnionBoxArg`, which boxes) and
-  `pick` takes the trailing **`arm=else`** (a plain `emitExpr`, which does not). Everything
-  downstream follows from `retUNm` being `""`.
-
-* **ROOT CAUSE — the inferred return is PINNED TO `string`, the TAIL's type, not to the join.**
-  Measured end to end with `tErr` / `emitFail` probes on pristine seeds:
-
-  the CHECKER computes the join correctly — `tyToStructStr(er)` is `i32 | string` and
-  `valueUnionRetName(er)` is `i32|string`, so A20's fork does have a name to record. But by
-  emit time `fn.fnRet` is no longer `< 0`: `emit_rewrite`'s inferred-return PIN ladder has
-  synthesized a TypeRef, and for `pick` it pins **`string`** with `retUnionFlag == 0`, while
-  the annotated control pins `i32|string` with `retUnionFlag == 1`. So `emitReturnValue` takes
-  `arm=else` and emits the raw value, while the FUNCTYPE — computed from `criClassify`, a
-  different producer — says `(result (ref $box))`. **That disagreement is the whole defect**,
-  and every earlier symptom on this row is downstream of it.
-
-  So the A20 gate is a red herring for this witness (the emitter never reads
-  `inferRetNameOf` here — `fn.fnRet >= 0` by then), and so is `retUNm`. **The fix belongs in
-  whatever writes that pin: it must use the recorded JOIN, not one return's type.**
-
-* **AND IT IS NOT `emit_rewrite`'s PIN LADDER — all fourteen non-void rungs probed, none
-  fires.** Instrumenting every `fn.fnRet = synthTypeRefTy(...)` in `synthRetAnnots` with a
-  `tErr`, unfiltered by function name, produces NO output for this program, while the emitter
-  still reports `fnRet=17 name=[string] uflag=0` (against the control's
-  `fnRet=2 name=[i32|string] uflag=1`). So node 17 is minted somewhere else.
-
-  `emit_mono`'s two `nret` paths were the next candidates and **both are also ruled out** —
-  probed with `tErr` at `monoSubstAnnNode` and at the `fnRetExprOf` rung, neither fires for
-  this program.
-
-* **SO EVERY KNOWN WRITER OF `fn.fnRet` IS ELIMINATED — but the INTERPRETATION filed with that
-  first is wrong, and this is the correction.** Two instrument errors were in the way:
-
-  the first probe of `emit_rewrite.synthRetAnnots` used **`tErr`, the CHECKER's channel**, which
-  does not surface during the emit phase — so "none fires" was measuring nothing. Re-probed with
-  `emitFail` (correct for that phase, built cleanly), none fires *for real*.
-
-  **And the control tells the story: `pick4(b: boolean)` — annotated param, INFERRED return —
-  gets no pin either, yet reaches the emitter with a correct `fnRet` and RUNS.** So a
-  non-negative `fn.fnRet` on an un-annotated function is NORMAL, not evidence of a pin. The
-  premise this row chased for several rounds — that an un-annotated return starts at `-1` and
-  something must have written it — **is false.**
-
-  What is actually true, and is the whole remaining question: the checker's `TyFunc` for `pick`
-  renders `i32 | string` (measured), while the AST's `fn.fnRet` node renders `string`; for
-  `pick4` the same node renders the union. Both functions have an inferred return and differ
-  only in whether the PARAM is annotated.
-
-* **`pick` IS MONOMORPHIZED AND `pick4` IS NOT — instrument validated this time, which is what
-  makes the rest of the trail trustworthy.** An unconditional `emitFail` at the top of the mono
-  clone path prints `fn=[pick] fnRet=-1` and prints NOTHING for `pick4`. So the clone is
-  created with `fnRet = -1`, and the `string` pin lands on it afterwards. All five `nret`
-  assignments in `emit_mono` were then probed with `emitFail` (the earlier `tErr` versions
-  measured nothing) and none fires, so `mkFunc` receives `-1`.
-
-  `synthRetAnnots` IS called (validated the same way), yet none of its fourteen non-void
-  `fn.fnRet = synthTypeRefTy(...)` rungs fires either.
-
-* **HALF THE BISECT IS DONE: `pick`'s `fn.fnRet` is STILL `-1` on ENTRY to `synthRetAnnots`.**
-  So the `string` pin lands at or after that pass, not before it — which, with all fourteen of
-  its rungs silent, means the writer is **downstream of `synthRetAnnots`** and is not any
-  `.fnRet = ` assignment `grep` can see.
-
-  The other half is blocked by the instrument, and the workaround is worth recording: `emitFail`
-  ABORTS the build at its first firing, so an ENTRY probe and an EXIT probe cannot both report
-  in one run — the EXIT line simply never appears. Run them as two separate builds, or use a
-  counter that only fires on the second visit.
-
-* **A NOTE ON THE OTHER SIDE, from the emitter's own comment at the `retUnionFlag` rung:** when
-  the functype and the body move to the box, the CALL-RESULT classifier (`computeRetInference`
-  / `criClassify`) is a THIRD home that must move in the same change, or the receiving local
-  stays an i32 and 8 of 520 grid cells go from a loud reject to check-clean invalid wasm.
-  Annotating the receiving binding does NOT substitute for it — measured here, and it still
-  fails — so budget that site into the fix rather than discovering it afterwards.
-
-* **BUT THE FLAG'S ORIGIN IS STILL UNEXPLAINED, and `computeVoidFns` appears not to be it.**
-  Its only path to `fRetVoid[i] = 1` is gated on `!blockHasValuedReturn(fn.fnBody)`, and that
-  helper DOES recurse into an `if` (`ifChainHasValuedReturn`), so `if b { return 1 }` should
-  make it false and leave the function non-void. Declaring void or non-void neighbours before
-  and after `pick` shifts nothing, so it is not an off-by-one position read either. **The next
-  attempt should establish where `fRetVoid` becomes 1 for this function before changing
-  anything** — the other writer is `emit_rewrite`'s void-adopted-lambda pin, and a
-  `buildFnMap#2` rebuild re-seeds the column from `retVoidAnnFlag` after `computeVoidFns` runs.
-
-* **AND GUARDING THE LEG IS NOT SUFFICIENT ON ITS OWN — measured, reverted.** Adding
-  `&& fRetKind[rvPos] != "union"` re-routes the returns to `emitReturnExit`/`emitReturnValue`
-  and converts the miscompile into the loud "no value box" refusal, which is a real
-  improvement in kind but not `runs`. Combining it with the A20 gate relaxation does NOT
-  finish the job either: the probe stays invalid wasm and the `relay` control goes from loud to
-  silent. So at least one more site is involved beyond the leg and the gate.
-
-Repro (check rc 0, invalid wasm):
+Repro (runs, prints `1`):
 
     const by: i32 | string = 7
     function pick(b) {
@@ -24008,7 +23857,7 @@ Repro (check rc 0, invalid wasm):
     }
     print(pick(true))
     print(by)
-    // vl check rc 0; vl run -> Invalid input WebAssembly code: expected (ref $type), found i32
+    // PRINTS 1
 
 ### D969 — D962 traded a LOUD refusal for a SILENT miscompile on the UN-ANNOTATED destination; closed, and the two questions were FIGHTING
 

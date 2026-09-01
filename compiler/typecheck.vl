@@ -28171,10 +28171,29 @@ export function checkProgram(rootIx: i32) {
           const ert0 = T.tys[er]
           if ert0 is TyVar { generic = true }
           if tyIsDeferredJoin(er) { generic = true }
+          // D970 — AN UN-ANNOTATED PARAM DOES NOT MAKE A CONCRETE UNION RETURN GENERIC.
+          // The skip below exists for a return that is per-call-site; a join over the body's
+          // OWN literals is not that. Kept narrow: only when the return is already a concrete
+          // `TyUnion` (a deferred join is still skipped, which is the case the comment above
+          // is really about).
+          let retIsConcreteUnion = false
+          if !generic {
+            const ertU = T.tys[er]
+            if ertU is TyUnion {
+              // ...and only when the body genuinely returns two DIFFERENT concrete types.
+              // That is what distinguishes a join over the function's own literals from a
+              // per-call-site result: `pick(a, b, c) { if a { return b }; c }` returns two
+              // TyVars and must keep the skip (admitting it turns `relay(x) { pick(x, "s",
+              // true) }` from a loud refusal into invalid wasm — measured).
+              if a20RetSetDisagrees(efn.fnBody) { retIsConcreteUnion = true }
+            }
+          }
           let gp = 0
           while gp < eftt.fnParamTypes.length {
             const pt = T.tys[eftt.fnParamTypes[gp]]
-            if pt is TyVar { generic = true }
+            if pt is TyVar {
+              if !retIsConcreteUnion { generic = true }
+            }
             if tyIsDeferredJoin(eftt.fnParamTypes[gp]) { generic = true }
             gp = gp + 1
           }
@@ -28771,6 +28790,53 @@ export function inferLetIxAt(i: i32) { inferLetIx[i] }
 // meaning-preserving rewrite should hand the old node's type to the new one. This is the one
 // place that writes the column, so the growth discipline (`push(-1)` up to the index) lives
 // here rather than at each call.
+// D970 — does this body return two DIFFERENT CONCRETE types? The A20 gate uses it to tell a
+// join over the function's OWN literals (which every instantiation shares) from a
+// per-call-site result (which it must not register a box for). A return whose type carries a
+// type VARIABLE is ignored, which is what keeps the deferred-join family on the old path.
+function a20RetSetDisagrees(blockIx: i32): boolean {
+  const rets: i32[] = []
+  a20CollectRets(blockIx, rets)
+  let seen = -1
+  let i = 0
+  while i < rets.length {
+    const rt = nodeTyIxOf(rets[i])
+    if rt >= 0 {
+      if !tyHasTyVar(rt) {
+        if seen < 0 { seen = rt }
+        else if seen != rt { return true }
+      }
+    }
+    i = i + 1
+  }
+  false
+}
+
+function a20CollectRets(blockIx: i32, out: i32[]) {
+  if blockIx < 0 { return 0 }
+  const b = P.nodes[blockIx]
+  if b is Block {
+    const stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      const st = P.nodes[stmts[i]]
+      if st is RetStmt {
+        if st.retArg >= 0 { out.push(st.retArg) }
+      } else if st is IfStmt {
+        a20CollectRets(st.ifThen, out)
+        a20CollectRets(st.ifElse, out)
+      }
+      if i == stmts.length - 1 {
+        if !(st is RetStmt) {
+          if !(st is IfStmt) { out.push(stmts[i]) }
+        }
+      }
+      i = i + 1
+    }
+  }
+  0
+}
+
 export function nodeTyCarry(dst: i32, src: i32) {
   if dst < 0 { return 0 }
   const ty = nodeTyIxOf(src)

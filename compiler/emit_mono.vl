@@ -243,32 +243,49 @@ import {
 // a RECURSIVE generic used at multiple shapes would mis-resolve its self-call
 // (none exists in the corpus; the first-instance/replacement path is exact).
 
+// PREFER the checker's recorded function type: for an UN-annotated lambda arg it inferred the param
+// types from the generic param's (substituted) expected type at the call site — `mapArr<T,R>(xs, f)`
+// called `mapArr([1,2,3], (x) => x*2)` types `f` as `(i32) => i32`, which the syntactic build below
+// CANNOT recover (the lambda param has no annotation). Used only when it yields a complete
+// `(params)=>ret` name; a named-fn arg / a case the checker didn't type falls through. The checker
+// renders a struct part STRUCTURALLY (`(i32) => {x: i32}`); NOMINALIZE it once here so the bound
+// type param (`R = P`) — and thus every downstream site (`R[]` validation, the result ref-list
+// interning, the binding type) — keys on the declared name, rather than each re-bridging the shape.
+// THE GATE ON THE ARENA, the render kept as the ARTEFACT. "Is this a function type" is a
+// question the arena answers outright (`nodeTyIsFunc`); `annArrowAt` was re-deriving it from
+// the render's top-level arrow, having spelled the type out first to do so.
+//
+// AND THE RENDER IS GONE TOO now. `nominalizeFnType(cn)` used to finish the job — decompose
+// the rendered function name with `annFnDecompose`, run each piece through
+// `resolveShapeToNominal`, reassemble — which is the same walk `TyFunc` already holds as
+// `fnParamTypes` / `fnRet`. `nominalizeFnTypeOfTy` does it on the type; the name twin had zero
+// callers afterwards and is deleted.
+//
+// Measured before the swap, not after: lockstep over the corpus put the two answers at 0
+// disagreements, and the gate FIRES on 8 files, so the 0 is a replacement rather than an inert
+// arm. B201 is why this is the arena and not the mono layer's usual spelling: the question is
+// about the node's OWN checker type, which is exactly what the arena holds — unlike a
+// monomorphized instance's SUBSTITUTED type, which is built nowhere but the annotation text.
+
+// A struct or struct-ARRAY annotation NAME usable as a monomorphization pin during the mono
+// pass (when the locals/struct-classification tables are unbuilt): the bare struct `P` (`T`
+// binds it), or a struct array `P[]` (`T[]` binds its element). "" for anything else (a scalar
+// / list annotation already resolves through the `expr*` classifiers below). One level of `[]`
+// — a deeper `P[][]` stays out of scope (falls through to the existing behavior).
+//
+// The `[]` test + cut are `emit_base`'s two homes (`nameIsArray` / `arrElemNameRaw`,
+// #1175). `n >= 3` stays in front of the test — it excludes the degenerate `"[]"`, whose
+// raw cut is "" and which `isSName("")` would answer for, not a widening this site asks.
+// D970 — does this function's RETURN SET disagree with `reIx`, the type of the ONE return
+// expression the mint above is derived from? True when any valued return in the body has a
+// different recorded type. Conservative by construction: it answers false whenever it cannot
+// see the returns, so every single-return instance keeps today's mint byte for byte.
+import { collectValuedReturnsIn } from "./emit_query"
+
 function monoArgFnTypeName(argIx: i32, _fnIx: i32) {
   const ax = unwrapParen(argIx)
   const an = P.nodes[ax]
-  // PREFER the checker's recorded function type: for an UN-annotated lambda arg it inferred the param
-  // types from the generic param's (substituted) expected type at the call site — `mapArr<T,R>(xs, f)`
-  // called `mapArr([1,2,3], (x) => x*2)` types `f` as `(i32) => i32`, which the syntactic build below
-  // CANNOT recover (the lambda param has no annotation). Used only when it yields a complete
-  // `(params)=>ret` name; a named-fn arg / a case the checker didn't type falls through. The checker
-  // renders a struct part STRUCTURALLY (`(i32) => {x: i32}`); NOMINALIZE it once here so the bound
-  // type param (`R = P`) — and thus every downstream site (`R[]` validation, the result ref-list
-  // interning, the binding type) — keys on the declared name, rather than each re-bridging the shape.
-  // THE GATE ON THE ARENA, the render kept as the ARTEFACT. "Is this a function type" is a
-  // question the arena answers outright (`nodeTyIsFunc`); `annArrowAt` was re-deriving it from
-  // the render's top-level arrow, having spelled the type out first to do so.
-  //
-  // AND THE RENDER IS GONE TOO now. `nominalizeFnType(cn)` used to finish the job — decompose
-  // the rendered function name with `annFnDecompose`, run each piece through
-  // `resolveShapeToNominal`, reassemble — which is the same walk `TyFunc` already holds as
-  // `fnParamTypes` / `fnRet`. `nominalizeFnTypeOfTy` does it on the type; the name twin had zero
-  // callers afterwards and is deleted.
-  //
-  // Measured before the swap, not after: lockstep over the corpus put the two answers at 0
-  // disagreements, and the gate FIRES on 8 files, so the 0 is a replacement rather than an inert
-  // arm. B201 is why this is the arena and not the mono layer's usual spelling: the question is
-  // about the node's OWN checker type, which is exactly what the arena holds — unlike a
-  // monomorphized instance's SUBSTITUTED type, which is built nowhere but the annotation text.
+
   if nodeTyIsFunc(ax) {
     const cn = nodeTyName(ax)
     if cn != "" { return nominalizeFnTypeOfTy(nodeTyIxOf(ax)) }
@@ -299,15 +316,32 @@ function monoArgFnTypeName(argIx: i32, _fnIx: i32) {
   ""
 }
 
-// A struct or struct-ARRAY annotation NAME usable as a monomorphization pin during the mono
-// pass (when the locals/struct-classification tables are unbuilt): the bare struct `P` (`T`
-// binds it), or a struct array `P[]` (`T[]` binds its element). "" for anything else (a scalar
-// / list annotation already resolves through the `expr*` classifiers below). One level of `[]`
-// — a deeper `P[][]` stays out of scope (falls through to the existing behavior).
-//
-// The `[]` test + cut are `emit_base`'s two homes (`nameIsArray` / `arrElemNameRaw`,
-// #1175). `n >= 3` stays in front of the test — it excludes the degenerate `"[]"`, whose
-// raw cut is "" and which `isSName("")` would answer for, not a widening this site asks.
+function monoRetJoinDisagrees(fnNodeIx: i32, reIx: i32): boolean {
+  if reIx < 0 { return false }
+  if fnNodeIx < 0 { return false }
+  const f = P.nodes[fnNodeIx]
+  if f is FuncDecl {
+    const rets: i32[] = []
+    collectValuedReturnsIn(f.fnBody, rets)
+    let i = 0
+    while i < rets.length {
+      const rt = nodeTyIxOf(rets[i])
+      if rt >= 0 {
+        // CONCRETE disagreement only. A return whose type is (or contains) a type VARIABLE
+        // is per-call-site — `pick(a, b, c) { if a { return b }; c }` returns two TyVars —
+        // and declining the mint for it turns the deferred-join family from a loud refusal
+        // into invalid wasm (measured: `relay(x) { pick(x, "s", true) }`). Only a genuine
+        // multi-arm CONCRETE join is this row's defect.
+        if !tyHasTyVar(rt) {
+          if rt != reIx { return true }
+        }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
 function monoStructAnnName(name: string) {
   if isSName(name) { return name }
   const n = name.length
@@ -3833,6 +3867,21 @@ function monoMakeInstance(
             mintName = monoRetRowName(reIx)
             if mintName == "" { mint = false }
           }
+        }
+        // D970 — A MULTI-RETURN FUNCTION IS NOT DESCRIBED BY ONE RETURN EXPRESSION. `reTy`
+        // comes from `fnRetExprOf(...)`, the return expression SINGULAR, so for
+        // `function pick(b) { if b { return 1 }; "s" }` it names `string` — the tail — while
+        // the function's actual result is the join `i32 | string`. Minting that pins the
+        // instance's `fnRet` to one arm; `emitReturnValue` then takes its plain-emit arm while
+        // the FUNCTYPE (computed independently by `criClassify`) says the union box, so the
+        // returns go out UNBOXED under a box result: `vl check` rc 0, invalid wasm.
+        //
+        // THE SAME MISTAKE D626 NAMED, one rung over — an inferred return read off the return
+        // EXPRESSION rather than the whole return SET. Declining is this site's own stated
+        // fallback for "cannot name it" (`nret = -1`), and it leaves the instance to the
+        // return-inference path that already handles a union result.
+        if mint {
+          if monoRetJoinDisagrees(monoOrigNode[origFe], reIx) { mint = false }
         }
         if mint { nret = synthTypeRefTy(mintName, -1, reIx) }
       }
