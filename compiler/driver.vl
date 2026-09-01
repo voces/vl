@@ -88,7 +88,11 @@ import {
   ufcsAliasAdd,
   ufcsAliasReset,
 } from "./ast"
-import { parseProgram } from "./parser"
+// `isStmtKeyword` is the PARSER's import-clause bound, shared rather than
+// re-spelled: `modScan` below is a second scanner over the same statement, and
+// the two disagreeing about where an import ENDS is exactly the defect that made
+// a char-quoted specifier adopt the next string literal in the file.
+import { importSpecCharMsg, isStmtKeyword, parseProgram } from "./parser"
 // The identifier-intern table (`docs/internals/identifier-interning-design.md`).
 // The driver owns two of its obligations: the per-compile RESET (R2 — the carrier
 // is keyed by arena INDEX, so a reset arena that reuses index 5 for a different
@@ -297,6 +301,12 @@ export function vcSource(): string {
 let vcDgIdx: i32[] = []
 let vcDgLine: i32[] = []
 let vcDgCol: i32[] = []
+// The 0-based EXCLUSIVE end column of the entry's span, on `vcDgLine`. A token
+// anchor is where `diagEndCol` normally gets a width, and these entries have
+// none — so without this every lex and module-resolution diagnostic rendered as a
+// single-column caret however much source it was about. Equal to `vcDgCol` for an
+// entry with no span (the point rendering).
+let vcDgEnd: i32[] = []
 let vcDgMod: i32[] = []
 // The module whose source `vcLoadToks` is currently loading — a lex diag's
 // owner. The modCompile parse loop sets it per module; 0 elsewhere.
@@ -309,6 +319,28 @@ function vcDgFind(i: i32): i32 {
     k = k + 1
   }
   -1
+}
+// Clear the tokenless-diag side table and the module it attributes to. ONE home
+// for the five assignments, which seven entry points make in lockstep — a table
+// that grew a column and left one of them behind would mis-key every later entry.
+function vcDgReset() {
+  vcDgIdx = []
+  vcDgLine = []
+  vcDgCol = []
+  vcDgEnd = []
+  vcDgMod = []
+  vcLoadMod = 0
+  0
+}
+// Record one tokenless diagnostic's position, owner and span, keyed on the
+// `P.diags` index it is about to occupy. The caller pushes the `P.diags` entry.
+function vcDgPush(idx: i32, line: i32, col: i32, endCol: i32, mod: i32) {
+  vcDgIdx.push(idx)
+  vcDgLine.push(line)
+  vcDgCol.push(col)
+  vcDgEnd.push(endCol)
+  vcDgMod.push(mod)
+  0
 }
 
 // ── H3 module-table state (globals precede their first textual use; the module
@@ -335,6 +367,16 @@ let impNameLine: i32[] = []
 let impNameCol: i32[] = []
 let impSpecLine: i32[] = []
 let impSpecCol: i32[] = []
+// The specifier's EXCLUSIVE end column, so the "unsupported specifier" report can
+// underline the whole literal rather than its first character.
+let impSpecEnd: i32[] = []
+// 1 when a CHAR literal (`'std:fs'`) sat where the specifier belongs. A specifier
+// is a STRING, so this is not a resolvable key and never becomes one — it is
+// recorded rather than skipped because the SENTENCE the reader needs ("that is a
+// char literal") is not the one an empty specifier produces, and only the scan
+// knows which happened. `impSpec` then carries the char literal's RAW LEXEME, the
+// one thing `importSpecCharMsg` needs to show the spelling that was meant.
+let impSpecChar: i32[] = []
 // Flat per-module export-name sets (token scan: `export`-modified declarations).
 let expMod: i32[] = []
 let expName: string[] = []
@@ -446,6 +488,8 @@ const modCacheImpNameLine: i32[] = []
 const modCacheImpNameCol: i32[] = []
 const modCacheImpSpecLine: i32[] = []
 const modCacheImpSpecCol: i32[] = []
+const modCacheImpSpecEnd: i32[] = []
+const modCacheImpSpecChar: i32[] = []
 const modCacheRePublic: string[] = []
 const modCacheReLocal: string[] = []
 const modCacheExpName: string[] = []
@@ -496,10 +540,13 @@ function vcLoadToks(src: string): i32 {
   // rides in the index-keyed `vcDg*` side table.
   let d = 0
   while d < r.diags.length {
-    vcDgIdx.push(P.diags.length)
-    vcDgLine.push(r.diags[d].line)
-    vcDgCol.push(r.diags[d].col)
-    vcDgMod.push(vcLoadMod)
+    vcDgPush(
+      P.diags.length,
+      r.diags[d].line,
+      r.diags[d].col,
+      r.diags[d].endCol,
+      vcLoadMod,
+    )
     P.diags.push({ msg: r.diags[d].msg, at: -1 })
     d = d + 1
   }
@@ -518,11 +565,7 @@ export function compileSrc(): i32 {
   nodeToks = []
   tsReset()
   declNameTok = []
-  vcDgIdx = []
-  vcDgLine = []
-  vcDgCol = []
-  vcDgMod = []
-  vcLoadMod = 0
+  vcDgReset()
   W.bytes = []
   emitErr = ""
   fnNames = []
@@ -639,11 +682,7 @@ export function checkSrc(): i32 {
   nodeToks = []
   tsReset()
   declNameTok = []
-  vcDgIdx = []
-  vcDgLine = []
-  vcDgCol = []
-  vcDgMod = []
-  vcLoadMod = 0
+  vcDgReset()
   fnNames = []
   fnIndices = []
   localNames = []
@@ -687,11 +726,7 @@ export function lintSrc(): i32 {
   nodeToks = []
   tsReset()
   declNameTok = []
-  vcDgIdx = []
-  vcDgLine = []
-  vcDgCol = []
-  vcDgMod = []
-  vcLoadMod = 0
+  vcDgReset()
   vcLoadToks(vcSource())
   const root = parseProgram()
   if P.diags.length > 0 { return -1 }
@@ -776,11 +811,7 @@ export function lintGraph(): i32 {
       nodeToks = []
       tsReset()
       declNameTok = []
-      vcDgIdx = []
-      vcDgLine = []
-      vcDgCol = []
-      vcDgMod = []
-      vcLoadMod = 0
+      vcDgReset()
       vcLoadToksMod(m)
       const root = parseProgram()
       if P.diags.length == 0 {
@@ -833,11 +864,7 @@ export function formatSrc(): i32 {
   nodeToks = []
   tsReset()
   declNameTok = []
-  vcDgIdx = []
-  vcDgLine = []
-  vcDgCol = []
-  vcDgMod = []
-  vcLoadMod = 0
+  vcDgReset()
   const src = vcSource()
   // Lex once, feeding tokens into the parser AND the formatter's comment table
   // (the formatter slices spans from `src` and places comments around them).
@@ -861,12 +888,16 @@ export function formatSrc(): i32 {
   }
   let d = 0
   while d < r.diags.length {
-    // Keep the lex diag's real position (`diagLine`/`diagCol` read the vcDg*
-    // side table), so a caller can point at the offending source.
-    vcDgIdx.push(P.diags.length)
-    vcDgLine.push(r.diags[d].line)
-    vcDgCol.push(r.diags[d].col)
-    vcDgMod.push(0)
+    // Keep the lex diag's real position and span (`diagLine`/`diagCol`/
+    // `diagEndCol` read the vcDg* side table), so a caller can point at the
+    // offending source.
+    vcDgPush(
+      P.diags.length,
+      r.diags[d].line,
+      r.diags[d].col,
+      r.diags[d].endCol,
+      0,
+    )
     P.diags.push({ msg: r.diags[d].msg, at: -1 })
     d = d + 1
   }
@@ -902,11 +933,7 @@ export function formatSrc(): i32 {
   nodeToks = []
   tsReset()
   declNameTok = []
-  vcDgIdx = []
-  vcDgLine = []
-  vcDgCol = []
-  vcDgMod = []
-  vcLoadMod = 0
+  vcDgReset()
   vcLoadToks(vcFmtOut)
   if P.diags.length == 0 { parseProgram() }
   if P.diags.length > 0 { return -2 }
@@ -936,11 +963,7 @@ export function checkSrcSym(): i32 {
   nodeToks = []
   tsReset()
   declNameTok = []
-  vcDgIdx = []
-  vcDgLine = []
-  vcDgCol = []
-  vcDgMod = []
-  vcLoadMod = 0
+  vcDgReset()
   fnNames = []
   fnIndices = []
   localNames = []
@@ -1564,14 +1587,22 @@ function emitErrTokIx(): i32 {
 // The diagnostic's END column: the anchor token's start + its lexeme length
 // (lexemes never span lines, so the end LINE is `diagLine`). A parse diag is
 // anchored at a TOKEN index; a type diag at an AST NODE index, resolved through
-// the `nodeToks` side table — the same resolution `tErr` applies. A tokenless
-// diag (lex / module-resolution) or a positionless/out-of-range anchor degrades
-// to `diagCol` — a zero-width range at the start, which an LSP host may widen
-// client-side.
+// the `nodeToks` side table — the same resolution `tErr` applies. A TOKENLESS
+// diag (lex / module-resolution) carries its OWN end in the `vcDg*` side table,
+// because there is no token to derive one from — a char literal of the wrong
+// length is about the whole literal and rendered as a one-column caret until it
+// could say so. A positionless/out-of-range anchor, or a side-table entry with no
+// span recorded, degrades to `diagCol` — a zero-width range at the start, which an
+// LSP host may widen client-side.
 export function diagEndCol(i: i32): i32 {
   let at = -1
   if i < P.diags.length {
-    if vcDgFind(i) < 0 { at = P.diags[i].at }
+    const k = vcDgFind(i)
+    if k >= 0 {
+      if vcDgEnd[k] > vcDgCol[k] { return vcDgEnd[k] }
+      return diagCol(i)
+    }
+    at = P.diags[i].at
   } else {
     const j = i - P.diags.length
     if j < T.diags.length {
@@ -1626,6 +1657,8 @@ export function modReset(): i32 {
   impNameCol = []
   impSpecLine = []
   impSpecCol = []
+  impSpecEnd = []
+  impSpecChar = []
   expMod = []
   expName = []
   expDeclLine = []
@@ -1728,6 +1761,8 @@ function modScanCached(m: i32, key: string, src: string): i32 {
       impNameCol.push(modCacheImpNameCol[ii])
       impSpecLine.push(modCacheImpSpecLine[ii])
       impSpecCol.push(modCacheImpSpecCol[ii])
+      impSpecEnd.push(modCacheImpSpecEnd[ii])
+      impSpecChar.push(modCacheImpSpecChar[ii])
       ii = ii + 1
     }
     let ri = modCacheReOff[ci]
@@ -1766,6 +1801,8 @@ function modScanCached(m: i32, key: string, src: string): i32 {
     modCacheImpNameCol.push(impNameCol[ci2])
     modCacheImpSpecLine.push(impSpecLine[ci2])
     modCacheImpSpecCol.push(impSpecCol[ci2])
+    modCacheImpSpecEnd.push(impSpecEnd[ci2])
+    modCacheImpSpecChar.push(impSpecChar[ci2])
     ci2 = ci2 + 1
   }
   modCacheImpEnd.push(modCacheImpSpec.length)
@@ -2108,9 +2145,21 @@ function modScan(m: i32, src: string): i32 {
       }
       // Forward to the path STRING (the `from` keyword rides as an IDENT). The
       // STRING token's `text` keeps its surrounding quotes — strip them.
+      //
+      // BOUNDED, exactly as `parseImport` bounds its own walk: a NEWLINE or SEMI
+      // ends the statement and so does a statement-start keyword. Unbounded, this
+      // loop skipped every token that was not a STRING — past the end of the
+      // import, past the end of the LINE — and adopted the next string literal
+      // anywhere in the file as this import's specifier. A single-quoted specifier
+      // is the everyday way to reach that: `'std:fs'` lexes as a CHAR, not a
+      // STRING, so the scan walked on and blamed an `it("passes", …)` fifty lines
+      // down. The parser grew this bound for the same reason and this scanner
+      // never did; `isStmtKeyword` is imported from there so they cannot drift.
       let spec = ""
       let specLine = kwLine
       let specCol = kwCol
+      let specEnd = kwCol
+      let specChar = 0
       let scanning = true
       while scanning && i < toks.length {
         const sk = toks[i].kind
@@ -2118,6 +2167,7 @@ function modScan(m: i32, src: string): i32 {
           spec = toks[i].text
           specLine = toks[i].line
           specCol = toks[i].col
+          specEnd = toks[i].col + toks[i].text.length
           if spec.length >= 2 {
             if spec[0] == '"' && spec[spec.length - 1] == '"' {
               spec = spec.slice(1, spec.length - 1)
@@ -2125,13 +2175,28 @@ function modScan(m: i32, src: string): i32 {
           }
           i = i + 1
           scanning = false
-        } else if sk == "EOF" {
+        } else if sk == "CHAR" {
+          // A char literal in the specifier slot. Recorded, not skipped: it is not
+          // a resolvable key, and the reader needs to be told THAT rather than
+          // that the import has no specifier at all. `spec` carries the RAW
+          // lexeme, which is what `importSpecCharMsg` re-quotes.
+          spec = toks[i].text
+          specLine = toks[i].line
+          specCol = toks[i].col
+          specEnd = toks[i].col + toks[i].text.length
+          specChar = 1
+          i = i + 1
+          scanning = false
+        } else if sk == "EOF" || sk == "NEWLINE" || sk == "SEMI" {
+          scanning = false
+        } else if isStmtKeyword(sk) {
           scanning = false
         } else {
           i = i + 1
         }
       }
-      const key = modResolveSpecifier(spec, modKeys[m])
+      let key = ""
+      if specChar == 0 { key = modResolveSpecifier(spec, modKeys[m]) }
       let n = 0
       while n < names.length {
         impMod.push(m)
@@ -2143,6 +2208,8 @@ function modScan(m: i32, src: string): i32 {
         impNameCol.push(nameCols[n])
         impSpecLine.push(specLine)
         impSpecCol.push(specCol)
+        impSpecEnd.push(specEnd)
+        impSpecChar.push(specChar)
         n = n + 1
       }
       if names.length == 0 {
@@ -2155,6 +2222,8 @@ function modScan(m: i32, src: string): i32 {
         impNameCol.push(kwCol)
         impSpecLine.push(specLine)
         impSpecCol.push(specCol)
+        impSpecEnd.push(specEnd)
+        impSpecChar.push(specChar)
       }
     } else if k == "EXPORT" && depth == 0 {
       if i + 1 < toks.length && toks[i + 1].kind == "LBRACE" {
@@ -2197,9 +2266,13 @@ function modScan(m: i32, src: string): i32 {
             i = i + 1
           }
         }
+        // BOUNDED and CHAR-aware for the same reasons the import arm above is —
+        // `export { a } from 'dep'` stole the next string literal too.
         let rspec = ""
         let rspecLine = rkwLine
         let rspecCol = rkwCol
+        let rspecEnd = rkwCol
+        let rspecChar = 0
         let rscan = true
         while rscan && i < toks.length {
           const sk = toks[i].kind
@@ -2207,6 +2280,7 @@ function modScan(m: i32, src: string): i32 {
             rspec = toks[i].text
             rspecLine = toks[i].line
             rspecCol = toks[i].col
+            rspecEnd = toks[i].col + toks[i].text.length
             if rspec.length >= 2 {
               if rspec[0] == '"' && rspec[rspec.length - 1] == '"' {
                 rspec = rspec.slice(1, rspec.length - 1)
@@ -2214,13 +2288,24 @@ function modScan(m: i32, src: string): i32 {
             }
             i = i + 1
             rscan = false
-          } else if sk == "EOF" {
+          } else if sk == "CHAR" {
+            rspec = toks[i].text
+            rspecLine = toks[i].line
+            rspecCol = toks[i].col
+            rspecEnd = toks[i].col + toks[i].text.length
+            rspecChar = 1
+            i = i + 1
+            rscan = false
+          } else if sk == "EOF" || sk == "NEWLINE" || sk == "SEMI" {
+            rscan = false
+          } else if isStmtKeyword(sk) {
             rscan = false
           } else {
             i = i + 1
           }
         }
-        const rkey = modResolveSpecifier(rspec, modKeys[m])
+        let rkey = ""
+        if rspecChar == 0 { rkey = modResolveSpecifier(rspec, modKeys[m]) }
         let rn = 0
         while rn < rnames.length {
           // Pull the symbol (an import edge) so the merge binds it and the host fetches `spec`.
@@ -2233,6 +2318,8 @@ function modScan(m: i32, src: string): i32 {
           impNameCol.push(rnameCols[rn])
           impSpecLine.push(rspecLine)
           impSpecCol.push(rspecCol)
+          impSpecEnd.push(rspecEnd)
+          impSpecChar.push(rspecChar)
           // Record the PUBLIC re-export (its merged target is resolved in `modCompile`).
           reExpMod.push(m)
           reExpPublic.push(rlocals[rn])
@@ -2305,8 +2392,22 @@ function modRecomputePending(): i32 {
 // several names pulled from one unresolvable specifier) still fold into one.
 let modDiagLine: i32[] = []
 let modDiagCol: i32[] = []
+let modDiagEnd: i32[] = []
 let modDiagMod: i32[] = []
 function modDiag(m: i32, line: i32, col: i32, msg: string): i32 {
+  modDiagSpan(m, line, col, col, msg)
+}
+// `modDiag` with a SPAN — `[col, endCol)` on `line`, for a report whose subject is
+// a whole lexeme the reader has to see (the specifier token). These diagnostics
+// are tokenless, so the span cannot be derived downstream; `endCol == col` is the
+// point rendering every other module report keeps.
+function modDiagSpan(
+  m: i32,
+  line: i32,
+  col: i32,
+  endCol: i32,
+  msg: string,
+): i32 {
   let i = 0
   while i < modDiags.length {
     if modDiagMod[i] == m && modDiags[i] == msg { return 0 }
@@ -2315,6 +2416,7 @@ function modDiag(m: i32, line: i32, col: i32, msg: string): i32 {
   modDiags.push(msg)
   modDiagLine.push(line)
   modDiagCol.push(col)
+  modDiagEnd.push(endCol)
   modDiagMod.push(m)
   0
 }
@@ -2415,20 +2517,32 @@ function modVisit(m: i32, depth: i32): i32 {
       if key == "" {
         // Texts mirror the host's `loadProgram` — keep them aligned. Spec-shaped
         // problems anchor at the specifier STRING token of THIS import.
-        if modKeyIsStd(modKeys[m]) && modIsRelative(spec) {
-          modDiag(
+        if impSpecChar[i] == 1 {
+          // A CHAR literal where the specifier belongs — the parser's sentence,
+          // shared (`importSpecCharMsg`), because the two scanners must agree.
+          modDiagSpan(
             m,
             impSpecLine[i],
             impSpecCol[i],
+            impSpecEnd[i],
+            importSpecCharMsg(spec),
+          )
+        } else if modKeyIsStd(modKeys[m]) && modIsRelative(spec) {
+          modDiagSpan(
+            m,
+            impSpecLine[i],
+            impSpecCol[i],
+            impSpecEnd[i],
             "Unsupported import specifier \"" +
               spec +
               "\" — std modules import only via `std:` specifiers (relative imports inside std are not allowed)",
           )
         } else {
-          modDiag(
+          modDiagSpan(
             m,
             impSpecLine[i],
             impSpecCol[i],
+            impSpecEnd[i],
             "Unsupported import specifier \"" +
               spec +
               "\" — supported: relative paths (`./`, `../`) and `std:` modules; bare specifiers are not yet implemented",
@@ -2437,24 +2551,27 @@ function modVisit(m: i32, depth: i32): i32 {
       } else {
         const d = modIndexOfKey(key)
         if d < 0 {
-          modDiag(
+          modDiagSpan(
             m,
             impSpecLine[i],
             impSpecCol[i],
+            impSpecEnd[i],
             "Cannot resolve import \"" + spec + "\" (no module `" + key + "`)",
           )
         } else if modFound[d] == 0 {
-          modDiag(
+          modDiagSpan(
             m,
             impSpecLine[i],
             impSpecCol[i],
+            impSpecEnd[i],
             "Cannot resolve import \"" + spec + "\" (no module `" + key + "`)",
           )
         } else if modState[d] == 1 {
-          modDiag(
+          modDiagSpan(
             m,
             impSpecLine[i],
             impSpecCol[i],
+            impSpecEnd[i],
             "Import cycle detected through \"" +
               spec +
               "\" (module `" +
@@ -2464,10 +2581,11 @@ function modVisit(m: i32, depth: i32): i32 {
         } else {
           if modState[d] == 0 {
             if depth >= MOD_DEPTH_MAX {
-              modDiag(
+              modDiagSpan(
                 m,
                 impSpecLine[i],
                 impSpecCol[i],
+                impSpecEnd[i],
                 "Import chain exceeds the maximum depth (" +
                   i32ToStr(MOD_DEPTH_MAX) +
                   ") at \"" +
@@ -2508,6 +2626,7 @@ function modCompile(emit: i32): i32 {
   modDiags = []
   modDiagLine = []
   modDiagCol = []
+  modDiagEnd = []
   modDiagMod = []
   let s = 0
   while s < modKeys.length {
@@ -2516,14 +2635,17 @@ function modCompile(emit: i32): i32 {
   }
   modVisit(0, 0)
   if modDiags.length > 0 {
-    // Tokenless (no tokens are loaded yet): position + owner ride the `vcDg*`
-    // side table, keyed on each entry's `P.diags` index.
+    // Tokenless (no tokens are loaded yet): position, span + owner ride the
+    // `vcDg*` side table, keyed on each entry's `P.diags` index.
     let d = 0
     while d < modDiags.length {
-      vcDgIdx.push(P.diags.length)
-      vcDgLine.push(modDiagLine[d])
-      vcDgCol.push(modDiagCol[d])
-      vcDgMod.push(modDiagMod[d])
+      vcDgPush(
+        P.diags.length,
+        modDiagLine[d],
+        modDiagCol[d],
+        modDiagEnd[d],
+        modDiagMod[d],
+      )
       P.diags.push({ msg: modDiags[d], at: -1 })
       d = d + 1
     }
