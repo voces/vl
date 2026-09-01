@@ -23806,6 +23806,64 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   invalid wasm.
 
 ---
+### D982 — a JSON value tree: `is` against a SELF-REFERENTIAL array arm is refused, and only when the union also has a `null` arm
+
+**loud check reject · owner-scheduled (a JSON value tree is the shape serde Stage 1 hangs on) · clause 2**
+
+    type J = null | string | J[]
+    function f(j: J) {
+      if j is J[] { print(1) } else { print(0) }
+    }
+    f("hi")
+
+* **THE MESSAGE NAMES THE ARM IT IS REFUSING.** `` `is` check type 'J[]' is not a variant of
+  string | J[] | null `` — `J[]` is printed inside the very union it is said not to belong to.
+  On the owner's full spelling the same refusal reads `not a variant of boolean | f64 | string
+  | Json[] | {[string]: Json} | null`.
+
+* **THE TRIGGER IS THE `null` ARM, AND THAT IS MEASURED, NOT ASSUMED.** Seven spellings, one
+  variable at a time:
+
+  | union | `is J[]` |
+  | --- | --- |
+  | `string \| J[]` | runs |
+  | `boolean \| string \| J[]` | runs |
+  | `f64 \| string \| J[]` | runs |
+  | `null \| string \| i32[]` (array arm NOT recursive) | runs |
+  | `null \| string \| J[]` | **refused** |
+  | `null \| boolean \| f64 \| string \| J[]` | **refused** |
+  | `null \| boolean \| f64 \| string \| J[] \| {[string]: J}` | **refused** |
+
+  So neither self-reference alone nor a `null` arm alone is enough — `type R = string | R[]`
+  with `if r is R[]` runs today. It takes both.
+
+* **THE TWO SPELLINGS ARE DIFFERENT `Ty` ROWS, and `assignable` fails BOTH directions.** A
+  probe on the guard in `checkIsExprNode` prints `assignable=no widenNotVariant=no chk=(string
+  | J[] | null)[] base=string | J[]`, and per-arm: arm 1 is `J[]` at row 41 while `chkTy` is
+  row 49. The `is` spelling mints an EXPANDED element (`string | J[] | null`) where the
+  declaration's arm holds the alias. `nameToTy` is not hash-consed — the same observation
+  `synthParamAnnots` records for its own site — so the two spellings never land on one row.
+
+* **`assignable` ALREADY HAS A COINDUCTIVE GUARD**, so "recursion is unhandled" is the wrong
+  reading: it pushes each `(src, dst)` pair and returns true on a repeat. The guard does not
+  fire here because the pair differs at every level — one side keeps unrolling.
+
+* **OPEN: why the `null` arm specifically flips it.** With no `null` the outer type is a
+  `TyUnion` and `is J[]` appears to reach the arm's own row (`src == dst` short-circuits);
+  with `null` it is a `TyNullable`, `checkIsExprNode` strips to `ot.nInner`, and the re-resolved
+  `J[]` is a fresh expansion. That is the reading the rows above fit, and it is NOT yet proven
+  — prove it before fixing it.
+
+  **Careful with the probe**: `tyToStr` on the recursive ELEMENT does not terminate. A probe
+  that renders `aElem` hangs the compiler build; print row INDICES for elements, names only for
+  whole arms.
+
+* **A SECOND, SEPARATE DEFECT SITS BEHIND IT.** `string | J[] | {[string]: J}` — array arm and
+  map arm together, no `null` — passes `check` and then fails at run with
+  `0: <unknown>!<wasm function 4121>`. That is a different outcome from this row's and wants
+  its own row once this one is closed; do not fold them together on the strength of both
+  involving `J[]`.
+
 ### D976 — a closure-valued FIELD called on a HOLE-typed parameter: the call lowers correctly and `print` picks the wrong import
 
 **check-clean invalid wasm · reported by the owner, minimized by vl-b7, verified here · `scripts/capability-probes/hole-param-closure-field-call.vl` is the standing measurement**
