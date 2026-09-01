@@ -223,21 +223,30 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   calling convention the emitter does not use — a lifted capturing instance already
   takes its env as the leading param and `emitDirectCall` already pushes it. Closed by
   DELETING the refusal; capability probes 9/9.
-- **serde OQ-1..OQ-7** (`docs/serde-design.md` §Open questions) — none block Stage 0
-  (in flight); Stage 1/2 scheduling wants OQ-1 (surface spelling) and OQ-2 (union
-  ordering) settled first.
-  **CRITIQUED 2026-09-01** — three-lens panel (consistency / cross-language / performance)
-  + synthesis, `docs/internals/serde-critique-synthesis.md`. Architecture holds; **seven
-  owner decisions A–G** are open there: (A) unknown-field policy and its three siblings
-  (case, duplicate keys, `null` vs omitted — recommended reject / exact / reject / always
-  emit `null`); (B) i64 on the wire (recommended: always a JSON number, add
-  `parseI64`/`parseI32`); (C) untagged refusal rule = first-token or required-key-set
-  distinguishable (recommended adopt); (D) cycles — static acyclic-shape predicate + depth
-  cap (recommended), reference-identity keys ruled separately; (E) VLB 8-byte shape
-  fingerprint header (recommended yes); (F) reopen OQ-6, newtypes transparent
-  (recommended); (G) stage 1 = value tree + parser, re-derive §Approach 1 with a POSITION
-  axis. Engineering fallout filed: D1008 (`u8[]` struct field, clause 2), D1009/D1010
-  (`null` membership in a recursive union at the checker), plus the routing table in the
+- **serde OQ-1..OQ-11** (`docs/serde-design.md` §Open questions) — **decisions A–G RULED
+  2026-09-01** ("Recommendations all sound reasonable to me"), after the three-lens critique
+  panel (consistency / cross-language / performance) + synthesis,
+  `docs/internals/serde-critique-synthesis.md`. Architecture holds. One clause each:
+  **(A)** reject unknown fields, exact case-sensitive matching, reject duplicate keys, always
+  emit `"f": null` → new **OQ-8**;
+  **(B)** `i64` is always a JSON NUMBER, never a decimal string → new **OQ-9**
+  (`parseI64`/`parseI32` land separately; the I-JSON framing was NOT verified and the ruling
+  does not rest on it);
+  **(C)** untagged arms must differ in FIRST TOKEN or REQUIRED KEY SET → **OQ-7** amended;
+  **(D)** build the static acyclic-shape predicate + depth-cap floor + N/4N timing probe →
+  §Cycles, with reference-identity keys split out OPEN as **OQ-11** (a language question) and
+  `serializeUnchecked` still deferred;
+  **(E)** VLB header carries an 8-byte wire-relevant shape fingerprint → new **OQ-10**;
+  **(F)** **OQ-6 REVERSED** — newtypes accepted transparently, erased at emit, brand kept by
+  the checker (the `Buf`/address hazard is its open remainder);
+  **(G)** **Stage 1 is UNBLOCKED and SCHEDULED** — `std:json` v1 is a real `Json` VALUE TREE
+  plus a parser and a renderer, not a pull lexer with hand codecs; §Approach 1 is being
+  re-derived with a POSITION axis as separate in-flight work.
+  Still open in that section: OQ-2/OQ-3/OQ-4 (full briefs with recommendations, awaiting a
+  ruling) and OQ-11. Engineering fallout filed: D1008 (`u8[]` struct field, clause 2),
+  D1009/D1010 (`null` membership in a recursive union at the checker — stage 1 ships around
+  both with one-line workarounds), D1011 (filed by the concurrent §Approach 1 pass; not yet
+  in `silent-class-inventory.md` as of this edit — grep before quoting it), plus the routing table in the
   synthesis (print≠toString f64, `type Dec<T> = (Lex) => T`, `parseI64`, `fromUtf8` view,
   seeded string hash, stage clause table).
 

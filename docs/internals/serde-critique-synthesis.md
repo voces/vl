@@ -95,6 +95,13 @@ constraint that `serialize<T>` needs, which already ships and blames the call si
 
 ## Decisions that are the owner's
 
+> **RULED 2026-09-01 — all seven, every recommendation adopted as stated.** The owner read
+> this section and answered: *"Recommendations all sound reasonable to me."* Each decision
+> below carries its ruling at the end of its paragraph; the arguments are left exactly as
+> they were written, because what was adopted is what they said. Applied to
+> `docs/serde-design.md` (header, §Recommendation, §Cycles, OQ-6/OQ-7 amended, OQ-8/9/10/11
+> added), `DECISIONS.md` and the `ROADMAP.md` ledger the same day.
+
 Each is a ruling, not engineering. Recommendation first; the alternative is stated so the
 choice is real.
 
@@ -105,6 +112,8 @@ omit it**. Every one is a named Go v1 regret; Zig defaults to all four. *Recomme
 as stated* — they are this repo's loud-over-silent preference applied to the wire, and the
 first one is what makes OQ-7's ambiguity predicate computable. Alternative: ignore-unknown
 (the JSON-config-forward-compat argument); it costs OQ-7 `{x} | {x,y}` and every shape like it.
+**RULED 2026-09-01: all four adopted as stated — reject unknown, exact case, reject
+duplicates, always emit `null` (serde-design OQ-8).**
 
 **B. Number policy — where `i64` goes on the wire.** The doc says "i64 as decimal string" in
 three places; F5 shows it collides with untagged (`i64 | string` underivable) and makes a
@@ -122,6 +131,9 @@ RFC before quoting either. The decision has the same shape either way:
 *Recommend (1)*, with `parseI64`/`parseI32` added to stage 0's remainder regardless (needed by
 every option, and today the ONLY number path is the funnel — `parseF64` is what the appendix
 sketch uses).
+**RULED 2026-09-01: (1) — `i64` is always a JSON number (serde-design OQ-9), on VL's own
+three reasons and NOT on the RFC, which neither party could check; `parseI64`/`parseI32` are
+landing separately.**
 
 **C. Untagged-union refusal rule** (F3/F4). Narrow "the deriver decides distinguishability
 statically" — which over recursive types is tree-automaton intersection emptiness — to one
@@ -133,6 +145,8 @@ doc's list misses, both RUN today: an open map arm overlaps every object arm
 (`{x:i32} | {[string]:i32}`), and JSON's single number type merges `i32 | f64`. *Recommend:
 adopt the rule.* Alternative: keep the general predicate and accept serde's silent-wrong-arm
 bug class when it under-approximates.
+**RULED 2026-09-01: adopted — first token or required key set, and both missed overlaps are
+recorded in serde-design OQ-7's amendment.**
 
 **D. Cycles — the seen-set has nothing to be.** The ruling was "cycles handled, unsafe variant
 deferred until measured". It is now measured (finding 3 above). Three ways out:
@@ -147,6 +161,9 @@ deferred until measured". It is now measured (finding 3 above). Three ways out:
 *Recommend (1) now, plus the perf critic's 10-line timing probe (walk a ref-bearing shape at N
 and 4N, fail above 6×) so the day the seen-set lands it cannot be quadratic unnoticed; rule (2)
 separately as the language question it is.*
+**RULED 2026-09-01: (1) plus the depth cap as the floor plus the timing probe, all stage-2
+work; (2) is SPLIT OUT and left OPEN as serde-design OQ-11, a language question; (3)
+`serializeUnchecked` stays deferred.**
 
 **E. VLB header shape fingerprint** (F1). Eight bytes, one compare, reusing the recursive
 structural fingerprint OQ-2 already commits to. Turns bincode's silent misread into
@@ -154,6 +171,8 @@ borsh-plus-a-header. Constraints from the regrets: hash wire-relevant structure 
 `serialVersionUID` broke on irrelevant edits), and a format-version byte is not a substitute
 (MessagePack's 2013 `str`/`bin` split). *Recommend: yes.* It slightly weakens "same build only"
 as a positioning line and strengthens it as a guarantee.
+**RULED 2026-09-01: yes — 8 bytes in the VLB header from its first version, wire-relevant
+structure only, alongside (not instead of) the format-version byte (serde-design OQ-10).**
 
 **F. OQ-6 newtypes — reopen.** Ruled "refuse/defer, not opinionated". The consistency critic
 shows the refusal is a capability refusal (`F32Base = new i32`, and `i32` is the domain's
@@ -162,12 +181,17 @@ centre), and that it is anti-correlated with its hazard: from one std file it re
 newtype-branded struct field RUNS today. *Recommend: accept newtypes transparently* — erased
 to their base at emit, brand kept by the checker — and keep the doc's `Buf` observation as the
 thing that actually needs a rule. Cheap to flip now; permanent if it ships as a refusal.
+**RULED 2026-09-01: OQ-6 REVERSED — newtypes accepted transparently, erased at emit, brand
+kept by the checker; the `Buf`/address hazard stays as OQ-6's open remainder.**
 
 **G. Stage 1's shape** — follows from A–C rather than a ruling of its own: with the value tree
 live, `std:json` v1 is a real `Json` value plus a parser, not a token-at-a-time lexer, and
 stage 3 retires less. The doc owes a re-derivation of §Approach 1 from what fact 5 now
 measures, with POSITION as the grid's missing axis (consistency §2 — const RUNS, parameter
 refuses, and the capability probes and the 28-cell grid disagreed for exactly that reason).
+**RULED 2026-09-01: adopted — `std:json` v1 is a `Json` value tree + parser + renderer, and
+stage 1 is UNBLOCKED and scheduled; §Approach 1's POSITION-axis re-derivation is separate
+in-flight work.**
 
 ---
 

@@ -3790,3 +3790,130 @@ collected here on its first surface. What the deferral does cost, and the header
 reaches the editor as a location into a file that does not exist (measured). That is an argument
 for closing the gap, not for distrusting the format — today an author who wants a located custom
 assertion has no alternative to hand-building one.
+
+## Serde on the wire: seven rulings, two of which reverse the same morning's decisions (owner, 2026-09-01)
+
+A three-lens critique panel (consistency / cross-language / performance) attacked
+`docs/serde-design.md` and its coordinator put seven decisions to the owner, who adopted every
+recommendation as stated ("Recommendations all sound reasonable to me"). The arguments live in
+`docs/internals/serde-critique-synthesis.md` §"Decisions that are the owner's" and the applied
+form in `docs/serde-design.md`; what is recorded here is the *why*, per ruling, because none of
+it is recoverable from a wire format's bytes.
+
+### Unknown fields are REJECTED — and that is what makes untagged unions decidable (serde-design OQ-8)
+
+Four sentences, all adopted: reject unknown fields; exact case-sensitive field matching; reject
+duplicate keys; always emit `"f": null` for a `T | null` field rather than omitting it. Each is
+a named Go v1 regret and Zig's default, and each is this repo's loud-over-silent preference
+applied to the wire — the same argument that already made `NaN` an encode error rather than a
+`null`.
+
+**The non-obvious part is that reject-unknown is not a taste, it is a PREMISE of OQ-7.** Under
+it, `{x} | {x,y}` is derivable — a document with `y` cannot be the `{x}` arm, because `y` would
+be unknown there — so the required-key-set rule decides it. Under ignore-unknown the same two
+arms are genuinely ambiguous, since every `{x,y}` document also matches `{x}`. Same VL type,
+opposite answers. A serde design that leaves the field policy open has not answered its union
+question either, which is why this became an OQ rather than a paragraph. The cost is
+forward-compatibility on hand-edited configs; a program that wants it carries a
+`{[string]: Json}` catch-all explicitly, in the type, where a reader can see it.
+
+### `i64` goes on the wire as a JSON NUMBER, and the reason is NOT the RFC (OQ-9)
+
+The doc had said "i64 as a decimal string" in three places, inherited from protobuf's canonical
+JSON mapping. Reversed. VL's reader is **type-directed**: it knows the destination is an `i64`
+before it reads a digit, so it parses exactly and never touches an f64 — the funnel that forces
+strings elsewhere does not exist here. Two further reasons: `i64 | string` stays derivable under
+the untagged rule (under the string rule every `i64` IS a string and no reader can tell the arms
+apart), and a human writing a config writes `3`, not `"3"`. A JavaScript consumer loses precision
+above 2^53 and is told so in the format's documentation, which is a true statement about
+JavaScript rather than a tax on every VL program.
+
+**The caveat is part of the decision.** The critic's supporting argument was that the f64 funnel
+is "JavaScript's, not JSON's" and that VL should rule against I-JSON. *That was never verified* —
+neither the critic nor the coordinator had web access, and the coordinator's recollection is that
+RFC 7493 §2.2 says the opposite (64-bit integers SHOULD be strings, i.e. the interop profile
+adopted the JS premise deliberately). **The ruling deliberately does not rest on the RFC in
+either direction.** If I-JSON does endorse strings, nothing here changes and the status becomes
+"VL is knowingly not I-JSON-conformant on this point" — a sentence the format docs should carry.
+Recorded this way because a decision resting on an unchecked citation is the failure mode this
+repo keeps paying for.
+
+### Untagged distinguishability is FIRST TOKEN or REQUIRED KEY SET, not a general predicate (OQ-7)
+
+"The deriver decides distinguishability statically" is right in shape and wrong in size: over
+recursive types that predicate is tree-automaton intersection emptiness — decidable, but
+unpredictable to a user and expensive to get right. The narrowed rule is one a user can hold in
+their head, and it buys three things at once: **no backtracking** (the reader commits on the
+first token, never O(arms × value) with a speculative parse per arm), streaming stays possible,
+and the refusal can name the two arms and the token they share. It also admits the plan's own
+migration idiom `deserialize<ConfigV1 | ConfigV2>` exactly when the versions differ in a required
+key — which is the honest condition, because two versions differing only in an optional field
+genuinely cannot be told apart. Two overlaps the doc's list had missed are now written down:
+an open map arm overlaps EVERY object arm (its required key set is empty), and JSON's single
+number type merges `i32 | f64`.
+
+### The cycles ruling SPLIT: the compiler predicate is serde's, reference identity is the language's (§Cycles, OQ-11)
+
+§Cycles priced its seen-set as "one hash-set insert per ref node". **There is no hash set** —
+`Map`/`Set` keys are `string` or `i32` only, and WasmGC gives `ref.eq` while deriving no integer
+from a reference — **and the static skip that would have made the cost moot does not exist in
+the compiler either** (audited: no transitive ref-free predicate anywhere; `repTyScalarMask` is
+the right template and the wrong question). The fallback a walk would get, a linear-scan
+seen-set, measures 204 ms at 16,000 nodes — 70× the VLB encode it protects — and degrades
+smoothly, so no small fixture would ever have shown it.
+
+Ruled: **build the static acyclic-shape predicate** (transitively ref-free, or ref-bearing with
+no back-edge in the type graph), keep a depth cap as the floor beneath it, and land a timing
+probe (walk a ref-bearing shape at N and 4N, fail above 6×) *with* it — the shape of quadratic
+this repo cannot see any other way.
+
+**The split is the decision worth recording.** Whether VL wants reference identity as a keyable
+concept — `Set<Node>`, `Map<Node, V>` — is a LANGUAGE question that serde surfaced and serde does
+not get to answer; it costs an identity slot on every allocation or a linear probe on every
+lookup, and both are decisions with reach far past a wire format. It is filed OPEN as OQ-11, and
+stage 2 deliberately does not wait on it: the static predicate is sufficient for the shapes serde
+walks, so a later "yes" makes the seen-set cheaper without making the predicate wrong.
+
+### VLB's header carries an 8-byte shape fingerprint, and a version byte is not a substitute (OQ-10)
+
+VLB is schema-implicit, so two builds that disagree about a shape do not fail — they silently
+misread, which is bincode's known failure mode and the thing "same build only" was asking users
+to guarantee by hand. Eight bytes of the recursive structural fingerprint OQ-2 already commits to
+(so: existing machinery, one compare) turns that into a loud refusal.
+
+Two constraints come from other languages' regrets and are part of the ruling. **Hash
+wire-relevant structure ONLY** — Java's `serialVersionUID` moved on edits that could not affect
+the bytes, users learned to pin it by hand, and the check died. **And the format-version byte
+stays beside it, not instead of it** — MessagePack's 2013 `str`/`bin` split is the case: a
+version says what the encoder's *rules* were and says nothing about whether this program's `Move`
+is the encoder's `Move`. It weakens "same build only" as a slogan and strengthens it as a
+guarantee, which is the trade taken everywhere else in this document.
+
+### OQ-6 REVERSED: newtypes serialize transparently, because the refusal was anti-correlated with its hazard
+
+The morning's posture was "refuse `new` types at the wire until a consumer opts in", on the
+argument that a brand marks provenance and provenance does not survive a trip. Reversed the same
+day. Measured from ONE std file: the refusal rejects `F32View`/`F32Base` — branded, and the brand
+is the only reason it can see them — while accepting `Buf`, a plain alias for **the same raw
+address**. The hazard belongs to the ADDRESS; the rule catches the spellings that told the truth
+about themselves and waves through the one that did not. It also refuses the domain's centre
+(`F32Base = new i32`), and a newtype-branded struct field runs today, so the refusal would remove
+a working program from the wire — clause 2's shape exactly. Accepting is cheap to narrow later;
+shipping a refusal into a version-locked std is not.
+
+**What still needs a rule is the `Buf` observation, and it is kept as the open remainder**: a
+plain alias over a linear-memory address encodes an integer that is meaningless in another
+instance and nothing marks it. That wants a rule about ADDRESSES, not about brands.
+
+### Stage 1 is a `Json` VALUE TREE, because the premise that forced a pull lexer was refuted
+
+`std:json` v1 was scoped as an escaping writer + token-at-a-time pull lexer + per-type hand
+codecs, on the design doc's fact 5: that a self-referential union cannot be built, so a value
+tree was impossible. #2244 landed the `null` arm and the six-arm tree
+`null | boolean | f64 | string | Json[] | { [string]: Json }` now renders and round-trips, with
+two checker residues that have one-line workarounds (D1009, D1010). So the lexer was a
+workaround for a wall that is gone, and v1 ships the tree plus a parser and a renderer instead.
+Two consequences: `deserialize` becomes a two-phase read whose first phase is reusable, and
+**stage 3 retires LESS** — the tree is the schemaless escape hatch by construction rather than a
+leftover lexer, so what stage 3 adds is the derived one-step path beside a `std:json` that keeps
+its own reason to exist.
