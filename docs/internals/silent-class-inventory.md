@@ -23593,91 +23593,44 @@ Repro (now RUNS, printing `true` then `false`):
     // vl check rc 0; runs, prints true then false.
 
 ---
-### D960 — `??` over a nullable VALUE-UNION box: the manual expansion of the same program RUNS, so this is sugar over a lowering that already exists
+### D960 — `??` over a nullable VALUE-UNION box: CLOSED at both spellings, and the two dead-end emit arms failed for a reason that turned out to be fixable
 
-**loud emit reject conceding capability — `emitProgram: `??` over this nullable value is not supported yet — narrow it first` — after `vl check` returns 0, so a clause-2 violation by construction · ZERO corpus cells; `scripts/capability-probes/coalesce-over-nullable-union.vl` is the measurement · TWO ROUTES WERE INVESTIGATED AND BOTH ARE DEAD ENDS — recorded so the next attempt starts past them**
+**closed — the re-readable spelling by D962's rewrite, the CALL-operand spelling by an emit arm here · the two earlier emit arms were right about the bytes and wrong about one classifier, which D969 named**
 
-`mk() ?? "d"` where `mk` returns `string | i32 | null` refuses. Write the same thing by hand —
-`const v = mk(b)` / `if v != null { return v }` / `"d"` — and it RUNS and prints `d`.
+`mk() ?? "d"` where `mk` returns `string | i32 | null` used to refuse while the hand-written
+expansion ran. Both spellings now run, and they take different routes on purpose:
 
-* **EVERY PIECE THE SUGAR NEEDS ALREADY WORKS, measured one at a time.** `v == null` over this
-  rep runs and answers correctly. `if v != null { … }` narrows and the narrowed value is
-  usable. The default `"d"` boxes into the union and the function returns `string | i32`
-  cleanly. So the capability is not missing — only the `??` dispatch does not reach it.
+* **A RE-READABLE OPERAND IS REWRITTEN, not emitted** (D962). `emit_rewrite` desugars it to
+  `if x != null { x } else { d }`, leaving no `??` node for the consumer classifiers to
+  disagree about. That argument still holds and is why the rewrite stays.
 
-* **DEAD END 1 — `emitCoalesceNulRef` does not apply.** It lowers with `br_on_non_null`, which
-  needs a nullable REF. Disassembled, this rep's null is a TAG: the box is
-  `(struct (field i32) (field anyref))` and `v == null` compiles to
-  `i32.eq (struct.get $box 0) <nullTag>`. There is no `ref.null` to branch on.
+* **A CALL OPERAND CANNOT TAKE THAT ROUTE** — the desugaring names the operand twice, and
+  evaluating a call twice is a different program — so it keeps its node and gets a real emit
+  arm: stash the box ONCE in `sharedFieldRecvSlot`, branch on its tag, and give the `if` the
+  BOX as its result type so both arms agree.
 
-* **DEAD END 2 — IT CANNOT BE A REWRITE, and the reason is one-evaluation.** The `??` rewrite
-  layer already folds the non-nullable case, and its header explains at length why a rewrite
-  beats an emit arm there (consumers dispatch on the `??` NODE; an emit-only identity produced
-  right bytes and wrong type, measured at 62 silent failures on a 9,126-cell sweep). That
-  argument does NOT carry here: desugaring `a ?? d` into `if a != null { a } else { d }`
-  evaluates `a` TWICE, and the existing lowerings all go to trouble to evaluate the left
-  operand once. A rewrite would need to introduce a temp binding, which an expression rewrite
-  at that layer cannot do.
+* **AND THE TWO EARLIER EMIT ARMS FAILED FOR A FIXABLE REASON.** This row recorded that the
+  second arm emitted a perfectly correct `(if (result (ref $box)) …)` and the RETURN PATH
+  wrapped it in a SECOND `struct.new $box` — read at the time as proof that an emit arm cannot
+  work. It is the same fighting pair D969 untangled: the consumer double-boxes precisely
+  because `exprUnion` answers FALSE for the node, so every box-typed position thinks it still
+  has to coerce. Teaching `unionNameOfExpr` to answer for a `??` whose checked type is a value
+  union makes `exprUnion` true and the double-box stops. **Neither half works alone**, which is
+  why two attempts at the arm alone both looked like the arm was impossible.
 
-* **SO THE SHAPE OF THE FIX IS NAMED: an emit arm with a TEMP LOCAL.** Evaluate the left
-  operand once into a local, `i32.eq` its tag against the null tag, and select — the block's
-  type being the box, so the default arm has to box through `emitUnionCoerce` exactly as the
-  hand-written `return "d"` already does.
+* **THE CORRECTNESS BOUND IS MEASURED, not argued.** A counter in the operand proves it is
+  evaluated exactly ONCE per `??` (`s,1` then `d,2`), and a counter in the default proves the
+  default is evaluated only when the value is null (`s,0` then `d,1`).
 
-* **THE NAIVE BLOCK+`br_if` ARM WAS BUILT AND IS WRONG — measured, so the next attempt can
-  skip it.** For a RE-READABLE left operand the arm needs no scratch at all: push the operand,
-  push it again for the tag, `i32.ne` against the null tag, `br_if 0` out of a
-  `(ref $uBoxIdx)` block, else `drop` and `emitUnionCoerce` the default. That compiles, the
-  arm fires, and every witness comes out `type mismatch: expected i32, found (ref $type)` —
-  including the forms with no `print` in the way, so it is the lowering and not a consumer
-  classifying the `??` node.
-
-* **THE TAG CONSTANT IS NOT THE BUG, which was the first suspicion and is ruled out.**
-  `nullBoxTag()` is `scalarTagOfKind(nullValKind())` = `uVariants.length + 6`, and the working
-  hand-written module (no variants declared) compares against a literal `6`. They agree.
-
-* **THE `if`-SHAPED ARM WAS THEN BUILT TOO, AND ITS BYTES ARE RIGHT — the problem is one
-  layer out.** Copying the hand-written form's branch (`i32.ne` on the tag, then an `if` whose
-  RESULT is the box via `fbIfRef(uBoxIdx)`, value in the then-arm, `emitUnionCoerce`d default
-  in the else-arm) emits exactly what it should. Disassembled, the arm is
-  `(if (result (ref $box)) (i32.ne (struct.get $box 0 (local.get $1)) (i32.const 6)) (then
-  (local.get $1)) (else (struct.new $box …)))` — correct on both branches. And that whole
-  correct expression is then wrapped in ANOTHER `struct.new $box …` by the return path. The
-  consumer RE-BOXES an already-boxed value, and THAT is the type mismatch.
-
-* **SO THE RESIDUE IS THE `??` NODE'S RESULT CLASSIFICATION, not its lowering.** This is
-  precisely the hazard `emit_rewrite`'s `??` header documents: *"every consumer classifier —
-  `exprString`, `exprIsLitAtom`, the print-import chooser, the local-cell ladder — dispatches
-  on the `??` NODE"*, and there it cost 62 silent failures on a 9,126-cell sweep when a
-  lowering changed without them. A `??` that now yields a union BOX has to be visible as such
-  to every consumer that asks what the node produces; until it is, the emit arm is correct
-  bytes in the wrong envelope. That is the work, and it is bigger than the arm.
-
-* **AND THE TEMP LOCAL IS NOT FREE HERE — but check which family you are in, because D965
-  found the opposite one line over.** The `setStrScrI` family IS pre-reserved by
-  `emit_classify`'s scan (`tests/cases/expressions/scratch-frame-reservation-positions.vl`
-  pins the positions), and that is what this bullet costed. The WIDEN family
-  (`widenSrcWrapSlot` / `widenDstBackSlot` / `widenTmpSlot`) mints slots LAZILY during
-  lowering, and its header explains that a pre-pass could not possibly do it. So "this
-  emitter does not mint locals on demand" is true of one family and false of another; before
-  costing a temp local, find out which one the site can use. For this site the fix is still a
-  reservation arm plus a lowering arm that agree about the slot — the same two-site
-  discipline `emitFail`'s "rebox scratch slot unreserved" message exists to catch when they do
-  not. That is new emit bytes rather than a redirect, which is why it is filed rather than
-  attempted at the end of a long session: this area produced three measured regressions today
-  (D955's 15 lost classes, D957's two).
-
-Repro (check rc 0; the EMITTER refuses):
+Repro (runs, prints `s`):
 
     function mk(b: boolean): string | i32 | null {
       if b { return "s" }
       null
     }
-    print(mk(false) ?? "d")
-    // vl check rc 0; vl run -> emitProgram: `??` over this nullable value is not supported yet
-    // SHOULD PRINT d. The hand-written if/else over the same value prints d today.
+    print(mk(true) ?? "d")
+    // PRINTS s
 
----
 ### D962 — [CLOSED 2026-09-01 for a re-readable operand] `??` over a nullable VALUE-UNION box, closed as a REWRITE after two emit arms proved it could not be one
 
 **closed as `runs` for a RE-READABLE left operand · was a loud emit reject conceding capability after `vl check` rc 0 · D960 stays OPEN for a CALL operand, which the correctness bound below excludes · ZERO corpus cells; the probe and the fixture are the measurement · distilled corpus 0 movement, `runs → not-runs` ZERO, stdout dual-run over all 4,620 running cells 0 DIFFER · fixture `tests/cases/expressions/coalesce-nullable-union-box.vl`**
