@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex};
 use wasmtime::*;
 
 fn usage() -> ! {
-    eprintln!("usage: vl <build|check|run|fmt|test> <file.vl> [-o out.wasm] [-O|-O3] [--wat] [--no-validate] [-w|--check] [-t name] [--jobs N] [--compiler vl-compiler.wasm]");
+    eprintln!("usage: vl <build|check|run|fmt|test|seed> <file.vl> [-o out.wasm] [-O|-O3] [--wat] [--no-validate] [-w|--check] [-t name] [--jobs N] [--compiler vl-compiler.wasm]");
     eprintln!("       vl run <file.vl> [args...] [-- args...]   arguments after `--` reach the program verbatim");
     std::process::exit(2);
 }
@@ -482,6 +482,77 @@ fn resolve_compiler(explicit: Option<String>) -> CompilerSource {
         return CompilerSource::Embedded(bytes);
     }
     CompilerSource::Path(DEFAULT.to_string())
+}
+
+/// `vl seed` — write the resolved compiler seed to stdout, or print where it came
+/// from with `--path`.
+///
+/// EXISTS FOR THE EDITOR, and the reason is portability rather than convenience.
+/// `resolve_compiler` above already makes the CLI work anywhere: a release build
+/// carries the seed inside it (`--features embed-seed`), so a user needs no
+/// out-of-band asset. The LSP had no equivalent — it resolved only
+/// `<workspace>/build/vl-compiler.wasm`, which is a gitignored artifact of THIS
+/// repo, so the extension silently did nothing in every project that is not the
+/// compiler itself. This is the rung that lets the editor ask an installed `vl`
+/// for the seed it would use, which also keeps the two version-locked: the seed
+/// and the language are one artifact, and a mismatched pair is worse than none
+/// (the checker's `speaksAbi` refuses it, correctly, but only after the fact).
+///
+/// Bytes go to stdout because the embedded copy has no path to print. `--path`
+/// answers the on-disk case for a caller that would rather mmap it than pipe it,
+/// and says `embedded` otherwise.
+fn seed_cmd(rest: &[String]) -> Result<()> {
+    let explicit = rest
+        .iter()
+        .position(|a| a == "--compiler")
+        .and_then(|i| rest.get(i + 1))
+        .cloned();
+    let source = resolve_compiler(explicit);
+    if rest.iter().any(|a| a == "--path") {
+        match &source {
+            CompilerSource::Path(p) => println!("{p}"),
+            CompilerSource::Embedded(_) => println!("embedded"),
+        }
+        return Ok(());
+    }
+    let bytes: Vec<u8> = match &source {
+        CompilerSource::Path(p) => std::fs::read(p)
+            .map_err(|e| Error::from(e).context(format!("reading seed `{p}`")))?,
+        CompilerSource::Embedded(b) => b.to_vec(),
+    };
+    // `--out` exists so a build step needs no shell redirect: `deno task` refuses
+    // `> file 2>/dev/null`, and a task that silently half-works is worse than a flag.
+    if let Some(i) = rest.iter().position(|a| a == "--out") {
+        let out = rest
+            .get(i + 1)
+            .ok_or_else(|| Error::msg("usage: vl seed --out <path>"))?;
+        if let Some(dir) = std::path::Path::new(out).parent() {
+            if !dir.as_os_str().is_empty() {
+                std::fs::create_dir_all(dir)?;
+            }
+        }
+        std::fs::write(out, &bytes)
+            .map_err(|e| Error::from(e).context(format!("writing seed `{out}`")))?;
+        return Ok(());
+    }
+    // REFUSE TO PAINT A TERMINAL WITH 1.6 MiB OF WASM. Writing binary to a tty is
+    // never what anyone meant, and the damage (a wedged terminal) lands before the
+    // user can react — so this is an error with the two fixes in it, not a warning
+    // after the fact. A pipe or a redirect is not a tty and passes straight through.
+    use std::io::{IsTerminal, Write};
+    if std::io::stdout().is_terminal() {
+        bail!(
+            "vl seed writes {} bytes of wasm to stdout, and stdout is a terminal.\n\
+             Redirect it, or name a file:\n\
+             \x20 vl seed --out vl-compiler.wasm\n\
+             \x20 vl seed > vl-compiler.wasm\n\
+             Use `vl seed --path` to print where the seed came from instead.",
+            bytes.len()
+        );
+    }
+    std::io::stdout().write_all(&bytes)?;
+    std::io::stdout().flush()?;
+    Ok(())
 }
 
 /// Drive the self-hosted compiler module: feed `source` in, call `entry`
@@ -3320,6 +3391,9 @@ fn real_main() -> Result<()> {
     if args.get(1).map(|s| s == "check").unwrap_or(false) {
         // The subcommand rides as argv[0] so the VL program dispatches on it.
         return cli_pump(&args[1..]);
+    }
+    if args.get(1).map(|s| s == "seed").unwrap_or(false) {
+        return seed_cmd(&args[2..]);
     }
     if args.get(1).map(|s| s == "test").unwrap_or(false) {
         // `vl test [path]` — same pump, three more commands (docs/internals/vl-test-design.md).
