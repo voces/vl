@@ -24959,6 +24959,35 @@ Repro (runs under `vl`, printing `0` — this half must keep running):
   single program refuses loudly with `object literal is missing a union-variant field`, and an
   `import` does not reproduce it because a module graph is ONE compile.
 
+* **[2026-08-31, D911] PROGRAM B IS FAR WIDER THAN THIS ROW'S WITNESS, AND THE `??` IS NOT AN
+  INGREDIENT OF IT AT ALL.** Re-ablated with the same first program: the SECOND program needs
+  only a struct in a SIGNATURE. `function plain(): { r: i32 } { { r: 17 } }` + `print(plain().r)`
+  — six lines, no `??`, no global cell, no nullable anything — traps, and so does a DECLARED-type
+  return (`type M = {r: i32}; function plain(): M`), a nullable one, and an inline-shape PARAM
+  (`function plain(p: { r: i32 }) { print(p.r) }`). Field NAMES are irrelevant: `{w: i32}`,
+  `{s: i32}` and `{z: i32}` all trap. A struct that never leaves a body
+  (`function plain() { const v = { r: 17 }; print(v.r) }`) does NOT. So the site sentence above
+  is this row's own "a validator sentence is not a mechanism": `emitGlobalSection` is where the
+  FILED witness dies, not where the family does.
+
+* **[2026-08-31, D911] AND A PROGRAM THAT DECLARES A UNION CLEARS IT, which is why the suite has
+  been one filename away from red for as long as both files have existed.**
+  `canonical-field-order.vl`'s immediate successor in `tests/cases/types` is
+  `coalesce-default-row-litunion-annotation.vl`, and a union declaration makes `uDeclared` true.
+  D911's four fixtures are named `coalesce-merged-row-*` for exactly that reason — as
+  `coalesce-default-row-*` they sorted immediately after `canonical-field-order.vl` and turned
+  `deno task test` red — and their header records it.
+
+* **[2026-08-31, D911] A NECESSARY-BUT-NOT-SUFFICIENT LEAD, measured so it is not re-derived.**
+  `collectU` resets every `u*` column unconditionally and `mAssignTypeIndices` resets
+  `uVarHeap`/`uVarTwin` the same way — but `uTags` is emptied INSIDE `assignTags` and
+  `uVarTwin`/`uVarSTwin` INSIDE `buildVariantTwins`, and BOTH callers sit under `if uDeclared`.
+  Every reader bounds-checks against the COLUMN's own length rather than `uVariants.length`, so
+  a row index from the previous program passes the guard. **Adding `uTags = []`,
+  `uVarTwin = []` and `uVarSTwin = []` beside `uVariants = []` in `collectU` leaves the trap
+  exactly where it was** — at least one more column, or a memo keyed on the previous program's
+  rows, is in the path.
+
 * **THE SITE IS `emitGlobalSection`, bisected rather than guessed.** A probe compiler that
   `emitFail`s the small program at a chosen point (gated on `stmts.length < 5`, so the first
   program still compiles in full) puts it exactly there: stop before `emitModule` and the
@@ -25390,6 +25419,11 @@ Repro (now runs, printing `7`):
   original body guarded `fnIx < 0` on its first line and the wrapper had to as well.
   `d891_module_scope` is the pin; it reddened in the intermediate build and nothing else did.
 
+* **AND FOUR OF THE FIVE REFUTATIONS ARE CLOSED — see D911.** `d891_bound_arg_is_ident`,
+  `d891_bound_named_arg`, `d891_bound_nested_arg` and `d891_bound_fn_as_value` all RUN as of
+  D911; the guards that remain are a GENERIC callee, TWO declarations of one name, a function
+  value the program can CALL, and an argument the ident reader cannot name.
+
 * **THE READER REFUTES ON FIVE THINGS, each because a call site it cannot see passes an argument
   it cannot move.** A GENERIC callee (the monomorphizer clones the annotation per instance, so
   the node this marks is not the slot any instance emits); TWO declarations of one name; the name
@@ -25664,11 +25698,11 @@ Repro (loads then traps, on master and here alike):
 
 ---
 
-### D893 — a family with NO literal at all: the CALLEE'S OWN RETURN ANNOTATION is the atom nobody reads
+### D893 — [CLOSED 2026-08-31 by D912] a family with NO literal at all: the CALLEE'S OWN RETURN ANNOTATION is the atom nobody reads
 
-**check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` · 3 cells (`distilled/named/d893_null_arg_only`, `d893_empty_body_callee`, `d893_empty_body_param`), OPEN · IDENTICAL on master, so it is not a regression · it is what `scripts/silent-sweep/minimise-cell.py` reduces D888's cell to, which is why D891's row says the sentence is not the mechanism**
+**CLOSED as `runs` by D912 · was check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` · 3 cells (`distilled/named/d893_null_arg_only`, `d893_empty_body_callee`, `d893_empty_body_param`) · it is what `scripts/silent-sweep/minimise-cell.py` reduces D888's cell to, which is why D891's row says the sentence is not the mechanism**
 
-Repro (check-clean invalid wasm):
+Repro (now runs, printing `0`):
 
     function src(): {r: i32} | null {
     }
@@ -25677,8 +25711,7 @@ Repro (check-clean invalid wasm):
       print(0)
     }
     rd()
-    // vl check rc 0; vl run -> type mismatch: expected i32, found (ref $type)
-    // SHOULD PRINT 0.
+    // D912: now RUNS and prints 0.
 
 * **THE READER ANSWERS AND CONTRIBUTES NOTHING.** An empty body has no return path to refuse, so
   `anonLeafCalleeRead` succeeds with an empty literal list; a parameter every call site passes
@@ -25699,11 +25732,11 @@ Repro (check-clean invalid wasm):
 
 ---
 
-### D894 — a returned BINDING whose value is a PARAMETER: D882 and D891 composed, and neither half reaches it
+### D894 — [CLOSED 2026-08-31 by D913] a returned BINDING whose value is a PARAMETER: D882 and D891 composed, and neither half reaches it
 
-**check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` · 1 cell (`distilled/named/d894_ret_binding_of_param`), OPEN · IDENTICAL on master, so it is not a regression · found by writing the program**
+**CLOSED as `runs` by D913 · was check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` · 1 cell (`distilled/named/d894_ret_binding_of_param`) · found by writing the program**
 
-Repro (check-clean invalid wasm):
+Repro (now runs, printing `7`):
 
     function src(p: {r: i32}): {r: i32} | null {
       const v = p
@@ -25714,8 +25747,7 @@ Repro (check-clean invalid wasm):
       print(g1.r)
     }
     rd()
-    // vl check rc 0; vl run -> type mismatch: expected i32, found (ref $type)
-    // SHOULD PRINT 7.
+    // D913: now RUNS and prints 7.
 
 * **`anonLeafBoundValOk` SPLITS A BOUND VALUE THREE WAYS AND AN IDENTIFIER IS NOT ONE OF THEM.**
   A literal is a member, a `null` is neither, a CALL is the next frame (D886), and everything
@@ -25730,11 +25762,11 @@ Repro (check-clean invalid wasm):
 
 ---
 
-### D895 — a SELF-PASSED parameter refutes the whole callee, and it is D885's argument one position over
+### D895 — [CLOSED 2026-08-31 by D914] a SELF-PASSED parameter refutes the whole callee, and it is D885's argument one position over
 
-**check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` · 1 cell (`distilled/named/d895_self_pass_param`), OPEN · IDENTICAL on master, so it is not a regression · found by writing the program**
+**CLOSED as `runs` by D914 · was check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` · 1 cell (`distilled/named/d895_self_pass_param`) · found by writing the program**
 
-Repro (check-clean invalid wasm):
+Repro (now runs, printing `5`):
 
     function src(n: i32, p: {r: i32}): {r: i32} | null {
       if n <= 0 { return p }
@@ -25745,8 +25777,7 @@ Repro (check-clean invalid wasm):
       print(g1.r)
     }
     rd()
-    // vl check rc 0; vl run -> type mismatch: expected i32, found (ref $type)
-    // SHOULD PRINT 5.
+    // D914: now RUNS and prints 5.
 
 * **THE CALL-SITE SCAN SEES AN IDENTIFIER AND REFUSES.** `anonLeafParamArgsOk` requires every
   argument at the parameter's position to be an object literal or `null`; the recursive call
@@ -25760,3 +25791,426 @@ Repro (check-clean invalid wasm):
   sound. It is filed rather than shipped because SHADOWING has to be excluded first — a local
   `const p = …` in the same body makes the identifier a different binding, and the reader would
   then be moving a slot no value reaches.
+
+---
+
+### D911 — [CLOSED 2026-08-31] the four argument CARRIERS D891's call-site reader could not name, and the name-as-a-value guard was wider than its own reason
+
+**closed as `runs` · was check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` · a CLAUSE-1 close, 4 cells (`distilled/named/d891_bound_arg_is_ident`, `_bound_named_arg`, `_bound_nested_arg`, `_bound_fn_as_value`) · ABLATED family 42 hand-written probes, TWELVE rungs, each one load-bearing on its own · measured against master `3f2ebc40` (which carries D901/D902) — the first cut was measured against `5c0224de` and cost four of D901's cells, see D918 · corpus `cmp` **2,491 modules · 2,041 identical · 0 DIFFER · 0 LOST** · distilled corpus `runs → not-runs` ZERO, `→ silent` ZERO**
+
+Repro (now runs, printing `7`):
+
+    function src(p: {r: i32}): {r: i32} | null {
+      p
+    }
+    function rd() {
+      const q = { r: 7 }
+      const g1 = src(q) ?? { r: "s" }
+      print(g1.r)
+    }
+    rd()
+    // D911: now RUNS and prints 7.
+
+* **D891 READ THE ARGUMENTS AT EVERY CALL SITE AND COULD NAME EXACTLY TWO SPELLINGS** — an
+  object literal written in place, and `null`. Its row filed the rest as refutation bounds and
+  put them in `named/` whole. Four of the five are these, and each needed a different rung.
+
+* **A NAMED ARGUMENT IS A SOURCE POSITION, NOT A PARAMETER SLOT.** The scan indexed
+  `callArgs[pos]` and refused the moment any `callArgNames[k]` was non-empty. It now binds the
+  call's arguments through `orderArgsByParamNames` — the ONE binder the checker's Call arm and
+  `emitCall` already share — so the position it reads is the parameter's. A leftover (an unknown
+  name, a collision, a surplus positional) means the call is not one the checker accepted at
+  this arity, so the arm refutes exactly as it did.
+
+* **A NESTED ARGUMENT IS ONE MORE FRAME, and it is why `fns`/`depth` came back.** D891's own
+  header predicted this: "NO `fns` / `depth`: … A future rung that follows a call-valued
+  argument takes them back." `src(mk())` hands the parameter whatever `mk` returns, which is the
+  question `anonLeafRetPathOk`'s Call arm already asks of a returned expression, so the arm is
+  the same call with `depth + 1`. Marking `mk`'s return row follows from `fns`.
+
+* **AND IT NEEDED A SECOND HALF IN THE EMITTER, WHICH THE READER ALONE DOES NOT REVEAL.** With
+  the reader in and nothing else, `mk`'s functype still said `(result (ref $narrow))` while the
+  literal it returns had been minted at the merged row — `d891_bound_nested_arg` moved from
+  `expected i32, found (ref $type)` to `expected (ref $type), found (ref $type)` and stayed
+  silent. The two annotated return-row sites (`emitOneFuncType`'s annotated arm and
+  `emitReturnValue`) gated their merge redirect on `retNulRefFlag`, because `S | null` is the
+  only shape a `??` LEFT OPERAND can have — true while the reader stopped at the operand, false
+  one frame in. Both now read the same KIND the result valtype is written with, which is also
+  the gate `fnRetStructIndexSid` (ungated on nullability all along) already made. Ablating that
+  pair alone reverts both nested-argument cells and nothing else.
+
+* **AN IDENT ARGUMENT IS D842'S READER ASKED OF AN ARGUMENT.** `const q = {r: 7}; src(q)`
+  delivers the literal through a binding, and the literals that reach `q` are the ones bound to
+  it — read by NAME over the whole program, exactly as `anonLeafJoinSources`' own IDENT arm
+  reads a `??`'s left operand, and STRICT where that one is lenient for `anonLeafJoinCallee`'s
+  reason. It is also what two of D914's cells need: a caller that hands the callee its own local
+  by name.
+
+* **THE NAME AS A VALUE WAS REFUSED FOR A `call_ref`'S SAKE, AND THE PROGRAM CONTAINED NO
+  `call_ref`.** The guard's stated reason is that "the arguments a `call_ref` passes are not at
+  any call site this can read" — so the test is now that reason: a function value refutes only
+  where the program can CALL one. `anonLeafAnyIndirectCall` over-approximates in the safe
+  direction (a callee that is not a bare identifier; an identifier a `LetDecl` or `Param`
+  declares anywhere — a builtin declares neither and costs nothing) and is asked only where a
+  function value was actually found. `d911_fn_value_called` is the bound and is still
+  check-clean invalid wasm.
+
+* **THE COMPOSITION FOUND A FIFTH OWNER THAT WAS ALREADY BROKEN — see D915.** A module holding
+  any function value gives every eligible function an env-leading `$fnsig`, and the pool entry's
+  RESULT slot took no merge redirect. That reproduces on master at D871's plainest carrier, so
+  it is not this landing's doing; it is fixed here because otherwise these four carriers do not
+  compose with a function value in the same module.
+
+* **THE ABLATION, over the 33 graded probes.** Strip-all is master's own `compiler/` at
+  `5c0224de`, rebuilt here rather than quoted: **`d4396c4e963741f1d4b310f028ac71b4`, 1,580,471
+  bytes**, byte-identical to the seed `agent-setup.sh` produces from master.
+
+  | rung | what it is | runs/42 | reverts | `runs` lost vs master |
+  |---|---|---|---|---|
+  | all twelve (shipped) | | **35** | corpus `cmp` 0 DIFFER · 0 LOST | 0 |
+  | strip-all (master) | | 11 | 24 | — |
+  | −the bound-value IDENT arm (D913) | | 31 | 4 | 0 |
+  | −the SELF-PASS skip (D914) | | 33 | 2 | 0 |
+  | −`orderArgsByParamNames` at the call site | a NAMED argument | 33 | 2 | 0 |
+  | −the CALL arm on an argument | a NESTED argument | 32 | 3 | 0 |
+  | −the arg-IDENT reader | | 30 | 5 | 0 |
+  | −the narrowed name-as-value guard | | 33 | 2 | 0 |
+  | −the callee-return annotation atom (D912) | | 30 | 5 | 0 |
+  | −the KIND gate at the two return-row sites | | 32 | 3 | 0 |
+  | −the fall-through-null supersede | | 31 | 4 | 0 |
+  | −the `$fnsig` result slot (D915) | | 33 | 2 | 0 |
+  | −the literal-bearing-callee stand-down (D918) | | 33 | 2 | **2** |
+  | −the annotation-atom WIDTH gate (D918) | | 30 | 5 | **3** |
+
+  `runs` LOST versus master is ZERO in every row EXCEPT the last two, and that is exactly what
+  those two rungs are: they are not capability, they are the interlock between D912 and D901's
+  fold, and the ablation is what says so. See D918.
+
+* **COUNTERS, reach AND ans, and every guard fires.** Over the 42 probes: the bound-value ident
+  arm 18/16, the self-pass 18/4, the named-argument binding 4/4, the call-valued argument 8/6,
+  the arg-ident reader 14/12, the function-value test 6/4, the callee-annotation atom 37/10, the
+  two return-row kind gates 6/3 each, the fall-through null 8/4, the `$fnsig` result slot 43/20,
+  the literal-bearing-callee stand-down 22, the width gate 16 offered / 6 refused.
+  Over `tests/cases` + `std` (2,045 reporting) every `ans` is zero outside this landing's own
+  four fixtures — the `$fnsig` slot is ASKED 2,921 times and moves 23, the width gate is offered
+  39 atoms and refuses **0** — which is why `cmp` is 0 DIFFER.
+
+* **REAL DISASSEMBLY** (`./node_modules/.bin/wasm-dis`, binaryen 130), on
+  `d891_bound_nested_arg`. Master: `mk` is `(func (result (ref $0)))` over
+  `(type $0 (struct (field (mut i32))))` returning `struct.new $0`, while `src` is
+  `(func (param (ref $1)) (result (ref null $1)))` over the merged
+  `(type $1 (struct (field (mut (ref $2)))))` — the callee builds narrow and the caller expects
+  merged. Here `mk` is `(func (result (ref $1)))` and returns `struct.new $1`: the SIGNATURE and
+  the RETURNED VALUE moved together, which is the pair the kind gate covers.
+
+* **MEASURED, all seven instruments, against master `3f2ebc40`.** Corpus byte-identity:
+  **2,491 modules · 2,041 identical · 0 DIFFER · 0 LOST · 450 not buildable by the base.**
+  Distilled corpus: **30 cells `check-clean invalid wasm` → `runs`**, `runs → not-runs`
+  **ZERO**, `→ silent` **ZERO**, one cell (`d911_arg_ident_narrow_use`) silent→silent with a
+  different message. `tests/cases` + `std`: **2,041 → 2,045 of 2,491 building in 5.1 s at
+  `JOBS=6`**, set difference exactly this landing's four fixtures, 0 LOST. Shared-instance probe:
+  `distilled/cells` **1,477 · 0 differ**, `distilled/named` **6,011 → 6,048 · 0 differ**,
+  `tests/cases/types` **200 → 204 · 0 differ**, `tests/cases/unions` **230 · 0 differ**, before
+  AND after. D411's 103-cell grid 103 → 103 `runs`, 0 movement; D661's 211-cell grid 211 → 211
+  `runs`; `d791_push_alias` still REFUSES; `d875_assign_call` still prints `7`;
+  `d884_litunion_beside_str` still runs; `d892_box_param_boolean_i32` still prints `true`;
+  `d891_module_scope` still runs; every one of D901/D902's five cells grades as master does.
+  Fixture: `tests/cases/types/coalesce-merged-row-argument-carriers.vl`.
+
+* **THE SCOREBOARD, WITH ITS POPULATION NAMED.** On the corpus master shipped (7,515 cells) the
+  total against the goal was **9**. This landing ADDS 37 cells to `named/` — 27 hand-written
+  carriers and bounds, D915's three and D918's seven — so the corpus is 7,525 and both numbers
+  are measured on the bigger question: master **38** against the goal, here **8**, `runs`
+  4,543 → 4,573 (60.37% → 60.77%). The 8 are the 7 named refutation bounds below plus
+  `d903_map_join_read_i32_f64`, which D901's own row filed OPEN and which this landing does not
+  touch.
+
+* **THE SEVEN BOUNDS THAT REMAIN, each a filed cell, and they are SEVEN MECHANISMS and not one
+  message.** `d911_arg_ident_narrow_use` (D916), `d911_fn_value_called` (a program with any
+  possibly-indirect call), `d911_arg_ident_unnameable` (the argument's binding is written from
+  the caller's own parameter), `d911_generic_callee` (the monomorphizer clones the annotation
+  per instance), `d911_nested_arg_two_frames` (the depth cap is one frame),
+  `d912_ann_named_ret` (a return spelled through a type ALIAS) and `d913_ret_binding_of_field`
+  (a binding written from a field read). All seven reproduce outcome-for-outcome on master
+  except `d911_arg_ident_narrow_use`, whose message moves.
+
+---
+
+### D912 — [CLOSED 2026-08-31] the `??` family with NO LITERAL AT ALL: the CALLEE'S DECLARED RETURN is the atom, and the reader is what licences it
+
+**closed as `runs` · was check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` · a CLAUSE-1 close, 3 cells (`distilled/named/d893_*`) · ABLATED: FOUR rungs — the atom, the fall-through-null owner, and the two GATES D918 records · corpus `cmp` 0 DIFFER · 0 LOST · `runs → not-runs` ZERO**
+
+Repro (now runs, printing `s`):
+
+    function src(): {r: i32} | null {
+    }
+    function rd() {
+      const g1 = src() ?? { r: "s" }
+      print(g1.r)
+    }
+    rd()
+    // D912: now RUNS and prints s.
+
+* **THE READER ANSWERS AND CONTRIBUTES NOTHING, which is the whole shape.** An empty callee body
+  has no return path to refuse, so `anonLeafCalleeRead` succeeds with an empty literal list; a
+  parameter every call site passes `null` to does the same through D891's arm. The set is then
+  the DEFAULT's atom alone, `atoms.length < 2` ends `anonLeafPolyUnionSetOpen`, and the pair
+  falls to D804's `A=i32 B=string` corner.
+
+* **D872 REFUSED TO READ A CALL OPERAND'S ANNOTATION ON A MEASURED LOUD→SILENT, and the
+  interlock it named is what makes this safe.** Its header records that taking the atom for a
+  CALL operand while `anonLeafJoinCallee` was DECLINING to move that callee mints the merged row
+  and leaves the callee's own literal at the narrow one — `bare null needs a struct-typed
+  context` became check-clean invalid wasm. "The reader is what licences a call's atom" is
+  exactly the gate: the arm runs `anonLeafCalleeRead` first and takes the annotation only where
+  the read SUCCEEDED, so every literal the callee hands back is already a member and its return
+  row is already marked. Where the read handed back literals the arm is a NO-OP — the checker
+  made those literals agree with the annotation, so the atom is in the set already and the dedup
+  drops it. Measured: 33 asks over `tests/cases` + `std`, 33 answers, and `cmp` 0 DIFFER.
+
+* **AND THE FALL-THROUGH `null` IS A FOURTH OWNER.** An empty body's whole result is
+  `emitNullForRet`'s `ref.null`, which read `retNulRefIndex` un-redirected. Reading the BYTES
+  rather than the disassembly is what showed it: `wasm-dis` renders both `d0 00` and `d0 01` as
+  `ref.null none`, and the difference between them is the narrow row and the merged one.
+  Ablating this line alone reverts four of the five probes and nothing else.
+
+* **AND IT TAKES TWO GATES THAT ARE NOT ABOUT ATOMS AT ALL — see D918.** Stamping
+  `anonLeafAnnTy` for a CALL operand arms `anonLeafCarrierRowOf`, D873's post-mint rung, which
+  with D901's fold in the tree pointed the CALLEE's declared row at the row the DEFAULT literal
+  had just minted; and an annotation atom WIDER than every value in the family makes the fold
+  answer a type no value has. Ungated, this arm cost four of D901's `runs` cells and three more
+  compositions nobody had written. `rlits.length > 0` and `anonLeafAnnAtomJoins` are the two
+  gates, and the ablation grades each at 2 and 3 `runs` cells respectively.
+
+* **THE BOUND is `d912_ann_named_ret`**: `type R = {r: i32}` with `: R | null` is a spelling
+  `anonLeafAnnAtomOf` declines — it reads the SHAPE off the annotation text
+  (`nameIsShapeSpanEnds`) — and it is still check-clean invalid wasm.
+
+Fixture: `tests/cases/types/coalesce-default-row-callee-return-annotation.vl`.
+
+---
+
+### D913 — [CLOSED 2026-08-31] a returned BINDING whose value is an IDENTIFIER, and the visited set the depth cap could not stand in for
+
+**closed as `runs` · was check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` · a CLAUSE-1 close, 1 cell (`distilled/named/d894_ret_binding_of_param`) + 3 new · ABLATED: one rung, 4 probes revert · corpus `cmp` 0 DIFFER · 0 LOST**
+
+Repro (now runs, printing `7`):
+
+    function src(p: {r: i32}): {r: i32} | null {
+      const v = p
+      v
+    }
+    function rd() {
+      const g1 = src({ r: 7 }) ?? { r: "s" }
+      print(g1.r)
+    }
+    rd()
+    // D913: now RUNS and prints 7.
+
+* **`anonLeafBoundValOk` SPLIT A BOUND VALUE THREE WAYS AND AN IDENTIFIER WAS NOT ONE OF THEM**
+  — a literal is a member, a `null` is neither, a CALL is the next frame (D886) — so D882's
+  binding arm and D891's parameter arm could not compose. `{ p }` runs and
+  `{ const v = { r: 7 }; v }` runs; `{ const v = p; v }` did not.
+
+* **THE ARM NEEDED `body` THREADED IN**, because a returned name resolves against the frame that
+  returned it — the same argument `anonLeafCalleeRets` already carries for D882's own scan.
+
+* **AND IT NEEDED A NAME-VISITED SET, which is the half that is not obvious.** `fns` bounds the
+  CALL recursion and `depth` caps it at one frame; an identifier chain opens neither, so
+  `let a = p; let b = p; a = b; b = a; a` re-enters the resolver for ever. `ids` answers a name
+  already on the path exactly as `fns` answers a function already on it, and for the same
+  reason: the frame that pushed it is being read, so its sources are already in the family.
+  `d913_ret_binding_cycle` is that program.
+
+* **THE BOUND is `d913_ret_binding_of_field`**: a binding written from a FIELD READ is still a
+  path this cannot name, and it still refutes the whole callee.
+
+Fixture: `tests/cases/types/coalesce-default-row-returned-binding-ident.vl`.
+
+---
+
+### D914 — [CLOSED 2026-08-31] a SELF-PASSED parameter is skipped, not refuted, and SHADOWING is what the two arms are ordered by
+
+**closed as `runs` · was check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` · a CLAUSE-1 close, 1 cell (`distilled/named/d895_self_pass_param`) + 3 new · ABLATED: the skip alone reverts 2 probes, and 2 more need D911's arg-ident reader · corpus `cmp` 0 DIFFER · 0 LOST**
+
+Repro (now runs, printing `5`):
+
+    function src(n: i32, p: {r: i32}): {r: i32} | null {
+      if n <= 0 { return p }
+      src(n - 1, p)
+    }
+    function rd() {
+      const g1 = src(2, { r: 5 }) ?? { r: "s" }
+      print(g1.r)
+    }
+    rd()
+    // D914: now RUNS and prints 5.
+
+* **THE VALUE HANDED ON IS THE SLOT BEING MOVED**, so it contributes nothing and there is no
+  unmoved value behind it. That is D885's answer one position over: there a call to a name
+  already on the path ANSWERED rather than refuting, because that frame's return row is already
+  being moved.
+
+* **SHADOWING IS WHAT MAKES IT A QUESTION RATHER THAN A SPELLING, and both halves shipped.** The
+  skip is taken only when the argument node is inside the parameter's OWN frame
+  (`anonLeafInFrame`, which never crosses a nested `FuncDecl`) and nothing in that frame rebinds
+  the name (`anonLeafFrameRebinds`, over `LetDecl` / `ForRange` / `ForIn` — a `match` arm's
+  payload binding is a minted `LetDecl`, so the first covers it).
+
+* **THE TWO ARMS ARE ORDERED, AND THE ORDER IS LOAD-BEARING.** The self-pass is asked BEFORE the
+  argument-ident reader, because that reader would resolve the parameter's own name against the
+  program's bindings, find none, and refute. `d914_caller_local_same_name` is the other
+  direction: a DIFFERENT function whose own local is spelled like the parameter, where the skip
+  must be refused and the reader must answer. Counters: the ident-argument arm is asked 18 times
+  over the probe battery and the skip is taken 4.
+
+Fixture: `tests/cases/types/coalesce-default-row-self-passed-argument.vl`.
+
+---
+
+### D915 — [CLOSED 2026-08-31] the `$fnsig` pool's RESULT slot is a fifth owner of the merged row, and it only appears when something in the module is a function VALUE
+
+**closed as `runs` · was check-clean invalid wasm · `type mismatch: expected (ref null $type), found (ref null $type)` · a CLAUSE-1 close, 3 cells (`distilled/named/d915_*`) · PRE-EXISTING: the repro is check-clean invalid wasm on master `5c0224de`'s own seed at D871's plainest carrier, so it is NOT D911's doing — it was FOUND because D911's four carriers would not compose with a function value in the same module · ABLATED: one rung, 2 probes revert**
+
+Repro (now runs, printing `13` then `0`):
+
+    function srcc(p: { r: i32 }): { r: i32 } | null { p }
+    function rc() {
+      const g1 = srcc({ r: 13 }) ?? { r: "s" }
+      print(g1.r)
+    }
+    rc()
+    function srcv(p: { r: i32 }): { r: i32 } | null { p }
+    const fv = srcv
+    function rv() {
+      print(0)
+    }
+    rv()
+    // D915: now RUNS and prints 13, 0.
+
+* **A FUNCTION VALUE ANYWHERE GIVES EVERY ELIGIBLE FUNCTION AN ENV-LEADING `$fnsig`.** That pool
+  entry's RESULT slot is `cloRetValSlot`, which is BOTH the interning key (`cloRetKeySuffix`)
+  and the emitted result valtype (`emitCloSigFunctype`) — one home, so one redirect fixes both.
+  Neither took the `??` merge redirect, so the pool declared `(result (ref null $narrow))` beside
+  a function functype of `(result (ref null $merged))`.
+
+* **THE PARAM SIDE HAD ALREADY FOLLOWED AND THE RESULT SIDE HAD NOT, which is what made it read
+  as an interaction rather than a gap.** `cloParamTok` resolves through `paramStructIdxOf`, which
+  D891 had already taught the mark — so the disassembly showed
+  `(func (param structref (ref $merged)) (result (ref null $narrow)))`: half of one signature
+  had learned the merge.
+
+* **THE REDIRECT IS NOW ONE CALL.** `anonLeafRetRowOf(fnDeclIx, si)` is the mark and the
+  supersede together, so a reader that needs only the pair cannot pick up one half. The four
+  sites that spell it out longhand keep their own wording — each carries a different extra gate.
+
+* **THE CONTROL IS `d915_fn_value_other_shape`**: a function value of a callee whose shape the
+  merge never touched runs on master and here alike, so the redirect is not a blanket one.
+  Counters: the slot is ASKED 2,925 times over `tests/cases` + `std` and MOVES 23, every one in
+  this landing's own fixtures.
+
+---
+
+### D916 — a family member with a NARROW consumer: moving the literal moves it out from under the other destination
+
+**check-clean invalid wasm · `type mismatch: expected (ref $type), found (ref $type)` · 1 cell (`distilled/named/d911_arg_ident_narrow_use`), OPEN · check-clean invalid wasm on master too (with a DIFFERENT message, `expected i32, found (ref $type)`), so it is not a regression · found by writing the control for D911's argument-ident reader**
+
+Repro (check-clean invalid wasm):
+
+    function src(p: {r: i32}): {r: i32} | null {
+      p
+    }
+    function keep(q: {r: i32}): i32 {
+      q.r
+    }
+    function rd() {
+      const q = { r: 7 }
+      const g1 = src(q) ?? { r: "s" }
+      print(g1.r)
+      print(keep(q))
+    }
+    rd()
+    // vl check rc 0; vl run -> type mismatch: expected (ref $type), found (ref $type)
+    // SHOULD PRINT 7 then 7.
+
+* **IT IS THE WHOLE `??`-MERGE LINE'S STANDING PRICE, not this reader's.** Every reader since
+  D804 makes a literal a family MEMBER, and a member is built at the merged row. A member with a
+  second, NARROW destination therefore arrives at that destination as `(ref $merged)`. D842's
+  own IDENT reader has the same exposure and has had it since it shipped; the argument reader
+  just makes it easy to write.
+
+* **THE TWO DIRECTIONS ARE NOT SYMMETRIC.** Refusing the merge whenever a member has another
+  consumer would give back `d911_arg_ident` and every cell like it and buy nothing measurable —
+  the program is check-clean invalid wasm either way. The real answer is a per-DESTINATION
+  coercion at the narrow use, which is a rung of its own.
+
+* **`d911_narrow_sibling_param` IS THE CONTROL AND IT RUNS**: a same-shaped parameter fed by a
+  literal that is NOT a family member keeps the narrow row, on master and here alike.
+
+
+---
+
+### D918 — [CLOSED 2026-08-31] an ANNOTATION atom describes a value that is ABSENT, so it may not WIDEN the family — and the direction is the whole rule
+
+**closed as `runs` · was check-clean invalid wasm (`type mismatch: expected f64, found i32`) and `trap_loads` (`wasm trap: cast failure`) · a CLAUSE-1 close, 2 cells master gets wrong (`distilled/named/d918_ident_ann_wider_f64`, `d918_ident_ann_wider_f32`) plus 5 that state the rule · found as a CROSS-PR INTERACTION: D912's first cut was measured against `5c0224de` and #2070 (D901/D902) landed in between, so the two were only ever in one tree after the rebase · ABLATED: two gates, 2 and 3 `runs` cells, and they are the ONLY rungs of this landing whose removal loses a `runs` cell versus master**
+
+Repro (now runs, printing `7` — check-clean invalid wasm on master `3f2ebc40`):
+
+    function rd() {
+      let a: { r: f64 } | null = null
+      const g1 = a ?? { r: 7 }
+      print(g1.r)
+    }
+    rd()
+    // D918: now RUNS and prints 7.
+
+* **D872 READS AN ANNOTATION FOR THE ATOM NO LITERAL SUPPLIES, and D901 then made that a
+  DIRECTIONAL question.** `joinTys` is `assignable`-driven and `numWidensName` makes the
+  int-to-wider edges lossless, so a numeric PAIR is one type to the checker and D901's fold
+  collapses the set to a single atom. An annotation atom is the one thing in the set that
+  describes a value nothing will build. The two directions are therefore not symmetric:
+
+  | | fold answers | who builds there | result |
+  |---|---|---|---|
+  | `a: {r: i32} \| null` … `?? { r: 1.5 }` | `f64` | the real literal, unchanged | **runs** |
+  | `a: {r: f64} \| null` … `?? { r: 7 }` | `f64` | an int literal that never widens | `expected f64, found i32` |
+  | `a: {r: f32} \| null` … `?? { r: 7 }` | — (f32 is no fold edge) | a two-atom BOX over one value | `wasm trap: cast failure` |
+
+  The first row is `d918_ident_ann_narrower`, and `d862_ann_only_atom_f64` /
+  `d872_module_ann_only_f64` are the same shape — they run on master and must keep running.
+  Rows two and three are `d918_ident_ann_wider_f64` and `_wider_f32`, and they do NOT run on
+  master: this is D872's own IDENT arm, and the defect has been there since it shipped.
+
+* **`anonLeafAnnAtomJoins` IS A WIDTH COMPARISON, not a "is it numeric" one, and the first
+  version of this gate WAS the numeric one — it cost `d862`/`d872` their `runs`.** The lattice
+  is `numWidensName`'s, flattened to a rank because only the comparison is needed
+  (`i32` 0, `i64`/`f32` 1, `f64` 2): an annotation atom joins when it is no wider than the widest
+  VALUE atom present, and always joins when either side has no numeric in it at all — which is
+  D912's own population, an `i32` or `f64` return beside a `string` default.
+
+* **AND THE SECOND GATE IS NOT ABOUT ATOMS AT ALL.** Stamping `anonLeafAnnTy` for a CALL operand
+  also arms `anonLeafCarrierRowOf`, D873's post-mint supersede. With D901's fold the family's
+  mint is a plain scalar row rather than a box, and that rung then pointed the CALLEE's declared
+  `{r: f64}` return row at the row the DEFAULT literal had just minted — `src` emitting
+  `struct.new $i32row (f64.const 1.5)`, `expected i32, found f64`. `rlits.length > 0` stands the
+  arm down for any callee that handed back a literal, which is every case where the literals are
+  the family anyway.
+
+* **THE PRICE, MEASURED CELL BY CELL, and it is why the set is kept whole.** Ungated against
+  master `3f2ebc40`: `d892_box_direct_f64_i32`, `d892_box_binding_f64_i32`,
+  `d892_box_param_f64_i32` (runs → check-clean invalid wasm) and `d901_fold_f32_dest`
+  (runs → `trap_loads`) — all four D901's own, and `d901_fold_f32_dest` is that row's explicitly
+  named price pin. With only the literal gate: `d918_empty_body_fold_f64`,
+  `d918_null_arg_fold_f64` (runs → `expected f64, found i32`) and `d918_empty_body_f32_dest`
+  (runs → cast failure). `d918_empty_body_fold_i64` is the control that survived BOTH bad cuts
+  and says the fold EDGE, not the width alone, is what the box question turns on.
+
+* **A DERIVED RULE CANNOT FIND THIS SET, which is the standing reason `named/` exists.** Five of
+  the seven RUN on master and two do not; on today's compiler all seven run, and nothing reading
+  current behaviour can tell which of them a candidate would break. What makes them worth keeping
+  is what two specific refused cuts DID to them.
+
+* **AND THE PROCESS FACT IS THE POINT.** Both changes are correct alone. Grading a branch
+  against its OWN baseline cannot see this by construction — the four cells did not exist on
+  `5c0224de`. Grading against MASTER's baseline after a rebase is what caught it, and this is
+  the first cross-PR interaction of the campaign.
