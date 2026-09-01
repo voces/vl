@@ -517,6 +517,37 @@ Staged, sized honestly:
   messaging), CBOR rendering (foreign self-describing interop), generated `flat`
   accessors (ROADMAP already holds this).
 
+## Print, templates, and color ride the same renderer (owner direction, 2026-09-01)
+
+Three surfaces, one widening chain. Template holes and `print` both bind to the CANONICAL
+stringifier — std's integer/boolean renderer today, its f64 arm at Stage 0B, the derived
+`show<T>` at Stage 2 — so **objects/maps/sets/arrays/unions become spellable in a template
+hole and printable the moment the derive lands, with zero new template or print work**.
+D711's ruling ("`print([1,2,3])` has no defined output") is not overturned early: it is
+revisited exactly once, at Stage 2, when `show<T>` DEFINES the rendering (with the §Cycles
+back-reference rule).
+
+**Colored print — ruled in principle, with one hard constraint: ANSI must never leak.**
+The owner's pain case is real and common: tools that write escape codes into non-TTYs,
+which then survive pipes, files, and copy/paste. Policy (Node's model, which has the right
+split):
+
+- A bare **string** prints raw, always — never colored, never quoted. Color applies to
+  RENDERED VALUES (numbers, booleans, null, and Stage 2's composite rendering), the way
+  `console.log(5)` colors and `console.log("s")` does not.
+- Escapes are emitted **only by print's TTY sink**: color iff stdout isatty AND `NO_COLOR`
+  is unset AND `TERM != dumb`, with `--color=always/never/auto` as the CLI override (the
+  detection machinery shipped with the CLI overhaul, #2080). Redirected output is clean by
+  construction — which is the whole copy/paste fix.
+- **The string layer stays pure**: `toString`/`show<T>` output NEVER contains ANSI. Color
+  is applied by the sink to the renderer's structure, not baked into strings — so template
+  literals, serde, and log files can never capture an escape code. At Stage 2 this falls
+  out naturally: the derive's walk is an event stream, the plain string builder is one
+  consumer, the colorizing TTY sink is another.
+- **Stage C0 (can land any time, host-side, small)**: the print sink already knows each
+  primitive's type (per-type host imports) — color primitives under the policy above.
+  **Stage C2**: composite coloring rides the Stage 2 event walk.
+
 ## Cycles (owner ruling, 2026-09-01)
 
 The owner's stance, recorded verbatim in intent: **print/show and serialization should both
