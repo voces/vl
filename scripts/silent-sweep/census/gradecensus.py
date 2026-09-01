@@ -30,6 +30,16 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
 VL = os.environ.get("VL", "scripts/vl-host/target/release/vl")
+# THE `std:` A GRADE READS IS THIS CHECKOUT'S, NOT THE BINARY'S. The host resolves `std:`
+# off the executable's ancestors, and an agent worktree symlinks
+# `scripts/vl-host/target` at the MAIN repo — so without this every cell was graded against
+# the main checkout's `std/` while claiming to grade the worktree's. It happens to be
+# invisible whenever the two agree, which is most of the time and is exactly what makes it
+# dangerous: a branch that touches `std/` grades as though it had not.
+# `corpuscmp.py` and `d451/mkcells.py` already pin it; this was the outlier.
+VL_ENV = dict(os.environ, VL_STD=os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))))), "std"))
 CELLS = sys.argv[1]
 SEED = sys.argv[2]
 OUTJSON = sys.argv[3]
@@ -61,7 +71,7 @@ def one(name):
     exp = EXPECT[name]
     try:
         c = subprocess.run([VL, "check", f, "--compiler", SEED],
-                           capture_output=True, text=True, timeout=120)
+                           capture_output=True, text=True, timeout=120, env=VL_ENV)
     except subprocess.TimeoutExpired:
         return name, "compiler trap", "check timeout"
     cout = c.stdout + c.stderr
@@ -70,7 +80,7 @@ def one(name):
             next((l for l in cout.splitlines() if l.startswith("[ERROR]")), cout))
     try:
         r = subprocess.run([VL, "run", f, "--compiler", SEED],
-                           capture_output=True, text=True, timeout=120)
+                           capture_output=True, text=True, timeout=120, env=VL_ENV)
     except subprocess.TimeoutExpired:
         return name, "compiler trap", "run timeout"
     if r.returncode == 0:
