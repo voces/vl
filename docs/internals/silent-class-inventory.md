@@ -24258,9 +24258,12 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   through `structIndexOfObjCtxMemo`. `adoptedFieldCompat` (three attempts) is a DIFFERENT
   matcher on a path this witness never takes.
 
-  Splitting the rows therefore needs two coordinated edits: the row must RECORD the closure's
-  result when it is created, and this loop must COMPARE it. Neither exists today —
-  `sFieldElemNameAt` is empty for a closure field, measured.
+  Splitting the rows therefore needs two coordinated edits, and **the two sides derive their
+  code from DIFFERENT functions**, which is what makes it coordination rather than a one-liner:
+  the ROW stores `nameFieldCodeTy(ftxt, fldTy)` (in `internInlineShapeTy`), and the MATCH asks
+  `anonFieldCode(f.fiValue)`. Both must encode the closure's RESULT, and must agree, or every
+  shape stops matching. `sFieldElemNameAt` — the discriminator code 15 uses for nested structs
+  — is empty for a closure field, measured, so there is no existing side-channel to reuse.
 
 * The real fix is per-CALL resolution: monomorphise the hole function per receiver shape, or
   give the two shapes distinct struct rows so they cannot share a `call_indirect` type. The
