@@ -1056,7 +1056,13 @@ export const memberCompletionsFromWasm = (
 // Soft keywords (recognized by text in parser.ts via `atSoft`):
 //   as from in step to
 // (`then` was removed from the language on 2026-08-31 — see DECISIONS.md.)
-const VL_HARD_KEYWORDS: readonly string[] = [
+//
+// Exported (beyond the completion list below) for rename's new-name validation
+// (`rename.ts`): a hard keyword can never be an identifier, and a soft keyword
+// — while lexed as an ID — re-parses as syntax in the very positions a renamed
+// binding is likely to appear (`for x in xs`, `import { a as b }`), so rename
+// refuses both as a NEW name.
+export const VL_HARD_KEYWORDS: readonly string[] = [
   "function",
   "if",
   "else",
@@ -1077,7 +1083,7 @@ const VL_HARD_KEYWORDS: readonly string[] = [
   "null",
 ];
 
-const VL_SOFT_KEYWORDS: readonly string[] = [
+export const VL_SOFT_KEYWORDS: readonly string[] = [
   "as",
   "from",
   "in",
@@ -1194,7 +1200,7 @@ export const snippetCompletions = (afterDot: boolean): Completion[] => {
 // alphabetical hand-sort as the seedless fallback.
 
 /** Convert a char offset in `source` to a 0-based LSP position. */
-const offsetToPos = (
+export const offsetToPos = (
   source: string,
   offset: number,
 ): { line: number; character: number } => {

@@ -200,6 +200,21 @@ const FEATURES: Parity[] = [
     knownGap:
       "workspace-scoped (lastUseMap); the single-file playground has no use-map",
   },
+  {
+    // TODO parity (D9.7): rename symbol ships in the LSP (`planRenameAt` +
+    // `renameEdits` in `lsp/src/rename.ts` — alias/import-edge aware, std
+    // refusals); Monaco has a matching `RenameProvider` (`provideRenameEdits`
+    // + `resolveRenameLocation` covering the prepare half, which is why
+    // `connection.onPrepareRename` sits in NON_FEATURE below rather than in a
+    // second row). A single-file playground rename is meaningful for local
+    // bindings; add the adapter binding + provider, then move this row up and
+    // drop `knownGap`.
+    feature: "rename symbol",
+    serverMarker: "connection.onRenameRequest",
+    adapterExport: "rename", // ← missing in lspAdapter.ts
+    mainMarker: "registerRenameProvider", // ← missing in main.ts
+    knownGap: "no rename adapter export and no registerRenameProvider",
+  },
 ];
 
 // --- 0. the table self-validates against server.ts --------------------------
@@ -235,6 +250,7 @@ Deno.test("every server.ts handler has a parity-table row", () => {
     "connection.onInitialize",
     "connection.onInitialized", // lifecycle: flushes the cached seed-origin notification
     "connection.onCodeLensResolve", // the resolve half of the code-lens row above
+    "connection.onPrepareRename", // the prepare half of the rename row above
     "documents.onDidSave", // save-triggered workspace pass; not a Monaco provider
   ]);
   for (const handler of found) {
