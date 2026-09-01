@@ -36,8 +36,8 @@ taste.
 | **`self` first, so exports read as UFCS methods** | `array.indexOf(self: T[], needle)`, `fmt.join(self: string[], sep)`, `buffer.loadI32(self: Buf, off)`, `utf8.encodeUtf8(self: string)` — and `fmt.vl`'s header says so outright |
 | **lowerCamelCase**, except a constructor | `Buffer(byteLength: i32): Buf` is the one capitalised export |
 | **generic in the element type** where it varies | all of `array.vl` |
-| **union returns are ALWAYS explicit; scalar returns are usually elided** | measured across all 77 std exports: **10 of 10** union-returning exports annotate (`decodeUtf8`, `readFile`, `listDir`, `pathKind`, `programArgs`, …), while `utf8Length`/`join`/`repeat`/`padLeft`/`toStr` elide. Check the union half — it is exceptionless. The scalar half is taste, not convention. |
-| **the module header explains WHY and names what it does NOT do** | `fmt.vl`: *"f64→string … is deliberately absent — `print` keeps covering floats"* |
+| **union returns are ALWAYS explicit; scalar returns are usually elided** | re-measured 2026-09-01 across all **121** std exports (the row said 77 and 10 of 10 when std was smaller): **12 of 12** union-returning exports annotate — `decodeUtf8`, `decodeUtf8At`, `readFile`, `readTextFile`, `writeFile`, `writeTextFile`, `listDir`, `pathKind`, `pathExists`, `programArgs`, `parseF64`, `decodeBase64` — while `utf8Length`/`join`/`repeat`/`padLeft`/`toStr` elide. Check the union half — it is exceptionless. The scalar half is taste, not convention. (`toStr`'s union is in its PARAMETER, which this row does not govern.) |
+| **the module header explains WHY and names what it does NOT do** | `base64.vl`: *"WHAT IS NOT HERE: the URL-safe alphabet … when one arrives it gets its OWN NAME, never a boolean parameter"*. (`fmt.vl` used to be the example here, for *"f64→string … is deliberately absent"* — that deferral was spent on 2026-09-01, and a citation going stale is itself the reason to re-read the header rather than the rubric.) |
 | **a width-suffixed family stays uniform** | `loadI8/loadU8/loadI16/loadU16/loadI32/loadI64/loadF32/loadF64` |
 
 **The name must be self-sufficient in a flat namespace.** VL has **no namespace import**
@@ -77,7 +77,10 @@ without a reason should ask for the reason, not the removal.
   decision, not making one.
 - **Duplicated functionality.** A second `split`, a second decoder. `std:utf8` is its own
   module precisely so there is one decoder with one opinion about invalid input.
-- **Anything speculative.** `std-design.md` D1's admission principle: nothing lands without
+- **Anything speculative.** `std-design.md` **D2**'s admission principle (this line said D1
+  until 2026-09-01, and D1 is the intrinsic floor — the block headed *"What belongs in std
+  (the admission principle)"* sits inside D2; a module citing D1 for it is citing the wrong
+  section, and so was this rubric): nothing lands without
   a consumer in the tree — its own illustration is *no `std:http` before a network story*.
   **Check WHICH clause admits the module**, though: the same principle separately admits
   "what the LANGUAGE story needs to be complete without third parties", and names

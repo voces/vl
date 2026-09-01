@@ -275,8 +275,16 @@ matcher surface (`expect<T>`, eventually) and all collections gate on it, and
 the rename walker is the riskiest code in the module bridge — land it alone.
 
 1. **`std:fmt` v1** — pure-VL `toStr` for i32/i64/boolean (the `i32ToStr`
-   technique), `padLeft`/`repeat`/`join`-class helpers. f64→string (shortest
-   round-trip, Ryu-class) explicitly DEFERRED — `print` keeps covering floats.
+   technique), `padLeft`/`repeat`/`join`-class helpers. ~~f64→string (shortest
+   round-trip, Ryu-class) explicitly DEFERRED — `print` keeps covering floats.~~
+   **THAT DEFERRAL IS SPENT (2026-09-01).** `toStr` has an f64 arm and `parseF64`
+   is beside it, landed as serde stage 0 (`docs/serde-design.md`
+   §Recommendation) — shortest round-trip in ECMA-262 `Number::toString` style,
+   and correctly rounded coming back. Not Ryū: Burger–Dybvig over exact big
+   integers, because a table-free correctness argument outweighs the speed for a
+   module with no deprecation story. The reasoning is in `std/fmt.vl`'s own
+   `f64 ↔ TEXT` header; `f32`→string is still deferred, and is a different
+   boundary computation rather than a wrapper.
 2. **`std:test` v1** — registration + matcher surface per D5; co-designed
    with the `vl test` runner.
 3. **`std:list`** — the collections-design §VL growable over the floor. The

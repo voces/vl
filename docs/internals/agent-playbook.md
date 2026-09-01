@@ -273,7 +273,8 @@ Two consequences worth stating:
 - **The fuzzer's grammar never emits a nested named function that captures**, so a
   fuzz A/B is structurally blind to `emitCapturedCall` — a sabotage there is inert
   across 25,200 programs. The corpus reaches it in exactly 2 of ~1,417 files
-  (`functions/closure.vl`, `numerics/error-intrinsic-with-fn-value.vl`), and only
+  (`functions/closure.vl`, `numerics/intrinsic-with-fn-value.vl` — an `error-`
+  fixture until 2026-09-01, when the gap it pinned closed), and only
   the first can move a row. For anything on that path, construct the population.
 - **Capture analysis is name-keyed module-wide.** Two nested functions with the
   SAME name in different outer frames report `emitProgram: captured variable not

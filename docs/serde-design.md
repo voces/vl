@@ -483,24 +483,58 @@ execution snapshot, no zero-copy promises in the GC tier.**
 
 Staged, sized honestly:
 
-- **Stage 0 — prerequisites.** `f64`/`f32` ↔ string: shortest-round-trip formatting and
-  correctly-rounded parsing in pure VL (`std:fmt` growth or `std:num`) — the one genuinely
-  hard algorithm in this whole program, needed by *every* text story including diagnostics,
-  and missing today (measured). `std:base64` (small). Every export here is a `std:*`
-  addition → `std-api-reviewer` per CLAUDE.md.
+- **Stage 0 — prerequisites, std-only, ~~no compiler change~~ ONE compiler change.**
+  ~~`f64` ↔ string~~ **LANDED 2026-09-01, as `std:fmt` growth.** The "no compiler change"
+  estimate was wrong by exactly one, and the miss is worth recording because it is the
+  shape a std slice keeps hitting: `capScan`'s callee exemption asked two of the compiler's
+  three intrinsic-name predicates, so a numeric-opcode intrinsic's NAME rode the capture
+  list and `emitProgram: the numeric intrinsic 'f64bits' is mistaken for a captured
+  variable here` fired for a call from an ordinary top-level function as soon as the
+  program contained a function value ANYWHERE. `f64bits` has no substitute in pure VL, so
+  the f64 arm was unusable beside a comparator lambda or `std:test` until that was fixed.
+  Stage 1 should budget for the same kind of one-line-but-blocking gap rather than assume
+  the std tier is closed. `toStr` gained an **f64 arm** and `parseF64(self:
+  string): f64 | null` is its inverse; the design, the correctness arguments and the
+  measurements are in `std/fmt.vl`'s `f64 ↔ TEXT` header, and the grading is
+  `tests/vl_std_float_text_test.ts`. Four decisions that bind the rest of this document:
+  - **The style is ECMA-262 `Number::toString`, radix 10** — the rule the two hosts' print
+    sinks already claim, so `print(x.toStr())` and `print(x)` are the same characters, and
+    a spec rather than a preference. Every JSON/text rendering below inherits it.
+  - **The formatter is Burger–Dybvig over exact big integers, not Ryū.** No tables, no
+    128-bit multiply (32-bit limbs inside an i64 leave room for every partial product), and
+    a correctness argument short enough to re-derive; ~25 µs per rendering, ~22 µs for an
+    exact-path parse, under 1 µs for a fast-path one. Ryū drops in behind the same
+    signature if a consumer ever names a throughput requirement.
+  - **The parser is correctly rounded at every halfway case** — Clinger's fast path over an
+    exact num/den fallback with ties-to-even. Measured against `Number(s)` on 200,000
+    random and 5,844 adversarial inputs (exact midpoints, ±1 decimal ulp, 900-zero
+    truncated tails, the subnormal boundary): **205,844 of 205,844**.
+  - **Range is not a parse failure**: overflow answers ±Infinity, underflow ±0, and `null`
+    means only "not a number in the grammar". A JSON reader inherits that split.
 
-  **The lexer half is DONE (2026-09-01).** Scientific notation lexes end to end:
-  `digits ('.' digits)? ([eE] [+-]? digits)?`, `_` separators throughout, exponent and all.
-  It is a SPELLING of the float literal VL already had — same node, f64 by default, same
-  contextual-f32 grant — so `1e3` reaches every position `1000.0` does, and `vl fmt` keeps
-  the author's bytes. The mantissa grammar did NOT widen: VL still has no bare `.5` or
-  `1.`, so `.5e3` and `1.e3` mean what they meant before. Values are correctly rounded —
-  the exponent scales the same exact bignum rational the plain spelling builds
-  (`mant * 10^(exp - fracDigits)`), so there is exactly one rounding and no
-  `mantissa * 10^exp` product in f64 anywhere; verified against CPython's `strtod` on 396
-  literals plus `1e23`, `8.98846567431158e307`, `2.2250738585072011e-308`, `5e-324` and
-  `1.7976931348623157e308`. That closes the *re-parseability* half of the round trip; the
-  formatting half (VL's own shortest-round-trip renderer) is still Stage 0 work.
+  **Two things fact 6 said that are now measured differently.** `-0.0` printing as `0` is
+  not a print-path defect, it is ECMA-262's own rule and `toStr` reproduces it — so −0 does
+  not survive a text round trip in EITHER direction, which is a reason stage 2's VLB
+  encodes float BITS rather than text. And the Rust host's `print` is **not** exactly JS
+  `String(v)`: it re-formats digits from Rust's `{:e}`, which breaks an exact decimal tie
+  away from even where the spec breaks it to even — 14 of 50,000 pseudo-random doubles,
+  smallest witness bits `4835952189745799117` (exactly 2023347301156851.25). The same VL
+  program prints differently under the V8 and Rust hosts for those values. `std:fmt`
+  follows the spec; the divergence is pinned by a test so a host fix flips it.
+
+  **STILL OPEN in stage 0.** `f32` ↔ string: an f32's shortest rendering is shorter than
+  its widened f64's (`0.1` vs `0.10000000149011612`), so it is a different boundary
+  computation and not a wrapper — the same Burger–Dybvig core with 24-bit significand
+  parameters, plus the f32-nearest rounding on the way in. Fix the
+  lexer's inability to read scientific notation so VL's own float rendering is
+  re-parseable (independent language bug surfaced by this survey).
+  ~~`std:base64` (small)~~ **LANDED 2026-09-01** — RFC 4648 §4, standard alphabet, padded,
+  `encodeBase64(self: u8[]): string` / `decodeBase64(self: string): u8[] | Base64Error`,
+  strict about non-canonical trailing bits so decode-then-encode is an exact identity. Note
+  for stage 1 and stage 3: the error arm is a struct rather than `null` because `u8[] |
+  null` **does not lower** on this compiler (`emitProgram: bare null needs a struct-typed
+  context`; `scripts/capability-probes/u8-list-nullable-return.vl`).
+  Every export here is a `std:*` addition → `std-api-reviewer` per CLAUDE.md.
 - **Stage 1 — `std:json` v1, std-only.** Escaping writer + pull lexer + hand codecs for
   the types the repo itself needs (config-file class). Deliberately minimal: it is the
   boilerplate *measurement* for stage 2 (the `std:fs`→`as` playbook) and the day-one
