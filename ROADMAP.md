@@ -103,8 +103,33 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   documented as output-changing like `--color=always`. DECISIONS: (a) adopt the
   param-type mechanism; (b) allow `CallerLoc` in function types; (c) accept the
   not-a-drop-in consequence; (d) uniform-on + `--strip-locations` over per-mode
-  defaults. Recommended: yes to all four. The editor-side single-expect
-  anchor is D9 slot 12 and needs no ruling.
+  defaults. ROUND 3 (owner: "explicit CallerLoc opt-in seems very
+  ugly — is this standard?"): the VISIBLE PARAMETER is the majority spelling — Swift
+  (`file: StaticString = #file`, XCTest's whole surface), C++20
+  (`std::source_location::current()` as a default), C# (`[CallerLineNumber] int line
+  = 0`), Zig (fully explicit `@src()` at every call) all put it in the signature; only
+  Rust hides it, at the cost of attribute machinery + fn-pointer shims; wasm's only role
+  is closing the runtime-introspection lane (Python/JS/Java frames). The structural
+  complaint is real though: Swift/C++/C# express the magic through DEFAULT ARGUMENTS —
+  a general feature + one callsite intrinsic — where the magic-type proposal fuses them
+  into a one-type special case. RECOMMENDATION SUPERSEDING THE MECHANISM CHOICE:
+  **default arguments v1 first, track-caller as their first customer.** v1 scope:
+  trailing params only; defaults evaluated AT THE CALL SITE in the caller's context
+  (the Swift/C++ semantics — required for `__callsite__`); default expressions
+  restricted to literals, module-scope consts, and `__callsite__` (legal only as a
+  default value); fixed-arity ABI preserved (compiler fills omitted args — no overload
+  resolution enters the language); a defaulted function VALUE carries its full
+  signature (not a drop-in where the shorter fn type is expected — same edge either
+  way). Independent justification: std has NO deprecation story, and trailing defaults
+  make std evolution ADDITIVE (a shipped function can grow an options param without
+  breaking a caller) — structural relief for a version-locked std. Then track-caller is
+  one std line: `expect(value: T, caller: CallerLoc = __callsite__)` — magic visible as
+  one literal in one place vs an invisible rule about a type name; everything
+  downstream (call sites, explicit forwarding in wrappers, failure output, the
+  fn-value edge) is byte-identical between the two spellings. Sequencing: behind
+  constraints Phase 1's merge (two concurrent typecheck features is the measured
+  rebase-pain ceiling). BLOCKED ON: the owner's one-word ruling on default arguments
+  v1. The editor-side single-expect anchor is D9 slot 12 and needs no ruling.
 - **`vl test --trace` inline run values** — RULED low priority (owner, 2026-09-01,
   "low prio I guess"): keep parked; an emitter flag instrumenting USER programs (never
   the compiler) logging `(site, value)` pairs, extension renders decorations after a
