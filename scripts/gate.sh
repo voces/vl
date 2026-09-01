@@ -46,6 +46,10 @@ run "ci-native"                env SELFHOST_NATIVE_ALIGN=1 bash -c \
 # rather than silently passing.
 run "lsp suites (ci list)"     env SELFHOST_NATIVE_ALIGN=1 bash -c \
                                  'L=$(awk "/Editor features on the wasm compiler/{f=1; next} f && /- name:/{exit} f{print}" .github/workflows/ci.yml | grep -oE "tests/[a-zA-Z0-9_]+\.ts" | sort -u); [ -n "$L" ] || { echo "no lsp suite list extracted from ci.yml" >&2; exit 1; }; deno test -A --no-check --parallel $L'
+# Root deno.json excludes lsp/ and every suite runs --no-check, so a type error
+# in lsp/src/*.ts is invisible to all the other gates (esbuild strips types
+# without checking). Mirrors ci.yml's "Type-check (lsp)" step.
+run "lsp typecheck"            deno check --config lsp/deno.json lsp/src/*.ts
 run "native-fixpoint"          bash scripts/native-fixpoint.sh
 run "lint-self + fmt"          bash scripts/lint-self.sh
 run "deno lint"                deno lint
