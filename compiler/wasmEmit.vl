@@ -347,6 +347,7 @@ import {
   uBoxNewEnd,
   uDeclared,
   uFieldCount,
+  uFieldElemName,
   uFieldNames,
   uFieldStart,
   uFieldTypes,
@@ -779,6 +780,10 @@ import {
   unionEqStashSlot,
   unionEqArmSlot,
   unionEqStashSlot2,
+  internInlineShapeTy,
+  structEqStashSlot,
+  structIdxOfElemName,
+  uFieldElemTyIxRow,
   widenScalarBackSlot,
   widenScalarWrapSlot,
   widenTmpSlot,
@@ -5696,7 +5701,13 @@ function variantFieldsComparable(vi: i32): boolean {
   while j < cnt {
     if start + j >= uFieldTypes.length { return false }
     const c = uFieldTypes[start + j]
-    if c != 0 && c != 3 { return false }
+    if c != 0 && c != 3 && c != 15 { return false }
+    // D974 — a NESTED SHAPE field (code 15) is comparable when its shape has an interned
+    // struct row, which `collectU` mints for exactly these (`internInlineShapeTy`). No row,
+    // no compare — the same decline discipline the scalar codes get.
+    if c == 15 {
+      if variantNestedRow(start + j) < 0 { return false }
+    }
     j = j + 1
   }
   true
@@ -5726,6 +5737,8 @@ function emitVariantArmEq(body: i32[], sl: i32, sr: i32, vi: i32) {
     fbStructGet(uVarHeap[vi], j)
     if c == 3 {
       if emitStrEqCore(body) < 0 { return -1 }
+    } else if c == 15 {
+      if emitNestedShapeEq(body, start + j) < 0 { return -1 }
     } else {
       fbI32Bin(70) // 0x46 i32.eq
     }
@@ -5734,6 +5747,47 @@ function emitVariantArmEq(body: i32[], sl: i32, sr: i32, vi: i32) {
   }
   0
 }
+
+// D974 — the interned struct row of a variant field's NESTED shape, or -1.
+function variantNestedRow(ufi: i32): i32 {
+  const nm = uFieldElemName[ufi]
+  if nm == "" { return -1 }
+  // A NAMED nested type (`type C = {r: i32}` as an arm's field) has a struct row under its
+  // NAME; only an INLINE shape needs interning. Asking the name first is what makes the
+  // common spelling resolve — `internInlineShapeTy("C", …)` answers -1 for it.
+  const named = structIdxOfElemName(nm)
+  if named >= 0 && named < sHeapIdx.length { return named }
+  const row = internInlineShapeTy(nm, uFieldElemTyIxRow(ufi))
+  if row < 0 { return -1 }
+  if row >= sHeapIdx.length { return -1 }
+  row
+}
+
+// Compare two NESTED shape refs already on the stack, field-wise. Unlike the arms themselves,
+// a nested shape HAS an interned struct row, so `emitStructEqRec` is available — it just needs
+// its operands parked, which is what its `-2` / `-3` sentinels read.
+function emitNestedShapeEq(body: i32[], ufi: i32) {
+  const row = variantNestedRow(ufi)
+  if row < 0 { return -1 }
+  const nl = structEqStashSlot(row)
+  const nr = structEqStashSlot(row + 1024)
+  fbLocalSet(nr)
+  fbLocalSet(nl)
+  const savedL = eqStashL
+  const savedR = eqStashR
+  eqStashL = nl
+  eqStashR = nr
+  const pathSi: i32[] = []
+  const pathFi: i32[] = []
+  const r = emitStructEqRec(body, -2, -3, row, pathSi, pathFi, fnIxOfNothing())
+  eqStashL = savedL
+  eqStashR = savedR
+  r
+}
+
+// `emitStructEqRec` takes a frame index only to resolve EXPRESSION operands; the stash-sentinel
+// path never reaches that, so -1 is the honest argument rather than a borrowed frame.
+function fnIxOfNothing(): i32 { -1 }
 
 function emitUnionUnionEq(
   body: i32[],
