@@ -916,16 +916,77 @@ Deno.test({ name: "wasm-symbols: a lambda-bound value and a function-typed param
   }
 });
 
-// ── template literals through the EDITOR path ────────────────────────────────
-// The server re-checks on every keystroke, and a template hole's renderer is a
-// `std:fmt` export — so the editor path has to arm the module fetch loop for a
-// file with no `import` line in it at all. `needsModules` in `wasmChecker.ts` is
-// that arming test, and it must agree with the Rust host's and the compiler's.
+// ── the module-arming gate through the EDITOR path ───────────────────────────
 //
-// Without it the loop never runs, `std:fmt` is never committed, and the injected
-// reference resolves to nothing: an "undeclared identifier" on a program the CLI
-// compiles cleanly — the worst shape of divergence, since it only appears in the
-// editor.
+// `needsModules` (now `compiler/moduleGate.ts`, imported by `wasmChecker.ts`)
+// decides whether the editor runs the module fetch loop, and it must agree with
+// the Rust host's copy and the compiler's `cliNeedsModules`. It has TWO arms and
+// each has its own failure shape:
+//
+//   • a module-dependency LINE — `import { … }` or a RE-EXPORT `export { … } from
+//     "…"`. The re-export arm landed in the CLI and the Rust host in #2182 and NOT
+//     in the two TS copies, so a file whose only module syntax was a re-export got
+//     ZERO diagnostics in the editor while `vl check` reported the unresolvable
+//     import. The row below is that file.
+//   • a TEMPLATE HOLE, whose renderer is a `std:fmt` export — so the editor path
+//     has to arm the loop for a file with no `import` line in it at all.
+//
+// The shared table both arms are graded against lives in
+// `tests/support/moduleGateCases.ts`; `tests/module_gate_agreement_test.ts` runs
+// it against the TS gate and checks the two mirrored copies' source, and
+// `tests/vl_module_gate_test.ts` runs it through the native `vl`.
+Deno.test({
+  name: "wasm-checker: a re-export of a missing module is diagnosed (the `export {` arm)",
+  ignore,
+}, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // The gate's ONLY module syntax is the re-export. With the arm missing the
+  // fetch loop never runs, the entry is compiled single-source, and the editor
+  // reports NOTHING — measured, 0 diagnostics against the CLI's error.
+  const reexport = await checker.check(
+    'export { helper } from "./nope"\nprint(1)\n',
+    "/proj/main.vl",
+    noSiblings,
+  );
+  if (!reexport.some((d) => d.message.includes("Cannot resolve import"))) {
+    throw new Error(
+      `expected the unresolvable-import diagnostic; got ${reexport.length}: ` +
+        `${reexport.map((d) => d.message).join("; ") || "(none — the fetch loop never armed)"}`,
+    );
+  }
+  // The control: the same file spelled with `import` — the arm that was never
+  // missing. Change ONE thing between witness and control.
+  const imported = await checker.check(
+    'import { helper } from "./nope"\nprint(1)\n',
+    "/proj/main.vl",
+    noSiblings,
+  );
+  if (!imported.some((d) => d.message.includes("Cannot resolve import"))) {
+    throw new Error(
+      `the \`import\` control lost its diagnostic too: ` +
+        `${imported.map((d) => d.message).join("; ") || "(none)"}`,
+    );
+  }
+  // `export` WITHOUT a brace list is a plain declaration, not a module edge: it
+  // must stay on the single-source path and check clean. This is the arm the `{`
+  // test buys, and a gate widened to a bare `startsWith("export")` breaks here.
+  const plainExport = await checker.check(
+    "export function twice(n: i32): i32 { n * 2 }\nprint(twice(2))\n",
+    "/proj/main.vl",
+    noSiblings,
+  );
+  if (plainExport.length !== 0) {
+    throw new Error(
+      `an exported declaration must not arm the module loop; got: ` +
+        plainExport.map((d) => d.message).join("; "),
+    );
+  }
+});
+
+// The template arm's own failure shape: without it the loop never runs, `std:fmt`
+// is never committed, and the injected reference resolves to nothing — an
+// "undeclared identifier" on a program the CLI compiles cleanly, the worst shape
+// of divergence, since it only appears in the editor.
 Deno.test({ name: "wasm-checker: a template with an i32 hole checks clean (std:fmt is fetched)", ignore }, async () => {
   const checker = loadWasmChecker(SEED, log)!;
   // The reader knows NOTHING about std — `withStd` serves `std:fmt` (and the

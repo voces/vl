@@ -1050,22 +1050,41 @@ export const memberCompletionsFromWasm = (
 };
 
 // VL keywords: hard keywords (reserved by the lexer) plus soft keywords
-// (contextual — lexed as `ID` but given syntactic meaning by the parser). We
-// enumerate them statically rather than importing the lexer's `KEYWORDS` map so
-// this module stays free of runtime dependencies on the compiler internals.
+// (contextual — lexed as `IDENT` but given syntactic meaning by the parser). We
+// enumerate them statically rather than reaching into the compiler so this module
+// stays free of runtime dependencies on it.
 //
-// Hard keywords (from lexer.ts `KEYWORDS` map):
-//   function if else while for const let return is await break continue
+// A DELIBERATE COPY IS STILL A COPY, and this one drifted: the list below is one
+// of FIVE keyword vocabularies in the tree (`keywordKind` in `compiler/lexer.vl`
+// — the AUTHORITY; `lexClassOf` in `compiler/driver.vl`; here; the TextMate
+// grammar `lsp/syntaxes/vital.tmLanguage.json`; the playground's Monarch table
+// `playground/src/main.ts`), and three of the five had never learned `match`.
+// The consequence was user-visible: `invalidNewNameReason` reads this list, so
+// the LSP ACCEPTED renaming a binding to `match` and produced a file that does
+// not parse. `tests/keyword_vocabulary_test.ts` now DERIVES both sets from the
+// compiler's own source and fails on any disagreement — so this stays a copy,
+// but no longer an unchecked one. The old header cited `lexer.ts`'s `KEYWORDS`
+// map, a file kill-TS deleted; the authority is `compiler/lexer.vl`.
+//
+// Hard keywords — reserved by the lexer, never an identifier (19):
+//   function if else while for const let return is await break continue match
 //   import export type true false null
-// Soft keywords (recognized by text in parser.ts via `atSoft`):
-//   as from in step to
-// (`then` was removed from the language on 2026-08-31 — see DECISIONS.md.)
+// Soft keywords — contextual, recognized by TEXT at one parser position each (7):
+//   as from in step to new flat
+// `new` (`type Id = new i32`, the nominal newtype) and `flat` (`flat type R = {…}`,
+// the flat record) are contextual keywords the earlier list never had; both are
+// measurably NOT reserved (`const new = 1` and `const flat = 2` run and print),
+// which is why they belong here and not above. `then` is deliberately in NEITHER
+// list: it was removed from the language on 2026-08-31 (see DECISIONS.md) and its
+// remaining parser site is a targeted refusal, not syntax.
 //
 // Exported (beyond the completion list below) for rename's new-name validation
 // (`rename.ts`): a hard keyword can never be an identifier, and a soft keyword
-// — while lexed as an ID — re-parses as syntax in the very positions a renamed
-// binding is likely to appear (`for x in xs`, `import { a as b }`), so rename
-// refuses both as a NEW name.
+// — while lexed as an IDENT — re-parses as syntax in positions a renamed name can
+// reach (`for x in xs`, `import { a as b }`, `type N = new T`), so rename refuses
+// both as a NEW name. The refusal is conservative for `new`/`flat`, whose windows
+// are narrower than `in`/`to`/`step`'s — a wrong rename there is silent, and the
+// cost of refusing is one rejected name.
 export const VL_HARD_KEYWORDS: readonly string[] = [
   "function",
   "if",
@@ -1079,6 +1098,7 @@ export const VL_HARD_KEYWORDS: readonly string[] = [
   "await",
   "break",
   "continue",
+  "match",
   "import",
   "export",
   "type",
@@ -1089,8 +1109,10 @@ export const VL_HARD_KEYWORDS: readonly string[] = [
 
 export const VL_SOFT_KEYWORDS: readonly string[] = [
   "as",
+  "flat",
   "from",
   "in",
+  "new",
   "step",
   "to",
 ];

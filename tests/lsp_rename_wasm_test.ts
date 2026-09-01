@@ -91,13 +91,79 @@ Deno.test("rename: new-name validation accepts identifiers, refuses grammar + ke
       `hard keyword '${kw}' must be refused as reserved; got ${reason}`,
     );
   }
-  for (const soft of ["as", "from", "in", "step", "to"]) {
+  for (const soft of ["as", "from", "in", "step", "to", "new", "flat"]) {
     const reason = invalidNewNameReason(soft);
     assert(
       reason !== undefined && reason.includes("contextual"),
       `soft keyword '${soft}' must be refused as contextual; got ${reason}`,
     );
   }
+});
+
+// `match` is the row this list was MISSING, and the miss was user-visible: the
+// LSP accepted the rename and wrote a file that does not parse. Kept as its own
+// named test — a loop over a list cannot say which entry mattered, and the whole
+// point of the defect is that a list entry was absent.
+// (`tests/keyword_vocabulary_test.ts` is the standing guard: it derives the
+// reserved set from `compiler/lexer.vl` and fails if any list drifts again.)
+Deno.test("rename: `match` is refused as a new name (it was accepted, and broke the file)", () => {
+  const reason = invalidNewNameReason("match");
+  assert(
+    reason !== undefined && reason.includes("reserved"),
+    "renaming a binding to `match` must be refused — accepted, it produces " +
+      "`const match = 1`, which fails to parse with `expected an identifier but " +
+      `found \`match\`\`. Got: ${JSON.stringify(reason)}`,
+  );
+  // The control: a name that merely STARTS with a keyword is a legal identifier
+  // and must still pass, so the refusal is the keyword and not a prefix test.
+  assert(
+    invalidNewNameReason("matched") === undefined,
+    "`matched` is a plain identifier and must remain an acceptable new name",
+  );
+});
+
+// The whole path, end to end: prepare → plan → edits → does the RESULT parse?
+// The pure check above pins the validator; this pins that the validator is what
+// the rename path actually consults. Before the fix this test's `after` source
+// was `const match = 1\nprint(match)\n` with five parse errors.
+Deno.test({
+  name: "rename: the seed-backed path refuses `match` and still accepts a plain name",
+  ignore,
+}, async () => {
+  const src = "const foo = 1\nprint(foo)\n";
+  const read = memoryReader({ "/proj/m.vl": src });
+  const plan = await planRenameAt(src, "/proj/m.vl", read, checker!, 0, 6);
+  assert(
+    plan !== undefined && plan.kind === "local",
+    `expected a local rename plan for \`foo\`, got ${JSON.stringify(plan)}`,
+  );
+  assert(
+    invalidNewNameReason("match") !== undefined,
+    "the rename request must refuse `match` before any edit is computed",
+  );
+  if (plan!.kind === "refused") return;
+  // The same plan with a legal name still produces a file that checks clean —
+  // the floor that keeps the refusal from being "rename is broken".
+  const result = await renameEdits(
+    plan!,
+    "bar",
+    src,
+    "/proj/m.vl",
+    pathToUri("/proj/m.vl"),
+    [],
+    [],
+    read,
+    checker!,
+  );
+  assert(!("error" in result), `expected edits, got ${JSON.stringify(result)}`);
+  if ("error" in result) return;
+  const after = applyEdits(src, result.changes[pathToUri("/proj/m.vl")]);
+  assert(
+    after === "const bar = 1\nprint(bar)\n",
+    `unexpected rename result: ${JSON.stringify(after)}`,
+  );
+  const diags = await checker!.check(after, "/proj/m.vl", read);
+  assert(diags.length === 0, `the renamed file must check clean; got ${diags.length}`);
 });
 
 // ---- pure: import specifier scan + resolution -------------------------------

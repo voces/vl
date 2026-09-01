@@ -540,8 +540,35 @@ same stale "Mirrors the Rust host's module gate" comment); A3's keyword split
 `const match = 1` refuses and `const new = 1` prints `1`); A8's absence of any test naming
 either token function.
 
+**A1 and A3 are CLOSED as of 2026-09-01 (#2219)** — their rows below carry the detail and the
+guards. The measurements in this section describe the tree as of the audit and are kept as
+filed; read a row's own CLOSED note before quoting its numbers. Two corrections the fixes
+owe this file: A3's "over-claims `new`" was wrong (`new` is a real CONTEXTUAL keyword and the
+row's own `const new = 1` probe only proves it is not a HARD one), and the row's five lists
+were also all missing `flat` — a sixth keyword nothing in the survey named, found by reading
+the parser rather than the lists. A1's "two TS copies may live in different bundles" was not
+a real obstacle: `lsp/src/wasmChecker.ts` already serves both the LSP and the playground.
+
 **A1 · The module-arming gate — 4 implementations in 3 languages, 2 missing the `export {`
-arm. REACHED, and user-visible in the editor.**
+arm. REACHED, and user-visible in the editor. — CLOSED (#2219).**
+
+> **CLOSED 2026-09-01 (#2219).** The two TS copies are now ONE leaf module,
+> `compiler/moduleGate.ts` (zero imports), imported by `lsp/src/wasmChecker.ts` — which
+> serves the VS Code LSP *and* the browser playground, so the "different bundles" worry was
+> not one — and by `tests/cases_wasm_test.ts`. The VL and Rust copies cannot import
+> TypeScript and stay MIRRORED, now under a guard:
+> `tests/module_gate_agreement_test.ts` **extracts each mirrored copy's arm set from its own
+> source** (`cliLineStartsKwBrace(line, "kw")` / `strip_prefix("kw")`) and requires it to
+> equal the shared module's `MODULE_LINE_KEYWORDS`, asserts neither TS consumer re-defines a
+> twin, asserts no fifth copy has appeared, requires both template scans to keep their
+> comment/quote/`${` anchors, and refuses the stale sentence tree-wide. The behavioural table
+> is shared (`tests/support/moduleGateCases.ts`, 15 rows) and re-run by three executors:
+> the pure TS gate, the native `vl check` (`tests/vl_module_gate_test.ts`, which exercises
+> the Rust host's gate and `cliNeedsModules` in series), and the seed-backed LSP checker.
+> After: `export { helper } from "./nope"` reports the diagnostic in the LSP, at every
+> spelling probed (indented, no space before the brace, on a later line). Sabotage-tested
+> 3/3 — dropping the VL arm, the Rust arm, or re-inlining the LSP copy each reddens a named
+> test.
 
 | site | arms |
 |---|---|
@@ -558,10 +585,12 @@ gate: a LINE-LEADING `import {`"* — stale, because the Rust host took the `exp
     LSP  (checker.check):  0 diagnostic(s)
     CLI  (vl check):       [ERROR]: Cannot resolve import "./nope" (no module .../nope.vl)
 
-with the `import {` control reporting the diagnostic in both. **Guard: NONE** —
-`tests/lsp_wasm_checker_test.ts:930` guards only the *template* half of the same gate.
-Unification: export `cliNeedsModules`'s decision across the seed ABI, or one shared TS
-helper the test and the LSP both import.
+with the `import {` control reporting the diagnostic in both. **Guard: NONE at the time of
+the audit** — `tests/lsp_wasm_checker_test.ts:930` guarded only the *template* half of the
+same gate. Unification: export `cliNeedsModules`'s decision across the seed ABI, or one
+shared TS helper the test and the LSP both import. *(The second option is what shipped; the
+seed-ABI one stays unbuilt — the gate has to answer BEFORE the source is staged, so routing
+it through the seed would add a staging round trip to every check for a two-token scan.)*
 
 **A2 · `retAtomKindOf` vs `valueAtomKind` — the list-atom codes. REACHED; the missing arm
 buys the LOUD outcome and the present arms produce SILENT invalid wasm.**
@@ -587,7 +616,30 @@ re-spelling of `valueAtomKind`'s `arrElemNameRaw` cascade; one shared
 `elemNameToAtomCode(elemName)` retires both.
 
 **A3 · The keyword vocabulary — 5 independently maintained lists, and a live LSP rename
-bug. REACHED.**
+bug. REACHED. — CLOSED (#2219).**
+
+> **CLOSED 2026-09-01 (#2219).** All five lists now reconcile against sets DERIVED from the
+> compiler by `tests/keyword_vocabulary_test.ts`: **19 hard** from `lexer.vl`'s `keywordKind`
+> (its `return "KIND"` arms, with each derived spelling required to be evidenced in the same
+> body, so the "TokKind is the spelling uppercased" convention is enforced rather than
+> assumed) and **7 soft** from `parser.vl`'s `.text == "word"` guards, minus the documented
+> `then` (removed from the language; its site is a targeted refusal) and plus the documented
+> `from` (positional-only — `parseImport` scans to the path STRING and never text-tests it).
+> `match` added to `driver.vl`'s `lexClassOf`, to `VL_HARD_KEYWORDS` and to Monarch; `fn` and
+> `elseif` removed from Monarch; `flat`/`to`/`step` added to TextMate; `new` and `flat` added
+> to `VL_SOFT_KEYWORDS`. Both grammars now paint EXACTLY hard ∪ soft — a partial soft rule is
+> what "some softs, chosen by nobody in particular" was, and it is unfalsifiable. Sabotage-
+> tested 4/4, one list at a time, each failure naming the entry.
+>
+> **This row's "over-claims `new`" was wrong, and running the program is what showed it.**
+> `const new = 1` runs (so `new` is not reserved — the row's own measurement) *and*
+> `type Id = new i32` runs (so it IS syntax): `new` is a CONTEXTUAL keyword, deliberately so
+> — `parser.vl:1629`'s comment says a hard keyword "would have been free against the corpus …
+> but reserves a common word language-wide for one declaration form". Reading only the first
+> half of that pair turns a correct grammar entry into a filed defect. The same probe found
+> `flat` (`flat type R = { … }`, `parser.vl:3033`), a contextual keyword **no list had at
+> all** and which no reading of the five lists could have surfaced. The genuine inventions
+> were Monarch's `fn` and `elseif`, neither of which is VL syntax at any position.
 
 | site | count | `match`? |
 |---|---|---|
@@ -605,11 +657,16 @@ parse**, and `match` is never offered in completion nor painted as a keyword.
 
 `typeFeatures.ts`'s header documents the *copy* as deliberate (*"rather than importing the
 lexer's `KEYWORDS` map so this module stays free of runtime dependencies"*) — a deliberate
-copy with an undocumented divergence. **Guard: NONE**;
+copy with an undocumented divergence. **Guard: NONE at the time of the audit**;
 `tests/playground_lsp_parity_test.ts` guards provider *wiring*, not vocabularies.
 Unification: `driver.vl` already ships `builtinScan`/`builtinCount`/`builtinNameCharAt`
 across the wasm ABI; the same shape for `keywordKind` feeds all four consumers — the exact
-move that made `printDomainStr` correct.
+move that made `printDomainStr` correct. *(What shipped is one step short of that: the lists
+stay copies and a PURE test derives the expected sets from `lexer.vl` and `parser.vl` and
+fails every list that disagrees. The ABI export remains the better end state for the LSP's
+two lists — it would make them derived rather than checked — but it cannot serve the TextMate
+grammar or the Monarch table, which are static data read by the editor before any seed
+loads, so a derivation-from-source guard is needed for those two either way.)*
 
 **A4 · `builtinScan` vs the lowered-intrinsic set. REACHED.**
 
@@ -675,14 +732,22 @@ live statement-position construct. Correctly shared by `parseImport` and `modSca
    closed vocabulary and closes A2. **Adopt `fieldCodeOfTy`'s `−2` decline convention** so a
    twin's silence is typed differently from its answers — that convention is already in the
    tree twice and it is what makes the arena/name split safe.
-2. **Export the lexer's keyword vocabulary across the wasm ABI.** `driver.vl` already ships
-   `builtinScan`/`builtinCount`/`builtinNameCharAt`; the same shape for `keywordKind`'s 19
-   spellings retires 4 hand lists (A3) — LSP hard keywords, the semantic-token class, the
-   TextMate grammar and the Monarch table. It also fixes a live rename bug.
-3. **One module-arming predicate, exported from the seed.** `cliNeedsModules` is the
-   authority; the Rust host, the LSP and the test harness each re-implement it (A1).
-   Exporting `needsModules(src) -> i32` collapses 4 sites in 3 languages to one, and it is
-   the only one of these three whose divergence is *already* visible to a user in the editor.
+2. ~~**Export the lexer's keyword vocabulary across the wasm ABI.**~~ **A3's bug is CLOSED
+   (#2219) and this candidate is DOWNGRADED, not taken.** The five lists reconcile under a
+   pure derivation guard (`tests/keyword_vocabulary_test.ts`) instead. The reason the ABI
+   move is not the answer here, and `printDomainStr`'s was: **two of the four consumers
+   cannot call the seed.** The TextMate grammar is JSON the editor reads before any server
+   starts, and the Monarch table is static data in the playground's bundle — so a
+   derivation-from-source guard is needed for those two whatever the LSP's own two lists do,
+   and once it exists it covers all five for the cost of one file. The ABI export is still
+   the better end state for the LSP's lists (derived beats checked) and is now a cleanup, not
+   a bug fix.
+3. ~~**One module-arming predicate, exported from the seed.**~~ **A1 is CLOSED (#2219) by the
+   audit's own second option** — one shared TS helper (`compiler/moduleGate.ts`) that the LSP,
+   the playground and the corpus oracle import — plus a source-extraction guard over the VL
+   and Rust copies. The seed-ABI variant stays unbuilt and probably should: the gate must
+   answer BEFORE the entry source is staged into the wasm, so routing it through the seed
+   adds a staging round trip to every `check` in order to run a two-token scan.
 
 ---
 

@@ -42,8 +42,9 @@
 //     canonical binding id, so their uses cannot be attributed to either
 //     specifier; likewise two aliases of one export;
 //   • a new name that fails the identifier grammar or is a hard OR soft
-//     keyword (soft keywords are contextual, but a binding named `in`/`to`/
-//     `step`/`as`/`from` re-parses as syntax in `for` headers and imports);
+//     keyword (soft keywords are contextual, but a name spelled `in`/`to`/
+//     `step`/`as`/`from`/`new`/`flat` re-parses as syntax where the parser
+//     tests for it — `for` headers, imports, `type N = new T`, `flat type`);
 //   • an import specifier whose statement does not resolve (no references to
 //     track).
 
@@ -75,8 +76,9 @@ export const invalidNewNameReason = (newName: string): string | undefined => {
     return `'${newName}' is a reserved keyword`;
   }
   if (VL_SOFT_KEYWORDS.includes(newName)) {
-    return `'${newName}' is a contextual keyword (soft keyword) — a binding ` +
-      `with this name re-parses as syntax in for-headers and imports`;
+    return `'${newName}' is a contextual keyword (soft keyword) — a name with ` +
+      `this spelling re-parses as syntax where the parser tests for it ` +
+      `(for-headers, import specifiers, \`type N = new T\`, \`flat type\`)`;
   }
   return undefined;
 };
