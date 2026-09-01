@@ -23982,20 +23982,23 @@ are the same six the kind-3 arm can already serve.
   `tyNameOf(nodeTyIxOf(fill))` is the obvious missing name and is **NOT** it: measured, with
   the parallel-table read already bounded, it traps the compiler on the annotated path too.
 
-* **`tyToEmitName(nodeTyIxOf(fill))` IS THE BETTER CANDIDATE AND STILL NOT RIGHT — measured,
-  reverted.** It does not trap, and it leaves the ANNOTATED spellings running, so it is
-  strictly further along than `tyNameOf`. The un-annotated case then fails as
-  `expected (ref null $type), found (ref $type)` — which reads like a nullability slip and is
-  not one: **the validator elides BOTH heap-type names** (see the CLAUDE.md note on grouping by
-  that message), so what it actually reports is that the row enrolled under this spelling is
-  not the row the READ resolves. The next attempt needs the element name in the same vocabulary
-  `ensureRefElem` / `refArrElemName` key on, and must identify the two disagreeing rows by
-  DISASSEMBLING rather than from the message, which cannot name them.
+* **`tyToEmitName(nodeTyIxOf(fill))` IS THE RIGHT NAME AND THE INTERN IS THE REMAINING GAP —
+  narrowed to one wrong heap type, by disassembly.** With that name the annotated spellings
+  keep running and the struct fill is untouched; the un-annotated case fails as
+  `expected (ref null $type), found (ref $type)`, whose heap-type names the validator ELIDES.
+  Disassembling both and diffing shows exactly one difference:
 
-* **A LATENT COMPILER OOB WENT WITH IT.** `rlBackIdx[anSlot]` / `rlWrapIdx[anSlot]` were read
-  with no bound on `anSlot`. Unreachable while the arm only ran for structs; an OOB trap in the
-  COMPILER the moment it widened. Bounded now, and the guard is what returns the clean refusal
-  to the un-annotated case.
+  the element scratch local is `(ref $0)` un-annotated and `(ref $3)` annotated — **`$0` is the
+  raw BACKING array and `$3` is the list WRAPPER**. So the row interned for the element carries
+  the backing where the annotated path carries the wrapper; the name is right and the REP the
+  intern picks for it is not.
+
+  **`ensureRefElemTy(elemName, ty)` is almost certainly the missing call**: it is the
+  type-CARRYING intern, and its kind-9 arm exists precisely to hand a nested array's row down
+  to its inner element instead of re-resolving the spelling. Every caller that gets this right
+  passes a type (`arrLitElemHintTy`, `sFieldElemTyIxRow`, `uFieldElemTyIxRow`, …); the
+  `__array_new__` path passes only a name. Start there, and grade by diffing the two
+  disassemblies rather than by the message, which cannot name the two rows.
 
 Repro (runs, prints `7`):
 
