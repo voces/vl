@@ -1904,14 +1904,24 @@ language question, not a recovery question, and it is the owner's to rule on.
 *It does not make a later TYPE error appear.* `checkSrc`/`compileSrc`/`lintSrc` in
 `compiler/driver.vl` all return at `P.diags.length > 0` — the checker never runs on a file that
 had any parse diagnostic. So `if c print(1)` followed by `const n: i32 = "hi"` still reports
-only the parse diagnostic. That gate predates this change and is well motivated in general (a
-mis-parse produces phantom type errors), but note that it is now MORE conservative than it needs
-to be for this class: a recovered unbraced body yields an AST with no `ErrExpr` in it, so its
-type errors would be real. Lifting the gate for a parse that recovered COMPLETELY is a separate,
-larger question — it would change the output of every parse-error program in the corpus — and is
-not decided here. Later PARSE errors do surface, which is what makes the recovery worth having:
-the arm is exactly one statement, never a scan, so the cursor lands back on the statement
-boundary.
+only the parse diagnostic. That gate predates this change, and **lifting it globally was tried
+and MEASURED before being left alone**: running `checkProgram` anyway costs **5 corpus cases**,
+every failure a PHANTOM type error the incomplete parse invented — `f(1 2)` becomes `wrong
+number of arguments: expected 2, got 1`, a mis-parsed operator overload becomes `redeclared ==`,
+and a `(1 +` truncation adds both `d is used before it is assigned` and `operator '+' is not
+defined for i32 and void`. That is the same noise this change exists to remove, one tier down,
+so the gate earns its keep as written.
+
+What the experiment DOES show is that the gate is coarser than the question: it keys on "any
+parse diagnostic", and an unbraced-body recovery is LOSSLESS — the arm is the statement the user
+wrote, so its type errors would all be real. A finer gate would have to be armed by each
+recovery SITE (this one is lossless; `expectClose`'s skip-to-closer drops tokens, which is what
+produces all five phantoms above), not derived from the AST — `f(1 2)` parses to a hole-free
+`f(1)` with no `ErrExpr` to detect. That is a design change with its own reach, and it is the
+owner's call, not this change's.
+
+Later PARSE errors do surface, which is what makes the recovery worth having: the arm is exactly
+one statement, never a scan, so the cursor lands back on the statement boundary.
 
 ## Which channel owns a NARROWED argument's type at a monomorphization pin
 
