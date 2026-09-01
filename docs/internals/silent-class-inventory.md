@@ -22735,6 +22735,139 @@ Both are arguments for keeping the program-population sweep alongside the ladder
 rather than in place of it.
 
 ---
+### D934 — [CLOSED 2026-09-01] a module-scope name resolves in the WHOLE ARENA, and the resolver that said otherwise was the wrong one to have asked
+
+**closed as `runs` · was check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` · 1 cell (`distilled/named/d921_arg_ident_module_chain`) · the header it replaces called the bound "a real bound and not an oversight" · MEASURED: the chain resolved exactly ONE hop and refused at two — `const z0 = {r:7}` answered, `const q0 = z0` did not · distilled corpus: `runs -> not-runs` ZERO, `-> silent` ZERO**
+
+`anonLeafBoundValOk`'s ident arm asked `anonLeafRetIdentOk`, which resolves a name against a
+FRAME's bindings and parameter list. A module-scope binding has neither — true, and the wrong
+resolver to have asked. `anonLeafArgIdentOk` already resolves by NAME over the whole arena,
+which is exactly the scope a module-level name resolves in, so the missing rung was not a
+reader but the recursion back into that function (`anonLeafArgIdentSeen`).
+
+* **THE VISITED SET IS LOAD-BEARING AND IT WAS ABLATED, NOT ASSUMED.** The recursion needs
+  D911's name-visited set SHARED rather than minted per call, because an ident chain opens no
+  call frame and the depth cap counts frames. Removed, `let a = {r:7}; let b = a; a = b`
+  exhausts the compiler's own call stack — `note: the call stack was exhausted` — which is a
+  COMPILER TRAP, a strictly worse outcome class than the cell being closed. Pinned by
+  `distilled/named/d934_module_chain_cycle`, with `d934_module_chain_4hop` for depth.
+
+Repro (now RUNS, printing `7`):
+
+    function src(p: {r: i32}): {r: i32} | null {
+      p
+    }
+    const z0 = { r: 7 }
+    const q0 = z0
+    function rd() {
+      const g1 = src(q0) ?? { r: "s" }
+      print(g1.r)
+    }
+    rd()
+    // vl check rc 0; runs, prints 7.
+
+---
+
+### D935 — [CLOSED 2026-09-01] a slot with SOME family members enrols the rest, because declining does not un-widen the ones it has
+
+**closed as `runs` · was check-clean invalid wasm · `type mismatch: expected (ref $type), found (ref $type)` · 1 cell (`distilled/named/d924_narrow_use_mixed_sites`) · distilled corpus: `runs -> not-runs` ZERO, `-> silent` ZERO**
+
+`anonLeafSlotAllMembers` refuses the moment one call site hands a slot a literal that is not
+already at the merged row. Refusing is right for a slot that cannot be made uniform, and WRONG
+here: declining does not un-widen the members, so `keep(q)` still passes a moved `q` into a slot
+that kept the narrow row and the module is invalid wasm rather than a refusal. The odd literal
+is enrolled into the family instead (`anonLeafSlotEnrolMembers`), at the members' own row and
+annotation, gated on its field NAMES matching a member's exactly.
+
+* **NEITHER CALL SITE IS A DEFECT ON ITS OWN, ONLY THE PAIR.** Ablated: `keep(q)` alone runs
+  (prints `7 7`), `keep({r: 3})` alone runs (prints `7 3`), both together are invalid wasm.
+  That is why every single-site reader in this family walked past it, and it is the reason the
+  row exists rather than a note on D924.
+
+* **TWO SPELLINGS, ONE CALL SITE.** The literal directly and through a binding
+  (`const z = {r:3}; keep(z)`) — `anonLeafIdentAllObjLits` is the second. The binding spelling
+  was confirmed PRE-EXISTING against a master-built control seed rather than assumed to be one.
+  Pinned by `distilled/named/d935_enrol_bound_sibling` and `d935_enrol_two_field` (the latter
+  writes its fields in the other order, so the name-match is graded rather than the position).
+
+Repro (now RUNS, printing `7`, `7`, `3`):
+
+    function src(p: {r: i32}): {r: i32} | null {
+      p
+    }
+    function keep(q: {r: i32}): i32 {
+      q.r
+    }
+    function rd() {
+      const q = { r: 7 }
+      const g1 = src(q) ?? { r: "s" }
+      print(g1.r)
+      print(keep(q))
+      print(keep({ r: 3 }))
+    }
+    rd()
+    // vl check rc 0; runs, prints 7 7 3.
+
+---
+
+### D936 — the fn-value decline is NOT NEUTRAL: no box is minted and the default then resolves by FIELD NAME onto the narrow row
+
+**check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` · 2 cells (`distilled/named/d925_fn_value_param_callback`, `d925_fn_value_two_targets`), OPEN · reproduces identically on master, so it is not a regression · TWO candidate fixes were built and MEASURED and are REVERTED**
+
+D925 recorded these two as "THE BOUNDS" without a mechanism. This is the mechanism, and it is
+not the one the bound implies.
+
+* **THE ABLATION IS EXACT AND IT ACQUITS THE FUNCTION VALUE.** Give `src` a fresh literal to
+  return instead of its parameter — `function src(p: {r: i32}): {r: i32} | null { { r: p.r } }`
+  — and the identical program, function value and indirect call and all, RUNS and prints
+  `1 7`. What breaks the cell is the callee returning its PARAMETER, which is what makes
+  `anonLeafParamArgsOk`'s function-value guard fire.
+
+* **THE DECLINE IS NOT NEUTRAL, AND THE DISASSEMBLY SAYS SO.** The working control mints a
+  boxed carrier — `(type $2 (struct (field i32) (field anyref)))` — and the merged row's field
+  holds a `ref $2`. The broken module contains NO box type at all: `$0 = (struct (field (mut
+  i32)))` and `$1 = (struct (field (mut (ref $str))))` are two separate narrow rows, and `rd`
+  emits BOTH `??` operands into `$0` — `(struct.new $0 (global.get $global$0))`, a string ref
+  into an i32 field. With the family reduced to one member the atom set is a single atom, no
+  box is minted, and `{r: "s"}` then falls to `structIndexOfObjCtx`'s field-NAME-only scan,
+  whose first match is `{r: i32}`. A "no answer" sentinel is not neutral when the caller has a
+  default.
+
+* **REFUTED CANDIDATE 1 — licensing the call's declared-return atom.** `anonLeafJoinAnnTy`'s
+  Call arm is gated on the read SUCCEEDING (D872's reason: an atom taken while the callee is
+  being refused points its return row at a row nobody merged). The fn-value decline looked like
+  a different decline worth licensing separately, via a predicate asking
+  `anonLeafParamArgsOk`'s own condition directly. It does not work, and this was measured twice
+  rather than reasoned about: forcing the predicate to `true` changes nothing, and removing
+  BOTH gates so the arm always takes the declared return changes nothing either. The declared
+  atom is not what is missing.
+
+* **REFUSING THE SLOT MOVE IS CORRECT — the missing capability is BOX-AT-THE-JOIN.** Moving
+  `p`'s slot really would be wrong: `cb({r: 9})` passes a narrow literal through a `call_ref`
+  no call site names, and a moved slot would meet it. So the merge must stop requiring the
+  PRODUCER's row to move and instead box at the `??` itself, coercing the narrow value the
+  callee returns on the way in. That is a new emit path, not a reader, which is why no reader
+  in this eleven-close family reaches it.
+
+Repro (check-clean invalid wasm, on master and here alike):
+
+    function src(p: {r: i32}): {r: i32} | null {
+      p
+    }
+    function apply(cb: ({r: i32}) => {r: i32} | null): i32 {
+      const v = cb({ r: 9 })
+      1
+    }
+    function rd() {
+      print(apply(src))
+      const g1 = src({ r: 7 }) ?? { r: "s" }
+      print(g1.r)
+    }
+    rd()
+    // vl check rc 0; vl run -> type mismatch: expected i32, found (ref $type)
+    // SHOULD PRINT 1 then 7.
+
+---
 
 ### D791 — [CLOSED 2026-08-31] READ-ONLY COVARIANCE is lowered by an element-CONVERTING COPY, licensed by a whole-program write scan — D661B's refusal was about the WRITABLE side only
 
