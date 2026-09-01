@@ -23954,10 +23954,21 @@ and the refusal turns into a miscompile:
   What is actually true, and is the whole remaining question: the checker's `TyFunc` for `pick`
   renders `i32 | string` (measured), while the AST's `fn.fnRet` node renders `string`; for
   `pick4` the same node renders the union. Both functions have an inferred return and differ
-  only in whether the PARAM is annotated. **So find what populates `FuncDecl.fnRet` for an
-  un-annotated return and why an un-annotated PARAM degrades it from the join to one arm's
-  type** — and note that `grep '\.fnRet = '` does NOT find it, so it is written through an
-  alias or by a shared node constructor.
+  only in whether the PARAM is annotated.
+
+* **`pick` IS MONOMORPHIZED AND `pick4` IS NOT — instrument validated this time, which is what
+  makes the rest of the trail trustworthy.** An unconditional `emitFail` at the top of the mono
+  clone path prints `fn=[pick] fnRet=-1` and prints NOTHING for `pick4`. So the clone is
+  created with `fnRet = -1`, and the `string` pin lands on it afterwards. All five `nret`
+  assignments in `emit_mono` were then probed with `emitFail` (the earlier `tErr` versions
+  measured nothing) and none fires, so `mkFunc` receives `-1`.
+
+  `synthRetAnnots` IS called (validated the same way), yet none of its fourteen non-void
+  `fn.fnRet = synthTypeRefTy(...)` rungs fires either. **THE PIPELINE BISECT IS THE NEXT STEP
+  AND IT IS ONE PROBE:** dump `pick`'s `fn.fnRet` at the ENTRY and EXIT of `synthRetAnnots`. If
+  it is already 17 on entry, the writer runs before it; if it changes across the call, a rung
+  that `grep '\.fnRet = '` does not match is doing it. Everything else on this row is already
+  eliminated, so that one measurement should finish the diagnosis.
 
 * **A NOTE ON THE OTHER SIDE, from the emitter's own comment at the `retUnionFlag` rung:** when
   the functype and the body move to the box, the CALL-RESULT classifier (`computeRetInference`
