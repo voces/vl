@@ -23770,6 +23770,43 @@ Repro (now RUNS, printing `3`, `7`):
     // vl check rc 0; runs, prints 3 then 7.
 
 ---
+### D964 — the capability-literal count is a LOWER BOUND, not the population: a reachable clause-2 violation whose message never says "not supported"
+
+**loud emit reject after `vl check` rc 0 — `emitProgram: narrowed union atom has no value box` — so a clause-2 violation by construction, and INVISIBLE to `goal-scoreboard.py` because its wording concedes nothing · ZERO corpus cells · probe `scripts/capability-probes/unannotated-param-union-return.vl` · reproduces on master**
+
+    function pick(b) {
+      if b { return 1 }
+      "s"
+    }
+    print(pick(true))
+
+Annotate the parameter — `function pick(b: boolean)` — and the identical body RUNS and prints
+`1`. So the union rep is not missing; only the un-annotated route to it is.
+
+* **THE MEASUREMENT IS THE POINT OF THIS ROW.** D958 audited the CONCEDES phrase list and took
+  the count from 12 to 24 by adding the other word order. This witness shows the remaining
+  problem is not a missing phrase but the PREMISE: the filter finds refusals that ADMIT they
+  are capability gaps, and a refusal is not obliged to admit anything. `narrowed union atom has
+  no value box` reads like an internal invariant and is a capability gap.
+
+* **THE UPPER BOUND, MEASURED: 405 distinct `emitFail` literals in `compiler/*.vl`, of which
+  13 match the filter.** The other 392 are mostly unreachable defensive floors — a floor that
+  no check-clean program can reach is not a clause-2 violation, and deleting them wholesale
+  would be worse than counting them. So the true site count is somewhere in `[23, 405]` and
+  **only a WITNESS settles which**. CLAUDE.md's own sentence — *"Every `loud emit reject` is a
+  clause-2 violation by construction, since `check` returned 0 to reach the emitter"* — is
+  about a reject that FIRES, and the filter cannot tell a fired one from a floor.
+
+* **SO THE PROBE SUITE IS THE INSTRUMENT AND THE LITERAL COUNT IS THE HEADLINE.** `--sites` is
+  cheap, stable and reads a lower bound; `scripts/capability-probes/run.py` is the only thing
+  that reports gaps a program actually reaches. When the two disagree, the probe is right.
+  Do not read `--sites` reaching zero as clause 2 being met.
+
+* **WHAT WOULD ACTUALLY CLOSE THIS ROW'S OWN GAP** is the un-annotated parameter's union return
+  reaching the same rep the annotated spelling already uses — the inference-path shape D937,
+  D956 and D957 all have, one more type over.
+
+---
 
 ### D791 — [CLOSED 2026-08-31] READ-ONLY COVARIANCE is lowered by an element-CONVERTING COPY, licensed by a whole-program write scan — D661B's refusal was about the WRITABLE side only
 
