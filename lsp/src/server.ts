@@ -17,9 +17,11 @@ import {
   InlayHintKind,
   InsertTextFormat,
   Location,
+  LSPErrorCodes,
   MarkupKind,
   ProposedFeatures,
   Range,
+  ResponseError,
   SemanticTokens,
   SymbolKind,
   TextDocuments,
@@ -88,6 +90,7 @@ import {
   typeLabelDetail,
 } from "./typeFeatures.ts";
 import { STD_SOURCES } from "../../std/embedded.ts";
+import { invalidNewNameReason, planRenameAt, renameEdits } from "./rename.ts";
 
 // The language id the extension registers (`package.json` → contributes.languages,
 // id `vital`, scope `source.vital`). Used as the markdown fence info string so
@@ -599,6 +602,107 @@ connection.onDocumentSymbol(
     });
   },
 );
+
+// ---- rename symbol (+prepare) (D9.7) ----------------------------------------
+//
+// `prepareRename` classifies the position (via `planRenameAt`) and returns the
+// identifier's exact range + placeholder — or null off any renameable symbol,
+// or a ResponseError carrying WHY for a deliberate refusal (a std-declared
+// binding, an unattributable alias mix), which VS Code shows inline. `rename`
+// re-plans against the request-time text (prepare and rename are separate
+// requests; the buffer may have moved), validates the new name (identifier
+// grammar, no hard/soft keywords — `invalidNewNameReason`), and assembles the
+// `WorkspaceEdit`: single-file plans edit the current document; an exported
+// symbol runs the same open-docs + capped-disk-crawl candidate set as
+// find-references. Semantics table + safety refusals: `rename.ts`.
+
+// What counts as a std declaration for rename's hard refusal: the `std:` key
+// scheme, plus the workspace's own `std/` dir (dogfooding in the compiler repo
+// resolves std keys to real files there — renaming those from an editor would
+// corrupt the version-locked std surface just the same).
+const isStdKeyForRename = (key: string): boolean => {
+  if (key.startsWith("std:")) return true;
+  const stdDir = getStdDir();
+  return stdDir !== undefined && key.startsWith(stdDir + "/");
+};
+
+connection.onPrepareRename(async (params) => {
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc || wasmChecker === undefined) return null;
+  const plan = await planRenameAt(
+    doc.getText(),
+    entryKeyOf(params.textDocument.uri),
+    workspaceReader,
+    wasmChecker,
+    params.position.line,
+    params.position.character,
+    isStdKeyForRename,
+  ).catch((err) => {
+    connection.console.log(`[rename] planRenameAt failed: ${err}`);
+    return undefined;
+  });
+  if (plan === undefined) return null;
+  if (plan.kind === "refused") {
+    throw new ResponseError(LSPErrorCodes.RequestFailed, plan.reason);
+  }
+  return { range: plan.range, placeholder: plan.word };
+});
+
+connection.onRenameRequest(async (params) => {
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc || wasmChecker === undefined) return null;
+  const badName = invalidNewNameReason(params.newName);
+  if (badName !== undefined) {
+    throw new ResponseError(LSPErrorCodes.RequestFailed, badName);
+  }
+  const text = doc.getText();
+  const entryKey = entryKeyOf(params.textDocument.uri);
+  const plan = await planRenameAt(
+    text,
+    entryKey,
+    workspaceReader,
+    wasmChecker,
+    params.position.line,
+    params.position.character,
+    isStdKeyForRename,
+  ).catch((err) => {
+    connection.console.log(`[rename] planRenameAt failed: ${err}`);
+    return undefined;
+  });
+  if (plan === undefined) return null;
+  if (plan.kind === "refused") {
+    throw new ResponseError(LSPErrorCodes.RequestFailed, plan.reason);
+  }
+  // The cross-module candidate set (export renames only): open docs + the
+  // capped disk crawl — identical scoping to find-references.
+  const openDocs = plan.kind === "export"
+    ? documents.all().map((d) => ({ uri: d.uri, text: d.getText() }))
+    : [];
+  const diskFiles = plan.kind === "export"
+    ? enumerateWorkspaceFiles(
+      workspaceFolder ? uriToPath(workspaceFolder) : detectProjectRoot(entryKey),
+    )
+    : [];
+  const result = await renameEdits(
+    plan,
+    params.newName,
+    text,
+    entryKey,
+    params.textDocument.uri,
+    openDocs,
+    diskFiles,
+    workspaceReader,
+    wasmChecker,
+  );
+  if ("error" in result) {
+    throw new ResponseError(LSPErrorCodes.RequestFailed, result.error);
+  }
+  const changes: Record<string, TextEdit[]> = {};
+  for (const [uri, edits] of Object.entries(result.changes)) {
+    changes[uri] = edits.map((e) => TextEdit.replace(e.range, e.newText));
+  }
+  return { changes };
+});
 
 // Extract the identifier `[A-Za-z_][A-Za-z0-9_]*` straddling `character` on
 // `line`, or null if the cursor isn't on a word. We scan outward from the
@@ -1367,6 +1471,9 @@ connection.onInitialize((params) => {
       },
       // Export reference-count lenses (D9.4); locations resolve on click.
       codeLensProvider: { resolveProvider: true },
+      // Rename symbol (D9.7); prepare returns the identifier range/placeholder
+      // and refuses non-renameable positions before the client opens the box.
+      renameProvider: { prepareProvider: true },
       hoverProvider: true,
       inlayHintProvider: true,
       semanticTokensProvider: {
