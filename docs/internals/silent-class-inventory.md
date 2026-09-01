@@ -23806,6 +23806,40 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   invalid wasm.
 
 ---
+### D985 — `is string` against a self-referential container union with `null`: check-clean invalid wasm
+
+**check-clean invalid wasm · clause 1 · the SILENT member of the D982/D984 family, and the one that matters most**
+
+    type J = null | string | J[]
+    function f(j: J) {
+      if j is string { print(j) } else { print(0) }
+    }
+    f("hi")
+
+* `vl check` reports `Checked 1 file, no errors.`; the build fails at
+  `wasm[0]::function[4]::f` with `WebAssembly translation error`. Verified against a compiler
+  built from `origin/master`, so it is not an artefact of the D982 checker experiment.
+
+* **BOTH CONTAINER KINDS.** The map spelling `null | string | {[string]: J}` behaves
+  identically — check-clean, same invalid module.
+
+* **THE ARM BEING TESTED IS NOT THE RECURSIVE ONE.** `is string` names a plain arm; the
+  self-referential container merely has to be PRESENT in the union. That is what makes this
+  the family's worst member: [D982](#d982) refuses loudly and [D984](#d984) traps the
+  compiler, but this one compiles clean and hands back a broken module.
+
+* **WHY IT WAS MISSED, AND THE INSTRUMENT LESSON.** The emit-side variant table is EMPTY for
+  this union — probing the failing lookup prints `wanted [J[]] have` with nothing after it,
+  where the no-`null` spelling interns its arms normally. So `null` plus a self-referential
+  container arm suppresses arm interning wholesale, and every `is` against that union is
+  then unlowerable; D982's refusal is the loud face of the same missing table. **Grade a fix
+  on `is string`, not only on `is J[]`** — the loud arm is the one that draws attention and
+  the silent arm is the one that ships.
+
+* A neighbouring grid classified this cell as an emit refusal rather than invalid wasm.
+  Re-measured here twice, against master and against a probe build: it is invalid wasm. Where
+  two harnesses disagree on outcome CLASS, run the module.
+
 ### D984 — a self-referential MAP arm with no `null` traps the COMPILER at the declaration alone
 
 **compiler trap · found by vl-b7's serde grid, reproduced here · clause 1 (the trap is the compiler's, not the program's)**
