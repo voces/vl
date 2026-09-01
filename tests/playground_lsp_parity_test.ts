@@ -155,6 +155,18 @@ const FEATURES: Parity[] = [
     adapterExport: "foldingRanges",
     mainMarker: "registerFoldingRangeProvider",
   },
+  {
+    // Signature help (D9.10): the callee's parameters while typing a call, with
+    // the argument under the cursor highlighted. In parity from the day it
+    // landed, like folding — the lexical half (`lsp/src/signatureHelp.ts`:
+    // which call, which argument) is shared verbatim, and the playground
+    // already drives the seed the parameter table comes from (`sigAt`), so the
+    // wiring is one adapter binding and one Monaco provider.
+    feature: "signature help",
+    serverMarker: "connection.onSignatureHelp",
+    adapterExport: "signatureHelp",
+    mainMarker: "registerSignatureHelpProvider",
+  },
 
   // ---- KNOWN PARITY GAPS (LSP exposes it; playground does NOT wire it) -------
   //

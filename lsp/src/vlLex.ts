@@ -29,8 +29,12 @@
 //
 // Consumers: `testDiscovery.ts` (comments dropped — the `describe`/`it` scan
 // wants a token stream where "identifier immediately followed by `(`" means a
-// call) and `folding.ts` (comments kept — a comment run is a foldable region
-// and a `}` inside one is not a closer).
+// call), `folding.ts` (comments kept — a comment run is a foldable region and a
+// `}` inside one is not a closer), and `signatureHelp.ts` (comments dropped; it
+// counts the commas that separate ARGUMENTS, so a `,` in a string or a comment
+// must not be one — and it is the one consumer that looks INSIDE a template,
+// via `scanTemplate`'s optional hole spans, because a hole is expression source
+// and a call can be written in it).
 
 export interface LexPos {
   line: number;
@@ -186,6 +190,13 @@ export const scanStringLiteral = (source: string, from: number): StringScan => {
   return { value, next: source.length, terminated: false, lineBreaks, lastBreak };
 };
 
+/** A `${…}` hole's CONTENT span — offsets into the source, `${` and `}` excluded. */
+export interface TemplateHole {
+  start: number;
+  /** Exclusive. The source end for an unterminated hole (mid-edit). */
+  end: number;
+}
+
 /**
  * Scans the backtick template opening at `source[from]`, returning the index one
  * past its closing backtick.
@@ -196,10 +207,19 @@ export const scanStringLiteral = (source: string, from: number): StringScan => {
  * ordinary — the hole is expression context), and a nested template recurses.
  * A newline is content on both sides, so the caller must count line breaks from
  * the consumed slice rather than assume there are none.
+ *
+ * `holes`, when given, collects this template's OWN hole spans in source order —
+ * the state machine already knows where each one begins and ends, and signature
+ * help needs exactly that to re-enter a hole as expression source (a template is
+ * one opaque `str` token to `tokenize`, so a call written inside one is
+ * invisible without it). A hole nested in an inner template is NOT collected:
+ * that template is itself one token of the outer hole's source, so the consumer
+ * recurses rather than flattening.
  */
 export const scanTemplate = (
   source: string,
   from: number,
+  holes?: TemplateHole[],
 ): { next: number; terminated: boolean } => {
   let i = from + 1;
   while (i < source.length) {
@@ -211,11 +231,14 @@ export const scanTemplate = (
     if (c === "`") return { next: i + 1, terminated: true };
     if (c === "$" && source[i + 1] === "{") {
       i += 2;
+      const holeStart = i;
+      let closed = false;
       let depth = 0;
       while (i < source.length) {
         const h = source[i];
         if (h === "}" && depth === 0) {
           i++;
+          closed = true;
           break;
         }
         if (h === "{") depth++;
@@ -224,6 +247,7 @@ export const scanTemplate = (
         else if (h === "`") i = scanTemplate(source, i).next - 1;
         i++;
       }
+      holes?.push({ start: holeStart, end: closed ? i - 1 : source.length });
       continue;
     }
     i++;

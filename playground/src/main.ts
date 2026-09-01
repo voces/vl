@@ -472,6 +472,38 @@ monaco.languages.registerFoldingRangeProvider(VL_LANGUAGE_ID, {
     })),
 });
 
+// --- signature help provider -------------------------------------------------
+//
+// Mirrors `server.ts`'s `onSignatureHelp` and its trigger set: `(` and `,` open
+// / advance the popup, `)` retriggers so closing an inner call hands the session
+// back to the outer one. Monaco's `SignatureHelpResult` is disposable, and its
+// `ParameterInformation.label` takes the same offset pair into the signature
+// label the protocol does — so the adapter's shape passes straight through.
+monaco.languages.registerSignatureHelpProvider(VL_LANGUAGE_ID, {
+  signatureHelpTriggerCharacters: ["(", ","],
+  signatureHelpRetriggerCharacters: [")"],
+  provideSignatureHelp: async (model, position) => {
+    const result = await lsp.signatureHelp(model.getValue(), {
+      line: position.lineNumber - 1, // Monaco 1-based line → LSP 0-based
+      character: position.column - 1, // Monaco 1-based col → LSP 0-based
+    }, entryKeyOf(model));
+    if (!result) return null;
+    return {
+      value: {
+        signatures: [{
+          label: result.label,
+          parameters: result.parameters.map(([start, end]) => ({
+            label: [start, end] as [number, number],
+          })),
+        }],
+        activeSignature: 0,
+        activeParameter: result.activeParameter,
+      },
+      dispose: () => {},
+    };
+  },
+});
+
 // --- theme management --------------------------------------------------------
 //
 // Tri-state: AUTO (follow OS) by default; clicking pins an explicit override;
