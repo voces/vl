@@ -16525,6 +16525,23 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32) {
 //                               element so a non-null struct/union/map/string surfaces)
 // The receiver must be a bare list local. An empty-list pop is the caller's contract
 // (reading `backing[-1]` would trap) — matched to the host semantics of `.pop()`.
+// D977 — the push scratch base and the used-flag for a scalar list of element kind `k`.
+function scalarPushScratchBaseOf(k: VKind): i32 {
+  if k == "f64" { return f64PushScratchBase }
+  if k == "i64" { return i64PushScratchBase }
+  if k == "f32" { return f32PushScratchBase }
+  if k == "u8list" { return u8PushScratchBase }
+  pushScratchBase
+}
+
+function scalarListUsedOf(k: VKind): boolean {
+  if k == "f64" { return fa64Used }
+  if k == "i64" { return ia64Used }
+  if k == "f32" { return fa32Used }
+  if k == "u8list" { return ba8Used }
+  lUsed
+}
+
 function emitPop(body: i32[], callIx: i32, fnIx: i32) {
   const c = P.nodes[callIx]
   if c is Call {
@@ -16535,7 +16552,15 @@ function emitPop(body: i32[], callIx: i32, fnIx: i32) {
       }
       const isRef = exprRefArray(callee.memObj, fnIx)
       const isStr = exprStringArray(callee.memObj, fnIx)
-      if !isRef && !isStr && !exprArray(callee.memObj, fnIx) {
+      // D977 — THE SCALAR-LIST FAMILY HAD NO ARM HERE. `exprArray` claims an i32-element
+      // list, so `i64[]` / `f64[]` / `f32[]` / `u8[]` fell to "receiver is not a list" — and
+      // because `emitFail` does not halt, a DISCARDED `a.pop()` then landed as check-clean
+      // INVALID WASM rather than a refusal. Everything the arm needs already exists: the
+      // wrapper and backing come from `scalarListWrap` / `scalarListBack`, and each kind has
+      // its own push scratch base.
+      let popEk = scalarListElemKind(callee.memObj, fnIx)
+      if popEk == "i32" { popEk = null }
+      if !isRef && !isStr && popEk == null && !exprArray(callee.memObj, fnIx) {
         return emitFail("emitProgram: .pop receiver is not a list")
       }
       // The popped element is a REF (struct / union box / map struct / string) for a
@@ -16557,6 +16582,15 @@ function emitPop(body: i32[], callIx: i32, fnIx: i32) {
         aTy = rlBackIdx[rslot]
         base = refPushScratchBaseFor(rslot)
         elemIsRef = true
+      } else if popEk != null {
+        // The scalar sibling of the i32 default below: same shape, a per-kind wrapper,
+        // backing and scratch base.
+        if !scalarListUsedOf(popEk) {
+          return emitFail("emitProgram: .pop but list type not collected")
+        }
+        lTy = scalarListWrap(popEk)
+        aTy = scalarListBack(popEk)
+        base = scalarPushScratchBaseOf(popEk)
       } else if isStr {
         if !slUsed {
           return emitFail(
