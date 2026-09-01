@@ -24049,8 +24049,17 @@ are the same six the kind-3 arm can already serve.
   non-struct fill, so nothing is enrolled. With the destination ANNOTATED the annotation
   interns the row and everything works — which is what proves the lowering complete.
   `tyNameOf(nodeTyIxOf(fill))` is the obvious missing name and is **NOT** it: measured, with
-  the parallel-table read already bounded, it traps the compiler on the annotated path too. So
-  the intern path needs more than a spelling, and that line is where the next attempt starts.
+  the parallel-table read already bounded, it traps the compiler on the annotated path too.
+
+* **`tyToEmitName(nodeTyIxOf(fill))` IS THE BETTER CANDIDATE AND STILL NOT RIGHT — measured,
+  reverted.** It does not trap, and it leaves the ANNOTATED spellings running, so it is
+  strictly further along than `tyNameOf`. The un-annotated case then fails as
+  `expected (ref null $type), found (ref $type)` — which reads like a nullability slip and is
+  not one: **the validator elides BOTH heap-type names** (see the CLAUDE.md note on grouping by
+  that message), so what it actually reports is that the row enrolled under this spelling is
+  not the row the READ resolves. The next attempt needs the element name in the same vocabulary
+  `ensureRefElem` / `refArrElemName` key on, and must identify the two disagreeing rows by
+  DISASSEMBLING rather than from the message, which cannot name them.
 
 * **A LATENT COMPILER OOB WENT WITH IT.** `rlBackIdx[anSlot]` / `rlWrapIdx[anSlot]` were read
   with no bound on `anSlot`. Unreachable while the arm only ran for structs; an OOB trap in the
