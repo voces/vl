@@ -23875,11 +23875,24 @@ and the refusal turns into a miscompile:
 * **`retUNm` IS NOT THE LEVER EITHER — hardcoded, and the returns still do not box.** With the
   gate forced open AND `retUNm` set to the literal `"i32 | string"` at `emitReturnValue`'s
   inferred-return rung, the disassembly is unchanged: `(return (i32.const 1))` raw under a
-  `(result (ref $box))` functype. So these returns are not being emitted through that rung at
-  all. **The two candidates are the RETURN SINK (`fnUsesUnionSink`, predicted per function by
-  `fnUnionRetSinkOk` at `emit_sections`) and `emitReturnValue` itself** — establish which one
-  writes those two instructions before changing anything, because three levers that looked
-  right (the gate, the recorded spelling, the `retUNm` delivery) have each moved nothing.
+  `(result (ref $box))` functype.
+
+* **BECAUSE `emitReturnValue` NEVER RUNS FOR THIS FUNCTION — counted, not inferred, and the
+  discriminator is the RETURN annotation rather than the param.** A `wU8(0)` marker at the top
+  of `emitReturnValue`, counted in the disassembly:
+
+  `pick(b)` (both inferred) — **0 markers**; `pick2(b: boolean): i32 | string` — 2;
+  `pick3(b): i32 | string` (un-annotated PARAM, annotated return) — 2.
+
+  So an un-annotated param is fine and the un-annotated RETURN is what diverts the returns
+  away from the whole `emitReturnExit` → `emitReturnValue` path. That is where the next attempt
+  should look, and it is a different place from every lever tried so far.
+
+* **AND A BYTE MARKER IS THE WRONG INSTRUMENT ONE LEVEL UP — do not repeat this.** The obvious
+  follow-up is to mark `emitReturnExit` the same way and see whether IT runs. It reads 0 for
+  BOTH shapes, including the control that reads 2 at `emitReturnValue`, so a `wU8` at that
+  site does not land in the function body at all. The marker is measuring the writer's target
+  buffer, not reachability. Use a counter global or a distinctive `emitFail` there instead.
 
 Repro (check rc 0, invalid wasm):
 
