@@ -144,6 +144,17 @@ const FEATURES: Parity[] = [
     adapterExport: "completion",
     mainMarker: "registerCompletionItemProvider",
   },
+  {
+    // Folding ranges (D9.9): blocks, multi-line paren/bracket groups, `//`
+    // comment runs, the leading import block. In parity from the day it
+    // landed and cheaply so — this is the one feature with NO checker in it
+    // (a token scan over `lsp/src/folding.ts`), so the playground needed no
+    // seed plumbing, just the Monaco line-base shift.
+    feature: "folding ranges",
+    serverMarker: "connection.onFoldingRanges",
+    adapterExport: "foldingRanges",
+    mainMarker: "registerFoldingRangeProvider",
+  },
 
   // ---- KNOWN PARITY GAPS (LSP exposes it; playground does NOT wire it) -------
   //

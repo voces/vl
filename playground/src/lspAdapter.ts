@@ -40,6 +40,10 @@ import {
   snippetCompletions,
   typeLabelDetail,
 } from "../../lsp/src/typeFeatures.ts";
+import {
+  foldingRanges as computeFoldingRanges,
+  type VlFoldingRange,
+} from "../../lsp/src/folding.ts";
 import type { WasmChecker } from "../../lsp/src/wasmChecker.ts";
 import type { ModuleReader } from "../../compiler/coreTypes.ts";
 import {
@@ -49,7 +53,7 @@ import {
   quickFixesForDiagnostic,
 } from "../../lsp/src/codeActions.ts";
 
-export type { LspTextEdit, QuickFix, VLDiagnostic };
+export type { LspTextEdit, QuickFix, VlFoldingRange, VLDiagnostic };
 export { SEMANTIC_TOKEN_LEGEND };
 
 /** LSP 0-based line / 0-based character — the wire form `server.ts` speaks. */
@@ -281,6 +285,22 @@ export const definition = async (
  */
 export const format = (source: string): string | undefined =>
   checker?.formatSrc(source);
+
+// ---- folding ranges (D9.9) --------------------------------------------------
+
+/**
+ * Foldable regions of `source` — bracketed blocks, multi-line paren/bracket
+ * groups, `//` comment runs, the leading import block. Lines are 0-based and
+ * `endLine` is inclusive, the LSP wire form `server.ts` returns;
+ * `main.ts` shifts both to Monaco's 1-based lines.
+ *
+ * The ONE exception to this module's shape: it is neither async nor
+ * seed-dependent. Folding is a token scan (`lsp/src/folding.ts`) over VL's
+ * lexical grammar, so the playground folds before `initLsp` and keeps folding
+ * when the seed fails to load.
+ */
+export const foldingRanges = (source: string): VlFoldingRange[] =>
+  computeFoldingRanges(source);
 
 // ---- quick-fixes (code actions / B17) --------------------------------------
 

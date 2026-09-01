@@ -106,7 +106,7 @@ parameter lists as structured data (only rendered type strings), declaration *bo
 | Formatting (range) | **missing** | Format a selection | Formatter is whole-doc by design; low value given doc-format is instant. Skip. |
 | Formatting (on-type) | n/a | — | Same reason; the auto-indent gap belongs to `language-configuration.json`, not LSP. |
 | Rename (+prepare) | **missing** | Rename a binding project-wide, safely | **Almost fully served**: single-file = `referencesAt` spans → `WorkspaceEdit`; cross-file = the existing `crossFileReferences` machinery; `prepareRename` = `definitionAt` hit-test. The highest-value missing feature per line of code after tests. |
-| Folding ranges | **missing** | Collapse functions/blocks/comment runs | Syntactic: brace scan + `lexicalTokensAt` comment spans, host-side. (VS Code's indentation folding covers some of this already.) |
+| Folding ranges | **have** | Collapse functions/blocks/comment runs/the import header | Shipped (D9.9): `foldingRanges` (`lsp/src/folding.ts`) over the shared host tokenizer — bracketed blocks, multi-line paren/bracket groups, `//` runs (kind `comment`), the leading import block (kind `imports`). The comment half needed no `lexicalTokensAt` after all: comments are lexical, so the whole feature is seed-FREE and is the one handler that still works when no seed loads. |
 | Selection ranges | **missing** | Expand-selection by syntax | Needs nested AST spans — the surface has none. Host-side bracket heuristic possible; low priority. |
 | Call hierarchy | **missing** | Incoming/outgoing calls of a fn | Incoming ≈ references of the fn filtered to call sites (host heuristic over `referencesAt`); outgoing needs callee edges → native export. Defer. |
 | Type hierarchy | n/a | — | Structural typing, no nominal sub/supertype tree. |
@@ -127,7 +127,7 @@ parameter lists as structured data (only rendered type strings), declaration *bo
 
 | Feature | Status | What it gives a VL user | Feasibility |
 |---|---|---|---|
-| **Testing API (TestController)** | **missing** | Test Explorer tree, **gutter run icons on `it(...)` lines**, per-test pass/fail states + failure message at the test's location, run-all/-file/-one | **The named ask — assessed in depth in §4.** CLI side is done: `vl test <file> -t <substring>` exists and works today. Extension-side only. |
+| **Testing API (TestController)** | **have** | Test Explorer tree, **gutter run icons on `it(...)` lines**, per-test pass/fail states + failure message at the test's location, run-all/-file/-one | Shipped (D9.8): `tests.createTestController` in `extension.ts` over the host-side discovery scan (`src/testDiscovery.ts`), spawning `vl test <file> [-t …]`; the `-t` substring's over-run is measured and surfaced rather than hidden. Assessed in depth in §4. (Row corrected 2026-09-01 while landing D9.9 — it still read **missing** three slots after it shipped.) |
 | Debug adapter (DAP) | missing | Breakpoints, stepping, inline values | Large native work: the emitter produces no DWARF/source map for live debugging, and a debug host doesn't exist. Genuinely big; see §6. |
 | Task provider | missing | `vl test` / `vl build` / `vl check` as VS Code tasks (problem matchers, keybindable) | Small, extension-only. A problem matcher over `vl check` output also gives Problems-pane diagnostics for CLI runs. |
 | Terminal links | n/a | — | VS Code already auto-links `path:line:col` in terminals. |
@@ -138,15 +138,15 @@ parameter lists as structured data (only rendered type strings), declaration *bo
 | Notebook controllers | n/a | — | As above. |
 | Walkthroughs | missing | Onboarding checklist (install `vl`, open a file, run a test) | Pure manifest work; worth one afternoon when the extension is published, not before. |
 | Snippet contributions | n/a | — | Snippets already ship via LSP completion (10 of them); a static contribution would duplicate. |
-| Language configuration | **partial** | Auto-indent on `{`/Enter | Present: comments, brackets, auto-closing, surrounding pairs. Missing: `indentationRules` / `onEnterRules` — a 10-line JSON edit. |
+| Language configuration | **have** | Auto-indent on `{`/Enter, `//` comment blocks continue | Shipped (D9.9): `indentationRules` (increase on a trailing unclosed `{`/`(`/`[` that is not inside a string or after a `//`; decrease on a leading closer) + `onEnterRules` for VL's ONLY comment form — a `//`/`///` block continues, an empty one ends the run. No block-comment rule exists to add: `compiler/lexer.vl` has none. |
 | File decorations | n/a | — | Nothing file-level to badge. |
 | Quick diff / SCM | n/a | — | Git's problem, already solved. |
 | Chat / LM APIs | n/a | — | Out of scope for a language extension today. |
 
 **Counts** (this survey's rows, not the protocol spec's; updated as D9 items land): LSP
-layer — 10 have, 5 partial, 12 missing, 9 n/a. VS Code layer — 1 have (status bar, D9.2),
-1 partial, 3 missing-worth-doing (Testing API, task provider, language-config rules) + 1
-missing-later (walkthrough), 1 missing-large (DAP), 9 n/a.
+layer — 11 have, 5 partial, 11 missing, 9 n/a. VS Code layer — 3 have (status bar D9.2,
+Testing API D9.8, language configuration D9.9), 0 partial, 1 missing-worth-doing (task
+provider) + 1 missing-later (walkthrough), 1 missing-large (DAP), 9 n/a.
 
 ---
 
@@ -253,12 +253,19 @@ occasionally generous. Optional hardening later, not a blocker: a `--json` repor
    a glance beats a debugging session. Sketch: custom notification from `loadWasmChecker`'s
    origin callback → `window.createStatusBarItem`. No checker work at all.
 
-8. **Folding ranges + language-config indentation rules.** What: collapse
+8. **Folding ranges + language-config indentation rules.** SHIPPED (D9.9). What: collapse
    functions/blocks/`//`-comment runs; correct auto-indent on Enter after `{`. Why: basic
-   editor ergonomics currently delegated to VS Code's indent heuristics. Sketch: folding
+   editor ergonomics currently delegated to VS Code's indent heuristics. Sketch was: folding
    from a host-side brace scan + `lexicalTokensAt` comment spans; `indentationRules` /
-   `onEnterRules` is a 10-line `language-configuration.json` edit. Served by:
-   `lexicalTokensAt` (comments); the rest is syntactic.
+   `onEnterRules` a 10-line `language-configuration.json` edit.
+   **What it cost, against the sketch:** the JSON half was 20 lines, not 10 — the extra ten
+   are the `///` doc-comment rules and the empty-comment stop rule, which the sketch did not
+   picture. The folding half needed **no `lexicalTokensAt` and no seed at all**: comments are
+   lexical, so the same host tokenizer that finds the braces finds the comment runs, and the
+   scan was lifted out of `testDiscovery.ts` into `src/vlLex.ts` rather than written a third
+   time. Two ranges the sketch did not name are in the shipped feature because the token
+   stream makes them free: multi-line paren/bracket groups, and the leading import block
+   (kind `imports`).
 
 9. **Doc-comment-aware hover and completion.** What: `///` prose above the type block in
    hover and completion docs — the D7 linkify plumbing already sits dormant in
