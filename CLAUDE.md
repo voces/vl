@@ -331,6 +331,27 @@ on 2026-08-28 after exactly that check. `wasm-opt`, `wasm-as`, `wasm-merge` and 
 the same directory. Disassembly is one of the four instruments a defect fix is graded on; do not
 substitute for it without first running the real binary by its real path.
 
+## AN INSTRUMENTED COMPILER POISONS THE SEED, and it looks exactly like a real regression
+
+Adding a probe byte to the emitter (`wU8(0)` at the top of a function, to count whether it
+runs) works — and then `refresh-compiler.sh` compiles the NEXT compiler **with that build as the
+seed**, so every module it emits, the compiler included, carries the stray bytes. The symptom is
+not a broken probe: it is three unrelated CLOSED inventory rows suddenly grading `runs →
+trap_loads`, which reads as a merged regression and is worth a bisect before you remember why.
+
+**Two tells, both cheap.** The artifact is the same SIZE as a pristine build (the probe adds a
+byte per call site, not per function), so compare with `cmp`, not `ls -l`. And a `git archive
+origin/master` build in `/tmp` grades the row clean while your worktree does not — same commit,
+different bytes. **Recover by copying a pristine `build/vl-compiler.wasm` over yours and
+re-running `refresh-compiler.sh`**; reverting the source alone is not enough, because the seed
+is what carries the damage forward.
+
+Corollary for the probe itself: **a byte marker measures the writer's current target buffer, not
+reachability.** A `wU8` at the top of `emitReturnValue` lands in the function body and counts
+correctly; the same marker at the top of `emitReturnExit` reads zero even for a control that
+provably calls it. Where the marker reads zero for a case you know fires, the instrument is
+wrong, not the code — use a counter global or a distinctive `emitFail`.
+
 ## After editing `compiler/*.vl`
 
 Run `scripts/refresh-compiler.sh` before testing. The compiler is itself a VL program at
