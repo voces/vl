@@ -23833,8 +23833,16 @@ turns that assertion back into a measurement.
   **IT IS TRIED BEFORE THE RE-READABILITY GATE**, because it does not need one: it evaluates
   each operand once into its own slot. That gate exists for the value-union lowering, which
   re-reads both sides per arm — so `mk3(3) == mk3(3)` works here while the same spelling needed
-  D972's tee on the value-union path. Fields of code 0 (i32 / boolean) and 3 (string) are
-  compared; a ref / list / map field DECLINES and keeps the loud refusal.
+  D972's tee on the value-union path. Fields of code 0 (i32 / boolean), 3 (string) and 15 (a
+  NESTED shape) are compared; a list or map field DECLINES and keeps the loud refusal.
+
+* **THE NESTED FIELD IS THE ONE PLACE `emitStructEqRec` DOES APPLY (D974), and it needed the
+  OPPOSITE lookup from the arms.** An arm has no struct row — the union path owns the types —
+  but its nested shape DOES: a NAMED type resolves through `structIdxOfElemName`, and only an
+  INLINE shape needs `internInlineShapeTy`. Asking the name first is what makes the common
+  spelling work, since interning answers -1 for `type C = {r: i32}`. With the row in hand the
+  nested pair is parked in a struct-heap-typed slot and compared by the ordinary recursive
+  machinery.
 
 Repro (runs, prints `true`):
 
