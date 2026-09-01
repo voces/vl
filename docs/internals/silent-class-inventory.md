@@ -23830,14 +23830,28 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   reasons. A checker-typed net added beside `exprString` therefore changed nothing. **Find
   what actually emits a `print` STATEMENT before touching any print classifier.**
 
-* **THE BINDING CELL IS A SECOND SITE, and `letIsString` is not it either.** `const v = x.f()`
-  types the cell `i32` while the `call_indirect` returns `(ref $string)` — the same disagreement
-  the `print` cell has, one consumer over. Adding a checker-typed net to `letIsString`
-  (`nodeTyIsStringPrim(d.letInit)` after `exprString`) changes nothing, and an `emitFail` probe
-  inside it never fires: **an earlier rung of `collectLocals`' ladder claims this binding
-  first.** Find which rung before writing another classifier arm — the ladder is ordered and
-  the first match wins, which is the same thing that made D970 look like three different
-  defects.
+* **THE BINDING CELL IS A SECOND SITE, AND `letIsString` IS THE RIGHT SITE — proven by a
+  FORCED probe.** `const v = x.f()` types the cell `i32` while the `call_indirect` returns
+  `(ref $string)`. Making `letIsString` return true for any Call init makes the program RUN,
+  so the classifier is where the fix belongs and only the PREDICATE is missing.
+
+  (An earlier note here said `letIsString` "is not it", read off an `emitFail` probe that never
+  fired. That probe could not fire: `emitFail` records rather than halts, and the VALIDATION
+  error superseded it. Same instrument trap as the CLAUDE.md note two sections down —
+  corrected.)
+
+* **FOUR RESOLVERS ALL DECLINE, and they decline for ONE reason: they need the receiver's
+  SHAPE.** Measured, each reverted: `exprString` (walks the shape); `nodeTyIsStringPrim(init)`
+  and `nodeTyPrimName(init)` (the call node carries no recorded prim type);
+  `fieldClosureFeOfRecv` (resolves the field through the receiver's shape — declines exactly
+  where the defect lives); and `calleeCloSigKeySid` + `sigKeyRetKind` (the shape-free
+  `$fnsig` reader, which also answers nothing here).
+
+  **So the open question is narrow: what answers "this call returns a string" without a
+  receiver shape?** The checker type-checks the program, so the fact exists — most likely on
+  the checker's side, as the FIELD's `TyFunc` result reached through the hole's resolved
+  binding, rather than in any emitter-side table. That is where to look, and note that D980's
+  neighbouring fix could use `fieldClosureFeOfRecv` only because its fixture ANNOTATES.
 
 * **AND D980 IS ITS NEIGHBOUR, NOT ITS TWIN.** The tail-position cell (`x.f()` as a function's
   last expression) traps with or WITHOUT the annotation and is closed separately; this row's
