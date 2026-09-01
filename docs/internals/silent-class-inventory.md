@@ -23400,56 +23400,32 @@ Repro (now RUNS; on master, check rc 0 and the module is invalid):
     // Swapping the members (`i32[] | string`) ran on master — same type, other spelling.
 
 ---
-### D955 — the dead union-atom arm: the FOLD is right and PROVEN, and no sound predicate for it exists yet — four candidates measured and reverted
+### D955 — the dead union-atom arm: the FOLD was right and a sound predicate now exists
 
-**loud emit reject · `emitProgram: narrowed union atom has no value box` · `vl check` returns 0, so this is a clause-2 violation by construction · ZERO corpus cells; `scripts/capability-probes/dead-union-atom-arm-read.vl` is the measurement · A FIX WAS BUILT, PROVEN CORRECT IN PLACEMENT, AND REVERTED because every predicate tried was wrong — the last one LOST 15 RUNNING CLASSES**
+**closed with D947 — the four candidates this row recorded all derived an ABI kind per member; the sound test is a SPELLING membership check against the set the narrow resolver already returns**
 
-`x is i64` where this instance pins `T = i32 | string` is constant-false. The tag-compare path
-emits a correct runtime test that always answers 0 — and correct is not enough, because the
-arm BEHIND it still emits, and its narrowed read asks for an i64 out of a box no module ever
-minted. Folding the test to a CONSTANT is what lets D932's `emittedCondConst` prune the dead
-arm, exactly as D950 does one receiver-rep over.
+This row filed the fold as proven and the predicate as an open problem, after four measured and
+reverted candidates. The missing step was not a cleverer derivation: it was PRINTING what
+`unionNameOfIdentSid` returns at the narrowed read. It renders the instance's own member set
+(`i32|string` dead, `i64|string` live) beside a narrowed atom of `i64`, so the question is
+plain membership on spellings — no kind lookup, no canonicalisation, no third state.
 
-* **THE PLACEMENT IS SETTLED, and that half should not be re-derived.** The fold must sit at
-  the HEAD of `emitIs`, before the tag-compare path. `monoStaticIsResult` — the obvious home —
-  is unreachable for a union receiver, and says so in its own header: *"Union-typed operands
-  took the tag-compare paths above"*. Proven by isolation: forcing the head-of-`emitIs` guard
-  unconditionally true makes the probe print `o`, the correct answer.
-
-* **FOUR PREDICATES, ALL WRONG, ALL MEASURED.** (1) `nodeTyIxOf(recv)` — at a monomorphized
-  clone the receiver node still carries `T`, a `TyVar`, so it answers about the DECLARATION.
-  (2) `monoArgPinTyIx` — takes its annotation channel only for FUNCTION types and otherwise
-  falls back to that same own-type. (3) A new unfiltered `monoInstanceTyIx` reading the
-  clone's rewritten annotation directly — answers nothing for a union receiver either. (4)
-  **The emitter's own `vbHeapIdxOfKind`** — "has this module minted a value box for the tested
-  atom", which reads sound (no box means nothing of that atom was ever boxed, so no union box
-  can hold one) and is NOT: the box table is populated DURING emission, so a test emitted
-  before its atom's box is minted folds false incorrectly. That candidate lost **15 running
-  classes** and turned `stri32_tounion_list_none` from `7` into `0` — a silently wrong value,
-  caught by the corpus grade on its blocking criterion.
-
-* **SO THE MISSING PIECE IS NAMED: an order-independent, per-INSTANCE type for a union
-  receiver at a mono clone.** Not the declaration's `T`, and not a table that fills as
-  emission proceeds. D950's fix needed the same thing one rep over and got it from
-  `nulNicheBaseClass`'s fnIx-scoped classifiers; the union receiver has no equivalent, and
-  building one is the work this row is waiting on.
-
-Repro (check rc 0; the EMITTER refuses):
+Repro (runs, prints `o`):
 
     function istr(v: i64) {
       if v == 0 { return "0" }
       "n"
     }
+
     function f<T>(x: T): string {
       if x is i64 { return istr(x) }
       "o"
     }
+
     const u: i32 | string = 4
     print(f(u))
-    // vl check rc 0; vl run -> emitProgram: narrowed union atom has no value box
-    // SHOULD PRINT o.
+    // PRINTS o
 
----
 ### D956 — [CLOSED 2026-09-01] the inferred nullable MAP, at EVERY value type: D937's restriction outlived the reason for it
 
 **closed as `runs` · was a CAPABILITY REFUSAL conceding type-validity (`'pick' infers the nullable return type {[string]: string} | null — type-valid, but an inferred return of this shape is not yet supported by codegen`) · ZERO corpus cells; `--sites` and the channel-pinning tests are the measurement · distilled corpus 0 movement, `runs → not-runs` ZERO · fixture `tests/cases/functions/infer-nullable-map-return-value-types.vl`**
@@ -28195,47 +28171,35 @@ Repro (loud emit reject):
   rep. Per this repo's message discipline: the sentence describes the arm that fired, and
   the plainest program the sentence permits (`i32[]` into the union) also refuses.
 
-### D947 — an `is`-atom arm a union T cannot hold still EMITS, and its read of the narrowed value refuses when no module union minted that atom's box
+### D947 — an `is`-atom arm a union T cannot hold: the read now lowers as `unreachable`
 
-**loud emit reject · `emitProgram: narrowed union atom has no value box` · found 2026-08-31 as std:test v2's review blocker: `expect(parse("4")).toEqual(4)` over `parse(s: string): i32 | string` RAN under v1 and refused under v2, because v1's five-atom receiver union minted every scalar value box just by existing and generic v2 minted only what the user's module declared · the box registry is MODULE-WIDE (`markValueUnionAtoms` marks `vb*Used` per registered value union's members; `emitUnionUnboxTail` refuses at `vbHeapIdxOfKind < 0`), so the SAME arm validates the moment any union in the module carries the atom — std/test.vl routes around it with a private five-atom alias (`VltAtomReps`), which is why the expect-level spelling no longer reproduces while this std-free witness still does · a 30-cell arm-by-union grid (scratch method, five ladder arms x six two-member unions) refused in exactly the cells {arm READS the narrowed value} x {arm atom's box unminted}, boolean riding i32's box (`boolean` arm over `f64 | string` refuses, over `i32 | string` runs)**
+**closed — a constant-false generic narrow reads `unreachable` instead of refusing the program · the sound predicate is a SPELLING membership test, which is what four earlier candidates got wrong**
 
-**THE `unreachable` FIX IS RIGHT AND ITS OBVIOUS SET TEST IS WRONG — measured 2026-09-01,
-candidate reverted.** The arm is constant-false at this instance, so the honest lowering is
-`unreachable` (polymorphic on the stack, and a TRAP rather than a bad read if the test ever
-fired) instead of refusing the whole program. Three things that attempt established, each of
-which costs an agent-task to rediscover:
+`f<T>(x: T) { if x is i64 { ... x ... } }` instantiated at `T = i32 | string` type-checks — a
+type parameter may be narrowed to anything — and the arm cannot run. The emitter reached the
+arm's READ and refused the whole program for an arm that never executes.
 
-* **`vbHeapIdxOfKind(ak) < 0` MUST NOT BE THE DEADNESS TEST.** It is the same answer nearly
-  always and it is the D950 trap: the box registry is populated DURING emission, so a LIVE arm
-  can read it before its box is minted and look exactly like a dead one. D950 was reverted for
-  that read after it turned fifteen running corpus classes into non-running ones.
+* **`unreachable` IS THE HONEST LOWERING.** Polymorphic on the stack, so it satisfies whatever
+  the arm was going to produce, and if the constant-false test ever did fire it TRAPS rather
+  than reading a box that is not there.
 
-* **AND A MEMBER-SET WALK IS NOT THE TEST EITHER — two versions, and the second REFUTES the
-  first attempt's diagnosis.** The natural order-independent test walks the member set and
-  compares each arm's value-atom ABI code against the narrowed atom's. Built as a boolean
-  (`unionHasAtomKind`) it silently killed the LIVE arm: `f(w)` over `const w: i64 | string = 9`
-  runs on master and TRAPS under the candidate. That was first filed as "the composition
-  `valueAtomKind(tyNameOf(member))` is wrong". **A second attempt shows that was not the
-  cause**, and the corrected facts are:
+* **THE PREDICATE IS ON SPELLINGS, and that correction is the whole story.** Two candidates
+  derived an ABI kind per member (`valueAtomKind(tyNameOf(mem))`) and got the answer INVERTED,
+  killing the LIVE arm; a third added a three-state don't-know and still did. Printing what the
+  resolver actually returns — the step this row asked for and none of the attempts took —
+  settles it in one build: the narrowed atom is `i64`, the dead instance's set renders
+  `i32|string`, the live one `i64|string`. Both come from ONE producer, so membership needs no
+  kind derivation and no canonicalisation.
 
-  It was rebuilt with THREE states (1 yes / 0 no / **2 don't know**), canonicalising the name
-  through `unionMemberSetOf` first, since `unionArmMemberTys` declines outright on a
-  non-canonical spelling and its `false` had been read as "no such arm" — eliding only on a
-  definite 0. It STILL kills the live arm, and **with a single instance**
-  (`const w: i64 | string = 9`, no second call), so **monomorphization is not the cause**:
-  that was the obvious next hypothesis, since a name-keyed table cannot see a mono clone, and
-  it is ruled out. Meanwhile the DEAD single instance (`i32 | string`) does NOT elide at all —
-  it keeps the loud refusal. So the predicate's two answers are **inverted** relative to what
-  the shapes call for, and that is unexplained. **The next attempt should print what
-  `unionNameOfIdentSid` actually returns inside the arm before writing any predicate over
-  it** — both attempts here assumed it names the binding's full union, and nothing has
-  confirmed that.
+* **AND `vbHeapIdxOfKind(ak) < 0` IS STILL NOT THE TEST** — that registry is populated DURING
+  emission, so a live arm can read it before its box is minted and look exactly like a dead
+  one. D950 was reverted for that read after it turned fifteen running corpus classes into
+  non-running ones.
 
-* **THE BARE-READ SPELLING IS NOT PART OF THIS ROW.** `if x is i64 { return "L" }` — a dead arm
-  that never reads `x` — runs on master. Only a read of the narrowed value refuses, which is
-  what the row's title says and what a candidate must not mistake for progress.
+* **THE FIXTURE CARRIES BOTH INSTANCES.** A candidate that elides the dead arm by breaking the
+  live one passes a dead-only fixture, which is how three of the four got as far as they did.
 
-Repro (loud emit reject):
+Repro (runs, prints `o`):
 
     function istr(v: i64) {
       if v == 0 { return "0" }
@@ -28249,32 +28213,4 @@ Repro (loud emit reject):
 
     const u: i32 | string = 4
     print(f(u))
-    // vl check rc 0; vl run -> emit error:
-    // emitProgram: narrowed union atom has no value box
-    // SHOULD PRINT o
-
-* **THE ARM IS STATICALLY DEAD** — `i32 | string` can never hold an i64, so the test is
-  constant-false and the checker could prune the body; instead it emits, and the dead
-  unbox is what refuses. The same arm with NO read of the narrowed value (`return "i64arm"`)
-  runs, and the same read under `const u: i64 | string` (a live arm) runs — the refusal
-  needs both the read and the unminted box, ablated one ingredient at a time.
-* **DECLARING `type X = i32 | i64 | f64 | boolean | string` anywhere in the module makes
-  this witness RUN** (registration alone mints the boxes; no value of the type is needed).
-  That is the std route-around, one line, measured both ways — and it is a route-around,
-  not a close: the pruning (or the on-demand mint) is the compiler-side fix.
-* **The route-around's boundary, measured through `expect` itself:** unions of the five
-  atoms run and render the held arm in v1's exact forms (`i32|string`, `f64|string`,
-  `boolean|string`, `i32|null` all measured). A union with a NON-atom member goes PAST this
-  refusal into deeper standing defects: `string | i32[]` is check-clean invalid wasm at the
-  bare generic-struct-field store (19-line std-free witness, `expected (ref $type), found
-  (ref $type)` in `expect`), and `Circle | null` emitted invalid wasm through the receipt
-  chain (bare field store alone RUNS there, so its mechanism is a different, un-ablated
-  family — that count is a message count). Under v1 both were LOUD check refusals (not
-  members of the receiver union), so for those two shapes the generic surface traded a
-  check refusal for a silent one — recorded as a price, not fixed here.
-  **UPDATE 2026-09-01 — the NULLABLE half of that price is paid back and the other half is
-  not.** D950 named the mechanism behind the three `d947_price_*` cells (`expect`'s
-  `if value is boolean` lowered to a bare non-null test at every nullable instantiation) and
-  its fix moves all three to `runs` printing `ok` — `nulstr`, `nulbool` and `nulcircle`. The
-  `string | i32[]` shape is UNCHANGED, byte-identical against a git-archive master control:
-  it is a different family, exactly as this bullet said, and it is still open.
+    // PRINTS o
