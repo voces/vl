@@ -63,19 +63,33 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   a std:test-visible callsite mechanism (Rust `#[track_caller]` / Swift `#line` shaped).
   Small compiler intrinsic, language-surface decision. The editor-side cheap half is D9
   slot 12 and needs no ruling.
-- **`vl test --trace` inline run values** (which `is` arm fired, what a binding held) —
-  an emitter flag instrumenting USER programs (never the compiler — seed-poisoning
-  hazard doesn't apply) logging `(site, value)` pairs; extension renders decorations
-  after a run. Wallaby/Quokka-class feature; real work, bounded. Blocked on: appetite.
+- **`vl test --trace` inline run values** — RULED low priority (owner, 2026-09-01,
+  "low prio I guess"): keep parked; an emitter flag instrumenting USER programs (never
+  the compiler) logging `(site, value)` pairs, extension renders decorations after a
+  run. Revisit when the test-debugging story matters more than new surface.
 - **Driver lossless-recovery flag** — report "parse error + later type error" together.
-  Measured cost recorded in DECISIONS.md beside the `then` entry: lifting the bail today
-  invents 5 phantom-error corpus cases from lossy recoveries; doing it right wants a
-  per-site lossless flag. Low priority.
-- **`vl compile` → standalone executable** — parked from the CLI overhaul (#2080) until
-  wanted; no design written.
-- **D971 — capturing lambda at two types** (filed by the compile-goal session): the last
-  capability probe; needs a calling convention for by-name calls to lifted closures.
-  Explicitly an owner decision per its row in the inventory.
+  Decision brief (2026-09-01): every modern reference compiler does this (Roslyn
+  full-fidelity trees, TypeScript's checker running on any tree, rustc/clang error
+  nodes + poisoned types, Go per-statement recovery) — the shared mechanism is an
+  ERROR NODE that both marks the recovered region and SILENCES derived errors; VL's
+  first-error bail is the batch-era outlier. Measured hazard (DECISIONS.md): lifting
+  the bail wholesale invents 5 phantom errors from lossy recoveries (`f(1 2)` parses
+  hole-free to `f(1)`). RECOMMENDED staging that removes the gamble: (1) per-site
+  lossless flag on the existing #2115/#2165 recovery arms (provably lossless — the arm
+  is the statement, nothing dropped) and lift the bail ONLY for files whose every parse
+  diagnostic is lossless-flagged — zero phantom risk by construction, and the LSP stops
+  losing ALL type feedback the moment one parse error exists mid-typing (the real
+  payoff; the server compiles per keystroke); (2) convert lossy skip sites one at a
+  time, each conversion widening the files that keep type feedback. No poison-type
+  plumbing needed until stage 2's tail. Priority: medium — an editor-experience
+  multiplier. Blocked on: owner go for stage 1.
+- **`vl compile` → standalone executable** — RULED low priority (owner, 2026-09-01):
+  parked from the CLI overhaul (#2080); no design written, none owed until revisited.
+- ~~D971~~ — RESOLVED without a ruling, hours after this ledger was written (the
+  one-directional staleness this file warns about): the refusal's sentence described a
+  calling convention the emitter does not use — a lifted capturing instance already
+  takes its env as the leading param and `emitDirectCall` already pushes it. Closed by
+  DELETING the refusal; capability probes 9/9.
 - **serde OQ-1..OQ-7** (`docs/serde-design.md` §Open questions) — none block Stage 0
   (in flight); Stage 1/2 scheduling wants OQ-1 (surface spelling) and OQ-2 (union
   ordering) settled first.
