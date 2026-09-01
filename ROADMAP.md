@@ -66,10 +66,14 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
 
 ### Awaiting owner rulings (durable list; each row names its doc)
 
-- **Constraints / nameable bounds** — `docs/constraints-design.md` (2026-09-01): Phase 1
-  concepts (`type Showable = { toString(self): string }`, `<T: Showable>`,
-  declaration-checked — also the root fix for D952's wordless refusal), Phase 2
-  UFCS-satisfaction-at-instantiation-scope. Blocked on: Phase 1 go/no-go + its OQ-1..5.
+- **Constraints / nameable bounds — RULED 2026-09-01 ("accept expression semantics from
+  day one"), moving to build.** `docs/constraints-design.md` carries the shipped package
+  in its header ruling block: `{ toString(): string }` call-shape members, `<T: Showable>`
+  bounds, expression satisfaction (field-first-then-UFCS at the instantiation site),
+  whole-program coherence, strict bodies. Also the root fix for D952's wordless refusal.
+  Sequencing: coordinating with the compile-goal session's D976 fix (the checker column
+  recording a param's resolved demanded shape is the natural substrate for recorded
+  bounds); implementation launches behind that answer.
 - **Track-caller intrinsic** (test failures at the `expect` line, not the `it` line) —
   a std:test-visible callsite mechanism (Rust `#[track_caller]` / Swift `#line` shaped).
   Small compiler intrinsic, language-surface decision. The editor-side cheap half is D9
