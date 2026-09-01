@@ -23817,11 +23817,26 @@ turns that assertion back into a measurement.
   of the function, ahead of the gates, where the surrounding lowering's context is not yet in
   force. **Evaluate where the original code evaluated, then tee.**
 
-* **THE STRUCT-UNION HALF IS A DIFFERENT ANIMAL and stays open.** `A | B` of two shapes refuses
-  at BOTH spellings, while struct `==` over one declared shape runs and value-union `==` runs.
-  It needs a tag dispatch over the variant arms with a per-arm struct compare underneath;
-  nothing in the tree does that today. `scripts/capability-probes/struct-union-equality.vl` is
-  the standing measurement.
+* **THE STRUCT-UNION HALF STAYS OPEN, and an attempt sharpened WHY.** `A | B` of two shapes
+  refuses at both spellings, while struct `==` over one declared shape runs and value-union
+  `==` runs. `scripts/capability-probes/struct-union-equality.vl` is the standing measurement.
+
+  The dispatch was built and reverted, and it got further than the row expected: a struct union
+  rides the SAME `{tag, payload}` box a value union does (disassembled), so tag-compare then
+  per-arm cast is straightforward, and `emitStructEqRec` already accepts a pre-stashed operand
+  pair through its `-2` / `-3` sentinels. Three things had to be learned on the way — the
+  refusal that fires for `u == v` is `emitUnionUnionEq`'s, not `emitUnionConcreteEq`'s;
+  `structIdxOfElemName` answers -1 for an arm because arms are registered as VARIANTS; and the
+  row can instead be found by matching `sHeapIdx` against `uVarHeap[vi]` (D280: an arm and its
+  declared twin are one heap).
+
+  **AND THAT LAST ONE IS WHERE IT STOPS: `sHeapIdx.length` is ZERO.** `emit_state`'s own
+  header says so — "when a UNION is declared, the union path owns the struct `type`s instead
+  (its variant table) and this table stays empty". So the per-arm field-wise compare has no row
+  to run through, and `emitStructEqRec` is keyed on a table struct unions never populate.
+  **The real prerequisite is a variant-keyed field compare (or struct rows minted for variant
+  arms), not the dispatch** — which is a bigger change than this row first implied, and an
+  owner-facing one since it touches how declared unions register their arms.
 
 Repro (runs, prints `true`):
 
