@@ -104,6 +104,7 @@ import {
   mkCallN,
   mkIdent,
   mkStr,
+  nodeChildren,
   orderArgsByParamNames,
   ufcsAliasOf,
 } from "./ast"
@@ -18151,8 +18152,12 @@ function emitCallStmt(body: i32[], s: Call, stmtIx: i32, fnIx: i32) {
 }
 
 // The compile-time value of an `if` CONDITION that is a monomorphized-instance guard
-// testing an INLINE STRUCT SHAPE (1 / 0), or -1 for anything else. Dropping an arm is
-// a control-flow change, so this is deliberately narrower than `emitIs`'s static path:
+// testing an INLINE STRUCT SHAPE (1 / 0), or -1 for anything else. Since D932 the ARM
+// skip itself reads the emitted condition (`emittedCondConst` in `emitIfStmtStmt` /
+// `emitIfTail`), so this predicate's only remaining reader is the BLOCK-truncation dual
+// (`monoStaticGuardEndsBlock`), which must decide before anything is emitted. Cutting a
+// block is a control-flow change, so this is deliberately narrower than `emitIs`'s
+// static path:
 //   - the condition must be a bare `IsExpr` (no compound / parenthesized forms);
 //   - the receiver must be a bare IDENT — the monomorphized param. `emitIs`'s
 //     union-FIELD, optional-chain and box-tag receiver forms are RUNTIME tests;
@@ -18173,6 +18178,58 @@ function monoStaticIsGuardOf(condIx: i32, fnIx: i32) {
     if exprNullableStruct(c.isObj, fnIx) { return -1 }
     return monoStaticIsResult(condIx, fnIx)
   }
+  -1
+}
+
+// D932 — the `emitLetCursor` positions that EMITTING the subtree at `ix` would consume.
+// A dead-arm skip is a control-flow change the LOCALS LAYOUT never hears about:
+// `collectLocals` allocates declared-local slots over the WHOLE body in pre-order and
+// `emitLetDeclStmt` hands them out POSITIONALLY (`emitLetCursor`), so skipping an arm
+// whose `let`s collect counted leaves every LATER binding one slot early — bound to a
+// cell of the wrong TYPE (`vl check` rc 0, invalid wasm; the pre-D932 whole-span-shape
+// skip had exactly this hole, witnessed by a `let` inside the pruned arm plus a `let`
+// after the `if`). Every skip below advances the cursor by this count, so the two
+// pre-orders agree again.
+//
+// The walker mirrors the emitters' own cursor arithmetic — `emitLetDeclStmt` +1,
+// `emitForRangeStmt` +2 (loop var + bound temp), `emitForInStmt` +3 (var + index +
+// length; those three sites are the module's ONLY cursor writers) — and `nodeChildren`
+// reaches every block a skipped statement can carry (a match arm's desugared binds
+// live in its body block by emit time). A `FuncDecl` subtree contributes nothing: a
+// nested declaration's body owns its OWN frame (and `nodeChildren` walks no lambda
+// body for the same reason).
+function cursorSlotsUnder(ix: i32): i32 {
+  if ix < 0 { return 0 }
+  const n = P.nodes[ix]
+  if n is FuncDecl { return 0 }
+  let cnt = 0
+  if n is LetDecl { cnt = 1 }
+  if n is ForRange { cnt = 2 }
+  if n is ForIn { cnt = 3 }
+  const kids = nodeChildren(ix)
+  let i = 0
+  while i < kids.length {
+    cnt = cnt + cursorSlotsUnder(kids[i])
+    i = i + 1
+  }
+  cnt
+}
+
+// D932 — did the condition emitted since `condStart` fold to a CONSTANT? 1 / 0, or -1
+// for any runtime test. Read off the BYTES the module actually carries (`wPeekBack`,
+// the peephole API), not off a parallel predicate: `emitIs`'s ladder decides which arm
+// claims a guard, and a second derivation of "was it folded" is exactly the drift that
+// let `monoStaticIsResult`'s direct answer disagree with the emitted condition (its own
+// header lists three receivers where the fold's raw answer is wrong and a ladder arm
+// above it is right). An `if` over `i32.const 0` / `i32.const 1` cannot run its dead
+// arm whatever produced the constant, so pruning on the bytes is sound by construction.
+// The encoding is exact: `fbI32Const` writes 0x41 + one SLEB byte for 0 / 1.
+function emittedCondConst(condStart: i32): i32 {
+  if wLen() != condStart + 2 { return -1 }
+  if wPeekBack(1) != 65 { return -1 } // 0x41 i32.const
+  const cb = wPeekBack(0)
+  if cb == 0 { return 0 }
+  if cb == 1 { return 1 }
   -1
 }
 
@@ -18201,10 +18258,23 @@ function emitIfStmtStmt(body: i32[], s: IfStmt, _stmtIx: i32, fnIx: i32) {
   // (see `monoStaticIsResult`), so one arm can be provably UNREACHABLE in this instance.
   // Emit that arm as EMPTY: its statements are typed against the OTHER instance's binding and
   // generally cannot lower at all (`v.foo` where this instance's `v` is an i32 — "field
-  // access but no struct type declared"). Skipping is host parity — the branch can never run
-  // here. -1 = not static, both arms emit as before.
-  const staticGuard = monoStaticIsGuardOf(s.ifCond, fnIx)
+  // access but no struct type declared") or lower INVALIDLY (a narrowed `"" + v` reads a
+  // string ref out of the i32 cell — D932's check-clean invalid wasm). Skipping is host
+  // parity — the branch can never run here. -1 = not static, both arms emit as before.
+  //
+  // D932 — THE GUARD IS READ OFF THE EMITTED CONDITION, NOT A PARALLEL PREDICATE. The
+  // pre-D932 gate (`monoStaticIsGuardOf`) scoped the skip to whole-span `{…}` shape tests,
+  // so `v is string` / `v is i32` in the instance where the fold decides them FALSE emitted
+  // a `i32.const 0` condition AND the dead arm's body. `emittedCondConst` prunes exactly
+  // when the condition the module carries is a constant, so the skip and the emitted test
+  // cannot disagree — the property the predicate route had to re-derive arm by arm. Scoped
+  // to a bare `is` condition (the monomorphized-guard family): a literal-valued or compound
+  // condition emits a runtime test and reads -1 here, both arms emitting as before.
+  const condStart = wLen()
   if emitExpr(body, s.ifCond, fnIx) < 0 { return -1 }
+  let staticGuard = -1
+  const condN = P.nodes[unwrapParen(s.ifCond)]
+  if condN is IsExpr { staticGuard = emittedCondConst(condStart) }
   fbIf(64) // 0x04 if, 0x40 void blocktype
   // The `if` opens ONE control frame (the `else` reuses it, `end` closes it), so a
   // `break`/`continue` nested in either arm sees the right relative `br` depth.
@@ -18216,6 +18286,9 @@ function emitIfStmtStmt(body: i32[], s: IfStmt, _stmtIx: i32, fnIx: i32) {
   const narrowed = setNarrowFromCond(s.ifCond, fnIx)
   if staticGuard != 0 {
     if emitStmts(body, s.ifThen, fnIx) < 0 { return -1 }
+  } else {
+    // D932 — the skipped arm's `let`s still own their collect-allocated slots.
+    emitLetCursor = emitLetCursor + cursorSlotsUnder(s.ifThen)
   }
   if narrowed { restoreNarrow(savedTop) }
   if s.ifElse >= 0 && staticGuard != 1 {
@@ -18233,6 +18306,9 @@ function emitIfStmtStmt(body: i32[], s: IfStmt, _stmtIx: i32, fnIx: i32) {
       if emitStmt(body, s.ifElse, fnIx) < 0 { return -1 }
     }
     if narrowedElse { restoreNarrow(savedElseTop) }
+  } else if s.ifElse >= 0 {
+    // D932 — the statically-dead else arm, same slot accounting as the then skip.
+    emitLetCursor = emitLetCursor + cursorSlotsUnder(s.ifElse)
   }
   fbEnd() // 0x0b end
   ctrlLeave()
@@ -18824,6 +18900,14 @@ export function emitFuncBody(body: i32[], blockIx: i32, fnIx: i32) {
       // A statically-TRUE `is` guard that always returns ends this instance's body.
       if monoStaticGuardEndsBlock(stmts[i], fnIx) {
         fbUnreachable() // 0x00 (dead padding — the cut path never runs)
+        // D932 — the truncated statements' `let`s still own their collect-allocated
+        // slots; a sibling emitted after this BLOCK (not after the function) would
+        // otherwise bind one slot early. See `cursorSlotsUnder`.
+        let cutAt = i + 1
+        while cutAt < n {
+          emitLetCursor = emitLetCursor + cursorSlotsUnder(stmts[cutAt])
+          cutAt = cutAt + 1
+        }
         i = n
       } else {
         pushPostGuardNarrow(stmts[i], fnIx)
@@ -18857,6 +18941,12 @@ function emitStmts(body: i32[], blockIx: i32, fnIx: i32) {
       }
       if monoStaticGuardEndsBlock(stmts[i], fnIx) {
         fbUnreachable() // 0x00 — see `monoStaticGuardEndsBlock`
+        // D932 — slot accounting over the truncated tail; see `cursorSlotsUnder`.
+        let cutAt = i + 1
+        while cutAt < stmts.length {
+          emitLetCursor = emitLetCursor + cursorSlotsUnder(stmts[cutAt])
+          cutAt = cutAt + 1
+        }
         i = stmts.length
       } else {
         pushPostGuardNarrow(stmts[i], fnIx)
@@ -18897,6 +18987,13 @@ function emitStmtsTail(body: i32[], blockIx: i32, fnIx: i32) {
       }
       if monoStaticGuardEndsBlock(stmts[i], fnIx) {
         fbUnreachable() // 0x00 — see `monoStaticGuardEndsBlock`
+        // D932 — slot accounting over the truncated tail (the un-emitted tail
+        // statement included); see `cursorSlotsUnder`.
+        let cutAt = i + 1
+        while cutAt < n {
+          emitLetCursor = emitLetCursor + cursorSlotsUnder(stmts[cutAt])
+          cutAt = cutAt + 1
+        }
         cut = true
         i = n - 1
       } else {
@@ -18936,7 +19033,15 @@ function emitStmtTail(body: i32[], stmtIx: i32, fnIx: i32) {
 function emitIfTail(body: i32[], stmtIx: i32, fnIx: i32) {
   const s = P.nodes[stmtIx]
   if s is IfStmt {
+    // D932 — the tail-position twin of `emitIfStmtStmt`'s dead-arm skip, same byte-read
+    // gate (`emittedCondConst`), same slot accounting (`cursorSlotsUnder`). The tail form
+    // is the same defect one position over: `function f(v) { if v is string { "\"" + v }
+    // else { "o" } }` emitted the statically-false arm's narrowed use in the i32 instance.
+    const condStart = wLen()
     if emitExpr(body, s.ifCond, fnIx) < 0 { return -1 }
+    let staticGuard = -1
+    const condN = P.nodes[unwrapParen(s.ifCond)]
+    if condN is IsExpr { staticGuard = emittedCondConst(condStart) }
     fbIf(64) // 0x04 if, 0x40 void blocktype
     // The arms hold RETURNS, and a union-box return SINKS to a `br` whose operand is the
     // frame distance to the function's exit block — so this frame has to be counted. The
@@ -18944,9 +19049,13 @@ function emitIfTail(body: i32[], stmtIx: i32, fnIx: i32) {
     ctrlEnter()
     const savedTop = narrowTop
     const narrowed = setNarrowFromCond(s.ifCond, fnIx)
-    if emitStmtsTail(body, s.ifThen, fnIx) < 0 { return -1 }
+    if staticGuard != 0 {
+      if emitStmtsTail(body, s.ifThen, fnIx) < 0 { return -1 }
+    } else {
+      emitLetCursor = emitLetCursor + cursorSlotsUnder(s.ifThen)
+    }
     if narrowed { restoreNarrow(savedTop) }
-    if s.ifElse >= 0 {
+    if s.ifElse >= 0 && staticGuard != 1 {
       fbElse() // 0x05 else
       // A VALUE union narrows to the COMPLEMENT set in the else-arm (see emitStmt).
       const savedElseTop = narrowTop
@@ -18959,6 +19068,8 @@ function emitIfTail(body: i32[], stmtIx: i32, fnIx: i32) {
         if emitStmtTail(body, s.ifElse, fnIx) < 0 { return -1 }
       }
       if narrowedElse { restoreNarrow(savedElseTop) }
+    } else if s.ifElse >= 0 {
+      emitLetCursor = emitLetCursor + cursorSlotsUnder(s.ifElse)
     }
     fbEnd() // 0x0b end
     ctrlLeave()
