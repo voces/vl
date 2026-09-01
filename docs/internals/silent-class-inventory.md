@@ -27084,3 +27084,45 @@ Repro (loud emit reject):
   capability the widen was carrying is expressible today; the union LOCAL is what has no
   rep. Per this repo's message discipline: the sentence describes the arm that fired, and
   the plainest program the sentence permits (`i32[]` into the union) also refuses.
+
+### D947 — an `is`-atom arm a union T cannot hold still EMITS, and its read of the narrowed value refuses when no module union minted that atom's box
+
+**loud emit reject · `emitProgram: narrowed union atom has no value box` · found 2026-08-31 as std:test v2's review blocker: `expect(parse("4")).toEqual(4)` over `parse(s: string): i32 | string` RAN under v1 and refused under v2, because v1's five-atom receiver union minted every scalar value box just by existing and generic v2 minted only what the user's module declared · the box registry is MODULE-WIDE (`markValueUnionAtoms` marks `vb*Used` per registered value union's members; `emitUnionUnboxTail` refuses at `vbHeapIdxOfKind < 0`), so the SAME arm validates the moment any union in the module carries the atom — std/test.vl routes around it with a private five-atom alias (`VltAtomReps`), which is why the expect-level spelling no longer reproduces while this std-free witness still does · a 30-cell arm-by-union grid (scratch method, five ladder arms x six two-member unions) refused in exactly the cells {arm READS the narrowed value} x {arm atom's box unminted}, boolean riding i32's box (`boolean` arm over `f64 | string` refuses, over `i32 | string` runs)**
+
+Repro (loud emit reject):
+
+    function istr(v: i64) {
+      if v == 0 { return "0" }
+      "n"
+    }
+
+    function f<T>(x: T): string {
+      if x is i64 { return istr(x) }
+      "o"
+    }
+
+    const u: i32 | string = 4
+    print(f(u))
+    // vl check rc 0; vl run -> emit error:
+    // emitProgram: narrowed union atom has no value box
+    // SHOULD PRINT o
+
+* **THE ARM IS STATICALLY DEAD** — `i32 | string` can never hold an i64, so the test is
+  constant-false and the checker could prune the body; instead it emits, and the dead
+  unbox is what refuses. The same arm with NO read of the narrowed value (`return "i64arm"`)
+  runs, and the same read under `const u: i64 | string` (a live arm) runs — the refusal
+  needs both the read and the unminted box, ablated one ingredient at a time.
+* **DECLARING `type X = i32 | i64 | f64 | boolean | string` anywhere in the module makes
+  this witness RUN** (registration alone mints the boxes; no value of the type is needed).
+  That is the std route-around, one line, measured both ways — and it is a route-around,
+  not a close: the pruning (or the on-demand mint) is the compiler-side fix.
+* **The route-around's boundary, measured through `expect` itself:** unions of the five
+  atoms run and render the held arm in v1's exact forms (`i32|string`, `f64|string`,
+  `boolean|string`, `i32|null` all measured). A union with a NON-atom member goes PAST this
+  refusal into deeper standing defects: `string | i32[]` is check-clean invalid wasm at the
+  bare generic-struct-field store (19-line std-free witness, `expected (ref $type), found
+  (ref $type)` in `expect`), and `Circle | null` emits invalid wasm through the receipt
+  chain (bare field store alone RUNS there, so its mechanism is a different, un-ablated
+  family — that count is a message count). Under v1 both were LOUD check refusals (not
+  members of the receiver union), so for those two shapes the generic surface traded a
+  check refusal for a silent one — recorded as a price, not fixed here.

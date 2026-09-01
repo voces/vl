@@ -144,6 +144,29 @@ Deno.test({
 
 Deno.test({
   name:
+    "vl-test: a UNION-TYPED receiver asserts, and a failure renders the held arm exactly",
+  ignore: !ENABLED,
+  fn: async () => {
+    const r = await runTest(`${FIXTURES}/union.test.vl`);
+    if (r.code !== 1) {
+      throw new Error(
+        `expected exit 1 (the fixture has failing tests), got ${r.code}:\n${r.err}`,
+      );
+    }
+    // The F1 shape: T inferred as `i32 | string` from a union-typed return.
+    // Under the pre-fix v2 this file refused at emit (`narrowed union atom has
+    // no value box`, inventory D947); it must keep compiling AND asserting.
+    expectHas(r.err, "ok   asserts through a union-typed receiver");
+    // A failing union receiver renders the arm it HOLDS, in v1's exact atom
+    // forms — not the `<value>` sentinel.
+    expectHas(r.err, "expected 4 to equal 5");
+    expectHas(r.err, 'expected "x" to equal "y"');
+    expectHas(r.err, "1 file · 1 passed · 2 failed");
+  },
+});
+
+Deno.test({
+  name:
     "vl-test: a TRAP fails only its own test — the file keeps running (isolation)",
   ignore: !ENABLED,
   fn: async () => {
@@ -183,7 +206,7 @@ Deno.test({
     // Every other file still ran.
     expectHas(r.err, "ok   adds");
     expectHas(r.err, "ok   still runs after two traps");
-    expectHas(r.err, "5 files · 13 passed · 9 failed · 1 skipped");
+    expectHas(r.err, "6 files · 14 passed · 11 failed · 1 skipped");
   },
 });
 
