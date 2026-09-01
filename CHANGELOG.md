@@ -547,6 +547,7 @@ see **`DECISIONS.md`**.
 - **`vl fmt --check` gate** — the whole `compiler/`, `std/`, `scripts/` tree is `vl fmt`-clean, enforced in `scripts/lint-self.sh` + CI (tests/ excluded by construction); landed via a one-time tree reformat. (#456)
 - **cleanup: `0 - N` literal idiom → unary `-N`** — ~915 operand-position numeric-literal sites in the compiler source; semantically identical (unary `-` lowers to the same `push 0; <x>; i32.sub`, so the self-compiled seed is byte-identical). (#457)
 - **kill-TS: retire the TS formatter (`compiler/format.ts`)** — the self-hosted `format.vl` (via the seed) is the sole formatter for `vl fmt`, the LSP, and the playground; `format.ts` had no remaining importers and is deleted. `lsp/src` and `compiler/cli.ts` reference no TS formatter.
+- **Go-to-def on a std export opens the std source (`vl-std:` scheme)** — a std import's module key (`std:test`) is not a path, but `toCrossFileSource` piped every key through `pathToUri`, so jumping to any std export errored on `file://std%3Atest`. `crossFileUriOf` now mirrors `withStd`'s read precedence: the workspace's own `std/NAME.vl` when it exists (dogfooding → the real file), else `vl-std:/NAME.vl`, served read-only from the embedded map by a `TextDocumentContentProvider` in the extension — same generated map the checker reads, so ranges can't drift. (#2072)
 
 ## Browser playground (Track E)
 
