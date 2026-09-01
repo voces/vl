@@ -23790,46 +23790,43 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   invalid wasm.
 
 ---
-### D971 — a CAPTURING lambda at two types: the refusal's reason is half true, and the missing piece is a calling convention
+### D971 — a CAPTURING lambda at two types: the refusal described a calling convention the emitter does not use
 
-**loud emit reject conceding capability — `a capturing lambda used at more than one type is not yet supported — annotate its parameters, or bind a separate copy per type` · the LAST of the nine capability probes, and the only one that is not a reachable lowering**
+**closed by DELETING the refusal — a lifted capturing instance already takes the env as its leading param, and `emitDirectCall` already pushes it · the last of the nine capability probes**
 
-`const n = 7; const f = (v) => n; f(1); f("s")` refuses. Both halves work separately: a
-NON-capturing lambda at two types runs (the multi-instance machinery exists), and a capturing
-lambda at ONE type runs (the env machinery exists).
+`const n = 7; const f = (v) => n; f(1); f("s")` refused. Both halves worked separately: a
+NON-capturing lambda at two types ran (the multi-instance machinery exists) and a capturing
+lambda at ONE type ran (the env machinery exists).
 
-* **THE REFUSAL'S SENTENCE IS HALF TRUE, and the half that is false is the useful half.** It
-  says a second-type call can be "neither a `call_ref` through it (wrong functype) nor a
-  by-name call (drops the env)". The `call_ref` half is right. The by-name half is not: a
-  lifted capturing lambda's instance takes the ENV AS ITS LEADING PARAM — `local.get 0`, a
-  `structref`, `ref.cast` to the instance's env heap, which is how `emitCapturedRead` reads
-  every capture. A by-name call CAN carry the env; it just has to push it.
+* **THE REFUSAL'S SENTENCE WAS HALF FALSE, and the false half was the whole gap.** It said a
+  second-type call can be "neither a `call_ref` through it (wrong functype) nor a by-name call
+  (drops the env)". The `call_ref` half is right and is exactly why the rename to a by-name
+  call exists. The by-name half is not: a lifted capturing instance takes the env as its
+  LEADING `structref` param — `local.get 0`, `ref.cast` to its env heap, which is how
+  `emitCapturedRead` reads every capture — and `emitDirectCall` already pushes it.
 
-* **SO THE MISSING PIECE IS A CALLING CONVENTION, not a lowering.** At `f("s")` the binding
-  holds the closure struct `{funcref, env}`, so the second instance is reachable as
-  `struct.get $clo <env>` then the args then `call $inst2`. What does not exist is any way for
-  `emitDirectCall` to know that a given callee is a lifted instance wanting an env prepended —
-  today a by-name call emits the declared args and nothing else.
+* **SO THE FIX IS THE DELETION AND NOTHING ELSE.** A side table pairing the renamed callee with
+  the binding whose env it needs was written first, on the assumption the env had to be plumbed
+  through; removing it changed no behaviour. **The convention the sentence described is not the
+  one the emitter uses**, which is the same failure mode this repo files as "a refusal's
+  sentence describes the arm that fired, not the feature".
 
-* **WHICH IS WHY THIS ONE IS NOT LIKE THE OTHER EIGHT.** Every other probe closed this session
-  was an existing lowering that some classifier failed to reach. This one needs a new
-  convention at the call boundary and a way to mark the callee as taking it. That is a design
-  decision (the owner's call), not a defect fix — and the mono site's refusal is the honest
-  answer until it is made.
+* **TWO CAPTURES ARE THE LOAD-BEARING CELL.** A single capture of `7` cannot tell a
+  correctly-read env from a zeroed one. `a + b == 43` at both instantiation types can, and a
+  third distinct type rules out a two-instance special case; all three are in the fixture.
 
-Repro (loud emit reject):
+Repro (runs, prints `7` twice):
 
     function outer() {
       const n = 7
-      const f = (v) => {
+      const f = (_v) => {
         return n
       }
       print(f(1))
       print(f("s"))
     }
     outer()
-    // vl check rc 0; vl run -> emit error:
-    // emitProgram: a capturing lambda used at more than one type is not yet supported
+    // PRINTS 7
 
 ### D970 — an inferred value-union return whose param is un-annotated: the monomorphizer minted the annotation from ONE return
 
