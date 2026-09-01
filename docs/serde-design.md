@@ -506,6 +506,58 @@ Staged, sized honestly:
   messaging), CBOR rendering (foreign self-describing interop), generated `flat`
   accessors (ROADMAP already holds this).
 
+## Cycles (owner ruling, 2026-09-01)
+
+The owner's stance, recorded verbatim in intent: **print/show and serialization should both
+handle cyclic values, ideally; serialization additionally wants an unsafe fast variant**
+(deserialization could have one too, or the format's own metadata makes it unnecessary).
+What that costs, per surface:
+
+- **Can VL even build a cycle?** Yes in principle: struct fields are mutable WasmGC refs,
+  so `a.next = a` is expressible the moment a self-referential type is (check the
+  recursive-type story before assuming — a `type Node = { next: Node | null }` must
+  actually check and emit; that is its own prerequisite and should be MEASURED when
+  stage 2 starts). Arrays/maps holding refs can also close a loop. Primitives cannot.
+- **The walk carries an identity seen-set.** The derive's shape-walk (stage 2) threads a
+  visited set keyed on REFERENCE IDENTITY (`ref.eq`-class, not `==` value equality —
+  value equality on a cyclic value is itself a divergence). Cost: one hash-set insert per
+  ref-typed node visited, zero for primitive-only shapes — a shape whose transitive
+  fields hold no ref cannot cycle, and the emitter knows that statically per
+  monomorphized shape, so **acyclic-by-construction shapes skip the bookkeeping at
+  compile time and pay nothing**. That static skip is the first-class fast path; the
+  unsafe variant below only matters for shapes that are ref-bearing but that the CALLER
+  knows are acyclic.
+- **`show`/`print` on a cycle: render a back-reference, never hang.** The failure mode
+  today's languages split on: naive recursion (stack overflow — pre-ES2015 JSON), refuse
+  (`JSON.stringify` TypeError), or render a marker (`[Circular]` — Node's
+  `util.inspect`, Python's `...` in reprs). For a DIAGNOSTIC surface the marker is the
+  only defensible answer: `show` exists to tell a user what a value is, and a value
+  being cyclic is part of that. Proposed rendering: `<cycle →#N>` where `#N` labels the
+  N-th ref node in walk order (labels printed only when actually referenced back).
+- **VLB (the binary derive format): back-references in the format.** A ref-typed field's
+  encoding gains one byte of tag: `0` null / `1` inline value / `2` back-ref, where
+  back-ref carries the varint index of the target in ENCODE VISIT ORDER. Decode keeps
+  the same table and patches on read — this is how a cyclic value ROUND-TRIPS, which
+  "refuse on encode" and "marker on encode" both forfeit. Deserialization needs no
+  unsafe variant under this design: the table is O(refs) either way, and a malformed
+  back-ref index is a bounds check, not a cycle hazard (decode never walks user-provided
+  topology unboundedly — the byte stream is finite and each byte is consumed once).
+- **JSON: refuse on cycle, loudly.** JSON has no reference syntax; every convention
+  (`$ref`, JSON-LD `@id`) is an application-layer schema that a consumer must also
+  speak, which contradicts JSON's job here (interop with things that are not VL). The
+  seen-set is already in the walk, so the refusal is free and precise ("cycle through
+  field `next` of `Node`"). A consumer needing cyclic JSON is a consumer for VLB or for
+  a schema of their own.
+- **The unsafe fast variant: `serializeUnchecked<T>` (name per OQ-1's resolution).**
+  Skips the seen-set for ref-bearing shapes the caller asserts are acyclic. On a lied-to
+  call it diverges (wasm stack exhaustion trap — loud, not silent corruption, worth
+  stating in the doc comment). Justified the same way `as` (vs `as?`) is: the checked
+  form is the default spelling, the unchecked form is an opt-in with the hazard in its
+  name. Measure before shipping it: if the static acyclic-shape skip already covers the
+  hot callers (likely — message-passing payloads are usually trees of records), the
+  unsafe variant may have no customer, and per std review discipline it then should NOT
+  ship. File it as deferred-until-measured rather than building it alongside stage 2.
+
 ## Open questions for the owner
 
 - **OQ-1 — surface spelling.** `serialize<T>`/`deserialize<T>` builtins vs a `derive`
