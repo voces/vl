@@ -3,9 +3,15 @@
 // workspace that is not this repo, with no configuration.
 //
 // Sources, first hit wins:
-//   1. `vl seed --out`  — an installed CLI's own seed, so the bundled copy is
-//      whatever that `vl` would use rather than a hand-placed file
-//   2. ../build/vl-compiler.wasm — this checkout's freshly built seed
+//   1. ../build/vl-compiler.wasm — this checkout's freshly built seed. The
+//      bundle is built FROM this tree, so it must carry this tree's compiler: a
+//      PATH-installed `vl` can be arbitrarily older than the sources being
+//      bundled (measured: it embedded a pre-filter seed while the server bundle
+//      relied on the new `scopeAt`), and the server half of the bundle assumes
+//      the seed speaks its ABI.
+//   2. `vl seed --out` — an installed CLI's own seed, for building the bundle
+//      outside a checkout (no ../build): still a real compiler, never a
+//      hand-placed file.
 //
 // MISSING IS NOT AN ERROR. CI builds the bundle to prove it compiles, on a box
 // with no `vl` and no seed, and failing there would gate the whole PR on an
@@ -34,10 +40,10 @@ const fromCheckout = (): boolean => {
 };
 
 Deno.mkdirSync("dist", { recursive: true });
-if (fromCli()) {
-  console.log(`bundled seed: ${OUT} (from \`vl seed\`)`);
-} else if (fromCheckout()) {
+if (fromCheckout()) {
   console.log(`bundled seed: ${OUT} (from ../build/vl-compiler.wasm)`);
+} else if (fromCli()) {
+  console.log(`bundled seed: ${OUT} (from \`vl seed\`)`);
 } else {
   console.log(
     "no seed to bundle — rung 5 will be absent. " +
