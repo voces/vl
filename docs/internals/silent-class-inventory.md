@@ -23855,12 +23855,22 @@ and the refusal turns into a miscompile:
   two cases.** The split has to distinguish a join over the body's OWN literals from a join
   over a CALLEE's per-call-site result, and nothing tried here does that.
 
-* **THE EMITTER HALF IS SEPARATELY UNFINISHED.** With the name recorded, the returns STILL did
-  not box — the functype and body were unchanged in the disassembly. So `retUNm` never took the
-  recorded name, and the next attempt should check which of the two is true before touching the
-  gate again: `isValueUnionName` rejecting the recorded spelling (`valueUnionRetName` joins
-  atoms with a bare `|`, while the canonical spelling elsewhere carries spaces), or
-  `inferRetNameOf` not being keyed the way the read assumes.
+* **THE EMITTER HALF IS SEPARATELY UNFINISHED, and the search is now narrowed to one place.**
+  With the gate forced open the box IS minted — the loud "no value box" refusal disappears —
+  but the returns STILL do not box, and the functype/body are unchanged in the disassembly. Two
+  candidate causes were named and one is now RULED OUT: canonicalising the recorded name at the
+  read (`unionMemberSetOf(im)` before `isValueUnionName`) changes nothing, so it is not a
+  spelling mismatch between `valueUnionRetName`'s bare-`|` join and the registry's canonical
+  form. **`inferRetNameOf(fn.fnName)` is simply answering `""`**, which means `recordInferRet`
+  is never reached even with `!generic` satisfied — so the next attempt starts at
+  `valueUnionRetName(er)` / `retAtomsCheap(er)` and the `isClassifiableRetName` fork above it,
+  NOT at the read and NOT at the gate.
+
+* **AND THE BOX IS MINTED BY A DIFFERENT PATH THAN THE NAME**, which is the structural fact
+  behind all of it: opening the gate mints the box without recording a name, so the "no value
+  box" refusal and the unboxed-return miscompile are two independent failures wearing one
+  witness. Fixing either alone moves the program between clause 2 and clause 1 rather than to
+  `runs` — which is exactly what the bystander demonstrates from the other side.
 
 Repro (check rc 0, invalid wasm):
 
