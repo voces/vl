@@ -244,3 +244,54 @@ Deno.test({
     }
   },
 });
+
+// `vl check` over a two-file project (entry + sibling) → captured stderr.
+const checkProject = async (
+  entry: string,
+  util: string,
+): Promise<{ code: number; err: string }> => {
+  const dir = await Deno.makeTempDir({ prefix: "vl_redun_proj_" });
+  await Deno.writeTextFile(`${dir}/main.vl`, entry);
+  await Deno.writeTextFile(`${dir}/util.vl`, util);
+  try {
+    const { code, stderr } = await new Deno.Command(VL, {
+      args: ["check", `${dir}/main.vl`, "--concise", "--compiler", COMPILER],
+      stdout: "null",
+      stderr: "piped",
+      env: { RUST_BACKTRACE: "0", NO_COLOR: "1" },
+    }).output();
+    return { code, err: new TextDecoder().decode(stderr) };
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+};
+
+Deno.test({
+  name: "vl-check-redundant-type: finding messages demangle in a multi-module compile (D9 slot 5)",
+  ignore: !ENABLED,
+  fn: async () => {
+    // The merge renames every top-level decl — the ENTRY's own `P` becomes `P$m0`
+    // and the dep's `Pair` becomes `Pair$m1`. Both findings quote a rendered type;
+    // the render goes through the user pathway (`tyToStrUser`), so the messages
+    // must carry the SOURCE names.
+    const util = "export type Pair = { a: i32, b: i32 }\n" +
+      "export function mk(): Pair { { a: 1, b: 2 } }\n";
+    const entry = 'import { mk } from "./util"\n' +
+      "type P = { a: i32 }\n" +
+      "function mkP(): P { { a: 1 } }\n" +
+      "const q: P = mkP()\n" + // redundant: inferred `P` (was `P$m0`)
+      "const p2 = mk()\n" +
+      "const r = p2 ?? p2\n" + // dead ??: `Pair` is never null (was `Pair$m1`)
+      "print(q.a + r.a)\n";
+    const { err } = await checkProject(entry, util);
+    if (!err.includes("`q` is inferred as `P`")) {
+      throw new Error(`expected the demangled redundant-annotation hint, got:\n${err}`);
+    }
+    if (!err.includes("`Pair` is never null")) {
+      throw new Error(`expected the demangled dead-coalesce warning, got:\n${err}`);
+    }
+    if (err.includes("$m")) {
+      throw new Error(`a mangled name leaked into a finding message:\n${err}`);
+    }
+  },
+});

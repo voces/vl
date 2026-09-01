@@ -282,10 +282,12 @@ Deno.test({ name: "wasm-symbols: hoverTypeAt renders a non-empty type", ignore }
   if (greetTy !== "string") {
     throw new Error(`expected string for greeting, got ${JSON.stringify(greetTy)}`);
   }
-  // The `add` function declaration on line 1 — its name starts at column 9.
+  // The `add` function declaration on line 1 — its name starts at column 9. A
+  // FuncDecl binding hovers as its NAMED signature (D9 slot 5): the decl's
+  // parameter names zipped with the type's parameter types.
   const addTy = await checker.hoverTypeAt(SYM_FIXTURE, "/tmp/x.vl", noSiblings, 1, 9);
-  if (addTy !== "(i32, i32) => i32") {
-    throw new Error(`expected the function type for add, got ${JSON.stringify(addTy)}`);
+  if (addTy !== "(a: i32, b: i32) => i32") {
+    throw new Error(`expected the named signature for add, got ${JSON.stringify(addTy)}`);
   }
   // A cursor off any binding (column 0 of a blank-ish position) yields undefined.
   const none = await checker.hoverTypeAt(SYM_FIXTURE, "/tmp/x.vl", noSiblings, 2, 0);
@@ -371,7 +373,7 @@ Deno.test({ name: "wasm-symbols: an unannotated function's inferred return is re
   // into the function's retained type, so hover renders `=> i32`, not the blank `=> _`.
   const src = "function add(a: i32, b: i32) {\n  a + b\n}\n";
   const ty = await checker.hoverTypeAt(src, "/tmp/x.vl", noSiblings, 0, 9);
-  if (ty !== "(i32, i32) => i32") {
+  if (ty !== "(a: i32, b: i32) => i32") {
     throw new Error(`expected the inferred return retained, got ${JSON.stringify(ty)}`);
   }
 });
@@ -380,11 +382,11 @@ Deno.test({ name: "wasm-symbols: an un-annotated polymorphic param hovers as the
   const checker = loadWasmChecker(SEED, log)!;
   // `x` is never annotated and only probed via `is i32`, so it stays a fresh
   // inference hole (`?describe.0`). The hover must render that as the blank `_`,
-  // not leak the internal hole name.
+  // not leak the internal hole name — inside the named signature.
   const fixture = 'function describe(x): string {\n  if x is i32 { return "num" }\n  return "str"\n}\n';
   const ty = await checker.hoverTypeAt(fixture, "/tmp/x.vl", noSiblings, 0, 9);
-  if (ty !== "(_) => string") {
-    throw new Error(`expected (_) => string for a polymorphic param, got ${JSON.stringify(ty)}`);
+  if (ty !== "(x: _) => string") {
+    throw new Error(`expected (x: _) => string for a polymorphic param, got ${JSON.stringify(ty)}`);
   }
 });
 
@@ -656,5 +658,154 @@ Deno.test({ name: "wasm-symbols: scopeAt respects block scope (an inner binding 
   if (after.includes("inner")) throw new Error(`'inner' should not leak past its block, got ${JSON.stringify(after)}`);
   if (!after.includes("g") || !after.includes("after")) {
     throw new Error(`expected 'g' and 'after' visible, got ${JSON.stringify(after)}`);
+  }
+});
+
+// ── D9 slot 5: ONE user-facing render pathway (`tyToStrUser`) + named signatures ──
+// Every type string a person reads renders through `tyToStrUser`/`tyToStructStrUser`
+// (demangle ∘ render, typecheck.vl) — the module merge renames every top-level decl
+// `name` → `name$mN` (the ENTRY included, as `$m0`), and before the pathway existed
+// each query exit leaked those internal names one surface at a time (hover showed
+// `Expectation$m1` live). One fixture per leak surface, each pinned to the
+// DEMANGLED spelling on a program whose types cross a module boundary.
+
+// The user's live case: a std:test import whose return type is the dep-declared
+// `Expectation` (rendered `Expectation$m1` before the pathway).
+const STD_HOVER_FIXTURE = 'import { expect } from "std:test"\nconst e = expect(1)\nprint(1)\n';
+
+// A local dep with a nominal type, a struct member OF that type, and an entry
+// alias + newtype (the entry's own decls mangle too — `W$m0`).
+const DEMANGLE_UTIL = [
+  "export type Pair = { a: i32, b: i32 }",
+  "export type Box = { inner: Pair }",
+  "export function mkBox(): Box { { inner: { a: 1, b: 2 } } }",
+  "export function fst(p: Pair): i32 { p.a }",
+  "",
+].join("\n");
+const DEMANGLE_ENTRY = [
+  'import { mkBox, fst } from "./util"', // line 0
+  "const b = mkBox()", //                   line 1 — `b` at col 6
+  "print(fst(b.inner))", //                 line 2 — `.inner` at col 12
+  "type Id = new i32", //                   line 3
+  "type W = { x: Id }", //                  line 4 — `W` at col 5
+  "const w: W = { x: 7 }", //               line 5
+  "print(w.x)", //                          line 6
+  "",
+].join("\n");
+const demangleRead = (key: string) => (key.endsWith("util.vl") ? DEMANGLE_UTIL : undefined);
+
+Deno.test({ name: "wasm-symbols: hover demangles a dep-nominal type (Expectation, not Expectation$m1)", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const eTy = await checker.hoverTypeAt(STD_HOVER_FIXTURE, "/proj/main.vl", noSiblings, 1, 6);
+  if (eTy !== "Expectation") {
+    throw new Error(`expected Expectation for e, got ${JSON.stringify(eTy)}`);
+  }
+  const bTy = await checker.hoverTypeAt(DEMANGLE_ENTRY, "/proj/main.vl", demangleRead, 1, 6);
+  if (bTy !== "Box") throw new Error(`expected Box for b, got ${JSON.stringify(bTy)}`);
+});
+
+Deno.test({ name: "wasm-symbols: member hover demangles (b.inner is Pair, not Pair$m1)", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const ty = await checker.memberTypeAt(DEMANGLE_ENTRY, "/proj/main.vl", demangleRead, 2, 12);
+  if (ty !== "Pair") throw new Error(`expected Pair for .inner, got ${JSON.stringify(ty)}`);
+});
+
+Deno.test({ name: "wasm-symbols: inlay hints demangle (dep nominals AND the entry's own $m0)", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const std = await checker.inlayHintsAt(STD_HOVER_FIXTURE, "/proj/main.vl", noSiblings);
+  const eHint = std.find((h) => h.line === 2 && h.kind === 0);
+  if (!eHint || eHint.type !== "Expectation") {
+    throw new Error(`expected an Expectation hint, got ${JSON.stringify(std)}`);
+  }
+  const dep = await checker.inlayHintsAt(DEMANGLE_ENTRY, "/proj/main.vl", demangleRead);
+  const types = dep.map((h) => h.type);
+  if (!types.includes("Box")) throw new Error(`expected a Box hint, got ${JSON.stringify(types)}`);
+  if (types.some((t) => t.includes("$"))) {
+    throw new Error(`a mangled name leaked into inlay hints: ${JSON.stringify(types)}`);
+  }
+});
+
+Deno.test({ name: "wasm-symbols: type-alias hover survives a multi-module compile (the entry's key mangles to $m0)", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // Before the `$m0` fallback the alias hover went dark in ANY program with an
+  // import: the merge renamed the entry's `W` → `W$m0` in the declared-types map
+  // while the hovered token still read `W`. The body render also demangles (the
+  // nested NEWTYPE name `Id` is the one nominal a structural render keeps).
+  const ty = await checker.typeAliasAt(DEMANGLE_ENTRY, "/proj/main.vl", demangleRead, 4, 5);
+  if (ty !== "{x: Id}") {
+    throw new Error(`expected the demangled alias body {x: Id}, got ${JSON.stringify(ty)}`);
+  }
+});
+
+Deno.test({ name: "wasm-symbols: completion details demangle through the shared pathway", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // The #2074 fix demangled these inline at symScopeAt's two fill sites; those
+  // wraps collapsed into `symBindTypeStr` rendering via the ONE pathway. Pin the
+  // detail (not just the name, which lsp_crossfile_wasm_test.ts already pins).
+  const scope = await checker.scopeAt(STD_HOVER_FIXTURE, "/proj/main.vl", noSiblings, 2, 0);
+  const e = scope.find((b) => b.name === "e");
+  if (!e || e.type !== "Expectation") {
+    throw new Error(`expected e: Expectation in completion, got ${JSON.stringify(e)}`);
+  }
+  const ex = scope.find((b) => b.name === "expect");
+  if (!ex || ex.type !== "(i32 | i64 | f64 | boolean | string) => Expectation") {
+    throw new Error(`expected expect's demangled signature, got ${JSON.stringify(ex)}`);
+  }
+});
+
+// ── Named function signatures (hover shows parameter NAMES) ───────────────────
+// `TyFunc` carries no parameter names by design; the query layer zips the
+// binding's FuncDecl param names with the type's param types. Bare-type
+// fallbacks: a lambda-bound value and a function-typed parameter have no
+// FuncDecl, so they keep the structural render.
+
+Deno.test({ name: "wasm-symbols: a local function hovers with parameter names (decl + use)", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const src = 'function greet(who: string, times: i32): string {\n  who + "!"\n}\nprint(greet("a", 1))\n';
+  const want = "(who: string, times: i32) => string";
+  const decl = await checker.hoverTypeAt(src, "/tmp/x.vl", noSiblings, 0, 9);
+  if (decl !== want) throw new Error(`expected ${want} at the decl, got ${JSON.stringify(decl)}`);
+  const use = await checker.hoverTypeAt(src, "/tmp/x.vl", noSiblings, 3, 7);
+  if (use !== want) throw new Error(`expected ${want} at the use, got ${JSON.stringify(use)}`);
+});
+
+Deno.test({ name: "wasm-symbols: an imported std function hovers with parameter names (it from std:test)", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // The imported binding's FuncDecl lives in the dep module; the merged program
+  // shares one node table, so the zip works across the boundary — and the
+  // rendered types demangle (`Expectation`, not `Expectation$m1`).
+  const src = 'import { it, expect } from "std:test"\nit("adds", () => {\n  expect(1).toEqual(1)\n})\n';
+  const itTy = await checker.hoverTypeAt(src, "/proj/main.vl", noSiblings, 1, 0);
+  if (itTy !== "(name: string, body: () => void) => void") {
+    throw new Error(`expected it's named signature, got ${JSON.stringify(itTy)}`);
+  }
+  const expectTy = await checker.hoverTypeAt(src, "/proj/main.vl", noSiblings, 2, 3);
+  if (expectTy !== "(value: i32 | i64 | f64 | boolean | string) => Expectation") {
+    throw new Error(`expected expect's named signature, got ${JSON.stringify(expectTy)}`);
+  }
+});
+
+Deno.test({ name: "wasm-symbols: a lambda-bound value and a function-typed parameter keep the bare type", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // A lambda binding's decl node is the LetStmt — no FuncDecl, no names to zip.
+  const lam = "const dbl = (x: i32) => x * 2\nprint(dbl(2))\n";
+  const lamTy = await checker.hoverTypeAt(lam, "/tmp/x.vl", noSiblings, 0, 6);
+  if (lamTy !== "(i32) => i32") {
+    throw new Error(`expected the bare type for a lambda binding, got ${JSON.stringify(lamTy)}`);
+  }
+  // A function-typed PARAMETER's decl node is the Param — bare type kept, at the
+  // decl and at a use. (The enclosing function still zips: `cb` is named there.)
+  const hof = "function run(cb: (i32) => i32): i32 {\n  cb(1)\n}\nprint(run((x: i32) => x))\n";
+  const paramDecl = await checker.hoverTypeAt(hof, "/tmp/x.vl", noSiblings, 0, 13);
+  if (paramDecl !== "(i32) => i32") {
+    throw new Error(`expected the bare type for a fn-typed param, got ${JSON.stringify(paramDecl)}`);
+  }
+  const paramUse = await checker.hoverTypeAt(hof, "/tmp/x.vl", noSiblings, 1, 2);
+  if (paramUse !== "(i32) => i32") {
+    throw new Error(`expected the bare type at the param's use, got ${JSON.stringify(paramUse)}`);
+  }
+  const fnDecl = await checker.hoverTypeAt(hof, "/tmp/x.vl", noSiblings, 0, 10);
+  if (fnDecl !== "(cb: (i32) => i32) => i32") {
+    throw new Error(`expected run's named signature, got ${JSON.stringify(fnDecl)}`);
   }
 });

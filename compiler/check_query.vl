@@ -2,7 +2,7 @@
 // occurrences / def / refs / hover (`sym*`), redundant-type reports (`redun*`), inlay
 // hints. Reads `check_state` + the checker's `T`/types, never drives checking.
 
-import { P, declNameTokOf, nodeToks } from "./ast"
+import { FuncDecl, P, Param, declNameTokOf, nodeToks } from "./ast"
 import {
   SYM_MEM_METHOD,
   inlayCol,
@@ -49,6 +49,11 @@ import {
   symVisSC,
   symVisSL,
 } from "./check_state"
+// Every rendered type string this module hands out is READ BY A PERSON (hover,
+// inlay, completion details), so it renders through the USER pathway —
+// `tyToStrUser`/`tyToStructStrUser`, demangle ∘ render — never the raw
+// `tyToStr`, whose spelling doubles as canon/interner keys and keeps its `$mN`
+// mangles. The boundary is documented at the pair's definition (typecheck.vl).
 import {
   T,
   TyFunc,
@@ -56,11 +61,10 @@ import {
   TyObj,
   TyPrim,
   cUserTypes,
-  demangleMsg,
   demangleName,
   inlayHole,
-  tyToStr,
-  tyToStructStr,
+  tyToStrUser,
+  tyToStructStrUser,
 } from "./typecheck"
 
 // The kind (0=variable 1=parameter 2=function) of the binding `declNode`
@@ -212,22 +216,60 @@ export function bindTypeOf(binding: i32) {
   }
   -1
 }
+// ── Named function signature (hover) ─────────────────────────────────────────
+// A FUNCTION binding hovers with its parameter NAMES: `TyFunc` deliberately
+// carries no names (`{ fnParamTypes, fnRet }` — the names live on the
+// declaration), so zip the binding's FuncDecl parameter names with the type's
+// parameter types: `(name: string, body: () => void) => void`. Returns "" when
+// the render does not apply, and the caller falls back to the bare type:
+//   - the binding is not FuncDecl-declared — a lambda-bound value (LetStmt) or a
+//     function-typed parameter (Param) keeps the bare structural type;
+//   - the retained type is not a TyFunc (defensive);
+//   - the decl's param count disagrees with the type's (defensive).
+// IMPORTED functions work through the same tables: the merged program shares one
+// node arena, so a dep module's FuncDecl is addressable here and its parameter
+// names are source names (the merge mangles only top-level DECL names). A future
+// signature-help provider (D9 slot 10) reads exactly this zip, one param per
+// index. Renders through the user pathway, like every string leaving this file.
+function fnSigStr(declNode: i32, ty: i32) {
+  if declNode < 0 || declNode >= P.nodes.length { return "" }
+  const nd = P.nodes[declNode]
+  if !(nd is FuncDecl) { return "" }
+  if ty < 0 { return "" }
+  const t = T.tys[ty]
+  if !(t is TyFunc) { return "" }
+  if nd.fnParams.length != t.fnParamTypes.length { return "" }
+  let s = "("
+  let i = 0
+  while i < nd.fnParams.length {
+    const pn = P.nodes[nd.fnParams[i]]
+    if !(pn is Param) { return "" }
+    if i > 0 { s = s + ", " }
+    s = s + pn.parName + ": " + tyToStrUser(t.fnParamTypes[i])
+    i = i + 1
+  }
+  s + ") => " + tyToStrUser(t.fnRet)
+}
 // The rendered TYPE STRING of the binding under (line, col), or "" when the
 // cursor is off any tracked binding or its type was not retained. The arena
 // `T.tys` persists for the whole check, so the retained index renders even after
-// the binding's scope closed (hover-types).
+// the binding's scope closed (hover-types). A FuncDecl-declared binding renders
+// as its NAMED signature (`fnSigStr` above); everything else as the bare type.
 export function symTypeStrAt(line: i32, col: i32) {
   const occ = symOccAt(line, col)
   if occ < 0 { return "" }
-  const ty = bindTypeOf(symOccDecl[occ])
+  const decl = symOccDecl[occ]
+  const ty = bindTypeOf(decl)
   if ty < 0 { return "" }
-  tyToStr(ty)
+  const sig = fnSigStr(decl, ty)
+  if sig != "" { return sig }
+  tyToStrUser(ty)
 }
 export function inlayPush(k: i32, occ: i32, ty: i32) {
   inlayKind.push(k)
   inlayLine.push(symOccEndLine(occ))
   inlayCol.push(symOccEndCol(occ))
-  inlayType.push(tyToStr(ty))
+  inlayType.push(tyToStrUser(ty))
   inlayOcc.push(occ)
 }
 export function symInlayScan() {
@@ -317,17 +359,22 @@ export function symTypeAliasAt(line: i32, col: i32) {
       col >= t.col &&
       col <= t.col + t.text.length
     ) {
-      if cUserTypes.has(t.text) {
-        const ty = cUserTypes[t.text] ?? (-1)
-        // THE ONE DISPLAY QUERY THAT WANTS THE STRUCTURAL RENDER, and the reason is
-        // its question. Every other surface asks "what type is this VALUE", and the
-        // useful answer is the name the source gives it. This one is handed the NAME
-        // and asks what it stands for, so the nominal render would answer `Pt` for a
-        // hover over `Pt` — the alias's body is the whole content of the reply.
-        // `tyToStructStr` is that render, and it is source-spelled — the structural
-        // entry has no second spelling to pick from.
-        if ty >= 0 { return tyToStructStr(ty) }
-      }
+      // In a MULTI-MODULE compile the merge renames the entry's own type decls
+      // too (`W` → `W$m0`), so the map's key is the mangled spelling while the
+      // token still reads `W` — without the `$m0` fallback the alias hover
+      // simply went dark in any program with an import (measured 2026-08-31).
+      // An alias's arena index is never negative, so -1 is a clean miss sentinel.
+      let ty = cUserTypes[t.text] ?? (-1)
+      if ty < 0 { ty = cUserTypes[t.text + "$m0"] ?? (-1) }
+      // THE ONE DISPLAY QUERY THAT WANTS THE STRUCTURAL RENDER, and the reason is
+      // its question. Every other surface asks "what type is this VALUE", and the
+      // useful answer is the name the source gives it. This one is handed the NAME
+      // and asks what it stands for, so the nominal render would answer `Pt` for a
+      // hover over `Pt` — the alias's body is the whole content of the reply.
+      // `tyToStructStrUser` is that render (through the user pathway — the body
+      // can embed a mangled NEWTYPE name), and it is source-spelled — the
+      // structural entry has no second spelling to pick from.
+      if ty >= 0 { return tyToStructStrUser(ty) }
     }
     i = i + 1
   }
@@ -355,7 +402,7 @@ export function symMemTypeStrAt(line: i32, col: i32) {
   if best < 0 { return "" }
   const ty = symMemTy[best]
   if ty < 0 { return "" }
-  tyToStr(ty)
+  tyToStrUser(ty)
 }
 // Whether type `ty` is a function — the `method` vs `property` distinction for
 // semantic tokens. Unwraps a nullable wrapper so an optional method (`o?.fn`)
@@ -383,13 +430,16 @@ export function symMemberIsMethod(i: i32) {
 }
 // The rendered TYPE STRING of binding `declNode`, or "" when no type was retained.
 // The arena persists for the whole check, so the index renders post-scope-close.
+// A USER-FACING render (its one consumer is the completion detail `symScopeAt`
+// fills), so it goes through the user pathway — this is where `symScopeAt`'s
+// former inline `demangleMsg` wraps (#2074) collapsed to.
 export function symBindTypeStr(declNode: i32) {
   let i = 0
   while i < symBindNode.length {
     if symBindNode[i] == declNode {
       const ty = symBindType[i]
       if ty < 0 { return "" }
-      return tyToStr(ty)
+      return tyToStrUser(ty)
     }
     i = i + 1
   }
@@ -449,16 +499,16 @@ export function symScopeAt(line: i32, col: i32) {
         idxByName[nm] = scopeResName.length
         scopeResName.push(nm)
         scopeResKind.push(symVisKind[i])
-        // `demangleMsg`: a rendered type can embed a MANGLED user type name
-        // (`Expectation$m1`) when the binding came from a dep module — an
-        // internal name that must not surface in a completion detail.
-        scopeResType.push(demangleMsg(symBindTypeStr(symVisNode[i])))
+        // `symBindTypeStr` renders through the user pathway, so a MANGLED user
+        // type name (`Expectation$m1`) from a dep-module binding never reaches
+        // the completion detail.
+        scopeResType.push(symBindTypeStr(symVisNode[i]))
         scopeResRaw.push(symVisName[i])
         scopeResTok.push(visDeclTok(symVisNode[i]))
         resVis.push(i)
       } else if visTighter(i, resVis[existing]) {
         scopeResKind[existing] = symVisKind[i]
-        scopeResType[existing] = demangleMsg(symBindTypeStr(symVisNode[i]))
+        scopeResType[existing] = symBindTypeStr(symVisNode[i])
         scopeResRaw[existing] = symVisName[i]
         scopeResTok[existing] = visDeclTok(symVisNode[i])
         resVis[existing] = i
@@ -546,7 +596,7 @@ export function symMemberScanAt(line: i32, col: i32) {
         const fty = t.objFieldTypes[k]
         let isfn = 0
         if symMemIsFn(fty) { isfn = 1 }
-        memcPush(nm, tyToStr(fty), isfn)
+        memcPush(nm, tyToStrUser(fty), isfn)
       }
       k = k + 1
     }
