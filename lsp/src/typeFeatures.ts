@@ -942,8 +942,11 @@ const escapeRegExp = (s: string): string =>
  *     REPLACED by the same statement with `name` merged into its specifiers,
  *     spelled by `formatImport` (fmt-sorted) or an alphabetical fallback;
  *   - otherwise a new `import { name } from "<moduleKey>"` line lands after the
- *     LAST import statement (fmt preserves statement order and does not force a
- *     blank line), or at the very top when the file has none.
+ *     LAST import statement (fmt preserves statement order), or at the very top
+ *     when the file has none. fmt guarantees exactly one blank line between the
+ *     import block and the first statement, so when the insertion lands directly
+ *     above a non-import, non-blank line the inserted text carries that blank —
+ *     the result is fmt-stable as inserted.
  * `undefined` when the statement already binds `name` (plain or as an alias
  * source) — nothing to do.
  */
@@ -984,11 +987,19 @@ export const importInsertionEdit = (
   for (let m = anyImport.exec(source); m !== null; m = anyImport.exec(source)) {
     lastEnd = m.index + m[0].length;
   }
+  // fmt keeps exactly one blank line between the import block and the first
+  // statement: an insertion landing directly above a non-blank line that is not
+  // itself part of the import block (an import, or a `export { … } from`
+  // re-export) must carry the blank, or the inserted result drifts under fmt.
+  const needsBlankAbove = (lineIdx: number): boolean => {
+    const line = (source.split("\n")[lineIdx] ?? "").trim();
+    return line !== "" && !/^(import\b|export\s*\{)/.test(line);
+  };
   const stmt = `import { ${name} } from "${moduleKey}"`;
   if (lastEnd < 0) {
     return {
       range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } },
-      newText: stmt + "\n",
+      newText: stmt + (needsBlankAbove(0) ? "\n\n" : "\n"),
     };
   }
   const after = offsetToPos(source, lastEnd);
@@ -997,7 +1008,10 @@ export const importInsertionEdit = (
   if (source.indexOf("\n", lastEnd) < 0) {
     return { range: { start: after, end: after }, newText: "\n" + stmt };
   }
-  return { range: { start: insertAt, end: insertAt }, newText: stmt + "\n" };
+  return {
+    range: { start: insertAt, end: insertAt },
+    newText: stmt + (needsBlankAbove(insertAt.line) ? "\n\n" : "\n"),
+  };
 };
 
 /** One std-module export the auto-import pass may offer. */
