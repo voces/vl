@@ -95,11 +95,11 @@ parameter lists as structured data (only rendered type strings), declaration *bo
 | Go to implementation | n/a | — | VL has no interfaces/traits to implement. |
 | Go to declaration | n/a | — | No decl/def split in VL. |
 | Find references | **have** | Cross-file, capped crawl | — |
-| Document highlights | **missing** | All same-file occurrences light up under the cursor | **Fully served by `referencesAt`** — a ~20-line handler. |
-| Document symbols | **missing** | Outline view, breadcrumbs, Ctrl+Shift+O | Flat list served by `tokensAt` (decl-flagged, kinds) + `moduleSurface`; `type` decls need a small host-side scan (not in the token slice); *nesting* needs body extents → native export. Flat is still a big discoverability win. |
+| Document highlights | **have** | All same-file occurrences light up under the cursor | Shipped (D9.1): `referencesAt` verbatim + a `definitionAt` pairing to mark the decl as the Write occurrence. |
+| Document symbols | **partial** | Outline view, breadcrumbs, Ctrl+Shift+O | Shipped flat (D9.3): `tokensAt` decls (functions + module-level values) + host scan for `type` decls + `moduleSurface` exported flags. REMAINDER: *nesting* needs body extents → native export (§7), so breadcrumbs show the file's symbols but not "which function am I in". |
 | Workspace symbols | **missing** | Ctrl+T "open any exported symbol by name" | Served by `moduleSurface` over `enumerateWorkspaceFiles` — the unused-export pass already runs exactly this crawl; add a name index. |
 | Code actions | **partial** | 4 lint quick-fixes | More fixes = more lint codes; machinery is done. No refactoring-tier actions (extract fn etc. — needs AST edits the surface doesn't expose). |
-| Code lens | **missing** | Inline "run test" / "N references" / "run file" | Reference counts for exports are **already computed** (`lastUseMap`); test lenses = the discovery scan from §4. |
+| Code lens | **partial** | Inline "run test" / "N references" / "run file" | Shipped (D9.4): "N refs" per export off `lastUseMap` (no new crawl; locations resolve on click via the reference machinery, through the `vital.showReferences` client shim). REMAINDER: run/test lenses = the discovery scan from §4. |
 | Document links | **missing** | Ctrl+click an import specifier's path | `moduleSurface.imports` has keys but no spans; a host-side scan of `import … from "…"` lines suffices — no native work. |
 | Document colors | n/a | — | No color literals in VL. |
 | Formatting (document) | **have** | `vl fmt` on save | — |
@@ -133,7 +133,7 @@ parameter lists as structured data (only rendered type strings), declaration *bo
 | Terminal links | n/a | — | VS Code already auto-links `path:line:col` in terminals. |
 | Tree views | n/a | — | Test Explorer covers the one tree worth having; a module-graph tree is speculation. |
 | Webviews | n/a | — | The browser playground already exists outside VS Code; no in-editor webview earns its keep. |
-| Status bar | **missing** | Which seed the LSP loaded (path + rung) at a glance | `loadWasmChecker` already knows its origin; surface it via a custom LSP notification + status bar item. The seed-ladder staleness class of bugs (documented at length in `server.ts`) becomes visible instead of a debugging session. |
+| Status bar | **have** | Which seed the LSP loaded (path + rung) at a glance | Shipped (D9.2): `vital/seedOrigin` notification (origin payload or null) → one status-bar item per window; the no-seed state renders with a warning background instead of staying invisible. |
 | Custom editors | n/a | — | No non-text VL artifacts to edit. |
 | Notebook controllers | n/a | — | As above. |
 | Walkthroughs | missing | Onboarding checklist (install `vl`, open a file, run a test) | Pure manifest work; worth one afternoon when the extension is published, not before. |
@@ -143,10 +143,10 @@ parameter lists as structured data (only rendered type strings), declaration *bo
 | Quick diff / SCM | n/a | — | Git's problem, already solved. |
 | Chat / LM APIs | n/a | — | Out of scope for a language extension today. |
 
-**Counts** (this survey's rows, not the protocol spec's): LSP layer — 9 have, 3 partial,
-15 missing, 9 n/a. VS Code layer — 1 partial, 4 missing-worth-doing (Testing API, status
-bar, task provider, language-config rules) + 1 missing-later (walkthrough), 1 missing-large
-(DAP), 9 n/a.
+**Counts** (this survey's rows, not the protocol spec's; updated as D9 items land): LSP
+layer — 10 have, 5 partial, 12 missing, 9 n/a. VS Code layer — 1 have (status bar, D9.2),
+1 partial, 3 missing-worth-doing (Testing API, task provider, language-config rules) + 1
+missing-later (walkthrough), 1 missing-large (DAP), 9 n/a.
 
 ---
 

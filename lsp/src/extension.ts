@@ -6,9 +6,15 @@ import { spawnSync } from "node:child_process";
 import {
   commands as Commands,
   ExtensionContext,
+  Location,
   OutputChannel,
+  Position,
+  Range,
+  StatusBarAlignment,
+  StatusBarItem,
   Terminal,
   TextDocument,
+  ThemeColor,
   Uri,
   window as Window,
   workspace as Workspace,
@@ -23,9 +29,34 @@ import {
 
 import { STD_SOURCES } from "../../std/embedded.ts";
 import { stdUriPathToKey, VL_STD_SCHEME } from "./moduleGraph.ts";
+import { type SeedOriginInfo, seedStatusView } from "./typeFeatures.ts";
 
 let defaultClient: LanguageClient;
 const clients: Map<string, LanguageClient> = new Map();
+
+// ---- status-bar seed indicator (D9.2) ---------------------------------------
+//
+// ONE item per window, updated by whichever client last reported — each server
+// (one per outermost workspace folder, plus the untitled default) sends
+// `vital/seedOrigin` with the seed-ladder rung it loaded, or null when NO seed
+// loaded. The degraded state gets the warning background: every LSP feature is
+// silently empty without a seed, and that used to be invisible outside the
+// output channel (the survey's "a glance beats a debugging session").
+let seedStatusItem: StatusBarItem | undefined;
+
+const updateSeedStatus = (origin: SeedOriginInfo | null): void => {
+  if (seedStatusItem === undefined) {
+    seedStatusItem = Window.createStatusBarItem(StatusBarAlignment.Left, 0);
+    seedStatusItem.name = "Vital: compiler seed";
+  }
+  const view = seedStatusView(origin);
+  seedStatusItem.text = view.text;
+  seedStatusItem.tooltip = view.tooltip;
+  seedStatusItem.backgroundColor = view.degraded
+    ? new ThemeColor("statusBarItem.warningBackground")
+    : undefined;
+  seedStatusItem.show();
+};
 
 let _sortedWorkspaceFolders: string[] | undefined;
 const sortedWorkspaceFolders = () => {
@@ -95,6 +126,9 @@ const createClient = (
   client.start();
   // (A `registerProposedFeatures()` call used to sit AFTER `start()` — dead by
   // ordering, and no proposed LSP feature is in use; removed rather than moved.)
+  // The seed-origin status item (D9.2). Registered after `start()` — the v9
+  // client queues handler registrations until the connection is live.
+  client.onNotification("vital/seedOrigin", updateSeedStatus);
   return client;
 };
 
@@ -210,11 +244,56 @@ const registerRunCommand = (context: ExtensionContext) => {
   context.subscriptions.push(Commands.registerCommand("vital.runFile", run));
 };
 
+// The wire shape of one reference location in a server-sent command argument
+// (LSP `Location`, plain JSON — classes don't survive the connection).
+type WireLocation = {
+  uri: string;
+  range: {
+    start: { line: number; character: number };
+    end: { line: number; character: number };
+  };
+};
+
+// The click-through behind the export reference-count code lens (D9.4). The
+// server can't target `editor.action.showReferences` directly — its arguments
+// must be real `Uri`/`Position`/`Location` instances, and the LSP wire delivers
+// plain JSON — so the lens command points here and this shim revives the values
+// (the standard pattern; rust-analyzer ships the same shim).
+const registerShowReferences = (context: ExtensionContext) => {
+  context.subscriptions.push(
+    Commands.registerCommand(
+      "vital.showReferences",
+      (
+        uri: string,
+        position: { line: number; character: number },
+        locations: WireLocation[],
+      ) =>
+        Commands.executeCommand(
+          "editor.action.showReferences",
+          Uri.parse(uri),
+          new Position(position.line, position.character),
+          (locations ?? []).map((l) =>
+            new Location(
+              Uri.parse(l.uri),
+              new Range(
+                l.range.start.line,
+                l.range.start.character,
+                l.range.end.line,
+                l.range.end.character,
+              ),
+            )
+          ),
+        ),
+    ),
+  );
+};
+
 export const activate = (context: ExtensionContext) => {
   const module = context.asAbsolutePath(path.join("dist", "server.mjs"));
   const outputChannel: OutputChannel = Window.createOutputChannel("vital");
 
   registerRunCommand(context);
+  registerShowReferences(context);
 
   // Serve `vl-std:/NAME.vl` documents from the generated embedded std map, so a
   // cross-file location into a `std:` module (go-to-definition / peek on a std
@@ -276,6 +355,8 @@ export const activate = (context: ExtensionContext) => {
 };
 
 export const deactivate = async () => {
+  seedStatusItem?.dispose();
+  seedStatusItem = undefined;
   const promises: Thenable<void>[] = [];
   if (defaultClient) promises.push(defaultClient.stop());
   for (const client of clients.values()) promises.push(client.stop());

@@ -1,12 +1,17 @@
 import {
   CodeAction,
   CodeActionKind,
+  CodeLens,
+  CodeLensRefreshRequest,
   CompletionItem,
   CompletionItemKind,
   createConnection,
   Diagnostic,
   DiagnosticSeverity,
   DiagnosticTag,
+  DocumentHighlight,
+  DocumentHighlightKind,
+  DocumentSymbol,
   Hover,
   InlayHint,
   InlayHintKind,
@@ -16,6 +21,7 @@ import {
   ProposedFeatures,
   Range,
   SemanticTokens,
+  SymbolKind,
   TextDocuments,
   TextDocumentSyncKind,
   TextEdit,
@@ -46,6 +52,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   loadWasmChecker,
+  type SeedOrigin,
   type SeedSource,
   type WasmChecker,
   type WasmImportedSource,
@@ -59,12 +66,18 @@ import {
   type CompletionKind,
   displayableType,
   docMarkdown,
+  documentHighlightsFromRefs,
   type DocRefResolver,
+  exportRefLenses,
+  flatDocumentSymbols,
+  type HighlightKind,
   inlayHintsFromWasm,
   isDisplayableType,
   keywordCompletions,
   type LspRange,
   memberCompletionsFromWasm,
+  type OutlineSymbolKind,
+  refCountLensTitle,
   scopeCompletionsFromBindings,
   SEMANTIC_TOKEN_LEGEND,
   semanticTokensDataFromWasm,
@@ -273,6 +286,12 @@ const runUnusedExportPass = async (): Promise<void> => {
       diagnostics: [...cached, ...hints].map(toLspDiagnostic),
     });
   }
+
+  // The export-reference-count lenses (D9.4) read this map, so a fresh map
+  // means every visible lens count may have moved — ask the client to re-query
+  // them. Best-effort: a client without `workspace/codeLens/refresh` support
+  // still re-queries on its own edit/save heuristics.
+  connection.sendRequest(CodeLensRefreshRequest.type).catch(() => {});
 };
 
 documents.onDidChangeContent(async (event) => {
@@ -478,6 +497,107 @@ connection.onReferences(async (params): Promise<Location[] | null> => {
   }
   return null;
 });
+
+// Document highlights (D9.1): every same-file occurrence of the symbol under
+// the cursor lights up on cursor rest — `referencesAt` verbatim (the survey's
+// cheapest polish item), single-file by design (highlights only ever apply to
+// the current document, so the cross-module crawl `onReferences` falls back to
+// has no business here). The declaration renders as a Write, uses as Reads:
+// `referencesAt` returns bare ranges, so the decl is identified by one extra
+// `definitionAt` at the same cursor (~0.1–1.3 ms — same budget as the
+// reference query itself); if that rung is unavailable every occurrence
+// degrades to Read (see `documentHighlightsFromRefs`). No checker → null.
+const highlightKindMap: Record<HighlightKind, DocumentHighlightKind> = {
+  read: DocumentHighlightKind.Read,
+  write: DocumentHighlightKind.Write,
+};
+connection.onDocumentHighlight(
+  async (params): Promise<DocumentHighlight[] | null> => {
+    const doc = documents.get(params.textDocument.uri);
+    if (!doc) return null;
+    if (wasmChecker?.referencesAt === undefined) return null;
+    const text = doc.getText();
+    const entryKey = entryKeyOf(params.textDocument.uri);
+    const refs = await wasmChecker
+      .referencesAt(
+        text,
+        entryKey,
+        workspaceReader,
+        params.position.line,
+        params.position.character,
+        true, // the declaration is an occurrence to light up too
+      )
+      .catch((err) => {
+        connection.console.log(`[wasm-symbols] referencesAt failed: ${err}`);
+        return [] as WasmRange[];
+      });
+    if (refs.length === 0) return null;
+    const decl = wasmChecker.definitionAt !== undefined
+      ? await wasmChecker
+        .definitionAt(
+          text,
+          entryKey,
+          workspaceReader,
+          params.position.line,
+          params.position.character,
+        )
+        .catch(() => undefined)
+      : undefined;
+    return documentHighlightsFromRefs(refs, decl).map((h) => ({
+      range: h.range,
+      kind: highlightKindMap[h.kind],
+    }));
+  },
+);
+
+// Document symbols (D9.3): the FLAT outline — Outline view, breadcrumbs,
+// Ctrl+Shift+O. Functions + module-level `let`/`const` come from the checker's
+// decl-flagged identifier tokens (`tokensAt`), `type` aliases from the host
+// line scan, the exported flag from `moduleSurface` — all assembled by
+// `flatDocumentSymbols`. Flat is the shipped grade: nesting needs a
+// declaration-body-extent export the seed doesn't have (survey §6/§7), so
+// `range` and `selectionRange` are both the NAME span rather than a guessed
+// body. No checker → null.
+const outlineKindMap: Record<OutlineSymbolKind, SymbolKind> = {
+  function: SymbolKind.Function,
+  variable: SymbolKind.Variable,
+  constant: SymbolKind.Constant,
+  // VL types are structural objects, not nominal classes — same mapping as
+  // completion's `type` items.
+  type: SymbolKind.Struct,
+};
+connection.onDocumentSymbol(
+  async (params): Promise<DocumentSymbol[] | null> => {
+    const doc = documents.get(params.textDocument.uri);
+    if (!doc) return null;
+    if (wasmChecker?.tokensAt === undefined) return null;
+    const text = doc.getText();
+    const entryKey = entryKeyOf(params.textDocument.uri);
+    const idents = await wasmChecker
+      .tokensAt(text, entryKey, workspaceReader)
+      .catch((err) => {
+        connection.console.log(`[wasm-symbols] tokensAt failed: ${err}`);
+        return [] as WasmToken[];
+      });
+    const exportedNames = new Set(
+      wasmChecker.moduleSurface(text, entryKey).exports.map((e) => e.name),
+    );
+    return flatDocumentSymbols(idents, text, exportedNames).map((s) => {
+      const range = {
+        start: { line: s.line, character: s.char },
+        end: { line: s.line, character: s.char + s.length },
+      };
+      const sym: DocumentSymbol = {
+        name: s.name,
+        kind: outlineKindMap[s.kind],
+        range,
+        selectionRange: range,
+      };
+      if (s.exported) sym.detail = "export";
+      return sym;
+    });
+  },
+);
 
 // Extract the identifier `[A-Za-z_][A-Za-z0-9_]*` straddling `character` on
 // `line`, or null if the cursor isn't on a word. We scan outward from the
@@ -958,7 +1078,132 @@ connection.onCodeAction((params): CodeAction[] => {
   return actions;
 });
 
+// ---- code lens: export reference counts (D9.4) -------------------------------
+//
+// One lens per EXPORT declaration in the open file: "N refs" (cross-module +
+// same-file), read from `lastUseMap` — the use-map the unused-export workspace
+// pass ALREADY computes on every save. Rendering a lens therefore costs one
+// `moduleSurface` + a map lookup, no crawl; before the first pass has run (or
+// for an export added since it ran) there is simply no lens yet rather than an
+// invented count, and `runUnusedExportPass` requests a client-side lens
+// refresh whenever the map is rebuilt.
+//
+// The click-through is wired in `codeLens/resolve` — the expensive part
+// (reference LOCATIONS, via the same capped cross-file crawl find-references
+// uses) is paid on click, not on render. The resolved command is the
+// extension-side `vital.showReferences`, which revives the JSON-serialized
+// arguments into real `Uri`/`Position`/`Location` values and forwards to
+// `editor.action.showReferences` (the LSP wire strips classes, so the built-in
+// command can't be targeted directly — the standard shim, same as
+// rust-analyzer's).
+
+/** What a lens carries from compute to resolve (`CodeLens.data`, JSON-safe). */
+type RefLensData = {
+  uri: string;
+  name: string;
+  line: number; // 0-based decl-name line
+  character: number; // 0-based decl-name col
+  title: string;
+};
+
+connection.onCodeLens((params): CodeLens[] => {
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc || wasmChecker === undefined) return [];
+  const entryKey = entryKeyOf(params.textDocument.uri);
+  const surface = wasmChecker.moduleSurface(doc.getText(), entryKey);
+  return exportRefLenses(surface.exports, lastUseMap.get(entryKey)).map(
+    (l): CodeLens => ({
+      range: {
+        start: { line: l.line, character: l.char },
+        end: { line: l.line, character: l.char + l.length },
+      },
+      data: {
+        uri: params.textDocument.uri,
+        name: l.name,
+        line: l.line,
+        character: l.char,
+        title: refCountLensTitle(l.count),
+      } satisfies RefLensData,
+    }),
+  );
+});
+
+connection.onCodeLensResolve(async (lens): Promise<CodeLens> => {
+  const data = lens.data as RefLensData | undefined;
+  if (data === undefined) return lens;
+  // The locations behind the count: the same cross-file machinery as
+  // find-references, driven from the export's decl (`crossFileReferences`
+  // resolves the canonical export and unions per-candidate occurrences — the
+  // entry file's own uses included). A closed document / degraded checker
+  // resolves to an empty peek rather than an error.
+  const doc = documents.get(data.uri);
+  let locations: { uri: string; range: Range }[] = [];
+  if (doc && wasmChecker !== undefined) {
+    const entryKey = entryKeyOf(data.uri);
+    const openDocs = documents.all().map((d) => ({ uri: d.uri, text: d.getText() }));
+    const crawlRoot = workspaceFolder
+      ? uriToPath(workspaceFolder)
+      : detectProjectRoot(entryKey);
+    const refs = await crossFileReferences(
+      data.name,
+      doc.getText(),
+      entryKey,
+      openDocs,
+      workspaceReader,
+      wasmChecker,
+      true,
+      enumerateWorkspaceFiles(crawlRoot),
+    ).catch((err) => {
+      connection.console.log(`[code-lens] reference crawl failed: ${err}`);
+      return undefined;
+    });
+    if (refs !== undefined) locations = refs;
+  }
+  lens.command = {
+    title: data.title,
+    command: "vital.showReferences",
+    arguments: [
+      data.uri,
+      { line: data.line, character: data.character },
+      locations,
+    ],
+  };
+  return lens;
+});
+
 documents.listen(connection);
+
+// ---- status-bar seed indicator (D9.2) ---------------------------------------
+//
+// Which seed-ladder rung won is the first question of every "the extension is
+// doing nothing" debugging session, and it used to live only in the output
+// channel. Forward `loadWasmChecker`'s origin callback to the client as a
+// custom notification; `extension.ts` renders it in a status-bar item (see
+// `seedStatusView` in typeFeatures.ts). Payload: `SeedOrigin` (label + detail
+// path/command + byte count), or `null` when NO seed loaded — the degraded
+// state the survey calls out as previously invisible.
+//
+// Timing: the origin callback fires inside `onInitialize` (the ladder resolves
+// synchronously), but a server may not send notifications before the client's
+// `initialized` handshake — so the latest origin is cached and flushed on
+// `onInitialized`. A later re-fire (the winning rung's mtime moved and the
+// lazy reload picked a rung, possibly the same one) sends immediately.
+const SEED_ORIGIN_NOTIFICATION = "vital/seedOrigin";
+let clientInitialized = false;
+let seedOriginKnown = false;
+let lastSeedOrigin: SeedOrigin | undefined;
+const sendSeedOrigin = (): void => {
+  if (!clientInitialized || !seedOriginKnown) return;
+  connection
+    .sendNotification(SEED_ORIGIN_NOTIFICATION, lastSeedOrigin ?? null)
+    .catch((err) => {
+      connection.console.log(`[seed-origin] notify failed: ${err}`);
+    });
+};
+connection.onInitialized(() => {
+  clientInitialized = true;
+  sendSeedOrigin();
+});
 
 connection.onInitialize((params) => {
   workspaceFolder = params.rootUri;
@@ -1042,6 +1287,11 @@ connection.onInitialize((params) => {
     (msg) => connection.console.log(msg),
     getStdDir,
     (origin) => {
+      // Cache + forward the winning rung (or the no-seed state) to the client's
+      // status bar (D9.2) — see SEED_ORIGIN_NOTIFICATION above.
+      lastSeedOrigin = origin;
+      seedOriginKnown = true;
+      sendSeedOrigin();
       // SAY SO WHEN THERE IS NO CHECKER. Every handler returns an empty result
       // without one, which renders identically to a clean file — that is what made
       // the missing-seed case cost a debugging session rather than a glance.
@@ -1069,10 +1319,14 @@ connection.onInitialize((params) => {
       },
       definitionProvider: true,
       referencesProvider: true,
+      documentHighlightProvider: true,
+      documentSymbolProvider: true,
       documentFormattingProvider: true,
       codeActionProvider: {
         codeActionKinds: [CodeActionKind.QuickFix],
       },
+      // Export reference-count lenses (D9.4); locations resolve on click.
+      codeLensProvider: { resolveProvider: true },
       hoverProvider: true,
       inlayHintProvider: true,
       semanticTokensProvider: {

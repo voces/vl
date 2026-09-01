@@ -476,6 +476,247 @@ export const inlayHintsFromWasm = (
   return hints;
 };
 
+// ---- document highlights ----------------------------------------------------
+//
+// `textDocument/documentHighlight`: every same-file occurrence of the symbol
+// under the cursor lights up on cursor rest. The occurrence set is
+// `referencesAt` verbatim (the survey's "cheapest genuine polish item"); the
+// only shaping is the per-occurrence KIND — the LSP distinguishes a Write
+// (the declaration) from a Read (a use). The checker's `referencesAt` returns
+// bare ranges without the decl flag, so the host pairs it with `definitionAt`
+// (one extra query at the same cursor) and marks the occurrence matching the
+// declaring span as the write.
+
+/** LSP-neutral highlight kind; `server.ts` maps to `DocumentHighlightKind`. */
+export type HighlightKind = "read" | "write";
+
+/** One document highlight: an occurrence span + read/write classification. */
+export type DocumentHighlightSpan = { range: LspRange; kind: HighlightKind };
+
+const sameLspRange = (a: LspRange, b: LspRange): boolean =>
+  a.start.line === b.start.line && a.start.character === b.start.character &&
+  a.end.line === b.end.line && a.end.character === b.end.character;
+
+/**
+ * Shape a reference set into document highlights: the occurrence whose span
+ * equals `decl` (the binding's declaring span, from `definitionAt`) is a
+ * `write`, every other a `read`. With no known declaration (`decl` undefined —
+ * e.g. a seed predating `defAt`) every occurrence is a `read`: the kind is
+ * decoration, and "all reads" renders correctly while "wrong write" would not.
+ */
+export const documentHighlightsFromRefs = (
+  refs: LspRange[],
+  decl: LspRange | undefined,
+): DocumentHighlightSpan[] =>
+  refs.map((range) => ({
+    range,
+    kind: decl !== undefined && sameLspRange(range, decl) ? "write" : "read",
+  }));
+
+// ---- document symbols: flat outline (D9.3) ----------------------------------
+//
+// `textDocument/documentSymbol` as a FLAT list — the survey's shipped grade
+// (nesting needs a declaration-body-extent export the seed doesn't have; do
+// not fake it with brace counting). Sources, per the survey's sketch:
+//   - functions: every decl-flagged identifier of binding kind 2 (`tokensAt`);
+//   - module-level `let`/`const`: decl-flagged kind-0 identifiers whose line
+//     starts with the declaration itself (a fmt-indented local never does);
+//   - `type` aliases: a host-side line scan — type names are deliberately not
+//     in the token slice;
+//   - the exported flag: `moduleSurface().exports` names (types additionally
+//     read their own `export` prefix — the alias may not ride the surface).
+// Parameters and function-local bindings are excluded: an outline is a map of
+// the module, not a dump of every binding.
+
+/** LSP-neutral outline kind; `server.ts` maps to `SymbolKind`. */
+export type OutlineSymbolKind = "function" | "variable" | "constant" | "type";
+
+/** One flat outline entry. Position is the NAME span (0-based, LSP). */
+export type OutlineSymbol = {
+  name: string;
+  kind: OutlineSymbolKind;
+  line: number; // 0-based
+  char: number; // 0-based
+  length: number;
+  exported: boolean;
+};
+
+// A module-level value declaration: the text before the binding name on its
+// line is exactly the declaration prefix. Anchored at the LINE START — a local
+// inside a function body is indented (fmt guarantees it), a `for` loop
+// variable is preceded by `for `, and both rightly fail this.
+const MODULE_DECL_PREFIX = /^(export\s+)?(let|const)\s+$/;
+
+// A `type` alias declaration line: `type Name = …`, optionally exported.
+const TYPE_DECL_LINE = /^(export\s+)?type\s+([A-Za-z_][A-Za-z0-9_]*)/;
+
+/**
+ * The flat document-symbol outline for `source`: functions + module-level
+ * variables from the checker's decl-flagged identifier tokens, `type` aliases
+ * from a line scan, sorted by position. `exportedNames` (from `moduleSurface`)
+ * marks the exported entries; a degraded surface (empty set) just leaves every
+ * flag false rather than dropping symbols.
+ */
+export const flatDocumentSymbols = (
+  idents: IdentToken[],
+  source: string,
+  exportedNames: ReadonlySet<string>,
+): OutlineSymbol[] => {
+  const lines = source.split("\n");
+  const out: OutlineSymbol[] = [];
+  for (const t of idents) {
+    if (!t.isDecl || t.length <= 0) continue;
+    const lineText = lines[t.line] ?? "";
+    const name = lineText.slice(t.char, t.char + t.length);
+    if (name.length !== t.length) continue; // span off the line's end; defensive
+    let kind: OutlineSymbolKind;
+    if (t.bindKind === 2) {
+      kind = "function";
+    } else if (t.bindKind === 0) {
+      const m = MODULE_DECL_PREFIX.exec(lineText.slice(0, t.char));
+      if (m === null) continue; // a local / loop binding — not outline material
+      kind = m[2] === "const" ? "constant" : "variable";
+    } else {
+      continue; // parameters
+    }
+    out.push({
+      name,
+      kind,
+      line: t.line,
+      char: t.char,
+      length: t.length,
+      exported: exportedNames.has(name),
+    });
+  }
+  // `type` aliases: not in the token slice, so scanned from the source. The
+  // name starts where the matched prefix ends.
+  for (let i = 0; i < lines.length; i++) {
+    const m = TYPE_DECL_LINE.exec(lines[i]);
+    if (m === null) continue;
+    const name = m[2];
+    out.push({
+      name,
+      kind: "type",
+      line: i,
+      char: m[0].length - name.length,
+      length: name.length,
+      exported: m[1] !== undefined || exportedNames.has(name),
+    });
+  }
+  out.sort((a, b) => a.line - b.line || a.char - b.char);
+  return out;
+};
+
+// ---- code lens: export reference counts (D9.4) -------------------------------
+//
+// One lens per EXPORT declaration — "N refs", cross-module + same-file — read
+// from the use-map the unused-export workspace pass already computes on every
+// save (`lastUseMap` in server.ts). No new crawl: the lens layer only SHAPES
+// data the save pass maintains; the reference LOCATIONS (for the click-through
+// peek) are computed lazily in `codeLens/resolve`, so rendering lenses costs
+// one `moduleSurface` and a map lookup.
+
+/** One export decl to consider for a lens (native 1-based line, 0-based col). */
+export type ExportDeclForLens = {
+  name: string;
+  declLine: number;
+  declCol: number;
+};
+
+/** One shaped lens: the export's name span (0-based, LSP) + its total count. */
+export type ExportRefLens = {
+  name: string;
+  line: number; // 0-based
+  char: number; // 0-based
+  length: number;
+  count: number; // cross + local
+};
+
+/**
+ * Shape the export-reference-count lenses for a file: each export named in
+ * `counts` (the file's slice of the workspace use-map) gets one lens carrying
+ * `cross + local`. `counts` undefined — no workspace pass has run yet — yields
+ * no lenses rather than counts invented from nothing; an export missing from
+ * the map (added since the last pass) is likewise skipped, so a lens never
+ * shows a stale zero for a symbol the pass has not yet seen. First decl wins
+ * on a duplicate name, mirroring `unusedExportHints`.
+ */
+export const exportRefLenses = (
+  exports: ExportDeclForLens[],
+  counts: ReadonlyMap<string, ExportRefCountsForLens> | undefined,
+): ExportRefLens[] => {
+  if (counts === undefined) return [];
+  const out: ExportRefLens[] = [];
+  const seen = new Set<string>();
+  for (const e of exports) {
+    if (seen.has(e.name)) continue;
+    seen.add(e.name);
+    const c = counts.get(e.name);
+    if (c === undefined) continue;
+    out.push({
+      name: e.name,
+      line: e.declLine > 0 ? e.declLine - 1 : 0,
+      char: e.declCol,
+      length: e.name.length,
+      count: c.cross + c.local,
+    });
+  }
+  return out;
+};
+
+/** The use-map's per-export counts (structurally `ExportRefCounts`). */
+export type ExportRefCountsForLens = { cross: number; local: number };
+
+/** The lens title: `0 refs` / `1 ref` / `N refs`. */
+export const refCountLensTitle = (count: number): string =>
+  `${count} ref${count === 1 ? "" : "s"}`;
+
+// ---- status-bar seed indicator (D9.2) ---------------------------------------
+//
+// The seed ladder is the extension's number-one operational hazard: a stale or
+// missing seed degrades every feature to empty results, which renders exactly
+// like a clean file, and the answer ("which rung won?") used to live only in
+// the output channel. The server forwards `loadWasmChecker`'s origin callback
+// as a `vital/seedOrigin` notification; the extension renders it in one
+// status-bar item per window. This helper is the RENDERING — pure, so the
+// text/tooltip/degraded-state contract is testable without a VS Code host.
+
+/** The `vital/seedOrigin` payload: the winning rung, or null when NO seed loaded. */
+export type SeedOriginInfo = { label: string; detail: string; bytes: number };
+
+/** What the status bar shows. `degraded` → warning background + icon. */
+export type SeedStatusView = { text: string; tooltip: string; degraded: boolean };
+
+/** A byte count → a human size for the tooltip (`1.6 MiB` / `312 KiB`). */
+const humanBytes = (bytes: number): string =>
+  bytes >= 1024 * 1024
+    ? `${(bytes / (1024 * 1024)).toFixed(1)} MiB`
+    : `${Math.max(1, Math.round(bytes / 1024))} KiB`;
+
+/**
+ * Render a seed origin (or its absence) for the status bar. The degraded state
+ * is the one this feature exists for: NO seed means diagnostics, hover,
+ * completion and navigation are all silently empty, so it gets the `$(warning)`
+ * icon and a warning background rather than blending in.
+ */
+export const seedStatusView = (origin: SeedOriginInfo | null): SeedStatusView =>
+  origin === null
+    ? {
+      text: "$(warning) vl: no seed",
+      tooltip: "No VL compiler seed loaded — diagnostics, hover, completion " +
+        "and navigation are disabled. Put `vl` on PATH or set " +
+        "`vital.compilerWasm`; the Vital output channel lists every location " +
+        "tried.",
+      degraded: true,
+    }
+    : {
+      text: `vl: ${origin.label}`,
+      tooltip: `VL compiler seed — ${origin.label}\n${origin.detail} (${
+        humanBytes(origin.bytes)
+      })`,
+      degraded: false,
+    };
+
 // ---- completion (D3) --------------------------------------------------------
 
 /**

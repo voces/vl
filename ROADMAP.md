@@ -1729,11 +1729,12 @@ seed from current `compiler/*.vl` in ~40s.*
   graded against the shipped extension and the `WasmChecker` capabilities — statuses,
   feasibility notes, and the detail live THERE; this list is the order, not the spec).
   Worked serially, one worktree agent per item, gates + PR each; quick wins first:
-  1. ⬜ Document highlights (`referencesAt` verbatim, ~20 lines)
-  2. ⬜ Status-bar seed indicator (`onOrigin` already reports the winning rung)
-  3. ⬜ Document symbols — flat outline (`tokensAt` + `moduleSurface`; nesting needs a
-     body-extent export later)
-  4. ⬜ Code lens: export reference counts (`lastUseMap` is already computed every save)
+  1. ✅ Document highlights (`referencesAt` verbatim + `definitionAt` to mark the decl Write)
+  2. ✅ Status-bar seed indicator (`vital/seedOrigin` notification → one item per window)
+  3. ✅ Document symbols — flat outline (`tokensAt` + `moduleSurface` + a host scan for
+     `type` decls; nesting still needs a body-extent export later)
+  4. ✅ Code lens: export reference counts (`lastUseMap`, no new crawl; locations
+     resolve lazily on click)
   5. ⬜ Hover polish — ONE user-facing type-render pathway in the query layer owning
      `$mN` demangling (hover/inlay/member/alias leak it today; scopeAt's inline wraps
      collapse into it), and a FUNCTION-BINDING hover that zips the decl's parameter
