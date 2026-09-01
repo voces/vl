@@ -22582,10 +22582,10 @@ Repro (now runs, printing `0`):
 
 ---
 
-### D931 — a generic value carried in a generic STRUCT FIELD loses its type identity to the field's LAYOUT, and the program prints the wrong answer
-**check-clean SILENTLY WRONG VALUE — the worst outcome class in the scoreboard's vocabulary, and the first `runs but wrong value` cell filed since D832 · found 2026-09-01 by the vl-99 tooling session's generic-`expect` agent, re-verified here against master's own seed before filing · monomorphization keys carrier instances by LAYOUT, so `Expectation<boolean>` collapses onto `Expectation<i32>` · 15 lines, no closure, no union declaration, no `??`**
+### D931 — [CLOSED 2026-09-01] a generic value carried in a generic STRUCT FIELD loses its type identity to the field's LAYOUT, and the program prints the wrong answer
+**closed as `runs` · was check-clean SILENTLY WRONG VALUE, the worst class in the scoreboard's vocabulary · the filed diagnosis was one layer off, and disassembly is what said so: the INSTANCES were never collapsed — `gaeEnsure` mints one application row per substitution and `monoMakeInstance` keys on the pinned row names, so both `tag` instances and both rows exist — what both instances shared was the wrong box TAG, because a boolean field is CODE 0 (`fieldCodeOfSpelling`), layout-shared with i32, and `exprIsBool`'s fast path reads the checker's bank, which on a mono clone's SHARED leaf still says `T` · fix: one Member arm in `exprIsBool` reading the field's precise type from the receiver row's D0 arena sidecar (`sTyIx` → `tyFieldTyOf`) — additive, only a field the ARENA spells `boolean` turns true · layout sharing untouched, measured: same instances, same rows, same module byte size, `i32.const 0` → `i32.const 1` as the tag; mono-tyaram grid 159 OK / 102 REJECT / 0 BAD unchanged · distilled corpus: `runs → not-runs` ZERO, `→ silent` ZERO, the named cell moves `runs but wrong value → runs` and its three controls hold · fixture `tests/cases/generics/carrier-field-boolean-keeps-tag.vl`**
 
-Repro (prints `i32` twice; the first line SHOULD print `boolean`):
+Repro (now RUNS, printing `boolean`; before the fix it printed `i32`):
 
     type Expectation<T> = { actual: T, negated: boolean }
 
@@ -22602,19 +22602,23 @@ Repro (prints `i32` twice; the first line SHOULD print `boolean`):
 
     const _forceI32 = tag(expect(5))
     print(tag(expect(true)))
-    // vl check rc 0, runs, exit 0. SHOULD PRINT boolean.
-    // PRINTS i32
+    // vl check rc 0, runs, exit 0.
+    // PRINTS boolean
 
-* **`_forceI32` IS LOAD-BEARING, not scenery.** The collapse needs BOTH instances to exist —
-  it is `Expectation<boolean>` landing on `Expectation<i32>`'s layout key — so the repro
-  instantiates both and prints only one. Delete the binding and there is nothing to collide
-  with and the program prints `boolean` correctly. It is written this way because the grader
-  compares the whole of stdout against a single `// PRINTS` line, and a two-line witness
-  cannot be expressed in one.
+* **`_forceI32` WAS FILED AS LOAD-BEARING, AND THE CLOSE MEASURED THAT IT NEVER WAS.**
+  The filed row claimed "delete the binding and the program prints `boolean` correctly" —
+  re-run at close time against the same pre-fix seed, the LONE-instantiation form prints
+  `i32` too, and the two-instantiation p20 form printed `i32` for BOTH orders. Instance
+  count and order never mattered, which is exactly what the corrected mechanism predicts:
+  the field CODE is per-row and every `Expectation<...>` row codes a boolean `actual` as
+  0. The binding is kept because the witness must not be re-typed (a paraphrase is a
+  different program), and because the grader compares the whole of stdout against a
+  single `// PRINTS` line.
 * **THE CONTROL IS ONE STRUCTURAL STEP AWAY AND IT IS CORRECT.** `d931_ctl_raw_param.vl`
   passes the value as a RAW PARAMETER instead of through the carrier struct and prints
   `boolean` then `i32`, correctly. So the `is` ladder, the widened annotation and the six-arm
-  union are all fine; what is lost is the instance identity, and it is lost at the FIELD.
+  union are all fine; what is lost is the field's BOOLEAN-ness at the widening, and it is
+  lost at the FIELD CODE (0, layout-shared with i32).
 * **WHY THIS IS THE WORST CLASS.** `vl check` returns 0, the module builds, the program runs
   to completion and exits 0. Every instrument in this repo except a value comparison reports
   success. The corpus grades it `runs`; only the `@log` expectation catches it, which is why
@@ -22625,10 +22629,10 @@ Repro (prints `i32` twice; the first line SHOULD print `boolean`):
 * Fixing this plus D932 is what a fully generic `std:test` `expect` needs; the tooling session
   reports the design already probed working at roughly sixty lines.
 
-### D932 — an `is`-arm BODY is emitted in instances where the guard is statically false, and the arm uses the narrowed value
-**check-clean invalid wasm · found 2026-09-01 with D931, re-verified here · `soundness.md` promises the narrowing is decided statically, and the DECIDING works — what does not exist is arm-body PRUNING · seven lines, hole-generic, no annotation anywhere**
+### D932 — [CLOSED 2026-09-01] an `is`-arm BODY is emitted in instances where the guard is statically false, and the arm uses the narrowed value
+**closed as `runs` · was check-clean invalid wasm · the filed diagnosis held exactly: the deciding half worked (`monoStaticIsResult` folded the condition to `i32.const 0`) and arm-body pruning did not exist outside the whole-span-`{…}`-shape family · fix, two pieces in `wasmEmit.vl`: (1) `emitIfStmtStmt` / `emitIfTail` now prune the arm whose EMITTED condition is a constant — the gate is the bytes the module carries (`emittedCondConst`, `wLen`/`wPeekBack`), not a second predicate that re-derives `emitIs`'s ladder arm by arm, so the skip and the test cannot disagree; (2) `cursorSlotsUnder` advances `emitLetCursor` over every skipped statement — the PRE-EXISTING whole-span skip desynced the positional slot handout whenever the pruned arm held a `let` (a `let` in the arm plus a `let` after the `if` was invalid wasm on master), and the three `monoStaticGuardEndsBlock` truncation sites had the same hole · the tail-position twin (`emitIfTail`) was broken the same way and is fixed and pinned · distilled corpus: `runs → not-runs` ZERO, `→ silent` ZERO, the named cell moves `check-clean invalid wasm → runs`, the control holds · fixtures `tests/cases/soundness/is-generic-static-false-arm-narrowed-use.vl`, `-tail-position.vl`, `is-generic-pruned-arm-keeps-let-slots.vl`**
 
-Repro:
+Repro (now RUNS, printing `"hi"` then `other`):
 
     function show(v): string {
       if v is string { return "\"" + v + "\"" }
@@ -22637,20 +22641,18 @@ Repro:
 
     print(show("hi"))
     print(show(5))
-    // vl check rc 0; vl run:
-    //   Invalid input WebAssembly code at offset 388: type mismatch: expected (ref $type)
-    // SHOULD PRINT "hi" (quoted) then other.
+    // vl check rc 0; runs, prints "hi" (quoted) then other.
 
 * **THE DECIDING HALF ALREADY WORKS**, which is what makes this a pruning gap rather than a
   narrowing one: `d932_ctl_const_arms.vl` has the same shape with arms that do not USE the
-  narrowed value and it runs. The `i32` instance is emitted with a body that concatenates a
+  narrowed value and it runs. The `i32` instance was emitted with a body that concatenates a
   string it can never hold.
 * The explicit-`<T>` twin behaves the same, so this is not about inference.
 
-### D933 — generic widening plus a second REF type as `T`: a narrowed use of the other ref arm extracts the wrong heap type
-**check-clean invalid wasm · found 2026-09-01 with D931/D932 · `expected (ref $type), found (ref $type)` at offset 358 with `T = Circle` · TWO controls, both running, isolate it to the narrowed USE**
+### D933 — [CLOSED 2026-09-01] generic widening plus a second REF type as `T`: a narrowed use of the other ref arm extracts the wrong heap type
+**closed as `runs` · was check-clean invalid wasm · closed by D932's fix with NO second change, and that was ABLATED, not assumed: disassembly of the pre-fix module shows the `T = Circle` instance holds `aw` as the RAW variant ref (no box — the value can hold none of the union's other arms) and `aw is string` had ALREADY folded to `i32.const 0`, so the arm was not live after all — it was D932's unpruned statically-false arm one rep over, its body extracting a string from the Circle ref · the row's caution ("do not assume one fix serves both — verify, and if it does, say so") is answered: one fix, both witnesses re-run verbatim under it — D932 prints `"hi"` / `other`, this row prints `o` / `"hi"` — and both controls still run · distilled corpus: `runs → not-runs` ZERO, `→ silent` ZERO, the named cell moves `check-clean invalid wasm → runs` · fixture `tests/cases/generics/widen-union-structT-narrowed-string-arm.vl`**
 
-Repro:
+Repro (now RUNS, printing `o` then `"hi"`):
 
     type Circle = { r: i32 }
 
@@ -22663,18 +22665,17 @@ Repro:
     const c: Circle = { r: 3 }
     print(tag(c))
     print(tag("hi"))
-    // vl check rc 0; vl run:
-    //   Invalid input WebAssembly code at offset 358: type mismatch:
-    //   expected (ref $type), found (ref $type)
-    // SHOULD PRINT o then "hi" (quoted).
+    // vl check rc 0; runs, prints o then "hi" (quoted).
 
 * **BOTH CONTROLS RUN, and they bracket the defect from opposite sides.**
   `d933_ctl_const_arms.vl` — the same widening with six CONSTANT arms, no narrowed use —
   runs. `d933_ctl_direct.vl` — the same narrowed use written DIRECTLY, without the generic —
   runs. So neither the widening nor the use is the defect on its own; it is the pair.
-* Same family as D932 (a narrowed use inside a generic instance) but a different rung: D932's
-  arm is statically dead and emitted anyway, while D933's arm is live and extracts the wrong
-  heap type. Do not assume one fix serves both — verify, and if it does, say so.
+* Same family as D932 (a narrowed use inside a generic instance) — and, measured at the
+  close, the SAME rung: the "live arm extracting the wrong heap type" reading was wrong,
+  because the instance's rep had already decided the guard statically and only the pruning
+  was missing. The direct spelling runs because the direct `aw` is a real three-arm box
+  with a runtime tag; the generic instance's `aw` is a rep the fold already answers.
 
 
 ## 6. Coverage gaps — axes not built, and why
