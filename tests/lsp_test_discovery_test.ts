@@ -13,6 +13,8 @@
 
 import {
   discoverTests,
+  failureAnchor,
+  failureLocation,
   filterFor,
   flattenTests,
   leafPaths,
@@ -471,4 +473,179 @@ Deno.test("parse: empty input is an empty report, not a crash", () => {
     [0, 0, 0, null],
     "nothing in, nothing out",
   );
+});
+
+// ---- the failure anchor (track-caller) ---------------------------------------
+//
+// `std:test`'s `expect` reports the call site it was written at, as a second line
+// under the assertion sentence. This is the REAL fix D9 slot 12 named: the
+// heuristic it supersedes could only ever anchor a body with exactly one
+// `expect`, and could never reach a failure inside a HELPER file at all.
+//
+// Captured verbatim from `vl test hop.test.vl` (relative target, so the module
+// keys are relative too) on 2026-09-01 — the fixture exercises all four hop
+// shapes at once: a same-file helper that forwards its `caller`, one that does
+// not, the same pair across a module boundary, and the `not()` chain.
+const HOP_REPORT = [
+  "hop.test.vl",
+  "  FAIL same-file forwarding helper names its caller",
+  "       expected 2 to equal 1",
+  "         at hop.test.vl:15:3",
+  "  FAIL same-file plain helper names its own expect",
+  "       expected 2 to equal 1",
+  "         at hop.test.vl:11:3",
+  "  FAIL cross-file forwarding helper names its caller",
+  "       expected 2 to equal 1",
+  "         at hop.test.vl:23:3",
+  "  FAIL cross-file plain helper names the HELPER file",
+  "       expected 2 to equal 1",
+  "         at helper.vl:10:3",
+  "  FAIL the not() chain keeps the expect site",
+  "       expected 1 not to equal 1",
+  "         at hop.test.vl:31:3",
+  "1 file · 0 passed · 5 failed",
+  "",
+].join("\n");
+
+Deno.test("anchor: every failing expect carries the location it was written at", () => {
+  const r = parseTestReport(HOP_REPORT);
+  eq(
+    r.results.map((x) => x.location),
+    [
+      { file: "hop.test.vl", line: 15, col: 3 },
+      { file: "hop.test.vl", line: 11, col: 3 },
+      { file: "hop.test.vl", line: 23, col: 3 },
+      // ONE HOP: a helper that does not forward reports its OWN expect, which is
+      // in another file entirely. No scan of the test body could have found it.
+      { file: "helper.vl", line: 10, col: 3 },
+      { file: "hop.test.vl", line: 31, col: 3 },
+    ],
+    "one location per failure, helper file included",
+  );
+  eq(
+    r.results[0].message,
+    "expected 2 to equal 1\n  at hop.test.vl:15:3",
+    "the message stays WHOLE — the location line is kept, not consumed",
+  );
+});
+
+Deno.test("anchor: a failure with no expect behind it carries no location", () => {
+  // `fail(msg)` and a raw trap both reach the runner without one, and a
+  // `<compile>` error is not a test result at all. Each must leave `location`
+  // undefined so the caller falls back to the `it` line rather than guessing.
+  const text = [
+    "/x/t.test.vl",
+    "  FAIL fails outright",
+    "       no branch reached",
+    "  FAIL traps outright",
+    "       wasm trap: wasm `unreachable` instruction executed",
+    "1 file · 0 passed · 2 failed",
+  ].join("\n");
+  const r = parseTestReport(text);
+  eq(
+    r.results.map((x) => x.location),
+    [undefined, undefined],
+    "no location invented for a message that has none",
+  );
+});
+
+Deno.test("anchor: captured output cannot forge a location", () => {
+  // The scan stops at the `--- captured output ---` sentinel, so a program that
+  // prints a location-shaped line cannot move the anchor. This is why `std:test`
+  // puts the location on its own line and the parser matches it ANCHORED: the
+  // failure sentence itself ends in a rendered operand, which is user text.
+  const text = [
+    "/x/t.test.vl",
+    "  FAIL real",
+    "       expected 1 to equal 2",
+    "         at real.vl:4:5",
+    "       --- captured output ---",
+    "         at forged.vl:99:99",
+    "1 file · 0 passed · 1 failed",
+  ].join("\n");
+  const r = parseTestReport(text);
+  eq(
+    r.results[0].location,
+    { file: "real.vl", line: 4, col: 5 },
+    "the pre-sentinel location wins",
+  );
+});
+
+Deno.test("anchor: an operand that reads like a location does not become one", () => {
+  // `expect("at a.vl:1:1").toEqual("x")` renders the operand INSIDE the sentence,
+  // which the anchored two-space match cannot mistake for std:test's own line.
+  const one = failureLocation(
+    'expected "at a.vl:1:1" to equal "x"\n  at real.vl:7:3',
+  );
+  eq(
+    one,
+    { file: "real.vl", line: 7, col: 3 },
+    "the real line, not the operand",
+  );
+  // A `fail()` whose text happens to BE a location-shaped line: std:test's own
+  // line always comes last in the failure text, so the last match wins.
+  const two = failureLocation("  at decoy.vl:1:1\n  at real.vl:7:3");
+  eq(two, { file: "real.vl", line: 7, col: 3 }, "the last match is std:test's");
+  eq(
+    failureLocation("expected 1 to equal 2"),
+    undefined,
+    "no line, no location",
+  );
+});
+
+Deno.test("anchor: a Windows-style drive path survives the colon split", () => {
+  // The file group is greedy, so `C:\x\t.test.vl:9:3` splits at the LAST two
+  // colons rather than the drive's.
+  eq(
+    failureLocation("expected 1 to equal 2\n  at C:\\x\\t.test.vl:9:3"),
+    { file: "C:\\x\\t.test.vl", line: 9, col: 3 },
+    "drive letter kept with the path",
+  );
+});
+
+Deno.test("anchor: a location resolves against the cwd the runner ran in", () => {
+  // `std:test` spells `file` exactly as the `vl test` target was spelled, so both
+  // sides are resolved the same way before they are compared.
+  const rel = failureAnchor(
+    { file: "hop.test.vl", line: 15, col: 3 },
+    "/w/tc",
+    "hop.test.vl",
+  );
+  eq(
+    rel,
+    { file: "/w/tc/hop.test.vl", isTarget: true, line: 14, col: 2 },
+    "the run's own file, in 0-based editor coordinates",
+  );
+  const helper = failureAnchor(
+    { file: "helper.vl", line: 10, col: 3 },
+    "/w/tc",
+    "hop.test.vl",
+  );
+  eq(
+    helper,
+    { file: "/w/tc/helper.vl", isTarget: false, line: 9, col: 2 },
+    "a helper file anchors in ITS file, not the test's",
+  );
+  // The absolute spelling the extension actually uses.
+  eq(
+    failureAnchor(
+      { file: "/w/tc/hop.test.vl", line: 1, col: 1 },
+      "/w",
+      "/w/tc/hop.test.vl",
+    ),
+    { file: "/w/tc/hop.test.vl", isTarget: true, line: 0, col: 0 },
+    "absolute target, absolute key, still the target",
+  );
+});
+
+Deno.test("anchor: an unsaved buffer's MIRROR still counts as the target", () => {
+  // A dirty buffer runs from `.t.vital-dirty.vl` beside the original, so the
+  // module key names the mirror. `isTarget` is what tells the caller to map it
+  // back to the document's uri instead of opening a dotfile the user never made.
+  const at = failureAnchor(
+    { file: "/w/.t.vital-dirty.vl", line: 5, col: 3 },
+    "/w",
+    "/w/.t.vital-dirty.vl",
+  );
+  eq(at.isTarget, true, "the mirror is the target");
 });

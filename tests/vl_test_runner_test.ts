@@ -8,7 +8,10 @@
 //   * a test file that does not COMPILE is one failing entry and the run continues;
 //   * a green run exits 0, any failure exits 1, a usage error exits 2;
 //   * files really are SCHEDULED in parallel (their stamped run intervals
-//     overlap under `--jobs 4` and are disjoint under `--jobs 1`).
+//     overlap under `--jobs 4` and are disjoint under `--jobs 1`);
+//   * a failed `expect` reports WHERE IT WAS WRITTEN (track-caller), and that
+//     position is the `expect` line rather than the `it` line — the claim the
+//     editor's failure anchor is built on.
 //
 // The report is built entirely in VL (`compiler/cli.vl`) — the host contributes
 // only wasm instances, the thread pool and trap catching — so these assertions
@@ -16,6 +19,12 @@
 //
 // GATING: same as tests/selfhost_native_align_test.ts — env-gated
 // (`SELFHOST_NATIVE_ALIGN=1`) AND requires the built binary + seed wasm.
+
+// The extension's own report parser and anchor resolver, so the editor payoff is
+// graded against the RUNNER'S REAL OUTPUT rather than a retyped sample. Pure —
+// `testDiscovery.ts` imports no `vscode` (tests/lsp_test_discovery_test.ts is the
+// unit half of the same pair).
+import { failureAnchor, parseTestReport } from "../lsp/src/testDiscovery.ts";
 
 const exists = (p: string): boolean => {
   try {
@@ -121,6 +130,190 @@ Deno.test({
     // The tests either side of a failure still ran.
     expectHas(r.err, "ok   passes before the failure");
     expectHas(r.err, "ok   passes after the failure");
+    // TRACK-CALLER: every one of those assertion sentences is followed by the
+    // position it was written at. The sentences above are unchanged — the
+    // location is a SECOND LINE, so every pin in this file stayed a prefix match
+    // when it landed. `fail(msg)` carries no location and must not grow a
+    // forged one.
+    expectHas(r.err, `at ${FIXTURES}/fail.test.vl:`);
+    const failLine = lines(r.err)
+      .findIndex((l) => l.includes("no branch reached"));
+    if (lines(r.err)[failLine + 1].startsWith("at ")) {
+      throw new Error(`fail(msg) must carry no location:\n${r.err}`);
+    }
+  },
+});
+
+Deno.test({
+  name: "vl-test: a failure ANCHORS at its own expect line, not at the it line",
+  ignore: !ENABLED,
+  fn: async () => {
+    // THE EDITOR PAYOFF, end to end: run the real runner, parse the real report
+    // with the extension's own parser, and check the position against the
+    // fixture's own source. Line numbers are READ OUT of the fixture rather than
+    // written down here, so the pin survives the file moving and fails loudly if
+    // the statements it names ever disappear.
+    const src = await Deno.readTextFile(`${FIXTURES}/fail.test.vl`);
+    const srcLines = src.split("\n");
+    const lineOf = (needle: string): number => {
+      const i = srcLines.findIndex((l) => l.includes(needle));
+      if (i < 0) {
+        throw new Error(
+          `fail.test.vl no longer contains ${JSON.stringify(needle)} — this ` +
+            "test reads its expected position out of the fixture",
+        );
+      }
+      return i + 1; // the runner counts lines from 1
+    };
+    const itLine = lineOf('it("fails an assertion"');
+    const expectLine = lineOf("expect(7).toEqual(8)");
+    const expectCol = srcLines[expectLine - 1].indexOf("expect(") + 1;
+    if (itLine === expectLine) {
+      throw new Error(
+        "the fixture must keep the `it` and its `expect` on different lines — " +
+          "otherwise this test cannot tell the anchor from the fallback",
+      );
+    }
+
+    const r = await runTest(`${FIXTURES}/fail.test.vl`);
+    const parsed = parseTestReport(r.err);
+    const result = parsed.results.find((x) => x.path === "fails an assertion");
+    if (result === undefined) {
+      throw new Error(`no result for "fails an assertion":\n${r.err}`);
+    }
+    const got = JSON.stringify(result.location);
+    const want = JSON.stringify({
+      file: `${FIXTURES}/fail.test.vl`,
+      line: expectLine,
+      col: expectCol,
+    });
+    if (got !== want) {
+      throw new Error(
+        `the failure anchored in the wrong place\n  want ${want}\n  got  ${got}` +
+          `\n${r.err}`,
+      );
+    }
+
+    // The claim spelled out: the message lands on the EXPECT, and the `it` line
+    // — what the D9 slot 12 heuristic would have given — is a different line.
+    const at = failureAnchor(
+      result.location!,
+      ROOT,
+      `${FIXTURES}/fail.test.vl`,
+    );
+    if (!at.isTarget) {
+      throw new Error(`the anchor left the file under test: ${at.file}`);
+    }
+    if (at.line !== expectLine - 1 || at.line === itLine - 1) {
+      throw new Error(
+        `the editor anchor is line ${at.line} (0-based); want ${
+          expectLine - 1
+        }, and NOT the it line ${itLine - 1}`,
+      );
+    }
+
+    // `fail(msg)` has no expect behind it, so the extension keeps today's
+    // it-line fallback rather than being handed a wrong position.
+    const outright = parsed.results.find((x) => x.path === "fails outright");
+    if (outright?.location !== undefined) {
+      throw new Error(
+        `fail(msg) must carry no location, got ${
+          JSON.stringify(outright.location)
+        }`,
+      );
+    }
+  },
+});
+
+Deno.test({
+  name:
+    "vl-test: ONE HOP — a forwarding helper reports its caller, a plain one reports itself",
+  ignore: !ENABLED,
+  fn: async () => {
+    // The semantics the owner ruled on: a `CallerLoc` is one location, never a
+    // chain. A wrapper that takes its own `caller: CallerLoc = __callsite__` and
+    // forwards it EXPLICITLY reports the line that called the wrapper; one that
+    // does not forward reports its own `expect` — which may be in a DIFFERENT
+    // FILE, the case no scan of the test body could ever have anchored.
+    //
+    // A temp dir rather than a new file under tests/fixtures/vl-test: the
+    // fixtures' aggregate `N files · P passed · F failed` pin is shared with
+    // every other case in this file, and this claim needs a helper module beside
+    // the test rather than another entry in that count.
+    const dir = await Deno.makeTempDir({ prefix: "vl_test_caller_" });
+    try {
+      await Deno.writeTextFile(
+        `${dir}/helper.vl`,
+        'import { CallerLoc, expect, toEqual } from "std:test"\n' +
+          "\n" +
+          "export function forwards(v: i32, caller: CallerLoc = __callsite__) {\n" +
+          "  expect(v, caller).toEqual(1)\n" +
+          "}\n" +
+          "\n" +
+          "export function keepsItself(v: i32) {\n" +
+          "  expect(v).toEqual(1)\n" +
+          "}\n",
+      );
+      await Deno.writeTextFile(
+        `${dir}/hop.test.vl`,
+        'import { it } from "std:test"\n' +
+          'import { forwards, keepsItself } from "./helper"\n' +
+          "\n" +
+          'it("forwarded", () => {\n' +
+          "  forwards(2)\n" +
+          "})\n" +
+          "\n" +
+          'it("kept", () => {\n' +
+          "  keepsItself(2)\n" +
+          "})\n",
+      );
+      const r = await runTest(`${dir}/hop.test.vl`);
+      const parsed = parseTestReport(r.err);
+      const at = (path: string) =>
+        JSON.stringify(parsed.results.find((x) => x.path === path)?.location);
+
+      // `forwards(2)` is line 5 of hop.test.vl, column 3.
+      const forwarded = JSON.stringify({
+        file: `${dir}/hop.test.vl`,
+        line: 5,
+        col: 3,
+      });
+      if (at("forwarded") !== forwarded) {
+        throw new Error(
+          `a forwarded caller must name the HELPER'S CALLER\n  want ${forwarded}` +
+            `\n  got  ${at("forwarded")}\n${r.err}`,
+        );
+      }
+      // `expect(v).toEqual(1)` is line 8 of helper.vl, column 3 — another file.
+      const kept = JSON.stringify({
+        file: `${dir}/helper.vl`,
+        line: 8,
+        col: 3,
+      });
+      if (at("kept") !== kept) {
+        throw new Error(
+          `an unforwarded caller must name the helper's own expect\n  want ${kept}` +
+            `\n  got  ${at("kept")}\n${r.err}`,
+        );
+      }
+
+      // And the editor resolves that second one into the helper file, not the
+      // test file — `isTarget` false is what tells the extension to open it.
+      const anchor = failureAnchor(
+        parsed.results.find((x) => x.path === "kept")!.location!,
+        dir,
+        `${dir}/hop.test.vl`,
+      );
+      if (anchor.isTarget || anchor.file !== `${dir}/helper.vl`) {
+        throw new Error(
+          `the helper's failure must anchor in helper.vl, got ${
+            JSON.stringify(anchor)
+          }`,
+        );
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
   },
 });
 

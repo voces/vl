@@ -121,6 +121,67 @@
 // `it("x", () => { expect(1).toEqual(1) })` fails to typecheck with
 // `expected () -> void, got () -> i32`.
 
+// ── WHERE THE FAILURE HAPPENED — `CallerLoc` and the one-hop rule ──────────────
+// A failed `expect` now names its own call site. The mechanism is default
+// arguments v1 (DECISIONS "Default arguments v1"), not a magic type: `expect`'s
+// trailing `caller: CallerLoc = __callsite__` is filled by the compiler AT THE
+// CALL, in the caller's frame, and is an ordinary parameter everywhere else.
+//
+// ONE HOP, NEVER A CHAIN (owner ruling, 2026-09-01). A `CallerLoc` is one
+// location. A helper that wraps `expect` takes its OWN `caller: CallerLoc =
+// __callsite__` and forwards it EXPLICITLY — ordinary code, no transitivity
+// machinery — and the failure then names the helper's caller instead of the line
+// inside the helper. Nothing in this module walks a parent link; a breadcrumb
+// trail, if it is ever wanted, is a library pattern over this same value and
+// needs no language addition.
+//
+// WHY THE TYPE IS EXPORTED, AND WHY FROM HERE. The intrinsic is checked
+// STRUCTURALLY against `{ file: string, line: i32, col: i32 }`, so the compiler
+// never learns this name and any structurally identical alias satisfies it
+// (measured 2026-09-01, both ways: a user-declared `type L = { file: string,
+// line: i32, col: i32 }` takes `__callsite__`, and this alias does). The name is
+// exported anyway because the forwarding helper above is the pattern that has to
+// NAME the type in a signature, and a test helper is a `std:test` consumer by
+// construction — making a user re-spell the three fields to write one is exactly
+// the "invisible rule about a type name" the defaults ruling avoided. It is NOT
+// in `std:fmt`: this module's dependency surface is deliberately ZERO (the
+// `vltDigit` paragraph below — the surface that reports failures in everything
+// else must not import the thing it reports on), and it is not its own module
+// because a whole module key for one three-field alias with one consumer is the
+// speculative surface a version-locked std cannot take back. Structural checking
+// is what makes that reversible: if a second consumer ever wants a different
+// home, an alias there is the SAME type, not a competing one.
+//
+// `file` IS THE CALLER'S MODULE KEY — the same string `vl test` prints as its
+// file header, spelled exactly as the CLI target was (measured 2026-09-01:
+// absolute for `vl test /abs/x.test.vl`, `x.test.vl` for the relative spelling).
+// DECISIONS records the caveat that a single-source compile with NO module table
+// answers `""`, because nothing in that pipeline knows the entry's path. Every
+// `std:test` consumer imports `std:test`, so it always HAS a module table
+// (measured: a file whose only import is `std:test` names itself) — the `""` case
+// is unreachable from here. `vltLocStr` guards it anyway, because `at :9:1` would
+// be worse than no location at all.
+//
+// `line`/`col` are 1-based and anchor on the CALLEE's own token — the `expect` in
+// `expect(x).toEqual(y)`, not the `.toEqual` and not the `it` line. That is the
+// position this feature exists to report, and it is what Swift's `#line` and
+// Rust's `Location::caller()` name for the same call.
+//
+// THE LOCATION RENDER IS LAZY, unlike the receipt's. `shown` is eager because it
+// is T-DEPENDENT and the lazy spellings are the miscompiling ones (the D941
+// paragraph above); `caller` is a concrete `CallerLoc` at every instantiation, so
+// none of that applies and it is rendered only on the failure path. A passing
+// `expect` therefore pays one struct copy into the receipt and nothing else.
+//
+// `fail(msg)` does NOT take a location in this version — one surface at a time,
+// and its argument is the author's own sentence rather than a rendered assertion.
+// `it`/`describe` likewise keep their signatures; a registration site is not an
+// assertion site.
+
+// A CALL SITE, as a value. `file` is the caller's module key; `line`/`col` are
+// 1-based and point at the callee's own token.
+export type CallerLoc = { file: string, line: i32, col: i32 }
+
 // ── the registry ────────────────────────────────────────────────────────────────
 // PARALLEL ARRAYS, the compiler driver's own idiom (`modKeys`/`modPending`/…): one
 // entry per registered test, index `i` is the protocol's test id.
@@ -245,6 +306,10 @@ function vltInScope(hook: string, test: string) {
 //              receiver keeps v1's semantics (compiles, fails at runtime)
 //   hasEcho / echo   — an f64's digits, printed on failure because the message
 //              renders f64 as `<f64>` (std-design D4 defers f64→string)
+//   caller   — where the `expect(...)` was written (the CallerLoc section above).
+//              Carried RAW and rendered only on the failure path: it is
+//              T-independent, so the eagerness `shown` is forced into does not
+//              apply to it.
 type Expectation<T> = {
   actual: T,
   negated: boolean,
@@ -252,7 +317,8 @@ type Expectation<T> = {
   isBool: boolean,
   boolVal: boolean,
   hasEcho: boolean,
-  echo: f64
+  echo: f64,
+  caller: CallerLoc
 }
 
 // PRIVATE, and never named by a signature: its REGISTRATION is the point (the
@@ -272,7 +338,16 @@ type VltAtomReps = i32 | i64 | f64 | boolean | string
 // lives in `vltShow`, and the two arms kept here bank the receipt facts a
 // rendering cannot carry (which boolean; the f64 echo). Each non-atom
 // instantiation prunes the atom arms and keeps the defaults.
-export function expect<T>(value: T): Expectation<T> {
+//
+// `caller` is the ONE parameter a call site normally omits: the compiler fills it
+// with this call's own position (the `CallerLoc` section above). Pass it
+// explicitly to forward a wrapper's location — `expect(v, caller)` inside a
+// helper that took `caller: CallerLoc = __callsite__` — which is the whole of the
+// one-hop story.
+export function expect<T>(
+  value: T,
+  caller: CallerLoc = __callsite__,
+): Expectation<T> {
   let isBool = false
   let boolVal = false
   let hasEcho = false
@@ -293,6 +368,7 @@ export function expect<T>(value: T): Expectation<T> {
     boolVal: boolVal,
     hasEcho: hasEcho,
     echo: echo,
+    caller: caller,
   }
 }
 
@@ -308,6 +384,7 @@ export function not<T>(self: Expectation<T>): Expectation<T> {
     boolVal: self.boolVal,
     hasEcho: self.hasEcho,
     echo: self.echo,
+    caller: self.caller,
   }
 }
 
@@ -380,17 +457,46 @@ function vltShow<T>(value: T): string {
   shown
 }
 
+// `file:line:col`, or "" when the location cannot name a file. The empty case is
+// unreachable through this module — every consumer imports `std:test`, which is a
+// module table, and only a table-less single-source compile answers `""` — but a
+// message reading `at :9:1` would be worse than one with no location at all, so
+// the guard is here rather than assumed away.
+function vltLocStr(loc: CallerLoc) {
+  if loc.file.length == 0 { return "" }
+  loc.file + ":" + vltI64Str(loc.line as i64) + ":" + vltI64Str(loc.col as i64)
+}
+
 // Assemble the failure message from ALREADY-RENDERED strings and abort. Reached
 // ONLY on failure. Non-generic on purpose: everything T-shaped was resolved by
 // the callers, so this is one shared body, not one per instantiation.
 // `kind`: 0 = toEqual, 1 = toBeTrue, 2 = toBeFalse.
-function vltFail(shownA: string, negated: boolean, kind: i32, shownE: string) {
+//
+// The location rides on its OWN LINE, `"\n  at <file>:<line>:<col>"`, and the
+// assertion sentence above it is byte-identical to what v2 shipped. Both halves
+// of that are deliberate. A suffix on the sentence would put a machine-read field
+// at the end of a line whose earlier content is arbitrary user text (a rendered
+// string operand can contain anything, `at x.vl:1:1` included); a dedicated line
+// is matched anchored, which is what the extension's report parser does. And
+// leaving the sentence alone keeps every existing message pin a PREFIX match
+// rather than a rewrite — `tests/vl_test_runner_test.ts` needed no edit to its
+// message assertions, only new ones for the location.
+function vltFail(
+  shownA: string,
+  negated: boolean,
+  kind: i32,
+  shownE: string,
+  loc: CallerLoc,
+) {
   let tail = "be true"
   if kind == 0 { tail = "equal " + shownE }
   if kind == 2 { tail = "be false" }
   let sense = "to "
   if negated { sense = "not to " }
-  vltAbort("expected " + shownA + " " + sense + tail)
+  let msg = "expected " + shownA + " " + sense + tail
+  const at = vltLocStr(loc)
+  if at.length > 0 { msg = msg + "\n  at " + at }
+  vltAbort(msg)
 }
 
 // `.toEqual` — equality at T's own `==`, jest semantics: value equality per
@@ -408,7 +514,7 @@ export function toEqual<T>(self: Expectation<T>, expected: T) {
   if bad {
     if self.hasEcho { print(self.echo) }
     if expected is f64 { print(expected) }
-    vltFail(self.shown, self.negated, 0, vltShow(expected))
+    vltFail(self.shown, self.negated, 0, vltShow(expected), self.caller)
   }
   vltDone()
 }
@@ -422,7 +528,7 @@ export function toBeTrue<T>(self: Expectation<T>) {
   if self.isBool { ok = self.boolVal }
   let bad = !ok
   if self.negated { bad = ok }
-  if bad { vltFail(self.shown, self.negated, 1, self.shown) }
+  if bad { vltFail(self.shown, self.negated, 1, self.shown, self.caller) }
   vltDone()
 }
 
@@ -433,7 +539,7 @@ export function toBeFalse<T>(self: Expectation<T>) {
   if self.isBool { ok = !self.boolVal }
   let bad = !ok
   if self.negated { bad = ok }
-  if bad { vltFail(self.shown, self.negated, 2, self.shown) }
+  if bad { vltFail(self.shown, self.negated, 2, self.shown, self.caller) }
   vltDone()
 }
 

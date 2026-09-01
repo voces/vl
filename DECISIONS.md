@@ -3692,3 +3692,73 @@ desugars in the parser into a concatenation with a call to the renderer in it, s
 would admit a CALL through the back door, and the whole literal rule exists to keep calls out.
 And no default expression is evaluated more than the call sites that omit it — there is no
 memoization question, because there is nothing to memoize.
+
+## Track-caller: the LOCATION is a second LINE, and `CallerLoc` lives where its consumer does (2026-09-01)
+
+Default arguments v1's first customer, and it needed no compiler change: `std:test` exports
+`type CallerLoc = { file: string, line: i32, col: i32 }` and `expect` takes a trailing
+`caller: CallerLoc = __callsite__`. Three choices were open and each is answered here rather
+than left to read off the diff.
+
+### The type's HOME, and why the structural check makes it reversible
+
+**`std:test`, exported.** The alternatives were `std:fmt` (std's shared-helpers home), a new
+module, and a `std:test`-local non-exported alias.
+
+* **`std:fmt` is ruled out by a standing decision, not by taste.** `std/test.vl`'s header
+  keeps this module's dependency surface at ZERO on the argument that it is the surface that
+  reports failures in everything else, `std:fmt` included — a defect in fmt's renderer must
+  not be able to corrupt the message that reports it. Putting `CallerLoc` there and importing
+  it back would spend exactly that.
+* **A new module is the speculative surface a version-locked std cannot take back.** One
+  three-field alias with one consumer does not earn a module key, and a module key is the most
+  permanent thing this repo mints.
+* **Non-exported does not work, for a reason the feature itself creates.** The one-hop rule
+  says a wrapper forwards its own `caller` EXPLICITLY. That wrapper has to NAME the type in a
+  signature. Leaving it unexported would make every test helper re-spell three fields — which
+  is precisely the "invisible rule about a type name" the defaults ruling rejected.
+
+**The structural check is what makes this reversible, and that is the load-bearing part.**
+`__callsite__` is typed against `{ file: string, line: i32, col: i32 }` at the DECLARATION, so
+the compiler never learns the std name and any identical alias satisfies it — measured both
+ways on 2026-09-01: a user-declared `type L = { … }` takes `__callsite__`, and `std:test`'s
+alias does. So if a second consumer ever wants a different home, an alias there is the SAME
+type rather than a competing one. A wrong choice here is cheap in a way most std naming is not.
+
+### The location is a separate LINE, and the assertion sentence is untouched
+
+`vltFail` emits `"expected 7 to equal 8\n  at /p/f.test.vl:11:3"`, not
+`"expected 7 to equal 8 at /p/f.test.vl:11:3"`. Both halves of that are decisions.
+
+**Why a line and not a suffix: the sentence ends in a RENDERED OPERAND.** That operand is
+arbitrary user text — `expect("at a.vl:1:1").toEqual("x")` renders it verbatim — so a machine
+reader sniffing the tail of the sentence is parsing a field whose neighbours it does not
+control. A dedicated line is matched ANCHORED, which is what `lsp/src/testDiscovery.ts` does,
+and the scan additionally stops at the `--- captured output ---` sentinel because a program
+under test can print anything at all, that shape included.
+
+**Why the sentence is byte-identical to v2: every existing pin stays a PREFIX match.** The
+runner suite's message assertions — the renderer-agreement i64-min pin included — needed no
+edit at all; the change is additive to the report and additive to the tests. That is the
+cheapest possible interaction with a fixture set the std:test v2 landing had to A/B twice.
+
+### The render is LAZY, and the reason is the receipt's own rule read backwards
+
+`std/test.vl`'s receipt computes `shown` EAGERLY, at `expect` time, because it is T-DEPENDENT
+and every lazy spelling of a T-dependent render is one of the D941 family's miscompiles. That
+argument does not extend to `caller`: it is a concrete `CallerLoc` at every instantiation, so
+it is carried RAW in the receipt and rendered only on the failure path. The pass path pays one
+struct copy and nothing else.
+
+Measured, 2026-09-01: **+525 bytes** unoptimized on a one-assertion module (5,873 → 6,398),
+**byte-identical at `-O3`** (596 both ways — Heap2Local scalarizes the struct, which reproduces
+the `__callsite__` cost finding above through std), and **~11 ns per PASSING assertion**
+(10M iterations, ~0.33 s → ~0.44 s) for the receipt copy plus the call site's `struct.new`.
+
+### `expect` only
+
+`fail(msg)` takes no location — its argument is the author's own sentence, not a rendered
+assertion — and `it`/`describe` keep their signatures, because a registration site is not an
+assertion site. One surface at a time; both are separate decisions to make on their own rather
+than riders on this one, and the editor keeps its `it`-line fallback for exactly the failures
+that carry no location by construction.
