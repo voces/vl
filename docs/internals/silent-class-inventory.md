@@ -23847,11 +23847,18 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   where the defect lives); and `calleeCloSigKeySid` + `sigKeyRetKind` (the shape-free
   `$fnsig` reader, which also answers nothing here).
 
-  **So the open question is narrow: what answers "this call returns a string" without a
-  receiver shape?** The checker type-checks the program, so the fact exists — most likely on
-  the checker's side, as the FIELD's `TyFunc` result reached through the hole's resolved
-  binding, rather than in any emitter-side table. That is where to look, and note that D980's
-  neighbouring fix could use `fieldClosureFeOfRecv` only because its fixture ANNOTATES.
+  **AND THE CALLEE'S OWN `TyFunc` IS NOT IT EITHER — the fifth, and it rules out the obvious
+  checker-side answer.** A helper reading `nodeTyIxOf(call.callFn)` and taking its `TyFunc`
+  result prim (`calleeRetPrimName`) declines too: the MEMBER node `x.f` carries no recorded
+  function type when the receiver is a hole. So the checker's answer is not parked on either
+  the call node or the callee node.
+
+  **What remains is to find where the checker DID record it.** It type-checks the program, so
+  `x.f()` is known to be a `string` somewhere — the field's type reached through the hole's
+  resolved binding, not through either node's own `nodeTyIx` entry. That is the last
+  unexplored place, and it is worth instrumenting the CHECKER (with `tErr`, which surfaces
+  there) rather than guessing another emitter-side reader. Note that D980's neighbouring fix
+  could use `fieldClosureFeOfRecv` only because its fixture ANNOTATES.
 
 * **AND D980 IS ITS NEIGHBOUR, NOT ITS TWIN.** The tail-position cell (`x.f()` as a function's
   last expression) traps with or WITHOUT the annotation and is closed separately; this row's
