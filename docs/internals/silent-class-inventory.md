@@ -23906,14 +23906,28 @@ and the refusal turns into a miscompile:
   fnIx=10). **Every byte-marker count previously filed on this row should be treated as
   unmeasured.**
 
-* **AND THE BOXING IS NOT IN THE TAIL CHAIN AT ALL — the sharpest fact this row has.** Probing
-  every arm of `emitReturnValue`'s `retF32 / retF64 / retI64 / retVi / retUNm` ladder with
-  `emitFail` shows **none of them fires — for EITHER shape**, including the annotated control
-  that boxes correctly. So the working path boxes somewhere EARLIER in `emitReturnValue` (the
-  seeds around `nodeTyIsStringPrim` / `retNulStringFlag` / `retLitUnionInline` / the
-  `fn.fnRet < 0` rungs), and `retUNm` is not the mechanism at all — which is why hardcoding it
-  changed nothing. **The next attempt should find what the control hits before that ladder and
-  ask why `pick` misses it**, and should not spend any more effort on `retUNm` or the A20 gate.
+* **THE DISCRIMINATOR IS `emitReturnValue`'s ARM, and it is `retUNm` after all** — an earlier
+  probe of this ladder was mis-applied and read "no arm fires"; re-run correctly with
+  `emitFail`, the annotated control takes **`arm=union`** (`emitUnionBoxArg`, which boxes) and
+  `pick` takes the trailing **`arm=else`** (a plain `emitExpr`, which does not). Everything
+  downstream follows from `retUNm` being `""`.
+
+* **AND OPENING THE A20 GATE DOES NOT MAKE `inferRetNameOf` ANSWER — verified with the gate
+  demonstrably applied.** With the `!generic` param test relaxed for a concrete-union return
+  (patch present in the tree, three occurrences), `pick` STILL takes `arm=else`. So the gate is
+  not what suppresses the recording: **`recordInferRet` is never reached for this function even
+  when the gate admits it.** The remaining fork is the one directly below the gate —
+  `isClassifiableRetName(recNm)` → else → `valueUnionRetName(er)` → else →
+  `structUnionRetName(er, …)`. **Determine which of those three answers for `pick`'s `er`, and
+  why it yields nothing; that is the whole remaining question** and it is three `emitFail`
+  probes away.
+
+* **A NOTE ON THE OTHER SIDE, from the emitter's own comment at the `retUnionFlag` rung:** when
+  the functype and the body move to the box, the CALL-RESULT classifier (`computeRetInference`
+  / `criClassify`) is a THIRD home that must move in the same change, or the receiving local
+  stays an i32 and 8 of 520 grid cells go from a loud reject to check-clean invalid wasm.
+  Annotating the receiving binding does NOT substitute for it — measured here, and it still
+  fails — so budget that site into the fix rather than discovering it afterwards.
 
 * **BUT THE FLAG'S ORIGIN IS STILL UNEXPLAINED, and `computeVoidFns` appears not to be it.**
   Its only path to `fRetVoid[i] = 1` is gated on `!blockHasValuedReturn(fn.fnBody)`, and that
