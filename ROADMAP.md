@@ -1755,7 +1755,7 @@ seed from current `compiler/*.vl` in ~40s.*
   8. ✅ Testing API: per-test click-to-run — #2112 — TestController + tokenizer-based
      discovery (`lsp/src/testDiscovery.ts`); `-t` substring ambiguity measured and
      surfaced, dirty buffers mirrored beside the file so relative imports resolve
-  9. ✅ Folding ranges + language-config indentation/on-enter rules — #TBD — blocks,
+  9. ✅ Folding ranges + language-config indentation/on-enter rules — #2170 — blocks,
      paren/bracket groups, `//` runs and the leading import block, off the shared host
      tokenizer (`lsp/src/vlLex.ts`, lifted out of `testDiscovery.ts`) — so it is SEED-FREE,
      the one handler that survives a missing seed; plus `indentationRules` + `//`/`///`
