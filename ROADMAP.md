@@ -40,7 +40,7 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
 ### Ruled and sequenced (owner decisions already made, waiting only on order)
 
 - **Kill the ambient builtin `toString`; rename std:fmt's `toStr` → `toString` in its
-  place** — DONE #TBD (ruled 2026-09-01, shipped the same day). Default scope, all six
+  place** — DONE #2199 (ruled 2026-09-01, shipped the same day). Default scope, all six
   emit/classify/collect arms and `emitToString` are gone; `std:fmt` exports `toString`;
   every in-tree caller migrated; both retired spellings get a targeted import hint.
 - **Template literals / interpolation — SHIPPED #2188.** Backtick strings, additive,
@@ -1829,7 +1829,7 @@ seed from current `compiler/*.vl` in ~40s.*
      tokenizer (`lsp/src/vlLex.ts`, lifted out of `testDiscovery.ts`) — so it is SEED-FREE,
      the one handler that survives a missing seed; plus `indentationRules` + `//`/`///`
      on-enter continuation (no block-comment rule — VL has none)
-  10. ✅ Signature help — #TBD — the CLEAN grade, because it cost less than the bridge:
+  10. ✅ Signature help — #2199 — the CLEAN grade, because it cost less than the bridge:
      one native export family (`sigAt` + `sigParam*`/`sigRet*` — the survey's §7
      "Signature table", verbatim) returns the callee's parameters as DATA, so the
      rendered-string re-parse the survey called "the acknowledged debt" was never
