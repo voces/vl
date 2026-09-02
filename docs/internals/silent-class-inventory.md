@@ -18553,7 +18553,11 @@ Repro:
   declarations change what these literals resolve to, and it becomes a different program.
 
 ### D627 — the map's VALUE type has a layout twin of its OWN: what SLOT equality still declines, one indirection past D624
-**check-clean invalid wasm · found 2026-08-30 by asking D624's close, directly, whether it unmasked a fifth defect in the D280 / D621 / D623 / D624 chain · it is NOT unmasked — the witness is check-clean invalid wasm on master as well — but it is the next layer out, and the widening that closes it is already measured and was declined for a named reason**
+**runs, prints `7` — CLOSED 2026-09-02 by taking D624's measured widening
+(`mvCanonRepOf` instead of slot-index equality) behind a COINDUCTIVE PAIR STACK, which is the
+bound this row asked for and is not a re-entrancy guard · the adversarial recursive shape the
+row could not witness now RUNS, so the hazard is graded rather than argued · zero `runs` lost ·
+`tests/cases/maps/map-value-layout-twin-heap-merge.vl` · was check-clean invalid wasm**
 
 Repro:
 
@@ -18606,6 +18610,24 @@ Repro:
   layout comparison. A plain re-entrancy guard is NOT an option: it makes the answer depend on
   the call stack, so the mint and the pairwise finds disagree, which is the one thing this
   layer's timing-independence forbids.
+
+* **CLOSED BY (b), AND THE OPEN QUESTION ANSWERS YES.** The row asked whether "assume merged on
+  revisit" is safe for a HEAP merge the way it is for a layout comparison. It is, and for the
+  standard reason: deciding two heap types are one IS equirecursive type equality, whose
+  intended answer is the GREATEST fixpoint — the pair is merged unless assuming it leads to a
+  contradiction. Every finite disagreement in the walk still returns -1 and unwinds the whole
+  descent with it, so an assumption survives only when nothing anywhere in the cycle disagreed.
+
+  And the row's objection to a plain re-entrancy guard — *"it makes the answer depend on the
+  call stack, so the mint and the pairwise finds disagree"* — is exactly right and does not
+  apply to a PAIR stack. The assumption is keyed on the very pair being decided and is
+  symmetric, so `(vi, si)` still determines the answer whatever route reached it. That is the
+  same argument `structFieldCodesEq`'s own pair stack rests on, which is why the row named it.
+
+* **(a) FELL OUT OF (b).** The row wanted "a witness that actually REACHES the recursion". The
+  self-recursive map-valued shape with a layout twin and a union was refused loudly before this
+  change — which is why the loop was unwitnessed — and it now RUNS, printing its value. It is
+  the second program in the fixture, so the hazard is a graded cell rather than an argument.
 * **ABLATED on the shipped seed, and the ingredients are D624's plus one indirection:** drop
   `type Leaf2` (the INNER twin, both values `Leaf`) → runs, 7; drop `type Dot` (the outer twin)
   → runs, 7; drop `type Shape` (the union) → runs, 7; make the field `r: {[string]: i32}` on both
@@ -31240,5 +31262,10 @@ Repro:
   `recordUnMemTys` states in as many words. Adding one silently re-tagged that same litunion
   file and broke a running program — measured, not reasoned: the dedupe went in, the fixture
   went red, the dedupe came out.
+
+  **Canon's member loop DOES dedupe, and this must not.** The two sit one indirection apart,
+  and carrying the rule across is the whole hazard: canon dedupes its own `kept` list, which
+  becomes a rendered NAME, while this builds the box-tag TABLE, where position IS the tag.
+  Different list, different consequence.
 
 ---
