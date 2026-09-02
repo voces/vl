@@ -12,10 +12,22 @@ the others' work:
 
 Every **(RUN)** claim a conclusion below rests on was re-run by the coordinator on the
 refreshed seed before this document was written — §6 lists them. Three defect rows came out
-of the exercise and are filed with probes: **D989** (union-vs-union `==` refuses at emit;
-vl-de, #2269/#2270/#2274/#2275), **D1017** (`==` over a struct with a list-of-structs field
-refuses at emit; #2273) and **D1018** (`==` between two bare-`null` operands refuses at emit;
-this PR). Each is a clause-2 gap on the `==` ladder the proposal's lowering would share.
+of the exercise and are filed with probes: **D989** (union-vs-union `==` refused at emit;
+filed #2269/#2270/#2274/#2275, **closed #2277**), **D1017** (`==` over a struct with a
+list-of-structs field refuses at emit; #2273, open) and **D1018** (`==` between two bare-`null`
+operands refused at emit; filed #2278, **closed #2279** — the answer is static, no rep was
+needed). Each is a clause-2 gap on the `==` ladder the proposal's lowering would share.
+
+**One lesson from closing D989 binds the `===` build items.** The refusal's message (`union
+`==` atom has no value box`) pointed two levels away from the cause — `emitUnionUnionEq`
+intersected both sides' member atoms and both lookups missed for a declared union. Expanding
+only the LEFT side **compiled cleanly and was silently wrong**: the intersection went empty,
+the arm loop emitted nothing, and the tag-only fallback compared the two TAGS, so `1 == 2`
+printed `true` (`i32.eq (struct.get $0 0 …) (struct.get $0 0 …)` in the disassembly). An
+intermediate state of the fix passed a compile and failed the value table. **Whatever lowers
+`===` over a union payload rides that unboxing, so its acceptance is a VALUE TABLE — same
+object true, two equal objects false, across arms false, null-vs-null true, inside and
+outside an `is` guard — never a compile.**
 
 The shape of the answer, before the detail: **the operator is cheap, sound on structs, and
 the critics converge on how to spell its rules; the container is right in shape and its
@@ -137,7 +149,8 @@ later. VL is not shipped; the reversal column is what "not shipped" is worth her
    array, `Map`, and a nullable of one of those — one `ref.eq`. **Union of struct arms:**
    payload compare, specified in P1 as an invariant, lowered in `eqCmpKindOfTy`'s family
    (`typecheck.vl:15638`) so checker and emitter read one answer; may ride D989's fix since
-   it needs the same unboxing. **Function values: out** — `==` is already identity there.
+   it needs the same unboxing (D989 is closed; its lesson above is the acceptance rule).
+   **Function values: out** — `==` is already identity there.
    Lists are in with a constraint the ruling must write down (F5/F6): today a list is a
    `{backing, len, cap}` header object whose identity survives growth **(RUN)**; §VL.7's
    unbuilt header-less fixed-array rep (`collections-design.md:680`) claims to be "invisible
@@ -154,10 +167,10 @@ later. VL is not shipped; the reversal column is what "not shipped" is worth her
    reference type`) — rendered at the user's spelling, with a newtype-operand fixture.
    *Reversal:* admitting it later is possible and every language that did regrets it.
 
-4. **`null === null`.** (consistency F10, D1018.) **Recommend: `true`**, one `ref.eq` on two
-   nulls; `x === null` gets the P1 hint pointing at `== null`. Prerequisite: D1018 — the
-   emitter refuses `null == null` today for want of a heap type to name, and `===` must not
-   inherit that floor. *Reversal:* none needed.
+4. **`null === null`.** (consistency F10, D1018.) **Recommend: `true`** — static, the way
+   D1018's close made `null == null` static (#2279: the equality emitter answers before either
+   operand is lowered); `x === null` gets the P1 hint pointing at `== null`. *Reversal:* none
+   needed.
 
 5. **P3 key-eligibility.** (crosslang 1, consistency F3, perf 8, D1017.) **Recommend the
    Rust model:** a struct is key-eligible iff every field is transitively `i32`/`i64`/
@@ -218,7 +231,7 @@ no container) and share `==`'s lowering; `IdentityMap`/`IdentitySet` are separat
 the C2 interfaces, keyed by a lazy `i64` serial on a private heap type, bucket-resolved by
 `ref.eq`. OQ-11 in `docs/serde-design.md` closes on that sentence. `ROADMAP.md` A15 lists
 the build items in ship order: (1) the operator + checker rule + hint, with D1018 and the
-union payload rule (D989's unboxing); (2) the key-eligibility predicate + struct-key
+union payload rule on D989's now-built unboxing, accepted by a value table; (2) the key-eligibility predicate + struct-key
 lowering for `Map`/`Set`, on the `==` ladder, with D1017; (3) `Set<T>`; (4) the two
 containers on the flat rep; (5) the declared-vs-rep field split; (6) the serial, with its
 four acceptance cells. Compiler work routes to the compile-goal track; the std surface of

@@ -30177,9 +30177,9 @@ Repro (loud emit reject):
     const b: T = { v: 1, kids: [{ w: 2 }] }
     print(a == b)
 
-### D1018 — `==` between two operands of the bare `null` TYPE refuses at emit; give either side a `T | null` and it runs
+### D1018 — `==` between two operands of the bare `null` TYPE refused at emit; give either side a `T | null` and it ran
 
-**loud emit reject · check rc 0 · `emitProgram: bare null needs a struct-typed context` (`compiler/wasmEmit.vl:21666`, the bare-`null` value emitter's fall-through when no struct seed is pending — the SAME literal D20's residual and the 164-cell module-scope family report, but a different mechanism: those cells all HAVE a `T | null` and lose it through a capture or a scope; this cell never had a `T`) · `DECISIONS.md` A-infer-null: "an unconstrained `let x = null` resolves to `null`", so the type is one the design names and the checker is right to accept it · probe `scripts/capability-probes/bare-null-equality.vl` (20 of 22 run on 2026-09-01) · found by the identity proposal's consistency critique (`docs/internals/identity-critique-consistency.md` F10, which noted `null === null` would be a NEW capability because `null == null` refuses), ablated 2026-09-01**
+**closed · was a loud emit reject · clause 2 · `tests/cases/unions/bare-null-equality.vl` (#2279: both sides bare `null` makes the answer STATIC, so the equality emitter answers before either operand is lowered — no rep was needed) · was: check rc 0 · `emitProgram: bare null needs a struct-typed context` (`compiler/wasmEmit.vl:21666`, the bare-`null` value emitter's fall-through when no struct seed is pending — the SAME literal D20's residual and the 164-cell module-scope family report, but a different mechanism: those cells all HAVE a `T | null` and lose it through a capture or a scope; this cell never had a `T`) · `DECISIONS.md` A-infer-null: "an unconstrained `let x = null` resolves to `null`", so the type is one the design names and the checker is right to accept it · probe `scripts/capability-probes/bare-null-equality.vl` (20 of 22 run on 2026-09-01) · found by the identity proposal's consistency critique (`docs/internals/identity-critique-consistency.md` F10, which noted `null === null` would be a NEW capability because `null == null` refuses), ablated 2026-09-01**
 
   | spelling | check | outcome |
   | --- | --- | --- |
@@ -30204,6 +30204,6 @@ Repro (loud emit reject):
   admits nullable operands to `===`, so `null === null` is a program that ruling makes
   legal; it must not inherit this floor. Whoever lowers `===` lowers this cell first.
 
-Repro (loud emit reject):
+Repro (runs — prints `true`):
 
     print(null == null)
