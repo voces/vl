@@ -36,14 +36,17 @@ self-hosted compiler wasm seed — selectable with the `vital.checker` setting
   itself discovers by *instantiating* the module, which an editor must not do
   per keystroke. That module is pure (no `vscode`) and unit-tested by
   [`tests/lsp_test_discovery_test.ts`](../tests/lsp_test_discovery_test.ts).
-- A **failure anchors at the `expect` that failed**, not at the `it` line. The
-  runner reports the position — `std:test`'s `expect` carries a
-  `caller: CallerLoc = __callsite__` default, so a failure prints a second line
+- A **failure anchors at the MATCHER that failed**, not at the `it` line. The
+  runner reports the position — each `std:test` matcher (`toEqual`, `toBeTrue`,
+  `toBeFalse`) carries a `caller: CallerLoc = __callsite__` default, so a
+  failure prints a second line
   reading `  at <file>:<line>:<col>` — and `testDiscovery.ts` parses it into a
   `FailureLocation`, then resolves it against the run's cwd (`failureAnchor`)
-  for `TestMessage.location`. Two cases fall out of that rather than being
-  special-cased: a body with SEVERAL expects anchors at the one that failed, and
-  a failure inside a HELPER anchors in the helper's own file. Failures that carry
+  for `TestMessage.location`. Three cases fall out of that rather than being
+  special-cased: a body with SEVERAL assertions anchors at the one that failed,
+  a failure inside a HELPER anchors in the helper's own file, and a chain broken
+  over lines (`expect(x)` ⏎ `  .toEqual(y)`) anchors on the matcher's LINE
+  rather than the setup's. Failures that carry
   no location by construction — `fail(msg)`, a raw trap, a `<compile>` error —
   keep the `it`-line fallback. Graded end to end against the real runner's output
   by [`tests/vl_test_runner_test.ts`](../tests/vl_test_runner_test.ts).

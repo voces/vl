@@ -256,16 +256,24 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   else fires. (2) **OPEN** — the scoping build, graded on D1045's list plus D1046's witness.
   DECISIONS.md §"A `type` declared in a function body is legal and lexically scoped".
   Compiler-side.
-- **Assertion failures locate at the MATCHER, not `expect` — RULED (owner, 2026-09-02),
-  UNBLOCKED, NOT BUILT.** Each `std:test` matcher (`toEqual`/`toBeTrue`/`toBeFalse`, `not`'s
-  continuation) takes `caller: CallerLoc = __callsite__` and the receipt stops carrying
-  `expect`'s. On today's grammar only the column moves (the method token, measured col 14);
-  the line moves once the leading-dot continuation below is built. Was blocked on D1044 (a
-  UFCS call omitting a defaulted tail argument refused `no field … on …` in every build
-  merging a `self`-function module) — closed by #2371 the same day. Graded on: one-line
-  spelling → col 14; `not.toEqual` → the final matcher; multi-line spelling → the `.toEqual`
-  LINE (once the grammar lands). std change → `std-api-reviewer`; header + DECISIONS "`expect`
-  only" paragraph updated with it; `testDiscovery.ts` untouched. std-side.
+- **Assertion failures locate at the MATCHER, not `expect` — SHIPPED (#2386).** Ruled by the
+  owner 2026-09-02 and built the same day, std-side only. Each `std:test` matcher
+  (`toEqual`/`toBeTrue`/`toBeFalse`) takes a trailing `caller: CallerLoc = __callsite__`; the
+  receipt dropped the `caller` it carried from `expect`, and `expect` dropped the parameter —
+  a second place to hand in ONE location would need a precedence rule with no honest answer,
+  so the one-hop forwarding surface moved with the anchor to `expect(v).toEqual(1, caller)`.
+  `not()` needs no caller (it decides nothing; the FINAL matcher reports) and got none. Both
+  blockers were gone by then: D1044 (a UFCS call omitting a defaulted tail argument, which is
+  every matcher call in every test file) closed in #2371, and the leading-dot chain
+  continuation shipped in #2382 — **so the LINE moves, not just the column**. Measured: a
+  one-line `expect(x).toEqual(y)` at column 5 reports **col 15** (the ruling's "col 14" was
+  the DOT — off by one in the prose, not the compiler); `not().toEqual` → the final matcher;
+  `expect(build(cfg))` ⏎ `  .toEqual(want)` → the `.toEqual` line; `toEqual(expect(3), 4)` →
+  its own `toEqual`; a forwarding helper → its caller; a passing assertion → no location.
+  Cost re-measured both ways: 10M passing assertions inside the noise (0.42–0.43 s vs
+  0.41–0.45 s), −10 bytes unoptimized, byte-identical at `-O3`. `testDiscovery.ts`'s wire
+  format is unchanged (only its doc comment, which named the wrong token). DECISIONS.md §"A
+  failed assertion is located at the MATCHER, not at `expect`".
 - **A leading `.` / `?.` on a new line continues the postfix chain — SHIPPED (#2382).** Ruled
   by the owner 2026-09-02 and built the same day. `parsePostfix` gains a NEWLINE arm that LOOKS
   past the run of newlines and continues iff the next kind is DOT/QUESTION_DOT; `(` and `[` do
@@ -318,9 +326,12 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   the disagreeing instantiation pair that shares one AST node. Still open from this list:
   D1004 (the wordless member-access diagnostic on an unbounded `<T>`) and LSP bound-member
   completion/hover on `x: T`.
-- **Track-caller — DONE 2026-09-01 (#2235).** Both halves have shipped. The std side is
+- **Track-caller — DONE 2026-09-01 (#2235); the ANCHOR moved to the matcher 2026-09-02
+  (#2386), so the `expect`-token findings below are the landing's, not today's.** Both halves
+  have shipped. The std side is
   three things and no compiler change: `export type CallerLoc = { file: string, line: i32,
-  col: i32 }` in `std:test`, `expect<T>(value: T, caller: CallerLoc = __callsite__)`, and a
+  col: i32 }` in `std:test`, the track-caller parameter (`caller: CallerLoc = __callsite__`,
+  on `expect` as it landed and on each MATCHER since), and a
   second line on the failure message reading `  at <file>:<line>:<col>`. The editor payoff is
   D9 slot 12, which this SUPERSEDES rather than completes — the heuristic queued there was
   never written. What the landing measured, all of it new:
@@ -330,12 +341,15 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
     i64, f64, boolean, string, struct, `i32[]`, `string[]`, `Circle[]`, a literal union, a
     value union, and nullable i32/i64/f64 — every one reporting an exact position;
   - **one hop, measured four ways**: a helper that forwards its own `caller` reports its
-    CALLER, one that does not reports its own `expect` (in the helper's FILE), a GENERIC
+    CALLER, one that does not reports its own assertion (in the helper's FILE), a GENERIC
     helper forwards correctly at two instantiations, and an explicit `CallerLoc` literal is
-    just an argument;
-  - the anchor is the `expect` token at every spelling — `expect(x).toEqual(y)`,
-    `expect(x).not().toEqual(y)` and the non-UFCS `toEqual(expect(x), y)` all report the
-    `expect(`, never the `.toEqual` and never the `it` line;
+    just an argument. Still true after #2386; only the hand-in point moved, from
+    `expect(v, caller)` to `expect(v).toEqual(1, caller)`;
+  - the anchor was the `expect` token at every spelling — `expect(x).toEqual(y)`,
+    `expect(x).not().toEqual(y)` and the non-UFCS `toEqual(expect(x), y)` all reported the
+    `expect(`, never the `.toEqual` and never the `it` line. **Reversed the next day by the
+    owner's matcher ruling (#2386)**: every one of those three now reports its MATCHER
+    token, and a chain broken over lines reports the matcher's LINE;
   - cost: **+325 bytes** (5,873 → 6,198) on a one-assertion module unoptimized, and
     **byte-identical at `-O3`** (596 bytes both ways — Heap2Local scalarizes the struct, the
     DECISIONS finding for `__callsite__` reproduced through std); ~11 ns per PASSING assertion

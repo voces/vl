@@ -131,21 +131,29 @@ ROADMAP §Next, `std/test.vl`'s `CallerLoc` header block):
 
     FAIL fails an assertion
          expected 7 to equal 8
-           at /abs/path/fail.test.vl:11:3
+           at /abs/path/fail.test.vl:11:13
 
-The position is the failing `expect(...)`'s own call site, filled by the compiler
-through `expect`'s trailing `caller: CallerLoc = __callsite__` default. Three
-properties the rest of the system depends on:
+The position is the failing MATCHER's own call site, filled by the compiler
+through each matcher's trailing `caller: CallerLoc = __callsite__` default
+(owner ruling 2026-09-02 — it anchored at `expect` for one day before that).
+Four properties the rest of the system depends on:
 
 * **The sentence above it is byte-identical to what v2 shipped.** The location is
   a SEPARATE LINE, not a suffix, so every message pin stayed a prefix match and
   a machine reader matches the location ANCHORED rather than sniffing the tail of
   a line that ends in a rendered operand (which is arbitrary user text).
 * **`fail(msg)` and a raw trap carry NO location**, by construction — there is no
-  `expect` behind them. Readers must treat its absence as normal.
-* **The file may not be the test's.** A helper that calls `expect` without
-  forwarding its own `caller` reports its own line, in its own module. One hop,
-  never a chain.
+  matcher behind them. Readers must treat its absence as normal.
+* **The file may not be the test's.** A helper that asserts without forwarding
+  its own `caller` to the matcher reports its own line, in its own module. One
+  hop, never a chain.
+* **The LINE may not be the `expect`'s.** A chain broken over lines anchors on
+  the matcher, which is the whole point of the move: in
+
+      expect(build(cfg))
+        .toEqual(want)
+
+  the `expect` line is setup and the `.toEqual` line is the assertion.
 
 ### Isolation
 
@@ -239,8 +247,9 @@ argument 1: expected () -> void, got () -> i32
    program merge), so the importer reports the imported file's tests too. Legal,
    surprising, and untested — treat `*.test.vl` as leaves.
 7. **No source location — CLOSED 2026-09-01 (track-caller).** v1 identified a
-   failure by test name plus rendered message and nothing more; `expect` now
-   reports its own call site (§"Failure messages are structural" above), which is
+   failure by test name plus rendered message and nothing more; the failing
+   MATCHER now reports its own call site (§"Failure messages are structural"
+   above — it was `expect`'s until the 2026-09-02 ruling moved it), which is
    what the editor anchors its `TestMessage` on. What is still open under it, and
    each is a surface decision rather than a blocked one: `fail(msg)` takes no
    location, `it`/`describe` keep their signatures, and there is no

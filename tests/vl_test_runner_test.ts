@@ -153,7 +153,7 @@ Deno.test({
 });
 
 Deno.test({
-  name: "vl-test: a failure ANCHORS at its own expect line, not at the it line",
+  name: "vl-test: a failure ANCHORS at its MATCHER token, not at the it line",
   ignore: !ENABLED,
   fn: async () => {
     // THE EDITOR PAYOFF, end to end: run the real runner, parse the real report
@@ -161,6 +161,12 @@ Deno.test({
     // fixture's own source. Line numbers are READ OUT of the fixture rather than
     // written down here, so the pin survives the file moving and fails loudly if
     // the statements it names ever disappear.
+    //
+    // The COLUMN is the `toEqual`, not the `expect` — the matcher is what
+    // decided `false`, so the matcher is what reports (DECISIONS §"A failed
+    // assertion is located at the MATCHER, not at `expect`"). On this one-line
+    // spelling only the column distinguishes the two; the LINE-moving spelling
+    // is pinned in the temp-dir grid below.
     const src = await Deno.readTextFile(`${FIXTURES}/fail.test.vl`);
     const srcLines = src.split("\n");
     const lineOf = (needle: string): number => {
@@ -174,12 +180,19 @@ Deno.test({
       return i + 1; // the runner counts lines from 1
     };
     const itLine = lineOf('it("fails an assertion"');
-    const expectLine = lineOf("expect(7).toEqual(8)");
-    const expectCol = srcLines[expectLine - 1].indexOf("expect(") + 1;
-    if (itLine === expectLine) {
+    const assertLine = lineOf("expect(7).toEqual(8)");
+    const assertCol = srcLines[assertLine - 1].indexOf("toEqual") + 1;
+    const expectCol = srcLines[assertLine - 1].indexOf("expect(") + 1;
+    if (itLine === assertLine) {
       throw new Error(
-        "the fixture must keep the `it` and its `expect` on different lines — " +
+        "the fixture must keep the `it` and its assertion on different lines — " +
           "otherwise this test cannot tell the anchor from the fallback",
+      );
+    }
+    if (assertCol === expectCol) {
+      throw new Error(
+        "the fixture must keep `expect` and `toEqual` at different columns — " +
+          "otherwise this test cannot tell the matcher anchor from the old one",
       );
     }
 
@@ -192,8 +205,8 @@ Deno.test({
     const got = JSON.stringify(result.location);
     const want = JSON.stringify({
       file: `${FIXTURES}/fail.test.vl`,
-      line: expectLine,
-      col: expectCol,
+      line: assertLine,
+      col: assertCol,
     });
     if (got !== want) {
       throw new Error(
@@ -202,8 +215,9 @@ Deno.test({
       );
     }
 
-    // The claim spelled out: the message lands on the EXPECT, and the `it` line
-    // — what the D9 slot 12 heuristic would have given — is a different line.
+    // The claim spelled out: the message lands on the assertion, and the `it`
+    // line — what the D9 slot 12 heuristic would have given — is a different
+    // line.
     const at = failureAnchor(
       result.location!,
       ROOT,
@@ -213,15 +227,15 @@ Deno.test({
     if (!at.isTarget) {
       throw new Error(`the anchor left the file under test: ${at.file}`);
     }
-    if (at.line !== expectLine - 1 || at.line === itLine - 1) {
+    if (at.line !== assertLine - 1 || at.line === itLine - 1) {
       throw new Error(
         `the editor anchor is line ${at.line} (0-based); want ${
-          expectLine - 1
+          assertLine - 1
         }, and NOT the it line ${itLine - 1}`,
       );
     }
 
-    // `fail(msg)` has no expect behind it, so the extension keeps today's
+    // `fail(msg)` has no MATCHER behind it, so the extension keeps today's
     // it-line fallback rather than being handed a wrong position.
     const outright = parsed.results.find((x) => x.path === "fails outright");
     if (outright?.location !== undefined) {
@@ -261,14 +275,15 @@ Deno.test({
 
 Deno.test({
   name:
-    "vl-test: ONE HOP, and every spelling anchors at the `expect` that failed",
+    "vl-test: ONE HOP, and every spelling anchors at the MATCHER that failed",
   ignore: !ENABLED,
   fn: async () => {
     // The semantics the owner ruled on: a `CallerLoc` is one location, never a
     // chain. A wrapper that takes its own `caller: CallerLoc = __callsite__` and
-    // forwards it EXPLICITLY reports the line that called the wrapper; one that
-    // does not forward reports its own `expect` — which may be in a DIFFERENT
-    // FILE, the case no scan of the test body could ever have anchored.
+    // forwards it EXPLICITLY to the MATCHER reports the line that called the
+    // wrapper; one that does not forward reports its own matcher — which may be
+    // in a DIFFERENT FILE, the case no scan of the test body could ever have
+    // anchored.
     //
     // A temp dir rather than a new file under tests/fixtures/vl-test: the
     // fixtures' aggregate `N files · P passed · F failed` pin is shared with
@@ -279,10 +294,14 @@ Deno.test({
     // count is a test that fails for a reason that has nothing to do with the
     // compiler, which is exactly the noise a position pin must not add.
     const helperSrc = [
-      'import { CallerLoc, expect, toEqual } from "std:test"',
+      'import { CallerLoc, expect, toBeTrue, toEqual } from "std:test"',
       "",
       "export function forwards(v: i32, caller: CallerLoc = __callsite__) {",
-      "  expect(v, caller).toEqual(1)",
+      "  expect(v).toEqual(1, caller)",
+      "}",
+      "",
+      "export function forwardsTrue(b: boolean, caller: CallerLoc = __callsite__) {",
+      "  expect(b).toBeTrue(caller)",
       "}",
       "",
       "export function keepsItself(v: i32) {",
@@ -290,22 +309,27 @@ Deno.test({
       "}",
     ];
     const testSrc = [
-      'import { expect, it, not, toEqual } from "std:test"',
-      'import { forwards, keepsItself } from "./helper"',
+      'import { expect, it, not, toBeFalse, toBeTrue, toEqual } from "std:test"',
+      'import { forwards, forwardsTrue, keepsItself } from "./helper"',
       "",
       'it("forwarded", () => {',
       "  forwards(2)",
+      "})",
+      "",
+      'it("forwarded-bool", () => {',
+      "  forwardsTrue(false)",
       "})",
       "",
       'it("kept", () => {',
       "  keepsItself(2)",
       "})",
       "",
-      // The SPELLING grid. Both must report the `expect` token: the location
-      // belongs to the ASSERTION, and `expect(` is where an assertion starts —
-      // never the `.toEqual`, never the `.not()`. That follows from the location
-      // riding on the RECEIPT rather than on each matcher, which is the reason
-      // the matchers did not grow a parameter of their own.
+      // The SPELLING grid. Every one must report the MATCHER token: the failure
+      // is the matcher's — `toEqual` is the thing that decided `false` — so the
+      // location is its own `__callsite__`, never the `expect` and never the
+      // `.not()`. `not()` decides nothing, so a negated chain reports the FINAL
+      // matcher; the non-UFCS spelling reports its own `toEqual` rather than the
+      // nested `expect`, which is the same rule at a different spelling.
       'it("negated", () => {',
       "  expect(1).not().toEqual(1)",
       "})",
@@ -313,6 +337,45 @@ Deno.test({
       'it("non-ufcs", () => {',
       "  toEqual(expect(3), 4)",
       "})",
+      "",
+      // THE CASE THE MOVE EXISTS FOR: with the matcher on its own line the
+      // failure's LINE moves too, not just its column. Anchoring at `expect`
+      // would send an author to the SETUP line. (The leading-dot chain
+      // continuation this spelling needs shipped in #2382.)
+      'it("multiline", () => {',
+      "  expect(build(5))",
+      "    .toEqual(6)",
+      "})",
+      "",
+      // Both boolean matchers, both spellings, so neither is anchored by
+      // accident of sharing `toEqual`'s wiring.
+      'it("true-inline", () => {',
+      "  expect(false).toBeTrue()",
+      "})",
+      "",
+      'it("false-inline", () => {',
+      "  expect(true).toBeFalse()",
+      "})",
+      "",
+      'it("true-multiline", () => {',
+      "  expect(false)",
+      "    .toBeTrue()",
+      "})",
+      "",
+      'it("false-multiline", () => {',
+      "  expect(true)",
+      "    .toBeFalse()",
+      "})",
+      "",
+      // A PASSING assertion renders no location at all — the failure path is
+      // the only one that reads `caller`.
+      'it("passes", () => {',
+      "  expect(1).toEqual(1)",
+      "  expect(true).toBeTrue()",
+      "  expect(1).not().toEqual(2)",
+      "})",
+      "",
+      "function build(n: i32): i32 { n }",
     ];
     /** The 1-based line/col of `needle` in `src` — the runner's own coordinates. */
     const posOf = (src: string[], needle: string, token: string) => {
@@ -340,26 +403,82 @@ Deno.test({
       };
 
       const test = `${dir}/hop.test.vl`;
+      const helper = `${dir}/helper.vl`;
       check(
         "forwarded",
         want(test, testSrc, "forwards(2)", "forwards"),
         "a forwarded caller must name the HELPER'S CALLER",
       );
       check(
+        "forwarded-bool",
+        want(test, testSrc, "forwardsTrue(false)", "forwardsTrue"),
+        "toBeTrue's forwarded caller must name the HELPER'S CALLER too",
+      );
+      check(
         "kept",
-        want(`${dir}/helper.vl`, helperSrc, "expect(v).toEqual(1)", "expect"),
-        "an unforwarded caller must name the helper's own expect, in ITS file",
+        want(helper, helperSrc, "expect(v).toEqual(1)", "toEqual"),
+        "an unforwarded caller must name the helper's own matcher, in ITS file",
       );
       check(
         "negated",
-        want(test, testSrc, "expect(1).not()", "expect"),
-        "the not() chain must anchor at the expect, not the .not() or .toEqual",
+        want(test, testSrc, "expect(1).not().toEqual(1)", "toEqual"),
+        "the not() chain must anchor at the FINAL matcher, not the expect or .not()",
       );
       check(
         "non-ufcs",
-        want(test, testSrc, "toEqual(expect(3)", "expect"),
-        "the non-UFCS spelling must anchor at the NESTED expect, not the toEqual",
+        want(test, testSrc, "toEqual(expect(3), 4)", "toEqual"),
+        "the non-UFCS spelling must anchor at its own toEqual, not the nested expect",
       );
+      // The line-moving case, stated as its own claim: the reported line is the
+      // MATCHER's, and the `expect` that set it up is a different line.
+      check(
+        "multiline",
+        want(test, testSrc, "    .toEqual(6)", "toEqual"),
+        "a matcher on its own line must anchor THERE, not on the expect line",
+      );
+      const setupLine = posOf(testSrc, "expect(build(5))", "expect").line;
+      const matcherLine = posOf(testSrc, "    .toEqual(6)", "toEqual").line;
+      if (setupLine === matcherLine) {
+        throw new Error(
+          "the multiline fixture collapsed onto one line — it can no longer " +
+            "tell a matcher anchor from an expect anchor",
+        );
+      }
+      check(
+        "true-inline",
+        want(test, testSrc, "expect(false).toBeTrue()", "toBeTrue"),
+        "toBeTrue must anchor at its own token",
+      );
+      check(
+        "false-inline",
+        want(test, testSrc, "expect(true).toBeFalse()", "toBeFalse"),
+        "toBeFalse must anchor at its own token",
+      );
+      check(
+        "true-multiline",
+        want(test, testSrc, "    .toBeTrue()", "toBeTrue"),
+        "toBeTrue on its own line must anchor THERE",
+      );
+      check(
+        "false-multiline",
+        want(test, testSrc, "    .toBeFalse()", "toBeFalse"),
+        "toBeFalse on its own line must anchor THERE",
+      );
+      // A PASSING assertion renders no location: `caller` is read on the
+      // failure path alone.
+      const passed = parsed.results.find((x) => x.path === "passes");
+      if (passed === undefined || passed.outcome !== "passed") {
+        throw new Error(
+          `the passing case must pass, got ${JSON.stringify(passed)}\n${r.err}`,
+        );
+      }
+      if (passed.location !== undefined) {
+        throw new Error(
+          `a passing assertion must render no location, got ${
+            JSON.stringify(passed.location)
+          }`,
+        );
+      }
 
       // And the editor resolves the helper's one into the helper FILE, not the
       // test file — `isTarget` false is what tells the extension to open it.
