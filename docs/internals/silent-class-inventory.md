@@ -32459,14 +32459,34 @@ Repro:
   | `orE<T>` at `T = i32` with an ANNOTATED destination `const t: i32 \| E = orE(5, true)` | ok | **runs** — `bad` (the annotation pins the rep, D969's shape) |
   | `orErr<T>` at `T = i32` with `const r: i32 \| "err" = orErr(5, true)` | ok | **emit reject** — the annotation does NOT rescue the literal arm; second ingredient, not yet ablated |
 
-* **MECHANISM (as far as measured).** The union a generic's return type becomes at an
-  instantiation is minted by the mono clone, and the emitter's member registry — the table
-  `union box atom test` consults — has no row for it; the same union written by hand is
-  registered when its spelling is resolved. The struct-arm row is rescued by annotating the
-  destination because the annotation registers the spelling; the literal-arm row is not,
-  which says the literal arm has a second, separate registration path that the clone also
-  misses. Two ingredients, then: (1) mono-minted unions are never registered — the family;
-  (2) a literal arm's atom registration is missed a second way — grade separately.
+* **MECHANISM — MEASURED 2026-09-02, AND IT IS A CHAIN OF THREE, NOT ONE.** The row first
+  read this as "mono-minted unions are never registered". That is ingredient (1) and it is
+  not the whole story; probing `unMemHasAtom`'s exits and `unionRowOf` directly gives:
+
+  1. **A PURE generic instantiation registers nothing.** `unionRowOf("i32|\"err\"")` and
+     `unionRowOf("i32|string")` are BOTH -1 for the repro above — no row exists under either
+     spelling, so the atom test's arena leg declines and the loud floor fires.
+
+  2. **AND THE TWO PRODUCERS SPELL ONE UNION TWO WAYS.** Put a DIRECT
+     `function f(bad: boolean): i32 | "err"` in the same module and it registers — under
+     `i32|string`, because CANON SOFTENS a literal member to its base scalar
+     (`canonEmitNameAt`'s `litMemberTy` arm). The generic still asks for `i32|"err"`, which
+     the registry does not have: the failing lookup prints `want[i32|"err"]
+     have[i32|string]`, and `unionRowOf` reads -1 for the wanted name and **0** for its
+     canon'd twin. So the clone's union never passes through canon. This is why adding a
+     direct spelling does NOT rescue the generic, which is the observation that rules out (1)
+     as a complete account.
+
+  3. **AND CLOSING (2) EXPOSES A THIRD REFUSAL.** A canon retry inside `unMemHasAtom` — on a
+     MISS only, `canonEmitName(name)` then re-lookup — was built and graded: the
+     direct-spelling-present program moves off `no recorded members` and onto
+     `emitProgram: literal \`is\` over a struct union`, still loud, still refused. So the
+     atom-test registry is one layer of at least two, and a fix that stops at the registry
+     buys a different sentence rather than a running program.
+
+  The build order this implies: register the clone's union THROUGH CANON (which fixes 1 and 2
+  together and makes the retry unnecessary), then grade the third refusal on its own. A retry
+  alone is not worth shipping — it converts one loud refusal into another.
 
 * **WHY IT MATTERS MORE THAN ITS SOURCE ROW.** `T | E` at a scalar `T` is the generic
   `Result` shape every fallible generic helper wants (`std:fs`/`std:json` are monomorphic
