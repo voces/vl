@@ -6388,16 +6388,26 @@ function emitUnionLitIs(body: i32[], objIx: i32, lit: string, fnIx: i32) {
   // see, was correct. `unionMemberSetOf` returns a non-alias name unchanged, so this is the
   // string the working spelling already passed.
   const unmArms = unionMemberSetOf(uname)
-  // A union carrying a literal-union ALIAS arm (`K | string`, `K | f64`) is a BOX like any
-  // value union — the arm rides it as its member string — but `isValueUnionName` declines it
-  // because `valueAtomKind("K")` is -1. It is the same box with the same tags, so the
-  // lowering below is unchanged; only the gate had to learn the second spelling.
-  if (
-    uname == "" ||
-    (!isValueUnionOfSet(usid, uname) && !unionCarriesLitUnionArm(uname))
-  ) {
+  // D1047 — THE EMPTY-NAME REJECT STAYS AHEAD OF THE ATOM LADDER. The ladder's i64-widening
+  // rung and the mixed-union gate below both ask `unionHasAtomK`, whose legacy fall-through
+  // (`unionHasAtomTy`) fails LOUDLY on an unregistered row; a receiver whose union has no
+  // NAME has no row at all, so it must not reach either. The `==` twin can afford to derive
+  // its atom first because `valueAtomKind(atom) >= 0` short-circuits its own membership call.
+  //
+  // AND THE SENTENCE IS THE CONDITION'S, not the old gate's. This carried
+  // ``literal `is` over a struct union is not supported`` while it was the branch D1043's
+  // inline `Kind | "err"` landed on; D1043 closed (#2373) and that witness runs, so nothing
+  // is left here that a "struct union" describes. What IS true is what `emit_classify` says
+  // one layer down when the gate is lifted — `union box atom test on a union with no
+  // recorded members` — because `unionNameOfExpr` gave nothing and `unionMemberSetOf` has no
+  // set to split. Measured UNREACHED by: the whole `tests/cases` tree (the suite is green),
+  // 0 of 7,564 distilled corpus cells (no cell's message mentions this site), D1043's own
+  // probe, and five hand-built candidate shapes for an unnamed union receiver — a generic
+  // pin, an array element, a struct field, a map value and an inferred local binding, all of
+  // which RUN. So this is a floor; it is worded as one.
+  if uname == "" {
     return emitFail(
-      "emitProgram: literal `is` over a struct union is not supported",
+      "emitProgram: literal `is` over a union with no recorded members",
     )
   }
   // The literal's rep atom (a quoted lexeme is a string; a float f64; an
@@ -6436,8 +6446,44 @@ function emitUnionLitIs(body: i32[], objIx: i32, lit: string, fnIx: i32) {
   // Without its second leg a `K | f64` box statically answers `is "aa"` FALSE: the member
   // kinds bank only `f64` (`valueAtomKind("K")` is -1), so the arm that actually holds the
   // value looks absent.
+  //
+  // D1047 — HOISTED ABOVE THE GATE, because it is the gate's third disjunct. Nothing about
+  // the answer changed; only the order.
   let litHasArm = unionHasAtomK(usid, unmArms, atom, lak)
   if !litHasArm && lak == 2 && unionTakesAtomAsStr(unmArms) { litHasArm = true }
+  // A union carrying a literal-union ALIAS arm (`K | string`, `K | f64`) is a BOX like any
+  // value union — the arm rides it as its member string — but `isValueUnionName` declines it
+  // because `valueAtomKind("K")` is -1. It is the same box with the same tags, so the
+  // lowering below is unchanged; only the gate had to learn the second spelling.
+  //
+  // D1047 — AND THE THIRD DISJUNCT, `litHasArm`, IS THE `==` TWIN'S `eqMixedOk` MIRRORED.
+  // A MIXED UNION IS TESTABLE AGAINST A SCALAR LITERAL, and this gate refused it while
+  // `emitUnionConcreteEq` — whose lowering below the gate is the same tag-then-payload
+  // shape — admitted it. The compare is arm-AGNOSTIC: it reads the box's TAG, compares it
+  // to the tag of the literal's own rep, and on a match compares that ONE payload. The
+  // union's remaining arms are never touched; a struct or container arm simply has a tag
+  // that does not match, which is the right answer (`false`) and needs no compare core.
+  // So requiring the WHOLE union to be a value union was stronger than the lowering needs:
+  // `type S = { v: i32 }` / `r is "err"` over `S | "err"` refused while `r == "err"` ran,
+  // and so did `r is string` over the same box. Measured on seed 42604b65, all four reject
+  // rows gate-probed `valunion=N litarm=N mixed=Y` — the disjunct was computed one line
+  // later and never consulted.
+  //
+  // WIDENED ONLY WHERE THE LITERAL'S OWN REP HAS AN ARM. `litHasArm` is the very test the
+  // static-false fold below already trusts, so this admits nothing that fold would not
+  // immediately have to answer for — and a literal whose rep no arm carries is a CHECK
+  // error at both spellings already (``is` check type '"err"' is not a variant of S | i32`
+  // / `cannot compare S | i32 with string`), so the refusal it leaves behind is a floor no
+  // check-clean program reaches.
+  if (
+    !isValueUnionOfSet(usid, uname) &&
+    !unionCarriesLitUnionArm(uname) &&
+    !litHasArm
+  ) {
+    return emitFail(
+      "emitProgram: literal `is` over a union with no arm of the literal's rep",
+    )
+  }
   if !litHasArm {
     if emitExpr(body, objIx, fnIx) < 0 { return -1 }
     fbDrop() // 0x1a drop
