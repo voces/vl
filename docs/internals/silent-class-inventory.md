@@ -29813,6 +29813,14 @@ Repro (loud emit reject):
   the receiver's node resolves; do not read it as the refusal happening during signature
   emission.
 
+* **THE `emitExpr` INDEX DISPATCH IS NOT THE SITE — measured.** That arm reads
+  `if exprMap(e.idxArr, fnIx) { return emitMapGet(…) }`, which looks like the obvious culprit:
+  `exprMap` answers from the declared type, the union has a map arm, and the same predicate
+  returns FALSE later inside `emitMapRecvKey`. But adding a narrowed-array bypass there
+  changes nothing, and neither does FORCING that bypass for this exact receiver. So
+  `const e = v[0]` is not reaching that dispatch at all — a BINDING whose init is an index
+  goes somewhere else, and that somewhere is what to find first.
+
 * Same family as [D1015](#d1015): a classifier answering from the declared type where the
   narrowed arm is what matters. That one was fixed by keying off `narrowSlotOf` +
   `narrowVariants` rather than `narrowedValueAtomOf`, after four probes died on the latter
