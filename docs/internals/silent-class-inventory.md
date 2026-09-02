@@ -30325,7 +30325,7 @@ Repro (runs — prints `true`):
 
 ### D1019 — `const t = m[k] ?? d` over a UNION-VALUED map is check-clean invalid wasm INSIDE A FUNCTION, and runs at module scope
 
-**check-clean invalid wasm · check rc 0 · `type mismatch: expected (ref $type), found (ref null $type)` at the engine · found 2026-09-01 while grading [D1012](#d1012)'s fix against the narrowing-blind fallback's OWN case, so the witness arrived as a control that was expected to pass · pre-existing: identical on master, byte-for-byte the same offset and message · three ingredients, each ablated alone**
+**runs, prints `7` — CLOSED 2026-09-01 by declining D962's `??` desugar over a MAP READ (`compiler/emit_rewrite.vl`), which leaves the shape to `emitMapGetOr`'s existing fused lowering; pinned by `tests/cases/maps/union-valued-map-coalesce-in-function.vl`. Was: check-clean invalid wasm · check rc 0 · `type mismatch: expected (ref $type), found (ref null $type)` at the engine · found 2026-09-01 while grading [D1012](#d1012)'s fix against the narrowing-blind fallback's OWN case, so the witness arrived as a control that was expected to pass · pre-existing: identical on master, byte-for-byte the same offset and message · three ingredients, each ablated alone**
 
 Repro:
 
@@ -30366,3 +30366,19 @@ lowering; it is right at module scope and wrong in a function body.
 * **CLAUSE 1.** `vl check` accepts it and the engine refuses the module, so this is a
   soundness violation, not a capability gap — no refusal text to narrow, nothing for
   `--sites` to count.
+
+* **THE MECHANISM IS A REWRITE, AND THE DISASSEMBLY IS WHAT SAID SO.** D962 desugars `x ?? d`
+  over a nullable value-union box into `if x != null { x } else { d }`, bounded to RE-READABLE
+  operands because the rewrite names the operand twice. `m[k]` is re-readable in exactly the
+  sense that predicate means, so the desugar fired — and the synthesized `!= null` lowers as a
+  TAG read on the box, while a map MISS is a bare `ref.null` in the vals slot, not a
+  null-tagged box. `struct.get` on a nullable ref is the whole defect.
+
+  **THE MAP WAS PROBED TWICE IN THE EMITTED BYTES.** That is the tell that separated a rewrite
+  from an emit arm before any source was read: no emitter would re-probe, and the duplicated
+  `call $8` sat right there in the `wasm-dis` output. Reading `emitMapGetOr` first — which is
+  correct, and which the fix now lets run — would have found nothing wrong with it.
+
+* **CLOSED BY DELETING A CASE, NOT ADDING ONE.** `emitMapGetOr` already lowers this shape and
+  probes once; the rewrite was overreaching. The guard is one predicate (`drwIsMapRead`), and
+  the fix is a net efficiency win as well as a correctness one.
