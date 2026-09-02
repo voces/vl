@@ -30697,13 +30697,27 @@ alias INSIDE another union that has no rep.
   Both are the owner's call. The measurement above is what the decision needs and is what this
   update adds.
 
-* **THE MECHANISM IS IN THE LITERAL-ARM MESSAGE.** `Json | "err"` is reported as
-  `Json|string` — a two-member union whose first member is the alias itself, "with no
-  recorded members". The emitter FLATTENS a non-recursive alias into the composition (that is
-  why the twin runs) and keeps a recursive one as an opaque atom, because flattening it would
-  recurse; the composed box then has no member table, `is` cannot find an arm, and a return
-  through it lands the raw struct in a slot typed for the box. The three loud spellings and the
-  silent one are the same missing rep seen from four positions.
+* **THE LITERAL-ARM MESSAGE WAS READ AS THE MECHANISM, AND IT IS NOT — the `string` in it is
+  the LITERAL.** `Json | "err"` is reported as `Json|string` and that was read as "the alias kept
+  as one opaque atom, plus a string". Run the non-recursive twin and the same sentence prints
+  `boolean|f64|string|f64[]|{[string]:f64}|null|string` — the alias fully flattened, and
+  `string` TWICE: the checker widens the literal `"err"` to its base `string`, which the union
+  already has, and the duplicate atom is what has "no recorded members". The literal-arm row is
+  **D1024** (`string | "err"` in a function signature is check-clean invalid wasm; the
+  six-arm spelling is merely its loud face). The recursive-alias mechanism above stands on
+  `valueAtomKind` answering -1 — a reading of the code — not on this message.
+
+* **ROUTE: (1), FLATTEN — decided 2026-09-01 by the tooling session, flagged to the owner in
+  `docs/internals/json-critique-synthesis.md`.** The reason it is not a rep call after all: the
+  non-recursive twin is ALREADY flattened at every spelling, so route (2) would give a recursive
+  alias a rep its non-recursive twin does not have — a `Json | E` value that is a double box
+  while `J2 | E` is a flat one, the type-does-not-carry-its-rep cliff that the literal-union
+  flag (`vl-litunion-rep-cliff`) was built to close. Route (1) makes the recursive case
+  behave like the case that runs. The `recordUnMemTys` price — re-tagging "every union that
+  already has a union-alias atom" — falls only on unions carrying a RECURSIVE alias atom
+  (non-recursive ones are already spliced), and this row's own table says every such union
+  fails today, so no running program holds the old tags. That is a claim `regress.py` grades
+  (zero `runs → not-runs`), and the fix is graded on it.
 
 * **CLAUSE 1 at the witness, CLAUSE 2 at every spelling that narrows.** `vl check` accepts
   all of them — the checker composes the union fine — and the probe file is the API's real
@@ -30803,3 +30817,44 @@ arm is taken silently — prints `A`.
   `path` for that reason and for the information it carries.
 
 ---
+
+### D1024 — a union spelled with a base type AND a literal of that base (`string | "err"`) is check-clean invalid wasm in a function signature: the literal widens to a DUPLICATE `string` atom and the string is delivered raw where the box is expected
+
+**check-clean invalid wasm · check rc 0 · `expected struct type at index 0, found (array (mut i32))` in the function (the raw string array is returned where the union box struct is expected) · ZERO corpus cells · found 2026-09-01 by vl-de's re-ablation of D1021 (the `Json | "err"` row of its table shares a message with D1021 and not a mechanism), minimised here · one ingredient: a literal arm whose BASE TYPE is already an arm, in a function's return or parameter type**
+
+Repro:
+
+    function f(): string | "err" {
+      return "err"
+    }
+    print(f())
+
+`string | "err"` is check-clean and the checker widens the literal to its base — the
+refusing sibling prints the member list as `…|string|…|string`, `string` twice. The union
+then has a duplicate atom, and the rep built for it does not match what the function
+delivers.
+
+* **THE FAMILY, ABLATED.** Parameter position (`function g(x: string | "err")`) is the
+  same invalid wasm; arm order (`"err" | string`) and a third arm (`string | "err" | null`)
+  change nothing; two literals (`string | "a" | "b"`) is the same. **Controls that RUN:**
+  `string | null` returning `"err"` prints `err`; the literal arm behind an ALIAS
+  (`type Kind = "a" | "b"`, `string | Kind`) prints `a`; and a module-scope binding of the
+  very type, `const r: string | "err" = "err"`, prints `err` — the defect is in the
+  signature's rep, not the type. **The loud faces:** the numeric twin `i32 | 3` refuses
+  `union box atom test on a union with no recorded members: i32`; a closure result
+  `(): string | "err" => "err"` refuses `value-union closure RESULT is not yet …`; and the
+  six-arm spelling `null | boolean | f64 | string | f64[] | {[string]: f64} | "err"` — the
+  row D1021's table carried — refuses with the same `no recorded members` sentence. Message
+  grouping would have put that last one with D1021; the ablation puts it here.
+
+* **CLAUSE 1, AND A LANGUAGE QUESTION UNDERNEATH IT.** `string | "err"` is a legal spelling
+  whose literal is subsumed by its base — it is `string`. The design has to say whether the
+  checker COLLAPSES it (so the signature's type is `string` and the literal carries nothing)
+  or keeps the literal as a nominal-ish arm; either way the program must build. The checker
+  today already widens the literal (the duplicated atom shows it), so collapse is what it
+  half-does; finishing the collapse — dedupe the atom after widening — is the small fix, and
+  whether the literal should survive `is "err"` on such a union is the owner's call.
+
+* **WHAT IT TOUCHES.** Nothing in `std:json`'s ruled surface (`Json | JsonError` has no
+  literal arm). It is here because D1021's ablation table filed it under the wrong defect,
+  and because a message count would keep doing so.
