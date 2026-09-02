@@ -31316,3 +31316,331 @@ Repro:
   Different list, different consequence.
 
 ---
+
+### D1029 — an `is`-narrowed MAP arm keeps the union's box at SIX delivery positions and is check-clean invalid wasm at every one; re-binding it at the arm's own type is the only spelling that unwraps it
+
+**check-clean invalid wasm · check rc 0 · `type mismatch: expected (ref $type), found (ref $type)` from the engine · clause 1 · found 2026-09-02 building `std/json.vl`, which routes around it at the one site that needs it (`renderInto`'s map arm) · the MAP arm alone: the `string` and `Json[]` arms run at all eight positions measured · neither the alias's RECURSION nor the composition `Json | JsonError` is an ingredient — both ablated away and the defect holds**
+
+Repro:
+
+    type Json = null | boolean | f64 | string | Json[] | { [string]: Json }
+    function f(v: Json): Json {
+      if v is { [string]: Json } { return v }
+      null
+    }
+    let m: { [string]: Json } = Map()
+    m["k"] = 1.5
+    const r = f(m)
+    if r is { [string]: Json } { print(r.size) }
+
+* **THE POSITION MATRIX — six lose, two run.** One tiny program per position, each delivering
+  the narrowed map to a `Json`-typed destination, all on the seed carrying #2318:
+
+  | position | `string` arm | `Json[]` arm | `{[string]: Json}` arm |
+  | --- | --- | --- | --- |
+  | `return` into `Json \| JsonError` | RUNS | RUNS | **INVALID WASM** |
+  | `return` into plain `Json` | RUNS | RUNS | **INVALID WASM** |
+  | `push` into `Json[]` | RUNS | RUNS | **INVALID WASM** |
+  | map value store `o["x"] = v` | RUNS | RUNS | **INVALID WASM** |
+  | binding annotated `: Json` | RUNS | RUNS | **INVALID WASM** |
+  | argument to a `Json` parameter | RUNS | RUNS | **INVALID WASM** |
+  | binding annotated at the ARM's type | RUNS | RUNS | **RUNS** |
+  | argument to a parameter of the ARM's type | RUNS | RUNS | **RUNS** |
+
+  So this is [D965](#d965)'s position rule read backwards: the capability is served at two
+  positions and lost at six, and the two that work are exactly the ones that name the ARM
+  rather than the union. `const o: { [string]: Json } = v` immediately after the `is` is a
+  one-line route-around, and it is what `std/json.vl` uses.
+
+* **ABLATED — two ingredients that look load-bearing are NOT.** Each control is the repro with
+  one thing changed, and each is still INVALID WASM: the alias made NON-recursive
+  (`type J = null | f64 | { [string]: f64 }`, `is { [string]: f64 }`); and the return type
+  made the plain alias rather than a composition. The map value's own type is not an
+  ingredient either. What IS load-bearing: the value must arrive by `is` NARROWING — a map
+  built fresh in the function and returned at the same position RUNS, which is what makes this
+  a narrowing defect and not a map-rep one.
+
+* **NOT [D1013](#d1013), which is closed and points the other way.** There the narrowed value
+  was fine and the REBIND lost it; here the narrowed value is what carries the box and the
+  arm-typed rebind is the repair. Both are the same underlying question — which rep an `is`
+  narrow leaves behind — and a fix should be graded on both files.
+
+* **WHAT IT TOUCHES.** Every walker over a `Json` tree: reading an object out of a container
+  and handing it anywhere is the shape. `std/json.vl` meets it once because the renderer only
+  ITERATES the narrowed map; a consumer that returns one from a helper meets it immediately.
+
+---
+
+### D1030 — the residue of narrowing `Json | JsonError` away from the error arm is the FLATTENED member list and is not assignable to `Json`, and a plain `Json` does not widen back INTO the composition
+
+**loud check reject · clause 2 (the program is type-valid: the residue's members ARE `Json`'s members, one for one) · `argument 1: expected Json, got boolean | f64 | string | Json[] | {[string]: Json} | null` and `return type mismatch: expected Json | JsonError, got Json` · found 2026-09-02 building `std/json.vl` · both faces survive D1028's close (#2318), which fixed the NAMED composition's emit and not this**
+
+Repro:
+
+    type Json = null | boolean | f64 | string | Json[] | { [string]: Json }
+    type JsonError = { at: i32, kind: "syntax", path: string, msg: string }
+    function g(v: Json): Json { v }
+    function f(n: i32): Json | JsonError {
+      if n == 0 { return { at: 0, kind: "syntax", path: "", msg: "x" } }
+      1.5
+    }
+    const r = f(1)
+    if r is JsonError { print("err") } else { print(g(r) == null) }
+
+* **THE SECOND FACE, the widening one, is the same row and is what a std entry point hits.**
+  A value whose declared type IS the alias cannot be returned from a function returning the
+  composition:
+
+      type Json = null | boolean | f64 | string | Json[] | { [string]: Json }
+      type JsonError = { at: i32, kind: "syntax", path: string, msg: string }
+      function mk(): Json { 1.5 }
+      function f(): Json | JsonError {
+        const v = mk()
+        return v
+      }
+      const r = f()
+      if r is JsonError { print("err") } else { print(r == null) }
+
+  → `return type mismatch: expected Json | JsonError, got Json` at the `return`.
+
+* **THE NAME IS ALREADY RIGHT, which is [D1027](#d1027)'s finding one level up.** The residue
+  the checker prints is `boolean | f64 | string | Json[] | {[string]: Json} | null` — exactly
+  `Json`'s six members, flattened and deduped, with one `null`. What it is not is the
+  REGISTERED name, and the assignability test is name-based where it needed to be
+  member-based. D1027 records the same split on the EMIT side (`the flattened spelling just is
+  not the REGISTERED one`); this is the CHECK side of it, and neither D1021's close nor
+  D1028's moves it.
+
+* **THE ROUTE-AROUND IS A SIX-ARM LADDER, and every consumer pays it.** `std/json.vl` carries
+  one (`asResult`) so `parseJson` can hand a parsed tree back at the composed type, and the
+  module's own test harness carries a second one for the consumer side. Each arm is delivered
+  at its own spelling, and the map arm needs [D1029](#d1029)'s re-bind on top — so the ladder
+  is not merely verbose, it is the shape in which two separate defects have to be worked
+  around at once. This is the concrete cost `json-design.md` §2.8 predicted for the walking
+  idiom, measured on the built module rather than on a sketch.
+
+* **THIS IS VISIBLE ON THE EXPORTED SURFACE, not only inside the module — GRADE THE CLOSE ON
+  THESE THREE.** `std:json`'s own pair does not compose: the value `parseJson` returns cannot
+  be handed to `toJson` at any direct spelling. Each line below is a separate refusal of the
+  same mechanism, and a fix has closed this row only when all three run:
+
+      const r = "{\"a\":1}".parseJson()
+      if r is JsonError { print(r.msg) } else { print(toJson(r)) }
+      // (1) argument 1: expected Json, got boolean | f64 | string | Json[] | {[string]: Json} | null
+
+      if r is JsonError { print(r.msg) } else { print(r.toJson()) }
+      // (2) member access '.toJson' on non-object boolean | f64 | string | Json[] | …
+
+      if r is JsonError { print(r.msg) } else { const v: Json = r  print(toJson(v)) }
+      // (3) cannot assign boolean | f64 | string | Json[] | {[string]: Json} | null to 'v' of type Json
+
+  They are ONE mechanism wearing three sentences, so they are this row's grading list rather
+  than three rows — a message per spelling is grouping-by-message in reverse, and the rule
+  against it cuts both ways.
+
+---
+
+### D1031 — a struct FIELD or a RETURN typed `JsonError | null` is a loud emit reject once `JsonError` is also a union ARM elsewhere in the program; the identical spellings run when nothing composes it
+
+**loud emit reject · check rc 0 · clause 2 · TWO messages, one ingredient: `emitProgram: a struct field typed as the union ARM JsonError has no field rep` at the field (the compiler backticks the type name inside its own message), and `emitProgram: ref valtype with no interned shape` at the return · found 2026-09-02 building `std/json.vl`, which routes around both by flattening its scanner's error into plain fields**
+
+Repro:
+
+    type Json = null | boolean | f64 | string | Json[] | { [string]: Json }
+    type JsonError = { at: i32, kind: "syntax", path: string, msg: string }
+    type Scan = { i: i32, err: JsonError | null }
+    function f(): Json | JsonError { 1.5 }
+    const p: Scan = { i: 0, err: null }
+    const r = f()
+    if r is JsonError { p.err = r }
+    const e = p.err
+    print(e == null)
+
+* **THE RETURN FACE, same ingredient, different message:**
+
+      type Json = null | boolean | f64 | string | Json[] | { [string]: Json }
+      type JsonError = { at: i32, kind: "syntax", path: string, msg: string }
+      function f(): Json | JsonError { 1.5 }
+      function g(n: i32): JsonError | null {
+        if n == 0 { return { at: 0, kind: "syntax", path: "", msg: "x" } }
+        null
+      }
+      const r = f()
+      if r is JsonError { print("err") }
+      print(g(1) == null)
+
+  → `emitProgram: ref valtype with no interned shape`, reported at `g`'s signature.
+
+* **THE CONTROLS RUN, and they are the same lines.** Delete the two functions that put
+  `JsonError` in a union and BOTH repros run — the struct-field one prints `x`, the return one
+  prints `true`. So neither spelling is refused on its own merits: `JsonError | null` is a
+  perfectly ordinary nullable struct until some OTHER declaration composes `JsonError` into a
+  union, at which point the arm's rep displaces the plain struct's and the nullable has
+  nowhere to land. **A type's usable spellings shrink because of a declaration elsewhere in
+  the program**, which is the part that makes this worth a row rather than a note.
+
+* **THE FIRST MESSAGE'S ADVICE DOES NOT APPLY.** It offers "give the field the UNION's own
+  type, or declare the arm as a plain struct". The first is wrong here — the field holds an
+  error, not a `Json | JsonError` — and the second is what the program already does, since
+  `JsonError` IS a plain struct declaration. The message describes the emitter's two internal
+  reps rather than a choice the author has, and narrowing it is part of the fix.
+
+* **WHAT IT COST, and the route-around.** `std/json.vl` carries its parse error as five flat
+  fields on the scanner struct (`live`, `at`, `kind`, `path`, `msg`) and its render error as
+  four on a second one, rather than one `JsonError | null` field each; the renderer returns a
+  `boolean` and reports through that struct rather than returning `JsonError | null`. That is
+  a mechanical rewrite and costs no behaviour, but it is the reason the module's internals do
+  not read like `std/fs.vl`'s, and it should be undone when this closes.
+
+---
+
+### D1032 — a bare `return` is refused at EMIT when the function's result type is INFERRED non-void, and the thing that makes it non-void can be a tail `if` block ending in a `push`
+
+**loud emit reject · check rc 0 · clause 2 · `emitProgram: bare return is not supported`, reported at the FUNCTION NAME rather than at the `return` · found 2026-09-02 building `std/json.vl`, whose renderer was void and used bare returns as guard clauses · TWO one-token route-arounds, both measured: annotate `: void`, or end the body with a statement**
+
+Repro:
+
+    function f(n: i32, buf: i32[]) {
+      if n == 0 {
+        buf.push(0)
+        return
+      }
+      if n == 1 {
+        buf.push(1)
+      }
+    }
+    const b: i32[] = []
+    f(0, b)
+    print(b.length)
+
+* **A BARE `return` IS A STATEMENT AND LOWERS FINE — that is the point of the row.** The
+  refusal is not about the keyword. `function f(n: i32) { if n == 0 { return }  print(n) }`
+  runs, and so does every ladder, loop and `for`-in shape tried. What decides it is the
+  function's RESULT TYPE: `compiler/wasmEmit.vl:18819` lowers a bare return only when
+  `fRetVoid` says the function is void, and falls to this reject otherwise.
+
+* **THE TRAP FOR A READER is that nothing in the source says "non-void".** Here the body's
+  tail is `if n == 1 { buf.push(1) }`, whose last expression is a `push` — that yields a
+  value, so the INFERRED result type is not void, and the bare return four lines above is
+  refused. Nobody wrote a return type; nobody returned a value; the diagnostic names the
+  function, not the line.
+
+* **ABLATED — three controls, each one token away from the repro:**
+
+  | spelling | outcome |
+  | --- | --- |
+  | as filed (inferred result, tail is a `push`) | **emit reject** |
+  | `function f(n: i32, buf: i32[]): void { … }` — annotated | RUNS |
+  | a trailing bare `return` after the tail `if`, making the tail a statement | RUNS |
+  | `function f(c: boolean) { if c { return }  return 5 }` | **emit reject** |
+
+  The last row is `compiler/wasmEmit.vl`'s OWN witness, written into the comment above the
+  reject; it is the same mechanism reached the obvious way, and it is arguably the CHECKER's
+  to refuse rather than the emitter's.
+
+* **THE FIX IS THE MESSAGE AS MUCH AS THE LOWERING.** "bare return is not supported" is false
+  as written — bare returns are supported — and it points at the function rather than at the
+  tail expression that made the result non-void. Either infer void for a body whose only
+  value is an incidental `push`, or say `this function's result type was inferred as T
+  because its last expression is …`, and point at that expression.
+
+---
+
+### D1033 — a STRING INDEX passed directly to a value-union parameter is check-clean invalid wasm when the string was narrowed out of a union carrying a RECURSIVE MAP arm; hoisting the index runs
+
+**check-clean invalid wasm · check rc 0 · `type mismatch: expected (ref $type), found i32` · clause 1 · found 2026-09-02 by the coordinator verifying #2322's review, writing the plainest consumer of `std:json` (`k[i].toString()` in a loop over a narrowed string) · independently re-hit the same hour by the builder writing a probe that printed `toString(v[0])` for a string read out of a `Json` map · three ingredients, each measured alone**
+
+Repro:
+
+    type J = string | { [string]: J }
+    function h(x: i32 | f64): i32 { if x is i32 { return x } 0 }
+    function f(k: J): i32 {
+      if k is string { return h(k[0]) }
+      0
+    }
+    print(f("ab"))
+
+* **ABLATED — the three ingredients, each removed alone, all RUN:**
+
+  | change | outcome |
+  | --- | --- |
+  | as filed | **INVALID WASM** |
+  | (i) the map arm made NON-recursive (`{ [string]: i32 }`) | RUNS → `97` |
+  | (i) a recursive LIST arm instead (`string \| J[]`) | RUNS → `97` |
+  | (ii) the index HOISTED (`const b: i32 = k[0]; h(b)`) | RUNS → `97` |
+  | (ii) `k.length` in place of `k[0]` | RUNS → `2` |
+  | (iii) the callee parameter a plain `i32` | RUNS → `97` |
+  | (iii) the callee is `std:fmt`'s `toString` (a value union) | **INVALID WASM** |
+
+  So: a **recursive MAP arm** in the operand's declared union, the **string index as the
+  DIRECT argument**, and a **value-union parameter** on the callee. The last row is why this
+  is not exotic — `toString` is the value union every program reaches for, so the shape is
+  `k[i].toString()`.
+
+* **THE READING.** The box-the-argument path classifies `k[0]` against `k`'s DECLARED type
+  `J`, sees the map arm, and emits a ref where the string byte (an `i32`) is on the stack —
+  the narrowing to `string` is not consulted at the boxing site. That is why hoisting fixes
+  it: the local has a declared `i32` type of its own and never re-consults `J`.
+
+* **WHAT IT TOUCHES.** Every byte-level walk over a parsed JSON string, which is the first
+  thing a consumer of `std:json` writes. The route-around is one line and is named in
+  `std/json.vl`'s consumer paragraph beside [D1030](#d1030) and [D1029](#d1029).
+
+---
+
+### D1034 — an `if`/`else` with ONE EMPTY BRANCH inside a VOID function is check-clean and TRAPS on `unreachable`; either branch, either outcome, and both non-empty runs
+
+**loads then traps · check rc 0 · a compiler-emitted `unreachable` trap reported inside the void function · clause 1, and the worst outcome in the vocabulary: a trap is not an error a program can handle · found 2026-09-02 building `std/json.vl`, whose renderer was void and whose f64 arm was `if isFiniteF64(v) { } else { rendFail(…) }` · FIVE controls, every one of them RUNS**
+
+Repro:
+
+    function f(c: boolean, buf: i32[]) {
+      if c {
+      } else {
+        buf.push(1)
+      }
+    }
+    const b: i32[] = []
+    f(true, b)
+    print(b.length)
+
+* **ABLATED — five controls, all RUN:**
+
+  | spelling | outcome |
+  | --- | --- |
+  | as filed (empty THEN, populated `else`) | **TRAP `unreachable`** |
+  | empty ELSE, populated `then` | **TRAP `unreachable`** |
+  | called so the OTHER branch is taken | **TRAP `unreachable`** |
+  | both branches non-empty | RUNS |
+  | the empty `if` with NO `else`, work moved after it | RUNS |
+  | the same function given a `: boolean` result and a tail value | RUNS |
+  | the same `if`/`else` at MODULE scope instead of in a function | RUNS |
+
+  So the ingredients are exactly two: **an `if`/`else` where one branch is empty**, and
+  **a void function around it**. Which branch is empty does not matter, and neither does
+  which branch actually executes — an empty arm nobody enters still traps.
+
+* **AN EMPTY BRANCH IS NOT DEAD CODE, it is how a reader writes "nothing to do here".** The
+  shape arrives naturally from a positive predicate (`if isFinite(x) { } else { fail() }`)
+  and from commenting a branch out while debugging, and both are check-clean.
+
+* **HOW IT WAS FOUND, and the two claims it replaced.** `std/json.vl`'s renderer was written
+  void first and trapped on the first value it was handed. Two explanations were filed from
+  that trap WITHOUT a witness — that a bare `return` is not a VL statement, and that a
+  fall-through `is` ladder runs later tests against an earlier arm's value so `is boolean`
+  against a null traps. **Both are false and neither survived a re-run**: an `is` ladder over
+  a six-arm union answers only `is null` for a null at every shape tried (sequential, `else
+  if`, early-return, and read out of a `Json[]` element), and a bare return lowers correctly
+  in a genuinely void function ([D1032](#d1032) is the real constraint there). A first
+  ablation of this row was wrong too, for a reason worth recording: it varied a
+  HAND-SHORTENED copy of the trapping program rather than the program itself, the copy
+  already ran, and so six "ingredients" were measured against a baseline that did not
+  reproduce. **Delta-debug the program that actually failed** — the shortened paraphrase is a
+  different program, which is the same rule the filed-witness checker enforces.
+
+* **`std/json.vl` HAS NO EMPTY BRANCH LEFT**, and `renderInto` answers a `boolean` — the two
+  facts are independent and both are noted at its declaration, because either one alone is
+  enough to keep this trap away and a later edit could remove either.
+
+---
+
