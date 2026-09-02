@@ -30779,7 +30779,10 @@ alias INSIDE another union that has no rep.
   Json | E` used as a return type is still invalid wasm. Naming ANY revisited declared alias
   rather than only the outermost — a reverse lookup over `cUserTypes` on the cycle hit — was
   built and measured and does not move it, so the second alias hop fails somewhere else.
-  Worth starting there rather than re-deriving the cycle-guard story.
+  Worth starting there rather than re-deriving the cycle-guard story. Filed and ablated as
+  [D1028](#d1028): every VALUE arm the recursive alias contributed is delivered raw through
+  the named hop (`f64`/`boolean`/`string` invalid wasm, a list loud) while the struct arm
+  and `null` land; the non-recursive twin named and `type J2 = Json` alone both run.
 
 * **THE LITERAL-ARM MESSAGE WAS READ AS THE MECHANISM, AND IT IS NOT — the `string` in it is
   the LITERAL.** `Json | "err"` is reported as `Json|string` and that was read as "the alias kept
@@ -31100,12 +31103,20 @@ Repro:
   given: `null | f64` IS a `TyNullable`, and `P | null` nested one. A null-bearing UNION
   composed with `| null` does not nest a nullable — row 2 runs — so the fold is not what
   the three-arm case needed either; its members arrive flat and collapse. What a recursive
-  alias does in a composition is [D1021](#d1021)'s mechanism: it stays an opaque atom with
-  no member table, so the `null` already inside it is invisible to the member split, and
-  the composed type has nothing for the `bare null` gate to seed from. **This is D1021 with
-  `null` as the composed arm**, and D1021's route (1) — flatten the recursive alias into
-  the composition — is the fix expected to close it. Grade D1021 on this witness and on the
-  probe as well as on `Json | JsonError`.
+  alias does in a composition looked like [D1021](#d1021)'s mechanism — an opaque atom
+  with no member table — so this row first said it was D1021 with `null` as the composed
+  arm and would close with route (1). **Measured wrong the same day:** D1021 closed
+  (#2315, the self-reference now renders as the alias name) and this witness and the probe
+  re-graded on 627b26b3 with the identical message at the identical site. Recursion AND
+  null membership are a mechanism of their own; vl-de has it.
+
+* **A "FALLS OUT OF" IS A PREDICTION, NOT A MEASUREMENT — write it as one.** Twice on this
+  date a residue was attributed to an OPEN row's mechanism before that row's fix existed
+  to test against — D1026 to D1024's "duplicate atom", this row to D1021's "opaque atom" —
+  and both attributions were refuted by the close, each costing a four-file correction.
+  What worked both times was the other half of the sentence: putting the residue's witness
+  on the open row's grading list, so the close MEASURED it. Keep doing that; stop asserting
+  the outcome in the row's headline before the close does.
 
 * **WHY IT WAS NOT SEEN.** A minimal witness is minimal for the MECHANISM it found, not for
   the row's headline. D1026 was filed FOR `Json | null`; its witness kept the composition
@@ -31120,8 +31131,6 @@ Repro:
   null` and every optional-parameter spelling meet it. The design doc's build order already
   puts D1021 first; this row is the reason `Json | null` does not move off the list when
   D1026 closed.
-
----
 
 * **RE-ABLATED AFTER D1021 CLOSED, AND IT IS NOT D1021's MECHANISM.** Re-graded on the seed
   carrying #2315: identical message, identical site. Six programs separate the ingredients,
@@ -31154,5 +31163,53 @@ Repro:
   which says **canon is not the path this annotation takes** — the same thing D1026's
   instrumentation said, and the reason to find that path first rather than write a third
   spelling-side fix.
+
+---
+
+### D1028 — a NAMED alias of a composition carrying a recursive alias delivers every value arm raw: `type JR = Json | E` is check-clean invalid wasm for `f64`, `boolean` and `string`, and refuses a list, while the struct arm and `null` land and the direct spelling `Json | E` runs
+
+**check-clean invalid wasm · check rc 0 · `type mismatch: expected (ref $type), found f64` in the returning function (`found i32` for `boolean`, `found (ref $type)` for `string`); a `Json[]` value refuses loudly instead, `emitProgram: array value does not match any array member of the union (leaf-scalar widening across a nested array is unsupported)` · ZERO corpus cells (no recursive-alias axis) · reproduces on master at 627b26b3, the seed carrying D1021's close (#2315) · found 2026-09-01 by vl-de as D1021's residue ("the second alias hop fails somewhere else"), ablated here · probe `scripts/capability-probes/recursive-union-alias-named-composition.vl` · ingredients, ablated: the composition is NAMED, it carries a RECURSIVE alias, and the value delivered is one of that alias's own arms**
+
+Repro:
+
+    type Json = null | boolean | f64 | string | Json[] | { [string]: Json }
+    type E = { at: i32, msg: string }
+    type JR = Json | E
+    function f(): JR {
+      return 2.5
+    }
+    const r = f()
+    if r is f64 { print(r) }
+
+* **THE FAMILY, ABLATED** — every cell on 627b26b3:
+
+  | value into `JR` | return position | outcome |
+  | --- | --- | --- |
+  | `2.5` (`f64`) | return · module binding `const r: JR = 2.5` · argument `f(2.5)` | **check-clean invalid wasm** at all three positions |
+  | `true` | return | **check-clean invalid wasm** (`found i32`) |
+  | `"s"` | return | **check-clean invalid wasm** (`found (ref $type)`) |
+  | a `Json[]` binding | return | loud — `array value does not match any array member of the union` |
+  | `{ at: 0, msg: "empty" }` (the struct arm) | return | RUNS → `empty` |
+  | `null` | return, `f() == null` | RUNS → `true` |
+
+  Controls that RUN, same seed: the DIRECT spelling `function f(): Json \| E { return 2.5 }`
+  → `2.5` (D1021's close); the non-recursive twin named — `type Json = null \| boolean \|
+  f64 \| string \| f64[] \| {[string]: f64}`, `type JR = Json \| E`, both arms → `empty` /
+  `2.5`; and an alias of the recursive alias alone — `type J2 = Json`, `function f(): J2 {
+  return 2.5 }` → `2.5`. So one alias hop over the recursive alias is fine, one alias hop
+  over the composition that HOLDS it loses every arm the recursive alias contributed: the
+  struct arm the composition added itself is known, the six the alias brought are not, and
+  a scalar is delivered unboxed where the composed box is expected.
+
+* **WHAT WAS ALREADY TRIED (vl-de, in D1021's close).** Naming ANY revisited declared alias
+  on the cycle hit — a reverse lookup over `cUserTypes` — rather than only the outermost,
+  built and measured: does not move this cell. The table above is where to start instead:
+  the members the named hop drops are exactly the recursive alias's, so the question is
+  which member table `JR` is registered with, not what the cycle guard renders.
+
+* **WHAT IT TOUCHES.** `std:json`'s own signatures spell the composition directly
+  (`parseJson(self: string): Json \| JsonError`) and run on this seed; the row is hit the
+  moment a CONSUMER — or the builder, for tidiness — writes `type JsonResult = Json \|
+  JsonError`. The builder brief says not to name it until this closes.
 
 ---

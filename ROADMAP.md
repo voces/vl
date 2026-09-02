@@ -269,13 +269,16 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   whether `string | "err"` collapses (D1024). Three more gaps filed by the critique
   round: D1025 (a map subscript mints no narrowing key — the usability critique's gap A,
   check-clean invalid wasm at an integer-literal key), D1026 (a null-bearing alias
-  composed with `| null` — CLOSED #2312 for its witness) and D1027 (the `Json | null`
+  composed with `| null` — CLOSED #2312 for its witness), D1027 (the `Json | null`
   signature D1026 was filed for is STILL refused after that fold: recursion is a second
-  ingredient, so it is D1021 with `null` as the composed arm). **Measuring it found the blocker: D1021 — `Json | JsonError`, the ruled fs-shaped
-  return, is check-clean INVALID WASM because a recursive alias does not compose into a
-  wider union** (probe `scripts/capability-probes/recursive-union-alias-composed.vl`). The
-  API is NOT bent around it (a carrier struct runs today and was declined — std has no
-  deprecation story); the builder is sequenced after D1021. Also filed: D1022 (named arm
+  ingredient; re-graded identical after D1021 closed, so its own mechanism) and D1028 (a
+  NAMED alias of the composition, `type JR = Json | E`, delivers the recursive alias's
+  value arms raw while the direct spelling runs). **Measuring it found the blocker: D1021
+  — `Json | JsonError`, the ruled fs-shaped return, was check-clean INVALID WASM because a
+  recursive alias did not compose into a wider union — CLOSED #2315** (probe
+  `scripts/capability-probes/recursive-union-alias-composed.vl` now RUNS). The API was NOT
+  bent around it (a carrier struct ran and was declined — std has no deprecation story);
+  the builder is unblocked and must spell `Json | JsonError` directly (D1028). Also filed: D1022 (named arm
   aliases `JsonObject`/`JsonArray` in a recursive union — readability, not blocking).
   Still open in that section: OQ-2/OQ-3/OQ-4 (full briefs with recommendations, awaiting a
   ruling). Engineering fallout filed: D1008 (`u8[]` struct field, clause 2),

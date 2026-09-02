@@ -20,7 +20,8 @@
 > language change, §5 names the change as a build item with its measurement, and the
 > surface is written for the language VL is meant to be. A `std` name is close to permanent
 > (CLAUDE.md); a compiler gap is not. **Four such gaps were found while measuring this
-> proposal, and one of them blocks the ruled error shape outright (D1021).**
+> proposal, and one of them blocked the ruled error shape outright (D1021 — closed #2315
+> the next day, which is the point: the gap moved, the name would not have).**
 
 ---
 
@@ -624,9 +625,10 @@ SURFACE needs, each one a program in the appendix:
 
 | position | outcome (RUN 2026-09-01) |
 | --- | --- |
-| `Json \| JsonError` returned, error side | **check-clean INVALID WASM — D1021** |
-| `Json \| JsonError` returned, value side only | invalid wasm — D1021 |
-| `is JsonError` on the composition | loud: `deferred value-union composition` — D1021 |
+| `Json \| JsonError` returned, error side | was check-clean INVALID WASM — D1021; **RUNS** after #2315 |
+| `Json \| JsonError` returned, value side only | was invalid wasm — D1021; **RUNS** after #2315 |
+| `is JsonError` on the composition | was loud `deferred value-union composition` — D1021; **RUNS** after #2315 |
+| `type JR = Json \| JsonError` NAMED, then used | **check-clean INVALID WASM — D1028** (the direct spelling is what runs) |
 | the same with a NON-recursive `J` | RUNS |
 | `{ value: Json, error: JsonError \| null }` carrier | RUNS (the shape declined in §5) |
 | `JsonObject`/`JsonArray` aliases as members of the tree | check error — D1022 |
@@ -647,7 +649,7 @@ SURFACE needs, each one a program in the appendix:
 
 Per the owner's direction the surface above is the one VL should have, and these are the
 gaps between it and the 2026-09-01 seed. Each is a program in the appendix; the first
-blocks the module outright.
+blocked the module outright until it closed the same day.
 
 1. **D1021 — a recursive union alias composed into a wider union.** `Json | JsonError`
    returns the error struct where the composed box is expected: **check-clean invalid wasm**
@@ -655,16 +657,20 @@ blocks the module outright.
    ingredient (the alias's recursion; arm kinds are not one). Mechanism visible in the
    literal-arm message: `Json | "err"` is reported as `Json|string` "with no recorded
    members" — the emitter flattens a non-recursive alias into a composition and keeps a
-   recursive one as an opaque atom with no member table. **Blocks v1.** Filed in
-   `docs/internals/silent-class-inventory.md`; probe
-   `scripts/capability-probes/recursive-union-alias-composed.vl` (the module's real shape,
-   grades GAP today).
+   recursive one as an opaque atom with no member table. Blocked v1 for one day.
+   **CLOSED #2315 (2026-09-01)**: the alias's self-reference now renders as the alias
+   name (the cycle guard answered `""`), and probe
+   `scripts/capability-probes/recursive-union-alias-composed.vl` — the module's real shape
+   — RUNS on 627b26b3, both sides of `Json | JsonError`, with `is JsonError` narrowing.
+   Two residues the close did not take, neither on the module's own spellings: D1027
+   (item 3) and D1028 (item 3a).
 
-   **Why the API is not bent around it.** `{ value: Json, error: JsonError | null }` RUNS
-   today and would ship the module tomorrow. Declined: std has no deprecation story, every
-   other std module returns `T | Error`, and a consumer who learned `if r is IoError` should
-   not learn `if r.error != null` for one module because of a compiler gap that has a row
-   number. The builder is sequenced after D1021.
+   **Why the API was not bent around it.** `{ value: Json, error: JsonError | null }` RAN
+   throughout and would have shipped the module a day earlier. Declined: std has no
+   deprecation story, every other std module returns `T | Error`, and a consumer who
+   learned `if r is IoError` should not learn `if r.error != null` for one module because
+   of a compiler gap that has a row number. The builder is sequenced after D1021 — which
+   is to say, unblocked now.
 
 2. **D1025 — a map subscript mints no narrowing key** (*post-critique*; the usability
    critique's gap A, filed 2026-09-01). The load-bearing gap the helper decline was
@@ -683,9 +689,21 @@ blocks the module outright.
    (#2312: `(T | null) | null` folds at `mkNullableTy`, the nesting was in the arena type
    and not in the spelling) and `string | "err"` fails identically afterwards. And the
    `Json | null` signature itself is STILL refused on the merged seed — D1027: the alias's
-   recursion is a second ingredient, which makes it D1021 with `null` as the composed arm,
-   expected to close with item 1. A minimal witness is minimal for the mechanism it found,
-   not for the row's headline; the probe that kept the headline shape is what caught it.
+   recursion is a second ingredient. It was then read as D1021 with `null` as the composed
+   arm; item 1 closed (#2315) and D1027 re-graded with the identical refusal, so it is its
+   own row (vl-de has it). Twice in one day a residue was attributed to an open row's
+   mechanism and the close refuted it: a minimal witness is minimal for the mechanism it
+   found, not for the row's headline, and "falls out of" is a prediction until measured.
+
+3a. **D1028 — a NAMED alias of the composition** (*post-D1021*; filed 2026-09-01).
+   `type JR = Json | E` delivers every arm the recursive alias contributed RAW — `f64`,
+   `boolean`, `string` are check-clean invalid wasm at return, binding and argument, a
+   `Json[]` value refuses loudly — while the struct arm and `null` land, and the direct
+   spelling `Json | E` runs (that is what item 1 closed). The module spells `Json |
+   JsonError` directly in every signature and so does not hit this; **the builder must
+   not introduce `export type JsonResult = Json | JsonError`** until it closes, and a
+   consumer who tidies the spelling into a name is the first to meet it. Probe
+   `scripts/capability-probes/recursive-union-alias-named-composition.vl`.
 
 4. **D1009 / D1010 — `Json | null` ↛ `Json` and null-bearing literals needing the `Json[]`
    annotation.** Both open, both loud check rejects. They are what makes the walking idiom
@@ -749,8 +767,9 @@ measurements):
    spells either.
 
 Everything else the three critiques raised is either taken (§1–§2 above, each marked
-*post-critique*) or a build item (§5). The builder is briefed after these three are ruled
-and D1021 closes.
+*post-critique*) or a build item (§5). D1021 closed on 2026-09-01; the builder is briefed
+on the ruled core (`Json`, `JsonError`, `parseJson`, `toJson`) with the three questions'
+outputs — `jsonPointer`, `asExactI32`, nothing for q3 — landing as follow-ups once ruled.
 
 ---
 
