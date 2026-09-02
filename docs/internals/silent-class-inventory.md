@@ -29627,7 +29627,7 @@ Repro (runs today and must keep running — as D1006, the defect is in the NEXT 
 
 ### D1008 — a `u8[]` STRUCT FIELD has no rep: the packed byte list ships at every VALUE position and at no CONTAINER position
 
-**loud emit reject · check rc 0 · `emitProgram: struct field type `u8[]` has no struct-field rep` · the ONE scalar list that cannot be a field — `i32[]` / `i64[]` / `f64[]` / `boolean[]` / `string[]` fields all run · `u8[]` runs at global, parameter, return, binding and capture · pinned LOUD by `tests/cases/arrays/error-u8-struct-field-unsupported.vl` and its generic-alias twin since #1829, but never filed as the clause-2 gap it is · surfaced by the serde critique panel: it is the VLB decoder's own cursor shape**
+**runs, all ten delivery positions print their value — CLOSED 2026-09-01 by giving the packed byte list its own struct-field code (35), wired at the type section, the construct, the element and whole-field writes, the widen site and the anon/functype gates; pinned by `tests/cases/arrays/u8-struct-field-positions.vl` and by the four fixtures that used to pin the refusal (`arrays/u8-struct-field.vl`, `arrays/u8-inline-shape-field-never-read.vl`, `generics/u8-field-through-generic-alias.vl`, `generics/u8-field-generic-alias-never-read.vl`, all graduated from `error-*` to `@run`). Was: loud emit reject · check rc 0 · `emitProgram: struct field type `u8[]` has no struct-field rep` · the ONE scalar list that could not be a field · surfaced by the serde critique panel: it is the VLB decoder's own cursor shape**
 
 The refusal is deliberate and old — the fixture that pins it says why: without it a `u8[]`
 field took `fieldCodeOfSpelling`'s ref-list code and the emitter interned a ref-list wrapper
@@ -29645,7 +29645,7 @@ honest; this row is what makes it a gap somebody owes.
 
 * **THE SITE.** `compiler/emit_classify.vl:19835-19858`: the union-ARM arms fire first
   (D734/D761), then the general sentence that substitutes the field's rendered type. The
-  fixture header (`tests/cases/arrays/error-u8-struct-field-unsupported.vl`) enumerates the
+  fixture header (`tests/cases/arrays/u8-struct-field.vl`) enumerates the
   container positions that share the missing backing — struct field, map value, ref-list
   element / `u8[][]`. The `T[] | null` niche it also listed has since landed (D979).
 
@@ -29657,14 +29657,34 @@ honest; this row is what makes it a gap somebody owes.
   heap type, different rep ladder) — both are workarounds for a missing field code, not
   designs.
 
-* **WHAT CLOSING IT NEEDS.** The struct table's field-kind ladder gets a packed-`u8` rung —
-  the type-section field type, the construct, the read, the write, struct equality, the
-  optional chain — wired at EVERY delivery before the gate narrows (the D965 order). The
-  generic-alias spelling (`type Box<T> = { v: T }` at `Box<u8[]>`, `gaeEnsure`) refuses
-  word-for-word today and must close in the same change; `string-rep-measurements.md`
-  (§"the `u8[]` generic arm") records the arm that becomes reachable when it does.
+* **HOW IT CLOSED — CODE 35, NOT A SIXTH `scalarListKindOfName` ENTRY.** The old refusal's
+  own comment explained why a sixth entry there would be wrong: those five codes are read by
+  the map-value, field, closure-result and `$fnsig` param/result ladders, and a sixth would
+  be a silent wrong answer in each until every one grew an arm. A code of its own is
+  invisible to all four. It reuses the wrapper/backing pair `u8[]` already has at every value
+  position (`bl8TypeIdx` / `ba8TypeIdx`, build kind 10), so nothing new was minted — the
+  container position simply gained the code it lacked. The other three container positions
+  (map value, ref-list element / `u8[][]`) still refuse loudly and still have their fixtures.
 
-Repro (loud emit reject):
+* **TEN POSITIONS, EACH READ BACK.** Per the D965 order the gate moved last, and the grading
+  is by VALUE: construct + `.length`, element read, element WRITE, whole-field write,
+  argument, `for in`, return, nested struct field, function scope, and an element of a
+  `Cur[]`. A one-byte backing is unforgiving of the wrong wrapper, which is what makes the
+  `255` round-trip in the generic-alias fixture and the `9` after an element write
+  load-bearing rather than decorative.
+
+* **THE FOUR REFUSAL FIXTURES GRADUATED RATHER THAN BEING DELETED**, and were renamed off
+  their `error-` prefix — a name that says "error" on a running program is the kind of drift
+  this row exists to catch. Each keeps its original account of the hazard it guarded; two of
+  them (`*-never-read`) pin the spellings whose miscompile produced no symptom at all.
+
+* **STRUCT EQUALITY IS NOT PART OF THIS ROW.** `a == b` over a `u8[]` field refuses — and so
+  does an `f64[]`, `i64[]` or `string[]` field, measured. Only `i32[]` (code 4) has an
+  equality arm. That is one pre-existing gap spanning four of the five scalar-list field
+  codes, filed as [D1020](#d1020); it is not a `u8[]` fact and closing it here would have
+  been the wrong row.
+
+Repro (runs, prints `0`):
 
     type Cur = { buf: u8[], pos: i32 }
     const c: Cur = { buf: [1, 2, 3], pos: 0 }
@@ -30456,3 +30476,41 @@ lowering; it is right at module scope and wrong in a function body.
 * **CLOSED BY DELETING A CASE, NOT ADDING ONE.** `emitMapGetOr` already lowers this shape and
   probes once; the rewrite was overreaching. The guard is one predicate (`drwIsMapRead`), and
   the fix is a net efficiency win as well as a correctness one.
+### D1020 — struct-field equality has an arm for `i32[]` and for NO other scalar list: `f64[]`, `i64[]`, `string[]` and `u8[]` fields all refuse
+
+**loud emit reject · check rc 0 · `emitProgram: unsupported struct field type in equality` (`compiler/wasmEmit.vl`) · four of the five scalar-list field codes have no equality arm, and the fifth's is a hand-written 50-line loop · found 2026-09-01 by [D1008](#d1008)'s position matrix, which had to exclude equality to stay a `u8[]` row · pre-existing and unrelated to `u8[]` — the same refusal predates that code**
+
+Repro:
+
+    type S = { v: f64[] }
+    const a: S = { v: [] }
+    const b: S = { v: [] }
+    print(a == b)
+
+Every OTHER position compares fine: two `f64[]` VALUES compare, and the same struct with an
+`i32[]` field compares. It is the field-equality ladder specifically, which grew exactly one
+scalar-list arm and never the rest.
+
+* **MEASURED ACROSS THE FIVE ELEMENT TYPES, same struct, same empty literal.**
+
+  | field type | field code | `a == b` |
+  | --- | --- | --- |
+  | `i32[]` | 4 | RUNS → `true` |
+  | `f64[]` | 25 | emit reject |
+  | `i64[]` | 26 | emit reject |
+  | `string[]` | 6 | emit reject |
+  | `u8[]` | 35 | emit reject |
+
+* **THE SHAPE OF THE FIX IS "GENERALISE, DON'T COPY".** Code 4's arm is ~50 lines of
+  open-coded loop: length off the wrapper, both backings into stash slots, a counter loop
+  with `array.get` + `i32.ne`. Four more copies differing only in the wrapper index, the
+  backing index and the element comparison instruction would be the wrong answer — the arm
+  wants the wrapper/backing pair and the compare op as parameters, the way
+  `emitListEqAnyRep` already serves the ref-list arm (code 5) for every element rep.
+
+* **CLAUSE 2 BY CONSTRUCTION.** `vl check` accepts the comparison, so either the program is
+  legal and must compile or the checker owed the diagnosis. The message concedes nothing
+  ("unsupported struct field type in equality"), so `goal-scoreboard.py --sites` does not
+  count it — a D964 lower-bound case.
+
+---
