@@ -31115,9 +31115,24 @@ until then.
   program at all. That is what to file or fix next; the alias spelling no longer adds anything
   to it.
 
-### D1023 — two struct arms with the same field names and reps but DIFFERENT literal-union field types are one arm to `is`: both tests answer `true`, and the narrowed access traps
+### D1023 — two struct arms with the same field names and reps but DIFFERENT literal-union field types are one arm to `is`: both tests answer `true` (the narrowed access ALSO trapped; that half is closed)
 
-**loads then traps · check rc 0 · `wasm trap: cast failure` at the second narrowed field read, after the first arm printed · `r is A` and `r is B` both print `true` for one value · ZERO corpus cells · found 2026-09-01 by the `std:json` std-consistency critique (`docs/internals/json-critique-std.md` finding 1): `JsonError { at, kind, msg }` re-spends `Base64Error`'s shape, and `Base64Error | JsonError` — a base64-embedded JSON payload's natural error union — is this program · one ingredient: the two arms share every field NAME and REP; the literal SETS differing is not enough**
+**check-clean silently wrong — `r2 is A` prints `true` on a `B` value where the 2026-09-02 ruling
+says `false` · the TRAP HALF closed 2026-09-02 with [D1031](#d1031)'s canon-key fix (the two arms
+now share ONE heap type, which is the rep the ruling recommends) and the witness was RE-FILED on
+the half that remains · ZERO corpus cells · found 2026-09-01 by the `std:json` critique
+(`docs/internals/json-critique-std.md` finding 1) · one ingredient: the two arms share every field
+NAME and REP; the literal SETS differing is not enough**
+
+**WHY THE TRAP WENT, AND WHY THAT IS NOT THE RULING BEING MET.** The trap was a CORRECT branch
+failing: `r2 is B` on a `B` value answered `true` and then `ref.cast`-ed to a heap type that was
+not the value's, because `repCanonId` gave a bare `TyLit` the ARENA-INDEX sentinel and the two
+arms therefore keyed as two shapes. With that key fixed the arms share ONE heap type — the
+representation the ruling recommends — and the ROW'S ORIGINAL WITNESS now prints the `a` then `b`
+its grading list asks for. **The answers did not move**: measured on the seed carrying the fix,
+`is A` / `is B` is still `true` / `true` on a `"p"` value AND on an `"x"` value. So the row is
+open on its own terms, and its witness is re-filed on the half that remains — a witness that
+takes only true-positive branches cannot see a test that never says `false`.
 
 Repro:
 
@@ -31127,10 +31142,17 @@ Repro:
       if n == 0 { return { at: 1, kind: "x", msg: "a" } }
       return { at: 2, kind: "p", msg: "b" }
     }
+    const r2 = f(1)
+    print(r2 is A)
+    // PRINTS true
+
+The ORIGINAL witness — the one that loaded and then trapped — is the same program reading the
+narrowed field at both arms, and it now prints `a` then `b`:
+
     const r = f(0)
     if r is A { print(r.msg) }
-    const r2 = f(1)
-    if r2 is B { print(r2.msg) }
+    const r2b = f(1)
+    if r2b is B { print(r2b.msg) }
 
 `A` and `B` are different TYPES — `"x" | "y"` and `"p" | "q"` share no member — so the
 checker keeps them as two arms and accepts the narrowing. The emitter gives a literal union
@@ -31846,11 +31868,16 @@ Repro:
 
 ---
 
-### D1031 — a struct FIELD or a RETURN typed `JsonError | null` is a loud emit reject once `JsonError` is also a union ARM elsewhere in the program; the identical spellings run when nothing composes it
+### D1031 — [CLOSED 2026-09-02] a struct FIELD or a RETURN typed `JsonError | null` is a loud emit reject once `JsonError` is also a union ARM elsewhere in the program; the identical spellings run when nothing composes it
 
-**loud emit reject · check rc 0 · clause 2 · TWO messages, one ingredient: `emitProgram: a struct field typed as the union ARM JsonError has no field rep` at the field (the compiler backticks the type name inside its own message), and `emitProgram: ref valtype with no interned shape` at the return · found 2026-09-02 building `std/json.vl`, which routes around both by flattening its scanner's error into plain fields**
+**runs, prints `true` — CLOSED 2026-09-02 by THREE independent fixes, and this row's own "TWO
+messages, ONE ingredient" headline is REFUTED by the ablation that closed it · was a loud emit
+reject, clause 2 · zero `runs` lost, distilled corpus unmoved (0 classes), rep-fuzz exact ·
+fixtures `unions/arm-with-literal-field-nullable-faces.vl` +
+`unions/narrowed-arm-delivery-positions.vl`, probe `narrowed-arm-delivery-positions.vl` · also
+closes the TRAP half of [D1023](#d1023) and flips `unions/nullable-variant-arm-beside-union.vl`**
 
-Repro:
+Repro (now runs, printing `true`):
 
     type Json = null | boolean | f64 | string | Json[] | { [string]: Json }
     type JsonError = { at: i32, kind: "syntax", path: string, msg: string }
@@ -31861,8 +31888,105 @@ Repro:
     if r is JsonError { p.err = r }
     const e = p.err
     print(e == null)
+    // was: vl check rc 0; vl run -> emitProgram: a struct field typed as the union ARM
+    //   `JsonError` has no field rep …
 
-* **THE RETURN FACE, same ingredient, different message:**
+* **THE TWO MESSAGES ARE TWO INGREDIENTS, NOT ONE — this row's own headline, corrected by the
+  ablation that closed it.** The bisection that produced "the blocking field is the
+  literal-union one" describes the FIELD face and does not describe the RETURN face at all: the
+  return witness still refuses with `kind: string` in place of `kind: "syntax"` (no literal
+  anywhere in the program), with `Json` deleted, and with the `is` test deleted. Its actual
+  ingredient is that the composing union is spelled INLINE. Each row below is ONE edit off the
+  return witness, on master:
+
+  | witness | master |
+  | --- | --- |
+  | the return face, verbatim | refuses |
+  | … `Json` replaced by a plain struct arm (`Other \| JsonError`) | refuses |
+  | … `kind: string` instead of `kind: "syntax"` | refuses |
+  | … the `is` test deleted | refuses |
+  | … the composing union given a NAME (`type Shape = Other \| JsonError`) | **runs** |
+  | … the `\| null` dropped from the return type | **runs** |
+  | … the inline union moved to a PARAM or a BINDING annotation | refuses |
+
+* **FIX 1 — A BARE `TyLit` KEYED BY ARENA INDEX, so two spellings of `"syntax"` were two
+  shapes.** `repCanonIdGo` / `repCanonKeyGo` left `TyLit` to the index sentinel, which is unique
+  per arena entry. `type Dot = {r: i32, k: "syntax"}` beside an identically-spelled
+  `type Dab = {r: i32, k: "syntax"}` therefore keyed differently, `buildStructTwins` never
+  compared them, and the two rows each allocated a heap type for ONE checker type — **check-clean
+  invalid wasm with no union anywhere in the program**, which nothing had filed. The sentinel's
+  own claim ("it can only DECLINE a merge, never invent one") is true and is not a safety
+  argument here: a declined merge between two shapes the CHECKER accepts for each other IS the
+  miscompile. A bare-literal field codes 3, the same slot a `string` field takes
+  (`variantFieldIdText` says so in its own words — "this is not a rep change: the field still
+  codes 3"), so the two shapes emit one struct type and must key as one; the enclosing UNION arm
+  already widened a lit run to `string` this way, so this is the bare case catching up with it.
+  With that key, D761's demand-driven arm intern finds its OWN row through the existing
+  structural rung — a `uVarArmRow` column banking the mint's answer was built first, and
+  REVERTED once the key made it dead.
+
+* **FIX 2 — THE NARROWED ARM WAS THE BOX AT NINE DELIVERY POSITIONS.** With the row minted the
+  field face became check-clean invalid wasm, exactly as this row predicted it would. See the
+  matrix below.
+
+* **FIX 3 — `annCommitVariantMembers` REFUSED TO REGISTER A STRUCT THE MODULE ALSO USES AS
+  `E | null`.** That exclusion was written when there was no `nulvariant` VKind, and
+  `unions/error-nullable-variant-unsupported.vl` says in its own words *"Lifting it is a rep
+  slice: a `nulvariant` VKind … When it lands, drop the exclusion with it."* It has landed
+  (`fbValtype`'s `nulvariant` arm, `retNulVariantFlag` / `nulVariantIndexOf` as the kind/slot
+  PAIR), so it is dropped and the RETURN face runs. The exclusion is also why only the INLINE
+  spelling refused: the DECLARATION route registers its members unconditionally.
+
+* **THE POSITION MATRIX — TEN lost, every one CHECK-CLEAN INVALID WASM on master.** One tiny
+  program per position, each printing a field read THROUGH the destination (`7`), so a cell that
+  lands the box cannot pass by printing something.
+
+  | position | master | now |
+  | --- | --- | --- |
+  | binding annotated at the arm | INVALID WASM | **runs** |
+  | argument, bare arm param | runs | runs |
+  | argument, `Circle \| null` param | INVALID WASM | **runs** |
+  | return, bare arm | runs | runs |
+  | return, `Circle \| null` | INVALID WASM | **runs** |
+  | struct field, construct | INVALID WASM | **runs** |
+  | struct field, construct, nullable | INVALID WASM | **runs** |
+  | struct field, assign | INVALID WASM | **runs** |
+  | struct field, assign, nullable | INVALID WASM | **runs** |
+  | ref-list element, literal `[s]` | INVALID WASM | **runs** |
+  | ref-list element, `push` | INVALID WASM | **runs** |
+  | module-GLOBAL assignment (`gv = s`) | INVALID WASM | **runs** |
+  | map VALUE store (`m[k] = s`) | INVALID WASM | **runs** |
+
+  The two that already ran are the two that carried the sequence inline (`emitCall`'s variant
+  PARAM, `emitVariantCoerce`'s return). The unbox is `struct.get $uBox 1` + `ref.cast`, cast to
+  the **DESTINATION's** heap rather than `uVarHeap[vi]`: where D280 merged the arm with a twin
+  the two indices are equal anyway, and asking the destination is what keeps the cast target and
+  the slot from disagreeing.
+
+* **NOT DONE THE `exprUnion` WAY, and that was a choice.** [D1029](#d1029) closed the MAP arm by
+  EXCLUDING it from `exprUnion`, so its read unboxes and union-typed destinations re-box. The
+  same move for the STRUCT arm relocates every `is`-narrowed struct receiver in the language at
+  once — `emitNarrowedMem`, `emitIs`'s re-narrowing and struct `==` all read the box today — so
+  this wires the deliveries instead and keeps the matrix as the completeness check.
+
+* **TWO POSITIONS ARE STILL NOT SERVED, and each is a different defect.** An UN-annotated
+  rebind (`const c = s`) is the loud `field access but no struct type declared`, and an
+  arm-typed field ON A VARIANT is the loud
+  `only i32 / boolean / string / array union-variant fields are supported` — D761's
+  variant-side sibling, untouched here.
+
+* **`std/json.vl` CANNOT DROP ITS WORKAROUND YET, AND THAT IS A MEASURED ANSWER, NOT A
+  CAUTION.** This row's witness spells `kind: "syntax"` — a BARE literal — and the module
+  spells `kind: "syntax" | "duplicate" | "depth" | "nonfinite"`, an inline literal UNION, which
+  is a different field code on the two tables and still refuses: [D1043](#d1043), filed from
+  the module's ACTUAL carriers rather than from this row's paraphrase of them. Naming that
+  union (`type JsonErrorKind = …`) makes the SCANNER face build today — verified by hand — and
+  the RENDERER face then meets [D1044](#d1044), a pre-existing silently-wrong read. So the
+  workaround comes out in one more step, not in this one. **Writing the real module's spelling
+  instead of the row's is what found both**: a paraphrased witness is a different program.
+
+* **THE RETURN FACE — a DIFFERENT ingredient, as the ablation above shows; "same ingredient"
+  was this row's claim and the close refuted it:**
 
       type Json = null | boolean | f64 | string | Json[] | { [string]: Json }
       type JsonError = { at: i32, kind: "syntax", path: string, msg: string }
@@ -31879,24 +32003,31 @@ Repro:
 
 * **THE CONTROLS RUN, and they are the same lines.** Delete the two functions that put
   `JsonError` in a union and BOTH repros run — the struct-field one prints `x`, the return one
-  prints `true`. So neither spelling is refused on its own merits: `JsonError | null` is a
+  prints `true`. So neither spelling was refused on its own merits: `JsonError | null` is a
   perfectly ordinary nullable struct until some OTHER declaration composes `JsonError` into a
-  union, at which point the arm's rep displaces the plain struct's and the nullable has
+  union, at which point the arm's rep displaces the plain struct's and the nullable had
   nowhere to land. **A type's usable spellings shrink because of a declaration elsewhere in
-  the program**, which is the part that makes this worth a row rather than a note.
+  the program**, which is the part that made this worth a row rather than a note — and it is
+  the part that survives the close intact, since the two faces turned out to have two
+  DIFFERENT declarations-elsewhere as their ingredient.
 
-* **THE FIRST MESSAGE'S ADVICE DOES NOT APPLY.** It offers "give the field the UNION's own
-  type, or declare the arm as a plain struct". The first is wrong here — the field holds an
-  error, not a `Json | JsonError` — and the second is what the program already does, since
-  `JsonError` IS a plain struct declaration. The message describes the emitter's two internal
-  reps rather than a choice the author has, and narrowing it is part of the fix.
+* **THE FIRST MESSAGE'S ADVICE DOES NOT APPLY, AND THE MESSAGE STILL STANDS.** It offers "give
+  the field the UNION's own type, or declare the arm as a plain struct". The first was wrong
+  here — the field holds an error, not a `Json | JsonError` — and the second is what the program
+  already did, since `JsonError` IS a plain struct declaration. The close did NOT narrow the
+  sentence: `armFieldStructRow` still answers -1 wherever `variantStructHeapTwinAt`'s layout
+  guard declines (an arm with a code 5 / 15 / 28 field), so the message survives for a domain it
+  still describes badly. Narrowing it is residue, not part of this fix.
 
 * **WHAT IT COST, and the route-around.** `std/json.vl` carries its parse error as five flat
   fields on the scanner struct (`live`, `at`, `kind`, `path`, `msg`) and its render error as
   four on a second one, rather than one `JsonError | null` field each; the renderer returns a
   `boolean` and reports through that struct rather than returning `JsonError | null`. That is
   a mechanical rewrite and costs no behaviour, but it is the reason the module's internals do
-  not read like `std/fs.vl`'s, and it should be undone when this closes.
+  not read like `std/fs.vl`'s. **THIS CLOSE DOES NOT UNDO IT** — see the bullet above: the
+  module's `kind` field is an inline literal UNION, not the bare literal this row's witness
+  carries, and that spelling still refuses ([D1043](#d1043)). The undo is a std change gated on
+  D1043 (or on naming the `kind` union) and wants its own review either way.
 
 ---
 
@@ -31910,23 +32041,30 @@ Repro:
   "syntax" }` **refuses**, and the full `JsonError` shape refuses. So a single literal-union
   member is enough.
 
-* **AND A HAND-WRITTEN LAYOUT TWIN DOES NOT HELP**, which is the part that rules out the
-  obvious repair. D761 resolves an arm-typed field through `variantStructHeapTwinAt`, whose
-  whole premise is that the arm shares a heap with a standalone struct row of the same layout
-  ([D280](#d280)). Declaring `type JETwin = { at: i32, kind: "syntax", path: string, msg:
-  string }` beside it changes nothing. Instrumented: `repRowOfTyStruct(uVarTyIx[vi], …)`
-  answers **si = -1** — no row matches, because the lookup is keyed by EXACT arena index and
-  each `"syntax"` literal is its own arena type, so two identically-spelled litunion fields
-  are two types.
+* **AND A HAND-WRITTEN LAYOUT TWIN DID NOT HELP — this observation is the one that closed the
+  row, one layer below where it stopped.** D761 resolves an arm-typed field through
+  `variantStructHeapTwinAt`, whose whole premise is that the arm shares a heap with a standalone
+  struct row of the same layout ([D280](#d280)). Declaring
+  `type JETwin = { at: i32, kind: "syntax", path: string, msg: string }` beside it changed
+  nothing. Instrumented: `repRowOfTyStruct(uVarTyIx[vi], …)` answered **si = -1**, because each
+  `"syntax"` literal is its own arena type and `repCanonId` gave a bare `TyLit` the
+  ARENA-INDEX sentinel — so two identically-spelled literal fields were two shapes.
 
-* **SO THE FIX IS A REP DECISION, NOT A LOOKUP FIX.** The field wants `(ref null
-  $uVarHeap[vi])` and code 15 can only name a struct ROW (`sHeapIdx[si]`); **no field code in
-  the table names a variant heap** — checked against `pushFieldStorage`'s whole ladder. Two
-  routes, both structural: give the arm-typed field a code of its own that stores
-  `uVarHeap[vi]` (D1008's shape, with the same D965 delivery matrix to wire), or mint a
-  standalone struct row for an arm that has no twin and point `uVarHeap[vi]` at it, which is
-  what D280 already does wherever a twin exists. The second is smaller in the type section and
-  larger in the variant/struct table relationship.
+  **THE TWIN'S OWN PROGRAM WAS ALREADY A MISCOMPILE, and nobody had run it.** Take the union
+  away entirely: `type Dot = {r: i32, k: "syntax"}` + `type Dab = {r: i32, k: "syntax"}` +
+  `const c: Dab = …` into a `Dot`-typed field is `vl check` rc 0 and **invalid wasm** on master.
+  That is D280's soundness rule broken by the literal, and fixing the key closes both it and
+  this row's field face at once. Re-running the twin control before believing "a twin does not
+  help" is what would have found it a day earlier.
+
+* **~~SO THE FIX IS A REP DECISION, NOT A LOOKUP FIX.~~ REFUTED BY THE CLOSE — it WAS a lookup
+  fix, one layer down.** This row reasoned that the field wants `(ref null $uVarHeap[vi])` while
+  code 15 can only name a struct ROW (`sHeapIdx[si]`), and offered two structural routes: a
+  field code of its own that stores `uVarHeap[vi]` (D1008's shape), or minting a standalone row
+  for a twinless arm. **Neither was taken.** D761 already mints the row on demand; what was
+  broken was the KEY that finds it, and `repCanonId`'s literal arm is a four-line change that
+  costs the type section nothing. Both premises were true and the conclusion did not follow —
+  the same shape of error D734 made about this family and D761 corrected.
 
 * **ROUTE (2) BUILT TWICE, AND THE SECOND VERSION COSTS NOTHING — but it is not shippable
   yet.** Registering EVERY arm as a struct row (deleting `collectS`'s
@@ -31953,8 +32091,12 @@ Repro:
   | `if r is A { p.err = r }` — STORE of a narrowed arm | **check-clean invalid wasm** |
   | `g(r)` into `g(x: A \| null)` — ARGUMENT | **check-clean invalid wasm** |
 
-  Trading a loud refusal for two silent miscompiles is D965's order violated, so this is
-  reverted rather than shipped.
+  Trading a loud refusal for two silent miscompiles is D965's order violated, so this was
+  reverted rather than shipped. **THE CLOSE PAID BOTH.** The mint route was not needed at all
+  (the canon key was the defect), and the two losing deliveries below were built and wired —
+  along with seven MORE that this table never reached, because it only probed what the mint
+  exposed. The ARGUMENT cell in it is also stale in one direction: `g(r)` into a BARE
+  `g(x: A)` has always run; only the `A | null` niche spelling lost.
 
 * **WHAT THE TWO LOSING DELIVERIES NEED, and it is a shape already in the tree.** Both are the
   MIRROR of [D1029](#d1029): there a narrowed map arm had to be RE-BOXED at a union-typed
@@ -31968,7 +32110,10 @@ Repro:
   **AND THE STORE SITE IS NOT `emitScalarFieldStoreVal` — tried, measured, no movement.** That
   is the obvious home (it is what a member-assign calls for every other field code) and adding
   a code-15 unbox arm there changes nothing, so the narrowed-arm value reaches the field
-  through some other path. Find that path first; it is one build saved.
+  through some other path. **The path is `emitAssign`'s own code-15 arm** — a field whose code
+  is 15 falls past every seeded branch into the terminal `else`, which is a plain
+  `emitExprExpect`; the construct half is the matching `else` in `emitObj`. That is where the
+  unbox went, beside the two widen sites the same boundaries already carry.
 
 ### D1032 — a bare `return` is refused at EMIT when the function's result type is INFERRED non-void, and the thing that makes it non-void can be a tail `if` block ending in a `push`
 
@@ -33733,3 +33878,104 @@ Repro (`vl check` rc 0, then the engine refuses the module):
 * **NOT D1061.** D1061 is union-vs-union through `emitStructUnionEq`; this is
   union-vs-concrete through `emitUnionConcreteEq`, a different function with a different
   gate, and D1061's fix moves none of these cells (re-measured after it landed).
+---
+
+### D1093 — the VARIANT table codes an INLINE multi-member literal-union field `string` and the STRUCT table codes it `atom`, so an arm carrying one still has no field rep; the NAMED alias spelling of the same union runs
+
+**loud emit reject: `emitProgram: a struct field typed as the union ARM `Circle` has no field
+rep` · check rc 0 · clause 2 · found 2026-09-02 as the RESIDUE of [D1031](#d1031), by writing
+`std/json.vl`'s ACTUAL carrier shapes rather than the row's paraphrase of them — that row's
+witness spells `kind: "syntax"`, a BARE literal it fixed, and the module spells
+`kind: "syntax" | "duplicate" | "depth" | "nonfinite"`, an INLINE literal UNION, which is this**
+
+Repro:
+
+    type Circle = { r: i32, k: "a" | "b" }
+    type Other = { o: string }
+    type Shape = Circle | Other
+    type GW = { g: Circle | null }
+    function mk(): Shape { { r: 3, k: "a" } }
+    const p: GW = { g: null }
+    const s = mk()
+    if s is Circle { p.g = s }
+    const e = p.g
+    if e == null { print("null") } else { print(e.r) }
+
+* **THE MECHANISM IS WHAT THE FAILING RUNG RECEIVED, not what the message says.** Instrumented
+  at `armFieldStructRow`, on the seed that closed D1031:
+
+      PROBE arm=Circle render={r:i32,k:"a"|"b"} repSlotOfTy=-1
+        rows: [0]{r:i32,k:"a"|"b"}{k:0/"a"|"b", r:0/}
+        ARM{k:3/, r:0/}
+
+  The render is FAITHFUL — D761's demand-driven intern minted `{r:i32,k:"a"|"b"}` and that row
+  codes `k` **0** (the atom-backed literal-union field, elem name `"a"|"b"`). The ARM's own row
+  codes the identical spelling **3** (a plain string slot, elem name ""). So
+  `variantStructHeapTwinAt`'s per-field code walk declines — CORRECTLY, because the two layouts
+  really do differ — and the field has no rep. **Both halves of the guess were wrong before the
+  probe ran**: the render is not lossy here, and the row is not the one that softened.
+
+* **THE ASYMMETRY IS THE DEFECT, and it is in the VARIANT recorder.** `collectVariantFields`
+  codes the field off a node canon has rewritten (`variantFieldIdText`'s own header says a bare
+  literal annotation "renders through canon as the softened `string`"), while
+  `internInlineShapeTy` codes it off the raw shape TEXT. One spelling, two tables, two codes.
+
+* **THE NAMED ALIAS RUNS, and that is the whole ablation.** `type K = "a" | "b"` +
+  `k: K` in the same program **runs** (prints `3`) — it was check-clean INVALID WASM before
+  D1031 and runs now — because a named litunion carries `K` in the elem-name column on BOTH
+  sides. A DECLARED plain-struct twin spelled identically also runs (`repSlotOfTy` finds it).
+  Only the inline spelling with no twin refuses.
+
+* **WHAT IT COSTS: `std/json.vl` KEEPS ITS WORKAROUND, OR NAMES ITS `kind` UNION.** Verified by
+  hand on the module's exact shapes — a `JsonError | null` scanner field plus a
+  `JsonError | null` renderer return, `JsonError` an arm of both public return types: with
+  `kind: "syntax" | "duplicate" | "depth" | "nonfinite"` inline it still refuses; with
+  `type JsonErrorKind = "syntax" | "duplicate" | "depth" | "nonfinite"` it builds and the
+  scanner face runs. That is a one-line std change and arguably better std style, but it is a
+  std API change and wants its own review — and the RENDER face then meets [D1094](#d1094).
+
+* **TWO ROUTES.** Make the VARIANT recorder code an inline literal-union field 0, which is a REP
+  change for every arm carrying one (and is the `A5c` un-named-literal atom rep
+  [D1023](#d1023) names); or make `internArmShapeOf` render the arm the way the VARIANT table
+  sees it, so the minted row's codes match by construction. The second is smaller and closes
+  only this; the first is what D1023's ruling needs anyway.
+
+---
+
+### D1094 — a literal-union FIELD read off an `S | null` binding prints the raw ATOM ID instead of the member string, once `S` is also a union ARM; the same read with no union in the program prints the member
+
+**check-clean silently wrong — prints `0` where the field holds `"a"` · found 2026-09-02 while
+verifying [D1031](#d1031)'s `std/json.vl` claim · PRE-EXISTING: the witness below runs and
+prints `0` on master (`seed-latest`, 2026-09-02) and on the D1031 seed alike, so it is neither
+caused nor moved by that close · clause 1**
+
+Repro:
+
+    type K = "a" | "b"
+    type S = { k: K, n: i32 }
+    type Other = { o: string }
+    type U = S | Other
+    function mk(): U { { o: "x" } }
+    function g(n: i32): S | null {
+      if n == 0 { return { k: "a", n: 1 } }
+      null
+    }
+    const t = mk()
+    if t is S { print("s") }
+    const v = g(0)
+    if v == null { print("null") } else { print(v.k) }
+    // PRINTS 0
+
+* **THE CONTROL IS ONE LINE OFF AND PRINTS THE MEMBER.** Delete `type U = S | Other`, `mk` and
+  the `is` test — so `S` is an ordinary struct and `S | null` is the kind-9 niche rather than
+  the `nulvariant` one — and the same read prints `a`. So the ingredient is that `S` is a union
+  ARM, which routes the read through the variant tables.
+
+* **AND THE NON-NULLABLE SPELLING PRINTS THE MEMBER TOO.** `function g(): S` with the union
+  still present prints `a`. Only the `S | null` niche loses it, which is what says this is the
+  READ off the niche and not the field's rep.
+
+* **WHY IT SURFACED NOW.** It sits behind [D1031](#d1031) and [D1093](#d1093): a program that
+  can carry a `JsonError | null` at all is new, so the read that mis-prints was unreachable in
+  the shape that wants it. `std/json.vl`'s renderer face meets it the moment the module names
+  its `kind` union and returns `JsonError | null`.
