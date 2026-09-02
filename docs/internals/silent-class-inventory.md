@@ -35151,14 +35151,32 @@ Repro (the `i64` face — `vl check` rc 0, module does not validate):
 * Probe: `scripts/capability-probes/clear-over-scalar-list-reps.vl`.
 
 ---
-### D1105 — a `u8[] | null` cell in the same module as an `i64[] | null` / `f64[] | null` / `f32[] | null` one is typed and read through the OTHER leaf's wrapper: check-clean INVALID WASM, with both spellings annotated
+### D1105 — [CLOSED 2026-09-02] a `u8[] | null` cell in the same module as an `i64[] | null` / `f64[] | null` / `f32[] | null` one is typed and read through the OTHER leaf's wrapper: check-clean INVALID WASM, with both spellings annotated
 
-**check-clean invalid wasm (`type mismatch: expected (ref null $type), found (ref $type)`) ·
-clause 1 · OPEN · found 2026-09-02 building [D1062](#d1062)'s fixture · PRE-EXISTING and NOT
-caused by that close: the repro below annotates every return, uses no inference at all, and
-reproduces identically on the `seed-latest` master seed**
+**runs, prints `7` then `9` — CLOSED 2026-09-02 by ONE missing arm in `emitIndex`'s
+nullable-scalar-list ladder · was check-clean invalid wasm, clause 1 · a u8-leaf position
+matrix goes **5 of 18 → 17 of 18** `runs` (the one remainder is [D1107](#d1107)'s loud
+map-value refusal, a separate clause-2 row) · zero `runs` lost, distilled corpus unmoved (0
+classes of 255,504 cells), rep-fuzz exact · fixture
+`arrays/nullable-u8-list-beside-i64-leaf.vl`**
 
-Repro (check rc 0; the module the engine refuses to load):
+* **THE MECHANISM, read off `wasm-dis` and not inferred.** `emitIndex`'s nullable-scalar-list
+  arm chooses the leaf's wrapper / backing / index-scratch pool from a three-line ladder that
+  had arms for `nuli64list` and `nulf32list` over an `f64` default, and none for `nulu8list`.
+  The `u8` read therefore asked for the **f64** wrapper — and in a module with no `f64` in it,
+  the usage-gated type-index formula leaves that slot pointing at whatever was minted there.
+  Beside an `i64[] | null` cell that is the i64 list wrapper, so the narrowing local was
+  declared `(ref null $5)` (i64) while the value on the stack was `(ref $7)` (the packed byte
+  wrapper), and the read was `struct.get $5 0` + `array.get $4`. With the arm added the same
+  cell is `(ref null $7)` and the read is `struct.get $7 0` + `array.get_u $6`.
+
+* **THAT IS ALSO WHY THE PAIRING LOOKED ARBITRARY.** `u8[] | null` beside `string[] | null`,
+  and `u8[] | null` alone, RAN — not because those spellings take a different path, but
+  because in those modules the unminted `fl64TypeIdx` offset happens to land on the packed-byte
+  wrapper. The defect was never about which leaf it was beside; it was one absent arm plus an
+  index formula that answers for a type the module never minted.
+
+Repro (runs, prints `7` then `9`):
 
     function go() {
       const x: i64[] | null = [7]
@@ -35185,12 +35203,12 @@ Repro (check rc 0; the module the engine refuses to load):
   `u8` one, with an `i64[] | null` function merely declared beside it, is the same invalid
   module.
 
-* **WHAT TO LOOK AT FIRST.** `nulScalarListFieldWrapHeap` (`emit_bytes.vl`) maps field codes
-  31–34 and has NO arm for 35, which `nulScalarListFieldCode` mints for `nulu8list`; the
-  `for`-in element ladders in `emit_collect.vl` (two lists) and `wasmEmit.vl:20507` likewise
-  enumerate the four older kinds without `nulu8list`. Each is a candidate, none is confirmed —
-  the WAT above says the local's kind is wrong, and the site that decides that local's kind is
-  what a probe has to name (`emitFail`, on this already-failing program).
+* **NONE OF THE THREE CANDIDATES THIS ROW NAMED WAS THE SITE**, and that is worth keeping.
+  `nulScalarListFieldWrapHeap`'s missing code-35 arm, the two `for`-in element ladders in
+  `emit_collect.vl` and `wasmEmit.vl:20507` were all listed as suspects off a reading of the
+  code. The witness has no struct field and no `for`-in, so none of them was ever on its path;
+  the WAT was the instrument that named the real one. (Those three ladders are still short an
+  arm and are still worth an audit — they just were not this.)
 
 * Because it is reachable with no inference anywhere, [D1062](#d1062)'s pin does not cause it —
   but the pin does make the UN-annotated spelling reach it, which is why
@@ -35458,12 +35476,13 @@ oversight.
   `scripts/capability-probes/litunion-alias-and-inline-arms.vl`.
 ---
 
-### D1110 — an INLINE-SHAPE ANNOTATION lays a literal-union field out as the i32 ATOM while the DECLARED and VARIANT recorders lay it out as a string ref, so passing an identically-spelled struct to such a param is check-clean invalid wasm
+### D1110 — [CLOSED 2026-09-02] an INLINE-SHAPE ANNOTATION lays a literal-union field out as the i32 ATOM while the DECLARED and VARIANT recorders lay it out as a string ref, so passing an identically-spelled struct to such a param is check-clean invalid wasm
 
-**check-clean invalid wasm: `type mismatch: expected (ref null $type), found (ref $type)` ·
-`vl check` rc 0 · clause 1 · found 2026-09-02 while closing [D1093](#d1093), by asking the
-plainest question its two-producer story implies — and NO union appears anywhere in the
-witness**
+**runs, prints `3` — CLOSED 2026-09-02 by the row's own candidate 1, plus the identity column
+it said code 3 did not have · was check-clean invalid wasm, clause 1 · a 16-cell matrix over
+the field's spellings, positions and the owner ruling goes **15 → 16** `runs` · zero `runs`
+lost, distilled corpus unmoved, rep-fuzz exact · fixture
+`unions/inline-litunion-field-two-spellings-one-layout.vl`**
 
 Repro:
 
@@ -35493,7 +35512,39 @@ Repro:
   `type K = "a" | "b"` + `k: K` each pass the same declared value into the same inline-shape
   param and print `3`.
 
-* **NOT CLOSED BY D1093, deliberately — BOTH DIRECTIONS WERE BUILT AND EACH NAMED ITS PRICE.**
+* **WHICH LAYOUT IS RIGHT IS ALREADY DECIDED, AND IT IS THE STRING REF.** The direction was
+  not a free choice between the two producers: `tyIsLitUnionAlias`'s own header states the
+  rule — *"a REGISTERED union type reps as the interned atom, an unregistered one does not, it
+  reps as a string ref"* — and two corpus fixtures pin it. `unions/arm-with-inline-literal-union-field.vl`
+  says of the inline field *"code 3, a plain string slot, **which is what this struct is
+  actually laid out with**"*, and `unions/discriminant-value-is-set-beside-base.vl` pins the
+  owner's D1023 amendment, under which `{kind: "x"|"y"}` and `{kind: string}` are a legal
+  discriminated pair — which requires them to SHARE a layout, i.e. the string one. So the
+  outlier was the NAME ladder (`nameFieldCode`), which claimed the atom for any spelling
+  `nameIsLitUnionType` recognised, registration or not.
+
+* **THE FIX IS CANDIDATE 1 PLUS THE COLUMN THIS ROW SAID IT LACKED.** Three edits: the name
+  ladder splits (`nameIsInlineLitUnion(t) -> 3` ahead of `nameIsLitUnionType(t) -> 0`), the
+  arena rung makes the same split (`tyIsLitUnionAlias -> 0`, `tyIsLitUnion -> 3`), and
+  `shapeFieldElemName` records the member set for a code-3 inline field — the identity column
+  the refused candidate needed. With it, `{kind:"x"|"y"}`, `{kind:"p"|"q"}` and `{kind:string}`
+  land in three `shapeFieldSetIdOf` buckets instead of one, so the dedup that refused
+  candidate 1 cannot happen. The DECLARED recorder records the same name through
+  `litUnionInlineNameOfTy`, because canon softens a bare inline set to `string` at `RC_ROOT` —
+  which is where a DECLARATION's field annotations canon — while the inline-SHAPE recorder
+  canons the same field at `RC_FIELD` and keeps the members. That render asymmetry is the whole
+  reason the two spellings interned two rows.
+
+* **AND CANDIDATE 2 WAS BUILT, MEASURED AND REFUSED WITH ITS PRICE.** Making the inline field
+  the ATOM everywhere (the node ladder + the recorded elem name + the arena hint) also gets the
+  witness and its whole family to `runs` — and moves
+  `unions/discriminant-value-is-set-beside-base.vl` and its hand-written twin from `runs` to
+  the loud `union U discriminates A from B on a literal field whose two arms rep differently`.
+  That is a `runs` cell lost on an OWNER RULING, and the distilled corpus is blind to it (0
+  classes moved): the only instrument that saw it was the fixture, and a hand-written
+  `{kind:"x"|"y"} | {kind:string}` membership grid.
+
+* **THE ORIGINAL TWO CANDIDATES AND THEIR PRICES, kept because the second is now the fix.**
 
   | candidate | what it buys | what it costs |
   | --- | --- | --- |
@@ -35505,11 +35556,27 @@ Repro:
 
 ---
 
-### D1111 — assigning an arm value to a module GLOBAL typed `Arm | null` is check-clean invalid wasm; every other delivery position at that niche runs
+### D1111 — [CLOSED 2026-09-02] assigning an arm value to a module GLOBAL typed `Arm | null` is check-clean invalid wasm; every other delivery position at that niche runs
 
-**check-clean invalid wasm: `type mismatch: expected (ref null $type), found (ref $type)` ·
-`vl check` rc 0 · clause 1 · found 2026-09-02 in [D1094](#d1094)'s position matrix ·
-PRE-EXISTING: identical on master (`seed-latest`, 2026-09-02)**
+**runs, prints `b` — CLOSED 2026-09-02: `emitAssign`'s `global.set` arm learns that an ARM CELL
+is not the box · was check-clean invalid wasm, clause 1 · an 18-cell niche/position matrix goes
+15 → 18 `runs` · zero `runs` lost, distilled corpus unmoved, rep-fuzz exact · fixture
+`globals/arm-niche-global-assign.vl`**
+
+It also closes two neighbours on the same seam: `gv = null` over the same cell (was the loud
+`bare null needs a struct-typed context`, clause 2) and an object-literal assignment to a
+kind-8 `variant` global (was check-clean invalid wasm, unfiled).
+
+* **THREE THINGS THE ARM DID NOT KNOW, and the comment that said so was stale.** The
+  union-box coercion fired on `letUnionNameOf(gLet) != ""`, under a comment reading *"a union
+  GLOBAL's cell is ALWAYS the box (`globalCellKind` has no kind-8 variant cell)"*.
+  `globalCellKind` has had a kind-8 `variant` arm and a `nulvariant` one for some time, so
+  `let gv: S | null` over a union ARM `S` names a union while its cell is
+  `(ref null $uVarHeap[vi])` — and the arm stored a `{tag, payload}` box into it. The fix is
+  the destination's own KIND, which is the only thing that can answer "is this position
+  box-shaped": the box coercion is skipped for an arm cell, `pendingVariantIdx` is seeded from
+  `globalCellArmIdx` so an object-literal RHS builds the bare variant instead of the box, and a
+  bare `null` RHS seeds `armDestHeapOf` so it lowers as `ref.null $uVarHeap[vi]`.
 
 Repro:
 
@@ -35544,8 +35611,8 @@ Repro:
 
 ### D1112 — an UN-ANNOTATED rebind off a `nulvariant` FIELD (`const e = p.err`) is check-clean invalid wasm; the annotated spelling of the same line runs
 
-**check-clean invalid wasm: `type mismatch: expected (ref $type), found i32` · `vl check` rc 0 ·
-clause 1 · found 2026-09-02 by writing `std/json.vl`'s post-[D1093](#d1093)/[D1094](#d1094)
+**check-clean invalid wasm: `type mismatch: expected (ref $type), found (ref null $type)` ·
+`vl check` rc 0 · clause 1 · found 2026-09-02 by writing `std/json.vl`'s post-[D1093](#d1093)/[D1094](#d1094)
 shape rather than a paraphrase · this is the ONE line still standing between `std/json.vl` and
 dropping its flat-field error workaround**
 
@@ -35574,11 +35641,53 @@ Repro:
   "a fixture that annotates every destination cannot see the missing-annotation defect"
   describes, found by removing the annotation rather than by adding one.
 
-* **THE PROBABLE RUNG, stated as a prediction rather than a mechanism:** `nulVariantIdxOfExpr`
-  — the reader `nulVariantIdxOfLet` uses to type an inferred binding — has arms for `Paren`,
-  `Index`, `BinExpr`, `AsExpr`, `Call` and `Ident`, and **no `Member` arm**, so a rebind whose
-  initializer is a field read cannot resolve its variant row. Put this witness on that arm's
-  grading list; do not treat the prediction as the close.
+* **THE PREDICTION WAS RIGHT ABOUT THE LAYER AND INCOMPLETE ABOUT THE TWIN — measured
+  2026-09-02 with an accumulated `emitFail` in `declareLocals`'s ladder**, on the witness and on
+  its annotated control, one token apart:
+
+      un-annotated  letIsNulVariant=0 nulVariantIdxOfLet=-1 letIsNulRef=1
+                    nulRefStructIdxOfLet=0 exprNullableVariant=0 exprNullableStruct=1
+      annotated     letIsNulVariant=1 nulVariantIdxOfLet=1  letIsNulRef=1
+                    nulRefStructIdxOfLet=0 exprNullableVariant=0 exprNullableStruct=1
+      both          memberFieldCode(p.err)=15  structIndexByName("JsonError")=-1
+                    variantIndexOf("JsonError")=1
+
+  `nulVariantIdxOfExpr` does lack the `Member` arm, as filed. But it is only consulted once the
+  BOOLEAN twin says yes, and `exprNullableVariant` lacks the same arm — so the ladder never
+  reaches the index reader at all. The binding falls through to `letIsNulRef` and binds
+  `nulstruct` with **struct row 0**, a row `JsonError` does not own: `collectS` SKIPS a union
+  member, so `structIndexByName("JsonError")` is -1 and the row that answered belongs to
+  another type. It is the `("struct", wrong-index)` pairing, not a missing index.
+
+* **A FIX EXISTS AND IS REFUSED ON ITS PRICE — a new COMPILER TRAP.** Giving both twins (and
+  `exprVariantIndex` / `structIndexOfExpr`'s code-15 rung) a `Member` arm keyed on
+  `variantRowOfTy` of the read's own recorded type takes an 18-cell position matrix over this
+  shape from **13 → 17** `runs` (the witness, the union-return delivery, both argument
+  positions and the null path), with `??` over the same field needing a variant sibling in
+  `emitCoalesce` to avoid a regression. All nine standing gates pass **except** the corpus
+  oracle, which runs its cases through ONE SHARED compiler instance: with
+  `unions/arm-with-inline-literal-union-field.vl` compiled first,
+  `unions/arm-with-literal-field-nullable-faces.vl` then dies with
+  `RuntimeError: array element access out of bounds` — a compiler crash, which is an explicit
+  veto. Bisected to the new reader; located by mapping the trap offset through
+  `wasm-tools print --print-offsets` to `emitVariantStruct`, whose `uFieldStart[vi]` /
+  `uFieldCount[vi]` reads are unguarded, and instrumented there: **`vi=2 len=2`**. So
+  `uVariants` is LONGER than the field-span tables and a row nameable by
+  `variantRowOfTy` can have no field span, no tag and no heap type. Neither file traps alone,
+  and both run correctly under the CLI, so nothing but the shared-instance harness sees it.
+
+  **The next step is that latent crash site, not another arm.** `emitVariantStruct` and
+  `emitUnionBoxAs` need the bound every parallel-table read in this codebase is supposed to
+  have, and whatever produces a `vi` past the field tables needs naming — with that settled,
+  the Member arm above is a small change that closes this row and, with it, `std/json.vl`'s
+  workaround.
+
+* **`std/json.vl` CANNOT DROP ITS WORKAROUND YET — and the reason moved.** The workaround's own
+  comment cites [D1031](#d1031) (a struct field typed at a union ARM was a loud emit reject),
+  and that row is CLOSED: the field face runs today. What still stands is this row, and only
+  this row: the module's both-faces shape runs provided EVERY rebind off the nullable
+  `JsonError` field is annotated. So the `std` change is unblocked the day this closes, and is
+  separate work needing the `std-api-reviewer` pass.
 
 * **`std/json.vl` CLEARS WITH THE ANNOTATION.** The module's full both-faces shape — a
   `JsonError | null` field on the scanner AND on the renderer carrier, both returned into
@@ -35652,3 +35761,79 @@ Repro:
   rung does not serve, because `variantStructHeapTwinAt` declines codes 5 / 15 / 28 by design
   and the nested read needs the target row rather than the field's own code.
 
+---
+
+### D1150 — a NON-NULLABLE arm-typed FIELD read (`const e = p.err` over `err: JsonError`) delivered into the union is check-clean invalid wasm; the same read used as a plain struct runs
+
+**check-clean invalid wasm: `type mismatch: expected (ref $type), found (ref null $type)` ·
+`vl check` rc 0 · clause 1 · OPEN · found 2026-09-02 on [D1112](#d1112)'s position matrix ·
+PRE-EXISTING: identical on the `seed-latest` master seed**
+
+Repro (check rc 0; the module the engine refuses to load):
+
+    type Other = { o: string }
+    type JsonError = { at: i32, kind: "syntax" | "duplicate", path: string, msg: string }
+    type U = Other | JsonError
+    type Scan = { err: JsonError }
+    function f(): U {
+      const p: Scan = { err: { at: 1, kind: "syntax", path: "", msg: "e" } }
+      const e = p.err
+      e
+    }
+    const a = f()
+    if a is JsonError { print(a.kind) } else { print("o") }
+
+* **THE NON-NULL SIBLING OF [D1112](#d1112), and it is a different arm.** That row is the
+  `T | null` field; this one has no `| null` anywhere, so the read is a bare ARM value and the
+  reader it needs is `exprVariantIndex`'s — which has `Paren`, `AsExpr`, `Ident`, `Call`,
+  `Index` and `BinExpr` arms and **no `Member` arm**. The value reaches the union-typed return
+  unboxed.
+
+* **THE ABLATION.** Drop the delivery into `U` and read a field instead (`e.at`) and the same
+  three lines RUN — so the read itself is fine and it is the union DELIVERY that has no
+  boxing. Remove `type U = Other | JsonError` (leaving `JsonError` a plain struct) and every
+  spelling runs.
+
+* **DO NOT FIX IT BY GIVING `exprVariantIndex` A `Member` ARM ALONE.** Measured 2026-09-02:
+  adding one (with `structIndexOfExpr`'s code-15 rung declining the arm to match) moves
+  `const e = p.err` + `e.at` from `runs` to
+  `emitProgram: field access receiver is not a struct`, because the non-null arm-field READ is
+  not wired to produce the `uVarHeap` ref the kind then claims. Build the read, then narrow the
+  classifier — see [D1112](#d1112) for the same order at the nullable niche, and for the
+  compiler-trap floor both share.
+
+---
+
+### D1151 — a literal-union ALIAS declared AFTER an inline-spelled struct carrying the same member set is check-clean invalid wasm; moving the `type K` line to the top of the file makes the identical program run
+
+**check-clean invalid wasm: `type mismatch: expected (ref $type), found (ref $type)` ·
+`vl check` rc 0 · clause 1 · OPEN · found 2026-09-02 while building [D1110](#d1110)'s fixture ·
+PRE-EXISTING: identical on the `seed-latest` master seed, before and after that close**
+
+Repro (check rc 0; the module the engine refuses to load):
+
+    type C = { r: i32, k: "a" | "b" }
+    function f(c: { r: i32, k: "a" | "b" }): i32 { c.r }
+    type K = "a" | "b"
+    type NC = { r: i32, k: K }
+    function nf(v: { r: i32, k: K }): i32 { v.r }
+    const c: C = { r: 3, k: "a" }
+    const nc: NC = { r: 4, k: "b" }
+    print(f(c))
+    print(nf(nc))
+
+* **THE ONLY INGREDIENT IS THE ORDER OF TWO DECLARATION LINES.** Move `type K = "a" | "b"` to
+  the top of the same file — nothing else changed, not one token — and the program prints `3`
+  then `4`. The two shapes are genuinely different types (an inline set reps as a string ref,
+  a registered alias as the interned atom — see [D1110](#d1110)), so they need two rows; what
+  the order decides is whether the second one gets its own.
+
+* **BOTH HALVES RUN ALONE.** `type C` + its inline-shape parameter is a program that runs, and
+  so is `type K` + `type NC` + its inline-shape parameter. Only the two together, in this
+  order, are invalid — which is the shape of a demand-driven intern reading a registry that
+  the later declaration has not reached yet, rather than of a wrong field code.
+
+* **NOT CAUSED BY [D1110](#d1110)'s CLOSE, and not fixed by it**: graded on the `seed-latest`
+  master seed and on the seed that closes D1110, same message, same offset. The fixture
+  `unions/inline-litunion-field-two-spellings-one-layout.vl` declares `K` first and says so, so
+  it pins D1110 without depending on this.
