@@ -1,0 +1,89 @@
+// @run
+// @log 7
+// @log 9
+// @log 9
+// @log 9
+// @log 5
+// @hint redundant type annotation: `a` is inferred as `{r: i32}[]` — remove it to lean on inference
+// @hint redundant type annotation: `a` is inferred as `{r: i32}[]` — remove it to lean on inference
+// @hint redundant type annotation: `mod` is inferred as `{r: i32}[]` — remove it to lean on inference
+// @hint redundant type annotation: `a` is inferred as `{r: i32}[]` — remove it to lean on inference
+// @hint redundant type annotation: `a` is inferred as `{r: i32}[]` — remove it to lean on inference
+// THE FIVE ANNOTATIONS ARE DECLARED-REDUNDANT, NEVER REMOVED. `const a: Circle[]` is what
+// makes the element the union ARM `Circle`; inference gives the anonymous `{r: i32}[]`,
+// which is a DIFFERENT element heap and the one shape this file is not testing. The hint
+// is the checker agreeing about the TYPE and saying nothing about the REP — exactly the
+// distinction CLAUDE.md draws — so the annotation stays and the hint is declared.
+//
+// Regression (silent-class-inventory D796).
+//
+// An indexed STORE of an object literal into a list whose element type is a union ARM was
+// check-clean invalid wasm, with no covariance anywhere in the program:
+//
+//   type mismatch: expected (ref null $type), found (ref $type)
+//
+// One destination, one element type, no assignment between two list types. What the program
+// has is a `Circle` that happens to be a union ARM, and an object literal stored into an
+// element slot typed at the arm's heap. Delete `type Shape = Circle | Sq` and the identical
+// program always ran.
+//
+// THE DECLINE WAS RIGHT AND ITS OTHER HALF WAS MISSING. `rlElemStructRow` refuses to answer
+// for an arm-typed element on purpose: the arm's heap is `uVarHeap[vi]`, and bridging it onto
+// a same-layout standalone struct row is D32, a different heap type and invalid wasm. So the
+// store saw no struct seed, fell through to the union-coerce, and built a `{tag, payload}`
+// BOX for a slot typed `(ref null $Circle)`. The disassembly is unambiguous —
+// `(struct.new $2 (i32.const 0) (struct.new $0 (i32.const 9)))` into a `(ref null $0)` local
+// — and the very same literal in the INITIALIZER built bare and validated, which is what
+// says the rep was reachable all along and only the hint was lost.
+//
+// The fix is the hint the decline should always have carried: where `rlElemStructRow`
+// declines, seed `pendingVariantIdx` with the arm so the literal builds at `uVarHeap[vi]`.
+//
+// THREE DELIVERIES, NOT ONE. `rlElemStructRow` has three consumers in the emitter — the
+// indexed store, `.push`, and the `__array_new__` fill — and all three had the identical
+// hole. The row only recorded the first two; the fill was found by grepping the callers
+// rather than by trusting the row's list, which is the D965 order applied to a bug fix
+// instead of a capability lift.
+//
+// STILL LOUD, deliberately: `a.pop()` on the same list refuses with `a ref-element list op
+// needs its receiver's element type known before the body is lowered`. That is a different
+// sentence and a different mechanism, and it is loud rather than silent, so it is not this
+// row's and is not silently swept in here.
+type Circle = { r: i32 }
+type Sq = { s: i32 }
+type Shape = Circle | Sq
+
+// The read-only control — this always ran.
+function readOnly() {
+  const a: Circle[] = [{ r: 7 }]
+  print(a[0].r)
+}
+readOnly()
+
+// 1 — the indexed store, in a function
+function idxStore() {
+  const a: Circle[] = [{ r: 7 }]
+  a[0] = { r: 9 }
+  print(a[0].r)
+}
+idxStore()
+
+// 2 — the same store at MODULE scope (the scope split that bit D1013 and D1019)
+const mod: Circle[] = [{ r: 7 }]
+mod[0] = { r: 9 }
+print(mod[0].r)
+
+// 3 — `.push`, which the row measured failing at a different offset
+function pushIt() {
+  const a: Circle[] = [{ r: 7 }]
+  a.push({ r: 9 })
+  print(a[1].r)
+}
+pushIt()
+
+// 4 — the `__array_new__` fill, the consumer the row did not list
+function fillIt() {
+  const a: Circle[] = __array_new__(2, { r: 5 })
+  print(a[1].r)
+}
+fillIt()
