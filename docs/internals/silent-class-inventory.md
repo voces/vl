@@ -30604,3 +30604,100 @@ scalar-list arm and never the rest.
   pair differing only in LENGTH — the branch an element loop skips.
 
 ---
+### D1021 — a RECURSIVE union alias composed into a wider union is check-clean invalid wasm: `Json | JsonError` returns the error struct where the composed box is expected
+
+**check-clean invalid wasm · check rc 0 · `type mismatch: expected (ref $type), found (ref $type)` in the returning function (binaryen: `return value should be a subtype of the function result type` on the `struct.new` of the error) · ZERO corpus cells (no recursive-alias axis) · reproduces on master · found 2026-09-01 measuring the `std:json` v1 surface (`docs/json-design.md`): the fs-shaped `T | Error` return with `T` the JSON value tree · probe `scripts/capability-probes/recursive-union-alias-composed.vl` · one ingredient, ablated: the alias's RECURSION**
+
+Repro:
+
+    type Json = null | boolean | f64 | string | Json[] | { [string]: Json }
+    type E = { at: i32, kind: "syntax" | "depth", msg: string }
+    function p(self: string): Json | E {
+      if self.length == 0 { return { at: 0, kind: "syntax", msg: "empty" } }
+      return 2.5
+    }
+    const r = "".p()
+    print(r == null)
+
+The value tree alone runs at 51 of 60 positions (#2254's matrix); the error struct alone
+runs everywhere; `J | E` with `J` a NON-recursive alias runs. It is putting a recursive
+alias INSIDE another union that has no rep.
+
+* **ONE INGREDIENT, EVERYTHING ELSE HELD.**
+
+  | change from the witness | outcome |
+  | --- | --- |
+  | make `J` non-recursive with the SAME six arm kinds (`f64[]`, `{[string]: f64}` for the self-references) | RUNS → `empty`, `2.5` |
+  | recursion through the list arm only (drop the map arm) | **still invalid** |
+  | return only the JSON-side value (`return 2.5`, no error path) | **still invalid** |
+  | name the composition (`type JsonResult = Json \| E`) and `is` on a PARAMETER | **still invalid** |
+  | compose with a LITERAL arm instead of the struct (`Json \| "err"`) | loud: `union box atom test on a union with no recorded members: Json\|string` |
+  | add `if r is E { print(r.msg) }` | loud: `` `is` names a declared union member with no interned arm representation (deferred value-union composition)`` |
+  | binding position only, no function (`const r: Json \| E = e`), then `r == null` | loud: `struct equality is not supported yet` |
+
+  So the family is *recursive alias* + *composition into a wider union*, and the ARM KINDS of
+  the alias are not an ingredient. The value is delivered wrong at the return boundary
+  whichever side of the union it comes from.
+
+* **THE MECHANISM IS IN THE LITERAL-ARM MESSAGE.** `Json | "err"` is reported as
+  `Json|string` — a two-member union whose first member is the alias itself, "with no
+  recorded members". The emitter FLATTENS a non-recursive alias into the composition (that is
+  why the twin runs) and keeps a recursive one as an opaque atom, because flattening it would
+  recurse; the composed box then has no member table, `is` cannot find an arm, and a return
+  through it lands the raw struct in a slot typed for the box. The three loud spellings and the
+  silent one are the same missing rep seen from four positions.
+
+* **CLAUSE 1 at the witness, CLAUSE 2 at every spelling that narrows.** `vl check` accepts
+  all of them — the checker composes the union fine — and the probe file is the API's real
+  shape (`parseJson` with `is JsonError`), which the emitter refuses loudly. The refusal's own
+  words concede it (`deferred value-union composition`) and it is not in `goal-scoreboard.py`'s
+  phrase list, so the sites count never saw it; the probe is the instrument.
+
+* **WHAT IT BLOCKS.** `std:json`'s ruled surface is `parseJson(self: string): Json | JsonError`
+  — the same `T | Error` shape as `readFile`'s `u8[] | IoError` and `decodeUtf8`'s
+  `string | Utf8Error`. Bending the API around this (a `{ value, error }` carrier struct RUNS
+  today) was declined: std has no deprecation story, and a compiler gap is not a reason to give
+  one module a different error shape from the other three. The builder is sequenced after this
+  row, not around it.
+
+---
+### D1022 — an ALIAS naming an arm of a recursive union is not a member of it: `type JsonObject = {[string]: Json}` refuses at check inside the tree, and at emit as a `Map()` binding outside it
+
+**loud check reject · clause 2 · `` `is` check type 'JsonObject' is not a variant of Json `` and `push: cannot add {[string]: Json} to Json[]` when the tree names the aliases; with the aliases declared AFTER a structurally-spelled tree the check passes and `let o: JsonObject = Map()` refuses in the EMITTER instead (`emitProgram: unsupported map value type (… interned no mv slot)`) · non-recursive control RUNS · ZERO corpus cells · found 2026-09-01 measuring the `std:json` v1 surface (`docs/json-design.md` §2.1), which wants `JsonObject` / `JsonArray` as the readable spellings of two arms**
+
+Repro:
+
+    type JsonObject = { [string]: Json }
+    type JsonArray = Json[]
+    type Json = null | boolean | f64 | string | JsonArray | JsonObject
+    function kind(v: Json): string { if v is JsonObject { return "object" } return "other" }
+    let o: JsonObject = Map()
+    o["k"] = 1.5
+    let a: JsonArray = []
+    a.push(o)
+    print(kind(a))
+
+An alias is transparent: `JsonObject` and `{ [string]: Json }` denote one type, and a
+program that spells the arm either way should mean the same thing. Today the SPELLING
+decides:
+
+  | spelling | outcome |
+  | --- | --- |
+  | tree names the aliases; `is JsonObject`; `push(o)` | **check error**, both sites |
+  | tree spelled structurally; aliases declared after; `is JsonObject` | check passes |
+  | … and `let o: JsonObject = Map()` | **emit refusal** (`interned no mv slot`) |
+  | … and `let o: { [string]: Json } = Map()` (same type, structural spelling) | RUNS |
+  | non-recursive `type O = {[string]: f64}; type J = null \| f64 \| O; v is O` | RUNS |
+
+So two mechanisms behind one row: the checker's member test for a recursive union
+resolves structural arms but not an alias that is itself part of the recursive knot, and
+the emitter's map-value slot is interned by the DECLARED spelling, so the alias-typed
+binding finds no slot the structural one interned. The `is` after-the-tree row passing is
+what shows the first is about the knot, not about aliases in general.
+
+**Clause 2.** Every spelling is type-valid; the checker refuses one and the emitter another.
+Not blocking `std:json` — the tree ships structurally spelled and the aliases arrive when
+this lands, changing no program's meaning — but every consumer's `is` chain reads worse
+until then.
+
+---
