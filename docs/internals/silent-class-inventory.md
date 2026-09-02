@@ -32304,9 +32304,25 @@ Repro:
   wrapper heap type.
 
   Adding the matching arm to `globalCellStructIdx` (returning `letNulMapReadSlotArg`, the
-  local ladder's own slot helper) does NOT fix it: the module still fails to validate
-  identically, so a third place types this cell and it has not been found yet. That is where
-  the next attempt starts.
+  local ladder's own slot helper) does NOT fix it. Two more sites were then found and wired,
+  and it STILL does not:
+
+  * **`emit_sections`' global-cell valtype is the third site, and its guard cannot be
+    `cs < 0`.** `if ck == "nulreflist" { cs = letAnnRefListSlot(…) }` types the cell, and for
+    an un-annotated map read `letAnnRefListSlot` answers **0** — the first ref-list slot,
+    a WRONG slot rather than a missing one. Measured on a module with two such globals: the
+    annotation leg says 0 for both while the binding's real element slot is 1, which is
+    exactly the shared wrapper. Preferring `letNulMapReadSlotArg` whenever
+    `letNulMapReadValKind` answers gives 1 there, and the module still fails to validate.
+
+  * So a FOURTH site types this cell. The init-seeding path next door (`gck == "map"` /
+    `"nulmap"` / `"struct"` / `"nulvariant"`) has no `nulreflist` arm at all, which is the
+    place to look next — though a map READ init should not need a `pendingListSlot` seed,
+    so the disagreement may be on the read side instead.
+
+  Each fix so far has revealed the next site, which is the signature of a capability that
+  needs its whole delivery matrix built at once (D965) rather than another arm. Everything
+  above is reverted; the row stays a LOUD refusal rather than a miscompile.
 
 * **SO THE FIXTURE FOR THIS ROW MUST CARRY TWO MAP-READ GLOBALS OF DIFFERENT ELEMENT REPS.**
   One witness per rep passes the broken candidate; the collision only appears when two share
