@@ -29744,7 +29744,7 @@ Repro (loud check reject):
 
 ### D1011 — `print(x)` and `toString(x)` disagree on an f64 exact tie: the host's sink breaks shortest-digit ties to ODD, the spec and `std:fmt` to EVEN
 
-**check-clean silently wrong · `print(2023347301156851.3)` prints `…851.3`; `toString(x)` and the `\{x}` hole print `…851.2` · the value is exactly `2023347301156851.25` (bits `4835952189745799117`), whose two 17-digit candidates are equidistant, and ECMA-262 `Number::toString` step 5 — the rule every VL renderer is defined against — takes the EVEN last digit · 14 of 50,000 pseudo-random doubles, every one an exact tie (measured 2026-09-01, `scripts/vl-host/src/main.rs` `js_number_to_string`) · NOT a compiler defect: the host's `__print_f64__` re-formats Rust's `{:e}` and inherits its tie-break · pinned by bit pattern in `tests/vl_std_float_text_test.ts` · found by the serde critique panel (consistency §6, perf §4); vl-de asked for it as a row, not a fallout-table line**
+**runs, prints `2023347301156851.2` — CLOSED 2026-09-01 by giving the host a shortest-with-ties-to-even producer (`shortest_sci` in `scripts/vl-host/src/main.rs`): ask for an EXPLICIT precision and walk it upward, because Rust's exact-precision formatting rounds half-to-EVEN while its shortest formatter does not. Measured over the SAME 50,000 pseudo-random doubles before and after: **10 disagreements with JS `String()` → 0**. `tests/vl_std_float_text_test.ts` flipped from pinning the divergent set to asserting equality outright, as its own header said it should. Was: check-clean silently wrong · `print(2023347301156851.3)` printed `…851.3` while `toString(x)` and the `\{x}` hole printed `…851.2` · the value is exactly `2023347301156851.25` (bits `4835952189745799117`), whose two 17-digit candidates are equidistant, and ECMA-262 `Number::toString` step 5 takes the EVEN last digit · NOT a compiler defect: the host's `__print_f64__` re-formatted Rust's `{:e}` and inherited its tie-break · found by the serde critique panel (consistency §6, perf §4)**
 
 Two renderers for one value is the class that yields "it printed differently in the test
 than in the app", and serde makes it three: `show<T>` / the JSON renderer will ride
@@ -29762,15 +29762,34 @@ is the arm users reach for first.
   isolated `--target-dir`, and the shared binary is rebuilt as a coordinator step after the
   merge. The pinning test lists the divergent set, so the fix flips a test rather than
   passing unnoticed; flip the pin in the same change.
-* **THE OWNER'S STANDING RULE** is that `print` rides the renderer. Binding the f64 arm to
-  `std:fmt` (or making the host produce the same digits) before `show<T>` lands is the cheap
-  moment; after it there are three implementations to keep agreeing.
+* **THE OWNER'S STANDING RULE** is that `print` rides the renderer, and this took the second
+  of the two routes the row offered — making the host produce the same digits — which was the
+  cheap one: five lines, no dependency from the host on `std:fmt`, and `show<T>` now has one
+  digit rule to agree with rather than two.
 
-Repro (check-clean silently wrong):
+* **THE RECIPE WAS IN THE FUNCTION'S OWN DOC COMMENT, AND ITS ONE CAVEAT WAS CHECKED FIRST.**
+  That comment said "VERIFY Rust's exact-precision rounding is half-to-EVEN before relying on
+  that", so it was verified before a line was written: `{:.0}` renders 0.5→0, 1.5→2, 2.5→2,
+  3.5→4 and `{:.2}` renders 0.125→0.12, 0.375→0.38. Ties to even at every probe, so the first
+  precision that round-trips is the shortest digit string under the SPEC's rule rather than
+  under Rust's.
+
+* **BEFORE AND AFTER ON THE SAME VECTORS.** 50,000 doubles from one generator, each printed by
+  the host and compared with JS `String()`: **10 disagreements on the old binary, 0 on the
+  new**. Running both halves against the identical set is what makes the number a measurement
+  rather than two measurements — the row's own 14 came from a different generator, and
+  quoting it as the "after" baseline would have compared two populations.
+
+* **BUILT WITHOUT TOUCHING THE SHARED BINARY.** Per CLAUDE.md's cargo rule the build used an
+  isolated `--target-dir` and this worktree's `target/release/vl` symlink was repointed at it,
+  so no other session's gate saw a binary change. CI rebuilds the host from source (the cache
+  key includes `scripts/vl-host/src/**`), so the flipped test is graded against the fix there;
+  the shared binary is a post-merge step.
+
+Repro (runs, prints `2023347301156851.2`):
 
     const x: f64 = 2023347301156851.3
     print(x)
-    // PRINTS 2023347301156851.3
     // the spec, `toString(x)` from std:fmt, and the `\{x}` hole all say 2023347301156851.2
 
 ---
