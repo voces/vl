@@ -32102,9 +32102,58 @@ Repro:
   scan. Built and graded: nothing moves — every witness including this row grades exactly as
   before, so the table would be one nothing reads.
 
-  The reason is worth keeping. `cUserTypes[name]` is ALREADY the placeholder index — pass 0a
-  mints an empty `mkUnionTy` / `mkObjTy` per declaration and pass 0b fills it in place — so
-  the declared index and the filled index are the SAME integer, and 43 is neither. It is a
-  third index, minted while resolving the reference to `J` from inside `JO`'s map. Any fix
-  has to name THAT index, so the question to answer first is what mints it and why the other
-  declaration order does not need one.
+* **WHAT THE THIRD INDEX IS: THE NULL FOLD, AND `cUserTypes` NAMES ONLY ITS WRAPPER.**
+  `type J = null | f64 | JO` folds its `null` (`annUnionTy(nonNull, true)`) and pass 0b fills
+  the 0a placeholder with that fold as its SINGLE member. So `cUserTypes["J"]` is a
+  one-member `TyUnion` and the index every reference actually carries — `JO`'s map value
+  among them — is the `TyNullable` INSIDE it. Probed directly, with the render stack empty:
+
+  | index | what it is | `tyToEmitName` |
+  | --- | --- | --- |
+  | 40 `cUserTypes["JO"]` | the map's wrapper | `{[string]:f64\|JO\|null}` |
+  | 41 `cUserTypes["J"]` | the fold's wrapper | `` (empty) |
+  | 43 `JO`'s `mVal` | the fold itself | `` (empty) |
+
+  Rendering 41 reaches 43, 43 reaches the map, the map's value is 43 again — and the cycle
+  guard cannot name 43, because `cUserTypes` maps `J` to 41. One nameless member collapses
+  the whole spelling, so `nodeTyMapValName` is empty and the mv slot is unresolvable. **The
+  declared type `J` has no emit name at all under this declaration order.**
+
+* **A REVISIT-ONLY UNWRAP FIXES THE RENDER AND DOES NOT CLOSE THE ROW.** Teaching
+  `aliasNameOfTyIx` to answer through a one-member wrapper whose member is a `TyNullable`
+  (only after the exact scan declines, and only for that shape) makes `J` render and moves
+  this row's failure OFF the binding and onto the first store:
+  `union box atom test on a union with no recorded members: f64|{[string]:J}|null`. The
+  fixture suite is green on it (2,998 passed) and nothing else moves — no corpus cell, no
+  probe — so it is not shipped on its own.
+
+  The unrestricted version of that unwrap is WORSE and the restriction is what the
+  measurement bought: naming a TRANSPARENT alias's member too (`type JO = {[string]: J}`)
+  turns a render that already worked from `{[string]:J}` into `JO`, and costs D1036's own
+  repro the same "no recorded members" refusal.
+
+* **AND NAMING THE FOLD AT RENDER ENTRY — WHICH DOES CLOSE THE STORE — BREAKS EIGHT
+  FIXTURES.** Returning the alias name from `tyToEmitNameAt` itself (not just on a revisit)
+  makes all seven spelling witnesses RUN, this row included, with the distilled corpus
+  clean (0 `runs` lost). It also re-spells every `type X = … | null` alias everywhere, and
+  `deno task test` loses eight cases across niches, litunions, match dispatch and the
+  totality gate. That is the D965 shape: the capability is real, the delivery is not wired.
+
+* **THE REGISTRY IS NOT THE DISAGREEING SIDE — MEASURED.** The natural conclusion from the
+  store's message is that the member row is missing under this order. It is not: the
+  registered set is IDENTICAL in both orders, `SET[J]=[null|f64|JO]`. What differs is the
+  name the CONSUMER computes and hands to `unionHasAtomTy`. So the fix belongs on the render
+  the consumer uses, not on `unNames`/`unMemberSet`.
+
+  Registering the alias's map value union from `collectA`'s `TypeRef` arm was also tried
+  (`declTyIxOfName` → `tyToEmitName` → `registerMapValUnion` when the spelling itself is not
+  a map): it renders the map from `JO`'s side and banks `f64|JO|null`, while the consumer
+  asks from `J`'s side for `f64|{[string]:J}|null`. Two legitimate renders of one type, and
+  patching consumers one at a time does not converge on either.
+
+* **WHERE THE NEXT ATTEMPT SHOULD START.** Not on another scan. The question is which render
+  a consumer of a recursive alias is ENTITLED to, and the two candidates are already known —
+  the alias name `J`, and the structural expansion that closes the cycle on whichever of the
+  pair the walk entered from. Pick one, make both producer and consumer use it, and expect
+  the delivery matrix D965 describes rather than a one-line gate change.
+
