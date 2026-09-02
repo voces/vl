@@ -1,0 +1,60 @@
+// @run
+// @log o
+// @log s
+// @log 5
+// @log x
+// Regression (silent-class-inventory D943).
+//
+// A generic struct holding BOTH a `T` field and a closure capturing the `T` value. The
+// SECOND ref instantiation emitted invalid wasm — `type mismatch: expected i32, found (ref
+// $type)` — and the disassembly named it exactly: both `mk` instances built their closure
+// environment with `struct.new $10`, where `$10` is `(struct (field i32))`, minted from the
+// FIRST instantiation. The `T := string` instance then stored a string ref into an i32 field.
+//
+// THREE THINGS WERE MISSING, and only the first is where the row pointed.
+//
+// 1. THE CLONE GATE READ THE WRITTEN SIGNATURE, NOT THE CAPTURES. `monoLamNodeIsTemplate`
+//    asks whether a parameter or the return still names a type parameter. `show: () =>
+//    string` names none — it only CAPTURES a `T`. One lifted slot means one env struct
+//    (`fnEnvIdx` is parallel to `fnStmts`), so the shared lambda could only ever have one
+//    layout. A capture is part of a lambda's effective signature.
+//
+// 2. THE WALKER NEVER REACHED THIS LAMBDA. `monoPinBodyLambdas` documented its own bound —
+//    "only a `LetDecl` INITIALIZER is rewritten" — and this lambda is a FIELD VALUE in an
+//    object literal returned from the generic. That is the shape a generic BUILDER has, so
+//    the bound excluded the main case. An `ObjLit` arm was the fix, recursing as well as
+//    rewriting.
+//
+// 3. THE CLONE INHERITED THE TEMPLATE'S FRAME. `fnParent` cannot be set at clone time: the
+//    instance's own `FuncDecl` does not exist yet, because its body is what the walk is
+//    producing. So the clone pointed at the template, `captureValKind` resolved `value` to
+//    `value: T` there, and both instances minted the same env layout — the clone existed and
+//    changed nothing. The minted slots are now recorded and re-pointed at the instance the
+//    moment it is lifted.
+//
+// Any one of the three alone leaves the witness failing; the second and third each produce a
+// build that looks like progress and prints the same error.
+type Box<T> = { actual: T, show: () => string }
+
+function mk<T>(value: T): Box<T> {
+  return {
+    actual: value,
+    show: () => {
+      if value is string { return "s" }
+      "o"
+    },
+  }
+}
+
+const b = mk(5)
+const f = b.show
+print(f())
+
+const b2 = mk("x")
+const f2 = b2.show
+print(f2())
+
+// The `T` FIELD still reads back at both instantiations — the env fix must not cost the
+// struct field its own per-instance layout, which is the other half of the same collision.
+print(b.actual)
+print(b2.actual)
