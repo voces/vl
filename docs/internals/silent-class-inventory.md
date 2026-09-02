@@ -32209,3 +32209,54 @@ Repro:
   the only thing that caught the miscompile was putting a second delivery position — an `is`
   over the map arm — in the fixture. The fixture carries the whole sweep for that reason.
 
+
+### D1038 — narrowing a LIST- or MAP-valued map READ with `is` is check-clean and refused at emit: `` `is` test but no union type declared ``
+
+**loud emit reject on a `vl check`-clean program — OPEN, clause 2**
+
+Repro:
+
+    const m: { [string]: i32[] } = Map()
+    m["a"] = [5]
+    const g = m["a"]
+    if g is i32[] { print(g[0]) }
+
+* **ABLATED — it is the map READ paired with a REF-container value.** One tiny program per
+  spelling, everything else held:
+
+  | spelling | outcome |
+  | --- | --- |
+  | `{[string]: i32[]}`, `g is i32[]` | **refused** |
+  | `{[string]: P[]}`, `g is P[]` | **refused** |
+  | `{[string]: {[string]: i32}}`, `g is {[string]: i32}` | **refused** |
+  | `{[string]: P}`, `g is P` | runs — a STRUCT value narrows |
+  | `{[string]: string}`, `g is string` | runs |
+  | `const g: i32[] \| null = [5]`, `g is i32[]` | runs — same type, no map read |
+  | `const g = m["a"] ?? []` | runs — the workaround, and the reason this is not a blocker |
+
+  So neither the nullable type nor `is` over a list is the problem: a declared
+  `i32[] | null` local narrows fine at the identical spelling. It is the map read's own
+  rep, and only for a value the read hands back as a ref container.
+
+* Found by hand while answering "do all legal programs compile now?" — the distilled corpus
+  has NO cell for it (its 7,564 cells are 4,620 `runs` and 2,944 loud CHECK rejects, zero
+  emit rejects), so every corpus-based instrument scored this as clean.
+
+### D1039 — the same map read compared `!= null` is check-clean and refused with a different message: `emitProgram: bare null needs a struct-typed context`
+
+**loud emit reject on a `vl check`-clean program — OPEN, clause 2**
+
+Repro:
+
+    const m: { [string]: i32[] } = Map()
+    m["a"] = [5]
+    const g = m["a"]
+    if g != null { print(g[0]) }
+
+* **The `is` spelling of the same narrowing is [D1038], and it fails with a DIFFERENT
+  message** — so the two are filed apart until an ablation says they share a mechanism. Per
+  this repo's own rule, a validator sentence is not a mechanism; grouping them on "both
+  reject the same program" would be the same mistake in the other direction.
+
+* `?? []` runs, so the value IS readable — what neither spelling has is the null test.
+
