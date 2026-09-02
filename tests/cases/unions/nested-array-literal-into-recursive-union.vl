@@ -1,0 +1,104 @@
+// @run
+// @log 2.5
+// @log 2.5
+// @log 2.5
+// @log 2.5
+// @log 2.5
+// @log 2.5
+// @log 2.5
+// @log 2.5
+// @log 2.5
+// @hint redundant type annotation: `leaf` is inferred as `f64` — remove it to lean on inference
+// Regression (silent-class-inventory D1016).
+//
+// A bare NESTED array literal, and a bare literal holding a MAP, delivered to a destination
+// typed as the recursive union rather than as its array arm. Both were loud emit rejects:
+//
+//   emitProgram: array value does not match any array member of the union
+//                (leaf-scalar widening across a nested array is unsupported)
+//   emitProgram: a union arm that is an array-of-map is not yet supported
+//                — use a named element type
+//
+// `[2.5]` at `Json` always worked; `[[2.5]]` and `[mv]` did not — and `const a: Json[] =
+// [[2.5]]` followed by `const c: Json = a` ran, so the arms had reps and the values were
+// constructible all along. What was missing was the conversion at the literal→union
+// boundary.
+//
+// THE ARM-CHOICE PROBE COULD NOT NAME THE ELEMENT. `emitUnionListLitViaRefArm` picks the arm
+// by classifying the first element's scalar ATOM (`"string"`, `"f64"`, a variant name), and
+// a nested list or a map element has none — so it bailed, and the caller's remaining paths
+// look for an arm that is literally a nested array (`i64[][]`) or an array-of-map, neither
+// of which `Json[]` is. Asking for the union's own name does not help either: `Json[]`'s
+// element union is `Json`, whose atoms are `null | boolean | f64 | string | Json[] |
+// {[string]: Json}` — and `Json` is not among them. What IS among them is `Json[]`, the very
+// member the inner `[2.5]` boxes as. So the test has to be STRUCTURAL on the element union's
+// atoms rather than nominal on the union, which is what `unionRefArrayArmSlotForNestedElem`
+// does.
+//
+// EVERY POSITION IS PINNED, AND EACH PRINTS THE LEAF. Per the D965 order, lifting a
+// capability gate turns a loud refusal into silent invalid wasm at every delivery that was
+// not wired — so this reads the value back out through the boxes rather than asserting the
+// program compiles. All nine were measured; a position that merely type-checks would print
+// `0`, not `2.5`.
+type Json = null | boolean | f64 | string | Json[] | { [string]: Json }
+
+// Reads the leaf back through the boxed element — an array element or a map element.
+function leaf(c: Json): f64 {
+  if c is Json[] {
+    const e = c[0]
+    if e is Json[] {
+      const f = e[0]
+      if f is f64 { return f }
+    }
+    if e is { [string]: Json } {
+      const g = e["k"]
+      if g is f64 { return g }
+    }
+  }
+  0.0
+}
+
+// 1 — binding
+const cBind: Json = [[2.5]]
+print(leaf(cBind))
+
+// 2 — argument
+function viaArg(v: Json) { print(leaf(v)) }
+viaArg([[2.5]])
+
+// 3 — return
+function viaRet(): Json { [[2.5]] }
+print(leaf(viaRet()))
+
+// 4 — map write
+const mw: { [string]: Json } = Map()
+mw["a"] = [[2.5]]
+const back = mw["a"]
+if back is Json[] { print(leaf(back)) }
+
+// 5 — global init (a second module-scope binding, read through a function)
+const gInit: Json = [[2.5]]
+print(leaf(gInit))
+
+// 6 — nested one level deeper: the element is itself a nested literal
+const deep: Json = [[[2.5]]]
+if deep is Json[] {
+  const d0 = deep[0]
+  if d0 is Json[] { print(leaf(d0)) }
+}
+
+// 7 — a MAP element, the second refusal's own spelling
+const mv: { [string]: Json } = Map()
+mv["k"] = 2.5
+const cMap: Json = [mv]
+print(leaf(cMap))
+
+// 8 — assignment to a module global
+let asg: Json = 0.0
+asg = [[2.5]]
+print(leaf(asg))
+
+// 9 — struct field
+type Box = { j: Json }
+const bx: Box = { j: [[2.5]] }
+print(leaf(bx.j))
