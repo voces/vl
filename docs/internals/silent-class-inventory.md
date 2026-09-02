@@ -32267,7 +32267,7 @@ Repro:
 * `?? []` runs, so the value IS readable — what neither spelling has is the null test.
 
 
-### D1040 — a map whose value is a REF ARRAY (`{[string]: P[]}`) gives its un-annotated read binding NO local kind at all
+### D1040 — a map whose value is a REF ARRAY (`{[string]: P[]}`) refuses at MODULE scope and runs inside a function
 
 **loud emit reject on a `vl check`-clean program — OPEN, clause 2**
 
@@ -32279,16 +32279,40 @@ Repro:
     const g = m["a"]
     if g is P[] { print(g[0].x) }
 
-* **The REMAINDER of [D1038], and NOT the same mechanism.** D1038 closed the map-read rung in
-  four classifiers; a scalar-list value (`i32[]`, `string[]`, `f64[]`) and a nested-MAP value
-  all narrow now, at both spellings and both positions. A ref-array value still refuses.
+* **THE FIRST FILING NAMED THE WRONG INGREDIENT, AND THE PROBE CORRECTED IT.** It was filed
+  as "a REF-ARRAY value gives its binding NO local kind" — the remainder of [D1038] by value
+  rep. Instrumenting `letNulMapReadValKind` showed it is never CALLED for this program, and
+  putting the identical code inside a function made it fire and return `reflist` at once:
 
-* **AND ITS ARM IS NEVER REACHED — measured, so the obvious fix is ruled out.** The same
-  map-read arm was added to `exprNullableRefArray` and instrumented: it does not fire at all
-  for this program. `declaredKind("g")` is `<null>` — the let-slot ladder assigns the binding
-  NO kind, so nothing ever asks the predicate. The hole is one level up from where D1038's
-  was, in the ladder rather than in the classifier.
+  | value | module scope | inside a function |
+  | --- | --- | --- |
+  | `i32[]`, `string[]`, `f64[]`, nested map | runs | runs |
+  | `P[]` (ref array) | **refused** | runs |
 
-* The ANNOTATED spelling (`const g: P[] | null = m["a"]`) works, as it does for every shape in
-  this family — the annotation pins the rep and never consults the initializer (D969).
+  It is SCOPE, not the value rep. The local ladder has a dedicated `letNulMapReadValKind`
+  arm covering every mv value rep at once; `globalCellKind`'s un-annotated branch never
+  mirrored it. The i32-list and nested-map reps reach a global cell by luck of ordering
+  (`letIsNulListInfer` and `letIsNulMap` happen to sit in that branch and happen to claim
+  them), and the ref-array rep is the one with no arm to fall into.
+
+* **THE ONE-ARM FIX IS A CLAUSE-1 TRAP — BUILT, MEASURED, REVERTED.** Mirroring the arm into
+  `globalCellKind` makes all three witnesses run, and then **two** such globals in ONE module
+  produce check-clean INVALID WASM: `type mismatch: expected (ref null $type), found (ref
+  null $type)`. `P[]` + `i32[][]`, and `i32[]` + `P[]`, both fail while each alone runs. The
+  kind landed without its SLOT — a `nulreflist` cell is typed from the inner ref-list slot
+  and a `nulmap` one from the inner map's shape — so every such global took one default
+  wrapper heap type.
+
+  Adding the matching arm to `globalCellStructIdx` (returning `letNulMapReadSlotArg`, the
+  local ladder's own slot helper) does NOT fix it: the module still fails to validate
+  identically, so a third place types this cell and it has not been found yet. That is where
+  the next attempt starts.
+
+* **SO THE FIXTURE FOR THIS ROW MUST CARRY TWO MAP-READ GLOBALS OF DIFFERENT ELEMENT REPS.**
+  One witness per rep passes the broken candidate; the collision only appears when two share
+  a module. `tests/cases/maps/map-read-list-value-null-narrowing.vl` covers the reps that
+  work today and is where those lines belong once the slot is wired.
+
+* The ANNOTATED spelling worked at both scopes throughout, as it does for this whole family:
+  the annotation pins the rep and never consults the initializer (D969).
 
