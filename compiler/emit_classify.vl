@@ -146,10 +146,13 @@ import {
   nodeUnionName,
   nominalStructNameOfTy,
   nulFoldWrapperTyIxOf,
+  numCastCanFail,
   numLitUnionArrayBaseName,
   numLitUnionBaseName,
   numLitUnionBaseTy,
   numLitUnionHasBase,
+  primNameOf,
+  primNameStr,
   recordClonedNodeTyFb,
   recordClonedNodeTyKnown,
   recordNodePin,
@@ -11728,6 +11731,70 @@ export function asExprIsUnionCast(ix: i32): boolean {
   // arm expands it before deciding. This gate must agree or the cast falls to the numeric
   // ladder and emits an i32 conversion over a ref.
   if ot is TyNullable { return true }
+  false
+}
+
+// ── the numeric EXACT-OR-FAIL cast (D1041 / json-design §6 q2, owner 2026-09-02) ──────────
+// The SOURCE primitive name of the `AsExpr` at `ix`, and its TARGET primitive name, read from
+// the ARENA rather than from the spelling `n.asTy`. The spelling is what `emitAsCast`'s
+// lossless ladder below reads, and it is right for that ladder because it only ever compares
+// against the four primitive names; here the answer has to survive an ALIAS (`type Px = i32`,
+// `d as? Px`) and a `T | null` result, so it comes off the checker's recorded types.
+export function asExprNumSrcName(ix: i32): string {
+  const n = P.nodes[ix]
+  if !(n is AsExpr) { return "" }
+  primNameStr(primNameOf(nodeTyIxOf(n.asObj)))
+}
+export function asExprNumTgtName(ix: i32): string {
+  const n = P.nodes[ix]
+  if !(n is AsExpr) { return "" }
+  // `as?` records `T | null` on the node; the other two record `T`. Peeling is a no-op on a
+  // non-nullable, so one read serves all three modes.
+  primNameStr(primNameOf(tyPeelNul(nodeTyIxOf(ix))))
+}
+
+// Whether the `AsExpr` at `ix` is a numeric cast that CAN FAIL — the emitter's half of the
+// checker's `numCastCanFail`, asked of the same two names. Disjoint from
+// `asExprIsUnionCast` by OPERAND (a union operand is never a primitive), so the two gates
+// cannot both claim a cast.
+export function asExprNumFallible(ix: i32): boolean {
+  if ix < 0 { return false }
+  const n = P.nodes[ix]
+  if !(n is AsExpr) { return false }
+  if asExprIsUnionCast(ix) { return false }
+  numCastCanFail(asExprNumSrcName(ix), asExprNumTgtName(ix))
+}
+
+// THE PEEPHOLE'S PREDICATE: is `exprIx` an expression whose f64/f32 value is INTEGRAL by
+// construction? `trunc` / `floor` / `ceil` / `nearest` are the four `f64 → f64` intrinsics
+// whose result has no fractional part, so `trunc(d) as! i32` cannot fail the integrality half
+// of the test and only the RANGE half is left — which the trapping `i32.trunc_f64_s` already
+// enforces on its own. That is what makes `trunc(d) as! i32` the SPELLED lossy truncation the
+// ruling names, at exactly one instruction.
+//
+// The list is the four intrinsics and nothing else. A user function named `floor` shadows
+// them (`fnIndexOfSid` resolves to a real declaration), so the name alone must not decide it.
+export function exprIsIntegralFloat(exprIx: i32, _fnIx: i32): boolean {
+  if exprIx < 0 { return false }
+  const e = P.nodes[unwrapParen(exprIx)]
+  if !(e is Call) { return false }
+  if e.callArgs.length != 1 { return false }
+  const callee = P.nodes[e.callFn]
+  if !(callee is Ident) { return false }
+  if fnIndexOfSid(sidOfNode(e.callFn)) >= 0 { return false }
+  const nm = callee.identName
+  nm == "trunc" || nm == "floor" || nm == "ceil" || nm == "nearest"
+}
+
+// Does the MODULE contain a fallible numeric cast? The `moduleHasUnionAs` twin, reserving the
+// three staging slots for the same reason and by the same linear arena walk — the operand of
+// an exactness test is read twice and is typically not a re-readable place.
+export function moduleHasNumCast(): boolean {
+  let i = 0
+  while i < P.nodes.length {
+    if asExprNumFallible(i) { return true }
+    i = i + 1
+  }
   false
 }
 
@@ -29114,6 +29181,18 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
   // own recorded type: a SINGLE-arm target is not a union and correctly answers false here,
   // which is what keeps `const c = mk(a) as Circle` a variant binding rather than a box one.
   if e is AsExpr {
+    // D1041 — A NUMERIC `as?` THAT CAN FAIL yields `T | null`, and for the four numeric atoms
+    // that is the value-union BOX (`isValueUnionName`'s solo rule), exactly as the union
+    // arm's `as? i32` below is. Answering here is what puts the cast into the box delivery
+    // matrix the union form already has: `unionNameOfExpr`'s `AsExpr` arm names the union off
+    // the same recorded type, and every box consumer (binding cell kind, argument coerce,
+    // return, `print`'s tag dispatch) keys on this predicate. Without it the box lands in a
+    // scalar slot — `vl check` rc 0, invalid wasm.
+    if asExprNumFallible(exprIx) {
+      if e.asMode == "null" { return true }
+      // `as!` and a bare `as` yield `T` itself — a plain scalar, never a box.
+      return false
+    }
     if asExprIsUnionCast(exprIx) {
       const cty = nodeTyIxOf(exprIx)
       if cty >= 0 {

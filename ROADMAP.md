@@ -132,12 +132,31 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   (4) `std/fmt.vl` `parseI32`'s "unchecked wrapping truncation" comment goes. Grade on
   D1041's ten-row table.
 
-  **STATUS 2026-09-02: (1) MERGED (#2355, byte-identical). (2) BUILT. (3) DESIGNED AND
-  BLOCKED AT ONE NAMED PLACE.** Branch `numeric-as-phase23-wip` carries both; it is NOT for
-  merge, because phase 2 alone turns a running `3.9 as? i32` into an emit refusal and the two
-  must land together.
+  **STATUS 2026-09-02: DONE — (1) #2355, (2)(3)(4) #2361.** `3.9 as? i32` prints `null`,
+  `3.9 as! i32` traps with `as! i32 at <l>:<c>: not exact`, a bare `f64 as i32` inside an
+  `i32 | null` function propagates, `4294967298 as? i32` is `null` rather than `2`, and
+  `trunc(d) as! i32` is the one `i32.trunc_f64_s` with no compare in front of it (checked with
+  `wasm-dis`). D1041's ten-row table matches the ruling row for row; the twelve-position
+  delivery matrix is `tests/cases/numerics/as-cast-exact-positions.vl`. Zero `runs` lost — no
+  distilled-corpus cell changed class.
 
-  Four things the attempt settled, so the next one does not re-derive them:
+  Three corrections the build made to what is written above:
+
+  * **The exactness test is "integral AND in range", not the round-trip compare** this bullet
+    and D1041 both specified. `trunc_sat` + convert-back + `eq` is exact for `f64 → i32` and
+    UNSOUND for the other three float pairs, because the convert-back rounds:
+    `9223372036854775808.0 as? i64` saturates to `i64::MAX`, converts back to exactly `2^63`,
+    and compares EQUAL — admitting a value the target cannot hold. DECISIONS.md carries the
+    correction.
+  * **Five pairs, not two.** `f64 → i32`, `f64 → i64`, `f32 → i32`, `f32 → i64`, `i64 → i32`
+    — the complete set of (source, integer target) pairs on which a VL value can lose itself.
+  * **The `as?` lowering is an EMITTER ARM, not the `emit_rewrite` desugar the wip branch
+    designed.** A desugar cannot work here for a pass-ordering reason the branch never
+    reached: `dispatchRewrite` runs AFTER the collect passes, so the `if`/`null` it synthesises
+    is invisible to `nliInferIfLet` and the `T | null` box is never interned. Keeping the
+    `AsExpr` node instead reuses the delivery matrix the UNION `as?` already has.
+
+  Four things the wip attempt settled, three of which held:
 
   * **The site count was 17, not 88** (compiler 2, std 15, tests/cases 167 — the 67/21/230
     estimate was a bare grep, and 70 of its compiler+std hits are prose inside `//` comments
@@ -149,16 +168,17 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
     would re-wire that matrix by hand. The predicate was MEASURED exact before it was written:
     a fraction fails the first conjunct, an overflow and an infinity fail the range, and NaN
     fails the first conjunct for free (`NaN == trunc(NaN)` is false). `trunc` returns `f64`.
-  * **THE BLOCKER IS THE SYNTHESIZED `null`, AND IT IS NOT A POSITION GAP.** The desugar
-    refuses with `emitProgram: bare null needs a struct-typed context`. A HAND-WRITTEN
-    `if b { 7 } else { null }` runs at all four positions tried — function-body tail,
-    annotated binding, un-annotated binding, argument — so the `if`-arm position is wired.
-    What the synthesized node lacks is whatever a real `null` carries: `emitNullLit`'s ladder
-    reads its DESTINATION (`pendingVariantIdx`, the enclosing `FuncDecl`'s nullable-variant
-    return, `pendingStructIdx`), never the node's own type, so `nodeTyCarry` on the `if` AND
-    on the `null` changes nothing — measured, both. `emitUnionCoerce`'s NullLit arm is the
-    existing capability that boxes a `null` into a value-union box; routing the desugared arm
-    to it is the next step.
+  * ~~**THE BLOCKER IS THE SYNTHESIZED `null`, AND IT IS NOT A POSITION GAP.**~~ **WRONG on
+    both halves, and the measurement that says so cost one run.** The refusal was not the
+    blocker's cause and the positions were not wired: graded across twelve delivery positions
+    the wip branch produced `bare null needs a struct-typed context` at TWO and check-clean
+    INVALID WASM at nine — the majority failure was never the message the finding names. The
+    real cause is pass ORDER (see the third correction above): `nliInferIfLet` runs in the
+    collect passes and `dispatchRewrite` runs after them, so no registration route ever sees
+    the synthesised `if`, and `nodeTyCarry` cannot help because the missing thing is a
+    REGISTRY row, not a node type. The hand-written control that "runs at all four positions"
+    also fails at a fifth the finding did not try — `print(if b { 7 } else { null })` — which
+    is exactly the position D1041's own witness needs.
   * **A bare `as` is a different lowering from `as?`**, not the same one — it yields `T` and
     propagates on failure, so it wants the early-`return` shape `emitAsCast`'s UNION arm
     already uses, not the `if`-expression above.
@@ -186,28 +206,6 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   D1024's table (`orErr<T>(): T | "err"` at `T = i32` → `no recorded members`) is NOT this
   item: it is about mono-minted unions, struct arm or literal alike — **D1042**.
   DECISIONS.md §"A subsumed literal arm COLLAPSES". Compiler-side; compile-goal surface.
-- **`is A` over same-shape struct arms is a DISCRIMINANT-VALUE test — RULED (owner,
-  2026-09-02), NOT BUILT.** `type Circle = { kind: "circle", r: f64 }` /
-  `type Square = { kind: "square", r: f64 }` is a legal union and `s is Circle` is true iff
-  the tag names the shared shape AND `s.kind` is a member of `Circle`'s literal set — the
-  arm set `s.kind == "circle"` already narrows to. A literal-typed field is a type that is
-  also a value; membership is decided by the value. Overlapping sets are legal and truthful;
-  a same-shape pair with NO literal-typed field (`{v: i32} | {v: boolean}`) is refused by
-  the CHECKER — a design rule (`docs/guide/unions.md`) the emitter enforces today. The rep is
-  the compiler's choice: one heap type + one tag + an `i32`-sentinel compare (recommended;
-  no rep change), or distinct heap types (not vetoed) — provided the answer stays the
-  value's, never the name a value was built under. Measured today: the singleton-literal TS
-  idiom is an EMIT REJECT with no `is` in the program (the idiom is unwritable); two-member
-  disjoint or overlapping sets fold into one variant and take the wrong arm silently
-  (**D1023**); only different field names run. **Build, in order:** (1) collect pass admits
-  a same-signature pair that differs in a literal-typed field (one tag, one layout);
-  (2) `is A` adds the membership compare(s) after the tag test — one `i32.eq` per singleton;
-  (3) the checker owns the no-discriminant refusal and the emit reject becomes a floor;
-  (4) `is`- and `==`-narrowing graded side by side at every spelling. D1023's RULED
-  paragraph has the six-row table and the grading list; DECISIONS.md §"`is A` over
-  same-shape struct arms is a DISCRIMINANT-VALUE test". Interim std rule until built: every
-  std error struct keeps a field NAME no other has (`JsonError.path`). Compiler-side;
-  compile-goal surface.
 - **Colored `print`** — ruled in principle 2026-09-01 with one hard constraint (ANSI must
   never leak into pipes/files/copies): Node's split — bare strings always raw, rendered
   values colored, escapes emitted only by the TTY-detected sink, `NO_COLOR`/`--color`

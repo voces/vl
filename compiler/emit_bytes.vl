@@ -57,6 +57,7 @@ import {
   fnUsesMapKeys,
   fnUsesMapVals,
   fnUsesNulStrPush,
+  fnUsesNumCast,
   fnUsesPush,
   fnUsesStrOp,
   fnUsesStrPush,
@@ -102,6 +103,9 @@ import {
   mvValName,
   mvValStructIdx,
   mvValsOutBase,
+  numCastF32Slot,
+  numCastF64Slot,
+  numCastI64Slot,
   pushScratchBase,
   refPushBaseBySlot,
   refPushScratchBase,
@@ -175,6 +179,24 @@ const OP_F32_DEMOTE_F64 = 0xb6
 const OP_F64_CONVERT_I32_S = 0xb7
 const OP_F64_CONVERT_I64_S = 0xb9
 const OP_F64_PROMOTE_F32 = 0xbb
+// The EXACTNESS-TEST opcodes the numeric `as` trio needs (D1041 / json-design §6 q2). A cast
+// to an integer target succeeds iff the value is exactly representable there, so the lowering
+// asks "is it integral" and "is it in range" before it converts. Nothing else in the emitter
+// compares two floats or truncates one toward an integral FLOAT, which is why these arrive
+// here as a block rather than one at a time.
+const OP_I32_AND = 0x71
+const OP_I64_EQ = 0x51
+const OP_I64_LE_S = 0x57
+const OP_I64_GE_S = 0x59
+const OP_F32_EQ = 0x5b
+const OP_F32_LT = 0x5d
+const OP_F32_GE = 0x60
+const OP_F64_EQ = 0x61
+const OP_F64_LT = 0x63
+const OP_F64_LE = 0x65
+const OP_F64_GE = 0x66
+const OP_F32_TRUNC = 0x8f
+const OP_F64_TRUNC = 0x9d
 // Reference instructions.
 const OP_REF_NULL = 0xd0
 const OP_REF_AS_NON_NULL = 0xd4
@@ -526,6 +548,70 @@ export function fbI64TruncF32S() {
 // i64.trunc_f64_s: 0xb0 — `f64 as i64`, truncate toward zero (trapping).
 export function fbI64TruncF64S() {
   wU8(OP_I64_TRUNC_F64_S) // 0xb0 i64.trunc_f64_s
+  0
+}
+// ── the numeric exact-or-fail test (D1041) ────────────────────────────────────────────
+// One writer per opcode, in the shape the rest of this file uses, so the cast lowering in
+// `wasmEmit.vl` reads as the instruction sequence it is rather than as a column of raw bytes.
+// `f64.trunc` / `f32.trunc` round toward zero and stay in the FLOAT type — they answer "is
+// this value integral" when compared against the operand, and a NaN answers false for free
+// (`NaN == trunc(NaN)` is false, which is exactly the ruling's verdict on a NaN cast).
+// i32.and: 0x71.
+export function fbI32And() {
+  wU8(OP_I32_AND)
+  0
+}
+// i64.eq: 0x51 — the `i64 → i32` round trip's compare.
+export function fbI64Eq() {
+  wU8(OP_I64_EQ)
+  0
+}
+// i64.le_s / i64.ge_s: 0x57 / 0x59.
+export function fbI64LeS() {
+  wU8(OP_I64_LE_S)
+  0
+}
+export function fbI64GeS() {
+  wU8(OP_I64_GE_S)
+  0
+}
+// f64.eq / f64.lt / f64.ge: 0x61 / 0x63 / 0x66.
+export function fbF64Eq() {
+  wU8(OP_F64_EQ)
+  0
+}
+export function fbF64Lt() {
+  wU8(OP_F64_LT)
+  0
+}
+export function fbF64Le() {
+  wU8(OP_F64_LE)
+  0
+}
+export function fbF64Ge() {
+  wU8(OP_F64_GE)
+  0
+}
+// f32.eq / f32.lt / f32.ge: 0x5b / 0x5d / 0x60.
+export function fbF32Eq() {
+  wU8(OP_F32_EQ)
+  0
+}
+export function fbF32Lt() {
+  wU8(OP_F32_LT)
+  0
+}
+export function fbF32Ge() {
+  wU8(OP_F32_GE)
+  0
+}
+// f64.trunc / f32.trunc: 0x9d / 0x8f — truncate toward zero WITHIN the float type.
+export function fbF64Trunc() {
+  wU8(OP_F64_TRUNC)
+  0
+}
+export function fbF32Trunc() {
+  wU8(OP_F32_TRUNC)
   0
 }
 // if: 0x04 <blocktype>. `blockType` is a single byte (0x40 void, or a valtype byte).
@@ -1214,6 +1300,13 @@ export function fbBeginFunc(nParams: i32, nLocals: i32) {
   // scan bit, so the self-hosted compiler reserves nothing).
   atomStageSlot = fbScratchCur
   if fnUsesAtomStage { fbReserve(1) }
+  // Numeric exact-or-fail `as` staging (3 slots — f64, f32, i64 — one per SOURCE rep the
+  // exactness test can read twice), appended after `atomStageSlot` so every earlier base is
+  // unchanged in a program with no fallible numeric cast.
+  numCastF64Slot = fbScratchCur
+  numCastF32Slot = fbScratchCur + 1
+  numCastI64Slot = fbScratchCur + 2
+  if fnUsesNumCast { fbReserve(3) }
   // List-index bounds-check frame: slot 0 the shared i32 index stash, then one
   // nullable wrapper-ref slot per distinct indexed list kind. Discovered lazily
   // DURING lowering (`listIdxWrapSlot`), so nothing is reserved here — the frame
@@ -1353,6 +1446,7 @@ export function fbLocalsCount(nLocals: i32) {
   if fbUsesSinkPair() { n = n + 2 }
   if fnUsesUnionAs { n = n + 1 }
   if fnUsesAtomStage { n = n + 1 }
+  if fnUsesNumCast { n = n + 3 }
   if liKinds.length > 0 { n = n + 1 + liKinds.length }
   n
 }
@@ -1671,6 +1765,12 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
   if fnUsesUnionAs { fbRefRun(uBoxIdx) }
   // The atom-narrow staging slot — likewise non-null, `local.set` before every read.
   if fnUsesAtomStage { fbRefRun(sTypeIdx) }
+  // The numeric exact-or-fail staging slots, in `fbBeginFunc`'s order: f64, f32, i64.
+  if fnUsesNumCast {
+    fbF64Run()
+    fbF32Run()
+    fbI64Run()
+  }
   // Lazy list scratch frame (appended LAST — after even the frames above,
   // matching `fbBeginFunc`'s base): the shared i32 index stash, then one
   // typed slot per entry (ref slots NULLABLE so they are defaultable) —
