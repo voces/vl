@@ -31644,3 +31644,53 @@ Repro:
 
 ---
 
+
+### D1035 — `is` admits a REFINEMENT of a union arm on its right-hand side and answers `false` unconditionally: `["xyz"] is string[]` over a `Json` is check-clean, runs, and prints `false`, while the struct spelling `r is { users: string[] }` is refused as "not a variant"
+
+**check-clean silently wrong — prints `0` where the list under test holds only strings ·
+filed 2026-09-02 (vl-b7) while answering the owner's "why one `is` test per level?" on
+`json-design.md` §6 q1 · the FIX is the deep `is` / `as` build item
+(`docs/serde-design.md` §"Deep `is` / `as` over a `Json` value"), not a checker refusal:
+under it this witness prints `3`**
+
+Repro:
+
+    type Json = null | boolean | f64 | string | Json[] | { [string]: Json }
+    function d(r: Json): i32 { if r is string[] { return r[0].length }  0 }
+    const l: Json = ["xyz"]
+    print(d(l))
+    // PRINTS 0
+
+* **THE FAMILY, MEASURED** — seed 0ff2587f, `VL_STD` pinned, every cell against
+  `type Json = null | boolean | f64 | string | Json[] | { [string]: Json }`:
+
+  | RHS spelling | value under test | check | run |
+  | --- | --- | --- | --- |
+  | `r is Json[]` | `["x"]` | ok | `true` — a registered arm |
+  | `r is { [string]: Json }` | any map | ok | `true` — a registered arm |
+  | `r is string[]` | `["xyz"]` | **ok** | **`false`** — and the arm body is checked and emitted against `string[]` |
+  | `r is { [string]: string }` | a map holding only strings | **ok** | **`false`** |
+  | `r is { [string]: Json[] }` | a map holding only lists | **ok** | **`false`** |
+  | `r is { users: string[] }` | any map | **check reject** — `` `is` check type '{users:string[]}' is not a variant of Json `` | — |
+  | `r is Cfg`, `type Cfg = { server: { port: f64 } }` | any map | **check reject** — same sentence | — |
+
+* **MECHANISM.** `is` over a union is a TAG test: the checker's membership question is
+  answered by ASSIGNABILITY (`string[]` widens into `Json[]`, `{[string]: string}` into
+  `{[string]: Json}`), so a refinement of an arm passes it; the emitter then compares the
+  box tag against the spelling as written, no registered tag carries it, and the test is
+  `false` for every value. The arm is narrowed to the refinement, so its body compiles
+  against a rep the value never has — unreachable today only because the test never
+  passes. The struct spellings fail the same membership test outright, which is the
+  honest half of the behaviour.
+
+* **WHAT THE FIX IS, AND IS NOT.** Refusing the refinement at the checker would make the
+  three admitted rows loud and leave the two refused rows refused — hygiene, and not the
+  goal. The owner's direction (2026-09-02) is that a complex, nested type on the right of
+  `is` is what a `Json` consumer should be able to write, so the close is the derived
+  SHAPE WALK: `r is string[]` walks the list and answers `true` when every element is a
+  string, and `r is { users: string[] }` walks the map. This row's witness then prints `3`
+  and the two refused rows run. Grade the close on all seven cells, and on the position
+  matrix the design names (`is` in `if` / `while` / `&&` / `!`; `as` at binding / return /
+  argument / assignment) before narrowing anything at the checker.
+
+---

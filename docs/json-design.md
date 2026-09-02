@@ -1,6 +1,6 @@
 # `std:json` v1 — the surface, and what the compiler has to grow to serve it
 
-> Status: **CRITIQUED 2026-09-01 — three open questions for the owner, then the builder.**
+> Status: **BUILT — #2322 (2026-09-02); §6 q1 RULED the same day, q2 and q3 still open.**
 > This is serde stage 1 (`docs/serde-design.md` §Recommendation, ruling G): a real `Json`
 > VALUE TREE plus a parser and a renderer over it. Nothing here is built. The owner answered
 > seven surface questions on 2026-09-01 and those answers are recorded in §0 as facts this
@@ -87,12 +87,11 @@ export function parseJson(self: string): Json | JsonError
 export function toJson(self: Json): string | JsonError
 ```
 
-That is the whole of v1: one type, one error type, two functions — plus, if §6 question 1
-is ruled as recommended, one accessor:
-
-```vl
-export function jsonPointer(self: Json, pointer: string): Json | JsonError   // §2.8, OPEN
-```
+That is the whole of v1: one type, one error type, two functions. ~~Plus, if §6 question 1
+is ruled as recommended, one accessor: `jsonPointer(self: Json, pointer: string): Json |
+JsonError`.~~ **No accessor — RULED 2026-09-02 (owner), §6 q1.** The consumer's decoder is
+a deep `is` / `as` over `Json` (a language build item, `docs/serde-design.md` §"Deep `is` /
+`as`"), not a walker.
 
 *Post-critique:* `path` is the fourth field (std #1, crosslang F10): it keeps `JsonError`
 structurally distinct from `Base64Error = { at, kind, msg }` — a union naming two
@@ -118,6 +117,11 @@ And the names the later stages will take, so v1 does not squat on them (§2.4):
 export function fromJson<T>(self: string): T | JsonError
 export function toJson<T>(self: T): string | JsonError        // generalises v1's toJson
 ```
+
+*2026-09-02:* the READ half of that pair may never need a name — the owner's direction is
+a deep `is` / `as` over `Json` (`docs/serde-design.md` §"Deep `is` / `as` over a `Json`
+value"), under which `text.parseJson() as Cfg` IS `fromJson<Cfg>`. The names stay reserved
+until that lands; nothing in v1 squats on either.
 
 A parse never traps and never returns a partial tree. A render never traps, never emits a
 partial document, and fails only on a value JSON cannot carry (`nonfinite`) or a tree it
@@ -196,8 +200,9 @@ JsonError` fails to emit (measured by the std critique, probe `a3`).
   exceeds the cap (§2.7), on parse OR render. `nonfinite` — on render, an `f64` arm holds
   `NaN` or `±Infinity`; on parse, a number lexeme whose value is not a finite `f64`
   (`1e999`; §2.5, *post-critique*). A fifth, `cycle`, arrives with the seen-set (§2.7),
-  and a sixth, `missing`, with `jsonPointer` if §6 rules it in — named here so the union
-  grows rather than reshapes. The header lists which kinds each function can produce; a
+  a sixth, `shape`, with deep `as` over `Json` (serde-design §"Deep `is` / `as`", sub-rule
+  S4), and `missing` stays reserved for a walker if one ever ships (§6 q1 ruled none for
+  v1) — named here so the union grows rather than reshapes. The header lists which kinds each function can produce; a
   consumer's exhaustive `match` over `kind` sees them all, which is the one cost of a single
   error type and the std precedent for it (`IoError` serves five operations with codes
   only some can produce).
@@ -342,7 +347,7 @@ Owner: *"Error I think. what does JS do? other languages?"*
 | serde_json | `null` for `f64::NAN` in `Value`; typed `to_string` of an `f64` NaN also `null` |
 | Python `json.dumps` | the literals `NaN` / `Infinity` — **invalid JSON** — unless `allow_nan=False`, which raises |
 | Go `json.Marshal` | error: `json: unsupported value: NaN` |
-| **VL `toJson`** | **`JsonError { kind: "nonfinite", at: <output offset> }`** |
+| **VL `toJson`** | **`JsonError { kind: "nonfinite", at: 0, path: "/a/2" }`** (`at` is a parse-side offset; render locates by `path`, §2.2) |
 
 Go's is the only one of the four that is both RFC-valid and loud, and it is the one the
 owner picked. `null` is the pragmatic JS choice and it is silently lossy — a `NaN` that
@@ -450,7 +455,12 @@ no consumer has named a need. JS has no cap and stack-overflows; Python's is the
 recursion limit (~1000); Go has none for `Unmarshal` into `interface{}` (it caps at 10,000
 since 1.15). If a consumer needs deeper, the number moves, once, upward, in the header.
 
-### 2.8 Accessor helpers — OPEN (§6 question 1); the walking idiom, and what the critiques measured
+### 2.8 Accessor helpers — RULED NONE (§6 question 1, 2026-09-02); the walking idiom is the INTERIM, and what the critiques measured
+
+*Ruled 2026-09-02: (a) none in v1. The idiom below is what a consumer writes TODAY; the
+destination is a deep `is` / `as` over `Json` that names the whole shape in one test
+(`docs/serde-design.md` §"Deep `is` / `as` over a `Json` value"). The three options are
+kept as the record of what was compared.*
 
 Owner's question 7 was "what?", so here is what was being asked. Walking a `Json` means
 narrowing at every step:
@@ -750,6 +760,37 @@ blocked the module outright until it closed the same day.
     literal, `compiler/wasmEmit.vl:14356`) — the builder uses a named buffer as fmt does; a
     clause-2 refusal worth a probe when someone is in that file.
 
+**Found by BUILDING the module (2026-09-02, #2322).** Three more, each filed with a
+position matrix or an ablation in the inventory, each routed around INSIDE `std/json.vl`
+with the surface untouched. They are the measured cost of the walking idiom §2.8
+predicted, and they rank ABOVE items 4–11 for a consumer, because every one is met by the
+first program that reads a tree:
+
+12. **D1030 — the residue of narrowing `Json | JsonError` is not `Json`, and a `Json` does
+    not widen INTO `Json | JsonError`.** Loud check reject, clause 2, both faces: after
+    `if r is JsonError { … } else { g(r) }` the residue prints as `boolean | f64 | string |
+    Json[] | {[string]: Json} | null` — `Json`'s six members, flattened and deduped — and
+    is refused where `Json` is expected; and `function f(): Json | JsonError { const v:
+    Json = …; return v }` is `return type mismatch: expected Json | JsonError, got Json`.
+    That second face is what `parseJson` ITSELF hits: the module carries a six-arm ladder
+    (`asResult`) to hand a parsed tree back at the composed type, and the test harness
+    carries a second one on the consumer side. This is D1027's "the flattened spelling is
+    not the REGISTERED one" on the CHECK side — assignability is name-based where it
+    needed to be member-based — and neither D1021's nor D1028's close moves it.
+    **First in ship order now**: it is the cost every consumer pays on line two.
+13. **D1029 — an `is`-narrowed MAP arm keeps the union's box at six of eight delivery
+    positions** (return composed / return plain / push / map-set / `Json`-annotated
+    binding / `Json` argument), check-clean invalid wasm at each; the two that run name
+    the ARM's type. Neither the recursion nor the composition is an ingredient (both
+    ablated away, the defect holds); `string` and `Json[]` arms run at all eight. Route:
+    `const o: { [string]: Json } = v` before use. Every walker's object arm.
+14. **D1031 — `JsonError | null` as a struct FIELD or a RETURN is a loud emit reject once
+    `JsonError` is also a union ARM elsewhere in the program**; the identical spellings
+    run when nothing composes it. A type's usable spellings shrink because of a
+    declaration elsewhere. The module carries its scanner's error as five flat fields
+    instead of one optional struct. Any consumer holding "the last error, or none" meets
+    it the moment they also call `parseJson`.
+
 ---
 
 ## 6. Open — the owner's three questions
@@ -760,9 +801,21 @@ closed above (§2.4, §2.3, §2.2, §2.9). What remains, with the synthesis's re
 in bold (`docs/internals/json-critique-synthesis.md` §2 has the votes and the
 measurements):
 
-1. **Helpers** — (a) none in v1; (b) `jsonGet`/`jsonAt` returning `Json`, missing = null;
+1. ~~**Helpers** — (a) none in v1; (b) `jsonGet`/`jsonAt` returning `Json`, missing = null;
    **(c) one `jsonPointer(self: Json, pointer: string): Json | JsonError`, RFC 6901,
-   `kind: "missing"` keeps missing distinct from a stored null.** §2.8 has all three.
+   `kind: "missing"` keeps missing distinct from a stored null.** §2.8 has all three.~~
+   **RULED 2026-09-02 (owner): (a) — none in v1, "until we have an actual consumer" — and
+   the walking idiom §2.8 documents is not the destination.** The owner's question was why
+   a consumer should need one `is` per level at all rather than a complex, nested type on
+   the right-hand side, and the measured answer is that nothing forbids it: `is` today is a
+   tag test, a struct on the right is refused as "not a variant", and a REFINEMENT of an
+   arm (`r is string[]`, `r is {[string]: string}`) is admitted and answers `false`
+   unconditionally (D1035). **The build item is deep `is` / `as` over `Json`** — a derived
+   shape walk that makes `if doc is Cfg { doc.server.port }` the whole decoder —
+   designed in `docs/serde-design.md` §"Deep `is` / `as` over a `Json` value", where four
+   sub-rules (copy semantics, integral `i32` fields, absent ≠ null, `as` propagates a
+   `JsonError` with `kind: "shape"`) carry recommendations awaiting the owner. A helper
+   returns to this list only when a consumer that cannot name its shape arrives.
 2. **`f64 → i32` off the wire** — (1) ship `asExactI32`/`asExactI64` (`: i32 | null`) in
    `std:fmt` beside `parseI32`: **yes**, with the `std-api-reviewer` pass. (2) What
    `f64 as i32` does out of range — trap (today), **saturate** (Rust; `i32.trunc_sat_f64_s`,
@@ -776,7 +829,8 @@ measurements):
 Everything else the three critiques raised is either taken (§1–§2 above, each marked
 *post-critique*) or a build item (§5). D1021 closed on 2026-09-01; the builder is briefed
 on the ruled core (`Json`, `JsonError`, `parseJson`, `toJson`) with the three questions'
-outputs — `jsonPointer`, `asExactI32`, nothing for q3 — landing as follow-ups once ruled.
+outputs — nothing for q1 (ruled: no helper; deep `is`/`as` is the build item),
+`asExactI32`, nothing for q3 — landing as follow-ups once ruled.
 
 ---
 

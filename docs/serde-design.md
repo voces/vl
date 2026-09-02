@@ -1392,6 +1392,110 @@ actually walks, and the seen-set getting cheaper never makes the predicate wrong
 thing that decides whether it ever has a customer, so it cannot be priced before the
 predicate exists.
 
+## Deep `is` / `as` over a `Json` value — the read's second phase is an OPERATOR (owner direction, 2026-09-02)
+
+*Owner, on `json-design.md` §6 question 1 (accessor helpers): "why would it have to be one
+`is` test per level? why can't you do a complex, nested type on the right hand side? I say
+get that working and then (a) is fine for now until we have an actual consumer."*
+
+**What `is` is today, measured (seed 0ff2587f, `VL_STD` pinned).** `x is T` over a union is
+an ARM-MEMBERSHIP test: the checker asks whether `T` is one of the union's registered
+members and the emitter compares the box's TAG against that member. It never looks inside
+the value. Against `type Json = null | boolean | f64 | string | Json[] | { [string]: Json }`:
+
+| RHS spelling | value under test | check | run |
+| --- | --- | --- | --- |
+| `r is Json[]` | `["x"]` | ok | `true` (a member) |
+| `r is { [string]: Json }` | any map | ok | `true` (a member) |
+| `r is { users: string[] }` | any map | **refused** — `` `is` check type '{users:string[]}' is not a variant of Json `` | — |
+| `r is Cfg` (`type Cfg = { server: { port: f64 } }`) | any map | **refused** — same sentence | — |
+| `r is string[]` | `["xyz"]` | **accepted** | **`false`** — and the arm reads `r[0].length`, narrowed to `string[]`, never reached |
+| `r is { [string]: string }` | a map holding only strings | **accepted** | **`false`** |
+| `r is { [string]: Json[] }` | a map holding only lists | **accepted** | **`false`** |
+
+So "one test per level" is not a rule anyone chose — it is the shape of a tag test. A
+STRUCT spelling on the right is refused because a struct is not an arm; a REFINEMENT of an
+arm (`string[]` under `Json[]`, `{[string]: string}` under `{[string]: Json}`) is admitted
+by the checker's assignability-based membership test and then answered `false`
+unconditionally by the emitter, because no registered tag matches the spelling. The last
+three rows are a check-clean silently-wrong answer — `["xyz"] is string[]` printing `false`
+is a wrong answer under any reading — filed as **D1035**; the build below is its fix.
+
+**What it should mean.** `r is T` where `r: Json` and `T` is not an arm but a JSON-SHAPE
+type is a **runtime shape walk plus conversion**: the emitter derives, per `(Json, T)` pair
+and memoised per `T`, a predicate-and-builder that walks the tree against `T` and, on
+success, produces a `T`-repped value. Inside the arm `r` IS a `T` — a real struct with
+fields, a real `string[]` — so a consumer reads `r.server.port` and never walks the tree.
+
+```vl
+import { parseJson } from "std:json"
+type Cfg = { server: { host: string, port: i32 }, tags: string[], note: string | null }
+
+const doc = text.parseJson()        // Json | JsonError
+if doc is Cfg {                     // deep walk; `doc: Cfg` in the arm
+  print(doc.server.port + 1)
+}
+const cfg = doc as Cfg              // narrow-or-propagate, in a fn returning `… | JsonError`
+const cfg2 = doc as? Cfg            // Cfg | null
+const cfg3 = doc as! Cfg            // Cfg, or a trap with the path in its message
+```
+
+This is the two-phase read this document already commits to — "`deserialize` is a
+two-phase read (text → `Json` → shape) whose first phase is reusable" (§Stage 1) — with
+the SECOND phase spelled as the operator the language already has, instead of as a
+`deserialize<T>` intrinsic. It is the same emitter shape-walk Stage 2 needs (§Approach 2),
+reached through `is`/`as` for the JSON source, and the OQ-1 (b) intrinsic remains the
+spelling for the BINARY source and for `serialize`, where no operator fits. The wire
+policies are inherited wholesale, not re-decided: unknown key → not a match, exact
+case-sensitive field names, duplicate keys are already a parse error (decision A);
+`i64` fields read a JSON number (decision B); a union `T` decides its arm by first token
+or required key set (OQ-7 as amended). The vocabulary of a JSON-shape `T`: `null` /
+`boolean` / `f64` / `i32` / `i64` / `string`, literal unions of strings, `T[]`,
+`{ [string]: T }`, structs, unions of those, and recursive aliases (`x is Json` is
+trivially true). Closures, `Buffer`, non-string-keyed maps and newtype brands refuse at
+the CHECKER, blaming the `is` site's `T` ("`Cfg.cb` is a closure; a JSON shape cannot hold
+one"), never a std file.
+
+**Four sub-rules, each with a recommendation; the owner rules or lets them stand.**
+
+- **S1 — the narrowed value is a COPY, and `is` rebinds.** A `{[string]: Json}` map and a
+  `{ server: … }` struct are different wasm reps, so the arm cannot be a view; the walk
+  BUILDS the struct. Narrowing already changes rep silently (a value-union arm unboxes its
+  payload); this is the same move on a container. Recommend: document it as "JSON is
+  data, not identity — mutating `doc` inside the arm does not write back to the tree", and
+  let `as` be the spelling that makes the new binding visible when a reader wants it.
+- **S2 — `i32` / `i64` fields accept an INTEGRAL, IN-RANGE number and nothing else.**
+  `8080` reads into `port: i32`; `80.5`, `3e9`, `NaN` do not match. This is exactly the
+  `asExactI32` predicate `json-design.md` §6 question 2 asks for, so the two land on one
+  definition. Recommend: exact-or-fail; a consumer that wants truncation declares `f64`
+  and truncates in VL, where the loss is spelled.
+- **S3 — absent key ≠ present `null`, and `T | null` matches only the latter.** Decision A
+  already rules the WRITE side ("always emit `"f": null`, never omit it"); the read side is
+  its mirror, and the reason is the same — `{x} | {x, y}` is only decidable when absence
+  is a fact. Recommend: keep the mirror; a config that wants optional keys declares the
+  field `T | null` AND writes the null, or reads through a `{[string]: Json}` catch-all.
+  The alternative (absent reads as `null`) is the JS convention and is what most config
+  readers want, so this is the one most worth the owner's eye.
+- **S4 — `as` propagates a `JsonError`, not the remainder.** The trio's rule for a union is
+  "propagate the arms `T` excludes"; for a shape test the excluded remainder is the whole
+  tree, which is useless to a caller. Recommend: `doc as Cfg` in a function returning
+  `… | JsonError` propagates `{ at: 0, kind: "shape", path: "/server/port", msg: "expected
+  i32, got 80.5" }` — `path` is why `JsonError` has that field, and `"shape"` joins the
+  reserved kinds (`cycle`, `missing`) in `std:json`'s header. `as!` traps with the same
+  message; `as?` is `null`; `is` is the boolean and says nothing about why.
+
+**Why this dissolves the helper question.** `jsonPointer` / `jsonGet` exist to walk a tree a
+consumer cannot name the shape of. A consumer that CAN name it — every config reader,
+every message payload — writes the shape once and never walks. What is left is the
+genuinely dynamic consumer (a JSON formatter, a jq-alike, a schema validator), and none
+is in the tree; when one arrives it will say which walker it needs. Hence (a) for v1.
+
+**Sequencing.** It is Stage 2's JSON half brought forward: a checker predicate ("`T` is a
+JSON shape", reusing the acyclic/ref-free predicate ruling D already schedules) and an
+emitter walk keyed on the RHS type at the `is`/`as` site. Position matrix before narrowing
+the checker — `is` in an `if`, `while`, `&&` chain and `!`, `as` at binding / return /
+argument / assignment — per the D965 lesson. Standing gap it closes: D1035.
+
 ## Open questions — the owner's answers, 2026-09-01, and what each one still leaves open
 
 *The owner answered all seven on 2026-09-01. Their words are quoted as ruling INPUTS —
