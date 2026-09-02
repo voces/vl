@@ -31611,6 +31611,11 @@ Repro:
   missing is the two delivery sites, not the lowering. Reading a field off the narrowed arm
   works today, which is what says the unbox exists and only the boundaries lack it.
 
+  **AND THE STORE SITE IS NOT `emitScalarFieldStoreVal` — tried, measured, no movement.** That
+  is the obvious home (it is what a member-assign calls for every other field code) and adding
+  a code-15 unbox arm there changes nothing, so the narrowed-arm value reaches the field
+  through some other path. Find that path first; it is one build saved.
+
 ### D1032 — a bare `return` is refused at EMIT when the function's result type is INFERRED non-void, and the thing that makes it non-void can be a tail `if` block ending in a `push`
 
 **runs, prints `1` — CLOSED 2026-09-02 by letting a BARE `return` in the body veto the
