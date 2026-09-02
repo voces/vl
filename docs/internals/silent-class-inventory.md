@@ -31574,6 +31574,43 @@ Repro:
   what D280 already does wherever a twin exists. The second is smaller in the type section and
   larger in the variant/struct table relationship.
 
+* **ROUTE (2) BUILT TWICE, AND THE SECOND VERSION COSTS NOTHING — but it is not shippable
+  yet.** Registering EVERY arm as a struct row (deleting `collectS`'s
+  `variantIndexOf(s.tdName) < 0` skip) fixes the field, and costs **530 `runs` cells across 50
+  classes** — every union in every program then mints an extra row and the heap assignment
+  moves under programs that were working. Hard veto, and the number is the point: this is not
+  a small perturbation.
+
+  Gating the mint on "a field in THIS program is typed at that arm" (a declaration-only scan)
+  brings the corpus back to **zero cells moved** — the only programs whose rows change are the
+  ones that refuse today — and `deno task test`, `ci-native`, the fixpoint and rep-fuzz are all
+  green with it.
+
+* **AND THEN THE ROW MOVES `emit_reject` → `silent_invalid_wasm`, which is why it is still
+  filed.** With the row minted, four spellings run — a `null` initializer, a struct-literal
+  initializer, a field read narrowed with `is`, and the plain `A | null` field of the bisected
+  arm — and two do not:
+
+  | spelling | with the row minted |
+  | --- | --- |
+  | `const p: Scan = { i: 0, err: null }` then read | RUNS |
+  | `err: { r: 1, k: "syntax" }` initializer | RUNS |
+  | `if p.err is A { print(e.r) }` | RUNS |
+  | `if r is A { p.err = r }` — STORE of a narrowed arm | **check-clean invalid wasm** |
+  | `g(r)` into `g(x: A \| null)` — ARGUMENT | **check-clean invalid wasm** |
+
+  Trading a loud refusal for two silent miscompiles is D965's order violated, so this is
+  reverted rather than shipped.
+
+* **WHAT THE TWO LOSING DELIVERIES NEED, and it is a shape already in the tree.** Both are the
+  MIRROR of [D1029](#d1029): there a narrowed map arm had to be RE-BOXED at a union-typed
+  destination; here a narrowed variant has to be UNBOXED at an ARM-typed one, because the
+  value is still the `{tag, payload}` box while the slot is `(ref null $uVarHeap[vi])`. The
+  instruction sequence is written already — `emitNarrowedMem` does exactly
+  `struct.get uBoxIdx 1` + `ref.cast uVarHeap[vi]` for a narrowed member RECEIVER — so what is
+  missing is the two delivery sites, not the lowering. Reading a field off the narrowed arm
+  works today, which is what says the unbox exists and only the boundaries lack it.
+
 ### D1032 — a bare `return` is refused at EMIT when the function's result type is INFERRED non-void, and the thing that makes it non-void can be a tail `if` block ending in a `push`
 
 **runs, prints `1` — CLOSED 2026-09-02 by letting a BARE `return` in the body veto the
