@@ -780,6 +780,7 @@ import {
   unionArmVariantForObj,
   unionArmVariantForStructExpr,
   unionClosureArmName,
+  unionArmTyOfAtom,
   unionClosureArmTy,
   unionEqAtomKindOf,
   unionHasAtomK,
@@ -5960,6 +5961,14 @@ function emitUnionPayloadUnbox(_body: i32[], k: i32) {
   // `emitUnionUnboxTail`'s ladder, which every other reader of a boxed list arm already
   // takes. Without this rung a list arm reached the scalar value-box lookup and refused with
   // "atom has no value box" on a `vl check`-clean program (D1095).
+  // D1098 — A CLOSURE arm's payload IS the closure fat-pointer struct, exactly as
+  // `emitUnionUnboxTail` recovers it for a narrowed read. Without this rung it reached the
+  // scalar value-box lookup and refused with "atom has no value box" on a `vl check`-clean
+  // program, the same shape D1095 closed for a list arm.
+  if k == 11 {
+    fbRefCast(cloStructIdx)
+    return 0
+  }
   const lw = listWrapHeapOfKind(k)
   if lw >= 0 {
     fbRefCast(lw)
@@ -5982,6 +5991,9 @@ function emitUnionPayloadUnbox(_body: i32[], k: i32) {
 // spelling from refusing at another.
 function emitUnionAtomPayloadEq(body: i32[], k: i32, fnIx: i32) {
   if k == 2 { return emitStrEqCore(body) }
+  // D1098 — two closures are equal by function IDENTITY (id + env), a separate core with its
+  // own frame (`cloEqNoteBin`), and this ladder is where the arm reaches it.
+  if k == 11 { return emitCloEqCore(body) }
   const lk = leqCoreKindOfAtomKind(k)
   if lk >= 0 { return emitListEqAnyRep(body, lk, 0, fnIx) }
   // D-EQOPCODE: the scalar payload compare's opcode is another projection of the same code
@@ -6079,15 +6091,6 @@ function emitUnionConcreteEq(
       "emitProgram: `==` over a struct union is not supported yet",
     )
   }
-  // A CLOSURE atom (code 11) is the one code above the scalar band with no VALUE compare at
-  // all: two closures are compared by function identity, which is a different lowering with
-  // its own scan (`cloEqNoteBin`). It gets a refusal that says which arm it is, rather than
-  // the "no value box" an internal invariant would report.
-  if eak == 11 {
-    return emitFail(
-      "emitProgram: `==` over a union's closure arm is not supported yet",
-    )
-  }
   // A MIXED UNION IS COMPARABLE TO A SCALAR LITERAL, and this gate refused it. The compare
   // below is arm-AGNOSTIC: it reads the box's TAG, compares it to the tag of the atom the
   // OTHER operand names, and on a match compares that one payload. The union's remaining
@@ -6149,7 +6152,10 @@ function emitUnionConcreteEq(
   if emitExpr(body, boxIx, fnIx) < 0 { return -1 }
   if eqOnce { fbLocalTee(eqStash) }
   fbStructGet(uBoxIdx, 0) // 0xfb 0x02 <box ht> field 0: tag
-  fbI32Const(scalarTagOfKind(eak))
+  // The CONCRETE operand's own arm type, through the very composition the BOX site uses
+  // (`cloBoxArmTy` → `cloArmTagOfTy`), so a closure arm is tested against the tag its box
+  // actually writes.
+  fbI32Const(unionEqTagOfArmTy(eak, cloBoxArmTy(otherIx, uname)))
   fbI32Bin(70)            // 0x46 i32.eq
   fbIf(127)               // 0x04 if, 0x7f i32 result blocktype
   if eqOnce { fbLocalGet(eqStash) }
@@ -6167,6 +6173,26 @@ function emitUnionConcreteEq(
     fbI32Eqz() // 0x45 i32.eqz (`!=` negates value-equality)
   }
   0
+}
+
+// D1098 — THE BOX TAG OF ONE ARM of a union `==`, which is `scalarTagOfKind` for every atom
+// EXCEPT a bare closure. A closure arm's tag is keyed on its SIGNATURE (`cloArmTagOfTy` →
+// `cloSigSlotTag`): the FIRST signature a module interns keeps the flat kind-11 offset and
+// each further one claims the band above, so two closure-armed unions in one module tag their
+// arms differently and `scalarTagOfKind(11)` is right for only one of them.
+//
+// MEASURED, NOT REASONED: with `((i32) => i32) | i32` and `(() => i32) | S` in one module, the
+// second union's box writes tag 16 (disassembled) and the compare tested 12 — `false` where
+// the answer is `true` at the union-vs-concrete spelling, and at the union-vs-union one a
+// `ref.cast` TRAP, because the failed test falls through to the next arm's payload cast.
+//
+// The tag already has ONE HOME — `cloArmTagOfTy`, whose BOX side is `emitUnionCoerce` and
+// whose TEST side is `isArmTagOfTy`. This routes the COMPARE through it too, so all three
+// derive an arm's tag from one render of one arena type. The two callers differ only in where
+// the arm's type comes from, which is the same split `cloBoxArmTy` already names.
+function unionEqTagOfArmTy(k: i32, armTy: i32): i32 {
+  if k == 11 { return cloArmTagOfTy(armTy) }
+  scalarTagOfKind(k)
 }
 
 // DOES THE UNION CARRY AN ARM AT THE OTHER OPERAND'S REP? One question, two instruments,
@@ -6349,10 +6375,11 @@ function emitStructUnionEq(
       if ak < 0 { return -1 }
       if ak == 2 {
         if !aUsed { return -1 }
-      } else if ak != nullValKind() {
+      } else if ak != nullValKind() && ak != 11 {
         // A LIST arm is servable too (D1095): its payload IS the wrapper ref, so the unbox
-        // is a `ref.cast` and the compare is the generic list core. Everything left — a
-        // closure arm above all — still needs a scalar value box and declines without one.
+        // is a `ref.cast` and the compare is the generic list core. A CLOSURE arm (11) rides
+        // the same shape and compares by identity (D1098). Everything left still needs a
+        // scalar value box and declines without one.
         if listWrapHeapOfKind(ak) < 0 {
           if vbHeapIdxOfKind(ak) < 0 { return -1 }
         }
@@ -6397,7 +6424,7 @@ function emitStructUnionEq(
   while a < vis.length - 1 {
     fbLocalGet(sl)
     fbStructGet(uBoxIdx, 0)
-    fbI32Const(unionArmTagOf(vis[a], aks[a]))
+    fbI32Const(unionArmTagOf(vis[a], aks[a], uname, arms[a]))
     fbI32Bin(70)
     fbIf(127)
     ctrlEnter()
@@ -6490,9 +6517,9 @@ function variantRefListFieldSlot(ufi: i32): i32 {
 // D1061 — the BOX TAG of one arm of a mixed struct/scalar union, from whichever of the two
 // per-arm columns holds it. The two tag spaces are disjoint by construction: a variant tag is
 // an index into `uVariants` and `scalarTagOfKind(k)` is `uVariants.length + k`.
-function unionArmTagOf(vi: i32, ak: i32): i32 {
+function unionArmTagOf(vi: i32, ak: i32, uname: string, atom: string): i32 {
   if vi >= 0 { return uTags[vi] }
-  scalarTagOfKind(ak)
+  unionEqTagOfArmTy(ak, unionArmTyOfAtom(uname, atom))
 }
 
 // D1061 — one arm of a mixed struct/scalar union, dispatched on which column named it. The
@@ -6756,13 +6783,17 @@ function emitUnionUnionEq(
     let armK = armKinds[k]
     if armK == -2 { armK = valueAtomKind(arms[k]) }
     if emitExpr(body, lIx, fnIx) < 0 { return -1 }
+    // The arm's TAG, not `scalarTagOfKind(armK)`: a closure arm tags by SIGNATURE. Both
+    // sides read the LEFT union's arm type — the intersection above matched the two arms by
+    // verbatim SPELLING, so they render the same signature and claim the same slot.
+    const armTag = unionEqTagOfArmTy(armK, unionArmTyOfAtom(lname, arms[k]))
     fbStructGet(uBoxIdx, 0) // left tag
-    fbI32Const(scalarTagOfKind(armK))
+    fbI32Const(armTag)
     fbI32Bin(70)            // 0x46 i32.eq
     fbIf(127)               // left holds this arm
     if emitExpr(body, rIx, fnIx) < 0 { return -1 }
     fbStructGet(uBoxIdx, 0) // right tag
-    fbI32Const(scalarTagOfKind(armK))
+    fbI32Const(armTag)
     fbI32Bin(70)            // 0x46 i32.eq
     fbIf(127)               // right holds it too → payload value-compare
     if emitExpr(body, lIx, fnIx) < 0 { return -1 }
