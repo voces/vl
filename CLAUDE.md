@@ -429,6 +429,37 @@ worktree, and on BOTH arms of any A/B.
 Run `scripts/refresh-compiler.sh` before testing. The compiler is itself a VL program at
 `build/vl-compiler.wasm`, and a stale seed silently tests the previous compiler.
 
+## A COST REGRESSION SHOWS UP ONE BOOTSTRAP STEP LATE, and it looks like a broken merge
+
+**An ungated collect pass does not make the SOURCE slow. It makes the compiler BUILT FROM IT
+non-terminating.** Level 1 — a healthy seed compiling your candidate — stays fast, because
+that build runs the OLD compiler. Level 2 — your candidate compiling the compiler — is where
+a quadratic pass shows, and by then the slow thing is your SEED, so *master's* source hangs
+too and it reads as "the merge broke something".
+
+Measured 2026-09-02 (D1090): `anonLeafCloBindMark` asked `anonLeafFnValueTarget` — a
+whole-arena scan — of EVERY binding. Three builds under `timeout 300` found it, and neither
+commit anyone suspected was the culprit:
+
+| commit | L1 seed builds candidate | L2 candidate builds compiler |
+| --- | --- | --- |
+| the two suspected fixes | 73s / 81s ok | 67s / 35s ok |
+| the ungated mark | 32s ok | **321s rc=124** |
+| the gate added | 69s ok | 32s ok |
+
+**Bisect at BOTH LEVELS, under a timeout.** An L1-only check is vacuous for this class.
+
+**`timeout` KILLS THE SHELL, NOT THE BUILD.** `timeout 900 bash scripts/refresh-compiler.sh`
+kills the script; the `vl build` it launched re-parents to init and keeps a core at ~90%
+forever. Five accumulated over 97 minutes before another session noticed the load — the
+agent saw no output, read a hang as slowness, and retried every ten minutes. Time-box the
+BUILD (`timeout 300 <build>`), and sweep for your own survivors before relaunching:
+`ps -eo pid,etimes,args | grep "vl build" | grep -v grep`.
+
+**And a hanging self-build is the FINDING, not an obstacle to it.** `gate.sh` hangs
+identically, so the candidate can never reach a red. A change that loops on the compiler has
+an unbounded recursion or a fixpoint that does not converge, and that is the defect.
+
 ## Claims about the tree
 
 `ROADMAP.md` and the design docs go stale one-directionally — a fixed defect keeps reading
