@@ -340,6 +340,8 @@ import {
   aUsed,
   annRlNul,
   annRlSlot,
+  anonLeafCloBindFn,
+  anonLeafCloBindName,
   anonLeafCloSlotFn,
   anonLeafEmitPhase,
   anonLeafJoined,
@@ -474,6 +476,7 @@ import {
   rlWrSlots,
   rlWrapIdx,
   sDeclared,
+  sFieldCloSig,
   sFieldCount,
   sFieldElemKeyI32,
   sFieldElemName,
@@ -5114,7 +5117,26 @@ export function anonLeafRetMovedOf(fnDeclIx: i32): boolean {
 export function anonLeafCloSlotSigKey(pIx: i32): string {
   if pIx < 0 { return "" }
   if pIx >= anonLeafCloSlotFn.length { return "" }
-  const nm = anonLeafCloSlotFn[pIx]
+  anonLeafMovedFnSigKey(anonLeafCloSlotFn[pIx])
+}
+
+// D1090 — THE SAME ANSWER AT A BINDING. `anonLeafCloBindName`/`anonLeafCloBindFn` hold only
+// bindings written with a function the merge MOVED, so "" here is "this binding is not one of
+// them" and the annotation arms downstream get their turn unchanged.
+export function anonLeafCloBindSigKey(name: string): string {
+  let i = 0
+  while i < anonLeafCloBindName.length {
+    if anonLeafCloBindName[i] == name {
+      return anonLeafMovedFnSigKey(anonLeafCloBindFn[i])
+    }
+    i = i + 1
+  }
+  ""
+}
+
+// The `$fnsig` key the FUNCTION named `nm` actually interned, or "" — the half
+// `anonLeafCloSlotSigKey` and `anonLeafCloBindSigKey` share.
+function anonLeafMovedFnSigKey(nm: string): string {
   if nm == "" { return "" }
   let fe = 0
   while fe < fnStmts.length {
@@ -24180,6 +24202,7 @@ export function internInlineShapeTy(nm: string, tyIx: i32) {
     const pi = dOrd[pj]
     sFieldNames.push(names[pi])
     sFieldTypes.push(codes[pi])
+    sFieldCloSig.push(fieldCloSigOf(codes[pi], texts[pi]))
     forceScalarListField(codes[pi])
     // B6b: the ROW'S KEY COLUMN, read off the field's OWN spelling and asked ONCE for
     // every code — the question the other FOUR row recorders (`pushFieldRow`'s three
@@ -24367,6 +24390,7 @@ export function internShapeAs(key: string, nm: string) {
     const fx = ord[pi]
     sFieldNames.push(names[fx])
     sFieldTypes.push(codes[fx])
+    sFieldCloSig.push(fieldCloSigOf(codes[fx], rawTexts[fx]))
     sFieldElemName.push("")
     // This recorder banks NO element name for any code (its rows carry "" — the alias
     // shape's fields are re-derived elsewhere), but the KEY half is free and is read
@@ -24671,6 +24695,15 @@ function annShapeIndexOf(names: string[], codes: i32[], texts: string[]) {
             // same shared-layout split — the atom-element context is per-row
             // (`sFieldIsLitUnionArray`), so the rows must stay distinct.
             allIn = false
+          } else if !sFieldCloSigCompat(si, fi, codes[i], texts[i]) {
+            // SIGNATURE-IDENTITY split, the closure field's twin of the two atom splits
+            // above: code 14 is layout-shared (every closure field is one `(ref
+            // $cloStruct)`), so `{f: () => string}` and `{f: () => i32}` matched here and
+            // the SECOND annotation resolved the FIRST's row — leaving its own spelling
+            // with no row at all and its parameter valtype `emitProgram: ref valtype with
+            // no interned shape`, on a program `vl check` accepts. The `sFieldCloSig`
+            // column is what makes the two legible; see its header in `emit_state.vl`.
+            allIn = false
           }
         }
         i = i + 1
@@ -24779,6 +24812,10 @@ export function gaeEnsure(name: string) {
   const names: string[] = []
   const codes: i32[] = []
   const elems: string[] = []
+  // The closure-signature column, banked per field for the same reason `ekeys` is: the
+  // APPLIED field spelling is the only place the signature is legible and the push loop
+  // below no longer has it.
+  const csigs: string[] = []
   // B6b: the field ROW's KEY column, banked per field beside its element name — an
   // APPLIED field spelling (`{[i32]: T}` at `T = i32`) is the only place the key is
   // legible, and the push loop below no longer has the spelling.
@@ -24846,6 +24883,7 @@ export function gaeEnsure(name: string) {
     names.push(gaeFieldNames[fs + fi])
     codes.push(code)
     elems.push(elem)
+    csigs.push(fieldCloSigOf(code, tn))
     let ek = 0
     if nameIsI32KeyedMap(tn) { ek = 1 }
     ekeys.push(ek)
@@ -24866,6 +24904,7 @@ export function gaeEnsure(name: string) {
     const pi = fOrd[pj]
     sFieldNames.push(names[pi])
     sFieldTypes.push(codes[pi])
+    sFieldCloSig.push(csigs[pi])
     sFieldElemName.push(elems[pi])
     recordSFieldElemRow(elems[pi], ekeys[pi] == 1) // D5
     pj = pj + 1
@@ -25499,6 +25538,51 @@ export function shapeFieldElemName(ftxt: string, code: i32) {
   // code-0 recording over the `| null`-stripped part.
   if code == 30 { return nulLitUnionInnerName(ftxt) }
   ""
+}
+
+// The `sFieldCloSig` column's ONE producer: the `$fnsig` key a CLOSURE field (code 14) or a
+// NULLABLE-closure field (code 22) records, "" for every other code. `cloNameSigKey` answers
+// both spellings and answers "" for a name it cannot decompose (an alias reaching a recorder
+// that holds only the raw text) — and "" is read as "unknown", never as "no signature", by
+// the one consumer. See `sFieldCloSig` in `emit_state.vl` for why the column exists.
+export function fieldCloSigOf(code: i32, ftxt: string) {
+  if code != 14 && code != 22 { return "" }
+  cloNameSigKey(ftxt)
+}
+
+// The same column from the ARENA instead of a spelling — `sigKeyOfTy` is `annSigKey`'s
+// type-taking twin and the two are byte-identical by construction, so a row recorded
+// through either provenance keys the same signature. The recorder that holds a `FieldDef`
+// node has no rendered field text (the render was deleted once nothing read it), and
+// re-introducing one to feed this column would be the render coming back.
+export function fieldCloSigOfTy(code: i32, tyIx: i32) {
+  if code != 14 && code != 22 { return "" }
+  sigKeyOfTy(tyIx)
+}
+
+// Could row `si`'s field `fi` and a query field spelled `(code, ftxt)` be the SAME closure
+// field? "" on EITHER side is UNKNOWN, not "no signature" — a recorder that holds only an
+// alias name banks "" — so an unknown answers TRUE and the pair keeps whatever behaviour it
+// had before the column existed. Only two signatures that BOTH resolve and DISAGREE split.
+export function sFieldCloSigCompat(
+  si: i32,
+  fi: i32,
+  code: i32,
+  ftxt: string,
+): boolean {
+  const want = fieldCloSigOf(code, ftxt)
+  if want == "" { return true }
+  const have = sFieldCloSigAt(si, fi)
+  if have == "" { return true }
+  have == want
+}
+
+// The `$fnsig` key recorded for row `si`'s field `fi` (`sFieldCloSig`), "" when the row
+// predates the column's fill or the field is not a closure.
+export function sFieldCloSigAt(si: i32, fi: i32) {
+  const at = sFieldStart[si] + fi
+  if at < 0 || at >= sFieldCloSig.length { return "" }
+  sFieldCloSig[at]
 }
 
 // The wasm-type code (`0` i32, `3` string) of variant `vi`'s field at field index `fi`.
@@ -37622,6 +37706,12 @@ function calleeCloSigKeySid(sid: i32, fnIx: i32) {
   }
   const pk = paramCloSigKey(fnIx, name)
   if pk != "" { return pk }
+  // D1090 — AND THE BINDING'S TWIN OF THAT ANSWER, ahead of the annotation arms for the same
+  // reason: a `??` merge can move the rows of the one function this binding ever holds, and
+  // the annotation still names the pre-move row. See `anonLeafCloBindSigKey` — "" everywhere
+  // else, so no other closure-valued binding changes a byte.
+  const bk = anonLeafCloBindSigKey(name)
+  if bk != "" { return bk }
   // ONE intern for the three resolutions below (design R3's shape (b) at its densest:
   // `identFnTypeAnnName`, `identClosureFe` and `identCopySource` each resolve the SAME
   // identifier against the SAME two tables, so this line removes five hash-and-probes).
