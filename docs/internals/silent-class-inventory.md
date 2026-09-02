@@ -33979,3 +33979,320 @@ Repro:
   can carry a `JsonError | null` at all is new, so the read that mis-prints was unreachable in
   the shape that wants it. `std/json.vl`'s renderer face meets it the moment the module names
   its `kind` union and returns `JsonError | null`.
+
+### D1080 — a DECLARATIONS-ONLY module is check-clean and refused at emit; the same file IMPORTED by a program that uses the type compiles and runs
+
+**loud emit reject · check rc 0 · clause 2 · `emitProgram: expected at least one top-level function or statement` (`compiler/emit_sections.vl:3881`) · ZERO corpus cells · found 2026-09-02 by the emit-refusal reachability sample**
+
+Repro (refuses):
+
+    export type Point = { x: i32, y: i32 }
+
+* **THE ENTRY POSITION IS THE INGREDIENT, AND IT IS WHAT MAKES THIS A GAP RATHER THAN A DESIGN
+  RULE.** The identical file imported by a program that uses `Point` compiles and runs. So the
+  compiler already agrees a types-only module is a legal module; it just cannot be the one you
+  name on the command line.
+
+* **EVERY DECLARATION FORM REPRODUCES IT**, ablated: `type T = { a: i32 }`, `type Id = i32`, and
+  `export type Point = …` all give check rc 0 and this refusal.
+
+* **THE EMPTY FILE IS A DIFFERENT SITE.** Zero bytes (or a comment-only file) fires
+  `emitProgram: expected at least one top-level statement` at `emit_sections.vl:4394`, which is
+  the arena-root check ahead of the pass table. Two sites, two sentences, and only one of them
+  has a declaration to look at.
+
+* Either resolution closes it — emit the empty module, or move the diagnosis into the CHECKER.
+  A `loud emit reject` is a clause-2 violation by construction: `check` returned 0 to reach the
+  emitter, so either the program is legal or the checker owed the diagnosis.
+
+* Probe: `scripts/capability-probes/declarations-only-module.vl`.
+
+### D1081 — an EMPTY inline object shape as a union arm (`{} | { x: i32 }`) is check-clean and refused as "malformed"
+
+**loud emit reject · check rc 0 · clause 2 · `emitProgram: malformed inline union-variant shape` (`compiler/emit_collect.vl:10808`) · ZERO corpus cells · found 2026-09-02 by the emit-refusal reachability sample**
+
+Repro (refuses):
+
+    type U = {} | { x: i32 }
+    function f(u: U): i32 {
+      if u is { x: i32 } { return u.x }
+      return 0
+    }
+    print(f({ x: 5 }))
+
+* **NOTHING HERE IS MALFORMED**, which is the whole complaint. An empty object type is a type
+  the checker accepts and a zero-field arm is a legal union member; the sentence describes the
+  parse the collector performed, not the program the user wrote.
+
+* **THE MECHANISM IS AN EMPTY-SPLIT ARTEFACT.** `{}` satisfies `nameIsShapeSpanEnds`, so
+  `collectVariantFields` routes it to `collectShapeVariantFields` (`emit_collect.vl:10876`).
+  `groupInnerOf("{}")` is `""`, and `tyTopLevelSplit` is called with `dropEmpty=false`
+  (`emit_base.vl:3097`), so it pushes ONE empty part whose `indexOf(":")` is `-1` —
+  `outNames.push("")` at `emit_base.vl:3102` — and the `fnames[fi] == ""` guard fires on a shape
+  that has no fields at all.
+
+* Probe: `scripts/capability-probes/empty-inline-union-arm.vl`.
+
+### D1082 — a generic `T[]` parameter applied at a UNION-element list is check-clean and refused with "expected an array argument" about an argument that is an array
+
+**loud emit reject · check rc 0 · clause 2 · ``emitProgram: monomorphize: expected an array argument for `xs` in a call to `first` `` (`compiler/emit_mono.vl:4813`) · ZERO corpus cells · found 2026-09-02 by the emit-refusal reachability sample**
+
+Repro (refuses):
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    function first<T>(xs: T[]): T {
+      return xs[0]
+    }
+    function go(): i32 {
+      const xs: Shape[] = [{ r: 5 }]
+      const f = first(xs)
+      if f is Circle { return f.r }
+      return 0
+    }
+    print(go())
+
+* **THE UNION ELEMENT IS THE INGREDIENT, ABLATED**: the identical program at
+  `const xs: Circle[]` compiles and runs. Only the union-element spelling refuses.
+
+* **THE MESSAGE IS FALSE ABOUT THE ARGUMENT.** `xs` is declared `Shape[]` and the checker
+  already proved it is an array of the right element. `monoArgPinName` hands the binding rung a
+  name `nameIsArray` does not recognise, and the rung reports that as the user's mistake.
+
+* Probe: `scripts/capability-probes/generic-array-param-union-element.vl`.
+
+### D1083 — a field read on a union narrowed by its NULL COMPLEMENT is check-clean and refused; dropping the `| null` arm runs
+
+**loud emit reject · check rc 0 · clause 2 · `emitProgram: narrowed receiver names no union variant` (`compiler/wasmEmit.vl:4162`) · ZERO corpus cells · found 2026-09-02 by the emit-refusal reachability sample**
+
+Repro (refuses):
+
+    type A = { k: i32, a: i32 }
+    type B = { k: i32, b: i32 }
+    type U = A | B | null
+    function f(u: U): i32 {
+      if u != null {
+        return u.k
+      }
+      0
+    }
+    const a: A = { k: 7, a: 1 }
+    print(f(a))
+
+* **THE `| null` THIRD ARM IS THE INGREDIENT, ABLATED**: `type U = A | B` with the same
+  shared-field read compiles and runs, and so do `U = i32[] | string` with `u.length` and an
+  `u is { a: i32 }` inline-shape narrowing.
+
+* **A PATH KEY BANKS THE SPELLING, NOT THE ARENA TYPE** — this is that rule again, one narrowing
+  over. The null-complement narrowing banks the RENDERED SURVIVOR SET, the string `"A | B"`.
+  `memIsNarrowed` answers true because that string is non-empty, `emitMem` routes to
+  `emitNarrowedMem`, and `variantIndexOf("A | B")` is an exact string compare against a variant
+  table holding `A` and `B` separately and nothing spelled `"A | B"`.
+
+* Probe: `scripts/capability-probes/null-complement-narrowed-field-read.vl`.
+
+### D1084 — an OPTIONAL-CHAIN result as a nullable-struct equality operand is check-clean and refused; every other producer of the same type compares fine
+
+**loud emit reject · check rc 0 · clause 2 · `emitProgram: struct equality over a non-struct operand` (`compiler/wasmEmit.vl:11809`) · ZERO corpus cells · found 2026-09-02 by the emit-refusal reachability sample**
+
+Repro (refuses):
+
+    type S = { a: i32 }
+    type T = { f: S }
+    function go(o: T | null, q: S | null): boolean {
+      return o?.f == q
+    }
+    print(go(null, null))
+
+* **IT IS A MISSING VISITOR ARM, NOT A REP GAP**, and the ablation is what says so. Every other
+  producer of `S | null` compares and runs: two locals, two call results, a `(S|null)[]`
+  element, a plain struct-field read `x.f == y.f`, a closure-value call, and a monomorphized
+  `eqN<T>` instance. Only the `?.` producer refuses.
+
+* **MECHANISM.** `o?.f` banks `S | null`, so the compare classifies as the `nulstruct` niche and
+  routes to `emitNulStructEq`, which resolves each operand's struct row through
+  `structIndexOfExpr` (`emit_classify.vl:28840`). That function's arms are ObjLit / Paren /
+  IfStmt / BinExpr / Call / Ident / Index / Member — and **no `OptMember`**. The `?.` operand
+  falls to the `-1` tail, `binEqNulVariantRow` also declines, and both `siFound` rungs miss.
+
+* Probe: `scripts/capability-probes/optchain-result-struct-equality.vl`.
+
+### D1085 — a LAMBDA anywhere underneath an `as` cast is never lifted: check-clean, refused at emit, and deleting the cast makes it run
+
+**loud emit reject · check rc 0 · clause 2 · `emitProgram: function literal not lifted` (`compiler/wasmEmit.vl:12891`) · ZERO corpus cells · found 2026-09-02 by the emit-refusal reachability sample**
+
+Repro (refuses):
+
+    function pick(f: (i32) => i32): i32 { return f(1) }
+    const v = pick((n: i32) => { return n }) as f64
+    print(v)
+
+* **THE CAST IS SCENERY TO THE VALUE AND LOAD-BEARING TO THE WALK.** Delete `as f64` and the
+  same call compiles and runs; the lambda's own shape never changes.
+
+* **MECHANISM, ONE NODE KIND WIDE.** `liftFnsInExpr` (`emit_collect.vl:3299-3355`) walks Block,
+  LetDecl, RetStmt, If, While, ForRange, ForIn, Call, BinExpr, Unary, Paren, Member, Index,
+  ObjLit and ArrayLit — and has no `AsExpr` arm. A function literal under `as` is therefore
+  never pushed to `fnStmts`, so `fnStmtsPosOf` answers `-1` at emit.
+
+* **A NEIGHBOURING UNWALKED NODE IS MASKED, NOT ABSENT**: a lambda inside a `?.` receiver is also
+  never lifted, but the emit reports `` emitProgram: `?.` needs a re-readable receiver `` first.
+  `match` arms and scrutinees are fine — `match` desugars into If/Block, which are walked.
+
+* Probe: `scripts/capability-probes/lambda-under-as-cast.vl`.
+
+### D1086 — an `if` EXPRESSION with no `else` is check-clean and refused at THREE different emit sites, one per rep
+
+**loud emit reject · check rc 0 · clause 2 · `emitProgram: if-expression requires an else arm` (`compiler/wasmEmit.vl:12942` at a ref rep and `compiler/wasmEmit.vl:13116` at a sentinel-nullable scalar rep) · ZERO corpus cells · found 2026-09-02 by the emit-refusal reachability sample**
+
+Repro (refuses):
+
+    const x = if true { "hi" }
+    if x != null { print(x) }
+
+* **A MISSING `else` IS NOT A TYPE ERROR.** The checker types the binding as `string | null` and
+  accepts it, which is exactly the value the language says the expression has when the condition
+  is false. The refusal is a codegen gap wearing a grammar rule's sentence.
+
+* **THE REP PICKS THE SITE, and there are at least three.** A `string` (or struct-join) then-arm
+  fires `wasmEmit.vl:12942` via `emitIfExprRef`; a `boolean` then-arm — and a literal-union atom
+  — declines every rung of `ifExprRefKind` and fires `wasmEmit.vl:13116` via `emitIfExprAs`; an
+  `i32` then-arm takes the value-union box path and fires a THIRD site, `wasmEmit.vl:5502`,
+  whose sentence reads `union if-expression requires an else arm`.
+
+* **THE ATTRIBUTION WAS MEASURED, NOT READ**, because 12942 and 13116 carry a byte-identical
+  literal and the message alone cannot say which fired. An instrumented compiler built to a
+  scratch `OUT=` path (never the seed; `build/vl-compiler.wasm` was `cmp`-verified byte-identical
+  before and after) tagged the two apart and confirmed both are independently reachable.
+
+* Probes: `scripts/capability-probes/if-expr-no-else-string-arm.vl` (12942) and
+  `scripts/capability-probes/if-expr-no-else-boolean-arm.vl` (13116).
+
+### D1087 — the emitter dispatches on a NAME the checker let the user bind, so a user's own parameter or struct field draws a BUILT-IN's arity complaint
+
+**loud emit reject · check rc 0 · clause 2 · `emitProgram: __memory_size__ takes no arguments` (`compiler/wasmEmit.vl:15119`) and `emitProgram: .pop takes no arguments` (`compiler/wasmEmit.vl:16985`) · ZERO corpus cells · found 2026-09-02 by the emit-refusal reachability sample**
+
+Repro (refuses):
+
+    function run(__memory_size__: (i32) => i32): i32 {
+      return __memory_size__(1)
+    }
+    print(run((n: i32) => { return n + 1 }))
+
+* **THE PARAMETER SPELLING.** `checkNotEmitterIntrinsic` guards a FUNCTION name
+  (`typecheck.vl:24827`) and a BINDING name (`typecheck.vl:35529`) — and not a parameter name.
+  The checker therefore lets the name be bound, types the call against the parameter's own
+  `(i32) => i32`, and accepts arity 1; `emitCall` dispatches on `callee.identName` before any
+  declaration lookup and lands in the intrinsic's arity-0 arm.
+
+* **THE STRUCT-FIELD SPELLING IS THE SAME DEFECT ONE DISPATCH OVER.** `type S = { pop: (i32) =>
+  i32 }` with `s.pop(1)` is check-clean and refused `.pop takes no arguments`:
+  `emitCallNode`'s member dispatch (`wasmEmit.vl:22125`) is `if callee.memProp == "pop"` with no
+  receiver-kind guard, unlike its `map` / `filter` / `keys` / `values` neighbours, which all test
+  the receiver first.
+
+* **`__trap__` IS NOT REACHABLE THIS WAY, AND THAT IS THE CONTROL**: its arity predicate is
+  duplicated ungated in the checker (`typecheck.vl:23960`), so the shadowing spelling is refused
+  at check rc 1. The difference between the two intrinsics is which layer owns the rule — which
+  is the fix for the other two.
+
+* Probes: `scripts/capability-probes/intrinsic-name-as-parameter.vl` and
+  `scripts/capability-probes/struct-field-named-pop.vl`.
+
+### D1088 — `collectMapFilterUse`'s result ladder has no `i64` / `f32` / `u8` arm, so a `.map` callback returning one of those builds a list whose rep flag was never set
+
+**loud emit reject · check rc 0 · clause 2 · `emitProgram: f32 indexed assignment but f32 list type not collected` (`compiler/wasmEmit.vl:16128`) and `emitProgram: .map/.filter over i64[] but i64 list type not collected` (`compiler/wasmEmit.vl:17390`) · ZERO corpus cells · found 2026-09-02 by the emit-refusal reachability sample**
+
+Repro (refuses):
+
+    function toF(n: i32): f32 { return 1.5 }
+    function main() {
+      const v: f32 = 2.5
+      const xs = [1, 2]
+      xs.map(toF)[0] = v
+      print(1)
+    }
+    main()
+
+* **ONE HOLE, AT LEAST THREE MESSAGES.** `collectMapFilterUse` (`emit_collect.vl:12800-12807`)
+  classifies a `.map` result by the callback's return kind and its ladder is an `f64` arm plus an
+  i32 DEFAULT — no `i64`, `f32` or `u8`. The result list is repped at the callback's real type
+  while the matching `*Used` flag stays false, and whichever floor the value next meets fires.
+  Measured so far: the f32 indexed-assignment floor, the i64 `.map` source floor, and
+  `.pop but list type not collected` at `wasmEmit.vl:17023`.
+
+* **NO ANNOTATION MENTIONS THE ELEMENT TYPE**, which is what keeps the other collector
+  (`collectA`'s TypeRef chain) from setting the flag: the rep is inferred from the callback's
+  return type alone. Write `f32[]` anywhere in the program and the flag is set by the other route.
+
+* **THE i64 WITNESS MUST BE ONE CHAINED EXPRESSION.** Bind the inner map to its own `const` and
+  the inner call's DESTINATION floor (`.map result is i64[] but i64 list type not collected`,
+  `wasmEmit.vl:17442`) is recorded first and masks this site — `emitFail` keeps only the first
+  message. The chained form is
+  `const zs = xs.map(toI).map(idI)` over `toI(n: i32): i64` and `idI(n: i64): i64`.
+
+* Probes: `scripts/capability-probes/map-callback-f32-indexed-assign.vl` and
+  `scripts/capability-probes/map-chain-i64-result.vl`.
+
+### D1089 — a PARENTHESISED assignment target `(x) = 5` is check-clean and refused "not a simple name"
+
+**loud emit reject · check rc 0 · clause 2 · `emitProgram: assignment target is not a simple name` (`compiler/wasmEmit.vl:16437`) · ZERO corpus cells · found 2026-09-02 by the emit-refusal reachability sample**
+
+Repro (refuses):
+
+    function f(): i32 {
+      let x = 1
+      (x) = 5
+      return x
+    }
+    print(f())
+
+* **THE MESSAGE IS TRUE ABOUT THE NODE AND FALSE ABOUT THE PROGRAM.** `(x)` is a simple name, and
+  the checker agrees — it type-checks the assignment and returns 0.
+
+* **MECHANISM, ONE CALL WIDE.** `emitAssign` (`wasmEmit.vl:15686`) reads `P.nodes[a.binLeft]` and
+  matches it against `Ident` / `Index` / `Member`. It applies `unwrapParen` to the RHS and not to
+  the target, so a `Paren` LHS matches no arm and falls to the floor.
+
+* Probe: `scripts/capability-probes/parenthesised-assignment-target.vl`.
+
+### D1130 — a `for`-loop variable sharing a spelling with a nested function's NAME, captured by a closure, is check-clean invalid wasm
+
+**check-clean invalid wasm · check rc 0 · `type mismatch: expected i32, found (ref $type)` · ZERO corpus cells · found 2026-09-02 as a SIDE-FINDING of the emit-refusal reachability measurement (`docs/internals/emit-refusal-reachability-2026-09.md` §7) — not part of its sample and not folded into its estimate — and re-verified by hand before filing**
+
+Repro (should print `1` then `6`):
+
+    function other(): i32 {
+      function q(): i32 { 1 }
+      q()
+    }
+    function go(): i32 {
+      let s = 0
+      for q in 1 to 3 {
+        const f = () => q
+        s = s + f()
+      }
+      s
+    }
+    print(other())
+    print(go())
+
+* **TWO INDEPENDENT HALVES, BOTH REQUIRED.** `capRecord` (`emit_classify.vl`) drops the capture
+  because `fnIndexOf(name) >= 0` — the name IS a function somewhere in the module, so it is
+  treated as a static callee rather than a captured local. Meanwhile `plScanStmt`
+  (`emit_base.vl`) records only a `LetDecl` and never a `ForRange.frVar` / `ForIn.fiVar`, so the
+  loop variable was never in the local plan to begin with. The emitter then resolves the name
+  through `fnIndexOfInScopeSid` and emits a closure value where an i32 is wanted.
+
+* **ABLATED.** Rename the loop variable and it runs; delete the nested `function q` and it runs;
+  drop the closure and it runs. The nested function need not be in the same function, or called,
+  or of a compatible type — `fnIndexOf` is a MODULE-wide question asked about a LOCAL name.
+
+* **WHY IT IS WORTH MORE THAN ITS WITNESS.** The bug is a name-keyed answer overruling a scope
+  the arena already knows about — the same shape as D940 and D988, closed the same day. A
+  module-wide name lookup deciding a question about a loop-local binding cannot be right at any
+  scale; `q` is a perfectly ordinary loop-variable name.
+
+* Probe: `scripts/capability-probes/loop-var-shadowing-fn-name-capture.vl`.
+
