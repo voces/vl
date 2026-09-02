@@ -287,7 +287,16 @@ the rename walker is the riskiest code in the module bridge — land it alone.
    integers, because a table-free correctness argument outweighs the speed for a
    module with no deprecation story. The reasoning is in `std/fmt.vl`'s own
    `f64 ↔ TEXT` header; `f32`→string is still deferred, and is a different
-   boundary computation rather than a wrapper.
+   boundary computation rather than a wrapper. **`parseI64` and `parseI32`
+   landed 2026-09-01 too**, the exact integer inverses of `toString`: the
+   `parseF64` funnel cannot be exact wherever the integer is not representable
+   as a double. Serde decision B
+   (`docs/internals/serde-critique-synthesis.md`) is still OPEN — it
+   *recommends* `i64` on the wire as a NUMBER — but it adds these two "regardless
+   … by every option", which is what admits them here. Their grammar is
+   a strict SUBSET of `parseF64`'s (`"-"? digit+`, no leading `+`), and out of
+   range is `null` rather than a wrap — the opposite of `parseF64`'s rule, for
+   the reason its `TEXT → INTEGER` header gives.
 2. **`std:test` v1** — registration + matcher surface per D5; co-designed
    with the `vl test` runner.
 3. **`std:list`** — the collections-design §VL growable over the floor. The
