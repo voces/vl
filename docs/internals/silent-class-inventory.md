@@ -31715,7 +31715,7 @@ Repro (now runs, printing `true`):
   PAIR), so it is dropped and the RETURN face runs. The exclusion is also why only the INLINE
   spelling refused: the DECLARATION route registers its members unconditionally.
 
-* **THE POSITION MATRIX — nine lost, every one CHECK-CLEAN INVALID WASM on master.** One tiny
+* **THE POSITION MATRIX — TEN lost, every one CHECK-CLEAN INVALID WASM on master.** One tiny
   program per position, each printing a field read THROUGH the destination (`7`), so a cell that
   lands the box cannot pass by printing something.
 
@@ -31733,6 +31733,7 @@ Repro (now runs, printing `true`):
   | ref-list element, literal `[s]` | INVALID WASM | **runs** |
   | ref-list element, `push` | INVALID WASM | **runs** |
   | module-GLOBAL assignment (`gv = s`) | INVALID WASM | **runs** |
+  | map VALUE store (`m[k] = s`) | INVALID WASM | **runs** |
 
   The two that already ran are the two that carried the sequence inline (`emitCall`'s variant
   PARAM, `emitVariantCoerce`'s return). The unbox is `struct.get $uBox 1` + `ref.cast`, cast to
@@ -31746,11 +31747,11 @@ Repro (now runs, printing `true`):
   once — `emitNarrowedMem`, `emitIs`'s re-narrowing and struct `==` all read the box today — so
   this wires the deliveries instead and keeps the matrix as the completeness check.
 
-* **THREE POSITIONS ARE STILL NOT SERVED, each a different defect.** An UN-annotated rebind
-  (`const c = s`) is the loud `field access but no struct type declared`; an arm-typed field ON
-  A VARIANT is the loud `only i32 / boolean / string / array union-variant fields are supported`
-  (D761's variant-side sibling, untouched); and a map VALUE at an arm type is refused by the
-  CHECKER.
+* **TWO POSITIONS ARE STILL NOT SERVED, and each is a different defect.** An UN-annotated
+  rebind (`const c = s`) is the loud `field access but no struct type declared`, and an
+  arm-typed field ON A VARIANT is the loud
+  `only i32 / boolean / string / array union-variant fields are supported` — D761's
+  variant-side sibling, untouched here.
 
 * **`std/json.vl` CANNOT DROP ITS WORKAROUND YET, AND THAT IS A MEASURED ANSWER, NOT A
   CAUTION.** This row's witness spells `kind: "syntax"` — a BARE literal — and the module
