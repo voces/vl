@@ -5851,6 +5851,17 @@ function emitUnionConcreteEq(
 // `sHeapIdx.length` is 0 for this program. The arms' fields live in `uFieldNames` /
 // `uFieldTypes`, so the compare reads them there.
 //
+// D1061 — A SCALAR ARM BESIDE THE STRUCT ONES IS SERVED HERE TOO, and it is the MIXED pair
+// that was the gap: `A | B` over two struct arms already compared and printed `true`, while
+// `A | i32` and `A | string` refused with a message naming the "struct union". The arm loop
+// required a VARIANT ROW per arm and a scalar arm has none (`variantIndexOf("i32")` is -1),
+// so the whole lowering declined for a set it can otherwise serve arm for arm. The dispatch
+// is unchanged — every arm of this box is selected by the SAME tag field, and a scalar arm's
+// tag is `scalarTagOfKind` of its value-atom code, which cannot collide with a variant tag
+// (`scalarTagOfKind(k)` is `uVariants.length + k`). Only the per-arm COMPARE differs: a
+// struct arm compares its fields through the variant table, a scalar arm value-compares the
+// unboxed payload the way `emitUnionUnionEq` does for a pure value union.
+//
 // Returns 0 when it emitted and -1 when it DECLINES, so an arm set it cannot serve keeps the
 // caller's loud message rather than becoming a bad lowering.
 function emitStructUnionEq(
@@ -5864,17 +5875,38 @@ function emitStructUnionEq(
   const arms: string[] = []
   splitUnionAtoms(unionMemberSetOf(uname), arms)
   if arms.length < 2 { return -1 }
+  // The two per-arm columns, index-parallel to `arms` and mutually exclusive: a STRUCT arm
+  // carries its variant row in `vis` and -1 in `aks`, a SCALAR arm the reverse. Every read
+  // below branches on `vis[a] >= 0`, so an arm is never asked the other column's question.
   const vis: i32[] = []
+  const aks: i32[] = []
   let i = 0
   while i < arms.length {
     const vi = variantIndexOf(arms[i])
-    if vi < 0 { return -1 }
+    if vi < 0 {
+      // NOT A VARIANT: the arm is servable exactly when it is a value ATOM whose payload
+      // this lowering can unbox and compare — the same bound `emitUnionPayloadUnbox` and
+      // `atomEqOpcodeOfKind` enforce, asked BEFORE any byte is written so an unservable arm
+      // still DECLINES (keeping the caller's loud message) instead of failing loudly here.
+      const ak = valueAtomKind(arms[i])
+      if ak < 0 { return -1 }
+      if ak == 2 {
+        if !aUsed { return -1 }
+      } else if ak != nullValKind() {
+        if vbHeapIdxOfKind(ak) < 0 { return -1 }
+      }
+      vis.push(-1)
+      aks.push(ak)
+      i = i + 1
+      continue
+    }
     if vi >= uVarHeap.length { return -1 }
     if vi >= uTags.length { return -1 }
     if vi >= uFieldStart.length { return -1 }
     if vi >= uFieldCount.length { return -1 }
     if !variantFieldsComparable(vi) { return -1 }
     vis.push(vi)
+    aks.push(-1)
     i = i + 1
   }
   const sl = unionEqStashSlot()
@@ -5896,15 +5928,25 @@ function emitStructUnionEq(
   while a < vis.length - 1 {
     fbLocalGet(sl)
     fbStructGet(uBoxIdx, 0)
-    fbI32Const(uTags[vis[a]])
+    fbI32Const(unionArmTagOf(vis[a], aks[a]))
     fbI32Bin(70)
     fbIf(127)
     ctrlEnter()
-    if emitVariantArmEq(body, sl, sr, vis[a]) < 0 { return -1 }
+    if emitUnionArmEq(body, sl, sr, vis[a], aks[a]) < 0 { return -1 }
     fbElse()
     a = a + 1
   }
-  if emitVariantArmEq(body, sl, sr, vis[vis.length - 1]) < 0 { return -1 }
+  if (
+    emitUnionArmEq(
+      body,
+      sl,
+      sr,
+      vis[vis.length - 1],
+      aks[aks.length - 1],
+    ) < 0
+  ) {
+    return -1
+  }
   let e = 0
   while e < vis.length - 1 {
     fbEnd()
@@ -5939,6 +5981,36 @@ function variantFieldsComparable(vi: i32): boolean {
     j = j + 1
   }
   true
+}
+
+// D1061 — the BOX TAG of one arm of a mixed struct/scalar union, from whichever of the two
+// per-arm columns holds it. The two tag spaces are disjoint by construction: a variant tag is
+// an index into `uVariants` and `scalarTagOfKind(k)` is `uVariants.length + k`.
+function unionArmTagOf(vi: i32, ak: i32): i32 {
+  if vi >= 0 { return uTags[vi] }
+  scalarTagOfKind(ak)
+}
+
+// D1061 — one arm of a mixed struct/scalar union, dispatched on which column named it. The
+// tag test that selects this arm has ALREADY proved both boxes carry it, so each half only
+// has to compare the arm's own payload.
+function emitUnionArmEq(body: i32[], sl: i32, sr: i32, vi: i32, ak: i32) {
+  if vi >= 0 { return emitVariantArmEq(body, sl, sr, vi) }
+  // The NULL arm carries no payload at all: two boxes that agree on the null tag are equal,
+  // and the enclosing tag test is that agreement.
+  if ak == nullValKind() {
+    fbI32Const(1)
+    return 0
+  }
+  fbLocalGet(sl)
+  fbStructGet(uBoxIdx, 1)
+  if emitUnionPayloadUnbox(body, ak) < 0 { return -1 }
+  fbLocalGet(sr)
+  fbStructGet(uBoxIdx, 1)
+  if emitUnionPayloadUnbox(body, ak) < 0 { return -1 }
+  if ak == 2 { return emitStrEqCore(body) }
+  fbI32Bin(atomEqOpcodeOfKind(ak))
+  0
 }
 
 // One arm: cast both payloads to the arm's variant heap, park them, and AND the fields.
