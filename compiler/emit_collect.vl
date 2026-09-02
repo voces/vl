@@ -133,6 +133,7 @@ import {
 } from "./ast"
 import {
   annArrowAt,
+  annFnDecompose,
   annGenAppDecompose,
   annRetNameOf,
   arrLeafNameOf,
@@ -312,6 +313,7 @@ import {
   rlWrapIdx,
   sBackIdx,
   sDeclared,
+  sFieldCloSig,
   sFieldCount,
   sFieldElemKeyI32,
   sFieldElemName,
@@ -435,6 +437,7 @@ import {
   exprIsBareFnName,
   exprIsLitAtom,
   exprMap,
+  fieldCloSigOfTy,
   fieldNameOrder,
   fieldRefElemName,
   fieldTypeCode,
@@ -5928,6 +5931,51 @@ function i32MapShapeFieldsLowerable(nm: string): i32 {
   0
 }
 
+// THE ONE HOME of "reserve the backing/wrapper heap types the type NAME `a` needs". A
+// presence flag is a RESERVATION: `mAssignTypeIndices` mints a heap type only where the
+// flag is set, and an unminted index falls through to `mNextType` — whatever heap type
+// happens to sit there — so a missed reservation is check-clean INVALID WASM, never a
+// missing feature. Monotone (every write is an OR into a flag), so calling it on a name
+// whose types another route already reserved is byte-inert.
+function forceAnnLeafReps(a: string): i32 {
+  if nameIsStringArray(a) {
+    slUsed = true
+    aUsed = true
+  } else if nameIsF64Array(a) {
+    fa64Used = true
+  } else if nameIsI64Array(a) {
+    ia64Used = true
+  } else if nameIsF32Array(a) {
+    fa32Used = true
+  } else if nameIsBareMap(a) {
+    mUsed = true
+    lUsed = true
+    aUsed = true
+  } else if nameIsNulI32List(a) {
+    lUsed = true
+    aUsed = true
+  } else if arrElemIs(a, "i32") || arrElemIs(a, "boolean") {
+    lUsed = true
+    aUsed = true
+  } else if nameIsString(a) || nameIsNulString(a) {
+    aUsed = true
+  } else if nulScalarListKind(a) != null {
+    const nsk = nulScalarListKind(a)
+    if nsk == "nulstrlist" {
+      slUsed = true
+      aUsed = true
+    }
+    if nsk == "nulf64list" { fa64Used = true }
+    if nsk == "nuli64list" { ia64Used = true }
+    if nsk == "nulf32list" { fa32Used = true }
+    // The packed-byte backing a `u8[] | null` cell's VALUE needs. Its three siblings
+    // above mark their backings here; this one did not, so the literal path's
+    // `!ba8Used` floor refused a program whose cell was already typed `nulu8list`.
+    if nsk == "nulu8list" { ba8Used = true }
+  }
+  0
+}
+
 function forceGenAppArgTypes(name: string): i32 {
   if !annGenAppSpanEnds(name) { return 0 }
   const args: string[] = []
@@ -5938,42 +5986,91 @@ function forceGenAppArgTypes(name: string): i32 {
     const a = args[i]
     // A NESTED application (`Box<Pair<i32, string>>`) is the same reservation one rung in.
     forceGenAppArgTypes(a)
-    if nameIsStringArray(a) {
-      slUsed = true
-      aUsed = true
-    } else if nameIsF64Array(a) {
-      fa64Used = true
-    } else if nameIsI64Array(a) {
-      ia64Used = true
-    } else if nameIsF32Array(a) {
-      fa32Used = true
-    } else if nameIsBareMap(a) {
-      mUsed = true
-      lUsed = true
-      aUsed = true
-    } else if nameIsNulI32List(a) {
-      lUsed = true
-      aUsed = true
-    } else if arrElemIs(a, "i32") || arrElemIs(a, "boolean") {
-      lUsed = true
-      aUsed = true
-    } else if nameIsString(a) || nameIsNulString(a) {
-      aUsed = true
-    } else if nulScalarListKind(a) != null {
-      const nsk = nulScalarListKind(a)
-      if nsk == "nulstrlist" {
-        slUsed = true
-        aUsed = true
-      }
-      if nsk == "nulf64list" { fa64Used = true }
-      if nsk == "nuli64list" { ia64Used = true }
-      if nsk == "nulf32list" { fa32Used = true }
-      // The packed-byte backing a `u8[] | null` cell's VALUE needs. Its three siblings
-      // above mark their backings here; this one did not, so the literal path's
-      // `!ba8Used` floor refused a program whose cell was already typed `nulu8list`.
-      if nsk == "nulu8list" { ba8Used = true }
-    }
+    forceAnnLeafReps(a)
     i = i + 1
+  }
+  0
+}
+
+// RESERVE THE REPS A CLOSURE FIELD'S SIGNATURE NEEDS, at every depth of an annotation
+// SPELLING. The `annRetNameOf` rung in `collectA`'s `TypeRef` arm handles a TOP-LEVEL
+// function type (`(i32) => string`) by forcing its return's reps; a closure spelled as a
+// struct FIELD (`{f: () => string}`) reaches no rung at all, because the top-level arrow
+// scan stops at the brace and the struct field table records a closure field's CODE (14)
+// with no signature text beside it — `sFieldElemName` is "" for such a field, so the field
+// loop cannot re-derive the reservation either.
+//
+// THE ALIAS SPELLING RAN ONLY BY ACCIDENT, and that is what locates this: `type Fs = {f:
+// () => string}` mints a SECOND `TypeRef` for the alias body's arrow (the arena holds
+// `<()=>string>` beside `<Fs>`), which the top-level rung then sees; the inline spelling
+// mints ONE node (`<{f:()=>string}>`) and nothing looks inside it. Both spellings build
+// the SAME struct row (one field, code 14), so the type tables cannot tell them apart —
+// the difference is entirely which annotation NODES exist. One nesting level deeper the
+// accident stops paying (`type Fs = {g: {f: () => string}}` fails exactly like the inline
+// form), which is why this walks the spelling rather than adding an alias-shaped case.
+//
+// SCOPE, DELIBERATELY: it forces only from types reached THROUGH an arrow nested inside a
+// composite. A top-level arrow's own return keeps the narrow list its own rung gives it,
+// so a program whose reservations already resolve cannot change a byte here.
+function forceNestedCloSigReps(nm: string, depth: i32): i32 {
+  if depth > 6 { return 0 }
+  if nm == "" { return 0 }
+  // A UNION / NULLABLE spelling: the shape may sit in any arm. `splitUnionAtoms` stops at
+  // a top-level `=>`, so a function type reaches the arrow rung below as ONE atom.
+  const arms: string[] = []
+  splitUnionAtoms(nm, arms)
+  if arms.length > 1 {
+    let ai = 0
+    while ai < arms.length {
+      forceNestedCloSigReps(arms[ai], depth + 1)
+      ai = ai + 1
+    }
+    return 0
+  }
+  // AN ARRAY OF the spelling (`{f: () => string}[]`) — peel one layer and continue.
+  if nameIsArray(nm) {
+    return forceNestedCloSigReps(listElemNameOf(nm), depth + 1)
+  }
+  // A TOP-LEVEL function type: descend into its parts WITHOUT forcing them, so the
+  // `annRetNameOf` rung stays the sole owner of a top-level return's reservation.
+  const tps: string[] = []
+  const tret = annFnDecompose(nm, tps)
+  if tret != "" {
+    forceNestedCloSigReps(tret, depth + 1)
+    let ti = 0
+    while ti < tps.length {
+      forceNestedCloSigReps(tps[ti], depth + 1)
+      ti = ti + 1
+    }
+    return 0
+  }
+  // A SHAPE. Every field whose text carries a top-level arrow is a closure field: force
+  // the reps its result and parameters name, then keep descending — a result may itself
+  // be a shape with a closure field of its own.
+  if !nameIsShapeSpanEnds(nm) { return 0 }
+  const fnames: string[] = []
+  const ftexts: string[] = []
+  // The GROUP-INTERIOR cut at its home (`tyname.groupInnerOf`, W1); the guard above is
+  // the bound that home requires.
+  shapeInnerFieldSplit(groupInnerOf(nm), fnames, ftexts)
+  let fi = 0
+  while fi < ftexts.length {
+    const ft = ftexts[fi]
+    const ps: string[] = []
+    const ret = annFnDecompose(ft, ps)
+    if ret != "" {
+      forceAnnLeafReps(ret)
+      forceNestedCloSigReps(ret, depth + 1)
+      let pi = 0
+      while pi < ps.length {
+        forceAnnLeafReps(ps[pi])
+        forceNestedCloSigReps(ps[pi], depth + 1)
+        pi = pi + 1
+      }
+    } else {
+      forceNestedCloSigReps(ft, depth + 1)
+    }
+    fi = fi + 1
   }
   0
 }
@@ -6357,6 +6454,9 @@ export function collectA(_stmts: i32[]) {
       if strContains(nd.tyName, "{[i32]:") {
         if i32MapSpellingLowerable(nd.tyName) < 0 { return -1 }
       }
+      // A CLOSURE spelled as a struct FIELD reserves nothing through the rung below —
+      // see `forceNestedCloSigReps`, which walks INTO the spelling for it.
+      forceNestedCloSigReps(nd.tyName, 0)
       // A TOP-LEVEL function-type annotation (`(i32) => R`): the function-type name
       // itself needs no array/list type, but its RETURN `R` may (an `i32[]`/`string[]`/
       // `f64[]` result list, or a `string`). Force the return's backing types so the
@@ -9634,6 +9734,9 @@ function anonMintRowFor(objIx: i32) {
         const pi = aOrd[pj]
         sFieldNames.push(names[pi])
         sFieldTypes.push(codes[pi])
+        // An anonymous literal's field has no annotation TEXT to key a closure signature
+        // from — "" is this recorder's honest answer, and the consumer reads it as unknown.
+        sFieldCloSig.push("")
         sFieldElemName.push(elemNames[pi])
         // B6b: an anonymous literal's MAP field (code 19) carries a real key column —
         // an mv slot's identity is the (KEY, VALUE) pair, and both halves come off the
@@ -10657,6 +10760,7 @@ function pushFieldRow(
   fName: string,
   tyText: string,
   elemTyHint: i32,
+  cloSig: string,
 ) {
   if toVariant {
     uFieldTypes.push(code)
@@ -10667,6 +10771,7 @@ function pushFieldRow(
   } else {
     sFieldTypes.push(code)
     sFieldElemName.push(elemNm)
+    sFieldCloSig.push(cloSig)
     recordSFieldElemRowTy(elemNm, keyI32, elemTyHint) // D5 + B6b
     sFieldNames.push(fName)
   }
@@ -10716,6 +10821,7 @@ export function collectS(stmts: i32[]) {
   sFieldCount = []
   sFieldTypes = []
   sFieldElemName = []
+  sFieldCloSig = []
   sFieldElemTyIx = []
   sFieldElemKeyI32 = []
   // Nested inline-shape FIELD types intern first, so the struct decls that reference them resolve.
@@ -10822,7 +10928,12 @@ export function collectS(stmts: i32[]) {
               fnode.fdName,
               "",
               fieldElemHintOf(fnode.fdType, code, recNm),
+              fieldCloSigOfTy(code, nodeTyIxOf(fnode.fdType)),
             )
+            // THE ARENA, not a render: the field text this recorder would have to
+            // re-render for a closure field is the render #1615 deleted as dead, and
+            // `sigKeyOfTy` answers the same key from the type it already has.
+
             // A DEAD RENDER, deleted. This is `pushFieldRow`'s `tyText`, and the branch this
             // call takes (`toVariant == false`) never reads it — only the VARIANT branch has a
             // text column (`uFieldTyText`); the struct side has no `sFieldTyText` at all. The
@@ -10929,7 +11040,10 @@ function collectShapeVariantFields(nm: string, shapeTy: i32) {
       fnames[fi],
       variantFieldIdText(ftxt, fldTy),
       -1,
+      "",
     )
+    // The VARIANT table has no `sFieldCloSig` twin — this branch pushes none.
+
     cnt = cnt + 1
     fx = fx + 1
   }
@@ -11023,7 +11137,10 @@ function collectVariantFields(stmts: i32[], name: string) {
               fnode.fdName,
               variantFieldIdText(ftxt, nodeTyIxOf(fnode.fdType)),
               fieldElemHintOf(fnode.fdType, code, elemNm),
+              "",
             )
+            // The VARIANT table has no `sFieldCloSig` twin — this branch pushes none.
+
             // Same column, same reasoning — and `fnode` is still live here, 33 lines after
             // `ftxt` was rendered from it. An earlier pass filed this site as string-only by
             // looking at the ARGUMENT's surface form rather than at what was in scope.
