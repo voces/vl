@@ -33655,9 +33655,13 @@ Repro (RUNS and prints `true`):
 
 ### D1062 — an INFERRED nullable return whose non-null arm is a LIST refuses through TWO different channels depending on the ELEMENT type, and annotating fixes both
 
-**loud emit reject at `i32[]` (`emitProgram: bare null needs a struct-typed context`) and a loud CHECK reject at `string[]` (`'f' infers the nullable return type string[] | null — type-valid, but an inferred return of this shape is not yet supported by codegen; annotate the return type`, `compiler/typecheck.vl:25831`) · check rc 0 on the first · clause 2 both ways · ZERO corpus cells · found 2026-09-02 triaging `goal-scoreboard.py --sites`**
+**CLOSED 2026-09-02 — runs. Was a loud emit reject at `i32[]` (`emitProgram: bare null needs a
+struct-typed context`) and a loud CHECK reject at every other element type (`'f' infers the
+nullable return type string[] | null — type-valid, but an inferred return of this shape is not
+yet supported by codegen; annotate the return type`) · clause 2 both ways · ZERO corpus cells ·
+found 2026-09-02 triaging `goal-scoreboard.py --sites`**
 
-Repro (refuses; the annotated twin `function f(n: i32): i32[] | null` RUNS and prints `false`):
+Repro (runs today and must keep running — prints `false`):
 
     function f(n: i32) {
       if n == 0 { return [1, 2] }
@@ -33671,15 +33675,51 @@ Repro (refuses; the annotated twin `function f(n: i32): i32[] | null` RUNS and p
   refusals sees one of these and a count of checker-side refusals sees the other, so neither
   number describes the gap.
 
-* **THE FAMILY, ABLATED.** Arms that already RUN under inference: `i32`, `string`, a struct,
-  and a MAP. Arms that refuse: a LIST and a CLOSURE. Arm ORDER does not matter — `return null`
-  first refuses identically. Removing the `null` arm runs.
+* **THE FAMILY, RE-ABLATED AND EXTENDED (2026-09-02, before the fix).** EVERY list element
+  type refused; only the CHANNEL differed, and it was decided by one predicate.
+  `tyIsNulI32BackedListInner` is the whole of it: where it answered (an `i32` / `boolean`
+  element), `nullableRetName` rendered `i32[]|null`, the checker's floor passed, and the
+  EMITTER refused; where it declined (`string[]`, `f64[]`, `i64[]`, `u8[]`, `f32[]`,
+  `i32[][]`, `string[][]`, `P[]`, `{[string]:i32}[]`, `K[]`, `(i32|null)[]`), the floor fired.
+  Arm ORDER did not matter, and the FALL-THROUGH spelling (no `return null` written at all,
+  the totality rule widening the return) refused identically. `i32`, `string`, a struct and a
+  MAP already ran; a CLOSURE arm still refuses and is not this row.
 
-* **ANNOTATING THE RETURN FIXES IT, WHICH IS WHY NO FIXTURE HAS CAUGHT IT.** This is D969's
+* **ANNOTATING THE RETURN FIXED IT, WHICH IS WHY NO FIXTURE HAD CAUGHT IT.** This is D969's
   rule exactly: an annotation pins the rep, so a fixture that annotates every destination
-  cannot see a defect whose ingredient is inference doing the pinning instead.
+  cannot see a defect whose ingredient is inference doing the pinning instead. The fixtures
+  added with the close (`tests/cases/functions/inferred-nullable-list-return.vl` and its
+  `u8` sibling) therefore annotate NO return.
 
-* Probe: `scripts/capability-probes/inferred-nullable-list-return.vl`.
+* **THE MECHANISM, AS WHAT THE FAILING RUNG RECEIVED.** An `emitFail` probe at
+  `emitNullLitNode` and at `emitReturnValue`, built with `OUT=_scratch/probe.wasm` so the seed
+  was never poisoned, printed for the `i32[]` witness: `fn=f fnRet=-1 vtKind=i32 fRetKind=list
+  im=i32[]|null retNulList=0` — and for its ANNOTATED twin, which runs: `fnRet=2
+  vtKind=nullist retNulList=1`. So the CHECKER had recorded `i32[]|null` correctly and NO
+  `fRetKind` cascade arm read it; the row fell through to `criClassify`'s expression-based
+  fallback, which sees only the NON-NULL arm and stamps `"list"`. The functype result was the
+  non-null `(ref $lTypeIdx)` and the bare `return null` reached `emitNullLitNode` with every
+  seed clear.
+
+* **CLOSED BY A PIN, NOT BY CASCADE ARMS, and the reason is the fan-out.** `vtKindOfType`
+  resolves FIVE kinds for the annotated spelling — `nullist`, `nulstrlist`,
+  `nulf64list`/`nuli64list`/`nulf32list`/`nulu8list`, `nulreflist` — each served at the result
+  valtype, the return-site seed, the call-result classification and the `$fnsig` key. A new
+  emit pass `synthNulListRetAnns` (`emit_rewrite.vl`, before `monomorphize`) sets `fn.fnRet`
+  to a synthesized `TypeRef` carrying the arena index the checker banked, so all five kinds are
+  served by ONE site and agree with the annotated spelling by construction. `nulListRetName`
+  (`typecheck.vl`) names the shape for any element type and the checker's floor accepts on the
+  SAME call, so what the floor admits is exactly what the pin serves.
+
+* **GRADED ON A 10-ELEMENT × 13-POSITION MATRIX (130 cells), against the ANNOTATED twin of
+  every cell.** Before: **0 / 130** ran. After: **97 / 130** — and the inferred table is
+  byte-identical to the annotated one at every cell, so the channel split is closed and every
+  residual refusal belongs to the ANNOTATED `T[] | null` return, not to inference. Those
+  residues are filed separately as [D1105](#d1105), [D1106](#d1106) and [D1107](#d1107);
+  each was confirmed against the `seed-latest` master seed with both returns annotated.
+
+* Probe: `scripts/capability-probes/inferred-nullable-list-return.vl` (now covers both former
+  channels and reads THROUGH the returned container).
 
 ---
 ### D1090 — a `??` merge that moves a function's rows breaks EVERY OTHER delivery of that function as a value: the binding hop, a wrapping lambda, a struct field, an array element and a two-target slot are all check-clean invalid wasm
@@ -34608,3 +34648,142 @@ Repro (the `i64` face — `vl check` rc 0, module does not validate):
 
 * Probe: `scripts/capability-probes/clear-over-scalar-list-reps.vl`.
 
+---
+### D1105 — a `u8[] | null` cell in the same module as an `i64[] | null` / `f64[] | null` / `f32[] | null` one is typed and read through the OTHER leaf's wrapper: check-clean INVALID WASM, with both spellings annotated
+
+**check-clean invalid wasm (`type mismatch: expected (ref null $type), found (ref $type)`) ·
+clause 1 · OPEN · found 2026-09-02 building [D1062](#d1062)'s fixture · PRE-EXISTING and NOT
+caused by that close: the repro below annotates every return, uses no inference at all, and
+reproduces identically on the `seed-latest` master seed**
+
+Repro (check rc 0; the module the engine refuses to load):
+
+    function go() {
+      const x: i64[] | null = [7]
+      if x != null { print(x[0]) }
+      const y: u8[] | null = [9]
+      if y != null { print(y[0]) }
+    }
+    go()
+
+* **THE SECOND CELL TAKES THE FIRST'S WRAPPER.** Disassembled (`node_modules/.bin/wasm-dis`
+  with the four flags), the `u8` narrowing local is declared `(ref null $5)` — the **i64**
+  wrapper struct — and its reads are `struct.get $5 0` / `array.get $4`, the i64 backing,
+  while the value on the stack is the packed `(ref $7)`. The `u8` function's own functype
+  result is correct (`(ref null $7)`); only the receiving cell is wrong.
+
+* **ONE LEAF IS THE INGREDIENT, and the pairing is measured rather than assumed.** Over the
+  five distinct-backing nullable list leaves, `u8[] | null` beside `i64[] | null`,
+  `f64[] | null` or `f32[] | null` is invalid wasm; `u8[] | null` beside `string[] | null`
+  RUNS, `u8[] | null` ALONE runs, and `i64[] | null` beside `f64[] | null` or `f32[] | null`
+  runs. So it is `nulu8list` colliding with the NUMERIC leaves, not a general
+  two-nullable-lists defect.
+
+* **A DECLARATION IS ENOUGH — the other cell need not be read.** A module that only reads the
+  `u8` one, with an `i64[] | null` function merely declared beside it, is the same invalid
+  module.
+
+* **WHAT TO LOOK AT FIRST.** `nulScalarListFieldWrapHeap` (`emit_bytes.vl`) maps field codes
+  31–34 and has NO arm for 35, which `nulScalarListFieldCode` mints for `nulu8list`; the
+  `for`-in element ladders in `emit_collect.vl` (two lists) and `wasmEmit.vl:20507` likewise
+  enumerate the four older kinds without `nulu8list`. Each is a candidate, none is confirmed —
+  the WAT above says the local's kind is wrong, and the site that decides that local's kind is
+  what a probe has to name (`emitFail`, on this already-failing program).
+
+* Because it is reachable with no inference anywhere, [D1062](#d1062)'s pin does not cause it —
+  but the pin does make the UN-annotated spelling reach it, which is why
+  `tests/cases/functions/inferred-nullable-u8-list-return.vl` keeps `u8[]` in a file of its
+  own rather than beside the other leaves.
+
+---
+### D1106 — an annotated `T[] | null` return with a REF element (`P[]`, `i32[][]`, `{[string]: i32}[]`) refuses at SIX of eleven delivery positions and runs at the other five: `bare null needs a struct-typed context`
+
+**loud emit reject (`emitProgram: bare null needs a struct-typed context`) · check rc 0 ·
+clause 2 · OPEN · found 2026-09-02 on [D1062](#d1062)'s position matrix · PRE-EXISTING: the
+repro annotates the return and reproduces on the `seed-latest` master seed**
+
+Repro (check rc 0, emit refuses):
+
+    type P = {a: i32}
+    function f(n: i32): P[] | null {
+      const v: P[] = [{a: 5}]
+      if n == 0 { return v }
+      return null
+    }
+    const r = f(0)
+    if r != null { print(r[0].a) }
+
+* **THE POSITION DECIDES, NOT THE ELEMENT.** The same function's value RUNS when it is
+  delivered to an ANNOTATED destination — a call ARGUMENT (`take(f(0))` with
+  `take(x: P[] | null)`), a map VALUE, a global ASSIGNMENT and a local ASSIGNMENT into a
+  `P[] | null` cell all print `5`. It refuses at the six positions where no annotation names
+  the nullable ref-list: a bare `const` binding, a `return` through a second function, a
+  struct FIELD initializer, a list ELEMENT, a global INITIALIZER, and a `.length` read.
+
+* **THAT SPLIT IS THE MECHANISM'S SHAPE.** The annotated destination is what interns the
+  ref-list row, so `tyAnnRefListSlot(fn.fnRet)` resolves and `emitReturnValue`'s
+  `retNulRefArr` arm can seed `retNulRefArrHeap`; with no such destination the slot is -1, the
+  seed never lands, and the `return null` reaches `emitNullLitNode` bare. Identical at
+  `i32[][] | null` and `{[string]: i32}[] | null` — every element type whose
+  `vtKindOfType` is `nulreflist`.
+
+* Measured as 6 refusing of 11 positions × 3 ref element types on the matrix
+  [D1062](#d1062) records; the eight non-ref element types run at every position except the
+  map-value one ([D1107](#d1107)).
+
+---
+### D1107 — a `{[string]: T[] | null}` MAP VALUE refuses for every SCALAR-backed list element and runs for every REF element — the inverse of [D1106](#d1106)'s split
+
+**loud emit reject (`emitProgram: bare null needs a struct-typed context`) · check rc 0 ·
+clause 2 · OPEN · found 2026-09-02 on [D1062](#d1062)'s position matrix · PRE-EXISTING: the
+repro annotates the return and reproduces on the `seed-latest` master seed**
+
+Repro (check rc 0, emit refuses):
+
+    function f(n: i32): i32[] | null {
+      if n == 0 { return [10, 20] }
+      return null
+    }
+    const m: {[string]: i32[] | null} = Map()
+    m["z"] = f(0)
+    const r = m["z"]
+    if r != null { print(r[0]) }
+
+* **THE INVERSE POPULATION OF [D1106](#d1106), which is why the two are separate rows.** The
+  map-value position refuses at `i32[]`, `string[]`, `f64[]`, `boolean[]`, `i64[]` and
+  `f32[]` — the i32-backed and distinct-backing leaves — and RUNS at `P[]`, `i32[][]` and
+  `{[string]: i32}[]`, the three `nulreflist` elements D1106 refuses at six other positions.
+  A fix aimed at either row moves none of the other's cells.
+
+* At `u8[]` the same position refuses with a DIFFERENT sentence
+  (`emitProgram: unsupported map value type (no rep for … a nullable list over an u8 …)`), so
+  the u8 leaf is a third population again; see [D1105](#d1105) for the u8 family's own defect.
+
+---
+### D1108 — an INFERRED nullable i32-KEYED map return still floors, while every STRING-keyed one runs: `nullableRetName`'s map arm requires a `string` key
+
+**loud CHECK reject (`'pick' infers the nullable return type {[i32]: i32} | null — type-valid,
+but an inferred return of this shape is not yet supported by codegen; annotate the return
+type`) · clause 2 · OPEN · found 2026-09-02 while re-pointing the channel tests after
+[D1062](#d1062) · PRE-EXISTING**
+
+Repro (refuses; the annotated twin `function pick(c: boolean): {[i32]: i32} | null` RUNS and
+prints `false`):
+
+    function pick(c: boolean) {
+      if c { return null }
+      const m: {[i32]: i32} = Map()
+      return m
+    }
+    print(pick(true) == null)
+
+* **THE RESIDUE OF D937/D956, which took the STRING-keyed map at every value type.**
+  `nullableRetName`'s map arm gates on `tyIsPrimNamed(it.mKey, "string")`, so an i32-keyed map
+  never gets a name and the floor reads that as "no rep exists" rather than "nobody wrote the
+  name down" — the same misreading D887 and D937 each closed for their own shape.
+
+* **IT IS THE WITNESS THE TWO CHANNEL TESTS NOW USE.**
+  `tests/selfhost_native_diag_code_test.ts` and `tests/lsp_wasm_checker_test.ts` pin that a
+  capability admission carries the stable `unsupported-lowering` code, and their witness has
+  moved five times as the gaps under it closed (D712, D887, D956, D1062). Closing this row
+  moves it a sixth time; that is the intended maintenance, not a test breakage.

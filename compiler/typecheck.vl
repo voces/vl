@@ -2368,6 +2368,13 @@ const IR_RUNG_NUL_ELEM_LIST = 8
 // consumer, and all this needs is for the two legs to say which they are. Splitting the code is
 // the whole fix.
 const IR_RUNG_NUL_ELEM_LIST_NICHE = 29
+// D1062 — `nulListRetName`, OUT OF BAND (30) because it is not a cascade position at all: it
+// is reached only by the NAMED-function loop (`elaborateInferRets`), never by the lambda
+// cascade, so numbering it 1..27 would assert a position it does not occupy. The named loop
+// asks it after `nullableRetName` declines, and the two never both answer — `nullableRetName`
+// claims the i32-backed inners and this claims every array inner, so a row that reaches here
+// is one the i32-backed arm rejected.
+const IR_RUNG_NUL_LIST_RET = 30
 const IR_RUNG_NUL_STRUCT_ELEM_LIST = 9
 const IR_RUNG_NUL_MAP_ELEM_LIST = 10
 const IR_RUNG_NUL_LIST_ELEM_LIST = 11
@@ -26124,11 +26131,21 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         // spelling keys, so the signature and the call site agree by construction rather than
         // by a second policy. A shape it cannot render (a map inner, an un-internable field)
         // still floors, with the message unchanged.
+        // D1062 — AND A NULLABLE LIST AT EVERY ELEMENT TYPE. `nullableRetName`'s i32-backed
+        // arm named `i32[]|null` / `boolean[]|null` and nothing else, so this floor split ONE
+        // shape across TWO channels: those two element types passed the floor and refused at
+        // the emitter instead (`bare null needs a struct-typed context`), while `string[]`,
+        // `f64[]`, `u8[]`, `P[]`, `i32[][]`, a map element and the rest refused HERE. Neither
+        // count described the gap. `nulListRetName` names the whole family, and
+        // `synthNulListRetAnns` pins each function's own return annotation to it — so the
+        // floor accepts EXACTLY what the pin can serve, which is the same property D887/D937
+        // built for the nullable struct and map.
         if (
           !tyIsPrimNamed(itt.nInner, "boolean") &&
           !tyIsPrimNamed(itt.nInner, "string") &&
           litUnionAliasNameOfTy(itt.nInner) == "" &&
-          nullableRetName(inferred, gRootStmts) == ""
+          nullableRetName(inferred, gRootStmts) == "" &&
+          nulListRetName(inferred) == ""
         ) {
           tErrUnsupported(
             "'" +
@@ -28937,6 +28954,40 @@ function nullableRetName(er: i32, stmts: i32[]) {
   ""
 }
 
+// D1062 — the emitter-format NAME of an inferred NULLABLE-LIST return `er`: a `TyNullable`
+// whose inner is a `TyArray` of ANY element type (`string[]|null`, `f64[]|null`, `u8[]|null`,
+// `P[]|null`, `i32[][]|null`, `{[string]:i32}[]|null`, …). Rendered NON-spaced, the emitter's
+// own convention, so `nullablePartOf` recognizes it.
+//
+// A SEPARATE PRODUCER FROM `nullableRetName`'s i32-backed arm, deliberately. That arm answers
+// only for the shapes that share the `nullist` rep and the `>o` value-call token
+// (`tyIsNulI32BackedListInner`), because it also serves the LAMBDA pin, where the `$fnsig`
+// result token has to agree with the value call. This one serves only the NAMED-function pin
+// (`synthNulListRetAnns`), which pins the function's OWN return annotation and therefore rides
+// whatever kind `vtKindOfType` already resolves for the annotated spelling — `nullist`,
+// `nulstrlist`, `nulf64list`/`nuli64list`/`nulf32list`/`nulu8list`, or `nulreflist`. Widening
+// the i32-backed arm instead would claim the i32 backing for an f64 list; the two questions
+// only look alike.
+//
+// The NAME is a render and the pin hands the ARENA index over beside it, so a spelling this
+// cannot resolve back is not a hazard here: every structural classifier the annotated path
+// consults reads `nodeTyIxOf`, which `synthTypeRefTy` records directly. "" for any non-array
+// inner, and for an inner the renderer cannot name at all.
+function nulListRetName(er: i32) {
+  if er < 0 { return "" }
+  const t = T.tys[er]
+  if t is TyNullable {
+    const it = T.tys[t.nInner]
+    if it is TyArray {
+      const lnm = tyToEmitName(t.nInner)
+      // The array's separators all sit inside its element render (the renderer reports its
+      // own width); `null` adds one atom (#1115).
+      if lnm != "" { return irAtoms(lnm + "|null", emitNameAtoms + 1) }
+    }
+  }
+  ""
+}
+
 // The emitter-format NAME of an inferred NULLABLE-LITUNION return `er` (`() => K0 | null`): a
 // `TyNullable` (or a `TyUnion` with a `null` atom) whose non-null part is a LITERAL union. The
 // emitter niches it as the i32 atom with `-1` = null (`nodeTyIsNulLitUnion` → `retNulLitUnion`),
@@ -30420,6 +30471,22 @@ export function checkProgram(rootIx: i32) {
                         inferRetNameAtoms,
                         IR_RUNG_NULLABLE,
                       )
+                    } else {
+                      // D1062 — A NULLABLE LIST at an element type the arm above does not
+                      // name. Recorded so `synthNulListRetAnns` can pin the function's own
+                      // return annotation to it; the floor two thousand lines up accepts on
+                      // the SAME call, so a shape recorded here is a shape the pin serves and
+                      // vice versa.
+                      const nln = nulListRetName(er)
+                      if nln != "" {
+                        recordInferRet(
+                          efn.fnName,
+                          nln,
+                          er,
+                          inferRetNameAtoms,
+                          IR_RUNG_NUL_LIST_RET,
+                        )
+                      }
                     }
                   }
                 }
@@ -30523,6 +30590,25 @@ export function inferRetBearsNull(name: string): boolean {
   const ty = inferRetTyIxOf(name)
   if ty < 0 { return false }
   tyBearsNull(ty)
+}
+
+// D1062 — IS THE ROW RECORDED FOR `name` A NULLABLE LIST (`T[] | null`)? Asked of the ARENA
+// index `recordInferRet` banked beside the name, never of the render: the emitter's pin
+// (`synthNulListRetAnns`) needs to know the SHAPE, and the two producers that can bank such a
+// row spell it two ways (`nullableRetName`'s i32-backed arm and `nulListRetName`), so a name
+// test here would have to know both spellings while the type is one answer.
+//
+// `ty < 0` is `false` for the reason `inferRetBearsNull` states above: every `recordInferRet`
+// reached with a function NAME passes a real `er`, so no arena index means no row.
+export function inferRetIsNulList(name: string): boolean {
+  const ty = inferRetTyIxOf(name)
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyNullable {
+    const it = T.tys[t.nInner]
+    if it is TyArray { return true }
+  }
+  false
 }
 
 export function inferRetNameOf(name: string) {

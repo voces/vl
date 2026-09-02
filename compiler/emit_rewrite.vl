@@ -10,7 +10,9 @@
 import { arrElemNameRaw, nameIsArray, nameIsSpaceFree } from "./tyname"
 import {
   annUnionAtomsOf,
+  inferRetIsNulList,
   inferRetNameByNode,
+  inferRetNameOf,
   inferRetRowByNode,
   inferRetRungIsBoxedUnion,
   inferRetRungIsLitUnionElemList,
@@ -22,6 +24,7 @@ import {
   inferRetRungIsScalarListRet,
   inferRetRungIsStructElemList,
   inferRetTyIxByNode,
+  inferRetTyIxOf,
   lambdaVoidAdoptedAt,
   litUnionAliasNameOfTy,
   mkArrayTy,
@@ -1071,6 +1074,57 @@ export function synthRetAnnots() {
       }
     }
     fe = fe + 1
+  }
+  0
+}
+
+// D1062 — PIN AN INFERRED NULLABLE-LIST RETURN ON A NAMED FUNCTION, so it lowers through the
+// annotation the user did not write.
+//
+// `function f(n: i32) { if n == 0 { return [1, 2] }; return null }` infers `i32[] | null`, and
+// the ANNOTATED twin `: i32[] | null` runs. What the inferred spelling had was a `fRetKind`
+// cascade with no nullable-LIST arm, so the row fell through to `criClassify`'s
+// expression-based fallback — which sees only the NON-NULL arm and stamps `"list"`. The
+// functype result was then the non-null `(ref $lTypeIdx)` and the bare `return null` reached
+// `emitNullLitNode` with no seed at all: `emitProgram: bare null needs a struct-typed context`.
+//
+// A PIN RATHER THAN CASCADE ARMS, and the reason is the fan-out. `vtKindOfType` resolves FIVE
+// distinct kinds for the annotated spelling — `nullist` (i32/boolean backing), `nulstrlist`,
+// `nulf64list`/`nuli64list`/`nulf32list`/`nulu8list`, `nulreflist` (struct / nested / map
+// element) — and each is served at the result valtype, the return-site seed, the call-result
+// classification and the `$fnsig` key. Teaching the inferred cascade all five at all four sites
+// is twenty places to keep in agreement; pinning the annotation is one, and it is agreement BY
+// CONSTRUCTION rather than by two ladders covering the same shapes. It is the move
+// `synthRetAnnots` below already makes for the anonymous LAMBDA, applied to the named function
+// the checker records by NAME instead of by node.
+//
+// THE ARENA INDEX RIDES ALONG (`synthTypeRefTy`'s third argument), so every structural
+// classifier the annotated path consults answers from the type the CHECKER decided, not from
+// a re-parse of the render. That is what lets one pin serve all five kinds.
+//
+// SCOPED TO THE NAMED FUNCTION. A lambda's row is keyed `#<nodeIx>` and is claimed by
+// `synthRetAnnots`' own nullable arm, whose rung set is deliberately narrower — the lambda's
+// `$fnsig` result token has to agree with the value call, and the distinct-backing leaves are
+// not in that ABI yet (`tyIsNulI32BackedListInner`'s header). This pass asks
+// `inferRetIsNulList` of a NAME, which no `#`-keyed row can answer.
+//
+// BEFORE `monomorphize`, like `synthRetAnnots`: an instance is cloned with `nret = fnRet`, so a
+// return pinned after the clone would leave the instance un-pinned.
+export function synthNulListRetAnns() {
+  let i = 0
+  while i < fnStmts.length {
+    const fn = P.nodes[fnStmts[i]]
+    if fn is FuncDecl {
+      if fn.fnRet < 0 && fn.fnName != "" {
+        if inferRetIsNulList(fn.fnName) {
+          const nm = inferRetNameOf(fn.fnName)
+          if nm != "" {
+            fn.fnRet = synthTypeRefTy(nm, -1, inferRetTyIxOf(fn.fnName))
+          }
+        }
+      }
+    }
+    i = i + 1
   }
   0
 }
