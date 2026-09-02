@@ -202,6 +202,7 @@ import {
   annRlNul,
   annRlSlot,
   anonLeafAnnTy,
+  anonLeafCloSlotFn,
   anonLeafFamRow,
   anonLeafJoined,
   anonLeafParamMoved,
@@ -7017,6 +7018,9 @@ function collectAnonShapes() {
   anonLeafJoinedMark()
   // D924 — AND THE FAMILY MEMBER'S *OTHER* DESTINATION. See `anonLeafNarrowUseMark`.
   anonLeafNarrowUseMark()
+  // D940 — AND THE CLOSURE-TYPED SLOT A MOVED FUNCTION IS DELIVERED TO. Last, because it
+  // reads the ret/param marks the two above write. See `anonLeafCloSlotMark`.
+  anonLeafCloSlotMark()
   let ai = 0
   while ai < P.nodes.length {
     const an = P.nodes[ai]
@@ -8830,6 +8834,73 @@ function anonLeafParamFnTargetGo(nm: string): string {
   ""
 }
 
+// D940 — THE CLOSURE-TYPED SLOT A MOVED FUNCTION IS DELIVERED TO. See `anonLeafCloSlotFn`.
+//
+// Runs once the ret/param marks are final, so a function this asks about has already been
+// moved or has not. Only a slot whose deliveries AGREE is marked: `anonLeafParamFnTarget`
+// answers "" the moment two call sites hand the parameter different functions, and that is
+// the same refusal `anonLeafSlotAllMembers` makes about a mixed slot — one parameter is one
+// wasm signature, so it cannot be at two rows.
+function anonLeafCloSlotMark() {
+  let fi = 0
+  while fi < P.nodes.length {
+    const fd = P.nodes[fi]
+    if fd is FuncDecl {
+      let pj = 0
+      while pj < fd.fnParams.length {
+        const pIx = fd.fnParams[pj]
+        const pn = P.nodes[pIx]
+        if pn is Param {
+          // The function-type gate is not an optimisation: `anonLeafParamFnTarget` is a
+          // whole-arena scan per parameter, and asking it of every scalar parameter in the
+          // program is the cost this walk cannot pay.
+          if pn.parType >= 0 && tyIsFuncType(pn.parType) {
+            const tgt = anonLeafParamFnTarget(pn.parName)
+            if tgt != "" {
+              if anonLeafFnNameMoved(tgt) {
+                while anonLeafCloSlotFn.length <= pIx {
+                  anonLeafCloSlotFn.push("")
+                }
+                anonLeafCloSlotFn[pIx] = tgt
+              }
+            }
+          }
+        }
+        pj = pj + 1
+      }
+    }
+    fi = fi + 1
+  }
+  0
+}
+
+// D940 — did the merge move any row of a function named `nm`? Either half counts: the
+// `$fnsig` key is built from BOTH the parameter tokens and the result token, so a move on
+// either side is a key the annotation cannot reproduce.
+function anonLeafFnNameMoved(nm: string): boolean {
+  let i = 0
+  while i < P.nodes.length {
+    const n = P.nodes[i]
+    if n is FuncDecl {
+      if n.fnName == nm {
+        if i < anonLeafRetMoved.length {
+          if anonLeafRetMoved[i] == 1 { return true }
+        }
+        let pj = 0
+        while pj < n.fnParams.length {
+          const px = n.fnParams[pj]
+          if px < anonLeafParamMoved.length {
+            if anonLeafParamMoved[px] == 1 { return true }
+          }
+          pj = pj + 1
+        }
+      }
+    }
+    i = i + 1
+  }
+  false
+}
+
 // D948 — EVERY FUNCTION A BINDING MAY HOLD, or false when it may hold something else.
 //
 // `anonLeafFnValueTarget` answers only for a binding written with ONE function name, because
@@ -10629,6 +10700,7 @@ export function collectS(stmts: i32[]) {
   anonLeafAnnTy = []
   anonLeafParamMoved = []
   anonLeafRetMoved = []
+  anonLeafCloSlotFn = []
   anonLeafSupersede = []
   // The struct-row NAME index keys THIS table's spellings — reset it with the table, or
   // the next program's rows answer with this one's names (see its header). MEASURED, not
