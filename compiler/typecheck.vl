@@ -1975,6 +1975,22 @@ function mkUnionTy(members: i32[]) {
 }
 
 function mkNullableTy(inner: i32) {
+  // NULLABLE IS IDEMPOTENT — `(T | null) | null` IS `T | null` (D1026). The language has no
+  // second null and no way to write one, so a nested nullable is a spelling artefact of
+  // composing an already-nullable ALIAS: `type P = null | f64` is stored as
+  // `TyNullable(f64)`, and `P | null` then minted `TyNullable(TyNullable(f64))` — a shape no
+  // arm of the return-seed ladder recognizes, so `return null` fell through to the bare-null
+  // floor and refused a program `vl check` accepts.
+  //
+  // THE INLINE SPELLING ALWAYS RAN, which is what says this is composition and not the
+  // nullable itself: `null | f64 | null` collapses in the member split before it ever gets
+  // here, so only the alias route could nest. Folding at the one home every `T | null` is
+  // minted through makes the two spellings the same type again, which is the rule the rest
+  // of this file keeps for every other pair of spellings.
+  if inner >= 0 {
+    const innerT = T.tys[inner]
+    if innerT is TyNullable { return inner }
+  }
   // THE NULLABLE-INNER CENSUS (see `annCommitVariantMembers`). This is the one home every
   // `T | null` is minted through — the annotation routes, the declaration route's niche
   // fold, the narrowing widenings — so recording here is the whole program's answer.
@@ -12376,6 +12392,21 @@ function unionAliasMembers(name: string) {
     if dsm != "" { return dsm }
     return tyToEmitName(ix)
   }
+  // D1026 — A NULLABLE ALIAS IS A UNION ALIAS TOO, and it was the one shape this flatten
+  // declined. `type P = null | f64` is stored as `TyNullable(f64)`, not `TyUnion`, so `P |
+  // null` kept `P` un-expanded, the outer union never saw the null it already contained, and
+  // the emitter met a return type with `null` TWICE — `bare null needs a struct-typed
+  // context`, on a program `vl check` accepts. The INLINE `null | f64 | null` always ran,
+  // because there the members arrive flat and the member loop's own dedupe collapses them.
+  //
+  // Expanding to `<inner>|null` puts the alias's null where the dedupe can see it, which is
+  // the same shape the `TyUnion` arm above already relies on. A nullable alias whose inner
+  // has no emit name declines exactly as before.
+  if t is TyNullable {
+    const inner = tyToEmitName(t.nInner)
+    if inner == "" { return "" }
+    return inner + "|null"
+  }
   ""
 }
 
@@ -14951,15 +14982,31 @@ function canonEmitNameTs(name: string, ctx: i32, root: i32) {
         c = "(" + c + ")"
         ca = 1
       }
-      let dup = false
-      let j = 0
-      while j < kept.length {
-        if kept[j] == c { dup = true }
-        j = j + 1
-      }
-      if !dup {
-        kept.push(c)
-        atoms = atoms + ca
+      // D1026 — DEDUPE AT THE ATOM, NOT AT THE MEMBER. The alias expansion above
+      // substitutes a whole member SET for one member, so a flattened `c` can hold several
+      // top-level atoms; comparing whole members cannot see that `"f64|null"` and `"null"`
+      // share one. The inline spelling always deduped because every member there is one
+      // atom. Same rule, at the granularity the flatten actually produces.
+      const cAtoms: string[] = []
+      splitUnionAtoms(c, cAtoms)
+      let ci2 = 0
+      while ci2 < cAtoms.length {
+        const cAtom = cAtoms[ci2]
+        let dup = false
+        let j = 0
+        while j < kept.length {
+          if kept[j] == cAtom { dup = true }
+          j = j + 1
+        }
+        if !dup {
+          kept.push(cAtom)
+          if cAtoms.length == 1 {
+            atoms = atoms + ca
+          } else {
+            atoms = atoms + 1
+          }
+        }
+        ci2 = ci2 + 1
       }
       i = i + 1
     }

@@ -30949,7 +30949,11 @@ expects the narrowed rep.
 
 ### D1026 — an alias that already holds `null`, composed with `| null` again in a SIGNATURE, is check-clean and emit-refused: `type P = null | f64` / `function g(): P | null { return null }` → `bare null needs a struct-typed context`
 
-**loud emit reject · check rc 0 · `emitProgram: bare null needs a struct-typed context` at the `return null` (or, when the body returns a value, at the caller's `g() == null`) · ZERO corpus cells · found 2026-09-01 measuring the `std:json` usability critique's "gap C" (`function pick(): Json | null`) · one ingredient: a null-bearing alias composed with a second `null` in a function's return or parameter type**
+**runs, prints `true` — CLOSED 2026-09-01 by making NULLABLE IDEMPOTENT at `mkNullableTy`,
+the one home every `T | null` is minted through: `(T | null) | null` folds to `T | null` ·
+zero `runs` lost and zero cells moved to silent · pinned by
+`tests/cases/types/nullable-alias-composed-with-null.vl` · was a loud emit reject,
+`emitProgram: bare null needs a struct-typed context`, with ZERO corpus cells**
 
 Repro:
 
@@ -30988,3 +30992,23 @@ signature, the composed union has no rep the emitter will hand a bare `null` to.
   `function pick(): Json` and returned `null` through the alias's own arm instead, which
   runs; the row is why the design doc's examples avoid `Json | null`, and it is a build
   item, not a surface constraint.
+
+* **THE ARENA NESTED; THE SPELLING DID NOT.** `null | f64` is stored as `TyNullable(f64)`, not
+  as a union, so `P | null` minted `TyNullable(TyNullable(f64))` — a shape no arm of the
+  return-seed ladder recognizes, so `return null` fell through every seed to the bare-null
+  floor. The inline spelling escaped because its members arrive flat and collapse in the
+  member split before a nullable is ever minted; only the ALIAS route could nest one.
+
+* **THE NAME WAS A RED HERRING AND IT COST TWO BUILDS.** The obvious reading is "the union has
+  `null` twice", so the obvious fix is a dedupe in canon's union member loop — including one
+  at ATOM granularity, since a flattened alias member arrives as several atoms in one string.
+  Neither moved the witness. Instrumenting the refusal settled it: canon already rendered the
+  return as `f64|null`, correctly deduped. **The nesting is in the arena TYPE, and the seeds
+  read the type, not the name.** Worth checking which of the two a ladder consults before
+  writing a fix for either.
+
+* **NOT D1024'S ROOT, measured.** The shared-root hypothesis was reasonable — both look like a
+  duplicate atom after expansion — and it is wrong: with nullable folded, `function f():
+  string | "err"` still fails identically. [D1024](#d1024) needs its own fix.
+
+---
