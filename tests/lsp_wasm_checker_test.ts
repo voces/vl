@@ -69,10 +69,10 @@ Deno.test({ name: "wasm-checker: a type error carries a message and a non-empty 
 
 Deno.test({ name: "wasm-checker: an emitter-capability rejection surfaces its stable code", ignore }, async () => {
   const checker = loadWasmChecker(SEED, log)!;
-  // Type-valid, but codegen cannot lower an INFERRED nullable distinct-backing LIST return — raised on the
-  // distinct channel whose `unsupported-lowering` code rides the
+  // Type-valid, but codegen cannot lower an INFERRED nullable i32-KEYED MAP return — raised
+  // on the distinct channel whose `unsupported-lowering` code rides the
   // `diagCodeLen`/`diagCodeByte` ABI into `VLDiagnostic.code`. (The annotated
-  // `: {[string]: i32} | null` spelling of the same function lowers and runs, which is what
+  // `: {[i32]: i32} | null` spelling of the same function lowers and runs, which is what
   // makes this a capability admission and not a type error.)
   //
   // THE WITNESS HAS MOVED TWICE NOW, AND THAT IS THE POINT OF THE TEST. It was
@@ -80,19 +80,20 @@ Deno.test({ name: "wasm-checker: an emitter-capability rejection surfaces its st
   // an inferred nullable-STRUCT return until D887 recorded that shape's row and gave the A20
   // pass and `emitReturnValue` the arms the annotated path already had. Any still-open
   // capability gap serves; what this asserts is the CHANNEL, not the gap.
-  // D956 CLOSED THE MAP ENTIRELY, so the witness has moved a FOURTH time — to `i64[] | null`.
-  // D937 took the i32-valued map and this comment then pinned a `string`-valued one; D956 took
-  // every value type, because the restriction it rested on had already expired. What still
-  // floors on this channel is the DISTINCT-BACKING scalar list — `i64[]`, `f64[]`, `f32[]`,
-  // `string[]` — whose inferred nullable return has no renderer arm. The annotated twin of
-  // each one runs, so it is a capability gap and the witness will move a fifth time.
-  // `scripts/capability-probes/inferred-nullable-container-return.vl` is the standing probe
-  // for the closed half; when the rest closes, this witness moves again.
+  // D956 CLOSED THE STRING-KEYED MAP ENTIRELY, so the witness moved a FOURTH time — to
+  // `i64[] | null`. D1062 then closed the nullable LIST at every element type (the pin
+  // `synthNulListRetAnns` gives a named function's inferred `T[] | null` return the
+  // annotation the user did not write), which is why it has moved a FIFTH. What still floors
+  // on this channel is the i32-KEYED map: `nullableRetName`'s map arm requires a `string`
+  // key. The annotated twin runs, so it is a capability gap and the witness will move again.
+  // `scripts/capability-probes/inferred-nullable-container-return.vl` and
+  // `inferred-nullable-list-return.vl` are the standing probes for the closed halves; when
+  // the rest closes, this witness moves again.
   const diags = await checker.check(
     [
       "function pick(c: boolean) {",
       "  if c { return null }",
-      "  const m: i64[] = [1]",
+      "  const m: {[i32]: i32} = Map()",
       "  m",
       "}",
       "function go() {",
