@@ -34012,9 +34012,51 @@ Repro (runs today and must keep running — prints `false`):
 ---
 ### D1090 — a `??` merge that moves a function's rows breaks EVERY OTHER delivery of that function as a value: the binding hop, a wrapping lambda, a struct field, an array element and a two-target slot are all check-clean invalid wasm
 
-**check-clean invalid wasm · clause 1 · OPEN · found 2026-09-02 while closing [D940](#d940), by
-building D940's fix a DELIVERY MATRIX rather than one witness · present identically before the
-D940 fix, so it is residue and not a regression — measured against a `git archive HEAD` build**
+**closed as `runs` · was check-clean invalid wasm · clause 1 · found 2026-09-02 while closing
+[D940](#d940), by building D940's fix a DELIVERY MATRIX rather than one witness · fixtures
+`tests/cases/types/coalesce-merged-row-fn-value-delivery-hops.vl` and
+`…-shared-callback-name.vl` · the four positions the fix does NOT close are [D1100](#d1100),
+which is DELIVERY rather than attribution and is measured as such**
+
+**THE ATTRIBUTION WAS KEYED BY NAME AND STOPPED AT THE BARE SPELLING — four refusals in one
+resolver, none of them about the program.** `anonLeafAnyIndirectCall` declines the whole `??`
+family the moment a call site names a function it cannot resolve, and the decline is NOT
+neutral: with the merge refused, `?? { r: "s" }` still resolves the `{r: i32}` row by
+field-name set and stores a string ref into an i32 slot.
+
+* **THE NAME KEYING.** `seen != 1` refused outright the moment two functions in one module
+  spelled their callback `cb`; three HOFs each handed the same `src` is a program whose answer
+  is not in doubt, and RENAMING one parameter made it run. Every `Param` of the name is now
+  answered on its OWN declaration and the answers must AGREE — the rule the call-site loop
+  already applied one level down.
+* **THE BINDING HOP AND THE RETURN HOP.** `apply(h)` over `const h = src` and `apply(pick())`
+  over `pick() { src }` deliver what `apply(src)` delivers. `anonLeafArgFnName` is the one home
+  for "which function does this argument name"; `anonLeafFnValueTarget` additionally chases a
+  write that names another binding (`let gb = src; gb = ga`), under the re-entry guard its
+  sibling already carries.
+* **THE EQUALITY WHERE THE FILE USES MEMBERSHIP.** The call-site scan tested
+  `anonLeafCalleeFnName == fnName` while every other argument reader here uses
+  `anonLeafCallMayTarget` (D948), so `let hf = apply; hf = apply2; hf(src)` found no call site.
+* **THE SINGLE-TARGET SLOT.** `apply(src)` beside `apply(other)` answered "".
+  `anonLeafParamFnNames` is the set form and `anonLeafCoMoveFnParamSlots` is what makes a set
+  legal: one slot is one wasm signature, so the whole set moves together — exactly the argument
+  `anonLeafCoMoveFnRets` makes for a binding.
+* **AND AN UNCALLED HIGHER-ORDER FUNCTION IS NOT A HAZARD.** A callback parameter with NO call
+  sites binds to nothing, so the `cb(…)` in its body can reach no function and its literal
+  lowers at the annotation's own row. Reading the empty scan as "a delivery I cannot name" made
+  ONE uncalled HOF beside a called one decline the whole family; deleting the uncalled function
+  made the same program run.
+* **THE TENTH OWNER OF THE MERGED ROW IS A BINDING, and it is the half that would have shipped
+  a `loud -> trap` movement.** With the attribution widened, an ANNOTATED closure binding
+  (`const lb: ({r: i32}) => … = src`) keys its call off the annotation exactly as a parameter
+  does, so two cells moved silent-invalid-wasm -> `wasm trap: indirect call type mismatch`.
+  `anonLeafCloBindName`/`anonLeafCloBindFn` + `anonLeafCloBindSigKey` are D940's per-param mark
+  one holder over; they also close two cells that ALREADY trapped on master.
+* **D940's GATE IS NOT REDUNDANT AND NOT WRONG — it is the layer below this one.** D940 answers
+  "what `$fnsig` does this slot call at"; D1090 answers "is this slot attributable at all".
+  Every position D1090 opens is then served by D940's mark, which is why widening the
+  attribution alone was not enough and why the per-param narrowness stays: `useOther` in the
+  fixture is the same annotation fed a function nothing moved, and a row rewrite would break it.
 
 D940 closed the ARGUMENT position: `apply(src)`, a bare function name into a closure-typed
 parameter, where `src`'s param/return rows followed a `??` merge. Every other way of handing the
@@ -34040,27 +34082,84 @@ Repro (each line is its own program; the merge is the last two lines of every on
 
 `Invalid input WebAssembly code … type mismatch: expected i32, found (ref $type)` in `rd`.
 
-* **THE MATRIX, MEASURED — seven positions, one program each, all `vl check` rc 0.** The four
-  that RUN are the ones D940 moved; the six that do not are this row.
+**PROBED AT THE RUNG, NOT READ OFF THE PATH.** A dump of what `anonLeafAnyIndirectCall`
+receives, per call site, on each cell — `indirect=1` is the decline, and the four refusals
+above are exactly the four ways `paramTgt` comes back empty:
 
-  | how `src` reaches the call | before D940 | after D940 |
-  | --- | --- | --- |
-  | bare-name argument, un-annotated HOF | trap_loads | **runs** |
-  | bare-name argument, annotated HOF (`: i32`) | runs | runs |
-  | argument is a BINDING (`const h = src; apply(h)`) | invalid wasm | invalid wasm |
-  | argument is a LAMBDA (`apply(q => src(q))`) | invalid wasm | invalid wasm |
-  | HOF reached through a binding holding two HOFs | invalid wasm | invalid wasm |
-  | struct FIELD (`{f: src}`, called through it) | invalid wasm | invalid wasm |
-  | array ELEMENT (`[src]`, called through it) | invalid wasm | invalid wasm |
-  | two functions into ONE slot (`apply(src)`, `apply(other)`) | invalid wasm | invalid wasm |
-  | HOF body binds the argument first (`const a = {r:4}; cb(a)`) | invalid wasm | **runs** |
-  | HOF reads the callback's RESULT through `??` | trap_loads | **runs** |
+    p01 bare arg    indirect=0  [cb bound=1 calleeFn=src paramTgt=src]   runs
+    p03 binding     indirect=1  [cb bound=1 calleeFn=    paramTgt=   ]   invalid wasm
+    p06 field       indirect=1  [callee-not-ident]                       invalid wasm
+    p08 two fns     indirect=1  [cb bound=1 calleeFn=    paramTgt=   ]   invalid wasm
+    p14 three `cb`  indirect=1  [cb x3, every paramTgt=""]               invalid wasm
+
+* **THE PRICE, MEASURED: AN UNGATED COLLECT PASS DOES NOT MAKE THE SOURCE SLOW, IT MAKES THE
+  COMPILER BUILT FROM IT NON-TERMINATING — one bootstrap step later than the change.**
+  `anonLeafCloBindMark` asks `anonLeafFnValueTarget` — a whole-arena scan — of every binding in
+  the program, so ungated it is quadratic in the node count for EVERY module, including the
+  compiler's own source. The tell is structural and is worth knowing before it costs an hour:
+  **level 1 (a healthy seed compiles the candidate source) is always fast; level 2 (the
+  candidate compiles the compiler) is where it shows.** A two-level bisect under `timeout 300`
+  reads
+
+      0637b979  (D1092)                    L1 73s rc=0   L2 67s rc=0
+      3e882cd1  (D1090 attribution)        L1 81s rc=0   L2 35s rc=0
+      5d678f67  (the ungated bind mark)    L1 32s rc=0   L2 321s rc=124
+      6c6c46a1  (the gate added)           L1 69s rc=0   L2 32s rc=0
+
+  and names the commit directly. Two operational notes it also earned: a `timeout` around
+  `refresh-compiler.sh` kills the SHELL and re-parents the `vl build` child to init, so each
+  abandoned attempt leaves a runaway at ~90% CPU — check `ps -eo pid,etimes,args | grep "vl
+  build"` before retrying, and never retry a self-build hoping it finishes. The early-out is one
+  O(n) read of the marks the passes above write, which is exactly the shape
+  `anonLeafNarrowUseMark`'s own header already prescribes for the same reason.
+
+* **THE POSITION MATRIX, MEASURED — 26 programs, one per cell, all `vl check` rc 0, each
+  printing a value that proves the delivery actually happened.** `master` is `6a737f4d`'s
+  published seed; `now` is this row's fix on the merged tree. **19 of 26 -> 26 running minus
+  the seven of [D1100](#d1100).**
+
+  | how `src` reaches the call | master | now | proving value |
+  | --- | --- | --- | --- |
+  | bare-name argument, un-annotated HOF | runs | runs | `1` |
+  | bare-name argument, annotated HOF (`: i32`) | runs | runs | `1` |
+  | argument is a BINDING (`const h = src; apply(h)`) | invalid wasm | **runs** | `1` |
+  | HOF reached through a binding holding two HOFs | invalid wasm | **runs** | `2` |
+  | two functions into ONE slot (`apply(src)`, `apply(other)`) | invalid wasm | **runs** | `1 1` |
+  | argument is a CALL that hands the function back (`apply(pick())`) | invalid wasm | **runs** | `1` |
+  | a module GLOBAL holding the value (`apply(gh)`) | invalid wasm | **runs** | `1` |
+  | global ASSIGNMENT between two globals (`gb = ga; apply(gb)`) | invalid wasm | **runs** | `1` |
+  | THREE HOFs all spelling the callback `cb` | invalid wasm | **runs** | `1 2 3` |
+  | …the same three with DISTINCT names (control) | runs | runs | `1 2 3` |
+  | HOF body binds the argument first (`const a = {r:4}; cb(a)`) | runs | runs | `1` |
+  | HOF reads the callback's RESULT through `??` | runs | runs | `9` |
+  | no merge at all (control) | runs | runs | `1` |
+  | merge whose default is the SAME shape (control) | runs | runs | `1 7` |
+  | a global `const` called DIRECTLY (`gh({r:5})`) | runs | runs | `5` |
+  | two ANNOTATED globals + assignment, called directly | invalid wasm | **runs** | `6` |
+  | two UN-annotated globals + assignment, called directly | invalid wasm | **runs** | `6` |
+  | one ANNOTATED global, no assignment, called directly | **trap** | **runs** | `6` |
+  | two ANNOTATED locals + assignment, called directly | invalid wasm | **runs** | `6` |
+  | two UN-annotated locals + assignment, called directly | invalid wasm | **runs** | `6` |
+  | one ANNOTATED local, called directly | **trap** | **runs** | `6` |
+  | argument is a LAMBDA (`apply((q) => src(q))`) | invalid wasm | invalid wasm | — |
+  | struct FIELD (`{f: src}`, called through it) | invalid wasm | invalid wasm | — |
+  | array ELEMENT (`[src]`, called through it) | invalid wasm | invalid wasm | — |
+  | ARRAY OF STRUCTS holding it (`[{f: src}]`) | invalid wasm | invalid wasm | — |
+  | calling a RETURNED value directly (`pick()({r:4})`) | invalid wasm | invalid wasm | — |
+
+  The two `trap` rows are pre-existing and are closed by the binding-side owner above; nothing
+  in the grid moved `runs -> not-runs` or acquired a trap.
 
 * **IT IS NOT D940'S MECHANISM ONE POSITION OVER — THE FAMILY NEVER MINTS AT ALL.** The
   disassembly of the binding cell shows `struct.new $0 (global.get $global$0)`: the merged row
   was never built and the DEFAULT literal `{r: "s"}` is stored into the narrow `{r: i32}` row.
   So the `$fnsig` disagreement D940 fixed is not what is happening here; the collect pass
   refuses the merge and leaves the `??` to lower at the pre-merge row.
+
+* **AND D1092 IS A DIFFERENT FAMILY, MEASURED IN BOTH DIRECTIONS RATHER THAN ARGUED.** A
+  compiler carrying ONLY D1092's fix moved **0 of 11** failing cells here; a compiler carrying
+  ONLY this row's fix moved **0 of 15** failing cells there — the same list master produces,
+  message for message. They share a subsystem and nothing else.
 
 * **THE ROUTE IN IS `anonLeafParamFnTarget` ANSWERING "".** It returns "" whenever the
   parameter's call sites do not agree on ONE function name, and it also returns "" when more
@@ -34072,10 +34171,15 @@ Repro (each line is its own program; the merge is the last two lines of every on
   program run. That is the module-wide name keying the playbook already warns about for capture
   analysis, in a second resolver.
 
-* **THE ORDER TO FIX IT IN IS D965'S.** The delivery positions above are the position matrix;
-  build the family-mint side first (so a value delivered through a binding, a field or an
-  element is still a member), then wire each delivery, and only then consider narrowing
-  anything. A per-position patch will convert one invalid module into another.
+* **THE ORDER TO FIX IT IN IS D965'S, AND THE HALF THAT REMAINS IS THE SECOND HALF.** The
+  family-mint side is built: a value delivered through a binding, a global, an assignment, a
+  return or a shared callback name is now a member. The five container positions need their
+  DELIVERY wired, and that is measured rather than assumed — with `anonLeafAnyIndirectCall`
+  forced to `false` they do NOT run either, they move to `wasm trap: indirect call type
+  mismatch`, a different `(ref null $type)` mismatch, and `emitProgram: function-value call
+  arity has no interned signature`. Lifting the veto for them without wiring each delivery
+  converts one invalid module into another, which is what this note has always said. Filed as
+  [D1100](#d1100) with that experiment as its evidence.
 
 ---
 ### D1091 — `vl check --fix` moves 165 of 1,093 corpus fixtures `runs -> not-runs`: the compiler's own autofix for `redundant type annotation` deletes load-bearing annotations
@@ -34130,9 +34234,63 @@ The population measurement is the sweep, not this program: copy `tests/cases` as
 ---
 ### D1092 — a closure-field parameter spelled INLINE (`z: {f: () => string}`) in a function nobody calls is check-clean invalid wasm; the same type behind a `type` alias runs
 
-**check-clean invalid wasm · clause 1 · OPEN · found 2026-09-02 while ablating [D988](#d988)'s
-ANNOTATED twin — an annotation was the control that was supposed to run, and it did not ·
-identical on a `git archive HEAD` build, so it is not a regression**
+**closed as `runs` · was check-clean invalid wasm · clause 1 · found 2026-09-02 while ablating
+[D988](#d988)'s ANNOTATED twin — an annotation was the control that was supposed to run, and it
+did not · fixtures `tests/cases/types/closure-field-inline-shape-reservation.vl` and
+`…-shape-twin-signatures.vl` · BOTH faces run, which is the acceptance test this row set**
+
+**TWO FACES, ONE DROPPED INPUT: the struct field table records that a field IS a closure (code
+14) and nothing else about it, and the annotation walk stops at the brace that hides the arrow.**
+
+* **THE RESERVATION.** A presence flag is a RESERVATION — `mAssignTypeIndices` mints a heap
+  type only where the flag is set, and an unminted index falls through to `mNextType`, whatever
+  heap type happens to sit there. So the witness left `$aTypeIdx`/`$sBackIdx` unallocated and
+  the body read a closure struct as a string. `forceNestedCloSigReps` walks INTO an annotation
+  spelling — union arms, array element, arrow parts, shape fields — and forces the reps each
+  closure field's result and parameters name.
+
+* **THE ALIAS RAN BY ACCIDENT, AND THAT IS WHAT LOCATED IT.** `type Fs = {f: () => string}`
+  mints a SECOND `TypeRef` for the alias body's arrow — the arena holds `<()=>string>` beside
+  `<Fs>` — which the top-level `annRetNameOf` rung then sees; the inline spelling mints ONE node
+  (`<{f:()=>string}>`) and nothing looked inside it. Both build the SAME struct row (one field,
+  code 14, elem name ""), so no type table can tell them apart: the difference is entirely which
+  annotation NODES exist. One nesting level deeper the accident stops paying — `type Fs = {g: {f:
+  () => string}}` failed exactly like the inline form — which is why the fix walks the spelling
+  rather than adding an alias-shaped special case.
+
+* **THE ROW.** `annShapeIndexOf` compares field names, codes and ELEMENT names, and a closure
+  field's element name is "" — so `{f: () => string}` and `{f: () => i32}` matched, the second
+  annotation resolved the first's row, its own spelling then resolved no row at all and the
+  parameter's valtype was the loud `emitProgram: ref valtype with no interned shape`.
+  `sFieldCloSig` banks the `$fnsig` KEY per field — a KEY, not the text, because two closure
+  fields with one rep spine are interchangeable in a row; "" is UNKNOWN, never "no signature",
+  so a recorder that cannot resolve one leaves the pair's behaviour unchanged. The `FieldDef`
+  recorder reads it off the ARENA (`sigKeyOfTy`) rather than bringing back the field render
+  #1615 deleted as dead — which is what also closes the MIXED spelling (`type Fn = {f: () =>
+  i32}` beside an inline `{f: () => string}`), the half an inline-only fix would have missed.
+
+* **THE 8-REP GRID, MEASURED — one program per cell, all `vl check` rc 0.** A closure result
+  inside a SHAPE went **1/8 -> 8/8**; the same 8 reps at the TOP-LEVEL arrow spelling were 8/8
+  before and after, because that rung's narrow list is untouched by construction.
+
+  | closure result rep | inside `{f: () => R}`, master | now | at `(f: () => R)`, both |
+  | --- | --- | --- | --- |
+  | `string` | invalid wasm | **runs** | runs |
+  | `i32[]` | `index access but list type not collected` | **runs** | runs |
+  | `string[]` | `string index access but string list type not collected` | **runs** | runs |
+  | `f64[]` | `index access but list type not collected` | **runs** | runs |
+  | `i64[]` | `index access but list type not collected` | **runs** | runs |
+  | `f32[]` | `index access but list type not collected` | **runs** | runs |
+  | `{[string]: i32}` | `map op but map type not collected` | **runs** | runs |
+  | `i32` | runs | runs | runs |
+
+  And the shape's own POSITION, same discipline: nested shape, shape-in-array, shape-in-nullable
+  and the alias's own nested form all move invalid wasm -> **runs**; the two-shape twin, the
+  mixed alias/inline twin and the different-arity sibling move emit reject -> **runs**.
+
+* **AND D1090 IS A DIFFERENT FAMILY, MEASURED IN BOTH DIRECTIONS.** A compiler carrying ONLY
+  this row's fix moved **0 of 11** of D1090's failing cells; a compiler carrying ONLY D1090's
+  fix moved **0 of 15** of this row's — the same list master produces, message for message.
 
 Repro (five lines, one function, and the function is never called):
 
@@ -34181,6 +34339,108 @@ structref`, in `hole`.
   the miscompile are one gap seen from two sides, so the acceptance test is both programs above
   RUNNING, plus the alias spelling staying byte-identical — the alias is the path that already
   works and a shared intern is the obvious way to break it.
+
+  **BOTH RUN, and the two sides turned out to be two RUNGS of one dropped input rather than one
+  fix.** The reservation walk closes the miscompile and moves none of the twin's cells; the
+  `sFieldCloSig` column closes the refusal and moves none of the reservation's. Neither is the
+  "intern the shape and stop" this note forbids — the shape was already interned in both cases;
+  what was missing was the SIGNATURE, in a flag on one side and in a row column on the other.
+
+---
+### D1100 — a `??`-moved function delivered through a CONTAINER (struct field, array element, wrapping lambda) is check-clean invalid wasm: the family mints, the delivery does not follow
+
+**check-clean invalid wasm · clause 1 · OPEN · found 2026-09-02 while closing [D1090](#d1090),
+as the half its position matrix does not reach · present identically on master's published seed
+(`6a737f4d`), so it is residue and not a regression**
+
+D1090 closed every position where the function VALUE's identity is knowable from bindings,
+parameters and returns. These five are the positions where it is knowable only from a CONTAINER
+read, and they need the delivery wired rather than the analysis widened.
+
+Repro (one program; the merge is the last two lines):
+
+    function src(p: {r: i32}): {r: i32} | null {
+      p
+    }
+    function rd() {
+      const o = {f: src}
+      const v = o.f({ r: 9 }) ?? { r: 0 }
+      print(v.r)
+      const g1 = src({ r: 7 }) ?? { r: "s" }
+      print(g1.r)
+    }
+    rd()
+
+`Invalid input WebAssembly code … type mismatch: expected i32, found (ref $type)` in `rd`.
+
+* **THE FIVE, ONE PROGRAM EACH, ALL `vl check` rc 0 — and all identical on master.**
+
+  | how `src` reaches the call | outcome |
+  | --- | --- |
+  | struct FIELD (`{f: src}`, called through it) | check-clean invalid wasm |
+  | array ELEMENT (`[src]`, called through it) | check-clean invalid wasm |
+  | array of STRUCTS (`[{f: src}]`) | check-clean invalid wasm |
+  | wrapping LAMBDA (`apply((q) => src(q))`) | check-clean invalid wasm |
+  | calling a RETURNED value directly (`pick()({r: 4})`) | check-clean invalid wasm |
+
+* **IT IS DELIVERY, NOT ATTRIBUTION, AND THAT IS MEASURED.** Forcing
+  `anonLeafAnyIndirectCall` to `false` — i.e. granting the family every attribution it could
+  ever want — does NOT make them run. They move instead to `wasm trap: indirect call type
+  mismatch` (the lambda and the returned value), a DIFFERENT `expected (ref null $type), found
+  (ref null $type)` (the field and the nested element), and `emitProgram: function-value call
+  arity has no interned signature` (the array element). So the missing half is the stored
+  closure carrying the moved `$fnsig` and the literal argument at the `call_ref` being built at
+  the merged row — the same two halves D940 built for a parameter slot, one holder over.
+
+* **THE ORDER IS D965'S AND D1090 ALREADY PAID FOR HALF OF IT.** Wire each delivery FIRST, then
+  admit the position; admitting it first is what turns one invalid module into another, and the
+  forced-veto experiment above is the cheap way to see that before writing any of it.
+
+* **THE ATTRIBUTION SIDE ALSO HAS A PRICE THAT IS ALREADY MEASURED.** Teaching
+  `anonLeafCalleeFnName` to follow a CALL in callee position (which is all `pick()({r: 4})`
+  needs) makes the compiler's own self-compile stop finishing: the resolver is a whole-arena
+  scan and a module is full of `x.push(…)` member calls. It was written, measured and reverted;
+  whatever closes this position has to carry an early-out, the way `anonLeafNarrowUseMark` and
+  `anonLeafCloBindMark` do.
+
+Probe: `scripts/capability-probes/coalesce-moved-fn-value-through-container.vl`.
+
+---
+### D1101 — a closure FIELD whose result is a MAP, called through the parameter that carries it, is check-clean invalid wasm: `unknown local N: local index out of bounds`
+
+**check-clean invalid wasm · clause 1 · OPEN · found 2026-09-02 while writing [D1092](#d1092)'s
+fixture, by CONSTRUCTING a value at a shape the row had only ever declared · present identically
+on master's published seed (`6a737f4d`)**
+
+Repro:
+
+    function viaMap(m: {f: () => {[string]: i32}}) {
+      m.f()["k"]
+    }
+    function mkMap(): {[string]: i32} {
+      const mp: {[string]: i32} = Map()
+      mp["k"] = 3
+      mp
+    }
+    print(viaMap({ f: () => mkMap() }))
+
+`Invalid input WebAssembly code … unknown local 3: local index out of bounds`, in `viaMap`.
+
+* **IT IS NOT D1092's FAMILY, AND THE ABLATION SAYS SO RATHER THAN THE MESSAGE.** D1092 is the
+  INLINE spelling of a closure-field shape whose reservation the alias got by accident. Here
+  **both spellings fail identically** — `type Fm = {f: () => {[string]: i32}}` produces the same
+  byte offset and the same message — and the UNCALLED spelling of the same shape BUILDS AND RUNS
+  on the fixed compiler. The ingredient D1092 needs (an inline spelling) is absent and the
+  ingredient this needs (a call through the field) is absent from D1092.
+
+* **THE MESSAGE NAMES THE MECHANISM'S SHAPE, unusually.** `unknown local N` is a local the
+  function body READS and the function header never declares — the map result of a closure-VALUE
+  call wants a scratch local in the frame that consumes it, and the frame reserving locals is
+  not the one emitting the read. That makes it a scratch-slot accounting bug, not a rep
+  disagreement, and it is the only cell in either row's grids that reports it.
+
+Probe: `scripts/capability-probes/closure-field-map-result-call.vl`.
+
 ### D1063 — two instantiations of ONE generic that must dispatch a member call DIFFERENTLY share a single AST node, so the disagreeing pair is check-clean invalid wasm
 
 **check-clean invalid wasm · `type mismatch: expected (ref $type), found (ref $type)` · ZERO corpus cells · reproduces on master · the PRICE [D1002](#d1002) declined to pay, named by the candidate that would have paid it**

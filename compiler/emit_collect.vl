@@ -135,6 +135,7 @@ import {
 } from "./ast"
 import {
   annArrowAt,
+  annFnDecompose,
   annGenAppDecompose,
   annRetNameOf,
   arrLeafNameOf,
@@ -204,6 +205,8 @@ import {
   annRlNul,
   annRlSlot,
   anonLeafAnnTy,
+  anonLeafCloBindFn,
+  anonLeafCloBindName,
   anonLeafCloSlotFn,
   anonLeafFamRow,
   anonLeafJoined,
@@ -314,6 +317,7 @@ import {
   rlWrapIdx,
   sBackIdx,
   sDeclared,
+  sFieldCloSig,
   sFieldCount,
   sFieldElemKeyI32,
   sFieldElemName,
@@ -438,6 +442,7 @@ import {
   exprIsBareFnName,
   exprIsLitAtom,
   exprMap,
+  fieldCloSigOfTy,
   fieldNameOrder,
   fieldRefElemName,
   fieldTypeCode,
@@ -5983,6 +5988,51 @@ function i32MapShapeFieldsLowerable(nm: string): i32 {
   0
 }
 
+// THE ONE HOME of "reserve the backing/wrapper heap types the type NAME `a` needs". A
+// presence flag is a RESERVATION: `mAssignTypeIndices` mints a heap type only where the
+// flag is set, and an unminted index falls through to `mNextType` — whatever heap type
+// happens to sit there — so a missed reservation is check-clean INVALID WASM, never a
+// missing feature. Monotone (every write is an OR into a flag), so calling it on a name
+// whose types another route already reserved is byte-inert.
+function forceAnnLeafReps(a: string): i32 {
+  if nameIsStringArray(a) {
+    slUsed = true
+    aUsed = true
+  } else if nameIsF64Array(a) {
+    fa64Used = true
+  } else if nameIsI64Array(a) {
+    ia64Used = true
+  } else if nameIsF32Array(a) {
+    fa32Used = true
+  } else if nameIsBareMap(a) {
+    mUsed = true
+    lUsed = true
+    aUsed = true
+  } else if nameIsNulI32List(a) {
+    lUsed = true
+    aUsed = true
+  } else if arrElemIs(a, "i32") || arrElemIs(a, "boolean") {
+    lUsed = true
+    aUsed = true
+  } else if nameIsString(a) || nameIsNulString(a) {
+    aUsed = true
+  } else if nulScalarListKind(a) != null {
+    const nsk = nulScalarListKind(a)
+    if nsk == "nulstrlist" {
+      slUsed = true
+      aUsed = true
+    }
+    if nsk == "nulf64list" { fa64Used = true }
+    if nsk == "nuli64list" { ia64Used = true }
+    if nsk == "nulf32list" { fa32Used = true }
+    // The packed-byte backing a `u8[] | null` cell's VALUE needs. Its three siblings
+    // above mark their backings here; this one did not, so the literal path's
+    // `!ba8Used` floor refused a program whose cell was already typed `nulu8list`.
+    if nsk == "nulu8list" { ba8Used = true }
+  }
+  0
+}
+
 function forceGenAppArgTypes(name: string): i32 {
   if !annGenAppSpanEnds(name) { return 0 }
   const args: string[] = []
@@ -5993,42 +6043,91 @@ function forceGenAppArgTypes(name: string): i32 {
     const a = args[i]
     // A NESTED application (`Box<Pair<i32, string>>`) is the same reservation one rung in.
     forceGenAppArgTypes(a)
-    if nameIsStringArray(a) {
-      slUsed = true
-      aUsed = true
-    } else if nameIsF64Array(a) {
-      fa64Used = true
-    } else if nameIsI64Array(a) {
-      ia64Used = true
-    } else if nameIsF32Array(a) {
-      fa32Used = true
-    } else if nameIsBareMap(a) {
-      mUsed = true
-      lUsed = true
-      aUsed = true
-    } else if nameIsNulI32List(a) {
-      lUsed = true
-      aUsed = true
-    } else if arrElemIs(a, "i32") || arrElemIs(a, "boolean") {
-      lUsed = true
-      aUsed = true
-    } else if nameIsString(a) || nameIsNulString(a) {
-      aUsed = true
-    } else if nulScalarListKind(a) != null {
-      const nsk = nulScalarListKind(a)
-      if nsk == "nulstrlist" {
-        slUsed = true
-        aUsed = true
-      }
-      if nsk == "nulf64list" { fa64Used = true }
-      if nsk == "nuli64list" { ia64Used = true }
-      if nsk == "nulf32list" { fa32Used = true }
-      // The packed-byte backing a `u8[] | null` cell's VALUE needs. Its three siblings
-      // above mark their backings here; this one did not, so the literal path's
-      // `!ba8Used` floor refused a program whose cell was already typed `nulu8list`.
-      if nsk == "nulu8list" { ba8Used = true }
-    }
+    forceAnnLeafReps(a)
     i = i + 1
+  }
+  0
+}
+
+// RESERVE THE REPS A CLOSURE FIELD'S SIGNATURE NEEDS, at every depth of an annotation
+// SPELLING. The `annRetNameOf` rung in `collectA`'s `TypeRef` arm handles a TOP-LEVEL
+// function type (`(i32) => string`) by forcing its return's reps; a closure spelled as a
+// struct FIELD (`{f: () => string}`) reaches no rung at all, because the top-level arrow
+// scan stops at the brace and the struct field table records a closure field's CODE (14)
+// with no signature text beside it — `sFieldElemName` is "" for such a field, so the field
+// loop cannot re-derive the reservation either.
+//
+// THE ALIAS SPELLING RAN ONLY BY ACCIDENT, and that is what locates this: `type Fs = {f:
+// () => string}` mints a SECOND `TypeRef` for the alias body's arrow (the arena holds
+// `<()=>string>` beside `<Fs>`), which the top-level rung then sees; the inline spelling
+// mints ONE node (`<{f:()=>string}>`) and nothing looks inside it. Both spellings build
+// the SAME struct row (one field, code 14), so the type tables cannot tell them apart —
+// the difference is entirely which annotation NODES exist. One nesting level deeper the
+// accident stops paying (`type Fs = {g: {f: () => string}}` fails exactly like the inline
+// form), which is why this walks the spelling rather than adding an alias-shaped case.
+//
+// SCOPE, DELIBERATELY: it forces only from types reached THROUGH an arrow nested inside a
+// composite. A top-level arrow's own return keeps the narrow list its own rung gives it,
+// so a program whose reservations already resolve cannot change a byte here.
+function forceNestedCloSigReps(nm: string, depth: i32): i32 {
+  if depth > 6 { return 0 }
+  if nm == "" { return 0 }
+  // A UNION / NULLABLE spelling: the shape may sit in any arm. `splitUnionAtoms` stops at
+  // a top-level `=>`, so a function type reaches the arrow rung below as ONE atom.
+  const arms: string[] = []
+  splitUnionAtoms(nm, arms)
+  if arms.length > 1 {
+    let ai = 0
+    while ai < arms.length {
+      forceNestedCloSigReps(arms[ai], depth + 1)
+      ai = ai + 1
+    }
+    return 0
+  }
+  // AN ARRAY OF the spelling (`{f: () => string}[]`) — peel one layer and continue.
+  if nameIsArray(nm) {
+    return forceNestedCloSigReps(listElemNameOf(nm), depth + 1)
+  }
+  // A TOP-LEVEL function type: descend into its parts WITHOUT forcing them, so the
+  // `annRetNameOf` rung stays the sole owner of a top-level return's reservation.
+  const tps: string[] = []
+  const tret = annFnDecompose(nm, tps)
+  if tret != "" {
+    forceNestedCloSigReps(tret, depth + 1)
+    let ti = 0
+    while ti < tps.length {
+      forceNestedCloSigReps(tps[ti], depth + 1)
+      ti = ti + 1
+    }
+    return 0
+  }
+  // A SHAPE. Every field whose text carries a top-level arrow is a closure field: force
+  // the reps its result and parameters name, then keep descending — a result may itself
+  // be a shape with a closure field of its own.
+  if !nameIsShapeSpanEnds(nm) { return 0 }
+  const fnames: string[] = []
+  const ftexts: string[] = []
+  // The GROUP-INTERIOR cut at its home (`tyname.groupInnerOf`, W1); the guard above is
+  // the bound that home requires.
+  shapeInnerFieldSplit(groupInnerOf(nm), fnames, ftexts)
+  let fi = 0
+  while fi < ftexts.length {
+    const ft = ftexts[fi]
+    const ps: string[] = []
+    const ret = annFnDecompose(ft, ps)
+    if ret != "" {
+      forceAnnLeafReps(ret)
+      forceNestedCloSigReps(ret, depth + 1)
+      let pi = 0
+      while pi < ps.length {
+        forceAnnLeafReps(ps[pi])
+        forceNestedCloSigReps(ps[pi], depth + 1)
+        pi = pi + 1
+      }
+    } else {
+      forceNestedCloSigReps(ft, depth + 1)
+    }
+    fi = fi + 1
   }
   0
 }
@@ -6412,6 +6511,9 @@ export function collectA(_stmts: i32[]) {
       if strContains(nd.tyName, "{[i32]:") {
         if i32MapSpellingLowerable(nd.tyName) < 0 { return -1 }
       }
+      // A CLOSURE spelled as a struct FIELD reserves nothing through the rung below —
+      // see `forceNestedCloSigReps`, which walks INTO the spelling for it.
+      forceNestedCloSigReps(nd.tyName, 0)
       // A TOP-LEVEL function-type annotation (`(i32) => R`): the function-type name
       // itself needs no array/list type, but its RETURN `R` may (an `i32[]`/`string[]`/
       // `f64[]` result list, or a `string`). Force the return's backing types so the
@@ -7076,6 +7178,9 @@ function collectAnonShapes() {
   // D940 — AND THE CLOSURE-TYPED SLOT A MOVED FUNCTION IS DELIVERED TO. Last, because it
   // reads the ret/param marks the two above write. See `anonLeafCloSlotMark`.
   anonLeafCloSlotMark()
+  // D1090 — AND THE CLOSURE-TYPED BINDING it is delivered to, which is the same signature
+  // one holder over. See `anonLeafCloBindMark`.
+  anonLeafCloBindMark()
   let ai = 0
   while ai < P.nodes.length {
     const an = P.nodes[ai]
@@ -8175,7 +8280,13 @@ function anonLeafMarkRetMoved(nm: string) {
   // binding unable to hold both. Guarded on `already` because the co-move calls back into
   // this function for each sibling: the second visit finds the mark set and stops, which is
   // the whole of the recursion's bound.
-  if !already { anonLeafCoMoveFnRets(nm) }
+  if !already {
+    anonLeafCoMoveFnRets(nm)
+    // D1090 — and every function this one shares a closure-typed PARAMETER SLOT with, for
+    // the same "one holder, one signature" reason. Under the same `already` guard, which is
+    // what bounds the mutual recursion between the two co-moves.
+    anonLeafCoMoveFnParamSlots(nm)
+  }
   0
 }
 
@@ -8816,11 +8927,21 @@ function anonLeafParamFnTarget(nm: string): string {
 }
 
 function anonLeafParamFnTargetGo(nm: string): string {
-  // The unique `Param` with this name, and the declaration that owns it.
-  let pIx = 0 - 1
-  let owner = 0 - 1
-  let pos = 0 - 1
-  let seen = 0
+  // EVERY `Param` with this name, each answered on ITS OWN declaration, and the answers
+  // required to AGREE.
+  //
+  // D1090 — THE `seen != 1` BAIL WAS THE MODULE-WIDE NAME KEYING, AND IT IS A LIVE HAZARD.
+  // A name does not scope, so this resolver refused outright the moment two functions in one
+  // module spelled their callback `cb` — and three higher-order functions each handed the
+  // same `src` is a program whose answer is not in doubt. Refusing it vetoed the whole `??`
+  // family (`anonLeafAnyIndirectCall` reads this), and the veto's fall-through is not
+  // neutral: the default literal then lands in the PRE-MERGE row, which is check-clean
+  // invalid wasm. Renaming one parameter made the same program run.
+  //
+  // Agreement is the same rule the call-site loop below already applies one level down (two
+  // call sites handing the parameter different functions still answer ""), asked of the
+  // parameters instead of the arguments — so a genuine ambiguity is refused exactly as before.
+  let ans = ""
   let fi = 0
   while fi < P.nodes.length {
     const fd = P.nodes[fi]
@@ -8830,10 +8951,12 @@ function anonLeafParamFnTargetGo(nm: string): string {
         const pn = P.nodes[fd.fnParams[pj]]
         if pn is Param {
           if pn.parName == nm {
-            seen = seen + 1
-            pIx = fd.fnParams[pj]
-            owner = fi
-            pos = pj
+            const one = anonLeafParamFnTargetAt(fi, pj)
+            if one == "" { return "" }
+            if ans != "" {
+              if ans != one { return "" }
+            }
+            ans = one
           }
         }
         pj = pj + 1
@@ -8841,7 +8964,257 @@ function anonLeafParamFnTargetGo(nm: string): string {
     }
     fi = fi + 1
   }
-  if seen != 1 || pIx < 0 || owner < 0 || pos < 0 { return "" }
+  ans
+}
+
+// D1090 — THE ONE FUNCTION AN ARGUMENT EXPRESSION EVALUATES TO, or "".
+//
+// The three spellings that name a function without BEING its name: an identifier (a
+// declaration, or a binding written with one — `anonLeafFnValueTarget`'s hop), and a CALL of a
+// function that hands one back. `apply(pick())` delivers `src` to the slot exactly as
+// `apply(src)` does, and reading only the bare name left the parameter unattributed.
+function anonLeafArgFnName(argIx: i32): string {
+  if argIx < 0 { return "" }
+  const av = unwrapParen(argIx)
+  if av < 0 { return "" }
+  const avn = P.nodes[av]
+  if avn is Ident {
+    if anonLeafOneDeclNamed(avn.identName) { return avn.identName }
+    return anonLeafFnValueTarget(avn.identName)
+  }
+  if avn is Call {
+    const cnm = anonLeafCalleeFnName(avn.callFn)
+    if cnm == "" { return "" }
+    return anonLeafFnRetFnName(cnm)
+  }
+  ""
+}
+
+// D1090 — THE ONE FUNCTION a function named `fname` HANDS BACK, or "". Strict: every value it
+// returns (each `return e` and the body's TAIL) must name the same single function.
+const anonLeafRetFnBusy: string[] = []
+
+function anonLeafFnRetFnName(fname: string): string {
+  let bi = 0
+  while bi < anonLeafRetFnBusy.length {
+    if anonLeafRetFnBusy[bi] == fname { return "" }
+    bi = bi + 1
+  }
+  anonLeafRetFnBusy.push(fname)
+  const ans = anonLeafFnRetFnNameGo(fname)
+  anonLeafRetFnBusy.pop()
+  ans
+}
+
+function anonLeafFnRetFnNameGo(fname: string): string {
+  if !anonLeafOneDeclNamed(fname) { return "" }
+  let ans = ""
+  let fi = 0
+  while fi < P.nodes.length {
+    const fd = P.nodes[fi]
+    if fd is FuncDecl {
+      if fd.fnName == fname {
+        const rets: i32[] = []
+        if !anonLeafFnRetExprs(fd.fnBody, rets, true) { return "" }
+        if rets.length == 0 { return "" }
+        let k = 0
+        while k < rets.length {
+          const one = anonLeafArgFnName(rets[k])
+          if one == "" { return "" }
+          if ans != "" {
+            if ans != one { return "" }
+          }
+          ans = one
+          k = k + 1
+        }
+      }
+    }
+    fi = fi + 1
+  }
+  ans
+}
+
+// Every expression a body hands back: each `return e` plus the block's implicit TAIL. A NESTED
+// function declaration is skipped — its returns are its own. `false` on a bare `return`, which
+// hands back no function at all.
+function anonLeafFnRetExprs(ix: i32, out: i32[], tail: boolean): boolean {
+  if ix < 0 { return true }
+  const n = P.nodes[ix]
+  if n is FuncDecl { return true }
+  if n is RetStmt {
+    if n.retArg < 0 { return false }
+    out.push(n.retArg)
+  }
+  if n is Block {
+    if tail {
+      if n.blkStmts.length > 0 { out.push(n.blkStmts[n.blkStmts.length - 1]) }
+    }
+  }
+  const kids = nodeChildren(ix)
+  let i = 0
+  while i < kids.length {
+    if !anonLeafFnRetExprs(kids[i], out, false) { return false }
+    i = i + 1
+  }
+  true
+}
+
+// D1090 — EVERY FUNCTION THE PARAMETER NAMED `nm` MAY RECEIVE, or false when the set is not
+// fully known. The membership form of `anonLeafParamFnTarget`, standing to it exactly as
+// `anonLeafFnValueNames` stands to `anonLeafFnValueTarget` (D948): a slot handed two KNOWN
+// functions is as attributable as one handed a single function, and refusing it left
+// `apply(src)` beside `apply(other)` unattributed — the family vetoed, the module invalid.
+//
+// One slot is one wasm signature, so the two are only both deliverable if BOTH rows move
+// together; `anonLeafCoMoveFnParamSlots` is that half. Names are appended without dedup —
+// every caller only asks membership.
+function anonLeafParamFnNames(nm: string, out: string[]): boolean {
+  let bi = 0
+  while bi < anonLeafParamFnBusy.length {
+    if anonLeafParamFnBusy[bi] == nm { return false }
+    bi = bi + 1
+  }
+  anonLeafParamFnBusy.push(nm)
+  const ok = anonLeafParamFnNamesGo(nm, out)
+  anonLeafParamFnBusy.pop()
+  ok
+}
+
+function anonLeafParamFnNamesGo(nm: string, out: string[]): boolean {
+  let found = false
+  let fi = 0
+  while fi < P.nodes.length {
+    const fd = P.nodes[fi]
+    if fd is FuncDecl {
+      let pj = 0
+      while pj < fd.fnParams.length {
+        const pn = P.nodes[fd.fnParams[pj]]
+        if pn is Param {
+          if pn.parName == nm {
+            if !anonLeafParamFnNamesAt(fi, pj, out) { return false }
+            found = true
+          }
+        }
+        pj = pj + 1
+      }
+    }
+    fi = fi + 1
+  }
+  found
+}
+
+// D1090 — EVERY OTHER FUNCTION `nm` SHARES A CLOSURE-TYPED PARAMETER SLOT WITH: their rows are
+// COUPLED to its, for the reason `anonLeafCoMoveFnRets` states about a binding. One slot holds
+// one wasm signature, so moving `src`'s row while `other`'s stays narrow gives `apply(src)`
+// beside `apply(other)` a parameter it cannot hold — `wasm trap: indirect call type mismatch`,
+// which is what the position graded once the attribution admitted it.
+function anonLeafCoMoveFnParamSlots(nm: string) {
+  let fi = 0
+  while fi < P.nodes.length {
+    const fd = P.nodes[fi]
+    if fd is FuncDecl {
+      let pj = 0
+      while pj < fd.fnParams.length {
+        const pn = P.nodes[fd.fnParams[pj]]
+        if pn is Param {
+          if pn.parType >= 0 && tyIsFuncType(pn.parType) {
+            const names: string[] = []
+            if anonLeafParamFnNamesAt(fi, pj, names) {
+              let hasNm = false
+              let j = 0
+              while j < names.length {
+                if names[j] == nm { hasNm = true }
+                j = j + 1
+              }
+              if hasNm {
+                let k = 0
+                while k < names.length {
+                  if names[k] != nm { anonLeafMarkRetMoved(names[k]) }
+                  k = k + 1
+                }
+              }
+            }
+          }
+        }
+        pj = pj + 1
+      }
+    }
+    fi = fi + 1
+  }
+  0
+}
+
+// The set form of `anonLeafParamFnTargetAt`: every function delivered to `owner`'s parameter
+// at position `pos`, or false when one delivery is something this cannot name.
+function anonLeafParamFnNamesAt(owner: i32, pos: i32, out: string[]): boolean {
+  const od = P.nodes[owner]
+  if od is FuncDecl {
+    if !anonLeafOneDeclNamed(od.fnName) { return false }
+    const pNames: string[] = []
+    let pk = 0
+    while pk < od.fnParams.length {
+      const pnk = P.nodes[od.fnParams[pk]]
+      if pnk is Param { pNames.push(pnk.parName) } else { pNames.push("") }
+      pk = pk + 1
+    }
+    let hits = 0
+    let ci = 0
+    while ci < P.nodes.length {
+      const cn = P.nodes[ci]
+      if cn is Call {
+        if anonLeafCallMayTarget(cn.callFn, od.fnName) {
+          const slots = orderArgsByParamNames(
+            pNames,
+            cn.callArgs,
+            cn.callArgNames,
+          )
+          if slots.length != pNames.length { return false }
+          if pos >= slots.length { return false }
+          const argNm = anonLeafArgFnName(slots[pos])
+          if argNm == "" { return false }
+          out.push(argNm)
+          hits = hits + 1
+        }
+      }
+      ci = ci + 1
+    }
+    if hits > 0 { return true }
+    // D1090 — NO CALL SITE AT ALL IS AN ANSWER, AND THE ANSWER IS "NOTHING REACHES THIS
+    // SLOT". A higher-order function nobody calls binds its callback to nothing, so the
+    // `cb(…)` inside its body can reach no function and threatens no row: its literal
+    // lowers at the annotation's own row, which is the row the veto exists to protect.
+    // Reading the empty scan as "a delivery I cannot name" made ONE uncalled HOF beside a
+    // called one veto the whole `??` family — check-clean invalid wasm, and deleting the
+    // uncalled function made the same program run.
+    //
+    // The name must not be used as a VALUE, which is the same refutation
+    // `anonLeafNarrowUseMark` makes of a declaration: a call through the value passes
+    // arguments no call-site scan reads, so "no call site" would not mean "never called".
+    return !anonLeafNameUsedAsValue(od.fnName)
+  }
+  false
+}
+
+// Is `fname` mentioned anywhere OTHER than in callee position — i.e. used as a function
+// VALUE? The scan `anonLeafNarrowUseMark` and `anonLeafSlotAllMembers` each spell inline.
+function anonLeafNameUsedAsValue(fname: string): boolean {
+  let vi = 0
+  while vi < P.nodes.length {
+    const vn = P.nodes[vi]
+    if vn is Ident {
+      if vn.identName == fname {
+        if !anonLeafIsCalleePos(vi) { return true }
+      }
+    }
+    vi = vi + 1
+  }
+  false
+}
+
+// The one function every caller passes to `owner`'s parameter at position `pos`, or "". The
+// per-declaration half of `anonLeafParamFnTargetGo`, split out so the name resolution above
+// can ask it once per `Param` rather than once per NAME.
+function anonLeafParamFnTargetAt(owner: i32, pos: i32): string {
   const od = P.nodes[owner]
   if od is FuncDecl {
     if !anonLeafOneDeclNamed(od.fnName) { return "" }
@@ -8858,7 +9231,12 @@ function anonLeafParamFnTargetGo(nm: string): string {
     while ci < P.nodes.length {
       const cn = P.nodes[ci]
       if cn is Call {
-        if anonLeafCalleeFnName(cn.callFn) == od.fnName {
+        // D1090 — THE MEMBERSHIP FORM, which every other argument reader in this file
+        // already uses (D948). A call spelled through a binding that may hold this
+        // function IS a call site of it, and reading only the equality missed
+        // `let hf = apply; hf = apply2; hf(src)` — no call site found, the parameter
+        // unattributed, the family vetoed and the module invalid.
+        if anonLeafCallMayTarget(cn.callFn, od.fnName) {
           const slots = orderArgsByParamNames(
             pNames,
             cn.callArgs,
@@ -8866,19 +9244,18 @@ function anonLeafParamFnTargetGo(nm: string): string {
           )
           if slots.length != pNames.length { return "" }
           if pos >= slots.length { return "" }
-          const av = unwrapParen(slots[pos])
-          if av < 0 { return "" }
-          const avn = P.nodes[av]
-          if avn is Ident {
-            if !anonLeafOneDeclNamed(avn.identName) { return "" }
-            if hits > 0 {
-              if hit != avn.identName { return "" }
-            }
-            hit = avn.identName
-            hits = hits + 1
-          } else {
-            return ""
+          // D1090 — THROUGH THE BINDING HOP AND THE RETURN HOP, exactly as the CALLEE
+          // position already resolves one (`anonLeafCalleeFnName`, D925). `apply(h)` over
+          // `const h = src` and `apply(pick())` over `pick(): … { src }` hand the slot the
+          // same function `apply(src)` does; reading only the bare name left the parameter
+          // unattributed, vetoed the family, and made the program invalid wasm.
+          const argNm = anonLeafArgFnName(slots[pos])
+          if argNm == "" { return "" }
+          if hits > 0 {
+            if hit != argNm { return "" }
           }
+          hit = argNm
+          hits = hits + 1
         }
       }
       ci = ci + 1
@@ -8910,7 +9287,17 @@ function anonLeafCloSlotMark() {
           // whole-arena scan per parameter, and asking it of every scalar parameter in the
           // program is the cost this walk cannot pay.
           if pn.parType >= 0 && tyIsFuncType(pn.parType) {
-            const tgt = anonLeafParamFnTarget(pn.parName)
+            let tgt = anonLeafParamFnTarget(pn.parName)
+            if tgt == "" {
+              // D1090 — A SLOT FED TWO KNOWN FUNCTIONS still has ONE signature, because
+              // `anonLeafCoMoveFnParamSlots` moved the whole set together. Any member is
+              // then a faithful representative of the slot's key; the FIRST is taken, and
+              // a set that is not fully known still answers "" and marks nothing.
+              const setNames: string[] = []
+              if anonLeafParamFnNamesAt(fi, pj, setNames) {
+                if setNames.length > 0 { tgt = setNames[0] }
+              }
+            }
             if tgt != "" {
               if anonLeafFnNameMoved(tgt) {
                 while anonLeafCloSlotFn.length <= pIx {
@@ -8925,6 +9312,67 @@ function anonLeafCloSlotMark() {
       }
     }
     fi = fi + 1
+  }
+  0
+}
+
+// D1090 — THE BINDINGS A MOVED FUNCTION IS DELIVERED TO. See `anonLeafCloBindName`.
+//
+// A binding written ONLY with a function whose rows the merge moved must call at that
+// function's own `$fnsig`, not at its annotation's. Only such a binding is recorded — an
+// un-annotated one already lowers correctly, and recording it changes nothing; a binding whose
+// target is unresolvable or unmoved records nothing at all, which is what keeps every
+// closure-valued binding in every other program byte-identical.
+function anonLeafCloBindMark() {
+  // THE SAME EARLY-OUT `anonLeafNarrowUseMark` TAKES, AND FOR ITS REASON. The loop below asks
+  // `anonLeafFnValueTarget` — a whole-arena scan — of every binding in the program, so an
+  // ungated pass is quadratic in the node count for EVERY module, the compiler's own source
+  // included (measured: the self-compile stopped finishing). Nothing can be recorded unless
+  // some row actually moved, and that is one O(n) read of the marks the passes above wrote.
+  let moved = false
+  let mr = 0
+  while mr < anonLeafRetMoved.length {
+    if anonLeafRetMoved[mr] == 1 { moved = true }
+    mr = mr + 1
+  }
+  let mp = 0
+  while mp < anonLeafParamMoved.length {
+    if anonLeafParamMoved[mp] == 1 { moved = true }
+    mp = mp + 1
+  }
+  if !moved { return 0 }
+  let i = 0
+  while i < P.nodes.length {
+    const n = P.nodes[i]
+    let bn = ""
+    if n is LetDecl { bn = n.letName }
+    if n is BinExpr {
+      if n.binOp == "=" {
+        const tgt = unwrapParen(n.binLeft)
+        if tgt >= 0 {
+          const tn = P.nodes[tgt]
+          if tn is Ident { bn = tn.identName }
+        }
+      }
+    }
+    if bn != "" {
+      let already = false
+      let k = 0
+      while k < anonLeafCloBindName.length {
+        if anonLeafCloBindName[k] == bn { already = true }
+        k = k + 1
+      }
+      if !already {
+        const tgt = anonLeafFnValueTarget(bn)
+        if tgt != "" {
+          if anonLeafFnNameMoved(tgt) {
+            anonLeafCloBindName.push(bn)
+            anonLeafCloBindFn.push(tgt)
+          }
+        }
+      }
+    }
+    i = i + 1
   }
   0
 }
@@ -8972,7 +9420,11 @@ function anonLeafFnValueNames(nm: string, out: string[]): boolean {
   while i < P.nodes.length {
     const n = P.nodes[i]
     if n is Param {
-      if n.parName == nm { return false }
+      // D1090 — A PARAMETER'S SOURCES ARE ITS CALL SITES' ARGUMENTS, which is the same
+      // widening `anonLeafFnValueTarget` already took one answer over (D939). Refuting
+      // outright made a callback slot fed two KNOWN functions unattributable, and the veto
+      // that reads this then declined the whole `??` family.
+      if n.parName == nm { return anonLeafParamFnNames(nm, out) }
     }
     let w = 0 - 1
     if n is LetDecl {
@@ -9091,7 +9543,27 @@ function anonLeafCalleeFnName(callFn: i32): string {
 
 // D925 — THE ONE FUNCTION NAME `nm` IS EVER BOUND TO, or "". A `Param` named `nm` refutes
 // outright: its value is whatever the caller passed, which is not at any write this can read.
+//
+// D1090 — A WRITE THAT NAMES ANOTHER BINDING IS FOLLOWED, not refused: `let gb = src; gb = ga`
+// over `let ga = src` is one function reached by two hops, and stopping at the first left the
+// binding unattributed for no reason the program contains. The busy list is the same
+// re-entry guard `anonLeafParamFnTarget` carries and for the same reason — `gb = ga; ga = gb`
+// is a cycle with no frame between the hops for a depth cap to count.
+const anonLeafFnValueBusy: string[] = []
+
 function anonLeafFnValueTarget(nm: string): string {
+  let bi = 0
+  while bi < anonLeafFnValueBusy.length {
+    if anonLeafFnValueBusy[bi] == nm { return "" }
+    bi = bi + 1
+  }
+  anonLeafFnValueBusy.push(nm)
+  const ans = anonLeafFnValueTargetGo(nm)
+  anonLeafFnValueBusy.pop()
+  ans
+}
+
+function anonLeafFnValueTargetGo(nm: string): string {
   let hit = ""
   let hits = 0
   let i = 0
@@ -9123,11 +9595,14 @@ function anonLeafFnValueTarget(nm: string): string {
     if w >= 0 {
       const wn = P.nodes[w]
       if wn is Ident {
-        if !anonLeafOneDeclNamed(wn.identName) { return "" }
+        // …and a write naming another BINDING is chased to that binding's own answer.
+        let wNm = wn.identName
+        if !anonLeafOneDeclNamed(wNm) { wNm = anonLeafFnValueTarget(wNm) }
+        if wNm == "" { return "" }
         if hits > 0 {
-          if hit != wn.identName { return "" }
+          if hit != wNm { return "" }
         }
-        hit = wn.identName
+        hit = wNm
         hits = hits + 1
       } else {
         return ""
@@ -9689,6 +10164,9 @@ function anonMintRowFor(objIx: i32) {
         const pi = aOrd[pj]
         sFieldNames.push(names[pi])
         sFieldTypes.push(codes[pi])
+        // An anonymous literal's field has no annotation TEXT to key a closure signature
+        // from — "" is this recorder's honest answer, and the consumer reads it as unknown.
+        sFieldCloSig.push("")
         sFieldElemName.push(elemNames[pi])
         // B6b: an anonymous literal's MAP field (code 19) carries a real key column —
         // an mv slot's identity is the (KEY, VALUE) pair, and both halves come off the
@@ -10762,6 +11240,7 @@ function pushFieldRow(
   tyText: string,
   elemTyHint: i32,
   litTyIx: i32,
+  cloSig: string,
 ) {
   if toVariant {
     uFieldTypes.push(code)
@@ -10777,6 +11256,7 @@ function pushFieldRow(
   } else {
     sFieldTypes.push(code)
     sFieldElemName.push(elemNm)
+    sFieldCloSig.push(cloSig)
     recordSFieldElemRowTy(elemNm, keyI32, elemTyHint) // D5 + B6b
     sFieldNames.push(fName)
   }
@@ -10811,6 +11291,8 @@ export function collectS(stmts: i32[]) {
   anonLeafParamMoved = []
   anonLeafRetMoved = []
   anonLeafCloSlotFn = []
+  anonLeafCloBindName = []
+  anonLeafCloBindFn = []
   anonLeafSupersede = []
   // The struct-row NAME index keys THIS table's spellings — reset it with the table, or
   // the next program's rows answer with this one's names (see its header). MEASURED, not
@@ -10826,6 +11308,7 @@ export function collectS(stmts: i32[]) {
   sFieldCount = []
   sFieldTypes = []
   sFieldElemName = []
+  sFieldCloSig = []
   sFieldElemTyIx = []
   sFieldElemKeyI32 = []
   // Nested inline-shape FIELD types intern first, so the struct decls that reference them resolve.
@@ -10924,6 +11407,9 @@ export function collectS(stmts: i32[]) {
             // `fieldRefElemName`'s answer at code 16 (neither of `fieldRecElemName`'s two
             // arms fires), so the home's code-16 intern reads the same value it would.
             const recNm = fieldRecElemName(fnode.fdType, code)
+            // THE LAST ARGUMENT IS THE ARENA, not a render: the field text this recorder
+            // would have to re-render for a closure field is the render #1615 deleted as
+            // dead, and `sigKeyOfTy` answers the same key from the type it already has.
             pushFieldRow(
               false,
               code,
@@ -10933,6 +11419,7 @@ export function collectS(stmts: i32[]) {
               "",
               fieldElemHintOf(fnode.fdType, code, recNm),
               -1,
+              fieldCloSigOfTy(code, nodeTyIxOf(fnode.fdType)),
             )
             // the STRUCT table has no discrimination rule to key, so no column either
 
@@ -11034,6 +11521,7 @@ function collectShapeVariantFields(nm: string, shapeTy: i32) {
     // is this recorder's own: it reads the field TYPE TEXT, where they read a `FieldDef`.
     // The SHAPE-TEXT recorder has no `FieldDef` node, so no row to hand over: -1 is
     // exactly today's call.
+    // The VARIANT table has no `sFieldCloSig` twin, so the trailing column is "".
     pushFieldRow(
       true,
       fc,
@@ -11043,6 +11531,7 @@ function collectShapeVariantFields(nm: string, shapeTy: i32) {
       variantFieldIdText(ftxt, fldTy),
       -1,
       fldTy,
+      "",
     )
     cnt = cnt + 1
     fx = fx + 1
@@ -11129,6 +11618,7 @@ function collectVariantFields(stmts: i32[], name: string) {
             // recorder's own answer, and for a code the node path DID produce the two agree.
             let elemNm = shapeFieldElemName(ftxt, code)
             if nodeCode >= 0 { elemNm = fieldRecElemName(fnode.fdType, code) }
+            // The VARIANT table has no `sFieldCloSig` twin, so the trailing column is "".
             pushFieldRow(
               true,
               code,
@@ -11138,6 +11628,7 @@ function collectVariantFields(stmts: i32[], name: string) {
               variantFieldIdText(ftxt, nodeTyIxOf(fnode.fdType)),
               fieldElemHintOf(fnode.fdType, code, elemNm),
               nodeTyIxOf(fnode.fdType),
+              "",
             )
             // Same column, same reasoning — and `fnode` is still live here, 33 lines after
             // `ftxt` was rendered from it. An earlier pass filed this site as string-only by
