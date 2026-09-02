@@ -31951,3 +31951,78 @@ Repro:
   argument / assignment) before narrowing anything at the checker.
 
 ---
+
+### D1036 — a map binding annotated with a RECURSIVE ALIAS refuses at `emitMapNew`; the STRUCTURAL spelling of the identical type has always run
+
+**runs, prints `0 / 1 / 1.5 / 2` — CLOSED 2026-09-02 by treating `letMapShape`'s render rung
+`-3` as a NON-ANSWER and falling through to the destination rung the structural spelling
+already used · zero `runs` lost · `tests/cases/maps/recursive-alias-map-annotation.vl` · was a
+loud emit reject on a `vl check`-clean program, clause 2**
+
+Repro:
+
+    type J = null | f64 | JO
+    type JO = { [string]: J }
+    const o: JO = Map()
+    o["k"] = 1.5
+    print(o.size)
+
+* **ABLATED — the alias spelling at the BINDING is the whole ingredient.** One tiny program
+  per spelling of the same mutually recursive pair:
+
+  | binding annotation | outcome |
+  | --- | --- |
+  | `const o: JO = Map()` | **refused** at `emitMapNew` |
+  | `const o: { [string]: J } = Map()` | runs — the identical type, spelled structurally |
+  | `const o: Root = Map()`, `type Root = { [string]: J }` | runs — an alias OUTSIDE the cycle |
+  | `type J = null \| f64 \| { [string]: J }` (self-recursive, no pair) | runs |
+  | `function f(o: JO): i32 { o.size }` | runs — a PARAM at the same alias |
+
+  So it is neither the recursion, nor the alias, nor the map value rep: it is an alias
+  standing INSIDE the cycle, in BINDING position.
+
+* **MECHANISM.** `letMapShape`'s `lt is TypeRef` rung renders the annotation and asks the NAME
+  layer: `JO` renders `{[string]:J}` (the cycle closes on `J`, which `aliasNameOfTyIx` names
+  correctly per D1021), so the value name is the bare alias `J`. No rung of
+  `mvValKindOfName` classifies it — `unionMemberSetOf` is a lookup in `unNames` and returns a
+  recursive alias UNEXPANDED, so the union rung's member count reads 1 — and the `-3` seeded
+  `pendingMapSlot`, which `emitMapNew` refuses. The structural spelling is not a `TypeRef`
+  node at all, skips this rung, and lands on the destination rung (D203/D207) below it.
+
+* **WHY THIS IS THE SAFE HALF OF THE ROUTING D-MAPNODETY REFUSES.** That refusal is about
+  taking the node type as a slot KEY: a better answer at a rung that today ANSWERS moves 128
+  measured cells onto a different mv slot. This fall-through runs only where the name leg
+  produced no slot at all, so no resolution the site ships today can move and no mint it
+  performs is skipped. All eleven gates pass, corpus unchanged.
+
+* **`mvValKindOfName("J")` STILL RETURNS `-3`, AND THAT IS NOT THE BUG.** Every other caller
+  already tolerates it — the structural binding, the param, the list-recursive alias
+  (`type L = f64 | L[]`) all reach the same `-3` and resolve elsewhere. Only this one rung
+  turned a non-answer into a refusal. Teaching `unionMemberSetOf` to expand a recursive alias
+  is a larger change with no witness asking for it; if one appears, it belongs on its own row.
+
+* **REMAINDER, FILED AS D1037.** Declaring the map alias FIRST still refuses.
+
+### D1037 — the recursive-alias map binding refuses when the MAP alias is declared BEFORE the union, and runs when it is declared after
+
+**loud emit reject on a `vl check`-clean program — OPEN, clause 2**
+
+Repro:
+
+    type JO = { [string]: J }
+    type J = null | f64 | JO
+    const o: JO = Map()
+    print(o.size)
+
+* **The SAME program with the two declarations SWAPPED runs** (that is D1036's own repro), so
+  this is a collect-ORDER dependency, not a rep gap: the destination rung that rescues D1036
+  finds a slot when `J` was walked first and finds none when `JO` was. A type declaration's
+  position in the file is not supposed to be observable.
+
+* Reaches the same `emitProgram: unsupported map value type` at the BINDING (site A,
+  `emitMapNew`'s `pendingMapSlot == -3`), with a store-free body too — so it is the seed, not
+  any op.
+
+* Next step is to find which of `mapShapeOfExpr` / `letMapDestShape` declines under the
+  swapped order; both answer under D1036's order.
+
