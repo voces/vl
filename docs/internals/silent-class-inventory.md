@@ -25476,9 +25476,11 @@ Repro (check rc 0, then a runtime trap — D741's `w0_base`, unchanged by D791):
 
 ### D794 — the widening reads its SOURCE row from the cell, so a call result / field read / indexed read source is not widened
 
-**check-clean invalid wasm · found 2026-08-31 as the deliberate bound of D791's
-`exprEmittedRefListSlot` · no corpus cell reaches it · a CLAUSE-1 residue named rather than
-guessed at, because the guess is what cost 105 `runs` cells during the build**
+**runs, prints `1` — CLOSED 2026-09-01: each SOURCE SHAPE now reads its OWN table (a call
+result the callee's `fRetRArrElem`, a field read the struct table's element pair, an indexed
+read the outer list's element slot) · zero `runs` lost and zero cells moved to silent ·
+`tests/cases/arrays/widen-source-row-per-shape.vl` · was check-clean invalid wasm, the
+deliberate bound of D791's `exprEmittedRefListSlot`, with no corpus cell reaching it**
 
 Repro (check rc 0, invalid module):
 
@@ -25514,6 +25516,21 @@ Repro (check rc 0, invalid module):
 * **CLOSING IT IS ONE ARM PER SOURCE SHAPE, NOT A WIDER GATE.** Each shape needs its own read of
   its own table, and each needs its own witness before it is added — the discipline that made
   the three shipped shapes safe.
+
+* **AND THAT IS EXACTLY HOW IT CLOSED, WITH THE PRICE RE-MEASURED RATHER THAN ASSUMED.** Three
+  arms, three tables, three witnesses. The reason each is sound is the same sentence in three
+  forms: the table read is the one the VALUE'S CELL was typed from, never the spelling. A
+  callee's return annotation is what the callee's own emit was typed from, so it cannot
+  disagree with itself; a field's element pair is what minted the field's storage slot; an
+  indexed read's row is whatever the outer backing was minted to hold.
+
+  The 105-cell figure above belongs to the SPELLING build and does not transfer —
+  re-measuring was the point. Measured on the branch: zero `runs` lost and zero cells moved
+  to silent, over the 255,504 census cells the distilled corpus stands for.
+
+* **THE FIXTURE READS A VALUE BACK, not just a length.** `const b: Shape[] = mk2()` then
+  `b[1]` narrowed to `Circle` prints `8`. A widening that produced the right length and the
+  wrong element rep passes a `.length` assertion and fails that one.
 
 ---
 
