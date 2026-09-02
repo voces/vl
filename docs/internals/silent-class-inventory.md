@@ -24351,7 +24351,42 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
 
 ### D988 — ONE hole-param function called with two different receiver shapes resolves per-FUNCTION, not per-call
 
-**loads then traps · clause 1 · the residue [D987](#d987)'s fix does not reach**
+**closed as `runs` · was loads-then-traps · clause 1 · was the residue [D987](#d987)'s fix did
+not reach · fixture `tests/cases/closures/closure-field-hole-param-per-call-instance.vl` ·
+EIGHTH attempt, and the first that did not touch the struct-row interner**
+
+* **THE INSTANCE KEY WAS BUILT FROM THE HALF THAT CANNOT TELL THEM APART — probed, in one
+  run.** A hole parameter pins the ARGUMENT's type NAME, and an object literal's name is the
+  synthetic ROW name `collectAnonShapes` minted. Dumping the pin columns at
+  `monoMakeInstance` prints `pinned=[#anon0 ; tyIx=51]` for `hole(s)` and
+  `pinned=[#anon0 ; tyIx=53]` for `hole(b)`: **the same NAME, two different arena TYPES**. The
+  key is `origFe + "#" + pinned.join(",")`, so the two calls collide onto one instance, one
+  `call_indirect` type is emitted, and whichever receiver the body did not resolve traps.
+
+* **SEVEN ATTEMPTS ASKED WHY THE ROWS COLLAPSE; THE ROWS ARE ALLOWED TO COLLAPSE.** Two
+  literals with the same field NAMES sharing a struct row is the design — the row is a LAYOUT
+  and both layouts are `(struct (field (mut (ref $closure))))`. What must not collapse is the
+  INSTANCE, and nothing about the row decides that. `monoAnonPinDiscrim` appends the pin's
+  RENDERED type (`tyToEmitName`) for an `#anon` pin and the module carries one `hole` per
+  shape. Zero fixtures move, rep-fuzz is clean, and the distilled corpus reports **0 classes**
+  moved in any direction — where the row-splitting candidates broke four fixtures and a
+  rep-fuzz cell every time.
+
+* **THE RENDER IS THE RIGHT GRAIN AND THE TYPE INDEX IS NOT.** Two literals of the same shape
+  carry distinct arena types, so keying on the index would mint an instance per call site. The
+  fixture's `same1`/`same2` pair is that control.
+
+* **THE ACCEPTANCE TEST THE ROW LEFT FOR THE NEXT ATTEMPT IS VACUOUSLY MET.** The blocker was a
+  new rep-fuzz trap at `p2r {[string]: () => {f: (() => i64) | null}}`, present under BOTH
+  discriminators tried. It was a price of splitting struct rows; this fix splits no rows, so
+  `scripts/rep-fuzz-check.sh` is green without the cell ever being materialised.
+
+* **THE READING TO KEEP: WHEN TWO THINGS THAT SHOULD DIFFER SHARE AN ANSWER, ASK WHAT THE KEY
+  IS MADE OF BEFORE ASKING WHY THE ANSWER IS COARSE.** Seven attempts went at the matcher that
+  produces `#anon0`, three of them at a predicate the witness never reaches. One dump of the
+  key's own INPUTS showed the discriminator was already sitting in the parallel column.
+
+Repro (prints `ok` then `7`; was `wasm trap: indirect call type mismatch` on the second call):
 
     const s = { f: () => "ok" }
     const b = { f: () => 7 }
@@ -24369,10 +24404,15 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   not build at all; between D976 and D987 it took whichever literal was DECLARED first; now it
   takes whichever ARGUMENT arrives first. One shape per function runs in every order.
 
-* **THE MONOMORPHISER DOES NOT SPLIT IT — checked, so nobody re-checks.** The emitted module
-  carries ONE `hole` (`(param $0 structref) (param $1 (ref $0))`) beside the two lambdas
-  (`(result (ref $3))` and `(result i32)`). Both receivers share a struct row, so one
-  `call_indirect` type is emitted for both and whichever receiver it did not pick traps.
+* **"THE MONOMORPHISER DOES NOT SPLIT IT — checked, so nobody re-checks" IS THE SENTENCE THAT
+  COST SIX ATTEMPTS, and every word of it was true.** The emitted module DID carry ONE `hole`
+  (`(param $0 structref) (param $1 (ref $0))`) beside the two lambdas (`(result (ref $3))` and
+  `(result i32)`), and both receivers DID share a struct row. What the observation does not
+  license is the inference the next six attempts drew from it — that the monomorphiser was
+  therefore not the place. It was; it was declining for a reason nobody had looked at, and the
+  reason was in a column the observation never read. **A measurement of an OUTPUT does not
+  license a conclusion about the INPUT that produced it** — the same discipline this file
+  states for `emitFail` probes, one pass over.
 
 * **TWO FIXES TRIED AND REVERTED, both following an existing pattern, neither moving the
   witness.** `adoptedFieldCompat` discriminates a NESTED STRUCT field (code 15) by name via
@@ -24448,9 +24488,11 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   differently. Settle THAT before narrowing the token further.
 
 * The real fix is per-CALL resolution: monomorphise the hole function per receiver shape, or
-  give the two shapes distinct struct rows so they cannot share a `call_indirect` type. The
-  row-splitting route is the one the code is shaped for, but only once the code question above
-  is answered.
+  give the two shapes distinct struct rows so they cannot share a `call_indirect` type. **It
+  was the FIRST of those two, and the sentence above named it correctly before six attempts
+  went at the second** — "the row-splitting route is the one the code is shaped for" was a
+  judgement about which edit looked closer to hand, and it outranked a route the same sentence
+  had already listed. Where two routes are named, price them both before ranking them.
 
 ### D987 — a module carrying BOTH a string-returning and a non-string closure field of the same layout
 
