@@ -15555,6 +15555,46 @@ export function blockTailIsValue(blockIx: i32, fnIx: i32) {
 // bare value expression rather than an explicit `return` — so it must be lowered via
 // `emitIfTail`. An `if` WITHOUT an `else` can fall through with no value, so it never
 // qualifies (the existing void-if path handles it). Recurses through `else if` chains.
+// True if the arm at `blockIx` is a BLOCK with no statements — the shape that has no tail to
+// give a value, and therefore no value for `emitIfTail` to place. A non-Block arm (an
+// `else if` chain) is never "empty" in this sense and answers false.
+export function blockTailIfHasEmptyArm(blockIx: i32): boolean {
+  const b = P.nodes[blockIx]
+  if b is Block {
+    const n = b.blkStmts.length
+    if n == 0 { return false }
+    const s = P.nodes[b.blkStmts[n - 1]]
+    if s is IfStmt {
+      if s.ifElse < 0 { return false }
+      if ifTailArmIsEmpty(s.ifThen) { return true }
+      if ifTailArmIsEmpty(s.ifElse) { return true }
+      const e = P.nodes[s.ifElse]
+      if e is IfStmt { return blockTailIfHasEmptyArmStmt(s.ifElse) }
+    }
+  }
+  false
+}
+
+// The `else if` hop of the walk above — the chain's own arms are the same question.
+function blockTailIfHasEmptyArmStmt(stmtIx: i32): boolean {
+  const s = P.nodes[stmtIx]
+  if s is IfStmt {
+    if s.ifElse < 0 { return false }
+    if ifTailArmIsEmpty(s.ifThen) { return true }
+    if ifTailArmIsEmpty(s.ifElse) { return true }
+    const e = P.nodes[s.ifElse]
+    if e is IfStmt { return blockTailIfHasEmptyArmStmt(s.ifElse) }
+  }
+  false
+}
+
+function ifTailArmIsEmpty(blockIx: i32): boolean {
+  if blockIx < 0 { return false }
+  const ab = P.nodes[blockIx]
+  if ab is Block { return ab.blkStmts.length == 0 }
+  false
+}
+
 function ifTailIsValue(stmtIx: i32, fnIx: i32) {
   const s = P.nodes[stmtIx]
   if s is IfStmt {
@@ -15565,6 +15605,20 @@ function ifTailIsValue(stmtIx: i32, fnIx: i32) {
     // (`function f(c) { if c then 5 }` → `i32 | null`) is handled separately at emit time
     // by `elseLessNullableTail` (gated on the FINAL nullable classification).
     if s.ifElse < 0 { return false }
+    // D1034 — AN EMPTY ARM DISQUALIFIES THE WHOLE `if`. This function answers "does ANY arm
+    // end in a bare value", which is the right question for choosing `emitIfTail` and the
+    // wrong one for the `fRetVoid` fixpoint it also feeds: `if c { } else { buf.push(1) }`
+    // has one arm whose tail is a value and one arm with NO tail at all, so the function was
+    // classified non-void and the empty arm was floored with a compiler-emitted
+    // `unreachable` — check rc 0, and a trap on whichever branch was taken.
+    //
+    // NOT WIDENED TO "EVERY ARM MUST BE A VALUE", which is the tempting form and is too
+    // strong: an arm ending in an explicit `return x` is not a bare tail value, and requiring
+    // both would reclassify a working `if c { return 1 } else { 2 }` as void. EMPTINESS is
+    // the measured ingredient — both non-empty arms run, and so does the else-less `if` —
+    // so emptiness is what this declines on.
+    if ifTailArmIsEmpty(s.ifThen) { return false }
+    if ifTailArmIsEmpty(s.ifElse) { return false }
     if blockTailIsValue(s.ifThen, fnIx) { return true }
     const els = P.nodes[s.ifElse]
     if els is Block { return blockTailIsValue(s.ifElse, fnIx) }

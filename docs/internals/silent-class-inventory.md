@@ -31616,7 +31616,10 @@ Repro:
 
 ### D1034 — an `if`/`else` with ONE EMPTY BRANCH inside a VOID function is check-clean and TRAPS on `unreachable`; either branch, either outcome, and both non-empty runs
 
-**loads then traps · check rc 0 · a compiler-emitted `unreachable` trap reported inside the void function · clause 1, and the worst outcome in the vocabulary: a trap is not an error a program can handle · found 2026-09-02 building `std/json.vl`, whose renderer was void and whose f64 arm was `if isFiniteF64(v) { } else { rendFail(…) }` · FIVE controls, every one of them RUNS**
+**runs, prints `0` — CLOSED 2026-09-02 by declining an EMPTY tail arm at BOTH gates that make
+a function non-void: `ifTailIsValue`, and the nullable-inference veto in `computeVoidFns` ·
+zero `runs` lost · `tests/cases/conditionals/if-else-empty-arm-void-fn.vl` · was a
+compiler-emitted `unreachable` trap on a check-clean program, clause 1**
 
 Repro:
 
@@ -31670,6 +31673,24 @@ Repro:
 
 ---
 
+* **TWO GATES HAD TO MOVE, AND FINDING ONLY THE FIRST LOOKS LIKE PROGRESS.** `ifTailIsValue`
+  asks "does ANY arm end in a bare value" — the right question for choosing `emitIfTail`, the
+  wrong one for the `fRetVoid` fixpoint it also feeds, since one arm had a value and the other
+  had no tail at all. Fixing that alone changed nothing: the CHECKER independently infers
+  `i32 | null` for the same shape (one arm's value, the other's absence) and
+  `inferRetBearsNull` kept the function non-void by itself. An arm written EMPTY is the author
+  saying there is no value here; the nullable inference was reading that absence as a null a
+  caller could receive.
+
+* **NOT WIDENED TO "EVERY ARM MUST BE A VALUE".** That is the tempting form and it is too
+  strong: an arm ending in an explicit `return x` is not a bare tail value, so requiring both
+  would reclassify the working `if c { return 1 } else { 2 }` as void. EMPTINESS is the
+  measured ingredient — both arms non-empty runs, the else-less `if` runs, the annotated
+  non-void spelling runs — so emptiness is what the decline keys on, and that control is in
+  the fixture for exactly that reason.
+
+* **THE `else if` CHAIN IS COVERED TOO**, walked arm by arm rather than only at the outermost
+  `if` — an empty first arm of a three-way chain was the same trap.
 
 ### D1035 — `is` admits a REFINEMENT of a union arm on its right-hand side and answers `false` unconditionally: `["xyz"] is string[]` over a `Json` is check-clean, runs, and prints `false`, while the struct spelling `r is { users: string[] }` is refused as "not a variant"
 
