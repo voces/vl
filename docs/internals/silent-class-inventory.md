@@ -30687,7 +30687,11 @@ scalar-list arm and never the rest.
 ---
 ### D1021 — a RECURSIVE union alias composed into a wider union is check-clean invalid wasm: `Json | JsonError` returns the error struct where the composed box is expected
 
-**check-clean invalid wasm · check rc 0 · `type mismatch: expected (ref $type), found (ref $type)` in the returning function (binaryen: `return value should be a subtype of the function result type` on the `struct.new` of the error) · ZERO corpus cells (no recursive-alias axis) · reproduces on master · found 2026-09-01 measuring the `std:json` v1 surface (`docs/json-design.md`): the fs-shaped `T | Error` return with `T` the JSON value tree · probe `scripts/capability-probes/recursive-union-alias-composed.vl` · one ingredient, ablated: the alias's RECURSION**
+**runs, prints `false` — CLOSED 2026-09-01 by rendering a recursive alias's self-reference
+as its own ALIAS NAME instead of letting `tyToEmitName`'s cycle guard answer `""` (four of
+five spellings; the NAMED composition is a separate residue, below) · zero `runs` lost ·
+probe `recursive-union-alias-composed.vl` now RUNS ·
+`tests/cases/unions/recursive-alias-composed-into-union.vl` · was check-clean invalid wasm**
 
 Repro:
 
@@ -30758,8 +30762,24 @@ alias INSIDE another union that has no rep.
      `Json` box. Coherent, ABI-safe, and a double box — a rep decision with a size and a
      `==` story, not something to land inside a defect fix.
 
-  Both are the owner's call. The measurement above is what the decision needs and is what this
-  update adds.
+  Route (1) was built. **The blocker was never the ABI re-tagging** the second bullet feared:
+  `unionAliasMembers` already flattens a union-alias member into the outer union — which is
+  exactly why the non-recursive twin ran — and for a recursive alias it asked `tyToEmitName`,
+  whose cycle guard hit `Json` inside `Json[]`, answered `""`, and took the whole render down
+  with it. With no members the composition never registered, `is` found no arm, and the
+  return had nowhere to box.
+
+  **`Json` IS A PERFECTLY GOOD NAME FOR ITS OWN SELF-REFERENCE.** The emitter already handles
+  `Json[]` and `{[string]: Json}` — the value tree runs at 51 of 60 positions — so the fix is
+  to render a revisit as the alias name. Four of the five spellings close: the struct return,
+  the literal arm, the `is E` narrow and the binding, plus both single-arm recursion faces
+  (`f64 | K[]` and `f64 | {[string]: K}`) with `null` out of the picture entirely.
+
+* **THE NAMED COMPOSITION IS A SEPARATE RESIDUE, and it is not this mechanism.** `type JR =
+  Json | E` used as a return type is still invalid wasm. Naming ANY revisited declared alias
+  rather than only the outermost — a reverse lookup over `cUserTypes` on the cycle hit — was
+  built and measured and does not move it, so the second alias hop fails somewhere else.
+  Worth starting there rather than re-deriving the cycle-guard story.
 
 * **THE LITERAL-ARM MESSAGE WAS READ AS THE MECHANISM, AND IT IS NOT — the `string` in it is
   the LITERAL.** `Json | "err"` is reported as `Json|string` and that was read as "the alias kept
