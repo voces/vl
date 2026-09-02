@@ -29316,7 +29316,12 @@ Repro (now runs, printing `other`):
 
 ### D943 — a generic struct holding BOTH a T field and a closure capturing the T value: the second ref instantiation emits invalid wasm
 
-**check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` in `mk$1` · needs all three ingredients, ablated: drop the `actual: T` field and it runs; drop the closure and it runs (that is D942's shape); drop the FIRST (i32) instantiation and the string instance alone runs · reproduces on the pre-#2081 compiler (there the invalid function is the lambda itself), STANDING · found 2026-08-31 probing a LAZY rendering closure for `std:test` v2 — the eager receipt is what shipped instead**
+**runs, prints `o` then `s` — CLOSED 2026-09-01 by three changes, only the first of which
+this row pointed at: the clone gate now counts CAPTURES as part of a lambda's signature,
+`monoPinBodyLambdas` grew an `ObjLit` arm, and a clone's `fnParent` is re-pointed at the
+instance once it is lifted · zero `runs` lost, mono-tyaram-grid and the fixpoint green ·
+`tests/cases/generics/generic-struct-t-field-and-capturing-closure.vl` · was check-clean
+invalid wasm, `type mismatch: expected i32, found (ref $type)` in `mk$1`**
 
 Repro (check-clean invalid wasm):
 
@@ -29345,6 +29350,40 @@ Repro (check-clean invalid wasm):
 * The second instance (`mk$1`, `T = string`) carries the first instance's scalar layout into
   the closure's environment — the same instance-collision family as D941/D942, reached
   through the capture instead of a call or a field read.
+
+* **THE DISASSEMBLY NAMED IT IN ONE LINE.** Both `mk` instances built their env with
+  `struct.new $10`, and `$10` is `(struct (field i32))` — minted from the first
+  instantiation. The `T := string` instance stored a string ref into that i32 field. One
+  lifted slot means one env struct, because `fnEnvIdx` is parallel to `fnStmts`.
+
+* **THREE THINGS WERE MISSING, AND TWO OF THEM LOOK LIKE PROGRESS WHILE CHANGING NOTHING.**
+
+  1. **The clone gate read the WRITTEN signature, not the captures.** `monoLamNodeIsTemplate`
+     asks whether a parameter or the return still names a type parameter; `show: () => string`
+     names none and only CAPTURES a `T`. A capture is part of a lambda's effective signature,
+     so a capturing lambda inside a generic frame is a template. Asked as "does it capture at
+     all" rather than "does a capture mention `T`" — the captures are recorded by NAME, and
+     being broad is safe in the direction that matters: an extra clone is a correct clone.
+
+  2. **The walker never reached this lambda.** `monoPinBodyLambdas` documented its own bound —
+     "only a `LetDecl` INITIALIZER is rewritten" — and this lambda is a FIELD VALUE in an
+     object literal returned from the generic. That is precisely the shape a generic BUILDER
+     has, so the stated bound excluded the main case rather than an edge of it.
+
+  3. **The clone inherited the TEMPLATE's frame.** `fnParent` cannot be set at clone time: the
+     instance's `FuncDecl` does not exist yet, because its body is what the walk is producing.
+     So the clone pointed at the template, `captureValKind` resolved `value` to `value: T`
+     there, and both instances minted the same layout — a clone that existed and bought
+     nothing. The minted slots are recorded and re-pointed at the instance when it is lifted.
+
+  Fixes 1 and 2 each produce a build that compiles, mints a second env struct, and prints the
+  identical error; only the third makes the layouts differ. Worth knowing before the next
+  instance-collision row, because "the clone now happens" is not the same as "the clone is
+  typed at the instance".
+
+* **THE `T` FIELD IS PINNED ALONGSIDE.** The fixture reads `b.actual` and `b2.actual` back at
+  both instantiations — the env fix must not cost the struct field its own per-instance
+  layout, which is the other half of the same collision family.
 
 ### D944 — [CLOSED 2026-09-01] widening a generic T into a union refuses for EVERY array T, and the refusal's sentence describes a different arm
 

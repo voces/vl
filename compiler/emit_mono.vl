@@ -282,6 +282,13 @@ import {
 // see the returns, so every single-return instance keeps today's mint byte for byte.
 import { collectValuedReturnsIn } from "./emit_query"
 
+// D943 — THE LIFTED SLOTS `monoPinBodyLambdas` MINTED FOR THE INSTANCE BEING BUILT. A clone's
+// `fnParent` cannot be set at clone time: the instance's own `FuncDecl` does not exist yet
+// (its body is what the walk is producing), so the clone inherits the TEMPLATE's parent and
+// its captures then type against `value: T` — one env layout for every instance, which is
+// the whole defect. Recorded here and re-pointed the moment the instance is lifted.
+let monoLamMintedSlots: i32[] = []
+
 function monoArgFnTypeName(argIx: i32, _fnIx: i32) {
   const ax = unwrapParen(argIx)
   const an = P.nodes[ax]
@@ -1888,7 +1895,24 @@ function monoCloneLambdaSubst(
       monoNoteLamNode(monoLamShared, fnIx)
       return -1
     }
+    // D943 — `any` ASKS WHETHER A SIGNATURE CHANGED, and a capture-only template changes
+    // none. The clone still has to happen: its purpose here is a fresh LIFTED SLOT, because
+    // `fnEnvIdx` is parallel to `fnStmts` and one slot means one env struct for every
+    // instance. `() => string` capturing a `T` substitutes nothing and needs its own env at
+    // each `T`.
+    let capOnly = false
     if !any {
+      let feC = 0 - 1
+      let kc = 0
+      while kc < fnStmts.length {
+        if fnStmts[kc] == fnIx { feC = kc }
+        kc = kc + 1
+      }
+      if feC >= 0 {
+        if captureCountOf(feC) > 0 { capOnly = true }
+      }
+    }
+    if !any && !capOnly {
       monoNoteLamNode(monoLamShared, fnIx)
       return -1
     }
@@ -1933,6 +1957,7 @@ function monoCloneLambdaSubst(
     // `.map` callback is rebuilt from an ARGUMENT position, not from a lifted slot that has
     // a frame of its own.)
     fnParent.push(monoLamParentOf(fnIx))
+    monoLamMintedSlots.push(fnStmts.length - 1)
     fnDispNames.push("")
     fnValUsed = true
     monoNoteLamNode(monoLamPinned, fnIx)
@@ -1994,6 +2019,46 @@ function monoPinBodyLambdas(
     const ca = monoPinBodyLambdas(n.retArg, typarams, tvN, tvV, bN, bT)
     if ca == n.retArg { return ix }
     return mkReturn(ca, n.pos)
+  }
+  // D943 — AN OBJECT LITERAL'S FIELD VALUE IS A POSITION A LAMBDA IS WRITTEN IN, and the
+  // bound above ("only a `LetDecl` INITIALIZER is rewritten") left it out. `return { actual:
+  // value, show: () => … }` is the shape a generic BUILDER has — a struct carrying both the
+  // `T` value and a closure over it — and its lambda was never reached, so every instance
+  // shared one lifted slot and therefore one env struct. Recurses as well as rewriting, so a
+  // lambda nested deeper inside the literal is reached too.
+  if n is ObjLit {
+    const fs: i32[] = []
+    let fchanged = false
+    let fi = 0
+    while fi < n.objFields.length {
+      const fnode = P.nodes[n.objFields[fi]]
+      let outF = n.objFields[fi]
+      if fnode is FieldInit {
+        const fv = P.nodes[fnode.fiValue]
+        let nv = fnode.fiValue
+        if fv is FuncDecl {
+          const fcl = monoCloneLambdaSubst(
+            fnode.fiValue,
+            typarams,
+            tvN,
+            tvV,
+            bN,
+            bT,
+          )
+          if fcl >= 0 { nv = fcl }
+        } else {
+          nv = monoPinBodyLambdas(fnode.fiValue, typarams, tvN, tvV, bN, bT)
+        }
+        if nv != fnode.fiValue {
+          outF = mkFieldInit(fnode.fiName, nv, fnode.pos)
+          fchanged = true
+        }
+      }
+      fs.push(outF)
+      fi = fi + 1
+    }
+    if !fchanged { return ix }
+    return mkObjLit(fs, n.pos)
   }
   if n is WhileStmt {
     const cb = monoPinBodyLambdas(n.whileBody, typarams, tvN, tvV, bN, bT)
@@ -2082,6 +2147,31 @@ function monoLamNodeIsTemplate(fnIx: i32, typarams: string[]) {
     if fn.fnRet >= 0 {
       const rann = monoDeclAnnName(fn.fnRet, tyNameOf(fn.fnRet), typarams)
       if monoAnnHasTyParam(rann, typarams) { return true }
+    }
+    // D943 — A CAPTURE IS PART OF A LAMBDA'S EFFECTIVE SIGNATURE, and the two checks above
+    // only read the WRITTEN one. `show: () => string` inside `mk<T>` takes no parameter and
+    // returns a concrete type, so it was shared across instances — while it CAPTURES
+    // `value: T`. One lifted slot means ONE env struct (`fnEnvIdx` is parallel to
+    // `fnStmts`), so the first instantiation's layout is the only one there is: at `T :=
+    // i32` the env is minted `(struct (field i32))` and the `T := string` instance then
+    // emits `struct.new` of a string ref into that i32 field — `expected i32, found (ref
+    // $type)`, check-clean invalid wasm, visible in the disassembly as both `mk` instances
+    // building `struct.new $10`.
+    //
+    // ASKED AS "DOES IT CAPTURE AT ALL", not "does a capture mention `T`". The captures are
+    // recorded by NAME (`capNamesFlat`), so deciding the precise question means resolving
+    // each name back through the enclosing generic's scope — and being broad here is SAFE in
+    // the direction that matters: an extra clone is a correct clone, only larger. Measured
+    // rather than assumed: zero `runs` lost and zero cells moved to silent over the
+    // distilled corpus, and the self-host fixpoint holds.
+    let feIx = 0 - 1
+    let k = 0
+    while k < fnStmts.length {
+      if fnStmts[k] == fnIx { feIx = k }
+      k = k + 1
+    }
+    if feIx >= 0 {
+      if captureCountOf(feIx) > 0 { return true }
     }
   }
   false
@@ -3910,6 +4000,7 @@ function monoMakeInstance(
     // lambda and exactly wrong for one whose parameters are written at `T`, since `collectFns`
     // has already lifted it and the one lifted function then served every instance at the
     // unsubstituted type. Copy-on-write: a body with no such lambda is the same node index.
+    monoLamMintedSlots = []
     const instBody0L = monoPinBodyLambdas(
       instBody0,
       fn.fnTyParams,
@@ -4026,6 +4117,16 @@ function monoMakeInstance(
       fnParent.push(-1)
       fnDispNames.push("")
       instFe = fnStmts.length - 1
+      // D943 — the clones' frame is THIS instance, not the template. `captureValKind` types
+      // an env field by resolving the capture in its enclosing frame, so until this runs the
+      // clone reads `value: T` and every instance mints the same env layout.
+      let mls = 0
+      while mls < monoLamMintedSlots.length {
+        const msl = monoLamMintedSlots[mls]
+        if msl >= 0 && msl < fnParent.length { fnParent[msl] = instFe }
+        mls = mls + 1
+      }
+      monoLamMintedSlots = []
       const cal2 = P.nodes[calleeIx]
       // R4 writer 6 of 8 (`compiler/symbols.vl`).
       if cal2 is Ident {
