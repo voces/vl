@@ -235,9 +235,10 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   form (struct, union/literal union, recursive, generic alias, nominal `new`) is admitted in a
   body, scoped to the block, shadowing outer names, and free to name the enclosing function's
   type parameters — substituted per instance as D426 does for lambdas; the NAMED-function
-  spelling of that substitution still refuses at emit (D1046) and closes with this. Sub-rulings
-  standing as vl-b7's recommendation: a local NOMINAL type may not escape through an inferred
-  return type (checker refuses); a structural one escapes as its shape. **Two steps:**
+  spelling of that substitution still refuses at emit (D1046) and closes with this. Sub-rulings:
+  a local NOMINAL type may not escape through an inferred return type — checker ERROR at the
+  return (owner, 2026-09-02); a structural one escapes as its shape (vl-b7's recommendation,
+  standing). **Two steps:**
   (1) **SHIPPED 2026-09-02 (#2369)** — the interim: the checker refuses the DECLARATION at its
   own line with one message naming the rule, on all three spellings, on every declaration form
   the parser admits in a body, and in the lambda and nested-named-function positions; nothing
@@ -245,15 +246,26 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   DECISIONS.md §"A `type` declared in a function body is legal and lexically scoped".
   Compiler-side.
 - **Assertion failures locate at the MATCHER, not `expect` — RULED (owner, 2026-09-02),
-  BLOCKED on D1044.** Each `std:test` matcher (`toEqual`/`toBeTrue`/`toBeFalse`, `not`'s
+  UNBLOCKED, NOT BUILT.** Each `std:test` matcher (`toEqual`/`toBeTrue`/`toBeFalse`, `not`'s
   continuation) takes `caller: CallerLoc = __callsite__` and the receipt stops carrying
   `expect`'s. On today's grammar only the column moves (the method token, measured col 14);
-  the line moves the day a leading-dot continuation line parses — a grammar question not yet
-  put to the owner. Blocked: a UFCS call that omits a defaulted tail argument is refused `no
-  field … on …` in every module build that merges a `self`-function module, so `.toEqual(y)`
-  cannot take the default until D1044 lands (eight-row ablation in its row). std change →
-  `std-api-reviewer`; header + DECISIONS "`expect` only" paragraph updated with it. std-side
-  after a compiler fix.
+  the line moves once the leading-dot continuation below is built. Was blocked on D1044 (a
+  UFCS call omitting a defaulted tail argument refused `no field … on …` in every build
+  merging a `self`-function module) — closed by #2371 the same day. Graded on: one-line
+  spelling → col 14; `not.toEqual` → the final matcher; multi-line spelling → the `.toEqual`
+  LINE (once the grammar lands). std change → `std-api-reviewer`; header + DECISIONS "`expect`
+  only" paragraph updated with it; `testDiscovery.ts` untouched. std-side.
+- **A leading `.` / `?.` on a new line continues the postfix chain — RULED (owner,
+  2026-09-02), NOT BUILT.** Today every such program is a parse error, so the rule changes no
+  existing program's meaning. `(` and `[` do NOT continue (legal statement starts); trailing-
+  dot stays refused (one form only); comment lines between links are free. **The formatter is
+  the real half**: `format.vl` prints chains inline, so without a fit-or-break chain layout
+  `fmt --check` re-joins the lines and the form is unusable in-repo. Build = `parsePostfix`
+  peeking past NEWLINEs for DOT/QUESTION_DOT, the fmt chain layout (fits → inline; else one
+  link per line, one indent), fixtures for 2/3+ links, comment between links, `?.`, `(`/`[`
+  lines still parsing as statements, fmt round-trip of a fitting and a breaking chain. LSP
+  untouched. DECISIONS.md §"A leading `.` on a new line continues the chain". Compiler-side
+  (parser + formatter).
 - **Colored `print`** — ruled in principle 2026-09-01 with one hard constraint (ANSI must
   never leak into pipes/files/copies): Node's split — bare strings always raw, rendered
   values colored, escapes emitted only by the TTY-detected sink, `NO_COLOR`/`--color`

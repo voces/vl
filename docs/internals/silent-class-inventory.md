@@ -34296,3 +34296,199 @@ Repro (should print `1` then `6`):
 
 * Probe: `scripts/capability-probes/loop-var-shadowing-fn-name-capture.vl`.
 
+### D1070 — a struct CALLABLE FIELD and a same-named module-scope `self`-function disagree about which one `a.toString()` calls, and the answer depends on the SCOPE of the receiver: at module top level the field wins (as ruled), inside ANY function body the emitter picks UFCS while the checker picks the field — check-clean invalid wasm
+
+**check-clean invalid wasm · clause 1 · OPEN · found 2026-09-02 by the owner in a `std:test`
+body ("this doesn't run") · pre-existing on `seed-latest` and on a fresh 60df1e87 seed alike ·
+DECISIONS line ~1127 already rules "field first, then a UFCS free function", and neither scope's
+answer is derived from that rule**
+
+Repro (the owner's program, minus the `std:test` import — which the ablation says is scenery):
+
+    function toString(self: {foo: string}) { self.foo }
+    function f() {
+      const a = { toString: () => "ok" }
+      print(a.toString())
+    }
+    f()
+
+`Invalid input WebAssembly code … type mismatch: expected (ref $type), found (ref $type)` in
+`f`. Disassembled (`wasm-dis`): `f` does `struct.new $1` (the `{toString: …}` literal) and
+then `call $0` with `local.get $1` — a call to the FREE function `toString`, whose parameter
+is `(ref $0)`, the `{foo: string}` shape. The emitter resolved `a.toString()` as UFCS
+`toString(a)`; the checker typed it as the callable field, so the argument's rep never matched.
+
+* **FOURTEEN CELLS, ONE INGREDIENT — the receiver is a LOCAL binding.** Every row `vl check`
+  rc 0.
+
+  | change | outcome |
+  | --- | --- |
+  | the witness (receiver bound inside a plain function) | **check-clean invalid wasm** |
+  | receiver bound inside an arrow lambda (the owner's `it(…, () => {…})`) | **check-clean invalid wasm** |
+  | receiver bound inside a NESTED named function | **check-clean invalid wasm** |
+  | self-fn spelled with an explicit `return self.foo` | **check-clean invalid wasm** |
+  | self-fn takes a second parameter (`self, n: i32`) | **check-clean invalid wasm** |
+  | field and self-fn renamed together to `shout` | **check-clean invalid wasm** |
+  | receiver bound at MODULE TOP LEVEL, same self-fn | runs, prints `ok` |
+  | receiver bound at top level, USED inside the lambda (captured) | runs, prints `ok` |
+  | no module-scope self-fn at all | runs |
+  | self-fn imported from `std:fmt` instead of declared locally | runs |
+  | `std:test`'s `it` replaced by a local `it` | same outcome as with the import (scenery) |
+
+  So: the name, the import, the lambda and `std:test` are all scenery. The defect needs (1) a
+  module-scope `self`-function, (2) a struct literal with a callable field of the SAME name,
+  (3) the receiver bound in a FUNCTION BODY rather than at top level.
+
+* **AND WHEN BOTH RESOLUTIONS ARE VALID, THE TWO SCOPES GIVE DIFFERENT ANSWERS.** Make the
+  self-function ADMIT the receiver — `function toString(self: {toString: () => string}) {
+  return "UFCS" }` beside `const a = { toString: () => "field" }` — and nothing is invalid any
+  more: the top-level spelling prints `field`, the function-body spelling prints `UFCS`. That
+  is the row's headline. Line ~1127 rules field-first; the top level obeys it and the body
+  does not, which means the body is not consulting the rule at all — it is reaching a
+  different resolver (the one `ufcsAliasOf` / the merge's `modSelfFnTarget` feed), and that
+  resolver checks the self-function BEFORE the receiver's fields.
+
+* **THE FIX IS ONE RESOLVER, NOT A PATCH ON THE BODY PATH.** Whatever the emitter uses to
+  decide a local receiver's `.prop(args)` has to ask the receiver's struct shape for a
+  callable field FIRST — the same order the checker and the top-level path already use — and
+  fall through to UFCS only when there is none. Graded on: the witness printing `ok`; the
+  admits-both spelling printing `field` in BOTH scopes; the owner's original `std:test` program
+  passing; and the UFCS-only spelling (no such field) still reaching the free function, at top
+  level and in a body.
+
+### D1120 — two MERGED modules whose `self`-functions share a NAME collide in the merge's UFCS alias registry, and the ENTRY's member-call is refused `no field 'area' on Box` whenever a dependency uses the other module's function first; the direct spelling runs
+
+**loud check reject · check rc 1 · OPEN · found 2026-09-02 while ablating [D1044](#d1044) — the
+name-collision cell D1044's fixture could not spell in one file · clause 2 (the program is
+legal by every rule: two modules may each export a `self`-function called `area`, and the
+entry imports only ONE of them)**
+
+Repro (four modules; `// file:` sections, the last is the entry):
+
+    // file: a.vl
+    export type Box = { v: i32 }
+    export function box(v: i32): Box { return { v: v } }
+    export function area(self: Box): i32 { return self.v * 2 }
+    // file: b.vl
+    export type Sq = { s: i32 }
+    export function sq(s: i32): Sq { return { s: s } }
+    export function area(self: Sq): i32 { return self.s * self.s }
+    // file: c.vl
+    import { sq, area } from "./b"
+    export function nine(): i32 { return sq(3).area() }
+    // file: main.vl
+    import { box, area } from "./a"
+    import { nine } from "./c"
+    print(box(5).area())
+    print(nine())
+
+`no field 'area' on Box` at `main.vl:3:14`. Expected `10`, `9`.
+
+* **THE ENTRY IMPORTS `area` FROM `a` ONLY, AND STILL GETS `b`'s.** `c.vl` never reaches the
+  entry's scope — it uses `b`'s `area` internally. The mirror orientation (entry imports `b`'s
+  `area`, a dependency uses `a`'s) is refused `no field 'area' on Sq`: the DEPENDENCY wins in
+  both, and the entry's own import order does not matter.
+
+* **CONTROLS, both RUN and print `10`, `9`.** (1) `c.vl` stops using `area` (`sq(3).s * 3`).
+  (2) The entry spells the call directly, `area(box(5))` — the direct spelling resolves through
+  the rename map and never touches the alias registry. And an entry-DEFINED `area` beside a
+  merged module's does not collide either — a user `toEqual` beside `std:test`'s runs — so this
+  is specifically two MERGED modules' self-functions.
+
+* **THE WRONG DIAGNOSIS ON A DOUBLE IMPORT.** `import { area } from "./a"` AND `import { area }
+  from "./b"` in the entry is refused `no field 'area' on Sq` — the same collision message —
+  where the checker owes a duplicate-import error at the second `import` line.
+
+* **MECHANISM (read, then measured by the orientation pair).** `ast.vl`'s alias registry is a
+  pair of parallel arrays `ufcsAliasFrom` / `ufcsAliasTo`; `ufcsAliasAdd(plain, mangled)`
+  happily holds BOTH `area → area$mA` and `area → area$mB` (it dedupes only identical pairs),
+  and `ufcsAliasOf(name)` returns the FIRST row for a plain name. `driver.vl`'s rewrite walk
+  (`modSelfFnTarget` at each member call, ~line 3798) visits modules in dependency order, so
+  the dependency's call site registers its row first and the entry's `.area()` is answered
+  with the other module's mangled name; the checker's `ufcsCallTy` then finds `area$mB`'s
+  `self: Sq` does not admit a `Box` and reports the receiver has no such field — a message
+  about a field that is really a wrong-alias lookup.
+
+* **FIX SHAPE.** The alias is a property of the CALL SITE, not of the plain name: the walk at
+  driver.vl:3798 already holds both the node and its resolved target, so record the alias per
+  node (or per `(plain, module)`) and have the three consumers (`typecheck.vl` ×2,
+  `emit_rewrite.vl`) look up by the site. A registry that can hold two rows for one key and
+  answers with the first is the in-band-sentinel shape one level up. Graded on: the witness
+  and its mirror printing `10`, `9`; a THREE-module chain (`a`, `b`, `c` each exporting
+  `area`, the entry using all three on their own receivers) running; the double-import spelling
+  refused at the second `import` with a duplicate-import message; and `std:test` files with a
+  user-defined `toEqual` still running.
+
+### D1121 — a `type` alias that NOTHING REFERENCES changes the REP of an unrelated function's return: an inline `Kind | "err"` reps its values as STRINGS (string-eq calls), the declared alias `type R = Kind | "err"` as ATOMS (`i32.eq`), and adding the unused alias flips the inline spelling — two producers of one type, agreeing about every answer measured
+
+**runs today and must keep running · not a clause-1 or clause-2 violation yet — no observable
+disagreement in seven probes — filed as the two-producer residue of [D1043](#d1043)'s close,
+visible ONLY in the disassembly · found 2026-09-02 by vl-07 and measured by vl-b7 on a fresh
+60df1e87 seed**
+
+Repro (D1043's own witness, which now runs and prints `a`, `b`, `e`; graded as a pin — the
+name-channel unification this row asks for must keep it running):
+
+    type Kind = "a" | "b"
+    function pick(n: i32): Kind | "err" {
+      if n == 0 { return "a" }
+      if n == 1 { return "b" }
+      "err"
+    }
+    let i = 0
+    while i < 3 {
+      const r = pick(i)
+      if r is "a" {
+        print("a")
+      } else {
+        if r is "b" { print("b") } else { print("e") }
+      }
+      i = i + 1
+    }
+
+* **WHAT THE DISASSEMBLY SAYS.** `wasm-dis` of the witness: `pick` is `(func (param i32)
+  (result (ref $3)))` where `$3` is the STRING struct, its arms are `global.get` of interned
+  strings, and each `is` is a `call` to string equality. Replace the annotation with `type R =
+  Kind | "err"` / `function pick(n: i32): R` and `pick` becomes `(func (param i32) (result
+  i32))`, the arms `i32.const 0/1/2`, and each `is` an `i32.eq`. Same program, same output,
+  7 bytes apart, and one of them allocates nothing.
+
+* **DEAD CODE DECIDES THE REP — the cell to lead with.** Keep `pick` annotated INLINE and
+  add `type R = Kind | "err"` that nothing references: `pick` now returns `i32`. Three
+  modules on 60df1e87 (vl-07 reproduced it independently):
+
+  | program | `pick`'s result |
+  | --- | --- |
+  | inline `Kind \| "err"` | `(ref $3)` — string struct, `call` string-eq |
+  | inline `Kind \| "err"` + an UNUSED `type R = Kind \| "err"` | `i32` — `i32.eq` |
+  | declared `type R = Kind \| "err"` | `i32` — `i32.eq` |
+
+  So a user who deletes an unused alias during a cleanup changes an unrelated function's
+  comparisons from integer equality to string equality, and nothing tells them, because
+  nothing breaks. The inline spelling's rep is decided by whether a NAME for the union exists
+  in the program — the name channel (`registerInlineUnion` classifying the inline shape) and
+  the arena (which has said "flat litunion" since D1043) are two producers, and the inline
+  shape only gets the arena's answer when a declaration happens to be around to canonicalise
+  through.
+
+* **NOT THE UNREFERENCED BOX TYPE.** The first reading of this residue was "the inline module
+  declares a union-box heap type nothing references". Measured: `(type $0 (struct (field i32)
+  (field anyref)))` is declared, unreferenced, in BOTH spellings — and in `type Kind = "a" |
+  "b"; const k: Kind = "a"; print(k)`, which has no union at all. It is what any litunion or
+  nullable program declares; it does not separate the spellings. The RESULT TYPE does.
+
+* **SEVEN PROBES, ALL RUN, ALL PRINT THE RIGHT THING — the population this "no observable
+  disagreement" is about.** `r == k` against a `Kind` binding (`true`, `false`); a struct field
+  typed inline holding a `pick()` and a `Kind`; a `(Kind | "err")[]` literal mixing both;
+  reassigning an inline-typed `let` from a `Kind`-returning function; narrowing `r` out of
+  `"err"` and passing it to a `Kind` parameter; and the two cross-boundary spellings (inline
+  producer → declared consumer, and the reverse). The conversions at every `Kind` boundary
+  are in place; what is missing is one answer to "what is the rep of `Kind | "err"`".
+
+* **WHY IT IS A ROW AND NOT A NOTE.** Two producers agreeing about the type and disagreeing
+  about the rep is the exact shape of [D1048](#d1048), [D1093](#d1093) and [D1094](#d1094),
+  each of which was silent-wrong or invalid wasm at the delivery position nobody had probed.
+  Graded, when the name channel is unified onto the arena's answer: this witness still prints
+  `a`, `b`, `e`; `pick` returns `i32` at BOTH spellings with no alias declared; adding an
+  UNUSED alias changes nothing in the disassembly; and the seven probes above still print what
+  they print today.
