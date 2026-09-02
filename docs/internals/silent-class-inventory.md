@@ -30190,11 +30190,24 @@ Repro (loud emit reject):
   variable, so no static path reaches it, and the two values needing comparison are on the
   stack rather than at the end of a path.
 
-* So closing this needs a VALUE-based struct compare — two struct refs, already materialised —
-  which does not exist today: every entry point here (`emitStructEq`, `…Rec`, `…Field`,
-  `…FieldInner`) is rooted in a binary expression. Build that first and code 5 becomes the
-  code-4 loop skeleton verbatim (length guard, index scratch, early-exit block) with the
-  element compare swapped in.
+* **CORRECTION — THE VALUE-BASED COMPARE ALREADY EXISTS, so this is wiring, not architecture.**
+  The paragraph this replaces said it did not. `emitChainRead` accepts ROOT SENTINELS `-2` and
+  `-3`, which read from the `eqStashL` / `eqStashR` locals instead of re-emitting an
+  expression — and its own failure text is `struct-element compare with no stashed root`.
+  `emitEqGStructElem` already uses them: it loads element `i` from each side, stashes the two
+  refs, and calls `emitStructEqRec(body, -2, -3, row, …)`. That is why `L[] == L[]` runs at
+  top level.
+
+  So code 5's arm does not need a new comparison. It needs to feed the EXISTING one: read the
+  field's two list refs with `emitChainRead` from each root, land them in the base locals
+  `leqgBaseOfRep(kind, slot)` expects, and call `emitListEqGCore`, whose struct-element class
+  already routes to `emitEqGStructElem`. The open question is where the frame comes from — the
+  core refuses with `list compare frame was not reserved for this rep` when it was not
+  reserved, and a FIELD's list has no rep slot the way a binding does.
+
+  **Grade any attempt on a VALUE TABLE, not a compile** — equal lists true, differing element
+  false, differing length false — because D989's near-miss on this same `==` ladder compiled
+  cleanly while printing `1 == 2` as true.
 
 * Ablation confirmed here: `L[] == L[]` runs, `{kids: i32[]}` runs, `{kids: L[]}` refuses. The
   list comparison and the struct comparison each work alone; only their composition at FIELD
