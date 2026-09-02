@@ -166,6 +166,7 @@ import {
   tyIsNewtypeBrand,
   tyIsNullableLitUnion,
   tyIsU8ArrayTy,
+  tyLitSetMemberLexes,
   tyLitUnionAliasIx,
   tyNestedArrLeafRenders,
   tySame,
@@ -493,8 +494,10 @@ import {
   uFieldElemKeyI32,
   uFieldElemName,
   uFieldElemTyIx,
+  uFieldLitTyIx,
   uFieldNames,
   uFieldStart,
+  uFieldTyText,
   uFieldTypes,
   uVarHeap,
   uVarSTwin,
@@ -25607,6 +25610,14 @@ export function repVariantSlotsTwin(a: i32, b: i32): i32 {
   if a == b { return 1 }
   if a < 0 || b < 0 { return 0 }
   if a >= uVariants.length || b >= uVariants.length { return 0 }
+  // D1023's rung, ahead of the canon-key gate for the reason `buildVariantTwins` states:
+  // the key preserves each arm's literal set, so two arms the tag already merged key apart.
+  // This is the PAIRWISE form and must answer exactly as that builder does — the `$fnsig`
+  // producers render `repVariantSlotRep` off it before `uVarTwin` is filled, and two
+  // structurally identical functypes at two rec-group indices are DISTINCT types.
+  if variantSig(a) == variantSig(b) && variantLitDiscriminable(a, b) {
+    return 1
+  }
   const ka = repNameCanonId(uVariants[a])
   if ka < 0 { return 0 }
   if ka != repNameCanonId(uVariants[b]) { return 0 }
@@ -25688,6 +25699,23 @@ export function buildVariantTwins() {
           j = i // stop at the first (smallest) twin
         }
         j = j + 1
+      }
+    }
+    // D1023's arms fold here too, and the canon key is why they need their own rung: it
+    // preserves each arm's literal SET, so `{kind: "circle", r: f64}` and
+    // `{kind: "square", r: f64}` key differently and miss the guard above — while
+    // `assignTags` has already ranked them ONE tag, because tags key on the field-NAME
+    // signature and that is identical. A shared tag with two heap types is not a
+    // representation: the box is built under whichever row matched the field names first, so
+    // the other arm's `ref.cast` traps. Fold them onto the smallest row instead.
+    if rep == i {
+      let d = 0
+      while d < i {
+        if variantSig(d) == variantSig(i) && variantLitDiscriminable(d, i) {
+          rep = d
+          d = i // the smallest such row, matching the guard above
+        }
+        d = d + 1
       }
     }
     uVarTwin.push(rep)
@@ -25860,6 +25888,194 @@ export function variantSig(vi: i32) {
     j = j + 1
   }
   out
+}
+
+// ── D1023: the discriminant column's three queries ────────────────────────────────────
+// `is A` over two struct arms that share a field-NAME set is a DISCRIMINANT-VALUE test
+// (DECISIONS §"`is A` over same-shape struct arms"): true iff the tag names the shared shape
+// AND the value's literal-typed fields are members of `A`'s sets. These three answer the
+// three questions that lowering asks — what are `vi`'s members at field `fi`, do two arms'
+// sets agree, and does `fi` need testing at all.
+
+// The literal-set member LEXEMES of variant `vi`'s field `fi` — empty when the field is not
+// a literal set. Reads the DISCRIMINANT column, whose header explains why the identity
+// column (`uFieldTyText`) cannot answer: canon softens a multi-member set to its base.
+export function variantFieldLitLexes(vi: i32, fi: i32) {
+  const none: string[] = []
+  if vi < 0 || vi >= uFieldStart.length { return none }
+  if fi < 0 || fi >= uFieldCount[vi] { return none }
+  const row = uFieldStart[vi] + fi
+  if row < 0 || row >= uFieldLitTyIx.length { return none }
+  tyLitSetMemberLexes(uFieldLitTyIx[row])
+}
+
+// Is LEXEME `lex` one of `lexes`? `emit_base.litLexIsMember`'s twin for a list that is
+// already quoted — that one quotes each element before comparing, which would re-quote a
+// lexeme and answer false for every member.
+function lexInLexes(lex: string, lexes: string[]): boolean {
+  let i = 0
+  while i < lexes.length {
+    if lexes[i] == lex { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Do variants `a` and `b` carry the SAME literal set at field `fi`? Set equality, not list
+// equality: `"x" | "y"` and `"y" | "x"` are one type, and a test that called them different
+// would emit a membership compare that is a tautology in both directions.
+function variantFieldLitSetSame(a: i32, b: i32, fi: i32): boolean {
+  const la = variantFieldLitLexes(a, fi)
+  const lb = variantFieldLitLexes(b, fi)
+  if la.length != lb.length { return false }
+  let i = 0
+  while i < la.length {
+    if !lexInLexes(la[i], lb) { return false }
+    i = i + 1
+  }
+  let j = 0
+  while j < lb.length {
+    if !lexInLexes(lb[j], la) { return false }
+    j = j + 1
+  }
+  true
+}
+
+// Must `x is <vi>` TEST field `fi`'s value, or does the tag already settle it?
+//
+// THE GATE IS "ANOTHER ARM SHARES MY TAG AND DISAGREES AT THIS FIELD", and it is what keeps
+// every program that existed before this change byte-identical. A variant whose tag is its
+// own — the overwhelming majority — has nothing to disambiguate, and a same-signature
+// sibling carrying the SAME set at `fi` (two aliases of one literal type, `K1` beside `K2`)
+// does not disagree: every value of the shared shape is a member of both, which is the
+// truthful answer and needs no instruction to produce it.
+//
+// Tags are program-global and keyed by `variantSig`, so "shares my tag" is "shares my
+// signature" — asked directly rather than off `uTags`, because this runs from `assignTags`
+// BEFORE that table is filled as well as from `emitIs` long after.
+export function variantDiscrimFieldNeeded(vi: i32, fi: i32): boolean {
+  if variantFieldLitLexes(vi, fi).length == 0 { return false }
+  const sig = variantSig(vi)
+  let vj = 0
+  while vj < uVariants.length {
+    if vj != vi {
+      if variantSig(vj) == sig {
+        if !variantFieldLitSetSame(vi, vj, fi) { return true }
+      }
+    }
+    vj = vj + 1
+  }
+  false
+}
+
+// Are variants `a` and `b` — same field-NAME set, so already sharing a tag — legal under
+// D1023's ruling: ONE tag, ONE layout, `is` answering by the discriminant's VALUE?
+//
+// TWO CONDITIONS, and the second is what makes the first sound. Every field must either
+// compare equal on `variantFieldTysEq`'s own ladder, or be a LITERAL SET IN BOTH ARMS WITH
+// THE SAME STORAGE — and at least one field must be the latter, or nothing tells the arms
+// apart at run time and the pair is the no-discriminant refusal the checker owns.
+//
+// STORAGE, NOT BASE TYPE, IS THE COMPARABILITY TEST, and it is the same column the reject
+// already trusts. Two literal sets are comparable exactly when their values land in one slot
+// under one compare: `{k: "a"} | {k: 1}` codes 3 against 0 and is refused, and so is a named
+// litunion ALIAS (the interned i32 atom) beside an inline set (a string ref) — same base,
+// two reps, no shared layout to fold onto. The elem-name and map-key columns come along for
+// the reason they do in the ladder proper: one code covers several storages.
+//
+// TWO CALLERS, AND THEY MUST AGREE OR THE MODULE TRAPS. `assignTags` uses it to ADMIT the
+// pair, and `buildVariantTwins` to give the admitted arms ONE heap type. Admitting without
+// folding is what the filed D1023 witness did: two structurally identical struct types at
+// two rec-group indices are DISTINCT types in WasmGC, the box was built under whichever row
+// the field-name match hit first, and the other arm's `ref.cast` trapped. One predicate,
+// asked twice, is what keeps the two answers from drifting.
+export function variantLitDiscriminable(a: i32, b: i32): boolean {
+  if a < 0 || b < 0 { return false }
+  if a >= uFieldCount.length || b >= uFieldCount.length { return false }
+  if uFieldCount[a] != uFieldCount[b] { return false }
+  let sawLit = false
+  let fi = 0
+  while fi < uFieldCount[a] {
+    const ra = uFieldStart[a] + fi
+    const rb = uFieldStart[b] + fi
+    const codeEq = uFieldTypes[ra] == uFieldTypes[rb] &&
+      uFieldElemKeyI32At(a, fi) == uFieldElemKeyI32At(b, fi)
+    const storageEq = codeEq && uFieldElemName[ra] == uFieldElemName[rb]
+    // EITHER, not BOTH (owner's amendment, 2026-09-02): a literal set beside its own BASE is
+    // legal, and the base arm carries no set to record. `{kind: "x" | "y"}` beside
+    // `{kind: string}` is the overlapping-set case with the second set being the whole base —
+    // `is A` compares the value, `is B` is the tag test alone, which is what
+    // `variantDiscrimFieldNeeded` already emits for an arm whose own set is empty.
+    //
+    // THE CODE COLUMN IS WHAT KEEPS THIS HONEST, and it is why widening to EITHER is safe
+    // here: `{v: i32} | {v: boolean}` reaches this line with both codes 0 and NEITHER a set,
+    // so it falls to the equality rung and parts on its type text, exactly as before. The
+    // CHECKER is the stricter gate in any case — it requires the base to be the one the set
+    // softens to, where this only asks that the two store alike.
+    const eitherLit = uFieldLitTyIx[ra] >= 0 || uFieldLitTyIx[rb] >= 0
+    // THE ELEM-NAME COLUMN IS AN IDENTITY HERE, NOT A STORAGE, so the discriminant rung
+    // drops it and the equality rung keeps it. A litunion field records its ALIAS NAME
+    // there (`type KC = "circle"` → `KC`), which is how the widen tower finds the member
+    // set — but every alias of a string literal set reps as the SAME interned i32 atom, so
+    // `K1` beside `K2` is one storage under two names. Requiring the names to match refused
+    // the alias spelling of the very pair the ruling makes legal, while the code column
+    // still parts an alias (atom) from an inline set (a string ref), which genuinely differ.
+    if codeEq && eitherLit {
+      sawLit = true
+    } else if !(storageEq && uFieldTyText[ra] == uFieldTyText[rb]) {
+      // Neither a discriminant candidate nor equal — the arms genuinely differ at a field
+      // whose values `is` has no way to compare.
+      return false
+    }
+    fi = fi + 1
+  }
+  sawLit
+}
+
+// Do `a` and `b` differ at a field where BOTH arms carry a literal set, but the two sets rep
+// DIFFERENTLY? The one shape D1023's ruling calls legal that this emitter still cannot build,
+// separated out so the refusal can say what is actually wrong.
+//
+// A string literal set has two reps and `nodeTyIsLitUnionAlias` is the seam: a registered
+// ALIAS (`type KC = "circle"`) is the interned i32 atom, an inline `"x" | "y"` a `(ref
+// $string)`. Put one of each in two arms of a union and the TYPES agree about everything the
+// ruling asks — same base, comparable values — while the LAYOUTS do not, so there is no
+// single heap type for the arms to share. Unifying the two reps is the litunion rep cliff and
+// a representation change; until then this pair is a capability gap, and calling it "the same
+// field names but different field types" would be false.
+export function variantLitRepMismatch(a: i32, b: i32): boolean {
+  if a < 0 || b < 0 { return false }
+  if a >= uFieldCount.length || b >= uFieldCount.length { return false }
+  if uFieldCount[a] != uFieldCount[b] { return false }
+  let fi = 0
+  while fi < uFieldCount[a] {
+    const ra = uFieldStart[a] + fi
+    const rb = uFieldStart[b] + fi
+    // EITHER arm carrying a set is enough, because the amendment made the BASE arm a legal
+    // partner: `{kind: K1} | {kind: string}` is a set beside its own base — legal by the
+    // ruling, and still two reps (interned atom / string ref), so it lands here too and
+    // deserves this sentence rather than the "different field types" one. The pairs where
+    // neither is a set never reach here: the checker refuses them.
+    if uFieldLitTyIx[ra] >= 0 || uFieldLitTyIx[rb] >= 0 {
+      if uFieldTypes[ra] != uFieldTypes[rb] { return true }
+    }
+    fi = fi + 1
+  }
+  false
+}
+
+// Does variant `vi` carry ANY field whose value `is` must test — i.e. is `vi` one of a set
+// of arms sharing a tag and parted by a discriminant? The whole-variant form of
+// `variantDiscrimFieldNeeded`, for the callers that ask about the arm rather than a field:
+// `emitIs`'s static fold, which is unsound exactly when this is true.
+export function variantHasDiscrimField(vi: i32): boolean {
+  if vi < 0 || vi >= uFieldCount.length { return false }
+  let fi = 0
+  while fi < uFieldCount[vi] {
+    if variantDiscrimFieldNeeded(vi, fi) { return true }
+    fi = fi + 1
+  }
+  false
 }
 
 // The GLOBALLY-stable tag of a value-union atom: every struct variant takes the

@@ -12965,6 +12965,210 @@ function flatFieldTyName(fdIx: i32) {
 //      nested record it contains has resolved. Anything still unresolved when the
 //      fixpoint stops making progress is part of a CYCLE — an infinite layout —
 //      and is reported by name rather than hung on.
+// ── D1023 pass 0d: a union's arms must be tellable apart ──────────────────────────────
+// The BASE SCALAR of a literal-set type — `TY_STR` for `"a" | "b"`, `TY_I32` / `TY_I64` /
+// `TY_F64` for a numeric set — or -1 when `ty` is not a literal set. `litBaseTy` lifted from
+// one member to the whole set.
+//
+// The base is the COMPARABILITY question the ruling asks: two arms are discriminable at a
+// field when both carry a literal set there AND the sets are comparable, which is what having
+// one base means. `{k: "a"} | {k: 1}` has a literal field in both arms and is still refused,
+// because no single compare answers across a string and an integer.
+//
+// A set is read off its FIRST member: `tyLitSetMemberLexes` has already rejected any type
+// with a non-literal member, and a set mixing bases (`"a" | 1`) takes its first member's base
+// and then fails to match the other arm — which is the refusal it should get.
+function litSetBaseTy(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  if tyLitSetMemberLexes(ty).length == 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyLit { return litBaseTy(t) }
+  if t is TyUnion {
+    let i = 0
+    while i < t.uMembers.length {
+      const m = T.tys[t.uMembers[i]]
+      if m is TyLit { return litBaseTy(m) }
+      i = i + 1
+    }
+  }
+  -1
+}
+
+// Do arms `a` and `b` carry the same field NAMES in the same order — the checker's reading of
+// `variantSig`, which IS the emitter's tag key. Order-sensitive on purpose: two arms spelling
+// their fields in different orders get different signatures and therefore different tags, so
+// nothing needs telling apart.
+function objSigSame(a: TyObj, b: TyObj): boolean {
+  if a.objFieldNames.length != b.objFieldNames.length { return false }
+  let i = 0
+  while i < a.objFieldNames.length {
+    if objFieldType(b, a.objFieldNames[i]) < 0 { return false }
+    i = i + 1
+  }
+  true
+}
+
+// `b`'s type for the field `a` holds at index `i`, or -1 — the BY-NAME pairing every
+// comparison below uses.
+//
+// BY NAME AND NOT BY INDEX, because the two orders are not the same order. The ARENA keeps a
+// `TyObj`'s fields in SOURCE order, while the emitter's `variantSig` — which IS the tag key —
+// sees them sorted, so `{v: i32, w: string}` and `{w: string, v: boolean}` collide on a tag
+// while their arena rows line up `v` against `w`. An index-paired comparison called that pair
+// two different signatures, let it past this rule, and left it to the emit floor: measured,
+// `vl check` rc 0 followed by `cannot be discriminated`. Pairing by name is what makes the
+// checker's question the same question the tag asks.
+function objPairedTy(a: TyObj, b: TyObj, i: i32): i32 {
+  objFieldType(b, a.objFieldNames[i])
+}
+
+// Is SOME field a comparable literal set in both arms — the discriminant the ruling requires?
+function objArmsDiscriminable(a: TyObj, b: TyObj): boolean {
+  let i = 0
+  while i < a.objFieldTypes.length {
+    const fa = a.objFieldTypes[i]
+    const fb = objPairedTy(a, b, i)
+    const ba = litSetBaseTy(fa)
+    const bb = litSetBaseTy(fb)
+    // Both arms carry a literal set, and the sets are comparable.
+    if ba >= 0 && ba == bb { return true }
+    // A LITERAL SET BESIDE ITS OWN BASE (owner's amendment, 2026-09-02). `{kind: "x" | "y"}`
+    // beside `{kind: string}` is the overlapping-set case with the second arm's set being
+    // the WHOLE base: `v is A` is `v.kind ∈ {"x","y"}`, `v is B` is true for every value of
+    // the shared shape, and `else` after `is A` narrows to B. The tag cannot answer and the
+    // value can, which is the ruling's principle line.
+    //
+    // The BASE has to be the one this set softens to, not merely another primitive:
+    // `{v: i32} | {v: "a" | "b"}` is a string set beside an `i32` and stays refused, which
+    // is the pair the ruling names and a different question from this one.
+    if ba >= 0 && tySame(fb, ba) { return true }
+    if bb >= 0 && tySame(fa, bb) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Are `a` and `b` the SAME TYPE — every field equal, structurally?
+//
+// THE EXEMPTION THAT MAKES THE RULE A RULE ABOUT ARMS AND NOT ABOUT SPELLINGS. `type Cat =
+// {m: i32}` beside `type Kot = {m: i32}`, or a declared name beside its inline `{…}` form, is
+// ONE type reached two ways — the checker accepts either wherever the other is expected — so
+// it is one arm, the twin machinery folds it onto one heap type, and there is nothing to tell
+// apart. Refusing it would refuse `variant-twin-scalar-spellings.vl`, where the whole point is
+// that the two spellings ARE the same variant.
+//
+// This is the checker's reading of the emitter's `variantFieldTysEq`, whose exemption the
+// `assignTags` reject has always carried for the same reason.
+function objArmsSameType(a: TyObj, b: TyObj): boolean {
+  if a.objFieldTypes.length != b.objFieldTypes.length { return false }
+  let i = 0
+  while i < a.objFieldTypes.length {
+    if !tySame(a.objFieldTypes[i], objPairedTy(a, b, i)) { return false }
+    i = i + 1
+  }
+  true
+}
+
+// THE DESIGN RULE `docs/guide/unions.md` HAS ALWAYS PROMISED, now owed by the checker
+// (D1023). VL's structural unions discriminate on the field-NAME set, so two arms sharing
+// that set need something else to part them; the ruling says a literal-typed field is that
+// something, and that a pair with none is refused. "" when `ty` is fine, or the message.
+//
+// IT IS A CHECK ERROR AND NOT AN EMIT ONE BECAUSE IT IS A RULE, NOT A GAP. The emitter still
+// carries `assignTags`' `cannot be discriminated` reject and that is deliberate — a floor,
+// not a diagnosis. Every `loud emit reject` is a clause-2 violation by construction, since
+// `check` returned 0 to reach the emitter: either the program is legal and should compile, or
+// it is illegal and the CHECKER owed the diagnosis. This is the checker paying that debt.
+//
+// ONE MESSAGE PER UNION, not one per pair: a six-arm union all of one shape has fifteen bad
+// pairs and one problem. Pairwise and quadratic in the arm count, like `nomUnionRepClashMsg`.
+//
+// `spellings` is the declaration's own arm names when the caller has them and they still line
+// up index for index. `nominalStructNameOfTy` is not an option: it answers with the FIRST
+// structurally-equal user type, which is the wrong tag for exactly this population.
+function unionDiscrimMsgNamed(ty: i32, spellings: string[]): string {
+  if ty < 0 { return "" }
+  const pt = T.tys[ty]
+  if pt is TyUnion {
+    const ms = pt.uMembers
+    const named = spellings.length == ms.length
+    let i = 1
+    while i < ms.length {
+      let j = 0
+      while j < i {
+        const mi = T.tys[ms[i]]
+        const mj = T.tys[ms[j]]
+        if mi is TyObj {
+          if mj is TyObj {
+            if (
+              objSigSame(mi, mj) &&
+              !objArmsSameType(mi, mj) &&
+              !objArmsDiscriminable(mi, mj)
+            ) {
+              let na = tyToStrUser(ms[j])
+              let nb = tyToStrUser(ms[i])
+              if named {
+                na = spellings[j]
+                nb = spellings[i]
+              }
+              return "arms `" +
+                na +
+                "` and `" +
+                nb +
+                "` share a field-name set and no literal-typed field " +
+                "distinguishes them — add a discriminant field"
+            }
+          }
+        }
+        j = j + 1
+      }
+      i = i + 1
+    }
+  }
+  ""
+}
+
+// The no-spellings form, for a caller holding only the arena type (an INLINE `A | B`
+// annotation, which has no declaration to read arm names off).
+function unionDiscrimMsg(ty: i32): string {
+  const none: string[] = []
+  unionDiscrimMsgNamed(ty, none)
+}
+
+// Report `msg` unless it has ALREADY been reported, at any anchor. `tErrPush`'s own dedupe
+// keys on `(message, anchor)`, which is right for it and too weak here: one bad union is
+// reachable from its DECLARATION and from every annotation naming it, so `type S = A | B`
+// used once printed the identical sentence at two positions. The pair named in the message
+// is the problem's identity, so the message alone is the key.
+//
+// First writer wins, and the order is deliberate: pass 0d runs before any annotation is
+// resolved and names the arms from the DECLARATION's own spellings, which is the better
+// message.
+function tErrOncePerMsg(msg: string, at: i32) {
+  let di = 0
+  while di < T.diags.length {
+    if T.diags[di].tmsg == msg { return 0 }
+    di = di + 1
+  }
+  tErr(msg, at)
+}
+
+function checkUnionDiscriminable(stmts: i32[]) {
+  let si = 0
+  while si < stmts.length {
+    const sd = P.nodes[stmts[si]]
+    if sd is UnionDecl {
+      const declIx = cUserTypes[sd.udName] ?? -1
+      if declIx >= 0 {
+        const m = unionDiscrimMsgNamed(declIx, sd.udVariants)
+        if m != "" { tErrOncePerMsg(m, stmts[si]) }
+      }
+    }
+    si = si + 1
+  }
+  0
+}
+
 function resolveFlatLayouts(stmts: i32[]) {
   // ── phase A: validate and stage ───────────────────────────────────────────
   // Two sweeps, because a flat record may nest one DECLARED LATER in the source:
@@ -24629,6 +24833,18 @@ function resolveAnnotAt(name: string, typarams: string[], at: i32) {
   annotDiagAt = at
   const r = resolveAnnotTs(name, typarams, annTsOf(at))
   annotDiagAt = saved
+  // D1023 AT THE INLINE SPELLING. Pass 0d catches a union with a DECLARATION to walk; an
+  // inline `function f(): A | B` has none, and the arm-discriminability rule is about the
+  // union the user wrote, not about where they wrote it. This is the annotation route's
+  // entry point and it carries a NODE, so the refusal lands on the annotation.
+  //
+  // THE `at` ROUTE IS THE CHECKER'S ALONE, which is what keeps a CHECK error out of the emit
+  // phase: `resolveAnnot` — the name route, `root < 0` — is what `emit_rep.vl`'s seven
+  // callers use, and it does not come through here. `tErrOncePerMsg` is what keeps this from
+  // doubling pass 0d's report: the memo inside `resolveAnnotTs` short-circuits the
+  // RESOLUTION but not this check, and a DECLARED union reaches the rule from both routes.
+  const dm = unionDiscrimMsg(r)
+  if dm != "" { tErrOncePerMsg(dm, at) }
   r
 }
 
@@ -27433,6 +27649,10 @@ function checkProgramNode(n: Program) {
   // is what makes a newtype over a scalar work for free) and must precede any
   // expression checking, since `N.size` / `N.field` fold against this sidecar.
   resolveFlatLayouts(stmts)
+  // Pass 0d: REFUSE a union whose arms nothing can tell apart (D1023). Runs here, after 0b
+  // has filled every arm's `TyObj`, because the rule reads field names and field TYPES and a
+  // declaration cycle can still leave a member an empty placeholder inside the fill itself.
+  checkUnionDiscriminable(stmts)
   // Pass 1: hoist top-level function signatures so call-before-decl and mutual
   // recursion type-check.
   let hi = 0
@@ -33644,6 +33864,63 @@ export function nodeTyMapValLitUnionTexts(ix: i32) {
     }
   }
   out
+}
+
+// The member LEXEMES of a LITERAL SET — a bare `TyLit`, or a `TyUnion` whose members are ALL
+// `TyLit` — in declaration order, and EMPTY for every other type. D1023's discriminant query.
+//
+// LEXEMES, NOT TEXTS, and the quotes are the point: a string member comes back QUOTED
+// (`"circle"`), a numeric one bare (`1`, `1.5`), which is exactly the form `emitLitMemberEq`
+// reads to pick string equality over numeric (`nameIsQuotedLeaf`). One list therefore serves
+// both bases and a caller hands a member straight to the compare.
+//
+// THE KIND-BLIND TWIN of `tyLitMemberTexts` (string members only, unquoted) and
+// `tyNumLitMemberTexts` (numeric only), and it has to be blind to be asked at all. The
+// question D1023 puts to it is whether two arms' literal fields share a BASE — and a
+// single-base query cannot distinguish "this arm has no literal set" from "this arm has one
+// of the OTHER base", which is the difference between a legal discriminated pair and
+// `{k: "a"} | {k: 1}`. A MIXED set (`"a" | 1`) returns its members too; the base agreement
+// is the caller's test, made on the field's storage code, not on this list.
+export function tyLitSetMemberLexes(ty: i32) {
+  const out: string[] = []
+  if ty < 0 { return out }
+  const t = T.tys[ty]
+  if t is TyLit {
+    if t.litKind == "str" {
+      out.push("\"" + t.litText + "\"")
+    } else {
+      out.push(t.litText)
+    }
+    return out
+  }
+  if t is TyUnion {
+    if t.uMembers.length < 1 { return out }
+    let i = 0
+    while i < t.uMembers.length {
+      const m = T.tys[t.uMembers[i]]
+      if m is TyLit {
+        if m.litKind == "str" {
+          out.push("\"" + m.litText + "\"")
+        } else {
+          out.push(m.litText)
+        }
+      } else {
+        // NOT a literal set: one non-literal member disqualifies the whole type. Returning
+        // the literal members of a MIXED union (`"a" | i32`) would let a caller build a
+        // membership chain that answers `false` for every legal `i32` value.
+        return emptyTextList()
+      }
+      i = i + 1
+    }
+    return out
+  }
+  out
+}
+
+// True if `ty` denotes a literal SET — the predicate half of `tyLitSetMemberLexes`, for a
+// caller that only needs the yes/no (the variant field row's `-1` decision).
+export function tyIsLitSet(ty: i32): boolean {
+  tyLitSetMemberLexes(ty).length > 0
 }
 
 // The member literal TEXTS (raw inner lexeme, no quotes) of ATOM-repped TYPE `ty`, in source order:

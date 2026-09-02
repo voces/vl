@@ -31225,12 +31225,12 @@ until then.
 
 ### D1023 — two struct arms with the same field names and reps but DIFFERENT literal-union field types are one arm to `is`: both tests answer `true` (the narrowed access ALSO trapped; that half is closed)
 
-**check-clean silently wrong — `r2 is A` prints `true` on a `B` value where the 2026-09-02 ruling
-says `false` · the TRAP HALF closed 2026-09-02 with [D1031](#d1031)'s canon-key fix (the two arms
-now share ONE heap type, which is the rep the ruling recommends) and the witness was RE-FILED on
-the half that remains · ZERO corpus cells · found 2026-09-01 by the `std:json` critique
-(`docs/internals/json-critique-std.md` finding 1) · one ingredient: the two arms share every field
-NAME and REP; the literal SETS differing is not enough**
+**CLOSED as `runs` — `r2 is A` on a `B` value now prints `false`. Was: check-clean silently
+wrong · closed in TWO halves — the TRAP half by [D1031](#d1031)'s canon-key fix (the arms share
+ONE heap type, the rep the ruling recommends), the ANSWER half by #2365, which built the ruling
+· ZERO corpus cells, which is why every gate was green through both · found 2026-09-01 by the
+`std:json` critique · the filed ingredient ("the literal SETS differing is not enough") was
+REFUTED by a peer ablation and is corrected below**
 
 **WHY THE TRAP WENT, AND WHY THAT IS NOT THE RULING BEING MET.** The trap was a CORRECT branch
 failing: `r2 is B` on a `B` value answered `true` and then `ref.cast`-ed to a heap type that was
@@ -31252,7 +31252,7 @@ Repro:
     }
     const r2 = f(1)
     print(r2 is A)
-    // PRINTS true
+    // PRINTS false
 
 The ORIGINAL witness — the one that loaded and then trapped — is the same program reading the
 narrowed field at both arms, and it now prints `a` then `b`:
@@ -31306,6 +31306,7 @@ arm is taken silently — prints `A`.
   | same, narrowed by `r.kind == "circle"` instead of `is` | — | same reject (the collect pass refuses the union itself) |
   | `kind: "x" \| "y"` vs `"p" \| "q"` — disjoint sets, this row | `true` / `true` | silently wrong arm (`A: p`) |
   | `kind: "x" \| "y"` vs `"y" \| "z"` — overlapping | `true` / `true` | silently wrong for `"x"` and `"z"` values |
+  | `kind: "x" \| "y"` vs `kind: string` — a set beside its own BASE (added by the peer ablation; the owner's AMENDMENT makes it legal) | `true` / `true` | check-clean and silently wrong: `is A` answers `true` for a `"z"` value that is a B and not an A |
   | `v: i32` vs `v: boolean` — no literal field | — | emit reject, same message (correct rule, wrong stage) |
   | `kind: "circle", r` vs `kind: "square", side` — different NAMES | `false` / `true` | **runs**, and `r.kind == "circle"` narrowing runs (`r.r` / `r.side` print `1` / `2`) |
 
@@ -31325,6 +31326,89 @@ arm is taken silently — prints `A`.
   with the DECISIONS sentence, and the last row is unchanged; `is`- and `==`-narrowing agree
   at every spelling. Probes: `$SP/q/d1023/t1–t11` of session vl-b7, reproduced from the
   table.
+
+  **BUILT 2026-09-02 (#2365), and every row of the grading list above is met.** The fixtures
+  are `tests/cases/unions/discriminant-value-is.vl` (the six-row table, each print naming the
+  arm taken), `…-positions.vl` (nine delivery positions), `…-ablation.vl`,
+  `no-discriminant-check-reject.vl`, `no-discriminant-field-order-reject.vl`, and the two
+  files this ruling REVERSED from `@emit-error` into runs —
+  `same-field-names-literal-tags.vl` and `…-numeric-tags.vl`, whose old headers argued the
+  pair had to stay loud until a rep decision was made.
+
+  Three things the build measured that the ruling's framing did not settle:
+
+  * **THE SENTINELS ARE INTERNED GLOBALLY BY LITERAL VALUE, NOT PER TYPE BY POSITION**, which
+    is what made the recommended one-heap-type route possible with no rep change at all.
+    `internAtom` is one module-global map keyed by the literal's TEXT: measured on a
+    disassembly, `"y"` is the same `i32` `1` in `type KA = "x" | "y"` (position 1) and in
+    `type KC = "y" | "z"` (position 0), where a per-type numbering would have made it `0`.
+    And a literal-set field does not always rep as a sentinel — an INLINE `kind: "x" | "y"`
+    is a `(ref $string)` holding the member's own characters, only a registered ALIAS is the
+    atom — so the compare is picked off the field's STORAGE, not the lexeme's looks.
+  * **THE FOLD AND THE REJECT WERE ONE COLUMN, exactly as this row suspected.**
+    `variantFieldIdText` restores a BARE literal's own text (`"circle"` vs `"square"` → part
+    → reject) but a MULTI-member set reaches it already softened by canon to the base its
+    members share (`"x" | "y"` and `"p" | "q"` both render `string` → equal → folded). One
+    predicate, two outcomes, and the softening is right for IDENTITY and useless for
+    MEMBERSHIP — so the fix banks the field's ARENA TYPE beside the text (`uFieldLitTyIx`)
+    rather than trying to recover members from a text column.
+  * **A SHARED TAG WITH TWO HEAP TYPES IS NOT A REPRESENTATION**, and admitting the pair
+    without folding it reproduced the filed trap from the other side. `assignTags` ranks by
+    the field-NAME signature, so these arms always shared a tag; `buildVariantTwins` keys on
+    a canon id that PRESERVES each arm's literal set, so they did not share a heap type. The
+    box is built under whichever row the field-name match hits first, so the other arm's
+    `ref.cast` trapped. One predicate (`variantLitDiscriminable`) now answers for both, which
+    is what keeps the two from drifting. Verified on `wasm-dis`: the filed shape emitted TWO
+    character-identical arm types and now emits ONE, with every `ref.cast` targeting it.
+
+  **A peer's 17-cell ablation REFUTED two things this row asserted, and both are now
+  fixtures** (`tests/cases/unions/discriminant-value-is-ablation.vl`):
+
+  * **"the literal SETS differing is not enough" named the wrong ingredient.** Two IDENTICAL
+    arms with no literal field anywhere also answer `true`/`true` — and there that answer is
+    CORRECT, because under structural typing they are ONE type. The defect was only ever arms
+    whose types genuinely DIFFER, plus the trap. The checker's rule needs the same exemption
+    (`objArmsSameType`), and without it `variant-twin-scalar-spellings.vl` is refused.
+  * **Field ORDER is not a defence, and it caught this build's own checker.** The arena keeps
+    a `TyObj`'s fields in SOURCE order while `variantSig` — the tag key — sees them SORTED, so
+    `{v: i32, w: string}` and `{w: string, v: boolean}` share a tag with their arena rows
+    misaligned. The rule paired fields BY INDEX, called them two signatures, and let the pair
+    through to the emit floor (`vl check` rc 0, then `cannot be discriminated`) — the exact
+    clause-2 shape moving the rule to the checker was meant to end. Pairs by NAME now;
+    `no-discriminant-field-order-reject.vl` pins it.
+
+  **And the ablation's numeric cell is why "does the witness trap" is not a grader.** Two
+  NUMERIC arms (`{kind: 0|1}` vs `{kind: 2|3}`) already interned to one struct type, so that
+  cell ran CLEAN with no trap and silently answered `true`/`true`. Graded by this row's filed
+  symptom it scores green while it is wrong. It answers by membership now.
+
+  **The peer's remaining cell went to the owner and was ADMITTED — a literal set beside its
+  own BASE is legal (amendment, 2026-09-02).** `{kind: "x"|"y", r}` vs `{kind: string, r}` had
+  been refused at CHECK by the first cut of this build, on the ruling's letter (*"BOTH arms
+  carry a literal set of the SAME base type"* — a plain `string` carries none) and on its
+  worked example (`{v: i32} | {v: "a"|"b"}` listed as refused). The owner ruled it the
+  overlapping-set case with B's set being the whole base, covered by the principle line: `is`
+  answers by value when the tag cannot. `v is A` ≡ `v.kind ∈ {"x","y"}`; `v is B` is true for
+  every value of the shared shape; `else` after `is A` narrows to B. DECISIONS' §"Amendment"
+  paragraph supersedes the BOTH-arms sentence for this pair only — a pair with NO set in
+  either arm still refuses, and one whose bases differ is a different question.
+
+  **The asymmetry is what makes it gradeable.** A membership compare is emitted only for the
+  arm that HAS a set, so `is B` stays the bare tag test; a fixture that built only A values
+  would score identically if `is A` had been compiled to the bare tag test too. The `"z"`
+  value — a B that is not an A — is the cell that actually grades the rule, and it is why the
+  fixture carries both directions at both spellings and both bases
+  (`discriminant-value-is-set-beside-base.vl`). Note the direction this moved: the pair was
+  check-clean and silently `true`/`true` before, so it is a silent wrong answer converted to a
+  correct one rather than a refusal either way.
+
+  **Residue, named rather than closed: the two litunion reps in one union.** `{kind: K1}`
+  beside `{kind: "x" | "y"}` — a registered alias in one arm, an inline set in the other — is
+  legal under the ruling (same base, comparable values) and is the ONE spelling that still
+  reaches the emit floor, because an interned atom and a string ref have no shared layout.
+  Unifying them is the litunion rep cliff and was out of this change's scope. Its refusal no
+  longer claims the field types differ; it says what is true and concedes the program is
+  type-valid, so `goal-scoreboard.py --sites` counts it (22 → 23 literals). Witness in D1050.
 
 ---
 
@@ -35328,6 +35412,50 @@ Repro (check rc 1, two errors):
   rejected, so exhaustiveness then reports the arm missing. A fix at the membership rule clears
   both.
 
+### D1050 — a union whose two arms spell their literal discriminant DIFFERENTLY (a named alias in one, an inline set in the other) refuses at emit, though both are string literal sets and D1023 rules the pair legal
+
+**loud emit reject · check rc 0 · clause 2 · `emitProgram: union `A|B` discriminates `A` from `B` on a literal field whose two arms rep differently … this program is type-valid but cannot build` · ZERO corpus cells · the ONE spelling of D1023's family the ruling calls legal that the build of it (#2365) did not close, named by that build rather than found later**
+
+Repro:
+
+    type K1 = "circle" | "round"
+    type A = { kind: K1, r: f64 }
+    type B = { kind: "x" | "y", r: f64 }
+    function f(n: i32): A | B {
+      if n == 0 { return { kind: "circle", r: 1.0 } }
+      return { kind: "x", r: 2.0 }
+    }
+    print(f(1).r)      // want: 2
+
+Both arms carry a string literal set at `kind`, so by D1023's rule — "treat a pair as
+distinguishable where BOTH arms carry a literal set of the SAME base type at some field" —
+this is a legal discriminated union and `f(1) is B` should be `true`. The CHECKER agrees: it
+asks by base and accepts. The EMITTER refuses, and its reason is real rather than an
+oversight.
+
+* **TWO REPS, ONE SEAM.** A string literal union has two representations and
+  `nodeTyIsLitUnionAlias` is the seam between them: a registered ALIAS (`type K1 = …`) is the
+  interned `i32` atom, an inline `"x" | "y"` a `(ref $string)`. Put one of each in two arms
+  and the TYPES agree about everything the ruling asks while the LAYOUTS do not, so there is
+  no single heap type for the arms to share — and a shared tag with two heap types is not a
+  representation (D1023's own second finding, reached from the other direction).
+
+* **WHY IT WAS NOT CLOSED WITH D1023.** Closing it means unifying the two litunion reps,
+  which is the litunion rep cliff — a rep change with corpus-wide byte effects, and the one
+  thing D1023's brief said to stop and report rather than widen into. `variantLitDiscriminable`
+  therefore compares the field's STORAGE CODE, which parts this pair while admitting every
+  same-rep one.
+
+* **CLAUSE 2, AND IT IS COUNTED.** The refusal concedes the program is type-valid in those
+  words, so `goal-scoreboard.py --sites` sees it (22 → 23 message literals). That is
+  deliberate: the previous sentence for this pair said they "have the same field names but
+  different field types", which is FALSE here — the types agree and only the reps do not —
+  and a gap wearing an invariant's clothes is the direction that hides.
+
+* **THE WORKAROUND IS EXACT AND THE MESSAGE NAMES IT**: spell both arms the same way. Two
+  aliases work (`variantLitDiscriminable` admits `K1` beside `K2` — the elem-name column is
+  an identity there, not a storage), and two inline sets work. Probe:
+  `scripts/capability-probes/litunion-alias-and-inline-arms.vl`.
 ---
 
 ### D1110 — an INLINE-SHAPE ANNOTATION lays a literal-union field out as the i32 ATOM while the DECLARED and VARIANT recorders lay it out as a string ref, so passing an identically-spelled struct to such a param is check-clean invalid wasm

@@ -799,12 +799,15 @@ import {
   unMemIsFunc,
   unMemIsMap,
   unMemIsRefElemArray,
+  variantDiscrimFieldNeeded,
   variantFieldElemName,
   variantFieldIndex,
   variantFieldIsLitUnion,
   variantFieldIsLitUnionArray,
+  variantFieldLitLexes,
   variantFieldRefSlot,
   variantFieldTypeAt,
+  variantHasDiscrimField,
   variantIndexOf,
   vtKindOfParam,
   vtKindOfType,
@@ -3826,6 +3829,143 @@ function nulNicheIsTestImpossible(recvIx: i32, ity: i32, fnIx: i32) {
   base != pTest
 }
 
+// `<recv>.<field fi of arm vi> == <lex>`, leaving an i32 — the ONE comparison D1023's
+// membership chain is built from, reading the discriminant off the union box.
+//
+// The read is the narrow's own three steps (`struct.get $uBox 1`, `ref.cast` to the arm's
+// heap type, `struct.get` the field), which is sound here for the reason the tag test that
+// precedes it is: this runs only inside the `tag == …` conjunction, so the payload IS the
+// arm's struct by the time the cast executes.
+//
+// THE COMPARE IS PICKED BY THE FIELD'S STORAGE, NOT BY THE LEXEME'S LOOKS. A string literal
+// set has TWO reps — the interned i32 atom when the field's annotation is a registered
+// ALIAS, a `(ref $string)` when it is inline — and the lexeme is `"circle"` either way. Ask
+// the code column and a quoted lexeme lands on `i32.eq` against `internAtom` at one spelling
+// and `strEq` at the other, which is what makes the ruling's answer independent of how the
+// arm spelled its discriminant.
+function emitDiscrimFieldEq(
+  body: i32[],
+  recvIx: i32,
+  vi: i32,
+  fi: i32,
+  lex: string,
+  fnIx: i32,
+) {
+  if vi < 0 || vi >= uVarHeap.length {
+    return emitFail(
+      "emitProgram: discriminant test on an arm with no heap type",
+    )
+  }
+  const code = uFieldTypes[uFieldStart[vi] + fi]
+  if emitExpr(body, recvIx, fnIx) < 0 { return -1 }
+  fbStructGet(uBoxIdx, 1)
+  fbRefCast(uVarHeap[vi])
+  fbStructGet(uVarHeap[vi], fi)
+  if code == 3 || code == 20 {
+    if !aUsed {
+      return emitFail(
+        "emitProgram: discriminant string test but array type not collected",
+      )
+    }
+    if emitStr(body, mkStr(lex, -1), fnIx) < 0 { return -1 }
+    return emitStrEqCore(body)
+  }
+  if code == 0 {
+    // The i32 slot serves both the interned string ATOM and a small numeric literal; the
+    // quotes are what part them, exactly as they do in `emitLitMemberEq`.
+    if nameIsQuotedLeaf(lex) {
+      fbI32Const(internAtom(lex))
+    } else {
+      fbI32Const(parseI32(lex))
+    }
+    fbI32Bin(70) // 0x46 i32.eq
+    return 0
+  }
+  if code == 17 {
+    fbF64Const(lex)
+    fbI32Bin(97) // 0x61 f64.eq
+    return 0
+  }
+  if code == 23 {
+    const pr = parseI64Pair(lex)
+    fbI64Const(pr[0], pr[1])
+    fbI32Bin(81) // 0x51 i64.eq
+    return 0
+  }
+  emitFail(
+    "emitProgram: a discriminant field of this storage has no membership compare",
+  )
+}
+
+// The MEMBERSHIP half of `x is A` (D1023) — emitted after the arm's tag test, and `i32.and`ed
+// onto it, for each field the tag alone cannot settle.
+//
+// `A`'s tag names the SHAPE. Where two declared types share a shape, the ruling makes `is` a
+// question about the VALUE — `s is Circle` is `tag == shared && s.kind == "circle"` — so this
+// emits the `&& …`. It emits NOTHING when no field needs it (`variantDiscrimFieldNeeded`),
+// which is every union that existed before the ruling, so those modules stay byte-identical.
+//
+// THE RECEIVER IS RE-READ ONCE PER MEMBER, which is `emitStrToAtom`'s bound taken for
+// `emitStrToAtom`'s reason: a chain that re-read a CALL would run it once per member — a
+// wrong number of EVALUATIONS, not merely a wrong value. `unionEqOperandOk` is the place
+// test, and a non-place receiver keeps the loud refusal rather than a silent miscount.
+//
+// IT CONSUMES THE TAG TEST INTO AN `if`, AND `i32.and` WOULD BE WRONG. Both operands of an
+// `i32.and` are evaluated, so conjoining the membership onto the tag ran the discriminant
+// read — a `ref.cast` to THIS arm's heap type — on values of every OTHER arm too. In a
+// two-arm union both arms share the shape and the cast happens to succeed; add a third arm
+// with different field names and `s is Circle` traps on the `Tri` value. The tag test is a
+// GUARD, so it has to be lowered as one.
+function emitVariantDiscrimTest(body: i32[], recvIx: i32, vi: i32, fnIx: i32) {
+  if vi < 0 || vi >= uFieldCount.length { return 0 }
+  const cnt = uFieldCount[vi]
+  let need = false
+  let fp = 0
+  while fp < cnt {
+    if variantDiscrimFieldNeeded(vi, fp) { need = true }
+    fp = fp + 1
+  }
+  if !need { return 0 }
+  if !unionEqOperandOk(recvIx) { return emitFailNoMembershipRecv() }
+  // <tag test> if (result i32) { <membership> } else { 0 }
+  fbIf(127) // 0x04 if, i32 result
+  ctrlEnter()
+  let first = true
+  let fi = 0
+  while fi < cnt {
+    if variantDiscrimFieldNeeded(vi, fi) {
+      const lexes = variantFieldLitLexes(vi, fi)
+      if lexes.length == 0 {
+        return emitFail(
+          "emitProgram: a discriminant field with no literal members",
+        )
+      }
+      let li = 0
+      while li < lexes.length {
+        if emitDiscrimFieldEq(body, recvIx, vi, fi, lexes[li], fnIx) < 0 {
+          return -1
+        }
+        if li > 0 {
+          fbI32Bin(114) // 0x72 i32.or — membership across the set
+        }
+        li = li + 1
+      }
+      // Every literal field of the tested type must hold: `is A` is membership in ALL of
+      // `A`'s literal sets, not in one of them.
+      if !first {
+        fbI32Bin(113) // 0x71 i32.and
+      }
+      first = false
+    }
+    fi = fi + 1
+  }
+  fbElse()
+  fbI32Const(0)
+  fbEnd()
+  ctrlLeave()
+  0
+}
+
 function emitIs(body: i32[], isIx: i32, fnIx: i32) {
   const nd0 = P.nodes[isIx]
   if nd0 is IsExpr {
@@ -4156,8 +4296,24 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
 
     const rvi = exprVariantIndex(nd.isObj, fnIx)
     if rvi >= 0 {
-      if rvi == vi { fbI32Const(1) } else { fbI32Const(0) }
-      return 0
+      // THE STATIC FOLD IS ONLY SOUND WHERE THE ROW IS THE ANSWER (D1023).
+      // `exprVariantIndex` resolves an object literal by its field-NAME set, so where two
+      // arms share a shape it names whichever row it matched FIRST — and folding
+      // `rvi == vi` would then answer `is` by the row a value happened to be built under,
+      // which is the nominal answer the ruling rules out.
+      //
+      // A NON-BOX RECEIVER STILL FOLDS, because for it the row really is all there is: a
+      // slot holding the raw variant ref (a `const s: {f: K0} = …` binding, whose union
+      // coerce passes it through un-boxed) has no tag and no payload to read, so there is no
+      // value to ask. Only a boxed receiver whose shape carries a discriminant falls through
+      // to the runtime chain.
+      const foldOk = !exprUnion(nd.isObj, fnIx) ||
+        (!variantHasDiscrimField(rvi) &&
+        !variantHasDiscrimField(vi))
+      if foldOk {
+        if rvi == vi { fbI32Const(1) } else { fbI32Const(0) }
+        return 0
+      }
     }
     if !exprUnion(nd.isObj, fnIx) {
       return emitFail("emitProgram: `is` receiver is not a union value")
@@ -4166,6 +4322,7 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
     fbStructGet(uBoxIdx, 0)
     fbI32Const(uTags[vi])
     fbI32Bin(70)
+    if emitVariantDiscrimTest(body, nd.isObj, vi, fnIx) < 0 { return -1 }
     return 0
   }
   emitFail("emitProgram: expected an `is` expression")

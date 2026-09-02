@@ -209,7 +209,7 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   item: it is about mono-minted unions, struct arm or literal alike — **D1042**.
   DECISIONS.md §"A subsumed literal arm COLLAPSES". Compiler-side; compile-goal surface.
 - **`is A` over same-shape struct arms is a DISCRIMINANT-VALUE test — RULED (owner,
-  2026-09-02), NOT BUILT.** `type Circle = { kind: "circle", r: f64 }` /
+  2026-09-02), DONE (#2365).** `type Circle = { kind: "circle", r: f64 }` /
   `type Square = { kind: "square", r: f64 }` is a legal union and `s is Circle` is true iff
   the tag names the shared shape AND `s.kind` is a member of `Circle`'s literal set — the
   arm set `s.kind == "circle"` already narrows to. A literal-typed field is a type that is
@@ -218,18 +218,27 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   the CHECKER — a design rule (`docs/guide/unions.md`) the emitter enforces today. The rep is
   the compiler's choice: one heap type + one tag + an `i32`-sentinel compare (recommended;
   no rep change), or distinct heap types (not vetoed) — provided the answer stays the
-  value's, never the name a value was built under. Measured today: the singleton-literal TS
-  idiom is an EMIT REJECT with no `is` in the program (the idiom is unwritable); two-member
-  disjoint or overlapping sets fold into one variant and take the wrong arm silently
-  (**D1023**); only different field names run. **Build, in order:** (1) collect pass admits
-  a same-signature pair that differs in a literal-typed field (one tag, one layout);
-  (2) `is A` adds the membership compare(s) after the tag test — one `i32.eq` per singleton;
-  (3) the checker owns the no-discriminant refusal and the emit reject becomes a floor;
-  (4) `is`- and `==`-narrowing graded side by side at every spelling. D1023's RULED
-  paragraph has the six-row table and the grading list; DECISIONS.md §"`is A` over
-  same-shape struct arms is a DISCRIMINANT-VALUE test". Interim std rule until built: every
-  std error struct keeps a field NAME no other has (`JsonError.path`). Compiler-side;
-  compile-goal surface.
+  value's, never the name a value was built under. Was: the singleton-literal TS idiom an
+  EMIT REJECT with no `is` in the program (the idiom unwritable); two-member disjoint or
+  overlapping sets folded into one variant and took the wrong arm silently (**D1023**); only
+  different field names ran. **Built as the four steps planned** — the collect pass admits a
+  same-signature pair differing in literal-typed fields of the same storage; `is A` adds the
+  membership compare after the tag test, as an `if` and NOT an `i32.and` (both operands of an
+  `and` evaluate, so the discriminant's `ref.cast` ran on arms of every other shape — only a
+  THREE-arm union sees it); `checkUnionDiscriminable` owns the no-discriminant refusal at
+  both the declared and inline spellings; `is` and `==` agree at every row. **The recommended
+  rep needed no rep change, and one measurement is why:** atom ids are interned globally by
+  literal VALUE, so `"y"` is the same `i32` in `"x" | "y"` and in `"y" | "z"` — a per-type
+  numbering would have forced interning per base type. Two arms the tag already merged also
+  had to be merged in `buildVariantTwins`, whose canon key preserves each arm's literal set:
+  a shared tag with two heap types reproduced the filed trap from the other side.
+  **Residue, named:** a named litunion ALIAS in one arm beside an inline set in the other is
+  legal by the ruling and still refuses, because the two litunion reps (interned atom /
+  string ref) share no layout — **D1050**, the litunion rep cliff. D1023's RULED paragraph
+  has the six-row table and the grading list; DECISIONS.md §"`is A` over same-shape struct
+  arms is a DISCRIMINANT-VALUE test". The std rule that was interim is now only a style
+  preference: a std error struct no longer NEEDS a unique field name, since a unique `kind`
+  literal discriminates. Compiler-side; compile-goal surface.
 - **A `type` declared in a function body is LEGAL and lexically scoped — RULED (owner,
   2026-09-02), NOT BUILT.** Today the declaration parses and is silently dropped: `unknown
   type 'P'` at the use, a check-clean emit reject when the name is unused, and a local `type
