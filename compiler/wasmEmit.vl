@@ -8368,9 +8368,14 @@ function emitNarrowedMapReadTail(idxIx: i32, fnIx: i32) {
   const key = indexPathKeyOf(idxIx)
   const v = narrowVariantFor(key)
   if v == "" || v == "null" { return 0 }
+  // A UNION value already left the NON-null box (`emitMapGetUnionBox` recovers it), so only
+  // the unbox is owed; every other ref value is the raw `(ref null <elem>)` vals slot.
+  if mvValKind[mrs] == 2 {
+    const ak = mapReadNarrowedAtomKind(idxIx, fnIx)
+    if ak >= 0 { return emitUnionUnboxTail(ak) }
+    return 0
+  }
   fbRefAsNonNull() // 0xd4 (the `is` guard proved the key present)
-  const ak = mapReadNarrowedAtomKind(idxIx, fnIx)
-  if ak >= 0 { return emitUnionUnboxTail(ak) }
   0
 }
 
@@ -12788,6 +12793,19 @@ export function emitExpr(body: i32[], exprIx: i32, fnIx: i32) {
     // G8: a map GET `m[k]` (no `??`) — scan, value or 0. A `??` get is fused in the
     // BinExpr branch below (it carries the default).
     if exprMap(e.idxArr, fnIx) {
+      // A UNION-VALUED map (mv kind 2) reads through the NULL-TAGGED BOX, the same lowering
+      // the `const t = m[k]` binding arm and its module-scope twin already take. `emitMapGet`
+      // yields the vals slot with a BARE `ref.null` miss, and every consumer of a boxed read
+      // starts with `struct.get $uBox 0` (the tag) — so a MISSING key trapped `null
+      // reference` on `m[k] is T`, `m[k] != null`, `m[k] == null` and `print(m[k])` alike,
+      // while the identical program through a binding ran. The box IS the read's `null`.
+      const ubs = mapReadNarrowableSlot(exprIx, fnIx)
+      if ubs >= 0 && mvValKind[ubs] == 2 {
+        if emitMapGetUnionBox(body, e.idxArr, e.idxIndex, fnIx) < 0 {
+          return -1
+        }
+        return emitNarrowedMapReadTail(exprIx, fnIx)
+      }
       if emitMapGet(body, e.idxArr, e.idxIndex, fnIx) < 0 { return -1 }
       return emitNarrowedMapReadTail(exprIx, fnIx)
     }

@@ -1,0 +1,172 @@
+// @run
+// @log 3
+// @log abc
+// @log 1.25
+// @log not-string
+// @log not-f64
+// @log 3
+// @log 1.25
+// @log s-absent
+// @log i-absent
+// @log s-null
+// @log null
+// @log abc
+// @log 3
+// @log 3
+// @log 3
+// @log 3
+// @log 3
+// @log 3
+// @log 7
+// @log 5
+// @log abc
+
+// @hint redundant type annotation: `z` is inferred as `string`
+// @hint redundant type annotation: `w` is inferred as `f64`
+// @hint redundant type annotation: `takeStr` is inferred as `i32`
+// @hint redundant type annotation: `retStr` is inferred as `string`
+// @hint redundant type annotation: `p` is inferred as `{s: string}`
+// @hint redundant type annotation: `xs` is inferred as `string[]`
+// @hint redundant type annotation: `acc` is inferred as `string`
+// @hint redundant type annotation: `gs` is inferred as `string`
+// @hint redundant type annotation: `c` is inferred as `Pack`
+// @hint redundant type annotation: `s` is inferred as `string`
+
+// EVERY ANNOTATION HERE IS DECLARED, NOT DELETED. A `redundant type annotation` hint says the
+// CHECKER agrees about the TYPE; it says nothing about whether the two spellings agree about
+// the REP, which is exactly what this file measures — so the annotated destinations stay and
+// their hints are declared.
+
+// A LITERAL map subscript is a stable PLACE, exactly as `xs[0]` is, so `if m[1] is string`
+// narrows the CELL — and the read has to deliver the narrowed rep. Both key spellings mint the
+// same key on both stages (`typecheck.subscriptKeyTextOf` / `emit_base.subscriptKeyLexemeOf`).
+//
+// EVERY READ HERE PRINTS SOMETHING THE NARROWING HAD TO PRODUCE, never just "it compiled":
+// `.length` on the string arm (a union box has no `.length`), `/ 2.0` on the f64 arm (a box
+// cannot be divided). Both arms of each union are discriminated, so an `is` that answered true
+// for its own arm and for the other one would fail here rather than pass twice.
+//
+// TWO DESTINATIONS PER POSITION, ANNOTATED AND NOT. An annotation PINS the destination's rep,
+// so a fixture that annotates every one of them cannot see the classifier half of this: the
+// un-annotated binding's slot is chosen from the initializer, and it has to follow the read
+// (which unboxes) rather than the map's declared value rep (which is the box).
+
+type Pack = { s: string }
+
+// ── the integer-literal key ───────────────────────────────────────────────────
+function intKey() {
+  const m: {[i32]: string | f64} = Map()
+  m[0] = "abc"
+  m[1] = 2.5
+  if m[0] is string {
+    const z: string = m[0]
+    print(z.length)
+    print(m[0])
+  }
+  if m[1] is f64 {
+    print(m[1] / 2.0)
+  }
+  // …and the OTHER arm of each cell must not match.
+  if m[0] is f64 { print("string-cell-is-f64") } else { print("not-string") }
+  if m[1] is string { print("f64-cell-is-string") } else { print("not-f64") }
+}
+intKey()
+
+// ── the string-literal key ────────────────────────────────────────────────────
+function strKey() {
+  const m: {[string]: string | f64} = Map()
+  m["s"] = "abc"
+  m["f"] = 2.5
+  if m["s"] is string {
+    const z = m["s"] // UN-ANNOTATED: the slot follows the read, not the map's value rep
+    print(z.length)
+  }
+  if m["f"] is f64 {
+    const w: f64 = m["f"]
+    print(w / 2.0)
+  }
+  // A MISSING key narrows nothing — the box reads back null-tagged, so `is` answers false
+  // instead of trapping on the vals slot's `ref.null`.
+  if m["nope"] is string { print("phantom") } else { print("s-absent") }
+  const n: {[i32]: string | f64} = Map()
+  if n[9] is string { print("phantom") } else { print("i-absent") }
+  // …and the same box is what `!= null` and `print` read. `{[K]: V}` and `{[K]: V | null}`
+  // differ only in whether a null can be STORED; a bare read is `V | null` in BOTH.
+  if m["nope"] != null { print("phantom") } else { print("s-null") }
+  print(m["nope"])
+}
+strKey()
+
+// ── the delivery positions ────────────────────────────────────────────────────
+function takeStr(s: string): i32 {
+  s.length
+}
+
+function retStr(m: {[string]: string | f64}): string {
+  if m["s"] is string {
+    return m["s"]
+  }
+  "?"
+}
+
+// ONE GUARD PER POSITION, deliberately. Passing the narrowed place itself to a call retires
+// it for the reads that follow (`callInvalidatesNarrowedPath`'s blunt argument leg), so
+// chaining the positions inside a single guard would measure that rule instead of these.
+function positions() {
+  const m: {[string]: string | f64} = Map()
+  m["s"] = "abc"
+  print(retStr(m))                      // RETURN
+  if m["s"] is string {
+    print(takeStr(m["s"]))              // ARGUMENT
+  }
+  if m["s"] is string {
+    const p: Pack = { s: m["s"] }       // STRUCT FIELD
+    print(p.s.length)
+  }
+  if m["s"] is string {
+    const xs: string[] = [m["s"]]       // NESTED ELEMENT
+    print(xs[0].length)
+  }
+  if m["s"] is string {
+    const bare = m["s"]                 // BINDING, un-annotated
+    print(bare.length)
+  }
+  let acc: string = "?"
+  if m["s"] is string {
+    acc = m["s"]                        // LOCAL ASSIGNMENT
+  }
+  print(acc.length)
+}
+positions()
+
+// ── a MODULE-SCOPE guard writing a module GLOBAL ──────────────────────────────
+const gm: {[i32]: string | f64} = Map()
+let gs: string = "?"
+gm[3] = "abc"
+if gm[3] is string {
+  gs = gm[3]
+}
+print(gs.length)
+
+// ── the REF-NICHE value kinds: nothing to unbox, but the read stops being nullable ────
+function niches() {
+  const cm: {[i32]: Pack} = Map()
+  cm[1] = { s: "abcdefg" }
+  if cm[1] is Pack {
+    const c: Pack = cm[1]
+    print(c.s.length)
+  }
+  const lm: {[string]: i32[]} = Map()
+  lm["a"] = [4, 5]
+  if lm["a"] is i32[] {
+    const l = lm["a"]
+    print(l[1])
+  }
+  const sm: {[i32]: string} = Map()
+  sm[1] = "abc"
+  if sm[1] is string {
+    const s: string = sm[1]
+    print(s)
+  }
+}
+niches()
