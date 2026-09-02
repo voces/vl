@@ -89,6 +89,7 @@ import {
   tyScalarBasePrim,
   tyToEmitName,
   tyToNominalName,
+  unionAliasMembers,
   valueAtomKind,
 } from "./typecheck"
 import {
@@ -12399,11 +12400,50 @@ export function collectU(stmts: i32[]) {
       unTyIx.push(declTyIxOfName(s.udName)) // B-1 step 1
       unDeclIx.push(stmts[i]) // the DECLARATION node — a nominal id that is not a string
       // The alias's full member set, pipe-joined (atom members like `null` kept).
+      // D1028 — A UNION-ALIAS MEMBER FLATTENS HERE TOO. `type JR = Json | E` joined its
+      // declared members verbatim, so the row's member table held `Json` as ONE opaque atom
+      // and every value arm the alias contributed — f64, boolean, string — was absent from
+      // it and got delivered raw: check-clean invalid wasm at return, binding and argument
+      // alike, while the struct arm `E` and `null` (the members the COMPOSITION added) ran.
+      //
+      // Canon already flattens the same shape when it sees the whole spelling with a pipe in
+      // it, which is why the DIRECT `Json | E` runs (D1021). A named alias never reaches that
+      // loop: canon rewrites a `UnionDecl`'s members one at a time, and a lone `Json` has no
+      // pipe, so `nameNeedsCanon` declines and the member stays whole. Same flatten, at the
+      // one site that had none.
+      //
+      // A LITUNION alias is NOT expanded: `K0 | f64` renders its run by the registered alias
+      // on purpose (the owner's 2026-07-29 ruling), and expanding it would soften the run to
+      // `string` — the exact split that ruling reversed.
       let udSet = ""
       let usj = 0
       while usj < vs.length {
+        let udMem = vs[usj]
+        // A LITUNION alias — NUMERIC as well as string. `nameIsLitUnionType` is the
+        // string-only twin (`litKind == "str"`), so gating on it alone expanded `type PA =
+        // 61 | 62` inside `type PU = PA | i32`, softened the run to `i32`, and left `is PA`
+        // with no arm to find. Asked of the ARENA row, which knows both bases.
+        // ONLY A MULTI-ATOM EXPANSION IS TAKEN — a structural self-check rather than a list
+        // of type predicates to keep in sync. A LITUNION alias renders through `tyToEmitName`
+        // as its SOFTENED base: `type PA = 61 | 62` comes back `i32`, ONE atom, and taking
+        // that would delete the arm `is PA` needs — the owner's 2026-07-29 ruling in reverse.
+        // `Json`'s six members render as six atoms and are taken. Three narrower guards were
+        // tried and each was wrong: `nameIsLitUnionType` is the STRING-only twin,
+        // `tyIsLitUnion` off `declTyIxOfName` disagrees with the index the expander resolves,
+        // and `unionMemberCount(name)` counts a pipe-joined SPELLING, so a bare alias name
+        // answers 1 and rejected every expansion.
+        //
+        // AND THE SET IS NOT DEDUPED. One entry per member in member order is what the union
+        // box-tag ABI depends on (`recordUnMemTys` says so in as many words); a dedupe here
+        // silently re-tagged `declared-union-of-litunions` and broke a running program.
+        const udExp = unionAliasMembers(udMem)
+        if udExp != "" {
+          const udExpAtoms: string[] = []
+          splitUnionAtoms(udExp, udExpAtoms)
+          if udExpAtoms.length > 1 { udMem = udExp }
+        }
         if udSet != "" { udSet = udSet + "|" }
-        udSet = udSet + vs[usj]
+        udSet = udSet + udMem
         usj = usj + 1
       }
       unMemberSet.push(udSet)
