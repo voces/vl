@@ -5801,11 +5801,10 @@ function emitUnionPayloadUnbox(_body: i32[], k: i32) {
 // arm's rep and on the stack (left below right), leaving the 0/1 answer.
 //
 // ONE HOME for the three union-`==` lowerings — union-vs-union over a value union, over a
-// struct union, and union-vs-concrete. Each of them had its own two-arm `if k == 2 { str }
-// else { opcode }` tail, so teaching a list arm to compare would have meant writing the same
-// third arm three times and letting them drift; the tag emitted a few instructions earlier
-// and the unbox immediately before are already shared, and this is the third projection of
-// the same code.
+// struct union, and union-vs-concrete. All three already share the tag they emit a few
+// instructions earlier and the unbox immediately before, both projections of the same atom
+// code; this is the third, and keeping it here is what stops a rep that compares at one
+// spelling from refusing at another.
 function emitUnionAtomPayloadEq(body: i32[], k: i32, fnIx: i32) {
   if k == 2 { return emitStrEqCore(body) }
   const lk = leqCoreKindOfAtomKind(k)
@@ -5926,11 +5925,12 @@ function emitUnionConcreteEq(
   // path of every JSON round-trip a consumer writes, which is why the usability critique's
   // programs hand-roll `deepEquals`.
   //
-  // WIDENED ONLY WHERE THE OTHER OPERAND NAMES A SCALAR ATOM THE UNION ACTUALLY CARRIES.
-  // `valueAtomKind` answers -1 for a container or closure atom, so a struct-vs-struct or
-  // list-vs-list compare still takes the refusal; and `unionHasAtomK` is the same membership
-  // test the `eqHasArm` rung below already trusts to decide the static-false fold, so this
-  // admits nothing that rung would not immediately have to answer for.
+  // WIDENED ONLY WHERE THE OTHER OPERAND NAMES AN ATOM THE UNION ACTUALLY CARRIES.
+  // `unionEqArmPresent` is the same membership test the `eqHasArm` rung below trusts to
+  // decide the static-false fold, so this admits nothing that rung would not immediately
+  // have to answer for. An operand with NO atom at all never reaches here — it took the
+  // variant compare above — so what this gate widens is exactly the set of arms whose
+  // payload the tail below can unbox and compare.
   const eqMixedOk = unionEqArmPresent(usid, unmArms, atom, eak)
   if (
     uname == "" ||
@@ -5982,9 +5982,8 @@ function emitUnionConcreteEq(
   fbStructGet(uBoxIdx, 1) // 0xfb 0x02 <box ht> field 1: value (anyref)
   if emitUnionPayloadUnbox(body, eak) < 0 { return -1 }
   if emitUnionEqOther(body, otherIx, eak, fnIx) < 0 { return -1 }
-  // D-EQOPCODE: the payload compare is the LAST projection of `eak` this site re-derived
-  // from the spelling — `atomEqOpcode` ran `valueAtomKind(atom)` and then a four-arm kind
-  // table, with the code already in hand.
+  // D-EQOPCODE: the payload compare is the last projection of `eak`, which already chose
+  // the box tag, the payload unbox and the widened operand emit above it.
   if emitUnionAtomPayloadEq(body, eak, fnIx) < 0 { return -1 }
   fbElse() // 0x05 else: wrong-rep arm — structurally unequal
   fbI32Const(0)
@@ -6048,10 +6047,16 @@ function emitUnionConcreteVariantEq(
   if !variantFieldsComparable(vi) { return -1 }
   const sl = unionEqStashSlot()
   const ar = unionEqArmSlot(vi + 1024)
+  // BOTH OPERANDS RIDE THE WASM STACK UNTIL BOTH HAVE BEEN COMPUTED, and only then are they
+  // parked. The three scratch slots here are shared per FUNCTION, not per site, so a value
+  // parked in one before other user code runs is a value that other code can overwrite: a
+  // union `==` nested inside `otherIx` (`p == pick(s != a1)`) re-enters this very function
+  // and re-uses the same slots. A stack value cannot be reached that way, and after the
+  // second operand lands there is no user code left to run before the compare finishes.
   if emitExpr(body, boxIx, fnIx) < 0 { return -1 }
-  fbLocalSet(sl)
   if emitExpr(body, otherIx, fnIx) < 0 { return -1 }
-  fbLocalSet(ar)
+  fbLocalSet(ar)          // pops the concrete operand, leaving the box on top
+  fbLocalSet(sl)
   fbLocalGet(sl)
   fbStructGet(uBoxIdx, 0) // field 0: tag
   fbI32Const(uTags[vi])   // the arm's program-global tag
@@ -6152,10 +6157,17 @@ function emitStructUnionEq(
   }
   const sl = unionEqStashSlot()
   const sr = unionEqStashSlot2()
+  // BOTH OPERANDS RIDE THE WASM STACK UNTIL BOTH HAVE BEEN COMPUTED, and only then are they
+  // parked. These slots are shared per FUNCTION, so a left operand parked before the right
+  // one is evaluated is a value the right one's own code can overwrite: a union `==` nested
+  // inside it (`p == pick(w == v)`) re-enters this function and re-uses the same two slots,
+  // and the outer compare then reads the INNER's left operand — a check-clean module with a
+  // wrong answer. A stack value cannot be reached that way, and the evaluation order is
+  // unchanged (left, then right).
   if emitExpr(body, lIx, fnIx) < 0 { return -1 }
-  fbLocalSet(sl)
   if emitExpr(body, rIx, fnIx) < 0 { return -1 }
-  fbLocalSet(sr)
+  fbLocalSet(sr) // pops the right operand, leaving the left on top
+  fbLocalSet(sl)
   // TAGS FIRST: two different arms are never equal, and the tag IS the arm.
   fbLocalGet(sl)
   fbStructGet(uBoxIdx, 0)

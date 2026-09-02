@@ -33906,6 +33906,19 @@ Repro (RUNS and prints `true`):
   [D1097](#d1097). Evaluation counts are pinned rather than asserted: each side runs exactly
   once, including on the miss arm, where the concrete operand is parked before the tag test.
 
+* **A NESTED UNION `==` INSIDE AN OPERAND CLOBBERED THE OPERAND STASH — found by writing
+  it, and PRE-EXISTING in the sibling lowering.** The scratch slots a union compare parks
+  its operands in are shared per FUNCTION, not per site, so
+  `p == pick(scalarArm != a1)` re-enters the same lowering and overwrites them, and the
+  outer compare then reads the INNER's operand: a check-clean module with a WRONG answer.
+  `emitStructUnionEq` has the identical shape and the identical bug — `p == pickAB(w == v)`
+  prints `false` where the answer is `true`, byte-identically on the merge-base `60df1e87`,
+  so it is not this change's. Both are fixed the same way: **both operands ride the wasm
+  STACK until both have been computed**, and only then are parked. Evaluation order is
+  unchanged, a stack value is unreachable from the nested code, and no user code runs
+  between the second operand landing and the compare finishing. Both rows are in the
+  fixture, each chosen so a clobber CHANGES the answer.
+
 * **NOT D1061.** D1061 is union-vs-union through `emitStructUnionEq`; this was
   union-vs-concrete through `emitUnionConcreteEq`, a different function with a different
   gate, and D1061's fix moved none of these cells (re-measured after it landed). The core
