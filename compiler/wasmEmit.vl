@@ -6202,6 +6202,47 @@ function unionEqArmPresent(
 // Returns 0 when it emitted and -1 when it DECLINES (the operand is not a concrete variant,
 // or the arm carries a field this lowering cannot compare), so the caller keeps its loud
 // refusal rather than writing a bad module.
+// D1180 / D1181 — THE VARIANT ROW THE CONCRETE OPERAND'S VALUE ACTUALLY HAS, which is not
+// always the row `exprVariantIndex` names. That resolver is REP-AUTHORITATIVE over BINDINGS,
+// so it carries a leg per storage class a binding can take (param, declared local, capture,
+// module global, cast, call, index, `??`) and none for a struct-FIELD read — `h.a` answers
+// -1 there. And an UN-ANNOTATED object literal is declined on purpose the moment the struct
+// table holds a row matching its field set (`objLitVariantIdxNoStructRow`), which one
+// unrelated `type N = { inner: { x: i32 } }` is enough to arrange. Both answer -1 while the
+// VALUE is a perfectly good arm-typed ref.
+//
+// THE BRIDGE IS HEAP IDENTITY, NOT SHAPE MATCHING. `sHeapIdx` and `uVarHeap` are two index
+// spaces over ONE wasm type space (DECISIONS.md keeps the namespaces apart on purpose), and
+// two rows that interned to the SAME wasm struct type hold values that are interchangeable
+// byte for byte. That is the whole of what the compare below needs: it casts the box's
+// payload to `uVarHeap[vi]` and parks the concrete operand in a slot typed from the same
+// index, so an equal heap index means no conversion sits between them. Where the two rows
+// interned separately this answers -1 and the caller keeps its loud refusal, which is the
+// honest answer — a cross-heap compare would need a converting read this lowering has not
+// built.
+//
+// EXACTLY ONE MATCH, OR NONE. Two arms of one union can share a heap type when their shapes
+// are identical, and then the HEAP does not determine the TAG — so an ambiguous match
+// declines rather than guessing which arm the payload cast should select.
+function eqConcreteVariantRow(exprIx: i32, fnIx: i32) {
+  const vi = exprVariantIndex(exprIx, fnIx)
+  if vi >= 0 { return vi }
+  const ssi = structIndexOfExpr(exprIx, fnIx)
+  if ssi < 0 { return -1 }
+  if ssi >= sHeapIdx.length { return -1 }
+  const h = sHeapIdx[ssi]
+  let found = -1
+  let i = 0
+  while i < uVarHeap.length {
+    if uVarHeap[i] == h {
+      if found >= 0 { return -1 }
+      found = i
+    }
+    i = i + 1
+  }
+  found
+}
+
 function emitUnionConcreteVariantEq(
   body: i32[],
   boxIx: i32,
@@ -6209,7 +6250,7 @@ function emitUnionConcreteVariantEq(
   isNe: boolean,
   fnIx: i32,
 ) {
-  const vi = exprVariantIndex(otherIx, fnIx)
+  const vi = eqConcreteVariantRow(otherIx, fnIx)
   if vi < 0 { return -1 }
   // The same four parallel-table bounds `emitStructUnionEq` takes before it writes a byte,
   // for the same reason: a variant row the emitter's tables do not cover must DECLINE, never
