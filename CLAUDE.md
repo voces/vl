@@ -380,6 +380,18 @@ the rebuild — `rm target/release/vl && touch src/main.rs` first — because ca
 fingerprint can say `Finished` while leaving a clobbered artifact in place; verify
 BEHAVIORALLY (run a program the change affects), never by timestamp.
 
+**AND PUT THE ISOLATED BINARY INSIDE THE WORKTREE, NOT IN SCRATCH** — the two rules in this
+section interact, and taking the first one literally breaks the second. `cargo build
+--target-dir /tmp/…` is correctly isolated and its binary resolves NO `std:` at all, because
+the host walks ancestors of the EXE and `/tmp` has none. The symptom is not a `std` error in
+the thing you are testing: it is **15 unrelated filed witnesses grading as `check_reject`**,
+which reads as a catastrophic regression from a five-line change. Build to the isolated
+`--target-dir`, then COPY the result over the worktree's own
+`scripts/vl-host/target/release/vl` (a symlink into the shared target — replacing it is
+worktree-local and leaves the shared binary untouched). Ancestors of that path include the
+worktree root, so `std/` resolves, and it resolves to the WORKTREE's std, which is what you
+want. Restore the symlink when done. Measured 2026-09-01 on D1011.
+
 ## `vl` resolves `std:` from the EXE's checkout — a worktree probe measures the WRONG std
 
 The host walks ancestors of the BINARY, and every agent worktree symlinks
