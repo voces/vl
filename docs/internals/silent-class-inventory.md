@@ -34296,3 +34296,45 @@ Repro (should print `1` then `6`):
 
 * Probe: `scripts/capability-probes/loop-var-shadowing-fn-name-capture.vl`.
 
+### D1131 — `.clear()` serves four list reps where `.pop()` serves eight, and fails THREE different ways at the rest — one of them check-clean invalid wasm
+
+**THREE outcome classes for one method · loud emit reject at `f64[]`/`f32[]` (`emitProgram: .clear but list type not collected`, `compiler/wasmEmit.vl`), a DIFFERENT loud reject one stage earlier at `u8[]` (`emitProgram: unsupported member-call statement`), and CHECK-CLEAN INVALID WASM at `i64[]` (`type mismatch: expected (ref null $type), found (ref $type)`) · ZERO corpus cells · found 2026-09-02 as a side-finding of the emit-refusal reachability measurement and re-verified cell by cell before filing**
+
+Repro (the `i64` face — `vl check` rc 0, module does not validate):
+
+    const xs: i64[] = [1, 2]
+    xs.clear()
+    print(xs.length)
+
+* **THE ABLATION IS A CLEAN LADDER, AND `.pop()` IS THE CONTROL THAT MAKES IT DAMNING.**
+
+  | element rep | `.clear()` | `.pop()` |
+  | --- | --- | --- |
+  | `i32[]` | runs | runs |
+  | `string[]` | runs | runs |
+  | `boolean[]` | runs | runs |
+  | a struct `P[]` | runs | runs |
+  | `f64[]` | **loud emit reject** | runs |
+  | `f32[]` | **loud emit reject** | runs |
+  | `u8[]` | **loud emit reject** (earlier stage) | runs |
+  | `i64[]` | **CHECK-CLEAN INVALID WASM** | runs |
+
+  Every rep `.clear()` refuses, `.pop()` serves. D977 built the scalar ladder for `pop` and
+  nothing asked `clear` the same question, so `emitClear` has no scalar arm.
+
+* **THREE MESSAGES IS THE SHAPE, NOT THE FAMILY.** `u8[]` is refused by the STATEMENT
+  DISPATCHER (`unsupported member-call statement`) before `emitClear` is reached at all, so it
+  refuses one stage earlier than `f64[]`/`f32[]` and its sentence names nothing about `clear`.
+  Grouping these by message would have produced three rows; the ablation says one gap.
+
+* **THE `i64` FACE IS A CLAUSE-1 VIOLATION and is the reason this is not merely a capability
+  gap.** `vl check` returns 0 and the module does not validate. One rep of one method is
+  unsound while its siblings are loud and its cousin is correct — which is exactly the state a
+  per-rep ladder decays into when only one method is walked.
+
+* **THE FIX IS THE LADDER, NOT THE MESSAGE.** Give `emitClear` the scalar arms `emitPop`
+  already has, and wire the statement dispatcher so `u8[]` reaches it. Narrowing any of the
+  three sentences closes nothing.
+
+* Probe: `scripts/capability-probes/clear-over-scalar-list-reps.vl`.
+
