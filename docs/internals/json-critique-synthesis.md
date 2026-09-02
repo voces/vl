@@ -7,7 +7,8 @@
 > session against the 2026-09-01 seed before it was relied on, and four of the claims
 > grew into inventory rows while being verified (D1024–D1028 filed; D1021 re-ablated and
 > closed #2315; D1026 closed the same day, leaving D1027 as its residue, and D1021's close
-> left D1028 as its own).
+> left D1028 as its own — closed #2318 the day after). Open from the round: D1024 (on the
+> q3 ruling), D1025, D1027.
 >
 > Three kinds of item here. **§1** is what all three agreed on or what costs nothing —
 > taken, and already written into `docs/json-design.md`. **§2** is what the owner has to
@@ -234,9 +235,9 @@ added four. In ship order:
    membership together. Read at first as D1021 with `null` as the composed arm; item 1
    closed (#2315) and D1027 re-graded with the identical refusal — its own row, vl-de's.
    And the close left a second residue, **D1028**: a NAMED alias of the composition
-   (`type JR = Json | E`) delivers the recursive alias's value arms raw (invalid wasm)
-   while the direct spelling runs. The module never names the composition; a consumer
-   will.
+   (`type JR = Json | E`) delivered the recursive alias's value arms raw (invalid wasm)
+   while the direct spelling ran — **CLOSED #2318** the next day (the declaration-site
+   member table held `Json` as one opaque atom; it flattens there now).
 4. **D1009 / D1010 — `Json | null` ↛ `Json`; null-bearing literals** (unchanged). The
    wrong-repair footgun (§1.10) is why D1009 outranks D1022.
 5. **D1022 — named arm aliases**, emit half first (`let o: JsonObject = Map()` refuses;
