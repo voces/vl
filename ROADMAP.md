@@ -97,11 +97,13 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   semantics), a compiler-derived per-`T` shape walk that BUILDS the `T`-repped value from
   the tree. Measured today: `is` is a tag test — a struct RHS is refused as "not a variant",
   and a refinement of an arm (`["xyz"] is string[]`) is check-clean and answers `false`
-  unconditionally (**D1035**, this item's witness). Design + four sub-rules with
-  recommendations (copy semantics; integral `i32` fields — the same predicate as q2's
-  exact `as`; absent ≠ null; `as` propagates `JsonError { kind: "shape", path }`) in
+  unconditionally (**D1035**, this item's witness). Design + four sub-rules (copy
+  semantics; integral `i32` fields — the same predicate as q2's exact `as`; **S3 RULED
+  2026-09-02: an absent key matches a `T | null` field and reads `null` — VL's own map
+  read already does, and a nullable field is not a REQUIRED key for OQ-7's arm rule**;
+  `as` propagates `JsonError { kind: "shape", path }`) in
   `docs/serde-design.md` §"Deep `is` / `as` over a `Json` value"; DECISIONS.md has the
-  ruling. It is serde Stage 2's JSON half brought forward (checker "is a JSON shape"
+  rulings. It is serde Stage 2's JSON half brought forward (checker "is a JSON shape"
   predicate + emitter walk keyed on the RHS type); OQ-1 (b)'s intrinsic stays for the
   binary source and `serialize`. Position matrix before the checker narrows (D965).
   Compiler-side work; the compile-goal session's surface once the sub-rules are ruled.

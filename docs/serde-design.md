@@ -1472,13 +1472,36 @@ one"), never a std file.
   to an INTEGER target is exact-or-fail under the trio"), so the two land on one definition:
   an `i32` field under the walk matches iff `v as? i32` would be non-null. Recommend: exact-or-fail; a consumer that wants truncation declares `f64`
   and truncates in VL, where the loss is spelled.
-- **S3 — absent key ≠ present `null`, and `T | null` matches only the latter.** Decision A
-  already rules the WRITE side ("always emit `"f": null`, never omit it"); the read side is
-  its mirror, and the reason is the same — `{x} | {x, y}` is only decidable when absence
-  is a fact. Recommend: keep the mirror; a config that wants optional keys declares the
-  field `T | null` AND writes the null, or reads through a `{[string]: Json}` catch-all.
-  The alternative (absent reads as `null`) is the JS convention and is what most config
-  readers want, so this is the one most worth the owner's eye.
+- **S3 — an ABSENT key matches a `T | null` field and reads as `null`. RULED (owner,
+  2026-09-02).** The recommendation here used to be the opposite (absent ≠ null, the
+  read-side mirror of decision A); measuring changed it, and the owner ruled the measured
+  way. Three facts decided it. (1) `doc`'s object level is the MAP `{[string]: Json}` and
+  `Cfg` is a STRUCT, so "absent" is a fact of the source and `null` is the only thing the
+  target can hold for it — a VL struct has no absent field, and there is no `field?: T`
+  syntax; `T | null` is the language's one spelling of "maybe not there". (2) **VL's own map
+  read already says absent is `null`**: `const m: {[string]: i32} = Map(); m["a"] = 0;
+  m["zz"] == null` prints `true` on the current seed, and the stored `0` under `"a"` reads
+  as `0`, not `null` (#1899/#1901 made a miss distinguishable from a stored zero, so the
+  `null` is the miss and nothing else). A shape walk that refused the
+  absent key would be STRICTER than reading the same map by hand. (3) Nothing a struct
+  could have expressed is lost: the consumer that needs "absent vs. explicit null" still has
+  it on the map (`doc["host"]`), and the round trip only canonicalises the JSON TEXT
+  (`{}` → read → write gives `{"host": null}`; the VL value is identical). What the rule
+  costs — a producer that forgot a nullable field reads as `null` rather than failing `is`
+  — is exactly what `m[k]` costs today.
+
+  Consequences, so OQ-7 stays decidable: a field typed `T | null` is **NOT a required
+  key**, so `{x} | {x, y: T | null}` has one required key set and the checker refuses the
+  union as ambiguous — the "two versions differing only in an optional field cannot be told
+  apart" sentence in the OQ-7 ruling was already this rule. A missing NON-nullable field is
+  still not a match (`{"host": "x"} is Cfg` is `false` when `port: i32`). Decision A on the
+  WRITE side stands unchanged: the writer always emits `"f": null`, so a VL-produced
+  document always carries every key and the asymmetry is the deliberate one — total writer,
+  lenient reader. The grading list for the build: `{"port": 1} is Cfg` → `true` with
+  `cfg.host == null`; `{"port": 1, "host": null}` → `true`; `{"host": "x"}` → `false`;
+  `type T = {x: i32} | {x: i32, y: i32 | null}` refused at the `is` site naming both arms;
+  and the un-annotated spelling of each (a `const cfg = doc as Cfg` with no declared
+  destination), since an annotation pins a rep the walk must not depend on.
 - **S4 — `as` propagates a `JsonError`, not the remainder.** The trio's rule for a union is
   "propagate the arms `T` excludes"; for a shape test the excluded remainder is the whole
   tree, which is useless to a caller. Recommend: `doc as Cfg` in a function returning
