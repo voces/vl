@@ -29917,12 +29917,31 @@ Repro (check-clean invalid wasm):
   literal's own elements rather than the narrowed destination's arm. That is why the INDEXED
   read-back runs: it never asks this classifier.
 
-* **BUT A RUNG IN `forInElemKind` DOES NOT REACH IT — measured, so do not start there.** Adding
-  a narrowed-arm rung ahead of `exprStringArray` changes nothing, and neither does forcing it
-  to return `"union"` for ANY narrowed atom. So either `narrowedValueAtomOf` answers nothing
-  for this receiver — it is a MODULE-level `const` narrowed by a top-level `if`, not a local —
-  or the `#l` temp's type is not decided by `forInElemKind` at all. Separate those two before
-  writing a fix; the disassembly above still says the two reps are `$5` and `$7`.
+* **THE DISCRIMINATION IS SETTLED: it is MODULE SCOPE, and only `for in`.** The identical
+  program inside a function RUNS. At module scope, narrowing itself is fine — `is string`
+  prints, `.length` prints `1`, and the INDEXED read prints `x`. Only `for in` fails. So
+  `narrowedValueAtomOf` and `exprUnion` do work for a module-level `const`; nothing about the
+  narrowing machinery is missing.
+
+  | spelling | module scope | in a function |
+  | --- | --- | --- |
+  | `is string` on the union | runs | runs |
+  | `is K[]` then `.length` | runs | runs |
+  | `is K[]` then `c[0]` | runs | runs |
+  | `is K[]` then `for e in c` | **check-clean invalid wasm** | runs |
+
+* **AND THE MODULE PATH IS A DIFFERENT CALL SITE.** `declareForInLocals` has exactly two
+  callers: `emit_collect.vl:4451` with the enclosing `fnIx`, and **`emit_sections.vl:1612`
+  with `-1`** — the module-level one. That is where the `#l` temp's kind is fixed for a
+  top-level `for in`.
+
+* **A RUNG IN `forInElemKind` DOES NOT REACH IT, measured**: adding a narrowed-arm rung ahead
+  of `exprStringArray` changes nothing, and neither does forcing it to return `"union"` for
+  ANY narrowed atom. Since narrowing demonstrably works at module scope by the table above,
+  the remaining explanation is TIMING — `declareForInLocals` runs while locals are being
+  declared, before the walk that pushes the narrowing record, so the atom is genuinely absent
+  at that moment. Confirm that before fixing: if it holds, the fix is to defer the `#l` kind
+  or to seed the narrowing earlier for module-level statements, NOT to add another rung.
 
 * So the target is one classifier, not the literal's construction: **a for-in over a
   narrowed union arm must take its element kind from the ARM, not from the values the literal
