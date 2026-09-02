@@ -240,6 +240,7 @@ import {
   mapShapeFoldSet,
   mapValNameOf,
   memberPathKeyOf,
+  moduleBindsLoopVar,
   nameIsBareMap,
   nameIsClosureArray,
   nameIsClosureArrayTy,
@@ -275,6 +276,7 @@ import {
   parenUnionArrElemName,
   parentLetOf,
   parentLetOfSid,
+  parentLoopVarOf,
   placeNarrowKeyOf,
   removeAtomFrom,
   retArrFlag,
@@ -4315,7 +4317,14 @@ export function captureCountOf(fe: i32) {
 function capRecord(name: string, bound: string[], caps: string[]) {
   if capIsBound(bound, name) { return 0 }
   if globalIndexOf(name) >= 0 || fnIndexOf(name) >= 0 {
-    if parentBindingFrameOf(capFrame, name) < 0 { return 0 }
+    if parentBindingFrameOf(capFrame, name) < 0 {
+      // The MODULE scope is the one enclosing scope the frame walk cannot reach, and it
+      // has a binding form that is not a global: a top-level `for` variable. Without this
+      // the walk running off the chain was read as "nothing encloses it", and a closure
+      // written in a top-level loop body silently addressed the module function instead
+      // of the loop variable (an `indirect call type mismatch` trap at run time).
+      if !moduleBindsLoopVar(emitRootIx, name) { return 0 }
+    }
   }
   // D-CAPCALLEE: the `isBuiltinFnName` exemption used to sit HERE — at every identifier in
   // every position — and it is POSITIONAL, so it moved to `capScan`'s `Call` arm. A builtin
@@ -4609,6 +4618,13 @@ function parentBindingFrameOf(fe: i32, name: string): i32 {
       i = i + 1
     }
     if parentLetOf(pfn.fnBody, name) >= 0 { return par }
+    // A `for` LOOP VARIABLE binds the frame exactly as a body `let` does — same
+    // function-scoped wasm local, same shadowing of an outer name. Without this arm the
+    // frame answered "does not bind it" for a loop variable, and `capRecord`'s
+    // global/function-name guard then dropped the capture: `for q in 1 to 3 { () => q }`
+    // in a module that also has SOME function named `q` built a null env and read the
+    // module `q` instead.
+    if parentLoopVarOf(pfn.fnBody, name) >= 0 { return par }
     return parentBindingFrameOf(par, name)
   }
   -1
@@ -38406,20 +38422,81 @@ function letDeclIsClosureNoLocal(letIx: i32) {
 // `paramIsClosure` is annotation-only (`tyIsFuncType(paramTypeNode(…))`) and
 // `letDeclIsClosureNoLocal` reads the annotation or one initializer node, so the
 // no-registry contract this function exists to keep is intact.
+// The binding node `name` denotes in the ONE frame whose `FuncDecl` is at arena index
+// `fnIx` — a `Param`, a body `let`/`const` (`LetDecl`) or a `for` variable
+// (`ForRange`/`ForIn`) — or -1 when this frame binds no such name. Params first, matching
+// the emitter's own resolution order.
+function frameBindingNode(fnIx: i32, name: string): i32 {
+  if fnIx < 0 { return -1 }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      const p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name { return params[i] }
+      }
+      i = i + 1
+    }
+    const li = parentLetOf(fn.fnBody, name)
+    if li >= 0 { return li }
+    return parentLoopVarOf(fn.fnBody, name)
+  }
+  -1
+}
+
+// The binding a bare identifier denotes, seen from inside the function at arena index
+// `fnIx`: this frame's own param / `let` / `for` variable, else the nearest ENCLOSING
+// frame that binds it (the name is a CAPTURE there). -1 when no scope in the chain binds
+// it — the only case in which the name can denote a module-level global or function.
+//
+// `parentBindingFrameOf` answers the frame half of this for the capture analysis; this
+// answers the NODE half from the same two facts (`fnParent` plus a frame's own bindings)
+// and covers the frame's own scope too, which that one deliberately skips.
+function identBindingNoLocal(fnIx: i32, name: string): i32 {
+  const own = frameBindingNode(fnIx, name)
+  if own >= 0 { return own }
+  let pp = fnStmtsPosOf(fnIx)
+  // `fnStmts.length` bounds the walk the way `fnIndexOfInScopeSid`'s does: a parent chain
+  // cannot outrun the function count, so a malformed `fnParent` cannot spin here.
+  let steps = 0
+  while pp >= 0 && steps <= fnStmts.length {
+    if pp >= fnParent.length { return -1 }
+    pp = fnParent[pp]
+    if pp < 0 || pp >= fnStmts.length { return -1 }
+    const hit = frameBindingNode(fnStmts[pp], name)
+    if hit >= 0 { return hit }
+    steps = steps + 1
+  }
+  -1
+}
+
 function exprIsClosureNoLocal(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
   const e = P.nodes[exprIx]
   if e is Paren { return exprIsClosureNoLocal(e.parInner, fnIx) }
   if e is FuncDecl { return true }
   if e is Ident {
-    if fnIndexOfSid(sidOfNode(exprIx)) >= 0 { return true }
-    if paramIsClosure(fnIx, e.identName) { return true }
-    const fn = P.nodes[fnIx]
-    if fn is FuncDecl {
-      const li = parentLetOf(fn.fnBody, e.identName)
-      if li >= 0 { return letDeclIsClosureNoLocal(li) }
+    // THE SCOPE IS ASKED FIRST. `fnIndexOfSid` is a MODULE-WIDE question — "is anything
+    // in this module named `q`" — and it used to stand ahead of every scope question, so
+    // a tail reading a PARAM, a body `let` or a `for` variable named `q` was classified
+    // as returning a function value whenever some unrelated `function q` existed
+    // anywhere. The result valtype was then minted as the closure struct over a body
+    // pushing an i32: `vl check` rc 0 and INVALID WASM at the caller
+    // ("expected i32, found (ref $type)"). A name a scope binds denotes that binding;
+    // only a name NO scope binds can denote the module's function.
+    const b = identBindingNoLocal(fnIx, e.identName)
+    if b >= 0 {
+      const bn = P.nodes[b]
+      if bn is Param { return tyIsFuncType(bn.parType) }
+      if bn is LetDecl { return letDeclIsClosureNoLocal(b) }
+      // A `for` variable: an i32 counter, or an element of the iterated list. Neither is
+      // a bare function NAME, which is all this no-registry predicate can claim.
+      return false
     }
-    return false
+    if moduleBindsLoopVar(emitRootIx, e.identName) { return false }
+    return fnIndexOfSid(sidOfNode(exprIx)) >= 0
   }
   if e is ObjLit { return false }
   false
