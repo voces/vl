@@ -29894,6 +29894,30 @@ Repro (check-clean invalid wasm):
 
 ---
 
+* **THE TWO REPS ARE NAMED, from the disassembly.** The narrowing emits
+  `local.set $2 (ref.cast (ref $5) (struct.get $0 1 …))` into a local declared `(ref $7)`, and
+  the validator's `expected (ref $type), found (ref $type)` is those two:
+
+  | type | definition | what it is |
+  | --- | --- | --- |
+  | `$5` | `struct (mut (ref $4)) …` where `$4` is `array (mut (ref null $0))` | a list of union BOXES |
+  | `$7` | `struct (mut (ref $6)) …` where `$6` is `array (mut (ref null $3))` | a list of STRINGS |
+
+  For `type K = string | K[]` the arm `K[]` is an array of `K`, and `K` is a union, so its
+  elements are boxes. **`$5` is right and `$7` is wrong** — the cast agrees with the union arm
+  and the for-in local does not.
+
+* **THE WRONG ONE COMES FROM `forInElemKind`.** It classifies the iterable's ELEMENT and
+  answers `str` here, which types the `#l` list temp as `strlist` (`$7`). It is reading the
+  literal's own elements rather than the narrowed destination's arm. That is why the INDEXED
+  read-back runs: it never asks this classifier.
+
+* So the target is one classifier, not the literal's construction: **a for-in over a
+  narrowed union arm must take its element kind from the ARM, not from the values the literal
+  happened to contain.** Grade any movement on `capability-probes/run.py` and the corpus —
+  the nested-array literal's "is unsupported" wording is NOT counted by
+  `goal-scoreboard.py --sites`.
+
 ### D1016 — a bare NESTED array literal refuses at ALL THREE delivery boundaries into `Json`, and a bare literal holding a MAP refuses with a second sentence; annotating the literal clears both
 
 **loud emit reject · check rc 0 · `emitProgram: array value does not match any array member of the union (leaf-scalar widening across a nested array is unsupported)` (`compiler/wasmEmit.vl:4887`) at binding, argument AND map-write · a bare literal whose element is a MAP instead takes `emitProgram: a union arm that is an array-of-map is not yet supported — use a named element type` (`wasmEmit.vl:4921`) · both are cleared by annotating the literal `Json[]` and delivering that · `goal-scoreboard.py --sites` lists the array-of-map literal as a **ZERO** row (no corpus cell reaches it) and does NOT count the nested-array one at all — its wording says "is unsupported", which the `CONCEDES` filter does not match, so it is a D964 lower-bound case · found by the serde round-3 appendix (residues (c) and (d)), re-measured 2026-09-01**
