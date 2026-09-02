@@ -130,7 +130,44 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   and the `trunc`/`floor`/`ceil`/`nearest`-operand peephole to the single trapping
   instruction — do not lean on binaryen for that fold, its float folds are NaN-conservative;
   (4) `std/fmt.vl` `parseI32`'s "unchecked wrapping truncation" comment goes. Grade on
-  D1041's ten-row table. DECISIONS.md §"Numeric `as` to an INTEGER target is exact-or-fail
+  D1041's ten-row table.
+
+  **STATUS 2026-09-02: (1) MERGED (#2355, byte-identical). (2) BUILT. (3) DESIGNED AND
+  BLOCKED AT ONE NAMED PLACE.** Branch `numeric-as-phase23-wip` carries both; it is NOT for
+  merge, because phase 2 alone turns a running `3.9 as? i32` into an emit refusal and the two
+  must land together.
+
+  Four things the attempt settled, so the next one does not re-derive them:
+
+  * **The site count was 17, not 88** (compiler 2, std 15, tests/cases 167 — the 67/21/230
+    estimate was a bare grep, and 70 of its compiler+std hits are prose inside `//` comments
+    discussing casts). Corrected here and in DECISIONS.md.
+  * **A DESUGAR, not an emitter arm, is the right lowering for `as?`** — `d as? i32` becomes
+    `if d == trunc(d) && d >= LO && d <= HI { d as! i32 } else { null }` in `emit_rewrite`,
+    beside D962's `??`. It is small precisely because `i32 | null` already has a rep at every
+    delivery position and an `if` yielding it reuses all of them, where an `emitAsCast` arm
+    would re-wire that matrix by hand. The predicate was MEASURED exact before it was written:
+    a fraction fails the first conjunct, an overflow and an infinity fail the range, and NaN
+    fails the first conjunct for free (`NaN == trunc(NaN)` is false). `trunc` returns `f64`.
+  * **THE BLOCKER IS THE SYNTHESIZED `null`, AND IT IS NOT A POSITION GAP.** The desugar
+    refuses with `emitProgram: bare null needs a struct-typed context`. A HAND-WRITTEN
+    `if b { 7 } else { null }` runs at all four positions tried — function-body tail,
+    annotated binding, un-annotated binding, argument — so the `if`-arm position is wired.
+    What the synthesized node lacks is whatever a real `null` carries: `emitNullLit`'s ladder
+    reads its DESTINATION (`pendingVariantIdx`, the enclosing `FuncDecl`'s nullable-variant
+    return, `pendingStructIdx`), never the node's own type, so `nodeTyCarry` on the `if` AND
+    on the `null` changes nothing — measured, both. `emitUnionCoerce`'s NullLit arm is the
+    existing capability that boxes a `null` into a value-union box; routing the desugared arm
+    to it is the next step.
+  * **A bare `as` is a different lowering from `as?`**, not the same one — it yields `T` and
+    propagates on failure, so it wants the early-`return` shape `emitAsCast`'s UNION arm
+    already uses, not the `if`-expression above.
+
+  And one price to write down before phase 2 ships: today a bare `f64 as i32` TRAPS on NaN,
+  ±Inf and overflow. Under the ruling those become a propagated `null`. After #2355 the tree
+  spells no bare numeric `as`, so the only program whose meaning changes is a user function
+  returning `| null` with a bare numeric `as` inside; everything else becomes a loud check
+  error. DECISIONS.md §"Numeric `as` to an INTEGER target is exact-or-fail
   under the trio" has the survey (Julia's `Int(3.9)` InexactError / `trunc(Int, x)` is the
   model adopted) and the cost. Compiler-side; the compile-goal session's surface.
 - **A subsumed literal arm COLLAPSES — RULED (owner, 2026-09-02), NOT BUILT.** A union is a
