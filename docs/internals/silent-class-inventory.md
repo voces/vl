@@ -24252,6 +24252,18 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   the arms**. Acceptance is a value table, not a compile: `1 == 1` true, `1 == 2` FALSE,
   `"ab" == "ab"` true, `1 == "ab"` false.
 
+* **AND THE VALUE BOX IS NOT THE BROKEN PART EITHER.** The obvious reading of "the i32 arm
+  always compares equal" is that `vbI32Idx` is stale because `vbI32Used` was never set, so the
+  cast-and-read lands on the wrong struct and reads a field that happens to match. Forcing
+  that flag true ALONGSIDE the arm expansion still prints `1 == 2` as `true`. Two independent
+  eliminations now: the flag alone (refusal unchanged) and the flag with the expansion (value
+  still wrong).
+
+  The compare SEQUENCE itself reads correctly at source level — unbox left, unbox right,
+  `atomEqOpcodeOfKind` — so the next probe should check what those two unboxes actually push,
+  by disassembling the expanded build rather than reading the emitter. That is the same move
+  that settled D1015 and D976 after source-reading failed.
+
 * Numbered in this session's block rather than the reporter's, so the range reservations stay
   clean.
 
