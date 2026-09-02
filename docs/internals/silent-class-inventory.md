@@ -29741,10 +29741,15 @@ module does not validate.
 * **INDEPENDENTLY REPRODUCED** by vl-de on the live seed, 2026-09-01: `const a: string = v`
   prints, and the bare re-bind fails to compile. Two agents, same seed, same split.
 
-* **PROBED AND NEGATIVE (vl-de, 2026-09-01) — do not repeat these two.** (1) Forcing
+* **PROBED AND NEGATIVE (vl-de, 2026-09-01) — do not repeat these three.** (1) Forcing
   `letIsString` true for the re-bound local changes NOTHING. (2) Forcing the local's slot to
   `"str"` in the 24-branch ladder in `emit_collect` (the `letIsLitUnion || letInitIsLitAtom`
-  head) changes NOTHING. So neither the string classifier nor the slot kind is the decision
+  head) changes NOTHING. (3) `exprString`'s Ident arm has no rung for an ordinary local
+  `let` — it asks about params, module declarations, captures and globals only — and a rung
+  that consults `letIsString` through `parentLetOf(fn.fnBody, name)` was added and did NOT
+  move the witness. (Recorded as "added and did not move it", not as a cause: `parentLetOf`
+  scans the function body and this binding sits inside the `if` block, which may be why —
+  unconfirmed.) So neither the string classifier nor the slot kind is the decision
   being made wrongly. The decision is at the value being STORED, or at its READ — which
   means the probe belongs at the CONSUMER, keyed on the argument node, not at the classifier
   keyed on a name. That is the D976 lesson arriving a second time: a classifier keyed by
