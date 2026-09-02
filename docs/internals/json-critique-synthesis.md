@@ -5,7 +5,8 @@
 > table cells right; 10 findings), `json-critique-usability.md` (four consumer programs
 > run on the seed; 8 findings). Every compiler claim below was re-run by the tooling
 > session against the 2026-09-01 seed before it was relied on, and four of the claims
-> grew into inventory rows while being verified (D1024–D1026 filed; D1021 re-ablated).
+> grew into inventory rows while being verified (D1024–D1027 filed; D1021 re-ablated;
+> D1026 closed the same day, leaving D1027 as its residue).
 >
 > Three kinds of item here. **§1** is what all three agreed on or what costs nothing —
 > taken, and already written into `docs/json-design.md`. **§2** is what the owner has to
@@ -196,9 +197,11 @@ check-clean invalid wasm in a signature (D1024). The checker already half-collap
   does this, and it makes `string | "err"` a different type from `string` while every
   value of one is a value of the other.
 
-**Recommendation: collapse**, and the same rule closes D1026 (`P | null` where `P`
-already holds `null` — dedupe after alias expansion). Nothing in `std:json` spells either;
-it is here because the fix for D1021/D1024/D1026 has to pick.
+**Recommendation: collapse.** Nothing in `std:json` spells either; it is here because the
+fix for D1024 has to pick. (This section first said the same rule closes D1026 — `P |
+null` where `P` already holds `null`. Measured wrong the same day: D1026's witness closed
+by a nullable fold in the arena TYPE, not by any dedupe of the spelling, and `string |
+"err"` fails identically after it. §3 item 3 has the corrected state.)
 
 ### 2.4 Nothing else is open
 
@@ -223,9 +226,12 @@ added four. In ship order:
    loud one every consumer meets; the integer-literal face is check-clean invalid wasm.
    **Build the emitter's map-read narrowing BEFORE widening the checker's key**, or the
    string face moves loud→silent (D965's position rule).
-3. **D1024 / D1026 — duplicate atom after alias expansion in a signature** (new; one
-   dedupe plausibly closes both). D1026 is `Json | null`, the signature every accessor
-   wants (usability gap C); with 2.3 ruled "collapse" it is the same fix.
+3. **D1024 — a literal arm whose base is already an arm** (new). Its own fix, on the
+   2.3 ruling. **D1026 CLOSED** (#2312, 2026-09-01) for the witness as filed — but the
+   headline shape `Json | null` (usability gap C, the signature every accessor wants) is
+   **still refused** on the merged seed: **D1027**, ablated to recursion AND null
+   membership together, i.e. D1021 with `null` as the composed arm. It rides on item 1;
+   grade D1021 on it.
 4. **D1009 / D1010 — `Json | null` ↛ `Json`; null-bearing literals** (unchanged). The
    wrong-repair footgun (§1.10) is why D1009 outranks D1022.
 5. **D1022 — named arm aliases**, emit half first (`let o: JsonObject = Map()` refuses;
