@@ -36259,10 +36259,9 @@ Repro:
 
 ### D1112 — an UN-ANNOTATED rebind off a `nulvariant` FIELD (`const e = p.err`) is check-clean invalid wasm; the annotated spelling of the same line runs
 
-**check-clean invalid wasm: `type mismatch: expected (ref $type), found (ref null $type)` ·
-`vl check` rc 0 · clause 1 · found 2026-09-02 by writing `std/json.vl`'s post-[D1093](#d1093)/[D1094](#d1094)
-shape rather than a paraphrase · this is the ONE line still standing between `std/json.vl` and
-dropping its flat-field error workaround**
+**runs today and must keep running — CLOSED 2026-09-02 by the `Member` arm the nullable-variant twins never had (`memberNulVariantRow`, keyed on the CHECKER'S TYPE at the read node) plus the four delivery sites it uncovered · the repro below is now the PIN · found 2026-09-02 by writing `std/json.vl`'s post-[D1093](#d1093)/[D1094](#d1094)
+shape rather than a paraphrase · `std/json.vl` may now drop its flat-field error workaround,
+which is separate work needing the `std-api-reviewer` pass**
 
 Repro:
 
@@ -36350,13 +36349,96 @@ Repro:
   [D1161](#d1161), this row's mirror. Neither rebind spelling runs at both positions, so the
   shipped module narrows `err` IN PLACE everywhere; D1161 carries the 4×3 matrix.
 
+* **HOW IT CLOSED, AND THE FIVE PIECES IT NEEDED.** The row predicted a `Member` arm on the two
+  nullable-variant twins. That is the first piece and it is not enough; each of the other four is
+  a DELIVERY the arm newly reaches, and the position matrix is what named them (15 cells, one
+  program per cell, each printing a value that proves the read or the write landed):
+
+  1. `memberNulVariantRow` — the `Member` arm shared by `exprNullableVariant` (boolean) and
+     `nulVariantIdxOfExpr` (index), so the pair cannot disagree, with `exprNullableStruct`'s own
+     `Member` arm DECLINING an arm target so the two twins never both answer for one read.
+  2. The WRITE mirror of `emitMember`'s nullable-variant read rung, in `emitAssign` — one
+     `ref.as_non_null` ahead of the `struct.set`. This is what closed [D1161](#d1161).
+  3. A variant sibling for `emitCoalesce`'s nullable-STRUCT arm — same `br_on_non_null`, one
+     table over, with `variantIdx` seeded where `structIdx` was. This is [D1113](#d1113).
+  4. `exprVariantIndex`'s own `??` rung, the twin of `structIndexOfExpr`'s. Without it the `??`
+     lowered correctly and its RESULT had no layout: `field access receiver is not a struct`.
+  5. A BOUND on `emitObjLitNode`'s `pendingVariantIdx` hint — [D1154](#d1154).
+
+* **THE KEY IS THE CHECKER'S TYPE AT THE READ NODE, AND THE TWO OBVIOUS SOURCES BOTH MISS.**
+  Probed on the witness, one build each: the field table's recorded NAME
+  (`sFieldElemNameAt`) reads back as canon's SOFTENED render
+  `{at:i32,kind:string,path:string,msg:string}`, so `variantIndexOf` answers -1 for the arm it
+  names; the same row's ARENA sidecar (`sFieldElemTyIxAt`) is that softened shape's type and
+  misses too; `nodeTyIxOf(memIx)` is a `TyNullable` whose inner HITS `variantRowOfTy`. Three
+  sources for one type question, and only the third answers — the general rule is already
+  filed, and this is the fourth instance.
+
+* **THE MATRIX, MEASURED BOTH SIDES.** Master (`seed-latest`) 11 of 15 `runs`; this fix 15 of
+  15, with `runs → not-runs` at ZERO. The four cells that moved are `retu_inf` and `rets_inf`
+  (this row), `assign_ann` ([D1161](#d1161)) and the non-null face ([D1150](#d1150)); an
+  intermediate candidate that had only piece 1 scored +3/−2 and was NOT shippable, which is
+  what the other four pieces are for.
+
+* **AND THE TRAP THIS ROW WAS BLOCKED ON FIRED FOR REAL, as a DIAGNOSTIC.** With
+  [D1152](#d1152)'s guard in and only piece 1 built, the corpus oracle's shared instance
+  printed `emitProgram: emitVariantStruct: union-variant 2 is outside the parallel field-span
+  tables — 2 variants but 2 field starts / 2 field counts / 4 field names / 4 field types`
+  where the earlier candidate had died on `RuntimeError: array element access out of bounds`.
+  Same `vi=2 len=2` the row recorded, now with the site, the id and every table length in the
+  sentence — which is how [D1154](#d1154) was found in two builds instead of a bisect.
+
 ---
+
+### D1154 — `pendingVariantIdx` is a HINT set from fifteen sites, and its consumer indexed `uVariants` with it unchecked; a KIND ladder saying `variant` beside an INDEX ladder that fell through to the struct table put a struct row past the end of the variant table
+
+**runs today and must keep running — a REFUTATION PIN · the mis-pairing is BOUNDED at the consumer, not root-caused: the setter that produced it is not yet named · found 2026-09-02 while landing [D1112](#d1112), and only because [D1152](#d1152)'s guard turned the crash into a sentence · reachable only in a SHARED compiler instance, and only with D1112's `Member` arm present**
+
+Repro (runs today, prints `true 1 syntax m true 2 3 4` — it is the pin, and the FIXTURE is the witness):
+
+    // tests/cases/unions/arm-with-literal-field-nullable-faces.vl, run through
+    // `deno test -A tests/cases_wasm_test.ts` — the oracle's ONE shared instance
+    type E = { at: i32, kind: "syntax", msg: string }
+    type ETwin = { at: i32, kind: "syntax", msg: string }
+    type Scan = { i: i32, err: E | null }
+    const p: Scan = { i: 0, err: null }
+    const e = p.err
+    type TW = { t: ETwin }
+    const tw: TW = { t: { at: 3, kind: "syntax", msg: "t" } }
+    const back: E = tw.t
+    print(back.at)
+
+* **THE FILE RUNS STANDALONE AND FAILS THROUGH THE ORACLE**, which is [D1152](#d1152)'s own
+  signature and the reason a CLI check is vacuous for this class. Measured: `vl run` on the
+  fixture prints all eight lines; `deno test -A tests/cases_wasm_test.ts` fails on it alone.
+
+* **THE MECHANISM IS A KIND/INDEX MIS-PAIRING, and the guard named it in two builds.**
+  `emitObjLitNode` consumes `pendingVariantIdx` as a variant id with no bound. Instrumenting
+  the three `emitVariantStruct` callers with distinct guard labels put it at
+  `emitObjLitNode`'s pending seed, with `vi = 2` against `2 variants / 2 field starts / 2 field
+  counts / 2 tyIx / 2 tags / 2 heap` — every parallel table length 2, so no well-behaved
+  classifier produced it. It is a row from ANOTHER table: some setter's KIND ladder said
+  variant while its INDEX ladder fell through to `structIndexOfExpr`. That is exactly the
+  `("struct", wrong-index)` pairing [D1112](#d1112) diagnosed, mirrored.
+
+* **WHAT WAS FIXED IS THE CONSUMER, AND THAT IS DELIBERATE BUT PARTIAL.** A hint naming no
+  variant row is not a hint: dropped, the literal takes `emitObjLitNode`'s other arms — what it
+  got before any seed existed. Two of the fifteen setters were bounded at source as well (the
+  module-GLOBAL `variant` / `nulvariant` seeds in `emitModule`, where the `nulvariant` arm
+  already bounded its `uVarHeap` read and let the seed itself escape). **Neither cleared the
+  fixture**, so the producing setter is still one of the other thirteen, and finding it is the
+  open half of this row.
+
+* **THE STANDING RULE.** A `pending*` global is a hint that crosses functions, so its consumer
+  cannot see which ladder set it. Bound every one of them at the read, and pair a KIND with an
+  INDEX from the SAME ladder — never a kind from one and an index from another's fall-through.
 
 ### D1113 — `??` over a nullable UNION-ARM value is the loud `not supported yet`; the identical coalesce over a non-arm struct runs
 
-**loud emit reject: ``emitProgram: `??` over this nullable value is not supported yet — narrow
-it first`` · `vl check` rc 0 · clause 2 · found 2026-09-02 in [D1094](#d1094)'s position
-matrix · PRE-EXISTING: identical on master (`seed-latest`, 2026-09-02)**
+**runs today and must keep running — CLOSED 2026-09-02 by the `Member` arm the nullable-variant twins never had (`memberNulVariantRow`, keyed on the CHECKER'S TYPE at the read node) plus the four delivery sites it uncovered · the repro below is now the PIN · found 2026-09-02 in [D1094](#d1094)'s position matrix · closed by the
+variant sibling of `emitCoalesce`'s nullable-STRUCT arm (same `br_on_non_null` lowering, one
+table over) plus `exprVariantIndex`'s own `??` rung, without which the `??` lowered and its
+RESULT then had no layout**
 
 Repro:
 
@@ -36461,12 +36543,11 @@ Repro (kept so this row stays gradeable; it is D1140's witness):
 
 ### D1161 — an ANNOTATED rebind off an `Arm | null` field is a loud emit reject wherever the narrowed value receives a field ASSIGNMENT; the un-annotated rebind and the in-place narrowing both run
 
-**loud emit reject: `emitProgram: field-assignment receiver is not a struct` · `vl check` rc 0 ·
-clause 2 · found 2026-09-02 dropping `std/json.vl`'s flat-field error carrier after
-[D1031](#d1031) landed · PRE-EXISTING: identical on master (`seed-latest`, 2026-09-02) ·
-this is [D1112](#d1112)'s MIRROR — that row is the un-annotated rebind at the RETURN position,
-this one is the annotated rebind at the ASSIGNMENT position, and together they leave narrowing
-in place as the only spelling that runs at both**
+**runs today and must keep running — CLOSED 2026-09-02 by the `Member` arm the nullable-variant twins never had (`memberNulVariantRow`, keyed on the CHECKER'S TYPE at the read node) plus the four delivery sites it uncovered · the repro below is now the PIN · found 2026-09-02 dropping `std/json.vl`'s flat-field error carrier after
+[D1031](#d1031) landed · closed by the WRITE mirror of `emitMember`'s nullable-variant read
+rung — one `ref.as_non_null` ahead of the `struct.set`, which is the whole difference · the
+4x3 matrix below is now ALL RUNS, so a module needing both positions no longer has to narrow
+in place**
 
 Repro:
 
@@ -36527,9 +36608,9 @@ Repro:
 
 ### D1150 — a NON-NULLABLE arm-typed FIELD read (`const e = p.err` over `err: JsonError`) delivered into the union is check-clean invalid wasm; the same read used as a plain struct runs
 
-**check-clean invalid wasm: `type mismatch: expected (ref $type), found (ref null $type)` ·
-`vl check` rc 0 · clause 1 · OPEN · found 2026-09-02 on [D1112](#d1112)'s position matrix ·
-PRE-EXISTING: identical on the `seed-latest` master seed**
+**runs today and must keep running — CLOSED 2026-09-02 by the `Member` arm the nullable-variant twins never had (`memberNulVariantRow`, keyed on the CHECKER'S TYPE at the read node) plus the four delivery sites it uncovered · the repro below is now the PIN · found 2026-09-02 on [D1112](#d1112)'s position matrix · the NON-NULL face of
+the same arm: a code-15 field stores `(ref null $T)` whatever its declared nullability, so one
+arm answers both**
 
 Repro (check rc 0; the module the engine refuses to load):
 

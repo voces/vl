@@ -16986,6 +16986,34 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
           return 0
         }
       }
+      // THE NULLABLE-VARIANT RECEIVER, the write mirror of `emitMember`'s own
+      // `nulVariantIdxOfExpr` read rung. A `T | null` binding whose `T` is a union ARM
+      // holds `(ref null $uVarHeap[vi])`, so the only difference from the variant-param
+      // write above is one `ref.as_non_null` — which cannot trap, because the checker
+      // admits the write only inside a null test. Without this the receiver fell through
+      // to the struct path, whose row a union arm does not own (`collectS` skips it).
+      const nwvi = nulVariantIdxOfExpr(target.memObj, fnIx)
+      if nwvi >= 0 && exprNullableVariant(target.memObj, fnIx) {
+        const nwfi = variantFieldIndex(nwvi, target.memProp)
+        if nwfi < 0 {
+          return emitFail(
+            "emitProgram: unknown variant field in field assignment",
+          )
+        }
+        if emitExpr(body, target.memObj, fnIx) < 0 { return -1 }
+        fbRefAsNonNull() // 0xd4 — the enclosing null test narrowed it
+        const nwCode = variantFieldTypeAt(nwvi, nwfi)
+        if seedFieldListBuild(nwCode, variantFieldRefSlot(nwvi, nwfi)) < 0 {
+          return -1
+        }
+        if emitScalarFieldStoreVal(body, a.binRight, fnIx, nwCode) < 0 {
+          return -1
+        }
+        pendingListKind = 0
+        pendingListSlot = 0
+        fbStructSet(uVarHeap[nwvi], nwfi)
+        return 0
+      }
       // Field WRITE `recv.field = v` → `struct.set $0 <fieldidx>` (`0xfb 0x05`). The
       // single declared struct lives at WasmGC type index 0 (matching `emitMem`'s read
       // path). Operand order is load-bearing: push the struct REF first, then the value,
@@ -23025,10 +23053,18 @@ function emitObjLitNode(body: i32[], _e: ObjLit, exprIx: i32, fnIx: i32) {
   // element) constructs the BARE variant struct `(ref $(uVarHeap[vi]))` — NOT a union
   // box. `pendingVariantIdx` is the variant; consume it so a nested literal doesn't
   // inherit the hint.
+  // BOUNDED, because `pendingVariantIdx` is a HINT and a hint can be mis-paired. It is set
+  // from some fifteen sites, several of which read an INDEX ladder that can fall through to
+  // the struct table while the KIND ladder beside it said variant — and a struct row handed
+  // in here is at best the wrong heap type and at worst past the end of `uVariants`. A hint
+  // that names no variant is not a hint; drop it and take the arms below, which is what this
+  // literal got before any seed existed.
   if pendingVariantIdx >= 0 {
     const pvi = pendingVariantIdx
     pendingVariantIdx = -1
-    return emitVariantStruct(body, exprIx, pvi, fnIx)
+    if pvi < uVariants.length {
+      return emitVariantStruct(body, exprIx, pvi, fnIx)
+    }
   }
   // A literal whose field-set matches a STANDALONE struct constructs that struct
   // directly (even alongside a union — `ast.vl`'s `Tok`/`Diag` coexist with `Node`).
@@ -25337,6 +25373,19 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
           }
         }
       }
+    }
+  }
+  // THE VARIANT SIBLING of the arm below, and it has to be its own arm rather than a
+  // widening of it: a `T | null` whose `T` is a union ARM stores
+  // `(ref null $uVarHeap[vi])`, and `structIndexOfExpr` has no row to answer with —
+  // `collectS` skips a union member. Same niche, same `br_on_non_null` lowering, one
+  // table over, and `variantIdx` is the `structIdx` an ObjLit default seeds against.
+  if exprNullableVariant(e.binLeft, fnIx) {
+    const cvi = nulVariantIdxOfExpr(e.binLeft, fnIx)
+    if cvi >= 0 && cvi < uVarHeap.length {
+      const vDefCtx = expCtxHere()
+      vDefCtx.variantIdx = cvi
+      return emitCoalesceNulRef(body, e, uVarHeap[cvi], vDefCtx, fnIx)
     }
   }
   // GENERIC nullable-STRUCT `??`: a `S | null` value — an ident / param binding, a struct FIELD,

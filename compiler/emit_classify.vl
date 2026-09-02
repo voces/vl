@@ -1735,6 +1735,9 @@ export function nulVariantIdxOfExpr(exprIx: i32, fnIx: i32) {
     if cri >= 0 { return mvValVariantOf(cri) }
   }
   if e is AsExpr { return nulVariantIndexOf(exprIx) }
+  // THE INDEX HALF of the nested-shape field arm the boolean twin gained — same field,
+  // same column, one fact (D1112/D1150).
+  if e is Member { return memberNulVariantRow(exprIx, fnIx) }
   // A CALL of a `: Circle | null`-returning function — the callee's own annotation owns
   // the index, which is what an INFERRED binding (`const c = h(true)`) has to read: it
   // has no annotation of its own, and its slot is declared from this answer.
@@ -2435,7 +2438,13 @@ export function exprNullableStruct(exprIx: i32, fnIx: i32) {
   // field genuinely carries null; a plain `inner: S` field is always written
   // non-null but shares the nullable storage, so the read is nullable-classified
   // (the consumer inserts `ref.as_non_null` before a chained field access).
-  if e is Member { return memberFieldCode(exprIx, fnIx) == 15 }
+  if e is Member {
+    if memberFieldCode(exprIx, fnIx) != 15 { return false }
+    // …but a code-15 field whose TARGET is a union ARM stores `(ref null $uVarHeap[vi])`,
+    // not `(ref null $S)`, and the variant twin owns it. Declining here is what keeps the
+    // two twins from both answering yes about one read (D1112/D1150).
+    return memberNulVariantRow(exprIx, fnIx) < 0
+  }
   // An INDEX into a NULLABLE-struct array (`(P | null)[]`, ref-list slot key "P | null")
   // yields `P | null` — the element legitimately holds null, so the read is NOT recovered
   // to non-null (unlike a `P[]` element). `const e = xs[i]` binds the kind-9 niche.
@@ -11332,6 +11341,36 @@ export function narrowedStructArmVi(exprIx: i32): i32 {
     if pk != "" { return variantIndexOf(narrowVariantFor(pk)) }
   }
   -1
+}
+
+// The VARIANT ROW a code-15 struct-field read `p.err` targets, or -1 when the field is not
+// a nested-shape field or its target is a plain struct.
+//
+// A code-15 field stores `(ref null $T)` whatever its declared nullability — a `T | null`
+// field genuinely carries null and a bare `T` field shares the storage — and the twin
+// question this answers is WHICH table owns `T`. When `T` is a union ARM the answer is the
+// variant table: `collectS` SKIPS a union member, so `structIndexByName` is -1 for it and
+// the struct-side lookup returns a row the arm does not own. That mis-pairing — kind
+// `nulstruct` against another type's row index — is D1112 and D1150; the row here is what
+// pairs the kind with the table that has the layout.
+export function memberNulVariantRow(memIx: i32, fnIx: i32) {
+  const m = P.nodes[memIx]
+  if m is Member {
+    if memberFieldCode(memIx, fnIx) != 15 { return -1 }
+    // THE CHECKER'S TYPE ON THE READ NODE, not the field table's recorded name — and that
+    // is the whole measurement. `sFieldElemNameAt` banks canon's SOFTENED rendering, so
+    // this field reads back as `{at:i32,kind:string,path:string,msg:string}` and
+    // `variantIndexOf` answers -1 for the arm it names; the same row's arena sidecar
+    // (`sFieldElemTyIxAt`) is the softened shape's type and misses too. Probed on the
+    // witness: name `variantHit=no`, sidecar `ty-miss`, node type `inner-HIT`.
+    const ty = nodeTyIxOf(memIx)
+    if ty < 0 { return -1 }
+    const t = T.tys[ty]
+    if t is TyNullable { return variantRowOfTy(t.nInner) }
+    variantRowOfTy(ty)
+  } else {
+    -1
+  }
 }
 
 // The VALUE-union name of a union-typed struct FIELD read `o.y` (field code 16),
@@ -28264,6 +28303,12 @@ export function exprNullableVariant(exprIx: i32, fnIx: i32) {
     }
     return false
   }
+  // A NESTED-SHAPE FIELD READ whose target is a union ARM (`p.err` over
+  // `err: JsonError | null`) — the arm this twin never had, and the reason an UN-ANNOTATED
+  // rebind off such a field bound the struct niche over a variant heap (D1112/D1150). Same
+  // code-15 storage the struct twin's own `Member` arm classifies nullable; what parts them
+  // is which table owns the target, which `memberNulVariantRow` is the one reader of.
+  if e is Member { return memberNulVariantRow(exprIx, fnIx) >= 0 }
   // A BARE `m[k]` over an ARM-VALUED map (`{[string]: Circle}`) is `Circle | null` — the
   // vals slot is `(ref null $uVarHeap[vi])` and the get yields it unrecovered. This is the
   // map-read rung `exprNullableStruct`'s own `Index` arm has carried since the struct-valued
@@ -28994,6 +29039,17 @@ export function exprVariantIndex(exprIx: i32, fnIx: i32) {
   if e is BinExpr {
     const cvs = coalesceMvSlot(exprIx, fnIx)
     if cvs >= 0 { return mvValVariantOf(cvs) }
+    // A `<T|null> ?? <T>` whose `T` is a union ARM yields the non-null arm ref — the
+    // variant twin of `structIndexOfExpr`'s own `??` arm, and needed for the same reason:
+    // without it `(r ?? d).field` has no layout. The left's nullable-variant row drives
+    // it, else the right default's.
+    if e.binOp == "??" {
+      if exprNullableVariant(e.binLeft, fnIx) {
+        const lv = nulVariantIdxOfExpr(e.binLeft, fnIx)
+        if lv >= 0 { return lv }
+      }
+      return exprVariantIndex(e.binRight, fnIx)
+    }
   }
   -1
 }
