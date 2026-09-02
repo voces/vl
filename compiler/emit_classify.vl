@@ -15567,6 +15567,45 @@ export function blockTailIsValue(blockIx: i32, fnIx: i32) {
 // True if the arm at `blockIx` is a BLOCK with no statements — the shape that has no tail to
 // give a value, and therefore no value for `emitIfTail` to place. A non-Block arm (an
 // `else if` chain) is never "empty" in this sense and answers false.
+// D1029/D1032/D1034 — IS THE NULLABLE INFERENCE'S NON-VOIDNESS REAL? `inferRetBearsNull`
+// exists for one shape: an else-less tail `if c { 5 }`, whose arm IS a value and whose
+// fall-through is the `null` — `blockTailIsValue` deliberately ignores else-less ifs, so
+// without that consultation the function would classify void and lose its `| null`.
+//
+// It was consulted UNCONDITIONALLY, and that is what three separate rows are: the checker
+// infers `T | null` from a tail `if` whose arm is not a value at all — an EMPTY arm (D1034), a
+// bare-`return` guard body (D1032), an index-target ASSIGNMENT (`o["x"] = v`, the map-store
+// position of D1029) — and the function was then emitted value-returning with a
+// compiler-emitted `unreachable` floor. Three ad-hoc vetoes would have been three chances to
+// miss the fourth.
+//
+// The rule instead: the veto applies only where the tail `if`'s arms actually END IN VALUES,
+// which is the shape it was written for. A body whose tail is not an `if` is unaffected.
+export function tailIfNullableIsReal(blockIx: i32, fnIx: i32): boolean {
+  const b = P.nodes[blockIx]
+  if b is Block {
+    const n = b.blkStmts.length
+    if n == 0 { return true }
+    const s = P.nodes[b.blkStmts[n - 1]]
+    if s is IfStmt { return ifArmsAllValues(b.blkStmts[n - 1], fnIx) }
+  }
+  true
+}
+
+// Every arm of the `if`/`else if` chain at `stmtIx` ends in a bare tail VALUE. An EMPTY arm
+// answers false (nothing to be a value), and so does an arm whose tail is a statement.
+function ifArmsAllValues(stmtIx: i32, fnIx: i32): boolean {
+  const s = P.nodes[stmtIx]
+  if s is IfStmt {
+    if !blockTailIsValue(s.ifThen, fnIx) { return false }
+    if s.ifElse < 0 { return true }
+    const e = P.nodes[s.ifElse]
+    if e is Block { return blockTailIsValue(s.ifElse, fnIx) }
+    if e is IfStmt { return ifArmsAllValues(s.ifElse, fnIx) }
+  }
+  false
+}
+
 export function blockTailIfHasEmptyArm(blockIx: i32): boolean {
   const b = P.nodes[blockIx]
   if b is Block {
@@ -29067,6 +29106,19 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
     // Without it a REBIND under the narrow classified as a union BOX while the init
     // emitted the unboxed wrapper ref — invalid wasm.
     if narrowedRefArrayOf(e.identName) != "" { return false }
+    // D1029 — AND THE MAP ARM, the third member of the same rule and the one that was
+    // missing. `if v is { [string]: Json }` reads UNBOXED to the map struct in this scope,
+    // exactly as the two arms above read unboxed — but `exprUnion` kept answering TRUE for
+    // it, so `emitUnionCoerce`'s "already a union, emit raw" rung fired and handed the
+    // UNBOXED map to a destination typed at the union. `expected (ref $type), found (ref
+    // $type)` at six delivery positions: return into the union, return into a composition,
+    // `push`, a map-value store, an annotated binding, and an argument. The two positions
+    // that RAN are the two that name the ARM rather than the union — the only ones that
+    // actually want the unboxed value.
+    //
+    // With this the map arm falls to the same boxing path the ref-array arm already takes,
+    // which is why that arm ran at all eight positions and this one ran at two.
+    if narrowedMapOf(e.identName) != "" { return false }
     if paramUnion(fnIx, e.identName) { return true }
     if declaredUnion(e.identName) { return true }
     // A CAPTURED union box (`const a: C | D = …; () => … a is C …`): the env field is the union

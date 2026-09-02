@@ -4754,6 +4754,38 @@ function cloBoxArmTy(exprIx: i32, unionName: string): i32 {
 // with a `null` member); a raw scalar/string boxes as its atom's tag + payload. A struct
 // union's object literal falls through to the normal lowering (`emitUnionBox` boxes it via
 // the `uDeclared` path).
+// D1029 — THE MAP ARM'S RE-BOX: the arm's tag, the map ref, one `struct.new`. Returns 1 when
+// it handled the value, 0 when the operand is not a map arm of `unionName`, -1 on error.
+//
+// A value narrowed to the union's map arm reads UNBOXED in that scope — that is the point of
+// the narrow — so delivering it to a destination typed at the UNION has to put the box back.
+// The ref-array arm has had this rung all along, which is why it ran at all eight delivery
+// positions while the map arm ran at two; without it `exprUnion` had to keep answering TRUE
+// for a narrowed map so the "already a union" rung would pass the cell through raw, which is
+// right for a map-value store and wrong everywhere the value had actually been unboxed.
+//
+// ONE HOME, because the two boundaries that need it are `emitUnionCoerce` and
+// `emitUnionBoxArg` — and a map-value store reaches only the second. Fixing the first alone
+// turned that position from invalid wasm into a compiler-emitted `unreachable`, which is a
+// different failure and not a better one.
+function emitUnionMapArmBox(
+  body: i32[],
+  unionName: string,
+  exprIx: i32,
+  fnIx: i32,
+): i32 {
+  if unionName == "" { return 0 }
+  if !exprMap(exprIx, fnIx) { return 0 }
+  const sh = mapShapeOfExpr(exprIx, fnIx)
+  const tag = mapSlotTag(sh)
+  if tag < 0 { return 0 }
+  if !unionHasMapArmSlot(unionName, sh) { return 0 }
+  fbI32Const(tag)
+  if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
+  fbStructNew(uBoxIdx) // { tag, map struct ref }
+  1
+}
+
 export function emitUnionCoerce(
   body: i32[],
   unionNameIn: string,
@@ -4901,6 +4933,19 @@ export function emitUnionCoerce(
   // gate below — such a union may have NO value atom (`S[] | {w:i32}`), so that gate would bail and
   // emit the RAW wrapper ref where a `(ref $uBox)` is expected (the pre-fix invalid-wasm). The slot
   // match guards against a ref-array whose element is not actually an arm (a checker-impossible case).
+  // D1029 — THE MAP ARM'S RE-BOX, the rung the ref-array arm below has had all along. A
+  // value narrowed to the union's map arm reads UNBOXED in that scope (that is the point of
+  // the narrow), so delivering it to a destination typed at the UNION has to put the box
+  // back: the arm's tag, the map ref, `struct.new`. Without it `exprUnion` had to keep
+  // answering TRUE for a narrowed map so the "already a union" rung would pass the cell
+  // through raw — which is right for a map-value store and wrong at the other five
+  // positions, where the value had already been unboxed.
+  //
+  // Written as the exact mirror of the ref-array rung so the two arms of one rule stay one
+  // shape: tag from the arm's own slot, value through the ordinary emit, one `struct.new`.
+  const d29 = emitUnionMapArmBox(body, unionName, exprIx, fnIx)
+  if d29 < 0 { return -1 }
+  if d29 == 1 { return 0 }
   if unionName != "" && exprRefArray(exprIx, fnIx) {
     const raSlot = refListSlotOfExpr(exprIx, fnIx)
     if unionHasRefArrayArmSlot(unionName, raSlot) {
@@ -5286,6 +5331,9 @@ export function emitUnionBoxArg(
   exprIx: i32,
   fnIx: i32,
 ) {
+  const bxMap = emitUnionMapArmBox(body, unionName, exprIx, fnIx)
+  if bxMap < 0 { return -1 }
+  if bxMap == 1 { return 0 }
   if !exprUnion(exprIx, fnIx) {
     const svi = exprVariantIndex(exprIx, fnIx)
     if svi >= 0 {
