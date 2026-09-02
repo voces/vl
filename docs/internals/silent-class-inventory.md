@@ -33996,6 +33996,27 @@ above are exactly the four ways `paramTgt` comes back empty:
     p08 two fns     indirect=1  [cb bound=1 calleeFn=    paramTgt=   ]   invalid wasm
     p14 three `cb`  indirect=1  [cb x3, every paramTgt=""]               invalid wasm
 
+* **THE PRICE, MEASURED: AN UNGATED COLLECT PASS DOES NOT MAKE THE SOURCE SLOW, IT MAKES THE
+  COMPILER BUILT FROM IT NON-TERMINATING — one bootstrap step later than the change.**
+  `anonLeafCloBindMark` asks `anonLeafFnValueTarget` — a whole-arena scan — of every binding in
+  the program, so ungated it is quadratic in the node count for EVERY module, including the
+  compiler's own source. The tell is structural and is worth knowing before it costs an hour:
+  **level 1 (a healthy seed compiles the candidate source) is always fast; level 2 (the
+  candidate compiles the compiler) is where it shows.** A two-level bisect under `timeout 300`
+  reads
+
+      0637b979  (D1092)                    L1 73s rc=0   L2 67s rc=0
+      3e882cd1  (D1090 attribution)        L1 81s rc=0   L2 35s rc=0
+      5d678f67  (the ungated bind mark)    L1 32s rc=0   L2 321s rc=124
+      6c6c46a1  (the gate added)           L1 69s rc=0   L2 32s rc=0
+
+  and names the commit directly. Two operational notes it also earned: a `timeout` around
+  `refresh-compiler.sh` kills the SHELL and re-parents the `vl build` child to init, so each
+  abandoned attempt leaves a runaway at ~90% CPU — check `ps -eo pid,etimes,args | grep "vl
+  build"` before retrying, and never retry a self-build hoping it finishes. The early-out is one
+  O(n) read of the marks the passes above write, which is exactly the shape
+  `anonLeafNarrowUseMark`'s own header already prescribes for the same reason.
+
 * **THE POSITION MATRIX, MEASURED — 26 programs, one per cell, all `vl check` rc 0, each
   printing a value that proves the delivery actually happened.** `master` is `6a737f4d`'s
   published seed; `now` is this row's fix on the merged tree. **19 of 26 -> 26 running minus
