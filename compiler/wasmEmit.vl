@@ -655,6 +655,7 @@ import {
   listOpKindOfBin,
   litAtomMemberTy,
   localIndexOf,
+  capturedKindOf,
   mapAnnShape,
   mapReadNarrowableSlot,
   mapReadNarrowedAtomKind,
@@ -15348,6 +15349,32 @@ function emitMemIntrinArg(body: i32[], ix: i32, fnIx: i32) {
   emitExprWideCleared(body, ix, fnIx)
 }
 
+// Is `name` bound BY THE USER in this frame — a parameter, a local, or a capture of one?
+//
+// THE CALLEE-POSITION HALF OF THE INTRINSIC RESERVATION, and the rule is the corpus's own:
+// `closures/capture-local-named-like-builtin.vl` states it as *"A name denotes instructions
+// only where it is being CALLED"*, and deliberately PINS a parameter named `__load_i32__` as
+// legal VL. So the reservation cannot be widened to every binding form — that fixture would
+// stop compiling, and it is right: an intrinsic-spelled name that is never called denotes
+// nothing.
+//
+// A PARAMETER (or a capture of one) is the only way a user can hold such a name at all: the
+// checker already refuses a `function` / `const` / `let` of an intrinsic spelling, at the
+// definition. And it is exactly the form that was misrouted — `emitCall` matched the
+// SPELLING before any declaration lookup, which is the hazard `nameIsEmitterIntrinsic`'s own
+// header describes ("a user `function __fs_read__(…)` would be silently discarded and every
+// call to it would become a syscall"). Measured on `run(__memory_grow__: (i32) => i32)` with
+// a capturing lambda: `vl check` rc 0, printed `1` instead of `779`, and the disassembled
+// body was `(memory.grow (i32.const 1))` with the parameter never called (D1087).
+//
+// This is the same test `userOwnsName` makes for the six BUILTIN names one screen down
+// (D975 — "A USER FUNCTION OF THE SAME NAME WINS"), asked of the scope rather than of the
+// function table, because a parameter is in neither.
+function identNameIsUserBound(name: string, fnIx: i32): boolean {
+  if localIndexOf(fnIx, name) >= 0 { return true }
+  capturedKindOf(fnIx, name) != null
+}
+
 // Node shapes read: Call { callFn: i32, callArgs: i32[] }, callee Ident { identName }.
 function emitCall(body: i32[], callIx: i32, fnIx: i32) {
   const c = P.nodes[callIx]
@@ -15370,6 +15397,9 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
       // Asking whether the callee RESOLVES is what the comment above already assumed: a
       // builtin resolves to nothing, so `fnIndexOfSid >= 0` means the user owns the name.
       const userOwnsName = fnIndexOfSid(sidOfNode(c.callFn)) >= 0
+      // …and the SCOPE's answer for the dunder intrinsics, whose arms below match the
+      // spelling with no declaration lookup at all. See `identNameIsUserBound`.
+      const userBindsName = identNameIsUserBound(callee.identName, fnIx)
       // `fromCodePoints(xs)` (H2): bulk string construction — one call into the shared
       // `__utf8_enc__` helper, which UTF-8-ENCODES the list's live code points into an
       // exact-fit backing and wraps a whole-backing header around it.
@@ -15599,7 +15629,7 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
       // store → `i32.store`, load → `i32.load`, `__log__` → call the synthetic
       // in-module decoder at `gMemLogIdx` (the host imports `__log__` instead; the
       // native runner provides no such import — see `emitMemLogFnCode`).
-      if callee.identName == "__store_i32__" {
+      if !userBindsName && callee.identName == "__store_i32__" {
         if c.callArgs.length != 2 {
           return emitFail(
             "emitProgram: __store_i32__ takes exactly two arguments",
@@ -15610,7 +15640,7 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
         fbI32Store()
         return 0
       }
-      if callee.identName == "__load_i32__" {
+      if !userBindsName && callee.identName == "__load_i32__" {
         if c.callArgs.length != 1 {
           return emitFail(
             "emitProgram: __load_i32__ takes exactly one argument",
@@ -15636,7 +15666,7 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
       // value subtree, as every other f32 coercion boundary does (see `emitMemIntrinArg`):
       // without it a float literal nested in the value expression lowers at f64 and the
       // store's operand is the wrong width.
-      if nameIsMemStoreIntrinsic(callee.identName) {
+      if !userBindsName && nameIsMemStoreIntrinsic(callee.identName) {
         if c.callArgs.length != 2 {
           return emitFail(
             "emitProgram: " +
@@ -15690,7 +15720,7 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
       // to reorder the operand emissions, which for arbitrary expressions means
       // reordering their SIDE EFFECTS — so the order is a signature decision, not a
       // formatting one.
-      if nameIsMemBulkIntrinsic(callee.identName) {
+      if !userBindsName && nameIsMemBulkIntrinsic(callee.identName) {
         if c.callArgs.length != 3 {
           return emitFail(
             "emitProgram: " +
@@ -15714,7 +15744,7 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
       // its natural alignment — and the per-width difference is exactly two bytes,
       // which `memLoadOpcode`/`memLoadAlignExp` hold. `__load_i32__` keeps its own arm
       // above so its bytes stay provably untouched by this change.
-      if nameIsMemLoadIntrinsic(callee.identName) {
+      if !userBindsName && nameIsMemLoadIntrinsic(callee.identName) {
         if c.callArgs.length != 1 {
           return emitFail(
             "emitProgram: " +
@@ -15749,14 +15779,14 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
       //                                                       or -1 if the grow failed
       // The -1 is the wasm spec's failure signal and is passed through unchanged: VL
       // does not translate it, so a caller checks it exactly as the spec describes.
-      if callee.identName == "__memory_size__" {
+      if !userBindsName && callee.identName == "__memory_size__" {
         if c.callArgs.length != 0 {
           return emitFail("emitProgram: __memory_size__ takes no arguments")
         }
         fbMemorySize()
         return 0
       }
-      if callee.identName == "__memory_grow__" {
+      if !userBindsName && callee.identName == "__memory_grow__" {
         if c.callArgs.length != 1 {
           return emitFail(
             "emitProgram: __memory_grow__ takes exactly one argument (the page count to add)",
@@ -15766,7 +15796,7 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
         fbMemoryGrow()
         return 0
       }
-      if callee.identName == "__log__" {
+      if !userBindsName && callee.identName == "__log__" {
         if c.callArgs.length != 2 {
           return emitFail("emitProgram: __log__ takes exactly two arguments")
         }
@@ -15856,7 +15886,7 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
       // lowered INLINE — host parity: toWasm.ts lowers the same names to single
       // WasmGC instructions (array.new / array.new_default / array.copy /
       // unreachable). `__trap__()` is the deliberate abort primitive.
-      if callee.identName == "__trap__" {
+      if !userBindsName && callee.identName == "__trap__" {
         if c.callArgs.length > 1 {
           return emitFail(
             "emitProgram: __trap__ takes an optional string message",
@@ -15880,8 +15910,9 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
       // `__array_new__`, the f64 list via an f64 fill; ref/string elements are
       // emitter long tail — fail loudly, never emit wrong bytes.
       if (
-        callee.identName == "__array_new__" ||
-        callee.identName == "__array_new_default__"
+        !userBindsName &&
+        (callee.identName == "__array_new__" ||
+          callee.identName == "__array_new_default__")
       ) {
         return emitArrayNewIntr(body, callIx, fnIx)
       }
@@ -15890,7 +15921,7 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
       // `dst[dstAt..]` (memmove semantics; OOB spans trap — the instruction's
       // own check). Operand order matches the instruction's stack shape, so no
       // scratch is needed.
-      if callee.identName == "__array_copy__" {
+      if !userBindsName && callee.identName == "__array_copy__" {
         return emitArrayCopyIntr(body, callIx, fnIx)
       }
       // SCOPE-AWARE, like the function-VALUE path at `emitIdentNode` — but through the
@@ -16521,9 +16552,7 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
       }
       // A MAP-typed LOCAL seeds the map SHAPE for a bare `Map()` RHS, exactly as the
       // global arm above does and for the same defect.
-      if exprMap(lhsIx, fnIx) {
-        pendingMapSlot = mapShapeOfExpr(lhsIx, fnIx)
-      }
+      if exprMap(lhsIx, fnIx) { pendingMapSlot = mapShapeOfExpr(lhsIx, fnIx) }
       // The LIST seeds this arm lacked, filed at this exact site by #1215 and graded on its
       // own here. The global arm above sets `pendingListKind`/`pendingListSlot` from the
       // cell's annotation before emitting the RHS, and `emitLetDeclStmt` does the same for

@@ -537,9 +537,27 @@ function guardProbeKey(condIx: i32) {
 
 // A plain binding NAME, or "" for anything else (a call result, a field read, …). The rule
 // compares receiver and key SYNTACTICALLY, so it only accepts shapes it can compare.
-function plainIdentName(ix: i32) {
-  if ix < 0 || ix >= P.nodes.length { return "" }
+// Peel any nested parentheses, returning the innermost wrapped expression index — the
+// front-end twin of `emit_base.unwrapParen`, written here because `lint` is a POST-PARSE
+// pass over the arena and does not import the emit layer.
+//
+// It exists for the ASSIGNMENT-TARGET question below. `(x) = 5` writes `x`, and every rule
+// in this file that asks "which binding does this assignment write" read the LHS node RAW,
+// so a parenthesised target marked nothing: prefer-const then reported ``x` is never
+// reassigned; use `const` instead of `let`` about a binding that is (D1089's front-end
+// half — the emitter had the identical omission, and the two were found by the same
+// program).
+function lintUnwrapParen(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return ix }
   const n = P.nodes[ix]
+  if n is Paren { return lintUnwrapParen(n.parInner) }
+  ix
+}
+
+function plainIdentName(ix: i32) {
+  const px = lintUnwrapParen(ix)
+  if px < 0 || px >= P.nodes.length { return "" }
+  const n = P.nodes[px]
   if n is Ident { return n.identName }
   ""
 }
@@ -588,7 +606,7 @@ function blockMutates(ix: i32, recvName: string, key: i32) {
         if lhs == recvName { return true }
         if lhs == plainIdentName(key) { return true }
       }
-      const li = P.nodes[n.binLeft]
+      const li = P.nodes[lintUnwrapParen(n.binLeft)]
       if li is Index {
         if plainIdentName(li.idxArr) == recvName { return true }
       }
@@ -1492,8 +1510,9 @@ function nameVisit(ix: i32) {
     // whose LHS is a bare name marks that BINDING written — prefer-const
     // consults this. The LHS Ident is still visited as a child (use + name).
     if n.binOp == "=" {
-      if n.binLeft >= 0 && n.binLeft < P.nodes.length {
-        const lhs = P.nodes[n.binLeft]
+      const lhsIx = lintUnwrapParen(n.binLeft)
+      if lhsIx >= 0 && lhsIx < P.nodes.length {
+        const lhs = P.nodes[lhsIx]
         if lhs is Ident { bindMark(lhs.identName, 1) }
         if lhs is Index { lintSawIndexWrite = true }
       }
