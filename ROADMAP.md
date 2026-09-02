@@ -132,7 +132,7 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   (4) `std/fmt.vl` `parseI32`'s "unchecked wrapping truncation" comment goes. Grade on
   D1041's ten-row table.
 
-  **STATUS 2026-09-02: DONE — (1) #2355, (2)(3)(4) #PRNUM.** `3.9 as? i32` prints `null`,
+  **STATUS 2026-09-02: DONE — (1) #2355, (2)(3)(4) #2361.** `3.9 as? i32` prints `null`,
   `3.9 as! i32` traps with `as! i32 at <l>:<c>: not exact`, a bare `f64 as i32` inside an
   `i32 | null` function propagates, `4294967298 as? i32` is `null` rather than `2`, and
   `trunc(d) as! i32` is the one `i32.trunc_f64_s` with no compare in front of it (checked with
