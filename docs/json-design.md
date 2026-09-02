@@ -628,7 +628,7 @@ SURFACE needs, each one a program in the appendix:
 | `Json \| JsonError` returned, error side | was check-clean INVALID WASM — D1021; **RUNS** after #2315 |
 | `Json \| JsonError` returned, value side only | was invalid wasm — D1021; **RUNS** after #2315 |
 | `is JsonError` on the composition | was loud `deferred value-union composition` — D1021; **RUNS** after #2315 |
-| `type JR = Json \| JsonError` NAMED, then used | **check-clean INVALID WASM — D1028** (the direct spelling is what runs) |
+| `type JR = Json \| JsonError` NAMED, then used | was check-clean INVALID WASM — D1028; **RUNS** after #2318 |
 | the same with a NON-recursive `J` | RUNS |
 | `{ value: Json, error: JsonError \| null }` carrier | RUNS (the shape declined in §5) |
 | `JsonObject`/`JsonArray` aliases as members of the tree | check error — D1022 |
@@ -699,11 +699,18 @@ blocked the module outright until it closed the same day.
    `type JR = Json | E` delivers every arm the recursive alias contributed RAW — `f64`,
    `boolean`, `string` are check-clean invalid wasm at return, binding and argument, a
    `Json[]` value refuses loudly — while the struct arm and `null` land, and the direct
-   spelling `Json | E` runs (that is what item 1 closed). The module spells `Json |
-   JsonError` directly in every signature and so does not hit this; **the builder must
-   not introduce `export type JsonResult = Json | JsonError`** until it closes, and a
-   consumer who tidies the spelling into a name is the first to meet it. Probe
-   `scripts/capability-probes/recursive-union-alias-named-composition.vl`.
+   spelling `Json | E` runs (that is what item 1 closed). **CLOSED #2318 (2026-09-02)**:
+   the member table was built from the DECLARED members joined verbatim, so `JR`
+   registered `Json|E` with `Json` as one opaque atom; canon flattens a whole pipe-joined
+   spelling but rewrites a `UnionDecl`'s members one at a time, and a lone `Json` has no
+   pipe. The flatten now happens at the declaration site; probe
+   `scripts/capability-probes/recursive-union-alias-named-composition.vl` RUNS (`2.5`,
+   `empty`). The module still spells `Json | JsonError` directly — not as a workaround now,
+   but because the surface never had a `JsonResult` and std does not add a name without a
+   consumer. Two traps the close recorded for anyone touching union member sets: do not
+   dedupe the member set (one entry per member in member ORDER is the box-tag ABI), and
+   guard an alias expansion by atom COUNT, not by name (a softened litunion alias is one
+   atom; three name-based predicates each measured wrong).
 
 4. **D1009 / D1010 — `Json | null` ↛ `Json` and null-bearing literals needing the `Json[]`
    annotation.** Both open, both loud check rejects. They are what makes the walking idiom
