@@ -1,0 +1,80 @@
+// @run
+// @log 7
+// @log 9
+// @log -1
+// @log 7
+// @log 11
+// @log -1
+// @log 7
+// @log -1
+// A field read on a union narrowed by its NULL COMPLEMENT (`type U = A | B | null` under
+// `if u != null`). Two mechanisms, and the second is why the first alone was not enough.
+//
+// `emitMem` routed on `memIsNarrowed`, which is true for ANY active narrowing including a
+// multi-variant survivor SET, while `emitNarrowedMem` can lower only a SINGLE variant. It
+// now asks `memNarrowVariantIndex`, so a survivor set falls through to the shared-union-field
+// dispatch — which already handles this shape ("a multi-variant NARROWED set dispatches over
+// just its remaining members"). The set is LOAD-BEARING rather than a nuisance: the
+// un-narrowed `A | B | null` cannot plan, because the `null` arm carries no `k`.
+//
+// That alone moved the refusal to `field access receiver is not a struct`, because the plan
+// was declining. Instrumented, its loop RECEIVES `{k:i32,a:i32}` and `{k:i32,b:i32}` — the
+// STRUCTURAL render, not the nominal `A` / `B` — since the interned member-set pool cannot
+// answer for this narrowing and the atoms come from splitting the rendered set. The bare
+// `variantIndexOf` is an exact compare against `uVariants` and could never match them;
+// `variantIndexOfTypeName` is the same lookup with the shape rung the struct resolver
+// already cites by name, and is `variantIndexOf` unchanged on a nominal atom (D1083).
+//
+// TWO CONSTRAINTS ON THIS FILE, BOTH MEASURED AGAINST THE PUBLISHED SEED, because closing
+// this row UNMASKS two pre-existing clause-1 defects that its own refusal used to hide
+// (`emitFail` keeps only the FIRST message, so a module that aborted at this read never
+// reached them):
+//
+//   · ARGUMENTS ARE INLINE LITERALS. An un-annotated `const a = {k: 7, a: 1}` bound to a
+//     nullable struct-union parameter is check-clean invalid wasm on master too — witnessed
+//     with `function g(u: U) { if u != null { return 1 } return -1 }`, which performs no
+//     shared read at all, and byte-identical there and here (D1172).
+//   · ONE FIELD REP PER MODULE. Two null-bearing struct unions whose shared field has
+//     DIFFERENT reps (i32 + string) are check-clean invalid wasm on master as well, through
+//     an `is` narrow to a single arm that master lowers — again byte-identical, 2040 bytes
+//     both (D1173). The string / f64 / boolean reps each run standalone.
+type A = { k: i32, a: i32 }
+type B = { k: i32, b: i32 }
+type U = A | B | null
+
+type TA = { k: i32, a: i32 }
+type TB = { k: i32, b: i32 }
+type TC = { k: i32, c: i32 }
+type U3 = TA | TB | TC | null
+
+type EA = { k: i32, a: i32 }
+type EB = { k: i32, b: i32 }
+type EU = EA | EB | null
+
+function sharedI32(u: U) {
+  if u != null { return u.k }
+  return -1
+}
+
+function threeArms(u: U3) {
+  if u != null { return u.k }
+  return -1
+}
+
+// The `== null` early-return spelling narrows the SAME way, through the else complement.
+function earlyReturn(u: EU) {
+  if u == null { return -1 }
+  return u.k
+}
+
+// DISCRIMINATE: each surviving arm must yield its OWN `k`, and the null arm the default.
+print(sharedI32({ k: 7, a: 1 }))
+print(sharedI32({ k: 9, b: 2 }))
+print(sharedI32(null))
+
+print(threeArms({ k: 7, a: 1 }))
+print(threeArms({ k: 11, c: 3 }))
+print(threeArms(null))
+
+print(earlyReturn({ k: 7, a: 1 }))
+print(earlyReturn(null))

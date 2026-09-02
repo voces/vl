@@ -34645,11 +34645,11 @@ Repro (RUNS and prints `true`):
 Fixture: `tests/cases/unions/union-list-arm-equality.vl`.
 ---
 
-### D1096 — a union `==` declines the whole compare when a STRUCT arm carries an f64, i64, f32 or LIST field; the same field types compare fine as plain struct fields
+### D1096 — [CLOSED 2026-09-02] a union `==` declines the WHOLE compare when a struct arm carries a field whose rep the variant-field ladder has no arm for — f64, i64, f32, every list rep and a function-valued field
 
-**loud emit reject: `emitProgram: `==` over a struct union is not supported yet` · check rc 0 · clause 2 · ZERO corpus cells · found 2026-09-02 as the residue of [D1071](#d1071); silently mis-compiled on the merge-base `60df1e87` (a module the engine refuses, after `vl check` rc 0) and loud since**
+**runs, prints `true` — CLOSED 2026-09-02 · was a loud emit reject (`emitProgram: `==` over a struct union is not supported yet`) on `vl check` rc 0, clause 2 · ZERO corpus cells · zero `runs` lost, distilled corpus unmoved (0 classes of 255,504 cells) · probe `union-eq-variant-field-rep.vl` GAP → RUNS**
 
-Repro (`vl check` rc 0, then the emitter refuses):
+Repro (runs, prints `true`):
 
     type A = { d: f64 }
     function mk(n: i32): A | i32 {
@@ -34660,28 +34660,49 @@ Repro (`vl check` rc 0, then the emitter refuses):
     const a: A = { d: 1.5 }
     print(p == a)
 
-* **THE INGREDIENT IS THE FIELD'S REP, NOT THE ARM SET.** Ablated one field type at a time
-  with the union and the operands held fixed: `x: i32` and `s: string` run, a nested inline
-  shape runs, and `d: f64`, `d: i64`, `d: f32` and `xs: i32[]` each refuse.
-  `variantFieldsComparable` accepts variant field codes 0 (i32 / boolean), 3 (string) and 15
-  (a nested shape) and declines everything else, and one unservable arm declines the whole
-  lowering.
+* **WHAT THE RUNG RECEIVED, PROBED RATHER THAN READ OFF THE CODE PATH.** An `emitFail` at the
+  decline printed `vi=0 ssi=-1 uRows=1 uHeap=0 cmp=0 codes=17,` — `exprVariantIndex` had
+  already resolved variant row 0 and every parallel-table bound passed; the only thing that
+  declined was `variantFieldsComparable`, on the single field's code 17. The gate admitted
+  the three codes the ladder happened to have arms for (0 i32/boolean, 3 string, 15 nested
+  shape) and ONE unservable field declined the whole compare.
 
-* **ONE GATE, BOTH SPELLINGS.** The union-vs-union and the union-vs-concrete compares read the
-  same predicate, so `p == q` and `p == a` refuse identically — this is one row, not two.
+* **THE FAMILY IS WIDER THAN FILED — a 15-cell grid, both spellings, one field type per
+  cell.** Refusing: `f64`, `i64`, `f32`, `i32[]`, `f64[]`, `i64[]`, `f32[]`, `string[]`,
+  `boolean[]`, a FUNCTION-valued field, and a `string | null` field. Running: `i32`,
+  `boolean`, `string`, a nested inline shape. The union-vs-concrete and union-vs-union
+  spellings read the one gate, so every cell refused at both and runs at both.
 
-* **THE CORES EXIST.** An f64 / i64 / f32 / list value compares at its direct spelling and as
-  a plain STRUCT field; what is missing is the variant-table ladder's route to them, which is
-  the same shape [D1020](#d1020) closed for scalar-backed list fields of a struct row.
+* **AND "THE CORES EXIST" WAS FALSE FOR TWO OF THEM.** The plain-STRUCT control — the same
+  field types with the union deleted — runs for f64, for every list rep and for the closure
+  field, and REFUSES for `i64` and `f32` with `emitProgram: unsupported struct field type in
+  equality`. Those two arms are BUILT here (`i64.eq` / `f32.eq`) rather than borrowed, and
+  the struct ladder still refuses them at its own spelling ([D1181](#d1181)).
 
-Probe: `scripts/capability-probes/union-eq-variant-field-rep.vl`.
+* **THE FRAME IS THE HALF THAT IS NOT THE COMPARE, and widening the gate first is what
+  proved it.** With the admission widened and the reservation not yet wired, a
+  function-valued field produced **check-clean INVALID WASM** — the closure-eq frame's scan
+  reads the BINARY'S OWN OPERANDS, which for a union `==` are boxes, so it saw no closure
+  anywhere. `unionArmsNeedCloEq` and `leqNoteVariantFields` now reserve for every arm of
+  either operand's union, because which arm runs is a runtime tag test no scan can narrow.
+
+* **ONE HOME, MIRRORED ARM FOR ARM.** `variantFieldComparable` decides and
+  `emitVariantFieldEqCore` emits; `eqVariantListFieldKind` is the single list-code map the
+  frame scan and the emitter share. It differs from its struct sibling in exactly one rung,
+  code 4 (`i32[]`), which that sibling excludes only because the struct ladder carries a
+  hand-written `i32[]` arm predating the generic cores.
+
+Residue: a `string | null` field is [D1180](#d1180) — still a loud refusal, and the checker
+rejects the same shape at the plain-struct spelling.
+
+Fixture: `tests/cases/unions/union-variant-field-reps-equality.vl`.
 ---
 
-### D1097 — a concrete variant delivered by reading a struct FIELD is not recognised as a variant, so the union `==` against it refuses; every other delivery of the same value runs
+### D1097 — [CLOSED 2026-09-02] a concrete operand whose variant row is unresolved — a struct-FIELD read, or an un-annotated literal — refuses the union `==` though its value already HAS the arm's heap type
 
-**loud emit reject: `emitProgram: `==` over a struct union is not supported yet` · check rc 0 · clause 2 · ZERO corpus cells · found 2026-09-02 by [D1071](#d1071)'s position matrix; silently mis-compiled on the merge-base `60df1e87` (a module the engine refuses, after `vl check` rc 0) and loud since**
+**runs, prints `true` — CLOSED 2026-09-02, TOGETHER WITH [D1099](#d1099), which is the same defect wearing a second face · was a loud emit reject (`emitProgram: `==` over a struct union is not supported yet`) on `vl check` rc 0, clause 2 · ZERO corpus cells · zero `runs` lost, distilled corpus unmoved · probes `union-eq-member-read-operand.vl` and `union-eq-unannotated-variant-operand.vl` both GAP → RUNS**
 
-Repro (`vl check` rc 0, then the emitter refuses):
+Repro (runs, prints `true`):
 
     type A = { x: i32 }
     type H = { a: A }
@@ -34693,26 +34714,77 @@ Repro (`vl check` rc 0, then the emitter refuses):
     const h: H = { a: { x: 1 } }
     print(p == h.a)
 
-* **THE DELIVERY IS THE GAP, NOT THE COMPARE.** The position matrix ran the identical compare
-  at nineteen other positions and every one of them works, including a struct-field read of
-  the BOX side (`h.u == a`). `exprVariantIndex` resolves a variant row for an `Ident`, an
-  `AsExpr`, a `Call` and a module GLOBAL and has no leg for a `Member` — so the concrete
-  operand answers -1 and the compare core declines. Binding it first does not help
-  (`const t = h.a; p == t` refuses too): the local's own row is resolved from the same read.
+* **ONE DEFECT, TWO FACES, MEASURED IN BOTH DIRECTIONS.** An `emitFail` probe at the
+  declining rung prints IDENTICALLY for this row and for D1099:
+  `vi=-1 ssi=0 sRows=2 uRows=1 sHeap=0 allU=A:0, allS={x:i32}:0,H:1,`. One change
+  (`eqConcreteVariantRow`) closed both and moved NEITHER [D1096](#d1096) nor
+  [D1098](#d1098); and closing each of those in turn moved neither of these two. Four rows,
+  three defects.
 
-* **IT IS THE OPERAND-SIDE FACE OF A WIDER GAP.** With a union declared, the union path owns
-  the struct `type`s, and `h.a == c` between two CONCRETE values of that shape already refuses
-  with `emitProgram: struct equality is not supported yet`. Delete the union declaration and
-  the same concrete-vs-concrete compare runs. One reader closes both.
+* **THE MECHANISM IS THAT `exprVariantIndex` IS REP-AUTHORITATIVE OVER BINDINGS.** Its answer
+  decides how a `let` / global cell is TYPED, so it carries one leg per storage class a
+  binding can take — param, declared local, capture, module global, `as` cast, call, index,
+  `??` — and none for a struct-FIELD read. And it declines an UN-ANNOTATED object literal the
+  moment the struct table holds a row matching its field set, which is
+  `objLitVariantIdxNoStructRow`'s own stated precondition. Both answer -1 while the VALUE is
+  a perfectly good arm-typed ref.
 
-Probe: `scripts/capability-probes/union-eq-member-read-operand.vl`.
+* **THE BRIDGE IS HEAP IDENTITY, NOT SHAPE MATCHING.** `sHeapIdx` and `uVarHeap` are two
+  INDEX spaces over one wasm TYPE space (`DECISIONS.md` keeps the namespaces apart on
+  purpose), and the last two probe columns are the fix: the operand's struct row and the
+  arm's variant row are the SAME heap index. That is exactly what the compare needs — it
+  casts the box's payload to `uVarHeap[vi]` and parks the concrete operand in a slot typed
+  from the same index, so an equal index means no conversion sits between them. Rows that
+  interned separately still decline, and so does an AMBIGUOUS match (two arms sharing one
+  heap type), where the heap does not determine the TAG.
+
+* **NARROWING THE RESOLVER WAS THE WRONG PLACE.** Adding a `Member` leg to
+  `exprVariantIndex` would change how `const t = h.a` BINDS, in a table whose header spends
+  its length on why the two namespaces must not merge. The bridge lives at the compare, is
+  read by nothing else, and cannot move a binding's rep.
+
+* **POSITION MATRIX, RUN NOT READ — 28 of 28**, each row printing a value that proves the
+  compare happened: top level, local binding, argument, return, local assignment, GLOBAL
+  assignment, global init, struct-field init, `if` condition, `while` condition, list
+  element, `&&` right operand, both operands as params, closure body, concrete-side call,
+  box-side field read, concrete-side field read, a bound field read, the un-annotated
+  operand, reversed operand order, `!=` at two spellings, THREE nested compares and three
+  evaluation-count rows. The same matrix is 0 of 28 on the merge-base `462e2a74`.
+
+* **AND `eqConcreteVariantRow` NEEDED A THIRD STORAGE CLASS, found by a MERGE — the bullet
+  above lists what the resolver covers, and this is what neither branch could see alone.**
+  [D1112](#d1112)/[D1150](#d1150) landed concurrently and gave a code-15 field read whose
+  target is a union ARM its own kind: the binding now classifies `nulvariant`. That kind
+  falls between BOTH of this row's rungs — `exprVariantIndex` declines it because that
+  resolver is the NON-NULL one, `structIndexOfExpr` declines it because an arm has no
+  `sNames` row — so `const tI = hI.a; p1 == tI` (line 73-75 of the fixture, the bound
+  field-read cell) went back to the loud refusal on the merged tree while BOTH branches were
+  green alone.
+
+  **THE TWO PREDICATES AGREE ABOUT THE WORLD; the bridge simply lacked the class.** `A` in
+  this fixture genuinely IS a union arm, so D1112's arm is not a false positive here — and
+  the row it hands back is the arm the CHECKER'S type names, which is strictly better than
+  the heap-identity scan below it: that scan must decline an ambiguous match, this cannot be
+  ambiguous. So the nullable-variant rung is asked FIRST, and the fixture's own `@log`
+  oracle is what pins that the two routes select the same tag.
+
+  **THE TWIN QUESTION DOES NOT DISCRIMINATE THEM — measured, and it refuted the first fix.**
+  The obvious narrowing was to decline D1112's arm wherever the target has a struct twin, on
+  the row's own report that `structIndexByName("JsonError")` was -1. Probed on both witnesses
+  at once: `hI.a` reads `sTwin=none hTwin=YES` and `p.err` reads `sTwin=YES hTwin=YES` — the
+  `uVarSTwin` column answers the OPPOSITE way round from the prediction, and
+  `variantStructHeapTwinAt` answers YES for both. That -1 was a fact about the OLD tree;
+  [D1105](#d1105)/[D1110](#d1110)'s `repCanonId` literal arm has since minted the row. A
+  citation is a measurement with a date on it, and this one had gone stale inside a week.
+
+Fixture: `tests/cases/unions/union-concrete-operand-delivery-equality.vl`.
 ---
 
-### D1098 — a union whose arm is a CLOSURE has no payload compare: `(() => i32) | i32` against a concrete function refuses
+### D1098 — [CLOSED 2026-09-02] a union whose arm is a CLOSURE has no payload compare — and the arm's box TAG was read from the wrong home, which only the fix could reach
 
-**loud emit reject: `emitProgram: `==` over a union's closure arm is not supported yet` · check rc 0 · clause 2 · ZERO corpus cells · found 2026-09-02 as the non-list half of [D1071](#d1071)'s container family; silently mis-compiled on the merge-base `60df1e87` (a module the engine refuses, after `vl check` rc 0) and loud since**
+**runs, prints `true` — CLOSED 2026-09-02 · was a loud emit reject (`emitProgram: `==` over a union's closure arm is not supported yet`; the union-vs-union spelling read `union `==` atom has no value box`) on `vl check` rc 0, clause 2 · ZERO corpus cells · zero `runs` lost, distilled corpus unmoved · probe `union-eq-closure-arm.vl` GAP → RUNS · `goal-scoreboard.py --sites` 23 → 22, removing the literal [D1071](#d1071) added**
 
-Repro (`vl check` rc 0, then the emitter refuses):
+Repro (runs, prints `true`):
 
     function seven(): i32 { 7 }
     function mk(n: i32): (() => i32) | i32 {
@@ -34722,26 +34794,45 @@ Repro (`vl check` rc 0, then the emitter refuses):
     const p = mk(1)
     print(p == seven)
 
-* **THE UNBOX EXISTS AND THE COMPARE DOES NOT.** A closure arm rides the box's `value` field
-  directly as its fat-pointer struct — the same shape the string and list arms ride, both of
-  which compare — and `emitUnionUnboxTail` already recovers it for a narrowed read. What has
-  no route is the compare: two closures are equal by function IDENTITY, a separate lowering
-  with its own scan (`cloEqNoteBin`), and the union arm ladder never reaches it.
+* **THE UNBOX ALREADY EXISTED AND THE COMPARE DID NOT.** A closure arm rides the box's
+  `value` field directly as its fat-pointer struct — the shape the string and list arms ride
+  — and `emitUnionUnboxTail` already recovered it for a narrowed read. The `==` twin went
+  straight to the scalar value-box lookup. Both spellings now `ref.cast` the payload to
+  `cloStructIdx` and compare through `emitCloEqCore` (id equal AND `env` `ref.eq`), the
+  identity core a standalone struct's function-valued field already takes.
 
-* **THE UNION-VS-UNION SPELLING IS UNCHANGED AND STILL REFUSES**, with the older message
-  `emitProgram: union `==` atom has no value box` — the same gap read through the other
-  lowering. The concrete spelling was SILENT before [D1071](#d1071)'s fix and now names the
-  arm, which is the one message literal this change ADDED to `goal-scoreboard.py --sites`
-  (22 → 23).
+* **AND THE TAG WAS WRONG, WHICH NOTHING BEFORE THE FIX COULD REACH.** A closure arm does not
+  tag at the flat value-atom offset: it tags by SIGNATURE (`cloArmTagOfTy` →
+  `cloSigSlotTag`), where the FIRST signature a module interns keeps the kind-11 offset and
+  each further one claims the band above. All three union `==` lowerings read
+  `scalarTagOfKind(11)`, which is right for exactly one union per module. **Disassembled**
+  (`wasm-dis`, the four feature flags) on a module carrying `((i32) => i32) | i32` and
+  `(() => i32) | S`: the second union's box writes `i32.const 16` and the compare tested
+  `i32.const 12`. That is a WRONG ANSWER at the union-vs-concrete spelling (`false` where the
+  answer is `true`) and a `ref.cast` **TRAP** at the union-vs-union one, where the failed
+  test falls through to the next arm's payload cast. `unionEqTagOfArmTy` routes all three
+  lowerings through the home the BOX site (`emitUnionCoerce`) and the `is` TEST site
+  (`isArmTagOfTy`) already share.
 
-Probe: `scripts/capability-probes/union-eq-closure-arm.vl`.
+* **A ONE-SIGNATURE FIXTURE CANNOT SEE THAT**, which is why the fixture carries three
+  signatures in one module and a union with TWO closure arms. It also carries a CAPTURING
+  lambda — identity is (id, env), so two closures built by one lambda from different frames
+  must compare unequal — and a closure arm beside a struct arm, where the tag rather than the
+  operand's spelling picks the core.
+
+* **THE FRAME IS THE HALF THAT IS NOT THE COMPARE**, and `cloEqNoteBin`'s three legs all read
+  the BINARY'S OWN OPERANDS, which for a union `==` are boxes. `unionArmsNeedCloEq` reserves
+  for every arm of either operand's union — the closure ARM here, and a struct arm's
+  function-valued FIELD for [D1096](#d1096).
+
+Fixture: `tests/cases/unions/union-closure-arm-equality.vl`.
 ---
 
-### D1099 — an UN-ANNOTATED concrete operand stops resolving its variant row once the file declares a second type carrying a structurally identical INLINE shape; nothing has to use it
+### D1099 — [CLOSED 2026-09-02] an UN-ANNOTATED concrete operand stops resolving its variant row once the file declares a second type carrying a structurally identical INLINE shape; nothing has to use it
 
-**loud emit reject: `emitProgram: `==` over a struct union is not supported yet` · check rc 0 · clause 2 · ZERO corpus cells · found 2026-09-02 by writing the un-annotated spelling of [D1071](#d1071)'s own fixture; silently mis-compiled on the merge-base `60df1e87` (a module the engine refuses, after `vl check` rc 0) and loud since**
+**runs, prints `true` — CLOSED 2026-09-02 by [D1097](#d1097)'s single change, which is the measurement that made the two ONE defect · was a loud emit reject (`emitProgram: `==` over a struct union is not supported yet`) on `vl check` rc 0, clause 2 · ZERO corpus cells · zero `runs` lost, distilled corpus unmoved**
 
-Repro (`vl check` rc 0, then the emitter refuses):
+Repro (runs, prints `true`):
 
     type A = { x: i32 }
     type N = { inner: { x: i32 } }
@@ -34754,17 +34845,84 @@ Repro (`vl check` rc 0, then the emitter refuses):
     print(p == a)
 
 * **THE INGREDIENT IS THE SECOND DECLARATION, NOT THE MISSING ANNOTATION.** Ablated in both
-  directions: delete `type N` and the same un-annotated program prints `true`; keep `N` and
-  write `const a: A = { x: 1 }` and it prints `true`. Nothing needs to USE `N` — a function
-  returning `N | i32` is not required, the bare declaration is enough — so the ingredient is
-  what declaring `{ inner: { x: i32 } }` does to the shape tables, not any flow through it.
+  directions: delete `type N` and the same un-annotated program printed `true` even before
+  the fix; keep `N` and write `const a: A = { x: 1 }` and it printed `true`. Nothing needs to
+  USE `N` — the bare declaration is enough — because its inline `{ x: i32 }` is interned into
+  the STRUCT table and `objLitVariantIdxNoStructRow` declines the moment a matching row
+  exists. The LOCAL spelling (`const a = { x: 1 }` inside a function) refused identically, so
+  it is not a globals-only rung.
+
+* **SAME RUNG STATE AS [D1097](#d1097), and that is the evidence they are one defect**, not
+  the shared message: both print `vi=-1 ssi=0 … allU=A:0, allS={x:i32}:0,` at the decline,
+  with the operand's struct row and the arm's variant row on the same heap index. The heap
+  identity bridge closed both at once and moved neither of the other two rows in the cluster.
 
 * **A FIXTURE THAT ANNOTATES CANNOT SEE THIS**, which is [D969](#d969)'s lesson one function
-  further in and how it was found: the annotation PINS the operand's rep, so
-  `union-concrete-variant-equality.vl` declares its `redundant type annotation` hints rather
-  than deleting the annotations, and says why in the file.
+  further in. `union-concrete-operand-delivery-equality.vl` therefore carries the annotated
+  AND the un-annotated spelling of every row, declares its `redundant type annotation` hints
+  rather than deleting the annotations, and asserts that the two spellings AGREE — a hint
+  saying an annotation is redundant is the checker agreeing about the TYPE and says nothing
+  about the REP.
 
-Probe: `scripts/capability-probes/union-eq-unannotated-variant-operand.vl`.
+Fixture: `tests/cases/unions/union-concrete-operand-delivery-equality.vl`.
+---
+
+### D1180 — a variant arm's `string | null` FIELD refuses the union `==` on a check-clean program, while the checker REJECTS the same field at the plain-struct spelling
+
+**loud emit reject: `emitProgram: `==` over a struct union is not supported yet` · check rc 0 · clause 2 · ZERO corpus cells · found 2026-09-02 as the one cell of [D1096](#d1096)'s 15-cell field-rep grid that its fix does not close**
+
+Repro (`vl check` rc 0, then the emitter refuses):
+
+    type A = { d: string | null }
+    function mk(n: i32): A | i32 {
+      if n == 0 { return 5 }
+      { d: "q" }
+    }
+    const p = mk(1)
+    const a: A = { d: "q" }
+    print(p == a)
+
+* **THE TWO SPELLINGS DISAGREE ABOUT WHETHER THE SHAPE IS EQUATABLE AT ALL.** With the union
+  deleted, `const a: A = { d: "q" }; a == b` is a LOUD CHECK REJECT — *"A isn't equatable (a
+  field is not value-comparable)"* — so at the plain-struct spelling the language has ruled.
+  Inside a union arm the same field passes `vl check` and refuses at emit, which is a
+  clause-2 violation whichever way the rule is meant to go: either `isEquatable` should
+  refuse the arm too, or both spellings owe a compare.
+
+* **IT IS NOT [D1096](#d1096)'S GATE.** That gate now serves every scalar, list, nested-shape
+  and closure field; this one needs a null-guarded string compare that neither field ladder
+  has (`emitStructEqFieldInner` has no arm for the code either), so it is a core to build,
+  not a route to open.
+
+* **DECIDE THE CHECKER QUESTION FIRST.** Building the compare while `isEquatable` refuses the
+  plain spelling would leave one shape comparable in a union and not outside it, which is the
+  kind of split the union path has repeatedly paid for.
+---
+
+### D1181 — an `i64` or `f32` STRUCT FIELD has no equality core, while every other scalar field rep does — and a union ARM carrying the same field now compares
+
+**loud emit reject: `emitProgram: unsupported struct field type in equality` · check rc 0 · clause 2 · ZERO corpus cells · found 2026-09-02 by running [D1096](#d1096)'s plain-struct CONTROL, which refuted that row's filed claim that "the same field types compare fine as plain struct fields"**
+
+Repro (`vl check` rc 0, then the emitter refuses):
+
+    type A = { d: i64 }
+    const a: A = { d: 9000000000 }
+    const b: A = { d: 9000000000 }
+    print(a == b)
+
+* **`f32` IS THE SAME CELL WITH ONE SPELLING CHANGED** (`type A = { d: f32 }`, `{ d: 1.5 }`),
+  same message. Every other scalar field rep compares: `i32`, `boolean`, `string`, `f64`, a
+  nested shape, a function-valued field and all six list reps.
+
+* **THE CORES ARE ONE OPCODE EACH** — `i64.eq` (`0x51`) and `f32.eq` (`0x5b`), beside the
+  `f64.eq` the ladder already emits — and [D1096](#d1096) BUILT exactly those two arms for
+  the VARIANT-table field ladder, so `type A = { d: i64 }` inside an `A | i32` compares today
+  while the same field outside a union does not. The two ladders should not disagree about a
+  field rep.
+
+* **THE VALUES COMPARE AT EVERY OTHER POSITION**: `9000000000 == 9000000000` at the direct
+  spelling, as a union arm's payload, and as a list element (`i64[] == i64[]` runs). This is
+  the field POSITION alone.
 ---
 
 ### D1093 — [CLOSED 2026-09-02] the VARIANT table codes an INLINE multi-member literal-union field `string` and the STRUCT table codes it `atom`, so an arm carrying one still has no field rep; the NAMED alias spelling of the same union runs
@@ -34961,11 +35119,24 @@ Repro:
 
 ### D1080 — a DECLARATIONS-ONLY module is check-clean and refused at emit; the same file IMPORTED by a program that uses the type compiles and runs
 
-**loud emit reject · check rc 0 · clause 2 · `emitProgram: expected at least one top-level function or statement` (`compiler/emit_sections.vl:3881`) · ZERO corpus cells · found 2026-09-02 by the emit-refusal reachability sample**
+**closed — `passCheckTopLevel` enforces nothing and its sibling root-level floor is gone; an empty wasm module is valid wasm and every section is already gated on having something to write · was a loud emit reject at check rc 0 · ZERO corpus cells · found 2026-09-02 by the emit-refusal reachability sample**
 
-Repro (refuses):
+Repro (runs, prints nothing):
 
     export type Point = { x: i32, y: i32 }
+
+* **BOTH SITES WENT, because they were two sentences for one refusal.** The pass and the
+  arena-root floor (`expected at least one top-level statement`, the zero-byte and
+  comment-only case) are closed together. Measured: `export type`, `type T = {…}`,
+  `type Id = i32`, two declarations, a `const`-only file, a comment-only file and a
+  ZERO-BYTE file all build; the artifact is `(module)` at 25 bytes and `wasm-opt -O3`
+  validates it. The import control still prints `7`.
+
+* Fixtures: `tests/cases/modules/declarations-only-entry/entry.vl` (the entry position) and
+  `tests/cases/modules/declarations-only-import/` (the control that always worked). Closing
+  this also retired a `selfhost_native_align` EXCLUSION whose stated reason was this very
+  refusal — `soundness/README.vl`, "declares no top-level statement for the emitter to
+  lower" — which its own tripwire then failed for agreeing.
 
 * **THE ENTRY POSITION IS THE INGREDIENT, AND IT IS WHAT MAKES THIS A GAP RATHER THAN A DESIGN
   RULE.** The identical file imported by a program that uses `Point` compiles and runs. So the
@@ -34988,9 +35159,9 @@ Repro (refuses):
 
 ### D1081 — an EMPTY inline object shape as a union arm (`{} | { x: i32 }`) is check-clean and refused as "malformed"
 
-**loud emit reject · check rc 0 · clause 2 · `emitProgram: malformed inline union-variant shape` (`compiler/emit_collect.vl:10808`) · ZERO corpus cells · found 2026-09-02 by the emit-refusal reachability sample**
+**closed — `shapeInnerFieldSplit` answers ZERO fields for the empty interior, so the `fnames[fi] == ""` guard no longer fires on a shape that has none · was a loud emit reject at check rc 0 · ZERO corpus cells · found 2026-09-02 by the emit-refusal reachability sample**
 
-Repro (refuses):
+Repro (runs, prints `5`):
 
     type U = {} | { x: i32 }
     function f(u: U): i32 {
@@ -35010,13 +35181,25 @@ Repro (refuses):
   `outNames.push("")` at `emit_base.vl:3102` — and the `fnames[fi] == ""` guard fires on a shape
   that has no fields at all.
 
-* Probe: `scripts/capability-probes/empty-inline-union-arm.vl`.
+* **THE FIX IS ON THE INTERIOR, NOT ON THE PART LIST**, so the malformed-input contract the
+  `dropEmpty=false` split exists for is untouched: `""` means the caller asked for the fields
+  of `{}`, while `"a:i32,"` still yields its empty trailing part and is still reported. All
+  thirteen callers pass `groupInnerOf(<shape>)` and are asking one question — "the fields of
+  this shape" — for which zero is the answer.
+
+* 8 of 9 grid cells run and DISCRIMINATE (`5|-1`, `6|-1` with the empty arm SECOND, `9|10|-1`
+  at three arms). The ninth, `{} | null`, is a DIFFERENT mechanism and is filed as D1171: it
+  refuses `ref valtype with no interned shape`, and the alias spelling (`type E = {}` then
+  `E | null`) already runs.
+
+* Probe: `scripts/capability-probes/empty-inline-union-arm.vl` (GAP → RUNS).
+  Fixture: `tests/cases/unions/empty-inline-shape-union-arm.vl`.
 
 ### D1082 — a generic `T[]` parameter applied at a UNION-element list is check-clean and refused with "expected an array argument" about an argument that is an array
 
-**loud emit reject · check rc 0 · clause 2 · ``emitProgram: monomorphize: expected an array argument for `xs` in a call to `first` `` (`compiler/emit_mono.vl:4813`) · ZERO corpus cells · found 2026-09-02 by the emit-refusal reachability sample**
+**closed — `monoAnnPinName`'s union-alias arm gained its LIST rung, the third instance in that ladder of a bare rung whose array complement was missing · was a loud emit reject at check rc 0 · ZERO corpus cells · found 2026-09-02 by the emit-refusal reachability sample**
 
-Repro (refuses):
+Repro (runs, prints `5`):
 
     type Circle = { r: i32 }
     type Sq = { s: i32 }
@@ -35039,13 +35222,28 @@ Repro (refuses):
   already proved it is an array of the right element. `monoArgPinName` hands the binding rung a
   name `nameIsArray` does not recognise, and the rung reports that as the user's mistake.
 
-* Probe: `scripts/capability-probes/generic-array-param-union-element.vl`.
+* **WHAT THE RUNG RECEIVED, instrumented rather than read off the code path**: `an2 = "i32"`,
+  with `ann = "T[]"` and `tp = "T"`. That is the cascade's CATCH-ALL, not a union name — the
+  probe was built to a scratch `OUT=` path and the seed `md5sum`-verified unchanged.
+
+* **ONE HOLE, TWO MESSAGES.** `expected an array argument` at an annotated local, at a second
+  instance beside an i32 one, and through a `T[]`-returning generic; `unsupported argument
+  type` at module scope and at a `Shape[]` PARAMETER forwarded in. All 11 grid cells run.
+
+* **THE PIN'S SAFETY PROPERTY IS MEASURED, NOT ARGUED.** `monoAnnPinName`'s contract is that a
+  pin must be a spelling a NON-generic function already lowers end to end; the controls
+  `firstS(xs: Shape[]): Shape` and `firstV(xs: V[]): V` (a value union, `i32 | string`) both
+  run. The rung SUBSUMES the literal-union `K[]` one further down, which is now stated as the
+  special case it always was.
+
+* Probe: `scripts/capability-probes/generic-array-param-union-element.vl` (GAP → RUNS).
+  Fixture: `tests/cases/generics/generic-array-param-union-element.vl`.
 
 ### D1083 — a field read on a union narrowed by its NULL COMPLEMENT is check-clean and refused; dropping the `| null` arm runs
 
-**loud emit reject · check rc 0 · clause 2 · `emitProgram: narrowed receiver names no union variant` (`compiler/wasmEmit.vl:4162`) · ZERO corpus cells · found 2026-09-02 by the emit-refusal reachability sample**
+**closed — `emitMem` routes to the narrowed-member downcast only when the narrow names ONE variant, and the shared-field plan resolves a STRUCTURALLY rendered atom · was a loud emit reject at check rc 0 · ZERO corpus cells · found 2026-09-02 by the emit-refusal reachability sample**
 
-Repro (refuses):
+Repro (runs, prints `7`):
 
     type A = { k: i32, a: i32 }
     type B = { k: i32, b: i32 }
@@ -35069,13 +35267,38 @@ Repro (refuses):
   `emitNarrowedMem`, and `variantIndexOf("A | B")` is an exact string compare against a variant
   table holding `A` and `B` separately and nothing spelled `"A | B"`.
 
-* Probe: `scripts/capability-probes/null-complement-narrowed-field-read.vl`.
+* **THE ROW'S OWN MECHANISM SENTENCE WAS WRONG ABOUT THE STRING, and the fix needed that
+  corrected.** It filed the banked survivor set as `"A | B"`. Instrumented, the plan's loop
+  RECEIVES `{k:i32,a:i32}` and `{k:i32,b:i32}` — the STRUCTURAL render. The interned
+  member-set pool cannot answer for this narrowing (`currentStructNarrowSetIdOf` resolves
+  through `msSetOfText(unionMemberSetOf(…))`, a null-bearing union's member set renders
+  structurally, the text lookup misses, `pushNarrowComplement` declines, and the fallback
+  `pushNarrow` banks the render with no set id), so the atoms come from splitting that render
+  and the bare `variantIndexOf` — an exact compare against `uVariants` — could never match
+  them. `variantIndexOfTypeName` is the same lookup with the shape rung the struct resolver
+  already cites by name, and is `variantIndexOf` unchanged on a nominal atom.
+
+* 14/14 witnesses run and DISCRIMINATE per arm: `7|9|-1`, `7|11|-1` at three arms plus null,
+  `aa|bb|none` at a string field, `1.5|2.5` at f64, `true|false` at boolean, plus `is null`,
+  the `== null` early return, a local rebind and a repeated read. A multi-variant subset
+  narrow of a NON-nullable union (`if u !is Cc` over `A|B|Cc`) runs too — the first change
+  buys it.
+
+* **CLOSING THIS UNMASKS TWO PRE-EXISTING CLAUSE-1 DEFECTS** that its refusal used to hide,
+  because `emitFail` keeps only the FIRST message: D1172 (an un-annotated `const` bound to a
+  nullable struct-union parameter) and D1173 (two null-bearing struct unions whose shared
+  field has different reps). Both are check-clean invalid wasm on the PUBLISHED SEED as well,
+  byte-identical there and here, so neither is a regression — but the fixture must avoid both
+  or it pins someone else's bug.
+
+* Probe: `scripts/capability-probes/null-complement-narrowed-field-read.vl` (GAP → RUNS).
+  Fixture: `tests/cases/unions/null-complement-shared-field-read.vl`.
 
 ### D1084 — an OPTIONAL-CHAIN result as a nullable-struct equality operand is check-clean and refused; every other producer of the same type compares fine
 
-**loud emit reject · check rc 0 · clause 2 · `emitProgram: struct equality over a non-struct operand` (`compiler/wasmEmit.vl:11809`) · ZERO corpus cells · found 2026-09-02 by the emit-refusal reachability sample**
+**closed — three missing `OptMember` / code-15 arms, one per layer: the equality classifier, the value lowering, and the nullable-struct classifier · was a loud emit reject at check rc 0 · ZERO corpus cells · found 2026-09-02 by the emit-refusal reachability sample**
 
-Repro (refuses):
+Repro (runs, prints `true`):
 
     type S = { a: i32 }
     type T = { f: S }
@@ -35095,13 +35318,32 @@ Repro (refuses):
   IfStmt / BinExpr / Call / Ident / Index / Member — and **no `OptMember`**. The `?.` operand
   falls to the `-1` tail, `binEqNulVariantRow` also declines, and both `siFound` rungs miss.
 
-* Probe: `scripts/capability-probes/optchain-result-struct-equality.vl`.
+* **THREE ARMS, AND REFUSALS CAME IN LAYERS.** `structIndexOfExpr` had no `OptMember` arm, so
+  the classifier could not name the row; then `emitOptMemberValue` had no code-15 arm, so the
+  operand had no value lowering (`a standalone ?. supports only i32/boolean and string leaf
+  fields`); then `exprNullableStruct` had no `OptMember` arm.
+
+* **THE THIRD ARM IS WHAT MAKES THE UN-ANNOTATED SPELLING WORK, and without it the fix was the
+  shape CLAUDE.md warns about.** With only the first two, `const r: S | null = o?.f` ran while
+  `const r = o?.f` was refused `bare null needs a struct-typed context` at its own `!= null`
+  guard — the annotation was pinning the rep. The controls say the gap is the `?.` PRODUCER
+  and not inference: the identical un-annotated binding from a CALL result and from a plain
+  field read both already ran.
+
+* **POSITION MATRIX, 11 of 12.** Equality (both operand orders, `!=`, both-sides `?.`),
+  annotated binding, INFERRED binding, return, argument, local assign, global assign,
+  struct-field, list element, and a two-hop chain — each printing a distinct proving value.
+  The twelfth, `o?.f ?? d` over a struct field, is a SEPARATE pre-existing site and is filed
+  as D1170.
+
+* Probe: `scripts/capability-probes/optchain-result-struct-equality.vl` (GAP → RUNS).
+  Fixture: `tests/cases/objects/optchain-result-nullable-struct.vl`.
 
 ### D1085 — a LAMBDA anywhere underneath an `as` cast is never lifted: check-clean, refused at emit, and deleting the cast makes it run
 
-**loud emit reject · check rc 0 · clause 2 · `emitProgram: function literal not lifted` (`compiler/wasmEmit.vl:12891`) · ZERO corpus cells · found 2026-09-02 by the emit-refusal reachability sample**
+**closed — `liftFnsInExpr` gained `AsExpr` and `IsExpr` arms · was a loud emit reject at check rc 0 · ZERO corpus cells · found 2026-09-02 by the emit-refusal reachability sample**
 
-Repro (refuses):
+Repro (runs, prints `1`):
 
     function pick(f: (i32) => i32): i32 { return f(1) }
     const v = pick((n: i32) => { return n }) as f64
@@ -35119,11 +35361,26 @@ Repro (refuses):
   never lifted, but the emit reports `` emitProgram: `?.` needs a re-readable receiver `` first.
   `match` arms and scrutinees are fine — `match` desugars into If/Block, which are walked.
 
-* Probe: `scripts/capability-probes/lambda-under-as-cast.vl`.
+* **`IsExpr` IS A SECOND UNWALKED KIND CARRYING THE SAME MESSAGE**, and the row named only
+  the cast. It was found by sweeping the node union rather than the row — the correct unit
+  here is the walk's arm list against `Node`'s members, not the witness.
 
-### D1086 — an `if` EXPRESSION with no `else` is check-clean and refused at THREE different emit sites, one per rep
+* **TWO KINDS DELIBERATELY NEED NO ARM, both measured.** `MatchExpr` desugars into
+  `IfStmt`/`Block`, which this walk already enters — a lambda in a match SCRUTINEE and in a
+  match ARM both run. `OptMember` cannot hold one at all: a `?.` receiver must be re-readable
+  (a name, or a chain of names), so no compilable program can put a call there, which also
+  retires the row's "masked neighbour" note as unreachable rather than pending.
 
-**loud emit reject · check rc 0 · clause 2 · `emitProgram: if-expression requires an else arm` (`compiler/wasmEmit.vl:12942` at a ref rep and `compiler/wasmEmit.vl:13116` at a sentinel-nullable scalar rep) · ZERO corpus cells · found 2026-09-02 by the emit-refusal reachability sample**
+* 8 cases run with distinct proving values — binding, index, struct-field, return, assignment,
+  module-global, `is`, and the `?.`-adjacent control. `as` over a non-numeric target stays a
+  CHECK reject (`\`as\` supports numeric conversions only`), which is the design rule.
+
+* Probe: `scripts/capability-probes/lambda-under-as-cast.vl` (GAP → RUNS).
+  Fixture: `tests/cases/closures/lambda-under-as-and-is.vl`.
+
+### D1086 — an `if` EXPRESSION with no `else` is check-clean and refused at EVERY rep at module scope and at the six composite reps inside a function — 18 of 24 grid cells, not three sites
+
+**loud emit reject · check rc 0 · clause 2 · `emitProgram: if-expression requires an else arm` and `emitProgram: union if-expression requires an else arm` · ZERO corpus cells · found 2026-09-02 by the emit-refusal reachability sample, SCOPE CORRECTED 2026-09-02 by a 2x12 grid**
 
 Repro (refuses):
 
@@ -35145,14 +35402,41 @@ Repro (refuses):
   scratch `OUT=` path (never the seed; `build/vl-compiler.wasm` was `cmp`-verified byte-identical
   before and after) tagged the two apart and confirmed both are independently reachable.
 
+* **NOT CLOSED, AND THE SCOPE IS THE FINDING.** A SCOPE x REP grid — module scope and function
+  scope crossed with twelve then-arm reps — grades **18 of 24 cells refusing**, not three
+  sites:
+
+  | then-arm rep | at module scope | inside a function |
+  | --- | --- | --- |
+  | `i32` / `boolean` / `string` / `f64` / `i64` / `f32` | refuses (6) | **runs** (6) |
+  | `struct` / `union` / `litunion` / list / string-list / map | refuses (6) | refuses (6) |
+
+  So MODULE SCOPE refuses at every rep — including the four scalar reps that run one nesting
+  level in — and function scope refuses at the six composite reps. Master has moved under the
+  row: the filed `string` witness runs today inside a function and refuses only as filed at
+  module scope, which is why the row's "three sites, one per rep" reads as a fragment.
+
+* **THE CHECKER IS NOT CONSISTENT ABOUT THE TYPE EITHER, and that is a second question the row
+  does not raise.** At a BINDING the else-less `if` types as `T | null` and is accepted; in
+  RETURN position and as a `??` left operand the checker calls it `void` — `return if c
+  { "hi" }` is `return type mismatch: expected string | null, got void`. Whichever answer is
+  right, the two positions disagree, and the codegen work should not start before that is
+  ruled on: lowering a synthesized null else arm at 18 cells while the checker calls the same
+  expression `void` elsewhere would build the feature twice.
+
+* **WHY IT WAS LEFT**: closing it is a per-rep null-else lowering at two scopes behind at
+  least three emit sites, which is a larger piece of work than the other nine rows in this
+  sample combined, and it is the one row where a partial landing would ship a rep that
+  compiles beside eleven that do not. Recorded rather than half-done.
+
 * Probes: `scripts/capability-probes/if-expr-no-else-string-arm.vl` (12942) and
-  `scripts/capability-probes/if-expr-no-else-boolean-arm.vl` (13116).
+  `scripts/capability-probes/if-expr-no-else-boolean-arm.vl` (13116) — both still GAP.
 
 ### D1087 — the emitter dispatches on a NAME the checker let the user bind, so a user's own parameter or struct field draws a BUILT-IN's arity complaint
 
-**loud emit reject · check rc 0 · clause 2 · `emitProgram: __memory_size__ takes no arguments` (`compiler/wasmEmit.vl:15119`) and `emitProgram: .pop takes no arguments` (`compiler/wasmEmit.vl:16985`) · ZERO corpus cells · found 2026-09-02 by the emit-refusal reachability sample**
+**closed — both dispatches now ask before matching a SPELLING: the eleven intrinsic arms ask the SCOPE, and `.pop` asks its receiver · was a loud emit reject at check rc 0 AND, at a matching arity, a check-clean SILENTLY WRONG ANSWER the row did not mention · ZERO corpus cells · found 2026-09-02 by the emit-refusal reachability sample**
 
-Repro (refuses):
+Repro (runs, prints `2`):
 
     function run(__memory_size__: (i32) => i32): i32 {
       return __memory_size__(1)
@@ -35176,14 +35460,47 @@ Repro (refuses):
   at check rc 1. The difference between the two intrinsics is which layer owns the rule — which
   is the fix for the other two.
 
-* Probes: `scripts/capability-probes/intrinsic-name-as-parameter.vl` and
-  `scripts/capability-probes/struct-field-named-pop.vl`.
+* **THE LOUD FACE WAS THE LUCKY ONE.** `__memory_size__` complains because its arity is 0 and
+  the call has 1 argument. `__memory_grow__` takes exactly 1, so the arms MATCH and the
+  emitter silently lowers the intrinsic: `run(__memory_grow__: (i32) => i32)` called with a
+  capturing lambda was `vl check` rc 0 and printed `1` (the previous page count) instead of
+  `779`, with `(memory.grow (i32.const 1))` in the disassembled body and the parameter never
+  called. The arities that line up are the silent ones.
+
+* **THE FIX IS IN CALLEE POSITION, AND THE FIRST ATTEMPT — RESERVING THE NAME AT THE
+  PARAMETER — WAS REFUTED BY THE CORPUS.** `closures/capture-local-named-like-builtin.vl`
+  deliberately PINS a parameter named `__load_i32__` as legal VL and states the rule: *"A name
+  denotes instructions only where it is being CALLED."* Widening the checker broke it, and the
+  fixture is right — an intrinsic-spelled name that is never called denotes nothing. So the
+  eleven arms ask `identNameIsUserBound` instead, which is the same test `userOwnsName`
+  already made for the six BUILTIN names (D975), asked of the frame rather than of the
+  function table because a parameter is in neither. The checker's reservation on `function` /
+  `const` / `let` is unchanged.
+
+* **`capScan`'s DUNDER EXEMPTION TOOK THE NUMERIC ARM'S SHADOWING GUARD**, which that site's
+  own comment had already asked for: *"Keeping the capture recorded is what leaves the env
+  correct for the day that dispatch is fixed."* Without it the closure's env never carried the
+  shadowing parameter and the new gate had nothing to find. The CAPTURED-call position then
+  reaches `call to unknown function` — and that is EXACT PARITY, not a residue: the identical
+  program with an ordinary parameter name gives the same refusal on master, while the
+  intrinsic-named twin there printed the wrong answer.
+
+* **THE STRUCT-FIELD FACE IS A DIFFERENT MECHANISM AND REACHES `runs` OUTRIGHT.** `pop` is not
+  a reserved word — the same program with the field named `push`, `map` or `filter` already
+  ran — so the receiver test is lifted to `popRecvIsList` and asked at BOTH dispatch sites
+  (value and statement) and at `emitPop`'s own floor, so routing and floor cannot drift.
+
+* Probe: `scripts/capability-probes/struct-field-named-pop.vl` (GAP → RUNS).
+  `intrinsic-name-as-parameter.vl` is RETIRED rather than flipped: its own header named both
+  admissible resolutions, and the program is now an ordinary running one.
+  Fixtures: `tests/cases/intrinsics/parameter-shadows-intrinsic-name.vl` and
+  `tests/cases/objects/struct-field-named-pop.vl`.
 
 ### D1088 — `collectMapFilterUse`'s result ladder has no `i64` / `f32` / `u8` arm, so a `.map` callback returning one of those builds a list whose rep flag was never set
 
-**loud emit reject · check rc 0 · clause 2 · `emitProgram: f32 indexed assignment but f32 list type not collected` (`compiler/wasmEmit.vl:16128`) and `emitProgram: .map/.filter over i64[] but i64 list type not collected` (`compiler/wasmEmit.vl:17390`) · ZERO corpus cells · found 2026-09-02 by the emit-refusal reachability sample**
+**closed — the ladder asks `cloRetValKind` for the two kinds `cloRetKindOf` cannot name · was a loud emit reject at check rc 0 · ZERO corpus cells · found 2026-09-02 by the emit-refusal reachability sample**
 
-Repro (refuses):
+Repro (runs, prints `1`):
 
     function toF(n: i32): f32 { return 1.5 }
     function main() {
@@ -35211,14 +35528,31 @@ Repro (refuses):
   message. The chained form is
   `const zs = xs.map(toI).map(idI)` over `toI(n: i32): i64` and `idI(n: i64): i64`.
 
+* **THE LADDER IS DOWNSTREAM OF A CLASSIFIER THAT CANNOT NAME THOSE KINDS**, which the row
+  read one level too shallow. `cloRetKindOf` answers only `"i32"` / `"f64"` / null BY CONTRACT
+  — "any inferred ref/i64/f32 kind is out of the value ABI" — so an i64/f32 callback arrived
+  as `null` and fell into the i32 default. `cloRetValKind` is the reader that can name them,
+  and it is already the one the struct / variant / union arms above consult.
+
+* **NO `u8` ARM IS NEEDED, and that is a scope correction rather than an omission**: the
+  checker refuses `u8` as a RETURN type outright ("a storage type, not a value type"), so no
+  check-clean program has a u8-returning callback to collect for.
+
+* **FIVE MESSAGES, NOT THREE**, over nine witnesses: `.map result is f32[] / i64[] but … list
+  type not collected` at a read, a `.pop`, a `.push`, a `.length` and a lambda callback; the
+  f32 indexed-assignment floor; and the chained i64 `.map`-source floor. 14 of 16 reachable
+  cells run. The two `print(xs.pop())` cells are a PRE-EXISTING gap independent of this one —
+  they refuse identically on an ANNOTATED `f64[]`, which is the control that says so.
+
 * Probes: `scripts/capability-probes/map-callback-f32-indexed-assign.vl` and
-  `scripts/capability-probes/map-chain-i64-result.vl`.
+  `scripts/capability-probes/map-chain-i64-result.vl` (both GAP → RUNS).
+  Fixture: `tests/cases/lists/map-callback-scalar-result-reps.vl`.
 
 ### D1089 — a PARENTHESISED assignment target `(x) = 5` is check-clean and refused "not a simple name"
 
-**loud emit reject · check rc 0 · clause 2 · `emitProgram: assignment target is not a simple name` (`compiler/wasmEmit.vl:16437`) · ZERO corpus cells · found 2026-09-02 by the emit-refusal reachability sample**
+**closed — `emitAssign` reads its target through `unwrapParen`, as it already read the RHS · was a loud emit reject at check rc 0 · ZERO corpus cells · found 2026-09-02 by the emit-refusal reachability sample**
 
-Repro (refuses):
+Repro (runs, prints `5`):
 
     function f(): i32 {
       let x = 1
@@ -35234,7 +35568,171 @@ Repro (refuses):
   matches it against `Ident` / `Index` / `Member`. It applies `unwrapParen` to the RHS and not to
   the target, so a `Paren` LHS matches no arm and falls to the floor.
 
-* Probe: `scripts/capability-probes/parenthesised-assignment-target.vl`.
+* **SEVEN POSITIONS, not one**, because the peel is at the top of `emitAssign` rather than in
+  one arm: a local, the nested `((x))` spelling, a compound `+=`, a module GLOBAL (whose
+  `globalIndexOfSid` was asking about the `Paren` wrapper's own sid), an INDEX target, a
+  MEMBER target, and a string local. `unwrapParen` is the identity on a non-`Paren` index, so
+  every program that compiled before reaches the identical arm with the identical node.
+
+* **THE LINT HAD THE IDENTICAL OMISSION, and the same program found it.** Every rule asking
+  "which binding does this assignment write" read the LHS node RAW, so `(x) = 5` marked
+  nothing and prefer-const reported ``x` is never reassigned; use `const` instead of `let``
+  about a binding that is. The peel now lives in `plainIdentName` and at the `bindMark` site.
+
+* Probe: `scripts/capability-probes/parenthesised-assignment-target.vl` (GAP → RUNS).
+  Fixture: `tests/cases/expressions/parenthesised-assignment-target.vl`.
+
+### D1170 — `o?.f ?? d` over a NESTED-STRUCT field has no `if` blocktype, while every other delivery position for the same value now runs
+
+**loud emit reject · check rc 0 · clause 2 · `emitProgram: `?.` over a nullable struct has no `if` blocktype for this field's rep` · ZERO corpus cells · found 2026-09-02 as the one position D1084's matrix did not close**
+
+Repro (refuses):
+
+    type S = { a: i32 }
+    type T = { f: S }
+    function go(o: T | null, d: S): i32 {
+      return (o?.f ?? d).a
+    }
+    const s: S = { a: 11 }
+    const d: S = { a: 12 }
+    const t: T = { f: s }
+    print(go(t, d))
+
+* **IT IS A SEPARATE SITE FROM D1084 AND PRE-DATES IT**, which the ablation says: this is the
+  `??` arm (`optChainFieldCodeOk` / `fbIfForSharedField`), and it declined code 15 before that
+  row was touched and still does. The other ELEVEN positions of the same value — equality both
+  ways, annotated and inferred bindings, return, argument, local and global assignment,
+  struct-field, list element, two-hop chain — all run.
+
+* **THE BLOCKTYPE IS THE WHOLE RESTRICTION, and it needs one thing the shared speller cannot
+  give it.** `fbIfForSharedField` is keyed on the field CODE alone, and a code-15 result needs
+  the field's own TARGET ROW to spell `(ref $S)`. The `?.`…`??` site knows that row (`nsi` /
+  `nfi`) and could emit it directly, which is why this looks small.
+
+* **AND IT IS NOT AS SMALL AS IT LOOKS — the nullable case is the trap.** A code-15 field slot
+  is nullable storage whether the field is declared `S` or `S | null`. For a declared `S` the
+  else arm may `ref.as_non_null`; for `S | null` it may NOT, because `o?.f ?? d` must yield `d`
+  when the FIELD is null too, and an unconditional recovery would trap instead. A fix has to
+  distinguish the two declarations, not just the code.
+
+### D1171 — an inline `{}` in a NULLABLE position has no interned shape, while the alias spelling of the same type runs
+
+**loud emit reject · check rc 0 · clause 2 · `emitProgram: ref valtype with no interned shape` · ZERO corpus cells · found 2026-09-02 beside D1081**
+
+Repro (refuses):
+
+    type U = {} | null
+    function f(u: U): i32 {
+      if u != null { return 11 }
+      return -1
+    }
+    const e: U = {}
+    print(f(e))
+
+* **THE ALIAS SPELLING IS THE CONTROL AND IT RUNS**: `type E = {}` then `type U = E | null`
+  prints `11` then `-1`. So the empty shape has a rep; the INLINE spelling in a nullable
+  position is what fails to intern one.
+
+* **A DIFFERENT MECHANISM FROM D1081, which is why that row closed without this.** D1081 was
+  the field SPLIT reporting one empty field for a zero-field shape (`collectShapeVariantFields`);
+  this is the anon-shape INTERNER, and it fires after the split is already correct. The
+  non-nullable inline spellings (`{} | { x: i32 }`, `{ x: i32 } | {}`, three arms) all run.
+
+* `{ x: i32 } | null` also runs, so the ingredient is EMPTINESS plus INLINE plus NULLABLE, not
+  the nullable position on its own.
+
+### D1172 — an UN-ANNOTATED `const` bound to a nullable struct-union parameter is check-clean invalid wasm, and D1083's refusal used to hide it
+
+**check-clean invalid wasm · check rc 0 · clause 1 · `type mismatch: expected (ref $type), found (ref $type)` · ZERO corpus cells · found 2026-09-02 by closing D1083; verified PRE-EXISTING against the published `seed-latest`**
+
+Repro (check-clean invalid wasm):
+
+    type A = { k: i32, a: i32 }
+    type B = { k: i32, b: i32 }
+    type U = A | B | null
+    function g(u: U) {
+      if u != null { return 1 }
+      return -1
+    }
+    const a = { k: 7, a: 1 }
+    print(g(a))
+    print(g(null))
+
+* **THE WITNESS PERFORMS NO SHARED FIELD READ AT ALL** (`return 1`), which is what separates it
+  from D1083: the defect is the un-annotated literal CONSTRUCT flowing into the union box, not
+  any read.
+
+* **NOT A REGRESSION, MEASURED BOTH WAYS.** Byte-identical on the published seed and on the
+  branch that closed D1083 (223 bytes each). D1083's `narrowed receiver names no union variant`
+  was recorded FIRST — `emitFail` keeps only the first message — so every module carrying this
+  aborted before reaching it. Annotating the binding (`const a: A = …`) or passing the literal
+  INLINE (`g({ k: 7, a: 1 })`) both run.
+
+* This is the "a fixture that annotates every destination cannot see the missing-annotation
+  defect" rule arriving from the other side: the annotation is what makes the working spelling
+  work, so a fixture written with one hides this entirely.
+
+### D1173 — two null-bearing struct unions whose shared field has DIFFERENT reps are check-clean invalid wasm in one module
+
+**check-clean invalid wasm · check rc 0 · clause 1 · `type mismatch: expected (ref $type), found (ref $type)` · ZERO corpus cells · found 2026-09-02 by closing D1083; verified PRE-EXISTING against the published `seed-latest`**
+
+Repro (check-clean invalid wasm):
+
+    type A = { k: i32, a: i32 }
+    type B = { k: i32, b: i32 }
+    type U = A | B | null
+    function pickI32(u: U) {
+      if u is A { return u.k }
+      return -1
+    }
+    type SA = { k: string, a: i32 }
+    type SB = { k: string, b: i32 }
+    type SU = SA | SB | null
+    function pickStr(u: SU) {
+      if u is SA { return u.k }
+      return "none"
+    }
+    print(pickI32({ k: 7, a: 1 }))
+    print(pickStr({ k: "aa", a: 1 }))
+
+* **THE WITNESS USES ONLY `is`-NARROWS TO A SINGLE ARM**, a lowering the published seed already
+  performs — so it reaches the defect without any of D1083's machinery. Byte-identical there
+  and on the branch that closed D1083 (2040 bytes each).
+
+* **DROP THE `| null` FROM BOTH AND IT RUNS**, on both compilers. The same two unions at two
+  reps without a null member print `7` then `aa`. So the ingredient is a null-BEARING union,
+  twice, at differing shared-field reps.
+
+* **THE PAIRS THAT SHARE A REP RUN**: i32+i32 (three arms), i32+boolean, and each rep alone
+  (string, f64, boolean). It is the disagreement between two modules' blocktypes, not either
+  one.
+
+* Cost recorded honestly: closing D1083 makes this REACHABLE where its own refusal previously
+  aborted the module. No `runs` cell is lost — these programs did not work before and do not
+  work now — but the corpus fixture for D1083 is deliberately single-family because of it.
+
+### D1174 — `return xs.pop()` in VALUE position is check-clean invalid wasm at every scalar list rep
+
+**check-clean invalid wasm · check rc 0 · clause 1 · `emitProgram: narrowed union atom has no value box` at `print`, invalid wasm at `return` · ZERO corpus cells · found 2026-09-02 beside D1087; verified PRE-EXISTING against the published `seed-latest`**
+
+Repro (check-clean invalid wasm):
+
+    function realPopValue() {
+      const xs = [1, 5]
+      return xs.pop()
+    }
+    print(realPopValue())
+
+* **THE STATEMENT POSITION RUNS**, on both compilers — `xs.pop()` discarded, then `xs.length`,
+  prints `4`. Only the value position fails, and byte-identically on the published seed (1886
+  bytes each), so it is untouched by D1087's `.pop` receiver guard.
+
+* **`print(xs.pop())` IS THE SAME GAP WEARING A DIFFERENT SENTENCE**, and the control that says
+  so is the ANNOTATED list: `const ys: f64[] = [1.5, 2.5]; print(ys.pop())` refuses too, as do
+  the `f32[]` and `i64[]` spellings. So it is not a `.map`-collector question either — D1088's
+  two remaining cells are this row, not that one.
+
+* `scripts/capability-probes/pop-value-position-scalar-reps.vl` is the standing probe.
 
 ### D1130 — a LOCAL sharing a spelling with a function's NAME, captured by a closure, is check-clean invalid wasm — and the loop variable in the filed witness was the narrowest of six faces
 
@@ -36364,6 +36862,10 @@ Repro:
   4. `exprVariantIndex`'s own `??` rung, the twin of `structIndexOfExpr`'s. Without it the `??`
      lowered correctly and its RESULT had no layout: `field access receiver is not a struct`.
   5. A BOUND on `emitObjLitNode`'s `pendingVariantIdx` hint — [D1154](#d1154).
+  6. A nullable-variant rung on `eqConcreteVariantRow` — found only on the MERGED tree, and
+     recorded on [D1097](#d1097). Piece 1 gives the read a THIRD storage class, and every
+     resolver whose leg list is keyed by storage class needs it; the union-`==` bridge was
+     the one that had a fixture.
 
 * **THE KEY IS THE CHECKER'S TYPE AT THE READ NODE, AND THE TWO OBVIOUS SOURCES BOTH MISS.**
   Probed on the witness, one build each: the field table's recorded NAME

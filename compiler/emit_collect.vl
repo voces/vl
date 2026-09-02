@@ -435,6 +435,7 @@ import {
   eqRowFieldCount,
   eqRowFieldTypeAt,
   eqScalarListFieldKind,
+  eqVariantListFieldKind,
   eqgElemClass,
   eqgInnerKind,
   eqgInnerSlot,
@@ -3366,6 +3367,27 @@ function liftFnsInExpr(ix: i32, parent: i32) {
     liftFnsInExpr(n.parInner, parent)
     return 0
   }
+  // THE TWO OPERAND-CARRYING NODE KINDS THIS WALK USED TO MISS (D1085). Both wrap an
+  // ordinary expression that may hold a function literal, and a literal this walk does not
+  // reach is never pushed to `fnStmts` — so `fnStmtsPosOf` answers -1 at emit and the
+  // module is refused `function literal not lifted` on a `vl check`-clean program. The
+  // cast and the test are SCENERY to the value and were load-bearing only to the walk:
+  // deleting `as f64` from `pick((n: i32) => { return n }) as f64` made the identical
+  // call compile.
+  //
+  // `MatchExpr` is deliberately NOT here and that is measured, not assumed: `match`
+  // desugars into `IfStmt`/`Block`, which this walk already enters, and a lambda in a
+  // match scrutinee AND in a match arm both run. `OptMember` is also absent, for a
+  // stronger reason — a `?.` receiver must be re-readable (a name, or a field chain of
+  // names), so no compilable program can put a call, and therefore a lambda, there.
+  if n is AsExpr {
+    liftFnsInExpr(n.asObj, parent)
+    return 0
+  }
+  if n is IsExpr {
+    liftFnsInExpr(n.isObj, parent)
+    return 0
+  }
   if n is Member {
     liftFnsInExpr(n.memObj, parent)
     return 0
@@ -4981,7 +5003,41 @@ function leqNoteUnionArms(uname: string) {
   while ui < arms.length {
     const lk = leqCoreKindOfAtomKind(valueAtomKind(arms[ui]))
     if lk >= 0 { leqgNoteRep(lk, 0, 0) }
+    // D1096 — AND A LIST FIELD OF A STRUCT ARM NEEDS A FRAME FOR THE SAME REASON A LIST ARM
+    // DOES. The arm's own compare walks its variant row field by field, so a list-repped
+    // FIELD runs the ordinary list core one level in; the scan above only ever looked at the
+    // arm ATOMS, which for a struct arm say nothing about what it carries.
+    leqNoteVariantFields(variantIndexOf(arms[ui]))
     ui = ui + 1
+  }
+  0
+}
+
+// Reserve a compare frame per LIST field of variant row `vi`, mirroring `leqNoteBin`'s walk
+// over a STRUCT row's fields. The map is `eqVariantListFieldKind`, the one home the field
+// emitter reads, so a frame reserved here and a core emitted there are one decision.
+function leqNoteVariantFields(vi: i32) {
+  if vi < 0 { return 0 }
+  if vi >= uFieldStart.length { return 0 }
+  if vi >= uFieldCount.length { return 0 }
+  const start = uFieldStart[vi]
+  let j = 0
+  while j < uFieldCount[vi] {
+    if start + j < uFieldTypes.length {
+      const c = uFieldTypes[start + j]
+      // A REF-LIST field's frame is keyed by the SLOT its element name resolves to, exactly
+      // as the struct row's code-5 arm keys its own.
+      if c == 5 {
+        const en = uFieldElemName[start + j]
+        if en != "" {
+          const rs = rlSlotByNameKeyTy(en, 0 - 1)
+          if rs >= 0 { leqgNoteRep(1, rs, 0) }
+        }
+      }
+      const lk = eqVariantListFieldKind(c)
+      if lk >= 0 { leqgNoteRep(lk, 0, 0) }
+    }
+    j = j + 1
   }
   0
 }
@@ -13571,8 +13627,32 @@ export function collectMapFilterUse() {
               } else {
                 let rk: VKind | null = null
                 if fe >= 0 { rk = cloRetKindOf(fe) }
+                // THE i64 / f32 RESULT KINDS NEED A SECOND READER, and that is the whole
+                // defect (D1088). `cloRetKindOf` answers only `"i32"` / `"f64"` / null —
+                // its contract is the VALUE ABI, where "any inferred ref/i64/f32 kind is
+                // out" — so an `i64`- or `f32`-returning callback arrived here as `null`
+                // and fell into the i32 default. The result list was then repped at the
+                // callback's REAL type while its `*Used` flag stayed false, and whichever
+                // floor the value next met fired. Measured, one hole behind FIVE messages:
+                // `.map result is f32[] / i64[] but … list type not collected` (at a read,
+                // a `.pop`, a `.push`, a `.length` and a lambda callback), `f32 indexed
+                // assignment but f32 list type not collected`, and `.map/.filter over
+                // i64[] but i64 list type not collected`.
+                //
+                // `cloRetValKind` is the reader that CAN name them — it is already the one
+                // the struct / variant / union arms above consult, for the same reason —
+                // so the two kinds are asked of it and everything else keeps the ladder it
+                // had. `u8` is NOT here and needs no arm: the checker refuses `u8` as a
+                // return type outright ("a storage type, not a value type"), so no
+                // check-clean program has a u8-returning callback to collect for.
+                let rvk: VKind | null = null
+                if fe >= 0 { rvk = cloRetValKind(fe) }
                 if rk == "f64" {
                   fa64Used = true
+                } else if rvk == "i64" {
+                  ia64Used = true
+                } else if rvk == "f32" {
+                  fa32Used = true
                 } else {
                   aUsed = true
                   lUsed = true
