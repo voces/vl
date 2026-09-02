@@ -241,7 +241,7 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   **D1002 and D1005 have since CLOSED (2026-09-02)** — a generic body's member dispatch is
   now decided per instantiation (the rewrite asks the call sites what the body cannot
   answer) and the UFCS receiver's fit is re-asked at the pin by a ninth deferred table
-  (`ufcsCstr*`) with a field-precedence guard; **D1043** is the residue those two named,
+  (`ufcsCstr*`) with a field-precedence guard; **D1063** is the residue those two named,
   the disagreeing instantiation pair that shares one AST node. Still open from this list:
   D1004 (the wordless member-access diagnostic on an unbounded `<T>`) and LSP bound-member
   completion/hover on `x: T`.

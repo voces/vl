@@ -6,6 +6,10 @@
 > RESERVED D981–D1000 — the compile-goal session (vl-de). D981 grandfathered to the
 > tooling session inside this block.
 > RESERVED D1001–D1020 — the tooling session (vl-b7).
+> RESERVED D1063 — the D1002/D1005 generic-member-dispatch session. Minted after
+> checking master's live maximum (D1062): D1043 was already taken there while this
+> worktree's base still ended at D1042, which is exactly the collision this block exists
+> to stop — so check the id against MASTER, not against your own branch.
 
 Every row below was produced by generating a program, running it, and grading the **run
 value** against an expectation computed independently of the compiler. Nothing here is
@@ -29622,7 +29626,7 @@ decided too early to be right.
   (`exprIsClosure(…, fnIx)`) — is already right at every instance. Usage-gated: a program with
   no such call site is byte-identical.
 
-* **UNANIMITY IS A DELIBERATE BOUND, and its price is [D1043](#d1043).** Where the
+* **UNANIMITY IS A DELIBERATE BOUND, and its price is [D1063](#d1063).** Where the
   instantiations DISAGREE, no single AST serves both — `monoCloneBody` SHARES every leaf
   expression between instances — and deferring unconditionally was MEASURED to trade this
   cell for nine others (the tail-statement position answers `emitProgram: unsupported
@@ -32560,7 +32564,7 @@ Repro:
   D965 delivery matrix for the instantiated value.
 
 ---
-### D1043 — two instantiations of ONE generic that must dispatch a member call DIFFERENTLY share a single AST node, so the disagreeing pair is check-clean invalid wasm
+### D1063 — two instantiations of ONE generic that must dispatch a member call DIFFERENTLY share a single AST node, so the disagreeing pair is check-clean invalid wasm
 
 **check-clean invalid wasm · `type mismatch: expected (ref $type), found (ref $type)` · ZERO corpus cells · reproduces on master · the PRICE [D1002](#d1002) declined to pay, named by the candidate that would have paid it**
 

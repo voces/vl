@@ -414,13 +414,13 @@ boolean }` with `<T: Eq<T>>`) are not in phase 1; the inline form covers the sam
   carries a field of that name, it declines and the field-closure lowering (which resolves per
   FUNCTION) is right at each instance. The ORDERING is unchanged; what moved is the decision.
   The disagreeing pair — one instantiation taking the field, another the `self`-function —
-  shares one AST node and stays open as D1043.
+  shares one AST node and stays open as D1063.
 
 ### 7.6 Still open
 
 * **OQ-2, operator bounds** — unchanged, and the implicit machinery still carries them.
 * **Phase 2, per-site UFCS satisfaction** — needs the dispatch decision to move past
-  monomorphization for the DISAGREEING instantiation pair (D1043). D1002 closed the
+  monomorphization for the DISAGREEING instantiation pair (D1063). D1002 closed the
   unanimous-field half without moving the pass, by asking the call sites at rewrite time.
 * **D1004** — the UNBOUNDED half of the empty member-access diagnostic. Closed for a bounded
   parameter, open by ruling for an unbounded one.
