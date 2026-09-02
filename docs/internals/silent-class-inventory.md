@@ -30201,9 +30201,17 @@ Repro (loud emit reject):
   So code 5's arm does not need a new comparison. It needs to feed the EXISTING one: read the
   field's two list refs with `emitChainRead` from each root, land them in the base locals
   `leqgBaseOfRep(kind, slot)` expects, and call `emitListEqGCore`, whose struct-element class
-  already routes to `emitEqGStructElem`. The open question is where the frame comes from — the
-  core refuses with `list compare frame was not reserved for this rep` when it was not
-  reserved, and a FIELD's list has no rep slot the way a binding does.
+  already routes to `emitEqGStructElem`. The open question is where the frame comes from, and it is now traced to
+  one function. Frames are registered by **`leqNoteBin(binIx, fnIx)`** during collection,
+  keyed `(kind, slot)` and derived from the BINARY'S OWN OPERANDS via `eqgListKindOfBin` /
+  `eqgListSlotOfBin`. For `a == b` where both are STRUCTS those answer -1 — the operands are
+  not lists — so a struct-equality binary never notes a frame for any list its fields hold,
+  and `emitListEqGCore` then refuses with `list compare frame was not reserved for this rep`.
+
+  Closing it means teaching `leqNoteBin` to walk the struct row's fields and note a frame per
+  code-5 field. **The unresolved part is the KEY**: frames are `(kind, slot)` pairs and a
+  field's list has no rep slot the way a binding does, so either a slot is synthesised for it
+  or the frame table needs a field-addressed variant. Settle the key before writing the walk.
 
   **Grade any attempt on a VALUE TABLE, not a compile** — equal lists true, differing element
   false, differing length false — because D989's near-miss on this same `==` ladder compiled
