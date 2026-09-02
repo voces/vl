@@ -30478,7 +30478,7 @@ lowering; it is right at module scope and wrong in a function body.
   the fix is a net efficiency win as well as a correctness one.
 ### D1020 — struct-field equality has an arm for `i32[]` and for NO other scalar list: `f64[]`, `i64[]`, `string[]` and `u8[]` fields all refuse
 
-**loud emit reject · check rc 0 · `emitProgram: unsupported struct field type in equality` (`compiler/wasmEmit.vl`) · four of the five scalar-list field codes have no equality arm, and the fifth's is a hand-written 50-line loop · found 2026-09-01 by [D1008](#d1008)'s position matrix, which had to exclude equality to stay a `u8[]` row · pre-existing and unrelated to `u8[]` — the same refusal predates that code**
+**runs — CLOSED 2026-09-01 by routing a scalar-list field to the generic compare core it already had (`eqScalarListFieldKind`, one map read by BOTH the frame reservation in `leqNoteBin` and the equality ladder in `wasmEmit.vl`); pinned by `tests/cases/structs/scalar-list-field-equality.vl`, fifteen values over six element types, each compared equal AND unequal. Was: loud emit reject · check rc 0 · `emitProgram: unsupported struct field type in equality` · four of the five scalar-list field codes had no equality arm · found 2026-09-01 by [D1008](#d1008)'s position matrix, which had to exclude equality to stay a `u8[]` row**
 
 Repro:
 
@@ -30512,5 +30512,20 @@ scalar-list arm and never the rest.
   legal and must compile or the checker owed the diagnosis. The message concedes nothing
   ("unsupported struct field type in equality"), so `goal-scoreboard.py --sites` does not
   count it — a D964 lower-bound case.
+
+* **CLOSED BY ROUTING, NOT BY WRITING A CORE.** The cores already existed — every one of
+  these lists compares as a VALUE — so the fix reads two lists off the field path and calls
+  `emitListEqAnyRep`, which is exactly the shape [D1017](#d1017) used for the code-5 ref-list
+  field. No copy of code 4's 50-line loop was made, and code 4 keeps its own arm: it predates
+  the generic cores and re-routing it would move bytes for a compare that already worked.
+
+* **THE FRAME AND THE CORE MUST READ ONE MAP.** `leqNoteBin` reserves a compare frame per rep
+  and the ladder emits the core; a code known to one side and not the other produces `list
+  compare frame was not reserved for this rep`. Both now read `eqScalarListFieldKind`, so the
+  two cannot drift — the same one-home discipline D1017 established, for the same failure.
+
+* **BOTH DIRECTIONS, AND A LENGTH MISMATCH.** An equality that answers `true` for everything
+  passes a naive fixture, so each element type is compared once equal and once NOT, plus one
+  pair differing only in LENGTH — the branch an element loop skips.
 
 ---
