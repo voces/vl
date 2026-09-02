@@ -99,12 +99,38 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   and a refinement of an arm (`["xyz"] is string[]`) is check-clean and answers `false`
   unconditionally (**D1035**, this item's witness). Design + four sub-rules with
   recommendations (copy semantics; integral `i32` fields — the same predicate as q2's
-  `asExactI32`; absent ≠ null; `as` propagates `JsonError { kind: "shape", path }`) in
+  exact `as`; absent ≠ null; `as` propagates `JsonError { kind: "shape", path }`) in
   `docs/serde-design.md` §"Deep `is` / `as` over a `Json` value"; DECISIONS.md has the
   ruling. It is serde Stage 2's JSON half brought forward (checker "is a JSON shape"
   predicate + emitter walk keyed on the RHS type); OQ-1 (b)'s intrinsic stays for the
   binary source and `serialize`. Position matrix before the checker narrows (D965).
   Compiler-side work; the compile-goal session's surface once the sub-rules are ruled.
+- **Numeric `as` honours the trio — RULED (owner, 2026-09-02), NOT BUILT.** A numeric `as`
+  to an INTEGER target is exact-or-fail: `f64 → i32`/`i64` succeeds iff integral and in
+  range, `i64 → i32` iff in range (no wrap), `i32 → i64`/`f64` cannot fail; failure is the
+  trio's — bare `as` propagates `null` (the return must carry `| null`, else the checker
+  names `as!`/`as?`), `as?` yields `T | null`, `as!` traps. A FLOAT target rounds and never
+  fails. Loss is spelled `trunc(d) as! i32` / `floor(d) as! i32`. Nothing ships in std
+  (json-design §6 q2's `asExactI32` is `as?` spelled as a function). Measured today
+  (**D1041**): the suffix is accepted and IGNORED on a numeric cast — `3.9 as? i32`,
+  `3.9 as! i32` and a bare `3.9 as i32` inside an `i32 | null` function all print `3`;
+  `4294967298 as i32` prints `2`. **The build, in order:** (1) migrate every numeric `as`
+  site in the tree to `as!` (they were written under "traps on NaN / out of range" and mean
+  it) — `compiler/` 67, `std/` 21, `tests/cases` 230 — which is byte-identical on today's
+  seed because it drops the suffix, so the fixpoint proves the migration touched nothing;
+  (2) checker: `checkCastNode`'s numeric arm reads `asMode` — bare `as` places the
+  propagation obligation on the enclosing return as the union arm does, `as?` types
+  `T | null`, `as!` types `T`, and `as?` on a lossless edge is a hint; (3) emitter: exact
+  lowering for an integer target (`i32.trunc_sat_f64_s` + `f64.convert_i32_s` + `f64.eq`,
+  the `i64` twin, `i32.wrap_i64` + `i64.extend_i32_s` + `i64.eq`; NaN fails the compare for
+  free), `as?` delivering the tagged `i32 | null` at every D965 position, `as!` trapping with
+  a source-located message (the diagnostic half of the old `f64-as-i32-out-of-range` ask),
+  and the `trunc`/`floor`/`ceil`/`nearest`-operand peephole to the single trapping
+  instruction — do not lean on binaryen for that fold, its float folds are NaN-conservative;
+  (4) `std/fmt.vl` `parseI32`'s "unchecked wrapping truncation" comment goes. Grade on
+  D1041's ten-row table. DECISIONS.md §"Numeric `as` to an INTEGER target is exact-or-fail
+  under the trio" has the survey (Julia's `Int(3.9)` InexactError / `trunc(Int, x)` is the
+  model adopted) and the cost. Compiler-side; the compile-goal session's surface.
 - **Colored `print`** — ruled in principle 2026-09-01 with one hard constraint (ANSI must
   never leak into pipes/files/copies): Node's split — bare strings always raw, rendered
   values colored, escapes emitted only by the TTY-detected sink, `NO_COLOR`/`--color`
@@ -281,8 +307,9 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   margin, `toJsonPretty`/`jsonKind` named as WHAT IS NOT HERE), and **§6 holds the questions the
   owner still has to rule**: ~~helpers (recommended: one `jsonPointer`, RFC 6901, `kind:
   "missing"`)~~ — **q1 RULED 2026-09-02: none; the decoder is deep `is`/`as` (bullet
-  above)** — `asExactI32` in `std:fmt` + whether `f64 as i32` saturates, and whether
-  `string | "err"` collapses (D1024). **v1 BUILT — #2322 (2026-09-02)**, reviewed by
+  above)** — ~~`asExactI32` in `std:fmt` + whether `f64 as i32` saturates~~ — **q2 RULED
+  2026-09-02: no helper, numeric `as` is exact-or-fail under the trio (bullet below)** —
+  and whether `string | "err"` collapses (D1024). **v1 BUILT — #2322 (2026-09-02)**, reviewed by
   `std-api-reviewer` (MERGE AFTER FIXES, ten findings, all header text, all taken); building
   it filed D1029–D1034. Three more gaps filed by the critique
   round: D1025 (a map subscript mints no narrowing key — the usability critique's gap A,
@@ -903,6 +930,10 @@ in-language GC knobs.
   must be made explicit with `as` (write `x as f64`)``), and mixed-width arithmetic rejects with
   ``operator '+' mixes f64 and i64``. Verified 2026-08-02 on all four edges. **REMAINING is a
   SEMANTICS + DIAGNOSTIC item, not a syntax one**, and it is sharper than the original entry:
+  - **RULED 2026-09-02 (owner): out of range is neither a trap, a saturate nor a wrap — it is
+    a FAILURE under the trio** (§Next "Numeric `as` honours the trio"; DECISIONS.md). The
+    measurement below stands as the pre-ruling state and the diagnostic half is folded into
+    the build item.
   - **`f64 as i32` out of range TRAPS, with a raw wasm backtrace and no diagnostic.** Measured:
     `100000000000.0 as i32` → `error while executing at wasm backtrace: vl!<wasm function 5>`;
     `(0.0/0.0) as i32` traps the same way. VL emits the trapping `i32.trunc_f64_s`; wasm also has
@@ -910,7 +941,8 @@ in-language GC knobs.
     (`1215752192`) — so this is a real three-way design choice that VL has made by accident and
     documented nowhere. Trapping is defensible under the "traps are for bugs" model, but it must be
     a stated ruling with a diagnostic, not a bare backtrace.
-  - In-range truncation is toward zero (`5.7 as i32` → `5`); write it down and pin it.
+  - In-range truncation is toward zero (`5.7 as i32` → `5`) — and under the ruling that
+    spelling FAILS (`5.7` is not integral); the truncation is spelled `trunc(5.7) as! i32`.
   - **Scientific-notation literals do not parse**: `1e30` is `undeclared identifier 'e30'`. Small
     lexer gap, found while probing the above.
 - **Param-skip ergonomics** (`docs/guide/lambda-param-skip-design.md`) — prerequisite 1 (self-host

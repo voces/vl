@@ -370,13 +370,28 @@ load-bearing waits on it.
 `as` is **one operator with one invariant: `x as T` always yields a `T`.** The
 operand's _kind_ determines how:
 
-- **Numeric operand → convert.** The just-approved B2 casts: `f as i32`
-  truncates, `i as f64` widens, etc., **trapping** on NaN / out-of-range.
-  Numeric casts **do NOT propagate** — the trapping default is deliberate: a raw
-  propagated `f64` would infect the enclosing signature's return type and
-  carries _no error information_ (which value? why?). A fallible numeric
-  conversion instead composes through a user cast (extension 3b below), which
-  _does_ return a union and so _does_ propagate.
+- **Numeric operand → convert, exact-or-fail at an integer target.** ~~The
+  just-approved B2 casts: `f as i32` truncates, `i as f64` widens, etc.,
+  **trapping** on NaN / out-of-range. Numeric casts **do NOT propagate** — the
+  trapping default is deliberate: a raw propagated `f64` would infect the
+  enclosing signature's return type and carries _no error information_ (which
+  value? why?).~~ **REVISED by the owner's 2026-09-02 ruling** (DECISIONS.md
+  §"Numeric `as` to an INTEGER target is exact-or-fail under the trio"). A
+  numeric `as` to `i32` / `i64` succeeds iff the value is exactly representable
+  — `f64 → i32` needs integral and in range; `i64 → i32` needs in range; `i32 →
+  i64` / `i32 → f64` cannot fail — and otherwise fails **under the trio exactly
+  as a union operand does**: bare `as` propagates `null` (the enclosing return
+  must carry `| null`, else the checker refuses and names `as!` / `as?`), `as?`
+  yields `null` typed `T | null`, `as!` traps. A FLOAT target (`f64 → f32`,
+  `i64 → f64`) rounds and never fails. Loss is spelled where it happens:
+  `trunc(d) as! i32` / `floor(d) as! i32`, which the emitter peepholes to the
+  one `i32.trunc_f64_s` today's `d as i32` emits. The struck paragraph's
+  objection was to propagating the OPERAND (a raw `f64`); what propagates here
+  is `null`, the trio's remainder for a failure with one cause, which infects
+  nothing the signature does not already owe. Extension 3b's user cast remains
+  the spelling for a conversion that needs to say WHY it failed. Measured
+  2026-09-02: the suffix is accepted and ignored on a numeric cast (D1041), so
+  this is a build item, sequenced migrate-`as!`-first.
 - **Union operand → narrow-or-propagate.** As above: yields the named arm, else
   early-returns the remainder.
 - **Unrepresentable → trap.** Anything `as` cannot honor at runtime traps (a
@@ -399,9 +414,11 @@ The reader's rule is therefore checkable from the signature alone:
 
 > _No error arm in the return type ⇒ nothing in this body can early-return._
 
-Numeric `as` never propagates by rule, and a numeric kernel returns a scalar, so
-webcraft-style `as f32`/`as i32` code is excluded twice over — by the operand
-rule and by its own signature. The residue is real but narrow: inside a function
+A numeric `as` to a FLOAT target never fails and so never propagates, and a
+numeric kernel returns a scalar, so webcraft-style `as f32` code is excluded
+twice over — by the operand rule and by its own signature; its `as i32` sites
+are `as! i32` under the 2026-09-02 ruling, which the scalar signature forces
+(a bare `as i32` there is a compile error naming the suffix). The residue is real but narrow: inside a function
 that *does* return `T | E`, finding the escape points means scanning for `as`
 with no distinguishing glyph. That is the context where propagating is the
 intent, which is why it was judged acceptable.

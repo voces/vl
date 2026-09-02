@@ -1,6 +1,6 @@
 # `std:json` v1 — the surface, and what the compiler has to grow to serve it
 
-> Status: **BUILT — #2322 (2026-09-02); §6 q1 RULED the same day, q2 and q3 still open.**
+> Status: **BUILT — #2322 (2026-09-02); §6 q1 and q2 RULED the same day, q3 still open.**
 > This is serde stage 1 (`docs/serde-design.md` §Recommendation, ruling G): a real `Json`
 > VALUE TREE plus a parser and a renderer over it. Nothing here is built. The owner answered
 > seven surface questions on 2026-09-01 and those answers are recorded in §0 as facts this
@@ -816,11 +816,19 @@ measurements):
    sub-rules (copy semantics, integral `i32` fields, absent ≠ null, `as` propagates a
    `JsonError` with `kind: "shape"`) carry recommendations awaiting the owner. A helper
    returns to this list only when a consumer that cannot name its shape arrives.
-2. **`f64 → i32` off the wire** — (1) ship `asExactI32`/`asExactI64` (`: i32 | null`) in
+2. ~~**`f64 → i32` off the wire** — (1) ship `asExactI32`/`asExactI64` (`: i32 | null`) in
    `std:fmt` beside `parseI32`: **yes**, with the `std-api-reviewer` pass. (2) What
    `f64 as i32` does out of range — trap (today), **saturate** (Rust; `i32.trunc_sat_f64_s`,
    NaN → 0), or wrap (JS `|0`). A language ruling for `DECISIONS.md`, on every consumer's
-   path.
+   path.~~ **RULED 2026-09-02 (owner): NO helper — the language does it.** The owner's
+   question was "isn't this just `as?`", and it is: a numeric `as` to an INTEGER target is
+   **exact-or-fail under the trio** — `p as? i32` is `i32 | null` (`null` on a fraction,
+   NaN, ±Inf or overflow), `p as! i32` traps, bare `p as i32` propagates `null`; a float
+   target rounds and never fails; truncation is spelled `trunc(p) as! i32`. That dissolves
+   (2) — out of range is a FAILURE, not a trap/saturate/wrap choice — and makes (1) a std
+   name for something the operator already means. The ignored suffix on a numeric cast is
+   D1041 and the build item is in ROADMAP §Next; DECISIONS.md §"Numeric `as` to an INTEGER
+   target is exact-or-fail under the trio" has the survey and the cost.
 3. **`string | "err"`** (D1024's question) — **collapse** the subsumed
    literal into its base (TypeScript's rule; a hint says the arm is inert), or keep it as
    a distinguishable arm. A language ruling for `DECISIONS.md`; nothing in this module
@@ -830,7 +838,8 @@ Everything else the three critiques raised is either taken (§1–§2 above, eac
 *post-critique*) or a build item (§5). D1021 closed on 2026-09-01; the builder is briefed
 on the ruled core (`Json`, `JsonError`, `parseJson`, `toJson`) with the three questions'
 outputs — nothing for q1 (ruled: no helper; deep `is`/`as` is the build item),
-`asExactI32`, nothing for q3 — landing as follow-ups once ruled.
+nothing for q2 (ruled: `p as? i32` — the language, not a helper), nothing for q3 —
+landing as follow-ups once ruled.
 
 ---
 
