@@ -2044,14 +2044,6 @@ function mkNullableTy(inner: i32) {
     const innerT = T.tys[inner]
     if innerT is TyNullable { return inner }
   }
-  // THE NULLABLE-INNER CENSUS (see `annCommitVariantMembers`). This is the one home every
-  // `T | null` is minted through — the annotation routes, the declaration route's niche
-  // fold, the narrowing widenings — so recording here is the whole program's answer.
-  if inner >= 0 {
-    if !cTyIxSetHas(cNullableInnerTyIxSet, inner) {
-      cTyIxSetAdd(cNullableInnerTyIxs, cNullableInnerTyIxSet, inner)
-    }
-  }
   const t: Ty = { nInner: inner }
   addTy(t)
 }
@@ -2575,11 +2567,6 @@ let cVariantMemberTyIxSet: boolean[] = []
 // be made at the moment the annotation resolves.
 let annPendingVariantTyIxs: i32[] = []
 let annPendingVariantTyIxSet: boolean[] = []
-// Every arena type that appears as the INNER of a `T | null` in this program, recorded at
-// `mkNullableTy` — the one home every nullable is minted through. Read only by
-// `annCommitVariantMembers`, which needs the WHOLE program's answer.
-let cNullableInnerTyIxs: i32[] = []
-let cNullableInnerTyIxSet: boolean[] = []
 // Declared UNION-ALIAS `Ty` indices (`type T = A | B`), for the emitter's `isUName` (C1).
 let cUnionTyIxs: i32[] = []
 let cUnionTyIxSet: boolean[] = []
@@ -10031,34 +10018,27 @@ function annUnionPushDistinctMember(members: i32[], m: i32) {
 //     a row to), and a forward-referenced `type` fills its entry after the annotation that
 //     names it resolves.
 //
-//   · `cNullableInnerTyIxs` — THE EXCLUSION, and the reason this is a commit rather than a
-//     push. A struct that the module ALSO uses as `E | null` has a second, incompatible demand
-//     on its rep: the nullable niche is `nulstruct`, whose `fbValtype` slot is a row in the
-//     STANDALONE struct table, and there is no `nulvariant` VKind for a nullable variant
-//     (`rtNulVKind` says so at the rep layer: "the flat alphabet has no kind for it"). Calling
-//     such a struct a variant satisfies the union positions and breaks the nullable one — a
-//     variant-returning CALL into an `E | null` return or binding becomes CHECK-CLEAN INVALID
-//     WASM (`current function requires result type [(ref null 0)] but callee returns
-//     [(ref 1)]`), which is exactly the shape `std/fs.vl` would take if its `IoError`
-//     constructor were factored out. MEASURED on a 24-cell nullable grid: excluded, 0 cells
-//     move in either direction; not excluded, 2 go RUN-OK → invalid wasm and 1 goes
-//     loud-reject → runtime trap.
+// A SECOND FILTER USED TO LIVE HERE AND IS GONE (silent-class-inventory D1031). A struct the
+// module ALSO used as `E | null` was excluded, because the nullable niche was `nulstruct` —
+// whose `fbValtype` slot is a row in the STANDALONE struct table — and there was no
+// `nulvariant` VKind to name a nullable variant with. Calling such a struct a variant
+// satisfied its union positions and broke the nullable one, so the exclusion kept it out and
+// `unions/error-nullable-variant-unsupported.vl` recorded the price in its own words:
+// *"Lifting it is a rep slice: a `nulvariant` VKind … When it lands, drop the exclusion with
+// it."* It landed (`fbValtype`'s `nulvariant` arm, `retNulVariantFlag` / `nulVariantIndexOf`
+// as the kind/slot PAIR), so the exclusion is dropped and that fixture now RUNS, renamed
+// `nullable-variant-arm-beside-union.vl`.
 //
-//     So a nullable-used struct keeps the classification it has on master, and its whole
-//     family stays refused exactly as it is today — pinned by
-//     `unions/error-nullable-variant-unsupported.vl`, which is where the `nulvariant` rep
-//     slice is filed. The DECLARATION route is not gated this way and is untouched: it has
-//     always registered such a member, and its cells are broken on master in the same
-//     positions (the exclusion cannot un-break them and must not pretend to).
+// The DECLARATION route was never gated this way, which is why only the INLINE spelling of a
+// composing union refused: `type U = string | E` + `const y: U = "v"` has always registered
+// `E` unconditionally and has always run.
 function annCommitVariantMembers() {
   let i = 0
   while i < annPendingVariantTyIxs.length {
     const m = annPendingVariantTyIxs[i]
     if cTyIxSetHas(cStructTyIxSet, m) {
-      if !cTyIxSetHas(cNullableInnerTyIxSet, m) {
-        if !cTyIxSetHas(cVariantMemberTyIxSet, m) {
-          cTyIxSetAdd(cVariantMemberTyIxs, cVariantMemberTyIxSet, m)
-        }
+      if !cTyIxSetHas(cVariantMemberTyIxSet, m) {
+        cTyIxSetAdd(cVariantMemberTyIxs, cVariantMemberTyIxSet, m)
       }
     }
     i = i + 1
@@ -27204,8 +27184,6 @@ function checkProgramNode(n: Program) {
   cVariantMemberTyIxSet = []
   annPendingVariantTyIxs = []
   annPendingVariantTyIxSet = []
-  cNullableInnerTyIxs = []
-  cNullableInnerTyIxSet = []
   cUnionTyIxs = []
   cUnionTyIxSet = []
   cUnionNames = []
@@ -31616,7 +31594,7 @@ export function nodeTyIsClosureArray(ix: i32) {
 }
 // ── DENSE MEMBERSHIP over the `Ty`-arena index sets ──────────────────────
 // Every nominal-identity sidecar set (`cStructTyIxs`, `cVariantMemberTyIxs`,
-// `cUnionTyIxs`, `cNullableInnerTyIxs`, `gaAppTyIxs`, `annPendingVariantTyIxs` —
+// `cUnionTyIxs`, `gaAppTyIxs`, `annPendingVariantTyIxs` —
 // declared together near the top of this file) is a MEMBERSHIP set keyed by a
 // `Ty`-arena index: a dense, small, non-negative integer. So each carries a
 // parallel `boolean[]` indexed BY THE ARENA INDEX ITSELF, and that flag array —
@@ -31630,7 +31608,7 @@ export function nodeTyIsClosureArray(ix: i32) {
 //   cUnionTyIxs             207,768          2,035,142             10
 //   cStructTyIxs            157,795          8,211,175             60
 //   gaAppTyIxs                7,100                  0              0
-//   cNullableInnerTyIxs         573              2,788             29
+//   cNullableInnerTyIxs         573              2,788             29   (set since removed)
 //   annPendingVariantTyIxs        0                  0              0
 //                         ─────────      ─────────────
 //                         1,426,650        209,097,445
