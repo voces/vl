@@ -29639,7 +29639,9 @@ callee ran):
     // PRINTS <fld>  — never <1> and never invalid wasm.
 
 Fixtures: `tests/cases/constraints/unbounded-generic-field-precedence.vl` (five delivery
-positions, every one printing `fld`).
+positions, every one printing `fld`) and
+`tests/cases/modules/generic-member-field-precedence/` (the MERGE axis — both names mangled,
+the property left plain; it printed `<C>` with no diagnostic at any layer before the fix).
 
 ---
 ### D1003 — [CLOSED 2026-09-01] the plain-to-mangled UFCS alias table was reset only on the MODULE path, so a single-file compile inherited the previous program's rows
