@@ -32740,3 +32740,58 @@ The population measurement is the sweep, not this program: copy `tests/cases` as
   diagnostic change and would be measured by this same sweep reaching zero. Making the
   un-annotated spelling LOWER THE SAME WAY is the goal-shaped close and is 165 witnesses of
   work. The sweep is cheap (~7 minutes) and should be the acceptance test either way.
+
+---
+### D1045 — a closure-field parameter spelled INLINE (`z: {f: () => string}`) in a function nobody calls is check-clean invalid wasm; the same type behind a `type` alias runs
+
+**check-clean invalid wasm · clause 1 · OPEN · found 2026-09-02 while ablating [D988](#d988)'s
+ANNOTATED twin — an annotation was the control that was supposed to run, and it did not ·
+identical on a `git archive HEAD` build, so it is not a regression**
+
+Repro (five lines, one function, and the function is never called):
+
+    function hole(z: {f: () => string}) {
+      print(z.f())
+    }
+    print(1)
+
+`Invalid input WebAssembly code at offset 250: type mismatch: expected (ref null $type), found
+structref`, in `hole`.
+
+* **THREE INGREDIENTS, EACH NECESSARY — one program per row, all `vl check` rc 0.**
+
+  | change | outcome |
+  | --- | --- |
+  | the witness above | **check-clean invalid wasm** |
+  | the field is not a closure (`z: {r: i32}`) | runs |
+  | the function IS called (`const s = {f: () => "ok"}; hole(s)`) | runs |
+  | the same type behind an alias (`type Fs = {f: () => string}`) | runs |
+
+  So it is the INLINE spelling of a CLOSURE-field shape in a function whose call site never
+  pins it. The inline shape and the alias are the same type — the checker agrees, and the two
+  spellings disagree about the REP, which is this file's standing shape.
+
+* **THE TWIN FACE IS A LOUD REFUSAL, AND IT NEEDS NO CALL EITHER.** Two inline closure-field
+  shapes with the SAME field name and DIFFERENT results, both functions uncalled, is
+  `emitProgram: ref valtype with no interned shape` — the message D53 already names for an
+  inline-shape parameter beside a struct of that layout. Here there is no other struct and no
+  literal at all:
+
+      function hole(z: {f: () => string}) {
+        print(z.f())
+      }
+      function holeN(y: {f: () => i32}) {
+        print(y.f())
+      }
+      print(1)
+
+* **IT IS WHY THE ANNOTATED SPELLING COULD NOT BE D988's CONTROL.** D988's hole parameter takes
+  its shape from the ARGUMENT; the obvious control is to annotate both parameters and check the
+  program runs. It does not — and the reason has nothing to do with D988: `d3` of the same
+  ablation, one hole parameter beside one annotated one, RUNS at both shapes. Read a control
+  that fails as a claim about the control until its own ablation says otherwise.
+
+* **DO NOT CLOSE THIS BY INTERNING THE SHAPE AT THE ANNOTATION AND STOPPING.** The refusal and
+  the miscompile are one gap seen from two sides, so the acceptance test is both programs above
+  RUNNING, plus the alias spelling staying byte-identical — the alias is the path that already
+  works and a shared intern is the obvious way to break it.
