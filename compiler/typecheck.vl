@@ -9588,6 +9588,124 @@ function homogLitUnionBase(ty: i32): i32 {
   -1
 }
 
+// The BASE SCALAR an arm's value set sits inside when the arm is a BARE LITERAL — `"err"`
+// -> string, `3` -> i32, `1.5` -> f64 — and -1 for every other arm.
+//
+// **THE LITUNION-ALIAS MIRROR IS DELIBERATELY NOT HERE, AND ITS PRICE IS TWO RUNNING
+// FIXTURES.** The ruling collapses `Kind | string` (`Kind = "a" | "b"`) to `string` as well,
+// and `homogLitUnionBase` is exactly the projection that would answer for it — one line. It
+// is left out because collapsing that arm makes
+// `tests/cases/literal-unions/mixed-union-litunion-arm-is-membership.vl` and
+// `is-litunion-arm-non-ident-receivers.vl` stop running: both pin `x is K` over a `K |
+// string` box as MEMBERSHIP over the payload (a tag compare answers TRUE for every string
+// the box holds, which is the silent wrong answer #1306 removed), and both pin the
+// `is K` / `is string` PAIRS that no tag scheme can green by halves. Collapse the arm and
+// `K | string | i32` reaches the emitter as `string | i32` with `K` gone, which is
+// `emitProgram: struct field type has no struct-field rep` at one fixture and invalid wasm
+// in `atomStoreIsK` at the other.
+//
+// Losing a running program is the one movement the gate refuses, so the mirror ships when
+// `is K` over a COLLAPSED base lowers as the same membership test `emitIs` already emits for
+// a standalone litunion receiver. Filed as D1048 with those two fixtures as its named set —
+// they are already fixtures, so the price stays guarded whoever tries it next.
+function armLiteralBaseTy(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyLit { return litBaseTy(t) }
+  -1
+}
+
+// Does `members` carry `base` as an ARM, after flattening and through aliases?
+// `flattenVariantsInto` is the walk `joinTys` uses, so a union-alias member (`Json`)
+// contributes its own arms and a nullable contributes its inner plus `null`.
+//
+// NO SELF-SKIP IS NEEDED, and that is a property of `armLiteralBaseTy` rather than an
+// oversight: the only members this is asked about are literal-shaped, and flattening one
+// yields its LITERALS (or itself), never the base PRIM. An arm can therefore never subsume
+// itself, so the caller does not have to track which index it is testing.
+//
+// INDEX EQUALITY against the base, not `sameVariantTy`. The primitives are canonical arena
+// singletons, and the loose test would answer TRUE for a `TyLit` sibling — which is exactly
+// the pair the ruling keeps apart (`"a" | "b" | "err"` must NOT collapse: its siblings are
+// literals, not the `string` ARM).
+function unionMembersCarryBaseArm(members: i32[], base: i32): boolean {
+  let i = 0
+  while i < members.length {
+    const flat: i32[] = []
+    flattenVariantsInto(members[i], flat)
+    let f = 0
+    while f < flat.length {
+      if flat[f] == base { return true }
+      f = f + 1
+    }
+    i = i + 1
+  }
+  false
+}
+
+// Is `ty`'s value set already carried by an arm of `members`? The predicate BOTH union
+// routes filter by — the annotation route over its member list, the declaration route over
+// that list AND over the wider `declMemberIxs` registration list.
+function unionArmSubsumedBy(ty: i32, members: i32[]): boolean {
+  const base = armLiteralBaseTy(ty)
+  if base < 0 { return false }
+  unionMembersCarryBaseArm(members, base)
+}
+
+// A SUBSUMED LITERAL ARM COLLAPSES — the owner's 2026-09-02 ruling, and the shared home
+// both union routes call so the two spellings cannot disagree about it.
+//
+// A union is a SET of values, and an arm that adds no values adds no arm. `string | "err"`
+// is `string` and `i32 | 3` is `i32`. Subsumption is decided PER ARM, AFTER FLATTENING and
+// THROUGH ALIASES, so where the subsuming arm came from does not matter:
+// `type Name = string` gives `Name | "err"` = `Name`, and `Json | "err"` flattens to
+// `null | ... | string | ... | "err"` and is `Json`.
+//
+// NOTHING COLLAPSES THAT ADDS A VALUE, and the base-arm test is what makes that exact
+// rather than approximate. `Kind | "err"` has no `string` ARM — flattening `Kind` reaches
+// its LITERALS — so it stays the three-atom litunion `"a" | "b" | "err"`; `i32 | "err"`
+// stays a genuine two-arm box. The ruling's MIRROR half (`Kind | string`) is deferred with
+// its price named — see `armLiteralBaseTy`.
+//
+// WHY IT IS A TYPE RULE AND NOT AN EMITTER ONE (D1024). The duplicate atom the widen
+// produced is not a rep the emitter can be taught: `string | "err"` widened the literal to
+// a SECOND `string` atom, the member set printed `...|string|...|string`, and a union box's
+// tags are POSITIONAL over that set, so the only sound answers are "never mint the
+// duplicate" or "renumber every tag". The ruling picks the first. Deduping the minted set
+// instead is the one thing that must not happen here — see the union member-set ABI.
+//
+// ALWAYS FILLS `out` WITH THE SURVIVORS, and answers whether it dropped anything. The
+// return value is a fact about the list, NOT permission to read `out` — a caller uses `out`
+// unconditionally.
+//
+// THE OTHER CONTRACT — "filled only on true, untouched on false" — was written first and is
+// the reason this note exists. It reads as the safer shape and it is a trap: the loop has to
+// walk every member to know whether ANY is subsumed, so `out` is already full by the time
+// the answer is known. The declaration route then appended `surviving` to an `out` that
+// already held it, and every union in the module doubled its member list — `MfKind`'s seven
+// atoms became fourteen, which surfaced as the COMPILER'S OWN SOURCE failing to build with
+// `non-exhaustive match — missing` every arm the match plainly had. `deno task test` and
+// `native-fixpoint` caught it; nothing about the D1024 witness did, because the collapse
+// path was correct and it was the NO-COLLAPSE path that was wrong.
+//
+// A list that collapses to NOTHING cannot arise — a dropped arm needs a surviving sibling to
+// be subsumed by — but the length guard is kept so the callers' one-member arms stay the only
+// place that degenerate case is decided.
+function unionDropSubsumedArms(members: i32[], out: i32[]): boolean {
+  let dropped = false
+  let i = 0
+  while i < members.length {
+    if members.length >= 2 && unionArmSubsumedBy(members[i], members) {
+      dropped = true
+    } else {
+      out.push(members[i])
+    }
+    i = i + 1
+  }
+  if out.length == 0 { return false }
+  dropped
+}
+
 // The FLATTENED, deduped literal members of `members` when EVERY member is a homogeneous
 // literal union over ONE COMMON base — filled into `out`, answering true. Answers false
 // and leaves `out` UNTOUCHED otherwise, so a caller keeps its own member list on that leg.
@@ -9834,6 +9952,16 @@ function annUnionInnerTy(members: i32[], hasNull: boolean): i32 {
   if nwClash.length > 0 {
     unkTyClash = nwClash
     return -1
+  }
+  // THE SUBSUMED-ARM COLLAPSE, ahead of BOTH remaining arms — `string | "err" | null` is
+  // `string?` for the same reason `string | "err"` is `string`, and the `null` early-out
+  // below would otherwise carry the duplicate atom into the niche. Re-enters the whole
+  // function on the survivors so the one-member arm above decides the degenerate case
+  // exactly once (a two-arm union that collapses to one is the COMMON shape here, not an
+  // edge: it is what `string | "err"` itself is).
+  const kept: i32[] = []
+  if unionDropSubsumedArms(members, kept) {
+    return annUnionInnerTy(kept, hasNull)
   }
   if hasNull {
     annRegisterVariantMembers(members)
@@ -26383,6 +26511,34 @@ function fillTypeDeclAt(sx: i32) {
           if nwClash.length > 0 {
             tErr(nwClash + " in union '" + sd.udName + "'", sx)
           }
+          // THE SUBSUMED-ARM COLLAPSE on the DECLARATION side — `unionDropSubsumedArms`,
+          // the same shared rule `annUnionInnerTy` applies. This arm builds its member
+          // list itself and so never reaches the shared annotation home, and the two
+          // routes are ONE language: `type R = string | "err"` must be `string` for the
+          // same reason the inline spelling is.
+          //
+          // THE REGISTRATION LIST IS FILTERED BY THE SAME PREDICATE rather than rebuilt
+          // from the survivors. `declMemberIxs` is a SUPERSET of `surviving` — it is
+          // pushed before the never-drop — so the two lists cannot be derived from each
+          // other, and a dropped arm left in it would register `"err"` as a variant member
+          // of a union that no longer has that arm: a positional-tag mismatch, which is
+          // the exact failure this collapse exists to prevent.
+          const survU: i32[] = []
+          const nonNullU: i32[] = []
+          const declU: i32[] = []
+          unionDropSubsumedArms(surviving, survU)
+          let cu = 0
+          while cu < survU.length {
+            if survU[cu] != TY_NULL { nonNullU.push(survU[cu]) }
+            cu = cu + 1
+          }
+          cu = 0
+          while cu < declMemberIxs.length {
+            if !unionArmSubsumedBy(declMemberIxs[cu], surviving) {
+              declU.push(declMemberIxs[cu])
+            }
+            cu = cu + 1
+          }
           // THE `null` NICHE FOLD — an un-parenthesized `type T = X | null` denotes
           // `X?`, exactly as the inline annotation `X | null` and the parenthesized
           // declaration `type T = (X | null)` already do (`annUnionTy`, the shared
@@ -26452,8 +26608,8 @@ function fillTypeDeclAt(sx: i32) {
           // `mkNullableTy` does not intern, so the wrap must happen exactly once, which
           // is what routing through `annUnionTy` (rather than its two halves) gives.
           let folded = -1
-          if sawNull && nonNull.length > 0 {
-            folded = annUnionTy(nonNull, true)
+          if sawNull && nonNullU.length > 0 {
+            folded = annUnionTy(nonNullU, true)
           }
           // THE LITERAL-UNION FLATTEN, on the DECLARATION side — `litUnionFlatMembers`,
           // the same member-list transform `annUnionInnerTy` climbs. This arm builds its
@@ -26476,7 +26632,7 @@ function fillTypeDeclAt(sx: i32) {
           if folded >= 0 {
             members.push(folded)
           } else {
-            if !sawNull { flattened = litUnionFlatMembers(surviving, flatU) }
+            if !sawNull { flattened = litUnionFlatMembers(survU, flatU) }
             if flattened {
               let fi = 0
               while fi < flatU.length {
@@ -26485,8 +26641,8 @@ function fillTypeDeclAt(sx: i32) {
               }
             } else {
               let mi = 0
-              while mi < surviving.length {
-                members.push(surviving[mi])
+              while mi < survU.length {
+                members.push(survU[mi])
                 mi = mi + 1
               }
             }
@@ -26517,11 +26673,11 @@ function fillTypeDeclAt(sx: i32) {
               }
             } else {
               let ri = 0
-              while ri < declMemberIxs.length {
+              while ri < declU.length {
                 cTyIxSetAdd(
                   cVariantMemberTyIxs,
                   cVariantMemberTyIxSet,
-                  declMemberIxs[ri],
+                  declU[ri],
                 )
                 ri = ri + 1
               }
