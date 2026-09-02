@@ -32269,7 +32269,11 @@ Repro:
 
 ### D1040 — a map whose value is a REF ARRAY (`{[string]: P[]}`) refuses at MODULE scope and runs inside a function
 
-**loud emit reject on a `vl check`-clean program — OPEN, clause 2**
+**runs, prints `7` — CLOSED 2026-09-02 in the SLOT HELPER, not at a caller: `letAnnRefListSlot`
+answers an un-annotated map-read binding with its own element slot instead of the `0` that is
+a real slot rather than a sentinel, and `globalCellKind` gained the local ladder's map-read
+arm · zero `runs` lost · `tests/cases/maps/map-read-list-value-null-narrowing.vl` · was a loud
+emit reject on a `vl check`-clean program, clause 2**
 
 Repro:
 
@@ -32320,9 +32324,23 @@ Repro:
     place to look next — though a map READ init should not need a `pendingListSlot` seed,
     so the disagreement may be on the read side instead.
 
-  Each fix so far has revealed the next site, which is the signature of a capability that
-  needs its whole delivery matrix built at once (D965) rather than another arm. Everything
-  above is reverted; the row stays a LOUD refusal rather than a miscompile.
+* **THE FIX WAS ONE PLACE, AND THE THREE FAILED ATTEMPTS ARE WHY.** Each of them patched a
+  CONSUMER of `letAnnRefListSlot`, and it has **nine** — the global cell's valtype and its
+  `ref.null` zero, the init-seeding branch, `pendingListSlot`, and the read-side classifiers.
+  A binding whose slot that helper cannot name is ONE question, not nine, so the answer goes
+  in the helper: when `d.letType < 0` and `letNulMapReadValKind` claims the binding, return
+  `letNulMapReadSlotArg` — the LOCAL ladder's own slot argument for exactly these bindings,
+  so a global and a same-typed local resolve one slot from one helper. Every consumer
+  followed at once and the whole matrix passed.
+
+  The trap that made this look like four separate sites: `letAnnRefListSlot` documents `0` as
+  "not a ref-array annotation", and 0 is ALSO the first real slot. So a caller cannot tell a
+  missing answer from a wrong one, and a `cs < 0` guard at any of them is dead code.
+
+* **GRADED ON A MATRIX, NOT A WITNESS**, because a single witness passed the broken
+  candidates: two ref-array-valued map globals over DIFFERENT structs, three element reps in
+  one module, annotated and inferred bindings of the same map side by side, module scope and
+  function scope together, and a MISS reading null. All run; the fixture carries them.
 
 * **SO THE FIXTURE FOR THIS ROW MUST CARRY TWO MAP-READ GLOBALS OF DIFFERENT ELEMENT REPS.**
   One witness per rep passes the broken candidate; the collision only appears when two share
