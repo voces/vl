@@ -30017,6 +30017,30 @@ makes this ONE row rather than four.
   `emitNarrowedMem` is the shape to copy; it already resolves BOTH an ident receiver and a
   member path key.
 
+* **SECOND ATTEMPT, IN THE RIGHT ORDER — THE DELIVERY UNBOX WORKS, AND THERE IS A THIRD
+  LAYER BEHIND IT.** Built delivery-first this time: `placeNarrowKeyOf` (member path / index
+  place), `placeNarrowedRefArraySlot`, and an unbox in `emitForInList` that reads the box and
+  `ref.cast`s the payload to the arm's wrapper — THEN the classifier rung. The bytes confirm
+  the delivery: `(local.set $3 (ref.cast (ref $5) (struct.get $2 1 (struct.get $1 0 …))))`,
+  the `#l` temp correctly holding a box-list wrapper. The `local.set` mismatch is gone.
+
+  What is left is a THIRD layer, one step further in: the loop VARIABLE. `for e in n.v`
+  binds `e` as a union box, and `if e is f64 { print(e) }` then passes the BOX to
+  `__print_f64__` — `expected f64, found (ref $type)`. The identical body over a hoisted
+  local unboxes correctly, so the element narrow is reading state the place-iterable path
+  does not establish.
+
+  **THE SLOT RESOLUTION NEEDS THE SPELLING, NOT THE ARENA TYPE.** `narrowedArmTyOf("n.v")`
+  answers `48` and `unMemIsRefElemArray` declines it; the arm NAME (`K[]` →
+  `arrElemNameRaw` → `rlSlotByNameKeyTy("K", -1)` → slot 0) is what resolves. That is the
+  same asymmetry `forInElemKind` already works around by reading `narrowVariants` rather
+  than `narrowSlotTy`, and it is worth knowing before the next attempt.
+
+* **STAGED, THEN.** Layer 1 (delivery unbox) and layer 2 (classifier) are measured and known
+  to work together; layer 3 (the loop variable's element narrow) is the open one, and
+  spellings 2, 3 and 4 each need their own delivery on top. Nothing has shipped: both
+  attempts were reverted, and this row's witnesses still refuse loudly.
+
 Repro (loud emit reject):
 
     type K = f64 | K[]
