@@ -266,10 +266,12 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   margin, `toJsonPretty`/`jsonKind` named as WHAT IS NOT HERE), and **§6 holds the three
   questions the owner still has to rule**: helpers (recommended: one `jsonPointer`, RFC
   6901, `kind: "missing"`), `asExactI32` in `std:fmt` + whether `f64 as i32` saturates, and
-  whether `string | "err"` collapses (D1024/D1026). Two more gaps filed by the critique
+  whether `string | "err"` collapses (D1024). Three more gaps filed by the critique
   round: D1025 (a map subscript mints no narrowing key — the usability critique's gap A,
-  check-clean invalid wasm at an integer-literal key) and D1026 (`Json | null` in a
-  signature is a loud emit reject). **Measuring it found the blocker: D1021 — `Json | JsonError`, the ruled fs-shaped
+  check-clean invalid wasm at an integer-literal key), D1026 (a null-bearing alias
+  composed with `| null` — CLOSED #2312 for its witness) and D1027 (the `Json | null`
+  signature D1026 was filed for is STILL refused after that fold: recursion is a second
+  ingredient, so it is D1021 with `null` as the composed arm). **Measuring it found the blocker: D1021 — `Json | JsonError`, the ruled fs-shaped
   return, is check-clean INVALID WASM because a recursive alias does not compose into a
   wider union** (probe `scripts/capability-probes/recursive-union-alias-composed.vl`). The
   API is NOT bent around it (a carrier struct runs today and was declined — std has no

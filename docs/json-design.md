@@ -675,12 +675,17 @@ blocks the module outright.
    map-read narrowing before widening the checker's key**, or the loud face moves to the
    silent one (D965's position rule).
 
-3. **D1024 / D1026 — a duplicate atom after alias expansion in a signature**
-   (*post-critique*; both filed 2026-09-01). D1026 is `function g(): Json | null` — the
-   signature every accessor writes first — `vl check` rc 0 then `bare null needs a
-   struct-typed context`; D1024 is the same shape with `string | "err"` and it builds
-   invalid wasm. One dedupe after expansion plausibly closes both; §6 question 3 is the
-   language ruling underneath (collapse the subsumed literal, or keep it).
+3. **D1024 — a literal arm whose base is already an arm, in a signature**
+   (*post-critique*; filed 2026-09-01). `string | "err"` builds check-clean invalid wasm.
+   §6 question 3 is the language ruling underneath (collapse the subsumed literal, or keep
+   it). It was filed beside D1026 (`function g(): Json | null`, a loud emit reject) as one
+   duplicate-atom root; **that was measured wrong** — D1026's witness closed on 2026-09-01
+   (#2312: `(T | null) | null` folds at `mkNullableTy`, the nesting was in the arena type
+   and not in the spelling) and `string | "err"` fails identically afterwards. And the
+   `Json | null` signature itself is STILL refused on the merged seed — D1027: the alias's
+   recursion is a second ingredient, which makes it D1021 with `null` as the composed arm,
+   expected to close with item 1. A minimal witness is minimal for the mechanism it found,
+   not for the row's headline; the probe that kept the headline shape is what caught it.
 
 4. **D1009 / D1010 — `Json | null` ↛ `Json` and null-bearing literals needing the `Json[]`
    annotation.** Both open, both loud check rejects. They are what makes the walking idiom
@@ -738,7 +743,7 @@ measurements):
    `f64 as i32` does out of range — trap (today), **saturate** (Rust; `i32.trunc_sat_f64_s`,
    NaN → 0), or wrap (JS `|0`). A language ruling for `DECISIONS.md`, on every consumer's
    path.
-3. **`string | "err"`** (D1024's question, and D1026's fix) — **collapse** the subsumed
+3. **`string | "err"`** (D1024's question) — **collapse** the subsumed
    literal into its base (TypeScript's rule; a hint says the arm is inert), or keep it as
    a distinguishable arm. A language ruling for `DECISIONS.md`; nothing in this module
    spells either.

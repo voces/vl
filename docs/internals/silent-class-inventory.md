@@ -30976,10 +30976,13 @@ signature, the composed union has no rep the emitter will hand a bare `null` to.
   (no second null); the module-scope binding `const x: P | null = null` (not a signature);
   the inline spelling above; a NON-null alias composed with null — `type P = string | f64`,
   `P | null`; and the null-bearing alias composed with something OTHER than null — `type P
-  = null | f64`, `P | string`. Recursion is not an ingredient: `Json | null` refuses for
-  the same reason `P | null` does, and `Json`'s recursion plays no part.
+  = null | f64`, `P | string`. ~~Recursion is not an ingredient: `Json | null` refuses for
+  the same reason `P | null` does, and `Json`'s recursion plays no part.~~ **Measured wrong
+  the day the fix landed:** both refused with one message on the pre-fix seed, and the fold
+  that closed `P | null` left `Json | null` refused. Recursion IS an ingredient of the
+  residue — [D1027](#d1027).
 
-* **CLAUSE 2, SAME ROOT AS D1024.** Both rows are an alias-expanded union carrying a
+* **CLAUSE 2, SAME ROOT AS D1024 — hypothesis, measured wrong below.** Both rows are an alias-expanded union carrying a
   duplicate atom into a signature's rep. D1024 duplicates `string` (after literal widening)
   and builds invalid wasm; this one duplicates `null` and refuses loudly — the null atom has
   a dedicated `bare null` gate that the string atom does not. One dedupe after expansion
@@ -31010,5 +31013,67 @@ signature, the composed union has no rep the emitter will hand a bare `null` to.
 * **NOT D1024'S ROOT, measured.** The shared-root hypothesis was reasonable — both look like a
   duplicate atom after expansion — and it is wrong: with nullable folded, `function f():
   string | "err"` still fails identically. [D1024](#d1024) needs its own fix.
+
+* **AND NOT THE ROW'S HEADLINE SHAPE, measured.** The witness minimised `Json | null` to
+  `P | null` with `P = null | f64` — a `TyNullable(f64)`, which is what the fold folds.
+  `Json` is a six-arm UNION carrying `null` as a member and recursing, and on the seed that
+  carries this fix `function g(): Json | null` still refuses with the identical message. The
+  probe kept the headline shape and caught it within minutes of the merge; filed as
+  [D1027](#d1027), which ablates to D1021 with `null` as the composed arm.
+
+---
+
+### D1027 — a null-bearing RECURSIVE alias composed with `| null` in a signature is still emit-refused after D1026's fold: `Json | null`, the accessor shape every `std:json` consumer writes, fails at three faces
+
+**loud emit reject · check rc 0 · `emitProgram: bare null needs a struct-typed context` reported at the SIGNATURE (`2:9`, the function name — not at the `return null`) · ZERO corpus cells (no recursive-alias axis) · reproduces on master at 57626bac, the seed carrying #2312 · found 2026-09-01 re-grading `scripts/capability-probes/null-bearing-alias-or-null-signature.vl` after D1026 merged · two ingredients, ablated: the alias RECURSES and the alias CARRIES `null`; either alone runs**
+
+Repro:
+
+    type P = null | f64 | string | P[]
+    function g(): P | null {
+      return null
+    }
+    print(g() == null)
+
+* **THE FAMILY, ABLATED** — every control on the same seed, all printing `true`:
+
+  | alias | composed | outcome |
+  | --- | --- | --- |
+  | `null \| f64` | `P \| null` | RUNS — D1026's witness, `TyNullable(TyNullable(f64))` folded by #2312 |
+  | `null \| f64 \| string` | `P \| null` | RUNS — a three-arm null-bearing union, not a `TyNullable` |
+  | `null \| f64 \| string \| P[]` | none (`: P`) | RUNS — the recursive alias uncomposed |
+  | `f64 \| string \| P[]` | `P \| null` | RUNS — recursive but NOT null-bearing; mints a plain nullable over the box |
+  | `null \| f64 \| string \| P[]` | `P \| null` | **REFUSES** |
+  | `null \| f64 \| string \| {[string]: P}` | `P \| null` | **REFUSES** — the map arm is the same |
+
+  Parameter position (`function g(x: P | null): boolean { return x == null }`, called with
+  `null`) is the same refusal at the same `2:9` site. A body that returns `1.5` instead,
+  with `if r is f64` on the result, refuses as `emitProgram: \`is\` names a type that is
+  not a union variant` — D1021's message family, the composed type having no member table.
+
+* **WHAT THE TABLE SAYS.** The fold at `mkNullableTy` is exactly right for the shape it was
+  given: `null | f64` IS a `TyNullable`, and `P | null` nested one. A null-bearing UNION
+  composed with `| null` does not nest a nullable — row 2 runs — so the fold is not what
+  the three-arm case needed either; its members arrive flat and collapse. What a recursive
+  alias does in a composition is [D1021](#d1021)'s mechanism: it stays an opaque atom with
+  no member table, so the `null` already inside it is invisible to the member split, and
+  the composed type has nothing for the `bare null` gate to seed from. **This is D1021 with
+  `null` as the composed arm**, and D1021's route (1) — flatten the recursive alias into
+  the composition — is the fix expected to close it. Grade D1021 on this witness and on the
+  probe as well as on `Json | JsonError`.
+
+* **WHY IT WAS NOT SEEN.** A minimal witness is minimal for the MECHANISM it found, not for
+  the row's headline. D1026 was filed FOR `Json | null`; its witness kept the composition
+  and dropped the recursion, because on that seed both refused with one message and the
+  ablation (correctly, then) reported recursion as not load-bearing. The fold closed the
+  witness and left the headline. **When a row is filed for a shape, keep that shape in the
+  row as a second witness** — the probe file did, and it is the only reason this was
+  caught the same day rather than by the `std:json` builder.
+
+* **WHAT IT TOUCHES.** Every `std:json` accessor signature — `jsonPointer`'s missing-vs-null
+  distinction is `Json | JsonError`, not this, but `function first(self: Json): Json |
+  null` and every optional-parameter spelling meet it. The design doc's build order already
+  puts D1021 first; this row is the reason `Json | null` does not move off the list when
+  D1026 closed.
 
 ---
