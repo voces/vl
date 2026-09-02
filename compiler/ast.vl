@@ -1382,12 +1382,46 @@ export function hasNamedArgs(names: string[]) {
 // emit-fixpoint goldens are unaffected. Defined here (the foundation file shared
 // by every concatenation) because both `typecheck.vl` and `wasmEmit.vl` consult
 // it while the driver — which populates it — is concatenated last.
+//
+// D1120 — AND THE PLAIN NAME IS NOT A KEY. Two merged modules may each export a
+// `self`-function called `area`; `ufcsAliasAdd` holds a row for each (it dedupes
+// only IDENTICAL pairs) and `ufcsAliasOf` answers with the FIRST. The rewrite walk
+// visits modules dependency-first, so a DEPENDENCY's `sq(3).area()` banks
+// `area → area$m3` before the entry's `box(5).area()` banks `area → area$m1`, and
+// the entry's call is then resolved against the other module's `self: Sq` — refused
+// `no field 'area' on Box`, a message about a field that is really a wrong-alias
+// lookup. Measured on the pre-fix seed: the table held exactly those two rows, in
+// exactly that order, and each SITE's own `modSelfFnTarget` had already computed the
+// right one.
+//
+// So the alias is banked per CALL SITE as well — `ufcsSiteTo[callIx]`, the same
+// node-index sidecar shape `callSiteLoc` uses. Node indices are stable from the
+// merge walk through `checkProgram` and `emitProgram`, which is what lets three
+// consumers in two phases read one answer. The plain-name map STAYS, and is the
+// fallback for every reader that has no call node: `witnessOf` answers a bound
+// before any call exists, and a call node minted after the walk (a monomorphized
+// clone, the emitter's rebuilt direct call) has no banked row. That fallback is the
+// pre-D1120 behaviour exactly, so a site the walk never saw is unchanged.
 export let ufcsAliasFrom: string[] = []
 export let ufcsAliasTo: string[] = []
+export let ufcsSiteTo: string[] = []
 export function ufcsAliasReset() {
   ufcsAliasFrom = []
   ufcsAliasTo = []
+  ufcsSiteTo = []
   0
+}
+// Bank the mangled self-function the UFCS member-call NODE `callIx` resolves to.
+export function ufcsSiteAdd(callIx: i32, mangled: string) {
+  if callIx < 0 { return 0 }
+  while ufcsSiteTo.length <= callIx { ufcsSiteTo.push("") }
+  ufcsSiteTo[callIx] = mangled
+  0
+}
+// The per-site answer for the call at `callIx`, or "" when the walk banked none.
+export function ufcsSiteOf(callIx: i32) {
+  if callIx >= 0 && callIx < ufcsSiteTo.length { return ufcsSiteTo[callIx] }
+  ""
 }
 export function ufcsAliasAdd(plain: string, mangled: string) {
   let i = 0
@@ -1401,6 +1435,10 @@ export function ufcsAliasAdd(plain: string, mangled: string) {
 }
 // The mangled self-function a UFCS `prop` resolves to, or `name` unchanged when
 // no merge alias applies (single-file mode, or a `prop` naming no self-function).
+//
+// NAME-KEYED, so it answers with the first row when two merged modules export a
+// self-function of one name (D1120). Every reader that HAS the call node must use
+// `ufcsAliasAtSite` instead; this one is the fallback for the readers that do not.
 export function ufcsAliasOf(name: string) {
   let i = 0
   while i < ufcsAliasFrom.length {
@@ -1408,6 +1446,17 @@ export function ufcsAliasOf(name: string) {
     i = i + 1
   }
   name
+}
+
+// The mangled self-function the UFCS member-call at `callIx` resolves to (D1120):
+// THAT SITE's own answer when the merge walk banked one, else the plain-name map.
+// The one entry point for the three consumers that hold a call node — `ufcsCallTy`,
+// `drwWalk`, and `emitCall`'s unrewritten-member fallback — so the checker and the
+// emitter cannot pick different modules' functions for one call.
+export function ufcsAliasAtSite(callIx: i32, name: string) {
+  const site = ufcsSiteOf(callIx)
+  if site != "" { return site }
+  ufcsAliasOf(name)
 }
 
 // ── free INDEX-OPERATOR declaration names (B14) ──────────────────────────────

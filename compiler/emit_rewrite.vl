@@ -99,7 +99,7 @@ import {
   orderArgsByParamNames,
   paramDefaultIsCallsite,
   paramDefaultOf,
-  ufcsAliasOf,
+  ufcsAliasAtSite,
 } from "./ast"
 import {
   annArrowAt,
@@ -389,21 +389,51 @@ function drwWalk(ix: i32, ctx: i32) {
       // mangled function, and the rebuilt direct-call Ident carries that name so
       // every downstream pass (string detection, print routing, coercion) sees a
       // normal named call. Identity single-file.
-      const uName = ufcsAliasOf(callee.memProp)
+      //
+      // D1120 — AT THE SITE. `ix` is this Call's arena node, the index the merge
+      // walk banked its own `modSelfFnTarget` answer on, so two merged modules'
+      // same-named `self`-functions no longer collapse onto whichever one the
+      // dependency-first walk registered first. Identity single-file and for any
+      // node the walk never saw (the plain-name map answers those, as before).
+      const uName = ufcsAliasAtSite(ix, callee.memProp)
       // Precedence, mirroring the host:
       //   • a REAL struct field of that name wins (a value access, not a call);
       //   • a callable FIELD (closure-valued, kind 14) wins as a `call_ref`
       //     member-call (`exprIsClosure`), so it is NOT UFCS-rewritten.
       // A non-struct receiver has no fields, so neither precedence case can
       // apply — the rewrite fires once a matching `self`-function exists.
+      // D1070 — FIELD-FIRST IS THE CHECKER'S PREDICATE, ASKED FIRST, IN EVERY SCOPE.
+      // Everything below this line resolves an emit-side struct-table ROW, and a row is
+      // not what the precedence rule is about. `structIndexOfExpr` answers for a MODULE
+      // GLOBAL (`globalStructIndexSid`, filled by `collectA`/`collectFns`, both before
+      // this pass) and for a PARAM, and answers -1 for a receiver bound inside a function
+      // body — `declaredStructIndex` reads `localNames`, which `buildLocals` fills during
+      // `emitModule`, long after `dispatchRewrite`. `exprIsClosure`'s Member arm hangs off
+      // the same `structIndexOfExpr`, so the `si < 0` fallback could not see the callable
+      // field either, and the arm read "no field, so UFCS".
+      //
+      // Measured on the pre-fix seed, one program per scope, same struct and same
+      // self-function: `ctx=-1 si=0 isClo=T` at module top level and `ctx=18 si=-1
+      // isClo=F` in a body — while `tyFieldTyOf(nodeTyIxOf(recv), prop)` answered a real
+      // field type (45 / 49) in BOTH. The checker had the answer in every scope; only the
+      // emitter's row lookup was scope-dependent, and it was deciding the rule.
+      //
+      // So the precedence question is asked of the RECEIVER'S CHECKED TYPE, through the
+      // exact predicate `ufcsCallTy`'s caller uses for `ufcsHasField` (`tyFieldTyOf` —
+      // `TyObj` + a field of that name). Ahead of the row lookup, and STRICTLY NARROWING:
+      // it can only turn a UFCS rewrite off, never on, so a receiver the checker recorded
+      // no type for (or a TyVar receiver inside a generic body, which is `drwEveryInstance
+      // TakesField`'s question, not this one) keeps exactly today's classification.
+      const recvFieldTy = tyFieldTyOf(nodeTyIxOf(callee.memObj), callee.memProp)
+      const recvHasField = recvFieldTy >= 0
       const si = structIndexOfExpr(callee.memObj, ctx)
       let ufcs = false
-      if si >= 0 {
+      if si >= 0 && !recvHasField {
         if sFieldIndex(si, callee.memProp) < 0 {
           if drwSelfFnOf(uName, args.length + 1) >= 0 { ufcs = true }
         }
       }
-      if si < 0 {
+      if si < 0 && !recvHasField {
         if !exprIsClosure(n.callFn, ctx) {
           if drwSelfFnOf(uName, args.length + 1) >= 0 {
             // A TYPE-PARAMETER receiver has no struct row YET, and `si < 0` is the arm
