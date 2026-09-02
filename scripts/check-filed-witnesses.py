@@ -50,6 +50,10 @@ DOC SHAPE IT READS
 Only the FIRST indented block after the first `Repro` line is run. Lines inside it that
 begin with `//` at top level are kept (they may be directives), so the program is used
 verbatim.
+
+A witness that needs MORE THAN ONE MODULE splits the block with `// file: <name>.vl` marker
+lines; each marker starts a file and the LAST one is the entry that is checked, run and
+built. Relative imports between the sections resolve. See `split_files`.
 """
 import json, re, subprocess, sys, tempfile, os
 from pathlib import Path
@@ -153,12 +157,39 @@ TRAP_MARKERS = ("wasm trap", "unreachable", "out of bounds", "divide by zero",
                 "null reference", "cast failure", "integer overflow")
 
 
+# A MULTI-FILE WITNESS. Some defects need two modules to exist at all — a merge-time registry
+# collision between two modules' same-named `self`-functions (D1120) cannot be spelled in one
+# file, and until this existed such a row was UNGRADEABLE and so unfileable under `--strict`.
+# The repro block carries `// file: <name>.vl` marker lines; each starts a new file, and the
+# LAST section is the entry the three channels run. A block with no marker is one file, as
+# before. Relative imports resolve inside the temp dir, so `import { x } from "./a"` works.
+FILE_MARK = re.compile(r"^// file: (\S+\.vl)\s*$")
+
+
+def split_files(src):
+    """(name, source) per `// file:` section; a single unnamed section is `w.vl`."""
+    files, name, body = [], None, []
+    for ln in src.splitlines():
+        m = FILE_MARK.match(ln)
+        if m:
+            if name is not None:
+                files.append((name, "\n".join(body).rstrip() + "\n"))
+            name, body = m.group(1), []
+        else:
+            body.append(ln)
+    if name is None:
+        return [("w.vl", src)]
+    files.append((name, "\n".join(body).rstrip() + "\n"))
+    return files
+
+
 def run_program(src):
     """Classify what the compiler does with `src`, on the same three channels the
     silent-sweep harness separates: check (diagnostic), run (value), build (module)."""
     with tempfile.TemporaryDirectory() as td:
-        f = os.path.join(td, "w.vl")
-        Path(f).write_text(src)
+        for name, body in split_files(src):
+            f = os.path.join(td, name)
+            Path(f).write_text(body)
         chk = subprocess.run([VL, "check", f, "--compiler", COMPILER],
                              capture_output=True, text=True, timeout=120)
         run = subprocess.run([VL, "run", f, "--compiler", COMPILER],
@@ -198,6 +229,11 @@ SELF_TEST = [
     # Before `trap_loads` existed this graded `silent_invalid_wasm`, which is what D19
     # sat behind.
     ("trap_loads", "const xs: i32[] = [1, 2]\nprint(xs.length)\nprint(xs[9])\n"),
+    # A TWO-FILE program: the `// file:` splitter must deliver the module the entry imports.
+    # Without the split this is one file whose first line is a comment and whose second is an
+    # `export` in a module that then imports from a sibling that does not exist.
+    ("runs", "// file: a.vl\nexport function six(): i32 { return 6 }\n"
+             "// file: main.vl\nimport { six } from \"./a\"\nprint(six() * 7)\n"),
 ]
 
 

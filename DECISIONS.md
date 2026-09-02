@@ -4223,15 +4223,18 @@ under D426 because the rule the owner agreed to — a body-scoped declaration se
 signature's type parameters — is the one rule all three node kinds owe, and the build closes
 them together.
 
-**Two sub-rulings, recorded as vl-b7's recommendation and standing unless the owner objects.**
+**Two sub-rulings. The first is the owner's (2026-09-02, shown the example and answering
+"seems like it should obviously be an error"); the second is vl-b7's recommendation and
+stands unless the owner objects.**
 
-* **A local NOMINAL type does not escape through an inferred return type.** `type Id = new
-  i32` inside `f` and `return Id(3)` with no return annotation would infer a type that no
-  caller can NAME — the checker refuses it, as it does any unnameable inferred type, with a
-  message that says to declare the type at module scope or annotate the return. A local
-  STRUCTURAL type escapes freely as its shape, because the shape is the type and the caller can
-  spell it. The asymmetry is the whole point of `new`: nominality is a name, and a name that
-  goes out of scope takes the nominal identity with it.
+* **A local NOMINAL type does not escape through an inferred return type — ERROR.** `type Id
+  = new i32` inside `fresh` and `return Id(7)` with no return annotation would infer a type
+  that no caller can NAME — the checker refuses it at the return, as it does any unnameable
+  inferred type: `` return type `Id` is declared inside `fresh` and no caller can name it;
+  annotate the return or move `Id` to module scope ``. A local STRUCTURAL type escapes freely
+  as its shape, because the shape is the type and the caller can spell it. The asymmetry is
+  the whole point of `new`: nominality is a name, and a name that goes out of scope takes the
+  nominal identity with it.
 * **Nothing else escapes either, and nothing needs a rule for it.** A local type used only
   in a local binding, argument, or `is` never reaches a signature, so the question of what a
   caller sees does not arise.
@@ -4261,12 +4264,11 @@ expect(build(cfg))
 
 the `expect` line is the setup and the `.toEqual` line is the assertion; Jest and Vitest
 report the matcher's line for the same reason. On today's grammar that spelling does not
-parse (`expected an expression but found DOT`, measured 2026-09-02 — a leading-dot
-continuation line is not admitted, and whether it should be is a grammar question for the
-owner, not filed as a defect), so on every program that compiles today only the COLUMN
-moves: `__callsite__` on a UFCS call already anchors on the METHOD token, column 14 for
-`expect(x).toEqual(y)` at column 5. No existing report changes its line; the ruling is made
-now so the location is right on the day the grammar admits the second line.
+parse (`expected an expression but found DOT`, measured 2026-09-02); the owner ruled the same
+day that it must — §"A leading `.` on a new line continues the chain" below — so until that
+lands only the COLUMN moves: `__callsite__` on a UFCS call already anchors on the METHOD
+token, column 14 for `expect(x).toEqual(y)` at column 5. No existing report changes its line;
+the ruling is made now so the location is right on the day the grammar admits the second line.
 
 **How it lands, and why it is not landing today.** Each matcher — `toEqual`, `toBeTrue`,
 `toBeFalse`, and `not`'s continuation — takes a trailing `caller: CallerLoc = __callsite__`,
@@ -4276,10 +4278,63 @@ change alters std exports and goes through `std-api-reviewer`; the header's anch
 and the track-caller ruling's "`expect` only" section are updated with it, and the editor's
 location line (`testDiscovery.ts`) is unchanged because the wire format is unchanged.
 
-**It is blocked by a compiler defect, found while measuring the move.** A UFCS call that OMITS
-a defaulted tail argument is refused `no field 'toEqual' on Expectation` in any module build
-that merges a `self`-function-bearing module — which `std:test` is, so EVERY test file. The
-direct spelling and the supplied-argument spelling run. Filed as D1044 with an eight-row
-ablation; the matcher move ships the PR after D1044's fix merges, and is graded on the
-multi-line spelling reporting the `.toEqual` line, the one-line spelling reporting column 14,
-and `not.toEqual` reporting the final matcher.
+**It was blocked by a compiler defect, found while measuring the move — closed the same day.**
+A UFCS call that OMITS a defaulted tail argument was refused `no field 'toEqual' on
+Expectation` in any module build that merges a `self`-function-bearing module — which
+`std:test` is, so EVERY test file. The direct spelling and the supplied-argument spelling ran.
+Filed as D1044 with an eight-row ablation and closed by #2371 (the merge's UFCS registry
+matched the DECLARED parameter count exactly where its consumers match an arity range). The
+matcher move is unblocked and is graded on the one-line spelling reporting column 14,
+`not.toEqual` reporting the final matcher, and — once the leading-dot ruling below is built —
+the multi-line spelling reporting the `.toEqual` line.
+
+## A leading `.` on a new line continues the chain (owner, 2026-09-02)
+
+**Ruling.** A NEWLINE followed by `.` or `?.` continues the postfix chain of the expression
+before it:
+
+```vl
+expect(build(cfg))
+  .toEqual(want)
+
+items
+  .filter(keep)
+  ?.first()
+```
+
+The owner's framing: *"for long chains, allowing the `.` on the next line is basically required
+or we have to deal with long lines."* Long chains are otherwise one line or nothing.
+
+**Why it is free here, and the exact rule.** VL's NEWLINE is a real token, and no legal
+statement starts with `.` or `?.` — `.5` is already a parse error at the DOT (lexer.vl, the
+NUMBER arm) and there is no other leading-dot form — so the rule reinterprets ONLY programs
+that are parse errors today; no existing program changes meaning. That is the same argument
+JS, Swift, Kotlin, Rust and Ruby rely on (Go cannot, because its semicolon rule fires at the
+trailing paren). The rule is deliberately tight, and these three edges are part of it:
+
+* **`(` and `[` do NOT continue.** A line starting with `(` is a legal parenthesised
+  statement today and a line starting with `[` a legal array-literal statement; admitting
+  either as a continuation is the classic ASI hazard and would change existing programs.
+* **Leading-dot is the ONLY form.** Go-style trailing-dot (`expect(x).` ⏎ `toEqual(y)`) also
+  fails today (`expect("IDENT")` meets NEWLINE) and stays refused: two spellings of one thing
+  is exactly what `fmt` would then have to canonicalise.
+* **Comment lines between links work for free** — the lexer consumes `// …` up to the newline,
+  so a commented-out link is just NEWLINE tokens.
+
+**The formatter is the real half of the build (vl-b7's recommendation, standing unless the
+owner objects).** `format.vl` is AST-driven and prints member chains inline, so without a
+chain-break policy `vl fmt -w` re-joins the lines and `lint-self.sh`'s `fmt --check` makes the
+form unusable in this repo. The policy is the deterministic one the formatter already uses for
+lists — **fit-or-break**: a chain that fits within `fmtWidth` prints inline; one that does not
+prints one `.link(args)` per line, indented one level, from the first link. `expect(x).toEqual(y)`
+fits and stays on one line; a long builder chain breaks. No author-break preservation: the
+formatter's output is a function of the tree and the width, as everywhere else.
+
+**Build.** Parser: in `parsePostfix`'s loop (`parser.vl`), on NEWLINE peek past the run of
+newlines and continue iff the next kind is `DOT` / `QUESTION_DOT` — a few lines. Formatter:
+the fit-or-break chain layout. Fixtures: a leading-dot chain across 2 and 3+ links, one with a
+comment line between links, `?.` as a continuation, a line starting with `(` and one starting
+with `[` still parsing as their own statements, and `fmt` round-tripping both a fitting and a
+breaking chain. The LSP is untouched (no new token kinds). A consequence for the matcher ruling
+above: with the matcher on its own line the failure's LINE moves, not just its column — which
+is the case where anchoring at `expect` would have sent an author to the wrong line.
