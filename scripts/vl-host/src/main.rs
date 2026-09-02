@@ -1820,6 +1820,33 @@ fn report_rep_shadow(inst: &Instance, store: &mut Store<()>, path: &str) -> Resu
     Ok(())
 }
 
+/// The SHORTEST round-tripping decimal for `v` in `{:e}` layout, with the spec's tie-break.
+///
+/// `format!("{:e}", v)` is also shortest-round-tripping, but on an EXACT TIE — two candidate
+/// digit strings equidistant from `v` — Rust's shortest formatter chooses the odd last digit
+/// where ECMA-262 `Number::toString` step 5 chooses the even one. Measured over 50,000
+/// pseudo-random doubles against V8: 14 disagreements, every one an exact tie
+/// (silent-class-inventory D1011).
+///
+/// Asking for an EXPLICIT precision takes a different path: Rust's exact-precision float
+/// formatting rounds half-to-EVEN, which is the spec's rule. So walking precisions upward and
+/// taking the first that round-trips yields the shortest digit string under the spec's
+/// tie-break rather than under Rust's. Verified before relying on it: `{:.0}` renders 0.5→0,
+/// 1.5→2, 2.5→2, 3.5→4 and `{:.2}` renders 0.125→0.12, 0.375→0.38 — ties to even at every
+/// probe.
+///
+/// 17 significant digits always round-trips an f64, so the loop terminates; the fallback is
+/// unreachable and exists so this function has no panic path.
+fn shortest_sci(v: f64) -> String {
+    for k in 1..=17 {
+        let s = format!("{:.*e}", k - 1, v);
+        if s.parse::<f64>() == Ok(v) {
+            return s;
+        }
+    }
+    format!("{:e}", v)
+}
+
 /// Render an f64 exactly as JS `String(v)` does (ECMA-262 `Number::toString`, radix
 /// 10) — the rule this host's float print sinks have always CLAIMED to follow, since
 /// `tests/support/runWasm.ts` and `playground/src/runtime.ts` both sink through
@@ -1879,7 +1906,7 @@ fn js_number_to_string(v: f64) -> String {
         return "0".to_string();
     }
     let neg = v < 0.0;
-    let sci = format!("{:e}", v.abs());
+    let sci = shortest_sci(v.abs());
     let (mant, exp) = sci
         .split_once('e')
         .expect("Rust's {:e} always emits an exponent");

@@ -263,47 +263,38 @@ Deno.test({
 
 Deno.test({
   // `print(x.toString())` and `print(x)` are meant to be indistinguishable — the
-  // Rust host's `js_number_to_string` says so in as many words. They are, for
-  // every vector EXCEPT an exact decimal tie, where the HOST is the one that
-  // deviates from the spec it cites: it re-formats digits it gets from Rust's
-  // `{:e}`, and Rust breaks a tie away from even where ECMA-262 breaks it to
-  // even. The double with bits 4835952189745799117 is exactly
-  // 2023347301156851.25, so "…851.2" and "…851.3" are equidistant 17-digit
-  // candidates; V8 and this module print the even one, the Rust host prints the
-  // odd one. The same VL program therefore prints differently under the two
-  // hosts for those values, which predates `std:fmt`.
+  // Rust host's `js_number_to_string` says so in as many words — and as of
+  // silent-class-inventory D1011 they finally are, at every vector.
   //
-  // This is a PIN, not a tolerance: the divergent set is listed, so fixing the
-  // host flips this test rather than silently widening the allowance. When it
-  // flips, delete the list and assert equality outright.
-  name: "std:fmt: print(x) matches toString(x) except at the host's known tie bug",
+  // WHAT THIS USED TO PIN. The host deviated from the spec it cites on an exact
+  // decimal tie: it re-formatted digits it got from Rust's `{:e}`, and Rust breaks
+  // such a tie away from even where ECMA-262 `Number::toString` step 5 breaks it to
+  // even. The double with bits 4835952189745799117 is exactly 2023347301156851.25,
+  // so "…851.2" and "…851.3" are equidistant 17-digit candidates; V8 and `std:fmt`
+  // printed the even one and the host printed the odd one. At 50,000 vectors the
+  // rate was 14, about 0.03%. This test carried the divergent set as a LIST, so
+  // fixing the host would flip it rather than silently widening an allowance —
+  // and this is that flip: the list is gone and the assertion is equality outright.
+  //
+  // The host now asks for an EXPLICIT precision and walks it upward
+  // (`shortest_sci`), because Rust's exact-precision formatting rounds half-to-EVEN
+  // while its shortest formatter does not. Same digits as `std:fmt`'s pure-VL
+  // Burger–Dybvig, by the same rule, from a five-line loop.
+  name: "std:fmt: print(x) and toString(x) agree at every vector",
   ignore: !ENABLED,
   fn: async () => {
     const rs = await rows();
-    const diverged: string[] = [];
+    const bad: string[] = [];
     for (const r of rs) {
-      if (r.host !== r.vl) diverged.push(r.bits.toString());
-      // Whichever way the host went, the module followed the spec — checked in
-      // the first test; here we only care that a divergence is the host's.
-      if (r.host !== r.vl && r.vl !== String(toF64(r.bits))) {
-        throw new Error(`bits=${r.bits}: toString also left the spec (${r.vl})`);
+      if (r.host !== r.vl) {
+        bad.push(`bits=${r.bits} host=${r.host} toString=${r.vl}`);
       }
     }
-    // Measured, 2026-09-01, over these exact vectors. The value appears TWICE
-    // because it is both a named special (it is the smallest witness, so it is
-    // in the table on purpose) and the one pseudo-random vector in 5,000 that
-    // lands on a tie. At 50,000 vectors the rate is 14 — about 0.03%.
-    const PINNED = [
-      "4835952189745799117",
-      "4835952189745799117",
-    ];
-    const got = diverged.join(",");
-    const want = PINNED.join(",");
-    if (got !== want) {
+    if (bad.length > 0) {
       throw new Error(
-        `the host/toString divergence set moved.\n  want: ${want}\n  got:  ${got}\n` +
-          `If the Rust host's tie-break was fixed, this test should now assert ` +
-          `equality on every vector and drop the pinned list.`,
+        `print(x) and toString(x) disagree on ${bad.length} vector(s) — the two ` +
+          `renderers must be indistinguishable (see D1011):\n  ` +
+          bad.slice(0, 10).join("\n  "),
       );
     }
   },
