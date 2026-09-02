@@ -1118,12 +1118,10 @@ Staged, sized honestly:
   `toString` means the imported one, and there is exactly one of it in the language.
 
   **`parseI64` / `parseI32` LANDED 2026-09-01**, closing the other half of stage 0's
-  remainder — and they landed INDEPENDENTLY of decision B, which is still open.
-  Decision B (`docs/internals/serde-critique-synthesis.md` §"Decisions that are the
-  owner's"; `ROADMAP.md` lists A–G as open) *recommends* `i64` on the wire as a NUMBER,
-  while §Approach 1's fidelity table above still says "i64 as decimal string" — that
-  contradiction is the pending ruling, not a claim either way. What admitted these two is
-  the recommendation's own clause: needed "regardless … by every option", since until
+  remainder — and they landed INDEPENDENTLY of decision B. Decision B was RULED the same
+  day (OQ-9: `i64` is ALWAYS a JSON number; `docs/internals/serde-critique-synthesis.md`
+  §"Decisions that are the owner's", DECISIONS.md), but the ruling is not what admitted
+  these two: the recommendation's own clause did — needed "regardless … by every option", since until
   they landed the only text→number path was the `parseF64` funnel, which cannot be exact
   wherever the integer is not representable as a double
   (`parseF64("9223372036854775807")` is 2^63, printing as `9223372036854776000`). A
