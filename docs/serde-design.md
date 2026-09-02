@@ -11,7 +11,8 @@
 > (untagged JSON, since narrowed by decision C), and gave the shaping arguments for
 > OQ-2/3/4. The critique round added and ruled OQ-8 (unknown fields), OQ-9 (`i64` on the
 > wire) and OQ-10 (VLB shape fingerprint), and opened OQ-11 (reference identity as a keyable
-> concept) as a LANGUAGE question. Stages 1–3 — `std:json`, the
+> concept) as a LANGUAGE question — since RULED YES (identity ruling 2026-09-01: the seen-set
+> is an `IdentitySet<T>`, `docs/identity-design.md` §0). Stages 1–3 — `std:json`, the
 > derive, the JSON rendering — are still unbuilt; **stage 1 is unblocked and scheduled**. Written 2026-08-31 at
 > the owner's ask: *"vl does not have a native serialization/deserialization format. This
 > is fine, as I think it requires a think. JSON is a bit annoying in that it does not
@@ -65,8 +66,8 @@
 > **(C)** untagged arms must be distinguishable by FIRST TOKEN or by REQUIRED KEY SET —
 > OQ-7, amended;
 > **(D)** build the static acyclic-shape predicate, keep the depth cap as the floor, add the
-> timing probe; reference-identity keys are a SEPARATE open language question (new
-> **OQ-11**) and `serializeUnchecked` stays deferred — §Cycles;
+> timing probe; reference-identity keys are a SEPARATE language question (new
+> **OQ-11**, since RULED yes) and `serializeUnchecked` stays deferred — §Cycles;
 > **(E)** the VLB header carries an 8-byte shape fingerprint over wire-relevant structure —
 > new **OQ-10**;
 > **(F)** OQ-6 is REVERSED — newtypes are accepted transparently, erased to their base at
@@ -1373,13 +1374,14 @@ assumed. **Land the perf critic's timing probe with it** — walk a ref-bearing 
 4N nodes, fail above 6× — under `scripts/capability-probes/`, so the day a seen-set does land
 for the shapes that need one, it cannot be quadratic unnoticed.
 
-**Reference-identity keys are ruled SEPARATELY, and are NOT decided** — see OQ-11. The
-refusal's own wording (`isn't supported yet`) leaves open a language question this document
-has no standing to answer: whether VL wants reference identity as a keyable concept at all.
-A `Set<Node>` would make the seen-set ordinary code, and it would cost an identity slot per
-object or a linear probe. Stage 2 must not wait on it: the static predicate is sufficient for
-the shapes serde actually walks, and if OQ-11 later says yes, the seen-set gets cheaper
-without the predicate becoming wrong.
+**Reference-identity keys were ruled SEPARATELY — and the answer is YES** (OQ-11, identity
+ruling 2026-09-01). The refusal's own wording (`isn't supported yet`) left open a language
+question this document had no standing to answer, and the language answered it:
+`IdentitySet<T>` is a concrete type keyed by `===` (`docs/identity-design.md` §0, ROADMAP A15
+item 4), so the seen-set on the non-acyclic path is ordinary code — a flat `ref.eq` scan first,
+the per-object serial only when a program measures the scan as a problem, same API either way.
+Stage 2 still does not wait on it: the static predicate is sufficient for the shapes serde
+actually walks, and the seen-set getting cheaper never makes the predicate wrong.
 
 **`serializeUnchecked` stays deferred**, unchanged — the static predicate is exactly the
 thing that decides whether it ever has a customer, so it cannot be priced before the
@@ -1929,10 +1931,19 @@ the format now tolerates being pointed at the wrong build. It strengthens as a *
 which is the trade this document takes everywhere else — a loud refusal in place of a quiet
 wrong value. Effectively it turns bincode into borsh-plus-a-header.
 
-### OQ-11 — is reference identity a keyable concept in VL? **OPEN. A LANGUAGE question, not a serde one.**
+### OQ-11 — is reference identity a keyable concept in VL? **RULED YES, 2026-09-01 — by the language, not by serde.**
 
-Split out of decision D deliberately, and **not decided**. Serde surfaced it and serde does
-not get to answer it.
+Split out of decision D deliberately, and answered where it belonged: the owner's identity
+ruling (`docs/identity-design.md` §0; evidence in
+`docs/internals/identity-critique-synthesis.md`). `===`/`!==` is one `ref.eq` on every
+reference kind; `IdentityMap<K, V>` / `IdentitySet<K>` are concrete types keyed by it, with
+`Map`/`Set`'s surface and satisfying `{[K]: V}`; v1 is a flat scan (the "linear probe" below),
+and the per-object serial (the "identity slot" below — lazy, `i64`, per keyed class only) is
+deferred until a program measures the scan as a problem. So the seen-set is an
+`IdentitySet<T>` on the path where the static predicate fails, and the 204 ms-at-16k figure is
+the price of the scan until the serial lands. The text below is the question as it was asked.
+
+Split out of decision D deliberately. Serde surfaced it and serde did not get to answer it.
 
 **What raised it.** §Cycles needs a set keyed on object identity, and there is none: `Map`/`Set`
 keys are `string` or `i32` only (`A Node-keyed Map isn't supported yet — Map/Set keys must be

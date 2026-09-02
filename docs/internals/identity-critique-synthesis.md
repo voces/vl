@@ -1,6 +1,11 @@
 # Identity proposal — critique synthesis
 
-**Status: SYNTHESIS, 2026-09-01 — awaiting the owner's ruling.** Three cross-examinations of
+**Status: RULED, 2026-09-01 — all ten §4 decisions taken one at a time; the rulings are
+`docs/identity-design.md` §0 and `DECISIONS.md` A15, the build order `ROADMAP.md` A15.**
+Where the owner overrode a recommendation here it is marked `Ruled:` under the item — the
+key-eligibility (5: `==`-comparable, not the Rust field set), the interface (6: the identity
+containers DO satisfy `{[K]: V}`), and functions (7: they compare only by `===`, `==` on
+them is now an error). Three cross-examinations of
 `docs/identity-design.md` (#2268), each from one angle, each by an agent that did not see
 the others' work:
 
@@ -144,6 +149,8 @@ later. VL is not shipped; the reversal column is what "not shipped" is worth her
    operands are struct-typed and neither is `null`, saying what `==` would mean there. Record
    in P6 that Dart reversed this decision, so the choice is made knowingly. *Reversal:* a
    rename; cheap while unshipped.
+   **Ruled: `===`/`!==`.** (The struct-operand hint is NOT part of the ruling — the rep
+   restriction is the guard; a hint on every legal use was judged noise.)
 
 2. **v1 operand set.** (consistency F1/F2/F5/F6, perf 7.) **Recommend:** struct, `List`/
    array, `Map`, and a nullable of one of those — one `ref.eq`. **Union of struct arms:**
@@ -160,17 +167,21 @@ later. VL is not shipped; the reversal column is what "not shipped" is worth her
    NOT the substitute for structural list hashing, which stays deferred
    (`collections-design.md:660`). *Reversal:* adding an operand kind later is free;
    removing one is a break.
+   **Ruled as recommended — with functions IN, not out** (see 7): every reference rep,
+   union of struct arms by payload, list identity = header identity as §VL.7's constraint.
 
 3. **`string === string`.** (crosslang answers, 4; consistency F10.) **Recommend: check
    error.** One template, three arms — scalar (`i32` has no identity — use `==`), string
    (`string` compares by value in VL — use `==`), union-with-scalar-arm (`… is not a
    reference type`) — rendered at the user's spelling, with a newtype-operand fixture.
    *Reversal:* admitting it later is possible and every language that did regrets it.
+   **Ruled: check error, three arms, user's spelling.**
 
 4. **`null === null`.** (consistency F10, D1018.) **Recommend: `true`** — static, the way
    D1018's close made `null == null` static (#2279: the equality emitter answers before either
    operand is lowered); `x === null` gets the P1 hint pointing at `== null`. *Reversal:* none
    needed.
+   **Ruled: `true`, static; `x === null` legal with the hint.**
 
 5. **P3 key-eligibility.** (crosslang 1, consistency F3, perf 8, D1017.) **Recommend the
    Rust model:** a struct is key-eligible iff every field is transitively `i32`/`i64`/
@@ -181,6 +192,13 @@ later. VL is not shipped; the reversal column is what "not shipped" is worth her
    Java mutable-key rule: a key mutated after insertion is lost. *Reversal:* lifting a
    restriction later is free; SameValueZero-style float keys would be a third equality
    relation and are the thing to avoid drifting into.
+   **Ruled AGAINST the recommendation: key-eligible = `==`-comparable.** "We should support
+   everything that `==` supports." `f64`, lists, nested structs all key; hash and `==` still
+   share one lowering. NaN's non-reflexivity is IEEE and is what Go does (a NaN key is
+   inserted and never found), so it is recorded in the `Map` header rather than refused;
+   the hash folds `-0.0` into `0.0` so `0.0 == -0.0` still finds its entry; the mutable-key
+   rule stays. Function-typed fields still refuse `==` by field name (decision 7), so they
+   fall out of key-eligibility by the same rule, not a separate one.
 
 6. **Container names and interfaces.** (crosslang 7, consistency F9, perf 9.) **Recommend:**
    `IdentityMap<K, V>` and `IdentitySet<K>` as separate types that do **not** subtype the C2
@@ -190,16 +208,36 @@ later. VL is not shipped; the reversal column is what "not shipped" is worth her
    identity keys keep their objects alive; iteration is insertion-ordered and the serial is
    unobservable (replay rule, `collections-design.md:1460`). *Reversal:* a name is close to
    permanent in std — this is the item the std review exists for.
+   **Ruled AGAINST F9: the identity containers DO satisfy the interface.** "`{[K]: T}` is a
+   shorthand for the interface, not the implementation, so both `Map` and `IdentityMap`
+   should satisfy it; we can support `Map` and `IdentityMap` at the type level if the
+   implementation wants to be specific." Two things this asks for do not exist and became
+   build items: the concrete names `Map<K, V>`/`Set<T>` as annotation types (measured:
+   `Map<string, i32>` is `unknown type`; only `{[string]: i32}` works) and TS-style explicit
+   type arguments on a call (`Map<string, i32>()` is a parse error). `Set<T>` stays a
+   prerequisite. Separate names confirmed; the header text stands minus "not a `Map`".
 
 7. **`K` for the identity containers.** (P4, consistency F4.) **Recommend:** a struct type,
    a union of struct types, or a nullable of one; `flat` types refused by name (layout
    contract); arrays/maps/functions not identity-keyable in v1 (no slot), refused with a
    message naming the limitation — P5 unchanged. *Reversal:* free to widen.
+   **Ruled: `K` = everything `===` accepts** — arrays, maps and functions included (the
+   scan needs no slot, so P5's "no slot" limitation is gone); `flat` still gets no slot
+   when the serial comes and stays on the scan. **And a re-ruling that came out of this
+   item: functions compare ONLY by `===`.** "It seems like `===` makes more sense for
+   [functions]" — `==` on a function value becomes a check error pointing at `===`, and a
+   struct with a function field refuses `==` by field name. Today's `==` lowering on
+   functions (table index + env `ref.eq`, measured in §6) is the `===` lowering.
 
 8. **Generics and newtypes.** (consistency F8, proposal §4.3/4.4.) **Recommend:** per-instance
    refusal at the instantiation, message naming the instance; a newtype over a struct is
    identity of the underlying, over a scalar it is decision 3's error, both rendered at the
    newtype's spelling. *Reversal:* none needed.
+   **Ruled as recommended**, with the owner's two precisions: the refusal lands at the
+   CALL on the offending argument, exactly like `+` today (`operator '+' is not defined for
+   boolean and boolean (the call's argument types)` at the call site); and a newtype has
+   exactly its base's identity — `Id = new string` makes `u === u` decision 3's error
+   rendered as `Id`, `Handle = new Circle` makes it identity of the underlying object.
 
 9. **Doc corrections that ride the ruling.** (crosslang 2/9/10, consistency F7.) A15's
    parenthetical becomes "same function AND the same captured-environment object (`ref.eq`
@@ -208,6 +246,7 @@ later. VL is not shipped; the reversal column is what "not shipped" is worth her
    inexact: `const a = f; const b = f` are two closure objects and `==` is `true`).
    `DECISIONS.md:835` "A custom `==` overrides" is deleted (D46). §3 cites Kotlin only.
    Map `===` moves to the motivation: it is the only map equality VL has.
+   **Ruled: all six, in the same PR as this status line.**
 
 10. **The serial — a build item with prerequisites, not a design fact.** (§2b/2c above.)
     **Recommend recording:** the identity containers need a per-object slot at scale (204 ms
@@ -220,8 +259,15 @@ later. VL is not shipped; the reversal column is what "not shipped" is worth her
     slot as the optimisation that follows — the API does not change when the rep does.
     *Reversal:* the slot's placement (per-class vs universal) can change under the same
     API; the split is compiler investment either way.
+    **Ruled: flat scan first, the serial only when a program measures the scan as a
+    problem** — "the interface is identical; only need to optimize when it becomes a
+    problem." The design above (lazy `i64`, per-class private heap type, the split, the
+    §2c cells + timing probe) is what gets built when that day comes; nothing waits on it.
 
 ## 5. What the ruling records
+
+(Written before the ruling; kept as the recommendation. Where it differs from what was
+ruled — key-eligibility, the interface, functions — `docs/identity-design.md` §0 wins.)
 
 If the recommendations stand, the A15 remainder in `DECISIONS.md` reads: identity is
 spelled `===`/`!==`, one `ref.eq`, over struct / list / map / nullable-of-those and the

@@ -96,6 +96,18 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   honored, renderer strings stay ANSI-free forever. Full policy + staging in
   `docs/serde-design.md` §"Print, templates, and color". Stage C0 (primitive coloring,
   host-side, small) can land any time; composite coloring rides serde Stage 2.
+- **Reference identity — RULED 2026-09-01, ten decisions taken one at a time**
+  (`docs/identity-design.md` §0 carries the rulings, `docs/internals/identity-critique-synthesis.md`
+  the evidence). `===`/`!==` on every reference kind INCLUDING functions — inverted from A15's
+  old text: `==` on a function is now a check error; `Map`/`Set` keys structural and
+  `==`-comparable (the Rust-style field restriction was REFUSED — NaN keys are Go's unreachable
+  entry, recorded in the header); `IdentityMap`/`IdentitySet` as concrete types that SATISFY
+  `{[K]: V}` (the critics' "off the interface" was refused: the index-signature is the
+  capability, and a signature names the concrete type when it wants one); the serial deferred
+  until a program measures the scan as a problem. Two things the ruling asked for that do not
+  exist today ride along: concrete `Map<K, V>`/`Set<T>` names as annotation types, and
+  `Map<string, i32>()` explicit type arguments. Build items in ship order under **A15**; the
+  operator is routed to vl-de.
 
 ### Awaiting owner rulings (durable list; each row names its doc)
 
@@ -234,7 +246,8 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   does not rest on it);
   **(C)** untagged arms must differ in FIRST TOKEN or REQUIRED KEY SET → **OQ-7** amended;
   **(D)** build the static acyclic-shape predicate + depth-cap floor + N/4N timing probe →
-  §Cycles, with reference-identity keys split out OPEN as **OQ-11** (a language question) and
+  §Cycles, with reference-identity keys split out as **OQ-11** (a language question — since
+  RULED yes, identity 2026-09-01: the seen-set is an `IdentitySet<T>`, A15 item 4) and
   `serializeUnchecked` still deferred;
   **(E)** VLB header carries an 8-byte wire-relevant shape fingerprint → new **OQ-10**;
   **(F)** **OQ-6 REVERSED** — newtypes accepted transparently, erased at emit, brand kept by
@@ -243,7 +256,7 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   plus a parser and a renderer, not a pull lexer with hand codecs; §Approach 1 is being
   re-derived with a POSITION axis as separate in-flight work.
   Still open in that section: OQ-2/OQ-3/OQ-4 (full briefs with recommendations, awaiting a
-  ruling) and OQ-11. Engineering fallout filed: D1008 (`u8[]` struct field, clause 2),
+  ruling). Engineering fallout filed: D1008 (`u8[]` struct field, clause 2),
   D1009/D1010 (`null` membership in a recursive union at the checker — stage 1 ships around
   both with one-line workarounds), D1011 (host `print` of an f64 breaks a halfway tie
   to odd where `toString` and the spec round to even; host-side, #2248), plus the routing table in the
@@ -1054,10 +1067,43 @@ in-language GC knobs.
   (`type Handle<T> = new …`), an OPAQUE type with runtime identity (`x is EntityId` — a newtype
   has no tag by construction), and a newtype as a MAP KEY (a pre-existing map-key-grammar gap a
   plain alias hits too).
-- 🟡 **A15. Equality.** REMAINING: a referential-identity operator (`===` / `identical`, O(1) `ref.eq`);
-  `boolean`→i32 coercion when storing a comparison result; SELF-HOST struct/function-value equality
-  (guarded loudly today — and note the `call_ref`-ABI wrinkle: funcrefs admit no `ref.eq`, so
-  function-identity compare needs an identity token on the closure struct).
+- 🟡 **A15. Equality — RULED 2026-09-01** (`docs/identity-design.md` §0 carries the ten rulings;
+  `docs/internals/identity-critique-synthesis.md` the evidence). Build items in SHIP ORDER, each
+  independent of the next, the API fixed by the ruling:
+  1. **`===`/`!==`** — one `ref.eq`; operands struct / list / map / function / nullable-of-one;
+     a union of struct arms by PAYLOAD (rides D989's unboxing); a function by table index + env
+     `ref.eq` (today's `==` lowering under the new spelling), with `==` on a function becoming a
+     CHECK ERROR and a function-field struct refusing `==` by field name; `null === null` static
+     `true`, `x === null` hinted to `== null`; the check-error template with three arms (scalar /
+     string / union-with-scalar-arm) rendered at the user's spelling; the generic constraint
+     reported at the call's argument like `+`. **Acceptance is a VALUE TABLE, never a compile**
+     (D989's near-miss: one side unboxed compiled clean and printed `1 == 2` as `true`): same
+     object true · two equal objects false · across union arms false · `null === null` true ·
+     inside AND outside an `is` guard · `mk(1) === mk(1)` false · `const a = f; const b = f;
+     a === b` true · a newtype fixture proving `Id` never prints as `string`. → **vl-de**.
+  2. **Struct keys for `Map`/`Set`** — key-eligible = `==`-comparable; hash and `==` share one
+     lowering (D1017 first); `-0.0` folds into `0.0` in the hash; the NaN-key and mutable-key
+     rules go in the `Map` header.
+  3. **`Set<T>`** (C2.2, unbuilt), the concrete names `Map<K, V>` / `Set<T>` as annotation-legal
+     types (`Map<string, i32>` is `unknown type` today — only `{[string]: i32}` works), and
+     TS-style explicit type arguments on a call (`Map<string, i32>()` is a parse error today;
+     `f<a>(b)` becomes a generic call and the relational chain `f < a > (b)` is given up, as TS
+     does).
+  4. **`IdentityMap<K, V>` / `IdentitySet<K>`** on the flat-scan rep — the 7-field map struct
+     with `ref.eq` as the probe compare and `index`/`hashes` unused; `IdentityMap <: {[K]: V}`,
+     `IdentitySet` on the sequence read core like `Set`; `K` = anything `===` accepts; header:
+     identity keys keep objects alive, insertion-ordered. Two permanent std names →
+     `std-api-reviewer` pass. Closes serde OQ-11 (the cycle seen-set becomes an
+     `IdentitySet<T>`).
+  5. **The serial — ONLY when a program measures the scan as a problem.** Lazy `i64` on a private
+     heap type per keyed class (the `repCanonKey` seam), 0 = unassigned, mixed through
+     `fbI32HashMix`, resolved by `ref.eq` (a SEED, never an identity — a wrap is a slowdown).
+     Prerequisite: a declared-vs-rep field split in the emitter (`emitStructEqRec` walks the rep
+     count today and would compare the slot; `emitStructExprAsVariantBox` copies field-for-field;
+     `repStructSlotsTwin` is computed twice and must agree). `flat` classes get no slot and stay
+     on the scan. Acceptance: synthesis §2c's four cells + the N/4N timing probe (fail above 6×).
+  Still REMAINING from before, unchanged: `boolean`→i32 coercion when storing a comparison
+  result; SELF-HOST struct/function-value equality (guarded loudly today).
 - 🟡 **A16. Literal-union types.** REMAINING: the **enum representation** (i32 tag for a closed
   literal union — see `docs/guide/unions.md`); a literal union read *inside* a body softens to base
   (coarser member-narrowing there than at the call boundary).
