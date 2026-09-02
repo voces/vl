@@ -26,7 +26,7 @@ warning. Implemented, with current depth:
 | Go-to-definition | Local (`definitionAt`) + cross-file to the exporting sibling (`importedNameSources`), incl. jumps **into std** via the read-only `vl-std:` scheme. |
 | Find references | Single-file (`referencesAt`) with cross-module fallback: per-candidate compiles over open buffers + a capped disk crawl (`referencesInEntry` × `crossFileReferences`). |
 | Formatting (document) | Whole-document via the seed's `formatSrc`, one full-range edit. No range / on-type (formatter is whole-doc by design). |
-| Code actions | Quick fixes for exactly four lint codes: `unused-variable` (remove / `_`-prefix), `unused-function` (`_`-prefix), `unused-import` (remove specifier or line), `prefer-const` (`let`→`const`). Plus a line-overlap cache so fixes appear when the cursor is off the exact range. |
+| Code actions | Quick fixes for exactly five lint codes: `unused-variable` (remove / `_`-prefix), `unused-function` (`_`-prefix), `unused-import` and `duplicate-import` (remove specifier or line — one arm, one anchor), `prefer-const` (`let`→`const`). Plus a line-overlap cache so fixes appear when the cursor is off the exact range. |
 | Inlay hints | Inferred types on unannotated `let`/`const` and function returns (`inlayHintsAt`), range-filtered. |
 | Semantic tokens | Full-document only: identifiers by binding kind (`tokensAt`) + member property/method (`memberTokensAt`) + lexical keywords/operators/literals/comments (`lexicalTokensAt`). No delta, no range — fine at measured latencies. |
 | Run (VS Code command) | `vital.runFile` (Ctrl+F5, editor title/context menu): `vl run` in a reused integrated terminal, dirty-buffer temp mirroring, binary probe with actionable error. |

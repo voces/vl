@@ -206,6 +206,19 @@ Deno.test("unused-import dispatches ONLY the remove-import fix (no `_`-prefix)",
   );
 });
 
+Deno.test("duplicate-import dispatches the same remove-import fix", () => {
+  // The `duplicate-import` lint points at the SECOND, redundant specifier's name
+  // token — the same anchor shape `unused-import` uses — so the remove-import fix
+  // applies unchanged and "remove one" is exactly what it does.
+  const src = 'import { a, b } from "./x"\nimport { a } from "./x"\n';
+  const fixes = quickFixesForDiagnostic(src, "duplicate-import", rangeOf(1, 9, 10));
+  assert(fixes.length === 1, `expected exactly one import fix, got ${fixes.length}`);
+  assert(
+    applyEdit(src, fixes[0].edits[0]) === 'import { a, b } from "./x"\n',
+    `applied: ${JSON.stringify(applyEdit(src, fixes[0].edits[0]))}`,
+  );
+});
+
 Deno.test("unused-function dispatches ONLY the `_`-prefix fix", () => {
   // `function dead(...)` — diagnostic range starts at the name `dead` (col 9).
   const src = "function dead(n: i32): i32 {\n  return n\n}\n";

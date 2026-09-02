@@ -2329,6 +2329,13 @@ seed from current `compiler/*.vl` in ~40s.*
     discarded). Retain the *as-written* type syntax (or its span) so the AST is lossless for
     types — also benefits hover/inlay rendering (D1/D6/D8).
 - 🟡 **D — Project-wide unused-export hints.** Core shipped: debounced workspace pass on save (+ 3 s idle), use-map over ≤500 `.vl` files, `hint`/`unnecessary` diagnostics for zero-reference exports. REMAINING: **struct field–level unused-export analysis** — deferred because VL's structural typing makes field-level usage tracking fuzzy (a field could be "used" via a widened receiver type without any import); a future refinement could cross-check field names against known call sites once structural subtyping is tightened.
+- ⬜ **D — Organize Imports should drop a DUPLICATE specifier too.** The `duplicate-import`
+  lint (#2393) already names every repeated specifier and its quick-fix removes one — but
+  `server.ts`'s Organize Imports filters the lint stream to `unused-import` alone, so a
+  one-key "organize" leaves the duplicate behind. Adding the code to that filter is one
+  line; what needs checking first is `organizeImportEdits` over TWO IDENTICAL ranges in
+  different statements (the unused case never produces two edits that delete the same
+  text), which is why this is a follow-up and not part of #2393.
 - ⬜ **D8. Hover verbosity step-expansion.** Alias-name preservation is done (see `CHANGELOG.md`).
   REMAINING: the interactive shallow↔deep verbosity stepper — expand one alias layer at a time
   on demand via the proposed LSP 3.18 hover-verbosity API (`HoverParams.context.verbosityLevel`

@@ -46,6 +46,12 @@
 //                           to it (binding-keyed, via the scope stack), a UFCS
 //                           member-call property, or a TYPE position (an
 //                           annotation/`is`/union-variant name segment).
+//   - duplicate-import    : the SAME specifier written twice — one local name
+//                           bound twice from one source by two specifiers that
+//                           also agree about the imported name. The second one
+//                           binds nothing new (D1120 rules it legal); this says
+//                           so. Two DIFFERENT declarations under one name are
+//                           the driver's ERROR, not this.
 //
 // NOT ported (need metadata the native front end does not produce):
 //   - empty-intersection  : needs the `emptyIntersectionInfo` records the type
@@ -100,34 +106,6 @@ import {
 import { P, declNameTokOf, nodeChildren, nodeToks } from "./ast"
 // The free INDEX-OPERATOR declaration-name encoding (B14).
 import { OP_INDEX_GET, OP_INDEX_SET, opDeclLabel, opDeclOpOf } from "./ast"
-import {
-  ArrayLit,
-  AsExpr,
-  BinExpr,
-  Block,
-  BoolLit,
-  BreakStmt,
-  Call,
-  ContinueStmt,
-  FieldInit,
-  ForIn,
-  ForRange,
-  FuncDecl,
-  Ident,
-  IfStmt,
-  Index,
-  IsExpr,
-  LetDecl,
-  Member,
-  NumLit,
-  ObjLit,
-  OptMember,
-  Paren,
-  Program,
-  RetStmt,
-  Unary,
-  WhileStmt,
-} from "./ast"
 
 // ── Diagnostic sink ──────────────────────────────────────────────────────────
 // Parallel arrays, mirroring the native checker's `T.diags` shape but kept as a
@@ -220,7 +198,7 @@ export function lint(progRoot: i32) {
   const root = P.nodes[progRoot]
   if root is Program {
     const stmts = root.progStmts
-    // Rule order: unused-variable, unused-imports, unused-function,
+    // Rule order: unused-variable, unused-imports, duplicate-imports, unused-function,
     // prefer-const, then one full-program walk per structural rule. Display order is position-sorted
     // downstream (the CLI's stable sort), so the emit sequence here only breaks
     // same-position ties. The binding/reference scan drives the binding rules
@@ -228,6 +206,7 @@ export function lint(progRoot: i32) {
     collectBindingsAndRefs(progRoot)
     unusedBindings()
     unusedImports()
+    duplicateImports(stmts)
     unusedFunctions(stmts)
     preferConst()
     lintWalk(lintRuleUnreachable, progRoot)
@@ -1772,18 +1751,123 @@ function unusedBindings() {
 // (that would need aliasing); the fix is to remove the specifier. Anchored at
 // the imported NAME token. A re-export never registers a binding (it is not an
 // `ImportDecl`), so re-exported names are never flagged.
+//
+// A NAME BOUND BY TWO IMPORTS REPORTS ONCE, AT THE LAST OF THEM. Binding-keyed
+// use tracking resolves an occurrence to the INNERMOST visible binding, so with
+// `import { used } from "./h"` written twice the SECOND binding absorbs every
+// use and the FIRST reads unused — `Unused import \`used\`` on a line whose name
+// is referenced two lines down. Two import bindings of one local name are the
+// same declaration in any program that compiles (D1120 refuses the other case),
+// so the twin's use IS this one's use; and where the name is genuinely unused,
+// the last binding still reports it, once. The redundancy itself is
+// `duplicate-import`'s to report — which it does, at the same token.
 function unusedImports() {
   let i = 0
   while i < declNodes.length {
     if declKinds[i] == 2 && declUsed[i] == 0 {
       const name = declNames[i]
-      if !propNamesHas(name) && !typeNamesHas(name) {
-        lintEmitAtTok(
-          "unused-import",
-          "Unused import `" + name + "` (remove it)",
-          "warning",
-          declToks[i],
-        )
+      if !importNameReboundLater(i, name) {
+        if !propNamesHas(name) && !typeNamesHas(name) {
+          lintEmitAtTok(
+            "unused-import",
+            "Unused import `" + name + "` (remove it)",
+            "warning",
+            declToks[i],
+          )
+        }
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// True when a LATER import binding (kind 2) binds `name` too — i.e. the entry at
+// `i` is shadowed by an identical-named import further down the module.
+function importNameReboundLater(i: i32, name: string) {
+  let k = i + 1
+  while k < declNodes.length {
+    if declKinds[k] == 2 && declNames[k] == name { return true }
+    k = k + 1
+  }
+  false
+}
+
+// duplicate-import: ONE specifier written twice. Fires when a later import
+// specifier repeats an earlier one in all three of its parts — the SOURCE text
+// (`impPath`, quotes stripped), the imported NAME, and the LOCAL binding — so the
+// second one introduces nothing: `import { area, box } from "./a"` followed by
+// `import { area } from "./a"`, or the same name twice inside one brace list.
+//
+// WHY ALL THREE PARTS AND NOT JUST (source, local). Because the two-part test is
+// the DRIVER's error, not a lint: `import { area as a } from "./a"` beside
+// `import { box as a } from "./a"` binds `a` to two different declarations, which
+// `modDiagDupImport` refuses as `Duplicate binding "a"` (D1120). A rule that fired
+// there too would warn about a program that does not compile, and would suggest
+// "remove one" for a choice the author has to make. Requiring the imported name to
+// agree leaves exactly the redundant case here and the ambiguous case there.
+//
+// WHY THE SPECIFIER TEXT AND NOT THE RESOLVED TARGET. D1120's ERROR tests the
+// resolved merged target on purpose — two spellings that land on one declaration
+// are unambiguous and must keep running. A LINT is a different question: it reports
+// what the author wrote, and `import { area } from "./b"` where `b.vl` re-exports
+// `area` from `./a` is not a repeated specifier, it is one name reached two ways.
+// The owner ruled that shape stays legal and unremarked (2026-09-02), and keying on
+// identical specifier text is what delivers that for free — the lint is per-file and
+// parse-only, so it cannot resolve a re-export chain even if it wanted to. It also
+// means `err-duplicate-import-two-modules` (two different sources) never trips it.
+//
+// Severity `warning`, message in the house style of `Unused import \`x\` (remove
+// it)`, anchored at the SECOND occurrence's imported NAME token — the same anchor
+// `unused-import` uses, so the LSP's remove-import quick-fix (which dispatches on
+// the code and finds the specifier under the range) applies unchanged.
+function duplicateImports(stmts: i32[]) {
+  const seenPath: string[] = []
+  const seenName: string[] = []
+  const seenLocal: string[] = []
+  let i = 0
+  while i < stmts.length {
+    const ix = stmts[i]
+    if ix >= 0 && ix < P.nodes.length {
+      const s = P.nodes[ix]
+      if s is ImportDecl {
+        let q = 0
+        while q < s.impLocals.length {
+          const local = s.impLocals[q]
+          // `impNames` is parallel to `impLocals` (the parser pushes both per
+          // item); read it defensively anyway — every other table read here is.
+          let nm = local
+          if q < s.impNames.length { nm = s.impNames[q] }
+          let dup = false
+          let k = 0
+          while k < seenPath.length {
+            if seenPath[k] == s.impPath {
+              if seenName[k] == nm && seenLocal[k] == local { dup = true }
+            }
+            k = k + 1
+          }
+          if dup {
+            // A repeat is NOT recorded, so a third copy still matches the first
+            // and warns too — one diagnostic per redundant specifier.
+            let tk = -1
+            if q < s.impNameToks.length { tk = s.impNameToks[q] }
+            lintEmitAtTok(
+              "duplicate-import",
+              "Duplicate import `" +
+                local +
+                "` from \"" +
+                s.impPath +
+                "\" (remove one)",
+              "warning",
+              tk,
+            )
+          } else {
+            seenPath.push(s.impPath)
+            seenName.push(nm)
+            seenLocal.push(local)
+          }
+          q = q + 1
+        }
       }
     }
     i = i + 1

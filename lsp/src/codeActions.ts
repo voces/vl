@@ -344,10 +344,16 @@ export const quickFixesForDiagnostic = (
       // mechanical fix).
       return [prefixWithUnderscoreFix(range)];
     }
-    case "unused-import": {
+    case "unused-import":
+    case "duplicate-import": {
       // Imports get ONLY the remove-import fix — no `_`-prefix (that would need
       // aliasing, not a bare `_`-insert). Removes the specifier, or the whole
       // `import` line when it was the only one.
+      //
+      // `duplicate-import` shares the arm because it shares everything the fix
+      // reads: the same anchor (the specifier's NAME token) and the same repair
+      // (delete that specifier). Its diagnostic points at the SECOND, redundant
+      // occurrence, so removing it is exactly "remove one".
       const remove = removeImportFix(source, range);
       return remove ? [remove] : [];
     }

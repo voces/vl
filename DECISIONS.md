@@ -4591,3 +4591,57 @@ any compiling program — import-vs-import is this rule, import-vs-declaration i
 `modRenameFirstBySid` and `modRenameLastBySid` are therefore no longer separated by any
 witness, and collapsing them would redden nothing. They are kept: a collapse now needs its own
 argument, since the case that used to supply the counter-example cannot.
+
+**ADDENDUM (owner, 2026-09-02): the error is confirmed, and the REDUNDANT half now LINTS.**
+Shown the diagnostic the same day it landed, the owner's words were "that's a good error" —
+so the rule above stands as filed. On the half it deliberately leaves running, the ruling was
+**"imports from the same source twice should lint"**: `duplicate-import`, a `warning` reading
+`` Duplicate import `area` from "./a" (remove one) ``, anchored at the SECOND occurrence's
+name token — the same anchor `unused-import` uses, so the LSP's remove-import quick-fix
+serves it with a one-line dispatch change. Redundant is not ambiguous, and it is not silent
+either.
+
+**The lint keys on the SPECIFIER TEXT where the error keys on the resolved DECLARATION, and
+that difference is the whole design.** The error asks "do these two bindings mean different
+things?", which only the merged target can answer. The lint asks "did you write the same
+specifier twice?", which is a question about the source and which a per-file, parse-only pass
+can answer at all — `lint.vl` has no module graph and runs on every keystroke. Requiring all
+THREE parts to agree (source text, imported name, local binding) is what keeps the two rules
+from overlapping: `import { area as a } from "./a"` beside `import { box as a } from "./a"`
+agrees on source and local but not on name, and is the ERROR's domain — measured, it reports
+`Duplicate binding "a": … imports it from both "./a" and "./a" — rename one`, naming one
+specifier twice because it is one specifier, which is correct and stays as it is.
+
+**A RE-EXPORT CHAIN LANDING ON ONE DECLARATION IS NEITHER, AND THAT WAS THE CHEAP ANSWER.**
+`import { area } from "./a"` beside `import { area } from "./b"` where `b.vl` re-exports
+`area` from `./a` reaches one declaration through two specifiers. Measured 2026-09-02: no
+error, no warning, prints `10`. The owner ruled an error there would be fine but is not worth
+analysis that is not free — and keying the lint on the text is what makes leaving it legal
+free, since `"./a"` is not `"./b"` and there is nothing to compare. Pinned as a program that
+must keep RUNNING: `tests/cases/modules/duplicate-import-reexport-chain/`.
+
+**THE PRICE, RE-MEASURED BY THE COMPILER: 122, AND THEY WERE FOUR WHOLE REDUNDANT BLOCKS.**
+`vl check` over `compiler/` and `std/` in DIRECTORY mode — each file its own entry, so nothing
+is counted once per importer, which the single-file mode does and which turns 122 into 989 —
+found **122 hits, 0 in std**, every one inside a second `import { … } from "./ast"` statement
+whose every specifier the first already carried: `format.vl` 32, `lint.vl` 26, `typecheck.vl`
+35, `wasmEmit.vl` 29. Four block deletions, no specifier moved, the emitted compiler unchanged
+in behaviour. The compiler's own source is now `duplicate-import`-clean, which is the standing
+condition `scripts/lint-self.sh` enforces from here.
+
+**The "126" above did not reproduce, and the three-part key is NOT the explanation.** A
+by-hand scan of the same tree keyed on (source, LOCAL) alone — the two-part reading the
+sentence describes — also returns 122, so the four are not specifiers the narrower key
+excludes; they are a number nothing here re-derives. Left standing as filed rather than
+silently corrected, because the count is not what that paragraph is for and the discrepancy is
+the more useful thing to record: **122 is the number a tool produced from the tree on
+2026-09-02, and it is the one to re-derive rather than quote.**
+
+**A SECOND WARNING ON ONE MISTAKE IS A BUG, AND MAKING DUPLICATES VISIBLE EXPOSED ONE.**
+Binding-keyed use tracking resolves an occurrence to the INNERMOST binding, so with a value
+import written twice the SECOND binding absorbed every use and the FIRST read `Unused import`
+— on a line whose name is referenced two lines down. `unusedImports` now skips a binding that
+a LATER import binding of the same name shadows: two import bindings of one local name are
+the same declaration in any program that compiles (this rule refuses the other case), so the
+twin's use is this one's use, and where the name really is unused the LAST binding still
+reports it once. One mistake, one diagnostic, at the specifier the fix should delete.
