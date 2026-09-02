@@ -32847,11 +32847,11 @@ Repro (the direct spelling `function pick(v: string, ...): string | "err"` RUNS 
 
 ### D1044 — a UFCS call that OMITS a defaulted tail argument is refused `no field 'scale' on Box` in any module build that merges a `self`-function-bearing module (`std:test` is one, so EVERY test file); the direct spelling and the supplied-argument spelling run
 
-**loud check reject `no field 'scale' on Box` on a program whose single-file form prints `15` ·
-filed 2026-09-02 (vl-b7) while probing the matcher-anchored `__callsite__` design (DECISIONS
-§"A failed assertion is located at the MATCHER") — it blocks that design outright, because
-`toEqual(self, expected, caller = __callsite__)` would refuse `expect(1).toEqual(2)` in every
-test file**
+**closed 2026-09-02 (#2371) · runs, `15` · was a loud check reject `no field 'scale' on Box`
+on a program whose single-file form printed `15` · clause 2 · the merge's UFCS alias registry
+matched the DECLARED parameter count EXACTLY, so a call omitting a defaulted tail registered
+no alias at all (`driver.vl` `modSelfFnTarget`) · `tests/cases/modules/default-params-ufcs/`
+pins all three omitting spellings**
 
 Repro:
 
@@ -32860,7 +32860,13 @@ Repro:
     function box(v: i32): Box { return { v: v } }
     function scale(self: Box, by: i32 = 3): i32 { return self.v * by }
     print(box(5).scale())
-    // 5:13: no field 'scale' on Box
+    // 15
+
+* **WHY IT MATTERED.** Filed 2026-09-02 (vl-b7) while probing the matcher-anchored
+  `__callsite__` design (DECISIONS §"A failed assertion is located at the MATCHER"), which it
+  blocked outright: `toEqual(self, expected, caller = __callsite__)` would have refused
+  `expect(1).toEqual(2)` in every test file, because `std:test` declares four
+  `self`-functions and so puts every `*.test.vl` in the failing mode.
 
 * **THE ABLATION, seed 42604b65 (origin/master), every cell run:**
 
@@ -32881,23 +32887,96 @@ Repro:
   not an ingredient. `std:test` declares `not`/`toEqual`/`toBeTrue`/`toBeFalse`, so every
   `*.test.vl` is in the failing mode.
 
-* **WHERE TO LOOK.** `ufcsCallTy` (`typecheck.vl`) resolves the callee through
-  `ufcsAliasOf(plainName)`, then reads the declared parameter list AFTER `self` via
-  `declParamsAfterSelf(name)` → `fnDeclIx[name]`, and computes the LOW end of the arity range
-  with `fnRequiredArity` over that list. If the alias/mangling leaves `fnDeclIx` keyed under a
-  name `declParamsAfterSelf` does not find, `uDecl` is EMPTY, the guard
-  `uDecl.length == params.length - 1` fails, `uRequired` stays at `params.length - 1`, and
-  `args.length < uRequired` returns -1 — which the member-access caller reports as
-  `no field`. That is a prediction from the code, not a measurement: PRINT what
-  `declParamsAfterSelf` returns for the filed witness before touching anything
-  ([[vl-probe-the-rung-input]]). The direct spelling running is what says the DECLARATION
-  side (defaults, `fnRequiredArity`) is fine and the UFCS resolution is what disagrees.
+* **THE PREDICTION WAS REFUTED BY THE FIRST PROBE, and the refutation was free.** The row
+  filed a mechanism read off `ufcsCallTy`: that the alias/mangling leaves `fnDeclIx` keyed
+  under a name `declParamsAfterSelf` cannot find, so `uDecl` comes back EMPTY and
+  `args.length < uRequired` returns -1. **`declParamsAfterSelf` is not the rung, and it is
+  not even reached with the right name.** Two measurements, both cheap, both disagreeing
+  with the prediction:
 
-* **THE FIX IS GRADED ON THREE SPELLINGS IN A MODULE BUILD**, never on the single-file
-  form: the user's own defaulted `self`-function, an IMPORTED one, and one whose default is
-  `__callsite__` (the anchor must stay on the method token, measured col 14 above). Plus the
-  named-argument form `box(5).scale(by: 2)` beside them, since `ufcsCallTy` has a separate
-  arm for it.
+  **(a) A DISCRIMINATING EXPERIMENT THAT NEEDED NO COMPILER EDIT.** The alias table is keyed
+  by the PLAIN property name, so putting ONE exact-arity call site elsewhere in the same
+  module should rescue the omitting site iff the defect is in alias REGISTRATION. It does:
+
+      print(box(1).scale(2))   // 2
+      print(box(5).scale())    // 15  — the SAME line that refuses without the line above
+
+  Under the filed prediction an unrelated sibling call could not matter. **Run this shape
+  before instrumenting anything**: it cost one file and settled the layer.
+
+  **(b) WHAT THE PROBE PRINTED** (a `tErr` at the top of `ufcsCallTy` gated on a callee named
+  `zzprobe`, so no other program can reach it; the witness with `scale` renamed):
+
+  | spelling | alias rows | `ufcsAliasOf` | `lookup(alias)` | `fnDeclIx` | `declParamsAfterSelf` | `lookup(name$m0)` |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | module, tail OMITTED | **0** | `zzprobe` (identity) | **-1** | **-1** | **0** | **329** |
+  | module, exact arity | 1 | `zzprobe$m0` | 329 | 919 | 1 | 329 |
+  | single file, tail omitted | 0 (no merge) | `zzprobe` | 46 | 24 | 1 | -1 |
+
+  Read the first row against the last column: the function **is** in the merged program, at
+  `329`, under `zzprobe$m0`. What is missing is the alias row that maps the plain property
+  onto it, so `ufcsAliasOf` returns the plain name unchanged, `lookup` answers -1, and
+  `ufcsCallTy` returns -1 at its FIRST guard — 30 lines above `declParamsAfterSelf`. The
+  `0` in the `declParamsAfterSelf` column is that function being asked about `zzprobe`, a
+  name the merged program does not define; asked about the mangled name it answers `1`, as
+  the middle row shows. Everything the prediction named was already correct.
+
+* **THE MECHANISM: `modSelfFnTarget` (`compiler/driver.vl`) MATCHED AN ARITY COUNT WHERE ITS
+  TWO CONSUMERS MATCH AN ARITY RANGE.** The merge cannot rewrite a call's property string (a
+  same-named struct field must keep precedence, decided by the receiver TYPE the rename
+  walker lacks), so it records a plain→mangled alias for every member call whose property
+  resolves through a registry of free `self`-functions. That resolution tested
+  `modSelfFnArity[i] == argc + 1` against the DECLARED count, so `box(5).scale()` on
+  `scale(self: Box, by: i32 = 3)` matched no row, `ufcsAliasAdd` was never called, and the
+  call fell through to the member-access caller's `no field`. The registry now stores
+  `fnRequiredArity` beside the declared count and matches the closed range — **the same
+  range both readers of that alias already enforced**: the checker's `ufcsCallTy`
+  (`fnRequiredArity(uDecl)`) and the emitter's `drwSelfFnOf` (`fnRequiredArity(ps)`).
+
+* **THE FIXTURE THAT COULD NOT SEE IT WAS ALREADY IN THE TREE, AND SAYS SO IN ITS OWN
+  COMMENT.** `tests/cases/functions/default-params-ufcs.vl` pins this exact arity range and
+  its header reads "both halves (the checker's `ufcsCallTy`, the emitter's `drwSelfFnOf`) now
+  read the declaration's range so they cannot drift apart". There were **three** halves. The
+  fixture is SINGLE-FILE, and the merge is precisely what a single-file build does not run —
+  the same shape as [[vl-second-delivery-position]], one layer earlier: the gap was not a
+  delivery position but the pass that never runs in the spelling the fixture uses.
+
+* **ONE EXACT-ARITY CALL SITE ANYWHERE RESCUES EVERY OMITTING SITE OF THE SAME NAME**, so a
+  fixture writing `box(5).scale()` beside `box(5).scale(2)` passes on the BROKEN compiler and
+  pins nothing. `tests/cases/modules/default-params-ufcs/` therefore gives each omitting call
+  a function nothing else calls at exact arity (`scale`, `grow`, `locOf`), and puts the
+  already-working spellings on a separate `mul`. Verified: on the pre-fix seed the fixture
+  fails at all three, on the fixed seed it prints its seven declared lines.
+
+* **GRADED IN A MODULE BUILD, never the single-file form** (measured 2026-09-02, A = pristine
+  `origin/master` seed, B = the fix, both at `VL_STD=$PWD/std`):
+
+  | cell | A (master) | B (fixed) |
+  | --- | --- | --- |
+  | the filed witness | check reject `no field 'scale' on Box` | **`15`** |
+  | the user's own defaulted `self`-fn, omitted | check reject | **`15`** |
+  | IMPORTED `grow(self: Box, by: i32 = 4)`, `box(5).grow()` | check reject `no field 'grow' on Box` | **`20`** |
+  | `__callsite__` default, `box(5).locOf()` — MODULE | check reject `no field 'locOf' on Box` | **`14`** |
+  | `__callsite__` default, `box(5).locOf()` — single file | `14` | **`14`** (the anchor does not move) |
+  | named arg `box(5).scale(by: 2)` | `10` | `10` |
+  | `box(5).scale(2)` / `scale(box(5))` / `scale(box(5), 4)` | `10` / `15` / `20` | `10` / `15` / `20` |
+  | over-arity `box(5).scale(1, 2, 3)` | check reject `no field` | check reject `no field` (unchanged) |
+  | wrong receiver `o.scale()` on an `Other` | check reject `no field 'scale' on Other` | unchanged |
+  | a callable FIELD named `scale` shadowing the free fn | `99` (field wins) | `99` (field wins) |
+
+  A 17-row delivery matrix over the same defaulted `self`-function — binding, return,
+  argument, assignment, list element, struct field, binary operand, two- and three-deep
+  omission, named args skipping a MIDDLE default, a generic `self`, and a `string` receiver —
+  prints its expected value at every position, so the defaults are demonstrably FILLED and not
+  merely accepted.
+
+* **A NEIGHBOUR THIS DID NOT TOUCH, and it is not new.** `ufcsAliasFrom`/`ufcsAliasTo` hold
+  ONE row per plain name and `ufcsAliasOf` takes the first, so two modules whose own
+  `self`-functions share a source name collide. Measured on both seeds, identically: an
+  entry declaring `tag(self: B, …)` while a dependency calls `mkA().tag(…)` refuses one of
+  the two sites with `no field 'tag' on B` — **with no defaults anywhere in the program**, so
+  the widened match neither causes nor worsens it. It is loud, not silent. Unfiled; the fix
+  is a registry keyed by (plain name, module) rather than by plain name.
 
 
 ---
