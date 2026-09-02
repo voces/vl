@@ -106,6 +106,7 @@ import {
   mkReturn,
   mkUnary,
   mkWhile,
+  nodeChildren,
   tsMentionsAnyName,
 } from "./ast"
 import { PIN_SIGKEY } from "./ast"
@@ -2054,7 +2055,18 @@ function monoCloneLambdaSubst(
         if captureCountOf(feC) > 0 { capOnly = true }
       }
     }
+    // D1220 — A BODY SPELLING IS THE THIRD REASON TO CLONE, and the two above only read the
+    // signature. `() => gv is T` takes no parameter, annotates no return and captures
+    // nothing, so both rungs above answer no — while `monoFoldTyParamLayout` below has an
+    // `is T` to substitute. Sharing one body across instances then answers the FIRST pin's
+    // spelling at every pin: silently wrong, not invalid wasm. This is the same question
+    // `monoLamNodeIsTemplate`'s fourth rung asks, and the two must agree or the prune stubs
+    // a template no clone replaced.
+    let bodyTP = false
     if !any && !capOnly {
+      if monoNodeNamesTyParam(a.fnBody, typarams) { bodyTP = true }
+    }
+    if !any && !capOnly && !bodyTP {
       monoNoteLamNode(monoLamShared, fnIx)
       return -1
     }
@@ -2318,6 +2330,37 @@ function monoEnclosingTyParams(fe: i32, out: string[]) {
 // WITHOUT THIS THE SUBSTITUTION BUYS NOTHING, because the template is emitted whether or not
 // an instance exists: a generic that is never CALLED still has its lambda lifted, and
 // `checkParams` reaches the slot directly. The two rungs are one landing.
+// Does the subtree at `ix` carry a SPELLING that `monoFoldTyParamLayout` substitutes — an `is`
+// whose check type mentions a type parameter, or a `T.field` layout constant? These are the
+// two places a type parameter reaches the emitter as source text rather than as an operand
+// type the emitter re-derives, so they are exactly the body facts that make one lifted lambda
+// wrong at every pin but the first.
+//
+// Walked through `nodeChildren` rather than a second copy of the fold's arm ladder: the two
+// would drift, and the generic walker already covers a nested `FuncDecl`'s parameters, return
+// annotation and body, which is the shape this has to see through.
+function monoNodeNamesTyParam(ix: i32, typarams: string[]) {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  if typarams.length == 0 { return false }
+  const n = P.nodes[ix]
+  if n is IsExpr {
+    if monoAnnHasTyParam(n.isVariant, typarams) { return true }
+  }
+  if n is Member {
+    const mo = P.nodes[n.memObj]
+    if mo is Ident {
+      if monoTyParamOf(mo.identName, typarams) != "" { return true }
+    }
+  }
+  const kids = nodeChildren(ix)
+  let i = 0
+  while i < kids.length {
+    if monoNodeNamesTyParam(kids[i], typarams) { return true }
+    i = i + 1
+  }
+  false
+}
+
 function monoLamNodeIsTemplate(fnIx: i32, typarams: string[]) {
   if typarams.length == 0 { return false }
   const fn = P.nodes[fnIx]
@@ -2359,6 +2402,14 @@ function monoLamNodeIsTemplate(fnIx: i32, typarams: string[]) {
     if feIx >= 0 {
       if captureCountOf(feIx) > 0 { return true }
     }
+    // D1220 — THE FOURTH RUNG: A TYPE PARAMETER NAMED IN THE BODY. The three above read the
+    // written signature and the capture count, and a lambda can mention `T` in none of them:
+    // `() => gv is T` has no parameters, an inferred return and no captures. Its only mention
+    // of `T` is the `is` SPELLING, which `monoFoldTyParamLayout` substitutes per pin — so one
+    // shared body answers the first instantiation's spelling at every instantiation and the
+    // program is check-clean SILENTLY WRONG. Broad in the direction D943 argued for: an extra
+    // clone is a correct clone, only larger.
+    if monoNodeNamesTyParam(fn.fnBody, typarams) { return true }
   }
   false
 }
