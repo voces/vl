@@ -31596,7 +31596,10 @@ Repro:
 
 ### D1033 — a STRING INDEX passed directly to a value-union parameter is check-clean invalid wasm when the string was narrowed out of a union carrying a RECURSIVE MAP arm; hoisting the index runs
 
-**check-clean invalid wasm · check rc 0 · `type mismatch: expected (ref $type), found i32` · clause 1 · found 2026-09-02 by the coordinator verifying #2322's review, writing the plainest consumer of `std:json` (`k[i].toString()` in a loop over a narrowed string) · independently re-hit the same hour by the builder writing a probe that printed `toString(v[0])` for a string read out of a `Json` map · three ingredients, each measured alone**
+**runs, prints `97` — CLOSED 2026-09-02 by teaching [D1012](#d1012)'s narrowing-blind
+fallback to decline a `string` narrow as well as an array one · zero `runs` lost ·
+`tests/cases/strings/string-index-into-value-union-param.vl` · was check-clean invalid wasm,
+`type mismatch: expected (ref $type), found i32`, clause 1**
 
 Repro:
 
@@ -31635,6 +31638,21 @@ Repro:
   `std/json.vl`'s consumer paragraph beside [D1030](#d1030) and [D1029](#d1029).
 
 ---
+
+* **IT IS D1012'S MECHANISM ONE ARM OVER, which is why the recursive MAP arm is an ingredient
+  and a recursive LIST arm is not.** `mapReadMvSlot` carries a deliberately narrowing-BLIND
+  fallback so the frame pre-pass can resolve a union's map arm before any `is` narrow is
+  active. Blind is right there and wrong once a narrow IS active: `k[0]` over a `k` narrowed
+  to `string` is a CHAR read yielding an i32, not a map read. Claiming the map arm made the
+  argument boundary skip its box, so a raw i32 went where `(ref $uBox)` was expected. D1012
+  taught that fallback to decline an ARRAY narrow; this is the string arm of the same rule.
+
+  The hoisted spelling running is what pointed at the classifier rather than the lowering —
+  the box happens correctly the moment the value has a binding of its own.
+
+* **THE GUARD DECLINES A NARROW, NOT THE FALLBACK.** The map arm the fallback exists for is
+  pinned in the fixture and still reads as a map, which is the thing a wider fix would have
+  cost.
 
 ### D1034 — an `if`/`else` with ONE EMPTY BRANCH inside a VOID function is check-clean and TRAPS on `unreachable`; either branch, either outcome, and both non-empty runs
 

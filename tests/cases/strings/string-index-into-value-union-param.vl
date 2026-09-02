@@ -1,0 +1,86 @@
+// @run
+// @log 97
+// @log 97
+// @log 97
+// @log 2
+// @log 1
+// @hint redundant type annotation: `h` is inferred as `i32` — remove it to lean on inference
+// @hint redundant type annotation: `f` is inferred as `i32` — remove it to lean on inference
+// @hint redundant type annotation: `fs` is inferred as `string` — remove it to lean on inference
+// @hint redundant type annotation: `b` is inferred as `i32` — remove it to lean on inference
+// @hint redundant type annotation: `fh` is inferred as `i32` — remove it to lean on inference
+// @hint redundant type annotation: `fl` is inferred as `i32` — remove it to lean on inference
+// @hint redundant type annotation: `g` is inferred as `i32` — remove it to lean on inference
+// The annotations are DECLARED redundant, not deleted. `const b: i32 = k[0]` in particular
+// is the HOISTED control and its annotation is the thing being contrasted with the direct
+// argument; the rest name what each helper returns, which is how a reader sees that the
+// value-union parameter is the only union in the picture.
+//
+// Regression (silent-class-inventory D1033).
+//
+// `h(k[0])` where `k` is narrowed to the STRING arm of a union that also carries a RECURSIVE
+// MAP arm, and `h` takes a value union, was check-clean invalid wasm: `expected (ref $type),
+// found i32`. Hoisting the index into a local ran, which is what says the classifier and not
+// the lowering was wrong.
+//
+// IT IS D1012'S MECHANISM ONE ARM OVER. `mapReadMvSlot` carries a deliberately
+// narrowing-BLIND fallback so the frame pre-pass can resolve a union's map arm before any
+// `is` narrow is active. Blind is right there and wrong once a narrow IS active: `k[0]` over
+// a `k` narrowed to `string` is a CHAR read yielding an i32, not a map read. Claiming the map
+// arm made the argument boundary skip its box, so a raw i32 went where `(ref $uBox)` was
+// expected. D1012 taught that fallback to decline an ARRAY narrow; this adds the string one.
+//
+// THE REAL-WORLD SHAPE IS THE SECOND LINE. `toString` is the value union every program
+// reaches for, so `k[i].toString()` in a loop over a narrowed string is the first thing a
+// `std:json` consumer writes — which is how this was found twice in one hour, from two
+// different directions.
+type J = string | { [string]: J }
+
+function h(x: i32 | f64): i32 {
+  if x is i32 { return x }
+  0
+}
+
+function f(k: J): i32 {
+  if k is string { return h(k[0]) }
+  0
+}
+print(f("ab"))
+
+// the shape a consumer actually writes
+import { toString } from "std:fmt"
+function fs(k: J): string {
+  if k is string { return toString(k[0]) }
+  ""
+}
+print(fs("ab"))
+
+// the hoisted spelling, which always ran and must keep running
+function fh(k: J): i32 {
+  if k is string {
+    const b: i32 = k[0]
+    return h(b)
+  }
+  0
+}
+print(fh("ab"))
+
+// the other string op on the same narrowed receiver
+function fl(k: J): i32 {
+  if k is string { return k.length }
+  0
+}
+print(fl("ab"))
+
+// AND THE MAP ARM STILL READS AS A MAP — the guard declines a `string` narrow, not the
+// fallback itself, so the very arm it exists for is untouched.
+const m: { [string]: J } = Map()
+m["a"] = "z"
+function g(k: J): i32 {
+  if k is { [string]: J } {
+    const v = k["a"]
+    if v is string { return v.length }
+  }
+  0
+}
+print(g(m))
