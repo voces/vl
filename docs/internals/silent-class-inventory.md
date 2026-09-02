@@ -24226,6 +24226,21 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   what D972 closed, so this is the union-vs-union RESIDUE of that fix rather than a regression
   of it. Both operands being a box is the whole difference.
 
+* **THE KIND IS NEGATIVE — there is no single arm to unbox, and that is the whole shape of
+  the defect.** Probing the guard prints `k=NEGATIVE`: `emitUnionPayloadUnbox` was handed an
+  UNDETERMINED atom kind. It is written for the case where one operand's arm is known — which
+  is exactly the union-against-LITERAL shape D972 closed — and union-vs-union has no such arm
+  on either side.
+
+* **SO IT IS NOT A MISSING VALUE BOX, and the `vbI32Used` flag is not the blocker.** Removing
+  that flag check entirely (returning `vbI32Idx` unconditionally for kinds 0/1) leaves the
+  refusal exactly where it was. The message names a symptom one level below the cause.
+
+* The fix is the same shape as D973's struct-union equality: compare the two boxes' TAGS
+  first, then dispatch to a per-arm comparison, rather than unboxing one assumed arm. Until
+  that exists the guard is correct to refuse — narrowing it alone would hand `==` two boxes it
+  cannot compare.
+
 * Numbered in this session's block rather than the reporter's, so the range reservations stay
   clean.
 
