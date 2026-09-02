@@ -33408,10 +33408,60 @@ Repro:
 
 ### D1047 — literal `is` over a union with a STRUCT (or container) arm beside the literal's base atom is refused `literal `is` over a struct union is not supported`, while the `==` spelling of the same test over the same union RUNS, and so does the TYPE-`is` (`r is string`) — the `==` twin's `eqMixedOk` widening was never mirrored onto `is`
 
-**loud emit reject on a `vl check`-clean program · filed 2026-09-02 (vl-b7) from the D1024
-canon-collapse agent's A/B, which found three rows (`Json`, `S | "err"`, `Kind | "err"`) that no
-union-construction collapse moves because the union is GENUINELY mixed · verified by hand on
-seed 42604b65, five-row ablation below**
+**closed 2026-09-02 (#2370) — runs, printing `ERR` / `S` · was a loud emit reject on a `vl
+check`-clean program · filed 2026-09-02 (vl-b7) from the D1024 canon-collapse agent's A/B, which
+found three rows (`Json`, `S | "err"`, `Kind | "err"`) that no union-construction collapse moves
+because the union is GENUINELY mixed · verified by hand on seed 42604b65, five-row ablation
+below · ZERO corpus cells (the distilled corpus moved 0 classes across the fix)**
+
+**THE GATE WAS MEASURED BEFORE IT WAS WIDENED, and the measurement is the whole finding.** A
+temporary `emitFail` at the refusing site printed each disjunct on the four rejecting rows;
+every one of them read **`valunion=N litarm=N mixed=Y`**:
+
+| row | `uname` | `isValueUnionOfSet` | `unionCarriesLitUnionArm` | the `==` twin's third disjunct |
+| --- | --- | --- | --- | --- |
+| `S \| "err"` + `is "err"` | `S\|string` | N | N | **Y** |
+| `S \| string` + `is "err"` | `S\|string` | N | N | **Y** |
+| `S \| i32` + `is 3` | `S\|i32` | N | N | **Y** |
+| `Json` + `j is "err"` | `null\|boolean\|f64\|string\|Json[]\|{[string]:Json}` | N | N | **Y** |
+
+So the answer the gate needed was already being computed one line further down, as
+`litHasArm`, and thrown away. THE FIX IS TO HOIST THAT LINE ABOVE THE GATE and make it the
+third disjunct — `litHasArm` rather than a fresh copy of `eqMixedOk`, because it carries the
+`unionTakesAtomAsStr` second leg the `==` twin applies after its own gate, and that leg is what
+admits a litunion arm beside the struct one (`S | K`, `K = "a" | "b"`, `is "a"` → `A`). The
+lowering below the gate is untouched; `wasm-dis` on the row's own witness shows the
+tag-then-payload shape it always emitted — `(if (result i32) (i32.eq (struct.get $1 0 …)
+(i32.const 3)) (then (call $strEq (ref.cast (ref $4) (struct.get $1 1 …)) "err")) (else
+(i32.const 0)))`.
+
+**THE REFUSAL THAT SURVIVES IS A FLOOR NO CHECK-CLEAN PROGRAM REACHES, and it was measured
+rather than assumed.** A literal whose rep the union carries no arm for is a CHECK error at
+BOTH spellings already — `` `is` check type '"err"' is not a variant of S | i32 `` and `cannot
+compare S | i32 with string`, and the same pair at `2.5` over `S | string | i32`. So `is` and
+`==` agree there without the emitter being consulted, and the narrowed message says what the
+condition actually is: `literal `is` over a union with no arm of the literal's rep`.
+
+**BOTH SENTENCES AT THIS SITE ARE NOW THE CONDITION'S, INCLUDING THE EMPTY-NAME FLOOR.** That
+branch carried ``literal `is` over a struct union is not supported`` for as long as it was
+where [D1043](#d1043)'s inline `Kind | "err"` landed. D1043 closed in #2373 and its witness
+runs, so nothing a "struct union" describes is left there; it now says what `emit_classify`
+says one layer down when the gate is lifted — `literal `is` over a union with no recorded
+members` — because `unionNameOfExpr` gave nothing and `unionMemberSetOf` has no set to split.
+**Measured UNREACHED** by the whole `tests/cases` tree (suite green), **0 of 7,564** distilled
+corpus cells (no cell's message names this site), D1043's own probe, and five hand-built
+candidate shapes for an unnamed union receiver — a generic pin, an array element, a struct
+field, a map value and an inferred local binding — all of which RUN.
+
+**THE ROW'S PREDICTION ABOUT D1043 WAS REFUTED, AND D1043 CLOSED ANYWAY THROUGH THE OTHER
+ROUTE.** The filing predicted the `is`-gate widening would make the inline `Kind | "err"`
+witness print `ERR`. Measured on this fix ALONE it refused **unchanged**, at the identical
+position — the widened gate never saw it, because that spelling arrived with no union name at
+all. What actually moved it is #2373's union-construction fix (`litUnionFlatMembers` admitting
+a bare literal beside a litunion, so both routes mint the flat set), which is the mechanism
+D1043's own row argued for and not this one. Both are in the tree now and the witness prints
+`a` / `b` / `e`. Recorded because the prediction was in this row's filing: a gate widening and
+a type-construction fix are not interchangeable just because they clear the same message.
 
 Repro:
 
@@ -33422,25 +33472,25 @@ Repro:
     }
     print(tag("err"))
     print(tag({ v: 1 }))
-    // vl check: clean
-    // emitProgram: literal `is` over a struct union is not supported
+    // vl check: clean; NOW prints ERR then S
+    // WAS: emitProgram: literal `is` over a struct union is not supported
 
-* **THE ABLATION (seed 42604b65) — the ingredient is a NON-VALUE arm beside the literal's
-  base atom; the operator is what decides:**
+* **THE ABLATION (seed 42604b65), REGRADED ON THE FIX — the ingredient is a NON-VALUE arm
+  beside the literal's base atom; the operator is what decides:**
 
-  | union | test | outcome |
-  | --- | --- | --- |
-  | `string \| i32` (value union) | `r is "err"` | RUNS `ERR` / `other` |
-  | `S \| string` | `r is "err"` | **emit reject** (as filed) |
-  | `S \| i32` | `r is 3` | **emit reject** — not a string thing |
-  | `S \| i32` | `r == 3` | RUNS `THREE` / `other` |
-  | `S \| string` | `r is string` (TYPE `is`) | RUNS `STR` / `other` |
-  | `Json` (std:json's `null \| boolean \| f64 \| string \| Json[] \| {[string]: Json}`) | `j is "err"` | **emit reject** |
-  | `Json` | `j == "err"` | RUNS `ERR` |
+  | union | test | as filed | after |
+  | --- | --- | --- | --- |
+  | `string \| i32` (value union) | `r is "err"` | RUNS `ERR` / `other` | RUNS `ERR` / `other` (unmoved) |
+  | `S \| string` | `r is "err"` | **emit reject** | RUNS `ERR` / `other` |
+  | `S \| i32` | `r is 3` | **emit reject** — not a string thing | RUNS `THREE` / `other` |
+  | `S \| i32` | `r == 3` | RUNS `THREE` / `other` | RUNS `THREE` / `other` (unmoved) |
+  | `S \| string` | `r is string` (TYPE `is`) | RUNS `STR` / `other` | RUNS `STR` / `other` (unmoved) |
+  | `Json` (std:json's `null \| boolean \| f64 \| string \| Json[] \| {[string]: Json}`) | `j is "err"` | **emit reject** | RUNS `ERR` / `other` |
+  | `Json` | `j == "err"` | RUNS `ERR` | RUNS `ERR` / `other` (unmoved) |
 
   So the tag test over the mixed box works (row 5), the payload compare over the mixed box
   works (rows 4, 7), and only the composition of the two — literal `is`, which is a tag test
-  followed by that payload compare — refuses. There is no lowering missing.
+  followed by that payload compare — refused. There was no lowering missing.
 
 * **MECHANISM (read, then confirmed by the agent's fix on its tree).** `emitUnionConcreteEq`
   (`wasmEmit.vl`) gates on `isValueUnionOfSet || unionCarriesLitUnionArm || eqMixedOk`, where
@@ -33462,20 +33512,44 @@ Repro:
   are meant to stay so. The agent measured them unmoved by the collapse and moved by the
   gate.
 
-* **PREDICTION for vl-07's D1043 (`Kind | "err"` inline refuses with THIS message while the
-  aliased spelling runs):** the agent's tree, carrying the `is`-gate widening and no other
-  emit change, printed `ERR` for the inline `Kind | "err"` + `is "err"` row. That is a
-  prediction that D1043's inline witness moves with this fix, not a claim of its mechanism —
-  D1043 is a two-SPELLINGS disagreement (`unionMemberSetOf` sees the alias's arms and not the
-  inline flattening, or the reverse) and deserves its own ablation; put this row's fix on
-  D1043's grading list rather than closing it from here.
+* **~~PREDICTION~~ REFUTED for vl-07's D1043, and the row closed through the OTHER route.** The
+  filing predicted the inline `Kind | "err"` row would print `ERR` under the `is`-gate
+  widening. It did NOT: measured on this fix alone, and on D1043's own probe
+  (`scripts/capability-probes/litunion-plus-literal-inline.vl`), the inline spelling refused
+  **unchanged** — same literal, same position (`:37:0`) — because that spelling arrives at
+  `emitUnionLitIs` with **no union name**, which the widened gate never sees. What moved it is
+  #2373's union-construction fix, the mechanism [D1043](#d1043)'s own row argued for. Both are
+  in the tree now and its witness prints `a` / `b` / `e`. The lesson is worth the line: a gate
+  widening and a type-construction fix are not interchangeable just because they clear the
+  same message.
 
-* **GRADING:** the seven rows of the table (every `is` row RUNS with the value shown by its
-  `==` twin; the two `==` rows and the type-`is` row unmoved); an un-annotated destination —
-  `const r = mk(true)` / `r is "err"` — beside the annotated one (a fixture that annotates
-  every destination cannot see the inference-pinned rep); `!(r is "err")` and `r is "err"
-  == false`; and the D1024 fixture set unmoved, because the gate change must not reach into
-  the collapse.
+* **GRADING, all measured on the merged tree (rebased onto `60df1e87`, seed refreshed):** the
+  seven rows of the table above; an un-annotated destination (`const r = mk(true)` /
+  `r is "err"` → `ERR`, and `mk(false)` → `S`); `!(r is "err")` and `(r is "err") == false`
+  (`ERR` / `notERR` each way) and `while r is "err"` as a loop condition (`3` / `0`); the FULL
+  atom sweep over `S | string | i32` — `is "err"` and `is 3` each asked at a value of every
+  arm, `Y n n n` and `Y n n n`; `is 2.5` over `S | string | f64` → `Y n n n`, and over
+  `S | string | i32` a CHECK reject at both `is` and `==`; `S | K` → `A` / `other` / `other`.
+  The D1024 fixture set is unmoved (`deno task test` green), the distilled corpus moved 0
+  classes, `--sites` is unmoved at 22, and the capability-probe runner reads **42 of 48 on
+  BOTH seeds** — a `git archive origin/master` build in scratch and this tree, same probe set,
+  so the number is an A/B and not a recollection.
+
+* **THE THREE ROWS THAT LANDED IN THIS FUNCTION'S NEIGHBOURHOOD WHILE THE FIX WAS IN FLIGHT
+  ALL KEEP THEIR VALUES WITH IT ON TOP**, graded on both seeds: [D1043](#d1043) prints
+  `a` / `b` / `e`, [D1060](#d1060) prints `yes`, [D1061](#d1061) prints `true`, identically on
+  master and here. Nothing this row touched is theirs — `unionEqOperandOk`, the `==` gate and
+  D1060's **code-17** receiver spill are all unmodified, and the hoist moved a BOOLEAN, which
+  emits nothing. The slot separation is the one worth pinning rather than asserting: an `is`
+  may sit inside a `==` operand, both boxes are `(ref null $uBoxIdx)`, and a shared stash
+  would clobber AND VALIDATE. The fixture carries that shape with both operands calls, so both
+  stashes are live in one expression — `mkX(1) == idx(mkY(0) is "a")` prints `true`, which is
+  the outer `==` reading its own `7` rather than whatever the inner `is` last parked. It
+  prints `true` on master too: it is a pin for their fix, not a claim about this one.
+
+* **Fixture:** `tests/cases/literal-unions/is-literal-over-mixed-union.vl` (31 `@log` lines;
+  every case discriminates at a matching AND a non-matching value, because a widened gate
+  admitting an unchanged wrong lowering would still print something).
 
 ### D1060 — `is <literal>` over a CALL-result union was a loud emit reject, and the message said "non-binding" when the ablation said "call"
 
@@ -34296,6 +34370,202 @@ Repro (should print `1` then `6`):
 
 * Probe: `scripts/capability-probes/loop-var-shadowing-fn-name-capture.vl`.
 
+### D1070 — a struct CALLABLE FIELD and a same-named module-scope `self`-function disagree about which one `a.toString()` calls, and the answer depends on the SCOPE of the receiver: at module top level the field wins (as ruled), inside ANY function body the emitter picks UFCS while the checker picks the field — check-clean invalid wasm
+
+**check-clean invalid wasm · clause 1 · OPEN · found 2026-09-02 by the owner in a `std:test`
+body ("this doesn't run") · pre-existing on `seed-latest` and on a fresh 60df1e87 seed alike ·
+DECISIONS line ~1127 already rules "field first, then a UFCS free function", and neither scope's
+answer is derived from that rule**
+
+Repro (the owner's program, minus the `std:test` import — which the ablation says is scenery):
+
+    function toString(self: {foo: string}) { self.foo }
+    function f() {
+      const a = { toString: () => "ok" }
+      print(a.toString())
+    }
+    f()
+
+`Invalid input WebAssembly code … type mismatch: expected (ref $type), found (ref $type)` in
+`f`. Disassembled (`wasm-dis`): `f` does `struct.new $1` (the `{toString: …}` literal) and
+then `call $0` with `local.get $1` — a call to the FREE function `toString`, whose parameter
+is `(ref $0)`, the `{foo: string}` shape. The emitter resolved `a.toString()` as UFCS
+`toString(a)`; the checker typed it as the callable field, so the argument's rep never matched.
+
+* **FOURTEEN CELLS, ONE INGREDIENT — the receiver is a LOCAL binding.** Every row `vl check`
+  rc 0.
+
+  | change | outcome |
+  | --- | --- |
+  | the witness (receiver bound inside a plain function) | **check-clean invalid wasm** |
+  | receiver bound inside an arrow lambda (the owner's `it(…, () => {…})`) | **check-clean invalid wasm** |
+  | receiver bound inside a NESTED named function | **check-clean invalid wasm** |
+  | self-fn spelled with an explicit `return self.foo` | **check-clean invalid wasm** |
+  | self-fn takes a second parameter (`self, n: i32`) | **check-clean invalid wasm** |
+  | field and self-fn renamed together to `shout` | **check-clean invalid wasm** |
+  | receiver bound at MODULE TOP LEVEL, same self-fn | runs, prints `ok` |
+  | receiver bound at top level, USED inside the lambda (captured) | runs, prints `ok` |
+  | no module-scope self-fn at all | runs |
+  | self-fn imported from `std:fmt` instead of declared locally | runs |
+  | `std:test`'s `it` replaced by a local `it` | same outcome as with the import (scenery) |
+
+  So: the name, the import, the lambda and `std:test` are all scenery. The defect needs (1) a
+  module-scope `self`-function, (2) a struct literal with a callable field of the SAME name,
+  (3) the receiver bound in a FUNCTION BODY rather than at top level.
+
+* **AND WHEN BOTH RESOLUTIONS ARE VALID, THE TWO SCOPES GIVE DIFFERENT ANSWERS.** Make the
+  self-function ADMIT the receiver — `function toString(self: {toString: () => string}) {
+  return "UFCS" }` beside `const a = { toString: () => "field" }` — and nothing is invalid any
+  more: the top-level spelling prints `field`, the function-body spelling prints `UFCS`. That
+  is the row's headline. Line ~1127 rules field-first; the top level obeys it and the body
+  does not, which means the body is not consulting the rule at all — it is reaching a
+  different resolver (the one `ufcsAliasOf` / the merge's `modSelfFnTarget` feed), and that
+  resolver checks the self-function BEFORE the receiver's fields.
+
+* **THE FIX IS ONE RESOLVER, NOT A PATCH ON THE BODY PATH.** Whatever the emitter uses to
+  decide a local receiver's `.prop(args)` has to ask the receiver's struct shape for a
+  callable field FIRST — the same order the checker and the top-level path already use — and
+  fall through to UFCS only when there is none. Graded on: the witness printing `ok`; the
+  admits-both spelling printing `field` in BOTH scopes; the owner's original `std:test` program
+  passing; and the UFCS-only spelling (no such field) still reaching the free function, at top
+  level and in a body.
+
+### D1120 — two MERGED modules whose `self`-functions share a NAME collide in the merge's UFCS alias registry, and the ENTRY's member-call is refused `no field 'area' on Box` whenever a dependency uses the other module's function first; the direct spelling runs
+
+**loud check reject · check rc 1 · OPEN · found 2026-09-02 while ablating [D1044](#d1044) — the
+name-collision cell D1044's fixture could not spell in one file · clause 2 (the program is
+legal by every rule: two modules may each export a `self`-function called `area`, and the
+entry imports only ONE of them)**
+
+Repro (four modules; `// file:` sections, the last is the entry):
+
+    // file: a.vl
+    export type Box = { v: i32 }
+    export function box(v: i32): Box { return { v: v } }
+    export function area(self: Box): i32 { return self.v * 2 }
+    // file: b.vl
+    export type Sq = { s: i32 }
+    export function sq(s: i32): Sq { return { s: s } }
+    export function area(self: Sq): i32 { return self.s * self.s }
+    // file: c.vl
+    import { sq, area } from "./b"
+    export function nine(): i32 { return sq(3).area() }
+    // file: main.vl
+    import { box, area } from "./a"
+    import { nine } from "./c"
+    print(box(5).area())
+    print(nine())
+
+`no field 'area' on Box` at `main.vl:3:14`. Expected `10`, `9`.
+
+* **THE ENTRY IMPORTS `area` FROM `a` ONLY, AND STILL GETS `b`'s.** `c.vl` never reaches the
+  entry's scope — it uses `b`'s `area` internally. The mirror orientation (entry imports `b`'s
+  `area`, a dependency uses `a`'s) is refused `no field 'area' on Sq`: the DEPENDENCY wins in
+  both, and the entry's own import order does not matter.
+
+* **CONTROLS, both RUN and print `10`, `9`.** (1) `c.vl` stops using `area` (`sq(3).s * 3`).
+  (2) The entry spells the call directly, `area(box(5))` — the direct spelling resolves through
+  the rename map and never touches the alias registry. And an entry-DEFINED `area` beside a
+  merged module's does not collide either — a user `toEqual` beside `std:test`'s runs — so this
+  is specifically two MERGED modules' self-functions.
+
+* **THE WRONG DIAGNOSIS ON A DOUBLE IMPORT.** `import { area } from "./a"` AND `import { area }
+  from "./b"` in the entry is refused `no field 'area' on Sq` — the same collision message —
+  where the checker owes a duplicate-import error at the second `import` line.
+
+* **MECHANISM (read, then measured by the orientation pair).** `ast.vl`'s alias registry is a
+  pair of parallel arrays `ufcsAliasFrom` / `ufcsAliasTo`; `ufcsAliasAdd(plain, mangled)`
+  happily holds BOTH `area → area$mA` and `area → area$mB` (it dedupes only identical pairs),
+  and `ufcsAliasOf(name)` returns the FIRST row for a plain name. `driver.vl`'s rewrite walk
+  (`modSelfFnTarget` at each member call, ~line 3798) visits modules in dependency order, so
+  the dependency's call site registers its row first and the entry's `.area()` is answered
+  with the other module's mangled name; the checker's `ufcsCallTy` then finds `area$mB`'s
+  `self: Sq` does not admit a `Box` and reports the receiver has no such field — a message
+  about a field that is really a wrong-alias lookup.
+
+* **FIX SHAPE.** The alias is a property of the CALL SITE, not of the plain name: the walk at
+  driver.vl:3798 already holds both the node and its resolved target, so record the alias per
+  node (or per `(plain, module)`) and have the three consumers (`typecheck.vl` ×2,
+  `emit_rewrite.vl`) look up by the site. A registry that can hold two rows for one key and
+  answers with the first is the in-band-sentinel shape one level up. Graded on: the witness
+  and its mirror printing `10`, `9`; a THREE-module chain (`a`, `b`, `c` each exporting
+  `area`, the entry using all three on their own receivers) running; the double-import spelling
+  refused at the second `import` with a duplicate-import message; and `std:test` files with a
+  user-defined `toEqual` still running.
+
+### D1121 — a `type` alias that NOTHING REFERENCES changes the REP of an unrelated function's return: an inline `Kind | "err"` reps its values as STRINGS (string-eq calls), the declared alias `type R = Kind | "err"` as ATOMS (`i32.eq`), and adding the unused alias flips the inline spelling — two producers of one type, agreeing about every answer measured
+
+**runs today and must keep running · not a clause-1 or clause-2 violation yet — no observable
+disagreement in seven probes — filed as the two-producer residue of [D1043](#d1043)'s close,
+visible ONLY in the disassembly · found 2026-09-02 by vl-07 and measured by vl-b7 on a fresh
+60df1e87 seed**
+
+Repro (D1043's own witness, which now runs and prints `a`, `b`, `e`; graded as a pin — the
+name-channel unification this row asks for must keep it running):
+
+    type Kind = "a" | "b"
+    function pick(n: i32): Kind | "err" {
+      if n == 0 { return "a" }
+      if n == 1 { return "b" }
+      "err"
+    }
+    let i = 0
+    while i < 3 {
+      const r = pick(i)
+      if r is "a" {
+        print("a")
+      } else {
+        if r is "b" { print("b") } else { print("e") }
+      }
+      i = i + 1
+    }
+
+* **WHAT THE DISASSEMBLY SAYS.** `wasm-dis` of the witness: `pick` is `(func (param i32)
+  (result (ref $3)))` where `$3` is the STRING struct, its arms are `global.get` of interned
+  strings, and each `is` is a `call` to string equality. Replace the annotation with `type R =
+  Kind | "err"` / `function pick(n: i32): R` and `pick` becomes `(func (param i32) (result
+  i32))`, the arms `i32.const 0/1/2`, and each `is` an `i32.eq`. Same program, same output,
+  7 bytes apart, and one of them allocates nothing.
+
+* **DEAD CODE DECIDES THE REP — the cell to lead with.** Keep `pick` annotated INLINE and
+  add `type R = Kind | "err"` that nothing references: `pick` now returns `i32`. Three
+  modules on 60df1e87 (vl-07 reproduced it independently):
+
+  | program | `pick`'s result |
+  | --- | --- |
+  | inline `Kind \| "err"` | `(ref $3)` — string struct, `call` string-eq |
+  | inline `Kind \| "err"` + an UNUSED `type R = Kind \| "err"` | `i32` — `i32.eq` |
+  | declared `type R = Kind \| "err"` | `i32` — `i32.eq` |
+
+  So a user who deletes an unused alias during a cleanup changes an unrelated function's
+  comparisons from integer equality to string equality, and nothing tells them, because
+  nothing breaks. The inline spelling's rep is decided by whether a NAME for the union exists
+  in the program — the name channel (`registerInlineUnion` classifying the inline shape) and
+  the arena (which has said "flat litunion" since D1043) are two producers, and the inline
+  shape only gets the arena's answer when a declaration happens to be around to canonicalise
+  through.
+
+* **NOT THE UNREFERENCED BOX TYPE.** The first reading of this residue was "the inline module
+  declares a union-box heap type nothing references". Measured: `(type $0 (struct (field i32)
+  (field anyref)))` is declared, unreferenced, in BOTH spellings — and in `type Kind = "a" |
+  "b"; const k: Kind = "a"; print(k)`, which has no union at all. It is what any litunion or
+  nullable program declares; it does not separate the spellings. The RESULT TYPE does.
+
+* **SEVEN PROBES, ALL RUN, ALL PRINT THE RIGHT THING — the population this "no observable
+  disagreement" is about.** `r == k` against a `Kind` binding (`true`, `false`); a struct field
+  typed inline holding a `pick()` and a `Kind`; a `(Kind | "err")[]` literal mixing both;
+  reassigning an inline-typed `let` from a `Kind`-returning function; narrowing `r` out of
+  `"err"` and passing it to a `Kind` parameter; and the two cross-boundary spellings (inline
+  producer → declared consumer, and the reverse). The conversions at every `Kind` boundary
+  are in place; what is missing is one answer to "what is the rep of `Kind | "err"`".
+
+* **WHY IT IS A ROW AND NOT A NOTE.** Two producers agreeing about the type and disagreeing
+  about the rep is the exact shape of [D1048](#d1048), [D1093](#d1093) and [D1094](#d1094),
+  each of which was silent-wrong or invalid wasm at the delivery position nobody had probed.
+  Graded, when the name channel is unified onto the arena's answer: this witness still prints
+  `a`, `b`, `e`; `pick` returns `i32` at BOTH spellings with no alias declared; adding an
+  UNUSED alias changes nothing in the disassembly; and the seven probes above still print what
+  they print today.
 ### D1131 — `.clear()` serves four list reps where `.pop()` serves eight, and fails THREE different ways at the rest — one of them check-clean invalid wasm
 
 **THREE outcome classes for one method · loud emit reject at `f64[]`/`f32[]` (`emitProgram: .clear but list type not collected`, `compiler/wasmEmit.vl`), a DIFFERENT loud reject one stage earlier at `u8[]` (`emitProgram: unsupported member-call statement`), and CHECK-CLEAN INVALID WASM at `i64[]` (`type mismatch: expected (ref null $type), found (ref $type)`) · ZERO corpus cells · found 2026-09-02 as a side-finding of the emit-refusal reachability measurement and re-verified cell by cell before filing**
