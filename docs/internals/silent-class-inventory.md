@@ -31345,7 +31345,12 @@ Repro:
 
 ### D1029 — an `is`-narrowed MAP arm keeps the union's box at SIX delivery positions and is check-clean invalid wasm at every one; re-binding it at the arm's own type is the only spelling that unwraps it
 
-**check-clean invalid wasm · check rc 0 · `type mismatch: expected (ref $type), found (ref $type)` from the engine · clause 1 · found 2026-09-02 building `std/json.vl`, which routes around it at the one site that needs it (`renderInto`'s map arm) · the MAP arm alone: the `string` and `Json[]` arms run at all eight positions measured · neither the alias's RECURSION nor the composition `Json | JsonError` is an ingredient — both ablated away and the defect holds**
+**runs — CLOSED 2026-09-02: all EIGHT positions. `exprUnion` now excludes a narrowed MAP arm
+(the third member of a rule it already had for value-atoms and ref-arrays), the map arm gained
+the RE-BOX rung the ref-array arm always had, and the map-value store additionally needed
+[D1032](#d1032)/[D1034](#d1034)'s void rule generalised · zero `runs` lost ·
+`tests/cases/maps/narrowed-map-arm-delivery-positions.vl` · was check-clean invalid wasm at
+six of eight positions, clause 1**
 
 Repro:
 
@@ -31396,6 +31401,27 @@ Repro:
   ITERATES the narrowed map; a consumer that returns one from a helper meets it immediately.
 
 ---
+
+* **THE ASYMMETRY WITH THE REF-ARRAY ARM WAS THE WHOLE DIAGNOSIS.** `exprUnion` excludes a
+  narrowed value-ATOM and a narrowed REF-ARRAY — in that scope the value reads unboxed and is
+  no longer a union value — and the MAP arm was simply missing from that rule. So
+  `emitUnionCoerce`'s "already a union, emit raw" rung fired and handed the UNBOXED map to a
+  destination typed at the union. The ref-array arm ran everywhere because it also has a
+  RE-BOX rung (the arm's tag, the value, one `struct.new`) that the map arm never got.
+  **Both halves are needed**: the exclusion alone routes the map into a boxing path that does
+  not exist, and the witness moves from invalid wasm to a compiler-emitted `unreachable`.
+
+* **AND THE MAP-VALUE STORE NEEDED A THIRD THING THAT IS NOT THIS ROW.** With the first two in
+  place `o["x"] = v` still trapped, and the cause was the enclosing function: its tail is an
+  else-less `if` whose arm is an INDEX-TARGET ASSIGNMENT, the checker infers `Json | null`
+  from it, and `inferRetBearsNull` made the function value-returning with an `unreachable`
+  floor. That is [D1032](#d1032)'s and [D1034](#d1034)'s mechanism a THIRD time — an empty
+  arm, a bare-`return` guard, and now an assignment.
+
+  So the three ad-hoc vetoes were replaced by the rule they were each approximating: **the
+  nullable inference keeps a function non-void only where the tail `if`'s arms actually END IN
+  VALUES**, which is the one shape `inferRetBearsNull` was written for (`if c { 5 }`). Three
+  special cases would have been three chances to miss the fourth.
 
 ### D1030 — the residue of narrowing `Json | JsonError` away from the error arm is the FLATTENED member list and is not assignable to `Json`, and a plain `Json` does not widen back INTO the composition
 

@@ -1,0 +1,119 @@
+// @run
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 2
+// @log 1
+// @hint redundant type annotation: `viaBinding` is inferred as `i32` — remove it to lean on inference
+// @hint redundant type annotation: `takes` is inferred as `i32` — remove it to lean on inference
+// @hint redundant type annotation: `viaArg` is inferred as `i32` — remove it to lean on inference
+// @hint redundant type annotation: `o` is inferred as `{[string]: Json}` — remove it to lean on inference
+// @hint redundant type annotation: `viaArm` is inferred as `i32` — remove it to lean on inference
+// The annotations are DECLARED redundant. `const o: { [string]: Json } = v` in particular is
+// position 6 — the ARM-typed binding that always worked — and the whole point of having it
+// beside position 4's `const b: Json = v` is that the two differ only in which type they
+// name. Deleting either deletes the contrast.
+//
+// Regression (silent-class-inventory D1029).
+//
+// An `is`-narrowed MAP arm kept the union's box at SIX delivery positions and was check-clean
+// invalid wasm at every one, while the `string` and `Json[]` arms ran at all eight. The two
+// positions that worked are exactly the two that name the ARM rather than the union — the
+// only two that actually want the unboxed value.
+//
+// `exprUnion` excludes a narrowed value-ATOM and a narrowed REF-ARRAY, on the ground that in
+// that scope the value reads unboxed and is no longer a union value. The MAP arm was missing
+// from that rule, so `emitUnionCoerce`'s "already a union, emit raw" rung fired and handed the
+// UNBOXED map to a destination typed at the union. The ref-array arm ran everywhere because
+// it has a RE-BOX rung — the arm's tag, the value, one `struct.new` — that the map arm never
+// got. Both halves are needed: the exclusion alone routes the map into a boxing path that
+// does not exist.
+//
+// AND THE MAP-VALUE STORE NEEDED A THIRD THING, which is the part worth carrying. With the
+// first two in place `o["x"] = v` stopped being invalid wasm and started TRAPPING on a
+// compiler-emitted `unreachable` — a different failure, not a better one. The cause was not
+// this row at all: the enclosing function's tail is an else-less `if` whose arm is an
+// INDEX-TARGET ASSIGNMENT, the checker infers `Json | null` from it, and `inferRetBearsNull`
+// made the function value-returning. That is D1032's and D1034's mechanism a third time —
+// an empty arm, a bare-`return` guard, and now an assignment — so the three ad-hoc vetoes
+// were replaced by the rule they were all approximating: the nullable inference keeps a
+// function non-void only where the tail `if`'s arms actually END IN VALUES, which is the one
+// shape `inferRetBearsNull` was written for.
+type Json = null | boolean | f64 | string | Json[] | { [string]: Json }
+
+const m: { [string]: Json } = Map()
+m["k"] = 1.5
+
+// 1 — return into the union
+function retUnion(v: Json): Json {
+  if v is { [string]: Json } { return v }
+  null
+}
+const r1 = retUnion(m)
+if r1 is { [string]: Json } { print(r1.size) }
+
+// 2 — push into a `Json[]`
+function pushIt(v: Json, out: Json[]) {
+  if v is { [string]: Json } { out.push(v) }
+}
+const o2: Json[] = []
+pushIt(m, o2)
+print(o2.length)
+
+// 3 — MAP-VALUE STORE, the position that needed the void rule too
+function storeIt(v: Json, o: { [string]: Json }) {
+  if v is { [string]: Json } { o["x"] = v }
+}
+const o3: { [string]: Json } = Map()
+storeIt(m, o3)
+print(o3.size)
+
+// 4 — a binding annotated at the UNION
+function viaBinding(v: Json): i32 {
+  if v is { [string]: Json } {
+    const b: Json = v
+    if b is { [string]: Json } { return b.size }
+  }
+  0
+}
+print(viaBinding(m))
+
+// 5 — an argument to a `Json` parameter
+function takes(x: Json): i32 {
+  if x is { [string]: Json } { return x.size }
+  0
+}
+function viaArg(v: Json): i32 {
+  if v is { [string]: Json } { return takes(v) }
+  0
+}
+print(viaArg(m))
+
+// 6 — a binding at the ARM's own type: the spelling that always worked
+function viaArm(v: Json): i32 {
+  if v is { [string]: Json } {
+    const o: { [string]: Json } = v
+    return o.size
+  }
+  0
+}
+print(viaArm(m))
+
+// 7 and 8 — the two arms that already ran at every position, kept as controls
+function retStr(v: Json): Json {
+  if v is string { return v }
+  null
+}
+const r7 = retStr("ab")
+if r7 is string { print(r7.length) }
+
+function retList(v: Json): Json {
+  if v is Json[] { return v }
+  null
+}
+const a8: Json[] = [1.5]
+const r8 = retList(a8)
+if r8 is Json[] { print(r8.length) }
