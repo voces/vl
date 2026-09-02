@@ -268,12 +268,33 @@ program compiles no better than before, and the script counts it the same as an 
 **AND THE NUMBER IS A LOWER BOUND, NOT THE POPULATION (D964).** The filter finds refusals whose
 WORDING admits a capability gap, and a refusal is not obliged to admit one:
 `emitProgram: narrowed union atom has no value box` reads like an internal invariant, fires on
-a `vl check`-clean program, and is a clause-2 violation the count never saw. Measured: **405**
-distinct `emitFail` literals in `compiler/*.vl`, of which **13** match the filter — the rest are
-mostly unreachable defensive floors, and a floor no check-clean program can reach is NOT a
-violation. So the true site count sits in `[23, 405]` and **only a WITNESS settles which**.
+a `vl check`-clean program, and is a clause-2 violation the count never saw. A floor no
+check-clean program can reach is NOT a violation, so only a WITNESS settles which sites count.
 `scripts/capability-probes/run.py` is therefore the instrument and `--sites` is the headline:
 when they disagree the probe is right, and **`--sites` reaching zero is not clause 2 being met**.
+
+**THE `[23, 405]` BOUND IS NOW MEASURED, AND "MOSTLY UNREACHABLE DEFENSIVE FLOORS" WAS WRONG.**
+This paragraph used to say 405 literals of which 13 matched the filter, "the rest mostly
+unreachable". A reproducibly-seeded sample of 40 sites (`docs/internals/emit-refusal-reachability-2026-09.md`,
+2026-09-02) grades **13 LIVE / 15 UNREACHABLE / 12 UNDECIDED** and puts **≈187–328 of the 504
+sites reachable by a `vl check`-clean program** — 37–65%, with a 95% envelope of 129–390. Even
+the most pessimistic reading is ~129, five times what the wording-based count can see. Both
+sources of error push the estimate UP, not down: a time-boxed UNDECIDED favours
+unreachable-by-argument over live (which needs a program nobody has written), and the frame
+excludes the already-known-live sites.
+
+The population itself was mis-derived three times, most recently by me: **504 call sites**
+(`emitFail`/`emitFailAt` is the only emit-side channel), **434 distinct message templates**,
+**472 distinct literals** — of which **91 are FRAGMENTS** of interpolated messages that can
+never be a whole message. "511 literals" is not reproducible from any argument-scoped
+derivation; it came from an 8-line WINDOW grep that swept in neighbouring code. That is
+*"a line is not a message"* one level out — the unit you count has to be the thing a user
+receives, and the literal unit still overstates messages by ~20%.
+
+**And the distilled corpus contributes ZERO emit-side evidence** — `baseline.jsonl` is 4,620
+`runs` plus 2,944 `loud check reject`, with no emit rejects and no silent cells. That is why
+`goal-scoreboard.py` can print `total against the goal 0` while ~500 refusal sites stand, and
+it is the sharpest available statement of the "name the population in the sentence" rule.
 
 **AND THE PHRASE LIST ITSELF NEEDS AUDITING — it was reporting HALF.** Until D958 the predicate
 matched four phrasings and found 12 literals; the compiler carried **12 more** that concede the

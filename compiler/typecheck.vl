@@ -2368,6 +2368,13 @@ const IR_RUNG_NUL_ELEM_LIST = 8
 // consumer, and all this needs is for the two legs to say which they are. Splitting the code is
 // the whole fix.
 const IR_RUNG_NUL_ELEM_LIST_NICHE = 29
+// D1062 — `nulListRetName`, OUT OF BAND (30) because it is not a cascade position at all: it
+// is reached only by the NAMED-function loop (`elaborateInferRets`), never by the lambda
+// cascade, so numbering it 1..27 would assert a position it does not occupy. The named loop
+// asks it after `nullableRetName` declines, and the two never both answer — `nullableRetName`
+// claims the i32-backed inners and this claims every array inner, so a row that reaches here
+// is one the i32-backed arm rejected.
+const IR_RUNG_NUL_LIST_RET = 30
 const IR_RUNG_NUL_STRUCT_ELEM_LIST = 9
 const IR_RUNG_NUL_MAP_ELEM_LIST = 10
 const IR_RUNG_NUL_LIST_ELEM_LIST = 11
@@ -2496,8 +2503,11 @@ let nodeTyIx: i32[] = []
 // `IsExpr` node. `checkIsExprNode` already resolves it (`isTypeTy`, from the node's own
 // SPELLING TREE) to enforce the variant-membership rule, so the emitter's narrowing stack banks
 // THE ANSWER instead of re-deriving the narrowed type by picking apart the tested SPELLING.
-// Sized with `nodeTyIx` and read through `isVarTyIxOf`, so an emitter-synthesized
-// (monomorphized) `is` node falls past the end, reads -1, and its consumer keeps the name path.
+// Sized with `nodeTyIx` and read through `isVarTyIxOf`. An emitter-synthesized (monomorphized)
+// `is` node falls past the end and reads -1 unless the minting pass BANKS it —
+// `recordClonedIsVarTy`, the `isVarTyIx` twin of `recordClonedNodeTy`. A monomorphized `is T`
+// must bank, because the whole point of substituting `T` is that the emitter's ladder reads a
+// CONCRETE type here instead of the declaration's `TyVar` (D951).
 let isVarTyIx: i32[] = []
 // THE DISCRIMINANT BANK, parallel to `isVarTyIx` and sized with it. At an `is` test whose
 // receiver is a member PATH over a struct union, this records the type the RECEIVER narrows to
@@ -12955,6 +12965,210 @@ function flatFieldTyName(fdIx: i32) {
 //      nested record it contains has resolved. Anything still unresolved when the
 //      fixpoint stops making progress is part of a CYCLE — an infinite layout —
 //      and is reported by name rather than hung on.
+// ── D1023 pass 0d: a union's arms must be tellable apart ──────────────────────────────
+// The BASE SCALAR of a literal-set type — `TY_STR` for `"a" | "b"`, `TY_I32` / `TY_I64` /
+// `TY_F64` for a numeric set — or -1 when `ty` is not a literal set. `litBaseTy` lifted from
+// one member to the whole set.
+//
+// The base is the COMPARABILITY question the ruling asks: two arms are discriminable at a
+// field when both carry a literal set there AND the sets are comparable, which is what having
+// one base means. `{k: "a"} | {k: 1}` has a literal field in both arms and is still refused,
+// because no single compare answers across a string and an integer.
+//
+// A set is read off its FIRST member: `tyLitSetMemberLexes` has already rejected any type
+// with a non-literal member, and a set mixing bases (`"a" | 1`) takes its first member's base
+// and then fails to match the other arm — which is the refusal it should get.
+function litSetBaseTy(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  if tyLitSetMemberLexes(ty).length == 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyLit { return litBaseTy(t) }
+  if t is TyUnion {
+    let i = 0
+    while i < t.uMembers.length {
+      const m = T.tys[t.uMembers[i]]
+      if m is TyLit { return litBaseTy(m) }
+      i = i + 1
+    }
+  }
+  -1
+}
+
+// Do arms `a` and `b` carry the same field NAMES in the same order — the checker's reading of
+// `variantSig`, which IS the emitter's tag key. Order-sensitive on purpose: two arms spelling
+// their fields in different orders get different signatures and therefore different tags, so
+// nothing needs telling apart.
+function objSigSame(a: TyObj, b: TyObj): boolean {
+  if a.objFieldNames.length != b.objFieldNames.length { return false }
+  let i = 0
+  while i < a.objFieldNames.length {
+    if objFieldType(b, a.objFieldNames[i]) < 0 { return false }
+    i = i + 1
+  }
+  true
+}
+
+// `b`'s type for the field `a` holds at index `i`, or -1 — the BY-NAME pairing every
+// comparison below uses.
+//
+// BY NAME AND NOT BY INDEX, because the two orders are not the same order. The ARENA keeps a
+// `TyObj`'s fields in SOURCE order, while the emitter's `variantSig` — which IS the tag key —
+// sees them sorted, so `{v: i32, w: string}` and `{w: string, v: boolean}` collide on a tag
+// while their arena rows line up `v` against `w`. An index-paired comparison called that pair
+// two different signatures, let it past this rule, and left it to the emit floor: measured,
+// `vl check` rc 0 followed by `cannot be discriminated`. Pairing by name is what makes the
+// checker's question the same question the tag asks.
+function objPairedTy(a: TyObj, b: TyObj, i: i32): i32 {
+  objFieldType(b, a.objFieldNames[i])
+}
+
+// Is SOME field a comparable literal set in both arms — the discriminant the ruling requires?
+function objArmsDiscriminable(a: TyObj, b: TyObj): boolean {
+  let i = 0
+  while i < a.objFieldTypes.length {
+    const fa = a.objFieldTypes[i]
+    const fb = objPairedTy(a, b, i)
+    const ba = litSetBaseTy(fa)
+    const bb = litSetBaseTy(fb)
+    // Both arms carry a literal set, and the sets are comparable.
+    if ba >= 0 && ba == bb { return true }
+    // A LITERAL SET BESIDE ITS OWN BASE (owner's amendment, 2026-09-02). `{kind: "x" | "y"}`
+    // beside `{kind: string}` is the overlapping-set case with the second arm's set being
+    // the WHOLE base: `v is A` is `v.kind ∈ {"x","y"}`, `v is B` is true for every value of
+    // the shared shape, and `else` after `is A` narrows to B. The tag cannot answer and the
+    // value can, which is the ruling's principle line.
+    //
+    // The BASE has to be the one this set softens to, not merely another primitive:
+    // `{v: i32} | {v: "a" | "b"}` is a string set beside an `i32` and stays refused, which
+    // is the pair the ruling names and a different question from this one.
+    if ba >= 0 && tySame(fb, ba) { return true }
+    if bb >= 0 && tySame(fa, bb) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Are `a` and `b` the SAME TYPE — every field equal, structurally?
+//
+// THE EXEMPTION THAT MAKES THE RULE A RULE ABOUT ARMS AND NOT ABOUT SPELLINGS. `type Cat =
+// {m: i32}` beside `type Kot = {m: i32}`, or a declared name beside its inline `{…}` form, is
+// ONE type reached two ways — the checker accepts either wherever the other is expected — so
+// it is one arm, the twin machinery folds it onto one heap type, and there is nothing to tell
+// apart. Refusing it would refuse `variant-twin-scalar-spellings.vl`, where the whole point is
+// that the two spellings ARE the same variant.
+//
+// This is the checker's reading of the emitter's `variantFieldTysEq`, whose exemption the
+// `assignTags` reject has always carried for the same reason.
+function objArmsSameType(a: TyObj, b: TyObj): boolean {
+  if a.objFieldTypes.length != b.objFieldTypes.length { return false }
+  let i = 0
+  while i < a.objFieldTypes.length {
+    if !tySame(a.objFieldTypes[i], objPairedTy(a, b, i)) { return false }
+    i = i + 1
+  }
+  true
+}
+
+// THE DESIGN RULE `docs/guide/unions.md` HAS ALWAYS PROMISED, now owed by the checker
+// (D1023). VL's structural unions discriminate on the field-NAME set, so two arms sharing
+// that set need something else to part them; the ruling says a literal-typed field is that
+// something, and that a pair with none is refused. "" when `ty` is fine, or the message.
+//
+// IT IS A CHECK ERROR AND NOT AN EMIT ONE BECAUSE IT IS A RULE, NOT A GAP. The emitter still
+// carries `assignTags`' `cannot be discriminated` reject and that is deliberate — a floor,
+// not a diagnosis. Every `loud emit reject` is a clause-2 violation by construction, since
+// `check` returned 0 to reach the emitter: either the program is legal and should compile, or
+// it is illegal and the CHECKER owed the diagnosis. This is the checker paying that debt.
+//
+// ONE MESSAGE PER UNION, not one per pair: a six-arm union all of one shape has fifteen bad
+// pairs and one problem. Pairwise and quadratic in the arm count, like `nomUnionRepClashMsg`.
+//
+// `spellings` is the declaration's own arm names when the caller has them and they still line
+// up index for index. `nominalStructNameOfTy` is not an option: it answers with the FIRST
+// structurally-equal user type, which is the wrong tag for exactly this population.
+function unionDiscrimMsgNamed(ty: i32, spellings: string[]): string {
+  if ty < 0 { return "" }
+  const pt = T.tys[ty]
+  if pt is TyUnion {
+    const ms = pt.uMembers
+    const named = spellings.length == ms.length
+    let i = 1
+    while i < ms.length {
+      let j = 0
+      while j < i {
+        const mi = T.tys[ms[i]]
+        const mj = T.tys[ms[j]]
+        if mi is TyObj {
+          if mj is TyObj {
+            if (
+              objSigSame(mi, mj) &&
+              !objArmsSameType(mi, mj) &&
+              !objArmsDiscriminable(mi, mj)
+            ) {
+              let na = tyToStrUser(ms[j])
+              let nb = tyToStrUser(ms[i])
+              if named {
+                na = spellings[j]
+                nb = spellings[i]
+              }
+              return "arms `" +
+                na +
+                "` and `" +
+                nb +
+                "` share a field-name set and no literal-typed field " +
+                "distinguishes them — add a discriminant field"
+            }
+          }
+        }
+        j = j + 1
+      }
+      i = i + 1
+    }
+  }
+  ""
+}
+
+// The no-spellings form, for a caller holding only the arena type (an INLINE `A | B`
+// annotation, which has no declaration to read arm names off).
+function unionDiscrimMsg(ty: i32): string {
+  const none: string[] = []
+  unionDiscrimMsgNamed(ty, none)
+}
+
+// Report `msg` unless it has ALREADY been reported, at any anchor. `tErrPush`'s own dedupe
+// keys on `(message, anchor)`, which is right for it and too weak here: one bad union is
+// reachable from its DECLARATION and from every annotation naming it, so `type S = A | B`
+// used once printed the identical sentence at two positions. The pair named in the message
+// is the problem's identity, so the message alone is the key.
+//
+// First writer wins, and the order is deliberate: pass 0d runs before any annotation is
+// resolved and names the arms from the DECLARATION's own spellings, which is the better
+// message.
+function tErrOncePerMsg(msg: string, at: i32) {
+  let di = 0
+  while di < T.diags.length {
+    if T.diags[di].tmsg == msg { return 0 }
+    di = di + 1
+  }
+  tErr(msg, at)
+}
+
+function checkUnionDiscriminable(stmts: i32[]) {
+  let si = 0
+  while si < stmts.length {
+    const sd = P.nodes[stmts[si]]
+    if sd is UnionDecl {
+      const declIx = cUserTypes[sd.udName] ?? -1
+      if declIx >= 0 {
+        const m = unionDiscrimMsgNamed(declIx, sd.udVariants)
+        if m != "" { tErrOncePerMsg(m, stmts[si]) }
+      }
+    }
+    si = si + 1
+  }
+  0
+}
+
 function resolveFlatLayouts(stmts: i32[]) {
   // ── phase A: validate and stage ───────────────────────────────────────────
   // Two sweeps, because a flat record may nest one DECLARED LATER in the source:
@@ -24619,6 +24833,18 @@ function resolveAnnotAt(name: string, typarams: string[], at: i32) {
   annotDiagAt = at
   const r = resolveAnnotTs(name, typarams, annTsOf(at))
   annotDiagAt = saved
+  // D1023 AT THE INLINE SPELLING. Pass 0d catches a union with a DECLARATION to walk; an
+  // inline `function f(): A | B` has none, and the arm-discriminability rule is about the
+  // union the user wrote, not about where they wrote it. This is the annotation route's
+  // entry point and it carries a NODE, so the refusal lands on the annotation.
+  //
+  // THE `at` ROUTE IS THE CHECKER'S ALONE, which is what keeps a CHECK error out of the emit
+  // phase: `resolveAnnot` — the name route, `root < 0` — is what `emit_rep.vl`'s seven
+  // callers use, and it does not come through here. `tErrOncePerMsg` is what keeps this from
+  // doubling pass 0d's report: the memo inside `resolveAnnotTs` short-circuits the
+  // RESOLUTION but not this check, and a DECLARED union reaches the rule from both routes.
+  const dm = unionDiscrimMsg(r)
+  if dm != "" { tErrOncePerMsg(dm, at) }
   r
 }
 
@@ -26124,11 +26350,21 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         // spelling keys, so the signature and the call site agree by construction rather than
         // by a second policy. A shape it cannot render (a map inner, an un-internable field)
         // still floors, with the message unchanged.
+        // D1062 — AND A NULLABLE LIST AT EVERY ELEMENT TYPE. `nullableRetName`'s i32-backed
+        // arm named `i32[]|null` / `boolean[]|null` and nothing else, so this floor split ONE
+        // shape across TWO channels: those two element types passed the floor and refused at
+        // the emitter instead (`bare null needs a struct-typed context`), while `string[]`,
+        // `f64[]`, `u8[]`, `P[]`, `i32[][]`, a map element and the rest refused HERE. Neither
+        // count described the gap. `nulListRetName` names the whole family, and
+        // `synthNulListRetAnns` pins each function's own return annotation to it — so the
+        // floor accepts EXACTLY what the pin can serve, which is the same property D887/D937
+        // built for the nullable struct and map.
         if (
           !tyIsPrimNamed(itt.nInner, "boolean") &&
           !tyIsPrimNamed(itt.nInner, "string") &&
           litUnionAliasNameOfTy(itt.nInner) == "" &&
-          nullableRetName(inferred, gRootStmts) == ""
+          nullableRetName(inferred, gRootStmts) == "" &&
+          nulListRetName(inferred) == ""
         ) {
           tErrUnsupported(
             "'" +
@@ -27413,6 +27649,10 @@ function checkProgramNode(n: Program) {
   // is what makes a newtype over a scalar work for free) and must precede any
   // expression checking, since `N.size` / `N.field` fold against this sidecar.
   resolveFlatLayouts(stmts)
+  // Pass 0d: REFUSE a union whose arms nothing can tell apart (D1023). Runs here, after 0b
+  // has filled every arm's `TyObj`, because the rule reads field names and field TYPES and a
+  // declaration cycle can still leave a member an empty placeholder inside the fill itself.
+  checkUnionDiscriminable(stmts)
   // Pass 1: hoist top-level function signatures so call-before-decl and mutual
   // recursion type-check.
   let hi = 0
@@ -28937,6 +29177,40 @@ function nullableRetName(er: i32, stmts: i32[]) {
   ""
 }
 
+// D1062 — the emitter-format NAME of an inferred NULLABLE-LIST return `er`: a `TyNullable`
+// whose inner is a `TyArray` of ANY element type (`string[]|null`, `f64[]|null`, `u8[]|null`,
+// `P[]|null`, `i32[][]|null`, `{[string]:i32}[]|null`, …). Rendered NON-spaced, the emitter's
+// own convention, so `nullablePartOf` recognizes it.
+//
+// A SEPARATE PRODUCER FROM `nullableRetName`'s i32-backed arm, deliberately. That arm answers
+// only for the shapes that share the `nullist` rep and the `>o` value-call token
+// (`tyIsNulI32BackedListInner`), because it also serves the LAMBDA pin, where the `$fnsig`
+// result token has to agree with the value call. This one serves only the NAMED-function pin
+// (`synthNulListRetAnns`), which pins the function's OWN return annotation and therefore rides
+// whatever kind `vtKindOfType` already resolves for the annotated spelling — `nullist`,
+// `nulstrlist`, `nulf64list`/`nuli64list`/`nulf32list`/`nulu8list`, or `nulreflist`. Widening
+// the i32-backed arm instead would claim the i32 backing for an f64 list; the two questions
+// only look alike.
+//
+// The NAME is a render and the pin hands the ARENA index over beside it, so a spelling this
+// cannot resolve back is not a hazard here: every structural classifier the annotated path
+// consults reads `nodeTyIxOf`, which `synthTypeRefTy` records directly. "" for any non-array
+// inner, and for an inner the renderer cannot name at all.
+function nulListRetName(er: i32) {
+  if er < 0 { return "" }
+  const t = T.tys[er]
+  if t is TyNullable {
+    const it = T.tys[t.nInner]
+    if it is TyArray {
+      const lnm = tyToEmitName(t.nInner)
+      // The array's separators all sit inside its element render (the renderer reports its
+      // own width); `null` adds one atom (#1115).
+      if lnm != "" { return irAtoms(lnm + "|null", emitNameAtoms + 1) }
+    }
+  }
+  ""
+}
+
 // The emitter-format NAME of an inferred NULLABLE-LITUNION return `er` (`() => K0 | null`): a
 // `TyNullable` (or a `TyUnion` with a `null` atom) whose non-null part is a LITERAL union. The
 // emitter niches it as the i32 atom with `-1` = null (`nodeTyIsNulLitUnion` → `retNulLitUnion`),
@@ -30420,6 +30694,22 @@ export function checkProgram(rootIx: i32) {
                         inferRetNameAtoms,
                         IR_RUNG_NULLABLE,
                       )
+                    } else {
+                      // D1062 — A NULLABLE LIST at an element type the arm above does not
+                      // name. Recorded so `synthNulListRetAnns` can pin the function's own
+                      // return annotation to it; the floor two thousand lines up accepts on
+                      // the SAME call, so a shape recorded here is a shape the pin serves and
+                      // vice versa.
+                      const nln = nulListRetName(er)
+                      if nln != "" {
+                        recordInferRet(
+                          efn.fnName,
+                          nln,
+                          er,
+                          inferRetNameAtoms,
+                          IR_RUNG_NUL_LIST_RET,
+                        )
+                      }
                     }
                   }
                 }
@@ -30523,6 +30813,25 @@ export function inferRetBearsNull(name: string): boolean {
   const ty = inferRetTyIxOf(name)
   if ty < 0 { return false }
   tyBearsNull(ty)
+}
+
+// D1062 — IS THE ROW RECORDED FOR `name` A NULLABLE LIST (`T[] | null`)? Asked of the ARENA
+// index `recordInferRet` banked beside the name, never of the render: the emitter's pin
+// (`synthNulListRetAnns`) needs to know the SHAPE, and the two producers that can bank such a
+// row spell it two ways (`nullableRetName`'s i32-backed arm and `nulListRetName`), so a name
+// test here would have to know both spellings while the type is one answer.
+//
+// `ty < 0` is `false` for the reason `inferRetBearsNull` states above: every `recordInferRet`
+// reached with a function NAME passes a real `er`, so no arena index means no row.
+export function inferRetIsNulList(name: string): boolean {
+  const ty = inferRetTyIxOf(name)
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyNullable {
+    const it = T.tys[t.nInner]
+    if it is TyArray { return true }
+  }
+  false
 }
 
 export function inferRetNameOf(name: string) {
@@ -31261,6 +31570,25 @@ export function recordClonedNodeTyKnown(
   while nodeTyIx.length <= nodeIx { nodeTyIx.push(-1) }
   nodeTyIx[nodeIx] = ty
   ty
+}
+// THE `isVarTyIx` TWIN OF `recordClonedNodeTy`. `checkIsExprNode` banks the resolved CHECK type
+// at every `is` node the checker sees; a node the MONOMORPHIZER mints postdates that pass and
+// reads -1 for ever (`isVarTyIx`'s header). For a cloned `is` that is merely a re-parent of the
+// same test, banking the ORIGINAL's row keeps the sidecar total across the clone. For a
+// SUBSTITUTED test (`is T` at `T := i32`) the row must be the one the new SPELLING names, which
+// is what `recordClonedIsVarTy` resolves — the same `nameToTy` route `recordClonedNodeTy` takes,
+// so a composite mints a fresh structurally-equal row and every structural consumer
+// (`isArmTagOfTy`, `tyIsLitUnion`, `nulNicheIsTestImpossible`, `repIsRowMatchTy`) answers the
+// same as it would for the hand-written concrete spelling. Returns the banked row, or -1.
+export function recordClonedIsVarTyIx(nodeIx: i32, ty: i32) {
+  if nodeIx < 0 { return -1 }
+  if ty < 0 { return -1 }
+  while isVarTyIx.length <= nodeIx { isVarTyIx.push(-1) }
+  isVarTyIx[nodeIx] = ty
+  ty
+}
+export function recordClonedIsVarTy(nodeIx: i32, name: string) {
+  recordClonedIsVarTyIx(nodeIx, nameToTy(name))
 }
 // The arena index of the `i32` primitive. The monomorphizer's all-i32 param arm mints no
 // annotation node at all (`parType` stays -1), so it has no `recordClonedNodeTy` return to
@@ -32991,7 +33319,7 @@ export function nameIsLitUnionType(name: string) {
 // True if the synthetic type name `name` is an INLINE literal union: 2+ top-level `|`-separated
 // members, each a quoted string literal. A mixed member (`"a" | i32`, `"a" | null`) or a single
 // literal fails — those are value unions / nullables / single-literal types, not atom unions.
-function nameIsInlineLitUnion(name: string) {
+export function nameIsInlineLitUnion(name: string) {
   // Cheap O(1) reject before the allocating split: an inline literal-union name always begins with
   // a quoted member (`"a"|…`). This skips every ordinary name (`i32`, `string`, struct/union names,
   // map/array shapes) — the overwhelming majority of `nameIsLitUnionType` calls — without allocating.
@@ -33536,6 +33864,63 @@ export function nodeTyMapValLitUnionTexts(ix: i32) {
     }
   }
   out
+}
+
+// The member LEXEMES of a LITERAL SET — a bare `TyLit`, or a `TyUnion` whose members are ALL
+// `TyLit` — in declaration order, and EMPTY for every other type. D1023's discriminant query.
+//
+// LEXEMES, NOT TEXTS, and the quotes are the point: a string member comes back QUOTED
+// (`"circle"`), a numeric one bare (`1`, `1.5`), which is exactly the form `emitLitMemberEq`
+// reads to pick string equality over numeric (`nameIsQuotedLeaf`). One list therefore serves
+// both bases and a caller hands a member straight to the compare.
+//
+// THE KIND-BLIND TWIN of `tyLitMemberTexts` (string members only, unquoted) and
+// `tyNumLitMemberTexts` (numeric only), and it has to be blind to be asked at all. The
+// question D1023 puts to it is whether two arms' literal fields share a BASE — and a
+// single-base query cannot distinguish "this arm has no literal set" from "this arm has one
+// of the OTHER base", which is the difference between a legal discriminated pair and
+// `{k: "a"} | {k: 1}`. A MIXED set (`"a" | 1`) returns its members too; the base agreement
+// is the caller's test, made on the field's storage code, not on this list.
+export function tyLitSetMemberLexes(ty: i32) {
+  const out: string[] = []
+  if ty < 0 { return out }
+  const t = T.tys[ty]
+  if t is TyLit {
+    if t.litKind == "str" {
+      out.push("\"" + t.litText + "\"")
+    } else {
+      out.push(t.litText)
+    }
+    return out
+  }
+  if t is TyUnion {
+    if t.uMembers.length < 1 { return out }
+    let i = 0
+    while i < t.uMembers.length {
+      const m = T.tys[t.uMembers[i]]
+      if m is TyLit {
+        if m.litKind == "str" {
+          out.push("\"" + m.litText + "\"")
+        } else {
+          out.push(m.litText)
+        }
+      } else {
+        // NOT a literal set: one non-literal member disqualifies the whole type. Returning
+        // the literal members of a MIXED union (`"a" | i32`) would let a caller build a
+        // membership chain that answers `false` for every legal `i32` value.
+        return emptyTextList()
+      }
+      i = i + 1
+    }
+    return out
+  }
+  out
+}
+
+// True if `ty` denotes a literal SET — the predicate half of `tyLitSetMemberLexes`, for a
+// caller that only needs the yes/no (the variant field row's `-1` decision).
+export function tyIsLitSet(ty: i32): boolean {
+  tyLitSetMemberLexes(ty).length > 0
 }
 
 // The member literal TEXTS (raw inner lexeme, no quotes) of ATOM-repped TYPE `ty`, in source order:

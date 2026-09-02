@@ -166,6 +166,7 @@ import {
   tyIsNewtypeBrand,
   tyIsNullableLitUnion,
   tyIsU8ArrayTy,
+  tyLitSetMemberLexes,
   tyLitUnionAliasIx,
   tyNestedArrLeafRenders,
   tySame,
@@ -174,6 +175,7 @@ import {
   tyToNominalName,
   unionAliasDeclNameOfTy,
   valueAtomKind,
+  valueRowKind,
 } from "./typecheck"
 import {
   ArrayLit,
@@ -495,8 +497,10 @@ import {
   uFieldElemKeyI32,
   uFieldElemName,
   uFieldElemTyIx,
+  uFieldLitTyIx,
   uFieldNames,
   uFieldStart,
+  uFieldTyText,
   uFieldTypes,
   uVarHeap,
   uVarSTwin,
@@ -8386,6 +8390,41 @@ export function eqScalarListFieldKind(code: i32): i32 {
   0 - 1
 }
 
+// THE UNION-ATOM CODE → GENERIC-COMPARE KIND map, in `catListKindOfExpr`'s alphabet, or -1
+// for an atom that is not a LIST (silent-class-inventory D1095). The union box's `value`
+// field holds a list arm's WRAPPER ref directly — no scalar value box — so an arm's compare
+// is a list compare over that wrapper, and `listWrapHeapOfKind` is the `ref.cast` half of
+// the same fact.
+//
+// ONE HOME for the same reason `eqScalarListFieldKind` above is one: `leqNoteBin` reserves
+// the compare frame from it and the three union-`==` lowerings emit their core from it, and
+// a core emitted against a frame nobody reserved is invalid wasm at the i32/string reps and
+// a loud "list compare frame was not reserved for this rep" at the rest.
+//
+// The two alphabets are genuinely different — a union atom's `7` is `i32[]` while a compare
+// kind's `7` is `f32[]` — which is exactly why this translation is a named function.
+export function leqCoreKindOfAtomKind(k: i32): i32 {
+  if k == 7 {
+    return 0 // i32[] / boolean[] / K[]
+  }
+  if k == 8 {
+    return 4 // f64[]
+  }
+  if k == 9 {
+    return 3 // string[]
+  }
+  if k == 10 {
+    return 6 // i64[]
+  }
+  if k == 12 {
+    return 7 // f32[]
+  }
+  if k == 13 {
+    return 10 // u8[] — the packed byte list
+  }
+  0 - 1
+}
+
 export function eqgRepComparable(kind: i32, slot: i32, depth: i32): boolean {
   if depth > 32 { return false }
   const c = eqgElemClass(kind, slot)
@@ -11103,10 +11142,30 @@ export function optChainStructIdxOf(exprIx: i32, fnIx: i32) {
   structIndexOfExpr(exprIx, fnIx)
 }
 
-// The union ATOM the concrete (non-box) side of a union `==` compares under —
-// the same rep ladder `emitUnionCoerce` classifies a coerced value with.
-export function unionEqAtomOf(otherIx: i32, unionName: string, fnIx: i32) {
-  let atom = "i32"
+// The value-atom KIND the concrete (non-box) side of a union `==` compares under — the same
+// rep ladder `emitUnionCoerce` classifies a coerced value with — or **-1 when the operand has
+// no atom rep at all** (a struct, a map, a void call).
+//
+// THE "CANNOT CLASSIFY" ANSWER HAS ITS OWN CHANNEL, and that is the whole point of the -1
+// (silent-class-inventory D1071). This ladder used to hand back a SPELLING starting from
+// `let atom = "i32"`, so a struct operand — matching no rung — was answered `"i32"`: a real,
+// well-formed atom name that the caller's `valueAtomKind(atom) >= 0` guard could not tell
+// apart from a genuine i32. `emitUnionConcreteEq` then passed its mixed-union gate (the union
+// really does carry an i32 arm), tested the box against the **i32 value box's** tag and
+// compared its unboxed i32 payload against a `(ref $A)` — check-clean invalid wasm. An
+// in-band sentinel is a real value; -1 is not one, and it matches the convention
+// `valueAtomKind` / `valueRowKind` already answer "not a value atom" with.
+//
+// The fall-through asks the OPERAND'S OWN arena row before it asks the union's promotion:
+// `valueRowKind` answers -1 for a shape with no atom rep, its real code for a container or
+// closure atom, and -2 where the arena declines (an unrecorded node), which is the one case
+// that keeps the historical i32 default.
+export function unionEqAtomKindOf(
+  otherIx: i32,
+  unionName: string,
+  fnIx: i32,
+): i32 {
+  let k = 0
   // A literal-union ATOM compares under the box's STRING arm, because that is the rep the
   // arm rides the box as (`unionTakesAtomAsStr`) — the atom's i32 id is a slot encoding, not
   // a box payload. Ahead of `exprString` because the ladder is first-match and an atom is
@@ -11114,18 +11173,28 @@ export function unionEqAtomOf(otherIx: i32, unionName: string, fnIx: i32) {
   // Without this arm the atom fell to the `"i32"` default and the compare read the box's
   // NUMERIC arm's payload against an interned id — a silent wrong answer, not invalid wasm.
   if exprIsLitAtom(otherIx, fnIx) {
-    atom = "string"
+    k = 2
   } else if exprString(otherIx, fnIx) {
-    atom = "string"
+    k = 2
   } else if exprIsF32(otherIx, fnIx) {
-    atom = "f32"
+    k = 5
   } else if exprIsF64(otherIx, fnIx) {
-    atom = "f64"
+    k = 4
   } else if exprIsI64(otherIx, fnIx) {
-    atom = "i64"
+    k = 3
   } else if exprIsBool(otherIx, fnIx) {
-    atom = "boolean"
+    k = 1
   } else {
+    // THE OPERAND'S OWN ROW FIRST. `-1` is the arena STATING the shape has no atom rep
+    // (a struct, a map, an alias union arm); `-2` is it declining, which leaves the
+    // historical default in force.
+    const ork = valueRowKind(nodeTyIxOf(unwrapParen(otherIx)))
+    if ork == -1 { return -1 }
+    // A CONTAINER or CLOSURE atom (codes 7 and up) rides the box's `value` field directly
+    // and has no scalar value box, so it is answered as ITSELF rather than promoted: the
+    // caller has to decide whether it owns a compare for that rep, and cannot do that from
+    // an `i32` it was handed by default.
+    if ork >= 7 { return ork }
     // THE UNION'S OWN PROMOTION, asked of the same ladder the STORE used
     // (`unionStoreAtomKind`) rather than re-derived here. This arm knew only the i64 half
     // — `!i32 && i64` — so an integer compared against a union whose only numeric arm is a
@@ -11136,20 +11205,20 @@ export function unionEqAtomOf(otherIx: i32, unionName: string, fnIx: i32) {
     // `emitUnionCoerce`'s ladder had before it was taught, which is the argument for the
     // two asking one function instead of each carrying a copy.
     const eqw = unionStoreAtomKind(unionName, 0)
-    if eqw >= 0 { atom = valueAtomNameOfKind(eqw) }
+    if eqw >= 0 { k = eqw }
     const bare = P.nodes[unwrapParen(otherIx)]
     if bare is NumLit {
-      if !numLexFitsI32(bare.numText) { atom = "i64" }
+      if !numLexFitsI32(bare.numText) { k = 3 }
     }
   }
   // The f64 -> f32 re-encode, the coerce ladder's twin of the same entry one atom up: a float
   // value against a union whose only float arm is `f32` is STORED in the f32 box, so the
   // compare has to select that arm.
-  if atom == "f64" {
+  if k == 4 {
     const eqw4 = unionStoreAtomKind(unionName, 4)
-    if eqw4 >= 0 { atom = valueAtomNameOfKind(eqw4) }
+    if eqw4 >= 0 { k = eqw4 }
   }
-  atom
+  k
 }
 
 // True if the member access at `memIx` reads a field of a CURRENTLY-narrowed union
@@ -11199,6 +11268,28 @@ export function memNarrowVariantIndex(memIx: i32) {
     }
   }
   -1
+}
+
+// THE FIFTH RECEIVER SHAPE of the member field-code ladder: a receiver typed `Arm | null`,
+// where `Arm` is a union member (silent-class-inventory D1094). The four the ladder had are a
+// NARROWED union identifier, a bare variant-typed expression, a plain struct, and an
+// un-narrowed struct union; a `nulvariant` cell is none of them, and `structIndexOfExpr`
+// declines it BY DESIGN — "an ARM value has no `sNames` row" (D34) — so every classifier
+// reading through the ladder answered -1 and fell back to its i32 default.
+//
+// THE COST WAS A SILENT WRONG VALUE, not a refusal: the field bytes lower correctly off the
+// niche (`struct.get $S <i>` on the narrowed non-null ref), and only the CONSUMER's idea of
+// what came back was missing. `print(v.k)` over a litunion-alias field printed the raw atom
+// id `0` where `a` was expected — rc 0, valid module — while the sibling reads that need a
+// ref (a string field's `==`, a closure field) produced check-clean INVALID WASM instead. One
+// missing rung, both disguises.
+//
+// The receiver is `nulvariant`, so the read is only reachable after the checker narrowed it
+// non-null, and the row it names is the concrete arm the narrowed ref points at —
+// `nulVariantIdxOfExpr` is the same reader `addLocalName` typed the cell with, so the
+// classifier and the slot cannot name two different rows.
+function memRecvNulVariantIndex(recvIx: i32, fnIx: i32) {
+  nulVariantIdxOfExpr(recvIx, fnIx)
 }
 
 // THE VARIANT ROW AN EXPRESSION IS CURRENTLY NARROWED TO, or -1 (silent-class-inventory
@@ -11617,6 +11708,26 @@ export function unionHasAtomK(s: i32, nm: string, kw: string, k: i32): boolean {
   const b = msHasValKind(s, k)
   if b >= 0 { return b == 1 }
   unionHasAtomTy(nm, kw, false)
+}
+
+// `unionHasAtomK` FOR A KIND THAT HAS NO SINGLE SPELLING — the list codes and up, where
+// `valueAtomNameOfKind` answers "" because 7 is `i32[]` AND `boolean[]` AND a litunion `K[]`
+// (D1095). Both of `unionHasAtomK`'s rungs need the keyword to fall back on, so a caller
+// holding only a container code cannot use it; this walks the member spellings and asks each
+// one for ITS kind, which is the same question from the side that can answer.
+//
+// It reads only KINDS, never positions, so it is not a member-set dedup: the arm's box TAG
+// still comes from `scalarTagOfKind(k)`, not from where the arm was found.
+export function unionHasAtomKindArm(unionName: string, k: i32): boolean {
+  if k < 0 { return false }
+  const arms: string[] = []
+  splitUnionAtoms(unionName, arms)
+  let i = 0
+  while i < arms.length {
+    if valueAtomKind(arms[i]) == k { return true }
+    i = i + 1
+  }
+  false
 }
 
 // The SPELLING of a value-atom kind — `valueAtomKind`'s inverse over the seven SCALAR
@@ -25185,6 +25296,9 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
     } else {
       mviA = exprVariantIndex(e.memObj, fnIx)
     }
+    // THE FIFTH RECEIVER SHAPE, taken in the same order the field-code twins take it: a bare
+    // variant first, then the `Arm | null` niche.
+    if mviA < 0 { mviA = memRecvNulVariantIndex(e.memObj, fnIx) }
     if mviA >= 0 {
       const mvfiA = variantFieldIndex(mviA, e.memProp)
       if mvfiA >= 0 && variantFieldTypeAt(mviA, mvfiA) == 0 {
@@ -25580,6 +25694,14 @@ export function repVariantSlotsTwin(a: i32, b: i32): i32 {
   if a == b { return 1 }
   if a < 0 || b < 0 { return 0 }
   if a >= uVariants.length || b >= uVariants.length { return 0 }
+  // D1023's rung, ahead of the canon-key gate for the reason `buildVariantTwins` states:
+  // the key preserves each arm's literal set, so two arms the tag already merged key apart.
+  // This is the PAIRWISE form and must answer exactly as that builder does — the `$fnsig`
+  // producers render `repVariantSlotRep` off it before `uVarTwin` is filled, and two
+  // structurally identical functypes at two rec-group indices are DISTINCT types.
+  if variantSig(a) == variantSig(b) && variantLitDiscriminable(a, b) {
+    return 1
+  }
   const ka = repNameCanonId(uVariants[a])
   if ka < 0 { return 0 }
   if ka != repNameCanonId(uVariants[b]) { return 0 }
@@ -25661,6 +25783,23 @@ export function buildVariantTwins() {
           j = i // stop at the first (smallest) twin
         }
         j = j + 1
+      }
+    }
+    // D1023's arms fold here too, and the canon key is why they need their own rung: it
+    // preserves each arm's literal SET, so `{kind: "circle", r: f64}` and
+    // `{kind: "square", r: f64}` key differently and miss the guard above — while
+    // `assignTags` has already ranked them ONE tag, because tags key on the field-NAME
+    // signature and that is identical. A shared tag with two heap types is not a
+    // representation: the box is built under whichever row matched the field names first, so
+    // the other arm's `ref.cast` traps. Fold them onto the smallest row instead.
+    if rep == i {
+      let d = 0
+      while d < i {
+        if variantSig(d) == variantSig(i) && variantLitDiscriminable(d, i) {
+          rep = d
+          d = i // the smallest such row, matching the guard above
+        }
+        d = d + 1
       }
     }
     uVarTwin.push(rep)
@@ -25833,6 +25972,194 @@ export function variantSig(vi: i32) {
     j = j + 1
   }
   out
+}
+
+// ── D1023: the discriminant column's three queries ────────────────────────────────────
+// `is A` over two struct arms that share a field-NAME set is a DISCRIMINANT-VALUE test
+// (DECISIONS §"`is A` over same-shape struct arms"): true iff the tag names the shared shape
+// AND the value's literal-typed fields are members of `A`'s sets. These three answer the
+// three questions that lowering asks — what are `vi`'s members at field `fi`, do two arms'
+// sets agree, and does `fi` need testing at all.
+
+// The literal-set member LEXEMES of variant `vi`'s field `fi` — empty when the field is not
+// a literal set. Reads the DISCRIMINANT column, whose header explains why the identity
+// column (`uFieldTyText`) cannot answer: canon softens a multi-member set to its base.
+export function variantFieldLitLexes(vi: i32, fi: i32) {
+  const none: string[] = []
+  if vi < 0 || vi >= uFieldStart.length { return none }
+  if fi < 0 || fi >= uFieldCount[vi] { return none }
+  const row = uFieldStart[vi] + fi
+  if row < 0 || row >= uFieldLitTyIx.length { return none }
+  tyLitSetMemberLexes(uFieldLitTyIx[row])
+}
+
+// Is LEXEME `lex` one of `lexes`? `emit_base.litLexIsMember`'s twin for a list that is
+// already quoted — that one quotes each element before comparing, which would re-quote a
+// lexeme and answer false for every member.
+function lexInLexes(lex: string, lexes: string[]): boolean {
+  let i = 0
+  while i < lexes.length {
+    if lexes[i] == lex { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Do variants `a` and `b` carry the SAME literal set at field `fi`? Set equality, not list
+// equality: `"x" | "y"` and `"y" | "x"` are one type, and a test that called them different
+// would emit a membership compare that is a tautology in both directions.
+function variantFieldLitSetSame(a: i32, b: i32, fi: i32): boolean {
+  const la = variantFieldLitLexes(a, fi)
+  const lb = variantFieldLitLexes(b, fi)
+  if la.length != lb.length { return false }
+  let i = 0
+  while i < la.length {
+    if !lexInLexes(la[i], lb) { return false }
+    i = i + 1
+  }
+  let j = 0
+  while j < lb.length {
+    if !lexInLexes(lb[j], la) { return false }
+    j = j + 1
+  }
+  true
+}
+
+// Must `x is <vi>` TEST field `fi`'s value, or does the tag already settle it?
+//
+// THE GATE IS "ANOTHER ARM SHARES MY TAG AND DISAGREES AT THIS FIELD", and it is what keeps
+// every program that existed before this change byte-identical. A variant whose tag is its
+// own — the overwhelming majority — has nothing to disambiguate, and a same-signature
+// sibling carrying the SAME set at `fi` (two aliases of one literal type, `K1` beside `K2`)
+// does not disagree: every value of the shared shape is a member of both, which is the
+// truthful answer and needs no instruction to produce it.
+//
+// Tags are program-global and keyed by `variantSig`, so "shares my tag" is "shares my
+// signature" — asked directly rather than off `uTags`, because this runs from `assignTags`
+// BEFORE that table is filled as well as from `emitIs` long after.
+export function variantDiscrimFieldNeeded(vi: i32, fi: i32): boolean {
+  if variantFieldLitLexes(vi, fi).length == 0 { return false }
+  const sig = variantSig(vi)
+  let vj = 0
+  while vj < uVariants.length {
+    if vj != vi {
+      if variantSig(vj) == sig {
+        if !variantFieldLitSetSame(vi, vj, fi) { return true }
+      }
+    }
+    vj = vj + 1
+  }
+  false
+}
+
+// Are variants `a` and `b` — same field-NAME set, so already sharing a tag — legal under
+// D1023's ruling: ONE tag, ONE layout, `is` answering by the discriminant's VALUE?
+//
+// TWO CONDITIONS, and the second is what makes the first sound. Every field must either
+// compare equal on `variantFieldTysEq`'s own ladder, or be a LITERAL SET IN BOTH ARMS WITH
+// THE SAME STORAGE — and at least one field must be the latter, or nothing tells the arms
+// apart at run time and the pair is the no-discriminant refusal the checker owns.
+//
+// STORAGE, NOT BASE TYPE, IS THE COMPARABILITY TEST, and it is the same column the reject
+// already trusts. Two literal sets are comparable exactly when their values land in one slot
+// under one compare: `{k: "a"} | {k: 1}` codes 3 against 0 and is refused, and so is a named
+// litunion ALIAS (the interned i32 atom) beside an inline set (a string ref) — same base,
+// two reps, no shared layout to fold onto. The elem-name and map-key columns come along for
+// the reason they do in the ladder proper: one code covers several storages.
+//
+// TWO CALLERS, AND THEY MUST AGREE OR THE MODULE TRAPS. `assignTags` uses it to ADMIT the
+// pair, and `buildVariantTwins` to give the admitted arms ONE heap type. Admitting without
+// folding is what the filed D1023 witness did: two structurally identical struct types at
+// two rec-group indices are DISTINCT types in WasmGC, the box was built under whichever row
+// the field-name match hit first, and the other arm's `ref.cast` trapped. One predicate,
+// asked twice, is what keeps the two answers from drifting.
+export function variantLitDiscriminable(a: i32, b: i32): boolean {
+  if a < 0 || b < 0 { return false }
+  if a >= uFieldCount.length || b >= uFieldCount.length { return false }
+  if uFieldCount[a] != uFieldCount[b] { return false }
+  let sawLit = false
+  let fi = 0
+  while fi < uFieldCount[a] {
+    const ra = uFieldStart[a] + fi
+    const rb = uFieldStart[b] + fi
+    const codeEq = uFieldTypes[ra] == uFieldTypes[rb] &&
+      uFieldElemKeyI32At(a, fi) == uFieldElemKeyI32At(b, fi)
+    const storageEq = codeEq && uFieldElemName[ra] == uFieldElemName[rb]
+    // EITHER, not BOTH (owner's amendment, 2026-09-02): a literal set beside its own BASE is
+    // legal, and the base arm carries no set to record. `{kind: "x" | "y"}` beside
+    // `{kind: string}` is the overlapping-set case with the second set being the whole base —
+    // `is A` compares the value, `is B` is the tag test alone, which is what
+    // `variantDiscrimFieldNeeded` already emits for an arm whose own set is empty.
+    //
+    // THE CODE COLUMN IS WHAT KEEPS THIS HONEST, and it is why widening to EITHER is safe
+    // here: `{v: i32} | {v: boolean}` reaches this line with both codes 0 and NEITHER a set,
+    // so it falls to the equality rung and parts on its type text, exactly as before. The
+    // CHECKER is the stricter gate in any case — it requires the base to be the one the set
+    // softens to, where this only asks that the two store alike.
+    const eitherLit = uFieldLitTyIx[ra] >= 0 || uFieldLitTyIx[rb] >= 0
+    // THE ELEM-NAME COLUMN IS AN IDENTITY HERE, NOT A STORAGE, so the discriminant rung
+    // drops it and the equality rung keeps it. A litunion field records its ALIAS NAME
+    // there (`type KC = "circle"` → `KC`), which is how the widen tower finds the member
+    // set — but every alias of a string literal set reps as the SAME interned i32 atom, so
+    // `K1` beside `K2` is one storage under two names. Requiring the names to match refused
+    // the alias spelling of the very pair the ruling makes legal, while the code column
+    // still parts an alias (atom) from an inline set (a string ref), which genuinely differ.
+    if codeEq && eitherLit {
+      sawLit = true
+    } else if !(storageEq && uFieldTyText[ra] == uFieldTyText[rb]) {
+      // Neither a discriminant candidate nor equal — the arms genuinely differ at a field
+      // whose values `is` has no way to compare.
+      return false
+    }
+    fi = fi + 1
+  }
+  sawLit
+}
+
+// Do `a` and `b` differ at a field where BOTH arms carry a literal set, but the two sets rep
+// DIFFERENTLY? The one shape D1023's ruling calls legal that this emitter still cannot build,
+// separated out so the refusal can say what is actually wrong.
+//
+// A string literal set has two reps and `nodeTyIsLitUnionAlias` is the seam: a registered
+// ALIAS (`type KC = "circle"`) is the interned i32 atom, an inline `"x" | "y"` a `(ref
+// $string)`. Put one of each in two arms of a union and the TYPES agree about everything the
+// ruling asks — same base, comparable values — while the LAYOUTS do not, so there is no
+// single heap type for the arms to share. Unifying the two reps is the litunion rep cliff and
+// a representation change; until then this pair is a capability gap, and calling it "the same
+// field names but different field types" would be false.
+export function variantLitRepMismatch(a: i32, b: i32): boolean {
+  if a < 0 || b < 0 { return false }
+  if a >= uFieldCount.length || b >= uFieldCount.length { return false }
+  if uFieldCount[a] != uFieldCount[b] { return false }
+  let fi = 0
+  while fi < uFieldCount[a] {
+    const ra = uFieldStart[a] + fi
+    const rb = uFieldStart[b] + fi
+    // EITHER arm carrying a set is enough, because the amendment made the BASE arm a legal
+    // partner: `{kind: K1} | {kind: string}` is a set beside its own base — legal by the
+    // ruling, and still two reps (interned atom / string ref), so it lands here too and
+    // deserves this sentence rather than the "different field types" one. The pairs where
+    // neither is a set never reach here: the checker refuses them.
+    if uFieldLitTyIx[ra] >= 0 || uFieldLitTyIx[rb] >= 0 {
+      if uFieldTypes[ra] != uFieldTypes[rb] { return true }
+    }
+    fi = fi + 1
+  }
+  false
+}
+
+// Does variant `vi` carry ANY field whose value `is` must test — i.e. is `vi` one of a set
+// of arms sharing a tag and parted by a discriminant? The whole-variant form of
+// `variantDiscrimFieldNeeded`, for the callers that ask about the arm rather than a field:
+// `emitIs`'s static fold, which is unsound exactly when this is true.
+export function variantHasDiscrimField(vi: i32): boolean {
+  if vi < 0 || vi >= uFieldCount.length { return false }
+  let fi = 0
+  while fi < uFieldCount[vi] {
+    if variantDiscrimFieldNeeded(vi, fi) { return true }
+    fi = fi + 1
+  }
+  false
 }
 
 // The GLOBALLY-stable tag of a value-union atom: every struct variant takes the
@@ -31941,6 +32268,12 @@ function memFieldTypeCode(memIx: i32, fnIx: i32) {
       const pvfi = variantFieldIndex(pvi, e.memProp)
       if pvfi >= 0 { return variantFieldTypeAt(pvi, pvfi) }
     }
+    // THE FIFTH RECEIVER SHAPE — `memRecvNulVariantIndex`'s own header states what it costs.
+    const nvi5 = memRecvNulVariantIndex(e.memObj, fnIx)
+    if nvi5 >= 0 {
+      const nvfi5 = variantFieldIndex(nvi5, e.memProp)
+      if nvfi5 >= 0 { return variantFieldTypeAt(nvi5, nvfi5) }
+    }
     const si = structIndexOfExpr(e.memObj, fnIx)
     if si >= 0 {
       const fi = sFieldIndex(si, e.memProp)
@@ -36177,6 +36510,13 @@ function memberFieldCode(memIx: i32, fnIx: i32) {
     if pvi >= 0 {
       const pvfi = variantFieldIndex(pvi, e.memProp)
       if pvfi >= 0 { return variantFieldTypeAt(pvi, pvfi) }
+      return -1
+    }
+    // THE FIFTH RECEIVER SHAPE, in lock-step with the twin above.
+    const nvi5 = memRecvNulVariantIndex(e.memObj, fnIx)
+    if nvi5 >= 0 {
+      const nvfi5 = variantFieldIndex(nvi5, e.memProp)
+      if nvfi5 >= 0 { return variantFieldTypeAt(nvi5, nvfi5) }
       return -1
     }
     const si = structIndexOfExpr(e.memObj, fnIx)

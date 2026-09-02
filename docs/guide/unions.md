@@ -43,6 +43,40 @@ typing a `B` value genuinely IS an `A` — so `v is A` is (soundly) always true 
 shape alone cannot. Distinct-shaped variants (the AST-node `NumLit | BinExpr | Call` pattern) are
 discriminated directly.
 
+**`is` over same-shape arms tests the discriminant's VALUE** (ruled 2026-09-02, DECISIONS.md
+§"`is A` over same-shape struct arms is a DISCRIMINANT-VALUE test"). For
+`type Circle = { kind: "circle", r: f64 }` / `type Square = { kind: "square", r: f64 }`,
+`s is Circle` is true iff the tag names the shared shape **and** `s.kind` is a member of
+`Circle`'s literal set — the same arm set `s.kind == "circle"` narrows to, so the two
+spellings agree by construction. A literal-typed field is a type that is also a value, and
+membership is decided by the value:
+
+```vl
+type Circle = { kind: "circle", r: f64 }
+type Square = { kind: "square", r: f64 }
+
+function area(s: Circle | Square): f64 {
+  if s is Circle { return s.r * s.r * 3.14159 }
+  return s.r * s.r
+}
+```
+
+The answer is the value's, never the name it was built under: a `{ kind: "circle", r: 1.0 }`
+written straight into a `Circle | Square` binding, with no `Circle` anywhere, is a `Circle`.
+
+Overlapping sets are legal and answer truthfully — a `kind: "y"` value is a member of both a
+`"x" | "y"` arm and a `"y" | "z"` one, because under structural typing it really is both, and
+`else` narrows to the remainder. A same-shape pair with no literal-typed field to distinguish
+it (`{v: i32} | {v: boolean}`) is refused by the checker: *arms `A` and `B` share a field-name
+set and no literal-typed field distinguishes them — add a discriminant field.* So is a pair
+whose literal fields share no base (`{k: "a"} | {k: 1}`), since no single comparison answers
+across a string and an integer.
+
+One spelling is still refused that the rule says should work: a named literal-union alias in
+one arm beside an inline set in the other (`{kind: K1} | {kind: "x" | "y"}`). The two spellings
+have different representations, so the arms cannot share a layout — spell both the same way
+(D1050).
+
 ## Shared-field access
 
 A field present on **every** member of a struct union with the **same** type is readable on the

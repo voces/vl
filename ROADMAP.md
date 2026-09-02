@@ -97,11 +97,13 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   semantics), a compiler-derived per-`T` shape walk that BUILDS the `T`-repped value from
   the tree. Measured today: `is` is a tag test — a struct RHS is refused as "not a variant",
   and a refinement of an arm (`["xyz"] is string[]`) is check-clean and answers `false`
-  unconditionally (**D1035**, this item's witness). Design + four sub-rules with
-  recommendations (copy semantics; integral `i32` fields — the same predicate as q2's
-  exact `as`; absent ≠ null; `as` propagates `JsonError { kind: "shape", path }`) in
+  unconditionally (**D1035**, this item's witness). Design + four sub-rules (copy
+  semantics; integral `i32` fields — the same predicate as q2's exact `as`; **S3 RULED
+  2026-09-02: an absent key matches a `T | null` field and reads `null` — VL's own map
+  read already does, and a nullable field is not a REQUIRED key for OQ-7's arm rule**;
+  `as` propagates `JsonError { kind: "shape", path }`) in
   `docs/serde-design.md` §"Deep `is` / `as` over a `Json` value"; DECISIONS.md has the
-  ruling. It is serde Stage 2's JSON half brought forward (checker "is a JSON shape"
+  rulings. It is serde Stage 2's JSON half brought forward (checker "is a JSON shape"
   predicate + emitter walk keyed on the RHS type); OQ-1 (b)'s intrinsic stays for the
   binary source and `serialize`. Position matrix before the checker narrows (D965).
   Compiler-side work; the compile-goal session's surface once the sub-rules are ruled.
@@ -207,7 +209,7 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   item: it is about mono-minted unions, struct arm or literal alike — **D1042**.
   DECISIONS.md §"A subsumed literal arm COLLAPSES". Compiler-side; compile-goal surface.
 - **`is A` over same-shape struct arms is a DISCRIMINANT-VALUE test — RULED (owner,
-  2026-09-02), NOT BUILT.** `type Circle = { kind: "circle", r: f64 }` /
+  2026-09-02), DONE (#2365).** `type Circle = { kind: "circle", r: f64 }` /
   `type Square = { kind: "square", r: f64 }` is a legal union and `s is Circle` is true iff
   the tag names the shared shape AND `s.kind` is a member of `Circle`'s literal set — the
   arm set `s.kind == "circle"` already narrows to. A literal-typed field is a type that is
@@ -216,18 +218,27 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   the CHECKER — a design rule (`docs/guide/unions.md`) the emitter enforces today. The rep is
   the compiler's choice: one heap type + one tag + an `i32`-sentinel compare (recommended;
   no rep change), or distinct heap types (not vetoed) — provided the answer stays the
-  value's, never the name a value was built under. Measured today: the singleton-literal TS
-  idiom is an EMIT REJECT with no `is` in the program (the idiom is unwritable); two-member
-  disjoint or overlapping sets fold into one variant and take the wrong arm silently
-  (**D1023**); only different field names run. **Build, in order:** (1) collect pass admits
-  a same-signature pair that differs in a literal-typed field (one tag, one layout);
-  (2) `is A` adds the membership compare(s) after the tag test — one `i32.eq` per singleton;
-  (3) the checker owns the no-discriminant refusal and the emit reject becomes a floor;
-  (4) `is`- and `==`-narrowing graded side by side at every spelling. D1023's RULED
-  paragraph has the six-row table and the grading list; DECISIONS.md §"`is A` over
-  same-shape struct arms is a DISCRIMINANT-VALUE test". Interim std rule until built: every
-  std error struct keeps a field NAME no other has (`JsonError.path`). Compiler-side;
-  compile-goal surface.
+  value's, never the name a value was built under. Was: the singleton-literal TS idiom an
+  EMIT REJECT with no `is` in the program (the idiom unwritable); two-member disjoint or
+  overlapping sets folded into one variant and took the wrong arm silently (**D1023**); only
+  different field names ran. **Built as the four steps planned** — the collect pass admits a
+  same-signature pair differing in literal-typed fields of the same storage; `is A` adds the
+  membership compare after the tag test, as an `if` and NOT an `i32.and` (both operands of an
+  `and` evaluate, so the discriminant's `ref.cast` ran on arms of every other shape — only a
+  THREE-arm union sees it); `checkUnionDiscriminable` owns the no-discriminant refusal at
+  both the declared and inline spellings; `is` and `==` agree at every row. **The recommended
+  rep needed no rep change, and one measurement is why:** atom ids are interned globally by
+  literal VALUE, so `"y"` is the same `i32` in `"x" | "y"` and in `"y" | "z"` — a per-type
+  numbering would have forced interning per base type. Two arms the tag already merged also
+  had to be merged in `buildVariantTwins`, whose canon key preserves each arm's literal set:
+  a shared tag with two heap types reproduced the filed trap from the other side.
+  **Residue, named:** a named litunion ALIAS in one arm beside an inline set in the other is
+  legal by the ruling and still refuses, because the two litunion reps (interned atom /
+  string ref) share no layout — **D1050**, the litunion rep cliff. D1023's RULED paragraph
+  has the six-row table and the grading list; DECISIONS.md §"`is A` over same-shape struct
+  arms is a DISCRIMINANT-VALUE test". The std rule that was interim is now only a style
+  preference: a std error struct no longer NEEDS a unique field name, since a unique `kind`
+  literal discriminates. Compiler-side; compile-goal surface.
 - **A `type` declared in a function body is LEGAL and lexically scoped — RULED (owner,
   2026-09-02), NOT BUILT.** Today the declaration parses and is silently dropped: `unknown
   type 'P'` at the use, a check-clean emit reject when the name is unused, and a local `type
@@ -235,9 +246,10 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   form (struct, union/literal union, recursive, generic alias, nominal `new`) is admitted in a
   body, scoped to the block, shadowing outer names, and free to name the enclosing function's
   type parameters — substituted per instance as D426 does for lambdas; the NAMED-function
-  spelling of that substitution still refuses at emit (D1046) and closes with this. Sub-rulings
-  standing as vl-b7's recommendation: a local NOMINAL type may not escape through an inferred
-  return type (checker refuses); a structural one escapes as its shape. **Two steps:**
+  spelling of that substitution still refuses at emit (D1046) and closes with this. Sub-rulings:
+  a local NOMINAL type may not escape through an inferred return type — checker ERROR at the
+  return (owner, 2026-09-02); a structural one escapes as its shape (vl-b7's recommendation,
+  standing). **Two steps:**
   (1) **SHIPPED 2026-09-02 (#2369)** — the interim: the checker refuses the DECLARATION at its
   own line with one message naming the rule, on all three spellings, on every declaration form
   the parser admits in a body, and in the lambda and nested-named-function positions; nothing
@@ -245,15 +257,30 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   DECISIONS.md §"A `type` declared in a function body is legal and lexically scoped".
   Compiler-side.
 - **Assertion failures locate at the MATCHER, not `expect` — RULED (owner, 2026-09-02),
-  BLOCKED on D1044.** Each `std:test` matcher (`toEqual`/`toBeTrue`/`toBeFalse`, `not`'s
+  UNBLOCKED, NOT BUILT.** Each `std:test` matcher (`toEqual`/`toBeTrue`/`toBeFalse`, `not`'s
   continuation) takes `caller: CallerLoc = __callsite__` and the receipt stops carrying
   `expect`'s. On today's grammar only the column moves (the method token, measured col 14);
-  the line moves the day a leading-dot continuation line parses — a grammar question not yet
-  put to the owner. Blocked: a UFCS call that omits a defaulted tail argument is refused `no
-  field … on …` in every module build that merges a `self`-function module, so `.toEqual(y)`
-  cannot take the default until D1044 lands (eight-row ablation in its row). std change →
-  `std-api-reviewer`; header + DECISIONS "`expect` only" paragraph updated with it. std-side
-  after a compiler fix.
+  the line moves once the leading-dot continuation below is built. Was blocked on D1044 (a
+  UFCS call omitting a defaulted tail argument refused `no field … on …` in every build
+  merging a `self`-function module) — closed by #2371 the same day. Graded on: one-line
+  spelling → col 14; `not.toEqual` → the final matcher; multi-line spelling → the `.toEqual`
+  LINE (once the grammar lands). std change → `std-api-reviewer`; header + DECISIONS "`expect`
+  only" paragraph updated with it; `testDiscovery.ts` untouched. std-side.
+- **A leading `.` / `?.` on a new line continues the postfix chain — SHIPPED (#2382).** Ruled
+  by the owner 2026-09-02 and built the same day. `parsePostfix` gains a NEWLINE arm that LOOKS
+  past the run of newlines and continues iff the next kind is DOT/QUESTION_DOT; `(` and `[` do
+  NOT continue (legal statement starts) and trailing-dot stays refused, both pinned. Grepped
+  rather than asserted: **0 of 10,355 `.vl` files** begin a line with `.`/`?.`, so no existing
+  program changed meaning. **The formatter was the real half** and is fit-or-break now — inline
+  while the chain fits `fmtWidth`, else one `.link(args)` per line at one extra indent from the
+  first link — with the threshold at **two links, a link starting at the first step CARRYING A
+  CALL** (a leading plain `.field` merges into the head, which is what keeps `P.toks.push({ … })`
+  and `node.callArgNames.length` on `wrapList`'s answer). Cost measured as a same-tree A/B over
+  two seeds: **1 of 10,355 files** reformats (`tests/cases/arrays/map-struct-to-struct.vl`, a
+  92-column three-link chain), **0 under `compiler/`/`std/`/`scripts/`**. Five corpus cases plus
+  two `vl_fmt_test.ts` pins; LSP untouched. DECISIONS.md §"A leading `.` on a new line continues
+  the chain". A consequence for the matcher-location ruling above: with the matcher on its own
+  line the failure's LINE moves too, not just its column.
 - **Colored `print`** — ruled in principle 2026-09-01 with one hard constraint (ANSI must
   never leak into pipes/files/copies): Node's split — bare strings always raw, rendered
   values colored, escapes emitted only by the TTY-detected sink, `NO_COLOR`/`--color`

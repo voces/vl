@@ -62,6 +62,7 @@ import {
   isBoolLitExpr,
   isTransparentAlias,
   isValueUnionName,
+  nameIsInlineLitUnion,
   nameIsLitUnionArmValueUnion,
   nameIsLitUnionType,
   nameMentionsGenAliasParam,
@@ -83,6 +84,7 @@ import {
   nulNumLitUnionBaseName,
   primNameStr,
   tyArrayElemPrim,
+  tyIsLitSet,
   tyIsLitUnion,
   tyIsLitUnionAlias,
   tyNomNameCycled,
@@ -337,6 +339,7 @@ import {
   uFieldElemKeyI32,
   uFieldElemName,
   uFieldElemTyIx,
+  uFieldLitTyIx,
   uFieldNames,
   uFieldStart,
   uFieldTyText,
@@ -472,6 +475,7 @@ import {
   internShapeDeepTy,
   isUName,
   isUnionOfTy,
+  leqCoreKindOfAtomKind,
   letAnnIsUninternedShape,
   letInfersF32,
   letInfersNulClosure,
@@ -602,9 +606,13 @@ import {
   uVarSTwinAt,
   unRowOfCanon,
   unionArmSigKey,
+  unionMemberSetOf,
+  unionNameOfExpr,
   unionSetHasNull,
   variantIndexOf,
   variantIndexOfLet,
+  variantLitDiscriminable,
+  variantLitRepMismatch,
   variantNestedShapeOk,
   variantSig,
 } from "./emit_classify"
@@ -784,6 +792,23 @@ function variantFieldIdText(txt: string, tyIx: i32) {
   const t = T.tys[tyIx]
   if t is TyLit { return "\"" + t.litText + "\"" }
   txt
+}
+
+// The DISCRIMINANT column's cell for a field whose annotation resolved to arena type `tyIx`:
+// `tyIx` itself when it denotes a literal SET, `-1` otherwise (D1023).
+//
+// THE COLUMN ABOVE CANNOT ANSWER THIS AND THAT IS THE WHOLE ROW. `variantFieldIdText`
+// restores a BARE literal's own text, so `"circle"` and `"square"` part there — but a
+// MULTI-member set reaches it already softened by canon to the base its members share, so
+// `"x" | "y"` and `"p" | "q"` render one identical `string` and were folded as the layout
+// twins that comparison exists to admit. Softening is right for identity (the two arms DO
+// store alike); it is the membership question it cannot serve, and membership is what the
+// ruling makes `is` ask. So the arena index is banked beside the text rather than derived
+// from it.
+function litSetTyIxOf(tyIx: i32): i32 {
+  if tyIx < 0 { return -1 }
+  if tyIsLitSet(tyIx) { return tyIx }
+  -1
 }
 
 // The hint for a field row pushed from a `FieldDef` NODE: the field's own row projected
@@ -4930,7 +4955,37 @@ function leqgNoteRep(kind: i32, slot: i32, depth: i32) {
 // compare-core home, which is the same function `emitEqNonNullCore` reads — a core reserved here
 // and a core emitted there are the same decision or the emitted core writes locals the function
 // never declared.
+// D1095 — RESERVE A COMPARE FRAME FOR EVERY LIST ARM OF A UNION `==`. A boxed union arm
+// whose atom is a LIST carries the list WRAPPER in the box's `value` field, so comparing that
+// arm runs the ordinary list core over two wrappers — and a core needs its frame reserved
+// here or it writes locals the function never declared.
+//
+// EVERY ARM, NOT THE ONE THE OPERANDS PICK. The union-vs-union lowerings emit a chain with a
+// compare per shared arm, so which arm's core runs is a runtime tag test, not something this
+// scan can narrow. Over-reserving costs four locals in one function; under-reserving is
+// invalid wasm at the i32 and string reps and a loud "list compare frame was not reserved for
+// this rep" at the others.
+function leqNoteUnionArms(uname: string) {
+  if uname == "" { return 0 }
+  const arms: string[] = []
+  splitUnionAtoms(unionMemberSetOf(uname), arms)
+  let ui = 0
+  while ui < arms.length {
+    const lk = leqCoreKindOfAtomKind(valueAtomKind(arms[ui]))
+    if lk >= 0 { leqgNoteRep(lk, 0, 0) }
+    ui = ui + 1
+  }
+  0
+}
+
 function leqNoteBin(binIx: i32, fnIx: i32) {
+  const ub = P.nodes[binIx]
+  if ub is BinExpr {
+    if ub.binOp == "==" || ub.binOp == "!=" {
+      leqNoteUnionArms(unionNameOfExpr(ub.binLeft, fnIx))
+      leqNoteUnionArms(unionNameOfExpr(ub.binRight, fnIx))
+    }
+  }
   let k = listOpKindOfBin(binIx, fnIx)
   if k < 0 { k = eqCoreKindOfBin(binIx, fnIx) }
   if k == 0 { fnUsesListEqI = true }
@@ -9269,6 +9324,23 @@ function anonLeafCloSlotMark() {
 // target is unresolvable or unmoved records nothing at all, which is what keeps every
 // closure-valued binding in every other program byte-identical.
 function anonLeafCloBindMark() {
+  // THE SAME EARLY-OUT `anonLeafNarrowUseMark` TAKES, AND FOR ITS REASON. The loop below asks
+  // `anonLeafFnValueTarget` — a whole-arena scan — of every binding in the program, so an
+  // ungated pass is quadratic in the node count for EVERY module, the compiler's own source
+  // included (measured: the self-compile stopped finishing). Nothing can be recorded unless
+  // some row actually moved, and that is one O(n) read of the marks the passes above wrote.
+  let moved = false
+  let mr = 0
+  while mr < anonLeafRetMoved.length {
+    if anonLeafRetMoved[mr] == 1 { moved = true }
+    mr = mr + 1
+  }
+  let mp = 0
+  while mp < anonLeafParamMoved.length {
+    if anonLeafParamMoved[mp] == 1 { moved = true }
+    mp = mp + 1
+  }
+  if !moved { return 0 }
   let i = 0
   while i < P.nodes.length {
     const n = P.nodes[i]
@@ -10969,6 +11041,55 @@ function internArmShapeAt(nm: string, depth: i32) {
   internArmShapeOf(nm)
 }
 
+// THE ARM'S RENDER, SPELLED THE WAY THE ARM'S OWN ROW IS CODED (silent-class-inventory
+// D1093). `tyToEmitName` renders a field's INLINE literal union faithfully — `{r:i32,k:"a"|"b"}`
+// — and `internInlineShapeTy` codes that text through the NAME ladder, where
+// `nameIsLitUnionType` claims it as the interned i32 ATOM (code 0). The VARIANT recorder
+// codes the SAME field from the annotation NODE, where the inline spelling is not a
+// registered alias and canon has softened it, so it codes 3 (a plain string slot) — and 3 is
+// what the arm's wasm struct is actually laid out with, exactly as the DECLARED spelling of
+// the same struct is. `variantStructHeapTwinAt` compares the two tables' codes POSITIONALLY,
+// so the mint could never be recognised as the arm's own row and `armFieldStructRow`
+// answered -1: a field typed as that arm had no rep, while the NAMED-alias spelling of the
+// identical union ran.
+//
+// THIS IS NOT A REP CHANGE AND IT DOES NOT SOFTEN THE TYPE. `Circle`'s checker type keeps its
+// member set, its VARIANT row keeps the unsoftened `"a"|"b"` in the IDENTITY column
+// (`variantFieldIdText` — what keeps two literal-tagged arms discriminable), and the emitted
+// slot is the string ref it already was. What is softened is the anonymous interned ROW'S OWN
+// KEY, which must describe the layout it carries: `annShapeIndexOf` matches rows by field
+// NAMES + CODES while `structIndexByName` resolves them by that key, so a row NAMED
+// `{r:i32,k:"a"|"b"}` while laid out as `{r:i32,k:string}` is a name that lies about its
+// layout — and the next annotation spelling the truthful text would dedup onto it and lose
+// its own name.
+//
+// BYTE-IDENTICAL WHERE NOTHING SOFTENS: the render is returned UNCHANGED unless a field
+// actually substitutes, so every arm without an inline literal-union field mints exactly the
+// key it minted before. A NAMED alias field (`k: K`) is not touched — `nameIsInlineLitUnion`
+// is false for it and both ladders already code it 0 — and neither is a NUMERIC literal union,
+// whose members are not quoted.
+function armMintShapeName(nm: string) {
+  if !nameIsShapeSpanEnds(nm) { return nm }
+  const fnames: string[] = []
+  const ftexts: string[] = []
+  shapeInnerFieldSplit(groupInnerOf(nm), fnames, ftexts)
+  let changed = false
+  let out = "{"
+  let i = 0
+  while i < fnames.length {
+    if i > 0 { out = out + "," }
+    let tx = ftexts[i]
+    if nameIsInlineLitUnion(tx) {
+      tx = "string"
+      changed = true
+    }
+    out = out + fnames[i] + ":" + tx
+    i = i + 1
+  }
+  if !changed { return nm }
+  out + "}"
+}
+
 function internArmShapeOf(nm: string) {
   const vi = variantIndexOf(nm)
   if vi < 0 { return 0 }
@@ -10981,7 +11102,7 @@ function internArmShapeOf(nm: string) {
   // `sNames` row, so this resolver declines and `exprVariantIndex` answers") turned off
   // module-wide. The row is found structurally instead, by `variantStructHeapTwinAt`'s
   // `repRowOfTyStruct` rung, which is the same route an inline `{r: i32}` field already takes.
-  internInlineShape(tyToEmitName(aty))
+  internInlineShape(armMintShapeName(tyToEmitName(aty)))
   0
 }
 
@@ -11118,11 +11239,17 @@ function pushFieldRow(
   fName: string,
   tyText: string,
   elemTyHint: i32,
+  litTyIx: i32,
   cloSig: string,
 ) {
   if toVariant {
     uFieldTypes.push(code)
     uFieldTyText.push(tyText)
+    // The DISCRIMINANT column (D1023): the field's own arena type when it is a literal set,
+    // `-1` otherwise. Pushed here rather than at each recorder for the parallel-table reason
+    // every other column is — three recorders write this table, and a column one of them
+    // forgets is a row whose index means a different field in each.
+    uFieldLitTyIx.push(litSetTyIxOf(litTyIx))
     uFieldElemName.push(elemNm)
     recordUFieldElemRowTy(elemNm, keyI32, elemTyHint) // D5 + B6b
     uFieldNames.push(fName)
@@ -11288,11 +11415,13 @@ export function collectS(stmts: i32[]) {
               fnode.fdName,
               "",
               fieldElemHintOf(fnode.fdType, code, recNm),
+              -1,
+              // THE ARENA, not a render: the field text this recorder would have to
+              // re-render for a closure field is the render #1615 deleted as dead, and
+              // `sigKeyOfTy` answers the same key from the type it already has.
               fieldCloSigOfTy(code, nodeTyIxOf(fnode.fdType)),
             )
-            // THE ARENA, not a render: the field text this recorder would have to
-            // re-render for a closure field is the render #1615 deleted as dead, and
-            // `sigKeyOfTy` answers the same key from the type it already has.
+            // the STRUCT table has no discrimination rule to key, so no column either
 
             // A DEAD RENDER, deleted. This is `pushFieldRow`'s `tyText`, and the branch this
             // call takes (`toVariant == false`) never reads it — only the VARIANT branch has a
@@ -11400,10 +11529,10 @@ function collectShapeVariantFields(nm: string, shapeTy: i32) {
       fnames[fi],
       variantFieldIdText(ftxt, fldTy),
       -1,
+      fldTy,
+      // The VARIANT table has no `sFieldCloSig` twin — this branch pushes none.
       "",
     )
-    // The VARIANT table has no `sFieldCloSig` twin — this branch pushes none.
-
     cnt = cnt + 1
     fx = fx + 1
   }
@@ -11497,10 +11626,10 @@ function collectVariantFields(stmts: i32[], name: string) {
               fnode.fdName,
               variantFieldIdText(ftxt, nodeTyIxOf(fnode.fdType)),
               fieldElemHintOf(fnode.fdType, code, elemNm),
+              nodeTyIxOf(fnode.fdType),
+              // The VARIANT table has no `sFieldCloSig` twin — this branch pushes none.
               "",
             )
-            // The VARIANT table has no `sFieldCloSig` twin — this branch pushes none.
-
             // Same column, same reasoning — and `fnode` is still live here, 33 lines after
             // `ftxt` was rendered from it. An earlier pass filed this site as string-only by
             // looking at the ARGUMENT's surface form rather than at what was in scope.
@@ -11603,6 +11732,15 @@ function assignTags() {
   // loudly here rather than emit the bad module. Layout-EQUAL same-name variants (the same
   // shape reached through two spellings) stay legal — they are one variant, and the twin
   // machinery already folds them.
+  //
+  // AND SO ARE ARMS A LITERAL-TYPED FIELD TELLS APART (D1023). `variantLitDiscriminable`
+  // admits a same-signature pair whose fields differ ONLY in literal sets of the same
+  // storage — `{kind: "circle", r: f64} | {kind: "square", r: f64}`, the TypeScript idiom
+  // this reject made unwritable. They are ONE tag and ONE layout, exactly as the folded
+  // pairs are; what makes them two arms is a VALUE, and `emitIs` reads the discriminant
+  // column to compare it. What still rejects here is the pair no value tells apart — and by
+  // the ruling that is a DESIGN rule the CHECKER owes (`checkUnionDiscriminable`), so this
+  // is now an unreachable floor rather than the diagnosis a user sees.
   let ui = 0
   while ui < unVarStart.length {
     const vs0 = unVarStart[ui]
@@ -11612,7 +11750,27 @@ function assignTags() {
       let b = a + 1
       while b < vc {
         if sigs[vs0 + a] == sigs[vs0 + b] {
-          if !variantFieldTysEq(vs0 + a, vs0 + b) {
+          if (
+            !variantFieldTysEq(vs0 + a, vs0 + b) &&
+            !variantLitDiscriminable(vs0 + a, vs0 + b)
+          ) {
+            // TWO REFUSALS, because they are two different things and one sentence was
+            // saying the wrong one about the second (D1023). The DESIGN rule — arms nothing
+            // tells apart — is the checker's now (`checkUnionDiscriminable`), so reaching it
+            // here is an unreachable floor. What still arrives is the CAPABILITY gap: two
+            // arms the ruling calls legal whose literal sets rep differently (an interned
+            // atom beside a string ref), where the types agree and only the layouts do not.
+            if variantLitRepMismatch(vs0 + a, vs0 + b) {
+              return emitFail(
+                "emitProgram: union `" +
+                  unNames[ui] +
+                  "` discriminates `" +
+                  uVariants[vs0 + a] +
+                  "` from `" +
+                  uVariants[vs0 + b] +
+                  "` on a literal field whose two arms rep differently (a named literal-union alias is an interned atom, an inline set a string) — this program is type-valid but cannot build; spell both arms the same way",
+              )
+            }
             return emitFail(
               "emitProgram: union `" +
                 unNames[ui] +
@@ -12922,6 +13080,7 @@ export function collectU(stmts: i32[]) {
   uFieldCount = []
   uFieldTypes = []
   uFieldTyText = []
+  uFieldLitTyIx = []
   uFieldElemName = []
   uFieldElemTyIx = []
   uFieldElemKeyI32 = []

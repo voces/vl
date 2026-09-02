@@ -50,6 +50,10 @@ DOC SHAPE IT READS
 Only the FIRST indented block after the first `Repro` line is run. Lines inside it that
 begin with `//` at top level are kept (they may be directives), so the program is used
 verbatim.
+
+A witness that needs MORE THAN ONE MODULE splits the block with `// file: <name>.vl` marker
+lines; each marker starts a file and the LAST one is the entry that is checked, run and
+built. Relative imports between the sections resolve. See `split_files`.
 """
 import json, re, subprocess, sys, tempfile, os
 from pathlib import Path
@@ -153,12 +157,39 @@ TRAP_MARKERS = ("wasm trap", "unreachable", "out of bounds", "divide by zero",
                 "null reference", "cast failure", "integer overflow")
 
 
+# A MULTI-FILE WITNESS. Some defects need two modules to exist at all — a merge-time registry
+# collision between two modules' same-named `self`-functions (D1120) cannot be spelled in one
+# file, and until this existed such a row was UNGRADEABLE and so unfileable under `--strict`.
+# The repro block carries `// file: <name>.vl` marker lines; each starts a new file, and the
+# LAST section is the entry the three channels run. A block with no marker is one file, as
+# before. Relative imports resolve inside the temp dir, so `import { x } from "./a"` works.
+FILE_MARK = re.compile(r"^// file: (\S+\.vl)\s*$")
+
+
+def split_files(src):
+    """(name, source) per `// file:` section; a single unnamed section is `w.vl`."""
+    files, name, body = [], None, []
+    for ln in src.splitlines():
+        m = FILE_MARK.match(ln)
+        if m:
+            if name is not None:
+                files.append((name, "\n".join(body).rstrip() + "\n"))
+            name, body = m.group(1), []
+        else:
+            body.append(ln)
+    if name is None:
+        return [("w.vl", src)]
+    files.append((name, "\n".join(body).rstrip() + "\n"))
+    return files
+
+
 def run_program(src):
     """Classify what the compiler does with `src`, on the same three channels the
     silent-sweep harness separates: check (diagnostic), run (value), build (module)."""
     with tempfile.TemporaryDirectory() as td:
-        f = os.path.join(td, "w.vl")
-        Path(f).write_text(src)
+        for name, body in split_files(src):
+            f = os.path.join(td, name)
+            Path(f).write_text(body)
         chk = subprocess.run([VL, "check", f, "--compiler", COMPILER],
                              capture_output=True, text=True, timeout=120)
         run = subprocess.run([VL, "run", f, "--compiler", COMPILER],
@@ -198,6 +229,11 @@ SELF_TEST = [
     # Before `trap_loads` existed this graded `silent_invalid_wasm`, which is what D19
     # sat behind.
     ("trap_loads", "const xs: i32[] = [1, 2]\nprint(xs.length)\nprint(xs[9])\n"),
+    # A TWO-FILE program: the `// file:` splitter must deliver the module the entry imports.
+    # Without the split this is one file whose first line is a comment and whose second is an
+    # `export` in a module that then imports from a sibling that does not exist.
+    ("runs", "// file: a.vl\nexport function six(): i32 { return 6 }\n"
+             "// file: main.vl\nimport { six } from \"./a\"\nprint(six() * 7)\n"),
 ]
 
 
@@ -215,7 +251,31 @@ def self_test():
     print(f"{len(SELF_TEST)} specimens · {len(SELF_TEST)-bad} routed correctly · {bad} wrong")
     return 1 if bad else 0
 
-SEC = re.compile(r"^#{2,4}\s+(D\d+[A-Za-z]?|[A-Z]\d+)\s+[—-]\s+(.*)$")
+SEC = re.compile(r"^#{2,4}\s+(D\d+(?:-?[A-Za-z][A-Za-z0-9]*)?|[A-Z]\d+)\s+[—-]\s+(.*)$")
+# A row id may carry a suffix, and the suffix grammar is whatever authors have reached for:
+# `D661A`, `D804b`, and `D1009-N` (minted with a hyphen by a session avoiding a cross-session
+# id collision). The hyphenated form did NOT match until 2026-09-02, and the failure was
+# SILENT: the row was not graded, not reported as ungradeable, and `--strict` still printed
+# `0 not graded`. It had been stale for a day — its witness runs, and the defect it describes
+# closed as D1009.
+#
+# WIDENING THE PATTERN IS THE SMALL HALF. The real fix is `unparsed_row_heads` below: count the
+# POPULATION of row-shaped headings and assert every one was parsed, so the next id shape
+# nobody anticipated fails loudly instead of vanishing. A parser that silently drops what it
+# does not recognise cannot be audited by reading its output — which is exactly what
+# `--strict`'s four columns were supposed to guarantee.
+
+# A heading that plainly NAMES a D-row, whatever suffix grammar it uses. `SEC` must match every
+# one of these; any it misses is a row the grader cannot see.
+ROWHEAD = re.compile(r"^#{2,4}\s+D\d")
+
+def unparsed_row_heads(doc):
+    """Row-shaped headings `SEC` failed to parse — the grader's blind spot, named."""
+    out = []
+    for i, ln in enumerate(Path(doc).read_text().splitlines()):
+        if ROWHEAD.match(ln) and not SEC.match(ln):
+            out.append((i + 1, ln.strip()))
+    return out
 # ANY heading, row or not. A row's scope has to END at one: `SEC` alone only closes a row at
 # the NEXT ROW, so the last row of a doc absorbed everything after it — in
 # `silent-class-inventory.md` that is the whole of `## 3. Shared-root analysis`, whose
@@ -302,8 +362,10 @@ def main(argv):
     if not docs:
         print(__doc__); return 2
 
-    results, moved, ungradable = [], [], []
+    results, moved, ungradable, unparsed = [], [], [], []
     for doc in docs:
+        for ln_no, head in unparsed_row_heads(doc):
+            unparsed.append((doc, ln_no, head))
         for r in parse(doc):
             if not r["repro"]:
                 ungradable.append((r, "no Repro block")); continue
@@ -342,7 +404,8 @@ def main(argv):
         print(f"{r['id']:<{w}}  {'-':<22} {'-':<22} not graded ({why})")
 
     print(f"\n{len(results)} graded · {len(results)-len(moved)} as filed · "
-          f"{len(moved)} MOVED · {len(ungradable)} not graded")
+          f"{len(moved)} MOVED · {len(ungradable)} not graded · "
+          f"{len(unparsed)} UNPARSED")
     if moved:
         print("\nRows whose filed behaviour no longer reproduces — re-grade the doc:")
         for r in moved:
@@ -362,10 +425,20 @@ def main(argv):
         print("      a defect reachable only under a change that was REFUSED is a "
               "refutation pin: file the program that must keep RUNNING, with the status "
               "`runs today and must keep running`.")
+    # AN UNPARSED ROW HEADING IS WORSE THAN AN UNGRADED ROW, because it is not in ANY
+    # column. `D1009-N` sat here for a day: not graded, not reported ungradeable, and
+    # `--strict` printing `0 not graded` beside it. The row had gone stale — its witness runs
+    # and the defect closed as D1009 — and nothing said so. Reading the four columns cannot
+    # catch what never entered them, so the population is counted instead of the matches.
+    if unparsed:
+        print("\nRow headings this parser did NOT recognise - they are in no column above:")
+        for doc, ln_no, head in unparsed:
+            print(f"  {doc}:{ln_no}  {head[:110]}")
+        print("      fix: widen `SEC`'s id pattern to admit the suffix, or rename the row.")
     if out_json:
         Path(out_json).write_text(json.dumps(results, indent=2))
         print(f"\nwrote {out_json}")
-    return 1 if (moved or (ungradable and strict)) else 0
+    return 1 if (moved or unparsed or (ungradable and strict)) else 0
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))

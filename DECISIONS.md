@@ -3984,11 +3984,47 @@ ruled (unknown key → no match, exact case, duplicate keys a parse error, `i64`
 union arms by first token / required key set). Four sub-rules carry recommendations and
 await the owner (`docs/serde-design.md` §"Deep `is` / `as` over a `Json` value"): the
 narrowed value is a COPY and `is` rebinds; `i32`/`i64` fields accept only an integral
-in-range number (the same predicate as q2's exact `as`, ruled the same day); absent key ≠ present `null`
-(the read-side mirror of decision A); `as` propagates a `JsonError { kind: "shape", path }`
+in-range number (the same predicate as q2's exact `as`, ruled the same day); an absent key
+reads as `null` for a `T | null` field (RULED the same day, next section — the
+recommendation had been the opposite); `as` propagates a `JsonError { kind: "shape", path }`
 rather than the useless remainder. A helper returns to the list the day a consumer that
 cannot name its shape arrives, and not before — std has no deprecation story, so the
 cheapest helper is the one never shipped.
+
+### An ABSENT key matches a `T | null` field and reads as `null` — VL's map read already says so (serde-design S3, owner, 2026-09-02)
+
+The sub-rule as drafted said the opposite: absent ≠ present `null`, the read-side mirror
+of decision A (the writer always emits `"f": null`), on the argument that `{x} | {x, y}` is
+only decidable when absence is a fact. The owner asked three questions — is `doc` a struct
+or a map, could an absent key match `null`, and does VL have optional-key semantics at all —
+and the measured answers reversed the recommendation before the ruling was made:
+
+- **`doc`'s object level is the MAP `{[string]: Json}`; the target is a STRUCT.** Absence is
+  a fact of the source; a VL struct has no absent field and no `field?: T` syntax exists —
+  `T | null` is the language's one spelling of "maybe not there". So the only question is
+  whether the walk PRESERVES the difference (refuse) or COERCES it (absent → `null`); a
+  struct cannot hold it either way.
+- **VL's own map read is already absent → `null`.** `const m: {[string]: i32} = Map();
+  m["a"] = 0; m["zz"] == null` prints `true` on the current seed, with the stored `0` under
+  `"a"` reading as `0` (#1899/#1901 made a miss distinguishable from a stored zero). A shape
+  walk that refused the absent key would be STRICTER than reading the same map by hand,
+  which is the argument that decided it.
+- **Nothing a struct could have expressed is lost.** The consumer that needs "absent vs.
+  explicit null" still has the map (`doc["host"]`); the round trip canonicalises only the
+  JSON text (`{}` → `{"host": null}`, the VL value identical). The cost — a producer that
+  forgot a nullable field reads as `null` rather than failing `is` — is the cost `m[k]`
+  already carries.
+
+**Ruling.** A missing key matches a field typed `T | null` and the field reads `null`. A
+missing NON-nullable field is not a match. A `T | null` field is therefore NOT a required
+key, so OQ-7's required-key-set rule refuses `{x: i32} | {x: i32, y: i32 | null}` as
+ambiguous at the `is` site, naming both arms — the OQ-7 ruling's own sentence ("two
+versions differing only in an optional field genuinely cannot be told apart") was already
+this rule. Decision A on the WRITE side stands: total writer, lenient reader, and the
+asymmetry is the chosen one. Grading list, with the un-annotated spelling of each (an
+annotation pins a rep the walk must not depend on): `{"port": 1} is Cfg` → `true` and
+`cfg.host == null`; `{"port": 1, "host": null}` → `true`; `{"host": "x"}` → `false`; the
+two-arm union above refused at the checker.
 
 ## Numeric `as` to an INTEGER target is exact-or-fail under the trio; a float target rounds; nothing ships in std (owner, 2026-09-02)
 
@@ -4179,9 +4215,56 @@ reject becomes an unreachable floor; (4) `==`-narrowing and `is`-narrowing over 
 must agree at every spelling — grade both. Grading list: D1023's filed witness (prints `a` then
 `b`), the six-row table in its RULED paragraph, `is` and `==` narrowing side by side on the
 Circle/Square idiom, the overlapping-set case answering `true`/`true` for `"y"` and
-`true`/`false` for `"x"`, and the `{v: i32} | {v: boolean}` pair refusing at CHECK. Interim std
-rule until built, unchanged: every std error struct carries a field NAME no other std error
-type has (`JsonError.path`).
+`true`/`false` for `"x"`, and the `{v: i32} | {v: boolean}` pair refusing at CHECK.
+
+**BUILT 2026-09-02 (#2365), as the four steps, and the recommended rep cost no rep change.**
+Three things the build settled that the ruling deliberately left open, kept because each was a
+question someone will ask again:
+
+* **The compare works on ONE layout because atom ids are interned globally by literal VALUE.**
+  `internAtom` is a single module-global map keyed by the literal's text, so `"y"` is the same
+  `i32` in `type KA = "x" | "y"` (position 1) and `type KC = "y" | "z"` (position 0) — measured
+  on a disassembly. Had the ids been per-type positions, a value compare would have needed
+  atoms interned per BASE type first, which IS a rep change. Note also that a literal set has
+  two reps and only one is a sentinel: an inline `kind: "x" | "y"` is a `(ref $string)` holding
+  the member's own characters, a registered ALIAS the interned atom. The compare is therefore
+  picked off the field's STORAGE, which is what makes the answer independent of spelling.
+* **The membership test must be a GUARD, not a conjunct.** Both operands of an `i32.and`
+  evaluate, so conjoining membership onto the tag test ran the discriminant read — a
+  `ref.cast` to this arm's heap type — on values of every other arm. A two-arm union hides
+  this completely (both arms share the shape, so the cast always succeeds); it takes a THIRD
+  arm with different field names to see it. Lowered as `if (result i32) … else 0`.
+* **A shared tag with two heap types is not a representation.** Tags key on the field-NAME
+  signature, so these arms always shared one; `buildVariantTwins` keys on a canon id that
+  PRESERVES each arm's literal set, so they did not share a heap type — and the box is built
+  under whichever row the field-name match hits first, so the other arm's `ref.cast` trapped.
+  Admitting the pair without folding it reproduced the filed bug from the other side. One
+  predicate now answers for both callers so they cannot drift.
+
+**Residue: the two litunion reps in one union (D1050).** `{kind: K1} | {kind: "x" | "y"}` is
+legal by this ruling and still refuses, because an interned atom and a string ref share no
+layout. Closing it means unifying the litunion reps — the rep cliff — and was out of scope; the
+refusal now says so in words that concede the program is type-valid rather than claiming the
+field types differ. The interim std rule is retired: a std error struct no longer NEEDS a
+unique field name, since a unique `kind` literal now discriminates. `JsonError.path` stays for
+the information it carries, not for discrimination.
+
+**Amendment (owner, 2026-09-02): a literal set beside its own base is legal.**
+`type A = { kind: "x" | "y" }` beside `type B = { kind: string }` in one union is a LEGAL
+discriminated pair: `v is A` ≡ `v.kind ∈ {"x","y"}`, `v is B` is true for every value of the
+shared shape (B's set is the whole base), and `else` after `is A` narrows to B. It is the
+overlapping-set case with one set being the base, and the ruling's principle line — *`is` asks
+whether the VALUE is a member of the type: by tag when the tag can answer, by value when it
+cannot* — already covers it. **The "treat a pair as distinguishable only where BOTH arms carry
+a literal set of the SAME base type" sentence above is superseded for this pair**: one arm
+carrying a set and the other carrying that set's BASE is enough. Unchanged either way: a pair
+where NEITHER arm carries a set (`{v: i32} | {v: boolean}`) still refuses at CHECK, and a pair
+whose field BASE TYPES differ (`{v: i32} | {v: "a" | "b"}`) is a different question this
+amendment does not reach. The lowering follows the asymmetry — a membership compare is emitted
+only for the arm that HAS a set, so `is B` stays the bare tag test — and that asymmetry is what
+makes the `"z"` value (a B that is not an A) the cell which actually grades the rule.
+Fixture: `tests/cases/unions/discriminant-value-is-set-beside-base.vl`, both spellings
+(annotated and inferred), both directions, both bases.
 
 ## A `type` declared in a function body is legal and lexically scoped, may name the enclosing function's type parameters, and is refused loudly until built (owner, 2026-09-02)
 
@@ -4223,15 +4306,18 @@ under D426 because the rule the owner agreed to — a body-scoped declaration se
 signature's type parameters — is the one rule all three node kinds owe, and the build closes
 them together.
 
-**Two sub-rulings, recorded as vl-b7's recommendation and standing unless the owner objects.**
+**Two sub-rulings. The first is the owner's (2026-09-02, shown the example and answering
+"seems like it should obviously be an error"); the second is vl-b7's recommendation and
+stands unless the owner objects.**
 
-* **A local NOMINAL type does not escape through an inferred return type.** `type Id = new
-  i32` inside `f` and `return Id(3)` with no return annotation would infer a type that no
-  caller can NAME — the checker refuses it, as it does any unnameable inferred type, with a
-  message that says to declare the type at module scope or annotate the return. A local
-  STRUCTURAL type escapes freely as its shape, because the shape is the type and the caller can
-  spell it. The asymmetry is the whole point of `new`: nominality is a name, and a name that
-  goes out of scope takes the nominal identity with it.
+* **A local NOMINAL type does not escape through an inferred return type — ERROR.** `type Id
+  = new i32` inside `fresh` and `return Id(7)` with no return annotation would infer a type
+  that no caller can NAME — the checker refuses it at the return, as it does any unnameable
+  inferred type: `` return type `Id` is declared inside `fresh` and no caller can name it;
+  annotate the return or move `Id` to module scope ``. A local STRUCTURAL type escapes freely
+  as its shape, because the shape is the type and the caller can spell it. The asymmetry is
+  the whole point of `new`: nominality is a name, and a name that goes out of scope takes the
+  nominal identity with it.
 * **Nothing else escapes either, and nothing needs a rule for it.** A local type used only
   in a local binding, argument, or `is` never reaches a signature, so the question of what a
   caller sees does not arise.
@@ -4261,12 +4347,11 @@ expect(build(cfg))
 
 the `expect` line is the setup and the `.toEqual` line is the assertion; Jest and Vitest
 report the matcher's line for the same reason. On today's grammar that spelling does not
-parse (`expected an expression but found DOT`, measured 2026-09-02 — a leading-dot
-continuation line is not admitted, and whether it should be is a grammar question for the
-owner, not filed as a defect), so on every program that compiles today only the COLUMN
-moves: `__callsite__` on a UFCS call already anchors on the METHOD token, column 14 for
-`expect(x).toEqual(y)` at column 5. No existing report changes its line; the ruling is made
-now so the location is right on the day the grammar admits the second line.
+parse (`expected an expression but found DOT`, measured 2026-09-02); the owner ruled the same
+day that it must — §"A leading `.` on a new line continues the chain" below — so until that
+lands only the COLUMN moves: `__callsite__` on a UFCS call already anchors on the METHOD
+token, column 14 for `expect(x).toEqual(y)` at column 5. No existing report changes its line;
+the ruling is made now so the location is right on the day the grammar admits the second line.
 
 **How it lands, and why it is not landing today.** Each matcher — `toEqual`, `toBeTrue`,
 `toBeFalse`, and `not`'s continuation — takes a trailing `caller: CallerLoc = __callsite__`,
@@ -4276,10 +4361,63 @@ change alters std exports and goes through `std-api-reviewer`; the header's anch
 and the track-caller ruling's "`expect` only" section are updated with it, and the editor's
 location line (`testDiscovery.ts`) is unchanged because the wire format is unchanged.
 
-**It is blocked by a compiler defect, found while measuring the move.** A UFCS call that OMITS
-a defaulted tail argument is refused `no field 'toEqual' on Expectation` in any module build
-that merges a `self`-function-bearing module — which `std:test` is, so EVERY test file. The
-direct spelling and the supplied-argument spelling run. Filed as D1044 with an eight-row
-ablation; the matcher move ships the PR after D1044's fix merges, and is graded on the
-multi-line spelling reporting the `.toEqual` line, the one-line spelling reporting column 14,
-and `not.toEqual` reporting the final matcher.
+**It was blocked by a compiler defect, found while measuring the move — closed the same day.**
+A UFCS call that OMITS a defaulted tail argument was refused `no field 'toEqual' on
+Expectation` in any module build that merges a `self`-function-bearing module — which
+`std:test` is, so EVERY test file. The direct spelling and the supplied-argument spelling ran.
+Filed as D1044 with an eight-row ablation and closed by #2371 (the merge's UFCS registry
+matched the DECLARED parameter count exactly where its consumers match an arity range). The
+matcher move is unblocked and is graded on the one-line spelling reporting column 14,
+`not.toEqual` reporting the final matcher, and — once the leading-dot ruling below is built —
+the multi-line spelling reporting the `.toEqual` line.
+
+## A leading `.` on a new line continues the chain (owner, 2026-09-02)
+
+**Ruling.** A NEWLINE followed by `.` or `?.` continues the postfix chain of the expression
+before it:
+
+```vl
+expect(build(cfg))
+  .toEqual(want)
+
+items
+  .filter(keep)
+  ?.first()
+```
+
+The owner's framing: *"for long chains, allowing the `.` on the next line is basically required
+or we have to deal with long lines."* Long chains are otherwise one line or nothing.
+
+**Why it is free here, and the exact rule.** VL's NEWLINE is a real token, and no legal
+statement starts with `.` or `?.` — `.5` is already a parse error at the DOT (lexer.vl, the
+NUMBER arm) and there is no other leading-dot form — so the rule reinterprets ONLY programs
+that are parse errors today; no existing program changes meaning. That is the same argument
+JS, Swift, Kotlin, Rust and Ruby rely on (Go cannot, because its semicolon rule fires at the
+trailing paren). The rule is deliberately tight, and these three edges are part of it:
+
+* **`(` and `[` do NOT continue.** A line starting with `(` is a legal parenthesised
+  statement today and a line starting with `[` a legal array-literal statement; admitting
+  either as a continuation is the classic ASI hazard and would change existing programs.
+* **Leading-dot is the ONLY form.** Go-style trailing-dot (`expect(x).` ⏎ `toEqual(y)`) also
+  fails today (`expect("IDENT")` meets NEWLINE) and stays refused: two spellings of one thing
+  is exactly what `fmt` would then have to canonicalise.
+* **Comment lines between links work for free** — the lexer consumes `// …` up to the newline,
+  so a commented-out link is just NEWLINE tokens.
+
+**The formatter is the real half of the build (vl-b7's recommendation, standing unless the
+owner objects).** `format.vl` is AST-driven and prints member chains inline, so without a
+chain-break policy `vl fmt -w` re-joins the lines and `lint-self.sh`'s `fmt --check` makes the
+form unusable in this repo. The policy is the deterministic one the formatter already uses for
+lists — **fit-or-break**: a chain that fits within `fmtWidth` prints inline; one that does not
+prints one `.link(args)` per line, indented one level, from the first link. `expect(x).toEqual(y)`
+fits and stays on one line; a long builder chain breaks. No author-break preservation: the
+formatter's output is a function of the tree and the width, as everywhere else.
+
+**Build.** Parser: in `parsePostfix`'s loop (`parser.vl`), on NEWLINE peek past the run of
+newlines and continue iff the next kind is `DOT` / `QUESTION_DOT` — a few lines. Formatter:
+the fit-or-break chain layout. Fixtures: a leading-dot chain across 2 and 3+ links, one with a
+comment line between links, `?.` as a continuation, a line starting with `(` and one starting
+with `[` still parsing as their own statements, and `fmt` round-tripping both a fitting and a
+breaking chain. The LSP is untouched (no new token kinds). A consequence for the matcher ruling
+above: with the matcher on its own line the failure's LINE moves, not just its column — which
+is the case where anchoring at `expect` would have sent an author to the wrong line.
