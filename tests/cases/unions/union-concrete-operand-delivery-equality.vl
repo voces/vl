@@ -1,0 +1,193 @@
+// @run
+// D1097 + D1099 — HOW THE CONCRETE OPERAND OF A UNION `==` IS DELIVERED.
+//
+// ONE MECHANISM, TWO FACES, and they were filed as two rows. `exprVariantIndex` is
+// REP-AUTHORITATIVE over BINDINGS — its answer decides how a `let`/global cell is typed —
+// so it carries one leg per storage class a binding can take (param, declared local,
+// capture, module global, `as` cast, call, index, `??`) and none for a struct-FIELD read;
+// and it declines an UN-ANNOTATED object literal the moment the struct table holds a row
+// matching its field set, which is `objLitVariantIdxNoStructRow`'s own precondition. Both
+// answer -1 while the VALUE is a perfectly good arm-typed ref, and the compare declined on
+// that -1.
+//
+// PROBED, NOT READ OFF THE CODE PATH. At the declining rung the two cells print
+// IDENTICALLY — `vi=-1 ssi=0 allU=A:0, allS={x:i32}:0,H:1,` — and the last two columns are
+// the fix: the operand's STRUCT row and the arm's VARIANT row are the same wasm heap type.
+// `sHeapIdx` and `uVarHeap` are two INDEX spaces over one TYPE space, and where a row in
+// each interned to the same struct type the two values are interchangeable byte for byte,
+// which is all the compare needs — it casts the box's payload to `uVarHeap[vi]` and parks
+// the concrete operand in a slot typed from the same index. Rows that interned separately
+// still decline, and so does an AMBIGUOUS match (two arms sharing one heap type), where
+// the heap does not determine the TAG.
+//
+// D1099'S INGREDIENT IS THE SECOND DECLARATION, NOT THE MISSING ANNOTATION: `type N` below
+// declares an inline `{x: i32}` that nothing uses, and its presence alone is what makes
+// the un-annotated `{x: 1}` stop resolving its arm. Delete `N` and the same file ran
+// before this fix.
+//
+// A FIXTURE THAT ANNOTATES EVERY OPERAND CANNOT SEE THIS (D969), so the un-annotated
+// spelling is here beside the annotated one, and the annotated rows DECLARE their
+// `redundant type annotation` hints rather than deleting the annotations: the hint is the
+// checker agreeing about the TYPE and says nothing about the REP.
+
+// @hint redundant type annotation: `hI` is inferred as `{a: {x: i32}}`
+// @hint redundant type annotation: `hJ` is inferred as `{a: {x: i32}}`
+// @hint redundant type annotation: `aAnn` is inferred as `{x: i32}`
+// @hint redundant type annotation: `aAnn2` is inferred as `{x: i32}`
+// @hint redundant type annotation: `dot1` is inferred as `{x: i32}`
+// @hint redundant type annotation: `dot2` is inferred as `{x: i32}`
+// @hint redundant type annotation: `hS` is inferred as `{s: {t: string}}`
+// @hint redundant type annotation: `sAnn` is inferred as `{t: string}`
+
+type A = { x: i32 }
+type H = { a: A }
+// Declared and never used: its INLINE `{x: i32}` is the whole ingredient of D1099.
+type N = { inner: { x: i32 } }
+
+function mk(n: i32): A | i32 {
+  if n == 0 { return 5 }
+  { x: n }
+}
+
+const p1 = mk(1)
+const p2 = mk(2)
+const pS = mk(0)
+
+// ── the concrete operand read out of a struct FIELD (D1097) ──────────────────
+const hI: H = { a: { x: 1 } }
+const hJ: H = { a: { x: 2 } }
+// @log true
+print(p1 == hI.a)
+// @log false
+print(p1 == hJ.a)
+// the box holds the SCALAR arm — the tag misses, so false rather than a trap
+// @log false
+print(pS == hI.a)
+// reversed operand order
+// @log true
+print(hI.a == p1)
+// `!=`
+// @log true
+print(p1 != hJ.a)
+// binding the field read first resolves through the same read, so it is the same cell
+const tI = hI.a
+// @log true
+print(p1 == tI)
+// @log false
+print(p2 == tI)
+
+// ── the UN-ANNOTATED concrete operand, beside `type N` (D1099) ────────────────
+const aInf = { x: 1 }
+const aInf2 = { x: 2 }
+// @log true
+print(p1 == aInf)
+// @log false
+print(p1 == aInf2)
+// @log false
+print(pS == aInf)
+// @log true
+print(aInf == p1)
+// @log true
+print(p1 != aInf2)
+
+// ── the ANNOTATED spelling still runs, unchanged ─────────────────────────────
+const aAnn: A = { x: 1 }
+const aAnn2: A = { x: 2 }
+// @log true
+print(p1 == aAnn)
+// @log false
+print(p1 == aAnn2)
+
+// ── the two deliveries agree with each other, which is the point ──────────────
+// @log true
+print((p1 == hI.a) == (p1 == aInf))
+// @log true
+print((p1 == aAnn) == (p1 == aInf))
+
+// ── A PLAIN STRUCT that is a LAYOUT TWIN of the arm, which is the soundness edge
+//    of a bridge keyed on heap identity: `Dot` is not an arm of anything, has its
+//    own struct row, and interns to the arm's wasm struct type. Structurally it IS
+//    `A`, so the compare is the same compare — and where two rows interned
+//    SEPARATELY the bridge finds no match and the caller keeps its loud refusal ──
+type Dot = { x: i32 }
+const dot1: Dot = { x: 1 }
+const dot2: Dot = { x: 2 }
+// @log true
+print(p1 == dot1)
+// @log false
+print(p1 == dot2)
+// the box holds the scalar arm
+// @log false
+print(pS == dot1)
+// @log true
+print(dot1 == p1)
+
+// ── a STRING-field arm, so the delivery is not tied to one field rep ──────────
+type SA = { t: string }
+type HS = { s: SA }
+function mkS(n: i32): SA | i32 {
+  if n == 0 { return 5 }
+  if n == 1 { return { t: "hi" } }
+  { t: "bye" }
+}
+const s1 = mkS(1)
+const s2 = mkS(2)
+const hS: HS = { s: { t: "hi" } }
+const sInf = { t: "hi" }
+const sAnn: SA = { t: "hi" }
+// @log true
+print(s1 == hS.s)
+// @log false
+print(s2 == hS.s)
+// @log true
+print(s1 == sInf)
+// @log false
+print(s2 == sInf)
+// @log true
+print(s1 == sAnn)
+
+// ── A NESTED COMPARE, which is the shape that catches an operand parked before
+//    the other operand is computed: the inner `==` re-enters this very lowering
+//    and re-uses the same per-FUNCTION scratch slots, so a clobber would make the
+//    outer compare read the INNER's operand. Chosen so a clobber CHANGES the
+//    answer — the inner compare is false and picks `{x: 2}` ─────────────────────
+function pickA(b: boolean): A {
+  if b { return { x: 1 } }
+  { x: 2 }
+}
+// inner: p1 == hJ.a is false, so pickA yields {x: 2}; outer: p1 == {x: 2} is false
+// @log false
+print(p1 == pickA(p1 == hJ.a))
+// inner: p1 == hI.a is true, so pickA yields {x: 1}; outer: p1 == {x: 1} is true
+// @log true
+print(p1 == pickA(p1 == hI.a))
+// the same two through the UN-ANNOTATED operand
+// @log false
+print(p1 == pickA(p1 == aInf2))
+// @log true
+print(p1 == pickA(p1 == aInf))
+
+// ── EVALUATION COUNTS: each side runs exactly once, including on the miss arm ──
+let boxN = 0
+let conN = 0
+function boxOf(n: i32): A | i32 {
+  boxN = boxN + 1
+  mk(n)
+}
+function conOf(): H {
+  conN = conN + 1
+  { a: { x: 1 } }
+}
+// @log true
+print(boxOf(1) == conOf().a)
+// @log 1
+print(boxN)
+// @log 1
+print(conN)
+// the MISS arm: the concrete operand is parked before the tag test, so it still runs once
+// @log false
+print(boxOf(0) == conOf().a)
+// @log 2
+print(boxN)
+// @log 2
+print(conN)
