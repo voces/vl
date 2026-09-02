@@ -1,0 +1,178 @@
+// @run
+// D1098 — A UNION ARM THAT IS A CLOSURE, COMPARED BY FUNCTION IDENTITY.
+//
+// A closure arm rides the box's `value` field directly as its fat-pointer struct — the
+// same shape the string and list arms ride — and `emitUnionUnboxTail` already recovered
+// it for a narrowed read. The `==` twin went straight to the scalar value-box lookup, so
+// the concrete spelling refused by arm name and the union-vs-union one with "atom has no
+// value box". Both now unbox as the closure struct and compare through the identity core
+// (`id` equal AND `env` `ref.eq`), the one a standalone struct's function-valued field
+// already takes.
+//
+// AND THE TAG IS THE HALF THAT IS NOT THE COMPARE. A closure arm does NOT tag at the flat
+// value-atom offset: it tags by SIGNATURE (`cloArmTagOfTy` → `cloSigSlotTag`), where the
+// FIRST signature a module interns keeps the kind-11 offset and each further one claims
+// the band above. All three union `==` lowerings read `scalarTagOfKind(11)`, which is
+// right for exactly one union per module — so with two closure-armed unions in one file
+// the second one's compare tested a tag its own box never writes. That is a WRONG ANSWER
+// at the union-vs-concrete spelling and a `ref.cast` TRAP at the union-vs-union one,
+// where the failed test falls through to the next arm's payload cast. THE THREE-SIGNATURE
+// AND TWO-CLOSURE-ARM SECTIONS BELOW ARE THAT PIN: a one-signature file cannot see it.
+//
+// Every row is CONSTRUCTED AND DISCRIMINATED — the same function, a different function,
+// and the box holding the OTHER arm — at both spellings and in both operand orders.
+
+// @hint redundant type annotation: `f0` is inferred as `i32`
+// @hint redundant type annotation: `g0` is inferred as `i32`
+// @hint redundant type annotation: `f1` is inferred as `i32`
+// @hint redundant type annotation: `g1` is inferred as `i32`
+// @hint redundant type annotation: `f2` is inferred as `i32`
+// @hint redundant type annotation: `g2` is inferred as `i32`
+// @hint redundant type annotation: `csSame` is inferred as `{x: i32}`
+
+function f0(): i32 { 7 }
+function g0(): i32 { 8 }
+function f1(v: i32): i32 { v }
+function g1(v: i32): i32 { v + 1 }
+function f2(v: i32, w: i32): i32 { v + w }
+function g2(v: i32, w: i32): i32 { v * w }
+
+// ── the plain shape: a closure arm beside a scalar arm ───────────────────────
+function u0(n: i32): (() => i32) | i32 {
+  if n == 0 { return 5 }
+  if n == 1 { return f0 }
+  g0
+}
+const b0 = u0(1)
+const b0b = u0(1)
+const b0c = u0(2)
+const b0s = u0(0)
+// @log true
+print(b0 == f0)
+// @log false
+print(b0 == g0)
+// reversed operand order
+// @log true
+print(f0 == b0)
+// `!=`
+// @log true
+print(b0 != g0)
+// the box holds the SCALAR arm — the tag misses, so false rather than a trap
+// @log false
+print(b0s == f0)
+// the scalar arm still compares, beside a closure arm
+// @log true
+print(b0s == 5)
+// union vs union
+// @log true
+print(b0 == b0b)
+// @log false
+print(b0 == b0c)
+// @log false
+print(b0 == b0s)
+
+// ── THREE SIGNATURES IN ONE MODULE. Only the first keeps the flat kind-11 tag —
+//    a file with one closure signature cannot see a tag read from the wrong home ─
+function u1(n: i32): ((i32) => i32) | i32 {
+  if n == 0 { return 5 }
+  if n == 1 { return f1 }
+  g1
+}
+function u2(n: i32): ((i32, i32) => i32) | i32 {
+  if n == 0 { return 5 }
+  if n == 1 { return f2 }
+  g2
+}
+const b1 = u1(1)
+const b1c = u1(2)
+const b2 = u2(1)
+const b2b = u2(1)
+const b2s = u2(0)
+// @log true
+print(b1 == f1)
+// @log false
+print(b1 == g1)
+// @log true
+print(b2 == f2)
+// @log false
+print(b2 == g2)
+// @log false
+print(b1 == b1c)
+// @log true
+print(b2 == b2b)
+// @log true
+print(b2s == 5)
+// @log false
+print(b2s == f2)
+
+// ── TWO CLOSURE ARMS IN ONE UNION: the TAG has to pick the arm, and the two
+//    signatures claim different slots ────────────────────────────────────────
+function pick(n: i32): (() => i32) | ((i32) => i32) {
+  if n == 0 { return f0 }
+  if n == 1 { return f1 }
+  g1
+}
+const p0 = pick(0)
+const p1 = pick(1)
+const p2 = pick(2)
+const p1b = pick(1)
+// @log true
+print(p0 == f0)
+// @log true
+print(p1 == f1)
+// same arm, other function
+// @log false
+print(p1 == g1)
+// @log true
+print(p1 == p1b)
+// @log false
+print(p1 == p2)
+// different arms
+// @log false
+print(p0 == p1)
+
+// ── A CAPTURING closure: identity is (id, env), so two closures built by ONE
+//    lambda from different frames must compare UNEQUAL ─────────────────────────
+function mkAdder(k: i32): (i32) => i32 {
+  (v: i32) => v + k
+}
+function boxIt(n: i32, f: (i32) => i32): ((i32) => i32) | i32 {
+  if n == 0 { return 5 }
+  f
+}
+const a1 = mkAdder(1)
+const a2 = mkAdder(2)
+const c1 = boxIt(1, a1)
+const c1b = boxIt(1, a1)
+const c2 = boxIt(1, a2)
+// same id, same env
+// @log true
+print(c1 == a1)
+// same id, DIFFERENT env
+// @log false
+print(c1 == a2)
+// @log true
+print(c1 == c1b)
+// @log false
+print(c1 == c2)
+
+// ── A closure arm beside a STRUCT arm: the tag chooses which core runs ────────
+type CS = { x: i32 }
+function mix(n: i32): (() => i32) | CS {
+  if n == 0 { return { x: 3 } }
+  f0
+}
+const m0 = mix(0)
+const m1 = mix(1)
+const csSame: CS = { x: 3 }
+// @log true
+print(m1 == f0)
+// @log true
+print(m0 == csSame)
+// the closure arm holds, so the struct compare must not run
+// @log false
+print(m1 == csSame)
+// @log false
+print(m0 == m1)
+// @log true
+print(m1 == mix(1))
