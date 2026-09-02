@@ -1178,6 +1178,11 @@ Staged, sized honestly:
   accepted where `Json` is expected, though `null ∈ Json`; spell `const c = v[k]` and
   narrow) and **D1010** (`[1.0, null]` cannot reach `Json` unannotated; annotate the
   binding). v1 therefore ships with those two spellings and gets shorter when they close.
+  **The v1 SURFACE is proposed in `docs/json-design.md` (2026-09-01)** — and measuring it
+  found a third residue that is not a workaround but a BLOCKER: **D1021**, the ruled
+  `Json | JsonError` return (the `T | Error` shape every std module uses) is check-clean
+  invalid wasm because a RECURSIVE alias does not compose into a wider union. The API is
+  kept and the builder is sequenced after the fix; see that doc's §5.
   What this buys: `deserialize` is a two-phase read (text → `Json` → shape) whose first
   phase is reusable, the tree is the schemaless escape hatch by construction rather than a
   leftover lexer, and stage 3 retires LESS of it. The wire policies below are stage 1's

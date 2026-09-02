@@ -254,7 +254,17 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   the checker (the `Buf`/address hazard is its open remainder);
   **(G)** **Stage 1 is UNBLOCKED and SCHEDULED** — `std:json` v1 is a real `Json` VALUE TREE
   plus a parser and a renderer, not a pull lexer with hand codecs; §Approach 1 is being
-  re-derived with a POSITION axis as separate in-flight work.
+  re-derived with a POSITION axis as separate in-flight work. **Its SURFACE is now
+  proposed — `docs/json-design.md` (2026-09-01): `Json` / `JsonError { at, kind, msg }` /
+  `parseJson(self: string): Json | JsonError` / `toJson(self: Json): string | JsonError`,
+  compact, `f64` numbers, `nonfinite` render error, depth cap 128, strict per ruling A.**
+  Owner's seven answers are its §0; five decisions go to the owner after the critique round
+  (§6). **Measuring it found the blocker: D1021 — `Json | JsonError`, the ruled fs-shaped
+  return, is check-clean INVALID WASM because a recursive alias does not compose into a
+  wider union** (probe `scripts/capability-probes/recursive-union-alias-composed.vl`). The
+  API is NOT bent around it (a carrier struct runs today and was declined — std has no
+  deprecation story); the builder is sequenced after D1021. Also filed: D1022 (named arm
+  aliases `JsonObject`/`JsonArray` in a recursive union — readability, not blocking).
   Still open in that section: OQ-2/OQ-3/OQ-4 (full briefs with recommendations, awaiting a
   ruling). Engineering fallout filed: D1008 (`u8[]` struct field, clause 2),
   D1009/D1010 (`null` membership in a recursive union at the checker — stage 1 ships around
