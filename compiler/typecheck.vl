@@ -7071,7 +7071,7 @@ function isNumeric(ix: i32) {
 // ABSENCE IS `null`, NOT `""`. The old empty-string marker was never TESTED for anywhere
 // — 0 sites compared this to `""` — it only had to lose every `== "i32"` comparison, which
 // `null` does identically. `T | null` is the absence idiom the language already commits to.
-function primNameOf(ix: i32): PrimName | null {
+export function primNameOf(ix: i32): PrimName | null {
   if ix < 0 { return null }
   const t = T.tys[ix]
   if t is TyPrim { return t.primName }
@@ -36285,6 +36285,87 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
 // point. The float→int forms trap at runtime on NaN / out-of-range (see emit).
 // `as` is numeric-only for now: a non-numeric operand OR target is a type error.
 // The cast expression's type is exactly `T`.
+// THE PROPAGATION OBLIGATION A BARE `as` TAKES ON — the ONE home of the three checks, shared
+// by the UNION arm (which propagates the unwanted arms) and the NUMERIC one (which propagates
+// `null`). Returns false with the diagnostic already reported.
+//
+// The two arms differ only in WHAT they propagate, which is the `rest` parameter, so a second
+// copy of this ladder would be three more chances for the two spellings of one rule to drift.
+// The messages name `rest` for that reason: a union cast reads "propagates `B | C`" and a
+// numeric one "propagates `null`", from one set of words.
+function castPropagationFits(rest: i32, asTy: string, ix: i32): boolean {
+  // A PENDING return (-2, still being inferred) is refused rather than joined into: a cast
+  // that silently widens the function's own signature is the opposite of what an explicit
+  // cast is for, and the annotation is one word.
+  if T.curRet == -2 {
+    tErr(
+      "`as " +
+        asTy +
+        "` propagates " +
+        tyToStr(rest) +
+        " — annotate the enclosing function's return type so the propagation has a declared home",
+      ix,
+    )
+    return false
+  }
+  // AT MODULE SCOPE THERE IS NOWHERE TO PROPAGATE TO, and saying "the enclosing function
+  // cannot return it" there names a function that does not exist (it rendered "it returns
+  // _"). The cast is still the wrong tool, but for a different reason, so it gets its own
+  // sentence and points at the two spellings that do work.
+  if T.curRet < 0 {
+    tErr(
+      "`as " +
+        asTy +
+        "` propagates " +
+        tyToStr(rest) +
+        " out of the enclosing function, and there is none here — at module scope, use `as!` to trap or `as?` to take a nullable",
+      ix,
+    )
+    return false
+  }
+  if !assignable(rest, T.curRet) {
+    tErr(
+      "`as " +
+        asTy +
+        "` propagates " +
+        tyToStr(rest) +
+        ", which the enclosing function cannot return (it returns " +
+        tyToStr(T.curRet) +
+        ") — use `as!` to trap instead, or `as?` to take the null here",
+      ix,
+    )
+    return false
+  }
+  true
+}
+
+// WHETHER A NUMERIC CAST CAN FAIL, under the owner's json-design §6 q2 ruling: a cast to an
+// INTEGER target is exact-or-fail, a cast to a FLOAT target rounds and cannot.
+//
+//   f64/f32 -> i32/i64   can fail — the value must be integral AND in range (NaN, +/-Inf,
+//                        a fraction and an overflow all fail)
+//   i64     -> i32       can fail — in range, and never a wrap
+//   i32     -> i64       cannot — lossless
+//   any     -> f64/f32   cannot — rounds
+//
+// Reading the SOURCE by name keeps this total: an operand the ladder above admitted but
+// `primNameOf` cannot name (a `TyErr` from an already-reported error) answers false, so a
+// broken operand collects one diagnostic rather than two.
+// THE FIVE PAIRS, and the list is CLOSED: those are every (source, integer target) pair on
+// which a VL value can lose itself. `i32 → i64` is the one widening integer edge and is
+// lossless; everything else either targets a float (rounds) or is the identity.
+//
+// The emitter (`emitNumExactCast`) covers exactly these five, and that is not a coincidence to
+// be maintained by hand — a pair admitted HERE and not lowered THERE would type the expression
+// `T | null` and then emit the old truncating conversion into a nullable destination, which is
+// the "narrow the checker first" trade this repo has paid for repeatedly (D965).
+export function numCastCanFail(src: string, tgt: string): boolean {
+  if tgt == "f64" || tgt == "f32" { return false }
+  if tgt == "i32" { return src == "f64" || src == "f32" || src == "i64" }
+  if tgt == "i64" { return src == "f64" || src == "f32" }
+  false
+}
+
 function checkCastNode(n: AsExpr, ix: i32) {
   const arg = checkNode(n.asObj)
   const target = nameToTyAt(n.asTy, ix)
@@ -36384,45 +36465,7 @@ function checkCastNode(n: AsExpr, ix: i32) {
       // goes. A PENDING return (-2, still being inferred) is refused rather than joined
       // into: a cast that silently widens the function's own signature is the opposite of
       // what an explicit cast is for, and the annotation is one word.
-      if T.curRet == -2 {
-        tErr(
-          "`as " +
-            n.asTy +
-            "` propagates " +
-            tyToStr(rest) +
-            " — annotate the enclosing function's return type so the propagation has a declared home",
-          ix,
-        )
-        return TY_ERR
-      }
-      // AT MODULE SCOPE THERE IS NOWHERE TO PROPAGATE TO, and saying "the enclosing function
-      // cannot return it" there names a function that does not exist (it rendered
-      // "it returns _"). The cast is still the wrong tool, but for a different reason, so it
-      // gets its own sentence and points at the two spellings that do work.
-      if T.curRet < 0 {
-        tErr(
-          "`as " +
-            n.asTy +
-            "` propagates " +
-            tyToStr(rest) +
-            " out of the enclosing function, and there is none here — at module scope, test the value with `is` instead",
-          ix,
-        )
-        return TY_ERR
-      }
-      if !assignable(rest, T.curRet) {
-        tErr(
-          "`as " +
-            n.asTy +
-            "` propagates " +
-            tyToStr(rest) +
-            ", which the enclosing function cannot return (it returns " +
-            tyToStr(T.curRet) +
-            ")",
-          ix,
-        )
-        return TY_ERR
-      }
+      if !castPropagationFits(rest, n.asTy, ix) { return TY_ERR }
       return target
     }
   }
@@ -36434,6 +36477,20 @@ function checkCastNode(n: AsExpr, ix: i32) {
   if !isNumeric(arg) || !targetIsScalar {
     tErr("`as` supports numeric conversions only", ix)
     return TY_ERR
+  }
+  // THE NUMERIC ARM HONOURS THE TRIO TOO (json-design §6 q2, owner 2026-09-02). Until now
+  // this arm returned `target` whatever the suffix said, so `3.9 as? i32`, `3.9 as! i32` and
+  // a bare `3.9 as i32` all type-checked identically and all printed 3 — the suffix was
+  // accepted and IGNORED (D1041). A cast that can fail owes the same three answers the union
+  // arm gives, from the same words.
+  if numCastCanFail(primNameStr(primNameOf(arg)), primNameStr(tn)) {
+    // `as!` TRAPS on a miss, so nothing is propagated and the enclosing return is not
+    // consulted — the same reading as the union arm's trap mode.
+    if n.asMode == "trap" { return target }
+    // `as?` re-wraps to `T | null` and the null stays local to the expression.
+    if n.asMode == "null" { return mkNullableTy(target) }
+    // A bare `as` propagates `null`, so the enclosing return must carry it.
+    if !castPropagationFits(TY_NULL, n.asTy, ix) { return TY_ERR }
   }
   target
 }

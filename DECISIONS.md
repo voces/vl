@@ -4034,9 +4034,23 @@ cannot reach.
 
 **Cost.** Performance: `trunc(d) as! i32` is the single instruction today's `d as i32`
 emits (peephole; the operand is integral by construction so the exactness compare is
-dead), and the general `d as! i32` is the conversion plus a round-trip compare — one
-`f64.convert_i32_s` and one `f64.eq`, both cheap and both what a correct Rust `try_from`
-pays. Do not lean on binaryen for the fold: its float folds are NaN-conservative and will
+dead), and the general `d as! i32` is the conversion plus a compare, cheap and what a
+correct Rust `try_from` pays. **CORRECTION, from building it (2026-09-02): the compare is
+`trunc(d) == d` plus a range test, NOT the round-trip `trunc_sat` + convert-back + `eq`
+this paragraph and D1041 both named.** The round trip is exact for `f64 → i32` — every i32
+is an exact f64 — and UNSOUND for the other three float pairs, because the convert-back
+ROUNDS: `9223372036854775808.0 as? i64` saturates to `i64::MAX`, converts back to exactly
+`2^63`, and compares EQUAL to the operand, admitting a value the target cannot hold. One
+shape that is right at all five pairs (`f64 → i32/i64`, `f32 → i32/i64`, `i64 → i32`) beats
+a cheaper shape that is right at one and has to be remembered at the other four. The bounds
+are `i32.const`/`i64.const` fed through `f64.convert_*`/`f32.convert_*` rather than spelled
+as float literals, which keeps the emitter's decimal→IEEE parser off the soundness path and
+makes the ENGINE's own rounding the fact the comparison is built on (`convert(i32::MAX)` is
+exact in f64 so that bound is `<=`; it rounds UP in the other three, so those are `<`).
+Binary size: the `as!` trap's source-located reason is per-SITE `__print_char__` code in the
+cold branch — measured +226 bytes at `-O` on `bench/arrays/binsearch` for one cast, the same
+trade Rust makes for `unwrap`'s panic location. A module-tail helper taking `(line, col)`
+would cut it to about ten bytes a site if that ever matters. Do not lean on binaryen for the fold: its float folds are NaN-conservative and will
 not remove the compare on their own. Migration: the tree's `as` sites are `as!` in intent
 today (they were written under "traps on NaN / out of range"), so the migration is a
 suffix per site — **`compiler/` 2, `std/` 15, `tests/cases` 167** (vl-de's
@@ -4110,61 +4124,3 @@ test at every spelling in that table, both hints. **Split off, not this ruling's
 generic-instantiated union `T | "err"` / `T | E` at a scalar `T` refuses `no recorded
 members` — measured 2026-09-02 to be about MONO-MINTED unions and not about the literal
 (D1042).
-
-## `is A` over same-shape struct arms is a DISCRIMINANT-VALUE test: a literal-typed field is a type that is also a value, and membership is decided by the value (owner, 2026-09-02)
-
-**Ruling.** Two struct arms that share a field-name set and differ only in a literal-typed
-field — `type Circle = { kind: "circle", r: f64 }` / `type Square = { kind: "square", r: f64 }`
-— are a legal union, and `s is Circle` is true iff the value's tag names the shared shape AND
-its discriminant is a member of `Circle`'s literal set: `s is Circle` ≡ `s.kind == "circle"`,
-narrowing to `Circle`. Generalised, `is A` tests membership in every field where `A`'s type is
-a literal set — the literal-field slice of the deep-`is` shape walk (json-design §6 q1). It is
-the rule `docs/guide/unions.md` already promised ("a union whose members share a shape needs an
-explicit discriminant field") and the rule TypeScript users arrive with; `s.kind == "circle"`
-narrowing already computes the same arm set today, so the two spellings agree by construction.
-Overlapping literal sets (`"x" | "y"` vs `"y" | "z"`) are LEGAL and answer truthfully — a value
-with `kind: "y"` is a member of both, as structural typing says, and `else` narrows to `B`
-minus `A`. A same-shape pair with NO distinguishing literal field (`{v: i32} | {v: boolean}`)
-is refused by the CHECKER, not the emitter: "arms `A` and `B` share a field-name set and no
-literal-typed field distinguishes them — add a discriminant field". That refusal is a DESIGN
-rule (the guide's sentence), so the checker owes it; today it is an emit reject.
-
-The owner's framing, kept because it is the reason the rule reads the way it does: *"circle"
-and "square" are types that are also values, so it's blurry. They are structurally the same
-shape but logically different.* One principle now covers q1, q3 and this row — **`is` asks
-whether the VALUE is a member of the type: by tag when the tag can answer, by value when it
-cannot, and refused only when neither can.**
-
-**Representation is the compiler's, not the ruling's.** The owner is "not against (nor for)"
-giving each named type its own heap type — "b vs c is an internal decision". So the emitter may
-lower this as one heap type + one tag + a `struct.get`-and-compare on the `i32` sentinel (no rep
-change; the recommended route), or as distinct heap types, PROVIDED the answer stays the value's:
-a `{ kind: "circle", r: 1.0 }` built under no name at all is a `Circle`, and a `Square` value
-widened through `Circle | Square` and back is still a `Square`. A rep that made `is` depend on
-which NAME a value was built under would be nominal typing by the back door and is not what was
-ruled. The litunion rep cliff is the known cost of the distinct-heap-type route (a struct's heap
-type would depend on inferred literal sets and force copies at widening sites); it is why the
-recommendation is the value compare.
-
-**What it changes, measured 2026-09-02 (seed c4f03200).** The TS idiom itself — same field
-names, singleton literals — is today an EMIT REJECT ("union `Circle|Square` cannot be
-discriminated — same field names but different field types") even with no `is` in the program,
-so the idiom is unwritable; two-member disjoint sets (`"x"|"y"` vs `"p"|"q"`, D1023's filed
-shape) answer `true`/`true` and take the wrong arm silently; overlapping sets likewise; only
-different field NAMES run. The guard (`variantFieldTysEq` in `emit_collect.vl`) parts singleton
-literals on its identity column but folds multi-member sets into "one variant" — that column is
-where the row's mechanism lives, and it is not the tag (`is` over struct arms is a tag compare on
-the field-name signature, not a `ref.test`; the row's first filing said `ref.test` and was
-wrong about the instrument, not the outcome).
-
-**Build.** (1) collect pass: a same-signature pair that differs in a literal-typed field is
-legal — one tag, one layout; (2) `is A` over such arms adds the membership compare(s) after the
-tag test (an `i32` atom compare per literal field; the peephole for a singleton set is one
-`i32.eq`); (3) the checker refuses the no-discriminant pair with the sentence above and the emit
-reject becomes an unreachable floor; (4) `==`-narrowing and `is`-narrowing over the same union
-must agree at every spelling — grade both. Grading list: D1023's filed witness (prints `a` then
-`b`), the six-row table in its RULED paragraph, `is` and `==` narrowing side by side on the
-Circle/Square idiom, the overlapping-set case answering `true`/`true` for `"y"` and
-`true`/`false` for `"x"`, and the `{v: i32} | {v: boolean}` pair refusing at CHECK. Interim std
-rule until built, unchanged: every std error struct carries a field NAME no other std error
-type has (`JsonError.path`).

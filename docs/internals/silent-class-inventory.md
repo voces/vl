@@ -31043,44 +31043,6 @@ arm is taken silently — prints `A`.
   carries a field NAME no other std error type has**, and `std:json`'s proposal takes
   `path` for that reason and for the information it carries.
 
-* **RULED 2026-09-02 (owner): `is A` over same-shape arms is a DISCRIMINANT-VALUE test.**
-  The union is legal; `r is A` is true iff the tag names the shared shape AND `r.kind` is a
-  member of `A`'s literal set — `r is A` ≡ `r.kind == "x" || r.kind == "y"`, narrowing to
-  `A`. Overlapping sets are legal and answer truthfully (a `"y"` value is a member of both);
-  a same-shape pair with NO literal-typed field distinguishing it (`{v: i32} | {v: boolean}`)
-  is refused by the CHECKER. Representation is the compiler's choice (one heap type + value
-  compare recommended; distinct heap types not vetoed, provided the answer stays the
-  value's). DECISIONS.md §"`is A` over same-shape struct arms is a DISCRIMINANT-VALUE test"
-  has the rule, the owner's framing and the build order; ROADMAP §Next carries the item.
-
-  **Re-measured for the ruling (seed c4f03200), and the family is wider than filed:**
-
-  | arms (same field names) | `is A` / `is B` on a `B` value | today |
-  |---|---|---|
-  | `kind: "circle"` vs `"square"` — the TS idiom, singleton literals | — | **emit reject** `cannot be discriminated — same field names but different field types`, with NO `is` in the program |
-  | same, narrowed by `r.kind == "circle"` instead of `is` | — | same reject (the collect pass refuses the union itself) |
-  | `kind: "x" \| "y"` vs `"p" \| "q"` — disjoint sets, this row | `true` / `true` | silently wrong arm (`A: p`) |
-  | `kind: "x" \| "y"` vs `"y" \| "z"` — overlapping | `true` / `true` | silently wrong for `"x"` and `"z"` values |
-  | `v: i32` vs `v: boolean` — no literal field | — | emit reject, same message (correct rule, wrong stage) |
-  | `kind: "circle", r` vs `kind: "square", side` — different NAMES | `false` / `true` | **runs**, and `r.kind == "circle"` narrowing runs (`r.r` / `r.side` print `1` / `2`) |
-
-  **Mechanism, corrected.** `is` over struct arms is a TAG compare on the field-name
-  signature (`variantSig`), not a `ref.test` as first filed — the outcome is the same, the
-  instrument was misnamed. A same-signature pair is refused by `emit_collect.vl`'s
-  `variantFieldTysEq` guard unless its fields compare equal on a code / type-text /
-  elem-name / map-key ladder; that ladder PARTS singleton literals (`"circle"` vs `"square"`
-  → reject) and FOLDS multi-member sets (`"x" | "y"` vs `"p" | "q"` → "one variant", same
-  tag), which is why the idiom refuses loudly while this row's shape runs wrong. The builder
-  should print the identity column for both spellings before touching it.
-
-  **Grading list (owner's ruling).** This row's witness prints `a` then `b`; every row of
-  the table above matches the ruling column — the first two RUN, the disjoint and
-  overlapping rows answer by membership (`false`/`true` on a `"p"` value; `true`/`true` on a
-  `"y"` value and `true`/`false` on an `"x"` value), the no-literal pair refuses at CHECK
-  with the DECISIONS sentence, and the last row is unchanged; `is`- and `==`-narrowing agree
-  at every spelling. Probes: `$SP/q/d1023/t1–t11` of session vl-b7, reproduced from the
-  table.
-
 ---
 
 ### D1024 — a union spelled with a base type AND a literal of that base (`string | "err"`) is check-clean invalid wasm in a function signature: the literal widens to a DUPLICATE `string` atom and the string is delivered raw where the box is expected
@@ -32412,20 +32374,24 @@ Repro:
 
 ### D1041 — a NUMERIC `as` ignores its `?` / `!` suffix: `3.9 as? i32` is check-clean and prints `3` where the ruling says `null`; `3.9 as! i32` prints `3` where it says trap; a bare `f64 as i32` inside an `i32 | null` function prints `3` where it propagates `null`
 
-**check-clean silently wrong — prints `3` for every one of the three spellings · filed
-2026-09-02 (vl-b7) from the owner's ruling on `json-design.md` §6 q2 (DECISIONS.md
-§"Numeric `as` to an INTEGER target is exact-or-fail under the trio") · the FIX is the
-build item that ruling names, not a checker refusal: under it this witness prints `null`**
+**runs, prints `null` — CLOSED 2026-09-02 by the ruling's own build item (phases 2-4): the
+checker's numeric arm reads `asMode`, and `emitAsCast` gained an exact-or-fail arm that tests
+"integral AND in range" before it converts · zero `runs` lost, no corpus cell changed class ·
+`tests/cases/numerics/as-cast-exact-trio.vl` + `as-cast-exact-positions.vl`, and the migrated
+`as-cast-values.vl` / `as-cast-alias-target.vl` · filed 2026-09-02 (vl-b7) from
+DECISIONS.md §"Numeric `as` to an INTEGER target is exact-or-fail under the trio"**
 
 Repro:
 
     const f = 3.9
     print(f as? i32)
-    // PRINTS 3
+    // PRINTS null
 
-* **THE FAMILY, MEASURED** — seed 8a7820e2, every cell run:
+* **THE FAMILY, RE-MEASURED AT THE CLOSE** — every cell run against the phase-2/3/4 seed;
+  the "today" column is the seed 8a7820e2 the row was filed against, and every "after" cell
+  equals the "ruling" column it was filed with:
 
-  | spelling | today | under the ruling |
+  | spelling | before (8a7820e2) | under the ruling — and MEASURED after |
   | --- | --- | --- |
   | `3.9 as i32` at a `: i32` site | `3` (`i32.trunc_f64_s`) | **check reject** — the enclosing function does not return `\| null`; the message names `as!` / `as?` |
   | `3.9 as i32` inside `function f(): i32 \| null` | `3` | `null` — propagated |
@@ -32446,23 +32412,41 @@ Repro:
   toward zero otherwise) and `i32.wrap_i64` (wraps). Three spellings that the trio says
   are three different programs compile to the same bytes.
 
-* **WHAT THE FIX IS.** The checker's numeric arm honours `asMode`: bare `as` to an
-  integer target places the propagation obligation on the enclosing return type exactly
-  as the union arm does; `as?` types as `T | null`; `as!` types as `T`. The emitter lowers
-  an integer target as exact-or-fail — conversion plus round-trip compare for `f64 → i32`
-  / `f64 → i64` (`i32.trunc_sat_f64_s` + `f64.convert_i32_s` + `f64.eq`, which also
-  refuses NaN), `i32.wrap_i64` + `i64.extend_i32_s` + `i64.eq` for `i64 → i32` — and
-  peepholes `trunc(d)` / `floor(d)` / `ceil(d)` / `nearest(d)` operands to the single
-  trapping instruction, since an integral operand cannot fail the compare. Float targets
-  keep their rounding conversions unchanged. **Sequence:** migrate the tree's `as` sites
-  to `as!` / `as` FIRST (today's seed accepts and ignores the suffix, so the migration is
-  byte-identical), then land the semantics — DONE as #2355 (vl-de, 2026-09-02): `compiler/`
-  2 sites, `std/` 15, `tests/cases` 167, `cmp`-byte-identical (the 67/21/230 first filed
-  here was a bare grep; 70 of its compiler+std hits were `//` prose about casts);
-  `std/fmt.vl`'s `parseI32` comment ("`as i32` is an unchecked wrapping truncation on this
-  compiler") goes with it. Grade the close on every
-  row of the table, at every delivery position (`const`, return, argument, assignment,
-  struct field, global init — D965's matrix), and on the migrated tree's fixpoint.
+* **WHAT THE FIX WAS.** The checker's numeric arm honours `asMode` (`castPropagationFits`,
+  shared with the union arm so the two spellings of one rule cannot drift), and
+  `emitAsCast` gained `emitNumExactCast`: stage the operand in a per-rep scratch local, test
+  it, then convert with the TRAPPING instruction the test has already proved cannot trap.
+  `as?` builds the `{tag, payload}` box on the hit and the null-tagged box on the miss;
+  `as!` streams a source-located reason and `unreachable`s; a bare `as` early-`return`s the
+  enclosing function's own `null` through `emitReturnValue`, so every nullable return rep is
+  served by the one ladder that already knows them. `trunc` / `floor` / `ceil` / `nearest`
+  operands peephole to the single trapping instruction. **Sequence:** the tree's `as` sites
+  migrated FIRST (#2355, byte-identical), then the semantics (this close).
+
+* **THE TEST IS "INTEGRAL AND IN RANGE", NOT THE ROUND-TRIP COMPARE this row and the ruling
+  both specified** — and the reason is soundness, not taste. `trunc_sat` + convert-back +
+  `eq` is exact for `f64 → i32` (every i32 is an exact f64) but WRONG for the other three
+  float pairs, because the convert-back rounds: `9223372036854775808.0 as? i64` saturates to
+  `i64::MAX`, converts back to exactly `2^63`, and compares EQUAL to the operand — admitting
+  a value the target cannot hold. One shape that is right at all five pairs beats a cheaper
+  shape that is right at one. The bounds are `i32.const`/`i64.const` fed through
+  `f64.convert_*` rather than spelled as float literals, so the emitter's decimal→IEEE parser
+  is off the soundness path and the ENGINE's own rounding is what the comparison is built on.
+  DECISIONS.md carries this as a correction to its Cost paragraph.
+
+* **THE POSITION MATRIX, twelve delivery positions, `3.0`/`3.9` at each** (D965's discipline;
+  the un-annotated spelling of every one is present, D969): function-body tail, `return`,
+  annotated binding, un-annotated binding, argument, `print` argument, struct-field init,
+  list element, global init, assignment to an existing `i32 | null` local, `?? 0`, and a
+  generic function at two instantiations. Ten ran off the emitter arm alone; the last two
+  needed one gate each — `coalChainHasCallLhs` + `emitCoalesce`'s stash arm (an `as?` is the
+  other non-re-readable box source beside a call), and `monoArgTyName` (every channel in that
+  cascade asks a BINDING, and a cast written inline at the call site is none of them).
+
+* **THE COST, measured.** One fallible `as!` is +226 bytes at `-O` on
+  `bench/arrays/binsearch` (381 → 607), of which ~130 is the trap message — per-site
+  `__print_char__` code in the cold branch, the same trade Rust makes for `unwrap`'s panic
+  location. `SHAPE_TABLE` carries the new numbers with the reason.
 
 ---
 
@@ -32497,49 +32481,14 @@ Repro:
   | `orE<T>` at `T = i32` with an ANNOTATED destination `const t: i32 \| E = orE(5, true)` | ok | **runs** — `bad` (the annotation pins the rep, D969's shape) |
   | `orErr<T>` at `T = i32` with `const r: i32 \| "err" = orErr(5, true)` | ok | **emit reject** — the annotation does NOT rescue the literal arm; second ingredient, not yet ablated |
 
-* **MECHANISM — MEASURED 2026-09-02, AND IT IS A CHAIN OF THREE, NOT ONE.** The row first
-  read this as "mono-minted unions are never registered". That is ingredient (1) and it is
-  not the whole story; probing `unMemHasAtom`'s exits and `unionRowOf` directly gives:
-
-  1. **A PURE generic instantiation registers nothing.** `unionRowOf("i32|\"err\"")` and
-     `unionRowOf("i32|string")` are BOTH -1 for the repro above — no row exists under either
-     spelling, so the atom test's arena leg declines and the loud floor fires.
-
-  2. **AND THE TWO PRODUCERS SPELL ONE UNION TWO WAYS.** Put a DIRECT
-     `function f(bad: boolean): i32 | "err"` in the same module and it registers — under
-     `i32|string`, because CANON SOFTENS a literal member to its base scalar
-     (`canonEmitNameAt`'s `litMemberTy` arm). The generic still asks for `i32|"err"`, which
-     the registry does not have: the failing lookup prints `want[i32|"err"]
-     have[i32|string]`, and `unionRowOf` reads -1 for the wanted name and **0** for its
-     canon'd twin. So the clone's union never passes through canon. This is why adding a
-     direct spelling does NOT rescue the generic, which is the observation that rules out (1)
-     as a complete account.
-
-  3. **AND CLOSING (2) EXPOSES A THIRD REFUSAL.** A canon retry inside `unMemHasAtom` — on a
-     MISS only, `canonEmitName(name)` then re-lookup — was built and graded: the
-     direct-spelling-present program moves off `no recorded members` and onto
-     `emitProgram: literal \`is\` over a struct union`, still loud, still refused. So the
-     atom-test registry is one layer of at least two, and a fix that stops at the registry
-     buys a different sentence rather than a running program.
-
-  The build order this implies: register the clone's union THROUGH CANON (which fixes 1 and 2
-  together and makes the retry unnecessary), then grade the third refusal on its own. A retry
-  alone is not worth shipping — it converts one loud refusal into another.
-
-* **AND THE OBVIOUS PLACE TO DO THAT REGISTRATION IS A TRAP — BUILT AND MEASURED.** There is
-  no per-instance return type NODE to walk: `monoInstantiate` builds the instance with the
-  ORIGINAL's return node (`mkFunc(specName, noTP, nps, fn.fnRet, …)`, still `T | "err"`), so
-  the concrete union exists only as the arena type the checker put on the CALL. Registering
-  it there — `collectA`'s `Call` arm, `registerInlineUnion(canonEmitName(tyToEmitName(callTy)))`
-  when `nodeTyIsUnion` — makes the struct-arm instantiations **TRAP AT RUNTIME** where they
-  were a loud emit reject, at `T = i32` and `T = string` alike. Loud → trap is the wrong
-  direction and the row keeps the refusal instead.
-
-  The likely reason is the one this repo already knows: **a union's box tags are POSITIONAL
-  over its member set**, so minting a second row for a union another producer already
-  registered leaves two tag slices for one type and a value boxed under one is read under the
-  other. Any fix has to reuse the EXISTING row where there is one, not add a row per call
-  site — which is a different shape of change from "register the clone's union".
+* **MECHANISM (as far as measured).** The union a generic's return type becomes at an
+  instantiation is minted by the mono clone, and the emitter's member registry — the table
+  `union box atom test` consults — has no row for it; the same union written by hand is
+  registered when its spelling is resolved. The struct-arm row is rescued by annotating the
+  destination because the annotation registers the spelling; the literal-arm row is not,
+  which says the literal arm has a second, separate registration path that the clone also
+  misses. Two ingredients, then: (1) mono-minted unions are never registered — the family;
+  (2) a literal arm's atom registration is missed a second way — grade separately.
 
 * **WHY IT MATTERS MORE THAN ITS SOURCE ROW.** `T | E` at a scalar `T` is the generic
   `Result` shape every fallible generic helper wants (`std:fs`/`std:json` are monomorphic
