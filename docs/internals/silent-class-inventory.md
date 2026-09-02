@@ -31752,9 +31752,15 @@ Repro (now runs, printing `true`):
   (D761's variant-side sibling, untouched); and a map VALUE at an arm type is refused by the
   CHECKER.
 
-* **`std/json.vl` CAN NOW DROP ITS WORKAROUND** — both faces run, and a `JsonError | null`
-  scanner field plus a `JsonError | null` renderer return both build. That rewrite is NOT in
-  this change; the note below stands as the description of what to undo.
+* **`std/json.vl` CANNOT DROP ITS WORKAROUND YET, AND THAT IS A MEASURED ANSWER, NOT A
+  CAUTION.** This row's witness spells `kind: "syntax"` — a BARE literal — and the module
+  spells `kind: "syntax" | "duplicate" | "depth" | "nonfinite"`, an inline literal UNION, which
+  is a different field code on the two tables and still refuses: [D1043](#d1043), filed from
+  the module's ACTUAL carriers rather than from this row's paraphrase of them. Naming that
+  union (`type JsonErrorKind = …`) makes the SCANNER face build today — verified by hand — and
+  the RENDERER face then meets [D1044](#d1044), a pre-existing silently-wrong read. So the
+  workaround comes out in one more step, not in this one. **Writing the real module's spelling
+  instead of the row's is what found both**: a paraphrased witness is a different program.
 
 * **THE RETURN FACE — a DIFFERENT ingredient, as the ablation above shows; "same ingredient"
   was this row's claim and the close refuted it:**
@@ -31795,9 +31801,10 @@ Repro (now runs, printing `true`):
   four on a second one, rather than one `JsonError | null` field each; the renderer returns a
   `boolean` and reports through that struct rather than returning `JsonError | null`. That is
   a mechanical rewrite and costs no behaviour, but it is the reason the module's internals do
-  not read like `std/fs.vl`'s. **THIS CLOSE UNBLOCKS IT AND DOES NOT DO IT** — both faces build
-  now (verified by hand: a `JsonError | null` scanner field and a `JsonError | null` renderer
-  return), so the rewrite is a separate change against a std module and wants its own review.
+  not read like `std/fs.vl`'s. **THIS CLOSE DOES NOT UNDO IT** — see the bullet above: the
+  module's `kind` field is an inline literal UNION, not the bare literal this row's witness
+  carries, and that spelling still refuses ([D1043](#d1043)). The undo is a std change gated on
+  D1043 (or on naming the `kind` union) and wants its own review either way.
 
 ---
 
@@ -32683,3 +32690,105 @@ Repro:
   and so never hit it). It should close by registering the clone's union where the direct
   spelling registers its own — not by an emit arm — and grade on every row above plus the
   D965 delivery matrix for the instantiated value.
+
+---
+
+### D1043 — the VARIANT table codes an INLINE multi-member literal-union field `string` and the STRUCT table codes it `atom`, so an arm carrying one still has no field rep; the NAMED alias spelling of the same union runs
+
+**loud emit reject: `emitProgram: a struct field typed as the union ARM `Circle` has no field
+rep` · check rc 0 · clause 2 · found 2026-09-02 as the RESIDUE of [D1031](#d1031), by writing
+`std/json.vl`'s ACTUAL carrier shapes rather than the row's paraphrase of them — that row's
+witness spells `kind: "syntax"`, a BARE literal it fixed, and the module spells
+`kind: "syntax" | "duplicate" | "depth" | "nonfinite"`, an INLINE literal UNION, which is this**
+
+Repro:
+
+    type Circle = { r: i32, k: "a" | "b" }
+    type Other = { o: string }
+    type Shape = Circle | Other
+    type GW = { g: Circle | null }
+    function mk(): Shape { { r: 3, k: "a" } }
+    const p: GW = { g: null }
+    const s = mk()
+    if s is Circle { p.g = s }
+    const e = p.g
+    if e == null { print("null") } else { print(e.r) }
+
+* **THE MECHANISM IS WHAT THE FAILING RUNG RECEIVED, not what the message says.** Instrumented
+  at `armFieldStructRow`, on the seed that closed D1031:
+
+      PROBE arm=Circle render={r:i32,k:"a"|"b"} repSlotOfTy=-1
+        rows: [0]{r:i32,k:"a"|"b"}{k:0/"a"|"b", r:0/}
+        ARM{k:3/, r:0/}
+
+  The render is FAITHFUL — D761's demand-driven intern minted `{r:i32,k:"a"|"b"}` and that row
+  codes `k` **0** (the atom-backed literal-union field, elem name `"a"|"b"`). The ARM's own row
+  codes the identical spelling **3** (a plain string slot, elem name ""). So
+  `variantStructHeapTwinAt`'s per-field code walk declines — CORRECTLY, because the two layouts
+  really do differ — and the field has no rep. **Both halves of the guess were wrong before the
+  probe ran**: the render is not lossy here, and the row is not the one that softened.
+
+* **THE ASYMMETRY IS THE DEFECT, and it is in the VARIANT recorder.** `collectVariantFields`
+  codes the field off a node canon has rewritten (`variantFieldIdText`'s own header says a bare
+  literal annotation "renders through canon as the softened `string`"), while
+  `internInlineShapeTy` codes it off the raw shape TEXT. One spelling, two tables, two codes.
+
+* **THE NAMED ALIAS RUNS, and that is the whole ablation.** `type K = "a" | "b"` +
+  `k: K` in the same program **runs** (prints `3`) — it was check-clean INVALID WASM before
+  D1031 and runs now — because a named litunion carries `K` in the elem-name column on BOTH
+  sides. A DECLARED plain-struct twin spelled identically also runs (`repSlotOfTy` finds it).
+  Only the inline spelling with no twin refuses.
+
+* **WHAT IT COSTS: `std/json.vl` KEEPS ITS WORKAROUND, OR NAMES ITS `kind` UNION.** Verified by
+  hand on the module's exact shapes — a `JsonError | null` scanner field plus a
+  `JsonError | null` renderer return, `JsonError` an arm of both public return types: with
+  `kind: "syntax" | "duplicate" | "depth" | "nonfinite"` inline it still refuses; with
+  `type JsonErrorKind = "syntax" | "duplicate" | "depth" | "nonfinite"` it builds and the
+  scanner face runs. That is a one-line std change and arguably better std style, but it is a
+  std API change and wants its own review — and the RENDER face then meets [D1044](#d1044).
+
+* **TWO ROUTES.** Make the VARIANT recorder code an inline literal-union field 0, which is a REP
+  change for every arm carrying one (and is the `A5c` un-named-literal atom rep
+  [D1023](#d1023) names); or make `internArmShapeOf` render the arm the way the VARIANT table
+  sees it, so the minted row's codes match by construction. The second is smaller and closes
+  only this; the first is what D1023's ruling needs anyway.
+
+---
+
+### D1044 — a literal-union FIELD read off an `S | null` binding prints the raw ATOM ID instead of the member string, once `S` is also a union ARM; the same read with no union in the program prints the member
+
+**check-clean silently wrong — prints `0` where the field holds `"a"` · found 2026-09-02 while
+verifying [D1031](#d1031)'s `std/json.vl` claim · PRE-EXISTING: the witness below runs and
+prints `0` on master (`seed-latest`, 2026-09-02) and on the D1031 seed alike, so it is neither
+caused nor moved by that close · clause 1**
+
+Repro:
+
+    type K = "a" | "b"
+    type S = { k: K, n: i32 }
+    type Other = { o: string }
+    type U = S | Other
+    function mk(): U { { o: "x" } }
+    function g(n: i32): S | null {
+      if n == 0 { return { k: "a", n: 1 } }
+      null
+    }
+    const t = mk()
+    if t is S { print("s") }
+    const v = g(0)
+    if v == null { print("null") } else { print(v.k) }
+    // PRINTS 0
+
+* **THE CONTROL IS ONE LINE OFF AND PRINTS THE MEMBER.** Delete `type U = S | Other`, `mk` and
+  the `is` test — so `S` is an ordinary struct and `S | null` is the kind-9 niche rather than
+  the `nulvariant` one — and the same read prints `a`. So the ingredient is that `S` is a union
+  ARM, which routes the read through the variant tables.
+
+* **AND THE NON-NULLABLE SPELLING PRINTS THE MEMBER TOO.** `function g(): S` with the union
+  still present prints `a`. Only the `S | null` niche loses it, which is what says this is the
+  READ off the niche and not the field's rep.
+
+* **WHY IT SURFACED NOW.** It sits behind [D1031](#d1031) and [D1043](#d1043): a program that
+  can carry a `JsonError | null` at all is new, so the read that mis-prints was unreachable in
+  the shape that wants it. `std/json.vl`'s renderer face meets it the moment the module names
+  its `kind` union and returns `JsonError | null`.
