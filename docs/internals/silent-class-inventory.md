@@ -23108,6 +23108,27 @@ but with a runtime trap.
   annotation gets a DECLARED hint rather than a deletion. This is the case that rule exists for,
   caught by doing the wrong thing first and watching the fixture trap.
 
+* **ABLATED 2026-09-02 — IT TAKES TWO INGREDIENTS, AND THE SECOND ONE IS A SHAPE THE PROGRAM
+  ONLY MENTIONS ONCE.** Dropping the `??` line runs (`1`); keeping it but writing `?? { r: 5 }`
+  so both shapes are `{r: i32}` runs (`1 7`); dropping `apply(src)` and keeping the `??` runs
+  (`7`). So it needs the function VALUE **and** a second `{r: …}` shape whose field is a union
+  BOX — the one `?? { r: "s" }` mints. Neither alone traps.
+
+* **THE DISASSEMBLY NAMES THE DISAGREEMENT EXACTLY.** The module has two one-field structs:
+  `$0` = `(struct (field (mut i32)))` and `$1` = `(struct (field (mut (ref $box))))`. They are
+  NOT layout twins — different field types — so this is not D627's family. The lifted `src`
+  value is emitted at **`(structref, (ref $1)) -> (ref null $1)`**, the WIDE boxed shape, while
+  the `call_indirect` at the consumption site is typed **`(structref, (ref $0)) -> (ref null
+  $0)`**, the narrow one `src` actually declares. Same table, two signatures, hence
+  `indirect call type mismatch`.
+
+  So the defect is not in the hint's end at all: `src`'s parameter `p: {r: i32}` — an INLINE
+  shape — interned to the wrong row. A field-name-set match cannot separate `{r: i32}` from
+  `{r: i32|string}`, and the annotated build differs only in which row wins. **The next
+  attempt starts at the inline-shape intern for a function VALUE's signature, and the question
+  is whether it compares field TYPES or only the name set.** Both functype pools are otherwise
+  identical up to the index in question, which is what rules out a pool-ordering shift.
+
 Repro (check rc 0; the module validates and the program TRAPS):
 
     function src(p: {r: i32}): {r: i32} | null {
