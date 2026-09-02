@@ -4124,3 +4124,162 @@ test at every spelling in that table, both hints. **Split off, not this ruling's
 generic-instantiated union `T | "err"` / `T | E` at a scalar `T` refuses `no recorded
 members` — measured 2026-09-02 to be about MONO-MINTED unions and not about the literal
 (D1042).
+
+## `is A` over same-shape struct arms is a DISCRIMINANT-VALUE test: a literal-typed field is a type that is also a value, and membership is decided by the value (owner, 2026-09-02)
+
+**Ruling.** Two struct arms that share a field-name set and differ only in a literal-typed
+field — `type Circle = { kind: "circle", r: f64 }` / `type Square = { kind: "square", r: f64 }`
+— are a legal union, and `s is Circle` is true iff the value's tag names the shared shape AND
+its discriminant is a member of `Circle`'s literal set: `s is Circle` ≡ `s.kind == "circle"`,
+narrowing to `Circle`. Generalised, `is A` tests membership in every field where `A`'s type is
+a literal set — the literal-field slice of the deep-`is` shape walk (json-design §6 q1). It is
+the rule `docs/guide/unions.md` already promised ("a union whose members share a shape needs an
+explicit discriminant field") and the rule TypeScript users arrive with; `s.kind == "circle"`
+narrowing already computes the same arm set today, so the two spellings agree by construction.
+Overlapping literal sets (`"x" | "y"` vs `"y" | "z"`) are LEGAL and answer truthfully — a value
+with `kind: "y"` is a member of both, as structural typing says, and `else` narrows to `B`
+minus `A`. A same-shape pair with NO distinguishing literal field (`{v: i32} | {v: boolean}`)
+is refused by the CHECKER, not the emitter: "arms `A` and `B` share a field-name set and no
+literal-typed field distinguishes them — add a discriminant field". That refusal is a DESIGN
+rule (the guide's sentence), so the checker owes it; today it is an emit reject.
+
+The owner's framing, kept because it is the reason the rule reads the way it does: *"circle"
+and "square" are types that are also values, so it's blurry. They are structurally the same
+shape but logically different.* One principle now covers q1, q3 and this row — **`is` asks
+whether the VALUE is a member of the type: by tag when the tag can answer, by value when it
+cannot, and refused only when neither can.**
+
+**Representation is the compiler's, not the ruling's.** The owner is "not against (nor for)"
+giving each named type its own heap type — "b vs c is an internal decision". So the emitter may
+lower this as one heap type + one tag + a `struct.get`-and-compare on the `i32` sentinel (no rep
+change; the recommended route), or as distinct heap types, PROVIDED the answer stays the value's:
+a `{ kind: "circle", r: 1.0 }` built under no name at all is a `Circle`, and a `Square` value
+widened through `Circle | Square` and back is still a `Square`. A rep that made `is` depend on
+which NAME a value was built under would be nominal typing by the back door and is not what was
+ruled. The litunion rep cliff is the known cost of the distinct-heap-type route (a struct's heap
+type would depend on inferred literal sets and force copies at widening sites); it is why the
+recommendation is the value compare.
+
+**What it changes, measured 2026-09-02 (seed c4f03200).** The TS idiom itself — same field
+names, singleton literals — is today an EMIT REJECT ("union `Circle|Square` cannot be
+discriminated — same field names but different field types") even with no `is` in the program,
+so the idiom is unwritable; two-member disjoint sets (`"x"|"y"` vs `"p"|"q"`, D1023's filed
+shape) answer `true`/`true` and take the wrong arm silently; overlapping sets likewise; only
+different field NAMES run. The guard (`variantFieldTysEq` in `emit_collect.vl`) parts singleton
+literals on its identity column but folds multi-member sets into "one variant" — that column is
+where the row's mechanism lives, and it is not the tag (`is` over struct arms is a tag compare on
+the field-name signature, not a `ref.test`; the row's first filing said `ref.test` and was
+wrong about the instrument, not the outcome).
+
+**Build.** (1) collect pass: a same-signature pair that differs in a literal-typed field is
+legal — one tag, one layout; (2) `is A` over such arms adds the membership compare(s) after the
+tag test (an `i32` atom compare per literal field; the peephole for a singleton set is one
+`i32.eq`); (3) the checker refuses the no-discriminant pair with the sentence above and the emit
+reject becomes an unreachable floor; (4) `==`-narrowing and `is`-narrowing over the same union
+must agree at every spelling — grade both. Grading list: D1023's filed witness (prints `a` then
+`b`), the six-row table in its RULED paragraph, `is` and `==` narrowing side by side on the
+Circle/Square idiom, the overlapping-set case answering `true`/`true` for `"y"` and
+`true`/`false` for `"x"`, and the `{v: i32} | {v: boolean}` pair refusing at CHECK. Interim std
+rule until built, unchanged: every std error struct carries a field NAME no other std error
+type has (`JsonError.path`).
+
+## A `type` declared in a function body is legal and lexically scoped, may name the enclosing function's type parameters, and is refused loudly until built (owner, 2026-09-02)
+
+The owner asked whether `type` inside a function body is legal. It was neither legal nor
+refused: the parser admits it (`parseStmt` is shared between module and block scope), the
+checker registers type names only from the module-level walk, and the declaration is silently
+dropped — so one mechanism wore THREE faces (D1045): `unknown type 'P'` at the use, a
+check-clean `unsupported statement in body` emit reject when the name is never used, and a
+local `type P` that silently resolves to a MODULE-scope `P` of a different shape. The
+precedent already in the language decided it: a nested NAMED `function` in the same position
+runs today, and a declaration form that is legal in a body for functions and not for types is
+a rule nobody would write on purpose.
+
+**Ruled: legal, and lexically scoped to the block.** Every form the module-scope grammar
+admits is admitted in a body, because `parseTypeDecl` is one production and the ruling is
+about WHERE it may stand, not which arms:
+
+| form | in a body | note |
+| --- | --- | --- |
+| struct `type P = { x: i32, y: i32 }` | legal | the filed witness |
+| union / literal union `type R = A \| B`, `type K = "a" \| "b"` | legal | usable in `is` inside the body |
+| recursive `type N = { next: N \| null }` | legal | self-reference resolves in the local scope |
+| generic alias `type Pair<A> = { a: A, b: A }` | legal | instantiated where used, as at module scope |
+| nominal `type Id = new i32` | legal | see the escape sub-ruling |
+
+The name shadows an outer one for the rest of the block — the shadowing spelling in D1045's
+table is the case the build is graded on, because it is the one that is WRONG today rather
+than merely refused. Nothing about the type's REP changes: a local struct is the same
+structural shape it would be at module scope, and two local declarations of the same shape in
+two functions are the same type, exactly as two module-scope ones are.
+
+**And a local type may name the enclosing function's type parameters.** The owner's second
+question. `type P = { a: T }` inside `f<T>` is legal and is substituted per instance the way
+every other node of the body is — the monomorphizer already lifts an arrow lambda that names
+`T` (D426, closed 2026-08-30), and a local type is the same obligation on a different node
+kind. Measuring the precedent found that the NAMED-function spelling of D426's own witness
+still refuses at emit while the lambda runs (D1046); it is filed beside D1045 rather than
+under D426 because the rule the owner agreed to — a body-scoped declaration sees the
+signature's type parameters — is the one rule all three node kinds owe, and the build closes
+them together.
+
+**Two sub-rulings, recorded as vl-b7's recommendation and standing unless the owner objects.**
+
+* **A local NOMINAL type does not escape through an inferred return type.** `type Id = new
+  i32` inside `f` and `return Id(3)` with no return annotation would infer a type that no
+  caller can NAME — the checker refuses it, as it does any unnameable inferred type, with a
+  message that says to declare the type at module scope or annotate the return. A local
+  STRUCTURAL type escapes freely as its shape, because the shape is the type and the caller can
+  spell it. The asymmetry is the whole point of `new`: nominality is a name, and a name that
+  goes out of scope takes the nominal identity with it.
+* **Nothing else escapes either, and nothing needs a rule for it.** A local type used only
+  in a local binding, argument, or `is` never reaches a signature, so the question of what a
+  caller sees does not arise.
+
+**Interim, shipping first: the DECLARATION refuses loudly.** Until scoping is built, the
+checker's body walk rejects a `TypeDecl` where it stands with `` a `type` declaration is
+module-scope only for now (D1045 — ruled legal, not yet built); move `P` to module scope ``,
+at the declaration's line, on every spelling — so the three faces collapse into one message
+that names the rule and the row. This is clause-2 hygiene, not progress on `runs`, and it is
+scheduled that way: the loud refusal is small and lands ahead; the scoping build is the
+ROADMAP item. Measured 2026-09-02 on seed 42604b65; witnesses under D1045 and D1046.
+
+## A failed assertion is located at the MATCHER, not at `expect` (owner, 2026-09-02) — blocked on D1044
+
+The owner asked why a failure's location points at `expect` rather than at `toEqual`. Because
+the track-caller ruling above anchored on `expect` by an UN-CONSULTED design choice: `expect`
+was the only surface that took `caller`, and its `__callsite__` naturally reports the `expect`
+token. The header at `std/test.vl` says so, and no one asked which token an author wants.
+
+**Ruled: the matcher.** The failure is the matcher's — `toEqual` is the thing that decided
+`false` — and on a multi-line spelling
+
+```vl
+expect(build(cfg))
+  .toEqual(want)
+```
+
+the `expect` line is the setup and the `.toEqual` line is the assertion; Jest and Vitest
+report the matcher's line for the same reason. On today's grammar that spelling does not
+parse (`expected an expression but found DOT`, measured 2026-09-02 — a leading-dot
+continuation line is not admitted, and whether it should be is a grammar question for the
+owner, not filed as a defect), so on every program that compiles today only the COLUMN
+moves: `__callsite__` on a UFCS call already anchors on the METHOD token, column 14 for
+`expect(x).toEqual(y)` at column 5. No existing report changes its line; the ruling is made
+now so the location is right on the day the grammar admits the second line.
+
+**How it lands, and why it is not landing today.** Each matcher — `toEqual`, `toBeTrue`,
+`toBeFalse`, and `not`'s continuation — takes a trailing `caller: CallerLoc = __callsite__`,
+and the receipt drops the `caller` it carries from `expect`. That is the one-hop rule applied
+one hop later: the matcher is the surface that reports, so it is the surface that asks. The
+change alters std exports and goes through `std-api-reviewer`; the header's anchor paragraph
+and the track-caller ruling's "`expect` only" section are updated with it, and the editor's
+location line (`testDiscovery.ts`) is unchanged because the wire format is unchanged.
+
+**It is blocked by a compiler defect, found while measuring the move.** A UFCS call that OMITS
+a defaulted tail argument is refused `no field 'toEqual' on Expectation` in any module build
+that merges a `self`-function-bearing module — which `std:test` is, so EVERY test file. The
+direct spelling and the supplied-argument spelling run. Filed as D1044 with an eight-row
+ablation; the matcher move ships the PR after D1044's fix merges, and is graded on the
+multi-line spelling reporting the `.toEqual` line, the one-line spelling reporting column 14,
+and `not.toEqual` reporting the final matcher.
