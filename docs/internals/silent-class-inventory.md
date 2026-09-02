@@ -29935,13 +29935,21 @@ Repro (check-clean invalid wasm):
   with `-1`** — the module-level one. That is where the `#l` temp's kind is fixed for a
   top-level `for in`.
 
-* **A RUNG IN `forInElemKind` DOES NOT REACH IT, measured**: adding a narrowed-arm rung ahead
-  of `exprStringArray` changes nothing, and neither does forcing it to return `"union"` for
-  ANY narrowed atom. Since narrowing demonstrably works at module scope by the table above,
-  the remaining explanation is TIMING — `declareForInLocals` runs while locals are being
-  declared, before the walk that pushes the narrowing record, so the atom is genuinely absent
-  at that moment. Confirm that before fixing: if it holds, the fix is to defer the `#l` kind
-  or to seed the narrowing earlier for module-level statements, NOT to add another rung.
+* **A RUNG IN `forInElemKind` DOES NOT REACH IT, and the timing story is now the measured
+  one.** Four probes: a narrowed-arm rung ahead of `exprStringArray`; the same rung forced to
+  return `"union"` for ANY narrowed atom; that forced rung moved to the very TOP of the ladder
+  (in case an earlier `return "str"` was winning); and forcing `setNarrowFromCond` to push for
+  this receiver regardless of `exprUnion`. **None moves the witness.**
+
+  The last one matters most: forcing the narrowing push changes nothing, which means the push
+  was already happening — `exprUnion` answers at module scope, consistent with `is string`,
+  `.length` and the indexed read all running. And the top-of-ladder rung reading `""` means
+  `narrowedValueAtomOf` genuinely has no record AT THAT MOMENT.
+
+  So the narrowing is pushed and the record is not visible where the `#l` kind is chosen. That
+  is a TIMING or SCOPE mismatch between `collectLocalsIf`'s push and `declareForInLocals`'s
+  read — the next step is to instrument which of those two runs first for a module-level
+  `for in` nested in an `if`, not to add a fifth rung.
 
 * So the target is one classifier, not the literal's construction: **a for-in over a
   narrowed union arm must take its element kind from the ARM, not from the values the literal
