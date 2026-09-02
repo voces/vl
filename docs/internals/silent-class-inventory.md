@@ -30858,3 +30858,94 @@ delivers.
 * **WHAT IT TOUCHES.** Nothing in `std:json`'s ruled surface (`Json | JsonError` has no
   literal arm). It is here because D1021's ablation table filed it under the wrong defect,
   and because a message count would keep doing so.
+
+### D1025 — an INTEGER-LITERAL map subscript narrows at check and not at emit: `if m[1] is string { const z: string = m[1] }` is check-clean invalid wasm, and the STRING-literal subscript `m["a"]` mints no narrowing key at all
+
+**check-clean invalid wasm · check rc 0 (the checker even hints the `string` annotation is redundant) · `type mismatch: expected (ref $type), found (ref null $type)` (the raw nullable map read is delivered where the narrowed `string` is expected) · ZERO corpus cells · found 2026-09-01 measuring the `std:json` usability critique's helper decline (its "gap A", the loud string-keyed face) and re-run at an `i32` key · two ingredients: a MAP read through an integer-literal subscript, and a narrowed destination**
+
+Repro:
+
+    let m: { [i32]: string | f64 } = Map()
+    m[1] = "x"
+    if m[1] is string {
+      const z: string = m[1]
+      print(z)
+    }
+
+`placeKeyOf` (`compiler/typecheck.vl`, the Index arm D11 built) keys an index place only
+through `intLitTextOf`, so `m[1]` gets a narrowing key the same way `xs[0]` does — and the
+checker narrows it to `string`, accepts the annotated binding, and calls the annotation
+redundant. The emitter's narrowed-read path was wired for ARRAY places (D11's rungs); a map
+read through the same key still lowers to the raw `(ref null)` map get, and the destination
+expects the narrowed rep.
+
+* **THE FAMILY, ABLATED.** The destination is the ingredient, not the value type: `{[i32]:
+  string}` (no union) with `is string` + `const z: string = m[1]` is the same invalid wasm;
+  `is f64` + `const z: f64 = m[1]` is the same; `return m[1]` from a `function f(): string`
+  inside the `is` is the same. **Controls that RUN:** `print(m[1])` inside the `is` prints
+  `x` (no narrowed destination); the un-annotated `const z = m[1]` prints `x`; hoisting the
+  read — `const v = m[1]` then `if v is string { const z: string = v }` — prints `x`; and
+  the ARRAY twin `const xs: (string | f64)[] = ["x", 2.5]` / `if xs[0] is string { const z:
+  string = xs[0] }` prints `x` (D11's built half).
+
+* **THE LOUD FACES ARE THE SAME DEFECT ONE STEP EARLIER.** At a STRING key —
+  `let m: {[string]: string | f64} = Map()` / `if m["a"] is string { const z: string =
+  m["a"] }` — the place mints no key and the check refuses `cannot assign string | f64 |
+  null to 'z' of type string`; a variable key (`m[k]`, `xs[i]`) is the same refusal; and
+  `!= null` narrows NEITHER key — `if m[1] != null { const z: string | f64 = m[1] }` refuses
+  `cannot assign string | f64 | null …` even at the integer literal, so the keyed place is
+  narrowed by `is` only. Every one of those is check-clean by the design (a literal subscript
+  is a stable place exactly as `xs[0]` is) and is a clause-2 refusal; the integer-literal
+  `is` face is the same gap with the checker's half done and the emitter's half not, which
+  is what makes it clause 1.
+
+* **WHAT IT TOUCHES.** The `std:json` helper decision: the usability critique's consumer
+  programs hoist every `obj["k"]` read into a local before narrowing, and this row is why
+  (`docs/internals/json-critique-usability.md`, "gap A"). A `Json` object is `{[string]:
+  Json}`, so the string-keyed loud face is the one every JSON consumer meets; the fix is
+  the same key for both subscripts (an index place keyed by a STRING literal too), plus the
+  emitter delivering the narrowed rep for a map read the way it does for an array read.
+  Build the emitter half first — narrowing the checker's key alone would move the string
+  face from loud to THIS row's silent one (the D965 position rule).
+
+### D1026 — an alias that already holds `null`, composed with `| null` again in a SIGNATURE, is check-clean and emit-refused: `type P = null | f64` / `function g(): P | null { return null }` → `bare null needs a struct-typed context`
+
+**loud emit reject · check rc 0 · `emitProgram: bare null needs a struct-typed context` at the `return null` (or, when the body returns a value, at the caller's `g() == null`) · ZERO corpus cells · found 2026-09-01 measuring the `std:json` usability critique's "gap C" (`function pick(): Json | null`) · one ingredient: a null-bearing alias composed with a second `null` in a function's return or parameter type**
+
+Repro:
+
+    type P = null | f64
+    function g(): P | null {
+      return null
+    }
+    print(g() == null)
+
+`P | null` expands to `null | f64 | null` — the same duplicate-atom shape as D1024's
+`string | "err"`, with `null` as the atom. Written INLINE the duplicate is harmless:
+`function g(): null | f64 | null { return null }` prints `true`. Through the alias, in a
+signature, the composed union has no rep the emitter will hand a bare `null` to.
+
+* **THE FAMILY, ABLATED.** Parameter position — `function g(x: P | null): boolean { return
+  x == null }` called with `null` — is the same refusal; a second alias layer, `type Q = P |
+  null` / `function g(): Q`, is the same; and a body that returns `1.5` moves the refusal
+  to the CALLER's `g() == null`, so the site is wherever the composed type first meets a
+  `null`. **Controls that RUN, all printing `true`:** `function g(): P { return null }`
+  (no second null); the module-scope binding `const x: P | null = null` (not a signature);
+  the inline spelling above; a NON-null alias composed with null — `type P = string | f64`,
+  `P | null`; and the null-bearing alias composed with something OTHER than null — `type P
+  = null | f64`, `P | string`. Recursion is not an ingredient: `Json | null` refuses for
+  the same reason `P | null` does, and `Json`'s recursion plays no part.
+
+* **CLAUSE 2, SAME ROOT AS D1024.** Both rows are an alias-expanded union carrying a
+  duplicate atom into a signature's rep. D1024 duplicates `string` (after literal widening)
+  and builds invalid wasm; this one duplicates `null` and refuses loudly — the null atom has
+  a dedicated `bare null` gate that the string atom does not. One dedupe after expansion
+  should close both; grade the fix on both witnesses and on the inline controls, which
+  must keep running.
+
+* **WHAT IT TOUCHES.** `std:json`'s `Json` is `null | boolean | f64 | string | Json[] |
+  {[string]: Json}`, so every consumer signature spelled `Json | null` — an "absent key"
+  return, an optional parameter — meets this row. The critique's consumers wrote
+  `function pick(): Json` and returned `null` through the alias's own arm instead, which
+  runs; the row is why the design doc's examples avoid `Json | null`, and it is a build
+  item, not a surface constraint.
