@@ -73,12 +73,30 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   proceeds past a parse diagnostic (a recovered program checks, it does not build), and
   `formatSrc` keeps the ANY reading because `fmt -w` would otherwise re-spell the mistake.
   **STAGE 2 is the remainder and needs no further ruling**: convert the lossy skip sites
-  one at a time — `expectClose`'s skip-to-closer first, then the `then`-removal arm, which
-  is already single-statement — each conversion making a recovery faithful and then
-  deleting its pin from `tests/vl_lossless_recovery_test.ts`. The five phantom cases that
-  suite pins are the standing regression floor; widening the gate without making the
-  recovery faithful is exactly what they exist to stop. DECISIONS.md §"A recovered parse
-  IS typechecked" is the durable home.
+  one at a time — each conversion making a recovery faithful and then deleting its pin from
+  `tests/vl_lossless_recovery_test.ts`. The phantom cases that suite pins are the standing
+  regression floor; widening the gate without making the recovery faithful is exactly what
+  they exist to stop. DECISIONS.md §"A recovered parse IS typechecked" is the durable home.
+  - **`expectClose`'s skip-to-closer — DONE #2397.** The defect was never the arity: the
+    parser had no separator arm, so an element-starting token ended the list and
+    `expectClose`'s scan DELETED it on the way to the closer. A missing list separator is
+    now diagnosed and INSERTED (`parseArgs` / `parseArrayLit` / `parseObjLit` /
+    `parseParamList`, each gated on its own element-start test), and `expectClose` marks
+    LOSSLESS exactly when its scan consumed nothing — a closer that is merely missing drops
+    no token. `f(1 2)`, `f(1 2 3)`, `g(f(1 2), 3)`, `[1 2]`, `{x: 1 y: 2}` and
+    `function f(a: i32 b: i32)` all typecheck now, and `f(1 2 3)` against a two-parameter
+    `f` reports the TRUE `expected 2, got 3`. `[{x: 1} {x: 2}]` is correctly still gated —
+    `{` is not an element start, by the same argument that makes it `expectClose`'s scan
+    bound. **The insert is SAME-LINE ONLY**, and the first cut of the change proved why:
+    every list site skips NEWLINEs, so an ungated insert read a missing CLOSER at end of
+    line as a missing COMMA and swallowed the next statement as an element
+    (`const xs = [1, 2` / `print(xs.length)` invented two type errors) — the exact phantom
+    class the pins exist to stop. The price is that a missing comma at a line end inside a
+    MULTI-LINE list is not inserted either; a missing closer and a missing separator are
+    indistinguishable there, and that spelling behaves exactly as master does. Four pins
+    remain. DECISIONS.md §"A missing list separator is inserted, never skipped past".
+  - **NEXT: the `then`-removal arm in `parseIf`**, which is already single-statement and was
+    called out at stage 1 as the cheapest remaining candidate.
 - **Width subtyping — RULED (owner, 2026-09-01): the non-prefix refusal is a GAP, closed
   the Roc way** — shape-monomorphization of narrow-typed consumers (offsets constant per
   caller shape; zero runtime cost; paid in instance count — the variant-count tradeoff

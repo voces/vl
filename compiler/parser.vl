@@ -247,6 +247,23 @@ function startsStmt(k: TokKind) {
     k == "MINUSMINUS"
 }
 
+// Whether the token kind plausibly starts an EXPRESSION — `startsStmt`'s set
+// minus the statement keywords, plus `if` (`match` is already in the set): those
+// two are the value-returning keyword forms `parsePrimary` dispatches, and the
+// other eight (`let`/`const`/`return`/`while`/`for`/`break`/`continue`/`type`/
+// `function`) start a statement and no expression.
+//
+// The delimited-list separator recovery below is the only caller, and `{` is
+// left OUT on purpose even though an object literal starts with one: after a
+// complete element a `{` is far more often a missing closer than a missing
+// comma, and it is already `expectClose`'s own scan bound — so `[1 {x: 2}]`
+// keeps the lossy recovery rather than guessing a separator into it.
+function startsExprTok(k: TokKind) {
+  if k == "IF" { return true }
+  if isStmtKeyword(k) { return false }
+  startsStmt(k)
+}
+
 // The kind TAG as text — the ONE place a `TokKind` atom is turned back into its
 // spelling. Every renderer goes through here so the atom→string materialisation
 // (a chain over the whole 68-member vocabulary) is emitted ONCE, in a function
@@ -313,17 +330,36 @@ function expect(kind: TokKind) {
 // bounded by the sync tokens, a statement-start keyword, and `{` (a nested
 // construct), so a genuinely MISSING closer abandons at the boundary instead
 // of swallowing following code.
+//
+// A ZERO-TOKEN SKIP IS A FAITHFUL RECOVERY, AND IS MARKED LOSSLESS (stage 2 of
+// the lossless-recovery work; DECISIONS.md §"A recovered parse IS typechecked").
+// The two outcomes of the scan are not the same kind of event:
+//
+//   • it stopped AT the boundary having consumed nothing — the closer is simply
+//     MISSING (`print(1` at end of line, a block whose `}` never arrives). The
+//     tree then holds every token the user wrote plus ONE inserted closer, so a
+//     type error read off it is a real one and the driver may run the checker.
+//   • it consumed tokens on the way — those tokens are GONE from the tree, and a
+//     count or a type read off what is left is fiction. Not marked; the file
+//     keeps the parse bail, which is what the phantom pins in
+//     `tests/vl_lossless_recovery_test.ts` exist to hold.
+//
+// The marker's contract is "the program the checker sees is the program the user
+// wrote, up to the inserted token" — an inserted CLOSER satisfies it exactly as
+// `parseBracedBody`'s inserted braces do.
 function expectClose(kind: TokKind) {
   if peekKind() == kind {
     P.pos = P.pos + 1
     return true
   }
+  const dgIx = P.diags.length // the index this push is about to occupy
   P.diags.push(
     {
       msg: "expected " + kindDesc(kind) + " but found " + foundDesc(peekTok()),
       at: P.pos,
     },
   )
+  const from = P.pos
   let scanning = true
   while scanning {
     const k = peekKind()
@@ -336,7 +372,70 @@ function expectClose(kind: TokKind) {
       P.pos = P.pos + 1
     }
   }
+  if P.pos == from { dgMarkLossless(dgIx) }
   false
+}
+
+// Whether a delimited list CONTINUES past the element just parsed. A real `,` is
+// consumed. A MISSING one — the cursor already sits on the next ELEMENT, as in
+// `f(1 2)`, `[1 2]`, `{x: 1 y: 2}` or `function f(a: i32 b: i32)` — is diagnosed
+// and INSERTED: the caller's loop simply goes round again, so every element the
+// user wrote lands in the tree.
+//
+// THE INSERTED `,` IS A LOSSLESS RECOVERY, and it is the point of stage 2. The
+// predecessor recovery had no separator arm at all: an element-starting token
+// ended the list and fell through to `expectClose`, whose scan SKIPS TO THE
+// CLOSER — that is what turned `f(1 2)` into a hole-free `f(1)` and made its
+// `wrong number of arguments: expected 2, got 1` fiction. Nothing is dropped
+// here and nothing is invented beyond the one separator the message names, so
+// the arity the checker reads is the arity on the screen.
+//
+// `startsElem` is the CALLER's element-start test — an expression for a call /
+// array literal, a field key for an object literal, a parameter name for a
+// parameter list — because "another element" is a different set per list. A
+// token that starts no element of THIS list (a stray closer, a statement
+// keyword, `{`) still ends the list and still reaches `expectClose`'s bounded
+// skip, still lossy and still gating.
+//
+// AND THE INSERT IS SAME-LINE ONLY — the guard is the whole difference between a
+// faithful recovery and a phantom, and it was measured as a phantom first. Every
+// caller here skips NEWLINEs before asking (a list may legally span lines), so
+// without the guard a missing CLOSER at end of line reads as a missing COMMA and
+// the NEXT STATEMENT is swallowed as an element:
+//
+//     const xs = [1, 2      →  `expected `,` but found `print``, then
+//     print(xs.length)         ``xs` is used before it is assigned` and
+//                              `list element expects a value, got void`
+//
+// Two type errors about a program nobody wrote, and — because `expectClose` then
+// reaches EOF having consumed nothing — a LOSSLESS mark that lets the checker
+// run on it. Master reports exactly one diagnostic there (`expected `]` but
+// found `print``), and so does this, because a NEWLINE between the element and
+// the element-start token declines the insert and falls through to
+// `expectClose`'s bounded lossy skip.
+//
+// THE PRICE IS REAL AND IS THE RIGHT ONE: a missing comma at the end of a line
+// inside a MULTI-LINE list is no longer inserted, so it keeps the old lossy
+// recovery and is not typechecked. A closer that is missing and a separator that
+// is missing are indistinguishable at a line end — the tokens are identical —
+// and guessing "separator" there is what invents a program. On ONE line they are
+// distinguishable, because a list that ends on that line has its closer there.
+//
+// Read from the token stream rather than a flag threaded through the four
+// callers: `skipNewlines` leaves the NEWLINE it consumed at `P.pos - 1`, so the
+// question "was a newline crossed" is already recorded where it happened.
+function takeSep(startsElem: boolean): boolean {
+  if peekKind() == "COMMA" {
+    advance()
+    return true
+  }
+  if !startsElem { return false }
+  if P.pos == 0 || kindAt(P.pos - 1) == "NEWLINE" { return false }
+  dgMarkLossless(P.diags.length) // the index this push is about to occupy
+  P.diags.push(
+    { msg: "expected `,` but found " + foundDesc(peekTok()), at: P.pos },
+  )
+  true
 }
 
 // ── operator precedence ──────────────────────────────────────────────────────
@@ -1252,16 +1351,17 @@ function parseArgs() {
   if peekKind() != "RPAREN" {
     parseOneArg(args, names)
     skipNewlines()
-    let more = peekKind() == "COMMA"
+    // `takeSep` consumes a real `,` and INSERTS a missing one (`f(1 2)`), so the
+    // `advance()` that used to head this loop now lives there.
+    let more = takeSep(startsExprTok(peekKind()))
     while more {
-      advance()
       skipNewlines()
       if peekKind() == "RPAREN" {
         more = false
       } else {
         parseOneArg(args, names)
         skipNewlines()
-        more = peekKind() == "COMMA"
+        more = takeSep(startsExprTok(peekKind()))
       }
     }
   }
@@ -1361,8 +1461,9 @@ function parseObjLit() {
       fields.push(mkFieldInit(name, value, fp0))
     }
     skipNewlines()
-    if peekKind() == "COMMA" {
-      advance()
+    // An object literal's element starts with its KEY — an IDENT or a STRING
+    // (`"+": fn`) — so `{x: 1 y: 2}` is a missing separator, not a missing `}`.
+    if takeSep(peekKind() == "IDENT" || peekKind() == "STRING") {
       skipNewlines()
       going = peekKind() != "RBRACE"
     } else {
@@ -1388,8 +1489,7 @@ function parseArrayLit() {
   while going {
     elems.push(parseExpr())
     skipNewlines()
-    if peekKind() == "COMMA" {
-      advance()
+    if takeSep(startsExprTok(peekKind())) {
       skipNewlines()
       going = peekKind() != "RBRACK"
     } else {
@@ -2392,9 +2492,10 @@ function parseParamList() {
   if peekKind() != "RPAREN" {
     params.push(parseParam())
     skipNewlines()
-    let more = peekKind() == "COMMA"
+    // A parameter's element start is its NAME, so `function f(a: i32 b: i32)` is
+    // a missing separator; `takeSep` inserts it and consumes a real `,`.
+    let more = takeSep(peekKind() == "IDENT")
     while more {
-      advance() // ","
       skipNewlines()
       // Trailing comma: a `,` immediately before `)` closes the list.
       if peekKind() == "RPAREN" {
@@ -2402,7 +2503,7 @@ function parseParamList() {
       } else {
         params.push(parseParam())
         skipNewlines()
-        more = peekKind() == "COMMA"
+        more = takeSep(peekKind() == "IDENT")
       }
     }
   }
@@ -2881,9 +2982,11 @@ function oneStmtBlock(): i32 {
 // — so every type error over the resulting AST is a REAL one. That is what lets
 // the driver run the checker anyway (DECISIONS.md, 2026-09-01) and report the
 // parse mistake TOGETHER with the type error four lines down, which the
-// first-error bail used to swallow. The `parseBlock` fall-through below is NOT
-// marked: `expectClose`'s skip-to-closer drops tokens, and a dropped token is
-// exactly what makes a later type error fiction.
+// first-error bail used to swallow. The `parseBlock` fall-through below carries
+// no mark of its own — whether it ends up lossless is `expectClose`'s answer,
+// and it is the SKIP that decides: a closer that is merely missing drops no
+// token and IS lossless, one whose scan ate tokens on the way is not, because a
+// dropped token is exactly what makes a later type error fiction.
 function parseBracedBody(msg: string): i32 {
   if peekKind() != "LBRACE" && startsStmt(peekKind()) {
     dgMarkLossless(P.diags.length) // the index this push is about to occupy

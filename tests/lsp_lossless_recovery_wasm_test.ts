@@ -77,24 +77,55 @@ Deno.test({
   }
 });
 
-// The negative half, at the same surface: a LOSSY parse error still suppresses
-// the checker, so no phantom type diagnostic reaches the editor either. `f(1 2)`
-// re-parses to a hole-free `f(1)` — the arity error a run checker would raise is
-// about a call the user never wrote.
+// STAGE 2 (the `expectClose` conversion) AT THE EDITOR SURFACE: a half-written
+// call is the most common mid-edit state there is, and a missing list separator
+// is now INSERTED rather than skipped past — so `f(1 2)` is the two-argument
+// call it looks like, and the type error under it reaches the editor with the
+// parse diagnostic instead of blanking it. The phantom `expected 2, got 1` that
+// the old skip-to-the-closer recovery would have invented must not appear.
+const HALF_WRITTEN_CALL =
+  'function f(a: i32, b: i32) { a + b }\nprint(f(1 2))\nconst n: i32 = "hi"\n';
+
 Deno.test({
-  name: "lsp lossless: a lossy parse error still suppresses the type tier",
+  name: "lsp lossless: a half-written call keeps its type feedback",
   ignore,
 }, async () => {
   const checker = loadWasmChecker(SEED, log)!;
   const diags = await checker.check(
-    "function f(a: i32, b: i32) { a + b }\nprint(f(1 2))\n",
-    "/tmp/lossy.vl",
+    HALF_WRITTEN_CALL,
+    "/tmp/halfcall.vl",
     noSiblings,
   );
   if (diags.some((d) => d.message.includes("wrong number of arguments"))) {
     throw new Error(`phantom arity error reached the editor: ${fmt(diags)}`);
   }
-  if (!diags.some((d) => d.message.includes("expected `)`"))) {
+  if (!diags.some((d) => d.message === "expected `,` but found `2`")) {
+    throw new Error(`want the inserted-separator diagnostic, got: ${fmt(diags)}`);
+  }
+  if (!diags.some((d) => d.message === TYPE_ERR)) {
+    throw new Error(
+      `want the type error to survive the recovery, got: ${fmt(diags)}`,
+    );
+  }
+});
+
+// The negative half, at the same surface: a LOSSY parse error still suppresses
+// the checker, so no type diagnostic read off a mangled tree reaches the editor.
+// `[{x: 1} {x: 2}]` is the skip-to-the-closer that SURVIVED stage 2 — `{` is not
+// an element start for the separator recovery, so `expectClose` still eats to
+// the `]` and the elements after the first are gone from the tree.
+const LOSSY_SKIP = 'const a = [{ x: 1 } { x: 2 }]\nconst n: i32 = "hi"\n';
+
+Deno.test({
+  name: "lsp lossless: a lossy parse error still suppresses the type tier",
+  ignore,
+}, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const diags = await checker.check(LOSSY_SKIP, "/tmp/lossy.vl", noSiblings);
+  if (diags.some((d) => d.message === TYPE_ERR)) {
+    throw new Error(`a type diagnostic escaped a LOSSY parse: ${fmt(diags)}`);
+  }
+  if (!diags.some((d) => d.message.includes("expected `]`"))) {
     throw new Error(`want the parse diagnostic itself, got: ${fmt(diags)}`);
   }
 });
@@ -123,6 +154,11 @@ Deno.test({
 // lossy one" is a sequence a user types in under a second — and a missing reset
 // makes the second check invent the phantom. Order matters here: the lossless
 // file must go FIRST, or there is nothing stale to leak.
+//
+// THE LOSSY ARM HAS TO STAY LOSSY, or this measures nothing: it used `f(1 2)`
+// until stage 2 made that recovery faithful, at which point the test would have
+// gone on passing while its control had stopped being a control. `LOSSY_SKIP` is
+// a skip-to-the-closer stage 2 deliberately did not convert.
 Deno.test({
   name: "lsp lossless: the flag column does not leak across checks on one instance",
   ignore,
@@ -132,14 +168,10 @@ Deno.test({
   if (!first.some((d) => d.message === TYPE_ERR)) {
     throw new Error(`setup: want the recovered file to typecheck, got: ${fmt(first)}`);
   }
-  const second = await checker.check(
-    "function f(a: i32, b: i32) { a + b }\nprint(f(1 2))\n",
-    "/tmp/b.vl",
-    noSiblings,
-  );
-  if (second.some((d) => d.message.includes("wrong number of arguments"))) {
+  const second = await checker.check(LOSSY_SKIP, "/tmp/b.vl", noSiblings);
+  if (second.some((d) => d.message === TYPE_ERR)) {
     throw new Error(
-      `a stale lossless mark from the PREVIOUS check let the phantom through: ${
+      `a stale lossless mark from the PREVIOUS check let the type tier through: ${
         fmt(second)
       }`,
     );

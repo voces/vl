@@ -2318,7 +2318,9 @@ would have been, so no token is dropped and none invented; a type error read off
 about the program the user wrote. `parseBlock`'s fall-through is NOT marked, because
 `expectClose`'s skip-to-closer drops tokens. The `then`-removal recovery in `parseIf` is
 arguably lossless too and is deliberately left unmarked — it was not in the ruled set, and it is
-the cheapest stage-2 candidate.
+the cheapest stage-2 candidate. (Stage 2's FIRST conversion has since landed and split
+`expectClose` in two — see the section below; the sentence above describes the site as stage 1
+left it.)
 
 **The quantifier is ALL, and that is what makes it safe by construction.** One lossy diagnostic
 anywhere in the file restores the old bail for the whole file, so the five phantoms cannot
@@ -2338,7 +2340,7 @@ corpus cases, each inventing the message beside it:
 
 | case | phantom |
 | --- | --- |
-| `parser/call-missing-comma-recovers.vl` | `wrong number of arguments: expected 2, got 1` |
+| `parser/call-missing-comma-recovers.vl` | `wrong number of arguments: expected 2, got 1` — **RETIRED by stage 2's first conversion; four pins remain** |
 | `functions/trailing-comma-illegal.vl` | `wrong number of arguments: expected 0, got 1` |
 | `objects/error-equality-not-overloadable.vl` | `redeclared ==`, `redeclared !=` |
 | `index/operator-unannotated-self.vl` | `cannot index non-array Box` |
@@ -2363,6 +2365,105 @@ already merged three sources; it now merges four.
 
 Measured: distilled corpus **zero cells moved** (the corpus is parse-clean, so the gate is
 unreachable from it), all eleven gates green, 349/349 filed witnesses as filed.
+
+## A MISSING LIST SEPARATOR IS INSERTED, NEVER SKIPPED PAST
+
+**Stage 2, first conversion. Inside a delimited list, a token that starts another ELEMENT where
+a `,` belongs is diagnosed and the `,` is INSERTED — the list keeps every element the user
+wrote. And `expectClose`'s skip-to-closer is now two events, not one: a scan that consumed
+NOTHING inserted only the closer and is LOSSLESS; a scan that ate tokens on the way is not.**
+(no new ruling needed — ROADMAP's stage-2 entry authorises the conversions; #2397)
+
+`f(1 2)` was the phantom DECISIONS names first, and it was never an arity bug. The parser had no
+separator arm at all: an element-starting token simply ended the list and fell through to
+`expectClose`, whose bounded scan ran forward to the `)` — so the `2` was **deleted**, the call
+re-parsed hole-free as `f(1)`, and `wrong number of arguments: expected 2, got 1` was a count
+nobody had written. Skipping was the defect; the phantom was its symptom, and lifting the bail
+would only have made the symptom visible.
+
+**The insert is gated on the CALLER's element-start test, not on one global predicate**, because
+"another element" is a different set per list: an expression for a call and an array literal
+(`startsExprTok` — `startsStmt` minus the statement keywords, plus `if`), a field key
+(IDENT/STRING) for an object literal, a parameter name (IDENT) for a parameter list. Four sites
+are wired: `parseArgs`, `parseArrayLit`, `parseObjLit`, `parseParamList`.
+
+**`{` is deliberately NOT an element start**, even though an object literal begins with one.
+After a complete element a `{` is far more often a missing closer than a missing comma, and it is
+already `expectClose`'s own scan bound — so `[{x: 1} {x: 2}]` keeps the lossy skip and keeps the
+bail. That is the case `tests/lsp_lossless_recovery_wasm_test.ts` now uses as its LOSSY control,
+having previously used `f(1 2)`: the conversion would otherwise have left that suite green with
+its control no longer controlling anything.
+
+**AND THE INSERT IS SAME-LINE ONLY — the guard is the whole difference between a faithful
+recovery and a phantom, and the first cut of this change was the phantom.** Every list site skips
+NEWLINEs before asking whether the list continues, because a list may legally span lines. Without
+a guard that makes a missing CLOSER at end of line read as a missing COMMA, and the NEXT
+STATEMENT becomes an element:
+
+```
+const xs = [1, 2      →  `expected `,` but found `print``, then
+print(xs.length)         ``xs` is used before it is assigned` and
+                         `list element expects a value, got void`
+```
+
+`expectClose` then reaches EOF having consumed nothing, marks the diagnostic LOSSLESS, and the
+checker runs over a program nobody wrote — **the exact class the phantom pins exist to stop,
+reintroduced by the change that retired one of them.** Master reports one diagnostic there
+(`expected `]` but found `print``) and so does this, because a NEWLINE between the element and
+the element-start token declines the insert. Measured on the built candidate against a pristine
+master control, all three shapes byte-for-byte identical to master: `const xs = [1, 2` / `print(1`
+/ `const a = { x: 1` each followed by a statement.
+
+**THE PRICE IS REAL AND IS THE RIGHT ONE.** A missing comma at the end of a line inside a
+MULTI-LINE list is no longer inserted, so it keeps the old lossy recovery and is not typechecked.
+A closer that is missing and a separator that is missing are *indistinguishable* at a line end —
+the tokens are identical — and guessing "separator" there is what invents a program. On ONE line
+they are distinguishable, because a list that ends on that line has its closer there. The price
+is a capability this change does not GAIN, not one it loses: the multi-line spelling behaves
+exactly as master does. All four shapes are pinned in `tests/vl_lossless_recovery_test.ts`
+(`NEWLINE_GATED`), each against MASTER'S OWN OUTPUT and each requiring a real type error placed
+after the mistake to be ABSENT — the inverse of the positive cases, and the assertion that fails
+if the gate is ever dropped. The pins were validated against the unguarded build, which produces
+every forbidden message.
+
+The guard reads the TOKEN STREAM rather than a flag threaded through the four callers:
+`skipNewlines` leaves the NEWLINE it consumed at `P.pos - 1`, so "was a newline crossed" is
+already recorded where it happened.
+
+**The zero-skip half generalises the marker to all twenty `expectClose` call sites** without
+touching any of them. The contract is unchanged — "the program the checker sees is the program
+the user wrote, up to the inserted token" — and an inserted CLOSER satisfies it exactly as
+`parseBracedBody`'s inserted braces do. `print(1` at end of line and a block whose `}` never
+arrives are now typechecked; anything whose recovery ATE tokens still is not.
+
+Measured on the built candidate, one program per spelling, each with a real type error placed
+after the mistake so "no phantom" cannot be confused with "the checker never ran":
+
+| spelling | diagnostic | checker ran | phantom |
+| --- | --- | --- | --- |
+| `f(1 2)` | ``expected `,` but found `2` `` | yes | none |
+| `f(1 2 3)` (3 params) | two, one per gap | yes | none |
+| `g(f(1 2), 3)` | ``expected `,` but found `2` `` | yes | none |
+| `[1 2]` | ``expected `,` but found `2` `` | yes | none |
+| `{ x: 1 y: 2 }` | ``expected `,` but found `y` `` | yes | none |
+| `function f(a: i32 b: i32)` | ``expected `,` but found `b` `` | yes | none |
+| `[{x: 1} {x: 2}]` | ``expected `]` but found `{` `` | **no — correctly still gated** | none |
+| `const xs = [1, 2` + a statement | ``expected `]` but found `print` `` (master's own) | **no — the newline gate** | none |
+| a multi-line list missing a comma | master's own two | **no — the price** | none |
+
+**The strongest witness is the arity error that DOES fire.** `f(1 2 3)` against a two-parameter
+`f` reports `wrong number of arguments: expected 2, got 3` — the phantom's own message with the
+right number in it, which is what separates "the separator was inserted" from "the checker
+happened not to run".
+
+`vl fmt` is unaffected and must stay so: the comma goes into the TREE, not into the file. The
+formatter keeps the ANY-diagnostic bail, refuses, and leaves the source byte-identical rather
+than silently spelling the missing `,` in.
+
+Measured: distilled corpus **zero cells moved**, all eleven gates green, three corpus fixtures
+re-worded (the message changed from the closer's to the separator's) and one added
+(`parser/call-missing-comma-typechecks.vl`). **Four phantom pins remain**; the next stage-2
+conversion is the `then`-removal arm in `parseIf`.
 
 ## Which channel owns a NARROWED argument's type at a monomorphization pin
 
