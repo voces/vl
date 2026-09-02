@@ -1,0 +1,68 @@
+// @run
+// @log 2
+// @log 1
+// @log false
+// @log false
+// @log 2.5
+// @hint redundant type annotation: `f` is inferred as `f64` — remove it to lean on inference
+// @warning Unused variable `c` (prefix with `_` to suppress, or remove it)
+// `c` is DECLARED unused: D1010's witness is the DECLARATION — the refusal was at the
+// assignment of `[1.0, null]` to a `J`, so binding it is the whole test and reading it back
+// would be a different rung.
+// Regression (silent-class-inventory D1009, D1010 and D1030 — one predicate, three rows).
+//
+// `assignable`'s rule read "a nullable source is not assignable to a non-nullable target",
+// which asserts without asking that the target does not admit `null`. The real subset test is:
+// `T | null` is assignable to `D` iff `T` is AND `null` is.
+//
+// THE SHAPE THAT MAKES THIS BITE IS THE INTERNING. A self-referential union with a `null` arm
+// interns as `TyUnion[ TyNullable(rest) ]` — the null folded into a niche, the alias left as a
+// one-member wrapper — so `Json`'s ONE member is a nullable. That made `Json` not assignable
+// to `Json | JsonError`, its own SUPERSET, and made the narrowing residue of that composition
+// not assignable back to `Json`. Every one of the three rows is a `null` the target already
+// had.
+//
+// AND THE CHECKER HALF ALONE IS NOT ENOUGH — it was measured turning D1009 from a loud check
+// reject into invalid wasm, which is clause 2 traded for clause 1. `null ∈ J` is true as a SET
+// statement and false at the REP: a map read's miss sentinel is a bare `ref.null` in the vals
+// slot, while `J`'s own null arm is a null-TAGGED box. `emitMapGetUnionBox` is exactly that
+// conversion and already served the BINDING position; the ARGUMENT boundary never routed to
+// it. Both halves ship together, in that order.
+type J = null | f64 | J[]
+
+function f(v: J): f64 {
+  if v == null { return 0.0 }
+  if v is f64 { return v }
+  1.0
+}
+
+// 1 — D1009: a map read (`J | null`, the miss sentinel) straight into a `J` parameter. The
+// value must survive the sentinel→box conversion, so the number matters, not the compile.
+const m: { [string]: J } = Map()
+m["a"] = 2.0
+print(f(m["a"]))
+
+// 2 — D1010: a null-bearing array literal reaching an element arm that admits null
+const c: J = [1.0, null]
+print(1)
+
+// 3 and 4 — D1030's two faces, over the composition std's fallible APIs use
+type Json = null | boolean | f64 | string | Json[] | { [string]: Json }
+type JsonError = { at: i32, kind: "syntax", path: string, msg: string }
+
+function g(v: Json): Json { v }
+function residue(n: i32): Json | JsonError {
+  if n == 0 { return { at: 0, kind: "syntax", path: "", msg: "x" } }
+  1.5
+}
+const r = residue(1)
+if r is JsonError { print("err") } else { print(g(r) == null) }
+
+function mk(): Json { 1.5 }
+function widen(): Json | JsonError { return mk() }
+print(widen() == null)
+
+// 5 — a MISS still reads as null, so the conversion did not lose the sentinel's meaning
+const m2: { [string]: J } = Map()
+m2["k"] = 2.5
+print(f(m2["k"]))

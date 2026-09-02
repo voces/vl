@@ -29900,7 +29900,11 @@ Repro (runs, prints `0`):
 
 ### D1009 — `J | null` is not assignable to `J` when `null` is already a member of `J`: a map read of a null-bearing recursive union cannot reach a callee typed `J`
 
-**loud check reject · `argument 1: expected J, got J | null` · `null` IS a member of `J` (`type J = null | f64 | J[]`), so `J | null` and `J` denote the same set and the check should be a no-op · the read is the map's ordinary `V | null` miss sentinel · found by the serde critique panel's JSON-tree probe the day #2244 landed D982/D985: the `is` ladder now works, and THIS is what stands between it and `render(v[k])` · workaround: bind the read and narrow on `== null` first — that spelling runs and prints `{"a":[1,null,"x"],"b":null,"c":{"deep":2.5}}`**
+**runs — CLOSED 2026-09-02 by ONE predicate shared with D1009/D1010/D1030: `assignable` now
+asks whether the target admits `null` instead of assuming it does not, and the ARGUMENT
+boundary routes a union-valued map read through `emitMapGetUnionBox` so the miss sentinel
+arrives as the tagged box the target's rep expects ·
+`tests/cases/types/nullable-source-into-null-bearing-target.vl` · was: loud check reject · `argument 1: expected J, got J | null` · `null` IS a member of `J` (`type J = null | f64 | J[]`), so `J | null` and `J` denote the same set and the check should be a no-op · the read is the map's ordinary `V | null` miss sentinel · found by the serde critique panel's JSON-tree probe the day #2244 landed D982/D985: the `is` ladder now works, and THIS is what stands between it and `render(v[k])` · workaround: bind the read and narrow on `== null` first — that spelling runs and prints `{"a":[1,null,"x"],"b":null,"c":{"deep":2.5}}`**
 
 The JSON value tree `type Json = null | boolean | f64 | string | Json[] | { [string]: Json }`
 builds and runs at every `is` arm since #2244. Rendering an object member is
@@ -29949,9 +29953,30 @@ Repro (loud check reject):
   `TY_NULL` member and the `TyUnion[ TyNullable(rest) ]` peel D1027 needs) and the witness is
   unchanged, because the map read's type is not minted through that home.
 
+* **THE CHECKER HALF ALONE TRADES CLAUSE 2 FOR CLAUSE 1 — measured, and it is why the two ship
+  together in this order.** With `assignable` relaxed and nothing else, this witness passes
+  `vl check` and emits invalid wasm. `null ∈ J` is true as a SET statement — the row's "the
+  check should be a no-op" follows from it — and false at the REP: a map read's miss sentinel
+  is a bare `ref.null` in the vals slot, while `J`'s own `null` arm is a null-TAGGED box.
+
+  `emitMapGetUnionBox` IS that conversion and was already serving the BINDING position
+  (`letNulMapReadUnionBox`); the ARGUMENT boundary simply never routed to it. So nothing had
+  to be invented — the lowering existed and one delivery lacked it, which is the same shape as
+  D1019, D1029 and D1033 before it.
+
+* **ONE PREDICATE, THREE ROWS.** The row guessed that "one `null ∈ J` predicate may close both
+  [D1010](#d1010) and this"; it closes [D1030](#d1030) too, whose two faces are the same fact
+  seen from the other side — a self-referential union with a `null` arm interns as
+  `TyUnion[ TyNullable(rest) ]`, so `Json`'s single member is a nullable and `Json` was not
+  assignable to `Json | JsonError`, its own superset.
+
 ### D1010 — a null-bearing array literal `[1.0, null]` cannot reach a recursive union whose element arm admits `null`: `(f64 | null)[]` is refused where `f64[]` is accepted
 
-**loud check reject · `cannot assign (f64 | null)[] to 'c' of type J` · with `type J = null | f64 | J[]`, the literal's element type `f64 | null` is a subset of `J`'s members, and `[1.0, 2.0]` (element type `f64`) IS accepted at the same three destinations — binding, map write, argument — so the element-widening test admits `f64 → J` and refuses `null → J` · the annotated spelling `const arr: J[] = [1.0, null]` runs · sibling of D1009**
+**runs — CLOSED 2026-09-02 by ONE predicate shared with D1009/D1010/D1030: `assignable` now
+asks whether the target admits `null` instead of assuming it does not, and the ARGUMENT
+boundary routes a union-valued map read through `emitMapGetUnionBox` so the miss sentinel
+arrives as the tagged box the target's rep expects ·
+`tests/cases/types/nullable-source-into-null-bearing-target.vl` · was: loud check reject · `cannot assign (f64 | null)[] to 'c' of type J` · with `type J = null | f64 | J[]`, the literal's element type `f64 | null` is a subset of `J`'s members, and `[1.0, 2.0]` (element type `f64`) IS accepted at the same three destinations — binding, map write, argument — so the element-widening test admits `f64 → J` and refuses `null → J` · the annotated spelling `const arr: J[] = [1.0, null]` runs · sibling of D1009**
 
 Three destinations, same literal, same alias: `const c: J = [1.0, null]` refuses;
 `m["a"] = [1.0, null]` into `{ [string]: J }` refuses (`cannot assign (f64 | null)[] to J |
@@ -31447,7 +31472,11 @@ Repro:
 
 ### D1030 — the residue of narrowing `Json | JsonError` away from the error arm is the FLATTENED member list and is not assignable to `Json`, and a plain `Json` does not widen back INTO the composition
 
-**loud check reject · clause 2 (the program is type-valid: the residue's members ARE `Json`'s members, one for one) · `argument 1: expected Json, got boolean | f64 | string | Json[] | {[string]: Json} | null` and `return type mismatch: expected Json | JsonError, got Json` · found 2026-09-02 building `std/json.vl` · both faces survive D1028's close (#2318), which fixed the NAMED composition's emit and not this**
+**runs — CLOSED 2026-09-02 by ONE predicate shared with D1009/D1010/D1030: `assignable` now
+asks whether the target admits `null` instead of assuming it does not, and the ARGUMENT
+boundary routes a union-valued map read through `emitMapGetUnionBox` so the miss sentinel
+arrives as the tagged box the target's rep expects ·
+`tests/cases/types/nullable-source-into-null-bearing-target.vl` · was: loud check reject · clause 2 (the program is type-valid: the residue's members ARE `Json`'s members, one for one) · `argument 1: expected Json, got boolean | f64 | string | Json[] | {[string]: Json} | null` and `return type mismatch: expected Json | JsonError, got Json` · found 2026-09-02 building `std/json.vl` · both faces survive D1028's close (#2318), which fixed the NAMED composition's emit and not this**
 
 Repro:
 
