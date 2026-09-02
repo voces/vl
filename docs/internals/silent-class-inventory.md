@@ -25564,10 +25564,12 @@ Repro (runs today and must keep running, printing `1`):
 
 ### D796 — an indexed STORE of an object literal into a list whose element is a union ARM has no lowering, with no covariance anywhere in the program
 
-**check-clean invalid wasm · found 2026-08-31 while building D791's write witnesses, as an
+**runs, prints `9` — CLOSED 2026-09-01 by seeding `pendingVariantIdx` with the ARM wherever
+`rlElemStructRow` declines, at all THREE of its emitter consumers (indexed store, `.push`,
+`__array_new__` fill); pinned by `tests/cases/arrays/arm-element-list-mutation.vl`.
+Was: check-clean invalid wasm · found 2026-08-31 while building D791's write witnesses, as an
 obstacle that turned out not to be covariance at all · a CLAUSE-1 soundness violation · no
-corpus cell reaches it · filed rather than fixed: it is one container over from D761/D771 and
-shares nothing with the covariance family but its type declarations**
+corpus cell reaches it**
 
 Repro (check rc 0, invalid module):
 
@@ -25604,6 +25606,30 @@ Repro (check rc 0, invalid module):
   the write-scan ablation, for THIS reason and not for the one it was written to show. The
   usable witness pushes through the union-box destination instead. Recording that costs a
   paragraph and saves the next person the same hour.
+
+* **THE DECLINE WAS RIGHT; ITS OTHER HALF WAS MISSING.** `rlElemStructRow` refuses to answer
+  for an arm-typed element on purpose — the arm's heap is `uVarHeap[vi]`, and bridging it onto
+  a same-layout standalone row is [D32](#d32), a different heap type and invalid wasm. What
+  never existed is the complement: telling the VALUE where to build instead. So the store saw
+  no struct seed, fell through to the union-coerce, and built a `{tag, payload}` BOX for a
+  slot typed `(ref null $Circle)`.
+
+  The disassembly says it in one line — `(struct.new $2 (i32.const 0) (struct.new $0
+  (i32.const 9)))` set into a `(ref null $0)` local — and the SAME literal in the initializer
+  built bare and validated. That contrast is what proves the rep was reachable all along and
+  only the hint was lost. `pendingVariantIdx` already existed for exactly this ("bare variant
+  an ObjLit must build"); no new machinery.
+
+* **THREE DELIVERIES, AND THE ROW ONLY KNEW TWO.** `rlElemStructRow` has three consumers in
+  the emitter — the indexed store, `.push`, and the `__array_new__` fill — and every one had
+  the identical hole. The row's own ablation found the first two; the fill came from grepping
+  the callers rather than trusting the list, which is D965's order applied to a bug fix rather
+  than to a capability lift. All three now print their value.
+
+* **`.pop()` IS STILL LOUD AND IS NOT SWEPT IN.** It refuses with `a ref-element list op needs
+  its receiver's element type known before the body is lowered` — a different sentence, a
+  different mechanism, and loud rather than silent, so it is not this row's clause-1 defect.
+  The fixture records that it stays refused rather than quietly leaving it unmentioned.
 
 ---
 
