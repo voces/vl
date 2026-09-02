@@ -24211,7 +24211,7 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
 
 ### D989 — `==` between two VALUES of a scalar-carrying union refuses at emit
 
-**loud emit reject · clause 2 · reported by vl-b7 while measuring the reference-identity proposal; reproduced here**
+**closed · was a loud emit reject · clause 2 · `tests/cases/unions/value-union-eq-both-sides.vl` — the acceptance condition is its VALUE TABLE, not a compile**
 
     type U = i32 | string
     const a: U = 1
@@ -24252,17 +24252,22 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   the arms**. Acceptance is a value table, not a compile: `1 == 1` true, `1 == 2` FALSE,
   `"ab" == "ab"` true, `1 == "ab"` false.
 
-* **AND THE VALUE BOX IS NOT THE BROKEN PART EITHER.** The obvious reading of "the i32 arm
-  always compares equal" is that `vbI32Idx` is stale because `vbI32Used` was never set, so the
-  cast-and-read lands on the wrong struct and reads a field that happens to match. Forcing
-  that flag true ALONGSIDE the arm expansion still prints `1 == 2` as `true`. Two independent
-  eliminations now: the flag alone (refusal unchanged) and the flag with the expansion (value
-  still wrong).
+* **CLOSED BY EXPANDING BOTH SIDES' ARM LISTS.** `emitUnionUnionEq` builds its arm list by
+  INTERSECTING the two sides' member atoms, and for a declared union both lookups miss:
+  `msMemberAtomsOfSet` returns false and the fallbacks answer for the union's own NAME —
+  `splitUnionAtoms` on the left, `unionHasAtom` on the right. Expanding through
+  `unionSetArmTys` on both sides gives the loop real arms.
 
-  The compare SEQUENCE itself reads correctly at source level — unbox left, unbox right,
-  `atomEqOpcodeOfKind` — so the next probe should check what those two unboxes actually push,
-  by disassembling the expanded build rather than reading the emitter. That is the same move
-  that settled D1015 and D976 after source-reading failed.
+* **EXPANDING ONLY THE LEFT COMPILES AND IS SILENTLY WRONG, which is how the cause was found.**
+  With one side expanded the intersection is EMPTY, the arm loop emits nothing, and control
+  reaches the tag-only fallback after it — so `==` compares just the two TAGS and `1 == 2`
+  prints `true`. The disassembly is the whole story in one line:
+  `i32.eq (struct.get $0 0 …) (struct.get $0 0 …)`, field 0 being the tag. Reading the emitter
+  had missed it three times; reading the bytes took one build.
+
+* **THE VALUE BOX WAS NEVER THE PROBLEM**, though the message points straight at it. Forcing
+  `vbI32Used` true changes neither the refusal nor, later, the wrong value. Two eliminations,
+  both recorded so the next reader does not start at `vbHeapIdxOfKind`.
 
 * Numbered in this session's block rather than the reporter's, so the range reservations stay
   clean.
