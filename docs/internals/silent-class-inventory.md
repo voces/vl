@@ -32086,10 +32086,10 @@ Repro (now runs, printing `true`):
 * **`std/json.vl` CANNOT DROP ITS WORKAROUND YET, AND THAT IS A MEASURED ANSWER, NOT A
   CAUTION.** This row's witness spells `kind: "syntax"` — a BARE literal — and the module
   spells `kind: "syntax" | "duplicate" | "depth" | "nonfinite"`, an inline literal UNION, which
-  is a different field code on the two tables and still refuses: [D1043](#d1043), filed from
+  is a different field code on the two tables and still refuses: [D1093](#d1093), filed from
   the module's ACTUAL carriers rather than from this row's paraphrase of them. Naming that
   union (`type JsonErrorKind = …`) makes the SCANNER face build today — verified by hand — and
-  the RENDERER face then meets [D1044](#d1044), a pre-existing silently-wrong read. So the
+  the RENDERER face then meets [D1094](#d1094), a pre-existing silently-wrong read. So the
   workaround comes out in one more step, not in this one. **Writing the real module's spelling
   instead of the row's is what found both**: a paraphrased witness is a different program.
 
@@ -32134,8 +32134,8 @@ Repro (now runs, printing `true`):
   a mechanical rewrite and costs no behaviour, but it is the reason the module's internals do
   not read like `std/fs.vl`'s. **THIS CLOSE DOES NOT UNDO IT** — see the bullet above: the
   module's `kind` field is an inline literal UNION, not the bare literal this row's witness
-  carries, and that spelling still refuses ([D1043](#d1043)). The undo is a std change gated on
-  D1043 (or on naming the `kind` union) and wants its own review either way.
+  carries, and that spelling still refuses ([D1093](#d1093)). The undo is a std change gated on
+  D1093 (or on naming the `kind` union) and wants its own review either way.
 
 ---
 
@@ -34320,13 +34320,14 @@ Repro (`vl check` rc 0, then the emitter refuses):
 Probe: `scripts/capability-probes/union-eq-unannotated-variant-operand.vl`.
 ---
 
-### D1093 — the VARIANT table codes an INLINE multi-member literal-union field `string` and the STRUCT table codes it `atom`, so an arm carrying one still has no field rep; the NAMED alias spelling of the same union runs
+### D1093 — [CLOSED 2026-09-02] the VARIANT table codes an INLINE multi-member literal-union field `string` and the STRUCT table codes it `atom`, so an arm carrying one still has no field rep; the NAMED alias spelling of the same union runs
 
-**loud emit reject: `emitProgram: a struct field typed as the union ARM `Circle` has no field
-rep` · check rc 0 · clause 2 · found 2026-09-02 as the RESIDUE of [D1031](#d1031), by writing
-`std/json.vl`'s ACTUAL carrier shapes rather than the row's paraphrase of them — that row's
-witness spells `kind: "syntax"`, a BARE literal it fixed, and the module spells
-`kind: "syntax" | "duplicate" | "depth" | "nonfinite"`, an INLINE literal UNION, which is this**
+**runs, prints `3` — CLOSED 2026-09-02 by TWO changes that had to land together (the mint's
+CODES and the mint's KEY) · was a loud emit reject, clause 2 · zero `runs` lost, distilled
+corpus unmoved (0 classes of 255,504 cells), rep-fuzz exact · fixture
+`unions/arm-with-inline-literal-union-field.vl` · also turns
+`{kind: "x"|"y"}` assigned into a `{kind: string}` binding from check-clean INVALID WASM into
+`runs`**
 
 Repro:
 
@@ -34374,20 +34375,66 @@ Repro:
   scanner face runs. That is a one-line std change and arguably better std style, but it is a
   std API change and wants its own review — and the RENDER face then meets [D1094](#d1094).
 
-* **TWO ROUTES.** Make the VARIANT recorder code an inline literal-union field 0, which is a REP
-  change for every arm carrying one (and is the `A5c` un-named-literal atom rep
-  [D1023](#d1023) names); or make `internArmShapeOf` render the arm the way the VARIANT table
-  sees it, so the minted row's codes match by construction. The second is smaller and closes
-  only this; the first is what D1023's ruling needs anyway.
+* **THE ROUTE THAT SHIPPED IS THE SECOND, AND THE FIRST WAS BUILT AND REFUTED.** Making the
+  VARIANT/NODE recorder code an inline literal-union field 0 is one line
+  (`tyIsLitUnion(nodeTyIxOf(litNode))` beside the alias test) and it is a REP MIGRATION, not a
+  fix: the field's slot becomes an i32 atom while the object-literal CONSTRUCT path still
+  builds the string-slot layout, so `type Circle = {r: i32, k: "a" | "b"}` with NO union in the
+  program emits TWO struct types for one declaration — `(struct (mut i32) (mut i32))` for the
+  field's row beside `(struct (mut (ref $str)) (mut i32))` for the literal — and the module does
+  not parse. Measured on the witness's own no-union control, which is why the route is recorded
+  as refuted rather than as untried.
+
+* **FIX 1 — THE MINT'S CODES (`armMintShapeName`).** `internArmShapeOf` renders the arm with
+  `tyToEmitName` and interns the TEXT, and the text ladder is the one that codes an inline
+  literal union 0. The render now spells such a field `string`, which is the slot the arm is
+  laid out with, so the minted row's codes match the arm's row by construction. Returned
+  UNCHANGED when no field substitutes, so every module without one mints byte-identically.
+  **The KEY had to move with the codes and not just the codes**: `annShapeIndexOf` matches rows
+  by field NAMES + CODES while `structIndexByName` resolves them by the row's own name, so a row
+  NAMED `{r:i32,k:"a"|"b"}` while laid out as `{r:i32,k:string}` is a name that lies about its
+  layout — and the next annotation spelling the truthful text deduped onto it and lost its own
+  name (`emitProgram: ref valtype with no interned shape`, on a program with no union in it).
+
+* **FIX 2 — THE REP KEY (`repCanonFieldTy`), and FIX 1 ALONE DOES NOTHING WITHOUT IT.**
+  Instrumented at `armFieldStructRow` with the mint's codes already corrected:
+
+      PROBE arm=Circle render={r:i32,k:"a"|"b"} repSlotOfTy=-1 repRowOfTyStruct=-1 armCanon=4
+        rows: [0]{r:i32,k:string}{k:3/ r:0/ }k=7 ty=58   ARM{k:3 r:0 }
+
+  Codes equal, row present, and `variantStructHeapTwinAt` never reached its code walk because
+  `repRowOfTyStruct` gates on the canon key FIRST and the arm keyed **4** against the row's
+  **7**. `repCanonKeyGo`'s `TyLit` arm claims in its own words that `hcUnionId` "widens a lit
+  run to `string`, so `{k: "a" | "b"}` already keys as `{k: string}`" — it does not: the widened
+  run is still keyed as a UNION. `repCanonFieldTy` already softens a NUMERIC literal-union field
+  to its base; it now softens an INLINE string one the same way. The NAMED alias is excluded by
+  `tyLitUnionAliasIx`, because `k: K` codes 0 — an interned i32 atom carrying the member set —
+  and a genuinely different layout must keep a different key.
+
+* **`{kind: "x" | "y"}` AND `{kind: string}` ARE STILL TWO TYPES, and that was the acceptance
+  test the merge had to pass rather than a hope.** The key is a REP key: it decides which two
+  layouts may share one wasm heap type, and these two really are one layout. The CHECKER is
+  untouched — `const a: A = {kind: "z"}` is still refused, a `Base` value is still not assignable
+  to `A`, `a.kind == "x"` still discriminates, and the VARIANT table still keeps the unsoftened
+  `"a"|"b"` in `uFieldTyText`, which is what stops two literal-tagged arms claiming to be one
+  variant. Graded as a 12-cell A/B against `seed-latest`: every cell identical **except**
+  `const b: {kind: string} = a` over `a: {kind: "x"|"y"}`, which was check-clean INVALID WASM on
+  master and now runs — a clause-1 fix, and the subset direction the ruling names.
+
+* **WHAT IT DID NOT CLOSE.** The INLINE-SHAPE ANNOTATION position still codes the same field the
+  other way (code 0, the atom) — `function f(v: { r: i32, k: "a" | "b" })` handed a value of an
+  identically-spelled DECLARED struct is check-clean invalid wasm, on master and after this,
+  with no union anywhere in the program: [D1110](#d1110).
 
 ---
 
-### D1094 — a literal-union FIELD read off an `S | null` binding prints the raw ATOM ID instead of the member string, once `S` is also a union ARM; the same read with no union in the program prints the member
+### D1094 — [CLOSED 2026-09-02] a literal-union FIELD read off an `S | null` binding prints the raw ATOM ID instead of the member string, once `S` is also a union ARM; the same read with no union in the program prints the member
 
-**check-clean silently wrong — prints `0` where the field holds `"a"` · found 2026-09-02 while
-verifying [D1031](#d1031)'s `std/json.vl` claim · PRE-EXISTING: the witness below runs and
-prints `0` on master (`seed-latest`, 2026-09-02) and on the D1031 seed alike, so it is neither
-caused nor moved by that close · clause 1**
+**runs, prints `a` — CLOSED 2026-09-02 by wiring the FIFTH receiver shape of the member
+field-code ladder · was check-clean silently wrong (printed `0` where the field holds `"a"`) ·
+clause 1 · zero `runs` lost, distilled corpus unmoved, rep-fuzz exact · fixture
+`unions/nullable-arm-field-read-positions.vl`, eight sources · also closes the INVALID-WASM half
+of the same missing rung, which no row had named**
 
 Repro:
 
@@ -34419,6 +34466,51 @@ Repro:
   can carry a `JsonError | null` at all is new, so the read that mis-prints was unreachable in
   the shape that wants it. `std/json.vl`'s renderer face meets it the moment the module names
   its `kind` union and returns `JsonError | null`.
+
+* **THE MECHANISM IS WHAT THE FAILING RUNG RECEIVED, and it is ONE missing rung wearing two
+  faces.** `memFieldTypeCode` (and its twin `memberFieldCode`, and `exprIsLitAtom`'s Member arm)
+  resolves a member read's receiver through FOUR shapes — a NARROWED union identifier, a bare
+  variant-typed expression, a plain struct, an un-narrowed struct union. A `nulvariant` cell is
+  none of them, and `structIndexOfExpr` declines it BY DESIGN (D34 — "an ARM value has no
+  `sNames` row"). Instrumented at the Member arm, failing witness beside its one-line control:
+
+      verbatim (prints 0)   mviA=-1 vfi=-1 vfcode=-1 msi=-1 mfi=-1 nulvi=0  memCode=-1
+      no union (prints a)   mviA=-1 vfi=-1 vfcode=-1 msi=0  mfi=0  nulvi=-1 memCode=0
+      non-nullable (prints a) mviA=0 vfi=0  vfcode=0  msi=-1 mfi=-1 nulvi=-1 memCode=0
+
+  `nulVariantIdxOfExpr` — the reader `addLocalName` typed the cell with — answers **0** in the
+  failing cell. Nothing asked it. `memRecvNulVariantIndex` is that ask, wired at the three sites
+  in the ladder's own order (bare variant first, then the niche).
+
+* **THE BYTES WERE ALWAYS RIGHT, WHICH IS WHY THE TWO FACES LOOK UNRELATED.** Disassembled, the
+  failing read is `call $__print_i32__ (struct.get $0 0 …)` — the correct field of the correct
+  struct, handed to the wrong consumer, because the atom→member `select` chain the control emits
+  was never armed. Where the field needs a REF instead of an atom the same missing claim is not
+  a wrong value but a wasm type mismatch, so `print(v.s)` over a `string` field and `v.k == "b"`
+  over the litunion one were **check-clean invalid wasm** on master. Neither had a row.
+
+* **THE POSITION MATRIX — eight sources, each printing THROUGH the field.** One program per
+  source, each printing a value an atom id could not coincide with (`v.n * 7` → `7`, `v.s` →
+  `hi`, the member string `b`):
+
+  | source of the `Arm \| null` | master | now |
+  | --- | --- | --- |
+  | call returning the niche, litunion field | prints `0` | **`b`** |
+  | … the same receiver's `i32` field | runs | runs |
+  | … a member `==` on the litunion field | INVALID WASM | **runs** |
+  | call returning the niche, `string` field, `print` | INVALID WASM | **`hi`** |
+  | … the same field under `==` | runs | runs |
+  | annotated module GLOBAL | prints `0` | **`b`** |
+  | struct FIELD typed at the niche | runs | runs |
+  | ref-list ELEMENT of `(S \| null)[]` | prints `0` | **`b`** |
+  | MAP value read (`m[k]`) | prints `0` | **`b`** |
+  | PARAM, read inside the callee | INVALID WASM | **`b`** |
+  | LOCAL of the niche type | INVALID WASM | **`b`** |
+
+* **STILL OPEN IN THE SAME FAMILY, each its own row:** an un-annotated rebind off a
+  `nulvariant` FIELD ([D1112](#d1112)), a module-GLOBAL assignment at the niche
+  ([D1111](#d1111)), `??` over an arm-typed nullable ([D1113](#d1113)) and a nested-STRUCT field
+  read through the niche ([D1114](#d1114)).
 
 ### D1080 — a DECLARATIONS-ONLY module is check-clean and refused at emit; the same file IMPORTED by a program that uses the type compiles and runs
 
@@ -35235,3 +35327,200 @@ Repro (check rc 1, two errors):
 * **THE SECOND ERROR IS THE FIRST ONE'S CONSEQUENCE**, not an independent finding: the arm was
   rejected, so exhaustiveness then reports the arm missing. A fix at the membership rule clears
   both.
+
+---
+
+### D1110 — an INLINE-SHAPE ANNOTATION lays a literal-union field out as the i32 ATOM while the DECLARED and VARIANT recorders lay it out as a string ref, so passing an identically-spelled struct to such a param is check-clean invalid wasm
+
+**check-clean invalid wasm: `type mismatch: expected (ref null $type), found (ref $type)` ·
+`vl check` rc 0 · clause 1 · found 2026-09-02 while closing [D1093](#d1093), by asking the
+plainest question its two-producer story implies — and NO union appears anywhere in the
+witness**
+
+Repro:
+
+    type C = { r: i32, k: "a" | "b" }
+    function f(c: { r: i32, k: "a" | "b" }): i32 { c.r }
+    const c: C = { r: 3, k: "a" }
+    print(f(c))
+    // vl check rc 0; vl run -> Invalid input WebAssembly code:
+    //   type mismatch: expected (ref null $type), found (ref $type)
+
+* **THE REP IS READ OFF THE DISASSEMBLY, not inferred.** The two spellings of one shape emit
+  different field types, and each alone is a module that runs:
+
+      DECLARED   type C = { r: i32, k: "a" | "b" }
+                 (type $0 (struct (field (mut (ref $4))) (field (mut i32))))   k is a STRING ref
+      INLINE ANN function f(v: { r: i32, k: "a" | "b" })
+                 (type $0 (struct (field (mut i32))))                          k is an i32 ATOM
+
+* **THE MECHANISM IS THE THIRD LADDER.** `fieldCodeOfSpelling` has a NODE entry point and a NAME
+  one. The node path asks `nodeTyIsLitUnionAlias` — false for an inline union, which is not
+  registered — and then reads canon's softened render, so it codes **3**. The name path asks
+  `nameIsLitUnionType`, which is TRUE for the inline spelling, so it codes **0**. `fieldCodeOfTy`
+  (the arena rung) agrees with the name path. Three producers, two answers, and which one a
+  field gets depends only on whether its spelling arrived as a node.
+
+* **THE CONTROLS ARE ONE TOKEN AWAY AND ALL RUN**: `k: string`, `k: i32`, and the NAMED alias
+  `type K = "a" | "b"` + `k: K` each pass the same declared value into the same inline-shape
+  param and print `3`.
+
+* **NOT CLOSED BY D1093, deliberately — BOTH DIRECTIONS WERE BUILT AND EACH NAMED ITS PRICE.**
+
+  | candidate | what it buys | what it costs |
+  | --- | --- | --- |
+  | code the inline field **3** in the arena + name ladders (`fieldCodeOfTy`, `fieldCodeOfSpelling`'s `-1` arm) | this row RUNS, and D1093's witness with it | two inline-shape annotations whose field NAMES match now share every column `annShapeIndexOf` compares, so the second deduped onto the first and never got its own `sNames` entry — `{kind:"x"\|"y"}` beside `{kind:"p"\|"q"}`, and `{kind:"x"\|"y"}` beside `{kind:string}`, both go from `runs` to `emitProgram: ref valtype with no interned shape`. That IS collapsing the two spellings, which the ruling forbids; keeping them apart needs an identity column code 3 does not have |
+  | code the inline field **0** in the NODE ladder (`fieldCodeOfSpelling`'s `litNode` arm) | the three ladders agree, and it is the direction a membership rung wants | a REP MIGRATION the object-literal CONSTRUCT path is not wired for: `type C = {r: i32, k: "a" \| "b"}` with NO union in the program emits `(struct (mut i32) (mut i32))` for the field's row beside `(struct (mut (ref $str)) (mut i32))` for the literal — two struct types for one declaration, module does not parse |
+
+  Both were measured on the witnesses above rather than argued. Either is a decision with its
+  own wiring, not a patch.
+
+---
+
+### D1111 — assigning an arm value to a module GLOBAL typed `Arm | null` is check-clean invalid wasm; every other delivery position at that niche runs
+
+**check-clean invalid wasm: `type mismatch: expected (ref null $type), found (ref $type)` ·
+`vl check` rc 0 · clause 1 · found 2026-09-02 in [D1094](#d1094)'s position matrix ·
+PRE-EXISTING: identical on master (`seed-latest`, 2026-09-02)**
+
+Repro:
+
+    type K = "a" | "b"
+    type S = { k: K, n: i32 }
+    type Other = { o: string }
+    type U = S | Other
+    function mk(): U { { o: "x" } }
+    let gv: S | null = null
+    const t = mk()
+    if t is S { print("s") }
+    function setg() {
+      gv = { k: "b", n: 2 }
+      0
+    }
+    const r = setg()
+    const e = gv
+    if e == null { print("null") } else { print(e.k) }
+    // vl check rc 0; vl run -> Invalid input WebAssembly code in `setg`:
+    //   type mismatch: expected (ref null $type), found (ref $type)
+
+* **IT IS THE `global.set` ARM, which is the position D1031's own matrix warned about**: that
+  row's nine-row matrix found module-GLOBAL assignment last, through `emitAssign`'s `global.set`
+  arm, because reading the sibling's callers did not name it. This is the same arm at the
+  `nulvariant` niche rather than the bare arm.
+
+* **THE CONTROLS RUN.** The same global INITIALISED at the niche
+  (`const gv: S | null = { k: "b", n: 2 }`) runs and prints `b`; so does the same assignment
+  when `S` is not a union arm.
+
+---
+
+### D1112 — an UN-ANNOTATED rebind off a `nulvariant` FIELD (`const e = p.err`) is check-clean invalid wasm; the annotated spelling of the same line runs
+
+**check-clean invalid wasm: `type mismatch: expected (ref $type), found i32` · `vl check` rc 0 ·
+clause 1 · found 2026-09-02 by writing `std/json.vl`'s post-[D1093](#d1093)/[D1094](#d1094)
+shape rather than a paraphrase · this is the ONE line still standing between `std/json.vl` and
+dropping its flat-field error workaround**
+
+Repro:
+
+    type Other = { o: string }
+    type JsonError = { at: i32, kind: "syntax" | "duplicate", path: string, msg: string }
+    type U = Other | JsonError
+    type Scan = { err: JsonError | null }
+    function f(n: i32): U {
+      const p: Scan = { err: null }
+      if n == 0 { p.err = { at: 1, kind: "syntax", path: "", msg: "e" } }
+      const e = p.err
+      if e == null { return { o: "x" } }
+      e
+    }
+    const a = f(0)
+    if a is JsonError { print(a.kind) } else { print("o") }
+    // vl check rc 0; vl run -> Invalid input WebAssembly code:
+    //   type mismatch: expected (ref $type), found i32
+
+* **THE ANNOTATED SPELLING OF THE SAME LINE RUNS, which is the whole ablation.** Change one
+  line to `const e: JsonError | null = p.err` and the program prints `syntax`. So the value, the
+  narrowing and the union-typed return delivery all work; what is missing is the INFERENCE that
+  the rebind is a `nulvariant` cell. This is exactly the shape CLAUDE.md's
+  "a fixture that annotates every destination cannot see the missing-annotation defect"
+  describes, found by removing the annotation rather than by adding one.
+
+* **THE PROBABLE RUNG, stated as a prediction rather than a mechanism:** `nulVariantIdxOfExpr`
+  — the reader `nulVariantIdxOfLet` uses to type an inferred binding — has arms for `Paren`,
+  `Index`, `BinExpr`, `AsExpr`, `Call` and `Ident`, and **no `Member` arm**, so a rebind whose
+  initializer is a field read cannot resolve its variant row. Put this witness on that arm's
+  grading list; do not treat the prediction as the close.
+
+* **`std/json.vl` CLEARS WITH THE ANNOTATION.** The module's full both-faces shape — a
+  `JsonError | null` field on the scanner AND on the renderer carrier, both returned into
+  `Json | JsonError` / `string | JsonError`, with `kind` left as the INLINE literal union — runs
+  and prints correctly today, provided each rebind off the nullable field is annotated. Master
+  refuses the same program.
+
+---
+
+### D1113 — `??` over a nullable UNION-ARM value is the loud `not supported yet`; the identical coalesce over a non-arm struct runs
+
+**loud emit reject: ``emitProgram: `??` over this nullable value is not supported yet — narrow
+it first`` · `vl check` rc 0 · clause 2 · found 2026-09-02 in [D1094](#d1094)'s position
+matrix · PRE-EXISTING: identical on master (`seed-latest`, 2026-09-02)**
+
+Repro:
+
+    type K = "a" | "b"
+    type S = { k: K, n: i32 }
+    type Other = { o: string }
+    type U = S | Other
+    function mk(): U { { o: "x" } }
+    function g(n: i32): S | null {
+      if n == 0 { return { k: "b", n: 1 } }
+      null
+    }
+    const t = mk()
+    if t is S { print("s") }
+    const d: S = { k: "a", n: 0 }
+    const v: S = g(0) ?? d
+    print(v.k)
+    // vl check rc 0; vl run -> emitProgram: `??` over this nullable value is not supported yet
+
+* **THE CONTROL IS THE UNION.** Delete `type Other`, `type U` and `mk` — so `S` is an ordinary
+  struct and `S | null` is the kind-9 niche rather than the `nulvariant` one — and the same
+  coalesce runs and prints `b`.
+
+* **THE UN-ANNOTATED SPELLING IS A DIFFERENT MESSAGE, not a different verdict**: `const v = g(0) ?? d`
+  is `emitProgram: ref valtype with no interned shape`, which is the same gap read one rung
+  further out.
+
+---
+
+### D1114 — a NESTED-STRUCT field read through an `Arm | null` receiver is the loud `field access receiver is not a struct`; the same read off the bare arm, and off a non-arm niche, both run
+
+**loud emit reject: `emitProgram: field access receiver is not a struct` · `vl check` rc 0 ·
+clause 2 · found 2026-09-02 in [D1094](#d1094)'s position matrix · PRE-EXISTING: identical on
+master (`seed-latest`, 2026-09-02)**
+
+Repro:
+
+    type Inner = { p: i32 }
+    type S = { i: Inner, n: i32 }
+    type Other = { o: string }
+    type U = S | Other
+    function mk(): U { { o: "x" } }
+    function g(n: i32): S | null {
+      if n == 0 { return { i: { p: 5 }, n: 1 } }
+      null
+    }
+    const t = mk()
+    if t is S { print("s") }
+    const v = g(0)
+    if v == null { print("null") } else { print(v.i.p * 2) }
+    // vl check rc 0; vl run -> emitProgram: field access receiver is not a struct
+
+* **BOTH CONTROLS RUN and each removes one ingredient.** With the union deleted the same
+  `v.i.p * 2` prints `10`; with the union kept and the receiver read off the BARE arm
+  (`if t is S { print(t.i.p * 2) }`) it prints `10` too. So the ingredient is the
+  code-15 field reached THROUGH the niche — the one field code [D1094](#d1094)'s fifth receiver
+  rung does not serve, because `variantStructHeapTwinAt` declines codes 5 / 15 / 28 by design
+  and the nested read needs the target row rather than the field's own code.
+
