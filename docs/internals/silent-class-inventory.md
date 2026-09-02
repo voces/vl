@@ -31168,7 +31168,11 @@ Repro:
 
 ### D1028 — a NAMED alias of a composition carrying a recursive alias delivers every value arm raw: `type JR = Json | E` is check-clean invalid wasm for `f64`, `boolean` and `string`, and refuses a list, while the struct arm and `null` land and the direct spelling `Json | E` runs
 
-**check-clean invalid wasm · check rc 0 · `type mismatch: expected (ref $type), found f64` in the returning function (`found i32` for `boolean`, `found (ref $type)` for `string`); a `Json[]` value refuses loudly instead, `emitProgram: array value does not match any array member of the union (leaf-scalar widening across a nested array is unsupported)` · ZERO corpus cells (no recursive-alias axis) · reproduces on master at 627b26b3, the seed carrying D1021's close (#2315) · found 2026-09-01 by vl-de as D1021's residue ("the second alias hop fails somewhere else"), ablated here · probe `scripts/capability-probes/recursive-union-alias-named-composition.vl` · ingredients, ablated: the composition is NAMED, it carries a RECURSIVE alias, and the value delivered is one of that alias's own arms**
+**runs, prints `2.5` — CLOSED 2026-09-02 by flattening a union-ALIAS member at the
+`UnionDecl` registration, the one site that had no flatten · zero `runs` lost ·
+`tests/cases/unions/named-composition-over-recursive-alias.vl` · was check-clean invalid
+wasm, every value arm the alias contributed delivered raw while the two the composition
+added ran**
 
 Repro:
 
@@ -31211,5 +31215,30 @@ Repro:
   (`parseJson(self: string): Json \| JsonError`) and run on this seed; the row is hit the
   moment a CONSUMER — or the builder, for tidiness — writes `type JsonResult = Json \|
   JsonError`. The builder brief says not to name it until this closes.
+
+---
+
+* **THE MEMBER TABLE IS BUILT FROM THE DECLARED MEMBERS, JOINED VERBATIM.** `type JR = Json |
+  E` registered the set `Json|E`, so the row held `Json` as ONE opaque atom and the six
+  members it stands for were absent — which is exactly the split the ablation shows, the
+  alias's arms lost and the composition's kept. Canon flattens the same shape when it sees a
+  whole spelling with a pipe in it (that is why the direct `Json | E` runs), but a named alias
+  never reaches that loop: canon rewrites a `UnionDecl`'s members ONE AT A TIME, and a lone
+  `Json` has no pipe, so `nameNeedsCanon` declines and the member stays whole.
+
+* **ONLY A MULTI-ATOM EXPANSION IS TAKEN, AND THREE NARROWER GUARDS WERE WRONG.** A litunion
+  alias renders through `tyToEmitName` as its SOFTENED base — `type PA = 61 | 62` comes back
+  `i32`, one atom — and taking that deletes the arm `is PA` needs, reversing the owner's
+  2026-07-29 ruling. Tried and measured wrong, in order: `nameIsLitUnionType` (the STRING-only
+  twin, so a numeric litunion walked through), `tyIsLitUnion` off `declTyIxOfName` (disagrees
+  with the index the expander itself resolves), and `unionMemberCount(name)` (counts a
+  pipe-joined SPELLING, so a bare alias name answers 1 and every expansion was rejected).
+  `literal-unions/declared-union-of-litunions.vl` caught all three.
+
+* **AND THE SET MUST NOT BE DEDUPED.** A dedupe looks obviously right here and is not: one
+  entry per member in member ORDER is what the union box-tag ABI depends on, which
+  `recordUnMemTys` states in as many words. Adding one silently re-tagged that same litunion
+  file and broke a running program — measured, not reasoned: the dedupe went in, the fixture
+  went red, the dedupe came out.
 
 ---
