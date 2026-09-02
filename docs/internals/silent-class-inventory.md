@@ -31043,6 +31043,44 @@ arm is taken silently — prints `A`.
   carries a field NAME no other std error type has**, and `std:json`'s proposal takes
   `path` for that reason and for the information it carries.
 
+* **RULED 2026-09-02 (owner): `is A` over same-shape arms is a DISCRIMINANT-VALUE test.**
+  The union is legal; `r is A` is true iff the tag names the shared shape AND `r.kind` is a
+  member of `A`'s literal set — `r is A` ≡ `r.kind == "x" || r.kind == "y"`, narrowing to
+  `A`. Overlapping sets are legal and answer truthfully (a `"y"` value is a member of both);
+  a same-shape pair with NO literal-typed field distinguishing it (`{v: i32} | {v: boolean}`)
+  is refused by the CHECKER. Representation is the compiler's choice (one heap type + value
+  compare recommended; distinct heap types not vetoed, provided the answer stays the
+  value's). DECISIONS.md §"`is A` over same-shape struct arms is a DISCRIMINANT-VALUE test"
+  has the rule, the owner's framing and the build order; ROADMAP §Next carries the item.
+
+  **Re-measured for the ruling (seed c4f03200), and the family is wider than filed:**
+
+  | arms (same field names) | `is A` / `is B` on a `B` value | today |
+  |---|---|---|
+  | `kind: "circle"` vs `"square"` — the TS idiom, singleton literals | — | **emit reject** `cannot be discriminated — same field names but different field types`, with NO `is` in the program |
+  | same, narrowed by `r.kind == "circle"` instead of `is` | — | same reject (the collect pass refuses the union itself) |
+  | `kind: "x" \| "y"` vs `"p" \| "q"` — disjoint sets, this row | `true` / `true` | silently wrong arm (`A: p`) |
+  | `kind: "x" \| "y"` vs `"y" \| "z"` — overlapping | `true` / `true` | silently wrong for `"x"` and `"z"` values |
+  | `v: i32` vs `v: boolean` — no literal field | — | emit reject, same message (correct rule, wrong stage) |
+  | `kind: "circle", r` vs `kind: "square", side` — different NAMES | `false` / `true` | **runs**, and `r.kind == "circle"` narrowing runs (`r.r` / `r.side` print `1` / `2`) |
+
+  **Mechanism, corrected.** `is` over struct arms is a TAG compare on the field-name
+  signature (`variantSig`), not a `ref.test` as first filed — the outcome is the same, the
+  instrument was misnamed. A same-signature pair is refused by `emit_collect.vl`'s
+  `variantFieldTysEq` guard unless its fields compare equal on a code / type-text /
+  elem-name / map-key ladder; that ladder PARTS singleton literals (`"circle"` vs `"square"`
+  → reject) and FOLDS multi-member sets (`"x" | "y"` vs `"p" | "q"` → "one variant", same
+  tag), which is why the idiom refuses loudly while this row's shape runs wrong. The builder
+  should print the identity column for both spellings before touching it.
+
+  **Grading list (owner's ruling).** This row's witness prints `a` then `b`; every row of
+  the table above matches the ruling column — the first two RUN, the disjoint and
+  overlapping rows answer by membership (`false`/`true` on a `"p"` value; `true`/`true` on a
+  `"y"` value and `true`/`false` on an `"x"` value), the no-literal pair refuses at CHECK
+  with the DECISIONS sentence, and the last row is unchanged; `is`- and `==`-narrowing agree
+  at every spelling. Probes: `$SP/q/d1023/t1–t11` of session vl-b7, reproduced from the
+  table.
+
 ---
 
 ### D1024 — a union spelled with a base type AND a literal of that base (`string | "err"`) is check-clean invalid wasm in a function signature: the literal widens to a DUPLICATE `string` atom and the string is delivered raw where the box is expected

@@ -186,6 +186,28 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   D1024's table (`orErr<T>(): T | "err"` at `T = i32` → `no recorded members`) is NOT this
   item: it is about mono-minted unions, struct arm or literal alike — **D1042**.
   DECISIONS.md §"A subsumed literal arm COLLAPSES". Compiler-side; compile-goal surface.
+- **`is A` over same-shape struct arms is a DISCRIMINANT-VALUE test — RULED (owner,
+  2026-09-02), NOT BUILT.** `type Circle = { kind: "circle", r: f64 }` /
+  `type Square = { kind: "square", r: f64 }` is a legal union and `s is Circle` is true iff
+  the tag names the shared shape AND `s.kind` is a member of `Circle`'s literal set — the
+  arm set `s.kind == "circle"` already narrows to. A literal-typed field is a type that is
+  also a value; membership is decided by the value. Overlapping sets are legal and truthful;
+  a same-shape pair with NO literal-typed field (`{v: i32} | {v: boolean}`) is refused by
+  the CHECKER — a design rule (`docs/guide/unions.md`) the emitter enforces today. The rep is
+  the compiler's choice: one heap type + one tag + an `i32`-sentinel compare (recommended;
+  no rep change), or distinct heap types (not vetoed) — provided the answer stays the
+  value's, never the name a value was built under. Measured today: the singleton-literal TS
+  idiom is an EMIT REJECT with no `is` in the program (the idiom is unwritable); two-member
+  disjoint or overlapping sets fold into one variant and take the wrong arm silently
+  (**D1023**); only different field names run. **Build, in order:** (1) collect pass admits
+  a same-signature pair that differs in a literal-typed field (one tag, one layout);
+  (2) `is A` adds the membership compare(s) after the tag test — one `i32.eq` per singleton;
+  (3) the checker owns the no-discriminant refusal and the emit reject becomes a floor;
+  (4) `is`- and `==`-narrowing graded side by side at every spelling. D1023's RULED
+  paragraph has the six-row table and the grading list; DECISIONS.md §"`is A` over
+  same-shape struct arms is a DISCRIMINANT-VALUE test". Interim std rule until built: every
+  std error struct keeps a field NAME no other has (`JsonError.path`). Compiler-side;
+  compile-goal surface.
 - **Colored `print`** — ruled in principle 2026-09-01 with one hard constraint (ANSI must
   never leak into pipes/files/copies): Node's split — bare strings always raw, rendered
   values colored, escapes emitted only by the TTY-detected sink, `NO_COLOR`/`--color`
