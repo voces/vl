@@ -32151,9 +32151,45 @@ Repro:
   asks from `J`'s side for `f64|{[string]:J}|null`. Two legitimate renders of one type, and
   patching consumers one at a time does not converge on either.
 
-* **WHERE THE NEXT ATTEMPT SHOULD START.** Not on another scan. The question is which render
-  a consumer of a recursive alias is ENTITLED to, and the two candidates are already known —
-  the alias name `J`, and the structural expansion that closes the cycle on whichever of the
-  pair the walk entered from. Pick one, make both producer and consumer use it, and expect
-  the delivery matrix D965 describes rather than a one-line gate change.
+* **A CANDIDATE THAT PASSES TEN GATES AND MUST NOT SHIP — IT TRADES THIS LOUD REFUSAL FOR A
+  SILENTLY WRONG ANSWER.** Neither candidate render has to win. Gate the naming on the render
+  having COLLAPSED: after `tyToEmitNameGo` returns, if it returned `""`, answer
+  `nulFoldAliasNameOf(ix)` instead. A render producing characters is then untouched by
+  construction, so the eight fixtures the entry-time version broke stay green. Measured on
+  that candidate:
+
+  | gate | result |
+  | --- | --- |
+  | all seven spelling witnesses | RUN, this row included |
+  | `deno task test`, ci-native, lsp, fixpoint, lint, rep-fuzz, mono-grid | green |
+  | distilled corpus | clean, 0 `runs` lost |
+  | capability probes | 30 of 30 |
+  | filed witnesses | this row AND D1022's emit half move to `runs` |
+
+  **And `is` over the map arm then answers FALSE for a value of that very arm.** Adding a
+  second delivery position to the fixture is what caught it:
+
+      type JO = { [string]: J }
+      type J = null | f64 | JO
+      function k(x: J): string {
+        if x == null { return "null" }
+        if x is f64 { return "f64" }
+        if x is JO { return "JO" }
+        "none"
+      }
+      const m: JO = Map()
+      print(k(m))          // "none" — the boxed map matches NO arm
+
+  The other declaration order prints `JO`. The `null` and `f64` arms are correct under both,
+  so it is the MAP arm alone: `mapSlotTag` keys off the mv SLOT, and the store and the `is`
+  test resolve different slots once the render changes. That is a clause-1 miscompile
+  replacing a clause-2 refusal, which is the worse trade and the reason this is filed rather
+  than merged.
+
+* **SO THE ROW IS ONE DELIVERY FROM CLOSED, AND THE DELIVERY IS NAMED.** The render fix is
+  right and is not the missing piece; wiring the map arm's `mapSlotTag` so the store and the
+  `is` test agree on one slot under the new render is. Do that FIRST and re-run the position
+  matrix — D965's order exactly — rather than landing the render on its own. Any future
+  attempt must carry an `is`-over-the-map-arm line in its fixture: every other gate in this
+  repo, all eleven of them, passed the broken candidate.
 
