@@ -257,17 +257,21 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   spelling → col 14; `not.toEqual` → the final matcher; multi-line spelling → the `.toEqual`
   LINE (once the grammar lands). std change → `std-api-reviewer`; header + DECISIONS "`expect`
   only" paragraph updated with it; `testDiscovery.ts` untouched. std-side.
-- **A leading `.` / `?.` on a new line continues the postfix chain — RULED (owner,
-  2026-09-02), NOT BUILT.** Today every such program is a parse error, so the rule changes no
-  existing program's meaning. `(` and `[` do NOT continue (legal statement starts); trailing-
-  dot stays refused (one form only); comment lines between links are free. **The formatter is
-  the real half**: `format.vl` prints chains inline, so without a fit-or-break chain layout
-  `fmt --check` re-joins the lines and the form is unusable in-repo. Build = `parsePostfix`
-  peeking past NEWLINEs for DOT/QUESTION_DOT, the fmt chain layout (fits → inline; else one
-  link per line, one indent), fixtures for 2/3+ links, comment between links, `?.`, `(`/`[`
-  lines still parsing as statements, fmt round-trip of a fitting and a breaking chain. LSP
-  untouched. DECISIONS.md §"A leading `.` on a new line continues the chain". Compiler-side
-  (parser + formatter).
+- **A leading `.` / `?.` on a new line continues the postfix chain — SHIPPED (#2382).** Ruled
+  by the owner 2026-09-02 and built the same day. `parsePostfix` gains a NEWLINE arm that LOOKS
+  past the run of newlines and continues iff the next kind is DOT/QUESTION_DOT; `(` and `[` do
+  NOT continue (legal statement starts) and trailing-dot stays refused, both pinned. Grepped
+  rather than asserted: **0 of 10,355 `.vl` files** begin a line with `.`/`?.`, so no existing
+  program changed meaning. **The formatter was the real half** and is fit-or-break now — inline
+  while the chain fits `fmtWidth`, else one `.link(args)` per line at one extra indent from the
+  first link — with the threshold at **two links, a link starting at the first step CARRYING A
+  CALL** (a leading plain `.field` merges into the head, which is what keeps `P.toks.push({ … })`
+  and `node.callArgNames.length` on `wrapList`'s answer). Cost measured as a same-tree A/B over
+  two seeds: **1 of 10,355 files** reformats (`tests/cases/arrays/map-struct-to-struct.vl`, a
+  92-column three-link chain), **0 under `compiler/`/`std/`/`scripts/`**. Five corpus cases plus
+  two `vl_fmt_test.ts` pins; LSP untouched. DECISIONS.md §"A leading `.` on a new line continues
+  the chain". A consequence for the matcher-location ruling above: with the matcher on its own
+  line the failure's LINE moves too, not just its column.
 - **Colored `print`** — ruled in principle 2026-09-01 with one hard constraint (ANSI must
   never leak into pipes/files/copies): Node's split — bare strings always raw, rendered
   values colored, escapes emitted only by the TTY-detected sink, `NO_COLOR`/`--color`

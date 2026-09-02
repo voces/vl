@@ -51,6 +51,27 @@ const run = async (
   };
 };
 
+// Another subcommand over a FILE. `vl fmt` returns unparseable input VERBATIM,
+// so an idempotency check cannot tell a good layout from one the parser rejects
+// (the lesson tests/vl_paren_newline_test.ts was written for) — a formatting rule
+// that emits a NEW spelling has to prove that spelling re-parses and still runs.
+const runOn = async (
+  sub: string,
+  file: string,
+): Promise<{ code: number; out: string; err: string }> => {
+  const { code, stdout, stderr } = await new Deno.Command(VL, {
+    args: [sub, file, "--compiler", COMPILER],
+    stdout: "piped",
+    stderr: "piped",
+    env: { RUST_BACKTRACE: "0", NO_COLOR: "1" },
+  }).output();
+  return {
+    code,
+    out: new TextDecoder().decode(stdout),
+    err: new TextDecoder().decode(stderr),
+  };
+};
+
 Deno.test({
   name: "vl-fmt: a file prints its formatted source to stdout (byte-exact)",
   ignore: !ENABLED,
@@ -1737,6 +1758,139 @@ Deno.test({
       throw new Error(
         `not idempotent (rc ${r2.code}):\n--- once ---\n${r.out}\n--- twice ---\n${r2.out}`,
       );
+    }
+  },
+});
+
+// ── member / call CHAINS are fit-or-break ────────────────────────────────────
+// A leading `.` / `?.` on a new line continues the postfix chain (DECISIONS.md,
+// owner 2026-09-02), which is what finally lets the formatter BREAK one: before
+// the ruling any broken chain was re-joined by the next `vl fmt`, so the spelling
+// was unusable in a tree `lint-self.sh` runs `fmt --check` over.
+//
+// The policy pinned here — compiler/format.vl's "member / call CHAIN layout"
+// section states it in full:
+//   · TWO OR MORE links, where a link starts at the first step CARRYING A CALL
+//     (leading plain `.field` steps merge into the head);
+//   · fit → inline, byte for byte as before the rule existed;
+//   · over width → one `.link(args)` per line at one extra indent, from the
+//     FIRST link.
+//
+// It lives here and not in tests/cases because the fmt gate never sees
+// tests/cases and cases_wasm_test.ts has no `@fmt` directive.
+Deno.test({
+  name: "vl-fmt: a member chain fits inline or breaks one link per line",
+  ignore: !ENABLED,
+  fn: async () => {
+    const src = [
+      "const xs = [1, 2, 3]",
+      "const fits = xs.map((v) => v * 2).filter((v) => v > 2).length",
+      "const wide = xs.map((valueOne) => valueOne * 2).filter((valueTwo) => " +
+      "valueTwo > 2).map((valueThree) => valueThree + 1).length",
+      "print(fits)",
+      "print(wide)",
+      "",
+    ].join("\n");
+    const r = await run([], src);
+    if (r.code !== 0) {
+      throw new Error(`vl fmt rejected valid source (rc ${r.code}):\n${r.err}`);
+    }
+    // A chain that FITS is untouched — the whole point of measuring first.
+    const inline =
+      "const fits = xs.map((v) => v * 2).filter((v) => v > 2).length\n";
+    if (!r.out.includes(inline)) {
+      throw new Error(`fmt broke a chain that fits:\n${r.out}`);
+    }
+    // …and one that does NOT fit breaks from its FIRST link, one indent deeper.
+    const broken = [
+      "const wide = xs",
+      "  .map((valueOne) => valueOne * 2)",
+      "  .filter((valueTwo) => valueTwo > 2)",
+      "  .map((valueThree) => valueThree + 1)",
+      "  .length",
+    ].join("\n");
+    if (!r.out.includes(broken)) {
+      throw new Error(
+        `expected the broken chain form:\n${broken}\n--- got ---\n${r.out}`,
+      );
+    }
+    // Breaking a chain is pointless if the lines it produced still overrun.
+    for (const line of r.out.split("\n")) {
+      if (line.length > 80) {
+        throw new Error(`formatted line still over 80 columns: ${line}`);
+      }
+    }
+    // The broken form must RE-PARSE and RUN. `vl fmt` returns unparseable input
+    // verbatim, so idempotency alone passes on a spelling the parser rejects.
+    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_chain_" });
+    try {
+      const f = `${dir}/chain.vl`;
+      await Deno.writeTextFile(f, r.out);
+      const ran = await runOn("run", f);
+      if (ran.code !== 0) {
+        throw new Error(`the broken chain form does not run:\n${ran.err}`);
+      }
+      if (ran.out !== "2\n2\n") {
+        throw new Error(
+          `the broken chain changed the program: ${JSON.stringify(ran.out)}`,
+        );
+      }
+      // Idempotent: formatting the BROKEN form reproduces it exactly.
+      const again = await runOn("fmt", f);
+      if (again.code !== 0 || again.out !== r.out) {
+        throw new Error(
+          `not idempotent over a broken chain (rc ${again.code}):\n` +
+            `--- once ---\n${r.out}\n--- twice ---\n${again.out}`,
+        );
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+// The THRESHOLD, pinned from the side that decides how much of the tree moves.
+// A `.field` step BEFORE the first called step belongs to the HEAD, so the shape
+// this compiler is made of — `P.toks.push({ … })`, a short field path whose only
+// call takes a long argument — keeps `wrapList`'s answer instead of shattering
+// into `P` / `.toks` / `.push({ … })`. Without the merge that one shape alone
+// reformatted three files under compiler/ and scripts/, at every width, for the
+// worse: the overflow is in the ARGUMENT, and the argument list already knew how
+// to wrap it.
+Deno.test({
+  name: "vl-fmt: a plain field path before the first call is HEAD, not links",
+  ignore: !ENABLED,
+  fn: async () => {
+    const src = [
+      "type Tok = { kind: string, text: string, start: i32, line: i32, " +
+      "col: i32 }",
+      "type Reg = { toks: Tok[] }",
+      "const reg: Reg = { toks: [] }",
+      'reg.toks.push({ kind: "IDENT", text: "someIdentifier", start: 100, ' +
+      "line: 7, col: 42 })",
+      "print(reg.toks.length)",
+      "",
+    ].join("\n");
+    const r = await run([], src);
+    if (r.code !== 0) {
+      throw new Error(`vl fmt rejected valid source (rc ${r.code}):\n${r.err}`);
+    }
+    if (!r.out.includes("reg.toks.push(\n")) {
+      throw new Error(
+        `the chain rule took a one-link field path — want the wrapped argument ` +
+          `list:\n${r.out}`,
+      );
+    }
+    if (r.out.includes("\n  .toks")) {
+      throw new Error(`a pre-call \`.field\` step opened a line:\n${r.out}`);
+    }
+    // A call-less field path never breaks, at any receiver length.
+    if (!r.out.includes("print(reg.toks.length)")) {
+      throw new Error(`a call-less field path was broken up:\n${r.out}`);
+    }
+    const again = await run([], r.out);
+    if (again.code !== 0 || again.out !== r.out) {
+      throw new Error(`not idempotent (rc ${again.code}):\n${again.out}`);
     }
   },
 });

@@ -37,7 +37,10 @@ import { pushCps } from "./strutil"
 // precedence-minimal parens, `is`, member / optional / index access, calls,
 // object / array literals, parenthesised expressions, function expressions,
 // `if`-expressions), with own-line and trailing comment placement, blank-line
-// preservation, list reflow at the width, and the multi-line trailing-comma policy.
+// preservation, list reflow at the width, the multi-line trailing-comma policy,
+// and fit-or-break layout of member/call CHAINS (two links or more — see the
+// "member / call CHAIN layout" section for the threshold and why the fit is
+// measured flat).
 //
 // SURFACE-FORM RECOVERY: the self-host parser DESUGARS several constructs in the
 // arena. Most carry a faithful-surface MARKER on the node so the printer reprints
@@ -1984,11 +1987,214 @@ function recoverIsType(ix: i32) {
   ""
 }
 
-function memberAccess(_ix: i32, node: Member, indent: i32, column: i32) {
+// ── member / call CHAIN layout (fit-or-break) ─────────────────────────────────
+//
+// A postfix chain of TWO OR MORE `.name` / `?.name` links is laid out fit-or-
+// break — the same policy `wrapList` gives an argument list, measured against the
+// same `fmtWidth`. Inline while the chain fits from its start column; otherwise
+// ONE LINK PER LINE at `indent + 1`, starting from the FIRST link:
+//
+//   expect(build(cfg))
+//     .toEqual(want)
+//
+// The broken form is only printable because a leading `.` / `?.` on a new line
+// CONTINUES the chain (DECISIONS.md, owner 2026-09-02); before that ruling the
+// formatter had no choice but to re-join one, which is what made the spelling
+// unusable in a `fmt --check`ed tree.
+//
+// THE THRESHOLD IS TWO LINKS, and a LINK STARTS AT THE FIRST CALLED STEP. It is
+// a threshold on structure, not on width. `(args)` and `[i]` suffixes RIDE the
+// step they follow, and every `.field` step BEFORE the first step that carries a
+// call belongs to the chain's HEAD — so
+//
+//   P.toks.push({ … })          head `P.toks`, ONE link — never breaks
+//   node.callArgNames.length    head, no link at all — never breaks
+//   xs.filter(f).map(g).length  head `xs`, THREE links — breaks when wide
+//
+// That merge is what keeps the rule off the dominant shape in this tree. Without
+// it a plain field path whose only call takes a long object literal breaks into
+// `P` / `.toks` / `.push({ … })`, which is worse at every width: the overflow
+// lives in the ARGUMENT, and `wrapList` already had the right answer for it.
+//
+// AND THE FIT IS MEASURED FLAT. The width policy being decided here is the
+// CHAIN's, so the measurement forbids the interior lists to wrap first —
+// otherwise a long final argument list absorbs every overflow (`wrapList` runs
+// before the chain is ever consulted) and no chain is ever wide enough to break.
+// A flat form that fits is what the ordinary path would have produced anyway, so
+// a fitting chain prints byte-for-byte as it did before this rule existed, and
+// costs one render.
+const FMT_CHAIN_FLAT = 1000000
+
+// Walk the postfix chain rooted at `ix` down to its head, recording each postfix
+// op OUTERMOST-FIRST into `kinds` (0 = `.p`, 1 = `?.p`, 2 = `(args)`, 3 = `[i]`)
+// and `nodes`. Returns the head — the first node that is not a postfix.
+function chainWalk(ix: i32, kinds: i32[], nodes: i32[]): i32 {
+  let cur = ix
+  let going = true
+  while going {
+    if cur < 0 || cur >= P.nodes.length {
+      going = false
+    } else {
+      const c = P.nodes[cur]
+      if c is Member {
+        kinds.push(0)
+        nodes.push(cur)
+        cur = c.memObj
+      } else if c is OptMember {
+        kinds.push(1)
+        nodes.push(cur)
+        cur = c.omObj
+      } else if c is Call {
+        kinds.push(2)
+        nodes.push(cur)
+        cur = c.callFn
+      } else if c is Index {
+        kinds.push(3)
+        nodes.push(cur)
+        cur = c.idxArr
+      } else {
+        going = false
+      }
+    }
+  }
+  cur
+}
+
+// The `kinds` index where the chain's LINKS begin: the LAST `.` / `?.` step in
+// the array — the FIRST in source order, since `chainWalk` records outermost
+// first — that is immediately followed by a call. -1 when no step carries one,
+// which makes the whole postfix run a head (`a.b.c` has no links at all).
+function chainLinkStart(kinds: i32[]): i32 {
+  let i = kinds.length - 1
+  while i >= 0 {
+    if kinds[i] == 0 || kinds[i] == 1 {
+      if i > 0 && kinds[i - 1] == 2 { return i }
+    }
+    i = i - 1
+  }
+  -1
+}
+
+// One postfix op appended to `text`. The three suffix forms render exactly as
+// their own printer does — `callTail` is the shared one — so an inline chain
+// assembled step by step is the string the recursive path produced.
+function chainStep(text: string, kind: i32, ix: i32, indent: i32, column: i32) {
+  const n = P.nodes[ix]
+  if kind == 0 {
+    if n is Member { return text + "." + n.memProp }
+  } else if kind == 1 {
+    if n is OptMember { return text + "?." + n.omProp }
+  } else if kind == 2 {
+    if n is Call { return callTail(n, text, indent, column) }
+  } else {
+    if n is Index { return text + "[" + expr(n.idxIndex, indent, column) + "]" }
+  }
+  text
+}
+
+// The chain on ONE line. `kinds`/`nodes` are outermost-first, so this replays
+// them in reverse — source order.
+function chainInline(
+  headIx: i32,
+  kinds: i32[],
+  nodes: i32[],
+  indent: i32,
+  column: i32,
+) {
+  let text = primary(headIx, indent, column)
+  let i = kinds.length - 1
+  while i >= 0 {
+    text = chainStep(text, kinds[i], nodes[i], indent, column)
+    i = i - 1
+  }
+  text
+}
+
+// The chain BROKEN: the head (with any suffixes that precede the first `.`) on
+// its own line, then one `.link(args)` per line at `indent + 1`. Each link is
+// rendered at that deeper indent and its own start column, so a link whose
+// argument list still overflows wraps beneath the link rather than beneath the
+// chain.
+function chainBroken(
+  headIx: i32,
+  kinds: i32[],
+  nodes: i32[],
+  linkStart: i32,
+  indent: i32,
+  column: i32,
+) {
+  const pad = indentStr(indent + 1)
+  const linkCol = (indent + 1) * 2
+  const parts: string[] = []
+  let piece = primary(headIx, indent, column)
+  let pieceIndent = indent
+  let pieceCol = column
+  let i = kinds.length - 1
+  while i >= 0 {
+    const k = kinds[i]
+    // Only a step at or past `linkStart` opens a line; a `.field` before it is
+    // still the head, so it lands on the head line where the count put it.
+    if (k == 0 || k == 1) && i <= linkStart {
+      parts.push(piece)
+      piece = ""
+      pieceIndent = indent + 1
+      pieceCol = linkCol
+    }
+    piece = chainStep(piece, k, nodes[i], pieceIndent, pieceCol)
+    i = i - 1
+  }
+  parts.push(piece)
+  const out: string[] = []
+  out.push(parts[0])
+  let j = 1
+  while j < parts.length {
+    out.push(pad + parts[j])
+    j = j + 1
+  }
+  joinLines(out)
+}
+
+// The chain rooted at `ix` laid out, or "" when this node is not a breakable
+// chain and the caller should print it the ordinary way.
+function chainLayout(ix: i32, indent: i32, column: i32) {
+  const kinds: i32[] = []
+  const nodes: i32[] = []
+  const headIx = chainWalk(ix, kinds, nodes)
+  if headIx < 0 || headIx >= P.nodes.length { return "" }
+  const linkStart = chainLinkStart(kinds)
+  let links = 0
+  let i = linkStart
+  while i >= 0 {
+    if kinds[i] == 0 || kinds[i] == 1 { links = links + 1 }
+    i = i - 1
+  }
+  if links < 2 { return "" }
+  // A comment inside the chain would be CONSUMED by the flat measurement below
+  // and lost the moment that render is discarded (`cmtCursor` is one-way, and a
+  // block-lambda argument is where a comment actually lives). Such a chain takes
+  // the ordinary inline path instead — one render, exactly as before. Same
+  // guard, same reason, as the one-line `if` collapse and `ifExpr`.
+  const start = nodePos(ix)
+  const stop = nodeEndOf(ix)
+  if start < 0 || stop < 0 { return "" }
+  if commentInCharSpan(start, stop) { return "" }
+  const realWidth = fmtWidth
+  fmtWidth = FMT_CHAIN_FLAT
+  const flat = chainInline(headIx, kinds, nodes, indent, column)
+  fmtWidth = realWidth
+  if !hasNewline(flat) && column + dispWidth(flat) <= realWidth { return flat }
+  chainBroken(headIx, kinds, nodes, linkStart, indent, column)
+}
+
+function memberAccess(ix: i32, node: Member, indent: i32, column: i32) {
+  const laid = chainLayout(ix, indent, column)
+  if laid.length > 0 { return laid }
   primary(node.memObj, indent, column) + "." + node.memProp
 }
 
-function optMemberAccess(_ix: i32, node: OptMember, indent: i32, column: i32) {
+function optMemberAccess(ix: i32, node: OptMember, indent: i32, column: i32) {
+  const laid = chainLayout(ix, indent, column)
+  if laid.length > 0 { return laid }
   primary(node.omObj, indent, column) + "?." + node.omProp
 }
 
@@ -2013,9 +2219,20 @@ function primary(ix: i32, indent: i32, column: i32) {
   rendered
 }
 
-function callExpr(_ix: i32, node: Call, indent: i32, column: i32) {
+function callExpr(ix: i32, node: Call, indent: i32, column: i32) {
+  const laid = chainLayout(ix, indent, column)
+  if laid.length > 0 { return laid }
   const callee = expr(node.callFn, indent, column)
   const head = calleePrimary(node.callFn, callee)
+  callTail(node, head, indent, column)
+}
+
+// `head` with the call's ARGUMENT LIST appended, at `indent` starting from
+// `column` (the column `head` itself begins at). Split out of `callExpr` because
+// the chain layout needs the same tail under a DIFFERENT head — `.filter` rather
+// than a rendered callee — and a second spelling of the trailing-lambda hug plus
+// the width test is exactly the "one width test" this file already has.
+function callTail(node: Call, head: string, indent: i32, column: i32) {
   const n = node.callArgs.length
   // Every argument BUT the last, at the wrapped list's continuation depth. The
   // LAST one is rendered exactly ONCE, at the depth whichever form wins needs —
