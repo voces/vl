@@ -32777,10 +32777,10 @@ Repro:
 
 ### D1043 — a litunion beside an EXTRA literal of its own base is a loud emit reject at the INLINE spelling and RUNS at the declared one: `Kind | "err"` vs `type R = Kind | "err"`
 
-**loud emit reject · check rc 0 · clause 2 · `emitProgram: literal `is` over a struct union is not supported` · ZERO corpus cells · found 2026-09-02 by the D1024 capability probe's own CONTROL — the arm the subsumption collapse must NOT eat — and measured pre-existing on a `git archive origin/master` build, both spellings graded identically there**
+**CLOSED 2026-09-02 — the repro now RUNS and prints `a`, `b`, `e` at BOTH spellings. Was: loud emit reject · check rc 0 · clause 2 · `emitProgram: literal `is` over a struct union is not supported` · ZERO corpus cells · found by the D1024 capability probe's own CONTROL — the arm the subsumption collapse must NOT eat — and measured pre-existing on a `git archive origin/master` build, both spellings graded identically there**
 
-Repro (refuses; the same program with `type R = Kind | "err"` and `function pick(n: i32): R`
-runs and prints `a`, `b`, `e`):
+Repro (now prints `a`, `b`, `e`; it refused, while the same program with
+`type R = Kind | "err"` and `function pick(n: i32): R` ran):
 
     type Kind = "a" | "b"
     function pick(n: i32): Kind | "err" {
@@ -32799,20 +32799,48 @@ runs and prints `a`, `b`, `e`):
       i = i + 1
     }
 
-* **THE TWO UNION ROUTES DISAGREE ABOUT ONE TYPE, and that is the whole finding.** The
-  declaration route reaches a shape `is` can test; the annotation route does not. So this is
-  not a capability the compiler lacks — it is a capability it has at one spelling and not the
-  other, which is the shape #1792 had and the shape `annUnionInnerTy`'s header exists to
-  prevent.
+* **THE TWO UNION ROUTES DISAGREED ABOUT ONE TYPE, and that was the whole finding.** The
+  declaration route reached a shape `is` could test; the annotation route did not. So this
+  was never a capability the compiler lacked — it was a capability it had at one spelling and
+  not the other, which is the shape #1792 had and the shape `annUnionInnerTy`'s header exists
+  to prevent.
 
-* **THE READ-OFF-THE-CODE MECHANISM, WHICH IS A PREDICTION AND NOT YET A MEASUREMENT.**
-  `litUnionFlatMembers` requires EVERY member to be a homogeneous literal UNION
-  (`homogLitUnionBase` returns -1 for anything that is not a `TyUnion`), so a bare `TyLit`
-  member declines the whole list and the annotation route keeps `[Kind, "err"]` — a union
-  whose member is a union. **The declaration route calls the SAME helper and it declines
-  there too**, so that alone does not explain why the declared spelling runs, and whatever
-  does is the actual mechanism. Print what the emitter receives for both spellings before
-  believing this paragraph.
+* **THE FILED PREDICTION WAS WRONG, AND THAT CORRECTION IS WORTH AS MUCH AS THE FIX.** It
+  read: `litUnionFlatMembers` requires EVERY member to be a homogeneous literal UNION, so a
+  bare `TyLit` member declines the list and the ANNOTATION route keeps `[Kind, "err"]`. The
+  first half is true; the conclusion is not, because the DECLARATION route calls the same
+  helper and it declines there too — which the row itself flagged. Both routes minted the
+  identical arena shape and NEITHER could rep it.
+
+* **THE MEASURED MECHANISM IS THE NAME CHANNEL.** Probed at `emitIs` on both spellings, every
+  reading was identical — `exprIsLitAtom=N`, `exprUnion=Y`, `nodeTyIsLitUnion=N`,
+  `tyIsLitUnion(recv)=N`, `tyLitUnionAliasIx=-1`, the same node member texts — except ONE:
+
+  | | inline `Kind \| "err"` | declared `type R = Kind \| "err"` |
+  | --- | --- | --- |
+  | `unionNameOfExpr` | `""` | `R` |
+
+  `emitUnionLitIs`' FIRST gate disjunct is `uname == ""`. The declared alias has a NAME whose
+  member set the emitter's predicates resolve (`unionMemberSetOf("R")` → `Kind | "err"`), so
+  it took the `unionCarriesLitUnionArm` arm; the inline union has no name at all. **The
+  declared spelling was running on the name channel over an arena shape neither route could
+  rep — it worked by accident.**
+
+* **A GATE WIDENING CANNOT FIX IT, MEASURED.** A candidate mechanism in circulation was that
+  `emitUnionLitIs` gates on only the first two disjuncts of `emitUnionConcreteEq`'s
+  `eqMixedOk` condition, one line short. Deleting `emitUnionLitIs`' gate ENTIRELY — strictly
+  stronger than adding that disjunct — moves the inline program from one refusal to another
+  (`emitProgram: union box atom test on a union with no recorded members:`, with an EMPTY
+  name where the member set should be) and it still does not run. Every predicate under the
+  gate keys on the name the receiver does not have.
+
+* **THE FIX IS THE FLATTEN, AT THE SHARED HELPER, SO NEITHER SPELLING NEEDS A NAME.**
+  `litUnionFlatMembers` now admits a bare `TyLit` member of the COMMON BASE as one more
+  member of the literal set, so both routes mint `"a" | "b" | "err"` and take the ordinary
+  literal-union rep. The numeric twin `KN | 3` over `type KN = 1 | 2` came with it (it
+  refused with a different sentence: `union box atom test on a union with no recorded
+  members: i32`), and the mixed-base `Kind | 3` still declines — the common-base test is the
+  scope, unchanged.
 
 * **NOT D1024, and the probe split says so.** The subsumption collapse does not fire on this
   union and must not: `Kind | "err"` has no `string` ARM — flattening `Kind` reaches its
@@ -32820,7 +32848,16 @@ runs and prints `a`, `b`, `e`):
   this case inside D1024's probe made that probe report D1024's own gap as still open, which
   is why they are two probes.
 
-* Probe: `scripts/capability-probes/litunion-plus-literal-inline.vl`.
+* **THE PRICE, MEASURED.** 12-position delivery matrix (return, binding, parameter, argument,
+  local assignment, struct field, list element, nested element, map value, global init, global
+  ASSIGNMENT between two module globals, closure result), each program discriminating all
+  three atoms: **0 / 12 before, 12 / 12 after.** Distilled corpus: 0 classes moved in any
+  direction (this shape has zero cells, which is why it needed a probe). Capability probes:
+  35 / 36 → 36 / 36.
+
+* Probe: `scripts/capability-probes/litunion-plus-literal-inline.vl` (RUNS).
+  Fixture: `tests/cases/literal-unions/inline-litunion-plus-extra-literal.vl` — both
+  spellings side by side, seven delivery positions, and the numeric twin.
 
 ### D1048 — the ruling's MIRROR half: a litunion beside its own base (`Kind | string`) does not collapse, and at a PARAMETER it is check-clean invalid wasm
 
@@ -32883,41 +32920,59 @@ as spelling-dependent — the parameter is the face that fails.
 
 ### D1049 — the SUBSTITUTION route is a THIRD union-construction site and does not reach the subsumed-arm collapse: `pick<T>(v: T): T | "err"` at `T = string` is still D1024's exact invalid wasm
 
-**check-clean invalid wasm · check rc 0 · `expected struct type at index 0, found (array (mut i32))` — D1024's message, byte for byte · ZERO corpus cells · found 2026-09-02 by vl-b7's question on D1024's PR, asked BEFORE the merge and answered by measurement: does a union minted by generic instantiation pass through `unionDropSubsumedArms`? It does not.**
+**CLOSED 2026-09-02 — the repro now RUNS and prints `x`. Was: check-clean invalid wasm · check rc 0 · `expected struct type at index 0, found (array (mut i32))` — D1024's message, byte for byte · ZERO corpus cells · found by vl-b7's question on D1024's PR, asked BEFORE the merge and answered by measurement: does a union minted by generic instantiation pass through `unionDropSubsumedArms`? It did not.**
 
-Repro (the direct spelling `function pick(v: string, ...): string | "err"` RUNS and prints `x`):
+Repro (prints `x`; the direct spelling `function pick(v: string): string | "err"` always did):
 
     function pick<T>(v: T): T | "err" { return v }
     print(pick("x"))
 
-* **TWO ROUTES WERE FIXED AND THERE ARE THREE.** D1024's collapse is called from
+* **TWO ROUTES WERE FIXED AND THERE WERE THREE.** D1024's collapse is called from
   `annUnionInnerTy` (both annotation spellings) and from `fillTypeDeclAt`'s `UnionDecl` arm.
-  A union built by SUBSTITUTION at the pin — `substTyDeep` / mono, when `T` is replaced in
-  `T | "err"` — mints its arena type through neither, so the duplicate `string` atom is
-  minted there exactly as it used to be everywhere.
+  A union built by SUBSTITUTION at the pin — `substTyDeep`, when `T` is replaced in
+  `T | "err"` — minted its arena type through neither, so the duplicate `string` atom was
+  minted there exactly as it used to be everywhere. It is now a third caller of the same
+  shared rule.
 
-* **THE TWO-SPELLINGS DISAGREEMENT IS NOW WIDER THAN BEFORE THE FIX, WHICH IS THE POINT OF
-  FILING IT THE SAME DAY.** Before D1024 the direct and generic spellings agreed — both were
-  invalid wasm. After it they disagree, and a disagreement between spellings is the shape
-  `annUnionInnerTy`'s own header exists to prevent. This is a price D1024 paid, recorded
-  rather than discovered later.
+* **THE TWO-SPELLINGS DISAGREEMENT WAS WIDER AFTER D1024 THAN BEFORE IT, WHICH IS THE POINT
+  OF FILING IT THE SAME DAY.** Before D1024 the direct and generic spellings agreed — both
+  were invalid wasm. After it they disagreed, and a disagreement between spellings is the
+  shape `annUnionInnerTy`'s own header exists to prevent. That price is now paid back.
 
-* **ONE ARM OF IT IS D1042 AND ONE IS NOT** — measured at three instantiations:
+* **THE FIX WAS A CALL SITE, NOT A RULE** — the rule was already written and shared.
+  `substTyDeep`'s `TyUnion` arm now routes its deduped member list through
+  `unionDropSubsumedArms`, reading `out` UNCONDITIONALLY (the return value is a fact about
+  the list, not permission to read `out`).
 
-  | program | today |
-  | --- | --- |
-  | `pick<T>(v: T): T \| "err"` at `T = string`, no `is` | **invalid wasm**, `expected struct type at index 0, found (array (mut i32))` |
-  | same at `T = string`, with `r is "err"` | **emit reject**, `` literal `is` over a struct union is not supported `` |
-  | same at `T = i32`, with `r is "err"` | **emit reject**, `union box atom test on a union with no recorded members: i32\|"err"` |
+* **THE INDEX DEDUP ALREADY IN THAT ARM COULD NOT SEE IT.** #1483's fold dedupes by ARENA
+  INDEX, for `T | string` at `T := string`; `string` and `"err"` are different rows, so
+  nothing was duplicated by index. What was duplicated is the VALUE SET, which is
+  `unionArmSubsumedBy`'s question. Both folds are needed, in that order.
 
-  The third row is [D1042](#d1042)'s own sentence and is a genuine two-arm box that the
-  collapse must NOT touch. The first two are this row: at `T = string` the union is subsumed
-  and should have collapsed.
+* **THE PRICE, MEASURED — 13-cell instantiation grid, before → after:** the seven
+  `T = string` cells (plain, `is "err"` false, `is "err"` TRUE, annotated binding, argument,
+  list element, subsuming arm through an alias) moved **invalid wasm / emit reject → RUNS with
+  the correct value**, and the four non-collapsing cells (`T = i32` and `T = Circle`, with and
+  without `is`) are **byte-for-byte unchanged**, still on D1042's and the struct-union
+  refusals. The two DIRECT-spelling controls ran before and after. Distilled corpus: 0 classes
+  moved. Capability probes: 35 / 36 → 37 / 37 (this row's probe added).
 
-* **THE FIX IS A CALL SITE, NOT A RULE** — the rule is already written and shared. Route the
-  substituted member list through `unionDropSubsumedArms` wherever the pin mints the union,
-  and re-ask D1042's grid afterwards, because closing this narrows that row's domain without
-  closing it.
+* **WHAT IT DOES TO D1042: NARROWS THE DOMAIN, DOES NOT CLOSE THE ROW.** Re-measured on all
+  three instantiations after the fix:
+
+  | program | before | after |
+  | --- | --- | --- |
+  | `T = string`, no `is` | invalid wasm, `expected struct type at index 0…` | **runs, `x`** |
+  | `T = string`, `r is "err"` | `` literal `is` over a struct union is not supported `` | **runs, `V` / `E`** |
+  | `T = i32`, `r is "err"` | `union box atom test on a union with no recorded members: i32\|"err"` | **unchanged** |
+
+  D1042 keeps every boxed instantiation. Do NOT grade it on a `T = string` witness.
+
+* Probe: `scripts/capability-probes/subsumed-literal-arm-at-the-pin.vl` (RUNS).
+  Fixtures: `tests/cases/generics/subsumed-literal-arm-at-the-pin.vl` (`@run`) and
+  `tests/cases/generics/error-subsumed-literal-arm-at-the-pin-controls.vl` (`@check`) — the
+  non-collapsing instantiations are pinned in the CHECKER because a box minted at the pin has
+  no `is` lowering yet (D1042), so a running control cannot discriminate its arms.
 
 ---
 
