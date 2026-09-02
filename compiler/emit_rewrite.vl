@@ -40,6 +40,8 @@ import {
   numLitUnionHasBase,
   opIdxFnAtNode,
   recordNodeTyFrom,
+  tyFieldTyOf,
+  tyHasTyVar,
   tyIsLitUnion,
   tyIsNulValueUnionBox,
   tyToEmitName,
@@ -268,6 +270,95 @@ function drwIsMapRead(ix: i32) {
   false
 }
 
+// Does EVERY instantiation of the enclosing generic resolve `prop` as a FIELD of the
+// receiver — so field precedence, not UFCS, is what this member call means?
+//
+// THE DISPATCH REWRITE RUNS BEFORE MONOMORPHIZATION (the pass table's
+// `monomorphize > dispatchRewrite` edge, so a rewritten call instantiates per receiver
+// shape), which means `drwWalk` meets `x.m()` while `x` is still a type parameter:
+// `structIndexOfExpr` finds no struct row, the `si < 0` arm sees a matching `self`-function,
+// and the call is rewritten to a direct call ONCE, for every instance the generic will ever
+// have. An instantiation whose type carries `m` as a closure FIELD then calls the free
+// function with a struct it cannot take — `vl check` rc 0, INVALID WASM
+// (`silent-class-inventory` D1002).
+//
+// THE DECISION IS THE CALL SITES', NOT THE BODY'S. The body cannot answer, but the call
+// sites can: the checker has already recorded a type on every argument node, so the set of
+// receivers this parameter will ever hold is readable here. Declining the rewrite hands the
+// call to the FIELD-CLOSURE lowering, which resolves per FUNCTION (`exprIsClosure(…, fnIx)`)
+// and is therefore already right at every instance.
+//
+// UNANIMITY IS REQUIRED, and that bound is deliberate. Where the instantiations DISAGREE —
+// one receiver carrying the field, another taking the `self`-function — no single AST can
+// serve both, because `monoCloneBody` SHARES every leaf expression between instances (only
+// the statement spine is rebuilt). Declining unanimity keeps today's behaviour for that
+// shape rather than trading one instance's miscompile for the other's: `emitCall`'s
+// unrewritten-member fallback covers the UFCS side in expression position but NOT in the
+// tail-statement position (`emitProgram: unsupported member-call statement`) nor in the
+// classifier-driven ones (a `const s = x.m()` local takes the i32 default — measured, and
+// invalid wasm). The mixed shape stays filed rather than half-fixed.
+//
+// Declines (false) on anything it cannot classify exactly: a receiver that is not the bare
+// parameter, a generic reached by UFCS rather than by name, a call site that does not reach
+// the position, and a generic with no call site at all — each keeps the existing rewrite.
+function drwEveryInstanceTakesField(recvIx: i32, prop: string, ctx: i32) {
+  if ctx < 0 { return false }
+  // ORDERED BY COST, and the order is load-bearing. `tyHasTyVar` fans out over a union's
+  // members and an object's fields to depth 12 with no memo, so on a recursive `Node`-shaped
+  // union it is exponential — asking it ahead of the two structural tests below made the
+  // compiler's own self-compile measurably slower for an answer that is `false` at every
+  // non-generic declaration.
+  const fn = P.nodes[ctx]
+  if fn is FuncDecl {
+    if fn.fnTyParams.length == 0 { return false }
+    const r = P.nodes[unwrapParen(recvIx)]
+    if r is Ident {
+      // The receiver's own recorded type must still be a HOLE — this is the pre-instance
+      // question and nothing else. A concrete receiver was already answered by
+      // `structIndexOfExpr`.
+      if !tyHasTyVar(nodeTyIxOf(recvIx)) { return false }
+      const ps = fn.fnParams
+      let pi = -1
+      let i = 0
+      while i < ps.length {
+        const pp = P.nodes[ps[i]]
+        if pp is Param {
+          if pp.parName == r.identName { pi = i }
+        }
+        i = i + 1
+      }
+      if pi < 0 { return false }
+      const gname = fn.fnName
+      if gname == "" { return false }
+      let seen = 0
+      let k = 0
+      while k < P.nodes.length {
+        const nd = P.nodes[k]
+        if nd is Call {
+          const ce = P.nodes[nd.callFn]
+          // A UFCS call naming this generic reaches it through a receiver this scan
+          // cannot line up with a parameter position — decline rather than guess.
+          if ce is Member {
+            if ce.memProp == gname { return false }
+          }
+          if ce is Ident {
+            if ce.identName == gname {
+              if pi >= nd.callArgs.length { return false }
+              if tyFieldTyOf(nodeTyIxOf(nd.callArgs[pi]), prop) < 0 {
+                return false
+              }
+              seen = seen + 1
+            }
+          }
+        }
+        k = k + 1
+      }
+      return seen > 0
+    }
+  }
+  false
+}
+
 function drwWalk(ix: i32, ctx: i32) {
   if ix < 0 { return ix }
   const n = P.nodes[ix]
@@ -311,7 +402,16 @@ function drwWalk(ix: i32, ctx: i32) {
       }
       if si < 0 {
         if !exprIsClosure(n.callFn, ctx) {
-          if drwSelfFnOf(uName, args.length + 1) >= 0 { ufcs = true }
+          if drwSelfFnOf(uName, args.length + 1) >= 0 {
+            // A TYPE-PARAMETER receiver has no struct row YET, and `si < 0` is the arm
+            // that reads that as "no field, so UFCS". It is not the same fact — see
+            // `drwEveryInstanceTakesField`. Asked LAST, after the `self`-function has
+            // actually matched: the predicate walks the arena and then the node table,
+            // and every `.push` / `.slice` receiver in a real program reaches this arm.
+            if !drwEveryInstanceTakesField(callee.memObj, callee.memProp, ctx) {
+              ufcs = true
+            }
+          }
         }
       }
       if ufcs {
