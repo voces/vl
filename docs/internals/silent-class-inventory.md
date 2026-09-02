@@ -24280,10 +24280,24 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   two closure fields are SUPPOSED to share a row, and comparing rendered signatures splits
   them.
 
-  **So the discriminator has to be coarser than the signature: only the RESULT REP, and only
-  where it changes the `call_indirect` type** — a ref result versus a scalar one. The row side
-  would take it from the signature text (`fnRetTextOf`), the match side from the value's type.
-  That is the next attempt, and the four fixtures above are its acceptance test.
+  **AND THE COARSE VERSION WAS TRIED TOO.** A REF-vs-SCALAR token — both sides through one
+  extraction (`normTypeAtom(annRetNameOf(peelGroupParens(sig)))`, row side from the field
+  text, match side from `tyToEmitName` of the value) — also fixes the witness and still breaks
+  four fixtures and the same rep-fuzz cell. The set shifts slightly
+  (`nested-closure-field-litunion-box-result` passes,
+  `error-nullable-elem-closure-field-array-lambda-sig-twin` breaks) but the count does not.
+
+  **THREE OF THE FOUR ARE `error-*` FIXTURES THAT NOW COMPILE** — "expected an emit-stage
+  failure, but the compile succeeded". Those refusals exist BECAUSE the rows collapse, so
+  splitting the rows legitimately closes them and the fixtures would become `@run`. **Do not
+  rewrite them on that basis without checking each program's OUTPUT is right** — a compile is
+  not a correct compile, and this file has a standing rule about exactly that.
+
+  **The blocker is rep-fuzz, not the fixtures:** a NEW trap at
+  `p2r {[string]: () => {f: (() => i64) | null}}`, present under both the signature and the
+  ref-token discriminators. That cell is the acceptance test for the next attempt — a nullable
+  closure inside a closure result, where the two sides must be rendering the result
+  differently. Settle THAT before narrowing the token further.
 
 * The real fix is per-CALL resolution: monomorphise the hole function per receiver shape, or
   give the two shapes distinct struct rows so they cannot share a `call_indirect` type. The
