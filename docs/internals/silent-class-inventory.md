@@ -31043,6 +31043,44 @@ arm is taken silently — prints `A`.
   carries a field NAME no other std error type has**, and `std:json`'s proposal takes
   `path` for that reason and for the information it carries.
 
+* **RULED 2026-09-02 (owner): `is A` over same-shape arms is a DISCRIMINANT-VALUE test.**
+  The union is legal; `r is A` is true iff the tag names the shared shape AND `r.kind` is a
+  member of `A`'s literal set — `r is A` ≡ `r.kind == "x" || r.kind == "y"`, narrowing to
+  `A`. Overlapping sets are legal and answer truthfully (a `"y"` value is a member of both);
+  a same-shape pair with NO literal-typed field distinguishing it (`{v: i32} | {v: boolean}`)
+  is refused by the CHECKER. Representation is the compiler's choice (one heap type + value
+  compare recommended; distinct heap types not vetoed, provided the answer stays the
+  value's). DECISIONS.md §"`is A` over same-shape struct arms is a DISCRIMINANT-VALUE test"
+  has the rule, the owner's framing and the build order; ROADMAP §Next carries the item.
+
+  **Re-measured for the ruling (seed c4f03200), and the family is wider than filed:**
+
+  | arms (same field names) | `is A` / `is B` on a `B` value | today |
+  |---|---|---|
+  | `kind: "circle"` vs `"square"` — the TS idiom, singleton literals | — | **emit reject** `cannot be discriminated — same field names but different field types`, with NO `is` in the program |
+  | same, narrowed by `r.kind == "circle"` instead of `is` | — | same reject (the collect pass refuses the union itself) |
+  | `kind: "x" \| "y"` vs `"p" \| "q"` — disjoint sets, this row | `true` / `true` | silently wrong arm (`A: p`) |
+  | `kind: "x" \| "y"` vs `"y" \| "z"` — overlapping | `true` / `true` | silently wrong for `"x"` and `"z"` values |
+  | `v: i32` vs `v: boolean` — no literal field | — | emit reject, same message (correct rule, wrong stage) |
+  | `kind: "circle", r` vs `kind: "square", side` — different NAMES | `false` / `true` | **runs**, and `r.kind == "circle"` narrowing runs (`r.r` / `r.side` print `1` / `2`) |
+
+  **Mechanism, corrected.** `is` over struct arms is a TAG compare on the field-name
+  signature (`variantSig`), not a `ref.test` as first filed — the outcome is the same, the
+  instrument was misnamed. A same-signature pair is refused by `emit_collect.vl`'s
+  `variantFieldTysEq` guard unless its fields compare equal on a code / type-text /
+  elem-name / map-key ladder; that ladder PARTS singleton literals (`"circle"` vs `"square"`
+  → reject) and FOLDS multi-member sets (`"x" | "y"` vs `"p" | "q"` → "one variant", same
+  tag), which is why the idiom refuses loudly while this row's shape runs wrong. The builder
+  should print the identity column for both spellings before touching it.
+
+  **Grading list (owner's ruling).** This row's witness prints `a` then `b`; every row of
+  the table above matches the ruling column — the first two RUN, the disjoint and
+  overlapping rows answer by membership (`false`/`true` on a `"p"` value; `true`/`true` on a
+  `"y"` value and `true`/`false` on an `"x"` value), the no-literal pair refuses at CHECK
+  with the DECISIONS sentence, and the last row is unchanged; `is`- and `==`-narrowing agree
+  at every spelling. Probes: `$SP/q/d1023/t1–t11` of session vl-b7, reproduced from the
+  table.
+
 ---
 
 ### D1024 — a union spelled with a base type AND a literal of that base (`string | "err"`) is check-clean invalid wasm in a function signature: the literal widens to a DUPLICATE `string` atom and the string is delivered raw where the box is expected
@@ -32534,14 +32572,49 @@ Repro:
   | `orE<T>` at `T = i32` with an ANNOTATED destination `const t: i32 \| E = orE(5, true)` | ok | **runs** — `bad` (the annotation pins the rep, D969's shape) |
   | `orErr<T>` at `T = i32` with `const r: i32 \| "err" = orErr(5, true)` | ok | **emit reject** — the annotation does NOT rescue the literal arm; second ingredient, not yet ablated |
 
-* **MECHANISM (as far as measured).** The union a generic's return type becomes at an
-  instantiation is minted by the mono clone, and the emitter's member registry — the table
-  `union box atom test` consults — has no row for it; the same union written by hand is
-  registered when its spelling is resolved. The struct-arm row is rescued by annotating the
-  destination because the annotation registers the spelling; the literal-arm row is not,
-  which says the literal arm has a second, separate registration path that the clone also
-  misses. Two ingredients, then: (1) mono-minted unions are never registered — the family;
-  (2) a literal arm's atom registration is missed a second way — grade separately.
+* **MECHANISM — MEASURED 2026-09-02, AND IT IS A CHAIN OF THREE, NOT ONE.** The row first
+  read this as "mono-minted unions are never registered". That is ingredient (1) and it is
+  not the whole story; probing `unMemHasAtom`'s exits and `unionRowOf` directly gives:
+
+  1. **A PURE generic instantiation registers nothing.** `unionRowOf("i32|\"err\"")` and
+     `unionRowOf("i32|string")` are BOTH -1 for the repro above — no row exists under either
+     spelling, so the atom test's arena leg declines and the loud floor fires.
+
+  2. **AND THE TWO PRODUCERS SPELL ONE UNION TWO WAYS.** Put a DIRECT
+     `function f(bad: boolean): i32 | "err"` in the same module and it registers — under
+     `i32|string`, because CANON SOFTENS a literal member to its base scalar
+     (`canonEmitNameAt`'s `litMemberTy` arm). The generic still asks for `i32|"err"`, which
+     the registry does not have: the failing lookup prints `want[i32|"err"]
+     have[i32|string]`, and `unionRowOf` reads -1 for the wanted name and **0** for its
+     canon'd twin. So the clone's union never passes through canon. This is why adding a
+     direct spelling does NOT rescue the generic, which is the observation that rules out (1)
+     as a complete account.
+
+  3. **AND CLOSING (2) EXPOSES A THIRD REFUSAL.** A canon retry inside `unMemHasAtom` — on a
+     MISS only, `canonEmitName(name)` then re-lookup — was built and graded: the
+     direct-spelling-present program moves off `no recorded members` and onto
+     `emitProgram: literal \`is\` over a struct union`, still loud, still refused. So the
+     atom-test registry is one layer of at least two, and a fix that stops at the registry
+     buys a different sentence rather than a running program.
+
+  The build order this implies: register the clone's union THROUGH CANON (which fixes 1 and 2
+  together and makes the retry unnecessary), then grade the third refusal on its own. A retry
+  alone is not worth shipping — it converts one loud refusal into another.
+
+* **AND THE OBVIOUS PLACE TO DO THAT REGISTRATION IS A TRAP — BUILT AND MEASURED.** There is
+  no per-instance return type NODE to walk: `monoInstantiate` builds the instance with the
+  ORIGINAL's return node (`mkFunc(specName, noTP, nps, fn.fnRet, …)`, still `T | "err"`), so
+  the concrete union exists only as the arena type the checker put on the CALL. Registering
+  it there — `collectA`'s `Call` arm, `registerInlineUnion(canonEmitName(tyToEmitName(callTy)))`
+  when `nodeTyIsUnion` — makes the struct-arm instantiations **TRAP AT RUNTIME** where they
+  were a loud emit reject, at `T = i32` and `T = string` alike. Loud → trap is the wrong
+  direction and the row keeps the refusal instead.
+
+  The likely reason is the one this repo already knows: **a union's box tags are POSITIONAL
+  over its member set**, so minting a second row for a union another producer already
+  registered leaves two tag slices for one type and a value boxed under one is read under the
+  other. Any fix has to reuse the EXISTING row where there is one, not add a row per call
+  site — which is a different shape of change from "register the clone's union".
 
 * **WHY IT MATTERS MORE THAN ITS SOURCE ROW.** `T | E` at a scalar `T` is the generic
   `Result` shape every fallible generic helper wants (`std:fs`/`std:json` are monomorphic
@@ -32670,3 +32743,225 @@ Repro (the direct spelling `function pick(v: string, ...): string | "err"` RUNS 
   and re-ask D1042's grid afterwards, because closing this narrows that row's domain without
   closing it.
 
+---
+
+### D1044 — a UFCS call that OMITS a defaulted tail argument is refused `no field 'scale' on Box` in any module build that merges a `self`-function-bearing module (`std:test` is one, so EVERY test file); the direct spelling and the supplied-argument spelling run
+
+**loud check reject `no field 'scale' on Box` on a program whose single-file form prints `15` ·
+filed 2026-09-02 (vl-b7) while probing the matcher-anchored `__callsite__` design (DECISIONS
+§"A failed assertion is located at the MATCHER") — it blocks that design outright, because
+`toEqual(self, expected, caller = __callsite__)` would refuse `expect(1).toEqual(2)` in every
+test file**
+
+Repro:
+
+    import { CallerLoc } from "std:test"
+    type Box = { v: i32 }
+    function box(v: i32): Box { return { v: v } }
+    function scale(self: Box, by: i32 = 3): i32 { return self.v * by }
+    print(box(5).scale())
+    // 5:13: no field 'scale' on Box
+
+* **THE ABLATION, seed 42604b65 (origin/master), every cell run:**
+
+  | change to the witness | outcome |
+  | --- | --- |
+  | as filed | **check reject** `no field 'scale' on Box` |
+  | drop the import (single-file build) | RUNS, `15` |
+  | supply the default: `box(5).scale(2)` | RUNS, `10` |
+  | direct spelling: `scale(box(5))` | RUNS, `15` |
+  | `import { toString } from "std:fmt"` instead | RUNS, `15` — `std:fmt` declares no `self`-function |
+  | a user module `m.vl` exporting `dbl(self: Box)`, import it | **check reject**, same message |
+  | the defaulted `self`-function itself IMPORTED (`grow(self: Box, by: i32 = 4)`), `box(5).grow()` | **check reject** `no field 'grow' on Box` |
+  | the default is `__callsite__` instead of a literal, single file | RUNS — and anchors on the METHOD token (`box(5).locOf()` → col 14) |
+
+  So the ingredients are exactly two: a merge that carries at least one `self`-function
+  (which is what populates `ufcsAliasFrom`/`ufcsAliasTo` — `ast.vl` `ufcsAliasAdd`), and a
+  UFCS call whose explicit argument count is BELOW the declared count. The default's KIND is
+  not an ingredient. `std:test` declares `not`/`toEqual`/`toBeTrue`/`toBeFalse`, so every
+  `*.test.vl` is in the failing mode.
+
+* **WHERE TO LOOK.** `ufcsCallTy` (`typecheck.vl`) resolves the callee through
+  `ufcsAliasOf(plainName)`, then reads the declared parameter list AFTER `self` via
+  `declParamsAfterSelf(name)` → `fnDeclIx[name]`, and computes the LOW end of the arity range
+  with `fnRequiredArity` over that list. If the alias/mangling leaves `fnDeclIx` keyed under a
+  name `declParamsAfterSelf` does not find, `uDecl` is EMPTY, the guard
+  `uDecl.length == params.length - 1` fails, `uRequired` stays at `params.length - 1`, and
+  `args.length < uRequired` returns -1 — which the member-access caller reports as
+  `no field`. That is a prediction from the code, not a measurement: PRINT what
+  `declParamsAfterSelf` returns for the filed witness before touching anything
+  ([[vl-probe-the-rung-input]]). The direct spelling running is what says the DECLARATION
+  side (defaults, `fnRequiredArity`) is fine and the UFCS resolution is what disagrees.
+
+* **THE FIX IS GRADED ON THREE SPELLINGS IN A MODULE BUILD**, never on the single-file
+  form: the user's own defaulted `self`-function, an IMPORTED one, and one whose default is
+  `__callsite__` (the anchor must stay on the method token, measured col 14 above). Plus the
+  named-argument form `box(5).scale(by: 2)` beside them, since `ufcsCallTy` has a separate
+  arm for it.
+
+
+---
+
+### D1045 — a `type` declared INSIDE A FUNCTION BODY parses and is silently DROPPED by the checker: naming it is `unknown type 'P'`, not naming it is a check-clean emit reject, and shadowing a module-scope name silently resolves to the OUTER declaration
+
+**loud check reject `unknown type 'P'` at the USE — the declaration itself raises nothing · filed
+2026-09-02 (vl-b7) from the owner's question; RULED the same day (DECISIONS.md §"A `type`
+declared in a function body is legal and lexically scoped"): legal, scoped, may name the
+enclosing function's type parameters — and until built, the DECLARATION is to refuse loudly
+so the three behaviours below collapse into one message that names the rule**
+
+Repro:
+
+    function f(): i32 {
+      type P = { x: i32, y: i32 }
+      const p: P = { x: 1, y: 2 }
+      return p.x + p.y
+    }
+    print(f())
+    // 3:11: unknown type 'P'
+
+* **THREE BEHAVIOURS FOR ONE MECHANISM, seed 42604b65:**
+
+  | spelling | outcome |
+  | --- | --- |
+  | local `P`, used by name (as filed) | **check reject** `unknown type 'P'` at the use |
+  | local `P`, never used by name | `vl check` clean → **`emitProgram: unsupported statement in body`** (clause 2) |
+  | local `type P = { x: i32, y: i32 }` shadowing a module-scope `type P = { x: i32 }` | resolves to the OUTER `P`: `no field 'y' on P` |
+  | a nested NAMED `function` in the same position | RUNS (`42`) — the precedent the ruling follows |
+
+* **MECHANISM.** `parseStmt` (`parser.vl`) is shared between module and block scope and
+  dispatches `TYPE` to `parseTypeDecl` wherever it stands, so the declaration parses in a
+  body. The checker registers type names only from the module-level statement walk
+  (`fillTypeDeclAt` over the top-level `stmts`, `typecheck.vl` ~27030); a `TypeDecl` node
+  inside a body is never visited, never registered and never diagnosed. Name resolution
+  (`nameToTy` / `resolveAnnot`) is module-wide, which is why the shadowing spelling finds the
+  outer name and why scoping is a real build rather than a registration fix.
+
+* **THE INTERIM (ships first, small):** the checker's body walk refuses a `TypeDecl` at the
+  DECLARATION — `a `type` declaration is module-scope only for now (D1045 — ruled legal, not
+  yet built); move `P` to module scope`. Graded on all three spellings above: each must
+  produce THIS message at line 2, and nothing else. `emit_sections`' `unsupported statement
+  in body` then becomes unreachable for this node kind.
+
+* **THE BUILD (the ruling):** every `type` form is admitted in a body — struct, union and
+  literal union, recursive, generic alias, and nominal `new` — lexically scoped to the
+  block, shadowing outer names, and free to name the enclosing function's type parameters
+  (substituted per instance exactly as the body's other nodes are; D1046 is the same
+  substitution owed to nested NAMED functions). Two sub-rulings recorded with it: a local
+  NOMINAL type may not escape through the function's inferred return type (refused at the
+  checker, like any unnameable inferred type), and a structural one escapes as its shape.
+  Grading list: the four rows of the table above RUN or refuse as ruled; `type P = { a: T }`
+  inside `f<T>` at two instantiations; a local union used in an `is`; a local `new` type
+  returned (refused) and used only inside (runs); a local name shadowing a module one at
+  DIFFERENT shapes, each side resolving to its own.
+
+
+---
+
+### D1046 — a nested NAMED `function` inside a generic body that names the enclosing `T` in its signature is check-clean and refused at emit with D426's message; the arrow-lambda spelling of the same program RUNS
+
+**loud emit reject `parameter `T` still names an unsubstituted type parameter — a lambda
+declared inside a generic body keeps the enclosing `T` …` on a `vl check`-clean program ·
+filed 2026-09-02 (vl-b7) while measuring the precedent for D1045's ruling · D426 lifted the
+LAMBDA half of this on 2026-08-30 and its message still names a lambda; the named-declaration
+half was never on that row**
+
+Repro:
+
+    function f<T>(x: T): T {
+      function id(a: T): T { return a }
+      return id(x)
+    }
+    print(f(41) + 1)
+    print(f("s"))
+    // vl check: clean
+    // emit: parameter `T` still names an unsubstituted type parameter — a lambda declared inside a generic body keeps the enclosing `T`, so its signature is interned at the unsubstituted type; …
+
+* **CONTROL, same seed (42604b65):** replace line 2 with `const id = (a: T) => a` and the
+  program prints `42` then `s` — D426's per-pin lambda lifting. A nested named function is
+  the declaration form of the same thing and did not get the lifting; the refusal's own
+  sentence ("a lambda declared inside a generic body") says which form it was written for.
+
+* **WHY IT IS FILED BESIDE D1045 AND NOT UNDER D426.** The rule the owner agreed to on
+  2026-09-02 is "an inner declaration sees the enclosing function's type parameters", for
+  local `type`s and for named functions alike. Both are the SAME substitution — the body is
+  fresh-cloned per instantiation and every node in it is pinned — so the build that scopes
+  local types should carry this row with it, and be graded on both. Until then the message
+  should at least stop saying "lambda" for a `function` declaration.
+
+* Grading list: the witness at two instantiations; the nested function CALLED from a
+  closure inside the body; a nested function whose RETURN names `T` but whose parameters do
+  not; recursion through the nested function (`id` calling itself) at a concrete pin.
+
+---
+
+### D1047 — literal `is` over a union with a STRUCT (or container) arm beside the literal's base atom is refused `literal `is` over a struct union is not supported`, while the `==` spelling of the same test over the same union RUNS, and so does the TYPE-`is` (`r is string`) — the `==` twin's `eqMixedOk` widening was never mirrored onto `is`
+
+**loud emit reject on a `vl check`-clean program · filed 2026-09-02 (vl-b7) from the D1024
+canon-collapse agent's A/B, which found three rows (`Json`, `S | "err"`, `Kind | "err"`) that no
+union-construction collapse moves because the union is GENUINELY mixed · verified by hand on
+seed 42604b65, five-row ablation below**
+
+Repro:
+
+    type S = { v: i32 }
+    function tag(r: S | "err"): string {
+      if r is "err" { return "ERR" }
+      return "S"
+    }
+    print(tag("err"))
+    print(tag({ v: 1 }))
+    // vl check: clean
+    // emitProgram: literal `is` over a struct union is not supported
+
+* **THE ABLATION (seed 42604b65) — the ingredient is a NON-VALUE arm beside the literal's
+  base atom; the operator is what decides:**
+
+  | union | test | outcome |
+  | --- | --- | --- |
+  | `string \| i32` (value union) | `r is "err"` | RUNS `ERR` / `other` |
+  | `S \| string` | `r is "err"` | **emit reject** (as filed) |
+  | `S \| i32` | `r is 3` | **emit reject** — not a string thing |
+  | `S \| i32` | `r == 3` | RUNS `THREE` / `other` |
+  | `S \| string` | `r is string` (TYPE `is`) | RUNS `STR` / `other` |
+  | `Json` (std:json's `null \| boolean \| f64 \| string \| Json[] \| {[string]: Json}`) | `j is "err"` | **emit reject** |
+  | `Json` | `j == "err"` | RUNS `ERR` |
+
+  So the tag test over the mixed box works (row 5), the payload compare over the mixed box
+  works (rows 4, 7), and only the composition of the two — literal `is`, which is a tag test
+  followed by that payload compare — refuses. There is no lowering missing.
+
+* **MECHANISM (read, then confirmed by the agent's fix on its tree).** `emitUnionConcreteEq`
+  (`wasmEmit.vl`) gates on `isValueUnionOfSet || unionCarriesLitUnionArm || eqMixedOk`, where
+  `eqMixedOk` is the D-era widening whose comment says it all: "A MIXED UNION IS COMPARABLE TO
+  A SCALAR LITERAL … the compare below is arm-AGNOSTIC: it reads the box's TAG, compares it to
+  the tag of the atom the OTHER operand names, and on a match compares that one payload" —
+  admitted "only where the other operand names a scalar atom the union actually carries"
+  (`valueAtomKind(atom) >= 0 && unionHasAtomK(…)`), built for exactly `Json == "b"`.
+  `emitUnionLitIs` gates on the first two disjuncts ONLY. Its own comment credits the `==`
+  twin for the alias/litunion-arm lines and then stops one line short. The lowering after the
+  gate is the same arm-agnostic tag-then-payload shape, which is why the agent's one-line
+  widening of the `is` gate made every reject row above print the right answer with no
+  further change.
+
+* **WHY NO UNION-CONSTRUCTION COLLAPSE MOVES THESE (and why the row exists beside D1024).**
+  D1024 collapses a literal arm SUBSUMED by a base arm (`string | "err"` → `string`). `S |
+  "err"` has no `string` arm to subsume into, `Json`'s literal is on the OTHER operand, and
+  `S | i32` carries no literal at all; all three are genuine two-arm (or six-arm) boxes and
+  are meant to stay so. The agent measured them unmoved by the collapse and moved by the
+  gate.
+
+* **PREDICTION for vl-07's D1043 (`Kind | "err"` inline refuses with THIS message while the
+  aliased spelling runs):** the agent's tree, carrying the `is`-gate widening and no other
+  emit change, printed `ERR` for the inline `Kind | "err"` + `is "err"` row. That is a
+  prediction that D1043's inline witness moves with this fix, not a claim of its mechanism —
+  D1043 is a two-SPELLINGS disagreement (`unionMemberSetOf` sees the alias's arms and not the
+  inline flattening, or the reverse) and deserves its own ablation; put this row's fix on
+  D1043's grading list rather than closing it from here.
+
+* **GRADING:** the seven rows of the table (every `is` row RUNS with the value shown by its
+  `==` twin; the two `==` rows and the type-`is` row unmoved); an un-annotated destination —
+  `const r = mk(true)` / `r is "err"` — beside the annotated one (a fixture that annotates
+  every destination cannot see the inference-pinned rep); `!(r is "err")` and `r is "err"
+  == false`; and the D1024 fixture set unmoved, because the gate change must not reach into
+  the collapse.
