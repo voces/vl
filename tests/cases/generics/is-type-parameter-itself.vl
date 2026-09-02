@@ -1,0 +1,101 @@
+// @run
+// @log 2
+// @log 1
+// @log b
+// @log a
+// @log 1
+// @log 0
+// @log 0
+// @log 1
+// @log true
+// @log true
+// @log true
+// @log true
+// @log false
+// @hint Intentionally-unused parameter `_t` (leading `_` marks it unused)
+// @hint redundant type annotation: `c` is inferred as `{r: i32}`
+// @hint redundant type annotation: `s` is inferred as `{s: i32}`
+// @hint redundant type annotation: `fi` is inferred as `(i32) => i32`
+// @hint redundant type annotation: `fs` is inferred as `(string) => i32`
+// D951 — `is T` AGAINST THE TYPE PARAMETER ITSELF, the capability the owner asked for by
+// name: *"can we do `is T` rather than having to do like `is T<string | boolean | i64>`
+// (spelling out the full type)"*.
+//
+// It used to fail in BOTH directions at once, and the filed row recorded only one of them.
+// At a NULLABLE instantiation (`T | null` narrowed by `is T`, the row's own witness) the
+// emitter refused loudly — `emitProgram: \`is\` names a type that is not a union variant`,
+// `vl check` rc 0. At every OTHER instantiation the same test was CHECK-CLEAN AND SILENTLY
+// FALSE: `monoStaticIsResult` compared the receiver's concrete instance name (`i32`) against
+// the node's spelling (`T`), found no match, and folded the test to `i32.const 0`. Twenty
+// delivery positions were measured and eighteen were wrong; nine were silent.
+//
+// THE FIX IS A SUBSTITUTION, NOT A SECOND LADDER. Under monomorphization `T` is concrete per
+// instance, so the monomorphizer rewrites the check SPELLING at the pin
+// (`monoFoldTyParamLayout`'s `IsExpr` arm) and banks the resolved row on the minted node
+// (`recordClonedIsVarTy` — `isVarTyIx` is sized at `checkProgram` entry, so a node minted
+// later reads -1 for ever unless the minting pass banks it). `y is T` at `T := i32` is then
+// the SAME PROGRAM as `y is i32`: measured byte-identical wasm at `i32` and at `string`, so
+// every arm of the existing ladder — the nullable niche arms, the litunion arms, the box tag
+// compare, the narrow push — serves this spelling without knowing it exists.
+//
+// What each block below proves, in order: the row's own witness at two instantiations
+// (present -> the narrowed `y`, null -> the fallback `x`, so the test is not answering TRUE
+// unconditionally); DISCRIMINATION against a declared union at BOTH arms (the answer follows
+// `T` per instance rather than the first instance to be built); the LAMBDA position, whose body
+// the instance clone shares with the template and therefore had to be substituted too; and a
+// CLOSURE instantiation, the one binding whose spelling no arena row can be resolved from.
+
+// 1. The filed witness: `T | null` narrowed by `is T`, at a BOX instantiation (i32) and a
+//    NICHE one (string). Present value -> `y`; null -> `x`.
+function pick<T>(x: T, y: T | null): T {
+  if y is T { return y }
+  x
+}
+
+// 2. Discrimination: `u` is a declared-union value and `T` is one of its arms. `count` must
+//    answer 1 for the arm it was instantiated at and 0 for the other, at BOTH instances.
+type Circle = { r: i32 }
+type Square = { s: i32 }
+type Sh = Circle | Square
+
+function count<T>(u: Sh, _t: T) {
+  if u is T { return 1 }
+  0
+}
+
+// 3. The LAMBDA position: the clone shares the template's body, so an `is T` inside it is
+//    substituted through the same walker.
+function inLambda<T>(v: T) {
+  const g = () => v is T
+  g()
+}
+
+// 4. A CLOSURE instantiation is the one the spelling substitution cannot bank an arena row
+//    for: `T` binds to the `$fnsig` KEY (`=>i>i`), a name `nameToTy` has never parsed back, so
+//    `isVarTyIxOf` stays -1 and `monoStaticIsResult`'s sigkey arm had no rows to compare. Two
+//    equal sigkeys ARE the same function type, so that arm now falls back to the key itself.
+//    Both answers are pinned: the matching signature and a DIFFERENT one.
+
+function sigMatch<T>(_t: T, w: (i32) => i32) { w is T }
+function sigDiffer<T>(_t: T, w: (string) => i32) { w is T }
+const fi: (i32) => i32 = (n: i32) => n + 1
+const fs: (string) => i32 = (t: string) => t.length
+
+print(pick(1, 2))
+print(pick(1, null))
+print(pick("a", "b"))
+print(pick("a", null))
+
+const c: Circle = { r: 1 }
+const s: Square = { s: 2 }
+print(count(c, c))
+print(count(s, c))
+print(count(c, s))
+print(count(s, s))
+
+print(inLambda(1))
+print(inLambda("a"))
+print(inLambda(1.5))
+
+print(sigMatch(fi, fi))
+print(sigDiffer(fi, fs))

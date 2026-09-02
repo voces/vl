@@ -34,6 +34,11 @@ becomes a different type within a branch. The fact is produced once (in the chec
   (`x != null && x.y is i32`), and its RHS is type-checked *and* codegen'd with the LHS's narrowing
   already applied (short-circuit). `||` is the De Morgan dual — `if x == null || y == null { return }`
   narrows **both** after.
+- **The type parameter itself:** inside a generic body, `if y is T` tests against the
+  *instantiated* `T` rather than making you spell its arms out — `function pick<T>(x: T, y: T | null): T { if y is T { return y } x }`.
+  The checker always accepted this; codegen answers it by SUBSTITUTING the check spelling at the
+  monomorphization pin, so `y is T` at `T := i32` is byte-for-byte the program `y is i32` is,
+  and every rep the concrete spelling handles this one handles too (D951).
 - **Literals:** `x == L` narrows then to `x & L`, else to `x − L`.
 - **`?.`:** `if x?.y is T { … }` narrows both the receiver (`x` non-null) and the path (`x.y` is `T`),
   so the body reads `x.y` directly.

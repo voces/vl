@@ -26,6 +26,7 @@ import {
   flatConstOfNameProp,
   i32TyIx,
   inferRetNameOf,
+  isVarTyIxOf,
   litUnionAliasNameOfTy,
   monoInferListElem,
   monoInferLocalScalar,
@@ -38,6 +39,8 @@ import {
   nodeTyMapName,
   nodeTyName,
   nodeTyNestedElemIsBoolPrim,
+  recordClonedIsVarTy,
+  recordClonedIsVarTyIx,
   recordClonedNodeTy,
   substTyDeep,
   tyExcludesNull,
@@ -2011,7 +2014,14 @@ function monoCloneLambdaSubst(
     const nm = "__lambda_" + i32ToStr(lambdaCtr)
     lambdaCtr = lambdaCtr + 1
     const noTP: string[] = []
-    const clone = mkFunc(nm, noTP, ps, nret, a.fnBody, a.pos)
+    // D951 — AN `is T` INSIDE THE LAMBDA'S BODY. The body is otherwise shared with the
+    // template (this function's header), which is right for every operand the emitter
+    // RE-DERIVES from the now-concrete parameter — and wrong for an `is`, whose check type is
+    // a SPELLING the body carries rather than a type anything re-derives. Substituted through
+    // the same copy-on-write walker the enclosing instance body uses, so a lambda with no
+    // type-parameter spelling in it returns the SAME node index and keeps sharing.
+    const nbody = monoFoldTyParamLayout(a.fnBody, typarams, tvN, tvV)
+    const clone = mkFunc(nm, noTP, ps, nret, nbody, a.pos)
     fnStmts.push(clone)
     // THE ORIGINAL'S FRAME, not module scope. The clone shares the body, so its free names
     // have to resolve up the SAME scope chain or a lambda that both captures and annotates
@@ -2554,6 +2564,52 @@ function monoCalleeIsGeneric(name: string) {
   monoGen[fe] == 1
 }
 
+// ── the `is` node's per-instance twin ────────────────────────────────────────────────────────
+// Three body walkers re-mint an `IsExpr` when its RECEIVER moved (`monoCloneGenericCalls`,
+// `monoFoldTyParamLayout`, `monoPinBinOps`), and a fourth SUBSTITUTES its check spelling (D951).
+// All four go through here, because minting an `is` node has a second half the `mk*` maker does
+// not do: `isVarTyIx` — the CHECK TYPE the checker banked at the original — is keyed by node and
+// sized at `checkProgram` entry, so a freshly minted node reads -1 for ever unless it is banked.
+// `isVarTyIxOf` is what `emitIs`'s whole ladder reads (`isArmTagOfTy`, `tyIsLitUnion`,
+// `nulNicheIsTestImpossible`, `repIsRowMatchTy`, `isVariantSpelling`), so dropping it silently
+// demotes a re-parented test to the NAME path.
+function monoMkIsExprLike(ix: i32, io: i32, variant: string) {
+  const n = P.nodes[ix]
+  if n is IsExpr {
+    if n.isNeg == 1 { return mkIsExprNeg(io, variant, n.pos) }
+    return mkIsExpr(io, variant, n.pos)
+  }
+  -1
+}
+// Re-parent onto the rewritten receiver `io`: SAME test, so the original's banked row carries.
+function monoReIsExpr(ix: i32, io: i32) {
+  const n = P.nodes[ix]
+  if n is IsExpr {
+    const nx = monoMkIsExprLike(ix, io, n.isVariant)
+    recordClonedIsVarTyIx(nx, isVarTyIxOf(ix))
+    return nx
+  }
+  ix
+}
+// D951 — `is T` AGAINST THE TYPE PARAMETER ITSELF. Under monomorphization `T` is CONCRETE per
+// instance, so `y is T` is the same question every other per-instance `is` asks. Substituting the
+// SPELLING here makes `y is T` at `T := i32` the SAME PROGRAM as `y is i32` — one rewrite, and
+// the entire existing ladder (the nullable niche arms, the litunion arms, the struct/variant tag
+// compare, the narrow push) applies unchanged, so every instantiation agrees with its hand-written
+// concrete spelling BY CONSTRUCTION rather than by a second implementation that has to be kept in
+// step. The banked row must come from the NEW spelling: the original's is the declaration's
+// `TyVar`, which renders as the empty string and is exactly what made the two rungs below answer
+// wrongly (`monoStaticIsResult` folded to `i32.const 0`; the union-variant floor refused loudly).
+function monoSubstIsExpr(ix: i32, io: i32, variant: string) {
+  const n = P.nodes[ix]
+  if n is IsExpr {
+    const nx = monoMkIsExprLike(ix, io, variant)
+    recordClonedIsVarTy(nx, variant)
+    return nx
+  }
+  ix
+}
+
 // Give an instance its OWN copy of every direct call to a generic — the `Call` node and its callee
 // `Ident` — so the per-instance rename `monoWalk`/`monoMakeInstance` perform (`cal.identName =
 // "at$1"`) lands on nodes no sibling instance can see.
@@ -2715,8 +2771,7 @@ function monoCloneGenericCalls(ix: i32) {
   if n is IsExpr {
     const io = monoCloneGenericCalls(n.isObj)
     if io == n.isObj { return ix }
-    if n.isNeg == 1 { return mkIsExprNeg(io, n.isVariant, n.pos) }
-    return mkIsExpr(io, n.isVariant, n.pos)
+    return monoReIsExpr(ix, io)
   }
   if n is AsExpr {
     const ao = monoCloneGenericCalls(n.asObj)
@@ -2993,8 +3048,7 @@ function monoPinBinOps(ix: i32, pNames: string[], pTys: i32[]) {
   if n is IsExpr {
     const io = monoPinBinOps(n.isObj, pNames, pTys)
     if io == n.isObj { return ix }
-    if n.isNeg == 1 { return mkIsExprNeg(io, n.isVariant, n.pos) }
-    return mkIsExpr(io, n.isVariant, n.pos)
+    return monoReIsExpr(ix, io)
   }
   if n is AsExpr {
     const ao = monoPinBinOps(n.asObj, pNames, pTys)
@@ -3208,9 +3262,16 @@ function monoFoldTyParamLayout(
   }
   if n is IsExpr {
     const io = monoFoldTyParamLayout(n.isObj, typarams, tvN, tvV)
+    // D951 — the check spelling is substituted only when it MENTIONS a type parameter, the
+    // `monoAnnHasTyParam`-then-`monoSubstAnn` contract every other substitution site keeps. A
+    // concrete `is {v: i32}` inside a generic body must return VERBATIM: `monoSubstAnn`'s object
+    // arm rebuilds a shape spelling from its parts, and a rebuilt spelling is a second intern key.
+    if monoAnnHasTyParam(n.isVariant, typarams) {
+      const sub = monoSubstAnn(n.isVariant, typarams, tvN, tvV)
+      if sub != "" && sub != n.isVariant { return monoSubstIsExpr(ix, io, sub) }
+    }
     if io == n.isObj { return ix }
-    if n.isNeg == 1 { return mkIsExprNeg(io, n.isVariant, n.pos) }
-    return mkIsExpr(io, n.isVariant, n.pos)
+    return monoReIsExpr(ix, io)
   }
   if n is AsExpr {
     const ao = monoFoldTyParamLayout(n.asObj, typarams, tvN, tvV)
