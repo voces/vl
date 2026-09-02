@@ -30209,9 +30209,24 @@ Repro (loud emit reject):
   and `emitListEqGCore` then refuses with `list compare frame was not reserved for this rep`.
 
   Closing it means teaching `leqNoteBin` to walk the struct row's fields and note a frame per
-  code-5 field. **The unresolved part is the KEY**: frames are `(kind, slot)` pairs and a
-  field's list has no rep slot the way a binding does, so either a slot is synthesised for it
-  or the frame table needs a field-addressed variant. Settle the key before writing the walk.
+  code-5 field. **AND THE KEY EXISTS** — this was filed as the unresolved part and it is not.
+  Frames are `(kind, slot)` pairs, and a code-5 field already carries what the slot is derived
+  from: `shapeFieldElemName`'s code-5 arm stores `refArrElemKeyDeferred(ftxt)`, and
+  `rlSlotByNameKeyTy` (behind `rlSlotOfArrName` / `rlSlotOfArrNameTy`) maps an element name to
+  a real ref-list slot. So the field's list can be keyed exactly as a binding's is, with no
+  synthesised slot and no new table.
+
+  **The whole plan is therefore settled, and nothing in it is a guess.** Collection:
+  `leqNoteBin` walks the struct row's fields and calls `leqgNoteRep(kind, slot, 0)` per code-5
+  field, with the slot from the element name. Emit: the code-5 arm reads both field lists with
+  `emitChainRead` into the frame's base locals (`bA + 0`, `bA + 1`, the pair
+  `emitEqGStructElem` already reads) and calls `emitListEqGCore`, whose struct-element class
+  routes to the stash-based `emitStructEqRec(body, -2, -3, …)`.
+
+  **Grade it on a VALUE TABLE, never a compile** — equal lists true, differing element false,
+  differing length false, empty-vs-empty true. On this same `==` ladder D989's half-wiring
+  compiled cleanly and printed `1 == 2` as `true`, and this row's own diagnosis has already
+  been wrong once.
 
   **Grade any attempt on a VALUE TABLE, not a compile** — equal lists true, differing element
   false, differing length false — because D989's near-miss on this same `==` ladder compiled
