@@ -275,12 +275,33 @@ let plSidVal: i32[] = []
 let plSidGen: i32[] = []
 let plGen: i32 = 0
 
+// The LOOP-VARIABLE half of the same plan, filled by the SAME walk under the SAME
+// generation stamp: `name -> ForRange/ForIn arena index`, FIRST-wins.
+//
+// A `for v in …` variable is a function-scoped wasm local exactly as a body `let` is, but
+// it is not a `LetDecl`, so it was invisible to every "does this frame bind this name"
+// question routed through `parentLetOf`. It rides a SECOND array rather than the first
+// because `parentLetOf` hands its answer to 70-odd callers that read it as a `LetDecl`
+// arena index; widening THAT return would change what each of them decodes. The question
+// this table answers is narrower — "is this name bound here at all" — and its callers ask
+// exactly that.
+let plLoopSidVal: i32[] = []
+let plLoopSidGen: i32[] = []
+
 // The FuncDecl-name set behind `nameNamesFunction`, and the arena high-water mark it has
 // folded. See that function's header for the append-only argument; the reset rides on
 // `resetParentLetCache` because both are per-COMPILE arena caches with the same lifetime and
 // the same one call site (`emitProgram`), and splitting them is how one of them rots.
 let nnfSet: {[string]: boolean} = Map()
 let nnfScanned: i32 = 0
+
+// The MODULE scope's loop-variable names, behind `moduleBindsLoopVar`. Built once per
+// compile from the `Program` node and kept in its own set rather than routed through the
+// single-entry `parentLetOf` cache: this is asked from inside capture analysis, which is
+// otherwise resolving against a FUNCTION body, and evicting that cache per identifier
+// would rebuild the whole body's plan each time.
+let mlvSet: {[string]: boolean} = Map()
+let mlvBuilt: boolean = false
 
 // Record `name` as naming a function WITHOUT waiting for the fold to reach its node — the
 // escape hatch for the one writer that renames a FuncDecl IN PLACE after the arena already
@@ -305,6 +326,8 @@ export function sidResetParentLet() {
   plCacheBlock = -1
   plSidVal = []
   plSidGen = []
+  plLoopSidVal = []
+  plLoopSidGen = []
   plGen = 0
   0
 }
@@ -313,6 +336,8 @@ export function resetParentLetCache() {
   sidResetParentLet()
   nnfSet = Map()
   nnfScanned = 0
+  mlvSet = Map()
+  mlvBuilt = false
   0
 }
 
@@ -343,8 +368,10 @@ function plScanStmt(ix: i32) {
   } else if st is WhileStmt {
     plScanStmt(st.whileBody)
   } else if st is ForRange {
+    plRecordLoopVar(st.frVar, ix)
     plScanStmt(st.frBody)
   } else if st is ForIn {
+    plRecordLoopVar(st.fiVar, ix)
     plScanStmt(st.fiBody)
   } else if st is Block {
     const stmts = st.blkStmts
@@ -369,6 +396,72 @@ function plScanStmt(ix: i32) {
     }
   }
   0
+}
+
+// Record loop variable `name`, bound by the `ForRange`/`ForIn` at arena index `ix`, into
+// the plan's loop-variable half. FIRST-wins under the current generation, matching the
+// `LetDecl` half's convention. An unnamed variable ("" — not producible by the parser, but
+// cheap to exclude) records nothing.
+function plRecordLoopVar(name: string, ix: i32) {
+  if name == "" { return 0 }
+  const lsid = sidOf(name)
+  if sidArrGet(plLoopSidGen, lsid) != plGen {
+    sidArrPut(plLoopSidGen, lsid, plGen)
+    sidArrPut(plLoopSidVal, lsid, ix)
+  }
+  0
+}
+
+// Collect every MODULE-scope `for` variable name reachable from statement `ix` into
+// `mlvSet`. Descends the bodies that share the module's local frame (loops, `if` arms,
+// bare blocks) and stops at a `FuncDecl`, whose loop variables belong to that function.
+function mlvScanStmt(ix: i32) {
+  if ix < 0 { return 0 }
+  const st = P.nodes[ix]
+  if st is ForRange {
+    if st.frVar != "" { mlvSet[st.frVar] = true }
+    mlvScanStmt(st.frBody)
+  } else if st is ForIn {
+    if st.fiVar != "" { mlvSet[st.fiVar] = true }
+    mlvScanStmt(st.fiBody)
+  } else if st is WhileStmt {
+    mlvScanStmt(st.whileBody)
+  } else if st is IfStmt {
+    mlvScanStmt(st.ifThen)
+    if st.ifElse >= 0 { mlvScanStmt(st.ifElse) }
+  } else if st is Block {
+    const stmts = st.blkStmts
+    let i = 0
+    while i < stmts.length {
+      mlvScanStmt(stmts[i])
+      i = i + 1
+    }
+  }
+  0
+}
+
+// Does the MODULE scope bind `name` as a `for` loop variable? `rootIx` is the `Program`
+// node.
+//
+// The module's top level is NOT a lifted frame — `fnParent` is -1 for a lambda written
+// there — so the frame walk that answers this question inside a function runs off the end
+// before it can. A top-level loop variable is nonetheless a genuine local of the start
+// function, and a closure written in the loop body captures it.
+export function moduleBindsLoopVar(rootIx: i32, name: string) {
+  if rootIx < 0 { return false }
+  if !mlvBuilt {
+    mlvBuilt = true
+    const r = P.nodes[rootIx]
+    if r is Program {
+      const stmts = r.progStmts
+      let i = 0
+      while i < stmts.length {
+        mlvScanStmt(stmts[i])
+        i = i + 1
+      }
+    }
+  }
+  mlvSet[name] == true
 }
 
 function plBuildLetMap(blockIx: i32) { plScanStmt(blockIx) }
@@ -403,6 +496,30 @@ export function parentLetOfSid(blockIx: i32, sid: i32) {
   if sid < 0 { return -1 }
   if sidArrGet(plSidGen, sid) != plGen { return -1 }
   sidArrGet(plSidVal, sid)
+}
+
+// Find the `for` LOOP VARIABLE named `name` anywhere in the body block at `blockIx` —
+// the loop-variable twin of `parentLetOf`, sharing its walk, its cache and its
+// generation stamp. Returns the binding `ForRange`/`ForIn` arena index, or -1.
+//
+// Ask it wherever "is this name bound in this frame" decides something, because a loop
+// variable is a function-scoped local like any other and `parentLetOf` cannot see it.
+export function parentLoopVarOf(blockIx: i32, name: string) {
+  parentLoopVarOfSid(blockIx, sidOf(name))
+}
+
+// The sid-taking primitive, with `parentLetOfSid`'s lazy build (the two halves are one
+// table under one generation, so either lookup builds both).
+export function parentLoopVarOfSid(blockIx: i32, sid: i32) {
+  if blockIx < 0 { return -1 }
+  if blockIx != plCacheBlock {
+    plGen = plGen + 1
+    plBuildLetMap(blockIx)
+    plCacheBlock = blockIx
+  }
+  if sid < 0 { return -1 }
+  if sidArrGet(plLoopSidGen, sid) != plGen { return -1 }
+  sidArrGet(plLoopSidVal, sid)
 }
 // The loop-stack position a `break`/`continue` targets: "" (unlabelled) binds
 // to the TOP entry (the innermost loop); a label scans from the top for the
