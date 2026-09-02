@@ -206,6 +206,52 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   D1024's table (`orErr<T>(): T | "err"` at `T = i32` → `no recorded members`) is NOT this
   item: it is about mono-minted unions, struct arm or literal alike — **D1042**.
   DECISIONS.md §"A subsumed literal arm COLLAPSES". Compiler-side; compile-goal surface.
+- **`is A` over same-shape struct arms is a DISCRIMINANT-VALUE test — RULED (owner,
+  2026-09-02), NOT BUILT.** `type Circle = { kind: "circle", r: f64 }` /
+  `type Square = { kind: "square", r: f64 }` is a legal union and `s is Circle` is true iff
+  the tag names the shared shape AND `s.kind` is a member of `Circle`'s literal set — the
+  arm set `s.kind == "circle"` already narrows to. A literal-typed field is a type that is
+  also a value; membership is decided by the value. Overlapping sets are legal and truthful;
+  a same-shape pair with NO literal-typed field (`{v: i32} | {v: boolean}`) is refused by
+  the CHECKER — a design rule (`docs/guide/unions.md`) the emitter enforces today. The rep is
+  the compiler's choice: one heap type + one tag + an `i32`-sentinel compare (recommended;
+  no rep change), or distinct heap types (not vetoed) — provided the answer stays the
+  value's, never the name a value was built under. Measured today: the singleton-literal TS
+  idiom is an EMIT REJECT with no `is` in the program (the idiom is unwritable); two-member
+  disjoint or overlapping sets fold into one variant and take the wrong arm silently
+  (**D1023**); only different field names run. **Build, in order:** (1) collect pass admits
+  a same-signature pair that differs in a literal-typed field (one tag, one layout);
+  (2) `is A` adds the membership compare(s) after the tag test — one `i32.eq` per singleton;
+  (3) the checker owns the no-discriminant refusal and the emit reject becomes a floor;
+  (4) `is`- and `==`-narrowing graded side by side at every spelling. D1023's RULED
+  paragraph has the six-row table and the grading list; DECISIONS.md §"`is A` over
+  same-shape struct arms is a DISCRIMINANT-VALUE test". Interim std rule until built: every
+  std error struct keeps a field NAME no other has (`JsonError.path`). Compiler-side;
+  compile-goal surface.
+- **A `type` declared in a function body is LEGAL and lexically scoped — RULED (owner,
+  2026-09-02), NOT BUILT.** Today the declaration parses and is silently dropped: `unknown
+  type 'P'` at the use, a check-clean emit reject when the name is unused, and a local `type
+  P` silently resolving to a MODULE-scope `P` of another shape (D1045). Ruled: every `type`
+  form (struct, union/literal union, recursive, generic alias, nominal `new`) is admitted in a
+  body, scoped to the block, shadowing outer names, and free to name the enclosing function's
+  type parameters — substituted per instance as D426 does for lambdas; the NAMED-function
+  spelling of that substitution still refuses at emit (D1046) and closes with this. Sub-rulings
+  standing as vl-b7's recommendation: a local NOMINAL type may not escape through an inferred
+  return type (checker refuses); a structural one escapes as its shape. **Two steps:** (1)
+  interim, ships first — the checker refuses the DECLARATION loudly on every spelling with
+  one message naming the rule (D1045's row has the text and the three-spelling grading);
+  (2) the scoping build, graded on D1045's list plus D1046's witness. DECISIONS.md §"A `type`
+  declared in a function body is legal and lexically scoped". Compiler-side.
+- **Assertion failures locate at the MATCHER, not `expect` — RULED (owner, 2026-09-02),
+  BLOCKED on D1044.** Each `std:test` matcher (`toEqual`/`toBeTrue`/`toBeFalse`, `not`'s
+  continuation) takes `caller: CallerLoc = __callsite__` and the receipt stops carrying
+  `expect`'s. On today's grammar only the column moves (the method token, measured col 14);
+  the line moves the day a leading-dot continuation line parses — a grammar question not yet
+  put to the owner. Blocked: a UFCS call that omits a defaulted tail argument is refused `no
+  field … on …` in every module build that merges a `self`-function module, so `.toEqual(y)`
+  cannot take the default until D1044 lands (eight-row ablation in its row). std change →
+  `std-api-reviewer`; header + DECISIONS "`expect` only" paragraph updated with it. std-side
+  after a compiler fix.
 - **Colored `print`** — ruled in principle 2026-09-01 with one hard constraint (ANSI must
   never leak into pipes/files/copies): Node's split — bare strings always raw, rendered
   values colored, escapes emitted only by the TTY-detected sink, `NO_COLOR`/`--color`

@@ -654,6 +654,8 @@ import {
   litAtomMemberTy,
   localIndexOf,
   mapAnnShape,
+  mapReadNarrowableSlot,
+  mapReadNarrowedAtomKind,
   mapReadScalarBoxKind,
   mapReadScalarBoxKindTy,
   mapRetExprShape,
@@ -686,7 +688,9 @@ import {
   mvValVariantOf,
   nameIsWholeSpanShape,
   narrowedMapOf,
+  narrowedMapOfPlace,
   narrowedRefArrayOf,
+  narrowedRefArrayOfPlace,
   nonNulBaseOf,
   narrowedValueAtomOf,
   narrowExcludesNull,
@@ -712,6 +716,7 @@ import {
   pushPostGuardNarrow,
   refArrSlotTag,
   refListSlotOfExpr,
+  refListSlotOfExprStrict,
   refPushScratchBaseFor,
   removeAtomFromSet,
   restoreNarrow,
@@ -4570,6 +4575,41 @@ function emitUnionUnboxTail(ak: i32) {
   0
 }
 
+// THE CONTAINER HALF OF A PLACE-NARROWED UNION READ, from a box already on the stack — the
+// member/index PLACE dual of `emitRefArrayUnionUnboxRead` and `emitMapUnionUnboxRead`, which
+// both push the box themselves from a NAME. 1 = a recovery was emitted, 0 = the place carries
+// no live container narrowing (the caller leaves the box exactly as it was), -1 = a recorded
+// failure.
+//
+// THE HEAP TYPE COMES FROM THE CLASSIFIER THE CONSUMER ALREADY ASKED, not from a second
+// derivation off the narrow stack. `refListSlotOfExprStrict` / `mapShapeOfExpr` are the very
+// functions `forInElemKind`, `emitIndex` and `emitMapPrep` type themselves against, so a
+// delivery that cast to a different row than the consumer expects is not expressible here.
+// (The scalar half stays in `emitUnionFieldNarrowUnbox` / `emitIndex`'s D451 rung, because it
+// also serves the UN-narrowed adoption reads those two sites carry.)
+function emitPlaceNarrowContainerUnbox(exprIx: i32, fnIx: i32): i32 {
+  if narrowedRefArrayOfPlace(exprIx) != "" {
+    const slot = refListSlotOfExprStrict(exprIx, fnIx)
+    if slot < 0 || slot >= rlWrapIdx.length {
+      return emitFail(
+        "emitProgram: narrowed union place ref-array arm has no reflist slot",
+      )
+    }
+    fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
+    fbRefCast(rlWrapIdx[slot]) // the payload IS the arm's list wrapper
+    return 1
+  }
+  if narrowedMapOfPlace(exprIx) != "" {
+    fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
+    // `mapShapeOfExpr` answers the mono sentinel -1 for an atom-valued map exactly as the
+    // name resolver does, and `mapTypeIdxOf(-1)` is the shared `$mStructIdx` — so the miss
+    // and the hit agree here for the same reason they do in `emitMapUnionUnboxRead`.
+    fbRefCast(mapTypeIdxOf(mapShapeOfExpr(exprIx, fnIx)))
+    return 1
+  }
+  0
+}
+
 // Recover the reflist WRAPPER ref a union binding narrowed to a REF-ELEMENT array arm holds
 // (`if x is S[]` then `x[i]` / `x.length`): push the box, read its `anyref` value (field 1),
 // `ref.cast` it to the arm's reflist wrapper heap. The ref-array analogue of
@@ -6377,6 +6417,10 @@ function emitSharedFieldRecv(body: i32[], recvIx: i32, fnIx: i32, slot: i32) {
 // site was corrected to it. An un-narrowed read yields the box unchanged, so a "" atom
 // emits nothing.
 function emitUnionFieldNarrowUnbox(memIx: i32, fnIx: i32) {
+  // The CONTAINER arms of the same narrowing (`if n.v is K[]`, `if n.v is {[string]: K}`) —
+  // disjoint from the value atom below, which answers "" for both (D1014).
+  const mCon = emitPlaceNarrowContainerUnbox(memIx, fnIx)
+  if mCon != 0 { return mCon - 1 }
   const mAtom = narrowedValueAtomOf(memberPathKeyOf(memIx))
   if mAtom == "" {
     // D209 — THE UN-NARROWED READ THE CHECKER TYPED AS A BARE ATOM. The box is the
@@ -6574,24 +6618,23 @@ function emitNarrowStoredAtomKind(from: i32, to: i32) {
 // The unbox SEQUENCE for a value-union box payload at atom kind `mfk`: `struct.get $uBox
 // 1` and then the atom's own recovery. One home, so the narrowed read and D209's
 // un-narrowed one cannot emit different instructions for the same atom.
+//
+// THE RECOVERY ITSELF IS `emitUnionUnboxTail`'s, not a second copy of it (D1014). The two
+// ladders had drifted: the ident read's tail recovers a STRING, a CLOSURE fat pointer and a
+// LIST WRAPPER before it falls to the scalar value box, while this one knew only the string
+// and the box — so `if n.v is f64[]` delivered `narrowed union field atom has no value box`
+// on a `vl check` rc 0 program whose identical hoisted spelling RUNS. What is left here is
+// the one thing that is genuinely this site's own: the `aUsed` guard, which turns an
+// unminted `sTypeIdx` into a message instead of a type-0 reference.
 function emitUnboxToAtomKind(mfk: i32) {
-  fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
   if mfk == 2 {
     if !aUsed {
       return emitFail(
         "emitProgram: narrowed string union field read but array type not collected",
       )
     }
-    fbRefCast(sTypeIdx) // the payload IS the string array ref
-    return 0
   }
-  const mvb = vbHeapIdxOfKind(mfk)
-  if mvb < 0 {
-    return emitFail("emitProgram: narrowed union field atom has no value box")
-  }
-  fbRefCast(mvb)
-  fbStructGet(mvb, 0) // the scalar payload
-  0
+  emitUnionUnboxTail(mfk)
 }
 
 // The message for one of `emitMem`'s three FIELD-ACCESS FLOORS — `dflt` prefixed, except
@@ -8372,6 +8415,33 @@ function emitMonoMapDefault(body: i32[], recvIx: i32, defIx: i32, fnIx: i32) {
 // Lower a bare map GET `m[k]` (no `??`) onto `body`: probe, return `vals[entry-1]` or
 // `0` when absent. The checker never uses a bare map get (always `?? -1`); provided for
 // completeness so `m[k]` in value position is total (0 default).
+// The NARROWED-READ tail of a bare map GET `m[1]` whose index PLACE carries a live
+// narrowing — the map twin of `emitIndex`'s two ref-list rungs (the niche recover and the
+// union-box unbox), and the emitter half the checker's `placeKeyOf` has always had.
+//
+// TWO RUNGS, IN THIS ORDER. `emitMapGet` leaves the vals element, which is `(ref null
+// <elem>)` for every ref-valued map because a MISS reads as `ref.null` — so the recover comes
+// first and is what the guard buys. A UNION value (kind 2) then unboxes to the tested atom
+// through `emitUnionUnboxTail`, the one home the narrowed ident / member / element reads
+// already share; a narrow that leaves two or more atoms keeps the box and takes the recover
+// alone, which is the rep a `(ref $uBox)` consumer wants.
+function emitNarrowedMapReadTail(idxIx: i32, fnIx: i32) {
+  const mrs = mapReadNarrowableSlot(idxIx, fnIx)
+  if mrs < 0 { return 0 }
+  const key = indexPathKeyOf(idxIx)
+  const v = narrowVariantFor(key)
+  if v == "" || v == "null" { return 0 }
+  // A UNION value already left the NON-null box (`emitMapGetUnionBox` recovers it), so only
+  // the unbox is owed; every other ref value is the raw `(ref null <elem>)` vals slot.
+  if mvValKind[mrs] == 2 {
+    const ak = mapReadNarrowedAtomKind(idxIx, fnIx)
+    if ak >= 0 { return emitUnionUnboxTail(ak) }
+    return 0
+  }
+  fbRefAsNonNull() // 0xd4 (the `is` guard proved the key present)
+  0
+}
+
 function emitMapGet(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32) {
   if emitMapPrep(body, recvIx, keyIx, fnIx) < 0 { return -1 }
   if cmSlot >= 0 {
@@ -10463,6 +10533,10 @@ function emitIndex(body: i32[], idxIx: i32, fnIx: i32) {
       // Routed through `emitUnionUnboxTail`, the ONE home the narrowed IDENT read
       // (`emitValueUnionUnboxRead`) and the union `as` cast already share, rather than a
       // fifth open-coded `struct.get 1` + `ref.cast` + `struct.get 0`.
+      // The CONTAINER arms of the same channel (`if xs[0] is K[]`, `if xs[0] is {[string]:
+      // K}`) — the index twin of `emitUnionFieldNarrowUnbox`'s (D1014).
+      const iCon = emitPlaceNarrowContainerUnbox(idxIx, fnIx)
+      if iCon != 0 { return iCon - 1 }
       const iuAtom = narrowedValueAtomOf(indexPathKeyOf(idxIx))
       if iuAtom != "" {
         if indexElemUnionName(idxIx, fnIx) != "" {
@@ -12786,7 +12860,21 @@ export function emitExpr(body: i32[], exprIx: i32, fnIx: i32) {
     // G8: a map GET `m[k]` (no `??`) — scan, value or 0. A `??` get is fused in the
     // BinExpr branch below (it carries the default).
     if exprMap(e.idxArr, fnIx) {
-      return emitMapGet(body, e.idxArr, e.idxIndex, fnIx)
+      // A UNION-VALUED map (mv kind 2) reads through the NULL-TAGGED BOX, the same lowering
+      // the `const t = m[k]` binding arm and its module-scope twin already take. `emitMapGet`
+      // yields the vals slot with a BARE `ref.null` miss, and every consumer of a boxed read
+      // starts with `struct.get $uBox 0` (the tag) — so a MISSING key trapped `null
+      // reference` on `m[k] is T`, `m[k] != null`, `m[k] == null` and `print(m[k])` alike,
+      // while the identical program through a binding ran. The box IS the read's `null`.
+      const ubs = mapReadNarrowableSlot(exprIx, fnIx)
+      if ubs >= 0 && mvValKind[ubs] == 2 {
+        if emitMapGetUnionBox(body, e.idxArr, e.idxIndex, fnIx) < 0 {
+          return -1
+        }
+        return emitNarrowedMapReadTail(exprIx, fnIx)
+      }
+      if emitMapGet(body, e.idxArr, e.idxIndex, fnIx) < 0 { return -1 }
+      return emitNarrowedMapReadTail(exprIx, fnIx)
     }
     return emitIndex(body, exprIx, fnIx)
   }

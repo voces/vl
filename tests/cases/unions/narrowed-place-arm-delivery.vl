@@ -1,0 +1,214 @@
+// @run
+// Regression (silent-class-inventory D1014).
+//
+// An `is` narrowing whose receiver is a struct FIELD (`n.v`) or an ARRAY ELEMENT (`xs[0]`)
+// type-checked and never reached the emitter. `setNarrowFromCond` HAS banked a member-path key
+// and an index-place key for a long time — each already gated on the place being a union BOX —
+// but every CONSUMER took a `name: string` and asked about an identifier, so the emitter worked
+// against the DECLARED union type and failed at whichever consumer came first. That is why one
+// defect produced FOUR sentences: `unsupported for-in iterable`, `narrowed union field atom has
+// no value box`, `index access but array type not collected`, `callee is not a function name`.
+// The message named the consumer, not the mechanism; hoisting the read into a local before the
+// `if` made all four run, which is the ablation that defines the family.
+//
+// THE HOIST IS NOT THE FIX, and the `fresh` leg is why. A hoisted temp is read ONCE; the place
+// is read at every use, so a same-arm store inside the branch has to be visible. That leg
+// prints `2` then `1` — a hoist prints `2` twice.
+//
+// THREE ARMS IN THREE UNIONS, because they take three different deliveries out of one box. A
+// scalar-element list atom rides `emitUnionUnboxTail`'s list-wrapper cast — the ladder the
+// FIELD read had open-coded a shorter copy of, which is why `if n.s is f64[]` alone answered
+// `narrowed union field atom has no value box`. A ref-element list and a map each need the
+// arm's own `ref.cast`, resolved through the very classifier the consumer asked
+// (`refListSlotOfExprStrict` / `mapShapeOfExpr`) so the delivery and the consumer cannot name
+// two different rows. Each arm is in its OWN union so no arm's cast can answer for another's.
+//
+// EVERY POSITION, BECAUSE A CAPABILITY GAP HAS A POSITION MATRIX. Narrowing the classifier
+// alone shipped check-clean invalid wasm: the `#l` temp took the arm's rep while the iterable
+// still evaluated to the raw box. The UN-ANNOTATED binding (`inferBind`) is the position an
+// annotated fixture cannot see — `const q: K[] = n.v` runs with the annotation and carries a
+// `redundant type annotation` hint, and the checker agreeing about the TYPE says nothing about
+// whether the two spellings agree about the REP. It needed `exprUnion` to stop calling a
+// place narrowed to a CONTAINER arm a union value, the rule the Ident arm already had.
+//
+// AND THE PLACE MUST STILL DELIVER WHERE THE UNION IS EXPECTED: the `boxed(…)` calls at the
+// end pass the narrowed place to a `K`-typed / `M`-typed parameter, so the unboxed value is
+// re-boxed rather than handed raw to a box-typed destination.
+
+// @log 2.5
+// @log 4
+// @log 4
+// @log 2
+// @log 4
+// @log 4
+// @log 4
+// @log 4
+// @log 4
+// @log 4
+// @log 4
+// @log 2
+// @log 1
+// @log 2.5
+// @log 4
+// @log 4
+// @log 4
+// @log 2
+// @log 4
+// @log 4
+// @log a
+// @log 2.5
+// @log 1
+// @log 2.5
+// @log 2.5
+// @log 4
+// @log 4
+// @log 2.5
+// @log 4
+// @log 2.5
+// @log 7.5
+// @hint redundant type annotation: `held` is inferred as `{w: K[]}` — remove it to lean on inference
+
+type K = f64 | K[]
+type Node = { v: K }
+type Wrap = { w: K[] }
+type Nest = { inner: Node }
+
+type M = f64 | { [string]: M }
+type MapNode = { mv: M }
+
+type S = f64 | f64[]
+type ScalarNode = { s: S }
+
+let gList: K[] = []
+let gScalars: f64[] = []
+
+const node: Node = { v: [2.5, 4.0] }
+
+// ── the REF-ELEMENT list arm (`K[]`) at the MEMBER place ──────────────────────────────
+if node.v is K[] {
+  for e in node.v {
+    if e is f64 { print(e) }
+  }
+  const at1 = node.v[1]
+  if at1 is f64 { print(at1) }
+  print(node.v.length)
+  // The UN-ANNOTATED binding — inference pins the rep here, not an annotation.
+  const inferBind = node.v
+  const ib1 = inferBind[1]
+  if ib1 is f64 { print(ib1) }
+  let assigned: K[] = []
+  assigned = node.v
+  const as1 = assigned[1]
+  if as1 is f64 { print(as1) }
+  const held: Wrap = { w: node.v }
+  const hd1 = held.w[1]
+  if hd1 is f64 { print(hd1) }
+  const nested = [node.v]
+  const ne1 = nested[0][1]
+  if ne1 is f64 { print(ne1) }
+  gList = node.v
+}
+const g1 = gList[1]
+if g1 is f64 { print(g1) }
+
+function armArg(xs: K[]) {
+  const a1 = xs[1]
+  if a1 is f64 { return a1 }
+  0.0
+}
+if node.v is K[] { print(armArg(node.v)) }
+
+function armRet(n: Node): K[] {
+  if n.v is K[] { return n.v }
+  []
+}
+const rr = armRet(node)
+const rr1 = rr[1]
+if rr1 is f64 { print(rr1) }
+
+// The place is read AT EVERY USE, so a same-arm store inside the branch is visible.
+const replacement: K[] = [7.5]
+const fresh: Node = { v: [2.5, 4.0] }
+if fresh.v is K[] {
+  print(fresh.v.length)
+  fresh.v = replacement
+  print(fresh.v.length)
+}
+
+// ── the same arm at the INDEX place (`xs[0]`) ─────────────────────────────────────────
+const cells: K[] = [[2.5, 4.0]]
+if cells[0] is K[] {
+  for e in cells[0] {
+    if e is f64 { print(e) }
+  }
+  const ce1 = cells[0][1]
+  if ce1 is f64 { print(ce1) }
+  const idxBind = cells[0]
+  const ib2 = idxBind[1]
+  if ib2 is f64 { print(ib2) }
+  print(cells[0].length)
+  print(armArg(cells[0]))
+}
+
+// ── a NESTED member path (`o.inner.v`), the key that hangs off another key ────────────
+const outer: Nest = { inner: { v: [2.5, 4.0] } }
+if outer.inner.v is K[] {
+  const on1 = outer.inner.v[1]
+  if on1 is f64 { print(on1) }
+}
+
+// ── the MAP arm, at both places ───────────────────────────────────────────────────────
+const seed: { [string]: M } = Map()
+seed["a"] = 2.5
+const mapNode: MapNode = { mv: seed }
+if mapNode.mv is { [string]: M } {
+  for k in mapNode.mv.keys() { print(k) }
+  const mvr = mapNode.mv["a"]
+  if mvr is f64 { print(mvr) }
+  print(mapNode.mv.size)
+  const mapBind = mapNode.mv
+  const mb = mapBind["a"]
+  if mb is f64 { print(mb) }
+}
+const mapCells: M[] = [seed]
+if mapCells[0] is { [string]: M } {
+  const mc = mapCells[0]["a"]
+  if mc is f64 { print(mc) }
+}
+
+// ── the f64-ELEMENT list arm — the atom-kind delivery ─────────────────────────────────
+const snode: ScalarNode = { s: [2.5, 4.0] }
+if snode.s is f64[] {
+  print(snode.s[1])
+  print(snode.s.length + 2)
+  gScalars = snode.s
+}
+print(gScalars[0])
+
+// ── re-boxing: inside the branch the place still delivers WHERE THE UNION IS EXPECTED ─
+function boxedList(u: K) {
+  if u is K[] {
+    const b1 = u[1]
+    if b1 is f64 { return b1 }
+  }
+  0.0
+}
+// Reads element 0, so the `fresh` place (whose same-arm store left a one-element list) is
+// deliverable at the union too.
+function boxedHead(u: K) {
+  if u is K[] {
+    const b0 = u[0]
+    if b0 is f64 { return b0 }
+  }
+  0.0
+}
+function boxedMap(u: M) {
+  if u is { [string]: M } {
+    const b2 = u["a"]
+    if b2 is f64 { return b2 }
+  }
+  0.0
+}
+if node.v is K[] { print(boxedList(node.v)) }
+if mapNode.mv is { [string]: M } { print(boxedMap(mapNode.mv)) }
+if fresh.v is K[] { print(boxedHead(fresh.v)) }
