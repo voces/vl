@@ -32034,6 +32034,17 @@ Repro:
 * **The SAME program with the two declarations SWAPPED runs** — that is D1036's own repro —
   so a type declaration's position in the file is observable, which it is not supposed to be.
 
+* **THE FORWARD REFERENCE IS NOT THE INGREDIENT; THE CYCLE THROUGH IT IS.** Same declaration
+  order, same forward reference, recursion removed:
+
+  | program | outcome |
+  | --- | --- |
+  | `type JO = {[string]: J}` then `type J = f64 \| string` | runs |
+  | `type JO = {[string]: J}` then `type J = null \| f64 \| JO` | **refused** |
+
+  So pass 0a's placeholder handles a plain forward reference fine. What it does not survive
+  is the reference coming back to the map that made it.
+
 * **THE CHECKER IS NOT THE ONE LOSING IT.** Both orders diagnose a misuse correctly, they
   just render the type differently: `o["k"] = "not a J"` reports `cannot assign string to
   f64 | JO | null` under this order and `… to J | null` under D1036's. The type is intact.
