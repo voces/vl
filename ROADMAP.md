@@ -116,8 +116,10 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   `3.9 as! i32` and a bare `3.9 as i32` inside an `i32 | null` function all print `3`;
   `4294967298 as i32` prints `2`. **The build, in order:** (1) migrate every numeric `as`
   site in the tree to `as!` (they were written under "traps on NaN / out of range" and mean
-  it) — `compiler/` 67, `std/` 21, `tests/cases` 230 — which is byte-identical on today's
-  seed because it drops the suffix, so the fixpoint proves the migration touched nothing;
+  it) — **DONE, #2355 (vl-de, 2026-09-02): `compiler/` 2, `std/` 15, `tests/cases` 167,
+  `cmp`-byte-identical** (the 67/21/230 first quoted was a bare grep; 70 of its compiler+std
+  hits were comment prose) — byte-identical on today's seed because it drops the suffix, so
+  the fixpoint proves the migration touched nothing;
   (2) checker: `checkCastNode`'s numeric arm reads `asMode` — bare `as` places the
   propagation obligation on the enclosing return as the union arm does, `as?` types
   `T | null`, `as!` types `T`, and `as?` on a lossless edge is a hint; (3) emitter: exact
@@ -131,6 +133,22 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   D1041's ten-row table. DECISIONS.md §"Numeric `as` to an INTEGER target is exact-or-fail
   under the trio" has the survey (Julia's `Int(3.9)` InexactError / `trunc(Int, x)` is the
   model adopted) and the cost. Compiler-side; the compile-goal session's surface.
+- **A subsumed literal arm COLLAPSES — RULED (owner, 2026-09-02), NOT BUILT.** A union is a
+  set of values; an arm that adds none adds no arm, decided per arm after flattening and
+  through aliases: `string | "err"` is `string`, `Name | "err"` (alias) is `Name`,
+  `Json | "err"` is `Json`, `Kind | string` is `string`; `Kind | "err"` (three atoms) and
+  `i32 | "err"` (a real two-arm box) stay. `x is <literal>` is a VALUE test everywhere — what
+  every spelling that builds today already does. Two non-blocking hints: at the written
+  subsumed spelling, and at an `is <literal>` whose operand collapsed; none at a generic
+  instantiation. **Build:** the collapse in CANON (the type becomes the base / a smaller
+  union) — never a dedupe of a built member set, box tags are positional — which closes
+  **D1024** (`function f(): string | "err"` is check-clean invalid wasm today because the
+  literal widens to a DUPLICATE `string` atom); then the two hints. Grade on D1024's spelling
+  table (`return`, parameter, alias, `Json | "err"`, `Kind | string`, module-scope binding)
+  and on `is "err"` answering as `==` at each. The generic-instantiation refusal that shared
+  D1024's table (`orErr<T>(): T | "err"` at `T = i32` → `no recorded members`) is NOT this
+  item: it is about mono-minted unions, struct arm or literal alike — **D1042**.
+  DECISIONS.md §"A subsumed literal arm COLLAPSES". Compiler-side; compile-goal surface.
 - **Colored `print`** — ruled in principle 2026-09-01 with one hard constraint (ANSI must
   never leak into pipes/files/copies): Node's split — bare strings always raw, rendered
   values colored, escapes emitted only by the TTY-detected sink, `NO_COLOR`/`--color`
@@ -309,7 +327,8 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   "missing"`)~~ — **q1 RULED 2026-09-02: none; the decoder is deep `is`/`as` (bullet
   above)** — ~~`asExactI32` in `std:fmt` + whether `f64 as i32` saturates~~ — **q2 RULED
   2026-09-02: no helper, numeric `as` is exact-or-fail under the trio (bullet below)** —
-  and whether `string | "err"` collapses (D1024). **v1 BUILT — #2322 (2026-09-02)**, reviewed by
+  and ~~whether `string | "err"` collapses (D1024)~~ — **q3 RULED 2026-09-02: it
+  collapses, per arm, after flattening, through aliases (bullet below); §6 is fully ruled**. **v1 BUILT — #2322 (2026-09-02)**, reviewed by
   `std-api-reviewer` (MERGE AFTER FIXES, ten findings, all header text, all taken); building
   it filed D1029–D1034. Three more gaps filed by the critique
   round: D1025 (a map subscript mints no narrowing key — the usability critique's gap A,

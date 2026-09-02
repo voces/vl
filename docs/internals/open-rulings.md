@@ -46,6 +46,12 @@ unsupported: nothing here is demonstrated to be BROKEN while these wait, and the
 paragraphs below quote defect counts from the same stale source.** Re-derive the grid before briefing
 either A16 ruling — the cheapest honest brief is the grid re-run, not this text.
 
+**And the F3 shape is now the RULE, not a fixed accident (owner, 2026-09-02, DECISIONS.md §"A
+subsumed literal arm COLLAPSES"):** `K | string` collapses to `string` because `K`'s values are
+all strings, and `x is K` is a value test ("is `x` one of `aa`/`bb`") — which is exactly what the
+witness above prints today (re-run on 8a7820e2: `ok: not K`, and `"a"` under `Kind | string` is
+`Kind`). Any future A16 tag-scheme work has to preserve that fold, not tag around it.
+
 The same check retired two of the largest rows in `silent-class-inventory-2.md` on the same day; the
 shape is general enough that it is worth stating as a rule for this file specifically: **an entry here
 is a scheduling instrument, so its witness must be RUN, not read, before it is quoted.**

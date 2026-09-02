@@ -31086,6 +31086,25 @@ delivers.
   literal arm). It is here because D1021's ablation table filed it under the wrong defect,
   and because a message count would keep doing so.
 
+* **RULED 2026-09-02 (owner; DECISIONS.md §"A subsumed literal arm COLLAPSES").** The
+  language question above is answered: the spelling COLLAPSES — `string | "err"` is
+  `string`, decided per arm, after flattening, through aliases (`Name | "err"` is `Name`,
+  `Json | "err"` is `Json`, `Kind | string` is `string`), and `x is "err"` is a value test.
+  Re-measured the same day (seed 8a7820e2): the ALIASED spelling `type R = string | "err"`
+  runs in return AND parameter position and its `is "err"` answers by value (`const s:
+  string = "err"; const c: R = s; c is "err"` → `true`), while the direct spelling in a
+  parameter (`function tag(r: string | "err")`) is the loud face `literal `is` over a
+  struct union is not supported`, not the invalid wasm — so the family is one mechanism
+  (the duplicated atom) with three faces by position. **The fix is the collapse in CANON**
+  (the signature's type becomes `string`; no box, no atom), never a dedupe of the built
+  member set — box tags are positional. Grade the close on: this witness printing `err`;
+  the parameter spelling running; `is "err"` answering as `==` at direct, aliased, `Json |
+  "err"` and `Kind | string` spellings; and the two hints. **The `i32 | "err"` loud face
+  listed above was mis-filed here** — the DIRECT spelling `function f(bad: boolean): i32 |
+  "err"` runs (both arms, `is "err"` included); what refuses is the GENERIC instantiation
+  `orErr<T>(): T | "err"` at `T = i32`, and a struct arm `T | E` refuses identically, so the
+  literal is scenery there: D1042.
+
 ### D1025 — an INTEGER-LITERAL map subscript narrows at check and not at emit: `if m[1] is string { const z: string = m[1] }` is check-clean invalid wasm, and the STRING-literal subscript `m["a"]` mints no narrowing key at all
 
 **check-clean invalid wasm · check rc 0 (the checker even hints the `string` annotation is redundant) · `type mismatch: expected (ref $type), found (ref null $type)` (the raw nullable map read is delivered where the narrowed `string` is expected) · ZERO corpus cells · found 2026-09-01 measuring the `std:json` usability critique's helper decline (its "gap A", the loud string-keyed face) and re-run at an `i32` key · two ingredients: a MAP read through an integer-literal subscript, and a narrowed destination**
@@ -32399,8 +32418,58 @@ Repro:
   trapping instruction, since an integral operand cannot fail the compare. Float targets
   keep their rounding conversions unchanged. **Sequence:** migrate the tree's `as` sites
   to `as!` / `as` FIRST (today's seed accepts and ignores the suffix, so the migration is
-  byte-identical), then land the semantics — measured 2026-09-02: `compiler/` 67 sites,
-  `std/` 21, `tests/cases` 230; `std/fmt.vl`'s `parseI32` comment ("`as i32` is an
-  unchecked wrapping truncation on this compiler") goes with it. Grade the close on every
+  byte-identical), then land the semantics — DONE as #2355 (vl-de, 2026-09-02): `compiler/`
+  2 sites, `std/` 15, `tests/cases` 167, `cmp`-byte-identical (the 67/21/230 first filed
+  here was a bare grep; 70 of its compiler+std hits were `//` prose about casts);
+  `std/fmt.vl`'s `parseI32` comment ("`as i32` is an unchecked wrapping truncation on this
+  compiler") goes with it. Grade the close on every
   row of the table, at every delivery position (`const`, return, argument, assignment,
   struct field, global init — D965's matrix), and on the migrated tree's fixpoint.
+
+---
+
+### D1042 — a union RETURN TYPE minted by GENERIC INSTANTIATION (`T | "err"` / `T | E` at a scalar `T`) has "no recorded members": check-clean, refused at emit on the `is` test or the box; the same union spelled directly runs
+
+**loud emit reject on a `vl check`-clean program — OPEN, clause 2 · found 2026-09-02 (vl-b7)
+ablating the `i32 | "err"` face D1024's row had filed as the literal arm's numeric twin; the
+literal is SCENERY — a struct arm refuses identically**
+
+Repro:
+
+    function orErr<T>(x: T, bad: boolean): T | "err" {
+      if bad { return "err" }
+      return x
+    }
+    const r = orErr(5, false)
+    if r is "err" { print("failed") } else { print(r) }
+
+`emitProgram: union box atom test on a union with no recorded members: i32|"err"`.
+
+* **THE FAMILY, ABLATED** — seed 8a7820e2, `VL_STD` pinned:
+
+  | program | check | run |
+  | --- | --- | --- |
+  | `orErr<T>(): T \| "err"` at `T = i32`, `r is "err"` | ok | **emit reject** `no recorded members: i32\|"err"` |
+  | same, `print(orErr(5, true))` — no `is` at all | ok | **emit reject**, same sentence |
+  | `orE<T>(): T \| E`, `type E = { msg: string }`, at `T = i32`, `r is E` | ok | **emit reject** `no recorded members: i32\|E` — the literal is not the ingredient |
+  | `orE<T>` at `T = string`, `t is E` | ok | **emit reject** `` `is` test but no union type declared `` — same family, second sentence |
+  | `orNull<T>(): T \| null` at `T = i32` | ok | **runs** `5` — the nullable rep is not a box |
+  | **control:** the DIRECT spelling `function orE(x: i32, bad: boolean): i32 \| E` | ok | **runs** — `bad` / `5` |
+  | **control:** the DIRECT spelling `function f(bad: boolean): i32 \| "err"`, `is "err"` | ok | **runs** — `failed` / `42` |
+  | `orE<T>` at `T = i32` with an ANNOTATED destination `const t: i32 \| E = orE(5, true)` | ok | **runs** — `bad` (the annotation pins the rep, D969's shape) |
+  | `orErr<T>` at `T = i32` with `const r: i32 \| "err" = orErr(5, true)` | ok | **emit reject** — the annotation does NOT rescue the literal arm; second ingredient, not yet ablated |
+
+* **MECHANISM (as far as measured).** The union a generic's return type becomes at an
+  instantiation is minted by the mono clone, and the emitter's member registry — the table
+  `union box atom test` consults — has no row for it; the same union written by hand is
+  registered when its spelling is resolved. The struct-arm row is rescued by annotating the
+  destination because the annotation registers the spelling; the literal-arm row is not,
+  which says the literal arm has a second, separate registration path that the clone also
+  misses. Two ingredients, then: (1) mono-minted unions are never registered — the family;
+  (2) a literal arm's atom registration is missed a second way — grade separately.
+
+* **WHY IT MATTERS MORE THAN ITS SOURCE ROW.** `T | E` at a scalar `T` is the generic
+  `Result` shape every fallible generic helper wants (`std:fs`/`std:json` are monomorphic
+  and so never hit it). It should close by registering the clone's union where the direct
+  spelling registers its own — not by an emit arm — and grade on every row above plus the
+  D965 delivery matrix for the instantiated value.
