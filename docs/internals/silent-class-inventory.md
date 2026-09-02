@@ -30106,3 +30106,45 @@ an array-of-map is not yet supported — use a named element type`):
     mv["k"] = 2.5
     const c: Json = [mv]
     print(1)
+
+### D1017 — `==` over a struct whose field is a LIST OF STRUCTS refuses at emit; the list compares on its own and a scalar-list field compares in place
+
+**loud emit reject · check rc 0 · `emitProgram: unsupported struct field type in equality` (`compiler/wasmEmit.vl:11990`, the field-code ladder's floor) · the SAME literal the inventory already records twice as a loud→loud severity downgrade (a mixed-base literal-union field; a 2-D list field) — this row is the first cell where the shape is soundly comparable and the ladder simply has no arm · not counted by `goal-scoreboard.py --sites` (the wording admits nothing) · probe `scripts/capability-probes/struct-list-field-equality.vl` (20 of 21 run on 2026-09-01) · found by the identity proposal's cross-language critique (`docs/internals/identity-critique-crosslang.md` finding 8), ablated 2026-09-01**
+
+The motivating shape was the tree every cycle-detection example is written over —
+`type T = { v: i32, kids: T[] }` — and the critique's point was that the identity proposal's
+own motivating program cannot be asked `==` today. The ablation says the recursion is
+scenery:
+
+  | spelling | check | outcome |
+  | --- | --- | --- |
+  | `type T = { v: i32, kids: T[] }`, `a == b` | rc 0 | emit reject |
+  | `type L = { w: i32 }`, `type T = { v: i32, kids: L[] }`, `a == b` | rc 0 | emit reject, same message |
+  | `type L = { w: i32 }`, `const a: L[]`, `a == b` | rc 0 | **RUNS**, prints `true` |
+  | `type T = { v: i32, kids: i32[] }`, `a == b` | rc 0 | **RUNS**, prints `true` |
+
+  So the ingredient is a STRUCT-ELEMENT LIST at FIELD position: the standalone list compare
+  exists (D751/D752 built it), the scalar-list field arm exists (code 21/30's arm, see the
+  D9xx close above that cites this literal), and nothing routes a struct-element list field
+  to the list compare. `emitStructEqRec`'s ladder reaches code 14 (function field) and falls
+  off the end.
+
+* **CLAUSE 2 BY CONSTRUCTION.** `isEquatable` admits the shape — correctly, a list of
+  equatable structs is equatable — and the emitter owes the lowering. The fix is an arm, not
+  a gate: route the field through the existing struct-list compare core. Do NOT close this by
+  teaching `isEquatable` to refuse it; that would be the 26th "silent→loud" close the
+  CLAUDE.md scoreboard section says does not count.
+
+* **WHY IT MATTERS BEYOND THE CELL.** `docs/identity-design.md` P3 makes struct keys
+  STRUCTURAL and says the hash "walks the same shape the serde derive walks". Every
+  tree-shaped key type has a struct-list field, so P3's lowering meets this ladder on day
+  one; the identity cross-examination's synthesis cites this row as the reason the key
+  lowering and the `==` lowering must be one code path.
+
+Repro (loud emit reject):
+
+    type L = { w: i32 }
+    type T = { v: i32, kids: L[] }
+    const a: T = { v: 1, kids: [{ w: 2 }] }
+    const b: T = { v: 1, kids: [{ w: 2 }] }
+    print(a == b)
