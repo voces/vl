@@ -31439,10 +31439,13 @@ LITERALS and never the `string` ARM. The test is base-arm membership after flatt
 through aliases, so `type Name = string` gives `Name | "err"` = `Name` and `Json | "err"` is
 `Json`.
 
-**THE BARE-LITERAL HALF ONLY — the ruling's MIRROR (`Kind | string`) is [D1048](#d1048), left
-out with its price measured.** It is one line (`homogLitUnionBase` inside `armLiteralBaseTy`)
-and it costs two RUNNING fixtures, which is the one movement the gate refuses. That is not a
-smaller ruling; it is the same ruling landed in the order that never loses a program.
+**THE BARE-LITERAL HALF ONLY — the ruling's MIRROR (`Kind | string`) was [D1048](#d1048), left
+out with its price measured, and SHIPPED later the same day.** It is one line
+(`homogLitUnionBase` inside `armLiteralBaseTy`) and it costs two RUNNING fixtures on its own,
+which is the one movement the gate refuses. The reason is a SECOND producer: canon's union arm
+preserved the litunion arm off the SPELLING, so the arena said `string` while the annotation
+still said `Kind|string`. D1048 landed both halves together; splitting the ruling here was the
+right call, and it was right for a reason this row's own analysis had not found yet.
 
 **THE NO-COLLAPSE PATH IS WHAT BROKE FIRST, and the witness could not see it.** The helper was
 written with the contract "fills `out` only when it dropped something, untouched otherwise" —
@@ -33214,62 +33217,93 @@ Repro (now prints `a`, `b`, `e`; it refused, while the same program with
 
 ### D1048 — the ruling's MIRROR half: a litunion beside its own base (`Kind | string`) does not collapse, and at a PARAMETER it is check-clean invalid wasm
 
-**check-clean invalid wasm · check rc 0 · `type mismatch: expected (ref $type), found (ref $type)` at the parameter · ZERO corpus cells · measured pre-existing on a `git archive origin/master` build (identical byte offset 254 on both arms) · found 2026-09-02 writing D1024's fixture, as the case the shipped half deliberately leaves out**
+**CLOSED 2026-09-02 — the repro now RUNS and prints `zz`. Was: check-clean invalid wasm · check rc 0 · `type mismatch: expected (ref $type), found (ref $type)` at the parameter · ZERO corpus cells · measured pre-existing on a `git archive origin/master` build (identical byte offset 254 on both arms) · found 2026-09-02 writing D1024's fixture, as the case the shipped half deliberately leaves out**
 
-Repro:
+Repro (prints `zz`):
 
     type Kind = "a" | "b"
     function mirror(x: Kind | string): string { x }
     print(mirror("zz"))
 
-`type R = Kind | string` with `const c: R = "zz"` RUNS, so this is position-dependent as well
-as spelling-dependent — the parameter is the face that fails.
+`type R = Kind | string` with `const c: R = "zz"` RAN even before the fix, so the defect was
+position-dependent as well as spelling-dependent — the parameter was the face that failed.
 
-* **~~THE FIX IS KNOWN AND IS ONE LINE~~ — CORRECTED 2026-09-02, and the correction is the
-  reason this row is worth reading.** Restoring `homogLitUnionBase` inside `armLiteralBaseTy`
-  is the arena half and it is one line. It is NOT the fix, because there are **TWO causes**
-  and the second is in CANON.
+* **IT TOOK TWO PRODUCERS, AND EACH ALONE IS A `runs → not-runs` VETO.** Measured in both
+  directions against this row's named set (`mixed-union-litunion-arm-is-membership.vl` = F1,
+  `is-litunion-arm-non-ident-receivers.vl` = F2), one seed refresh per state:
 
-* **THE SECOND CAUSE: canon PRESERVES a string-litunion member where the arena would drop
-  it.** `canonEmitNameTs`'s union arm applies `litUnionPreserve` to a string litunion instead
-  of softening it, so after an arena-side collapse the arena says `string` while canon still
-  spells `K|string` — and the emitter reserves a union box for what is now a plain-string
-  binding. Measured by a peer session on exactly the intermediate state (collapse in
-  `annUnionInnerTy` + `fillTypeDeclAt`, litunion-alias drop enabled):
-  `mixed-union-litunion-arm-is-membership.vl::atomStoreIsK` fails
-  `local.set[0] expected type (ref 4), found local.get of type i32`, and
-  `is-litunion-arm-non-ident-receivers.vl` fails `struct field type K|string|i32 has no
-  struct-field rep`.
+  | state | position matrix | F1 | F2 |
+  | --- | --- | --- | --- |
+  | master | 34/42 RUNS-ok | runs | runs |
+  | ARENA only (`homogLitUnionBase` in `armLiteralBaseTy`) | 41/42 | **check-clean INVALID WASM** (offset 1242, `expected (ref $type), found i32`) | **emit reject** `struct field type \`K\|string\|i32\` has no struct-field rep` |
+  | CANON only (`canonDropSubsumedParts`) | 27/42, **+1 RUNS-WRONG** | **emit reject** `only i32 locals are supported` | **check-clean INVALID WASM** (offset 3857) |
+  | both | **42/42** | runs, output unchanged | runs, output unchanged |
 
-* **WHY THE BARE-LITERAL HALF DID NOT NEED THIS, and it is luck rather than design.** Canon's
-  `TyLit` arm already softens to the base and its atom dedup collapses `string|string`, so for
-  `string | "err"` the two producers agree BY ACCIDENT. A litunion-ALIAS arm is different:
-  canon keeps `K` as its own atom. So D1024 shipping only the bare-literal half was the
-  correct call for a reason its own analysis had not found yet.
+  Canon-only also answers `x is Kind` a silent **TRUE** for the non-member `"zz"` at a
+  parameter — the #1306 wrong answer arriving from the other side, and the sharpest statement
+  of why one producer moving alone is worse than neither.
 
-* **THE ORDER, CORRECTED.** (a) teach `is K` over a COLLAPSED base to lower as the membership
-  test `emitIs` already emits for a standalone litunion receiver, AND (b) make canon's union
-  arm drop the same arms the arena drops — **both** before restoring `homogLitUnionBase`.
-  Either one alone is the `runs → not-runs` veto.
+* **STEP 1 OF THE PRESCRIBED ORDER WAS ALREADY BUILT, and measuring that first is what made
+  the rest cheap.** The row prescribed teaching `is K` over a COLLAPSED base to lower as
+  `emitIs`'s membership ladder. It already does — verified on master **before any edit** by
+  writing both named-set fixtures in the spelling the collapse produces (`K | string` →
+  `string`, `K | string | i32` → `string | i32`, `K | string | null` → `string | null`):
+  **20 of 20 answers correct**, the `string | i32` box and the `string | null` niche included.
+  So the mirror needed the two PRODUCERS to agree and nothing else. Writing the collapsed
+  spelling by hand costs one file and it retired a whole prescribed step.
 
-* **THE PRICE, MEASURED — TWO RUNNING FIXTURES, and they are this row's NAMED SET.** With the
-  mirror collapsing, `tests/cases/literal-unions/mixed-union-litunion-arm-is-membership.vl`
-  and `tests/cases/literal-unions/is-litunion-arm-non-ident-receivers.vl` stop running:
-  `emitProgram: struct field type \`K|string|i32\` has no struct-field rep` at the first and
-  invalid wasm in `atomStoreIsK` at the second. Both pin `x is K` over a `K | string` box as
-  MEMBERSHIP over the payload — a tag compare answers TRUE for every string the box holds,
-  which is the silent wrong answer #1306 removed — and both pin `is K` / `is string` PAIRS
-  that no tag scheme can green by halves. Losing a running program is the movement the gate
-  refuses, so the collapse is not the first step.
+* **THE ARENA HALF** is the one line the row always said it was — `homogLitUnionBase` inside
+  `armLiteralBaseTy`, so a homogeneous literal UNION arm reports its base exactly as a BARE
+  literal arm already did. All three union-construction sites reach it through the shared
+  `unionDropSubsumedArms` (`annUnionInnerTy`, `fillTypeDeclAt`'s `UnionDecl` arm, and
+  `substTyDeep`'s `TyUnion` arm — D1049 had already wired the third), so no call site changed.
+
+* **THE CANON HALF** is `canonDropSubsumedParts`, called at the TOP of `canonEmitNameTs`'s
+  union arm — ahead of `nulLitUnionPreserve`, `litUnionPreserve` and
+  `mixedUnionLitAliasRegroup`, mirroring where `annUnionInnerTy` puts the collapse — and
+  re-entering on the survivors exactly as that function does. It drops a part that denotes
+  only STRING LITERALS when a sibling arm canons to `string`. `partIsStrLitSet` is the
+  string-side twin of `homogLitUnionBase`, and its UNION leg is load-bearing rather than
+  decorative: `(K | K2) | string` reaches the arena as ONE flattened litunion, but
+  `nameIsLitUnionType("K|K2")` is FALSE, so without the recursion canon keeps an arm the arena
+  has dropped.
+
+* **WHY ONLY THE STRING-LITUNION ARM NEEDED AN EXPLICIT CANON RULE, and it is luck rather than
+  design.** Canon's per-member render already softens a bare literal (`"err"` → `string`) and
+  a NUMERIC litunion alias (`numLitUnionAliasName`: `type N = 0|1` → `i32`), and its atom
+  dedup then collapses `string|string` / `i32|i32` — so those spellings agreed with the arena
+  BY ACCIDENT, which is why D1024's bare-literal half needed no canon change at all. A string
+  litunion is different: `nameIsLitUnionType` is the interned-atom identity, `litUnionPreserve`
+  keeps it, and `mixedUnionLitAliasRegroup` puts an alias name back even for the INLINE
+  spelling. The rule is written out for all three bases anyway, so the two producers now run
+  ONE rule rather than meeting in the middle.
+
+* **THE POSITION MATRIX FOUND EIGHT FAILING CELLS AND READING THE CALL SITES WOULD HAVE FOUND
+  FOUR.** 42 cells, one program per delivery position of a `Kind | string` value. Failing on
+  master: `param`, `param_member`, `concat`, `global` and `genpin_ret` (check-clean invalid
+  wasm); `elem` (`operator '+' is not defined for Kind | string and Kind | string`); and the
+  two NUMERIC controls `ctl_numlit` / `ctl_f64lit`, which failed with `union box atom test on a
+  union with no recorded members: i32` — **the same disagreement running the other way**
+  (canon had already collapsed `N | i32` to `i32` while the arena still minted two members),
+  and neither was filed anywhere. All eight run now. The un-annotated spellings
+  (`const y = make()` at an inferred `Kind | string`, and `y is Kind` over it) ran on master
+  and still run — inference was never the ingredient here, which is worth recording because it
+  is the one direction a fixture that annotates cannot see.
 
 * **THE SHAPE OF THE LESSON.** Two producers of one type — the ARENA and CANON — have to be
   changed together, and a fix that moves only one leaves them disagreeing about a rep while
   agreeing about the type. That is the build-the-lowering-first discipline D965 named, applied
-  to a rep collapse instead of a converting copy: build both producers' answers, verify both
-  fixtures still run, THEN collapse.
+  to a rep collapse instead of a converting copy.
 
-* **NOT A REGRESSION AND NOT INTRODUCED BY D1024** — the parameter witness fails identically on
+* **NOT A REGRESSION AND NOT INTRODUCED BY D1024** — the parameter witness failed identically on
   master, at the same byte offset.
+
+* Fixture: `tests/cases/literal-unions/subsumed-litunion-arm-collapses.vl` (the matrix,
+  including the un-annotated spellings and the four non-collapsing controls). Probe:
+  `scripts/capability-probes/subsumed-litunion-arm.vl`. The named set stays as it is — both
+  fixtures run with byte-identical output, and their annotations are now redundant BY THE
+  RULING, declared with `@hint` rather than deleted (deleting them would remove the very
+  spelling the row is about).
 
 ### D1049 — the SUBSTITUTION route is a THIRD union-construction site and does not reach the subsumed-arm collapse: `pick<T>(v: T): T | "err"` at `T = string` is still D1024's exact invalid wasm
 

@@ -192,7 +192,13 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   error. DECISIONS.md §"Numeric `as` to an INTEGER target is exact-or-fail
   under the trio" has the survey (Julia's `Int(3.9)` InexactError / `trunc(Int, x)` is the
   model adopted) and the cost. Compiler-side; the compile-goal session's surface.
-- **A subsumed literal arm COLLAPSES — RULED (owner, 2026-09-02), NOT BUILT.** A union is a
+- **A subsumed literal arm COLLAPSES — RULED (owner, 2026-09-02); THE COLLAPSE IS BUILT, the
+  two dedicated HINTS are not.** The bare-literal half shipped as **D1024** and the MIRROR
+  (`Kind | string` is `string`) as **D1048**, which needed the drop in BOTH producers — at
+  type construction (`unionDropSubsumedArms`) and on the annotation SPELLING
+  (`canonDropSubsumedParts`), each alone a `runs → not-runs` veto. The first hint arrives
+  free (the existing redundant-annotation hint now fires at a collapsed annotation); the
+  `is <literal>`-whose-operand-collapsed hint is still to write. A union is a
   set of values; an arm that adds none adds no arm, decided per arm after flattening and
   through aliases: `string | "err"` is `string`, `Name | "err"` (alias) is `Name`,
   `Json | "err"` is `Json`, `Kind | string` is `string`; `Kind | "err"` (three atoms) and
