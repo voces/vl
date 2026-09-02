@@ -31722,6 +31722,45 @@ export function nodeTyIsUnionAlias(ix: i32) {
   // LITERAL union — string OR numeric (`0 | 1 | 2` canon-names `i32`), whose members are all `TyLit`
   // and which reps as an interned atom, not a `{tag, value}` box. A struct-alias is single-member.
   if isValueUnionBox(ty) { return true }
+  // D1027 — A NULLABLE OVER A UNION THAT ALREADY BOXES IS STILL THAT BOX. The exclusion in
+  // the comment above is right for a NICHE — `S | null`, `string | null` — and wrong the
+  // moment the inner is a value-union box: adding `null` to a box is a box, and when the
+  // union already CARRIES `null` the composition is the union itself.
+  //
+  // `function first(self: Json): Json | null` is that shape, and the two spellings disagreed
+  // about their own rep: the composed one answered `vtKindOfType` = `"i32"` while the INLINE
+  // flattened spelling of the identical type — same rendered name, character for character —
+  // answered `"union"`. So `return null` had an i32 return slot with nowhere to put a box and
+  // fell through every seed to `bare null needs a struct-typed context`.
+  //
+  // Three earlier candidates all attacked the NAME (a `mkNullableTy` fold, a canon collapse
+  // to the alias, a member-set match in `unionRowOf`) and none moved the witness, because the
+  // name was already right and the disagreement is in the arena TYPE the annotation resolves
+  // to. Probing `vtKindOfType` on both spellings is what separated them.
+  if t is TyNullable {
+    // PEEL TO A FIXPOINT, because the interning stacks the two wrappers. `Json | null`
+    // interns as `TyNullable( TyUnion[ TyNullable(rest) ] )` — the outer `| null`, the
+    // alias's one-member wrapper, and the alias's OWN null folded into a niche — so one
+    // unwrap of each is not enough and the peel has to alternate. Measured: the inner is
+    // `union1` at the first look and only the second nullable reaches the 5-member box the
+    // inline spelling shows directly.
+    let nin = t.nInner
+    let guard = 0
+    while nin >= 0 && guard < 8 {
+      const nw = T.tys[nin]
+      if nw is TyNullable {
+        nin = nw.nInner
+      } else if nw is TyUnion {
+        if nw.uMembers.length == 1 { nin = nw.uMembers[0] } else { guard = 8 }
+      } else {
+        guard = 8
+      }
+      guard = guard + 1
+    }
+    if nin >= 0 {
+      if isValueUnionBox(nin) { return true }
+    }
+  }
   // A SAME-SHAPE union (`A | B` with A, B structurally IDENTICAL) collapses to a single `TyObj` in the
   // arena — structural equality dedups the members — losing its union-ness, though the emitter keeps the
   // union box for tag discrimination (`isUName`). The arena can't represent this, so recover it locally
