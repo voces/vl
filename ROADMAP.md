@@ -255,7 +255,7 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   spelling → col 14; `not.toEqual` → the final matcher; multi-line spelling → the `.toEqual`
   LINE (once the grammar lands). std change → `std-api-reviewer`; header + DECISIONS "`expect`
   only" paragraph updated with it; `testDiscovery.ts` untouched. std-side.
-- **A leading `.` / `?.` on a new line continues the postfix chain — SHIPPED (#PRNUM).** Ruled
+- **A leading `.` / `?.` on a new line continues the postfix chain — SHIPPED (#2382).** Ruled
   by the owner 2026-09-02 and built the same day. `parsePostfix` gains a NEWLINE arm that LOOKS
   past the run of newlines and continues iff the next kind is DOT/QUESTION_DOT; `(` and `[` do
   NOT continue (legal statement starts) and trailing-dot stays refused, both pinned. Grepped
