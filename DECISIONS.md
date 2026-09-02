@@ -3954,3 +3954,38 @@ Two consequences: `deserialize` becomes a two-phase read whose first phase is re
 **stage 3 retires LESS** — the tree is the schemaless escape hatch by construction rather than a
 leftover lexer, so what stage 3 adds is the derived one-step path beside a `std:json` that keeps
 its own reason to exist.
+
+## `std:json` ships NO accessor helper, because the decoder is an OPERATOR (owner, 2026-09-02)
+
+`json-design.md` §6 q1 offered three helpers for walking a `Json` tree (none / `jsonGet` /
+an RFC 6901 `jsonPointer`) and recommended the pointer. The owner declined the premise:
+"why would it have to be one `is` test per level? why can't you do a complex, nested type
+on the right hand side? I say get that working and then (a) is fine for now until we have
+an actual consumer." Two facts made the question answerable rather than a taste call:
+
+- **"One test per level" was never a rule.** `x is T` over a union is a TAG test: the
+  checker asks whether `T` is a registered arm, the emitter compares the box tag. A struct
+  on the right is refused ("not a variant of Json"); a REFINEMENT of an arm (`r is
+  string[]`, `r is {[string]: string}`) is admitted by the assignability-based membership
+  test and then answers **`false` unconditionally** — `["xyz"] is string[]` prints `false`,
+  a check-clean silently-wrong answer (D1035). Nothing in the language decided that; it is
+  the shape of a tag test applied where a shape walk is meant.
+- **The walker helper and the typed decoder are the same customer.** Every consumer in
+  reach (config readers, message payloads) can NAME its shape; a helper only serves the
+  consumer that cannot, and none of those is in the tree. serde-design already commits to
+  `deserialize` being a two-phase read (text → `Json` → shape); the ruling is that the
+  second phase is spelled `doc is Cfg` / `doc as Cfg` — the operator the language has —
+  rather than a `deserialize<T>` intrinsic, which OQ-1 (b) keeps for the BINARY source and
+  for `serialize`, where no operator fits.
+
+So: **(a) no helper in v1; the build item is deep `is` / `as` over `Json`** — a derived
+per-`T` shape walk that BUILDS the `T`-repped value, inheriting the wire policies already
+ruled (unknown key → no match, exact case, duplicate keys a parse error, `i64` a number,
+union arms by first token / required key set). Four sub-rules carry recommendations and
+await the owner (`docs/serde-design.md` §"Deep `is` / `as` over a `Json` value"): the
+narrowed value is a COPY and `is` rebinds; `i32`/`i64` fields accept only an integral
+in-range number (the same predicate as q2's `asExactI32`); absent key ≠ present `null`
+(the read-side mirror of decision A); `as` propagates a `JsonError { kind: "shape", path }`
+rather than the useless remainder. A helper returns to the list the day a consumer that
+cannot name its shape arrives, and not before — std has no deprecation story, so the
+cheapest helper is the one never shipped.

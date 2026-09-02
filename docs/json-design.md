@@ -1,6 +1,6 @@
 # `std:json` v1 — the surface, and what the compiler has to grow to serve it
 
-> Status: **CRITIQUED 2026-09-01 — three open questions for the owner, then the builder.**
+> Status: **BUILT — #2322 (2026-09-02); §6 q1 RULED the same day, q2 and q3 still open.**
 > This is serde stage 1 (`docs/serde-design.md` §Recommendation, ruling G): a real `Json`
 > VALUE TREE plus a parser and a renderer over it. Nothing here is built. The owner answered
 > seven surface questions on 2026-09-01 and those answers are recorded in §0 as facts this
@@ -87,12 +87,11 @@ export function parseJson(self: string): Json | JsonError
 export function toJson(self: Json): string | JsonError
 ```
 
-That is the whole of v1: one type, one error type, two functions — plus, if §6 question 1
-is ruled as recommended, one accessor:
-
-```vl
-export function jsonPointer(self: Json, pointer: string): Json | JsonError   // §2.8, OPEN
-```
+That is the whole of v1: one type, one error type, two functions. ~~Plus, if §6 question 1
+is ruled as recommended, one accessor: `jsonPointer(self: Json, pointer: string): Json |
+JsonError`.~~ **No accessor — RULED 2026-09-02 (owner), §6 q1.** The consumer's decoder is
+a deep `is` / `as` over `Json` (a language build item, `docs/serde-design.md` §"Deep `is` /
+`as`"), not a walker.
 
 *Post-critique:* `path` is the fourth field (std #1, crosslang F10): it keeps `JsonError`
 structurally distinct from `Base64Error = { at, kind, msg }` — a union naming two
@@ -118,6 +117,11 @@ And the names the later stages will take, so v1 does not squat on them (§2.4):
 export function fromJson<T>(self: string): T | JsonError
 export function toJson<T>(self: T): string | JsonError        // generalises v1's toJson
 ```
+
+*2026-09-02:* the READ half of that pair may never need a name — the owner's direction is
+a deep `is` / `as` over `Json` (`docs/serde-design.md` §"Deep `is` / `as` over a `Json`
+value"), under which `text.parseJson() as Cfg` IS `fromJson<Cfg>`. The names stay reserved
+until that lands; nothing in v1 squats on either.
 
 A parse never traps and never returns a partial tree. A render never traps, never emits a
 partial document, and fails only on a value JSON cannot carry (`nonfinite`) or a tree it
@@ -196,8 +200,9 @@ JsonError` fails to emit (measured by the std critique, probe `a3`).
   exceeds the cap (§2.7), on parse OR render. `nonfinite` — on render, an `f64` arm holds
   `NaN` or `±Infinity`; on parse, a number lexeme whose value is not a finite `f64`
   (`1e999`; §2.5, *post-critique*). A fifth, `cycle`, arrives with the seen-set (§2.7),
-  and a sixth, `missing`, with `jsonPointer` if §6 rules it in — named here so the union
-  grows rather than reshapes. The header lists which kinds each function can produce; a
+  a sixth, `shape`, with deep `as` over `Json` (serde-design §"Deep `is` / `as`", sub-rule
+  S4), and `missing` stays reserved for a walker if one ever ships (§6 q1 ruled none for
+  v1) — named here so the union grows rather than reshapes. The header lists which kinds each function can produce; a
   consumer's exhaustive `match` over `kind` sees them all, which is the one cost of a single
   error type and the std precedent for it (`IoError` serves five operations with codes
   only some can produce).
@@ -450,7 +455,12 @@ no consumer has named a need. JS has no cap and stack-overflows; Python's is the
 recursion limit (~1000); Go has none for `Unmarshal` into `interface{}` (it caps at 10,000
 since 1.15). If a consumer needs deeper, the number moves, once, upward, in the header.
 
-### 2.8 Accessor helpers — OPEN (§6 question 1); the walking idiom, and what the critiques measured
+### 2.8 Accessor helpers — RULED NONE (§6 question 1, 2026-09-02); the walking idiom is the INTERIM, and what the critiques measured
+
+*Ruled 2026-09-02: (a) none in v1. The idiom below is what a consumer writes TODAY; the
+destination is a deep `is` / `as` over `Json` that names the whole shape in one test
+(`docs/serde-design.md` §"Deep `is` / `as` over a `Json` value"). The three options are
+kept as the record of what was compared.*
 
 Owner's question 7 was "what?", so here is what was being asked. Walking a `Json` means
 narrowing at every step:
@@ -791,9 +801,21 @@ closed above (§2.4, §2.3, §2.2, §2.9). What remains, with the synthesis's re
 in bold (`docs/internals/json-critique-synthesis.md` §2 has the votes and the
 measurements):
 
-1. **Helpers** — (a) none in v1; (b) `jsonGet`/`jsonAt` returning `Json`, missing = null;
+1. ~~**Helpers** — (a) none in v1; (b) `jsonGet`/`jsonAt` returning `Json`, missing = null;
    **(c) one `jsonPointer(self: Json, pointer: string): Json | JsonError`, RFC 6901,
-   `kind: "missing"` keeps missing distinct from a stored null.** §2.8 has all three.
+   `kind: "missing"` keeps missing distinct from a stored null.** §2.8 has all three.~~
+   **RULED 2026-09-02 (owner): (a) — none in v1, "until we have an actual consumer" — and
+   the walking idiom §2.8 documents is not the destination.** The owner's question was why
+   a consumer should need one `is` per level at all rather than a complex, nested type on
+   the right-hand side, and the measured answer is that nothing forbids it: `is` today is a
+   tag test, a struct on the right is refused as "not a variant", and a REFINEMENT of an
+   arm (`r is string[]`, `r is {[string]: string}`) is admitted and answers `false`
+   unconditionally (D1035). **The build item is deep `is` / `as` over `Json`** — a derived
+   shape walk that makes `if doc is Cfg { doc.server.port }` the whole decoder —
+   designed in `docs/serde-design.md` §"Deep `is` / `as` over a `Json` value", where four
+   sub-rules (copy semantics, integral `i32` fields, absent ≠ null, `as` propagates a
+   `JsonError` with `kind: "shape"`) carry recommendations awaiting the owner. A helper
+   returns to this list only when a consumer that cannot name its shape arrives.
 2. **`f64 → i32` off the wire** — (1) ship `asExactI32`/`asExactI64` (`: i32 | null`) in
    `std:fmt` beside `parseI32`: **yes**, with the `std-api-reviewer` pass. (2) What
    `f64 as i32` does out of range — trap (today), **saturate** (Rust; `i32.trunc_sat_f64_s`,
@@ -807,7 +829,8 @@ measurements):
 Everything else the three critiques raised is either taken (§1–§2 above, each marked
 *post-critique*) or a build item (§5). D1021 closed on 2026-09-01; the builder is briefed
 on the ruled core (`Json`, `JsonError`, `parseJson`, `toJson`) with the three questions'
-outputs — `jsonPointer`, `asExactI32`, nothing for q3 — landing as follow-ups once ruled.
+outputs — nothing for q1 (ruled: no helper; deep `is`/`as` is the build item),
+`asExactI32`, nothing for q3 — landing as follow-ups once ruled.
 
 ---
 

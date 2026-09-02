@@ -90,6 +90,21 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   repeat silently; the mitigation is an INSTRUMENT, not hesitation (a per-build instance
   report making mono growth visible — filed as part of the implementation's grading).
   Compiler-side work; the compile-goal session's surface.
+- **Deep `is` / `as` over a `Json` value — RULED (owner, 2026-09-02): "why would it have to
+  be one `is` test per level? … get that working"** — `std:json` v1 (#2322) ships NO
+  accessor helper (json-design §6 q1 = (a), "until we have an actual consumer"); the
+  decoder is the operator: `if doc is Cfg { doc.server.port }` / `doc as Cfg` (trio
+  semantics), a compiler-derived per-`T` shape walk that BUILDS the `T`-repped value from
+  the tree. Measured today: `is` is a tag test — a struct RHS is refused as "not a variant",
+  and a refinement of an arm (`["xyz"] is string[]`) is check-clean and answers `false`
+  unconditionally (**D1035**, this item's witness). Design + four sub-rules with
+  recommendations (copy semantics; integral `i32` fields — the same predicate as q2's
+  `asExactI32`; absent ≠ null; `as` propagates `JsonError { kind: "shape", path }`) in
+  `docs/serde-design.md` §"Deep `is` / `as` over a `Json` value"; DECISIONS.md has the
+  ruling. It is serde Stage 2's JSON half brought forward (checker "is a JSON shape"
+  predicate + emitter walk keyed on the RHS type); OQ-1 (b)'s intrinsic stays for the
+  binary source and `serialize`. Position matrix before the checker narrows (D965).
+  Compiler-side work; the compile-goal session's surface once the sub-rules are ruled.
 - **Colored `print`** — ruled in principle 2026-09-01 with one hard constraint (ANSI must
   never leak into pipes/files/copies): Node's split — bare strings always raw, rendered
   values colored, escapes emitted only by the TTY-detected sink, `NO_COLOR`/`--color`
@@ -263,10 +278,13 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   `docs/internals/json-critique-synthesis.md`; the unanimous and measured changes are
   written into the design (`JsonError` gains `path` as its distinguishing fourth field,
   `1e999` refused at parse, `-0` rendered, I-JSON profile, depth cap 128 measured at ~8×
-  margin, `toJsonPretty`/`jsonKind` named as WHAT IS NOT HERE), and **§6 holds the three
-  questions the owner still has to rule**: helpers (recommended: one `jsonPointer`, RFC
-  6901, `kind: "missing"`), `asExactI32` in `std:fmt` + whether `f64 as i32` saturates, and
-  whether `string | "err"` collapses (D1024). Three more gaps filed by the critique
+  margin, `toJsonPretty`/`jsonKind` named as WHAT IS NOT HERE), and **§6 holds the questions the
+  owner still has to rule**: ~~helpers (recommended: one `jsonPointer`, RFC 6901, `kind:
+  "missing"`)~~ — **q1 RULED 2026-09-02: none; the decoder is deep `is`/`as` (bullet
+  above)** — `asExactI32` in `std:fmt` + whether `f64 as i32` saturates, and whether
+  `string | "err"` collapses (D1024). **v1 BUILT — #2322 (2026-09-02)**, reviewed by
+  `std-api-reviewer` (MERGE AFTER FIXES, ten findings, all header text, all taken); building
+  it filed D1029–D1034. Three more gaps filed by the critique
   round: D1025 (a map subscript mints no narrowing key — the usability critique's gap A,
   check-clean invalid wasm at an integer-literal key), D1026 (a null-bearing alias
   composed with `| null` — CLOSED #2312 for its witness), D1027 (the `Json | null`
