@@ -43,6 +43,17 @@ typing a `B` value genuinely IS an `A` — so `v is A` is (soundly) always true 
 shape alone cannot. Distinct-shaped variants (the AST-node `NumLit | BinExpr | Call` pattern) are
 discriminated directly.
 
+**`is` over same-shape arms tests the discriminant's VALUE** (ruled 2026-09-02, DECISIONS.md
+§"`is A` over same-shape struct arms is a DISCRIMINANT-VALUE test"; not yet built — D1023).
+For `type Circle = { kind: "circle", r: f64 }` / `type Square = { kind: "square", r: f64 }`,
+`s is Circle` is true iff the tag names the shared shape **and** `s.kind` is a member of
+`Circle`'s literal set — the same arm set `s.kind == "circle"` narrows to. A literal-typed
+field is a type that is also a value, and membership is decided by the value. Overlapping sets
+are legal and answer truthfully (a `kind: "y"` value is a member of both `"x" | "y"` and
+`"y" | "z"` arms); a same-shape pair with no literal-typed field to distinguish it
+(`{v: i32} | {v: boolean}`) is refused by the checker. Today the singleton-literal idiom is an
+emit reject and multi-member sets fold into one variant — see D1023's table.
+
 ## Shared-field access
 
 A field present on **every** member of a struct union with the **same** type is readable on the

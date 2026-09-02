@@ -12,6 +12,14 @@ in §Probes. They are the only claims here marked (RUN); everything else is a ci
 
 ## 1. `JsonError` is not structurally distinct from `Base64Error`, and the doc's own distinctness argument never checks its nearest neighbour — CHANGE THE SURFACE
 
+> **Language ruling, 2026-09-02 (owner), after this finding:** `is A` over same-shape struct
+> arms is a DISCRIMINANT-VALUE test — the `kind` literal sets DO distinguish `Base64Error`
+> from `JsonError` by rule, and `Base64Error | JsonError` is a legal union once D1023 is
+> built. The finding's premise ("the rep erases the sets") describes today's compiler, not
+> the language. The surface change it asked for (`path`) stands on its own merits and shipped;
+> the interim std rule (a field NAME no other std error has) stays until D1023 closes.
+> DECISIONS.md §"`is A` over same-shape struct arms is a DISCRIMINANT-VALUE test".
+
 **The choice.** §2.2: `JsonError = { at: i32, kind: "syntax"|"duplicate"|"depth"|"nonfinite",
 msg: string }`, with the argument that `kind` "is also the third field that keeps `JsonError`
 structurally distinct from `IoError` and from any `{ at, msg }` a program of its own declares."
