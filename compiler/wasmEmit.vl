@@ -11005,9 +11005,17 @@ function emitIndex(body: i32[], idxIx: i32, fnIx: i32) {
         wU8(212) // 0xd4 ref.as_non_null (non-null string element)
         return 0
       }
+      // The leaf ELEMENT kind whose wrapper / backing / index-scratch pool this read uses.
+      // `u8list` is the packed-byte leaf's spelling in `scalarListWrap` / `scalarListBack` /
+      // `listIdxKindOf` (the element is an ordinary i32, so the kind names the LIST, not a
+      // scalar). Without its arm a `u8[] | null` read fell to the `f64` default and read the
+      // f64 wrapper's heap index — which, in a module with no f64 at all, is whatever the
+      // usage-gated offset formula left there (the i64 list wrapper, beside an `i64[] | null`
+      // cell): check-clean invalid wasm.
       let nek: VKind = "f64"
       if nsk == "nuli64list" { nek = "i64" }
       if nsk == "nulf32list" { nek = "f32" }
+      if nsk == "nulu8list" { nek = "u8list" }
       emitListIdxGuard(
         listIdxWrapSlot(listIdxKindOf(nek), 0),
         scalarListWrap(nek),
@@ -16263,6 +16271,14 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
           if gaKind == "nulstruct" {
             pendingStructIdx = nulRefStructIdxOfLet(gLet, -1)
           }
+          // AN ARM CELL — kind-8 `variant` or the `nulvariant` niche — seeds the VARIANT
+          // index, exactly as the binding boundary does (`letAnnVariantIdx` + its slot-kind
+          // twin), so an object-literal RHS builds the bare `(ref $uVarHeap[vi])` instead of
+          // the `{tag, value}` box. `globalCellArmIdx` is the same resolver the D1031 unbox
+          // at the foot of this arm reads, so the seed and the cast target cannot disagree.
+          const gaArmIdx = globalCellArmIdx(gLet, gaKind)
+          const gaCellIsArm = gaKind == "variant" || gaKind == "nulvariant"
+          if gaCellIsArm { pendingVariantIdx = gaArmIdx }
           pendingListKind = letAnnRefListKind(gLet)
           pendingListSlot = letAnnRefListSlot(gLet)
           // FIXED (was FILED here) — the GLOBAL cell these two seeds do not rescue was never
@@ -16309,8 +16325,16 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
           // value whose heap is already deduped with the arm's variant struct, storing a
           // `(ref $variant)` into the `(ref null $uBox)` cell — invalid wasm, `vl check`
           // clean before `--codegen` validated the module (#1678).
+          //
+          // AND AN ARM CELL IS NOT THE BOX. `globalCellKind` has an arm cell in two
+          // flavours — kind-8 `variant` and the `nulvariant` niche — so naming a union is
+          // not enough to conclude the cell holds one: `let gv: S | null` over a union ARM
+          // `S` names the union while its cell is `(ref null $uVarHeap[vi])`, and boxing
+          // there stored a `{tag, payload}` into an arm cell (check-clean invalid wasm at
+          // the `global.set`). The kind is the destination's own, which is the only thing
+          // that can answer "is this position box-shaped".
           const gUNm = letUnionNameOf(gLet, -1)
-          if gUNm != "" && !nameIsLitUnionType(gUNm) {
+          if gUNm != "" && !nameIsLitUnionType(gUNm) && !gaCellIsArm {
             if emitUnionBoxArg(body, gUNm, a.binRight, fnIx) < 0 { return -1 }
           } else if exprIsI64(a.binLeft, fnIx) {
             // An i64 GLOBAL target (`a = 7` over `let a: i64`) widens an i32 RHS to i64 — the
@@ -16369,6 +16393,15 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
             if exprNullableMap(a.binLeft, fnIx) {
               gsCtx.nulRefHeap = mapTypeIdxOf(mapShapeOfExpr(a.binLeft, fnIx))
             }
+            // The `nulvariant` niche: `gv = null` is `ref.null $uVarHeap[vi]`. Armed only
+            // for a bare `null` RHS, like the kind-18 arm below, so a non-null RHS keeps
+            // the ambient seed (the #964 SEED-LEAK gate).
+            if gaKind == "nulvariant" {
+              const gnvRhs = P.nodes[unwrapParen(a.binRight)]
+              if gnvRhs is NullLit {
+                gsCtx.nulRefHeap = armDestHeapOf(gaKind, gaArmIdx)
+              }
+            }
             // The sixth niche, missed when the five above landed: a kind-18 nullable REF
             // array global (`g: i32[][] | null`, `g: S[] | null`). Its null is THIS
             // global's element wrapper — `pendingListSlot` above already holds the slot
@@ -16407,9 +16440,7 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
           // `if s is Circle`, between two module globals. The cell's own kind is again the
           // destination, so `armDestHeapOf` reads the pair `emitGlobalSection` gave it.
           if narrowedArmNeedsUnbox(a.binRight, fnIx) {
-            emitNarrowedArmUnboxTo(
-              armDestHeapOf(gaKind, globalCellArmIdx(gLet, gaKind)),
-            )
+            emitNarrowedArmUnboxTo(armDestHeapOf(gaKind, gaArmIdx))
           }
           return emitUserGlobalSet(gIdx) // 0x24 global.set, or a promoted `local.set`
         }
