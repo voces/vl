@@ -3732,10 +3732,21 @@ memoization question, because there is nothing to memoize.
 
 ## Track-caller: the LOCATION is a second LINE, and `CallerLoc` lives where its consumer does (2026-09-01)
 
+> **THE ANCHOR MOVED THE NEXT DAY — read this entry as of 2026-09-01, not as of today.**
+> §"A failed assertion is located at the MATCHER, not at `expect`" (below, BUILT in #2386)
+> moved the `caller` parameter off `expect` and onto each MATCHER (`toEqual` / `toBeTrue` /
+> `toBeFalse`), and the receipt no longer carries it. So everywhere this entry writes
+> `expect(v, caller)` or "`expect` takes a trailing `caller`", today's spelling is
+> `expect(v).toEqual(1, caller)` and "each matcher takes a trailing `caller`". Everything
+> else here — the type's home, the structural check, the separate-LINE format, the
+> last-line invariant, one-hop — is unchanged and still current. The banner is at the TOP
+> because a superseded signature read as current fact is exactly the cost this file exists
+> to stop paying.
+
 Default arguments v1's first customer, and it needed no compiler change: `std:test` exports
 `type CallerLoc = { file: string, line: i32, col: i32 }` and `expect` takes a trailing
-`caller: CallerLoc = __callsite__`. Three choices were open and each is answered here rather
-than left to read off the diff.
+`caller: CallerLoc = __callsite__` (as of this ruling; see the banner). Three choices were
+open and each is answered here rather than left to read off the diff.
 
 ### The type's HOME, and why the structural check makes it reversible
 
@@ -3753,7 +3764,8 @@ module, and a `std:test`-local non-exported alias.
 * **Non-exported still COMPILES — and that is the problem.** It would be easy to write that
   the forwarding helper cannot be spelled without the export. It can: measured 2026-09-01, a
   user's own `type MyLoc = { file: string, line: i32, col: i32 }` in another module takes
-  `__callsite__`, forwards into `expect(v, caller)`, and reports the caller exactly, with
+  `__callsite__`, forwards into the assertion (`expect(v, caller)` then, `expect(v).toEqual(1,
+  caller)` since #2386), and reports the caller exactly, with
   `CallerLoc` never imported. What the export buys is DISCOVERABILITY, not capability — the
   one-hop rule says a wrapper forwards its own `caller` explicitly, and leaving the type
   unexported would make every test helper re-spell three fields against an unwritten contract,
@@ -3803,15 +3815,26 @@ cheapest possible interaction with a fixture set the std:test v2 landing had to 
 `std/test.vl`'s receipt computes `shown` EAGERLY, at `expect` time, because it is T-DEPENDENT
 and every lazy spelling of a T-dependent render is one of the D941 family's miscompiles. That
 argument does not extend to `caller`: it is a concrete `CallerLoc` at every instantiation, so
-it is carried RAW in the receipt and rendered only on the failure path. The pass path pays one
-struct copy and nothing else.
+it is rendered only on the failure path. As of this ruling it was carried RAW in the receipt
+and the pass path paid one struct copy; since #2386 the receipt does not hold it at all and
+the pass path pays the matcher's own `struct.new` instead. The LAZY-render conclusion is
+unchanged either way — it is the placement that moved, not the reasoning.
 
 Measured, 2026-09-01: **+325 bytes** unoptimized on a one-assertion module (5,873 → 6,198),
 **byte-identical at `-O3`** (596 both ways — Heap2Local scalarizes the struct, which reproduces
 the `__callsite__` cost finding above through std), and **~11 ns per PASSING assertion**
 (10M iterations, ~0.33 s → ~0.44 s) for the receipt copy plus the call site's `struct.new`.
+Those ABSOLUTES are that day's program on that day's seed and do not compare with the
+2026-09-02 pair in the matcher entry below; only the DELTAS do.
 
-### `expect` only
+### The MATCHERS only — and it said `expect` only for one day
+
+**Superseded 2026-09-02 by §"A failed assertion is located at the MATCHER, not at `expect`"
+below, which is BUILT (#2386).** This section shipped saying `expect` was the one surface that
+took `caller`; the parameter now lives on `toEqual` / `toBeTrue` / `toBeFalse` and `expect`
+takes none. The sentence that follows is the part that survived unchanged, and the part that
+did not is instructive: "one surface at a time" was right about `fail` and `it`, and wrong
+about WHICH surface, because nobody asked which token an author wants to be sent to.
 
 `fail(msg)` takes no location — its argument is the author's own sentence, not a rendered
 assertion — and `it`/`describe` keep their signatures, because a registration site is not an
@@ -4330,7 +4353,7 @@ that names the rule and the row. This is clause-2 hygiene, not progress on `runs
 scheduled that way: the loud refusal is small and lands ahead; the scoping build is the
 ROADMAP item. Measured 2026-09-02 on seed 42604b65; witnesses under D1045 and D1046.
 
-## A failed assertion is located at the MATCHER, not at `expect` (owner, 2026-09-02) — blocked on D1044
+## A failed assertion is located at the MATCHER, not at `expect` (owner, 2026-09-02) — BUILT (#2386)
 
 The owner asked why a failure's location points at `expect` rather than at `toEqual`. Because
 the track-caller ruling above anchored on `expect` by an UN-CONSULTED design choice: `expect`
@@ -4346,30 +4369,72 @@ expect(build(cfg))
 ```
 
 the `expect` line is the setup and the `.toEqual` line is the assertion; Jest and Vitest
-report the matcher's line for the same reason. On today's grammar that spelling does not
-parse (`expected an expression but found DOT`, measured 2026-09-02); the owner ruled the same
-day that it must — §"A leading `.` on a new line continues the chain" below — so until that
-lands only the COLUMN moves: `__callsite__` on a UFCS call already anchors on the METHOD
-token, column 14 for `expect(x).toEqual(y)` at column 5. No existing report changes its line;
-the ruling is made now so the location is right on the day the grammar admits the second line.
+report the matcher's line for the same reason. When this was ruled that spelling did not
+parse (`expected an expression but found DOT`, measured 2026-09-02) and the ruling said only
+the COLUMN would move; the leading-dot continuation shipped the same day (#2382), so **the
+LINE moves too** and the multi-line case the ruling exists for is live.
 
-**How it lands, and why it is not landing today.** Each matcher — `toEqual`, `toBeTrue`,
-`toBeFalse`, and `not`'s continuation — takes a trailing `caller: CallerLoc = __callsite__`,
-and the receipt drops the `caller` it carries from `expect`. That is the one-hop rule applied
-one hop later: the matcher is the surface that reports, so it is the surface that asks. The
-change alters std exports and goes through `std-api-reviewer`; the header's anchor paragraph
-and the track-caller ruling's "`expect` only" section are updated with it, and the editor's
-location line (`testDiscovery.ts`) is unchanged because the wire format is unchanged.
+**How it landed (#2386).** Each matcher — `toEqual`, `toBeTrue`, `toBeFalse`, and `not`'s
+continuation, which IS one of those three — takes a trailing
+`caller: CallerLoc = __callsite__`, and the receipt drops the `caller` it carried from
+`expect`. That is the one-hop rule applied one hop later: the matcher is the surface that
+reports, so it is the surface that asks. `not()` itself takes NO caller and needs none — it
+decides nothing, so the matcher after it is the one that reports, measured. std-side only, no
+compiler work: `__callsite__` as a defaulted trailing parameter of a UFCS `self`-function
+already anchors on the METHOD token at both spellings.
+
+**The forwarding surface moved with the anchor, and that was the one open choice.** The
+ruling's text said the receipt drops `expect`'s `caller`; it did not say whether `expect(v,
+caller)` should survive as a forwarding surface. It did not. Two places to hand in ONE location
+need a precedence rule between them — an `expect` caller versus a matcher caller — and the
+only available answers are bad ones: a forwarded `expect(v, caller)` silently losing to the
+matcher's own filled default is worse than not offering it. The one-hop pattern is now
+`expect(v).toEqual(1, caller)`, which is one hop, still explicit, and still ordinary code.
+
+**Measured on the built change, 2026-09-02.** A one-line `expect(x).toEqual(y)` at column 5
+reports **column 15**; `expect(x).not().toEqual(y)` reports the final `toEqual`; the
+two-line spelling reports the `.toEqual` LINE; `toEqual(expect(3), 4)` reports its own
+`toEqual` rather than the nested `expect`; a helper forwarding its own `caller` reports the
+helper's caller, and one that does not reports its own matcher in its own file; a passing
+assertion renders no location. **The ruling's "column 14" above was off by one** — that is the
+DOT's column, and the anchor is the method-name token after it. The arithmetic slipped in the
+prose, not in the compiler.
+
+**Cost, re-measured the way the track-caller entry above sets:** ten million passing
+`expect(7).toEqual(7)` run 0.42–0.43 s anchored at `expect` and 0.41–0.45 s anchored at the
+matcher, i.e. inside the noise — one `struct.new` either way, just at a different call. Size
+went DOWN 10 bytes unoptimized on a one-assertion module (6,353 → 6,343: the receipt lost a
+field and `not` lost a copy) and is byte-identical at `-O3` (`cmp`, 416 bytes both ways).
+
+The editor's location line (`testDiscovery.ts`) is unchanged as a WIRE FORMAT — only its doc
+comment moved, because it named the `expect` token as the anchor and that is now false.
+
+**`std-api-reviewer`: approve-with-changes, and every finding was documentation.** Two are
+worth recording here because they change the entry above. First, the strongest argument for
+dropping `expect`'s `caller` is not the one the header first made: "no honest answer for
+which wins" reads as taste, when in fact the obvious precedence rule (*an explicitly passed
+`expect` caller beats a default-filled matcher caller*) is **UNWRITABLE** under defaults v1 —
+a default is filled at the CALL, in the caller's frame, so a callee cannot tell a supplied
+argument from an omitted one, which is §"Default arguments v1"'s own ABI finding read one
+consumer later. Second, the review caught that this entry's supersession banner sat 80 lines
+below the heading of the ruling it supersedes, so a reader grepping `CallerLoc` landed on the
+old signature as current fact — the repo's own "claims about the tree" failure, committed by
+the PR that created the staleness. The banner is now the first thing under that heading. Two
+further corrections it forced: the two SIZE paragraphs quote absolutes from different
+seed-days and different programs, so only their DELTAS compare (they read as a 30%
+regression otherwise), and the `wasm-opt --closed-world -O3 --gufa -O3` command this file
+recorded **refuses this tree's output** without `--all-features`.
 
 **It was blocked by a compiler defect, found while measuring the move — closed the same day.**
 A UFCS call that OMITS a defaulted tail argument was refused `no field 'toEqual' on
 Expectation` in any module build that merges a `self`-function-bearing module — which
 `std:test` is, so EVERY test file. The direct spelling and the supplied-argument spelling ran.
 Filed as D1044 with an eight-row ablation and closed by #2371 (the merge's UFCS registry
-matched the DECLARED parameter count exactly where its consumers match an arity range). The
-matcher move is unblocked and is graded on the one-line spelling reporting column 14,
-`not.toEqual` reporting the final matcher, and — once the leading-dot ruling below is built —
-the multi-line spelling reporting the `.toEqual` line.
+matched the DECLARED parameter count exactly where its consumers match an arity range).
+**That defect was the whole of the compiler-side cost**: with it closed the move is a std
+diff and nothing else — every matcher call in every test file is a UFCS call omitting a
+defaulted tail argument, so D1044 was not a blocker beside the feature, it was the feature's
+only mechanism failing.
 
 ## A leading `.` on a new line continues the chain (owner, 2026-09-02)
 

@@ -352,17 +352,23 @@ parallelism, and output capture live). The maintainer's direction: jest-shaped
   There are still no runtime stack traces, and v1's failure identity was test
   name + rendered message. The chartered `#[track_caller]` analog landed as
   TRACK-CALLER over default arguments instead: `std:test` exports
-  `type CallerLoc = { file: string, line: i32, col: i32 }` and `expect` takes a
-  trailing `caller: CallerLoc = __callsite__`, so the position is a VISIBLE
-  parameter the compiler fills at the call rather than an implicit argument or
+  `type CallerLoc = { file: string, line: i32, col: i32 }` and each MATCHER
+  takes a trailing `caller: CallerLoc = __callsite__`, so the position is a
+  VISIBLE parameter the compiler fills at the call rather than an implicit
+  argument or
   an attribute — the Swift/C++20/C# spelling, and the survey's own finding that
   only Rust hides it (ROADMAP §Next's track-caller row carries the comparison).
   A failure gains a second line, `  at <file>:<line>:<col>`.
   - **One hop, never a chain.** A `CallerLoc` is one location. A helper forwards
-    its own `caller` EXPLICITLY to report its caller; there is no transitivity
+    its own `caller` EXPLICITLY to the matcher (`expect(v).toEqual(1, caller)`)
+    to report its caller; there is no transitivity
     machinery and none is owed. A breadcrumb trail, if ever wanted, is a library
     pattern over this value, not a language addition.
-  - **It is on `expect` only.** `it`/`describe` keep their signatures — a
+  - **It is on the MATCHERS only — `toEqual`/`toBeTrue`/`toBeFalse`** (owner
+    ruling 2026-09-02; it was on `expect` for one day). The matcher is what
+    decides `false`, so it is what reports, and a chain broken over lines then
+    anchors on the assertion's line rather than the setup's. `it`/`describe`
+    keep their signatures — a
     registration site is not an assertion site — and `fail(msg)` takes no
     location, because its argument is the author's own sentence. Both are
     separate surface decisions, not blocked ones.

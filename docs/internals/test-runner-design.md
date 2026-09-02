@@ -240,16 +240,21 @@ file FAILs and the run continues), 2 usage — consistent with the binary today.
 1. **Compiler-injected call sites — SHIPPED 2026-09-01, and the mechanism is not
    the one chartered here.** The charter said an IMPLICIT `file:line` argument
    stamped onto `it`/`expect`. What landed is TRACK-CALLER: `std:test` exports
-   `type CallerLoc = { file: string, line: i32, col: i32 }` and `expect` takes a
-   trailing **visible** `caller: CallerLoc = __callsite__`, filled by default
+   `type CallerLoc = { file: string, line: i32, col: i32 }` and each MATCHER
+   (`toEqual`/`toBeTrue`/`toBeFalse`) takes a trailing **visible**
+   `caller: CallerLoc = __callsite__`, filled by default
    arguments v1. Three deliberate departures from the charter's wording:
    * **Visible, not implicit.** Swift/C++20/C# all put it in the signature and
      only Rust hides it, at the cost of attribute machinery and fn-pointer shims
      (ROADMAP §Next's track-caller row carries the survey). The visible parameter
      is also what makes a wrapper's forwarding ORDINARY code rather than a
      transitivity rule.
-   * **`expect` only, not `it`.** A registration site is not an assertion site;
-     `it`/`describe` keep their signatures, and `fail(msg)` takes no location.
+   * **The MATCHERS only, not `it` and not `expect`.** A registration site is not
+     an assertion site, so `it`/`describe` keep their signatures and `fail(msg)`
+     takes no location; and `expect` is SETUP, so it lost the parameter it
+     carried for one day (owner ruling 2026-09-02 — the matcher is what decides
+     `false`, so the matcher is what reports, and a chain broken over lines then
+     anchors on the assertion's line rather than the setup's).
    * **Clickable failures: DONE. `path:line` targeting: NOT.** The position is
      REPORTED (a second report line, `  at <file>:<line>:<col>`, which the
      VS Code extension turns into `TestMessage.location`); it is not yet ACCEPTED

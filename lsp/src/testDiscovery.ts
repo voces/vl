@@ -293,10 +293,11 @@ export const planFileRun = (
 export type TestOutcome = "passed" | "failed" | "skipped";
 
 /**
- * Where the failing `expect(...)` was WRITTEN — `std:test`'s track-caller line,
+ * Where the failing assertion was WRITTEN — `std:test`'s track-caller line,
  * parsed back off the report. `file` is the caller's module key, spelled exactly
  * as the `vl test` target was (absolute for an absolute target); `line`/`col` are
- * 1-based, anchored on the `expect` token itself.
+ * 1-based, anchored on the MATCHER token (`toEqual` / `toBeTrue` / `toBeFalse`),
+ * which on a chain broken over lines is a different LINE from the `expect`.
  *
  * It is a location, not a chain: `std:test`'s `CallerLoc` is one hop, and a
  * helper that forwards its own `caller` reports its CALLER — so a location in a
