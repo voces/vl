@@ -29308,7 +29308,11 @@ Repro (now runs, printing `3` — the ref-tail spelling was check-clean invalid 
 
 ### D941 — a generic-typed PARAMETER forwarded as an ARGUMENT to a second generic function refuses at monomorphize
 
-**loud emit reject · `emitProgram: monomorphize: unsupported argument type for `e` in a call to `inner`` · found 2026-08-31 assembling the generic `std:test` (the factored matcher chain toEqual → adjudicate → report is exactly this shape) · reproduces byte-identically on the pre-#2081 compiler (`d4af1c9e` source self-compiled), so it is a STANDING gap, a regression of nothing · the same forward RUNS when the top-level origin is an annotated literal (`const e1: Expectation<i32> = { … }` then `outer(e1)`), and a CHAIN of top-level generic calls (`expect(5).not().toEqual(6)`) runs too — the refusing cell is a generic-typed PARAM re-passed inside a generic BODY when the call site's T was inferred from a generic call's RETURN**
+**runs, prints `p` — CLOSED 2026-09-02 by widening `monoArgTyName`'s THIRD channel (the
+instance's own parameter annotation, which is already substituted) past its closure-only
+gate, pinning a generic APPLICATION by its own spelling · zero `runs` lost ·
+`tests/cases/generics/generic-carrier-forwarded-to-generic.vl` · was a loud emit reject,
+`emitProgram: monomorphize: unsupported argument type for `e` in a call to `inner``**
 
 Repro (loud emit reject):
 
@@ -29342,6 +29346,28 @@ Repro (loud emit reject):
   raw-forward twin has its own wrong-CODE family: D943's closure and D942's field reads.
 * Blocked the natural factoring of `std:test` v2's matchers; the shipped module inlines the
   failure path instead (std/test.vl header, "HOW A GENERIC VALUE GETS RENDERED").
+
+* **THE RAW-`T`-RUNS ASYMMETRY WAS THE WHOLE DIAGNOSIS.** `monoArgTyName` has three channels
+  and the first two ask the ARGUMENT NODE; a clone shares its leaf expressions, so `e`'s
+  recorded type is still the template's `Expectation<T>` and no pin rung claims it. The THIRD
+  channel reads the instance's own parameter annotation — which HAS been substituted, measured
+  at the refusal as `Expectation<i32>` — but sits behind a `monoAnnIsCloPin` gate written for
+  a function-VALUED forwarder and never widened. A raw `T` forward is claimed earlier by the
+  rep cascade; a generic STRUCT carrier had nothing but that gate.
+
+  So the answer was one read away, behind a gate only closures could open. A generic
+  application is now pinned by its own SPELLING — the same argument `monoAnnPinName`'s variant
+  rung makes: `e: Expectation<i32>` is an annotation a NON-generic function already lowers end
+  to end, so the instance lands on the working path rather than beside it.
+
+* **POSITION MATTERED AND A LAST RESORT DOES NOT WORK.** The rung was first written at the
+  bottom of the cascade, where it never fired: several arms above `return ""` outright, so the
+  `"i32"` catch-all is not in fact the only way out and there is no reachable bottom. Placing
+  it at the third channel — beside the read it generalises — is what makes it reachable.
+
+* **THE FIXTURE FORWARDS A VALUE, NOT JUST A TYPE.** Besides the row's witness it takes the
+  negated arm (so the hop is carrying the FIELD) and reads the carrier's payload back at its
+  own type through a second forwarder.
 
 ### D942 — [CLOSED 2026-09-01 by D950's fix] `is string` on a value read from a generic struct FIELD answers TRUE for a struct T
 
