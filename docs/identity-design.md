@@ -1,15 +1,74 @@
 # Reference identity in VL — `===`, `IdentityMap`, `IdentitySet`
 
-**Status: PROPOSAL, 2026-09-01 — awaiting cross-examination.** Written by the tooling
-track at the owner's request; this is the language question serde decision D split off
-(`docs/internals/serde-critique-synthesis.md`, OQ-11 in `docs/serde-design.md`), and it
-resolves the half of A15 that `DECISIONS.md` left as "would be `===` or `identical(a, b)` —
-deferred". Every fact below marked **(RUN)** was measured on the live seed on 2026-09-01;
-everything else is a claim to be examined.
+**Status: RULED, 2026-09-01.** The owner took the ten decisions in
+`docs/internals/identity-critique-synthesis.md` §4 one at a time; **§0 below is the ruling**
+and supersedes the proposal where they differ (P2, P4 and P5 are amended in place). Written
+by the tooling track at the owner's request; this is the language question serde decision D
+split off (`docs/internals/serde-critique-synthesis.md`, OQ-11 in `docs/serde-design.md`),
+and it resolves the half of A15 that `DECISIONS.md` left as "would be `===` or
+`identical(a, b)` — deferred". Every fact below marked **(RUN)** was measured on the live
+seed on 2026-09-01; the rest was examined by three critics and then ruled on.
 
 The owner's framing, verbatim: *"Reference identity keys are useful for cyclic dependencies,
 right? I think it does make sense to support referential equality. Can even use === for
 that? Similar to JS? Or is that a footgun?"*
+
+## 0. The ruling
+
+Ten decisions, in the synthesis's order, each as the owner ruled it. Build order and
+acceptance are in `ROADMAP.md` A15; the rationale is in `DECISIONS.md` A15.
+
+1. **Spelling: `===` / `!==`.** Kotlin kept `===` with structural `==` and retrofitted
+   diagnostics for the value-typed cases; Dart removed it. VL takes Kotlin's route knowing
+   Dart's, because the rep restriction (3) is a compile error at every JS-reflex site.
+2. **Operands: every reference rep** — struct, list/array, map, function value, or a nullable
+   of one — and a **union of struct arms compares the PAYLOAD**, never the per-widening-site
+   `{tag, payload}` box: `u === u` is `true` outside an `is` guard. Rides D989's unboxing.
+3. **Scalars and `string` are check errors**, and so is any union with a scalar/string arm —
+   one template, three arms, rendered at the USER's spelling (a newtype `Id` prints as `Id`,
+   never as the erased `string`). A string is a value in VL; `"ab" === "a" + "b"` being
+   `false` is exactly the surprise the rule forbids.
+4. **`null === null` is `true`, statically.** `x === null` is legal and gets a hint pointing
+   at `== null`. No prerequisite: the static fold already exists for `==` (D1018, #2279).
+5. **`Map`/`Set` keys: key-eligible = `==`-comparable.** The Rust-style field restriction
+   (no `f64`, no lists) was REFUSED — everything `==` accepts keys. Hash and `==` share ONE
+   lowering (D1017 is why that matters). Consequences go in the `Map` header rather than
+   being special-cased: a NaN inside a struct key is inserted and never found (IEEE; Go's
+   behaviour — JS `Map` and Java special-case NaN, VL keeps one relation), the hash folds
+   `-0.0` into `0.0` so `0.0 == -0.0` finds its entry, a key mutated after insertion is lost.
+6. **`IdentityMap<K, V>` / `IdentitySet<K>` are concrete types that SATISFY `{[K]: V}`.**
+   The critics' F9 ("off the interface") was refused: the index signature is the CAPABILITY
+   that both `Map` and `IdentityMap` provide, and a signature names `Map<K, V>` or
+   `IdentityMap<K, V>` when it wants the specific one. Two things the ruling asked for do
+   not exist today and are build items: the concrete names as annotation types
+   (`Map<string, i32>` is `unknown type` today — only `{[string]: i32}` works) and TS-style
+   explicit type arguments on a call (`Map<string, i32>()` is a parse error today; `Set<T>`
+   itself is C2.2, unbuilt).
+7. **`K` for the identity containers = anything `===` accepts** — struct, list, map,
+   function, nullable, union of struct arms. `flat` classes (field order is byte layout)
+   get no serial slot and stay on the scan. And, ruled here because it fell out of (2):
+   **functions compare only by `===`.** `==` on two functions becomes a check error
+   pointing at `===`, and a struct with a function field refuses `==` by field name (Go's
+   rule). Today's `==` lowering on functions (table index + `ref.eq` on the captured
+   environment) becomes the `===` lowering: `mk(1) === mk(1)` is `false` with equal
+   captures; `const a = f; const b = f; a === b` is `true`.
+8. **Generics refuse per instance, at the call, on the offending argument** — the body's
+   `===` is an inferred constraint on `T` like `+` is today
+   (`operator '+' is not defined for boolean and boolean (the call's argument types)`).
+   **A newtype has exactly its base's identity**: over a struct, `===` is identity of the
+   underlying object; over a scalar or string it is (3)'s error rendered as the brand name;
+   cross-brand `===` rejects like every mixed-brand operator.
+9. **Six doc corrections**, all made in the same PR as this section: "A custom `==`
+   overrides" deleted (there is no custom `==` — `function "=="` is a parse error); the A15
+   bullets rewritten; §3 below cites Kotlin only (Swift's `===` is `AnyObject`-restricted, a
+   different shape) with the Dart note; `Map` joins the `===` operand list; OQ-11 closes;
+   key-eligibility text says `==`-comparable.
+10. **Ship the flat scan first; the serial only when a program measures the scan as a
+    problem.** The API is identical either way, so nothing waits on it. When built: lazy
+    `i64` on a private heap type per keyed class (the `repCanonKey` seam), 0 = unassigned,
+    mixed through `fbI32HashMix`, resolved by `ref.eq` (a SEED, never an identity);
+    prerequisite is a declared-vs-rep field split in the emitter; acceptance is the
+    synthesis's §2c four cells plus the N/4N timing probe.
 
 ## 1. What is already true
 
@@ -67,27 +126,33 @@ WasmGC, so `"ab" === "a" + "b"` would be `false` — exactly the surprise the ru
 forbid), and any union with a scalar or string arm (whose rep may be an unboxed niche or a
 `{tag, payload}` box, neither of which answers identity). A union of struct arms is fine.
 
-**P2. `==` is unchanged.** Structural on data, identity on functions (A15, already live).
-`===` on a function value means what `==` already means there; the operator is still
-admitted so that generic code can spell "same closure" without knowing whether `T` is data.
+**P2. `==` is unchanged.** ~~Structural on data, identity on functions (A15, already live).~~
+**AMENDED by ruling 7:** `==` is structural on DATA ONLY; on a function value it is a check
+error pointing at `===`, and a struct with a function field refuses `==` by field name.
+`===` on a function value is what `==` used to mean there (table index + env `ref.eq`).
 
 **P3. `Map`/`Set` keys over structs are STRUCTURAL.** Consistent with `==` and with the
 collections design's "membership keyed by element value". The structural hash walks the
 same shape the serde derive walks — one mechanism, two customers. (The unbuilt part today is
-the struct-key lowering, not a decision.)
+the struct-key lowering, not a decision.) **Ruling 5 fixes the eligibility:** any
+`==`-comparable type keys — `f64`, lists and nested structs included — with the NaN,
+`-0.0` and mutable-key consequences in the `Map` header.
 
 **P4. `IdentityMap<K, V>` and `IdentitySet<K>` are the identity-keyed containers** — Java's
-`IdentityHashMap` split, not an option on `Map`. `K` must be a struct type, a union of
-struct types, or a nullable of one. The compiler is whole-program, so it can give a hidden
-**serial field** to *exactly* the struct types that are identity-keyed somewhere in the
-program, assigned from a global counter at construction. Cost: one extra field and one
-counter increment per allocation **of those types only**; zero for every other type.
+`IdentityHashMap` split, not an option on `Map`. ~~`K` must be a struct type, a union of
+struct types, or a nullable of one.~~ **AMENDED by rulings 6, 7 and 10:** `K` is anything
+`===` accepts; both containers SATISFY `{[K]: V}` / the sequence read core; v1 is a flat
+`ref.eq` scan on the existing map struct, and the hidden serial — lazy `i64`, per keyed
+class, on a private heap type — is built only when a program measures the scan as a
+problem. The whole-program observation stands: the serial, when built, costs exactly the
+identity-keyed classes and nothing else.
 
-**P5. Consequences accepted up front.** Arrays, maps and function values have nowhere to put
-a serial (uniform element type; no user-visible closure struct), so in v1 they are
-`===`-comparable but **not identity-keyable** — a check error naming the limitation, never a
-silent linear probe. The serializer's cycle seen-set (serde decision D) is an
-`IdentitySet<T>` on the path where the static acyclic-shape predicate fails.
+**P5. Consequences accepted up front.** ~~Arrays, maps and function values … are
+`===`-comparable but not identity-keyable — a check error naming the limitation, never a
+silent linear probe.~~ **AMENDED by rulings 7 and 10:** they ARE identity-keyable, and v1 is
+the linear scan for every `K` — announced in the header, not silent. The serializer's cycle
+seen-set (serde decision D) is an `IdentitySet<T>` on the path where the static
+acyclic-shape predicate fails.
 
 **P6. Spelling alternatives, and why not.** Python's `is` collides with VL's narrowing
 keyword. `identical(a, b)` is the fallback if the cross-examination judges `===` a footgun:
@@ -98,18 +163,24 @@ it costs nothing in semantics, only in ergonomics. Making `==` mean identity on 
 
 In JS, `===` vs `==` is about **coercion**; both are reference equality on objects. VL's `==`
 does not coerce, so a VL `===` would mean something JS's never did — **identity versus
-structure**. That is Swift's split (`==` Equatable / `===` object identity, restricted to
-`AnyObject`) and Kotlin's (`==` equals / `===` referential), both with structural `==` like
-ours, both used by large JS-adjacent populations without incident. The trap to avoid is
-OCaml's: `=` structural, `==` physical, and the *short* spelling is the wrong one. `===` is
-the longer, rarer operator for the rarer operation.
+structure**. That is Kotlin's split (`==` equals / `===` referential), structural `==` like
+ours, used by a large JS-adjacent population — Kotlin kept it and retrofitted diagnostics
+for `===` on value-typed operands, which is what P1's rep restriction does from day one.
+(Swift's `===` is restricted to `AnyObject` and is a different shape; the earlier draft
+cited it and the crosslang critique corrected that. Dart went the other way and removed
+`===` — the choice here is made knowing both.) The trap to avoid is OCaml's: `=`
+structural, `==` physical, and the *short* spelling is the wrong one. `===` is the longer,
+rarer operator for the rarer operation.
 
 The residual footgun is JS reflex — writing `===` everywhere. P1's rep restriction turns
 `x === 1` and `s === "a"` into compile errors rather than wrong answers; what survives is
-`p === q` on two value-shaped structs, which is the Swift/Kotlin situation and is
-answerable by the error message pointing at `==`.
+`p === q` on two value-shaped structs, which is the Kotlin situation and is answerable by
+the error message pointing at `==`.
 
 ## 4. Costs and unknowns the examination should press on
+
+(Each of these was examined — `docs/internals/identity-critique-{perf,consistency,crosslang}.md`
+— and ruled; §0 carries the answers. Kept as the questions that were asked.)
 
 1. **`ref.eq` and Heap2Local.** An identity compare may pin an allocation that binaryen's
    Heap2Local would otherwise scalarise. One `wasm-opt` run settles it; it should be run,
@@ -133,10 +204,12 @@ answerable by the error message pointing at `==`.
    narrowed-union rep is a `{tag, payload}` box in some positions (D972/D973) and a bare ref in
    others; the operator must compare the *object*, never the box.
 
-## 5. What a ruling would record
+## 5. What the ruling recorded
 
-The A15 remainder in `DECISIONS.md` becomes: identity is spelled `===`/`!==`, reference reps
-only; `Map`/`Set` keys structural; `IdentityMap`/`IdentitySet` for identity keying via a
-whole-program serial field. OQ-11 in `docs/serde-design.md` closes. `ROADMAP.md` A15 lists
-the four build items: the operator + checker rule, the struct-key lowering for `Map`/`Set`,
-the serial injection, and the two containers.
+The A15 remainder in `DECISIONS.md` now reads: identity is spelled `===`/`!==`, reference
+reps only, functions included and `==` on them an error; `Map`/`Set` keys structural and
+`==`-comparable; `IdentityMap`/`IdentitySet` as concrete types satisfying `{[K]: V}`, flat
+scan first, serial when measured. OQ-11 in `docs/serde-design.md` is closed. `ROADMAP.md`
+A15 lists five build items in ship order: the operator + checker arms (→ vl-de, value-table
+acceptance), the struct-key lowering, `Set<T>` + concrete type names + explicit type
+arguments, the two containers on the scan, and the deferred serial with its prerequisite.

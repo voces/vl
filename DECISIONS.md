@@ -829,13 +829,50 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   `Unknown`/`Infer` are inference _holes that resolve_ to concrete types — there
   is no gradual/untyped escape hatch. Blueprint: Elixir v1.20 set-theoretic
   types. (A0)
-- **`==`/`!=` are structural (by value) by default.** `{x:1} == {x:1}` is `true`
-  — consistent with numerics and strings and VL's value semantics.
-  Function-valued fields compare _by reference_ (same function + same captured
-  env): "data by value, functions by identity." A custom `==` overrides. (A15)
-- **Referential identity gets its own spelling.** `is` is reserved for
-  type-narrowing, so an O(1) `ref.eq` identity check would be `===` or
-  `identical(a, b)` — deferred. (A15)
+- **`==`/`!=` are structural (by value), and DATA-ONLY.** `{x:1} == {x:1}` is `true`
+  — consistent with numerics and strings and VL's value semantics. A function value
+  has no structural equality (extensional equality is undecidable; comparing captured
+  VALUES would be a third relation nobody has), so `==` on two functions is a CHECK
+  ERROR pointing at `===`, and a struct with a function field refuses `==` by field
+  name (Go's rule). There is no custom `==` — `function "=="` is a parse error (D46).
+  (A15; functions RE-RULED 2026-09-01 — they had compared "by reference" under `==`,
+  which was identity wearing the structural operator.)
+- **Referential identity is `===`/`!==` — one `ref.eq`, reference reps only.** Owner
+  ruling 2026-09-01, ten decisions taken one at a time over `docs/identity-design.md`
+  (§0 carries them) and its three-lens critique
+  (`docs/internals/identity-critique-synthesis.md`). Operands: struct, list/array, map,
+  function value, or a nullable of one. A union of struct arms compares the PAYLOAD,
+  never the per-widening-site box (`u === u` must be `true` outside an `is` guard). A
+  function is the same iff same table index AND the same captured-environment object:
+  `mk(1) === mk(1)` is `false` with equal captures, `const a = f; const b = f; a === b`
+  is `true` — the closure struct is per-binding and is NOT what is compared.
+  `null === null` is `true`, statically; `x === null` gets a hint pointing at `== null`.
+  Scalars, `string` (a value in VL) and any union with a scalar/string arm are check
+  errors — one template, three arms, rendered at the user's spelling (`Id`, never the
+  erased `string`). Kotlin kept `===` and retrofitted these diagnostics; Dart removed
+  it; the choice is made knowing both. Generics: a body's `===` is an inferred
+  constraint on `T`, reported at the call on the offending argument like every
+  operator. A newtype has exactly its base's identity (the brand is erased);
+  cross-brand `===` rejects like every mixed-brand operator. A list's identity is its
+  `{backing, len, cap}` header's — §VL.7's header-less rep inherits that as a
+  constraint. (A15)
+- **Keys: `Map`/`Set` keys are STRUCTURAL, and key-eligible = `==`-comparable.** Every
+  field kind `==` accepts keys — `f64`, lists, nested structs included; the key hash and
+  `==` share ONE lowering (D1017 is why). Consequences recorded rather than
+  special-cased, all three in the `Map` header: a struct key holding a NaN is inserted
+  and never found (IEEE — Go's behaviour; JS `Map` and Java special-case it, VL keeps
+  one relation); the hash folds `-0.0` into `0.0` so `0.0 == -0.0` finds its entry; a
+  key mutated after insertion is lost (Java's rule). **`IdentityMap<K, V>` /
+  `IdentitySet<K>` are the identity-keyed containers** — separate concrete types with
+  `Map`/`Set`'s whole surface, `K` = anything `===` accepts, and BOTH satisfy the
+  index-signature interface: `{[K]: V}` is the CAPABILITY, not the implementation, and
+  a signature names `Map<K, V>` or `IdentityMap<K, V>` when it wants the specific one
+  (the concrete names become annotation-legal and `Map<string, i32>()` parses
+  TS-style as part of this — neither exists today). Rep: the existing 7-field map
+  struct with `ref.eq` as the probe compare; v1 is a flat scan, and the lazy `i64`
+  per-class serial is the optimisation that follows ONLY WHEN MEASURED NECESSARY — the
+  API is identical, so nothing waits on it. Identity keys keep their objects alive;
+  there are no weak references. (A15)
 - **Bare literals default to their base type.** `let x = 0` is `i32`, not the
   singleton `0`; the literal type survives only via an explicit annotation
   (`let x: 0 | 1`). (A16)
