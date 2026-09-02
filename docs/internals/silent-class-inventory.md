@@ -30177,6 +30177,29 @@ Repro (loud emit reject):
     const b: T = { v: 1, kids: [{ w: 2 }] }
     print(a == b)
 
+* **THE LADDER'S SHAPE IS THE BLOCKER, and it is architectural rather than a missing arm.**
+  `emitStructEqFieldInner` dispatches on the field code: 0/21/30 scalars, 17 f64, 3 i64, 15 a
+  NESTED STRUCT, 4 a scalar list, 14 a closure. A ref-array field (code 5) has no arm and
+  falls to the floor — but adding one is not symmetric with the others, because of HOW code 15
+  recurses.
+
+* **`emitStructEqRec` IS PATH-BASED.** Its signature is
+  `(body, lRoot, rRoot, si, pathSi[], pathFi[], fnIx)`: it re-emits both ROOT expressions and
+  walks a STATIC field path down to the pair being compared. A nested struct field is exactly
+  that shape — one more `pathFi` entry. **An array ELEMENT is not**: its index is a loop
+  variable, so no static path reaches it, and the two values needing comparison are on the
+  stack rather than at the end of a path.
+
+* So closing this needs a VALUE-based struct compare — two struct refs, already materialised —
+  which does not exist today: every entry point here (`emitStructEq`, `…Rec`, `…Field`,
+  `…FieldInner`) is rooted in a binary expression. Build that first and code 5 becomes the
+  code-4 loop skeleton verbatim (length guard, index scratch, early-exit block) with the
+  element compare swapped in.
+
+* Ablation confirmed here: `L[] == L[]` runs, `{kids: i32[]}` runs, `{kids: L[]}` refuses. The
+  list comparison and the struct comparison each work alone; only their composition at FIELD
+  position has no path.
+
 ### D1018 — `==` between two operands of the bare `null` TYPE refused at emit; give either side a `T | null` and it ran
 
 **closed · was a loud emit reject · clause 2 · `tests/cases/unions/bare-null-equality.vl` (#2279: both sides bare `null` makes the answer STATIC, so the equality emitter answers before either operand is lowered — no rep was needed) · was: check rc 0 · `emitProgram: bare null needs a struct-typed context` (`compiler/wasmEmit.vl:21666`, the bare-`null` value emitter's fall-through when no struct seed is pending — the SAME literal D20's residual and the 164-cell module-scope family report, but a different mechanism: those cells all HAVE a `T | null` and lose it through a capture or a scope; this cell never had a `T`) · `DECISIONS.md` A-infer-null: "an unconstrained `let x = null` resolves to `null`", so the type is one the design names and the checker is right to accept it · probe `scripts/capability-probes/bare-null-equality.vl` (20 of 22 run on 2026-09-01) · found by the identity proposal's consistency critique (`docs/internals/identity-critique-consistency.md` F10, which noted `null === null` would be a NEW capability because `null == null` refuses), ablated 2026-09-01**
