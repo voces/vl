@@ -1083,6 +1083,36 @@ let memCstrProp: string[] = []
 let memCstrIx: i32[] = []
 let memCstrFn: i32[] = []
 
+// DEFERRED UFCS-RECEIVER constraints — the NINTH deferred table, and the receiver's half of
+// the question `memCstrTy` asks about `.length` / `x[i]`. `ufcsCallTy` gates dispatch on
+// `assignable(recvTy, params[0])`, and `assignable` answers TRUE for a `TyVar` on EITHER
+// side — deliberately, since a `T` pinned to the self-function's receiver type is exactly
+// what the call is for. So inside a generic body the selection is made by NAME ALONE and
+// the receiver's FIT is never re-asked at the pin: `g<T>(x: T) { x.toString() }` beside
+// `toString(self: Circle)` is `vl check` rc 0 at `g({s: 2.0})` and INVALID WASM, while the
+// one-annotation-different direct spelling `const v = {s: 2.0}  v.toString()` is a
+// positioned `no field 'toString' on {s: f64}`. Clause 1 in the direction that hides.
+//
+// `ufcsCstrP0` is the SELF-FUNCTION's parameter-0 type — the contract the pin re-asks
+// against. Kept beside the row rather than re-resolved from the name at the pin, because
+// the name is the PLAIN property and the function it selected is the merge-mangled one; the
+// row banks the answer `ufcsCallTy` already had.
+//
+// THE FIELD-PRECEDENCE GUARD IS WHAT MAKES THE PIN SAFE TO RAISE. A callable FIELD of that
+// name wins over UFCS at every concrete spelling (`drwWalk`'s `sFieldIndex` arm, and
+// `emitCall`'s `exprIsClosure` rung), so an instantiation whose substituted receiver carries
+// the field is a FIELD call and this constraint does not speak about it at all. Asked of the
+// SUBSTITUTED receiver with `tyFieldTyOf` — measured 2026-09-02: for `Boxed = {r: f64,
+// toString: () => string}` the substituted `ur` renders `Boxed`, IS a `TyObj`, and answers
+// the field, so `memberFloorMsg(ur, "toString")` is EMPTY. (An earlier attempt recorded that
+// this floor answered `no field 'toString' on Boxed` and concluded no guard could be
+// written; that reading was of a receiver the pin does not carry.)
+let ufcsCstrTy: i32[] = []
+let ufcsCstrProp: string[] = []
+let ufcsCstrIx: i32[] = []
+let ufcsCstrFn: i32[] = []
+let ufcsCstrP0: i32[] = []
+
 // SOLVED un-annotated parameter types — the parameter's own body USAGE, read back as
 // its type. A hole is permissively assignable both ways, so a usage that requires a
 // concrete type (`const r: K = u`, `return u` under a declared return, `q(u)` into an
@@ -3402,6 +3432,11 @@ export function initChecker() {
   memCstrProp = []
   memCstrIx = []
   memCstrFn = []
+  ufcsCstrTy = []
+  ufcsCstrProp = []
+  ufcsCstrIx = []
+  ufcsCstrFn = []
+  ufcsCstrP0 = []
   solvedParamTys = Map()
   paramSolveTried = Map()
   holeFlowSrc = []
@@ -19490,6 +19525,31 @@ function noteMemCstr(recv: i32, prop: string, ix: i32) {
   0
 }
 
+// Record a deferred UFCS-RECEIVER constraint when the receiver still carries a hole — the
+// body cannot decide whether `T` is a receiver this `self`-function takes, so the generic
+// call site re-asks it under substitution. Stamped with the OWNING declaration for
+// `noteMemCstr`'s reason: `substTyDeep` matches TyVars by NAME, so an unowned row would let
+// one generic's receiver adjudicate a sibling's call.
+function noteUfcsCstr(recv: i32, prop: string, ix: i32, p0: i32) {
+  if recv < 0 { return 0 }
+  if tyHasHole(recv) {
+    const owner = cstrOwnerTop()
+    let k = 0
+    while k < ufcsCstrTy.length {
+      if ufcsCstrTy[k] == recv && ufcsCstrProp[k] == prop {
+        if ufcsCstrFn[k] == owner && ufcsCstrP0[k] == p0 { return 0 }
+      }
+      k = k + 1
+    }
+    ufcsCstrTy.push(recv)
+    ufcsCstrProp.push(prop)
+    ufcsCstrIx.push(ix)
+    ufcsCstrFn.push(owner)
+    ufcsCstrP0.push(p0)
+  }
+  0
+}
+
 // THE INTEGER-ONLY OPERATORS — the bitwise ops, the shifts, and `%`. ONE list, read by
 // `checkBinary`'s reject and by `binOpDefinedFor`'s pin mirror, because those are the two
 // homes that have to agree about it and they drifted apart precisely by holding the list
@@ -20459,6 +20519,71 @@ function validateBmCstrs(
 // a scalar element): the argument gate cannot see it either, so that cell stays exactly as it
 // is today. BOUND, stated rather than discovered later; no cell of `lengrid.py`, of the
 // distilled corpus or of `tests/cases` reaches it.
+// Do the deferred UFCS-RECEIVER constraints this binding resolves hold? The ninth table's
+// pin — see `ufcsCstrTy`'s header for why `ufcsCallTy` cannot decide it in the body.
+//
+// THREE ANSWERS, in this order, and the order IS the language's dispatch precedence:
+//   1. the substituted receiver still carries a hole → RE-DEFER under the caller's hole,
+//      exactly as `validateMemCstrs` does (a generic body relaying into a second generic);
+//   2. the substituted receiver has a FIELD of that name → this instantiation is a FIELD
+//      call, not a UFCS one, and the constraint does not speak about it. Field precedence is
+//      asked of ANY field, not only a callable one, because that is what `drwWalk` asks
+//      (`sFieldIndex`) — a non-callable field of that name is a different diagnosis and the
+//      concrete spelling owns it;
+//   3. otherwise the receiver must FIT the `self` parameter, and the message is the DIRECT
+//      spelling's own (`memberFloorMsg`), for the reason `memCstrTy`'s header gives: the two
+//      spellings are one annotation apart and must be one sentence apart. The contract the
+//      receiver missed rides the clause after it, so the reader is told what `self` takes
+//      rather than only what the substituted type lacks.
+function validateUfcsCstrs(
+  bNames: string[],
+  bTys: i32[],
+  ix: i32,
+  calleeFn: i32,
+  who: string,
+) {
+  const nOrigU = ufcsCstrTy.length
+  let ci = 0
+  while ci < nOrigU {
+    if cstrOwnedBy(ufcsCstrFn[ci], calleeFn) {
+      const ur = substTyDeep(ufcsCstrTy[ci], bNames, bTys)
+      if calleeFn >= 0 {
+        if ur != ufcsCstrTy[ci] {
+          if tyHasHole(ur) {
+            noteUfcsCstr(ur, ufcsCstrProp[ci], ufcsCstrIx[ci], ufcsCstrP0[ci])
+          }
+        }
+      }
+      if !tyHasHole(ur) {
+        // FIELD PRECEDENCE — clause 2 above.
+        if tyFieldTyOf(ur, ufcsCstrProp[ci]) < 0 {
+          if !assignable(ur, ufcsCstrP0[ci]) {
+            let uMsg = memberFloorMsg(ur, ufcsCstrProp[ci])
+            if uMsg == "" {
+              uMsg = "no method '." + ufcsCstrProp[ci] + "' on " + tyToStr(ur)
+            }
+            let uWho = "the callee's body"
+            if who != "" { uWho = "the body of `" + who + "`" }
+            tErr(
+              uMsg +
+                " — the `" +
+                ufcsCstrProp[ci] +
+                "` in scope takes " +
+                tyToStr(ufcsCstrP0[ci]) +
+                " (" +
+                uWho +
+                " at the call's argument types)",
+              ix,
+            )
+          }
+        }
+      }
+    }
+    ci = ci + 1
+  }
+  0
+}
+
 function validateMemCstrs(
   bNames: string[],
   bTys: i32[],
@@ -22578,6 +22703,10 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
     if uDecl.length == params.length - 1 { uRequired = fnRequiredArity(uDecl) }
     if args.length < uRequired || args.length + 1 > params.length { return -1 }
     if !assignable(recvTy, params[0]) { return -1 }
+    // THE VACUOUS HALF OF THAT GATE, deferred. `assignable` answers TRUE for a `TyVar` on
+    // either side, so a hole receiver has just passed a test that asked nothing; the row
+    // makes the call site ask it for real. See `ufcsCstrTy`'s header.
+    noteUfcsCstr(recvTy, plainName, ix, params[0])
     // NAMED arguments (`5.scale(plus: 1, by: 2)`): the receiver is an unnamed
     // slot-0 positional, so the explicit args bind against the parameter names
     // AFTER `self`, in PARAMETER order (host: `orderArgumentsByParameters` over
@@ -22737,6 +22866,16 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
         // UFCS half for the reason the five above are here: `p.g()` and `g(p)` are the same
         // call and must answer the same way. (`silent-class-inventory` D651 / D691.)
         validateMemCstrs(
+          bNames,
+          bTys,
+          ix,
+          fnDeclIx[name] ?? CSTR_NODECL,
+          plainName,
+        )
+        // And the RECEIVER of a UFCS `self`-method resolved inside the body, at the UFCS
+        // half for the reason the six above are here: `p.g()` and `g(p)` are the same call
+        // and must answer the same way. (`silent-class-inventory` D1005.)
+        validateUfcsCstrs(
           bNames,
           bTys,
           ix,
@@ -24036,6 +24175,7 @@ function checkCallNode(n: Call, ix: i32) {
       // — correctly, since a `T` pinned to a collection has it — and this is the first
       // position that knows which rep `T` became. (`silent-class-inventory` D651 / D691.)
       validateMemCstrs(bNames, bTys, ix, cstrCallee, cstrWho)
+      validateUfcsCstrs(bNames, bTys, ix, cstrCallee, cstrWho)
       // And the BOUNDS the callee declared, judged HERE — in this site's own scope,
       // against the types this site bound. It sits with the deferred-constraint
       // validators because it is the same shape of question they answer (a body
