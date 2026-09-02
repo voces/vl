@@ -1963,6 +1963,24 @@ function monoNoteLamNode(xs: i32[], v: i32) {
   0
 }
 
+// D1116 — THE LIFTED SLOTS MINTED WHILE WALKING ONE LAMBDA'S BODY BELONG TO THAT LAMBDA'S
+// CLONE, not to the enclosing instance. `monoMakeInstance` re-points every slot still standing
+// in `monoLamMintedSlots` at the instance function, which is right for a lambda bound directly
+// in the instance body and wrong one frame down: a nested clone's free names resolve up the
+// chain THROUGH the lambda that encloses it, and `captureValKind` types an env field by that
+// chain. Re-point the run from `mark` on, then retire each entry (-1, which the instance loop
+// already skips) so the outer pass cannot undo it.
+function monoReparentNestedLams(mark: i32, parentSlot: i32) {
+  let k = mark
+  while k < monoLamMintedSlots.length {
+    const s = monoLamMintedSlots[k]
+    if s >= 0 && s < fnParent.length { fnParent[s] = parentSlot }
+    monoLamMintedSlots[k] = -1
+    k = k + 1
+  }
+  0
+}
+
 // The lexical frame a lifted function's slot records (`fnParent`), found from its arena node.
 // -1 when the node holds no lifted slot, which is the value `collectFns` itself pushes for a
 // module-scope lift.
@@ -2117,7 +2135,19 @@ function monoCloneLambdaSubst(
     // a SPELLING the body carries rather than a type anything re-derives. Substituted through
     // the same copy-on-write walker the enclosing instance body uses, so a lambda with no
     // type-parameter spelling in it returns the SAME node index and keeps sharing.
-    const nbody = monoFoldTyParamLayout(a.fnBody, typarams, tvN, tvV)
+    const nbodyF = monoFoldTyParamLayout(a.fnBody, typarams, tvN, tvV)
+    // D1116 — A LAMBDA NESTED INSIDE THIS ONE IS A TEMPLATE TOO, and `monoPinBodyLambdas`
+    // walks only the INSTANCE body's spine, which reaches `const g = …` and stops at its
+    // FuncDecl. `const g = () => { const h = () => v; h() }` therefore minted a fresh slot for
+    // `g` per instance and left `h` on the one lifted slot every instance shares — D943's env
+    // defect exactly, one frame down: at `T := i32` `h`'s env is `(struct (field i32))` and the
+    // `T := string` instance emits `struct.new` of a string ref into it.
+    //
+    // Recursing here rather than teaching `monoPinBodyLambdas` a FuncDecl-initializer arm is
+    // what keeps the two facts a clone owns together: the body substitution above and the
+    // frame the nested clones hang off (`monoReparentNestedLams`, below the push).
+    const mark = monoLamMintedSlots.length
+    const nbody = monoPinBodyLambdas(nbodyF, typarams, tvN, tvV, bN, bT)
     const clone = mkFunc(nm, noTP, ps, nret, nbody, a.pos)
     // D1046 — THE FIRST INSTANCE OF A NAMED NESTED FUNCTION REPLACES THE TEMPLATE'S
     // SLOT rather than pushing beside it. See `monoInstIsFirst`: the by-name lookup
@@ -2131,6 +2161,7 @@ function monoCloneLambdaSubst(
         fnStmts[tSlot] = clone
         monoNamedTmplNode.push(fnIx)
         monoNamedTmplSlot.push(tSlot)
+        monoReparentNestedLams(mark, tSlot)
         fnValUsed = true
         monoNoteLamNode(monoLamPinned, fnIx)
         return clone
@@ -2143,7 +2174,9 @@ function monoCloneLambdaSubst(
     // `.map` callback is rebuilt from an ARGUMENT position, not from a lifted slot that has
     // a frame of its own.)
     fnParent.push(monoLamParentOf(fnIx))
-    monoLamMintedSlots.push(fnStmts.length - 1)
+    const mySlot = fnStmts.length - 1
+    monoReparentNestedLams(mark, mySlot)
+    monoLamMintedSlots.push(mySlot)
     fnDispNames.push("")
     fnValUsed = true
     monoNoteLamNode(monoLamPinned, fnIx)
