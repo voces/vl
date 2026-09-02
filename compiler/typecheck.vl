@@ -26251,7 +26251,26 @@ function fillTypeDeclAt(sx: i32) {
             // rendered types per side, and the STRICT structural walk finds 0
             // disagreements — while `tyEq` finds 0 under a sabotage the strict
             // walk catches 547 times, which is why the walk is the comparator.
-            const m = annotResolve(variants[vi], udTsRootAt(sx, vi))
+            let m = annotResolve(variants[vi], udTsRootAt(sx, vi))
+            // D1022 — A MEMBER BLOCKED BY A DECLARATION CYCLE FALLS BACK TO ITS PLACEHOLDER,
+            // rather than being dropped. `type JO = { [string]: J }` before
+            // `type J = null | f64 | JO` makes `JO`'s fill demand `J`'s, which is in progress,
+            // so `annotResolve` answers -1 — and the `m >= 0` gate below silently DROPPED the
+            // arm. `J` then WAS `f64 | null`: not the type the program declares, so `is JO`
+            // was "not a variant of f64 | null" and a `JO` value could not be pushed into a
+            // `J[]`. Two diagnostics, both true of a union nobody wrote.
+            //
+            // Pass 0a already registered a placeholder for EVERY declaration precisely so a
+            // forward reference has something to name (`cFillStmtIx`'s own header says so),
+            // and the arena is built to hold a cycle — a recursive union spelled
+            // STRUCTURALLY resolves through the same placeholders and always worked. This
+            // reaches for that placeholder instead of losing the member: the only spellings
+            // it changes are the ones that were dropping an arm.
+            if m < 0 {
+              const phName = variants[vi]
+              const ph = cUserTypes[phName] ?? -1
+              if ph >= 0 { m = ph }
+            }
             if m >= 0 {
               declMemberIxs.push(m)
               resolvedAny = true
@@ -26260,7 +26279,26 @@ function fillTypeDeclAt(sx: i32) {
               // (`0 | (1 & !1)` is `0`); a declaration with NO surviving
               // member is the never-value HARD ERROR below (host PR #189:
               // errors at the declaration even when unused).
-              if !isNeverTy(m) {
+              // D1022 — AN UNFILLED PLACEHOLDER IS NOT `never`, and dropping it as one is
+              // what made a declaration ORDER decide a type. `type JO = { [string]: J }`
+              // before `type J = null | f64 | JO` leaves `JO`'s placeholder EMPTY while `J`
+              // is being filled, an empty union reads as `never`, and the arm was dropped —
+              // so `J` WAS `f64 | null`, not the type the program declares. `is JO` then
+              // reported "not a variant of f64 | null" and a `JO` value could not be pushed
+              // into a `J[]`: two true diagnostics about a union nobody wrote.
+              //
+              // Pass 0a registers a placeholder for EVERY declaration precisely so a forward
+              // reference has something to name, and the arena is built to hold a cycle — the
+              // STRUCTURALLY spelled tree resolves through the same placeholders and always
+              // worked. The never-drop is for an empty INTERSECTION (`A & B` over disjoint
+              // operands), which is a resolved answer; a placeholder mid-fill is not an
+              // answer yet.
+              let mPlaceholder = false
+              const mDecl = cFillStmtIx[variants[vi]] ?? -1
+              if mDecl >= 0 {
+                if !fillDone(mDecl) { mPlaceholder = true }
+              }
+              if !isNeverTy(m) || mPlaceholder {
                 surviving.push(m)
                 if m == TY_NULL { sawNull = true } else { nonNull.push(m) }
               }

@@ -30938,7 +30938,11 @@ alias INSIDE another union that has no rep.
 ---
 ### D1022 — an ALIAS naming an arm of a recursive union is not a member of it: `type JsonObject = {[string]: Json}` refuses at check inside the tree, and at emit as a `Map()` binding outside it
 
-**loud check reject · clause 2 · `` `is` check type 'JsonObject' is not a variant of Json `` and `push: cannot add {[string]: Json} to Json[]` when the tree names the aliases; with the aliases declared AFTER a structurally-spelled tree the check passes and `let o: JsonObject = Map()` refuses in the EMITTER instead (`emitProgram: unsupported map value type (… interned no mv slot)`) · non-recursive control RUNS · ZERO corpus cells · found 2026-09-01 measuring the `std:json` v1 surface (`docs/json-design.md` §2.1), which wants `JsonObject` / `JsonArray` as the readable spellings of two arms**
+**loud EMIT reject (was a loud CHECK reject) · clause 2 · the CHECK half is FIXED
+2026-09-02 — a member blocked by a declaration cycle is no longer dropped as `never`, so the
+declared arm survives and the union is the type the program wrote; what remains is the emit
+rep for a recursive map VALUE, which the STRUCTURALLY spelled tree hits too and is therefore
+not an alias question · was: `` `is` check type 'JsonObject' is not a variant of Json ``**
 
 Repro:
 
@@ -30976,6 +30980,25 @@ this lands, changing no program's meaning — but every consumer's `is` chain re
 until then.
 
 ---
+
+* **THE CHECK HALF WAS A DECLARATION-ORDER BUG THAT SILENTLY BUILT A DIFFERENT TYPE.** Pass 0a
+  registers a placeholder for every declaration precisely so a forward reference has something
+  to name. `type JO = { [string]: J }` before `type J = null | f64 | JO` leaves `JO`'s
+  placeholder EMPTY while `J` is being filled — and an empty union reads as `never`, so the
+  union fill's never-drop threw the arm away. **`J` then WAS `f64 | null`.** Both diagnostics
+  were true of that union and neither was true of the one the program declares: `is JO` really
+  is not a variant of `f64 | null`, and a `JO` really cannot be pushed into its `J[]`.
+
+  The never-drop exists for an empty INTERSECTION (`A & B` over disjoint operands), which is a
+  RESOLVED answer. A placeholder mid-fill is not an answer yet, and the two were being read as
+  the same thing. Exempting it costs nothing on the corpus and moves the row to its emit face.
+
+* **WHAT IS LEFT IS NOT AN ALIAS QUESTION.** The remaining `emitProgram: unsupported map value
+  type` fires on the STRUCTURALLY spelled tree as well (`type J = null | f64 | {[string]: J}`
+  with a `Map()` binding), so it is the recursive map-VALUE rep, reachable with no alias in the
+  program at all. That is what to file or fix next; the alias spelling no longer adds anything
+  to it.
+
 ### D1023 — two struct arms with the same field names and reps but DIFFERENT literal-union field types are one arm to `is`: both tests answer `true`, and the narrowed access traps
 
 **loads then traps · check rc 0 · `wasm trap: cast failure` at the second narrowed field read, after the first arm printed · `r is A` and `r is B` both print `true` for one value · ZERO corpus cells · found 2026-09-01 by the `std:json` std-consistency critique (`docs/internals/json-critique-std.md` finding 1): `JsonError { at, kind, msg }` re-spends `Base64Error`'s shape, and `Base64Error | JsonError` — a base64-embedded JSON payload's natural error union — is this program · one ingredient: the two arms share every field NAME and REP; the literal SETS differing is not enough**
