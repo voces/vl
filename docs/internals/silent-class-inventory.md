@@ -31546,6 +31546,34 @@ Repro:
 
 ---
 
+* **NEITHER `Json` NOR RECURSION IS AN INGREDIENT — measured.** A plain two-struct union
+  (`type U = JsonError | Other`) refuses identically, and with no union in the program at all
+  the same field runs. So the ingredient is only "the field's type is a union ARM", which is
+  [D761](#d761)'s bound, and the `Json` in the witness is scenery.
+
+* **THE BLOCKING FIELD IS THE LITERAL-UNION ONE, bisected.** Same arm, same union, one field
+  list changed at a time: `{ r: i32 }` RUNS, `{ r: i32, s: string }` RUNS, `{ r: i32, k:
+  "syntax" }` **refuses**, and the full `JsonError` shape refuses. So a single literal-union
+  member is enough.
+
+* **AND A HAND-WRITTEN LAYOUT TWIN DOES NOT HELP**, which is the part that rules out the
+  obvious repair. D761 resolves an arm-typed field through `variantStructHeapTwinAt`, whose
+  whole premise is that the arm shares a heap with a standalone struct row of the same layout
+  ([D280](#d280)). Declaring `type JETwin = { at: i32, kind: "syntax", path: string, msg:
+  string }` beside it changes nothing. Instrumented: `repRowOfTyStruct(uVarTyIx[vi], …)`
+  answers **si = -1** — no row matches, because the lookup is keyed by EXACT arena index and
+  each `"syntax"` literal is its own arena type, so two identically-spelled litunion fields
+  are two types.
+
+* **SO THE FIX IS A REP DECISION, NOT A LOOKUP FIX.** The field wants `(ref null
+  $uVarHeap[vi])` and code 15 can only name a struct ROW (`sHeapIdx[si]`); **no field code in
+  the table names a variant heap** — checked against `pushFieldStorage`'s whole ladder. Two
+  routes, both structural: give the arm-typed field a code of its own that stores
+  `uVarHeap[vi]` (D1008's shape, with the same D965 delivery matrix to wire), or mint a
+  standalone struct row for an arm that has no twin and point `uVarHeap[vi]` at it, which is
+  what D280 already does wherever a twin exists. The second is smaller in the type section and
+  larger in the variant/struct table relationship.
+
 ### D1032 — a bare `return` is refused at EMIT when the function's result type is INFERRED non-void, and the thing that makes it non-void can be a tail `if` block ending in a `push`
 
 **runs, prints `1` — CLOSED 2026-09-02 by letting a BARE `return` in the body veto the
