@@ -4050,21 +4050,29 @@ function placeKeyOf(ix: i32) {
   if n is Index {
     const base = placeKeyOf(n.idxArr)
     if base == "" { return "" }
-    const lit = intLitTextOf(n.idxIndex)
+    const lit = subscriptKeyTextOf(n.idxIndex)
     if lit == "" { return "" }
     return base + "[" + lit + "]"
   }
   ""
 }
 
-// The DIGITS of an integer-literal subscript, or `""` when the node is not one. The
+// The KEY TEXT of a LITERAL subscript — the digits of an integer literal, the RAW LEXEME
+// (quotes and all) of a string literal — or `""` when the node is neither. The
 // spelling is the key, so `xs[0]` and `xs[00]` are different keys — over-conservative
 // in the harmless direction (two keys for one cell narrows less, never more), and no
 // program spells the same constant two ways in one guard.
-function intLitTextOf(ix: i32) {
+//
+// THE STRING LITERAL IS HERE BECAUSE A MAP SUBSCRIPT IS A STABLE PLACE FOR EXACTLY THE
+// REASON `xs[0]` IS (D1025). Without it `if m["a"] is string { const z: string = m["a"] }`
+// minted no key, so the guard narrowed nothing and the read stayed `V | null` — a clause-2
+// refusal of a program the design permits, and the one every `{[string]: Json}` consumer
+// meets. The lexeme keeps its quotes, which is what keeps the integer and string grammars
+// from colliding: `m[0]` and `m["0"]` are two different places and two different keys.
+function subscriptKeyTextOf(ix: i32) {
   if ix < 0 || ix >= P.nodes.length { return "" }
   const n = P.nodes[ix]
-  if n is Paren { return intLitTextOf(n.parInner) }
+  if n is Paren { return subscriptKeyTextOf(n.parInner) }
   if n is NumLit {
     const t = n.numText
     if t.length < 1 { return "" }
@@ -4075,6 +4083,7 @@ function intLitTextOf(ix: i32) {
     }
     return t
   }
+  if n is StrLit { return n.strText }
   ""
 }
 
@@ -4641,8 +4650,55 @@ function callInvalidatesNarrowedPath(callIx: i32, key: string) {
   false
 }
 
+// The COLLECTION METHODS that can REMOVE a cell — the only intrinsic calls that falsify a
+// narrowing of a cell of their own receiver. Deliberately NOT `cwMutatesList`'s whole set:
+// `push` appends and `set`/`add` insert, none of which can take `xs[0]` or `m["a"]` away, and
+// retiring on those would end a narrowing the guard still proves.
+function cellRemovingMethod(p: string): boolean {
+  if p == "delete" { return true }
+  if p == "clear" { return true }
+  if p == "pop" { return true }
+  false
+}
+
+// The cell a `delete(<literal>)` names, as its KEY TEXT, or "" when the call names no single
+// cell (`clear` / `pop` take no key; a variable key names none). Same rule as a write target:
+// a literal subscript names its cell and nothing else, anything else may have hit any of them.
+function removedCellKeyText(cn: Call, prop: string): string {
+  if prop != "delete" { return "" }
+  if cn.callArgs.length != 1 { return "" }
+  subscriptKeyTextOf(cn.callArgs[0])
+}
+
 function callInvalidatesReal(cn: Call, key: string) {
   const declIx = callDeclFnIx(cn)
+  // A CELL-REMOVING COLLECTION METHOD RETIRES THAT CELL'S NARROWINGS, and it has to be asked
+  // FIRST because it reaches neither leg below: an intrinsic answers `-2` on the next line,
+  // and `callArgPlaces` puts a receiver in the argument list only for a UFCS call to a user
+  // function. So `m.delete(1)` under `if m[1] is string` left the cell narrowed while the key
+  // was gone — `vl check` rc 0 over a read of a key that is not there.
+  //
+  // THE KEY ARGUMENT IS READ EXACTLY AS A WRITE TARGET IS: a literal subscript names its cell
+  // and retires only that one (`m.delete(2)` leaves `m[1]` narrowed), while `clear` / `pop` /
+  // a variable key name NO cell and therefore may have hit any of them — which is
+  // `retireNarrowingsForWrite`'s own `tgtKey == ""` rule, one call shape over.
+  const rmRecv = P.nodes[cn.callFn]
+  if rmRecv is Member {
+    if cellRemovingMethod(rmRecv.memProp) {
+      const rmRoot = placeKeyOf(rmRecv.memObj)
+      if rmRoot != "" {
+        const rmLit = removedCellKeyText(cn, rmRecv.memProp)
+        if rmLit == "" {
+          if keyHasPrefix(key, rmRoot + "[") { return true }
+        } else {
+          const rmCell = rmRoot + "[" + rmLit + "]"
+          if key == rmCell { return true }
+          if keyHasPrefix(key, rmCell + ".") { return true }
+          if keyHasPrefix(key, rmCell + "[") { return true }
+        }
+      }
+    }
+  }
   // An intrinsic writes no object field. The BROAD rule as filed does not make that
   // distinction — "any call that receives the object" includes `print(o)` — so the
   // switch bypasses this too, and the two measurements compare the filed rules
@@ -7106,7 +7162,7 @@ function isNumeric(ix: i32) {
 // ABSENCE IS `null`, NOT `""`. The old empty-string marker was never TESTED for anywhere
 // — 0 sites compared this to `""` — it only had to lose every `== "i32"` comparison, which
 // `null` does identically. `T | null` is the absence idiom the language already commits to.
-function primNameOf(ix: i32): PrimName | null {
+export function primNameOf(ix: i32): PrimName | null {
   if ix < 0 { return null }
   const t = T.tys[ix]
   if t is TyPrim { return t.primName }
@@ -9623,6 +9679,130 @@ function homogLitUnionBase(ty: i32): i32 {
   -1
 }
 
+// The BASE SCALAR an arm's value set sits inside when the arm is a BARE LITERAL — `"err"`
+// -> string, `3` -> i32, `1.5` -> f64 — and -1 for every other arm.
+//
+// **THE LITUNION-ALIAS MIRROR IS DELIBERATELY NOT HERE, AND ITS PRICE IS TWO RUNNING
+// FIXTURES.** The ruling collapses `Kind | string` (`Kind = "a" | "b"`) to `string` as well,
+// and `homogLitUnionBase` is exactly the projection that would answer for it. Restoring it
+// here is NOT the fix, and the reason is a SECOND producer: canon's union arm preserves a
+// string-litunion member (`litUnionPreserve`) where this would drop it, so the arena would
+// say `string` while canon still spelled `K|string` and the emitter reserved a union box for
+// a plain-string binding. The bare-literal half above needs no canon change only because
+// canon's `TyLit` arm already softens to the base and its atom dedup collapses
+// `string|string` — the two producers agree by accident there, and not here. It
+// is left out because collapsing that arm makes
+// `tests/cases/literal-unions/mixed-union-litunion-arm-is-membership.vl` and
+// `is-litunion-arm-non-ident-receivers.vl` stop running: both pin `x is K` over a `K |
+// string` box as MEMBERSHIP over the payload (a tag compare answers TRUE for every string
+// the box holds, which is the silent wrong answer #1306 removed), and both pin the
+// `is K` / `is string` PAIRS that no tag scheme can green by halves. Collapse the arm and
+// `K | string | i32` reaches the emitter as `string | i32` with `K` gone, which is
+// `emitProgram: struct field type has no struct-field rep` at one fixture and invalid wasm
+// in `atomStoreIsK` at the other.
+//
+// Losing a running program is the one movement the gate refuses, so the mirror ships when
+// `is K` over a COLLAPSED base lowers as the same membership test `emitIs` already emits for
+// a standalone litunion receiver. Filed as D1048 with those two fixtures as its named set —
+// they are already fixtures, so the price stays guarded whoever tries it next.
+function armLiteralBaseTy(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyLit { return litBaseTy(t) }
+  -1
+}
+
+// Does `members` carry `base` as an ARM, after flattening and through aliases?
+// `flattenVariantsInto` is the walk `joinTys` uses, so a union-alias member (`Json`)
+// contributes its own arms and a nullable contributes its inner plus `null`.
+//
+// NO SELF-SKIP IS NEEDED, and that is a property of `armLiteralBaseTy` rather than an
+// oversight: the only members this is asked about are literal-shaped, and flattening one
+// yields its LITERALS (or itself), never the base PRIM. An arm can therefore never subsume
+// itself, so the caller does not have to track which index it is testing.
+//
+// INDEX EQUALITY against the base, not `sameVariantTy`. The primitives are canonical arena
+// singletons, and the loose test would answer TRUE for a `TyLit` sibling — which is exactly
+// the pair the ruling keeps apart (`"a" | "b" | "err"` must NOT collapse: its siblings are
+// literals, not the `string` ARM).
+function unionMembersCarryBaseArm(members: i32[], base: i32): boolean {
+  let i = 0
+  while i < members.length {
+    const flat: i32[] = []
+    flattenVariantsInto(members[i], flat)
+    let f = 0
+    while f < flat.length {
+      if flat[f] == base { return true }
+      f = f + 1
+    }
+    i = i + 1
+  }
+  false
+}
+
+// Is `ty`'s value set already carried by an arm of `members`? The predicate BOTH union
+// routes filter by — the annotation route over its member list, the declaration route over
+// that list AND over the wider `declMemberIxs` registration list.
+function unionArmSubsumedBy(ty: i32, members: i32[]): boolean {
+  const base = armLiteralBaseTy(ty)
+  if base < 0 { return false }
+  unionMembersCarryBaseArm(members, base)
+}
+
+// A SUBSUMED LITERAL ARM COLLAPSES — the owner's 2026-09-02 ruling, and the shared home
+// both union routes call so the two spellings cannot disagree about it.
+//
+// A union is a SET of values, and an arm that adds no values adds no arm. `string | "err"`
+// is `string` and `i32 | 3` is `i32`. Subsumption is decided PER ARM, AFTER FLATTENING and
+// THROUGH ALIASES, so where the subsuming arm came from does not matter:
+// `type Name = string` gives `Name | "err"` = `Name`, and `Json | "err"` flattens to
+// `null | ... | string | ... | "err"` and is `Json`.
+//
+// NOTHING COLLAPSES THAT ADDS A VALUE, and the base-arm test is what makes that exact
+// rather than approximate. `Kind | "err"` has no `string` ARM — flattening `Kind` reaches
+// its LITERALS — so it stays the three-atom litunion `"a" | "b" | "err"`; `i32 | "err"`
+// stays a genuine two-arm box. The ruling's MIRROR half (`Kind | string`) is deferred with
+// its price named — see `armLiteralBaseTy`.
+//
+// WHY IT IS A TYPE RULE AND NOT AN EMITTER ONE (D1024). The duplicate atom the widen
+// produced is not a rep the emitter can be taught: `string | "err"` widened the literal to
+// a SECOND `string` atom, the member set printed `...|string|...|string`, and a union box's
+// tags are POSITIONAL over that set, so the only sound answers are "never mint the
+// duplicate" or "renumber every tag". The ruling picks the first. Deduping the minted set
+// instead is the one thing that must not happen here — see the union member-set ABI.
+//
+// ALWAYS FILLS `out` WITH THE SURVIVORS, and answers whether it dropped anything. The
+// return value is a fact about the list, NOT permission to read `out` — a caller uses `out`
+// unconditionally.
+//
+// THE OTHER CONTRACT — "filled only on true, untouched on false" — was written first and is
+// the reason this note exists. It reads as the safer shape and it is a trap: the loop has to
+// walk every member to know whether ANY is subsumed, so `out` is already full by the time
+// the answer is known. The declaration route then appended `surviving` to an `out` that
+// already held it, and every union in the module doubled its member list — `MfKind`'s seven
+// atoms became fourteen, which surfaced as the COMPILER'S OWN SOURCE failing to build with
+// `non-exhaustive match — missing` every arm the match plainly had. `deno task test` and
+// `native-fixpoint` caught it; nothing about the D1024 witness did, because the collapse
+// path was correct and it was the NO-COLLAPSE path that was wrong.
+//
+// A list that collapses to NOTHING cannot arise — a dropped arm needs a surviving sibling to
+// be subsumed by — but the length guard is kept so the callers' one-member arms stay the only
+// place that degenerate case is decided.
+function unionDropSubsumedArms(members: i32[], out: i32[]): boolean {
+  let dropped = false
+  let i = 0
+  while i < members.length {
+    if members.length >= 2 && unionArmSubsumedBy(members[i], members) {
+      dropped = true
+    } else {
+      out.push(members[i])
+    }
+    i = i + 1
+  }
+  if out.length == 0 { return false }
+  dropped
+}
+
 // The FLATTENED, deduped literal members of `members` when EVERY member is a homogeneous
 // literal union over ONE COMMON base — filled into `out`, answering true. Answers false
 // and leaves `out` UNTOUCHED otherwise, so a caller keeps its own member list on that leg.
@@ -9869,6 +10049,16 @@ function annUnionInnerTy(members: i32[], hasNull: boolean): i32 {
   if nwClash.length > 0 {
     unkTyClash = nwClash
     return -1
+  }
+  // THE SUBSUMED-ARM COLLAPSE, ahead of BOTH remaining arms — `string | "err" | null` is
+  // `string?` for the same reason `string | "err"` is `string`, and the `null` early-out
+  // below would otherwise carry the duplicate atom into the niche. Re-enters the whole
+  // function on the survivors so the one-member arm above decides the degenerate case
+  // exactly once (a two-arm union that collapses to one is the COMMON shape here, not an
+  // edge: it is what `string | "err"` itself is).
+  const kept: i32[] = []
+  if unionDropSubsumedArms(members, kept) {
+    return annUnionInnerTy(kept, hasNull)
   }
   if hasNull {
     annRegisterVariantMembers(members)
@@ -26523,6 +26713,34 @@ function fillTypeDeclAt(sx: i32) {
           if nwClash.length > 0 {
             tErr(nwClash + " in union '" + sd.udName + "'", sx)
           }
+          // THE SUBSUMED-ARM COLLAPSE on the DECLARATION side — `unionDropSubsumedArms`,
+          // the same shared rule `annUnionInnerTy` applies. This arm builds its member
+          // list itself and so never reaches the shared annotation home, and the two
+          // routes are ONE language: `type R = string | "err"` must be `string` for the
+          // same reason the inline spelling is.
+          //
+          // THE REGISTRATION LIST IS FILTERED BY THE SAME PREDICATE rather than rebuilt
+          // from the survivors. `declMemberIxs` is a SUPERSET of `surviving` — it is
+          // pushed before the never-drop — so the two lists cannot be derived from each
+          // other, and a dropped arm left in it would register `"err"` as a variant member
+          // of a union that no longer has that arm: a positional-tag mismatch, which is
+          // the exact failure this collapse exists to prevent.
+          const survU: i32[] = []
+          const nonNullU: i32[] = []
+          const declU: i32[] = []
+          unionDropSubsumedArms(surviving, survU)
+          let cu = 0
+          while cu < survU.length {
+            if survU[cu] != TY_NULL { nonNullU.push(survU[cu]) }
+            cu = cu + 1
+          }
+          cu = 0
+          while cu < declMemberIxs.length {
+            if !unionArmSubsumedBy(declMemberIxs[cu], surviving) {
+              declU.push(declMemberIxs[cu])
+            }
+            cu = cu + 1
+          }
           // THE `null` NICHE FOLD — an un-parenthesized `type T = X | null` denotes
           // `X?`, exactly as the inline annotation `X | null` and the parenthesized
           // declaration `type T = (X | null)` already do (`annUnionTy`, the shared
@@ -26592,8 +26810,8 @@ function fillTypeDeclAt(sx: i32) {
           // `mkNullableTy` does not intern, so the wrap must happen exactly once, which
           // is what routing through `annUnionTy` (rather than its two halves) gives.
           let folded = -1
-          if sawNull && nonNull.length > 0 {
-            folded = annUnionTy(nonNull, true)
+          if sawNull && nonNullU.length > 0 {
+            folded = annUnionTy(nonNullU, true)
           }
           // THE LITERAL-UNION FLATTEN, on the DECLARATION side — `litUnionFlatMembers`,
           // the same member-list transform `annUnionInnerTy` climbs. This arm builds its
@@ -26616,7 +26834,7 @@ function fillTypeDeclAt(sx: i32) {
           if folded >= 0 {
             members.push(folded)
           } else {
-            if !sawNull { flattened = litUnionFlatMembers(surviving, flatU) }
+            if !sawNull { flattened = litUnionFlatMembers(survU, flatU) }
             if flattened {
               let fi = 0
               while fi < flatU.length {
@@ -26625,8 +26843,8 @@ function fillTypeDeclAt(sx: i32) {
               }
             } else {
               let mi = 0
-              while mi < surviving.length {
-                members.push(surviving[mi])
+              while mi < survU.length {
+                members.push(survU[mi])
                 mi = mi + 1
               }
             }
@@ -26657,11 +26875,11 @@ function fillTypeDeclAt(sx: i32) {
               }
             } else {
               let ri = 0
-              while ri < declMemberIxs.length {
+              while ri < declU.length {
                 cTyIxSetAdd(
                   cVariantMemberTyIxs,
                   cVariantMemberTyIxSet,
-                  declMemberIxs[ri],
+                  declU[ri],
                 )
                 ri = ri + 1
               }
@@ -36425,6 +36643,87 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
 // point. The float→int forms trap at runtime on NaN / out-of-range (see emit).
 // `as` is numeric-only for now: a non-numeric operand OR target is a type error.
 // The cast expression's type is exactly `T`.
+// THE PROPAGATION OBLIGATION A BARE `as` TAKES ON — the ONE home of the three checks, shared
+// by the UNION arm (which propagates the unwanted arms) and the NUMERIC one (which propagates
+// `null`). Returns false with the diagnostic already reported.
+//
+// The two arms differ only in WHAT they propagate, which is the `rest` parameter, so a second
+// copy of this ladder would be three more chances for the two spellings of one rule to drift.
+// The messages name `rest` for that reason: a union cast reads "propagates `B | C`" and a
+// numeric one "propagates `null`", from one set of words.
+function castPropagationFits(rest: i32, asTy: string, ix: i32): boolean {
+  // A PENDING return (-2, still being inferred) is refused rather than joined into: a cast
+  // that silently widens the function's own signature is the opposite of what an explicit
+  // cast is for, and the annotation is one word.
+  if T.curRet == -2 {
+    tErr(
+      "`as " +
+        asTy +
+        "` propagates " +
+        tyToStr(rest) +
+        " — annotate the enclosing function's return type so the propagation has a declared home",
+      ix,
+    )
+    return false
+  }
+  // AT MODULE SCOPE THERE IS NOWHERE TO PROPAGATE TO, and saying "the enclosing function
+  // cannot return it" there names a function that does not exist (it rendered "it returns
+  // _"). The cast is still the wrong tool, but for a different reason, so it gets its own
+  // sentence and points at the two spellings that do work.
+  if T.curRet < 0 {
+    tErr(
+      "`as " +
+        asTy +
+        "` propagates " +
+        tyToStr(rest) +
+        " out of the enclosing function, and there is none here — at module scope, use `as!` to trap or `as?` to take a nullable",
+      ix,
+    )
+    return false
+  }
+  if !assignable(rest, T.curRet) {
+    tErr(
+      "`as " +
+        asTy +
+        "` propagates " +
+        tyToStr(rest) +
+        ", which the enclosing function cannot return (it returns " +
+        tyToStr(T.curRet) +
+        ") — use `as!` to trap instead, or `as?` to take the null here",
+      ix,
+    )
+    return false
+  }
+  true
+}
+
+// WHETHER A NUMERIC CAST CAN FAIL, under the owner's json-design §6 q2 ruling: a cast to an
+// INTEGER target is exact-or-fail, a cast to a FLOAT target rounds and cannot.
+//
+//   f64/f32 -> i32/i64   can fail — the value must be integral AND in range (NaN, +/-Inf,
+//                        a fraction and an overflow all fail)
+//   i64     -> i32       can fail — in range, and never a wrap
+//   i32     -> i64       cannot — lossless
+//   any     -> f64/f32   cannot — rounds
+//
+// Reading the SOURCE by name keeps this total: an operand the ladder above admitted but
+// `primNameOf` cannot name (a `TyErr` from an already-reported error) answers false, so a
+// broken operand collects one diagnostic rather than two.
+// THE FIVE PAIRS, and the list is CLOSED: those are every (source, integer target) pair on
+// which a VL value can lose itself. `i32 → i64` is the one widening integer edge and is
+// lossless; everything else either targets a float (rounds) or is the identity.
+//
+// The emitter (`emitNumExactCast`) covers exactly these five, and that is not a coincidence to
+// be maintained by hand — a pair admitted HERE and not lowered THERE would type the expression
+// `T | null` and then emit the old truncating conversion into a nullable destination, which is
+// the "narrow the checker first" trade this repo has paid for repeatedly (D965).
+export function numCastCanFail(src: string, tgt: string): boolean {
+  if tgt == "f64" || tgt == "f32" { return false }
+  if tgt == "i32" { return src == "f64" || src == "f32" || src == "i64" }
+  if tgt == "i64" { return src == "f64" || src == "f32" }
+  false
+}
+
 function checkCastNode(n: AsExpr, ix: i32) {
   const arg = checkNode(n.asObj)
   const target = nameToTyAt(n.asTy, ix)
@@ -36524,45 +36823,7 @@ function checkCastNode(n: AsExpr, ix: i32) {
       // goes. A PENDING return (-2, still being inferred) is refused rather than joined
       // into: a cast that silently widens the function's own signature is the opposite of
       // what an explicit cast is for, and the annotation is one word.
-      if T.curRet == -2 {
-        tErr(
-          "`as " +
-            n.asTy +
-            "` propagates " +
-            tyToStr(rest) +
-            " — annotate the enclosing function's return type so the propagation has a declared home",
-          ix,
-        )
-        return TY_ERR
-      }
-      // AT MODULE SCOPE THERE IS NOWHERE TO PROPAGATE TO, and saying "the enclosing function
-      // cannot return it" there names a function that does not exist (it rendered
-      // "it returns _"). The cast is still the wrong tool, but for a different reason, so it
-      // gets its own sentence and points at the two spellings that do work.
-      if T.curRet < 0 {
-        tErr(
-          "`as " +
-            n.asTy +
-            "` propagates " +
-            tyToStr(rest) +
-            " out of the enclosing function, and there is none here — at module scope, test the value with `is` instead",
-          ix,
-        )
-        return TY_ERR
-      }
-      if !assignable(rest, T.curRet) {
-        tErr(
-          "`as " +
-            n.asTy +
-            "` propagates " +
-            tyToStr(rest) +
-            ", which the enclosing function cannot return (it returns " +
-            tyToStr(T.curRet) +
-            ")",
-          ix,
-        )
-        return TY_ERR
-      }
+      if !castPropagationFits(rest, n.asTy, ix) { return TY_ERR }
       return target
     }
   }
@@ -36574,6 +36835,20 @@ function checkCastNode(n: AsExpr, ix: i32) {
   if !isNumeric(arg) || !targetIsScalar {
     tErr("`as` supports numeric conversions only", ix)
     return TY_ERR
+  }
+  // THE NUMERIC ARM HONOURS THE TRIO TOO (json-design §6 q2, owner 2026-09-02). Until now
+  // this arm returned `target` whatever the suffix said, so `3.9 as? i32`, `3.9 as! i32` and
+  // a bare `3.9 as i32` all type-checked identically and all printed 3 — the suffix was
+  // accepted and IGNORED (D1041). A cast that can fail owes the same three answers the union
+  // arm gives, from the same words.
+  if numCastCanFail(primNameStr(primNameOf(arg)), primNameStr(tn)) {
+    // `as!` TRAPS on a miss, so nothing is propagated and the enclosing return is not
+    // consulted — the same reading as the union arm's trap mode.
+    if n.asMode == "trap" { return target }
+    // `as?` re-wraps to `T | null` and the null stays local to the expression.
+    if n.asMode == "null" { return mkNullableTy(target) }
+    // A bare `as` propagates `null`, so the enclosing return must carry it.
+    if !castPropagationFits(TY_NULL, n.asTy, ix) { return TY_ERR }
   }
   target
 }

@@ -4034,9 +4034,23 @@ cannot reach.
 
 **Cost.** Performance: `trunc(d) as! i32` is the single instruction today's `d as i32`
 emits (peephole; the operand is integral by construction so the exactness compare is
-dead), and the general `d as! i32` is the conversion plus a round-trip compare — one
-`f64.convert_i32_s` and one `f64.eq`, both cheap and both what a correct Rust `try_from`
-pays. Do not lean on binaryen for the fold: its float folds are NaN-conservative and will
+dead), and the general `d as! i32` is the conversion plus a compare, cheap and what a
+correct Rust `try_from` pays. **CORRECTION, from building it (2026-09-02): the compare is
+`trunc(d) == d` plus a range test, NOT the round-trip `trunc_sat` + convert-back + `eq`
+this paragraph and D1041 both named.** The round trip is exact for `f64 → i32` — every i32
+is an exact f64 — and UNSOUND for the other three float pairs, because the convert-back
+ROUNDS: `9223372036854775808.0 as? i64` saturates to `i64::MAX`, converts back to exactly
+`2^63`, and compares EQUAL to the operand, admitting a value the target cannot hold. One
+shape that is right at all five pairs (`f64 → i32/i64`, `f32 → i32/i64`, `i64 → i32`) beats
+a cheaper shape that is right at one and has to be remembered at the other four. The bounds
+are `i32.const`/`i64.const` fed through `f64.convert_*`/`f32.convert_*` rather than spelled
+as float literals, which keeps the emitter's decimal→IEEE parser off the soundness path and
+makes the ENGINE's own rounding the fact the comparison is built on (`convert(i32::MAX)` is
+exact in f64 so that bound is `<=`; it rounds UP in the other three, so those are `<`).
+Binary size: the `as!` trap's source-located reason is per-SITE `__print_char__` code in the
+cold branch — measured +226 bytes at `-O` on `bench/arrays/binsearch` for one cast, the same
+trade Rust makes for `unwrap`'s panic location. A module-tail helper taking `(line, col)`
+would cut it to about ten bytes a site if that ever matters. Do not lean on binaryen for the fold: its float folds are NaN-conservative and will
 not remove the compare on their own. Migration: the tree's `as` sites are `as!` in intent
 today (they were written under "traps on NaN / out of range"), so the migration is a
 suffix per site — **`compiler/` 2, `std/` 15, `tests/cases` 167** (vl-de's
@@ -4168,3 +4182,104 @@ Circle/Square idiom, the overlapping-set case answering `true`/`true` for `"y"` 
 `true`/`false` for `"x"`, and the `{v: i32} | {v: boolean}` pair refusing at CHECK. Interim std
 rule until built, unchanged: every std error struct carries a field NAME no other std error
 type has (`JsonError.path`).
+
+## A `type` declared in a function body is legal and lexically scoped, may name the enclosing function's type parameters, and is refused loudly until built (owner, 2026-09-02)
+
+The owner asked whether `type` inside a function body is legal. It was neither legal nor
+refused: the parser admits it (`parseStmt` is shared between module and block scope), the
+checker registers type names only from the module-level walk, and the declaration is silently
+dropped — so one mechanism wore THREE faces (D1045): `unknown type 'P'` at the use, a
+check-clean `unsupported statement in body` emit reject when the name is never used, and a
+local `type P` that silently resolves to a MODULE-scope `P` of a different shape. The
+precedent already in the language decided it: a nested NAMED `function` in the same position
+runs today, and a declaration form that is legal in a body for functions and not for types is
+a rule nobody would write on purpose.
+
+**Ruled: legal, and lexically scoped to the block.** Every form the module-scope grammar
+admits is admitted in a body, because `parseTypeDecl` is one production and the ruling is
+about WHERE it may stand, not which arms:
+
+| form | in a body | note |
+| --- | --- | --- |
+| struct `type P = { x: i32, y: i32 }` | legal | the filed witness |
+| union / literal union `type R = A \| B`, `type K = "a" \| "b"` | legal | usable in `is` inside the body |
+| recursive `type N = { next: N \| null }` | legal | self-reference resolves in the local scope |
+| generic alias `type Pair<A> = { a: A, b: A }` | legal | instantiated where used, as at module scope |
+| nominal `type Id = new i32` | legal | see the escape sub-ruling |
+
+The name shadows an outer one for the rest of the block — the shadowing spelling in D1045's
+table is the case the build is graded on, because it is the one that is WRONG today rather
+than merely refused. Nothing about the type's REP changes: a local struct is the same
+structural shape it would be at module scope, and two local declarations of the same shape in
+two functions are the same type, exactly as two module-scope ones are.
+
+**And a local type may name the enclosing function's type parameters.** The owner's second
+question. `type P = { a: T }` inside `f<T>` is legal and is substituted per instance the way
+every other node of the body is — the monomorphizer already lifts an arrow lambda that names
+`T` (D426, closed 2026-08-30), and a local type is the same obligation on a different node
+kind. Measuring the precedent found that the NAMED-function spelling of D426's own witness
+still refuses at emit while the lambda runs (D1046); it is filed beside D1045 rather than
+under D426 because the rule the owner agreed to — a body-scoped declaration sees the
+signature's type parameters — is the one rule all three node kinds owe, and the build closes
+them together.
+
+**Two sub-rulings, recorded as vl-b7's recommendation and standing unless the owner objects.**
+
+* **A local NOMINAL type does not escape through an inferred return type.** `type Id = new
+  i32` inside `f` and `return Id(3)` with no return annotation would infer a type that no
+  caller can NAME — the checker refuses it, as it does any unnameable inferred type, with a
+  message that says to declare the type at module scope or annotate the return. A local
+  STRUCTURAL type escapes freely as its shape, because the shape is the type and the caller can
+  spell it. The asymmetry is the whole point of `new`: nominality is a name, and a name that
+  goes out of scope takes the nominal identity with it.
+* **Nothing else escapes either, and nothing needs a rule for it.** A local type used only
+  in a local binding, argument, or `is` never reaches a signature, so the question of what a
+  caller sees does not arise.
+
+**Interim, shipping first: the DECLARATION refuses loudly.** Until scoping is built, the
+checker's body walk rejects a `TypeDecl` where it stands with `` a `type` declaration is
+module-scope only for now (D1045 — ruled legal, not yet built); move `P` to module scope ``,
+at the declaration's line, on every spelling — so the three faces collapse into one message
+that names the rule and the row. This is clause-2 hygiene, not progress on `runs`, and it is
+scheduled that way: the loud refusal is small and lands ahead; the scoping build is the
+ROADMAP item. Measured 2026-09-02 on seed 42604b65; witnesses under D1045 and D1046.
+
+## A failed assertion is located at the MATCHER, not at `expect` (owner, 2026-09-02) — blocked on D1044
+
+The owner asked why a failure's location points at `expect` rather than at `toEqual`. Because
+the track-caller ruling above anchored on `expect` by an UN-CONSULTED design choice: `expect`
+was the only surface that took `caller`, and its `__callsite__` naturally reports the `expect`
+token. The header at `std/test.vl` says so, and no one asked which token an author wants.
+
+**Ruled: the matcher.** The failure is the matcher's — `toEqual` is the thing that decided
+`false` — and on a multi-line spelling
+
+```vl
+expect(build(cfg))
+  .toEqual(want)
+```
+
+the `expect` line is the setup and the `.toEqual` line is the assertion; Jest and Vitest
+report the matcher's line for the same reason. On today's grammar that spelling does not
+parse (`expected an expression but found DOT`, measured 2026-09-02 — a leading-dot
+continuation line is not admitted, and whether it should be is a grammar question for the
+owner, not filed as a defect), so on every program that compiles today only the COLUMN
+moves: `__callsite__` on a UFCS call already anchors on the METHOD token, column 14 for
+`expect(x).toEqual(y)` at column 5. No existing report changes its line; the ruling is made
+now so the location is right on the day the grammar admits the second line.
+
+**How it lands, and why it is not landing today.** Each matcher — `toEqual`, `toBeTrue`,
+`toBeFalse`, and `not`'s continuation — takes a trailing `caller: CallerLoc = __callsite__`,
+and the receipt drops the `caller` it carries from `expect`. That is the one-hop rule applied
+one hop later: the matcher is the surface that reports, so it is the surface that asks. The
+change alters std exports and goes through `std-api-reviewer`; the header's anchor paragraph
+and the track-caller ruling's "`expect` only" section are updated with it, and the editor's
+location line (`testDiscovery.ts`) is unchanged because the wire format is unchanged.
+
+**It is blocked by a compiler defect, found while measuring the move.** A UFCS call that OMITS
+a defaulted tail argument is refused `no field 'toEqual' on Expectation` in any module build
+that merges a `self`-function-bearing module — which `std:test` is, so EVERY test file. The
+direct spelling and the supplied-argument spelling run. Filed as D1044 with an eight-row
+ablation; the matcher move ships the PR after D1044's fix merges, and is graded on the
+multi-line spelling reporting the `.toEqual` line, the one-line spelling reporting column 14,
+and `not.toEqual` reporting the final matcher.

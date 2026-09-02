@@ -31,6 +31,7 @@ import {
   nodeTyIsMap,
   nodeTyIsNulLitUnion,
   nodeTyIsNulNumLitUnion,
+  nodeTyIsNulScalarBox,
   nodeTyIsNullable,
   nodeTyIsNullableStruct,
   nodeTyIsStringPrim,
@@ -107,8 +108,10 @@ import {
   mkBinary,
   mkCallN,
   mkIdent,
+  mkNull,
   mkStr,
   nodeChildren,
+  nodeToks,
   orderArgsByParamNames,
   ufcsAliasOf,
 } from "./ast"
@@ -307,6 +310,9 @@ import {
   narrowStripNullOnly,
   narrowTop,
   nulStrReadStaysRaw,
+  numCastF32Slot,
+  numCastF64Slot,
+  numCastI64Slot,
   pendingF32,
   pendingF64,
   pendingI64,
@@ -383,12 +389,22 @@ import {
   fbF32ConvertI32S,
   fbF32ConvertI64S,
   fbF32DemoteF64,
+  fbF32Eq,
+  fbF32Ge,
+  fbF32Lt,
+  fbF32Trunc,
   fbF64Const,
   fbF64ConvertI32S,
   fbF64ConvertI64S,
+  fbF64Eq,
+  fbF64Ge,
+  fbF64Le,
+  fbF64Lt,
   fbF64PromoteF32,
+  fbF64Trunc,
   fbGlobalGet,
   fbGlobalSet,
+  fbI32And,
   fbI32Bin,
   fbI32Const,
   fbI32Eqz,
@@ -400,6 +416,8 @@ import {
   fbI32WrapI64,
   fbI64Const,
   fbI64ExtendI32S,
+  fbI64GeS,
+  fbI64LeS,
   fbI64TruncF32S,
   fbI64TruncF64S,
   fbIf,
@@ -464,6 +482,9 @@ import {
   arrLitIsStr,
   arrNewIntrKind,
   asExprIsUnionCast,
+  asExprNumFallible,
+  asExprNumSrcName,
+  asExprNumTgtName,
   binEqNulVariantRow,
   binEqStructRow,
   binEqVariantRow,
@@ -528,6 +549,7 @@ import {
   exprIsF32,
   exprIsF64,
   exprIsI64,
+  exprIsIntegralFloat,
   exprIsLitAtom,
   exprIsStrBytes,
   exprIsStrCharBoundary,
@@ -632,6 +654,8 @@ import {
   litAtomMemberTy,
   localIndexOf,
   mapAnnShape,
+  mapReadNarrowableSlot,
+  mapReadNarrowedAtomKind,
   mapReadScalarBoxKind,
   mapReadScalarBoxKindTy,
   mapRetExprShape,
@@ -664,7 +688,9 @@ import {
   mvValVariantOf,
   nameIsWholeSpanShape,
   narrowedMapOf,
+  narrowedMapOfPlace,
   narrowedRefArrayOf,
+  narrowedRefArrayOfPlace,
   nonNulBaseOf,
   narrowedValueAtomOf,
   narrowExcludesNull,
@@ -690,6 +716,7 @@ import {
   pushPostGuardNarrow,
   refArrSlotTag,
   refListSlotOfExpr,
+  refListSlotOfExprStrict,
   refPushScratchBaseFor,
   removeAtomFromSet,
   restoreNarrow,
@@ -4548,6 +4575,41 @@ function emitUnionUnboxTail(ak: i32) {
   0
 }
 
+// THE CONTAINER HALF OF A PLACE-NARROWED UNION READ, from a box already on the stack — the
+// member/index PLACE dual of `emitRefArrayUnionUnboxRead` and `emitMapUnionUnboxRead`, which
+// both push the box themselves from a NAME. 1 = a recovery was emitted, 0 = the place carries
+// no live container narrowing (the caller leaves the box exactly as it was), -1 = a recorded
+// failure.
+//
+// THE HEAP TYPE COMES FROM THE CLASSIFIER THE CONSUMER ALREADY ASKED, not from a second
+// derivation off the narrow stack. `refListSlotOfExprStrict` / `mapShapeOfExpr` are the very
+// functions `forInElemKind`, `emitIndex` and `emitMapPrep` type themselves against, so a
+// delivery that cast to a different row than the consumer expects is not expressible here.
+// (The scalar half stays in `emitUnionFieldNarrowUnbox` / `emitIndex`'s D451 rung, because it
+// also serves the UN-narrowed adoption reads those two sites carry.)
+function emitPlaceNarrowContainerUnbox(exprIx: i32, fnIx: i32): i32 {
+  if narrowedRefArrayOfPlace(exprIx) != "" {
+    const slot = refListSlotOfExprStrict(exprIx, fnIx)
+    if slot < 0 || slot >= rlWrapIdx.length {
+      return emitFail(
+        "emitProgram: narrowed union place ref-array arm has no reflist slot",
+      )
+    }
+    fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
+    fbRefCast(rlWrapIdx[slot]) // the payload IS the arm's list wrapper
+    return 1
+  }
+  if narrowedMapOfPlace(exprIx) != "" {
+    fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
+    // `mapShapeOfExpr` answers the mono sentinel -1 for an atom-valued map exactly as the
+    // name resolver does, and `mapTypeIdxOf(-1)` is the shared `$mStructIdx` — so the miss
+    // and the hit agree here for the same reason they do in `emitMapUnionUnboxRead`.
+    fbRefCast(mapTypeIdxOf(mapShapeOfExpr(exprIx, fnIx)))
+    return 1
+  }
+  0
+}
+
 // Recover the reflist WRAPPER ref a union binding narrowed to a REF-ELEMENT array arm holds
 // (`if x is S[]` then `x[i]` / `x.length`): push the box, read its `anyref` value (field 1),
 // `ref.cast` it to the arm's reflist wrapper heap. The ref-array analogue of
@@ -6355,6 +6417,10 @@ function emitSharedFieldRecv(body: i32[], recvIx: i32, fnIx: i32, slot: i32) {
 // site was corrected to it. An un-narrowed read yields the box unchanged, so a "" atom
 // emits nothing.
 function emitUnionFieldNarrowUnbox(memIx: i32, fnIx: i32) {
+  // The CONTAINER arms of the same narrowing (`if n.v is K[]`, `if n.v is {[string]: K}`) —
+  // disjoint from the value atom below, which answers "" for both (D1014).
+  const mCon = emitPlaceNarrowContainerUnbox(memIx, fnIx)
+  if mCon != 0 { return mCon - 1 }
   const mAtom = narrowedValueAtomOf(memberPathKeyOf(memIx))
   if mAtom == "" {
     // D209 — THE UN-NARROWED READ THE CHECKER TYPED AS A BARE ATOM. The box is the
@@ -6552,24 +6618,23 @@ function emitNarrowStoredAtomKind(from: i32, to: i32) {
 // The unbox SEQUENCE for a value-union box payload at atom kind `mfk`: `struct.get $uBox
 // 1` and then the atom's own recovery. One home, so the narrowed read and D209's
 // un-narrowed one cannot emit different instructions for the same atom.
+//
+// THE RECOVERY ITSELF IS `emitUnionUnboxTail`'s, not a second copy of it (D1014). The two
+// ladders had drifted: the ident read's tail recovers a STRING, a CLOSURE fat pointer and a
+// LIST WRAPPER before it falls to the scalar value box, while this one knew only the string
+// and the box — so `if n.v is f64[]` delivered `narrowed union field atom has no value box`
+// on a `vl check` rc 0 program whose identical hoisted spelling RUNS. What is left here is
+// the one thing that is genuinely this site's own: the `aUsed` guard, which turns an
+// unminted `sTypeIdx` into a message instead of a type-0 reference.
 function emitUnboxToAtomKind(mfk: i32) {
-  fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
   if mfk == 2 {
     if !aUsed {
       return emitFail(
         "emitProgram: narrowed string union field read but array type not collected",
       )
     }
-    fbRefCast(sTypeIdx) // the payload IS the string array ref
-    return 0
   }
-  const mvb = vbHeapIdxOfKind(mfk)
-  if mvb < 0 {
-    return emitFail("emitProgram: narrowed union field atom has no value box")
-  }
-  fbRefCast(mvb)
-  fbStructGet(mvb, 0) // the scalar payload
-  0
+  emitUnionUnboxTail(mfk)
 }
 
 // The message for one of `emitMem`'s three FIELD-ACCESS FLOORS — `dflt` prefixed, except
@@ -8350,6 +8415,33 @@ function emitMonoMapDefault(body: i32[], recvIx: i32, defIx: i32, fnIx: i32) {
 // Lower a bare map GET `m[k]` (no `??`) onto `body`: probe, return `vals[entry-1]` or
 // `0` when absent. The checker never uses a bare map get (always `?? -1`); provided for
 // completeness so `m[k]` in value position is total (0 default).
+// The NARROWED-READ tail of a bare map GET `m[1]` whose index PLACE carries a live
+// narrowing — the map twin of `emitIndex`'s two ref-list rungs (the niche recover and the
+// union-box unbox), and the emitter half the checker's `placeKeyOf` has always had.
+//
+// TWO RUNGS, IN THIS ORDER. `emitMapGet` leaves the vals element, which is `(ref null
+// <elem>)` for every ref-valued map because a MISS reads as `ref.null` — so the recover comes
+// first and is what the guard buys. A UNION value (kind 2) then unboxes to the tested atom
+// through `emitUnionUnboxTail`, the one home the narrowed ident / member / element reads
+// already share; a narrow that leaves two or more atoms keeps the box and takes the recover
+// alone, which is the rep a `(ref $uBox)` consumer wants.
+function emitNarrowedMapReadTail(idxIx: i32, fnIx: i32) {
+  const mrs = mapReadNarrowableSlot(idxIx, fnIx)
+  if mrs < 0 { return 0 }
+  const key = indexPathKeyOf(idxIx)
+  const v = narrowVariantFor(key)
+  if v == "" || v == "null" { return 0 }
+  // A UNION value already left the NON-null box (`emitMapGetUnionBox` recovers it), so only
+  // the unbox is owed; every other ref value is the raw `(ref null <elem>)` vals slot.
+  if mvValKind[mrs] == 2 {
+    const ak = mapReadNarrowedAtomKind(idxIx, fnIx)
+    if ak >= 0 { return emitUnionUnboxTail(ak) }
+    return 0
+  }
+  fbRefAsNonNull() // 0xd4 (the `is` guard proved the key present)
+  0
+}
+
 function emitMapGet(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32) {
   if emitMapPrep(body, recvIx, keyIx, fnIx) < 0 { return -1 }
   if cmSlot >= 0 {
@@ -10441,6 +10533,10 @@ function emitIndex(body: i32[], idxIx: i32, fnIx: i32) {
       // Routed through `emitUnionUnboxTail`, the ONE home the narrowed IDENT read
       // (`emitValueUnionUnboxRead`) and the union `as` cast already share, rather than a
       // fifth open-coded `struct.get 1` + `ref.cast` + `struct.get 0`.
+      // The CONTAINER arms of the same channel (`if xs[0] is K[]`, `if xs[0] is {[string]:
+      // K}`) — the index twin of `emitUnionFieldNarrowUnbox`'s (D1014).
+      const iCon = emitPlaceNarrowContainerUnbox(idxIx, fnIx)
+      if iCon != 0 { return iCon - 1 }
       const iuAtom = narrowedValueAtomOf(indexPathKeyOf(idxIx))
       if iuAtom != "" {
         if indexElemUnionName(idxIx, fnIx) != "" {
@@ -12764,7 +12860,21 @@ export function emitExpr(body: i32[], exprIx: i32, fnIx: i32) {
     // G8: a map GET `m[k]` (no `??`) — scan, value or 0. A `??` get is fused in the
     // BinExpr branch below (it carries the default).
     if exprMap(e.idxArr, fnIx) {
-      return emitMapGet(body, e.idxArr, e.idxIndex, fnIx)
+      // A UNION-VALUED map (mv kind 2) reads through the NULL-TAGGED BOX, the same lowering
+      // the `const t = m[k]` binding arm and its module-scope twin already take. `emitMapGet`
+      // yields the vals slot with a BARE `ref.null` miss, and every consumer of a boxed read
+      // starts with `struct.get $uBox 0` (the tag) — so a MISSING key trapped `null
+      // reference` on `m[k] is T`, `m[k] != null`, `m[k] == null` and `print(m[k])` alike,
+      // while the identical program through a binding ran. The box IS the read's `null`.
+      const ubs = mapReadNarrowableSlot(exprIx, fnIx)
+      if ubs >= 0 && mvValKind[ubs] == 2 {
+        if emitMapGetUnionBox(body, e.idxArr, e.idxIndex, fnIx) < 0 {
+          return -1
+        }
+        return emitNarrowedMapReadTail(exprIx, fnIx)
+      }
+      if emitMapGet(body, e.idxArr, e.idxIndex, fnIx) < 0 { return -1 }
+      return emitNarrowedMapReadTail(exprIx, fnIx)
     }
     return emitIndex(body, exprIx, fnIx)
   }
@@ -13594,6 +13704,221 @@ function emitExprAsKind(body: i32[], exprIx: i32, k: i32, fnIx: i32) {
 // `1.5` as `f32.const` — and then this function appended `f32.demote_f64` to it. `const g:
 // f32 = (1.5 as f32)` was `vl check` clean INVALID WASM in 12 of 16 measured positions, and
 // only the two spellings whose context happens NOT to seed `pendingF32` escaped.
+// ── the numeric EXACT-OR-FAIL cast (D1041 / json-design §6 q2, owner 2026-09-02) ──────────
+// A numeric `as` to an INTEGER target succeeds iff the value is exactly representable there,
+// and otherwise fails the way the trio fails everywhere: `as?` yields `null`, `as!` traps, a
+// bare `as` propagates the `null` to the enclosing `| null` return. Three spellings that used
+// to compile to the SAME truncating instruction (the suffix was accepted and dropped) are
+// three different programs.
+//
+// THE TEST IS "INTEGRAL AND IN RANGE", not the round-trip compare the ruling's cost paragraph
+// names, and the difference is soundness rather than taste. `trunc_sat` + convert-back + `eq`
+// is exact for `f64 → i32` (every i32 is an exact f64) but NOT for the other three float
+// pairs, because the convert-back ROUNDS: `9223372036854775808.0 as? i64` saturates to
+// `i64::MAX`, converts back to `2^63` — and compares EQUAL to the operand, admitting a value
+// the target cannot hold. One shape that is right at all five pairs beats a cheaper shape
+// that is right at one and has to be remembered at the other four.
+//
+// THE BOUNDS ARE CONVERTED, NOT SPELLED. `f64.const 9223372036854775808.0` would put the
+// emitter's decimal→IEEE parser on the soundness path for a 19-digit literal; `i64.const
+// 9223372036854775807` + `f64.convert_i64_s` puts the ENGINE's own conversion there instead,
+// and its rounding is the fact the comparison is built on:
+//
+//   f64 <- i32   convert(i32::MAX) is EXACT (2147483647.0)     -> the upper test is `<=`
+//   f32 <- i32   convert(i32::MAX) rounds UP to 2^31           -> the upper test is `<`
+//   f64 <- i64   convert(i64::MAX) rounds UP to 2^63           -> the upper test is `<`
+//   f32 <- i64   convert(i64::MAX) rounds UP to 2^63           -> the upper test is `<`
+//
+// Every MINIMUM (`i32::MIN`, `i64::MIN`) is a power of two and converts exactly in both float
+// widths, so the lower test is `>=` at all four. NaN fails the integrality compare for free.
+//
+// Leaves an i32 0/1 on the stack; the operand is already staged in the slot for its rep.
+function emitNumExactTest(src: string, tgt: string) {
+  if src == "i64" {
+    // `i64 -> i32`: a pure range test, and never a wrap. The bounds are exact i64 literals.
+    fbLocalGet(numCastI64Slot)
+    fbI64Const(-1, -2147483648) // i64.const -2147483648
+    fbI64GeS()
+    fbLocalGet(numCastI64Slot)
+    fbI64Const(0, 2147483647) // i64.const 2147483647
+    fbI64LeS()
+    fbI32And()
+    return 0
+  }
+  const isF32 = src == "f32"
+  let slot = numCastF64Slot
+  if isF32 { slot = numCastF32Slot }
+  // INTEGRAL: `trunc(d) == d`. A fraction fails it, and so does NaN (no comparison involving
+  // NaN is true), which is the ruling's verdict on a NaN cast arriving for free.
+  fbLocalGet(slot)
+  if isF32 { fbF32Trunc() } else { fbF64Trunc() }
+  fbLocalGet(slot)
+  if isF32 { fbF32Eq() } else { fbF64Eq() }
+  // IN RANGE, lower: `d >= convert(<target>::MIN)`. ±Inf fails one side or the other.
+  fbLocalGet(slot)
+  if tgt == "i32" {
+    fbI32Const(-2147483648)
+    if isF32 { fbF32ConvertI32S() } else { fbF64ConvertI32S() }
+  } else {
+    fbI64Const(-2147483648, 0) // i64.const -9223372036854775808
+    if isF32 { fbF32ConvertI64S() } else { fbF64ConvertI64S() }
+  }
+  if isF32 { fbF32Ge() } else { fbF64Ge() }
+  fbI32And()
+  // IN RANGE, upper — `<=` only where the converted maximum is exact (see the table above).
+  fbLocalGet(slot)
+  if tgt == "i32" {
+    fbI32Const(2147483647)
+    if isF32 { fbF32ConvertI32S() } else { fbF64ConvertI32S() }
+  } else {
+    fbI64Const(2147483647, -1) // i64.const 9223372036854775807
+    if isF32 { fbF32ConvertI64S() } else { fbF64ConvertI64S() }
+  }
+  if isF32 { fbF32Lt() }
+  else if tgt == "i64" { fbF64Lt() }
+  else { fbF64Le() }
+  fbI32And()
+  0
+}
+
+// The conversion itself, reached only where `emitNumExactTest` has already proved it cannot
+// fail — so the TRAPPING instructions are used rather than the saturating ones: an operand
+// that reaches them is in range by construction, and if that were ever false a trap is the
+// honest outcome, not a silent clamp.
+function emitNumExactConvert(src: string, tgt: string) {
+  if src == "i64" {
+    fbLocalGet(numCastI64Slot)
+    fbI32WrapI64()
+    return 0
+  }
+  if src == "f32" {
+    fbLocalGet(numCastF32Slot)
+    if tgt == "i32" { fbI32TruncF32S() } else { fbI64TruncF32S() }
+    return 0
+  }
+  fbLocalGet(numCastF64Slot)
+  if tgt == "i32" { fbI32TruncF64S() } else { fbI64TruncF64S() }
+  0
+}
+
+// THE `as!` TRAP'S REASON, streamed to the host boundary before the abort — the diagnostic
+// half of the old `f64-as-i32-out-of-range` ask, and the same two imports `__trap__("reason")`
+// uses (`__print_char__` then `__print_str_flush__`). Built as CHARACTERS rather than as a
+// synthesized `StrLit` because a string literal minted at emit time is invisible to the collect
+// passes that intern `$sTypeIdx`: a program whose only string is this message would emit a
+// `ref.cast` at a heap index that was never allocated. `scanPrintUse` reserves the four print
+// imports for a fallible `as!` for the same reason it reserves them for `__trap__`.
+//
+// AND THE WORDING IS SIZED, not chosen for prose. Every character is `i32.const` + `call`,
+// about five bytes, so the message is per-SITE code in a cold branch. MEASURED on
+// `bench/arrays/binsearch`, one cast, `-O`: 381 bytes before this ruling, 729 with the first
+// wording (`: value is not exactly representable`), 607 with this one — so the sentence alone
+// was 122 of the 348. `: not exact` says what the ruling says ("exact-or-fail") in the ruling's
+// own word, and the LOCATION is the part a user cannot recover from the backtrace. The
+// remaining +226 a site is the same trade Rust makes for `unwrap`'s panic location. If a program ever
+// carries enough of these to care, the fix is a module-tail helper taking `(line, col)` —
+// `gHelpStrHash`'s block is the pattern — which would cut it to about ten bytes a site; it is
+// not built here because it needs its own digit rendering (`__print_i32__` emits a whole LINE,
+// so it cannot be mixed into a streamed message).
+function emitNumCastTrapMsg(exprIx: i32, tgt: string) {
+  let where = ""
+  if exprIx >= 0 && exprIx < nodeToks.length {
+    const at = nodeToks[exprIx]
+    if at >= 0 && at < P.toks.length {
+      where = " at " +
+        i32ToStr(P.toks[at].line) +
+        ":" +
+        i32ToStr(P.toks[at].col + 1)
+    }
+  }
+  for cp in "as! " + tgt + where + ": not exact" {
+    fbI32Const(cp)
+    fbCall(2) // __print_char__ (import 2)
+  }
+  fbCall(3) // __print_str_flush__ (import 3)
+  0
+}
+
+// THE `null` NODE a bare `as`'s early return hands to `emitReturnValue` — the propagated
+// value, spelled as the thing it is so the RETURN path's seeds (`emitNullLitNode`'s rep table)
+// serve it rather than a second ladder here guessing a null encoding per rep.
+//
+// MINTED FRESH PER SITE, not cached in a module `let`. A cached arena index outliving the
+// program that minted it is the exact hazard `emitProgram`'s sidecar-reset block describes,
+// and the LSP compiles many programs through one instance; a bare numeric `as` is rare enough
+// that one spare node per site costs nothing worth trading that for.
+function numCastNullNode(): i32 { mkNull("null", -1) }
+
+// The three modes, over one test and one conversion.
+//
+//   `as?`   a value-producing `if` whose result IS the `{tag, payload}` union box — the same
+//           rep the union `as?` arm builds and the same one `emitUnionCoerce`'s `NullLit`
+//           builds, so `!= null` on the result sees the null and every delivery position
+//           (binding, return, argument, field, element, global, `??`) already knows it.
+//   `as!`   the reason, then `unreachable`, then the conversion.
+//   `as`    the enclosing function's own `null`, then `return` — the early-exit shape the
+//           union arm's propagating mode uses, with the null built by the RETURN path so
+//           every nullable rep (box / niche / variant) is served by one ladder.
+function emitNumExactCast(body: i32[], e: AsExpr, exprIx: i32, fnIx: i32) {
+  const src = asExprNumSrcName(exprIx)
+  const tgt = asExprNumTgtName(exprIx)
+  // Stage the operand ONCE — the test reads it up to three times and it is typically a call.
+  if src == "i64" {
+    if emitNumIntrArg(body, e.asObj, 3, fnIx) < 0 { return -1 }
+    fbLocalSet(numCastI64Slot)
+  } else if src == "f32" {
+    if emitNumIntrArg(body, e.asObj, 5, fnIx) < 0 { return -1 }
+    fbLocalSet(numCastF32Slot)
+  } else {
+    if emitNumIntrArg(body, e.asObj, 4, fnIx) < 0 { return -1 }
+    fbLocalSet(numCastF64Slot)
+  }
+  if emitNumExactTest(src, tgt) < 0 { return -1 }
+  if e.asMode == "null" {
+    const nck = valueAtomKind(tgt)
+    const nvb = vbHeapIdxOfKind(nck)
+    if nvb < 0 || !uDeclared {
+      return emitFail(
+        "emitProgram: `as? " +
+          tgt +
+          "` has no value box — the `" +
+          tgt +
+          " | null` row was never registered",
+      )
+    }
+    fbIfRefNul(uBoxIdx, false) // if (result (ref $uBox))
+    ctrlEnter()
+    fbI32Const(scalarTagOfKind(nck))
+    if emitNumExactConvert(src, tgt) < 0 { return -1 }
+    fbStructNew(nvb) // wrap the scalar payload
+    fbStructNew(uBoxIdx)
+    fbElse()
+    // THE NULL-TAGGED BOX, not a null box ref — what `T | null` means for a boxed union.
+    fbI32Const(nullBoxTag())
+    fbRefNullNone() // the payload slot is unread under the null tag
+    fbStructNew(uBoxIdx)
+    fbEnd()
+    ctrlLeave()
+    return 0
+  }
+  fbI32Eqz()
+  fbIf(64) // if (void) — the SAD path, the only place the two remaining modes differ
+  ctrlEnter()
+  if e.asMode == "trap" {
+    if emitNumCastTrapMsg(exprIx, tgt) < 0 { return -1 }
+    fbUnreachable()
+  } else {
+    // A bare `as` PROPAGATES. The checker proved the enclosing function returns something
+    // `null` fits, so the value to hand back is that function's own null — built through
+    // `emitReturnValue`, which is where every nullable-return seed already lives.
+    if emitReturnValue(body, numCastNullNode(), fnIx) < 0 { return -1 }
+    fbReturn()
+  }
+  fbEnd()
+  ctrlLeave()
+  emitNumExactConvert(src, tgt)
+}
+
 function emitAsCast(body: i32[], e: AsExpr, _exprIx: i32, fnIx: i32) {
   const obj = e.asObj
   const tgt = e.asTy
@@ -13668,6 +13993,21 @@ function emitAsCast(body: i32[], e: AsExpr, _exprIx: i32, fnIx: i32) {
         }
         return 0
       }
+    }
+  }
+  // NUMERIC EXACT-OR-FAIL (D1041 / json-design §6 q2, owner 2026-09-02) — checked ahead of
+  // the union arm and disjoint from it by OPERAND, exactly as the checker's two arms are.
+  // Only a cast that CAN fail comes here; the lossless and float-target edges fall through to
+  // the plain conversion ladder at the bottom of this function, byte-identical.
+  if asExprNumFallible(_exprIx) {
+    // THE PEEPHOLE the ruling names: `trunc(d) as! i32` / `floor` / `ceil` / `nearest`. The
+    // operand is integral by construction, so the only way the cast can fail is RANGE — and
+    // the trapping `i32.trunc_f64_s` at the bottom of this function already traps on exactly
+    // that. So the spelled lossy truncation costs the one instruction it always cost, with no
+    // test in front of it. `as?` and a bare `as` do NOT take this door: they owe a `null` on
+    // an out-of-range value, which a trap cannot produce.
+    if !(e.asMode == "trap" && exprIsIntegralFloat(obj, fnIx)) {
+      return emitNumExactCast(body, e, _exprIx, fnIx)
     }
   }
   if asExprIsUnionCast(_exprIx) {
@@ -23748,7 +24088,17 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // deferred like the ident/field forms. One slot is sound across nesting: each
   // `??` sets-tests-uses within its own evaluation, and the null arm never reads
   // the box again (so a nested call-LHS `??` in the default may reuse the slot).
-  if lhs is Call {
+  // D1041 — AND AN `as?` YIELDING A BOX IS THE SAME SHAPE. `(d as? i32) ?? 0` produces the box
+  // from an expression that cannot be re-read (re-reading it would re-run the exactness test
+  // AND re-evaluate the operand), which is exactly the property this arm was built for. The
+  // gate is widened rather than a second arm added: the lowering below reads only
+  // `unionNameOfExpr` and the box, both of which the cast answers — and it is the SAME
+  // predicate `coalChainHasCallLhs` reserves the slot on, so the two cannot disagree.
+  if (
+    lhs is Call ||
+    (lhs is AsExpr &&
+      (tyIsNulValueUnionBox(nodeTyIxOf(lhsIx)) || nodeTyIsNulScalarBox(lhsIx)))
+  ) {
     const kunm = unionNameOfExpr(e.binLeft, fnIx)
     if kunm != "" {
       // D-VALUNION + D-SETONCE: one resolution feeds the value-union gate AND the

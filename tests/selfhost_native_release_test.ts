@@ -505,8 +505,14 @@ const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3: ShapeP
     // `std:fmt`. `-O` 2662 -> 3383 bytes, fns 5 -> 6, allocs 30 -> 51; `-O3` 2595 -> 2890,
     // fns 5 (held), allocs 30 -> 50. See `collections/map-string` above for why the two
     // rungs move by different amounts.
-    O: { bytes: 3383, fns: 6, allocs: 51, indirect: 0, refEq: 1 },
-    O3: { bytes: 2890, fns: 5, allocs: 50, indirect: 0, refEq: 1 },
+    //
+    // 2026-09-02, the numeric-`as` ruling (D1041): `main.vl`'s `(seed % (v as! i64)) as! i32`
+    // is an `i64 -> i32` cast, which is now EXACT-OR-FAIL rather than a silent wrap — so the
+    // site carries a range test and a source-located trap message (the message is per-site
+    // `__print_char__` code in the cold branch; see `emitNumCastTrapMsg`). `-O` 3383 -> 3617,
+    // `-O3` 2890 -> 3099, structure unchanged at both rungs. One cast site, ~230 bytes.
+    O: { bytes: 3617, fns: 6, allocs: 51, indirect: 0, refEq: 1 },
+    O3: { bytes: 3099, fns: 5, allocs: 50, indirect: 0, refEq: 1 },
   },
   // ARRAY ELEMENT WRITE + READ, 400M of each, with the allocation hoisted out of the steady
   // state by construction. `fns: 1` is the load-bearing pin: every element accessor has been
@@ -526,8 +532,15 @@ const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3: ShapeP
   {
     bench: "arrays/binsearch",
     axis: "binary search over a sorted i32 array",
-    O: { bytes: 381, fns: 1, allocs: 2, indirect: 0 },
-    O3: { bytes: 346, fns: 1, allocs: 2, indirect: 0 },
+    //
+    // 2026-09-02, the numeric-`as` ruling (D1041): the SETUP loop's
+    // `(seed % (3 * n as! i64)) as! i32` is exact-or-fail now, so it carries a range test and
+    // a source-located trap message. `-O` 381 -> 607, `-O3` 346 -> 558, structure unchanged.
+    // This is the row where that cost is most visible — the kernel is 381 bytes, so ONE cast
+    // site is +59% — and it is visible because the module is tiny, not because the loop got
+    // slower: the added code is a cold branch outside the search loop.
+    O: { bytes: 607, fns: 1, allocs: 2, indirect: 0 },
+    O3: { bytes: 558, fns: 1, allocs: 2, indirect: 0 },
   },
   // STRUCT FIELD THROUGH AN ARRAY (array-of-structs). Adds a `struct.get` per element to the
   // fill-sum shape, and `allocs: 3` says the per-element structs are allocated once during
