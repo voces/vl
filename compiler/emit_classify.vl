@@ -18979,6 +18979,19 @@ export function globalCellKind(letIx: i32): VKind {
     // asks `globalCellKind`, and `globalIsNulList` now asks `letIsNulListInfer` — the
     // same predicate this arm uses.
     if letInfersNulClosure(letIx, -1) { return "nulclosure" }
+    // A BARE MAP READ (`const g = m[k]`) at MODULE scope — the local ladder's
+    // `letNulMapReadValKind` arm, mirrored so a global agrees with a same-typed local on its
+    // cell kind (D1040). Without it a module-scope read of a REF-ARRAY-valued map got no
+    // nullable cell at all and `is` / `!= null` over it reached the `uDeclared` floor on a
+    // `vl check`-clean program, while the IDENTICAL code inside a function ran.
+    //
+    // BEFORE the `nullist` arm below and the scalar-list ones after it, exactly as in the
+    // local ladder: this classifier answers the value's established nullable kind for every
+    // mv value rep at once, and the arms below claim only the subset they name. The i32-list
+    // and nested-map reps reached a cell by luck of that ordering; the ref-array rep had no
+    // arm to fall into. The matching SLOT is in `letAnnRefListSlot`.
+    const gMapRead = letNulMapReadValKind(letIx, -1)
+    if gMapRead != null { return gMapRead }
     if letIsNulListInfer(letIx, -1) { return "nullist" }
     // A DISTINCT-backing nullable scalar list (`string[]|null`, `f64[]|null`, `i64[]|null`,
     // `f32[]|null`) bound to a CALL (`const r = mk()`): its own `(ref null $wrapper)` cell,
@@ -33378,7 +33391,29 @@ export function letAnnRefListKind(letIx: i32) {
 // so an empty `[]` initializer builds the annotation's distinct element type.
 export function letAnnRefListSlot(letIx: i32) {
   const d = P.nodes[letIx]
-  if d is LetDecl { return tyAnnRefListSlot(d.letType) }
+  if d is LetDecl {
+    // AN UN-ANNOTATED MAP READ HAS NO ANNOTATION TO NAME ITS SLOT, AND `0` IS A WRONG
+    // ANSWER RATHER THAN A MISSING ONE (D1040). `const g = m[k]` over a `{[string]: P[]}`
+    // is a kind-18 binding with `d.letType < 0`, so `tyAnnRefListSlot` returns the 0 this
+    // function documents as "not a ref-array annotation" — and 0 is also a REAL slot, the
+    // first one. Every consumer therefore typed such a global from slot 0: with two of them
+    // in one module the cells shared a wrapper heap type while the reads produced their own,
+    // which is `type mismatch: expected (ref null $type), found (ref null $type)` on a
+    // check-clean program (each global fine ALONE).
+    //
+    // FIXED HERE RATHER THAN AT A CALLER because there are NINE call sites — the global cell
+    // valtype and its `ref.null` zero, the init-seeding branch, `pendingListSlot`, and the
+    // read-side classifiers — and a binding whose slot this function cannot name is one
+    // question, not nine. `letNulMapReadSlotArg` is the LOCAL ladder's own slot argument for
+    // exactly these bindings, so a global and a same-typed local resolve one slot from one
+    // helper.
+    if d.letType < 0 {
+      if letNulMapReadValKind(letIx, -1) != null {
+        return letNulMapReadSlotArg(letIx, -1)
+      }
+    }
+    return tyAnnRefListSlot(d.letType)
+  }
   0
 }
 
