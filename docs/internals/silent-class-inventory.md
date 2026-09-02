@@ -32212,7 +32212,10 @@ Repro:
 
 ### D1038 — narrowing a LIST- or MAP-valued map READ with `is` is check-clean and refused at emit: `` `is` test but no union type declared ``
 
-**loud emit reject on a `vl check`-clean program — OPEN, clause 2**
+**runs, prints `5` — CLOSED 2026-09-02 by giving the map read its own arm in the three list
+classifiers and the map one, so the receiver the checker already calls nullable is CLAIMED by
+a rep predicate · zero `runs` lost · `tests/cases/maps/map-read-list-value-null-narrowing.vl`
+· closed D1039 with it · REMAINDER: a REF-ARRAY value (`{[string]: P[]}`) is [D1040]**
 
 Repro:
 
@@ -32244,7 +32247,10 @@ Repro:
 
 ### D1039 — the same map read compared `!= null` is check-clean and refused with a different message: `emitProgram: bare null needs a struct-typed context`
 
-**loud emit reject on a `vl check`-clean program — OPEN, clause 2**
+**runs, prints `5` — CLOSED 2026-09-02 with D1038, and the two messages WERE one mechanism:
+both spellings funnel into `emitNulIsNullTest`, whose six rep predicates all answered false
+for a map read. Filing them apart was right — the ablation, not the message, is what merged
+them · zero `runs` lost · `tests/cases/maps/map-read-list-value-null-narrowing.vl`**
 
 Repro:
 
@@ -32259,4 +32265,30 @@ Repro:
   reject the same program" would be the same mistake in the other direction.
 
 * `?? []` runs, so the value IS readable — what neither spelling has is the null test.
+
+
+### D1040 — a map whose value is a REF ARRAY (`{[string]: P[]}`) gives its un-annotated read binding NO local kind at all
+
+**loud emit reject on a `vl check`-clean program — OPEN, clause 2**
+
+Repro:
+
+    type P = { x: i32 }
+    const m: { [string]: P[] } = Map()
+    m["a"] = [{ x: 7 }]
+    const g = m["a"]
+    if g is P[] { print(g[0].x) }
+
+* **The REMAINDER of [D1038], and NOT the same mechanism.** D1038 closed the map-read rung in
+  four classifiers; a scalar-list value (`i32[]`, `string[]`, `f64[]`) and a nested-MAP value
+  all narrow now, at both spellings and both positions. A ref-array value still refuses.
+
+* **AND ITS ARM IS NEVER REACHED — measured, so the obvious fix is ruled out.** The same
+  map-read arm was added to `exprNullableRefArray` and instrumented: it does not fire at all
+  for this program. `declaredKind("g")` is `<null>` — the let-slot ladder assigns the binding
+  NO kind, so nothing ever asks the predicate. The hole is one level up from where D1038's
+  was, in the ladder rather than in the classifier.
+
+* The ANNOTATED spelling (`const g: P[] | null = m["a"]`) works, as it does for every shape in
+  this family — the annotation pins the rep and never consults the initializer (D969).
 
