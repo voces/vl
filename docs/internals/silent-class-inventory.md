@@ -29849,7 +29849,7 @@ not a function name`:
 
 ### D1015 — a bare array literal of STRINGS at a recursive-union destination gets an array whose ELEMENT rep is wrong: `for in` read-back is check-clean invalid wasm, an INDEXED read-back runs
 
-**check-clean invalid wasm · check rc 0 · `Invalid input WebAssembly code at offset 350: type mismatch: expected (ref $type), found (ref $type)` · the ingredient is the BARE literal at the union destination — `const a: K[] = ["x"]` then `const c: K = a` RUNS and prints `x` · and it is NOT element read-back in general: `if c is K[] { const e = c[0]; if e is string { print(e) } }` on the same bare literal RUNS and prints `x`, while `print(c.length)` on it RUNS and prints `1` · `f64` and `boolean` elements RUN at the identical bare spelling · found by the serde round-3 appendix (residue (b)), and the indexed-read-back scope fact measured by the coordinator 2026-09-01 and confirmed here**
+**closed · was check-clean invalid wasm · clause 1 · `tests/cases/types/recursive-union-for-in-module-scope.vl`**
 
 The bare literal builds an array that exists and has the right length; what it does not have
 is an element rep the narrowed read-back agrees with. Which read-back exposes that depends on
@@ -29935,21 +29935,17 @@ Repro (check-clean invalid wasm):
   with `-1`** — the module-level one. That is where the `#l` temp's kind is fixed for a
   top-level `for in`.
 
-* **A RUNG IN `forInElemKind` DOES NOT REACH IT, and the timing story is now the measured
-  one.** Four probes: a narrowed-arm rung ahead of `exprStringArray`; the same rung forced to
-  return `"union"` for ANY narrowed atom; that forced rung moved to the very TOP of the ladder
-  (in case an earlier `return "str"` was winning); and forcing `setNarrowFromCond` to push for
-  this receiver regardless of `exprUnion`. **None moves the witness.**
+* **CLOSED, AND THE LOOKUP WAS THE PROBLEM — not timing, not the narrowing.** Four things
+  that each look like the cause and are not: the narrowing machinery works at module scope
+  (`is string`, `.length` and the INDEXED read-back all run); forcing `setNarrowFromCond` to
+  push changes nothing, because the push already happened; a flag set at push time reads TRUE
+  inside `forInElemKind`, so the ordering is fine; and a rung keyed off `narrowedValueAtomOf`
+  never fires even at the TOP of the ladder, because that helper answers `""` for a
+  module-level receiver.
 
-  The last one matters most: forcing the narrowing push changes nothing, which means the push
-  was already happening — `exprUnion` answers at module scope, consistent with `is string`,
-  `.length` and the indexed read all running. And the top-of-ladder rung reading `""` means
-  `narrowedValueAtomOf` genuinely has no record AT THAT MOMENT.
-
-  So the narrowing is pushed and the record is not visible where the `#l` kind is chosen. That
-  is a TIMING or SCOPE mismatch between `collectLocalsIf`'s push and `declareForInLocals`'s
-  read — the next step is to instrument which of those two runs first for a module-level
-  `for in` nested in an `if`, not to add a fifth rung.
+  The rung is therefore keyed off `narrowSlotOf` + `narrowVariants`, and returns `"union"`
+  when the narrowed variant is an array whose element names a union. The same program inside
+  a FUNCTION always ran — its receiver is a local — so both scopes are pinned in the fixture.
 
 * So the target is one classifier, not the literal's construction: **a for-in over a
   narrowed union arm must take its element kind from the ARM, not from the values the literal
