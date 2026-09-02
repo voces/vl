@@ -80,6 +80,7 @@ import {
   fnRequiredArity,
   fnTpBoundOf,
   i32ToStr,
+  isBodyTyDecl,
   mkFieldInit,
   mkNum,
   mkObjLit,
@@ -3437,9 +3438,17 @@ function modRenamed(name: string): string {
   modRenameTo[row]
 }
 // A TYPE-position name: annotations are SYNTHETIC strings ("A|B", "Point[]",
-// "Box<i32>"), so rewrite identifier SEGMENTS through the rename map (types are
-// never shadowed by locals — VL has no local type declarations). Quoted
+// "Box<i32>"), so rewrite identifier SEGMENTS through the rename map. Quoted
 // string-literal segments (`"a"|"b"`) are copied verbatim.
+//
+// A BLOCK-LOCAL TYPE NEEDS NO SHADOW ENTRY, and since D1045 that is a statement
+// about the mangling rather than about the language: a `type` declared in a body
+// IS legal and lexically scoped, but the parser resolves that scope by minting the
+// declaration under a unique name (`P` → `P$b7`) and spelling every reference at
+// it, so by the time the merge runs there is nothing left for `modShadow` to hide.
+// What the merge must not do is visit such a declaration TWICE — `modRwStmt`'s
+// `Program` arm skips it, because this scanner sees only "an identifier run" and
+// would rename the `P` of `P$b7` against a top-level `P`.
 //
 // Both halves of the walk are the leaf's (W8): the identifier CHARACTER CLASS is
 // `tyname.nameIdentChar`, and where a quoted member ENDS is `tyname.skipQuotedName`, so a
@@ -3688,7 +3697,15 @@ function modRwStmt(ix: i32): i32 {
   if n is Program {
     let i = 0
     while i < n.progStmts.length {
-      modRwStmt(n.progStmts[i])
+      // D1045 — A BODY-SCOPED `type` IS IN THIS LIST TWICE OVER, once here (the
+      // parser hoists it so the checker and the emitter register it) and once at
+      // its lexical position inside a block. Rewrite it THERE, never here: the
+      // lexical visit runs with `modTyShadow` holding the enclosing function's
+      // type parameters, which a declaration that CAPTURED one (`P$b7<T>`) needs,
+      // and a second visit would run the declared name through `modTypeRenamed`
+      // twice — whose identifier-RUN scanner would happily rename the `P` segment
+      // of an already-mangled `P$b7` if the module also declares a top-level `P`.
+      if !isBodyTyDecl(n.progStmts[i]) { modRwStmt(n.progStmts[i]) }
       i = i + 1
     }
     return 0

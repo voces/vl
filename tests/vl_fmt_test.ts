@@ -1894,3 +1894,73 @@ Deno.test({
     }
   },
 });
+
+// D1045 — A BODY-SCOPED `type` SURVIVES `vl fmt`, and the two ways it did not are
+// both the parser's scoping mechanism leaking into the printer.
+//
+// The declaration is minted under a UNIQUE name (`P` -> `P$b1`) and HOISTED into
+// `progStmts` so the checker and the emitter register it, while staying at its
+// lexical position inside the block. Two consequences, both measured as `vl fmt`
+// failures before they were fixed:
+//
+//   * the top-level statement walk reached the declaration a SECOND time and
+//     printed a stray copy at the end of the file (the same reason `ImportDecl`
+//     is filtered there);
+//   * three printers take a name from the NODE rather than from the source span --
+//     an `Ident`, an `is` check-type and an `as` target -- so a `flat type TV`'s
+//     `TV.size` fold printed `TV$b1.size` and `11 as Id` printed `11 as Id$b1`,
+//     neither of which re-parses. `vl fmt -w` refuses to write unparseable text,
+//     so the symptom was `formatter produced invalid output`: `vl fmt` failing
+//     outright on a legal program.
+//
+// The idempotency check is the assertion that matters -- a mangled spelling either
+// trips the round-trip gate (rc != 0) or comes back changed.
+Deno.test({
+  name: "vl-fmt: a body-scoped `type` round-trips (no duplicate, no mangled name)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const src = [
+      "type P = { x: i32 }",
+      "function shadows(): i32 {",
+      "  type P = { x: i32, y: i32 }",
+      "  const p: P = { x: 1, y: 2 }",
+      "  return p.x + p.y",
+      "}",
+      "function nominal(): i32 {",
+      "  type Id = new i32",
+      "  const i: Id = 11 as Id",
+      "  return i as i32",
+      "}",
+      "function flatRec(): i32 {",
+      "  flat type TV = { a: i32, b: i32 }",
+      "  return TV.size",
+      "}",
+      "print(shadows() + nominal() + flatRec())",
+      "",
+    ].join("\n");
+    const r = await run([], src);
+    if (r.code !== 0) {
+      throw new Error(`vl fmt rejected valid source (rc ${r.code}):\n${r.err}`);
+    }
+    if (r.out.includes("$b")) {
+      throw new Error(
+        `a block-scope mangled name leaked into the output:\n${r.out}`,
+      );
+    }
+    // Each local declaration appears exactly ONCE — the hoisted copy must not print.
+    const count = (needle: string) => r.out.split(needle).length - 1;
+    if (count("type P = { x: i32, y: i32 }") !== 1) {
+      throw new Error(`the hoisted declaration printed twice:\n${r.out}`);
+    }
+    if (count("type Id = new i32") !== 1 || count("flat type TV") !== 1) {
+      throw new Error(`a hoisted declaration printed twice:\n${r.out}`);
+    }
+    if (r.out !== src) {
+      throw new Error(`already-canonical source was reformatted:\n${r.out}`);
+    }
+    const again = await run([], r.out);
+    if (again.code !== 0 || again.out !== r.out) {
+      throw new Error(`not idempotent (rc ${again.code}):\n${again.out}`);
+    }
+  },
+});

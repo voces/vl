@@ -4360,13 +4360,67 @@ stands unless the owner objects.**
   in a local binding, argument, or `is` never reaches a signature, so the question of what a
   caller sees does not arise.
 
-**Interim, shipping first: the DECLARATION refuses loudly.** Until scoping is built, the
-checker's body walk rejects a `TypeDecl` where it stands with `` a `type` declaration is
+**Interim, shipped first: the DECLARATION refused loudly.** Until scoping was built, the
+checker's body walk rejected a `TypeDecl` where it stood with `` a `type` declaration is
 module-scope only for now (D1045 — ruled legal, not yet built); move `P` to module scope ``,
-at the declaration's line, on every spelling — so the three faces collapse into one message
-that names the rule and the row. This is clause-2 hygiene, not progress on `runs`, and it is
-scheduled that way: the loud refusal is small and lands ahead; the scoping build is the
+at the declaration's line, on every spelling — so the three faces collapsed into one message
+that named the rule and the row. This was clause-2 hygiene, not progress on `runs`, and it was
+scheduled that way: the loud refusal was small and landed ahead; the scoping build was the
 ROADMAP item. Measured 2026-09-02 on seed 42604b65; witnesses under D1045 and D1046.
+
+**BUILT (#2391), 2026-09-02 — and the build settled three things the ruling left open.**
+The interim is removed with it.
+
+*Where the name is resolved: the MODULE MERGE'S mechanism, one scope in.* The ruling said
+"lexically scoped" and left the resolution open; a scope CHAIN in the checker was the obvious
+reading and is the wrong one, because a type name in this compiler is answered by more than
+one producer — the checker's `cUserTypes`, canon's rendered spelling, and the emitter's
+per-name tables — and a checker-only chain would have them agreeing about the TYPE and
+disagreeing about the REP. The merge already faced the identical problem (two modules may each
+declare a `Pair`) and answered it by RENAMING: `typecheck.tyToStr`'s header says in so many
+words that `Pair$m1` and `Pair` are different types to the tables that hold them. Two FUNCTIONS
+may each declare a `P`, so the same answer serves — the parser mints a body-scoped declaration
+under a unique name (`P` → `P$b7`), spells every reference in its lexical extent at that name,
+and HOISTS the declaration node into `progStmts`. The hoist is what makes the rest free, and
+it was measured rather than assumed: the checker's passes 0a–0d and every emitter registry
+build (`collectS`, `collectU`, `gaeCollectDecls`, `resolveFlatLayouts`, …) read
+`root.progStmts` and only `root.progStmts`. `demangleMsg` strips `$b<digits>` beside
+`$m<digits>`, so nothing user-facing changes. **In the PARSER**, because recursive descent is
+lexical by construction — "the rest of this block" and "the enclosing function's type
+parameters" are both already on its stack — and because `parseTypeAtom`'s IDENT arm is the ONE
+substitution site every type-position name in the language reaches, which makes the coverage a
+property of the grammar rather than of a list of positions.
+
+*Type-parameter capture is a GENERIC ALIAS, and only of the parameters actually mentioned.*
+`type P = { a: T }` inside `f<T>` is minted `type P$b7<T> = { a: T }` and referred to as
+`P$b7<T>`, so the per-instance substitution is the one the language already performs for a
+module-scope `Pair<A>` applied at a type parameter — measured to run at two pins before the
+build started, which is what made this a reuse rather than a new mechanism. Capturing every
+live parameter unconditionally was tried and refused on a measurement: a local `type Id = new
+i32` in a generic body would become a GENERIC newtype, which pass 0a does not support, so the
+declaration would silently stop being nominal. The capture set is therefore decided by a
+bounded token lookahead over the rest of the declaration — the answer is needed BEFORE the
+body is parsed, because a recursive `type N = { next: N | null }` spells its own name while
+the body is being read and must carry the same arguments every other reference does.
+
+*What the ruling got wrong, and the residue it did not name.* **(a)** The ruling's sentence
+"nothing about the type's REP changes … two local declarations of the same shape in two
+functions are the same type" is true of ASSIGNABILITY and had to be checked for the REP; it
+holds, because two same-shaped module-scope declarations under different names are already
+mutually assignable and share a heap type (measured before the build). **(b)** D1046 was
+UNDER-FILED as a loud emit reject: two further spellings of a nested named function naming
+`T` — a return-only `T`, and a fully concrete signature capturing a `T`-typed local — were
+`vl check`-clean INVALID WASM, which no narrowing of `checkParams`' message could have
+reached, since that floor reads parameters only. **(c)** A residue the ruling's table does not
+cover: a RECURSIVE local type inside a GENERIC function that mentions the type parameter
+becomes a recursive generic alias and inherits the pre-existing module-scope refusal
+`recursive generic type … is not supported — its expansion has no finite type name`. The
+module-scope spelling refuses identically, so the local spelling inherits the gap rather than
+introducing one. **(d)** The build also had to reach `vl fmt`, which the ruling never
+mentions: the formatter prints an `Ident`, an `is` check-type and an `as` target from the NODE
+rather than the source span, so a parser-side rename leaks into a file `vl fmt -w` writes
+back — `TV$b1.size`, `11 as Id$b1`, neither of which re-parses. Demangled at those three
+prints, with the scan given one home in the zero-import leaf (`tyname.demangleSpelling`).
 
 ## A failed assertion is located at the MATCHER, not at `expect` (owner, 2026-09-02) — BUILT (#2386)
 

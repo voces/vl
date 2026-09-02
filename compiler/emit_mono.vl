@@ -294,6 +294,60 @@ import { collectValuedReturnsIn } from "./emit_query"
 // the whole defect. Recorded here and re-pointed the moment the instance is lifted.
 let monoLamMintedSlots: i32[] = []
 
+// D1046 — IS THIS THE FIRST INSTANCE OF THE GENERIC BEING BUILT? Set beside
+// `monoLamMintedSlots` at the one `monoPinBodyLambdas` call site, and read by the
+// NESTED NAMED FUNCTION arm alone, which needs it for a reason the anonymous-lambda
+// arm does not have: a lambda is reached through the BINDING the clone is written
+// into, so template and clone can coexist, while a named nested function is called
+// BY NAME through the lexical frame chain (`nestedFnDeclaredIn`, first match wins).
+// At `count == 0` the instance REUSES the template's own slot (`fnStmts[origFe] =
+// nfn`), so template and clone would be two children of one frame under one name
+// and the call would answer the unsubstituted template. The first instance
+// therefore REPLACES the template's lifted slot instead of pushing beside it.
+let monoInstIsFirst = false
+
+// D1046 — the lifted slot a NAMED nested template was replaced in, keyed by the
+// template's own node. The first instance overwrites `fnStmts[slot]` (above), which
+// breaks the "scan `fnStmts` for this node" lookup that `monoLamNodeIsTemplate` and
+// the capture-only rung both use to find a template's slot — and that lookup answering
+// -1 at the SECOND instance turns a capture-only template into "not a template",
+// silently sharing one env struct across two pins, which is D943 exactly.
+const monoNamedTmplNode: i32[] = []
+const monoNamedTmplSlot: i32[] = []
+
+// The lifted slot holding node `fnIx` — the plain scan, plus the replacement table for
+// a named template whose slot now holds its first instance. One home, because two
+// call sites asked the same question with the same loop and only one of them would
+// have been fixed.
+function monoSlotOfLamNode(fnIx: i32) {
+  let fe = 0 - 1
+  let k = 0
+  while k < fnStmts.length {
+    if fnStmts[k] == fnIx { fe = k }
+    k = k + 1
+  }
+  if fe >= 0 { return fe }
+  let r = 0
+  while r < monoNamedTmplNode.length {
+    if monoNamedTmplNode[r] == fnIx { return monoNamedTmplSlot[r] }
+    r = r + 1
+  }
+  -1
+}
+
+// Is `nm` a SOURCE function name rather than the emitter's synthesized lambda name?
+// `collectFns` rewrites an anonymous lambda's empty name to `__lambda_N` BEFORE
+// monomorphize runs, so `fnName != ""` is true of every lifted lambda and is not the
+// test — reading it as one made every capturing lambda take the named path and lose
+// its per-instance env (measured: `function k<T>(x: T) { const via = () => x; … }`
+// went from `runs` to invalid wasm). Same rule as `criFnIsAnonLambda`, asked of a name
+// rather than of a slot.
+function monoFnNameIsSourceNamed(nm: string) {
+  if nm == "" { return false }
+  if nm.length >= 8 && nm.slice(0, 8) == "__lambda" { return false }
+  true
+}
+
 function monoArgFnTypeName(argIx: i32, _fnIx: i32) {
   const ax = unwrapParen(argIx)
   const an = P.nodes[ax]
@@ -1967,12 +2021,7 @@ function monoCloneLambdaSubst(
     // each `T`.
     let capOnly = false
     if !any {
-      let feC = 0 - 1
-      let kc = 0
-      while kc < fnStmts.length {
-        if fnStmts[kc] == fnIx { feC = kc }
-        kc = kc + 1
-      }
+      const feC = monoSlotOfLamNode(fnIx)
       if feC >= 0 {
         if captureCountOf(feC) > 0 { capOnly = true }
       }
@@ -2011,8 +2060,16 @@ function monoCloneLambdaSubst(
         }
       }
     }
-    const nm = "__lambda_" + i32ToStr(lambdaCtr)
-    lambdaCtr = lambdaCtr + 1
+    // D1046 — A NESTED NAMED FUNCTION KEEPS ITS NAME. An anonymous lambda is reached
+    // through the value the clone is written into, so a minted `__lambda_N` is
+    // invisible; a nested `function id(a: T): T` is reached BY NAME through the frame
+    // chain, so renaming it would leave every call in the instance body resolving to
+    // nothing.
+    let nm = a.fnName
+    if !monoFnNameIsSourceNamed(nm) {
+      nm = "__lambda_" + i32ToStr(lambdaCtr)
+      lambdaCtr = lambdaCtr + 1
+    }
     const noTP: string[] = []
     // D951 — AN `is T` INSIDE THE LAMBDA'S BODY. The body is otherwise shared with the
     // template (this function's header), which is right for every operand the emitter
@@ -2022,6 +2079,23 @@ function monoCloneLambdaSubst(
     // type-parameter spelling in it returns the SAME node index and keeps sharing.
     const nbody = monoFoldTyParamLayout(a.fnBody, typarams, tvN, tvV)
     const clone = mkFunc(nm, noTP, ps, nret, nbody, a.pos)
+    // D1046 — THE FIRST INSTANCE OF A NAMED NESTED FUNCTION REPLACES THE TEMPLATE'S
+    // SLOT rather than pushing beside it. See `monoInstIsFirst`: the by-name lookup
+    // takes the FIRST child of the frame, and at `count == 0` the instance reuses the
+    // template's frame, so two same-named children means the call answers the
+    // unsubstituted template — a silently wrong callee rather than a loud one.
+    // Later instances push and are re-pointed at their own frame by the caller.
+    if monoFnNameIsSourceNamed(a.fnName) && monoInstIsFirst {
+      const tSlot = monoSlotOfLamNode(fnIx)
+      if tSlot >= 0 {
+        fnStmts[tSlot] = clone
+        monoNamedTmplNode.push(fnIx)
+        monoNamedTmplSlot.push(tSlot)
+        fnValUsed = true
+        monoNoteLamNode(monoLamPinned, fnIx)
+        return clone
+      }
+    }
     fnStmts.push(clone)
     // THE ORIGINAL'S FRAME, not module scope. The clone shares the body, so its free names
     // have to resolve up the SAME scope chain or a lambda that both captures and annotates
@@ -2086,6 +2160,23 @@ function monoPinBodyLambdas(
     const ci = monoPinBodyLambdas(n.letInit, typarams, tvN, tvV, bN, bT)
     if ci == n.letInit { return ix }
     return mkLet(n.letKw, n.letName, n.letType, ci, n.pos)
+  }
+  // D1046 — A NESTED NAMED `function` STATEMENT IS THE DECLARATION FORM OF THE SAME
+  // THING, and it was the one statement kind this walk had no arm for. `collectFns`
+  // lifts it exactly like a lambda, so one lifted slot served every instance at the
+  // UNSUBSTITUTED type — loud at `checkParams` when a PARAMETER names `T` (the message
+  // still says "a lambda"), and check-clean INVALID WASM in the two spellings that
+  // floor never reads: a return-only `T`, and a fully concrete signature that CAPTURES
+  // a `T`-typed local (D943's defect at the named spelling).
+  //
+  // THE STATEMENT ITSELF EMITS NOTHING (`wasmEmit.emitStmt`'s `FuncDecl` arm), so the
+  // node this returns is immaterial — the lifted SLOT is the whole effect. The
+  // statement is returned unchanged so the spine stays shared when nothing was minted.
+  if n is FuncDecl {
+    if monoFnNameIsSourceNamed(n.fnName) {
+      monoCloneLambdaSubst(ix, typarams, tvN, tvV, bN, bT)
+    }
+    return ix
   }
   if n is RetStmt {
     const ca = monoPinBodyLambdas(n.retArg, typarams, tvN, tvV, bN, bT)
@@ -2236,12 +2327,7 @@ function monoLamNodeIsTemplate(fnIx: i32, typarams: string[]) {
     // the direction that matters: an extra clone is a correct clone, only larger. Measured
     // rather than assumed: zero `runs` lost and zero cells moved to silent over the
     // distilled corpus, and the self-host fixpoint holds.
-    let feIx = 0 - 1
-    let k = 0
-    while k < fnStmts.length {
-      if fnStmts[k] == fnIx { feIx = k }
-      k = k + 1
-    }
+    const feIx = monoSlotOfLamNode(fnIx)
     if feIx >= 0 {
       if captureCountOf(feIx) > 0 { return true }
     }
@@ -4154,6 +4240,7 @@ function monoMakeInstance(
     // has already lifted it and the one lifted function then served every instance at the
     // unsubstituted type. Copy-on-write: a body with no such lambda is the same node index.
     monoLamMintedSlots = []
+    monoInstIsFirst = count == 0
     const instBody0L = monoPinBodyLambdas(
       instBody0,
       fn.fnTyParams,
