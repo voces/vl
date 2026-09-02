@@ -1349,6 +1349,8 @@ export const createWasmChecker = (
   // `for-step-zero` are advisories, not dead code — not tagged.)
   const UNNECESSARY_CODES = new Set([
     "unused-import",
+    // A repeated specifier binds nothing new — dead in the same sense.
+    "duplicate-import",
     "unused-variable",
     "unused-function",
     "constant-condition",

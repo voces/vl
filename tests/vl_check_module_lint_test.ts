@@ -129,3 +129,71 @@ Deno.test({
     }
   },
 });
+
+// `duplicate-import` over a module GRAPH (the owner's ruling of 2026-09-02: the
+// same source twice should lint). The corpus's `tests/cases/modules/` tier does
+// NOT adjudicate lint — `cases_wasm_test.ts` runs it on SINGLE-FILE cases only —
+// so this is the graded pin for the warning's message and anchor on a real
+// multi-module program, beside the single-file pin in `tests/cases/lint/`.
+const DUP_MAIN = `import { Pair, add } from "./helper"
+import { add } from "./helper"
+
+export function total(p: Pair): i32 { return add(p.l, p.r) }
+`;
+
+// The near miss on the SAME line count: one name from TWO sources is not this
+// lint, it is `modDiagDupImport`'s ERROR (D1120) — asserted here so the two
+// diagnostics cannot silently swap places.
+const AMBIG_MAIN = `import { add } from "./helper"
+import { add } from "./other"
+
+export function total(): i32 { return add(1, 2) }
+`;
+
+Deno.test({
+  name:
+    "vl-check-module-lint: a repeated specifier warns duplicate-import; two sources still ERROR",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_check_moddup_" });
+    try {
+      await Deno.writeTextFile(`${dir}/helper.vl`, HELPER);
+      await Deno.writeTextFile(`${dir}/main.vl`, DUP_MAIN);
+      const r = await check("main.vl", dir);
+      // Anchored at the SECOND occurrence's name token — line 2.
+      if (
+        !/main\.vl: warning \[2:\d+\] Duplicate import `add` from "\.\/helper" \(remove one\)/
+          .test(r.out)
+      ) {
+        throw new Error(`missing duplicate-import in main.vl:\n${r.out}`);
+      }
+      // Exactly one finding: the FIRST specifier is the one that binds and is
+      // neither duplicated nor (since its twin absorbs the uses) unused.
+      const hits = r.out.match(/Duplicate import `add`/g) ?? [];
+      if (hits.length !== 1) {
+        throw new Error(`expected 1 duplicate-import, got ${hits.length}:\n${r.out}`);
+      }
+      if (/Unused import `add`/.test(r.out)) {
+        throw new Error(`a duplicated import must not ALSO read unused:\n${r.out}`);
+      }
+      if (!/Found 0 errors/.test(r.out)) {
+        throw new Error(`a repeated specifier must stay legal:\n${r.out}`);
+      }
+
+      // Two DIFFERENT sources: the driver's error, and no lint on top of it.
+      await Deno.writeTextFile(`${dir}/other.vl`, HELPER);
+      await Deno.writeTextFile(`${dir}/main.vl`, AMBIG_MAIN);
+      const r2 = await check("main.vl", dir);
+      if (!/error \[2:\d+\] Duplicate binding "add"/.test(r2.out)) {
+        throw new Error(`missing the D1120 error:\n${r2.out}`);
+      }
+      if (/Duplicate import `add`/.test(r2.out)) {
+        throw new Error(
+          `the lint keys on identical specifier TEXT — it must not fire here:\n${r2.out}`,
+        );
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
