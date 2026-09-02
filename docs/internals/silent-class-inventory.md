@@ -31522,7 +31522,11 @@ Repro:
 
 ### D1032 — a bare `return` is refused at EMIT when the function's result type is INFERRED non-void, and the thing that makes it non-void can be a tail `if` block ending in a `push`
 
-**loud emit reject · check rc 0 · clause 2 · `emitProgram: bare return is not supported`, reported at the FUNCTION NAME rather than at the `return` · found 2026-09-02 building `std/json.vl`, whose renderer was void and used bare returns as guard clauses · TWO one-token route-arounds, both measured: annotate `: void`, or end the body with a statement**
+**runs, prints `1` — CLOSED 2026-09-02 by letting a BARE `return` in the body veto the
+nullable inference in `computeVoidFns`, the sibling of [D1034](#d1034)'s empty-arm veto · the
+message is also rewritten, since it was false as written · zero `runs` lost ·
+`tests/cases/functions/bare-return-inferred-void.vl` · was a loud emit reject at the FUNCTION
+NAME, clause 2**
 
 Repro:
 
@@ -31571,6 +31575,24 @@ Repro:
   because its last expression is …`, and point at that expression.
 
 ---
+
+* **A BARE `return` IS THE AUTHOR SETTLING THE QUESTION.** You cannot `return;` out of a
+  function that owes a value, so its presence in the body is a written statement that this
+  function returns nothing — and it now vetoes the nullable inference exactly as an empty tail
+  arm does ([D1034](#d1034)). Both are "the source says void" beating "the inference guessed
+  non-void", and both were needed because the inference reaches its answer from a `push` in a
+  tail `if` that nobody wrote a return type for.
+
+* **THE MESSAGE WAS FALSE AS WRITTEN, and the row said so.** A bare `return` IS supported and
+  lowers to `0x0f` two lines above the reject; what was refused is a bare return from a
+  NON-VOID function. "not supported" sends a reader looking for a missing keyword lowering
+  instead of at why their function is non-void — which, with no annotation anywhere in the
+  source, is the one thing they need to be told. It now says that, and names both
+  route-arounds.
+
+* **THE CONTROL IS IN THE FIXTURE.** A veto that fired on any `return` would reclassify a
+  genuinely value-returning function as void; `function g(n: i32): i32 { if n == 0 { return 5 }
+  7 }` is pinned beside the witness for that reason.
 
 ### D1033 — a STRING INDEX passed directly to a value-union parameter is check-clean invalid wasm when the string was narrowed out of a union carrying a RECURSIVE MAP arm; hoisting the index runs
 
