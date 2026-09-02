@@ -32082,6 +32082,18 @@ Repro:
   So the value type EXISTS and only its rendering is empty — the render of 43 recurses into
   44 (the map), which revisits 43, and the nameless cycle collapses the whole spelling. The
   guard answers `""` under BOTH orders, so what differs is which of the pair got a fresh
-  resolved index, not what the guard does with it. A fix has to give the renderer a name for
-  a RESOLVED index without calling the resolver — a reverse table populated where the
-  resolution happens, rather than any scan bolted onto `aliasNameOfTyIx`.
+  resolved index, not what the guard does with it.
+
+* **AND THE REVERSE TABLE THAT SUGGESTS IS ALSO NOT IT — THE INDEX IS A THIRD ONE.** The
+  obvious repair is to bank the name→index direction where the resolution happens
+  (`annotNameRev[r] = name` beside `annotNameMemo[name] = r`, restricted to names
+  `cUserTypes` knows, first writer wins) and have `aliasNameOfTyIx` read it after the exact
+  scan. Built and graded: nothing moves — every witness including this row grades exactly as
+  before, so the table would be one nothing reads.
+
+  The reason is worth keeping. `cUserTypes[name]` is ALREADY the placeholder index — pass 0a
+  mints an empty `mkUnionTy` / `mkObjTy` per declaration and pass 0b fills it in place — so
+  the declared index and the filled index are the SAME integer, and 43 is neither. It is a
+  third index, minted while resolving the reference to `J` from inside `JO`'s map. Any fix
+  has to name THAT index, so the question to answer first is what mints it and why the other
+  declaration order does not need one.
