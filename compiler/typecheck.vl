@@ -9716,17 +9716,45 @@ function unionDropSubsumedArms(members: i32[], out: i32[]): boolean {
 // for the same reason `K | f64` is. A member that is not a literal union at all —
 // `TyPrim`, `TyObj`, a one-member alias WRAPPER over a litunion — declines the whole
 // list, which is §8.3's "the mixed arena SHAPE is load-bearing" ruling read exactly.
+//
+// A BARE LITERAL OF THE COMMON BASE IS A MEMBER OF THAT SET, NOT A REASON TO DECLINE
+// (D1043). `Kind | "err"` over `type Kind = "a" | "b"` IS the three-atom literal union
+// `"a" | "b" | "err"` — flattening `Kind` reaches its LITERALS, and `"err"` is one more
+// literal over the same base — so the flattened set is exactly what the language says the
+// type is. Declining it left BOTH routes minting `TyUnion[Kind, "err"]`, a union whose
+// member is a union, with no literal-union rep at either spelling; the DECLARED spelling
+// only ran because its ALIAS NAME let the emitter's name-channel predicates resolve a
+// member set (`unionMemberSetOf("R")` → `Kind | "err"`), and the inline spelling has no
+// name at all — `unionNameOfExpr` answered `""` and `emitUnionLitIs`' first gate disjunct
+// refused. MEASURED, both spellings, with everything else identical: `exprIsLitAtom=N`,
+// `exprUnion=Y`, `tyIsLitUnion(recv)=N`, `tyLitUnionAliasIx=-1`, and the ONE difference
+// `uname=[]` vs `uname=[R]`.
+//
+// THIS IS NOT THE SUBSUMPTION COLLAPSE AND MUST NOT BECOME IT. `unionDropSubsumedArms`
+// drops an arm that ADDS NO VALUES (`string | "err"` is `string`); this ADDS the literal's
+// value to a set that is still literal, so `"a" | "b" | "err"` keeps all three atoms.
+// `Kind | string` is the collapse's question, not this one, and it is still declined here
+// (`string` is a `TyPrim`, so `armLiteralBaseTy` answers -1) — see D1048.
+//
+// GATED ON `sawUnion` so the PURE literal list is untouched. `"a" | "b"` spelled inline has
+// nothing to flatten and already reaches the identical member list through the callers'
+// FALSE leg (their own `pushDistinctVariantTy` loop); answering true for it would only move
+// which branch builds the same answer, while changing which list the declaration route
+// registers as variant members.
 function litUnionFlatMembers(members: i32[], out: i32[]): boolean {
   if members.length < 2 { return false }
   let base = -1
+  let sawUnion = false
   let i = 0
   while i < members.length {
-    const b = homogLitUnionBase(members[i])
+    let b = homogLitUnionBase(members[i])
+    if b >= 0 { sawUnion = true } else { b = armLiteralBaseTy(members[i]) }
     if b < 0 { return false }
     if base < 0 { base = b }
     if base != b { return false }
     i = i + 1
   }
+  if !sawUnion { return false }
   i = 0
   while i < members.length {
     const mt = T.tys[members[i]]
@@ -9736,6 +9764,8 @@ function litUnionFlatMembers(members: i32[], out: i32[]): boolean {
         pushDistinctVariantTy(out, mt.uMembers[ml])
         ml = ml + 1
       }
+    } else {
+      pushDistinctVariantTy(out, members[i])
     }
     i = i + 1
   }
@@ -21423,7 +21453,26 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
         if !seen { uniq.push(out3[q]) }
         q = q + 1
       }
-      if uniq.length == 1 { res = uniq[0] } else { res = mkUnionTy(uniq) }
+      // THE SUBSUMED-ARM COLLAPSE, ON THE SUBSTITUTION ROUTE — the THIRD union-construction
+      // site, and the one D1024 did not reach (D1049). `annUnionInnerTy` and
+      // `fillTypeDeclAt`'s `UnionDecl` arm call the shared `unionDropSubsumedArms`; a union
+      // minted HERE — `T | "err"` with `T := string` — reached neither, so the duplicate
+      // `string` atom the ruling exists to prevent was minted exactly as it used to be
+      // everywhere: `vl check` rc 0, `expected struct type at index 0, found (array (mut
+      // i32))`, byte for byte D1024's own message.
+      //
+      // The index dedup above CANNOT see it. `string` and `"err"` are different arena rows,
+      // so nothing is duplicated by INDEX; what is duplicated is the VALUE SET, which is the
+      // question `unionArmSubsumedBy` asks. The two folds are therefore both needed and in
+      // this order — dedupe first so the collapse sees each member once.
+      //
+      // `out` IS READ UNCONDITIONALLY. `unionDropSubsumedArms` always fills it and returns
+      // whether it dropped anything; treating the return value as permission to read `out`
+      // is the contract that doubled every union's member list once already (see that
+      // function's header).
+      const kept3: i32[] = []
+      unionDropSubsumedArms(uniq, kept3)
+      if kept3.length == 1 { res = kept3[0] } else { res = mkUnionTy(kept3) }
     }
   } else if t is TyMap {
     const k2 = substTyDeep(t.mKey, bNames, bTys)
