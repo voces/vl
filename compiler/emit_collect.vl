@@ -203,6 +203,8 @@ import {
   annRlNul,
   annRlSlot,
   anonLeafAnnTy,
+  anonLeafCloBindFn,
+  anonLeafCloBindName,
   anonLeafCloSlotFn,
   anonLeafFamRow,
   anonLeafJoined,
@@ -7121,6 +7123,9 @@ function collectAnonShapes() {
   // D940 — AND THE CLOSURE-TYPED SLOT A MOVED FUNCTION IS DELIVERED TO. Last, because it
   // reads the ret/param marks the two above write. See `anonLeafCloSlotMark`.
   anonLeafCloSlotMark()
+  // D1090 — AND THE CLOSURE-TYPED BINDING it is delivered to, which is the same signature
+  // one holder over. See `anonLeafCloBindMark`.
+  anonLeafCloBindMark()
   let ai = 0
   while ai < P.nodes.length {
     const an = P.nodes[ai]
@@ -9118,7 +9123,35 @@ function anonLeafParamFnNamesAt(owner: i32, pos: i32, out: string[]): boolean {
       }
       ci = ci + 1
     }
-    return hits > 0
+    if hits > 0 { return true }
+    // D1090 — NO CALL SITE AT ALL IS AN ANSWER, AND THE ANSWER IS "NOTHING REACHES THIS
+    // SLOT". A higher-order function nobody calls binds its callback to nothing, so the
+    // `cb(…)` inside its body can reach no function and threatens no row: its literal
+    // lowers at the annotation's own row, which is the row the veto exists to protect.
+    // Reading the empty scan as "a delivery I cannot name" made ONE uncalled HOF beside a
+    // called one veto the whole `??` family — check-clean invalid wasm, and deleting the
+    // uncalled function made the same program run.
+    //
+    // The name must not be used as a VALUE, which is the same refutation
+    // `anonLeafNarrowUseMark` makes of a declaration: a call through the value passes
+    // arguments no call-site scan reads, so "no call site" would not mean "never called".
+    return !anonLeafNameUsedAsValue(od.fnName)
+  }
+  false
+}
+
+// Is `fname` mentioned anywhere OTHER than in callee position — i.e. used as a function
+// VALUE? The scan `anonLeafNarrowUseMark` and `anonLeafSlotAllMembers` each spell inline.
+function anonLeafNameUsedAsValue(fname: string): boolean {
+  let vi = 0
+  while vi < P.nodes.length {
+    const vn = P.nodes[vi]
+    if vn is Ident {
+      if vn.identName == fname {
+        if !anonLeafIsCalleePos(vi) { return true }
+      }
+    }
+    vi = vi + 1
   }
   false
 }
@@ -9224,6 +9257,50 @@ function anonLeafCloSlotMark() {
       }
     }
     fi = fi + 1
+  }
+  0
+}
+
+// D1090 — THE BINDINGS A MOVED FUNCTION IS DELIVERED TO. See `anonLeafCloBindName`.
+//
+// A binding written ONLY with a function whose rows the merge moved must call at that
+// function's own `$fnsig`, not at its annotation's. Only such a binding is recorded — an
+// un-annotated one already lowers correctly, and recording it changes nothing; a binding whose
+// target is unresolvable or unmoved records nothing at all, which is what keeps every
+// closure-valued binding in every other program byte-identical.
+function anonLeafCloBindMark() {
+  let i = 0
+  while i < P.nodes.length {
+    const n = P.nodes[i]
+    let bn = ""
+    if n is LetDecl { bn = n.letName }
+    if n is BinExpr {
+      if n.binOp == "=" {
+        const tgt = unwrapParen(n.binLeft)
+        if tgt >= 0 {
+          const tn = P.nodes[tgt]
+          if tn is Ident { bn = tn.identName }
+        }
+      }
+    }
+    if bn != "" {
+      let already = false
+      let k = 0
+      while k < anonLeafCloBindName.length {
+        if anonLeafCloBindName[k] == bn { already = true }
+        k = k + 1
+      }
+      if !already {
+        const tgt = anonLeafFnValueTarget(bn)
+        if tgt != "" {
+          if anonLeafFnNameMoved(tgt) {
+            anonLeafCloBindName.push(bn)
+            anonLeafCloBindFn.push(tgt)
+          }
+        }
+      }
+    }
+    i = i + 1
   }
   0
 }
@@ -11087,6 +11164,8 @@ export function collectS(stmts: i32[]) {
   anonLeafParamMoved = []
   anonLeafRetMoved = []
   anonLeafCloSlotFn = []
+  anonLeafCloBindName = []
+  anonLeafCloBindFn = []
   anonLeafSupersede = []
   // The struct-row NAME index keys THIS table's spellings — reset it with the table, or
   // the next program's rows answer with this one's names (see its header). MEASURED, not
