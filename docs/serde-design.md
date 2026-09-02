@@ -694,11 +694,12 @@ gets past it. None is a design rule; every one is a clause-1 or clause-2 violati
 | **NEW (d)** — bare `[…]` holding a map | `emitProgram: a union arm that is an array-of-map is not yet supported — use a named element type` | annotate the literal `Json[]` |
 | **NEW (e)** — `const e = v[0]` on a narrowed array arm, when the union also has a self-referential MAP arm | `emitProgram: map op receiver is not a map` | `for e in v { … }`, or hand `v[i]` straight to a call |
 | **NEW (f)** — `print` of a local re-bound from an `is`-narrowed REF arm | check rc 0, then `type mismatch: expected i32, found (ref $type)` — **check-clean invalid wasm**; sibling of the closed D968 | print the narrowed value directly, or annotate the rebind |
-| **NEW (g)** — an `is` narrowing on a struct-FIELD or ARRAY-ELEMENT receiver | four messages, one mechanism: `unsupported for-in iterable` · `narrowed union field atom has no value box` · `index access but array type not collected` · `callee is not a function name` | hoist the read into a local **before** the `if` |
+| ~~**NEW (g)** — an `is` narrowing on a struct-FIELD or ARRAY-ELEMENT receiver~~ **CLOSED 2026-09-02 (D1014)** | was four messages, one mechanism: `unsupported for-in iterable` · `narrowed union field atom has no value box` · `index access but array type not collected` · `callee is not a function name` | none needed — the hoist is no longer required at any position |
 
-Two of these bear on the *design*, not just the implementation. (g) is why a recursive walker
-must hoist before it narrows — which is the natural spelling anyway, so the cost is a sentence
-in the module header. And (b)/(c)/(d) together say the same thing as D1010: **the un-annotated
+Two of these bore on the *design*, not just the implementation. (g) was why a recursive walker
+had to hoist before it narrowed; **it is closed (D1014)** and a walker may now narrow the field
+or the element in place — and must, wherever the place is written inside the branch, because a
+hoisted temp is read once while the place is read at every use. And (b)/(c)/(d) together say the same thing as D1010: **the un-annotated
 array literal is the one delivery position the tree does not carry**, so `std:json`'s parser
 builds every array through an annotated `let a: Json[] = []` and pushes into it. Dropping that
 one annotation from the working parser is check-clean invalid wasm (measured).

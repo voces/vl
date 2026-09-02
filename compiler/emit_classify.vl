@@ -273,6 +273,7 @@ import {
   parenUnionArrElemName,
   parentLetOf,
   parentLetOfSid,
+  placeNarrowKeyOf,
   removeAtomFrom,
   retArrFlag,
   retF32ArrFlag,
@@ -29299,6 +29300,14 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
       const iAtom = narrowVariantFor(indexPathKeyOf(exprIx))
       const iak = valueAtomKind(iAtom)
       if iak >= 0 && iak != 6 { return false }
+      // …and the CONTAINER arms of the same narrowing (D1014). The Ident arm has declined a
+      // narrowed ref-array (and, since D1029, a narrowed map) for the same reason the atom
+      // rule above exists: the read UNBOXES, so the value is a list / a map here and not a
+      // union. Without them an un-annotated REBIND under the narrow took the union-box cell
+      // while the init emitted the unboxed wrapper — the exact invalid wasm the ident arm's
+      // own comment records, one receiver shape over.
+      if narrowedRefArrayOfPlace(exprIx) != "" { return false }
+      if narrowedMapOfPlace(exprIx) != "" { return false }
       return rlElemKindTbl[slot] == 2
     }
     // A bare `m[k]` over a UNION-valued map yields the value union box.
@@ -29346,6 +29355,9 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
     const mAtom = narrowVariantFor(memberPathKeyOf(exprIx))
     const mk = valueAtomKind(mAtom)
     if mk >= 0 && mk != 6 { return false }
+    // …and the CONTAINER arms of the same narrowing (D1014) — see the Index arm above.
+    if narrowedRefArrayOfPlace(exprIx) != "" { return false }
+    if narrowedMapOfPlace(exprIx) != "" { return false }
     // D209 — THE OTHER END OF THE READ. An un-narrowed read the READ SITE unboxes is
     // not a union VALUE here either, and this is the same predicate that site asks:
     // one answer, so the consumer boxes exactly what the read delivered.
@@ -30056,6 +30068,47 @@ export function narrowedMapValTyOf(name: string): i32 {
   const i = narrowSlotOf(name)
   if i < 0 { return -1 }
   tyMapValOf(narrowSlotTy(i))
+}
+
+// The REF-ELEMENT-ARRAY arm a NON-IDENTIFIER PLACE is currently narrowed to (`if n.v is K[]`
+// -> `K[]`; `if xs[0] is K[]` -> `K[]`), or "" — `narrowedRefArrayOf`'s place-keyed dual, with
+// the map twins below it.
+//
+// D1014 — THE NARROW WAS ALWAYS BANKED; NOTHING READ IT. `setNarrowFromCond` has pushed a
+// member-path key and an index-place key for some time, each already gated on the place being
+// a union BOX (`memberUnionFieldNameRead` / `indexElemUnionName`), so a non-"" answer here
+// means "this place holds a union box whose live narrowing is that arm" and needs no
+// storage-class gate of its own. What was missing is every CONSUMER: they take a `name:
+// string` and ask about an identifier, so `if n.v is K[] { for e in n.v … }` reached the
+// emitter carrying the DECLARED union type and failed at whichever floor came first — four
+// different sentences for one lost fact.
+//
+// `narrowTop` FIRST, because the key is a BUILT string and these are asked on every classifier
+// query (the same reason `memIsNarrowed` opens with it).
+export function narrowedRefArrayOfPlace(exprIx: i32): string {
+  if narrowTop == 0 { return "" }
+  const k = placeNarrowKeyOf(exprIx)
+  if k == "" { return "" }
+  narrowedRefArrayOf(k)
+}
+
+// The MAP arm a NON-IDENTIFIER PLACE is currently narrowed to, or "" — see
+// `narrowedRefArrayOfPlace`.
+export function narrowedMapOfPlace(exprIx: i32): string {
+  if narrowTop == 0 { return "" }
+  const k = placeNarrowKeyOf(exprIx)
+  if k == "" { return "" }
+  narrowedMapOf(k)
+}
+
+// The map VALUE type banked beside `narrowedMapOfPlace`'s arm, or -1 — the place-keyed dual of
+// `narrowedMapValTyOf`, read off the SAME narrow-stack row so the arm spelling and its value
+// type cannot describe two different maps.
+export function narrowedMapValTyOfPlace(exprIx: i32): i32 {
+  if narrowTop == 0 { return -1 }
+  const k = placeNarrowKeyOf(exprIx)
+  if k == "" { return -1 }
+  narrowedMapValTyOf(k)
 }
 
 // The atom KIND an IDENT expression currently reads as, for the scalar/string
@@ -31923,6 +31976,10 @@ export function exprRefArray(exprIx: i32, fnIx: i32) {
   // A field read `p.items` whose struct field is a `T[]`/`N[]` (code `5`) yields the ref
   // list wrapper ref — so `.length` / indexing / assignment treat it as a ref list.
   if e is Member {
+    // A union-box FIELD whose member PATH is narrowed to a ref-element array arm (`if n.v is
+    // K[]`) unboxes to that arm's reflist wrapper, so it IS a ref array in the narrowed
+    // branch — the Ident arm's rule at the one receiver shape that never had it (D1014).
+    if narrowedRefArrayOfPlace(exprIx) != "" { return true }
     if memFieldTypeCode(exprIx, fnIx) == 5 { return true }
     if exprNullableRefArray(exprIx, fnIx) { return true }
   }
@@ -31930,6 +31987,9 @@ export function exprRefArray(exprIx: i32, fnIx: i32) {
   // inner ref list, so the index yields a ref array. Recurses — `g[i][j]` over `S[][][]` is a ref
   // array too (the inner slot is itself kind 9).
   if e is Index {
+    // A union-box ELEMENT whose index PLACE is narrowed to a ref-element array arm
+    // (`if xs[0] is K[]`) — the index twin of the Member arm above (D1014).
+    if narrowedRefArrayOfPlace(exprIx) != "" { return true }
     if exprRefArray(e.idxArr, fnIx) {
       const slot = refListSlotOfExpr(e.idxArr, fnIx)
       if slot >= 0 && slot < rlElemKindTbl.length {
@@ -32182,6 +32242,12 @@ export function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
     return globalRefArrayName(e.identName)
   }
   if e is Member {
+    // The member PATH's OWN narrowing first (D1014): a union-box field narrowed to `K[]` names
+    // the ARM's element, which is the row the narrowed read casts to. Ahead of the
+    // receiver-narrowing arm below, which answers a different question (the RECEIVER being a
+    // variant) and returns "" unconditionally once it fires.
+    const raPm = narrowedRefArrayOfPlace(exprIx)
+    if raPm != "" { return refArrElemName(raPm) }
     // A `recv.field` ref-list field read — the field's element name from the receiver's
     // struct / narrowed variant.
     if memIsNarrowed(exprIx) {
@@ -32202,6 +32268,12 @@ export function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
   // of `g`'s element list — strip ONE `[]` off `g`'s element name (`S[]` → `S`). Recurses for
   // deeper nesting (`g[i][j]` over `S[][][]`).
   if e is Index {
+    // The index PLACE's OWN narrowing to a ref-array ARM (D1014) — the index twin of the
+    // member arm above, and distinct from the nullable-niche narrowing directly below it:
+    // that one peels a `| null` off the CELL's element name, this one names the ARM the box
+    // holds, which the cell's element name does not mention at all.
+    const raPi = narrowedRefArrayOfPlace(exprIx)
+    if raPi != "" { return refArrElemName(raPi) }
     // A NARROWED index place over a nullable-ref-array element (D451). The recursion below
     // gates on `nameIsArray(outer)`, which is FALSE for an element name ending `| null`, so
     // the arm declined and `refListSlotOfExpr` turned its `rlSlotByName` miss into slot 0 —
@@ -34818,8 +34890,17 @@ export function exprMap(exprIx: i32, fnIx: i32) {
   // A MAP-typed struct field read (`node.children`, code 19) yields a Map ref —
   // map member/index ops on it route to the existing map lowering.
   if e is Member {
+    // A union-box FIELD whose member PATH is narrowed to a MAP arm (`if n.v is {[string]: K}`)
+    // unboxes to the map struct ref, so it IS a map in the narrowed branch — the Ident arm's
+    // rule at the receiver shape that never had it (D1014).
+    if narrowedMapOfPlace(exprIx) != "" { return true }
     if memFieldTypeCode(exprIx, fnIx) == 19 { return true }
     if exprNullableMap(exprIx, fnIx) { return true }
+  }
+  // A union-box ELEMENT whose index PLACE is narrowed to a MAP arm (`if xs[0] is {[string]:
+  // K}`) — the index twin of the Member arm above (D1014).
+  if e is Index {
+    if narrowedMapOfPlace(exprIx) != "" { return true }
   }
   // `outer[k] ?? d` over a NESTED map (value kind 6) yields the inner Map ref — so a
   // chained `(outer[k] ?? d)[j]` routes through the map lowering.
@@ -35587,6 +35668,14 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
   // classifier that answered a different struct than the field's storage type is the
   // same invalid-wasm class one layer up.
   if e is Member {
+    // The member PATH's OWN narrowing to a MAP arm (D1014): its shape is the ARM's value type,
+    // read off the same narrow-stack row as the arm spelling (`narrowedMapValTyOfPlace`) —
+    // exactly what the Ident arm above does. Ahead of the RECEIVER-narrowing arm below, which
+    // answers about a variant field and would fall through to the mono `-1`.
+    const mpP = narrowedMapOfPlace(exprIx)
+    if mpP != "" {
+      return mvSlotOfMapNameTy(mpP, narrowedMapValTyOfPlace(exprIx))
+    }
     if memIsNarrowed(exprIx) {
       const nvi = memNarrowVariantIndex(exprIx)
       if nvi >= 0 {
@@ -35612,6 +35701,15 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
         const mfc = sFieldTypeAt(msi, mfi)
         if mfc == 19 || mfc == 29 { return sFieldMapShape(msi, mfi) }
       }
+    }
+  }
+  // The index PLACE's OWN narrowing to a MAP arm (D1014) — the index twin of the Member arm
+  // above, and ahead of the composition read below, whose receiver-derived answer describes
+  // the CELL (a union box) rather than the arm the narrowing proved is in it.
+  if e is Index {
+    const mpI = narrowedMapOfPlace(exprIx)
+    if mpI != "" {
+      return mvSlotOfMapNameTy(mpI, narrowedMapValTyOfPlace(exprIx))
     }
   }
   // A composition MAP READ that yields a typed-value map — either a NESTED-map read
