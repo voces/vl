@@ -35217,7 +35217,7 @@ Repro (the `i64` face — `vl check` rc 0, module does not validate):
 
 * **THE ABLATION IS A CLEAN LADDER, AND `.pop()` IS THE CONTROL THAT MAKES IT DAMNING.**
 
-  | element rep | `.clear()` | `.pop()` |
+  | element rep | `.clear()` | `.pop()` (as a STATEMENT — see [D1160](#d1160)) |
   | --- | --- | --- |
   | `i32[]` | runs | runs |
   | `string[]` | runs | runs |
@@ -35230,6 +35230,11 @@ Repro (the `i64` face — `vl check` rc 0, module does not validate):
 
   Every rep `.clear()` refuses, `.pop()` serves. D977 built the scalar ladder for `pop` and
   nothing asked `clear` the same question, so `emitClear` has no scalar arm.
+
+  **The `.pop()` column is the STATEMENT form**, which is what was measured here. Consuming
+  pop's RESULT serves only four of the eight — [D1160](#d1160). The conclusion above is
+  unchanged (`.clear()` still refuses where `.pop()` runs), but the sibling it is compared
+  against is narrower than this row originally stated.
 
 * **THREE MESSAGES IS THE SHAPE, NOT THE FAMILY.** `u8[]` is refused by the STATEMENT
   DISPATCHER (`unsupported member-call statement`) before `emitClear` is reached at all, so it
@@ -35748,4 +35753,49 @@ Repro:
   code-15 field reached THROUGH the niche — the one field code [D1094](#d1094)'s fifth receiver
   rung does not serve, because `variantStructHeapTwinAt` declines codes 5 / 15 / 28 by design
   and the nested read needs the target row rather than the field's own code.
+
+### D1160 — the RESULT of `.pop()` cannot be consumed at any NUMERIC element rep: `print(a.pop())` over an `i32[]` is a loud emit reject
+
+**loud emit reject · check rc 0 · clause 2 · `emitProgram: narrowed union atom has no value box` · ZERO corpus cells · found 2026-09-02 verifying the emit-refusal reachability measurement's un-filed side-findings**
+
+Repro (should print `2`):
+
+    const a: i32[] = [1, 2]
+    print(a.pop())
+
+* **THIS LITERAL IS CLAUDE.md's OWN EXAMPLE, AND IT IS STILL LIVE.** D964 cites
+  `emitProgram: narrowed union atom has no value box` as the canonical refusal that "reads
+  like an internal invariant, fires on a `vl check`-clean program, and is a clause-2
+  violation the count never saw". This is its witness, and it is the plainest program in
+  this file.
+
+* **THE STATEMENT FORM RUNS AT EVERY REP.** `a.pop()` discarding the result compiles
+  everywhere. It is CONSUMING the result that fails.
+
+  | element rep | `a.pop()` as a statement | consuming the result |
+  | --- | --- | --- |
+  | `i32[]` | runs | **emit reject** |
+  | `i64[]` | runs | **emit reject** |
+  | `f32[]` | runs | **emit reject** |
+  | `f64[]` | runs | **emit reject** |
+  | `boolean[]` | runs | runs |
+  | `u8[]` | runs | runs |
+  | `string[]` | runs | runs |
+  | a struct `P[]` | runs | runs |
+  | `P[][]` (ref list element) | runs | **emit reject**, a DIFFERENT message (`bare null needs a struct-typed context`) |
+
+* **THE CONSUMER IS NOT THE INGREDIENT.** `print(a.pop())`, `const v = a.pop()` and
+  `const v = a.pop(); if v != null { print(v) }` all fail identically at `i32[]`. So the
+  narrowing is not what is missing; the value has no box the moment it exists.
+
+* **CONTROLS THAT RUN and must keep running**: `a[a.length - 1]` prints `2`, and
+  `a.pop() ?? 0` prints `2`. The `??` control is the interesting one — it proves a consumer
+  EXISTS for the same value, which bounds the fix.
+
+* **IT REFINES [D1131](#d1131)'s TABLE.** That row's control column reads "`.pop()` serves
+  eight reps"; that is true of the STATEMENT form only, which is what was measured. The
+  result form serves four. D1131's conclusion is unchanged — `.clear()` still refuses where
+  `.pop()` runs — but the sibling it is compared against is narrower than stated.
+
+* Probe: `scripts/capability-probes/pop-result-at-numeric-reps.vl`.
 
