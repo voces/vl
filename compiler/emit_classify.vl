@@ -25259,6 +25259,11 @@ export function buildVariantTwins() {
 // answer for the same reason: each claimant resolves its own field's recorded type/name
 // against those tables without observing the other, so the mint and every pairwise find
 // compute one function of (`vi`, `si`).
+// D627's coinductive assumption stack — the (variant, struct-row) pairs currently being
+// decided. See the argument inside `variantStructHeapTwinAt`.
+const vshtPairVi: i32[] = []
+const vshtPairSi: i32[] = []
+
 export function variantStructHeapTwinAt(vi: i32): i32 {
   if vi < 0 { return -1 }
   if vi >= uVarTyIx.length { return -1 }
@@ -25286,19 +25291,59 @@ export function variantStructHeapTwinAt(vi: i32): i32 {
   if si < 0 { return -1 }
   if si >= sFieldCount.length { return -1 }
   if uFieldCount[vi] != sFieldCount[si] { return -1 }
+  // D627 — THE COINDUCTIVE PAIR STACK, and it is NOT a re-entrancy guard. The map-value
+  // comparison below asks `mvCanonRepOf`, which walks `repMapValSlotsTwin`, whose cross-table
+  // arm re-enters this function — unbounded on a mutually recursive map-valued shape, and a
+  // new compiler trap is on the veto list, which is why D624 shipped the tight rung and left
+  // this one open.
+  //
+  // WHY "ASSUME MERGED ON REVISIT" IS SOUND HERE. Deciding two heap types are one is
+  // equirecursive type equality, and the answer wanted is the GREATEST fixpoint: the pair is
+  // merged unless assuming it leads to a contradiction. Every finite disagreement below still
+  // returns -1 and unwinds the whole descent with it, so an assumption can only survive when
+  // no field anywhere in the cycle disagreed. The row's own objection to a plain re-entrancy
+  // guard — "it makes the answer depend on the call stack, so the mint and the pairwise finds
+  // disagree" — does not apply to a PAIR stack: the assumption is keyed on the very pair being
+  // decided and is symmetric, so `(vi, si)` still determines the answer whatever route reached
+  // it. That is the same argument `structFieldCodesEq`'s own pair stack rests on.
+  let vsi = 0
+  while vsi < vshtPairVi.length {
+    if vshtPairVi[vsi] == vi && vshtPairSi[vsi] == si { return si }
+    vsi = vsi + 1
+  }
+  vshtPairVi.push(vi)
+  vshtPairSi.push(si)
   let fi = 0
   while fi < uFieldCount[vi] {
     const cv = uFieldTypes[uFieldStart[vi] + fi]
-    if cv != sFieldTypes[sFieldStart[si] + fi] { return -1 }
-    if cv == 5 || cv == 15 || cv == 28 { return -1 }
+    if cv != sFieldTypes[sFieldStart[si] + fi] { return vshtPop(0 - 1) }
+    if cv == 5 || cv == 15 || cv == 28 { return vshtPop(0 - 1) }
     if cv == 19 || cv == 29 {
       const um = uFieldMapShape(vi, fi)
-      if um == -3 { return -1 }
-      if um != sFieldMapShape(si, fi) { return -1 }
+      if um == -3 { return vshtPop(0 - 1) }
+      const sm = sFieldMapShape(si, fi)
+      // THE WIDENING D624 MEASURED AND DECLINED. Two mv slots whose VALUE types are layout
+      // twins emit byte-identical map structs, so slot-index equality declines a merge the
+      // reps already agree on: `{[string]: Leaf}` beside `{[string]: Leaf2}`. Costs nothing
+      // on the distilled corpus (the same 55 movers as D624, zero `runs` lost) and is what
+      // makes D627's witness print its value.
+      if um != sm {
+        if mvCanonRepOf(um) != mvCanonRepOf(sm) { return vshtPop(0 - 1) }
+      }
     }
     fi = fi + 1
   }
-  si
+  vshtPop(si)
+}
+
+// Pop the pair stack and pass `r` through — so every exit of the walk above unwinds it
+// exactly once, whatever it answers.
+function vshtPop(r: i32): i32 {
+  if vshtPairVi.length > 0 {
+    vshtPairVi.pop()
+    vshtPairSi.pop()
+  }
+  r
 }
 
 // The structural signature of variant `vi` — its field names joined with `,` (a
