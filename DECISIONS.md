@@ -3984,11 +3984,47 @@ ruled (unknown key → no match, exact case, duplicate keys a parse error, `i64`
 union arms by first token / required key set). Four sub-rules carry recommendations and
 await the owner (`docs/serde-design.md` §"Deep `is` / `as` over a `Json` value"): the
 narrowed value is a COPY and `is` rebinds; `i32`/`i64` fields accept only an integral
-in-range number (the same predicate as q2's exact `as`, ruled the same day); absent key ≠ present `null`
-(the read-side mirror of decision A); `as` propagates a `JsonError { kind: "shape", path }`
+in-range number (the same predicate as q2's exact `as`, ruled the same day); an absent key
+reads as `null` for a `T | null` field (RULED the same day, next section — the
+recommendation had been the opposite); `as` propagates a `JsonError { kind: "shape", path }`
 rather than the useless remainder. A helper returns to the list the day a consumer that
 cannot name its shape arrives, and not before — std has no deprecation story, so the
 cheapest helper is the one never shipped.
+
+### An ABSENT key matches a `T | null` field and reads as `null` — VL's map read already says so (serde-design S3, owner, 2026-09-02)
+
+The sub-rule as drafted said the opposite: absent ≠ present `null`, the read-side mirror
+of decision A (the writer always emits `"f": null`), on the argument that `{x} | {x, y}` is
+only decidable when absence is a fact. The owner asked three questions — is `doc` a struct
+or a map, could an absent key match `null`, and does VL have optional-key semantics at all —
+and the measured answers reversed the recommendation before the ruling was made:
+
+- **`doc`'s object level is the MAP `{[string]: Json}`; the target is a STRUCT.** Absence is
+  a fact of the source; a VL struct has no absent field and no `field?: T` syntax exists —
+  `T | null` is the language's one spelling of "maybe not there". So the only question is
+  whether the walk PRESERVES the difference (refuse) or COERCES it (absent → `null`); a
+  struct cannot hold it either way.
+- **VL's own map read is already absent → `null`.** `const m: {[string]: i32} = Map();
+  m["a"] = 0; m["zz"] == null` prints `true` on the current seed, with the stored `0` under
+  `"a"` reading as `0` (#1899/#1901 made a miss distinguishable from a stored zero). A shape
+  walk that refused the absent key would be STRICTER than reading the same map by hand,
+  which is the argument that decided it.
+- **Nothing a struct could have expressed is lost.** The consumer that needs "absent vs.
+  explicit null" still has the map (`doc["host"]`); the round trip canonicalises only the
+  JSON text (`{}` → `{"host": null}`, the VL value identical). The cost — a producer that
+  forgot a nullable field reads as `null` rather than failing `is` — is the cost `m[k]`
+  already carries.
+
+**Ruling.** A missing key matches a field typed `T | null` and the field reads `null`. A
+missing NON-nullable field is not a match. A `T | null` field is therefore NOT a required
+key, so OQ-7's required-key-set rule refuses `{x: i32} | {x: i32, y: i32 | null}` as
+ambiguous at the `is` site, naming both arms — the OQ-7 ruling's own sentence ("two
+versions differing only in an optional field genuinely cannot be told apart") was already
+this rule. Decision A on the WRITE side stands: total writer, lenient reader, and the
+asymmetry is the chosen one. Grading list, with the un-annotated spelling of each (an
+annotation pins a rep the walk must not depend on): `{"port": 1} is Cfg` → `true` and
+`cfg.host == null`; `{"port": 1, "host": null}` → `true`; `{"host": "x"}` → `false`; the
+two-arm union above refused at the checker.
 
 ## Numeric `as` to an INTEGER target is exact-or-fail under the trio; a float target rounds; nothing ships in std (owner, 2026-09-02)
 
