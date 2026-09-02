@@ -16,6 +16,42 @@ Exit 0 when every probe runs and prints what its header says. Non-zero names the
 still refuse — which today is the point of the directory, so **it is not a merge gate.** It is
 the thing you re-run to find out whether a fix moved anything the corpus was blind to.
 
+## THE 2026-09-02 AUDIT: most of the remaining literals are FLOORS, not gaps
+
+`--sites` reported **22** capability literals, every one reached by no corpus cell, and the
+temptation is to read that as 22 open gaps. It is not: D964's own note says the true site count
+sits in `[23, 405]` and **only a WITNESS settles which are reachable**. So fourteen were
+witnessed, one plainest-program each.
+
+**Thirteen of the fourteen already RUN** — the literal is live in the source and no
+`vl check`-clean program reaches it:
+
+| site | witness | verdict |
+| --- | --- | --- |
+| `typecheck.vl:18061` structural width subtyping | `Wide` into `Narrow` | RUNS |
+| `typecheck.vl:18028` element-converting copy | `i32[]` into `f64[]` | RUNS |
+| `typecheck.vl:25622` inferred union return | an `if`/tail union body | RUNS |
+| `typecheck.vl:27854` `print` of a union value | `print(v)` over `i32 \| string` | RUNS |
+| `typecheck.vl:16151` `==` with no lowering | struct `==` struct | RUNS |
+| `wasmEmit.vl:23671/23753/23896` `??` over `string \| null` | union, call result, field | RUNS |
+| `wasmEmit.vl:5699` `==` over a struct union | `mk() == mk()` | RUNS |
+| `wasmEmit.vl:5959` union `==`, non-binding operand | same | RUNS |
+| `wasmEmit.vl:6111` literal `is`, non-binding operand | `mk() is A` | RUNS |
+| `wasmEmit.vl:22385` struct equality | two-field struct `==` | RUNS |
+| `wasmEmit.vl:23088` `__array_new__` fill | `__array_new__(2, 1.5)` | RUNS |
+
+**One was live**, and it is the one this directory now has a probe for:
+`inferred-union-return-hole-param.vl` — `typecheck.vl:20084`, an inferred union return passed
+to an un-annotated parameter, which refused while the annotated twin ran. Fixed the same day.
+
+**What to take from the shape of that table.** A `--sites` count is a lower bound on SITES and
+says nothing about reachability, so a falling count is not progress and a flat one is not
+stagnation — the number stayed at 22 across the fix, because the literal is still in the source
+and still correct as a floor. Six of the twenty-two live in `typecheck.vl`, the direction
+CLAUDE.md warns hides, and five of those six turned out to be floors: the warning is right
+that a gap can hide there, and wrong as a presumption that one does. **Probe before
+scheduling.**
+
 ## Adding one
 
 A probe earns its place by being reached by NO corpus cell. Check before adding:
