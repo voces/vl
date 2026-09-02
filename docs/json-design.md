@@ -342,7 +342,7 @@ Owner: *"Error I think. what does JS do? other languages?"*
 | serde_json | `null` for `f64::NAN` in `Value`; typed `to_string` of an `f64` NaN also `null` |
 | Python `json.dumps` | the literals `NaN` / `Infinity` — **invalid JSON** — unless `allow_nan=False`, which raises |
 | Go `json.Marshal` | error: `json: unsupported value: NaN` |
-| **VL `toJson`** | **`JsonError { kind: "nonfinite", at: <output offset> }`** |
+| **VL `toJson`** | **`JsonError { kind: "nonfinite", at: 0, path: "/a/2" }`** (`at` is a parse-side offset; render locates by `path`, §2.2) |
 
 Go's is the only one of the four that is both RFC-valid and loud, and it is the one the
 owner picked. `null` is the pragmatic JS choice and it is silently lossy — a `NaN` that
@@ -749,6 +749,37 @@ blocked the module outright until it closed the same day.
 11. Minor: `fromCodePoints` requiring a NAMED `i32[]` binding (emit refusal on an inline
     literal, `compiler/wasmEmit.vl:14356`) — the builder uses a named buffer as fmt does; a
     clause-2 refusal worth a probe when someone is in that file.
+
+**Found by BUILDING the module (2026-09-02, #2322).** Three more, each filed with a
+position matrix or an ablation in the inventory, each routed around INSIDE `std/json.vl`
+with the surface untouched. They are the measured cost of the walking idiom §2.8
+predicted, and they rank ABOVE items 4–11 for a consumer, because every one is met by the
+first program that reads a tree:
+
+12. **D1030 — the residue of narrowing `Json | JsonError` is not `Json`, and a `Json` does
+    not widen INTO `Json | JsonError`.** Loud check reject, clause 2, both faces: after
+    `if r is JsonError { … } else { g(r) }` the residue prints as `boolean | f64 | string |
+    Json[] | {[string]: Json} | null` — `Json`'s six members, flattened and deduped — and
+    is refused where `Json` is expected; and `function f(): Json | JsonError { const v:
+    Json = …; return v }` is `return type mismatch: expected Json | JsonError, got Json`.
+    That second face is what `parseJson` ITSELF hits: the module carries a six-arm ladder
+    (`asResult`) to hand a parsed tree back at the composed type, and the test harness
+    carries a second one on the consumer side. This is D1027's "the flattened spelling is
+    not the REGISTERED one" on the CHECK side — assignability is name-based where it
+    needed to be member-based — and neither D1021's nor D1028's close moves it.
+    **First in ship order now**: it is the cost every consumer pays on line two.
+13. **D1029 — an `is`-narrowed MAP arm keeps the union's box at six of eight delivery
+    positions** (return composed / return plain / push / map-set / `Json`-annotated
+    binding / `Json` argument), check-clean invalid wasm at each; the two that run name
+    the ARM's type. Neither the recursion nor the composition is an ingredient (both
+    ablated away, the defect holds); `string` and `Json[]` arms run at all eight. Route:
+    `const o: { [string]: Json } = v` before use. Every walker's object arm.
+14. **D1031 — `JsonError | null` as a struct FIELD or a RETURN is a loud emit reject once
+    `JsonError` is also a union ARM elsewhere in the program**; the identical spellings
+    run when nothing composes it. A type's usable spellings shrink because of a
+    declaration elsewhere. The module carries its scanner's error as five flat fields
+    instead of one optional struct. Any consumer holding "the last error, or none" meets
+    it the moment they also call `parseJson`.
 
 ---
 
