@@ -31221,7 +31221,16 @@ delivers.
 
 ### D1025 — an INTEGER-LITERAL map subscript narrows at check and not at emit: `if m[1] is string { const z: string = m[1] }` is check-clean invalid wasm, and the STRING-literal subscript `m["a"]` mints no narrowing key at all
 
-**check-clean invalid wasm · check rc 0 (the checker even hints the `string` annotation is redundant) · `type mismatch: expected (ref $type), found (ref null $type)` (the raw nullable map read is delivered where the narrowed `string` is expected) · ZERO corpus cells · found 2026-09-01 measuring the `std:json` usability critique's helper decline (its "gap A", the loud string-keyed face) and re-run at an `i32` key · two ingredients: a MAP read through an integer-literal subscript, and a narrowed destination**
+**runs, prints `x` — CLOSED 2026-09-02 by building the MAP twin of D451's index-place
+narrowing channel and giving BOTH stages the same key grammar (a string literal keys a
+subscript too) · zero `runs` lost and zero cells moved to silent · pinned by
+`tests/cases/maps/literal-subscript-narrow.vl` (a 21-line oracle over 9 delivery positions,
+both key spellings, both arms of each union discriminated) and
+`tests/cases/maps/error-literal-subscript-narrow-retired-by-delete.vl` (the soundness floor)
+· probe `scripts/capability-probes/map-read-literal-subscript-narrowing.vl` · was check-clean
+invalid wasm, `type mismatch: expected (ref $type), found (ref null $type)`, with ZERO corpus
+cells · found 2026-09-01 measuring the `std:json` usability critique's helper decline (its
+"gap A", the loud string-keyed face) and re-run at an `i32` key**
 
 Repro:
 
@@ -31232,32 +31241,76 @@ Repro:
       print(z)
     }
 
-`placeKeyOf` (`compiler/typecheck.vl`, the Index arm D11 built) keys an index place only
-through `intLitTextOf`, so `m[1]` gets a narrowing key the same way `xs[0]` does — and the
-checker narrows it to `string`, accepts the annotated binding, and calls the annotation
-redundant. The emitter's narrowed-read path was wired for ARRAY places (D11's rungs); a map
-read through the same key still lowers to the raw `(ref null)` map get, and the destination
-expects the narrowed rep.
+`placeKeyOf` (`compiler/typecheck.vl`, the Index arm D11 built) keyed an index place only
+through `intLitTextOf`, so `m[1]` got a narrowing key the same way `xs[0]` does — and the
+checker narrowed it to `string`, accepted the annotated binding, and called the annotation
+redundant. The emitter's narrowed-read path was wired for ARRAY receivers (D451's rungs); a
+map read through the same key still lowered to the raw `(ref null)` map get, and the
+destination expected the narrowed rep.
 
-* **THE FAMILY, ABLATED.** The destination is the ingredient, not the value type: `{[i32]:
-  string}` (no union) with `is string` + `const z: string = m[1]` is the same invalid wasm;
-  `is f64` + `const z: f64 = m[1]` is the same; `return m[1]` from a `function f(): string`
-  inside the `is` is the same. **Controls that RUN:** `print(m[1])` inside the `is` prints
-  `x` (no narrowed destination); the un-annotated `const z = m[1]` prints `x`; hoisting the
-  read — `const v = m[1]` then `if v is string { const z: string = v }` — prints `x`; and
+**WHAT THE FAILING RUNG RECEIVED, off the disassembly.** The start function's tail is
+`local.set $34 (array.get $4 …)` then `local.set $0 (local.get $34)`, where `$34` is the map
+slot's valStash declared `(ref null $2)` and `$0` is `z`, declared `(ref $2)` from its
+annotation. The checker's half was already right; only the value on the stack was nullable.
+
+**THE FIX IS THE MAP TWIN OF D451, over one key grammar.** `pushIndexMapNarrow` pushes for a
+REF-valued map read — every value kind except the three scalar-backed ones (`f64` / `i64` /
+`f32`), whose miss is a numeric zero and carries no null in the rep. `emitNarrowedMapReadTail`
+recovers non-null at the read and, for a UNION value, unboxes to the tested atom through
+`emitUnionUnboxTail`. `mapReadNarrowedAtomKind` is the ONE producer of "this read unboxes",
+asked by the read and by every classifier that must stop calling it a box (`exprUnion`,
+`unionNameOfExpr`, `indexUnionReadKind`, the union-box binding arm) — the ref-list twin asks
+`narrowVariantFor` in its classifiers and `narrowedValueAtomOf` at its read, and those two
+disagree on a numeric-litunion arm, so this side asks the read's question everywhere.
+`subscriptKeyTextOf` / `subscriptKeyLexemeOf` then take the STRING literal on both stages, the
+lexeme kept with its quotes so `m[0]` and `m["0"]` cannot render one key.
+
+**TWO LAYERS UNDER IT, both found by running the fix's own positions and both closed here.**
+(1) A bare read of a UNION-valued map at a MISSING key **trapped `null reference` on master**
+for `is`, `!= null`, `== null`, `is null` and `print` alike — `emitMapGet` yields the vals
+slot with a bare `ref.null` miss while every consumer of a boxed read opens with `struct.get
+$uBox 0`. The `const t = m[k]` BINDING always ran, because that arm alone took
+`emitMapGetUnionBox`, whose miss synthesises the null-tagged box; the bare read now takes it
+too, and `print(m[k])` at an absent key prints `null` (the print plan gains the `null` arm the
+map's declared VALUE set does not carry — a bare read is `V | null` in both the `{[K]: V}` and
+`{[K]: V | null}` spellings). (2) `m.delete(1)` did NOT retire the cell narrowing — an
+intrinsic answers `-2` in `callInvalidatesReal` and `callArgPlaces` puts a receiver in the
+argument list only for a UFCS call to a user function — so the narrowed read after it would
+have recovered a key that is gone. `cellRemovingMethod` (`delete` / `clear` / `pop`, NOT
+`push` / `set` / `add`, which cannot take a cell away) now retires it, precisely at a literal
+key and bluntly otherwise. That also closes the ARRAY twin, which trapped `out of bounds
+array access` on master: `if xs[0] is string { xs.pop(); const z: string = xs[0] }`.
+
+* **THE FAMILY, ABLATED.** The destination was the ingredient, not the value type: `{[i32]:
+  string}` (no union) with `is string` + `const z: string = m[1]` was the same invalid wasm;
+  `is f64` + `const z: f64 = m[1]` was the same; `return m[1]` from a `function f(): string`
+  inside the `is` was the same. **Controls that RAN:** `print(m[1])` inside the `is` printed
+  `x` (no narrowed destination); the un-annotated `const z = m[1]` printed `x`; hoisting the
+  read — `const v = m[1]` then `if v is string { const z: string = v }` — printed `x`; and
   the ARRAY twin `const xs: (string | f64)[] = ["x", 2.5]` / `if xs[0] is string { const z:
-  string = xs[0] }` prints `x` (D11's built half).
+  string = xs[0] }` printed `x` (D451's built half). **THE TWO CONTROLS ARE WHERE THE FIX
+  COSTS THE MOST**, and they are why the classifier list above is four names long: the
+  un-annotated binding takes its slot from the initializer, so it has to follow the read
+  (which now unboxes) rather than the map's declared value rep, and `print` had to stop
+  asking for the box. Each broke in one of the first two candidate builds — fixing the
+  binding is what broke `print`, and fixing `print` is what broke the binding — and both are
+  in the fixture.
 
-* **THE LOUD FACES ARE THE SAME DEFECT ONE STEP EARLIER.** At a STRING key —
+* **THE STRING-KEY LOUD FACE IS CLOSED WITH IT, AND THREE NEIGHBOURS ARE NOT.**
   `let m: {[string]: string | f64} = Map()` / `if m["a"] is string { const z: string =
-  m["a"] }` — the place mints no key and the check refuses `cannot assign string | f64 |
-  null to 'z' of type string`; a variable key (`m[k]`, `xs[i]`) is the same refusal; and
-  `!= null` narrows NEITHER key — `if m[1] != null { const z: string | f64 = m[1] }` refuses
-  `cannot assign string | f64 | null …` even at the integer literal, so the keyed place is
-  narrowed by `is` only. Every one of those is check-clean by the design (a literal subscript
-  is a stable place exactly as `xs[0]` is) and is a clause-2 refusal; the integer-literal
-  `is` face is the same gap with the checker's half done and the emitter's half not, which
-  is what makes it clause 1.
+  m["a"] }` minted no key and refused `cannot assign string | f64 | null to 'z' of type
+  string`; it now runs. **Still refused, and each for its own reason:** a VARIABLE key
+  (`m[k]`, `xs[i]`) names no cell, which is the same rule a variable-index WRITE is retired
+  under rather than a gap; `!= null` narrows NEITHER key (`if m[1] != null { const z: string |
+  f64 = m[1] }` still refuses `cannot assign string | f64 | null …` even at the integer
+  literal), so a keyed place is narrowed by `is` only; and `is` over a MONO-i32 map moved one
+  stage later rather than away — `{[K]: i32}` / `if m[k] is i32` was `cannot assign i32 |
+  null to 'z' of type i32` at the string key and is now the emitter's "`is` test but no union
+  type declared" at both keys. That third one is a REP question, not a key question: the mono
+  i32 map is the one value rep with no spare value for `null` (`emitMapGet`'s sentinel comment
+  names it), so the whole `i32`-valued family refuses at every spelling. Its `entry != 0`
+  probe is already computed and sitting in the map scratch frame, which is what makes it look
+  cheap; nothing here depends on it.
 
 * **WHAT IT TOUCHES.** The `std:json` helper decision: the usability critique's consumer
   programs hoist every `obj["k"]` read into a local before narrowing, and this row is why
@@ -31265,8 +31318,9 @@ expects the narrowed rep.
   Json}`, so the string-keyed loud face is the one every JSON consumer meets; the fix is
   the same key for both subscripts (an index place keyed by a STRING literal too), plus the
   emitter delivering the narrowed rep for a map read the way it does for an array read.
-  Build the emitter half first — narrowing the checker's key alone would move the string
-  face from loud to THIS row's silent one (the D965 position rule).
+  Both halves landed, emitter first — narrowing the checker's key alone would have moved the
+  string face from loud to THIS row's silent one (the D965 position rule), and that order is
+  what the two commits are split along.
 
 ### D1026 — an alias that already holds `null`, composed with `| null` again in a SIGNATURE, is check-clean and emit-refused: `type P = null | f64` / `function g(): P | null { return null }` → `bare null needs a struct-typed context`
 

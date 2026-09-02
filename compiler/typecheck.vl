@@ -4015,21 +4015,29 @@ function placeKeyOf(ix: i32) {
   if n is Index {
     const base = placeKeyOf(n.idxArr)
     if base == "" { return "" }
-    const lit = intLitTextOf(n.idxIndex)
+    const lit = subscriptKeyTextOf(n.idxIndex)
     if lit == "" { return "" }
     return base + "[" + lit + "]"
   }
   ""
 }
 
-// The DIGITS of an integer-literal subscript, or `""` when the node is not one. The
+// The KEY TEXT of a LITERAL subscript — the digits of an integer literal, the RAW LEXEME
+// (quotes and all) of a string literal — or `""` when the node is neither. The
 // spelling is the key, so `xs[0]` and `xs[00]` are different keys — over-conservative
 // in the harmless direction (two keys for one cell narrows less, never more), and no
 // program spells the same constant two ways in one guard.
-function intLitTextOf(ix: i32) {
+//
+// THE STRING LITERAL IS HERE BECAUSE A MAP SUBSCRIPT IS A STABLE PLACE FOR EXACTLY THE
+// REASON `xs[0]` IS (D1025). Without it `if m["a"] is string { const z: string = m["a"] }`
+// minted no key, so the guard narrowed nothing and the read stayed `V | null` — a clause-2
+// refusal of a program the design permits, and the one every `{[string]: Json}` consumer
+// meets. The lexeme keeps its quotes, which is what keeps the integer and string grammars
+// from colliding: `m[0]` and `m["0"]` are two different places and two different keys.
+function subscriptKeyTextOf(ix: i32) {
   if ix < 0 || ix >= P.nodes.length { return "" }
   const n = P.nodes[ix]
-  if n is Paren { return intLitTextOf(n.parInner) }
+  if n is Paren { return subscriptKeyTextOf(n.parInner) }
   if n is NumLit {
     const t = n.numText
     if t.length < 1 { return "" }
@@ -4040,6 +4048,7 @@ function intLitTextOf(ix: i32) {
     }
     return t
   }
+  if n is StrLit { return n.strText }
   ""
 }
 
@@ -4606,8 +4615,55 @@ function callInvalidatesNarrowedPath(callIx: i32, key: string) {
   false
 }
 
+// The COLLECTION METHODS that can REMOVE a cell — the only intrinsic calls that falsify a
+// narrowing of a cell of their own receiver. Deliberately NOT `cwMutatesList`'s whole set:
+// `push` appends and `set`/`add` insert, none of which can take `xs[0]` or `m["a"]` away, and
+// retiring on those would end a narrowing the guard still proves.
+function cellRemovingMethod(p: string): boolean {
+  if p == "delete" { return true }
+  if p == "clear" { return true }
+  if p == "pop" { return true }
+  false
+}
+
+// The cell a `delete(<literal>)` names, as its KEY TEXT, or "" when the call names no single
+// cell (`clear` / `pop` take no key; a variable key names none). Same rule as a write target:
+// a literal subscript names its cell and nothing else, anything else may have hit any of them.
+function removedCellKeyText(cn: Call, prop: string): string {
+  if prop != "delete" { return "" }
+  if cn.callArgs.length != 1 { return "" }
+  subscriptKeyTextOf(cn.callArgs[0])
+}
+
 function callInvalidatesReal(cn: Call, key: string) {
   const declIx = callDeclFnIx(cn)
+  // A CELL-REMOVING COLLECTION METHOD RETIRES THAT CELL'S NARROWINGS, and it has to be asked
+  // FIRST because it reaches neither leg below: an intrinsic answers `-2` on the next line,
+  // and `callArgPlaces` puts a receiver in the argument list only for a UFCS call to a user
+  // function. So `m.delete(1)` under `if m[1] is string` left the cell narrowed while the key
+  // was gone — `vl check` rc 0 over a read of a key that is not there.
+  //
+  // THE KEY ARGUMENT IS READ EXACTLY AS A WRITE TARGET IS: a literal subscript names its cell
+  // and retires only that one (`m.delete(2)` leaves `m[1]` narrowed), while `clear` / `pop` /
+  // a variable key name NO cell and therefore may have hit any of them — which is
+  // `retireNarrowingsForWrite`'s own `tgtKey == ""` rule, one call shape over.
+  const rmRecv = P.nodes[cn.callFn]
+  if rmRecv is Member {
+    if cellRemovingMethod(rmRecv.memProp) {
+      const rmRoot = placeKeyOf(rmRecv.memObj)
+      if rmRoot != "" {
+        const rmLit = removedCellKeyText(cn, rmRecv.memProp)
+        if rmLit == "" {
+          if keyHasPrefix(key, rmRoot + "[") { return true }
+        } else {
+          const rmCell = rmRoot + "[" + rmLit + "]"
+          if key == rmCell { return true }
+          if keyHasPrefix(key, rmCell + ".") { return true }
+          if keyHasPrefix(key, rmCell + "[") { return true }
+        }
+      }
+    }
+  }
   // An intrinsic writes no object field. The BROAD rule as filed does not make that
   // distinction — "any call that receives the object" includes `print(o)` — so the
   // switch bypasses this too, and the two measurements compare the filed rules
