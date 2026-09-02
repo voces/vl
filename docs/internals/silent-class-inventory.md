@@ -31116,7 +31116,12 @@ signature, the composed union has no rep the emitter will hand a bare `null` to.
 
 ### D1027 — a null-bearing RECURSIVE alias composed with `| null` in a signature is still emit-refused after D1026's fold: `Json | null`, the accessor shape every `std:json` consumer writes, fails at three faces
 
-**loud emit reject · check rc 0 · `emitProgram: bare null needs a struct-typed context` reported at the SIGNATURE (`2:9`, the function name — not at the `return null`) · ZERO corpus cells (no recursive-alias axis) · reproduces on master at 57626bac, the seed carrying #2312 · found 2026-09-01 re-grading `scripts/capability-probes/null-bearing-alias-or-null-signature.vl` after D1026 merged · two ingredients, ablated: the alias RECURSES and the alias CARRIES `null`; either alone runs**
+**runs — CLOSED 2026-09-02 by letting `nodeTyIsUnionAlias` see through a NULLABLE whose inner
+is a value-union box, peeling the stacked `TyNullable`/one-member-`TyUnion` wrappers to a
+fixpoint · probe `null-bearing-alias-or-null-signature.vl` now RUNS (28 of 28) · zero `runs`
+lost · `tests/cases/types/nullable-over-a-union-that-boxes.vl` · was a loud emit reject,
+`emitProgram: bare null needs a struct-typed context` at the SIGNATURE, with ZERO corpus
+cells**
 
 Repro:
 
@@ -31208,6 +31213,27 @@ Repro:
   spelling-side fix.
 
 ---
+
+* **THE TWO SPELLINGS DISAGREED ABOUT THEIR OWN REP WHILE RENDERING THE SAME NAME.** `Json |
+  null` answered `vtKindOfType` = `"i32"`; the INLINE flattened spelling of the identical type
+  — same rendered name, character for character — answered `"union"`. An i32 return slot has
+  nowhere to put a box, so `return null` fell through every seed to the bare-null floor.
+
+* **AND THE PEEL HAS TO ALTERNATE.** `nodeTyIsUnionAlias` excludes a `TyNullable` on purpose,
+  which is right for a NICHE (`S | null`, `string | null`) and wrong the moment the inner is a
+  value-union box. One unwrap is not enough: `Json | null` interns as
+  `TyNullable( TyUnion[ TyNullable(rest) ] )` — the outer `| null`, the alias's one-member
+  wrapper, and the alias's own `null` folded into a niche. Measured with a describe probe: the
+  inner reads `union1` at the first look, and only the SECOND nullable reaches the five-member
+  box the inline spelling shows directly.
+
+* **FOUR CANDIDATES, AND THE FIRST THREE ALL ATTACKED THE NAME.** A `mkNullableTy` idempotence
+  fold, a canon collapse back to the alias, and a member-SET match in `unionRowOf` — each
+  built, each measured, none moved the witness by a character. The name was already right,
+  flattened and deduped; the disagreement was in the arena TYPE. **What separated them was
+  asking `vtKindOfType` of both spellings**, which took one probe and should have been the
+  first move: two spellings of one type that disagree are a REP question, and the rep is what
+  to print.
 
 ### D1028 — a NAMED alias of a composition carrying a recursive alias delivers every value arm raw: `type JR = Json | E` is check-clean invalid wasm for `f64`, `boolean` and `string`, and refuses a list, while the struct arm and `null` land and the direct spelling `Json | E` runs
 
