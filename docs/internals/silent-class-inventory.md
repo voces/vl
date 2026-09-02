@@ -29532,6 +29532,36 @@ receiver's fit is never re-asked at the pin.
   then names the contract instead of a substituted type — but it cannot be the only one while
   an unbounded `<T>` remains legal.
 
+* **THE DEFERRED RECEIVER CONSTRAINT WAS BUILT AND IT WORKS — AND IT CANNOT SHIP UNTIL ITS
+  FIELD-PRECEDENCE GUARD CAN BE WRITTEN.** A `ufcsCstr*` table beside `memCstr*`, recorded in
+  `ufcsCallTy` right after the vacuous `assignable(recvTy, params[0])` gate and re-asked at
+  both pins next to `validateMemCstrs`, turns this row's witness into a positioned CHECK error
+  (`no `toString` for receiver {s: f64} — the only `toString` in scope takes Circle`) while
+  the satisfied instantiation still prints `<C>`. Roughly 70 lines, entirely in the shape the
+  row prescribed.
+
+  **IT ALSO REFUSES [D1002](#d1002)'s WITNESS, WHICH IS A LEGAL PROGRAM.** `type Boxed = { r:
+  f64, toString: () => string }` has `toString` as a FIELD; field precedence means
+  `x.toString()` is a field call, and with the `std:fmt` import deleted the same program
+  prints `<fld>`. Refusing it would trade a clause-1 miscompile for a clause-2 wrong reject —
+  strictly worse, and exactly the "closed by making it loud" move this file's own goal
+  section forbids.
+
+* **THE BLOCKER IS SHARP: THE SUBSTITUTED RECEIVER IS NOT MEMBER-EQUIVALENT TO THE ARGUMENT'S
+  OWN TYPE.** The obvious guard is "skip when the receiver has the member", asked of the
+  substituted type the way `validateMemCstrs` asks its own. It does not work here.
+  `memberFloorMsg(ur, "toString")` answers **`no field 'toString' on Boxed`** for a receiver
+  whose DIRECT spelling resolves that very field and prints `fld` — measured with the message
+  instrumented, and `boundMemberList(ur)` renders EMPTY for it. So `ur` renders as `Boxed` and
+  answers member questions as a shell.
+
+  That is the thing to find out first next time, because `validateMemCstrs` has no such
+  problem with its own recorded type — which says the difference is in WHICH type
+  `ufcsCallTy`'s `recvTy` parameter carries, not in `substTyDeep`. Compare what the member
+  path records against what `ufcsCallTy` receives, before writing the table again.
+
+* **NOTHING SHIPPED.** The change was reverted; both witnesses still reproduce as filed.
+
 Repro (check rc 0, then invalid wasm):
 
     type Circle = { r: f64 }
