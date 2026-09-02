@@ -30656,6 +30656,47 @@ alias INSIDE another union that has no rep.
   the alias are not an ingredient. The value is delivered wrong at the return boundary
   whichever side of the union it comes from.
 
+* **RE-ABLATED 2026-09-01 AGAINST THE NON-RECURSIVE TWIN AT EVERY SPELLING, AND ONE ROW OF THE
+  TABLE ABOVE IS NOT THIS DEFECT.** Running each spelling twice — once with `Json`
+  self-referential, once with the same six arm kinds non-recursive — separates them:
+
+  | spelling | recursive | non-recursive |
+  | --- | --- | --- |
+  | struct return `Json \| E` | check-clean invalid wasm | RUNS → `false` |
+  | named composition `type JR = Json \| E` | check-clean invalid wasm | RUNS → `false` |
+  | `is E` narrow | loud (`deferred value-union composition`) | RUNS → `empty` |
+  | binding `const r: Json \| E = e` | loud (`struct equality is not supported yet`) | RUNS → `false` |
+  | **literal arm `Json \| "err"`** | **loud (`no recorded members`)** | **loud — IDENTICAL** |
+
+  Four of the five are recursion-gated. The LITERAL-ARM row is not: `J2 \| "err"` over a
+  non-recursive `J2` refuses with the same sentence, so it is a separate defect that happens
+  to share a message — the exact thing this file's own "a validator sentence is not a
+  mechanism" rule warns about, caught by running the plainest program the sentence forbids.
+
+* **AND RECURSION THROUGH THE MAP ARM ALONE ALSO FAILS**, with `null` removed from the picture
+  entirely: `type K = f64 \| K[]` and `type K = f64 \| {[string]: K}` composed with a struct
+  both refuse at `is E`, while `type K = f64 \| f64[]` runs and prints `empty`. So the
+  ingredient is self-reference itself, through EITHER arm, and not the list arm the first
+  ablation happened to use.
+
+* **WHY IT IS NOT FIXED HERE: the composed box's PAYLOAD is a design decision.** The mechanism
+  is settled — the emitter keeps a recursive alias as an opaque atom, `valueAtomKind` answers
+  -1 for it, the composition never registers a member row, and everything downstream reads an
+  uncovered row. Two routes exist and neither is a patch:
+
+  1. **Flatten the alias into the composition**, as the non-recursive twin already is. The
+     arena flatten (`flattenVariantsInto`) terminates on a recursive alias by construction —
+     `K[]` is a `TyArray`, not a `TyUnion` — so the recursion fear does not apply to it. What
+     blocks this is the SPELLING side: `recordUnMemTys` is documented as one recorded index
+     per atom in atom order, "the union box-tag ABI depends on it", so splicing there changes
+     tags for every union that already has a union-alias atom.
+  2. **Register the composition with the alias as ONE member**, whose payload is itself a
+     `Json` box. Coherent, ABI-safe, and a double box — a rep decision with a size and a
+     `==` story, not something to land inside a defect fix.
+
+  Both are the owner's call. The measurement above is what the decision needs and is what this
+  update adds.
+
 * **THE MECHANISM IS IN THE LITERAL-ARM MESSAGE.** `Json | "err"` is reported as
   `Json|string` — a two-member union whose first member is the alias itself, "with no
   recorded members". The emitter FLATTENS a non-recursive alias into the composition (that is
