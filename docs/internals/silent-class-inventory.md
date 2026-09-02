@@ -32988,3 +32988,91 @@ Repro:
   every destination cannot see the inference-pinned rep); `!(r is "err")` and `r is "err"
   == false`; and the D1024 fixture set unmoved, because the gate change must not reach into
   the collapse.
+
+### D1060 — `is <literal>` over a CALL-result union is a loud emit reject, and the message says "non-binding" when the ablation says "call"
+
+**loud emit reject · check rc 0 · clause 2 · `emitProgram: literal `is` over a non-binding union value is not supported yet` (`compiler/wasmEmit.vl:6150`) · ZERO corpus cells · found 2026-09-02 by triaging `goal-scoreboard.py --sites`, which listed this literal as reached by NO corpus cell and by no probe**
+
+Repro (refuses; binding the call to a `const` first RUNS and prints `yes`):
+
+    type K = "a" | "b"
+    function mk(n: i32): K | i32 {
+      if n == 0 { return "a" }
+      7
+    }
+    if mk(0) is "a" { print("yes") } else { print("no") }
+
+* **THE ABLATION SAYS "CALL", NOT "NON-IDENTIFIER" — the message's own wording is broader
+  than the defect, which is the third time that has been true this campaign.** A struct-FIELD
+  receiver (`s.u is "a"`) RUNS. An ELEMENT receiver (`xs[0] is "a"`) RUNS. Binding the call to
+  a `const` RUNS. Only the call result refuses, and PARENTHESISING it (`(mk(0)) is "a"`)
+  refuses identically, so the paren peel is not the bound either.
+
+* **THE FIX IS A SCRATCH-LOCAL SPILL, not a widened re-readability predicate.** The receiver
+  has to be evaluated once into a local and the existing membership lowering run against that
+  local — which is what the user writes by hand today to make the program work.
+
+* **NOT D1061**, though the two literals sit six lines apart in `wasmEmit.vl` and both say
+  "non-binding": binding both operands does NOT fix `==` over a struct-plus-scalar union.
+  Separated by ablation, not by their sentences.
+
+* Probe: `scripts/capability-probes/lit-is-call-result-union.vl`.
+
+### D1061 — `==` over a union carrying a STRUCT arm beside a SCALAR arm is a loud emit reject; two STRUCT arms compare fine
+
+**loud emit reject · check rc 0 · clause 2 · `emitProgram: `==` over a struct union is not supported yet` (`compiler/wasmEmit.vl:5738`) · ZERO corpus cells · found 2026-09-02 triaging `goal-scoreboard.py --sites`**
+
+Repro (refuses):
+
+    type A = { x: i32 }
+    function mk(n: i32): A | i32 {
+      if n == 0 { return 5 }
+      { x: 1 }
+    }
+    const p = mk(0)
+    const q = mk(0)
+    print(p == q)
+
+* **THE MIXED ARM IS THE INGREDIENT, NOT THE STRUCT ONE**, and the message's word "struct
+  union" points at the arm that is NOT the problem. Measured: `A | B` over two struct arms
+  compares and prints `true`; `A | i32` and `A | string` both refuse. So a union whose arms
+  are all structs is already served, and it is the STRUCT-BESIDE-SCALAR pair that has no
+  compare core.
+
+* **BINDING DOES NOT HELP**, which is what separates it from [D1060](#d1060): both operands
+  here are already `const` locals.
+
+* **PLAIN STRUCT EQUALITY IS NOT THE GAP EITHER** — `a == b` over two `P` values outside any
+  union runs and prints `true`, so `emitProgram: struct equality is not supported yet`
+  (`wasmEmit.vl:22654`) is a different literal with a different, narrower domain.
+
+* Probe: `scripts/capability-probes/union-eq-struct-and-scalar-arm.vl`.
+
+### D1062 — an INFERRED nullable return whose non-null arm is a LIST refuses through TWO different channels depending on the ELEMENT type, and annotating fixes both
+
+**loud emit reject at `i32[]` (`emitProgram: bare null needs a struct-typed context`) and a loud CHECK reject at `string[]` (`'f' infers the nullable return type string[] | null — type-valid, but an inferred return of this shape is not yet supported by codegen; annotate the return type`, `compiler/typecheck.vl:25831`) · check rc 0 on the first · clause 2 both ways · ZERO corpus cells · found 2026-09-02 triaging `goal-scoreboard.py --sites`**
+
+Repro (refuses; the annotated twin `function f(n: i32): i32[] | null` RUNS and prints `false`):
+
+    function f(n: i32) {
+      if n == 0 { return [1, 2] }
+      return null
+    }
+    print(f(0) == null)
+
+* **ONE SHAPE, TWO CHANNELS, and that is the reason to file it as one row.** The `i32[]`
+  element reaches the emitter and refuses there; the `string[]` element is refused by the
+  CHECKER with a message that concedes the program is type-valid. A count of emit-side
+  refusals sees one of these and a count of checker-side refusals sees the other, so neither
+  number describes the gap.
+
+* **THE FAMILY, ABLATED.** Arms that already RUN under inference: `i32`, `string`, a struct,
+  and a MAP. Arms that refuse: a LIST and a CLOSURE. Arm ORDER does not matter — `return null`
+  first refuses identically. Removing the `null` arm runs.
+
+* **ANNOTATING THE RETURN FIXES IT, WHICH IS WHY NO FIXTURE HAS CAUGHT IT.** This is D969's
+  rule exactly: an annotation pins the rep, so a fixture that annotates every destination
+  cannot see a defect whose ingredient is inference doing the pinning instead.
+
+* Probe: `scripts/capability-probes/inferred-nullable-list-return.vl`.
+
