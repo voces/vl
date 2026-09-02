@@ -29,6 +29,7 @@ import {
   nodeTyCarry,
   nodeTyExcludesNull,
   nodeTyIsLitUnionAlias,
+  nodeTyIsMap,
   nodeTyIsNullable,
   nodeTyIsObj,
   nodeTyIsUnion,
@@ -259,6 +260,14 @@ function drwFillDefaults(ix: i32, ctx: i32) {
 
 // Post-order rewrite of the tree at `ix` (inside function `ctx`, -1 = top
 // level). Returns the node index to use in `ix`'s place (usually `ix` itself).
+// True if `ix` is a map INDEX read (`m[k]`), parens peeled — the shape whose `??` has a
+// fused lowering in `emitMapGetOr` and must not be desugared into a re-reading `if`.
+function drwIsMapRead(ix: i32) {
+  const n = P.nodes[unwrapParen(ix)]
+  if n is Index { return nodeTyIsMap(n.idxArr) }
+  false
+}
+
 function drwWalk(ix: i32, ctx: i32) {
   if ix < 0 { return ix }
   const n = P.nodes[ix]
@@ -447,7 +456,15 @@ function drwWalk(ix: i32, ctx: i32) {
       // cost one: the desugaring names the operand twice, and `exprReReadable` is precisely
       // the predicate for "evaluating this again is the same value with no second effect". A
       // CALL operand keeps the `??` and the emitter's refusal, which is why D960 stays open.
-      if exprReReadable(unwrapParen(n.binLeft)) {
+      // ...AND NOT OVER A MAP READ, WHICH ALREADY HAS A FUSED LOWERING. `m[k]` is
+      // re-readable in the sense this predicate means — effect-free, same value twice — so
+      // the desugar fired on it, and the `!= null` it synthesizes lowers as a TAG read on
+      // the box. A map MISS is not a null-tagged box, it is a bare `ref.null` in the vals
+      // slot, so the tag read was `struct.get` on a nullable ref: `vl check` rc 0 and a
+      // module the engine refuses (D1019). `emitMapGetOr` already lowers this shape
+      // correctly and probes the map ONCE rather than twice, so the fix is to leave it
+      // alone. Module scope escaped only because its binding took a different path.
+      if exprReReadable(unwrapParen(n.binLeft)) && !drwIsMapRead(n.binLeft) {
         if tyIsNulValueUnionBox(nodeTyIxOf(n.binLeft)) {
           const dsThen: i32[] = []
           dsThen.push(n.binLeft)

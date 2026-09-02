@@ -1,0 +1,53 @@
+// @run
+// @log 7
+// @log 5
+// @log 7
+// @log 9
+// @hint redundant type annotation: `t` is inferred as `i64 | string` — remove it to lean on inference
+// Regression (silent-class-inventory D1019).
+//
+// `const t = m[k] ?? d` over a UNION-VALUED map, INSIDE A FUNCTION. `vl check` returned 0
+// and the engine refused the module:
+//
+//   type mismatch: expected (ref $type), found (ref null $type)
+//
+// D962 desugars `x ?? d` over a nullable value-union box into `if x != null { x } else { d }`,
+// bounded to RE-READABLE operands because the rewrite names the operand twice. `m[k]` is
+// re-readable in exactly the sense that predicate means — effect-free, same value twice — so
+// the desugar fired on it, and the synthesized `!= null` lowers as a TAG read on the box. A
+// map MISS is not a null-tagged box; it is a bare `ref.null` sitting in the vals slot. So the
+// tag read was a `struct.get` on a nullable ref.
+//
+// `emitMapGetOr` already lowers this shape correctly, so the fix is for the rewrite to leave
+// a map read alone. It also probes the map ONCE where the desugared form probed it twice —
+// the double probe is visible in the disassembly and was the tell that a rewrite, not an
+// emit arm, was producing these bytes.
+//
+// MODULE SCOPE RAN THE WHOLE TIME, which is what made this look scope-independent when it is
+// not: the same three lines at module scope bind through a different path and never reach the
+// desugar. Both scopes are pinned below.
+function hit(m: { [string]: i32 | string }, k: string) {
+  const t = m[k] ?? 7
+  if t is i32 { print(t) }
+}
+
+const mm: { [string]: i32 | string } = Map()
+mm["a"] = 5
+
+hit(mm, "zz") // a MISS takes the default
+hit(mm, "a")  // a HIT takes the stored value
+
+// Module scope — the spelling that always ran, kept so a future change cannot fix one
+// scope by breaking the other.
+const t0 = mm["zz"] ?? 7
+if t0 is i32 { print(t0) }
+
+// An i64-armed value union, and an ANNOTATED binding: neither is an ingredient, and the
+// annotation notably did NOT help before the fix — so this is not inference picking a rep.
+function hit64(m: { [string]: i64 | string }, k: string) {
+  const t: i64 | string = m[k] ?? 9
+  if t is i64 { print(t) }
+}
+
+const m64: { [string]: i64 | string } = Map()
+hit64(m64, "zz")
