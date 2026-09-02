@@ -349,15 +349,17 @@
 // second UTF-8 decoder in the tree (there is one, `std:utf8`'s) to serve inputs
 // that a strict decoder should have rejected upstream.
 //
-// ── COMPILER GAPS: ONE REACHES THE CALLER, THE REST ONLY THE BODY ─────────
+// ── COMPILER GAPS: TWO REACH THE CALLER, THE REST ONLY THE BODY ───────────
 //
 // The four EXPORTED NAMES are the ones `json-design.md` specifies and no
 // signature is bent around a compiler gap (the standing rule: propose the
-// better surface and file the gap). But **one gap is visible to a caller and
-// this header does not pretend otherwise**: D1030 means the pair does not
+// better surface and file the gap). But **two gaps are visible to a caller and
+// this header does not pretend otherwise**. D1030 means the pair does not
 // compose — the value `parseJson` returns cannot be handed straight to
-// `toJson`. The working spellings are written out at `parseJson` below; read
-// that before writing a consumer.
+// `toJson`; the working spellings are written out at `parseJson` below, so read
+// that before writing a consumer. D1050 is why `kind` is an INLINE literal set
+// rather than a named alias, and it is a deviation this module CHOSE with a
+// measurement rather than inherited — the entry below has it.
 //
 // The rest shape only the body, each marked at its site and each carrying an
 // inventory row so the shape can be undone when the row closes:
@@ -368,9 +370,44 @@
 //     six-arm ladder that costs, and it is why the parser's value functions
 //     answer a plain `Json` with the error riding on the scanner instead of
 //     returning `Json | JsonError` the way every other std module would.
-//   • D1031 — `JsonError | null` is refused as a struct FIELD and as a RETURN
-//     type, because `JsonError` is a union arm elsewhere here. Both error
-//     carriers (`Scan`, `Rend`) are therefore flat fields plus a `live` flag.
+//   • D1031 — CLOSED 2026-09-02 (#2385); the flat-field carriers it forced are
+//     gone. See `Scan` for what they were.
+//   • D1112 / D1161 — WHY EVERY READ OF `err` NARROWS IN PLACE. Neither rebind
+//     spelling runs at both of the positions this module needs. Measured
+//     2026-09-02 against `seed-latest`, one tiny program per cell, each
+//     printing a value that proves the read or the write landed. The three
+//     spellings are `const e: E | null = c.err` (ANN), `const e = c.err` (INF)
+//     and `if c.err != null { … c.err … }` (IN PLACE):
+//
+//         position                          ANN          INF     IN PLACE
+//         read a field off `err`            runs         runs    runs
+//         ASSIGN a field on `err`           emit reject  runs    runs
+//         return into `Json | JsonError`    runs         SILENT  runs
+//         return into `string | JsonError`  runs         SILENT  runs
+//
+//     `emit reject` is D1161, `SILENT` is D1112's check-clean invalid wasm.
+//     IN PLACE is the one column with no hole, so it is the only spelling used,
+//     and a "redundant" rebind is not a safe cleanup here — the compiler
+//     ACTIVELY suggests the refused ANN spelling with a `redundant type
+//     annotation` hint, which is why the table is written out rather than cited.
+//     Both rows need `JsonError` to be a union ARM: the two non-return rows run
+//     once it is not one (D1161's own ablation), and at the two return rows the
+//     union IS the destination and cannot be ablated away.
+//   • D1050 — `kind` IS SPELLED INLINE AT ALL FIVE SITES AND THERE IS NO PRIVATE
+//     `JsonErrorKind` ALIAS. This is the one caller-visible deviation besides
+//     D1030, and the reason is not that the alias refuses — measured 2026-09-02,
+//     a std copy with the alias uniformly at all five sites BUILDS and answers
+//     all 32 error-surface cases byte-identically. What it costs is at the
+//     BOUNDARY: against that std, a caller rebinding at the module's own
+//     documented spelling — `const k: "syntax" | "duplicate" | "depth" |
+//     "nonfinite" = e.kind` — is `vl check` rc 0 and then `emitProgram: map key
+//     is not a string`, where against this one it runs. A comparison
+//     (`e.kind == "syntax"`) survives the alias; the rebind does not. D1050's
+//     rep split (a registered alias is the interned i32 atom, an inline set a
+//     `(ref $string)`) is the obvious mechanism, but the plain two-rep reduction
+//     RUNS, so that is a prediction and not a located cause; the measurement
+//     above is what this choice rests on. The alias also stops being free the
+//     day `kind` is exported, so it waits for D1050 either way.
 //   • D1029 — an `is`-narrowed MAP arm must be re-bound at its own type before
 //     it can be delivered anywhere.
 //   • D1009 / D1025 — a map read is `Json | null` and does not narrow to
@@ -535,12 +572,17 @@ function pushText(buf: i32[], s: string) {
   for cp in s { buf.push(cp) }
 }
 
-// The walk's failure, carried beside the buffer for the same filed reason the
-// scanner's is (D1031): `JsonError` is an arm of both public return types, and
-// a `JsonError | null` RETURN is `emitProgram: ref valtype with no interned
-// shape` — the signature face of the struct-field refusal. `live` is the flag
-// the null would have carried, and `at` is absent because a render error's
-// `at` is always 0.
+// The walk's failure, carried beside the buffer so `renderInto` can answer a
+// plain `boolean` and every level can prepend its own pointer segment on the
+// way out. It is ONE `JsonError | null`; D1031 — which made this three flat
+// fields plus a `live` flag — closed on 2026-09-02. `at` is not carried
+// separately because a render error's `at` is always 0.
+//
+// ── EVERY READ OF `err` NARROWS IT IN PLACE (`if r.err != null { … r.err … }`)
+// AND NEVER THROUGH A REBIND, in this type and in `Scan`. Neither rebind
+// spelling runs at every position this module needs, and the measured matrix is
+// in the header's gap list under D1112 / D1161 — read it before "cleaning up" a
+// redundant-looking annotation or null test.
 //
 // ── DO NOT MAKE `renderInto` VOID. It was void once and TRAPPED on
 // `unreachable` at the first value it was handed. The mechanism is D1034: an
@@ -549,30 +591,26 @@ function pushText(buf: i32[], s: string) {
 // the shape a positive predicate produces naturally. TWO independent facts keep
 // it away now: `renderInto` is not void, and no branch here is empty. A later
 // edit could undo either one, so both are noted rather than assumed.
-type Rend = {
-  live: boolean,
-  kind: "syntax" | "duplicate" | "depth" | "nonfinite",
-  path: string,
-  msg: string,
-}
+type Rend = { err: JsonError | null }
 
 function rendFail(
   r: Rend,
   kind: "syntax" | "duplicate" | "depth" | "nonfinite",
   msg: string,
 ) {
-  if !r.live {
-    r.live = true
-    r.kind = kind
-    r.path = ""
-    r.msg = msg
-  }
+  // First failure wins, and a render error's `at` is always 0.
+  if r.err == null { r.err = jsonErr(0, kind, "", msg) }
 }
 
 // Re-point a propagating render error one level up. On render `path` names the
 // VALUE, so EVERY level prepends its own segment — which costs nothing on the
 // success path and O(depth) once, on the way out of a failure.
-function underSeg(r: Rend, seg: string) { r.path = "/" + seg + r.path }
+function underSeg(r: Rend, seg: string) {
+  // D1112/D1161: `err` is narrowed IN PLACE here and everywhere else in this
+  // module. Neither rebind spelling runs at both of the positions this module
+  // needs — see the note at `Rend`.
+  if r.err != null { r.err.path = "/" + seg + r.err.path }
+}
 
 // Walk `v` into `buf`. Answers whether it was written; `r` carries WHY when it
 // was not. `depth` is the number of containers already open, so the cap is
@@ -636,7 +674,7 @@ function renderInto(v: Json, buf: i32[], depth: i32, r: Rend): boolean {
     let first = true
     let bad = ""
     for k in o {
-      if !r.live {
+      if r.err == null {
         if !first { buf.push(44) }
         first = false
         pushQuoted(buf, k)
@@ -652,7 +690,7 @@ function renderInto(v: Json, buf: i32[], depth: i32, r: Rend): boolean {
         }
       }
     }
-    if r.live {
+    if r.err != null {
       underSeg(r, ptrSeg(bad))
       return false
     }
@@ -674,8 +712,21 @@ function renderInto(v: Json, buf: i32[], depth: i32, r: Rend): boolean {
 // ever returned: the buffer is discarded on failure.
 export function toJson(self: Json): string | JsonError {
   const buf: i32[] = []
-  const r: Rend = { live: false, kind: "nonfinite", path: "", msg: "" }
-  if !renderInto(self, buf, 0, r) { return jsonErr(0, r.kind, r.path, r.msg) }
+  const r: Rend = { err: null }
+  if !renderInto(self, buf, 0, r) {
+    // D1112/D1161: narrowed in place — see the note at `Rend`.
+    if r.err != null { return r.err }
+    // Unreachable while every `false` from `renderInto` has raised first, and
+    // it carries the same `kind` the pre-D1031 flat carrier's initial values
+    // produced here. It is a failure rather than a partial document on
+    // purpose, and it is a `JsonError` rather than `__trap__` because this
+    // module's whole contract is that neither direction traps — the same
+    // argument the depth cap is built on. `msg` says what happened rather than
+    // being empty, matching `renderInto`'s own seventh-arm floor twenty lines
+    // up; `kind` is the least wrong of four and is not evidence about a cause
+    // nothing here knows.
+    return jsonErr(0, "nonfinite", "", "the renderer stopped without raising")
+  }
   fromCodePoints(buf)
 }
 
@@ -688,22 +739,21 @@ export function toJson(self: Json): string | JsonError {
 // registered name (D1030). This is a private carrier, not a second error
 // channel: the surface is `Json | JsonError` in both directions.
 //
-// THE ERROR IS FIVE FLAT FIELDS RATHER THAN ONE `JsonError | null`, for a
-// filed reason and not for taste: a struct field typed at a type that is a
-// union ARM elsewhere in the program is a loud emit reject here — the emitter
-// says the field has no rep (D1031) — and `JsonError` is an arm of both public
-// return types. `live` is the flag the null would have carried.
+// THE ERROR IS ONE `JsonError | null`, and `parseJson` hands that same object
+// straight back to the caller. It was four flat fields plus a `live` flag until
+// 2026-09-02, when D1031 — a struct field typed at a type that is a union ARM
+// elsewhere in the program — closed. `err == null` is what `live` said.
+//
+// Reads of `err` narrow IN PLACE and never through a rebind; the note at `Rend`
+// has the measured reason (D1112, D1161).
 //
 // `sealed` is how `path` is computed without paying for it on the success
-// path — see `sealErr`.
+// path — see `sealErr`. It stays a flat field because it is the SCANNER's
+// bookkeeping and not part of the error a caller receives.
 type Scan = {
   s: string,
   i: i32,
-  live: boolean,
-  at: i32,
-  kind: "syntax" | "duplicate" | "depth" | "nonfinite",
-  path: string,
-  msg: string,
+  err: JsonError | null,
   sealed: boolean,
 }
 
@@ -723,12 +773,8 @@ function raise(
   kind: "syntax" | "duplicate" | "depth" | "nonfinite",
   msg: string,
 ) {
-  if !p.live {
-    p.live = true
-    p.at = at
-    p.kind = kind
-    p.path = ""
-    p.msg = msg
+  if p.err == null {
+    p.err = jsonErr(at, kind, "", msg)
     p.sealed = false
   }
 }
@@ -752,12 +798,10 @@ function raiseHere(
 // segment of the child it was parsing. That builds `path` in O(depth) on the
 // failure path and costs nothing on the success path.
 function sealErr(p: Scan, seg: string) {
-  if !p.live { return }
-  if !p.sealed {
-    p.sealed = true
-    return
+  // D1112/D1161: narrowed in place — see the note at `Rend`.
+  if p.err != null {
+    if p.sealed { p.err.path = "/" + seg + p.err.path } else { p.sealed = true }
   }
-  p.path = "/" + seg + p.path
 }
 
 function isWs(c: i32): boolean { c == 32 || c == 9 || c == 10 || c == 13 }
@@ -991,7 +1035,7 @@ function pArray(p: Scan, depth: i32): Json {
   while true {
     skipWs(p)
     const v = pValue(p, depth + 1)
-    if p.live {
+    if p.err != null {
       sealErr(p, toString(a.length))
       return null
     }
@@ -1041,7 +1085,7 @@ function pObject(p: Scan, depth: i32): Json {
       return null
     }
     const k = pString(p)
-    if p.live {
+    if p.err != null {
       sealErr(p, "")
       return null
     }
@@ -1059,7 +1103,7 @@ function pObject(p: Scan, depth: i32): Json {
     p.i = p.i + 1
     skipWs(p)
     const v = pValue(p, depth + 1)
-    if p.live {
+    if p.err != null {
       sealErr(p, ptrSeg(k))
       return null
     }
@@ -1185,22 +1229,15 @@ export function parseJson(self: string): Json | JsonError {
   if self.length >= 3 && self[0] == 239 && self[1] == 187 && self[2] == 191 {
     return jsonErr(0, "syntax", "", "leading byte-order mark")
   }
-  const p: Scan = {
-    s: self,
-    i: 0,
-    live: false,
-    at: 0,
-    kind: "syntax",
-    path: "",
-    msg: "",
-    sealed: false,
-  }
+  const p: Scan = { s: self, i: 0, err: null, sealed: false }
   skipWs(p)
   if p.i >= self.length {
     return jsonErr(self.length, "syntax", "", "unexpected end of input")
   }
   const v = pValue(p, 0)
-  if p.live { return jsonErr(p.at, p.kind, p.path, p.msg) }
+  // D1112/D1161: narrowed in place — see the note at `Rend`. Since D1031 closed
+  // this is the SAME object the scanner raised, not a copy of its fields.
+  if p.err != null { return p.err }
   skipWs(p)
   if p.i < self.length {
     return jsonErr(

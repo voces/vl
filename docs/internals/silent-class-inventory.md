@@ -32224,6 +32224,13 @@ Repro (now runs, printing `true`):
   carries, and that spelling still refuses ([D1093](#d1093)). The undo is a std change gated on
   D1093 (or on naming the `kind` union) and wants its own review either way.
 
+  **THE UNDO SHIPPED 2026-09-02, and the gate this bullet named was already lifted when it was
+  written**: #2385 closed D1093 alongside this row, so the inline literal union spelling runs.
+  `Scan` and `Rend` are now one `err: JsonError | null` each and `parseJson` returns the object
+  the scanner raised. The residue is a SPELLING constraint and not a capability one — see
+  [D1112](#d1112) and [D1161](#d1161), which between them leave narrowing in place as the only
+  read of the field that runs at every position that module needs.
+
 ---
 
 * **NEITHER `Json` NOR RECURSION IS AN INGREDIENT — measured.** A plain two-struct union
@@ -36221,11 +36228,18 @@ Repro:
   initializer is a field read cannot resolve its variant row. Put this witness on that arm's
   grading list; do not treat the prediction as the close.
 
-* **`std/json.vl` CLEARS WITH THE ANNOTATION.** The module's full both-faces shape — a
-  `JsonError | null` field on the scanner AND on the renderer carrier, both returned into
-  `Json | JsonError` / `string | JsonError`, with `kind` left as the INLINE literal union — runs
-  and prints correctly today, provided each rebind off the nullable field is annotated. Master
-  refuses the same program.
+* **`std/json.vl` CLEARS WITH THE ANNOTATION *at this position*.** The module's full both-faces
+  shape — a `JsonError | null` field on the scanner AND on the renderer carrier, both returned
+  into `Json | JsonError` / `string | JsonError`, with `kind` left as the INLINE literal union —
+  runs and prints correctly today, provided each rebind off the nullable field is annotated.
+  Master refuses the same program.
+
+  **CORRECTED 2026-09-02 when the module was actually rewritten: "annotate every rebind" is NOT
+  a sufficient recipe for this module**, and this bullet read as though it were. The module also
+  PREPENDS a pointer segment (`err.path = "/" + seg + err.path`, in `sealErr` and `underSeg`),
+  and at that field-ASSIGNMENT position the ANNOTATED rebind is a loud emit reject —
+  [D1161](#d1161), this row's mirror. Neither rebind spelling runs at both positions, so the
+  shipped module narrows `err` IN PLACE everywhere; D1161 carries the 4×3 matrix.
 
 ---
 
@@ -36334,3 +36348,69 @@ Repro (kept so this row stays gradeable; it is D1140's witness):
   `print` is a loud clause-2 refusal, while binding it and not using it is clause-1 invalid
   wasm. A fix graded on either witness alone would report the other as untouched.
 
+---
+
+### D1161 — an ANNOTATED rebind off an `Arm | null` field is a loud emit reject wherever the narrowed value receives a field ASSIGNMENT; the un-annotated rebind and the in-place narrowing both run
+
+**loud emit reject: `emitProgram: field-assignment receiver is not a struct` · `vl check` rc 0 ·
+clause 2 · found 2026-09-02 dropping `std/json.vl`'s flat-field error carrier after
+[D1031](#d1031) landed · PRE-EXISTING: identical on master (`seed-latest`, 2026-09-02) ·
+this is [D1112](#d1112)'s MIRROR — that row is the un-annotated rebind at the RETURN position,
+this one is the annotated rebind at the ASSIGNMENT position, and together they leave narrowing
+in place as the only spelling that runs at both**
+
+Repro:
+
+    type Other = { o: string }
+    type E = { at: i32, path: string }
+    type U = Other | E
+    type C = { err: E | null }
+    const c: C = { err: { at: 1, path: "p" } }
+    const e: E | null = c.err
+    if e != null { e.path = "/a" + e.path }
+    if c.err != null { print(c.err.path) }
+    // vl check rc 0; vl run -> emitProgram: field-assignment receiver is not a struct
+
+* **THREE INGREDIENTS, EACH ABLATED ALONE. The other four edits tried change nothing**, so the
+  family is the intersection and not the message. Each row is one edit off the witness above:
+
+  | edit | outcome |
+  | --- | --- |
+  | verbatim | emit reject |
+  | `type U` deleted (so `E` is no longer a union ARM) | **runs**, prints `/ap` |
+  | the annotation dropped (`const e = c.err`) | **runs**, prints `/ap` |
+  | narrowed in place (`if c.err != null { c.err.path = … }`) | **runs**, prints `/ap` |
+  | the assignment made a READ (`print(e.path)`) | **runs** |
+  | the union DECLARED but never constructed (no call, no value) | emit reject |
+  | `E` given a literal-union field (`kind: "syntax"`) | emit reject |
+  | the rebind + assignment moved inside a function | emit reject |
+
+  So it needs exactly: `E` a member of some union spelled anywhere in the module (the union
+  need not be reached by any value), the field REBOUND through an annotation, and the narrowed
+  local used as an assignment RECEIVER. A literal-union field, a function boundary and how the
+  union is named are all scenery.
+
+* **THE MIRROR MATTERS MORE THAN EITHER ROW.** The full position × spelling matrix, one program
+  per cell, each printing a value that proves the read or the write landed:
+
+  | position | `const e: E \| null = c.err` | `const e = c.err` | `if c.err != null` |
+  | --- | --- | --- | --- |
+  | read a field off `err` | runs | runs | runs |
+  | ASSIGN a field on `err` | **emit reject (this row)** | runs | runs |
+  | return into `Json \| JsonError` | runs | **invalid wasm ([D1112](#d1112))** | runs |
+  | return into `string \| JsonError` | runs | **invalid wasm ([D1112](#d1112))** | runs |
+
+  A module needing both positions — `std/json.vl` is one — therefore has NO working rebind
+  spelling and must narrow in place at every site. That is what the module does, and its
+  header records this table so nobody "cleans up" an annotation or a `!= null` test later —
+  the compiler ACTIVELY suggests the refused ANN spelling with a `redundant type annotation`
+  hint, so a bare row-id citation would not have stopped it.
+
+  **THE ARM-MEMBERSHIP ABLATION IS ONLY CHECKABLE AT THE TOP TWO ROWS.** Deleting the union
+  makes both non-return rows run; at the two RETURN rows the union IS the destination, so
+  there is no cell left to grade once it is gone. Stated because "delete the union and every
+  cell runs" reads like a claim about all four and is a measurement of two.
+
+* **THE `redundant type annotation` HINT FIRES ON THE REFUSED SPELLING**, which is CLAUDE.md's
+  "an annotation is a REP decision, not a TYPE one" one more time: here the checker calls the
+  annotation redundant AND the annotated program is the one that does not build.

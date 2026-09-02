@@ -784,12 +784,18 @@ first program that reads a tree:
     the ARM's type. Neither the recursion nor the composition is an ingredient (both
     ablated away, the defect holds); `string` and `Json[]` arms run at all eight. Route:
     `const o: { [string]: Json } = v` before use. Every walker's object arm.
-14. **D1031 — `JsonError | null` as a struct FIELD or a RETURN is a loud emit reject once
+14. **D1031 — `JsonError | null` as a struct FIELD or a RETURN was a loud emit reject once
     `JsonError` is also a union ARM elsewhere in the program**; the identical spellings
-    run when nothing composes it. A type's usable spellings shrink because of a
-    declaration elsewhere. The module carries its scanner's error as five flat fields
-    instead of one optional struct. Any consumer holding "the last error, or none" meets
-    it the moment they also call `parseJson`.
+    ran when nothing composed it. A type's usable spellings shrank because of a
+    declaration elsewhere, and the module carried its scanner's error as five flat fields
+    instead of one optional struct. **FIXED 2026-09-02 (#2385)**: both carriers are now
+    one `err: JsonError | null` and `parseJson` returns the object the scanner raised. The
+    residue is a SPELLING constraint, not a capability one — D1112 (an un-annotated rebind
+    off the field, RETURNED into the composition, is check-clean invalid wasm) and D1161
+    (the ANNOTATED rebind, used as a field-ASSIGNMENT receiver, is a loud emit reject)
+    between them leave `if p.err != null { … p.err … }` as the only spelling that runs at
+    both positions, which is what the module uses. A consumer holding "the last error, or
+    none" hits the same pair the moment they also call `parseJson`.
 
 ---
 
