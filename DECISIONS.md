@@ -3984,8 +3984,71 @@ ruled (unknown key → no match, exact case, duplicate keys a parse error, `i64`
 union arms by first token / required key set). Four sub-rules carry recommendations and
 await the owner (`docs/serde-design.md` §"Deep `is` / `as` over a `Json` value"): the
 narrowed value is a COPY and `is` rebinds; `i32`/`i64` fields accept only an integral
-in-range number (the same predicate as q2's `asExactI32`); absent key ≠ present `null`
+in-range number (the same predicate as q2's exact `as`, ruled the same day); absent key ≠ present `null`
 (the read-side mirror of decision A); `as` propagates a `JsonError { kind: "shape", path }`
 rather than the useless remainder. A helper returns to the list the day a consumer that
 cannot name its shape arrives, and not before — std has no deprecation story, so the
 cheapest helper is the one never shipped.
+
+## Numeric `as` to an INTEGER target is exact-or-fail under the trio; a float target rounds; nothing ships in std (owner, 2026-09-02)
+
+**Ruling.** `x as T` with a numeric operand and an INTEGER target (`i32`, `i64`) succeeds
+iff the value is exactly representable in `T`, and otherwise FAILS the way the trio fails
+everywhere else: bare `as` propagates `null` (the enclosing function must return `| null`,
+else the checker refuses and names `as!` / `as?`), `as?` yields `null` typed `T | null`,
+`as!` traps. Concretely: `f64 → i32` / `f64 → i64` succeed iff the value is integral and in
+range (NaN, ±Inf, a fraction and an overflow all fail); `i64 → i32` iff in range (no wrap);
+`i32 → i64` / `i32 → f64` are lossless and cannot fail (`as?` on one is a hint). A FLOAT
+target (`f64 → f32`, `i64 → f64`, `i32 → f32`) ROUNDS and never fails — rounding to the
+nearest representable float is the conversion, not a loss of the value's meaning. Loss is
+SPELLED where it happens: `trunc(d) as! i32`, `floor(d) as! i32`, `nearest(d) as! i32`,
+where `trunc`/`floor`/`ceil`/`nearest` are the existing `f64 → f64` intrinsics and the
+`as!` is provably infallible after them (the emitter peepholes the pair to the one
+`i32.trunc_f64_s`). **No `asExactI32` / `asExactI64` ships in `std:fmt`** — that name
+would have been `as?` spelled as a function, a std API bent around the ignored-suffix gap
+(D1041), which is exactly what the 2026-09-01 "design is not bounded by the seed" rule
+forbids.
+
+**What it answers.** `json-design.md` §6 q2 in full: (1) the helper — none; a consumer reads
+`p as? i32` / `p as! i32` (and, once deep `is`/`as` lands, an `i32` field under a shape
+walk uses this same predicate — serde-design S2). (2) `f64 as i32` out of range — neither
+trap-by-default, saturate nor wrap: it is a FAILURE the trio spells, so the three-way fork
+the 2026-08-02 ROADMAP entry and `open-rulings.md` §`f64-as-i32-out-of-range` held open is
+dissolved rather than picked. (3) The silently ignored `as?` / `as!` suffix on a numeric
+cast becomes the build item.
+
+**Why this and not truncation.** The owner asked whether `as` erroring instead of
+truncating is normal and good design, and whether `trunc(d) as i32` costs more than the one
+instruction. The survey: C and Go truncate, out of range undefined (C) or
+implementation-defined (Go); Java, Kotlin and Rust `as` truncate and saturate, NaN to 0,
+with `TryFrom` as Rust's checked spelling; Swift `Int(d)` and Zig `@intFromFloat` truncate and TRAP out of range, and
+Swift adds `Int(exactly:)` for the check; Python's `int(x)` truncates but RAISES on NaN and
+inf; Ada rounds and raises `Constraint_Error`; Julia's `Int(3.9)` is an `InexactError` and
+the loss is spelled `trunc(Int, x)` / `floor(Int, x)`. Every language that made truncation
+the default has an exact variant bolted on beside it; Julia is the one whose default is the
+exact one, and its rule is the one adopted. The reason it fits VL rather than Rust: VL has a
+propagating cast operator with three spellings and the "you get a `T`" invariant, so an
+inexact conversion already has a home for its failure — the same place a union `as` puts
+its remainder. Rust's `as` is total because Rust's `?` is a separate operator that `as`
+cannot reach.
+
+**Cost.** Performance: `trunc(d) as! i32` is the single instruction today's `d as i32`
+emits (peephole; the operand is integral by construction so the exactness compare is
+dead), and the general `d as! i32` is the conversion plus a round-trip compare — one
+`f64.convert_i32_s` and one `f64.eq`, both cheap and both what a correct Rust `try_from`
+pays. Do not lean on binaryen for the fold: its float folds are NaN-conservative and will
+not remove the compare on their own. Migration: the tree's `as` sites are `as!` in intent
+today (they were written under "traps on NaN / out of range"), so the migration is a
+suffix per site — `compiler/` 67, `std/` 21, `tests/cases` 230 (measured 2026-09-02) — and
+it lands FIRST, byte-identical, because the current seed accepts and ignores the suffix;
+the semantics land second. `error-handling-design.md` §"The unified `as` principle" said
+"Numeric casts do NOT propagate"; its stated reason (a propagated raw `f64` would infect the
+signature and carries no information) argued against propagating the OPERAND, and this
+ruling propagates `null`, which is the trio's remainder for a single-cause failure and
+infects nothing but the `| null` the signature already owes. That paragraph is revised in
+place with a pointer here.
+
+**Grading list.** D1041 (`3.9 as? i32` prints `3`); the ten-row table on that row; D965's
+delivery matrix for the `T | null` result of `as?`; `std/fmt.vl` `parseI32`'s comment,
+which documents `as i32` as "an unchecked wrapping truncation on this compiler" and is
+false the day this lands.

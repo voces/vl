@@ -1466,8 +1466,10 @@ one"), never a std file.
   let `as` be the spelling that makes the new binding visible when a reader wants it.
 - **S2 — `i32` / `i64` fields accept an INTEGRAL, IN-RANGE number and nothing else.**
   `8080` reads into `port: i32`; `80.5`, `3e9`, `NaN` do not match. This is exactly the
-  `asExactI32` predicate `json-design.md` §6 question 2 asks for, so the two land on one
-  definition. Recommend: exact-or-fail; a consumer that wants truncation declares `f64`
+  exact-`as` rule the owner ruled for `json-design.md` §6 question 2 on 2026-09-02 (a numeric
+  `as` to an integer target succeeds iff exactly representable — DECISIONS.md §"Numeric `as`
+  to an INTEGER target is exact-or-fail under the trio"), so the two land on one definition:
+  an `i32` field under the walk matches iff `v as? i32` would be non-null. Recommend: exact-or-fail; a consumer that wants truncation declares `f64`
   and truncates in VL, where the loss is spelled.
 - **S3 — absent key ≠ present `null`, and `T | null` matches only the latter.** Decision A
   already rules the WRITE side ("always emit `"f": null`, never omit it"); the read side is

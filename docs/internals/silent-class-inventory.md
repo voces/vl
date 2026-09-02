@@ -32332,3 +32332,57 @@ Repro:
 * The ANNOTATED spelling worked at both scopes throughout, as it does for this whole family:
   the annotation pins the rep and never consults the initializer (D969).
 
+
+---
+
+### D1041 — a NUMERIC `as` ignores its `?` / `!` suffix: `3.9 as? i32` is check-clean and prints `3` where the ruling says `null`; `3.9 as! i32` prints `3` where it says trap; a bare `f64 as i32` inside an `i32 | null` function prints `3` where it propagates `null`
+
+**check-clean silently wrong — prints `3` for every one of the three spellings · filed
+2026-09-02 (vl-b7) from the owner's ruling on `json-design.md` §6 q2 (DECISIONS.md
+§"Numeric `as` to an INTEGER target is exact-or-fail under the trio") · the FIX is the
+build item that ruling names, not a checker refusal: under it this witness prints `null`**
+
+Repro:
+
+    const f = 3.9
+    print(f as? i32)
+    // PRINTS 3
+
+* **THE FAMILY, MEASURED** — seed 8a7820e2, every cell run:
+
+  | spelling | today | under the ruling |
+  | --- | --- | --- |
+  | `3.9 as i32` at a `: i32` site | `3` (`i32.trunc_f64_s`) | **check reject** — the enclosing function does not return `\| null`; the message names `as!` / `as?` |
+  | `3.9 as i32` inside `function f(): i32 \| null` | `3` | `null` — propagated |
+  | `3.9 as? i32` | `3` | `null`, typed `i32 \| null` |
+  | `3.9 as! i32` | `3` | **trap** |
+  | `8.0 as! i32` | `8` | `8` — integral and in range |
+  | `4294967298 as i32` (`i64` operand) | `2` — `i32.wrap_i64` | propagates / `null` / trap by suffix — out of range |
+  | `100000000000.0 as i32` | **trap**, bare backtrace | propagates / `null` / trap by suffix |
+  | `trunc(3.9) as! i32` | `3` | `3` — the spelled loss; the emitter peepholes it to the one instruction |
+  | `3 as f64`, `3 as i64` | `3` | `3` — lossless; cannot fail; `as?` here is a hint |
+  | `f64 as f32`, `i64 as f64` | rounds | rounds — a FLOAT target never fails |
+
+* **MECHANISM.** `checkCastNode` (`compiler/typecheck.vl`, the numeric ladder after the
+  union arm) types the expression as exactly `T` and reads `n.asMode` only on the union
+  and nullable arms; the numeric arm never consults it, so the parser's suffix is
+  accepted and dropped. The emitter then lowers every numeric cast to its wasm
+  conversion instruction: `i32.trunc_f64_s` (traps on NaN / out of range, truncates
+  toward zero otherwise) and `i32.wrap_i64` (wraps). Three spellings that the trio says
+  are three different programs compile to the same bytes.
+
+* **WHAT THE FIX IS.** The checker's numeric arm honours `asMode`: bare `as` to an
+  integer target places the propagation obligation on the enclosing return type exactly
+  as the union arm does; `as?` types as `T | null`; `as!` types as `T`. The emitter lowers
+  an integer target as exact-or-fail — conversion plus round-trip compare for `f64 → i32`
+  / `f64 → i64` (`i32.trunc_sat_f64_s` + `f64.convert_i32_s` + `f64.eq`, which also
+  refuses NaN), `i32.wrap_i64` + `i64.extend_i32_s` + `i64.eq` for `i64 → i32` — and
+  peepholes `trunc(d)` / `floor(d)` / `ceil(d)` / `nearest(d)` operands to the single
+  trapping instruction, since an integral operand cannot fail the compare. Float targets
+  keep their rounding conversions unchanged. **Sequence:** migrate the tree's `as` sites
+  to `as!` / `as` FIRST (today's seed accepts and ignores the suffix, so the migration is
+  byte-identical), then land the semantics — measured 2026-09-02: `compiler/` 67 sites,
+  `std/` 21, `tests/cases` 230; `std/fmt.vl`'s `parseI32` comment ("`as i32` is an
+  unchecked wrapping truncation on this compiler") goes with it. Grade the close on every
+  row of the table, at every delivery position (`const`, return, argument, assignment,
+  struct field, global init — D965's matrix), and on the migrated tree's fixpoint.

@@ -109,9 +109,21 @@ Work is parked on these, but nothing currently misbehaves.
 
 </details>
 
-### f64-as-i32-out-of-range
+### f64-as-i32-out-of-range — RULED 2026-09-02: none of the three; an inexact integer cast FAILS under the trio
 
-**Out-of-range `f64 as i32` — trap, saturate, or wrap**  
+**Ruling (owner, 2026-09-02, via `json-design.md` §6 q2 — DECISIONS.md §"Numeric `as` to an
+INTEGER target is exact-or-fail under the trio").** The three-way fork below is dissolved
+rather than picked: `f64 as i32` succeeds iff the value is integral and in range, and
+otherwise fails the way every other `as` fails — bare `as` propagates `null` (the return
+must carry `| null`), `as?` yields `null`, `as!` traps. `i64 as i32` stops wrapping under the
+same rule; float targets round and never fail; truncation is spelled `trunc(d) as! i32`
+(peepholed to the one instruction). Nothing ships in std. Not yet BUILT — the suffix is
+accepted and ignored on a numeric cast today (D1041), and the build item with its
+migrate-`as!`-first sequencing is in ROADMAP §Next. The filing below is kept as it was
+verified; the diagnostic half of the ask (a source-located trap message for `as!`) still
+stands as part of the build.
+
+**Out-of-range `f64 as i32` — trap, saturate, or wrap** (as filed)  
 `/workspace/ROADMAP.md:748-754`
 
 **The question.** Accurate, with two small corrections. (1) The filing's own example does not compile: `1e30` is `undeclared identifier 'e30'` (verified) — scientific notation does not lex, which ROADMAP already notes as a separate small gap, so any diagnostic work here must use a plain-decimal witness. (2) The backtrace is no longer bare: the trapping frame now symbolizes as `vl!go` and the trap reason prints as `wasm trap: integer overflow`. It still carries no source location, so the diagnostic half of the ask stands, but it is a missing span rather than an unreadable `<wasm function 5>`.
