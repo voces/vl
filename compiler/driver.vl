@@ -101,6 +101,7 @@ import {
   udTsRootAt,
   ufcsAliasAdd,
   ufcsAliasReset,
+  ufcsSiteAdd,
 } from "./ast"
 // `isStmtKeyword` is the PARSER's import-clause bound, shared rather than
 // re-spelled: `modScan` below is a second scanner over the same statement, and
@@ -2829,6 +2830,54 @@ function modMergedTargetOf(m: i32, name: string): string {
   }
   cn + "$m" + i32ToStr(cm)
 }
+// D1120 — A DUPLICATE IMPORT IS AMBIGUOUS ONLY WHEN THE TWO BINDINGS RESOLVE TO
+// DIFFERENT DECLARATIONS, and that is a design rule with a sentence.
+//
+// `import { area } from "./a"` beside `import { area } from "./b"` binds ONE name in
+// one scope to two different functions; there is no answer, and until this diagnostic
+// the program was refused at a USE with `no field 'area' on Sq` — a message about a
+// field, at a line that is not the mistake, naming neither module. Whereas the same
+// name imported twice from the SAME module (or through a re-export chain that lands on
+// the same declaration) binds it to ONE thing: redundant, not ambiguous, and it RUNS
+// today. Refusing that too would trade a working program for a tidier rule, so the test
+// is on the resolved merged target — `modMergedTargetOf`, the exact key
+// `modBuildRename` pushes — and not on the specifier text.
+//
+// Anchored at the SECOND occurrence's imported NAME token (the one that introduces the
+// ambiguity), and it names both specifiers, because a diagnostic about two imports that
+// mentions one of them makes the reader go looking for the other.
+function modDiagDupImport(m: i32, i: i32, d: i32, spec: string): i32 {
+  const local = impLocal[i]
+  if local == "" { return 0 }
+  const here = modMergedTargetOf(d, impName[i])
+  let j = 0
+  while j < i {
+    if impMod[j] == m && impLocal[j] == local && impName[j] != "" {
+      const dj = modIndexOfKey(impKey[j])
+      if dj >= 0 {
+        if modMergedTargetOf(dj, impName[j]) != here {
+          modDiag(
+            m,
+            impNameLine[i],
+            impNameCol[i],
+            "Duplicate binding \"" +
+              local +
+              "\": module `" +
+              modKeys[m] +
+              "` imports it from both \"" +
+              impSpec[j] +
+              "\" and \"" +
+              spec +
+              "\" — rename one (`as` on the import)",
+          )
+          return 0
+        }
+      }
+    }
+    j = j + 1
+  }
+  0
+}
 // Visit module `m`: resolve + validate its imports (unsupported specifier,
 // unresolvable key, cycle back-edge, name-not-exported), recursing into deps
 // first. Message texts match the host's `modules.ts` (the corpus `@error`s
@@ -2937,6 +2986,8 @@ function modVisit(m: i32, depth: i32): i32 {
                 impNameCol[i],
                 "\"" + impName[i] + "\" is not exported by \"" + spec + "\"",
               )
+            } else {
+              modDiagDupImport(m, i, d, spec)
             }
           }
         }
@@ -3793,10 +3844,18 @@ function modRwExpr(ix: i32): i32 {
     // the receiver TYPE — info the rename walker lacks). Instead, record the
     // plain→mangled alias so the checker's/emitter's UFCS resolution (which runs
     // AFTER the field check, with the plain `prop`) can find the mangled function.
+    //
+    // D1120 — AND THE ANSWER IS BANKED ON THIS NODE, not only under the plain name.
+    // `modSelfFnTarget` resolves `prop` through the LIVE module's rename map, so it
+    // is already this call site's own answer; the flat name-keyed table is what lost
+    // it when a second merged module exports a self-function of the same name.
     const cf = P.nodes[n.callFn]
     if cf is Member {
       const target = modSelfFnTarget(cf.memProp, n.callArgs.length)
-      if target != "" { ufcsAliasAdd(cf.memProp, target) }
+      if target != "" {
+        ufcsAliasAdd(cf.memProp, target)
+        ufcsSiteAdd(ix, target)
+      }
     }
     modRwExpr(n.callFn)
     let i = 0

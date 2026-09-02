@@ -114,6 +114,7 @@ import {
   orderArgsByParamNames,
   paramDefaultIsCallsite,
   tsMentionsAnyName,
+  ufcsAliasAtSite,
   ufcsAliasOf,
 } from "./ast"
 // The free INDEX-OPERATOR declaration-name encoding (B14).
@@ -23145,10 +23146,15 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
   // A UFCS callee names a free `self`-function by its SOURCE name. The module
   // merge mangles such functions (`shout` → `shout$m1`) but leaves the call's
   // property string plain so field precedence still resolves from the receiver
-  // type; `ufcsAliasOf` maps the plain name to the mangled function here, where
+  // type; the alias maps the plain name to the mangled function here, where
   // the field check has already been passed. Single-file builds have no merge,
   // so the alias is identity.
-  const name = ufcsAliasOf(plainName)
+  //
+  // D1120 — AT THE SITE, not by plain name: two merged modules may each export an
+  // `area(self: …)`, and the name-keyed map answers both calls with whichever the
+  // dependency-first walk banked first. `ix` is this Call's arena node, the same
+  // index the merge walk keyed on, so this site gets its own module's function.
+  const name = ufcsAliasAtSite(ix, plainName)
   const fnTy = lookup(name)
   if fnTy < 0 { return -1 }
   const preFt = T.tys[fnTy]
@@ -24106,11 +24112,18 @@ function checkCallNode(n: Call, ix: i32) {
     // `o.f(args)` lowers to `f(o, args)` when the receiver carries no such
     // FIELD (a callable field keeps precedence) and a matching free function
     // exists; otherwise fall through to the normal member-call path/error.
-    let ufcsHasField = false
+    //
+    // D1070 — THE FIELD-FIRST HALF IS `tyFieldTyOf`, AND IT IS THE EMITTER'S TOO.
+    // This used to spell the `TyObj` + `objFieldType` lookup inline; the emitter's
+    // dispatch rewrite (`drwWalk`) asked a DIFFERENT question — `structIndexOfExpr`,
+    // which resolves an emit-side struct-table ROW and cannot answer for a receiver
+    // bound inside a function BODY, because `buildLocals` has not run when
+    // `dispatchRewrite` does. So the top level obeyed "field first" and every function
+    // body silently took UFCS: `vl check` rc 0, and the free function called with a
+    // struct it cannot take. One predicate, two callers, is the fix — `drwWalk` calls
+    // this same `tyFieldTyOf` on the receiver node's recorded type.
+    const ufcsHasField = tyFieldTyOf(recvTy, cfn.memProp) >= 0
     const urt = T.tys[recvTy]
-    if urt is TyObj {
-      if objFieldType(urt, cfn.memProp) >= 0 { ufcsHasField = true }
-    }
     // A BOUNDED type parameter as the receiver (OQ-5, strict bodies). The bound
     // answers, and only the bound: the arguments are checked against the members
     // it declared and the result is the one it promised. There is no dispatch here

@@ -4486,3 +4486,39 @@ with `[` still parsing as their own statements, and `fmt` round-tripping both a 
 breaking chain. The LSP is untouched (no new token kinds). A consequence for the matcher ruling
 above: with the matcher on its own line the failure's LINE moves, not just its column — which
 is the case where anchoring at `expect` would have sent an author to the wrong line.
+
+## One name may not bind two IMPORTS, and the test is on the resolved DECLARATION (D1120, 2026-09-02)
+
+`import { area } from "./a"` beside `import { area } from "./b"` is refused —
+`Duplicate binding "area": … imports it from both "./a" and "./b"` — at the SECOND
+import's name token, in the wording `modCheckDupBindings` already uses for a declaration
+colliding with an import. The two halves of the duplicate rule were split for no reason:
+import-vs-declaration was diagnosed and import-vs-import was not.
+
+**Ambiguity, not redundancy, is what is refused.** The test is `modMergedTargetOf` — the
+resolved merged target, the exact key `modBuildRename` pushes — not the specifier text. So
+the same name imported twice from the same module, or through a re-export chain landing on
+the same declaration, is redundant and still RUNS; only two DIFFERENT declarations under one
+name are refused. Pinned both ways:
+`tests/cases/modules/duplicate-import-same-declaration/` and
+`tests/cases/modules/err-duplicate-import-two-modules/`.
+
+**Why it is a rule and not a lint: the meaning was reader-dependent.** The merge's rename map
+held two rows under one key and its readers disagreed about which won — `modRenamed` (VALUE
+references) took the FIRST, `modRwTsName`/`modTypeRenamed` (TYPE positions) took the LAST. So
+`tag` resolved to one module and `Tag` to the other in the same program, decided by which pass
+asked. That is not a program whose behaviour a warning can make correct.
+
+**The price, measured: exactly one corpus case, repo-wide.**
+`tests/cases/modules/duplicate-import-first-vs-last/` was the only pre-existing program that
+imported a local name from two specifiers (every other duplicate-local import in the tree —
+126 of them, all in `compiler/*.vl` — repeats ONE specifier, which stays legal). That case
+existed to pin the FIRST/LAST disagreement, "declared rather than fixed" in its own words,
+because nothing had ruled on the shape that produces it. It is now an `@error` pin.
+
+**A consequence to state rather than discover.** A duplicate rename key is now unreachable by
+any compiling program — import-vs-import is this rule, import-vs-declaration is
+`modCheckDupBindings`, and the injected template row's `from` is a name no program can spell.
+`modRenameFirstBySid` and `modRenameLastBySid` are therefore no longer separated by any
+witness, and collapsing them would redden nothing. They are kept: a collapse now needs its own
+argument, since the case that used to supply the counter-example cannot.

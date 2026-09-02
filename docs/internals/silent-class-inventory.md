@@ -34914,12 +34914,14 @@ Repro (should print `1` then `6`):
 
 ### D1070 — a struct CALLABLE FIELD and a same-named module-scope `self`-function disagree about which one `a.toString()` calls, and the answer depends on the SCOPE of the receiver: at module top level the field wins (as ruled), inside ANY function body the emitter picks UFCS while the checker picks the field — check-clean invalid wasm
 
-**check-clean invalid wasm · clause 1 · OPEN · found 2026-09-02 by the owner in a `std:test`
-body ("this doesn't run") · pre-existing on `seed-latest` and on a fresh 60df1e87 seed alike ·
-DECISIONS line ~1127 already rules "field first, then a UFCS free function", and neither scope's
-answer is derived from that rule**
+**CLOSED as `runs` 2026-09-02 — the repro RUNS and prints `ok`, and the admits-both spelling
+prints `field` in EVERY scope. Was: check-clean invalid wasm · clause 1 · found 2026-09-02 by
+the owner in a `std:test` body ("this doesn't run") · pre-existing on `seed-latest` and on a
+fresh 60df1e87 seed alike · DECISIONS line ~1127 already ruled "field first, then a UFCS free
+function", and neither scope's answer was derived from that rule**
 
-Repro (the owner's program, minus the `std:test` import — which the ablation says is scenery):
+Repro (RUNS and prints `ok`; the owner's program, minus the `std:test` import — which the
+ablation says is scenery):
 
     function toString(self: {foo: string}) { self.foo }
     function f() {
@@ -34972,14 +34974,65 @@ is `(ref $0)`, the `{foo: string}` shape. The emitter resolved `a.toString()` as
   passing; and the UFCS-only spelling (no such field) still reaching the free function, at top
   level and in a body.
 
+* **THE MECHANISM, MEASURED AT THE RUNG'S INPUT — and the row's "different resolver" guess was
+  wrong about WHICH one.** The row predicted the body path "reaches a different resolver (the
+  one `ufcsAliasOf` / the merge's `modSelfFnTarget` feed)". It does not: single-file programs
+  never populate that table at all, and the D1120 fix to exactly that registry moves **0 of
+  these 51 cells** (measured, below). Both scopes reach the SAME arm of `drwWalk`; what differs
+  is the answer it gets. Printing the arm's inputs on the pre-fix seed, same struct and same
+  self-function, one program per scope:
+
+  | scope | `structIndexOfExpr` | `exprIsClosure` | `tyFieldTyOf(nodeTyIxOf(recv))` |
+  | --- | --- | --- | --- |
+  | module top level | `si=0` | `T` | a real field type (45) |
+  | inside a function body | **`si=-1`** | **`F`** | a real field type (49) |
+
+  `structIndexOfExpr` resolves an emit-side struct-table ROW: it answers for a module GLOBAL
+  (`globalStructIndexSid`, filled by `collectA`/`collectFns`, both before `dispatchRewrite`)
+  and for a PARAM, and answers -1 for a receiver bound in a function body — `declaredStructIndex`
+  reads `localNames`, which `buildLocals` fills during `emitModule`, long after the rewrite.
+  `exprIsClosure`'s Member arm hangs off the SAME lookup, so the `si < 0` fallback could not
+  see the callable field either, and read "no field, so UFCS". The CHECKER's own predicate had
+  the answer in both scopes and was never asked.
+
+* **CLOSED BY ONE PREDICATE WITH TWO CALLERS.** `ufcsCallTy`'s caller spelled its `ufcsHasField`
+  gate inline (`TyObj` + `objFieldType`); that is exactly `tyFieldTyOf`, which was already
+  exported. The checker now calls it, and `drwWalk` calls it on the receiver node's recorded
+  type ahead of the row lookup. STRICTLY NARROWING — it can only turn a UFCS rewrite off, never
+  on — so a receiver the checker recorded no type for, and a `TyVar` receiver inside a generic
+  body (`drwEveryInstanceTakesField`'s question, not this one), keep today's classification.
+
+* **51-CELL GRID, 12-POSITION MATRIX, ZERO `runs` LOST.** The ablation's axes rebuilt as
+  receiver scope (top / body / lambda / nested fn / captured / param) × field-present ×
+  self-fn-present (admits / disjoint / none) × annotated-or-not. Against `origin/master`
+  6a737f4d: **6 cells check-clean invalid wasm and 6 more printing `UFCS` where the rule says
+  `field`**. After: **0 clause-1 violations, 12 movements, all of them
+  `SILENT_INVALID_WASM → field` (6) or `UFCS → field` (6), and `runs → not-runs` NONE.** The
+  delivery-position matrix (binding, argument, return, annotated return, closure, tail
+  expression, parameter receiver, UFCS chain, struct field, list element, global assignment,
+  condition) went **10 of 12 wrong → 12 of 12 `field`**; the two already right were the closure
+  (receiver captured, so `capturedStructIndex` resolved it) and the parameter cell, which is
+  the signature of a rule enforced through a row lookup rather than through the rule.
+  Fixtures: `tests/cases/objects/field-precedence-in-function-body.vl` (the witness,
+  UN-ANNOTATED), `field-precedence-receiver-scope-grid.vl`,
+  `field-precedence-delivery-positions.vl`, and `ufcs-dispatch-when-no-such-field.vl` — the
+  counter-pin that field precedence must not swallow UFCS.
+
+* **NOT ONE FIX WITH [D1120](#d1120), MEASURED IN BOTH DIRECTIONS.** A compiler carrying only
+  D1120's per-call-site alias grades this grid **byte-for-byte as master does** — 51 cells, 6
+  clause-1 violations, 0 movements — and a compiler carrying only this fix leaves all four of
+  D1120's witnesses refused with their original messages. Two mechanisms, two fixes; they
+  landed together only because they were briefed together.
+
 ### D1120 — two MERGED modules whose `self`-functions share a NAME collide in the merge's UFCS alias registry, and the ENTRY's member-call is refused `no field 'area' on Box` whenever a dependency uses the other module's function first; the direct spelling runs
 
-**loud check reject · check rc 1 · OPEN · found 2026-09-02 while ablating [D1044](#d1044) — the
-name-collision cell D1044's fixture could not spell in one file · clause 2 (the program is
-legal by every rule: two modules may each export a `self`-function called `area`, and the
-entry imports only ONE of them)**
+**CLOSED as `runs` 2026-09-02 — the repro RUNS and prints `10`, `9`, and so do its mirror and a
+three-module chain. Was: loud check reject · check rc 1 · found 2026-09-02 while ablating
+[D1044](#d1044) — the name-collision cell D1044's fixture could not spell in one file · clause 2
+(the program is legal by every rule: two modules may each export a `self`-function called
+`area`, and the entry imports only ONE of them)**
 
-Repro (four modules; `// file:` sections, the last is the entry):
+Repro (RUNS and prints `10`, `9`; four modules, `// file:` sections, the last is the entry):
 
     // file: a.vl
     export type Box = { v: i32 }
@@ -34998,7 +35051,7 @@ Repro (four modules; `// file:` sections, the last is the entry):
     print(box(5).area())
     print(nine())
 
-`no field 'area' on Box` at `main.vl:3:14`. Expected `10`, `9`.
+Was `no field 'area' on Box` at `main.vl:3:14`; now prints `10`, `9`.
 
 * **THE ENTRY IMPORTS `area` FROM `a` ONLY, AND STILL GETS `b`'s.** `c.vl` never reaches the
   entry's scope — it uses `b`'s `area` internally. The mirror orientation (entry imports `b`'s
@@ -35034,6 +35087,50 @@ Repro (four modules; `// file:` sections, the last is the entry):
   `area`, the entry using all three on their own receivers) running; the double-import spelling
   refused at the second `import` with a duplicate-import message; and `std:test` files with a
   user-defined `toEqual` still running.
+
+* **THE MECHANISM WAS MEASURED, NOT INFERRED, AND THE ROW HAD IT RIGHT — down to the row
+  ORDER.** Dumping the registry at the refusal on the pre-fix seed, with the mangled names
+  printed as code points (the diagnostic renderer's `demangleMsg` STRIPS `$mN`, which is why a
+  plain print of the table shows two identical-looking `[area->area]` rows and is not evidence
+  of anything):
+
+      table = [area -> area$m3] [area -> area$m1]
+      rw node=53 prop=area target=area$m3      (c.vl, visited first)
+      rw node=65 prop=area target=area$m1      (main.vl)
+
+  So `modSelfFnTarget` had already computed the RIGHT answer at each site — `area$m1` for the
+  entry, `area$m3` for the dependency — and only the flat name-keyed read lost it. That is the
+  fix shape the row named, confirmed before it was built.
+
+* **CLOSED BY A PER-CALL-NODE COLUMN, `ufcsSiteTo`** — the same node-index sidecar shape
+  `callSiteLoc` uses, written by the merge walk beside the existing `ufcsAliasAdd` and read
+  through one entry point (`ufcsAliasAtSite`) by all three consumers: `ufcsCallTy` (which
+  already takes the Call node's `ix`), `drwWalk`, and `emitCall`'s unrewritten-member fallback.
+  The plain-name map STAYS as the fallback for readers with no call node — `witnessOf` answers
+  a bound before any call exists, and a node minted after the walk (a monomorphized clone, the
+  emitter's rebuilt direct call) has none — so every site the walk did not see is unchanged.
+  Fixtures: `tests/cases/modules/ufcs-same-name-two-modules/`, `…-mirror/`, `…-three-modules/`.
+
+* **AND THE DOUBLE IMPORT IS NOW A DUPLICATE-BINDING REFUSAL, WHICH COST ONE CORPUS CASE.**
+  `import { area } from "./a"` beside `import { area } from "./b"` binds one name to two
+  declarations; the checker says so at the second import and names both specifiers, in the
+  wording `modCheckDupBindings` already uses for the import-vs-declaration case. The rule is
+  narrow on purpose — it fires only when the two bindings resolve to DIFFERENT merged targets,
+  so the same name imported twice from the same module (or via a re-export chain landing on the
+  same declaration) still RUNS. Swept: repo-wide, exactly ONE pre-existing program imported a
+  local name from two specifiers, `tests/cases/modules/duplicate-import-first-vs-last/`, whose
+  own header documented that VALUE references took the FIRST rename row while TYPE positions
+  took the LAST — `tag` from one module and `Tag` from the other, in one program. It is
+  converted to an `@error` pin. See DECISIONS.md for the ruling and for what that case no
+  longer witnesses. New fixtures: `modules/err-duplicate-import-two-modules/` and
+  `modules/duplicate-import-same-declaration/`.
+
+* **NOT ONE FIX WITH [D1070](#d1070), MEASURED IN BOTH DIRECTIONS.** A compiler carrying only
+  D1070's field-first predicate leaves all four witnesses here refused with their original
+  messages (`no field 'area' on Box` / `on Sq` / `on Tri`), and a compiler carrying only this
+  fix grades D1070's 51-cell grid byte-for-byte as master does — 0 movements. The alias
+  registry is EMPTY in single-file mode, which is why D1070's guess that the body path "reaches
+  the resolver `ufcsAliasOf` feeds" could not have been right.
 
 ### D1121 — a `type` alias that NOTHING REFERENCES changes the REP of an unrelated function's return: an inline `Kind | "err"` reps its values as STRINGS (string-eq calls), the declared alias `type R = Kind | "err"` as ATOMS (`i32.eq`), and adding the unused alias flips the inline spelling — two producers of one type, agreeing about every answer measured
 
