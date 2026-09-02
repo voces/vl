@@ -29927,6 +29927,28 @@ Repro (loud check reject):
 
 ---
 
+* **THE CHECKER HALF IS ONE LINE AND IT IS CORRECT — and it turns the row clause-2 → clause 1,
+  so it cannot ship alone.** `assignable`'s rule reads "a nullable source is not assignable to
+  a non-nullable target", which asserts without asking that the target does not admit `null`.
+  The real subset test is: `T | null` is assignable to `D` iff `T` is AND `null` is. Written
+  that way (`if assignable(TY_NULL, dst) { return assignable(s.nInner, dst) }`) the witness
+  passes `vl check` — and then emits invalid wasm.
+
+* **BECAUSE THE TWO NULLS HAVE DIFFERENT REPS, which is the fact the membership argument hides.**
+  `null ∈ J` is true as a SET statement, and the row's "the check should be a no-op" follows
+  from it. It does not follow at the rep: a map read's miss sentinel is a bare `ref.null` in
+  the vals slot, while `J`'s own `null` arm is a null-TAGGED BOX. So the value that arrives is
+  not the value the callee's slot is typed for, and the conversion — sentinel to tagged box —
+  is a lowering nobody has written. That is the same shape [D1019](#d1019) fixed one boundary
+  over, where a map miss met a `??` that expected a box.
+
+* **SO IT IS TWO PIECES, IN THIS ORDER.** Build the miss-sentinel → tagged-box conversion at
+  the delivery boundaries first, then relax `assignable`. Relaxing first is D965's order
+  violated and was measured as exactly that. Folding at `mkNullableTy` does NOT substitute for
+  the conversion: both spellings of "the union already carries null" were added there (a bare
+  `TY_NULL` member and the `TyUnion[ TyNullable(rest) ]` peel D1027 needs) and the witness is
+  unchanged, because the map read's type is not minted through that home.
+
 ### D1010 — a null-bearing array literal `[1.0, null]` cannot reach a recursive union whose element arm admits `null`: `(f64 | null)[]` is refused where `f64[]` is accepted
 
 **loud check reject · `cannot assign (f64 | null)[] to 'c' of type J` · with `type J = null | f64 | J[]`, the literal's element type `f64 | null` is a subset of `J`'s members, and `[1.0, 2.0]` (element type `f64`) IS accepted at the same three destinations — binding, map write, argument — so the element-widening test admits `f64 → J` and refuses `null → J` · the annotated spelling `const arr: J[] = [1.0, null]` runs · sibling of D1009**
