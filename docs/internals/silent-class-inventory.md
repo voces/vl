@@ -31122,3 +31122,37 @@ Repro:
   D1026 closed.
 
 ---
+
+* **RE-ABLATED AFTER D1021 CLOSED, AND IT IS NOT D1021's MECHANISM.** Re-graded on the seed
+  carrying #2315: identical message, identical site. Six programs separate the ingredients,
+  with `null` and the arm kind varied independently:
+
+  | alias | composed `| null`? | outcome |
+  | --- | --- | --- |
+  | `f64 \| J[]` (recursive, NO null) | yes | RUNS |
+  | `f64 \| {[string]: J}` (recursive, NO null) | yes | RUNS |
+  | `null \| f64 \| J[]` | yes | **refuses** |
+  | `null \| f64 \| {[string]: J}` | yes | **refuses** |
+  | `Json` (the full six-arm tree) | **no** (`: Json`) | RUNS |
+  | inline `f64 \| f64[] \| null`, no alias | — | RUNS |
+
+  So the ingredients are *recursion* + *`null` IN the alias* + *composition*, through either
+  arm — and each one alone runs.
+
+* **THE NAME IS ALREADY RIGHT, WHICH IS THE WHOLE FINDING.** Instrumenting the refusal prints
+  the return type as `boolean|f64|string|Json[]|{[string]:Json}|null` — flattened, and with
+  exactly ONE `null`. There is no duplicate left to remove. What that spelling is NOT is the
+  REGISTERED name `Json`, and `: Json` alone runs while the composition does not. This is a
+  "two spellings of one type carrying two reps" split: composing forces the flatten, and the
+  flattened spelling — correct and deduped — has no rep because nothing registered it.
+
+* **TWO CANDIDATES BUILT AND MEASURED, NEITHER MOVES IT.** (1) Extending D1026's
+  `mkNullableTy` fold to a `TyUnion` that already carries a `null` member — the same
+  idempotence one shape wider. (2) Collapsing the composition back to the ALIAS NAME in
+  canon's member loop when exactly one alias was expanded and every other member deduped into
+  its atoms, so `Json | null` renders `Json`. Neither changes the witness by a character,
+  which says **canon is not the path this annotation takes** — the same thing D1026's
+  instrumentation said, and the reason to find that path first rather than write a third
+  spelling-side fix.
+
+---
