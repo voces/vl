@@ -2436,6 +2436,29 @@ export function exprNullableStruct(exprIx: i32, fnIx: i32) {
   // non-null but shares the nullable storage, so the read is nullable-classified
   // (the consumer inserts `ref.as_non_null` before a chained field access).
   if e is Member { return memberFieldCode(exprIx, fnIx) == 15 }
+  // THE `?.` SPELLING OF THE SAME READ (D1084). `o?.f` over a code-15 field is `S | null`
+  // for the SECOND reason as well as the first — the chain itself can be null — so it is
+  // nullable-classified wherever `o.f` is.
+  //
+  // THIS ARM IS WHAT MAKES THE UN-ANNOTATED SPELLING WORK, and it is a separate fix from
+  // the emitter's code-15 arm rather than a tidy-up of it: with only the emitter arm,
+  // `const r: S | null = o?.f` runs and `const r = o?.f` is refused `bare null needs a
+  // struct-typed context` at its own `r != null` guard — the annotation was pinning the
+  // rep, which is exactly the shape CLAUDE.md names as invisible to a fixture that
+  // annotates every destination. The controls say the gap is the `?.` PRODUCER and not
+  // inference: the identical un-annotated binding from a CALL result and from a plain
+  // field read both already ran.
+  //
+  // `optChainStructIdxOf` is the resolver the EMITTER uses at this node, so classifier and
+  // emitter cannot disagree about which struct row the chain names.
+  if e is OptMember {
+    const oNsi = optChainStructIdxOf(e.omObj, fnIx)
+    if oNsi >= 0 {
+      const oNfi = sFieldIndex(oNsi, e.omProp)
+      if oNfi >= 0 { return sFieldTypeAt(oNsi, oNfi) == 15 }
+    }
+    return false
+  }
   // An INDEX into a NULLABLE-struct array (`(P | null)[]`, ref-list slot key "P | null")
   // yields `P | null` — the element legitimately holds null, so the read is NOT recovered
   // to non-null (unlike a `P[]` element). `const e = xs[i]` binds the kind-9 niche.
@@ -4507,8 +4530,24 @@ export function capScan(ix: i32, bound: string[], caps: string[]) {
     const cal = P.nodes[unwrapParen(n.callFn)]
     if cal is Ident {
       if isBuiltinFnName(cal.identName) { skipCallee = true }
-      if nameIsEmitterIntrinsic(cal.identName) { skipCallee = true }
-      if isNumIntrinsicName(cal.identName) {
+      // THE DUNDER FAMILY NOW TAKES THE SAME SHADOWING GUARD AS THE NUMERIC ONE, and the
+      // paragraph above is what asked for it: *"a LOCAL closure named after an intrinsic
+      // still lowers as the OPCODE at its call site … Keeping the capture recorded is what
+      // leaves the env correct for the day that dispatch is fixed."* That day is D1087 —
+      // `emitCall`'s intrinsic arms are now gated on `identNameIsUserBound`, so a call whose
+      // name the frame binds routes to the VALUE. Without this, the closure's env never
+      // carried the parameter and the gate had nothing to find: `run(__memory_grow__: (i32)
+      // => i32) { const g = () => __memory_grow__(1); g() }` still printed the page count.
+      //
+      // The condition is the numeric arm's, verbatim, and it is the same condition under
+      // which the emitter writes the opcode: not bound in this frame, not a collected
+      // function, not a module global, and not bound by an ENCLOSING frame — that last rung
+      // is the one a shadowing parameter answers. An unshadowed `__load_i32__(p)` is exempt
+      // exactly as before.
+      if (
+        nameIsEmitterIntrinsic(cal.identName) ||
+        isNumIntrinsicName(cal.identName)
+      ) {
         let shadowed = capIsBound(bound, cal.identName)
         if fnIndexOf(cal.identName) >= 0 { shadowed = true }
         if globalIndexOf(cal.identName) >= 0 { shadowed = true }
@@ -29357,7 +29396,7 @@ function capturedIsBool(fnIx: i32, name: string) {
 // `i32` while its body emitted the concat, which is invalid wasm with everything in
 // sight annotated. The guard was redundant besides: `fnEnvIdxOf(fe) >= 0` holds
 // exactly when `captureCountOf(fe) > 0`, which the scan below decides for itself.
-function capturedKindOf(fnIx: i32, name: string): VKind | null {
+export function capturedKindOf(fnIx: i32, name: string): VKind | null {
   if fnIx < 0 { return null }
   if !fnValUsed { return null }
   const fe = fnStmtsPosOf(fnIx)
@@ -29672,6 +29711,29 @@ export function structIndexOfExpr(exprIx: i32, fnIx: i32) {
   }
   // A field read `o.inner` whose field is a NESTED STRUCT (code 15) yields the
   // field's target struct — so `o.inner.v` chains and `n.next` re-enters as `S|null`.
+  // THE `?.` PRODUCER (D1085's sibling one node kind over, D1084). `o?.f` over
+  // `o: T | null` with `T = {f: S}` banks `S | null`, so an `==` against another
+  // `S | null` classifies as the `nulstruct` niche and `emitNulStructEq` resolves both
+  // operands through THIS function. Every other producer of `S | null` already answered
+  // — two locals, two call results, a `(S|null)[]` element, a plain `x.f` read, a closure
+  // value call, a monomorphized `eqN<T>` instance — and only the `?.` one fell to the -1
+  // tail, which is what says this is a MISSING ARM and not a rep gap.
+  //
+  // The body is the `Member` arm's struct leg verbatim: `?.` differs from `.` only in
+  // what happens when the RECEIVER is null, and the field's declared layout — the only
+  // thing this function answers — does not depend on that. The narrowed / variant legs
+  // the `Member` arm carries below are deliberately not mirrored: a `?.` receiver must be
+  // re-readable (a name or a chain of names), so no narrowed-variant receiver reaches here.
+  if e is OptMember {
+    const osi = structIndexOfExpr(e.omObj, fnIx)
+    if osi >= 0 {
+      const ofi = sFieldIndex(osi, e.omProp)
+      if ofi >= 0 {
+        if sFieldTypeAt(osi, ofi) == 15 { return sFieldTgtStructIdx(osi, ofi) }
+      }
+    }
+    return -1
+  }
   if e is Member {
     const msi = structIndexOfExpr(e.memObj, fnIx)
     if msi >= 0 {
@@ -32336,7 +32398,26 @@ export function sharedUnionFieldPlan(
   let code = -1
   let i = 0
   while i < atoms.length {
-    const vi = variantIndexOf(atoms[i])
+    // THE TYPE-TAKING TWIN, and it was already written (D1083). This asked the bare
+    // `variantIndexOf`, an EXACT compare against `uVariants` — fine while the atoms come
+    // from the interned member-set pool (nominal spellings), and wrong the moment they come
+    // from splitting the RENDERED set, because that render is STRUCTURAL.
+    //
+    // Measured at the rung rather than read off the code path: for `type U = A | B | null`
+    // under `if u != null`, the atoms this loop receives are `{k:i32,a:i32}` and
+    // `{k:i32,b:i32}` — NOT `A` and `B`. The pool cannot answer for that narrowing because
+    // `currentStructNarrowSetIdOf` resolves through `msSetOfText(unionMemberSetOf(…))` and
+    // the null-bearing union's member set renders structurally, so `msSetOfText` misses,
+    // `pushNarrowComplement` declines, and the fallback `pushNarrow` banks the render with
+    // no set id. The narrowing is CORRECT — it names the right two arms — and only its
+    // spelling was unresolvable here.
+    //
+    // `variantIndexOfTypeName` is the same lookup with the shape rung the struct resolver
+    // already documents as "the `variantIndexOfTypeName` discipline": exact name first, then
+    // a field-NAME-set match TIGHTENED by the field-TYPE layout guard, so two shapes sharing
+    // field names but differing in a field's type cannot collide onto the wrong slot. On a
+    // nominal atom it is `variantIndexOf` unchanged.
+    const vi = variantIndexOfTypeName(atoms[i])
     if vi < 0 { return -1 }
     const fi = variantFieldIndex(vi, prop)
     if fi < 0 { return -1 }

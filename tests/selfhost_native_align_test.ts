@@ -213,8 +213,6 @@ const tiersOf = (s: string): Tier[] => {
 // below re-runs every entry and FAILS when one starts agreeing — an exclusion
 // that has been fixed must be deleted, not left to rot.
 const EXCLUSIONS: Record<string, string> = {
-  "soundness/README.vl":
-    "the soundness directory's INDEX, not a case — its prose explanation of the directive vocabulary contains a line-leading `@run`, which the scan reads as a directive; the file's real directive is `@check` and it declares no top-level statement for the emitter to lower",
   "lint/generic-intersection-no-warn.vl":
     "checker gap — a generic intersection `T & S` inside a union reports `unknown type 'T'`, so this must-not-error fixture cannot check clean yet",
 };
