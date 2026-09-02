@@ -237,11 +237,13 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   type parameters — substituted per instance as D426 does for lambdas; the NAMED-function
   spelling of that substitution still refuses at emit (D1046) and closes with this. Sub-rulings
   standing as vl-b7's recommendation: a local NOMINAL type may not escape through an inferred
-  return type (checker refuses); a structural one escapes as its shape. **Two steps:** (1)
-  interim, ships first — the checker refuses the DECLARATION loudly on every spelling with
-  one message naming the rule (D1045's row has the text and the three-spelling grading);
-  (2) the scoping build, graded on D1045's list plus D1046's witness. DECISIONS.md §"A `type`
-  declared in a function body is legal and lexically scoped". Compiler-side.
+  return type (checker refuses); a structural one escapes as its shape. **Two steps:**
+  (1) **SHIPPED 2026-09-02 (#2369)** — the interim: the checker refuses the DECLARATION at its
+  own line with one message naming the rule, on all three spellings, on every declaration form
+  the parser admits in a body, and in the lambda and nested-named-function positions; nothing
+  else fires. (2) **OPEN** — the scoping build, graded on D1045's list plus D1046's witness.
+  DECISIONS.md §"A `type` declared in a function body is legal and lexically scoped".
+  Compiler-side.
 - **Assertion failures locate at the MATCHER, not `expect` — RULED (owner, 2026-09-02),
   BLOCKED on D1044.** Each `std:test` matcher (`toEqual`/`toBeTrue`/`toBeFalse`, `not`'s
   continuation) takes `caller: CallerLoc = __callsite__` and the receipt stops carrying
