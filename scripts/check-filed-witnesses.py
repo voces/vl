@@ -251,7 +251,31 @@ def self_test():
     print(f"{len(SELF_TEST)} specimens · {len(SELF_TEST)-bad} routed correctly · {bad} wrong")
     return 1 if bad else 0
 
-SEC = re.compile(r"^#{2,4}\s+(D\d+[A-Za-z]?|[A-Z]\d+)\s+[—-]\s+(.*)$")
+SEC = re.compile(r"^#{2,4}\s+(D\d+(?:-?[A-Za-z][A-Za-z0-9]*)?|[A-Z]\d+)\s+[—-]\s+(.*)$")
+# A row id may carry a suffix, and the suffix grammar is whatever authors have reached for:
+# `D661A`, `D804b`, and `D1009-N` (minted with a hyphen by a session avoiding a cross-session
+# id collision). The hyphenated form did NOT match until 2026-09-02, and the failure was
+# SILENT: the row was not graded, not reported as ungradeable, and `--strict` still printed
+# `0 not graded`. It had been stale for a day — its witness runs, and the defect it describes
+# closed as D1009.
+#
+# WIDENING THE PATTERN IS THE SMALL HALF. The real fix is `unparsed_row_heads` below: count the
+# POPULATION of row-shaped headings and assert every one was parsed, so the next id shape
+# nobody anticipated fails loudly instead of vanishing. A parser that silently drops what it
+# does not recognise cannot be audited by reading its output — which is exactly what
+# `--strict`'s four columns were supposed to guarantee.
+
+# A heading that plainly NAMES a D-row, whatever suffix grammar it uses. `SEC` must match every
+# one of these; any it misses is a row the grader cannot see.
+ROWHEAD = re.compile(r"^#{2,4}\s+D\d")
+
+def unparsed_row_heads(doc):
+    """Row-shaped headings `SEC` failed to parse — the grader's blind spot, named."""
+    out = []
+    for i, ln in enumerate(Path(doc).read_text().splitlines()):
+        if ROWHEAD.match(ln) and not SEC.match(ln):
+            out.append((i + 1, ln.strip()))
+    return out
 # ANY heading, row or not. A row's scope has to END at one: `SEC` alone only closes a row at
 # the NEXT ROW, so the last row of a doc absorbed everything after it — in
 # `silent-class-inventory.md` that is the whole of `## 3. Shared-root analysis`, whose
@@ -338,8 +362,10 @@ def main(argv):
     if not docs:
         print(__doc__); return 2
 
-    results, moved, ungradable = [], [], []
+    results, moved, ungradable, unparsed = [], [], [], []
     for doc in docs:
+        for ln_no, head in unparsed_row_heads(doc):
+            unparsed.append((doc, ln_no, head))
         for r in parse(doc):
             if not r["repro"]:
                 ungradable.append((r, "no Repro block")); continue
@@ -378,7 +404,8 @@ def main(argv):
         print(f"{r['id']:<{w}}  {'-':<22} {'-':<22} not graded ({why})")
 
     print(f"\n{len(results)} graded · {len(results)-len(moved)} as filed · "
-          f"{len(moved)} MOVED · {len(ungradable)} not graded")
+          f"{len(moved)} MOVED · {len(ungradable)} not graded · "
+          f"{len(unparsed)} UNPARSED")
     if moved:
         print("\nRows whose filed behaviour no longer reproduces — re-grade the doc:")
         for r in moved:
@@ -398,10 +425,20 @@ def main(argv):
         print("      a defect reachable only under a change that was REFUSED is a "
               "refutation pin: file the program that must keep RUNNING, with the status "
               "`runs today and must keep running`.")
+    # AN UNPARSED ROW HEADING IS WORSE THAN AN UNGRADED ROW, because it is not in ANY
+    # column. `D1009-N` sat here for a day: not graded, not reported ungradeable, and
+    # `--strict` printing `0 not graded` beside it. The row had gone stale — its witness runs
+    # and the defect closed as D1009 — and nothing said so. Reading the four columns cannot
+    # catch what never entered them, so the population is counted instead of the matches.
+    if unparsed:
+        print("\nRow headings this parser did NOT recognise - they are in no column above:")
+        for doc, ln_no, head in unparsed:
+            print(f"  {doc}:{ln_no}  {head[:110]}")
+        print("      fix: widen `SEC`'s id pattern to admit the suffix, or rename the row.")
     if out_json:
         Path(out_json).write_text(json.dumps(results, indent=2))
         print(f"\nwrote {out_json}")
-    return 1 if (moved or (ungradable and strict)) else 0
+    return 1 if (moved or unparsed or (ungradable and strict)) else 0
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
