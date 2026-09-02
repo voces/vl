@@ -1,0 +1,1062 @@
+// `std:json` — RFC 8259 JSON as a VL value tree, with an I-JSON (RFC 7493)
+// parser and a compact renderer. Text in, `Json` out, and back.
+//
+// WHY THIS MODULE EXISTS. `docs/serde-design.md` ruling G makes stage 1 of the
+// serialization story "a real `Json` VALUE TREE plus a parser and a renderer
+// over it", and `docs/json-design.md` is this module's specification — every
+// decision below is one of its sections, cited where it is made. It is
+// admitted under `std-design.md` D2's clause (a): what the LANGUAGE story needs
+// to be complete without third parties. JSON is the format a VL program meets
+// first — a config file, an HTTP body, a `package.json` — and with no package
+// ecosystem there is nowhere else for it to come from. Its consumer is in the
+// tree today (`std:fs`'s `readTextFile` is the other half of "read a config"),
+// and stage 3's derived `fromJson<T>` is a SECOND consumer of the lexer rather
+// than a consumer of this tree (§2.3).
+//
+// THE WHOLE SURFACE IS FOUR NAMES: `Json`, `JsonError`, `parseJson`, `toJson`.
+//
+// ── `at` AND `path` LOCATE A FAILURE IN THE TWO DIRECTIONS ────────────────
+//
+// `at` is a byte offset into `self` on parse and is NOT meaningful on render,
+// where it is `0` and `path` locates the value. `path` is an RFC 6901 JSON
+// Pointer: on parse it names the CONTAINER being read when the error fired
+// (`"/users/3"` for a bad byte inside the fourth user, `""` before any
+// container opens); on render it names the OFFENDING VALUE itself. Segments
+// are escaped as the RFC requires — `~` is `~0` and `/` is `~1` — so a pointer
+// through a key that contains a slash is still one pointer.
+//
+// The two directions produce different kinds, and the header owes the split:
+//
+//   • `parseJson` produces `syntax`, `duplicate`, `depth` and `nonfinite`.
+//   • `toJson` produces `depth` and `nonfinite`. It never produces `syntax`
+//     (a `Json` is already a tree) or `duplicate` (a VL map has one entry per
+//     key by construction).
+//
+// A consumer's exhaustive branch over `kind` therefore sees arms one function
+// can never return. That is the one cost of a single error type, and it is the
+// std precedent (`IoError` serves five operations with codes only some can
+// produce, `std/fs.vl`). The alternative — a `JsonError` and a
+// `JsonRenderError` — doubles the type count for a caller who mostly writes
+// `if r is JsonError`, and `depth` would have to be spelled in both
+// (`json-design.md` §2.2).
+//
+// `msg` IS FOR A HUMAN AND IS NOT PART OF THE CONTRACT. Branch on `kind`,
+// locate with `at` and `path`, and treat `msg` as prose — the same split
+// `Utf8Error`, `Base64Error` and `IoError` make.
+//
+// ── THE PROFILE IS I-JSON (RFC 7493 §2.1–2.3), NOT BARE RFC 8259 ──────────
+//
+// The parser accepts LESS than RFC 8259, and the difference is exactly one
+// published profile rather than three ad-hoc house rules (`json-design.md`
+// §2.9). What it refuses beyond the grammar:
+//
+//   • DUPLICATE MEMBER NAMES → `kind: "duplicate"`, `at` at the SECOND
+//     occurrence's opening quote (RFC 7493 §2.3; serde ruling A). Every other
+//     implementation surveyed takes last-wins; a duplicate is never intentional
+//     and last-wins hides a producer bug, so this one is stricter on purpose.
+//   • LONE SURROGATES → `kind: "syntax"`. `\uD800` not followed by a low
+//     surrogate, and a stray low surrogate, are both refused; a surrogate PAIR
+//     decodes to the one code point it names (RFC 7493 §2.1). A VL string is
+//     UTF-8 bytes and a lone surrogate has no UTF-8 encoding, so this is
+//     `std:utf8`'s DECODE IS STRICT ruling reaching one more surface — those
+//     bytes are not text and the program about to treat them as text is about
+//     to be wrong. It is also what keeps `fromCodePoints` honest: it
+//     substitutes U+FFFD for a non-scalar, so refusing at the parser is what
+//     stops a silent replacement downstream.
+//   • A NUMBER OUTSIDE IEEE-754 DOUBLE RANGE → `kind: "nonfinite"` (RFC 7493
+//     §2.2, whose own example is `1E400`). `parseF64("1e999")` is `Infinity`;
+//     accepting it would put a value in the tree that `toJson` then refuses,
+//     and §1's invariant is that EVERY TREE `parseJson` RETURNS, `toJson`
+//     RENDERS. Underflow (`1e-999` → `0`) stays silent: `0` is finite and
+//     renders.
+//   • RAW CONTROL CHARACTERS (U+0000–U+001F) inside a string → `kind:
+//     "syntax"`. RFC 8259 §7 already forbids them; it is named here because
+//     the refusal is one people meet.
+//   • A LEADING BYTE-ORDER MARK → `kind: "syntax"` at 0, with `msg` naming the
+//     BOM rather than saying "unexpected byte", because that is the one input
+//     where the byte the user sees and the byte the parser sees differ.
+//
+// And the grammar itself is validated BY HAND rather than delegated:
+// `parseF64` IS NOT THE JSON NUMBER GRAMMAR and cannot be used as its gate. It
+// accepts `01`, `NaN` and `Infinity`, and rejects `.5` and `1.` — measured, and
+// in `json-design.md` §4's matrix. So the lexer scans a lexeme against RFC 8259
+// §6 (`-?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?`) itself and hands `parseF64` only
+// text it has already accepted, for the CONVERSION alone, which is correctly
+// rounded (`std/fmt.vl`: 205,844 of 205,844 against `Number(s)`). No leading
+// zeros, no leading `+`, no hex, no trailing commas, no comments, no single
+// quotes, no unquoted keys. Whitespace is RFC 8259's four bytes and no others:
+// space, tab, LF, CR.
+//
+// TRAILING CONTENT AND AN EMPTY BODY GET THEIR OWN MESSAGES. `{} x` is
+// `syntax` at the first non-whitespace byte after the value, and an empty or
+// whitespace-only input is `syntax` at `self.length` reading "unexpected end of
+// input". Both are `syntax` under any reading of the grammar; they are called
+// out because they are the two failures that actually happen — a truncated
+// transfer and an empty response body — and "unexpected byte" locates neither.
+//
+// INVALID UTF-8 INSIDE THE INPUT IS NOT THIS PARSER'S CONCERN. A `string`
+// reached VL through `decodeUtf8` (or `readTextFile`, which folds it), and that
+// is where the strictness lives — one decoder with one opinion. This is why v1
+// takes `string` and not `u8[]`; RFC 8259 §8.1 makes UTF-8 the only interchange
+// encoding worth accepting, and a `u8[]` entry, if a consumer ever names one,
+// is a separate export with its own name.
+//
+// ── NUMBERS ARE `f64`, AND INTEGERS BEYOND 2⁵³ ROUND SILENTLY ─────────────
+//
+// The tree's only number arm is `f64` (`json-design.md` §2.3, owner-ruled).
+// The consequence is real and is stated rather than hidden: RFC 8259 §6's
+// interoperable range is ±(2⁵³ − 1), and past it precision is lost without an
+// error — `parseF64("9007199254740993")` is `9007199254740992` (`std/fmt.vl`'s
+// own witness). A 64-bit id — a snowflake, a database key, any `i64` a VL
+// program serialises under serde ruling B — does not survive this tree.
+//
+// This is the one SILENTLY LOSSY behaviour in the module and it is a chosen
+// deviation from `std-api-review.md` §2, on three grounds. The type says it:
+// `f64` is the arm a reader sees. The alternatives are worse — `f64 | i64` arms
+// by lexical form make every consumer test two arms for one concept and split
+// `1` from `1.0`, which JSON says are the same number; a lexeme-carrying
+// number struct costs an allocation per number and a `.value` on every read;
+// and refusing the lexeme outright makes a document holding one large id
+// unparseable as a tree at all, which is the JS failure mode with a worse
+// ergonomic. And THE EXACT PATH IS STAGE 3, by design: `fromJson<T>` with an
+// `i64` field parses the lexeme straight to `i64` and never materialises an
+// `f64`, so the typed decoder is a second consumer of the lexer and does not
+// inherit this rounding. Until it exists, `parseJson` is not the recommended
+// path for VL↔VL traffic that carries `i64`. `parseI64` (`std/fmt.vl`) is the
+// exact primitive when a caller has the lexeme.
+//
+// The decision is REVERSIBLE at near-zero cost, which is what makes "silent,
+// documented" safe to choose now: the lexer already scans the lexeme, so a
+// `precision` kind can be added later without redesigning anything.
+//
+// ── RENDERING: COMPACT, INSERTION-ORDERED, AND `-0` KEEPS ITS SIGN ────────
+//
+// No whitespace at all (`json-design.md` §2.6 — compact is three of the four
+// languages surveyed, and the exception is a wart). PRETTY IS A SECOND
+// FUNCTION, NOT A PARAMETER, and its name is reserved below.
+//
+// Objects render in INSERTION ORDER, because VL maps are insertion-ordered
+// (measured: inserting `b, a, c`, deleting `a` and re-inserting it iterates
+// `b c a`). So parse→render is an identity on key order, which is what a
+// config-file rewrite wants; Go sorts and serde's `Value` sorts unless
+// `preserve_order` is on. Sorted output is a `toJson` variant if a consumer
+// ever names one (canonical JSON for hashing is the usual reason), not this
+// default.
+//
+// Numbers go through `toString` (`std:fmt`), which is ECMA-262
+// `Number::toString` — shortest round-trip, so `1.0` is `1`, `1e21` is `1e+21`
+// and `1e-7` is `1e-7`. ONE EXCEPTION: `toString(-0.0)` is `0`, and this
+// renderer emits `-0`. RFC 8259's grammar admits it, Go, serde and Python all
+// keep the sign, and JS alone loses it; one branch buys a shorter round-trip
+// exception list. `NaN` and `±Infinity` have no JSON spelling at all and are
+// `kind: "nonfinite"` with `path` at the value — Go's answer, the only one of
+// the four surveyed that is both RFC-valid and loud, and the one the owner
+// ruled. JS emits `null` for them, which is silently lossy: a `NaN` that meant
+// "no reading" comes back indistinguishable from an intentional null.
+//
+// STRING ESCAPES are the RFC minimum and nothing above it: `"` and `\`, then
+// the five named control escapes `\b \t \n \f \r`, and every other code point
+// below U+0020 as `\u00xx` with LOWERCASE hex (RFC 8259 permits either case;
+// this module picks lower and is consistent). `/` is NOT escaped — the RFC
+// permits either and no surveyed default escapes it. NON-ASCII IS EMITTED RAW
+// as UTF-8: the output is a VL string, VL strings are UTF-8 bytes, and escaping
+// non-ASCII quadruples every non-English document for the benefit of no
+// consumer VL has. The invariant that makes raw safe is that THERE IS NO INPUT
+// ON WHICH THIS RENDERER EMITS TEXT IT WOULD NOT ITSELF ACCEPT: a lone
+// surrogate cannot be in a VL string (the parser refuses one, and
+// `fromCodePoints` substitutes U+FFFD for a non-scalar), so the raw path never
+// emits one.
+//
+// ── THE DEPTH CAP IS 128, ON BOTH DIRECTIONS, AND A CYCLE HITS IT ─────────
+//
+// `MAX_DEPTH` below caps container nesting on parse (the input) and on render
+// (the tree). VL is the only one of the five implementations surveyed that caps
+// BOTH. The number is serde_json's, and it is kept because it is a
+// STACK-BUDGET MEASUREMENT rather than a copied constant: a parser-shaped frame
+// on this host survives ~2,000 recursions and traps at 3,000 with `wasm trap:
+// call stack exhausted`, and a recursive-descent parser spends about two frames
+// per nesting level — so ~1,000 levels is the trap EDGE, while 128 is ~8×
+// inside the budget. A trap is not an error a program can handle, and this is
+// the floor that keeps one from happening. Re-take the measurement with the
+// real frame before moving the number; a limit can be RAISED later and never
+// lowered, so the conservative one keeps both options.
+//
+// A CYCLE IN A PROGRAM-BUILT TREE SURFACES AS `kind: "depth"`. The tree can
+// hold one (`let a: Json[] = []; a.push(a)` checks and runs), a naive recursive
+// walk over it is a TRAP, and the cap is what converts that trap into an error
+// a caller can read. It is deterministic and correct, and slightly misnamed;
+// when `IdentitySet<T>` lands (`docs/identity-design.md` A15 build item 4) the
+// renderer will keep the current node's ancestors in one and report a `cycle`
+// kind at the first back-edge, with the depth cap staying as the floor for the
+// deep-but-acyclic case. A `cycle` kind is named here so the union grows rather
+// than reshapes; so is `missing`, if `jsonPointer` is ever ruled in.
+//
+// TWO THINGS THE CAP DOES NOT DO. A PARSED tree cannot contain a cycle, so the
+// exposure is program-built trees only. And the cap protects `parseJson` and
+// `toJson` and NOTHING THE CONSUMER WRITES: a hand-written walker over a cyclic
+// tree still traps, and cannot defend itself today, because the ancestor scan
+// it would need is `===` (`==` over refs is structural and itself diverges on a
+// cycle) and `===` does not parse yet.
+//
+// ── WHAT IS NOT HERE ──────────────────────────────────────────────────────
+//
+// Named so the next person does not ship the wrong spelling, in
+// `std/base64.vl`'s form. None is in v1; each waits for a consumer or a ruling:
+//
+//   • `toJsonPretty(self: Json, …)` — the NAME is fixed so nothing else takes
+//     it, and the mode-switch spelling `toJson(v, pretty)` is refused outright.
+//     The PARAMETER is deliberately not fixed: the proposal's `indent: i32` is
+//     the one signature all four surveyed languages contradict (JS `space` may
+//     be a string, Python `indent=` a `str`, Go `MarshalIndent` takes an
+//     indent string, serde `with_indent(&[u8])`), and an integer forecloses
+//     tabs permanently in a std with no deprecation story.
+//   • `jsonKind(self: Json): JsonKind` over `"null" | "boolean" | "number" |
+//     "string" | "array" | "object"` — "what is this" is the first question
+//     every generic walker asks, and the six-way `is` ladder to answer it is
+//     the same lines in every one of them. It waits for its first consumer,
+//     which is likely the pretty printer.
+//   • `jsonPointer(self: Json, pointer: string): Json | JsonError` — an RFC
+//     6901 accessor. `json-design.md` §6 question 1 is UNRULED; nothing here
+//     squats on the name.
+//   • `jsonEquals` — deliberately absent rather than merely deferred. `==` over
+//     `Json` is an emit refusal today (`==` over a struct union), which is the
+//     only reason a consumer reaches for one; VL's `==` over refs is already
+//     structural, so a std `jsonEquals` would duplicate an operator the day
+//     that gap closes. Compare by rendering — `toJson(a)` against `toJson(b)`
+//     — until it does.
+//   • `fromJson<T>` / a generic `toJson<T>` — stage 3, and the names are left
+//     free for it. `toJson` is ONE name across both stages by design: stage
+//     3's `toJson<T>` at `T = Json` IS this function, so it generalises in
+//     place with no rename and no second export. (A `toJson<T>` defined for
+//     every `T` a deriver reaches is the universal renderer `toString`
+//     deliberately refused to become; it is admissible only because stage 2's
+//     derive is what delivers it, not a runtime walk.)
+//
+// ── HOW TEXT IS BUILT, AND WHY IT IS TWO ROUTES AND NOT ONE ───────────────
+//
+// `an i32[] grows, a string does not` (`std/str.vl`'s header, with the
+// measurement: `s = s + piece` in a loop is O(n²) on this compiler — 313 ms at
+// n=20,000 and 7,614 ms at n=80,000). So nothing here accumulates into a
+// `string`.
+//
+// THE RENDERER fills ONE code-point buffer and calls `fromCodePoints` once, the
+// `std:base64` / `std:fmt` idiom exactly. Existing string content reaches that
+// buffer through `for cp in s`, which yields CODE POINTS — never `s[i]`, which
+// yields a BYTE, and a byte pushed into a code-point buffer comes back out as a
+// different character.
+//
+// THE PARSER CANNOT USE THAT BUFFER FOR ITS OWN SCANNING, because `at` is a
+// BYTE offset and lookahead needs an index, so it scans with `s[i]` over bytes.
+// That leaves the bytes→string question for a parsed string VALUE, and this
+// module takes the SLICE route rather than decoding UTF-8 by hand:
+//
+//   • With NO escapes — the overwhelmingly common case — the value is ONE
+//     `self.slice(start, end)`. That is byte-exact by construction: the bytes
+//     of the input are the bytes of the value, nothing is decoded, nothing is
+//     re-encoded, and the module needs no UTF-8 decoder of its own (there is
+//     one decoder in the tree, `std:utf8`'s, and this is not a second).
+//   • The FIRST escape switches the literal onto the same ONE code-point
+//     buffer the renderer uses: the raw run before it is carried across by
+//     `for cp in <slice>`, and each escape's code point is pushed directly, so
+//     a `\uXXXX` surrogate pair becomes the one code point it names and is
+//     emitted as its UTF-8 bytes. That round trip is exact for valid UTF-8,
+//     which every VL string is (the only routes to one — `decodeUtf8`,
+//     `readTextFile`, `fromCodePoints` — are each strict or substituting).
+//
+// The split is worth the two paths: it makes the common case allocation-free
+// AND makes "the parser copies string bytes through unchanged" literally true
+// there, rather than true-up-to-a-round-trip everywhere.
+//
+// ── COMPILER GAPS ROUTED AROUND IN THIS BODY ──────────────────────────────
+//
+// The surface above is the one `json-design.md` specifies; NONE of it is bent
+// around a compiler gap (the standing rule: propose the better surface and
+// file the gap). What IS shaped by one is the body, at five places, each marked
+// at its site and each carrying an inventory row so the shape can be undone
+// when the row closes:
+//
+//   • D1030 — a `Json | JsonError` narrowed away from the error arm leaves the
+//     FLATTENED member list, which is not assignable to `Json`; and a plain
+//     `Json` does not widen back INTO the composition. `asResult` is the
+//     six-arm ladder that costs, and it is why the parser's value functions
+//     answer a plain `Json` with the error riding on the scanner instead of
+//     returning `Json | JsonError` the way every other std module would.
+//   • D1031 — `JsonError | null` is refused as a struct FIELD and as a RETURN
+//     type, because `JsonError` is a union arm elsewhere here. Both error
+//     carriers (`Scan`, `Rend`) are therefore flat fields plus a `live` flag,
+//     and `renderInto` answers a `boolean`.
+//   • D1029 — an `is`-narrowed MAP arm must be re-bound at its own type before
+//     it can be delivered anywhere.
+//   • D1009 / D1025 — a map read is `Json | null` and does not narrow to
+//     `Json`, and a subscript is hoisted into a local before an `is`.
+//
+// Two smaller shapes are the language as it stands rather than filed gaps: a
+// bare `return` is not a statement, so every early exit carries a value (which
+// is also why `renderInto`'s arms return `boolean` rather than falling through
+// — a ladder that falls through runs a later `is` against an earlier arm's
+// value, and `is boolean` on a null TRAPS); and `for i in 0 to n` is INCLUSIVE
+// of `n`, so every loop here is `while i < n`, as all of std is.
+
+import { parseF64, toString } from "std:fmt"
+
+// The value tree: the six JSON types, arms spelled structurally.
+//
+// Objects are VL maps and arrays are VL lists, so `m.has(k)` sits beside
+// `m[k]` and MISSING stays distinguishable from a stored `null` on the tree
+// itself — a distinction any flattening accessor would have to give up.
+//
+// The arms are NOT named (`type JsonObject = { [string]: Json }`), which is
+// what a reader wants and what the compiler refuses today: as a member of the
+// recursive union the checker rejects it, and declared after the tree
+// `let o: JsonObject = Map()` refuses at emit (D1022). An alias is transparent,
+// so adding the two names later changes no program's meaning.
+export type Json = null | boolean | f64 | string | Json[] | { [string]: Json }
+
+// Why a parse or a render stopped, where, and in which of the four ways. See
+// the module header for the `at`/`path` split and for which `kind`s each
+// function can produce.
+//
+// `kind` IS A LITERAL UNION, not an `i32` code, so a caller writes
+// `e.kind == "depth"` against something the checker can verify and `match` sees
+// the arms. `path` is the FOURTH field and it earns its place twice: it is the
+// render-side coordinate (a render never emits a partial document, so an offset
+// into a discarded buffer would locate nothing), and it is what keeps
+// `JsonError` structurally DISTINCT from `Base64Error = { at, kind, msg }` —
+// VL aliases are structural and a union naming two identical structural types
+// fails to emit, the same collision `std:utf8` and `std:base64` each record
+// dodging with a third field.
+export type JsonError = {
+  at: i32,
+  kind: "syntax" | "duplicate" | "depth" | "nonfinite",
+  path: string,
+  msg: string,
+}
+
+// Container nesting cap, both directions. See the header: this is a stack
+// budget, not a taste, and it can be raised later but never lowered.
+const MAX_DEPTH = 128
+
+function jsonErr(
+  at: i32,
+  kind: "syntax" | "duplicate" | "depth" | "nonfinite",
+  path: string,
+  msg: string,
+): JsonError {
+  { at: at, kind: kind, path: path, msg: msg }
+}
+
+// One RFC 6901 pointer segment. The two escapes are ordered: `~` first, or the
+// `~1` produced from a `/` would itself be re-escaped into `~01`.
+function ptrSeg(k: string): string {
+  const out: i32[] = []
+  for cp in k {
+    if cp == 126 {
+      out.push(126)
+      out.push(48)
+    } else {
+      if cp == 47 {
+        out.push(126)
+        out.push(49)
+      } else {
+        out.push(cp)
+      }
+    }
+  }
+  fromCodePoints(out)
+}
+
+// ── the renderer ───────────────────────────────────────────────────────────
+
+// Whether `x` has a JSON spelling. NaN fails its own equality; the infinities
+// are the only finite-comparison failures left once NaN is gone.
+function isFiniteF64(x: f64): boolean {
+  if x != x { return false }
+  if x > 1.7976931348623157e308 { return false }
+  if x < -1.7976931348623157e308 { return false }
+  true
+}
+
+// `toString` is ECMA-262 `Number::toString` and is right for every f64 except
+// negative zero, which it prints as `0`. See the header for why the sign is
+// kept.
+function numText(x: f64): string {
+  if x == 0.0 && 1.0 / x < 0.0 { return "-0" }
+  toString(x)
+}
+
+function hexDigit(v: i32): i32 {
+  if v < 10 { return 48 + v }
+  97 + (v - 10)
+}
+
+// The character that follows the backslash for the five control characters
+// RFC 8259 gives a named escape, or 0 for every other code point. A ladder
+// rather than a lookup because it inverts exactly — `simpleEscape` reads the
+// same five pairs in the parse direction — and two tables that must agree is
+// one more thing to get wrong (`std/base64.vl`'s `b64Char`/`b64Val` rule).
+//
+// `"` and `\` are NOT here: they escape to themselves, so the caller writes
+// them without a table.
+function namedEscape(cp: i32): i32 {
+  if cp == 8 { return 98 }
+  if cp == 9 { return 116 }
+  if cp == 10 { return 110 }
+  if cp == 12 { return 102 }
+  if cp == 13 { return 114 }
+  0
+}
+
+// `s` as a JSON string literal, quotes included, pushed onto `buf` as code
+// points. `for cp in s` is what makes non-ASCII pass through raw and correct:
+// the code point goes in whole and `fromCodePoints` re-encodes it.
+function pushQuoted(buf: i32[], s: string) {
+  buf.push(34)
+  for cp in s {
+    const named = namedEscape(cp)
+    if cp == 34 || cp == 92 {
+      buf.push(92)
+      buf.push(cp)
+    } else {
+      if named != 0 {
+        buf.push(92)
+        buf.push(named)
+      } else {
+        // Everything else below U+0020 has no named escape and takes the
+        // six-character form. Lowercase hex, consistently (RFC 8259 §7 allows
+        // either case).
+        if cp < 32 {
+          buf.push(92)
+          buf.push(117)
+          buf.push(48)
+          buf.push(48)
+          buf.push(hexDigit(cp >> 4))
+          buf.push(hexDigit(cp & 15))
+        } else {
+          buf.push(cp)
+        }
+      }
+    }
+  }
+  buf.push(34)
+}
+
+function pushText(buf: i32[], s: string) {
+  for cp in s { buf.push(cp) }
+}
+
+// The walk's failure, carried beside the buffer for the same filed reason the
+// scanner's is (D1031): `JsonError` is an arm of both public return types, and
+// a `JsonError | null` RETURN is `emitProgram: ref valtype with no interned
+// shape` — the signature face of the struct-field refusal. `live` is the flag
+// the null would have carried, and `at` is absent because a render error's
+// `at` is always 0.
+type Rend = {
+  live: boolean,
+  kind: "syntax" | "duplicate" | "depth" | "nonfinite",
+  path: string,
+  msg: string,
+}
+
+function rendFail(
+  r: Rend,
+  kind: "syntax" | "duplicate" | "depth" | "nonfinite",
+  msg: string,
+) {
+  if !r.live {
+    r.live = true
+    r.kind = kind
+    r.path = ""
+    r.msg = msg
+  }
+}
+
+// Re-point a propagating render error one level up. On render `path` names the
+// VALUE, so EVERY level prepends its own segment — which costs nothing on the
+// success path and O(depth) once, on the way out of a failure.
+function underSeg(r: Rend, seg: string) { r.path = "/" + seg + r.path }
+
+// Walk `v` into `buf`. Answers whether it was written; `r` carries WHY when it
+// was not. `depth` is the number of containers already open, so the cap is
+// checked as a container is ENTERED.
+//
+// EVERY ARM EXITS. A bare `return` is not a VL statement, so the boolean is
+// what buys the early exit — and the exit is load-bearing rather than tidy: a
+// ladder that falls through runs the LATER `is` tests on a value the earlier
+// one already claimed, and `is boolean` against a null TRAPS.
+function renderInto(v: Json, buf: i32[], depth: i32, r: Rend): boolean {
+  if v is null {
+    pushText(buf, "null")
+    return true
+  }
+  if v is boolean {
+    if v { pushText(buf, "true") } else { pushText(buf, "false") }
+    return true
+  }
+  if v is f64 {
+    if !isFiniteF64(v) {
+      rendFail(r, "nonfinite", "no JSON spelling for this number")
+      return false
+    }
+    pushText(buf, numText(v))
+    return true
+  }
+  if v is string {
+    pushQuoted(buf, v)
+    return true
+  }
+  if v is Json[] {
+    if depth + 1 > MAX_DEPTH {
+      rendFail(r, "depth", "nesting exceeds the depth cap")
+      return false
+    }
+    buf.push(91)
+    let i = 0
+    while i < v.length {
+      if i > 0 { buf.push(44) }
+      if !renderInto(v[i], buf, depth + 1, r) {
+        underSeg(r, toString(i))
+        return false
+      }
+      i = i + 1
+    }
+    buf.push(93)
+    return true
+  }
+  if v is { [string]: Json } {
+    // D1029: an `is`-narrowed MAP arm still carries the union's box at every
+    // delivery position; re-binding it at the arm's OWN type is what unwraps
+    // it. Six of eight positions are check-clean INVALID WASM without this
+    // line, so it is load-bearing and not a style choice.
+    const o: { [string]: Json } = v
+    if depth + 1 > MAX_DEPTH {
+      rendFail(r, "depth", "nesting exceeds the depth cap")
+      return false
+    }
+    buf.push(123)
+    let first = true
+    let bad = ""
+    for k in o {
+      if !r.live {
+        if !first { buf.push(44) }
+        first = false
+        pushQuoted(buf, k)
+        buf.push(58)
+        // D1009/D1025: the read is hoisted, and it is `Json | null` rather
+        // than `Json`. A key reached by iteration is always present, so the
+        // `null` face is a stored JSON null and renders as one.
+        const mv = o[k]
+        if mv == null {
+          pushText(buf, "null")
+        } else {
+          if !renderInto(mv, buf, depth + 1, r) { bad = k }
+        }
+      }
+    }
+    if r.live {
+      underSeg(r, ptrSeg(bad))
+      return false
+    }
+    buf.push(125)
+    return true
+  }
+  true
+}
+
+// `self` as compact RFC 8259 text, or the reason it has none. The two ways it
+// can fail are a number with no JSON spelling (`NaN`, `±Infinity`) and a tree
+// deeper than the cap — which is also how a cycle arrives. Nothing partial is
+// ever returned: the buffer is discarded on failure.
+export function toJson(self: Json): string | JsonError {
+  const buf: i32[] = []
+  const r: Rend = { live: false, kind: "nonfinite", path: "", msg: "" }
+  if !renderInto(self, buf, 0, r) { return jsonErr(0, r.kind, r.path, r.msg) }
+  fromCodePoints(buf)
+}
+
+// ── the parser ─────────────────────────────────────────────────────────────
+
+// Scanner state. The error rides HERE rather than in every return type so the
+// value functions can answer a plain `Json` — a `Json | JsonError` result
+// cannot be narrowed back to a `Json` for a `push` or a map store, because the
+// residue of removing the error arm is the FLATTENED member list and not the
+// registered name (D1030). This is a private carrier, not a second error
+// channel: the surface is `Json | JsonError` in both directions.
+//
+// THE ERROR IS FIVE FLAT FIELDS RATHER THAN ONE `JsonError | null`, for a
+// filed reason and not for taste: a struct field typed at a type that is a
+// union ARM elsewhere in the program is a loud emit reject here — the emitter
+// says the field has no rep (D1031) — and `JsonError` is an arm of both public
+// return types. `live` is the flag the null would have carried.
+//
+// `sealed` is how `path` is computed without paying for it on the success
+// path — see `sealErr`.
+type Scan = {
+  s: string,
+  i: i32,
+  live: boolean,
+  at: i32,
+  kind: "syntax" | "duplicate" | "depth" | "nonfinite",
+  path: string,
+  msg: string,
+  sealed: boolean,
+}
+
+// The byte at `i`, or -1 at end of input. Every read goes through this: an
+// unguarded `s[i]` past the end TRAPS, and a parser must never trap.
+function byteAt(p: Scan, i: i32): i32 {
+  if i < 0 || i >= p.s.length { return -1 }
+  p.s[i]
+}
+
+// Raise from a SCALAR position: the enclosing container owns the pointer, so
+// the error is left unsealed for it to claim. First error wins — a parse stops
+// at the first fault and later positions are not meaningful.
+function raise(
+  p: Scan,
+  at: i32,
+  kind: "syntax" | "duplicate" | "depth" | "nonfinite",
+  msg: string,
+) {
+  if !p.live {
+    p.live = true
+    p.at = at
+    p.kind = kind
+    p.path = ""
+    p.msg = msg
+    p.sealed = false
+  }
+}
+
+// Raise from a CONTAINER's own token stream (a missing `:`, an unterminated
+// array). This container is the one being read, so it claims the pointer here
+// and no ancestor prepends anything below it.
+function raiseHere(
+  p: Scan,
+  at: i32,
+  kind: "syntax" | "duplicate" | "depth" | "nonfinite",
+  msg: string,
+) {
+  raise(p, at, kind, msg)
+  p.sealed = true
+}
+
+// Called by a container when a CHILD failed. The first container the error
+// passes through IS the container being read when it fired, so it claims the
+// pointer and contributes no segment; every container above it prepends the
+// segment of the child it was parsing. That builds `path` in O(depth) on the
+// failure path and costs nothing on the success path.
+function sealErr(p: Scan, seg: string) {
+  if !p.live { return }
+  if !p.sealed {
+    p.sealed = true
+    return
+  }
+  p.path = "/" + seg + p.path
+}
+
+function isWs(c: i32): boolean { c == 32 || c == 9 || c == 10 || c == 13 }
+
+function skipWs(p: Scan) {
+  while p.i < p.s.length && isWs(p.s[p.i]) { p.i = p.i + 1 }
+}
+
+function isDigit(c: i32): boolean { c >= 48 && c <= 57 }
+
+function hexVal(c: i32): i32 {
+  if c >= 48 && c <= 57 { return c - 48 }
+  if c >= 97 && c <= 102 { return c - 97 + 10 }
+  if c >= 65 && c <= 70 { return c - 65 + 10 }
+  -1
+}
+
+// The four hex digits of a `\uXXXX` at `p.i`, or -1. Does not advance.
+function hex4(p: Scan): i32 {
+  let v = 0
+  let k = 0
+  while k < 4 {
+    const d = hexVal(byteAt(p, p.i + k))
+    if d < 0 { return -1 }
+    v = v * 16 + d
+    k = k + 1
+  }
+  v
+}
+
+// A JSON string literal starting at the opening quote. Returns the decoded
+// value; on failure sets the scanner's error and returns `""`.
+//
+// TWO ROUTES, and the header says why: with no escape the value is one
+// byte-exact `slice`; with escapes the pieces go through a code-point buffer.
+// The code point a one-character escape names, or -1 if it names none. `/` is
+// escapable on input even though the renderer never escapes it — RFC 8259
+// allows `\/` and every producer that HTML-escapes emits it.
+function simpleEscape(e: i32): i32 {
+  if e == 34 { return 34 }
+  if e == 92 { return 92 }
+  if e == 47 { return 47 }
+  if e == 98 { return 8 }
+  if e == 102 { return 12 }
+  if e == 110 { return 10 }
+  if e == 114 { return 13 }
+  if e == 116 { return 9 }
+  -1
+}
+
+// A `\uXXXX` escape whose backslash is at `esc` and whose `u` has just been
+// consumed. Pushes one code point, combining a surrogate PAIR into the single
+// character it names. Answers whether it succeeded.
+function pUnicodeEscape(p: Scan, buf: i32[], esc: i32): boolean {
+  const hi = hex4(p)
+  if hi < 0 {
+    raise(p, esc, "syntax", "\\u needs four hex digits")
+    return false
+  }
+  p.i = p.i + 4
+  if hi >= 55296 && hi <= 56319 {
+    // A high surrogate is text only as the first half of a pair, and the
+    // second half has to be spelled as its own escape.
+    if byteAt(p, p.i) != 92 || byteAt(p, p.i + 1) != 117 {
+      raise(p, esc, "syntax", "lone high surrogate escape")
+      return false
+    }
+    p.i = p.i + 2
+    const lo = hex4(p)
+    if lo < 0 {
+      raise(p, esc, "syntax", "\\u needs four hex digits")
+      return false
+    }
+    if lo < 56320 || lo > 57343 {
+      raise(p, esc, "syntax", "high surrogate not followed by a low surrogate")
+      return false
+    }
+    p.i = p.i + 4
+    buf.push(65536 + ((hi - 55296) * 1024) + (lo - 56320))
+    return true
+  }
+  if hi >= 56320 && hi <= 57343 {
+    raise(p, esc, "syntax", "lone low surrogate escape")
+    return false
+  }
+  buf.push(hi)
+  true
+}
+
+function pString(p: Scan): string {
+  p.i = p.i + 1
+  const start = p.i
+  const buf: i32[] = []
+  let escaped = false
+  let runStart = start
+  let out = ""
+  let done = false
+  while !done {
+    const c = byteAt(p, p.i)
+    if c < 0 {
+      raise(p, p.s.length, "syntax", "unterminated string")
+      return ""
+    }
+    if c < 32 {
+      raise(p, p.i, "syntax", "raw control character in a string")
+      return ""
+    }
+    if c == 34 {
+      // With no escape anywhere, the value IS the input's bytes and one slice
+      // delivers them; nothing is decoded and nothing is re-encoded.
+      if escaped {
+        for cp in p.s.slice(runStart, p.i) { buf.push(cp) }
+        out = fromCodePoints(buf)
+      } else {
+        out = p.s.slice(start, p.i)
+      }
+      p.i = p.i + 1
+      done = true
+    } else {
+      if c == 92 {
+        // The first escape switches this literal onto the buffer route; the
+        // raw run before it is carried across as code points.
+        escaped = true
+        for cp in p.s.slice(runStart, p.i) { buf.push(cp) }
+        const esc = p.i
+        p.i = p.i + 1
+        const e = byteAt(p, p.i)
+        const simple = simpleEscape(e)
+        if simple >= 0 {
+          buf.push(simple)
+          p.i = p.i + 1
+        } else {
+          if e != 117 {
+            raise(p, esc, "syntax", "unknown escape")
+            return ""
+          }
+          p.i = p.i + 1
+          if !pUnicodeEscape(p, buf, esc) { return "" }
+        }
+        runStart = p.i
+      } else {
+        p.i = p.i + 1
+      }
+    }
+  }
+  out
+}
+
+// A number lexeme validated against RFC 8259 §6 BY HAND, then converted.
+// `parseF64` is the conversion and never the gate — it accepts `01`, `NaN` and
+// `Infinity`, which JSON does not.
+function pNumber(p: Scan): Json {
+  const start = p.i
+  if byteAt(p, p.i) == 45 { p.i = p.i + 1 }
+  const intStart = p.i
+  if byteAt(p, p.i) == 48 {
+    p.i = p.i + 1
+    if isDigit(byteAt(p, p.i)) {
+      raise(p, intStart, "syntax", "a number may not have a leading zero")
+      return null
+    }
+  } else {
+    if !isDigit(byteAt(p, p.i)) {
+      raise(p, p.i, "syntax", "a number needs a digit")
+      return null
+    }
+    while isDigit(byteAt(p, p.i)) { p.i = p.i + 1 }
+  }
+  if byteAt(p, p.i) == 46 {
+    p.i = p.i + 1
+    if !isDigit(byteAt(p, p.i)) {
+      raise(p, p.i, "syntax", "a fraction needs a digit after the point")
+      return null
+    }
+    while isDigit(byteAt(p, p.i)) { p.i = p.i + 1 }
+  }
+  const e = byteAt(p, p.i)
+  if e == 101 || e == 69 {
+    p.i = p.i + 1
+    const sign = byteAt(p, p.i)
+    if sign == 43 || sign == 45 { p.i = p.i + 1 }
+    if !isDigit(byteAt(p, p.i)) {
+      raise(p, p.i, "syntax", "an exponent needs a digit")
+      return null
+    }
+    while isDigit(byteAt(p, p.i)) { p.i = p.i + 1 }
+  }
+  const lex = p.s.slice(start, p.i)
+  const v = parseF64(lex)
+  if v == null {
+    // Defensive: the scan above accepts a subset of what `parseF64` does.
+    raise(p, start, "syntax", "not a number")
+    return null
+  }
+  if !isFiniteF64(v) {
+    raise(p, start, "nonfinite", "number out of range for a double")
+    return null
+  }
+  v
+}
+
+// `word` at `p.i`, consumed. The three JSON literals are the only keywords.
+function eatWord(p: Scan, word: string): boolean {
+  let k = 0
+  while k < word.length {
+    if byteAt(p, p.i + k) != word[k] { return false }
+    k = k + 1
+  }
+  p.i = p.i + word.length
+  true
+}
+
+function pArray(p: Scan, depth: i32): Json {
+  if depth + 1 > MAX_DEPTH {
+    raiseHere(p, p.i, "depth", "nesting exceeds the depth cap")
+    return null
+  }
+  p.i = p.i + 1
+  const a: Json[] = []
+  skipWs(p)
+  if byteAt(p, p.i) == 93 {
+    p.i = p.i + 1
+    return a
+  }
+  while true {
+    skipWs(p)
+    const v = pValue(p, depth + 1)
+    if p.live {
+      sealErr(p, toString(a.length))
+      return null
+    }
+    a.push(v)
+    skipWs(p)
+    const c = byteAt(p, p.i)
+    if c == 44 {
+      p.i = p.i + 1
+      skipWs(p)
+      if byteAt(p, p.i) == 93 {
+        raiseHere(p, p.i, "syntax", "trailing comma in an array")
+        return null
+      }
+    } else {
+      if c == 93 {
+        p.i = p.i + 1
+        return a
+      }
+      if c < 0 {
+        raiseHere(p, p.s.length, "syntax", "unexpected end of input")
+        return null
+      }
+      raiseHere(p, p.i, "syntax", "expected ',' or ']' in an array")
+      return null
+    }
+  }
+  null
+}
+
+function pObject(p: Scan, depth: i32): Json {
+  if depth + 1 > MAX_DEPTH {
+    raiseHere(p, p.i, "depth", "nesting exceeds the depth cap")
+    return null
+  }
+  p.i = p.i + 1
+  const o: { [string]: Json } = Map()
+  skipWs(p)
+  if byteAt(p, p.i) == 125 {
+    p.i = p.i + 1
+    return o
+  }
+  while true {
+    skipWs(p)
+    const keyAt = p.i
+    if byteAt(p, p.i) != 34 {
+      raiseHere(p, p.i, "syntax", "expected a '\"'-quoted member name")
+      return null
+    }
+    const k = pString(p)
+    if p.live {
+      sealErr(p, "")
+      return null
+    }
+    // I-JSON (RFC 7493 §2.3) and serde ruling A: a repeat is refused, and `at`
+    // points at the SECOND occurrence.
+    if o.has(k) {
+      raiseHere(p, keyAt, "duplicate", "duplicate member name")
+      return null
+    }
+    skipWs(p)
+    if byteAt(p, p.i) != 58 {
+      raiseHere(p, p.i, "syntax", "expected ':' after a member name")
+      return null
+    }
+    p.i = p.i + 1
+    skipWs(p)
+    const v = pValue(p, depth + 1)
+    if p.live {
+      sealErr(p, ptrSeg(k))
+      return null
+    }
+    o[k] = v
+    skipWs(p)
+    const c = byteAt(p, p.i)
+    if c == 44 {
+      p.i = p.i + 1
+      skipWs(p)
+      if byteAt(p, p.i) == 125 {
+        raiseHere(p, p.i, "syntax", "trailing comma in an object")
+        return null
+      }
+    } else {
+      if c == 125 {
+        p.i = p.i + 1
+        return o
+      }
+      if c < 0 {
+        raiseHere(p, p.s.length, "syntax", "unexpected end of input")
+        return null
+      }
+      raiseHere(p, p.i, "syntax", "expected ',' or '}' in an object")
+      return null
+    }
+  }
+  null
+}
+
+function pValue(p: Scan, depth: i32): Json {
+  const c = byteAt(p, p.i)
+  if c < 0 {
+    raise(p, p.s.length, "syntax", "unexpected end of input")
+    return null
+  }
+  if c == 123 { return pObject(p, depth) }
+  if c == 91 { return pArray(p, depth) }
+  if c == 34 { return pString(p) }
+  if c == 45 || isDigit(c) { return pNumber(p) }
+  if c == 116 {
+    if eatWord(p, "true") { return true }
+    raise(p, p.i, "syntax", "expected 'true'")
+    return null
+  }
+  if c == 102 {
+    if eatWord(p, "false") { return false }
+    raise(p, p.i, "syntax", "expected 'false'")
+    return null
+  }
+  if c == 110 {
+    if eatWord(p, "null") { return null }
+    raise(p, p.i, "syntax", "expected 'null'")
+    return null
+  }
+  raise(p, p.i, "syntax", "unexpected byte where a value was expected")
+  null
+}
+
+// A parsed `Json` re-delivered as `Json | JsonError`. The whole ladder exists
+// because the alias is not a member of its own composition: `return v` for a
+// `v: Json` is `expected Json | JsonError, got Json`, so each arm is handed
+// over at its own spelling. The map arm additionally needs the D1029 re-bind —
+// without it this function is check-clean INVALID WASM.
+function asResult(v: Json): Json | JsonError {
+  if v is boolean { return v }
+  if v is f64 { return v }
+  if v is string { return v }
+  if v is Json[] { return v }
+  if v is { [string]: Json } {
+    const o: { [string]: Json } = v
+    return o
+  }
+  null
+}
+
+// The `Json` `self` holds, or why it is not JSON. See the module header for
+// the profile: RFC 8259 grammar, I-JSON strictness, and a depth cap of 128.
+//
+// A parse NEVER TRAPS and never returns a partial tree.
+export function parseJson(self: string): Json | JsonError {
+  // The BOM is the one input where the byte the user sees and the byte the
+  // parser sees differ, so it is named rather than reported as a stray byte.
+  if self.length >= 3 && self[0] == 239 && self[1] == 187 && self[2] == 191 {
+    return jsonErr(0, "syntax", "", "leading byte-order mark")
+  }
+  const p: Scan = {
+    s: self,
+    i: 0,
+    live: false,
+    at: 0,
+    kind: "syntax",
+    path: "",
+    msg: "",
+    sealed: false,
+  }
+  skipWs(p)
+  if p.i >= self.length {
+    return jsonErr(self.length, "syntax", "", "unexpected end of input")
+  }
+  const v = pValue(p, 0)
+  if p.live { return jsonErr(p.at, p.kind, p.path, p.msg) }
+  skipWs(p)
+  if p.i < self.length {
+    return jsonErr(
+      p.i,
+      "syntax",
+      "",
+      "trailing content after the top-level value",
+    )
+  }
+  asResult(v)
+}
