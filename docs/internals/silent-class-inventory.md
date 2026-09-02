@@ -30718,3 +30718,47 @@ this lands, changing no program's meaning — but every consumer's `is` chain re
 until then.
 
 ---
+### D1023 — two struct arms with the same field names and reps but DIFFERENT literal-union field types are one arm to `is`: both tests answer `true`, and the narrowed access traps
+
+**loads then traps · check rc 0 · `wasm trap: cast failure` at the second narrowed field read, after the first arm printed · `r is A` and `r is B` both print `true` for one value · ZERO corpus cells · found 2026-09-01 by the `std:json` std-consistency critique (`docs/internals/json-critique-std.md` finding 1): `JsonError { at, kind, msg }` re-spends `Base64Error`'s shape, and `Base64Error | JsonError` — a base64-embedded JSON payload's natural error union — is this program · one ingredient: the two arms share every field NAME and REP; the literal SETS differing is not enough**
+
+Repro:
+
+    type A = { at: i32, kind: "x" | "y", msg: string }
+    type B = { at: i32, kind: "p" | "q", msg: string }
+    function f(n: i32): A | B {
+      if n == 0 { return { at: 1, kind: "x", msg: "a" } }
+      return { at: 2, kind: "p", msg: "b" }
+    }
+    const r = f(0)
+    if r is A { print(r.msg) }
+    const r2 = f(1)
+    if r2 is B { print(r2.msg) }
+
+`A` and `B` are different TYPES — `"x" | "y"` and `"p" | "q"` share no member — so the
+checker keeps them as two arms and accepts the narrowing. The emitter gives a literal union
+an `i32` sentinel rep, so both structs intern to one wasm struct type, and `is` is a
+`ref.test` that cannot tell them apart: `print(r is A); print(r is B)` on the `B` value is
+`true`, `true` **(RUN)**. In binding position (`const r: A | B = b; if r is A`) the wrong
+arm is taken silently — prints `A`.
+
+* **THIS IS THE `std:base64` HEADER'S RULE, MEASURED PAST WHERE IT LOOKED.** The header
+  says a union naming two IDENTICAL structural types "fails to emit", and adds a third
+  field to stay distinct. Two things it did not measure: identical structs (`{ at, msg }`
+  twice) do not fail to emit either — they answer `true`/`true` and run, which is CORRECT
+  under structural typing since they are one type; and a third field of literal-union type
+  buys nothing unless its LITERAL SET is unique across every std error, which nobody is
+  checking. `Utf8Error.byte: i32` is distinct by a field NAME; `Base64Error.kind` and
+  `JsonError.kind` would be distinct only by their literal sets, which the rep erases.
+
+* **CLAUSE 1.** Check accepts; the program takes the wrong arm or traps. Two repairs are
+  on the table and the choice is a language one: the checker refuses a union whose arms
+  are rep-indistinguishable (loud, and it makes every std error type carry a unique field
+  NAME by rule), or the emitter distinguishes arms whose types differ — by testing the
+  literal sentinel's membership when two struct arms share a wasm type, or by giving each
+  declared alias its own struct type (nominal reps under structural types, the
+  `vl-nominal-vs-structural` question). Until ruled, std's rule is: **a std error type
+  carries a field NAME no other std error type has**, and `std:json`'s proposal takes
+  `path` for that reason and for the information it carries.
+
+---
