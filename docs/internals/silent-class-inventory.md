@@ -29799,6 +29799,25 @@ Repro (loud emit reject):
 
 ---
 
+* **ONLY THE INDEX, and `.length` is the control that proves it.** On the same narrowed
+  receiver `print(v.length)` RUNS (prints 1) while `const e = v[0]` refuses. So the narrowing
+  itself reaches the emitter and the array arm is usable — it is the INDEX operation
+  specifically that goes wrong.
+
+* **THE GUARD IS `emitMapRecvKey`'s `!exprMap(recvIx, fnIx)`** (wasmEmit.vl). Reaching it at
+  all means the index was routed to the MAP path, so something upstream classified the
+  receiver as a map — which it is only in the sense that the UNION has a map arm. The
+  narrowing to the array arm is what that classification ignores.
+
+* The reported position (`3:9`) is the PARAM, not the index expression, because that is where
+  the receiver's node resolves; do not read it as the refusal happening during signature
+  emission.
+
+* Same family as [D1015](#d1015): a classifier answering from the declared type where the
+  narrowed arm is what matters. That one was fixed by keying off `narrowSlotOf` +
+  `narrowVariants` rather than `narrowedValueAtomOf`, after four probes died on the latter
+  answering "" — try that keying here first.
+
 ### D1013 — `print` of a local RE-BOUND from an `is`-narrowed REF arm is check-clean invalid wasm: D968 fixed the narrowed RECEIVER and the rebind kept the box
 
 **closed · was check-clean invalid wasm · clause 1 · `tests/cases/unions/narrowed-union-rebound-local.vl` pins BOTH scopes**
