@@ -32526,6 +32526,21 @@ Repro:
   together and makes the retry unnecessary), then grade the third refusal on its own. A retry
   alone is not worth shipping — it converts one loud refusal into another.
 
+* **AND THE OBVIOUS PLACE TO DO THAT REGISTRATION IS A TRAP — BUILT AND MEASURED.** There is
+  no per-instance return type NODE to walk: `monoInstantiate` builds the instance with the
+  ORIGINAL's return node (`mkFunc(specName, noTP, nps, fn.fnRet, …)`, still `T | "err"`), so
+  the concrete union exists only as the arena type the checker put on the CALL. Registering
+  it there — `collectA`'s `Call` arm, `registerInlineUnion(canonEmitName(tyToEmitName(callTy)))`
+  when `nodeTyIsUnion` — makes the struct-arm instantiations **TRAP AT RUNTIME** where they
+  were a loud emit reject, at `T = i32` and `T = string` alike. Loud → trap is the wrong
+  direction and the row keeps the refusal instead.
+
+  The likely reason is the one this repo already knows: **a union's box tags are POSITIONAL
+  over its member set**, so minting a second row for a union another producer already
+  registered leaves two tag slices for one type and a value boxed under one is read under the
+  other. Any fix has to reuse the EXISTING row where there is one, not add a row per call
+  site — which is a different shape of change from "register the clone's union".
+
 * **WHY IT MATTERS MORE THAN ITS SOURCE ROW.** `T | E` at a scalar `T` is the generic
   `Result` shape every fallible generic helper wants (`std:fs`/`std:json` are monomorphic
   and so never hit it). It should close by registering the clone's union where the direct
