@@ -32682,10 +32682,32 @@ Repro:
 `type R = Kind | string` with `const c: R = "zz"` RUNS, so this is position-dependent as well
 as spelling-dependent — the parameter is the face that fails.
 
-* **THE FIX IS KNOWN AND IS ONE LINE, WHICH IS WHY THE PRICE IS THE WHOLE ROW.** The
-  2026-09-02 ruling collapses `Kind | string` to `string`; `homogLitUnionBase` is exactly the
-  projection that answers for it, and restoring it inside `armLiteralBaseTy` is the change.
-  D1024 ships without it ON PURPOSE.
+* **~~THE FIX IS KNOWN AND IS ONE LINE~~ — CORRECTED 2026-09-02, and the correction is the
+  reason this row is worth reading.** Restoring `homogLitUnionBase` inside `armLiteralBaseTy`
+  is the arena half and it is one line. It is NOT the fix, because there are **TWO causes**
+  and the second is in CANON.
+
+* **THE SECOND CAUSE: canon PRESERVES a string-litunion member where the arena would drop
+  it.** `canonEmitNameTs`'s union arm applies `litUnionPreserve` to a string litunion instead
+  of softening it, so after an arena-side collapse the arena says `string` while canon still
+  spells `K|string` — and the emitter reserves a union box for what is now a plain-string
+  binding. Measured by a peer session on exactly the intermediate state (collapse in
+  `annUnionInnerTy` + `fillTypeDeclAt`, litunion-alias drop enabled):
+  `mixed-union-litunion-arm-is-membership.vl::atomStoreIsK` fails
+  `local.set[0] expected type (ref 4), found local.get of type i32`, and
+  `is-litunion-arm-non-ident-receivers.vl` fails `struct field type K|string|i32 has no
+  struct-field rep`.
+
+* **WHY THE BARE-LITERAL HALF DID NOT NEED THIS, and it is luck rather than design.** Canon's
+  `TyLit` arm already softens to the base and its atom dedup collapses `string|string`, so for
+  `string | "err"` the two producers agree BY ACCIDENT. A litunion-ALIAS arm is different:
+  canon keeps `K` as its own atom. So D1024 shipping only the bare-literal half was the
+  correct call for a reason its own analysis had not found yet.
+
+* **THE ORDER, CORRECTED.** (a) teach `is K` over a COLLAPSED base to lower as the membership
+  test `emitIs` already emits for a standalone litunion receiver, AND (b) make canon's union
+  arm drop the same arms the arena drops — **both** before restoring `homogLitUnionBase`.
+  Either one alone is the `runs → not-runs` veto.
 
 * **THE PRICE, MEASURED — TWO RUNNING FIXTURES, and they are this row's NAMED SET.** With the
   mirror collapsing, `tests/cases/literal-unions/mixed-union-litunion-arm-is-membership.vl`
@@ -32697,10 +32719,11 @@ as spelling-dependent — the parameter is the face that fails.
   that no tag scheme can green by halves. Losing a running program is the movement the gate
   refuses, so the collapse is not the first step.
 
-* **THE ORDER THAT WORKS.** Teach `is K` over a COLLAPSED base to lower as the same membership
-  test `emitIs` already emits for a standalone litunion receiver, verify both fixtures still
-  run, THEN restore the mirror in `armLiteralBaseTy`. That is the build-the-lowering-first
-  discipline D965 named, applied to a rep collapse instead of a converting copy.
+* **THE SHAPE OF THE LESSON.** Two producers of one type — the ARENA and CANON — have to be
+  changed together, and a fix that moves only one leaves them disagreeing about a rep while
+  agreeing about the type. That is the build-the-lowering-first discipline D965 named, applied
+  to a rep collapse instead of a converting copy: build both producers' answers, verify both
+  fixtures still run, THEN collapse.
 
 * **NOT A REGRESSION AND NOT INTRODUCED BY D1024** — the parameter witness fails identically on
   master, at the same byte offset.
