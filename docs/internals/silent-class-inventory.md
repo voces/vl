@@ -30135,7 +30135,7 @@ Repro (check-clean invalid wasm):
 
 ### D1016 — a bare NESTED array literal refuses at ALL THREE delivery boundaries into `Json`, and a bare literal holding a MAP refuses with a second sentence; annotating the literal clears both
 
-**loud emit reject · check rc 0 · `emitProgram: array value does not match any array member of the union (leaf-scalar widening across a nested array is unsupported)` (`compiler/wasmEmit.vl:4887`) at binding, argument AND map-write · a bare literal whose element is a MAP instead takes `emitProgram: a union arm that is an array-of-map is not yet supported — use a named element type` (`wasmEmit.vl:4921`) · both are cleared by annotating the literal `Json[]` and delivering that · `goal-scoreboard.py --sites` lists the array-of-map literal as a **ZERO** row (no corpus cell reaches it) and does NOT count the nested-array one at all — its wording says "is unsupported", which the `CONCEDES` filter does not match, so it is a D964 lower-bound case · found by the serde round-3 appendix (residues (c) and (d)), re-measured 2026-09-01**
+**runs, all nine delivery positions print the leaf `2.5` — CLOSED 2026-09-01 by resolving the arm STRUCTURALLY when the probe cannot name the element (`unionRefArrayArmSlotForNestedElem`, `compiler/emit_classify.vl`) and routing both literal shapes through it (`compiler/wasmEmit.vl`); pinned by `tests/cases/unions/nested-array-literal-into-recursive-union.vl`. Was: loud emit reject · check rc 0 · `emitProgram: array value does not match any array member of the union (leaf-scalar widening across a nested array is unsupported)` (`compiler/wasmEmit.vl:4887`) at binding, argument AND map-write · a bare literal whose element is a MAP instead took `emitProgram: a union arm that is an array-of-map is not yet supported — use a named element type` (`wasmEmit.vl:4921`) · both were cleared by annotating the literal `Json[]` and delivering that · found by the serde round-3 appendix (residues (c) and (d)), re-measured 2026-09-01**
 
 Both are the same delivery: an ARRAY LITERAL, written bare, at a destination typed as the
 recursive union rather than as its array arm. `[2.5]` at `Json` works; `[[2.5]]` does not,
@@ -30165,8 +30165,30 @@ for a non-leaf element.
 * **CLAUSE 2, AND ONE OF THEM IS COUNTED.** `wasmEmit.vl:4921` ("not yet supported") is one
   of the 22 capability literals `--sites` reports, and it is a ZERO row: no corpus cell
   reaches it, so the scoreboard cannot see it move. `wasmEmit.vl:4887` is not counted at all.
-  Both need a hand-written probe under `scripts/capability-probes/` before either can be
-  graded by anything but this row.
+  Both now have one — `scripts/capability-probes/nested-literal-into-recursive-union.vl`,
+  covering both spellings and reading the leaf back (23 of 23 probes run on 2026-09-01) — so
+  the closure is gradeable by the runner rather than only by this row.
+
+* **WHAT WAS ACTUALLY MISSING WAS A NAME, NOT A LOWERING.** `emitUnionListLitViaRefArm` picks
+  the arm by classifying the first element's scalar ATOM, and a nested list or a map element
+  has none — so it bailed to paths that look for an arm that is literally a nested array
+  (`i64[][]`) or an array-of-map, and `Json[]` is neither. The build it needed was already
+  there: `pendingListKind = 2` boxes each element into the union box, which is exactly what
+  the annotated `const a: Json[] = [[2.5]]` control was doing all along.
+
+  **ASKING FOR THE UNION'S OWN NAME DOES NOT WORK, AND THAT WAS THE FIRST ATTEMPT.**
+  `Json[]`'s element union is `Json`, whose atoms are `null | boolean | f64 | string |
+  Json[] | {[string]: Json}` — `Json` is not among them. What IS among them is the ARRAY
+  atom `Json[]`, the member the inner `[2.5]` boxes as. So the arm test is structural on the
+  element union's atoms, never nominal on the union. One build was spent on the nominal
+  version before the arena said so.
+
+* **THE POSITION MATRIX WAS RUN AFTER THE LIFT, NOT BEFORE — nine positions, each printing the
+  LEAF.** The row above recorded three boundaries taking one message; lifting the gate could
+  still have left the other six silent, which is D965's whole lesson. Binding, argument,
+  return, map-write, global-init, a deeper nesting, the map element, global assignment and a
+  struct field all print `2.5`. A position that merely type-checked would print `0.0` — the
+  fixture reads the value back through the boxes rather than asserting the program compiles.
 
 Repro (loud emit reject):
 

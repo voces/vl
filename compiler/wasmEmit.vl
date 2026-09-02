@@ -761,6 +761,7 @@ import {
   unionNameOfIdentSid,
   unionNestedArrayArmSlot,
   unionRefArrayArmSlotForElem,
+  unionRefArrayArmSlotForNestedElem,
   unionRefArrayArmSlotForMapElem,
   unionSetHasNull,
   unMemAtomKind,
@@ -4592,12 +4593,31 @@ function emitUnionListLitViaRefArm(
     // coerces independently inside the build). An element this static probe cannot name
     // (a nested list / map) bails to the caller's existing paths.
     let elemAtom = ""
+    // Hoisted: the empty-`[]` branch below shares the arm-slot resolution at the bottom.
+    let selfArm = false
+    let selfSlot = 0 - 1
     if bare.arrElems.length >= 1 {
       const e0 = bare.arrElems[0]
+      // D1016 — A NESTED LIST OR MAP ELEMENT IS UNNAMEABLE BY THE PROBE ABOVE, AND A
+      // SELF-REFERENTIAL UNION HAS EXACTLY THE ARM THAT ADMITS IT. `[[2.5]]` and `[mv]`
+      // into `type Json = … | Json[] | {[string]: Json}` both bailed here, and the caller's
+      // remaining paths look for an arm that is literally a NESTED array (`i64[][]`) or an
+      // array-of-map, neither of which `Json[]` is — so both ended at a loud refusal. But
+      // `Json[]`'s element type is `Json` itself, so every element is a legal member and
+      // `pendingListKind = 2` boxes it as one. That is the same recursive step the ANNOTATED
+      // `const a: Json[] = [[2.5]]` already performs, which is why the control ran while the
+      // bare literal refused. No self-referential array arm ⇒ bail exactly as before.
       if exprArray(e0, fnIx) || exprRefArray(e0, fnIx) || exprMap(e0, fnIx) {
-        return 0
+        selfSlot = unionRefArrayArmSlotForNestedElem(
+          unionName,
+          exprMap(e0, fnIx),
+        )
+        if selfSlot < 0 { return 0 }
+        selfArm = true
       }
-      if exprString(e0, fnIx) {
+      if selfArm {
+        // the arm is already chosen — the value-atom ladder below must not reclaim it
+      } else if exprString(e0, fnIx) {
         elemAtom = "string"
       } else if exprIsBool(e0, fnIx) {
         elemAtom = "boolean"
@@ -4615,7 +4635,11 @@ function emitUnionListLitViaRefArm(
         }
       }
       // The union's own value-atom LIST arm is the exact match — let the ladder box it.
-      if unionHasAtomTy(unionName, elemAtom, true) { return 0 }
+      // Not for the self-referential arm: `Json` names the union, and asking whether it has
+      // a `Json[]` value atom is asking about the arm we just picked.
+      if !selfArm {
+        if unionHasAtomTy(unionName, elemAtom, true) { return 0 }
+      }
     } else {
       // An EMPTY `[]`: only route when NO value-atom list arm could claim it.
       if (
@@ -4629,7 +4653,8 @@ function emitUnionListLitViaRefArm(
         return 0
       }
     }
-    const armSlot = unionRefArrayArmSlotForElem(unionName, elemAtom)
+    let armSlot = unionRefArrayArmSlotForElem(unionName, elemAtom)
+    if selfArm { armSlot = selfSlot }
     if armSlot < 0 { return 0 }
     fbI32Const(refArrSlotTag(armSlot))
     const savedK = pendingListKind
@@ -4916,6 +4941,27 @@ export function emitUnionCoerce(
         pendingListKind = savedMK
         pendingListSlot = savedMS
         if mrc < 0 { return -1 }
+        fbStructNew(uBoxIdx) // { tag, reflist-wrapper ref }
+        return 0
+      }
+      // D1016 — before refusing, try the arm whose element is a UNION carrying a map atom.
+      // `unionRefArrayArmSlotForMapElem` above looks for an arm that is an array-OF-MAP
+      // (`{[string]: i64}[]`), and `Json[]` is not one: its element is the union `Json`,
+      // which merely HAS a map among its atoms. So `[mv]` into `Json` matched nothing and
+      // refused, while `const a: Json[] = [mv]` — the same value, one annotation — ran.
+      // The arm's build boxes each element into the union box (`pendingListKind = 2`), and
+      // a map element boxes exactly as the annotated spelling already boxes it.
+      const nmSlot = unionRefArrayArmSlotForNestedElem(unionName, true)
+      if nmSlot >= 0 {
+        fbI32Const(refArrSlotTag(nmSlot))
+        const savedNK = pendingListKind
+        const savedNS = pendingListSlot
+        pendingListKind = 2
+        pendingListSlot = nmSlot
+        const nrc = emitExpr(body, exprIx, fnIx)
+        pendingListKind = savedNK
+        pendingListSlot = savedNS
+        if nrc < 0 { return -1 }
         fbStructNew(uBoxIdx) // { tag, reflist-wrapper ref }
         return 0
       }
