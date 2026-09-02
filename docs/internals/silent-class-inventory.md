@@ -36602,7 +36602,7 @@ Repro (check rc 0; the module the engine refuses to load):
 
 ### D1152 — `uVariants` can outgrow its parallel field-span tables, and THREE unguarded reads index them by variant id — a latent compiler TRAP, reachable today only in a shared instance
 
-**runs today and must keep running — a REFUTATION PIN · the defect it pins is LATENT: three unguarded parallel-table reads that are correct only while `uVariants` and its field-span tables stay the same length · reached 2026-09-02 by a candidate fix for [D1112](#d1112), inside the corpus oracle's SHARED compiler instance, and not from the CLI on any program measured so far · this row flips the day someone lands a change that lengthens `uVariants` without extending the spans**
+**runs today and must keep running — a REFUTATION PIN · CLOSED 2026-09-02: the trap is now a LOUD `emitFail` naming both lengths, seen firing against a sabotaged control · the pin stays, because what must not move is that this program still RUNS · reached 2026-09-02 by a candidate fix for [D1112](#d1112), inside the corpus oracle's SHARED compiler instance, and not from the CLI on any program measured so far**
 
 Repro (runs today, prints `b` — it is the pin, not a failure):
 
@@ -36642,4 +36642,70 @@ Repro (runs today, prints `b` — it is the pin, not a failure):
   the mismatch a loud `emitFail` naming the two lengths, so the next change that lengthens
   `uVariants` alone gets a diagnostic instead of a trap. That is the prerequisite [D1112](#d1112)
   is blocked on: its fix reaches `runs` at 17 of 18 positions and cannot ship past this.
+
+* **AND BOUNDING THE THREE SITES IS NOT SUFFICIENT — MEASURED, WITH A CONTROL THAT TRAPS.**
+  The row's own prescription was tried first and graded against a sabotaged compiler that
+  drops the LAST variant's span rows at the end of `collectU` (`uFieldStart.pop()` +
+  `uFieldCount.pop()`, built to `_scratch/probe.wasm` off a pristine seed). With the three
+  site guards in and nothing else, the pin still died on `wasm trap: out of bounds array
+  access` — because the FIRST read to go out of bounds is not on the byte-writing path at
+  all. It is `emitTypeSection`'s variant loop (`emit_sections.vl`, `while vi <
+  uVariants.length` → `uFieldCount[vi]`), and there are some thirty more in the classifier
+  accessors (`variantFieldTypeAt`, `variantSig`, `variantStructHeapTwinAt`, …). **A
+  read-site guard cannot close a table-length class**: it protects the site you thought of,
+  in a program that never reaches it.
+
+* **SO THE INVARIANT IS RECONCILED ONCE, AT THE HEAD OF THE EMIT PHASE.**
+  `reconcileVariantFieldSpans` (`emit_collect.vl`, called from `emitModule` before
+  `emitHeader`) compares the three lengths, reports BOTH loudly, and pads the short table
+  with EMPTY spans so every downstream read is in bounds and the recorded message is what
+  reaches the user. Two integer compares per module on the passing path. The three site
+  guards stay as the per-site floor for the other half of the class — a `vi` that is bogus
+  rather than uncovered, which no length reconciliation can see.
+
+* **BOTH GUARDS WERE SEEN TO FIRE, EACH AGAINST A CONTROL THAT TRAPS WITHOUT IT.** Four
+  probe compilers, one sabotage each, the row's own repro as the program:
+
+  | probe | sabotage | guard present | outcome |
+  | --- | --- | --- | --- |
+  | `probe_guarded` | last variant's span rows popped | site guards only | `wasm trap: out of bounds array access` |
+  | `probe_reconcile` | last variant's span rows popped | + the reconcile | **loud**: `the union-variant field-span tables do not cover every variant — 2 variants but 1 field starts / 1 field counts` |
+  | `probe_site_noguard` | `emitUnionBoxAs` hands `emitVariantStruct` `vi = uFieldStart.length` (the measured `vi=2 len=2`) | none | `wasm trap: out of bounds array access` |
+  | `probe_site` | same | site guard | **loud**: `emitVariantStruct: union-variant 2 is outside the parallel field-span tables — 2 variants but 2 field starts / 2 field counts / 6 field names / 6 field types` |
+
+### D1153 — the variant field-span class has TWO more parallel-table families with the same shape, and only one of them is currently unreachable by argument
+
+**runs today and must keep running — a REFUTATION PIN · latent, FILED not fixed · found 2026-09-02 while closing [D1152](#d1152) · no witness program exists for either family: both need a swallowed registration `-1`, which is what made D1152 reachable and what neither has today · this row flips the day a `collectS` or union-registration refusal is swallowed rather than propagated**
+
+Repro (runs today and must keep running — the struct-table half of the same shape, printing `3`):
+
+    type S = { a: i32, b: string }
+    function f(s: S): i32 { s.a }
+    print(f({ a: 3, b: "x" }))
+
+* **THE STRUCT TABLE IS THE SAME MECHANISM, one table over.** `sNames` is parallel to
+  `sFieldStart` / `sFieldCount` exactly as `uVariants` is to its spans, and `collectS`
+  pushes `sNames` + `sFieldStart` at `emit_collect.vl:11358`/`:11361` and `sFieldCount`
+  **101 lines later** at `:11462` — with two `return emitFail(…)` refusals in between
+  (`fieldTypeRefusalMsg`, `malformed struct field`). A refusal there leaves `sNames` one row
+  longer than `sFieldCount`, and `sFieldCount[si]` is then the same out-of-bounds read.
+
+* **WHAT MAKES IT UNREACHABLE TODAY IS THE CALLER, NOT THE GAP — and that is precisely the
+  property D1152 lost.** Those refusals `return` out of `collectS`, the pass loop halts on a
+  pass's `-1` (`emit_sections.vl`'s `if runEmitPass(…) < 0 { return -1 }`), and `emitModule`
+  never runs. The variant table had the identical argument until the map-atom and
+  ref-array-atom `registerInlineUnion` recursions started SWALLOWING their `-1`. So this is
+  filed as a shape to check whenever a swallowing caller is added, not as a defect with a
+  program. The on-demand struct minters (`emit_classify.vl:24206`, `:24398`, `:24910`) push
+  start and count on ADJACENT lines and cannot desync.
+
+* **AND THE PER-UNION TABLE IS THE THIRD.** `unNames` (`:13190`) is parallel to `unVarStart`
+  (`:13242`) / `unVarCount` (`:13255`), with fifty lines between the first two. Same shape,
+  same argument, same absence of a witness.
+
+* **THE GENERAL RULE THIS FAMILY EARNS: a parallel table is safe only while its pushes are
+  ADJACENT.** Every instance here is a push separated from its partner by a body that can
+  refuse. Where the separation is unavoidable (the field loop must run to know the count),
+  the reconciliation D1152 installed is the pattern — one length check at the head of the
+  consumer, not a guard at each of thirty reads.
 

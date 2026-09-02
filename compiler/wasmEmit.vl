@@ -332,6 +332,7 @@ import {
   uSinkFired,
   uTags,
   uVarHeap,
+  uVariants,
   unionAsSlot,
   unionSinkBase,
   variantReboxSlot,
@@ -3263,7 +3264,55 @@ function emitCaptureRead(_body: i32[], name: string, fnIx: i32) {
   emitFail("emitProgram: captured variable not found in enclosing frame")
 }
 
+// ── The variant field-span INVARIANT, enforced rather than assumed ────────────────────
+//
+// `uFieldStart` / `uFieldCount` are PARALLEL TO `uVariants` and slice the flat
+// `uFieldNames` / `uFieldTypes` stores (`emit_state.vl` states the rule); NOTHING keeps the
+// lengths in step. They come apart whenever a registration helper pushes a variant row and
+// then REJECTS one of its fields — `collectShapeVariantFields` pushes `uFieldStart` before
+// it can refuse, so a caller that swallows the `-1` leaves the row a start with no count.
+// `emitFail` RECORDS a failure and keeps emitting, so the next `uFieldStart[vi]` on the
+// byte-writing path reads PAST THE END and traps the compiler instead of delivering the
+// message already recorded. Measured at `emitVariantStruct` with `vi=2` against a two-row
+// span table, from a shared compiler instance compiling a second module (D1152).
+//
+// Every span read that writes bytes asks this first. The passing path is four compares and
+// no allocation; the message is built only when it refuses, and it names the variant count
+// beside every span length, so the next change that lengthens `uVariants` alone gets a
+// DIAGNOSTIC rather than a trap.
+function guardVariantFieldSpan(vi: i32, where: string) {
+  if vi >= 0 && vi < uFieldStart.length && vi < uFieldCount.length {
+    const end = uFieldStart[vi] + uFieldCount[vi]
+    if (
+      uFieldStart[vi] >= 0 &&
+      uFieldCount[vi] >= 0 &&
+      end <= uFieldNames.length &&
+      end <= uFieldTypes.length
+    ) {
+      return 0
+    }
+  }
+  emitFail(
+    "emitProgram: " +
+      where +
+      ": union-variant " +
+      i32ToStr(vi) +
+      " is outside the parallel field-span tables — " +
+      i32ToStr(uVariants.length) +
+      " variants but " +
+      i32ToStr(uFieldStart.length) +
+      " field starts / " +
+      i32ToStr(uFieldCount.length) +
+      " field counts / " +
+      i32ToStr(uFieldNames.length) +
+      " field names / " +
+      i32ToStr(uFieldTypes.length) +
+      " field types",
+  )
+}
+
 function emitVariantStruct(body: i32[], objIx: i32, vi: i32, fnIx: i32) {
+  if guardVariantFieldSpan(vi, "emitVariantStruct") < 0 { return -1 }
   const start = uFieldStart[vi]
   const cnt = uFieldCount[vi]
   let fj = 0
@@ -3454,6 +3503,7 @@ function emitStructExprAsVariantBox(
   ssi: i32,
   fnIx: i32,
 ) {
+  if guardVariantFieldSpan(vi, "emitStructExprAsVariantBox") < 0 { return -1 }
   const cnt = uFieldCount[vi]
   const reReadable = cnt == 1 || exprReReadable(unwrapParen(exprIx))
   if !reReadable {
@@ -3825,6 +3875,21 @@ function emitDiscrimFieldEq(
   if vi < 0 || vi >= uVarHeap.length {
     return emitFail(
       "emitProgram: discriminant test on an arm with no heap type",
+    )
+  }
+  if guardVariantFieldSpan(vi, "emitDiscrimFieldEq") < 0 { return -1 }
+  // The FIELD index is the second half of the same read, and it arrives from a caller's
+  // loop rather than from the table — bound it here so the row this reads is provably
+  // inside the arm's own span, not merely inside the flat store.
+  if fi < 0 || fi >= uFieldCount[vi] {
+    return emitFail(
+      "emitProgram: emitDiscrimFieldEq: field " +
+        i32ToStr(fi) +
+        " is outside union-variant " +
+        i32ToStr(vi) +
+        "'s " +
+        i32ToStr(uFieldCount[vi]) +
+        " fields",
     )
   }
   const code = uFieldTypes[uFieldStart[vi] + fi]
