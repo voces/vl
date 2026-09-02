@@ -33332,11 +33332,11 @@ Repro:
   == false`; and the D1024 fixture set unmoved, because the gate change must not reach into
   the collapse.
 
-### D1060 — `is <literal>` over a CALL-result union is a loud emit reject, and the message says "non-binding" when the ablation says "call"
+### D1060 — `is <literal>` over a CALL-result union was a loud emit reject, and the message said "non-binding" when the ablation said "call"
 
-**loud emit reject · check rc 0 · clause 2 · `emitProgram: literal `is` over a non-binding union value is not supported yet` (`compiler/wasmEmit.vl:6150`) · ZERO corpus cells · found 2026-09-02 by triaging `goal-scoreboard.py --sites`, which listed this literal as reached by NO corpus cell and by no probe**
+**CLOSED as `runs` 2026-09-02 — the repro RUNS and prints `yes`. Was: a loud emit reject on `vl check` rc 0 (`emitProgram: literal `is` over a non-binding union value is not supported yet`, then at `compiler/wasmEmit.vl:6150`) · clause 2 · ZERO corpus cells · found by triaging `goal-scoreboard.py --sites`, which listed this literal as reached by NO corpus cell and by no probe**
 
-Repro (refuses; binding the call to a `const` first RUNS and prints `yes`):
+Repro (RUNS and prints `yes`; before the close it refused, while binding the call to a `const` first already ran):
 
     type K = "a" | "b"
     function mk(n: i32): K | i32 {
@@ -33352,20 +33352,41 @@ Repro (refuses; binding the call to a `const` first RUNS and prints `yes`):
   refuses identically, so the paren peel is not the bound either.
 
 * **THE FIX IS A SCRATCH-LOCAL SPILL, not a widened re-readability predicate.** The receiver
-  has to be evaluated once into a local and the existing membership lowering run against that
-  local — which is what the user writes by hand today to make the program work.
+  is evaluated once into a local (`unionLitIsStashSlot`, back code 17) and the existing
+  membership lowering runs against that local — D972's move for `emitUnionConcreteEq`, which
+  is also what the user writes by hand today to make the program work. Its OWN slot code
+  rather than the union-`==` stash's 13: an `is` can sit inside a `==` operand's call
+  argument and the two boxes share a wasm type, so a shared slot would clobber and the module
+  would still validate.
 
-* **NOT D1061**, though the two literals sit six lines apart in `wasmEmit.vl` and both say
-  "non-binding": binding both operands does NOT fix `==` over a struct-plus-scalar union.
-  Separated by ablation, not by their sentences.
+* **THE RECEIVER-SHAPE SWEEP RAN WIDER THAN THE ROW SAID.** A field read and an element read
+  ROOTED at a call (`mk(0).u is "a"`, `mk(0)[0] is "a"`) refused too, because
+  `unionEqOperandOk` recurses into the receiver — as did a closure call and an element read
+  whose SUBSCRIPT is a call. All seven shapes run now, at both the string and the numeric
+  literal rep. Fixture: `tests/cases/literal-unions/is-literal-call-result-receiver.vl`.
+
+* **THE EVALUATION COUNT IS PINNED, because a spill changes that question.** One call per
+  `is`, verified with a counter and a print marker in the callee, across both literal reps
+  and a short-circuiting pair:
+  `tests/cases/literal-unions/is-literal-call-receiver-evaluated-once.vl`.
+
+* **THE MEMBERSHIP SPELLING IS A DIFFERENT ROW AND STILL REFUSES.** `mk(0) is K` over a
+  multi-member literal union re-reads the receiver once PER MEMBER, so one stash's live range
+  cannot serve it; `emitProgram: `is` over a literal union needs a re-readable receiver` is
+  unchanged, and `tests/cases/literal-unions/is-litunion-arm-call-receiver-rejected.vl` and
+  its string twin still pin it as an error.
+
+* **NOT D1061**, though the two literals sat six lines apart in `wasmEmit.vl` and both said
+  "non-binding": binding both operands did NOT fix `==` over a struct-plus-scalar union.
+  Separated by ablation, not by their sentences — and the two fixes share no line.
 
 * Probe: `scripts/capability-probes/lit-is-call-result-union.vl`.
 
-### D1061 — `==` over a union carrying a STRUCT arm beside a SCALAR arm is a loud emit reject; two STRUCT arms compare fine
+### D1061 — `==` over a union carrying a STRUCT arm beside a SCALAR arm was a loud emit reject; two STRUCT arms compared fine
 
-**loud emit reject · check rc 0 · clause 2 · `emitProgram: `==` over a struct union is not supported yet` (`compiler/wasmEmit.vl:5738`) · ZERO corpus cells · found 2026-09-02 triaging `goal-scoreboard.py --sites`**
+**CLOSED as `runs` 2026-09-02 — the repro RUNS and prints `true`. Was: a loud emit reject on `vl check` rc 0 (`emitProgram: `==` over a struct union is not supported yet`, the copy in `emitUnionUnionEq`) · clause 2 · ZERO corpus cells · found by triaging `goal-scoreboard.py --sites`**
 
-Repro (refuses):
+Repro (RUNS and prints `true`):
 
     type A = { x: i32 }
     function mk(n: i32): A | i32 {
@@ -33377,13 +33398,35 @@ Repro (refuses):
     print(p == q)
 
 * **THE MIXED ARM IS THE INGREDIENT, NOT THE STRUCT ONE**, and the message's word "struct
-  union" points at the arm that is NOT the problem. Measured: `A | B` over two struct arms
-  compares and prints `true`; `A | i32` and `A | string` both refuse. So a union whose arms
-  are all structs is already served, and it is the STRUCT-BESIDE-SCALAR pair that has no
-  compare core.
+  union" pointed at the arm that was NOT the problem. Measured: `A | B` over two struct arms
+  compares and prints `true`; `A | i32`, `A | string`, `A | f64`, `A | i64` and
+  `A | boolean` all refused. So a union whose arms are all structs was already served, and it
+  was the STRUCT-BESIDE-SCALAR pair that had no compare core.
 
-* **BINDING DOES NOT HELP**, which is what separates it from [D1060](#d1060): both operands
-  here are already `const` locals.
+* **THE MECHANISM IS THE ARM LOOP'S VARIANT-ROW REQUIREMENT, printed rather than read off the
+  code path.** An `emitFail` probe at each of `emitStructUnionEq`'s seven decline points
+  reported `no variant for arm <i32> of <A|i32>` — `variantIndexOf` answers -1 for a scalar
+  arm, and one unservable arm declined the whole set. The must-fire control was the failing
+  witness itself; the two-struct spelling, which compiles, printed nothing, which is exactly
+  what an `emitFail` probe is required to do there.
+
+* **THE DISPATCH NEVER HAD TO CHANGE.** Every arm of this box is selected by the same tag
+  field, and a scalar arm's tag is `scalarTagOfKind(k)` = `uVariants.length + k`, which cannot
+  collide with a variant tag. The arm loop now carries two index-parallel columns (`vis` /
+  `aks`, mutually exclusive) and only the per-arm COMPARE branches: fields through the variant
+  table for a struct arm, an unboxed payload compare for a scalar one, and bare tag agreement
+  for a `null` arm. An arm that is neither still DECLINES before a byte is written, so a LIST
+  or MAP arm keeps the caller's loud refusal instead of becoming a bad lowering — `A | i32[]`
+  and `A | B | i32[]` are the witnesses for that, and they are the residue of this row.
+
+* Fixture: `tests/cases/unions/struct-union-equality-scalar-arm.vl` — every arm constructed
+  AND discriminated at five scalar reps, both ways round the arm boundary, plus a three-arm
+  set with two struct rows and the reversed arm order.
+
+* **BINDING DID NOT HELP**, which is what separated it from [D1060](#d1060): both operands
+  here are already `const` locals. CALL operands work too — `emitStructUnionEq` is tried
+  BEFORE the re-readability gate because it parks each operand in its own slot, so it
+  evaluates each exactly once (pinned by a counter: two calls, two evaluations).
 
 * **PLAIN STRUCT EQUALITY IS NOT THE GAP EITHER** — `a == b` over two `P` values outside any
   union runs and prints `true`, so `emitProgram: struct equality is not supported yet`
@@ -33645,3 +33688,48 @@ Repro (check rc 0, then invalid wasm):
     print(describe(b))
     // vl check -> rc 0; vl run -> Invalid input WebAssembly code, type mismatch
     // Either print ALONE runs, and prints <C> / <fld> respectively.
+
+### D1071 — a union `==` against a CONCRETE operand that is not a value atom reads the WRONG arm's payload: check-clean invalid wasm
+
+**check-clean invalid wasm (`type mismatch: expected i32, found (ref $type)`) · check rc 0 · clause 1 · ZERO corpus cells · found 2026-09-02 while sweeping the residue of [D1061](#d1061); PRE-EXISTING and byte-identical on the merge-base `5aac87cd`, confirmed by A/B against a compiler self-built from that tree**
+
+Repro (`vl check` rc 0, then the engine refuses the module):
+
+    type A = { x: i32 }
+    function mk(n: i32): A | i32 {
+      if n == 0 { return 5 }
+      { x: n }
+    }
+    const p = mk(1)
+    const a: A = { x: 1 }
+    print(p == a)
+
+* **THE MECHANISM IS AN IN-BAND DEFAULT, NOT A MISSING ARM.** `unionEqAtomOf` classifies the
+  CONCRETE side of a union `==` down a first-match ladder (litunion atom / string / f32 / f64
+  / i64 / boolean) and its `else` arm falls back to the union's own numeric promotion, which
+  starts from `let atom = "i32"`. A STRUCT operand matches no rung, so it is answered `"i32"`
+  — a real value meaning "I could not classify this". `emitUnionConcreteEq`'s `eqMixedOk`
+  gate then passes, because the union genuinely does carry an `i32` arm, and the compare
+  emits the i32 arm's tag test and unboxes the i32 payload against a `(ref $A)`.
+
+* **DISASSEMBLED, so the arm is named rather than inferred** (`wasm-dis`, the four feature
+  flags): `(i32.eq (struct.get $2 0 (ref.cast (ref $2) (struct.get $1 1 …))) (global.get
+  $global$1))` — the box's tag is compared against `1`, which is the **i32 value box's** tag,
+  not the `A` variant's `0`, and the right-hand side is the whole struct ref.
+
+* **THE INGREDIENT IS "THE UNION CARRIES A VALUE ATOM", NOT "THE UNION CARRIES A STRUCT".**
+  Ablated: `A | B` (two struct arms) against a concrete `A` refuses LOUDLY, because no arm is
+  a value atom and `eqMixedOk` is false. `A | i32` against a struct is silent. `i32 | i32[]`
+  against a concrete `i32[]` is silent by the identical mechanism, so the family is a union
+  with at least one value-atom arm compared against a concrete operand whose type is not a
+  value atom — the container arm is incidental.
+
+* **AN IN-BAND SENTINEL IS A REAL VALUE.** The caller's guard reads `valueAtomKind(atom) >= 0
+  && unionHasAtomK(…, atom, …)`, which is a sound test of the ATOM and no test at all of
+  whether the atom describes the OPERAND. Closing this needs `unionEqAtomOf` to be able to
+  say "not an atom" — and then a union-vs-concrete-STRUCT compare core, or the loud refusal
+  `A | B` already gets. Both halves are in one place; neither is written.
+
+* **NOT D1061.** D1061 is union-vs-union through `emitStructUnionEq`; this is
+  union-vs-concrete through `emitUnionConcreteEq`, a different function with a different
+  gate, and D1061's fix moves none of these cells (re-measured after it landed).
