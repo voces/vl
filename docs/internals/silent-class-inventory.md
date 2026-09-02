@@ -24265,6 +24265,26 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   shape stops matching. `sFieldElemNameAt` — the discriminator code 15 uses for nested structs
   — is empty for a closure field, measured, so there is no existing side-channel to reuse.
 
+* **THE COORDINATED PAIR WORKS — and full signature text is too strong.** Fifth attempt, and
+  the first to move the witness: record the closure's signature on the row
+  (`shapeFieldElemName`'s code-14 arm), return the value's rendered signature on the match
+  side (`anonFieldElemName`'s code-14 arm), and compare them in `structIndexOfObjCtxGo`
+  exactly as map fields (code 19) already do. `hole(s); hole(b)` then prints `ok` then `7`.
+  **So the mechanism is confirmed: the rows collapse, and splitting them fixes the defect.**
+
+  It is not shippable as written. Four fixtures break —
+  `error-lambda-result-struct-closure-field-variant-twin`,
+  `error-nested-lambda-field-collision`, `nested-closure-field-litunion-box-result`,
+  `maps/map-closure-return-nulclosure-field-struct` — and rep-fuzz reports a NEW trap at
+  `p2r {[string]: () => {f: (() => i64) | null}}`. Their names say why: those are cases where
+  two closure fields are SUPPOSED to share a row, and comparing rendered signatures splits
+  them.
+
+  **So the discriminator has to be coarser than the signature: only the RESULT REP, and only
+  where it changes the `call_indirect` type** — a ref result versus a scalar one. The row side
+  would take it from the signature text (`fnRetTextOf`), the match side from the value's type.
+  That is the next attempt, and the four fixtures above are its acceptance test.
+
 * The real fix is per-CALL resolution: monomorphise the hole function per receiver shape, or
   give the two shapes distinct struct rows so they cannot share a `call_indirect` type. The
   row-splitting route is the one the code is shaped for, but only once the code question above
