@@ -29696,7 +29696,34 @@ Repro (loud emit reject):
 
 ### D1013 — `print` of a local RE-BOUND from an `is`-narrowed REF arm is check-clean invalid wasm: D968 fixed the narrowed RECEIVER and the rebind kept the box
 
-**check-clean invalid wasm · check rc 0 · `Invalid input WebAssembly code at offset 312: type mismatch: expected i32, found (ref $type)` — a ref arriving at `__print_i32__`, the same sentence D968 fixed one spelling earlier · sibling of D968, which handled `print(v)` on a `!= null`-narrowed receiver; this is `const a = v` inside an `is` narrow and then `print(a)` · SIX ablations RUN, including `print(v)` with no rebind and `const a: string = v` with the annotation · `let a = v` fails identically to `const` · the ANNOTATION pins it, so a fixture that annotates cannot see this — the D962/D969 shape · found by the serde round-3 appendix (residue (f)), re-measured 2026-09-01**
+**check-clean invalid wasm at MODULE scope · clause 1 · the FUNCTION-scope spelling is fixed and pinned by `tests/cases/unions/narrowed-union-rebound-local.vl`**
+
+* **HALF CLOSED, AND THE OPEN HALF IS MODULE SCOPE.** Inside a function the witness now runs;
+  the filed repro above is TOP-LEVEL and still fails. `a` is declared inside a top-level `if`,
+  so it is neither a global (`globalLetOf` misses it — it is not in `globalIndexBySid`) nor
+  reachable through an enclosing `FuncDecl` body, which is what the fix scans. It lives in the
+  START function's locals and needs a lookup that scans module statements recursively. Exactly
+  the module-vs-function split that cost four probes on [D1015](#d1015); worth checking that
+  one's `narrowSlotOf` keying here.
+
+* **THE CAUSE: `unionIdentReadKind(a)` answered -2**, meaning "a union binding with no
+  narrowing of its own", and `exprString` read that as `-2 == 2`, false. But `a` does not hold
+  a BOX — the init was already narrowed, so it holds the ATOM. It now inherits the init's
+  narrowed atom, one level only. The bytes were already right: the local is declared
+  `(ref $4)` and filled by a proper `ref.cast`; only the print dispatch was wrong.
+
+* **TWO THINGS THAT ARE NOT THE FIX, both measured.** Forcing `emitPrintStrExpr` at the print
+  site does not work on its own — the string scratch frame is allocated at COLLECTION time
+  from the same classifier, so the dispatch and the frame must agree. And forcing `exprString`
+  true for the INIT `v` changes nothing, because the chain from `a` to `v` was never walked.
+
+* Three earlier probes are recorded in this row and remain correct as eliminations:
+  `letIsString` forced true, the local slot forced to `"str"`, and an `exprString` Ident-arm
+  rung consulting `letIsString`. The last one failed because `unionIdentReadKind` returns
+  BEFORE it — `if uk != -3 { return uk == 2 }` — which is the same "the rung was too late in
+  the ladder" shape that cost four probes on [D1015](#d1015).
+
+**closed · was check-clean invalid wasm · clause 1 · `tests/cases/unions/narrowed-union-rebound-local.vl`**
 
 An `is` narrow to ONE arm should leave the value at that arm's own rep — that is exactly the
 reasoning D968's fix rests on (`printUnionRecvIsBox` declines the tag-dispatch plan for a
