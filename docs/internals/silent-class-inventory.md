@@ -32067,6 +32067,21 @@ Repro:
 
   Widening the scan to structural identity (`tySame(cUserTypes[k], ix)`, after the exact scan
   declines) was built and graded: `nodeTyMapValName` is STILL empty under this order and every
-  witness grades exactly as before. The empty render has another source, and the next probe
-  should walk the value type itself rather than the guard — which is reached in both orders
-  and answers the same thing in both.
+  witness grades exactly as before.
+
+* **AND THE OBVIOUS SECOND WIDENING IS ACTIVELY WORSE — DO NOT RE-TRY IT.** Matching a
+  declaration by its RESOLUTION rather than its declaration index (`resolveAnnot(k, [])
+  == ix`, again only after the exact scan declines) is the natural next guess, and it breaks
+  two witnesses that run today: the self-recursive union with a structural binding, and
+  D1036's own repro, both of which start rendering empty as well. `resolveAnnot` is not a
+  read — it is the resolver, memo and all — so calling it from inside a RENDER changes which
+  name wins for types that render perfectly well now.
+
+* **WHERE THE VALUE ACTUALLY GOES.** `nodeTyMapValName` is `tyToEmitName(t.mVal)`, and under
+  the bad order `t.mVal` is 43: a real index, `isNeverTy` 0, well inside `T.tys` (length 60).
+  So the value type EXISTS and only its rendering is empty — the render of 43 recurses into
+  44 (the map), which revisits 43, and the nameless cycle collapses the whole spelling. The
+  guard answers `""` under BOTH orders, so what differs is which of the pair got a fresh
+  resolved index, not what the guard does with it. A fix has to give the renderer a name for
+  a RESOLVED index without calling the resolver — a reverse table populated where the
+  resolution happens, rather than any scan bolted onto `aliasNameOfTyIx`.
