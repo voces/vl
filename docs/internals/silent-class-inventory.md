@@ -29316,7 +29316,12 @@ Repro (now runs, printing `other`):
 
 ### D943 — a generic struct holding BOTH a T field and a closure capturing the T value: the second ref instantiation emits invalid wasm
 
-**check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` in `mk$1` · needs all three ingredients, ablated: drop the `actual: T` field and it runs; drop the closure and it runs (that is D942's shape); drop the FIRST (i32) instantiation and the string instance alone runs · reproduces on the pre-#2081 compiler (there the invalid function is the lambda itself), STANDING · found 2026-08-31 probing a LAZY rendering closure for `std:test` v2 — the eager receipt is what shipped instead**
+**runs, prints `o` then `s` — CLOSED 2026-09-01 by three changes, only the first of which
+this row pointed at: the clone gate now counts CAPTURES as part of a lambda's signature,
+`monoPinBodyLambdas` grew an `ObjLit` arm, and a clone's `fnParent` is re-pointed at the
+instance once it is lifted · zero `runs` lost, mono-tyaram-grid and the fixpoint green ·
+`tests/cases/generics/generic-struct-t-field-and-capturing-closure.vl` · was check-clean
+invalid wasm, `type mismatch: expected i32, found (ref $type)` in `mk$1`**
 
 Repro (check-clean invalid wasm):
 
@@ -29345,6 +29350,40 @@ Repro (check-clean invalid wasm):
 * The second instance (`mk$1`, `T = string`) carries the first instance's scalar layout into
   the closure's environment — the same instance-collision family as D941/D942, reached
   through the capture instead of a call or a field read.
+
+* **THE DISASSEMBLY NAMED IT IN ONE LINE.** Both `mk` instances built their env with
+  `struct.new $10`, and `$10` is `(struct (field i32))` — minted from the first
+  instantiation. The `T := string` instance stored a string ref into that i32 field. One
+  lifted slot means one env struct, because `fnEnvIdx` is parallel to `fnStmts`.
+
+* **THREE THINGS WERE MISSING, AND TWO OF THEM LOOK LIKE PROGRESS WHILE CHANGING NOTHING.**
+
+  1. **The clone gate read the WRITTEN signature, not the captures.** `monoLamNodeIsTemplate`
+     asks whether a parameter or the return still names a type parameter; `show: () => string`
+     names none and only CAPTURES a `T`. A capture is part of a lambda's effective signature,
+     so a capturing lambda inside a generic frame is a template. Asked as "does it capture at
+     all" rather than "does a capture mention `T`" — the captures are recorded by NAME, and
+     being broad is safe in the direction that matters: an extra clone is a correct clone.
+
+  2. **The walker never reached this lambda.** `monoPinBodyLambdas` documented its own bound —
+     "only a `LetDecl` INITIALIZER is rewritten" — and this lambda is a FIELD VALUE in an
+     object literal returned from the generic. That is precisely the shape a generic BUILDER
+     has, so the stated bound excluded the main case rather than an edge of it.
+
+  3. **The clone inherited the TEMPLATE's frame.** `fnParent` cannot be set at clone time: the
+     instance's `FuncDecl` does not exist yet, because its body is what the walk is producing.
+     So the clone pointed at the template, `captureValKind` resolved `value` to `value: T`
+     there, and both instances minted the same layout — a clone that existed and bought
+     nothing. The minted slots are recorded and re-pointed at the instance when it is lifted.
+
+  Fixes 1 and 2 each produce a build that compiles, mints a second env struct, and prints the
+  identical error; only the third makes the layouts differ. Worth knowing before the next
+  instance-collision row, because "the clone now happens" is not the same as "the clone is
+  typed at the instance".
+
+* **THE `T` FIELD IS PINNED ALONGSIDE.** The fixture reads `b.actual` and `b2.actual` back at
+  both instantiations — the env fix must not cost the struct field its own per-instance
+  layout, which is the other half of the same collision family.
 
 ### D944 — [CLOSED 2026-09-01] widening a generic T into a union refuses for EVERY array T, and the refusal's sentence describes a different arm
 
@@ -30858,3 +30897,94 @@ delivers.
 * **WHAT IT TOUCHES.** Nothing in `std:json`'s ruled surface (`Json | JsonError` has no
   literal arm). It is here because D1021's ablation table filed it under the wrong defect,
   and because a message count would keep doing so.
+
+### D1025 — an INTEGER-LITERAL map subscript narrows at check and not at emit: `if m[1] is string { const z: string = m[1] }` is check-clean invalid wasm, and the STRING-literal subscript `m["a"]` mints no narrowing key at all
+
+**check-clean invalid wasm · check rc 0 (the checker even hints the `string` annotation is redundant) · `type mismatch: expected (ref $type), found (ref null $type)` (the raw nullable map read is delivered where the narrowed `string` is expected) · ZERO corpus cells · found 2026-09-01 measuring the `std:json` usability critique's helper decline (its "gap A", the loud string-keyed face) and re-run at an `i32` key · two ingredients: a MAP read through an integer-literal subscript, and a narrowed destination**
+
+Repro:
+
+    let m: { [i32]: string | f64 } = Map()
+    m[1] = "x"
+    if m[1] is string {
+      const z: string = m[1]
+      print(z)
+    }
+
+`placeKeyOf` (`compiler/typecheck.vl`, the Index arm D11 built) keys an index place only
+through `intLitTextOf`, so `m[1]` gets a narrowing key the same way `xs[0]` does — and the
+checker narrows it to `string`, accepts the annotated binding, and calls the annotation
+redundant. The emitter's narrowed-read path was wired for ARRAY places (D11's rungs); a map
+read through the same key still lowers to the raw `(ref null)` map get, and the destination
+expects the narrowed rep.
+
+* **THE FAMILY, ABLATED.** The destination is the ingredient, not the value type: `{[i32]:
+  string}` (no union) with `is string` + `const z: string = m[1]` is the same invalid wasm;
+  `is f64` + `const z: f64 = m[1]` is the same; `return m[1]` from a `function f(): string`
+  inside the `is` is the same. **Controls that RUN:** `print(m[1])` inside the `is` prints
+  `x` (no narrowed destination); the un-annotated `const z = m[1]` prints `x`; hoisting the
+  read — `const v = m[1]` then `if v is string { const z: string = v }` — prints `x`; and
+  the ARRAY twin `const xs: (string | f64)[] = ["x", 2.5]` / `if xs[0] is string { const z:
+  string = xs[0] }` prints `x` (D11's built half).
+
+* **THE LOUD FACES ARE THE SAME DEFECT ONE STEP EARLIER.** At a STRING key —
+  `let m: {[string]: string | f64} = Map()` / `if m["a"] is string { const z: string =
+  m["a"] }` — the place mints no key and the check refuses `cannot assign string | f64 |
+  null to 'z' of type string`; a variable key (`m[k]`, `xs[i]`) is the same refusal; and
+  `!= null` narrows NEITHER key — `if m[1] != null { const z: string | f64 = m[1] }` refuses
+  `cannot assign string | f64 | null …` even at the integer literal, so the keyed place is
+  narrowed by `is` only. Every one of those is check-clean by the design (a literal subscript
+  is a stable place exactly as `xs[0]` is) and is a clause-2 refusal; the integer-literal
+  `is` face is the same gap with the checker's half done and the emitter's half not, which
+  is what makes it clause 1.
+
+* **WHAT IT TOUCHES.** The `std:json` helper decision: the usability critique's consumer
+  programs hoist every `obj["k"]` read into a local before narrowing, and this row is why
+  (`docs/internals/json-critique-usability.md`, "gap A"). A `Json` object is `{[string]:
+  Json}`, so the string-keyed loud face is the one every JSON consumer meets; the fix is
+  the same key for both subscripts (an index place keyed by a STRING literal too), plus the
+  emitter delivering the narrowed rep for a map read the way it does for an array read.
+  Build the emitter half first — narrowing the checker's key alone would move the string
+  face from loud to THIS row's silent one (the D965 position rule).
+
+### D1026 — an alias that already holds `null`, composed with `| null` again in a SIGNATURE, is check-clean and emit-refused: `type P = null | f64` / `function g(): P | null { return null }` → `bare null needs a struct-typed context`
+
+**loud emit reject · check rc 0 · `emitProgram: bare null needs a struct-typed context` at the `return null` (or, when the body returns a value, at the caller's `g() == null`) · ZERO corpus cells · found 2026-09-01 measuring the `std:json` usability critique's "gap C" (`function pick(): Json | null`) · one ingredient: a null-bearing alias composed with a second `null` in a function's return or parameter type**
+
+Repro:
+
+    type P = null | f64
+    function g(): P | null {
+      return null
+    }
+    print(g() == null)
+
+`P | null` expands to `null | f64 | null` — the same duplicate-atom shape as D1024's
+`string | "err"`, with `null` as the atom. Written INLINE the duplicate is harmless:
+`function g(): null | f64 | null { return null }` prints `true`. Through the alias, in a
+signature, the composed union has no rep the emitter will hand a bare `null` to.
+
+* **THE FAMILY, ABLATED.** Parameter position — `function g(x: P | null): boolean { return
+  x == null }` called with `null` — is the same refusal; a second alias layer, `type Q = P |
+  null` / `function g(): Q`, is the same; and a body that returns `1.5` moves the refusal
+  to the CALLER's `g() == null`, so the site is wherever the composed type first meets a
+  `null`. **Controls that RUN, all printing `true`:** `function g(): P { return null }`
+  (no second null); the module-scope binding `const x: P | null = null` (not a signature);
+  the inline spelling above; a NON-null alias composed with null — `type P = string | f64`,
+  `P | null`; and the null-bearing alias composed with something OTHER than null — `type P
+  = null | f64`, `P | string`. Recursion is not an ingredient: `Json | null` refuses for
+  the same reason `P | null` does, and `Json`'s recursion plays no part.
+
+* **CLAUSE 2, SAME ROOT AS D1024.** Both rows are an alias-expanded union carrying a
+  duplicate atom into a signature's rep. D1024 duplicates `string` (after literal widening)
+  and builds invalid wasm; this one duplicates `null` and refuses loudly — the null atom has
+  a dedicated `bare null` gate that the string atom does not. One dedupe after expansion
+  should close both; grade the fix on both witnesses and on the inline controls, which
+  must keep running.
+
+* **WHAT IT TOUCHES.** `std:json`'s `Json` is `null | boolean | f64 | string | Json[] |
+  {[string]: Json}`, so every consumer signature spelled `Json | null` — an "absent key"
+  return, an optional parameter — meets this row. The critique's consumers wrote
+  `function pick(): Json` and returned `null` through the alias's own arm instead, which
+  runs; the row is why the design doc's examples avoid `Json | null`, and it is a build
+  item, not a surface constraint.
