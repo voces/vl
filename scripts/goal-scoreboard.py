@@ -84,13 +84,21 @@ LOUD = ("loud check reject", "loud emit reject")
 # literals instead of lines; the literal COUNT was then right and the PREDICATE deciding which
 # literals to count was never checked against the source it reads.
 #
+# D1045 — "not yet BUILT", the wording a RULED-legal-but-unbuilt refusal reaches for. Its one
+# literal today is the body-scope `type` declaration's interim refusal, which says "ruled legal,
+# not yet built" in so many words: the owner ruled the program legal on 2026-09-02 and the
+# checker refuses it until the scoping is built. That is the concession this list is for, and it
+# arrived in the CHECKER — the direction CLAUDE.md names as the one that hides, since a gap moved
+# out of the emitter stops looking like a gap while the program compiles no better than before.
+# Counting it is what stops this interim from being free.
+#
 # Deliberately NOT added: bare "unsupported" and "are not supported". Those appear in internal
 # invariant failures (`emitNullForRet: unsupported nullable return rep`) and in genuine DESIGN
 # rules (`Map`/`Set` keys must be `string` or `i32`), neither of which concedes that a legal
 # program was refused. A phrase earns a place here only if it admits the program is fine.
 CONCEDES = re.compile(
     r"no lowering|not yet supported|not supported by codegen|type-valid but cannot build"
-    r"|not supported yet|not yet implemented|not yet callable",
+    r"|not supported yet|not yet implemented|not yet callable|not yet built",
     re.I)
 
 

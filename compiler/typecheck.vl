@@ -507,6 +507,29 @@ let scopeEC: i32[] = []
 // equivalent (and keeps the full compiler self-emittable). Reset by `initChecker`.
 export let cUserTypes: {[string]: i32} = Map()
 
+// `cBodyTyDeclNames` — D1045's INTERIM: every `type` name declared inside a function
+// BODY rather than at module scope, keyed to 1 by `refuseBodyTypeDecls` (which runs
+// before pass 0a, so no resolution can happen first). A body-scope `type` is RULED legal
+// and lexically scoped (DECISIONS.md §"A `type` declared in a function body is legal and
+// lexically scoped"); until that scoping is BUILT the checker refuses the DECLARATION,
+// and this set is what keeps that refusal the ONLY diagnostic.
+//
+// It has to be a set and not just a message, because two of the three faces the dropped
+// declaration wore are SECOND diagnostics at the USE: a body-local `P` named in an
+// annotation reported `unknown type 'P'` (line 3, not the declaration's line 2), and one
+// that SHADOWS a module-scope `P` resolved to the OUTER shape and reported `no field 'y'
+// on P` — a field the local declaration does declare. Both go away when the name resolves
+// to the ERROR type instead, which is what `declaredTyOfName` and `applyGenAliasArgs`
+// consult this for.
+//
+// PROGRAM-WIDE rather than lexical, deliberately: lexical scoping IS the build this
+// interim stands in for, and a name in here has already failed the compile, so the only
+// thing the extra width can cost is the quality of other diagnostics mentioning that one
+// name in a program that is rejected either way. A generic declaration banks BOTH
+// spellings — `Pair<A>` as declared and `Pair` as applied — because the declaration
+// registry and the alias-application registry reach it under different names.
+let cBodyTyDeclNames: {[string]: i32} = Map()
+
 // ── Arena-mutation generations (the emit-side repOf memo invalidation) ───────
 // `tyMutEpoch` advances on EVERY in-place mutation of an EXISTING `T.tys` entry
 // — empty-collection pinning (`aElem`/`mKey`/`mVal`/`nInner`), return-inference
@@ -3316,6 +3339,7 @@ export function initChecker() {
   T.diags = []
   T.curRet = -1
   cUserTypes = Map()
+  cBodyTyDeclNames = Map()
   // The arena is re-minted for this program: advance BOTH generations so no
   // emit-side memo stamped under a previous program can be consulted on a
   // shared instance (advance, never reset — a reset could collide with a stamp
@@ -7071,14 +7095,24 @@ function tErrCoded(msg: string, at: i32, code: string) {
 // range to zero width), so the position degrades to a point at the start.
 // Falls back to the plain anchor when the node has no source start.
 function tErrAtNodeStart(msg: string, at: i32) {
+  tErrAtNodeStartCoded(msg, at, "")
+}
+
+// `tErrAtNodeStart` on the CATEGORY-CODED channel — the START-anchor twin of
+// `tErrCoded`, so a capability refusal (`tErrUnsupported`) can also point at the
+// construct's first token. D1045's body-scope `type` needs both halves at once: it is a
+// "type-valid but cannot build" refusal, and a multiline declaration's last token is the
+// closing brace of its field list, a line or more below the `type` keyword the message
+// tells the reader to move.
+function tErrAtNodeStartCoded(msg: string, at: i32, code: string) {
   const sp = nodePos(at)
   if sp >= 0 {
     const tk = tokIndexAt(sp)
     if tk >= 0 && tk < P.toks.length {
-      return tErrPush(msg, at, P.toks[tk].line, P.toks[tk].col, "")
+      return tErrPush(msg, at, P.toks[tk].line, P.toks[tk].col, code)
     }
   }
-  tErr(msg, at)
+  tErrCoded(msg, at, code)
 }
 
 function tErrPush(msg: string, at: i32, ln: i32, co: i32, code: string) {
@@ -9135,7 +9169,15 @@ export function applyGenAlias(head: string, inner: string) {
 // because the two routes must not be able to drift.
 function applyGenAliasArgs(head: string, inner: string, appIx: i32) {
   const gi = gaIndexOf(head)
-  if gi < 0 { return -1 }
+  if gi < 0 {
+    // D1045 INTERIM — a body-scope generic alias APPLIED by name (`Pair<i32>`) misses
+    // here, because only a module-scope `type Pair<A> = …` ever registers. The error type
+    // rather than -1, for the reason `declaredTyOfName`'s twin gives: -1 becomes
+    // `unknown type 'Pair<i32>'` at the use, a second diagnostic for a declaration the
+    // checker has already refused at its own line.
+    if cBodyTyDeclNames.has(head) { return TY_ERR }
+    return -1
+  }
   // The declared parameter names, read as a SLICE of the flat column — split
   // once when the alias registered (D-GAPARAM), not re-split here per
   // application. `pcount` is the declared ARITY.
@@ -9331,6 +9373,13 @@ function methodInValuePosMsg(member: string) {
 }
 
 function declaredTyOfName(name: string) {
+  // D1045 INTERIM — a name a BODY-SCOPE `type` declared resolves to the error type, and
+  // SILENTLY: `refuseBodyTypeDecls` has already reported the declaration, and that
+  // refusal is the whole diagnosis. Answered before the registries below because the
+  // shadowing spelling would otherwise find the module-scope entry and report against
+  // the OUTER shape (`no field 'y' on P`), which is the one face of this defect that is
+  // wrong rather than merely refused.
+  if cBodyTyDeclNames.has(name) { return TY_ERR }
   // A BOUND in VALUE position. It is a design refusal and not a capability gap:
   // `{ toString(): string }` as a parameter type would be an existential needing
   // dynamic dispatch, and everything in VL monomorphizes (see
@@ -26871,6 +26920,89 @@ function forceDeclFill(name: string) {
   0
 }
 
+// D1045's INTERIM refusal, shared by the two declaration node kinds the parser splits a
+// `type` into (a `{`-bodied one is a `TypeDecl`, everything else — union, literal union,
+// nominal `new`, plain alias — is a `UnionDecl`). ONE message, at the `type` keyword's own
+// token (`pos` on both nodes, set by `parseTypeDecl`), naming the declared name AS
+// WRITTEN: `Pair<A>` for a generic alias, because that is the spelling the parser folded
+// the parameters into and the spelling the reader has to move.
+//
+// `CODE_UNSUPPORTED_LOWERING` and not a plain `tErr`: the ruling is that this program is
+// LEGAL, so the diagnostic belongs on the capability channel ("type-valid but cannot
+// build") rather than in the type system's verdict vocabulary. That is also the honest
+// bookkeeping — `scripts/goal-scoreboard.py` counts a conceding refusal as the clause-2
+// violation this interim IS, so moving the gap from the emitter into the checker cannot
+// hide it. Anchored at the node's START (`tErrAtNodeStartCoded`) because the default
+// anchor is the node's LAST token: a multiline `type P = {\n  x: i32\n}` would otherwise
+// report at the closing brace, not at the `type` keyword the message names.
+function refuseBodyTyDecl(name: string, ix: i32) {
+  tErrAtNodeStartCoded(
+    "a `type` declaration is module-scope only for now (D1045 — ruled legal, not yet built); move `" +
+      name +
+      "` to module scope",
+    ix,
+    CODE_UNSUPPORTED_LOWERING,
+  )
+  cBodyTyDeclNames[name] = 1
+  // A generic alias is reached under TWO names — `Pair<A>` by the declaration registry,
+  // `Pair` by the application registry — so bank the base too (`""` for a plain name).
+  const base = declGpBaseOf(ix)
+  if base.length > 0 { cBodyTyDeclNames[base] = 1 }
+  0
+}
+
+// D1045 INTERIM — refuse every `type` declaration that does not stand at MODULE scope,
+// before pass 0a so nothing has resolved a name yet.
+//
+// WHY AN ARENA SCAN AND NOT THE STATEMENT WALK. `parseStmt` is shared between module and
+// block scope and dispatches `TYPE` wherever it stands, so one of these nodes can sit in
+// a function body, a nested named function, an arrow-lambda body, an `if`/`while`/`for`
+// block or a `match` arm — and the checker has several statement-list readers, so
+// enumerating the positions is the position-matrix mistake in miniature: a missed reader
+// is a SILENT hole (the program stays `vl check`-clean and dies at
+// `emitProgram: unsupported statement in body`, which is the clause-2 face this closes).
+// The arena holds every node the parser built and the parser is the ONLY producer of
+// these two kinds, so "declared, and not a top-level statement" decides it without naming
+// a single position.
+//
+// The module-scope set is taken from EVERY `Program` node in the arena rather than from
+// the root being checked: the driver merges the module graph into a synthesized root
+// (`driver.vl`'s `mkProgram(allStmts, -1)`) while each module's own root stays in the
+// arena, and reading one root would refuse another module's top-level declarations the
+// moment anything checks a single file's root directly.
+function refuseBodyTypeDecls() {
+  const isTop: i32[] = []
+  let z = 0
+  while z < P.nodes.length {
+    isTop.push(0)
+    z = z + 1
+  }
+  let px = 0
+  while px < P.nodes.length {
+    const pn = P.nodes[px]
+    if pn is Program {
+      const ps = pn.progStmts
+      let q = 0
+      while q < ps.length {
+        const sx = ps[q]
+        if sx >= 0 && sx < isTop.length { isTop[sx] = 1 }
+        q = q + 1
+      }
+    }
+    px = px + 1
+  }
+  let ix = 0
+  while ix < P.nodes.length {
+    if isTop[ix] == 0 {
+      const nd = P.nodes[ix]
+      if nd is TypeDecl { refuseBodyTyDecl(nd.tdName, ix) }
+      else if nd is UnionDecl { refuseBodyTyDecl(nd.udName, ix) }
+    }
+    ix = ix + 1
+  }
+  0
+}
+
 // The program root: pass 0 registers `type` declarations (structs, then unions over
 // them), pass 1 hoists function signatures (call-before-decl + mutual recursion),
 // pass 2 checks every top-level statement.
@@ -26914,6 +27046,11 @@ function checkProgramNode(n: Program) {
   flFOff = []
   cLitUnionCopyTyIxs = []
   cLitUnionCopyAliasIxs = []
+  // Pass 0−: D1045's INTERIM. Refuse every `type` declaration that is not a top-level
+  // statement, and bank its name, BEFORE pass 0a registers anything — so a body-local
+  // name is already poisoned to the error type by the time any annotation resolves and
+  // the declaration's own refusal is the only diagnostic the program gets.
+  refuseBodyTypeDecls()
   // Pass 0: register top-level struct `type` declarations BEFORE anything else, so
   // a struct name in a param/return/let annotation (pass 1/2) or in a later struct's
   // field resolves via `nameToTy`. Types register in source order, so a field may

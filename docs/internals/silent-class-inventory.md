@@ -32902,13 +32902,14 @@ Repro:
 
 ---
 
-### D1045 — a `type` declared INSIDE A FUNCTION BODY parses and is silently DROPPED by the checker: naming it is `unknown type 'P'`, not naming it is a check-clean emit reject, and shadowing a module-scope name silently resolves to the OUTER declaration
+### D1045 — a `type` declared INSIDE A FUNCTION BODY parses and is DROPPED by the checker, which is RULED legal and lexically scoped; the three faces it wore (`unknown type 'P'` at the use, a check-clean emit reject when unused, silent resolution to a shadowed OUTER declaration) are one message at the declaration since the interim, and the scoping is the build
 
-**loud check reject `unknown type 'P'` at the USE — the declaration itself raises nothing · filed
-2026-09-02 (vl-b7) from the owner's question; RULED the same day (DECISIONS.md §"A `type`
-declared in a function body is legal and lexically scoped"): legal, scoped, may name the
-enclosing function's type parameters — and until built, the DECLARATION is to refuse loudly
-so the three behaviours below collapse into one message that names the rule**
+**loud check reject AT THE DECLARATION — `` a `type` declaration is module-scope only for now
+… ; move `P` to module scope ``, exactly one message per declaration, at the `type` keyword's
+own line, on every spelling and every declaration form · INTERIM SHIPPED 2026-09-02 (#2369);
+the row stays OPEN for the scoping build · filed 2026-09-02 (vl-b7) from the owner's question;
+RULED the same day (DECISIONS.md §"A `type` declared in a function body is legal and lexically
+scoped"): legal, scoped, may name the enclosing function's type parameters**
 
 Repro:
 
@@ -32918,30 +32919,69 @@ Repro:
       return p.x + p.y
     }
     print(f())
-    // 3:11: unknown type 'P'
+    // 2:2: a `type` declaration is module-scope only for now (D1045 — ruled legal, not yet built); move `P` to module scope
 
-* **THREE BEHAVIOURS FOR ONE MECHANISM, seed 42604b65:**
+* **THREE BEHAVIOURS FOR ONE MECHANISM, seed 42604b65 — and what each is since #2369:**
 
-  | spelling | outcome |
-  | --- | --- |
-  | local `P`, used by name (as filed) | **check reject** `unknown type 'P'` at the use |
-  | local `P`, never used by name | `vl check` clean → **`emitProgram: unsupported statement in body`** (clause 2) |
-  | local `type P = { x: i32, y: i32 }` shadowing a module-scope `type P = { x: i32 }` | resolves to the OUTER `P`: `no field 'y' on P` |
-  | a nested NAMED `function` in the same position | RUNS (`42`) — the precedent the ruling follows |
+  | spelling | before the interim | since #2369 |
+  | --- | --- | --- |
+  | local `P`, used by name (as filed) | **check reject** `unknown type 'P'` at the use (line 3) | the declaration's message, line 2, alone |
+  | local `P`, never used by name | `vl check` clean → **`emitProgram: unsupported statement in body`** (clause 2) | the declaration's message, line 2, alone |
+  | local `type P = { x: i32, y: i32 }` shadowing a module-scope `type P = { x: i32 }` | resolves to the OUTER `P`: `no field 'y' on P` **plus** an object-literal complaint about `y` — two diagnostics, neither naming the problem | the declaration's message, line 3 (its own), alone |
+  | a nested NAMED `function` in the same position | RUNS (`42`) — the precedent the ruling follows | RUNS (`42`), unchanged |
 
 * **MECHANISM.** `parseStmt` (`parser.vl`) is shared between module and block scope and
   dispatches `TYPE` to `parseTypeDecl` wherever it stands, so the declaration parses in a
   body. The checker registers type names only from the module-level statement walk
   (`fillTypeDeclAt` over the top-level `stmts`, `typecheck.vl` ~27030); a `TypeDecl` node
-  inside a body is never visited, never registered and never diagnosed. Name resolution
+  inside a body was never visited, never registered and never diagnosed. Name resolution
   (`nameToTy` / `resolveAnnot`) is module-wide, which is why the shadowing spelling finds the
-  outer name and why scoping is a real build rather than a registration fix.
+  outer name and why scoping is a real build rather than a registration fix. The interim
+  changed only the LAST of those three: the declaration is diagnosed where it stands and its
+  name is poisoned to the error type. It is still never registered, and registration under a
+  lexical scope is exactly what the build owes.
 
-* **THE INTERIM (ships first, small):** the checker's body walk refuses a `TypeDecl` at the
-  DECLARATION — `a `type` declaration is module-scope only for now (D1045 — ruled legal, not
-  yet built); move `P` to module scope`. Graded on all three spellings above: each must
-  produce THIS message at line 2, and nothing else. `emit_sections`' `unsupported statement
-  in body` then becomes unreachable for this node kind.
+* **THE INTERIM — SHIPPED 2026-09-02 (#2369).** The checker refuses a `TypeDecl`/`UnionDecl`
+  that is not a top-level statement, at the DECLARATION, with `` a `type` declaration is
+  module-scope only for now (D1045 — ruled legal, not yet built); move `P` to module scope ``.
+  Measured on all three spellings above and on every declaration form the parser admits in a
+  body (struct, union, literal union, recursive, generic alias `Pair<A>`, nominal `new`,
+  `flat type`) plus the arrow-lambda and nested-named-function positions: each produces THIS
+  message, at the declaration's own line, naming its own name, and NOTHING else. Pinned by
+  `tests/cases/types/error-body-scope-type-decl-shadows-module.vl` (the shadowing spelling,
+  the face that was wrong rather than merely refused) and `…-forms.vl` (all ten forms and
+  positions); the corpus's strict rule — every diagnostic must be declared by a directive —
+  is what makes those files assert "and nothing else".
+
+  Three things worth carrying to the build. **(a) The refusal is an ARENA SCAN, in
+  `refuseBodyTypeDecls`, running before pass 0a — deliberately, over the statement walk.**
+  `parseStmt` is one production shared by both scopes, so the declaration can stand anywhere a
+  statement can, and the checker has several statement-list readers: enumerating the positions
+  is the position-matrix mistake in miniature, and a missed reader would be a SILENT hole
+  (check-clean, dying at `emitProgram: unsupported statement in body`). "Declared, and not a
+  top-level statement" decides it without naming a position. The module-scope set is taken from
+  EVERY `Program` node in the arena, since the driver merges the module graph into a
+  synthesized root while each module's own root stays behind. **(b) The cascade suppression is
+  a NAME SET (`cBodyTyDeclNames`), consulted by `declaredTyOfName` and `applyGenAliasArgs`
+  before their registries** — without it the used-by-name spelling keeps `unknown type 'P'` at
+  the USE and the shadowing spelling keeps resolving to the OUTER shape, i.e. the refusal at
+  the declaration would be a THIRD diagnostic instead of the only one. It is program-wide
+  rather than lexical (lexical scoping is the build this stands in for), and a generic alias
+  banks both `Pair<A>` and `Pair` because the two registries reach it under different names.
+  **(c) The diagnostic anchors at the node's START token** (`tErrAtNodeStartCoded`, a new
+  category-coded twin of `tErrAtNodeStart`): the default anchor is the node's LAST token, so a
+  multiline `type P = {\n x: i32\n}` would report at the closing brace instead of at the `type`
+  keyword the message tells the reader to move.
+
+  It is on the `unsupported-lowering` channel, so `scripts/goal-scoreboard.py --sites` counts
+  it: 22 → **23** capability literals, the one new site being this one. That is the interim
+  paying its own price — a gap moved out of the emitter and into the checker is the direction
+  CLAUDE.md names as the one that hides, and `scripts/capability-probes/body-scope-type-decl.vl`
+  is the standing witness that flips to RUNS when the build lands.
+
+  `wasmEmit`'s `emitProgram: unsupported statement in body` is now UNREACHABLE for these two
+  node kinds and is deliberately left in place: it is a floor over every other statement kind
+  the emitter has no arm for, and the check-clean route to it for a `type` is what closed.
 
 * **THE BUILD (the ruling):** every `type` form is admitted in a body — struct, union and
   literal union, recursive, generic alias, and nominal `new` — lexically scoped to the
