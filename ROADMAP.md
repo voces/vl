@@ -245,23 +245,26 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   arms is a DISCRIMINANT-VALUE test". The std rule that was interim is now only a style
   preference: a std error struct no longer NEEDS a unique field name, since a unique `kind`
   literal discriminates. Compiler-side; compile-goal surface.
-- **A `type` declared in a function body is LEGAL and lexically scoped — RULED (owner,
-  2026-09-02), NOT BUILT.** Today the declaration parses and is silently dropped: `unknown
-  type 'P'` at the use, a check-clean emit reject when the name is unused, and a local `type
-  P` silently resolving to a MODULE-scope `P` of another shape (D1045). Ruled: every `type`
-  form (struct, union/literal union, recursive, generic alias, nominal `new`) is admitted in a
-  body, scoped to the block, shadowing outer names, and free to name the enclosing function's
-  type parameters — substituted per instance as D426 does for lambdas; the NAMED-function
-  spelling of that substitution still refuses at emit (D1046) and closes with this. Sub-rulings:
-  a local NOMINAL type may not escape through an inferred return type — checker ERROR at the
-  return (owner, 2026-09-02); a structural one escapes as its shape (vl-b7's recommendation,
-  standing). **Two steps:**
-  (1) **SHIPPED 2026-09-02 (#2369)** — the interim: the checker refuses the DECLARATION at its
-  own line with one message naming the rule, on all three spellings, on every declaration form
-  the parser admits in a body, and in the lambda and nested-named-function positions; nothing
-  else fires. (2) **OPEN** — the scoping build, graded on D1045's list plus D1046's witness.
-  DECISIONS.md §"A `type` declared in a function body is legal and lexically scoped".
-  Compiler-side.
+- **A `type` declared in a function body is LEGAL and lexically scoped — SHIPPED (#2391).**
+  Ruled by the owner 2026-09-02 and built the same day, in two steps: (1) **#2369**, the interim
+  loud refusal at the declaration; (2) **#2391**, the scoping, which removes it. Every `type`
+  form (struct, union/literal union, recursive, generic alias, nominal `new`, `flat`) is
+  admitted in a body, scoped to the block, shadowing outer names, and free to name the enclosing
+  function's type parameters. **The mechanism is the MODULE MERGE'S, one scope in:** the parser
+  mints a body-scoped declaration under a unique name (`P` → `P$b7`), spells every reference in
+  its lexical extent at that name, and HOISTS the declaration into `progStmts` — so the
+  checker's passes 0a–0d and every emitter registry build, which read `root.progStmts` and only
+  that, work unchanged, exactly as `name$mN` already makes two modules' `Pair` two types.
+  In the PARSER because recursive descent is lexical by construction and `parseTypeAtom`'s IDENT
+  arm is the ONE substitution site every type-position name reaches. Type-parameter capture is a
+  GENERIC ALIAS (`type P = {a: T}` in `f<T>` → `type P$b7<T>`), reusing the substitution a
+  module-scope `Pair<A>` applied at a type parameter already performs. Sub-rulings both built: a
+  local NOMINAL type may not escape through an inferred return — checker ERROR at the return, at
+  three spellings including a returned closure; a structural one escapes as its shape, measured
+  through all three escape positions. D1046 closes with it — a nested NAMED function naming the
+  enclosing `T` was one loud emit reject and TWO check-clean invalid-wasm spellings the row had
+  not named, all five grading rows now `runs`. DECISIONS.md §"A `type` declared in a function
+  body is legal and lexically scoped". Compiler-side; compile-goal surface.
 - **Assertion failures locate at the MATCHER, not `expect` — SHIPPED (#2386).** Ruled by the
   owner 2026-09-02 and built the same day, std-side only. Each `std:test` matcher
   (`toEqual`/`toBeTrue`/`toBeFalse`) takes a trailing `caller: CallerLoc = __callsite__`; the

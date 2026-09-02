@@ -84,13 +84,19 @@ LOUD = ("loud check reject", "loud emit reject")
 # literals instead of lines; the literal COUNT was then right and the PREDICATE deciding which
 # literals to count was never checked against the source it reads.
 #
-# D1045 — "not yet BUILT", the wording a RULED-legal-but-unbuilt refusal reaches for. Its one
-# literal today is the body-scope `type` declaration's interim refusal, which says "ruled legal,
-# not yet built" in so many words: the owner ruled the program legal on 2026-09-02 and the
-# checker refuses it until the scoping is built. That is the concession this list is for, and it
-# arrived in the CHECKER — the direction CLAUDE.md names as the one that hides, since a gap moved
-# out of the emitter stops looking like a gap while the program compiles no better than before.
-# Counting it is what stops this interim from being free.
+# D1045 — "not yet BUILT", the wording a RULED-legal-but-unbuilt refusal reaches for. It was
+# added for the body-scope `type` declaration's interim refusal ("ruled legal, not yet built"):
+# the owner ruled the program legal on 2026-09-02 and the checker refused it until the scoping
+# was built. That is the concession this list is for, and it had arrived in the CHECKER — the
+# direction CLAUDE.md names as the one that hides, since a gap moved out of the emitter stops
+# looking like a gap while the program compiles no better than before. Counting it is what
+# stopped the interim from being free.
+#
+# THE SCOPING LANDED THE SAME DAY and the literal went with it (measured: the count falls 24 →
+# 23), so this phrase matches NOTHING today. It stays because it is a phrase, not a literal —
+# the list's own contract is "the compiler's own words rather than a curated list, so a new gap
+# is counted the day it is written". A refusal reading "ruled legal, not yet built" is exactly
+# the shape this file exists to price, and dropping the phrase would make the next one free.
 #
 # Deliberately NOT added: bare "unsupported" and "are not supported". Those appear in internal
 # invariant failures (`emitNullForRet: unsupported nullable return rep`) and in genuine DESIGN

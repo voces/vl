@@ -33499,109 +33499,140 @@ Repro:
 
 ---
 
-### D1045 — a `type` declared INSIDE A FUNCTION BODY parses and is DROPPED by the checker, which is RULED legal and lexically scoped; the three faces it wore (`unknown type 'P'` at the use, a check-clean emit reject when unused, silent resolution to a shadowed OUTER declaration) are one message at the declaration since the interim, and the scoping is the build
+### D1045 — [CLOSED 2026-09-02] a `type` declared INSIDE A FUNCTION BODY parses and is DROPPED by the checker, which is RULED legal and lexically scoped; the three faces it wore (`unknown type 'P'` at the use, a check-clean emit reject when unused, silent resolution to a shadowed OUTER declaration) were one message at the declaration under the interim, and the scoping is now built
 
-**loud check reject AT THE DECLARATION — `` a `type` declaration is module-scope only for now
-… ; move `P` to module scope ``, exactly one message per declaration, at the `type` keyword's
-own line, on every spelling and every declaration form · INTERIM SHIPPED 2026-09-02 (#2369);
-the row stays OPEN for the scoping build · filed 2026-09-02 (vl-b7) from the owner's question;
-RULED the same day (DECISIONS.md §"A `type` declared in a function body is legal and lexically
-scoped"): legal, scoped, may name the enclosing function's type parameters**
+**runs, prints `3` — CLOSED 2026-09-02 by the SCOPING BUILD (#2391); the interim refusal
+shipped the same day (#2369) and is removed with it · was a loud check reject on the
+`unsupported-lowering` channel, clause 2 · filed 2026-09-02 (vl-b7) from the owner's question
+and RULED that day (DECISIONS.md §"A `type` declared in a function body is legal and lexically
+scoped") · zero `runs` lost, distilled corpus unmoved, rep-fuzz exact ·
+`scripts/capability-probes/body-scope-type-decl.vl` flips to RUNS, `--sites` drops 24 → 23**
+
+Fixtures: `types/body-scope-type-decl-shadows-module.vl` (the shadowing spelling),
+`…-forms.vl` (nine declaration forms and nesting positions), `…-positions.vl` (the position
+matrix, every row annotated AND un-annotated), `types/body-scope-local-struct-escapes.vl`,
+`types/error-body-scope-nominal-escapes-return.vl`, and `vl_fmt_test.ts`'s round-trip.
 
 Repro:
 
+    type P = { x: i32 }
     function f(): i32 {
       type P = { x: i32, y: i32 }
       const p: P = { x: 1, y: 2 }
       return p.x + p.y
     }
     print(f())
-    // 2:2: a `type` declaration is module-scope only for now (D1045 — ruled legal, not yet built); move `P` to module scope
+    // 3
 
-* **THREE BEHAVIOURS FOR ONE MECHANISM, seed 42604b65 — and what each is since #2369:**
+* **THE FOUR ROWS OF THE FILED TABLE, on the closing seed.** The shadowing spelling is the one
+  the build is graded on, because it is the face that was WRONG rather than merely refused.
 
-  | spelling | before the interim | since #2369 |
-  | --- | --- | --- |
-  | local `P`, used by name (as filed) | **check reject** `unknown type 'P'` at the use (line 3) | the declaration's message, line 2, alone |
-  | local `P`, never used by name | `vl check` clean → **`emitProgram: unsupported statement in body`** (clause 2) | the declaration's message, line 2, alone |
-  | local `type P = { x: i32, y: i32 }` shadowing a module-scope `type P = { x: i32 }` | resolves to the OUTER `P`: `no field 'y' on P` **plus** an object-literal complaint about `y` — two diagnostics, neither naming the problem | the declaration's message, line 3 (its own), alone |
-  | a nested NAMED `function` in the same position | RUNS (`42`) — the precedent the ruling follows | RUNS (`42`), unchanged |
+  | spelling | before the interim | under the interim (#2369) | now |
+  | --- | --- | --- | --- |
+  | local `P`, used by name | check reject `unknown type 'P'` at the USE | the declaration's message, line 2 | **runs** |
+  | local `P`, never used by name | `vl check` clean → `emitProgram: unsupported statement in body` | the declaration's message, line 2 | **runs** |
+  | local `P` shadowing a module `P` of ANOTHER shape | resolves to the OUTER `P`: `no field 'y' on P` **plus** an object-literal complaint | the declaration's message, line 3 | **runs, prints `3`** |
+  | a nested NAMED `function` in the same position | runs (`42`) — the precedent the ruling follows | runs (`42`) | runs (`42`) |
 
-* **MECHANISM.** `parseStmt` (`parser.vl`) is shared between module and block scope and
-  dispatches `TYPE` to `parseTypeDecl` wherever it stands, so the declaration parses in a
-  body. The checker registers type names only from the module-level statement walk
-  (`fillTypeDeclAt` over the top-level `stmts`, `typecheck.vl` ~27030); a `TypeDecl` node
-  inside a body was never visited, never registered and never diagnosed. Name resolution
-  (`nameToTy` / `resolveAnnot`) is module-wide, which is why the shadowing spelling finds the
-  outer name and why scoping is a real build rather than a registration fix. The interim
-  changed only the LAST of those three: the declaration is diagnosed where it stands and its
-  name is poisoned to the error type. It is still never registered, and registration under a
-  lexical scope is exactly what the build owes.
+* **THE MECHANISM IS THE MODULE MERGE'S, ONE SCOPE IN — not a second one.** The merge already
+  renames every top-level declaration `name` → `name$mN` for exactly this reason, and
+  `typecheck.tyToStr`'s own header says why: *"`Pair$m1` and `Pair` are different types to the
+  tables that hold them (two modules can each declare a `Pair`)"*. Two FUNCTIONS can each
+  declare a `P`, so the answer is the same one: the parser mints a body-scoped declaration
+  under a unique name (`P` → `P$b7`), spells every reference in its lexical extent at that
+  name, and HOISTS the declaration node into `progStmts`. `demangleMsg` strips `$b<digits>`
+  beside `$m<digits>` on the way to a person, so nothing user-facing changes.
 
-* **THE INTERIM — SHIPPED 2026-09-02 (#2369).** The checker refuses a `TypeDecl`/`UnionDecl`
-  that is not a top-level statement, at the DECLARATION, with `` a `type` declaration is
-  module-scope only for now (D1045 — ruled legal, not yet built); move `P` to module scope ``.
-  Measured on all three spellings above and on every declaration form the parser admits in a
-  body (struct, union, literal union, recursive, generic alias `Pair<A>`, nominal `new`,
-  `flat type`) plus the arrow-lambda and nested-named-function positions: each produces THIS
-  message, at the declaration's own line, naming its own name, and NOTHING else. Pinned by
-  `tests/cases/types/error-body-scope-type-decl-shadows-module.vl` (the shadowing spelling,
-  the face that was wrong rather than merely refused) and `…-forms.vl` (all ten forms and
-  positions); the corpus's strict rule — every diagnostic must be declared by a directive —
-  is what makes those files assert "and nothing else".
+  **IN THE PARSER, because recursive descent is lexical by construction.** "The rest of this
+  block" and "the enclosing function's type parameters" are both already on the parser's stack;
+  every other pass would rebuild them, and the checker has several statement-list readers — a
+  missed one would be a SILENT hole, which is the position-matrix mistake the interim's own
+  note (a) named. `parseTypeAtom`'s IDENT arm is the ONE substitution site, and it is total by
+  the grammar rather than by a list of positions: every type-position identifier in the
+  language reaches that atom.
 
-  Three things worth carrying to the build. **(a) The refusal is an ARENA SCAN, in
-  `refuseBodyTypeDecls`, running before pass 0a — deliberately, over the statement walk.**
-  `parseStmt` is one production shared by both scopes, so the declaration can stand anywhere a
-  statement can, and the checker has several statement-list readers: enumerating the positions
-  is the position-matrix mistake in miniature, and a missed reader would be a SILENT hole
-  (check-clean, dying at `emitProgram: unsupported statement in body`). "Declared, and not a
-  top-level statement" decides it without naming a position. The module-scope set is taken from
-  EVERY `Program` node in the arena, since the driver merges the module graph into a
-  synthesized root while each module's own root stays behind. **(b) The cascade suppression is
-  a NAME SET (`cBodyTyDeclNames`), consulted by `declaredTyOfName` and `applyGenAliasArgs`
-  before their registries** — without it the used-by-name spelling keeps `unknown type 'P'` at
-  the USE and the shadowing spelling keeps resolving to the OUTER shape, i.e. the refusal at
-  the declaration would be a THIRD diagnostic instead of the only one. It is program-wide
-  rather than lexical (lexical scoping is the build this stands in for), and a generic alias
-  banks both `Pair<A>` and `Pair` because the two registries reach it under different names.
-  **(c) The diagnostic anchors at the node's START token** (`tErrAtNodeStartCoded`, a new
-  category-coded twin of `tErrAtNodeStart`): the default anchor is the node's LAST token, so a
-  multiline `type P = {\n x: i32\n}` would report at the closing brace instead of at the `type`
-  keyword the message tells the reader to move.
+  **THE HOIST IS WHAT MAKES THE REST FREE, and it was measured rather than assumed.** The
+  checker's passes 0a–0d and every emitter registry build — `collectS`, `collectU`,
+  `gaeCollectDecls`, `collectNestedFieldShapes`, `collectVariantFields`, `resolveFlatLayouts` —
+  read `root.progStmts` and ONLY `root.progStmts` (`emit_sections.vl:4394` is literally
+  `const stmts = root.progStmts`). Widening those ~15 walks is the position matrix again; one
+  unique name in the list they already read is the same result with nothing to keep in step.
+  Downstream diff: a `TypeDecl`/`UnionDecl` no-op arm in `wasmEmit.emitStmt` (the declaration
+  still stands at its lexical position and emits nothing there), the two node kinds added to
+  `isStmtNode`, and two DOUBLE-VISIT guards — see the next bullet.
 
-  It is on the `unsupported-lowering` channel, so `scripts/goal-scoreboard.py --sites` counts
-  it: 22 → **23** capability literals, the one new site being this one. That is the interim
-  paying its own price — a gap moved out of the emitter and into the checker is the direction
-  CLAUDE.md names as the one that hides, and `scripts/capability-probes/body-scope-type-decl.vl`
-  is the standing witness that flips to RUNS when the build lands.
+* **THE DECLARATION IS REACHABLE TWICE, and both consumers that must not double-count it were
+  found by RUNNING them, not by reading.** The node is in `progStmts` AND at its lexical
+  position, so `ast.isBodyTyDecl` marks it for:
 
-  `wasmEmit`'s `emitProgram: unsupported statement in body` is now UNREACHABLE for these two
-  node kinds and is deliberately left in place: it is a floor over every other statement kind
-  the emitter has no arm for, and the check-clean route to it for a `type` is what closed.
+  * **the FORMATTER.** `formatProgram` walks `progStmts` and printed a stray second copy of the
+    declaration at the end of the file — the same reason it already filters `ImportDecl`. A
+    research pass had cleared `format.vl` as "immune (verbatim source slices)", which was true
+    of the type-NAME question it was asked and false of this one. `vl fmt` on
+    `scripts/capability-probes/body-scope-type-decl.vl` is what said so.
+  * **the MODULE MERGE.** `modRwStmt`'s `Program` arm now skips such a node, because the
+    lexical visit is the one that runs with `modTyShadow` holding the enclosing function's type
+    parameters (which a declaration that CAPTURED one needs), and because a second visit would
+    run the declared name through `modTypeRenamed` — an identifier-RUN scanner that would
+    happily rename the `P` segment of an already-mangled `P$b7`. `modTypeRenamed`'s header said
+    *"types are never shadowed by locals — VL has no local type declarations"*; that sentence
+    is now false and is rewritten.
 
-* **THE BUILD (the ruling):** every `type` form is admitted in a body — struct, union and
-  literal union, recursive, generic alias, and nominal `new` — lexically scoped to the
-  block, shadowing outer names, and free to name the enclosing function's type parameters
-  (substituted per instance exactly as the body's other nodes are; D1046 is the same
-  substitution owed to nested NAMED functions). Two sub-rulings recorded with it: a local
-  NOMINAL type may not escape through the function's inferred return type (refused at the
-  checker, like any unnameable inferred type), and a structural one escapes as its shape.
-  Grading list: the four rows of the table above RUN or refuse as ruled; `type P = { a: T }`
-  inside `f<T>` at two instantiations; a local union used in an `is`; a local `new` type
-  returned (refused) and used only inside (runs); a local name shadowing a module one at
-  DIFFERENT shapes, each side resolving to its own.
+* **AND `vl fmt` PRINTS THREE NAMES FROM THE NODE, NOT FROM THE SOURCE SPAN.** An `Ident`, an
+  `is` check-type and an `as` target. A rename had never leaked into the formatter before —
+  the merge does not run for a single-file format — so a body-scoped `flat type TV` printed
+  `TV$b1.size` and a body-scoped `type Id = new i32` printed `11 as Id$b1`, neither of which
+  re-parses: `vl fmt` failed outright with `formatter produced invalid output` on a legal
+  program. Fixed by demangling at those three prints. The scan now has ONE home in the
+  zero-import leaf (`tyname.demangleSpelling`) and `typecheck.demangleMsg` delegates to it.
 
+* **TYPE-PARAMETER CAPTURE IS A GENERIC ALIAS, and the enabling fact was measured first.**
+  `type P = { a: T }` inside `f<T>` is minted as `type P$b7<T> = { a: T }` and referred to as
+  `P$b7<T>`, so substitution per instantiation is the one the language ALREADY performs — a
+  module-scope `type Pair<A>` applied at a type parameter (`const p: Pair<T> = …` inside
+  `f<T>`) runs today at two pins, which is what makes this a reuse and not a new mechanism.
+  Only the parameters the declaration MENTIONS are captured, decided by a bounded token
+  lookahead over the rest of the declaration: the answer is needed BEFORE the body is parsed,
+  because a recursive `type N = { next: N | null }` spells its own name while the body is being
+  read and has to carry the same arguments every other reference does. Capturing
+  unconditionally was rejected on a measurement — a local `type Id = new i32` in a generic body
+  would become a GENERIC newtype, which pass 0a explicitly does not support, so the declaration
+  would silently stop being nominal.
+
+* **THE NOMINAL-ESCAPE ERROR (the owner's sub-ruling), at three spellings.** `` return type
+  `Id` is declared inside `fresh` and no caller can name it; annotate the return or move `Id`
+  to module scope ``, anchored at the return's START token. It fires on an explicit `return`,
+  on the implicit trailing-expression return, and on a nominal buried INSIDE the inferred type
+  rather than being it — a returned closure `() => Id`, which names something out of scope just
+  as surely as a bare `Id` does, and is why the escape predicate descends a `TyFunc` where its
+  `nodeTyHasRepTyVar` sibling deliberately does not.
+
+  **THE OTHER TWO ESCAPE POSITIONS WERE TESTED AND NEED NO RULE, which is the ruling's second
+  sub-ruling confirmed rather than assumed.** A local nominal stored into an OUTER-SCOPE
+  container is already refused by nominal distinctness (`push: cannot add Id to i32[]`, the
+  name correctly demangled), and a local nominal used only INSIDE the function runs. A local
+  STRUCTURAL type escapes freely through all three positions —
+  `types/body-scope-local-struct-escapes.vl` — because the shape IS the type and the caller can
+  spell it.
+
+* **RESIDUE, named and measured: a RECURSIVE local type inside a GENERIC function that mentions
+  the type parameter.** `type N = { v: T, next: N | null }` inside `f<T>` captures `T`, becomes
+  the recursive generic alias `N$b1<T>`, and inherits the pre-existing module-scope refusal
+  `recursive generic type `N<i32>` is not supported — its expansion has no finite type name`.
+  That is the SAME answer the module-scope spelling gives (`type N<T> = { v: T, next: N<T> |
+  null }` refuses identically on this seed), so it is a gap the local spelling INHERITS rather
+  than one it introduces. Recursive local types in a NON-generic function run
+  (`…-forms.vl` row 4).
 
 ---
 
-### D1046 — a nested NAMED `function` inside a generic body that names the enclosing `T` in its signature is check-clean and refused at emit with D426's message; the arrow-lambda spelling of the same program RUNS
+### D1046 — [CLOSED 2026-09-02] a nested NAMED `function` inside a generic body that names the enclosing `T` in its signature is check-clean and refused at emit with D426's message; the arrow-lambda spelling of the same program RUNS
 
-**loud emit reject `parameter `T` still names an unsubstituted type parameter — a lambda
-declared inside a generic body keeps the enclosing `T` …` on a `vl check`-clean program ·
-filed 2026-09-02 (vl-b7) while measuring the precedent for D1045's ruling · D426 lifted the
-LAMBDA half of this on 2026-08-30 and its message still names a lambda; the named-declaration
-half was never on that row**
+**runs, prints `42` then `s` — CLOSED 2026-09-02 with D1045's scoping build (#2391) · was a
+loud emit reject on a `vl check`-clean program at the filed spelling, and check-clean INVALID
+WASM at two spellings the row did not name · filed 2026-09-02 (vl-b7) while measuring the
+precedent for D1045's ruling · zero `runs` lost, distilled corpus unmoved, rep-fuzz exact ·
+fixture `generics/nested-named-fn-names-enclosing-typaram.vl`**
 
 Repro:
 
@@ -33611,24 +33642,55 @@ Repro:
     }
     print(f(41) + 1)
     print(f("s"))
-    // vl check: clean
-    // emit: parameter `T` still names an unsubstituted type parameter — a lambda declared inside a generic body keeps the enclosing `T`, so its signature is interned at the unsubstituted type; …
+    // 42
+    // s
 
-* **CONTROL, same seed (42604b65):** replace line 2 with `const id = (a: T) => a` and the
-  program prints `42` then `s` — D426's per-pin lambda lifting. A nested named function is
-  the declaration form of the same thing and did not get the lifting; the refusal's own
-  sentence ("a lambda declared inside a generic body") says which form it was written for.
+* **THE ROW WAS UNDER-FILED: one of three spellings was loud, the other two were SILENT.**
+  Measured on the pre-close seed. Every arrow-lambda control ran, which is what makes the three
+  one defect and not three.
 
-* **WHY IT IS FILED BESIDE D1045 AND NOT UNDER D426.** The rule the owner agreed to on
-  2026-09-02 is "an inner declaration sees the enclosing function's type parameters", for
-  local `type`s and for named functions alike. Both are the SAME substitution — the body is
-  fresh-cloned per instantiation and every node in it is pinned — so the build that scopes
-  local types should carry this row with it, and be graded on both. Until then the message
-  should at least stop saying "lambda" for a `function` declaration.
+  | nested named function | before | now |
+  | --- | --- | --- |
+  | `function id(a: T): T` — a PARAMETER names `T` (as filed) | loud emit reject, D426's message | **runs** (`42` / `s`) |
+  | `function mk(n: i32): T` — the RETURN names `T`, no parameter does | `vl check` rc 0 → invalid wasm, `expected i32, found (ref $type)` | **runs** (`8` / `t`) |
+  | a fully CONCRETE signature that captures a `T`-typed local | `vl check` rc 0 → invalid wasm at the second instance | **runs** (`ay` / `by`) |
 
-* Grading list: the witness at two instantiations; the nested function CALLED from a
-  closure inside the body; a nested function whose RETURN names `T` but whose parameters do
-  not; recursion through the nested function (`id` calling itself) at a concrete pin.
+  The last is D943's defect at the named spelling — one lifted slot means one env struct
+  (`fnEnvIdx` is parallel to `fnStmts`), so the first instantiation's layout was the only one
+  there was. `checkParams` reads PARAMETERS only, so neither silent row was reachable by
+  narrowing or widening that message; only the per-pin cloning moves them.
+
+* **THE MECHANISM: `monoPinBodyLambdas` had no `FuncDecl` STATEMENT arm.** D426 routes a
+  lambda into `monoCloneLambdaSubst` from a `LetDecl` INITIALIZER test; a nested named function
+  is a bare statement, matched none of `LetDecl`/`RetStmt`/`ObjLit`/… and fell through the
+  walk untouched, so `collectFns`'s single lifted slot served every instance at the
+  unsubstituted type. The arm is the fix; the clone keeps its SOURCE name, because a lambda is
+  reached through the value the clone is written into while a named function is reached BY NAME
+  through the frame chain (`nestedFnDeclaredIn`).
+
+* **THE FIRST INSTANCE REPLACES THE TEMPLATE'S SLOT, and that asymmetry is forced by the
+  lookup.** `nestedFnDeclaredIn` takes the FIRST child of a frame with a matching name, and at
+  `count == 0` the instance REUSES the template's frame (`fnStmts[origFe] = nfn`) — so template
+  and clone would be two children of one frame under one name and every call in the instance
+  body would answer the unsubstituted template: a silently wrong callee rather than a loud one.
+  Later instances push and are re-pointed at their own frame by D943's existing loop.
+
+* **`fnName != ""` IS NOT THE TEST FOR "NAMED", AND READING IT AS ONE COST A `runs`.**
+  `collectFns` rewrites an anonymous lambda's empty name to `__lambda_N` BEFORE monomorphize
+  runs (`criFnIsAnonLambda`'s own header says so), so the first cut of this fix sent every
+  lifted LAMBDA down the named path. The witness was not a named function at all —
+  `function k<T>(x: T): T { const via = () => x; return via() }`, a capture-only lambda — and it
+  went from `runs` to check-clean invalid wasm, because replacing the template's slot then made
+  the "scan `fnStmts` for this node" lookup answer -1 at the second instance and
+  `monoLamNodeIsTemplate` decline the capture. Two corrections landed with it: the name test is
+  the `__lambda` prefix, and that slot lookup has one home (`monoSlotOfLamNode`) with a
+  replacement table behind it, because two call sites asked the same question with the same
+  loop and only one of them would otherwise have been fixed.
+
+* **Grading list, all five `runs`:** the filed witness at two instantiations; a nested function
+  whose RETURN names `T` but whose parameters do not; a concrete-signature nested function
+  CAPTURING a `T`-typed local at two instantiations; the nested function called FROM A CLOSURE
+  inside the body; and recursion through the nested function at a concrete pin.
 
 ---
 

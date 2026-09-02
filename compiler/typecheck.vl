@@ -1,5 +1,3 @@
-import { pushCps } from "./strutil"
-
 // A type-checker for a meaningful subset of VL, written in VL
 // (Track H / H3 self-hosting — the compiler stage after the lexer and parser).
 //
@@ -153,6 +151,7 @@ import {
   declGpParamsOf,
   fnHasTpBound,
   fnTpBoundOf,
+  isBodyTyDecl,
   tsKidCount,
   tsKidStart,
   tsKids,
@@ -296,6 +295,7 @@ import {
 import {
   annGenAppSpanEnds,
   arrElemNameRaw,
+  demangleSpelling,
   fieldNameOf,
   fieldTypeTextOf,
   fnParamsTextOf,
@@ -507,29 +507,6 @@ let scopeEC: i32[] = []
 // a bare-map struct field, and there is exactly one checker instance, so this is
 // equivalent (and keeps the full compiler self-emittable). Reset by `initChecker`.
 export let cUserTypes: {[string]: i32} = Map()
-
-// `cBodyTyDeclNames` — D1045's INTERIM: every `type` name declared inside a function
-// BODY rather than at module scope, keyed to 1 by `refuseBodyTypeDecls` (which runs
-// before pass 0a, so no resolution can happen first). A body-scope `type` is RULED legal
-// and lexically scoped (DECISIONS.md §"A `type` declared in a function body is legal and
-// lexically scoped"); until that scoping is BUILT the checker refuses the DECLARATION,
-// and this set is what keeps that refusal the ONLY diagnostic.
-//
-// It has to be a set and not just a message, because two of the three faces the dropped
-// declaration wore are SECOND diagnostics at the USE: a body-local `P` named in an
-// annotation reported `unknown type 'P'` (line 3, not the declaration's line 2), and one
-// that SHADOWS a module-scope `P` resolved to the OUTER shape and reported `no field 'y'
-// on P` — a field the local declaration does declare. Both go away when the name resolves
-// to the ERROR type instead, which is what `declaredTyOfName` and `applyGenAliasArgs`
-// consult this for.
-//
-// PROGRAM-WIDE rather than lexical, deliberately: lexical scoping IS the build this
-// interim stands in for, and a name in here has already failed the compile, so the only
-// thing the extra width can cost is the quality of other diagnostics mentioning that one
-// name in a program that is rejected either way. A generic declaration banks BOTH
-// spellings — `Pair<A>` as declared and `Pair` as applied — because the declaration
-// registry and the alias-application registry reach it under different names.
-let cBodyTyDeclNames: {[string]: i32} = Map()
 
 // ── Arena-mutation generations (the emit-side repOf memo invalidation) ───────
 // `tyMutEpoch` advances on EVERY in-place mutation of an EXISTING `T.tys` entry
@@ -2670,6 +2647,21 @@ let nwDeclNames: string[] = []
 let nwTyIxs: i32[] = []
 let nwNames: string[] = []
 let nwBaseTyIxs: i32[] = []
+// D1045 — the NOMINAL declarations that were declared INSIDE A BLOCK, keyed by
+// their mangled name. A nominal type IS its name, so one whose name goes out of
+// scope takes the nominal identity with it: a caller cannot spell the return type
+// of `function fresh() { type Id = new i32; return 7 as Id }`, and the checker
+// refuses the inferred return rather than hand back a type nothing can name
+// (DECISIONS.md, the ruling's first sub-ruling — the owner's).
+//
+// Only NOMINAL rows are here. A local STRUCTURAL type escapes freely, because the
+// shape IS the type and the caller can spell it — which is the asymmetry `new`
+// exists to draw, and is measured by `types/body-scope-local-struct-escapes.vl`.
+let nwBodyScopedNames: {[string]: i32} = Map()
+// The enclosing function's name while its body is checked, for that refusal's
+// sentence. Saved and restored beside `T.curRet` in `checkFuncDeclNode`; "" at
+// module scope and for an anonymous lambda.
+let curFnEscName = ""
 // FLAT RECORD sidecar (webcraft P1.2) — the measured layout of every
 // `flat type N = { … }` in the program, built once by `resolveFlatLayouts` after
 // the declaration passes have resolved field types, and read by exactly one
@@ -3367,7 +3359,6 @@ export function initChecker() {
   T.diags = []
   T.curRet = -1
   cUserTypes = Map()
-  cBodyTyDeclNames = Map()
   // The arena is re-minted for this program: advance BOTH generations so no
   // emit-side memo stamped under a previous program can be consulted on a
   // shared instance (advance, never reset — a reset could collide with a stamp
@@ -6987,43 +6978,33 @@ export function demangleName(nm: string) {
   nm
 }
 
-// Strip every `$m<digits>` MODULE-MERGE mangle suffix from a free-form diagnostic MESSAGE
-// — the merge renames a module's declarations `name` → `name$mN` (N = its table index),
-// an internal name that must not surface to the user. `$` is not a valid source identifier
-// char (the lexer), so the pattern is unambiguous. The message analogue of `demangleName`
-// (which strips a BARE name): a message embeds the name mid-text, and `tyToStr` can embed a
-// mangled TYPE name too (`Box$m1<i32>`), so both are cleaned by one pass over the text.
-export function demangleMsg(s: string) {
-  const out: i32[] = []
-  let i = 0
-  // STAGE 2c: the VERBATIM run is copied through a SLICE (O(1) since 2b) rather than pushed
-  // element by element, because the buffer is drained by `fromCodePoints` and `s[i]` is now
-  // a byte. This function walks DIAGNOSTIC MESSAGES — the one corner of the compiler where
-  // all 105 of its non-ASCII characters live — so the double-encode would have been visible
-  // in every em-dash of every error the compiler prints. The `$m<digits>` scan itself is
-  // pure ASCII and unit-free: `$`, `m` and the digits sit at the same offsets in either
-  // unit, and a multi-byte character's continuation bytes are all >= 0x80 and so can never
-  // be mistaken for one of them.
-  let runStart = 0
-  while i < s.length {
-    if (
-      s[i] == '$' &&
-      i + 2 < s.length &&
-      s[i + 1] == 'm' &&
-      s[i + 2] >= '0' &&
-      s[i + 2] <= '9'
-    ) {
-      pushCps(out, s.slice(runStart, i))
-      i = i + 2
-      while i < s.length && s[i] >= '0' && s[i] <= '9' { i = i + 1 }
-      runStart = i
-    } else {
-      i = i + 1
-    }
-  }
-  pushCps(out, s.slice(runStart, s.length))
-  fromCodePoints(out)
-}
+// Strip every `$m<digits>` MODULE-MERGE and `$b<digits>` BLOCK-SCOPE mangle suffix from a
+// free-form diagnostic MESSAGE — the merge renames a module's declarations `name` →
+// `name$mN` (N = its table index) and the parser renames a body-scoped `type` `P` → `P$bN`
+// (D1045), both internal names that must not surface to the user. `$` is not a valid source
+// identifier char (the lexer), so the pattern is unambiguous. The message analogue of
+// `demangleName` (which strips a BARE name at the first `$`, so it already covers both): a
+// message embeds the name mid-text, and `tyToStr` can embed a mangled TYPE name too
+// (`Box$m1<i32>`, `P$b7`), so both are cleaned by one pass over the text.
+//
+// THE TWO SUFFIXES COMPOSE, and the scan handles that for free by restarting at the
+// character after the digits: a body-scoped declaration is hoisted into `progStmts`, so the
+// merge renames it as well and `P$b7$m1` reaches here — two adjacent suffixes, both cut.
+// ONE HOME, IN THE LEAF (`tyname.demangleSpelling`). The scan was written here first
+// because a diagnostic message was its only reader; D1045 gave it a second one in the
+// FORMATTER, which prints an `Ident` name, an `is` check-type and an `as` target from
+// the node and so can now emit a mangled spelling into a file it writes back. A second
+// copy of a scan whose whole job is to agree with the renamer is exactly the shape this
+// repo has paid for before.
+//
+// STAGE 2c IS UNAFFECTED BY THE MOVE, and that is worth stating because this function
+// walks DIAGNOSTIC MESSAGES — the one corner of the compiler where all 105 of its
+// non-ASCII characters live. The leaf copies verbatim runs by SLICE and concatenates
+// them, so bytes pass through untouched; the `$m`/`$b` scan itself is pure ASCII and
+// unit-free (`$`, the letter and the digits sit at the same offsets in either unit, and
+// a multi-byte character's continuation bytes are all >= 0x80 and so can never be
+// mistaken for one of them).
+export function demangleMsg(s: string) { demangleSpelling(s) }
 
 // Bind `name` to type-arena index `ty` in the innermost scope.
 export function declare(name: string, ty: i32) {
@@ -9202,15 +9183,7 @@ export function applyGenAlias(head: string, inner: string) {
 // because the two routes must not be able to drift.
 function applyGenAliasArgs(head: string, inner: string, appIx: i32) {
   const gi = gaIndexOf(head)
-  if gi < 0 {
-    // D1045 INTERIM — a body-scope generic alias APPLIED by name (`Pair<i32>`) misses
-    // here, because only a module-scope `type Pair<A> = …` ever registers. The error type
-    // rather than -1, for the reason `declaredTyOfName`'s twin gives: -1 becomes
-    // `unknown type 'Pair<i32>'` at the use, a second diagnostic for a declaration the
-    // checker has already refused at its own line.
-    if cBodyTyDeclNames.has(head) { return TY_ERR }
-    return -1
-  }
+  if gi < 0 { return -1 }
   // The declared parameter names, read as a SLICE of the flat column — split
   // once when the alias registered (D-GAPARAM), not re-split here per
   // application. `pcount` is the declared ARITY.
@@ -9406,13 +9379,11 @@ function methodInValuePosMsg(member: string) {
 }
 
 function declaredTyOfName(name: string) {
-  // D1045 INTERIM — a name a BODY-SCOPE `type` declared resolves to the error type, and
-  // SILENTLY: `refuseBodyTypeDecls` has already reported the declaration, and that
-  // refusal is the whole diagnosis. Answered before the registries below because the
-  // shadowing spelling would otherwise find the module-scope entry and report against
-  // the OUTER shape (`no field 'y' on P`), which is the one face of this defect that is
-  // wrong rather than merely refused.
-  if cBodyTyDeclNames.has(name) { return TY_ERR }
+  // D1045 — A BODY-SCOPE `type` NEEDS NO ARM HERE. The parser mints it under a
+  // unique name and hoists the declaration into `progStmts`, so it is registered
+  // by pass 0a like any module-scope declaration and found by the `cUserTypes`
+  // lookup below; the SHADOWING spelling resolves because the reference was
+  // spelled at the local name, not because this resolver knows about scopes.
   // A BOUND in VALUE position. It is a design refusal and not a capability gap:
   // `{ toString(): string }` as a parameter type would be an existential needing
   // dynamic dispatch, and everything in VL monomorphizes (see
@@ -25135,6 +25106,12 @@ function isStmtNode(ix: i32) {
   if nd is RetStmt { return true }
   if nd is ForRange { return true }
   if nd is ForIn { return true }
+  // D1045 — a body-scoped `type` is a DECLARATION, so a block that ends in one is
+  // valueless, exactly as one ending in a `let` is. Without this the trailing
+  // declaration would be read as the block's value and a void function would be
+  // deferred as a value-return one.
+  if nd is TypeDecl { return true }
+  if nd is UnionDecl { return true }
   false
 }
 
@@ -25653,6 +25630,11 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   daClear()
   const savedRet = T.curRet
   T.curRet = ret
+  // D1045: the name the nominal-escape refusal puts in its sentence. An anonymous
+  // lambda keeps the ENCLOSING function's name, which is the scope the declaration
+  // is actually inside.
+  const savedEscName = curFnEscName
+  if n.fnName != "" { curFnEscName = n.fnName }
   // LSP: the function name binds in the OUTER scope (decl-scope chain), but its
   // body — params + statements — is checked under this pushed scope. Record the
   // name occurrence against the enclosing decl scope before descending.
@@ -25743,6 +25725,9 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
           // A value-producing trailing expression is a value return POSITION (vs a
           // bare trailing statement); the redundant-return fixpoint defers only these.
           if !isStmtNode(stmts[s]) { fnSawValueRet = true }
+          // D1045 — the IMPLICIT return of the same rule: the trailing expression
+          // is what a caller receives, so a body-scoped nominal escapes here too.
+          if !isStmtNode(stmts[s]) { refuseLocalNomEscape(stTy, stmts[s]) }
           noteInferredRet(inferRetTyOf(stmts[s], stTy))
         } else {
           // Redundant-return rule: witness the trailing expression's NATURAL type
@@ -25846,6 +25831,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   // `popScope` below would drop. The flag is consumed after `ret` is finalized.
   const bodyTotalForRet = nodeIsTotal(n.fnBody)
   T.curRet = savedRet
+  curFnEscName = savedEscName
   daRestore(daSavedUnassigned)
   let tpPop = 0
   while tpPop < n.fnTyParams.length {
@@ -27462,89 +27448,6 @@ function forceDeclFill(name: string) {
   0
 }
 
-// D1045's INTERIM refusal, shared by the two declaration node kinds the parser splits a
-// `type` into (a `{`-bodied one is a `TypeDecl`, everything else — union, literal union,
-// nominal `new`, plain alias — is a `UnionDecl`). ONE message, at the `type` keyword's own
-// token (`pos` on both nodes, set by `parseTypeDecl`), naming the declared name AS
-// WRITTEN: `Pair<A>` for a generic alias, because that is the spelling the parser folded
-// the parameters into and the spelling the reader has to move.
-//
-// `CODE_UNSUPPORTED_LOWERING` and not a plain `tErr`: the ruling is that this program is
-// LEGAL, so the diagnostic belongs on the capability channel ("type-valid but cannot
-// build") rather than in the type system's verdict vocabulary. That is also the honest
-// bookkeeping — `scripts/goal-scoreboard.py` counts a conceding refusal as the clause-2
-// violation this interim IS, so moving the gap from the emitter into the checker cannot
-// hide it. Anchored at the node's START (`tErrAtNodeStartCoded`) because the default
-// anchor is the node's LAST token: a multiline `type P = {\n  x: i32\n}` would otherwise
-// report at the closing brace, not at the `type` keyword the message names.
-function refuseBodyTyDecl(name: string, ix: i32) {
-  tErrAtNodeStartCoded(
-    "a `type` declaration is module-scope only for now (D1045 — ruled legal, not yet built); move `" +
-      name +
-      "` to module scope",
-    ix,
-    CODE_UNSUPPORTED_LOWERING,
-  )
-  cBodyTyDeclNames[name] = 1
-  // A generic alias is reached under TWO names — `Pair<A>` by the declaration registry,
-  // `Pair` by the application registry — so bank the base too (`""` for a plain name).
-  const base = declGpBaseOf(ix)
-  if base.length > 0 { cBodyTyDeclNames[base] = 1 }
-  0
-}
-
-// D1045 INTERIM — refuse every `type` declaration that does not stand at MODULE scope,
-// before pass 0a so nothing has resolved a name yet.
-//
-// WHY AN ARENA SCAN AND NOT THE STATEMENT WALK. `parseStmt` is shared between module and
-// block scope and dispatches `TYPE` wherever it stands, so one of these nodes can sit in
-// a function body, a nested named function, an arrow-lambda body, an `if`/`while`/`for`
-// block or a `match` arm — and the checker has several statement-list readers, so
-// enumerating the positions is the position-matrix mistake in miniature: a missed reader
-// is a SILENT hole (the program stays `vl check`-clean and dies at
-// `emitProgram: unsupported statement in body`, which is the clause-2 face this closes).
-// The arena holds every node the parser built and the parser is the ONLY producer of
-// these two kinds, so "declared, and not a top-level statement" decides it without naming
-// a single position.
-//
-// The module-scope set is taken from EVERY `Program` node in the arena rather than from
-// the root being checked: the driver merges the module graph into a synthesized root
-// (`driver.vl`'s `mkProgram(allStmts, -1)`) while each module's own root stays in the
-// arena, and reading one root would refuse another module's top-level declarations the
-// moment anything checks a single file's root directly.
-function refuseBodyTypeDecls() {
-  const isTop: i32[] = []
-  let z = 0
-  while z < P.nodes.length {
-    isTop.push(0)
-    z = z + 1
-  }
-  let px = 0
-  while px < P.nodes.length {
-    const pn = P.nodes[px]
-    if pn is Program {
-      const ps = pn.progStmts
-      let q = 0
-      while q < ps.length {
-        const sx = ps[q]
-        if sx >= 0 && sx < isTop.length { isTop[sx] = 1 }
-        q = q + 1
-      }
-    }
-    px = px + 1
-  }
-  let ix = 0
-  while ix < P.nodes.length {
-    if isTop[ix] == 0 {
-      const nd = P.nodes[ix]
-      if nd is TypeDecl { refuseBodyTyDecl(nd.tdName, ix) }
-      else if nd is UnionDecl { refuseBodyTyDecl(nd.udName, ix) }
-    }
-    ix = ix + 1
-  }
-  0
-}
-
 // The program root: pass 0 registers `type` declarations (structs, then unions over
 // them), pass 1 hoists function signatures (call-before-decl + mutual recursion),
 // pass 2 checks every top-level statement.
@@ -27575,6 +27478,7 @@ function checkProgramNode(n: Program) {
   nwTyIxs = []
   nwNames = []
   nwBaseTyIxs = []
+  nwBodyScopedNames = Map()
   flNames = []
   flSizes = []
   flFStart = []
@@ -27586,11 +27490,6 @@ function checkProgramNode(n: Program) {
   flFOff = []
   cLitUnionCopyTyIxs = []
   cLitUnionCopyAliasIxs = []
-  // Pass 0−: D1045's INTERIM. Refuse every `type` declaration that is not a top-level
-  // statement, and bank its name, BEFORE pass 0a registers anything — so a body-local
-  // name is already poisoned to the error type by the time any annotation resolves and
-  // the declaration's own refusal is the only diagnostic the program gets.
-  refuseBodyTypeDecls()
   // Pass 0: register top-level struct `type` declarations BEFORE anything else, so
   // a struct name in a param/return/let annotation (pass 1/2) or in a later struct's
   // field resolves via `nameToTy`. Types register in source order, so a field may
@@ -27733,7 +27632,10 @@ function checkProgramNode(n: Program) {
           cUserTypesVer = cUserTypesVer + 1
           cTyIxSetAdd(cStructTyIxs, cStructTyIxSet, sIx0)
           cStructNames.push(sd0.tdName)
-          if sd0.tdNew == 1 { nwDeclNames.push(sd0.tdName) }
+          if sd0.tdNew == 1 {
+            nwDeclNames.push(sd0.tdName)
+            if isBodyTyDecl(stmts[t0]) { nwBodyScopedNames[sd0.tdName] = 1 }
+          }
         }
       }
     } else if sd0 is UnionDecl {
@@ -27761,7 +27663,10 @@ function checkProgramNode(n: Program) {
       cUserTypesVer = cUserTypesVer + 1
       cTyIxSetAdd(cUnionTyIxs, cUnionTyIxSet, uIx0)
       cUnionNames.push(sd0.udName)
-      if sd0.udNew == 1 { nwDeclNames.push(sd0.udName) }
+      if sd0.udNew == 1 {
+        nwDeclNames.push(sd0.udName)
+        if isBodyTyDecl(stmts[t0]) { nwBodyScopedNames[sd0.udName] = 1 }
+      }
     }
     t0 = t0 + 1
   }
@@ -31969,6 +31874,94 @@ function tyHasRepHoleAt(tyIx: i32, depth: i32) {
   }
   // A `TyFunc` is deliberately NOT descended into — see the header.
   false
+}
+
+// D1045's NOMINAL-ESCAPE rule (DECISIONS.md, the owner's sub-ruling). The SOURCE
+// name of a body-scoped nominal type reachable inside `tyIx`, or "".
+//
+// IT DESCENDS `TyFunc`, unlike the predicate above, and for the opposite reason:
+// that one asks about a REP the parameter slot has to pick, this one asks whether
+// a CALLER could write the type down. `function fresh() { type Id = new i32;
+// return (): Id => 7 as Id }` hands back `() => Id` — a type whose spelling names
+// something out of scope just as surely as a bare `Id` does.
+//
+// The name is DEMANGLED, because it goes into a sentence a person reads and the
+// `$b7` suffix is the parser's bookkeeping (`demangleName` cuts at the first `$`,
+// which also drops a merge suffix stacked on top of it).
+function localNomEscapeAt(tyIx: i32, depth: i32): string {
+  if tyIx < 0 { return "" }
+  if depth > 8 { return "" }
+  const nwn = nomNameOfTy(tyIx)
+  if nwn != "" {
+    if nwBodyScopedNames.has(nwn) { return demangleName(nwn) }
+  }
+  const t = T.tys[tyIx]
+  if t is TyArray { return localNomEscapeAt(t.aElem, depth + 1) }
+  if t is TyNullable { return localNomEscapeAt(t.nInner, depth + 1) }
+  if t is TyMap {
+    const k = localNomEscapeAt(t.mKey, depth + 1)
+    if k != "" { return k }
+    return localNomEscapeAt(t.mVal, depth + 1)
+  }
+  if t is TyObj {
+    const ofts = t.objFieldTypes
+    let i = 0
+    while i < ofts.length {
+      const f = localNomEscapeAt(ofts[i], depth + 1)
+      if f != "" { return f }
+      i = i + 1
+    }
+    return ""
+  }
+  if t is TyUnion {
+    const ums = t.uMembers
+    let u = 0
+    while u < ums.length {
+      const m = localNomEscapeAt(ums[u], depth + 1)
+      if m != "" { return m }
+      u = u + 1
+    }
+    return ""
+  }
+  if t is TyFunc {
+    const ps = t.fnParamTypes
+    let p = 0
+    while p < ps.length {
+      const a = localNomEscapeAt(ps[p], depth + 1)
+      if a != "" { return a }
+      p = p + 1
+    }
+    return localNomEscapeAt(t.fnRet, depth + 1)
+  }
+  ""
+}
+
+// Refuse an INFERRED return that carries a body-scoped nominal type. Called from
+// the two sites that witness a pending function's result — the explicit `return`
+// and the trailing expression — so the diagnostic lands on the RETURN, which is
+// where the repair is written ("annotate the return", or move the declaration).
+//
+// A DECLARED return is untouched: writing `: Id` inside `fresh` is the author
+// saying they meant it, and the ruling's remedy clause offers exactly that.
+function refuseLocalNomEscape(t: i32, at: i32) {
+  if t < 0 { return 0 }
+  const nm = localNomEscapeAt(t, 0)
+  if nm == "" { return 0 }
+  // ANCHORED AT THE NODE'S START, because `nodeToks`'s default is its LAST token:
+  // `return (): Handle => 1 as Handle` would otherwise report at the closing
+  // `Handle` of the lambda, a whole expression away from the `return` the message
+  // tells the reader to annotate.
+  tErrAtNodeStart(
+    "return type `" +
+      nm +
+      "` is declared inside `" +
+      demangleName(curFnEscName) +
+      "` and no caller can name it; annotate the return or move `" +
+      nm +
+      "` to module scope",
+    at,
+  )
+  0
 }
 // STRUCTURAL: node `ix`'s type is `boolean | null` (the i32 sentinel-2 niche) — a
 // `TyNullable` whose inner is the `boolean` prim. Lets `exprNulBool` recover the niche
@@ -38399,6 +38392,8 @@ function checkRetStmtNode(n: RetStmt, ix: i32) {
     // `assignable(void, void)` holds under an explicit `: void`. A void body still
     // returns from a BARE `return`, or by ending in the call as a statement.
     if voidValueSlotErr(rArgTy, n.retArg, "return", ix) { return TY_VOID }
+    // D1045 — a body-scoped NOMINAL type may not escape through an INFERRED return.
+    refuseLocalNomEscape(rArgTy, ix)
     noteInferredRet(inferRetTyOf(n.retArg, rArgTy))
     return TY_VOID
   }

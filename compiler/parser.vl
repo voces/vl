@@ -74,6 +74,7 @@ import {
   TS_PAREN,
   TS_UNION,
   setAnnTs,
+  setBodyTyDecl,
   setDeclBound,
   setDeclGp,
   setFnTpBound,
@@ -478,6 +479,224 @@ function expectTypeGt() {
 // plain `>` closing the inner application banks nothing, so its `|` still extends the
 // argument. Two spellings, two trees, from the same continuation token.
 function atTypeCont(kind: TokKind) { pendingGt == 0 && peekKind() == kind }
+
+// ── D1045: block-scoped `type` declarations ──────────────────────────────────
+// A `type` declared inside a block is LEXICALLY SCOPED (DECISIONS.md §"A `type`
+// declared in a function body is legal and lexically scoped"). The scope is
+// implemented HERE, in the parser, for one reason: recursive descent is lexical
+// by construction, so "the rest of this block" and "the enclosing function's type
+// parameters" are both already on the stack — every other pass would have to
+// rebuild them, and the checker has several statement-list readers, so a missed
+// one would be a SILENT hole rather than a diagnostic (D1045's interim note (a)).
+//
+// THE MECHANISM IS THE MODULE MERGE'S, not a second one. The merge renames every
+// top-level declaration `name` → `name$mN` precisely so that two modules' `Pair`
+// are two types to the tables that hold them (`typecheck.tyToStr`'s header says
+// so), and `demangleMsg` strips the suffix on the way to a person. A body-scoped
+// `type` is the same problem one scope in — two functions may each declare a `P`
+// — so it takes the same answer: the declaration is minted under a unique name
+// (`P` → `P$b7`), every reference in its lexical extent is spelled at that name,
+// and the declaration node is HOISTED into `progStmts` (`parseProgram`). Every
+// consumer that looks a type up BY NAME — `cUserTypes`, the generic-alias and
+// newtype registries, the emitter's per-declaration walks, canon — then works
+// unchanged, which is what makes this a scoping change and not a rep change.
+//
+// TYPE-PARAMETER CAPTURE IS A GENERIC ALIAS. `type P = { a: T }` inside `f<T>` is
+// minted as `type P$b7<T> = { a: T }` and referred to as `P$b7<T>`, so the
+// substitution per instantiation is the one the language already performs for a
+// module-scope `Pair<A>` applied at a type parameter (measured: `Pair<T>` inside
+// `f<T>` runs at two pins). Only the parameters the declaration MENTIONS are
+// captured — an unmentioned one would make an unrelated declaration generic, and
+// `type Id = new i32` in a generic body would silently stop being a newtype (a
+// generic newtype is not in this phase; `typecheck`'s pass 0a says so).
+let btDepth = 0
+// The scope chain, innermost LAST: the SOURCE name as written, the mangled base
+// it was minted under, and the captured type parameters comma-joined ("" when the
+// declaration captured none).
+let btNames: string[] = []
+let btBases: string[] = []
+let btArgs: string[] = []
+// Whether the row's name is also spelled in VALUE position. Two forms are: a
+// `flat type TV` answers `TV.size` / `TV.field` as a constant fold, and a nominal
+// `type Id = new …` is the declaration whose name a future constructor spelling
+// would take. Set after the `new` marker is read (it sits past the `=`), which is
+// why it is a column rather than part of the push.
+let btIsNew: boolean[] = []
+// The enclosing functions' live type parameters, outermost first.
+let btTyParams: string[] = []
+// The mint counter and the hoist list, both per PROGRAM (`parseProgram` resets
+// them): a name only has to be unique within its module, because the merge
+// renames each module's top-level declarations — these included — apart.
+let btSeq = 0
+let btHoisted: i32[] = []
+// The declaration currently being parsed, when it is body-scoped: its mangled
+// base, or "" at module scope. Read by the five `mkTypeDecl`/`mkUnionDecl` exits.
+let btPendingBase = ""
+
+// The innermost scope row binding `name`, or -1. The walk stops at the first
+// match, which IS the shadowing rule: an inner `type P` hides an outer one, and
+// an outer one hides the module-scope declaration (which is not in this table at
+// all, so an unmatched name falls through to module resolution unchanged).
+function btLookup(name: string): i32 {
+  let i = btNames.length - 1
+  while i >= 0 {
+    if btNames[i] == name { return i }
+    i = i - 1
+  }
+  -1
+}
+
+// Trim the three scope columns back to `saved` rows (rebuilt rather than popped —
+// a bare `.pop()` STATEMENT is an emit gap in the native pipeline, the same reason
+// `driver.modTrimTo` exists).
+function btTrimTo(saved: i32) {
+  const ns: string[] = []
+  const bs: string[] = []
+  const as: string[] = []
+  const nw: boolean[] = []
+  let i = 0
+  while i < saved {
+    ns.push(btNames[i])
+    bs.push(btBases[i])
+    as.push(btArgs[i])
+    nw.push(btIsNew[i])
+    i = i + 1
+  }
+  btNames = ns
+  btBases = bs
+  btArgs = as
+  btIsNew = nw
+  0
+}
+
+function btTyParamsTrimTo(saved: i32) {
+  const keep: string[] = []
+  let i = 0
+  while i < saved {
+    keep.push(btTyParams[i])
+    i = i + 1
+  }
+  btTyParams = keep
+  0
+}
+
+// The live type parameters the REST of this declaration mentions, in declaration
+// order — the capture set of a body-scoped `type`.
+//
+// A TOKEN LOOKAHEAD, not a walk of the parsed body, because the answer is needed
+// BEFORE the body is parsed: a self-reference (`type N = { next: N | null }`) is
+// spelled while the body is being read, and it has to carry the same arguments
+// every other reference does. Deciding afterwards would leave the self-reference
+// at the wrong arity with no way to widen a finished spelling node.
+//
+// The scan is a statement scan: it ends at a NEWLINE/`;` at nesting depth 0 — or
+// at the `}` that closes the enclosing block — and steps over a newline that a
+// multiline union continues with a leading `|`. Over-scanning would only capture
+// a parameter the declaration does not mention, which costs an unused alias
+// parameter; under-scanning would leave `T` unbound, so the continuation case is
+// handled rather than left to chance.
+function btCaptureScan(): string[] {
+  const out: string[] = []
+  if btTyParams.length == 0 { return out }
+  const seen: boolean[] = []
+  let s = 0
+  while s < btTyParams.length {
+    seen.push(false)
+    s = s + 1
+  }
+  let depth = 0
+  let i = P.pos
+  let going = true
+  while going && i < P.toks.length {
+    const t = P.toks[i]
+    const k = t.kind
+    if k == "EOF" {
+      going = false
+    } else if k == "LBRACE" || k == "LPAREN" || k == "LBRACK" {
+      depth = depth + 1
+    } else if k == "RBRACE" || k == "RPAREN" || k == "RBRACK" {
+      if depth == 0 { going = false } else { depth = depth - 1 }
+    } else if k == "NEWLINE" || k == "SEMI" {
+      if depth == 0 {
+        let j = i + 1
+        while j < P.toks.length && P.toks[j].kind == "NEWLINE" { j = j + 1 }
+        if j < P.toks.length && P.toks[j].kind == "PIPE" {
+          i = j
+        } else {
+          going = false
+        }
+      }
+    } else if k == "IDENT" {
+      let p = 0
+      while p < btTyParams.length {
+        if btTyParams[p] == t.text { seen[p] = true }
+        p = p + 1
+      }
+    }
+    i = i + 1
+  }
+  let q = 0
+  while q < btTyParams.length {
+    if seen[q] { out.push(btTyParams[q]) }
+    q = q + 1
+  }
+  out
+}
+
+// Join a captured-parameter list into the comma-separated argument text a
+// reference spells (`"T,U"`), and push one `TS_NAME` leaf per parameter so the
+// reference's `TS_APP` closes over them as its trailing arguments.
+function btCaptureText(caps: string[]): string {
+  let out = ""
+  let i = 0
+  while i < caps.length {
+    if i > 0 { out = out + "," }
+    out = out + caps[i]
+    i = i + 1
+  }
+  out
+}
+
+function btPushCaptureLeaves(capt: string) {
+  let start = 0
+  let i = 0
+  while i <= capt.length {
+    if i == capt.length || capt[i] == ',' {
+      if i > start { tsMk(TS_NAME, capt.slice(start, i), tsMark()) }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  0
+}
+
+// A `flat type` and a nominal `new` type are the `type` forms whose declared name
+// is also spelled in EXPRESSION position — `TV.size` / `TV.field` fold against the
+// flat layout — so an identifier naming one renames like its annotation does. This
+// is the same answer the module merge gives: `modBuildRename` reads `fnName`,
+// `letName`, `tdName` and `udName` into ONE table, so a module-scope declaration's
+// name is already renamed by the VALUE reader (`modRenamed`) wherever it appears.
+//
+// Restricted to those rows on purpose. A plain struct / union / alias name has no
+// meaning in expression position, so renaming one could only ever capture an
+// unrelated binding that happens to share the spelling.
+function btValueName(name: string): string {
+  const row = btLookup(name)
+  if row < 0 { return name }
+  if !btIsNew[row] { return name }
+  btBases[row]
+}
+
+// Record a body-scoped declaration node: marked for the two consumers that must
+// not double-count it (the formatter's top-level walk and the module merge — see
+// `ast.bodyTyDeclNode`) and queued for the hoist into `progStmts`.
+function btNoteDecl(ix: i32) {
+  if btPendingBase == "" { return 0 }
+  setBodyTyDecl(ix)
+  btHoisted.push(ix)
+  0
+}
+
 // A type-name leaf (`i32`, `string`, a user type), optionally followed by one or
 // more `[]` array suffixes (`i32[]`, `i32[][]`). Each `[]` appends the literal
 // chars to the type-name, so an array type is a `TypeRef` whose name carries the
@@ -753,6 +972,17 @@ function parseTypeAtom() {
     tsMk(TS_NULL, "null", tm)
   } else if peekKind() == "IDENT" {
     name = advance().text
+    // D1045 — A BLOCK-SCOPED `type` NAME RESOLVES HERE, and this is the only site
+    // that has to: every type-position identifier in the language reaches this
+    // atom, so the substitution is total by the grammar rather than by a list of
+    // positions. An unbound name is returned unchanged and resolves module-wide,
+    // which is what makes an outer/module `P` visible until a local one shadows it.
+    const btRow = btLookup(name)
+    let capt = ""
+    if btRow >= 0 {
+      name = btBases[btRow]
+      capt = btArgs[btRow]
+    }
     const head = name // the identifier alone — the name grows a `<…>` below
     if peekKind() == "LT" {
       // A generic-alias APPLICATION `Box<i32>` / `Pair<i32, string>` — in TYPE
@@ -774,7 +1004,19 @@ function parseTypeAtom() {
         }
       }
       expectTypeGt() // ">"
+      // A body-scoped GENERIC alias that also captured the enclosing function's
+      // type parameters takes them as TRAILING arguments, after its own.
+      if capt != "" {
+        name = name + "," + capt
+        btPushCaptureLeaves(capt)
+      }
       name = name + ">"
+      tsMk(TS_APP, head, tm)
+    } else if capt != "" {
+      // A body-scoped `type` that names the enclosing `T` was minted as the
+      // generic alias `P$b7<T>`; every reference to it is that application.
+      btPushCaptureLeaves(capt)
+      name = name + "<" + capt + ">"
       tsMk(TS_APP, head, tm)
     } else {
       tsMk(TS_NAME, head, tm)
@@ -846,7 +1088,7 @@ function parsePrimary() {
     // statement and expression position (like `if`).
     return parseMatch()
   }
-  if k == "IDENT" { return mkIdent(advance().text, p0) }
+  if k == "IDENT" { return mkIdent(btValueName(advance().text), p0) }
   if k == "LPAREN" {
     // `(params) => body` — an arrow lambda — when `=>` follows the matching `)`;
     // otherwise a grouped expression `(expr)`.
@@ -1614,6 +1856,51 @@ function parseTypeDecl(flatAt: i32) {
     expectClose("GT") // ">"
     name = name + ">"
   }
+  // D1045 — A BODY-SCOPED DECLARATION IS MINTED UNIQUE, AND THE SCOPE ROW GOES IN
+  // BEFORE THE BODY IS PARSED. `btDepth > 0` is "inside a block", which is exactly
+  // the ruling's scope and is the parser's own nesting rather than a list of the
+  // positions a statement can stand in — `parseStmt` is one production shared by
+  // module and block scope, so a position list is the mistake this avoids.
+  //
+  // The row is pushed here, not at the return, so a RECURSIVE local type
+  // (`type N = { next: N | null }`) resolves its own name; the row is not popped
+  // here either — the enclosing block's `btTrimTo` is what ends the scope, which
+  // is what makes the name visible to every LATER statement of the block and to
+  // the lambdas and nested functions inside them.
+  btPendingBase = ""
+  if btDepth > 0 {
+    let srcName = name
+    if gpBase != "" { srcName = gpBase }
+    btSeq = btSeq + 1
+    const mangled = srcName + "$b" + i32ToStr(btSeq)
+    const caps = btCaptureScan()
+    if caps.length > 0 || gpBase != "" {
+      // Declared generic, or made generic by CAPTURE: the captured parameters are
+      // appended AFTER the declaration's own, which is the order every reference
+      // spells them in (`parseTypeAtom`).
+      let ci = 0
+      while ci < caps.length {
+        gpNames.push(caps[ci])
+        ci = ci + 1
+      }
+      gpBase = mangled
+      name = mangled + "<"
+      let ni = 0
+      while ni < gpNames.length {
+        if ni > 0 { name = name + "," }
+        name = name + gpNames[ni]
+        ni = ni + 1
+      }
+      name = name + ">"
+    } else {
+      name = mangled
+    }
+    btNames.push(srcName)
+    btBases.push(mangled)
+    btArgs.push(btCaptureText(caps))
+    btIsNew.push(false)
+    btPendingBase = mangled
+  }
   // A bodyless `type Bar` (no `= body`) is reported ONCE, at the declaration,
   // with an actionable message — instead of cascading "expected EQUAL …" from
   // mis-parsing the following line as the body. Recover as a sentinel TypeDecl
@@ -1636,6 +1923,7 @@ function parseTypeDecl(flatAt: i32) {
     const blix = mkTypeDecl(name, bodyless, p0, 0, 0)
     if gpBase != "" { setDeclGp(blix, gpBase, gpNames) }
     mkDeclNameTok(blix, nameTok)
+    btNoteDecl(blix)
     return blix
   }
   expect("EQUAL")
@@ -1662,6 +1950,13 @@ function parseTypeDecl(flatAt: i32) {
         isNew = 1
       }
     }
+  }
+  // D1045: mark the scope row as having a VALUE-position spelling, so a `TV.size`
+  // fold renames with its annotation (`btValueName`). Read here rather than at the
+  // push because `new` sits after the `=`, and the row has to exist before the
+  // body is parsed.
+  if btPendingBase != "" && (isNew == 1 || isFlat) {
+    if btIsNew.length > 0 { btIsNew[btIsNew.length - 1] = true }
   }
   // `type N = A | B | C` — a discriminated-union ALIAS (the RHS is a type name, not
   // a `{`). Parse the `member (PIPE member)*` list into a `UnionDecl` — a member
@@ -1713,6 +2008,7 @@ function parseTypeDecl(flatAt: i32) {
     setUdTs(uix, vroots)
     if gpBase != "" { setDeclGp(uix, gpBase, gpNames) }
     mkDeclNameTok(uix, nameTok)
+    btNoteDecl(uix)
     return uix
   }
   expect("LBRACE")
@@ -1837,6 +2133,7 @@ function parseTypeDecl(flatAt: i32) {
     setDeclBound(bix, bAnn)
     if gpBase != "" { setDeclGp(bix, gpBase, gpNames) }
     mkDeclNameTok(bix, nameTok)
+    btNoteDecl(bix)
     return bix
   }
   // D188 — AN ARRAY SUFFIX ON A `{ … }` BODY, WHICH WAS SILENTLY DROPPED. `type L =
@@ -1951,6 +2248,7 @@ function parseTypeDecl(flatAt: i32) {
     setUdTs(u2ix, vroots2)
     if gpBase != "" { setDeclGp(u2ix, gpBase, gpNames) }
     mkDeclNameTok(u2ix, nameTok)
+    btNoteDecl(u2ix)
     return u2ix
   }
   P.pos = afterBrace
@@ -1959,6 +2257,7 @@ function parseTypeDecl(flatAt: i32) {
   const tdix = mkTypeDecl(name, fields, p0, isNew, flatMark)
   if gpBase != "" { setDeclGp(tdix, gpBase, gpNames) }
   mkDeclNameTok(tdix, nameTok)
+  btNoteDecl(tdix)
   tdix
 }
 
@@ -2139,6 +2438,18 @@ function parseFuncBodyAndBuild(
   // (`function makePoint() { x: 3, y: 4 }`) is the same implicit-return shape:
   // the `{` opens an expression, not a block — but EMPTY braces `{}` stay a
   // block (a void function), matching the host's tie-break.
+  // D1045 — THE BODY'S live type parameters. A `type` declared in this body may
+  // NAME them (the ruling's second half), and it captures them by becoming a
+  // generic alias; the enclosing generics' parameters stay live too, so a nested
+  // function's body sees both. Pushed here rather than in `parseFuncHead` because
+  // this is the one entry every body — `function`, method, and arrow lambda —
+  // goes through, and the signature's own annotations are already parsed.
+  const btTpSaved = btTyParams.length
+  let tpi = 0
+  while tpi < typarams.length {
+    btTyParams.push(typarams[tpi])
+    tpi = tpi + 1
+  }
   if peekKind() != "LBRACE" {
     const e = parseExpr()
     const stmts: i32[] = []
@@ -2147,6 +2458,7 @@ function parseFuncBodyAndBuild(
     // FuncDecl anchors at the function form's start.
     const bix = mkFunc(name, typarams, params, ret, mkBlock(stmts, -1), funcPos)
     mkDeclNameTok(bix, nameTok)
+    btTyParamsTrimTo(btTpSaved)
     return bix
   }
   let scan = P.pos + 1
@@ -2169,11 +2481,13 @@ function parseFuncBodyAndBuild(
       funcPos,
     )
     mkDeclNameTok(oix, nameTok)
+    btTyParamsTrimTo(btTpSaved)
     return oix
   }
   const body = parseBlock()
   const fix = mkFunc(name, typarams, params, ret, body, funcPos)
   mkDeclNameTok(fix, nameTok)
+  btTyParamsTrimTo(btTpSaved)
   fix
 }
 
@@ -2531,8 +2845,14 @@ function parseFunc() { parseFuncHead(true) }
 // so nothing past the parser needs to know a body was recovered. Every unbraced
 // body rides this, `else` included since the bare-statement `else` was removed.
 function oneStmtBlock(): i32 {
+  // The recovered one-statement arm is a BLOCK, so it opens a `type` scope like
+  // any other (`parseBlock`) — a `type` declared in it is scoped to it.
+  const btSaved = btNames.length
+  btDepth = btDepth + 1
   const one: i32[] = []
   one.push(parseStmt())
+  btDepth = btDepth - 1
+  btTrimTo(btSaved)
   mkBlock(one, -1)
 }
 
@@ -2918,6 +3238,10 @@ function parseReturn() {
 function parseBlock() {
   const p0 = peekTok().start // the opening `{`
   expect("LBRACE")
+  // D1045: a block opens a `type` SCOPE. The mark is taken here and trimmed at
+  // the close, which is the whole of "lexically scoped to the block".
+  const btSaved = btNames.length
+  btDepth = btDepth + 1
   const stmts: i32[] = []
   let going = true
   while going {
@@ -2927,6 +3251,8 @@ function parseBlock() {
     else { stmts.push(parseStmt()) }
   }
   expectClose("RBRACE")
+  btDepth = btDepth - 1
+  btTrimTo(btSaved)
   mkBlock(stmts, p0)
 }
 
@@ -3269,6 +3595,19 @@ export function parseProgram() {
   // malformed) run: a banked `>` credit would silently close some later
   // unrelated generic.
   pendingGt = 0
+  // D1045: the block-scope machinery is per PROGRAM. A mint counter only has to
+  // be unique within its module — the merge renames each module's top-level
+  // declarations, these included, apart — and a leaked scope row from an earlier
+  // (possibly malformed) parse would silently rename an unrelated annotation.
+  btDepth = 0
+  btSeq = 0
+  btPendingBase = ""
+  btNames = []
+  btBases = []
+  btArgs = []
+  btIsNew = []
+  btTyParams = []
+  btHoisted = []
   const p0 = peekTok().start // the first token of the source
   const stmts: i32[] = []
   let going = true
@@ -3279,6 +3618,26 @@ export function parseProgram() {
     else if k == "IMPORT" { stmts.push(parseImport()) }
     else if k == "EXPORT" && kindAt(P.pos + 1) == "LBRACE" { skipReexport() }
     else { stmts.push(parseStmt()) }
+  }
+  // D1045 — THE HOIST. A body-scoped declaration is ALSO a top-level statement of
+  // the program: that is what makes the checker's passes 0a–0d register it and the
+  // emitter's per-declaration walks (`collectS`, `collectU`, `gaeCollectDecls`,
+  // `resolveFlatLayouts`, …) mint its rep, all of which read `progStmts` and only
+  // `progStmts`. Widening those ~15 walks instead is the position-matrix mistake;
+  // one unique name in the list they already read is the same result with nothing
+  // to keep in step.
+  //
+  // APPENDED, so a hoisted declaration registers AFTER every module-scope one. A
+  // local type may name a module type (pass 0b fills in DEMAND order, so even a
+  // forward reference resolves); a module type can never name a local one.
+  //
+  // The node stays where it lexically is as well — it is reachable twice, and
+  // `ast.isBodyTyDecl` is what the two consumers that must not double-count it ask
+  // (the module merge; the formatter re-slices the source and is immune).
+  let hi = 0
+  while hi < btHoisted.length {
+    stmts.push(btHoisted[hi])
+    hi = hi + 1
   }
   mkProgram(stmts, p0)
 }

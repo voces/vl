@@ -1,4 +1,5 @@
 import { pushCps } from "./strutil"
+import { demangleSpelling } from "./tyname"
 
 // AST-driven source formatter for the self-hosted VL front end — the VL port of
 // `compiler/format.ts` (kill-TS step 1).
@@ -94,7 +95,7 @@ import {
   UnionDecl,
   WhileStmt,
 } from "./ast"
-import { P, nodeEndOf } from "./ast"
+import { P, isBodyTyDecl, nodeEndOf } from "./ast"
 // The free INDEX-OPERATOR declaration-name encoding (B14) — the formatter prints
 // the operator back in its SOURCE spelling, not the name it declares under.
 import { opDeclOpOf } from "./ast"
@@ -584,12 +585,22 @@ export function formatProgram(progRoot: i32) {
     // `ImportDecl` nodes are FILTERED out of the statement walk: emitting them
     // there too would duplicate every import. Seed the top-level blank-line
     // policy with the last import's line.
+    //
+    // D1045 — A BODY-SCOPED `type` IS FILTERED FOR THE SAME REASON, one scope in.
+    // The parser hoists such a declaration into `progStmts` so the checker and the
+    // emitter register it (they read that list and only that list), and it stays at
+    // its lexical position inside the block as well — so the walk reaches it TWICE
+    // and printed it a second time at the end of the file. Measured, not reasoned:
+    // `vl fmt` on `scripts/capability-probes/body-scope-type-decl.vl` appended a
+    // stray `type P = { x: i32, y: i32 }` after the last statement.
     topPrevLine = emitImports()
     const stmts: i32[] = []
     let fi = 0
     while fi < root.progStmts.length {
       const fn = P.nodes[root.progStmts[fi]]
-      if !(fn is ImportDecl) { stmts.push(root.progStmts[fi]) }
+      if !(fn is ImportDecl) {
+        if !isBodyTyDecl(root.progStmts[fi]) { stmts.push(root.progStmts[fi]) }
+      }
       fi = fi + 1
     }
     emitStatements(stmts, 0)
@@ -1606,7 +1617,12 @@ function letInline(_ix: i32, node: LetDecl, indent: i32) {
 function expr(ix: i32, indent: i32, column: i32) {
   if ix < 0 || ix >= P.nodes.length { return "" }
   const n = P.nodes[ix]
-  if n is Ident { return n.identName }
+  // D1045 — DEMANGLED. This is one of three places the formatter prints a name the
+  // NODE carries rather than the source span, and a body-scoped `type` renames
+  // through all three: a `flat type TV` declared in a body becomes `TV$b1`, and its
+  // `TV.size` fold is an `Ident`. `demangleSpelling` is a no-op on every other name
+  // (`$` is not a legal identifier character).
+  if n is Ident { return demangleSpelling(n.identName) }
   if n is NumLit { return literalSlice(ix, n.numText) }
   if n is StrLit { return literalSlice(ix, n.strText) }
   if n is CharLit { return literalSlice(ix, n.charText) }
@@ -1645,7 +1661,7 @@ function matchPatFmt(patIx: i32, bindIx: i32, indent: i32) {
     const raw = trimWs(recoverType(patIx))
     if raw.length > 0 { return raw + matchBindFmt(bindIx) }
     // No span (a synthesized pattern): the check-type NAME is the canonical spelling.
-    return pn.isVariant + matchBindFmt(bindIx)
+    return demangleSpelling(pn.isVariant) + matchBindFmt(bindIx)
   }
   expr(patIx, indent, 0)
 }
@@ -1961,7 +1977,7 @@ function asExpr(_ix: i32, node: AsExpr, indent: i32, column: i32) {
   let kw = " as "
   if node.asMode == "trap" { kw = " as! " }
   if node.asMode == "null" { kw = " as? " }
-  primary(node.asObj, indent, column) + kw + node.asTy
+  primary(node.asObj, indent, column) + kw + demangleSpelling(node.asTy)
 }
 
 // Recover the check-type source of an `is` from the node's span.
