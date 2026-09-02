@@ -2435,6 +2435,29 @@ export function exprNullableStruct(exprIx: i32, fnIx: i32) {
   // non-null but shares the nullable storage, so the read is nullable-classified
   // (the consumer inserts `ref.as_non_null` before a chained field access).
   if e is Member { return memberFieldCode(exprIx, fnIx) == 15 }
+  // THE `?.` SPELLING OF THE SAME READ (D1084). `o?.f` over a code-15 field is `S | null`
+  // for the SECOND reason as well as the first — the chain itself can be null — so it is
+  // nullable-classified wherever `o.f` is.
+  //
+  // THIS ARM IS WHAT MAKES THE UN-ANNOTATED SPELLING WORK, and it is a separate fix from
+  // the emitter's code-15 arm rather than a tidy-up of it: with only the emitter arm,
+  // `const r: S | null = o?.f` runs and `const r = o?.f` is refused `bare null needs a
+  // struct-typed context` at its own `r != null` guard — the annotation was pinning the
+  // rep, which is exactly the shape CLAUDE.md names as invisible to a fixture that
+  // annotates every destination. The controls say the gap is the `?.` PRODUCER and not
+  // inference: the identical un-annotated binding from a CALL result and from a plain
+  // field read both already ran.
+  //
+  // `optChainStructIdxOf` is the resolver the EMITTER uses at this node, so classifier and
+  // emitter cannot disagree about which struct row the chain names.
+  if e is OptMember {
+    const oNsi = optChainStructIdxOf(e.omObj, fnIx)
+    if oNsi >= 0 {
+      const oNfi = sFieldIndex(oNsi, e.omProp)
+      if oNfi >= 0 { return sFieldTypeAt(oNsi, oNfi) == 15 }
+    }
+    return false
+  }
   // An INDEX into a NULLABLE-struct array (`(P | null)[]`, ref-list slot key "P | null")
   // yields `P | null` — the element legitimately holds null, so the read is NOT recovered
   // to non-null (unlike a `P[]` element). `const e = xs[i]` binds the kind-9 niche.
@@ -29581,6 +29604,29 @@ export function structIndexOfExpr(exprIx: i32, fnIx: i32) {
   }
   // A field read `o.inner` whose field is a NESTED STRUCT (code 15) yields the
   // field's target struct — so `o.inner.v` chains and `n.next` re-enters as `S|null`.
+  // THE `?.` PRODUCER (D1085's sibling one node kind over, D1084). `o?.f` over
+  // `o: T | null` with `T = {f: S}` banks `S | null`, so an `==` against another
+  // `S | null` classifies as the `nulstruct` niche and `emitNulStructEq` resolves both
+  // operands through THIS function. Every other producer of `S | null` already answered
+  // — two locals, two call results, a `(S|null)[]` element, a plain `x.f` read, a closure
+  // value call, a monomorphized `eqN<T>` instance — and only the `?.` one fell to the -1
+  // tail, which is what says this is a MISSING ARM and not a rep gap.
+  //
+  // The body is the `Member` arm's struct leg verbatim: `?.` differs from `.` only in
+  // what happens when the RECEIVER is null, and the field's declared layout — the only
+  // thing this function answers — does not depend on that. The narrowed / variant legs
+  // the `Member` arm carries below are deliberately not mirrored: a `?.` receiver must be
+  // re-readable (a name or a chain of names), so no narrowed-variant receiver reaches here.
+  if e is OptMember {
+    const osi = structIndexOfExpr(e.omObj, fnIx)
+    if osi >= 0 {
+      const ofi = sFieldIndex(osi, e.omProp)
+      if ofi >= 0 {
+        if sFieldTypeAt(osi, ofi) == 15 { return sFieldTgtStructIdx(osi, ofi) }
+      }
+    }
+    return -1
+  }
   if e is Member {
     const msi = structIndexOfExpr(e.memObj, fnIx)
     if msi >= 0 {
