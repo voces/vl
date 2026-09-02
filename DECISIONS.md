@@ -4184,6 +4184,21 @@ generic-instantiated union `T | "err"` / `T | E` at a scalar `T` refuses `no rec
 members` — measured 2026-09-02 to be about MONO-MINTED unions and not about the literal
 (D1042).
 
+**Note added 2026-09-02 (D1048), and it sharpens "the collapse lives in CANON" rather than
+contradicting it: THERE ARE TWO PRODUCERS OF A UNION'S TYPE AND THE COLLAPSE HAS TO LIVE IN
+BOTH.** The ruling's bare-literal half shipped as D1024 with the collapse at type
+construction (`unionDropSubsumedArms`, reached by all three union-construction sites). The
+MIRROR half — a litunion beside its base, `Kind | string` is `string` — needed the same drop
+a second time, on the annotation SPELLING (`canonDropSubsumedParts` in `canonEmitNameTs`'s
+union arm), because canon PRESERVES a string-litunion member (`litUnionPreserve`, and
+`mixedUnionLitAliasRegroup` for the inline spelling) where the arena drops it. Each half alone
+is a `runs → not-runs` veto, measured in both directions on two running fixtures; canon's half
+alone additionally answers `x is Kind` a silent TRUE for a non-member. The bare-literal half
+needed no canon change only because canon's `TyLit` arm already softens to the base and its
+atom dedup collapses `string|string` — the two producers agreed there BY ACCIDENT. So the
+build note's rule is right and incomplete as written: **a type-level collapse must move the
+arena AND canon, or they agree about the TYPE and disagree about the REP.**
+
 ## `is A` over same-shape struct arms is a DISCRIMINANT-VALUE test: a literal-typed field is a type that is also a value, and membership is decided by the value (owner, 2026-09-02)
 
 **Ruling.** Two struct arms that share a field-name set and differ only in a literal-typed

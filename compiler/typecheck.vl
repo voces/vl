@@ -9726,34 +9726,42 @@ function homogLitUnionBase(ty: i32): i32 {
   -1
 }
 
-// The BASE SCALAR an arm's value set sits inside when the arm is a BARE LITERAL — `"err"`
-// -> string, `3` -> i32, `1.5` -> f64 — and -1 for every other arm.
+// The BASE SCALAR an arm's value set sits inside when the arm denotes only LITERALS — a
+// BARE literal (`"err"` -> string, `3` -> i32, `1.5` -> f64) or a HOMOGENEOUS literal UNION
+// (`Kind = "a"|"b"` -> string, `N = 0|1` -> i32) — and -1 for every other arm.
 //
-// **THE LITUNION-ALIAS MIRROR IS DELIBERATELY NOT HERE, AND ITS PRICE IS TWO RUNNING
-// FIXTURES.** The ruling collapses `Kind | string` (`Kind = "a" | "b"`) to `string` as well,
-// and `homogLitUnionBase` is exactly the projection that would answer for it. Restoring it
-// here is NOT the fix, and the reason is a SECOND producer: canon's union arm preserves a
-// string-litunion member (`litUnionPreserve`) where this would drop it, so the arena would
-// say `string` while canon still spelled `K|string` and the emitter reserved a union box for
-// a plain-string binding. The bare-literal half above needs no canon change only because
-// canon's `TyLit` arm already softens to the base and its atom dedup collapses
-// `string|string` — the two producers agree by accident there, and not here. It
-// is left out because collapsing that arm makes
-// `tests/cases/literal-unions/mixed-union-litunion-arm-is-membership.vl` and
-// `is-litunion-arm-non-ident-receivers.vl` stop running: both pin `x is K` over a `K |
-// string` box as MEMBERSHIP over the payload (a tag compare answers TRUE for every string
-// the box holds, which is the silent wrong answer #1306 removed), and both pin the
-// `is K` / `is string` PAIRS that no tag scheme can green by halves. Collapse the arm and
-// `K | string | i32` reaches the emitter as `string | i32` with `K` gone, which is
-// `emitProgram: struct field type has no struct-field rep` at one fixture and invalid wasm
-// in `atomStoreIsK` at the other.
+// **THE LITUNION-ALIAS MIRROR SHIPPED 2026-09-02 (D1048), AND IT TOOK TWO PRODUCERS.** This
+// header used to record why the mirror was left out, and the reason was real: canon's union
+// arm PRESERVED a string-litunion member (`litUnionPreserve`, and the inline spelling through
+// `mixedUnionLitAliasRegroup`) where this drops it, so the arena said `string` while canon
+// still spelled `K|string` and the emitter reserved a union box for a plain-string binding.
+// The bare-literal leg needed no canon change only because canon's `TyLit` arm already
+// softens to the base and its atom dedup collapses `string|string` — the two producers agree
+// there BY ACCIDENT, and not here.
 //
-// Losing a running program is the one movement the gate refuses, so the mirror ships when
-// `is K` over a COLLAPSED base lowers as the same membership test `emitIs` already emits for
-// a standalone litunion receiver. Filed as D1048 with those two fixtures as its named set —
-// they are already fixtures, so the price stays guarded whoever tries it next.
+// EACH HALF ALONE IS A `runs → not-runs` VETO, measured in both directions on the two
+// fixtures this row named. This line alone: `is-litunion-arm-non-ident-receivers.vl` refuses
+// with `struct field type \`K|string|i32\` has no struct-field rep` and
+// `mixed-union-litunion-arm-is-membership.vl` is check-clean INVALID WASM. Canon's half
+// alone: the first refuses with `only i32 locals are supported`, the second is invalid wasm,
+// and `x is Kind` over a `Kind | string` PARAMETER answers a silent TRUE for the non-member
+// `"zz"` — the #1306 wrong answer, arriving from the other side.
+//
+// THE THIRD STEP THE ROW PRESCRIBED WAS ALREADY BUILT. `is K` over a COLLAPSED `string` base
+// is ALREADY the membership ladder `emitIs` emits for a standalone litunion receiver, at
+// every position the named set exercises — measured on master before any edit, by writing
+// the two fixtures in the spelling the collapse produces (20/20 correct, the `string | i32`
+// box and the `string | null` niche included). So the mirror needed the two PRODUCERS to
+// agree and nothing else.
 function armLiteralBaseTy(ty: i32): i32 {
   if ty < 0 { return -1 }
+  // THE LITUNION-ALIAS MIRROR (D1048) — `Kind | string` is `string` for the same reason
+  // `"a" | string` is. `homogLitUnionBase` is the projection that answers for a homogeneous
+  // literal UNION arm; the `TyLit` leg below answers for a BARE literal arm. It ships only
+  // with canon's `canonDropSubsumedParts`, which drops the same arm off the SPELLING —
+  // alone, this line is a `runs → not-runs` veto (measured, both named-set fixtures).
+  const hb = homogLitUnionBase(ty)
+  if hb >= 0 { return hb }
   const t = T.tys[ty]
   if t is TyLit { return litBaseTy(t) }
   -1
@@ -9877,8 +9885,9 @@ function unionDropSubsumedArms(members: i32[], out: i32[]): boolean {
 // THIS IS NOT THE SUBSUMPTION COLLAPSE AND MUST NOT BECOME IT. `unionDropSubsumedArms`
 // drops an arm that ADDS NO VALUES (`string | "err"` is `string`); this ADDS the literal's
 // value to a set that is still literal, so `"a" | "b" | "err"` keeps all three atoms.
-// `Kind | string` is the collapse's question, not this one, and it is still declined here
-// (`string` is a `TyPrim`, so `armLiteralBaseTy` answers -1) — see D1048.
+// `Kind | string` is the collapse's question, not this one, and it never reaches here at all
+// since D1048 — the collapse runs AHEAD of this arm in every caller and has already dropped
+// `Kind`, so what arrives is the one-member `string`.
 //
 // GATED ON `sawUnion` so the PURE literal list is untouched. `"a" | "b"` spelled inline has
 // nothing to flatten and already reaches the identical member list through the callers'
@@ -15304,6 +15313,106 @@ function litRunPartTexts(p: string, out: string[]): i32 {
   LRP_OTHER
 }
 
+// ── the SUBSUMED-ARM COLLAPSE, canon's side (D1048) ──────────────────────────────────
+// The arena drops a union arm that adds no values (`unionDropSubsumedArms`). Canon has to
+// drop the SAME arms or the two producers agree about the TYPE and disagree about the REP:
+// with the arena saying `string` and canon still spelling `Kind|string`, the emitter
+// reserves a union box for a plain-string binding. That is the whole of D1048, and it is
+// why `armLiteralBaseTy`'s litunion mirror could not ship on its own.
+//
+// ONLY THE STRING-LITUNION ARM NEEDS AN EXPLICIT RULE, and the reason the others do not is
+// worth stating because it is luck, not design. Canon's per-member render already softens a
+// bare literal (`"err"` → `string`) and a NUMERIC litunion alias (`numLitUnionAliasName`:
+// `type N = 0|1` → `i32`), and its atom dedup then collapses `string|string` / `i32|i32` to
+// the bare scalar — so those spellings agree with the arena BY ACCIDENT. A string litunion
+// is different: `nameIsLitUnionType` is the interned-atom identity, `litUnionPreserve` keeps
+// it, and `mixedUnionLitAliasRegroup` puts an alias name back even for the INLINE spelling.
+// Writing the rule out covers all three anyway, so the two producers now run one rule rather
+// than meeting in the middle.
+
+// Does the union-member spelling `p` denote a set of STRING LITERALS and nothing else? The
+// canon-side twin of `homogLitUnionBase` over the `string` base — a quoted lexeme, a
+// registered litunion ALIAS, an inline `"a"|"b"` run, a union of those, and any of them
+// inside a grouper.
+//
+// THE UNION LEG IS NOT DECORATION: `(K | K2) | string` reaches the arena as ONE flattened
+// litunion (`litUnionFlatMembers`), so `homogLitUnionBase` answers `string` for it and the
+// arm drops. `nameIsLitUnionType("K|K2")` is FALSE — that predicate reads a registered alias
+// or a run of quoted lexemes, and `K|K2` is neither — so without the recursion canon would
+// keep an arm the arena had already dropped, which is the exact disagreement this exists to
+// prevent.
+function partIsStrLitSet(p: string): boolean {
+  if p.length == 0 { return false }
+  if nameIsParenSpanEnds(p) && !isTopLevelFuncTypeName(p) {
+    return partIsStrLitSet(groupInnerOf(p))
+  }
+  if nameIsLitUnionType(p) { return true }
+  if nameHasPipe(p) && !isTopLevelFuncTypeName(p) {
+    const sub: string[] = []
+    tyTopLevelSplit(p, '|', false, sub)
+    let si = 0
+    while si < sub.length {
+      if !partIsStrLitSet(sub[si]) { return false }
+      si = si + 1
+    }
+    return true
+  }
+  const lm = litMemberTy(p)
+  if lm >= 0 {
+    const lt = T.tys[lm]
+    if lt is TyLit { return lt.litKind == "str" }
+  }
+  false
+}
+
+// The survivors of the collapse over a union spelling's top-level `parts`, and whether any
+// arm was dropped. `out` IS FILLED UNCONDITIONALLY, exactly as `unionDropSubsumedArms`
+// fills its own — the same contract, for the same reason (the walk has to see every part to
+// know whether ANY is subsumed, so `out` is already full when the answer is known).
+//
+// THE `string` ARM IS LOOKED FOR AMONG THE NON-LITERAL PARTS ONLY, which is
+// `unionMembersCarryBaseArm` read exactly rather than approximated. That walk scans every
+// member, but flattening a literal member yields its LITERALS and never the base PRIM — so a
+// literal arm can never supply the base, and `K | ("a"|"b")` (two literal sets, no `string`
+// arm) keeps both members on both sides. Asking canon's own renderer for the base is what
+// makes `type Name = string` count: `Name | K` collapses because `Name` canons to `string`,
+// which is the transparency the arena gets from `flattenVariantsInto`.
+function canonDropSubsumedParts(parts: string[], out: string[]): boolean {
+  if parts.length < 2 { return false }
+  const isLit: boolean[] = []
+  let anyLit = false
+  let i = 0
+  while i < parts.length {
+    const l = partIsStrLitSet(parts[i])
+    isLit.push(l)
+    if l { anyLit = true }
+    i = i + 1
+  }
+  // The cheap reject: no literal arm, nothing to subsume. Keeps the extra render below off
+  // every ordinary union spelling.
+  if !anyLit { return false }
+  let hasStrArm = false
+  i = 0
+  while i < parts.length {
+    if !isLit[i] {
+      if canonEmitNameAt(parts[i], RC_ROOT) == "string" { hasStrArm = true }
+    }
+    i = i + 1
+  }
+  if !hasStrArm { return false }
+  let dropped = false
+  i = 0
+  while i < parts.length {
+    if isLit[i] { dropped = true } else { out.push(parts[i]) }
+    i = i + 1
+  }
+  // A list that collapses to NOTHING cannot arise (a dropped arm needs the surviving
+  // `string` arm that subsumed it), but the guard keeps the degenerate case out of the
+  // rejoin below — the same length guard `unionDropSubsumedArms` keeps.
+  if out.length == 0 { return false }
+  dropped
+}
+
 // The registered litunion ALIAS that a MIXED union spelling's string-literal run regroups
 // into, or "" when the spelling is not mixed, carries no run of 2+ literals, or its run
 // matches no registered alias. Fills `cls` with one class per part so the substitution
@@ -15467,6 +15576,21 @@ function canonEmitNameTs(name: string, ctx: i32, root: i32) {
   if nameHasPipe(name) && !isTopLevelFuncTypeName(name) {
     const parts: string[] = []
     tyTopLevelSplit(name, '|', false, parts)
+    // THE SUBSUMED-ARM COLLAPSE (D1048), ahead of EVERY other arm — the mirror of where
+    // `annUnionInnerTy` puts it, and for the same reason: `K | string | null` is `string?`
+    // exactly as `K | string` is `string`, so the `| null` preserve below must not claim it
+    // first. RE-ENTERS on the survivors, which is that function's own shape too, so the
+    // one-member case is decided by the arms below exactly once.
+    const dsKept: string[] = []
+    if canonDropSubsumedParts(parts, dsKept) {
+      let dsJoin = dsKept[0]
+      let dsI = 1
+      while dsI < dsKept.length {
+        dsJoin = dsJoin + "|" + dsKept[dsI]
+        dsI = dsI + 1
+      }
+      return canonEmitNameTs(dsJoin, ctx, -1)
+    }
     // A nullable literal-union (`K | null`) keeps its litunion members — see `nulLitUnionPreserve`.
     const nlu = nulLitUnionPreserve(parts, ctx)
     if nlu != "" {
