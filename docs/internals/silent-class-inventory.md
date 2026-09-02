@@ -30374,11 +30374,14 @@ made this ONE row rather than four, and the close confirms it: **one channel mov
   non-identifier receiver to keep three of its rows from being coloured by this, and every
   recursive-tree walker written the obvious way hit it at its first field.
 
-* **FOUND ON THE WAY OUT, AND NOT THIS FAMILY.** `type K = f64 | K[] | { [string]: K }` —
-  a THREE-arm union with both a list and a map arm — mis-classifies an un-annotated rebind of
-  the field read as a MAP cell (`emitProgram: map op receiver is not a map` at the following
-  index read). It reproduces IDENTICALLY at the hoisted/ident spelling and on master, so the
-  D1014 ablation excludes it; it is a separate defect in `exprMap`'s field-code arm.
+* **FOUND ON THE WAY OUT, AND NOT THIS FAMILY — it is serde residue (e), already filed.**
+  `type K = f64 | K[] | { [string]: K }` — a THREE-arm union with both a list and a self-
+  referential map arm — mis-classifies an un-annotated rebind of the narrowed array arm as a
+  MAP cell (`emitProgram: map op receiver is not a map` at the following index read). It
+  reproduces IDENTICALLY at the hoisted/ident spelling and on master's published seed, so the
+  D1014 ablation excludes it, and `docs/serde-design.md`'s residue table already names it. It
+  is why this row's FIXTURE puts each arm in its OWN union: a three-arm union would have made
+  the fixture red for a reason that is not this row.
 
       type K = f64 | K[] | { [string]: K }
       type Node = { v: K }
