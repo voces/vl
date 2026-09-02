@@ -237,9 +237,13 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   wordless refusal at the BOUNDED spelling, and it closed D1001 (an unsatisfied
   instantiation was check-clean invalid wasm). The D976 substrate was NOT used and the
   reason is measured: the checker's inferred-shape column does not survive into emit, so
-  bounds ride the ANNOTATION path instead. Follow-ups filed rather than folded in: D1002
-  (dispatch is rewritten before monomorphization, so a closure-field witness loses to a
-  same-named `self`-function), D1004/D1005 (the unbounded halves), and LSP bound-member
+  bounds ride the ANNOTATION path instead. Follow-ups filed rather than folded in:
+  **D1002 and D1005 have since CLOSED (2026-09-02)** — a generic body's member dispatch is
+  now decided per instantiation (the rewrite asks the call sites what the body cannot
+  answer) and the UFCS receiver's fit is re-asked at the pin by a ninth deferred table
+  (`ufcsCstr*`) with a field-precedence guard; **D1043** is the residue those two named,
+  the disagreeing instantiation pair that shares one AST node. Still open from this list:
+  D1004 (the wordless member-access diagnostic on an unbounded `<T>`) and LSP bound-member
   completion/hover on `x: T`.
 - **Track-caller — DONE 2026-09-01 (#2235).** Both halves have shipped. The std side is
   three things and no compiler change: `export type CallerLoc = { file: string, line: i32,

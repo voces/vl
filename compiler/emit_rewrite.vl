@@ -303,14 +303,20 @@ function drwIsMapRead(ix: i32) {
 // the position, and a generic with no call site at all — each keeps the existing rewrite.
 function drwEveryInstanceTakesField(recvIx: i32, prop: string, ctx: i32) {
   if ctx < 0 { return false }
-  // The receiver's own recorded type must still be a HOLE — this is the pre-instance
-  // question and nothing else. A concrete receiver was already answered by `structIndexOfExpr`.
-  if !tyHasTyVar(nodeTyIxOf(recvIx)) { return false }
+  // ORDERED BY COST, and the order is load-bearing. `tyHasTyVar` fans out over a union's
+  // members and an object's fields to depth 12 with no memo, so on a recursive `Node`-shaped
+  // union it is exponential — asking it ahead of the two structural tests below made the
+  // compiler's own self-compile measurably slower for an answer that is `false` at every
+  // non-generic declaration.
   const fn = P.nodes[ctx]
   if fn is FuncDecl {
     if fn.fnTyParams.length == 0 { return false }
     const r = P.nodes[unwrapParen(recvIx)]
     if r is Ident {
+      // The receiver's own recorded type must still be a HOLE — this is the pre-instance
+      // question and nothing else. A concrete receiver was already answered by
+      // `structIndexOfExpr`.
+      if !tyHasTyVar(nodeTyIxOf(recvIx)) { return false }
       const ps = fn.fnParams
       let pi = -1
       let i = 0
@@ -395,12 +401,16 @@ function drwWalk(ix: i32, ctx: i32) {
         }
       }
       if si < 0 {
-        // A TYPE-PARAMETER receiver has no struct row YET, and `si < 0` is the arm that
-        // reads that as "no field, so UFCS". It is not the same fact: see
-        // `drwEveryInstanceTakesField`.
-        if !drwEveryInstanceTakesField(callee.memObj, callee.memProp, ctx) {
-          if !exprIsClosure(n.callFn, ctx) {
-            if drwSelfFnOf(uName, args.length + 1) >= 0 { ufcs = true }
+        if !exprIsClosure(n.callFn, ctx) {
+          if drwSelfFnOf(uName, args.length + 1) >= 0 {
+            // A TYPE-PARAMETER receiver has no struct row YET, and `si < 0` is the arm
+            // that reads that as "no field, so UFCS". It is not the same fact — see
+            // `drwEveryInstanceTakesField`. Asked LAST, after the `self`-function has
+            // actually matched: the predicate walks the arena and then the node table,
+            // and every `.push` / `.slice` receiver in a real program reaches this arm.
+            if !drwEveryInstanceTakesField(callee.memObj, callee.memProp, ctx) {
+              ufcs = true
+            }
           }
         }
       }

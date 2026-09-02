@@ -29585,47 +29585,61 @@ Repro (now a loud check reject naming the bound; was check-clean invalid wasm):
     // vl check -> {s: f64} does not satisfy `Showable`: no `toString(): string`
 
 ---
-### D1002 — a monomorphized member call is UFCS-rewritten BEFORE the instance exists, so a closure-FIELD witness is check-clean invalid wasm whenever a same-named `self`-function is in scope
+### D1002 — [CLOSED 2026-09-02] a monomorphized member call was UFCS-rewritten BEFORE the instance existed, so a closure-FIELD witness was check-clean invalid wasm whenever a same-named `self`-function was in scope
 
-**check-clean invalid wasm · `type mismatch: expected (ref $type), found (ref $type)` · ZERO corpus cells · reproduces on master with NO constraints syntax · PRE-EXISTING: the unbounded twin fails identically**
+**closed · was check-clean invalid wasm, and SILENTLY WRONG OUTPUT wherever the two callees shared a rep · ZERO corpus cells · the fix asks the CALL SITES what the body cannot answer**
 
 The field-versus-UFCS precedence the checker applies (a callable field wins) and the one the
-emitter applies inside a generic body are decided at different times, and the emitter's is
+emitter applied inside a generic body were decided at different times, and the emitter's was
 decided too early to be right.
 
-* **THE ORDERING IS DECLARED, not incidental.** `emit_sections.vl` states
-  `"monomorphize > dispatchRewrite …"` — the dispatch rewrite runs FIRST. So `drwWalk` meets
-  `x.m()` while `x` is still a type parameter: `structIndexOfExpr` finds no struct row, the
-  `si < 0` arm falls to `!exprIsClosure(...)`, a matching `self`-function exists, and the call
-  is rewritten to a direct call ONCE, for every instance the generic will ever have. An
-  instantiation whose type carries `m` as a closure field then calls the free function with a
-  struct it cannot take.
+* **THE ORDERING IS DECLARED, not incidental, and it still holds.** `emit_sections.vl`'s pass
+  table states `"monomorphize > dispatchRewrite …"` — verified live on 2026-09-02, not read
+  off the comment. So `drwWalk` meets `x.m()` while `x` is still a type parameter.
+  **PROBED, not inferred**: at the failing rung the receiver's recorded arena type is a type
+  VARIABLE (`si=-1 tyIx=47 hasTv=y`) where the concrete spelling reads `si=0 hasTv=n`.
+  `structIndexOfExpr` finds no struct row, the `si < 0` arm falls to `!exprIsClosure(...)`, a
+  matching `self`-function exists, and the call was rewritten to a direct call ONCE, for every
+  instance the generic will ever have.
 
 * **ABLATED, three ingredients, all required.** (1) the receiver is a generic type parameter —
   the non-generic spelling `b.toString()` with both present prints `fld`, correctly; (2) a
   `self`-function of that name is in scope where the GENERIC BODY is written — remove the
-  import and the same program runs, using the field; (3) the instantiation type carries the
-  name as a closure field. It is NOT a module-boundary defect: single-file reproduces.
+  import and the checker refuses the body outright (that is [D1004](#d1004), not this row);
+  (3) the instantiation type carries the name as a closure field. It is NOT a module-boundary
+  defect: single-file reproduces.
 
-* **THE DISASSEMBLY NAMES THE BRANCH.** `wasm-dis` of the failing instance shows
-  `(call $27 (ref.null none) (local.get $1))` — the direct call, with the raw struct in the
-  argument slot — where the field witness would have been an indirect call through the
-  closure. The checker had resolved `field`; the emitter had already resolved UFCS.
+* **THE SILENT-WRONG-VALUE TWIN IS WORSE THAN THE FILED ONE.** With a LOCAL
+  `toString(self: Circle)` in place of the `std:fmt` import, the same shape does not produce
+  invalid wasm — it produces `<C>`, the free function's answer, for a receiver whose own field
+  says `fld`. Same mechanism, no diagnostic at any layer.
 
-* **THE FIX IS THE ORDERING, and it is its own change.** Deciding member dispatch per MINTED
-  INSTANCE (or deferring the decision past monomorphization) is a monomorphizer change with an
-  explicit ordering constraint to renegotiate, so it is not folded into the constraints
-  landing. Constraints phase 1 makes the checker's answer right; this row is the emitter's.
+* **THE FIX IS THE DECISION, NOT THE ORDERING.** `drwEveryInstanceTakesField` asks the CALL
+  SITES the question the body cannot answer: the checker has recorded a type on every argument
+  node, so the set of receivers a type parameter will ever hold is readable at rewrite time.
+  When every call site's argument at that position carries a field of that name, the rewrite
+  DECLINES and the field-closure lowering — which resolves per FUNCTION
+  (`exprIsClosure(…, fnIx)`) — is already right at every instance. Usage-gated: a program with
+  no such call site is byte-identical.
 
-Repro (check rc 0, then invalid wasm — and the same without any bound):
+* **UNANIMITY IS A DELIBERATE BOUND, and its price is [D1043](#d1043).** Where the
+  instantiations DISAGREE, no single AST serves both — `monoCloneBody` SHARES every leaf
+  expression between instances — and deferring unconditionally was MEASURED to trade this
+  cell for nine others (the tail-statement position answers `emitProgram: unsupported
+  member-call statement`, and a `const s = x.m()` local takes the i32 default: invalid wasm).
+
+Repro (runs today and must keep running — a CLOSED row, graded by the value that says WHICH
+callee ran):
 
     import { toString } from "std:fmt"
     type Boxed = { r: f64, toString: () => string }
     function describeU<T>(x: T): string { "<" + x.toString() + ">" }
     const b: Boxed = { r: 1.0, toString: () => "fld" }
     print(describeU(b))
-    // vl check -> rc 0; vl run -> Invalid input WebAssembly code, type mismatch
-    // Delete the std:fmt import and the same program prints <fld>.
+    // PRINTS <fld>  — never <1> and never invalid wasm.
+
+Fixtures: `tests/cases/constraints/unbounded-generic-field-precedence.vl` (five delivery
+positions, every one printing `fld`).
 
 ---
 ### D1003 — [CLOSED 2026-09-01] the plain-to-mangled UFCS alias table was reset only on the MODULE path, so a single-file compile inherited the previous program's rows
@@ -29691,54 +29705,47 @@ Repro (check rc 1, message empty):
     // vl check -> "[ERROR]: " with a caret under `.n` and no sentence.
 
 ---
-### D1005 — an unsatisfied instantiation of an UNBOUNDED generic is still check-clean invalid wasm (D1001's remaining half)
+### D1005 — [CLOSED 2026-09-02] an unsatisfied instantiation of an UNBOUNDED generic was check-clean invalid wasm (D1001's remaining half)
 
-**check-clean invalid wasm · `type mismatch: expected (ref $type), found (ref $type)` · ZERO corpus cells · reproduces on master · the UNBOUNDED spelling of the hole constraints phase 1 fixed for bounded parameters**
+**closed · now a loud check reject, positioned at the offending call · was check-clean invalid wasm · ZERO corpus cells · the DEFERRED RECEIVER CONSTRAINT the row prescribed, with the field-precedence guard that blocked it in September**
 
-The mechanism is D1001's, verbatim: `assignable` answers TRUE for a `TyVar` on either side, so
-`ufcsCallTy` selects a free `self`-function by NAME alone inside a generic body, and the
-receiver's fit is never re-asked at the pin.
+The mechanism was D1001's, verbatim: `assignable` answers TRUE for a `TyVar` on either side,
+so `ufcsCallTy` selected a free `self`-function by NAME alone inside a generic body, and the
+receiver's fit was never re-asked at the pin.
 
-* **THE MISSING PIECE IS A DEFERRED RECEIVER CONSTRAINT**, and its home already exists.
+* **THE MISSING PIECE WAS A DEFERRED RECEIVER CONSTRAINT**, and its home already existed.
   `memCstr` records `.length` / `x[i]` on a `T` and `validateMemCstrs` re-asks it under each
-  call's substitution; the UFCS RECEIVER records nothing. Adding that row is the shape of the
-  fix, and it would close this without any bound syntax.
+  call's substitution; the UFCS RECEIVER recorded nothing. `ufcsCstr*` is that row —
+  recorded in `ufcsCallTy` right after the vacuous `assignable(recvTy, params[0])` gate,
+  re-asked at BOTH pins beside `validateMemCstrs`, and banking the `self` parameter's own
+  type so the message can name the contract.
 
-* **A BOUND IS THE OTHER ANSWER, and it is the better one for library code** — the refusal
-  then names the contract instead of a substituted type — but it cannot be the only one while
-  an unbounded `<T>` remains legal.
+* **THE FIELD-PRECEDENCE GUARD IS WRITABLE, and the September blocker was a reading of the
+  wrong receiver.** That attempt recorded `memberFloorMsg(ur, "toString")` answering
+  **`no field 'toString' on Boxed`** for a receiver whose direct spelling resolves that very
+  field, and concluded `ur` "renders as `Boxed` and answers member questions as a shell".
+  **Measured 2026-09-02 at the pin, with `ur = substTyDeep(recordedHole, bNames, bTys)`:**
+  `urTy=41 render=Boxed isObj=y fld=43 fldIsFn=y floor=[]` — the substituted receiver IS a
+  `TyObj`, `tyFieldTyOf` answers the field, and the floor message is EMPTY. Whatever the
+  earlier table handed `memberFloorMsg`, it was not this. The guard is one call.
 
-* **THE DEFERRED RECEIVER CONSTRAINT WAS BUILT AND IT WORKS — AND IT CANNOT SHIP UNTIL ITS
-  FIELD-PRECEDENCE GUARD CAN BE WRITTEN.** A `ufcsCstr*` table beside `memCstr*`, recorded in
-  `ufcsCallTy` right after the vacuous `assignable(recvTy, params[0])` gate and re-asked at
-  both pins next to `validateMemCstrs`, turns this row's witness into a positioned CHECK error
-  (`no `toString` for receiver {s: f64} — the only `toString` in scope takes Circle`) while
-  the satisfied instantiation still prints `<C>`. Roughly 70 lines, entirely in the shape the
-  row prescribed.
+* **THE GUARD ASKS ABOUT ANY FIELD, NOT ONLY A CALLABLE ONE**, because that is the question
+  `drwWalk` asks (`sFieldIndex`). A non-callable field of that name is a different diagnosis
+  and the concrete spelling owns it.
 
-  **IT ALSO REFUSES [D1002](#d1002)'s WITNESS, WHICH IS A LEGAL PROGRAM.** `type Boxed = { r:
-  f64, toString: () => string }` has `toString` as a FIELD; field precedence means
-  `x.toString()` is a field call, and with the `std:fmt` import deleted the same program
-  prints `<fld>`. Refusing it would trade a clause-1 miscompile for a clause-2 wrong reject —
-  strictly worse, and exactly the "closed by making it loud" move this file's own goal
-  section forbids.
+* **A BOUND IS THE OTHER ANSWER, and it is still the better one for library code** — the
+  refusal then names the contract at the DECLARATION rather than at the call — but it could
+  not be the only one while an unbounded `<T>` remains legal, and that ruling is unchanged.
 
-* **THE BLOCKER IS SHARP: THE SUBSTITUTED RECEIVER IS NOT MEMBER-EQUIVALENT TO THE ARGUMENT'S
-  OWN TYPE.** The obvious guard is "skip when the receiver has the member", asked of the
-  substituted type the way `validateMemCstrs` asks its own. It does not work here.
-  `memberFloorMsg(ur, "toString")` answers **`no field 'toString' on Boxed`** for a receiver
-  whose DIRECT spelling resolves that very field and prints `fld` — measured with the message
-  instrumented, and `boundMemberList(ur)` renders EMPTY for it. So `ur` renders as `Boxed` and
-  answers member questions as a shell.
+* **THE REFUSAL IS CLAUSE-2 CLEAN.** The refused program is genuinely illegal: `{s: f64}` has
+  no `toString` and no free `toString` takes it, and the DIRECT spelling
+  (`const v = {s: 2.0}  v.toString()`) is the same error today. The message is that same
+  sentence plus the contract the receiver missed, so the two spellings stay one sentence
+  apart. [D1002](#d1002)'s legal witness is NOT refused — the guard is what makes that true,
+  and `tests/cases/constraints/unbounded-generic-field-precedence.vl` is the pin that says so.
 
-  That is the thing to find out first next time, because `validateMemCstrs` has no such
-  problem with its own recorded type — which says the difference is in WHICH type
-  `ufcsCallTy`'s `recvTy` parameter carries, not in `substTyDeep`. Compare what the member
-  path records against what `ufcsCallTy` receives, before writing the table again.
-
-* **NOTHING SHIPPED.** The change was reverted; both witnesses still reproduce as filed.
-
-Repro (check rc 0, then invalid wasm):
+Repro (check rc 1 — now a loud check reject, positioned at the second call; the FIRST
+instantiation is legal and is not what is reported):
 
     type Circle = { r: f64 }
     function toString(self: Circle): string {
@@ -29748,7 +29755,10 @@ Repro (check rc 0, then invalid wasm):
     function describeU<T>(x: T): string { "<" + x.toString() + ">" }
     print(describeU({ r: 1.0 }))
     print(describeU({ s: 2.0 }))
-    // vl check -> rc 0; vl run -> Invalid input WebAssembly code, type mismatch
+    // vl check -> no field 'toString' on {s: f64} — the `toString` in scope takes Circle
+    //             (the body of `describeU` at the call's argument types)
+
+Fixture: `tests/cases/constraints/error-unbounded-ufcs-receiver-unsatisfied.vl`.
 
 ---
 ### D1006 — `startFnDetectScratch` never clears `fnUsesU8Push`, so a `u8[]` push leaves the NEXT program's start function reserving a scratch quad it does not use
@@ -32546,3 +32556,59 @@ Repro:
   and so never hit it). It should close by registering the clone's union where the direct
   spelling registers its own — not by an emit arm — and grade on every row above plus the
   D965 delivery matrix for the instantiated value.
+
+---
+### D1043 — two instantiations of ONE generic that must dispatch a member call DIFFERENTLY share a single AST node, so the disagreeing pair is check-clean invalid wasm
+
+**check-clean invalid wasm · `type mismatch: expected (ref $type), found (ref $type)` · ZERO corpus cells · reproduces on master · the PRICE [D1002](#d1002) declined to pay, named by the candidate that would have paid it**
+
+`g<T>(x: T) { x.tag() }` called once at a `Circle` (no such field — the free `self`-function
+`tag` answers) and once at a `Boxed` (the field answers) needs two different lowerings of one
+source expression. Each spelling runs ALONE; it is the disagreement that has no lowering.
+
+* **THE OBSTACLE IS AST SHARING, not the decision.** `monoCloneBody` rebuilds only the
+  STATEMENT SPINE of an instance and SHARES every leaf expression — its own header says so,
+  and `monoCloneLambdaSubst` states the principle: "the emitter re-derives every operand type
+  from the (now concrete) parameter per function, so one body lowers correctly under each
+  pin." Member dispatch is the operand-type decision that is NOT re-derived per function: it
+  is baked into the arena by `drwWalk` before monomorphization. So the two instances are one
+  `x.tag()` node and one decision has to serve both.
+
+* **THE CHEAP FIX IS MEASURED AND REFUSED, and this is its price.** Deferring the rewrite
+  unconditionally for a type-parameter receiver makes this cell RUN (`<C>` then `<fld>`) and
+  costs **nine `runs → not-runs` cells** on a 35-program position matrix (2026-09-02): the
+  TAIL-STATEMENT position answers `emitProgram: unsupported member-call statement`
+  (`emitCallStmt`'s Member arm has no UFCS fallback where `emitCall`'s does), a `const s =
+  x.tag()` local takes the **i32 default** and the module is invalid wasm, `print(x.tag())`
+  the same, a GENERIC `self`-function is never instantiated by mono and resolves to its
+  pruned `() -> void` stub (`emitProgram: callee is not a function name`), and every
+  non-struct receiver (string, i32, `i32[]`, f64, boolean) fails with it. **The blocking half
+  is the CLASSIFIERS, not the byte emitters** — the pre-mono rewrite exists precisely so the
+  local-kind, print-routing and string-detection passes see a plain named call.
+
+* **WHAT WOULD ACTUALLY CLOSE IT**, in the order the position-matrix rule prescribes: give
+  `emitCallStmt`'s Member arm the same unrewritten-UFCS fallback `emitCall` already carries,
+  give the local-kind and print-routing classifiers a member-call arm that resolves the
+  `self`-function, keep the pre-mono rewrite for a GENERIC `self`-function (mono cannot
+  instantiate what it never sees as a direct call), and only THEN widen D1002's unanimity gate
+  from "every instantiation takes the field" to "any". Narrowing the gate first is the
+  clause-1 trade this row records.
+
+* **NOT A REGRESSION.** This cell was invalid wasm before D1002 and is invalid wasm after it;
+  D1002 moved the UNANIMOUS-field shape and deliberately left this one. `scripts/capability-probes/generic-mixed-member-dispatch.vl` is the standing probe.
+
+Repro (check rc 0, then invalid wasm):
+
+    type Circle = { r: f64 }
+    type Boxed = { tag: () => string }
+    function tag(self: Circle): string {
+      if self.r > 0.0 { return "C" }
+      "c"
+    }
+    function describe<T>(x: T): string { "<" + x.tag() + ">" }
+    const c: Circle = { r: 1.0 }
+    const b: Boxed = { tag: () => "fld" }
+    print(describe(c))
+    print(describe(b))
+    // vl check -> rc 0; vl run -> Invalid input WebAssembly code, type mismatch
+    // Either print ALONE runs, and prints <C> / <fld> respectively.

@@ -405,20 +405,30 @@ boolean }` with `<T: Eq<T>>`) are not in phase 1; the inline form covers the sam
   witness per property name program-wide before the checker sees it. Reported as measured
   rather than demonstrated. The ledger stays because it is the enforcement point the ruling
   asks for and it is what must already exist the day dispatch becomes per-site.
-* **A closure-FIELD witness loses to a same-named `self`-function inside a generic body, and
-  the result is invalid wasm** — `silent-class-inventory` D1002, pre-existing, reproducible
+* **A closure-FIELD witness lost to a same-named `self`-function inside a generic body, and
+  the result was invalid wasm** — `silent-class-inventory` D1002, pre-existing, reproducible
   with no constraints syntax. `dispatchRewrite` runs BEFORE `monomorphize` (a declared ordering
-  in `emit_sections.vl`), so the member call is rewritten once for every instance while the
-  receiver is still a type parameter. The field witness works whenever no `self`-function of
-  that name is in scope, which is what `bound-field-witness.vl` pins.
+  in `emit_sections.vl`), so the member call was rewritten once for every instance while the
+  receiver was still a type parameter. **CLOSED 2026-09-02**: the rewrite now asks the CALL
+  SITES the question the body cannot answer — when every argument at that parameter position
+  carries a field of that name, it declines and the field-closure lowering (which resolves per
+  FUNCTION) is right at each instance. The ORDERING is unchanged; what moved is the decision.
+  The disagreeing pair — one instantiation taking the field, another the `self`-function —
+  shares one AST node and stays open as D1043.
 
 ### 7.6 Still open
 
 * **OQ-2, operator bounds** — unchanged, and the implicit machinery still carries them.
 * **Phase 2, per-site UFCS satisfaction** — needs the dispatch decision to move past
-  monomorphization (the same change D1002 wants).
-* **D1004 / D1005** — the UNBOUNDED half of the empty diagnostic and of the unsatisfied
-  instantiation. Both are closed for a bounded parameter and both stay open by ruling.
+  monomorphization for the DISAGREEING instantiation pair (D1043). D1002 closed the
+  unanimous-field half without moving the pass, by asking the call sites at rewrite time.
+* **D1004** — the UNBOUNDED half of the empty member-access diagnostic. Closed for a bounded
+  parameter, open by ruling for an unbounded one.
+* **D1005 — CLOSED 2026-09-02.** The unbounded half of the unsatisfied instantiation, closed
+  the way the row prescribed: a deferred UFCS-RECEIVER constraint (`ufcsCstr*`) beside
+  `memCstr*`, re-asked at both pins, guarded by field precedence asked of the SUBSTITUTED
+  receiver. The refusal names the contract (`the \`toString\` in scope takes Circle`) and the
+  legal field witness is not refused.
 * **LSP bound-member completion and hover on `x: T`** — a fast-follow, deliberately not in
   scope. One line on what it needs: `check_query`'s member-completion path reads the receiver's
   `TyObj` fields, so a `TyVar` receiver yields nothing; it needs the same
