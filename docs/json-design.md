@@ -1,6 +1,6 @@
 # `std:json` v1 — the surface, and what the compiler has to grow to serve it
 
-> Status: **BUILT — #2322 (2026-09-02); §6 q1 and q2 RULED the same day, q3 still open.**
+> Status: **BUILT — #2322 (2026-09-02); §6 q1, q2 and q3 all RULED the same day — nothing open.**
 > This is serde stage 1 (`docs/serde-design.md` §Recommendation, ruling G): a real `Json`
 > VALUE TREE plus a parser and a renderer over it. Nothing here is built. The owner answered
 > seven surface questions on 2026-09-01 and those answers are recorded in §0 as facts this
@@ -829,17 +829,25 @@ measurements):
    name for something the operator already means. The ignored suffix on a numeric cast is
    D1041 and the build item is in ROADMAP §Next; DECISIONS.md §"Numeric `as` to an INTEGER
    target is exact-or-fail under the trio" has the survey and the cost.
-3. **`string | "err"`** (D1024's question) — **collapse** the subsumed
+3. ~~**`string | "err"`** (D1024's question) — **collapse** the subsumed
    literal into its base (TypeScript's rule; a hint says the arm is inert), or keep it as
    a distinguishable arm. A language ruling for `DECISIONS.md`; nothing in this module
-   spells either.
+   spells either.~~ **RULED 2026-09-02 (owner): collapse.** A union is a set of values and
+   an arm that adds none adds no arm — decided per arm, after flattening, through aliases:
+   `string | "err"` is `string`, `Name | "err"` is `Name`, `Json | "err"` is `Json`, and
+   `Kind | string` is `string`; `Kind | "err"` and `i32 | "err"` add a value and stay.
+   `x is "err"` is a value test everywhere. Two non-blocking hints (at the written spelling;
+   at an `is <literal>` whose operand collapsed). For this module the consequence is the one
+   it already lives by: a `Json` can be `null` and can be `"err"`, so only a STRUCT arm
+   (`JsonError`) can carry a failure. DECISIONS.md §"A subsumed literal arm COLLAPSES";
+   D1024 closes in canon; the generic-instantiation refusal it shared a table with is D1042.
 
 Everything else the three critiques raised is either taken (§1–§2 above, each marked
 *post-critique*) or a build item (§5). D1021 closed on 2026-09-01; the builder is briefed
 on the ruled core (`Json`, `JsonError`, `parseJson`, `toJson`) with the three questions'
 outputs — nothing for q1 (ruled: no helper; deep `is`/`as` is the build item),
-nothing for q2 (ruled: `p as? i32` — the language, not a helper), nothing for q3 —
-landing as follow-ups once ruled.
+nothing for q2 (ruled: `p as? i32` — the language, not a helper), nothing for q3 (ruled:
+collapse; `Json | JsonError` was already the only honest shape) — **§6 is fully ruled.**
 
 ---
 

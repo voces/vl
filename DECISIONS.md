@@ -4039,9 +4039,18 @@ dead), and the general `d as! i32` is the conversion plus a round-trip compare �
 pays. Do not lean on binaryen for the fold: its float folds are NaN-conservative and will
 not remove the compare on their own. Migration: the tree's `as` sites are `as!` in intent
 today (they were written under "traps on NaN / out of range"), so the migration is a
-suffix per site — `compiler/` 67, `std/` 21, `tests/cases` 230 (measured 2026-09-02) — and
-it lands FIRST, byte-identical, because the current seed accepts and ignores the suffix;
-the semantics land second. `error-handling-design.md` §"The unified `as` principle" said
+suffix per site — **`compiler/` 2, `std/` 15, `tests/cases` 167** (vl-de's
+comment-and-string-aware count, landed as #2355 the same day and `cmp`-byte-identical; the
+first figure quoted here, 67/21/230, was a bare grep and **70 of its 87 compiler+std hits
+were prose inside `//` comments** — a count of casts is a count of CODE spans, not lines) —
+and it lands FIRST, byte-identical, because the current seed accepts and ignores the
+suffix; the semantics land second. **One live behaviour change to write down:** a bare
+numeric `as` TRAPS today in three of its five failure modes (NaN, ±Inf, `f64` overflow) and
+is silent in the other two (fraction truncates, `i64 → i32` wraps). After the migration no
+site in the tree spells a bare `as`, but a USER function that returns `| null` and holds a
+bare `f64 as i32` changes meaning from trap to propagated `null` for those three modes;
+every other bare `as` becomes a check error naming the suffix, which is loud. After #2355
+the tree spells no bare numeric `as` at all, so the price is documented rather than paid. `error-handling-design.md` §"The unified `as` principle" said
 "Numeric casts do NOT propagate"; its stated reason (a propagated raw `f64` would infect the
 signature and carries no information) argued against propagating the OPERAND, and this
 ruling propagates `null`, which is the trio's remainder for a single-cause failure and
@@ -4052,3 +4061,52 @@ place with a pointer here.
 delivery matrix for the `T | null` result of `as?`; `std/fmt.vl` `parseI32`'s comment,
 which documents `as i32` as "an unchecked wrapping truncation on this compiler" and is
 false the day this lands.
+
+## A subsumed literal arm COLLAPSES: `string | "err"` is `string`, through aliases and through a union's arms; `x is <literal>` is a value test everywhere (owner, 2026-09-02)
+
+**Ruling.** A union is a SET of values, and an arm that adds no values adds no arm. A literal
+whose base type is already an arm — `string | "err"`, `i32 | 3` — is subsumed and the type is
+the base. Subsumption is decided PER ARM, AFTER FLATTENING and THROUGH ALIASES, so where the
+subsuming arm came from does not matter: `type Name = string` gives `Name | "err"` = `Name`;
+`Json | "err"` flattens to `null | … | string | … | "err"` and is `Json`; and the mirror image,
+a litunion beside its base (`Kind | string`, `Kind = "a" | "b"`), is `string`. Nothing
+collapses that adds a value: `Kind | "err"` is the three-atom litunion `"a" | "b" | "err"`, and
+`i32 | "err"` is a genuine two-arm box. `x is <literal>` is a VALUE test — it means
+`x == <literal>` with narrowing — over a collapsed base, over a litunion atom and over a
+value-union arm alike, which is what the language already does everywhere the spelling
+builds today (`const s: string = "err"; const c: R = s; c is "err"` prints `true` over
+`type R = string | "err"`). Two hints, neither blocking: at a WRITTEN spelling whose arm is
+subsumed (`"err"` is subsumed by `string` — the arm carries nothing; a distinguishable
+failure is `| null` or a struct arm), and at an `is <literal>` whose operand collapsed
+(`r` is `string`; this is a value test and cannot tell a failure from data). No hint at a
+generic instantiation (`orErr<Json>`): the caller did not write it and the author cannot
+avoid it; the second hint fires exactly where the loss bites.
+
+**What it answers.** `json-design.md` §6 q3 in full, and D1024's language question. It is
+the same fold the language already applies to `Json | null` (D1021, #2312: `null` is an arm
+of `Json`, so the composition is `Json`), stated once for every arm kind. The consequence
+for `std:json` is the one the module already lives by: for a `Json`, NEITHER `| null` NOR
+`| "err"` can be a failure arm, because both are data a document can hold — a struct arm
+(`JsonError`) is the one thing a `Json` cannot be, and that is why it exists.
+
+**Why collapse and not the two alternatives.** (b) A DISTINGUISHABLE literal arm — a value
+returned as the literal tagged differently from the same value returned as a `string` — gives
+a free poor-man's `Result` for generics and nothing else: two equalities diverge (`is`
+false while `==` true — the opposite of today's measured behaviour), a value acquires an
+identity by which arm it flowed through, every such union pays a box where the collapse
+pays none, no structural literal-typed language does it (TypeScript, Flow and mypy all fold
+`"err" | string` to `string`), and it is precisely the nominal-by-erasure thing the checker
+already refuses for `string | Err` with `type Err = new string` ("same runtime
+representation, so `is` cannot tell them apart"). (c) REFUSING the spelling is loud and
+inert-free, but `T | "err"` at `T = string` then errors at an instantiation the author never
+wrote — TypeScript's reason for folding silently — and avoiding that needs "refuse when
+written, collapse when instantiated", two rules for one type.
+
+**Build note.** The collapse lives in CANON — the type becomes a non-union, or a smaller
+union — never as a dedupe of a built member set: box tags are POSITIONAL (the union
+member-set ABI), and D1024's "dedupe the atom after widening" was the wrong layer. Grading
+list: D1024 (prints `err`), the six-row spelling table on its row, `is "err"` as a value
+test at every spelling in that table, both hints. **Split off, not this ruling's:** the
+generic-instantiated union `T | "err"` / `T | E` at a scalar `T` refuses `no recorded
+members` — measured 2026-09-02 to be about MONO-MINTED unions and not about the literal
+(D1042).
