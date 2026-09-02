@@ -29917,6 +29917,13 @@ Repro (check-clean invalid wasm):
   literal's own elements rather than the narrowed destination's arm. That is why the INDEXED
   read-back runs: it never asks this classifier.
 
+* **BUT A RUNG IN `forInElemKind` DOES NOT REACH IT — measured, so do not start there.** Adding
+  a narrowed-arm rung ahead of `exprStringArray` changes nothing, and neither does forcing it
+  to return `"union"` for ANY narrowed atom. So either `narrowedValueAtomOf` answers nothing
+  for this receiver — it is a MODULE-level `const` narrowed by a top-level `if`, not a local —
+  or the `#l` temp's type is not decided by `forInElemKind` at all. Separate those two before
+  writing a fix; the disassembly above still says the two reps are `$5` and `$7`.
+
 * So the target is one classifier, not the literal's construction: **a for-in over a
   narrowed union arm must take its element kind from the ARM, not from the values the literal
   happened to contain.** Grade any movement on `capability-probes/run.py` and the corpus —
