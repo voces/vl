@@ -24262,7 +24262,20 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
 
 ### D1009-N — `J | null` is refused where `J` is expected and `null` is already an arm of `J`
 
-**loud check reject · clause 2 · reported by vl-b7 as D1009; reproduced and DIAGNOSED here, not fixed. Numbered in this session's block to avoid a cross-session collision — see vl-b7's row for the serde context**
+**runs — CLOSED 2026-09-02 by [D1009](#d1009), which is the SAME defect under the other session's number · was: loud check reject, clause 2 · reported by vl-b7 as D1009; reproduced and DIAGNOSED here, not fixed. Numbered in this session's block to avoid a cross-session collision — see D1009 for the fix and the serde context**
+
+**THIS ROW WAS INVISIBLE TO THE GRADER FOR A DAY, and that is the finding worth keeping.**
+`check-filed-witnesses.py`'s `SEC` pattern admitted `D661A` and `D804b` but not a HYPHENATED
+suffix, so `D1009-N` was never parsed: not graded, not reported ungradeable, and `--strict`
+printed `0 not graded` beside it. It went stale the moment D1009 closed and nothing said so.
+Fixed on the same day in two halves — the id pattern now admits the suffix, and
+`unparsed_row_heads` counts the POPULATION of row-shaped headings and fails `--strict` on any
+the parser did not recognise, so the next unanticipated id shape cannot vanish the same way.
+**Reading the four columns cannot catch what never entered them.**
+
+**A DUPLICATE NUMBERING IS A REAL COST, not just untidiness.** Two sessions filed one defect
+twice to avoid an id collision, and the copy that was not fixed kept reading as live. The
+convention that avoided the collision is what hid the staleness.
 
     type J = null | f64 | J[]
     function f(v: J): f64 {
