@@ -30938,11 +30938,12 @@ alias INSIDE another union that has no rep.
 ---
 ### D1022 — an ALIAS naming an arm of a recursive union is not a member of it: `type JsonObject = {[string]: Json}` refuses at check inside the tree, and at emit as a `Map()` binding outside it
 
-**loud EMIT reject (was a loud CHECK reject) · clause 2 · the CHECK half is FIXED
-2026-09-02 — a member blocked by a declaration cycle is no longer dropped as `never`, so the
-declared arm survives and the union is the type the program wrote; what remains is the emit
-rep for a recursive map VALUE, which the STRUCTURALLY spelled tree hits too and is therefore
-not an alias question · was: `` `is` check type 'JsonObject' is not a variant of Json ``**
+**runs, prints `other` — CLOSED 2026-09-02 in two halves. The CHECK half: a member blocked
+by a declaration cycle is no longer dropped as `never`, so the declared arm survives and the
+union is the type the program wrote. The EMIT half closed with D1037 — the same recursive
+alias had NO emit name at all, because `cUserTypes` names only the wrapper the null fold
+leaves behind · zero `runs` lost · was: `` `is` check type 'JsonObject' is not a variant of
+Json ``, then `emitProgram: unsupported map value type`**
 
 Repro:
 
@@ -32018,11 +32019,16 @@ Repro:
   can see `-3` for a name a later call classifies. Only this one rung turned it into a
   refusal.
 
-* **REMAINDER, FILED AS D1037.** Declaring the map alias FIRST still refuses.
+* **REMAINDER, CLOSED AS D1037.** Declaring the map alias FIRST refused for a different
+  reason — the declared type had no emit name at all — and closed there.
 
 ### D1037 — the recursive-alias map binding refuses when the MAP alias is declared BEFORE the union, and runs when it is declared after
 
-**loud emit reject on a `vl check`-clean program — OPEN, clause 2**
+**runs, prints `0` — CLOSED 2026-09-02 in two halves, and the first alone was a MISCOMPILE:
+a collapsed render answers with the declared name (`nulFoldAliasNameOf`), and
+`mvSlotOfValTyK` retries through the fold's wrapper so the store and an `is` test tag one arm
+once · zero `runs` lost · `tests/cases/maps/recursive-alias-declared-first.vl` · closed
+D1022's emit half with it · was a loud emit reject on a `vl check`-clean program, clause 2**
 
 Repro:
 
@@ -32186,10 +32192,20 @@ Repro:
   replacing a clause-2 refusal, which is the worse trade and the reason this is filed rather
   than merged.
 
-* **SO THE ROW IS ONE DELIVERY FROM CLOSED, AND THE DELIVERY IS NAMED.** The render fix is
-  right and is not the missing piece; wiring the map arm's `mapSlotTag` so the store and the
-  `is` test agree on one slot under the new render is. Do that FIRST and re-run the position
-  matrix — D965's order exactly — rather than landing the render on its own. Any future
-  attempt must carry an `is`-over-the-map-arm line in its fixture: every other gate in this
-  repo, all eleven of them, passed the broken candidate.
+* **AND THAT DELIVERY IS WHAT CLOSED IT.** `mapSlotTag` keys off the mv slot, and the two
+  sides asked for it with different integers: the STORE interns through the value NAME, which
+  resolves to the fold's WRAPPER, while an `is` test asks `mvSlotOfValTyK(tyMapValOf(ity))` —
+  the MEMBER inside it. Both are "the type `J`" and the slot is one slot, so `mvSlotOfValTyK`
+  now retries through `nulFoldWrapperTyIxOf` **on a miss only**, and the arm tags agree. With
+  both halves in, every arm answers correctly in BOTH declaration orders:
+
+  | value | `x == null` | `x is f64` | `x is JO` |
+  | --- | --- | --- | --- |
+  | a `JO` map | — | — | **JO** |
+  | `2.5` | — | **f64** | — |
+  | `null` | **null** | — | — |
+
+  The lesson the row is kept for: **all eleven gates passed the render half on its own**, and
+  the only thing that caught the miscompile was putting a second delivery position — an `is`
+  over the map arm — in the fixture. The fixture carries the whole sweep for that reason.
 
