@@ -13124,6 +13124,50 @@ function guardFiniteUserTypes(): i32 {
   0
 }
 
+// ── The variant field-span INVARIANT, reconciled once per module ─────────────────────
+//
+// `uFieldStart` / `uFieldCount` are PARALLEL TO `uVariants` and slice the flat
+// `uFieldNames` / `uFieldTypes` stores (`emit_state.vl` states the rule); nothing enforces
+// the lengths. They come apart whenever a registration helper pushes a variant row and then
+// REJECTS one of its fields — `collectShapeVariantFields` pushes `uFieldStart` before it can
+// refuse, so a caller that swallows the `-1` (the map-atom and ref-array-atom
+// `registerInlineUnion` recursions do) leaves the row a start with no count.
+//
+// `emitFail` RECORDS a failure and keeps emitting, so EVERY later `uFieldStart[vi]` reads
+// past the end and TRAPS THE COMPILER instead of delivering the message already recorded.
+// There are some thirty such reads — `emitTypeSection`'s variant loop, the classifier
+// accessors (`variantFieldTypeAt`, `variantSig`, `variantStructHeapTwinAt`, …) and the
+// byte-writing sites — so guarding them one at a time cannot close the class: MEASURED with
+// the last variant's span rows dropped, the first read to trap is `emitTypeSection`'s, and
+// the emitter never runs.
+//
+// So the invariant is restored ONCE, at the head of the emit phase: report BOTH lengths
+// loudly, then pad the short table with EMPTY spans so every downstream read is in bounds
+// and the recorded diagnostic is what reaches the user rather than a wasm trap. Two integer
+// compares per module on the passing path.
+export function reconcileVariantFieldSpans() {
+  if (
+    uFieldStart.length >= uVariants.length &&
+    uFieldCount.length >= uVariants.length
+  ) {
+    return 0
+  }
+  emitFail(
+    "emitProgram: the union-variant field-span tables do not cover every variant — " +
+      i32ToStr(uVariants.length) +
+      " variants but " +
+      i32ToStr(uFieldStart.length) +
+      " field starts / " +
+      i32ToStr(uFieldCount.length) +
+      " field counts",
+  )
+  // An EMPTY span (start 0, count 0) is in bounds against any flat store, so a padded row
+  // reads as a fieldless variant rather than off the end of the table.
+  while uFieldStart.length < uVariants.length { uFieldStart.push(0) }
+  while uFieldCount.length < uVariants.length { uFieldCount.push(0) }
+  -1
+}
+
 // Scan the top-level statements for EVERY union alias `type N = A | B | …` (a
 // `UnionDecl`); for each, record its name + variant-slice range in the per-union table
 // (`unNames`/`unVarStart`/`unVarCount`), append its variant struct names to the GLOBAL

@@ -332,6 +332,7 @@ import {
   uSinkFired,
   uTags,
   uVarHeap,
+  uVariants,
   unionAsSlot,
   unionSinkBase,
   variantReboxSlot,
@@ -3266,7 +3267,55 @@ function emitCaptureRead(_body: i32[], name: string, fnIx: i32) {
   emitFail("emitProgram: captured variable not found in enclosing frame")
 }
 
+// ── The variant field-span INVARIANT, enforced rather than assumed ────────────────────
+//
+// `uFieldStart` / `uFieldCount` are PARALLEL TO `uVariants` and slice the flat
+// `uFieldNames` / `uFieldTypes` stores (`emit_state.vl` states the rule); NOTHING keeps the
+// lengths in step. They come apart whenever a registration helper pushes a variant row and
+// then REJECTS one of its fields — `collectShapeVariantFields` pushes `uFieldStart` before
+// it can refuse, so a caller that swallows the `-1` leaves the row a start with no count.
+// `emitFail` RECORDS a failure and keeps emitting, so the next `uFieldStart[vi]` on the
+// byte-writing path reads PAST THE END and traps the compiler instead of delivering the
+// message already recorded. Measured at `emitVariantStruct` with `vi=2` against a two-row
+// span table, from a shared compiler instance compiling a second module (D1152).
+//
+// Every span read that writes bytes asks this first. The passing path is four compares and
+// no allocation; the message is built only when it refuses, and it names the variant count
+// beside every span length, so the next change that lengthens `uVariants` alone gets a
+// DIAGNOSTIC rather than a trap.
+function guardVariantFieldSpan(vi: i32, where: string) {
+  if vi >= 0 && vi < uFieldStart.length && vi < uFieldCount.length {
+    const end = uFieldStart[vi] + uFieldCount[vi]
+    if (
+      uFieldStart[vi] >= 0 &&
+      uFieldCount[vi] >= 0 &&
+      end <= uFieldNames.length &&
+      end <= uFieldTypes.length
+    ) {
+      return 0
+    }
+  }
+  emitFail(
+    "emitProgram: " +
+      where +
+      ": union-variant " +
+      i32ToStr(vi) +
+      " is outside the parallel field-span tables — " +
+      i32ToStr(uVariants.length) +
+      " variants but " +
+      i32ToStr(uFieldStart.length) +
+      " field starts / " +
+      i32ToStr(uFieldCount.length) +
+      " field counts / " +
+      i32ToStr(uFieldNames.length) +
+      " field names / " +
+      i32ToStr(uFieldTypes.length) +
+      " field types",
+  )
+}
+
 function emitVariantStruct(body: i32[], objIx: i32, vi: i32, fnIx: i32) {
+  if guardVariantFieldSpan(vi, "emitVariantStruct") < 0 { return -1 }
   const start = uFieldStart[vi]
   const cnt = uFieldCount[vi]
   let fj = 0
@@ -3457,6 +3506,7 @@ function emitStructExprAsVariantBox(
   ssi: i32,
   fnIx: i32,
 ) {
+  if guardVariantFieldSpan(vi, "emitStructExprAsVariantBox") < 0 { return -1 }
   const cnt = uFieldCount[vi]
   const reReadable = cnt == 1 || exprReReadable(unwrapParen(exprIx))
   if !reReadable {
@@ -3828,6 +3878,21 @@ function emitDiscrimFieldEq(
   if vi < 0 || vi >= uVarHeap.length {
     return emitFail(
       "emitProgram: discriminant test on an arm with no heap type",
+    )
+  }
+  if guardVariantFieldSpan(vi, "emitDiscrimFieldEq") < 0 { return -1 }
+  // The FIELD index is the second half of the same read, and it arrives from a caller's
+  // loop rather than from the table — bound it here so the row this reads is provably
+  // inside the arm's own span, not merely inside the flat store.
+  if fi < 0 || fi >= uFieldCount[vi] {
+    return emitFail(
+      "emitProgram: emitDiscrimFieldEq: field " +
+        i32ToStr(fi) +
+        " is outside union-variant " +
+        i32ToStr(vi) +
+        "'s " +
+        i32ToStr(uFieldCount[vi]) +
+        " fields",
     )
   }
   const code = uFieldTypes[uFieldStart[vi] + fi]
@@ -6259,6 +6324,23 @@ function unionEqArmPresent(
 function eqConcreteVariantRow(exprIx: i32, fnIx: i32) {
   const vi = exprVariantIndex(exprIx, fnIx)
   if vi >= 0 { return vi }
+  // THE NULLABLE-NICHE STORAGE CLASS, and the list above did not omit it — it did not
+  // exist. A code-15 field read whose target is a union ARM now binds `nulvariant`
+  // (D1112/D1150), which `exprVariantIndex` declines because that resolver is the NON-NULL
+  // one, and which `structIndexOfExpr` declines because an arm has no `sNames` row. A cell
+  // between the two kinds fell through both rungs and took the caller's loud refusal.
+  //
+  // ASKED AHEAD OF THE HEAP SCAN BECAUSE IT IS THE EXACT ANSWER. The bridge below infers a
+  // row from heap identity and must decline an AMBIGUOUS match (two arms sharing one heap
+  // type); this reads the arm the checker's own type names, so it cannot be ambiguous.
+  //
+  // The value is the same `(ref null $uVarHeap[vi])` niche the `nulstruct` operand the
+  // bridge already serves parks: the arm slot is nullable and the field `struct.get` traps
+  // on null exactly as it does for that one.
+  if exprNullableVariant(exprIx, fnIx) {
+    const nvi = nulVariantIdxOfExpr(exprIx, fnIx)
+    if nvi >= 0 { return nvi }
+  }
   const ssi = structIndexOfExpr(exprIx, fnIx)
   if ssi < 0 { return -1 }
   if ssi >= sHeapIdx.length { return -1 }
@@ -17175,6 +17257,34 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
           return 0
         }
       }
+      // THE NULLABLE-VARIANT RECEIVER, the write mirror of `emitMember`'s own
+      // `nulVariantIdxOfExpr` read rung. A `T | null` binding whose `T` is a union ARM
+      // holds `(ref null $uVarHeap[vi])`, so the only difference from the variant-param
+      // write above is one `ref.as_non_null` — which cannot trap, because the checker
+      // admits the write only inside a null test. Without this the receiver fell through
+      // to the struct path, whose row a union arm does not own (`collectS` skips it).
+      const nwvi = nulVariantIdxOfExpr(target.memObj, fnIx)
+      if nwvi >= 0 && exprNullableVariant(target.memObj, fnIx) {
+        const nwfi = variantFieldIndex(nwvi, target.memProp)
+        if nwfi < 0 {
+          return emitFail(
+            "emitProgram: unknown variant field in field assignment",
+          )
+        }
+        if emitExpr(body, target.memObj, fnIx) < 0 { return -1 }
+        fbRefAsNonNull() // 0xd4 — the enclosing null test narrowed it
+        const nwCode = variantFieldTypeAt(nwvi, nwfi)
+        if seedFieldListBuild(nwCode, variantFieldRefSlot(nwvi, nwfi)) < 0 {
+          return -1
+        }
+        if emitScalarFieldStoreVal(body, a.binRight, fnIx, nwCode) < 0 {
+          return -1
+        }
+        pendingListKind = 0
+        pendingListSlot = 0
+        fbStructSet(uVarHeap[nwvi], nwfi)
+        return 0
+      }
       // Field WRITE `recv.field = v` → `struct.set $0 <fieldidx>` (`0xfb 0x05`). The
       // single declared struct lives at WasmGC type index 0 (matching `emitMem`'s read
       // path). Operand order is load-bearing: push the struct REF first, then the value,
@@ -23245,10 +23355,18 @@ function emitObjLitNode(body: i32[], _e: ObjLit, exprIx: i32, fnIx: i32) {
   // element) constructs the BARE variant struct `(ref $(uVarHeap[vi]))` — NOT a union
   // box. `pendingVariantIdx` is the variant; consume it so a nested literal doesn't
   // inherit the hint.
+  // BOUNDED, because `pendingVariantIdx` is a HINT and a hint can be mis-paired. It is set
+  // from some fifteen sites, several of which read an INDEX ladder that can fall through to
+  // the struct table while the KIND ladder beside it said variant — and a struct row handed
+  // in here is at best the wrong heap type and at worst past the end of `uVariants`. A hint
+  // that names no variant is not a hint; drop it and take the arms below, which is what this
+  // literal got before any seed existed.
   if pendingVariantIdx >= 0 {
     const pvi = pendingVariantIdx
     pendingVariantIdx = -1
-    return emitVariantStruct(body, exprIx, pvi, fnIx)
+    if pvi < uVariants.length {
+      return emitVariantStruct(body, exprIx, pvi, fnIx)
+    }
   }
   // A literal whose field-set matches a STANDALONE struct constructs that struct
   // directly (even alongside a union — `ast.vl`'s `Tok`/`Diag` coexist with `Node`).
@@ -25557,6 +25675,19 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
           }
         }
       }
+    }
+  }
+  // THE VARIANT SIBLING of the arm below, and it has to be its own arm rather than a
+  // widening of it: a `T | null` whose `T` is a union ARM stores
+  // `(ref null $uVarHeap[vi])`, and `structIndexOfExpr` has no row to answer with —
+  // `collectS` skips a union member. Same niche, same `br_on_non_null` lowering, one
+  // table over, and `variantIdx` is the `structIdx` an ObjLit default seeds against.
+  if exprNullableVariant(e.binLeft, fnIx) {
+    const cvi = nulVariantIdxOfExpr(e.binLeft, fnIx)
+    if cvi >= 0 && cvi < uVarHeap.length {
+      const vDefCtx = expCtxHere()
+      vDefCtx.variantIdx = cvi
+      return emitCoalesceNulRef(body, e, uVarHeap[cvi], vDefCtx, fnIx)
     }
   }
   // GENERIC nullable-STRUCT `??`: a `S | null` value — an ident / param binding, a struct FIELD,
