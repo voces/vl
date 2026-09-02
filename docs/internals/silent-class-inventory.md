@@ -23079,12 +23079,45 @@ Repro (now RUNS, printing `1` then `7`):
 ---
 ### D940 — an UN-ANNOTATED function passed as a value builds and TRAPS: `indirect call type mismatch`, and the hint calls the annotation that saves it redundant
 
-**loads then traps: `vl check` returns 0, the module VALIDATES, and the program traps at run time with `wasm trap: indirect call type mismatch` · reproduces identically on master, so it is not a regression · ZERO corpus cells · found incidentally while writing D939's fixture, by DELETING an annotation a hint had just called redundant**
+**closed as `runs` · was loads-then-traps (`vl check` rc 0, the module VALIDATES, `wasm trap: indirect call type mismatch`) · clause 1 · ZERO corpus cells · fixtures `tests/cases/types/coalesce-merged-row-fn-value-unannotated-hof.vl` and `…-fn-value-slot-sig.vl` · found incidentally while writing D939's fixture, by DELETING an annotation a hint had just called redundant**
+
+* **THE `$fnsig` POOL HELD BOTH SIGNATURES AND THE CALL PICKED THE WRONG ONE — probed, not
+  read off the path.** A dump at the `call_indirect` site prints
+  `ckey=[s0;>n0;] pos=3 sig=11 || #0=[s1;>n1;] rep=src ty=8 ; … ; #3=[s0;>n0;] rep=-1 ty=11`.
+  `src`'s own rows followed the merge, so it interned `s1;>n1;` (slot 1, the merged row) and
+  its wasm functype IS `ty 8`. The callback PARAMETER keys off its ANNOTATION, which still
+  spells the pre-merge row — `s0;>n0;`, synthesized with no rep function (`rep=-1`). Same
+  table, two signatures. The closure struct carries only a function INDEX, so the engine
+  signature-checks the moved callee against the un-moved functype and traps.
+
+* **THE FIX IS A NINTH OWNER OF THE MERGED ROW, and it is a SIGNATURE rather than a value.**
+  `anonLeafCloSlotMark` marks a closure-typed `Param` whose slot receives exactly one function
+  and whose function the merge moved; `anonLeafCloSlotSigKey` hands `paramCloSigKey` that
+  callee's own key. Per-param, for `anonLeafParamMoved`'s reason exactly: rewriting the row
+  wherever the annotation spells it would move every `({r: i32}) => …` parameter in the
+  program, including one fed a function nothing moved — which is the control the fixture runs.
+
+* **AND THE ARGUMENT IS THE SECOND HALF.** Moving the key alone trades the trap for invalid
+  wasm: an object-literal argument resolves its OWN row by field set and lands
+  `struct.new $narrow` in a `(ref $merged)` slot. The value-call arm now seeds
+  `pendingStructIdx` from the resolved key, exactly as the direct call seeds it from
+  `paramStructIdxOf`.
+
+* **THE ANNOTATION NEVER FIXED THE LOWERING — it routed AROUND it.** `monoSpecializeConcrete`
+  declines an un-annotated return outright (`if fn.fnRet < 0 { return 0 }`), so `: i32` bakes
+  the callback into a DIRECT call and the broken `call_indirect` is never reached. Every OTHER
+  delivery of the same function value fails with the annotation in place: a binding hop, a
+  wrapping lambda, and a two-HOF binding are all check-clean invalid wasm at `: i32` — see
+  D1043 for what is left.
+
+* **THE HINT IS STILL FOLLOWABLE INTO A BREAK, and now there is a number: D1044.** For THIS
+  witness it is safe (the un-annotated spelling is the one that runs), but `vl check --fix`
+  over `tests/cases/` changes 1,093 fixtures and moves **165** of them `runs -> not-runs`.
 
 D939's fixture carries `function apply(cb: …): i32`. `vl check` emits
 *"redundant type annotation: `apply` is inferred as `i32` — remove it to lean on inference"*.
-Remove it and the program stops working — not with a refusal, and not with an invalid module,
-but with a runtime trap.
+Removing it used to stop the program working — not with a refusal, and not with an invalid
+module, but with a runtime trap. The rest of this row is what that trap turned out to be.
 
 * **THE HINT IS ABOUT INFERENCE AND THE ANNOTATION IS ABOUT THE LOWERING, and nothing connects
   them.** The inferred type really is `i32`, so the hint is not lying about what it checked. It
@@ -23098,11 +23131,12 @@ but with a runtime trap.
   VALUE's signature and the `call_ref` site disagree; the annotated form pins a signature that
   the inferred form leaves free to differ.
 
-* **THE FIX IS NOT OBVIOUSLY THE ANNOTATION'S END.** Either the un-annotated function's value
-  signature must be pinned the way the annotation pins it, or the hint must stop firing where
-  removing the annotation changes the lowering. The second is cheaper and is a real bound: a
-  hint that cannot be safely followed should not be offered. Both are unscoped here — this row
-  records the witness and the measurement, not a chosen repair.
+* **BOTH REPAIRS WERE ON THE TABLE AND THE FIRST IS THE ONE THAT MOVES THE GOAL.** Pinning the
+  function value's signature makes the un-annotated program RUN; suppressing the hint would
+  only have stopped one user reaching the trap, leaving the lowering broken for every spelling
+  that never carried an annotation. The hint half is real and is filed as D1044 with a
+  measurement — it is bigger than this row, and 129 of its 165 breakages are a `let`
+  annotation, not a return one.
 
 * **HOW IT WAS FOUND IS THE REUSABLE PART.** `docs` has a standing rule that a load-bearing
   annotation gets a DECLARED hint rather than a deletion. This is the case that rule exists for,
@@ -23122,14 +23156,16 @@ but with a runtime trap.
   $0)`**, the narrow one `src` actually declares. Same table, two signatures, hence
   `indirect call type mismatch`.
 
-  So the defect is not in the hint's end at all: `src`'s parameter `p: {r: i32}` — an INLINE
-  shape — interned to the wrong row. A field-name-set match cannot separate `{r: i32}` from
-  `{r: i32|string}`, and the annotated build differs only in which row wins. **The next
-  attempt starts at the inline-shape intern for a function VALUE's signature, and the question
-  is whether it compares field TYPES or only the name set.** Both functype pools are otherwise
-  identical up to the index in question, which is what rules out a pool-ordering shift.
+  **AND THE READING THAT FOLLOWED FROM IT WAS WRONG — the probe is what settled it.** This
+  paragraph once read "`src`'s parameter interned to the wrong row … the next attempt starts at
+  the inline-shape intern, and the question is whether it compares field TYPES or only the name
+  set." Neither row is wrong and the intern compares nothing relevant: `src` is CORRECTLY at
+  the merged row (its literals moved there), the annotation is CORRECTLY at the narrow one
+  (nothing moved it), and the defect is that the `$fnsig` POOL keeps both and the call site
+  resolves the annotation's. A mechanism read off the code path, again, where a dump of what
+  the failing rung RECEIVED named it in one run.
 
-Repro (check rc 0; the module validates and the program TRAPS):
+Repro (prints `1` then `7`; was `wasm trap: indirect call type mismatch`):
 
     function src(p: {r: i32}): {r: i32} | null {
       p
@@ -23144,8 +23180,6 @@ Repro (check rc 0; the module validates and the program TRAPS):
       print(g1.r)
     }
     rd()
-    // vl check rc 0 (with a hint recommending exactly this deletion);
-    // vl run -> wasm trap: indirect call type mismatch. SHOULD PRINT 1 then 7.
 
 ---
 ### D948 — [CLOSED 2026-09-01] a binding that may hold TWO known functions is still an attributable call site, and moving one return row moves the whole set
@@ -32546,3 +32580,121 @@ Repro:
   and so never hit it). It should close by registering the clone's union where the direct
   spelling registers its own — not by an emit arm — and grade on every row above plus the
   D965 delivery matrix for the instantiated value.
+
+---
+### D1043 — a `??` merge that moves a function's rows breaks EVERY OTHER delivery of that function as a value: the binding hop, a wrapping lambda, a struct field, an array element and a two-target slot are all check-clean invalid wasm
+
+**check-clean invalid wasm · clause 1 · OPEN · found 2026-09-02 while closing [D940](#d940), by
+building D940's fix a DELIVERY MATRIX rather than one witness · present identically before the
+D940 fix, so it is residue and not a regression — measured against a `git archive HEAD` build**
+
+D940 closed the ARGUMENT position: `apply(src)`, a bare function name into a closure-typed
+parameter, where `src`'s param/return rows followed a `??` merge. Every other way of handing the
+same value over is still broken, and they were broken with the `: i32` annotation in place too —
+which is what shows the annotation was routing around the lowering rather than fixing it.
+
+Repro (each line is its own program; the merge is the last two lines of every one):
+
+    function src(p: {r: i32}): {r: i32} | null {
+      p
+    }
+    function apply(cb: ({r: i32}) => {r: i32} | null) {
+      const _v = cb({ r: 9 })
+      1
+    }
+    function rd() {
+      const h = src
+      print(apply(h))
+      const g1 = src({ r: 7 }) ?? { r: "s" }
+      print(g1.r)
+    }
+    rd()
+
+`Invalid input WebAssembly code … type mismatch: expected i32, found (ref $type)` in `rd`.
+
+* **THE MATRIX, MEASURED — seven positions, one program each, all `vl check` rc 0.** The four
+  that RUN are the ones D940 moved; the six that do not are this row.
+
+  | how `src` reaches the call | before D940 | after D940 |
+  | --- | --- | --- |
+  | bare-name argument, un-annotated HOF | trap_loads | **runs** |
+  | bare-name argument, annotated HOF (`: i32`) | runs | runs |
+  | argument is a BINDING (`const h = src; apply(h)`) | invalid wasm | invalid wasm |
+  | argument is a LAMBDA (`apply(q => src(q))`) | invalid wasm | invalid wasm |
+  | HOF reached through a binding holding two HOFs | invalid wasm | invalid wasm |
+  | struct FIELD (`{f: src}`, called through it) | invalid wasm | invalid wasm |
+  | array ELEMENT (`[src]`, called through it) | invalid wasm | invalid wasm |
+  | two functions into ONE slot (`apply(src)`, `apply(other)`) | invalid wasm | invalid wasm |
+  | HOF body binds the argument first (`const a = {r:4}; cb(a)`) | invalid wasm | **runs** |
+  | HOF reads the callback's RESULT through `??` | trap_loads | **runs** |
+
+* **IT IS NOT D940'S MECHANISM ONE POSITION OVER — THE FAMILY NEVER MINTS AT ALL.** The
+  disassembly of the binding cell shows `struct.new $0 (global.get $global$0)`: the merged row
+  was never built and the DEFAULT literal `{r: "s"}` is stored into the narrow `{r: i32}` row.
+  So the `$fnsig` disagreement D940 fixed is not what is happening here; the collect pass
+  refuses the merge and leaves the `??` to lower at the pre-merge row.
+
+* **THE ROUTE IN IS `anonLeafParamFnTarget` ANSWERING "".** It returns "" whenever the
+  parameter's call sites do not agree on ONE function name, and it also returns "" when more
+  than one `Param` in the program carries the parameter's NAME (`seen != 1`). Both make
+  `anonLeafCallMayTarget` refuse the callback's own call as a call site of `src`, and the
+  literal that call delivers then never joins the family. **The name collision is a live
+  hazard, not a hypothetical**: three higher-order functions in one module all spelling their
+  callback `cb` is check-clean invalid wasm, and giving them distinct names makes the same
+  program run. That is the module-wide name keying the playbook already warns about for capture
+  analysis, in a second resolver.
+
+* **THE ORDER TO FIX IT IN IS D965'S.** The delivery positions above are the position matrix;
+  build the family-mint side first (so a value delivered through a binding, a field or an
+  element is still a member), then wire each delivery, and only then consider narrowing
+  anything. A per-position patch will convert one invalid module into another.
+
+---
+### D1044 — `vl check --fix` moves 165 of 1,093 corpus fixtures `runs -> not-runs`: the compiler's own autofix for `redundant type annotation` deletes load-bearing annotations
+
+**loud check reject on the program the compiler's own autofix WROTE · OPEN · the repro below is
+one of 165, and the other 164 spread over every failing outcome the grader has a word for ·
+measured 2026-09-02 over `tests/cases/` · 166 on a `git archive HEAD` build and 165 after
+[D940](#d940), so it is pre-existing and one of them was D940's**
+
+D940 was found by deleting an annotation a hint called redundant and watching the program trap.
+That is not one fixture's bad luck. `vl check --fix --severity hint` over a COPY of `tests/cases`
+rewrites **1,093** files, and grading every rewritten file against its original gives
+`1093 changed · 165 runs -> not-runs`.
+
+Repro — `vl check` hints that `: i32[]` is redundant; `vl check --fix` deletes it; the result is
+this, which the SAME checker then refuses. Put the annotation back and it prints `0`:
+
+    function mk(len: i32) {
+      return __array_new_default__(len)
+    }
+    const zs = mk(6)
+    print(zs[0])
+
+`[ERROR]: cannot infer a type for 'zs' — add a type annotation`. The hint and the error are the
+same compiler disagreeing with itself about one annotation, in one file, in one run.
+
+The population measurement is the sweep, not this program: copy `tests/cases` aside, run
+`vl check <copy> --fix --severity hint`, then run each CHANGED file before and after.
+
+* **THE COUNT SPLITS BY WHICH ANNOTATION WAS DELETED, and the return-type half is the SMALL
+  one.** 129 of the 165 are a `let` / `const` annotation alone, 10 are a function RETURN
+  annotation alone, and 26 files lose both. So D940's own shape (`function f(…): T`) is 36 of
+  165 at most, and a fix scoped to `recordRedundantRet` cannot close this row.
+
+* **THE RECORDER ALREADY KNOWS THE SHAPE OF THE ANSWER — it just does not go far enough.**
+  `recordRedundantRet` excludes an object return, a non-classifiable return name and any
+  function with an un-annotated (hole) parameter, each for exactly this reason: the emitter
+  re-derives the type from the expression and can land on a different REP. Every remaining
+  breakage is another such case that nobody has named yet.
+
+* **A HINT SAYING AN ANNOTATION IS REDUNDANT IS THE CHECKER AGREEING ABOUT THE TYPE**, and says
+  nothing about whether the two spellings agree about the REP — which is the standing rule this
+  repo already writes down for fixtures. The finding here is that the compiler ships the same
+  mistake as advice, with an autofix attached.
+
+* **WHY IT IS FILED WITH A NUMBER RATHER THAN FIXED HERE.** Two honest closes exist and they
+  are different sizes. Narrowing the hint (stop offering it where the rep can move) is a
+  diagnostic change and would be measured by this same sweep reaching zero. Making the
+  un-annotated spelling LOWER THE SAME WAY is the goal-shaped close and is 165 witnesses of
+  work. The sweep is cheap (~7 minutes) and should be the acceptance test either way.
