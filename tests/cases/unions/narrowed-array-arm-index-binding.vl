@@ -1,0 +1,65 @@
+// @run
+// @log 1.5
+// @log 2.5
+// @log 3.5
+// Regression (silent-class-inventory D1012).
+//
+// `const e = v[0]` where `v` is a self-recursive union NARROWED to its ARRAY arm, in a
+// union that ALSO has a map arm. On master this was a loud emit reject —
+//
+//   emitProgram: map op receiver is not a map
+//
+// — and the two ends of that sentence were emitted by the same predicate disagreeing with
+// itself. `mapReadMvSlot` classified the binding as a union-valued MAP read, so
+// `emitLetDeclStmt` took its union-box arm, whose `emitMapRecvKey` then asked `exprMap`
+// about the very receiver `mapReadMvSlot` had just called a map — and got FALSE, because
+// the `is` narrow makes it an array.
+//
+// THE SITE IS NOT THE ONE IT LOOKS LIKE. `emitExpr`'s Index arm carries a visibly similar
+// `if exprMap(e.idxArr, fnIx) { return emitMapGet(…) }`, and it is the natural suspect.
+// It is not reached: a BINDING whose initialiser is an index never goes through it. A
+// narrowed-array bypass there changes nothing, and neither does FORCING that bypass for
+// this exact receiver — measured, both.
+//
+// The real cause is a deliberately narrowing-BLIND fallback in `mapReadMvSlot`, added so
+// the frame PRE-PASS (where no `is` narrow is active yet) can still resolve a union's map
+// arm. Blind is correct there and wrong here: when a narrow IS active and says "array",
+// `exprMap` missing is the answer, not a pre-pass artefact. The fallback now declines that
+// case and every other one behaves as before — the map arm below is the same fallback
+// still doing its job.
+type K = f64 | K[] | { [string]: K }
+
+function g(v: K) {
+  if v is K[] {
+    const e = v[0]
+    if e is f64 { print(e) }
+  }
+  if v is { [string]: K } {
+    const e2 = v["k"]
+    if e2 is f64 { print(e2) }
+  }
+}
+
+g([1.5])
+
+const mm: { [string]: K } = Map()
+mm["k"] = 2.5
+g(mm)
+
+// A nested array arm reads through the same binding path. The inner list is built
+// through an annotated binding — a bare `[[3.5]]` literal is a separate open gap
+// (leaf-scalar widening across a nested array), unrelated to this row.
+const inner35: K[] = [3.5]
+const outer35: K[] = [inner35]
+
+function h(v: K) {
+  if v is K[] {
+    const a = v[0]
+    if a is K[] {
+      const leaf = a[0]
+      if leaf is f64 { print(leaf) }
+    }
+  }
+}
+
+h(outer35)
