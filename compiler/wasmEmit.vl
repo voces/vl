@@ -811,6 +811,7 @@ import {
   unionEqStashSlot,
   unionEqArmSlot,
   unionEqStashSlot2,
+  unionLitIsStashSlot,
   internInlineShapeTy,
   structEqStashSlot,
   rlSlotByNameKeyTy,
@@ -6185,11 +6186,18 @@ function emitUnionUnionEq(
 // rep has no arm is statically false (literal-is-always-false), evaluating the
 // receiver for effects. The same gated shape as `emitUnionConcreteEq`.
 function emitUnionLitIs(body: i32[], objIx: i32, lit: string, fnIx: i32) {
-  if !unionEqOperandOk(objIx) {
-    return emitFail(
-      "emitProgram: literal `is` over a non-binding union value is not supported yet",
-    )
-  }
+  // D1060 — A NON-RE-READABLE RECEIVER IS STASHED AT ITS FIRST READ, not refused; the same
+  // move D972 made for `emitUnionConcreteEq`, for the same reason and with the same bound.
+  // The compare reads the box TWICE (the tag, then the payload inside the tag-matched arm),
+  // which is the whole content of `unionEqOperandOk` — so a CALL receiver, or a field/element
+  // path ROOTED at a call, refused while `const u = mk(0); u is "a"` ran and printed the
+  // right answer.
+  //
+  // TEED AT THE FIRST READ rather than pre-emitted at the top: the receiver must be evaluated
+  // where the original code evaluated it, so any context the surrounding lowering seeded is
+  // still in force, and so the static-false fold below still evaluates it EXACTLY ONCE.
+  const isStash = unionLitIsStashSlot()
+  const isOnce = !unionEqOperandOk(objIx)
   const uname = unionNameOfExpr(objIx, fnIx)
   // D-VALUNION / D-SETONCE — see `emitUnionConcreteEq`.
   const usid = msSetOfText(uname)
@@ -6266,11 +6274,13 @@ function emitUnionLitIs(body: i32[], objIx: i32, lit: string, fnIx: i32) {
     )
   }
   if emitExpr(body, objIx, fnIx) < 0 { return -1 }
+  if isOnce { fbLocalTee(isStash) }
   fbStructGet(uBoxIdx, 0) // 0xfb 0x02 <box ht> field 0: tag
   fbI32Const(scalarTagOfKind(lak))
   fbI32Bin(70)            // 0x46 i32.eq
   fbIf(127)               // 0x04 if, 0x7f i32 result blocktype
-  if emitExpr(body, objIx, fnIx) < 0 { return -1 }
+  if isOnce { fbLocalGet(isStash) }
+  else if emitExpr(body, objIx, fnIx) < 0 { return -1 }
   fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
   if emitUnionPayloadUnbox(body, lak) < 0 { return -1 }
   if lak == 2 {
