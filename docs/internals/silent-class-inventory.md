@@ -29647,3 +29647,299 @@ Repro (check-clean silently wrong):
     print(x)
     // PRINTS 2023347301156851.3
     // the spec, `toString(x)` from std:fmt, and the `\{x}` hole all say 2023347301156851.2
+
+---
+
+### D1012 — indexing an `is`-narrowed self-referential ARRAY arm INTO A LOCAL refuses, and the ingredient is a self-referential MAP arm the program never touches
+
+**loud emit reject · check rc 0 · `emitProgram: map op receiver is not a map` (`compiler/wasmEmit.vl:7796`) · the receiver is a narrowed ARRAY and no map is constructed anywhere in the program — the MAP ARM'S PRESENCE IN THE ALIAS is the whole ingredient · five ablations RUN unchanged, `for e in v` over the same value among them · fires identically at module `const`, at a parameter and inside a function body · found by the serde round-3 POSITION matrix (`docs/serde-design.md` appendix, residue (e)) and re-measured cell by cell here on the 2026-09-01 seed**
+
+`type K = f64 | K[] | { [string]: K }` is the JSON value tree's own shape minus the leaf
+scalars. Narrow to the array arm, index it, and BIND the result — the emitter routes the
+index through a map-op path and fails a receiver test that the value could never pass,
+because the value is an array. The program contains no `Map()`, no `[k]` on a map, no
+`.keys()`; deleting the map arm from the ALIAS is enough to make it run.
+
+* **ABLATED, one ingredient at a time — every one of these RUNS (measured, this seed).**
+
+  | spelling | change from the witness | outcome |
+  | --- | --- | --- |
+  | `if v is K[] { for e in v { if e is f64 { print(e) } } }` | iterate instead of index | RUNS → `2.5` |
+  | `if v is K[] { print(v.length) }` | the other array op | RUNS → `1` |
+  | `g(v[0])` against `function g(x: K)` | index result → ARGUMENT, not a local | RUNS → `2.5` |
+  | `type K = f64 \| K[]` | drop the map arm | RUNS → `2.5` |
+  | `type K = f64 \| K[] \| { [string]: f64 }` | make the map arm NON-recursive | RUNS → `2.5` |
+
+  So the family is: *self-referential array arm* + *self-referential map arm in the same
+  alias* + *the index result BOUND to a local*. Remove any one and it compiles.
+
+* **POSITION IS NOT AN INGREDIENT.** The same five lines inside `function h(v: K) { … }`
+  called as `h([2.5])`, and the same five lines inside a `function main()` body, both refuse
+  with the identical message. That is the opposite of D965's shape — there is nothing to
+  wire per position here, there is one classifier picking the wrong path.
+
+* **CLAUSE 2 BY CONSTRUCTION.** `vl check` returns 0, so either the program is legal and must
+  compile, or the CHECKER owed the diagnosis. The message is an internal-invariant sentence
+  (`… is not a map`), which is exactly D964's point: it concedes nothing, so
+  `goal-scoreboard.py --sites` does not count it and never will.
+
+Repro (loud emit reject):
+
+    type K = f64 | K[] | { [string]: K }
+    const v: K = [2.5]
+    if v is K[] {
+      const e = v[0]
+      if e is f64 { print(e) }
+    }
+
+---
+
+### D1013 — `print` of a local RE-BOUND from an `is`-narrowed REF arm is check-clean invalid wasm: D968 fixed the narrowed RECEIVER and the rebind kept the box
+
+**check-clean invalid wasm · check rc 0 · `Invalid input WebAssembly code at offset 312: type mismatch: expected i32, found (ref $type)` — a ref arriving at `__print_i32__`, the same sentence D968 fixed one spelling earlier · sibling of D968, which handled `print(v)` on a `!= null`-narrowed receiver; this is `const a = v` inside an `is` narrow and then `print(a)` · SIX ablations RUN, including `print(v)` with no rebind and `const a: string = v` with the annotation · `let a = v` fails identically to `const` · the ANNOTATION pins it, so a fixture that annotates cannot see this — the D962/D969 shape · found by the serde round-3 appendix (residue (f)), re-measured 2026-09-01**
+
+An `is` narrow to ONE arm should leave the value at that arm's own rep — that is exactly the
+reasoning D968's fix rests on (`printUnionRecvIsBox` declines the tag-dispatch plan for a
+narrow to one atom, correctly). Re-binding the narrowed value to a fresh local loses it: the
+local is given the union's boxed rep while `print` is emitted against the atom's, and the
+module does not validate.
+
+* **ABLATED — all six of these RUN (measured, this seed).**
+
+  | spelling | outcome |
+  | --- | --- |
+  | `if v is string { print(v) }` — no rebind | RUNS → `x` |
+  | `const a: string = v` — the rebind ANNOTATED | RUNS → `x` |
+  | `const a = v` then `print(a + "y")` — concatenation, not bare print | RUNS → `xy` |
+  | `const a = v` then `s(a)` against `function s(t: string)` | RUNS → `x` |
+  | `type K = f64 \| i32` at the `i32` arm — a SCALAR arm | RUNS → `3` |
+  | `type K = null \| string` narrowed with `if v != null` | RUNS → `x` |
+
+  `let a = v` in place of `const a = v` is byte-for-byte the same failure, so mutability is
+  not an ingredient. The ingredient is: *a REF-repped arm*, *reached by an `is` narrow*,
+  *re-bound WITHOUT an annotation*, *consumed by bare `print`*.
+
+* **ARM SWEEP over the six-arm `Json` tree.** `type Json = null | boolean | f64 | string |
+  Json[] | { [string]: Json }`, same rebind-then-print: the **string** arm is silent (offset
+  424), the **f64** and **boolean** arms RUN. Consistent with the rep story — the two that
+  run are the scalar arms.
+
+* **A CORRECTION TO THE SOURCE THIS ROW CAME FROM.** `docs/serde-design.md` residue (f) adds
+  "over `type K = f64 | K[]` the recursive array arm is SILENT too (`print(a.length)`)".
+  That is a CONFOUNDED cell, not this defect. Its program builds the array with a BARE
+  literal, which is D1015; feed the same rebind an ANNOTATED intermediate
+  (`const arr: K[] = [2.5]` / `const v: K = arr`) and it RUNS, printing `1`. The two are also
+  separable by message — this row is `expected i32, found (ref $type)`, the bare-literal one
+  is `expected (ref $type), found (ref $type)` — and CLAUDE.md's rule applies in both
+  directions: the shared validator sentence is not what makes two cells one family, and a
+  different one is not what makes them two. The ABLATION is: annotate the intermediate and
+  the array cell runs; annotate the rebind and this one runs. Different fixes.
+
+* **INVISIBLE TO THE SCOREBOARD, for D968's exact reason.** No corpus cell has this shape, so
+  clause 1 reads it as nothing. It was found by hand off a design doc's own probe.
+
+* **INDEPENDENTLY REPRODUCED** by vl-de on the live seed, 2026-09-01: `const a: string = v`
+  prints, and the bare re-bind fails to compile. Two agents, same seed, same split.
+
+* **PROBED AND NEGATIVE (vl-de, 2026-09-01) — do not repeat these two.** (1) Forcing
+  `letIsString` true for the re-bound local changes NOTHING. (2) Forcing the local's slot to
+  `"str"` in the 24-branch ladder in `emit_collect` (the `letIsLitUnion || letInitIsLitAtom`
+  head) changes NOTHING. So neither the string classifier nor the slot kind is the decision
+  being made wrongly. The decision is at the value being STORED, or at its READ — which
+  means the probe belongs at the CONSUMER, keyed on the argument node, not at the classifier
+  keyed on a name. That is the D976 lesson arriving a second time: a classifier keyed by
+  name cannot see a fact that belongs to one expression.
+
+Repro (check-clean invalid wasm):
+
+    type K = f64 | string
+    const v: K = "x"
+    if v is string {
+      const a = v
+      print(a)
+    }
+
+---
+
+### D1014 — an `is` narrowing whose receiver is a struct FIELD or an ARRAY ELEMENT never reaches the emitter: FOUR messages, one mechanism
+
+**loud emit reject · check rc 0 · `emitProgram: unsupported for-in iterable` (`compiler/wasmEmit.vl:19617`, `compiler/emit_collect.vl:3990`) at the primary spelling, and the same lost narrowing surfaces as `narrowed union field atom has no value box` (`wasmEmit.vl:6403`/`:4143`), `index access but array type not collected` (`wasmEmit.vl:10371`) and `callee is not a function name` (`wasmEmit.vl:14825`) at three others · the family is defined by the ABLATION, not by the sentences — hoisting the read into a local before the `if` makes all four RUN, and the same field with NO union runs at every spelling · found by the serde round-3 POSITION matrix (residue (g)), which had to hoist EVERY non-identifier receiver to keep three rows of the matrix from being coloured by this · re-measured 2026-09-01**
+
+`if n.v is K[]` type-checks: the checker narrows the field read and every consumer downstream
+sees the narrowed type. The emitter never receives that fact, so whatever it does next it does
+against the DECLARED union type, and it fails at whichever consumer comes first. That is why
+four different sentences come out of one defect — the message names the consumer, not the
+mechanism. CLAUDE.md's rule ("let the ablation define the family, never the message") is what
+makes this ONE row rather than four.
+
+* **THE ABLATION THAT DEFINES IT — measured, this seed.** Hoist the receiver into a local and
+  narrow the LOCAL, and every one of the four spellings RUNS. On the primary witness that is
+  one inserted line: `const q = n.v` before the `if`, then
+  `if q is K[] { for e in q { if e is f64 { print(e) } } }` — RUNS, prints `2.5`.
+  And the same field with NO union in it (`type N = { v: f64[] }`) runs at both the `for in`
+  and the index spelling, printing `2.5` twice — so it is the NARROWING that is lost, not the
+  field read.
+
+* **THE FOUR MESSAGES, each measured at its own spelling** (all `vl check` rc 0):
+
+  | receiver | consumer | message |
+  | --- | --- | --- |
+  | struct field, `type K = f64 \| K[]` | `for e in n.v` | `unsupported for-in iterable` |
+  | struct field, `type K = f64 \| f64[]` | `for e in n.v` | `narrowed union field atom has no value box` |
+  | struct field, `type K = f64 \| K[]` | `const e = n.v[0]` | `index access but array type not collected` |
+  | struct field, `type K = f64 \| { [string]: K }` | `for k in n.v.keys()` | `callee is not a function name` |
+  | ARRAY ELEMENT, `xs[0]` | `for e in xs[0]` | `unsupported for-in iterable` |
+
+  The array-element row is what makes this "a non-identifier receiver" rather than "a struct
+  field": the same loss happens when the receiver is `xs[0]`.
+
+* **WHY IT MATTERS.** Every recursive-tree walker written the obvious way hits this at its
+  first field. The workaround is one line per read and is what the round-3 `std:json`-shaped
+  round trip does throughout — but it is a workaround for a narrowing that does not survive
+  the front end, and it silently changes what the matrix above was measuring.
+
+* **WHERE TO LOOK.** Not at the four `emitFail` sites — those are downstream floors doing the
+  right thing with the type they were handed. The narrowing table the checker builds is keyed
+  by identifier; a field or element receiver has no key, so the emitter reads the declared
+  type. `compiler/typecheck.vl:3070` already records this in a comment for the callee case
+  ("a field that is an ARRAY …"), which is the same observation from the other side.
+
+Repro (loud emit reject):
+
+    type K = f64 | K[]
+    type N = { v: K }
+    const n: N = { v: [2.5] }
+    if n.v is K[] { for e in n.v { if e is f64 { print(e) } } }
+
+The second spelling — a NON-recursive array arm, same field receiver — reaches a different
+floor, `emitProgram: narrowed union field atom has no value box`:
+
+    type K = f64 | f64[]
+    type N = { v: K }
+    const n: N = { v: [2.5] }
+    if n.v is f64[] { for e in n.v { print(e) } }
+
+The third — index the narrowed field instead of iterating it — reaches `emitProgram: index
+access but array type not collected`:
+
+    type K = f64 | K[]
+    type N = { v: K }
+    const n: N = { v: [2.5] }
+    if n.v is K[] {
+      const e = n.v[0]
+      if e is f64 { print(e) }
+    }
+
+The fourth — the MAP arm, whose consumer is a method call — reaches `emitProgram: callee is
+not a function name`:
+
+    type K = f64 | { [string]: K }
+    const mv: { [string]: K } = Map()
+    mv["k"] = 2.5
+    type N = { v: K }
+    const n: N = { v: mv }
+    if n.v is { [string]: K } { for k in n.v.keys() { print(k) } }
+
+---
+
+### D1015 — a bare array literal of STRINGS at a recursive-union destination gets an array whose ELEMENT rep is wrong: `for in` read-back is check-clean invalid wasm, an INDEXED read-back runs
+
+**check-clean invalid wasm · check rc 0 · `Invalid input WebAssembly code at offset 350: type mismatch: expected (ref $type), found (ref $type)` · the ingredient is the BARE literal at the union destination — `const a: K[] = ["x"]` then `const c: K = a` RUNS and prints `x` · and it is NOT element read-back in general: `if c is K[] { const e = c[0]; if e is string { print(e) } }` on the same bare literal RUNS and prints `x`, while `print(c.length)` on it RUNS and prints `1` · `f64` and `boolean` elements RUN at the identical bare spelling · found by the serde round-3 appendix (residue (b)), and the indexed-read-back scope fact measured by the coordinator 2026-09-01 and confirmed here**
+
+The bare literal builds an array that exists and has the right length; what it does not have
+is an element rep the narrowed read-back agrees with. Which read-back exposes that depends on
+the arm, which is why the row's headline is the ABLATION and not the message — the validator
+sentence here (`(ref $type)` on both sides, both elided) is the one CLAUDE.md names as
+carrying no mechanism at all.
+
+* **THE ABLATION GRID — every cell measured on this seed.** `type K = string | K[]` unless
+  noted; "bare" is `const c: K = ["x"]`, "annotated" is `const a: K[] = ["x"]` then
+  `const c: K = a`.
+
+  | literal | read-back | outcome |
+  | --- | --- | --- |
+  | bare | `for e in c { if e is string { print(e) } }` | **SILENT** (offset 350) |
+  | annotated | the same `for in` | RUNS → `x` |
+  | bare | `const e = c[0]; if e is string` — INDEXED | RUNS → `x` |
+  | bare | `print(c.length)` on the narrowed receiver | RUNS → `1` |
+  | bare | `const a = c; print(a.length)` — receiver RE-BOUND | **SILENT** (offset 317) |
+  | bare, `["x", "y"]` | `for in` | **SILENT** (offset 377) |
+  | bare, `type K = f64 \| K[]`, `[2.5]` | `for in` | RUNS → `2.5` |
+  | bare, `type K = boolean \| K[]`, `[true]` | `for in` | RUNS → `true` |
+  | bare, `type K = f64 \| K[]`, `[2.5]` | `const a = c; print(a.length)` | **SILENT** (offset 269) |
+  | annotated, `type K = f64 \| K[]` | `const a = c; print(a.length)` | RUNS → `1` |
+
+  Read the last four rows together: the `for in` spelling needs a REF element to fail, the
+  receiver-rebind spelling fails at `f64` too — and the annotated intermediate clears BOTH.
+  So the one ingredient common to every silent cell is the bare literal at the union
+  destination; the read-back only decides whether the bad rep is ever looked at.
+
+* **THE `null` CONTROL DOES NOT EXIST AT THIS SHAPE, and the source doc's claim that it runs
+  did not reproduce.** Residue (b) lists "f64, boolean and null elements all RUN". `f64` and
+  `boolean` do. A `null` ELEMENT needs `null` in the alias, and that changes the program at
+  check time: `type K = null | K[]` refuses the narrow itself — `` `is` check type 'K[]' is
+  not a variant of K[] | null `` — which is fact 5's mechanism 1, not this row; and
+  `type K = null | string | K[]` with `const c: K = [null]` is a DIFFERENT emit refusal,
+  `emitProgram: bare null needs a struct-typed context`. Neither is a control for this
+  defect. Filed as measured rather than as quoted.
+
+* **THE ANNOTATION PINS IT**, which is the D962/D969 shape again: any fixture written with
+  `const a: K[] = […]` at the destination is structurally unable to see this.
+
+Repro (check-clean invalid wasm):
+
+    type K = string | K[]
+    const c: K = ["x"]
+    if c is K[] { for e in c { if e is string { print(e) } } }
+
+---
+
+### D1016 — a bare NESTED array literal refuses at ALL THREE delivery boundaries into `Json`, and a bare literal holding a MAP refuses with a second sentence; annotating the literal clears both
+
+**loud emit reject · check rc 0 · `emitProgram: array value does not match any array member of the union (leaf-scalar widening across a nested array is unsupported)` (`compiler/wasmEmit.vl:4887`) at binding, argument AND map-write · a bare literal whose element is a MAP instead takes `emitProgram: a union arm that is an array-of-map is not yet supported — use a named element type` (`wasmEmit.vl:4921`) · both are cleared by annotating the literal `Json[]` and delivering that · `goal-scoreboard.py --sites` lists the array-of-map literal as a **ZERO** row (no corpus cell reaches it) and does NOT count the nested-array one at all — its wording says "is unsupported", which the `CONCEDES` filter does not match, so it is a D964 lower-bound case · found by the serde round-3 appendix (residues (c) and (d)), re-measured 2026-09-01**
+
+Both are the same delivery: an ARRAY LITERAL, written bare, at a destination typed as the
+recursive union rather than as its array arm. `[2.5]` at `Json` works; `[[2.5]]` does not,
+and neither does `[mv]`. The union's array arm is `Json[]`, whose element type is `Json`, so
+both inner values (an array, a map) are legal members — the widening walk just has no case
+for a non-leaf element.
+
+* **THE POSITION MATRIX IS UNIFORM, and that is worth recording.** All three boundaries take
+  the SAME message, so this is not D965's shape — there is one refusal serving one missing
+  lowering, not a gate narrowed ahead of its deliveries:
+
+  | boundary | spelling | outcome |
+  | --- | --- | --- |
+  | binding | `const c: Json = [[2.5]]` | emit reject |
+  | argument | `f([[2.5]])` against `function f(v: Json)` | emit reject, same message |
+  | map write | `m["a"] = [[2.5]]` into `{ [string]: Json }` | emit reject, same message |
+
+  Closing it therefore means BUILDING the widening, not narrowing the gate — and the D965
+  order applies to the fix, not to the current state: wire every delivery before the gate
+  moves, or the three rows above become three silent ones.
+
+* **THE CONTROLS RUN.** `const a: Json[] = [[2.5]]` then `const c: Json = a` RUNS and prints
+  `1`; `const a: Json[] = [mv]` then `const c: Json = a` RUNS and prints `1`. So the arms
+  themselves have reps and the values are constructible — what is missing is the conversion
+  at the literal→union boundary. Same annotation-pins-it shape as D1010 and D1015.
+
+* **CLAUSE 2, AND ONE OF THEM IS COUNTED.** `wasmEmit.vl:4921` ("not yet supported") is one
+  of the 22 capability literals `--sites` reports, and it is a ZERO row: no corpus cell
+  reaches it, so the scoreboard cannot see it move. `wasmEmit.vl:4887` is not counted at all.
+  Both need a hand-written probe under `scripts/capability-probes/` before either can be
+  graded by anything but this row.
+
+Repro (loud emit reject):
+
+    type Json = null | boolean | f64 | string | Json[] | { [string]: Json }
+    const c: Json = [[2.5]]
+    print(1)
+
+The MAP-element spelling, which reaches the second literal (`emitProgram: a union arm that is
+an array-of-map is not yet supported — use a named element type`):
+
+    type Json = null | boolean | f64 | string | Json[] | { [string]: Json }
+    const mv: { [string]: Json } = Map()
+    mv["k"] = 2.5
+    const c: Json = [mv]
+    print(1)
