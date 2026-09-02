@@ -1,19 +1,24 @@
-// A `for`-loop VARIABLE sharing a spelling with a nested function's NAME, captured by a closure.
-//
-//   check rc 0, then: type mismatch: expected i32, found (ref $type)
+// A LOCAL sharing a spelling with a FUNCTION's name, captured by a closure.
 //
 // silent-class inventory D1130 — a clause-1 miscompile found 2026-09-02 while measuring how many
 // emit-side refusal sites are reachable, and verified independently before filing.
 //
-// MECHANISM: `capRecord` drops the capture because `fnIndexOf(name) >= 0` — the name IS a
-// function somewhere in the module — while `plScanStmt` records only a `LetDecl` and never a
-// `ForRange.frVar` / `ForIn.fiVar`. The emitter then resolves the name through
-// `fnIndexOfInScopeSid` and emits a closure value where an i32 is wanted.
+// MECHANISM, two independent halves. `exprIsClosureNoLocal`'s `Ident` arm asked the MODULE-WIDE
+// `fnIndexOfSid` ahead of every scope question, so a lifted function whose tail reads a local
+// named `q` was declared `(result (ref $closure))` over a body pushing an i32. And `plScanStmt`
+// recorded only a `LetDecl`, never a `ForRange.frVar` / `ForIn.fiVar`, so `parentBindingFrameOf`
+// answered "this frame binds nothing of that name" for a loop variable and `capRecord`'s
+// global/function-name guard dropped the capture entirely (a NULL env).
 //
-// The two halves are independent and BOTH are needed: rename the loop variable and it runs;
-// delete the nested `function q` and it runs; drop the closure and it runs.
+// The loop variable was the narrowest of six faces: a `while`-body `const`, a PARAMETER, a
+// module-scope (not nested) function, a `for-in` loop, a nested NAMED capturing function, a
+// transitive capture two frames down and a module-LEVEL loop all reproduced it, and a colliding
+// module GLOBAL was a SILENTLY WRONG ANSWER (three reads of the global, exit 0) rather than
+// invalid wasm.
 //
-// Should print 1 then 6.
+// Should print: 1 6 1 6 1 6 1 6 100 6 6
+
+// The filed witness: a `for` variable against a NESTED function's name.
 function other(): i32 {
   function q(): i32 { 1 }
   q()
@@ -30,3 +35,89 @@ function go(): i32 {
 
 print(other())
 print(go())
+
+// The same collision against a body `const` — no loop anywhere. Half 1 alone.
+function other2(): i32 {
+  function w(): i32 { 1 }
+  w()
+}
+
+function go2(): i32 {
+  let s = 0
+  let i = 1
+  while i <= 3 {
+    const w = i
+    const f = () => w
+    s = s + f()
+    i = i + 1
+  }
+  s
+}
+
+print(other2())
+print(go2())
+
+// The same collision against a PARAMETER. The capture is recorded correctly here — only the
+// lifted function's RESULT valtype was wrong — which is what proves the halves independent.
+function other3(): i32 {
+  function p(): i32 { 1 }
+  p()
+}
+
+function go3(p: i32): i32 {
+  const f = () => p
+  f()
+}
+
+print(other3())
+print(go3(6))
+
+// A TRANSITIVE capture two frames down, over a `for-in` loop variable.
+function other4(): i32 {
+  function t(): i32 { 1 }
+  t()
+}
+
+function go4(): i32 {
+  let s = 0
+  for t in [1, 2, 3] {
+    const outer = () => {
+      const inner = () => t
+      inner()
+    }
+    s = s + outer()
+  }
+  s
+}
+
+print(other4())
+print(go4())
+
+// A module GLOBAL of the same spelling — the SILENTLY WRONG face. Printed 300 (three reads of
+// the global) where 6 is correct, at exit 0 and with no diagnostic at any tier.
+let g = 100
+
+function go5(): i32 {
+  let s = 0
+  for g in 1 to 3 {
+    const f = () => g
+    s = s + f()
+  }
+  s
+}
+
+print(g)
+print(go5())
+
+// A MODULE-LEVEL loop capturing its own variable against a module function's name. The module
+// top level is not a lifted frame, so the parent-frame walk runs off the end before it can
+// answer; `moduleBindsLoopVar` is the arm that reaches it. This face TRAPPED
+// (`indirect call type mismatch`) rather than failing to validate.
+function m(): i32 { 1 }
+
+let ms = 0
+for m in 1 to 3 {
+  const f = () => m
+  ms = ms + f()
+}
+print(ms)

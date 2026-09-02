@@ -17199,19 +17199,39 @@ function listOpRecvNarrowedUnion(objIx: i32, name: string, fnIx: i32) {
 // `op` names the operation in the two diagnostics; `allowIndex` is the one behavioural
 // difference between the callers (only `.push` accepts an INDEXED receiver, whose inner list
 // the classifiers upstream have already resolved into `base`).
+// The scratch base a receiver that STAGES will use. `base` is the family default the
+// caller already resolved; `refSlot >= 0` defers the REF family's per-element-type frame
+// to here, the one point that knows staging is actually happening.
+//
+// A `.pop`/`.clear` touches the frame only to stage a receiver it cannot read in place (a
+// struct field, a module global, a narrowed union box) — a bare list LOCAL is read
+// directly — while a `.push` reads `base`..`base+2` for its grow sequence whatever the
+// receiver is. So the ref frame is reserved for the first group and not the second, and
+// resolving it EAGERLY made a bare-local ref-element `.clear()`/`.pop()` inside a function
+// a loud refusal: nothing had reserved a frame (correctly), and `refPushScratchBaseFor`
+// reads "no frame" as "the pre-pass classified this receiver differently from the emit"
+// and fails. The tell was that `xs.clear()` alone refused while `xs.clear()` followed by
+// an `xs.push(…)` ran — the push had reserved the frame the clear then found.
+function listOpStageBase(base: i32, refSlot: i32): i32 {
+  if refSlot < 0 { return base }
+  refPushScratchBaseFor(refSlot)
+}
+
 function listOpRecvLocal(
   body: i32[],
   objIx: i32,
   fnIx: i32,
   base: i32,
+  refSlot: i32,
   op: string,
   allowIndex: boolean,
 ): i32 {
   const recv = P.nodes[objIx]
   if recv is Ident {
     if listOpRecvNarrowedUnion(objIx, recv.identName, fnIx) {
-      if stageListRecv(body, objIx, fnIx, base) < 0 { return -1 }
-      return base + 3
+      const sb = listOpStageBase(base, refSlot)
+      if stageListRecv(body, objIx, fnIx, sb) < 0 { return -1 }
+      return sb + 3
     }
     const lIdx = localIndexOf(fnIx, recv.identName)
     if lIdx >= 0 { return lIdx }
@@ -17220,20 +17240,23 @@ function listOpRecvLocal(
     if globalIndexOfSid(sidOfNode(objIx)) < 0 {
       return emitFail("emitProgram: " + op + " receiver is not a list local")
     }
-    if stageListRecv(body, objIx, fnIx, base) < 0 { return -1 }
-    return base + 3
+    const gb = listOpStageBase(base, refSlot)
+    if stageListRecv(body, objIx, fnIx, gb) < 0 { return -1 }
+    return gb + 3
   }
   if recv is Member {
-    if stageListRecv(body, objIx, fnIx, base) < 0 { return -1 }
-    return base + 3
+    const mb = listOpStageBase(base, refSlot)
+    if stageListRecv(body, objIx, fnIx, mb) < 0 { return -1 }
+    return mb + 3
   }
   if allowIndex {
     // An INDEXED receiver (`g[0].push(x)` - push onto an INNER list of a nested array, or
     // onto a list read from a list-valued map). The classifiers upstream already recognize a
     // nested `g[i]` read as its inner list, so `lTy`/`aTy`/`base` are the inner list's.
     if recv is Index {
-      if stageListRecv(body, objIx, fnIx, base) < 0 { return -1 }
-      return base + 3
+      const ib = listOpStageBase(base, refSlot)
+      if stageListRecv(body, objIx, fnIx, ib) < 0 { return -1 }
+      return ib + 3
     }
     return emitFail(
       "emitProgram: " +
@@ -17418,9 +17441,12 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32) {
         callee.memObj,
         fnIx,
         base,
+        -1,
         ".push",
         true,
       )
+      // `.push` always needs the frame, so its base is already resolved
+
       if lIdx < 0 { return -1 }
       if true {
         if c.callArgs.length != 1 {
@@ -17613,6 +17639,10 @@ function emitPop(body: i32[], callIx: i32, fnIx: i32) {
       let lTy = lTypeIdx
       let aTy = aTypeIdx
       let base = pushScratchBase
+      // The ref-list table slot whose scratch frame a STAGING receiver would use, or -1
+      // for every other family. Handed to `listOpRecvLocal` so the frame is resolved only
+      // where staging happens — see `listOpStageBase`.
+      let popRefSlot = -1
       let elemIsRef = false
       if isRef {
         if !rlUsed {
@@ -17623,7 +17653,7 @@ function emitPop(body: i32[], callIx: i32, fnIx: i32) {
         const rslot = refListSlotOfExpr(callee.memObj, fnIx)
         lTy = rlWrapIdx[rslot]
         aTy = rlBackIdx[rslot]
-        base = refPushScratchBaseFor(rslot)
+        popRefSlot = rslot
         elemIsRef = true
       } else if popEk != null {
         // The scalar sibling of the i32 default below: same shape, a per-kind wrapper,
@@ -17653,6 +17683,7 @@ function emitPop(body: i32[], callIx: i32, fnIx: i32) {
         callee.memObj,
         fnIx,
         base,
+        popRefSlot,
         ".pop",
         false,
       )
@@ -17715,11 +17746,25 @@ function emitClear(body: i32[], callIx: i32, fnIx: i32) {
       }
       const isRef = exprRefArray(callee.memObj, fnIx)
       const isStr = exprStringArray(callee.memObj, fnIx)
-      if !isRef && !isStr && !exprArray(callee.memObj, fnIx) {
+      // THE SCALAR-LIST FAMILY, the arm `emitPop` grew at D977 and this one did not.
+      // `exprArray` claims any i32-ELEMENT list, so `i64[]` / `f64[]` / `f32[]` / `u8[]`
+      // either fell through to "receiver is not a list" or — worse, wherever the i32 list
+      // type happened to be collected — reset the length THROUGH THE i32 WRAPPER over a
+      // value of another kind's wrapper type: `vl check` rc 0 and INVALID WASM.
+      let clearEk = scalarListElemKind(callee.memObj, fnIx)
+      if clearEk == "i32" { clearEk = null }
+      if (
+        !isRef &&
+        !isStr &&
+        clearEk == null &&
+        !exprArray(callee.memObj, fnIx)
+      ) {
         return emitFail("emitProgram: .clear receiver is not a list")
       }
       let lTy = lTypeIdx
       let base = pushScratchBase
+      // See `emitPop`'s `popRefSlot`.
+      let clearRefSlot = -1
       if isRef {
         if !rlUsed {
           return emitFail(
@@ -17728,7 +17773,15 @@ function emitClear(body: i32[], callIx: i32, fnIx: i32) {
         }
         const rslot = refListSlotOfExpr(callee.memObj, fnIx)
         lTy = rlWrapIdx[rslot]
-        base = refPushScratchBaseFor(rslot)
+        clearRefSlot = rslot
+      } else if clearEk != null {
+        // The scalar sibling of the i32 default below, and `emitPop`'s arm minus the
+        // backing (a `.clear` writes only the length field, so no `aTy`).
+        if !scalarListUsedOf(clearEk) {
+          return emitFail("emitProgram: .clear but list type not collected")
+        }
+        lTy = scalarListWrap(clearEk)
+        base = scalarPushScratchBaseOf(clearEk)
       } else if isStr {
         if !slUsed {
           return emitFail(
@@ -17745,6 +17798,7 @@ function emitClear(body: i32[], callIx: i32, fnIx: i32) {
         callee.memObj,
         fnIx,
         base,
+        clearRefSlot,
         ".clear",
         false,
       )
@@ -17910,9 +17964,12 @@ function emitPopOr(body: i32[], popIx: i32, defIx: i32, fnIx: i32) {
         callee.memObj,
         fnIx,
         base,
+        -1,
         ".pop",
         false,
       )
+      // the fused `pop ?? d` is i32-family only; no ref frame to defer
+
       if lIdx < 0 { return -1 }
       // cond: len != 0 (len is never negative)
       pushListLen(body, lIdx, lTy)
@@ -20347,11 +20404,17 @@ function emitCallStmt(body: i32[], s: Call, stmtIx: i32, fnIx: i32) {
       return 0
     }
     // A `.clear()` STATEMENT resets the list's length to 0 (backing retained).
+    // The gate carries the SCALAR reps (`scalarListElemKind`) alongside the i32 / ref /
+    // string ones: without it a `u8[]` / `i64[]` / `f64[]` / `f32[]` receiver never
+    // reached `emitClear` at all and was refused HERE, one stage earlier, by a sentence
+    // that names nothing about lists. `.pop` reaches every rep through `emitPop`; the
+    // two gates now admit the same set.
     if callee.memProp == "clear" {
       if (
         exprArray(callee.memObj, fnIx) ||
         exprRefArray(callee.memObj, fnIx) ||
-        exprStringArray(callee.memObj, fnIx)
+        exprStringArray(callee.memObj, fnIx) ||
+        scalarListElemKind(callee.memObj, fnIx) != null
       ) {
         return emitClear(body, stmtIx, fnIx)
       }

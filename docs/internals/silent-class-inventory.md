@@ -34873,11 +34873,11 @@ Repro (refuses):
 
 * Probe: `scripts/capability-probes/parenthesised-assignment-target.vl`.
 
-### D1130 — a `for`-loop variable sharing a spelling with a nested function's NAME, captured by a closure, is check-clean invalid wasm
+### D1130 — a LOCAL sharing a spelling with a function's NAME, captured by a closure, is check-clean invalid wasm — and the loop variable in the filed witness was the narrowest of six faces
 
-**check-clean invalid wasm · check rc 0 · `type mismatch: expected i32, found (ref $type)` · ZERO corpus cells · found 2026-09-02 as a SIDE-FINDING of the emit-refusal reachability measurement (`docs/internals/emit-refusal-reachability-2026-09.md` §7) — not part of its sample and not folded into its estimate — and re-verified by hand before filing**
+**closed — the scope is asked before the module-wide name map, and a `for` variable is in the local plan · was check-clean invalid wasm (`type mismatch: expected i32, found (ref $type)`), a check-clean SILENTLY WRONG ANSWER at a global collision, and an `indirect call type mismatch` TRAP at module scope · ZERO corpus cells · found 2026-09-02 as a SIDE-FINDING of the emit-refusal reachability measurement (`docs/internals/emit-refusal-reachability-2026-09.md` §7) — not part of its sample and not folded into its estimate — and re-verified by hand before filing**
 
-Repro (should print `1` then `6`):
+Repro (runs, prints `1` then `6`):
 
     function other(): i32 {
       function q(): i32 { 1 }
@@ -34894,21 +34894,64 @@ Repro (should print `1` then `6`):
     print(other())
     print(go())
 
-* **TWO INDEPENDENT HALVES, BOTH REQUIRED.** `capRecord` (`emit_classify.vl`) drops the capture
-  because `fnIndexOf(name) >= 0` — the name IS a function somewhere in the module, so it is
-  treated as a static callee rather than a captured local. Meanwhile `plScanStmt`
-  (`emit_base.vl`) records only a `LetDecl` and never a `ForRange.frVar` / `ForIn.fiVar`, so the
-  loop variable was never in the local plan to begin with. The emitter then resolves the name
-  through `fnIndexOfInScopeSid` and emits a closure value where an i32 is wanted.
+* **THE FILED SCOPE WAS THE NARROWEST FACE, AND THE PLAINEST PROGRAM THE HEADLINE FORBIDS
+  REFUTED IT.** The row said "loop variable". Replace the loop variable with a plain `const q =
+  i` in a `while` body, or with a PARAMETER `go(q: i32)`, and the identical program is the same
+  check-clean invalid wasm. The loop variable is not an ingredient of the larger half at all —
+  what matters is only that a LOCAL and a FUNCTION share a spelling and a closure reads the
+  local.
 
-* **ABLATED.** Rename the loop variable and it runs; delete the nested `function q` and it runs;
-  drop the closure and it runs. The nested function need not be in the same function, or called,
-  or of a compatible type — `fnIndexOf` is a MODULE-wide question asked about a LOCAL name.
+* **TWO INDEPENDENT HALVES, and only the second is about loops.** The disassembly separates
+  them: for the PARAM face the closure's env carries a correct `(field i32)` and its body reads
+  it correctly, while the lifted function is DECLARED `(result (ref $closure))` — so the capture
+  was fine and only the result valtype was wrong.
 
-* **WHY IT IS WORTH MORE THAN ITS WITNESS.** The bug is a name-keyed answer overruling a scope
-  the arena already knows about — the same shape as D940 and D988, closed the same day. A
-  module-wide name lookup deciding a question about a loop-local binding cannot be right at any
-  scale; `q` is a perfectly ordinary loop-variable name.
+  1. **`exprIsClosureNoLocal`'s `Ident` arm asked `fnIndexOfSid` FIRST** — a module-wide "is
+     anything here named `q`" ahead of every scope question. A tail reading a param / `let` /
+     `for` variable named `q` was therefore classified as returning a function value whenever
+     any unrelated `function q` existed, and the result valtype was minted as the closure
+     struct over a body pushing an i32. Fixed by resolving the BINDING first
+     (`identBindingNoLocal`: own params, own `let`s, own `for` variables, then each enclosing
+     frame) and consulting the module-wide map only for a name no scope binds.
+  2. **`plScanStmt` (`emit_base.vl`) recorded only a `LetDecl`**, never a `ForRange.frVar` /
+     `ForIn.fiVar` — so `parentBindingFrameOf` answered "this frame binds nothing of that name"
+     for a loop variable and `capRecord`'s global/function-name guard dropped the capture. Fixed
+     by a loop-variable half of the same plan (`parentLoopVarOf`), filled by the SAME walk under
+     the SAME generation stamp, plus `moduleBindsLoopVar` for the module scope, which is not a
+     frame at all.
+
+* **THE BANKED DISCRIMINATOR WAS ALREADY THERE, HALF-WIRED.** `capRecord` did not need a new
+  table — it already asked `parentBindingFrameOf`, exactly the right question. The table that
+  question reads simply had no row for a loop variable. That is the D940 / D988 / D1120 shape
+  once more (a name-keyed answer overruling a scope the arena knows), with the twist that the
+  scope-aware resolver existed and was being consulted; only its INPUT was incomplete.
+
+* **THE ABLATION AND POSITION MATRIX — 18 programs, 16 of which now run** (the two that do not
+  are [D1142](#d1142), a different defect that needs no name collision at all).
+
+  | position | before | after |
+  | --- | --- | --- |
+  | the filed witness (`for q`, nested `function q` elsewhere) | invalid wasm | runs `1 6` |
+  | rename the loop variable | runs | runs |
+  | delete the nested function | runs | runs |
+  | drop the closure | runs | runs |
+  | a `while`-body `const q` instead of the loop variable | **invalid wasm** | runs `1 6` |
+  | a PARAMETER `q` instead of the loop variable | **invalid wasm** | runs `1 6` |
+  | a MODULE-scope `function q` (not nested) | **invalid wasm** | runs `1 6` |
+  | the nested `function q` in the SAME function | **invalid wasm** | runs `7` |
+  | `for q in [1,2,3]` (ForIn, not ForRange) | **invalid wasm** | runs `1 6` |
+  | the closure ESCAPES the loop (read after it) | **trap** | runs `1 3` |
+  | captured by a nested NAMED function, not a lambda | **invalid wasm** | runs `1 6` |
+  | a module GLOBAL `let q = 100` collides | **runs, prints `300`** | runs `100 6` |
+  | transitive: captured two frames down | **invalid wasm** | runs `1 6` |
+  | the loop var as a call ARGUMENT, no closure | runs | runs |
+  | a MODULE-LEVEL loop capturing its own variable | **trap** | runs `6` |
+  | the loop var read directly in the loop | runs | runs |
+
+* **THE WORST FACE WAS NOT THE FILED ONE.** A module GLOBAL sharing the spelling
+  (`let q = 100` + `for q in 1 to 3 { const f = () => q }`) exits 0 and prints `300` — three
+  reads of the global — where `6` is correct. No diagnostic at any tier, which is strictly
+  worse than the invalid wasm the row was filed for.
 
 * Probe: `scripts/capability-probes/loop-var-shadowing-fn-name-capture.vl`.
 
@@ -35110,9 +35153,9 @@ name-channel unification this row asks for must keep it running):
   they print today.
 ### D1131 — `.clear()` serves four list reps where `.pop()` serves eight, and fails THREE different ways at the rest — one of them check-clean invalid wasm
 
-**THREE outcome classes for one method · loud emit reject at `f64[]`/`f32[]` (`emitProgram: .clear but list type not collected`, `compiler/wasmEmit.vl`), a DIFFERENT loud reject one stage earlier at `u8[]` (`emitProgram: unsupported member-call statement`), and CHECK-CLEAN INVALID WASM at `i64[]` (`type mismatch: expected (ref null $type), found (ref $type)`) · ZERO corpus cells · found 2026-09-02 as a side-finding of the emit-refusal reachability measurement and re-verified cell by cell before filing**
+**closed — `emitClear` has `emitPop`'s scalar arms, the statement dispatcher routes every rep to it, and the ref-element scratch frame is resolved where staging happens instead of eagerly · was THREE outcome classes for one method: a loud emit reject at `f64[]`/`f32[]` (`emitProgram: .clear but list type not collected`, `compiler/wasmEmit.vl`), a DIFFERENT loud reject one stage earlier at `u8[]` (`emitProgram: unsupported member-call statement`), and CHECK-CLEAN INVALID WASM at `i64[]` (`type mismatch: expected (ref null $type), found (ref $type)`) · ZERO corpus cells · found 2026-09-02 as a side-finding of the emit-refusal reachability measurement and re-verified cell by cell before filing**
 
-Repro (the `i64` face — `vl check` rc 0, module does not validate):
+Repro (runs, prints `0`):
 
     const xs: i64[] = [1, 2]
     xs.clear()
@@ -35120,35 +35163,161 @@ Repro (the `i64` face — `vl check` rc 0, module does not validate):
 
 * **THE ABLATION IS A CLEAN LADDER, AND `.pop()` IS THE CONTROL THAT MAKES IT DAMNING.**
 
-  | element rep | `.clear()` | `.pop()` |
-  | --- | --- | --- |
-  | `i32[]` | runs | runs |
-  | `string[]` | runs | runs |
-  | `boolean[]` | runs | runs |
-  | a struct `P[]` | runs | runs |
-  | `f64[]` | **loud emit reject** | runs |
-  | `f32[]` | **loud emit reject** | runs |
-  | `u8[]` | **loud emit reject** (earlier stage) | runs |
-  | `i64[]` | **CHECK-CLEAN INVALID WASM** | runs |
+  The filed table graded only ONE scope. `.clear()` answers differently at module top level
+  and inside a function body, so the real grid is 8 reps x 2 scopes; both columns now run.
 
-  Every rep `.clear()` refuses, `.pop()` serves. D977 built the scalar ladder for `pop` and
-  nothing asked `clear` the same question, so `emitClear` has no scalar arm.
+  | element rep | `.clear()` at module scope | `.clear()` in a function | now |
+  | --- | --- | --- | --- |
+  | `i32[]` | runs | runs | runs |
+  | `string[]` | runs | runs | runs |
+  | `boolean[]` | runs | runs | runs |
+  | a struct `P[]` | runs | **loud emit reject** | runs |
+  | `i32[][]` | runs | **loud emit reject** | runs |
+  | `f64[]` | **loud emit reject** | **loud emit reject** (earlier stage) | runs |
+  | `f32[]` | **loud emit reject** | **loud emit reject** (earlier stage) | runs |
+  | `u8[]` | **CHECK-CLEAN INVALID WASM** | **loud emit reject** (earlier stage) | runs |
+  | `i64[]` | **CHECK-CLEAN INVALID WASM** | **loud emit reject** (earlier stage) | runs |
 
-* **THREE MESSAGES IS THE SHAPE, NOT THE FAMILY.** `u8[]` is refused by the STATEMENT
-  DISPATCHER (`unsupported member-call statement`) before `emitClear` is reached at all, so it
-  refuses one stage earlier than `f64[]`/`f32[]` and its sentence names nothing about `clear`.
-  Grouping these by message would have produced three rows; the ablation says one gap.
+  So the clause-1 face was TWO reps, not one — the row filed `u8[]` as loud because it graded
+  that rep in a function body and `i64[]` at module scope. D977 built the scalar ladder for
+  `pop` and nothing asked `clear` the same question, so `emitClear` had no scalar arm.
 
-* **THE `i64` FACE IS A CLAUSE-1 VIOLATION and is the reason this is not merely a capability
-  gap.** `vl check` returns 0 and the module does not validate. One rep of one method is
-  unsound while its siblings are loud and its cousin is correct — which is exactly the state a
-  per-rep ladder decays into when only one method is walked.
+* **THREE MESSAGES IS THE SHAPE, NOT THE FAMILY.** `u8[]` in a function body is refused by the
+  STATEMENT DISPATCHER (`unsupported member-call statement`) before `emitClear` is reached at
+  all, so it refuses one stage earlier than `f64[]`/`f32[]` and its sentence names nothing
+  about `clear`. Grouping these by message would have produced three rows; the ablation says
+  one gap. The gate now admits the same set both dispatchers do (`scalarListElemKind != null`
+  alongside the i32 / ref / string predicates).
 
-* **THE FIX IS THE LADDER, NOT THE MESSAGE.** Give `emitClear` the scalar arms `emitPop`
-  already has, and wire the statement dispatcher so `u8[]` reaches it. Narrowing any of the
-  three sentences closes nothing.
+* **A THIRD MECHANISM THE ROW DID NOT NAME, and reading the collectors would have got it
+  wrong.** A ref-element `.clear()` / `.pop()` on a BARE LOCAL inside a function refused with
+  `a ref-element list op needs its receiver's element type known before the body is lowered`.
+  Reading `collectRefPushSlots` / `collectMemberPopRefSlotsExpr` says "the reservation pass
+  does not walk `.clear()` statements", and that is FALSE — a bare expression statement falls
+  through to the pop collector, which handles `clear` too.
+
+  What the failing rung actually RECEIVED settles it: `emitClear`/`emitPop` called
+  `refPushScratchBaseFor(rslot)` **eagerly**, for a value only a STAGING receiver ever reads.
+  A bare local is read in place and needs no frame, so the pre-pass correctly reserved none,
+  and the eager lookup read "no frame" as "the pre-pass and the emit disagree" and failed. The
+  one-line tell: `xs.clear()` alone refused, while `xs.clear()` followed by `xs.push(…)` RAN —
+  the push had reserved the frame the clear then found. Fixed by deferring the ref frame to
+  `listOpStageBase`, called at the three staging sites inside `listOpRecvLocal`; `.push`, which
+  needs the frame whatever its receiver, still resolves it eagerly.
+
+* **THE FIX IS THE LADDER, NOT THE MESSAGE.** Narrowing any of the three sentences closes
+  nothing. All 8 reps x 2 scopes x {`.clear()`, `.pop()` statement, `.push`, `.length`,
+  indexing, indexed assignment} now run — 132 of the 144-cell grid, the remaining 12 being
+  [D1140](#d1140) and [D1141](#d1141), neither of which involves `clear`.
+
+* **THE SIBLING AUDIT THIS ROW ASKED FOR FOUND TWO MORE.** `.pop()` in VALUE position is
+  check-clean invalid wasm over every numeric rep ([D1140](#d1140)) and `u8[].slice` is
+  check-clean invalid wasm ([D1141](#d1141)). `.push`, `.length`, indexing and indexed
+  assignment are clean at all 8 reps in both scopes.
 
 * Probe: `scripts/capability-probes/clear-over-scalar-list-reps.vl`.
+
+---
+### D1140 — `.pop()` in VALUE position is check-clean invalid wasm over EVERY numeric element rep, and its four delivery spellings disagree
+
+**check-clean invalid wasm (`type mismatch: expected (ref null $type), found i32` / `found i64` / `found f64` / `found f32`) · clause 1 · OPEN · found 2026-09-02 by the sibling audit [D1131](#d1131)'s close asked for · NOT caused by that close — verified against `git archive origin/master`, and named as a known separate limit by [D977](#d977) ("THE VALUE-USED SPELLING IS A SEPARATE, PRE-EXISTING LIMIT") without ever getting a row**
+
+Repro (check rc 0; the module the engine refuses to load):
+
+    const xs: i32[] = [1, 2]
+    const v = xs.pop()
+    print(xs.length)
+
+* **THE STATEMENT FORM IS THE CONTROL AND IT IS CLEAN.** `xs.pop()` discarded runs at all
+  eight reps and both scopes ([D1131](#d1131)'s grid). Bind the result and four reps break. So
+  the gap is the RESULT rep of a scalar pop — the checker types it `T | null` and `emitPop`
+  pushes the raw scalar — not the pop itself.
+
+* **THE GRID, and the four delivery spellings do not agree with each other.**
+
+  | element rep | `const v = xs.pop()` (unused) | bound then `v != null` | `const v: T \| null =` | `xs.pop() ?? d` |
+  | --- | --- | --- | --- | --- |
+  | `i32[]` | **invalid wasm** | loud emit reject | **invalid wasm** | runs |
+  | `i64[]` | **invalid wasm** | loud emit reject | **invalid wasm** | **invalid wasm** |
+  | `f64[]` | **invalid wasm** | loud emit reject | **invalid wasm** | loud emit reject |
+  | `f32[]` | **invalid wasm** | loud emit reject | **invalid wasm** | loud emit reject |
+  | `u8[]` | runs | loud emit reject | check reject (`u8` is not a value type — BY DESIGN) | **invalid wasm** |
+  | `string[]` | runs | runs | runs | runs |
+  | `boolean[]` | runs | runs | runs | runs |
+  | `i32[][]` | **invalid wasm** | — | — | — |
+
+  `string[]` rides a nullable ref and `boolean[]` rides the i32 niche (true=1/false=0/null=2,
+  the arm `emitPop` spells out), which is exactly why those two are the reps that work. Every
+  rep with no null representation in its own valtype is broken.
+
+* **`?? d` IS NOT THE ESCAPE HATCH IT LOOKS LIKE.** `emitPopOr` is an i32-family-only fused
+  lowering (its own header says so), so it serves `i32[]` and refuses or miscompiles the other
+  four — a fifth outcome for one method.
+
+* **THE FIX IS THE ONE D1131 TOOK, one rung up.** The nullable-scalar result needs a rep and a
+  delivery at each of the four boundaries above, not a narrowed message at any one of them.
+  Narrowing `emitPopOr` closes nothing.
+
+* Probe: `scripts/capability-probes/pop-value-position-scalar-reps.vl`.
+
+---
+### D1141 — `u8[].slice` is check-clean invalid wasm at module scope and a loud reject naming the wrong thing inside a function
+
+**check-clean invalid wasm (`type mismatch: expected (ref $type), found (ref $type)`) at module scope · a loud `emitProgram: callee is not a function name` inside a function body · clause 1 · OPEN · found 2026-09-02 by the sibling audit [D1131](#d1131)'s close asked for, and PRE-EXISTING to it**
+
+Repro (check rc 0; the module the engine refuses to load):
+
+    const xs: u8[] = [1, 2, 3]
+    const s = xs.slice(0, 2)
+    print(s.length)
+
+* **EVERY OTHER REP SLICES.** `i32[]`, `i64[]`, `f64[]`, `f32[]`, `string[]` and `boolean[]`
+  all run and print `2`. `u8[]` is alone, and it is alone for the reason its own
+  `scalarListElemKind` header gives: it is the one list whose element VALUE kind (i32) does
+  not identify its rep, because its backing is `(array (mut i8))` while every other
+  i32-element list is `(array (mut i32))`. A slice mints a NEW list, so it has to pick the
+  backing from the rep and not from the element kind.
+
+* **THE FUNCTION-SCOPE SENTENCE IS ABOUT SOMETHING ELSE ENTIRELY.** Inside a function body the
+  same line refuses with `emitProgram: callee is not a function name` — a message that names
+  neither `slice` nor `u8` nor lists, and would send a reader to the call path rather than the
+  list-rep ladder. Two outcomes, and neither says what the gap is.
+
+* Probe: `scripts/capability-probes/u8-list-slice.vl`.
+
+---
+### D1142 — a captured `for-in` LOOP VARIABLE whose element is not i32 gets an i32 env field: check-clean invalid wasm, with no name collision anywhere
+
+**check-clean invalid wasm (`type mismatch: expected i32, found (ref $type)` at `string`, `expected i32, found f64` at f64) · clause 1 · OPEN · found 2026-09-02 as the residue of [D1130](#d1130)'s close, and PRE-EXISTING to it — the repro below has no shadowing of any kind and reproduces identically on the `seed-latest` master seed**
+
+Repro (check rc 0; the module the engine refuses to load — should print `ab`):
+
+    function go(): string {
+      let s = ""
+      for z in ["a", "b"] {
+        const f = () => z
+        s = s + f()
+      }
+      s
+    }
+    print(go())
+
+* **THE `let` CONTROL IS THE ONE THAT MAKES IT A LOOP-VARIABLE ROW.** A captured `const z =
+  "a"` runs and prints `a`; a captured `const z = 1.5` runs and prints `1.5`. Only the LOOP
+  VARIABLE misses, so the capture's valtype is resolved from a channel a `for` binding does not
+  populate — `parentBindingOf` returns a `Param` or a `LetDecl` and has no answer for a
+  `ForRange`/`ForIn`, and the env field falls to the i32 default.
+
+* **THE i32 LOOP VARIABLE IS WHY THIS HID.** `for q in 1 to 3 { () => q }` is i32 and the
+  default is right, which is every `for-in` capture the corpus and [D1130](#d1130)'s own
+  witness contain. Iterating a `string[]` or an `f64[]` is what exposes it.
+
+* **NOT [D1130](#d1130), and the ablation says so in one line:** no function, global or other
+  binding in the module shares the spelling `z`. D1130's fix (the scope asked before the
+  module-wide name map, and loop variables in the local plan) moved 16 of its 18 position cells
+  to `runs` and left exactly these two, because they need no collision at all.
+
+* Probe: `scripts/capability-probes/captured-non-i32-loop-variable.vl`.
 
 ---
 ### D1105 — a `u8[] | null` cell in the same module as an `i64[] | null` / `f64[] | null` / `f32[] | null` one is typed and read through the OTHER leaf's wrapper: check-clean INVALID WASM, with both spellings annotated

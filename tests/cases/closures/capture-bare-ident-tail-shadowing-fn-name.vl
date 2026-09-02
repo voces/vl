@@ -1,0 +1,164 @@
+// @run
+// @log 1
+// @log 6
+// @log 1
+// @log 6
+// @log 1
+// @log 6
+// @log 7
+// @log 1
+// @log 3
+// @log 100
+// @log 6
+// @log 6
+// @log 1
+// @log 100
+// THE BARE-IDENT TAIL, which `capture-local-shadowing-fn-name.vl` cannot reach. That case's
+// closures all end in `x + tag` — a `BinExpr` — and the defect here lives in the arm that
+// classifies a lifted function's RESULT from its tail EXPRESSION. `exprIsClosureNoLocal`'s
+// `Ident` arm asked the module-wide `fnIndexOfSid` ahead of every scope question, so a closure
+// whose whole body is the captured name was declared `(result (ref $closure))` over a body
+// pushing an i32: `vl check` rc 0, then `type mismatch: expected i32, found (ref $type)`.
+//
+// A name a scope binds denotes that binding; only a name NO scope binds can denote the module's
+// function. Every binding form has to be in that answer — a param, a body `let`, a `for`
+// variable, and the same three in an ENCLOSING frame (a transitive capture) — which is why the
+// cases below sweep the binding form rather than the closure form.
+//
+// THE LOOP VARIABLE NEEDS ITS OWN HALF and the two are independent: the `for` binding was
+// missing from the local plan entirely (`plScanStmt` recorded only a `LetDecl`), so
+// `parentBindingFrameOf` said the frame binds nothing of that name and the capture was dropped
+// into a NULL env. At a PARAM the env is correct and only the result valtype is wrong; at a
+// `for` variable both are wrong.
+//
+// THE GLOBAL CASE IS THE SILENT ONE. Before, `globalLoop` exited 0 and printed 300 — three
+// reads of the global — where 6 is correct. No diagnostic at any tier, which is why it is
+// pinned with a proving value rather than merely with "it builds".
+//
+// Lifted functions are keyed by name FIRST-WINS in `buildFnMap`, so each nested function and
+// each closure is spelled distinctly (the discipline `capture-local-shadowing-fn-name.vl`'s
+// header states).
+
+// A nested function in ANOTHER function — the collision needs no relationship to the reader.
+function otherFrame() {
+  function q() { 1 }
+  return q()
+}
+
+// A `for`-RANGE variable, captured by a lambda whose whole body is the name.
+function rangeLoop() {
+  let s = 0
+  for q in 1 to 3 {
+    const capRange = () => q
+    s = s + capRange()
+  }
+  return s
+}
+print(otherFrame()) // 1
+print(rangeLoop()) // 6
+
+// A `for`-IN variable over a list — the other loop form.
+function otherFrame2() {
+  function w() { 1 }
+  return w()
+}
+
+function inLoop() {
+  let s = 0
+  for w in [1, 2, 3] {
+    const capIn = () => w
+    s = s + capIn()
+  }
+  return s
+}
+print(otherFrame2()) // 1
+print(inLoop()) // 6
+
+// A body `const` — no loop at all, which is what proves the loop is not the ingredient of the
+// result-valtype half.
+function otherFrame3() {
+  function e() { 1 }
+  return e()
+}
+
+function letBinding() {
+  let s = 0
+  let i = 1
+  while i <= 3 {
+    const e = i
+    const capLet = () => e
+    s = s + capLet()
+    i = i + 1
+  }
+  return s
+}
+print(otherFrame3()) // 1
+print(letBinding()) // 6
+
+// The nested function declared in the SAME frame as the loop that shadows it.
+function sameFrame() {
+  function r() { 1 }
+  let s = r()
+  for r in 1 to 3 {
+    const capSame = () => r
+    s = s + capSame()
+  }
+  return s
+}
+print(sameFrame()) // 7 — 1 from the call, then 1+2+3
+
+// The closure ESCAPES the loop and is called after it: the capture must be the loop variable's
+// LAST value, not a function reference. This face TRAPPED rather than failing to validate.
+function otherFrame4() {
+  function t() { 1 }
+  return t()
+}
+
+function escaping() {
+  let g = () => 0
+  for t in 1 to 3 {
+    g = () => t
+  }
+  return g()
+}
+print(otherFrame4()) // 1
+print(escaping()) // 3 — the loop variable's last value
+
+// A module GLOBAL of the same spelling. The DIRECT read must still see 100 and the captured
+// loop variable must still see 1, 2, 3 — the two must not collapse into each other.
+const gq = 100
+
+function globalLoop() {
+  let s = 0
+  for gq in 1 to 3 {
+    const capGlobal = () => gq
+    s = s + capGlobal()
+  }
+  return s
+}
+print(gq) // 100 — the global is untouched
+print(globalLoop()) // 6, not 300
+
+// A MODULE-LEVEL loop capturing its own variable against a module function's name. The module
+// top level is not a lifted frame, so the parent-frame walk runs off the end before it can
+// answer and `moduleBindsLoopVar` is the arm that reaches it.
+function m() { 1 }
+
+let ms = 0
+for m in 1 to 3 {
+  const capModule = () => m
+  ms = ms + capModule()
+}
+print(ms) // 6
+print(m()) // 1 — the module function is still callable by that name
+
+// CONTROL — nothing shadows `keeps`, so the bare-ident tail really IS the function name and
+// must still build a closure value. The guard has to stay honest in this direction too.
+function keeps() { return 100 }
+
+function passesFnAlong() {
+  const pick = () => keeps
+  const f = pick()
+  return f()
+}
+print(passesFnAlong()) // 100
