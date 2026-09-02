@@ -24209,6 +24209,26 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   gate. The sibling row (`[1.0, null]` reaching `J`) moves to `emitProgram: bare null` under
   the same change, which is the same story one step earlier.
 
+### D989 — `==` between two VALUES of a scalar-carrying union refuses at emit
+
+**loud emit reject · clause 2 · reported by vl-b7 while measuring the reference-identity proposal; reproduced here**
+
+    type U = i32 | string
+    const a: U = 1
+    const b: U = 1
+    print(a == b)
+
+* `vl check` rc 0, then ``emitProgram: union `==` atom has no value box`` — the G5 guard in
+  the `vbHeapIdxOfKind` table at `wasmEmit.vl:5480`. Same refusal with string arms and at
+  parameter position (`function eq(a: U, b: U): boolean { a == b }`).
+
+* **UNION-AGAINST-LITERAL RUNS** — `a == 1` prints `true`, and `s == "ab"` likewise. That is
+  what D972 closed, so this is the union-vs-union RESIDUE of that fix rather than a regression
+  of it. Both operands being a box is the whole difference.
+
+* Numbered in this session's block rather than the reporter's, so the range reservations stay
+  clean.
+
 ### D988 — ONE hole-param function called with two different receiver shapes resolves per-FUNCTION, not per-call
 
 **loads then traps · clause 1 · the residue [D987](#d987)'s fix does not reach**
@@ -24292,6 +24312,14 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   splitting the rows legitimately closes them and the fixtures would become `@run`. **Do not
   rewrite them on that basis without checking each program's OUTPUT is right** — a compile is
   not a correct compile, and this file has a standing rule about exactly that.
+
+  **SPACING IS NOT THE DISAGREEMENT.** Normalising both sides through `nameStripSpaces`
+  before extraction leaves the trap exactly where it was. And a HAND-WRITTEN program of that
+  shape — `type R = { f: (() => i64) | null }`, a `{[string]: () => R}` map, call it, read the
+  field, call that — prints `7` on BOTH master and the patched compiler. So the fuzz cell
+  differs from its own shape label in a way not yet isolated: materialise it with
+  `scripts/fuzz-vl.sh --keep --out-dir` over the seeds in `rep-fuzz-check.sh` before guessing
+  again. Seven attempts on this row; the next should start from the actual program.
 
   **The blocker is rep-fuzz, not the fixtures:** a NEW trap at
   `p2r {[string]: () => {f: (() => i64) | null}}`, present under both the signature and the
