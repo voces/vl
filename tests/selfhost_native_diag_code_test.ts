@@ -69,8 +69,9 @@ Deno.test({
   ignore,
 }, () => {
   const exp = instantiate();
-  // An INFERRED nullable-MAP return is type-valid; codegen cannot lower it un-annotated
-  // (the annotated `: i64[] | null` spelling of the same function builds and runs).
+  // An INFERRED nullable i32-KEYED MAP return is type-valid; codegen cannot lower it
+  // un-annotated (the annotated `: {[i32]: i32} | null` spelling of the same function
+  // builds and runs).
   //
   // THE WITNESS HAS MOVED TWICE, AND WHY IS THE POINT OF THE TEST. It was
   // `print(pick(true))` over an `i32 | string`, which now RUNS — D712 built the box-tag
@@ -79,17 +80,20 @@ Deno.test({
   // inferred-return row so the A20 pass and `emitReturnValue` could take the arms the
   // annotated path already had. What this test pins is the CHANNEL (a capability admission
   // carries a stable code), so any still-open capability gap serves as its witness.
-  // D956 closed the MAP entirely, so it has now moved a FOURTH time — to `i64[] | null`, a
-  // distinct-backing scalar list, whose inferred nullable return still has no renderer arm.
-  // The annotated twin runs, so it is a capability gap and this will move again.
-  // `scripts/capability-probes/inferred-nullable-container-return.vl` is the standing probe
-  // for the closed half; when the rest closes, this moves again.
+  // D956 closed the string-keyed MAP at every value type and it moved a FOURTH time, to
+  // `i64[] | null`; D1062 closed the nullable LIST at every element type, which is why it
+  // has moved a FIFTH. What still floors here is the i32-KEYED map — `nullableRetName`'s
+  // map arm requires a `string` key — and its annotated twin runs, so it is a capability
+  // gap and this will move again.
+  // `scripts/capability-probes/inferred-nullable-container-return.vl` and
+  // `inferred-nullable-list-return.vl` are the standing probes for the closed halves; when
+  // the rest closes, this moves again.
   const { rc, diags } = check(
     exp,
     [
       "function pick(c: boolean) {",
       "  if c { return null }",
-      "  const m: i64[] = [1]",
+      "  const m: {[i32]: i32} = Map()",
       "  m",
       "}",
       "function go() {",
