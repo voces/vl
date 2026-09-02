@@ -778,8 +778,9 @@ import {
   unionArmVariantForStructExpr,
   unionClosureArmName,
   unionClosureArmTy,
-  unionEqAtomOf,
+  unionEqAtomKindOf,
   unionHasAtomK,
+  unionHasAtomKindArm,
   unionHasAtomTy,
   unionHasCollapsedStringMapArm,
   unionHasMapArmSlot,
@@ -822,6 +823,8 @@ import {
   widenScalarBackSlot,
   widenScalarWrapSlot,
   widenTmpSlot,
+  valueAtomNameOfKind,
+  leqCoreKindOfAtomKind,
 } from "./emit_classify"
 import { sidOfNode } from "./symbols"
 import {
@@ -5778,10 +5781,38 @@ function emitUnionPayloadUnbox(_body: i32[], k: i32) {
     fbRefCast(sTypeIdx) // the payload IS the string array ref
     return 0
   }
+  // A LIST arm rides the box's `value` field as its WRAPPER ref, exactly as a string does —
+  // `emitUnionUnboxTail`'s ladder, which every other reader of a boxed list arm already
+  // takes. Without this rung a list arm reached the scalar value-box lookup and refused with
+  // "atom has no value box" on a `vl check`-clean program (D1095).
+  const lw = listWrapHeapOfKind(k)
+  if lw >= 0 {
+    fbRefCast(lw)
+    return 0
+  }
   const vb = vbHeapIdxOfKind(k)
   if vb < 0 { return emitFail("emitProgram: union `==` atom has no value box") }
   fbRefCast(vb)      // 0xfb 0x16 <value box>
   fbStructGet(vb, 0) // the scalar payload
+  0
+}
+
+// THE PER-ARM PAYLOAD COMPARE of a union `==`, with both payloads already unboxed to the
+// arm's rep and on the stack (left below right), leaving the 0/1 answer.
+//
+// ONE HOME for the three union-`==` lowerings — union-vs-union over a value union, over a
+// struct union, and union-vs-concrete. Each of them had its own two-arm `if k == 2 { str }
+// else { opcode }` tail, so teaching a list arm to compare would have meant writing the same
+// third arm three times and letting them drift; the tag emitted a few instructions earlier
+// and the unbox immediately before are already shared, and this is the third projection of
+// the same code.
+function emitUnionAtomPayloadEq(body: i32[], k: i32, fnIx: i32) {
+  if k == 2 { return emitStrEqCore(body) }
+  const lk = leqCoreKindOfAtomKind(k)
+  if lk >= 0 { return emitListEqAnyRep(body, lk, 0, fnIx) }
+  // D-EQOPCODE: the scalar payload compare's opcode is another projection of the same code
+  // that chose the tag and the unbox, not a fresh question about the arm's spelling.
+  fbI32Bin(atomEqOpcodeOfKind(k))
   0
 }
 
@@ -5856,7 +5887,33 @@ function emitUnionConcreteEq(
   // and the arm-membership test read a name, so an alias or a litunion arm made them report
   // a box that cannot hold what it holds.
   const unmArms = unionMemberSetOf(uname)
-  const atom = unionEqAtomOf(otherIx, unmArms, fnIx)
+  // D1071 — THE OTHER OPERAND'S REP CODE, WITH A REAL "NOT AN ATOM" ANSWER. `-1` here is out
+  // of band (`unionEqAtomKindOf`'s header carries why an in-band `"i32"` default was the
+  // miscompile); the two branches below are the only readers, and both consume the code
+  // rather than a spelling. `valueAtomNameOfKind` re-derives the SPELLING for the membership
+  // test's decline argument — a bijection over the seven scalar codes and "" above them,
+  // which is exactly the partition the scalar path is allowed to serve.
+  const eak = unionEqAtomKindOf(otherIx, unmArms, fnIx)
+  const atom = valueAtomNameOfKind(eak)
+  if eak < 0 {
+    // THE OPERAND HAS NO ATOM REP — a struct, a map, a shape the arena named. The box can
+    // still hold it as a VARIANT arm, which is a tag test plus that arm's field compare.
+    if emitUnionConcreteVariantEq(body, boxIx, otherIx, isNe, fnIx) == 0 {
+      return 0
+    }
+    return emitFail(
+      "emitProgram: `==` over a struct union is not supported yet",
+    )
+  }
+  // A CLOSURE atom (code 11) is the one code above the scalar band with no VALUE compare at
+  // all: two closures are compared by function identity, which is a different lowering with
+  // its own scan (`cloEqNoteBin`). It gets a refusal that says which arm it is, rather than
+  // the "no value box" an internal invariant would report.
+  if eak == 11 {
+    return emitFail(
+      "emitProgram: `==` over a union's closure arm is not supported yet",
+    )
+  }
   // A MIXED UNION IS COMPARABLE TO A SCALAR LITERAL, and this gate refused it. The compare
   // below is arm-AGNOSTIC: it reads the box's TAG, compares it to the tag of the atom the
   // OTHER operand names, and on a match compares that one payload. The union's remaining
@@ -5874,31 +5931,30 @@ function emitUnionConcreteEq(
   // list-vs-list compare still takes the refusal; and `unionHasAtomK` is the same membership
   // test the `eqHasArm` rung below already trusts to decide the static-false fold, so this
   // admits nothing that rung would not immediately have to answer for.
-  const eqMixedOk = valueAtomKind(atom) >= 0 &&
-    unionHasAtomK(usid, unmArms, atom, valueAtomKind(atom))
+  const eqMixedOk = unionEqArmPresent(usid, unmArms, atom, eak)
   if (
     uname == "" ||
     (!isValueUnionOfSet(usid, uname) &&
       !unionCarriesLitUnionArm(uname) &&
       !eqMixedOk)
   ) {
+    // THE SECOND DOOR TO THE VARIANT COMPARE, for an operand the ARENA DECLINED to type
+    // (`valueRowKind` -2) and which therefore still carries the ladder's historical i32
+    // default. The expression itself can still name a concrete variant, and reading it is
+    // the only thing that distinguishes "an i32" from "a row the arena has not recorded".
+    if emitUnionConcreteVariantEq(body, boxIx, otherIx, isNe, fnIx) == 0 {
+      return 0
+    }
     return emitFail(
       "emitProgram: `==` over a struct union is not supported yet",
     )
   }
-  // D-UNION-ATOM-KIND / D-EQOPCODE / D-VALKIND: the other operand's rep CODE, derived
-  // ONCE. The box tag, the `string` special-cases, the payload unbox, the widened operand
-  // emit, the payload-compare opcode and the membership test below are all projections of
-  // it. The SPELLING survives only as the membership test's DECLINE argument — a kind
-  // outside the seven scalar keywords (a LIST / closure atom) keeps the exact
-  // `TyPrim.primName` path, which is what those need.
-  const eak = valueAtomKind(atom)
   // A `string`-repped other operand has an arm whenever the box can carry it as a string ref
   // — a plain `string` arm OR a literal-union arm, `unionTakesAtomAsStr`'s question and
   // `emitUnionLitIs`'s same second leg. Without it a `K | i32` box statically answers
   // `u == k` FALSE: the banked member kinds carry only `i32` (`valueAtomKind("K")` is -1), so
   // the arm that actually holds the value looks absent.
-  let eqHasArm = unionHasAtomK(usid, unmArms, atom, eak)
+  let eqHasArm = unionEqArmPresent(usid, unmArms, atom, eak)
   if !eqHasArm && eak == 2 && unionTakesAtomAsStr(unmArms) { eqHasArm = true }
   if !eqHasArm {
     // No arm has the other operand's rep: the box can never hold such a value.
@@ -5926,20 +5982,93 @@ function emitUnionConcreteEq(
   fbStructGet(uBoxIdx, 1) // 0xfb 0x02 <box ht> field 1: value (anyref)
   if emitUnionPayloadUnbox(body, eak) < 0 { return -1 }
   if emitUnionEqOther(body, otherIx, eak, fnIx) < 0 { return -1 }
-  if eak == 2 {
-    if emitStrEqCore(body) < 0 { return -1 }
-  } else {
-    // D-EQOPCODE: the payload compare's opcode is the LAST projection of `eak` this
-    // site re-derived from the spelling — `atomEqOpcode` ran `valueAtomKind(atom)`
-    // and then a four-arm kind table, with the code already in hand two lines up.
-    fbI32Bin(atomEqOpcodeOfKind(eak))
-  }
+  // D-EQOPCODE: the payload compare is the LAST projection of `eak` this site re-derived
+  // from the spelling — `atomEqOpcode` ran `valueAtomKind(atom)` and then a four-arm kind
+  // table, with the code already in hand.
+  if emitUnionAtomPayloadEq(body, eak, fnIx) < 0 { return -1 }
   fbElse() // 0x05 else: wrong-rep arm — structurally unequal
   fbI32Const(0)
   fbEnd()  // 0x0b end
   if isNe {
     fbI32Eqz() // 0x45 i32.eqz (`!=` negates value-equality)
   }
+  0
+}
+
+// DOES THE UNION CARRY AN ARM AT THE OTHER OPERAND'S REP? One question, two instruments,
+// split on whether the code HAS a spelling: the seven scalar codes take the banked
+// `unionHasAtomK` (with its keyword fall-through), and a container code — which
+// `valueAtomNameOfKind` cannot name, because 7 is `i32[]` and `boolean[]` and `K[]` — takes
+// the member walk. Both readers of this question (the mixed-union gate and the static-false
+// fold) ask it here, so the two cannot answer differently for the same operand.
+function unionEqArmPresent(
+  usid: i32,
+  unmArms: string,
+  atom: string,
+  eak: i32,
+): boolean {
+  if atom == "" { return unionHasAtomKindArm(unmArms, eak) }
+  unionHasAtomK(usid, unmArms, atom, eak)
+}
+
+// D1071 — union `==` a CONCRETE VARIANT (`p == a` with `p: A | i32` and `a: A`). The box's
+// tag selects the arm, and on a match that arm's payload is compared field-wise against the
+// concrete operand — the union-vs-union compare with one side's unbox deleted.
+//
+// THE CONCRETE OPERAND ALREADY HAS THE ARM'S HEAP TYPE. When a union is declared, the union
+// path owns the struct `type`s (the struct table is empty and `uVarHeap` carries them), so a
+// `const a: A = {x: 1}` beside `type A` in a `A | i32` is a `(ref $uVarHeap[vi])` — the very
+// type the box's payload casts to. Disassembled on the row's own witness: the global's cell
+// type and the `ref.cast` target are the same heap index, so no conversion sits between them.
+//
+// THE BOX IS EVALUATED FIRST AND ONCE, keeping the operand order every other arm of this
+// compare uses, and both operands are parked so an effectful operand runs exactly once —
+// which is also what makes an operand that is not a re-readable place (a call) work here
+// without the `unionEqOperandOk` gate `emitUnionConcreteEq`'s scalar path needs.
+//
+// Returns 0 when it emitted and -1 when it DECLINES (the operand is not a concrete variant,
+// or the arm carries a field this lowering cannot compare), so the caller keeps its loud
+// refusal rather than writing a bad module.
+function emitUnionConcreteVariantEq(
+  body: i32[],
+  boxIx: i32,
+  otherIx: i32,
+  isNe: boolean,
+  fnIx: i32,
+) {
+  const vi = exprVariantIndex(otherIx, fnIx)
+  if vi < 0 { return -1 }
+  // The same four parallel-table bounds `emitStructUnionEq` takes before it writes a byte,
+  // for the same reason: a variant row the emitter's tables do not cover must DECLINE, never
+  // read out of bounds (`emitFail does not halt`).
+  if vi >= uVarHeap.length { return -1 }
+  if vi >= uTags.length { return -1 }
+  if vi >= uFieldStart.length { return -1 }
+  if vi >= uFieldCount.length { return -1 }
+  if !variantFieldsComparable(vi) { return -1 }
+  const sl = unionEqStashSlot()
+  const ar = unionEqArmSlot(vi + 1024)
+  if emitExpr(body, boxIx, fnIx) < 0 { return -1 }
+  fbLocalSet(sl)
+  if emitExpr(body, otherIx, fnIx) < 0 { return -1 }
+  fbLocalSet(ar)
+  fbLocalGet(sl)
+  fbStructGet(uBoxIdx, 0) // field 0: tag
+  fbI32Const(uTags[vi])   // the arm's program-global tag
+  fbI32Bin(70)            // 0x46 i32.eq
+  fbIf(127)               // 0x04 if, i32 result
+  ctrlEnter()
+  const al = unionEqArmSlot(vi)
+  fbLocalGet(sl)
+  fbStructGet(uBoxIdx, 1) // field 1: payload (anyref)
+  fbRefCast(uVarHeap[vi])
+  fbLocalSet(al)
+  if emitVariantFieldsEq(body, al, ar, vi) < 0 { return -1 }
+  fbElse()                // the box holds a different arm — structurally unequal
+  fbI32Const(0)
+  fbEnd()
+  ctrlLeave()
+  if isNe { fbI32Eqz() }
   0
 }
 
@@ -6000,7 +6129,12 @@ function emitStructUnionEq(
       if ak == 2 {
         if !aUsed { return -1 }
       } else if ak != nullValKind() {
-        if vbHeapIdxOfKind(ak) < 0 { return -1 }
+        // A LIST arm is servable too (D1095): its payload IS the wrapper ref, so the unbox
+        // is a `ref.cast` and the compare is the generic list core. Everything left — a
+        // closure arm above all — still needs a scalar value box and declines without one.
+        if listWrapHeapOfKind(ak) < 0 {
+          if vbHeapIdxOfKind(ak) < 0 { return -1 }
+        }
       }
       vis.push(-1)
       aks.push(ak)
@@ -6039,7 +6173,7 @@ function emitStructUnionEq(
     fbI32Bin(70)
     fbIf(127)
     ctrlEnter()
-    if emitUnionArmEq(body, sl, sr, vis[a], aks[a]) < 0 { return -1 }
+    if emitUnionArmEq(body, sl, sr, vis[a], aks[a], fnIx) < 0 { return -1 }
     fbElse()
     a = a + 1
   }
@@ -6051,6 +6185,7 @@ function emitStructUnionEq(
     sr,
     vis[vis.length - 1],
     aks[aks.length - 1],
+    fnIx,
   )
   if lastRc < 0 { return -1 }
   let e = 0
@@ -6100,7 +6235,14 @@ function unionArmTagOf(vi: i32, ak: i32): i32 {
 // D1061 — one arm of a mixed struct/scalar union, dispatched on which column named it. The
 // tag test that selects this arm has ALREADY proved both boxes carry it, so each half only
 // has to compare the arm's own payload.
-function emitUnionArmEq(body: i32[], sl: i32, sr: i32, vi: i32, ak: i32) {
+function emitUnionArmEq(
+  body: i32[],
+  sl: i32,
+  sr: i32,
+  vi: i32,
+  ak: i32,
+  fnIx: i32,
+) {
   if vi >= 0 { return emitVariantArmEq(body, sl, sr, vi) }
   // The NULL arm carries no payload at all: two boxes that agree on the null tag are equal,
   // and the enclosing tag test is that agreement.
@@ -6114,9 +6256,7 @@ function emitUnionArmEq(body: i32[], sl: i32, sr: i32, vi: i32, ak: i32) {
   fbLocalGet(sr)
   fbStructGet(uBoxIdx, 1)
   if emitUnionPayloadUnbox(body, ak) < 0 { return -1 }
-  if ak == 2 { return emitStrEqCore(body) }
-  fbI32Bin(atomEqOpcodeOfKind(ak))
-  0
+  emitUnionAtomPayloadEq(body, ak, fnIx)
 }
 
 // One arm: cast both payloads to the arm's variant heap, park them, and AND the fields.
@@ -6131,6 +6271,15 @@ function emitVariantArmEq(body: i32[], sl: i32, sr: i32, vi: i32) {
   fbStructGet(uBoxIdx, 1)
   fbRefCast(uVarHeap[vi])
   fbLocalSet(ar)
+  emitVariantFieldsEq(body, al, ar, vi)
+}
+
+// AND the fields of variant `vi` over two ALREADY-CAST variant refs parked in `al` / `ar`,
+// leaving one i32. Split from `emitVariantArmEq` because the two operands do not always both
+// arrive out of a box: a union compared against a CONCRETE variant (D1071) unboxes only the
+// left one and parks the right operand's own `(ref $uVarHeap)` value directly. The unbox and
+// the compare are two decisions, and only the unbox differs between the two callers.
+function emitVariantFieldsEq(body: i32[], al: i32, ar: i32, vi: i32) {
   const start = uFieldStart[vi]
   const cnt = uFieldCount[vi]
   fbI32Const(1)
@@ -6325,15 +6474,11 @@ function emitUnionUnionEq(
     if emitExpr(body, rIx, fnIx) < 0 { return -1 }
     fbStructGet(uBoxIdx, 1) // right payload (anyref)
     if emitUnionPayloadUnbox(body, armK) < 0 { return -1 }
-    if armK == 2 {
-      if emitStrEqCore(body) < 0 { return -1 }
-    } else {
-      // D-EQOPCODE: `armK` came out of the banked `unMemValKind` column (or the
-      // per-atom derivation where the row is uncovered) and already decided the two
-      // tag compares and both payload unboxes above — the opcode is the same code's
-      // fifth projection, not a fresh question about `arms[k]`'s spelling.
-      fbI32Bin(atomEqOpcodeOfKind(armK))
-    }
+    // D-EQOPCODE: `armK` came out of the banked `unMemValKind` column (or the per-atom
+    // derivation where the row is uncovered) and already decided the two tag compares and
+    // both payload unboxes above — the compare is the same code's fifth projection, not a
+    // fresh question about `arms[k]`'s spelling.
+    if emitUnionAtomPayloadEq(body, armK, fnIx) < 0 { return -1 }
     fbElse() // right holds a different arm → unequal
     fbI32Const(0)
     fbEnd()

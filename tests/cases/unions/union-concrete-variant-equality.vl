@@ -1,0 +1,180 @@
+// @run
+// D1071 — `==` BETWEEN A UNION BOX AND A CONCRETE VARIANT OF ONE OF ITS ARMS.
+//
+// THE INGREDIENT IS "THE UNION CARRIES A VALUE ATOM", NOT "THE UNION CARRIES A STRUCT".
+// `unionEqAtomOf` classified the concrete operand down a first-match ladder and its
+// fall-through started from `let atom = "i32"`, so a STRUCT operand — matching no rung —
+// was answered `"i32"`: a real, well-formed atom name meaning "I could not classify this".
+// The mixed-union gate then passed (the union genuinely does carry an i32 arm), and the
+// compare tested the box against the **i32 value box's** tag and compared its unboxed i32
+// payload against a `(ref $A)` — check-clean invalid wasm. `A | B`, with no value atom at
+// all, took the loud refusal instead, which is why the struct arm looked like the
+// ingredient and was not.
+//
+// The classifier now answers a KIND with -1 for "not an atom" — an out-of-band channel,
+// the convention `valueAtomKind` and `valueRowKind` already use — and the -1 routes to a
+// compare core that tests the box's tag against the ARM's tag and compares that arm's
+// fields against the concrete operand. The concrete operand already HAS the arm's heap
+// type: when a union is declared the union path owns the struct `type`s, so a `const a: A`
+// beside a `A | i32` is the very `(ref $uVarHeap[vi])` the payload casts to.
+//
+// EVERY ARM IS CONSTRUCTED AND DISCRIMINATED, in both operand orders and for both
+// operators, and the box is exercised holding the OTHER arm at each row — a fixture that
+// only ever compares a box holding the arm it names passes while the miss answers a
+// constant.
+
+// THE ANNOTATIONS ARE LOAD-BEARING, and the hint calling them redundant is the checker
+// agreeing about the TYPE while saying nothing about the REP: `const a1: A = {x: 1}` is
+// what makes this operand the union's ARM rather than an anonymous shape, which is the
+// whole question the compare has to answer. MEASURED, not assumed — the un-annotated
+// spelling of this very file refuses, and the ingredient is `type N` below: an inline
+// shape structurally identical to `A` makes an un-annotated `{x: 1}` stop resolving its
+// variant row, at both spellings and whether or not anything uses `N` (D1099). Without
+// `N` in the file the un-annotated spelling runs, which is why the hint is declared here
+// rather than the annotation deleted.
+// @hint redundant type annotation: `a1` is inferred as `{x: i32}`
+// @hint redundant type annotation: `a2` is inferred as `{x: i32}`
+// @hint redundant type annotation: `b1` is inferred as `{y: string}`
+// @hint redundant type annotation: `b2` is inferred as `{y: string}`
+// @hint redundant type annotation: `sHi` is inferred as `{s: string}`
+// @hint redundant type annotation: `sBye` is inferred as `{s: string}`
+// @hint redundant type annotation: `nSame` is inferred as `{inner: {x: i32}}`
+// @hint redundant type annotation: `nDiff` is inferred as `{inner: {x: i32}}`
+
+type A = { x: i32 }
+type B = { y: string }
+type S = { s: string }
+type N = { inner: { x: i32 } }
+
+// ── a struct arm beside a SCALAR arm: the silent family's own shape ──────────
+function mkAI(n: i32): A | i32 {
+  if n == 0 { return 5 }
+  { x: n }
+}
+
+const ai1 = mkAI(1)
+const ai5 = mkAI(0)
+const a1: A = { x: 1 }
+const a2: A = { x: 2 }
+
+// @log true
+print(ai1 == a1)
+// @log false
+print(ai1 == a2)
+// the box holds the SCALAR arm — the tag misses, so the answer is false, not a trap
+// @log false
+print(ai5 == a1)
+// reversed operand order — equality is symmetric and the box side is found either way
+// @log true
+print(a1 == ai1)
+// @log false
+print(a2 == ai1)
+// `!=` negates each of the three
+// @log false
+print(ai1 != a1)
+// @log true
+print(ai1 != a2)
+// @log true
+print(ai5 != a1)
+
+// ── a struct arm beside a STRING arm: the same ladder, a different value atom ─
+function mkAS(n: i32): A | string {
+  if n == 0 { return "s" }
+  { x: n }
+}
+
+const as1 = mkAS(1)
+const asS = mkAS(0)
+// @log true
+print(as1 == a1)
+// @log false
+print(as1 == a2)
+// @log false
+print(asS == a1)
+
+// ── TWO STRUCT ARMS: no value atom at all, which took the loud refusal before ─
+function mkAB(n: i32): A | B {
+  if n == 0 { return { y: "b" } }
+  { x: n }
+}
+
+const ab1 = mkAB(1)
+const abB = mkAB(0)
+const b1: B = { y: "b" }
+const b2: B = { y: "c" }
+// @log true
+print(ab1 == a1)
+// @log false
+print(ab1 == a2)
+// the box holds the OTHER struct arm — a different tag, so false
+// @log false
+print(ab1 == b1)
+// @log true
+print(abB == b1)
+// @log false
+print(abB == b2)
+// @log false
+print(abB == a1)
+
+// ── a STRING field, compared through the shared `__str_eq__` helper ──────────
+function mkSI(n: i32): S | i32 {
+  if n == 0 { return 5 }
+  { s: "hi" }
+}
+
+const si = mkSI(1)
+const sHi: S = { s: "hi" }
+const sBye: S = { s: "bye" }
+// @log true
+print(si == sHi)
+// @log false
+print(si == sBye)
+
+// ── a NESTED SHAPE field (variant field code 15), compared field-wise ────────
+function mkNI(n: i32): N | i32 {
+  if n == 0 { return 5 }
+  { inner: { x: n } }
+}
+
+const ni = mkNI(1)
+const nSame: N = { inner: { x: 1 } }
+const nDiff: N = { inner: { x: 2 } }
+// @log true
+print(ni == nSame)
+// @log false
+print(ni == nDiff)
+
+// ── A CALL OPERAND ON EITHER SIDE. Both operands are parked at their first read,
+// so neither has to be a re-readable place and each runs EXACTLY ONCE — which the
+// counters below pin rather than assert.
+let boxCalls = 0
+function boxOnce(): A | i32 {
+  boxCalls = boxCalls + 1
+  { x: 1 }
+}
+
+let concCalls = 0
+function concOnce(): A {
+  concCalls = concCalls + 1
+  { x: 1 }
+}
+
+// @log true
+print(boxOnce() == concOnce())
+// @log 1
+print(boxCalls)
+// @log 1
+print(concCalls)
+
+// THE MISS ARM EVALUATES BOTH SIDES TOO: the concrete operand is parked before the tag
+// test, so a box holding the scalar arm still runs it.
+let missCalls = 0
+function missOnce(): A {
+  missCalls = missCalls + 1
+  { x: 1 }
+}
+
+// @log false
+print(ai5 == missOnce())
+// @log 1
+print(missCalls)
