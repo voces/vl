@@ -683,9 +683,21 @@ blocks the module outright.
    (#2312: `(T | null) | null` folds at `mkNullableTy`, the nesting was in the arena type
    and not in the spelling) and `string | "err"` fails identically afterwards. And the
    `Json | null` signature itself is STILL refused on the merged seed — D1027: the alias's
-   recursion is a second ingredient, which makes it D1021 with `null` as the composed arm,
-   expected to close with item 1. A minimal witness is minimal for the mechanism it found,
-   not for the row's headline; the probe that kept the headline shape is what caught it.
+   recursion is a second ingredient. It was then read as D1021 with `null` as the composed
+   arm; item 1 closed (#2315) and D1027 re-graded with the identical refusal, so it is its
+   own row (vl-de has it). Twice in one day a residue was attributed to an open row's
+   mechanism and the close refuted it: a minimal witness is minimal for the mechanism it
+   found, not for the row's headline, and "falls out of" is a prediction until measured.
+
+3a. **D1028 — a NAMED alias of the composition** (*post-D1021*; filed 2026-09-01).
+   `type JR = Json | E` delivers every arm the recursive alias contributed RAW — `f64`,
+   `boolean`, `string` are check-clean invalid wasm at return, binding and argument, a
+   `Json[]` value refuses loudly — while the struct arm and `null` land, and the direct
+   spelling `Json | E` runs (that is what item 1 closed). The module spells `Json |
+   JsonError` directly in every signature and so does not hit this; **the builder must
+   not introduce `export type JsonResult = Json | JsonError`** until it closes, and a
+   consumer who tidies the spelling into a name is the first to meet it. Probe
+   `scripts/capability-probes/recursive-union-alias-named-composition.vl`.
 
 4. **D1009 / D1010 — `Json | null` ↛ `Json` and null-bearing literals needing the `Json[]`
    annotation.** Both open, both loud check rejects. They are what makes the walking idiom

@@ -5,8 +5,9 @@
 > table cells right; 10 findings), `json-critique-usability.md` (four consumer programs
 > run on the seed; 8 findings). Every compiler claim below was re-run by the tooling
 > session against the 2026-09-01 seed before it was relied on, and four of the claims
-> grew into inventory rows while being verified (D1024–D1027 filed; D1021 re-ablated;
-> D1026 closed the same day, leaving D1027 as its residue).
+> grew into inventory rows while being verified (D1024–D1028 filed; D1021 re-ablated and
+> closed #2315; D1026 closed the same day, leaving D1027 as its residue, and D1021's close
+> left D1028 as its own).
 >
 > Three kinds of item here. **§1** is what all three agreed on or what costs nothing —
 > taken, and already written into `docs/json-design.md`. **§2** is what the owner has to
@@ -230,8 +231,12 @@ added four. In ship order:
    2.3 ruling. **D1026 CLOSED** (#2312, 2026-09-01) for the witness as filed — but the
    headline shape `Json | null` (usability gap C, the signature every accessor wants) is
    **still refused** on the merged seed: **D1027**, ablated to recursion AND null
-   membership together, i.e. D1021 with `null` as the composed arm. It rides on item 1;
-   grade D1021 on it.
+   membership together. Read at first as D1021 with `null` as the composed arm; item 1
+   closed (#2315) and D1027 re-graded with the identical refusal — its own row, vl-de's.
+   And the close left a second residue, **D1028**: a NAMED alias of the composition
+   (`type JR = Json | E`) delivers the recursive alias's value arms raw (invalid wasm)
+   while the direct spelling runs. The module never names the composition; a consumer
+   will.
 4. **D1009 / D1010 — `Json | null` ↛ `Json`; null-bearing literals** (unchanged). The
    wrong-repair footgun (§1.10) is why D1009 outranks D1022.
 5. **D1022 — named arm aliases**, emit half first (`let o: JsonObject = Map()` refuses;
