@@ -27,6 +27,9 @@ import {
   mkArrayTy,
   nameIsLitUnionType,
   nodeTyCarry,
+  primNameStr,
+  primNameOf,
+  numCastCanFail,
   nodeTyExcludesNull,
   nodeTyIsLitUnionAlias,
   nodeTyIsMap,
@@ -90,6 +93,7 @@ import {
   mkMember,
   mkNull,
   mkNum,
+  mkAsExpr,
   mkParam,
   orderArgsByParamNames,
   paramDefaultIsCallsite,
@@ -266,6 +270,14 @@ function drwIsMapRead(ix: i32) {
   const n = P.nodes[unwrapParen(ix)]
   if n is Index { return nodeTyIsMap(n.idxArr) }
   false
+}
+
+// The one-element argument list `mkCall` needs, named so the desugar above reads as the
+// program it produces rather than as list bookkeeping.
+function dcArgs(a: i32) {
+  const xs: i32[] = []
+  xs.push(a)
+  xs
 }
 
 function drwWalk(ix: i32, ctx: i32) {
@@ -571,6 +583,84 @@ function drwWalk(ix: i32, ctx: i32) {
   }
   if n is AsExpr {
     n.asObj = drwWalk(n.asObj, ctx)
+    // `x as? T` OVER A NUMERIC OPERAND DESUGARS HERE (json-design §6 q2, owner 2026-09-02).
+    // The ruling makes a cast to an INTEGER target exact-or-fail, and `as?` takes the failure
+    // as `null` — so the expression's value is `T | null`, which the checker now types
+    // (`numCastCanFail`). The LOWERING is this rewrite rather than an emitter arm, and that is
+    // the whole reason it is small: `i32 | null` already has a rep at every delivery position
+    // — return, binding, argument, map value, struct field — and an `if` that yields it reuses
+    // every one of them. An `emitAsCast` arm would have had to re-wire that matrix by hand,
+    // which is the D965 shape this repo keeps paying for.
+    //
+    //     d as? i32   ==>   if d == trunc(d) && d >= -2147483648.0 && d <= 2147483647.0 {
+    //                         d as! i32
+    //                       } else {
+    //                         null
+    //                       }
+    //
+    // The predicate is exact by construction and was measured before it was written: a
+    // FRACTION fails the first conjunct, an OVERFLOW and an INFINITY fail the range, and NaN
+    // fails the first conjunct for free (`NaN == trunc(NaN)` is false). The `as!` in the then
+    // arm is the EXISTING trapping conversion, reached only where the predicate has already
+    // proved it cannot trap.
+    //
+    // THE OPERAND IS NAMED FOUR TIMES, so it must be re-readable — the same gate and the same
+    // reason as D962's `??` desugar next door. And `nodeTyCarry` hands the `if` the cast's own
+    // checked type, without which the rewrite is type-BLINDING as well as node-erasing (D969's
+    // correction to that desugar, and the same trap here).
+    if n.asMode == "null" {
+      const dcSrc = primNameStr(primNameOf(nodeTyIxOf(n.asObj)))
+      if numCastCanFail(dcSrc, n.asTy) {
+        if exprReReadable(unwrapParen(n.asObj)) {
+          let dcExact = mkBinary(
+            ">=",
+            n.asObj,
+            mkNum("-2147483648", n.pos),
+            n.pos,
+          )
+          if dcSrc == "f64" {
+            // The INTEGRAL test, which only a float source needs — an `i64` operand is
+            // integral already and owes the range test alone.
+            dcExact = mkBinary(
+              "&&",
+              mkBinary(
+                "==",
+                n.asObj,
+                mkCall(mkIdent("trunc", n.pos), dcArgs(n.asObj), n.pos),
+                n.pos,
+              ),
+              mkBinary(">=", n.asObj, mkNum("-2147483648.0", n.pos), n.pos),
+              n.pos,
+            )
+          }
+          const dcHi = mkNum("2147483647", n.pos)
+          const dcCond = mkBinary(
+            "&&",
+            dcExact,
+            mkBinary("<=", n.asObj, dcHi, n.pos),
+            n.pos,
+          )
+          const dcThen: i32[] = []
+          dcThen.push(mkAsExpr(n.asObj, n.asTy, "trap", n.pos))
+          const dcElse: i32[] = []
+          // THE `null` ARM NEEDS THE TYPE TOO, not just the `if`. A bare `null` has no rep of
+          // its own — the emitter asks its CONTEXT which box to build — so carrying the cast's
+          // `T | null` only to the `if` left the arm itself contextless and every spelling
+          // refused with `emitProgram: bare null needs a struct-typed context`.
+          const dcNull = mkNull("null", n.pos)
+          nodeTyCarry(dcNull, ix)
+          dcElse.push(dcNull)
+          const dcIf = mkIf(
+            dcCond,
+            mkBlock(dcThen, n.pos),
+            mkBlock(dcElse, n.pos),
+            n.pos,
+          )
+          nodeTyCarry(dcIf, ix)
+          return dcIf
+        }
+      }
+    }
     return ix
   }
   if n is ArrayLit {
