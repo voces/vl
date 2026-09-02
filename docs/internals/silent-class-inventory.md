@@ -30171,3 +30171,34 @@ Repro (loud emit reject):
     const a: T = { v: 1, kids: [{ w: 2 }] }
     const b: T = { v: 1, kids: [{ w: 2 }] }
     print(a == b)
+
+### D1018 — `==` between two operands of the bare `null` TYPE refuses at emit; give either side a `T | null` and it runs
+
+**loud emit reject · check rc 0 · `emitProgram: bare null needs a struct-typed context` (`compiler/wasmEmit.vl:21666`, the bare-`null` value emitter's fall-through when no struct seed is pending — the SAME literal D20's residual and the 164-cell module-scope family report, but a different mechanism: those cells all HAVE a `T | null` and lose it through a capture or a scope; this cell never had a `T`) · `DECISIONS.md` A-infer-null: "an unconstrained `let x = null` resolves to `null`", so the type is one the design names and the checker is right to accept it · probe `scripts/capability-probes/bare-null-equality.vl` (20 of 22 run on 2026-09-01) · found by the identity proposal's consistency critique (`docs/internals/identity-critique-consistency.md` F10, which noted `null === null` would be a NEW capability because `null == null` refuses), ablated 2026-09-01**
+
+  | spelling | check | outcome |
+  | --- | --- | --- |
+  | `print(null == null)` | rc 0 | emit reject |
+  | `print(null != null)` | rc 0 | emit reject, same message |
+  | `const n = null`, `print(n == null)` | rc 0 | emit reject, same message, at the BINDING (`1:6`) — the unconstrained hole resolves to `null` and the initializer itself has no lowering |
+  | `type P = { x: i32 }`, `const a: P | null = null`, `a == null`, `null == a` | rc 0 | **RUNS**, prints `true` twice |
+  | `const a: P | null = null`, `const b: P | null = null`, `a == b` | rc 0 | **RUNS**, prints `true` |
+
+  So the ingredient is an operand — or a binding — whose type RESOLVES to bare `null`: no
+  `T` was ever inferred, so `pendingStructIdx` is never seeded and the value emitter has no
+  heap type to spell `ref.null` with. Every spelling that carries a `T | null` runs.
+
+* **CLAUSE 2 BY CONSTRUCTION.** The checker accepts the program and the design names the
+  type. The lowering is trivial — a bare `null` value is `ref.null none` (there is no `$S`
+  to name because there is no `S`), and `==` over two of them is `ref.eq` or the constant
+  `true`. The alternative close — the checker refusing a binding that resolves to bare
+  `null` — would contradict A-infer-null's own sentence and is the silent→loud close the
+  scoreboard section says does not count.
+
+* **WHY IT MATTERS BEYOND THE CELL.** The identity ruling (`docs/identity-design.md` P1)
+  admits nullable operands to `===`, so `null === null` is a program that ruling makes
+  legal; it must not inherit this floor. Whoever lowers `===` lowers this cell first.
+
+Repro (loud emit reject):
+
+    print(null == null)
