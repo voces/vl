@@ -31981,13 +31981,24 @@ Repro:
   So it is neither the recursion, nor the alias, nor the map value rep: it is an alias
   standing INSIDE the cycle, in BINDING position.
 
-* **MECHANISM.** `letMapShape`'s `lt is TypeRef` rung renders the annotation and asks the NAME
-  layer: `JO` renders `{[string]:J}` (the cycle closes on `J`, which `aliasNameOfTyIx` names
-  correctly per D1021), so the value name is the bare alias `J`. No rung of
-  `mvValKindOfName` classifies it — `unionMemberSetOf` is a lookup in `unNames` and returns a
-  recursive alias UNEXPANDED, so the union rung's member count reads 1 — and the `-3` seeded
-  `pendingMapSlot`, which `emitMapNew` refuses. The structural spelling is not a `TypeRef`
-  node at all, skips this rung, and lands on the destination rung (D203/D207) below it.
+* **MECHANISM — CORRECTED 2026-09-02, THE FIRST FILING NAMED THE WRONG ONE.** It was filed
+  as `mvValKindOfName` failing to classify the value `J` because `unionMemberSetOf` returns a
+  recursive alias unexpanded. Probing the rung's actual input refutes that. `letMapShape`'s
+  `lt is TypeRef` rung hands `mvShapeOfMapNameArmTy` the render of the annotation, and the
+  render is measured per witness:
+
+  | witness | `lt.tyName` | `mapValNameOf` |
+  | --- | --- | --- |
+  | `o: JO`, cycle through `JO` | `JO` | `` (empty) |
+  | `o: {[string]: J}` | `{[string]:J}` | `J` |
+  | `o: JO`, cycle NOT through `JO` | `{[string]:f64\|{[string]:J}\|null}` | the union |
+
+  When the annotated alias stands INSIDE the cycle, the render collapses to the bare alias
+  name — that is D1021's `aliasNameOfTyIx` correctly naming the revisit — and the map NAME
+  layer is purely syntactic: `nameIsMap("JO")` is false, so `mapValNameOf` returns `""` and
+  the kind ladder answers `-3` for the empty name. The value `J` never comes into it. Note
+  the structural spelling reaches this same rung (`nodeTyIsMap` resolves the arena type
+  either way) and resolves, which is what makes the two spellings differ.
 
 * **WHY THIS IS THE SAFE HALF OF THE ROUTING D-MAPNODETY REFUSES.** That refusal is about
   taking the node type as a slot KEY: a better answer at a rung that today ANSWERS moves 128
@@ -31995,11 +32006,17 @@ Repro:
   produced no slot at all, so no resolution the site ships today can move and no mint it
   performs is skipped. All eleven gates pass, corpus unchanged.
 
-* **`mvValKindOfName("J")` STILL RETURNS `-3`, AND THAT IS NOT THE BUG.** Every other caller
-  already tolerates it — the structural binding, the param, the list-recursive alias
-  (`type L = f64 | L[]`) all reach the same `-3` and resolve elsewhere. Only this one rung
-  turned a non-answer into a refusal. Teaching `unionMemberSetOf` to expand a recursive alias
-  is a larger change with no witness asking for it; if one appears, it belongs on its own row.
+* **THE NAME LAYER IS LEFT SYNTACTIC ON PURPOSE.** Teaching `mapValNameOf` to resolve an
+  alias would give every name-keyed classifier a second opinion about a spelling the mv slot
+  is KEYED on, which is the disagreement D-MAPNODETY's 128 cells are made of. The rung that
+  can already answer without a spelling is the destination rung, so the fix routes to it
+  rather than making `{[` mean more than it says.
+
+* **A `-3` HERE IS ROUTINE, NOT AN ERROR STATE.** `mvValKindOfName` answers it for any name
+  the layer cannot parse, and other callers reach it and resolve elsewhere every run — the
+  kind ladder is also consulted BEFORE collect has registered every union, so an early call
+  can see `-3` for a name a later call classifies. Only this one rung turned it into a
+  refusal.
 
 * **REMAINDER, FILED AS D1037.** Declaring the map alias FIRST still refuses.
 
@@ -32014,15 +32031,31 @@ Repro:
     const o: JO = Map()
     print(o.size)
 
-* **The SAME program with the two declarations SWAPPED runs** (that is D1036's own repro), so
-  this is a collect-ORDER dependency, not a rep gap: the destination rung that rescues D1036
-  finds a slot when `J` was walked first and finds none when `JO` was. A type declaration's
-  position in the file is not supposed to be observable.
+* **The SAME program with the two declarations SWAPPED runs** — that is D1036's own repro —
+  so a type declaration's position in the file is observable, which it is not supposed to be.
 
-* Reaches the same `emitProgram: unsupported map value type` at the BINDING (site A,
-  `emitMapNew`'s `pendingMapSlot == -3`), with a store-free body too — so it is the seed, not
-  any op.
+* **THE CHECKER IS NOT THE ONE LOSING IT.** Both orders diagnose a misuse correctly, they
+  just render the type differently: `o["k"] = "not a J"` reports `cannot assign string to
+  f64 | JO | null` under this order and `… to J | null` under D1036's. The type is intact.
 
-* Next step is to find which of `mapShapeOfExpr` / `letMapDestShape` declines under the
-  swapped order; both answer under D1036's order.
+* **THE EMIT RENDER IS.** Probing `letMapShape`'s rung on both orders:
+
+  | order | `nodeTyMapValName(letType)` | `mvShapeOfMapNodeTy` |
+  | --- | --- | --- |
+  | `type J` first (D1036, runs) | `f64\|{[string]:J}\|null` | `1` |
+  | `type JO` first (this row) | `` (empty) | `-3` |
+
+  `nodeTyIsMap` is 1 in both, so the node IS a map and only its VALUE fails to render. Every
+  name-keyed and node-keyed resolver downstream is therefore handed nothing, which is why
+  D1036's fall-through — and a further route to `mvShapeOfMapNodeTy`, built and measured —
+  rescue this order and not that one.
+
+* **LEAD: `aliasNameOfTyIx` (D1021) is the suspect, and it is a reverse lookup.** Rendering
+  the value union reaches member `JO` while `JO`'s own type index is on `emitNameSeen`, so
+  the cycle guard fires and asks `aliasNameOfTyIx` for the name. That scans `cUserTypes` for
+  a key whose index EQUALS the revisited one; if the forward-declared `JO` was filled through
+  a placeholder, `cUserTypes["JO"]` and the index on the stack are two different integers,
+  the scan answers `""`, and an empty member collapses the whole render. Next step is to
+  print both indices under each order — if they differ, the fix is on the identity the guard
+  matches, not on the render.
 
