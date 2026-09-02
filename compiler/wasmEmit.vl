@@ -5540,7 +5540,13 @@ function narrowedArmNeedsUnbox(exprIx: i32, fnIx: i32): boolean {
 
 // The unbox itself: recover the box's `anyref` payload and cast it to `heapIdx`. Emitted
 // AFTER the value, so the box is already on the stack.
+//
+// A NEGATIVE `heapIdx` EMITS NOTHING, and that is the bounds discipline `fbValtype` states,
+// not laziness: a destination whose table slot never resolved has no cast target, and writing
+// `ref.cast -1` would put a garbage heap index in the module where master left a diagnosable
+// one. The boundary then emits exactly what it emits today.
 function emitNarrowedArmUnboxTo(heapIdx: i32) {
+  if heapIdx < 0 { return 0 }
   fbStructGet(uBoxIdx, 1) // 0xfb 0x02 <box ht> field 1: value (anyref)
   fbRefCast(heapIdx)      // 0xfb 0x16 <dest struct/variant heap> ref.cast (non-null)
   0
@@ -5563,6 +5569,43 @@ function sFieldTgtHeapOf(si: i32, fi: i32): i32 {
   const t = sFieldTgtStructIdx(si, fi)
   if t < 0 || t >= sHeapIdx.length { return -1 }
   sHeapIdx[t]
+}
+
+// The heap a DESTINATION names, from the (kind, slot) pair every boundary already holds —
+// the same pair `fbValtype` writes the slot's valtype from, so the cast target and the slot
+// cannot disagree. -1 for a kind that is not a struct/variant ref and for an index outside its
+// table: the delivery then emits unchanged rather than reading `uVarHeap[-1]`.
+// The heap a REF-LIST slot's ELEMENT names, when that element is a struct / variant ref
+// (`rlElemKindTbl` 1) — the destination for a narrowed arm delivered into a `Circle[]`. -1
+// for a union-BOX element (kind 2), which wants the box and is already right, and for every
+// composite element kind, whose value is a list / map / closure and never an arm.
+function rlElemArmHeapOf(rslot: i32): i32 {
+  if rslot < 0 || rslot >= rlElemKindTbl.length { return -1 }
+  if rlElemKindTbl[rslot] != 1 { return -1 }
+  if rslot >= rlElemHeap.length { return -1 }
+  rlElemHeap[rslot]
+}
+
+// The SLOT half of that pair for a module GLOBAL's cell — read from the same two resolvers
+// the assignment arm already seeds `pendingStructIdx` / `pendingVariantIdx` from, so the cast
+// target and the declared cell cannot disagree. `globalCellStructIdx` answers the variant
+// index for a `variant` / `nulvariant` cell and the struct row for a `struct` one; only the
+// kind-9 niche reads its base through the `| null` peel.
+function globalCellArmIdx(gLet: i32, kind: VKind): i32 {
+  if kind == "nulstruct" { return nulRefStructIdxOfLet(gLet, -1) }
+  globalCellStructIdx(gLet)
+}
+
+function armDestHeapOf(kind: VKind, idx: i32): i32 {
+  if idx < 0 { return -1 }
+  if kind == "variant" || kind == "nulvariant" {
+    if idx < uVarHeap.length { return uVarHeap[idx] }
+    return -1
+  }
+  if kind == "struct" || kind == "nulstruct" {
+    if idx < sHeapIdx.length { return sHeapIdx[idx] }
+  }
+  -1
 }
 
 // Coerce the expression at `exprIx` to the CONCRETE variant `vi`'s rep `(ref
@@ -7514,7 +7557,12 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
               if elemNest == 5 { elCtx.nulRefHeap = rlElemHeap[rslot] }
             }
           }
+          const elArmOwed = narrowedArmNeedsUnbox(elems[i], fnIx)
           if emitExprExpect(body, elems[i], fnIx, elCtx) < 0 { return -1 }
+          // THE NARROWED-ARM UNBOX at a REF-LIST ELEMENT (D1031) — `[s]` of a `Circle[]`
+          // under `if s is Circle`. The SLOT's own element heap is the destination, the same
+          // one `rlBackIdx` types the backing array with.
+          if elArmOwed { emitNarrowedArmUnboxTo(rlElemArmHeapOf(rslot)) }
           // READ-ONLY COVARIANCE at a NESTED-LIST ELEMENT (D791) — `[lv1]` of a
           // `Shape[][]`, where the element's own row is the inner ref list.
           if elemNest == 9 && nestInnerSlot >= 0 {
@@ -15573,6 +15621,14 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
           // initializer is a wasm constexpr, while a re-assignment is ordinary code and
           // lowers here. `globalCellKind` is the destination cell's own kind.
           emitScalarListWidenSite(body, a.binRight, fnIx, gaKind)
+          // THE NARROWED-ARM UNBOX at the same NINTH boundary (D1031) — `gv = s` under
+          // `if s is Circle`, between two module globals. The cell's own kind is again the
+          // destination, so `armDestHeapOf` reads the pair `emitGlobalSection` gave it.
+          if narrowedArmNeedsUnbox(a.binRight, fnIx) {
+            emitNarrowedArmUnboxTo(
+              armDestHeapOf(gaKind, globalCellArmIdx(gLet, gaKind)),
+            )
+          }
           return emitUserGlobalSet(gIdx) // 0x24 global.set, or a promoted `local.set`
         }
         return emitFail(
@@ -16145,12 +16201,10 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
         // The ASSIGN half of the construct arm above (`p.g = s` after `if s is Circle`) —
         // `emitObj` and `emitAssign` are the two halves of every field code and have to be
         // wired together, which is the lesson the code-20 arm three branches up records.
-        if emitArmDelivery(
-          body,
-          a.binRight,
-          fnIx,
-          sFieldTgtHeapOf(si, fieldIdx),
-        ) < 0 {
+        if (
+          emitArmDelivery(body, a.binRight, fnIx, sFieldTgtHeapOf(si, fieldIdx)) <
+          0
+        ) {
           return -1
         }
       } else {
@@ -16469,6 +16523,9 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32) {
       let pushVariantIdx = -1
       let pushUnionNm = ""
       let pushNestSlot = -1
+      // The heap a narrowed ARM pushed into a `Circle[]` has to land in (D1031) — the SLOT's
+      // own element heap, the same one `rlBackIdx` types the backing with.
+      let pushArmHeap = -1
       if isRef {
         if !rlUsed {
           return emitFail(
@@ -16486,6 +16543,7 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32) {
           }
         }
         if rlElemKindTbl[rslot] == 2 { pushUnionNm = rlElemName[rslot] }
+        pushArmHeap = rlElemArmHeapOf(rslot)
         // The same ONE predicate the indexed-assign boundary uses (see there).
         if rlElemNeedsValueCtx(rslot) { pushNestSlot = rslot }
       } else if isStr {
@@ -16561,6 +16619,7 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32) {
         const valIdx = base
         const capIdx = base + 1
         const backIdx = base + 2
+        const pushArmOwed = narrowedArmNeedsUnbox(c.callArgs[0], fnIx)
         // V = x  (an f64-list push coerces/encodes the value as f64)
         pendingStructIdx = pushStructIdx
         const savedPVI = pendingVariantIdx
@@ -16631,6 +16690,10 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32) {
         }
         pendingStructIdx = -1
         pendingVariantIdx = savedPVI
+        // THE NARROWED-ARM UNBOX at the `.push` boundary (D1031) — `xs.push(s)` into a
+        // `Circle[]` under `if s is Circle`. The element-literal twin is in `emitArr`; both
+        // read the same slot heap, so the two spellings of one store cannot disagree.
+        if pushArmOwed { emitNarrowedArmUnboxTo(pushArmHeap) }
         fbLocalSet(valIdx) // local.set
         // if len(L) == cap(L)
         pushListLen(body, lIdx, lTy)
@@ -18030,6 +18093,12 @@ function retNonNullRefResult(fnIx: i32, fnPos: i32) {
 // wasm validation.
 function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
   const fn = P.nodes[fnIx]
+  // The heap a NICHE struct/variant result names (`Circle | null`, `Dot | null`) — the
+  // narrowed-arm unbox's destination at this boundary (D1031). Declared here because the
+  // seeding block that answers it runs well above the rest of this function's flags. The bare
+  // `: Circle` result needs none: `retVi` routes it through `emitVariantCoerce`, which carries
+  // the sequence itself.
+  let retArmHeap = -1
   // ONE READ, FOUR USES. The INFERRED-return arms below want the same `fnStmts` position four
   // separate times — the variant seed, the variant index, the `fRetKind` widen and the
   // atom-to-string widen — and taking it once is a HOIST, not a memo: nothing between the four
@@ -18085,6 +18154,12 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
         pendingVariantIdx = rnvi
         pendingNulRefHeap = uVarHeap[rnvi]
       }
+      retArmHeap = armDestHeapOf("nulvariant", rnvi)
+    }
+    // The kind-9 twin: a `Dot | null` result over a DECLARED struct that is the arm's layout
+    // twin. Same slot shape, same unbox owed, a struct row instead of a variant one.
+    if retNulRefFlag(fn.fnRet) == 1 {
+      retArmHeap = armDestHeapOf("nulstruct", retNulRefIndex(fn.fnRet))
     }
     // An INFERRED variant return (a `.map` lambda collapsing to one variant): seed it from
     // the checker's recorded return shape so the else-arm's `{ … }` literal builds the bare
@@ -18562,6 +18637,16 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
   // and the declared result in agreement by construction.
   if retSLKind != null {
     emitScalarListWidenSite(body, retArg, fnIx, retSLKind)
+  }
+  // THE NARROWED-ARM UNBOX at the RETURN boundary (D1031). The bare `: Circle` result is
+  // already served — `retVi >= 0` routes through `emitVariantCoerce`, which carries the
+  // sequence inline — and the NICHE results (`Circle | null`, `Dot | null`) are the ones that
+  // took the box into a `(ref null $H)` slot. Read off the same (kind, slot) pair the RESULT
+  // VALTYPE is written from, so the cast target cannot disagree with the functype.
+  if retArmHeap >= 0 && retVi < 0 {
+    if narrowedArmNeedsUnbox(retArg, fnIx) {
+      emitNarrowedArmUnboxTo(retArmHeap)
+    }
   }
   pendingStructIdx = -1
   pendingVariantIdx = -1
@@ -19111,6 +19196,10 @@ function emitLetDeclStmt(body: i32[], s: LetDecl, stmtIx: i32, fnIx: i32) {
       }
     }
   }
+  // Asked BEFORE the init ladder below: an init carrying its own `if` pushes and pops the
+  // narrowing stack, and this boundary's question is about the value it receives. Consumed
+  // beside the two widen sites at the very bottom (D1031).
+  const letArmOwed = narrowedArmNeedsUnbox(s.letInit, fnIx)
   // An empty `[]` initializer over a ref-array annotation (`let xs: T[] = []`) needs
   // the element kind to pick the ref-list construction — record it for `emitArr`.
   // …and an UN-annotated one takes its DESTINATION's (D381) — `letListBuildKind` /
@@ -19416,6 +19505,15 @@ function emitLetDeclStmt(body: i32[], s: LetDecl, stmtIx: i32, fnIx: i32) {
   // THE SCALAR DUAL (D965) — `const b: f64[] = e` over an `i32[]`. The cell's own kind IS
   // the destination list kind, so this needs no second derivation.
   emitScalarListWidenSite(body, s.letInit, fnIx, localIsRef[slot])
+  // THE NARROWED-ARM UNBOX at the BINDING boundary (D1031) — `const c: Circle = s` under
+  // `if s is Circle`. The same shape as the two widen sites above and for the same reason: the
+  // CELL's own (kind, slot) pair IS the destination, so the cast target is the slot's.
+  // `letArmOwed` is taken BEFORE the init emits — an init carrying its own `if` moves the
+  // narrowing stack, and the question is about the value this boundary receives.
+  if letArmOwed {
+    const letArmHeap = armDestHeapOf(localIsRef[slot], localStructIdx[slot])
+    if letArmHeap >= 0 { emitNarrowedArmUnboxTo(letArmHeap) }
+  }
   fbLocalSet(idx) // 0x21 local.set
   // Bind `name → slot` in the current emit-time frame AFTER emitting the init (so the
   // init resolved any same-named OUTER binding), making this binding live for the rest
@@ -22967,6 +23065,18 @@ function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
           if exprNullableVariant(args[i], fnIx) {
             fbRefAsNonNull() // 0xd4
           }
+        }
+      }
+      // THE NICHE PARAMETER'S UNBOX (D1031) — `g(r)` into `g(x: Circle | null)` under
+      // `if r is Circle`. The BARE variant parameter's unbox is the arm below and has always
+      // been here; its `| null` twin declares the same heap with a nullable slot and never
+      // grew one, so the box went in whole: `vl check` rc 0, invalid wasm. Guarded on `cVi`
+      // being absent so the two arms cannot both fire on one argument.
+      if cVi < 0 && cParamNulVariantIdx >= 0 {
+        if narrowedArmNeedsUnbox(args[i], fnIx) {
+          emitNarrowedArmUnboxTo(
+            armDestHeapOf("nulvariant", cParamNulVariantIdx),
+          )
         }
       }
       if cVi >= 0 {
