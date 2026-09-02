@@ -33963,9 +33963,9 @@ Repro (check rc 0, then invalid wasm):
 
 ### D1071 — a union `==` against a CONCRETE operand that is not a value atom reads the WRONG arm's payload: check-clean invalid wasm
 
-**check-clean invalid wasm (`type mismatch: expected i32, found (ref $type)`) · check rc 0 · clause 1 · ZERO corpus cells · found 2026-09-02 while sweeping the residue of [D1061](#d1061); PRE-EXISTING and byte-identical on the merge-base `5aac87cd`, confirmed by A/B against a compiler self-built from that tree**
+**CLOSED as `runs` 2026-09-02 — the repro RUNS and prints `true`. Was: check-clean invalid wasm (`type mismatch: expected i32, found (ref $type)`) on `vl check` rc 0 · clause 1 · ZERO corpus cells · found while sweeping the residue of [D1061](#d1061); PRE-EXISTING and byte-identical on the merge-base `5aac87cd`, confirmed by A/B against a compiler self-built from that tree**
 
-Repro (`vl check` rc 0, then the engine refuses the module):
+Repro (RUNS and prints `true`):
 
     type A = { x: i32 }
     function mk(n: i32): A | i32 {
@@ -33976,35 +33976,253 @@ Repro (`vl check` rc 0, then the engine refuses the module):
     const a: A = { x: 1 }
     print(p == a)
 
-* **THE MECHANISM IS AN IN-BAND DEFAULT, NOT A MISSING ARM.** `unionEqAtomOf` classifies the
+* **THE MECHANISM IS AN IN-BAND DEFAULT, NOT A MISSING ARM.** `unionEqAtomOf` classified the
   CONCRETE side of a union `==` down a first-match ladder (litunion atom / string / f32 / f64
-  / i64 / boolean) and its `else` arm falls back to the union's own numeric promotion, which
-  starts from `let atom = "i32"`. A STRUCT operand matches no rung, so it is answered `"i32"`
-  — a real value meaning "I could not classify this". `emitUnionConcreteEq`'s `eqMixedOk`
-  gate then passes, because the union genuinely does carry an `i32` arm, and the compare
-  emits the i32 arm's tag test and unboxes the i32 payload against a `(ref $A)`.
+  / i64 / boolean) and its `else` arm fell back to the union's own numeric promotion, which
+  starts from `let atom = "i32"`. A STRUCT operand matches no rung, so it was answered
+  `"i32"` — a real value meaning "I could not classify this". `emitUnionConcreteEq`'s
+  `eqMixedOk` gate then passed, because the union genuinely does carry an `i32` arm, and the
+  compare emitted the i32 arm's tag test and unboxed the i32 payload against a `(ref $A)`.
+
+* **PROBED, NOT READ OFF THE CODE PATH.** An `emitFail` at the rung printed what it RECEIVED
+  for each cell: `atom=i32 arms=A|i32 tyIx=40 rowKind=-1 vi=0`. The spelling it handed back
+  was `i32` while the operand's own arena row answered **-1 — "not a value atom"** — and
+  `exprVariantIndex` already knew the operand was variant row **0**. Both facts were
+  available at the site; neither was asked. The must-fire control was `mk(0) == 5`, a
+  program that COMPILES: it printed the probe too, which is what validates an `emitFail`
+  instrument that is otherwise silent on anything that builds.
 
 * **DISASSEMBLED, so the arm is named rather than inferred** (`wasm-dis`, the four feature
-  flags): `(i32.eq (struct.get $2 0 (ref.cast (ref $2) (struct.get $1 1 …))) (global.get
-  $global$1))` — the box's tag is compared against `1`, which is the **i32 value box's** tag,
-  not the `A` variant's `0`, and the right-hand side is the whole struct ref.
+  flags). Before: `(i32.eq (struct.get $2 0 (ref.cast (ref $2) (struct.get $1 1 …)))
+  (global.get $global$1))` — the box's tag compared against `1`, the **i32 value box's** tag,
+  not the `A` variant's `0`, with the whole struct ref on the right. After: the tag is
+  compared against `0`, the payload is `ref.cast (ref $0)` to `uVarHeap[A]`, and the compare
+  is `struct.get $0 0` of each side.
 
 * **THE INGREDIENT IS "THE UNION CARRIES A VALUE ATOM", NOT "THE UNION CARRIES A STRUCT".**
-  Ablated: `A | B` (two struct arms) against a concrete `A` refuses LOUDLY, because no arm is
-  a value atom and `eqMixedOk` is false. `A | i32` against a struct is silent. `i32 | i32[]`
-  against a concrete `i32[]` is silent by the identical mechanism, so the family is a union
+  Ablated: `A | B` (two struct arms) against a concrete `A` refused LOUDLY, because no arm is
+  a value atom and `eqMixedOk` was false. `A | i32` against a struct was silent. `i32 | i32[]`
+  against a concrete `i32[]` was silent by the identical mechanism, so the family is a union
   with at least one value-atom arm compared against a concrete operand whose type is not a
   value atom — the container arm is incidental.
 
-* **AN IN-BAND SENTINEL IS A REAL VALUE.** The caller's guard reads `valueAtomKind(atom) >= 0
-  && unionHasAtomK(…, atom, …)`, which is a sound test of the ATOM and no test at all of
-  whether the atom describes the OPERAND. Closing this needs `unionEqAtomOf` to be able to
-  say "not an atom" — and then a union-vs-concrete-STRUCT compare core, or the loud refusal
-  `A | B` already gets. Both halves are in one place; neither is written.
+* **THE FIX GIVES "CANNOT ANSWER" ITS OWN CHANNEL.** `unionEqAtomOf` is now
+  `unionEqAtomKindOf` and returns a value-atom KIND, with **-1 meaning "not an atom"** — the
+  convention `valueAtomKind` and `valueRowKind` already answer that question with, and not a
+  second magic spelling. Its fall-through asks the OPERAND'S OWN arena row
+  (`valueRowKind(nodeTyIxOf(...))`) before it asks the union's promotion: -1 is the arena
+  STATING there is no atom rep, a container code is answered as itself, and only -2 (the
+  arena declining) leaves the historical i32 default in force. The single call site is the
+  only reader, so there is no second decoder to drift.
 
-* **NOT D1061.** D1061 is union-vs-union through `emitStructUnionEq`; this is
+* **AND THEN A UNION-VS-CONCRETE-VARIANT COMPARE CORE**, which is the union-vs-union compare
+  with one side's unbox deleted: park both operands, test the box's tag against the ARM's
+  tag, and on a match compare that arm's fields against the concrete value. The concrete
+  operand already HAS the arm's heap type — with a union declared, the union path owns the
+  struct `type`s, so `const a: A` in a program carrying `A | i32` is the very
+  `(ref $uVarHeap[vi])` the payload casts to (disassembled, same heap index). The field loop
+  is `emitVariantArmEq`'s, split out as `emitVariantFieldsEq` so the two callers share the
+  compare and differ only in the unbox.
+
+* **POSITION MATRIX, RUN NOT READ — 19 of 20 positions, each printing a value that proves the
+  compare happened.** Top level, local binding, argument, return, local assignment, GLOBAL
+  assignment (`emitAssign`'s `global.set` arm), struct-field init, `if` condition, list
+  element, `&&` right operand, global init, `while` condition, both operands as params,
+  closure body, concrete-side call, box-side struct-field read, and three evaluation-count
+  rows. The twentieth — a concrete operand delivered by reading a struct FIELD — is
+  [D1097](#d1097). Evaluation counts are pinned rather than asserted: each side runs exactly
+  once, including on the miss arm, where the concrete operand is parked before the tag test.
+
+* **A NESTED UNION `==` INSIDE AN OPERAND CLOBBERED THE OPERAND STASH — found by writing
+  it, and PRE-EXISTING in the sibling lowering.** The scratch slots a union compare parks
+  its operands in are shared per FUNCTION, not per site, so
+  `p == pick(scalarArm != a1)` re-enters the same lowering and overwrites them, and the
+  outer compare then reads the INNER's operand: a check-clean module with a WRONG answer.
+  `emitStructUnionEq` has the identical shape and the identical bug — `p == pickAB(w == v)`
+  prints `false` where the answer is `true`, byte-identically on the merge-base `60df1e87`,
+  so it is not this change's. Both are fixed the same way: **both operands ride the wasm
+  STACK until both have been computed**, and only then are parked. Evaluation order is
+  unchanged, a stack value is unreachable from the nested code, and no user code runs
+  between the second operand landing and the compare finishing. Both rows are in the
+  fixture, each chosen so a clobber CHANGES the answer.
+
+* **NOT D1061.** D1061 is union-vs-union through `emitStructUnionEq`; this was
   union-vs-concrete through `emitUnionConcreteEq`, a different function with a different
-  gate, and D1061's fix moves none of these cells (re-measured after it landed).
+  gate, and D1061's fix moved none of these cells (re-measured after it landed). The core
+  built here serves `A | B` against a concrete `A` too, which was a LOUD refusal before.
+
+Fixture: `tests/cases/unions/union-concrete-variant-equality.vl`.
+---
+
+### D1095 — a union arm whose atom is a LIST has no payload compare: `i32 | i32[]` == `i32 | i32[]` is a loud emit reject, and a struct union carrying a list arm declines wholesale
+
+**CLOSED as `runs` 2026-09-02 — the repro RUNS and prints `true`. Was: a loud emit reject on `vl check` rc 0 (`emitProgram: union `==` atom has no value box` at the value-union spelling, `emitProgram: `==` over a struct union is not supported yet` at the struct-union one) · clause 2 · ZERO corpus cells · found as the container half of [D1071](#d1071)'s family and the list-arm residue of [D1061](#d1061)**
+
+Repro (RUNS and prints `true`):
+
+    type A = { x: i32 }
+    function mk(n: i32): A | i32[] {
+      if n == 0 { return [1] }
+      { x: n }
+    }
+    const p = mk(0)
+    const q = mk(0)
+    print(p == q)
+
+* **A LIST ARM RIDES THE BOX'S `value` FIELD AS ITS WRAPPER REF**, with no scalar value box —
+  the same shape a string arm rides, and `emitUnionUnboxTail` already recovers it that way
+  for every narrowed read. `emitUnionPayloadUnbox`, the `==` twin, went straight to
+  `vbHeapIdxOfKind`, which answers -1 for a list code, so a value union refused with `union
+  `==` atom has no value box`; and `emitStructUnionEq`'s arm admission asked the same
+  question, so one list arm declined an arm set it could otherwise serve.
+
+* **THREE LOWERINGS HAD THREE COPIES OF THE PAYLOAD COMPARE** (`if k == 2 { str } else {
+  opcode }`), so teaching a list arm to compare would have meant writing the same third arm
+  three times. They now share `emitUnionAtomPayloadEq`, which is the third projection of the
+  code that already chose the tag and the unbox at each of them.
+
+* **THE FRAME IS THE HALF THAT IS NOT THE COMPARE.** A list core writes into a reserved
+  scratch frame, and the scan that reserves it (`leqNoteBin`) only ever looked at the
+  BINARY'S OWN OPERAND REPS — which here are union boxes. It now notes a frame for EVERY list
+  arm of either operand's union, because which arm's core runs is a runtime tag test and no
+  scan can narrow it. Over-reserving costs four locals in one function; under-reserving is
+  invalid wasm at the i32 and string reps and a loud `list compare frame was not reserved for
+  this rep` at the rest.
+
+* **THE UNION-ATOM ALPHABET IS NOT THE COMPARE-KIND ALPHABET** — a union atom's `7` is
+  `i32[]`, a compare kind's `7` is `f32[]` — so the translation is a named function
+  (`leqCoreKindOfAtomKind`) read by both the scan and the emitter, the same one-home
+  discipline `eqScalarListFieldKind` carries for struct fields.
+
+* **EVERY LIST REP, CONSTRUCTED AND DISCRIMINATED**: `i32[]` (equal / one element different /
+  a different LENGTH), `f64[]`, `string[]`, `i64[]`, `f32[]`, `boolean[]` and the packed
+  `u8[]`, at both the union-vs-concrete and the union-vs-union spelling, with the box also
+  holding the OTHER arm at each row. A union with TWO list arms is included, because there the
+  tag rather than the operand's spelling has to pick the core.
+
+Fixture: `tests/cases/unions/union-list-arm-equality.vl`.
+---
+
+### D1096 — a union `==` declines the whole compare when a STRUCT arm carries an f64, i64, f32 or LIST field; the same field types compare fine as plain struct fields
+
+**loud emit reject: `emitProgram: `==` over a struct union is not supported yet` · check rc 0 · clause 2 · ZERO corpus cells · found 2026-09-02 as the residue of [D1071](#d1071); silently mis-compiled on the merge-base `60df1e87` (a module the engine refuses, after `vl check` rc 0) and loud since**
+
+Repro (`vl check` rc 0, then the emitter refuses):
+
+    type A = { d: f64 }
+    function mk(n: i32): A | i32 {
+      if n == 0 { return 5 }
+      { d: 1.5 }
+    }
+    const p = mk(1)
+    const a: A = { d: 1.5 }
+    print(p == a)
+
+* **THE INGREDIENT IS THE FIELD'S REP, NOT THE ARM SET.** Ablated one field type at a time
+  with the union and the operands held fixed: `x: i32` and `s: string` run, a nested inline
+  shape runs, and `d: f64`, `d: i64`, `d: f32` and `xs: i32[]` each refuse.
+  `variantFieldsComparable` accepts variant field codes 0 (i32 / boolean), 3 (string) and 15
+  (a nested shape) and declines everything else, and one unservable arm declines the whole
+  lowering.
+
+* **ONE GATE, BOTH SPELLINGS.** The union-vs-union and the union-vs-concrete compares read the
+  same predicate, so `p == q` and `p == a` refuse identically — this is one row, not two.
+
+* **THE CORES EXIST.** An f64 / i64 / f32 / list value compares at its direct spelling and as
+  a plain STRUCT field; what is missing is the variant-table ladder's route to them, which is
+  the same shape [D1020](#d1020) closed for scalar-backed list fields of a struct row.
+
+Probe: `scripts/capability-probes/union-eq-variant-field-rep.vl`.
+---
+
+### D1097 — a concrete variant delivered by reading a struct FIELD is not recognised as a variant, so the union `==` against it refuses; every other delivery of the same value runs
+
+**loud emit reject: `emitProgram: `==` over a struct union is not supported yet` · check rc 0 · clause 2 · ZERO corpus cells · found 2026-09-02 by [D1071](#d1071)'s position matrix; silently mis-compiled on the merge-base `60df1e87` (a module the engine refuses, after `vl check` rc 0) and loud since**
+
+Repro (`vl check` rc 0, then the emitter refuses):
+
+    type A = { x: i32 }
+    type H = { a: A }
+    function mk(n: i32): A | i32 {
+      if n == 0 { return 5 }
+      { x: n }
+    }
+    const p = mk(1)
+    const h: H = { a: { x: 1 } }
+    print(p == h.a)
+
+* **THE DELIVERY IS THE GAP, NOT THE COMPARE.** The position matrix ran the identical compare
+  at nineteen other positions and every one of them works, including a struct-field read of
+  the BOX side (`h.u == a`). `exprVariantIndex` resolves a variant row for an `Ident`, an
+  `AsExpr`, a `Call` and a module GLOBAL and has no leg for a `Member` — so the concrete
+  operand answers -1 and the compare core declines. Binding it first does not help
+  (`const t = h.a; p == t` refuses too): the local's own row is resolved from the same read.
+
+* **IT IS THE OPERAND-SIDE FACE OF A WIDER GAP.** With a union declared, the union path owns
+  the struct `type`s, and `h.a == c` between two CONCRETE values of that shape already refuses
+  with `emitProgram: struct equality is not supported yet`. Delete the union declaration and
+  the same concrete-vs-concrete compare runs. One reader closes both.
+
+Probe: `scripts/capability-probes/union-eq-member-read-operand.vl`.
+---
+
+### D1098 — a union whose arm is a CLOSURE has no payload compare: `(() => i32) | i32` against a concrete function refuses
+
+**loud emit reject: `emitProgram: `==` over a union's closure arm is not supported yet` · check rc 0 · clause 2 · ZERO corpus cells · found 2026-09-02 as the non-list half of [D1071](#d1071)'s container family; silently mis-compiled on the merge-base `60df1e87` (a module the engine refuses, after `vl check` rc 0) and loud since**
+
+Repro (`vl check` rc 0, then the emitter refuses):
+
+    function seven(): i32 { 7 }
+    function mk(n: i32): (() => i32) | i32 {
+      if n == 0 { return 5 }
+      seven
+    }
+    const p = mk(1)
+    print(p == seven)
+
+* **THE UNBOX EXISTS AND THE COMPARE DOES NOT.** A closure arm rides the box's `value` field
+  directly as its fat-pointer struct — the same shape the string and list arms ride, both of
+  which compare — and `emitUnionUnboxTail` already recovers it for a narrowed read. What has
+  no route is the compare: two closures are equal by function IDENTITY, a separate lowering
+  with its own scan (`cloEqNoteBin`), and the union arm ladder never reaches it.
+
+* **THE UNION-VS-UNION SPELLING IS UNCHANGED AND STILL REFUSES**, with the older message
+  `emitProgram: union `==` atom has no value box` — the same gap read through the other
+  lowering. The concrete spelling was SILENT before [D1071](#d1071)'s fix and now names the
+  arm, which is the one message literal this change ADDED to `goal-scoreboard.py --sites`
+  (22 → 23).
+
+Probe: `scripts/capability-probes/union-eq-closure-arm.vl`.
+---
+
+### D1099 — an UN-ANNOTATED concrete operand stops resolving its variant row once the file declares a second type carrying a structurally identical INLINE shape; nothing has to use it
+
+**loud emit reject: `emitProgram: `==` over a struct union is not supported yet` · check rc 0 · clause 2 · ZERO corpus cells · found 2026-09-02 by writing the un-annotated spelling of [D1071](#d1071)'s own fixture; silently mis-compiled on the merge-base `60df1e87` (a module the engine refuses, after `vl check` rc 0) and loud since**
+
+Repro (`vl check` rc 0, then the emitter refuses):
+
+    type A = { x: i32 }
+    type N = { inner: { x: i32 } }
+    function mk(n: i32): A | i32 {
+      if n == 0 { return 5 }
+      { x: n }
+    }
+    const p = mk(1)
+    const a = { x: 1 }
+    print(p == a)
+
+* **THE INGREDIENT IS THE SECOND DECLARATION, NOT THE MISSING ANNOTATION.** Ablated in both
+  directions: delete `type N` and the same un-annotated program prints `true`; keep `N` and
+  write `const a: A = { x: 1 }` and it prints `true`. Nothing needs to USE `N` — a function
+  returning `N | i32` is not required, the bare declaration is enough — so the ingredient is
+  what declaring `{ inner: { x: i32 } }` does to the shape tables, not any flow through it.
+
+* **A FIXTURE THAT ANNOTATES CANNOT SEE THIS**, which is [D969](#d969)'s lesson one function
+  further in and how it was found: the annotation PINS the operand's rep, so
+  `union-concrete-variant-equality.vl` declares its `redundant type annotation` hints rather
+  than deleting the annotations, and says why in the file.
+
+Probe: `scripts/capability-probes/union-eq-unannotated-variant-operand.vl`.
 ---
 
 ### D1093 — the VARIANT table codes an INLINE multi-member literal-union field `string` and the STRUCT table codes it `atom`, so an arm carrying one still has no field rep; the NAMED alias spelling of the same union runs
