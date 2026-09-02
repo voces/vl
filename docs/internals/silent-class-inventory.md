@@ -29757,7 +29757,7 @@ Repro (check-clean silently wrong):
 
 ### D1012 — indexing an `is`-narrowed self-referential ARRAY arm INTO A LOCAL refuses, and the ingredient is a self-referential MAP arm the program never touches
 
-**loud emit reject · check rc 0 · `emitProgram: map op receiver is not a map` (`compiler/wasmEmit.vl:7796`) · the receiver is a narrowed ARRAY and no map is constructed anywhere in the program — the MAP ARM'S PRESENCE IN THE ALIAS is the whole ingredient · five ablations RUN unchanged, `for e in v` over the same value among them · fires identically at module `const`, at a parameter and inside a function body · found by the serde round-3 POSITION matrix (`docs/serde-design.md` appendix, residue (e)) and re-measured cell by cell here on the 2026-09-01 seed**
+**runs, prints `1.5` — CLOSED 2026-09-01 by declining the map arm in `mapReadMvSlot`'s narrowing-BLIND fallback when an `is` narrow says the receiver is the ARRAY arm (`compiler/emit_classify.vl`), pinned by `tests/cases/unions/narrowed-array-arm-index-binding.vl`. Was: loud emit reject · check rc 0 · `emitProgram: map op receiver is not a map` (`compiler/wasmEmit.vl:7796`) · the receiver is a narrowed ARRAY and no map is constructed anywhere in the program — the MAP ARM'S PRESENCE IN THE ALIAS is the whole ingredient · five ablations RUN unchanged, `for e in v` over the same value among them · fires identically at module `const`, at a parameter and inside a function body · found by the serde round-3 POSITION matrix (`docs/serde-design.md` appendix, residue (e)) and re-measured cell by cell here on the 2026-09-01 seed**
 
 `type K = f64 | K[] | { [string]: K }` is the JSON value tree's own shape minus the leaf
 scalars. Narrow to the array arm, index it, and BIND the result — the emitter routes the
@@ -29787,6 +29787,27 @@ because the value is an array. The program contains no `Map()`, no `[k]` on a ma
   compile, or the CHECKER owed the diagnosis. The message is an internal-invariant sentence
   (`… is not a map`), which is exactly D964's point: it concedes nothing, so
   `goal-scoreboard.py --sites` does not count it and never will.
+
+* **THE SITE WAS NOT THE ONE IT LOOKED LIKE, AND THAT COST A BUILD.** `emitExpr`'s Index arm
+  reads `if exprMap(e.idxArr, fnIx) { return emitMapGet(…) }` — the same predicate, the same
+  receiver, and `emitMapGet` reaches the refusing `emitMapRecvKey`. It is the natural suspect
+  and it is never reached: a BINDING whose initialiser is an index does not go through it. A
+  narrowed-array bypass there changed nothing, and neither did FORCING that bypass for this
+  exact receiver name. Both measured before the real site was found. `emitMapGet` has exactly
+  ONE caller, which is what made the elimination conclusive — grep the callers of the refusing
+  function, not of the predicate.
+
+* **THE REAL SITE IS A FALLBACK THAT IS BLIND ON PURPOSE.** `mapReadMvSlot` resolves a union's
+  map arm directly when `exprMap` misses, because in the frame PRE-PASS no `is` narrow is
+  active yet and a `const t1 = t0[k] ?? d; t1()` chain would otherwise lose its closure arm.
+  Blind is right there. It is wrong once a narrow IS active and says ARRAY: then `exprMap`
+  missing is the correct answer, not a pre-pass artefact. The fix is one line — decline when
+  `nameIsArray(narrowVariantFor(name))` — and the fallback's own case is pinned in the fixture
+  by the map arm alongside, which still routes through it.
+
+* **SAME FAMILY AS [D1015](#d1015), SAME KEYING.** A classifier answering from the DECLARED
+  type where the narrowed arm is what matters, fixed by keying off `narrowVariantFor` rather
+  than `narrowedValueAtomOf` (which answers `""` here, as it did there).
 
 Repro (loud emit reject):
 
@@ -30293,3 +30314,47 @@ Repro (loud emit reject):
 Repro (runs — prints `true`):
 
     print(null == null)
+
+### D1019 — `const t = m[k] ?? d` over a UNION-VALUED map is check-clean invalid wasm INSIDE A FUNCTION, and runs at module scope
+
+**check-clean invalid wasm · check rc 0 · `type mismatch: expected (ref $type), found (ref null $type)` at the engine · found 2026-09-01 while grading [D1012](#d1012)'s fix against the narrowing-blind fallback's OWN case, so the witness arrived as a control that was expected to pass · pre-existing: identical on master, byte-for-byte the same offset and message · three ingredients, each ablated alone**
+
+Repro:
+
+    function go(m: { [string]: i32 | string }, k: string) {
+      const t1 = m[k] ?? 7
+      if t1 is i32 { print(t1) }
+    }
+    const mm: { [string]: i32 | string } = Map()
+    mm["a"] = 7
+    go(mm, "a")
+
+The `??` hit arm loads the map's stored box, which is `(ref null $box)` because a miss is a
+null; the miss arm synthesizes the default. The binding's declared cell is the non-null
+`(ref $box)`, and nothing casts the hit arm's value down to it. `emitMapGetOr` is the
+lowering; it is right at module scope and wrong in a function body.
+
+* **THREE INGREDIENTS, EACH REMOVED ALONE — the other two held in every row.**
+
+  | change from the witness | outcome |
+  | --- | --- |
+  | move the same three lines to MODULE SCOPE | RUNS → `7` |
+  | drop `?? 7`, bind the bare `m[k]` | RUNS → `7` |
+  | make the value type NON-union (`{[string]: i32}`) | RUNS → `7` |
+  | annotate the binding `const t1: i32 \| string = …` | **still invalid** |
+  | swap the arms to `i64 \| string` | **still invalid** |
+  | wrap the map in a union and reach it by `is` narrow | **still invalid** |
+
+  So it is: *function scope* + *`??` default* + *union-valued map*. The arm TYPES are not an
+  ingredient and neither is an annotation — which is the [D1013](#d1013) shape again, a
+  module-vs-function scope split in a lowering that reads as scope-independent.
+
+* **THE ANNOTATION NOT HELPING IS THE INTERESTING HALF.** Per the standing rule that a
+  fixture annotating every destination cannot see the missing-annotation defect, the first
+  thing to try was the annotated spelling — and here it changes nothing, so the defect is
+  not inference picking the wrong rep. Both spellings agree about the TYPE and neither
+  emits the null-cast the REP needs.
+
+* **CLAUSE 1.** `vl check` accepts it and the engine refuses the module, so this is a
+  soundness violation, not a capability gap — no refusal text to narrow, nothing for
+  `--sites` to count.
