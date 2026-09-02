@@ -30137,7 +30137,7 @@ an array-of-map is not yet supported — use a named element type`):
 
 ### D1017 — `==` over a struct whose field is a LIST OF STRUCTS refuses at emit; the list compares on its own and a scalar-list field compares in place
 
-**loud emit reject · check rc 0 · `emitProgram: unsupported struct field type in equality` (`compiler/wasmEmit.vl:11990`, the field-code ladder's floor) · the SAME literal the inventory already records twice as a loud→loud severity downgrade (a mixed-base literal-union field; a 2-D list field) — this row is the first cell where the shape is soundly comparable and the ladder simply has no arm · not counted by `goal-scoreboard.py --sites` (the wording admits nothing) · probe `scripts/capability-probes/struct-list-field-equality.vl` (20 of 21 run on 2026-09-01) · found by the identity proposal's cross-language critique (`docs/internals/identity-critique-crosslang.md` finding 8), ablated 2026-09-01**
+**closed · was a loud emit reject · clause 2 · `tests/cases/structs/struct-list-field-equality.vl` — the acceptance is its VALUE TABLE, not a compile**
 
 The motivating shape was the tree every cycle-detection example is written over —
 `type T = { v: i32, kids: T[] }` — and the critique's point was that the identity proposal's
@@ -30223,7 +30223,15 @@ Repro (loud emit reject):
   `emitEqGStructElem` already reads) and calls `emitListEqGCore`, whose struct-element class
   routes to the stash-based `emitStructEqRec(body, -2, -3, …)`.
 
-  **Grade it on a VALUE TABLE, never a compile** — equal lists true, differing element false,
+  **CLOSED exactly as planned, and nothing new was built.** Collection: `leqNoteBin` now walks
+  the struct row and calls `leqgNoteRep(1, slot, 0)` per code-5 field, the slot from
+  `rlSlotByNameKeyTy(sFieldElemNameAt(row, fi), -1)`. Emit: the code-5 arm reads both lists
+  with `emitChainRead` off the field path and calls `emitListEqAnyRep(body, 1, slot, fnIx)` —
+  the same call the top-level `L[] == L[]` site makes. The value table passes: equal true,
+  differing element false, differing length false, empty-vs-empty true, empty-vs-nonempty
+  false, `!=` true.
+
+  **Graded on a VALUE TABLE, never a compile** — equal lists true, differing element false,
   differing length false, empty-vs-empty true. On this same `==` ladder D989's half-wiring
   compiled cleanly and printed `1 == 2` as `true`, and this row's own diagnosis has already
   been wrong once.
