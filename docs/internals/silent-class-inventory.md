@@ -24236,10 +24236,21 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   that flag check entirely (returning `vbI32Idx` unconditionally for kinds 0/1) leaves the
   refusal exactly where it was. The message names a symptom one level below the cause.
 
-* The fix is the same shape as D973's struct-union equality: compare the two boxes' TAGS
-  first, then dispatch to a per-arm comparison, rather than unboxing one assumed arm. Until
-  that exists the guard is correct to refuse — narrowing it alone would hand `==` two boxes it
-  cannot compare.
+* **THE UNION-VS-UNION PATH ALREADY EXISTS, and the arm list was the visible failure.**
+  `emitUnionUnionEq` implements tag-compare-then-per-arm. Probing the arm loop prints
+  `arm=[U]`: `msMemberAtomsOfSet` misses for this shape and the fallback splits the union's
+  own NAME, so the list is ONE "arm" called `U` whose atom kind is -1. That is what reaches
+  the value-box guard — the message names a symptom two levels below the cause.
+
+* **EXPANDING THE ARMS MAKES IT COMPILE AND SILENTLY WRONG — do not ship that.** Expanding
+  through `unionSetArmTys` before the text split makes `a == b` print `true`, and it also
+  makes **`1 == 2` print `true`**. Cross-arm comparison is right (`1 == "x"` is `false`); the
+  SAME-arm payload comparison is not. Measured, reverted.
+
+  So the refusal was protecting a broken implementation, not a missing one, and this row is
+  not "expand the arm list" — it is **fix `emitUnionUnionEq`'s payload compare, then expand
+  the arms**. Acceptance is a value table, not a compile: `1 == 1` true, `1 == 2` FALSE,
+  `"ab" == "ab"` true, `1 == "ab"` false.
 
 * Numbered in this session's block rather than the reporter's, so the range reservations stay
   clean.
