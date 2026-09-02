@@ -29834,11 +29834,6 @@ Repro (loud emit reject):
   the receiver's node resolves; do not read it as the refusal happening during signature
   emission.
 
-* Same family as [D1015](#d1015): a classifier answering from the declared type where the
-  narrowed arm is what matters. That one was fixed by keying off `narrowSlotOf` +
-  `narrowVariants` rather than `narrowedValueAtomOf`, after four probes died on the latter
-  answering "" — try that keying here first.
-
 ### D1013 — `print` of a local RE-BOUND from an `is`-narrowed REF arm is check-clean invalid wasm: D968 fixed the narrowed RECEIVER and the rebind kept the box
 
 **closed · was check-clean invalid wasm · clause 1 · `tests/cases/unions/narrowed-union-rebound-local.vl` pins BOTH scopes**
