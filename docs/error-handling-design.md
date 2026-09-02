@@ -264,10 +264,14 @@ the rep family the Phase-2 rep rewrite is still burning down (R3b / R7). So:
 
 1. **Now:** this doc lands as the decided direction. std stays total (D1):
    `std:fmt`/`std:array`/`std:test` never return `T | E`; failures trap.
-   (Updated 2026-09-01: `std:fmt` gained `parseF64(self: string): f64 | null`.
-   That is the ABSENCE channel, not `T | E`, so the rep prerequisite this
-   clause is about does not bind and the letter of the ruling is intact — but
-   the module is no longer total, and the sentence above named it as one.)
+   (Updated 2026-09-01: `std:fmt` gained `parseF64(self: string): f64 | null`,
+   then `parseI64(self: string): i64 | null` and
+   `parseI32(self: string): i32 | null` beside it. All three are the ABSENCE
+   channel, not `T | E`, so the rep prerequisite this clause is about does not
+   bind and the letter of the ruling is intact — but the module is no longer
+   total, and the sentence above named it as one. The integer pair's header
+   records why `i64 | ParseIntError` was the road not taken, which is this
+   clause's question asked once per export rather than once per module.)
 2. **After R3b/R7 land** (the struct-in-union rep family is solid): fallible std
    APIs become buildable. `std:fs`/`std:io` ship `T | IoError` surfaces. This is
    an _implementation-order_ constraint, not a paper blocker — std-design.md's
