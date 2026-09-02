@@ -8407,6 +8407,24 @@ export function eqScalarListFieldKind(code: i32): i32 {
   0 - 1
 }
 
+// D1180 — THE SAME MAP FOR A VARIANT ARM'S FIELD, which differs in exactly one rung: code 4
+// (`i32[]` / `boolean[]` / `K[]`) is included here and excluded there. The exclusion above is
+// about the STRUCT ladder's history — that ladder carries a hand-written 50-line `i32[]` arm
+// that predates the generic cores, and re-routing it would move bytes for a compare that
+// already works. The variant ladder has no such arm and no such history, so its `i32[]` field
+// takes the generic core like every other list rep.
+//
+// ONE HOME for the same pairing its sibling is one for: `leqNoteUnionArms` reserves the
+// compare frame from it and `emitVariantFieldEqCore` emits the core from it, and a core
+// emitted against a frame nobody reserved refuses with "list compare frame was not reserved
+// for this rep".
+export function eqVariantListFieldKind(code: i32): i32 {
+  if code == 4 {
+    return 0 // i32[] / boolean[] / K[]
+  }
+  eqScalarListFieldKind(code)
+}
+
 // THE UNION-ATOM CODE → GENERIC-COMPARE KIND map, in `catListKindOfExpr`'s alphabet, or -1
 // for an atom that is not a LIST (silent-class-inventory D1095). The union box's `value`
 // field holds a list arm's WRAPPER ref directly — no scalar value box — so an arm's compare
@@ -8725,6 +8743,25 @@ function shapeHasCloField(row: i32, seen: i32[]) {
 // a RESERVATION scan, and a layout it cannot see is a `local.set` into a slot the function
 // never declared. A union ARM with a closure field is the same compare as a standalone
 // struct with one, and only the table changed.
+// Does any arm of union `uname` reach the function-identity core — the arm ITSELF being a
+// closure (atom kind 11), or a struct arm whose row carries a function-valued field?
+function unionArmsNeedCloEq(uname: string): boolean {
+  if uname == "" { return false }
+  const arms: string[] = []
+  splitUnionAtoms(unionMemberSetOf(uname), arms)
+  let ui = 0
+  while ui < arms.length {
+    if valueAtomKind(arms[ui]) == 11 { return true }
+    const avi = variantIndexOf(arms[ui])
+    if avi >= 0 {
+      const aseen: i32[] = []
+      if shapeHasCloField(eqRowOfVariant(avi), aseen) { return true }
+    }
+    ui = ui + 1
+  }
+  false
+}
+
 export function cloEqNoteBin(binIx: i32, fnIx: i32) {
   const e = P.nodes[binIx]
   if e is BinExpr {
@@ -8732,6 +8769,19 @@ export function cloEqNoteBin(binIx: i32, fnIx: i32) {
       if exprIsClosure(e.binLeft, fnIx) || exprIsClosure(e.binRight, fnIx) {
         fnUsesCloEq = true
         return 0
+      }
+      // D1096 / D1098 — AND THE ARMS OF A UNION OPERAND, which the three legs below cannot
+      // see: they read the BINARY'S OWN OPERANDS and here those are BOXES. A union `==`
+      // compares the arm its TAG selects, so a CLOSURE arm (identity, D1098) or a struct
+      // arm carrying a function-valued FIELD (D1096) runs the identity core one level in —
+      // and which arm runs is a runtime tag test, so every arm of either operand's union has
+      // to be reserved for. Over-reserving costs two locals in one function; under-reserving
+      // is a `local.set` into a slot the function never declared.
+      if unionArmsNeedCloEq(unionNameOfExpr(e.binLeft, fnIx)) {
+        fnUsesCloEq = true
+      }
+      if unionArmsNeedCloEq(unionNameOfExpr(e.binRight, fnIx)) {
+        fnUsesCloEq = true
       }
       // THE STRUCT LEG STAYS LEFT-ONLY, deliberately, and it is NOT `binEqStructRow`.
       // A reservation scan may over-reserve and may not under-reserve, and this one has
@@ -27273,6 +27323,28 @@ export function unionClosureArmName(name: string) {
 // a union carries two function arms, because a top-level `=>` absorbs the `|` that follows it
 // (`(i32) => i32 | (i32) => string` splits to ONE atom), so a member set that has lost the
 // split cannot be re-split. The arena member column kept it.
+// D1098 — the ARENA type of the arm SPELLED `atom` in union `name`, or -1. The per-arm form
+// of `unionClosureArmTy` below, which answers for the FIRST function arm only and so cannot
+// separate two closure signatures in one union — and a closure arm's box TAG is keyed on its
+// signature (`cloArmTagOfTy`), so "the first one" is the wrong answer for the second.
+//
+// -1 is the honest decline: `cloArmTagOfTy(-1)` is the flat kind-11 tag, which is exactly the
+// tag an un-nameable closure arm already has.
+export function unionArmTyOfAtom(name: string, atom: string): i32 {
+  const atoms: string[] = []
+  const mems: i32[] = []
+  if unionArmTys(name, atoms, mems) {
+    let m = 0
+    while m < atoms.length {
+      if atoms[m] == atom {
+        if m < mems.length { return mems[m] }
+      }
+      m = m + 1
+    }
+  }
+  0 - 1
+}
+
 export function unionClosureArmTy(name: string): i32 {
   const atoms: string[] = []
   const mems: i32[] = []
