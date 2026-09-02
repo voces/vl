@@ -4215,9 +4215,56 @@ reject becomes an unreachable floor; (4) `==`-narrowing and `is`-narrowing over 
 must agree at every spelling — grade both. Grading list: D1023's filed witness (prints `a` then
 `b`), the six-row table in its RULED paragraph, `is` and `==` narrowing side by side on the
 Circle/Square idiom, the overlapping-set case answering `true`/`true` for `"y"` and
-`true`/`false` for `"x"`, and the `{v: i32} | {v: boolean}` pair refusing at CHECK. Interim std
-rule until built, unchanged: every std error struct carries a field NAME no other std error
-type has (`JsonError.path`).
+`true`/`false` for `"x"`, and the `{v: i32} | {v: boolean}` pair refusing at CHECK.
+
+**BUILT 2026-09-02 (#2365), as the four steps, and the recommended rep cost no rep change.**
+Three things the build settled that the ruling deliberately left open, kept because each was a
+question someone will ask again:
+
+* **The compare works on ONE layout because atom ids are interned globally by literal VALUE.**
+  `internAtom` is a single module-global map keyed by the literal's text, so `"y"` is the same
+  `i32` in `type KA = "x" | "y"` (position 1) and `type KC = "y" | "z"` (position 0) — measured
+  on a disassembly. Had the ids been per-type positions, a value compare would have needed
+  atoms interned per BASE type first, which IS a rep change. Note also that a literal set has
+  two reps and only one is a sentinel: an inline `kind: "x" | "y"` is a `(ref $string)` holding
+  the member's own characters, a registered ALIAS the interned atom. The compare is therefore
+  picked off the field's STORAGE, which is what makes the answer independent of spelling.
+* **The membership test must be a GUARD, not a conjunct.** Both operands of an `i32.and`
+  evaluate, so conjoining membership onto the tag test ran the discriminant read — a
+  `ref.cast` to this arm's heap type — on values of every other arm. A two-arm union hides
+  this completely (both arms share the shape, so the cast always succeeds); it takes a THIRD
+  arm with different field names to see it. Lowered as `if (result i32) … else 0`.
+* **A shared tag with two heap types is not a representation.** Tags key on the field-NAME
+  signature, so these arms always shared one; `buildVariantTwins` keys on a canon id that
+  PRESERVES each arm's literal set, so they did not share a heap type — and the box is built
+  under whichever row the field-name match hits first, so the other arm's `ref.cast` trapped.
+  Admitting the pair without folding it reproduced the filed bug from the other side. One
+  predicate now answers for both callers so they cannot drift.
+
+**Residue: the two litunion reps in one union (D1050).** `{kind: K1} | {kind: "x" | "y"}` is
+legal by this ruling and still refuses, because an interned atom and a string ref share no
+layout. Closing it means unifying the litunion reps — the rep cliff — and was out of scope; the
+refusal now says so in words that concede the program is type-valid rather than claiming the
+field types differ. The interim std rule is retired: a std error struct no longer NEEDS a
+unique field name, since a unique `kind` literal now discriminates. `JsonError.path` stays for
+the information it carries, not for discrimination.
+
+**Amendment (owner, 2026-09-02): a literal set beside its own base is legal.**
+`type A = { kind: "x" | "y" }` beside `type B = { kind: string }` in one union is a LEGAL
+discriminated pair: `v is A` ≡ `v.kind ∈ {"x","y"}`, `v is B` is true for every value of the
+shared shape (B's set is the whole base), and `else` after `is A` narrows to B. It is the
+overlapping-set case with one set being the base, and the ruling's principle line — *`is` asks
+whether the VALUE is a member of the type: by tag when the tag can answer, by value when it
+cannot* — already covers it. **The "treat a pair as distinguishable only where BOTH arms carry
+a literal set of the SAME base type" sentence above is superseded for this pair**: one arm
+carrying a set and the other carrying that set's BASE is enough. Unchanged either way: a pair
+where NEITHER arm carries a set (`{v: i32} | {v: boolean}`) still refuses at CHECK, and a pair
+whose field BASE TYPES differ (`{v: i32} | {v: "a" | "b"}`) is a different question this
+amendment does not reach. The lowering follows the asymmetry — a membership compare is emitted
+only for the arm that HAS a set, so `is B` stays the bare tag test — and that asymmetry is what
+makes the `"z"` value (a B that is not an A) the cell which actually grades the rule.
+Fixture: `tests/cases/unions/discriminant-value-is-set-beside-base.vl`, both spellings
+(annotated and inferred), both directions, both bases.
 
 ## A `type` declared in a function body is legal and lexically scoped, may name the enclosing function's type parameters, and is refused loudly until built (owner, 2026-09-02)
 

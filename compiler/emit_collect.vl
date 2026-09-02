@@ -83,6 +83,7 @@ import {
   nulNumLitUnionBaseName,
   primNameStr,
   tyArrayElemPrim,
+  tyIsLitSet,
   tyIsLitUnion,
   tyIsLitUnionAlias,
   tyNomNameCycled,
@@ -333,6 +334,7 @@ import {
   uFieldElemKeyI32,
   uFieldElemName,
   uFieldElemTyIx,
+  uFieldLitTyIx,
   uFieldNames,
   uFieldStart,
   uFieldTyText,
@@ -603,6 +605,8 @@ import {
   unionSetHasNull,
   variantIndexOf,
   variantIndexOfLet,
+  variantLitDiscriminable,
+  variantLitRepMismatch,
   variantNestedShapeOk,
   variantSig,
 } from "./emit_classify"
@@ -782,6 +786,23 @@ function variantFieldIdText(txt: string, tyIx: i32) {
   const t = T.tys[tyIx]
   if t is TyLit { return "\"" + t.litText + "\"" }
   txt
+}
+
+// The DISCRIMINANT column's cell for a field whose annotation resolved to arena type `tyIx`:
+// `tyIx` itself when it denotes a literal SET, `-1` otherwise (D1023).
+//
+// THE COLUMN ABOVE CANNOT ANSWER THIS AND THAT IS THE WHOLE ROW. `variantFieldIdText`
+// restores a BARE literal's own text, so `"circle"` and `"square"` part there — but a
+// MULTI-member set reaches it already softened by canon to the base its members share, so
+// `"x" | "y"` and `"p" | "q"` render one identical `string` and were folded as the layout
+// twins that comparison exists to admit. Softening is right for identity (the two arms DO
+// store alike); it is the membership question it cannot serve, and membership is what the
+// ruling makes `is` ask. So the arena index is banked beside the text rather than derived
+// from it.
+function litSetTyIxOf(tyIx: i32): i32 {
+  if tyIx < 0 { return -1 }
+  if tyIsLitSet(tyIx) { return tyIx }
+  -1
 }
 
 // The hint for a field row pushed from a `FieldDef` NODE: the field's own row projected
@@ -10690,10 +10711,16 @@ function pushFieldRow(
   fName: string,
   tyText: string,
   elemTyHint: i32,
+  litTyIx: i32,
 ) {
   if toVariant {
     uFieldTypes.push(code)
     uFieldTyText.push(tyText)
+    // The DISCRIMINANT column (D1023): the field's own arena type when it is a literal set,
+    // `-1` otherwise. Pushed here rather than at each recorder for the parallel-table reason
+    // every other column is — three recorders write this table, and a column one of them
+    // forgets is a row whose index means a different field in each.
+    uFieldLitTyIx.push(litSetTyIxOf(litTyIx))
     uFieldElemName.push(elemNm)
     recordUFieldElemRowTy(elemNm, keyI32, elemTyHint) // D5 + B6b
     uFieldNames.push(fName)
@@ -10855,7 +10882,10 @@ export function collectS(stmts: i32[]) {
               fnode.fdName,
               "",
               fieldElemHintOf(fnode.fdType, code, recNm),
+              -1,
             )
+            // the STRUCT table has no discrimination rule to key, so no column either
+
             // A DEAD RENDER, deleted. This is `pushFieldRow`'s `tyText`, and the branch this
             // call takes (`toVariant == false`) never reads it — only the VARIANT branch has a
             // text column (`uFieldTyText`); the struct side has no `sFieldTyText` at all. The
@@ -10962,6 +10992,7 @@ function collectShapeVariantFields(nm: string, shapeTy: i32) {
       fnames[fi],
       variantFieldIdText(ftxt, fldTy),
       -1,
+      fldTy,
     )
     cnt = cnt + 1
     fx = fx + 1
@@ -11056,6 +11087,7 @@ function collectVariantFields(stmts: i32[], name: string) {
               fnode.fdName,
               variantFieldIdText(ftxt, nodeTyIxOf(fnode.fdType)),
               fieldElemHintOf(fnode.fdType, code, elemNm),
+              nodeTyIxOf(fnode.fdType),
             )
             // Same column, same reasoning — and `fnode` is still live here, 33 lines after
             // `ftxt` was rendered from it. An earlier pass filed this site as string-only by
@@ -11159,6 +11191,15 @@ function assignTags() {
   // loudly here rather than emit the bad module. Layout-EQUAL same-name variants (the same
   // shape reached through two spellings) stay legal — they are one variant, and the twin
   // machinery already folds them.
+  //
+  // AND SO ARE ARMS A LITERAL-TYPED FIELD TELLS APART (D1023). `variantLitDiscriminable`
+  // admits a same-signature pair whose fields differ ONLY in literal sets of the same
+  // storage — `{kind: "circle", r: f64} | {kind: "square", r: f64}`, the TypeScript idiom
+  // this reject made unwritable. They are ONE tag and ONE layout, exactly as the folded
+  // pairs are; what makes them two arms is a VALUE, and `emitIs` reads the discriminant
+  // column to compare it. What still rejects here is the pair no value tells apart — and by
+  // the ruling that is a DESIGN rule the CHECKER owes (`checkUnionDiscriminable`), so this
+  // is now an unreachable floor rather than the diagnosis a user sees.
   let ui = 0
   while ui < unVarStart.length {
     const vs0 = unVarStart[ui]
@@ -11168,7 +11209,27 @@ function assignTags() {
       let b = a + 1
       while b < vc {
         if sigs[vs0 + a] == sigs[vs0 + b] {
-          if !variantFieldTysEq(vs0 + a, vs0 + b) {
+          if (
+            !variantFieldTysEq(vs0 + a, vs0 + b) &&
+            !variantLitDiscriminable(vs0 + a, vs0 + b)
+          ) {
+            // TWO REFUSALS, because they are two different things and one sentence was
+            // saying the wrong one about the second (D1023). The DESIGN rule — arms nothing
+            // tells apart — is the checker's now (`checkUnionDiscriminable`), so reaching it
+            // here is an unreachable floor. What still arrives is the CAPABILITY gap: two
+            // arms the ruling calls legal whose literal sets rep differently (an interned
+            // atom beside a string ref), where the types agree and only the layouts do not.
+            if variantLitRepMismatch(vs0 + a, vs0 + b) {
+              return emitFail(
+                "emitProgram: union `" +
+                  unNames[ui] +
+                  "` discriminates `" +
+                  uVariants[vs0 + a] +
+                  "` from `" +
+                  uVariants[vs0 + b] +
+                  "` on a literal field whose two arms rep differently (a named literal-union alias is an interned atom, an inline set a string) — this program is type-valid but cannot build; spell both arms the same way",
+              )
+            }
             return emitFail(
               "emitProgram: union `" +
                 unNames[ui] +
@@ -12478,6 +12539,7 @@ export function collectU(stmts: i32[]) {
   uFieldCount = []
   uFieldTypes = []
   uFieldTyText = []
+  uFieldLitTyIx = []
   uFieldElemName = []
   uFieldElemTyIx = []
   uFieldElemKeyI32 = []
