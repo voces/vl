@@ -258,8 +258,18 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   proposed — `docs/json-design.md` (2026-09-01): `Json` / `JsonError { at, kind, msg }` /
   `parseJson(self: string): Json | JsonError` / `toJson(self: Json): string | JsonError`,
   compact, `f64` numbers, `nonfinite` render error, depth cap 128, strict per ruling A.**
-  Owner's seven answers are its §0; five decisions go to the owner after the critique round
-  (§6). **Measuring it found the blocker: D1021 — `Json | JsonError`, the ruled fs-shaped
+  Owner's seven answers are its §0. **CRITIQUED 2026-09-01** — three Opus critiques (std
+  #2302, crosslang #2305, usability #2306) synthesised in
+  `docs/internals/json-critique-synthesis.md`; the unanimous and measured changes are
+  written into the design (`JsonError` gains `path` as its distinguishing fourth field,
+  `1e999` refused at parse, `-0` rendered, I-JSON profile, depth cap 128 measured at ~8×
+  margin, `toJsonPretty`/`jsonKind` named as WHAT IS NOT HERE), and **§6 holds the three
+  questions the owner still has to rule**: helpers (recommended: one `jsonPointer`, RFC
+  6901, `kind: "missing"`), `asExactI32` in `std:fmt` + whether `f64 as i32` saturates, and
+  whether `string | "err"` collapses (D1024/D1026). Two more gaps filed by the critique
+  round: D1025 (a map subscript mints no narrowing key — the usability critique's gap A,
+  check-clean invalid wasm at an integer-literal key) and D1026 (`Json | null` in a
+  signature is a loud emit reject). **Measuring it found the blocker: D1021 — `Json | JsonError`, the ruled fs-shaped
   return, is check-clean INVALID WASM because a recursive alias does not compose into a
   wider union** (probe `scripts/capability-probes/recursive-union-alias-composed.vl`). The
   API is NOT bent around it (a carrier struct runs today and was declined — std has no

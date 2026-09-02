@@ -1,10 +1,13 @@
 # `std:json` v1 — the surface, and what the compiler has to grow to serve it
 
-> Status: **PROPOSED 2026-09-01 — for critique, then a ruling.** This is serde stage 1
-> (`docs/serde-design.md` §Recommendation, ruling G): a real `Json` VALUE TREE plus a
-> parser and a renderer over it. Nothing here is built. The owner answered seven surface
-> questions on 2026-09-01 and those answers are recorded in §0 as facts this doc does not
-> re-open; everything else is a proposal with its alternatives beside it.
+> Status: **CRITIQUED 2026-09-01 — three open questions for the owner, then the builder.**
+> This is serde stage 1 (`docs/serde-design.md` §Recommendation, ruling G): a real `Json`
+> VALUE TREE plus a parser and a renderer over it. Nothing here is built. The owner answered
+> seven surface questions on 2026-09-01 and those answers are recorded in §0 as facts this
+> doc does not re-open. Three critiques (`docs/internals/json-critique-{std,crosslang,
+> usability}.md`) were synthesised in `docs/internals/json-critique-synthesis.md`; the
+> unanimous and measured changes are written INTO the sections below (each marked
+> *post-critique*), and §6 now lists only what the owner still has to rule.
 >
 > **Every claim about today's compiler marked (RUN) was executed against the 2026-09-01
 > seed** (worktree-refreshed, `VL_STD=$PWD/std`); the programs are in the appendix so a
@@ -71,9 +74,11 @@ std conventions this module inherits (each measured in the module that set it):
 export type Json = null | boolean | f64 | string | Json[] | { [string]: Json }
 
 export type JsonError = {
-  at: i32,                                   // byte offset into the input (parse) or into
-                                             // the output produced so far (render)
+  at: i32,                                   // byte offset into the input on parse;
+                                             // 0 on render (the location is `path`)
   kind: "syntax" | "duplicate" | "depth" | "nonfinite",
+  path: string,                              // RFC 6901 JSON Pointer to the value:
+                                             // "/users/3/score"; "" at the root
   msg: string,
 }
 
@@ -81,13 +86,29 @@ export function parseJson(self: string): Json | JsonError
 export function toJson(self: Json): string | JsonError
 ```
 
-That is the whole of v1: one type, one error type, two functions. Two more are named now so
-their signatures are fixed before a consumer forces them, but are **not** in v1:
+That is the whole of v1: one type, one error type, two functions — plus, if §6 question 1
+is ruled as recommended, one accessor:
 
 ```vl
-export function toJsonPretty(self: Json, indent: i32): string | JsonError   // §2.6
-export function jsonKind(self: Json): "null" | "boolean" | "number" | "string" | "array" | "object"
+export function jsonPointer(self: Json, pointer: string): Json | JsonError   // §2.8, OPEN
 ```
+
+*Post-critique:* `path` is the fourth field (std #1, crosslang F10): it keeps `JsonError`
+structurally distinct from `Base64Error = { at, kind, msg }` — a union naming two
+structurally identical error types fails to emit, which is why every std error carries a
+field of its own — and it is the render-side coordinate, since a render "never emits a
+partial document" and an offset into a discarded buffer located nothing.
+
+**WHAT IS NOT HERE** — named so the next person does not ship the mode-switch spelling,
+in `std/base64.vl`'s form (its URL-safe alphabet is named with the name it will take and
+the shape it must not take). Neither is in v1; both wait for a consumer:
+
+- `toJsonPretty(self: Json, …)` — §2.6. The NAME is fixed (never `toJson(v, pretty)`); the
+  parameter is not, beyond one refusal: not `indent: i32` (all four languages take a
+  string; an integer forecloses tabs in a std with no deprecation story).
+- `jsonKind(self: Json): JsonKind` with `export type JsonKind = "null" | "boolean" |
+  "number" | "string" | "array" | "object"` — §2.8; a named alias because it is a RETURN
+  (`pathKind`/`FileKind`), where `JsonError.kind`'s union is inline because it is a field.
 
 And the names the later stages will take, so v1 does not squat on them (§2.4):
 
@@ -100,6 +121,9 @@ export function toJson<T>(self: T): string | JsonError        // generalises v1'
 A parse never traps and never returns a partial tree. A render never traps, never emits a
 partial document, and fails only on a value JSON cannot carry (`nonfinite`) or a tree it
 cannot finish (`depth`, which is also how a cycle surfaces until the seen-set lands).
+**Every tree `parseJson` returns, `toJson` renders** (*post-critique*, §2.5: a non-finite
+number lexeme is refused at parse, so no non-finite `f64` ever exists inside a parsed
+tree; the only way to hold one is to build it in the program).
 
 ---
 
@@ -144,11 +168,19 @@ wrapper, and a wrapper would cost an allocation per scalar and a `.value` on eve
 
 **Considered and declined — separate `Json` value and `JsonNumber` lexeme carrier.** §2.3.
 
-### 2.2 The error type is a struct with a literal-union `kind`, and `at` is a byte offset
+### 2.2 The error type is a struct with a literal-union `kind`, `at` is a byte offset, and `path` is a JSON Pointer
 
 ```vl
-type JsonError = { at: i32, kind: "syntax" | "duplicate" | "depth" | "nonfinite", msg: string }
+type JsonError = { at: i32, kind: "syntax" | "duplicate" | "depth" | "nonfinite", path: string, msg: string }
 ```
+
+*Post-critique:* `path` added (std #1–2, crosslang F10). On parse it is the pointer to the
+container being read when the error fired (`"/users/3"` for a bad byte inside the fourth
+user; `""` before any container opens); on render it is the pointer to the offending value
+and `at` is `0`. The header states the split in one sentence: *`at` is an offset into
+`self` on parse and is not meaningful on render, where `path` locates the value.* Without
+the field `JsonError` was structurally `Base64Error`, and the union `Base64Error |
+JsonError` fails to emit (measured by the std critique, probe `a3`).
 
 - **Why a struct and not `null` (fmt's `parseF64` shape):** a JSON parse failure has a
   POSITION and a REASON, and `null` carries neither. This is `Utf8Error`'s and
@@ -160,9 +192,14 @@ type JsonError = { at: i32, kind: "syntax" | "duplicate" | "depth" | "nonfinite"
 - **The four kinds, and what each is for.** `syntax` — the input is not JSON (RFC 8259):
   anything from a bad byte to an unterminated string, with `msg` saying which. `duplicate`
   — ruling A: an object repeats a key; `at` is the second occurrence. `depth` — nesting
-  exceeds the cap (§2.7), on parse OR render. `nonfinite` — render only: an `f64` arm holds
-  `NaN` or `±Infinity` (§2.5). A fifth, `cycle`, arrives with the seen-set (§2.7) and is
-  named here so the union grows rather than reshapes.
+  exceeds the cap (§2.7), on parse OR render. `nonfinite` — on render, an `f64` arm holds
+  `NaN` or `±Infinity`; on parse, a number lexeme whose value is not a finite `f64`
+  (`1e999`; §2.5, *post-critique*). A fifth, `cycle`, arrives with the seen-set (§2.7),
+  and a sixth, `missing`, with `jsonPointer` if §6 rules it in — named here so the union
+  grows rather than reshapes. The header lists which kinds each function can produce; a
+  consumer's exhaustive `match` over `kind` sees them all, which is the one cost of a single
+  error type and the std precedent for it (`IoError` serves five operations with codes
+  only some can produce).
 - **`at` is a BYTE offset**, because a VL string is bytes now: `"aé€😀".length` is `10` and
   `s[1]` is `195`, é's lead byte **(RUN)**. That is also what a text editor's "go to
   offset" and every other std error (`Utf8Error.at`, `Base64Error.at`) mean. Line/column is
@@ -177,7 +214,9 @@ type count for a consumer who mostly writes `if r is JsonError`, and the shared 
 (`depth`) would have to be spelled twice. One type; the header lists which kinds each
 function can produce. Cross-language: serde_json has one `Error` for both directions; Go has
 `SyntaxError`/`UnmarshalTypeError` for decode and `UnsupportedValueError` for encode; JS
-throws `SyntaxError` for parse and `TypeError` for stringify. The critique may disagree.
+throws `SyntaxError` for parse and `TypeError` for stringify. *Post-critique: all three
+critiques ACCEPT the single type; the honest half of the split argument was `at` meaning
+two things, and `path` closes it.*
 
 ### 2.3 Numbers are `f64`, integers beyond 2⁵³ round silently, and stage 3 is the exact path
 
@@ -222,11 +261,26 @@ Two measured facts that shape the number lexer:
   lexeme against RFC 8259 §6 itself (`-?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?`) and hands the
   validated text to `parseF64` for the CONVERSION only, which is correctly rounded
   (`std/fmt.vl` header: 205,844 of 205,844 against `Number(s)`).
-- **Range is not a parse failure**, inherited from fmt: `1e999` parses to `Infinity`, which
-  the tree can hold and the renderer will then refuse (§2.5). JS does the same
-  (`JSON.parse("1e999")` is `Infinity`); serde_json errors (`number out of range`). Named as
-  a critique item: a parse that produces a value the renderer refuses is a round-trip that
-  fails one step late.
+- **Range IS a parse failure** (*post-critique*, reversing the proposal): `parseF64("1e999")`
+  is `Infinity` **(RUN)**, and the lexer refuses that conversion result with `kind:
+  "nonfinite"` rather than let the tree hold a value the renderer refuses (§2.5). serde
+  and Go do the same; JS parses it to `Infinity` and renders `null`.
+
+*Post-critique — what the header owes on the rounding decision* (std #8, crosslang F2; all
+three critiques ACCEPT silent rounding, the `f64` type says it, and fmt sets the form):
+fmt's witness verbatim — `parseF64("9007199254740993")` is `9007199254740992` **(RUN)** —
+beside a pointer to `parseI64` as the exact path (`std/fmt.vl:240-244`, `271-281`); the
+interop bound stated as RFC 8259 §6's **±(2⁵³ − 1)**, not ±2⁵³ (2⁵³ is representable,
+2⁵³ + 1 is not); the VL↔VL hole in one sentence — an `i64` a VL program serialised under
+ruling B does not round-trip through VL's own tree, and stage 3's `fromJson<T>` is the
+answer, so `parseJson` is not the recommended path for VL↔VL traffic until stage 3 exists;
+and that the decision is **reversible at near-zero cost** — `parseI64` is exact where
+`parseF64` is not, the lexer already scans the lexeme, so a `precision` kind can be added
+later without redesigning anything. That reversibility is what makes "silent, documented"
+safe to choose now. And fmt's admission sentence for `parseI64`/`parseI32` (`std/fmt.vl:
+246-257`) names `std:json` as the consumer that will spell them — this module's v1 does
+not; the header says the STAGE 3 decoder is that consumer, so fmt's sentence is not read
+as false.
 
 ### 2.4 Names: `parseJson` / `toJson`, and how stage 3 lands beside them without a rename
 
@@ -264,9 +318,18 @@ Why `parseJson` for the tree and `fromJson<T>` for the typed decode rather than 
   parameter spelled or inferred from the destination, which is a heavier read for "just
   parse it".
 
-**The alternatives the critique should weigh:** `jsonParse`/`jsonRender` (noun-first, like
-`pathKind`); `decodeJson`/`encodeJson` (the utf8/base64 verb pair — but those are
-byte-level codecs, and JSON is text); `Json.parse` (no namespaces in VL today).
+**The alternatives, and why each loses** (*post-critique*: all three critiques ACCEPT
+`parseJson`/`toJson`; the dismissal of the codec pair is rewritten on the std critique's
+ground, #4): `jsonParse`/`jsonRender` — `render*` exists in std only as PRIVATE names
+(`renderI64`/`renderF64` behind `toString`), and noun-first is reserved (`std/fs.vl:68-75`)
+for functions that ASK ABOUT a subject rather than operate on it. `decodeJson`/`encodeJson`
+— not because "those are byte codecs and JSON is text" (`encodeBase64(self: u8[]): string`
+produces text too), but because both existing `encode*` functions are TOTAL and their
+`decode*` twins are the fallible half; `toJson` is fallible in the encode direction, so the
+codec framing would promise a symmetry this module does not have. `Json.parse` — no
+namespaces in VL today. One note the header owes (std #4): a `toJson<T>` defined for every
+`T` the deriver reaches IS the universal renderer `toString` deliberately refused to become
+(`std/fmt.vl:49-61`), admissible only because serde stage 2's derive is what delivers it.
 
 ### 2.5 The renderer refuses `NaN` and `±Infinity` — `kind: "nonfinite"`
 
@@ -283,12 +346,25 @@ Owner: *"Error I think. what does JS do? other languages?"*
 Go's is the only one of the four that is both RFC-valid and loud, and it is the one the
 owner picked. `null` is the pragmatic JS choice and it is silently lossy — a `NaN` that
 went in as "no reading" comes back as "the reading is null", indistinguishable from an
-intentional null. The `at` for a render error is the byte offset into the output produced
-so far, which locates the offending value by position in the document being written;
-the msg carries the key/index path when the walker has one.
+intentional null. A render error carries `at: 0` and the value's pointer in `path`
+(§2.2).
 
-`-0.0` renders as `0` (ECMA-262, inherited from `toString`; JS does the same). It does not
-survive a text round trip and the doc says so rather than special-casing it.
+*Post-critique — `1e999` is refused at PARSE too, `kind: "nonfinite"`* (std #3, crosslang
+F1). The proposal parsed it to `Infinity` (`parseF64("1e999")` is `Infinity` **(RUN)**)
+and then refused to render the tree — a document accepted into a tree the module cannot
+write back, which none of the four does: Go and serde refuse the lexeme at parse (`number
+out of range`), JS and Python accept it and their renderers then emit something (`null`,
+`Infinity`) rather than refuse. The lexer refuses a numeric lexeme whose
+`f64` value is not finite; the kind is `nonfinite` because the lexeme is grammatical
+(`syntax` would be false) and the property is the value's. Underflow (`1e-999` → `0`)
+stays silent, as in all four — `0` is finite and renders. I-JSON §2.2's own example of what
+a message SHOULD NOT contain is `1E400`. This is what makes §1's invariant true: every
+tree `parseJson` returns, `toJson` renders.
+
+*Post-critique — `-0.0` renders as `-0`* (crosslang F7). `toString(-0.0)` is `0` **(RUN)**,
+so the renderer special-cases negative zero (`x == 0.0 && 1.0 / x < 0.0` → `-0`); Go,
+serde and Python all keep the sign and JS alone loses it, and RFC 8259's grammar admits
+`-0`. One branch; the round-trip exception list loses an entry.
 
 ### 2.6 Compact by default; pretty is a second function, deferred, with its signature fixed
 
@@ -303,17 +379,29 @@ Owner: *"compact seems sensible. what do other languages do?"*
 
 Compact is three of four, and the one exception (Python's spaced separators) is widely
 regarded as a wart. **A second function, not an argument**: VL has no optional parameters,
-an `indent: i32` on the main entry would be a magic-number parameter on every call, and the
-std rubric prefers two names to a mode switch. Signature fixed now so the name is not taken
-by something else: `toJsonPretty(self: Json, indent: i32): string | JsonError`, two-space
-indent being `2`, newline after every element, `": "` after keys — the JS/serde layout.
+an indent parameter on the main entry would be a magic parameter on every call, and the
+std rubric prefers two names to a mode switch. The NAME is fixed now so it is not taken by
+something else: `toJsonPretty`. *Post-critique (std #11, crosslang F5c):* its PARAMETER is
+not fixed — the proposal's `indent: i32` is the one signature in this doc all four
+languages contradict (JS `space` may be a string, Python `indent=` a `str`, Go
+`MarshalIndent(v, prefix, indent string)`, serde `with_indent(&[u8])`), and an integer
+forecloses tabs permanently in a std with no deprecation story. The consumer that arrives
+rules the shape; the ruling must define what an empty indent does (JS: no newlines at all;
+Go/serde: newlines with no indentation — they disagree) and copies Python's post-3.4
+detail that the item separator is `","` with indentation on, so no line ends in
+whitespace. Layout otherwise: newline after every element, `": "` after keys — JS/serde.
 **Not in v1** until a consumer names it; the first is likely `vl fmt`-adjacent tooling or a
 config rewriter.
 
 Escaping on output, all four agree on the RFC minimum and differ above it: `"`, `\`, and
 control characters U+0000–U+001F are escaped (`\n \t \r \b \f`, else `\u00XX`);
-**non-ASCII is emitted raw as UTF-8** (JS, serde; Python escapes it by default with
-`ensure_ascii=True`; Go additionally HTML-escapes `<`, `>`, `&` by default). Raw is right:
+**non-ASCII is emitted raw as UTF-8** (serde; JS emits it raw but, since ES2019, escapes a
+LONE SURROGATE rather than emitting it — JS is lax on input and strict on output, the
+inverse of §2.9's framing; Python escapes non-ASCII by default with `ensure_ascii=True`; Go
+HTML-escapes `<`, `>`, `&` by default and escapes U+2028/U+2029 unconditionally, and
+replaces invalid UTF-8 with U+FFFD — *post-critique*, crosslang F5a–b). The invariant VL
+adopts from the JS correction: **there is no input on which the renderer emits text it
+would not itself accept.** Raw is right:
 the output is a VL string, VL strings are UTF-8 bytes, and escaping non-ASCII quadruples the
 size of every non-English document for the benefit of no consumer VL has. `/` is not
 escaped (RFC permits either; nobody's default escapes it).
@@ -325,26 +413,43 @@ Both are measured facts about the tree, not hypotheticals:
 - **The tree can hold a cycle (RUN):** `let a: Json[] = []; a.push(a)` checks and runs, and
   so does `m["self"] = m` on the map arm. A naive recursive walk over either is
   `wasm trap: call stack exhausted` **(RUN)** — a trap, not an error a program can handle.
-- **The recursion budget is finite and not huge (RUN):** a two-line self-call survives
-  10,000 frames and traps at 100,000. A parser frame is larger. A hostile document of
-  `[[[[[…` at a few thousand levels would trap the parser without a cap.
+- **The recursion budget is finite and not huge (RUN, re-measured post-critique):** a
+  two-line self-call survives **30,000** frames on the host and traps at 40,000; a
+  PARSER-SHAPED frame (eight scalar locals, a string, a list and a map per frame) survives
+  **2,000** and traps at 3,000 (`wasm trap: call stack exhausted`). A recursive-descent
+  parser spends two frames per nesting level, so ~1,000 levels of `[[[[[…` is 2,000–3,000
+  parser frames — the trap edge, with nothing left for the caller's own stack.
 
 **Cap = 128**, serde_json's number, applied to parse (nesting of arrays/objects in the
 input) and to render (nesting of the tree being walked). No real document is 128 deep;
-every DoS document is. **A cycle exceeds any cap** and therefore surfaces as `kind:
-"depth"` with `msg` saying the cap was reached — correct, deterministic, and slightly
-misnamed. When A15 build item 4 lands `IdentitySet<T>`, the renderer keeps the ancestors of
-the current node in one and reports `kind: "cycle"` at the first back-edge, with `at` at the
-position the repeated node would have been written; the depth cap stays as the floor for
-the deep-but-acyclic case. This is the serde §Cycles ruling applied to one surface: detect,
-error, depth-cap floor, unsafe fast path not offered.
+every DoS document is. *Post-critique (crosslang F3 asked for ~1,000 as "the strictest of
+the four by 78×"; std #10 accepted 128 in fmt's form):* the measurement above is the
+justification — 128 is ~8× inside the parser-frame budget, 1,000 is at its edge — and it is
+recorded in the header as a **stack-budget measurement to re-take with the real frame**,
+not a copied constant; in fmt's form (`const MAX_DEPTH = 128`, the DoS argument, serde's
+citation, and the shape of `std/fmt.vl:296-302`'s grammar rule — a limit can be RAISED
+later and never lowered, so the conservative number keeps both options). VL is the only
+one of the five that caps BOTH directions.
+
+**A cycle exceeds any cap** and therefore surfaces as `kind: "depth"` with `msg` saying
+the cap was reached — correct, deterministic, and slightly misnamed. When A15 build item 4
+lands `IdentitySet<T>`, the renderer keeps the ancestors of the current node in one and
+reports `kind: "cycle"` at the first back-edge, `path` naming the repeated node; the depth
+cap stays as the floor for the deep-but-acyclic case. *Post-critique (crosslang F4,
+usability F8):* the ancestor scan uses **`===`, never `==`** — `==` over refs is structural
+and itself diverges on a cycle; `===` does not parse today (§5 item 7), which also means a
+CONSUMER cannot write a cycle-safe walker at all. The header therefore says, beside the
+cap, that the cap protects `parseJson` and `toJson` and **nothing the consumer writes**,
+and that a PARSED tree cannot contain a cycle — the exposure is program-built trees only.
+This is the serde §Cycles ruling applied to one surface: detect, error, depth-cap floor,
+unsafe fast path not offered.
 
 **Considered — make the cap a parameter.** No: it is a safety floor, not a tuning knob, and
 no consumer has named a need. JS has no cap and stack-overflows; Python's is the interpreter
 recursion limit (~1000); Go has none for `Unmarshal` into `interface{}` (it caps at 10,000
-since 1.15). If a consumer needs deeper, the number moves, once, in the header.
+since 1.15). If a consumer needs deeper, the number moves, once, upward, in the header.
 
-### 2.8 No accessor helpers in v1 — the walking idiom, and the one helper worth naming
+### 2.8 Accessor helpers — OPEN (§6 question 1); the walking idiom, and what the critiques measured
 
 Owner's question 7 was "what?", so here is what was being asked. Walking a `Json` means
 narrowing at every step:
@@ -380,30 +485,75 @@ export function at(self: Json, index: i32): Json       // array element, else nu
 
 so that `r.get("users").at(0).get("name")` is a `Json` and ONE `is string` reads it. They
 cost nothing to build, and they lose the missing-vs-null distinction on purpose (the map arm
-keeps it, §2.1). **Declined for v1 on two grounds**, either of which the critique may
-overturn:
+keeps it, §2.1). The proposal **declined them for v1 on two grounds**:
 
 1. `get`/`at` are the two most generic names in the language and would land in every
    importer's flat scope (`import { parseJson } from "std:json"` does not import them, but
-   `get` as a std export name sets a precedent that `std:collections` will want back).
-   `jsonGet`/`jsonAt` are the noun-first spellings; ugly enough that it is worth waiting for
-   a consumer to say the four-`is` idiom hurts before paying it.
+   `get` as a std export name sets a precedent that `std:collections` will want back) —
+   and `get` is already a checker-claimed map builtin (std #6). `jsonGet`/`jsonAt` are the
+   noun-first spellings.
 2. **The idiom's cost is mostly a compiler gap, not a library gap.** Two of its four
    hoists exist only because of D1009 (`Json | null` does not narrow to `Json` though `null`
    is an arm) and the general rule that a field/element read must be hoisted before `is`.
-   Fixing those makes the idiom `if r is {[string]: Json} && r["users"] is Json[] && …`,
-   which is what the helpers were for. Build the language, then see if the helpers are
-   still wanted.
 
-**The one helper worth naming now**: `jsonKind(self: Json)` returning the JSON type name
-as a literal union, because "what is this" is the first question every generic walker asks
-(a pretty-printer, a schema checker, a diff), and the six-way `is` ladder to answer it is
-the same nineteen lines in every one of them **(RUN — the ladder works today on the
-structurally-spelled tree)**. Deferred with the pretty printer as its first consumer.
+*Post-critique — ground 2 is false as stated, and the decision is the owner's.* The
+usability critique wrote the consumer programs and measured: the `&&` chain ground 2
+predicts is blocked by a THIRD gap that is neither D1009 nor D1010 — a map subscript mints
+no narrowing key, **D1025** (loud at a string key; check-clean invalid wasm at an
+integer-literal key). And with every gap closed the hoists go, the `is` checks stay: the
+helpers' value scales with path DEPTH (measured 9 lines / 4 `is` / 3 hoists → 2 lines /
+1 `is` / 0 hoists on this very example). Votes: std ACCEPT the decline (its stronger
+ground: `Json | null` has no spelling for "missing", so (b) below is lossy by
+construction); crosslang ACCEPT conditionally, and reserve `pointer()` (RFC 6901) as the
+name; usability OVERTURN, ship `jsonGet`/`jsonAt`. The options on the table, with the
+synthesis's recommendation in bold:
 
-### 2.9 Strictness — RFC 8259, ruling A, and the std:utf8 precedent
+- **(a)** none in v1 — every consumer hand-rolls one and re-decides what a missing key
+  returns.
+- **(b)** `jsonGet`/`jsonAt` returning `Json`, missing = `null`, documented lossy.
+- **(c) `jsonPointer(self: Json, pointer: string): Json | JsonError`** — one export over
+  an RFC 6901 pointer (`"/users/0/name"`; `""` is the whole document; `~1` → `/`, `~0` →
+  `~`). A step that does not resolve (key absent, index out of range, wrong container) is
+  `JsonError { kind: "missing", path: <the prefix that resolved> }`, so missing stays
+  distinct from a stored `null` while the consumer who does not care writes `if v is
+  string` once and gets the same answer for "missing" and "wrong type". A malformed
+  pointer is `kind: "syntax"` with `at` into the pointer. serde's `Value::pointer` is the
+  same thing; JS and Python need nothing because property access is their accessor. Costs
+  a sixth `kind` and the RFC's ten lines of unescaping; needs nothing from the compiler
+  that `parseJson` does not already need (D1021).
 
-What `parseJson` accepts is exactly RFC 8259 text, and nothing more:
+**The one helper worth naming now regardless**: `jsonKind(self: Json): JsonKind`, because
+"what is this" is the first question every generic walker asks (a pretty-printer, a
+schema checker, a diff), and the six-way `is` ladder to answer it is the same nineteen
+lines in every one of them **(RUN — the ladder works today on the structurally-spelled
+tree)**. Deferred with the pretty printer as its first consumer; listed in §1's WHAT IS
+NOT HERE.
+
+**Not a helper: `jsonEquals`.** Usability F2 asked for one because the obvious wrong
+repair of a hand-written `deepEquals` (`a != null && b != null`) checks, runs and makes a
+present null equal to everything. The reason a consumer writes `deepEquals` at all is that
+`==` over `Json` is an emit refusal (§5 item 6), and VL's `==` over refs is already
+structural — a `jsonEquals` would be a std name duplicating an operator the day the
+operator's gap closes. The footgun is real and is why D1009 is sequenced early.
+
+### 2.9 Strictness — I-JSON (RFC 7493), ruling A, and the std:utf8 precedent
+
+*Post-critique (crosslang F9):* the proposal said "exactly RFC 8259 text, and nothing
+more". It accepts LESS: duplicates are refused (RFC 8259 §4 lists "report an error" among
+the behaviours implementations have for them, so ruling A is anticipated by the RFC, not a
+departure from it) and lone surrogates are refused (§8.2: such text is "not
+interoperable"). The profile that results — UTF-8 only, unique member names, no surrogates,
+numbers within IEEE-754 double — is **I-JSON, RFC 7493 §2.1–2.3** almost verbatim
+(verified against the RFC text: §2.1 "MUST be encoded using UTF-8", names and strings
+"MUST NOT include code points that identify Surrogates or Noncharacters"; §2.2 messages
+"SHOULD NOT include numbers that express greater magnitude or precision than an IEEE 754
+double", with `1E400` as its example; §2.3 "MUST NOT have members with duplicate names").
+The header makes that one conformance claim instead of three apparent limitations, and it
+is the honest answer to "why is the number arm only `f64`". One tension recorded: I-JSON
+§2.2 RECOMMENDS encoding numbers beyond double precision as strings, and serde ruling B
+puts `i64` on the wire as a number; ruling B does not rest on I-JSON and stands.
+
+What `parseJson` accepts:
 
 | input | JS | Python | Go | serde_json | **VL** |
 | --- | --- | --- | --- | --- | --- |
@@ -415,9 +565,16 @@ What `parseJson` accepts is exactly RFC 8259 text, and nothing more:
 | leading zero `01` | error | error | error | error | error |
 | raw control char in a string | error | error (default) | error | error | error |
 | lone surrogate `\uD800` | accepted (UTF-16 string) | accepted | replaced with U+FFFD | error | **error `syntax`** |
-| leading BOM | error | error | error | error | error |
+| leading BOM | error | error | error | error | **error `syntax` at 0, msg names the BOM** |
 | whitespace: only ` \t\n\r` | yes | yes | yes | yes | yes |
 | top-level scalar `2` | yes | yes | yes | yes | yes |
+| trailing content `{} x` | error | error (`Extra data`) | error (whole-string API; `Decoder` allows a sequence) | error (`trailing characters`) | **error `syntax` at the first non-whitespace byte after the value** |
+| empty / whitespace-only input | error | error | error (`unexpected end of JSON input`) | error (`EOF while parsing a value`) | **error `syntax` at `self.length`, msg "unexpected end of input"** |
+| `1e999` | `Infinity` | `inf` | error (out of range) | error (out of range) | **error `nonfinite`** (§2.5) |
+
+*(The last three rows are post-critique, crosslang F8 and F1 — trailing content is the row
+that catches the most real bugs, and an empty body is the single most common real parse
+failure, so both get a distinguishable message rather than "unexpected byte".)*
 
 Two rows are choices rather than the RFC: duplicates (ruled A — stricter than every
 listed implementation; the argument is that a duplicate is never intentional and last-wins
@@ -433,11 +590,13 @@ must be a named i32[] binding`, a clause-2 gap noted in §5)**.
 string bytes through unchanged (escapes aside) and validates nothing about them. A VL
 string that came from the outside world went through `decodeUtf8` to become a string, and
 that is where the strictness lives. This is why v1 takes `string` and not `u8[]`
-(serde has `from_slice`; Go takes `[]byte`): the file→JSON pipeline is
-`readFile(p)` → `decodeUtf8()` → `parseJson()`, three steps that each own one failure
-kind, rather than one function with an `IoError | Utf8Error | JsonError` return. If the
-three-step pipeline turns out to be the only way anyone ever calls it, a `u8[]` overload
-is a later, additive export.
+(serde has `from_slice`; Go takes `[]byte`; Python accepts bytes and auto-detects the
+encoding — and each of them then owns the encoding question). *Post-critique (std #7):*
+the pipeline nobody writes is `readFile` → `decodeUtf8` → `parseJson`; the one people
+write is `readTextFile(p)` → `parseJson()`, two steps, because `readTextFile` already
+folds the decode (`std/fs.vl`) and RFC 8259 §8.1 makes UTF-8 the only interchange encoding
+worth accepting. A `u8[]` entry, if a consumer ever names one, is a separate export with
+its own name — VL has no overloading, and the header does not use the word.
 
 ---
 
@@ -507,55 +666,86 @@ blocks the module outright.
    not learn `if r.error != null` for one module because of a compiler gap that has a row
    number. The builder is sequenced after D1021.
 
-2. **D1009 / D1010 — `Json | null` ↛ `Json` and null-bearing literals needing the `Json[]`
+2. **D1025 — a map subscript mints no narrowing key** (*post-critique*; the usability
+   critique's gap A, filed 2026-09-01). The load-bearing gap the helper decline was
+   mis-attributed to (§2.8). `if m["a"] is string { const z: string = m["a"] }` is a loud
+   check reject at a string key, and at an INTEGER-LITERAL key (`m[1]`) it is check-clean
+   invalid wasm — the checker narrows (D11's place key) and the emitter delivers the raw
+   nullable map read. Every JSON object read meets the string face. **Build the emitter's
+   map-read narrowing before widening the checker's key**, or the loud face moves to the
+   silent one (D965's position rule).
+
+3. **D1024 / D1026 — a duplicate atom after alias expansion in a signature**
+   (*post-critique*; both filed 2026-09-01). D1026 is `function g(): Json | null` — the
+   signature every accessor writes first — `vl check` rc 0 then `bare null needs a
+   struct-typed context`; D1024 is the same shape with `string | "err"` and it builds
+   invalid wasm. One dedupe after expansion plausibly closes both; §6 question 3 is the
+   language ruling underneath (collapse the subsumed literal, or keep it).
+
+4. **D1009 / D1010 — `Json | null` ↛ `Json` and null-bearing literals needing the `Json[]`
    annotation.** Both open, both loud check rejects. They are what makes the walking idiom
-   four hoists deep (§2.8); the helpers were declined partly on the strength of these being
-   fixed rather than worked around.
+   four hoists deep (§2.8). Sequenced ahead of D1022 because the obvious WRONG repair of
+   D1009 (`a != null && b != null` in a hand-written `deepEquals`) checks, runs and is
+   silently wrong (usability F2).
 
-3. **D1022 — named arm aliases in a recursive union.** `JsonObject`/`JsonArray` as members
-   of the tree (checker) and as the type of a `Map()` binding (emitter). Readability of
-   every consumer's `is` chain; not blocking.
+5. **D1022 — named arm aliases in a recursive union.** `JsonObject`/`JsonArray` as members
+   of the tree (checker) and as the type of a `Map()` binding (emitter). Emit half first:
+   the `is` sites already run when the aliases are declared after the tree, and
+   `let o: JsonObject = Map()` (`interned no mv slot`) is the line every builder writes
+   (usability F7). Readability; not blocking.
 
-4. **A15 build item 4 — `IdentitySet<T>`** — turns the renderer's `depth` report on a cycle
+6. **`==` over a union with struct or list arms** (*post-critique*, usability F4):
+   `v == "b"` over a `Json` is `emitProgram: \`==\` over a struct union is not supported
+   yet` **(RUN)** — clause 2, on the critical path of every round-trip test, and the
+   reason a consumer writes `deepEquals` by hand. A capability probe belongs under
+   `scripts/capability-probes/`.
+
+7. **`===` parses** (*post-critique*, crosslang F4 / usability F8): the cycle scan's
+   primitive (§2.7) and A15's ruled spelling; today `expected an expression but found
+   EQUAL` **(RUN)**. Sequenced with item 8, which it is the primitive for.
+
+8. **A15 build item 4 — `IdentitySet<T>`** — turns the renderer's `depth` report on a cycle
    into `cycle` at the back-edge. Sequenced by the identity ruling, not by this doc.
 
-5. **Explicit type arguments at a call, and/or destination-driven inference of a
+9. **Explicit type arguments at a call, and/or destination-driven inference of a
    return-only type parameter** — stage 3's `fromJson<T>` cannot be called without one of
    them. Already on A15's list (`Map<string,i32>()`); named here as the thing stage 3's
    naming depends on.
 
-6. Minor: `fromCodePoints` requiring a NAMED `i32[]` binding (emit refusal on an inline
-   literal, `compiler/wasmEmit.vl:14356`) — the builder uses a named buffer as fmt does; a
-   clause-2 refusal worth a probe when someone is in that file.
+10. **`f64 as i32` out of range** — traps today (`3000000000.0 as i32` → `wasm trap:
+    integer overflow` **(RUN)**); §6 question 2 asks whether it saturates. One instruction
+    (`i32.trunc_sat_f64_s`) if ruled so.
+
+11. Minor: `fromCodePoints` requiring a NAMED `i32[]` binding (emit refusal on an inline
+    literal, `compiler/wasmEmit.vl:14356`) — the builder uses a named buffer as fmt does; a
+    clause-2 refusal worth a probe when someone is in that file.
 
 ---
 
-## 6. Questions for the critique round
+## 6. Open — the owner's three questions
 
-Three agents, three angles, each writing `docs/internals/json-critique-<angle>.md`:
+The critique round's five decisions (names; silent rounding; the single error type;
+`string`-only input; helpers) came back unanimous on four and split on one. The four are
+closed above (§2.4, §2.3, §2.2, §2.9). What remains, with the synthesis's recommendation
+in bold (`docs/internals/json-critique-synthesis.md` §2 has the votes and the
+measurements):
 
-- **crosslang** — does any row of the tables in §2.3, §2.5, §2.6, §2.9 misstate what JS,
-  serde_json, Go or Python actually do, and is there a behaviour one of them gets right that
-  this surface gets wrong? In particular: the >2⁵³ silent rounding vs a `precision` error;
-  `1e999` parsing to a value the renderer refuses; lone surrogates.
-- **std-consistency** — grade the surface against `docs/internals/std-api-review.md` and
-  the fs/fmt/utf8/base64 headers: names (§2.4 alternatives), the single error type for
-  both directions (§2.2), `string` not `u8[]` (§2.9), the declined helpers (§2.8), the
-  deferred-but-named exports (`toJsonPretty`, `jsonKind`) — is naming a signature you do
-  not ship "speculative" under the rubric, or is it the cheapest moment to be critical?
-- **usability / checker** — write the three programs a real consumer writes (read a config
-  file into a struct-shaped tree; build and render a response; round-trip a document and
-  diff it) against the idiom in §2.8 and §3, on the seed, and report what the narrowing
-  gaps cost in lines and in wrong turns. Is the helper decline right, and is D1009/D1010 the
-  whole of the cost or is there a third gap the idiom hides?
+1. **Helpers** — (a) none in v1; (b) `jsonGet`/`jsonAt` returning `Json`, missing = null;
+   **(c) one `jsonPointer(self: Json, pointer: string): Json | JsonError`, RFC 6901,
+   `kind: "missing"` keeps missing distinct from a stored null.** §2.8 has all three.
+2. **`f64 → i32` off the wire** — (1) ship `asExactI32`/`asExactI64` (`: i32 | null`) in
+   `std:fmt` beside `parseI32`: **yes**, with the `std-api-reviewer` pass. (2) What
+   `f64 as i32` does out of range — trap (today), **saturate** (Rust; `i32.trunc_sat_f64_s`,
+   NaN → 0), or wrap (JS `|0`). A language ruling for `DECISIONS.md`, on every consumer's
+   path.
+3. **`string | "err"`** (D1024's question, and D1026's fix) — **collapse** the subsumed
+   literal into its base (TypeScript's rule; a hint says the arm is inert), or keep it as
+   a distinguishable arm. A language ruling for `DECISIONS.md`; nothing in this module
+   spells either.
 
-Decisions the owner will be asked to make after synthesis (the current proposal in bold):
-
-1. Names — **`parseJson`/`toJson`** vs `jsonParse`/`jsonRender` vs `decodeJson`/`encodeJson`.
-2. Large integers — **silent rounding, documented, stage 3 exact** vs `precision` error.
-3. Helpers — **none in v1** vs `get`/`at` (or `jsonGet`/`jsonAt`) now.
-4. Error type — **one `JsonError` for both directions** vs a render-side twin.
-5. Input type — **`string` only** vs `string` + `u8[]`.
+Everything else the three critiques raised is either taken (§1–§2 above, each marked
+*post-critique*) or a build item (§5). The builder is briefed after these three are ruled
+and D1021 closes.
 
 ---
 
