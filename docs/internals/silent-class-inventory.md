@@ -29989,6 +29989,34 @@ makes this ONE row rather than four.
   type. `compiler/typecheck.vl:3070` already records this in a comment for the callee case
   ("a field that is an ARRAY …"), which is the same observation from the other side.
 
+* **THE NARROW IS ALREADY PUSHED UNDER A PATH KEY — the gap is on the READ side, and it is a
+  D965 ladder, not a one-liner.** `setNarrowFromCond` has carried a member channel
+  (`memberPathKeyOf`) and an index channel (`indexPathKeyOf`) for some time, so `if n.v is
+  K[]` DOES bank a narrowing under the key `n.v`. What is keyed by identifier is every
+  CONSUMER: `forInElemKind` and the emitter's three unbox families all take a `name: string`
+  and call `narrowVariantFor(identName)`.
+
+* **NARROWING THE CLASSIFIER FIRST WAS BUILT AND MEASURED, AND IT SHIPS CLAUSE 1.** Adding a
+  place-keyed lookup (`narrowVariantForExpr` — ident, member path, index place) and using it
+  in `forInElemKind` moves the primary witness and the array-element witness from a LOUD
+  refusal to **check-clean invalid wasm**: the `#l` temp is now declared at the arm's rep
+  while the iterable expression still evaluates to the raw box, so `local.set` gets
+  `(ref $uBox)` where `(ref $reflistWrapper)` is expected. The disassembly shows the read as
+  a bare `struct.get $1 0` with no unbox at all. Spellings 2, 3 and 4 do not move.
+
+  That is D965's order stated exactly: **build the lowering, wire every delivery, THEN narrow
+  the gate.** Reverted rather than shipped.
+
+* **WHAT THE FIX ACTUALLY NEEDS — three member analogues, each with its own storage-class
+  gate.** The identifier read has `emitValueUnionUnboxRead`, `emitRefArrayUnionUnboxRead` and
+  `emitMapUnionUnboxRead`, and each is entered behind `unionNameOfIdentSid` /
+  `capturedIsUnionBox` / `identChainTyBoxedUnion`. A member or index PLACE needs the same
+  three unboxings — push the box, `struct.get` the anyref payload, `ref.cast` to the arm's
+  wrapper / map struct / scalar box — reachable from a path key rather than a name. The
+  four consumer floors then need nothing: they are correct given a correctly-typed input.
+  `emitNarrowedMem` is the shape to copy; it already resolves BOTH an ident receiver and a
+  member path key.
+
 Repro (loud emit reject):
 
     type K = f64 | K[]
