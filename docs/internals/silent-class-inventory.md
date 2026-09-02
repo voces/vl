@@ -29196,7 +29196,11 @@ Fixture: `tests/cases/types/coalesce-merged-row-tag-dispatch.vl`.
 
 ### D945 — a CONSUMED void-typed closure VALUE is invalid wasm in its two ref containers, and the void-tail acceptance routes two more spellings onto it
 
-**check-clean invalid wasm · PRE-EXISTING (byte-identical failure on the pre-void-coercion seed — the coercion landing changed which SPELLINGS reach it, not the defect) · 2 hand-witnessed spellings moved loud→silent by that landing (the price, recorded here per the refused-candidate rule) · 0 corpus cells (no void-callback axis exists; the derived corpus cannot see this family)**
+**runs, prints `35` then `36` — CLOSED 2026-09-01 by giving `calleeCloSigKeySid` a rung that
+reads the CHECKER's recorded type of the binding's INITIALIZER, after every name rung
+declines · zero `runs` lost and zero cells moved to silent ·
+`tests/cases/closures/void-closure-value-consumed.vl` · was check-clean invalid wasm,
+PRE-EXISTING (byte-identical on the pre-void-coercion seed) with 0 corpus cells**
 
 Repro (check rc 0; `Error: failed to compile: wasm[0]::function[6]` at instantiation):
 
@@ -29225,6 +29229,27 @@ Repro (check rc 0; `Error: failed to compile: wasm[0]::function[6]` at instantia
 * The fix owes the consumption sites (return-slot and element reads of a void-sig
   closure) the same functype treatment the coercion's `synthVoidTwins` gave argument
   passing — the twin exists, these reads don't route through it.
+
+* **IT WAS NOT THE TWIN, AND THE SCOPE SPLIT IS WHAT SAID SO.** The identical body inside a
+  FUNCTION runs; only module scope fails. `synthVoidTwins` is about a named `(): i32` function
+  coerced at an ARGUMENT — nothing here is coerced. What actually decides is `emitCallStmt`,
+  which drops a call statement's result unless it knows the callee is void, and for a closure
+  VALUE that knowledge is `calleeReturnsVoid` → the resolved `$fnsig` key.
+
+* **EVERY RUNG OF THAT CHAIN ANSWERS ABOUT A NAME.** A narrowed arm, a parameter, a
+  function-type annotation, a lifted closure, a copy of another binding — and `const m = mk()`
+  is none of them, because its initializer is a CALL. The key came back `""`, void went
+  unrecognised, a `drop` was emitted, and there was nothing to drop: `expected a type but
+  nothing on stack`.
+
+  The rung added reads the checker's recorded TYPE of the initializer instead of any spelling,
+  so one arm answers for a call, an indexed read and a field read alike — the three
+  consumption containers this row names, both of the silent ones now pinned. It is reached
+  only after every name rung declines, so nothing that resolved before resolves differently.
+
+* **`mk()()` STAYS LOUD and is not swept in** — `emitProgram: bare call statement is not
+  supported`, a callee that is a CALL rather than a binding. Different sentence, different
+  mechanism, and loud rather than silent.
 
 ### D946 — [CLOSED 2026-08-31] a `: void` RETURN ANNOTATION was invisible to the emitter — an effect-only body TRAPPED and a ref tail was invalid wasm
 
