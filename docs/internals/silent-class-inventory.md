@@ -32050,12 +32050,23 @@ Repro:
   D1036's fall-through — and a further route to `mvShapeOfMapNodeTy`, built and measured —
   rescue this order and not that one.
 
-* **LEAD: `aliasNameOfTyIx` (D1021) is the suspect, and it is a reverse lookup.** Rendering
-  the value union reaches member `JO` while `JO`'s own type index is on `emitNameSeen`, so
-  the cycle guard fires and asks `aliasNameOfTyIx` for the name. That scans `cUserTypes` for
-  a key whose index EQUALS the revisited one; if the forward-declared `JO` was filled through
-  a placeholder, `cUserTypes["JO"]` and the index on the stack are two different integers,
-  the scan answers `""`, and an empty member collapses the whole render. Next step is to
-  print both indices under each order — if they differ, the fix is on the identity the guard
-  matches, not on the render.
+* **THE `aliasNameOfTyIx` LEAD IS REFUTED — MEASURED, AND THE MEASUREMENT IS THE USEFUL
+  PART.** The guess was that rendering the value union revisits `JO` while its index is on
+  `emitNameSeen`, and D1021's reverse lookup answers `""` because the forward declaration
+  banked a different index. HALF of that is true and it is not the cause:
 
+  | order | cycle-guard `ix` | `cUserTypes["JO"]` | `cUserTypes["J"]` | guard's name |
+  | --- | --- | --- | --- | --- |
+  | `type J` first (runs) | 42 | 41 | 40 | `""` |
+  | `type JO` first (this row) | 44 | 40 | 41 | `""` |
+
+  The index the guard holds matches NEITHER declaration in EITHER order, so the reverse scan
+  answers `""` in both — including the order that renders perfectly well. `cUserTypes` banks
+  the index a `type X = …` declaration produced and the render walks the type the ANNOTATION
+  resolved to; for a mutually recursive pair those are different integers.
+
+  Widening the scan to structural identity (`tySame(cUserTypes[k], ix)`, after the exact scan
+  declines) was built and graded: `nodeTyMapValName` is STILL empty under this order and every
+  witness grades exactly as before. The empty render has another source, and the next probe
+  should walk the value type itself rather than the guard — which is reached in both orders
+  and answers the same thing in both.
