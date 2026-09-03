@@ -46,6 +46,9 @@ Compiler internals, self-hosting, contributor and agent process.
 - [`internals/selfhost-name-section.md`](internals/selfhost-name-section.md) — wasm name-section emission.
 - [`internals/selfhost-print-emit-plan.md`](internals/selfhost-print-emit-plan.md) — `print` emission staging.
 - [`internals/selfhost-corpus-paydown-findings.md`](internals/selfhost-corpus-paydown-findings.md) — emitter coverage notes.
+- [`internals/parser-notes.md`](internals/parser-notes.md) — long-form parser rationale, moved out of `compiler/parser.vl`.
+- [`internals/format-notes.md`](internals/format-notes.md) — long-form formatter rationale, moved out of `compiler/format.vl`.
+- [`internals/emit-sections-notes.md`](internals/emit-sections-notes.md) — long-form emitter-section rationale, moved out of `compiler/emit_sections.vl`.
 - [`internals/rep-fuzz-findings.md`](internals/rep-fuzz-findings.md) — rep-composition fuzzer findings.
 - [`internals/compiler-code-review.md`](internals/compiler-code-review.md) — synthesized code-review priorities (live to-do).
 - [`internals/vl-tech-debt.md`](internals/vl-tech-debt.md) — remaining cleanups and limitations.

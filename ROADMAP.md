@@ -121,6 +121,13 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
     remain. DECISIONS.md §"A missing list separator is inserted, never skipped past".
   - **NEXT: the `then`-removal arm in `parseIf`**, which is already single-statement and was
     called out at stage 1 as the cheapest remaining candidate.
+- **Modernization program — (1) comment trim, PILOT DONE #2413**: `compiler/parser.vl`,
+  `compiler/format.vl` and `compiler/emit_sections.vl` are at the 12-line comment-block
+  budget (72 blocks over 12 → 2, both of those module headers under their own 40-line
+  budget), with a byte-identical seed and the moved text archived verbatim in
+  `docs/internals/{parser,format,emit-sections}-notes.md`. `emit_bytes.vl` and the large
+  emitter/checker files come later, under a freeze; the lint + ratchet
+  (`scripts/comment-budget.py`) lands separately.
 - **Width subtyping — RULED (owner, 2026-09-01): the non-prefix refusal is a GAP, closed
   the Roc way** — shape-monomorphization of narrow-typed consumers (offsets constant per
   caller shape; zero runtime cost; paid in instance count — the variant-count tradeoff
