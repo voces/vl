@@ -22262,7 +22262,16 @@ export function internInlineShapeTy(nm: string, tyIx: i32) {
     }
     fi = fi + 1
   }
-  if !ok || names.length == 0 { return -1 }
+  if !ok { return -1 }
+  // THE EMPTY SHAPE `{}` IS A REAL ZERO-FIELD LAYOUT, NOT A PARSE FAILURE (D1171).
+  // A `names.length == 0` blanket return refused it, so `{} | null` reached `fbValtype`
+  // as `nulstruct` with structIdx -1 and an EMPTY `sHeapIdx` — a loud
+  // `ref valtype with no interned shape` on a program the alias spelling
+  // (`type E = {}`) compiles and runs. Only a body that is actually empty may mint a
+  // zero-field row; a non-empty body that split into no fields is still malformed.
+  if names.length == 0 {
+    if nameStripSpaces(groupInnerOf(nm)).length != 0 { return -1 }
+  }
   const existing = annShapeIndexOf(names, codes, texts)
   if existing >= 0 { return existing }
   // D831: the WIDER `#anon` row a literal already interned serves this annotation too.
@@ -33685,10 +33694,6 @@ export function blockHasMapOp(blockIx: i32, fnIx: i32) {
         if exprHasMapOp(s.letInit, fnIx) { return true }
       } else if s is RetStmt {
         if exprHasMapOp(s.retArg, fnIx) { return true }
-      } else if s is BinExpr {
-        if exprHasMapOp(stmts[i], fnIx) { return true }
-      } else if s is Call {
-        if exprHasMapOp(stmts[i], fnIx) { return true }
       } else if s is IfStmt {
         if ifChainHasMapOp(stmts[i], fnIx) { return true }
       } else if s is WhileStmt {
@@ -33711,6 +33716,19 @@ export function blockHasMapOp(blockIx: i32, fnIx: i32) {
         if exprHasMapOp(s.frFrom, fnIx) { return true }
         if exprHasMapOp(s.frTo, fnIx) { return true }
         if blockHasMapOp(s.frBody, fnIx) { return true }
+      } else if s is Block {
+        if blockHasMapOp(stmts[i], fnIx) { return true }
+      } else {
+        // EVERY OTHER STATEMENT IS AN EXPRESSION STATEMENT, and the dispatch above used to
+        // name only two of the kinds one can be (`BinExpr`, `Call`) — so a tail
+        // `mk()["k"]` was an `Index` statement nothing walked. `exprMap` answers for a
+        // map-returning CALL receiver, the emitter lowers it as a map GET, and with no
+        // frame reserved that `local.set` names a local the header never declared:
+        // `unknown local N`, at `vl check` rc 0 (D1101). Asking `exprHasMapOp` of the
+        // whole statement is the widest form and cannot over-reserve — it has no arm for
+        // a declaration or a nested `FuncDecl`, so it answers false for every statement
+        // kind the arms above already own.
+        if exprHasMapOp(stmts[i], fnIx) { return true }
       }
       i = i + 1
     }
