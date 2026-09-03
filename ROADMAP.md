@@ -191,7 +191,7 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   takes `emit_collect.vl` from 124/46 to 0/0** — 1,325 comment lines gone, three ORPHANED
   function headers moved back to the functions they document (`forceGenAppArgTypes`,
   `collectA`, `collectTyReachRegister`), two stale citations corrected. **Batch 6 takes
-  `wasmEmit.vl` from 180/47 to 0/0** — 1,535 comment lines gone, SEVEN orphaned function
+  `wasmEmit.vl` from 180/47 to 0/0** — 1,536 comment lines gone, SEVEN orphaned function
   headers moved back (so the block count rises by seven) and an eighth dropped because its
   function had moved to `emit_classify.vl`, eight citations to the `toWasm.ts` / `parser.ts`
   deleted in #466 removed, and two multi-page FILINGS graded rather than trimmed: the
