@@ -309,7 +309,7 @@ receives, and the literal unit still overstates messages by ~20%.
 `goal-scoreboard.py` can print `total against the goal 0` while ~500 refusal sites stand, and
 it is the sharpest available statement of the "name the population in the sentence" rule.
 
-**AND THE PHRASE LIST ITSELF NEEDS AUDITING — it was reporting HALF.** Until D958 the predicate
+**AND THE PHRASE LIST ITSELF NEEDS AUDITING — it was reporting HALF.** Until #2122 the predicate
 matched four phrasings and found 12 literals; the compiler carried **12 more** that concede the
 same thing in the other WORD ORDER (`not supported YET` rather than `not YET supported`), plus
 `not yet implemented` and `not yet callable`. Two of the newly-counted were verified by witness
