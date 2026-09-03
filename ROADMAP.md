@@ -524,9 +524,14 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   row, so the arms fold onto a single heap type; the WHOLE-TREE litunion unification (the rep
   cliff proper) was NOT needed and remains unbuilt. **The cliff was smaller than its name**:
   scoped to the arms of a mixed pair, it moved 0 of 255,504 corpus cells and emits master's
-  own source byte-identically. Its BOUND is `tyIsLitUnion` on both arms — a set beside its
-  own BASE (`{kind: K1} | {kind: string}`) and a BARE single literal are not atom material and
-  keep the loud refusal, so the message literal stays counted. D1023's RULED paragraph has the
+  own source byte-identically. **And its BOUND is gone too (D1460, D1461, 2026-09-03):** the
+  ONE-MEMBER set (`{kind: K1} | {kind: "a"}`) was a spelling, not a rep — the alias form of the
+  same set has carried the atom all along — and the set beside its own BASE
+  (`{kind: K1} | {kind: string}`) unifies on the STRING side, which needed three of its four
+  mirror sites already built and a fourth that is not a mirror. The whole family now RUNS at
+  every spelling: 8 -> 0 emit refusals over a 144-pair ordered grid, and the refusal that
+  prescribed "spell both arms the same way" — an edit that fixed neither program — is now a
+  floor that names the field and the two owners of the invariant. D1023's RULED paragraph has the
   six-row table and the grading list; DECISIONS.md §"`is A` over same-shape struct arms is a
   DISCRIMINANT-VALUE test" and §"a mixed-spelling variant field carries the ATOM". The std rule that was interim is now only a style
   preference: a std error struct no longer NEEDS a unique field name, since a unique `kind`
