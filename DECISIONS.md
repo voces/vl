@@ -4914,20 +4914,14 @@ keys on the code rather than parsing the sentence.
 
 **BUILT 2026-09-02 — BOTH HALVES.** The three tooling items ship, and so does the
 compile-goal half: the refusal names the missing import and carries the quick-fix's whole
-answer on the existing `diagCodeLen`/`diagCodeByte` channel, so the code action never parses
-the sentence. The fallback on the old message shape is therefore retired.
-
-    ufcs-not-imported;member=toEqual;modules=std:test;recv=Expectation<i32>
-
-`;`-separated, fixed order, `,` between module specifiers, and **`recv=` LAST** because a
-rendered type is the only field that can itself contain those characters (`A | B`,
-`{a: i32, b: i32}`) — read it as everything after the first `;recv=`. ONE diagnostic lists
-every candidate module, so the quick-fix emits one code action per entry in `modules=`
-rather than answering N squiggles on one token. Specifiers are spelled the way the file can
-write them TODAY: the file's own import text where it already imports the module, and the
-bare `std:` key where it does not. A RELATIVE module the file does not import is deliberately
-NOT offered — its key is a normalized path, and reconstructing a specifier relative to the
-entry is `..`-arithmetic that can name a different module.
+answer in machine form, so the code action never parses the sentence. The fallback on the old
+message shape is therefore retired. ONE diagnostic lists every candidate module, so the
+quick-fix emits one code action per candidate rather than answering N squiggles on one token.
+Specifiers are spelled the way the file can write them TODAY: the file's own import text where
+it already imports the module, and the bare `std:` key where it does not. A RELATIVE module
+the file does not import is deliberately NOT offered — its key is a normalized path, and
+reconstructing a specifier relative to the entry is `..`-arithmetic that can name a different
+module.
 
 Three things the build settled that the ruling could not have known:
 
@@ -4955,3 +4949,51 @@ for a bare identifier, while the UFCS probe APPENDS a property and keeps a real 
 And the same appended-property trick is what lets the quick-fix ask about
 `expect(1 + 2).toEqual(3)` without repairing anything: the diagnostic points AT the member, and
 the receiver is that access's object, whatever expression it is.
+
+### A diagnostic code is a bare CATEGORY; its payload rides `data` — 2026-09-02
+
+The first build of the answer above had nowhere to put it. The diagnostic ABI had ONE string
+channel (`diagCodeLen`/`diagCodeByte`, `TDiag.tcode`), so the payload was packed into the code:
+
+    ufcs-not-imported;member=toEqual;modules=std:test;recv=Expectation<i32>
+
+`;`-separated, fixed order, `,` between specifiers, `recv=` last because a rendered type was
+the one field that could contain those characters. It worked, and the shape of what it cost is
+the point. **Every consumer owed a `diagCategory(code)` cut at the first `;` before it could
+compare a code at all** — an `===` against `ufcs-not-imported` silently stops matching the day
+a payload is added, which is exactly what happened. The framing lived in the values: `recv=`
+had to be LAST, `modules=` needed specifiers that hold no `,`, and each new field was another
+character some value must never contain. The code stopped being a category and became a
+one-off grammar that only its own writer and reader understood.
+
+**So the ABI grew the channel it was missing.** `TDiag` carries `tdata`, exported as
+`diagDataLen`/`diagDataByte` beside the code pair, and `CODE_UFCS_NOT_IMPORTED` is the bare
+word again. The payload is netstrings — `<byte-length> ":" <bytes> ","` — read as alternating
+KEY and VALUE:
+
+    6:member,7:toEqual,7:modules,8:std:test,4:recv,16:Expectation<i32>,
+
+The length is authoritative, so a value may hold ANY byte — `;`, `,`, a `"` from a
+string-literal type member, a newline — with nothing escaped and no field order to preserve.
+**A REPEATED KEY IS A LIST**, which is how `modules` carries every candidate: there is no
+`,`-joined value to re-split, so a specifier holding a separator cannot merge two modules into
+one. And the length is a UTF-8 BYTE count, not a JS `.length`, which is why the TS decoder
+(`compiler/diagnostics.ts` `decodeDiagData`) takes bytes: `{a: i32, tag: "a;b,c|d" | "éè"}` is
+31 characters and 33 bytes, and a reader that sliced the decoded string would be two bytes
+wrong on a real type name.
+
+Three decisions inside that are worth keeping:
+
+* **`diagCategory` STAYS, and nothing depends on it.** It is a tolerant reader against the
+  next packed code, kept because the mistake is cheap to make again — not a fallback anything
+  calls.
+* **A malformed payload decodes to `{}`, never a partial read.** This is a channel between two
+  halves of one toolchain, so disagreement means a seed/host mismatch; a quick-fix acting on
+  the readable prefix would write an import from a module the compiler never named.
+* **The quick-fix stopped asking the checker anything.** It used to re-run `ufcsCandidatesAt`
+  per lightbulb and convert module KEYS back to specifiers in the host. The compiler decided
+  both at the raise, so `onCodeAction` is now synchronous.
+
+`--json` deliberately carries neither the code nor the payload for a COMPILE diagnostic
+(`compiler/cli.vl`, unchanged): the payload is an editor's answer, and the fix is an edit no
+batch reporter performs. Adding it would store a field nothing reads.
