@@ -49,6 +49,7 @@ import {
 } from "./tyname"
 import {
   EqCmpKind,
+  PrimName,
   T,
   TyArray,
   TyFunc,
@@ -8699,9 +8700,8 @@ export function fnHasStrOp(fnIx: i32) {
 
 // The intrinsic-allocation ELEMENT KIND of the Call at `callIx`: `0` = the i32
 // list (i32/boolean fills — the i32 backing), `1` = the f64 list (an f64 fill),
-// `-1` = not an intrinsic allocation. `__array_new_default__` is always the i32
-// list natively: its element kind is not derivable from the argument list (an
-// f64 default needs `__array_new__(n, 0.0)`); the host covers it generically.
+// `-1` = not an intrinsic allocation. `__array_new__` reads its FILL; the
+// default allocator has no fill and reads its DESTINATION (`arrNewDefaultKind`).
 // D966 — the arena type of an `__array_new__` call's FILL argument, or -1. The element row
 // for the resulting list is interned from it, so the intern can derive the element's KIND
 // rather than assuming the struct one.
@@ -8748,10 +8748,39 @@ export function arrNewIntrKind(callIx: i32, fnIx: i32) {
         }
         return 0
       }
-      if callee.identName == "__array_new_default__" { return 0 }
+      if callee.identName == "__array_new_default__" {
+        return arrNewDefaultKind(callIx)
+      }
     }
   }
   -1
+}
+
+// The `__array_new_default__(n)` element kind, read off the CHECKER's recorded type for the
+// CALL. `array.new_default` writes each slot's ZERO, so the kind is the DESTINATION's — the
+// argument list carries none — and the destination reaches the call node through the very
+// unification the empty `[]` hole rides (`constrainEmptyD` pins `aElem` in place, and
+// `emptyArrHoleKind` reads the identical node type). An UNPINNED hole answers `0`, matching
+// the i32 default `flushUninferred` gives such a binding, so checker and emitter agree.
+//
+// LADDERED OVER `PrimName`, WHICH IS THE CHECKER'S OWN VOCABULARY HERE — `elemHasZero` decides
+// admission over the same ten names, so the gate and the kind cannot drift into a rep the other
+// did not expect. Every non-`TyPrim` element (a struct, a closure, a map, a nested list, a
+// union, anything nullable) and `string` are refused there, so their `0` below is unreachable
+// rather than a fallback; the reachable `0` is `i32`/`boolean` and the unpinned hole. D1470.
+function arrNewDefaultKind(callIx: i32) {
+  const p = tyPrimLeafElemName(nodeTyIxOf(callIx))
+  if p == "f64" { return 1 }
+  if p == "i64" { return 4 }
+  if p == "u8" { return 5 }
+  if p == "f32" { return 6 }
+  if p == "i32" { return 0 }
+  if p == "boolean" { return 0 }
+  if p == "string" { return 0 }
+  if p == "void" { return 0 }
+  if p == "null" { return 0 }
+  if p == "never" { return 0 }
+  0
 }
 
 // The declared-local POSITION of `name`: the innermost live lexical binding if the
@@ -31936,26 +31965,35 @@ function emptyArrHoleKind(exprIx: i32): VKind | null {
   null
 }
 
-// The list `VKind` an ARRAY type over a bare `TyPrim` LEAF reps as — `i32`/`boolean` share
-// the one i32-list backing, every other leaf has its own — or `null` for any other element
-// (or any non-array). The ARENA twin of the `nameIs*Array` ladder, written once for the
-// positions that hold a TYPE and no annotation node to run the name ladder over.
-function tyPrimLeafListKind(ty: i32): VKind | null {
+// The bare `TyPrim` ELEMENT NAME of an array type, or `null` for a non-array, an unpinned
+// hole, or any element that is not a bare primitive. The one home of that walk — the two
+// answers below and `arrNewDefaultKind` each need it, and the third wants to ladder over
+// `PrimName` rather than over the list `VKind` this folds to.
+function tyPrimLeafElemName(ty: i32): PrimName | null {
   if ty < 0 { return null }
   const t = T.tys[ty]
   if t is TyArray {
     if t.aElem < 0 { return null }
     const el = T.tys[t.aElem]
-    if el is TyPrim {
-      const n = el.primName
-      if n == "i32" || n == "boolean" { return "list" }
-      if n == "string" { return "strlist" }
-      if n == "f64" { return "f64list" }
-      if n == "i64" { return "i64list" }
-      if n == "f32" { return "f32list" }
-      if n == "u8" { return "u8list" }
-    }
+    if el is TyPrim { return el.primName }
   }
+  null
+}
+
+// The list `VKind` an ARRAY type over a bare `TyPrim` LEAF reps as — `i32`/`boolean` share
+// the one i32-list backing, every other leaf has its own — or `null` for any other element
+// (or any non-array). The ARENA twin of the `nameIs*Array` ladder, written once for the
+// positions that hold a TYPE and no annotation node to run the name ladder over.
+function tyPrimLeafListKind(ty: i32): VKind | null {
+  const n = tyPrimLeafElemName(ty)
+  if n == "i32" || n == "boolean" { return "list" }
+  if n == "string" { return "strlist" }
+  if n == "f64" { return "f64list" }
+  if n == "i64" { return "i64list" }
+  if n == "f32" { return "f32list" }
+  if n == "u8" { return "u8list" }
+  // `void` / `null` / `never` are not element types the list layer has a backing for, and
+  // neither is the `null` this answers for a non-array or a non-primitive element.
   null
 }
 
@@ -31963,16 +32001,7 @@ function tyPrimLeafListKind(ty: i32): VKind | null {
 // `tyPrimLeafListKind` does NOT map (a `TyPrim` the list layer has no backing for) out of
 // the ref-list row lookup below it. `nodeArrayElemName` renders a prim element as its bare
 // scalar name, and a bare scalar is not a ref-list key: matching one would be a coincidence.
-function tyPrimLeafElem(ty: i32) {
-  if ty < 0 { return false }
-  const t = T.tys[ty]
-  if t is TyArray {
-    if t.aElem < 0 { return false }
-    const el = T.tys[t.aElem]
-    if el is TyPrim { return true }
-  }
-  false
-}
+function tyPrimLeafElem(ty: i32) { tyPrimLeafElemName(ty) != null }
 
 // The `pendingListKind` build vocabulary a list `VKind` + its ref-list ROW demand — the
 // same 0/1/2/3/4/5/6/7/10 alphabet `tyAnnRefListKind` produces from an ANNOTATION node and

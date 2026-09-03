@@ -2146,9 +2146,14 @@ in-language GC knobs.
   optimizer: the builtin does NOT inline the callback (`call_indirect` per element, same
   as std would pay), it buys a pre-sized `array.new_default`; `mapIndexed<T, U>` in
   `std/array.vl` is the existence proof that a generic std `map` is writable today, and
-  the residue is a generic, monomorphization-aware sized-array constructor
-  (`__array_new_default__` is i32-only — its element kind "is not derivable from the
-  argument list").
+  the residue is a generic, monomorphization-aware sized-array constructor.
+  **`__array_new_default__` is NO LONGER i32-only** (D1470): its element kind was never
+  underivable, only unread — it comes from the DESTINATION the checker pins onto the call,
+  and `f64` / `i64` / `f32` / `u8` / `boolean` all build and run. What is still missing for
+  a std `map` is the GENERIC face, and it now has a mechanism instead of a shrug: a
+  monomorphized instance body is emitter-synthesized, so the pinned element the direct
+  spelling reads is not there and every non-i32 instance builds the i32 backing under
+  another rep's destination ([D1472](docs/internals/inventory/D1472.md)).
 - 🟡 **B13. Well-known-symbol dispatch.** REMAINING: callable objects (`"()"`).
 - ⬜ **B13a. Multi-index matrix idiom** (low priority). Single-bracket `m[i, j]` → multi-arg
   `"[]"`/`"[]="` + flat-backed `Matrix`/`Grid` type. Nested `m[i][j]` already composes today —

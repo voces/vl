@@ -767,6 +767,26 @@ let printCstrTy: i32[] = []
 let printCstrIx: i32[] = []
 let printCstrFn: i32[] = []
 
+// EVERY `__array_new_default__(n)` CALL — its node, and the array-hole row it returned.
+// `array.new_default` writes each slot's ZERO, so the intrinsic's element type is decided by
+// what pins its hole, and neither answer is available where the call is checked: the
+// destination pins AFTER the call's own type is returned (`constrainEmptyD`), and a hole
+// nothing pins is only known to be unpinned once its scope closes. Both questions are
+// therefore asked LATE — `flushUninferred` defaults an unpinned hole to `i32`, and
+// `checkArrayNewDefaultElems` refuses a pinned element that has no zero. Keyed by the CALL
+// rather than by the delivery, so every syntactic position is covered by one pass. D1470.
+let arrDefCallIx: i32[] = []
+let arrDefCallTy: i32[] = []
+
+// TWO OPEN ARRAY HOLES THAT MET AT A STORE (`b = a` between two un-annotated bindings, and
+// every other position `constrainEmpty` covers). Neither pins the other at the time, and a
+// later use pins only ONE of the two rows — so a DEFAULT applied to the other silently
+// disagrees with it. Recorded as an unordered pair and read by `arrDefHoleToI32` before it
+// reaches for `i32`. Only the intrinsic's own rows consult it, which is why this is a side
+// list and not a union-find over the arena. D1470.
+let holeLinkA: i32[] = []
+let holeLinkB: i32[] = []
+
 // DEFERRED RETURN-TYPE constraints — the DECLARED return re-asked at the pin, because neither
 // layer owns the question in the body: `assignable(T, V)` is vacuous over a hole, so
 // `checkRetStmtNode`'s mismatch check passes, and `substTyDeep` then hands the substituted
@@ -1373,8 +1393,16 @@ function constrainEmptyD(srcTy: i32, dstTy: i32, depth: i32) {
   if s is TyArray {
     if d is TyArray {
       if s.aElem < 0 {
-        s.aElem = d.aElem
-        tyMutEpoch = tyMutEpoch + 1 // in-place element pin — canonical keys change
+        // BOTH SIDES OPEN is not a pin, it is a LINK — `s.aElem = d.aElem` writes the `-1`
+        // back and loses the fact that these two rows must agree. Nothing read that fact
+        // until an unpinned hole acquired a DEFAULT (`arrDefHoleToI32`), which without the
+        // link defaults one side while a later use pins the other to something else. D1470.
+        if d.aElem < 0 {
+          noteHoleLink(srcTy, dstTy)
+        } else {
+          s.aElem = d.aElem
+          tyMutEpoch = tyMutEpoch + 1 // in-place element pin — canonical keys change
+        }
       } else {
         constrainEmptyD(s.aElem, d.aElem, depth - 1)
       }
@@ -1415,6 +1443,143 @@ function constrainEmptyD(srcTy: i32, dstTy: i32, depth: i32) {
   0
 }
 
+// An `__array_new_default__` hole that NOTHING pinned, defaulted to `i32` in place — true when
+// this row was one, false for every other unresolved hole. `array.new_default` promises the
+// element's zero and says nothing about which element, so a binding no annotation and no use
+// ever pins is not underdetermined the way `const xs = []` is: `i32` is the base scalar, the
+// rep the emitter has always built for this intrinsic, and the one every consumer of the
+// resulting list already reads. Asked from `flushUninferred`, i.e. only after every pin has
+// had its chance, so a `.push(1.5)` or an `xs[0] = 1.5` still decides the element instead.
+// D1470.
+function arrDefHoleToI32(ty: i32) {
+  if ty < 0 { return false }
+  let j = 0
+  while j < arrDefCallTy.length {
+    if arrDefCallTy[j] == ty {
+      const t = T.tys[ty]
+      if t is TyArray {
+        if t.aElem < 0 {
+          const partner = holeLinkElemOf(ty)
+          if partner >= 0 { t.aElem = partner } else { t.aElem = TY_I32 }
+          tyMutEpoch = tyMutEpoch + 1 // in-place element pin — canonical keys change
+          return true
+        }
+      }
+      return false
+    }
+    j = j + 1
+  }
+  false
+}
+
+// Record that the two array rows `a` and `b` must carry the same element. Deduped, because
+// one `b = a` inside a loop body is checked once but a repeated store spelling is not.
+function noteHoleLink(a: i32, b: i32) {
+  if a < 0 || b < 0 || a == b { return 0 }
+  let i = 0
+  while i < holeLinkA.length {
+    if holeLinkA[i] == a && holeLinkB[i] == b { return 0 }
+    if holeLinkA[i] == b && holeLinkB[i] == a { return 0 }
+    i = i + 1
+  }
+  holeLinkA.push(a)
+  holeLinkB.push(b)
+  0
+}
+
+// The element a row LINKED to `ty` resolved to, or -1. ONE HOP, in both directions: a chain
+// of three still-open bindings takes the `i32` default, which is the honest answer for it —
+// nothing in that chain ever said otherwise. The pairs are read at flush time, i.e. after
+// every pin, so a partner that was going to resolve already has.
+function holeLinkElemOf(ty: i32) {
+  let i = 0
+  while i < holeLinkA.length {
+    let other = -1
+    if holeLinkA[i] == ty { other = holeLinkB[i] }
+    if holeLinkB[i] == ty { other = holeLinkA[i] }
+    if other >= 0 {
+      const o = T.tys[other]
+      if o is TyArray {
+        if o.aElem >= 0 { return o.aElem }
+      }
+    }
+    i = i + 1
+  }
+  -1
+}
+
+// Does the element type `el` have a ZERO — a default value that is itself a member of `el`?
+// The scalars do (`0` / `0.0` / `false`), and nothing else in the language does: `string` is
+// non-nullable with no empty default the rest of the language recognises (`let s: string` is a
+// definite-assignment error, not `""`), and a struct / variant / closure / map / nested list /
+// union / nullable element would get a WasmGC null or a niche sentinel that is not a member of
+// its own type. This is the DESIGN's answer to what `__array_new_default__` means, so it is a
+// plain `tErr` and not a lowering concession — `__array_new__(n, fill)` serves the rest. D1470.
+function elemHasZero(el: i32) {
+  const p = primNameOf(el)
+  if p == "i32" { return true }
+  if p == "boolean" { return true }
+  if p == "u8" { return true }
+  if p == "f64" { return true }
+  if p == "i64" { return true }
+  if p == "f32" { return true }
+  if p == "string" { return false }
+  // `void` / `null` / `never` cannot be an element type at all, so they arrive here the way
+  // a struct or a closure element does — through the `null` a non-primitive answers.
+  if p == "void" { return false }
+  if p == "null" { return false }
+  if p == "never" { return false }
+  false
+}
+
+// An element type this pass must NOT judge: a `TyErr` (its own diagnostic was already
+// raised, and a second one on the same expression is the cascade `TyErr` exists to stop) or
+// a `TyVar` (a generic body's hole — the instance decides, so the question has no answer
+// here). Both answer `false` to `elemHasZero`, which is why they need naming ahead of it.
+function arrDefElemDeferred(el: i32) {
+  if el < 0 { return true }
+  const t = T.tys[el]
+  if t is TyErr { return true }
+  t is TyVar
+}
+
+// Grade every `__array_new_default__` call once the pins are all in: an element with no zero
+// is refused HERE, at the checker, because the emitter reaching it would have built the i32
+// backing under a destination of some other rep — `vl check` rc 0 and invalid wasm, which is
+// what this arm used to produce at `f64[]`, `string[]`, `S[]`, `i32[][]` and `(i32 | null)[]`.
+// A still-open hole is pinned to `i32` so the arena says what the emitter builds.
+//
+// KEYED BY THE CALL, WHICH IS WHY IT IS ONE PASS AND NOT ONE PER DELIVERY. The refusal is a
+// property of the value, so a checker gate written at the binding would have to be re-written
+// at the return, the argument, the field, the element, the map value and the global — the
+// position matrix D965 paid for. `scripts/capability-probes/matrix/array-new-default-f64.matrix.vl`
+// is the standing grade of that claim.
+function checkArrayNewDefaultElems() {
+  let i = 0
+  while i < arrDefCallTy.length {
+    const t = T.tys[arrDefCallTy[i]]
+    if t is TyArray {
+      if t.aElem < 0 {
+        t.aElem = TY_I32
+        tyMutEpoch = tyMutEpoch + 1 // nothing pinned it — the intrinsic's base element
+      } else if arrDefElemDeferred(t.aElem) {
+        // An ERROR element already has its own diagnostic and a HOLE element is a generic
+        // body's, where this question has no answer until the pin — the same deferral every
+        // other floor in this file makes over a `TyVar` (see `notePrintCstr`).
+      } else if !elemHasZero(t.aElem) {
+        tErr(
+          "__array_new_default__ fills every slot with the element's default value, and " +
+            tyToStr(t.aElem) +
+            " has none — use __array_new__(n, fill)",
+          arrDefCallIx[i],
+        )
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
 // Flush every pending binding recorded at scope `depth` (called just before the
 // scope is popped, and for the global scope at program end). A binding whose hole is
 // still open at this point will never be pinned, so report the unified
@@ -1428,10 +1593,14 @@ function flushUninferred(depth: i32) {
   while i < pendNames.length {
     if pendDepths[i] == depth {
       if unresolvedHole(pendTys[i]) {
-        tErr(
-          "cannot infer a type for '" + pendNames[i] + "' — add a type annotation",
-          pendAts[i],
-        )
+        if !arrDefHoleToI32(pendTys[i]) {
+          tErr(
+            "cannot infer a type for '" +
+              pendNames[i] +
+              "' — add a type annotation",
+            pendAts[i],
+          )
+        }
       }
     } else {
       keepN.push(pendNames[i])
@@ -3135,6 +3304,10 @@ export function initChecker() {
   printCstrTy = []
   printCstrIx = []
   printCstrFn = []
+  arrDefCallIx = []
+  arrDefCallTy = []
+  holeLinkA = []
+  holeLinkB = []
   retCstrGot = []
   retCstrWant = []
   retCstrIx = []
@@ -22633,9 +22806,11 @@ function checkCallNode(n: Call, ix: i32) {
       }
       return mkArrayTy(checkNode(anArgs[1]))
     }
-    // `__array_new_default__(n)`: `n` zeroed/default slots. The element type is
-    // a HOLE (-1) pinned by the annotation — the empty-`[]` mechanism (host: the
-    // fresh element hole returned by `typeFromExpression`).
+    // `__array_new_default__(n)`: `n` zeroed/default slots. The element type is a HOLE (-1)
+    // pinned by the destination — the empty-`[]` mechanism, and the emitter reads the SAME
+    // pinned row back off this node (`arrNewDefaultKind`), so the two cannot disagree about
+    // the rep. The two questions this arm cannot answer yet — an element with no zero, and a
+    // hole nothing pins — are recorded here and asked late; see `arrDefCallIx`.
     if cfn.identName == "__array_new_default__" {
       const adArgs = n.callArgs
       if adArgs.length != 1 {
@@ -22653,7 +22828,10 @@ function checkCallNode(n: Call, ix: i32) {
           )
         }
       }
-      return mkArrayTy(-1)
+      const adTy = mkArrayTy(-1)
+      arrDefCallIx.push(ix)
+      arrDefCallTy.push(adTy)
+      return adTy
     }
     // `__array_copy__(dst, dstAt, src, srcAt, count)`: bulk-move `count`
     // elements from `src[srcAt..]` into `dst[dstAt..]`; void. dst/src must be
@@ -28471,6 +28649,8 @@ export function checkProgram(rootIx: i32) {
   // The global scope (depth 0) is never popped, so flush its un-annotated
   // empty-collection bindings here: any still-open hole is genuinely uninferable.
   flushUninferred(0)
+  // …and with every pin now in, grade what `__array_new_default__` was asked to default.
+  checkArrayNewDefaultElems()
   // Rewrite literal/intersection annotation names into the emitter's
   // vocabulary (membership was enforced above; the emitter needs only the
   // runtime representation). Names without those constructs are untouched.
