@@ -251,6 +251,70 @@ def p_closure_capture(t, face):
     return assemble(t, body=body)
 
 
+# --- module-scope BLOCKS ---------------------------------------------------
+#
+# THE SCOPE THE OTHER TWENTY POSITIONS DO NOT HAVE. Every one of them delivers at module
+# scope or inside a function; none opens a BLOCK whose enclosing scope is the module.
+# D1244 lives exactly there — a closure capturing a ref local declared in a module-scope
+# block is `emitProgram: field access receiver is not a struct`, and the identical block
+# one level inside a function RUNS — so `closure_capture` graded that capability green
+# while the row was live. Three block kinds, because D1244's ablation found `if`, `else`,
+# `while`, `for` and a bare `{ }` all equal, times the capture/plain split: the capture is
+# what the row needs and the plain read is its control.
+#
+# CAVEAT: a bare block after a CALL statement is a PARSE error (D1253 — the brace glues to
+# the call), so a template whose SETUP ends in a call gets a manufactured `block_bare`.
+
+def _block(kind, inner):
+    """Wrap `inner` in a module-scope block. The `while` runs exactly one iteration."""
+    if kind == "if":
+        return ["if true {", ind("\n".join(inner), 2), "}"]
+    if kind == "while":
+        return ["while __i < 1 {", ind("\n".join(inner + ["__i = __i + 1"]), 2), "}"]
+    return ["{", ind("\n".join(inner), 2), "}"]
+
+
+def _in_block(t, face, kind, capture):
+    """The delivery and its proof INSIDE a module-scope block, captured or read plainly."""
+    if capture:
+        inner = [t.bind("__c", t.value, face),
+                 "const __f = () => {", ind("const v = __c\n" + t.proof, 2), "}", "__f()"]
+    else:
+        inner = [t.bind("v", t.value, face), t.proof]
+    pre = ["let __i = 0"] if kind == "while" else []
+    return assemble(t, pre=pre, body=_block(kind, inner))
+
+
+@position("block_if", "the binding inside the block")
+def p_block_if(t, face):
+    return _in_block(t, face, "if", False)
+
+
+@position("block_if_capture", "the captured binding inside the block")
+def p_block_if_capture(t, face):
+    return _in_block(t, face, "if", True)
+
+
+@position("block_while", "the binding inside the block")
+def p_block_while(t, face):
+    return _in_block(t, face, "while", False)
+
+
+@position("block_while_capture", "the captured binding inside the block")
+def p_block_while_capture(t, face):
+    return _in_block(t, face, "while", True)
+
+
+@position("block_bare", "the binding inside the block")
+def p_block_bare(t, face):
+    return _in_block(t, face, "bare", False)
+
+
+@position("block_bare_capture", "the captured binding inside the block")
+def p_block_bare_capture(t, face):
+    return _in_block(t, face, "bare", True)
+
+
 # --- discrimination shapes -------------------------------------------------
 
 def _disc(t, face, shape):

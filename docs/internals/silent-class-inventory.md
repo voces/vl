@@ -14,6 +14,10 @@
 > D1240–D1242; `git grep -nE 'D124[0-2]\b'` on the merged tree found D1240 and D1241
 > already minted, and `scripts/inventory/ls.py --next` answered D1242, so the block moved
 > up by two. Three ids, not a block of 20, because three is what was minted.
+> RESERVED D1251–D1253 — the follow-on session (vl-b7v): the three defects #2420's agent
+> found and could not file, plus the `block_*` position family D1244 asked the harness
+> for. `ls.py --next` answered D1251 and a sweep of every live worktree's inventory put
+> the tree-wide maximum at D1250, so the block starts there. Three ids again, minted.
 
 Every row below was produced by generating a program, running it, and grading the **run
 value** against an expectation computed independently of the compiler. Nothing here is
@@ -38596,8 +38600,9 @@ Ablation:
   workaround makes it worse — `print((a as i32) * 2)` under `function take(a)` is
   **check-clean invalid wasm**, while the annotated twin gets a clear check reject naming the
   fix (``  `as i32` propagates "err" — annotate the enclosing function's return type``). That
-  cell ablates to a DIFFERENT mechanism: it refuses with the `is` guard removed entirely, so
-  it is not this row's family and needs its own id.
+  cell ablates to a DIFFERENT mechanism: it still fails with the `is` guard removed
+  entirely, and with the `* 2` removed too — filed as [D1251](#d1251), whose minimal witness
+  carries no `is` at all.
 
 * **THE POSITION MATRIX.**
   `scripts/capability-probes/matrix/is-complement-hole-param.matrix.vl` (the nullable
@@ -38606,14 +38611,15 @@ Ablation:
   `binding`, `global_init`, `closure_capture`, `is_in_if`/`while`/`and`/`not` and `else_if`
   all RUN un-annotated, which is what confines the row to the PARAMETER. Two cells are other
   rows: `struct_field_init`/un-annotated is [D1242](#d1242), and `map_value`/un-annotated is
-  **check-clean invalid wasm** and unfiled. `orerr-generic-pin.matrix.vl` shows the same two
+  **check-clean invalid wasm**, filed as [D1252](#d1252) — where it ablates away from the map
+  AND from the hole parameter, to a rebind of an already-narrowed nullable. `orerr-generic-pin.matrix.vl` shows the same two
   cells at the literal-union spelling, which is what proves the gap is the complement rather
   than the literal member.
 
 * Probe: `scripts/capability-probes/is-complement-hole-param.vl` (GAP today).
 
-* **Grading list.** The `(a as i32)` silent cell above; `map_value`/un-annotated from this
-  row's matrix; the struct-arm `expected A | {s: _}` message, which should become a narrowing
+* **Grading list.** The `(a as i32)` silent cell above ([D1251](#d1251));
+  `map_value`/un-annotated from this row's matrix ([D1252](#d1252)); the struct-arm `expected A | {s: _}` message, which should become a narrowing
   and not a unification; and the HIT-arm controls, which must keep running.
 
 ### D1244 — a closure capturing a ref local declared in a MODULE-SCOPE block is `emitProgram: field access receiver is not a struct`; the identical block inside a function runs
@@ -38671,15 +38677,22 @@ Ablation:
 
 * Probe: `scripts/capability-probes/module-block-closure-capture-struct.vl` (GAP today).
 
-* **NOT EXPRESSIBLE IN THE POSITION MATRIX.** `matrix.py`'s twenty positions all deliver at
-  module scope or inside a function; none of them opens a module-scope BLOCK, so
-  `closure_capture` grades this capability green while the row is live. That is a gap in the
-  harness, not in this row's evidence — a `block_*` position family is the fix, and until it
-  exists the ablation table above is the matrix.
+* **THE POSITION MATRIX — ADDED FOR THIS ROW, 2026-09-02.** It read "not expressible":
+  `matrix.py`'s twenty positions all delivered at module scope or inside a function and none
+  opened a module-scope BLOCK, so `closure_capture` graded this capability green while the
+  row was live. Six `block_*` positions now exist (`if` / `while` / bare, each with a
+  capture and a plain-read variant, both faces) and all three of this row's reps are graded:
+  `matrix/module-block-capture-struct.matrix.vl` is the LOUD cell — `block_if_capture`,
+  `block_while_capture` and `block_bare_capture` all `emitProgram: field access receiver is
+  not a struct`, with `block_if` / `block_while` RUNS as the control — while
+  `module-block-capture-list` and `-string` put `block_if_capture` and `block_while_capture`
+  into **SILENT**, four cells each. `block_bare_capture` on those two reports
+  [D1253](#d1253)'s floor first, which is why the bare-block cell is not this row's.
 
 * **AND A BARE `{ … }` BLOCK INSIDE A FUNCTION IS ITS OWN REFUSAL**, found while ablating the
   block kinds: `emitProgram: unsupported statement in body`, `vl check` rc 0, on a function
-  body containing nothing but `{ const p: P = { x: 7 } … }`. Unfiled, and not this row.
+  body containing nothing but `{ const p: P = { x: 7 } … }`. Filed as [D1253](#d1253), and
+  not this row.
 
 ### D1191 — a name-keyed UFCS alias LEAKS across modules: an un-exported `self`-function becomes callable from a module that never imported it, while the direct spelling stays `undeclared identifier`
 
@@ -38811,3 +38824,292 @@ Repro (check rc 0, then the engine refuses the module):
   `print(xs.length)` alone is the silent form above; adding `const r = xs[0]` and `if r != null`
   turns it into the loud `emitProgram: bare null needs a struct-typed context`. Grade both
   spellings — a fix that only moves the loud one has moved the worse cell nowhere.
+
+---
+
+### D1251 — a numeric `as` cast on a HOLE parameter is lowered as the IDENTITY: the union box goes straight into the i32 consumer
+
+**check-clean invalid wasm · clause 1 · `vl check` rc 0 then `type mismatch: expected i32, found (ref $type)` · the whole `as` / `as?` / `as!` trio · ZERO corpus cells · filed 2026-09-02 off [D1243](#d1243)'s grading list, minimised and reproduced from scratch on the merged tree**
+
+Repro (`vl check` rc 0; the `as?` and `as!` twins under `function take(a: i32 | null)` both print `5`):
+
+    const u: i32 | null = 5
+
+    function take(a) {
+      print(a as i32)
+    }
+
+    take(u)
+
+* **THE `* 2` AND THE `is` GUARD D1243 NAMED ARE BOTH SCENERY.** The cell D1243 handed over
+  was `print((a as i32) * 2)` inside the else arm of `if a is "err"`. Removing the arithmetic
+  still fails, removing the guard entirely still fails, and the union producer collapses to a
+  module global — five lines instead of ten, with no `is` anywhere. That is why this is not
+  D1243's family: D1243 needs the complement, this needs only the cast.
+
+* **THE OPERAND'S ARENA TYPE IS A `TyVar`, AND BOTH GATES READ IT.** `checkCastNode`
+  (`typecheck.vl:38029`) reaches the trio's union arm only through `if argU >= 0 { const argT
+  = T.tys[argU]; if argT is TyUnion { … } }` — the operand's recorded type — and a hole
+  parameter's is a `TyVar`, so `unionCoversTy` / `subtractTy` / `castPropagationFits` never
+  run. `isNumeric` then answers **true** for a `TyVar` on purpose (`typecheck.vl:7377`: "a
+  checking failure or unresolved hole doesn't cascade a spurious `not a number` error"), so
+  the numeric ladder admits the cast and it types as `i32` with rc 0. The emitter's own gate
+  `asExprIsUnionCast` (`emit_classify.vl:12186`) reads the SAME `nodeTyIxOf(n.asObj)` and
+  declines for the same reason, so `emitAsCast` falls past the union arm and past the
+  exact-or-fail arm to the plain conversion ladder — where source and target are both unnamed
+  and nothing is emitted.
+
+* **THE DISASSEMBLY IS ONE INSTRUCTION LONG** (`vl build --no-validate --names`, then
+  `./node_modules/.bin/wasm-dis`):
+
+      (func $take (type $3) (param $0 (ref $1))
+       (call $__print_i32__
+        (local.get $0)
+       )
+      )
+
+  `$1` is the `(struct (field i32) (field anyref))` box the CALL SITE pinned the parameter
+  to. No unbox, no tag test, no conversion — the box is handed to a consumer whose parameter
+  is `i32`, which is the validator's whole complaint.
+
+* **THE CAST IS NOT ALWAYS A NO-OP, AND THAT IS THE CONTROL.** A hole SOLVED TO A SCALAR
+  lowers correctly: `function take(a) { print(a as i32) }` with `take(2.5)` emits
+  `i32.trunc_f64_s`, and `print(a as f64)` with `take(5)` emits `f64.convert_i32_s`. Only a
+  union-repped argument leaves the box in place, so the defect is the union rep at the hole
+  rather than casts at holes.
+
+* **AND THE SOLVED-TO-`f64` CELL IS A SECOND, QUIETER FACE.** That same
+  `function take(a) { print(a as i32) }` with `take(2.5)` PRINTS `2`, while the annotated
+  `function take(a: f64)` twin is a check reject (`` `as i32` propagates null — annotate the
+  enclosing function's return type ``). The exact-or-fail ruling (D1041 / json-design §6 q2)
+  is bypassed at the hole exactly as the trio's propagation is, so the un-annotated spelling
+  silently keeps the truncating conversion that ruling replaced.
+
+* **THE TRIO, BOTH FACES, AT `i32 | null`** — one program per cell:
+
+| suffix | `function take(a: i32 \| null)` | `function take(a)` |
+| --- | --- | --- |
+| `a as i32` | check reject, `` `as i32` propagates null `` — CORRECT, the enclosing function is void | **check-clean invalid wasm** |
+| `a as? i32` | RUNS, prints `5` | **check-clean invalid wasm** |
+| `a as! i32` | RUNS, prints `5` | **check-clean invalid wasm** |
+
+  So the row is clause 1 in two readings: at `as?`/`as!` a capability the annotated twin HAS
+  is lost, and at bare `as` the checker admits a program its own ruling forbids.
+
+Ablation (each line is one ingredient removed from the repro; `runs` means the defect is gone):
+
+| ingredient removed | outcome | needed? |
+| --- | --- | --- |
+| the hole (`function take(a: i32 \| null)`) | check reject, naming the fix | **yes** |
+| the union (`take(5)` into `function take(a)`) | runs, prints 5 | **yes** |
+| the cast (`print(a)`) | runs, prints 5 | **yes** |
+| the parameter (an inferred LOCAL `const a = u`) | check reject, naming the fix | **yes** |
+| the arithmetic (D1243's `* 2`) | still fails | no |
+| the `is` guard (D1243's `if a is "err" { … } else { … }`) | still fails | no |
+| the call producer (`orErr(false)` → a module global) | still fails | no |
+| the literal arm (`i32 \| "err"`, `i32 \| string`) | still fails | no |
+| the suffix (`as?`, `as!`) | still fails | no |
+| the target width (`as i64`, `as f64`) | still fails | no |
+| the delivery (`const b = a as i32`, `return a as i32`, `f(a as i32)`) | still fails | no |
+| ADDED: an early-return `if a is null { return }` before the cast | runs, prints 5 | rescue (only at `null`) |
+
+* **BOTH FACES.** Annotated: RUNS at `as?`/`as!`, a correct loud check reject at bare `as`.
+  Un-annotated: `check-clean invalid wasm` at all three. `as string` at the hole is the one
+  loud cell — `` `as` supports numeric conversions only `` — which is the numeric ladder's
+  TARGET test firing, and it proves the operand passed `isNumeric` on the way there.
+
+* **THE POSITION MATRIX, BY HAND.** `matrix.py` has no position that delivers a value into a
+  hole PARAMETER's body — `argument` annotates the parameter, so its un-annotated face is
+  exactly this row and there is no sibling to vary — so the three positions were run by hand:
+
+| position | annotated | un-annotated (the hole) |
+| --- | --- | --- |
+| argument (`function take(a) { print(a as i32) }`) | check reject (correct) | **check-clean invalid wasm** |
+| binding (`const a = u` then `print(a as i32)`) | check reject | check reject — the SAME message |
+| early-return guard, `is null` | RUNS, prints 5 | RUNS, prints 5 |
+| early-return guard, `is "err"` over `i32 \| "err"` | RUNS, prints 5 | **check-clean invalid wasm** |
+
+  The binding row is what confines this to the PARAMETER: a hole LOCAL still gets the loud
+  refusal. And the two guard rows are the split worth keeping — an `is null` guard pins the
+  hole to the unboxed scalar and rescues the cast, while the literal-arm guard does not,
+  which is [D1243](#d1243)'s complement showing through.
+
+* Probe: `scripts/capability-probes/numeric-as-cast-hole-param.vl` (GAP today, at the `as!`
+  spelling, whose annotated twin runs).
+
+* **Grading list.** All three suffixes at the hole; the `take(2.5)` cell that prints `2`
+  where the annotated twin refuses; the `as string` loud cell, which must stay loud; the four
+  position cells above, including the two guard rows and their split; and the
+  solved-to-scalar controls (`i32.trunc_f64_s` / `f64.convert_i32_s`), which must keep
+  running.
+
+### D1252 — a REBIND of an already-narrowed nullable, re-tested with `is null`, reads the complement arm through a union UNBOX on a scalar slot
+
+**check-clean invalid wasm · clause 1 · `type mismatch: expected (ref null $type), found i32` · the four numeric value-niche reps only · ZERO corpus cells · found 2026-09-02 by `matrix/is-complement-hole-param.matrix.vl` at `map_value`/un-annotated, and ABLATED away from both the map and the hole parameter it was found under**
+
+Repro (prints `5` when the rebind is annotated `const v: i32 | null = u`):
+
+    const u: i32 | null = 5
+    if u != null {
+      const v = u
+      if v is null { print(0) } else { print(v) }
+    }
+
+* **THE MAP IS NOT AN INGREDIENT, AND NEITHER IS THE HOLE PARAMETER.** The cell the harness
+  handed over was a bare `Map()` carrying `i32 | null`, read back under `!= null`, rebound
+  and re-tested. Deleting the map keeps the failure; ANNOTATING the map (`const __m: {
+  [string]: i32 | null } = Map()`) keeps it too, so `map_value`'s face was not the axis
+  either. What is left is three statements: a narrowing, a rebind inside it, and a second
+  `is null` over the rebind. This is "a validator sentence is not a mechanism" one level out
+  — the POSITION a cell was found at is not its mechanism either.
+
+* **THE CHECKER KNOWS `v` IS `i32` AND ADMITS `v is null` ANYWAY.** `if v != null` in the
+  same place is a loud check reject — `cannot compare i32 with null` — so the narrowing DID
+  reach the rebind and the `!=` operator reads it. `v is null` is accepted at the same site.
+  One null test agrees with the narrowing; the other does not.
+
+* **THE FAILING INSTRUCTION IS THE COMPLEMENT ARM'S READ, NOT THE TEST.** With neither arm
+  reading `v` the program runs, and its disassembly shows the rebind unboxed and the test
+  already const-folded:
+
+      (local.set $0
+       (struct.get $2 0
+        (ref.cast (ref $2)
+         (struct.get $1 1
+          (global.get $global$0)))))
+      (if
+       (i32.const 0)
+       (then)
+       (else
+        (call $__print_i32__
+         (i32.const 1))))
+
+  `v`'s slot is the unboxed `i32` and `v is null` folded to `i32.const 0` — both correct. Put
+  a READ of `v` in the complement arm and the module stops validating with `expected (ref
+  null $type), found i32`, which is the shape of a `struct.get` applied to that local. The
+  ANNOTATED twin's disassembly carries exactly that instruction in exactly that place: its
+  `v` IS the box, its test reads the tag (`(i32.eq (struct.get $0 0 (local.get $0)) (i32.const
+  6))`), and its else arm unboxes with `(struct.get $1 0 (ref.cast (ref $1) (struct.get $0 1
+  (local.get $0))))`. The invalid module cannot be disassembled — binaryen's parser stops at
+  the offset the validator names — so the annotated twin is what identifies the borrowed
+  lowering, and the validator's own sentence is what places it.
+
+* **IT IS THE FOUR NUMERIC VALUE-NICHE REPS, AND ONLY THOSE.** `i32`, `i64`, `f32` and `f64`
+  arms all fail; `string`, a struct, `i32[]` and `boolean` all run. Those four are exactly
+  the arms `isValueUnionName`'s solo rule admits — the ones whose `T | null` is a BOXED value
+  union rather than a nullable ref or a sentinel niche.
+
+Ablation:
+
+| ingredient removed | outcome | needed? |
+| --- | --- | --- |
+| the outer narrowing (`const v = u` at top level) | runs, prints 5 | **yes** |
+| the rebind (test `u` itself twice) | runs, prints 5 | **yes** |
+| the second test (`print(v)` only) | runs, prints 5 | **yes** |
+| the complement arm's READ (`print(1)` in the else) | runs, prints 1 | **yes** |
+| ADDED: the annotation on the rebind, `const v: i32 \| null = u` | runs, prints 5 | rescue |
+| the map the cell was found in | still fails | no |
+| the hole parameter the cell was found in | still fails | no |
+| the outer test's spelling (`!(u is null)`, `u == null` + else) | still fails | no |
+| the inner test's shape (`else if`, `while`, `&&`, `!(v is null)`) | still fails | no |
+| `const` → `let` on the rebind | still fails | no |
+| the module scope (the same four lines inside a function) | still fails | no |
+| the source (a call result, a parameter, a function-local `const`) | still fails | no |
+| one rebind → two (`const w = v`) | still fails | no |
+
+* **BOTH FACES.** Annotated (`const v: i32 | null = u`): RUNS, prints `5`. Un-annotated:
+  `check-clean invalid wasm`. The rescue is the annotation putting the rebind back on the box
+  rep the `is null` lowering assumes — the reverse of the usual direction, and worth saying
+  out loud: here the ANNOTATION is what agrees with the emitter and INFERENCE is what is
+  right about the type.
+
+* **TWO NEIGHBOURS THAT ARE NOT THIS ROW.** `v is i32` and its complement both run, so the
+  row is `is null` specifically. And moving the rebind OUTSIDE the narrowing (`const v = u`
+  before the `if`) is a loud emit reject instead — ``emitProgram: `is` names a type that is
+  not a union variant`` — a different arm reached by a differently-typed rebind.
+
+* Probe: `scripts/capability-probes/narrowed-rebind-is-null-complement.vl` (GAP today).
+
+* **Grading list.** The four numeric reps, one cell each; the `string` / struct / `i32[]` /
+  `boolean` controls, which must keep running; `v != null`'s loud check reject, which must
+  stay loud (or become a run) rather than joining `is null` in silence; the
+  outside-the-narrowing rebind's ``  `is` names a type that is not a union variant ``; and
+  [D1243](#d1243)'s `map_value`/un-annotated cell, which is where this was found.
+
+### D1253 — a bare `{ … }` block is `emitProgram: unsupported statement in body` at EVERY scope, while the parser mints it deliberately and the checker gives it a scope
+
+**loud emit reject · clause 2 · `vl check` rc 0 · every scope and every content · ZERO corpus cells · noted in [D1244](#d1244) while ablating the block kinds, filed 2026-09-02 with its own witness**
+
+Repro (`vl check` rc 0; deleting the two braces prints `7`):
+
+    function go() {
+      {
+        print(7)
+      }
+    }
+
+    go()
+
+* **THE PARSER MINTS A `Block` ON PURPOSE.** `Block = { blkStmts: i32[], pos: i32 }`
+  (`ast.vl:207`), and `parseStmt` dispatches to it in as many words: "A `{` at statement
+  position is a BLOCK, UNLESS it shapes up as an object literal" (`parser.vl:3273`), with
+  `looksLikeObject` as the tie-break. This is not a construct the grammar admits by accident
+  — it has a node, a dispatch, and a documented disambiguation.
+
+* **AND THE CHECKER GIVES IT ITS OWN SCOPE.** `{ const n = 7 } … const n = 9` type-checks
+  with no redeclaration error and the block's `n` collects its own `[WARNING]: Unused
+  variable n`. Two of the three phases already implement the construct; only `emitStmt` has
+  no arm for a `Block` that a statement position OWNS — it handles one only where an `if` arm
+  or a loop body owns it — and falls to the floor at `wasmEmit.vl:20536`.
+
+* **CONTENT IS NOT AN INGREDIENT, AND NEITHER IS SCOPE.** Empty, a `print`, a local, an
+  annotated struct local, an un-annotated one, a closure, a nested block, a block inside an
+  `if`, a `while`, a `for`, a lambda body, and module scope — twelve spellings, one sentence.
+  The only edit that changes the outcome is deleting the braces.
+
+* **THE MODULE-SCOPE TWIN IS THE SAME REFUSAL, AND [D1244](#d1244) IS THE OTHER HALF.** A
+  module-scope `{ const n = 7  print(n) }` is this row's sentence. D1244 is the module-scope
+  block that CAPTURES a ref local into a closure, which refuses one message earlier —
+  `emitProgram: field access receiver is not a struct` at the struct rep, check-clean invalid
+  wasm at `i32[]` and `string`. Where a bare block and a capture meet, this row's floor fires
+  first: `block_bare_capture` on the `module-block-capture-list` and `-string` templates
+  reports `unsupported statement in body`, not D1244's cell.
+
+* **THE HARNESS GRADES IT NOW.** `matrix.py`'s new `block_bare` position is this row at every
+  template under `matrix/`: **18 of 18 cells** — nine templates, both faces — report
+  `emitProgram: unsupported statement in body`. That is what a floor with no exceptions looks
+  like from the matrix, and it is the cheapest available proof that content and capability
+  are both irrelevant to it.
+
+* **AND A BARE BLOCK AFTER A CALL STATEMENT IS A PARSE ERROR INSTEAD**, found while ablating
+  the preceding statement: `print(1)` on one line and `{` on the next inside a function body
+  is `vl check` rc 1 with `` expected an identifier but found `1` ``, pointing INTO the
+  call's argument list. A `const`, an assignment or a `;` after the call all restore the
+  block reading, and at module scope the same pair parses. It is loud, it is not this row,
+  and it is why `matrix.py`'s `block_bare` carries a caveat about a template whose
+  `@@SETUP@@` ends in a call.
+
+Ablation:
+
+| ingredient removed | outcome | needed? |
+| --- | --- | --- |
+| the braces (`print(7)` in the body) | runs, prints 7 | **yes** |
+| the block, replaced by `if true { … }` | runs, prints 7 | **yes** |
+| the block, replaced by a one-iteration `while` | runs, prints 7 | **yes** |
+| the enclosing function (the same block at module scope) | still refuses | no |
+| the enclosing function, replaced by a lambda | still refuses | no |
+| the block's content (empty, a local, a closure, a nested block) | still refuses | no |
+| the annotation on a struct local inside it | still refuses | no |
+| the block's position (inside an `if`, a `while`, a `for`; before or after a `const`) | still refuses | no |
+
+* **BOTH FACES.** The annotation is not a face here, as in [D1244](#d1244): `{ const p: P = {
+  x: 7 } … }` and `{ const p = { x: 7 } … }` refuse identically, and so does a block with no
+  binding at all. Nothing about the block's contents moves the outcome, which is what a
+  MISSING EMIT ARM looks like as opposed to a rep disagreement.
+
+* Probe: `scripts/capability-probes/bare-block-statement.vl` (GAP today).
+
+* **Grading list.** The twelve spellings above; the module-scope twin; the `block_bare` and
+  `block_bare_capture` cells on all nine matrix templates; the checker's own scoping (the
+  block's `n` must keep NOT colliding with an outer `n` once the emitter has an arm); and the
+  call-then-block parse error, which is a separate question this row's close does not answer.

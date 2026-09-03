@@ -67,7 +67,16 @@ A `matrix/*.matrix.vl` is `// @@SECTION@@` blocks: `@@PRELUDE@@`, `@@VALUE@@`, `
 `@@WANT@@`, and either `@@PROOF@@` or `@@TEST@@`/`@@HIT@@`/`@@MISS@@` — the latter also
 unlocks the six discrimination positions. `@@SETUP@@`/`@@GUARD@@`/`@@FALLBACK@@` deliver a
 NARROWED value; `@@SKIP@@` takes `position: reason`. `matrix.py`'s docstring is the spec and
-`--list-positions` prints the twenty and what each face annotates.
+`--list-positions` prints the twenty-six and what each face annotates.
+
+**The `block_*` six were added for D1244**, whose shape — a closure capturing a ref local
+declared in a MODULE-SCOPE block — none of the original twenty could reach, so
+`closure_capture` graded that capability green while the row was live. They deliver inside a
+module-scope `if true`, a one-iteration `while`, and a bare `{ }`, each with a capture and a
+plain-read variant. Every template is now red at `block_bare` (D1253's floor: a bare block is
+`unsupported statement in body` at every scope) and at `block_*_capture` for any ref rep, so
+those cells are D1244/D1253 speaking, not the template's own capability — read them as the
+harness reporting two standing rows rather than as a finding about the value under test.
 
 Grading is `run.py`'s, imported not copied. It exits non-zero on `runs -> not-runs` between
 two seeds or any `SILENT` after, so **a brief runs it before the fix and after it** and
