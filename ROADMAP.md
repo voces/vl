@@ -129,6 +129,12 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   `docs/internals/{parser,format,emit-sections}-notes.md`. `emit_bytes.vl` and the large
   emitter/checker files come later, under a freeze; the lint + ratchet
   (`scripts/comment-budget.py`) lands separately.
+- **Modernization program, item 3 — the defect inventory is ONE FILE PER ROW. TOOLING SHIPPED;
+  the split itself lands on merge day.** `scripts/inventory/split.py --apply --relink` run
+  against fresh master, under a freeze on inventory appends; every consumer already reads
+  either form, so nothing else changes that day. Two gates came out of it:
+  `tests/vl_inventory_refs_test.ts` (a cited row must EXIST — #2405 deleted a row and every
+  gate stayed green) and the file-stem check in `vl_inventory_rows_test.ts`.
 - **Width subtyping — RULED (owner, 2026-09-01): the non-prefix refusal is a GAP, closed
   the Roc way** — shape-monomorphization of narrow-typed consumers (offsets constant per
   caller shape; zero runtime cost; paid in instance count — the variant-count tradeoff

@@ -14,10 +14,14 @@ hand-retyped witness that differs in one type is a different program, and gradin
 you nothing about the row.
 
 USAGE
+    python3 scripts/check-filed-witnesses.py docs/internals/inventory
     python3 scripts/check-filed-witnesses.py docs/internals/silent-class-inventory.md
-    python3 scripts/check-filed-witnesses.py --json out.json <doc>...
-    python3 scripts/check-filed-witnesses.py --strict <doc>...
+    python3 scripts/check-filed-witnesses.py --json out.json <doc-or-dir>...
+    python3 scripts/check-filed-witnesses.py --strict <doc-or-dir>...
     python3 scripts/check-filed-witnesses.py --self-test
+
+An argument may be a MONOLITH or a DIRECTORY of one-row files — see `resolve`. Both grade
+identically, which is what lets the gate command stay put while the split lands.
 
 `--self-test` proves the outcome vocabulary can be made to fire on demand, on three
 specimens whose outcome is known by construction. A classifier that has never been seen
@@ -269,6 +273,38 @@ SEC = re.compile(r"^#{2,4}\s+(D\d+(?:-?[A-Za-z][A-Za-z0-9]*)?|[A-Z]\d+)\s+[—-]
 # one of these; any it misses is a row the grader cannot see.
 ROWHEAD = re.compile(r"^#{2,4}\s+D\d")
 
+# A DOC ARGUMENT MAY BE A DIRECTORY OF ONE-ROW FILES. The inventories are moving to
+# `docs/internals/inventory/D1042.md`, one file per row, because every defect PR appended to
+# one file's tail and two concurrent PRs conflicted there nearly every hour — once splicing
+# two rows into the middle of a third. BOTH forms read the same here, so the gate command
+# does not change on merge day: a directory holding `D*.md` is that many one-row docs, and a
+# directory holding none yet falls back to the monolith named in its own README. One source
+# of truth for that mapping, written and read by `scripts/inventory/split.py`.
+SOURCE_MARK = re.compile(r"^<!--\s*inventory-split:\s*source\s+(\S+)\s*-->\s*$", re.M)
+
+
+def row_id_key(rid):
+    """Sort `D9` before `D10`, and `D661` before `D661A`."""
+    m = re.match(r"^([A-Za-z]+)(\d+)(.*)$", rid or "")
+    return (m.group(1), int(m.group(2)), m.group(3)) if m else (rid or "", 0, "")
+
+
+def resolve(arg):
+    """A doc path as given, or the row files under a directory, in id order."""
+    p = Path(arg)
+    if not p.is_dir():
+        return [arg]
+    files = sorted(p.glob("D*.md"), key=lambda f: row_id_key(f.stem))
+    if files:
+        return [str(f) for f in files]
+    readme = p / "README.md"
+    m = SOURCE_MARK.search(readme.read_text()) if readme.exists() else None
+    if not m:
+        raise SystemExit(f"{arg}: holds no `D*.md` rows, and {readme} carries no "
+                         f"`<!-- inventory-split: source ... -->` line to fall back to")
+    return [m.group(1)]
+
+
 def unparsed_row_heads(doc):
     """Row-shaped headings `SEC` failed to parse — the grader's blind spot, named."""
     out = []
@@ -363,7 +399,7 @@ def main(argv):
         print(__doc__); return 2
 
     results, moved, ungradable, unparsed = [], [], [], []
-    for doc in docs:
+    for doc in [d for arg in docs for d in resolve(arg)]:
         for ln_no, head in unparsed_row_heads(doc):
             unparsed.append((doc, ln_no, head))
         for r in parse(doc):
