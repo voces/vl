@@ -38066,11 +38066,14 @@ Repro:
   arms inline, and with both arms aliases, each print `x` — so the gap is specific to a field
   the unification promoted, and did not exist before D1050 closed (before it, the whole
   program was D1050's own refusal).
-### D1210 — an UN-ANNOTATED binding of a NESTED-list `.pop()` is check-clean invalid wasm, and its `!= null` / `??` spellings are loud — the one rep [D1174](#d1174)'s box does not reach
+### D1210 — [CLOSED 2026-09-02] an UN-ANNOTATED binding of a NESTED-list `.pop()` is check-clean invalid wasm — the one rep [D1174](#d1174)'s box does not reach
 
-**check-clean invalid wasm (`type mismatch: expected i32, found (ref $type)`) · check rc 0 ·
-clause 1 · OPEN · found 2026-09-02 as the named RESIDUE of [D1140](#d1140)'s grid, and
-PRE-EXISTING: byte-identical on the published `seed-latest`**
+**runs, prints `1` — CLOSED 2026-09-02 by the MEMBER-callee leg the three nullable-list
+classifiers never had (`popRefElemKind` / `popRefRecvSlot`, at kinds 4 / 6-7-8-10 / 9 plus the
+inner-slot row a nested-ref pop binds) · was check-clean invalid wasm, clause 1 · a 38-cell
+position x face matrix goes 23 → 32 `runs`, zero lost, zero silent · corpus unmoved · fixture
+`lists/pop-nested-list-inferred.vl`, probe `pop-nested-list-inferred-binding.vl`
+(GAP → RUNS)**
 
 Repro (check rc 0; the module the engine refuses to load):
 
@@ -38101,13 +38104,35 @@ Repro (check rc 0; the module the engine refuses to load):
   `bare null needs a struct-typed context`), and `xs.pop() ?? [0]` (loud
   `` `??` over this nullable value is not supported ``).
 
----
-### D1211 — `u8[].pop()` in value position refuses at three of four delivery spellings, and the annotated one is a DESIGN reject
+* **THE FIX IS THE INFERENCE ARM THE ROW PREDICTED, AND IT IS FIVE ELEMENT KINDS WIDE.**
+  `string[][]` / `f64[][]` / `i64[][]` / `f32[][]` are the same hole in
+  `exprNulScalarListKind`, and `S[][]` the same hole in `exprNullableRefArray`; each is one
+  line against the shared receiver-slot resolver. Unlike the `Index` arms beside them this
+  asks NO `rlElemNullable` bit — a pop is nullable by construction, so the EMPTINESS carries
+  the null and the element slot need not.
 
-**loud emit reject (`emitProgram: bare null needs a struct-typed context` / `` `??` over this
-nullable value is not supported ``) · check rc 0 · clause 2 · OPEN · found 2026-09-02 as the
-named RESIDUE of [D1140](#d1140)'s grid, and PRE-EXISTING: identical on the published
-`seed-latest`**
+* **`S[][]` NEEDED THE INNER-SLOT ROW AS WELL AS THE KIND**, and the kind alone moved the cell
+  from one loud message to another (`bare null needs a struct-typed context` ->
+  `ref valtype with no interned shape`). `nulRefArrayInnerSlot` resolves a kind-18 binding's
+  inner ref list from an annotation, an `Index` or a declared-return call; a `.pop()` reaches
+  the same answer through the receiver slot's own inner row, which is what makes the
+  un-annotated face run.
+
+* **MEASURED SEPARATE FROM ITS THREE NEIGHBOURS, BOTH DIRECTIONS.** The four witnesses of
+  D1210 / [D1211](#d1211) / [D1212](#d1212) / [D1241](#d1241) were graded at every commit of
+  the closing branch and each moves at exactly its own commit and no other; D1211 and D1210
+  landed together and split cleanly by FILE (`typecheck.vl` alone closes D1211 and leaves
+  D1210 silent; `emit_classify.vl` alone does the reverse). Four mechanisms, not one family.
+
+---
+### D1211 — [CLOSED 2026-09-02] `u8[].pop()` in value position refuses at three of four delivery spellings, and the annotated one is a DESIGN reject
+
+**runs, prints `1` — CLOSED 2026-09-02 by `arrElemValueTy`, the ONE HOME of the widened-read
+rule `checkIndexNode` already applied inline: `.pop()` / `.get(i)` now answer
+`mkNullableTy(arrElemValueTy(elem))`, so a `u8[]` pop is `i32 | null` · was a loud emit
+reject, clause 2 · a 38-cell position x face matrix goes 0 → 33 `runs`, zero lost, zero
+silent · distilled corpus unmoved, rep-fuzz exact · fixture `lists/pop-u8-list-widened.vl`,
+probe `pop-u8-list-null-discriminated.vl` (GAP → RUNS, runner 74/90 → 75/90)**
 
 Repro (check rc 0; the emitter refuses):
 
@@ -38133,23 +38158,39 @@ Repro (check rc 0; the emitter refuses):
   over a `u8[]` to be typed `i32 | null` in `typecheck.vl`, and that is a checker change with
   its own witness.
 
+* **THE RETAINED CANDIDATE'S WARNING WAS A CITATION WITH A DATE ON IT, AND THE DATE EXPIRED.**
+  The D1141/D1142 agent measured the checker widening ALONE moving 4 cells `runs -> SILENT`
+  because `popBoxAtomKind` still excluded `u8`, and concluded the box arm had to land in the
+  same commit. That was true of the D1140-era candidate, whose `popBoxAtomKind` asked the
+  RECEIVER's rep. [D1174](#d1174) then shipped a DIFFERENT architecture: `emitPopNulBox` keys
+  on `tyNulNumScalarValKind(nodeTyIxOf(callIx))` — the CHECKER's recorded type — and
+  `collectU`'s registration reads the same home. So the widening is the whole fix and the box
+  arm comes with it: measured on the merged tree, the checker change alone is 33 of 38 with
+  ZERO silent cells and zero corpus movement, and no emitter arm was written.
+
+* **THE FIVE CELLS THAT STILL REFUSE ARE NOT `u8`'s**, and the control that says so is an
+  `i32[]` template with the same twenty positions: it grades 33 of 38 with the identical five
+  (`argument` and `early_return_guard` un-annotated hit `monomorphize: unsupported argument
+  type`, `struct_field_init` un-annotated `object literal matches no union variant`,
+  `array_element` un-annotated the bare-null floor, `map_value` un-annotated types the read
+  non-null). Every one is the un-annotated delivery of ANY `T | null`.
+
+* **THE EMPTY POP AND THE HIGH BYTE ARE THE TWO CELLS THAT GRADE THE REP.** `u8[] = []` popped
+  answers `null` (the box's null arm, which the raw read never had), and `[200, 255]` popped
+  prints `255` — `fbArrayGet` emits `array.get_u` for a packed backing, so a sign-extending
+  read would print `-1`.
+
+* **`u8[].get(i)` IS A SEPARATE REFUSAL AND STAYS OPEN** — see [D1281](#d1281).
+
 ---
 
-* **A CANDIDATE FOR THIS ALREADY EXISTS, MEASURED AND RETAINED.** The D1141/D1142 agent built
-  the checker-side widening this row asks for — `.pop()` / `.get(i)` returning
-  `mkNullableTy(arrElemValueTy(elem))`, so a `u8[]` pop types as `i32 | null` — as part of a
-  D1140 candidate that was rescoped out when D1174 closed D1140 first. Patch retained at that
-  agent's `_scratch/d1140-candidate.patch`. **Its step-4 measurement is the part worth
-  reading**: the widening ALONE moved 4 cells `runs → SILENT`, because `popBoxAtomKind` still
-  excluded `u8`; letting `u8` box as its widened `i32` atom recovered them and bought 4 more.
-  So the checker change needs the box arm in the same commit, and this row should not be
-  attempted without it.
+### D1212 — [CLOSED 2026-09-02] `.pop()` on an EMPTY ref- or string-element list TRAPS where the type says `null`
 
-### D1212 — `.pop()` on an EMPTY ref- or string-element list TRAPS where the type says `null`
-
-**loads then traps (`wasm trap: out of bounds array access`) · check rc 0 · clause 1 · OPEN ·
-found 2026-09-02 beside [D1174](#d1174), and PRE-EXISTING: identical on the published
-`seed-latest`**
+**runs, prints `null` — CLOSED 2026-09-02 by the `len != 0` branch the ref/string arm never
+had: the present arm keeps the backing's own `(ref null $elem)` and the empty arm answers a
+typed `ref.null`, so the non-null recovery moves to the READ side where the narrowing proves
+it · was a run-time trap, clause 1 · zero `runs` lost, zero silent, distilled corpus unmoved ·
+fixture `lists/pop-empty-ref-list-null.vl`**
 
 Repro (loads, then traps — it prints nothing and dies):
 
@@ -38166,12 +38207,21 @@ Repro (loads, then traps — it prints nothing and dies):
   indexes `-1` and `array.get` traps before the `ref.as_non_null` is reached. The boolean arm
   has had the `len != 0` branch since B6 and the numeric arms have it now; these two do not.
 
-* **THE FIX IS THE SAME BRANCH WITH A `ref.null` ELSE ARM, and its price is the reason it is
-  filed rather than taken here**: the arm currently ends `ref.as_non_null`, so consumers of a
-  ref pop are typed NON-null today. Making the empty case answer `null` means the value's rep
-  becomes `(ref null $heap)` and every consumer position has to be re-graded — the position
-  matrix in `lists/pop-value-position-nullable-scalar.vl`, one rep over. A guard that traps
-  LOUDLY instead is not a close: the program is legal and `null` is the answer the type gives.
+* **THE FIX IS THE SAME BRANCH WITH A `ref.null` ELSE ARM, and the row filed its PRICE rather
+  than taking it**: the arm ended `ref.as_non_null`, so consumers of a ref pop were typed
+  NON-null and making the empty case answer `null` retypes the value `(ref null $heap)`.
+
+* **THE PRICE WAS MEASURED AND IS ZERO.** Two 38-cell position x face matrices over a
+  NON-EMPTY pop — `string[]` and `S[]` — grade 32 and 33 `runs` against the pre-change seed
+  with zero `runs` lost, zero silent, and no non-RUNS cell changing its message. The reason it
+  is free is that the checker already types the call `T | null`, so every consumer cell was
+  already `(ref null $heap)` and the recovery was narrowing a value into a subtype of the slot
+  it was going into.
+
+* **THE EMPTY POP MUST NOT MOVE THE LENGTH**, which the fixture prints at every rep: the
+  decrement lives inside the present arm, so popping past the end leaves `0`, not `-1`. All
+  seven reps (`i32` / `i64` / `f64` / `f32` / `boolean` / `u8` / `string`) answer `null` on an
+  empty list now; on the pre-change seed the same program trapped.
 
 * **THIS ROW CANNOT CARRY A CAPABILITY PROBE, and that is a fact about the runner.**
   `scripts/capability-probes/run.py` classifies any `wasm backtrace` in the output as
@@ -38208,9 +38258,14 @@ Repro (refuses; adding `return` in front of the last line makes it print `2`):
 
 * Probe: none yet — one is worth adding with the explicit-`return` control beside it.
 
-### D1241 — `u8[][]` has no rep at ANY value: `emitProgram: only i32[] arrays and struct/union element arrays are supported`
+### D1241 — [CLOSED 2026-09-02] `u8[][]` has no rep at ANY value: `emitProgram: only i32[] arrays and struct/union element arrays are supported`
 
-**loud emit reject · check rc 0 · clause 2 · ZERO corpus cells · found 2026-09-02 while closing D1141 (`u8[].slice`), and it is the reason two cells of that row's 12-position matrix stay refused**
+**runs, prints `1` — CLOSED 2026-09-02 by ref-list element KIND 11, the packed-byte leaf
+`refArrShapeKind` never had, mirroring the f32 leaf arm for arm (shape classifier, slot key,
+element heap, four `ba8Used` forcings, the element-value context and the for-in loop var) ·
+was a loud emit reject, clause 2 · a 26-cell position x face matrix goes 8 → 24 `runs`, zero
+lost, zero silent · corpus unmoved, rep-fuzz exact · fixture
+`arrays/u8-nested-list-positions.vl`**
 
 Repro (refuses on a program that does nothing but declare it):
 
@@ -38228,6 +38283,26 @@ Repro (refuses on a program that does nothing but declare it):
 * **THE MESSAGE ENUMERATES WHAT IS SERVED**, which makes it unusually honest for a refusal in
   this file — `i32[]` arrays and struct/union element arrays. The gap is every other element
   rep at the nested spelling, and `u8` is simply the one a witness exists for.
+
+* **`refArrElemName` IS THE SITE A KIND ALONE DOES NOT COVER, and skipping it turns the loud
+  refusal into a MISCOMPILE.** With the shape arm in and the slot-key arm out,
+  `nameIsRefArray("u8[][]")` answered true, `ensureRefElemTy` interned the row under the wrong
+  key at kind 4, and the declaration built an i32-list element under a `u8[]` read: check-clean
+  invalid wasm where master had a refusal. `wasm-tools print` shows it exactly — the backing is
+  `(array (mut (ref null $i32ListWrapper)))` while the read is `struct.get $u8ListWrapper 1`.
+  An accumulated `emitFail` in the kind-11 heap pass is what proved the arm had never fired;
+  reading the diff did not.
+
+* **IT BOUGHT SIX CELLS OF [D1141](#d1141)'s MATRIX, not the two that row recorded.** Re-graded
+  after the close, a 26-cell `u8[].slice` delivery matrix goes 16 -> 22 `runs`: the two
+  `u8[][]` cells the row named, plus `array_element_assign` / `array_push` at both faces — and
+  one of the six, `array_element` un-annotated, was SILENT (check-clean invalid wasm) rather
+  than refused. [D1174](#d1174)'s recorded remainder — "the ref-element niche next door" — is
+  [D1210](#d1210) and [D1212](#d1212), both closed in the same branch.
+
+* **MEASURED SEPARATE FROM ITS THREE NEIGHBOURS.** Graded at every commit of the closing
+  branch, this witness moves only at its own; D1210 / D1211 / D1212 do the same. Four
+  mechanisms in one neighbourhood, not one family.
 
 ### D1220 — a void-tail function whose last statement is an `if` assigning a STRUCT module global infers a non-void return and TRAPS on `unreachable`
 
@@ -39113,3 +39188,66 @@ Ablation:
   `block_bare_capture` cells on all nine matrix templates; the checker's own scoping (the
   block's `n` must keep NOT colliding with an outer `n` once the emitter has an arm); and the
   call-then-block parse error, which is a separate question this row's close does not answer.
+
+### D1280 — a `.pop()` INLINE in a `.push` ARGUMENT clobbers the push: the i32 face TRAPS, the string face silently drops the element
+
+**loads then traps (`wasm trap: out of bounds array access`) · check rc 0 · clause 1 · OPEN ·
+found 2026-09-02 by the `string[]`-pop position matrix built for [D1212](#d1212), and
+PRE-EXISTING: identical on the pre-change seed**
+
+Repro (loads, then traps — it prints nothing and dies):
+
+    const src: i32[] = [1, 2]
+    const xs: i32[] = []
+    xs.push(src.pop() ?? 0)
+    print(xs[0])
+
+* **HOISTING THE POP INTO A BINDING IS THE ONE-LINE CONTROL.** `const p = src.pop() ?? 0` on
+  its own line, then `xs.push(p)`, prints `2` — the value is right and the push lands. Only
+  the INLINE spelling fails, which is what makes this the shared list-op scratch frame and not
+  the pop or the push alone.
+
+* **THE ABLATION IS THE ARGUMENT, one ingredient at a time, everything else held.** All four
+  of `xs.push(src[0])`, `xs.push(src.length)`, `xs.push(src.slice(0, 1).length)` and
+  `xs.push(mk())` for a declared `function mk(): i32` run and land the element; only a
+  `.pop()` — the list op that MUTATES its receiver and resolves it through
+  `listOpRecvLocal`'s scratch frame — reaches the defect.
+
+* **THE SECOND FACE IS A SILENTLY WRONG ANSWER, not a trap**, and it is the same ablation:
+
+      const src: string[] = ["a", "b"]
+      const xs: (string | null)[] = []
+      xs.push(src.pop())
+      print(xs.length)
+
+  prints `0`. The push did nothing at all, `vl check` is rc 0 and the program exits 0. The
+  hoisted spelling prints `1`.
+
+* **IT IS NOT [D1212](#d1212)'s** — the trap is identical on the pre-change seed, before the
+  empty-pop guard existed, and the receiver here is never empty.
+
+---
+### D1281 — `u8[].get(i)` falls out of the member ladder: `emitProgram: callee is not a function name`
+
+**loud emit reject · check rc 0 · clause 2 · OPEN · found 2026-09-02 while closing
+[D1211](#d1211), and PRE-EXISTING: identical on the pre-change seed**
+
+Repro (refuses; `b[0]` and `b.pop()` over the same list both run):
+
+    const b: u8[] = [200, 255]
+    print(b.get(0))
+
+* **THE CHECKER TYPES IT AND THE EMITTER HAS NO RECEIVER ARM.** Since [D1211](#d1211) the
+  checker answers `i32 | null` for this call — the same type `b.pop()` gets, which RUNS at
+  every delivery — so the type is not the gap. `emitListGet` refuses any receiver
+  `structListPopGetElem` does not claim, and the call then falls out of `emitCallNode`'s
+  member ladder into `emitCall`, whose sentence names neither `get` nor `u8` nor lists.
+
+* **IT IS THE SAME SHAPE [D1141](#d1141) FIXED FOR `.slice`**, one member over: the message is
+  word-for-word the one that row records for the in-function `u8[].slice` face, and the cause
+  is the same — a member lowering whose receiver ladder has rungs for every list rep except
+  the packed one.
+
+* **`.pop()` IS THE CONTROL THAT SIZES IT.** `b.pop()` over the identical list runs and prints
+  `255` at every position, so the `i32 | null` delivery machinery and the packed `array.get_u`
+  read both exist; what is missing is `.get`'s own receiver arm.

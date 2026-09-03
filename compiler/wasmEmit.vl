@@ -8315,6 +8315,7 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
           elemNest != 8 &&
           elemNest != 9 &&
           elemNest != 10 &&
+          elemNest != 11 &&
           elemUnionNm == ""
         ) {
           if exprArray(elems[i], fnIx) || exprRefArray(elems[i], fnIx) {
@@ -8354,6 +8355,8 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
             elCtx.listKind = 6
           } else if elemNest == 10 {
             elCtx.listKind = 7 // f32-inner list -> build each element as an f32[] (kind 7)
+          } else if elemNest == 11 {
+            elCtx.listKind = 10 // u8-inner list -> build each element as a packed u8[]
           } else if elemNest == 9 {
             elCtx.listKind = 5
             elCtx.listSlot = nestInnerSlot
@@ -8391,6 +8394,7 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
               if elemNest == 7 { elCtx.nulRefHeap = fl64TypeIdx }
               if elemNest == 8 { elCtx.nulRefHeap = il64TypeIdx }
               if elemNest == 10 { elCtx.nulRefHeap = fl32TypeIdx }
+              if elemNest == 11 { elCtx.nulRefHeap = bl8TypeIdx }
               // A `({[string]: V} | null)[]` element (kind 3 nullable niche) → `ref.null` of
               // the element's map struct (the slot heap, resolved by the kind-3 passes).
               if elemNest == 3 { elCtx.nulRefHeap = rlElemHeap[rslot] }
@@ -17521,6 +17525,8 @@ function refElemValueCtx(rslot: i32): ExpCtx {
     c.listKind = 6
   } else if k == 10 {
     c.listKind = 7
+  } else if k == 11 {
+    c.listKind = 10 // u8-inner list -> the packed-byte literal build
   } else if k == 9 {
     c.listKind = 5
     c.listSlot = rlElemInnerSlot(rslot)
@@ -17531,6 +17537,7 @@ function refElemValueCtx(rslot: i32): ExpCtx {
     if k == 7 { c.nulRefHeap = fl64TypeIdx }
     if k == 8 { c.nulRefHeap = il64TypeIdx }
     if k == 10 { c.nulRefHeap = fl32TypeIdx }
+    if k == 11 { c.nulRefHeap = bl8TypeIdx }
     if k == 9 && c.listSlot >= 0 { c.nulRefHeap = rlWrapIdx[c.listSlot] }
     // A nullable-CLOSURE element (kind 5): a `null` value stores as `ref.null` of the
     // shared closure fat-pointer (the slot heap, `cloStructIdx`).
@@ -17554,7 +17561,7 @@ function refElemValueCtx(rslot: i32): ExpCtx {
 // under `refElemValueCtx` so a literal value builds the inner list, not the default.
 function rlElemIsNestedList(rslot: i32) {
   const k = rlElemKindTbl[rslot]
-  k == 4 || k == 6 || k == 7 || k == 8 || k == 9 || k == 10
+  k == 4 || k == 6 || k == 7 || k == 8 || k == 9 || k == 10 || k == 11
 }
 
 // Whether a ref-list slot's element-VALUE emit needs `refElemValueCtx` at all — the ONE
@@ -18252,6 +18259,38 @@ function emitPop(body: i32[], callIx: i32, fnIx: i32, nulBox: boolean) {
             const pnk = tyNulNumScalarValKind(nodeTyIxOf(callIx))
             if pnk >= 0 { return emitPopNulBox(body, lIdx, lTy, aTy, pnk) }
           }
+        }
+        // AN EMPTY REF / STRING POP ANSWERS `null`, IT DOES NOT TRAP (D1212). Reading
+        // `backing[len - 1]` unguarded indexes -1 on an empty list, so `array.get` trapped
+        // before the `ref.as_non_null` below was reached — while the checker types the call
+        // `T | null` and every scalar rep already answers `null` there. The result is the
+        // backing's own `(ref null $elem)`, which is exactly the cell a `nulstruct` /
+        // `nulstr` / `nullist` / `nulreflist` consumer holds; the non-null recovery moves to
+        // the READ side, where the narrowing is what proves it.
+        if elemIsRef {
+          let popElemHeap = sTypeIdx
+          if popRefSlot >= 0 {
+            if popRefSlot >= rlElemHeap.length {
+              return emitFail("emitProgram: ref .pop element heap not interned")
+            }
+            popElemHeap = rlElemHeap[popRefSlot]
+          }
+          pushListLen(body, lIdx, lTy) // cond: len != 0
+          fbIfRefNul(popElemHeap, true)
+          ctrlEnter()
+          fbLocalGet(lIdx)             // L.len = len - 1
+          pushListLen(body, lIdx, lTy)
+          fbI32Const(1)
+          fbI32Bin(107)                // 0x6b i32.sub
+          fbStructSet(lTy, 1)          // field 1: len
+          pushListBacking(body, lIdx, lTy)
+          pushListLen(body, lIdx, lTy)
+          fbArrayGet(aTy)              // backing[len] — already `(ref null $elem)`
+          fbElse()                     // 0x05 else — empty → the typed null
+          fbRefNull(popElemHeap)
+          fbEnd()                      // 0x0b end
+          ctrlLeave()
+          return 0
         }
         // L.len = len - 1
         fbLocalGet(lIdx)    // local.get L
@@ -21514,10 +21553,12 @@ function emitForInStmt(body: i32[], s: ForIn, _stmtIx: i32, fnIx: i32) {
     ek == "f64list" ||
     ek == "i64list" ||
     ek == "f32list" ||
+    ek == "u8list" ||
     ek == "nulstrlist" ||
     ek == "nulf64list" ||
     ek == "nuli64list" ||
     ek == "nulf32list" ||
+    ek == "nulu8list" ||
     ek == "closure" ||
     ek == "reflist" ||
     ek == "nulreflist"
@@ -21674,6 +21715,7 @@ function emitForInStmt(body: i32[], s: ForIn, _stmtIx: i32, fnIx: i32) {
     ek == "f64list" ||
     ek == "i64list" ||
     ek == "f32list" ||
+    ek == "u8list" ||
     ek == "closure" ||
     ek == "reflist"
   ) {
