@@ -3379,6 +3379,16 @@ function emitVariantStruct(body: i32[], objIx: i32, vi: i32, fnIx: i32) {
       else if rlElemKindTbl[vslot28] == 1 { pendingListKind = 1 }
       else { pendingListKind = 5 }
       if vslot28 < rlWrapIdx.length { pendingNulRefHeap = rlWrapIdx[vslot28] }
+    } else if isNulScalarListFieldCode(vcode) {
+      // A nullable SCALAR-BACKED list ARM field — the struct literal's arm, which this
+      // ladder never grew: a bare `null` written here reached `emitNullLitNode` with every
+      // seed at its default and took the loud `bare null needs a struct-typed context`
+      // reject (D1294).
+      pendingListKind = nulScalarListBuildKind(nulScalarListCodeKind(vcode))
+      const vnslV = P.nodes[unwrapParen(valIx)]
+      if vnslV is NullLit {
+        pendingNulRefHeap = nulScalarListFieldWrapHeap(vcode)
+      }
     } else if vcode == 29 {
       const vmslot29 = uFieldMapShape(vi, fj)
       pendingMapSlot = vmslot29
@@ -6498,50 +6508,9 @@ function emitStructUnionEq(
   fnIx: i32,
 ) {
   const arms: string[] = []
-  splitUnionAtoms(unionMemberSetOf(uname), arms)
-  if arms.length < 2 { return -1 }
-  // The two per-arm columns, index-parallel to `arms` and mutually exclusive: a STRUCT arm
-  // carries its variant row in `vis` and -1 in `aks`, a SCALAR arm the reverse. Every read
-  // below branches on `vis[a] >= 0`, so an arm is never asked the other column's question.
   const vis: i32[] = []
   const aks: i32[] = []
-  let i = 0
-  while i < arms.length {
-    const vi = variantIndexOf(arms[i])
-    if vi < 0 {
-      // NOT A VARIANT: the arm is servable exactly when it is a value ATOM whose payload
-      // this lowering can unbox and compare — the same bound `emitUnionPayloadUnbox` and
-      // `atomEqOpcodeOfKind` enforce, asked BEFORE any byte is written so an unservable arm
-      // still DECLINES (keeping the caller's loud message) instead of failing loudly here.
-      const ak = valueAtomKind(arms[i])
-      if ak < 0 { return -1 }
-      if ak == 2 {
-        if !aUsed { return -1 }
-      } else if ak != nullValKind() && ak != 11 {
-        // A LIST arm is servable too (D1095): its payload IS the wrapper ref, so the unbox
-        // is a `ref.cast` and the compare is the generic list core. A CLOSURE arm (11) rides
-        // the same shape and compares by identity (D1098). Everything left still needs a
-        // scalar value box and declines without one.
-        if listWrapHeapOfKind(ak) < 0 {
-          if vbHeapIdxOfKind(ak) < 0 { return -1 }
-        }
-      }
-      vis.push(-1)
-      aks.push(ak)
-      i = i + 1
-      continue
-    }
-    if vi >= uVarHeap.length { return -1 }
-    if vi >= uTags.length { return -1 }
-    if vi >= uFieldStart.length { return -1 }
-    if vi >= uFieldCount.length { return -1 }
-    if !variantFieldsComparable(vi) { return -1 }
-    vis.push(vi)
-    aks.push(-1)
-    i = i + 1
-  }
-  const sl = unionEqStashSlot()
-  const sr = unionEqStashSlot2()
+  if !unionBoxEqColumns(uname, arms, vis, aks) { return -1 }
   // BOTH OPERANDS RIDE THE WASM STACK UNTIL BOTH HAVE BEEN COMPUTED, and only then are they
   // parked. These slots are shared per FUNCTION, so a left operand parked before the right
   // one is evaluated is a value the right one's own code can overwrite: a union `==` nested
@@ -6551,6 +6520,75 @@ function emitStructUnionEq(
   // unchanged (left, then right).
   if emitExpr(body, lIx, fnIx) < 0 { return -1 }
   if emitExpr(body, rIx, fnIx) < 0 { return -1 }
+  emitUnionBoxEqStaged(body, arms, vis, aks, isNe, uname, fnIx)
+}
+
+// THE ARM COLUMNS of a box `==` over union `uname`, index-parallel to `arms` and mutually
+// exclusive: a STRUCT arm carries its variant row in `vis` and -1 in `aks`, a SCALAR arm the
+// reverse. FALSE DECLINES, so an arm set the lowering cannot serve keeps its caller's loud
+// refusal — and it is asked before any byte is written, which is why it is its own function
+// rather than the head of the emitter.
+function unionBoxEqColumns(
+  uname: string,
+  arms: string[],
+  vis: i32[],
+  aks: i32[],
+): boolean {
+  splitUnionAtoms(unionMemberSetOf(uname), arms)
+  if arms.length < 2 { return false }
+  let i = 0
+  while i < arms.length {
+    const vi = variantIndexOf(arms[i])
+    if vi < 0 {
+      // NOT A VARIANT: the arm is servable exactly when it is a value ATOM whose payload
+      // this lowering can unbox and compare — the same bound `emitUnionPayloadUnbox` and
+      // `atomEqOpcodeOfKind` enforce, asked BEFORE any byte is written so an unservable arm
+      // still DECLINES (keeping the caller's loud message) instead of failing loudly here.
+      const ak = valueAtomKind(arms[i])
+      if ak < 0 { return false }
+      if ak == 2 {
+        if !aUsed { return false }
+      } else if ak != nullValKind() && ak != 11 {
+        // A LIST arm is servable too (D1095): its payload IS the wrapper ref, so the unbox
+        // is a `ref.cast` and the compare is the generic list core. A CLOSURE arm (11) rides
+        // the same shape and compares by identity (D1098). Everything left still needs a
+        // scalar value box and declines without one.
+        if listWrapHeapOfKind(ak) < 0 {
+          if vbHeapIdxOfKind(ak) < 0 { return false }
+        }
+      }
+      vis.push(-1)
+      aks.push(ak)
+      i = i + 1
+      continue
+    }
+    if vi >= uVarHeap.length { return false }
+    if vi >= uTags.length { return false }
+    if vi >= uFieldStart.length { return false }
+    if vi >= uFieldCount.length { return false }
+    if !variantFieldsComparable(vi) { return false }
+    vis.push(vi)
+    aks.push(-1)
+    i = i + 1
+  }
+  true
+}
+
+// THE TAG-THEN-ARM COMPARE over two boxes ALREADY ON THE STACK (left below right), leaving
+// the 0/1 answer. Split from the operand evaluation because a box-typed FIELD reaches this
+// same core through two chain reads rather than two expressions (D1290), and two callers
+// must not carry two copies of the dispatch.
+function emitUnionBoxEqStaged(
+  body: i32[],
+  arms: string[],
+  vis: i32[],
+  aks: i32[],
+  isNe: boolean,
+  uname: string,
+  fnIx: i32,
+) {
+  const sl = unionEqStashSlot()
+  const sr = unionEqStashSlot2()
   fbLocalSet(sr) // pops the right operand, leaving the left on top
   fbLocalSet(sl)
   // TAGS FIRST: two different arms are never equal, and the tag IS the arm.
@@ -6659,12 +6697,25 @@ function variantFieldComparable(ufi: i32): boolean {
   // A REF-LIST field needs the ref-list SLOT its element name resolves to, both to reserve
   // the frame and to pick the element core; without one there is no compare to emit.
   if c == 5 { return variantRefListFieldSlot(ufi) >= 0 }
+  // A BOX field is comparable when the shared box core can serve every arm (D1290).
+  if c == 16 { return variantBoxFieldComparable(ufi) }
   // D1180 — A REF-NICHE field (`string | null`, `T[] | null`) is its non-null twin's core
   // under a null guard, so it is comparable exactly when that twin is. Same table, same
   // guard and the same admission rule as the STRUCT ladder's: one home, two ladders.
   const cn = nulFieldInnerCode(c)
   if cn >= 0 { return variantFieldCodeComparable(ufi, cn) }
   eqVariantListFieldKind(c) >= 0
+}
+
+// Can the shared box core serve every arm of a code-16 variant field's union? The field's
+// recorded elem name IS the atom-set name the box was built against.
+function variantBoxFieldComparable(ufi: i32): boolean {
+  const bn = uFieldElemName[ufi]
+  if bn == "" { return false }
+  const bArms: string[] = []
+  const bVis: i32[] = []
+  const bAks: i32[] = []
+  unionBoxEqColumns(bn, bArms, bVis, bAks)
 }
 
 // The admission question keyed by an EXPLICIT code, so the niche rung above can ask it of the
@@ -6862,6 +6913,14 @@ function emitVariantFieldEqCoreAt(body: i32[], ufi: i32, fnIx: i32, c: i32) {
   if c == 14 { return emitCloEqCore(body) }
   if c == 5 {
     return emitListEqAnyRep(body, 1, variantRefListFieldSlot(ufi), fnIx)
+  }
+  if c == 16 {
+    const vbN = uFieldElemName[ufi]
+    const vbArms: string[] = []
+    const vbVis: i32[] = []
+    const vbAks: i32[] = []
+    if !unionBoxEqColumns(vbN, vbArms, vbVis, vbAks) { return -1 }
+    return emitUnionBoxEqStaged(body, vbArms, vbVis, vbAks, false, vbN, fnIx)
   }
   const lk = eqVariantListFieldKind(c)
   if lk >= 0 { return emitListEqAnyRep(body, lk, 0, fnIx) }
@@ -12196,6 +12255,20 @@ function eqgNeOpcode(kind: i32) {
 // core is `emitListEqRCore`. Without a shared entry the new core would carry a second copy
 // of this dispatch and the two would drift.
 function emitListEqAnyRep(body: i32[], kind: i32, slot: i32, fnIx: i32) {
+  // A LIST CORE STARTS A FRESH CHAIN, so the niche guard's recover must not survive into it
+  // (D1291). Both wrappers are already on the stack and were recovered by the arm that read
+  // them; every read the core makes below is its OWN — `backing[i]`, then a struct element's
+  // fields off the stash pair — and an `i32` leaf field with a `ref.as_non_null` appended is
+  // check-clean invalid wasm. The flag names the CURRENT chain, so it is cleared for the
+  // duration of any core that opens another one.
+  const savedRec = eqChainRecover
+  eqChainRecover = false
+  const r = emitListEqAnyRepAt(body, kind, slot, fnIx)
+  eqChainRecover = savedRec
+  r
+}
+
+function emitListEqAnyRepAt(body: i32[], kind: i32, slot: i32, fnIx: i32) {
   if kind == 0 { return emitListEqICore(body) }
   if kind == 3 { return emitListEqSCore(body) }
   if kind == 1 {
@@ -13376,6 +13449,32 @@ function emitStructEqFieldAt(
     if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
     if emitChainRead(body, rRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
     return emitCloEqCore(body)
+  }
+  if code == 16 {
+    // A VALUE-UNION / STRUCT-UNION BOX field compares exactly as the box does at top level:
+    // tag first, then the arm the tag selects. The only thing this arm adds is READING the
+    // two boxes off a field path instead of off two operands — the shape D1017 gave the
+    // ref-list field. Columns FIRST, so an arm set the core cannot serve declines before a
+    // byte is written and keeps the loud refusal below (D1290).
+    const bxN = sFieldElemNameAt(si, fi)
+    if bxN != "" {
+      const bxArms: string[] = []
+      const bxVis: i32[] = []
+      const bxAks: i32[] = []
+      if unionBoxEqColumns(bxN, bxArms, bxVis, bxAks) {
+        if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
+        if emitChainRead(body, rRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
+        return emitUnionBoxEqStaged(
+          body,
+          bxArms,
+          bxVis,
+          bxAks,
+          false,
+          bxN,
+          fnIx,
+        )
+      }
+    }
   }
   if code == 5 {
     // A REF-LIST FIELD compares exactly as a ref list does at top level — push the two
