@@ -294,3 +294,94 @@ axis("closures", 4.0, "`fnStmtsPosOf` scans `fnStmts` once per closure.", (d) =>
 // registry, so N pins mint N rows and cost N^2 comparisons.
 axis("generic pins", 9.0, "`collectA` interns each pin through a linear registry scan.", (d) =>
   twoFiles(d, genPins(400, true), genPins(400, false)));
+
+// ── the one RUNTIME axis ─────────────────────────────────────────────────────
+// Every pair above grades COMPILE time, because every cost above is the compiler's. String
+// building is the exception: the cost lands in the EMITTED program, so this pair builds
+// nothing and times `vl run` on two programs that produce the same 800 KB string — one by
+// appending in a loop, one through std's hand-rolled code-point builder (`str.join`), which
+// has always been linear. The builder arm is the baseline the append arm has to match.
+//
+// `vl run` compiles too, and that fixed ~0.05 s lands on BOTH arms, so it dilutes the ratio
+// rather than inflating it — the bar is an upper bound and dilution can only make this
+// weaker, never a false red. The floor is the pair's own (0.05 s, not `FLOOR`): both arms
+// finish well under 0.4 s now, and `FLOOR` would divide the append arm by 0.4 and pass a
+// quadratic. Measured 2026-09-03 at 40,000 appends: **16.10 on master, 0.32 after** (the
+// append arm 0.805 s -> 0.02 s against the builder arm 0.028 s / 0.03 s). Bar 2.5.
+const runProg = async (src: string): Promise<number> => {
+  const t0 = Date.now();
+  const { code, stderr } = await new Deno.Command(VL, {
+    args: ["run", src, "--compiler", COMPILER],
+    stdout: "null",
+    stderr: "piped",
+    env: { RUST_BACKTRACE: "0", NO_COLOR: "1", VL_STD: `${ROOT}/std` },
+  }).output();
+  if (code !== 0) {
+    throw new Error(`vl run failed on ${src}: ${new TextDecoder().decode(stderr).slice(0, 400)}`);
+  }
+  return (Date.now() - t0) / 1000;
+};
+
+const RUN_FLOOR = 0.05;
+
+const genAppendLoop = (n: number): string =>
+  [
+    "function build(n: i32): string {",
+    '  let s = ""',
+    "  let i = 0",
+    '  while i < n { s = s + "0123456789abcdefghij"; i = i + 1 }',
+    "  return s",
+    "}",
+    `print(build(${n}).length)`,
+    "",
+  ].join("\n");
+
+const genJoinBuild = (n: number): string =>
+  [
+    'import { join } from "std:str"',
+    "function build(n: i32): string {",
+    "  let parts: string[] = []",
+    "  let i = 0",
+    '  while i < n { parts.push("0123456789abcdefghij"); i = i + 1 }',
+    '  return join(parts, "")',
+    "}",
+    `print(build(${n}).length)`,
+    "",
+  ].join("\n");
+
+Deno.test({
+  name: "scaling shape: string append loop",
+  ignore: !ENABLED,
+  fn: async () => {
+    const bar = 2.5;
+    const dir = await Deno.makeTempDir({ prefix: "vl_scale_strappend_" });
+    try {
+      const [manySrc, oneSrc] = twoFiles(dir, genAppendLoop(40000), genJoinBuild(40000));
+      let tMany = await runProg(manySrc);
+      let tOne = await runProg(oneSrc);
+      const bad = () => tMany > bar * Math.max(tOne, RUN_FLOOR);
+      if (bad()) {
+        tMany = Math.min(tMany, await runProg(manySrc));
+        tOne = Math.min(tOne, await runProg(oneSrc));
+      }
+      if (VERBOSE) {
+        console.log(
+          `[scaling] string append loop: many ${tMany.toFixed(2)}s one ${tOne.toFixed(2)}s ` +
+            `ratio ${(tMany / Math.max(tOne, RUN_FLOOR)).toFixed(2)} bar ${bar}`,
+        );
+      }
+      if (bad()) {
+        throw new Error(
+          `string append loop: 40,000 appends cost ${tMany}s against ${tOne}s for the same ` +
+            `800 KB string through std's builder (ratio ` +
+            `${(tMany / Math.max(tOne, RUN_FLOOR)).toFixed(2)}, bar ${bar}) — the loop-local ` +
+            "accumulator lowering (`strAccScan` / `emitStrAccAppend`, compiler/wasmEmit.vl) " +
+            "stopped firing, so every append allocates an exact-fit backing and copies the " +
+            "whole prefix again. Check what disqualified the binding.",
+        );
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});

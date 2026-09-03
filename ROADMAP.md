@@ -47,9 +47,11 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   `gate.sh` and CI), the baseline `scripts/comment-budget-baseline.json`, and the
   self-lint exemption that deletes itself when the baseline reaches zero. See CLAUDE.md,
   "Comments state the invariant; measurements live in the inventory".
-- 🟡 **1. Per-file comment trim — PILOT DONE (#2413), the bulk remains.** `parser.vl`,
-  `format.vl` and `emit_sections.vl` are trimmed; `emit_classify.vl` (397 blocks over
-  budget), `typecheck.vl` (364) and `wasmEmit.vl` (180) are the weight. One PR per file:
+- 🟡 **1. Per-file comment trim — PILOT DONE (#2413), batches 2-4 and 6 DONE (#2428, #2433,
+  #2444, #2440); `emit_classify.vl` (398 blocks over budget) is the last one.**
+  `parser.vl`, `format.vl`, `emit_sections.vl`, `emit_mono.vl`, `emit_state.vl`,
+  `emit_base.vl`, `emit_rewrite.vl`, `tyname.vl`, `ast.vl`, `emit_collect.vl`,
+  `typecheck.vl` and `wasmEmit.vl` are trimmed. One PR per file:
   move every census count, probe output and A/B table to its inventory row or a
   `DECISIONS.md` section, cite the id from the comment, and lower the baseline in the same
   PR. **Proof of safety: a byte-identical seed** — a comment-only change that moves one
@@ -71,6 +73,20 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   remaining work is 4b (`registerInlineUnion`'s 11 recursions, under an `emit_collect.vl`
   freeze) and then the switch. The variant registry and the per-resolver kind ladders
   (ONE storage-class dispatch table) are still ahead of both.
+- 🟢 **7. String building — BOTH LOWERINGS SHIPPED; module-GLOBAL accumulators remain.**
+  `docs/internals/perf-opportunities-2026-09.md` Part D priced what the owner asked for
+  ("optimize string building at the compiler level, without the user having to use an actual
+  builder pattern"), and its options A and B are both in. **A**: a maximal string `+` chain —
+  every interpolation included, since the parser desugars one into a chain — lowers to ONE
+  sized allocation and one `array.copy` per part. **B**: a proven loop-local accumulator
+  (`let s = ""` then `s = s + piece` inside a loop) appends IN PLACE into slack its own grow
+  path allocated, capacity doubling, so the loop is O(n). Together they take the compiler's
+  own emitted `__str_concat__` call sites **2,649 -> 399** and a 40,000-append loop
+  **0.805 s -> 0.02 s**. The REMAINDER is an accumulator that is a module GLOBAL rather than
+  a function local: the analysis is per function, so `let s = ""` at top level with a
+  top-level `while` still allocates per step (measured unchanged, ratio 5.1 per doubling).
+  Option C (ropes) stays refused — it changes the rep for every program to fix a pattern a
+  static analysis can see.
 
 
 ### Ruled and sequenced (owner decisions already made, waiting only on order)
@@ -178,9 +194,10 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
     remain. DECISIONS.md §"A missing list separator is inserted, never skipped past".
   - **NEXT: the `then`-removal arm in `parseIf`**, which is already single-statement and was
     called out at stage 1 as the cheapest remaining candidate.
-- **Modernization program — (1) comment trim, PILOT DONE #2413, batch 2 DONE #2428: six
-  files, batch 3 DONE #2433: `emit_collect`**: `compiler/parser.vl`, `compiler/format.vl` and
-  `compiler/emit_sections.vl` are at
+- **Modernization program — (1) comment trim, COMPLETE for `compiler/*`. PILOT DONE #2413,
+  batch 2 DONE #2428: six files, batch 3 DONE #2433: `emit_collect`, batch 4 DONE #2444:
+  `typecheck`, batch 5 DONE #2446: `emit_classify`, batch 6 DONE #2440: `wasmEmit`**:
+  `compiler/parser.vl`, `compiler/format.vl` and `compiler/emit_sections.vl` are at
   the 12-line comment-block budget (72 blocks over 12 → 2, both of those module headers under
   their own 40-line budget), with a byte-identical seed and the moved text archived verbatim in
   `docs/internals/{parser,format,emit-sections}-notes.md`. **Batch 2 takes `emit_mono.vl`,
@@ -190,10 +207,28 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   `docs/internals/*.md`) or not at all; eleven already-false claims fell out of it. **Batch 3
   takes `emit_collect.vl` from 124/46 to 0/0** — 1,325 comment lines gone, three ORPHANED
   function headers moved back to the functions they document (`forceGenAppArgTypes`,
-  `collectA`, `collectTyReachRegister`), two stale citations corrected. **NEXT:
-  `emit_classify.vl` (398/151), `typecheck.vl` (365/69) and `wasmEmit.vl` (180/47)** — the
-  whole remaining 1,131/343, and the three files where the ratchet's `lint-self.sh` exemption
-  still has to hold.
+  `collectA`, `collectTyReachRegister`), two stale citations corrected. **Batch 4 takes
+  `typecheck.vl` — the campaign's largest file — from 365/69 to 0/0**: 3,937 comment lines
+  gone, the block count unchanged at 2,355, the longest surviving block the 28-line module
+  header, and six stale claims dropped (`compiler/typecheck.ts` and its concatenating driver,
+  both deleted; three "the recorder is byte-identical" notes on sidecars the emitter now reads;
+  one fixture that exists nowhere and two renamed when their defects closed; `concatRefusal`,
+  `splitTopAmp` and a doc path). **Batch 6 takes `wasmEmit.vl` from 180/47 to 0/0** — 1,536
+  comment lines gone, SEVEN orphaned function headers moved back (so the block count rises by
+  seven) and an eighth dropped because its function had moved to `emit_classify.vl`, eight
+  citations to the `toWasm.ts` / `parser.ts` deleted in #466 removed, and two multi-page
+  FILINGS graded rather than trimmed: the `print(m["k"])` map note and the
+  assignment-as-expression residue table both RUN today. **Batch 5 takes `emit_classify.vl`
+  — the worst file in the tree — from 398/151 to 0/0**: 4,009 comment lines gone, TWENTY-TWO
+  orphaned function headers moved back to functions that had none, and six stale claims
+  dropped (three EMITTER headers in a file that writes no bytes, one of them citing
+  `toWasm.ts`; a `True if …` boolean header above a shape-returning function; a
+  "PRE-EXISTING DEFECT LIVES NEXT DOOR" paragraph D1087 closed; a duplicated header; a
+  migration note for a deleted wrapper; and a `collectAnnShapes` paragraph left behind when
+  its function moved out). **The ratchet is 188/76 and every file over 50 is gone**: the
+  largest remaining are `emit_rep.vl` (48/13) and `driver.vl` (29/8), then a tail of
+  single-digit rows across `std/*` and the small compiler modules. NEXT: those two, then
+  the tail — at zero, `lint-self.sh`'s exemption deletes itself.
 - **Modernization program, item 3 — the defect inventory is ONE FILE PER ROW. TOOLING SHIPPED;
   the split itself lands on merge day.** `scripts/inventory/split.py --apply --relink` run
   against fresh master, under a freeze on inventory appends; every consumer already reads
@@ -551,8 +586,30 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   answer) and the UFCS receiver's fit is re-asked at the pin by a ninth deferred table
   (`ufcsCstr*`) with a field-precedence guard; **D1063** is the residue those two named,
   the disagreeing instantiation pair that shares one AST node. Still open from this list:
-  D1004 (the wordless member-access diagnostic on an unbounded `<T>`) and LSP bound-member
-  completion/hover on `x: T`.
+  D1004's CAPABILITY half — its wordless diagnostic was fixed 2026-09-03 and the ruling it
+  needs is the next bullet — and LSP bound-member completion/hover on `x: T`.
+- **Does an unbounded `<T>` INFER its bound from the body? (raised 2026-09-03 by D1004 and
+  D1221; `docs/constraints-design.md` OQ-5 is the doc.)** `function getN<T>(x: T): i32 { x.n }`
+  refuses. Three neighbours run: the direct `function getN(x: { n: i32 })`, the UN-ANNOTATED
+  `function getN(x)` (the parameter hole grows an `{n}` shape), and the bounded
+  `<T: { n: i32 }>` — the last at two instantiation shapes. The refusal now STATES the rule
+  (a parameter's members come from its bound) and names the edit, so the wordless half is
+  closed whichever way this goes; what is open is whether the rule should stand.
+  - **The argument for standing pat is mechanical, not aesthetic.** A generic body is checked
+    ONCE, so `x.n` needs ONE type and only the declaration can supply it. Inferring the bound
+    makes the member's type a fresh hole per instantiation — body-level monomorphization of
+    INFERRED shapes, which is the D976 substrate constraints phase 1 declined on the measured
+    ground that "the checker's inferred-shape column does not survive into emit" (§7).
+  - **The argument against is that the two faces disagree.** `function getN(x)` already infers
+    exactly this shape and runs, so a user who ADDS `<T>` — the more explicit spelling — loses
+    a program that worked. That is CLAUDE.md's "two faces, two clauses" pointing at a language
+    rule rather than at a codegen gap.
+  - **The ruling asked for**, one of: (a) today's rule stands and the sentence is the whole
+    answer; (b) an unbounded `<T>` infers a structural bound from its body's demands; (c)
+    member access on a type parameter requires a bound, stated as a hard rule.
+    `tests/cases/constraints/unbounded-type-param-unchanged.vl` is the refutation pin either
+    way, and D1221 is the same question at a member CALL — where a free `self`-function of
+    the name anywhere in the program already makes the refusing program run.
 - **Track-caller — DONE 2026-09-01 (#2235); the ANCHOR moved to the matcher 2026-09-02
   (#2386), so the `expect`-token findings below are the landing's, not today's.** Both halves
   have shipped. The std side is
