@@ -376,6 +376,22 @@ large input, which is exactly what `fmt_util.vl:216` records happening once alre
 which is the shape that hurts; C changes the rep for every program to fix a pattern a
 static analysis can see in most of them.
 
+### D6 · Measured after A (n-ary concat, 2026-09-03)
+
+| | before | after |
+| --- | ---: | ---: |
+| `call $__str_concat__` sites in the emitted compiler | 2,643 | 529 |
+| inline `array.copy` sites in it | 2,366 | 5,145 |
+| `__str_concat__` self% of a self-compile (`VL_PROFILE_GUEST`) | 0.69% | 0.48% |
+| seed bytes | 1,832,652 | 1,968,294 |
+
+665 chains fused (the two deltas solve for chain count and mean arity 4.18), so **2,114
+pairwise concat calls are gone** and with them their allocations: a k-part chain allocated
+k-1 exact-fit backings and copied its prefix k-1 times, and now allocates once. D3's
+regex floor (451 explicit 3+ chains) undercounts because interpolation is desugared in the
+parser and never reads as a `+` chain in source. `tests/cases` byte-identity: 2,191 of
+2,790 identical, 98 differ (every one carries a chain), 501 refuse under both seeds.
+
 ---
 
 ## E · What this survey could NOT measure

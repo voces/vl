@@ -473,7 +473,15 @@ const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3: ShapeP
     // the `-O3` row as this benchmark's real shape and the `-O` row as the cost of the
     // missing pipeline DCE. The pin still fires exactly on any codegen move — it is an
     // equality test — it just has more of std in it now.
-    O: { bytes: 7769, fns: 16, allocs: 91, indirect: 0, refEq: 1 },
+    //
+    // 2026-09-03, n-ary concat: `-O` moves allocs 91 -> 95 and bytes 7792 -> 8005 while
+    // `-O3` is byte-identical (2147/46). The benchmark's own keys are `"key" + toString(i)`
+    // — two operands, untouched — so every moved byte is in the `std:fmt` code `-O` carries
+    // and `-O3` drops. A fused chain writes its `array.new_default` + `struct.new` INLINE
+    // instead of calling `__str_concat__`, so STATIC alloc sites rise where DYNAMIC
+    // allocations fall (n - 1 -> 1 per chain execution): this row counts sites, and the
+    // direction it moves is the opposite of the direction the work moves.
+    O: { bytes: 8005, fns: 16, allocs: 95, indirect: 0, refEq: 1 },
     O3: { bytes: 2147, fns: 5, allocs: 46, indirect: 0, refEq: 1 },
   },
   // MAP PROBE WITHOUT THE STRING COST. i32 keys, so this isolates the bucket walk and the

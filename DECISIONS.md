@@ -5028,3 +5028,27 @@ Three decisions inside that are worth keeping:
 `--json` deliberately carries neither the code nor the payload for a COMPILE diagnostic
 (`compiler/cli.vl`, unchanged): the payload is an editor's answer, and the fix is an edit no
 batch reporter performs. Adding it would store a field nothing reads.
+
+## String building is a LOWERING, not a spelling the user has to know (owner direction, 2026-09-03)
+
+The owner's direction is "optimize string building at the compiler level, without the user
+having to use an actual builder pattern". Two lowerings answer it, and each is EXACT — it
+fires only where its condition is proven, and every other program keeps the bytes it had.
+
+**N-ary concat.** A maximal string `+` chain lowers to ONE sized allocation plus one
+`array.copy` per part, instead of one `__str_concat__` call per `+`. The chain is flattened
+by `exprIsStrConcat` — the same predicate that routes `+` to the string lowering — so the
+walk and the dispatch cannot disagree about where the chain ends. EXACTNESS: parts are
+evaluated left to right, exactly once, before any is stashed, which is the nested-op
+discipline §G6 already imposes; a non-string operand keeps whatever render step it had; a
+parenthesised sub-chain is a `Paren` node and is not interior, so it keeps its own lowering.
+A program with no 3+ chain is byte-identical (2,191 of 2,790 `tests/cases` modules; all 98
+that moved carry a chain, and 501 refuse under both seeds).
+
+Two options were NOT taken. A variadic `__str_concat_n__` through a scratch table would
+need a second allocation for the parts array and an `(array (ref $str))` heap type in every
+chain-bearing module; the inline form pays ~46 bytes per part of code instead (the seed
+moves 1.83 MB -> 1.97 MB) and allocates exactly once. Ropes (Part D's option C) change the
+string REP for every program to fix a pattern a static analysis can see in most of them, so
+they stay the owner's held option rather than this PR's.
+

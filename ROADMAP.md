@@ -73,6 +73,15 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   remaining work is 4b (`registerInlineUnion`'s 11 recursions, under an `emit_collect.vl`
   freeze) and then the switch. The variant registry and the per-resolver kind ladders
   (ONE storage-class dispatch table) are still ahead of both.
+- 🟡 **7. String building — N-ARY CONCAT SHIPPED, the loop-local builder is the rest.**
+  `docs/internals/perf-opportunities-2026-09.md` Part D prices the two lowerings the owner
+  asked for ("optimize string building at the compiler level, without the user having to use
+  an actual builder pattern"). Shipped: a maximal string `+` chain — and every interpolation,
+  which the parser desugars into one — lowers to ONE sized allocation and one `array.copy` per
+  part, taking the compiler's own emitted `__str_concat__` call sites 2,643 -> 529. The
+  remainder is Part D's option B, the loop-local accumulator (`let s = ""` then `s = s + piece`
+  inside a loop, read only after it) lowered to a growable buffer; option C (ropes) stays
+  refused, since it changes the rep for every program to fix a pattern an analysis can see.
 
 
 ### Ruled and sequenced (owner decisions already made, waiting only on order)
