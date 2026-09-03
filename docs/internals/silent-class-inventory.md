@@ -32618,12 +32618,14 @@ Repro:
 
 ---
 
-### D1197 — `.push` is the ONE delivery that drops the non-null recovery for a narrowed nullable REF: `out.push(e)` under `if e != null` is check-clean invalid wasm, while eight other positions for the same value all run
+### D1197 — [CLOSED 2026-09-03] `.push` is the ONE delivery that drops the non-null recovery for a narrowed nullable REF: `out.push(e)` under `if e != null` is check-clean invalid wasm, while eight other positions for the same value all run
 
-**check-clean invalid wasm — `type mismatch: expected (ref $type), found (ref null $type)`
-· filed 2026-09-02 (vl-b7) while building deep `is` (D1035), which is why the generated
-walkers return `T` + a separate `boolean` instead of the `T | null` the shape wants ·
-clause 1**
+**runs, prints `1` — CLOSED 2026-09-03: `emitPush` asks `nulNicheRecoverOwed` before it
+stages the value, the same question the binding / return / argument / field / assign
+deliveries ask · was check-clean invalid wasm, clause 1 · the FILED SCOPE WAS ONE CELL AND
+THE POPULATION IS 20: a rep grid of 11 element reps x 2 faces graded 2 of 22 `runs` before
+and 22 of 22 after, so every ref rep was red at `.push`, not only the struct one · the
+position matrix moved 23 -> 25 `runs` of 36 graded with 0 `runs` lost**
 
 Repro:
 
@@ -32655,6 +32657,13 @@ Repro:
 
   So this is NOT the D965/D1031 shape of "a capability served in one place and delivered in
   many". Eight positions already recover the non-null; `emitPush` is the one that does not.
+
+* **THE MECHANISM, AS WHAT THE RUNG RECEIVED.** Not the `array.set` — the push VALUE SLOT.
+  A ref-push quad's value local is declared `(ref $rlElemHeap[slot])` unless the element is
+  itself a niche (`rlElemNullable`), and the disassembly shows `local.set $0` of type
+  `(ref $0)` receiving a `global.get` of type `(ref null $0)`. `pushDestVKind` names that
+  slot's rep from the element-kind code and hands it to the one question every other
+  delivery asks, so a rep added to `vkNulNicheOf` reaches `.push` too.
 
 * **WHY IT MATTERS BEYOND ITS OWN WITNESS.** It is what makes a deep-`is` walker that
   returns `T | null` unusable: the natural generated shape is `const e = walk(v[i])  if e !=
@@ -35098,9 +35107,14 @@ Repro (runs, prints `true`):
 Fixture: `tests/cases/unions/union-concrete-operand-delivery-equality.vl`.
 ---
 
-### D1180 — a variant arm's `string | null` FIELD refuses the union `==` on a check-clean program, while the checker REJECTS the same field at the plain-struct spelling
+### D1180 — [CLOSED 2026-09-03] a variant arm's `string | null` FIELD refuses the union `==` on a check-clean program, while the checker REJECTS the same field at the plain-struct spelling
 
-**loud emit reject: `emitProgram: `==` over a struct union is not supported yet` · check rc 0 · clause 2 · ZERO corpus cells · found 2026-09-02 as the one cell of [D1096](#d1096)'s 15-cell field-rep grid that its fix does not close**
+**runs, prints `true` — CLOSED 2026-09-03, and the CHECKER QUESTION WAS SETTLED FIRST: BOTH
+SPELLINGS OWE A COMPARE · was a loud emit reject, clause 2 · a 15-type x 2-spelling grid
+went 2 -> 11 `runs` at the plain-struct spelling and 1 -> 8 at the arm spelling, with ZERO
+silent cells at either · it also closed a PRE-EXISTING clause-1 trap the widening exposed
+(a `Inner | null` arm field compared without a guard and died on `{d: null} == {d: null}`
+on `seed-latest`, 2026-09-03)**
 
 Repro (`vl check` rc 0, then the emitter refuses):
 
@@ -35128,11 +35142,40 @@ Repro (`vl check` rc 0, then the emitter refuses):
 * **DECIDE THE CHECKER QUESTION FIRST.** Building the compare while `isEquatable` refuses the
   plain spelling would leave one shape comparable in a union and not outside it, which is the
   kind of split the union path has repeatedly paid for.
+
+* **HOW IT WAS SETTLED, AND THE EVIDENCE.** `string | null == string | null` RUNS at the
+  DIRECT spelling and prints the right answers (`true false true`), so the language already
+  has a defined equality for the type — the refusal was not a design rule. `isEquatable`'s
+  blanket *"a NULLABLE field is NOT value-comparable"* was a REP observation (the niche
+  needs a guard) in a soundness gate's clothes, exactly as D101 found one rep narrower. The
+  rule is now `T | null` is comparable iff `T` is, which keeps every genuinely undefined
+  inner refused through the recursion: `{[string]: i32} | null` is still a CHECK reject.
+
+* **AND THE EMITTER HALF IS ONE WRAPPER, NOT ONE ARM PER REP.** `nulFieldInnerCode` maps a
+  ref-niche field code to its NON-NULL twin, and both ladders open the same null guard over
+  that twin's core (`null == null` true, one-sided null false, otherwise the core). It is
+  also the ADMISSION gate and the frame pre-pass's key, so a niche can never get a guard
+  with no core or a core with no frame. Codes 28 (`S[] | null`) and 22 (`fn | null`) are
+  MEASURED out of it — see [D1291](#d1291) and [D1292](#d1292).
+
+* **THE VARIANT LADDER WAS THE NARROWER ONE, WHICH IS THE OPPOSITE OF THE FILED AXIS.** The
+  headline is right about `string | null`, and the grid found `boolean | null` and
+  `"a" | "b" | null` running at the PLAIN spelling (D101) and refusing at the ARM one —
+  `variantFieldComparable` never grew D101's i32-sentinel rung. It has it now.
+
+* **Grading list.** The 15-type x 2-spelling grid; the actual-`null` case at both spellings
+  (`{d: null} == {d: null}` must be `true` and must not trap); the nested-struct compare,
+  whose code-15 arm is now guarded unconditionally; and
+  `tests/cases/std/error-array-needle-not-equatable.vl`, whose full-remedy-clause directive
+  this close MOVED for the third time (see that file's header).
 ---
 
-### D1181 — an `i64` or `f32` STRUCT FIELD has no equality core, while every other scalar field rep does — and a union ARM carrying the same field now compares
+### D1181 — [CLOSED 2026-09-03] an `i64` or `f32` STRUCT FIELD has no equality core, while every other scalar field rep does — and a union ARM carrying the same field now compares
 
-**loud emit reject: `emitProgram: unsupported struct field type in equality` · check rc 0 · clause 2 · ZERO corpus cells · found 2026-09-02 by running [D1096](#d1096)'s plain-struct CONTROL, which refuted that row's filed claim that "the same field types compare fine as plain struct fields"**
+**runs, prints `true` — CLOSED 2026-09-03: one arm serves all three wide numeric widths
+(`f64.eq` / `i64.eq` / `f32.eq`) in `emitStructEqFieldInner`, so THE TWO LADDERS NOW AGREE
+field code for field code · was a loud emit reject, clause 2 · graded on unequal values and
+through a nested struct, not just on `true`: `true false false true false`**
 
 Repro (`vl check` rc 0, then the emitter refuses):
 
@@ -35154,6 +35197,12 @@ Repro (`vl check` rc 0, then the emitter refuses):
 * **THE VALUES COMPARE AT EVERY OTHER POSITION**: `9000000000 == 9000000000` at the direct
   spelling, as a union arm's payload, and as a list element (`i64[] == i64[]` runs). This is
   the field POSITION alone.
+
+* **THE LADDERS AGREE, CHECKED BOTH DIRECTIONS.** `variantFieldComparable` admits
+  0/3/17/23/24/14/15/5 plus the list map; `emitStructEqFieldInner` now serves 17/23/24 from
+  one arm. Re-graded after the close: `{d: i64}` and `{d: f32}` run at the plain spelling
+  AND inside an `A | i32`, and the other three rows of this cluster were re-graded
+  UNMOVED by it — which is the evidence that this was its own family.
 ---
 
 ### D1093 — [CLOSED 2026-09-02] the VARIANT table codes an INLINE multi-member literal-union field `string` and the STRUCT table codes it `atom`, so an arm carrying one still has no field rep; the NAMED alias spelling of the same union runs
@@ -37530,11 +37579,13 @@ Repro:
 
 ---
 
-### D1114 — a NESTED-STRUCT field read through an `Arm | null` receiver is the loud `field access receiver is not a struct`; the same read off the bare arm, and off a non-arm niche, both run
+### D1114 — [CLOSED 2026-09-03] a NESTED-STRUCT field read through an `Arm | null` receiver is the loud `field access receiver is not a struct`; the same read off the bare arm, and off a non-arm niche, both run
 
-**loud emit reject: `emitProgram: field access receiver is not a struct` · `vl check` rc 0 ·
-clause 2 · found 2026-09-02 in [D1094](#d1094)'s position matrix · PRE-EXISTING: identical on
-master (`seed-latest`, 2026-09-02)**
+**runs, prints `10` — CLOSED 2026-09-03: `structIndexOfExpr`'s Member arm grew the NICHE
+twin of its `pvi` rung, resolving the field's TARGET row through `uFieldTgtStructIdx` ·
+was a loud emit reject, clause 2 · a 36-cell position matrix
+(`matrix/nulvariant-nested-struct-field.matrix.vl`) went 18 -> 24 `runs`, closing binding /
+block_if / block_while in both faces, with 0 `runs` lost and 0 silent**
 
 Repro:
 
@@ -37559,6 +37610,17 @@ Repro:
   code-15 field reached THROUGH the niche — the one field code [D1094](#d1094)'s fifth receiver
   rung does not serve, because `variantStructHeapTwinAt` declines codes 5 / 15 / 28 by design
   and the nested read needs the target row rather than the field's own code.
+
+* **THE FILED REPRO CARRIES TWO LINES OF SCENERY.** `const t = mk()` and `if t is S` are
+  not ingredients: the DECLARATION of the union alone is what moves `S` out of the struct
+  table, and the row reproduces with both lines deleted. Recorded because the next reader
+  should not go looking for an `is`-narrowing interaction that is not there.
+
+* **MECHANISM, AS WHAT THE RUNG RECEIVED.** `structIndexOfExpr(v.i)` was asked for the
+  layout of the OUTER read's receiver and answered -1: the struct probe misses (an arm has
+  no `sNames` row), `memIsNarrowed` is about `is`-narrowing and not a null test, and the
+  `exprVariantIndex` rung answers only for a NON-null variant. The niche rung is the
+  fourth question, and `uFieldTgtStructIdx` is the answer the field's own code cannot give.
 
 ### D1160 — [CLOSED 2026-09-02] DUPLICATE of [D1140](#d1140), filed 40 minutes apart by two workers on the same defect
 
@@ -39189,6 +39251,148 @@ Ablation:
   block's `n` must keep NOT colliding with an outer `n` once the emitter has an arm); and the
   call-then-block parse error, which is a separate question this row's close does not answer.
 
+### D1290 — a value-union BOX field (`i32 | null`, `f64 | null`) has no equality core at either spelling, and the checker now admits it
+
+**loud emit reject: `emitProgram: unsupported struct field type in equality` · `vl check` rc 0 ·
+clause 2 · found 2026-09-03 by [D1180](#d1180)'s 15-type field grid, which is what made the
+soundness gate stop refusing it**
+
+Repro:
+
+    type A = { d: i32 | null }
+    const a: A = { d: 3 }
+    const b: A = { d: 3 }
+    print(a == b)
+    // vl check rc 0; vl run -> emitProgram: unsupported struct field type in equality
+
+* **IT IS THE BOX, NOT THE NULL.** `i32 | null` and `f64 | null` are code 16 — a `{tag, value}`
+  BOX, two cells with a discriminant — not the `(ref null $H)` niche [D1180](#d1180)'s guard
+  serves. `nulFieldInnerCode` has no entry for 16 and should not: the compare is a TAG compare
+  plus a payload compare per member, which is a core to build, not a guard to open.
+
+* **THE SEVERITY MOVED SIDEWAYS AND THAT WAS THE PRICE OF THE SOUNDNESS FIX.** Before
+  [D1180](#d1180) this was a loud CHECK reject claiming the field was not value-comparable.
+  It is: three values, all distinguishable. So the check reject was wrong about the design and
+  the emit reject is the honest column — but the program compiles no better, which is exactly
+  the direction CLAUDE.md warns hides.
+
+* **Grading list.** `i32 | null`, `f64 | null` and `i64 | null` fields at the plain-struct and
+  the union-ARM spellings; the ARM spelling additionally refuses at
+  `` `==` over a struct union is not supported yet``, so the two must be re-graded together.
+
+### D1291 — an `S[] | null` FIELD is the one ref niche whose guarded compare is check-clean invalid wasm, so it is held OUT of the niche table and refuses loudly
+
+**loud emit reject: `emitProgram: unsupported struct field type in equality` · `vl check` rc 0 ·
+clause 2 · found 2026-09-03 by MEASURING every entry of [D1180](#d1180)'s `nulFieldInnerCode`
+under the guard, which is why the table is an admission gate rather than a mapping**
+
+Repro:
+
+    type Inner = { p: i32 }
+    type A = { d: Inner[] | null }
+    const a: A = { d: [{ p: 5 }] }
+    const b: A = { d: [{ p: 5 }] }
+    print(a == b)
+    // vl check rc 0; vl run -> emitProgram: unsupported struct field type in equality
+
+* **WITH `28 -> 5` IN THE TABLE IT IS SILENT**, `type mismatch: expected ref but found i32` —
+  measured, then withdrawn. Its non-null twin (code 5) does not take two refs off the stack
+  like the other leaf cores: it re-reads the two lists off the field path itself and hands them
+  to `emitListEqAnyRep`, so the guard's `ref.as_non_null` recover lands in the wrong place.
+
+* **THE SIBLING NICHES ALL RUN**, which is what says this is the arm's shape and not the
+  guard's: `string | null`, `i32[] | null`, `string[] | null`, `f64[] | null` and `i64[] | null`
+  fields all compare correctly under the same wrapper, null case included.
+
+* **Grading list.** The witness above; the same field inside an `A | i32` arm (a different
+  refusal, [D1293](#d1293)); and the `28` entry of `nulFieldInnerCode`, whose absence is the
+  fix's own contract.
+
+### D1292 — a `fn | null` FIELD is the second ref niche held out of the guard table: its closure-eq frame is reserved per NON-NULL code
+
+**loud emit reject: `emitProgram: unsupported struct field type in equality` · `vl check` rc 0 ·
+clause 2 · found 2026-09-03 the same way as [D1291](#d1291) — by putting `22 -> 14` in the table
+and grading it**
+
+Repro:
+
+    type Fn1 = (i32) => i32
+    type A = { d: Fn1 | null }
+    const f: Fn1 = (n: i32) => n
+    const a: A = { d: f }
+    const b: A = { d: f }
+    print(a == b)
+    // vl check rc 0; vl run -> emitProgram: unsupported struct field type in equality
+
+* **WITH `22 -> 14` IN THE TABLE IT IS SILENT AT BOTH SPELLINGS** — `unknown local 12: local
+  index out of bounds` at the plain struct one and `expected (ref null $type), found (ref
+  $type)` at the arm one. Two distinct causes in one entry: `cloEqNoteBin`'s frame scan never
+  sees the niche code, and `emitCloEqCore`'s two stash slots are typed non-null.
+
+* **THE FIX IS THE PAIR, NOT THE TABLE ENTRY** — the frame scan has to resolve a niche field
+  through `nulFieldInnerCode` the way the LIST frame pre-pass now does, and only then does the
+  entry become admissible. Recorded as the price of adding it blind.
+
+* **Grading list.** The witness above and its arm spelling; `f == g` at the direct spelling
+  (runs today and must keep running); the `22` entry of `nulFieldInnerCode`.
+
+### D1293 — an `S[] | null` ARM field has no variant field code at all, so the union `==` refuses on a sentence about a different allow-list
+
+**loud emit reject: `emitProgram: only i32 / boolean / string / array union-variant fields are
+supported` · `vl check` rc 0 · clause 2 · found 2026-09-03 in [D1180](#d1180)'s arm-spelling
+column**
+
+Repro:
+
+    type Inner = { p: i32 }
+    type A = { d: Inner[] | null }
+    function mk(n: i32): A | i32 {
+      if n == 0 { return 5 }
+      { d: [{ p: 5 }] }
+    }
+    const p = mk(1)
+    const a: A = { d: [{ p: 5 }] }
+    print(p == a)
+    // vl check rc 0; vl run -> emitProgram: only i32 / boolean / string / array union-variant fields are supported
+
+* **IT IS EARLIER THAN THE COMPARE.** The refusal fires while the variant table is BUILT, not
+  while the compare is emitted: the arm's field has no `uFieldTypes` code, so no admission gate
+  and no core is ever consulted. Dropping the `| null` runs; the same field on a plain struct
+  is code 28 and reaches [D1291](#d1291)'s refusal instead.
+
+* **THE SENTENCE IS THE ALLOW-LIST LIE D734 REMOVED ONE LAYER OUT.** An arm field may be `f64`,
+  `i64`, `f32`, a nested shape, a closure and five list backings, none of them named. Narrowing
+  it is part of the fix, not a substitute for one.
+
+* **Grading list.** The witness; the plain-struct twin ([D1291](#d1291)); `Inner[]` without the
+  `| null` as an arm field, which runs today.
+
+### D1294 — an ARM object literal cannot write `null` into its own `T[] | null` field: `bare null needs a struct-typed context`
+
+**loud emit reject: `emitProgram: bare null needs a struct-typed context` · `vl check` rc 0 ·
+clause 2 · PRE-EXISTING: identical on `seed-latest` (2026-09-03) · found 2026-09-03 while
+grading [D1180](#d1180)'s actual-null case at the arm spelling**
+
+Repro:
+
+    type A = { d: string[] | null }
+    function mk(k: i32): A | i32 {
+      if k == 2 { return 5 }
+      { d: null }
+    }
+    print(mk(1) == mk(1))
+    // vl check rc 0; vl run -> emitProgram: bare null needs a struct-typed context
+
+* **IT IS A CONSTRUCTION GAP, NOT A COMPARE ONE**, and the compare is what found it: the same
+  `{ d: null }` written for a PLAIN `A` binding builds and compares correctly
+  ([D1180](#d1180)), and `{ d: [] }` in the arm position builds. Only the bare `null` in an
+  arm-literal field of a list-niche type refuses.
+
+* **THE MESSAGE NAMES THE WRONG DESTINATION.** The context is a list niche, not a struct, so a
+  reader following the sentence looks for a missing struct annotation that would not help.
+
+* **Grading list.** The witness; `{ d: null }` for `string | null` and `Inner | null` arm fields
+  (both build today and must keep building); the plain-struct spelling of the same literal.
 ### D1280 — a `.pop()` INLINE in a `.push` ARGUMENT clobbers the push: the i32 face TRAPS, the string face silently drops the element
 
 **loads then traps (`wasm trap: out of bounds array access`) · check rc 0 · clause 1 · OPEN ·
