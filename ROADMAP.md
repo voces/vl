@@ -179,8 +179,8 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   - **NEXT: the `then`-removal arm in `parseIf`**, which is already single-statement and was
     called out at stage 1 as the cheapest remaining candidate.
 - **Modernization program — (1) comment trim, PILOT DONE #2413, batch 2 DONE #2428: six
-  files, batch 3 DONE #2433: `emit_collect`**: `compiler/parser.vl`, `compiler/format.vl` and
-  `compiler/emit_sections.vl` are at
+  files, batch 3 DONE #2433: `emit_collect`, batch 6 DONE #2440: `wasmEmit`**:
+  `compiler/parser.vl`, `compiler/format.vl` and `compiler/emit_sections.vl` are at
   the 12-line comment-block budget (72 blocks over 12 → 2, both of those module headers under
   their own 40-line budget), with a byte-identical seed and the moved text archived verbatim in
   `docs/internals/{parser,format,emit-sections}-notes.md`. **Batch 2 takes `emit_mono.vl`,
@@ -190,10 +190,14 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   `docs/internals/*.md`) or not at all; eleven already-false claims fell out of it. **Batch 3
   takes `emit_collect.vl` from 124/46 to 0/0** — 1,325 comment lines gone, three ORPHANED
   function headers moved back to the functions they document (`forceGenAppArgTypes`,
-  `collectA`, `collectTyReachRegister`), two stale citations corrected. **NEXT:
-  `emit_classify.vl` (398/151), `typecheck.vl` (365/69) and `wasmEmit.vl` (180/47)** — the
-  whole remaining 1,131/343, and the three files where the ratchet's `lint-self.sh` exemption
-  still has to hold.
+  `collectA`, `collectTyReachRegister`), two stale citations corrected. **Batch 6 takes
+  `wasmEmit.vl` from 180/47 to 0/0** — 1,535 comment lines gone, SEVEN orphaned function
+  headers moved back (so the block count rises by seven) and an eighth dropped because its
+  function had moved to `emit_classify.vl`, eight citations to the `toWasm.ts` / `parser.ts`
+  deleted in #466 removed, and two multi-page FILINGS graded rather than trimmed: the
+  `print(m["k"])` map note and the assignment-as-expression residue table both RUN today.
+  **NEXT: `emit_classify.vl` (398/151) and `typecheck.vl` (365/69)** — the whole remaining
+  951/296, and the two files where the ratchet's `lint-self.sh` exemption still has to hold.
 - **Modernization program, item 3 — the defect inventory is ONE FILE PER ROW. TOOLING SHIPPED;
   the split itself lands on merge day.** `scripts/inventory/split.py --apply --relink` run
   against fresh master, under a freeze on inventory appends; every consumer already reads
