@@ -4150,6 +4150,36 @@ annotation pins a rep the walk must not depend on): `{"port": 1} is Cfg` → `tr
 `cfg.host == null`; `{"port": 1, "host": null}` → `true`; `{"host": "x"}` → `false`; the
 two-arm union above refused at the checker.
 
+## Deep `is` over a `Json` value is a SHAPE WALK plus a conversion, and its walker is generated VL (2026-09-02)
+
+**Standing.** `r is T` where `r`'s type is a JSON-shaped union and `T` is not one of its
+arms is a RUNTIME SHAPE WALK, not a tag test. `docs/serde-design.md` §"Deep `is` / `as` over
+a `Json` value" is the design; **S1, S2 and S3 stand as built, S4 (the `as` trio) is the
+remainder**. S1: the arm binds one converted COPY, so mutating it never writes back to the
+tree — a `{[string]: Json}` map and a `Cfg` struct are different wasm reps, so the arm
+cannot be a view, and narrowing already changes rep silently for a value-union arm. S2: an
+integer target matches iff the value is integral and in range, and it is not a second
+definition — the walk asks `v as? i32`, so it IS §"Numeric `as` to an INTEGER target is
+exact-or-fail under the trio". S3 (RULED by the owner): an ABSENT key matches a `T | null`
+field as `null`, because the source's object level is a MAP and VL's own map read already
+says absent is `null`; a walk that refused it would be stricter than reading the map by hand.
+
+**Why the walker is GENERATED VL SOURCE rather than emitted wasm.** The walk must BUILD
+every target rep — a `string[]`, a struct, a `{[string]: i32}` map — and the emitter already
+knows how to build each of those out of ordinary VL. Generating the walk as source (one
+`__vlJsonIs_<k>` + `__vlJsonGet_<k>` pair per distinct target, parsed into the same arena and
+appended to the program root) means the arm's binding is an ORDINARY local of the target
+type, so no delivery position needs wiring and `wasmEmit.vl` learns no new rep. That is
+D965's rule satisfied by construction rather than by a nine-cell matrix. The cost is a
+second parse and a second check, paid ONLY by a program that has a deep `is` — a program
+without one emits byte-identical wasm.
+
+**Why a PAIR and not one function returning `T | null`.** The arm would then bind a nullable
+narrowed to non-null, and `.push` is a delivery that drops the non-null recovery for exactly
+that value (D1197, check-clean invalid wasm; eight other positions run). The pair costs a
+second walk and owes nothing to a standing defect. When D1197 closes, the pair collapses to
+one function and a RECURSIVE target (D1198) becomes expressible.
+
 ## Numeric `as` to an INTEGER target is exact-or-fail under the trio; a float target rounds; nothing ships in std (owner, 2026-09-02)
 
 **Ruling.** `x as T` with a numeric operand and an INTEGER target (`i32`, `i64`) succeeds

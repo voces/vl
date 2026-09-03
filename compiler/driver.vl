@@ -128,8 +128,16 @@ import {
   checkProgram,
   demangleMsg,
   initChecker,
+  jwSetGenTokStart,
+  jwSiteNode,
   printDomainStr,
 } from "./typecheck"
+import {
+  jwGenerateSource,
+  jwRestoreMangling,
+  jwRewriteAll,
+  jwSplice,
+} from "./json_walk"
 import {
   isvalMsgAt,
   isvalTokAt,
@@ -622,6 +630,56 @@ function vcLoadToks(src: string): i32 {
   }
   P.toks.length
 }
+// ── DEEP `is` OVER A `Json` VALUE — the SECOND CHECK PASS (D1035) ────────────
+//
+// `r is T` for a JSON-SHAPE `T` that is not one of the union's arms is a runtime
+// SHAPE WALK (`docs/serde-design.md` §"Deep `is` / `as` over a `Json` value").
+// The checker cannot lower one, so pass 1 only RECORDS which sites are that and
+// what they walk; this runs after it, generates one predicate + one builder per
+// distinct target as ordinary VL SOURCE, parses that fragment into the SAME
+// arena, appends its declarations to the program root, rewrites each site into a
+// call, and re-checks. Everything downstream then sees an ordinary program.
+//
+// IT COSTS NOTHING FOR A PROGRAM WITHOUT A DEEP `is` — `jwSiteNode` is empty and
+// this returns on its first line, which is why the compiler (which has none)
+// pays neither the second parse nor the second check.
+//
+// THE REWRITE REFUSING IS A HARD STOP, not a fall-through. A deep `is` the
+// rewrite cannot route would reach the emitter as a bare arm test and answer
+// `false` for every value — D1035 itself — so it is reported as a diagnostic
+// instead.
+function jwSecondPass(root: i32): i32 {
+  if jwSiteNode.length == 0 { return 0 }
+  const gen = jwGenerateSource()
+  if gen == "" { return 0 }
+  // The fragment is tokenized ONTO the existing stream (the module pipeline's
+  // own move) and parsed with `P.pos` at its first token, so every node the user
+  // wrote keeps its arena index and the recorded sites stay valid.
+  P.pos = P.toks.length
+  const jwGenTok = P.toks.length
+  vcLoadToks(gen)
+  jwRestoreMangling(jwGenTok)
+  const frag = parseProgram()
+  if vcParseBlocked() { return 1 }
+  if !jwSplice(root, frag) {
+    vcDgPush(P.diags.length, 1, 0, 0, 0)
+    P.diags.push(
+      { msg: "internal: deep `is` walkers could not be spliced", at: -1 },
+    )
+    return 1
+  }
+  // A refusal is already a positioned TYPE error on the offending `is` site; rc 2 is the
+  // type-error rung, exactly as pass 1's own diagnostics take.
+  if jwRewriteAll() > 0 { return 2 }
+  initChecker()
+  // AFTER the reset, not before: `initChecker` clears the walker worklist and this marker
+  // with it. The style tier must not report a finding about code the author never wrote,
+  // and the marker is the first generated token (`jwTokIsGenerated` reads it).
+  jwSetGenTokStart(jwGenTok)
+  checkProgram(root)
+  0
+}
+
 // 0 = ok; 1 = lex/parse error; 2 = type error; 3 = emit error.
 export function compileSrc(): i32 {
   symSetEnabled(0)
@@ -658,6 +716,10 @@ export function compileSrc(): i32 {
   // file's diagnostics are still ERRORS — `vl build`/`vl run` keep rc 1 and the
   // same parse message; the only difference is that the type errors the checker
   // just found are now reported with it instead of hidden behind it.
+  if P.diags.length > 0 { return 1 }
+  if T.diags.length > 0 { return 2 }
+  const jwRc = jwSecondPass(root)
+  if jwRc != 0 { return jwRc }
   if P.diags.length > 0 { return 1 }
   if T.diags.length > 0 { return 2 }
   // A single-source program's wasm ABI is its `export`-marked functions, staged
@@ -782,6 +844,13 @@ export function checkSrc(): i32 {
   checkProgram(root)
   // A lossless-recovered file reports BOTH streams and keeps rc 1 — the parse
   // mistake is still the headline error, the type errors ride with it.
+  if P.diags.length > 0 { return 1 }
+  if T.diags.length > 0 { return 2 }
+  // `check` runs the deep-`is` second pass too: a site the rewrite cannot route
+  // is a hard error, and `vl check` must not say yes to a program `vl build`
+  // then refuses.
+  const jwRc = jwSecondPass(root)
+  if jwRc != 0 { return jwRc }
   if P.diags.length > 0 { return 1 }
   if T.diags.length > 0 { return 2 }
   0
@@ -3225,6 +3294,15 @@ function modCompile(emit: i32): i32 {
   checkProgram(merged)
   // A lossless-recovered graph CHECKS but never BUILDS — same rule as
   // `compileSrc`, and the rc stays 1 so `vl build` behaves exactly as before.
+  if P.diags.length > 0 { return 1 }
+  if T.diags.length > 0 { return 2 }
+  // The deep-`is` second pass, on the MERGED program: the generated walkers name
+  // their types through `tyToStr`, which after the merge renders the mangled
+  // declarations (`Json$m1`), and the fragment is parsed AFTER the rename pass —
+  // so its identifiers resolve verbatim in exactly the scope they were rendered
+  // from.
+  const jwRc = jwSecondPass(merged)
+  if jwRc != 0 { return jwRc }
   if P.diags.length > 0 { return 1 }
   if T.diags.length > 0 { return 2 }
   if emit != 0 {
