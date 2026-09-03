@@ -139,22 +139,15 @@ import {
 // ── self-method / operator / index-trap dispatch REWRITE (B13 + B14) ─────────
 // The HOST resolves these in its type-aware parser; the native parser is
 // type-free, so the emitter rewrites the arena BEFORE monomorphization:
-//   o.f(args)  → f(o, args)         a free `self`-function, receiver a struct
-//                                   that lacks a field `f` (UFCS)
-//   a op b     → op(a, b)           a free `self`-function named for the
-//                                   operator, struct left operand
-//   a op b     → (a."op")(b)        the left operand carries an operator
-//                                   closure FIELD ("*", "/", …)
-//   o[k]       → (o."[]")(k)        a "[]" trap field (native arrays/maps/
-//                                   strings never classify as structs, so they
-//                                   keep their fast paths)
-//   o[k] = v   → (o."[]=")(k, v)    a "[]=" trap field on the assignment form
-// The walk is POST-ORDER (children first, parents store the returned — possibly
-// new — child index back into their i32 child fields), so a chained `a[1][2]`
+//   o.f(args) → f(o, args)   a free `self`-function, receiver a struct with no
+//                            field `f` (UFCS); `a op b` → `op(a, b)` likewise
+//   a op b    → (a."op")(b)  left operand carries an operator closure FIELD
+//   o[k]      → (o."[]")(k)  a "[]" trap field; `o[k] = v` → `(o."[]=")(k, v)`
+//                            (arrays/maps/strings never classify as structs,
+//                            so they keep their fast paths)
+// POST-ORDER (parents store the returned child index back), so `a[1][2]`
 // rewrites its inner trap before the outer looks at its receiver. The rewritten
-// forms ride the EXISTING lowerings: plain calls monomorphize per receiver
-// shape; field-closure calls use the member-call machinery. Usage-gated: a
-// program with none of these shapes rewrites nothing (byte-identical bytes).
+// forms ride the EXISTING lowerings, and a program with none of these shapes rewrites nothing.
 
 // The `fnStmts` index of a free `self`-function `name` reachable at `argc` total
 // params (first param NAMED `self`), or -1 — the host's UFCS reachability rule,
@@ -184,23 +177,18 @@ export function drwSelfFnOf(name: string, argc: i32) {
   -1
 }
 
-// Normalize a DIRECT call to its callee's FULL arity, appending the
-// declaration's DEFAULT expressions for the trailing arguments the call omitted.
+// Normalize a DIRECT call to its callee's FULL arity, appending the declaration's
+// DEFAULT expressions for the trailing arguments the call omitted.
 //
 // This is the whole emit-side of parameter defaults. It runs before
-// monomorphization and before signature collection, so mono, `collectCloSigs`
-// and the emitter's per-parameter argument coercion all see an ordinary
-// full-arity call and need to know nothing about defaults. That is also what
-// keeps the feature clear of the `$fnsig` value-call ABI: the callee's declared
-// signature never changes, no call site is reclassified, and no new signature
-// key is minted — `fnSigKeyOf` reads the DECLARATION's parameter list, which
-// this does not touch.
+// monomorphization and signature collection, so mono, `collectCloSigs` and the
+// per-parameter argument coercion all see an ordinary full-arity call. It is also
+// what keeps the feature clear of the `$fnsig` value-call ABI: the callee's
+// declared signature never changes and no new signature key is minted.
 //
 // The callee is resolved with `fnIndexOfInScopeChain` — the SAME classifier
-// `emitCall` uses to choose the direct/captured path over `call_ref`, so a call
-// is normalized here exactly when it will be emitted as a direct call. A call
-// through a function VALUE resolves no function and keeps its full arity, which
-// leaves an under-supplied value call as the arity error the checker reported.
+// `emitCall` uses to pick the direct path over `call_ref` — so a call through a
+// function VALUE resolves nothing and keeps the arity error the checker reported.
 function drwFillDefaults(ix: i32, ctx: i32) {
   const n = P.nodes[ix]
   if n is Call {
@@ -274,42 +262,17 @@ function drwIsMapRead(ix: i32) {
 }
 
 // Does ANY instantiation of the enclosing generic resolve `prop` as a FIELD of the
-// receiver — so the answer differs per instance and this member call is not one rewrite's
-// to make?
+// receiver — so the answer differs per instance and this member call is not one
+// rewrite's to make?
 //
-// THE DISPATCH REWRITE RUNS BEFORE MONOMORPHIZATION (the pass table's
-// `monomorphize > dispatchRewrite` edge, so a rewritten call instantiates per receiver
-// shape), which means `drwWalk` meets `x.m()` while `x` is still a type parameter:
-// `structIndexOfExpr` finds no struct row, the `si < 0` arm sees a matching `self`-function,
-// and the call is rewritten to a direct call ONCE, for every instance the generic will ever
-// have. An instantiation whose type carries `m` as a closure FIELD then calls the free
-// function with a struct it cannot take — `vl check` rc 0, INVALID WASM
-// (`silent-class-inventory` D1002).
-//
-// THE DECISION IS THE CALL SITES', NOT THE BODY'S. The body cannot answer, but the call
-// sites can: the checker has already recorded a type on every argument node, so the set of
-// receivers this parameter will ever hold is readable here. Declining the rewrite hands the
-// call to the FIELD-CLOSURE lowering, which resolves per FUNCTION (`exprIsClosure(…, fnIx)`)
-// and is therefore already right at every instance.
-//
-// UNANIMITY USED TO BE REQUIRED, and D1063 was that bound's price: where the instantiations
-// DISAGREE — one receiver carrying the field, another taking the `self`-function — no single
-// AST can serve both, because `monoCloneBody` SHARES every leaf expression between instances
-// (only the statement spine is rebuilt). Deferring anyway left the UFCS side unrewritten at
-// emit, where `emitCall`'s member fallback covers expression position and nothing covers the
-// tail statement (`emitProgram: unsupported member-call statement`) or the classifier-driven
-// positions (a `const s = x.m()` local took the i32 default — measured, and invalid wasm).
-//
-// SO THE DEFERRED QUESTION IS ANSWERED WHERE THE PIN EXISTS, and that is why "any" is now
-// enough: `monoPinBinOps`' member-call arm re-runs the rewrite PER INSTANCE off the pinned
-// receiver type, so the disagreeing instances get different ASTs and each downstream
-// classifier still sees the plain named call the pre-mono rewrite gave it. Measured over a
-// 70-cell position matrix (10 receiver shapes x 7 positions): the mixed shape moved from 7
-// check-clean invalid-wasm cells to 7 running, with zero controls lost.
-//
-// Declines (false) on anything it cannot classify exactly: a receiver that is not the bare
-// parameter, a generic reached by UFCS rather than by name, a call site that does not reach
-// the position, and a generic with no call site at all — each keeps the existing rewrite.
+// The rewrite runs BEFORE monomorphization, so `drwWalk` meets `x.m()` while `x` is
+// still a type parameter and would rewrite once for every instance the generic will
+// ever have — `vl check` rc 0, invalid wasm at any instance carrying `m` as a closure
+// FIELD (D1002). The BODY cannot answer; the CALL SITES can, because the checker
+// recorded a type on every argument node. Declining hands the call to the
+// field-closure lowering, which resolves per FUNCTION and is right at every instance.
+// "Any" (not unanimity) is enough because `monoPinBinOps` re-runs the rewrite PER
+// INSTANCE off the pinned receiver type — D1063 is the price unanimity charged.
 function drwAnyInstanceTakesField(recvIx: i32, prop: string, ctx: i32) {
   if ctx < 0 { return false }
   // ORDERED BY COST, and the order is load-bearing. `tyHasTyVar` fans out over a union's
@@ -381,54 +344,30 @@ function drwWalk(ix: i32, ctx: i32) {
     if callee is Member {
       callee.memObj = drwWalk(callee.memObj, ctx)
       // UFCS (host parser.ts case 2): `o.f(args)` where `f` is a free function
-      // whose FIRST parameter is named `self` (arity matching) lowers to the
-      // direct call `f(o, args)`. The receiver TYPE does not gate it — string,
-      // i32, and value-union receivers dispatch identically to struct ones.
-      // The Call node mutates in place: the receiver shifts in as argument 0,
-      // the callee becomes a bare Ident, and any named args slide right of the
-      // unnamed receiver ("" rides slot 0).
+      // whose FIRST parameter is named `self` lowers to the direct call
+      // `f(o, args)`. The receiver TYPE does not gate it. The Call node mutates
+      // in place: the receiver shifts in as argument 0, the callee becomes a bare
+      // Ident, and any named args slide right of the unnamed receiver.
       //
-      // The module merge mangles a free `self`-function (`shout` → `shout$m1`)
-      // but leaves the call's property plain so field precedence still resolves
-      // from the receiver shape; `ufcsAliasAtSite` maps the plain property to the
-      // mangled function, and the rebuilt direct-call Ident carries that name so
-      // every downstream pass (string detection, print routing, coercion) sees a
-      // normal named call. Identity single-file.
-      //
-      // D1120 — AT THE SITE. `ix` is this Call's arena node, the index the merge
-      // walk banked its own `modSelfFnTarget` answer on, so two merged modules'
-      // same-named `self`-functions no longer collapse onto whichever one the
-      // dependency-first walk registered first. Identity single-file and for any
-      // node the walk never saw (the plain-name map answers those, as before).
+      // The module merge mangles a free `self`-function (`shout` → `shout$m1`) but
+      // leaves the call's property plain, so `ufcsAliasAtSite` maps the plain
+      // property to the mangled function and every downstream pass sees a normal
+      // named call. D1120 — asked AT THE SITE (`ix` is this Call's arena node, the
+      // index the merge walk banked `modSelfFnTarget` on), so two merged modules'
+      // same-named `self`-functions no longer collapse onto whichever came first.
       const uName = ufcsAliasAtSite(ix, callee.memProp)
       // Precedence, mirroring the host:
       //   • a REAL struct field of that name wins (a value access, not a call);
       //   • a callable FIELD (closure-valued, kind 14) wins as a `call_ref`
       //     member-call (`exprIsClosure`), so it is NOT UFCS-rewritten.
-      // A non-struct receiver has no fields, so neither precedence case can
-      // apply — the rewrite fires once a matching `self`-function exists.
+      // A non-struct receiver has no fields, so neither case can apply.
+      //
       // D1070 — FIELD-FIRST IS THE CHECKER'S PREDICATE, ASKED FIRST, IN EVERY SCOPE.
-      // Everything below this line resolves an emit-side struct-table ROW, and a row is
-      // not what the precedence rule is about. `structIndexOfExpr` answers for a MODULE
-      // GLOBAL (`globalStructIndexSid`, filled by `collectA`/`collectFns`, both before
-      // this pass) and for a PARAM, and answers -1 for a receiver bound inside a function
-      // body — `declaredStructIndex` reads `localNames`, which `buildLocals` fills during
-      // `emitModule`, long after `dispatchRewrite`. `exprIsClosure`'s Member arm hangs off
-      // the same `structIndexOfExpr`, so the `si < 0` fallback could not see the callable
-      // field either, and the arm read "no field, so UFCS".
-      //
-      // Measured on the pre-fix seed, one program per scope, same struct and same
-      // self-function: `ctx=-1 si=0 isClo=T` at module top level and `ctx=18 si=-1
-      // isClo=F` in a body — while `tyFieldTyOf(nodeTyIxOf(recv), prop)` answered a real
-      // field type (45 / 49) in BOTH. The checker had the answer in every scope; only the
-      // emitter's row lookup was scope-dependent, and it was deciding the rule.
-      //
-      // So the precedence question is asked of the RECEIVER'S CHECKED TYPE, through the
-      // exact predicate `ufcsCallTy`'s caller uses for `ufcsHasField` (`tyFieldTyOf` —
-      // `TyObj` + a field of that name). Ahead of the row lookup, and STRICTLY NARROWING:
-      // it can only turn a UFCS rewrite off, never on, so a receiver the checker recorded
-      // no type for (or a TyVar receiver inside a generic body, which is `drwEveryInstance
-      // TakesField`'s question, not this one) keeps exactly today's classification.
+      // `structIndexOfExpr` answers for a module global and a param but -1 inside a
+      // function body (`localNames` is filled long after this pass), so the emit-side
+      // ROW decided the rule scope-dependently. Ask the RECEIVER'S CHECKED TYPE
+      // instead (`tyFieldTyOf`, what `ufcsCallTy` uses), ahead of the row lookup and
+      // STRICTLY NARROWING: it can only turn a UFCS rewrite off, never on.
       const recvFieldTy = tyFieldTyOf(nodeTyIxOf(callee.memObj), callee.memProp)
       const recvHasField = recvFieldTy >= 0
       const si = structIndexOfExpr(callee.memObj, ctx)
@@ -561,47 +500,28 @@ function drwWalk(ix: i32, ctx: i32) {
     // selected, so the coalesce FOLDS AWAY here, before collection and classification.
     //
     // WHY A REWRITE AND NOT AN EMIT ARM. Lowering the identity inside `emitCoalesce`
-    // (`emitExpr` on the left operand) produces the right BYTES and the wrong TYPE: every
-    // consumer classifier — `exprString`, `exprIsLitAtom`, the print-import chooser, the
-    // local-cell ladder — dispatches on the `??` NODE, and each of their `??` arms answers
-    // only for a NULLABLE left operand (they were written for the fused map/niche reads).
-    // A non-nullable LHS therefore fell past all of them to the i32 default while the emit
-    // pushed the LHS's real rep. MEASURED on the 9,126-cell nullability sweep: the emit-arm
-    // version turned 132 loud rejects into `correct` and 62 into SILENT failures — 40
-    // invalid-wasm (`string`, inline litunion: `expected i32, found (ref $type)` at `print`)
-    // and 22 wrong-value (a named litunion printed its raw atom id). Folding the node
-    // instead means there is no `??` node left to classify, so all of them agree by
-    // construction.
+    // produces the right BYTES and the wrong TYPE: every consumer classifier
+    // (`exprString`, `exprIsLitAtom`, the print-import chooser, the local-cell ladder)
+    // dispatches on the `??` NODE and answers only for a NULLABLE left operand, so a
+    // non-nullable LHS fell to the i32 default while the emit pushed the LHS's real rep
+    // — invalid wasm and wrong values. Folding the node leaves nothing left to classify.
     //
-    // Safe to run this EARLY, ahead of every fused `??` lowering, because each of those
-    // lowerings requires a NULLABLE left operand and this fires only on a non-nullable one:
-    // `m[k]`, `m.get(k)`, `xs.get(i)` and `xs.pop()` are all typed `V | null` by the
-    // checker, so `nodeTyExcludesNull` declines them and their fused reads keep their
-    // default. Anything the query cannot prove non-nullable keeps the `??` node and the
-    // emitter's own loud reject.
+    // Safe this EARLY because every fused `??` lowering (`m[k]`, `m.get`, `xs.get`,
+    // `xs.pop`) needs a NULLABLE left operand, which `nodeTyExcludesNull` declines.
     if n.binOp == "??" {
       if nodeTyExcludesNull(n.binLeft) { return n.binLeft }
-      // D962 — `x ?? d` OVER A NULLABLE VALUE-UNION BOX DESUGARS HERE, for the same reason
-      // the fold above lives here rather than in `emitCoalesce`: the header's argument is
-      // that "every consumer classifier dispatches on the `??` NODE", so a lowering the
-      // consumers do not know about is correct bytes in the wrong envelope. Two emit arms
-      // for this rep were built and both proved that exactly (D960): the second emitted a
-      // correct `(if (result (ref $box)) …)` and the return path wrapped it in a SECOND
-      // `struct.new $box`. Rewriting leaves no `??` node to classify, so the question
-      // cannot arise.
+      // D962 — `x ?? d` OVER A NULLABLE VALUE-UNION BOX DESUGARS HERE, for the reason
+      // the fold above lives here: a lowering the consumer classifiers do not know
+      // about is correct bytes in the wrong envelope. Two emit arms for this rep were
+      // built and both proved it (D960) — the second's correct `(if (result (ref
+      // $box)) …)` was wrapped in a SECOND `struct.new $box` by the return path.
       //
-      // RE-READABLE LEFT OPERANDS ONLY, and here that is a CORRECTNESS bound rather than a
-      // cost one: the desugaring names the operand twice, and `exprReReadable` is precisely
-      // the predicate for "evaluating this again is the same value with no second effect". A
-      // CALL operand keeps the `??` and the emitter's refusal, which is why D960 stays open.
-      // ...AND NOT OVER A MAP READ, WHICH ALREADY HAS A FUSED LOWERING. `m[k]` is
-      // re-readable in the sense this predicate means — effect-free, same value twice — so
-      // the desugar fired on it, and the `!= null` it synthesizes lowers as a TAG read on
-      // the box. A map MISS is not a null-tagged box, it is a bare `ref.null` in the vals
-      // slot, so the tag read was `struct.get` on a nullable ref: `vl check` rc 0 and a
-      // module the engine refuses (D1019). `emitMapGetOr` already lowers this shape
-      // correctly and probes the map ONCE rather than twice, so the fix is to leave it
-      // alone. Module scope escaped only because its binding took a different path.
+      // RE-READABLE LEFT OPERANDS ONLY, and here that is CORRECTNESS, not cost: the
+      // desugaring names the operand twice. A CALL operand keeps the `??` and the
+      // emitter's refusal, which is why D960 stays open. AND NOT OVER A MAP READ: a
+      // map MISS is a bare `ref.null` in the vals slot, not a null-tagged box, so the
+      // synthesized `!= null` read a tag off a nullable ref (D1019). `emitMapGetOr`
+      // already lowers that shape correctly and probes the map once.
       if exprReReadable(unwrapParen(n.binLeft)) && !drwIsMapRead(n.binLeft) {
         if tyIsNulValueUnionBox(nodeTyIxOf(n.binLeft)) {
           const dsThen: i32[] = []
@@ -630,23 +550,14 @@ function drwWalk(ix: i32, ctx: i32) {
       // order); else an operator closure FIELD dispatches member-call style.
       //
       // THE SELF-FN GATE ASKS THE CHECKER AND THE FIELD GATE ASKS THE EMITTER'S STRUCT
-      // TABLE, and until D424 both asked the table. `structIndexOfExpr`'s `Ident` arm knows
-      // a PARAM, a module-declared binding, a GLOBAL and a CAPTURE — and not a plain
-      // function-body LOCAL, whose slot is minted by the emit pass this rewrite runs ahead
-      // of. So `const a: V = { … }` inside a function body did not dispatch: `a < b` fell
-      // into the numeric tail and emitted `i32.lt_s` over two struct refs — `vl check` rc 0,
-      // INVALID WASM — and `a + b` reached its field read as a non-struct, a loud
-      // `field access receiver is not a struct`. The SAME program at module scope, or with
-      // the operands delivered as PARAMETERS or GLOBALS, dispatches and runs, which is why
-      // `tests/cases/objects/operator-self-method.vl` — the tree's ONE operator fixture — is
-      // green: every binding in it is a module global. A single position, and the fixture
-      // sat at the working one.
-      //
-      // The self-fn branch needs only "is the left operand an OBJECT", which is exactly what
-      // the CHECKER asked before resolving the dispatch itself (`opSelfFnTy`, under
-      // `T.tys[lt] is TyObj`), so it asks the same question of the same bank. The FIELD
-      // branch needs the struct table ROW to look the field up in and cannot be widened the
-      // same way. (`silent-class-inventory` D424.)
+      // TABLE, and until D424 both asked the table. `structIndexOfExpr` does not know a
+      // plain function-body LOCAL — its slot is minted by the emit pass this rewrite
+      // runs ahead of — so `const a: V = { … }` in a body did not dispatch: `a < b`
+      // emitted `i32.lt_s` over two struct refs, check-clean INVALID WASM. The same
+      // program at module scope runs, which is why the tree's ONE operator fixture
+      // (`tests/cases/objects/operator-self-method.vl`, all globals) stayed green.
+      // The self-fn branch asks only "is the left operand an OBJECT" — the CHECKER's
+      // own question (`opSelfFnTy`); the FIELD branch needs the ROW and cannot (D424).
       if osi >= 0 || nodeTyIsObj(n.binLeft) {
         if drwSelfFnOf(n.binOp, 2) >= 0 {
           const oargs: i32[] = []
@@ -770,27 +681,18 @@ export function dispatchRewrite(stmts: i32[]) {
   0
 }
 
-// Pin every un-annotated lambda that returns a UNION to that union, by CONSUMING the contextual return
-// type the CHECKER already computed — instead of re-deriving it per boundary in the emitter.
+// Pin every un-annotated lambda that returns a UNION to that union, by CONSUMING the
+// contextual return type the CHECKER already computed rather than re-deriving it per
+// boundary in the emitter.
 //
-// An un-annotated lambda's body-inferred return for a union join (`if … { aCat } else { aDog }`)
-// collapses to ONE arm (a struct / string), so its emitted functype result and `$fnsig` key (`i>s0;` /
-// `i>S`) disagree with a call site's `i>u` — leaving the value call un-interned and the body un-boxed.
-// Pinning `fnRet` to the union makes the lambda emit the boxed-union result (like an annotated `: Cat |
-// Dog` function): it interns `i>u`, boxes each arm via `emitReturnValue`'s `retUNm`, and the call's
-// `ref.cast` + `is`-narrow resolve. The checker proved the union the lambda returns AT ITS BOUNDARY
-// (binding / function-return / struct field / array element / call argument) and recorded it under a
-// node-index sentinel (`inferRetNameByNode`, the #533 channel) — so reading it pins the return at EVERY
-// position UNIFORMLY, with no per-boundary walk (the abstraction the emitter's syntactic re-derivation
-// otherwise lacks). Runs BEFORE monomorphization (a HOF-bound clone inherits `nret = fnRet`) and the
-// shape passes (the union's box + variants intern for the return). A non-union recorded return / an
-// already-annotated lambda is left untouched → byte-identical (the compiler has no union-returning
-// lambdas, so the native fixpoint is unaffected).
-//
-// EVERY ARM BELOW READS THE SAME WAY: the checker proved/adopted shape X at the lambda's boundary,
-// and pinning `fnRet` routes the lambda through the lowering the ANNOTATED named-function spelling
-// already has. Each arm states only what is its own — the recorder, the witness, and the failure the
-// pin prevents.
+// A body-inferred return for a union join (`if … { aCat } else { aDog }`) collapses to
+// ONE arm, so the lambda's functype result and `$fnsig` key disagree with the call
+// site's `i>u` and the value call goes un-interned, the body un-boxed. Pinning `fnRet`
+// to the union makes the lambda emit the boxed-union result exactly as the ANNOTATED
+// spelling does. The checker recorded the boundary's proof under a node-index sentinel
+// (`inferRetNameByNode`), so one read pins every position uniformly. Runs BEFORE
+// monomorphization and the shape passes. EVERY ARM BELOW READS THE SAME WAY: it states
+// only its own recorder, witness, and the failure the pin prevents.
 export function synthRetAnnots() {
   if !fnValUsed { return 0 }
   let fe = 0
@@ -821,22 +723,18 @@ export function synthRetAnnots() {
           // answer from the name that producer built. See the nullable arm below for the first
           // arm converted; the rest are specified in the destringify programme's B26/B27.
           const ctxRow = inferRetRowByNode(lamIx)
-          // ASKED OF THE RUNG. This four-way disjunction was the ladder's largest name test, and
-          // for four of its eight rungs it reduced to `isUName(ctx)` ALONE — a lookup in the
-          // module's union REGISTRY, filled by a LATER pass. So the pin depended on
-          // `collectU`'s inferred-return loop reaching `registerInlineUnion`, and asking the
-          // producer instead removes that cross-pass dependence entirely. See
-          // `inferRetRungIsBoxedUnion` for the chain, and for the safety net this trades away.
+          // ASKED OF THE RUNG. This four-way disjunction was the ladder's largest name
+          // test, and for four of its eight rungs it reduced to `isUName(ctx)` alone —
+          // a lookup in the module's union REGISTRY, filled by a LATER pass. So the pin
+          // depended on `collectU`'s inferred-return loop reaching `registerInlineUnion`;
+          // asking the PRODUCER instead removes that cross-pass dependence entirely. See
+          // `inferRetRungIsBoxedUnion` for the chain, and for the safety net it trades away.
           //
-          // MEASURED: 73 corpus files reach this arm, ALL EIGHT rungs exercised (3:27 · 4:4 ·
-          // 5:10 · 20:5 · 21:15 · 22:6 · 23:59 · 27:31 rows), no ninth rung reaches it, 0
-          // disagreements against the ladder position computed both ways.
-          //
-          // The `nameIsLitUnionArmValueUnion` disjunct it replaces was there because a value
-          // union with a litunion-ALIAS arm (`K0 | i64`) never registers as a union alias — the
-          // box is the value box, its alias arm the string atom — yet the pinned TypeRef lowers
-          // exactly like the annotated spelling. That case is rung 4, and it needs no special
-          // clause once the question is which producer answered.
+          // The `nameIsLitUnionArmValueUnion` disjunct it replaces was there because a
+          // value union with a litunion-ALIAS arm (`K0 | i64`) never registers as a union
+          // alias — the box is the value box, its alias arm the string atom — yet the
+          // pinned TypeRef lowers exactly like the annotated spelling. That case is one
+          // rung in the set above, needing no clause once the question is which producer answered.
           if inferRetRungIsBoxedUnion(ctxRow) {
             // A litunion ALIAS return (`(i32) => K = (x) => "b"`, recorded by the checker's
             // return adoption): pin `fnRet` to the alias so the lambda's `$fnsig` result keys
@@ -845,58 +743,44 @@ export function synthRetAnnots() {
             // declared union alias, `nameIsLitUnionType`).
             fn.fnRet = synthTypeRefTy(ctx, -1, ctxTy)
           } else if inferRetRungIsNullable(ctxRow) {
-            // ASKED OF THE RUNG, not of the name. This arm used to run `nullablePartOf(ctx)` — a
-            // depth-aware, quote-aware `|` scan — over a spelling the checker had just rendered
-            // from a type it was holding. The producer that built that spelling already knew the
-            // answer: only `nullableRetName` and `nulLitUnionRetName` mint a top-level nullable
-            // name, and both mint `<part> + "|null"` and nothing else.
+            // ASKED OF THE RUNG, not of the name. This arm used to run `nullablePartOf(ctx)`
+            // — a depth-aware, quote-aware `|` scan — over a spelling the checker had just
+            // rendered from a type it was holding. The producer that built that spelling
+            // already knew: only `nullableRetName` and `nulLitUnionRetName` mint a top-level
+            // nullable name, and both mint `<part> + "|null"` and nothing else. A value union
+            // with a `null` member (`i32|null`) does NOT come here — it is
+            // `valueUnionRetName`'s, claimed by the arm above via `isValueUnionName`.
             //
-            // MEASURED, and the discrimination checked separately from the agreement: 22 corpus
-            // files reach this arm, the two contributing rungs are BOTH exercised (39 rows from
-            // `nullableRetName`, 8 from `nulLitUnionRetName`), NO third rung reaches it, and there
-            // are 0 disagreements. The middle two clauses are what make the last one mean
-            // something — a clean agreement over rows from one producer would say nothing about
-            // the other.
-            //
-            // A value union with a `null` member (`i32|null`) does NOT come here: it is
-            // `valueUnionRetName`'s, and the arm above claims it via `isValueUnionName`.
-            //
-            // A NULLABLE-ref return (`P | null`, `string | null`) the checker proved at the lambda's
-            // boundary — pin it so the lambda's `$fnsig` result keys the nullable token (`>n<idx>;` /
-            // `>N`), matching the value call's key. The niche/nullable-struct lowering already exists
-            // for the annotated form; this routes the anonymous lambda through it. (Nullable dual of
-            // the union pin.)
+            // A NULLABLE-ref return (`P | null`, `string | null`) the checker proved at the
+            // lambda's boundary — pin it so the lambda's `$fnsig` result keys the nullable
+            // token, matching the value call's key. The niche/nullable-struct lowering already
+            // exists for the annotated form; this routes the anonymous lambda through it.
             fn.fnRet = synthTypeRefTy(ctx, -1, ctxTy)
-            // THE MAP-MEMBER-UNION ARM IS GONE, and its deletion is load-bearing rather than tidy.
-            // It read `nameIsMapMemberUnion(ctx)` and pinned `{[string]:f32} | {w:i32}` with a body
-            // IDENTICAL to arm 1's. Only `mapUnionRetName` (rung 21) can render such a name — no
-            // other producer emits a `{[`-leading name with >= 2 top-level atoms, and the
-            // `recordable` fall-through cannot (`isObjShapeName` rejects a top-level `|`) — and
-            // rung 21 is in arm 1's set above.
+            // THE MAP-MEMBER-UNION ARM IS GONE, and its deletion is load-bearing rather than
+            // tidy. It read `nameIsMapMemberUnion(ctx)` and pinned `{[string]:f32} | {w:i32}`
+            // with a body IDENTICAL to arm 1's. Only `mapUnionRetName` can render such a name
+            // — no other producer emits a `{[`-leading name with two or more top-level atoms,
+            // and the `recordable` fall-through cannot (`isObjShapeName` rejects a top-level
+            // `|`) — and that rung is in arm 1's set above.
             //
-            // KEEPING IT WOULD MASK A DEFECT. Since the bodies are identical, this arm can only
-            // ever fire when arm 1's rung set MISSED a row it should have claimed — and it would
-            // paper over that silently by pinning anyway. Deleted so that a gap in arm 1's set
-            // shows up as an un-pinned row rather than as nothing at all.
-            //
-            // Measured before deleting: 0 corpus files reach it.
+            // KEEPING IT WOULD MASK A DEFECT. Since the bodies are identical, this arm can
+            // only ever fire when arm 1's rung set MISSED a row it should have claimed, and it
+            // would paper over that silently by pinning anyway. Deleted so that a gap in arm
+            // 1's set shows up as an un-pinned row rather than as nothing at all. No corpus
+            // file reached it.
           } else if inferRetRungIsParenUnionElemList(ctxRow) {
-            // MEASURED THE WAY ARM 2's CONVERSION IS, because nine rungs at once is where a bare
-            // agreement count stops meaning anything: 16 corpus files reach this arm; ALL NINE
-            // contributing rungs are exercised (8:2 · 9:5 · 10:3 · 11:14 · 12:3 · 13:11 · 14:2 ·
-            // 15:4 · 19:3 rows); NO TENTH rung reaches it; 0 disagreements against the ladder
-            // position computed both ways. The middle two clauses are what make the last one
-            // mean something.
+            // ASKED OF THE RUNG, like arm 2, and checked the same three ways: every
+            // contributing rung exercised, no further rung reaching the arm, and no
+            // disagreement against the ladder position computed both ways. The middle
+            // clause is what makes the last one mean something.
             //
-            // EVERY ARM ABOVE THIS ONE IS NOW A RUNG TEST. Arm 3 (`nameIsMapMemberUnion`) used to
-            // sit here and was deleted with arm 1's conversion — every rung in this set declined
-            // it anyway (it needs a leading `{[`, and all nine render a `(`-leading array), so
-            // nothing in this set moved when it went.
-            // An ELEMENT-VALUE-UNION list return (`(f64|null)[]`, `(i32|null)[]`, `(i64|boolean)[]`,
-            // `(i64|string)[]`): `emitReturnValue` seeds each element through the value-union-box
-            // list rep (`refArrElemKind == 2`). `parenUnionArrElemName` extracts the box element (a
-            // `<v>|null` nullable value union OR a plain value union `i64|boolean`), the
-            // distinguishing mark of the niche/box list shape.
+            // EVERY ARM ABOVE THIS ONE IS NOW A RUNG TEST. Arm 3 (`nameIsMapMemberUnion`) used
+            // to sit here and went with arm 1's conversion — every rung in this set declined it
+            // anyway (it needs a leading `{[` and all of these render a `(`-leading array).
+            //
+            // An ELEMENT-VALUE-UNION list return (`(f64|null)[]`, `(i64|boolean)[]`): each
+            // element is seeded through the value-union-box list rep (`refArrElemKind == 2`),
+            // whose box element `parenUnionArrElemName` extracts — the shape's distinguishing mark.
             fn.fnRet = synthTypeRefTy(ctx, -1, ctxTy)
           } else if inferRetRungIsNestedElemUnionList(ctxRow) {
             // A NESTED (2-D+) union-element array return (`({f: (…) => boolean} | i32)[][]`,
@@ -932,46 +816,18 @@ export function synthRetAnnots() {
             // call found no interned signature.
             fn.fnRet = synthTypeRefTy(ctx, -1, ctxTy)
           } else if inferRetRungIsScalarListRet(ctxRow) {
-            // ASKED OF THE GATE that admitted the row. This arm's three-way predicate and
-            // `isScalarListRetName`'s admitted set are the SAME THREE STRINGS by construction,
-            // not by measurement: `arrElemNameRaw` rejects anything not ending `[]` and otherwise
-            // drops exactly those two characters, so `arrElemNameRaw(nm) == "f64"` IFF
-            // `nm == "f64[]"` — and both sides read the one home for that cut.
+            // ASKED OF THE GATE that admitted the row: this arm's three-way predicate and
+            // `isScalarListRetName`'s admitted set are the same strings by construction, since
+            // `arrElemNameRaw` drops exactly the trailing `[]`. Every other producer is excluded
+            // structurally — except `litUnionElemListRetName`, whose body is `alias + "[]"` for
+            // any REGISTERED alias and nothing reserves prim spellings for a `type` declaration,
+            // so `type f64 = "a"|"b"` makes a `K[]` return render `f64[]`. That row is ARM 6's,
+            // which sits above this one with an identical body — so the two agree only by ladder
+            // POSITION, not independently. RE-ARGUE THIS ARM IF THE ARMS ABOVE ARE REORDERED.
             //
-            // EXACTLY ONE PRODUCER CAN RENDER THOSE THREE, AND IT IS CLAIMED ABOVE. An earlier
-            // draft of this comment said NONE could, and enumerated the producers to prove it —
-            // the enumeration covered `litUnionAliasNameOfTy` (a bare identifier) and missed its
-            // element-list sibling `litUnionElemListRetName` (rung 26), whose body is
-            // `alias + "[]"` for any REGISTERED alias name. Nothing reserves prim spellings for a
-            // `type` declaration, and the alias lookup matches by literal SET rather than by
-            // name, so with `type f64 = "a"|"b"` registered first, a `K[]` return renders
-            // `f64[]`.
-            //
-            // That row is ARM 6's (`inferRetRungIsLitUnionElemList`), which sits above this one
-            // with a byte-identical body — so master and this conversion agree on it. But the
-            // agreement is ladder POSITION, not independence: if arm 6 ever moves below this one
-            // or its rung set narrows, the name test would still claim the row and the rung test
-            // would drop the pin. RE-ARGUE THIS ARM IF THE ARMS ABOVE ARE REORDERED.
-            //
-            // Every other producer is excluded structurally: union producers emit a top-level
-            // `|`, nullables emit `<part>|null`, paren-grouped lists open with `(`, nested and
-            // map lists end `][]` or carry braces, struct producers are brace-terminated.
-            // The three classifiers are `emit_base`'s one-line homes; this arm hand-wrote
-            // their bodies as whole-spelling equalities (`ctx == "i64[]" || …`) in a file
-            // that already imports that module. Three copies of three homes, and a
-            // whole-spelling compare decides a COMPOSITE type by its rendered characters —
-            // the homes ask the array grammar's one CUT and compare only the leaf name.
-            // (`typecheck.isScalarListRetName`, named below, is a FOURTH copy of the same
-            // three-way set; it cannot route here — `typecheck` is the module `emit_base`
-            // imports, so the edge only runs the other way. Left for its owner.)
-            //
-            // A DISTINCT-BACKING SCALAR-LEAF list return (`(i32) => f32[] = (q0) => ([97.5])`,
-            // `() => i64[] = () => ([5])`, `isScalarListRetName`'s recordable set): the body
-            // literal builds the leaf's wrapper under the RETURN-position seed and the pinned
-            // TypeRef collects its list types — the value-call index read requires them;
-            // un-pinned, the read fails "list type not collected". An i32-backed list (`i32[]`,
-            // `boolean[]`, `K0[]`) is never recorded here (self-classification already agrees
-            // with the annotation), so it never reaches this arm.
+            // A DISTINCT-BACKING SCALAR-LEAF list return (`() => i64[] = () => ([5])`): the pin
+            // collects the leaf wrapper's list types, which the value-call index read requires;
+            // un-pinned it fails "list type not collected". An i32-backed list never gets here.
             fn.fnRet = synthTypeRefTy(ctx, -1, ctxTy)
           } else if nameIsStructWithLitUnionField(ctx) {
             // A STRUCT-with-LITUNION-field return (`{f:K0}`, recorded by `objLitWidenFields`'
@@ -991,49 +847,27 @@ export function synthRetAnnots() {
             // elements and the `$fnsig` result keys the SAME reflist slot the annotated
             // `(): {f:…|boolean}[]` spelling resolves. Un-pinned, the self-inferred
             // plain-element list stored a struct ref into the boxed field's i32 tag slot —
-            // INVALID-WASM (fuzz-nightly run 29874629450, seed 214588500 d6).
-            // (Element-list sibling of the struct arm below.)
+            // INVALID-WASM (fuzz-nightly run 29874629450, seed 214588500 d6). Element-list
+            // sibling of the struct arm below.
             //
             // The guard's `[]` TEST and `[]` CUT are `emit_base`'s two homes (`nameIsArray` /
-            // `arrElemNameRaw`, #1175) — this arm and the next spelled both halves out by
-            // hand. `ctx.length > 2` stays IN FRONT of the test: it excludes the degenerate
-            // `"[]"`, which `nameIsArray` accepts and whose raw cut is "", exactly as the
-            // hand-written form did.
+            // `arrElemNameRaw`) — this arm and the next spelled both halves out by hand.
+            // `ctx.length > 2` stays IN FRONT of the test: it excludes the degenerate `"[]"`,
+            // which `nameIsArray` accepts and whose raw cut is "", as the hand-written form did.
             fn.fnRet = synthTypeRefTy(ctx, -1, ctxTy)
           } else if inferRetRungIsStructElemList(ctxRow) {
-            // THE RUNG COLUMN, not the spelling. `ctx.length > 2 && nameIsArray(ctx) &&
-            // nameIsWholeSpanShape(arrElemNameRaw(ctx))` re-derived from the render what
-            // `recordInferRet` already banked: this row was recorded BY `structElemListRetName`,
-            // and `inferRetRungAt` says so directly. Three name predicates and two `[]` cuts
-            // retire with it.
+            // THE RUNG COLUMN, not the spelling: the old guard re-derived from the RENDER what
+            // `recordInferRet` had already banked — this row was recorded BY
+            // `structElemListRetName`, and `inferRetRungAt` says so directly. The two
+            // disagreements are both the canon SOFTENING again (an element struct with a
+            // litunion-ALIAS field, which the name test accepts and the rung column does not);
+            // both corpus files and three constructed witnesses are unchanged across the two
+            // builds, so the narrowing is exercised on purpose and still inert.
             //
-            // THE ONE ARM OF THIS TAIL WORTH CONVERTING, measured rather than ranked. Forcing
-            // each of the six remaining arms off in turn: arms 9, 10, 12, 13 and 14 move **0
-            // corpus rows apiece** — their pins were earned on fuzz seeds and no fixture can see
-            // them work, so a clean A/B there would measure nothing (B81). THIS one moves **5**.
-            //
-            // TWO DISAGREEMENTS, both narrowings, both measured inert:
-            // `closures/closure-array-result-composed-reads.vl` and
-            // `closures/lambda-array-result-adopt.vl` reach here with `{a:f64,f:K0,z:string}[]`
-            // and `{a:f32,f:K0,z:i64}[]` — element structs with a LITUNION-alias field, which the
-            // name test accepts and the rung column does not. The canon softening again, a fifth
-            // site. Both files are byte-identical across the two builds, and so are three
-            // CONSTRUCTED witnesses: a litunion-field element list with a same-fieldset twin row
-            // in scope (the exact shape this arm exists to protect, per fuzz seed 369283890),
-            // the same without a twin, and a plain-element control.
-            //
-            // So: 0 corpus rows at a LIVE arm, with the narrowing exercised on purpose and still
-            // invisible. That is as much evidence as this site can produce.
-            // A PLAIN-STRUCT-element LIST return (`{a:i64,f:f64,z:{…}}[]`, recorded by
-            // `structElemListRetName`) — pin it so the element literals build under the
-            // annotated threading. Un-pinned, a program with same-fieldset TWIN rows in
-            // scope fieldset-matched the element onto the wrong row and boxed the list —
-            // INVALID-WASM (fuzz sweep3 multiobs leg, seed 369283890 case_00290).
-            // NOMINAL-resolved: a `{v:i32}[]` render over a declared `type S = {v:i32}`
-            // pins `S[]` so the `$fnsig` result keys the SAME ref-list slot the
-            // annotation-side value call resolves (un-resolved, the inline spelling
-            // keyed a twin slot — "no interned signature" on the ref-list ABI cases).
-            // Same two `[]` homes as the arm above (`nameIsArray` / `arrElemNameRaw`).
+            // A PLAIN-STRUCT-element LIST return (`{a:i64,f:f64,z:{…}}[]`): pin it so element
+            // literals build under the annotated threading — un-pinned, same-fieldset TWIN rows
+            // fieldset-matched the wrong row and boxed the list (INVALID-WASM, fuzz seed
+            // 369283890). NOMINAL-resolved, so the `$fnsig` keys the annotation side's ref-list slot.
             fn.fnRet = synthTypeRefTy(resolveShapeToNominal(ctx), -1, ctxTy)
           } else if nameIsStructWithUnionField(ctx) {
             // A STRUCT-with-UNION/NULLABLE-field return (`{f: boolean | {w: i32}}`,
@@ -1056,53 +890,31 @@ export function synthRetAnnots() {
             // map ref; fuzz-nightly seed 184510897 d6). (Map-field sibling of the
             // union-field-struct pin above.)
             fn.fnRet = synthTypeRefTy(ctx, -1, ctxTy)
-            // STAYS ON THE NAME — MEASURED DECLINE (B81), against a derivation that said the
-            // conversion was provably safe. The rung column is banked right here (`ctxRow`), and
-            // `inferRetRungAt(ctxRow) == IR_RUNG_STRUCT_PLAIN` looks like an exact twin: every
-            // `recordable` struct render is SPACED (`tyToStrAt`'s `TyObj` arm writes `", "`), so
-            // the only space-free brace render is `tyToEmitName`'s, which is what
-            // `structPlainRetName` banks. That argument is correct and still gets the wrong answer.
-            //
-            // ONE DISAGREEMENT, and it is the canon SOFTENING again:
-            // `literal-unions/inline-atom-shape-field.vl` reaches here with `ctx = "{v:string}"`
-            // at rung **SFB28**, not 2 — the field is a literal union, canon renders it `string`,
-            // and the space-free render says nothing about which rung banked it. Arm 9
-            // (`nameIsStructWithLitUnionField`) cannot see it for the same reason, so a rung-28
-            // row legitimately arrives at this arm and takes the NOMINAL-resolved pin.
-            //
-            // The rung test is therefore NARROWER, and this arm's whole job is preventing a
-            // same-fieldset twin row from being fieldset-matched wrong — INVALID-WASM, per the
-            // fuzz seeds cited below. Narrowing a pin that exists to stop invalid wasm is the
-            // dangerous direction.
-            //
-            // AND THE CORPUS CANNOT ADJUDICATE IT: forcing this arm OFF entirely moves **0 corpus
-            // rows**. The arm is inert here, so a 0-row conversion result would have been
-            // meaningless — it measured a site with no observable effect on any of the 81 files
-            // that reach it. A constructed rung-28-with-declared-nominal-twin witness agrees too.
-            // The evidence to convert this does not exist on this corpus, and the shape that
-            // would produce it is a fuzz seed, not a fixture.
+            // STAYS ON THE NAME — a DECLINE on measurement (B81), against a derivation that said the
+            // conversion was provably safe. `inferRetRungAt(ctxRow) == IR_RUNG_STRUCT_PLAIN`
+            // looks like an exact twin (every `recordable` struct render is SPACED, so the only
+            // space-free brace render is `structPlainRetName`'s), and that argument is correct
+            // and still gets the wrong answer: the canon SOFTENING lets a struct whose field is
+            // a literal union render `{v:string}` at a DIFFERENT rung, so such a row
+            // legitimately arrives here and takes the NOMINAL-resolved pin. The rung test is
+            // therefore NARROWER, and this arm's whole job is stopping a same-fieldset twin row
+            // from being fieldset-matched wrong — INVALID-WASM, per the fuzz seeds cited below.
+            // Narrowing a pin that exists to stop invalid wasm is the dangerous direction.
+            // AND THE CORPUS CANNOT ADJUDICATE IT: forcing this arm off entirely moves nothing
+            // here, so a clean A/B would have measured a site with no observable effect.
           } else if nameIsWholeSpanShape(ctx) && nameIsSpaceFree(ctx) {
-            // A PLAIN struct return recorded CANONICALLY (`structPlainRetName` —
-            // `{f:f32}`, `{a:i64,f:f64,z:{…}}`): pin it so the body literal builds
-            // under the annotated threading. Un-pinned, a same-fieldset TWIN row in
-            // scope fieldset-matched the wrong row (`{f: 4.5}` took the `{f: f64}`
-            // twin where the context declared `{f: f32}` — INVALID-WASM, fuzz sweep3
-            // multiobs leg, seed 784841544 case_00222). CANON-ONLY (the space
-            // guard): a legacy SPACED record (a struct whose composite fields
-            // `structPlainRetName` declines, recorded via the `recordable` render)
-            // must keep its established un-pinned route. NOMINAL-resolved: a shape
-            // with a declared twin (`{v:i32}` beside `type S = {v:i32}`) pins the
-            // NOMINAL name so the `$fnsig` matches the annotation-side key.
+            // A PLAIN struct return recorded CANONICALLY (`structPlainRetName` — `{f:f32}`,
+            // `{a:i64,f:f64,z:{…}}`): pin it so the body literal builds under the annotated
+            // threading. Un-pinned, a same-fieldset TWIN row in scope fieldset-matched the
+            // wrong row (`{f: 4.5}` took the `{f: f64}` twin where the context declared
+            // `{f: f32}` — INVALID-WASM, fuzz sweep3 multiobs leg, seed 784841544 case_00222).
+            // NOMINAL-resolved: a shape with a declared twin pins the NOMINAL name so the
+            // `$fnsig` matches the annotation-side key.
             //
-            // THE SPACE GUARD IS `tyname.nameIsSpaceFree` (W7). It was spelled
-            // `!strContains(ctx, " ")` — the ONE writing of this rule that no
-            // character-anchored census could see, because it asks the question as a
-            // substring CALL rather than as a `' '` compare. The two are equal on every
-            // input by construction, not by reachability: with a one-character needle
-            // `strContains` rejects the empty string on its `sub.length > s.length` line
-            // (where the home answers "space-free", true — and the negation makes those
-            // the same answer) and otherwise walks exactly the same `s[i] == ' '` compare.
-            // Retiring it takes `strContains` out of this file's `emit_base` import list.
+            // CANON-ONLY, and that is what the space guard is for: a legacy SPACED record (a
+            // struct whose composite fields `structPlainRetName` declines, recorded via the
+            // `recordable` render) must keep its established un-pinned route. The guard's home
+            // is `tyname.nameIsSpaceFree` (W7), not this file's own `strContains` spelling.
             fn.fnRet = synthTypeRefTy(resolveShapeToNominal(ctx), -1, ctxTy)
           }
         }
@@ -1114,37 +926,17 @@ export function synthRetAnnots() {
 }
 
 // D1062 — PIN AN INFERRED NULLABLE-LIST RETURN ON A NAMED FUNCTION, so it lowers through the
-// annotation the user did not write.
+// annotation the user did not write. `if n == 0 { return [1, 2] }; return null` infers
+// `i32[] | null`, and the ANNOTATED twin runs; the inferred spelling had no nullable-LIST arm
+// in the `fRetKind` cascade, fell to `criClassify` (which sees only the non-null arm), and the
+// bare `return null` reached `emitNullLitNode` with no seed at all.
 //
-// `function f(n: i32) { if n == 0 { return [1, 2] }; return null }` infers `i32[] | null`, and
-// the ANNOTATED twin `: i32[] | null` runs. What the inferred spelling had was a `fRetKind`
-// cascade with no nullable-LIST arm, so the row fell through to `criClassify`'s
-// expression-based fallback — which sees only the NON-NULL arm and stamps `"list"`. The
-// functype result was then the non-null `(ref $lTypeIdx)` and the bare `return null` reached
-// `emitNullLitNode` with no seed at all: `emitProgram: bare null needs a struct-typed context`.
-//
-// A PIN RATHER THAN CASCADE ARMS, and the reason is the fan-out. `vtKindOfType` resolves FIVE
-// distinct kinds for the annotated spelling — `nullist` (i32/boolean backing), `nulstrlist`,
-// `nulf64list`/`nuli64list`/`nulf32list`/`nulu8list`, `nulreflist` (struct / nested / map
-// element) — and each is served at the result valtype, the return-site seed, the call-result
-// classification and the `$fnsig` key. Teaching the inferred cascade all five at all four sites
-// is twenty places to keep in agreement; pinning the annotation is one, and it is agreement BY
-// CONSTRUCTION rather than by two ladders covering the same shapes. It is the move
-// `synthRetAnnots` below already makes for the anonymous LAMBDA, applied to the named function
-// the checker records by NAME instead of by node.
-//
-// THE ARENA INDEX RIDES ALONG (`synthTypeRefTy`'s third argument), so every structural
-// classifier the annotated path consults answers from the type the CHECKER decided, not from
-// a re-parse of the render. That is what lets one pin serve all five kinds.
-//
-// SCOPED TO THE NAMED FUNCTION. A lambda's row is keyed `#<nodeIx>` and is claimed by
-// `synthRetAnnots`' own nullable arm, whose rung set is deliberately narrower — the lambda's
-// `$fnsig` result token has to agree with the value call, and the distinct-backing leaves are
-// not in that ABI yet (`tyIsNulI32BackedListInner`'s header). This pass asks
-// `inferRetIsNulList` of a NAME, which no `#`-keyed row can answer.
-//
-// BEFORE `monomorphize`, like `synthRetAnnots`: an instance is cloned with `nret = fnRet`, so a
-// return pinned after the clone would leave the instance un-pinned.
+// A PIN RATHER THAN CASCADE ARMS, because of the fan-out: `vtKindOfType` resolves five distinct
+// kinds for the annotated spelling and each is served at four sites — twenty places to keep in
+// agreement, versus one pin that agrees BY CONSTRUCTION. The arena index rides along
+// (`synthTypeRefTy`'s third argument) so classifiers answer from the CHECKER's type. SCOPED to
+// the NAMED function (a lambda's row is `#<nodeIx>`-keyed and is `synthRetAnnots`'), and runs
+// BEFORE `monomorphize` — an instance is cloned with `nret = fnRet`.
 export function synthNulListRetAnns() {
   let i = 0
   while i < fnStmts.length {
@@ -1167,35 +959,15 @@ export function synthNulListRetAnns() {
 // THE PIN an un-annotated UNION param takes — chosen by the param's OWN union REP, never by
 // `unNames` DECLARATION ORDER.
 //
-// THREE reps answer to one `nodeTyIsUnion`: a BOXED union (`i32 | string`, `Cat | Dog`) is the
-// shared `{tag, value}` `$uBox`, a STRING LITUNION (`"a" | "b"`, `type K = "a" | "b"`) is an
-// interned i32 ATOM, and a NUMERIC litunion (`0 | 1`, `type Z = 0 | 1`) is its plain BASE
-// SCALAR. `unNames` holds ALL THREE — `collectU` pushes every declared `type … = … | …`
-// alias in source order, litunion aliases of either flavour included — so `unNames[0]` picked
-// the pin by which alias the FILE happened to declare first, and no two of the reps substitute
-// for each other in EITHER direction:
-//   · `type K = "a"|"b"` declared ahead of an `(i32|string)` callback param pinned the param to
-//     the ATOM, so the value call's `ref.cast` found an i32 where the box was declared — TRAP
-//     (and INVALID WASM, `expected (ref $type), found i32`, once the lambda body USES the
-//     param). Moving the same litunion declaration BELOW a value-union alias made the identical
-//     program correct — the defect was the ORDER, not the program.
-//   · the mirror: a litunion-ALIAS param (`(K) => i32`) behind ANY declared boxed union pinned
-//     the atom param to the box — the same trap, the same invalid wasm when the body uses it.
-//   · and BOTH again on the numeric axis (`type Z = 0 | 1` for `type K`), which the string-only
-//     `nameIsLitUnionType` / `tyIsLitUnion` predicates could not see at all.
-//
-// The BOXED half keeps the arm's shortcut and states its bound: every boxed union shares
-// `$uBox` and program-global variant tags, so ANY declared BOXED alias routes emission
-// identically and the checker has already validated the precise type — the pin only has to
-// carry the REP. The LITUNION half cannot borrow that argument, because a litunion's atom ids
-// are its own member strings; it pins the param's OWN rendered type instead, which is the same
-// name an explicit annotation spells and the same move the nullable arm below makes.
-//
-// "" means NO PIN — the param keeps its un-pinned route, which is exactly what the arm did
-// when `unNames` was empty (that guard now lives here; see the call site). Reachable only for a
-// BOXED param in a program that registers no boxed alias at all — a struct union with no
-// `type U = A | B` alias, since `registerValueUnionName` declines a non-scalar member set. The
-// litunion half never returns "": its pin is the param's own spelling, not a registered row.
+// THREE reps answer to one `nodeTyIsUnion`: a BOXED union is the shared `{tag, value}` `$uBox`,
+// a STRING LITUNION an interned i32 ATOM, a NUMERIC litunion its plain BASE SCALAR. `unNames`
+// holds all three in source order, so `unNames[0]` picked the pin by whichever alias the FILE
+// declared first — and no two reps substitute in EITHER direction: moving one declaration above
+// or below another flipped the same program between correct and TRAP / INVALID WASM.
+// The BOXED half keeps that shortcut (every boxed union shares `$uBox` and program-global tags,
+// so the pin need only carry the REP); the LITUNION half cannot — atom ids are its own member
+// strings — so it pins the param's OWN rendered type. "" means NO PIN: a boxed param in a
+// program that registers no boxed alias at all.
 function unionParamPinName(ix: i32) {
   const ty = nodeTyIxOf(ix)
   if tyIsLitUnion(ty) {
@@ -1213,22 +985,18 @@ function unionParamPinName(ix: i32) {
     // The inline spelling's own emit name: `string`, by that same soften.
     return tyToEmitName(ty)
   }
-  // A NUMERIC literal union (`0 | 1`, `1.5 | 2.5`, the alias-of-an-alias `type Y = Z`) is
-  // the SECOND HALF of the arm above, and `tyIsLitUnion` cannot see it: that predicate
-  // rejects any member whose `litKind != "str"`, so every numeric litunion falls past it
-  // into the boxed loop below — a rep it does not have. Its rep is the BASE SCALAR
-  // (`i32` / `i64` / `f64`), and `numLitUnionBaseName` is that rule's home. So the pin is
-  // the base name, which is byte-for-byte the name the ANNOTATION side now carries too:
-  // #1273 made `canonEmitName` canon the interior of a function type, so `(Z) => i32`
-  // reaches the `$fnsig` producers as `(i32) => i32`. That is what makes this arm a pin
-  // rather than a second answer — canon rewrites the annotation's NAMES, and this selector
-  // reads the type ARENA, which canon never touches. The FLOAT base is the witness that the
-  // arm is load-bearing at all: `1.5 | 2.5` is wrong in every declaration order, including
-  // with no boxed row declared, because the un-pinned param defaults to i32.
+  // A NUMERIC literal union (`0 | 1`, `1.5 | 2.5`, the alias-of-an-alias `type Y = Z`) is the
+  // SECOND HALF of the arm above, and `tyIsLitUnion` cannot see it: that predicate rejects any
+  // member whose `litKind != "str"`, so every numeric litunion fell past it into the boxed loop
+  // below — a rep it does not have. Its rep is the BASE SCALAR; `numLitUnionBaseName` is that
+  // rule's home, and the base name it pins is what the ANNOTATION side carries too, since #1273
+  // made `canonEmitName` canon the interior of a function type. That is what makes this a pin
+  // rather than a second answer: canon rewrites the annotation's NAMES, this selector reads the
+  // type ARENA, which canon never touches. The FLOAT base proves the arm load-bearing — `1.5 |
+  // 2.5` is wrong in EVERY declaration order, the un-pinned param defaulting to i32.
   //
-  // NO SPELLING SPLIT, unlike the string half: an alias `Z` and an inline `0 | 1` soften
-  // to the SAME base scalar (the alias name is not an atom identity to preserve — the
-  // members ARE i32s), so one answer serves both and `nodeTyIsLitUnionAlias` is not asked.
+  // NO SPELLING SPLIT, unlike the string half: an alias `Z` and an inline `0 | 1` soften to the
+  // SAME base scalar, so one answer serves both and `nodeTyIsLitUnionAlias` is not asked.
   const nb = numLitUnionBaseName(ty)
   if nb != "" { return nb }
   let u = 0
@@ -1236,20 +1004,16 @@ function unionParamPinName(ix: i32) {
     const nm = unNames[u]
     // …AND THE SAME BLIND SPOT ON THE OTHER SIDE OF THE SELECTOR. `nameIsLitUnionType` is
     // the string-only reject, so a `type Z = 0 | 1` row was offered as a BOXED pin to an
-    // unrelated `(i32 | string)` callback — and being row 0 it won, which reproduces #1270's
-    // defect verbatim on the numeric axis: one numeric litunion alias declared ABOVE a union
-    // callback trapped it, and moving the same line BELOW a boxed alias made the identical
-    // program correct. A numeric row does not rep as the box any more than a string one
-    // does; skip both, and declaration order stops being an input here too.
+    // unrelated `(i32 | string)` callback — and being row 0 it won, reproducing #1270's
+    // defect verbatim on the numeric axis. A numeric row does not rep as the box any more
+    // than a string one does; skip both, and declaration order stops being an input here too.
+    //
     // THE ROW, not the name. Both predicates below are `cUserTypes[nm]` followed by a
     // structural test — the exact lookup `unTyIx` already performed at mint ("B-1 step 1:
     // resolve ONCE at mint"), so asking them by name re-resolves a row this loop is holding.
-    // Dual-written against the name pair over the corpus: 42/42, no row missing, and the one
-    // arm that could diverge (a synthetic spelling absent from `cUserTypes`, where the name
-    // route falls to `nameIsInlineLitUnion`) was exercised twice and agreed both times.
-    //
-    // The NAME is still what this function RETURNS — `synthParamAnnots` mints an annotation
-    // from it — so this converts the decision, not the product.
+    // Dual-written against the name pair over the corpus with no row missing, the one arm
+    // that could diverge (a synthetic spelling absent from `cUserTypes`) exercised and
+    // agreeing. The NAME is still what this function RETURNS: this converts the decision.
     const row = unTyIx[u]
     let skip = nameIsLitUnionType(nm) || numLitUnionAliasName(nm) != ""
     if row >= 0 { skip = tyIsLitUnion(row) || numLitUnionHasBase(row) }
@@ -1259,58 +1023,18 @@ function unionParamPinName(ix: i32) {
   ""
 }
 
-// THE NAME an un-annotated parameter's RECORDED type pins to — "what its annotation would
-// have said". "" when the checker recorded no usable type, which is exactly the still-open
-// inference HOLE: a `TyVar` is neither a union nor a nullable and `nodeTyName` renders ""
-// for it, so a genuine hole falls through all three arms and keeps its un-pinned route.
+// THE NAME an un-annotated parameter's RECORDED type pins to — "what its annotation would have
+// said". "" when the checker recorded no usable type: a `TyVar` renders "" and keeps its
+// un-pinned route, which is exactly the still-open inference HOLE.
 //
-// ONE answer with two readers: `synthParamAnnots` below MINTS the annotation from it, and
-// the monomorphizer's un-annotated-parameter pin CONSULTS it before deriving one from the
-// argument type (`monoArgTyName`). A parameter the checker has already decided — solved
-// from its own body usage, or pinned contextually by a receiver — must not get a second,
-// argument-derived answer: the two disagree exactly where the rep depends on the SPELLING,
-// and the body was checked against the parameter, not against the argument.
+// ONE answer with two readers — `synthParamAnnots` MINTS the annotation, the monomorphizer's
+// un-annotated-parameter pin CONSULTS it before deriving one from the ARGUMENT type. The two
+// disagree exactly where the rep depends on the SPELLING; the body was checked against the param.
 //
-// THREE ARMS, one per rep family, and the union/nullable pair cannot fold into the general
-// arm because `nodeTyName` renders "" for both:
-//
-//   UNION (`xs.filter((a) => a is Cat)`, a solved litunion) — a name of the SAME REP, so
-//   the `is`-narrowing and the closure `$fnsig` param token (kind 4) resolve.
-//   `unionParamPinName` is which name, and why DECLARATION ORDER is not it. Its ""
-//   ("no pin available" — a boxed param in a program that registers no boxed alias) is the
-//   faithful answer; the `unNames.length > 0` guard that used to stand at the call site was
-//   a proxy for it, true only of the boxed half, and it silently withheld the pin from a
-//   program whose only union is an INLINE litunion — leaving the param on the i32 default
-//   while the annotation keyed the string soften (TRAP / invalid wasm).
-//
-//   NULLABLE (`const f: (i32 | null) => i32 = (_k) => 1`) — a `T | null` is a `TyNullable`,
-//   NOT a `TyUnion`, so it reaches neither of the other arms. The union arm's shortcut (pin
-//   ANY declared alias) must NOT be imitated: every boxed union shares one `$uBox`, but
-//   nullables do NOT share a rep — `i32|null` boxes, `string|null`/`S|null`/`i32[]|null` are
-//   NICHE refs, `boolean|null` is the 0/1/2 i32 sentinel. So the pin is the parameter's OWN
-//   type, rendered by the arena and resolved to the emitter's nominal spelling exactly as
-//   the general arm does, which is what makes the pinned name identical to an explicit
-//   annotation's. Three outcomes, all measured, all reached by that ONE pin because the rep
-//   the name selects IS the difference between them (the annotated twin is the control):
-//     · `i32|null`, `i64|null`, `f64|null`, `f32|null` (boxed): the plain i32 param declared
-//       a functype the value call's `ref.cast` did not — a cast-failure TRAP. Pinned, both
-//       sides key the box: CORRECT.
-//     · `f64|null` / `f32|null` whose lambda USES the param (`(k) => useN(k)`): the i32 param
-//       fed the callee's box coercion an i32 where the wide scalar was stored — INVALID
-//       WASM. Pinned: CORRECT.
-//     · `string|null`, `S|null`, `i32[]|null` (niche refs): the pinned-i32 param made the
-//       value's own `$fnsig` key NON-EMPTY, so `emitClosureValueCore`'s
-//       `cloSigKeyExt(fe) == ""` floor never fired and the raw ref reached an i32 param —
-//       INVALID WASM. Pinned with the real nullable the key is "" and the floor fires: the
-//       same CLEAN REJECT ("a function value may not take a nullable parameter") the
-//       annotated twin has always produced.
-//   `boolean|null` was already correct un-annotated (its niche IS an i32, so the default
-//   happened to agree) and stays correct — the pin makes it agree by construction.
-//
-//   EVERYTHING ELSE — `resolveShapeToNominal` maps the checker's shape name to the emitter's
-//   nominal form (a struct / variant shape to its declared name, a ref-array shape
-//   recursively to `<element>[]`) so `checkParams` and the struct- / ref-list-param
-//   machinery key on it. A scalar / string / closure name passes through.
+// THREE ARMS, one per rep family; union and nullable cannot fold into the general one because
+// `nodeTyName` renders "" for both. NULLABLE is the trap — nullables do NOT share a rep
+// (`i32|null` boxes, `string|null` niches, `boolean|null` is an i32 sentinel), so the union
+// arm's "pin ANY declared alias" shortcut must not be imitated: pin the parameter's OWN type.
 export function recordedParamPinName(pIx: i32) {
   if nodeTyIsUnion(pIx) { return unionParamPinName(pIx) }
   if nodeTyIsNullable(pIx) {
@@ -1326,9 +1050,8 @@ export function recordedParamPinName(pIx: i32) {
     // `{w:i32}|null` and `W|null` produce the same outcome on every shape reachable now,
     // because every composite nullable reaches the "not yet supported" floor BEFORE any
     // nominal-keyed consumer runs. It stays because it is one rule spelled the same way in
-    // both arms: were the general arm's `resolveShapeToNominal` absent here, a reader would
-    // have to explain the asymmetry, and whoever graduates the floor would have to
-    // rediscover it.
+    // both arms — drop it and a reader has to explain the asymmetry, and whoever graduates
+    // the floor has to rediscover it.
     const nbase = nullablePartOf(nty)
     if nbase != "" {
       const nnom = resolveShapeToNominal(nbase)
@@ -1338,30 +1061,18 @@ export function recordedParamPinName(pIx: i32) {
   }
   const tn = nodeTyName(pIx)
   if tn == "" { return "" }
-  // The shape-to-nominal DECISION on the arena. The render above is still taken, and stays: at
+  // The shape-to-nominal DECISION on the arena. The RENDER above is still taken and stays: at
   // this site the name is the ARTEFACT (`synthParamAnnots` mints an annotation from it) and its
-  // emptiness is the inference-HOLE gate — a `TyVar` renders "", which is the un-pinned route.
-  // What moves off the string is the MATCHING. Measured in lockstep over the corpus: the arena
-  // rung answers on 9 files and agrees with the name ladder on all 9, so this is a replacement,
-  // not a second opinion. The gate ORDER is deliberately unchanged — hoisting the arena rung
-  // above the render would make the hole gate conditional, which is the shape of the regression
-  // B191 recorded.
-  // AND THE NAME LADDER IS GONE. `resolveShapeToNominal(tn)` stood here: parse the RENDER's
-  // field set, match it against the struct rows, then against the variant rows, else return the
-  // spelling unchanged. `shapeNominalOfTy` now asks all three of those of the TYPE — banked
-  // struct row, struct field set, variant field set — and measured at THIS consumer (B205's
-  // rule: ask whether the thing being retired still does work, not whether the new arm fired),
-  // the ladder resolved `tn` to something other than itself on 2 corpus files, then 1, then 0
-  // as each arena rung landed.
+  // emptiness is the inference-HOLE gate — a `TyVar` renders "", the un-pinned route. What moves
+  // off the string is the MATCHING. The gate ORDER is deliberately unchanged: hoisting the arena
+  // rung above the render would make the hole gate conditional, the shape of the B191 regression.
   //
-  // Returning `tn` is the RIGHT answer where the two could still differ, not merely the equal
-  // one — the same argument as B203/B204. `resolveShapeToNominal` matching where the arena
-  // declined means the rendered field set matched a row the TYPE's field set does not, i.e. the
-  // render found a row by softening away the distinction that rules it out.
-  //
-  // The render above STAYS, and is not a decline path: `tn` is the ARTEFACT this function
-  // exists to produce (the pinned annotation's spelling) and its emptiness is the inference-HOLE
-  // gate. Nothing here asks a question of it any more.
+  // AND THE NAME LADDER IS GONE. `resolveShapeToNominal(tn)` stood here — parse the RENDER's
+  // field set, match it against the struct rows, then the variant rows, else return the spelling
+  // unchanged. `shapeNominalOfTy` asks all three of those of the TYPE instead, and by B205's
+  // rule (ask whether the thing being retired still does work) the ladder had stopped resolving
+  // `tn` to anything but itself. Returning `tn` is the RIGHT answer where the two could still
+  // differ — a render matching where the arena declines has softened away the ruling distinction.
   const nom = shapeNominalOfTy(nodeTyIxOf(pIx))
   if nom != "" { return nom }
   tn
@@ -1384,47 +1095,28 @@ export function synthParamAnnots() {
               // `synthTypeRefTy(…, -1)`, and -1 means "resolve the name" — which mints a
               // structurally identical `Ty` row, `nameToTy` not being hash-consed — and then
               // `recordNodeTyFrom` below OVERWROTE the result unconditionally with the very
-              // type handed over here. 534 wasted parses over the corpus, the largest single
-              // remaining site. This is the funnel-records-then-caller-re-records shape the
-              // programme doc names at B8, in its pure form: the funnel's answer was not
-              // merely duplicated, it was thrown away.
+              // type handed over here. The funnel's answer was not merely duplicated, it was
+              // thrown away (the programme doc's B8 shape, in its pure form).
               //
               // `recordNodeTyFrom` is KEPT rather than deleted, and that is what makes this
-              // exactly equivalent instead of nearly so. When `srcTy >= 0` it now rewrites the
-              // same value (a no-op); when it is -1 — which the header above argues cannot
-              // happen, since `upin != ""` means the param HAS a recorded type — the hand-over
-              // declines, `recordClonedNodeTyKnown` falls to its PLACEHOLDER, and the copy
-              // overwrites that placeholder with -1 exactly as it did before. Deleting it would
-              // change that unreachable arm from -1 to a placeholder.
+              // exactly equivalent instead of nearly so: with `srcTy >= 0` it rewrites the same
+              // value, and at -1 — which the header above argues cannot happen — the hand-over
+              // declines and the copy overwrites `recordClonedNodeTyKnown`'s PLACEHOLDER with
+              // -1 exactly as it did before. Deleting it would change that unreachable arm.
               const srcTy = nodeTyIxOf(ps[pi])
               const un = synthTypeRefTy(upin, -1, srcTy)
-              // Carry the parameter's recorded arena type onto the synthesized annotation,
-              // so a consumer classifies the pin STRUCTURALLY instead of re-deriving it
-              // from the name: the pinned name may be an interned `#anonN` shape name
-              // `nameToTy` cannot resolve, and `exprIsLitAtom` asks
-              // `nodeTyIsLitUnionAlias(p.parType)` of every Ident naming a parameter.
-              // Without it a litunion param pinned `K` — so its wasm param IS the i32 atom
-              // — while the annotation node carried no type, and every atom-consuming site
-              // in the body still took the string route: a `const r: K = u` lowered the
-              // string→atom widen (`select` over a `__str_eq__` of an i32 param, INVALID
-              // WASM) and a bare `print(u)` printed the raw atom id. The pin NAME and the
-              // recorded TYPE are one answer or they are a bug.
-              //
-              // Faithful for the softened half too: an INLINE `"a"|"b"` pins to `string`
-              // and its arena index is NOT a registered alias, so `nodeTyIsLitUnionAlias`
-              // still answers no — the name and the arena agree.
-              //
-              // This is ALSO what retires the ref-list ROW record that used to sit in the
-              // general arm (destringify D-ANNRLREC): the record's only readers are
-              // `annRefArrSlot` and `annTyNulFlag`, and BOTH consult the node's recorded
-              // arena type first. `upin != ""` means the param HAS a recorded type, so
-              // `nodeTyIxOf(un) >= 0` and `annTyNulFlag(un)` can never reach `annRlNulAt` —
-              // that half is dead by construction. The slot half is dead by measurement:
-              // the recorded row and `annRefArrSlot`'s own arena rung agreed on 2 of 2
-              // answering calls and the name leg never answered where the arena declined,
-              // over 15,760 reaches (1,274 corpus files + 50,400 fuzz programs). Rows only
-              // ever append, so a row the arena resolves HERE it still resolves at the
-              // consumer.
+              // Carry the parameter's recorded arena type onto the synthesized annotation, so a
+              // consumer classifies the pin STRUCTURALLY instead of re-deriving it from the
+              // name: the pinned name may be an interned `#anonN` shape name `nameToTy` cannot
+              // resolve, and `exprIsLitAtom` asks `nodeTyIsLitUnionAlias(p.parType)` of every
+              // Ident naming a parameter. Without it a litunion param pinned `K` — so its wasm
+              // param IS the i32 atom — while the annotation node carried no type, and every
+              // atom-consuming site in the body still took the string route (INVALID WASM, and
+              // a bare `print(u)` printing the raw atom id). The pin NAME and the recorded TYPE
+              // are one answer or they are a bug. Faithful for the softened half too: an INLINE
+              // `"a"|"b"` pins to `string` and its arena index is NOT a registered alias.
+              // This also retires the ref-list ROW record that sat in the general arm: both its
+              // readers consult the node's recorded arena type first (destringify D-ANNRLREC).
               recordNodeTyFrom(un, ps[pi])
               p.parType = un
             }
@@ -1445,12 +1137,11 @@ export function synthParamAnnots() {
 // a pure AST rewrite, done before monomorphization so instances inherit it: a captured-mutated
 // local is boxed as a LENGTH-1 ARRAY (a shared heap ref both scopes index). `let c = init`
 // becomes `let c = [init]`, and EVERY use of `c` (read OR assignment target) becomes `c[0]`, so
-// the closure's `c = c + 1` lowers to the indexed write `c[0] = c[0] + 1` into the shared array,
-// visible in the maker. Arrays are already capturable + index-assignable through a closure.
+// `c = c + 1` in the closure lowers to `c[0] = c[0] + 1` into the shared array — and arrays are
+// already capturable and index-assignable through a closure.
 //
-// Conservative: only a DIRECT `let` of the maker that is assigned INSIDE a nested lambda and is
-// NOT shadowed by any nested binding (param / let / loop var) is boxed. Anything else is left
-// untouched, falling back to the existing loud error rather than risking a mis-rewrite.
+// Conservative: only a DIRECT `let` of the maker, assigned INSIDE a nested lambda and NOT
+// shadowed by any nested binding, is boxed; anything else keeps the existing loud error.
 
 // One scan of a maker body: `dlets` = the maker's own `let` names (depth 0); `alam` = names
 // ASSIGNED inside a nested lambda (depth > 0); `ndecls` = every binding declared inside a nested
@@ -1604,38 +1295,18 @@ function cboxWalk(ix: i32, boxed: string[]) {
       if n.letType >= 0 {
         const lt = P.nodes[n.letType]
         if lt is TypeRef {
-          // THE ARRAY TYPE IS CONSTRUCTED, NOT RE-PARSED. This site appends `[]` to a name
-          // and `recordClonedNodeTy` used to parse the result straight back — a string
-          // built and taken apart in two adjacent statements, the destringify programme's
-          // own headline shape. The element's arena index is on the annotation node the
-          // checker already recorded, so the array type is one `mkArrayTy` over it and the
-          // name is left as the node's spelling for the consumers that still read it.
+          // THE ARRAY TYPE IS CONSTRUCTED, NOT RE-PARSED. This site appends `[]` to a name and
+          // `recordClonedNodeTy` used to parse the result straight back; the element's arena index
+          // is on the annotation node the checker recorded, so the array type is one `mkArrayTy`
+          // over it. The atom count is BANKED too (`annUnionAtomsOf`, written by
+          // `canonEmitTypeNames` — the pass that PRODUCED this spelling), not re-scanned.
           //
           // GATED ON THE NAME BEING A SINGLE TOP-LEVEL ATOM, AND THAT GATE IS THE WHOLE
-          // CORRECTNESS OF THE HUNK. `nm + "[]"` is an array spelling only when `nm` is an
-          // atom: `"i32 | string" + "[]"` is `"i32 | string[]"`, which denotes
-          // `i32 | (string[])` — a union whose second arm is a list, not a list of the
-          // union. That concat has always been malformed, and it was HARMLESS because both
-          // halves were wrong together: the name parsed back to the union, `nodeTyIx` held
-          // the union, the indexed-assignment lowering saw a non-array and rejected loudly.
-          //
-          // Handing the type over UNGATED fixes one half and leaves the other, which is
-          // worse than fixing neither: the arena says `(i32 | string)[]` so every
-          // array-shaped check passes, the name-keyed lowering still reads
-          // `"i32 | string[]"`, and the disagreement lands in codegen —
-          // `let u: i32 | string` captured by a closure went from a loud
-          // `indexed-assignment target is not an array` to check-clean INVALID WASM.
-          //
-          // So the hand-over runs only where the SPELLING denotes the type it is handed. A
-          // composite keeps the name path and master's loud reject; widening that reject
-          // into working code is a capability change (a parenthesized `(i32 | string)[]`
-          // does compile and run) and belongs to its own slice with its own fuzz gate.
-          // THE BANKED ATOM COUNT, not a re-parse. `annUnionAtomsOf` is the number
-          // `splitUnionAtoms(tyNameOf(ix)).length` would re-derive, recorded by
-          // `canonEmitTypeNames` — the pass that PRODUCED this node's spelling (#1055). The
-          // scan here was rebuilding it character by character from the name canon had just
-          // written. Measured: 2 corpus files reach this site, both answers present (1 atom
-          // and 2), 0 disagreements. A thin population, and stated as one.
+          // CORRECTNESS OF THE HUNK. `nm + "[]"` is an array spelling only when `nm` is an atom:
+          // `"i32 | string" + "[]"` denotes `i32 | (string[])`. The concat was always malformed
+          // and HARMLESS only because both halves were wrong together, so handing the type over
+          // UNGATED fixes one half and turns a loud reject into check-clean INVALID WASM. A
+          // composite keeps the name path; widening that reject is a capability change of its own.
           let boxedTy = -1
           if annUnionAtomsOf(n.letType) == 1 {
             if annArrowAt(lt.tyName) < 0 {
@@ -1821,24 +1492,17 @@ export function captureBoxRewrite(_stmts: i32[]) {
 }
 
 // ── synthVoidTwins — the VOID TWIN mint for coerced function VALUES ─────────────
-//
 // The emitter half of the `(P…) => T` → `(P…) => void` wholesale value coercion
-// (DECISIONS: void contexts discard implicit tail values, clause 3; the checker
-// half is `fnValVoidCoerce`). A coerced value is CALLED through a `>v` `$fnsig`
-// (0 results), and `call_indirect` signature-checks the callee — so the closure
-// built at the coercion seam must reference a function whose OWN functype has 0
-// results. The original cannot be that function (its other callers want the
-// value), so this pass mints ONE capture-free VOID TWIN per coerced target:
-// same name-referenced params, a synthesized `: void` return, a body that calls
-// the original and (via the void statement path) discards. The closure-build
-// swap happens node-keyed at `emitExpr`'s Ident value arm (`voidTwinForNode`).
-//
-// Runs POST-monomorphization (fnStmts positions are final — a pre-mono mint
-// would store twin positions the renumbering invalidates) and BEFORE
-// `buildFnMap#2`, whose `retVoidAnnFlag` seed classifies the twins void.
-// Targets are TOP-LEVEL declarations only, matched by (name, `fnParent < 0`) —
-// the same set the checker's grant admits (`fnDeclIx` + unshadowed), so the two
-// gates cannot disagree on nested/shadowing namesakes.
+// (DECISIONS: void contexts discard implicit tail values, clause 3; the checker half
+// is `fnValVoidCoerce`). A coerced value is CALLED through a `>v` `$fnsig` and
+// `call_indirect` signature-checks the callee, so the closure built at the coercion
+// seam must reference a function whose OWN functype has 0 results. The original cannot
+// be it (its other callers want the value), so this pass mints ONE capture-free VOID
+// TWIN per coerced target; the swap is node-keyed at `emitExpr`'s Ident value arm
+// (`voidTwinForNode`). Runs POST-monomorphization (fnStmts positions are final — a
+// pre-mono mint would store positions the renumbering invalidates) and BEFORE
+// `buildFnMap#2`. Targets are TOP-LEVEL declarations only, the same set the checker's
+// grant admits, so the two gates cannot disagree on nested/shadowing namesakes.
 let voidTwinTargetFe: i32[] = []
 let voidTwinFe: i32[] = []
 
