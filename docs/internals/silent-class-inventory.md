@@ -10,6 +10,10 @@
 > checking master's live maximum (D1062): D1043 was already taken there while this
 > worktree's base still ended at D1042, which is exactly the collision this block exists
 > to stop — so check the id against MASTER, not against your own branch.
+> RESERVED D1242–D1244 — the position-matrix findings session (vl-b7f). The brief said
+> D1240–D1242; `git grep -nE 'D124[0-2]\b'` on the merged tree found D1240 and D1241
+> already minted, and `scripts/inventory/ls.py --next` answered D1242, so the block moved
+> up by two. Three ids, not a block of 20, because three is what was minted.
 
 Every row below was produced by generating a program, running it, and grading the **run
 value** against an expectation computed independently of the compiler. Nothing here is
@@ -30368,7 +30372,7 @@ Repro (loud emit reject):
   BEFORE it — `if uk != -3 { return uk == 2 }` — which is the same "the rung was too late in
   the ladder" shape that cost four probes on [D1015](#d1015).
 
-**closed · was check-clean invalid wasm · clause 1 · `tests/cases/unions/narrowed-union-rebound-local.vl`**
+*NOTE (2026-09-02): what follows is an EARLIER copy of this row's own body, left by a "keep both sides" merge resolution. Its duplicate STATUS line is removed so the row has exactly one; the prose and the `Repro:` block below are kept, because the repro belongs to this half and the grader reads the FIRST status line. A spliced row splits badly — see the inventory-split tooling.*
 
 An `is` narrow to ONE arm should leave the value at that arm's own rep — that is exactly the
 reasoning D968's fix rests on (`printUnionRecvIsBox` declines the tag-dispatch plan for a
@@ -35603,57 +35607,114 @@ Repro (runs, prints `1`):
 
 ### D1086 — an `if` EXPRESSION with no `else` is check-clean and refused at EVERY rep at module scope and at the six composite reps inside a function — 18 of 24 grid cells, not three sites
 
-**loud emit reject · check rc 0 · clause 2 · `emitProgram: if-expression requires an else arm` and `emitProgram: union if-expression requires an else arm` · ZERO corpus cells · found 2026-09-02 by the emit-refusal reachability sample, SCOPE CORRECTED 2026-09-02 by a 2x12 grid**
+**closed — the checker now types an else-less `if` used as a VALUE as `T | null` in every value position and the emitter synthesizes the rep's own null else arm, so the 2x12 scope x rep grid grades 48 of 48 running at BOTH the annotated and the un-annotated spelling · was a loud emit reject at check rc 0 · clause 2 · ZERO corpus cells · found 2026-09-02 by the emit-refusal reachability sample, SCOPE CORRECTED 2026-09-02 by a 2x12 grid, RULED and BUILT 2026-09-02**
 
-Repro (refuses):
+Repro (runs, prints `hi`):
 
     const x = if true { "hi" }
     if x != null { print(x) }
 
-* **A MISSING `else` IS NOT A TYPE ERROR.** The checker types the binding as `string | null` and
-  accepts it, which is exactly the value the language says the expression has when the condition
-  is false. The refusal is a codegen gap wearing a grammar rule's sentence.
+* **THE RULING IS WHAT MADE THIS A BUILD** (DECISIONS, "An else-less `if` used as a VALUE is
+  `T | null` in every position"). The checker used to give two answers about one expression:
+  `T | null` at a binding, `void` in return position and as a `??` operand. Neither the
+  codegen nor the diagnostics could be right while that stood, which is why the row was
+  deliberately left open when nine of its ten siblings closed.
 
-* **THE REP PICKS THE SITE, and there are at least three.** A `string` (or struct-join) then-arm
-  fires `wasmEmit.vl:12942` via `emitIfExprRef`; a `boolean` then-arm — and a literal-union atom
-  — declines every rung of `ifExprRefKind` and fires `wasmEmit.vl:13116` via `emitIfExprAs`; an
-  `i32` then-arm takes the value-union box path and fires a THIRD site, `wasmEmit.vl:5502`,
-  whose sentence reads `union if-expression requires an else arm`.
+* **THE GRID WAS RE-MEASURED BEFORE ANY CODE WAS WRITTEN, and it had moved.** On master
+  2e406026 it graded **14 of 48** cells running (12 reps x 2 scopes x annotated/inferred),
+  not the filed 6 of 24 — `union` had started running at function scope under an unrelated
+  merge. A citation is a measurement with a date on it; the table below is the one this fix
+  was graded against.
 
-* **THE ATTRIBUTION WAS MEASURED, NOT READ**, because 12942 and 13116 carry a byte-identical
-  literal and the message alone cannot say which fired. An instrumented compiler built to a
-  scratch `OUT=` path (never the seed; `build/vl-compiler.wasm` was `cmp`-verified byte-identical
-  before and after) tagged the two apart and confirmed both are independently reachable.
+  | then-arm rep | module/inf | module/ann | fn/inf | fn/ann |
+  | --- | --- | --- | --- | --- |
+  | `i32` `boolean` `string` `f64` `i64` `f32` `union` | refuses -> **runs** | refuses -> **runs** | runs | runs |
+  | `struct` `litunion` `list` `string[]` `map` | refuses -> **runs** | refuses -> **runs** | refuses -> **runs** | refuses -> **runs** |
 
-* **NOT CLOSED, AND THE SCOPE IS THE FINDING.** A SCOPE x REP grid — module scope and function
-  scope crossed with twelve then-arm reps — grades **18 of 24 cells refusing**, not three
-  sites:
+* **ONE RULE IN THE CHECKER, ASKED ONCE.** `checkIfStmtNode`'s tail returned
+  `mkNullableTy(thenTy)` behind two position gates (`ifTail`, `ix == letInitIfIx`) and
+  `TY_VOID` otherwise. It now returns `mkNullableTy(thenTy)` whenever the then arm carries a
+  value, full stop — a value-armed `if` HAS that value, wherever it is written. No
+  per-position table was added, and the statement half needs no gate: a statement `if`'s arm
+  is a statement, so `thenTy` is `TY_VOID` and the same line answers `void`. The whole
+  checker change is two lines shorter than what it replaced.
 
-  | then-arm rep | at module scope | inside a function |
-  | --- | --- | --- |
-  | `i32` / `boolean` / `string` / `f64` / `i64` / `f32` | refuses (6) | **runs** (6) |
-  | `struct` / `union` / `litunion` / list / string-list / map | refuses (6) | refuses (6) |
+* **THE EMITTER'S SYNTHESIZED NULL IS THE REP'S OWN NULL, at the four value-`if` sinks.**
+  `fbRefNullOfKind` is `fbValtypeNullable`'s VALUE twin — the same `match` over `VKind`, arm
+  for arm, so the cell's declaration and the null written into it cannot name different heap
+  types. `emitIfExprRef` writes it and takes the nullable blocktype; `emitUnionIfValue`
+  writes the null-tagged box; `emitVariantIfValue` writes `ref.null $(uVarHeap[vi])`;
+  `emitIfExprAs` writes the NICHE SENTINEL (2 for `boolean | null`, -1 for a nullable literal
+  union) and keeps refusing for a bare scalar, whose `T | null` rep is the box.
 
-  So MODULE SCOPE refuses at every rep — including the four scalar reps that run one nesting
-  level in — and function scope refuses at the six composite reps. Master has moved under the
-  row: the filed `string` witness runs today inside a function and refuses only as filed at
-  module scope, which is why the row's "three sites, one per rep" reads as a fragment.
+* **THE NULLABLE BLOCKTYPE FIXED A PRE-EXISTING SILENT CLASS ON THE WAY PAST.**
+  `emitIfExprRef` asked `nodeTyIsNullableStruct` — the nullable question for ONE kind — so
+  `if c { v } else { null }` at every OTHER ref kind was check-clean invalid wasm
+  (`expected (ref $type), found (ref null $type)`). Measured at `str`, `strlist`, `list` and
+  `map`, at both scopes: **8 cells silent -> runs** in the 144-program A/B against a
+  `git archive origin/master` build, which also records **0 runs lost and 0 new silent**
+  across the no-else, explicit-`else { null }` and no-`if`-at-all spellings of the grid.
 
-* **THE CHECKER IS NOT CONSISTENT ABOUT THE TYPE EITHER, and that is a second question the row
-  does not raise.** At a BINDING the else-less `if` types as `T | null` and is accepted; in
-  RETURN position and as a `??` left operand the checker calls it `void` — `return if c
-  { "hi" }` is `return type mismatch: expected string | null, got void`. Whichever answer is
-  right, the two positions disagree, and the codegen work should not start before that is
-  ruled on: lowering a synthesized null else arm at 18 cells while the checker calls the same
-  expression `void` elsewhere would build the feature twice.
+* **THE UN-ANNOTATED FACE LANDED IN A DIFFERENT CLAUSE, four for four with the week's other
+  rows.** With the annotated half green, five composite reps still failed inferred — and one
+  of them SILENTLY: `const x = if c { mkList() }` classified an i32 local and the `if` pushed
+  a `(ref null $lTypeIdx)` into it, `vl check` rc 0. The annotation was pinning the rep. The
+  fix is one rung per classifier in the `exprNullable*` family (`nulArmIfThenValueIx`): an
+  `if` whose other arm is null yields the THEN ARM's rep made nullable, which is the question
+  `ifExprRefKind` already asks one level in. **The rung serves BOTH null spellings** — the
+  absent arm and a bare `else { null }` — because they are the same value; serving only the
+  absent one left the explicit spelling refusing at five composite reps while its else-less
+  twin ran, which is one type with two reps decided by a word the author may not have
+  written. Measured on the explicit-`else { null }` grid: **29 -> 45 of 48**.
 
-* **WHY IT WAS LEFT**: closing it is a per-rep null-else lowering at two scopes behind at
-  least three emit sites, which is a larger piece of work than the other nine rows in this
-  sample combined, and it is the one row where a partial landing would ship a rep that
-  compiles beside eleven that do not. Recorded rather than half-done.
+* **A VOID ARM IS NOT A VALUE, and the exemption that hid it is gone.**
+  `const x = if c { voidCall() }` was check-clean and crashed the emitter with
+  `if-expression requires an else arm` — a sentence about the wrong ingredient, since adding
+  an `else` does not give a void arm a value. `voidSlotExemptExpr` exempted every
+  if-expression because the widening used to be position-gated; with one rule the exemption
+  refuses nothing legal, and the program now draws the checker's own
+  `cannot bind the void result of 'x'`.
 
-* Probes: `scripts/capability-probes/if-expr-no-else-string-arm.vl` (12942) and
-  `scripts/capability-probes/if-expr-no-else-boolean-arm.vl` (13116) — both still GAP.
+* **POSITION MATRIX — 20 of 21, both spellings, each cell constructing AND discriminating**
+  (the taken branch proves 7, the untaken proves -1, so a null that produced the value anyway
+  moves a line): binding at function scope, binding at module scope, explicit `return`, return
+  TAIL, call argument, struct-field init, array element, assignment to a LOCAL, assignment to a
+  module GLOBAL (`emitAssign`'s `global.set` arm — D965's own missed delivery), map value,
+  nested element, closure result. Negative controls hold: an else-less `if` as a CONDITION is
+  still `if-condition must be boolean, got boolean | null`, and statement position is still
+  `void`. The one residue is [D1250](#d1250) — `??` over an if-expression written in place.
+
+* Probes: `scripts/capability-probes/if-expr-no-else-string-arm.vl` and
+  `scripts/capability-probes/if-expr-no-else-boolean-arm.vl` — both GAP -> RUNS.
+  Fixtures: `tests/cases/types/if-expression-no-else-scope-rep-grid.vl` (all 96 cells),
+  `tests/cases/types/if-expression-no-else-value-positions.vl`,
+  `tests/cases/types/if-expression-no-else-statement-position.vl`.
+
+### D1250 — `??` whose LEFT OPERAND is an if-EXPRESSION written IN PLACE refuses; only the spelling through a BINDING runs
+
+**loud emit reject · check rc 0 · clause 2 · `emitProgram: \`??\` over this nullable value is not supported yet — narrow it first, e.g. \`if v != null { … }\`` · ZERO corpus cells · found 2026-09-02 by [D1086](#d1086)'s position matrix, which made this program check-clean for the first time · PRE-EXISTING and INDEPENDENT of D1086: the explicit-`else` spelling refuses identically**
+
+Repro (refuses; should print `7`):
+
+    function go(): void {
+      print((if 1 == 1 { 7 }) ?? -1)
+    }
+    go()
+
+* **THE MISSING `else` IS NOT AN INGREDIENT — ablated.** `(if c { 7 } else { null }) ?? -1`
+  draws the identical message, and so does a `string` arm and the call-argument position. The
+  only spelling that runs is through a BINDING: `const a = if c { 7 }` then `a ?? -1`.
+
+* **WHAT THE ARM NEEDS IS A NAME, and it asks the wrong node for one.** The value-union-box
+  `??` arm reads `unionNameOfExpr` of the `??` NODE, whose own checked type is the COALESCED
+  scalar (`i32`) — not a union name — so it comes back empty and the arm declines to the
+  fall-through. The left operand's type (`i32 | null`) is the one that names the box.
+
+* **THE BINDING SPELLING NEVER REACHES THE ARM.** `emit_rewrite` desugars a RE-READABLE left
+  operand into an `if` (D962), and a binding is re-readable while an if-expression is not, so
+  the two spellings of one program take different lowerings and only one of them was built.
+
+* Probe: `scripts/capability-probes/coalesce-over-if-expression-operand.vl` (GAP).
 
 ### D1087 — the emitter dispatches on a NAME the checker let the user bind, so a user's own parameter or struct field draws a BUILT-IN's arity complaint
 
@@ -38395,6 +38456,220 @@ Before: `no field 'toEqual' on Expectation<i32>`. Now:
   per-site table for the two-module ambiguity but left the fallback answering for callers that
   should get nothing. The fixture's `lib.vl` calls `hidden` DIRECTLY for exactly this reason,
   and says so in a comment, so this row's control cannot silently start measuring that instead.
+
+### D1242 — an INFERRED anonymous struct whose field holds a union value is `emitProgram: object literal matches no union variant`, and the rescue is a `type` DECLARATION, not the annotation
+
+**loud emit reject · check rc 0 · clause 2 · `emitProgram: object literal matches no union variant` · ZERO corpus cells · found 2026-09-02 by the position-matrix harness (#2415) on its first use, at `struct_field_init`/un-annotated, and reproduced from scratch on the merged tree**
+
+Repro (refuses; the annotated twin `const w: { f: i32 | null } = { f: u }` prints `5`):
+
+    const u: i32 | null = 5
+    const w = { f: u }
+    print(w.f ?? 0)
+
+* **THE ANNOTATION IS NOT WHAT FIXES IT — A DECLARATION IS.** Adding `type W = { f: i32 |
+  null }` to the module and then *never mentioning `W` again* makes the repro above compile
+  and print `5`. The rescue is shape REGISTRATION: a `type` declaration registers the shape
+  `{f: i32 | null}`, inference alone never does, and the emitter's fallback route for an
+  unregistered object literal is `emitUnionBox` (`wasmEmit.vl:3494`), whose `objVariantName`
+  answers `""` — hence a message about union variants for a program with no union type in it.
+
+* **THE RESCUE IS SHAPE-KEYED, WHICH IS HOW WE KNOW IT IS REGISTRATION.** `type Q = { g: i32
+  | null }` (a different field name) does not help — same refusal. `type Q = { f: i32 }` (the
+  same field name, a NON-union field type) is worse than nothing: the literal is registered
+  against the wrong shape and the failure moves downstream to ``emitProgram: `??` over this
+  nullable value is not supported yet``.
+
+* **THE COMPILER SUGGESTS THE BREAKING EDIT.** On the annotated named-type spelling `const w:
+  W = { f: orErr(5, false) }` the checker emits (backticks elided) `[HINT]: redundant type
+  annotation: w is inferred as {f: i32 | "err"} — remove it to lean on inference`. Taking the
+  hint is the repro. This is CLAUDE.md's "a hint saying the annotation is redundant is the checker
+  agreeing about the TYPE, and says nothing about whether the two spellings agree about the
+  REP", with the checker volunteering the mistake.
+
+Ablation (each line is one ingredient removed from the repro; `runs` means the defect is gone):
+
+| ingredient removed | outcome | needed? |
+| --- | --- | --- |
+| the annotation on the destination (`const w: { f: i32 \| null }`) | runs, prints 5 | **yes** |
+| the struct wrapper (`const v = u` and read `v`) | runs, prints 5 | **yes** |
+| the union-valued field (`const w = { f: 5 }`) | runs, prints 10 | **yes** |
+| the field READ (`print(1)` instead) | still refuses | no |
+| the generic (`orErr<T>` → a plain `i32 \| "err"` function) | still refuses | no |
+| the literal arm (`i32 \| null` instead of `i32 \| "err"`) | still refuses | no |
+| both arms struct-typed (`A \| B`) | still refuses | no |
+| a value union (`i32 \| string`) | still refuses | no |
+| `let` instead of `const` | still refuses | no |
+| a second, non-union field beside it | still refuses | no |
+| ADDED: `type W = { f: i32 \| null }`, unused | runs, prints 5 | rescue |
+
+* **BOTH FACES.** Annotated (inline `{ f: i32 | null }` or a named `type W`): RUNS, prints
+  `5`. Un-annotated: `loud emit reject`, `vl check` rc 0. Every ANNOTATED destination runs —
+  binding, argument, annotated return — so the defect is the inferred destination alone.
+
+* **THE POSITION MATRIX.** `scripts/capability-probes/matrix/inferred-anon-struct-union-field.matrix.vl`,
+  `runs 19 of 28 graded · 12 skipped · 0 silent · 9 other`. Every annotated cell runs; **nine
+  of the fourteen un-annotated cells refuse, in four different messages** — `binding`,
+  `struct_field_init` and `two_instances` with this row's sentence; `return_inferred`,
+  `array_element`, `global_init` and `global_assign` with `emitProgram: ref valtype with no
+  interned shape`; `map_value` with `emitProgram: unsupported map value type`; and
+  `closure_capture` with ``emitProgram: `??` over this nullable value is not supported yet``.
+  Per "a validator sentence is not a mechanism" those four are NOT asserted to be one family
+  — they are this row's grading list.
+
+* Probe: `scripts/capability-probes/inferred-anon-struct-union-field.vl` (GAP today).
+
+* **Grading list.** The four messages above, one cell each, plus: the named-`type` rescue must
+  keep working; the `type Q = { f: i32 }` mis-registration must not start silently accepting;
+  and the `[HINT]: redundant type annotation` on the annotated spelling should stop being
+  emitted for a destination whose removal changes the REP.
+
+### D1243 — an UN-ANNOTATED parameter has the `is` HIT arm but not the COMPLEMENT: `else` over a hole param is `operator '*' is not defined for i32 | "err" and i32`
+
+**loud check reject · clause 2 · the identical body under `function take(a: i32 | "err")` compiles and prints `10` · ZERO corpus cells · found 2026-09-02 by the position-matrix harness (#2415) at `argument` and `early_return_guard`, un-annotated face**
+
+Repro (`vl check` rc 1; annotating the parameter `a: i32 | "err"` makes it print `10`):
+
+    function orErr(bad: boolean): i32 | "err" {
+      if bad { return "err" }
+      return 5
+    }
+
+    function take(a) {
+      if a is "err" { print(0) } else { print(a * 2) }
+    }
+
+    take(orErr(false))
+
+* **THE HIT ARM NARROWS AT BOTH FACES; ONLY THE COMPLEMENT IS LOST.** `if a is "err" { print(a
+  + "!") }` prints `err!` under `function take(a)` — string concatenation is only well-typed
+  on a value narrowed to `"err"`, so the positive arm is genuinely narrowed. Same for a
+  struct-arm union: `if a is A { print(a.n) }` prints `5` un-annotated. Swap the arms and the
+  un-annotated face refuses. A row headlined "inferred parameters are not narrowed" would be
+  wrong by half.
+
+* **THE COMPLEMENT NEEDS A DECLARED TYPE TO SUBTRACT FROM, AND A HOLE HAS NONE.**
+  `collectElseNarrows` (`typecheck.vl:6296`) computes the else-branch fact as
+  `subtractTy(cur, tIdx)`, and `subtractTy` returns -1 the moment `ty < 0`
+  (`typecheck.vl:5684`) — the same `subtractTy(-1, …)` shape the comment at `typecheck.vl:5448`
+  already records for a different producer. The HIT arm needs no subtraction: it binds the
+  tested arm directly.
+
+* **THE STRUCT-ARM SPELLING PRINTS THE MECHANISM OUT LOUD.** `function take(a) { if a is A {
+  print(0) } else { print(a.s) } }` called with `A | B` refuses with `argument 1: expected A |
+  {s: _}, got A | B`. The parameter was SOLVED by unifying the body's uses, and the else arm's
+  `a.s` contributed a structural member `{s: _}` to the union instead of being narrowed to
+  `B`. That is a hole being filled from uses, not a declaration being narrowed.
+
+* **NO DESIGN RULE SAYS INFERRED PARAMETERS ARE NOT NARROWED.** `DECISIONS.md` and
+  `ROADMAP.md` carry no such entry, and the directory already treats hole parameters as a
+  capability to be served: `scripts/capability-probes/inferred-union-return-hole-param.vl` and
+  `hole-param-closure-field-call.vl` are both filed as gaps. Clause 2.
+
+Ablation:
+
+| ingredient removed | outcome | needed? |
+| --- | --- | --- |
+| the annotation on the parameter | runs, prints 10 | **yes** |
+| the union (`take(5)` into `function take(a)`) | runs, prints 10 | **yes** |
+| the COMPLEMENT (read `a` in the HIT arm instead) | runs, prints `err!` | **yes** |
+| `else` → an early-return guard (`if a is "err" { return }`) | still refuses | no |
+| `else` → `if !(a is "err")` | still refuses | no |
+| `else` → `!(a is "err") && …` | still refuses | no |
+| the literal arm (`i32 \| null`, `is null`) | still refuses | no |
+| the literal arm (`i32 \| string`, `is string`) | still refuses | no |
+| the generic on `orErr` | still refuses | no |
+| the parameter (an inferred LOCAL `const a = orErr(false)`) | runs, prints 10 | **yes** |
+| ADDED: rebind `const b = a` inside the body, then narrow `b` | still refuses | — |
+
+* **BOTH FACES.** Annotated: RUNS, prints `10`. Un-annotated: `loud check reject`. And the
+  workaround makes it worse — `print((a as i32) * 2)` under `function take(a)` is
+  **check-clean invalid wasm**, while the annotated twin gets a clear check reject naming the
+  fix (``  `as i32` propagates "err" — annotate the enclosing function's return type``). That
+  cell ablates to a DIFFERENT mechanism: it refuses with the `is` guard removed entirely, so
+  it is not this row's family and needs its own id.
+
+* **THE POSITION MATRIX.**
+  `scripts/capability-probes/matrix/is-complement-hole-param.matrix.vl` (the nullable
+  spelling, carrying no literal arm at all): `runs 35 of 40 graded · 0 skipped · 1 silent · 4
+  other`. `argument`/un-annotated and `early_return_guard`/un-annotated are this row.
+  `binding`, `global_init`, `closure_capture`, `is_in_if`/`while`/`and`/`not` and `else_if`
+  all RUN un-annotated, which is what confines the row to the PARAMETER. Two cells are other
+  rows: `struct_field_init`/un-annotated is [D1242](#d1242), and `map_value`/un-annotated is
+  **check-clean invalid wasm** and unfiled. `orerr-generic-pin.matrix.vl` shows the same two
+  cells at the literal-union spelling, which is what proves the gap is the complement rather
+  than the literal member.
+
+* Probe: `scripts/capability-probes/is-complement-hole-param.vl` (GAP today).
+
+* **Grading list.** The `(a as i32)` silent cell above; `map_value`/un-annotated from this
+  row's matrix; the struct-arm `expected A | {s: _}` message, which should become a narrowing
+  and not a unification; and the HIT-arm controls, which must keep running.
+
+### D1244 — a closure capturing a ref local declared in a MODULE-SCOPE block is `emitProgram: field access receiver is not a struct`; the identical block inside a function runs
+
+**loud emit reject · check rc 0 · clause 2 · `emitProgram: field access receiver is not a struct` · ZERO corpus cells · found 2026-09-02 by the position-matrix harness (#2415) while grading `closure_capture`, and the block scope — not the narrowing it was found under — is the ingredient**
+
+Repro (refuses; wrapping the whole thing in `function go() { … }` and calling it prints `7`):
+
+    type P = { x: i32 }
+
+    if true {
+      const p: P = { x: 7 }
+      const f = () => p.x
+      print(f())
+    }
+
+* **IT IS NOT "A BLOCK" — IT IS A BLOCK WHOSE ENCLOSING SCOPE IS THE MODULE.** The same `if`
+  body one level inside a function RUNS, and so does an `if` inside a `while` inside a
+  function. At module scope every block kind refuses: `if`, `else`, `while`, `for`, and a
+  bare `{ … }`. Two module-scope blocks nested inside each other refuse too. The reported
+  headline ("the block scope is the ingredient") is half of it; the other half is that a
+  function body already fixes it.
+
+* **THE CAPTURE IS LOAD-BEARING AND SO IS THE LOCAL'S SCOPE.** Reading `p.x` in the block
+  with no closure runs. Passing `p` to the closure as a PARAMETER runs. A closure declared in
+  the block capturing a MODULE-scope `p` runs. Only capturing a local *declared in that
+  block* refuses.
+
+* **AND IT IS EVERY REF REP, WITH TWO OF THEM SILENT.** A captured `i32` runs. A captured
+  struct is this row's loud refusal on a field READ, and `emitProgram: field-assignment
+  receiver is not a struct` on a field WRITE. A captured `i32[]`, a captured `string`, and a
+  struct merely PASSED THROUGH the closure to a function are all **check-clean invalid
+  wasm** — and all three RUN when the same block is inside a function. Those are the cells
+  this row's close has to re-grade; they are named here rather than filed as a message group.
+
+Ablation:
+
+| ingredient removed | outcome | needed? |
+| --- | --- | --- |
+| the block (declare `p` and `f` at module scope) | runs, prints 7 | **yes** |
+| the module scope (wrap the block in a function) | runs, prints 7 | **yes** |
+| the closure (`print(p.x)` in the block) | runs, prints 7 | **yes** |
+| the capture (`const f = (q: P) => q.x`, `f(p)`) | runs, prints 7 | **yes** |
+| the local's block scope (capture a module-scope `p`) | runs, prints 7 | **yes** |
+| the ref rep (capture an `i32` instead) | runs, prints 7 | **yes** |
+| the annotation on `p` (`const p = { x: 7 }`) | still refuses | no |
+| the named type (an anon `{ x: 7 }`) | still refuses | no |
+| `if` → `else` / `while` / `for` / bare `{ }` | still refuses | no |
+| calling `f` in the block (let it escape to a module global) | still refuses | no |
+| one closure → a closure inside a closure | still refuses | no |
+
+* **BOTH FACES.** The annotation is not a face here — `const p: P = { x: 7 }` and `const p = {
+  x: 7 }` both refuse, and both run inside a function. The face that DOES separate the
+  outcomes is the enclosing scope, which is why the row is spelled against that.
+
+* Probe: `scripts/capability-probes/module-block-closure-capture-struct.vl` (GAP today).
+
+* **NOT EXPRESSIBLE IN THE POSITION MATRIX.** `matrix.py`'s twenty positions all deliver at
+  module scope or inside a function; none of them opens a module-scope BLOCK, so
+  `closure_capture` grades this capability green while the row is live. That is a gap in the
+  harness, not in this row's evidence — a `block_*` position family is the fix, and until it
+  exists the ablation table above is the matrix.
+
+* **AND A BARE `{ … }` BLOCK INSIDE A FUNCTION IS ITS OWN REFUSAL**, found while ablating the
+  block kinds: `emitProgram: unsupported statement in body`, `vl check` rc 0, on a function
+  body containing nothing but `{ const p: P = { x: 7 } … }`. Unfiled, and not this row.
 ---
 ### D1270 — an UN-ANNOTATED array literal whose element is a nullable CONTAINER (`[f(0)]` where `f(): i32[] | null`) builds the mono i32 list: check-clean invalid wasm
 

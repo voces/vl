@@ -29,11 +29,11 @@ import {
   nodeTyIsLitUnion,
   nodeTyIsLitUnionAlias,
   nodeTyIsMap,
+  nodeTyIsNulBool,
   nodeTyIsNulLitUnion,
   nodeTyIsNulNumLitUnion,
   nodeTyIsNulScalarBox,
   nodeTyIsNullable,
-  nodeTyIsNullableStruct,
   nodeTyIsStringPrim,
   nodeTyIsUnion,
   nodeTyIsVariant,
@@ -404,6 +404,7 @@ import {
   fbRefCast,
   fbRefNull,
   fbRefNullNone,
+  fbRefNullOfKind,
   fbRefNullStruct,
   fbReturn,
   fbReturnCall,
@@ -5769,9 +5770,10 @@ function emitUnionIfValue(
 ) {
   const s = P.nodes[ifIx]
   if s is IfStmt {
-    if s.ifElse < 0 {
-      return emitFail("emitProgram: union if-expression requires an else arm")
-    }
+    // AN ELSE-LESS `if` USED AS A VALUE IS `T | null` (DECISIONS, 2026-09-02), and in the
+    // box rep that null is the NULL-TAGGED BOX — the same value `emitNulNullToLocal`
+    // writes for the binding sink's rep 0, built here on the stack instead of into a slot.
+    const noElse = s.ifElse < 0
     if emitExpr(body, s.ifCond, fnIx) < 0 { return -1 }
     wU8(4)                 // 0x04 if
     fbValtype("union", -1) // result blocktype: the union box `(ref $uBox)`
@@ -5789,12 +5791,18 @@ function emitUnionIfValue(
     fbElse() // 0x05 else
     const savedElseTop = narrowTop
     const narrowedElse = setNarrowFromCondElse(s.ifCond, fnIx)
-    const els = P.nodes[s.ifElse]
     let rc = 0
-    if els is IfStmt {
-      rc = emitUnionIfValue(body, unionName, s.ifElse, fnIx)
+    if noElse {
+      fbI32Const(nullBoxTag())
+      fbRefNullNone() // the payload slot is unread under the null tag
+      fbStructNew(uBoxIdx)
     } else {
-      rc = emitUnionIfArm(body, unionName, s.ifElse, fnIx)
+      const els = P.nodes[s.ifElse]
+      if els is IfStmt {
+        rc = emitUnionIfValue(body, unionName, s.ifElse, fnIx)
+      } else {
+        rc = emitUnionIfArm(body, unionName, s.ifElse, fnIx)
+      }
     }
     if narrowedElse { restoreNarrow(savedElseTop) }
     if rc < 0 { return -1 }
@@ -5982,27 +5990,36 @@ function emitVariantPassThrough(body: i32[], exprIx: i32, fnIx: i32) {
 function emitVariantIfValue(body: i32[], vi: i32, ifIx: i32, fnIx: i32) {
   const s = P.nodes[ifIx]
   if s is IfStmt {
-    if s.ifElse < 0 {
-      return emitFail("emitProgram: variant if-expression requires an else arm")
-    }
+    // AN ELSE-LESS `if` USED AS A VALUE IS `T | null` (DECISIONS, 2026-09-02): the
+    // variant rep's null is `ref.null $(uVarHeap[vi])`, so the blocktype goes nullable
+    // with it (`fbRefNullOfKind` is `fbValtypeNullable`'s value twin).
+    const noElse = s.ifElse < 0
     if emitExpr(body, s.ifCond, fnIx) < 0 { return -1 }
-    wU8(4)                   // 0x04 if
-    fbValtype("variant", vi) // result blocktype: the variant struct `(ref $(uVarHeap[vi]))`
-    ctrlEnter()              // count the frame — see `emitUnionIfValue`
+    wU8(4) // 0x04 if
+    if noElse {
+      fbValtypeNullable("variant", vi) // `(ref null $(uVarHeap[vi]))`
+    } else {
+      fbValtype("variant", vi) // result blocktype: the variant struct `(ref $(uVarHeap[vi]))`
+    }
+    ctrlEnter() // count the frame — see `emitUnionIfValue`
     const savedTop = narrowTop
     const narrowed = setNarrowFromCond(s.ifCond, fnIx)
     const rcT = emitVariantIfArm(body, vi, s.ifThen, fnIx)
     if narrowed { restoreNarrow(savedTop) }
     if rcT < 0 { return -1 }
-    fbElse()                 // 0x05 else
+    fbElse()    // 0x05 else
     const savedElseTop = narrowTop
     const narrowedElse = setNarrowFromCondElse(s.ifCond, fnIx)
-    const els = P.nodes[s.ifElse]
     let rc = 0
-    if els is IfStmt {
-      rc = emitVariantIfValue(body, vi, s.ifElse, fnIx)
+    if noElse {
+      rc = fbRefNullOfKind("variant", vi)
     } else {
-      rc = emitVariantIfArm(body, vi, s.ifElse, fnIx)
+      const els = P.nodes[s.ifElse]
+      if els is IfStmt {
+        rc = emitVariantIfValue(body, vi, s.ifElse, fnIx)
+      } else {
+        rc = emitVariantIfArm(body, vi, s.ifElse, fnIx)
+      }
     }
     if narrowedElse { restoreNarrow(savedElseTop) }
     if rc < 0 { return -1 }
@@ -13820,18 +13837,22 @@ function emitIfExprRef(
 ) {
   const s = P.nodes[ifIx]
   if s is IfStmt {
-    if s.ifElse < 0 {
-      return emitFail("emitProgram: if-expression requires an else arm")
-    }
+    // AN ELSE-LESS `if` USED AS A VALUE IS `T | null` (DECISIONS, 2026-09-02): the false
+    // path yields `null`, so the join is nullable and the missing arm is the rep's own
+    // null. The blocktype below and the else arm at the bottom are that one fact, twice.
+    const noElse = s.ifElse < 0
     if emitExpr(body, s.ifCond, fnIx) < 0 { return -1 }
     wU8(4) // 0x04 if
-    // A struct join the checker typed `S | null` (one arm is `null` → `(ref null $S)`, the other a
-    // `(ref $S)`) needs a NULLABLE blocktype, else the null arm's `(ref null $S)` mismatches the
-    // non-null `(ref $S)` result. `nodeTyIsNullableStruct` reads the checker's recorded join type — the
-    // generic signal — rather than re-deriving from the arms. (A non-nullable struct join, or a binding
-    // annotated `S | null` whose arms are both non-null, stays non-null: the value widens on store.)
-    if kind == "struct" && nodeTyIsNullableStruct(ifIx) {
-      fbValtypeNullable(kind, slot) // `(ref null $S)` result blocktype
+    // A join the checker typed `T | null` — one arm `null`, or absent — needs a NULLABLE
+    // blocktype, else that arm's `(ref null $ht)` mismatches the non-null result.
+    // `nodeTyIsNullable` reads the checker's recorded join type: the GENERIC signal, asked
+    // for every ref kind at once. Asking it per-kind is what a struct-only spelling of this
+    // line did, and every other ref kind with a `null` arm was then check-clean INVALID
+    // WASM (`expected (ref $type), found (ref null $type)`) — measured at `str`, `strlist`,
+    // `list` and `map`. A non-nullable join, or a binding annotated `T | null` whose arms
+    // are both non-null, stays non-null: the value widens on store.
+    if noElse || nodeTyIsNullable(ifIx) {
+      fbValtypeNullable(kind, slot) // `(ref null $ht)` result blocktype
     } else {
       fbValtype(kind, slot) // ref result blocktype `(ref $ht)`
     }
@@ -13843,12 +13864,19 @@ function emitIfExprRef(
     fbElse() // 0x05 else
     const savedElseTop = narrowTop
     const narrowedElse = setNarrowFromCondElse(s.ifCond, fnIx)
-    const els = P.nodes[s.ifElse]
     let rc = 0
-    if els is IfStmt {
-      rc = emitIfExprRef(body, s.ifElse, fnIx, kind, slot)
+    if noElse {
+      // The synthesized false path: the rep's own null, matching the nullable blocktype
+      // above. `fbRefNullOfKind` is `fbValtypeNullable`'s VALUE twin, so the declaration
+      // and the value cannot name different heap types.
+      rc = fbRefNullOfKind(kind, slot)
     } else {
-      rc = emitRefIfArm(body, s.ifElse, fnIx, kind, slot)
+      const els = P.nodes[s.ifElse]
+      if els is IfStmt {
+        rc = emitIfExprRef(body, s.ifElse, fnIx, kind, slot)
+      } else {
+        rc = emitRefIfArm(body, s.ifElse, fnIx, kind, slot)
+      }
     }
     if narrowedElse { restoreNarrow(savedElseTop) }
     if rc < 0 { return -1 }
@@ -13994,8 +14022,17 @@ function emitRefIfArm(
 function emitIfExprAs(body: i32[], ifIx: i32, fnIx: i32, kind: i32) {
   const s = P.nodes[ifIx]
   if s is IfStmt {
-    if s.ifElse < 0 {
-      return emitFail("emitProgram: if-expression requires an else arm")
+    // AN ELSE-LESS `if` USED AS A VALUE IS `T | null` (DECISIONS, 2026-09-02). This is the
+    // i32-blocktype family, so the false path is a NICHE SENTINEL — 2 for `boolean | null`,
+    // -1 for a nullable literal union — the same two values `emitNullLitNode` writes for a
+    // bare `null` in those reps. A bare `i32`/`i64`/`f64`/`f32` join has no such spare
+    // value: its `T | null` rep is the union BOX, which `emitUnionIfValue` lowers, so this
+    // path keeps the loud refusal for it rather than inventing a sentinel in an i32.
+    const noElseNiche = s.ifElse < 0
+    if noElseNiche {
+      if !nodeTyIsNulBool(ifIx) && !nodeTyIsNulLitUnion(ifIx) {
+        return emitFail("emitProgram: if-expression requires an else arm")
+      }
     }
     if emitExpr(body, s.ifCond, fnIx) < 0 { return -1 }
     fbIf(kind) // 0x04 if, <kind> result blocktype
@@ -14007,12 +14044,16 @@ function emitIfExprAs(body: i32[], ifIx: i32, fnIx: i32, kind: i32) {
     fbElse()   // 0x05 else
     const savedElseTop = narrowTop
     const narrowedElse = setNarrowFromCondElse(s.ifCond, fnIx)
-    const els = P.nodes[s.ifElse]
     let rc = 0
-    if els is IfStmt {
-      rc = emitIfExprAs(body, s.ifElse, fnIx, kind)
+    if noElseNiche {
+      if nodeTyIsNulBool(ifIx) { fbI32Const(2) } else { fbI32Const(0 - 1) }
     } else {
-      rc = emitBlockValueAs(body, s.ifElse, fnIx, kind)
+      const els = P.nodes[s.ifElse]
+      if els is IfStmt {
+        rc = emitIfExprAs(body, s.ifElse, fnIx, kind)
+      } else {
+        rc = emitBlockValueAs(body, s.ifElse, fnIx, kind)
+      }
     }
     if narrowedElse { restoreNarrow(savedElseTop) }
     if rc < 0 { return -1 }

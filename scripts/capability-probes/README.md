@@ -52,6 +52,29 @@ CLAUDE.md warns hides, and five of those six turned out to be floors: the warnin
 that a gap can hide there, and wrong as a presumption that one does. **Probe before
 scheduling.**
 
+## The position matrix — `matrix.py`, one template, every position, both faces
+
+A capability is enforced in ONE place and served in MANY, so a fix is graded at every
+delivery position in the ANNOTATED and UN-ANNOTATED face. Hand-writing those ~40 programs is
+where the misses come from — D965 lost global assignment, D1193 was silent at seven of nine,
+D1197 is red at exactly one. Write the template instead:
+
+    python3 scripts/capability-probes/matrix.py matrix/orerr-generic-pin.matrix.vl
+    python3 scripts/capability-probes/matrix.py <t> --before old.wasm --after new.wasm
+    python3 scripts/capability-probes/matrix.py <t> --only array_push,global_assign --keep
+
+A `matrix/*.matrix.vl` is `// @@SECTION@@` blocks: `@@PRELUDE@@`, `@@VALUE@@`, `@@TYPE@@`,
+`@@WANT@@`, and either `@@PROOF@@` or `@@TEST@@`/`@@HIT@@`/`@@MISS@@` — the latter also
+unlocks the six discrimination positions. `@@SETUP@@`/`@@GUARD@@`/`@@FALLBACK@@` deliver a
+NARROWED value; `@@SKIP@@` takes `position: reason`. `matrix.py`'s docstring is the spec and
+`--list-positions` prints the twenty and what each face annotates.
+
+Grading is `run.py`'s, imported not copied. It exits non-zero on `runs -> not-runs` between
+two seeds or any `SILENT` after, so **a brief runs it before the fix and after it** and
+pastes both tables. `--keep` leaves the cells, which is how a red one becomes a probe here.
+A template is a fragment collection, not a program: `lint-self.sh` prunes `matrix/` from its
+fmt sweep, and `run.py`'s probe count is untouched because it never descends into it.
+
 ## Adding one
 
 A probe earns its place by being reached by NO corpus cell. Check before adding:
