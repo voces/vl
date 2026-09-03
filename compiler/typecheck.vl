@@ -564,6 +564,27 @@ let holeShapeTys: i32[] = []
 // rejects a non-indexable scalar argument bound to such a param (`head(5)` where the body
 // read `self[0]`), the indexing analogue of the demanded-shape check above.
 let holeArrayDemand: string[] = []
+// Hole NAMES whose body applied an `as` CAST to the hole itself (`a as i32`), one row per
+// cast site. The trio's two type-level obligations — a bare `as` needs a declared home for
+// what it propagates, and `as?` yields `T | null` exactly when the cast can fail — are both
+// decided from the OPERAND's type, which a hole does not carry. So the row parks them and the
+// call site that PINS the hole re-asks them against the argument, the same shape
+// `holeArrayDemand` uses for the indexing demand. D1342 (the propagation), D1341 (the result).
+let holeCastNames: string[] = []
+// The cast's mode ("prop" / "trap" / "null"), its TARGET arena row and spelling, the node, and
+// `T.curRet` AS SEEN AT THE CAST — the enclosing return the propagation must fit, which by the
+// time the call is checked may have been inferred into something the cast never saw.
+let holeCastMode: string[] = []
+// The operand's own IDENT, which must be the PARAMETER's name at the call site: a hole read
+// through anything else (`const b = a ?? 0`) carries a type the pin does not describe.
+let holeCastVar: string[] = []
+// `<holeName>.<ident>` for every hole binding the body ASSIGNS to — a write replaces the value
+// the call site's pin describes, so a cast on it afterwards has no adjudicable operand.
+let holeCastClob: string[] = []
+let holeCastTgtTy: i32[] = []
+let holeCastTgtName: string[] = []
+let holeCastIx: i32[] = []
+let holeCastRet: i32[] = []
 // Hole NAMES whose body used the MAP/SET SURFACE (`self.set(k, v)`, `.get`, `.has`,
 // `.delete`, `.add`, `.keys()`, `.values()`) — so the hole demands a map, and the parallel
 // `holeMapTys` entry IS that map: an open `{[?]: ?}` the body's own operations pin in place.
@@ -3024,6 +3045,14 @@ export function initChecker() {
   holeShapeNames = []
   holeShapeTys = []
   holeArrayDemand = []
+  holeCastNames = []
+  holeCastMode = []
+  holeCastVar = []
+  holeCastClob = []
+  holeCastTgtTy = []
+  holeCastTgtName = []
+  holeCastIx = []
+  holeCastRet = []
   holeMapNames = []
   holeMapTys = []
   holeAltNames = []
@@ -17518,6 +17547,19 @@ function holeMapDemandTy(name: string, isSet: boolean) {
   ty
 }
 
+// Whether any `is` GUARD in the body tested hole `name` — `holeAltNames` is the record, and
+// this is the boolean half of it. The alternatives are what the guard's branch handles on its
+// own path, so their presence says the hole's type at a later read is the pin MINUS something
+// the checker cannot name; a rung that decides from the pin alone must decline. D1342.
+function holeHasIsAlt(name: string) {
+  let a = 0
+  while a < holeAltNames.length {
+    if holeAltNames[a] == name { return true }
+    a = a + 1
+  }
+  false
+}
+
 function holeIsArrayDemanded(name: string) {
   let i = 0
   while i < holeArrayDemand.length {
@@ -21332,6 +21374,8 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
         if holeIsArrayDemanded(pHole.tvName) {
           if tyRefusesArrayDemand(at) { holeArgArrayErr(i + 1, at, args[i]) }
         }
+        // The `as` cast the body parked on this hole, re-asked under the argument. D1342.
+        holeCastPinCheck(pHole.tvName, at, declParamNameAt(uDecl, i))
       }
       constrainEmptyExpr(args[i], at, expected)
       if !assignableExpr(args[i], at, expected) {
@@ -22633,6 +22677,8 @@ function checkCallNode(n: Call, ix: i32) {
         if holeIsArrayDemanded(pHole.tvName) {
           if tyRefusesArrayDemand(at) { holeArgArrayErr(i + 1, at, args[i]) }
         }
+        // The `as` cast the body parked on this hole, re-asked under the argument. D1342.
+        holeCastPinCheck(pHole.tvName, at, declParamNameAt(dParams, i))
       }
       // Passing an empty-collection argument into a concrete `T[]` / map param pins
       // its element type from the param (`len(empty)` resolves `empty` to `i32[]`),
@@ -32893,6 +32939,14 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
     if asgTgt is Ident {
       const asgCur = lookup(asgTgt.identName)
       if asgCur >= 0 {
+        // A WRITE TO A HOLE BINDING ENDS THE PIN'S JURISDICTION OVER IT. The call site pins
+        // the PARAMETER; `a = 7` replaces the value the pin describes, so a cast after it is
+        // not the cast the pin can adjudicate. Recorded, not decided, because the write's own
+        // type says nothing about the hole. D1342.
+        const asgHole = T.tys[asgCur]
+        if asgHole is TyVar {
+          noteCastClobber(asgHole.tvName + "." + asgTgt.identName)
+        }
         const rtT = T.tys[rt]
         let rhsNullable = false
         if rtT is TyNullable { rhsNullable = true }
@@ -34416,11 +34470,17 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
 // Returns false with the diagnostic already reported. The two arms differ only in WHAT they
 // propagate, which is the `rest` parameter, so a second copy of this ladder would be three more
 // chances for the two spellings of one rule to drift. The messages name `rest` for that reason.
-function castPropagationFits(rest: i32, asTy: string, ix: i32): boolean {
+// The enclosing return is a PARAMETER because `castPinAdjudicate` asks from a CALL SITE. D1342.
+function castPropagationFits(
+  rest: i32,
+  asTy: string,
+  ix: i32,
+  curRet: i32,
+): boolean {
   // A PENDING return (-2, still being inferred) is refused rather than joined into: a cast
   // that silently widens the function's own signature is the opposite of what an explicit
   // cast is for, and the annotation is one word.
-  if T.curRet == -2 {
+  if curRet == -2 {
     tErr(
       "`as " +
         asTy +
@@ -34435,7 +34495,7 @@ function castPropagationFits(rest: i32, asTy: string, ix: i32): boolean {
   // cannot return it" there names a function that does not exist (it rendered "it returns
   // _"). The cast is still the wrong tool, but for a different reason, so it gets its own
   // sentence and points at the two spellings that do work.
-  if T.curRet < 0 {
+  if curRet < 0 {
     tErr(
       "`as " +
         asTy +
@@ -34446,20 +34506,166 @@ function castPropagationFits(rest: i32, asTy: string, ix: i32): boolean {
     )
     return false
   }
-  if !assignable(rest, T.curRet) {
+  if !assignable(rest, curRet) {
     tErr(
       "`as " +
         asTy +
         "` propagates " +
         tyToStr(rest) +
         ", which the enclosing function cannot return (it returns " +
-        tyToStr(T.curRet) +
+        tyToStr(curRet) +
         ") — use `as!` to trap instead, or `as?` to take the null here",
       ix,
     )
     return false
   }
   true
+}
+
+// PARK an `as` cast whose OPERAND is still a hole. Both of the trio's type-level obligations
+// are decided from the operand — a bare `as` needs a declared home for what it propagates,
+// and `as?` yields `T | null` exactly when the cast can fail — and a hole answers neither, so
+// the numeric ladder below admits the cast and types it `T`. One row per cast SITE (the node
+// is the dedupe key), re-asked by `holeCastPinCheck` at the call that pins the hole. D1342.
+function noteCastDemand(name: string, n: AsExpr, ix: i32, target: i32) {
+  if name == "" { return 0 }
+  // THE PIN DESCRIBES THE PARAMETER, so the demand may only speak for a DIRECT read of it.
+  // `const b = a ?? 0` leaves `b` holding the very hole row — the coalesce does not retype it
+  // — so a rung reading the pin there refuses `b as i32` where the annotated spelling runs.
+  // The ident is checked against the DECLARED parameter name at the call site.
+  const vn = castOperandIdent(n.asObj)
+  if vn == "" { return 0 }
+  // A NARROWING IN FORCE OVER THE OPERAND'S PLACE IS THE OPERAND'S TYPE, and the pin is not:
+  // `a = 7` ahead of the cast leaves the PARAMETER pinned to `i32 | null` while the cast reads
+  // an `i32` that cannot fail.
+  if narrowedPathTy(vn) >= 0 { return 0 }
+  // …AND A WRITE TO THE HOLE BINDING IS THE SAME FACT WITHOUT AN OVERLAY TO CARRY IT: a hole
+  // has nothing to narrow FROM, so `a = 7` leaves it a `TyVar` and only the write's own record
+  // says the pin has stopped describing it.
+  if castClobbered(name + "." + vn) { return 0 }
+  // AN `is` GUARD OVER THE HOLE MEANS THE SAME THING ONE STATEMENT OUT. `if a is null {
+  // return }` subtracts the arm on the surviving path, and the checker records the guard on
+  // the hole (`noteHoleAlt`) without being able to name the remainder. Declining is the safe
+  // direction — it never adds a refusal — and refusing here would refuse a program that RUNS
+  // and whose ANNOTATED spelling runs, which is the divergence this rung exists to close.
+  if holeHasIsAlt(name) { return 0 }
+  let i = 0
+  while i < holeCastIx.length {
+    if holeCastIx[i] == ix { return 0 }
+    i = i + 1
+  }
+  holeCastNames.push(name)
+  holeCastMode.push(n.asMode)
+  holeCastVar.push(vn)
+  holeCastTgtTy.push(target)
+  holeCastTgtName.push(n.asTy)
+  holeCastIx.push(ix)
+  holeCastRet.push(T.curRet)
+  0
+}
+
+// Record / read a hole binding the body wrote to, by `<holeName>.<ident>`. Idempotent.
+function noteCastClobber(key: string) {
+  if castClobbered(key) { return 0 }
+  holeCastClob.push(key)
+  0
+}
+function castClobbered(key: string): boolean {
+  let i = 0
+  while i < holeCastClob.length {
+    if holeCastClob[i] == key { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The cast operand's IDENT name, through parens, or "" for any other expression shape.
+function castOperandIdent(ix: i32): string {
+  if ix < 0 || ix >= P.nodes.length { return "" }
+  const n = P.nodes[ix]
+  if n is Paren { return castOperandIdent(n.parInner) }
+  if n is Ident { return n.identName }
+  ""
+}
+
+// The DECLARED name of parameter `i` in a `Param`-node list, or "" — the call site's half of
+// the direct-read rule above. A call through a function VALUE has no declaration to read, and
+// answers "", which declines every parked cast rather than adjudicating one blind.
+function declParamNameAt(dParams: i32[], i: i32): string {
+  if i < 0 || i >= dParams.length { return "" }
+  const pn = P.nodes[dParams[i]]
+  if pn is Param { return pn.parName }
+  ""
+}
+
+// Every parked cast on hole `name`, re-asked under the type this call site pinned it to. The
+// same shape `holeIsArrayDemanded` uses, and for the same reason: the body records what it
+// needs to know about the hole, and the argument is the first place the answer exists.
+// Gated on the REAL pass because the `as?` half WRITES a node type, which a probe's
+// save/restore does not cover.
+function holeCastPinCheck(name: string, at: i32, pName: string) {
+  if inferQuiet { return 0 }
+  if at < 0 { return 0 }
+  if pName == "" { return 0 }
+  if tyIsHole(at) { return 0 }
+  let k = 0
+  while k < holeCastNames.length {
+    if holeCastNames[k] == name && holeCastVar[k] == pName {
+      castPinAdjudicate(k, at)
+    }
+    k = k + 1
+  }
+  0
+}
+
+// One parked cast, adjudicated against the pinned operand type `at`. The ladder is
+// `checkCastNode`'s own, minus the arms a hole already answered: the coverage error and the
+// non-numeric refusal stay where they are, because this rung must never be the FIRST place a
+// cast is rejected for a reason the direct spelling reports differently.
+function castPinAdjudicate(k: i32, at: i32) {
+  const target = holeCastTgtTy[k]
+  if target < 0 { return 0 }
+  const mode = holeCastMode[k]
+  if mode == "trap" { return 0 }
+  const castIx = holeCastIx[k]
+  // A NULLABLE OPERAND IS A UNION OPERAND, expanded exactly as `checkCastNode`'s arm expands
+  // it — one rule, two entry points, so the hole and the annotation cannot disagree.
+  let argU = at
+  const argN = T.tys[at]
+  if argN is TyNullable {
+    if argN.nInner >= 0 {
+      const nulU = mkUnionTy([argN.nInner, TY_NULL])
+      if nulU >= 0 { argU = nulU }
+    }
+  }
+  const argT = T.tys[argU]
+  if argT is TyUnion {
+    if !unionCoversTy(argT, target) { return 0 }
+    const rest = subtractTy(argU, target)
+    if rest < 0 { return 0 }
+    if mode == "null" { return castPinNullResult(castIx, target) }
+    castPropagationFits(rest, holeCastTgtName[k], castIx, holeCastRet[k])
+    return 0
+  }
+  const sn = primNameStr(primNameOf(at))
+  const tn = primNameStr(primNameOf(target))
+  if !numCastCanFail(sn, tn) { return 0 }
+  if mode == "null" { return castPinNullResult(castIx, target) }
+  castPropagationFits(TY_NULL, holeCastTgtName[k], castIx, holeCastRet[k])
+  0
+}
+
+// D1341 — `as?` yields `T | null` exactly when the cast CAN FAIL, and at a hole operand
+// `numCastCanFail("", "i32")` answered false, so the node was typed the BARE arm while the
+// monomorphizer pinned the operand to a box: the emitter built the nullable and handed it to
+// a consumer the checker had typed `i32`. Re-record the result from the pinned answer. The
+// cell that must NOT move is `take(5)`, where the pin makes the cast infallible and this rung
+// is never reached, so the node keeps `T` and the `const x: i32 = a as? i32` binding runs.
+function castPinNullResult(castIx: i32, target: i32) {
+  const nt = mkNullableTy(target)
+  if nt < 0 { return 0 }
+  if castIx >= 0 && castIx < nodeTyIx.length { nodeTyIx[castIx] = nt }
+  0
 }
 
 // WHETHER A NUMERIC CAST CAN FAIL, under the owner's `docs/json-design.md` §6 q2 ruling: a cast to
@@ -34487,6 +34693,14 @@ function checkCastNode(n: AsExpr, ix: i32) {
   if target < 0 {
     tErr("unknown type `" + n.asTy + "` in `as` cast", ix)
     return TY_ERR
+  }
+  // A HOLE OPERAND ANSWERS NEITHER OF THE TRIO'S TYPE-LEVEL QUESTIONS, and the numeric ladder
+  // below admits it on purpose (`isNumeric` is true for a `TyVar`, so an unresolved hole does
+  // not cascade a spurious `not a number`). Park both on the hole; the call site that pins it
+  // re-asks them under a type that can answer. D1342.
+  if arg >= 0 {
+    const argH = T.tys[arg]
+    if argH is TyVar { noteCastDemand(argH.tvName, n, ix, target) }
   }
   // The TARGET must be a concrete numeric scalar (strict — `primNameOf` skips
   // arrays/objects/unions/type-vars). The OPERAND uses the tolerant `isNumeric` (true for `TyErr`),
@@ -34551,7 +34765,7 @@ function checkCastNode(n: AsExpr, ix: i32) {
       // goes. A PENDING return (-2, still being inferred) is refused rather than joined
       // into: a cast that silently widens the function's own signature is the opposite of
       // what an explicit cast is for, and the annotation is one word.
-      if !castPropagationFits(rest, n.asTy, ix) { return TY_ERR }
+      if !castPropagationFits(rest, n.asTy, ix, T.curRet) { return TY_ERR }
       return target
     }
   }
@@ -34576,7 +34790,7 @@ function checkCastNode(n: AsExpr, ix: i32) {
     // `as?` re-wraps to `T | null` and the null stays local to the expression.
     if n.asMode == "null" { return mkNullableTy(target) }
     // A bare `as` propagates `null`, so the enclosing return must carry it.
-    if !castPropagationFits(TY_NULL, n.asTy, ix) { return TY_ERR }
+    if !castPropagationFits(TY_NULL, n.asTy, ix, T.curRet) { return TY_ERR }
   }
   target
 }
