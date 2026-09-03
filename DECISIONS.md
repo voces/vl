@@ -4300,6 +4300,30 @@ atom dedup collapses `string|string` — the two producers agreed there BY ACCID
 build note's rule is right and incomplete as written: **a type-level collapse must move the
 arena AND canon, or they agree about the TYPE and disagree about the REP.**
 
+**Note added 2026-09-02 (D1199): BOTH HINTS ARE BUILT, and the second one needs a bank because
+THE COLLAPSE IS INVISIBLE IN ITS OWN RESULT.** The first hint arrived free, exactly as ruled —
+`string | "err"` now infers as `string`, so the existing redundant-annotation hint fires at the
+written spelling with no new code. The second could not be derived that way, and the reason is
+worth writing down: after the collapse `r` IS a `string` — the canonical arena singleton, the
+canon spelling `string` — so the arena, the canon render and the message all agree with a
+`string` nobody wrote a union for. A rule reading the TYPE at the `is` site would fire on every
+legitimate `s is "err"` in the language. **How "collapsed" is recorded:** the annotation route
+banks the arena index it collapsed TO (`collapsedTy`, a third bank on `unkTyPart`'s wire —
+cleared by the outermost `tsToTy`/`nameToTy` frame, restored across `resolveAnnotTs`'s name memo
+like `annotPart`); the DECLARATION route banks the alias NAME (`collapsedAliases`), which
+`declaredTyOfName` re-banks at every later `: R`, so `type R = string | "err"` reaches
+`function f(): R` through the one door every declared-type reference comes through. A `let`,
+a parameter and a declared RETURN each compare their OWN resolved type against the bank —
+so `(string | "err")[]` marks nothing — and an un-annotated `const r = f(…)` inherits the mark
+from the callee's decl node. Marks are depth-tagged sparse rows dropped by `popScope`, paired
+with `lookupDepth` at the read, which is what makes an inner plain `const r: string` shadowing
+an outer collapsed `r` silent without recording anything itself. The generic-instantiation
+decline is STRUCTURAL rather than a special case: substitution mints its collapsed union on the
+third route (`substTyDeep`), which banks nothing, so `orErr<Json>` cannot reach the hint. The
+diagnostic is a non-blocking `hint` under the code `collapsed-arm-value-test`, fires only for a
+LITERAL check type (`is null` / `is string` / `is Circle` still discriminate), and changes no
+codegen — 18 programs graded against a pristine `origin/master` seed emit byte-identical wasm.
+
 ## `is A` over same-shape struct arms is a DISCRIMINANT-VALUE test: a literal-typed field is a type that is also a value, and membership is decided by the value (owner, 2026-09-02)
 
 **Ruling.** Two struct arms that share a field-name set and differ only in a literal-typed
