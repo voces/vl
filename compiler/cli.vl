@@ -195,10 +195,40 @@ let cliFmtBad = 0      // count of files whose INPUT did not parse (exit 2)
 let cliFmtBug = 0      // count of round-trip gate trips — formatter bug (exit 3)
 let cliFix = 0         // check --fix: apply the safe lint fixes in place
 let cliFixCount = 0    // total safe fixes applied across the run
+let cliFixDeclined = 0 // total edits VERIFY-AND-REVERT threw away across the run
 let cliLintGraphed = 0 // 1 = the current file's lint ran module-aware (lintGraph)
 let cliFileFixed = 0   // 1 once the current file's fixes were applied — so
 // the module-aware re-check (for the report) doesn't
 // re-fix. Reset per file in cliStartFile.
+// ── verify-and-revert (D1091) ──────────────────────────────────────────────────
+// An autofix must never ship a program that stops working, so every candidate
+// rewrite is COMPILED (emit + engine validation, not just `check`) before it
+// reaches the disk, and an edit that breaks a file that built is dropped. The
+// phases run inside the existing per-file check loop — `cliBeginCheck` restages
+// from the in-memory source and every dependency is already cached, so a trial
+// costs one compile and no host read.
+const FIXP_OFF = 0                // not verifying: the report path
+const FIXP_ALL = 1                // trial = every computed edit at once (the fast path)
+const FIXP_BASE = 2               // trial = the ORIGINAL source (did it build before?)
+const FIXP_ONE = 3                // trial = the accepted set plus edit `cliFixTrial`
+let cliFixPhase = 0
+let cliFixTrial = 0               // index under trial in FIXP_ONE
+let cliFixOrig = ""               // the file's source before any edit
+let cliFixPassRc = 0              // compileSrc's rc for the trial just run
+let cliFixEditPos: i32[] = []
+let cliFixEditLen: i32[] = []
+let cliFixEditTxt: string[] = []
+let cliFixEditWhat: string[] = [] // the lint/hint the edit came from, for the report
+let cliFixEditLine: i32[] = []
+let cliFixEditCol: i32[] = []
+let cliFixKeep: i32[] = []        // 1 = this edit is in the current candidate
+// One row per edit verify-and-revert DECLINED, drained into an `info` diagnostic by
+// the report pass. A declined edit is a site where the finding that OFFERED it is
+// wrong, and a count alone cannot be worked on — this is the standing worklist of
+// annotations inference cannot yet do without (D1091).
+let cliFixDeclinedAt: string[] = []
+let cliFixDeclinedLine: i32[] = []
+let cliFixDeclinedCol: i32[] = []
 // ── `vl test` (cliCmd == 2) ────────────────────────────────────────────────────
 // Flags.
 let cliTestFilter = "" // -t <substring>: keep tests whose scope-path contains it
@@ -363,8 +393,23 @@ export function cliArgReset() {
   cliFmtResult = ""
   cliFix = 0
   cliFixCount = 0
+  cliFixDeclined = 0
   cliLintGraphed = 0
   cliFileFixed = 0
+  cliFixPhase = FIXP_OFF
+  cliFixTrial = 0
+  cliFixOrig = ""
+  cliFixPassRc = 0
+  cliFixEditPos = []
+  cliFixEditLen = []
+  cliFixEditTxt = []
+  cliFixEditWhat = []
+  cliFixEditLine = []
+  cliFixEditCol = []
+  cliFixKeep = []
+  cliFixDeclinedAt = []
+  cliFixDeclinedLine = []
+  cliFixDeclinedCol = []
   cliDirNames = []
   cliDirIsDirs = []
   cliDirNameAcc = []
@@ -924,7 +969,16 @@ function cliIngestEntries(base: string, relBase: string) {
 function cliCheckCurFile() {
   if cliModMode == 0 { cliStageEntry() }
   let rc = 0
-  if cliCodegen != 0 { rc = compileSrc() } else { rc = checkSrc() }
+  // A `--fix` VERIFY pass compiles rather than checks: the annotation the hint
+  // calls redundant is load-bearing for the EMITTER in more files than for the
+  // checker, so a `check`-only verification would wave 87 of 159 breakages
+  // through (D1091).
+  if cliCodegen != 0 || cliFixPhase != FIXP_OFF {
+    rc = compileSrc()
+  } else {
+    rc = checkSrc()
+  }
+  cliFixPassRc = rc
   cliLastStage = ""
   if rc == 1 { cliLastStage = "parse" }
   else if rc == 2 { cliLastStage = "type" }
@@ -937,6 +991,15 @@ function cliCheckCurFile() {
   // `rbyte*` and commits a string, never re-entering the compiler, so the driver's
   // diagnostic stores the rest of this function reads are untouched.
   cliValidateMsg = ""
+  // A verify pass ALWAYS hands the bytes over, even for a nonzero `rc` whose
+  // verdict is already decided: the round-trip is what unwinds the stack between
+  // trials, so a file with many candidate edits costs one frame, not one per
+  // trial. `--no-validate` is a `--codegen` reporting flag and does not weaken a
+  // fix's safety net.
+  if cliFixPhase != FIXP_OFF {
+    cliState = ST_CHECK_VALIDATE
+    return CMD_VALIDATE
+  }
   if cliCodegen != 0 && rc == 0 && cliNoValidate == 0 {
     cliState = ST_CHECK_VALIDATE
     return CMD_VALIDATE
@@ -948,6 +1011,14 @@ function cliCheckCurFile() {
 // `cliCheckCurFile`). Split out ONLY so the validate round-trip has somewhere to
 // resume; nothing else about the ordering changed.
 function cliCheckCurFileRest() {
+  // A VERIFY pass produces a verdict, never a report: the diagnostics it just
+  // computed describe a CANDIDATE source that may never reach the disk.
+  if cliFixPhase != FIXP_OFF {
+    let ok = 0
+    if cliFixPassRc == 0 && cliValidateMsg.length == 0 { ok = 1 }
+    cliValidateMsg = ""
+    return cliFixVerdict(ok)
+  }
   // Error-tier diagnostics (all `error`) — capture them NOW, straight from the
   // driver stores, BEFORE `lintSrc` below: that re-parses the entry source and
   // resets the diagnostic stores, which would otherwise drop module-compile errors.
@@ -1021,16 +1092,20 @@ function cliCheckCurFileRest() {
   // into `let x: []`).
   if cliFix != 0 && cliFileFixed == 0 {
     cliFileFixed = 1
-    const fixed = cliComputeFixes(cliEntrySrc)
-    if fixed != cliEntrySrc {
-      cliEntrySrc = fixed
-      // Keep the per-run source cache coherent with the rewrite the host is
-      // about to perform, so later files that import this one see the fix.
-      cliSrcCachePut(cliCurFile, fixed, 1)
-      cliCmdPath = cliCurFile
-      cliCmdData = fixed
-      cliState = ST_FIX_WROTE
-      return CMD_WRITE_FILE
+    cliCollectFixes(cliEntrySrc)
+    if cliFixEditPos.length > 0 {
+      cliFixOrig = cliEntrySrc
+      // Trial one: every edit at once. On the overwhelming majority of files it
+      // holds, and then verification costs exactly one compile.
+      cliFixKeep = []
+      let fk = 0
+      while fk < cliFixEditPos.length {
+        cliFixKeep.push(1)
+        fk = fk + 1
+      }
+      cliFixPhase = FIXP_ALL
+      cliEntrySrc = cliApplyFixEdits(cliFixOrig, cliFixKeep)
+      return cliBeginCheck()
     }
   }
 
@@ -1053,6 +1128,25 @@ function cliCheckCurFileRest() {
       cliLintModAt(k),
     )
     k = k + 1
+  }
+  // `--fix` DECLINED an edit here (an `info`): applying it stopped the file
+  // building, so the diagnostic that offered it is wrong about this site. Reported
+  // per SITE, not as a count, because a count cannot be worked on — this list is
+  // the standing worklist of annotations inference cannot yet do without (D1091).
+  let fd = 0
+  while fd < cliFixDeclinedAt.length {
+    cliAddDiag(
+      "info",
+      "fix-declined",
+      cliFixDeclinedLine[fd],
+      cliFixDeclinedCol[fd],
+      cliFixDeclinedCol[fd] + 1,
+      "`--fix` left this alone: applying the " +
+        cliFixDeclinedAt[fd] +
+        " fix stops this file building, so the finding that offers it is wrong here",
+      0,
+    )
+    fd = fd + 1
   }
   // Redundant explicit type annotations (a `hint`): `let x: T = e` where the
   // initializer already infers to exactly `T`. Entry module only (`redunModuleAt
@@ -1152,10 +1246,18 @@ function cliCheckCurFileRest() {
 // a directory run aggregates across files and omits it.
 function cliFinishSummary() {
   // --fix: note how many safe fixes were written, ahead of the check report.
-  if cliFix != 0 && cliFixCount > 0 {
-    cliOut.push(
-      cliAnsi(cliColor, "2", "Applied " + i32ToStr(cliFixCount) + " fix(es)."),
-    )
+  // A DECLINED edit is one verify-and-revert threw away because the rewritten
+  // file stopped building — the count is the standing measure of how often an
+  // annotation a hint calls redundant is load-bearing (D1091).
+  if cliFix != 0 && (cliFixCount > 0 || cliFixDeclined > 0) {
+    let note = "Applied " + i32ToStr(cliFixCount) + " fix(es)."
+    if cliFixDeclined > 0 {
+      note = note +
+        " Declined " +
+        i32ToStr(cliFixDeclined) +
+        " that stopped the file building."
+    }
+    cliOut.push(cliAnsi(cliColor, "2", note))
   }
   // --json: the diagnostics ARE the report — one JSON array on a single stdout
   // line, no human summary (the exit code carries the gate, unchanged). Built
@@ -1595,6 +1697,18 @@ function cliStartFile() {
   }
   cliCurFile = cliFiles[cliFileIdx]
   cliFileFixed = 0
+  cliFixPhase = FIXP_OFF
+  cliFixOrig = ""
+  cliFixEditPos = []
+  cliFixEditLen = []
+  cliFixEditTxt = []
+  cliFixEditWhat = []
+  cliFixEditLine = []
+  cliFixEditCol = []
+  cliFixKeep = []
+  cliFixDeclinedAt = []
+  cliFixDeclinedLine = []
+  cliFixDeclinedCol = []
   // Already read this run as another file's dependency? Check it straight from
   // the cache — no host round-trip. A cached miss (found = 0) falls through to
   // a real read: the not-found path differs by target kind (see ST_CHECK_READ).
@@ -1647,18 +1761,23 @@ function cliBeginCheck() {
 }
 
 // ── check --fix (A-impl 4) ──────────────────────────────────────────────────────
-// Apply the auto-fixes to `src` and return the rewritten source, counting fixes into
-// cliFixCount. Exactly ONE fix, the only one that is *always* right with no human
-// judgment: prefer-const → the `let` keyword (the lint anchors on it) becomes `const`.
+// Collect the auto-fix edits for `src` into `cliFixEdit*`, ordered by start offset.
+// Two fixes: prefer-const → the `let` keyword (the lint anchors on it) becomes
+// `const`; a redundant type annotation → the `: T ` span becomes one space.
 // `--fix` deliberately does NOT touch unused-variable/parameter, because the `_`-prefix
 // SILENCES a warning and whether silencing is correct depends on intent; the lint still
-// reports them. Edits are absolute (offset, len, text), spliced back-to-front so earlier
-// offsets stay valid; lint is parse-only, so this needs no type info.
+// reports them. Edits are absolute (offset, len, text).
 // PRECONDITION: the caller (`cliCheckCurFile`) has just run the MODULE-AWARE check over
 // the resolved graph AND `lintSrc` over `src`, so both streams are populated. We only
 // read them and compute edits — a per-file re-check without its imports gives unreliable
 // types, which is exactly what corrupted an empty-array annotation before this.
-function cliComputeFixes(src: string) {
+function cliCollectFixes(src: string) {
+  cliFixEditPos = []
+  cliFixEditLen = []
+  cliFixEditTxt = []
+  cliFixEditWhat = []
+  cliFixEditLine = []
+  cliFixEditCol = []
   const n = cliLintCount()
   // The absolute offset where each 0-based line begins.
   const starts = [0]
@@ -1667,9 +1786,12 @@ function cliComputeFixes(src: string) {
     if src[s] == '\n' { starts.push(s + 1) }
     s = s + 1
   }
-  const pos: i32[] = []
-  const len: i32[] = []
-  const txt: string[] = []
+  const pos = cliFixEditPos
+  const len = cliFixEditLen
+  const txt = cliFixEditTxt
+  const what = cliFixEditWhat
+  const eln = cliFixEditLine
+  const ecl = cliFixEditCol
   let k = 0
   while k < n {
     const code = cliLintCodeAt(k)
@@ -1690,6 +1812,9 @@ function cliComputeFixes(src: string) {
           pos.push(off)
           len.push(3)
           txt.push("const")
+          what.push("prefer-const")
+          eln.push(ln + 1)
+          ecl.push(col)
         }
       }
     }
@@ -1716,54 +1841,153 @@ function cliComputeFixes(src: string) {
           pos.push(so)
           len.push(eo - so)
           txt.push(" ")
+          what.push("redundant type annotation")
+          eln.push(sl + 1)
+          ecl.push(redunSColAt(rk))
         }
       }
     }
     rk = rk + 1
   }
-  if pos.length == 0 { return src }
-  // Order the edits by start offset ASCENDING (insertion sort over indices), then
-  // build the result in a SINGLE forward pass into a code-point buffer: copy the
-  // gap before each edit, append its replacement, skip the replaced span — O(n +
-  // edits). (Splicing the whole string per edit was O(edits × len), pathological
-  // on the large compiler files.) The two safe fixes never overlap; a defensive
-  // `>= cur` guard drops any that somehow would.
-  const order: i32[] = []
-  let oi = 0
-  while oi < pos.length {
-    order.push(oi)
-    oi = oi + 1
-  }
+  // Order the edits by start offset ASCENDING (insertion sort over the three
+  // parallel columns), so `cliApplyFixEdits` can splice in one forward pass and
+  // so an edit's INDEX is stable across the verify trials.
   let a = 1
-  while a < order.length {
-    const key = order[a]
+  while a < pos.length {
+    const kp = pos[a]
+    const kl = len[a]
+    const kt = txt[a]
+    const kw = what[a]
+    const kln = eln[a]
+    const kcl = ecl[a]
     let b = a - 1
-    while b >= 0 && pos[order[b]] > pos[key] {
-      order[b + 1] = order[b]
+    while b >= 0 && pos[b] > kp {
+      pos[b + 1] = pos[b]
+      len[b + 1] = len[b]
+      txt[b + 1] = txt[b]
+      what[b + 1] = what[b]
+      eln[b + 1] = eln[b]
+      ecl[b + 1] = ecl[b]
       b = b - 1
     }
-    order[b + 1] = key
+    pos[b + 1] = kp
+    len[b + 1] = kl
+    txt[b + 1] = kt
+    what[b + 1] = kw
+    eln[b + 1] = kln
+    ecl[b + 1] = kcl
     a = a + 1
   }
+  0
+}
+
+// `src` with every edit whose `keep` flag is set applied. A SINGLE forward pass
+// into a code-point buffer: copy the gap before each edit, append its replacement,
+// skip the replaced span — O(n + edits). (Splicing the whole string per edit was
+// O(edits × len), pathological on the large compiler files.) The two safe fixes
+// never overlap; a defensive `>= cur` guard drops any that somehow would.
+function cliApplyFixEdits(src: string, keep: i32[]) {
   const buf: i32[] = []
   let cur = 0
   let e = 0
-  while e < order.length {
-    const idx = order[e]
-    const p = pos[idx]
-    if p >= cur {
+  while e < cliFixEditPos.length {
+    const p = cliFixEditPos[e]
+    if keep[e] != 0 && p >= cur {
       // The gap and the replacement both go in as CODE POINTS. `src.slice(cur, p)` is an
       // O(1) view since Stage 2b, so routing the gap through a slice costs nothing and
       // buys the unit: `buf.push(src[g])` would push bytes into a code-point buffer.
       pushCps(buf, src.slice(cur, p))
-      pushCps(buf, txt[idx])
-      cur = p + len[idx]
-      cliFixCount = cliFixCount + 1
+      pushCps(buf, cliFixEditTxt[e])
+      cur = p + cliFixEditLen[e]
     }
     e = e + 1
   }
   pushCps(buf, src.slice(cur, src.length))
   fromCodePoints(buf)
+}
+
+// ── verify-and-revert: the trial ladder (D1091) ─────────────────────────────────
+// `ok` is the verdict on the candidate `cliEntrySrc` just COMPILED (emit + engine
+// validation). Advance the phase and either start the next trial (re-enter the
+// per-file check over a new in-memory candidate) or commit.
+//   ALL  ok → commit everything; broken → ask whether the file built at all.
+//   BASE broken → the file did not build BEFORE, so no edit can have broken it:
+//        commit everything, exactly as `--fix` behaved before this ladder.
+//   BASE ok  → greedy: start from the empty (known-good) set and offer one edit
+//        at a time, keeping only those that leave the file building.
+//   ONE  → record the verdict for `cliFixTrial`, then offer the next edit.
+function cliFixVerdict(ok: i32) {
+  const n = cliFixEditPos.length
+  if cliFixPhase == FIXP_ALL {
+    if ok != 0 { return cliFixCommit() }
+    cliFixPhase = FIXP_BASE
+    let z = 0
+    while z < n {
+      cliFixKeep[z] = 0
+      z = z + 1
+    }
+    cliEntrySrc = cliFixOrig
+    return cliBeginCheck()
+  }
+  if cliFixPhase == FIXP_BASE {
+    if ok == 0 {
+      // Already broken before the fix — `runs -> not-runs` is not reachable here.
+      let z = 0
+      while z < n {
+        cliFixKeep[z] = 1
+        z = z + 1
+      }
+      return cliFixCommit()
+    }
+    // One edit and the whole-file trial failed ⇒ that edit is the culprit; the
+    // greedy pass would only re-derive it at the cost of one more compile.
+    if n == 1 { return cliFixCommit() }
+    cliFixPhase = FIXP_ONE
+    cliFixTrial = 0
+    cliFixKeep[0] = 1
+    cliEntrySrc = cliApplyFixEdits(cliFixOrig, cliFixKeep)
+    return cliBeginCheck()
+  }
+  // FIXP_ONE
+  if ok == 0 { cliFixKeep[cliFixTrial] = 0 }
+  cliFixTrial = cliFixTrial + 1
+  if cliFixTrial >= n { return cliFixCommit() }
+  cliFixKeep[cliFixTrial] = 1
+  cliEntrySrc = cliApplyFixEdits(cliFixOrig, cliFixKeep)
+  cliBeginCheck()
+}
+
+// The accepted edit set is final: tally it, leave verification, and hand the
+// result to the report path — writing the file only when it actually changed.
+function cliFixCommit() {
+  let kept = 0
+  cliFixDeclinedAt = []
+  cliFixDeclinedLine = []
+  cliFixDeclinedCol = []
+  let ki = 0
+  while ki < cliFixKeep.length {
+    if cliFixKeep[ki] != 0 {
+      kept = kept + 1
+    } else if ki < cliFixEditWhat.length {
+      cliFixDeclinedAt.push(cliFixEditWhat[ki])
+      cliFixDeclinedLine.push(cliFixEditLine[ki])
+      cliFixDeclinedCol.push(cliFixEditCol[ki])
+    }
+    ki = ki + 1
+  }
+  cliFixCount = cliFixCount + kept
+  cliFixDeclined = cliFixDeclined + (cliFixKeep.length - kept)
+  cliFixPhase = FIXP_OFF
+  const out = cliApplyFixEdits(cliFixOrig, cliFixKeep)
+  cliEntrySrc = out
+  if out == cliFixOrig { return cliBeginCheck() }
+  // Keep the per-run source cache coherent with the rewrite the host is
+  // about to perform, so later files that import this one see the fix.
+  cliSrcCachePut(cliCurFile, out, 1)
+  cliCmdPath = cliCurFile
+  cliCmdData = out
+  cliState = ST_FIX_WROTE
+  CMD_WRITE_FILE
 }
 
 // Begin formatting cliFiles[cliFileIdx] (read its source), or — work-list done —

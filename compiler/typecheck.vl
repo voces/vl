@@ -2408,6 +2408,11 @@ let cbExpPool: i32[] = [] // flattened expected param-type arena indices
 // return (`const v: () => i64 = () => (5)`) ADOPTS the expected return, so the widening
 // happens INSIDE the body at the return seam (where codegen inserts the convert) instead
 // of riding function-type variance, which has no adapter (see `fnSlotAssignable`).
+// How many times a CONTEXTUAL seed changed what a lambda infers — an un-annotated
+// param typed from it, or a return the lambda ADOPTED. `checkLetDecl` reads the
+// delta across its initializer: nonzero means the annotation shaped the type it
+// would be compared against, so redundancy cannot be concluded (D1442).
+let cbSeedUsed = 0
 let cbExpRetNode: i32[] = []
 let cbExpRetTy: i32[] = []
 
@@ -2886,6 +2891,12 @@ function unionArrayArmForLit(u: TyUnion, arrIx: i32) {
   }
   -1
 }
+// RETURNS 1 when the seed actually reached a LAMBDA and pinned its params/result —
+// i.e. when the expected type is load-bearing for what the expression infers to.
+// `recordRedundantAnnot` is the caller that needs the answer: an annotation that seeded
+// its own initializer cannot be judged redundant by comparing the two, because the
+// comparison is then circular (D1442). Every other arm only RECURSES, so a plain
+// `const xs: i32[] = [1, 2]` still answers 0.
 function seedExpected(exprIx: i32, expectedTy: i32) {
   if exprIx < 0 || expectedTy < 0 { return 0 }
   let u = exprIx
@@ -2894,6 +2905,7 @@ function seedExpected(exprIx: i32, expectedTy: i32) {
     const node = P.nodes[u]
     if node is Paren { u = node.parInner } else { done = true }
   }
+  let did = 0
   const en = P.nodes[u]
   const et = T.tys[expectedTy]
   // A nullable expected type (`(i32) => i32 | null` — e.g. a map VALUE slot, which is
@@ -2904,6 +2916,7 @@ function seedExpected(exprIx: i32, expectedTy: i32) {
       if et is TyFunc {
         recordCbExpected(u, et.fnParamTypes)
         recordCbExpectedRet(u, et.fnRet)
+        did = 1
         // RECURSE into the lambda's BODY against the expected RESULT type — the dual of the
         // array/object recursion below. A curried `(a) => (b) => …` against `(i32) => ((i32) =>
         // i32)` then types its inner lambda's params from the result function type, at any depth.
@@ -2916,14 +2929,14 @@ function seedExpected(exprIx: i32, expectedTy: i32) {
         // loud type error — the checker seam the emit layers depend on. Arity-matched so a
         // non-function arm (or a wrong-arity closure) is left to the normal assignability check.
         const arm = unionFuncArmForArity(et, en.fnParams.length)
-        if arm >= 0 { seedExpected(u, arm) }
+        if arm >= 0 { did = seedExpected(u, arm) }
       }
     }
   } else if en is ArrayLit {
     if et is TyArray {
       let i = 0
       while i < en.arrElems.length {
-        seedExpected(en.arrElems[i], et.aElem)
+        if seedExpected(en.arrElems[i], et.aElem) != 0 { did = 1 }
         i = i + 1
       }
     } else if et is TyUnion {
@@ -2937,7 +2950,7 @@ function seedExpected(exprIx: i32, expectedTy: i32) {
       // with the arm's `TyArray` reuses the element-recursion branch; assignability still gates the
       // whole literal against the union, so a wrong arm cannot be silently adopted.
       const arm = unionArrayArmForLit(et, u)
-      if arm >= 0 { seedExpected(u, arm) }
+      if arm >= 0 { did = seedExpected(u, arm) }
     }
   } else if en is ObjLit {
     if et is TyObj {
@@ -2947,7 +2960,9 @@ function seedExpected(exprIx: i32, expectedTy: i32) {
         const fnode = P.nodes[fields[i]]
         if fnode is FieldInit {
           const fty = objFieldType(et, fnode.fiName)
-          if fty >= 0 { seedExpected(fnode.fiValue, fty) }
+          if fty >= 0 {
+            if seedExpected(fnode.fiValue, fty) != 0 { did = 1 }
+          }
         }
         i = i + 1
       }
@@ -2959,10 +2974,10 @@ function seedExpected(exprIx: i32, expectedTy: i32) {
       // with the arm's `TyObj` reuses the field-recursion branch; assignability still gates the
       // whole literal against the union, so a wrong arm cannot be silently adopted.
       const arm = unionObjArmForLit(et, u)
-      if arm >= 0 { seedExpected(u, arm) }
+      if arm >= 0 { did = seedExpected(u, arm) }
     }
   }
-  0
+  did
 }
 
 // —— DEEP `is` OVER A `Json` VALUE — the sites the checker ADMITS and RECORDS ——
@@ -3032,6 +3047,7 @@ export function initChecker() {
   cbExpOff = []
   cbExpLen = []
   cbExpPool = []
+  cbSeedUsed = 0
   cbExpRetNode = []
   cbExpRetTy = []
   valBindLambda = []
@@ -6496,31 +6512,38 @@ function recordRedundantRet(n: FuncDecl, fnIx: i32, ret: i32) {
   }
   const nameTok = declNameTokOf(fnIx)
   if nameTok < 0 { return 0 }
-  let colonTok = -1
-  let depth = 0
-  let ci = nameTok + 1
-  while ci < P.toks.length && colonTok < 0 {
-    const kd = P.toks[ci].kind
-    if kd == "LPAREN" || kd == "LBRACK" || kd == "LBRACE" {
-      depth = depth + 1
-    } else if kd == "RPAREN" || kd == "RBRACK" || kd == "RBRACE" {
-      depth = depth - 1
-    } else if depth == 0 && kd == "COLON" {
-      colonTok = ci
-    }
-    ci = ci + 1
-  }
-  if colonTok < 0 { return 0 }
   const bn = P.nodes[n.fnBody]
   if !(bn is Block) { return 0 }
   if bn.pos < 0 { return 0 }
   let braceTok = -1
-  let bi = colonTok + 1
+  let bi = nameTok + 1
   while bi < P.toks.length && braceTok < 0 {
     if P.toks[bi].start == bn.pos { braceTok = bi }
     bi = bi + 1
   }
   if braceTok < 0 { return 0 }
+  // The return annotation's colon, found by scanning BACKWARD from the body `{`.
+  // Forward from the NAME finds the wrong one: a type-parameter BOUND's colon
+  // (`<T: Showable>`) is also at bracket depth 0, because `<`/`>` are not brackets
+  // and cannot be counted as any (`=>` lexes as EQUAL + GT). The fix then deleted
+  // `: Showable>(x: T): string` and wrote `function describe<T {` — source that does
+  // not parse (D1441). Backward, the return's colon is the FIRST depth-0 one, and a
+  // colon inside the return type (`: {a: i32}`) sits at depth >= 1 either way.
+  let colonTok = -1
+  let depth = 0
+  let ci = braceTok - 1
+  while ci > nameTok && colonTok < 0 {
+    const kd = P.toks[ci].kind
+    if kd == "RPAREN" || kd == "RBRACK" || kd == "RBRACE" {
+      depth = depth + 1
+    } else if kd == "LPAREN" || kd == "LBRACK" || kd == "LBRACE" {
+      depth = depth - 1
+    } else if depth == 0 && kd == "COLON" {
+      colonTok = ci
+    }
+    ci = ci - 1
+  }
+  if colonTok < 0 { return 0 }
   if jwTokIsGenerated(nameTok) { return 0 }
   redunSLine.push(P.toks[colonTok].line)
   redunSCol.push(P.toks[colonTok].col)
@@ -23670,8 +23693,11 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       } else if cbExpectUsable && cbExpect[pi] >= 0 {
         // Contextual inference: the expected callback type pins this un-annotated
         // param (e.g. `xs.map(function(n) …)` over `i32[]` ⇒ `n: i32`), matching
-        // the host's receiver-driven inference.
+        // the host's receiver-driven inference. The seed is the ONLY source of this
+        // param's type, so an annotation that supplied it is load-bearing — count it
+        // (D1442), or `recordRedundantAnnot` calls it redundant and `--fix` deletes it.
         pt = cbExpect[pi]
+        cbSeedUsed = cbSeedUsed + 1
       } else if n.fnName != "" {
         // HOST PARITY (`Infer<Unknown>` param holes): a NAMED function's
         // un-annotated parameter is a fresh inference HOLE — a synthetic TyVar
@@ -24072,6 +24098,11 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
     // widening through function-type VARIANCE is rejected instead (`fnSlotAssignable`): a
     // function VALUE's rep is fixed, so the body is the only place the value can widen.
     if n.fnName == "" && inferred >= 0 {
+      // A CONTEXTUAL ADOPTION below means the seed CHANGED what this lambda infers, so an
+      // annotation that supplied it is load-bearing and cannot be judged redundant by
+      // comparing the two (D1442). Snapshot/compare rather than marking each arm: there are
+      // twenty of them and a new one must not have to remember.
+      const preAdopt = inferred
       const expRet = cbExpectedRetFor(fnIx)
       if expRet >= 0 {
         if numWidens(inferred, expRet) { inferred = expRet }
@@ -24526,6 +24557,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
           }
         }
       }
+      if inferred != preAdopt { cbSeedUsed = cbSeedUsed + 1 }
     }
     // PERMISSIVE FALL-THROUGH (totality): an un-annotated function that can fall off the
     // end on some path implicitly yields `null` there, so its inferred return widens to
@@ -29794,6 +29826,11 @@ export function nodeTyIsNulBool(ix: i32) {
   if ty < 0 { return false }
   const t = T.tys[ty]
   if t is TyNullable {
+    // `nInner` is -1 while the inner type is still a HOLE — a bare `null` element
+    // whose list never pinned one. Unguarded this is an arena read at -1, i.e. the
+    // COMPILER traps on a `vl check`-clean program (D1440); the list sibling
+    // `nodeTyIsNulBoolList` has always carried the guard.
+    if t.nInner < 0 || t.nInner >= T.tys.length { return false }
     const inner = T.tys[t.nInner]
     if inner is TyPrim { return inner.primName == "boolean" }
   }
@@ -33625,6 +33662,7 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
   // Bidirectional: a `const f: (i32) => i32 = (x) => …` (or a composite of such — an
   // annotated array/object of lambdas) infers each un-annotated lambda param from the
   // annotation BEFORE the initializer is checked.
+  const seedMark = cbSeedUsed
   if n.letInit >= 0 && annot >= 0 { seedExpected(n.letInit, annot) }
   // An UN-annotated binding to a bare lambda (`const add = (a, b) => …`): mark the lambda so its
   // un-annotated params type as inference holes (a value-flow-monomorphized generic function)
@@ -33658,11 +33696,16 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
       initTy = TY_ERR
     }
   }
-  // Redundant explicit annotation: the initializer's CONTEXT-FREE type (checked
-  // just above, before the annotation is consulted) already IS the annotation, so
-  // `: T` adds nothing. Recorded BEFORE `constrainEmpty` runs, so an empty-
+  // Redundant explicit annotation: the initializer's type already IS the annotation,
+  // so `: T` adds nothing. Recorded BEFORE `constrainEmpty` runs, so an empty-
   // collection hole the annotation legitimately pins is naturally excluded.
-  if annot >= 0 && initTy >= 0 && n.letInit >= 0 {
+  // NOT when checking the initializer CONSUMED a contextual seed the annotation
+  // supplied — an un-annotated lambda param typed from it, or a return the lambda
+  // adopted. The two types then agree BECAUSE the annotation shaped the inference, and
+  // comparing them is circular. `const v: () => (i64 | boolean)[] = () => ([7])`
+  // self-infers `() => i32[]` un-annotated and `const f: (i32) => i32 = (x) => x + 1`
+  // does not type at all; both were reported redundant and `--fix` deleted them (D1442).
+  if annot >= 0 && initTy >= 0 && n.letInit >= 0 && cbSeedUsed == seedMark {
     recordRedundantAnnot(n, ix, initTy, annot)
   }
   let bound = TY_ERR
