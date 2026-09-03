@@ -13,10 +13,10 @@ QUICK = a day, no design question. STRUCT = a design track.
 
 | # | item | saving | eff | risk | proof the fix PR must carry | kind |
 | --- | --- | --- | --- | --- | --- | --- |
-| 1 | Shard `tests/cases_wasm_test.ts` — one file, so one core, 44 s | **−32 s** | S | none | same `2684 passed / 9 ignored`; shards partition the name space; `ci_seed_coverage_test.ts` updated | QUICK |
-| 2 | Split the 3 heaviest ci-native files (§A3): `--parallel` is one worker per FILE, so the step's wall floor is the slowest file, 39.6 s | **−20…30 s** | S | none | per-file wall (`per-file-time.sh`) drops below the step's CPU/cores floor; case count unchanged | QUICK |
-| 3 | Warm BOTH `.cwasm` engine tags in `refresh-compiler.sh` — it carries forward only the one its own `vl run` made | **−10 s** CI; **−280 s CPU** locally, 45% of the step | S | low | `ls build/*.cwasm` = 2 after a refresh; A/B the step's user CPU with `parallel-jit-storm.sh` | QUICK |
-| 4 | Content-key the sidecar (`seed-<key>-<tag>.cwasm`, as the EMBEDDED path already does) instead of mtime | folds in #3; CI's seed cache survives a byte-identical rebuild | S | low | a rewritten byte-identical seed keeps `load_compiler` at 5 ms | QUICK |
+| 1 | ✅ **LANDED (§F1)** — shard `tests/cases_wasm_test.ts`: one file, so one core, 44 s | **−16 s measured** (§F7; −32 s estimated) | S | none | same `2684 passed / 9 ignored`; shards partition the name space; `ci_seed_coverage_test.ts` updated | QUICK |
+| 2 | ✅ **LANDED for 2 of 3 (§F2)** — split the heaviest ci-native files (§A3): `--parallel` is one worker per FILE, so the step's wall floor is the slowest file, 39.6 s | **−20…30 s** | S | none | per-file wall (`per-file-time.sh`) drops below the step's CPU/cores floor; case count unchanged | QUICK |
+| 3 | ✅ **LANDED (§F3)** — warm BOTH `.cwasm` engine tags in `refresh-compiler.sh`; it carried forward only the one its own `vl run` made | ~~−10 s CI~~ **a wash on the runner (§F7)**; **−330 s CPU** locally, 48% of the step | S | low | `ls build/*.cwasm` = 2 after a refresh; A/B the step's user CPU with `parallel-jit-storm.sh` | QUICK |
+| 4 | ✅ **LANDED (§F4)** — content-key the sidecar (`seed-<key>-<tag>.cwasm`, as the EMBEDDED path already does) instead of mtime | folds in #3; CI's seed cache survives a byte-identical rebuild | S | low | a rewritten byte-identical seed keeps `load_compiler` at 5 ms | QUICK |
 | 5 | `variantIndexOf` → sid-keyed index: 76 call sites, 13/13 in `wasmEmit.vl` per-expression, table FROZEN after `collectU` | **3.6%** of self-compile self time, 7.1% incl | M | union member-set ABI (never dedupe) | byte-identical seed; `regress.py`; `rep-fuzz-check.sh`; the unions scaling axis | STRUCT |
 | 6 | String `+` in a loop is **O(n²)** (§D): a loop-local builder, with n-ary chain fusion as the down payment. The fusion once shipped in the TS core and was never ported | ×4.80 per doubling; 5.4× at 320 KB; ≥129 in-loop sites | M / L | rep layer | corpus byte-identity where the pattern is absent; a scaling pair "append N" vs "join N", ratio bar 2.5 — **a value fixture cannot pin a cost class** | STRUCT |
 | 7 | `unRowOfName`/`isUName` → incrementally maintained sid index (3 push sites, one POST-collect) | **2.9%** self time; 824,867 reaches/corpus | M | index must extend at all 3 pushes | byte-identical seed; `regress.py`; the unions axis | STRUCT |
@@ -415,3 +415,150 @@ identical, 107 differ (each carries a 3+ chain or an accumulator), 501 refuse un
 * **The exact count of §D3's accumulators.** 129/451 are floors from a regex detector; the
   true figures need the checker's own answer. The per-file *shape* is stable across both
   detectors, which is what the ranking rests on.
+
+---
+
+## F · Landed: items 1–4, each A/B'd
+
+Every A/B ALTERNATES its arms inside one load window on this shared box (24 cores; the
+load is quoted per row because it moved 20 → 160 while these ran), and every row states
+its test COUNT — a suite that self-ignores exits 0, and the release split did exactly
+that once, before its `import.meta.url` paths were rebased. The BEFORE arm is a pristine
+`git archive origin/master` tree beside this one, so both grade the same compiler source
+with the same seed. The runner is measured in **§F7** — it was not, when this section was first
+written — and it REFUTES item 3's CI estimate while confirming item 1's.
+
+### F1 · Item 1 — the corpus oracle is four files
+
+`tests/cases_wasm_test.ts` → `tests/support/casesWasmOracle.ts` + four
+`tests/cases_wasm_<k>_test.ts`, and the ci.yml step gains `--parallel`. Three alternating
+pairs, each arm the step as its own job runs it:
+
+| arm | wall | user | load | count |
+| --- | ---: | ---: | ---: | --- |
+| one file | 46.55 / 25.65 / 25.13 s | 44.97 / 26.68 / 25.73 s | 94 / 55 / 32 | 2688 · 0 · 9 |
+| four shards | **17.86 / 11.22 / 10.81** s | 35.92 / 25.95 / **25.05** s | 75 / 44 / 28 | 2688 · 0 · 9 |
+
+**Median wall 25.65 → 11.22 s**, counts identical. The survey predicted +25% user for four
+seed loads; at low load it does not appear (25.73 → 25.05 s, within noise), and the +40%
+seen on the first pair tracks the load, not the split. Residue: the shards run 6.6 / 5.9 /
+1.9 / 1.0 s of summed test time, because `tests/cases/std` is 7.75 s of the corpus's 17.1 s
+in 67 of 2,786 cases and is CONTIGUOUS, so no contiguous cut can spread it. A cost-weighted
+cut is the next ~5 s. Four and not eight: the per-shard fixed cost is real, and on a 4-core
+runner more shards than workers only adds seed loads.
+
+### F2 · Item 2 — two of the three heavy files split, the third measured and left
+
+Per-file A/B, alternating, median of three (load 16 → 111):
+
+| file | before wall / user | after wall / user | tests |
+| --- | ---: | ---: | ---: |
+| `selfhost_native_release_test.ts` → 4 files | 64.73 s / 63.84 s | **20.92 s** / 51.77 s | 36 = 36 |
+| `vl_buffer_view_bounds_shape_test.ts` → 2 files | 18.81 s / 32.93 s | **14.02 s** / 36.34 s | 19 = 19 |
+
+`per-file-time.sh` over both trees back to back (load 156 → 115, so read the RANKING, not
+the absolutes): `selfhost_native_release_test.ts` was the #2 file at 63.8 s wall / 59.4 s
+user and its four successors are 22.2 / 23.3 / 20.9 / 2.5 s; `vl_buffer_view_bounds_shape`
+was #3 at 31.0 s / 51.5 s and is now 16.3 s + 5.2 s. Neither is in the top three any more.
+
+**`vl_check_codegen_test.ts` is NOT split, and the survey's §E gap is why.** 19.00 s of its
+19.08 s is ONE test, whose two `vl check --codegen <dir>` sweeps split **45.9 s**
+(`tests/cases/std`, 67 files) against **0.79 s** (`tests/cases/soundness`, 194) — so
+neither a file split nor concurrent directories moves it (measured: concurrent 34.3 s
+against serial 31.8 s). The cost is `vl check` re-checking the std graph once per importing
+file, which is §B1's cross-program checked-form cache: a STRUCT item, not this one.
+
+### F3 · Item 3 — both engine tags warmed by the refresh
+
+`parallel-jit-storm.sh`, alternating, load 75 → 89. The `post-refresh` arm is what
+`refresh-compiler.sh` left behind before this change — verified, `ls build/*.cwasm` = **1**:
+
+| arm | wall | user CPU |
+| --- | ---: | ---: |
+| post-refresh (the `vl check` tag cold) | 58.45 / 95.08 s | 647.0 / 715.4 s |
+| both tags warm | 42.31 / 46.14 s | **342.7 / 358.5 s** |
+
+Median **681 → 351 s of user CPU per native step, −48%**. `count-vl-spawns.sh` puts the
+population at **3,573 `vl` subprocesses** a step (2,880 `check`, 339 `run`, 223 `build`,
+97 `fmt`, 18 `test`, 2 `seed`, 14 argv-only) — the survey's 3,567 plus master's new tests —
+and at ~10 s of CPU per cold seed compile the saved 330 s is **≈33 redundant Cranelift
+compiles of the 1.8 MB seed**, one per worker that started before the first publish. The
+refresh now warms both tags concurrently and prints the count it left; `ls build/*.cwasm`
+is **2** after it.
+
+### F4 · Item 4 — the sidecar is content-keyed
+
+`build/vl-compiler.wasm.<seed key>.<engine tag>.cwasm`. Behaviour proof: `vl run`,
+`vl check` and `vl build` output unchanged and the emitted module byte-identical under the
+old and new binaries; only the file NAME moves. The point, measured:
+`touch build/vl-compiler.wasm` (identical bytes, new mtime) cost a full **4.43 s** re-JIT
+and now costs **0.02 s**. A different seed at the same path retires the old key's files and
+the mtime-era name, so `build/` stays at two sidecars.
+
+Price, and it is not zero: the key is read and hashed on EVERY invocation. Byte-at-a-time
+FNV-1a — `build.rs`'s spelling — cost **+2 ms** of `load_compiler` (best of 15, 6 → 8 ms),
+which over 3,573 spawns is ~7 s of CPU a step and would also land on `regress.py`, whose
+grader spawns `vl` per cell. Four-lane word FNV instead: **+0.85 ms** an invocation (200
+spawns, user 12.05 → 12.90 ms each; `load_compiler` best of 5 reads 5 → 6 ms). The zero-cost alternative — keep the mtime fast path
+and fall back to a content compare — was not taken: it needs a second on-disk file and a
+new trust, for the same hit rate.
+
+### F5 · What this PR found and did not fix
+
+`unions/paren-narrowed-receiver-read.vl` fails with `emitProgram: object literal is missing
+a union-variant field` when `unions/nullable-variant-positions.vl` runs IMMEDIATELY BEFORE
+it on one shared `WebAssembly.Instance`. Both pass alone and in the corpus order; that
+two-case sequence is the whole repro. It is a per-instance emitter state leak of D986's and
+D1003's class, which `tests/vl_instance_state_leak_test.ts` misses because its ~30 curated
+programs do not include the pair — and which the corpus oracle was passing only by ORDER
+LUCK, some case between the two happening to reset it. Found by trying `i % n` sharding,
+which is why the landed partition is a CONTIGUOUS block: it keeps every case's predecessor
+but the `shards - 1` block-first ones.
+
+### F6 · The gate, before and after
+
+`scripts/gate.sh` on each tree, both starting from an idle box and both self-contending
+(the gate fans 18 rows out at once, and takes the box to load ~110 by itself). Read the
+LAST row: `gate.sh` waits on its rows in order, so every row after the slowest reports the
+running maximum, not its own time.
+
+| | seed build | `deno task test` | `ci-native` | slowest row | verdict |
+| --- | ---: | ---: | ---: | ---: | --- |
+| before (origin/master) | 1833871 bytes | 80.4 s · 3181·0·2977 | 124.1 s · 3059·0·3 | 149.9 s | ALL GATES PASS |
+| after (this branch) | 1833871 bytes, 2 sidecars warm | **66.0 s** · 3181·0·2977 | **78.7 s** · 3059·0·3 | **88.8 s** | ALL GATES PASS |
+
+The counts are the test-count equality proof at gate scale: `deno task test`
+**3181 passed · 0 failed · 2977 ignored** and `ci-native` **3059 · 0 · 3** on BOTH arms.
+
+Re-run on the MERGED tree after a rebase, where the arms differ only in the HOST binary
+and so isolate items 3 + 4: master's `vl` and master's refresh give **148.8 s** (load
+119 → 154), this branch's give **86.2 s** (load 95 → 77) — counts **3185 · 0 · 2980** and
+**3063 · 0 · 3** on both, and `ls build/*.cwasm` shows the content-keyed pair with the
+mtime-era names pruned. Loads differ, so read that pair as corroboration of §F3, not as
+its measurement.
+
+### F7 · GitHub's runner, MEASURED — and item 3's CI estimate does not survive it
+
+§E said the runner was never measured and the JIT-storm saving there was *inferred*. It is
+measured now, from this PR's own `ci-native` job against six master runs (`ci-steps.sh`):
+
+| step | master, 6 runs (median) | this PR, 3 runs (median) | delta |
+| --- | ---: | ---: | ---: |
+| corpus oracle | 39·39·40·41·44·44 (40.5) | 18·24·28 (**24**) | **−16 s** |
+| native suites | 121·125·129·142·143·147 (135.5) | 103·131·131 (131) | −4 s, inside the spread |
+| refresh seed | 9·9·9·15·24·30 (12) | 32·38·39 (**38**) | **+26 s** |
+| job total | 197–243 (224.5) | 179·237·244 (237) | +12 s |
+
+**Item 1 lands: the corpus oracle is 40.5 → 24 s median on the real runner** — less than
+the −32 s estimate, because four shards on four cores are bounded by the biggest shard
+(§F1's 6.6 s of summed test time) plus four seed loads, not by total/4.
+
+**Item 3's "−10 s CI" does NOT reproduce, and on the runner it is net NEGATIVE.** The
+native step does not move (131 against 135.5, inside master's own 121–147) while the
+refresh pays the seed JIT up front, +26 s. On four cores the storm is ~4 workers deep and
+the first publisher serves the rest, so there is little to save; the −330 s of user CPU in
+§F3 is a 24-WORKER effect and does not transfer. It is kept because the local win is large
+and the cost is now deterministic, but **the follow-up is to background the `check`-tag
+warm** so CI stops paying it on the critical path. Two of the three PR runs also paid a
+one-off ~21 s of `Build vl-host` (the host source changed); the third, which hit the binary
+cache, is the 179 s total — below master's whole range.
