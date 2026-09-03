@@ -212,6 +212,19 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   this axis**, from the post-fix profile: `__str_eq__` at 19.2% self is the name-keyed
   registries doing linear lookups (`isUName`, `variantIndexOf`, `declaredSlotOf`,
   `__map_probe__`) — the registry-keying design track item 4 opened, not a hot-spot fix.
+- **Modernization program, item 4 — the registries keyed by an interned REP KEY. STEPS 1-3
+  SHIPPED (additive, byte-identical); 4-6 need the freeze.** `canonUnionKey` is minted in
+  canon and pushed as `unKey` beside `unTyIx` at all three mint sites with **no reader**;
+  every name-keyed union read has an arena-keyed twin beside it, and 22 sites offer an arena
+  id through a per-site A/B seam that still ships the name answer. **The counters say the
+  switch cannot be taken on the key the tree had**: over 2,782 corpus programs the
+  `repCanonId` twin DIFFERS from the name key at **2,103 reaches** and answers alone at 107
+  more, so the ID-FREE sites were deliberately not converted to id-first. The new key grades
+  **2,441/2,441 covered, 2,441/2,441 agreeing with the row's own member set, and ZERO merges
+  across different member SETS** (`repCanonId`: 65) — but its ARENA route agrees only
+  **1,363/2,441 (55.8%)**, because `tyToEmitName` renders structurally where the row records
+  declared member names. **That gap is step 4's first job and step 5 blocks on it.**
+  `docs/internals/registry-by-type-id.md` §5.
 - **Width subtyping — RULED (owner, 2026-09-01): the non-prefix refusal is a GAP, closed
   the Roc way** — shape-monomorphization of narrow-typed consumers (offsets constant per
   caller shape; zero runtime cost; paid in instance count — the variant-count tradeoff
@@ -685,8 +698,9 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
 > own standing check (`docs/internals/destringify-types-program.md` § "How to verify"): both greps
 > pass. Do not re-open it from a stale call-site census; run that check first.
 >
-> **The one forward question it leaves — now PRICED, still unstarted** (Modernization program item
-> 4; `docs/internals/registry-by-type-id.md`, 2026-09-02): the emitter's registries are keyed on the
+> **The one forward question it leaves — PRICED, and its three ADDITIVE steps are shipped**
+> (Modernization program item 4; `docs/internals/registry-by-type-id.md` §5, 2026-09-02): the
+> emitter's registries are keyed on the
 > canon-SOFTENED spelling because that is the REP, not the type. Measured over 2,389 registered
 > union rows, **neither candidate key in the tree works**: the arena index is not an identity, and
 > `repCanonId` merges **360 row pairs** the positional box-tag ABI needs apart (63 with different

@@ -71,6 +71,8 @@ import {
   anyLitUnionUsed,
   canonRewroteNode,
   canonTyIxOf,
+  canonUnionKey,
+  canonUnionKeyOfName,
   covarValueWriteState,
   eqCoreKindOfTyToken,
   fusedMapReadRecvIx,
@@ -516,6 +518,7 @@ import {
   uVarTyIx,
   uVariants,
   unDeclIx,
+  unKey,
   unMemAtomIds,
   unMemAtoms,
   unMemKinds,
@@ -26915,6 +26918,7 @@ export function registerValueUnionNameTy(name: string, tyIx: i32) {
   uDeclared = true
   unNames.push(name)
   unTyIx.push(tyIx)
+  unKey.push(canonUnionKeyOfName(name))
   unDeclIx.push(-1) // value-union row: registered from a name, no declaration
   unMemberSet.push(name)
   recordUnMemTys(name) // D-UNION foundation
@@ -32049,6 +32053,54 @@ export function registerValueUnionNameAB(
   registerValueUnionNameTy(name, d)
 }
 
+// D-UNIONKEY's stability check, per row: does the key the row's PRODUCER minted (from the
+// spelling it handed the registry) equal the key the other two producers would obtain — the
+// one holding the arena TYPE, and the one holding the recorded member SET? A key with three
+// entry points is only a key if they land on one id, and that is the property step 5's
+// switch rests on. `ty-none` separates "the arena route has no render" from "it disagrees".
+function unKeySweepRow(u: i32, ty: i32) {
+  let k = -1
+  if u < unKey.length { k = unKey[u] }
+  if k >= 0 { repShadowBumpReason("keySweep/covered") }
+  if ty >= 0 {
+    const kt = canonUnionKey(ty)
+    if kt < 0 { repShadowBumpReason("keySweep/ty-none") }
+    else if kt == k { repShadowBumpReason("keySweep/ty-agree") }
+    else { repShadowBumpReason("keySweep/ty-differ") }
+  }
+  if u < unMemberSet.length {
+    const ks = canonUnionKeyOfName(unMemberSet[u])
+    if ks == k {
+      repShadowBumpReason("keySweep/set-agree")
+    } else {
+      repShadowBumpReason("keySweep/set-differ")
+    }
+  }
+  0
+}
+
+// The ABI assertion §5 step 3 owes: two rows one key would FUSE, and how many of those
+// record a different member SET. A union's box tags are positional over its own member set,
+// so a merge across different sets reads a value tagged under one slice through the other's
+// — the exact hazard that disqualified `repCanonId` (65 such pairs on this corpus).
+// `merge-diffset` must be 0 for the key to be usable at all.
+function unKeySweepPair(u: i32, v: i32) {
+  let k = -1
+  let kv = -1
+  if u < unKey.length { k = unKey[u] }
+  if v < unKey.length { kv = unKey[v] }
+  if k < 0 || kv < 0 { return 0 }
+  if k != kv { return 0 }
+  repShadowBumpReason("keySweep/merge")
+  if unNames[u] != unNames[v] { repShadowBumpReason("keySweep/merge-diffname") }
+  if v < unMemberSet.length && u < unMemberSet.length {
+    if unMemberSet[u] != unMemberSet[v] {
+      repShadowBumpReason("keySweep/merge-diffset")
+    }
+  }
+  0
+}
+
 // The whole-registry measurement, run once per program beside `repShadowSweep`: every row
 // asked about ITSELF, both ways, with no call-site plumbing at all. The round-trips say
 // whether a key can even name its own row; `canon-merge` counts PAIRS of distinct rows one
@@ -32088,11 +32140,13 @@ export function unionRegistryABSweep() {
       if unionRowOfTy(ty) == u { repShadowBumpReason("unionSweep/canon-rt") }
       if unionRowOfTyRaw(ty) == u { repShadowBumpReason("unionSweep/raw-rt") }
     }
+    unKeySweepRow(u, ty)
     let v = u + 1
     while v < unNames.length {
       if unNames[u] == unNames[v] { repShadowBumpReason("unionSweep/name-dup") }
       let tv = -1
       if v < unTyIx.length { tv = unTyIx[v] }
+      unKeySweepPair(u, v)
       if ty >= 0 && tv >= 0 {
         if repCanonId(ty) == repCanonId(tv) {
           repShadowBumpReason("unionSweep/canon-merge")

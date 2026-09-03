@@ -147,14 +147,90 @@ producer agree — a producer fix — and today both spellings share ONE row (`w
 
 Byte-identical until step 5; steps 1-2 are this PR.
 
-| # | step | freeze | proof it is safe |
-| --- | --- | --- | --- |
-| 1 | `unionRowOfTy` / `unionRowOfTyRaw` shims + `unionRowOfAB` / `isUNameAB` seams, OFF by default | none | corpus `cmp` per module |
-| 2 | convert the 4 ID-FREE + 24 NODE-IN-SCOPE sites to the seam, still returning the NAME answer | none | agreement counters ≥ 99.9%, `id-only` inspected one by one |
-| 3 | mint `canonUnionKey` in canon; push `unKey` at all three registry mint sites; **no reader** | none | `unKey` coverage %, and a sweep asserting no two rows with different member SETS share a key |
-| 4 | thread the key into `registerInlineUnion`'s 11 recursive sites — the real work | `emit_collect.vl` | per-site liveness + disagreement, one build per site (B87) |
-| 5 | **the switch**: seams return the id answer; retire `unNames`-scanning readers | `emit_classify.vl` + `emit_collect.vl`, one PR | rep-fuzz, fixpoint, corpus run-diff, the ABI assertion from step 3 |
-| 6 | retire `unMemberSet` as a KEY (it stays as a rendering) | `emit_state.vl` | — |
+| # | step | freeze | proof it is safe | status |
+| --- | --- | --- | --- | --- |
+| 1 | `unionRowOfTy` / `unionRowOfTyRaw` shims + `unionRowOfAB` / `isUNameAB` seams, OFF by default | none | corpus `cmp` per module | **SHIPPED** |
+| 2 | convert the ID-FREE + NODE-IN-SCOPE sites to the seam, still returning the NAME answer | none | agreement counters ≥ 99.9%, `id-only` inspected one by one | **SHIPPED — and the counter REFUSED the ≥ 99.9% premise** |
+| 3 | mint `canonUnionKey` in canon; push `unKey` at all three registry mint sites; **no reader** | none | `unKey` coverage %, and a sweep asserting no two rows with different member SETS share a key | **SHIPPED — 100% covered, 0 different-set merges** |
+| 4 | thread the key into `registerInlineUnion`'s 11 recursive sites — the real work | `emit_collect.vl` | per-site liveness + disagreement, one build per site (B87) | + the ARENA route, below |
+| 5 | **the switch**: seams return the id answer; retire `unNames`-scanning readers | `emit_classify.vl` + `emit_collect.vl`, one PR | rep-fuzz, fixpoint, corpus run-diff, the ABI assertion from step 3 | blocked on 4 |
+| 6 | retire `unMemberSet` as a KEY (it stays as a rendering) | `emit_state.vl` | — | |
+
+### What steps 1-3 landed, measured
+
+All three are byte-identical: over `tests/cases` the pristine and candidate seeds emit
+**2,281 identical modules, 0 differing, 0 rc-differing** (501 refuse under both), and master's
+own compiler source builds **byte-identical** (1,812,575 B) under every candidate seed. The
+compiler's own wasm grows with the dormant code: 1,812,575 → 1,819,045 (**+6,470 B, +0.36%**),
+all of it unreachable while the harness is unarmed. Fixpoint holds at each step, and the
+self-compile does not move: five interleaved A/B pairs on the same source (master's own
+compiler, after #2419's memoisation made the build ~6 s), min **5.85 s pristine vs 6.00 s**,
+median 6.02 s vs 6.09 s — **+1-2.5%, inside the pristine arm's own 5.85-7.35 s spread**.
+
+**Step 1 — the twins.** Every name-keyed union reader now has an arena-keyed sibling over ONE
+row core, so the two keys cannot become two readings of the member columns: `unRowOfName`
+(new, and `isUName` is now `unRowOfName(...) >= 0`), `unionMemberTysOfRow`/`…OfTy`,
+`unionHasAtomRow`/`unionHasAtomOfTy`, `unMemHasAtomTy` beside #2417's `unMemHasAtomRow`.
+The tallies became PER SITE (`unABCnt[site * 6 + k]`, reported as `unionAB/<site>/<outcome>`)
+because a pooled bucket cannot say which site owns a residue, and step 5 flips site by site.
+
+**Step 2 — the sites.** The re-derivation found **7 ID-FREE** sites (the doc's earlier 4 was
+counted before #2417 converted two of them) of which 4 were convertible now — the two
+`internShapeDeepTy` reads, `internFuncTypeShapesTy`'s mint, and `inferRetArenaUnionIsDup` —
+and **18 NODE-IN-SCOPE** sites that were threaded. Two ID-FREE sites
+(`collectTyReachRegister`'s two `registerInlineUnion` calls) are step 4's, since threading
+them changes that function's signature. Residue: **59 sites are still name-keyed**, of which
+11 are `registerInlineUnion`'s own recursions, 12 are the resolvers' own bodies and thin
+wrappers, and the rest are genuinely NAME-ONLY (`monoAnnPinName` ×3, `internInlineShapeTy`
+×3, `unionRetOfFnType`, `emitUnionCoerce`, `scanPrintUse`, …).
+
+**And the agreement premise was wrong.** Step 2's stated bar was "every reach answered by
+the id twin agrees with the name key". Over 2,782 corpus programs, 24 converted sites:
+
+| outcome | reaches |
+| --- | --- |
+| agree | 29,774 |
+| **differ** | **2,103** |
+| name-only | 426 |
+| id-only | 107 |
+| neither | 960,579 |
+| no-ty | 33,169 |
+
+2,636 reaches would take a different answer from the `repCanonId` twin — worst at
+`arrLitBoxElem` (1,053 differ of 6,424 answered) and `arrLitUnionElemName` (336 of 2,077).
+That is §2's 362 merge pairs arriving at call sites, so **the ID-FREE sites did NOT convert
+to id-FIRST**: the fallback the plan expected the counter to prove unused is used, and
+`inferRetArenaUnionIsDup` alone is 8 agree / 1 **id-only**.
+
+**Step 3 — and the flatten is the key while the SOFTENING is not.** §3 above says the key is
+canon's rendering. Measured, the full render is *worse* than `repCanonId` on the one property
+that matters: keying on `canonEmitName` of the alias-expanded spelling fused **185 pairs of
+rows with different member SETS** against `repCanonId`'s 65, because the softening collapses
+`"aa"|"bb"` to `string` and `61|62` to `i32`. The two halves of `canonEmitName` pull opposite
+ways, and only the FLATTEN belongs in a key. `canonUnionKeyText` is therefore the member
+SEQUENCE — `collectU`'s own expansion rule verbatim (a union-alias atom expands only when the
+expansion is multi-atom, so a litunion alias never softens), not deduped, not reordered — and
+`unKey` is that sequence interned. Over the same corpus, 2,441 registered rows:
+
+| | |
+| --- | --- |
+| `unKey` coverage | **2,441 / 2,441 (100%)** |
+| agrees with the row's own recorded member set | **2,441 / 2,441 (100%)** |
+| agrees with the ARENA route (`canonUnionKey(unTyIx[u])`) | 1,363 / 2,441 (**55.8%**) |
+| pairs one key fuses | 312 — every one with the SAME member set |
+| **fused pairs with DIFFERENT member sets** | **0** (`repCanonId`: 65) |
+
+The two §2 witnesses grade as the design predicted: `flat.vl`'s `U = J \| E` and its
+flattening `V` get **one key** (`repCanonId` splits them — this is #2406-d2), and `merge.vl`'s
+`SA`/`SB` share a key but also share a member set, so the merge is one of §2's benign 297.
+
+**The arena route's 44% miss is step 4's first job, and it is §2's own mechanism.**
+`tyToEmitName` is one of the four producers and renders STRUCTURALLY: a declared struct
+member comes back as its shape where the source said `S`, and a litunion alias as its
+softened base. Until it can produce the member SEQUENCE a row records, a querier holding only
+an arena type cannot obtain this key — which is exactly the "every producer OBTAINS rather
+than renders" clause, unmet on one producer. **Step 5's switch cannot be scheduled before
+that closes**, because a querier that mints a different key silently reads the wrong row.
 
 **Order matters, for D965's reason**: lifting the name key at the READER before every PRODUCER
 can supply one turns a loud refusal into a wrong row. Mint, wire every producer, then narrow.
@@ -236,7 +312,23 @@ becomes a checked accessor in the same change. Both halves of D1152 belong in a 
 timed under `timeout 300`: **L1 (seed builds the spike) ok, L2 (spike builds the compiler) 125 s
 rc 0**, fixpoint held. An L1-only check is vacuous for this class.
 
-## 8. What this PR ships
+## 8. What the PRs ship
+
+**Steps 1-3 (the second PR).** `unRowOfName`, `unionMemberTysOfRow`/`…OfTy`,
+`unionHasAtomRow`/`unionHasAtomOfTy`, `unMemHasAtomTy`; the per-site counter (`unABCnt`,
+`unABProbe`, `unABTyProbe`, `unABSiteName`) and the seams `unionRowOfAB`, `isUNameAB`,
+`unionMemberTysOfAB`, `unionHasAtomAB`, `registerValueUnionNameAB`, each carrying a site id;
+22 converted call sites; `canonUnionKey` / `canonUnionKeyOfName` / `canonUnionKeyText` in
+canon, the `unKey` column, and `unKeySweepRow` / `unKeySweepPair`. Arming still rides
+`$VL_REP_SHADOW`; nothing reads `unKey`.
+
+**Two instrument facts the measurements turned on.** Bucket names come from a SITE TABLE
+rather than an interpolation, so the report is greppable and a call site costs one i32
+constant. And `repShadowAddReason` skips a zero, so a site with no reaches prints NO ROW —
+reading "the site is missing" as "the site is dead" would have been wrong twice here
+(`arrLitBoxElem` and `arrLitUnionElemName` were simply below a `tail -60`).
+
+## 8.1. What the first PR shipped
 
 The spike, OFF by default and byte-identical when off: `unionRowOfTy`, `unionRowOfTyRaw`,
 `unionRowOfAB`, `isUNameAB`, `unMemHasAtomRow`, `unionRowOfSpellingTy`, `unABAtomRetry`,
