@@ -1,6 +1,6 @@
 // Compiler-free wasm execution for the behavioral test corpus.
 //
-// `cases_wasm_test.ts` (the standing `.vl` corpus oracle — it COMPILES through the
+// `cases_wasm_*_test.ts` (the standing `.vl` corpus oracle — it COMPILES through the
 // self-hosted seed, never the TS compiler) needs only to RUN the emitted module
 // and capture `print`/`log` output, plus surface a trap as a typed error for
 // `@trap` cases. This lifts exactly that — the host-import ABI + trap mapping —
@@ -151,7 +151,7 @@ export const runWasm = async (wasm: Uint8Array): Promise<RunResult> => {
     // still surface here and map identically.
     //
     // Worth knowing: `deno task test` runs with `--no-check`, so the local gate does
-    // NOT type-check this file. `ci-native`'s `deno test -A tests/cases_wasm_test.ts`
+    // NOT type-check this file. `ci-native`'s `deno test -A tests/cases_wasm_*_test.ts`
     // does, and it is what caught this.
     const { instance } = await WebAssembly.instantiate(wasm as BufferSource, {
       imports: {

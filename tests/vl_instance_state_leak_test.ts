@@ -21,7 +21,7 @@
 // THE STRUCTURAL BLINDNESS. `vl` compiles once per process, so the CLI, the corpus sweep
 // (`scripts/native-corpus-sweep.sh`, one process per file) and every native suite are blind
 // to this class **at any corpus size**. The two drivers that are not blind are the two that
-// found the bugs by accident: `cases_wasm_test.ts` (one instance over ~2,500 cases) and the
+// found the bugs by accident: `cases_wasm_*_test.ts` (one instance over ~2,500 cases) and the
 // LSP server (one instance over every keystroke — `lsp/src/wasmCheckerNode.ts`: "one
 // instance is reused across keystrokes"). In both, a leak surfaces as a scatter of
 // unrelated failures with no common cause, which is what cost D986 a bisect. This file pins
@@ -334,7 +334,7 @@ const compile = (exp: Exports, src: string): Result => {
   pushString(exp.srcPush, src);
   const rc = exp.compileSrc();
   // rc 0 means no diagnostics — the store is only read on failure, and on a SHARED instance
-  // a stale emit failure can still be sitting in it (`cases_wasm_test.ts` says the same).
+  // a stale emit failure can still be sitting in it (`cases_wasm_*_test.ts` says the same).
   const diags: string[] = [];
   if (rc !== 0) {
     const n = exp.diagCount();

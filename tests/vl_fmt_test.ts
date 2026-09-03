@@ -1152,7 +1152,7 @@ Deno.test({
 // tests/cases/parser/type-decl-brace-{union,intersection}-multiline.vl, but the
 // formatter half cannot live in tests/cases: `tests/` is excluded from the
 // `vl fmt --check` gate by construction (scripts/lint-self.sh never passes it in)
-// and tests/cases_wasm_test.ts has no `@fmt` directive, so no corpus file can
+// and tests/cases_wasm_*_test.ts has no `@fmt` directive, so no corpus file can
 // express "this must FORMAT clean". Hence the pin belongs here, driving `vl fmt`
 // end to end. Filed as a hand-off by #1181; this closes it.
 //
@@ -1210,7 +1210,7 @@ Deno.test({
 // back into plain records at rc 0. A silent downgrade, not a diagnostic.
 //
 // It cannot live in tests/cases: `tests/` is excluded from the `vl fmt --check`
-// gate and cases_wasm_test.ts has no `@fmt` directive (see the D-FMTDECL pin
+// gate and cases_wasm_*_test.ts has no `@fmt` directive (see the D-FMTDECL pin
 // above). Four positions, because the slice/prefix interaction differs across
 // them: bare, `export`-prefixed, over-width (so `wrapTypeDecl` is reached), and
 // already-multiline.
@@ -1719,7 +1719,7 @@ Deno.test({
 // case asserts the spaces inside the braces.
 //
 // It cannot live in tests/cases: `tests/` is excluded from the `vl fmt --check`
-// gate and cases_wasm_test.ts has no `@fmt` directive (the D-FMTDECL pin above).
+// gate and cases_wasm_*_test.ts has no `@fmt` directive (the D-FMTDECL pin above).
 Deno.test({
   name: "vl-fmt: a type-parameter BOUND survives formatting (alias, inline, multi-param)",
   ignore: !ENABLED,
@@ -1777,7 +1777,7 @@ Deno.test({
 //     FIRST link.
 //
 // It lives here and not in tests/cases because the fmt gate never sees
-// tests/cases and cases_wasm_test.ts has no `@fmt` directive.
+// tests/cases and cases_wasm_*_test.ts has no `@fmt` directive.
 Deno.test({
   name: "vl-fmt: a member chain fits inline or breaks one link per line",
   ignore: !ENABLED,

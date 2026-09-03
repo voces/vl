@@ -5,7 +5,7 @@
 //   2. `scripts/vl-host/src/main.rs`  the inline gate in `stage_program` + `has_template_hole`
 //   3. `compiler/moduleGate.ts`       the shared TS copy, imported by …
 //   4. … `lsp/src/wasmChecker.ts` (VS Code LSP + browser playground) and
-//      `tests/cases_wasm_test.ts` (the corpus oracle)
+//      `tests/support/casesWasmOracle.ts` (the corpus oracle, shared by its shards)
 //
 // WHY: a host that answers `false` where the compiler answers `true` leaves the
 // guest asking for a module nobody will fetch, and the symptom is SILENCE, not an
@@ -54,7 +54,7 @@ const CLI_UTIL = "compiler/cli_util.vl";
 const MAIN_RS = "scripts/vl-host/src/main.rs";
 const GATE_TS = "compiler/moduleGate.ts";
 const LSP_CHECKER = "lsp/src/wasmChecker.ts";
-const CORPUS_ORACLE = "tests/cases_wasm_test.ts";
+const CORPUS_ORACLE = "tests/support/casesWasmOracle.ts";
 
 const sorted = (xs: Iterable<string>): string[] => [...new Set(xs)].sort();
 
