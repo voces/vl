@@ -1,0 +1,108 @@
+// @run
+// @log <C>
+// @log <fld>
+// @log C
+// @log fld
+// @log C
+// @log fld
+// @log C
+// @log fld
+// @log [C]
+// @log [fld]
+// @log C
+// @log fld
+// @log ok
+// @log ok
+// @log <fld>
+// @log <f2>
+// @log <C>
+// @log <Sy>
+// @log <I>
+// @hint redundant type annotation
+// CONTRACT (D1063): two instantiations of one generic that must dispatch a member call
+// DIFFERENTLY each get their own answer, at every position the call can sit in.
+//
+// `dispatchRewrite` runs BEFORE monomorphization, so `drwWalk` meets `x.tag()` while `x` is
+// still a type parameter and has to answer for every instance at once: `structIndexOfExpr`
+// finds no struct row, the `si < 0` arm reads that as "no field, so UFCS", and the call is
+// rewritten to a direct call ONCE. D1002 gave that arm `drwAnyInstanceTakesField` so a
+// receiver carrying a callable field of that name keeps the member call — but only where
+// EVERY instantiation agreed. Where they DISAGREE (a `Circle` answered by the free
+// `tag(self: Circle)`, a `Boxed` answered by its own field) no single AST serves both:
+// `monoCloneBody` SHARES every leaf expression between instances.
+//
+// SO THE DEFERRED QUESTION IS ANSWERED WHERE THE PIN EXISTS. `monoPinBinOps` already re-runs
+// two of `drwWalk`'s arms over ONE instance body with the pin in hand (D511/D512); the
+// member-call arm is the third. Field first — the checker's precedence, asked with the same
+// `tyFieldTyOf` the gate asks of the call-site argument types — else the free `self`-function
+// and the call is rebuilt as the plain direct call. Copy-on-write, so the instance that takes
+// the field keeps the shared node.
+//
+// THE POSITIONS ARE THE POINT. Deferring with nothing behind it costs nine cells, because the
+// UFCS side then reaches emission UNREWRITTEN: `emitCall`'s member fallback covers expression
+// position and nothing covers the tail statement (`emitProgram: unsupported member-call
+// statement`) or the classifier-driven ones (a `const s = x.tag()` local takes the i32
+// default). Answering per instance means every downstream classifier still sees the plain
+// named call, which is why all seven positions below run.
+type Circle = { r: f64 }
+type Boxed = { tag: () => string }
+type Boxed2 = { tag: () => string }
+
+function tag(self: Circle): string {
+  if self.r > 0.0 { return "C" }
+  "c"
+}
+
+function wrap(s: string): string { "[" + s + "]" }
+
+function inConcat<T>(x: T): string { "<" + x.tag() + ">" }
+function inReturn<T>(x: T): string { return x.tag() }
+function inTail<T>(x: T): string { x.tag() }
+function inLocal<T>(x: T): string {
+  const s = x.tag()
+  s
+}
+function inPrint<T>(x: T) { print(x.tag()) }
+function inArgument<T>(x: T): string { wrap(x.tag()) }
+function inStatement<T>(x: T) {
+  x.tag()
+  print("ok")
+}
+
+const c: Circle = { r: 1.0 }
+const b: Boxed = { tag: () => "fld" }
+const b2: Boxed2 = { tag: () => "f2" }
+
+// the DISAGREEING pair, at all seven positions
+print(inConcat(c))
+print(inConcat(b))
+print(inReturn(c))
+print(inReturn(b))
+print(inTail(c))
+print(inTail(b))
+print(inLocal(c))
+print(inLocal(b))
+print(inArgument(c))
+print(inArgument(b))
+inPrint(c)
+inPrint(b)
+inStatement(c)
+inStatement(b)
+
+// THE UNANIMOUS CONTROLS, both directions — D1002's shape (every instantiation takes the
+// FIELD) and the plain UFCS one (none does). Neither may move.
+function bothFields<T>(x: T): string { "<" + x.tag() + ">" }
+print(bothFields(b))
+print(bothFields(b2))
+
+function noField<T>(x: T): string { "<" + x.tag() + ">" }
+function tagS(self: string): string { "S" + self }
+function tagI(self: i32): string {
+  if self > 0 { return "I" }
+  "i"
+}
+function viaS<T>(x: T): string { "<" + x.tagS() + ">" }
+function viaI<T>(x: T): string { "<" + x.tagI() + ">" }
+print(noField(c))
+print(viaS("y"))
+print(viaI(4))
