@@ -253,7 +253,15 @@ Clause 2 is what keeps clause 1 honest. Without it "legal" drifts to mean "whate
 accepts" and the goal is vacuous — any refusal can be relabelled a design rule after the fact.
 That is not hypothetical: **25 inventory rows closed in five days, every one by converting
 `check-clean invalid wasm` into a loud refusal.** Under "fix all miscompiles" each of those
-closes is correct and defensible. Under this goal **they are all still open.**
+closes is correct and defensible. Under this goal **each of them is still open UNLESS the
+refusal is one the design owed** — and the conversion itself is NOT the tell. The 2026-09-03
+audit of all 53 `check_reject` rows (`docs/internals/check-reject-audit-2026-09.md`, #2441)
+graded the converted rows **28 DESIGN / 4 CAPABILITY** and the rows with no such
+conversion **8 DESIGN / 11 CAPABILITY**: eleven of the converted ones were a refusal the
+checker owed at the DIRECT spelling and had merely lost at a monomorphization pin, so the
+program was ill-typed all along. Grade a silent→loud close by whether a NEIGHBOURING
+spelling runs and whether the refusal names a CONTRACT or a MECHANISM, not by the shape of
+the close.
 
 **Count progress in programs that RUN.** `regress.py` already prints it: `runs` was
 **3,704 / 7,021 (52.8%)** on 2026-08-30. Silent→loud is hygiene, belongs in the record, and is

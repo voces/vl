@@ -73,6 +73,7 @@ import {
   canonTyIxOf,
   canonUnionKey,
   canonUnionKeyOfName,
+  canonUnionKeyOfTy,
   covarValueWriteState,
   eqCoreKindOfTyToken,
   fusedMapReadRecvIx,
@@ -16447,7 +16448,7 @@ export function fnRetNullBearing(fnIx: i32) {
 // `.push` IS THE ONE EXCLUSION, and it is measured, not stylistic: the checker types it `i32`
 // while NO position lowers that value — `const n = xs.push(2)` is `callee is not a function
 // name` — so admitting it here would classify a working void procedure non-void and refuse it.
-// The gap is [D1301](docs/internals/silent-class-inventory.md#d1301); this line goes when it does.
+// The gap is [D1301](../docs/internals/inventory/D1301.md); this line goes when it does.
 export function memberCallYieldsValue(stmtIx: i32) {
   const s = P.nodes[stmtIx]
   if s is Call {
@@ -32019,9 +32020,11 @@ export function unionRowOf(name: string): i32 {
 // ── SPIKE: the union registry asked by ARENA TYPE ID (docs/internals/registry-by-type-id.md).
 // OFF by default and byte-identical when off: `unABOn()` is 0 unless the host armed the
 // rep-shadow harness, and `unionRowOfAB` then returns exactly what `unionRowOf` returned.
-// Mode 2 PREFERS the id answer; it is armed from SOURCE only (flip `unABMode`), because a
-// compiler that reads its own environment is a second input to its own fixpoint, and the
-// switch belongs to a later PR under a freeze rather than to a runtime flag.
+// Mode 2 PREFERS the id answer; mode 3 leaves the shipped answer alone and re-keys the
+// TALLY on `unKey` (step 4a's arena route) instead of `repCanonId`. Both are armed from
+// SOURCE only (flip `unABMode`), because a compiler that reads its own environment is a
+// second input to its own fixpoint, and the switch belongs to a later PR under a freeze
+// rather than to a runtime flag.
 export let unABMode: i32 = 0
 
 // The emit-time tallies, PER CONVERTED SITE. They are COUNTERS rather than reason-bucket
@@ -32151,6 +32154,32 @@ export function unionRowOfTyRaw(ty: i32): i32 {
   -1
 }
 
+// The KEY-keyed twin — the third and last candidate, and the one the design argues for:
+// the row whose minted `unKey` equals the key the ARENA route obtains for `ty`. Neither
+// sibling above is that equivalence — the raw index is not an identity, and `repCanonId`
+// MERGES row pairs the box ABI needs apart. It exists only now because step 4a built the
+// arena-side renderer that reaches the row's key
+// (`docs/internals/registry-by-type-id.md` §5).
+export function unRowOfKey(ty: i32): i32 {
+  const k = canonUnionKeyOfTy(ty)
+  if k < 0 { return -1 }
+  let u = 0
+  while u < unKey.length {
+    if unKey[u] == k { return u }
+    u = u + 1
+  }
+  -1
+}
+
+// The ID side's row under the harness MODE: 3 keys on `unKey`, anything else on
+// `repCanonId`. Only the four A/B seams route through here, and only their TALLY moves —
+// the shipped answer stays the name's at every mode but 2, so an armed compile at mode 3
+// emits exactly what an unarmed one does.
+function unRowOfTyAB(ty: i32): i32 {
+  if unABMode == 3 { return unRowOfKey(ty) }
+  unionRowOfTy(ty)
+}
+
 // The A/B seam over the registry's row lookup: the NAME answer, plus a tally of what the
 // id-keyed twin would have said. `ty < 0` is counted SEPARATELY — "this call site has no
 // arena id to offer" and "the id disagrees" are different findings, and collapsing them is
@@ -32160,7 +32189,7 @@ export function unionRowOfAB(site: i32, name: string, ty: i32): i32 {
   const m = unABOn()
   if m == 0 { return n }
   let d = -1
-  if ty >= 0 { d = unionRowOfTy(ty) }
+  if ty >= 0 { d = unRowOfTyAB(ty) }
   unABProbe(site, n, d, ty)
   if m == 2 && d >= 0 { return d }
   n
@@ -32174,7 +32203,7 @@ export function isUNameAB(site: i32, name: string, ty: i32): boolean {
   const m = unABOn()
   if m == 0 { return n }
   let d = -1
-  if ty >= 0 { d = unionRowOfTy(ty) }
+  if ty >= 0 { d = unRowOfTyAB(ty) }
   let nr = -1
   if n { nr = unRowOfName(name) }
   unABProbe(site, nr, d, ty)
@@ -32196,7 +32225,7 @@ export function unionMemberTysOfAB(
   const m = unABOn()
   if m == 0 { return r }
   let d = -1
-  if ty >= 0 { d = unionRowOfTy(ty) }
+  if ty >= 0 { d = unRowOfTyAB(ty) }
   unABProbe(site, unRowOfName(name), d, ty)
   if m == 2 && !r { return unionMemberTysOfRow(d, out) }
   r
@@ -32215,7 +32244,7 @@ export function unionHasAtomAB(
   const m = unABOn()
   if m == 0 { return n }
   let d = -1
-  if ty >= 0 { d = unionRowOfTy(ty) }
+  if ty >= 0 { d = unRowOfTyAB(ty) }
   unABProbe(site, unRowOfName(name), d, ty)
   if m == 2 && d >= 0 { return unionHasAtomRow(d, atom) }
   n
@@ -32253,6 +32282,13 @@ function unKeySweepRow(u: i32, ty: i32) {
     if kt < 0 { repShadowBumpReason("keySweep/ty-none") }
     else if kt == k { repShadowBumpReason("keySweep/ty-agree") }
     else { repShadowBumpReason("keySweep/ty-differ") }
+    // The step-4a route beside the step-3 one, on the same rows in the same run: the
+    // structural render's reach is what `tykey-*` has to beat, and a table of one is a
+    // number nobody can grade.
+    const kn = canonUnionKeyOfTy(ty)
+    if kn < 0 { repShadowBumpReason("keySweep/tykey-none") }
+    else if kn == k { repShadowBumpReason("keySweep/tykey-agree") }
+    else { repShadowBumpReason("keySweep/tykey-differ") }
   }
   if u < unMemberSet.length {
     const ks = canonUnionKeyOfName(unMemberSet[u])
