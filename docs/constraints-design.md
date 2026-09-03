@@ -475,6 +475,26 @@ what the ruling called passive aggressive: it explained a concept and prescribed
 a program that was legal. `tests/cases/constraints/unbounded-generic-matches-hole-spelling.vl`
 holds the agreement as a fixture, because a message assertion cannot.
 
+**THE MEMBER FLOOR'S REMAINING DOMAIN IS "THE ANNOTATION IS NOT A BOUND", AND IT TOOK TWO
+TRIES TO SAY SO WITHOUT ASSERTING SOMETHING FALSE.** With `<T>` routed onto the hole, the only
+receiver still reaching `tpMemberFloorMsg` is one whose bound annotation fails
+`boundObjRootOf` — and that is NOT the same as "a bound with no members". Three of its four
+sub-cases have members: a struct alias (`Circle = { r: f64 }`), a FIELD-member alias
+(`Showable = { show: () => string }`), and an undeclared name about which nothing is known;
+only `<T: i32>` has none. A named alias is a bound only when it declares METHOD members
+(OQ-1's call shape), so a field-member alias is a type with members that is still not a
+bound. The sentence is therefore `no \`other\` on \`T\` — \`Showable\` is not a bound`,
+and the RULE and the spelling that fixes it stay in the instantiation's own diagnostic —
+one fault, two anchors, no repetition.
+
+**A REAL BOUND MISSING THE MEMBER NEVER REACHED THAT RUNG and did not change.** It is
+`boundMemberFloorMsg`'s: `no \`other\` on \`T\` — its bound \`Showable\` grants
+\`show()\``, which is already the register the ruling asks for. The two rungs are pinned
+apart by `error-member-on-malformed-bound.vl`, `error-member-on-field-member-alias-bound.vl`
+(which also holds the named-vs-INLINE asymmetry: an inline `{ show: () => string }` IS a
+bound, because it is an object spelling rather than a name lookup) and OQ-5's
+`error-strict-body-member-not-in-bound.vl`.
+
 **And the ruling exposed a clause-1 defect in the OTHER direction (D1430).** The emitter's
 dispatch rewrite read `fnTyParams.length == 0` as "not generic", so the question it asks of a
 generic's call sites — does any instantiation carry this member as a FIELD? — was never asked
