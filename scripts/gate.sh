@@ -64,6 +64,10 @@ run "lsp suites (ci list)"     env SELFHOST_NATIVE_ALIGN=1 bash -c \
 run "lsp typecheck"            deno check --node-modules-dir=none --config lsp/deno.json lsp/src/*.ts
 run "native-fixpoint"          bash scripts/native-fixpoint.sh
 run "lint-self + fmt"          bash scripts/lint-self.sh
+# The comment-budget RATCHET: per-file counts of the two comment lint codes may only
+# fall. lint-self.sh holds those codes out of its own `info` gate while the baseline
+# is non-zero, so this is what stops the tree drifting back up meanwhile.
+run "comment budget"           python3 scripts/comment-budget.py --check
 run "deno lint"                deno lint
 run "rep-fuzz"                 bash scripts/rep-fuzz-check.sh
 run "mono-tyaram-grid"         bash scripts/mono-tyaram-grid.sh

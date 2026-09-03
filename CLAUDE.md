@@ -465,6 +465,31 @@ BUILD (`timeout 300 <build>`), and sweep for your own survivors before relaunchi
 identically, so the candidate can never reach a red. A change that loops on the compiler has
 an unbounded recursion or a fixpoint that does not converge, and that is the defect.
 
+## Comments state the invariant; measurements live in the inventory
+
+**A comment block is capped at 12 lines — 40 for a module HEADER — and a comment stating a
+MEASUREMENT must cite where it is graded.** Both are lint rules, tier `warning`:
+`comment-block-too-long` and `comment-measurement-uncited` in `compiler/lint.vl`. The header
+is the FIRST block with no code before it (blank lines and the leading `import` region may
+precede it — owner ruling, 2026-09-02), and the message names the budget it applied.
+
+What belongs in a code comment: the INVARIANT, the WHY (what breaks without it), and the id
+where the evidence lives — `D<row>`, a `DECISIONS.md` section, a `docs/**.md`. What does not:
+census counts, probe outputs, A/B tables, dates, history. **A comment is never re-graded; a
+row is re-run by every gate**, so a number in a comment goes stale in silence. Three wrong
+fixes on 2026-09-02 came from comments that were confidently STALE, not long — a length
+budget alone would have corrected none of them.
+
+The tree cannot reach zero in one PR, so both rules ride a RATCHET.
+`python3 scripts/comment-budget.py --check` (a gate in `gate.sh` and in CI) fails when any
+FILE's count goes up; `--write-baseline` lowers it, in the same PR as the trim that earned it.
+`scripts/lint-self.sh` holds exactly these two codes out of its own `info` gate while the
+baseline still owes them — read FROM the baseline, so the exemption deletes itself at zero.
+
+**A comment-only change must produce a BYTE-IDENTICAL seed.** That is the trim campaign's
+whole safety proof: `scripts/refresh-compiler.sh`, then `cmp` against a seed built from the
+pre-trim source. One byte different means you edited code, not comments.
+
 ## Claims about the tree
 
 `ROADMAP.md` and the design docs go stale one-directionally — a fixed defect keeps reading
