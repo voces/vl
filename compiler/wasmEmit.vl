@@ -53,6 +53,7 @@ import {
   tyIsNulValueUnionBox,
   tyLitMemberTexts,
   tyLitUnionAliasIx,
+  tyNulLitUnionInner,
   tyNulNumScalarValKind,
   tyNumLitMemberTexts,
   tyPrimNameOf,
@@ -17825,9 +17826,9 @@ function popRecvIsList(recvIx: i32, fnIx: i32) {
   exprArray(recvIx, fnIx)
 }
 
-// `xs.pop()` at a NUMERIC-SCALAR element rep, delivered as the `T | null` the checker gives
-// it (`mkNullableTy(rt.aElem)`): the `{tag, anyref}` value-union BOX, empty list → the null
-// tag. `vk` is the non-null member's value-atom kind (`tyNulNumScalarValKind`).
+// A CHECKED LIST READ (`xs.pop()` / `xs.get(i)`) at a NUMERIC-SCALAR element rep,
+// delivered as the `T | null` the checker gives it: the `{tag, anyref}` value-union BOX,
+// absent → the null tag. `vk` is the non-null member's kind (`tyNulNumScalarValKind`).
 //
 // THE SHAPE IS THE BOOLEAN ARM'S, ONE REP OUT. That arm has read `len != 0` and produced the
 // sentinel `2` on the empty branch since B6; i32 / i64 / f64 / f32 have no spare bit pattern
@@ -17837,29 +17838,30 @@ function popRecvIsList(recvIx: i32, fnIx: i32) {
 // WITHOUT IT `emitPop` LEFT THE RAW SCALAR under a `(ref $uBox)` destination: check-clean
 // invalid wasm at `return` / `arg` / an annotated binding, and the loud `narrowed union atom
 // has no value box` at `print` / an inferred binding — one gap, two disguises (D1174).
-function emitPopNulBox(body: i32[], lIdx: i32, lTy: i32, aTy: i32, vk: i32) {
+function emitPopNulBox(
+  body: i32[],
+  lIdx: i32,
+  lTy: i32,
+  aTy: i32,
+  vk: i32,
+  idxIx: i32,
+  fnIx: i32,
+) {
   const vb = vbHeapIdxOfKind(vk)
   if vb < 0 {
     return emitFail(
-      "emitProgram: .pop yields a nullable scalar but its value box was not collected",
+      "emitProgram: this list read yields a nullable scalar but its value box was not collected",
     )
   }
-  pushListLen(body, lIdx, lTy)    // cond: len != 0
+  if pushTakeCond(body, lIdx, lTy, idxIx, fnIx) < 0 { return -1 }
   wU8(4)                          // 0x04 if
   fbValtype("union", -1)          // result blocktype: the union box `(ref $uBox)`
   ctrlEnter()
   fbI32Const(scalarTagOfKind(vk)) // the present arm's atom tag
-  fbLocalGet(lIdx)                // L.len = len - 1
-  pushListLen(body, lIdx, lTy)
-  fbI32Const(1)
-  fbI32Bin(107)                   // 0x6b i32.sub
-  fbStructSet(lTy, 1)             // field 1: len
-  pushListBacking(body, lIdx, lTy)
-  pushListLen(body, lIdx, lTy)
-  fbArrayGet(aTy)                 // backing[len] — the popped scalar
+  if pushTakeElem(body, lIdx, lTy, aTy, idxIx, fnIx) < 0 { return -1 }
   fbStructNew(vb)                 // the per-rep value box
   fbStructNew(uBoxIdx)            // { tag, value }
-  fbElse()                        // 0x05 else — empty → the null-tagged box
+  fbElse()                        // 0x05 else — absent → the null-tagged box
   fbI32Const(nullBoxTag())
   fbRefNullNone()                 // the payload slot is unread under the null tag
   fbStructNew(uBoxIdx)
@@ -17868,13 +17870,96 @@ function emitPopNulBox(body: i32[], lIdx: i32, lTy: i32, aTy: i32, vk: i32) {
   0
 }
 
-function emitPop(body: i32[], callIx: i32, fnIx: i32, nulBox: boolean) {
+// THE CHECKED-READ CONDITION, one home for `.pop()` and `.get(i)`. `idxIx < 0` is the
+// `.pop` face and asks `len != 0` (a non-zero i32 IS the `if` condition); `idxIx >= 0` is
+// `.get` and asks the ONE unsigned compare `i u< len`, which covers the negative and the
+// past-len cases together. Both faces deliver the same `T | null` at the same four reps
+// (D1281), so the condition and the four result arms must not be able to drift.
+function pushTakeCond(
+  body: i32[],
+  lIdx: i32,
+  lTy: i32,
+  idxIx: i32,
+  fnIx: i32,
+): i32 {
+  if idxIx < 0 { return pushListLen(body, lIdx, lTy) }
+  if emitExpr(body, idxIx, fnIx) < 0 { return -1 }
+  pushListLen(body, lIdx, lTy)
+  fbI32Bin(73) // 0x49 i32.lt_u
+  0
+}
+
+// THE ELEMENT READ under that condition. `.pop` DECREMENTS the length first, so the new
+// `len` IS the removed element's index; `.get` reads at `idxIx` and never mutates. The
+// index expression is emitted a SECOND time here (the condition emitted it once), which
+// is what makes the caller's literal-or-name purity gate load-bearing.
+function pushTakeElem(
+  body: i32[],
+  lIdx: i32,
+  lTy: i32,
+  aTy: i32,
+  idxIx: i32,
+  fnIx: i32,
+): i32 {
+  if idxIx < 0 {
+    fbLocalGet(lIdx)    // L.len = len - 1
+    pushListLen(body, lIdx, lTy)
+    fbI32Const(1)
+    fbI32Bin(107)       // 0x6b i32.sub
+    fbStructSet(lTy, 1) // field 1: len
+    pushListBacking(body, lIdx, lTy)
+    pushListLen(body, lIdx, lTy)
+    fbArrayGet(aTy)     // backing[len] — the popped element
+    return 0
+  }
+  pushListBacking(body, lIdx, lTy)
+  if emitExpr(body, idxIx, fnIx) < 0 { return -1 }
+  fbArrayGet(aTy) // backing[i] — the read element
+  0
+}
+
+// The `.get(i)` INDEX PURITY GATE: the index is emitted twice (bounds check + read), so
+// only a re-readable expression is admissible — a literal, a name, or a NEGATIVE literal
+// (`xs.get(-1)`), which the unsigned compare maps past `len` and so takes the absent arm.
+// `emitListGetOr`'s own gate is the same one; this is its unfused twin.
+function takeIdxRefusal(idxIx: i32): string {
+  const idxN = P.nodes[unwrapParen(idxIx)]
+  if idxN is NumLit { return "" }
+  if idxN is Ident { return "" }
+  if idxN is Unary {
+    if idxN.unOp == "-" {
+      const inner = P.nodes[unwrapParen(idxN.unArg)]
+      if inner is NumLit { return "" }
+    }
+  }
+  "emitProgram: .get index must be a literal or a name"
+}
+
+// `xs.pop()` and `xs.get(i)` — the two CHECKED list reads, which the checker types
+// identically (`T | null`) and which differ only in the condition, the element index and
+// whether the length is decremented (`pushTakeCond` / `pushTakeElem`). `getIdx` is the
+// `.get` index node, or -1 for `.pop`. Serving both from one body is what keeps `.get`
+// reaching every rep `.pop` reaches: before D1281 the bare `.get` existed for the
+// struct-element ref list alone and fell out of the member ladder at every other rep.
+function emitPop(
+  body: i32[],
+  callIx: i32,
+  fnIx: i32,
+  nulBox: boolean,
+  getIdx: i32,
+) {
+  const opNm = if getIdx < 0 { ".pop" } else { ".get" }
   const c = P.nodes[callIx]
   if c is Call {
     const callee = P.nodes[c.callFn]
     if callee is Member {
-      if c.callArgs.length != 0 {
-        return emitFail("emitProgram: .pop takes no arguments")
+      if getIdx < 0 {
+        if c.callArgs.length != 0 {
+          return emitFail("emitProgram: .pop takes no arguments")
+        }
+      } else {
+        const idxBad = takeIdxRefusal(getIdx)
+        if idxBad != "" { return emitFail(idxBad) }
       }
       const isRef = exprRefArray(callee.memObj, fnIx)
       const isStr = exprStringArray(callee.memObj, fnIx)
@@ -17887,7 +17972,7 @@ function emitPop(body: i32[], callIx: i32, fnIx: i32, nulBox: boolean) {
       let popEk = scalarListElemKind(callee.memObj, fnIx)
       if popEk == "i32" { popEk = null }
       if !popRecvIsList(callee.memObj, fnIx) {
-        return emitFail("emitProgram: .pop receiver is not a list")
+        return emitFail("emitProgram: " + opNm + " receiver is not a list")
       }
       // The popped element is a REF (struct / union box / map struct / string) for a
       // ref or string list — surface it non-null; an i32 list yields a raw i32. `base` is
@@ -17904,7 +17989,7 @@ function emitPop(body: i32[], callIx: i32, fnIx: i32, nulBox: boolean) {
       if isRef {
         if !rlUsed {
           return emitFail(
-            "emitProgram: ref .pop but ref list type not collected",
+            "emitProgram: ref " + opNm + " but ref list type not collected",
           )
         }
         const rslot = refListSlotOfExpr(callee.memObj, fnIx)
@@ -17916,7 +18001,9 @@ function emitPop(body: i32[], callIx: i32, fnIx: i32, nulBox: boolean) {
         // The scalar sibling of the i32 default below: same shape, a per-kind wrapper,
         // backing and scratch base.
         if !scalarListUsedOf(popEk) {
-          return emitFail("emitProgram: .pop but list type not collected")
+          return emitFail(
+            "emitProgram: " + opNm + " but list type not collected",
+          )
         }
         lTy = scalarListWrap(popEk)
         aTy = scalarListBack(popEk)
@@ -17924,7 +18011,9 @@ function emitPop(body: i32[], callIx: i32, fnIx: i32, nulBox: boolean) {
       } else if isStr {
         if !slUsed {
           return emitFail(
-            "emitProgram: string .pop but string list type not collected",
+            "emitProgram: string " +
+              opNm +
+              " but string list type not collected",
           )
         }
         lTy = mkListIdx
@@ -17932,7 +18021,7 @@ function emitPop(body: i32[], callIx: i32, fnIx: i32, nulBox: boolean) {
         base = strPushScratchBase
         elemIsRef = true
       } else if !lUsed {
-        return emitFail("emitProgram: .pop but list type not collected")
+        return emitFail("emitProgram: " + opNm + " but list type not collected")
       }
       // Receiver resolution — `listOpRecvLocal`, shared with `.push`/`.clear`/`.pop() ?? d`.
       const lIdx = listOpRecvLocal(
@@ -17941,7 +18030,7 @@ function emitPop(body: i32[], callIx: i32, fnIx: i32, nulBox: boolean) {
         fnIx,
         base,
         popRefSlot,
-        ".pop",
+        opNm,
         false,
       )
       if lIdx < 0 { return -1 }
@@ -17951,20 +18040,15 @@ function emitPop(body: i32[], callIx: i32, fnIx: i32, nulBox: boolean) {
         // 2 instead of trapping — mirroring the host's nullable `.pop()` (B6).
         if !elemIsRef {
           if listElemIsBool(callee.memObj, fnIx) {
-            pushListLen(body, lIdx, lTy) // cond: len != 0
-            fbIf(127)                    // 0x04 if, 0x7f i32 result blocktype
+            if pushTakeCond(body, lIdx, lTy, getIdx, fnIx) < 0 { return -1 }
+            fbIf(127) // 0x04 if, 0x7f i32 result blocktype
             ctrlEnter()
-            fbLocalGet(lIdx)             // L.len = len - 1
-            pushListLen(body, lIdx, lTy)
-            fbI32Const(1)
-            fbI32Bin(107)                // 0x6b i32.sub
-            fbStructSet(lTy, 1)          // field 1: len
-            pushListBacking(body, lIdx, lTy)
-            pushListLen(body, lIdx, lTy)
-            fbArrayGet(aTy)              // the popped element (0/1)
-            fbElse()                     // 0x05 else — empty → the null sentinel
+            if pushTakeElem(body, lIdx, lTy, aTy, getIdx, fnIx) < 0 {
+              return -1
+            }
+            fbElse() // 0x05 else — absent → the null sentinel
             fbI32Const(2)
-            fbEnd()                      // 0x0b end
+            fbEnd()  // 0x0b end
             ctrlLeave()
             return 0
           }
@@ -17981,7 +18065,27 @@ function emitPop(body: i32[], callIx: i32, fnIx: i32, nulBox: boolean) {
           // one reads.
           if nulBox {
             const pnk = tyNulNumScalarValKind(nodeTyIxOf(callIx))
-            if pnk >= 0 { return emitPopNulBox(body, lIdx, lTy, aTy, pnk) }
+            if pnk >= 0 {
+              return emitPopNulBox(body, lIdx, lTy, aTy, pnk, getIdx, fnIx)
+            }
+          }
+          // A `K[]` ATOM LIST reads CHECKED too, on the `-1` sentinel below every
+          // interned atom id (`tyNulLitUnionInner`) — the boolean arm's shape at the one
+          // other niche rep. Unlike that one it applies at a STATEMENT `.pop()` as well:
+          // the read is what trapped, not the boxing, so declining here would keep an
+          // `array.get` at index -1 on an empty list (D1281).
+          if tyNulLitUnionInner(nodeTyIxOf(callIx)) {
+            if pushTakeCond(body, lIdx, lTy, getIdx, fnIx) < 0 { return -1 }
+            fbIf(127) // 0x04 if, 0x7f i32 result blocktype
+            ctrlEnter()
+            if pushTakeElem(body, lIdx, lTy, aTy, getIdx, fnIx) < 0 {
+              return -1
+            }
+            fbElse() // 0x05 else — absent → the atom-niche null sentinel
+            fbI32Const(0 - 1)
+            fbEnd()  // 0x0b end
+            ctrlLeave()
+            return 0
           }
         }
         // AN EMPTY REF / STRING POP ANSWERS `null`, IT DOES NOT TRAP (D1212). Reading
@@ -17995,37 +18099,26 @@ function emitPop(body: i32[], callIx: i32, fnIx: i32, nulBox: boolean) {
           let popElemHeap = sTypeIdx
           if popRefSlot >= 0 {
             if popRefSlot >= rlElemHeap.length {
-              return emitFail("emitProgram: ref .pop element heap not interned")
+              return emitFail(
+                "emitProgram: ref " + opNm + " element heap not interned",
+              )
             }
             popElemHeap = rlElemHeap[popRefSlot]
           }
-          pushListLen(body, lIdx, lTy) // cond: len != 0
+          if pushTakeCond(body, lIdx, lTy, getIdx, fnIx) < 0 { return -1 }
           fbIfRefNul(popElemHeap, true)
           ctrlEnter()
-          fbLocalGet(lIdx)             // L.len = len - 1
-          pushListLen(body, lIdx, lTy)
-          fbI32Const(1)
-          fbI32Bin(107)                // 0x6b i32.sub
-          fbStructSet(lTy, 1)          // field 1: len
-          pushListBacking(body, lIdx, lTy)
-          pushListLen(body, lIdx, lTy)
-          fbArrayGet(aTy)              // backing[len] — already `(ref null $elem)`
-          fbElse()                     // 0x05 else — empty → the typed null
+          if pushTakeElem(body, lIdx, lTy, aTy, getIdx, fnIx) < 0 { return -1 }
+          fbElse() // 0x05 else — absent → the typed null
           fbRefNull(popElemHeap)
-          fbEnd()                      // 0x0b end
+          fbEnd()  // 0x0b end
           ctrlLeave()
           return 0
         }
-        // L.len = len - 1
-        fbLocalGet(lIdx)    // local.get L
-        pushListLen(body, lIdx, lTy)
-        fbI32Const(1)       // i32.const 1
-        fbI32Bin(107)       // 0x6b i32.sub
-        fbStructSet(lTy, 1) // 0xfb 0x05 <lTy> field 1: len
-        // backing[L.len]  (the just-decremented len is the popped element's index)
-        pushListBacking(body, lIdx, lTy)
-        pushListLen(body, lIdx, lTy)
-        fbArrayGet(aTy) // 0xfb 0x0b <aTy>
+        // The UNCHECKED tail: a `.pop` STATEMENT (the value is dropped) and the reps
+        // with no `T | null` cell of their own — the `K[]` atom list, whose nullable
+        // rides the `-1` sentinel and whose recorded type is a litunion.
+        if pushTakeElem(body, lIdx, lTy, aTy, getIdx, fnIx) < 0 { return -1 }
         if elemIsRef {
           wU8(212) // 0xd4 ref.as_non_null
         }
@@ -18033,7 +18126,7 @@ function emitPop(body: i32[], callIx: i32, fnIx: i32, nulBox: boolean) {
       }
     }
   }
-  emitFail("emitProgram: expected a .pop call")
+  emitFail("emitProgram: expected a .pop or .get call")
 }
 
 // Lower a `.clear()` STATEMENT onto `body`: reset the list's logical length to 0,
@@ -18115,66 +18208,6 @@ function emitClear(body: i32[], callIx: i32, fnIx: i32) {
     }
   }
   emitFail("emitProgram: expected a .clear call")
-}
-
-// Lower a checked `.get(i)` over a STRUCT-element ref list onto `body`, leaving a
-// `(ref null $S)` on the stack: in-bounds yields the backing slot as-is (already
-// nullable-widened), out-of-bounds `ref.null $S` — `xs.get(9)` is `null`, mirroring
-// the host's checked list read. ONE unsigned compare (`idx u< len`) covers both the
-// negative and the past-len cases. The receiver and index are each emitted twice
-// (the bounds check + the read), so both must be PURE re-reads: a bare name receiver
-// and a literal/name index — anything else fails loudly.
-function emitListGet(body: i32[], callIx: i32, fnIx: i32) {
-  const c = P.nodes[callIx]
-  if c is Call {
-    const callee = P.nodes[c.callFn]
-    if callee is Member {
-      if c.callArgs.length != 1 {
-        return emitFail("emitProgram: .get takes exactly one argument")
-      }
-      if structListPopGetElem(callIx, fnIx) < 0 || !rlUsed {
-        return emitFail("emitProgram: .get receiver is not a struct list")
-      }
-      const rslot = refListSlotOfExpr(callee.memObj, fnIx)
-      const elemHeap = rlElemHeap[rslot]
-      const recvN = P.nodes[unwrapParen(callee.memObj)]
-      let okRecv = false
-      if recvN is Ident { okRecv = true }
-      if !okRecv {
-        return emitFail(
-          "emitProgram: .get receiver must be a named list binding",
-        )
-      }
-      const idxN = P.nodes[unwrapParen(c.callArgs[0])]
-      let okIdx = false
-      if idxN is NumLit { okIdx = true }
-      if idxN is Ident { okIdx = true }
-      if !okIdx {
-        return emitFail("emitProgram: .get index must be a literal or a name")
-      }
-      // cond: idx u< len
-      if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
-      if emitExpr(body, callee.memObj, fnIx) < 0 { return -1 }
-      fbStructGet(rlWrapIdx[rslot], 1) // field 1: len
-      fbI32Bin(73)                     // 0x49 i32.lt_u
-      // if (result (ref null $elem))
-      wU8(4)                           // 0x04 if
-      wU8(99)                          // 0x63 (ref null ht) result blocktype
-      wSLEB(elemHeap)
-      ctrlEnter()
-      if emitExpr(body, callee.memObj, fnIx) < 0 { return -1 }
-      fbStructGet(rlWrapIdx[rslot], 0) // field 0: backing
-      if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
-      fbArrayGet(rlBackIdx[rslot])     // -> (ref null $elem)
-      fbElse()                         // 0x05 else
-      wU8(208)                         // 0xd0 ref.null
-      wSLEB(elemHeap)
-      fbEnd()                          // 0x0b end
-      ctrlLeave()
-      return 0
-    }
-  }
-  emitFail("emitProgram: expected a .get call")
 }
 
 // Lower a FUSED `xs.get(i) ?? d` over a SCALAR-element list (i32 / boolean / f64)
@@ -20590,7 +20623,7 @@ function emitCallStmt(body: i32[], s: Call, stmtIx: i32, fnIx: i32) {
     // the value it leaves on the stack.
     if callee.memProp == "pop" {
       if popRecvIsList(callee.memObj, fnIx) {
-        if emitPop(body, stmtIx, fnIx, false) < 0 { return -1 }
+        if emitPop(body, stmtIx, fnIx, false, -1) < 0 { return -1 }
         fbDrop() // 0x1a drop
         return 0
       }
@@ -22948,14 +22981,20 @@ function emitCallNode(body: i32[], e: Call, exprIx: i32, fnIx: i32) {
     // `pop` is a `call_ref` member call like any other (D1087).
     if callee.memProp == "pop" {
       if popRecvIsList(callee.memObj, fnIx) {
-        return emitPop(body, exprIx, fnIx, true)
+        return emitPop(body, exprIx, fnIx, true, -1)
       }
     }
-    // `xs.get(i)` over a STRUCT-element ref list: the checked nullable read —
-    // in-bounds yields the (still nullable) element slot, out-of-bounds `ref.null $S`.
+    // `xs.get(i)` — the checked nullable list read, at EVERY list rep. It is `.pop()`
+    // with a bounds condition and no decrement, so it shares that body (D1281): before,
+    // the bare `.get` existed for the struct-element ref list alone and every other rep
+    // fell out of this ladder into `emitCall`, whose sentence names neither `get` nor
+    // lists. A non-list receiver still falls through — a map `.get(k)` and a
+    // function-valued struct field named `get` are `emitCall`'s, exactly as before.
     if callee.memProp == "get" {
-      if structListPopGetElem(exprIx, fnIx) >= 0 {
-        return emitListGet(body, exprIx, fnIx)
+      if e.callArgs.length == 1 {
+        if popRecvIsList(callee.memObj, fnIx) {
+          return emitPop(body, exprIx, fnIx, true, e.callArgs[0])
+        }
       }
     }
     // `xs.map(f)` / `xs.filter(p)` over a LIST receiver lower to the inline

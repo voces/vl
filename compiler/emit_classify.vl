@@ -1865,7 +1865,7 @@ export function letNulMapReadUnionBox(letIx: i32, fnIx: i32) {
   false
 }
 
-// The ref-list ELEMENT KIND a `.pop()` over a NESTED list yields, or -1 (D1210). `xs.pop()`
+// The ref-list ELEMENT KIND a checked read over a NESTED list yields, or -1 (D1210). `xs.pop()`
 // over an `i32[][]` is `i32[] | null` to the checker and the popped value is the inner list's
 // WRAPPER, so the three nullable-list classifiers each claim it at their own element kind —
 // 4 in `exprNullableList`, 6/7/8/10 in `exprNulScalarListKind`, 9 in `exprNullableRefArray`
@@ -1879,9 +1879,14 @@ function popRefElemKind(exprIx: i32, fnIx: i32): i32 {
   -1
 }
 
-// The RECEIVER's ref-list slot of a `.pop()` over a nested list, or -1 — the row every
-// question about the popped element reads: its kind above, and its INNER slot where the
-// element is itself a ref list (`nulRefArrayInnerSlot`'s pop arm).
+// The RECEIVER's ref-list slot of a CHECKED READ over a nested list, or -1 — the row
+// every question about the read element asks: its kind above, and its INNER slot where
+// the element is itself a ref list (`nulRefArrayInnerSlot`'s pop arm).
+//
+// `.get(i)` COUNTS FOR THE SAME REASON `.pop()` DOES (D1281): both are `T | null` over
+// the same receiver and both yield the inner list's WRAPPER, so a classifier that knows
+// only `.pop` leaves the `.get` binding with no rep — `bare null needs a struct-typed
+// context` at the `!= null` narrow, on a program whose `.pop` twin runs.
 function popRefRecvSlot(exprIx: i32, fnIx: i32): i32 {
   if exprIx < 0 { return -1 }
   const e = P.nodes[exprIx]
@@ -1889,7 +1894,7 @@ function popRefRecvSlot(exprIx: i32, fnIx: i32): i32 {
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Member {
-      if callee.memProp == "pop" {
+      if callee.memProp == "pop" || callee.memProp == "get" {
         if exprRefArray(callee.memObj, fnIx) {
           return refListSlotOfExpr(callee.memObj, fnIx)
         }
@@ -6676,8 +6681,16 @@ function callPopBits(callIx: i32, fnIx: i32) {
     const callee = P.nodes[c.callFn]
     if callee is Member {
       // `.clear()` resolves its receiver the same way `.pop()` does (a Member /
-      // global receiver stages the wrapper ref in `recvRef`), so it counts too.
-      if callee.memProp == "pop" || callee.memProp == "clear" {
+      // global receiver stages the wrapper ref in `recvRef`), so it counts too — and
+      // since D1281 so does `.get(i)`, which shares `.pop`'s body and its
+      // `listOpRecvLocal`. `.get` is gated on the receiver being a LIST because a map
+      // `.get(k)` is a different lowering and `pushKindBitsOf`'s no-bits fallback would
+      // hand it the i32-list quad it never uses.
+      let getIsList = false
+      if callee.memProp == "get" {
+        getIsList = mfRecvKindOf(callee.memObj, fnIx) != null
+      }
+      if callee.memProp == "pop" || callee.memProp == "clear" || getIsList {
         const recv = P.nodes[callee.memObj]
         // A struct-FIELD / global-field Member receiver, OR a bare module-GLOBAL list
         // ident — both materialize the wrapper ref into the `recvRef` scratch slot, so
@@ -10058,7 +10071,16 @@ export function structIndexOfObj(objIx: i32) { structIndexOfObjCtx(objIx, -1) }
 // not spell — so the composite value codes refute only against an ANONYMOUS row.
 function anonValueFitsField(vc: i32, sc: i32, valIx: i32, si: i32, mfi: i32) {
   if vc < 0 { return true }
-  if sc == 16 { return true }
+  if sc == 16 {
+    // …EXCEPT A NESTED OBJECT LITERAL, WHICH IS NOT AN ATOM. The box field's leniency is
+    // about the ATOMS a `{tag, anyref}` holds; a `{…}` value fits one only where the
+    // field's own member set has a STRUCT arm to hold it. Without the refutation
+    // `{ f: { f: u } }` merged its OUTER literal onto the INNER row — the field-name sets
+    // are both `{f}` and the inner's code-16 field accepted the struct — so a read of
+    // `w.f` found a union box where a struct ref is stored (D1242).
+    if vc == 15 { return unionSetCanHoldStruct(sFieldElemNameAt(si, mfi)) }
+    return true
+  }
   const anonRow = sIsAnonRow(si)
   if vc == sc {
     // A NESTED-STRUCT field (code 15) still has to agree on WHICH struct: two
@@ -21161,6 +21183,39 @@ function anonTySpellable(ty: i32): boolean {
   false
 }
 
+// The MEMBER-SET NAME an anonymous literal's value-union field records, or "" when the
+// field is not one. Two conjuncts, and both are load-bearing: the ARENA has to grade the
+// type a value union (`fieldCodeOfTy` == 16 — its own `isValueUnionTyOr` rung, which
+// declines rather than guess), and the RENDER has to produce a name the registry accepts,
+// because that string is the box's key at intern time and at every read. A render the name
+// predicate rejects is not a near miss — it is a field whose box would never be interned.
+function anonUnionFieldName(valIx: i32): string {
+  if valIx < 0 { return "" }
+  const ty = nodeTyIxOf(valIx)
+  if ty < 0 { return "" }
+  const nm = tyToEmitName(ty)
+  if nm == "" { return "" }
+  // THE TWO RUNGS THE DECLARED LADDER ENDS ON, in its order (`fieldCodeOfSpelling`):
+  // `isValueUnionName` for a union of ATOMS (plus null), then `isUName` for a REGISTERED
+  // struct or heterogeneous one — which `fieldCodeOfTy` declines by design, its own rung
+  // being the value-union half alone.
+  if fieldCodeOfTy(ty) == 16 {
+    if isValueUnionName(nm) { return nm }
+    return ""
+  }
+  // Matched on EITHER registry column (`unionRowOf`), not `isUName`: that one reads the
+  // ALIAS names alone, while `tyToEmitName` renders a union alias as its MEMBER SET, so
+  // the two spellings never met and a `type AB = A | B`-valued field kept minting nothing.
+  if unionRowOf(nm) >= 0 { return nm }
+  // THE ARENA, once the render has declined. `unRowOfCanon` keys the registry on the
+  // type's canonical id rather than on a spelling, so a declared union whose render is
+  // STRUCTURAL still finds its row; the name handed back is the registry's own, which is
+  // the key every reader of this column resolves through.
+  const ur = unRowOfCanon(ty)
+  if ur >= 0 { return unNames[ur] }
+  ""
+}
+
 export function anonFieldCode(valIx: i32) {
   if valIx < 0 { return -1 }
   // THE PACKED BYTE LIST HAS NO FIELD CODE (`fieldTypeIsDeferred`), so no synthetic row may claim
@@ -21178,6 +21233,14 @@ export function anonFieldCode(valIx: i32) {
   if tyIsU8ArrayTy(nodeRepTyIxOf(valIx)) { return -1 }
   const syn = anonFieldCodeSyn(valIx)
   if syn >= 0 { return syn }
+  // A VALUE-UNION field value (`{ f: u }` with `u: i32 | null`) is the shared BOX — code 16,
+  // exactly what the DECLARED twin `type W = { f: i32 | null }` gets from `isValueUnionName`.
+  // AHEAD of the spellability gate on purpose: `nodeTyName` deliberately spells no union, so
+  // that gate refused the whole literal a row, and `emitObjLitNode`'s fallback for a literal
+  // with no row is `emitUnionBox` — a sentence about union VARIANTS for a program declaring
+  // none (D1242). `anonUnionFieldName` supplies the companion column, which is the admission
+  // rule `anonCodeIsSelfContained` states for a code that needs one.
+  if anonUnionFieldName(valIx) != "" { return 16 }
   // THE GATE, THEN THE ARENA, THEN THE RENDER. The gate below is `nodeTyName(valIx) != ""` asked
   // of the TYPE (`anonTySpellable`), so it still keeps an unspellable type out of BOTH paths —
   // which is what the render's emptiness was doing here, and what a naive hoist of the arena rung
@@ -21346,6 +21409,11 @@ function anonFieldCodeSyn(valIx: i32) {
 // }` → the inner shape's synthetic name). "" otherwise.
 export function anonFieldElemName(valIx: i32, code: i32) {
   if code == 19 { return nodeTyMapValName(valIx) }
+  // A VALUE-UNION field (code 16) records its MEMBER SET, the same column
+  // `shapeFieldElemName` fills from the declared spelling — and the same string the mint's
+  // own `registerValueUnionName` loop then interns the box under. Supplying it is what
+  // admits code 16 to `anonFieldCode` at all (D1242).
+  if code == 16 { return anonUnionFieldName(valIx) }
   if code != 15 { return "" }
   const si = structIndexOfObj(valIx)
   if si >= 0 { return sNames[si] }
@@ -30416,6 +30484,17 @@ function objMatchesVariantIdx(objIx: i32, vi: i32): boolean {
     return allMatch
   }
   false
+}
+
+// Does the union registered under `set` carry a STRUCT arm — a variant a `{…}` value could
+// be stored as? REFUTATION-ONLY, so a set with no row answers YES: a helper whose caller uses
+// it to refute must never refute on ignorance, and an unregistered set is ignorance rather
+// than an absence. `unVarCount == 0` is the one thing this can state positively — a union of
+// atoms alone (`i32 | null`) has nowhere to put a struct.
+export function unionSetCanHoldStruct(set: string): boolean {
+  const u = unionRowOf(set)
+  if u < 0 { return true }
+  unVarCount[u] > 0
 }
 
 // The VARIANT table index of the arm OF THE UNION whose registered member set is

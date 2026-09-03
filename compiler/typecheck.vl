@@ -640,6 +640,11 @@ const HD_RET = 1
 const HD_ELEM = 2
 const HD_GALT = 3
 const HD_BINOP = 4
+// The GUARD'S COMPLEMENT: the hole MINUS the type an `is` tested for, which is what the
+// ELSE arm of `if a is T` reads. `subtractTy` cannot answer at a hole — there is no member
+// list to remove from — so the remainder is DEFERRED to the pin, exactly as HD_GALT defers
+// reachability and HD_BINOP the operator's result. D1243.
+const HD_GNOT = 5
 let hdKind: i32[] = []
 let hdField: string[] = []
 let hdInner: i32[] = []
@@ -5668,6 +5673,25 @@ function collectThenNarrows(condIx: i32, names: string[], tys: i32[]) {
   0
 }
 
+// May the ELSE arm of `if <hole> is T` carry a DEFERRED remainder (`HD_GNOT`)? Two
+// exclusions, and neither is a design rule.
+//
+// A LITERAL-BEARING `T` is the EMITTER'S REACH: `litElseNarrow` reads the receiver's own
+// recorded type, which for a hole parameter is the pin's SOFTENED spelling, so the literal
+// matches no member and the else arm reads the raw box — D1412.
+//
+// A SHAPE `T` would re-base the hole's own field DEMANDS onto a derived hole the caller's
+// argument check never consults, losing a rejection
+// (`soundness/hole-is-guard-alternative-reject`). That family has its own machine already,
+// `noteHoleAlt`.
+function holeElseRemainderOk(tIdx: i32): boolean {
+  if tIdx < 0 { return false }
+  if isLitBearing(tIdx) { return false }
+  const t = T.tys[tIdx]
+  if t is TyObj { return false }
+  true
+}
+
 // Collect the narrowings that hold when `cond` is FALSE: `x == null` strips
 // the null in the else-branch, `x is null` false means non-null, `x is T`
 // false leaves the union COMPLEMENT `U − T` (host `subtractType`), `a || b`
@@ -5685,14 +5709,31 @@ function collectElseNarrows(condIx: i32, names: string[], tys: i32[]) {
     if placeHasOptionalHop(cond.isObj) { return 0 }
     const cur = placeCurTy(cond.isObj, names, tys)
     if cond.isVariant == "null" {
-      const inner = nonNullTy(cur)
+      let inner = nonNullTy(cur)
+      // THE NULL FACE OF THE SAME HOLE (D1243). `nonNullTy` peels a `TyNullable`; a hole is
+      // not one, so `if a is null { … } else { … }` lost the else arm exactly as the typed
+      // complement below did. `TY_NULL` is what the pin subtracts.
+      if inner == cur {
+        if tyIsHole(cur) {
+          inner = mkDerivedHole(HD_GNOT, "", -1, TY_NULL, cur)
+        }
+      }
       if inner >= 0 && inner != cur {
         pushNarrowFact(cond.isObj, inner, names, tys)
       }
     } else {
       const tIdx = isTypeTyRead(cond.isVariant, condIx)
       if tIdx >= 0 {
-        const sub = subtractTy(cur, tIdx)
+        let sub = subtractTy(cur, tIdx)
+        // A HOLE HAS NO MEMBER LIST TO SUBTRACT FROM, so the remainder is DEFERRED to the
+        // pin rather than lost. Without it the `else` arm of `if a is string` over an
+        // un-annotated parameter read `a` at the FULL pinned union, and `a * 2` refused a
+        // program whose annotated twin runs — while the HIT arm, which needs no subtraction
+        // at all, narrowed at both faces (D1243). `holeElseRemainderOk` states which tested
+        // types the remainder may be minted for, and why each exclusion is not a design rule.
+        if sub < 0 && holeElseRemainderOk(tIdx) {
+          sub = mkDerivedHole(HD_GNOT, "", -1, tIdx, cur)
+        }
         pushNarrowFact(cond.isObj, sub, names, tys)
         // THE COMPLEMENT, banked into the ELSE table. This was deliberately withheld when
         // the THEN half shipped, because `setNarrowFromCondElse` declines to else-narrow a
@@ -7120,6 +7161,7 @@ function holeBaseTy(tyIx: i32) {
     return holeBaseTy(hdBase[row])
   }
   if k == HD_GALT { return holeBaseTy(hdBase[row]) }
+  if k == HD_GNOT { return holeBaseTy(hdBase[row]) }
   tyIx
 }
 
@@ -13178,6 +13220,18 @@ export function tyNulNumScalarValKind(ty: i32): i32 {
     }
   }
   -1
+}
+
+// True when a nullable type's non-null member is a LITERAL UNION (a singleton `TyLit`
+// counts, for `tyIsLitUnionOrLit`'s reason). That rep's absence rides the `-1` SENTINEL
+// below every interned atom id (`pendingNulLitUnion`), not the `{tag, anyref}` box
+// `tyNulNumScalarValKind` names — so a checked list read at this rep needs the sentinel
+// arm, and without one the read was unchecked and an out-of-range `.get` trapped (D1281).
+export function tyNulLitUnionInner(ty: i32): boolean {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyNullable { return tyIsLitUnionOrLit(t.nInner) }
+  false
 }
 
 // The pipe-joined UNION NAME the four kinds above register under (`registerValueUnionName`
@@ -19563,6 +19617,9 @@ function hdRenderName(
   if kind == HD_BINOP {
     return "?binop." + field + "." + i32ToStr(inner) + "." + baseName
   }
+  // The TESTED type rides the name because it IS the derivation: two `else` arms over one
+  // hole testing different types are different remainders.
+  if kind == HD_GNOT { return "?gnot." + i32ToStr(alt) + "." + baseName }
   "?galt." + i32ToStr(inner) + "." + i32ToStr(alt) + "." + baseName
 }
 
@@ -19661,6 +19718,20 @@ function substHoleTy(tyIx: i32, bNames: string[], bTys: i32[]) {
     if tyIsHole(gPin) { return rebaseDerivedHole(row, gPin) }
     if holeAssignOk(-1, gPin, gAlt) { return gInner }
     return -1
+  }
+  // THE GUARD'S COMPLEMENT (`else` over an `is` on a hole). The pin is the first place a
+  // remainder EXISTS: `subtractTy` needs a member list and a hole has none. A pin the
+  // subtraction cannot reduce — the tested type is not one of its members — keeps the pin
+  // itself, which is what the un-narrowed `else` already meant.
+  if kind == HD_GNOT {
+    const nAlt = hdAlt[row]
+    if nAlt < 0 { return -1 }
+    const nPin = substHoleTy(hdBase[row], bNames, bTys)
+    if nPin < 0 { return -1 }
+    if tyIsHole(nPin) { return rebaseDerivedHole(row, nPin) }
+    const nRest = subtractTy(nPin, nAlt)
+    if nRest >= 0 { return nRest }
+    return nPin
   }
   if kind == HD_RET {
     const inner = substHoleTy(hdBase[row], bNames, bTys)
