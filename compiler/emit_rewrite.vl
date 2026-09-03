@@ -275,33 +275,46 @@ function drwIsMapRead(ix: i32) {
 // field-closure lowering, which resolves per FUNCTION and is right at every instance.
 // "Any" (not unanimity) is enough because `monoPinBinOps` re-runs the rewrite PER
 // INSTANCE off the pinned receiver type — D1063 is the price unanimity charged.
+
+// AN UN-ANNOTATED PARAMETER IS A GENERIC TOO. Reading `fnTyParams.length == 0` as "not
+// generic" made D1430 a check-clean miscompile: `function g(x) { x.tag() }` declared no
+// type parameters, so this declined to look and the call was rewritten onto a
+// `self`-function whose receiver type no instantiation can ever have. The two spellings
+// of one generic answer alike (owner ruling; `docs/constraints-design.md` §7.7).
 function drwAnyInstanceTakesField(recvIx: i32, prop: string, ctx: i32) {
   if ctx < 0 { return false }
   // ORDERED BY COST, and the order is load-bearing. `tyHasTyVar` fans out over a union's
   // members and an object's fields to depth 12 with no memo, so on a recursive `Node`-shaped
-  // union it is exponential — asking it ahead of the two structural tests below made the
+  // union it is exponential — asking it ahead of the structural tests below made the
   // compiler's own self-compile measurably slower for an answer that is `false` at every
-  // non-generic declaration.
+  // declaration whose parameters are all written down. The parameter scan moved AHEAD of it
+  // so the un-annotated spelling can be admitted without paying that cost anywhere else:
+  // a receiver naming an ANNOTATED parameter of a non-generic function still returns before
+  // the fan-out.
   const fn = P.nodes[ctx]
   if fn is FuncDecl {
-    if fn.fnTyParams.length == 0 { return false }
     const r = P.nodes[unwrapParen(recvIx)]
     if r is Ident {
-      // The receiver's own recorded type must still be a HOLE — this is the pre-instance
-      // question and nothing else. A concrete receiver was already answered by
-      // `structIndexOfExpr`.
-      if !tyHasTyVar(nodeTyIxOf(recvIx)) { return false }
       const ps = fn.fnParams
       let pi = -1
+      let piHole = false
       let i = 0
       while i < ps.length {
         const pp = P.nodes[ps[i]]
         if pp is Param {
-          if pp.parName == r.identName { pi = i }
+          if pp.parName == r.identName {
+            pi = i
+            piHole = pp.parType < 0
+          }
         }
         i = i + 1
       }
       if pi < 0 { return false }
+      if fn.fnTyParams.length == 0 && !piHole { return false }
+      // The receiver's own recorded type must still be a HOLE — this is the pre-instance
+      // question and nothing else. A concrete receiver was already answered by
+      // `structIndexOfExpr`, and an un-annotated parameter the body pinned answers here.
+      if !tyHasTyVar(nodeTyIxOf(recvIx)) { return false }
       const gname = fn.fnName
       if gname == "" { return false }
       let seen = 0
