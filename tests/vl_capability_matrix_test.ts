@@ -184,19 +184,20 @@ Deno.test({
       // block, which nothing graded before the positions existed. D1244's mechanism, this
       // template's value.
       wantVerdict(cells, "block_if", face, "RUNS", "the plain read inside the block is fine");
-      wantVerdict(cells, "block_if_capture", face, "SILENT", "D1244 at the union box");
+      wantVerdict(cells, "block_if_capture", face, "RUNS", "D1244 closed: the module block is a frame");
     }
-    // A SILENT cell in the after column, so the harness must report FAILURE. This assertion
-    // said `exit 0` until the `block_*` positions landed; the cells above are why it flipped,
-    // and pinning them by name is what stops the number moving again unexplained.
-    if (code === 0) {
-      throw new Error("want a non-zero exit on D1244's block cells, got 0");
+    // Back to `exit 0`, and the third value this assertion has held. It wanted 0 before the
+    // `block_*` positions existed, non-zero while D1244's captured box was SILENT, and 0
+    // again now the frame landed. The cells above are pinned by name so the number cannot
+    // move a fourth time without someone saying which cell moved.
+    if (code !== 0) {
+      throw new Error(`want exit 0 once D1244's block cells run, got ${code}`);
     }
   },
 });
 
 Deno.test({
-  name: "matrix: D1197's `.push` cell RUNS with its eight siblings — the row is closed",
+  name: "matrix: D1197's `.push` cell runs; D1370's four annotated captures are the price",
   ignore: !ENABLED,
   fn: async () => {
     const { code, cells } = await runMatrix("narrowed-nullable-ref-push.matrix.vl");
@@ -215,8 +216,28 @@ Deno.test({
       // so rather than reporting a refusal it manufactured itself.
       wantVerdict(cells, "global_init", face, "skipped", "a global init cannot nest in a guard");
     }
-    if (code !== 0) {
-      throw new Error(`want exit 0 with no SILENT cell in the after column, got ${code}`);
+    // D1370 — THE PRICE D1244's FRAME BOUGHT, PINNED BY NAME AND BY FACE. Making a
+    // module-scope block a real frame let four captured cells reach the emitter, and the
+    // ANNOTATED rebind arrives with a rep nothing converts: `const c: Item = e` under
+    // `if e != null`. On master all four were D1244's own loud message. Eight cells left the
+    // loud column here — four to RUNS, these four to SILENT, with runs -> not-runs at zero.
+    // The un-annotated face of every one of them RUNS, which is why the face is part of the
+    // pin: a fix that moves the annotated four must not quietly move the other face instead.
+    for (const p of ["closure_capture", "block_if_capture", "block_while_capture", "block_bare_capture"]) {
+      wantVerdict(cells, p, "annotated", "SILENT", "D1370. When it closes, change to RUNS");
+      wantVerdict(cells, p, "un-annotated", "RUNS", "D1370's un-annotated face already runs");
+    }
+    // Non-zero BECAUSE of those four and nothing else. The count is asserted so a fifth
+    // silent cell cannot hide behind a pin that only names four.
+    const silent = cells.filter((c) => verdictOf(c.grade) === "SILENT");
+    if (silent.length !== 4) {
+      throw new Error(
+        `want exactly D1370's 4 SILENT cells, got ${silent.length}: ` +
+          silent.map((c) => `${c.position}/${c.face}`).join(", "),
+      );
+    }
+    if (code === 0) {
+      throw new Error("want a non-zero exit while D1370's four cells are SILENT, got 0");
     }
   },
 });
@@ -235,7 +256,7 @@ const BLOCKS =
   "block_if,block_if_capture,block_while,block_while_capture,block_bare,block_bare_capture";
 
 Deno.test({
-  name: "matrix: D1244's LOUD cell — a captured struct in a module-scope block, three kinds",
+  name: "matrix: D1244 CLOSED — a captured struct in a module-scope block, three block kinds",
   ignore: !ENABLED,
   fn: async () => {
     const { code, cells } = await runMatrix("module-block-capture-struct.matrix.vl", BLOCKS);
@@ -245,11 +266,9 @@ Deno.test({
       wantVerdict(cells, "block_if", face, "RUNS", "D1244: the capture is the ingredient");
       wantVerdict(cells, "block_while", face, "RUNS", "D1244: the capture is the ingredient");
       for (const p of ["block_if_capture", "block_while_capture", "block_bare_capture"]) {
-        wantVerdict(cells, p, face, "emit refuses", "D1244. When it closes, change to RUNS");
-        const grade = gradeOf(cells, p, face);
-        if (!grade.includes("field access receiver is not a struct")) {
-          throw new Error(`${p}/${face}: want D1244's message, got ${grade}`);
-        }
+        // Was D1244's `field access receiver is not a struct`; the close removes the message
+        // along with the refusal, so the verdict IS the assertion now.
+        wantVerdict(cells, p, face, "RUNS", "D1244 closed 2026-09-03: the module block is a frame");
       }
       // D1253 CLOSED the floor that used to sit under all three: a bare block now lowers like
       // any other scope, so the plain-read bare cell runs with its `if` and `while` siblings
@@ -263,28 +282,20 @@ Deno.test({
 });
 
 Deno.test({
-  name: "matrix: D1244's `i32[]` rep grades SILENT where its struct rep is loud",
+  name: "matrix: D1244 CLOSED at the `i32[]` rep too — the two silent cells and D1253's price",
   ignore: !ENABLED,
   fn: async () => {
     const { code, cells } = await runMatrix("module-block-capture-list.matrix.vl", BLOCKS);
     for (const face of ["annotated", "un-annotated"]) {
       wantVerdict(cells, "block_if", face, "RUNS", "the plain read of the list is fine");
-      wantVerdict(
-        cells,
-        "block_if_capture",
-        face,
-        "SILENT",
-        "D1244 at `i32[]`: check-clean invalid wasm. When D1244 closes, change this to RUNS",
-      );
-      wantVerdict(cells, "block_while_capture", face, "SILENT", "D1244 at `i32[]`");
-      // THE PRICE D1253 PAID, PINNED. Closing the bare-block floor made this cell reachable,
-      // so it moved emit-refuses -> SILENT: it is D1244's `i32[]` cell, identical to the two
-      // above, that the floor was hiding. It closes when D1244 does, with them.
-      wantVerdict(cells, "block_bare_capture", face, "SILENT", "D1253's price: D1244 at `i32[]`");
+      wantVerdict(cells, "block_if_capture", face, "RUNS", "D1244 closed 2026-09-03");
+      wantVerdict(cells, "block_while_capture", face, "RUNS", "D1244 closed 2026-09-03");
+      // D1253's PRICE, NOW REPAID. Closing the bare-block floor made this cell reachable and
+      // it moved emit-refuses -> SILENT; D1244's frame moves it the rest of the way. A price
+      // pinned by name is what let this be read as repayment rather than noticed as a number.
+      wantVerdict(cells, "block_bare_capture", face, "RUNS", "D1253's price, repaid by D1244");
       wantVerdict(cells, "block_bare", face, "RUNS", "D1253 closed");
     }
-    if (code === 0) {
-      throw new Error("want a non-zero exit on D1244's silent ref-rep cells, got 0");
-    }
+    if (code !== 0) throw new Error(`want exit 0 once the ref reps run, got ${code}`);
   },
 });

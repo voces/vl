@@ -72,7 +72,7 @@ LOUD = ("loud check reject", "loud emit reject")
 # capability gaps: the type system permits the program and the backend cannot lower it.
 # Kept as the compiler's own words rather than a curated list, so a new gap is counted the
 # day it is written instead of the day someone remembers to add it here.
-# D958 — THE PHRASE LIST WAS ITSELF UNAUDITED, and it was reporting HALF the population.
+# #2122 — THE PHRASE LIST WAS ITSELF UNAUDITED, and it was reporting HALF the population.
 # The four phrases below caught 12 literals; the compiler carries 12 MORE that concede exactly
 # the same thing in the other word order — "not supported YET" rather than "not YET supported"
 # — plus "not yet implemented" and "not yet callable". Measured, not estimated: adding these
