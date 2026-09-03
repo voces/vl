@@ -4909,9 +4909,22 @@ same for a user module in the workspace graph, not only `std:`. Compile-goal tra
 D1230's diagnostic text and a stable diagnostic code carrying module + name, so the quick-fix
 keys on the code rather than parsing the sentence.
 
-**BUILT 2026-09-02 (tooling half).** All three tooling items ship; the compile-goal half
-(D1230's text + the `ufcs-not-imported` code) is still open, and the quick-fix already keys
-on that code with the current sentence as a fallback.
+**BUILT 2026-09-02 — BOTH HALVES.** The three tooling items ship, and so does the
+compile-goal half: the refusal names the missing import and carries the quick-fix's whole
+answer on the existing `diagCodeLen`/`diagCodeByte` channel, so the code action never parses
+the sentence. The fallback on the old message shape is therefore retired.
+
+    ufcs-not-imported;member=toEqual;modules=std:test;recv=Expectation<i32>
+
+`;`-separated, fixed order, `,` between module specifiers, and **`recv=` LAST** because a
+rendered type is the only field that can itself contain those characters (`A | B`,
+`{a: i32, b: i32}`) — read it as everything after the first `;recv=`. ONE diagnostic lists
+every candidate module, so the quick-fix emits one code action per entry in `modules=`
+rather than answering N squiggles on one token. Specifiers are spelled the way the file can
+write them TODAY: the file's own import text where it already imports the module, and the
+bare `std:` key where it does not. A RELATIVE module the file does not import is deliberately
+NOT offered — its key is a normalized path, and reconstructing a specifier relative to the
+entry is `..`-arithmetic that can name a different module.
 
 Three things the build settled that the ruling could not have known:
 
