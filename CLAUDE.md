@@ -126,6 +126,18 @@ loud→silent while its loud-emit column moved −126, so the regression was ari
 invisible. And a named set re-grades against any new seed in ~10 invocations, so use one rather
 than rebuilding its grid.
 
+**THE SEED'S SIZE IS A GATED NUMBER — `scripts/seed-size.py --check`.**
+`build/vl-compiler.wasm` is the compiler's own codegen of itself, so every emitter change is
+priced in its bytes — and that price was read only when somebody went looking: **+8.8% across
+four landings on 2026-09-03**, noticed because a peer asked. Same ratchet shape as the comment
+budget: a committed one-line `scripts/seed-size-baseline.json`, `--check` in `gate.sh` and in
+ci-native, `--write-baseline` in the SAME PR as the growth it records. It reds only above
+**+3%** — shrinkage and small growth print and pass, because the thing being defended is
+*nobody noticed*, not a byte target. **And the deciding reading is the FIXPOINT's**: one
+self-compile off a stale seed is the PREVIOUS compiler's output, so ci-native takes it straight
+after `--prove-fixpoint`. Rationale and both measurements: DECISIONS.md §"The seed's size is a
+per-landing number".
+
 ## "Zero silent rows" is a claim about the INVENTORY, not about VL
 
 The filed inventories hold ~199 hand-written rows. The distilled corpus holds **7,021 cells**.
@@ -501,6 +513,8 @@ The tree cannot reach zero in one PR, so both rules ride a RATCHET.
 FILE's count goes up; `--write-baseline` lowers it, in the same PR as the trim that earned it.
 `scripts/lint-self.sh` holds exactly these two codes out of its own `info` gate while the
 baseline still owes them — read FROM the baseline, so the exemption deletes itself at zero.
+**The baseline IS zero now (batch 7), so the exemption is gone and both rules gate at `info`
+like every other lint: a 13-line block or an uncited number fails `lint-self.sh` outright.**
 
 **A comment-only change must produce a BYTE-IDENTICAL seed.** That is the trim campaign's
 whole safety proof: `scripts/refresh-compiler.sh`, then `cmp` against a seed built from the
