@@ -520,6 +520,17 @@ like every other lint: a 13-line block or an uncited number fails `lint-self.sh`
 whole safety proof: `scripts/refresh-compiler.sh`, then `cmp` against a seed built from the
 pre-trim source. One byte different means you edited code, not comments.
 
+## A LADDER OVER A CLOSED KIND SET IS EXHAUSTIVE, OR ITS DEFAULT NAMES WHAT IT EXCLUDES
+
+Four in one week: no `nulvariant` rung (#2400), no `IfStmt` arm (D981), no unbounded-`TyVar`
+arm (D1004/D1221), no module-block arm (D1370). **A bare fall-through to `-1` / `""` / `false` /
+`0` satisfies nothing** — a NAMED default is an `emitFail`, a sentence, or a delegation to the
+ladder that owns the rest. `kind-ladder-incomplete` is the rule; `kind-ladder-split` is one walk
+across two functions where only one hands back. Ratchet: `python3 scripts/ladder-budget.py
+--check` (a gate row; it also re-derives every closed set from its `export type` and fails on
+drift). `scripts/ladder-census.py` is the discovery half — `--sets`, `--split`, and `--pred`
+for the form with no kind literal in it, which is the only place #2400's hole is visible.
+
 ## Claims about the tree
 
 `ROADMAP.md` and the design docs go stale one-directionally — a fixed defect keeps reading

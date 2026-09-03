@@ -191,9 +191,11 @@ export function lint(progRoot: i32) {
     lintWalk(lintRuleHasGuardReread, progRoot)
     lintWalk(lintRuleUnionLetNoMelt, progRoot)
     lintWalk(lintRuleUnusedPureExpr, progRoot)
-    // Not walks: neither comments nor a loop's SHAPE is in the arena. Both read the source
-    // the driver set, and `commentBudget` consumes it, so it runs last.
+    // Not walks: neither comments, nor a loop's SHAPE, nor a ladder's DEFAULT is in the
+    // arena. All three read the source the driver set, and `commentBudget` consumes it,
+    // so it runs last.
     arenaScanLint()
+    kindLadderLint()
     commentBudget()
   }
   lintCodes.length
@@ -2397,5 +2399,937 @@ function arenaScanLint() {
     i = e + 1
     line = line + 1
   }
+  0
+}
+
+// ── kind-ladder-incomplete / kind-ladder-split ───────────────────────────────
+//
+// A LADDER is a run of `if` / `else if` arms, inside ONE function, testing the SAME
+// subject against members of ONE closed set. It must be exhaustive over that set, or end
+// in a default that NAMES what it excludes — a refusal channel, a sentence, or a
+// delegation to the ladder that owns the rest. A bare fall-through to `-1` / `""` /
+// `false` / `0` names nothing: D1004/D1221, D981 and D1370 are three ways one did.
+//
+// `scripts/ladder-census.py` is the same walk over the whole tree; `ladder-budget.py` is
+// the per-file ratchet, and it RE-DERIVES every set below from the `export type` that
+// declares it, refusing to run when one has drifted.
+
+// BOUND: this reads the source text, not the arena, so a USER program declaring its own
+// `type Node = …` is graded against the compiler's. The tree this polices is this one.
+//
+// Two arms, not three: the floor is measured, not chosen. At one arm the
+// `const n = P.nodes[ix]; if n is X { … }` guard idiom floods (1,901 silent ladders);
+// two is 408 and three 248, and D1370's ladder has exactly two.
+const klMinArms = 2
+// A quoted run at least this long is a SENTENCE — a default that said something.
+const klMsgLen = 12
+
+// `AsMode` — compiler/ast.vl
+const klAsMode = ["prop", "null", "trap"]
+// `BtKind` — compiler/emit_classify.vl
+const klBtKind = ["f64", "f32", "i64"]
+// `LitKind` — compiler/typecheck.vl
+const klLitKind = ["str", "int", "flt"]
+// `MfKind` — compiler/emit_state.vl
+const klMfKind = ["i32", "f64", "ref", "str", "i64", "f32", "u8"]
+// `PushKind` — compiler/emit_classify.vl
+const klPushKind = ["i32", "ref", "str", "f64", "i64", "f32", "u8"]
+// `PrimName` — compiler/typecheck.vl
+const klPrimName = [
+  "i32",
+  "i64",
+  "f32",
+  "f64",
+  "boolean",
+  "string",
+  "void",
+  "null",
+  "never",
+  "u8",
+]
+// `Ty` — compiler/typecheck.vl
+const klTy = [
+  "TyPrim",
+  "TyErr",
+  "TyObj",
+  "TyFunc",
+  "TyUnion",
+  "TyNullable",
+  "TyArray",
+  "TyMap",
+  "TyVar",
+  "TyLit",
+  "TyNeg",
+]
+// `RtKind` — compiler/emit_rep.vl
+const klRtKind = [
+  "i32",
+  "bool",
+  "i64",
+  "f64",
+  "f32",
+  "str",
+  "u8",
+  "atom",
+  "list",
+  "map",
+  "box",
+  "closure",
+  "struct",
+  "nul",
+  "unsup",
+]
+// `EqCmpKind` — compiler/typecheck.vl
+const klEqCmpKind = [
+  "",
+  "str",
+  "scalar",
+  "closure",
+  "struct",
+  "none",
+  "list",
+  "strlist",
+  "reflist",
+  "glist",
+  "nulglist",
+  "nulstr",
+  "nulclosure",
+  "nulstruct",
+  "nullist",
+  "nulstrlist",
+  "nulreflist",
+]
+// `VKind` — compiler/emit_state.vl
+const klVKind = [
+  "i32",
+  "struct",
+  "list",
+  "str",
+  "union",
+  "reflist",
+  "map",
+  "strlist",
+  "variant",
+  "nulvariant",
+  "nulstruct",
+  "i64",
+  "f64",
+  "f64list",
+  "f32",
+  "closure",
+  "nullist",
+  "nulstr",
+  "nulbool",
+  "nulreflist",
+  "nulclosure",
+  "i64list",
+  "f32list",
+  "nulstrlist",
+  "nulf64list",
+  "nuli64list",
+  "nulf32list",
+  "nulu8list",
+  "nulmap",
+  "u8list",
+]
+// `Node` — compiler/ast.vl
+const klNode = [
+  "NumLit",
+  "StrLit",
+  "CharLit",
+  "BoolLit",
+  "NullLit",
+  "Ident",
+  "Unary",
+  "BinExpr",
+  "Call",
+  "Member",
+  "OptMember",
+  "Paren",
+  "ErrExpr",
+  "LetDecl",
+  "Param",
+  "TypeRef",
+  "FuncDecl",
+  "IfStmt",
+  "WhileStmt",
+  "BreakStmt",
+  "ContinueStmt",
+  "RetStmt",
+  "Block",
+  "Program",
+  "FieldDef",
+  "TypeDecl",
+  "FieldInit",
+  "ObjLit",
+  "ArrayLit",
+  "Index",
+  "UnionDecl",
+  "IsExpr",
+  "AsExpr",
+  "ForRange",
+  "ForIn",
+  "MatchExpr",
+  "ImportDecl",
+]
+// `TokKind` — compiler/lexer.vl
+const klTokKind = [
+  "",
+  "IDENT",
+  "NUMBER",
+  "STRING",
+  "CHAR",
+  "TEMPLATE",
+  "TEMPLATE_HEAD",
+  "TEMPLATE_MID",
+  "TEMPLATE_TAIL",
+  "NEWLINE",
+  "EOF",
+  "ERROR",
+  "IF",
+  "IS",
+  "IMPORT",
+  "FUNCTION",
+  "FOR",
+  "FALSE",
+  "CONST",
+  "CONTINUE",
+  "ELSE",
+  "EXPORT",
+  "TYPE",
+  "TRUE",
+  "RETURN",
+  "LET",
+  "WHILE",
+  "AWAIT",
+  "BREAK",
+  "MATCH",
+  "NULL",
+  "LPAREN",
+  "RPAREN",
+  "LBRACE",
+  "RBRACE",
+  "LBRACK",
+  "RBRACK",
+  "COMMA",
+  "SEMI",
+  "DOT",
+  "COLON",
+  "QUESTION",
+  "TILDE",
+  "PLUS",
+  "MINUS",
+  "STAR",
+  "SLASH",
+  "PERCENT",
+  "CARET",
+  "EQUAL",
+  "BANG",
+  "GT",
+  "LT",
+  "PIPE",
+  "AMPERSAND",
+  "PLUSPLUS",
+  "MINUSMINUS",
+  "PLUSEQ",
+  "MINUSEQ",
+  "STAREQ",
+  "SLASHEQ",
+  "SHL",
+  "AND",
+  "OR",
+  "QUESTION_DOT",
+  "QUESTION_QUESTION",
+  "EQ",
+  "NE",
+  "GE",
+  "LE",
+  "SHR",
+  "USHR",
+]
+
+// SMALLEST FIRST, so `klSetOf` can take the FIRST set that holds every arm and land on the
+// same answer the census's "smallest set containing them all" does.
+const klSetNames = [
+  "AsMode",
+  "BtKind",
+  "LitKind",
+  "MfKind",
+  "PushKind",
+  "PrimName",
+  "Ty",
+  "RtKind",
+  "EqCmpKind",
+  "VKind",
+  "Node",
+  "TokKind",
+]
+// 1 when the set's members are TYPE names (`x is TyObj`), 0 when they are string literals.
+const klSetIsType = [0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0]
+
+// The i-th set's members. A dispatch on an INDEX, not on a kind — the lint's own ladders
+// are over `i32`, so this rule cannot report itself.
+function klSetMembers(i: i32): string[] {
+  if i == 0 { return klAsMode }
+  if i == 1 { return klBtKind }
+  if i == 2 { return klLitKind }
+  if i == 3 { return klMfKind }
+  if i == 4 { return klPushKind }
+  if i == 5 { return klPrimName }
+  if i == 6 { return klTy }
+  if i == 7 { return klRtKind }
+  if i == 8 { return klEqCmpKind }
+  if i == 9 { return klVKind }
+  if i == 10 { return klNode }
+  if i == 11 { return klTokKind }
+  []
+}
+
+// The refusal channels a default may speak through. A ladder whose tail reaches one of
+// these has NAMED what it excludes, whatever it says.
+const klNamingCalls = [
+  "emitFail",
+  "emitFailAt",
+  "tErr",
+  "tErrAt",
+  "tErrUnsupported",
+  "pErr",
+  "lintEmit",
+  "panic",
+  "unreachable",
+  "diagPush",
+  "cliFail",
+]
+
+// ── the line index ───────────────────────────────────────────────────────────
+// Byte offsets of every line's start and its end (the `\r` and `\n` excluded). Built once
+// per module; three walks read it, and none of them re-splits the source.
+let klLnStart: i32[] = []
+let klLnEnd: i32[] = []
+
+function klIndexLines(s: string) {
+  klLnStart = []
+  klLnEnd = []
+  let i = 0
+  while i <= s.length {
+    let e = i
+    while e < s.length && s[e] != '\n' { e = e + 1 }
+    let le = e
+    if le > i && s[le - 1] == '\r' { le = le - 1 }
+    klLnStart.push(i)
+    klLnEnd.push(le)
+    i = e + 1
+  }
+  0
+}
+
+// ── reading a line without building one ──────────────────────────────────────
+// Every helper below walks the RAW source and steps over string / char literals in place.
+// Blanking each line into a fresh string would be quadratic in a pass that runs on every
+// keystroke; skipping is linear and reads the same, which is what lets the census (which
+// does blank, in Python, where it is cheap) agree with this walk line for line.
+
+// Index just past the literal opening at `i`, or `b`.
+function klSkipLit(s: string, i: i32, b: i32) {
+  const q = s[i]
+  let j = i + 1
+  while j < b && s[j] != q {
+    if s[j] == '\\' && j + 1 < b { j = j + 1 }
+    j = j + 1
+  }
+  if j < b { return j + 1 }
+  b
+}
+
+// Where the line's CODE ends: at its `//` comment, or at `b`. A `//` inside a literal is
+// text, not a comment, which is why this walks rather than searching.
+function klCodeEnd(s: string, a: i32, b: i32) {
+  let i = a
+  while i < b {
+    const c = s[i]
+    if c == '/' && i + 1 < b && s[i + 1] == '/' { return i }
+    if c == '"' || c == '\'' { i = klSkipLit(s, i, b) } else { i = i + 1 }
+  }
+  b
+}
+
+// Net `{` minus `}` over `[a, e)`, literals skipped.
+function klBraceDelta(s: string, a: i32, e: i32) {
+  let d = 0
+  let i = a
+  while i < e {
+    const c = s[i]
+    if c == '"' || c == '\'' {
+      i = klSkipLit(s, i, e)
+    } else {
+      if c == '{' { d = d + 1 }
+      if c == '}' { d = d - 1 }
+      i = i + 1
+    }
+  }
+  d
+}
+
+// A double-quoted run of `klMsgLen` characters or more — the tell that a default said
+// something rather than returning a sentinel.
+function klHasSentence(s: string, a: i32, e: i32) {
+  let i = a
+  while i < e {
+    const c = s[i]
+    if c == '\'' {
+      i = klSkipLit(s, i, e)
+    } else if c == '"' {
+      const j = klSkipLit(s, i, e)
+      if j - i - 2 >= klMsgLen { return true }
+      i = j
+    } else {
+      i = i + 1
+    }
+  }
+  false
+}
+
+// The first non-space, non-tab index in `[a, e)`, or `e`.
+function klIndentEnd(s: string, a: i32, e: i32) {
+  let i = a
+  while i < e && (s[i] == ' ' || s[i] == '\t') { i = i + 1 }
+  i
+}
+
+// End of the identifier at `i`, or -1 when none begins there (a digit does not).
+function klIdentEnd(s: string, i: i32, b: i32) {
+  if !cbWordAt(s, i, b) { return -1 }
+  if cbIsDigit(s[i]) { return -1 }
+  let j = i
+  while cbWordAt(s, j, b) { j = j + 1 }
+  j
+}
+
+// Index just past the `op`…`cl` group opening at `i`, or -1 when it never closes.
+function klCloser(s: string, i: i32, b: i32, op: i32, cl: i32) {
+  let d = 0
+  let j = i
+  while j < b {
+    if s[j] == op {
+      d = d + 1
+    } else if s[j] == cl {
+      d = d - 1
+      if d == 0 { return j + 1 }
+    }
+    j = j + 1
+  }
+  -1
+}
+
+// End of a SUBJECT starting at `i`: an identifier, then any run of `.field`, `[…]` and
+// `(…)`. The four spellings the tree dispatches on — `n`, `ot.primName`, `P.nodes[ix]`,
+// `kindAt(k)` — and nothing that is not one.
+function klSubjEnd(s: string, i: i32, b: i32) {
+  let j = klIdentEnd(s, i, b)
+  if j < 0 { return -1 }
+  let go = true
+  while go && j < b {
+    if s[j] == '.' && klIdentEnd(s, j + 1, b) > 0 {
+      j = klIdentEnd(s, j + 1, b)
+    } else if s[j] == '[' {
+      const k = klCloser(s, j, b, '[', ']')
+      if k < 0 { go = false } else { j = k }
+    } else if s[j] == '(' {
+      const k = klCloser(s, j, b, '(', ')')
+      if k < 0 { go = false } else { j = k }
+    } else {
+      go = false
+    }
+  }
+  j
+}
+
+// Where an ARM's test begins on this line, or -1. A test anywhere else — a `||`
+// continuation, an assignment, a `while` — is part of ONE boolean expression and not a
+// rung: `startsStmt` asks about seventeen token kinds in a single `||` chain and
+// dispatches on none of them.
+function klArmLead(s: string, a: i32, e: i32) {
+  const k = klIndentEnd(s, a, e)
+  if cbAt(s, k, e, "if ") { return k + 3 }
+  if cbAt(s, k, e, "} else if ") { return k + 10 }
+  if cbAt(s, k, e, "else if ") { return k + 8 }
+  -1
+}
+
+// `klTestAt`'s answer: the subject text, the member text, and 1 when the member is a TYPE
+// name. Read only after it returns true; it writes all three on every true.
+let klTSubj = ""
+let klTMem = ""
+let klTIsType = 0
+
+// The arm test beginning at `k`: a STRICT FORWARD PARSE — subject, then `is` / `!is` /
+// `==` / `!=`. So `if !p(x)`, `if i >= 0` and `if a && b is C` are not arms. A scan that
+// searched ANYWHERE past the `if` would read the second conjunct of a compound condition
+// as the ladder's rung, and the census would then disagree with this walk.
+function klTestAt(s: string, k: i32, b: i32) {
+  klTSubj = ""
+  klTMem = ""
+  klTIsType = 0
+  const p = cbSpacesEnd(s, k, b)
+  const e = klSubjEnd(s, p, b)
+  if e < 0 { return false }
+  const q = cbSpacesEnd(s, e, b)
+  let off = 0
+  if q > e && cbAt(s, q, b, "is ") { off = 3 }
+  if q > e && cbAt(s, q, b, "!is ") { off = 4 }
+  if off > 0 {
+    const r = cbSpacesEnd(s, q + off, b)
+    const me = klIdentEnd(s, r, b)
+    if me <= r { return false }
+    if s[r] < 'A' || s[r] > 'Z' { return false }
+    klTSubj = s.slice(p, e)
+    klTMem = s.slice(r, me)
+    klTIsType = 1
+    return true
+  }
+  if !cbAt(s, q, b, "==") && !cbAt(s, q, b, "!=") { return false }
+  const r = cbSpacesEnd(s, q + 2, b)
+  if r >= b { return false }
+  if s[r] != '"' { return false }
+  let j = r + 1
+  while j < b && s[j] != '"' { j = j + 1 }
+  if j >= b { return false }
+  klTSubj = s.slice(p, e)
+  klTMem = s.slice(r + 1, j)
+  klTIsType = 0
+  true
+}
+
+// ── functions ────────────────────────────────────────────────────────────────
+// TOP-LEVEL functions only, by a column-0 `function` / `export function` header; each body
+// runs to the line before the next header.
+let klFnName: string[] = []
+let klFnLo: i32[] = []
+let klFnHi: i32[] = []
+
+function klIndexFns(s: string) {
+  klFnName = []
+  klFnLo = []
+  klFnHi = []
+  let n = 0
+  while n < klLnStart.length {
+    const nm = asFnNameOf(s, klLnStart[n], klLnEnd[n])
+    if nm.length > 0 {
+      if klFnName.length > 0 { klFnHi[klFnName.length - 1] = n - 1 }
+      klFnName.push(nm)
+      klFnLo.push(n)
+      klFnHi.push(klLnStart.length - 1)
+    }
+    n = n + 1
+  }
+  0
+}
+
+// ── the default region ───────────────────────────────────────────────────────
+// What runs when no arm matched. From the last arm, count braces: the arm's own block is
+// skipped, and a `} else {` at the chain's depth hands the region to the ELSE BODY, which
+// IS the default. Everything from there to the end of the function is the tail.
+//
+// Without the brace walk the region is the whole rest of the function, and a message
+// inside the LAST ARM reads as a named default — the hole then hides behind the one arm
+// that does have words.
+
+// `else` occurs before this line's first `{` — the `} else {` that continues a chain.
+function klElseBeforeBrace(s: string, k: i32, e: i32) {
+  let i = k
+  while i < e {
+    if s[i] == '{' { return false }
+    if cbAt(s, i, e, "else") { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The tail's first line, or `hi + 1` when there is none.
+function klTailStart(s: string, last: i32, hi: i32) {
+  let depth = 0
+  let i = last
+  while i <= hi {
+    const a = klLnStart[i]
+    const e = klCodeEnd(s, a, klLnEnd[i])
+    const k = klIndentEnd(s, a, e)
+    if depth == 1 && k < e && s[k] == '}' && klElseBeforeBrace(s, k, e) {
+      return i + 1
+    }
+    depth = depth + klBraceDelta(s, a, e)
+    if depth <= 0 { return i + 1 }
+    i = i + 1
+  }
+  hi + 1
+}
+
+// True when `[a, e)` calls `target` by name, literals skipped.
+function klLineCallsName(s: string, a: i32, e: i32, target: string) {
+  let i = a
+  while i < e {
+    const c = s[i]
+    if c == '"' || c == '\'' {
+      i = klSkipLit(s, i, e)
+    } else {
+      const j = klIdentEnd(s, i, e)
+      if j < 0 {
+        i = i + 1
+      } else {
+        const p = cbSpacesEnd(s, j, e)
+        if p < e && s[p] == '(' && s.slice(i, j) == target { return true }
+        i = j
+      }
+    }
+  }
+  false
+}
+
+// True when the line calls a refusal channel or a top-level function of this module.
+function klLineCallsAny(s: string, a: i32, e: i32) {
+  let i = a
+  while i < e {
+    const c = s[i]
+    if c == '"' || c == '\'' {
+      i = klSkipLit(s, i, e)
+    } else {
+      const j = klIdentEnd(s, i, e)
+      if j < 0 {
+        i = i + 1
+      } else {
+        const p = cbSpacesEnd(s, j, e)
+        if p < e && s[p] == '(' {
+          const nm = s.slice(i, j)
+          if asListHas(klNamingCalls, nm) { return true }
+          if asListHas(klFnName, nm) { return true }
+        }
+        i = j
+      }
+    }
+  }
+  false
+}
+
+// True when the DEFAULT names what the ladder excludes: a refusal channel, a sentence long
+// enough to be one, or a delegation to another function of this module.
+function klTailNames(s: string, last: i32, hi: i32) {
+  const ts = klTailStart(s, last, hi)
+  let i = ts
+  // A one-line `if c { … } else { … }` closes and reopens on the same line, so its else
+  // body has nowhere else to be read: the arm's own line joins the tail.
+  const la = klLnStart[last]
+  const le = klCodeEnd(s, la, klLnEnd[last])
+  if ts == last + 1 && cbFind(s, la, le, "else") { i = last }
+  while i <= hi {
+    const a = klLnStart[i]
+    const e = klCodeEnd(s, a, klLnEnd[i])
+    if klHasSentence(s, a, e) { return true }
+    if klLineCallsAny(s, a, e) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// True when the tail of the ladder ending at `last` calls `target` — a DELEGATING default,
+// which is what makes a pair of ladders one split walk rather than two functions that
+// happen to call each other.
+function klTailCalls(s: string, last: i32, hi: i32, target: string) {
+  let i = klTailStart(s, last, hi)
+  while i <= hi {
+    const a = klLnStart[i]
+    const e = klCodeEnd(s, a, klLnEnd[i])
+    if klLineCallsName(s, a, e, target) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// True when function `f`'s BODY calls `target` anywhere — the reachability half of the
+// split rule, where the tail is the delegation half.
+function klBodyCalls(s: string, f: i32, target: string) {
+  let i = klFnLo[f]
+  while i <= klFnHi[f] {
+    const a = klLnStart[i]
+    const e = klCodeEnd(s, a, klLnEnd[i])
+    if klLineCallsName(s, a, e, target) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// ── grading a group of arms ──────────────────────────────────────────────────
+// The closed set a group of arms is a ladder over: the FIRST — so, the smallest — set
+// holding every one of them. -1 when no set holds them all, which means the arms are not
+// one vocabulary and the group is not a ladder.
+function klSetOf(mems: string[], a: i32, n: i32, isType: i32) {
+  let si = 0
+  while si < klSetNames.length {
+    if klSetIsType[si] == isType {
+      const ms = klSetMembers(si)
+      let ok = true
+      let k = 0
+      while k < n {
+        if !asListHas(ms, mems[a + k]) { ok = false }
+        k = k + 1
+      }
+      if ok { return si }
+    }
+    si = si + 1
+  }
+  -1
+}
+
+// The ladders this module declares, in source order. Flat parallel arrays: the arm names
+// live in one `klLadMem` run per ladder, addressed by start + count.
+let klLadFn: i32[] = []
+let klLadSet: i32[] = []
+let klLadMem: string[] = []
+let klLadMemAt: i32[] = []
+let klLadMemN: i32[] = []
+let klLadLine: i32[] = []
+let klLadCol: i32[] = []
+let klLadLast: i32[] = []
+
+// Per-function scratch: one group per (subject, member kind), its arms appended to
+// `klGMem` in first-seen order.
+let klGSubj: string[] = []
+let klGType: i32[] = []
+let klGFirst: i32[] = []
+let klGCol: i32[] = []
+let klGLast: i32[] = []
+let klGSeen: i32[] = []
+let klGMem: string[] = []
+let klGOwner: i32[] = []
+
+// The group index for `subj` at this member kind, appending one when it is new.
+function klGroupFor(subj: string, isType: i32) {
+  let g = 0
+  while g < klGSubj.length {
+    if klGSubj[g] == subj && klGType[g] == isType { return g }
+    g = g + 1
+  }
+  klGSubj.push(subj)
+  klGType.push(isType)
+  klGFirst.push(0)
+  klGCol.push(0)
+  klGLast.push(0)
+  klGSeen.push(0)
+  klGSubj.length - 1
+}
+
+// `mem` is already an arm of group `g`.
+function klGroupHas(g: i32, mem: string) {
+  let i = 0
+  while i < klGMem.length {
+    if klGOwner[i] == g && klGMem[i] == mem { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The arms `x` tests and `y` does not.
+function klArmsMissing(x: i32, y: i32) {
+  const out: string[] = []
+  let i = 0
+  while i < klLadMemN[x] {
+    const m = klLadMem[klLadMemAt[x] + i]
+    let found = false
+    let j = 0
+    while j < klLadMemN[y] {
+      if klLadMem[klLadMemAt[y] + j] == m { found = true }
+      j = j + 1
+    }
+    if !found { out.push(m) }
+    i = i + 1
+  }
+  out
+}
+
+// The first six names, then `…` — a diagnostic names the shape, the census lists the set.
+function klJoinFirst(xs: string[]) {
+  let out = ""
+  let i = 0
+  while i < xs.length && i < 6 {
+    if i > 0 { out = out + " " }
+    out = out + xs[i]
+    i = i + 1
+  }
+  if xs.length > 6 { out = out + " …" }
+  out
+}
+
+// Grade one group and, when it is an incomplete ladder, record it and report a silent one.
+function klRecordLadder(s: string, f: i32, g: i32) {
+  if klGSeen[g] < klMinArms { return 0 }
+  const at = klLadMem.length
+  let n = 0
+  let i = 0
+  while i < klGMem.length {
+    if klGOwner[i] == g {
+      klLadMem.push(klGMem[i])
+      n = n + 1
+    }
+    i = i + 1
+  }
+  const si = klSetOf(klLadMem, at, n, klGType[g])
+  // Not one vocabulary, or exhaustive over it — either way there is no default to name.
+  if si < 0 || n >= klSetMembers(si).length {
+    while klLadMem.length > at { klLadMem.pop() }
+    return 0
+  }
+  const total = klSetMembers(si).length
+  klLadFn.push(f)
+  klLadSet.push(si)
+  klLadMemAt.push(at)
+  klLadMemN.push(n)
+  klLadLine.push(klGFirst[g] + 1)
+  klLadCol.push(klGCol[g])
+  klLadLast.push(klGLast[g])
+  if !klTailNames(s, klGLast[g], klFnHi[f]) {
+    lintEmitAtPos(
+      "kind-ladder-incomplete",
+      "`" +
+        klFnName[f] +
+        "` tests " +
+        cbNumStr(n) +
+        " of " +
+        cbNumStr(total) +
+        " " +
+        klSetNames[si] +
+        " kinds and ends without naming the rest — add the missing arms or an `emitFail`/message default that lists them",
+      "warning",
+      klGFirst[g] + 1,
+      klGCol[g],
+    )
+  }
+  0
+}
+
+// Collect one function's groups, then record every one that is a ladder.
+function klScanFn(s: string, f: i32) {
+  klGSubj = []
+  klGType = []
+  klGFirst = []
+  klGCol = []
+  klGLast = []
+  klGSeen = []
+  klGMem = []
+  klGOwner = []
+  let i = klFnLo[f]
+  while i <= klFnHi[f] {
+    const a = klLnStart[i]
+    const e = klCodeEnd(s, a, klLnEnd[i])
+    const lead = klArmLead(s, a, e)
+    if lead >= 0 && klTestAt(s, lead, e) {
+      const g = klGroupFor(klTSubj, klTIsType)
+      if !klGroupHas(g, klTMem) {
+        klGMem.push(klTMem)
+        klGOwner.push(g)
+        klGSeen[g] = klGSeen[g] + 1
+      }
+      if klGSeen[g] == 1 {
+        klGFirst[g] = i
+        klGCol[g] = klIndentEnd(s, a, e) - a
+      }
+      klGLast[g] = i
+    }
+    i = i + 1
+  }
+  let g = 0
+  while g < klGSubj.length {
+    klRecordLadder(s, f, g)
+    g = g + 1
+  }
+  0
+}
+
+// ── the split walk ───────────────────────────────────────────────────────────
+// One walk over one enum, SPLIT by syntactic position into two ladders that cover
+// disjoint subsets and hand the rest to each other. D981 is the worked instance: the
+// statement half tested `IfStmt` and its default delegated to the expression half, which
+// tested no `IfStmt` and handed nothing back, so an `if`-expression arm fell out of the
+// rename entirely and one import blanked module scope inside it.
+//
+// The criterion is the ONE-WAY drop, not the union gap: a pair that hands back in BOTH
+// directions (`urcExprClean` / `urcStmtFlags`) legitimately omits the leaf kinds neither
+// can reach, and reporting it would say nothing a reader can act on.
+
+// Report `x` and `y` when x's DEFAULT delegates to y, y's body calls x back, and y drops
+// a kind x tests.
+function klGradePair(s: string, x: i32, y: i32) {
+  const fx = klLadFn[x]
+  const fy = klLadFn[y]
+  if !klTailCalls(s, klLadLast[x], klFnHi[fx], klFnName[fy]) { return 0 }
+  if klTailCalls(s, klLadLast[y], klFnHi[fy], klFnName[fx]) { return 0 }
+  if !klBodyCalls(s, fy, klFnName[fx]) { return 0 }
+  const drops = klArmsMissing(x, y)
+  if drops.length == 0 { return 0 }
+  lintEmitAtPos(
+    "kind-ladder-split",
+    "`" +
+      klFnName[fx] +
+      "` and `" +
+      klFnName[fy] +
+      "` split the " +
+      klSetNames[klLadSet[x]] +
+      " ladder: this default hands the rest to `" +
+      klFnName[fy] +
+      "`, which hands none back, so " +
+      cbNumStr(drops.length) +
+      " kinds only `" +
+      klFnName[fx] +
+      "` tests fall through it — " +
+      klJoinFirst(drops),
+    "warning",
+    klLadLine[x],
+    klLadCol[x],
+  )
+  1
+}
+
+// ONE diagnostic per FUNCTION PAIR, not per ladder pair: `parseBlock` and `parseStmt`
+// each carry two TokKind ladders and reported the same sentence twice at the same
+// position, which reads as a doubled finding rather than one split walk.
+let klSplitDone: string[] = []
+
+function klSplitWalks(s: string) {
+  klSplitDone = []
+  let x = 0
+  while x < klLadFn.length {
+    let y = 0
+    while y < klLadFn.length {
+      if x != y && klLadSet[x] == klLadSet[y] && klLadFn[x] != klLadFn[y] {
+        const key = cbNumStr(klLadFn[x]) + ":" + cbNumStr(klLadFn[y])
+        if !asListHas(klSplitDone, key) {
+          if klGradePair(s, x, y) == 1 { klSplitDone.push(key) }
+        }
+      }
+      y = y + 1
+    }
+    x = x + 1
+  }
+  0
+}
+
+// One pass to index the module, one per function to collect its ladders, and one over the
+// recorded ladders for the split rule. Linear in bytes for the first two; the third is
+// quadratic in LADDERS, of which the largest module has under two hundred.
+function kindLadderLint() {
+  const s = cbSource
+  klLadFn = []
+  klLadSet = []
+  klLadMem = []
+  klLadMemAt = []
+  klLadMemN = []
+  klLadLine = []
+  klLadCol = []
+  klLadLast = []
+  klIndexLines(s)
+  klIndexFns(s)
+  let f = 0
+  while f < klFnName.length {
+    klScanFn(s, f)
+    f = f + 1
+  }
+  klSplitWalks(s)
   0
 }

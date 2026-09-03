@@ -82,6 +82,10 @@ run "seed size"                python3 scripts/seed-size.py --check
 # is a `warning` lint-self.sh holds out while the baseline is non-zero, so this is
 # what stops a whole-program scan being added outside a pass. #2419's class.
 run "arena-scan budget"        python3 scripts/scan-budget.py --check
+# The kind-ladder RATCHET, third of the same shape: a ladder over a closed kind set is
+# exhaustive over it or its default NAMES what it excludes. Also re-derives the lint's
+# copy of every closed set from the `export type` that declares it and FAILS on drift.
+run "kind-ladder budget"       python3 scripts/ladder-budget.py --check
 # THE SHAPE FAMILY: seven pairs, same work, one axis reshaped, graded on the TIME
 # RATIO so machine speed and box load cancel. ~16-25 s; it is the only gate here
 # whose verdict is a measurement, and it reds on the pre-#2419 compiler.
