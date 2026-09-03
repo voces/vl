@@ -1,46 +1,31 @@
-// A type-checker for a meaningful subset of VL, written in VL
-// (Track H / H3 self-hosting — the compiler stage after the lexer and parser).
+// A type-checker for a meaningful subset of VL, written in VL — the compiler stage
+// between the parser and the emitter. It consumes the REAL parser's node arena
+// (`P.nodes`): it lexes nothing and parses nothing itself, it walks the union AST the
+// parser built. The TS side-by-side it was ported from (`compiler/typecheck.ts`) and
+// the driver that concatenated the stages are both GONE — the compiler is a real
+// `import`/`export` module graph rooted at `compiler/entry.vl`.
 //
-// Side-by-side with `compiler/typecheck.ts`, whose SHAPE it follows (a type
-// algebra, a scope chain, inference from initializers, structural assignability,
-// a diagnostics channel) but reimplemented idiomatically for VL — it is NOT a
-// transliteration. VL has no module system yet, so the TS driver
-// (`tests/selfhost_typecheck_test.ts`) concatenates `compiler/ast.vl`,
-// `compiler/parser.vl`, this file, then a `.vl` harness before compiling, so the
-// AST types/constructors, the global parser state `P`, the parse entry points,
-// and `i32ToStr` are already in scope. The checker consumes the REAL parser's
-// node arena (`P.nodes`): it lexes nothing and parses nothing itself, it walks
-// the union AST the parser built.
+// —— the type algebra is a TYPE ARENA ————————————————————————————————————————
+// A `type` union alias cannot self- or forward-reference its own members, so a
+// recursive `VLType` is not expressible in VL. Types therefore live in a flat arena
+// `T.tys: Ty[]` and every place a type would nest another holds an `i32` INDEX into
+// it — `TyObj.objFieldTypes`, `TyFunc.fnParamTypes` / `fnRet`, `TyUnion.uMembers`,
+// `TyNullable.nInner`. Same workaround the AST node arena uses (`ast.vl`), applied to
+// the type algebra.
 //
-// ── Finding 1 — the type algebra is a TYPE ARENA ─────────────────────────────
-// VL's `compiler/typecheck.ts` represents types as a RECURSIVE union `VLType`
-// whose members nest more `VLType`s (an `Object` property's type is a `VLType`, a
-// `Function`'s return is a `VLType`). That encoding is NOT expressible in VL: a
-// `type` union alias cannot self- or forward-reference its own members (the same
-// limitation that forced the AST to use arena indices for child nodes — see
-// `ast.vl`). So types live in their OWN flat arena `T.tys: Ty[]` and every place
-// a type would nest another type holds an `i32` INDEX into that arena instead:
-//   - `TyObj.objFieldTypes : i32[]`  (a field's type is a type-arena index)
-//   - `TyFunc.fnParamTypes : i32[]`, `TyFunc.fnRet : i32`
-//   - `TyUnion.uMembers : i32[]`, `TyNullable.nInner : i32`
-// This is the same workaround the AST node arena uses, applied to the type
-// algebra — the predicted gap, now confirmed (PR gap inventory #1).
+// —— the visitor is FACTORED, not one mega-function ——————————————————————————
+// Two mutually recursive functions that `is`-narrowed the SAME union once miscompiled,
+// which forced every per-variant body inline into `checkNode`. That host bug is FIXED
+// and pinned by `tests/cases/types/union-two-visitors.vl` and
+// `union-narrowed-helper-recursion.vl`, so per-kind helpers (`checkCallNode`,
+// `checkFuncDeclNode`, `checkProgramNode`) take the NARROWED variant as a struct
+// parameter, narrow further `Node` children themselves, and recurse back through
+// `checkNode`. Remaining small arms stay inline for readability, not out of necessity.
 //
-// ── Finding 2 (RESOLVED) — the mono-visitor constraint is lifted ─────────────
-// Historically, two distinct functions that `is`-narrowed the SAME union and were
-// mutually recursive through it MISCOMPILED ("Object has no field …"), which forced
-// every per-variant body to be INLINED into the single `checkNode` mega-function.
-// That host bug is FIXED — pinned by `tests/cases/types/union-two-visitors.vl` and
-// `union-narrowed-helper-recursion.vl` — so the visitor is now factored naturally:
-// per-kind helpers (`checkCallNode`, `checkFuncDeclNode`, `checkProgramNode`) take
-// the NARROWED variant as a struct parameter, narrow further `Node` children
-// themselves, and recurse back through `checkNode`. Remaining small arms stay
-// inline in `checkNode` for readability, not out of necessity.
-//
-// Checker state lives in the global `T` (a `Checker` struct), like the parser's
-// `P` — a style choice for call-site brevity. (The old struct-param-into-recursive-
-// group miscompile is also fixed, pinned by
-// `tests/cases/functions/struct-param-mutual-recursion-global.vl`.)
+// Checker state lives in the global `T` (a `Checker` struct), like the parser's `P` —
+// a style choice for call-site brevity. The struct-param-into-recursive-group
+// miscompile is fixed too, pinned by
+// `tests/cases/functions/struct-param-mutual-recursion-global.vl`.
 
 // The AST data layer (`compiler/ast.vl`): the global parser state `P` (whose
 // `P.nodes` arena the checker walks), the int→string helper, and every `Node`
@@ -207,63 +192,18 @@ import {
   symVisSL,
 } from "./check_state"
 
-// ── THE TYPE-NAME GRAMMARS AND THE BRACKET-DEPTH WALK: THE HOME IS `tyname.vl` ────────
-//
-// Twenty-one pure character grammars over a type-name STRING used to live in THIS file,
-// because until #1228 this was the lowest module both the checker and the emitter could
-// reach (`emit_base.vl` imports this one, so a home up there was unreachable from here —
-// eight headers in this file said so). They now live one module further down, in
-// `compiler/tyname.vl`, a LEAF with zero imports: every body is a pure function of a
-// string, which is what makes the extra module free rather than a new cycle risk.
-//
-// Phase 0 published all twenty uniformly from HERE and this line was a re-export — an
-// import that also publishes — so every call site in this file, plus `emit_base.vl`'s
-// `import`/`export … from "./typecheck"` lines and `driver.vl`'s `gaeLtAt`, compiled
-// untouched and phase 0 changed no emitter module. **That is no longer the arrangement.**
-// D-TYNAMEHOME phase 1 re-pointed all nine consumers at the home (1a `emit_classify` +
-// `emit_base`, 1b `emit_collect` + `emit_mono`, 1c `emit_rewrite` + `driver` + `emit_rep` +
-// `emit_sections`), so NOTHING reaches `tyname.vl` through this file any more and the
-// re-export is a plain `import`. `emit_base.vl`'s republishing line is likewise gone, so the
-// three-hop chase (`tyname` → `typecheck` → `emit_base` → an emitter module) is out of the
-// tree: every consumer is now exactly ONE hop from the home.
-//
-// The set shrank TWENTY → SEVENTEEN with the line's demotion, and the seventeen are exactly
-// the grammars this file itself calls. `parenEnclosesWhole` and `tyGtIsClose` had no
-// consumer through here from the moment phase 0 published all twenty uniformly, and
-// `peelGroupParens` lost its last one (`emit_base`) in 1a. Unpublishing is resolver-enforced,
-// not asserted: dropping a name a consumer still wants makes the compiler refuse to build
-// itself and NAME the consumers, and these three produce no such error.
-//
-// ── PHASE 2 PUT A REPUBLISHING LINE BACK; THE FOLLOW-UP IT FILED IS NOW DISCHARGED ─────
-// D-TYNAMEHOME phase 2 moved `splitUnionAtoms` / `unionMemberCount` down to the leaf and
-// could not re-point every consumer — `emit_base.vl`, `emit_classify.vl` and `wasmEmit.vl`
-// were HELD by concurrent slices — so it parked an
-// `export { splitUnionAtoms, unionMemberCount } from "./tyname"` line here, exactly the
-// shape #1236 deleted, to keep their imports resolving with ZERO held-file edits. **That
-// line is gone.** The three files came free; their FIVE entries now name `./tyname`, and the
-// two grammars reach this file's own five call sites through the plain `import` below like
-// the other twenty-six. Nothing in the tree republishes a grammar again, and the leaf's ten
-// importers are ten ONE-hop edges — the arrangement #1236 reached and phase 2 dented.
-//
-// **THE RE-POINT SET IS RESOLVER-DERIVED, NOT GREPPED, AND IT IS NOT THE SET THE QUEUE
-// ENTRY NAMED.** Deleting the line makes the compiler refuse to build itself and enumerate
-// the consumers: `emit_base.vl` (2 entries), `emit_classify.vl` (2), `wasmEmit.vl` (1) —
-// FIVE entries in THREE files, re-derived by this cleanup and identical to phase 2's own
-// run. D-SPLITDOWN's queue entry priced phase 2 at "six import lines in three files —
-// `emit_rep`, `wasmEmit`, `emit_collect`" and did not list `emit_base` or `emit_classify` at
-// all. Unpublishing stays resolver-enforced rather than asserted, in both directions: a
-// control build with ZERO `is not exported by` errors is the whole proof that no consumer
-// was left behind.
-//
-// **PHASE 2'S FILING PREDICTED THIS IMPORT WOULD GO 17 → 19; IT READ 26 → 28.** Seventeen
-// was phase 1's number and it went stale the moment W1/W2/W4/W7/W14 moved nine further
-// grammars into the leaf and added them to the list below. A count carried forward in a
-// comment drifts on exactly the slices that touch the list it describes — the same shape
-// this programme already recorded for `tyname.vl`'s own IN roster.
-//
-// A module line must sit with the other module lines: `vl fmt` hoists `import` and
-// `export … from` to the top of the file, so a module line parked at the grammars' old
-// position is not format-stable — it round-trips to here, dragging its comment along.
+// —— THE TYPE-NAME GRAMMARS: THE HOME IS `tyname.vl` ————————————————————————————
+// The pure character grammars over a type-name STRING live in `compiler/tyname.vl`, a
+// LEAF with zero imports — every body is a pure function of a string, which is what
+// makes the extra module free rather than a new cycle risk. NOTHING republishes one:
+// no `export … from "./tyname"` line stands in the tree, so every consumer is exactly
+// ONE hop from the home and the line below is a plain `import`.
+// UNPUBLISHING IS RESOLVER-ENFORCED, NOT GREPPED: dropping a name a consumer still
+// wants makes the compiler refuse to build itself and NAME the consumers, so a control
+// build with zero `is not exported by` errors is the proof nothing was left behind.
+// Never carry a COUNT of this list forward; it drifts on the very slices that move a
+// grammar into the leaf (`docs/internals/destringify-types-program.md`).
+// A module line must sit with the other module lines — `vl fmt` hoists them to the top.
 import {
   annGenAppSpanEnds,
   arrElemNameRaw,
@@ -466,19 +406,16 @@ function diagDataField(key: string, val: string) {
 // pass `vl check`.
 const CODE_UNSUPPORTED_LOWERING = "unsupported-lowering"
 
-// D1230's category code — a BARE category, like every code on this channel. Its
-// answer travels on the DATA channel (`ufcsNotImportedData`) under three keys:
-//
+// D1230's category code — a BARE category, like every code on this channel. Its answer
+// travels on the DATA channel (`ufcsNotImportedData`) under three keys:
 //   * `member` — the property AS WRITTEN.
-//   * `modules` — ONE FIELD PER candidate module, each spelled the way the file
-//     can write it TODAY (an existing import's own text, or a `std:` specifier),
-//     in the registry's dependency-first order and deduplicated.
+//   * `modules` — ONE FIELD PER candidate module, each spelled the way the file can
+//     write it TODAY (an existing import's own text, or a `std:` specifier), in the
+//     registry's dependency-first order and deduplicated.
 //   * `recv` — the rendered receiver type, demangled.
-//
-// THE QUICK-FIX MUST NEVER PARSE THE SENTENCE: the wording is free to improve and
-// these keys are not. ONE DIAGNOSTIC PER CALL lists every candidate module,
-// because the fix is one choice among them — N diagnostics would stack N squiggles
-// on one token.
+// THE QUICK-FIX MUST NEVER PARSE THE SENTENCE: the wording is free to improve and these
+// keys are not. ONE DIAGNOSTIC PER CALL lists every candidate module, because the fix is
+// one choice among them — N diagnostics would stack N squiggles on one token.
 const CODE_UFCS_NOT_IMPORTED = "ufcs-not-imported"
 
 // ── Checker state (one struct, held in the global `T`) ───────────────────────
@@ -523,20 +460,17 @@ let scopeEC: i32[] = []
 // equivalent (and keeps the full compiler self-emittable). Reset by `initChecker`.
 export let cUserTypes: {[string]: i32} = Map()
 
-// ── Arena-mutation generations (the emit-side repOf memo invalidation) ───────
-// `tyMutEpoch` advances on EVERY in-place mutation of an EXISTING `T.tys` entry
-// — empty-collection pinning (`aElem`/`mKey`/`mVal`/`nInner`), return-inference
-// patching (`fnRet`), hole-shape field recording — i.e. any event that can
-// change a type's canonical structural key (`repCanonKey`, emit_rep.vl). Its
-// memos there are stamped with this epoch; a stale stamp discards the memo, so
-// a bump is always SAFE (worst case a recompute) while a MISSED bump is a
-// soundness bug (a stale key could merge/split struct slots wrongly). Minting a
-// NEW arena index needs no bump: no existing type's key walk can reach it.
-// `cUserTypesVer` advances on every `cUserTypes` WRITE (decl registration,
-// `resolveAnnot` memoization) — any event that can change which declared arena
-// index a struct-slot NAME resolves to (the `repSlotOfTy` scan input). Both
-// also advance in `initChecker`: the arena is re-minted per program, so no memo
-// stamped under an earlier program may survive on a shared instance.
+// —— Arena-mutation generations (the emit-side repOf memo invalidation) ——————————
+// `tyMutEpoch` advances on EVERY in-place mutation of an existing `T.tys` entry —
+// empty-collection pinning, return-inference patching, hole-shape field recording —
+// i.e. any event that can change a type's canonical structural key (`repCanonKey`,
+// emit_rep.vl), whose memos are stamped with this epoch. A bump is always SAFE (worst
+// case a recompute); a MISSED bump is a soundness bug, since a stale key can merge or
+// split struct slots wrongly. Minting a NEW arena index needs no bump: no existing
+// type's key walk can reach it. `cUserTypesVer` advances on every `cUserTypes` WRITE —
+// any event that can change which declared arena index a struct-slot NAME resolves to
+// (the `repSlotOfTy` scan input). Both also advance in `initChecker`: the arena is
+// re-minted per program, so no memo stamped under an earlier program may survive.
 export let tyMutEpoch = 0
 export let cUserTypesVer = 0
 
@@ -550,26 +484,17 @@ export let cUserTypesVer = 0
 let gaNames: string[] = []
 let gaDeclIxs: i32[] = []
 
-// D-GAPARAM — the declared type-PARAMETER NAMES, as a flat column plus a
-// (start, count) slice per alias, the same shape the spelling arena uses for its
-// kids (`tsKids`/`tsKidStart`/`tsKidCount`).
+// D-GAPARAM — the declared type-PARAMETER NAMES, as a flat column plus a (start, count)
+// slice per alias, the same shape the spelling arena uses for its kids
+// (`tsKids`/`tsKidStart`/`tsKidCount`).
 //
-// This column used to be `gaParamLists: string[]`, ONE COMMA-JOINED STRING per
-// alias ("T", "A,B") that `applyGenAliasArgs` split back apart with
-// `splitGenArgs` on EVERY APPLICATION. The joining is not this file's doing:
-// `parser.vl`'s `parseTypeDecl` folds the parameter TOKENS into the declared
-// name (`name = name + ","` per parameter) and its own comment says "the checker
-// splits them back out" — so a list the parser held as tokens was joined into a
-// string, sliced back out of that string here at registration, and then
-// re-split at every use. Splitting ONCE at registration removes the per-
-// application parse and the per-application `string[]` it allocated; the arity
-// check and the binding loop read `gaParamCount` / `gaParamNames[start + k]`
-// directly.
-//
-// The remaining half is a HAND-OFF to whoever owns `parser.vl` + `ast.vl`: bank
-// the parameter names on the `TypeDecl` node (a `string[]` beside `tdFields`, or
-// the same flat-column shape) and the `<`-scan-and-slice at registration goes
-// too — a name is then only ever a name, never a list the checker takes apart.
+// It replaces a `gaParamLists: string[]` that held ONE COMMA-JOINED STRING per alias
+// ("T", "A,B") and was re-split with `splitGenArgs` on EVERY APPLICATION. `parser.vl`'s
+// `parseTypeDecl` still folds the parameter TOKENS into the declared name, so the `<`
+// scan-and-slice happens ONCE here at registration; the arity check and the binding loop
+// then read `gaParamCount` / `gaParamNames[start + k]` directly, with no per-application
+// parse and no per-application `string[]`. Banking the names on the `TypeDecl` node would
+// retire that last scan too (`docs/internals/destringify-types-program.md`).
 let gaParamNames: string[] = []
 let gaParamStart: i32[] = []
 let gaParamCount: i32[] = []
@@ -608,23 +533,18 @@ function tpBoundOfName(name: string) {
   -1
 }
 
-// ── the coherence ledger (OQ-3 as ruled) ────────────────────────────────────
+// —— the coherence ledger (OQ-3 as ruled) ————————————————————————————————————
 // VL compiles WHOLE-PROGRAM, which is what lets satisfaction be judged in each
-// instantiation site's own scope AND still be coherent: every site is visible to
-// one compiler run, so a disagreement can be named instead of legislated away by
-// an orphan rule. One row per (generic function, instantiation type, bound member)
-// that some site resolved; a second site resolving the same key to a DIFFERENT
-// witness is the refusal, and it names both sites.
-//
-// THE KEY IS `tyToStr`, NOT AN ARENA INDEX, and that is a correction to the plan
-// this was built from. The checker's type arena is APPEND-ONLY — `addTy` pushes
-// unconditionally, so `mkArrayTy(TY_I32)` twice yields two indices for one type
-// and there is no hash-consing to key on. `tyToStr` is the checker's canonical
-// renderer and `tyEq`'s exact string equivalent (that equivalence is `tyEq`'s
-// documented contract), and it folds nominality in, so a newtype keys apart from
-// its base. It is NOT `canon`/`tyToEmitName`, the emit-side spelling-dependent
-// renderer CLAUDE.md warns about; that one runs a phase later and answers a
-// different question.
+// instantiation site's own scope AND still be coherent: every site is visible to one
+// run, so a disagreement can be named instead of legislated away by an orphan rule.
+// One row per (generic function, instantiation type, bound member) that some site
+// resolved; a second site resolving the same key to a DIFFERENT witness is the refusal,
+// and it names both sites.
+// THE KEY IS `tyToStr`, NOT AN ARENA INDEX: the arena is APPEND-ONLY (`addTy` pushes
+// unconditionally, so `mkArrayTy(TY_I32)` twice yields two indices for one type) and
+// there is no hash-consing to key on. `tyToStr` is `tyEq`'s exact string equivalent and
+// folds nominality in, so a newtype keys apart from its base — it is NOT `canon` /
+// `tyToEmitName`, the spelling-dependent emit-side renderer that runs a phase later.
 let cohKeys: string[] = []
 let cohWitness: string[] = []
 let cohSiteLine: i32[] = []
@@ -653,33 +573,18 @@ let holeArrayDemand: string[] = []
 let holeMapNames: string[] = []
 let holeMapTys: i32[] = []
 
-// ALTERNATIVE hole constraints contributed by an `is` GUARD over the hole itself:
-//
-//     function foobar(v) {
-//       if v is {foo: string} { return v.foo }
-//       return v.bar
-//     }
-//
-// Inside the then-branch `v` is NARROWED to `{foo: string}`, so `v.foo` reads the
-// narrowed binding and never grows the demanded shape — only the fall-through
-// `v.bar` does. The shape therefore records the constraint of the COMPLEMENT path
-// ALONE (`{bar: any}`), and checking every argument against it rejects the very
-// argument the guard exists to accept. The tested types are ALTERNATIVES, not
-// additional fields, so they are recorded here and the call-arg check accepts an
+// ALTERNATIVE hole constraints contributed by an `is` GUARD over the hole itself.
+// Inside `if v is {foo: string} { return v.foo }` the narrowed binding is read, so the
+// demanded shape grows only from the COMPLEMENT path (`{bar: any}`) — and checking every
+// argument against that alone rejects the argument the guard exists to accept. The
+// tested types are ALTERNATIVES, not additional fields: the call-arg check accepts an
 // argument satisfying the demanded shape OR one of them.
-//
-// This is precise rather than a loosening, because each alternative also carries
-// WHICH demanded fields an argument taking the guard's TRUE path still reaches:
-//   • `holeAltPreN[k]` — the number of shape fields already demanded when the guard
-//     was reached. Those accesses run BEFORE the guard, so they are still required.
-//   • `holeAltTailN[k]` — the shape-field count at the END of the guard `if`, i.e.
-//     the start of the fields demanded AFTER it, or -1 when the then-branch
-//     DIVERGES (a `return`/`break`/`continue` guard clause) and the tail is
-//     therefore unreachable for an argument that satisfies the alternative.
-// Fields demanded strictly INSIDE the `if` (its else arm) are never required: the
-// guard being true means that arm did not run. So `if v is T { return v.foo }` /
-// `return v.bar` accepts `{foo: string}` while `print(v.zap)` ahead of the guard,
-// or a non-diverging then-branch, keeps the complement's fields required.
+// Precise rather than a loosening, because each alternative carries WHICH demanded
+// fields an argument taking the guard's TRUE path still reaches: `holeAltPreN[k]` is the
+// shape-field count when the guard was reached (those accesses run BEFORE it, so they
+// stay required) and `holeAltTailN[k]` the count at the END of the guard `if`, or -1 when
+// the then-branch DIVERGES and the tail is unreachable. Fields demanded strictly INSIDE
+// the `if` are never required: the guard being true means that arm did not run.
 let holeAltNames: string[] = []
 let holeAltTys: i32[] = []
 let holeAltPreN: i32[] = []
@@ -690,42 +595,18 @@ let holeAltTailN: i32[] = []
 // is the only place the two are already paired.
 let holeAltHoleIx: i32[] = []
 
-// ── DERIVED-HOLE DERIVATIONS (W6: "a union is a data structure") ─────────────
-//
-// A DERIVED hole is a hole that names a READ off another hole — field-of,
-// return-of, element-of, guarded-alternative-of. The derivation used to live in
-// the hole's NAME, as a dotted path (`?fld.x.?ret.?f.0`) that four functions
-// decoded again by prefix-match plus recursive slicing, with the guarded form
-// round-tripping two arena indices through DECIMAL TEXT. That is a type held as
-// a parsable string, and it is now a DATA STRUCTURE: one row per derivation, in
-// the parallel-array style every other side table here uses.
-//
-//   hdKind[r]   HD_FLD | HD_RET | HD_ELEM | HD_GALT | HD_BINOP
-//   hdField[r]  HD_FLD: the property read. HD_BINOP: the OPERATOR. "" otherwise.
-//   hdInner[r]  HD_GALT: the type the guarded branch contributes (arena ix).
-//               HD_BINOP: the type the BODY decided with no dispatch (arena ix). -1 otherwise.
-//   hdAlt[r]    HD_GALT: the guard's tested type (arena ix). -1 otherwise.
-//   hdBase[r]   the hole this derivation READS FROM (arena ix) — itself possibly derived.
-//   hdDepth[r]  how many derivation layers stack here, so the re-basing budget
-//               (`HOLE_REBASE_MAX`) is a stored count instead of a `?`-census of the name.
-//
-// The NAME is still minted, and still identical byte-for-byte (`hdRenderName`),
-// because it remains the hole's IDENTITY: generic bindings (`bNames`), demanded
-// shapes, array demands and the alternative rows are all keyed by it. Rendering a
-// type is allowed; parsing one back is what this retires. Nothing reads a `?fld.`
-// prefix any more — the structure is authoritative from the moment it is minted.
-//
-// HD_BINOP IS THE ONE DERIVATION THAT IS NOT A MEMBER READ, and it is here because it
-// is the same shape: a type the BODY cannot decide, named by what it reads off a hole.
-// `a ^ b` inside `function g<T>(a: T, b: T)` has one answer per PIN — the operand type
-// at every non-object pin, and the OVERLOAD's return type at an object pin that
-// dispatches — and `checkBinExprNode` reaches the overload only through its
-// `T.tys[lt] is TyObj` arm, which a `TyVar` left operand never enters. So the body
-// recorded the operand type (`return lt`), the emitter's instance returned the
-// overload's `i32`, and the two disagreed with nobody left to ask: check-clean invalid
-// wasm (`silent-class-inventory` D532). Deferring the answer to `substHoleTy` is the
-// per-pin re-derivation that row said this needed, in the layer that already does it
-// for `?ret.` and `?elem.`.
+// —— DERIVED-HOLE DERIVATIONS (W6: "a union is a data structure") ————————————————
+// A DERIVED hole names a READ off another hole — field-of, return-of, element-of,
+// guarded-alternative-of, binop-of. The derivation is a DATA STRUCTURE, one row per
+// derivation in the parallel-array style every other side table here uses: `hdKind`,
+// `hdField` (the property, or the OPERATOR for HD_BINOP), `hdInner` / `hdAlt` (the
+// guarded branch's and the guard's tested type for HD_GALT; the body's undispatched type
+// for HD_BINOP), `hdBase` (the hole read FROM) and `hdDepth` (the stored re-basing
+// budget, so `HOLE_REBASE_MAX` is not a `?`-census of a name).
+// The NAME is still minted and byte-for-byte the same (`hdRenderName`) because it remains
+// the hole's IDENTITY, and nothing parses a `?fld.` prefix back out: rendering a type is
+// allowed, parsing one back is what this retires. HD_BINOP is here because a type the
+// body cannot decide has one answer per PIN, and disagreeing silently was D532.
 const HD_FLD = 0
 const HD_RET = 1
 const HD_ELEM = 2
@@ -838,101 +719,33 @@ let argCstrExp: i32[] = []
 let argCstrWho: string[] = []
 
 // DEFERRED `print` constraints over un-annotated-param / type-parameter holes — the
-// PRINTABILITY capability, deferred to the pin for exactly the reason the two tables above
-// defer the operator and the argument flow.
-//
-// `print` takes ONE value of `printDomainStr()`, and the two floors that say so —
-// `tyPrintsAsRef` and `tyPrintsAsUnionBox` — are asked of the ARGUMENT'S TYPE in the body.
-// They answer on DIFFERENT channels (a reference is outside the domain, `tErr`/D711; a
-// boxed value union is inside it and awaiting a tag dispatch, `tErrUnsupported`/D712) and
-// `validatePrintCstrs` carries that split to the pin.
-//
-// Inside a generic that type is a hole (`T`, or the `?elem.T` a `x[0]` read derives), and a
-// hole is neither a ref nor a box, so both floors answer FALSE and the call is admitted. The emitter's print
-// ladder is a run of POSITIVE tests ending in an unguarded `call __print_i32__`, so the
-// instance then handed a `(ref $t)` to an `(i32) -> ()` import: `vl check` rc 0 and a module
-// the engine refuses. `tyPrintsAsRef`'s own header used to claim the opposite —
-// *"nor a `TyVar` … the concrete argument is gated there"* — and NOTHING gated it there;
-// `scripts/silent-sweep/d401/printgrid.py` measures 19 such cells, at every argument rep
-// whose CONCRETE twin is a clean check reject. (`silent-class-inventory` D401.)
-//
-// Record the printed type and the argument NODE; the generic call site substitutes the hole
-// to the call's concrete argument type and asks the same two floors, so the generic spelling
-// lands on the direct spelling's own diagnostic rather than one annotation away from it.
+// PRINTABILITY capability, deferred to the pin for the reason the tables above defer the
+// operator and the argument flow. `print` takes ONE value of `printDomainStr()`, and the two
+// floors that say so — `tyPrintsAsRef` and `tyPrintsAsUnionBox` — are asked of the ARGUMENT'S
+// TYPE in the body, on different channels (a reference is outside the domain, `tErr`/D711; a
+// boxed value union is inside it awaiting a tag dispatch, `tErrUnsupported`/D712).
+// Inside a generic that type is a hole, which is neither a ref nor a box, so both floors
+// answer FALSE and the call is admitted — and the emitter's print ladder is a run of POSITIVE
+// tests ending in an unguarded `call __print_i32__`, so the instance hands a `(ref $t)` to an
+// `(i32) -> ()` import: check-clean invalid wasm (D401). Record the printed type and the
+// argument NODE; the pin substitutes the hole to the concrete argument type and asks the same
+// two floors, so the generic spelling lands on the direct spelling's own diagnostic.
 let printCstrTy: i32[] = []
 let printCstrIx: i32[] = []
 let printCstrFn: i32[] = []
 
-// DEFERRED RETURN-TYPE constraints — the DECLARED return re-asked at the pin, for exactly
-// the reason the three tables above defer the operator, the argument flow and the print.
-//
-// `function g<T>(a: T): V { return a }` is not decidable in the body: `got` is the type
-// parameter's `TyVar` and `assignable(T, V)` is TRUE for the same permissive reason every
-// other hole gate is vacuous, so `checkRetStmtNode`'s mismatch check passes. At the call
-// site `substTyDeep` substitutes the DECLARED return and hands it out as the call's type —
-// and NOTHING compares it against the substituted BODY type. Both layers are individually
-// reasonable and neither owns the question, which is why the defect survived both.
-//
-// The consequence is one token wide. `g(p)` with `p: i32` is `vl check` rc 0 over a module
-// the engine refuses (`type mismatch: expected (ref $type), found i32`), while the SAME
-// declaration written `function g(a: i32): V` is a positioned `return type mismatch:
-// expected V, got i32`. `scripts/silent-sweep/d551/retgrid.py` measures the family across
-// the return-type / body / argument axes and grades every cell against that direct twin.
-// (`silent-class-inventory` D551.)
-//
-// RECORDED ON EITHER SIDE — when the RETURNED type carries a hole, OR when only the DECLARED
-// one does. The want side was a REFUSED rung when this table landed and is now the table's
-// own (`silent-class-inventory` D561); what stayed refused is the widening WITHOUT the
-// exemption below, and the difference is one predicate.
-//
-// The mirror image is real: `function g<T>(a: T, n: i32): T { return n + 1 }` at `g("s", 2)`
-// is the same check-clean invalid wasm beside the same loud direct twin. Two more the filed
-// row did not count came with it — `g(true, -1)` VALIDATED and printed `false` for an
-// argument that was `true` (i32 and boolean share a rep, so there was no invalid wasm to trip
-// over), and a `Meters` was handed back where the call bound the parameter to `Feet`.
-//
-// WIDENED WITHOUT EXCEPTION IT REFUSES TWO CORPUS MODULES THAT RUN CORRECTLY,
-// `tests/cases/memory/flat-generic-rows-branded.vl` (webcraft P1.2, ten right values) first:
-//
-//     type TVAddr = new i32
-//     function rowAt<R, A>(self: Rows<R, A>, i: i32): A { return self.base + i * R.size }
-//
-// The body computes an `i32` address and hands it back as the brand `A`. Its direct spelling
-// is a loud `return type mismatch: expected TVAddr, got i32` — so the pin would be RIGHT by
-// the parity rule this table is built on — but there is no spelling that expresses the
-// intent: `as` over a type PARAMETER is `` `as` supports numeric conversions only `` (`as A1`
-// over the concrete newtype works and always has; what `as` cannot do is resolve a target the
-// body has not bound). Refusing a program the language offers no way to write is not a fix,
-// and "a corpus module that stops building" is a veto term outright. Those cells are not lost
-// by COINCIDENCE, which is the first of the four terms an override needs — and the three that
-// ARE overridden pass all four.
-//
-// SO `retNomOnlyAtHole` DEFERS EXACTLY THAT ONE MISMATCH: a want-side-ONLY constraint whose
-// substituted destination is a newtype BRAND over a base the body's type already fits. Same
-// rep, same value, the brand the one thing missing. Its residue — any body value may wear a
-// brand it fits unbranded, inside a generic returning a bare type parameter — is filed as
-// D571 and pinned by `tests/cases/generics/declared-return-hole-newtype-brand-keeps.vl`.
-// The day `as A` exists, the exemption goes and D571 closes with it.
-//
-// THE ANSWER IS `assignableExpr` ON THE SUBSTITUTED PAIR — the SAME function the body
-// asked, handed the same expression — and that identity is the whole soundness argument:
-// the pin agrees with the direct spelling by construction rather than by a second rule that
-// can drift apart from it the way `checkBinary` and `binOpDefinedFor` did (D492 / D493).
-//
-// `assignable` ALONE IS NOT THAT FUNCTION, and the difference is not academic. The A7
-// coercion — a boolean-typed VALUE flows into an `i32` slot as 1/0 — lives at the
-// EXPRESSION seam and is deliberately absent from `assignable`, so a pin asking the plain
-// predicate REFUSED `function g<T>(a: T): i32 { return a }` at `g(true)` while the direct
-// spelling `function g(a: boolean): i32` runs and prints `1`. That is a false reject
-// invented by the fix, in the exact shape the row is about, and only measuring the direct
-// twin found it. The same holds for the f32-literal adoption, the literal-type member rule,
-// the nominal-literal brand waiver and the field-wise object-literal recursion: every one
-// is keyed on the source EXPRESSION, which is why the expression is what gets recorded.
-//
-// Its recording side effects are re-applied, not newly applied: the body already ran this
-// seam on this node, and for the dominant case the substituted destination IS the
-// destination it ran with (a DECLARED return type carries no hole to substitute). Corpus
-// byte-identity over the module graph is the instrument that says so.
+// DEFERRED RETURN-TYPE constraints — the DECLARED return re-asked at the pin, because neither
+// layer owns the question in the body: `assignable(T, V)` is vacuous over a hole, so
+// `checkRetStmtNode`'s mismatch check passes, and `substTyDeep` then hands the substituted
+// DECLARED return out as the call's type without comparing it against the substituted BODY
+// type (D551). Recorded on EITHER side, want or got (D561).
+// THE ANSWER IS `assignableExpr` ON THE SUBSTITUTED PAIR — the SAME function the body asked,
+// handed the same expression — so the pin agrees with the direct spelling by construction
+// rather than by a second rule that can drift apart from it (D492 / D493). `assignable` alone
+// is NOT that function: the A7 boolean-into-i32 coercion, the f32-literal adoption, the
+// literal-type member rule and the field-wise recursion all live at the EXPRESSION seam.
+// `retNomOnlyAtHole` defers the ONE mismatch that has no spelling to fix it — a want-side-ONLY
+// constraint whose destination is a newtype BRAND over a base the body's type fits (D571).
 let retCstrGot: i32[] = []
 let retCstrWant: i32[] = []
 // The returned EXPRESSION's node — the handle `assignableExpr` needs at the pin, not a
@@ -951,55 +764,18 @@ let retCstrFn: i32[] = []
 // see a candidate that INVENTS one.
 let retCstrWOnly: i32[] = []
 
-// ── THE DESTINATION SEAM (`silent-class-inventory` D572) ─────────────────────────────
-// The SIXTH deferred-constraint table, and the mirror of `retCstrGot` one node over. D551
-// and D561 are both about the RETURN: a generic's declared return type against its body's
-// type, re-asked at the pin. This one is about every OTHER place a value lands inside a
-// generic body — a local DECLARATION, a plain re-assignment, a struct field write, an
-// array element write — and the reason it is a separate table rather than a widening of
-// the fifth is that `validateRetCstrs` cannot see these at all:
-//
-//     function g<T>(self: T, n: i32): T {
-//       const r: T = n + 1
-//       return r
-//     }
-//     print(g("s", 2))
-//
-// `vl check` rc 0 over a module the engine refuses. The `return r` is clean BY
-// CONSTRUCTION — `r`'s declared type is the hole `T`, which substitutes to `string` at the
-// pin and matches the declared return exactly — so the return seam has nothing to say. The
-// i32 entered at `const r: T = n + 1`, where `assignable(i32, T)` is vacuous for the same
-// permissive reason every hole gate is, and nothing recorded the pair. Graded on all four
-// D561 seeds (its base, `ABL_ADD_R5`, the newtype-exemption cut and the landing): check-clean
-// invalid wasm on every one.
-//
-// BOTH SIDES, and the mirror was never filed. The row names the DECLARED-side hole; the
-// BODY-side one is the same silent outcome — `function g<T>(self: T): i32 { const r: i32 =
-// self  return r }` at `g("s")` is check-clean invalid wasm beside a loud `cannot assign
-// string to 'r' of type i32`. `scripts/silent-sweep/d572/letgrid.py` measures the family
-// over seam x destination x argument x call and grades every cell against its direct twin.
-//
-// AND THE WORST CELL IS NEITHER A REJECT NOR INVALID WASM. At `T = boolean` the store is
-// rep-compatible, so `g(true, -1)` VALIDATES and prints `false` for an argument that was
-// `true` — eight such cells across the four seams, invisible to any grid that prints a
-// constant. That is the third time this family has cost a grid exactly that way.
-//
-// THE ANSWER IS `assignableExpr` ON THE SUBSTITUTED PAIR, for `retCstrGot`'s reason and
-// with the same soundness argument: the pin asks the SAME function the body asked, handed
-// the same expression, so it agrees with the direct spelling by construction rather than by
-// a second rule that can drift apart from it. `assignable` alone is NOT that function — the
-// A7 coercion (a boolean-typed value into an `i32` slot) lives at the EXPRESSION seam, so
-// a pin asking the plain predicate invents a false reject for `const r: i32 = self` at
-// `g(true)`, which runs and prints `1` in both spellings on every seed ever graded. D551's
-// first cut made exactly that mistake at the return seam; `d572o_a7_*` is the standing cell.
-//
-// NO NEWTYPE EXEMPTION HERE, and that is measured rather than inherited. D561 had to exempt
-// a want-side-only constraint whose destination is a newtype BRAND, because `as A` over a
-// type parameter is not a spelling the language has and two corpus modules RETURN a bare
-// i32 as a brand. No corpus module reaches a brand through this seam — corpus byte-identity
-// over the whole module graph says so — and the shape that would (`const r: A = self.base +
-// i * 4  return r`) is exactly the "rewrite" D572's row warns is a relocation rather than a
-// repair. It is `d572o_brandlet_*`, it is graded, and this landing closes it deliberately.
+// —— THE DESTINATION SEAM (D572) ————————————————————————————————————————————————
+// The SIXTH deferred-constraint table, and the mirror of `retCstrGot` one node over. D551 and
+// D561 are about the RETURN; this one is about every OTHER place a value lands inside a
+// generic body — a local DECLARATION, a plain re-assignment, a struct field write, an array
+// element write — and it is a separate table rather than a widening of the fifth because
+// `validateRetCstrs` cannot see these at all: in `function g<T>(self: T, n: i32): T { const
+// r: T = n + 1  return r }` the return is clean BY CONSTRUCTION and the i32 entered at the
+// `const`, where `assignable(i32, T)` is vacuous. Recorded on BOTH sides, declared and body.
+// THE ANSWER IS `assignableExpr` ON THE SUBSTITUTED PAIR, for `retCstrGot`'s reason and with
+// the same soundness argument. NO NEWTYPE EXEMPTION HERE, and that is measured rather than
+// inherited: D561 needed one because corpus modules RETURN a bare i32 as a brand, and no
+// corpus module reaches a brand through this seam.
 let letCstrGot: i32[] = []
 let letCstrWant: i32[] = []
 // The SOURCE expression's node — the handle `assignableExpr` needs at the pin, not a
@@ -1015,30 +791,18 @@ let letCstrFn: i32[] = []
 // `letAssignMsg` is that fork in one home, so the pin cannot drift from the body.
 let letCstrName: string[] = []
 
-// DEFERRED BUILTIN-METHOD ARGUMENT constraints — the SEVENTH deferred table, and it exists
-// for the one reason `argCstr*` cannot serve this position: that table is recorded from the
-// user-function call path and adjudicated against a callee it can NAME, and a builtin method
-// has no `FuncDecl` at all. Its argument check is the builtin's OWN arm
-// (`xs.push(v)` asking `assignableExpr(v, elem)`, `m.set(k, v)` asking the key and the value,
-// `"s".charCodeAt(i)` asking for an i32), and inside a generic body every one of those arms
-// is vacuous: `assignable(T, string)` waves the value past and the arm never fires. `vl check`
-// rc 0, and the engine refuses the module — or worse, i32 and boolean share a rep so it
-// VALIDATES and prints `false` for an i32. (`silent-class-inventory` D582.)
-//
-// FOURTEEN ARMS OVER THREE RECEIVER KINDS, measured rather than assumed: the row filed "at
-// least two builtins" and `scripts/silent-sweep/d581/litgrid.py`'s block B grades the whole
-// surface — array `push`/`get`/`slice`, map `set` (key AND value) / `get` / `has` / `delete`,
-// set `add`/`has`, and the six string methods that take a typed argument.
-//
-// THE MESSAGE IS THE ARM'S OWN, IN ONE HOME. `bmArgMsg` renders every one of those sentences
-// and BOTH the arm and this pin call it, for `letAssignMsg`'s reason: a second copy of a
-// diagnostic is exactly the drift `checkBinary` and `binOpDefinedFor` had (D492 / D493).
-// `bmArgPred` is the same discipline for the PREDICATE — three of the arms ask
-// `assignableExpr`, one asks `assignable` with the newtype retry, the rest ask plain
-// `assignable`, and the pin must ask whichever the arm asked or it invents a false reject
-// (the A7 boolean-into-i32 coercion lives at the EXPRESSION seam) or leaks a residue (asking
-// the expression predicate where the arm asked the plain one accepts what the direct spelling
-// rejects).
+// DEFERRED BUILTIN-METHOD ARGUMENT constraints — the SEVENTH deferred table, and it exists for
+// the one reason `argCstr*` cannot serve this position: that table is adjudicated against a
+// callee it can NAME, and a builtin method has no `FuncDecl` at all. Its argument check is the
+// builtin's OWN arm (`xs.push(v)` asking `assignableExpr(v, elem)`, `m.set(k, v)` asking key
+// and value), and inside a generic body every one of those arms is vacuous — `vl check` rc 0
+// over a module the engine refuses, or worse a VALIDATING module printing `false` for an i32,
+// since i32 and boolean share a rep (D582). Fourteen arms over three receiver kinds;
+// `scripts/silent-sweep/d581/litgrid.py` block B grades the surface.
+// THE MESSAGE IS THE ARM'S OWN, IN ONE HOME (`bmArgMsg`), and so is the PREDICATE
+// (`bmArgPred`): the arms ask three different predicates, and a pin asking the wrong one
+// invents a false reject or leaks a residue. A second copy of a diagnostic is exactly the
+// drift D492 / D493 had.
 let bmCstrGot: i32[] = []
 let bmCstrWant: i32[] = []
 // The type the SENTENCE needs that is neither side of the comparison: the receiver array for
@@ -1069,31 +833,18 @@ const BM_BYTEOFF = 9
 const BM_BOUNDS0 = 10
 const BM_BOUNDS1 = 11
 
-// DEFERRED RECEIVER-CLASSIFICATION constraints — the EIGHTH deferred table, and the one
-// D14's own close created. `checkMemberNode`'s `TyVar` arm admits `.length` on every type
-// variable and `checkIndexNode`'s admits `x[i]` on every type variable, both deliberately:
-// a `T` pinned to a list / string / map / set has both, and refusing them in the BODY
-// refuses the eight reps that work. What neither arm does is re-ask the question at the PIN,
-// where `T` is known — so `g<T>(x: T) { print(x.length) }` at `g(true)` is `vl check` rc 0
-// and the EMITTER is left holding it (`'.length' on a receiver the emitter cannot classify
-// as a list, string, map or set`), while the one-annotation-different direct spelling
-// `const v = true  print(v.length)` is a positioned `member access '.length' on non-object
-// boolean`. Clause 2 in the direction that hides: a lost REFUSAL, not a lost lowering.
-// (`silent-class-inventory` D651 prescribed exactly this table; D691 builds it and D14's
-// own `lengrid.py` prices it.)
-//
-// ONE TABLE FOR BOTH OPERATIONS, because they are one question — "can this receiver be
-// classified?" — asked at two spellings, and their two emit-side floors were two thirds of
-// one 22-cell cluster. `memCstrProp` carries the member name, or `OP_INDEX_GET` for the
-// index form, which is the language's own name for that operation and can never collide
-// with a property name (`.[]` does not parse).
-//
-// THE MESSAGE IS THE DIRECT SPELLING'S, IN ONE HOME. `memberFloorMsg` / `indexFloorMsg`
-// render every sentence the two arms raise and BOTH the arm and this pin call them, for
-// `letAssignMsg`'s reason: a second copy of a diagnostic is exactly the drift `checkBinary`
-// and `binOpDefinedFor` had (D492 / D493). Here the drift would be worse than cosmetic —
-// the whole argument for reporting at the pin is that the generic and the concrete
-// spellings are one annotation apart and must therefore be one sentence apart.
+// DEFERRED RECEIVER-CLASSIFICATION constraints — the EIGHTH deferred table, and the one D14's
+// own close created. `checkMemberNode`'s `TyVar` arm admits `.length` on every type variable
+// and `checkIndexNode`'s admits `x[i]`, both deliberately: a `T` pinned to a list / string /
+// map / set has both, and refusing them in the BODY refuses every rep that works. Neither arm
+// re-asks at the PIN, where `T` is known, so `g<T>(x: T) { print(x.length) }` at `g(true)` is
+// `vl check` rc 0 and the EMITTER is left holding it, while the one-annotation-different
+// direct spelling is a positioned `member access on non-object boolean` — a lost REFUSAL, not
+// a lost lowering (D651 prescribed this table, D691 builds it).
+// ONE TABLE FOR BOTH OPERATIONS, because they are one question asked at two spellings.
+// `memCstrProp` carries the member name, or `OP_INDEX_GET` for the index form, which can never
+// collide with a property name (`.[]` does not parse). The messages are the direct spelling's,
+// in one home (`memberFloorMsg` / `indexFloorMsg`) — D492 / D493's drift, avoided.
 let memCstrTy: i32[] = []
 let memCstrProp: string[] = []
 let memCstrIx: i32[] = []
@@ -1101,69 +852,47 @@ let memCstrFn: i32[] = []
 
 // DEFERRED UFCS-RECEIVER constraints — the NINTH deferred table, and the receiver's half of
 // the question `memCstrTy` asks about `.length` / `x[i]`. `ufcsCallTy` gates dispatch on
-// `assignable(recvTy, params[0])`, and `assignable` answers TRUE for a `TyVar` on EITHER
-// side — deliberately, since a `T` pinned to the self-function's receiver type is exactly
-// what the call is for. So inside a generic body the selection is made by NAME ALONE and
-// the receiver's FIT is never re-asked at the pin: `g<T>(x: T) { x.toString() }` beside
-// `toString(self: Circle)` is `vl check` rc 0 at `g({s: 2.0})` and INVALID WASM, while the
-// one-annotation-different direct spelling `const v = {s: 2.0}  v.toString()` is a
-// positioned `no field 'toString' on {s: f64}`. Clause 1 in the direction that hides.
-//
-// `ufcsCstrP0` is the SELF-FUNCTION's parameter-0 type — the contract the pin re-asks
-// against. Kept beside the row rather than re-resolved from the name at the pin, because
-// the name is the PLAIN property and the function it selected is the merge-mangled one; the
-// row banks the answer `ufcsCallTy` already had.
-//
-// THE FIELD-PRECEDENCE GUARD IS WHAT MAKES THE PIN SAFE TO RAISE. A callable FIELD of that
-// name wins over UFCS at every concrete spelling (`drwWalk`'s `sFieldIndex` arm, and
-// `emitCall`'s `exprIsClosure` rung), so an instantiation whose substituted receiver carries
-// the field is a FIELD call and this constraint does not speak about it at all. Asked of the
-// SUBSTITUTED receiver with `tyFieldTyOf` — measured 2026-09-02: for `Boxed = {r: f64,
-// toString: () => string}` the substituted `ur` renders `Boxed`, IS a `TyObj`, and answers
-// the field, so `memberFloorMsg(ur, "toString")` is EMPTY. (An earlier attempt recorded that
-// this floor answered `no field 'toString' on Boxed` and concluded no guard could be
-// written; that reading was of a receiver the pin does not carry.)
+// `assignable(recvTy, params[0])`, which answers TRUE for a `TyVar` on EITHER side, so inside
+// a generic body the selection is made by NAME ALONE and the receiver's FIT is never re-asked
+// at the pin: `g<T>(x: T) { x.toString() }` beside `toString(self: Circle)` is check-clean
+// invalid wasm at `g({s: 2.0})` while the direct spelling is a positioned `no field` (D1005).
+// `ufcsCstrP0` banks the SELF-FUNCTION's parameter-0 type rather than re-resolving it at the
+// pin, because the name is the PLAIN property and the selected function is the merge-mangled
+// one. THE FIELD-PRECEDENCE GUARD IS WHAT MAKES THE PIN SAFE TO RAISE: a callable FIELD of
+// that name wins over UFCS at every concrete spelling, so an instantiation whose SUBSTITUTED
+// receiver carries the field is a FIELD call this constraint never speaks about — asked with
+// `tyFieldTyOf` of the substituted receiver, not of the declared one.
 let ufcsCstrTy: i32[] = []
 let ufcsCstrProp: string[] = []
 let ufcsCstrIx: i32[] = []
 let ufcsCstrFn: i32[] = []
 let ufcsCstrP0: i32[] = []
 
-// D1230 — the missing-import answer, banked at the CALLEE MEMBER NODE by the call
-// site that computed it and read back by the member arm that raises the sentence.
-//
-// The two halves of the question live in different places and neither can move to
-// the other: only the CALL knows the argument count that decides whether a
-// candidate's arity fits, and only `checkMemberNode` reaches the arm that names
-// the receiver ("no field on a struct", "on array", "on map", …). A sidecar keyed
-// by node index costs nothing and leaves the control flow of a failing call
-// EXACTLY as it was — the arguments are still checked, the same one diagnostic is
-// still raised, at the same anchor.
-//
+// D1230 — the missing-import answer, banked at the CALLEE MEMBER NODE by the call site that
+// computed it and read back by the member arm that raises the sentence. The two halves live in
+// different places and neither can move to the other: only the CALL knows the argument count
+// that decides whether a candidate's arity fits, and only `checkMemberNode` reaches the arm
+// that names the receiver. A sidecar keyed by node index costs nothing and leaves the control
+// flow of a failing call EXACTLY as it was — the arguments are still checked, the same one
+// diagnostic is still raised, at the same anchor.
 // `ufcsMissSpecs[i]` is the `,`-joined specifier list for the callee member node
-// `ufcsMissAt[i]`. A node is banked at most once (the first call wins; a member
-// node belongs to one call).
+// `ufcsMissAt[i]`; a node is banked at most once (the first call wins, and a member node
+// belongs to one call).
 let ufcsMissAt: i32[] = []
 let ufcsMissSpecs: string[] = []
 
-// SOLVED un-annotated parameter types — the parameter's own body USAGE, read back as
-// its type. A hole is permissively assignable both ways, so a usage that requires a
-// concrete type (`const r: K = u`, `return u` under a declared return, `q(u)` into an
-// annotated parameter, a `K` field / element / map value) rejects nothing in the body
-// and leaves the parameter's REP to whatever the call site's argument happened to be.
-// The two are not interchangeable: a NAMED string litunion is an interned i32 ATOM
-// while a plain `string` is a `(ref $array)`, so the correct program `p("a")` through
-// `function p(u) { const r: K = u }` emitted a module the engine rejects, and the
-// non-member `p("zz")` — which the annotated spelling rejects — passed `vl check`.
-//
-// Both directions come from one answer: SOLVE the hole to what its usage demands and
-// the parameter becomes indistinguishable from the annotated spelling — the call site
-// checks the argument against it, and the emitter's synthesized annotation
-// (`synthParamAnnots`, off `nodeTyIx`) reps it identically.
-//
-// Keyed by the parameter's HOLE NAME, which is already its identity: the pass-1 hoist
-// and `checkFuncDeclNode` mint the same name for the same parameter, so both read one
-// answer out of `unannotParamTy`.
+// SOLVED un-annotated parameter types — the parameter's own body USAGE, read back as its type.
+// A hole is permissively assignable both ways, so a usage that requires a concrete type
+// (`const r: K = u`, `return u` under a declared return, `q(u)` into an annotated parameter, a
+// `K` field / element / map value) rejects nothing in the body and leaves the parameter's REP
+// to whatever the call site's argument happened to be. The two are not interchangeable: a
+// NAMED string litunion is an interned i32 ATOM while a plain `string` is a `(ref $array)`.
+// Both directions come from one answer: SOLVE the hole to what its usage demands and the
+// parameter becomes indistinguishable from the annotated spelling — the call site checks the
+// argument against it, and the emitter's synthesized annotation (`synthParamAnnots`, off
+// `nodeTyIx`) reps it identically. Keyed by the parameter's HOLE NAME, which is already its
+// identity: the pass-1 hoist and `checkFuncDeclNode` mint the same name for the same
+// parameter, so both read one answer out of `unannotParamTy`.
 let solvedParamTys: {[string]: i32} = Map()
 // Declarations whose solve has been ATTEMPTED, keyed by decl node index — a body is
 // probed at most once, whether or not the probe found anything to solve.
@@ -1190,39 +919,31 @@ let constScopes: {[string]: boolean}[] = []
 // is unchanged, exactly like `constScopes`.
 let fnDeclScopes: {[string]: i32}[] = []
 
-// The function-ALIAS chain, PARALLEL to `T.scopes` and to the two above: each frame records,
-// for a binding whose initializer is a BARE IDENT naming a declared function (`const f = addT`),
-// the arena node of that declaration. `fnDeclScopes` deliberately answers -1 for such a name —
-// a local that shadows or wraps a function is a function VALUE, and the call must keep the
-// exact-arity gate a value call has — so this is a SECOND question about the same name and
-// gets its own table rather than loosening that one.
-//
+// The function-ALIAS chain, PARALLEL to `T.scopes`: each frame records, for a binding whose
+// initializer is a BARE IDENT naming a declared function (`const f = addT`), the arena node of
+// that declaration. `fnDeclScopes` deliberately answers -1 for such a name — a local that
+// shadows or wraps a function is a function VALUE, and the call must keep the exact-arity gate
+// a value call has — so this is a SECOND question about the same name and gets its own table
+// rather than loosening that one.
 // IT HAS EXACTLY ONE CONSUMER: deferred-constraint OWNERSHIP (`cstrOwnedBy`). A call site that
 // cannot NAME its callee consults EVERY generic's constraints, and `substTyDeep` matches TyVars
-// by name, so `const g = idT  g(structList)` reported `myIndexOf`'s `==` refusal — a generic
-// that compares nothing, refused for a comparison in a function it never calls. That is the
-// same false reject #1946 removed for a DECLARED callee, at the one delivery its fix could not
-// see, and it is why a `const f = addT` still adjudicates `addT`'s own constraint: the alias
-// resolves, so the true positive keeps firing and only the cross-generic leak goes.
-//
-// A CLOSURE PARAMETER IS DELIBERATELY NOT HERE. `f` inside a HOF has no initializer to resolve,
-// so it stays unnamed and keeps consulting everything — which is what the HOF case needs, and
-// what #1946's header records as the reason the enclosing-body rule was reverted.
+// by name, so `const g = idT  g(structList)` reported an unrelated generic's `==` refusal. The
+// alias resolves, so the true positive keeps firing and only the cross-generic leak goes.
+// A CLOSURE PARAMETER IS DELIBERATELY NOT HERE: `f` inside a HOF has no initializer to resolve,
+// so it stays unnamed and keeps consulting everything, which is what the HOF case needs.
 let fnAliasScopes: {[string]: i32}[] = []
 
-// THE COLLAPSED-BINDING MARKS (D1048's second hint): the bindings whose DECLARED type
-// dropped a subsumed literal arm, and the function declarations whose declared RETURN
-// did. Read at an `is <literal>` to decide whether the test the author wrote is a tag
-// test or — because the arm collapsed — a value compare.
-//
-// DEPTH-TAGGED SPARSE ROWS, not a fourth map per scope frame. Almost every program
-// records NOTHING here, and a parallel `{[string]: …}[]` would allocate an empty map on
-// every `pushScope` for a fact that is usually absent everywhere; these two lists cost
-// one length test on entry and one on exit instead. `popScope` drops the rows whose
-// depth the pop retired, so a name that goes out of scope stops answering — and the
-// read pairs the row's depth with `lookupDepth`, so an inner PLAIN binding shadowing an
-// outer collapsed one answers correctly (different depth ⇒ no match) without the inner
-// one having to record anything.
+// THE COLLAPSED-BINDING MARKS (D1048's second hint): the bindings whose DECLARED type dropped
+// a subsumed literal arm, and the function declarations whose declared RETURN did. Read at an
+// `is <literal>` to decide whether the test the author wrote is a tag test or — because the
+// arm collapsed — a value compare.
+// DEPTH-TAGGED SPARSE ROWS, not a fourth map per scope frame. Almost every program records
+// NOTHING here, and a parallel `{[string]: …}[]` would allocate an empty map on every
+// `pushScope` for a fact that is usually absent; these two lists cost one length test on entry
+// and one on exit instead. `popScope` drops the rows whose depth the pop retired, so a name
+// that goes out of scope stops answering — and the read pairs the row's depth with
+// `lookupDepth`, so an inner PLAIN binding shadowing an outer collapsed one answers correctly
+// (different depth, no match) without the inner one having to record anything.
 let collBindDepth: i32[] = []
 let collBindName: string[] = []
 // The `FuncDecl` NODES whose return annotation collapsed. Module-scoped rather than
@@ -1247,58 +968,36 @@ let pendTys: i32[] = []
 let pendAts: i32[] = []
 let pendDepths: i32[] = []
 
-// FLOW-NARROWED PROPERTY PATHS (mirrors the host's `narrowedPaths` overlay):
-// a stack of `key → type-arena index` entries (`"o.v" → i32`) overlaid while a
-// branch body is checked, plus per-scope frame marks so `popScope` unwinds the
-// entries pushed inside that scope. Bare-NAME narrowings keep riding the scope
-// chain (a shadowing `declare`); only dotted paths land here.
-//
-// `npInvBy` is the INVALIDATION side table, one slot per entry: the arena index of
-// the call that may have written the path's field through an alias, or -1 while the
-// narrowing is still in force. A narrowing over a property path is a fact about
-// HEAP state, so unlike a bare local it can be falsified by a write the guarded
-// scope never spells — `clr(o)` where `clr` assigns `o.v = null` left `o.v` narrowed
-// and both the checker and the emitter believed it (a trap for a ref rep, a printed
-// `null` for a boxed one). `callWritesPlace` decides, per call, which entries stop
-// being in force.
-//
-// INVALIDATION IS WRITTEN IN PLACE, NOT PUSHED. A shadowing push would unwind at
-// the end of whatever inner block held the call, resurrecting the narrowing for the
-// statements after it — `if o.v != null { if c { clr(o) } print(o.v.length) }` must
-// stay rejected, because the write MAY have happened. Overwriting the entry the
-// guard pushed keeps the invalidation alive exactly as long as the narrowing it
-// kills, and `popScope` retires both together.
+// FLOW-NARROWED PROPERTY PATHS (the host's `narrowedPaths` overlay): a stack of
+// `key → type-arena index` entries (`"o.v" → i32`) overlaid while a branch body is checked,
+// plus per-scope frame marks so `popScope` unwinds what that scope pushed. Bare-NAME
+// narrowings keep riding the scope chain (a shadowing `declare`); only dotted paths land here.
+// `npInvBy` is the INVALIDATION side table, one slot per entry: the arena index of the call
+// that may have written the path's field through an alias, or -1 while the narrowing is still
+// in force. A narrowing over a property path is a fact about HEAP state, so unlike a bare local
+// it can be falsified by a write the guarded scope never spells — `clr(o)` assigning
+// `o.v = null`. `callWritesPlace` decides, per call, which entries stop being in force.
+// INVALIDATION IS WRITTEN IN PLACE, NOT PUSHED: a shadowing push would unwind at the end of
+// whatever inner block held the call and resurrect the narrowing for the statements after it,
+// and the write MAY have happened. `popScope` retires the narrowing and its invalidation.
 let npKeys: string[] = []
 let npTys: i32[] = []
 let npInvBy: i32[] = []
 let npEpochs: i32[] = []
 let npFrames: i32[] = []
 
-// POST-GUARD narrowings HANDED UP by an `if` that is itself the ELSE ARM of another
-// `if` — an `else if`. Such an `if` has NO enclosing block of its own: "the rest of its
-// block" is the rest of the PARENT's block, and it is the parent that decides whether
-// that code is reachable at all. So it cannot `declare` its own fall-through narrowing,
-// and both ways it used to try were wrong, one in each direction:
-//
-//   * the parent had pushed an else-arm narrowing scope, and `popScope` unwound the
-//     arm's `declare` with it — the whole `else if` chain narrowed nothing past the
-//     FIRST arm (`soundness/elseif-chain-residual.vl`'s open half);
-//   * the parent had pushed NO scope (its condition narrowed nothing — `else if` after
-//     `if k > 0 { … }`), so the arm's `declare` landed straight in the enclosing block
-//     and applied even when the PARENT's then did not diverge — a fall-through the
-//     guard never proved. `if k > 0 { print(…) } else if x is string { return 0 }` then
-//     `return x + 1` was check-clean and emitted `type mismatch: expected i32, found
-//     (ref $type)`, measured on `e2b5a1f7`.
-//
-// The parent consumes these ONLY when its own then diverges, which composes to exactly
-// "every arm from the top of the chain down to here exited, so control reached here
-// through the last arm's false edge". Bare names only, for the reason the guard-clause
-// comment in `checkIfStmtNode` gives at length about property paths.
-//
-// Entries are pushed in POST-ORDER, so the innermost arm's (tightest) residual for a
-// place lands LAST — `checkIfStmtNode` applies the buffer in REVERSE for that reason.
-// A frame mark (`pgUpMark`, a local) drops an arm's whole subtree when that arm's own
-// then does not diverge.
+// POST-GUARD narrowings HANDED UP by an `if` that is itself the ELSE ARM of another `if` — an
+// `else if`. Such an `if` has NO enclosing block of its own: "the rest of its block" is the
+// rest of the PARENT's, and it is the parent that decides whether that code is reachable at
+// all. So it cannot `declare` its own fall-through narrowing, and both ways it used to try
+// were wrong in opposite directions — the parent's `popScope` unwound the arm's `declare`, so
+// the chain narrowed nothing past the FIRST arm
+// (`tests/cases/soundness/elseif-chain-residual.vl`); or, with no parent scope pushed, the
+// `declare` landed straight in the enclosing block and applied even when the PARENT's then did
+// not diverge — a fall-through the guard never proved. The parent consumes these ONLY when its
+// own then diverges, which composes to "every arm from the top of the chain down to here
+// exited". Bare names only. Entries are pushed in POST-ORDER so the innermost arm's residual
+// lands LAST — `checkIfStmtNode` applies the buffer in REVERSE, and `pgUpMark` drops a subtree.
 let pgUpKeys: string[] = []
 let pgUpTys: i32[] = []
 
@@ -1309,18 +1008,16 @@ let pgUpTys: i32[] = []
 let pgUpArmIx = -1
 
 // THE PLACE TYPE A TRAILING CHAIN SAW, banked at the instant the post-guard subtraction
-// replaced it. `ifChainExhausts` asks whether a chain's arms COVER its place's union,
-// and by the time it runs the chain has already SUBTRACTED those same arms from that
-// place — so asking `lookup` is circular and answers "covered" every time. It did:
+// replaced it. `ifChainExhausts` asks whether a chain's arms COVER its place's union, and by
+// the time it runs the chain has already SUBTRACTED those same arms from that place — so
+// asking `lookup` is circular and answers "covered" every time. It did:
 // `exhaustive-is-chain-no-else-reject.vl` and `exhaustive-missing-is-case.vl` both went
 // silently green, which is the failure mode this whole change has to avoid.
-//
-// Keyed by the chain HEAD's node index, and that is the load-bearing part. A head that
-// does not post-narrow (its then falls through, or its condition narrows nothing) writes
-// nothing, so `pgPreIx` still names some earlier statement's `if` — the check must not
-// read that bank, or a chain whose place was legitimately narrowed by a guard ABOVE it
-// gets a "missing" list computed against a union it never saw. On a miss it falls back
-// to `lookup`, which is right whenever nothing subtracted.
+// Keyed by the chain HEAD's node index, and that is the load-bearing part. A head that does
+// not post-narrow writes nothing, so `pgPreIx` still names some earlier statement's `if` — the
+// check must not read that bank, or a chain whose place was legitimately narrowed by a guard
+// ABOVE it gets a "missing" list computed against a union it never saw. On a miss it falls
+// back to `lookup`, which is right whenever nothing subtracted.
 let pgPreIx = -1
 let pgPreKeys: string[] = []
 let pgPreTys: i32[] = []
@@ -1357,74 +1054,18 @@ let tyToStrDepth = 0
 // return and read by the immediate caller, never carried between programs.
 let tyStrAtoms = 1
 
-// NARROWED bare-name bindings: name → the type it was DECLARED with, before a
-// narrowing shadowed it. Per-scope frame marks like the two overlays above, so
-// `popScope` unwinds a scope's entries with the narrowings themselves. Two entry
-// KINDS ride one bank (`NAR_KIND_ASG` / `NAR_KIND_GUARD`) because one question is
-// asked of both — what the storage can hold — and the answers must not disagree.
-//
-// WHY THIS EXISTS AT ALL (#1225's defect, re-derived). A bare-NAME narrowing in
-// this checker is a shadowing `declare` into a scope the caller PUSHED for the
-// branch (`applyNarrows`), and `popScope` takes it away again. The assignment
-// narrowing uses the same `declare` with NO scope of its own — so it does not
-// shadow the declaration, it OVERWRITES it, in the very scope that holds it. The
-// narrowing is a correct FLOW fact and the overwrite is what is wrong with it:
-// the declared type is the binding's STORAGE contract, and three questions must
-// keep asking it after a narrowing, or a legal program stops compiling —
-//
-//   * what the binding ACCEPTS. `let xs: S[] | null = []` / `xs = [{n:1}]` /
-//     `xs = null` rejected "cannot assign null to {n: i32}[]", and a FUNCTION
-//     declared afterwards could not assign null to the global either: the
-//     narrowed type was what its body's `lookup` found. A GUARD narrowing leaks
-//     into the same question — `while q != null { … q = null }` rejected "cannot
-//     assign null to i32" — which is why guard entries are banked here too.
-//   * whether a null TEST is meaningful. `if xs != null` rejected "cannot
-//     compare {n: i32}[] with null", which is how the defect was filed. This one
-//     is ASSIGNMENT-KIND ONLY: a redundant `if q != null` nested inside a live
-//     guard is a genuinely dead test and keeps its diagnostic.
-//   * whether a write RETIRES the narrowing (`writeRetiresNarrowing`).
-//
-// Reads keep the narrowed type — that is the whole point of narrowing, and the
-// straight-line `let x: T | null = null` / `x = mk()` / `x.f` pattern depends on
-// it. Only the questions above are re-pointed at the declaration.
-//
-// THE DEPTH IS LOAD-BEARING, not bookkeeping. An entry answers only while its own
-// `declare` is still the INNERMOST binding of the name: `let x: i32 | null = null`
-// / `x = 5` / `{ let x = "s"   x = null }` banked `i32 | null` for the outer `x`
-// and the inner write read it, so `null` went into a `string` binding and the
-// binding's type was overwritten with `i32?` — a check-clean wrong type.
-//
-// A RETIRED bare-name narrowing leaves the name READABLE, at its DECLARED type — the
-// declared type going back into the scope the narrowing shadowed IS the whole retirement,
-// and every read after the write then asks the storage. It used to be refused outright,
-// for an emitter reason and not a soundness one: the emitter's narrow stack held the
-// region's narrowed rep for the rest of the guarded block, so a read typed `i32?` here
-// lowered against the stale UNBOXED rep. The emitter retires the same write now
-// (`narrowRetired`, emit_state.vl), so the two agree and the read lowers.
-//
-// THE PROPERTY-PATH SPELLING NOW MATCHES IT for the same CAUSE, and the split is by cause
-// rather than by spelling (`pathRetiredByAssign`). The asymmetry used to be total, and the
-// reason given for it covered only half the column: "a path narrowing also dies to an
-// ALIASED write through a call, which the emitter has no relation to detect". True of a
-// CALL; false of a direct `w.f = e`, which is a statement the emit walk passes over exactly
-// as it passes over `f = e`. So the direct write retires on both sides
-// (`emit_classify`'s write-retirement grew a Member arm) and the read below it asks the
-// storage; only the CALL cause still refuses (`pathInvalidatedErr`), which is where the
-// emitter really is blind. Inventory #2 D8's 46 cells, flat across 23 of 23 reps, were the
-// whole of that half.
-//
-// `narFnEpoch` counts FUNCTION BODIES CHECKED, and every narrowing — bank entry or path
-// overlay slot — records the count at install. A closure created inside a guarded region
-// reads its capture at the region's NARROWED rep and runs later, so a write that retires
-// the narrowing behind it is observed through the capture: `if v != null { const w = () =>
-// { print(v + 1) }   v = null   w() }` is check-clean and emits an invalid module without
-// this. A mismatch between the recorded epoch and the current one means "a body that may
-// have captured this narrowing has been checked since it was installed", and the write
-// keeps master's verdict AND master's message — a captured narrowing is exactly the case
-// where refusing the write is the sound answer, not an accident.
-//
-// A closure created BEFORE the guard captured the binding un-narrowed, and its epoch is
-// already spent when the narrowing installs, so it does not block the write.
+// NARROWED bare-name bindings: name → the type it was DECLARED with, before a narrowing
+// shadowed it, with per-scope frame marks like the overlays above. Two entry KINDS ride one
+// bank (`NAR_KIND_ASG` / `NAR_KIND_GUARD`) because one question is asked of both: what the
+// storage can hold. A narrowing is a correct FLOW fact, but the DECLARED type is the
+// binding's STORAGE contract, and three questions must keep asking it or a legal program
+// stops compiling — what the binding ACCEPTS, whether a null TEST is meaningful (assignment
+// kind only), and whether a write RETIRES the narrowing. Reads keep the narrowed type, and
+// THE DEPTH IS LOAD-BEARING: an entry answers only while its own `declare` is the INNERMOST
+// binding of the name. A retired narrowing leaves the name READABLE at its DECLARED type;
+// the emitter retires the same write (`narrowRetired`, emit_state.vl) so the two agree, the
+// path spelling splits by CAUSE (`pathRetiredByAssign`), and only the CALL cause still refuses
+// (inventory-2 D8). `narFnEpoch` counts bodies checked, so a CAPTURED narrowing keeps refusing.
 const NAR_KIND_ASG = 0
 const NAR_KIND_GUARD = 1
 // THE POST-GUARD FALL-THROUGH's shadow, banked under a kind of its own.
@@ -1635,48 +1276,34 @@ function tyReachesUnion(ty: i32, depth: i32): boolean {
   false
 }
 
-// USAGE-DRIVEN INFERENCE through a TYPED context: when an empty `[]` / bare
-// `Map()`/`Set()` (open holes) flows into a slot with a concrete shape — a `T[]`
-// param at a call site, an annotated assignment (`const ys: i32[] = zs`), or a
-// `T[]`-returning tail — PIN the source's open holes to the destination's, in place,
-// so the binding is no longer uninferable. Mirrors the host's `constrainElementHole`.
-// A no-op unless the source is an array/map with an open hole and the destination
-// supplies the matching shape; recurses into element types so a nested empty pins too.
-//
-// THE CONTAINER POSITIONS (D17/D18) ARE THE OBJ/MAP-VALUE RECURSION, NOT A SECOND ROOT.
-// `{ xs: fq() }` against `{xs: string[]}` and `m["a"] = fq()` against `{[string]: f64[]}`
-// were check-clean invalid wasm for one reason: this walk stopped at the CONTAINER. An
-// array destination already recursed (`const xss: string[][] = [fq()]` has always lowered),
-// so the element-of-an-array position pinned while the field-of-a-struct and
-// value-of-a-map positions did not — a difference with no rule behind it. Once the hole is
-// pinned, the D16 emit-side seed (`emptyArrHoleKind`, read off the literal node) is what
-// makes it lower; nothing on the emit side changed for these.
-//
+// USAGE-DRIVEN INFERENCE through a TYPED context: when an empty `[]` / bare `Map()`/`Set()`
+// (open holes) flows into a slot with a concrete shape — a `T[]` param at a call site, an
+// annotated assignment (`const ys: i32[] = zs`), or a `T[]`-returning tail — PIN the source's
+// open holes to the destination's, in place, so the binding is no longer uninferable. Mirrors
+// the host's `constrainElementHole`. A no-op unless the source is an array/map with an open
+// hole and the destination supplies the matching shape; recurses into element types.
+// THE CONTAINER POSITIONS (D17/D18) ARE THE OBJ/MAP-VALUE RECURSION, NOT A SECOND ROOT. This
+// walk used to stop at the CONTAINER, so the element-of-an-array position pinned while
+// field-of-a-struct and value-of-a-map did not — a difference with no rule behind it. Once the
+// hole is pinned, the D16 emit-side seed (`emptyArrHoleKind`) is what makes it lower.
 // DEPTH-BOUNDED because the object arm closes a cycle the array/map arms could not: a
-// recursive struct (`type T = { xs: T[] }`) constrained against itself would recur forever
-// through the field. The bound is the same shape `tyReachesEmptyHole` uses one screen up.
+// recursive struct (`type T = { xs: T[] }`) constrained against itself would recur forever.
 function constrainEmpty(srcTy: i32, dstTy: i32) {
   constrainEmptyD(srcTy, dstTy, 12)
 }
 
-// `constrainEmpty` AT A POSITION THAT HOLDS THE SOURCE EXPRESSION — the form every site
-// that pins and then asks `assignableExpr` must use.
-//
-// THE PIN ERASES ITS OWN TRIGGER. `assignableExpr` records an ObjLit/ArrayLit's
-// DESTINATION rep on the `nodeRepTyIx` sidecar only while the literal still REACHES an
-// open hole (`tyReachesEmptyHole` gates `recordRepTyAdopt` there — an unpinned literal is
-// plainly `assignable`, so it would short-circuit past the literal-aware adoption block).
-// Pinning first makes that gate FALSE, the rep is never recorded, and the literal falls
-// back to structural row resolution. With a SELF-REFERENTIAL map value that resolver has
-// no answer: `type Tree = { value: i32, children: {[string]: Tree} }` /
-// `const leaf: Tree = { value: 1, children: Map() }` became "emitProgram: map value type
-// has no interned slot" — `tests/cases/types/recursive-map-value.vl`, the one corpus file
-// the field-wise pin reddened. Recording on the SAME condition, BEFORE the pin, is what
-// keeps the two in step.
-//
-// Not "check first, then pin": that order would lose a SAME-STATEMENT conflict
-// (`const w: W = { xs: fq(), ys: fq() }` over `{xs: string[], ys: f64[]}` is loud today
-// because the first field's pin is what makes the second field's check fail).
+// `constrainEmpty` AT A POSITION THAT HOLDS THE SOURCE EXPRESSION — the form every site that
+// pins and then asks `assignableExpr` must use.
+// THE PIN ERASES ITS OWN TRIGGER. `assignableExpr` records an ObjLit/ArrayLit's DESTINATION
+// rep on the `nodeRepTyIx` sidecar only while the literal still REACHES an open hole
+// (`tyReachesEmptyHole` gates `recordRepTyAdopt` there — an unpinned literal is plainly
+// `assignable`, so it would short-circuit past the literal-aware adoption block). Pinning
+// first makes that gate FALSE, the rep is never recorded, and the literal falls back to
+// structural row resolution — which has no answer for a SELF-REFERENTIAL map value
+// (`tests/cases/types/recursive-map-value.vl`). Recording on the SAME condition, BEFORE the
+// pin, is what keeps the two in step. Not "check first, then pin": that order would lose a
+// SAME-STATEMENT conflict, where the first field's pin is what makes the second field's check
+// fail.
 function constrainEmptyExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   if !inferQuiet && srcExpr >= 0 && tyReachesEmptyHole(srcTy, 8) {
     recordRepTyAdopt(srcExpr, dstTy, 6)
@@ -1772,26 +1399,18 @@ function flushUninferred(depth: i32) {
   0
 }
 
-// ── definite-assignment flow (A-definite-assign) ─────────────────────────────
-// Mirrors `compiler/typecheck.ts`'s host analysis (which lives in `parser.ts`):
-// an uninitialized `let x: T` (no initializer) starts UNASSIGNED and is non-null,
-// so a READ before it is provably written on every preceding path is a "used
-// before it is assigned" error — closing the silent-`0` soundness gap
-// (`let x: i32; return x` used to compile and return a fabricated 0). The
-// declaration is fine; only the read is gated.
-//
-// `daUnassigned` is the live set of binding NAMES still un-written on the CURRENT
-// path (a plain list — the set is tiny, only uninitialized lets in scope). A
-// `let x: T` with no initializer adds its name; `x = …` removes it; a read of a
-// still-present name errors (and drops it, so the same hole doesn't re-fire on
-// every later read). The host keys by `Binding` identity for exact shadowing; VL
-// keys by name (innermost-wins like `lookup`/`isConstName`) — sound for the
-// subset since the compiler's own source has NO uninitialized lets and no source
-// shadows an uninitialized let. Fork/join for `if`/`else` and loops is explicit
-// (snapshot/restore/join), modelled on the host. `daWriteTarget` is the node
-// index of a plain-`=` LHS Ident currently being evaluated as a WRITE (not a
-// read) so the `Ident` arm does not trip use-before-assign on it; a compound
-// `x += …` desugars to `x = x + (…)` whose RHS reads `x` and IS checked.
+// —— definite-assignment flow (A-definite-assign) ——————————————————————————————
+// An uninitialized `let x: T` starts UNASSIGNED and is non-null, so a READ before it is
+// provably written on every preceding path is a "used before it is assigned" error — closing
+// the silent-`0` soundness gap where `let x: i32` then `return x` returned a fabricated 0.
+// The declaration is fine; only the read is gated. `daUnassigned` is the live set of binding
+// NAMES still un-written on the CURRENT path (a plain list — the set is tiny). A `let x: T`
+// with no initializer adds its name, `x = …` removes it, a read of a still-present name errors
+// and drops it so the same hole does not re-fire. Keyed by NAME (innermost-wins like
+// `lookup`/`isConstName`), sound for the subset: the compiler's own source has no
+// uninitialized lets and nothing shadows one. Fork/join for `if`/`else` and loops is explicit
+// (snapshot/restore/join). `daWriteTarget` is the node index of a plain-`=` LHS Ident being
+// evaluated as a WRITE, so the `Ident` arm does not trip on it; a compound `x += …` IS checked.
 const daUnassigned: string[] = []
 let daWriteTarget = -1
 
@@ -2012,26 +1631,18 @@ let TY_NULL = -1
 // concrete types folds to. The bottom type: assignable to anything, nothing
 // (but itself / err) assignable to it.
 let TY_NEVER = -1
-// `u8` — a STORAGE type. Wasm has no 8-bit VALUE type (every 8-bit quantity computes as
-// an i32) but WasmGC DOES have packed STORAGE types: `i8`/`i16` are legal as array
-// element and struct field types. VL mirrors its substrate exactly, and the distinction
-// is what makes the type honest: a `u8` VALUE would be an i32 with nothing enforcing
-// 0..255 — a claim the runtime does not keep — whereas a `u8` SLOT is backed by one
-// byte, the store truncates, and every read genuinely yields 0..255. The claim is
-// enforced by the storage.
-//
-// So `u8` is legal in exactly ONE position today: the ELEMENT of an array (`u8[]`).
-// It is reachable ONLY through that spelling — `primTyOfName` deliberately does not
-// answer for it, so a bare `u8` annotation is not a type at all and gets the storage-type
-// diagnostic instead of resolving into a value position. `u8[]`'s elements are `u8` for
-// STORAGE and `i32` for VALUES: `b[i]` yields an i32 in 0..255 (`array.get_u` widens),
-// `b[i] = v` truncates to the low 8 bits (`array.set` does), and `push` takes an i32 —
-// exactly as `string` is `(array i32)` whose `s[i]` is an i32 code point with no `char`
-// type above it (DECISIONS A7).
-//
-// CONSEQUENCE, and it is deliberate: `u8[]` is NOT an instantiation of `T[]`, because
-// `T` binds VALUE types and `u8` is not one. `tyVarMayBind` refuses it, so generic code
-// cannot abstract over a `u8[]`.
+// `u8` — a STORAGE type. Wasm has no 8-bit VALUE type (every 8-bit quantity computes as an
+// i32) but WasmGC DOES have packed STORAGE types: `i8`/`i16` are legal as array element and
+// struct field types. VL mirrors its substrate exactly, and the distinction is what makes the
+// type honest: a `u8` VALUE would be an i32 with nothing enforcing 0..255 — a claim the
+// runtime does not keep — whereas a `u8` SLOT is backed by one byte, the store truncates, and
+// every read genuinely yields 0..255. So `u8` is legal in exactly ONE position: the ELEMENT of
+// an array (`u8[]`), reachable ONLY through that spelling — `primTyOfName` deliberately does
+// not answer for it, so a bare `u8` annotation gets the storage-type diagnostic instead of
+// resolving into a value position. `b[i]` widens (`array.get_u`), `b[i] = v` truncates, and
+// `push` takes an i32, exactly as `string` is `(array i32)` with no `char` type above it
+// (DECISIONS A7). CONSEQUENCE, deliberate: `u8[]` is NOT an instantiation of `T[]`, because
+// `T` binds VALUE types and `u8` is not one — `tyVarMayBind` refuses it.
 let TY_U8 = -1
 
 // ── type-arena constructors ──────────────────────────────────────────────────
@@ -2099,31 +1710,18 @@ function mkMapTy(key: i32, val: i32, isSet: i32) {
   addTy(t)
 }
 
-// THE ONE HOME of "which HASH does a `Map`/`Set` key take" — the map rep has exactly
-// two, `string` (hashed element-wise, `__str_hash__`) and `i32` (hashed by the integer
-// mix). Answers the arena type the keys are hashed AS (`TY_I32` / `TY_STR`), or -1 for
-// a key the rep cannot hold. Every gate — the two annotation gates (`tsToTy`'s `TS_MAP`,
-// `nameToTyReal`'s map arm), the usage-driven pin (`checkInferredMapKey`) and the two
-// emitter key-rep predicates (`nodeTyMapKeyIsI32`, `emit_rep.tyMapKeyIsI32`) — projects
-// this one answer, so the checker and the emitter cannot disagree about which hash a
-// map takes.
-//
-// THE TEST IS THE LOWERING, NOT THE SPELLING. Index equality against `TY_I32`/`TY_STR`
-// read the spelling: a nominal newtype is minted as a SECOND arena index over the SAME
-// `Ty` value (`newtype-design.md` §3) and is erased before the emitter runs, so
-// `{[Id]: V}` over `type Id = new i32` hashes byte-for-byte as `{[i32]: V}` — yet the
-// index compare refused it, and refused it in BOTH spellings (the annotation and the
-// `m[k] = v` pin), which made an annotation that restates what inference already knows a
-// reject. `tyPrimNameOf` is structural and peels a one-member union wrapper, so the
-// brand, the transparent alias and the alias-of-an-alias all reach their base here.
-//
-// A LITERAL UNION is deliberately NOT admitted, and it is not an oversight: a NAMED
-// string litunion reps as an interned i32 ATOM while its own spelling stays `K` at emit
-// (`numLitUnionBaseName` excludes the string base for exactly this reason), so the two
-// halves of a `{[K]: V}` map would disagree about the hash — the key expression lowers
-// as an atom and the map struct resolves string-keyed. That is a silent wrong answer,
-// strictly worse than the reject; admitting it needs the key RENDER and `.keys()`'s
-// element type to move together.
+// THE ONE HOME of "which HASH does a `Map`/`Set` key take" — the map rep has exactly two,
+// `string` (hashed element-wise, `__str_hash__`) and `i32` (hashed by the integer mix).
+// Answers the arena type the keys are hashed AS (`TY_I32` / `TY_STR`), or -1 for a key the rep
+// cannot hold. Every gate — the two annotation gates (`tsToTy`'s `TS_MAP`, `nameToTyReal`'s map
+// arm), the usage-driven pin (`checkInferredMapKey`) and the two emitter key-rep predicates —
+// projects this one answer, so the checker and the emitter cannot disagree about the hash.
+// THE TEST IS THE LOWERING, NOT THE SPELLING. A nominal newtype is a SECOND arena index over
+// the SAME `Ty` value (`newtype-design.md` §3), erased before the emitter runs, so `{[Id]: V}`
+// hashes as `{[i32]: V}` — yet an index compare refused it in BOTH spellings. `tyPrimNameOf`
+// is structural and peels a one-member union wrapper. A LITERAL UNION is deliberately NOT
+// admitted: a NAMED string litunion reps as an interned i32 ATOM while its spelling stays `K`,
+// so the two halves of a `{[K]: V}` map would disagree about the hash — silently.
 export function mapKeyRepTy(k: i32) {
   if tyIsPrimNamed(k, "i32") { return TY_I32 }
   if tyIsPrimNamed(k, "string") { return TY_STR }
@@ -2251,31 +1849,18 @@ let opIdxFns: string[] = []
 // operator banks nothing, which is this feature's inertness statement.
 let opIdxSiteNode: i32[] = []
 let opIdxSiteFn: string[] = []
-// ── THE TYPE-PARAMETER `self` OPERATOR, BANKED FROM BOTH ENDS (D491) ─────────────
-//
-// `binOpDeadSelf` refuses a binary operator declaration whose `self` can never be an
-// object (D425) and SUBTRACTS the hole: `function "+"<T>(self: T, other: T)` is silent
-// at an i32 site and DISPATCHES at an object one, so a type variable is whatever the
-// site pins it to and no declaration-site rule can be right for both. That subtraction
-// is correct and it is not the end of the question — the missing input is not in the
-// declaration, it is at the SITES, and the checker visits every one of them before it
-// returns.
-//
-// So: bank the declarations that gate subtracted (`opBinHoleDecl*`), and bank what each
-// `a op b` site DID with the operator (`opBinDispatched` / `opBinDeclined`).
-// `checkProgramEndOpDecls` then answers the whole-program question neither end can:
-// a hole-`self` declaration that NO site dispatched to while at least one site took the
-// language's own is a declaration that never fires, and it is said out loud at the
-// declaration's own line, at `vl check`, where an editor can show it.
-//
-// THE `opBinDeclined` HALF IS WHAT KEEPS `d471_pin_typaram` RUNNING. A declaration with
-// no `a op b` site anywhere is not this class — nothing was silently ignored, there was
-// nothing to ignore — and D471's own boundary set files that spelling as a cell that
-// must keep running. "Never used" is the linter's sentence, not this one's.
-//
-// SPARSE, and both banks are keyed by operator NAME rather than by node: `lookup(op)`
-// is the same name-keyed resolution `opSelfFnTy` makes, so a name is exactly the
-// granularity at which a site and a declaration can be said to be about each other.
+// —— THE TYPE-PARAMETER `self` OPERATOR, BANKED FROM BOTH ENDS (D491) ——————————————
+// `binOpDeadSelf` refuses a binary operator declaration whose `self` can never be an object
+// (D425) and SUBTRACTS the hole: `function "+"<T>(self: T, other: T)` is silent at an i32 site
+// and DISPATCHES at an object one, so no declaration-site rule can be right for both. That
+// subtraction is correct and not the end of the question — the missing input is at the SITES,
+// and the checker visits every one of them before it returns. So bank the declarations the
+// gate subtracted (`opBinHoleDecl*`) and what each `a op b` site DID (`opBinDispatched` /
+// `opBinDeclined`); `checkProgramEndOpDecls` then answers the whole-program question neither
+// end can, out loud at the declaration's own line. THE `opBinDeclined` HALF IS WHAT KEEPS
+// `d471_pin_typaram` RUNNING: a declaration with NO site anywhere is not this class, and D471's
+// boundary set files that spelling as a cell that must keep running. Both banks are keyed by
+// operator NAME, the granularity `lookup(op)` and `opSelfFnTy` already resolve at.
 let opBinHoleDeclName: string[] = []
 let opBinHoleDeclNode: i32[] = []
 let opBinHoleDeclAnn: boolean[] = []
@@ -2328,57 +1913,43 @@ let gRootStmts: i32[] = []
 let inferRetFn: string[] = []
 let inferRetTy: string[] = []
 // #1057 — the TOP-LEVEL ATOM COUNT of the recorded name, parallel to `inferRetTy`. The
-// emitter's anonymous-nominal residual (`registerInferRetNominalUnion`) asks "did this
-// recorded name spell a UNION" and answered by RE-SPLITTING the name it had just been
-// handed; the recorder banks the answer instead, and the consumer is a lookup.
-//
-// The FIRST attempt at this column walked the recorded ARENA type's union/nullable spine
-// (`retMemCountOf`) and was REFUTED in `registerInferRetNominalUnion`'s own comment: a
-// litunion member renders as ONE atom (its ALIAS) while the spine walk counts its literal
-// members, so the two disagree on `K0 | null` — and in the other direction a bare `K0`
-// return renders one atom while the walk counts >= 2, which would register a union this
+// emitter's anonymous-nominal residual (`registerInferRetNominalUnion`) asks "did this recorded
+// name spell a UNION" and answered by RE-SPLITTING the name it had just been handed; the
+// recorder banks the answer instead, and the consumer is a lookup.
+// A FIRST attempt walked the recorded ARENA type's union/nullable spine (`retMemCountOf`) and
+// was REFUTED: a litunion member renders as ONE atom (its ALIAS) while the spine walk counts
+// its literal members, so the two disagree on `K0 | null` — and in the other direction a bare
+// `K0` return renders one atom while the walk counts more, which would register a union this
 // compiler does not register. The count belongs to the NAME PRODUCER (how many atoms it
-// joined), not to a walk of the type it rendered. `recordInferRet` is the single funnel
-// every producer's name lands in, so the count is banked there, on the very string the
-// consumer would have split. -1 is unreachable by construction (every push records).
+// joined), not to a walk of the type it rendered. `recordInferRet` is the single funnel every
+// producer's name lands in, so the count is banked there, on the very string the consumer would
+// have split. -1 is unreachable by construction (every push records).
 let inferRetAtomCount: i32[] = []
-// The TOP-LEVEL atom count of the name the LAST inferred-return name producer returned —
-// the number `unionMemberCount` would report for it, produced BY THE PRODUCER THAT JOINED
-// IT instead of re-derived by scanning the finished string (#1115, the `emitNameAtoms`
-// discipline of #1113 applied to the inferred-return funnel).
-//
-// The contract every producer honours: **write this immediately before each NON-EMPTY
-// return** (`irAtoms` / `irRendered` do it in one expression). Writing only on the
-// non-empty returns is what makes the ladder in `checkFuncDeclNode` total without an
-// entry-reset: the rungs short-circuit, so the LAST producer to return non-empty is the
-// one whose name is recorded, and every earlier rung's "" (however much its own nested
-// calls churned this scalar) is overwritten by the winner.
-//
-// Not an arena-lifetime sidecar (method note 7): a scalar written on the way out of a
-// call and read by the immediate caller, never carried between programs.
+// The TOP-LEVEL atom count of the name the LAST inferred-return name producer returned — the
+// number `unionMemberCount` would report for it, produced BY THE PRODUCER THAT JOINED IT
+// instead of re-derived by scanning the finished string (the `emitNameAtoms` discipline applied
+// to the inferred-return funnel).
+// The contract every producer honours: **write this immediately before each NON-EMPTY return**
+// (`irAtoms` / `irRendered` do it in one expression). Writing only on the non-empty returns is
+// what makes the ladder in `checkFuncDeclNode` total without an entry-reset: the rungs
+// short-circuit, so the LAST producer to return non-empty is the one whose name is recorded,
+// and every earlier rung's "" is overwritten by the winner.
+// Not an arena-lifetime sidecar: a scalar written on the way out of a call and read by the
+// immediate caller, never carried between programs.
 let inferRetNameAtoms = 1
 
-// Hand back inferred-return name `nm` and report that it is `atoms` top-level atoms wide.
-// The producers' way of returning a second value: VL has one return slot, and the width is
+// Hand back inferred-return name `nm` and report that it is `atoms` top-level atoms wide —
+// the producers' way of returning a second value: VL has one return slot, and the width is
 // free at the `|` join that built the name.
-// ── THE RUNG COLUMN (destringify B26/B27) ────────────────────────────────────
-// WHICH PRODUCER answered for a recorded inferred-return row. The lambda cascade is ~28
-// short-circuiting producers and the one that answers non-empty IS the decision — but the
-// decision was thrown away and every consumer re-derived it by running character predicates
-// over the NAME the producer had built. `synthRetAnnots` alone runs up to 25 of them.
-//
-// Banking it is the same move #1057/#1112/#1115 made for the atom COUNT and #1113 for the canon
-// WIDTH, at the same funnel: the producer knows, so the producer records.
-//
-// THE FALL-THROUGH IS NOT A PRODUCER and gets its own code rather than 0-by-omission — B26
-// numbered it 0 and spent a measurement discovering that "no rung" and "rung 0" are different
-// claims. `IR_RUNG_NONE` means the `recordable` path (`anm`, the SPACED `tyToStructStr` render),
-// which admits three unrelated shapes through one `||`. Those three now carry their own codes
-// (the `IR_REC_*` band below), so a fall-through row says WHICH gate admitted it.
-//
-// The cascade's INITIALIZER (`unm = sfbNm`) is a producer despite not being spelled
-// `if unm == ""`, and B27 found it banked at 0 with the fall-through, which is what made an
-// earlier entry attribute two of `synthRetAnnots`' arms to the wrong source. It is `IR_RUNG_SFB`.
+// —— THE RUNG COLUMN (destringify B26/B27) ————————————————————————————————————
+// WHICH PRODUCER answered for a recorded inferred-return row. The cascade is a run of
+// short-circuiting producers and the one that answers non-empty IS the decision — thrown away
+// before this column existed, then re-derived by every consumer running character predicates
+// over the NAME the producer built. The producer knows, so the producer records.
+// THE FALL-THROUGH IS NOT A PRODUCER and gets its own code rather than 0-by-omission:
+// `IR_RUNG_NONE` means the `recordable` path, which admits three unrelated shapes through one
+// `||`, and those carry their own `IR_REC_*` codes below. The cascade's INITIALIZER
+// (`unm = sfbNm`) is a producer despite not being spelled `if unm == ""` — `IR_RUNG_SFB`.
 const IR_RUNG_NONE = 0 // the `recordable` fall-through — determines nothing
 const IR_RUNG_SFB = 28 // `structFieldBoxRetName`, the cascade's initializer
 // Rungs 1..27 are the `if unm == ""` producers in source order. 28 and 29 are OUT OF BAND on
@@ -2436,23 +2007,18 @@ const IR_RUNG_MAP_ELEM_LIST = 25
 const IR_RUNG_LITUNION_ELEM_LIST = 26
 const IR_RUNG_LITUNION_ALIAS = 27
 
-// ── THE FALL-THROUGH'S THREE GATES ───────────────────────────────────────────────────────────
+// —— THE FALL-THROUGH'S THREE GATES ——————————————————————————————————————————
 // NOT PRODUCERS, which is why they are not rungs. `recordable` admits three unrelated shapes
-// through one `||`, so banking 0 for all three said only "not a producer" — the conflation B26
-// spent a measurement discovering. These name WHICH GATE admitted the row.
-//
-// THEIR OWN BAND (>= 40), so the in-band cascade numbering (1..27) and the out-of-band
-// producer/leg numbering (28 initializer, 29 second leg, next leg 30) never have to step over
-// them. A future gate takes 43; a future leg still takes 30.
-//
+// through one `||`, so banking 0 for all three said only "not a producer"; these name WHICH
+// GATE admitted the row. THEY HAVE THEIR OWN BAND, so the in-band cascade numbering and the
+// out-of-band producer/leg numbering never have to step over them.
 // THE THREE ADMITTED SETS ARE PAIRWISE DISJOINT ON EVERY INPUT, not merely on reached ones:
-//   · scalar-list vs classifiable — `arrElemNameRaw` is a function, and {i32,string} is disjoint
-//     from {i64,f32,f64}; the six bare-leaf spellings fail `nameIsArray` so the cut yields "".
-//   · obj-shape vs either array leg — one requires a final `]`, the other a final `}`.
-//   · obj-shape vs the bare leaves — none of them opens with `{`.
-// So no tie-break rule is needed and the `||` order is NOT load-bearing. It is preserved anyway,
-// so this split asserts nothing about it. If a future change WIDENS any gate, disjointness must
-// be re-argued rather than assumed.
+// scalar-list vs classifiable (`arrElemNameRaw` is a function, {i32,string} is disjoint from
+// {i64,f32,f64}, and the bare-leaf spellings fail `nameIsArray`); obj-shape vs either array
+// leg (one requires a final `]`, the other a final `}`); obj-shape vs the bare leaves (none
+// opens with `{`). So no tie-break rule is needed and the `||` order is NOT load-bearing. It
+// is preserved anyway, so this split asserts nothing about it — but WIDEN any gate and
+// disjointness must be re-argued rather than assumed.
 const IR_REC_CLASSIFIABLE = 40 // `isClassifiableRetName` — NOT "scalar": it admits `i32[]`/`string[]` too
 const IR_REC_OBJ_SHAPE = 41 // `isObjShapeName`
 const IR_REC_SCALAR_LIST = 42 // `isScalarListRetName`
@@ -2508,10 +2074,10 @@ function irRendered(nm: string): string {
 // recorder had no arena index (falls through the walks harmlessly).
 let inferRetTyIx: i32[] = []
 // Name → its FIRST index in the arrays, so the hot `inferRetNameOf` is an O(1) map lookup
-// instead of a linear scan (it was ~6% of self-compile time). An i32-VALUED map (the well-
-// supported `{[string]: i32}` path — the string-valued map above mis-lowers), kept in sync via
-// `recordInferRet`. FIRST-wins, matching the old scan. The arrays stay for the emitter's INDEXED
-// access (`inferRetCount`/`inferRetTyAt`) and to hold the string type the map can't.
+// instead of a linear scan — it was a visible slice of self-compile time. An i32-VALUED map
+// (the well-supported `{[string]: i32}` path), kept in sync via `recordInferRet`, FIRST-wins to
+// match the old scan. The arrays stay for the emitter's INDEXED access
+// (`inferRetCount`/`inferRetTyAt`) and to hold the string type the map cannot.
 let inferRetIdx: {[string]: i32} = Map()
 // The binding analogue of `inferRetFn`/`inferRetTy`: an un-annotated `const`/`let`
 // whose INFERRED type is a value union is recorded by its LetDecl NODE INDEX, so the
@@ -2564,39 +2130,29 @@ let isParentTyIx: i32[] = []
 // them from two different sites (`setNarrowFromCond` and `setNarrowFromCondElse`) that never
 // run together for one branch. A flag would have to be set by whichever site asked last.
 let isParentElseTyIx: i32[] = []
-// CONTEXT-RESOLVED type sidecar (rep-twin-matcher phase 0a): parallel to `nodeTyIx`, this table
-// records — at the arena-pure coercion/ADOPTION sites — the DESTINATION (context) type a literal
-// node was widened INTO, which the emitter actually builds the rep for. `nodeTyIx` holds the
-// checker's NAIVE self-inferred type (`{f: boolean}` for a `{f: boolean}` literal), and it stays
-// untouched for its existing consumers; the emitter's rep/layer keying reads `nodeRepTyIxOf`, which
-// returns the recorded context type when present and falls back to `nodeTyIxOf` otherwise. Recorded
-// for the union-box / nullable-niche / i32→i64 adoptions where the literal's built rep is the
+// CONTEXT-RESOLVED type sidecar: parallel to `nodeTyIx`, this table records — at the
+// arena-pure coercion/ADOPTION sites — the DESTINATION (context) type a literal node was
+// widened INTO, which is the rep the emitter actually builds. `nodeTyIx` holds the checker's
+// NAIVE self-inferred type (`{f: boolean}` for a `{f: boolean}` literal) and stays untouched
+// for its existing consumers; the emitter's rep/layer keying reads `nodeRepTyIxOf`, which
+// returns the recorded context type when present and falls back to `nodeTyIxOf`. Recorded for
+// the union-box / nullable-niche / i32→i64 adoptions where the literal's built rep is the
 // destination (a `{f: boolean}` return adopted to `{f: boolean | {w: i32}}`), recursively into
-// fields/elements exactly where the adoption recursion goes (`tyDeeperThan`-guarded for recursive
-// types). NOTHING consumes it in this phase — the recorder is byte-identical.
+// fields/elements exactly where the adoption recursion goes (`tyDeeperThan`-guarded for
+// recursive types).
 let nodeRepTyIx: i32[] = []
-// ANNOTATION ATOM-COUNT sidecar (#1055): how many TOP-LEVEL union atoms the annotation
-// node's EMIT-TIME spelling is joined from, banked BY THE PRODUCER OF THAT SPELLING.
-//
+// ANNOTATION ATOM-COUNT sidecar: how many TOP-LEVEL union atoms the annotation node's
+// EMIT-TIME spelling is joined from, banked BY THE PRODUCER OF THAT SPELLING.
 // `canonEmitTypeNames` is that producer — it rewrites every `TypeRef`'s `tyName` into the
-// emitter's vocabulary at the end of `checkProgram`, and `compileSrc` hands the SAME arena
-// to `emitProgram`, so the name it writes is the name every emitter consumer reads. The
-// emitter used to re-derive the count by SPLITTING that rendered name back apart
-// (`registerCollapsedUnionName`); it now reads the number the producer already knows.
-//
-// Why the count cannot be recovered from the arena: an annotation whose members are
-// SAME-SHAPE declared structs (`A | B` with `type A = {v: i32}` / `type B = {v: i32}`)
-// resolves through `nameToTy`'s union arm, where `sameVariantTy` DEDUPS the two members
-// to one and the whole union collapses to a plain `TyObj`. After that collapse the arena
-// holds a struct, not a union, and "the source spelled a union" survives only in the
-// spelling. (`retMemCountOf`'s arena-spine walk was the refuted attempt at the sibling
-// question — see `recordInferRet`.)
-//
-// One entry per NODE (not per name): -1 for a node that is not a `TypeRef`, so a
-// consumer's `>= 2` test reads exactly what `splitUnionAtoms("")` gives it (1 atom, no
-// union) at a non-annotation node. Sized to the node arena and rebuilt inside
-// `canonEmitTypeNames`, which runs unconditionally on every checked program, so the
-// sidecar's lifetime is the program's.
+// emitter's vocabulary at the end of `checkProgram`, and `compileSrc` hands the SAME arena to
+// `emitProgram`, so the name it writes is the name every emitter consumer reads. The emitter
+// used to re-derive the count by SPLITTING that rendered name back apart.
+// The count cannot be recovered from the arena: an annotation whose members are SAME-SHAPE
+// declared structs (`A | B` over two `{v: i32}`) resolves through `nameToTy`'s union arm,
+// where `sameVariantTy` DEDUPS them and the union collapses to a plain `TyObj` — after which
+// "the source spelled a union" survives only in the spelling. One entry per NODE, -1 at a
+// non-`TypeRef`, so a consumer's `>= 2` test reads what `splitUnionAtoms("")` gives it. Sized
+// to the node arena and rebuilt inside `canonEmitTypeNames`, so its lifetime is the program's.
 let annUnionAtoms: i32[] = []
 // NOMINAL-IDENTITY sidecar (C1): the `Ty`-arena indices of DECLARED STRUCT types (`cStructTyIxs`)
 // and of UNION-VARIANT MEMBER types (`cVariantMemberTyIxs`). A struct annotation's node reads
@@ -2626,22 +2182,17 @@ let cUnionTyIxSet: boolean[] = []
 // ALIAS (an inline litunion spelling reps as a string ref, so the alias name is required).
 let cUnionNames: string[] = []
 // GENERIC-APPLICATION NOMINAL sidecar (typed-IR P1). The third reverse map in the
-// `cStructTyIxs`/`cUnionTyIxs` family, and the record #1267 measured missing: the arena
-// knows what `Box<i32>` EXPANDS to and nothing at all about the fact that an application
-// was written, so the nominal renderer had no route back to `Box<i32>` and produced the
-// structural `{value: i32}` instead — 114 of the 194 cells where `tyToNominalName ∘
-// nameToTy` disagrees with `canonEmitName`, the single largest class in that residue.
-//
+// `cStructTyIxs`/`cUnionTyIxs` family: the arena knows what `Box<i32>` EXPANDS to and nothing
+// at all about the fact that an application was WRITTEN, so the nominal renderer had no route
+// back to `Box<i32>` and produced the structural `{value: i32}` instead — the single largest
+// class in the residue where `tyToNominalName → nameToTy` disagrees with `canonEmitName`.
 // `applyGenAliasArgs` is the site with both halves in hand. It MEMOIZES the expansion per
-// `(head, argument type indices)` and mints a fresh `TyObj` per distinct application, and
-// the arena does not intern (`addTy` always pushes), so the recorded index belongs to that
-// application and to nothing else — an inline `{value: i32}` written elsewhere in the same
-// program gets its own index and is never claimed by this map.
-//
-// A NAME IS A NAME: the head is genuine nominal identity (the emitter's own `gaeBases`
-// registry is keyed by that declared name), so storing it as a string is not the disease.
-// The ARGUMENTS are stored as ARENA INDICES, not as a spelling — the renderer recurses
-// through them, so nothing here has to be parsed back.
+// `(head, argument type indices)` and mints a fresh `TyObj` per distinct application, and the
+// arena does not intern (`addTy` always pushes), so the recorded index belongs to that
+// application and to nothing else — an inline `{value: i32}` elsewhere gets its own index.
+// A NAME IS A NAME: the head is genuine nominal identity (the emitter's `gaeBases` registry is
+// keyed by that declared name), so storing it as a string is not the disease. The ARGUMENTS
+// are stored as ARENA INDICES, not as a spelling — the renderer recurses through them.
 let gaAppTyIxs: i32[] = []
 let gaAppTyIxSet: boolean[] = []
 let gaAppHeads: string[] = []
@@ -2665,47 +2216,33 @@ let gaAppFinite: i32[] = []
 // a plain alias-reference must be TRANSPARENT instead (see `aliasRefIsPlainRoot`).
 let cPlainAliasNames: string[] = []
 
-// ── the declaration FILL registry (pass 0a / 0b) ─────────────────────────────
-// `cUserTypes` gets a declaration's PLACEHOLDER in pass 0a and its SHAPE in pass 0b, so a
-// name resolved between the two answers from an EMPTY arena entry. That is not a missing
-// diagnostic, it is a WRONG TYPE: `declaredTyOfName`'s transparency collapse
-// (`singleAliasMemberTyIx`) needs the alias's one member to be present, so an unfilled
-// `type Flag = boolean` hands back the union WRAPPER, and the struct field that named it
-// keeps a one-member `TyUnion` where the declaration denotes `boolean`.
-//
-// These three columns make the fill DEMAND-ORDERED. `cFillStmtIx` maps a declared type
-// name to its declaration statement (LAST wins, exactly as `cUserTypes` does for a
-// redeclared name); `cFillDoneAt` is the set of arena entries already filled, keyed by
-// ARENA INDEX so two declarations sharing one placeholder still fill it once;
-// `cFillActive` is true only while pass 0b runs, so no later pass — and not the emitter,
-// which re-resolves names long afterwards — can re-enter the fill.
-//
-// `cFillDoneAt` is a FLAG COLUMN INDEXED BY the arena index (1 == filled), not a list of
-// the filled indices: the membership question is asked once per declaration and the list
-// grows once per declaration, so a scan would be O(#typedecls²) over the whole pass.
-// Indexing is available because `addTy` appends without interning, so a placeholder's
-// arena index is dense and unique to it. The KEY is unchanged — arena index, never name —
-// which is what keeps a redeclaration filling one placeholder exactly once.
+// —— the declaration FILL registry (pass 0a / 0b) ————————————————————————————
+// `cUserTypes` gets a declaration's PLACEHOLDER in pass 0a and its SHAPE in pass 0b, so a name
+// resolved between the two answers from an EMPTY arena entry. That is not a missing diagnostic,
+// it is a WRONG TYPE: `declaredTyOfName`'s transparency collapse (`singleAliasMemberTyIx`)
+// needs the alias's one member present, so an unfilled `type Flag = boolean` hands back the
+// union WRAPPER. These three columns make the fill DEMAND-ORDERED. `cFillStmtIx` maps a
+// declared type name to its declaration statement (LAST wins, as `cUserTypes` does for a
+// redeclared name); `cFillDoneAt` is the set of arena entries already filled, keyed by ARENA
+// INDEX so two declarations sharing one placeholder still fill it once; `cFillActive` is true
+// only while pass 0b runs, so no later pass — and not the emitter — can re-enter the fill.
+// `cFillDoneAt` is a FLAG COLUMN INDEXED BY the arena index, not a list of filled indices: a
+// scan would be quadratic in the declaration count. The KEY is the arena index, never a name.
 let cFillStmtIx: {[string]: i32} = Map()
 let cFillDoneAt: i32[] = []
 let cFillActive = false
-// NOMINAL NEWTYPE sidecar (webcraft P1.5 / A14) — the fourth member of the
-// `cStructTyIxs` / `cUnionTyIxs` / `gaAppTyIxs` family, and built to the same rule:
-// the arena stays STRUCTURAL and nominal-ness is a column beside it.
-//
-// `nwDeclNames` is the DECLARATION fact — the names written `type N = new …`,
-// recorded in pass 0a. `nwTyIxs`/`nwNames`/`nwBaseTyIxs` are the arena-index
-// sidecar: index `nwTyIxs[i]` carries the brand `nwNames[i]` and is structurally
+// NOMINAL NEWTYPE sidecar (webcraft P1.5 / A14) — the fourth member of the `cStructTyIxs` /
+// `cUnionTyIxs` / `gaAppTyIxs` family, and built to the same rule: the arena stays STRUCTURAL
+// and nominal-ness is a column beside it. `nwDeclNames` is the DECLARATION fact — the names
+// written `type N = new …`, recorded in pass 0a. `nwTyIxs`/`nwNames`/`nwBaseTyIxs` are the
+// arena-index sidecar: index `nwTyIxs[i]` carries the brand `nwNames[i]` and is structurally
 // the type at `nwBaseTyIxs[i]`.
-//
-// A BRAND IS A NAME, and that is the whole representation: a branded index is a
-// second index over the SAME `Ty` payload (`addTy(T.tys[base])`), so every
-// structural question — rep, width, field lookup, `is TyPrim` — answers exactly
-// as the base answers, and only `assignable`/`tyEq`/the binary-operator mixing
-// rule consult the column. That is what makes the type ZERO-COST: there is no
-// wrapper for the emitter to unwrap, and the emitter never learns the name at all
-// (canon's alias-transparency arm has already rewritten the annotation).
-// `docs/internals/newtype-design.md` is the design record.
+// A BRAND IS A NAME, and that is the whole representation: a branded index is a second index
+// over the SAME `Ty` payload (`addTy(T.tys[base])`), so every structural question — rep, width,
+// field lookup, `is TyPrim` — answers exactly as the base answers, and only
+// `assignable`/`tyEq`/the binary-operator mixing rule consult the column. That is what makes
+// the type ZERO-COST: no wrapper for the emitter to unwrap, and the emitter never learns the
+// name at all. `docs/internals/newtype-design.md` is the design record.
 let nwDeclNames: string[] = []
 let nwTyIxs: i32[] = []
 let nwNames: string[] = []
@@ -2725,22 +2262,18 @@ let nwBodyScopedNames: {[string]: i32} = Map()
 // sentence. Saved and restored beside `T.curRet` in `checkFuncDeclNode`; "" at
 // module scope and for an anonymous lambda.
 let curFnEscName = ""
-// FLAT RECORD sidecar (webcraft P1.2) — the measured layout of every
-// `flat type N = { … }` in the program, built once by `resolveFlatLayouts` after
-// the declaration passes have resolved field types, and read by exactly one
-// consumer: the `N.size` / `N.field` constant fold in `checkMemberNode`.
-//
-// The layout rule is the whole design in one line: **offsets are the running sum
-// of the declared field widths and the compiler never inserts a byte.** No
-// alignment, no trailing pad, no reordering. `docs/internals/flat-records-design.md`
-// §2 records why (the requirements doc's own example carries an explicit `pad`
-// field, which is only necessary if nothing pads implicitly; and unaligned access
-// is legal in wasm, so there is no correctness argument for the alternative).
-//
-// PER DECLARATION: `flSizes[d]` is the total byte size, or `FL_UNRESOLVED` while
-// the nested-record fixpoint is still running, or `FL_INVALID` when the
-// declaration was rejected (which suppresses the cycle report — an invalid
-// declaration is not a recursive one).
+// FLAT RECORD sidecar (webcraft P1.2) — the layout of every `flat type N = { … }` in the
+// program, built once by `resolveFlatLayouts` after the declaration passes have resolved field
+// types, and read by exactly one consumer: the `N.size` / `N.field` constant fold in
+// `checkMemberNode`.
+// The layout rule is the whole design in one line: **offsets are the running sum of the
+// declared field widths and the compiler never inserts a byte.** No alignment, no trailing pad,
+// no reordering. `docs/internals/flat-records-design.md` §2 records why — the requirements
+// doc's own example carries an explicit `pad` field, which is only necessary if nothing pads
+// implicitly, and unaligned access is legal in wasm.
+// PER DECLARATION: `flSizes[d]` is the total byte size, or `FL_UNRESOLVED` while the
+// nested-record fixpoint is still running, or `FL_INVALID` when the declaration was rejected
+// (which suppresses the cycle report — an invalid declaration is not a recursive one).
 let flNames: string[] = []
 let flSizes: i32[] = []
 let flFStart: i32[] = []
@@ -2864,20 +2397,17 @@ function isValBindLambda(nodeIx: i32) {
 }
 
 // VOID-CONTEXT DISCARD (DECISIONS: void contexts discard implicit tail values).
-//
-// The two node ledgers below are the checker→emitter channel for the void-discard
-// rule, and both are keyed on the CONTEXT being void — never on a tail's shape
-// (a bare-tail callee with a NON-void return keeps returning its value; the guard
-// fixtures `functions/nonvoid-bare-tail-value-*.vl` pin that keying).
-//
-// `voidCtxLambdaNodes`: lambda LITERAL nodes checked against an expected
-// `(…) => void` (a `cb: () => void` argument, an annotated binding/field/return).
-// Such a lambda ADOPTS the void return: its body is checked under `curRet = void`
-// — so an explicit `return expr` inside it is the ordinary
-// `return type mismatch: expected void, got …` anchored AT the return — and a
+// The two node ledgers below are the checker→emitter channel for the void-discard rule, and
+// both are keyed on the CONTEXT being void — never on a tail's shape (a bare-tail callee with a
+// NON-void return keeps returning its value; the guard fixtures
+// `functions/nonvoid-bare-tail-value-*.vl` pin that keying).
+// `voidCtxLambdaNodes`: lambda LITERAL nodes checked against an expected `(…) => void` (a
+// `cb: () => void` argument, an annotated binding/field/return). Such a lambda ADOPTS the void
+// return: its body is checked under `curRet = void` — so an explicit `return expr` inside it is
+// the ordinary `return type mismatch: expected void, got …` anchored AT the return — and a
 // value-bearing tail is accepted and DISCARDED. The emitter reads the ledger in
-// `synthRetAnnots` and pins the lambda's `fnRet` to `void`, which is what routes
-// its functype to 0 results (`>v`) and its tail through the statement/drop path.
+// `synthRetAnnots` and pins the lambda's `fnRet` to `void`, which is what routes its functype
+// to zero results (`>v`) and its tail through the statement/drop path.
 let voidCtxLambdaNodes: i32[] = []
 function noteVoidCtxLambda(nodeIx: i32) {
   if !listHasI32(voidCtxLambdaNodes, nodeIx) { voidCtxLambdaNodes.push(nodeIx) }
@@ -2974,14 +2504,13 @@ function lambdaBodyTail(bodyIx: i32) {
 // FIELD-WISE into the contextual expected return (`const v: () => {f: i64} = () => ({f: 5})`)
 // ADOPTS the expected shape. Sound only when every widening field's VALUE is a small int
 // literal — the literal re-encodes at the wider rep inside the body, and the expected field
-// type is RECORDED on the literal node so the emitter's literal-shape interner
-// (`anonFieldCode`, which otherwise codes a small literal i32) interns the wide slot.
-// Anything else keeps the inferred shape, and `objNumWidens` in `fnSlotAssignable` rejects
-// it loudly (a function value's field rep is fixed; only a literal body can re-encode).
-// The FIELD WALK of `objRetWidenAdopt`, factored out so a NESTED object field recurses:
-// `litIx` is an ObjLit whose inferred type `sTyIx` adopts the expected `dTyIx` field-wise,
-// appending each re-encodable value node + its adopted field type to `recNodes`/`recTys`.
-// Returns false on any proven field mismatch (the caller keeps the inferred type).
+// type is RECORDED on the literal node so the emitter's literal-shape interner (`anonFieldCode`)
+// interns the wide slot. Anything else keeps the inferred shape, and `objNumWidens` in
+// `fnSlotAssignable` rejects it loudly: a function value's field rep is fixed, and only a
+// literal body can re-encode. The FIELD WALK of `objRetWidenAdopt`, factored out so a NESTED
+// object field recurses: `litIx` is an ObjLit whose inferred `sTyIx` adopts the expected
+// `dTyIx` field-wise, appending each re-encodable value node + its adopted field type to
+// `recNodes`/`recTys`. Returns false on any proven mismatch (the caller keeps the inferred one).
 function objLitWidenFields(
   litIx: i32,
   sTyIx: i32,
@@ -3033,22 +2562,18 @@ function objLitWidenFields(
       recNodes.push(fv)
       recTys.push(dty)
     } else if assignable(sty, dty) && !assignable(dty, sty) {
-      // The field WIDENS by BOXING — a bare scalar/struct arm into a UNION or NULLABLE
-      // field (`{f: false}` against `{f: boolean | {w: i32}}`, `{f: 99}` against
-      // `{f: i64 | string}`). Adopt when the literal value re-encodes at the wider field
-      // type (`assignableExpr`, field-wise) — the object dual of the value-union return
-      // arm. Record the field type so the emitter boxes the field slot and coerces the
-      // ObjLit value into the box, exactly as the annotated `: {f: boolean | {w: i32}}`
-      // named-function return already lowers. `synthRetAnnots` pins the lambda's `fnRet`
-      // to the whole struct shape (`nameIsStructWithUnionField`), so its `$fnsig` result
-      // is the union-field struct — without which the value call mis-recovered the plain
-      // struct (MISMATCH / INVALID-WASM at the boxed field read).
-      // A NESTED object field whose INNER field widens (`{f: {f: 16743}}` against
-      // `{f: {f: i32 | string}}`): the value is itself an ObjLit — RECURSE so the inner
-      // literal adopts the union-field shape and records ITS node type; without the
-      // descent the lambda body built the self-inferred `{f: i32}` layout while the sig
-      // keyed the union-field struct (INVALID-WASM at the return; fuzz-nightly run
-      // 29808029476, seed 78530533 d5 `(i32) => {f: {f: i32 | string}}`).
+      // The field WIDENS by BOXING — a bare scalar/struct arm into a UNION or NULLABLE field
+      // (`{f: false}` against `{f: boolean | {w: i32}}`). Adopt when the literal value
+      // re-encodes at the wider field type (`assignableExpr`, field-wise) — the object dual of
+      // the value-union return arm. Record the field type so the emitter boxes the field slot
+      // and coerces the ObjLit value into the box, exactly as the annotated named-function
+      // return already lowers. `synthRetAnnots` pins the lambda's `fnRet` to the whole struct
+      // shape (`nameIsStructWithUnionField`), so its `$fnsig` result is the union-field struct
+      // — without which the value call mis-recovers the plain struct (invalid wasm at the boxed
+      // field read). A NESTED object field whose INNER field widens: the value is itself an
+      // ObjLit, so RECURSE and let the inner literal adopt the union-field shape and record ITS
+      // node type; without the descent the lambda body builds the self-inferred layout while
+      // the sig keys the union-field struct.
       if fv < 0 { return false }
       let fvIn = fv
       let fvDone = false
@@ -3253,19 +2778,16 @@ function unionObjArmForLit(u: TyUnion, objIx: i32) {
 }
 // The union member index of `u`'s array arm covering the array literal `arrIx`, or -1. Lets
 // `seedExpected` descend an array LITERAL flowing into a union into that arm so a bare element
-// lambda (directly, or NESTED in a struct-element field) infers its params/result from the arm's
-// element type. Two admitted element shapes, both of which the emitter has a sound narrowed read
-// for (the direct `T[]` binding lowers today):
+// lambda (directly, or NESTED in a struct-element field) infers its params/result from the
+// arm's element type. Two admitted element shapes, both of which the emitter has a sound
+// narrowed read for (the direct `T[]` binding lowers today):
 //   - a CLOSURE element (`((i32) => f32)[] | i32`): the element lambda seeds off the function arm;
-//   - a STRUCT element (`{a: f64, f: (() => f64|null)[], z: string}[] | i64`) whose fields are
-//     seed-safe (`unionArmSeedSafe`) AND cover the literal's element ObjLit field names: a bare
-//     field/closure-array-field lambda deep in the element struct seeds off the arm's field types
-//     (else it self-infers a narrower result — e.g. `() => f64` for a `() => f64|null` field — and
-//     the boxed producer/consumer disagree → a runtime cast trap).
-// A scalar/string array arm needs no contextual seed (its elements infer standalone) and is left
-// out. Seeding only supplies contextual types; the whole literal is still gated by the normal
-// assignability check against the union, so a mis-matched arm cannot be silently accepted. FIRST
-// match wins.
+//   - a STRUCT element whose fields are seed-safe (`unionArmSeedSafe`) AND cover the literal's
+//     element ObjLit field names: a bare field/closure-array-field lambda deep in the element
+//     struct seeds off the arm's field types, else it self-infers a narrower result and the
+//     boxed producer and consumer disagree — a runtime cast trap.
+// A scalar/string array arm needs no contextual seed and is left out. Seeding only supplies
+// contextual types; the literal is still gated by the normal assignability check. FIRST wins.
 function unionArrayArmForLit(u: TyUnion, arrIx: i32) {
   const an = P.nodes[arrIx]
   if an is ArrayLit {
@@ -3394,17 +2916,14 @@ function seedExpected(exprIx: i32, expectedTy: i32) {
   0
 }
 
-// ── DEEP `is` OVER A `Json` VALUE — the sites the checker ADMITS and RECORDS ──
-// (`docs/serde-design.md` §"Deep `is` / `as` over a `Json` value`; closes
-// silent-class-inventory D1035.)
-//
-// `r is T` where `r`'s type is a JSON-SHAPED UNION and `T` is not one of its arms is a
-// RUNTIME SHAPE WALK, not a tag test. The checker's whole job is to say WHICH sites are
-// that — it cannot lower one — so it records the site and the target here, and
-// `json_walk.vl` turns each distinct target into one generated VL walker and rewrites the
-// site into a call. The tables are ARENA-PARALLEL to nothing and node-parallel to nothing:
-// they are a per-compile worklist, so they reset exactly where the arena does.
-//
+// —— DEEP `is` OVER A `Json` VALUE — the sites the checker ADMITS and RECORDS ——
+// (`docs/serde-design.md` §"Deep `is` / `as` over a `Json` value"; closes D1035.)
+// `r is T` where `r`'s type is a JSON-SHAPED UNION and `T` is not one of its arms is a RUNTIME
+// SHAPE WALK, not a tag test. The checker's whole job is to say WHICH sites are that — it
+// cannot lower one — so it records the site and the target here, and `json_walk.vl` turns each
+// distinct target into one generated VL walker and rewrites the site into a call.
+// The tables are ARENA-PARALLEL to nothing and node-parallel to nothing: they are a per-compile
+// worklist, so they reset exactly where the arena does.
 // `jwTgt*` is DEDUPED by (target spelling, receiver spelling) — that pair is the walker's
 // identity, and it is why two `is Cfg` sites in one module emit ONE walker.
 export let jwTgtSpell: string[] = []
@@ -3729,42 +3248,18 @@ export function initChecker() {
   declare("__memory_size__", mkFuncTy(noParams, TY_I32))
   declare("__memory_copy__", mkFuncTy([TY_I32, TY_I32, TY_I32], TY_VOID))
   declare("__memory_fill__", mkFuncTy([TY_I32, TY_I32, TY_I32], TY_VOID))
-  // THE LOAD-WIDTH MATRIX (webcraft P0.1, `buffer-design.md` §C2). Each VL signature
-  // IS the wasm instruction's signature — the same rule P0.3/P0.4's numeric intrinsics
-  // follow — so there is nothing to choose here beyond the name:
-  //
-  //   __load_i8__  → i32.load8_s   __load_u8__  → i32.load8_u
-  //   __load_i16__ → i32.load16_s  __load_u16__ → i32.load16_u
-  //   __load_i64__ → i64.load      __load_f32__ → f32.load    __load_f64__ → f64.load
-  //
-  // The narrow loads all RESULT in i32 — that is what the instruction does: the `_s`
-  // form sign-extends the byte/halfword into the i32, the `_u` form zero-extends it,
-  // and the difference is the whole reason both spellings exist (`__load_i8__` of the
-  // byte 0xFF is -1; `__load_u8__` of the same byte is 255).
-  //
-  // THE WIDE STORE WIDTHS were declared above long before they lowered; they now do,
-  // as the exact duals of the three wide loads (`nameIsMemStoreIntrinsic`):
-  //
-  //   __store_i64__ → i64.store   __store_f32__ → f32.store   __store_f64__ → f64.store
-  //
-  // The VALUE operand takes the declared width (an integer literal re-encodes at i64, a
-  // float literal at f32/f64) — unlike the ADDRESS, which is an i32 in all fourteen.
-  //
-  // THE NARROW STORE WIDTHS complete §C2's matrix:
-  //
-  //   __store_i8__ → i32.store8 (0x3a)     __store_i16__ → i32.store16 (0x3b)
-  //
-  // Both take an i32 VALUE and TRUNCATE it — there is one instruction per width and it
-  // cannot tell a signed byte from an unsigned one, which is why there is no
-  // `__store_u8__`/`__store_u16__` twin (§O2, ruled). That asymmetry against the loads,
-  // which really do have two instructions each, is the instruction set's and is
-  // deliberate: `__store_i8__(a, 255)` and `__store_i8__(a, -1)` write the same byte,
-  // and `__load_i8__` reads it back as -1 while `__load_u8__` reads 255.
-  //
+  // THE LOAD-WIDTH MATRIX (webcraft P0.1, `buffer-design.md` §C2). Each VL signature IS the
+  // wasm instruction's signature — the same rule P0.3/P0.4's numeric intrinsics follow — so
+  // there is nothing to choose here beyond the name: `__load_i8__`/`__load_u8__` are
+  // `i32.load8_s`/`i32.load8_u`, `__load_i16__`/`__load_u16__` the halfword pair, and
+  // `__load_i64__`/`__load_f32__`/`__load_f64__` the wide three. The narrow loads all RESULT in
+  // i32 because that is what the instruction does, and the `_s`/`_u` split is the whole reason
+  // both spellings exist. The WIDE stores are their exact duals (`nameIsMemStoreIntrinsic`) and
+  // take the declared width in the VALUE operand, unlike the ADDRESS, which is always an i32.
+  // THE NARROW STORES complete §C2's matrix — `i32.store8` / `i32.store16`, both taking an i32
+  // VALUE and TRUNCATING it, so there is no `__store_u8__`/`__store_u16__` twin (§O2, ruled).
   // `__store_string__` and `__log_string__` stay dead: they are the two names
-  // `nameIsUnimplementedIntrinsic` lists, and calling one is a positioned CHECKER
-  // diagnostic rather than an `emitProgram: call to unknown function` that reads like a
-  // typo'd identifier. Neither is a table entry away — see that comment.
+  // `nameIsUnimplementedIntrinsic` lists, so calling one is a positioned CHECKER diagnostic.
   declare("__load_i8__", mkFuncTy([TY_I32], TY_I32))
   declare("__load_u8__", mkFuncTy([TY_I32], TY_I32))
   declare("__load_i16__", mkFuncTy([TY_I32], TY_I32))
@@ -3772,32 +3267,18 @@ export function initChecker() {
   declare("__load_i64__", mkFuncTy([TY_I32], TY_I64))
   declare("__load_f32__", mkFuncTy([TY_I32], TY_F32))
   declare("__load_f64__", mkFuncTy([TY_I32], TY_F64))
-  // ── THE FILESYSTEM FLOOR (`std:fs`) ─────────────────────────────────────────
-  // Seven HOST IMPORTS — unlike everything above them in this function, these do not
-  // lower to instructions. Each is a real entry in the `"imports"` module, because a
-  // syscall is the one thing wasm cannot express: the module asks the embedder.
-  //
-  // BYTES, NOT STRINGS, in both directions. A path is what POSIX stores — a byte
-  // string, not necessarily UTF-8 — and file CONTENT is bytes by definition. `u8[]`
-  // (#1805) is the packed `(array (mut i8))` under the standard wrapper, so a payload
-  // crosses as ONE GC object with no linear memory, no pointer and no length
-  // negotiation. `std:utf8` owns the transcoding on top; this layer never decodes.
-  //
-  // ERRORS ARE OUT OF BAND, and that is a WART with a filed reason. The shape this
-  // wants is `u8[] | i32` (contents or errno) or `u8[] | null`; BOTH were measured at
-  // this head and neither lowers — `u8[] | i32` is check-clean INVALID WASM
-  // (`expected i32, found (ref $type)`) while the `i32[] | i32` control runs, and
-  // `u8[] | null` declines loudly (`bare null needs a struct-typed context`). Filed as
-  // #1806. So a failing call answers an EMPTY `u8[]` and the reason is read from
-  // `__fs_errno__()`, which is POSIX's own convention and is UNAMBIGUOUS because errno
-  // is zeroed on success: `len == 0 && errno == 0` is an empty file, `len == 0 &&
-  // errno != 0` is a failure. `std:fs` isolates that read in one helper, so when #1806
-  // lands the floor becomes stateless without touching a caller.
-  //
-  // THE ERRNOS ARE WASI PREVIEW1 NUMBERING (ENOENT=44, not 2) because that is the
-  // numbering `std/fs.vl` already hardcodes and the numbering a WASI host would report.
-  // A negative return is `-errno`; `__fs_stat__` answers 0 for a file, 1 for a
-  // directory.
+  // —— THE FILESYSTEM FLOOR (`std:fs`) ——————————————————————————————————————
+  // Seven HOST IMPORTS — unlike everything above them in this function, these do not lower to
+  // instructions. Each is a real entry in the `"imports"` module, because a syscall is the one
+  // thing wasm cannot express: the module asks the embedder.
+  // BYTES, NOT STRINGS, in both directions. A path is what POSIX stores — a byte string, not
+  // necessarily UTF-8 — and file CONTENT is bytes by definition. `u8[]` is the packed
+  // `(array (mut i8))` under the standard wrapper, so a payload crosses as ONE GC object with
+  // no linear memory and no length negotiation; `std:utf8` owns the transcoding on top.
+  // ERRORS ARE OUT OF BAND, and that is a WART with a filed reason: neither `u8[] | i32` nor
+  // `u8[] | null` lowers at this head, so a failing call answers an EMPTY `u8[]` and the reason
+  // is read from `__fs_errno__()` — unambiguous because errno is zeroed on success. THE ERRNOS
+  // ARE WASI PREVIEW1 NUMBERING, which `std/fs.vl` hardcodes; a negative return is `-errno`.
   const u8Arr = mkArrayTy(TY_U8)
   declare("__fs_read__", mkFuncTy([u8Arr], u8Arr))
   declare("__fs_write__", mkFuncTy([u8Arr, u8Arr], TY_I32))
@@ -3809,33 +3290,18 @@ export function initChecker() {
   0
 }
 
-// The intrinsic names the EMITTER dispatches on at the CALL SITE, by name, before it
-// ever looks up a declaration: each lowers to instructions inline
-// (`wasmEmit.emitCallExpr`'s `__store_i32__`/`__load_i32__`/`__log__` arms and the
-// array-intrinsic floor `__array_new__`/`__array_new_default__`/`__array_copy__`/
-// `__trap__`). A user function of one of these names therefore NEVER RUNS — the call
-// site is rewritten and the body is silently discarded.
-//
-// Measured, one shape per name: `function __load_i32__(a: i32) { return 7 }` +
-// `print(__load_i32__(1))` printed **0** (an `i32.load` of address 1), `vl check` clean;
-// in STATEMENT position `__store_i32__` and `__log__` discarded the body just as
-// silently. The others only failed LOUDLY by accident of stack shape (an `i32.store`
-// leaves nothing where an i32 was wanted) or because the checker happens to carry an
-// arity arm for them — not by design, and a differently-shaped user signature loses that
-// accident. So the rule is the NAME, not the symptom: reject the DEFINITION, where the
-// author can see it, instead of letting a call site quietly mean something else.
-//
-// This list is the reservation; the emitter's per-name arms stay where they are because
-// each picks a DIFFERENT lowering (a dispatch, not a classification). The two must be
-// kept in step — a new inline-lowered intrinsic belongs here the same day.
-//
-// EXPORTED because it is also the exact soundness condition for `capScan`'s callee-position
-// capture exemption (`emit_classify.vl`): a name whose CALL SITE the emitter rewrites before
-// looking up a declaration denotes instructions, not a value, so there is nothing to read out
-// of an enclosing frame. `emit_base.isBuiltinFnName` had been keeping a PARTIAL COPY of this
-// set for that purpose and its header filed the export as the fix; `capScan` now asks this
-// predicate directly, so a new intrinsic reserved here is exempt there the same day and the
-// two cannot drift.
+// The intrinsic names the EMITTER dispatches on at the CALL SITE, by name, before it ever looks
+// up a declaration: each lowers to instructions inline (`wasmEmit.emitCallExpr`'s
+// `__store_i32__`/`__load_i32__`/`__log__` arms and the array-intrinsic floor). A user function
+// of one of these names therefore NEVER RUNS — the call site is rewritten and the body is
+// silently discarded, `vl check` clean. The others only failed LOUDLY by accident of stack
+// shape, or because the checker happens to carry an arity arm, and a differently-shaped user
+// signature loses that accident. So the rule is the NAME: reject the DEFINITION, where the
+// author can see it, instead of letting a call site quietly mean something else. This list is
+// the reservation; the emitter's per-name arms stay where they are because each picks a
+// DIFFERENT lowering. EXPORTED because it is also the exact soundness condition for `capScan`'s
+// callee-position capture exemption (`emit_classify.vl`): a name whose CALL SITE the emitter
+// rewrites denotes instructions, not a value, so there is nothing to read out of a frame.
 export function nameIsEmitterIntrinsic(name: string) {
   if name == "__store_i32__" { return true }
   if name == "__load_i32__" { return true }
@@ -3863,32 +3329,18 @@ export function nameIsEmitterIntrinsic(name: string) {
   false
 }
 
-// THE BULK PAIR (`buffer-design.md` §C3) — the two ops webcraft calls load-bearing
-// rather than convenient, because snapshot and rollback ARE these instructions and
-// without them a snapshot is a per-word loop:
-//
-//   __memory_copy__(dst, src, len)   → memory.copy   (0xfc 10 0x00 0x00)
-//   __memory_fill__(dst, byte, len)  → memory.fill   (0xfc 11 0x00)
-//
-// All six operands are i32 and both results are void, so unlike the store widths there
-// is no width dispatch: every operand takes the ordinary `emitMemIntrinArg` spine.
-//
-// TWO SEMANTICS THE SIGNATURE DOES NOT SHOW, both of them the instruction's and
-// therefore not this layer's to soften (the VL signature IS the wasm signature, the
-// same rule the load matrix and P0.3/P0.4's numeric intrinsics follow):
-//
-//   - `len` is UNSIGNED. A negative length is ~4 GiB and traps. A caller that wants
-//     "a non-positive length writes nothing" must say so itself — `std:buffer`'s
-//     `fill`/`copyFrom` do, because that is POLICY and policy is std's (O1 = (c)).
-//   - `memory.copy` is defined to behave as if the bytes went through a temporary, so
-//     it is OVERLAP-SAFE IN BOTH DIRECTIONS — memmove, not memcpy. That is a property
-//     of the instruction, which is exactly why it is worth reaching: the `std:buffer`
-//     loop it replaces had to choose its direction from the addresses by hand.
-//
-// Neither needs an import and neither needs a data segment: these are the `memory.init`
-// family's siblings, but only the two that operate on already-mapped bytes. What they
-// DO need is the `0xfc` misc prefix, which this emitter had no writer for until they
-// landed — see `fbMemBulk`.
+// THE BULK PAIR (`buffer-design.md` §C3) — the two ops webcraft calls load-bearing rather than
+// convenient, because snapshot and rollback ARE these instructions and without them a snapshot
+// is a per-word loop: `__memory_copy__(dst, src, len)` → `memory.copy`, and
+// `__memory_fill__(dst, byte, len)` → `memory.fill`. All six operands are i32 and both results
+// are void, so unlike the store widths there is no width dispatch: every operand takes the
+// ordinary `emitMemIntrinArg` spine.
+// TWO SEMANTICS THE SIGNATURE DOES NOT SHOW, both the instruction's and therefore not this
+// layer's to soften: `len` is UNSIGNED, so a negative length is enormous and traps — a caller
+// wanting "a non-positive length writes nothing" must say so itself, because that is POLICY and
+// policy is std's (O1 = (c)); and `memory.copy` behaves as if the bytes went through a
+// temporary, so it is OVERLAP-SAFE IN BOTH DIRECTIONS — memmove, not memcpy. Both need the
+// `0xfc` misc prefix, which this emitter had no writer for until they landed — see `fbMemBulk`.
 export function nameIsMemBulkIntrinsic(name: string) {
   if name == "__memory_copy__" { return true }
   if name == "__memory_fill__" { return true }
@@ -3910,21 +3362,18 @@ export function nameIsMemLoadIntrinsic(name: string) {
   false
 }
 
-// The five store widths that are not `__store_i32__` — the three WIDE ones (the exact
-// duals of `__load_i64__`/`__load_f32__`/`__load_f64__`) and the two NARROW ones that
-// complete §C2's matrix. `__store_i32__` predates them all and keeps its own arm at
-// every call site, so it is deliberately NOT in this set, exactly as `__load_i32__` is
-// not in `nameIsMemLoadIntrinsic`.
-//
-// The narrow pair has no signed/unsigned split because there is one instruction per
-// width and it truncates (§O2, ruled `store8`/`store16` at the `std:buffer` surface).
-// They differ from the wide three in exactly one respect the emitter must honour: their
-// VALUE operand is an i32, so it takes the ordinary `emitMemIntrinArg` spine rather
-// than an `emitExprAs{I64,F32,F64}` widening — see the arm.
-//
-// One list, consulted by the checker's definition reservation, the emitter's dispatch,
-// the tail-value classifier, the statement `drop` suppression and the memory-usage scan
-// — so the five cannot drift.
+// The five store widths that are not `__store_i32__` — the three WIDE ones (the exact duals of
+// `__load_i64__`/`__load_f32__`/`__load_f64__`) and the two NARROW ones that complete §C2's
+// matrix. `__store_i32__` predates them all and keeps its own arm at every call site, so it is
+// deliberately NOT in this set, exactly as `__load_i32__` is not in `nameIsMemLoadIntrinsic`.
+// The narrow pair has no signed/unsigned split because there is one instruction per width and
+// it truncates (§O2, ruled `store8`/`store16` at the `std:buffer` surface). They differ from the
+// wide three in exactly one respect the emitter must honour: their VALUE operand is an i32, so
+// it takes the ordinary `emitMemIntrinArg` spine rather than an `emitExprAs{I64,F32,F64}`
+// widening — see the arm.
+// One list, consulted by the checker's definition reservation, the emitter's dispatch, the
+// tail-value classifier, the statement `drop` suppression and the memory-usage scan — so the
+// five cannot drift.
 export function nameIsMemStoreIntrinsic(name: string) {
   if name == "__store_i64__" { return true }
   if name == "__store_f32__" { return true }
@@ -3934,22 +3383,18 @@ export function nameIsMemStoreIntrinsic(name: string) {
   false
 }
 
-// ── the filesystem floor: ONE ordered list, six readers ───────────────────────
-// The SLOT is the identity of an fs intrinsic everywhere downstream, and the order
-// below is the only place it is written. Six consumers key off it — the checker's
-// redefinition reservation (`nameIsEmitterIntrinsic`), the emitter's use scan
-// (`scanPrintUse`), the type section's standalone functypes, the import section's
-// entries, the name section's labels, and the call lowering's `fbCall` target — so a
-// name added here appears in all six or in none, and none of them carries its own
-// spelling of the set.
-//
-// THE ORDER IS APPEND-ONLY, for the same reason the print family's is: slot k's import
-// index is assigned by counting the USED slots below k, so inserting a name in the
-// middle would move the wasm function index of every later import in a program that
-// uses both. A new syscall goes on the END.
-//
-// -1 for every other name, which is what makes `nameIsFsIntrinsic` a projection of this
-// function rather than a second list beside it.
+// —— the filesystem floor: ONE ordered list, six readers ——————————————————————
+// The SLOT is the identity of an fs intrinsic everywhere downstream, and the order below is the
+// only place it is written. Six consumers key off it — the checker's redefinition reservation
+// (`nameIsEmitterIntrinsic`), the emitter's use scan (`scanPrintUse`), the type section's
+// standalone functypes, the import section's entries, the name section's labels, and the call
+// lowering's `fbCall` target — so a name added here appears in all six or in none, and none of
+// them carries its own spelling of the set.
+// THE ORDER IS APPEND-ONLY, for the same reason the print family's is: slot k's import index is
+// assigned by counting the USED slots below k, so inserting a name in the middle would move the
+// wasm function index of every later import in a program that uses both. A new syscall goes on
+// the END. -1 for every other name, which is what makes `nameIsFsIntrinsic` a projection of
+// this function rather than a second list beside it.
 export function fsIntrinsicSlot(name: string): i32 {
   if name == "__fs_read__" { return 0 }
   if name == "__fs_write__" { return 1 }
@@ -4013,25 +3458,18 @@ export function fsIntrinsicArity(k: i32): i32 {
 // turn on.
 export function fsRetIsU8List(k: i32) { k == 0 || k == 2 || k == 5 }
 
-// THE DECLARED-BUT-UNLOWERED MEMORY INTRINSICS — the ones that pass `vl check` and then
-// die at emit with `emitProgram: call to unknown function`. Re-censused at each head, in
-// three call POSITIONS each (statement / value / binding), against the names
-// `defaultScope` declares: #1170 gave the load-width matrix and `memory.size`/
-// `memory.grow` their arms (twelve lowering, five not), the wide store widths got
-// theirs next, and THIS change adds the narrow store pair and the bulk pair — declared
-// and lowered in the same commit, so they never spend a day on this list. TWO remain:
-//
-//   `__store_string__`  `__log_string__`                — host-boundary string sinks
-//
-// Named here so the CHECKER says that, positioned and in the author's terms, instead of
-// letting the call reach the emitter and come back as `call to unknown function` — a
-// message that reads like a TYPO'D IDENTIFIER when the identifier is real and the
-// IMPLEMENTATION is what is missing. `docs/internals/memory-gc-design.md` §1.2 filed
-// exactly that as "the half worth fixing first"; this is that half.
-//
-// The two string sinks are NOT a table entry away: `__store_string__` would have to copy
-// a GC `(array i32)` into linear memory with no byte encoding decided, and `__log_string__`
-// is a host import the native runner does not provide. Each needs a design.
+// THE DECLARED-BUT-UNLOWERED MEMORY INTRINSICS — the ones that pass `vl check` and then die at
+// emit with `emitProgram: call to unknown function`. Re-censused at each head, in three call
+// POSITIONS each (statement / value / binding), against the names `defaultScope` declares. Two
+// remain: `__store_string__` and `__log_string__`, the host-boundary string sinks.
+// Named here so the CHECKER says that, positioned and in the author's terms, instead of letting
+// the call reach the emitter and come back as `call to unknown function` — a message that reads
+// like a TYPO'D IDENTIFIER when the identifier is real and the IMPLEMENTATION is what is
+// missing. `docs/internals/memory-gc-design.md` §1.2 filed exactly that as "the half worth
+// fixing first"; this is that half.
+// The two string sinks are NOT a table entry away: `__store_string__` would have to copy a GC
+// `(array i32)` into linear memory with no byte encoding decided, and `__log_string__` is a host
+// import the native runner does not provide. Each needs a design.
 export function nameIsUnimplementedIntrinsic(name: string) {
   if name == "__store_string__" { return true }
   if name == "__log_string__" { return true }
@@ -4083,31 +3521,18 @@ function checkNotEmitterIntrinsic(name: string, at: i32) {
   0
 }
 
-// A BINARY OPERATOR DECLARED BELOW MODULE SCOPE CAN NEVER DISPATCH (D541), and it is
-// the twin of the check directly above: a definition that would never run, refused at
-// the definition rather than silently meaning something else at the site.
-//
-// EVERY OTHER GATE IN THIS FAMILY LIVES IN `checkProgram`'s PASS-1 TOP-LEVEL HOIST —
-// D444's arity, D445's index receiver, D471's `self` name, D425's `self` type, D491's
-// and D521's whole-program deadness — and the hoist walks `gRootStmts` only. So this
-// position escaped all five, and it is the same class at both `self` spellings and
-// at BOTH nestings: measured on `042624e1`, `function outer(): i32 { function "+"(self:
-// i32, other: i32): i32 { return 99 }  … return a + b }` is `vl check` rc 0 and prints
-// 10, and so is the same declaration inside a top-level `if true { … }` block. The
-// message names both, because `gRootStmts` membership is what is actually tested and a
-// block body is as far outside it as a function body is.
-//
-// IT IS DEAD AT EVERY RECEIVER, not just the ones D425 subtracts. `opSelfFnTy` resolves
-// through `lookup(op)`, and a nested `function "+"` is bound in its ENCLOSING scope by
-// `declareFnDeclNode` — a node table, not the type scope `lookup` reads — so an OBJECT
-// receiver in the same body is already the loud `operator '+' is not defined for V and
-// V`, positioned at the site and blaming the user for not declaring what they declared
-// three lines up. So there is no receiver for which a nested declaration fires, no cell
-// to preserve, and the reject can be unconditional: it is a POSITION rule, not a type
-// rule, which is why it needs neither the resolved `self` type nor the site bank.
-//
-// Zero cost, measured rather than assumed: no `.vl` anywhere under `tests/`, `std/`,
-// `compiler/` or the distilled corpus declares a binary operator below module scope.
+// A BINARY OPERATOR DECLARED BELOW MODULE SCOPE CAN NEVER DISPATCH (D541), and it is the twin
+// of the check directly above: a definition that would never run, refused at the definition
+// rather than silently meaning something else at the site.
+// EVERY OTHER GATE IN THIS FAMILY LIVES IN `checkProgram`'s PASS-1 TOP-LEVEL HOIST — D444's
+// arity, D445's index receiver, D471's `self` name, D425's `self` type, D491's and D521's
+// whole-program deadness — and the hoist walks `gRootStmts` only, so this position escaped all
+// five. It is the same class at both `self` spellings and at BOTH nestings; the message names
+// both, because `gRootStmts` membership is what is actually tested and a block body is as far
+// outside it as a function body is.
+// IT IS DEAD AT EVERY RECEIVER, not just the ones D425 subtracts: `opSelfFnTy` resolves through
+// `lookup(op)`, and a nested `function "+"` is bound by `declareFnDeclNode` in a node table,
+// not the type scope `lookup` reads. So the reject is a POSITION rule, not a type rule.
 function checkNotNestedBinOpDecl(name: string, at: i32) {
   if !isBinOpFuncName(name) { return 0 }
   if isTopLevelStmt(at) { return 0 }
@@ -4136,34 +3561,18 @@ function isTopLevelStmt(ix: i32) {
 
 // ── scope chain ──────────────────────────────────────────────────────────────
 
-// ── flow narrowing (condition collectors) ────────────────────────────────────
-// The canonical narrowing key for a "place" — a bare name (`x`), a property
-// path rooted at one (`o.v`, `o.v.w`), or a CONSTANT-INDEX element of either
-// (`xs[0]`, `o.xs[1].v`) — or "" for anything else (a call, a variable index, a
-// literal: not a stable place to narrow). Mirrors the host's
-// `placeKey`; `x?.y` keys the same place as `x.y`, so a guard written with
-// `?.` refines the regular `x.y` reads in the branch body.
-//
-// A CONSTANT INDEX IS A PLACE (inventory-2 D11). `xs[0]` names one storage cell for as
-// long as nothing writes `xs` or that cell, which is the identical condition the property
-// path already relies on — and the retirement side is what makes both true, not the key.
-// Only an integer LITERAL subscript keys: `xs[i]` names a cell only the runtime knows, so
-// it stays unkeyable, and the write side (`retireNarrowingsForWrite`) reads that "" as
-// "may hit any element" rather than as "hits nothing".
-//
-// PARENTHESES ARE NOT PART OF A PLACE (silent-class-inventory D352). `(t).v` is the same
-// storage as `t.v` and must key the same, exactly as `x?.y` keys as `x.y` one line above.
-// Without the peel this answered "" for every parenthesised link and the read fell back to
-// the DECLARED field type: `if t.v is Circle { print((t).v.r) }` was
-// `field 'r' is not on every member of Shape`, while both `t.v.r` and `(t.v).r` printed 7.
-//
-// THE ARM GOES AT THE HEAD, NOT AT THE RECURSION SITES, and that is what makes it
-// arm-for-arm complete: `Member` and `OptMember` reach their receivers through this same
-// function, so one peel covers the node, its receiver, and every link of a nested path.
-// `memberPathKeyOf` is the EMITTER's twin of this key and needed the same fix at #1991
-// (D222) — there it took an `unwrapParen` on the node AND on the receiver because that one
-// recurses on `m.memObj` through `P.nodes` directly. Same defect, same shape, one stage
-// earlier; this is the half that refuses `(t).v.r` before the emitter is ever reached.
+// —— flow narrowing (condition collectors) ——————————————————————————————————
+// The canonical narrowing key for a "place" — a bare name (`x`), a property path rooted at one
+// (`o.v`, `o.v.w`), or a CONSTANT-INDEX element of either (`xs[0]`, `o.xs[1].v`) — or "" for
+// anything else. Mirrors the host's `placeKey`; `x?.y` keys the same place as `x.y`, so a guard
+// written with `?.` refines the regular `x.y` reads in the branch body.
+// A CONSTANT INDEX IS A PLACE (inventory-2 D11): `xs[0]` names one storage cell for as long as
+// nothing writes `xs` or that cell, the identical condition the property path relies on. Only
+// an integer LITERAL subscript keys; the write side (`retireNarrowingsForWrite`) reads the ""
+// of `xs[i]` as "may hit any element" rather than as "hits nothing".
+// PARENTHESES ARE NOT PART OF A PLACE (D352): `(t).v` is the same storage as `t.v`. THE ARM
+// GOES AT THE HEAD, NOT AT THE RECURSION SITES, which is what makes it arm-for-arm complete —
+// `Member`/`OptMember` reach their receivers here. `memberPathKeyOf` is the emitter's twin (D222).
 function placeKeyOf(ix: i32) {
   const n = P.nodes[ix]
   if n is Paren { return placeKeyOf(n.parInner) }
@@ -4298,21 +3707,17 @@ function placeSubPath(ix: i32, root: string) {
 }
 
 // WRITE-EFFECT SUMMARIES for the effect-based invalidation rule, keyed
-// `"<fn-node-ix>#<param-ix>"`. A value is either the OPAQUE token `"*"` — assume the
-// callee writes everything reachable through that parameter — or a `,`-TERMINATED
-// list of the field sub-paths it may write (`"v,a.v,"`). Keyed by the callee's arena
-// index rather than its name, so two nested functions sharing a name (which capture
-// analysis is already name-confused about) cannot share a summary.
-//
-// `weOpen` is the in-progress stack. A recursive cycle answers `"*"`, not "writes
-// nothing": a summary that guesses must guess CLOSED, and a one-pass walk has no
-// fixpoint to fall back on.
-//
-// A MAP, not parallel arrays, because the bank is read once per (live narrowing ×
-// call) while it grows one entry per summarised (callee, parameter): a scan makes the
-// predicate quadratic in the number of DISTINCT callees a guarded region calls, which
-// is the dominant term for property-path guards. `""` is a legitimate value ("writes
-// nothing"), so presence is asked with `has` and never inferred from the value.
+// `"<fn-node-ix>#<param-ix>"`. A value is either the OPAQUE token `"*"` — assume the callee
+// writes everything reachable through that parameter — or a `,`-TERMINATED list of the field
+// sub-paths it may write (`"v,a.v,"`). Keyed by the callee's arena index rather than its name,
+// so two nested functions sharing a name cannot share a summary.
+// `weOpen` is the in-progress stack. A recursive cycle answers `"*"`, not "writes nothing": a
+// summary that guesses must guess CLOSED, and a one-pass walk has no fixpoint to fall back on.
+// A MAP, not parallel arrays, because the bank is read once per (live narrowing × call) while
+// it grows one entry per summarised (callee, parameter): a scan makes the predicate quadratic
+// in the number of DISTINCT callees a guarded region calls, which is the dominant term for
+// property-path guards. `""` is a legitimate value ("writes nothing"), so presence is asked
+// with `has` and never inferred from the value.
 let weSums: {[string]: string} = Map()
 let weOpen: string[] = []
 
@@ -4332,11 +3737,10 @@ let weRoots: i32[] = []
 // independent query with a summary that is too small.
 let weCut = 0
 
-// Answer a recursive cycle OPAQUE instead of ⊥ — the strictly-fail-closed reading.
-// It is sound but costs every read-only recursive callee: measured at 18 of 348 grid
-// cells newly rejecting CORRECT programs, all of them that one shape, against 0 for
-// the fixpoint. Kept as a switch because it is the conservative fallback if the
-// fixpoint argument above is ever found wanting.
+// Answer a recursive cycle OPAQUE instead of ⊥ — the strictly-fail-closed reading. It is sound
+// but costs every read-only recursive callee, newly rejecting CORRECT programs of that one
+// shape where the fixpoint rejects none. Kept as a switch because it is the conservative
+// fallback if the fixpoint argument above is ever found wanting.
 const ALIAS_CYCLE_OPAQUE = false
 
 // Set to make every statically-known callee answer OPAQUE — the BROAD rule ("any
@@ -4424,21 +3828,18 @@ function findFnDeclInRoots(name: string) {
   -1
 }
 
-// The subtree walk, MEMOISED on `(rootIx, name)`. Every query inside one summary asks
-// the same root, and an INTRINSIC call (`print`) asks a name no root holds — so the
-// uncached walk is re-run per call in the body, making one summary quadratic in the
-// number of calls that body makes. The NEGATIVE answer is the one worth banking:
-// `-1` means "this subtree was walked and holds no such declaration".
-//
-// The memo is exact rather than approximate. `findFnDeclWalk` is a pure function of
-// `(P.nodes, rootIx, name)` and the checker appends no nodes, so a banked answer is
-// the answer the walk would give.
-//
-// KEYING ON THE ROOT IS LOAD-BEARING. The same name resolves to different
-// declarations under different enclosing bodies, so a name-only memo — or a flat
-// module-wide name→declaration map — can answer a declaration this walk would never
-// reach. That direction fails OPEN: `callDeclFnIx` would summarise an unrelated body
-// as writing nothing where it owes the caller the opaque answer.
+// The subtree walk, MEMOISED on `(rootIx, name)`. Every query inside one summary asks the same
+// root, and an INTRINSIC call (`print`) asks a name no root holds — so the uncached walk is
+// re-run per call in the body, making one summary quadratic in the number of calls that body
+// makes. The NEGATIVE answer is the one worth banking: `-1` means "this subtree was walked and
+// holds no such declaration".
+// The memo is exact rather than approximate: `findFnDeclWalk` is a pure function of
+// `(P.nodes, rootIx, name)` and the checker appends no nodes, so a banked answer is the answer
+// the walk would give.
+// KEYING ON THE ROOT IS LOAD-BEARING. The same name resolves to different declarations under
+// different enclosing bodies, so a name-only memo — or a flat module-wide name→declaration map
+// — can answer a declaration this walk would never reach. That direction fails OPEN:
+// `callDeclFnIx` would summarise an unrelated body as writing nothing.
 function findFnDeclIn(rootIx: i32, name: string) {
   if rootIx < 0 || rootIx >= P.nodes.length { return -1 }
   const key = i32ToStr(rootIx) + "#" + name
@@ -4757,24 +4158,18 @@ function placeRootOf(key: string) {
   key
 }
 
-// THE ONE PLACE that decides whether the call at `callIx` invalidates the path
-// narrowing keyed `key`. Everything else about aliased writes is bookkeeping around
-// this answer.
-//
-// The rule is EFFECT-BASED: `key` dies only when some argument place `ak` of the call
-// is a prefix of `key` AND the callee may write, through that parameter, a sub-path
-// that is a prefix of the rest of `key`. Writing `o.a` kills `o.a.v` (the sub-object
-// is replaced), writing `o.w` leaves `o.v` alone, and a callee that only READS keeps
-// every narrowing — which is what makes the rule usable rather than merely sound.
-//
-// It fails CLOSED at every edge: an unresolvable or first-class callee, a recursive
-// cycle, and a parameter that escapes all answer "writes everything".
-//
-// THE HOLE IT DOES NOT CLOSE, stated so the next reader does not read the rule as
-// total: invalidation is keyed on the SYNTACTIC argument. `const p = o` then `clr(p)`
-// leaves a narrowing on `o.v` in force, because nothing connects the two names. That
-// is an aliasing question this checker has no machinery for; the measured grid marks
-// the cell, and closing it needs a may-alias relation, not a wider write rule.
+// THE ONE PLACE that decides whether the call at `callIx` invalidates the path narrowing keyed
+// `key`. Everything else about aliased writes is bookkeeping around this answer.
+// The rule is EFFECT-BASED: `key` dies only when some argument place `ak` of the call is a
+// prefix of `key` AND the callee may write, through that parameter, a sub-path that is a prefix
+// of the rest of `key`. Writing `o.a` kills `o.a.v` (the sub-object is replaced), writing `o.w`
+// leaves `o.v` alone, and a callee that only READS keeps every narrowing — which is what makes
+// the rule usable rather than merely sound. It fails CLOSED at every edge: an unresolvable or
+// first-class callee, a recursive cycle, and a parameter that escapes all answer "writes
+// everything".
+// THE HOLE IT DOES NOT CLOSE, stated so the next reader does not read the rule as total:
+// invalidation is keyed on the SYNTACTIC argument, so `const p = o` then `clr(p)` leaves `o.v`
+// narrowed. Closing it needs a may-alias relation, not a wider write rule.
 function callInvalidatesNarrowedPath(callIx: i32, key: string) {
   const cn = P.nodes[callIx]
   if cn is Call { return callInvalidatesReal(cn, key) }
@@ -4888,27 +4283,18 @@ function pathHitsAny(path: string, sum: string, under: string) {
   false
 }
 
-// RE-EXECUTION BARRIERS: the scope depth and overlay height at entry to each open
-// loop body and nested-function body, innermost last.
-//
-// A narrowing retires at a falsifying write because the statements AFTER the write
-// run with the narrowing gone — a statement-order fact. A loop body breaks that
-// reading: it is checked once and executed many times, so the reads textually BEFORE
-// the write run again after it. `if q != null { while c { use(q)   q = null } }` is
-// exactly that shape and `use(q)` sees a null on the second iteration.
-//
-// The narrowing a loop's OWN condition establishes is different: the condition is
-// re-tested on every back edge, so it holds on entry to every iteration whatever the
-// body wrote. `while q != null { use(q)   q = null }` — the idiom the retirement
-// rule exists to allow — is therefore sound with no back-edge analysis, and so is a
-// guard INSIDE the body. Both sit at or above the barrier mark; a narrowing from an
-// enclosing guard sits below it. A nested FUNCTION body carries the same hazard for
-// the same reason (the body may run any number of times, at any point), and takes the
-// same mark.
-//
-// A write that would retire a narrowing BELOW the innermost mark keeps its reject.
-// That is master's verdict for every such program, so the barrier bounds the
-// widening rather than trading one unsound acceptance for another.
+// RE-EXECUTION BARRIERS: the scope depth and overlay height at entry to each open loop body and
+// nested-function body, innermost last.
+// A narrowing retires at a falsifying write because the statements AFTER the write run with the
+// narrowing gone — a statement-order fact. A loop body breaks that reading: it is checked once
+// and executed many times, so the reads textually BEFORE the write run again after it.
+// `if q != null { while c { use(q)   q = null } }` is exactly that shape.
+// The narrowing a loop's OWN condition establishes is different: the condition is re-tested on
+// every back edge, so it holds on entry to every iteration whatever the body wrote — `while
+// q != null { use(q)   q = null }` is sound with no back-edge analysis, and so is a guard
+// INSIDE the body. Both sit at or above the barrier mark. A nested FUNCTION body carries the
+// same hazard and takes the same mark. A write that would retire a narrowing BELOW the
+// innermost mark keeps its reject, so the barrier bounds the widening.
 let reScopeBases: i32[] = []
 let reNpBases: i32[] = []
 
@@ -4978,20 +4364,17 @@ function writeBarredErr(place: string, at: i32) {
   0
 }
 
-// THE STORAGE TYPE OF AN ASSIGNMENT TARGET — what the place can HOLD, as against
-// what a narrowing currently proves it holds — or -1 when no live narrowing overlays
-// the place and the flow type IS the storage type. That -1 covers every place in a
-// program with no narrowing, so this is exactly the set of writes a narrowing used to
-// shrink.
-//
-// A bare NAME reads the narrowing bank, because the guard's shadowing `declare` hid
-// the declaration in an outer scope. A property PATH reads the field off the
-// RECEIVER's own type, because the overlay keys the path string and never touches the
-// struct's field types; the receiver keeps its own narrowing, since a non-null
-// receiver is what makes the field reachable at all.
-//
-// Returns -1 across a re-execution barrier (see `narInsideBarrier`): the write stays
-// rejected there, which is master's verdict.
+// THE STORAGE TYPE OF AN ASSIGNMENT TARGET — what the place can HOLD, as against what a
+// narrowing currently proves it holds — or -1 when no live narrowing overlays the place and the
+// flow type IS the storage type. That -1 covers every place in a program with no narrowing, so
+// this is exactly the set of writes a narrowing used to shrink.
+// A bare NAME reads the narrowing bank, because the guard's shadowing `declare` hid the
+// declaration in an outer scope. A property PATH reads the field off the RECEIVER's own type,
+// because the overlay keys the path string and never touches the struct's field types; the
+// receiver keeps its own narrowing, since a non-null receiver is what makes the field reachable
+// at all.
+// Returns -1 across a re-execution barrier (see `narInsideBarrier`): the write stays rejected
+// there, which is master's verdict.
 function writeStorageTy(ix: i32) {
   const n = P.nodes[ix]
   if n is Ident {
@@ -5012,21 +4395,17 @@ function writeStorageTy(ix: i32) {
     if key == "" { return -1 }
     const slot = narrowedPathIx(key)
     if slot < 0 { return -1 }
-    // AN ALREADY-RETIRED NARROWING STILL ANSWERS, and the `npInvBy[slot] >= 0` bail that
-    // used to stand here was an ORDERING BUG inside a single statement. `lt` is read off
-    // the target BEFORE the right-hand side is checked, so it is the NARROWED type; the
-    // RHS is then checked and an opaque callee retires the path
-    // (`noteCallInvalidations`); and this question, asked afterwards, saw the retirement
-    // and declined — leaving `asgLt` at a narrowed type the storage never had.
-    // `if w.f != null { w.f = mk() }` was `cannot assign {[string]: i32} | null to
-    // {[string]: i32}` when `mk`'s body used a METHOD call and clean when it used an
-    // index write, which is the write-effect summary showing through as if it were a rep
-    // axis (inventory-2 D8 filed exactly that message and read it as flat across reps).
-    //
-    // Answering is also the RIGHT answer on its own terms: a retired narrowing means the
-    // place reads at its declared type, so the storage type is what the write is against
-    // either way. The two remaining guards stay — they bound the widening to narrowings
-    // this function body installed (`npEpochs`) and outside a re-execution barrier
+    // AN ALREADY-RETIRED NARROWING STILL ANSWERS, and the `npInvBy[slot] >= 0` bail that used
+    // to stand here was an ORDERING BUG inside a single statement. `lt` is read off the target
+    // BEFORE the right-hand side is checked, so it is the NARROWED type; the RHS is then
+    // checked and an opaque callee retires the path (`noteCallInvalidations`); and this
+    // question, asked afterwards, saw the retirement and declined — leaving `asgLt` at a
+    // narrowed type the storage never had. `if w.f != null { w.f = mk() }` refused or passed
+    // by whether `mk`'s body used a METHOD call or an index write, which is the write-effect
+    // summary showing through as if it were a rep axis (inventory-2 D8 read it as flat).
+    // Answering is also the RIGHT answer on its own terms: a retired narrowing means the place
+    // reads at its declared type. The two remaining guards stay — they bound the widening to
+    // narrowings this function body installed (`npEpochs`) and outside a re-execution barrier
     // (`npInsideBarrier`), neither of which the retirement changes.
     if npEpochs[slot] != narFnEpoch { return -1 }
     if !npInsideBarrier(slot) { return -1 }
@@ -5053,31 +4432,18 @@ function writeStorageTy(ix: i32) {
   -1
 }
 
-// DOES A WRITE TO `tgtKey` OF A VALUE TYPED `rt` RETIRE THE NARROWING `(key, npTy)`?
-// The one home for that question — both the bare-name and the property-path
-// retirement sides ask it, so they cannot disagree, and the read arms' "is this
-// narrowing in force" reading stays the complement of it.
-//
-// Three ordered legs:
-//   * PLACE. The write must name the narrowed place or a PREFIX of it. `o.v = …`
-//     retires `o.v` and also `o.v.w` (the sub-object is a different object now),
-//     while `o.w = …` retires neither. A CONSTANT-index target is a place like any
-//     other (`xs[0] = …` retires `xs[0]` and `xs[0].v`); an UNKEYABLE one (`xs[i] = …`)
-//     keys "" here and is handled one level up, in `retireNarrowingsForWrite`, where
-//     the receiver is still in hand — it retires EVERY cell of the array it may have
-//     hit. Reading "" as "retires nothing" is what made the candidate for inventory-2
-//     D11 unsound before this rung: see `d341_sound_varidx_write`.
-//   * THE PREFIX LEG SPEAKS BOTH SEPARATORS. `xs = [null]` replaces the whole array, so
-//     it retires `xs[0]` for the same reason `o = null` retires `o.v`; matching only
-//     `tgtKey + "."` missed every index child (`d341_sound_root_write`).
-//   * VALUE, for an EXACT place match: a write the narrowing still admits keeps it.
-//     `if q != null { q = 5   use(q) }` must keep reading `q` as non-null, and
-//     `assignable` is the same relation every other reader of a narrowed type uses.
-//   * A PREFIX match retires UNCONDITIONALLY, whatever the value's type: the place
-//     now holds a different object, and nothing is known about its fields. Without
-//     this leg the widening is unsound on its own terms — `if o != null && o.v !=
-//     null { o = null   use(o.v) }` reads `o.v` off a null receiver, because the
-//     member arm answers from the overlay before it ever checks the receiver.
+// DOES A WRITE TO `tgtKey` OF A VALUE TYPED `rt` RETIRE THE NARROWING `(key, npTy)`? The one
+// home for that question — both the bare-name and the property-path retirement sides ask it, so
+// they cannot disagree, and the read arms' "is this narrowing in force" stays its complement.
+//   * PLACE. The write must name the narrowed place or a PREFIX of it: `o.v = …` retires `o.v`
+//     and `o.v.w`, `o.w = …` retires neither, and a CONSTANT-index target is a place like any
+//     other. An UNKEYABLE one (`xs[i] = …`) keys "" here and is handled in
+//     `retireNarrowingsForWrite`, where the receiver is still in hand, by retiring EVERY cell
+//     it may have hit (`d341_sound_varidx_write`; "" as "retires nothing" was unsound).
+//   * THE PREFIX LEG SPEAKS BOTH SEPARATORS — `xs = [null]` retires `xs[0]` for the reason
+//     `o = null` retires `o.v` (`d341_sound_root_write`).
+//   * VALUE, for an EXACT match only: a write the narrowing still admits keeps it. A PREFIX
+//     match retires UNCONDITIONALLY — the place holds a different object and nothing is known.
 function writeRetiresNarrowing(
   tgtKey: string,
   rt: i32,
@@ -5187,24 +4553,18 @@ function calleeNameOf(callIx: i32) {
   "?"
 }
 
-// DID AN ASSIGNMENT, RATHER THAN A CALL, RETIRE THIS NARROWING? Both causes write the
-// same `npInvBy` column and they need different answers, so the question has one home.
-//
-// A retired BARE-NAME narrowing leaves the name readable AT ITS DECLARED TYPE (see the
-// `narFnEpoch` note above); the property-path spelling of the identical program refused
-// outright. The asymmetry was real but its stated reason covers only half the column —
-// "a path narrowing also dies to an ALIASED write through a call, which the emitter has
-// no relation to detect". A DIRECT `w.f = e` is not that: it is a statement the emit walk
-// passes over exactly as it passes over `f = e`, and the emit half retires it now
-// (`emit_classify`'s write-retirement grew the Member arm alongside this). So the CALL
-// cause keeps the refusal — that is where the emitter really is blind — and the
-// ASSIGNMENT cause reads at the declared type like its bare-name twin.
-//
-// THE PREFIX LEG STAYS SAFE WITHOUT A SECOND TEST. `o = null` retires `o.v` through
-// `writeRetiresNarrowing`'s prefix leg, and falling through here re-checks the RECEIVER —
-// whose own narrowing the same write retired by exact match — so `o.v` is refused by the
-// ordinary nullable-receiver rule instead of by this one. The overlay used to answer
-// before the receiver was ever checked; that is what made the early return load-bearing.
+// DID AN ASSIGNMENT, RATHER THAN A CALL, RETIRE THIS NARROWING? Both causes write the same
+// `npInvBy` column and they need different answers, so the question has one home.
+// A retired BARE-NAME narrowing leaves the name readable AT ITS DECLARED TYPE; the
+// property-path spelling of the identical program refused outright. The asymmetry was real but
+// its stated reason covers only half the column — "a path narrowing also dies to an ALIASED
+// write through a call, which the emitter has no relation to detect". A DIRECT `w.f = e` is not
+// that: it is a statement the emit walk passes over exactly as it passes over `f = e`, and the
+// emit half retires it now (`emit_classify`'s write-retirement grew the Member arm). So the
+// CALL cause keeps the refusal and the ASSIGNMENT cause reads at the declared type.
+// THE PREFIX LEG STAYS SAFE WITHOUT A SECOND TEST: `o = null` retires `o.v` through
+// `writeRetiresNarrowing`'s prefix leg, and falling through here re-checks the RECEIVER, so
+// `o.v` is refused by the ordinary nullable-receiver rule instead of by this one.
 function pathRetiredByAssign(byIx: i32) {
   if byIx < 0 { return false }
   !(P.nodes[byIx] is Call)
@@ -5298,19 +4658,16 @@ function tyMentionsVoid(ty: i32, depth: i32) {
 }
 
 // Whether the expression at `exprIx` (peeled through parens) is a `match` — the void-typed
-// expression FORM every void-in-value-slot gate exempts, and the one predicate all of them
-// ask.
-//
+// expression FORM every void-in-value-slot gate exempts, and the one predicate all of them ask.
 // AN if-EXPRESSION IS NO LONGER EXEMPT, and the ruling is why. An else-less `if` used as a
-// value is `T | null` in EVERY value position (DECISIONS, 2026-09-02), so `checkIfStmtNode`
-// has already widened any if whose arm carries a value by the time a slot asks — an `if`
-// that still types `void` here has a VOID ARM, which is a real void in a value slot and
-// exactly what these gates exist to catch. The exemption dated from the widening being
-// gated to the binding position, where it stopped a correctly-typed program being refused;
-// with one rule it refuses nothing, and keeping it left `const x = if c { voidCall() }`
-// check-clean and crashing the emitter with `if-expression requires an else arm` — a
-// sentence about the wrong ingredient, since adding an `else` does not give a void arm a
-// value.
+// value is `T | null` in EVERY value position (DECISIONS), so `checkIfStmtNode` has already
+// widened any if whose arm carries a value by the time a slot asks — an `if` that still types
+// `void` here has a VOID ARM, which is a real void in a value slot and exactly what these gates
+// exist to catch. The exemption dated from the widening being gated to the binding position,
+// where it stopped a correctly-typed program being refused; with one rule it refuses nothing,
+// and keeping it left `const x = if c { voidCall() }` check-clean and crashing the emitter with
+// `if-expression requires an else arm` — a sentence about the wrong ingredient, since adding an
+// `else` does not give a void arm a value.
 function voidSlotExemptExpr(exprIx: i32) {
   if exprIx < 0 { return false }
   let vi = exprIx
@@ -5415,23 +4772,18 @@ function isNulBoolTy(ty: i32) {
   false
 }
 
-// The non-null part of `ty` (the host's `nonNullable`): a nullable peels to
-// its inner type; anything else is already non-null. -1 propagates. NESTED
-// nullables collapse (`Nullable(Nullable(X))` ≡ `Nullable(X)` ≡ non-null `X`) —
-// a double nullable arises when a map whose VALUE is already nullable is read
-// (`{[string]: T | null}` → `mkNullableTy(T | null)`); a single peel there would
-// leave an inner `T?` that a narrowed member/field access rejects as non-object,
-// so a `!= null` narrow must strip EVERY layer to reach the non-null value.
-//
-// A ONE-MEMBER UNION AROUND A NULLABLE IS NOT THIS FUNCTION'S JOB, and teaching it to peel
-// one is a MISCOMPILE rather than a missing case. `type T = (S | null)` interns
-// `TyUnion[S?]`, and `declaredTyOfName` already resolves that wrapper to its member for
-// every inner (`singleAliasMemberTyIx` → `nulAliasMemberFaithful`), so an annotation of `T`
-// arrives here as a plain `S?`. A wrapper that reaches here is one the EMITTER also refused
-// to see through, and peeling it makes the checker narrow a value the emitter is still
-// lowering as a union box: measured at 47 loud emit rejects, 15 check-clean-invalid-wasm
-// cells and zero new running programs across the 1,020-cell alias grid. The peel belongs at
-// the transparency predicate, which is the one place both sides read.
+// The non-null part of `ty` (the host's `nonNullable`): a nullable peels to its inner type;
+// anything else is already non-null. -1 propagates. NESTED nullables collapse — a double
+// nullable arises when a map whose VALUE is already nullable is read
+// (`{[string]: T | null}` → `mkNullableTy(T | null)`), and a single peel there would leave an
+// inner `T?` that a narrowed member/field access rejects as non-object, so a `!= null` narrow
+// must strip EVERY layer to reach the non-null value.
+// A ONE-MEMBER UNION AROUND A NULLABLE IS NOT THIS FUNCTION'S JOB, and teaching it to peel one
+// is a MISCOMPILE rather than a missing case. `type T = (S | null)` interns `TyUnion[S?]`, and
+// `declaredTyOfName` already resolves that wrapper to its member for every inner
+// (`singleAliasMemberTyIx` → `nulAliasMemberFaithful`), so an annotation of `T` arrives here as
+// a plain `S?`. A wrapper that reaches here is one the EMITTER also refused to see through, so
+// peeling it narrows a value the emitter is still lowering as a union box.
 function nonNullTy(ty: i32) {
   if ty < 0 { return -1 }
   let cur = ty
@@ -5447,19 +4799,16 @@ function nonNullTy(ty: i32) {
   cur
 }
 
-// A place's CURRENT type during fact collection: facts already collected into
-// `names`/`tys` (innermost-last wins) override the path overlay, which
-// overrides the scope/field lookup — so successive narrowings compose
-// (`o != null && o.y is i32` resolves `o.y` against the non-null `o`).
-// Read-only: collection must never raise a diagnostic.
-//
-// PARENS PEEL HERE TOO (D352), and this arm is the KEY's — not a second copy of it. The
-// lookup above is `placeKeyOf`'s, so once that peels a `Paren` the key resolves; the TAIL
-// below re-derives the type from the node when no fact and no overlay hold, and that tail
-// read `P.nodes[ix]` raw. Without the arm `(t).v` keyed `t.v`, found no fact, fell to the
-// tail, saw a `Paren` and answered -1 — so the ELSE-branch complement (`subtractTy(-1, …)`)
-// produced no fact at all and `if (t).v is Sq { … } else { t.v.r }` stayed loud while its
-// THEN twin ran. 28 of the 184-cell paren grid, all `isnot` with a parenthesised guard.
+// A place's CURRENT type during fact collection: facts already collected into `names`/`tys`
+// (innermost-last wins) override the path overlay, which overrides the scope/field lookup — so
+// successive narrowings compose (`o != null && o.y is i32` resolves `o.y` against the non-null
+// `o`). Read-only: collection must never raise a diagnostic.
+// PARENS PEEL HERE TOO (D352), and this arm is the KEY's — not a second copy of it. The lookup
+// above is `placeKeyOf`'s, so once that peels a `Paren` the key resolves; the TAIL below
+// re-derives the type from the node when no fact and no overlay hold, and that tail read
+// `P.nodes[ix]` raw. Without the arm `(t).v` keyed `t.v`, found no fact, fell to the tail, saw
+// a `Paren` and answered -1 — so the ELSE-branch complement (`subtractTy(-1, …)`) produced no
+// fact at all and `if (t).v is Sq { … } else { t.v.r }` stayed loud while its THEN twin ran.
 function placeCurTy(ix: i32, names: string[], tys: i32[]) {
   const key = placeKeyOf(ix)
   if key != "" {
