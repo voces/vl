@@ -37791,6 +37791,17 @@ Repro (check rc 0; the emitter refuses):
   its own witness.
 
 ---
+
+* **A CANDIDATE FOR THIS ALREADY EXISTS, MEASURED AND RETAINED.** The D1141/D1142 agent built
+  the checker-side widening this row asks for — `.pop()` / `.get(i)` returning
+  `mkNullableTy(arrElemValueTy(elem))`, so a `u8[]` pop types as `i32 | null` — as part of a
+  D1140 candidate that was rescoped out when D1174 closed D1140 first. Patch retained at that
+  agent's `_scratch/d1140-candidate.patch`. **Its step-4 measurement is the part worth
+  reading**: the widening ALONE moved 4 cells `runs → SILENT`, because `popBoxAtomKind` still
+  excluded `u8`; letting `u8` box as its widened `i32` atom recovered them and bought 4 more.
+  So the checker change needs the box arm in the same commit, and this row should not be
+  attempted without it.
+
 ### D1212 — `.pop()` on an EMPTY ref- or string-element list TRAPS where the type says `null`
 
 **loads then traps (`wasm trap: out of bounds array access`) · check rc 0 · clause 1 · OPEN ·
@@ -37827,3 +37838,51 @@ Repro (loads, then traps — it prints nothing and dies):
   and the trap is at run time. `check-filed-witnesses.py` grades it correctly (`trap_loads`, a
   state its vocabulary has precisely because D19 was mis-read the same way), so THIS row is the
   instrument until the runner learns the difference.
+
+### D1240 — a member call in TAIL position is `unsupported member-call statement` at every rep, while the identical call under an explicit `return` RUNS
+
+**loud emit reject · check rc 0 · clause 2 · `emitProgram: unsupported member-call statement` · ZERO corpus cells · found 2026-09-02 by the D1141/D1142 agent and re-verified by hand on the merged tree**
+
+Repro (refuses; adding `return` in front of the last line makes it print `2`):
+
+    function f(): i32[] {
+      const xs: i32[] = [1, 2, 3]
+      xs.slice(0, 2)
+    }
+    print(f().length)
+
+* **IT IS NOT ABOUT THE REP.** `i32[]` refuses, which is the rep everything else serves
+  first. The row's own control is one keyword: `return xs.slice(0, 2)` runs and prints `2`.
+
+* **A TAIL EXPRESSION IS A VALUE EVERYWHERE ELSE IN VL** — a block's last expression is its
+  value, which is why `it("x", () => { … })` and every `=>` body work. A member call is the
+  one expression form where the tail position is routed to the STATEMENT dispatcher instead,
+  and the statement dispatcher's job is to discard.
+
+* **THE SENTENCE NAMES THE DISPATCHER, NOT THE DEFECT** — the same wording D1131 hit at
+  `u8[].clear()`, where the statement dispatcher refused one stage before the emitter that
+  could have served it. Worth checking whether both are the same missing route.
+
+* Probe: none yet — one is worth adding with the explicit-`return` control beside it.
+
+### D1241 — `u8[][]` has no rep at ANY value: `emitProgram: only i32[] arrays and struct/union element arrays are supported`
+
+**loud emit reject · check rc 0 · clause 2 · ZERO corpus cells · found 2026-09-02 while closing D1141 (`u8[].slice`), and it is the reason two cells of that row's 12-position matrix stay refused**
+
+Repro (refuses on a program that does nothing but declare it):
+
+    const xs: u8[][] = [[1, 2]]
+    print(xs.length)
+
+* **NO SLICE, NO POP, NO METHOD AT ALL.** The declaration alone refuses, so this is not a
+  member-call gap wearing a container costume — the nested `u8` list has no representation.
+
+* **IT BOUNDS D1141 AND D1174 BOTH.** `u8[].slice` now runs at 10 of 12 positions and the
+  two that do not are this; the pop work's remaining SILENT cells are the ref-element niche
+  next door. A `u8[][]` rep is the prerequisite for finishing either matrix, and neither row
+  should be graded as incomplete for lacking it.
+
+* **THE MESSAGE ENUMERATES WHAT IS SERVED**, which makes it unusually honest for a refusal in
+  this file — `i32[]` arrays and struct/union element arrays. The gap is every other element
+  rep at the nested spelling, and `u8` is simply the one a witness exists for.
+
