@@ -36339,36 +36339,101 @@ Repro (check rc 0; the module the engine refuses to load):
 * Probe: `scripts/capability-probes/pop-value-position-scalar-reps.vl`.
 
 ---
-### D1141 — `u8[].slice` is check-clean invalid wasm at module scope and a loud reject naming the wrong thing inside a function
+### D1141 — [CLOSED 2026-09-02] `u8[].slice` is check-clean invalid wasm at module scope and a loud reject naming the wrong thing inside a function
 
-**check-clean invalid wasm (`type mismatch: expected (ref $type), found (ref $type)`) at module scope · a loud `emitProgram: callee is not a function name` inside a function body · clause 1 · OPEN · found 2026-09-02 by the sibling audit [D1131](#d1131)'s close asked for, and PRE-EXISTING to it**
+**runs, prints `2` — CLOSED 2026-09-02 by the PACKED rung `mfRecvKindOf` never had
+(`exprU8Array` ahead of `exprArray`, where `scalarListElemKind` already puts it) plus the
+`u8` arms in `emitArrSlice` and both `emitMapFilter` ladders · clause 1 · a 12-POSITION
+delivery matrix goes 0 → 10 `runs` (the 2 left are `u8[][]`, a separate gap) and a
+5-spelling × 2-decl × 2-scope slice grid 0 → 20 · zero `runs` lost, corpus unmoved,
+rep-fuzz exact · fixture `arrays/u8-list-slice-positions.vl`**
 
-Repro (check rc 0; the module the engine refuses to load):
+* **THE MECHANISM, AS WHAT THE FAILING RUNG RECEIVED.** `emitArrSlice` picks BOTH the result
+  wrapper and the result backing from one input, `mfRecvKindOf(callee.memObj, fnIx)`. That
+  ladder had rungs for f64 / i64 / f32 / ref / string and then `exprArray`, which claims ANY
+  i32-element list — so it received a `u8[]` receiver and answered `"i32"`, and the fresh
+  list was minted as `array.new_default $aTypeIdx` under `struct.new $lTypeIdx` while the
+  receiver on the stack was a `(ref $bl8TypeIdx)`. `MfKind` already carried a `"u8"` member
+  and `emit_bytes`' frame tables already wrote `bl8`/`ba8` slots for it; **nothing had ever
+  produced the value.** With the rung and the arm, `wasm-dis` shows
+  `array.new_default $ba8` + `array.copy $ba8 $ba8` — i8 to i8, so the ELEMENTS survive.
+
+* **EVERY OTHER REP SLICED.** `i32[]`, `i64[]`, `f64[]`, `f32[]`, `string[]` and `boolean[]`
+  all ran and printed `2`. `u8[]` was alone, for the reason its own `scalarListElemKind`
+  header gives: it is the one list whose element VALUE kind (i32) does not identify its rep,
+  because its backing is `(array (mut i8))` while every other i32-element list is
+  `(array (mut i32))`. A slice mints a NEW list, so it has to pick the backing from the rep.
+
+* **THE TWO SCOPES DIFFERED BECAUSE ONE `exprArray` LEG STILL CLAIMED THE CELL.** At module
+  scope `globalIsArraySid` → `letIsArray` falls through a settled `u8[]` annotation to its
+  INITIALIZER (`exprArray([1, 2, 3])` → true), so the receiver test passed and the lowering
+  ran with the wrong heap types: check-clean invalid wasm. Inside a function the local's cell
+  is correctly `u8list`, `declaredArray` declined, `mfRecvKindOf` answered `null`,
+  `callIsArrSlice` declined with it, and the call fell out of `emitCallNode`'s member ladder
+  into `emitCall` — `emitProgram: callee is not a function name`, a sentence naming neither
+  `slice` nor `u8` nor lists. Asking `exprU8Array` FIRST makes both scopes answer `"u8"`, so
+  the disagreement cannot be reached from this ladder. `letIsArray`'s missing negative arm is
+  left standing DELIBERATELY and not filed: every consumer that could observe it was swept —
+  `.length`, index, `+`, `.pop`, `for-in`, argument passing, an annotated copy, `.get(i) ?? d`
+  — and all nine answer correctly, so there is no witness and an unwitnessed row is a claim
+  about the tree with nothing to re-run. Its f32 sibling `letIsF32Array` has the arm; if a
+  witness ever appears, that is the shape of the fix.
+
+* **`.map` / `.filter` GOT THEIR ARMS IN THE SAME CHANGE AND BUY NO CELL TODAY.** Widening
+  `mfRecvKindOf` newly admits a `u8[]` receiver into `emitMapFilter`, whose src and dst
+  ladders had no `u8` either. Nothing reaches them yet — `u8` arithmetic is a CHECK reject
+  and a bare `u8` callback parameter is refused one stage earlier — but a rung that silently
+  mints the 4-byte backing the moment that gap closes is the exact shape of this row.
+
+* Probe: `scripts/capability-probes/u8-list-slice.vl` — GAP → RUNS (`2 2 1`).
+
+Repro (runs, prints `2`):
 
     const xs: u8[] = [1, 2, 3]
     const s = xs.slice(0, 2)
     print(s.length)
 
-* **EVERY OTHER REP SLICES.** `i32[]`, `i64[]`, `f64[]`, `f32[]`, `string[]` and `boolean[]`
-  all run and print `2`. `u8[]` is alone, and it is alone for the reason its own
-  `scalarListElemKind` header gives: it is the one list whose element VALUE kind (i32) does
-  not identify its rep, because its backing is `(array (mut i8))` while every other
-  i32-element list is `(array (mut i32))`. A slice mints a NEW list, so it has to pick the
-  backing from the rep and not from the element kind.
-
-* **THE FUNCTION-SCOPE SENTENCE IS ABOUT SOMETHING ELSE ENTIRELY.** Inside a function body the
-  same line refuses with `emitProgram: callee is not a function name` — a message that names
-  neither `slice` nor `u8` nor lists, and would send a reader to the call path rather than the
-  list-rep ladder. Two outcomes, and neither says what the gap is.
-
-* Probe: `scripts/capability-probes/u8-list-slice.vl`.
-
 ---
-### D1142 — a captured `for-in` LOOP VARIABLE whose element is not i32 gets an i32 env field: check-clean invalid wasm, with no name collision anywhere
+### D1142 — [CLOSED 2026-09-02] a captured `for-in` LOOP VARIABLE whose element is not i32 gets an i32 env field: check-clean invalid wasm, with no name collision anywhere
 
-**check-clean invalid wasm (`type mismatch: expected i32, found (ref $type)` at `string`, `expected i32, found f64` at f64) · clause 1 · OPEN · found 2026-09-02 as the residue of [D1130](#d1130)'s close, and PRE-EXISTING to it — the repro below has no shadowing of any kind and reproduces identically on the `seed-latest` master seed**
+**runs, prints `ab` — CLOSED 2026-09-02 by the `ForIn` arm the capture-typing pair never had
+(`captureLoopVarIterOf`, ahead of `captureValKind` / `captureValStructIdx`'s shared `b < 0`
+floor) plus the ONE HOME the companion slot now has (`forInVarStructIdx`) · clause 1 · a
+9-rep × 4-capture-shape matrix goes 12 → 40 `runs` of 40 and a 9-rep × 6-ITERABLE-SPELLING
+matrix 14 → 54 of 54 · zero `runs` lost, corpus unmoved (0 of 255,504 cells), rep-fuzz exact
+· fixture `closures/capture-for-in-loop-var-reps.vl`**
 
-Repro (check rc 0; the module the engine refuses to load — should print `ab`):
+* **THE MECHANISM, AS WHAT THE FAILING RUNG RECEIVED.** `captureValKind` opens
+  `const b = parentBindingOf(fe, name); if b < 0 { return "i32" }`. For a loop variable
+  `parentBindingOf` receives a name its own contract cannot answer — it returns a `Param`
+  arena index or a `LetDecl` one, and a loop variable is the ONE storage class with NO
+  declaration node (`ForIn` carries `fiVar` as a bare string field). So it handed back `-1`,
+  the pair `("i32", -1)` reached `fbValtype`, and the env struct's field was declared i32
+  while `declareForInLocals` — running with the frame live — had typed the loop-var LOCAL
+  `"str"` / `"f64"` off `forInElemKind`. The engine throws at the MAKER's
+  `struct.new $env`, not at the read, because the read side is self-consistently wrong.
+  `-1` also means no loud floor fires: `fbValtype("i32", -1)` is a well-formed field, which
+  is why this is clause 1 and not `ref valtype with no interned shape`.
+
+* **THE ASYMMETRY THAT NAMED THE FIX.** D1130 already taught `parentBindingFrameOf` about
+  loop variables (`if parentLoopVarOf(pfn.fnBody, name) >= 0 { return par }`), so *which
+  frame owns the capture* was right and only *what type it has* was wrong. One arm, in the
+  function two lines below the one D1130 edited.
+
+* **AND A SECOND RUNG THE FIRST ONE EXPOSED — the ITERABLE's own storage class.** Every rung
+  of `forInElemKind`'s Ident arm is frame-independent except `declaredKind`, which reads the
+  live SCOPE STACK; the type section runs with no frame's locals bound. So `for z in xs` over
+  a **local** `xs` still classified as the i32 default here, invisibly for a scalar element
+  (whose Ident rung answers off the arena) and as invalid wasm for a REF one. Measured, not
+  guessed: with only the first arm, `param` / `global` / `call` / inline-literal iterables ran
+  at all nine reps and `local` / annotated-`local` failed at exactly the three ref-element
+  reps — 6 cells of 54. Re-asking the binding's INITIALIZER (which needs no scope stack) and
+  only where the iterable's own answer is that default closes them.
+
+* Fixture proves the VALUE per cell, not the shape: `z / 2.0` → `0.75` over an f64 element
+  (an i32 field cannot produce it), an i64 product past 2^32, `z.r * 10` through a struct ref.
+
+Repro (runs, prints `ab`):
 
     function go(): string {
       let s = ""
@@ -36380,11 +36445,11 @@ Repro (check rc 0; the module the engine refuses to load — should print `ab`):
     }
     print(go())
 
-* **THE `let` CONTROL IS THE ONE THAT MAKES IT A LOOP-VARIABLE ROW.** A captured `const z =
-  "a"` runs and prints `a`; a captured `const z = 1.5` runs and prints `1.5`. Only the LOOP
-  VARIABLE misses, so the capture's valtype is resolved from a channel a `for` binding does not
+* **THE `let` CONTROL IS THE ONE THAT MADE IT A LOOP-VARIABLE ROW.** A captured `const z =
+  "a"` ran and printed `a`; a captured `const z = 1.5` ran and printed `1.5`. Only the LOOP
+  VARIABLE missed, so the capture's valtype was resolved from a channel a `for` binding does not
   populate — `parentBindingOf` returns a `Param` or a `LetDecl` and has no answer for a
-  `ForRange`/`ForIn`, and the env field falls to the i32 default.
+  `ForRange`/`ForIn`, and the env field fell to the i32 default.
 
 * **THE i32 LOOP VARIABLE IS WHY THIS HID.** `for q in 1 to 3 { () => q }` is i32 and the
   default is right, which is every `for-in` capture the corpus and [D1130](#d1130)'s own

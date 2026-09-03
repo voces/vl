@@ -1,0 +1,108 @@
+// @run
+// @log 2
+// @log 98
+// @log 2
+// @log 98
+// @log 98
+// @log 98
+// @log 98
+// @log 98
+// @log 98
+// @log 98
+// @log 99
+// @log 3
+// @log 120
+// @log 3
+// @hint redundant type annotation: `s` is inferred as `u8[]`
+// @hint redundant type annotation: `k` is inferred as `{b: u8[]}`
+// Both annotations are kept AGAINST their own hints: `s` is the annotated-destination
+// spelling (a fixture that annotates every destination cannot see a missing-annotation
+// defect, so this file carries both), and `k: Box` pins the NOMINAL struct whose field code
+// is the one the slice result has to match.
+// D1141: `.slice` over a `u8[]` mints its new list from the REP, not from the element
+// kind. `mfRecvKindOf` — the one home the slice emitter, the `.map`/`.filter` emitter and
+// `mfScan`'s frame reservation all read — had rungs for f64 / i64 / f32 / ref / string and
+// then `exprArray`, which claims ANY i32-element list. `u8[]` is the one list whose element
+// VALUE kind (i32) does not identify its rep: its backing is `(array (mut i8))` while every
+// other i32-element list is `(array (mut i32))`. So the fresh list was minted over the
+// 4-byte backing.
+//
+// TWO SCOPES, TWO OUTCOMES, AND THAT IS WHY IT NEEDED A REP RUNG RATHER THAN A MESSAGE. At
+// MODULE scope a `u8[]` global with a list-literal init still answered `exprArray` (through
+// `globalIsArraySid` -> `letIsArray`, whose initializer fallback claims the literal), so the
+// slice lowering RAN with the wrong heap types: check-clean INVALID WASM. Inside a function
+// the local's cell is correctly `u8list`, `exprArray` declined, `callIsArrSlice` declined
+// with it, and the call fell all the way out of the member ladder into `emitCall` —
+// `emitProgram: callee is not a function name`, a sentence naming neither `slice` nor `u8`
+// nor lists. One gap, two faces, neither of them saying what it was.
+//
+// THE ELEMENTS MUST SURVIVE THE COPY, NOT JUST THE LENGTH. Every cell below prints a BYTE
+// (`98` is `b`), because a length-only assertion passes on a mis-typed backing that happens
+// to validate. `array.copy $ba8 $ba8` is what the disassembly must show.
+//
+// A 12-position matrix goes 10 -> 12 loud-to-runs; the two that remain are `u8[][]`, which
+// has no rep for ANY value (`only i32[] arrays and struct/union element arrays are
+// supported` fires with no slice in sight) and is a separate gap.
+
+// MODULE SCOPE with an annotated list-literal init — the check-clean invalid wasm face.
+const gx: u8[] = [97, 98, 99]
+const gs = gx.slice(1, 3)
+print(gs.length)
+print(gs[0])
+
+// FUNCTION SCOPE — the `callee is not a function name` face.
+function inFn() {
+  const xs = "abc".bytes()
+  const t = xs.slice(1, 3)
+  print(t.length)
+  print(t[0])
+
+  // The annotated binding, whose hint is declared above: it pins the destination's rep
+  // where the un-annotated one infers it, and a fixture that annotates every destination
+  // cannot see a missing-annotation defect — so this file carries both.
+  const s: u8[] = xs.slice(1, 3)
+  print(s[0])
+}
+
+inFn()
+
+// RETURN, ARGUMENT, ASSIGNMENT, GLOBAL ASSIGNMENT, STRUCT FIELD — the delivery positions a
+// capability gap is served at once the lowering exists.
+function cut(xs: u8[]): u8[] { return xs.slice(1, 3) }
+
+print(cut("abc".bytes())[0])
+
+function take(ys: u8[]) { print(ys[0]) }
+
+function positions() {
+  const xs = "abc".bytes()
+  take(xs.slice(1, 3))
+
+  let loc = "z".bytes()
+  loc = xs.slice(1, 3)
+  print(loc[0])
+
+  gmut = xs.slice(1, 3)
+  print(gmut[0])
+
+  const k: Box = { b: xs.slice(1, 3) }
+  print(k.b[0])
+
+  // CHAINED: "abcde"[1:4] is b,c,d; [1:3] of that is c,d; [0] is c = 99.
+  const five = "abcde".bytes()
+  print(five.slice(1, 4).slice(1, 3)[0])
+
+  // The result is a FRESH list with its own backing — pushing into it must not touch the
+  // source, and its capacity must grow like any other packed list.
+  const grown = xs.slice(1, 3)
+  grown.push(120)
+  print(grown.length)
+  print(grown[2])
+  print(xs.length)
+}
+
+type Box = { b: u8[] }
+
+let gmut = "z".bytes()
+
+positions()
