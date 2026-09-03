@@ -32531,11 +32531,11 @@ Repro:
 
 ### D1035 — `is` admits a REFINEMENT of a union arm on its right-hand side and answers `false` unconditionally: `["xyz"] is string[]` over a `Json` is check-clean, runs, and prints `false`, while the struct spelling `r is { users: string[] }` is refused as "not a variant"
 
-**check-clean silently wrong — prints `0` where the list under test holds only strings ·
-filed 2026-09-02 (vl-b7) while answering the owner's "why one `is` test per level?" on
-`json-design.md` §6 q1 · the FIX is the deep `is` / `as` build item
-(`docs/serde-design.md` §"Deep `is` / `as` over a `Json` value"), not a checker refusal:
-under it this witness prints `3`**
+**runs, prints `3` — CLOSED 2026-09-02 by BUILDING the deep `is` the design ruled: a
+JSON-SHAPE target is a runtime shape walk plus a conversion, generated as one VL walker
+pair per distinct target · `compiler/json_walk.vl` + `driver.jwSecondPass` ·
+`tests/cases/unions/deep-is-json-shape-walk.vl` + 7 more ·
+`scripts/capability-probes/deep-is-json-*.vl` grade RUNS · was clause 1**
 
 Repro:
 
@@ -32543,7 +32543,40 @@ Repro:
     function d(r: Json): i32 { if r is string[] { return r[0].length }  0 }
     const l: Json = ["xyz"]
     print(d(l))
-    // PRINTS 0
+    // PRINTS 3
+
+* **ALL SEVEN FAMILY CELLS MOVED, and the three silent ones are the reason the close is a
+  BUILD rather than a checker refusal.** Refusing the admitted refinements would have made
+  three rows loud and left two refused — hygiene, and not the goal.
+
+  | RHS spelling | before | after |
+  | --- | --- | --- |
+  | `r is Json[]` | `true` (a registered arm) | `true`, unchanged — an arm is still a tag test |
+  | `r is { [string]: Json }` | `true` (a registered arm) | `true`, unchanged |
+  | `r is string[]` | check-clean, **`false`** | **`true`**, and `r[0].length` reads a real `string[]` |
+  | `r is { [string]: string }` | check-clean, **`false`** | **`true`**, a real `{[string]: string}` |
+  | `r is { [string]: Json[] }` | check-clean, **`false`** | **`true`** |
+  | `r is { users: string[] }` | check reject, "not a variant of Json" | **runs** |
+  | `r is Cfg` | check reject, same sentence | **runs**, `cfg.port` reads an `i32` |
+
+* **THE MECHANISM IS A GENERATED WALKER, NOT A NEW EMITTER REP.** The checker decides which
+  sites are deep (`jsonUnionRootOf` finds the canonical `Json` a receiver is a view of;
+  `jsonShapeBad` says whether the target has a JSON shape) and RECORDS them. The driver then
+  generates, per distinct target, `__vlJsonIs_<k>(v: Json): boolean` and
+  `__vlJsonGet_<k>(v: Json): T` as ordinary VL SOURCE, parses that fragment onto the same
+  token stream and arena, appends its declarations to the program root, rewrites each site
+  into a call, and re-checks. Nothing in `wasmEmit.vl` learns a rep, and no delivery position
+  needs wiring, because the arm's binding is an ORDINARY local of the target type — which is
+  how D965's rule is satisfied rather than sidestepped.
+
+* **A PROGRAM WITH NO DEEP `is` PAYS NOTHING, MEASURED.** `jwSiteNode` is empty and the
+  second pass returns on its first line, so there is no second parse and no second check.
+  Five control programs (an ordinary-union `is`, `is string` over `Json`, an `as?` numeric,
+  `is Json[]`, `is {[string]: Json}`) emit **byte-identical** modules before and after.
+
+* **THE PRICE, NAMED.** A deep `is` arm that REBINDS or WRITES the tested place is now a
+  loud refusal (D1190) where master ran it and printed the wrong answer, and a RECURSIVE
+  JSON shape target is refused (D1198). Both are recorded rows with witnesses, not silent.
 
 * **THE FAMILY, MEASURED** — seed 0ff2587f, `VL_STD` pinned, every cell against
   `type Json = null | boolean | f64 | string | Json[] | { [string]: Json }`:
@@ -32567,15 +32600,136 @@ Repro:
   passes. The struct spellings fail the same membership test outright, which is the
   honest half of the behaviour.
 
-* **WHAT THE FIX IS, AND IS NOT.** Refusing the refinement at the checker would make the
-  three admitted rows loud and leave the two refused rows refused — hygiene, and not the
-  goal. The owner's direction (2026-09-02) is that a complex, nested type on the right of
-  `is` is what a `Json` consumer should be able to write, so the close is the derived
-  SHAPE WALK: `r is string[]` walks the list and answers `true` when every element is a
-  string, and `r is { users: string[] }` walks the map. This row's witness then prints `3`
-  and the two refused rows run. Grade the close on all seven cells, and on the position
-  matrix the design names (`is` in `if` / `while` / `&&` / `!`; `as` at binding / return /
-  argument / assignment) before narrowing anything at the checker.
+* **WHAT THE FIX WAS, AND WAS NOT.** The owner's direction (2026-09-02) is that a complex,
+  nested type on the right of `is` is what a `Json` consumer should be able to write, so the
+  close is the derived SHAPE WALK and not a checker refusal. It was graded on all seven
+  cells above AND on the position matrix the design names — `is` in `if` / `while` / `&&` /
+  `!` / `else if` / a closure body, over a struct field, an index, a call result and a map
+  read — before anything at the checker was narrowed. The `as` trio (S4) is the REMAINDER
+  and is not built: `ROADMAP.md` carries it.
+
+---
+
+### D1197 — `.push` is the ONE delivery that drops the non-null recovery for a narrowed nullable REF: `out.push(e)` under `if e != null` is check-clean invalid wasm, while eight other positions for the same value all run
+
+**check-clean invalid wasm — `type mismatch: expected (ref $type), found (ref null $type)`
+· filed 2026-09-02 (vl-b7) while building deep `is` (D1035), which is why the generated
+walkers return `T` + a separate `boolean` instead of the `T | null` the shape wants ·
+clause 1**
+
+Repro:
+
+    type Item = { name: string }
+    function mk(i: i32): Item | null {
+      if i > 0 { return { name: "a" } }
+      null
+    }
+    const out: Item[] = []
+    const e = mk(1)
+    if e != null { out.push(e) }
+    print(out.length)
+    // check rc 0, then: Invalid input WebAssembly code: type mismatch: expected (ref $type), found (ref null $type)
+
+* **A NINE-POSITION MATRIX, AND ONLY ONE CELL IS RED.** One tiny program per delivery of the
+  SAME narrowed value, each printing something the delivery had to produce:
+
+  | position | outcome |
+  | --- | --- |
+  | `out.push(e)` | **check-clean invalid wasm** |
+  | `const c: Item = e` | runs |
+  | `const c = e` | runs |
+  | `take(e)` (argument) | runs |
+  | `return e` from an `Item` function | runs |
+  | `{ it: e }` (struct field init) | runs |
+  | `[e]` (array literal element) | runs |
+  | `m["k"] = e` (map value) | runs |
+  | `e.name.length` (read only) | runs |
+
+  So this is NOT the D965/D1031 shape of "a capability served in one place and delivered in
+  many". Eight positions already recover the non-null; `emitPush` is the one that does not.
+
+* **WHY IT MATTERS BEYOND ITS OWN WITNESS.** It is what makes a deep-`is` walker that
+  returns `T | null` unusable: the natural generated shape is `const e = walk(v[i])  if e !=
+  null { out.push(e) } else { return null }`, which is exactly this cell. The build works
+  around it by generating a PREDICATE and a BUILDER whose return is non-null, at the cost of
+  walking twice; closing this row is what would let a walker be one function, and with it a
+  RECURSIVE target (D1198).
+
+* **THE LIKELY SHAPE OF THE FIX.** `emitPush` already carries `narrowedArmNeedsUnbox` /
+  `emitNarrowedArmUnboxTo` for the union-ARM case (D1031). The niche case wants the same
+  hook one predicate over: a value whose slot is `(ref null $S)` and whose live narrowing
+  excludes null needs `0xd4 ref.as_non_null` before `local.set` into the push quad's
+  non-null scratch. Grade it on the matrix above, and on `arrays/` + `unions/` corpus cells.
+
+---
+
+### D1198 — a RECURSIVE JSON shape on the right of a deep `is` is refused: `type Tree = { v: f64, kids: Tree[] }` has no walker because the generator INLINES each level
+
+**loud check reject on a `vl check`-clean type — `` `Tree` is recursive; a recursive JSON
+shape has no walker yet`` · filed 2026-09-02 (vl-b7) with the deep-`is` build (D1035) ·
+`tests/cases/unions/error-deep-is-recursive-shape.vl` · clause 2**
+
+Repro:
+
+    type Json = null | boolean | f64 | string | Json[] | { [string]: Json }
+    type Tree = { v: f64, kids: Tree[] }
+    const j: Json = null
+    print(j is Tree)
+    // check reject: `is` check type 'Tree' is not a JSON shape — field `kids`: `Tree` is recursive; a recursive JSON shape has no walker yet
+
+* **A RECURSIVE DOCUMENT IS PERFECTLY GOOD JSON**, so this is a capability gap and not a
+  design rule — which is why it refuses with a sentence that says "yet" and carries a row.
+
+* **THE INGREDIENT IS THE GENERATOR'S SHAPE, NOT THE TYPE.** `compiler/json_walk.vl` emits
+  the walk by INLINING each level of the target into one function body, which a cycle makes
+  unbounded. The fix is a per-target function whose recursive call is a CALL — one walker
+  per level, not one per nesting — and that needs a walker that can say "no match" from a
+  nested position, i.e. a `T | null` return, i.e. D1197 closed first.
+
+* **NON-RECURSIVE NESTING IS UNAFFECTED and is covered**: `{ items: Item[], total: f64 }`
+  with `Item = { name: string, price: f64 }` walks and runs
+  (`tests/cases/unions/deep-is-json-shape-walk.vl` §NESTED).
+
+---
+
+### D1190 — a deep `is` arm that REBINDS or WRITES the tested place is refused, where master ran the same program and printed the wrong answer
+
+**loud check reject positioned at the `is` site — `a deep `is` arm that rebinds or writes
+`r` is not supported yet — bind the converted value first` · filed 2026-09-02 (vl-b7) with
+the deep-`is` build (D1035) ·
+`tests/cases/unions/error-deep-is-arm-rebinds-receiver.vl` · clause 2, and a named
+loud→refused price**
+
+Repro:
+
+    type Json = null | boolean | f64 | string | Json[] | { [string]: Json }
+    function d(r: Json): i32 {
+      if r is string[] {
+        const n = r[0].length
+        r = null
+        return n
+      }
+      0
+    }
+    const l: Json = ["xyz"]
+    print(d(l))
+    // check reject: a deep `is` arm that rebinds or writes `r` is not supported yet — bind the converted value first
+
+* **THE PRICE IS NAMED, NOT HIDDEN.** On master this program RAN and printed `0` — because
+  `r is string[]` answered `false` for every value, so the arm was dead. It is a wrong
+  answer that happens to run, and the row records the transition rather than leaving it to
+  be discovered.
+
+* **WHY THE REWRITE REFUSES.** A deep `is` arm reads the CONVERTED copy through a binding the
+  rewrite prepends, and every read of the tested place inside the arm is rewritten to it. A
+  write to that place falsifies the narrowing part-way through the arm — which is exactly
+  what `retireNarrowingsForWrite` encodes for the ordinary case — so the reads before and
+  after the write want DIFFERENT bindings, and a blanket rewrite would give them one.
+
+* **THE FIX IS A SCOPED SUBSTITUTION, and it is bounded work**: walk the arm in statement
+  order, stop rewriting the place at the first write or shadowing declaration, and let the
+  reads after it keep the receiver's declared type. The refusal is conservative on purpose
+  until that walk exists — it is loud, positioned at the `is` site, and it names the fix.
 
 ---
 

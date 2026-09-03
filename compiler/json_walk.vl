@@ -1,0 +1,918 @@
+// `json_walk.vl` — DEEP `is` OVER A `Json` VALUE: the walker GENERATOR and the
+// site REWRITE (`docs/serde-design.md` §"Deep `is` / `as` over a `Json` value";
+// closes `docs/internals/silent-class-inventory.md` D1035).
+//
+// WHAT THIS SOLVES. `r is string[]` where `r: Json` is not an arm test — a
+// `Json[]` holding strings is not a `string[]` in the heap, so no tag says yes,
+// and the emitter answered `false` for every value on a `vl check`-clean
+// program. The design rules the test a RUNTIME SHAPE WALK plus a conversion: on
+// success the arm binds a real `string[]` built out of the tree.
+//
+// WHY THE WALKER IS GENERATED VL AND NOT EMITTED WASM. The walk has to BUILD
+// every target rep — a `string[]`, a struct, a `{[string]: i32}` map — and the
+// emitter already knows how to build each of those from ordinary VL. Writing the
+// walk as VL SOURCE and handing it back to the pipeline reuses all of it: the
+// generator emits text, the driver parses it into the SAME arena and appends the
+// declarations to the program root, and check/emit run over the result. Nothing
+// in `wasmEmit.vl` learns a new rep, and no delivery position has to be wired,
+// because the narrowed value is an ORDINARY local of the target type — which is
+// the whole point of D965's rule, reached by making the lowering something the
+// emitter already serves at every position rather than a new one.
+//
+// TWO FUNCTIONS PER TARGET, MEMOISED BY (target spelling, receiver spelling):
+//
+//   __vlJsonIs_<k>(v: Json): boolean   — the predicate, allocation-free
+//   __vlJsonGet_<k>(v: Json): T        — the builder, called only under it
+//
+// The predicate is what `r is T` becomes; the builder is what the ARM's reads of
+// `r` become, bound ONCE at the top of the arm so S1 holds exactly (the narrowed
+// value is one converted COPY, and mutating it does not write back to the tree).
+// `jwTgt*` is deduped by that pair, so two `is Cfg` sites in one module emit ONE
+// pair of walkers.
+//
+// WHY NOT ONE FUNCTION RETURNING `T | null`. Because the arm would then bind a
+// nullable narrowed to non-null, and DELIVERING that into a non-null slot is a
+// standing clause-1 defect (D1197): `out.push(e)` under `if e != null` is
+// check-clean invalid wasm today. The pair sidesteps it entirely — every value
+// the generated code delivers is either a literal or a narrowed union ARM, and
+// the emitter wires both (D1031).
+//
+// THE FAILURE PATH IS A `return`. Each shape test opens `if <src> is <arm> {`
+// and closes `} else { return <fail> }`, so a mismatch anywhere unwinds the whole
+// walk in one step and no partial value escapes.
+
+import {
+  ArrayLit,
+  AsExpr,
+  BinExpr,
+  Block,
+  Call,
+  FieldInit,
+  ForIn,
+  ForRange,
+  FuncDecl,
+  Ident,
+  IfStmt,
+  Index,
+  IsExpr,
+  LetDecl,
+  MatchExpr,
+  Member,
+  Node,
+  NumLit,
+  ObjLit,
+  OptMember,
+  P,
+  Param,
+  Paren,
+  Program,
+  RetStmt,
+  StrLit,
+  Unary,
+  WhileStmt,
+  i32ToStr,
+  mkCall,
+  mkIdent,
+  mkIndex,
+  mkLet,
+  mkMember,
+  mkNum,
+  mkStr,
+  nodeToks,
+} from "./ast"
+import {
+  PrimName,
+  T,
+  TyArray,
+  TyMap,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  jsonSelfRef,
+  jsonUnionMembers,
+  jwSiteNode,
+  jwSiteTgt,
+  jwTgtRecv,
+  jwTgtRootTy,
+  jwTgtSpell,
+  jwTgtTy,
+  tErr,
+  tyToStr,
+} from "./typecheck"
+
+// ── generator state ─────────────────────────────────────────────────────────
+// Module-level rather than threaded: the recursion below already carries the two
+// arguments that VARY (the type and the source name), and the four that do not —
+// build mode, the failure expression, the receiver union and its two container
+// arm spellings — are constant for a whole function body.
+let jwCtr = 0
+let jwBuild = false
+let jwFail = "false"
+let jwRecvTy = -1
+let jwArrSpell = ""
+let jwMapSpell = ""
+
+function jwFresh(p: string): string {
+  jwCtr = jwCtr + 1
+  p + i32ToStr(jwCtr)
+}
+
+// The receiver union's ARRAY (`want` 0) or MAP (`want` 1) arm, spelled. Read off
+// the arena rather than spelled by hand: nothing privileges the name `Json`, and
+// a merged module's alias is `Json$mN`.
+function jwRecvArmSpell(recvTy: i32, want: i32): string {
+  if recvTy < 0 { return "" }
+  const ms = jsonUnionMembers(recvTy)
+  let i = 0
+  while i < ms.length {
+    const m = T.tys[ms[i]]
+    if m is TyArray {
+      if want == 0 {
+        if jsonSelfRef(m.aElem, recvTy) { return tyToStr(ms[i]) }
+      }
+    } else if m is TyMap {
+      if want == 1 {
+        if jsonSelfRef(m.mVal, recvTy) { return tyToStr(ms[i]) }
+      }
+    }
+    i = i + 1
+  }
+  ""
+}
+
+// A DEFAULT value of `ty`, spelled as VL source. Two consumers: the builder's
+// failure `return`, and the pre-declared accumulator every container case needs
+// so the value survives the `if` that guards it. Every JSON shape has one, which
+// is why the builder never needs a nullable carrier.
+function jwDefault(ty: i32): string {
+  if ty < 0 { return "null" }
+  if jsonSelfRef(ty, jwRecvTy) { return "null" }
+  const t = T.tys[ty]
+  if t is TyPrim {
+    const p = t.primName
+    if p == "string" { return "\"\"" }
+    if p == "boolean" { return "false" }
+    if p == "f64" { return "0.0" }
+    if p == "i32" { return "0" }
+    if p == "i64" { return "0" }
+    return "null"
+  }
+  if t is TyNullable { return "null" }
+  if t is TyArray { return "[]" }
+  if t is TyMap { return "Map()" }
+  if t is TyObj {
+    const fn = t.objFieldNames
+    const ft = t.objFieldTypes
+    let s = "{"
+    let i = 0
+    while i < fn.length {
+      if i > 0 { s = s + ", " }
+      s = s + fn[i] + ": " + jwDefault(ft[i])
+      i = i + 1
+    }
+    return s + "}"
+  }
+  "null"
+}
+
+// The nullable INNER of `ty` when `ty` is `X | null`, else -1. The checker's
+// shape predicate already refused every wider union, so this is the only union
+// shape the generator can meet.
+function jwNullableInner(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyNullable { return t.nInner }
+  if t is TyUnion {
+    const ms = t.uMembers
+    if ms.length == 2 {
+      if jwIsNullPrim(ms[0]) { return ms[1] }
+      if jwIsNullPrim(ms[1]) { return ms[0] }
+    }
+  }
+  -1
+}
+
+function jwIsNullPrim(ty: i32): boolean {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyPrim { return t.primName == "null" }
+  false
+}
+
+function jwAppend(dst: string[], src: string[]) {
+  let i = 0
+  while i < src.length {
+    dst.push(src[i])
+    i = i + 1
+  }
+  0
+}
+
+// The container guard: `if <src> is <spell> { <inner> } else { return <fail> }`.
+// An EMPTY inner would print an empty block, so it collapses to the negated leaf
+// form instead — same meaning, and a shape the checker and the formatter both
+// already accept.
+function jwGuard(out: string[], src: string, spell: string, inner: string[]) {
+  if inner.length == 0 {
+    out.push("if !(" + src + " is " + spell + ") { return " + jwFail + " }")
+    return 0
+  }
+  out.push("if " + src + " is " + spell + " {")
+  jwAppend(out, inner)
+  out.push("} else { return " + jwFail + " }")
+  0
+}
+
+// THE WALK. Appends to `out` the statements that test `src` (a NAME bound to a
+// `Json`-typed value) against `ty` and, in build mode, bind the converted value.
+// Returns the name holding it, or "" in check mode.
+//
+// `src` IS ALWAYS A NAME, never an expression. Re-binding a NARROWED value to a
+// fresh `const` is a standing emitter defect (`const s = v` under `if v is Json[]`
+// loses the list rep and refuses at `emitProgram: map op receiver is not a map`),
+// so every recursive step binds the SOURCE first and narrows the binding in
+// place, never the other way round.
+function jwWalk(ty: i32, src: string, out: string[]): string {
+  // The JSON union itself is the WILDCARD leaf: it matches anything and is taken
+  // BY REFERENCE — no walk, no copy (`docs/serde-design.md`, the "Deep" clause).
+  if jsonSelfRef(ty, jwRecvTy) { return jwWildcard(src) }
+  const nin = jwNullableInner(ty)
+  if nin >= 0 {
+    // S3: an ABSENT key and an explicit JSON `null` are the same fact here — a
+    // map read answers `null` for both — and both match `T | null`.
+    const inner: string[] = []
+    const iv = jwWalk(nin, src, inner)
+    if jwBuild {
+      const g = jwFresh("__vjn")
+      out.push("let " + g + ": " + tyToStr(ty) + " = null")
+      out.push("if " + src + " != null {")
+      jwAppend(out, inner)
+      out.push(g + " = " + iv)
+      out.push("}")
+      return g
+    }
+    if inner.length == 0 { return "" }
+    out.push("if " + src + " != null {")
+    jwAppend(out, inner)
+    out.push("}")
+    return ""
+  }
+  const t = T.tys[ty]
+  if t is TyPrim { return jwWalkPrim(t.primName, ty, src, out) }
+  if t is TyArray { return jwWalkArray(ty, t.aElem, src, out) }
+  if t is TyMap { return jwWalkMap(ty, t.mVal, src, out) }
+  if t is TyObj {
+    return jwWalkObj(ty, t.objFieldNames, t.objFieldTypes, src, out)
+  }
+  // Unreachable: `jsonShapeBad` refused every other arena shape at the `is` site,
+  // so the generator is never asked for one. A `return <fail>` rather than
+  // silence, so a shape that ever slips past the checker fails LOUD.
+  out.push("return " + jwFail)
+  ""
+}
+
+function jwWildcard(src: string): string {
+  if jwBuild { return src }
+  ""
+}
+
+function jwWalkPrim(p: PrimName, ty: i32, src: string, out: string[]): string {
+  if p == "i32" || p == "i64" {
+    // S2: an integer target takes an INTEGRAL, IN-RANGE JSON number and nothing
+    // else — the same predicate the exact `as?` conversion applies (DECISIONS.md
+    // §"Numeric `as` to an INTEGER target is exact-or-fail under the trio"), so
+    // the two definitions cannot drift apart.
+    const c = jwFresh("__vjc")
+    const inner: string[] = []
+    inner.push("const " + c + " = " + src + " as? " + p)
+    if jwBuild {
+      const g = jwFresh("__vji")
+      out.push("let " + g + ": " + p + " = 0")
+      inner.push(
+        "if " +
+          c +
+          " != null { " +
+          g +
+          " = " +
+          c +
+          " } else { return " +
+          jwFail +
+          " }",
+      )
+      jwGuard(out, src, "f64", inner)
+      return g
+    }
+    inner.push("if " + c + " == null { return " + jwFail + " }")
+    jwGuard(out, src, "f64", inner)
+    return ""
+  }
+  if p == "null" {
+    out.push("if " + src + " != null { return " + jwFail + " }")
+    if jwBuild { return "null" }
+    return ""
+  }
+  if !jwBuild {
+    out.push("if !(" + src + " is " + p + ") { return " + jwFail + " }")
+    return ""
+  }
+  const g = jwFresh("__vjp")
+  out.push("let " + g + ": " + p + " = " + jwDefault(ty))
+  out.push(
+    "if " +
+      src +
+      " is " +
+      p +
+      " { " +
+      g +
+      " = " +
+      src +
+      " } else { return " +
+      jwFail +
+      " }",
+  )
+  g
+}
+
+function jwWalkArray(ty: i32, elem: i32, src: string, out: string[]): string {
+  const inner: string[] = []
+  const iv = jwFresh("__vje")
+  const ix = jwFresh("__vjx")
+  inner.push("let " + ix + " = 0")
+  inner.push("while " + ix + " < " + src + ".length {")
+  inner.push("const " + iv + " = " + src + "[" + ix + "]")
+  const ev = jwWalk(elem, iv, inner)
+  let g = ""
+  if jwBuild {
+    g = jwFresh("__vja")
+    inner.push(g + ".push(" + ev + ")")
+  }
+  inner.push(ix + " = " + ix + " + 1")
+  inner.push("}")
+  if jwBuild { out.push("const " + g + ": " + tyToStr(ty) + " = []") }
+  jwGuard(out, src, jwArrSpell, inner)
+  g
+}
+
+function jwWalkMap(ty: i32, val: i32, src: string, out: string[]): string {
+  const inner: string[] = []
+  const kv = jwFresh("__vjk")
+  const iv = jwFresh("__vjv")
+  inner.push("for " + kv + " in " + src + " {")
+  inner.push("const " + iv + " = " + src + "[" + kv + "]")
+  const ev = jwWalk(val, iv, inner)
+  let g = ""
+  if jwBuild {
+    g = jwFresh("__vjm")
+    inner.push(g + "[" + kv + "] = " + ev)
+  }
+  inner.push("}")
+  if jwBuild { out.push("const " + g + ": " + tyToStr(ty) + " = Map()") }
+  jwGuard(out, src, jwMapSpell, inner)
+  g
+}
+
+function jwWalkObj(
+  ty: i32,
+  fn: string[],
+  ft: i32[],
+  src: string,
+  out: string[],
+): string {
+  const inner: string[] = []
+  const vals: string[] = []
+  let i = 0
+  while i < fn.length {
+    const rv = jwFresh("__vjf")
+    inner.push("const " + rv + " = " + src + "[\"" + fn[i] + "\"]")
+    vals.push(jwWalk(ft[i], rv, inner))
+    i = i + 1
+  }
+  let g = ""
+  if jwBuild {
+    g = jwFresh("__vjo")
+    let lit = "{"
+    let j = 0
+    while j < fn.length {
+      if j > 0 { lit = lit + ", " }
+      lit = lit + fn[j] + ": " + vals[j]
+      j = j + 1
+    }
+    lit = lit + "}"
+    out.push("let " + g + ": " + tyToStr(ty) + " = " + jwDefault(ty))
+    inner.push(g + " = " + lit)
+  }
+  jwGuard(out, src, jwMapSpell, inner)
+  g
+}
+
+// ── the generated SOURCE ─────────────────────────────────────────────────────
+export function jwWalkerName(k: i32): string { "__vlJsonGet_" + i32ToStr(k) }
+export function jwPredName(k: i32): string { "__vlJsonIs_" + i32ToStr(k) }
+
+function jwJoin(lines: string[]): string {
+  let s = ""
+  let i = 0
+  while i < lines.length {
+    s = s + lines[i] + "\n"
+    i = i + 1
+  }
+  s
+}
+
+// The whole fragment: one predicate + one builder per recorded target.
+export function jwGenerateSource(): string {
+  let src = ""
+  let k = 0
+  while k < jwTgtSpell.length {
+    // The ROOT, not the parameter: the walk's tests and its wildcard leaf are about the
+    // JSON tree, while the parameter is only what the site can hand it.
+    jwRecvTy = jwTgtRootTy[k]
+    jwArrSpell = jwRecvArmSpell(jwRecvTy, 0)
+    jwMapSpell = jwRecvArmSpell(jwRecvTy, 1)
+    const tgt = jwTgtTy[k]
+    const recv = jwTgtRecv[k]
+    const spell = jwTgtSpell[k]
+
+    jwBuild = false
+    jwFail = "false"
+    const chk: string[] = []
+    jwWalk(tgt, "v", chk)
+    src = src +
+      "function " +
+      jwPredName(k) +
+      "(v: " +
+      recv +
+      "): boolean {\n" +
+      jwJoin(chk) +
+      "true\n}\n"
+
+    jwBuild = true
+    jwFail = jwDefault(tgt)
+    const bld: string[] = []
+    const val = jwWalk(tgt, "v", bld)
+    src = src +
+      "function " +
+      jwWalkerName(k) +
+      "(v: " +
+      recv +
+      "): " +
+      spell +
+      " {\n" +
+      jwJoin(bld) +
+      val +
+      "\n}\n"
+    k = k + 1
+  }
+  // Every `$` in the text came from a merge-mangled type name, and the lexer cannot take
+  // one; it travels as `__jwmangle__` and `jwRestoreMangling` undoes it on the tokens.
+  jwReplaceAll(src, "$", JW_DOLLAR)
+}
+
+// ── THE MERGE-MANGLING ESCAPE ────────────────────────────────────────────────
+//
+// A MODULE BUILD renames every top-level declaration `Json` → `Json$m1`, and `tyToStr`
+// renders those names — which is exactly what makes the generated fragment resolve in the
+// merged scope. But `$` IS NOT AN IDENTIFIER CHARACTER: the lexer refuses it deliberately,
+// so that the template renderer's `$tpl$render` cannot be spelled by a user. Handing the
+// lexer a `Json$m1` is forty parse errors on a program that used to run.
+//
+// So the generator writes a LEXABLE stand-in and the driver puts the `$` back ON THE TOKEN
+// STREAM, before `parseProgram` sees it. Doing it at the token level rather than on the
+// parsed strings is what keeps it consistent: the parser builds the annotation SPELLING
+// TREE out of the same tokens it builds `TypeRef.tyName` from, and a rename applied to only
+// one of the two is exactly the drift `ast.clearAnnTs` exists to warn about.
+const JW_DOLLAR = "__jwmangle__"
+
+function jwReplaceAll(s: string, from: string, to: string): string {
+  let out = ""
+  let i = 0
+  while i < s.length {
+    let hit = false
+    if i + from.length <= s.length {
+      if s.slice(i, i + from.length) == from { hit = true }
+    }
+    if hit {
+      out = out + to
+      i = i + from.length
+    } else {
+      out = out + s.slice(i, i + 1)
+      i = i + 1
+    }
+  }
+  out
+}
+
+// Put the `$` back into every token of the generated fragment. `from` is the index the
+// fragment's tokens start at, so nothing the user wrote is touched.
+export function jwRestoreMangling(from: i32): i32 {
+  let i = from
+  while i < P.toks.length {
+    const tk = P.toks[i]
+    if tk.text.length >= JW_DOLLAR.length {
+      tk.text = jwReplaceAll(tk.text, JW_DOLLAR, "$")
+    }
+    i = i + 1
+  }
+  0
+}
+
+// ── the SITE REWRITE ─────────────────────────────────────────────────────────
+// `r is T` becomes `__vlJsonIs_k(r)`, in place — the node index is overwritten,
+// so every parent slot that pointed at the `IsExpr` keeps pointing at the call
+// and no parent surgery is needed. Where the receiver is a narrowable PLACE and
+// the test governs a branch, the arm additionally gets
+// `const __vljvN = __vlJsonGet_k(r)` prepended and every read of the place in
+// that arm rewritten to `__vljvN` — which is what makes the arm see a converted
+// `T` instead of the `Json` the checker no longer narrows.
+
+// The PLACE a node spells (`r`, `o.p`, `xs[0]`, `m[k]`), or "" for anything that
+// is not a stable place. The same grammar the checker's `placeKeyOf` spells, cut
+// to what this rewrite has to match.
+function jwPlaceKey(ix: i32): string {
+  if ix < 0 { return "" }
+  const n = P.nodes[ix]
+  if n is Ident { return n.identName }
+  if n is Paren { return jwPlaceKey(n.parInner) }
+  if n is Member {
+    const b = jwPlaceKey(n.memObj)
+    if b == "" { return "" }
+    return b + "." + n.memProp
+  }
+  if n is Index {
+    const b = jwPlaceKey(n.idxArr)
+    if b == "" { return "" }
+    const k = jwIndexKey(n.idxIndex)
+    if k == "" { return "" }
+    return b + "[" + k + "]"
+  }
+  ""
+}
+
+function jwIndexKey(ix: i32): string {
+  if ix < 0 { return "" }
+  const n = P.nodes[ix]
+  if n is NumLit { return n.numText }
+  if n is StrLit { return "\"" + n.strText + "\"" }
+  if n is Ident { return n.identName }
+  ""
+}
+
+// The ROOT identifier of a place key — what a shadowing declaration would have
+// to be named.
+function jwKeyRoot(key: string): string {
+  let i = 0
+  while i < key.length {
+    const c = key[i]
+    if c == '.' { return key.slice(0, i) }
+    if c == '[' { return key.slice(0, i) }
+    i = i + 1
+  }
+  key
+}
+
+function jwSetTok(ix: i32, tok: i32): i32 {
+  if ix >= 0 {
+    if ix < nodeToks.length { nodeToks[ix] = tok }
+  }
+  ix
+}
+
+// A fresh copy of a place expression — the builder call needs its own subtree,
+// because the original is now the predicate call's argument.
+function jwCopyPlace(ix: i32, tok: i32): i32 {
+  if ix < 0 { return -1 }
+  const n = P.nodes[ix]
+  if n is Ident { return jwSetTok(mkIdent(n.identName, n.pos), tok) }
+  if n is Paren { return jwCopyPlace(n.parInner, tok) }
+  if n is Member {
+    const b = jwCopyPlace(n.memObj, tok)
+    if b < 0 { return -1 }
+    return jwSetTok(mkMember(b, n.memProp, n.pos), tok)
+  }
+  if n is Index {
+    const a = jwCopyPlace(n.idxArr, tok)
+    if a < 0 { return -1 }
+    const i = jwCopyIndex(n.idxIndex, tok)
+    if i < 0 { return -1 }
+    return jwSetTok(mkIndex(a, i, n.pos), tok)
+  }
+  -1
+}
+
+function jwCopyIndex(ix: i32, tok: i32): i32 {
+  if ix < 0 { return -1 }
+  const n = P.nodes[ix]
+  if n is NumLit { return jwSetTok(mkNum(n.numText, n.pos), tok) }
+  if n is StrLit { return jwSetTok(mkStr(n.strText, n.pos), tok) }
+  if n is Ident { return jwSetTok(mkIdent(n.identName, n.pos), tok) }
+  -1
+}
+
+// The CHILD node indices of `ix`. Unlisted kinds are treated as leaves: a missed
+// kind loses a substitution, and a lost substitution is a LOUD type error in the
+// second check pass (the arm reads the place at `Json`), never a silent one.
+function jwKids(ix: i32): i32[] {
+  const ks: i32[] = []
+  if ix < 0 { return ks }
+  const n = P.nodes[ix]
+  if n is Unary {
+    ks.push(n.unArg)
+  } else if n is BinExpr {
+    ks.push(n.binLeft)
+    ks.push(n.binRight)
+  } else if n is Call {
+    ks.push(n.callFn)
+    jwPushAll(ks, n.callArgs)
+  } else if n is Member {
+    ks.push(n.memObj)
+  } else if n is OptMember {
+    ks.push(n.omObj)
+  } else if n is Paren {
+    ks.push(n.parInner)
+  } else if n is Index {
+    ks.push(n.idxArr)
+    ks.push(n.idxIndex)
+  } else if n is ArrayLit {
+    jwPushAll(ks, n.arrElems)
+  } else if n is ObjLit {
+    jwPushAll(ks, n.objFields)
+  } else if n is FieldInit {
+    ks.push(n.fiValue)
+  } else if n is IsExpr {
+    ks.push(n.isObj)
+  } else if n is AsExpr {
+    ks.push(n.asObj)
+  } else if n is LetDecl {
+    ks.push(n.letInit)
+  } else if n is IfStmt {
+    ks.push(n.ifCond)
+    ks.push(n.ifThen)
+    ks.push(n.ifElse)
+  } else if n is WhileStmt {
+    ks.push(n.whileCond)
+    ks.push(n.whileBody)
+  } else if n is ForRange {
+    ks.push(n.frFrom)
+    ks.push(n.frTo)
+    ks.push(n.frStep)
+    ks.push(n.frBody)
+  } else if n is ForIn {
+    ks.push(n.fiIter)
+    ks.push(n.fiBody)
+  } else if n is MatchExpr {
+    ks.push(n.matchScrut)
+    jwPushAll(ks, n.matchBodies)
+  } else if n is RetStmt {
+    ks.push(n.retArg)
+  } else if n is Block {
+    jwPushAll(ks, n.blkStmts)
+  } else if n is Program {
+    jwPushAll(ks, n.progStmts)
+  } else if n is FuncDecl {
+    ks.push(n.fnBody)
+  }
+  ks
+}
+
+function jwPushAll(dst: i32[], src: i32[]) {
+  let i = 0
+  while i < src.length {
+    dst.push(src[i])
+    i = i + 1
+  }
+  0
+}
+
+// Replace every occurrence of the place `key` under `ix` with `name`, IN PLACE.
+// A matched node is overwritten and NOT descended into — `o.p.q` matches at
+// `o.p` and becomes `<name>.q`, which is the read the arm wanted.
+function jwSubst(ix: i32, key: string, name: string) {
+  if ix < 0 { return 0 }
+  if jwPlaceKey(ix) == key {
+    const nd: Node = { identName: name, pos: -1 }
+    P.nodes[ix] = nd
+    return 0
+  }
+  const ks = jwKids(ix)
+  let i = 0
+  while i < ks.length {
+    jwSubst(ks[i], key, name)
+    i = i + 1
+  }
+  0
+}
+
+// Does the arm REBIND or WRITE the place? Either would make a blanket
+// substitution wrong (the checker retires a narrowing for exactly these), so the
+// rewrite refuses LOUDLY instead of guessing.
+function jwArmDisturbs(ix: i32, key: string, root: string): boolean {
+  if ix < 0 { return false }
+  const n = P.nodes[ix]
+  if n is LetDecl {
+    if n.letName == root { return true }
+  } else if n is ForIn {
+    if n.fiVar == root { return true }
+  } else if n is ForRange {
+    if n.frVar == root { return true }
+  } else if n is FuncDecl {
+    let p = 0
+    while p < n.fnParams.length {
+      const pn = P.nodes[n.fnParams[p]]
+      if pn is Param {
+        if pn.parName == root { return true }
+      }
+      p = p + 1
+    }
+  } else if n is BinExpr {
+    if n.binOp == "=" {
+      const lk = jwPlaceKey(n.binLeft)
+      if lk == key { return true }
+      if lk == root { return true }
+    }
+  }
+  const ks = jwKids(ix)
+  let i = 0
+  while i < ks.length {
+    if jwArmDisturbs(ks[i], key, root) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Where does the site sit in `c0`? 1 = a positive position (the THEN arm sees
+// the narrowing), -1 = under an odd number of `!` at the top (the ELSE arm sees
+// it), 0 = nowhere the narrowing reaches. `&&` propagates only the positive
+// answer: the else of `a && (r is T)` proves nothing about `r`.
+function jwPolarity(c0: i32, siteIx: i32): i32 {
+  if c0 < 0 { return 0 }
+  if c0 == siteIx { return 1 }
+  const c = P.nodes[c0]
+  if c is Paren { return jwPolarity(c.parInner, siteIx) }
+  if c is Unary {
+    if c.unOp == "!" {
+      const p = jwPolarity(c.unArg, siteIx)
+      if p == 1 { return -1 }
+      if p == -1 { return 1 }
+      return 0
+    }
+    return 0
+  }
+  if c is BinExpr {
+    if c.binOp == "&&" {
+      if jwPolarity(c.binLeft, siteIx) == 1 { return 1 }
+      if jwPolarity(c.binRight, siteIx) == 1 { return 1 }
+      return 0
+    }
+    return 0
+  }
+  0
+}
+
+// Prepend `stmt` to `blk`'s statement list, in place. The list is mutated
+// through `.push`/`.pop` rather than replaced, so no field write is needed on a
+// narrowed arm.
+function jwPrependStmt(blk: i32, stmt: i32): boolean {
+  if blk < 0 { return false }
+  const b = P.nodes[blk]
+  if b is Block {
+    const old: i32[] = []
+    let i = 0
+    while i < b.blkStmts.length {
+      old.push(b.blkStmts[i])
+      i = i + 1
+    }
+    while b.blkStmts.length > 0 { b.blkStmts.pop() }
+    b.blkStmts.push(stmt)
+    let j = 0
+    while j < old.length {
+      b.blkStmts.push(old[j])
+      j = j + 1
+    }
+    return true
+  }
+  false
+}
+
+// The BLOCK the narrowing governs for the innermost conditional enclosing the
+// site, or -1 when the test is used as a plain boolean.
+function jwArmBlockOf(siteIx: i32): i32 {
+  let c = siteIx + 1
+  while c < P.nodes.length {
+    const n = P.nodes[c]
+    if n is IfStmt {
+      const p = jwPolarity(n.ifCond, siteIx)
+      if p == 1 { return n.ifThen }
+      if p == -1 {
+        if n.ifElse >= 0 {
+          const e = P.nodes[n.ifElse]
+          if e is Block { return n.ifElse }
+        }
+        return -1
+      }
+    } else if n is WhileStmt {
+      // A LOOP BODY GETS NO BINDING, and that is the language's rule rather than a gap
+      // here: `checkWhileStmt` carries only NULL STRIPS into a loop body, never an
+      // `is T` variant pin, because a pin would reject the assignment that flips the
+      // variant and that is how a loop over a union terminates. `while x is Circle {
+      // x.r }` is refused for an ordinary union today, so a deep `is` in the same
+      // position gives the BOOLEAN and nothing else — matching, not extending.
+      const p = jwPolarity(n.whileCond, siteIx)
+      if p != 0 { return -1 }
+    }
+    c = c + 1
+  }
+  -1
+}
+
+let jwVarCtr = 0
+
+// Rewrite one recorded site. "" on success, otherwise a message that stops the
+// compile LOUDLY — a deep `is` that cannot be routed must never fall through to
+// the emitter, which would answer `false` for every value (D1035 itself).
+function jwRewriteSite(siteIx: i32, k: i32): string {
+  if siteIx < 0 || siteIx >= P.nodes.length {
+    return "internal: deep `is` site is out of range"
+  }
+  const n = P.nodes[siteIx]
+  if n is IsExpr {
+    const recvIx = n.isObj
+    const tok = nodeToks[siteIx]
+    const arm = jwArmBlockOf(siteIx)
+    const key = jwPlaceKey(recvIx)
+    // The narrowed BINDING, prepended to the arm. Only a stable PLACE can carry
+    // one: a call result has no place for the checker to narrow either, so the
+    // test there is a plain boolean and nothing in the arm refers to it.
+    if arm >= 0 && key != "" {
+      const root = jwKeyRoot(key)
+      if jwArmDisturbs(arm, key, root) {
+        return "a deep `is` arm that rebinds or writes `" +
+          key +
+          "` is not supported yet — bind the converted value first"
+      }
+      jwVarCtr = jwVarCtr + 1
+      const vname = "__vljv" + i32ToStr(jwVarCtr)
+      jwSubst(arm, key, vname)
+      const cp = jwCopyPlace(recvIx, tok)
+      if cp < 0 { return "internal: deep `is` receiver has no copyable place" }
+      const gid = jwSetTok(mkIdent(jwWalkerName(k), -1), tok)
+      const gargs: i32[] = []
+      gargs.push(cp)
+      const gcall = jwSetTok(mkCall(gid, gargs, -1), tok)
+      const letIx = jwSetTok(mkLet("const", vname, -1, gcall, -1), tok)
+      if !jwPrependStmt(arm, letIx) {
+        return "internal: deep `is` arm is not a block"
+      }
+    }
+    const fid = jwSetTok(mkIdent(jwPredName(k), n.pos), tok)
+    const args: i32[] = []
+    args.push(recvIx)
+    const names: string[] = []
+    const call: Node = {
+      callFn: fid,
+      callArgs: args,
+      callArgNames: names,
+      pos: n.pos,
+    }
+    P.nodes[siteIx] = call
+    return ""
+  }
+  "internal: deep `is` site is not an `is` expression"
+}
+
+// Rewrite every recorded site. Returns the number of sites that REFUSED; each refusal is
+// raised as a positioned type error at its own `is` site rather than returned as a string,
+// because a rewrite refusal is a fact about the program the author wrote and belongs in the
+// channel every other verdict on that line arrives in.
+export function jwRewriteAll(): i32 {
+  jwVarCtr = 0
+  let bad = 0
+  let s = 0
+  while s < jwSiteNode.length {
+    const e = jwRewriteSite(jwSiteNode[s], jwSiteTgt[s])
+    if e != "" {
+      tErr(e, jwSiteNode[s])
+      bad = bad + 1
+    }
+    s = s + 1
+  }
+  bad
+}
+
+// Append the parsed fragment's declarations to the program root.
+export function jwSplice(root: i32, frag: i32): boolean {
+  if root < 0 || frag < 0 { return false }
+  const f = P.nodes[frag]
+  if f is Program {
+    const r = P.nodes[root]
+    if r is Program {
+      let i = 0
+      while i < f.progStmts.length {
+        r.progStmts.push(f.progStmts[i])
+        i = i + 1
+      }
+      return true
+    }
+  }
+  false
+}

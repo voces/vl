@@ -1393,7 +1393,7 @@ actually walks, and the seen-set getting cheaper never makes the predicate wrong
 thing that decides whether it ever has a customer, so it cannot be priced before the
 predicate exists.
 
-## Deep `is` / `as` over a `Json` value — the read's second phase is an OPERATOR (owner direction, 2026-09-02)
+## Deep `is` / `as` over a `Json` value — the read's second phase is an OPERATOR (owner direction, 2026-09-02) — **`is` BUILT 2026-09-02 (PR-DEEPIS); the `as` trio is the remainder**
 
 *Owner, on `json-design.md` §6 question 1 (accessor helpers): "why would it have to be one
 `is` test per level? why can't you do a complex, nested type on the right hand side? I say
@@ -1521,6 +1521,153 @@ JSON shape", reusing the acyclic/ref-free predicate ruling D already schedules) 
 emitter walk keyed on the RHS type at the `is`/`as` site. Position matrix before narrowing
 the checker — `is` in an `if`, `while`, `&&` chain and `!`, `as` at binding / return /
 argument / assignment — per the D965 lesson. Standing gap it closes: D1035.
+
+### WHAT WAS BUILT — `is` only, 2026-09-02 (PR-DEEPIS)
+
+**`is` is BUILT with S1, S2 and S3 exactly as recommended/ruled. The `as` trio (S4) is NOT
+built** and is the remainder `ROADMAP.md` carries; a half-wired `as` was explicitly not
+shipped, because the trio's `JsonError` propagation is a std surface change and every
+delivery position of a `T | JsonError` has to be wired before the checker admits one.
+
+**THE WALKER IS GENERATED VL, NOT EMITTED WASM, and that is what made the position matrix
+free.** The walk has to BUILD every target rep — a `string[]`, a struct, a `{[string]: i32}`
+map — and the emitter already knows how to build each of those out of ordinary VL. So the
+checker RECORDS which `is` sites are deep (`typecheck.jsonUnionRootOf` /
+`typecheck.jsonShapeBad`), and `driver.jwSecondPass` generates one pair of functions per
+distinct target as VL SOURCE, parses that fragment onto the same token stream and arena,
+appends its declarations to the program root, rewrites each site into a call, and re-checks:
+
+    __vlJsonIs_<k>(v: Json): boolean   — the predicate, what `r is T` becomes
+    __vlJsonGet_<k>(v: Json): T        — the builder, what the ARM's reads of `r` become
+
+Nothing in `wasmEmit.vl` learned a rep and no delivery position needed wiring, because the
+arm's binding is an ORDINARY local of the target type. D965's rule is met by making the
+lowering something the emitter already serves everywhere, rather than by wiring a new one
+into nine places.
+
+**MEMOISED ON (target spelling, receiver spelling)** — two `is Cfg` sites emit ONE pair,
+pinned by a function-count differential in `tests/vl_deep_is_walker_test.ts`. A program with
+no deep `is` pays nothing: the second pass returns on its first line, and five control
+programs emit byte-identical modules before and after.
+
+**WHY TWO FUNCTIONS AND NOT ONE RETURNING `T | null`.** The arm would then bind a nullable
+narrowed to non-null, and DELIVERING that into a non-null slot is a standing clause-1 defect
+— `out.push(e)` under `if e != null` is check-clean invalid wasm (D1197, and `.push` is the
+only one of nine positions that breaks). The pair sidesteps it entirely at the cost of
+walking twice. Closing D1197 is what would collapse the pair back to one function, and with
+it unlock a RECURSIVE target (D1198), which this build refuses because the generator inlines
+each level.
+
+**THE SUB-RULES, GRADED.**
+
+* **S1 (copy/rebind) — BUILT as recommended.** The arm's `r` is one converted COPY, bound
+  once at the top of the arm; mutating it does not write back to the tree.
+* **S2 (integers) — BUILT as recommended, and it is literally the same predicate.** The walk
+  asks `v as? i32`, so an integer target matches iff the exact-or-fail numeric conversion
+  would. `1e12 is i32` → `false`, `1e12 is i64` → `true`, `1.5 is i32` → `false`.
+* **S3 (absent key) — BUILT as RULED.** The whole grading list the ruling wrote out passes,
+  at both the annotated and the un-annotated spelling of each:
+  `{"port": 1} is Cfg` → `true` with `cfg.host == null`; `{"port":1,"host":null}` → `true`;
+  `{"host":"x"}` → `false`; and `type T = {x: i32} | {x: i32, y: i32 | null}` is REFUSED at
+  the `is` site, naming both arms structurally.
+* **S4 (the `as` trio) — NOT BUILT.** `std/json.vl` is untouched: the `"shape"` kind is
+  still only RESERVED in its header, so this change needed no std review.
+
+**THE RECEIVER MAY BE WIDER THAN THE TREE, which is what makes this document's own opening
+example work.** `const doc = text.parseJson()` is a `Json | JsonError`, and a value of that
+type is NOT assignable to `Json` — so the walker's PARAMETER is the receiver's own type
+rather than the tree's, and only the shape predicate, the wildcard leaf and the two arm
+spellings are read from the tree. Its container tests still work, because a nested union's
+arms flatten through: `doc is {[string]: Json}` runs over `Json | JsonError` today while
+`doc is Json` is a loud emit reject. An arm of the RECEIVER stays a tag test — a
+JSON-shaped `Payload` that is also an arm of `Json | Payload` is discriminated, not walked,
+or `x is Payload` would answer `true` for any map whose keys happened to fit.
+
+**A MODULE BUILD NEEDED ONE MORE THING, AND IT IS THE KIND OF THING ONLY A WITNESS FINDS.**
+The merge renames every declaration `Json` → `Json$m1`, and `tyToStr` renders those names —
+which is exactly what makes the generated fragment resolve in the merged scope. But `$` is
+NOT an identifier character: the lexer refuses it so that `$tpl$render` cannot be spelled by
+a user. Handing the lexer a `Json$m1` was forty parse errors on a program that had compiled
+(and answered wrong) the day before — a `runs → not-runs` regression that no fixture in the
+tree would have caught, because none of them imports `std:json` AND tests a shape. So the
+generator writes a lexable stand-in and the driver restores the `$` ON THE TOKEN STREAM
+before the fragment parses; doing it on tokens rather than on the parsed strings is what
+keeps `TypeRef.tyName` and the annotation spelling tree from drifting apart.
+`tests/cases/std/json-deep-is-parse-result.vl` is that witness.
+
+**TWO FACES THE FIRST CUT DID NOT GRADE, both found by review and both fixed before merge.**
+The two-faces rule was applied to the RECEIVER and to the ARM BINDING, and both of the
+misses were somewhere else:
+
+* **The ENCLOSING FUNCTION'S RETURN.** A function with an un-annotated return is checked
+  more than once — the return-inference pass re-walks the body — so pass 1 recorded one `is`
+  site twice, and the second worklist row met a node the first had already rewritten:
+  `internal: deep \`is\` site is not an \`is\` expression`, on a program whose annotated twin
+  ran. The worklist is deduped by node index, and an `internal:` sentence must not be
+  reachable from a legal program. `tests/cases/unions/deep-is-json-inferred-return.vl` pins
+  both faces plus four body shapes that were scenery.
+* **The COMPLEMENT VIEW after an earlier guard — and it has TWO PRODUCERS, which is why the
+  first cut of this looked fixed and was not.** `if r is JsonError { … }` leaves `r` narrowed
+  for what follows, and the checker's type there is `Json`'s arms with `JsonError` gone. The
+  EMITTER has no such view; it holds the binding's DECLARED union. A walker spelled from the
+  narrowed type made the call a conversion between two unions keyed on a FLATTENED spelling
+  nothing registered — a loud emit reject on a `vl check`-clean program.
+
+  The producers, enumerated from the code: `applyNarrows` installs the ELSE-ARM /
+  `while`-body / match-arm / `&&`-conjunct complement and banks the shadowed declaration
+  (`noteNarShadow`, `NAR_KIND_GUARD`); the POST-GUARD FALL-THROUGH — `if r is JsonError {
+  return }`, the shape a std:json consumer writes FIRST — narrows the rest of the block with a
+  bare `declare` in the enclosing scope and banked nothing, and the `else if` chain hand-up
+  (`pgUpKeys`) is the same `declare` one level out. Both now bank under a THIRD kind,
+  `NAR_KIND_POSTGUARD`, so `narGuardSlot`'s retirement and the dead-`??` reader keep seeing
+  exactly the rows they saw before.
+
+  AND THE READER TAKES THE OUTERMOST ROW. `narDeclaredTy` answers the INNERMOST shadow, whose
+  banked type is itself already narrowed once two guards stack; "the one with the most union
+  members" reads right and is exactly backwards, because `Json | JsonError` has TWO members
+  and its complement view is the union FLATTENED — seven — so that rule picked the narrowed
+  type every time and re-broke the `else if` form it had just fixed. The bank is
+  append-ordered, so the FIRST live row is the declaration.
+
+  `tests/cases/std/json-deep-is-after-error-guard.vl` pins fourteen cells: the early-return
+  guard (annotated and inferred return, and an arm reading the nullable field), a guard that
+  diverges by `break` and by `continue`, `else if`, a nested `if`, `!(r is JsonError) && r is
+  Cfg`, `!(…)` with the test inside, a `while` guard, module scope, two guards STACKED, the
+  unguarded control, and the error arm actually taken. Each prints a distinct value.
+
+**THE COST IS A SECOND PARSE AND A SECOND CHECK, paid only by a file that uses the feature —
+and MEASURING IT NEEDED ONE MORE CONTROL THAN IT LOOKED LIKE.** `vl check`, best of 12 on a
+shared box, each program against the same program with its `is` target made non-deep:
+
+| program | best |
+| --- | --- |
+| no deep `is` (the control) | **10 ms** |
+| one deep `is`, one top-level function, `Json` only | 23 ms |
+| one deep `is`, one top-level function, `Json` + an unused `Cfg` | **41 ms** |
+| the SAME program plus one trivial unrelated function | **10 ms** |
+| two deep `is` functions (two targets) | 12 ms |
+| four deep `is` sites, three targets | 14 ms |
+
+The fourth row is the one that settles it: adding a function that has nothing to do with the
+feature takes the same program from 41 ms back to the control's 10 ms. So the added cost does
+NOT track the number of deep `is` sites, and it is not simply "a second check pass" either —
+it is a SHAPE sensitivity in the existing whole-program machinery that a one-function program
+exposes. On any file with more than one top-level function the measured cost of the second
+pass is ~0–4 ms; the worst reading is +31 ms on a five-line, single-function file. For the
+LSP, which checks on every keystroke, that is the number to watch, and a one-function file is
+the shape to watch it on; a file with no deep `is` pays nothing at all (the second pass
+returns on its first line, and its emitted module is byte-identical).
+
+**TWO POSITIONS ARE THE LANGUAGE'S RULE RATHER THAN THIS BUILD'S LIMIT.** A `while`
+condition gives the boolean and no binding — `checkWhileStmt` carries only NULL STRIPS into
+a loop body, never an `is T` variant pin, and `while x is Circle { x.r }` over an ordinary
+union is refused today for the same reason. A CALL-result receiver gives the boolean and no
+binding because there is no place for the checker to narrow, which is also already true.
+
+**THE PRICE, NAMED.** A deep `is` arm that REBINDS or WRITES the tested place is now a loud
+refusal positioned at the `is` site (D1190) where master ran the program and printed the
+wrong answer. That is the one loud→refused transition this build makes, and it is a row with
+a witness rather than a discovery waiting to happen.
 
 ## Open questions — the owner's answers, 2026-09-01, and what each one still leaves open
 

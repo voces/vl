@@ -118,8 +118,26 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   repeat silently; the mitigation is an INSTRUMENT, not hesitation (a per-build instance
   report making mono growth visible — filed as part of the implementation's grading).
   Compiler-side work; the compile-goal session's surface.
-- **Deep `is` / `as` over a `Json` value — RULED (owner, 2026-09-02): "why would it have to
-  be one `is` test per level? … get that working"** — `std:json` v1 (#2322) ships NO
+- **Deep `is` over a `Json` value — `is` BUILT 2026-09-02 (PR-DEEPIS); the `as` TRIO IS THE
+  REMAINDER.** `r is T` for a JSON-SHAPE `T` is now a runtime shape walk plus a conversion:
+  the checker records the deep sites, the driver generates one `__vlJsonIs_<k>` +
+  `__vlJsonGet_<k>` pair per distinct target as ordinary VL SOURCE, splices it into the
+  program and re-checks, so the arm binds a real `string[]` / `Cfg` / `{[string]: i32}` and
+  no delivery position had to be wired. S1 (copy), S2 (integral, in-range — literally
+  `v as? i32`) and S3 (absent key matches `T | null` as `null`) all hold; D1035 CLOSED.
+  **Still to build: S4, the `as` trio** — `r as T` yielding `T | JsonError` with
+  `JsonError { kind: "shape", path: "<json pointer to the first mismatch>" }`, `as!`
+  trapping with the same message, `as? ` yielding `T | null`. That needs the walker to track
+  a POINTER (the current pair returns a bare boolean and a bare `T`), and adding `"shape"` to
+  the exported `JsonError.kind` literal set is a std API change that must go through
+  `std-api-reviewer` first. Three residue rows carry the rest: **D1197** (`.push` drops the
+  non-null recovery for a narrowed nullable ref — the reason the walker is a PAIR rather
+  than one `T | null` function), **D1198** (a recursive JSON shape target has no walker,
+  because the generator inlines each level), **D1190** (a deep `is` arm that rebinds or
+  writes the tested place refuses). Closing D1197 is the unlock for both of the others.
+  Design + the built/not-built split: `docs/serde-design.md` §"Deep `is` / `as` over a
+  `Json` value" §"WHAT WAS BUILT"; DECISIONS.md has the standing rule.
+- **`as` trio over a `Json` value — the remainder of the item above, NOT BUILT** — `std:json` v1 (#2322) ships NO
   accessor helper (json-design §6 q1 = (a), "until we have an actual consumer"); the
   decoder is the operator: `if doc is Cfg { doc.server.port }` / `doc as Cfg` (trio
   semantics), a compiler-derived per-`T` shape walk that BUILDS the `T`-repped value from
