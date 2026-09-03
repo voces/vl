@@ -109,6 +109,26 @@ function vocabulary(src: string): string[] {
   return phrases;
 }
 
+// PROSE IS NOT A PROGRAM, and the fallback rule could not tell the difference. A row that
+// writes an indented paragraph — a numbered list's continuation lines are five spaces in,
+// which is correct Markdown — handed "the first indented block after the status line" an
+// English witness; `vl check` called it a parse error, the row's declared `check reject`
+// matched, and `--strict` passed on a program nobody wrote (D957). This test runs nothing,
+// so it decides by SHAPE: the block's first non-blank line must open like VL. Measured over
+// both inventories on 2026-09-03 — 522 of 523 rows' first repro line passes, and the one
+// that fails is exactly the paragraph. The grader needs no such predicate: it RUNS the
+// program and grades an unparsed one `witness_unparsed`, which is why the rule lives here
+// alone rather than being read from the python the way the status vocabulary is.
+const VL_KEYWORDS = [
+  "import", "export", "function", "const", "let", "type", "if", "else", "for",
+  "while", "return", "print", "test", "break", "continue", "throw", "new", "match",
+];
+const VL_LINE = new RegExp(
+  "^(?://|@|[{[(])" + // a comment, a directive, or a literal/paren opener
+    "|^(?:" + VL_KEYWORDS.join("|") + ")\\b" + // a statement keyword
+    "|^[A-Za-z_$][A-Za-z0-9_$]*\\s*[({[.=,;:<]", // an identifier VL punctuation follows
+);
+
 type Row = {
   id: string;
   title: string;
@@ -116,6 +136,7 @@ type Row = {
   status?: string;
   sawReproLabel: boolean;
   hasRepro: boolean;
+  proseBlock?: string;
 };
 
 /** Rows and the two properties that make one gradeable — the grader's own rules. */
@@ -123,6 +144,9 @@ function parseRows(text: string): Row[] {
   const lines = text.split("\n");
   const rows: Row[] = [];
   let cur: Row | undefined;
+  // Whether the previous line was inside an indented block: only a block's FIRST line is
+  // judged, so a paragraph's later lines cannot smuggle the block in behind the first.
+  let inBlock = false;
   for (let i = 0; i < lines.length; i++) {
     const m = SEC.exec(lines[i]);
     if (m) {
@@ -134,11 +158,13 @@ function parseRows(text: string): Row[] {
         sawReproLabel: false,
         hasRepro: false,
       };
+      inBlock = false;
       continue;
     }
     if (ANYHEAD.test(lines[i])) {
       if (cur) rows.push(cur);
       cur = undefined;
+      inBlock = false;
       continue;
     }
     if (!cur) continue;
@@ -166,13 +192,14 @@ function parseRows(text: string): Row[] {
     // drift this test exists to prevent. Found by sabotage: deleting a row's program while
     // leaving its `Repro (…):` line made this pass and the grader fail.
     if (/^Repro\b/.test(ln)) cur.sawReproLabel = true;
-    if (
-      !cur.hasRepro &&
-      (cur.sawReproLabel || cur.status !== undefined) &&
-      ln.startsWith("    ") &&
-      ln.trim() !== ""
-    ) {
-      cur.hasRepro = true;
+    const indented = ln.startsWith("    ") && ln.trim() !== "";
+    if (!indented && ln.trim() !== "") inBlock = false;
+    if (indented && !inBlock) {
+      inBlock = true;
+      if (cur.sawReproLabel || cur.status !== undefined) {
+        if (VL_LINE.test(ln.trim())) cur.hasRepro = true;
+        else if (cur.proseBlock === undefined) cur.proseBlock = ln.trim();
+      }
     }
   }
   if (cur) rows.push(cur);
@@ -213,7 +240,13 @@ Deno.test("every filed inventory row carries a witness the checker can run", asy
           bad.push(
             `${doc}:${r.line}  ${r.id} — no repro block\n` +
               `      want: a \`Repro:\` block, or an indented program after the status line\n` +
-              `      got:  neither`,
+              `      got:  ${
+                r.proseBlock === undefined
+                  ? "neither"
+                  : `an indented block that does not open like VL — ${
+                    JSON.stringify(r.proseBlock.slice(0, 70))
+                  }. Prose is not a witness: the grader would run it and get a parse error.`
+              }`,
           );
         }
       }
@@ -263,5 +296,36 @@ Deno.test("every filed inventory row carries a witness the checker can run", asy
         `file the program that must keep RUNNING, with the status ` +
         `\`runs today and must keep running\`.`,
     );
+  }
+});
+
+// THE SHAPE RULE, SEEN TO FIRE — on specimens whose answer is known by construction, the
+// same discipline `check-filed-witnesses.py --self-test` applies to the outcome vocabulary.
+// A predicate that has never rejected anything is not known to reject prose, and the test
+// above cannot show it: every filed row passes, so a `VL_LINE` that accepted everything
+// would look identical. In process, no files planted, no compiler.
+const SHAPE_SPECIMENS: Array<[string, boolean, string]> = [
+  ["a plain VL witness", true, "Repro:\n\n    print(6 * 7)\n"],
+  ["prose alone", false, "  1. **Why.** `i32[]`,\n     `boolean[]` share one kind, and\n"],
+  ["prose ABOVE a real block", true, "  1. **Why.** `i32[]`,\n     `boolean[]` share it\n" +
+    "\nRepro:\n\n    print(6 * 7)\n"],
+  ["a `// directive` first line", true, "Repro:\n\n    // @hint x\n    print(1)\n"],
+];
+
+Deno.test("an indented English paragraph does not count as a repro block", () => {
+  const bad: string[] = [];
+  for (const [name, want, body] of SHAPE_SPECIMENS) {
+    const text = `### D1 — specimen\n**closed**\n\n${body}`;
+    const rows = parseRows(text);
+    if (rows.length !== 1) {
+      bad.push(`${name}: want 1 parsed row, got ${rows.length}`);
+      continue;
+    }
+    if (rows[0].hasRepro !== want) {
+      bad.push(`${name}: want hasRepro ${want}, got ${rows[0].hasRepro}`);
+    }
+  }
+  if (bad.length > 0) {
+    throw new Error(`the repro-shape rule misroutes:\n  ${bad.join("\n  ")}`);
   }
 });
