@@ -501,6 +501,8 @@ The tree cannot reach zero in one PR, so both rules ride a RATCHET.
 FILE's count goes up; `--write-baseline` lowers it, in the same PR as the trim that earned it.
 `scripts/lint-self.sh` holds exactly these two codes out of its own `info` gate while the
 baseline still owes them — read FROM the baseline, so the exemption deletes itself at zero.
+**The baseline IS zero now (batch 7), so the exemption is gone and both rules gate at `info`
+like every other lint: a 13-line block or an uncited number fails `lint-self.sh` outright.**
 
 **A comment-only change must produce a BYTE-IDENTICAL seed.** That is the trim campaign's
 whole safety proof: `scripts/refresh-compiler.sh`, then `cmp` against a seed built from the

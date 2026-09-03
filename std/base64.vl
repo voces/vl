@@ -1,115 +1,43 @@
 // `std:base64` — RFC 4648 §4 base64, the standard alphabet with padding, in
-// pure VL. Bytes in, text out, and back.
+// pure VL. Bytes in, text out, and back; `docs/serde-design.md` names it as
+// the answer for `u8[]` in every text format VL reads or writes.
 //
-// WHY THIS MODULE EXISTS. `std:utf8` converts between VL's strings and the byte
-// world for bytes that ARE text. Bytes that are NOT text — a PNG, a hash, a
-// key, the `u8[]` field of any record — have no spelling as a `string` at all,
-// and every text format VL is about to read or write needs one:
-// `docs/serde-design.md` names base64 as the answer for `u8[]` in both the
-// hand-written `std:json` (stage 1) and the derived JSON rendering (stage 3),
-// and lists it among stage 0's prerequisites. It is admitted under
-// `std-design.md` D2's clause (a) — what the language story needs to be
-// complete without third parties — and the honest caveat is that its first
-// in-tree CONSUMER is stage 1, which is scheduled and not yet built. It lands
-// now rather than with that consumer for two reasons that do not generalise to
-// speculative modules: the specification is an RFC with published test vectors,
-// so there is no design risk in landing it early, and stage 0 is defined as the
-// slice that clears the prerequisites off stage 1's critical path.
+// THE DIRECTIONS READ BACKWARDS FROM `std:utf8` AND THAT IS DELIBERATE:
+// `encodeUtf8` goes text → bytes, `encodeBase64` goes bytes → text; in each
+// domain "encode" is the direction the format's own name describes, and the
+// receiver type disambiguates. ENCODE IS TOTAL, the ruling `std:utf8` makes
+// for the same reason: every `u8[]` has a base64 encoding, so a fallible
+// signature would infect callers for input that cannot exist; `[]` → `""`.
 //
-// THE DIRECTIONS READ BACKWARDS FROM `std:utf8` AND THAT IS DELIBERATE.
-// `encodeUtf8(self: string): u8[]` goes text → bytes; `encodeBase64(self:
-// u8[]): string` goes bytes → text. Neither is inconsistent: in each domain
-// "encode" is the direction the format's own name describes — the UTF-8
-// ENCODING of a string is bytes, the base64 ENCODING of bytes is text. The
-// receiver type disambiguates at every call site, and the alternative
-// (`toBase64`/`fromBase64`) would have made the pair read as a cast rather
-// than as the codec it is.
+// DECODE IS STRICT. Each refusal is one `kind` on `Base64Error`:
+//   • `"character"` — any byte outside `A-Za-z0-9+/=`, SPACES AND NEWLINES
+//     INCLUDED: base64's familiar wrapping is MIME's (RFC 2045 §6.8), a
+//     different format, and stripping it is the caller's decision.
+//   • `"length"` — not a multiple of four; padding is REQUIRED, so `"QQ"` is
+//     refused where `"QQ=="` decodes. THIS GATE RUNS FIRST, so wrapped MIME
+//     reports `"length"` at the input's size, not `"character"` at the break.
+//   • `"padding"` — `=` anywhere but the last one or two positions.
+//   • `"bits"` — non-canonical trailing bits: the bits of the final character
+//     past the end of the last byte must be zero (RFC 4648 §3.5 permits the
+//     refusal). It is what makes decode-then-encode an exact identity on every
+//     accepted string, which a lenient decoder cannot offer.
 //
-// ENCODE IS TOTAL, the same ruling `std:utf8` makes for the same reason: every
-// `u8[]` has a base64 encoding, so a fallible signature would infect callers
-// for an input that cannot exist. `encodeBase64([])` is `""`.
+// WHAT IS NOT HERE: the URL-safe alphabet (RFC 4648 §5) and unpadded decoding.
+// When one arrives it gets its OWN NAME (`encodeBase64Url`), never a boolean
+// parameter — `f(bytes, true)` is the shape `std-api-review.md` §2 names.
 //
-// DECODE IS STRICT, and here is exactly what it refuses — each refusal is one
-// `kind` on the error below:
+// THE FAILURE CHANNEL IS `u8[] | Base64Error`, not `u8[] | null`: a blob is
+// machine-produced, so an offset locates a truncated transfer or a stray
+// newline, and the four kinds call for different fixes — the "failure with
+// information the caller needs" case `error-handling-design.md` spends `T | E`
+// on, where `parseF64` answers `f64 | null` because a float literal has one
+// way to be wrong. `kind` is a LITERAL UNION, not an i32 code, so `match` sees
+// the arms (`std-api-review.md` §3), and it keeps the type DISTINCT: VL
+// aliases are structural, so bare `{ at: i32, msg: string }` hits `ParseError`.
 //
-//   • `"character"` — any byte outside `A-Za-z0-9+/=`. That includes SPACES
-//     AND NEWLINES: RFC 4648 base64 has no line breaks, and the 76-column
-//     wrapping people associate with base64 is MIME's (RFC 2045 §6.8), a
-//     different format. A caller holding MIME text strips the breaks first,
-//     which is a `replaceAll` per break character (CRLF needs both) and is the
-//     caller's decision, not this module's.
-//   • `"length"` — a length that is not a multiple of four. Padding is
-//     REQUIRED, so `"QQ"` is refused where `"QQ=="` decodes. THIS GATE RUNS
-//     FIRST, so an input whose whitespace makes it a non-multiple of four
-//     reports `"length"` at the input's size, not `"character"` at the break —
-//     a wrapped MIME blob is usually that case, and `"    "` (four spaces) is
-//     the shape that reaches `"character"`.
-//   • `"padding"` — `=` anywhere but the last one or two positions of the
-//     whole input.
-//   • `"bits"` — NON-CANONICAL TRAILING BITS: the bits of the final base64
-//     character that lie past the end of the last byte must be zero (RFC 4648
-//     §3.5 permits a decoder to reject these, and this one does). `"QQ=="`
-//     decodes to `[65]`; `"QR=="` names the same byte with junk in the unused
-//     bits and is refused. That refusal is what makes `decodeBase64` followed
-//     by `encodeBase64` an exact identity on every accepted string, so a
-//     decoded-then-re-encoded blob is byte-for-byte what arrived — the
-//     property a content hash or a byte-comparable snapshot needs, and one a
-//     lenient decoder cannot offer.
-//
-// WHAT IS NOT HERE: the URL-safe alphabet (RFC 4648 §5, `-` and `_`), and
-// unpadded decoding. Both are real variants and neither has a consumer in the
-// tree; when one arrives it gets its OWN NAME (`encodeBase64Url`), never a
-// boolean parameter on these — `f(bytes, true)` at a call site is exactly the
-// unreadable shape `std-api-review.md` §2 names.
-//
-// ── THE FAILURE CHANNEL IS `u8[] | Base64Error`, AND `u8[] | null` WAS TRIED
-// FIRST. Two reasons, in the order they were found:
-//
-//   1. `u8[] | null` DOES NOT LOWER on this compiler. Measured 2026-09-01,
-//      minimal witness:
-//
-//          function f(s: string): u8[] | null {
-//            if s.length == 0 { return null }
-//            const out: u8[] = []
-//            out.push(65)
-//            out
-//          }
-//
-//      → it DID NOT LOWER when this module was written; D979 closed that gap
-//      the same day (the witness above now RUNS — re-measured 2026-09-01), and
-//      per this header's own promise, nothing here changes. The adjacent
-//      literal-return spelling (`return [1, 2, 3]` from a `u8[] | null`
-//      annotation) stayed check-clean invalid wasm and is filed as D983. The
-//      SECOND reason below was always the better half and now carries the
-//      choice alone.
-//   2. Once a struct is unavoidable, an EMPTY one would be strictly worse than
-//      one carrying the position and the reason, and `error-handling-design.md`
-//      spends `T | E` on exactly "a failure with information the caller needs —
-//      an errno, a message, a parse position". Base64 has one: a blob is long
-//      and machine-produced, so "byte 4001 is not in the alphabet" locates a
-//      truncated transfer or a stray newline, and the four kinds above call for
-//      genuinely different fixes. That is the difference from `std:fmt`'s
-//      `parseF64`, which answers `f64 | null` — a float literal is one token
-//      with one way to be wrong, and an offset inside it points at nothing the
-//      caller can act on. The two modules differ because the failures differ,
-//      not because the channel drifted.
-//
-// `Base64Error` CARRIES `kind` AS A LITERAL UNION, not an i32 code, so a
-// caller writes `e.kind == "length"` and `match` sees the arms
-// (`std-api-review.md` §3). It is also what keeps the type DISTINCT: VL
-// aliases are structural, so a bare `{ at: i32, msg: string }` would be
-// literally the same type as the `ParseError` `error-handling-design.md`
-// blesses, and a union naming both would fail to emit — the collision
-// `std:utf8`'s header records having dodged with its own third field.
-//
-// `u8[]` IS OUTSIDE THE GENERIC SURFACE. It is not a `T[]`, so none of
-// `std:array` reaches these values — no `map`, no `indexOf`, no `sorted`. The
-// loops below are written out for that reason and not from taste.
-//
-// PERFORMANCE. `encodeBase64` fills ONE code-point buffer and calls
-// `fromCodePoints` once; the `out = out + c` spelling is O(n²) on this compiler
-// and the measurement behind that rule is in `std:str`'s header. Decoding
-// pushes into one `u8[]`, which is an amortised append.
+// `u8[]` IS OUTSIDE THE GENERIC SURFACE — not a `T[]`, so no `map`/`indexOf`/
+// `sorted`; the loops below are written out for that. `encodeBase64` fills ONE
+// code-point buffer and calls `fromCodePoints` once — `out = out + c` is O(n²).
 
 // Why a decode stopped, where, and in which of the four ways. `at` is a BYTE
 // offset into the string that was handed in — the same coordinate system
