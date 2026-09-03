@@ -25,3 +25,12 @@ Notes, each of which cost something to learn:
   frame of every sample whose leaf is a given function, to find whose loop it is.
 * **`VL_STD=<worktree>/std`** on every worktree probe — the host resolves `std:` from the
   BINARY's checkout, which is the main repo's.
+
+## Measured 2026-09-02 (#2419)
+
+Self-compile before the memo, 28,755 guest samples: `moduleHasUnionAs` 29.8% self time and
+`moduleHasNumCast` 29.4% — each a whole-arena scan asked once per emitted function (4,399
+functions, no union-`as` in the compiler, so every scan ran to the end) — and
+`fieldClosureFeOfRecv` 12.8%, scanning to prove an answer `fnValUsed` already gave. After:
+master's source compiles in 11 s by the memoised compiler versus 43 s by master's own fixpoint
+at load 13 (116 s → 6 s on an idle box), byte-identical output.
