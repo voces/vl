@@ -116,35 +116,13 @@ export const wordRangeAt = (
 
 // ---- import specifier scan ---------------------------------------------------
 
-/**
- * Resolve an import specifier written in the module at `fromKey` to a module
- * key, or `""` for a kind the compiler's resolver rejects. A pure-string-math
- * mirror of `modResolveSpecifier` (`compiler/driver.vl`): a well-formed `std:`
- * specifier IS its key (verbatim); a relative specifier resolves against
- * `fromKey`'s directory with `.`/`..` normalization and `.vl` appended;
- * everything else (bare specifiers, relative-inside-std) is unresolvable.
- */
-export const resolveImportSpecifier = (spec: string, fromKey: string): string => {
-  if (/^std:[a-z0-9_]+(\/[a-z0-9_]+)*$/.test(spec)) return spec;
-  if (!spec.startsWith("./") && !spec.startsWith("../")) return "";
-  if (fromKey.startsWith("std:")) return "";
-  const slash = fromKey.lastIndexOf("/");
-  const base = slash >= 0 ? fromKey.slice(0, slash) : "";
-  const joined = base !== "" ? `${base}/${spec}` : spec;
-  // Normalize, collapsing `.` and `..` segments (leading `..` that escape the
-  // root are kept — the key stays distinct and the reader won't find it).
-  const absolute = joined.startsWith("/");
-  const segs: string[] = [];
-  for (const seg of joined.split("/")) {
-    if (seg === "" || seg === ".") continue;
-    if (seg === ".." && segs.length > 0 && segs[segs.length - 1] !== "..") {
-      segs.pop();
-    } else {
-      segs.push(seg);
-    }
-  }
-  return (absolute ? "/" : "") + segs.join("/") + ".vl";
-};
+// `resolveImportSpecifier` now lives with the other import-STATEMENT helpers in
+// `typeFeatures.ts` (`importInsertionEdit`, `organizeImportEdits`), because the
+// UFCS auto-import needed the same specifier↔key math and that module is the one
+// with no dependencies of its own. Re-exported here so this module's own name for
+// it — and every existing importer — is unchanged.
+export { resolveImportSpecifier } from "./typeFeatures.ts";
+import { resolveImportSpecifier } from "./typeFeatures.ts";
 
 /**
  * One specifier of an `import { … } from "…"` statement, located exactly:
