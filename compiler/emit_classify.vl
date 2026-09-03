@@ -1885,6 +1885,40 @@ export function letNulMapReadUnionBox(letIx: i32, fnIx: i32) {
   false
 }
 
+// The ref-list ELEMENT KIND a `.pop()` over a NESTED list yields, or -1 (D1210). `xs.pop()`
+// over an `i32[][]` is `i32[] | null` to the checker and the popped value is the inner list's
+// WRAPPER, so the three nullable-list classifiers each claim it at their own element kind —
+// 4 in `exprNullableList`, 6/7/8/10 in `exprNulScalarListKind`, 9 in `exprNullableRefArray`
+// — exactly as they already claim an `Index` read of a `(T[] | null)[]`.
+//
+// UNLIKE THOSE INDEX ARMS THIS ASKS NO `rlElemNullable` BIT: a pop is nullable by
+// construction, so the EMPTINESS carries the null and the element slot need not.
+function popRefElemKind(exprIx: i32, fnIx: i32): i32 {
+  const slot = popRefRecvSlot(exprIx, fnIx)
+  if slot >= 0 && slot < rlElemKindTbl.length { return rlElemKindTbl[slot] }
+  -1
+}
+
+// The RECEIVER's ref-list slot of a `.pop()` over a nested list, or -1 — the row every
+// question about the popped element reads: its kind above, and its INNER slot where the
+// element is itself a ref list (`nulRefArrayInnerSlot`'s pop arm).
+function popRefRecvSlot(exprIx: i32, fnIx: i32): i32 {
+  if exprIx < 0 { return -1 }
+  const e = P.nodes[exprIx]
+  if e is Paren { return popRefRecvSlot(e.parInner, fnIx) }
+  if e is Call {
+    const callee = P.nodes[e.callFn]
+    if callee is Member {
+      if callee.memProp == "pop" {
+        if exprRefArray(callee.memObj, fnIx) {
+          return refListSlotOfExpr(callee.memObj, fnIx)
+        }
+      }
+    }
+  }
+  -1
+}
+
 // True if evaluating the expression at `exprIx` yields a NULLABLE i32-list ref —
 // a nullable-list-annotated param/local/global reference or a `rest: i32[]|null`
 // FIELD read (code 18). The nullable-LIST dual of `exprNullableStruct`: list-op
@@ -1949,6 +1983,9 @@ export function exprNullableList(exprIx: i32, fnIx: i32) {
   // un-annotated `const r = f(…)` infers kind 15 (and narrows with `if r != null`). Mirrors the
   // niche-nullable call inference for bool/string returns.
   if e is Call {
+    // `xs.pop()` over an `i32[][]` — the MEMBER callee the Ident/closure legs below cannot
+    // see, and the one rep D1174's value box does not serve (D1210).
+    if popRefElemKind(exprIx, fnIx) == 4 { return true }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
       const target = fnIndexOfSid(sidOfNode(e.callFn))
@@ -2038,6 +2075,8 @@ export function exprNullableRefArray(exprIx: i32, fnIx: i32) {
   // un-annotated `const t = mk(…)` infers kind 18 and narrows with `if t != null`. Mirrors the nullable-i32
   // -list call inference in `exprNullableList` above.
   if e is Call {
+    // `g.pop()` over an `S[][]` — the nested-ref sibling of `exprNullableList`'s pop leg (D1210).
+    if popRefElemKind(exprIx, fnIx) == 9 { return true }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
       if fnRetNulRefArrayNameSid(sidOfNode(e.callFn)) != "" { return true }
@@ -2103,6 +2142,10 @@ function nulRefArrayInnerSlot(exprIx: i32, fnIx: i32) {
   }
   // A nulreflist-returning CALL (`const t = mk()`): its inner ref-list slot is the return's inner element.
   if e is Call {
+    // `g.pop()` over an `S[][]`: the popped element IS the inner ref list, so the row is the
+    // receiver slot's inner one — the same answer the `Index` arm above gives (D1210).
+    const pes = popRefRecvSlot(exprIx, fnIx)
+    if pes >= 0 && pes < rlElemName.length { return rlElemInnerSlot(pes) }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
       const rn = fnRetNulRefArrayNameSid(sidOfNode(e.callFn))
@@ -2234,6 +2277,13 @@ export function exprNulScalarListKind(exprIx: i32, fnIx: i32): VKind | null {
     if gl >= 0 { return letNulScalarListKind(gl, fnIx) }
   }
   if e is Call {
+    // `xs.pop()` over a `string[][]` / `f64[][]` / `i64[][]` / `f32[][]` — the
+    // distinct-backing siblings of `exprNullableList`'s pop leg (D1210).
+    const pek = popRefElemKind(exprIx, fnIx)
+    if pek == 6 { return "nulstrlist" }
+    if pek == 7 { return "nulf64list" }
+    if pek == 8 { return "nuli64list" }
+    if pek == 10 { return "nulf32list" }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
       const target = fnIndexOfSid(sidOfNode(e.callFn))
