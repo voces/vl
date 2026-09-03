@@ -92,6 +92,7 @@ import {
   nameIsMemBulkIntrinsic,
   nameIsMemStoreIntrinsic,
   nameIsNewtypeBrand,
+  nodeArrayElemIsBareStrLit,
   nodeArrayElemIsLitUnion,
   nodeArrayElemIsNulLitUnion,
   nodeArrayElemIsNulStr,
@@ -164,6 +165,7 @@ import {
   tyIsNewtypeBrand,
   tyIsNullableLitUnion,
   tyIsU8ArrayTy,
+  tyLitMemberTexts,
   tyLitSetMemberLexes,
   tyLitUnionAliasIx,
   tyNestedArrLeafRenders,
@@ -9952,8 +9954,12 @@ export function sFieldIsLitUnion(si: i32, fi: i32) {
   // fall-through to the recorded name is untouched, so an uncovered row (-1 — a
   // plain field's "" element, or a spelling that resolved through neither path)
   // still answers exactly as before.
+  // `tyIsLitUnionOrLit`, NOT `tyIsLitUnion`: the ONE-MEMBER set is atom material at both of
+  // its spellings (D1460). The bare `TyLit` reaches this classifier only on a row
+  // `promoteLitFieldToAtom` re-laid — a bare `"a"` ANNOTATION codes 3 — so the widening is
+  // scoped to the promotion and cannot move a declared field's rep.
   const ety = sFieldElemTyIxAt(si, fi)
-  if ety >= 0 { return tyIsLitUnion(ety) }
+  if ety >= 0 { return tyIsLitUnionOrLit(ety) }
   const r = nameIsLitUnionType(sFieldElemNameAt(si, fi))
   r
 }
@@ -9993,8 +9999,9 @@ export function variantFieldIsLitUnionArray(vi: i32, fj: i32) {
 // arena answer from one place.
 export function variantFieldIsLitUnion(vi: i32, fj: i32) {
   if variantFieldTypeAt(vi, fj) != 0 { return false }
+  // `tyIsLitUnionOrLit` for `sFieldIsLitUnion`'s reason (D1460).
   const ety = uFieldElemTyIxAt(vi, fj)
-  if ety >= 0 { return tyIsLitUnion(ety) }
+  if ety >= 0 { return tyIsLitUnionOrLit(ety) }
   nameIsLitUnionType(variantFieldElemName(vi, fj))
 }
 
@@ -20066,6 +20073,12 @@ export function arrLitIsStr(arrIx: i32, fnIx: i32) {
     // annotation on the atom list, and BESIDE the nullable twin below, which is this arm for
     // the `(string | null)[]` spelling and is the reason that spelling already worked.
     if nodeArrayElemIsStr(arrIx) { return true }
+    // The ONE-MEMBER set spelled BARE (`("a")[]`) — a string list for the reason
+    // `nodeArrayElemIsBareStrLit` states, and here for the reason the arm above is: a literal
+    // whose only element is a promoted one-member discriminant field READS as an atom, so the
+    // first-element probe below misses it and the literal built the i32 list into a string-list
+    // slot. Beside the `string[]` arm, after the two litunion exclusions (D1460).
+    if nodeArrayElemIsBareStrLit(arrIx) { return true }
     // A `(string | null)[]` literal with NO string-typed first element (`[null]`, `[null,
     // "x"]`): the recorded context-adoption type is the only signal — it IS the string-ref
     // niche list (`emitArr` seeds `pendingNulString` off the same recorded type), so the
@@ -23534,6 +23547,23 @@ export function litAtomMemberTy(exprIx: i32, fnIx: i32) {
   litAtomMemberTyAt(exprIx, fnIx, 0)
 }
 
+// The member TEXTS to spell atom-repped node `ix` with — one home for the ladder the two
+// widen consumers (`emitAtomToStr`, `print`'s atom arm) each wrote out. `exprIsLitAtom` has
+// already decided the value IS an atom; this only answers what to widen it WITH, so an empty
+// answer is a genuine disagreement and both callers still refuse loudly on it.
+//
+// THE THIRD RUNG IS THE ONE-MEMBER SET (D1460). `nodeLitUnionMemberTexts` declines a bare
+// `TyLit` on purpose — its OTHER callers read an empty list as "not a widenable atom" — but a
+// promoted one-member discriminant field is exactly a bare `TyLit` whose value is an atom, and
+// `tyLitMemberTexts` is the kind-blind reading of the same node.
+export function litAtomWidenTexts(ix: i32, fnIx: i32) {
+  const direct = nodeLitUnionMemberTexts(ix)
+  if direct.length > 0 { return direct }
+  const decl = tyLitMemberTexts(litAtomMemberTy(ix, fnIx))
+  if decl.length > 0 { return decl }
+  tyLitMemberTexts(nodeTyIxOf(ix))
+}
+
 function litAtomMemberTyAt(exprIx: i32, fnIx: i32, depth: i32): i32 {
   if exprIx < 0 { return 0 - 1 }
   const ix = unwrapParen(exprIx)
@@ -24464,11 +24494,12 @@ function variantLitPairKind(a: i32, b: i32): i32 {
 // may: both sides must already be atom MATERIAL, or the promotion would have to invent a rep for
 // a value that has none.
 //
-// `tyIsLitUnion` ON BOTH SIDES IS THE BOUND, and it is narrower than `tyIsLitSet` on purpose. It
-// admits only a 2+-member set every one of whose members is a STRING — what `internAtom` keys,
-// what `variantFieldIsLitUnion` claims for the read, and what `emitAtomToStr` can widen back. A
-// numeric set reps as its base value and has no atom; a BARE single literal is not a litunion to
-// the read classifier, so promoting it would store an atom nothing widens. Both stay refused.
+// `tyIsLitUnionOrLit` ON BOTH SIDES IS THE BOUND, and it is narrower than `tyIsLitSet` on
+// purpose. It admits only a STRING literal set — what `internAtom` keys, what
+// `variantFieldIsLitUnion` claims for the read, and what `emitAtomToStr` can widen back. A
+// NUMERIC set reps as its base value and has no atom, and stays refused. The MEMBER COUNT is
+// not part of the bound (D1460): a one-member set is atom material at both spellings, and the
+// alias spelling of it has carried the atom rep all along.
 export function variantFieldLitRepMixed(a: i32, b: i32, fi: i32): boolean {
   if a < 0 || b < 0 { return false }
   if a >= uFieldCount.length || b >= uFieldCount.length { return false }
@@ -24487,7 +24518,7 @@ function litFieldRowIsAtomisable(ix: i32): boolean {
   if ix < 0 || ix >= uFieldTypes.length { return false }
   const code = uFieldTypes[ix]
   if code != 0 && code != 3 { return false }
-  tyIsLitUnion(uFieldLitTyIx[ix])
+  tyIsLitUnionOrLit(uFieldLitTyIx[ix])
 }
 
 // Do `a` and `b` differ at a field where BOTH arms carry a literal set, but the two sets rep
