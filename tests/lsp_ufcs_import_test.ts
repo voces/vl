@@ -203,7 +203,10 @@ const noFieldDiag = (source: string, name: string, line: number) => {
 Deno.test("quick-fix: the member name is read from the diagnostic's RANGE, not its sentence", () => {
   const src = 'import { expect, it } from "std:test"\n\nexpect(1 + 2).toEqual(3)\n';
   assert(
-    ufcsMissingImportAt(src, noFieldDiag(src, "toEqual", 2)) === "toEqual",
+    ufcsMissingImportAt(src, {
+      ...noFieldDiag(src, "toEqual", 2),
+      code: "ufcs-not-imported",
+    }) === "toEqual",
     "the range names the member",
   );
 });
@@ -331,7 +334,7 @@ Deno.test({
   const src = 'import { expect, it } from "std:test"\n\nit("x", () => {\n  expect(1 + 2).toEqual(3)\n})\n';
   const before = await checker.check(src, "/proj/main.vl", read);
   assert(
-    before.some((d) => d.message.includes("no field 'toEqual'")),
+    before.some((d) => (d.code ?? "").startsWith("ufcs-not-imported")),
     `the D1230 diagnostic must be present; got ${JSON.stringify(before.map((d) => d.message))}`,
   );
   const edit = importInsertionEdit(
@@ -421,7 +424,7 @@ Deno.test({
   const { checker, read } = checkerAndReader();
   const src = 'import { expect, it } from "std:test"\n\nit("x", () => {\n  expect(1 + 2).toEqual(3)\n})\n';
   const diags = await checker.check(src, "/proj/main.vl", read);
-  const d1230 = diags.find((d) => d.message.includes("no field 'toEqual'"));
+  const d1230 = diags.find((d) => (d.code ?? "").startsWith("ufcs-not-imported"));
   if (d1230 === undefined) {
     throw new Error(`expected the D1230 diagnostic; got ${JSON.stringify(diags.map((x) => x.message))}`);
   }
