@@ -4404,13 +4404,67 @@ question someone will ask again:
   Admitting the pair without folding it reproduced the filed bug from the other side. One
   predicate now answers for both callers so they cannot drift.
 
-**Residue: the two litunion reps in one union (D1050).** `{kind: K1} | {kind: "x" | "y"}` is
-legal by this ruling and still refuses, because an interned atom and a string ref share no
-layout. Closing it means unifying the litunion reps — the rep cliff — and was out of scope; the
-refusal now says so in words that concede the program is type-valid rather than claiming the
-field types differ. The interim std rule is retired: a std error struct no longer NEEDS a
-unique field name, since a unique `kind` literal now discriminates. `JsonError.path` stays for
-the information it carries, not for discrimination.
+**Residue: the two litunion reps in one union (D1050) — CLOSED 2026-09-02, see the section
+below.** `{kind: K1} | {kind: "x" | "y"}` is legal by this ruling and refused, because an
+interned atom and a string ref share no layout. The refusal was worded to concede the program
+is type-valid rather than to claim the field types differ, which is what kept it visible; it
+is now reached only by the two shapes that have no atom rep at all. The interim std rule is
+retired: a std error struct no longer NEEDS a unique field name, since a unique `kind` literal
+now discriminates. `JsonError.path` stays for the information it carries, not for
+discrimination.
+
+## A MIXED-SPELLING VARIANT FIELD CARRIES THE ATOM
+
+*Decided 2026-09-02 while closing D1050. The question the ruling above left open: when two arms
+of one discriminated union spell their literal discriminant differently — a named literal-union
+ALIAS in one, an inline set in the other — which of the two litunion representations does the
+shared field carry?*
+
+**THE ATOM, and the reason is that its consumers are already built.** A string literal set has
+two reps and `nodeTyIsLitUnionAlias` is the seam: a registered alias is the interned `i32`
+atom, an inline `"x" | "y"` a `(ref $string)`. Either could in principle be the shared one. The
+atom side already has all four sites a unification needs — `emitDiscrimFieldEq`'s code-0 arm
+compares interned ids, `emitVariantStruct`'s `variantFieldIsLitUnion` arm interns the member
+literal at CONSTRUCTION, `exprIsLitAtom`'s variant and struct member arms claim the READ off
+the same field code, and `emitAtomToStr` widens it back at every string boundary — so the
+conversion costs no new lowering. Unifying on the STRING side would need all four written from
+scratch for the arm whose type is the alias, and would then give that alias a rep the rest of
+the module does not use for it.
+
+**THE UNIFICATION IS SCOPED TO THE ARMS OF A MIXED PAIR, NOT TO THE TREE.** This was the
+question that made D1023 stop: "closing it means unifying the two litunion reps", the litunion
+rep cliff, with corpus-wide byte effects. That framing assumed the unification had to be
+GLOBAL. It does not — `unifyMixedLitRepArms` moves the two rows a mixed pair actually has, and
+the distilled corpus moved **0 classes of 255,504 cells** while the candidate compiler emits
+master's own source byte-identically. The whole-tree unification remains unbuilt and is not
+required for this ruling.
+
+**BOTH TABLES MOVE OR NEITHER DOES.** The VARIANT row is what the union box is built and cast
+through; the arm's DECLARED STRUCT row is what `variantStructHeapTwinAt` merges it with and
+what a `const s: B = { … }` outside the union builds. Rewriting only the first gives one
+declaration two heap types, and any value crossing between them is a module the engine refuses.
+The arena sidecar (`*FieldElemTyIx`) moves with the code for the same reason one rung out: the
+read classifiers are code-0-**plus**-`tyIsLitUnion(ety)`, so a promoted row without its sidecar
+entry stores an atom that every reader calls a plain `i32` and `print` emits the raw interned
+id.
+
+**THE BOUND IS "BOTH ARMS ARE ATOM MATERIAL", and two legal pairs stay refused because of it.**
+A field may be re-laid only when both arms carry a 2+-member set every one of whose members is
+a string — what `internAtom` keys and what `emitAtomToStr` can widen back. So `{kind: K1} |
+{kind: string}` (the amendment's set-beside-its-base: the base arm holds an arbitrary string
+with no interned id) and `{kind: K1} | {kind: "a"}` (a BARE single literal, a `TyLit` rather
+than a `TyUnion`, which the read classifier does not treat as a litunion) keep the loud
+refusal. That refusal is still the right diagnosis, so its message literal stays counted by
+`--sites` — the SITE narrowed, it did not clear. Closing those two means the STRING-side
+unification, which is the genuinely open half of this question.
+
+**THE ADMISSION AND THE ACTION ARE ONE PREDICATE ASKED TWICE.** `assignTags` runs at the end of
+`collectU`, one pass before the struct table exists, so it cannot do the re-lay; it admits on
+`variantLitRepUnifiable`, which is the acting pass's own applicability test.
+`variantLitDiscriminable` keeps asking the strict "agree as laid out" question because
+`buildVariantTwins` runs after the unification and must see the FINAL layout. Both are arms of
+one walk (`variantLitPairKind`) — the same discipline the ruling above already imposed on
+`assignTags` and `buildVariantTwins`, one seam further along.
 
 **Amendment (owner, 2026-09-02): a literal set beside its own base is legal.**
 `type A = { kind: "x" | "y" }` beside `type B = { kind: string }` in one union is a LEGAL

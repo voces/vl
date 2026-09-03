@@ -586,6 +586,8 @@ import {
   scopeUnbind,
   setNarrowFromCond,
   setNarrowFromCondElse,
+  setSFieldElemRowTy,
+  setUFieldElemRowTy,
   shapeFieldElemName,
   shapeFieldElemRow,
   shapeSetIxReset,
@@ -611,10 +613,12 @@ import {
   unionMemberSetOf,
   unionNameOfExpr,
   unionSetHasNull,
+  variantFieldLitRepMixed,
   variantIndexOf,
   variantIndexOfLet,
   variantLitDiscriminable,
   variantLitRepMismatch,
+  variantLitRepUnifiable,
   variantNestedShapeOk,
   variantSig,
 } from "./emit_classify"
@@ -11520,6 +11524,11 @@ export function collectS(stmts: i32[]) {
     }
     i = i + 1
   }
+  // D1050 — give a MIXED-SPELLING discriminated pair ONE layout, now that BOTH field tables
+  // are complete. Here rather than in `collectU` because the declared struct row has to move
+  // with the variant row (see the pass's header), and before the shape passes below because a
+  // shape interned against the OLD storage would twin onto a row this is about to re-lay.
+  if unifyMixedLitRepArms() < 0 { return -1 }
   // Generic-alias APPLICATION shapes next (the declared structs they may
   // reference are interned above; their own names then resolve as code-15
   // struct-ref fields and annotation/literal sites).
@@ -11775,6 +11784,103 @@ function variantFieldTysEq(a: i32, b: i32) {
   true
 }
 
+// D1050 — LAY A MIXED-SPELLING DISCRIMINATED PAIR OUT UNDER ONE REP.
+//
+// A string literal set has two representations and `nodeTyIsLitUnionAlias` is the seam: a
+// registered ALIAS (`type K1 = "circle" | "round"`) is the interned i32 atom, an inline
+// `"x" | "y"` a `(ref $string)`. Spell one arm each way — `{kind: K1, r: f64} | {kind: "x" |
+// "y", r: f64}` — and D1023's ruling calls the pair legal (both arms carry a string literal
+// set at `kind`, so `is` is a membership question about the VALUE) while the two arms have no
+// single heap type to share. That was the refusal this pass removes.
+//
+// THE ATOM IS THE REP THEY UNIFY ON, and the choice is measured rather than aesthetic: the
+// atom side already has every consumer built. `emitDiscrimFieldEq`'s code-0 arm compares
+// interned ids, `emitVariantStruct`'s `variantFieldIsLitUnion` arm interns the member literal
+// at CONSTRUCTION, `exprIsLitAtom`'s variant/struct member arms claim the READ off the same
+// field code, and `emitAtomToStr` widens it back to the member string for `print` / `+` /
+// a `string` boundary. Unifying on the STRING side would need the mirror of all four written
+// from scratch, for the arm whose type is the alias — and would then be the rep the rest of
+// the module does NOT use for that alias.
+//
+// TWO ROWS MOVE PER PROMOTED FIELD, and moving only the first is invalid wasm. The VARIANT
+// row is what the union box is built and cast through; the arm's DECLARED STRUCT row is what
+// `variantStructHeapTwinAt` merges it with and what every use of the type OUTSIDE the union
+// (`const s: B = { kind: "x", r: 7.0 }`) builds. Leave the struct row at code 3 and the two
+// disagree about one declaration — the arm gets a second heap type and any value crossing
+// between them is a `struct.new` / `ref.cast` the engine refuses.
+//
+// IT PROMOTES ONLY WHAT `variantFieldLitRepMixed` NAMES, which is both arms carrying a 2+
+// member STRING set. Nothing else in the tree moves: a module with no such pair never enters
+// the inner loop, and a same-rep D1023 pair is `variantLitDiscriminable` already.
+function unifyMixedLitRepArms(): i32 {
+  if !uDeclared { return 0 }
+  let ui = 0
+  while ui < unVarStart.length {
+    const vs0 = unVarStart[ui]
+    const vc = unVarCount[ui]
+    let a = 0
+    while a < vc {
+      let b = a + 1
+      while b < vc {
+        const va = vs0 + a
+        const vb = vs0 + b
+        // The same gate `assignTags` admitted on, asked again rather than banked: the tag
+        // key is the field-NAME set, so only a same-sig pair shares a layout at all.
+        if variantSig(va) == variantSig(vb) && variantLitRepUnifiable(va, vb) {
+          let fi = 0
+          while fi < uFieldCount[va] {
+            if variantFieldLitRepMixed(va, vb, fi) {
+              if promoteLitFieldToAtom(va, fi) < 0 { return -1 }
+              if promoteLitFieldToAtom(vb, fi) < 0 { return -1 }
+            }
+            fi = fi + 1
+          }
+        }
+        b = b + 1
+      }
+      a = a + 1
+    }
+    ui = ui + 1
+  }
+  0
+}
+
+// Re-lay variant `vi`'s field `fi` — a string literal set — under the interned-atom rep, in
+// BOTH tables. A row already at code 0 is the alias arm and is left exactly as it is, so the
+// pass is idempotent and the alias spelling stays byte-identical.
+//
+// THE ARENA SIDECAR MOVES WITH THE CODE, and that is what makes the READ agree with the
+// bytes. `variantFieldIsLitUnion` / `sFieldIsLitUnion` are code-0-plus-`tyIsLitUnion(ety)`,
+// and the ety they read is the D5 sidecar — so a row promoted to code 0 without its sidecar
+// entry would store an atom that every read classifier calls a plain `i32`, and `print` would
+// emit the raw interned id where the member text belongs. The set's own arena type is already
+// banked in the DISCRIMINANT column (`uFieldLitTyIx`), which is where it comes from.
+function promoteLitFieldToAtom(vi: i32, fi: i32): i32 {
+  const r = uFieldStart[vi] + fi
+  const lty = uFieldLitTyIx[r]
+  if lty < 0 { return 0 }
+  // The elem-NAME column's fallback answer for the same question (`nameIsLitUnionType`),
+  // written so the two legs agree; `litUnionInlineNameOfTy` prefers a declared alias with
+  // exactly these members and falls back to the inline `"x"|"y"` spelling.
+  const nm = litUnionInlineNameOfTy(lty)
+  if nm == "" { return 0 }
+  if uFieldTypes[r] != 0 {
+    uFieldTypes[r] = 0
+    uFieldElemName[r] = nm
+    setUFieldElemRowTy(r, lty)
+  }
+  const si = structIndexOfTypeName(uVariants[vi])
+  if si >= 0 && fi < sFieldCount[si] {
+    const sr = sFieldStart[si] + fi
+    if sFieldTypes[sr] != 0 {
+      sFieldTypes[sr] = 0
+      sFieldElemName[sr] = nm
+      setSFieldElemRowTy(sr, lty)
+    }
+  }
+  0
+}
+
 // Assign each variant its GLOBAL tag = its rank when the variants are ordered by
 // structural signature (mirroring `toWasm.ts`'s sorted `variantKey` tag assignment).
 // `uTags[i]` is variant i's tag: the number of variants whose sig sorts strictly
@@ -11826,9 +11932,17 @@ export function assignTags() {
       let b = a + 1
       while b < vc {
         if sigs[vs0 + a] == sigs[vs0 + b] {
+          // THE THIRD ADMISSION IS THE PAIR THE ATOM UNIFICATION WILL FIX (D1050). This pass
+          // runs at the end of `collectU`, one pass BEFORE the struct table exists, so it
+          // cannot do the re-lay itself — `unifyMixedLitRepArms` does it at the end of
+          // `collectS`, where both tables are complete. Admitting here on the unification's
+          // OWN predicate is what keeps the two from disagreeing: every pair this admits is a
+          // pair that pass re-lays, and every pair it re-lays reaches `buildVariantTwins`
+          // discriminable.
           if (
             !variantFieldTysEq(vs0 + a, vs0 + b) &&
-            !variantLitDiscriminable(vs0 + a, vs0 + b)
+            !variantLitDiscriminable(vs0 + a, vs0 + b) &&
+            !variantLitRepUnifiable(vs0 + a, vs0 + b)
           ) {
             // TWO REFUSALS, because they are two different things and one sentence was
             // saying the wrong one about the second (D1023). The DESIGN rule — arms nothing

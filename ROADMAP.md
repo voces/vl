@@ -267,11 +267,18 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   numbering would have forced interning per base type. Two arms the tag already merged also
   had to be merged in `buildVariantTwins`, whose canon key preserves each arm's literal set:
   a shared tag with two heap types reproduced the filed trap from the other side.
-  **Residue, named:** a named litunion ALIAS in one arm beside an inline set in the other is
-  legal by the ruling and still refuses, because the two litunion reps (interned atom /
-  string ref) share no layout — **D1050**, the litunion rep cliff. D1023's RULED paragraph
-  has the six-row table and the grading list; DECISIONS.md §"`is A` over same-shape struct
-  arms is a DISCRIMINANT-VALUE test". The std rule that was interim is now only a style
+  **Residue, named and now CLOSED (D1050, 2026-09-02):** a named litunion ALIAS in one arm
+  beside an inline set in the other is legal by the ruling and refused, because the two
+  litunion reps (interned atom / string ref) share no layout. The close lays the mixed field
+  out under ONE rep — the interned ATOM — in the variant row and the arm's declared struct
+  row, so the arms fold onto a single heap type; the WHOLE-TREE litunion unification (the rep
+  cliff proper) was NOT needed and remains unbuilt. **The cliff was smaller than its name**:
+  scoped to the arms of a mixed pair, it moved 0 of 255,504 corpus cells and emits master's
+  own source byte-identically. Its BOUND is `tyIsLitUnion` on both arms — a set beside its
+  own BASE (`{kind: K1} | {kind: string}`) and a BARE single literal are not atom material and
+  keep the loud refusal, so the message literal stays counted. D1023's RULED paragraph has the
+  six-row table and the grading list; DECISIONS.md §"`is A` over same-shape struct arms is a
+  DISCRIMINANT-VALUE test" and §"a mixed-spelling variant field carries the ATOM". The std rule that was interim is now only a style
   preference: a std error struct no longer NEEDS a unique field name, since a unique `kind`
   literal discriminates. Compiler-side; compile-goal surface.
 - **A `type` declared in a function body is LEGAL and lexically scoped — SHIPPED (#2391).**
