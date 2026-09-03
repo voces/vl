@@ -344,16 +344,15 @@ export function exprHasArrNew(exprIx: i32) {
 // True if any statement in the block at `blockIx` (descending into if/else arms
 // and loop bodies) contains an intrinsic allocator call.
 //
-// The EXPRESSION-statement case is a FALL-THROUGH, not an enumeration. It used to
-// name three shapes (`BinExpr` / `Call` / `ObjLit`), which silently skipped every
-// other way a block's trailing VALUE can be spelled — `(__array_new__(n, 0))`,
-// `__array_new__(n, 0).length`, `[__array_new__(n, 0)]`, `x as T`, `-e`. That
-// mattered most for a bare-expression function body: the parser wraps
-// `(n) => (__array_new__(n, 0).length)` in a SYNTHETIC one-statement Block whose
-// only statement is a `Paren`, so an expression-bodied lambda holding the
-// function's only allocator reserved nothing and emitted invalid wasm. Handing
-// every non-statement shape to the expression walker cannot over-reach: it
-// answers false for the statement kinds it does not know.
+// The EXPRESSION-statement case is a FALL-THROUGH, not an enumeration. Naming a
+// fixed set of shapes (`BinExpr` / `Call` / `ObjLit`) silently skips every other way
+// a block's trailing VALUE can be spelled — `(__array_new__(n, 0))`,
+// `[__array_new__(n, 0)]`, `x as T`, `-e` — and the parser wraps a bare-expression
+// function body in a SYNTHETIC one-statement Block whose only statement is a
+// `Paren`, so an expression-bodied lambda holding the function's only allocator
+// reserved nothing and emitted invalid wasm. Handing every non-statement shape to
+// the expression walker cannot over-reach: it answers false for the statement kinds
+// it does not know.
 export function blockHasArrNew(blockIx: i32) {
   const b = P.nodes[blockIx]
   if b is Block {
@@ -408,26 +407,17 @@ export function fnHasArrNew(fnIx: i32) {
   false
 }
 // ── `f(x) ?? d` (a CALL-LHS null-coalesce) scratch detection ───────────────────
-// A `??` whose left operand is a CALL cannot RE-EVALUATE its LHS the way an
-// ident/field `x ?? d` does (a call has effects + cost), so it stashes the call's
-// result (a value-union box) in a 1-slot `(ref $uBoxIdx)` frame, then tests the tag
-// and unboxes off the ONE evaluation. The scan reserves that slot for any function
-// containing such a `??`; a function without one keeps a byte-identical layout.
-// Over-approximates to ANY call-LHS `??` (the emit path uses the slot only for a
-// value-union-box result; an unhandled rep reserves-but-skips, still valid).
-//
-// True if any operand of the `??` CHAIN at `binIx` that BECOMES a `??` LHS is a
-// Call. `a ?? b ?? d` parses LEFT-associative as `(a ?? b) ?? d`, and
-// `emitCoalesce` (wasmEmit.vl) RE-ASSOCIATES it to `a ?? (b ?? d)` — minting a
-// fresh `BinExpr` in which the MIDDLE operand `b` is an LHS. That node does not
-// exist when this scan runs, and the parsed shape carries `b` in a `binRight`, so
-// asking only "is `binLeft` a Call?" missed it: `x ?? f() ?? d` reserved nothing
-// and then ran `fbLocalSet(coalesceCallSlot)` against an undeclared local.
-//
-// Walk the LEFT SPINE, mirroring the rewrite exactly: every operand of the chain
-// except the outermost `binRight` — the chain's final default, which the rewrite
-// never moves into an LHS position — can become one. Deliberately NOT widened to
-// "any operand": `x ?? f()` must keep a byte-identical layout.
+// A `??` whose left operand is a CALL cannot RE-EVALUATE its LHS the way an ident/field
+// `x ?? d` does (a call has effects + cost), so it stashes the call's result (a value-union
+// box) in a 1-slot `(ref $uBoxIdx)` frame and tests the tag off the ONE evaluation. The scan
+// reserves that slot for any function containing such a `??`; over-approximating to ANY
+// call-LHS `??` is safe, since an unhandled rep reserves-but-skips and stays valid.
+// True if any operand of the `??` CHAIN at `binIx` that BECOMES a `??` LHS is a Call.
+// `a ?? b ?? d` parses LEFT-associative and `emitCoalesce` (wasmEmit.vl) RE-ASSOCIATES it to
+// `a ?? (b ?? d)`, so the MIDDLE operand becomes an LHS in a node that does not exist when
+// this scan runs. Asking only "is `binLeft` a Call?" therefore missed `x ?? f() ?? d`, which
+// reserved nothing and ran `fbLocalSet(coalesceCallSlot)` against an undeclared local — so
+// the scan walks the LEFT SPINE: every operand except the outermost `binRight`.
 function coalChainHasCallLhs(binIx: i32) {
   const e = P.nodes[binIx]
   if e is BinExpr {
@@ -681,19 +671,17 @@ export function ifAlwaysReturns(ifIx: i32) {
   }
   false
 }
-// Does this loop BODY contain a `continue` that binds to THIS loop (whose label
-// is `label`, "" when unlabelled)? Two binding forms (mirroring the host's
-// `hasEscapingBreak` shape, applied to continue):
-//   • an UNLABELLED `continue` binds to the innermost loop — so it counts only
-//     when not `nested` inside another loop (descends `if` arms, a conditional
-//     continue, but NOT nested loops: their `continue` is their own);
-//   • a LABELLED `continue l` binds to the loop labelled `l` from ANYWHERE in
-//     the body, including inside nested loops — so when this loop HAS a label
-//     the scan also descends nested loop bodies looking for it.
+// Does this loop BODY contain a `continue` that binds to THIS loop (whose label is
+// `label`, "" when unlabelled)? Two binding forms:
+//   • an UNLABELLED `continue` binds to the innermost loop — so it counts only when
+//     not `nested` inside another loop (descends `if` arms, a conditional continue,
+//     but NOT nested loops: their `continue` is their own);
+//   • a LABELLED `continue l` binds to the loop labelled `l` from ANYWHERE in the
+//     body, including inside nested loops — so when this loop HAS a label the scan
+//     also descends nested loop bodies looking for it.
 // Drives the for-range/for-in INNER continue block: a body without a binding
-// `continue` keeps the original (golden-pinned) two-frame shape, and an
-// unlabelled loop scans exactly as before (the nested-loop descent is gated on
-// `label != ""`), so existing modules stay byte-identical.
+// `continue` keeps the original (golden-pinned) two-frame shape, and an unlabelled
+// loop scans exactly as before, the nested-loop descent being gated on `label != ""`.
 export function blockHasContinueFor(
   blockIx: i32,
   label: string,
@@ -802,20 +790,15 @@ export function nliAtomOfExpr(exprIx: i32) {
             // AN UN-ANNOTATED CALLEE IS NOT AN UNKNOWN CALLEE. `tyNameOf` answers "" for
             // `f.fnRet < 0`, and this arm returned "" with it — so `nliInferLet` never called
             // `registerValueUnionName` and the `T | null` box was never interned. A MINTING
-            // flag answering FALSE for "I have no annotation" is the hazard B60 step 5 names,
-            // and the answer was one lookup away: the checker banks every inferred return in
-            // `inferRetIdx` and `elaborateInferRets` fills it before the emitter runs.
+            // flag answering FALSE for "I have no annotation" is the hazard B60 step 5 names;
+            // the checker banks every inferred return in `inferRetIdx`, and
+            // `elaborateInferRets` fills it before the emitter runs. WITNESS:
+            // `types/infer-null-conditional-assign.vl` with `: i32` deleted from `f`.
             //
-            // WITNESS: `types/infer-null-conditional-assign.vl` with `: i32` deleted from `f`
-            // — `emitProgram: bare null needs a struct-typed context`, on a program the LINTER
-            // ASKS YOU TO WRITE. That fixture carries `@hint redundant type annotation: `f` is
-            // inferred as `i32``, so following the compiler's own advice broke the build.
-            //
-            // THE NAME, NOT THE ARENA, AND THAT IS NOT AN OVERSIGHT. `inferRetTyIxOf` is
-            // exported beside `inferRetNameOf` and this could read it — but what this function
-            // RETURNS is a registry key: `registerValueUnionName` is name-keyed, so an atom
-            // NAME is the currency the consumer needs. Converting it is blocked on the union
-            // registry (prerequisite B-1), not on this site.
+            // THE NAME, NOT THE ARENA, AND THAT IS NOT AN OVERSIGHT: what this returns is a
+            // registry key, and `registerValueUnionName` is name-keyed, so an atom NAME is the
+            // currency the consumer needs. Converting it to `inferRetTyIxOf` is blocked on the
+            // union registry (prerequisite B-1), not on this site.
             if rn == "" { rn = inferRetNameOf(f.fnName) }
             if valueAtomKind(rn) >= 0 && rn != "null" { return rn }
             return ""
@@ -906,32 +889,18 @@ export function ifExprCollectAtoms(ifIx: i32, atoms: string[]) {
   }
   -2
 }
-// True if the parameter `name` of function `fnIx` is an array type.
-// The TYPE-annotation node index of parameter `name` of function `fnIx` (its `parType`),
-// or -1 (no such param / module scope / an un-annotated param / `name` is SHADOWED by a
-// live lexical binding). The single param-scan the `param*` type predicates share — each
-// then reads the node via a `ret*Flag` classifier (D-PARAMARR took the last five off
-// `tyNameOf`; only `paramMap` still renders, and its header says why).
+// The TYPE-annotation node index of parameter `name` of function `fnIx` (its `parType`), or
+// -1 (no such param / module scope / un-annotated param / `name` SHADOWED by a live lexical
+// binding). The single param-scan the whole `param*` type-predicate family shares.
 //
-// A LIVE LEXICAL BINDING SUPPRESSES THE PARAM ANSWER, and this is the type half of the
-// same rule `localIndexOf` applies to the local INDEX. Inside
-//
-//   function f(v: string, n: i32) { if n > 0 { const v = 99  print(v) } }
-//
-// the inner `v` is an i32 local with its own slot; `localIndexOf` resolves the read to
-// that slot, so every `param*` predicate must stop claiming the read is a `string`. When
-// the two disagreed the emitter picked the sink from the PARAM's type and the operand
-// from the LOCAL's slot — `print` dispatched its string arm over a raw i32, an invalid
-// module. Because this is the one scan the whole `param*` family shares, gating it here
-// keeps all ~20 predicates in agreement rather than fixing them one arm at a time.
-//
-// INERT WHENEVER THE SCOPE STACK IS NOT LIVE. The detection/classifier and
-// monomorphization passes run scope-less (`scopeNames` empty — mono runs before the
-// locals table is even built), so `scopeSlotOf` answers -1 there and every existing
-// answer is unchanged. Only the collect/emit walks, which maintain the stack in
-// lockstep, can reach the new arm — and a binding enters the stack only AFTER its own
-// declaration (`scopeBind`), so a param read in the shadowing local's own INITIALIZER
-// (`const v = v + 1`) still resolves to the param.
+// A LIVE LEXICAL BINDING SUPPRESSES THE PARAM ANSWER — the type half of the rule
+// `localIndexOf` applies to the local INDEX. In `f(v: string) { if n > 0 { const v = 99 } }`
+// the inner `v` is an i32 local with its own slot, so a `param*` predicate must stop calling
+// the read a `string`: when the two disagreed the emitter took the sink from the PARAM's type
+// and the operand from the LOCAL's slot and built an invalid module. Gating the ONE shared
+// scan keeps the family in agreement. It is INERT where the scope stack is not live (the
+// classifier and mono passes run scope-less, so `scopeSlotOf` answers -1), and a binding
+// enters the stack only AFTER its declaration, so `const v = v + 1` still reads the param.
 export function paramTypeNode(fnIx: i32, name: string) {
   if fnIx < 0 { return -1 }
   if scopeSlotOf(name) >= 0 { return -1 }
@@ -950,28 +919,18 @@ export function paramTypeNode(fnIx: i32, name: string) {
   -1
 }
 
+// True if the parameter `name` of function `fnIx` is an array type.
+//
 // D-PARAMARR — the `param*Array` family asks the LIST-REP question of a parameter's
-// annotation NODE, and it used to answer it by RENDERING that node to a synthetic name
-// (`tyNameOf`) and parsing the render back (`nameIsI32Array` / `nameIsStringArray` /
-// `nameIsF64Array` / `nameIsF32Array` / `nameIsI64Array`). The node is right there, and
-// `emit_base`'s `ret*ArrFlag` family answers the identical question STRUCTURALLY off
-// `nodeTyArrayElemRepName` — whose own header says it "Mirrors `nameIsI32Array` /
-// `nameIsF64Array`/… exactly".
+// annotation NODE, and it used to answer by RENDERING that node to a synthetic name
+// (`tyNameOf`) and parsing the render back. The node is right there, and `emit_base`'s
+// `ret*ArrFlag` family answers the identical question STRUCTURALLY off
+// `nodeTyArrayElemRepName`.
 //
-// THE ARENA LEG IS NOT NEW AND IT IS NOT A GAMBLE: `vtKindOfType` already classifies
-// `Param.parType` nodes through `retArrFlag`/`retStrArrFlag`/… with no name fall-through
-// (`emit_classify.vl:2289`), so the arena is ALREADY authoritative for this exact node
-// population — these five predicates were the last consumers asking the same nodes the
-// same question through a render.
-//
-// COVERAGE, MEASURED rather than assumed (the `ret*ArrFlag` family DECLINES to 0 when
-// `nodeTyIx` is unset, so a gap here would silently lose a list): over corpus + fuzz,
-// **190,692 twin invocations, 0 disagreements**; of those, **18,577 have a real parameter
-// annotation node and 18,577 of them are arena-covered — 100%**. The other 172,115 are
-// `paramTypeNode` returning -1 (the ident is not a parameter of this function at all),
-// where both legs answer false; `uncovLive` — a call where the NAME says yes and the
-// arena declines — is **0** on every channel. The inverted twin disagrees on
-// 110,586 of 110,586 reaches, so the comparator is not inert.
+// THE ARENA LEG IS NOT A GAMBLE — it had to be shown covering this node population first,
+// because `ret*ArrFlag` DECLINES to 0 when `nodeTyIx` is unset and a gap would silently lose
+// a list. `vtKindOfType` already classifies `Param.parType` through `retArrFlag`/… with no
+// name fall-through, so these five predicates were the render's last consumers.
 export function paramArray(fnIx: i32, name: string) {
   retArrFlag(paramTypeNode(fnIx, name)) == 1
 }
@@ -1034,19 +993,15 @@ export function paramI64Array(fnIx: i32, name: string) {
 // True if the parameter `name` of function `fnIx` is a map type.
 //
 // A UNION param whose FIRST atom is a map (`{[string]: V} | X`) has a NAME that starts with
-// `{[`, so the old `nameIsMap` probe matched the whole union spelling and every consumer had to
-// subtract the false positive with a second scan (a top-level union split). It is a union BOX
-// param, not a bare map — the map arm boxes into the union, and an un-annotated copy of the
-// param (`const t0 = p`) must ride the box so the map arm reads through the `is`-narrowing.
+// `{[`, so the old `nameIsMap` probe matched the whole union spelling and every consumer had
+// to subtract the false positive with a second scan. It is a union BOX param, not a bare map
+// — the map arm boxes into the union, and an un-annotated copy of the param (`const t0 = p`)
+// must ride the box so the map arm reads through the `is`-narrowing.
 //
-// The ARENA never had the false positive to subtract: a bare map is a `TyMap`, a map-member
-// union is a `TyUnion`. `nodeTyIsMap` IS that test, already exported and already in production
-// for EXPRESSION nodes. D-PARAMARR left this predicate rendering its node
-// (`nameIsBareMap(tyNameOf(…))`) because the coverage was unmeasured; D-BAREMAP measured it —
-// 48,781 of 48,781 calls that HAVE a parameter annotation node are arena-covered, 0
-// disagreements over 354,137 twin invocations, 0 uncovered-live. So the render and both name
-// scans go, not just one of them. (The remaining 305,356 reaches are `paramTypeNode` = -1 — the
-// ident is not a parameter of this function — where the name leg read `nameIsBareMap("")`.)
+// The ARENA never had that false positive to subtract: a bare map is a `TyMap`, a map-member
+// union is a `TyUnion`, and `nodeTyIsMap` IS that test, already in production for EXPRESSION
+// nodes. D-PARAMARR left this predicate rendering because its coverage was unestablished;
+// D-BAREMAP established it, so the render and BOTH name scans go, not just one of them.
 export function paramMap(fnIx: i32, name: string) {
   nodeTyIsMap(paramTypeNode(fnIx, name))
 }
@@ -1067,9 +1022,9 @@ export function letIsSet(letIx: i32) {
   false
 }
 // True if the `LetDecl`/global at `letIx` declares an `f32` binding. ANNOTATION-ONLY:
-// a bare float literal stays f64 by default (keeps existing programs byte-identical),
-// so only an explicit `: f32` annotation selects the f32 slot (valtype `0x7d`, kind 13).
-// The initializer literal is then lowered as `f32.const`. (Slice 5.)
+// a bare float literal stays f64 by default, so only an explicit `: f32` annotation
+// selects the f32 slot (valtype `0x7d`, kind 13) and lowers the initializer literal as
+// `f32.const`.
 export function letIsF32(letIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
@@ -1081,15 +1036,10 @@ export function letIsF32(letIx: i32) {
         // answers "" both for "not an f32" and for "no type recorded", and this picks a REP: the
         // f32 slot, valtype 0x7d, kind 13. Under-answering drops an f32 local into the f64 slot.
         //
-        // MEASURED: 0 disagreements over the corpus, with an INVERTED control firing on 667
-        // files — so the two forms agree across a very large live population, not a thin one.
-        // Forcing the rung off moves 48 corpus rows, so it is live in its own right.
-        //
-        // The disagreement shape would be an f32 ALIAS (`type G = f32; const x: G = 2.5`), and it
-        // cannot arise: `canonEmitTypeNames` rewrites a one-member alias to its body in the
-        // `TypeRef` itself, so the spelling reads `f32` before this ever sees it. That is the
-        // same mechanism B72 measured — annotation `TypeRef`s carry the alias-EXPANDED spelling —
-        // and it is why this conversion is equal by construction rather than by luck.
+        // The disagreement shape would be an f32 ALIAS (`type G = f32; const x: G = 2.5`), and
+        // it cannot arise: `canonEmitTypeNames` rewrites a one-member alias to its body in the
+        // `TypeRef` itself, so the spelling reads `f32` before this ever sees it — the same
+        // mechanism B72 named, and why this conversion is equal by construction, not by luck.
         if nodeTyIxOf(d.letType) >= 0 {
           if nodeTyPrimName(d.letType) == "f32" { return true }
         } else if lt.tyName == "f32" {

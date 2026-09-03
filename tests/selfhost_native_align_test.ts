@@ -2,7 +2,7 @@
 // TS/deno/V8 in the compile+run path (deno only DISCOVERS cases, parses their
 // directives, and ASSERTS the verdict; the brains run in the native tool).
 //
-// The corpus oracle (`tests/cases_wasm_test.ts`) proves the VL pipeline AGREES
+// The corpus oracle (`tests/cases_wasm_*_test.ts`) proves the VL pipeline AGREES
 // with the spec when the seed is driven as a wasm module under deno. THIS suite
 // re-drives the SAME corpus through the NATIVE path — `scripts/vl-host` (Rust +
 // wasmtime) executing `build/vl-compiler.wasm` — and asserts the native tool

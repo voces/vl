@@ -132,7 +132,7 @@ Deno.test({
 
 // `duplicate-import` over a module GRAPH (the owner's ruling of 2026-09-02: the
 // same source twice should lint). The corpus's `tests/cases/modules/` tier does
-// NOT adjudicate lint — `cases_wasm_test.ts` runs it on SINGLE-FILE cases only —
+// NOT adjudicate lint — `cases_wasm_*_test.ts` runs it on SINGLE-FILE cases only —
 // so this is the graded pin for the warning's message and anchor on a real
 // multi-module program, beside the single-file pin in `tests/cases/lint/`.
 const DUP_MAIN = `import { Pair, add } from "./helper"

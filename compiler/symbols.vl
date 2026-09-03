@@ -64,20 +64,15 @@ export function sidOf(text: string) {
 // The id of `text` IF IT HAS ALREADY BEEN INTERNED, else -1. **Never mints.**
 //
 // **USE THIS ONLY WHERE THE TABLE IT FEEDS IS ALREADY FULLY BUILT**, and prefer
-// `sidOf` when in doubt. The rule has two teeth, both of which bit during this
-// conversion before the argument was written down:
+// `sidOf` when in doubt. Two teeth, both of which bit during the conversion:
+//  1. A LAZILY BUILT table must mint. `parentLetOfSid` BUILDS its block's rows on the
+//     miss, so resolving the query name with `sidLookup` FIRST passes -1 for a name
+//     the build is about to intern — a silent wrong resolution, not a slow one.
+//  2. A sid form that recovers its own spelling with `sidText` must mint, or the text
+//     it recovers is "" instead of the caller's name.
 //
-//  1. A LAZILY BUILT table must mint. `parentLetOfSid` BUILDS its block's rows on
-//     the miss — interning each `LetDecl` name as it goes — so a wrapper that
-//     resolved the query name with `sidLookup` FIRST would pass -1 for a name that
-//     the build is about to intern, and answer "absent" for a binding that exists.
-//     That is a silent wrong resolution, not a slow one.
-//  2. A sid form that recovers its own spelling with `sidText` must mint, or the
-//     text it recovers is "" instead of the caller's name.
-//
-// Where it IS exact — an eagerly built table like `globalIndexBySid`, whose every
-// key was interned at the build point — it is R6's argument read backwards: a text
-// with no id cannot be a key, so -1 feeds `sidArrGet` and reads "absent".
+// Where it IS exact — an eagerly built table like `globalIndexBySid` — a text with no
+// id cannot be a key, so -1 reads "absent" (R6 backwards).
 export function sidLookup(text: string) { sidMap[text] ?? -1 }
 
 // The inverse: an ARRAY READ, not a probe. -1 renders as "" so a caller that got
@@ -95,62 +90,30 @@ export function sidCount() { sidTexts.length }
 // ── R3: the CARRIER is an arena-node side table ──────────────────────────────
 // `sidNode[ix]` is the interned id of the node's PRIMARY NAME (`Ident.identName`,
 // `FuncDecl.fnName`, `LetDecl.letName`, `Param.parName`, `ForRange.frVar`,
-// `ForIn.fiVar`), -1 for a node with no name, and `SID_UNFILLED` for a slot no one
-// has asked about yet. Filled LAZILY, grown on demand (append-only, so the growth
-// is amortized O(1) over the compile).
+// `ForIn.fiVar`), -1 for a node with no name, and `SID_UNFILLED` for a slot no one has
+// asked about yet. Filled LAZILY, grown on demand (append-only, amortized O(1)).
 //
-// WHY AN ARENA SIDE TABLE, and not a token field or an AST field:
-//   - the arena index is what the emitter and checker already thread everywhere
-//     (`emitExpr(body, ix, fnIx)`, `checkNode(ix)`, `capScan(ix, …)`);
-//   - the SAME node's name is asked for many times per compile — `emitIdentNode`
-//     alone resolves one identifier through seven name-keyed lookups, and the
-//     classifier/rewrite/emit passes each walk the arena again — so one intern
-//     amortizes over all of them;
-//   - it costs one i32 per node (~4 MB against a ~511 MB self-compile) and needs
-//     no change to `ast.vl`'s node shapes, which every `is`-narrowing site, the
-//     parser's constructors, the formatter and the LSP query families read.
-// An id field ON THE NODE is semantically cleaner and cannot desynchronize by
-// construction; it is filed as the END STATE, because its writer set (every
-// synthesized node in `emit_mono`/`emit_rewrite`/parser recovery) is unbounded
-// where this one's is enumerable (R4).
+// AN ARENA SIDE TABLE, not a token or AST field, because the arena index is what the
+// emitter and checker already thread everywhere (`emitExpr(body, ix, fnIx)`); one node's
+// name is asked for many times per compile, so one intern amortizes over all of them;
+// and it needs no change to `ast.vl`'s node shapes, which every `is`-narrowing site, the
+// parser, the formatter and the LSP read. An id field ON THE NODE cannot desynchronize
+// and is filed as the END STATE — its writer set is unbounded where this one's is (R4).
 const SID_UNFILLED = -2
 let sidNode: i32[] = []
 
 // ── R4: the INVARIANT ────────────────────────────────────────────────────────
 // `sidNode[ix]` must equal `sidOf(<the node's name RIGHT NOW>)`. Two clauses:
-//
-//  1. A NODE ARRIVES FULLY BUILT. `ast.addNode(n)` takes a complete `Node` and
-//     appends it; there is exactly one append in the compiler and nothing removes.
-//     So a lazily-filled slot is correct for every node that is never rewritten.
-//  2. EVERY IN-PLACE WRITE TO A NODE'S NAME CALLS `sidNoteNodeName(ix)`. The
-//     writer set is EIGHT, enumerated structurally and re-derivable with
-//     `grep -n '\.identName = \|\.fnName = \|\.letName = \|\.parName = \|\.frVar = \|\.fiVar = ' compiler/*.vl`:
-//       driver.vl        `n.fnName = modRenamed(…)`      (module merge)
-//       driver.vl        `n.letName = modRenamed(…)`
-//       driver.vl        `n.identName = modRenamed(…)`
-//       emit_collect.vl  `n.fnName = "__lambda_" + …`    (lambda numbering)
-//       emit_mono.vl     `cal.identName = monoInstName[k]`
-//       emit_mono.vl     `cal2.identName = instName`
-//       emit_mono.vl     `cal.identName = monoInstName[r]`
-//       emit_mono.vl     `cal2.identName = specName`
-//     Type-position names (`tyName`, `isVariant`, `asTy`) are also written in
-//     place and are OUT OF SCOPE — the carrier does not index them.
-//
-// A STALE SLOT RESOLVES AN IDENTIFIER TO THE WRONG SYMBOL — a silent miscompile,
-// the worst class. `docs/internals/perf-program.md` §9.6 poisons each of the eight
-// and records which instrument reddened, because "the ladder would catch it" is a
-// claim, not a witness. **It was a claim, and it was wrong** — §9.6.1: the fixpoint
-// ladder is BLIND to all eight; the SUITE and the six-channel CORPUS are the
-// witnesses, and the fuzz A/B sees nothing. Two consequences for anyone editing here:
-//   - writers 1-3 (the driver's merge renames) are INERT TODAY — the merge runs
-//     before any emit pass and every `sidOfNode` caller is in `emit_*`, so the
-//     carrier is empty and the call returns at the length guard below. They are kept
-//     as the defence for the day a pass lands between the merge and emit. Deleting
-//     one reddens NOTHING (measured: 1,714/1,714 corpus rows same, fixpoint holds).
-//   - writers 4-8 (lambda numbering, monomorphization) are live and loud.
-//
-// Lazy and not eager: an eager pass would need the same eight notifications PLUS a
-// pass, and would have to re-run after every mutating emit pass.
+//  1. A NODE ARRIVES FULLY BUILT. `ast.addNode(n)` appends a complete `Node`, there is
+//     one append and nothing removes, so a lazily-filled slot is correct for every
+//     node that is never rewritten.
+//  2. EVERY IN-PLACE WRITE TO A NODE'S NAME CALLS `sidNoteNodeName(ix)`. That writer
+//     set is enumerable and must be RE-DERIVED, never trusted from here:
+//     `grep -n '\.identName = \|\.fnName = \|\.letName = \|\.parName = \|\.frVar = \|\.fiVar = ' compiler/*.vl`.
+//     Type-position names (`tyName`, `isVariant`, `asTy`) are OUT OF SCOPE.
+// A STALE SLOT RESOLVES AN IDENTIFIER TO THE WRONG SYMBOL — a silent miscompile. Which
+// instrument catches a poisoned writer is graded in `docs/internals/perf-program.md`
+// §9.6/§9.6.1; the fixpoint ladder is NOT one. Eager would need a re-run per pass.
 export function sidNoteNodeName(ix: i32) {
   if ix < 0 { return 0 }
   if ix >= sidNode.length { return 0 }
@@ -178,25 +141,18 @@ export function sidOfNode(ix: i32) {
   s
 }
 
-// Per-compile reset (R2). Called wherever `P.nodes = []` is — the carrier is keyed
-// by ARENA INDEX, so a reset arena that reuses index 5 for a different identifier
-// would otherwise read the previous program's answer. That is the sharpest edge in
-// this file and `lintGraph`'s per-module loop walks straight onto it.
+// Per-compile reset (R2). Called wherever `P.nodes = []` is — the carrier is keyed by
+// ARENA INDEX, so a reset arena reusing an index for a different identifier would
+// otherwise read the previous program's answer, and `lintGraph`'s per-module loop walks
+// straight onto that edge.
 //
 // **EVERY SID-KEYED TABLE IN THE COMPILER MUST BE DROPPED WITH THIS CALL**, and the
 // driver does it by pairing every `sidReset()` with `sidKeyedTablesReset()`
-// (`emit_sections.vl`). That obligation is NOT the same one the string-keyed maps
-// had, and the difference is what makes it easy to get wrong:
-//
-//   a NAME-keyed row survives a program boundary harmlessly — program N+1 only
-//   collides with it if it uses the SAME SPELLING. A SID-keyed row collides
-//   whenever program N+1 mints the same NUMBER, and the space is dense from 0, so
-//   sid 3 exists in every program that has three identifiers.
-//
-// Measured, not theorised: converting the three maps without this pairing left the
-// wasm harness — which drives ONE `WebAssembly.Instance` over the whole corpus —
-// failing 18 cases with `array element access out of bounds`, while each of those
-// cases passed in isolation. That harness is this hazard's standing witness.
+// (`emit_sections.vl`). That obligation is NOT the one the string-keyed maps had: a
+// NAME-keyed row survives a program boundary harmlessly, colliding only on the SAME
+// SPELLING, while a SID-keyed row collides whenever the next program mints the same
+// NUMBER — and the space is dense from 0. The standing witness is the wasm harness,
+// whose ONE `WebAssembly.Instance` over the corpus fails without the pairing.
 export function sidReset() {
   sidMap = Map()
   sidTexts = []

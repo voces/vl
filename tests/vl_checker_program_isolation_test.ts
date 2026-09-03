@@ -10,7 +10,7 @@
 // the sweep reported 0 of 2,032 rows moved on the same build. See the destringify
 // programme's B31 entry.
 //
-// `cases_wasm_test.ts` catches this class only incidentally — it happens to share one
+// `cases_wasm_*_test.ts` catches this class only incidentally — it happens to share one
 // instance across the corpus, so a leak shows up as a scatter of unrelated failures with
 // no obvious common cause. This file pins the invariant DIRECTLY and names it, so the
 // next such leak reports itself as what it is.

@@ -2,20 +2,17 @@
 // from the checker's `Ty` arena (ROADMAP "repOf unification").
 //
 // WHY THIS MODULE EXISTS. The emitter historically enumerates the same wasm rep
-// families in FIVE parallel schemes that must agree by convention:
-//   1. the `VKind` string union (emit_state.vl) — locals/params/results,
-//   2. raw numeric codes 0–21 (the historical `VKind` codes, still live in
-//      struct FIELD codes),
-//   3. single-char `$fnsig` tokens (`cloParamTok` / `cloRetKeySuffix` encode,
-//      `sigKeyRetKind` decodes to a `VKind` directly — no more raw-code hop),
-//   4. the per-function stored inferred-return kind (`fRetKind`),
-//   5. side enums (`MfKind`/`BtKind`/`PushKind`).
+// families in FIVE parallel schemes that must agree by convention: the `VKind`
+// string union (emit_state.vl), raw numeric codes 0–21 (still live in struct FIELD
+// codes), single-char `$fnsig` tokens (`cloParamTok` / `cloRetKeySuffix` encode,
+// `sigKeyRetKind` decodes straight to a `VKind`), the per-function stored
+// inferred-return kind (`fRetKind`), and side enums (`MfKind`/`BtKind`/`PushKind`).
 // Every translation ladder between them is a place a new rep can be missed — each
 // wave-4 rep bug was one enumeration arm that had drifted from its twins. `repOf`
 // is the strangler replacement: ONE descriptor, derived ONCE from the checked
-// type, that every scheme becomes a projection of. Consumers migrate site by
-// site (each migration gated by the fixpoint + corpus byte-compare + the rep
-// fuzzer); the old schemes then become delegation shims and finally die.
+// type, that every scheme becomes a projection of. Consumers migrate site by site,
+// each migration gated by the fixpoint + corpus byte-compare + the rep fuzzer; the
+// old schemes then become delegation shims and finally die.
 //
 // COVERAGE DISCIPLINE (`rdCovered`). The derivation is deliberately PARTIAL: an
 // arm is marked covered only where the arena structure decides the rep exactly
@@ -23,26 +20,23 @@
 // shapes whose rep still depends on emitter interning gates (typed-value maps,
 // union-element lists, nested arrays, nullable lists beyond `i32[] | null`) —
 // returns `rdCovered == 0`, and the consumer keeps its legacy path. This is the
-// same consult-the-checker-first / fall-back-syntactic pattern the typed-IR
-// sidecar (`nodeTy*`) established; coverage widens arm by arm as consumers
-// migrate, never by a blanket claim.
+// consult-the-checker-first / fall-back-syntactic pattern the typed-IR sidecar
+// (`nodeTy*`) established; coverage widens arm by arm, never by a blanket claim.
 //
 // SLOTS. `rdSlot` carries a rep's interned STRUCT-table slot. The arena
 // derivation resolves it for a DECLARED-struct object type via `repSlotOfTy`
 // (keyed on the checker's memoized arena index, so nominal twins stay distinct —
 // see the note there); it stays -1 for inline shapes, variants, ref-list and map
-// reps, whose slots remain name-keyed at the consumer (`structIndexByName` /
-// `rlSlotByName` / `mvValName`, all in emit_classify, ABOVE this module). No
-// consumer reads `rdSlot` yet — it is the descriptor foundation the slot-layer
-// migration builds on; the canonical structural key (`repCanonKey`) that makes it
-// cycle-safe lives just below.
+// reps, whose slots remain name-keyed at the consumer in emit_classify
+// (`structIndexByName` / `rlSlotByName` / `mvValName`). No consumer reads `rdSlot`
+// yet; the canonical structural key (`repCanonKey`) that makes it cycle-safe is
+// just below.
 //
-// CYCLES. Recursive structural types are REAL arena cycles: `type Tree = {kids:
-// Tree[]}` resolves `Tree` through `cUserTypes` memoization, so the field's
-// `TyArray.aElem` points back at the enclosing `TyObj`'s index. The KIND arms
-// below never recurse more than one wrapper deep (an array classifies by its
-// element's variant, never by the element's own descriptor), so they cannot
-// loop. The TRANSITIVE queries (`repTyScalarMask`) walk the full graph and
+// CYCLES. Recursive structural types are REAL arena cycles: in `type Tree = {kids:
+// Tree[]}` the field's `TyArray.aElem` points back at the enclosing `TyObj`. The
+// KIND arms below never recurse more than one wrapper deep (an array classifies by
+// its element's variant, never by the element's own descriptor), so they cannot
+// loop; the TRANSITIVE queries (`repTyScalarMask`) walk the full graph and
 // terminate via a generation-stamped visited mark per arena index.
 
 import { i32ToStr } from "./ast"
@@ -137,26 +131,17 @@ import {
 import { sidOf } from "./symbols"
 
 // ── The descriptor ────────────────────────────────────────────────────────────
-// One struct per classified type. Field semantics:
-//   rdCovered  — 1: structurally derived from the arena; 0: the arena does not
-//                decide this shape yet — the consumer MUST use its legacy path.
-//   rdKind     — the `VKind` member (the valtype byte and heap index follow from
-//                `fbValtype(rdKind, rdSlot)` — the one declarative kind→byte
-//                table; the descriptor does not duplicate it).
-//   rdNul      — how the rep encodes `null`:
-//                  0 not nullable · 1 nullable ref (`ref.null` niche) ·
-//                  2 i32 sentinel 2 (`boolean | null`) ·
-//                  3 i32 atom sentinel -1 (`K | null` litunion) ·
-//                  4 boxed (`null` is a member atom tag in the value-union box).
-//   rdSlot     — the interned table slot where the consumer resolved one
-//                (struct index / variant index / ref-list slot / map shape);
-//                -1 at the arena level (see SLOTS above).
-//   rdSigTok   — the canonical `$fnsig` token character for this kind ("" when
-//                the kind has no token in the value-call ABI). Slot-carrying
-//                tokens (`s`/`n`/`V`/`r`) append `<slot>;` at the encode site.
-//   rdListElem — for the list kinds, the ELEMENT's rep vocabulary name
-//                ("i32" / "i64" / "f64" / "f32" / "string" / "struct" /
-//                "closure"), else "".
+// One struct per classified type. `rdCovered` is 1 when the rep was structurally derived
+// from the arena and 0 when the arena does not decide this shape yet — at 0 the consumer
+// MUST use its legacy path. `rdKind` is the `VKind` member; the valtype byte and heap index
+// follow from `fbValtype(rdKind, rdSlot)`, the one declarative kind-to-byte table, which the
+// descriptor deliberately does not duplicate. `rdNul` says how the rep encodes `null`: 0
+// not nullable, 1 nullable ref, 2 the `boolean | null` i32 sentinel, 3 the litunion atom
+// sentinel, 4 boxed as a member atom tag in the value-union box. `rdSlot` is the interned
+// table slot where the consumer resolved one, and stays -1 at the arena level (see SLOTS
+// above). `rdSigTok` is the canonical `$fnsig` token character, "" when the kind has no
+// token in the value-call ABI, with slot-carrying tokens appending the slot at the encode
+// site. `rdListElem` names the ELEMENT's rep vocabulary for the list kinds, else "".
 export type RepDesc = {
   rdCovered: i32,
   rdKind: VKind,
@@ -227,26 +212,18 @@ export function repSigTokHasSlot(kind: VKind | null): boolean {
     kind == "map"
 }
 
-// Mint a SLOT-CARRYING `$fnsig` token: the kind's token char followed by the
-// `;`-terminated decimal slot (`s3;`, `r0;`, `m2;`). The ONE place token digits
-// are assembled — the producers (`cloParamTok`/`cloRetKeySuffix`/`annParamKind`/
-// `annRetKind`) call this instead of hand-appending `i32ToStr(slot) + ";"`.
+// Mint a SLOT-CARRYING `$fnsig` token: the kind's token char followed by the `;`-terminated
+// decimal slot (`s3;`, `r0;`, `m2;`). The ONE place token digits are assembled, so the
+// producers never hand-append `i32ToStr(slot) + ";"`.
 //
-// SIG-SPACE CANONICALIZATION (rep-twin sig-canon slice): a STRUCT / NULLABLE-STRUCT
-// slot digit renders its `sTwin`-canonical representative (`repStructSlotRep`), not
-// the raw row. Two spelling-twin struct rows (`type A={v:i32}` vs an inline `{v:i32}`
-// annotation, or a closure-field / nullable-litunion twin) are `structFieldCodesEq`
-// under one `slotCanonId`, so they emit BYTE-IDENTICAL functypes (`fbValtype` reads
-// `sHeapIdx[slot]`, and `sHeapIdx` collapses twins) — but their raw digits made the
-// three `$fnsig` producers key structurally-identical shapes under DIFFERENT sig
-// keys (the #980 KEY-vs-ROW divergence that blocks the phase-1 bridge leg + phase-2
-// authoritative swap). Rendering the canonical rep makes the sig KEY twin-invariant:
-// whichever row a resolver lands on, the digit — hence the interned functype key —
-// is the same, so structurally-identical shapes dedup to ONE `$fnsig`. The rep is
-// computed TIMING-INDEPENDENTLY (from `slotCanonId`, never the `sTwin[]` array,
-// which `buildStructTwins` fills AFTER `collectCloSigs` has already interned the sig
-// set) so intern-time and emit-time renders agree. Other slot kinds (reflist /
-// variant / map) index their OWN tables and pass through unchanged.
+// SIG-SPACE CANONICALIZATION: a STRUCT / NULLABLE-STRUCT slot digit renders its
+// `sTwin`-canonical representative (`repStructSlotRep`), not the raw row. Two spelling-twin
+// struct rows already emit identical functypes, because `fbValtype` reads `sHeapIdx` and
+// that collapses twins — but their RAW digits made the three `$fnsig` producers key one
+// shape under DIFFERENT sig keys. Rendering the canonical rep makes the sig KEY
+// twin-invariant, so whichever row a resolver lands on the interned functype key is the
+// same. The rep is computed TIMING-INDEPENDENTLY, from `slotCanonId` and never the `sTwin[]`
+// array `buildStructTwins` fills after `collectCloSigs`. Other slot kinds pass through.
 export function repSigSlotTokOfKind(kind: VKind | null, slot: i32): string {
   let s = slot
   if kind == "struct" || kind == "nulstruct" { s = repStructSlotRep(slot) }
@@ -313,34 +290,29 @@ function repMk(kind: VKind, nul: i32, elem: string): RepDesc {
 }
 
 // ── Canonical structural key (cycle-terminating) ─────────────────────────────
-// A string that identifies a type's STRUCTURE, walked in FULL so `{a:i32}` and
-// `{a:i32,b:i32}` differ (unlike the descriptor arms, which classify at most one
-// wrapper deep). Recursive arena cycles (`type List = {next: List | null}`, mutual
-// `A→B→A`) terminate via a visited STACK: re-entering a type already being
-// expanded emits a RELATIVE back-edge `#<k>` (k = stack distance to the enclosing
-// occurrence — a de Bruijn index), so two isomorphic cyclic types render the same
-// key regardless of their (per-compile, non-deduped) arena indices. Two
-// structurally-identical types — including through cycles — share a key; two
-// distinct ones never collide. A leaf variant the emitter does not narrow
-// (`TyVar`/`TyLit`/`TyErr`) is keyed by its arena index (`@N`): distinctness is
-// preserved (never a false merge); isomorphism across such leaves is not — the
-// slot resolver only consults DECLARED-struct keys, where these do not arise.
+// A string identifying a type's STRUCTURE, walked in FULL so `{a:i32}` and `{a:i32,b:i32}`
+// differ (unlike the descriptor arms, which classify at most one wrapper deep). Recursive
+// arena cycles terminate via a visited STACK: re-entering a type already being expanded
+// emits a RELATIVE back-edge `#<k>`, k the stack distance to the enclosing occurrence — a
+// de Bruijn index — so two isomorphic cyclic types render the same key regardless of their
+// per-compile arena indices. Two structurally-identical types share a key and two distinct
+// ones never collide. A leaf variant the emitter does not narrow (`TyVar`/`TyLit`/`TyErr`)
+// is keyed by its arena index (`@N`): distinctness is preserved, never a false merge, while
+// isomorphism across such leaves is not — the slot resolver only consults DECLARED-struct
+// keys, where these do not arise.
 const repKeyStack: i32[] = []
 
 // ── The repCanonKey memo (generation-stamped) ────────────────────────────────
-// The full recursive string build above made `repCanonKey` the hottest compile
-// path (~47% of a self-compile: every `repSlotOfTy` query re-rendered every
-// declared struct's key). The memo is per arena index ("" = unfilled — every
-// real key is non-empty: a prim name, a bracketed shape, or `@N`/`!`), stamped
-// with the checker's `tyMutEpoch`; ANY in-place arena mutation (see the bump
-// inventory at `tyMutEpoch`) advances that epoch and the whole memo drops —
-// conservative, since one pinned hole can change every key that reaches it.
-// Consulted and written at TOP-LEVEL calls only (`repKeyStack` empty): an
-// INTERIOR key fragment is context-dependent — a de Bruijn back-edge `#k` in it
-// counts stack distance into the ENCLOSING walk — so only a root's key is a
-// self-contained string that can be reused verbatim. Interior recursion inside
-// one computation stays fresh, so a computed key is byte-identical to the
-// unmemoized render.
+// The full recursive string build above made `repCanonKey` the hottest compile path: every
+// `repSlotOfTy` query re-rendered every declared struct's key. The memo is per arena index
+// ("" = unfilled — every real key is non-empty: a prim name, a bracketed shape, or `@N`/`!`),
+// stamped with the checker's `tyMutEpoch`; ANY in-place arena mutation advances that epoch
+// and the whole memo drops — conservative, since one pinned hole can change every key that
+// reaches it. Consulted and written at TOP-LEVEL calls only (`repKeyStack` empty): an
+// INTERIOR key fragment is context-dependent, because a de Bruijn back-edge `#k` in it
+// counts stack distance into the ENCLOSING walk, so only a root's key is a self-contained
+// string that can be reused verbatim. Interior recursion inside one computation stays
+// fresh, so a computed key matches the unmemoized render exactly.
 let repKeyMemo: string[] = []
 let repKeyMemoEpoch = -1
 
@@ -355,36 +327,18 @@ function repKeyMemoSync() {
   0
 }
 
-// D611: THE NUMERIC-LITERAL-UNION SOFTEN FOR A STRUCT FIELD, applied on both canon-key
-// walks so the id and the string stay one answer. `type N = 1 | 2` and `i32` are ONE
-// emitted field: `numLitUnionBaseTy` is the checker's own `softenLitTy` rule and claims a
-// type only when every member is a literal over the SAME i32 / i64 / f64 base.
-//
-// IT IS CANON'S RULE, NOT A NEW EQUIVALENCE, which is why it belongs in the key rather than
-// at one mint site. `canonEmitTypeNames` rewrites the ANNOTATION `{r: N}` to `{r:i32}` and
-// banks the REWRITTEN spelling's type (`canonTyIxCol`), which is what an inline shape row
-// records; a DECLARED `type Box1 = {r: N}` records the pre-canon `cUserTypes` entry, which
-// canon never revisits. So one structural shape reached `buildStructTwins` under two arena
-// types — `{r: i32}` and `{r: N}` — with different canon ids. `keys[j] == keys[i]` is tested
-// BEFORE `structFieldCodesEq`, so the pair was never even compared: two heap types for one
-// shape, `vl check` rc 0, `vl run` "expected (ref null $type), found (ref $type)" (D611).
-//
-// THE FIELD POSITION ONLY, and that bound is measured rather than cautious. Softening at
-// EVERY position instead (at the top of `repCanonId`/`repCanonKey`) buys the same 227 cells
-// and LOSES 21 that run today — the whole `d362*_numlitun_*` named set, `type Z = 0 | 1`
-// under `type L = Z[]` / a map value / a union member, which went `runs` -> check-clean
-// invalid wasm ("expected (ref $type), found i32"). A numeric literal union is its base
-// SCALAR in a field slot; in the list / map-value / union-member layers it is not the same
-// interned row as its base, and the key is what keeps those apart.
-//
-// THE STRING BASE IS EXCLUDED BY THE HELPER AND MUST BE. `type K = "a" | "b"` reps as an
-// interned i32 atom and its alias NAME *is* that identity (`numLitUnionBaseTy`'s header
-// states the rule); softening it would fuse an atom field onto a `string` field. A numeric
-// literal union has no identity to keep — its members ARE i32s.
-//
-// Layout safety stays DOUBLE-GATED exactly as the TyUnion mix-widening below is:
-// `structFieldCodesEq` still has to agree positionally before two rows share a heap type,
-// so this rung can only ever let a merge be CONSIDERED, never force one.
+// D611: THE NUMERIC-LITERAL-UNION SOFTEN FOR A STRUCT FIELD, applied on both canon-key walks
+// so the id and the string stay one answer. `type N = 1 | 2` and `i32` are ONE emitted field;
+// `numLitUnionBaseTy` is the checker's own `softenLitTy` rule and claims a type only when
+// every member is a literal over the SAME base. IT IS CANON'S RULE, NOT A NEW EQUIVALENCE,
+// which is why it belongs in the key rather than at one mint site: canon rewrites an
+// ANNOTATION `{r: N}` to `{r:i32}` and banks that spelling's type, while a DECLARED
+// `type Box1 = {r: N}` records the pre-canon entry canon never revisits — so one shape
+// reached `buildStructTwins` under two arena types and got two heap types. THE FIELD POSITION
+// ONLY, and that bound is graded: softening at every position LOSES cells that run today,
+// because outside a field a numeric literal union is not the same interned row as its base.
+// The STRING base is excluded and must be — softening an atom field would fuse it onto a
+// `string` field. Layout safety stays DOUBLE-GATED: `structFieldCodesEq` still has to agree.
 function repCanonFieldTy(ty: i32): i32 {
   const nb = numLitUnionBaseTy(ty)
   if nb >= 0 { return nb }
@@ -393,31 +347,18 @@ function repCanonFieldTy(ty: i32): i32 {
   ty
 }
 
-// The `string` prim an INLINE string literal-union FIELD keys as, or -1 (silent-class-inventory
-// D1093) — the multi-member twin of `repCanonKeyGo`'s `TyLit` arm, which keys a BARE literal
-// field as its base scalar for exactly this reason (D1031).
-//
-// THE TWO SPELLINGS EMIT ONE SLOT AND HAD TWO KEYS. An inline `k: "a" | "b"` field is not a
-// registered alias, so the field-code ladder reads canon's softened render and codes it 3 — a
-// plain string ref, the same slot a `k: string` field takes and the same slot the DECLARED
-// struct and the union ARM are both laid out with. Their keys did not follow: `hcUnionId`
-// widens the literal run to `string` but still keys a UNION, so `{r:i32,k:"a"|"b"}` and
-// `{r:i32,k:string}` were two ids for one layout. `variantStructHeapTwinAt` finds an arm's own
-// struct row through `repRowOfTyStruct`, which gates on this key, so the demand-driven mint of
-// an arm carrying such a field could never be recognised as that arm's row — and a field typed
-// as the arm had no rep while the NAMED-alias spelling of the same union ran.
-//
-// THE ALIAS SPELLING IS EXCLUDED AND THAT IS THE WHOLE CARE. `k: K` over `type K = "a" | "b"`
-// codes 0: an interned i32 ATOM carrying the member set in the elem-name column, a genuinely
-// different layout from a string ref, and it must keep a different key. `tyLitUnionAliasIx`
-// is the same predicate the rep layer assigns that valtype with, so the split here and the
-// slot cannot disagree. NUMERIC literal unions are left to `numLitUnionBaseTy` above.
-//
-// COARSE ON PURPOSE, AND GUARDED like the bare-literal arm: this is a REP key, not a type
-// identity. `{kind: "x" | "y"}` and `{kind: string}` remain two distinct CHECKER types with
-// distinct member sets — a value of the second is still refused where the first is asked for —
-// and every consumer of this key pairs it with `structFieldCodesEq`, which is what separates
-// two canon-key twins whose emitted layouts differ.
+// The `string` prim an INLINE string literal-union FIELD keys as, or -1
+// (silent-class-inventory D1093) — the multi-member twin of `repCanonKeyGo`'s `TyLit` arm,
+// which keys a BARE literal field as its base scalar for exactly this reason (D1031).
+// THE TWO SPELLINGS EMIT ONE SLOT AND HAD TWO KEYS: an inline `k: "a" | "b"` field is not a
+// registered alias, so the field-code ladder reads canon's softened render and codes it 3, a
+// plain string ref — the same slot a `k: string` field takes — while `hcUnionId` still keyed
+// a UNION. `variantStructHeapTwinAt` finds an arm's struct row through `repRowOfTyStruct`,
+// which gates on this key, so an arm carrying such a field could never be recognised as its
+// own row. THE ALIAS SPELLING IS EXCLUDED AND THAT IS THE WHOLE CARE: `k: K` over
+// `type K = "a" | "b"` codes 0, an interned i32 ATOM, a genuinely different layout that must
+// keep a different key — and `tyLitUnionAliasIx` is the same predicate the rep layer assigns
+// that valtype with. COARSE ON PURPOSE: this is a REP key, guarded by `structFieldCodesEq`.
 function inlineLitUnionFieldBase(ty: i32): i32 {
   if ty < 0 { return -1 }
   if !tyIsLitUnion(ty) { return -1 }
@@ -505,12 +446,10 @@ function repCanonKeyGo(ty: i32): string {
       // STRING-repped in the box, so its canonical key renders "string". Without this a
       // declared `{a: K0 | {w:i32} | {q:i64}}` and the inline spelling (interned under the
       // checker's string-softened render) keyed DIFFERENTLY, declined the struct-twin dedup,
-      // and minted two byte-identical heap types — iso-recursively DISTINCT, so the
-      // declared-param call site's (ref $T0) mismatched the inline literal's twin
-      // (INVALID-WASM; fuzz-nightly 29875839073 declared leg, `mix:{a: K0 | {w: i32} |
-      // {q: i64}, …}` seed 88370995 d6). A PURE litunion (`K0`, `K0 | null`) keeps its
-      // structural render — the atom-i32 rep, NOT mergeable with `string`. Widened members
-      // dedup to one "string" render (the softened spelling collapses a `K0 | string` pair).
+      // and minted two structurally-equal but iso-recursively DISTINCT heap types, so the
+      // declared-param call site's `(ref $T0)` mismatched the inline literal's twin: invalid
+      // wasm. A PURE litunion (`K0`, `K0 | null`) keeps its structural render — the atom-i32
+      // rep, NOT mergeable with `string`. Widened members dedup to one "string" render.
       // Layout safety stays double-gated: `structFieldCodesEq` still refuses a merge whose
       // emitted field codes differ.
       let mixHasOther = false
@@ -577,29 +516,16 @@ function repCanonKeyGo(ty: i32): string {
     TyLit => {
       // A BARE literal type keys as its BASE SCALAR, which is the rep it actually has
       // (silent-class-inventory D1031). The index sentinel this arm used to fall to is
-      // unique per arena entry, and EVERY spelling of `"syntax"` is its own entry — so
-      // `type Dot = {r: i32, k: "syntax"}` beside an identically-spelled `type Dab` keyed
-      // differently, `buildStructTwins` never compared them, and the two rows each
-      // allocated a heap type for ONE checker type. That is D280's soundness bug reached
-      // through the literal: `vl check` rc 0 and a module the engine refuses, with no union
-      // anywhere in the program.
-      //
-      // THE INDEX SENTINEL'S OWN CLAIM — "it can only DECLINE a merge, never invent one" —
-      // is true and is not a safety argument here: a declined merge between two shapes the
-      // CHECKER accepts for each other is the miscompile, not the safe side.
-      //
-      // KEYING AS THE BASE IS WHAT THE FIELD ALREADY EMITS. A bare-literal field codes 3 (a
-      // plain string slot) exactly as a `string` field does — `variantFieldIdText` says so
-      // in its own words, "this is not a rep change: the field still codes 3" — so the two
-      // shapes emit one struct type and must key as one. It is also what the enclosing
-      // UNION arm has always done: `hcUnionId` widens a lit run to `string`, so
-      // `{k: "a" | "b"}` already keys as `{k: string}` while `{k: "a"}` did not. This is the
-      // bare case catching up with the union one.
-      //
-      // COARSE ON PURPOSE, AND GUARDED. The key is a REP key, not a type identity: every
-      // consumer pairs it with `structFieldCodesEq` (`repStructSlotsTwin`,
-      // `repStructSlotRep`, `repRowOfTyStruct`), which is what already separates a code-0
-      // atom-backed litunion field from a code-3 plain one under this same shared key.
+      // unique per arena entry, and EVERY spelling of a literal is its own entry — so two
+      // identically-spelled declared shapes keyed differently, `buildStructTwins` never
+      // compared them, and the two rows each allocated a heap type for ONE checker type:
+      // D280's soundness bug reached through the literal, with no union in the program. The
+      // sentinel's own claim — "it can only DECLINE a merge, never invent one" — is true and
+      // is not a safety argument here, since a declined merge between shapes the CHECKER
+      // accepts for each other IS the miscompile. Keying as the base is what the field
+      // already emits (a bare-literal field codes 3, a plain string slot) and what the
+      // enclosing UNION arm always did. COARSE ON PURPOSE AND GUARDED: this is a REP key,
+      // and every consumer pairs it with `structFieldCodesEq`.
       return repCanonKey(litBaseTy(t))
     }
     TyErr => {
@@ -614,26 +540,17 @@ function repCanonKeyGo(ty: i32): string {
 }
 
 // ── repElemKey — the ref-list ELEMENT rep key (destringify D2) ────────────────
-// A canonical key for a ref-list element's REPRESENTATION (its WasmGC
-// wrapper-equivalence class), NOT its type. Equal iff two elements ride ONE
-// wrapper heap type / occupy ONE ref-list slot. The structural replacement for
-// the string-surgery `rlCanonElemName`.
-//
-// This is NOT `repCanonKey` — that keys the arena TYPE, and diverges from a slot
-// key on BOTH ends:
-//   · it keeps `i32[]`, `boolean[]`, litunion `K[]` and `(boolean|null)[]` APART
-//     (correct as a type key), yet all four ride the ONE `lTypeIdx` i32-list
-//     backing; likewise `(string|null)[]` shares `string[]`'s `$mkListIdx`
-//     wrapper. `repElemKey` FOLDS each shared-wrapper leaf list to one token.
-//   · it EXPANDS a declared struct to its field shape, so two declared twins
-//     (`type A = {v:i32}`, `type B = {v:i32}`) collapse — but the ref-list layer
-//     keeps them NOMINAL (distinct slots, deduped to one heap later via `rlTwin`;
-//     `structural-twin-reflist-dedup.vl`). `repElemKey` keys a DECLARED struct by
-//     its nominal slot (`repSlotOfTyDecl`); only an INLINE shape is expanded
-//     structurally (its arena index is minted fresh per spelling, so a nominal
-//     index key would be unstable between the intern and the lookup).
-// Everything else — the litunion-atom softening of a MIXED union, nested arrays,
-// nullable, maps, closures — is structural, mirroring `rlCanonLitUnionAtoms`.
+// A canonical key for a ref-list element's REPRESENTATION (its WasmGC wrapper-equivalence
+// class), NOT its type: equal iff two elements ride ONE wrapper heap type / occupy ONE
+// ref-list slot. The structural replacement for the string-surgery `rlCanonElemName`. It is
+// NOT `repCanonKey`, which diverges from a slot key at BOTH ends. That key keeps `i32[]`,
+// `boolean[]`, litunion `K[]` and `(boolean|null)[]` apart — correct as a TYPE key — yet
+// all four ride one i32-list backing, so `repElemKey` FOLDS each shared-wrapper leaf list
+// to one token. And it EXPANDS a declared struct to its field shape, collapsing declared
+// twins, while the ref-list layer keeps them NOMINAL (distinct slots, deduped later via
+// `rlTwin`); so `repElemKey` keys a DECLARED struct by its nominal slot and expands only an
+// INLINE shape, whose arena index is minted fresh per spelling and would be unstable
+// between intern and lookup. Everything else is structural, mirroring `rlCanonLitUnionAtoms`.
 export function repElemKey(ty: i32): string {
   if ty < 0 { return "!" }
   let si = repElemKeyStack.length - 1
@@ -671,43 +588,16 @@ const repElemKeyStack: i32[] = []
 
 // THE `repElemKey` MEMO — `repKeyMemo`'s twin, with one more generation to compare.
 // `repCanonKeyGo` reads the ARENA ALONE, so its memo syncs on `tyMutEpoch`; this key's
-// `TyObj` arm additionally asks `repSlotOfTyDecl`, whose answer belongs to the slot
-// cache — so this memo syncs on exactly the TRIPLE `repSlotCacheSync` compares
-// (`tyMutEpoch`, `cUserTypesVer`, `sNames.length`). Anything that can change a key
-// changes one of the three, and stamping the same triple keeps the two caches from
-// disagreeing about which generation they are in.
-//
-// TOP OF RECURSION ONLY, exactly as `repKeyMemo`, and for a reason that is not
-// caution: the de Bruijn back-edge (`#n`) is a function of the caller's DEPTH, not of
-// `ty`, so an INNER answer is not a pure function of its type and must never be banked.
-//
-// EXACT, AND THE GATE IS A DUAL-RUN: every memo HIT recomputed from scratch and compared
-// with the banked answer — **54,906 agree / 0 disagree** over the corpus and **15,445 / 0**
-// on the compiler's own source. The comparator is live, proven by banking `s + "X"`, which
-// turns it into 0 / 15,445 with witnesses (`memo=S0X fresh=S0`).
-//
-// NEITHER GENERATION CONJUNCT IS LOAD-BEARING ON ANY INPUT MEASURED, and that is recorded
-// rather than banked as safety: dropping `sNames.length` from the sync leaves 0
-// disagreements, and dropping `tyMutEpoch` as well ALSO leaves 0 — so on everything
-// available, nothing this key depends on moves inside the window `repElemKey` runs in. The
-// triple is kept anyway, because the alternative is an unguarded cache resting on an
-// emit-window invariant nobody has stated, and because syncing on exactly what
-// `repSlotCacheSync` compares is what makes "the two caches are in the same generation" a
-// one-line argument. If that invariant is ever written down, this guard is deletable.
-//
-// WHY IT DID NOT EXIST: nothing recorded a reason — `repCanonKey` was memoized and this
-// twin was not, and the cost is the whole gap between the two. Measured before adding
-// it: `repCanonKey` takes 38,145 of 51,393 corpus calls on the memo (74.2%) while
-// `repElemKey` took 0 of 152,090 and rebuilt **1,139,860 characters** of type spelling;
-// on the compiler's own source, 0 of 23,784 calls and 174,564 characters. After: corpus
-// builds **152,090 -> 7,989** and characters **1,139,860 -> 65,644** (-94.2%); self-compile
-// builds **23,784 -> 346** and characters **174,564 -> 5,774** (-96.7%).
-//
-// PERF: UNMEASURABLE, and that is the honest answer. Five warmed alternating self-compiles
-// per side: 1.48/1.52/1.49/1.53/1.48 against 1.50/1.49/1.50/1.49/1.53 — the 169 KB of
-// string building removed is microseconds against a 1.5 s compile. It ships as a
-// destringify result (94% of a string-building population the programme exists to remove,
-// at zero risk and zero byte movement), NOT as a speed one.
+// `TyObj` arm additionally asks `repSlotOfTyDecl`, whose answer belongs to the slot cache —
+// so this memo syncs on exactly the TRIPLE `repSlotCacheSync` compares (`tyMutEpoch`,
+// `cUserTypesVer`, `sNames.length`). Anything that can change a key changes one of the
+// three, and stamping the same triple keeps the two caches from disagreeing about which
+// generation they are in. TOP OF RECURSION ONLY, exactly as `repKeyMemo`, and not out of
+// caution: the de Bruijn back-edge (`#n`) is a function of the caller's DEPTH, not of `ty`,
+// so an INNER answer is not a pure function of its type and must never be banked. No
+// generation conjunct has been shown load-bearing on any input tried; the triple is kept
+// anyway, because the alternative is an unguarded cache resting on an emit-window invariant
+// nobody has stated. This ships as a DESTRINGIFY result, not a speed one.
 let repElemMemo: string[] = []
 let repElemMemoEpoch = -1
 let repElemMemoUserVer = -1
@@ -888,56 +778,18 @@ export function tyIsStrLeafElem(e: i32): boolean {
   false
 }
 
-// The name bridge for the ref-list layer (which is name-keyed): resolve a
-// ref-list element NAME to its arena type (memoized per spelling by
-// `resolveAnnot`), then compute its rep key.
-//
-// IT ASKS `resolveAnnot` DIRECTLY rather than through `declTyIxOfName`, and that is
-// a MEASURED exclusion, not an oversight: a `new` newtype's declared-name entry and
-// the index the annotation grammar resolves to are two DIFFERENT arena entries over
-// one `Ty` — the base and its brand — and here, unlike at the file's other two name
-// bridges, the two indices' **rep keys differ**. `declTyIxOfName`'s header carries the
-// mechanism, the counts and the witness.
-//
-// A spelling that does not resolve
-// keys on the name itself (nominal — matches only an identical spelling), and
-// the runaway cap mirrors `repNameCanonId`'s (a name this long is never a legit
-// slot key — feeding it to `resolveAnnot` mints fresh arena types per probe).
-//
-// `ty` IS THE CALLER'S RECORDED ARENA TYPE FOR THIS VERY NAME (destringify
-// D-REPELEMTY), -1 for no hint. The whole of the bridge is
-// `repElemKey(resolveAnnot(name))`, so a caller that ALREADY holds the type the
-// name resolves to is asking `resolveAnnot` to hand back something it banked;
-// rung 1 reads the bank instead. The name ladder below is untouched and still
-// first for every unhinted caller.
-//
-// **THE HINT MUST BE THE TYPE THIS VERY NAME WAS RESOLVED TO, NOT MERELY A TYPE
-// THE NAME'S POSITION HAS.** Both shipped hint sources are the D5 sidecar
-// (`sFieldElemTyIx` / `uFieldElemTyIx`), whose recorder is
-// `fieldElemTyIxOfName(nm)` over the SAME `sFieldElemName` / `uFieldElemName`
-// cell the caller passes here — so the two rungs compute `repElemKey` of one
-// arena index and agreement is by CONSTRUCTION, not by measurement (measured
-// anyway: 377 covered entries, 0 disagreements in either direction, over 1,417
-// corpus programs + `std`). A hint taken from a NODE bank is a different claim and
-// does NOT hold here — `collectA`'s `TypeRef` walk disagrees on 61 of 1,400
-// covered entries, and the writer that separates the two vocabularies is
-// `typecheck.canonEmitTypeNames`: it rewrites `TypeRef.tyName` IN PLACE to the
-// emitter's spelling (a literal-union alias to its base scalar, a transparent
-// alias to its member, a type-parameter name that shadows a global alias to that
-// alias's body) and leaves `nodeTyIx` holding the type the CHECKER recorded before
-// the rewrite. So `tyName` is the emitter's vocabulary and `nodeTyIx` is the
-// checker's algebra, and at this site they are two answers to two questions — 57
-// of the 61 sit on a canon-rewritten node, and the `@<index>` tell is
-// `repElemKeyGo`'s identity arm keying the un-widened `TyLit`s (and, under a
-// shadowed type parameter, a `TyVar`). The monomorphizer writes none of them: every
-// annotation it synthesizes goes through `synthTypeRef` → `recordClonedNodeTy`,
-// which banks the SUBSTITUTED spelling's own type. The measurement, its per-file
-// residue and the lockstep experiment that closes 55 of the 61 are in
-// `docs/internals/destringify-types-program.md` (D-REPELEMTY §3a).
-//
-// The `name == ""` early-out stays ABOVE the hint: an unnamed element has no row, and the
-// -1 identity it answers (the key is an id now, not a rendered string) is what makes both
-// interner and resolver decline together.
+// The name bridge for the ref-list layer (which is name-keyed): resolve a ref-list element
+// NAME to its arena type (memoized per spelling by `resolveAnnot`), then compute its rep
+// key. It asks `resolveAnnot` DIRECTLY rather than through `declTyIxOfName` — a graded
+// exclusion: a `new` newtype's declared-name entry and the index the annotation grammar
+// resolves to are two arena entries over one `Ty` whose rep keys differ HERE (mechanism in
+// `declTyIxOfName`'s header). An unresolvable spelling keys on the name itself, nominally.
+// `ty` is the caller's RECORDED arena type FOR THIS VERY NAME (D-REPELEMTY), -1 for none —
+// and it must be that, not merely a type the name's POSITION has: the shipped hint sources
+// are D5 sidecar cells recorded over the same string, so agreement is by CONSTRUCTION,
+// while a NODE bank disagrees because `canonEmitTypeNames` rewrites `TypeRef.tyName` in
+// place and leaves `nodeTyIx` on the pre-rewrite type. The `name == ""` early-out stays
+// ABOVE the hint: an unnamed element has no row, so interner and resolver decline together.
 export function repElemIdOfNameTy(name: string, ty: i32): i32 {
   if name == "" { return -1 }
   if ty >= 0 { return repElemId(ty) }
@@ -948,31 +800,17 @@ export function repElemIdOfNameTy(name: string, ty: i32): i32 {
 }
 
 // ── repMvValKey — the map-VALUE slot rep key ──────────────────────────────────
-// A canonical key for a `{[string]: V}` VALUE type's mv-table slot identity.
-// Equal iff two value spellings intern ONE `mvValName` row.
-//
-// It is neither of the two keys above, and the difference is the whole point:
-//   · NOT `repElemKey`. The ref-list layer FOLDS every shared-wrapper leaf list
-//     into one token (`i32[]`, `boolean[]`, litunion `K[]` → `$rlI32L`), because
-//     those elements ride one wrapper. The mv table does NOT: each leaf-list
-//     value spelling interns its OWN row (its `mvValName`, `mvValKind`,
-//     `mvMapTypeIdx` are per-row; the layout dedup happens LATER and separately,
-//     at `mvTwin`/`mvCanonRepOf`). Folding here would hand a caller a row whose
-//     recorded NAME is a different spelling — so the array arms recurse
-//     structurally and the leaf folds are deliberately absent.
-//   · NOT `repCanonKey`. That EXPANDS a declared struct to its field shape, so
-//     declared twins (`type A = {v:i32}` / `type B = {v:i32}`) collapse — yet
-//     `{[string]: A}` and `{[string]: B}` are distinct mv rows with distinct
-//     `mvValStructIdx`. So: nominal slot (`repSlotOfTyDecl`) for a declared struct,
-//     structural expansion for an inline shape — exactly as `repElemKey` keys them.
-// The one FOLD it does perform mirrors `mvCanonValName`, the string surgery it
-// replaces: a litunion member of a MIXED union is STRING-repped in the box, so
-// it keys "string" (same niche guard — a PURE `K0` / `K0 | null` keeps its
-// atom-i32 render).
-//
-// Strictness is the safe direction: a key finer than the name equality makes the
-// resolver DECLINE (the caller falls through to its name scan), while a coarser
-// one would hand back another row's slot.
+// A canonical key for a `{[string]: V}` VALUE type's mv-table slot identity: equal iff two
+// value spellings intern ONE `mvValName` row. It is neither of the two keys above, and the
+// difference is the point. NOT `repElemKey`, which FOLDS every shared-wrapper leaf list
+// into one token because those elements ride one wrapper — the mv table does not, each leaf
+// list value interning its OWN row, and folding here would hand a caller a row whose
+// recorded NAME is a different spelling. NOT `repCanonKey`, which EXPANDS a declared struct
+// to its field shape and so collapses declared twins, while `{[string]: A}` and
+// `{[string]: B}` are distinct mv rows: nominal slot for a declared struct, structural
+// expansion for an inline shape. Its one FOLD mirrors `mvCanonValName` — a litunion member
+// of a MIXED union is STRING-repped in the box, so it keys "string". Strictness is the safe
+// direction: a finer key makes the resolver DECLINE, a coarser one hands back another row's.
 export function repMvValKey(ty: i32): string {
   if ty < 0 { return "!" }
   let si = repMvKeyStack.length - 1
@@ -1132,73 +970,44 @@ export function mapShapeKeyI32(sh: i32): boolean {
   sh == -4 || sh == -5 || mvSlotKeyI32(sh)
 }
 
-// THE D1 HAZARD, RESTATED FOR THE MEMO. The note below says both sides compute the key at QUERY
-// time from the recorded arena INDEX, never a key frozen at intern time, so an in-place arena
-// mutation moves both together. That is still true of the WALK and no longer the whole story of
-// the CACHE: `repMvValId` banks a depth-0 answer per arena index, so between generation bumps the
-// answer IS frozen. What discharges D1 is the generation triple it syncs on — `tyMutEpoch`,
-// `cUserTypesVer`, `sNames.length` — and every in-place arena patch bumps `tyMutEpoch`. The
-// precedent is already shipped and looser: `mvValCanonId` carries the same "computed at QUERY
-// time" language over `repCanonId`, which memoises on `tyMutEpoch` ALONE.
-//
-// The KEY-paired form. A slot's identity is (key rep, value type) — the map struct's
-// `keys` field differs between the two reps — so the scan must agree on BOTH halves or
-// a `{[i32]: S}` would resolve its `{[string]: S}` twin's struct (a string-ref keys list
-// read as an i32 list: invalid wasm that `vl check` cannot see).
-//
-// …AND IT NO LONGER EXISTS UN-HINTED (D93). Every caller of the two-argument form held the
-// map value's ARENA TYPE and passed `MV_ARM_NOHINT` anyway, so each one matched a slot of
-// any arm parity and landed on the first slot of that structural key — which is a coin
-// flip between an arm and its layout twin, decided by declaration order. The hint they
-// were missing is a pure function of the argument they already had, so the form is gone
-// rather than deprecated: `emit_classify.mvSlotOfValTyK` is the one typed-find entry and
-// it derives the hint itself. `mvSlotOfTyKArm` below stays for the callers that genuinely
-// hold a caller-supplied tri-state.
+// THE D1 HAZARD, RESTATED FOR THE MEMO. Both sides compute the key at QUERY time from the
+// recorded arena INDEX, never a key frozen at intern time, so an in-place arena mutation
+// moves both together. That is still true of the WALK and no longer the whole story of the
+// CACHE: `repMvValId` banks a depth-0 answer per arena index, so between generation bumps
+// the answer IS frozen. What discharges D1 is the generation triple it syncs on —
+// `tyMutEpoch`, `cUserTypesVer`, `sNames.length` — and every in-place arena patch bumps
+// `tyMutEpoch`. THE KEY-PAIRED FORM: a slot's identity is (key rep, value type), since the
+// map struct's `keys` field differs between the two reps, so the scan must agree on BOTH
+// halves or a `{[i32]: S}` would resolve its `{[string]: S}` twin's struct — invalid wasm
+// `vl check` cannot see. The UN-HINTED two-argument form is gone rather than deprecated
+// (D93): its callers all held the value's arena type, so the hint they were missing was a
+// pure function of an argument they already had. `mvSlotOfTyKArm` below keeps the tri-state.
 
 // ── THE ARM: THE THIRD COMPONENT OF AN mv SLOT'S IDENTITY (D48) ──────────────
-// The pair (key rep, value type) is not the whole of a slot's identity, for the same
-// reason the KEY had to be added to it: `{[string]: Circle}` where `Circle` is a
-// declared union ARM and `{[string]: Dot}` over its exact layout twin are two DIFFERENT
-// vals element heaps — `uVarHeap[Circle]` and `$Dot`, in two tables that never merge
-// (`DECISIONS.md`: the variant⇄struct-TABLE seam stays nominal) — and they agree on both
-// existing components. Every name the mv layer holds is a RENDER (`tyToEmitName` spells
-// a declared arm `{r:i32}`) and re-resolving it mints one shared anonymous arena index,
-// so the value-TYPE component cannot see the difference either. The arm is the component
-// that can, and #1947 already banks it per slot (`mvValVariantIdx`, `variantRowOfTy` —
-// nominal by construction, no structural rung).
-//
-// THREE STATES, AND THE THIRD IS THE WHOLE REASON THIS IS NOT #1948's REFUTED CANDIDATE.
-// That one asked arm PARITY of two slots; a find has only ONE slot and a caller, and the
-// caller falls into three cases, not two:
-//
-//   `MV_ARM_NOHINT` (-2)  the caller holds no type — it must match a slot of ANY parity,
-//                         which is today's behaviour byte for byte. Every un-hinted
-//                         entry point passes this, so nothing they resolve moves.
-//   -1                    the caller's type IS resolved and is NOT an arm — it must match
-//                         only a non-arm slot. This is the state a two-value parity has
-//                         no room for, and it is the one that stops the TWIN's mint from
-//                         finding the arm's slot.
-//   >= 0                  the caller's type is that arm — match only that arm's slot.
-//
-// A hint is a FILTER on the existing rungs and never a new match: a slot rejected here is
-// one the caller would have taken by structure alone, so the ladder below it (the name
-// rung, then the mint) runs exactly as it does today.
+// The pair (key rep, value type) is not the whole of a slot's identity, for the same reason
+// the KEY had to be added: `{[string]: Circle}` where `Circle` is a declared union ARM and
+// `{[string]: Dot}` over its exact layout twin have DIFFERENT vals element heaps, in two
+// tables that never merge (`DECISIONS.md`: the variant-to-struct TABLE seam stays nominal),
+// yet agree on both existing components. Every name the mv layer holds is a RENDER, and
+// re-resolving it mints one shared anonymous arena index, so the value-TYPE component
+// cannot see the difference either; the arm can, and is banked per slot
+// (`mvValVariantIdx`, nominal by construction). THREE states, not a parity: `MV_ARM_NOHINT`
+// matches any parity (today's behaviour byte for byte), -1 matches only a NON-arm slot —
+// the state that stops a twin's mint finding the arm's slot — and `>= 0` only that arm's.
+// A hint FILTERS the existing rungs and never adds a match, so the ladder below is intact.
 export function mvSlotOfTyKArm(ty: i32, keyI32: boolean, armHint: i32): i32 {
   if ty < 0 { return -1 }
   // THE INTERNED ID, not a rebuilt spelling. Both sides of this comparison are ARENA
   // INDICES; master rendered each to a full structural STRING and compared the strings —
   // and did it inside the scan, so `repMvValKey` was re-run for every occupied row on every
-  // query. Measured over the corpus at the head of this programme: 94,635 calls for 1,211
-  // distinct types, 98.7% of them repeats.
+  // query, overwhelmingly on types it had already keyed.
   //
   // The id form is the same move `repCanonKey` -> `repCanonId` and `repElemKey` ->
-  // `repElemId` already made; this was the one of the three that was never converted, and
-  // the last string hash-cons key in the compiler whose two sides are both arena types.
-  // It retires the STRING memo B16 built and declined — but not memoisation as such, and the
-  // first version of this comment claimed otherwise while the change was adding `hcMvMemo` forty
-  // lines away. What the id buys is that a repeat is an i32 compare instead of a rebuilt
-  // spelling; the depth-0 memo still exists, rides `repElemMemo`'s generation triple, and is
-  // what stops the walk re-descending at all.
+  // `repElemId` already made; this was the last string hash-cons key in the compiler whose
+  // two sides are both arena types. It retires the STRING memo B16 built and declined — but
+  // not memoisation as such. What the id buys is that a repeat is an i32 compare instead of
+  // a rebuilt spelling; the depth-0 memo still exists, rides `repElemMemo`'s generation
+  // triple, and is what stops the walk re-descending at all.
   const k = repMvValId(ty)
   let i = 0
   while i < mvValTyIx.length {
@@ -1259,30 +1068,18 @@ export function tyMapKeyIsI32(ty: i32): boolean {
   false
 }
 
-// The name bridge for the mv layer (still name-keyed at its entry points):
-// resolve a map-value NAME to its arena type, then to its (key-paired) slot. -1 when
-// the name does not resolve or no row claims it — the caller keeps its name scan.
-// There is no key-blind sibling: every caller holds a map whose key it can name, and a
-// default of "string-keyed" is exactly the silent wrong answer the key column exists
-// to prevent.
+// The name bridge for the mv layer (still name-keyed at its entry points): resolve a
+// map-value NAME to its arena type, then to its (key-paired) slot. -1 when the name does
+// not resolve or no row claims it — the caller keeps its name scan. There is no key-blind
+// sibling: every caller holds a map whose key it can name, and a default of "string-keyed"
+// is exactly the silent wrong answer the key column exists to prevent.
 //
-// D-MAPNODETY MEASURED WHERE ITS CALLS COME FROM, ONE CALL SITE AT A TIME, and that
-// bucketing is the finding: of the 9,805 `resolveAnnot` reaches `fieldElemTyIxOfName`
-// makes over `tests/cases`, 6,723 arrive through THIS bridge and 5,019 of those come from
-// a caller that is holding an annotation / expression NODE — whose map type the checker
-// banked at that very node (`nodeMapValTyIx` below is the read). Two of those sites route
-// (`mapAnnShape`, `mvSlotOfMapValNameOrMonoK`) with a dual-write disagreement count of 0;
-// three do NOT, for two separate measured reasons, both recorded at their own sites:
-// `mvShapeOfValNameK` MINTS, and `letMapShapeOf`'s node type and emit spelling name
-// DIFFERENT mv slots. What is left here is the population that has only a spelling — a
-// narrowed-arm map name, a union-arm atom, a `sNames` row — plus the FALL-THROUGH the two
+// D-MAPNODETY BUCKETED THE CALLS BY SITE, and that bucketing is the finding: most of the
+// traffic arrives from a caller holding an annotation or expression NODE whose map type the
+// checker banked at that very node (`nodeMapValTyIx` below is the read), and those sites
+// route there instead. What is left here is the population that has only a spelling — a
+// narrowed-arm map name, a union-arm atom, a `sNames` row — plus the FALL-THROUGH the
 // routed sites keep for a node the checker did not cover.
-//
-// D-MVSLOTFIND RE-DERIVED THAT BUCKETING PER CALLER on the post-#1297 tree (4,677 reaches
-// through this bridge) and routed four more callers. Two of the three still-blocked rows
-// are re-measured at their own sites and are 61% of what is left; the third
-// (`ensureRefElemTy`'s map-ELEMENT arm) is blocked on COVERAGE, not disagreement — its
-// hint is present at 34 of 271 entries because most `ensureRefElem` callers pass no type.
 export function mvSlotOfValNameTyK(nm: string, keyI32: boolean): i32 {
   mvSlotOfValNameTyKArm(nm, keyI32, MV_ARM_NOHINT)
 }
@@ -1297,47 +1094,35 @@ export function mvSlotOfValNameTyKArm(
   mvSlotOfTyKArm(fieldElemTyIxOfName(nm), keyI32, armHint)
 }
 
-// The ARENA TYPE a map-value spelling denotes — the rung the bridge above sits on, and
-// the one place a caller's OWN resolution of that spelling replaces it.
+// The ARENA TYPE a map-value spelling denotes — the rung the bridge above sits on, and the
+// one place a caller's OWN resolution of that spelling replaces it.
 //
 // `rowTy >= 0` REPLACES the bridge rather than fronting it, and that is the whole
-// distinction this parameter carries (D-MVSLOTFIND). A hint that is a better ANSWER —
-// a node's map type, a narrowing's arm type — may only be tried FIRST, because where it
-// declines the name may still resolve; that is what `mapAnnShape` and `mvSlotOfMapNameTy`
-// do with theirs. A hint that is the same INPUT deletes the resolution outright: the two
-// D5 field-row callers pass the cell `record{S,U}FieldElemRow` computed by calling
-// `fieldElemTyIxOfName` on the very `…ElemName` string they pass here, one row-push
-// earlier. Measured over the corpus: 441 + 56 entries, the raw arena INDEX identical on
-// every one (not merely the slot it resolves) — which is what licenses deleting a rung
-// under a MINT, where a merely-better answer would skip the mint (D-MAPNODETY §3a).
-// -1 is "no bank" and keeps the bridge verbatim, so a padded / uncovered row self-heals.
-//
-// A BANK THAT IS THE SAME SPELLING'S OWN EARLIER RESOLUTION IS ARENA-ORDER-NEUTRAL BY
-// CONSTRUCTION, which is what distinguishes it from a hint that skips a mint.
-// `resolveAnnot` memoizes per spelling and a positive entry is never invalidated, so a
-// second ask could only return the index the first one minted: nothing is minted that was
-// not, and nothing is skipped that would have been. `repElemKeyGo`'s identity arm keys
-// `TyVar`/`TyLit`/`TyErr` by arena INDEX, so mint ORDER is load-bearing — this is the one
-// class of reuse that cannot move it.
+// distinction this parameter carries (D-MVSLOTFIND). A hint that is a better ANSWER — a
+// node's map type, a narrowing's arm type — may only be tried FIRST, because where it
+// declines the name may still resolve. A hint that is the same INPUT deletes the resolution
+// outright, and is ARENA-ORDER-NEUTRAL BY CONSTRUCTION: `resolveAnnot` memoizes per
+// spelling and a positive entry is never invalidated, so a second ask could only return the
+// index the first one minted. That is what licenses deleting a rung under a MINT, where a
+// merely-better answer would skip it — and `repElemKeyGo`'s identity arm keys `TyVar` /
+// `TyLit` / `TyErr` by arena INDEX, so mint ORDER is load-bearing. -1 keeps the bridge.
 export function mvValTyIxOfNameRow(nm: string, rowTy: i32): i32 {
   if rowTy >= 0 { return rowTy }
   fieldElemTyIxOfName(nm)
 }
 
-// The (`| null`-peeled) `TyMap` arena index an annotation / expression NODE denotes, or
-// -1 — the NODE-side entry to the same `tyMapValOf` / `tyMapKeyIsI32` pair the sidecar
-// legs (`rlElemMapValMvSlotAt`, `mvValInnerMvSlotAt`) read off their own columns.
+// The (`| null`-peeled) `TyMap` arena index an annotation / expression NODE denotes, or -1
+// — the NODE-side entry to the same `tyMapValOf` / `tyMapKeyIsI32` pair the sidecar legs
+// (`rlElemMapValMvSlotAt`, `mvValInnerMvSlotAt`) read off their own columns.
 //
-// One `| null` wrapper is tolerated, exactly as `typecheck.nodeTyMapKeyIsI32` tolerates
-// it and exactly as deep as the name side's `nulMapInnerName` strips, so a
-// `{[K]: V} | null` annotation resolves the map its non-null twin does.
+// One `| null` wrapper is tolerated, exactly as `typecheck.nodeTyMapKeyIsI32` tolerates it
+// and exactly as deep as the name side's `nulMapInnerName` strips, so a `{[K]: V} | null`
+// annotation resolves the map its non-null twin does.
 //
 // -1 IS THE DECLINE AND IT IS LOAD-BEARING: an interior `TypeRef` (a map spelled inside a
-// union member's struct field, or inside an `is` pattern) carries no `nodeTyIx` — the
-// coverage gap D-BAREMAP measured at 2 live nodes and named its witness for
-// (`tests/cases/maps/map-value-union-struct-map-field.vl`). Every consumer therefore keeps
-// its name leg BELOW this one and reaches it unchanged on a decline; measured over the
-// corpus, `mapAnnShape` declines on 33 of 2,083 entries and takes the name path there.
+// union member's struct field, or inside an `is` pattern) carries no `nodeTyIx` — coverage
+// gap D-BAREMAP, witnessed by `tests/cases/maps/map-value-union-struct-map-field.vl`. Every
+// consumer therefore keeps its name leg BELOW this one and reaches it on a decline.
 export function nodeMapTyIx(nodeIx: i32): i32 {
   const ty = nodeTyIxOf(nodeIx)
   if ty < 0 { return -1 }
@@ -1359,49 +1144,18 @@ export function nodeMapValTyIx(nodeIx: i32): i32 {
   tyMapValOf(nodeMapTyIx(nodeIx))
 }
 
-// The interned STRUCT-table slot for an object type `ty`, derived from the arena
-// alone, or -1 when none is claimed (the consumer keeps its nominal path).
-//
-// The struct table is keyed NOMINALLY: a declared `type A = {v:i32}` and a
-// declared `type B = {v:i32}` occupy DISTINCT slots even though their structure —
-// hence `repCanonKey` — is identical, and the emitter deliberately keeps them
-// apart (a `B`-typed value resolves its OWN slot). So the canonical key alone
-// cannot reproduce nominal slot identity; the checker's MEMOIZED arena index does
-// (`cUserTypes` mints one index per declared alias, so `A` and `B` differ THERE).
-// This resolver therefore:
-//   · returns a slot on an EXACT arena-index match against a declared slot's
-//     memoized type (nominal identity — `A`↦A, `B`↦B); else
-//   · returns the UNIQUE declared slot whose structural key matches (the
-//     structural→nominal bridge for an inline shape with exactly one declared
-//     twin); else -1 when zero or MANY declared slots match (an inline shape with
-//     structural twins is left to the nominal path — never collapsed).
-// Only DECLARED-struct slots (`cUserTypes[name] >= 0`) participate; inline-shape
-// slots stay -1 in this layer. Cycle-safe via `repCanonKey`.
-// The resolver's scan, CACHED (generation-stamped like the key memo above —
-// the scan was the hot half of the ~47%: every query re-walked ALL of `sNames`
-// re-rendering each declared key). One build pass over the declared-struct
-// slots produces
-//   · `repSlotByDecl[di]` — the FIRST slot whose `cUserTypes` arena index is
-//     `di` (the loop's nominal early-return, exact-match-wins order preserved:
-//     the scan only early-returned on the QUERIED index, which structural
-//     matches never preempt);
-//   · `repSlotKeySi[id]` / `repSlotKeyN[id]` — A matching slot per canonical
-//     key + the match COUNT (the unique-twin gate needs `n == 1`, and with
-//     exactly one match the recorded slot IS the scan's `found`).
-//
-// KEYED ON THE STRUCTURAL IDENTITY, NOT ON THE RENDERED KEY (the rep-column rewrite,
-// step 2). `repCanonId` is proven to partition exactly as `repCanonKey` does — 283,052
-// (spelling, id) pairs over the corpus and the compiler's own source with 0 false merges,
-// 0 false splits and 0 rendered-length mismatches, asserted by `repShadowSweep` and
-// sabotage-checked. So this is a change of REPRESENTATION with the partition held fixed,
-// which is why it cannot move a byte and does not. Ids are dense from 0, so the two
-// string maps become two plain arrays; the rendered key is no longer built here at all.
-// Rebuilt whenever anything the scan reads can have changed: an arena mutation
-// (`tyMutEpoch` — keys), a `cUserTypes` write (`cUserTypesVer` — which arena
-// index a name resolves to, incl. `resolveAnnot` memoizing a NEW spelling
-// mid-emit), or `sNames` growth (a slot interned mid-emit; `sNames` is
-// push-only within a program, and the cross-program `sNames = []` reset always
-// rides an `initChecker` epoch advance).
+// The interned STRUCT-table slot for an object type `ty`, derived from the arena alone, or
+// -1 when none is claimed (the consumer keeps its nominal path). The struct table is keyed
+// NOMINALLY: declared `type A = {v:i32}` and `type B = {v:i32}` occupy DISTINCT slots even
+// though `repCanonKey` is identical, so the canonical key alone cannot reproduce nominal
+// slot identity while the checker's MEMOIZED arena index can. This resolver therefore takes
+// an EXACT arena-index match against a declared slot's memoized type first, else the UNIQUE
+// declared slot whose structural key matches, else -1 — zero or MANY matches are left to
+// the nominal path, never collapsed. Only DECLARED-struct slots participate; cycle-safe via
+// `repCanonKey`. The scan is CACHED (`repSlotByDecl` / `repSlotKeySi` / `repSlotKeyN`) and
+// KEYED ON THE STRUCTURAL IDENTITY, not the rendered key: `repCanonId` partitions exactly
+// as `repCanonKey` does, asserted by `repShadowSweep` and sabotage-checked, so this is a
+// change of REPRESENTATION with the partition held fixed and cannot move a byte.
 let repSlotCacheEpoch = -1
 let repSlotCacheUserVer = -1
 let repSlotCacheLen = -1
@@ -1414,6 +1168,11 @@ let repSlotKeyN: i32[] = []
 // same "smallest twin" `repStructSlotRep` already defines.
 let repSlotKeyFirst: i32[] = []
 
+// Rebuilt whenever anything the scan reads can have changed: an arena mutation
+// (`tyMutEpoch` — keys), a `cUserTypes` write (`cUserTypesVer` — which arena index a name
+// resolves to, including `resolveAnnot` memoizing a NEW spelling mid-emit), or `sNames`
+// growth (a slot interned mid-emit; `sNames` is push-only within a program, and the
+// cross-program `sNames = []` reset always rides an `initChecker` epoch advance).
 function repSlotCacheSync() {
   if (
     repSlotCacheEpoch == tyMutEpoch &&
@@ -1430,20 +1189,15 @@ function repSlotCacheSync() {
   while si < sNames.length {
     // THE ROW LAYER'S LAST NAME->TYPE RESOLUTION, RETIRED. This opened
     // `cUserTypes[sNames[si]] ?? -1`, which reads as "resolve this row's name" and decides
-    // two separate things: IS the row declared, and WHICH arena type it is. Both are
-    // banked now — declared-ness by `sRowDecl` at the mint (the name's own `cUserTypes`
-    // answer, asked once), the type by the `sTyIx` sidecar (D0).
+    // two separate things: IS the row declared, and WHICH arena type it is. Both are banked
+    // now — declared-ness by `sRowDecl` at the mint (the name's own `cUserTypes` answer,
+    // asked once), the type by the `sTyIx` sidecar — and the swap was graded exact on both
+    // halves, against the resolution it replaces, before it was taken.
     //
-    // EXACT ON BOTH HALVES, measured before the swap. Declared-ness: **602 agree / 0
-    // disagree** over 2,185 corpus rows. Type: of the same rows the two agree on **602**,
-    // **0 differ**, and **0** resolve by NAME where the sidecar is empty.
-    //
-    // THE COLUMN MUST BE RESET WITH `sNames`, and that is not decoration — the first
-    // version of it omitted the reset and disagreed on 8 cells, which I then explained by
-    // inventing a mechanism ("the answer moves after the mint") that a direct probe
-    // refuted: `cUserTypes["AB"]` reads 31 at the mint and 31 at the cache. The bug was
-    // mine; the design was fine. Same hazard `structNameIxReset` and `structTyIxReset`
-    // carry, and the same fix.
+    // THE COLUMN MUST BE RESET WITH `sNames`, and that is not decoration: the first version
+    // omitted the reset and disagreed, and the mechanism I invented to explain it ("the
+    // answer moves after the mint") was refuted by a direct probe — the bug was the missing
+    // reset. Same hazard `structNameIxReset` and `structTyIxReset` carry, and the same fix.
     let di = -1
     if si < sRowDecl.length {
       if sRowDecl[si] == 1 {
@@ -1509,35 +1263,18 @@ export function repSlotOfTy(ty: i32): i32 {
   const key = repCanonId(ty)
   if key < 0 || key >= repSlotKeyN.length { return -1 }
   if repSlotKeyN[key] == 1 { return repSlotKeySi[key] }
-  // A UNIQUE HEAP TYPE, WHICH IS A WEAKER QUESTION THAN A UNIQUE ROW — and the
-  // difference is the whole of silent-class-inventory D100. That row is filed as D39's
-  // CHANNEL case ("`Circle` and `Dot` are two equally valid readings of `{r:i32}` and
-  // nothing at a resolver's position can separate them"), and it names the measurement
-  // that would refute it without taking it: *"`sTwin` merges exact layout twins onto ONE
-  // heap type, so if `Circle` and `Dot` are `repStructSlotsTwin` the two answers emit the
-  // same module and a 'first row wins' rule would be sound without a channel at all."*
-  //
-  // TAKEN, AND IT REFUTES THE ROW. Probed at this rung on the filed witness:
-  //
-  //   N=2 rows=Circle(0/rep0) Dot(1/rep0)[twin0=1]
-  //
-  // — both rows carry `repStructSlotRep` 0 and `repStructSlotsTwin(0,1)` is 1, so the two
-  // "claimants" are ONE WasmGC heap type and there is no answer to choose between. What
-  // declined was a uniqueness test stronger than soundness needs, not an ambiguity.
-  //
-  // THE PREDICATE IS THE CONJUNCTION THE ROW NAMED, not `structFieldCodesEq` alone:
-  // `repStructSlotsTwin` is the `slotCanonId` key AND the field-code layout guard, the
-  // shipped `sTwin` equivalence, and its own header licenses exactly this use — "queryable
-  // PAIRWISE (independent of `buildStructTwins` having run)". Against the bucket's FIRST
-  // row, which is what makes the accepted answer that row: if every member is a twin of
-  // the smallest, then `repStructSlotRep` of every member IS the smallest.
-  //
-  // GENUINE AMBIGUITY STILL DECLINES, and that is the arm this keeps rather than removes.
-  // Two rows sharing a canonical key but NOT a layout — the atom-vs-plain collision
-  // `repRowOfTyStruct` refuses to guess through — fail the guard and the bridge answers -1
-  // exactly as before. Nothing here reaches the VARIANT namespace: the caller
-  // (`paramStructIndex`) gates on `variantIndexOf(ty.tyName) < 0`, so the D63/D75 collapse
-  // this resolver's header forbids is unreachable from the widened rung too.
+  // A UNIQUE HEAP TYPE, WHICH IS A WEAKER QUESTION THAN A UNIQUE ROW — and the difference
+  // is the whole of silent-class-inventory D100. That row was filed as D39's CHANNEL case
+  // (`Circle` and `Dot` are two equally valid readings of one field set), naming a
+  // refutation it did not take: if the claimants are `repStructSlotsTwin` they are ONE
+  // WasmGC heap type, so both answers emit the same module and "first row wins" is sound
+  // with no channel at all. Probed at this rung on the filed witness, they are — what
+  // declined was a uniqueness test stronger than soundness needs, not an ambiguity. THE
+  // PREDICATE IS THE CONJUNCTION THE ROW NAMED, not `structFieldCodesEq` alone, taken
+  // against the bucket's FIRST row: if every member is a twin of the smallest, then
+  // `repStructSlotRep` of every member IS the smallest. GENUINE AMBIGUITY STILL DECLINES —
+  // two rows sharing a canonical key but NOT a layout fail the guard and answer -1 — and
+  // the caller gates on `variantIndexOf`, so the D63/D75 variant collapse stays unreachable.
   const fst = repSlotKeyFirst[key]
   if fst < 0 { return -1 }
   let si2 = 0
@@ -1559,32 +1296,17 @@ export function repSlotOfTy(ty: i32): i32 {
 }
 
 // ── STRUCTURAL IDENTITY, HASH-CONSED — the rep key without a spelling ─────────
-// (band 1, the terminal item's first step)
-//
-// `repCanonKey` / `repElemKey` RENDER a structural string from an arena type, and every
-// consumer uses it for ONE thing: equality. So the string is a REPRESENTATION of a
-// structural identity, not the identity itself — which is the thesis's second half
-// ("stop BUILDING strings to represent types") in its purest instance.
-//
-// These build the identity directly. Every node interns `(tag, args…)` into a hash-consed
-// table and returns its INDEX, so two structurally-equal types get the same i32 and no
-// type spelling is ever composed. The recursion mirrors the string builders ARM FOR ARM —
-// same mix-widening, same de Bruijn back-edge, same sentinels, same order — because the
-// partition must be IDENTICAL, not merely similar.
-//
-// `hcLen` carries what the string builder's answer WOULD be, in characters. It is not
-// decoration and it is not a debug aid: it reproduces the runaway cap exactly (a key past
-// 262,144 characters collapses to an arena-index sentinel that can only DECLINE a merge),
-// and it is a far tighter equivalence check than partition agreement — a length that
-// matches at every node says the two recursions have the same SHAPE, which two different
-// recursions could not fake by accident.
-//
-// WIRED, IN FOUR STEPS, ALL ON THIS BRANCH — this note used to say "not yet wired to any
-// consumer, deliberately", which was true of the commit that added the identity and of
-// nothing since. `repSlotKeySi` / `repSlotKeyN` key on it (step 2), then `slotCanonId` and
-// the ref-list element column (step 3), then `repNameCanonId` / `mvValCanonId` (step 4).
-// After those, `repCanonKey` / `repElemKey` are reached from four call sites, all inside
-// the shadow harness — so on a real compile no rep key is built as a string at all.
+// `repCanonKey` / `repElemKey` RENDER a structural string from an arena type and every
+// consumer uses it for ONE thing: equality, so the string REPRESENTS a structural identity
+// rather than being one. These build the identity directly: every node interns
+// `(tag, args…)` into a hash-consed table and returns its INDEX, so two structurally-equal
+// types get the same i32 and no type spelling is ever composed. The recursion mirrors the
+// string builders ARM FOR ARM — same mix-widening, same de Bruijn back-edge, same
+// sentinels, same order — because the partition must be IDENTICAL, not merely similar.
+// `hcLen` carries what the string builder's answer WOULD be in characters: it reproduces
+// the runaway cap exactly and is a far tighter equivalence check than partition agreement,
+// since a length matching at every node says the two recursions have the same SHAPE. Every
+// live consumer keys on the id now; the string builders survive only in the shadow harness.
 const HC_ERRTY = 0 // the `ty < 0` key, `"!"`
 const HC_PRIM = 1
 const HC_OBJ = 2
@@ -1804,31 +1526,18 @@ function repCanonIdGo(ty: i32): i32 {
       return hcPrimId(t.primName)
     }
     TyObj => {
-      // `"{" + Σ(name + ":" + child + ",") + "}"`
-      // FIELD ORDER IS SORTED OUT OF THE KEY. The 2026-08 ruling is that
-      // `{a: i32, b: string}` and `{b: string, a: i32}` are THE SAME TYPE, and the checker
-      // already agrees — `assignable` takes one where the other is asked for. This descent
-      // walked `objFieldNames` in DECLARATION order, so the twins keyed differently, and
-      // `buildStructTwins` gates on exactly this id: `keys[j] == keys[i]` is tested BEFORE
-      // `structFieldCodesEq`, so the pair was never even compared and the two rows each
-      // allocated a heap type. `vl check --codegen` rc 0, `vl run` invalid wasm
-      // (`soundness/xfail-miscompile-permuted-struct-fields.vl`).
-      //
-      // SORTING IS SAFE BY CONSTRUCTION RATHER THAN BY MEASUREMENT, which is the only
-      // acceptable argument for touching this key: an object's field NAMES are unique, so
-      // ordering the (name-sid, child-id) pairs by sid is a BIJECTION on the field set. Two
-      // objects with the same sorted list have the same fields with the same types — they
-      // ARE the same type. Sorting can therefore merge twins and can never collide two
-      // distinct types, which is the property a hash-cons key has to keep.
-      //
-      // The sort is `shapeFieldSetIdOf`'s, in the same insertion form, on the same sid
-      // column — that function has keyed the shape-row bucket order-insensitively all along,
-      // which is why the INLINE spelling of a permuted shape has always resolved correctly
-      // (`types/permuted-inline-shape-shares-row.vl`). This is the arena key catching up.
-      //
-      // `len` is accumulated over the SORTED walk so the byte-length estimate matches the
-      // key it describes; it is a size hint for `hcIntern`, and feeding it the declaration
-      // order while the args are sorted would desynchronise the two.
+      // The key is the brace-wrapped concatenation of `name:child,` over the fields.
+      // FIELD ORDER IS SORTED OUT OF IT: `{a: i32, b: string}` and `{b: string, a: i32}`
+      // are THE SAME TYPE, and the checker already agrees — `assignable` takes one where
+      // the other is asked for. Walking `objFieldNames` in DECLARATION order keyed the
+      // twins differently, and `buildStructTwins` tests this id BEFORE `structFieldCodesEq`,
+      // so the pair was never compared and each row allocated its own heap type: check-clean
+      // invalid wasm. SORTING IS SAFE BY CONSTRUCTION rather than by measurement, the only
+      // acceptable argument for touching this key — field NAMES are unique, so ordering the
+      // (name-sid, child-id) pairs by sid is a BIJECTION on the field set, able to merge
+      // twins and never to collide two distinct types. It is `shapeFieldSetIdOf`'s sort, on
+      // the same sid column. `len` accumulates over the SORTED walk, so `hcIntern`'s size
+      // hint describes the key it is actually given.
       const sortedSid: i32[] = []
       const sortedIx: i32[] = []
       let si2 = 0
@@ -2202,25 +1911,17 @@ function repElemIdGo(ty: i32, mv: boolean): i32 {
 }
 
 // ── Structural heap-type dedup (roadmap Next#1, the slot layer) ───────────────
-// The canonical structural key for struct slot `si`, or "" when `si` does not
-// participate in dedup. A DECLARED struct (a `cUserTypes` arena index whose type
-// is a `TyObj`) keys on its memoized arena index; an INLINE-SHAPE slot (interned
-// under its annotation spelling, `{v:i32}`) resolves that spelling through the
-// checker's name grammar (`resolveAnnot`) to the same key vocabulary. (Shape
-// slots MOSTLY dedup at intern time — `annShapeIndexOf` — but a FIELD shape
-// interned by `collectNestedFieldShapes` lands BEFORE the declared structs, so a
-// declared twin still minted a duplicate heap type: `type A={v:i32}` flowing
-// into a `{inner:{v:i32}}` field was invalid wasm. Keying shape slots here
-// collapses that duplicate.) The key is `repCanonKey`: two structurally-identical
-// slots (including recursive twins `type L1={n:L1|null}` / `type L2={n:L2|null}`,
-// canonicalized by the de Bruijn back-edge) render the SAME key; distinct
-// structures never collide. Any other slot (an anonymous-literal `#anon` shape,
-// an unresolvable spelling) stays "" — never merged.
-//
-// A14 FORWARD-COMPAT SEAM: a future nominal/opaque type OPTS OUT of dedup by
-// making its `repCanonKey` unique (injecting its nominal identity into the key at
-// the `repCanonKeyGo` construction point above) — its slot then matches no twin
-// and keeps a private heap type. Nothing here needs to change for that.
+// The canonical structural key for struct slot `si`, or "" when `si` does not participate
+// in dedup. A DECLARED struct keys on its memoized arena index; an INLINE-SHAPE slot
+// (interned under its annotation spelling) resolves that spelling through the checker's
+// name grammar to the same key vocabulary. Shape slots mostly dedup at intern time, but a
+// FIELD shape interned by `collectNestedFieldShapes` lands BEFORE the declared structs, so
+// a declared twin still minted a duplicate heap type — invalid wasm; keying shape slots
+// here collapses it. The key is `repCanonKey`: structurally identical slots (recursive
+// twins included, canonicalized by the de Bruijn back-edge) render the SAME key and
+// distinct structures never collide; anything else stays "" and is never merged. A14
+// FORWARD-COMPAT SEAM: a future nominal/opaque type opts OUT by injecting its nominal
+// identity into `repCanonKeyGo`'s key, so its slot matches no twin — nothing here changes.
 const repNoTyparams: string[] = []
 
 // The arena type index a struct-row NAME denotes, or -1 — the resolution
@@ -2241,52 +1942,38 @@ export function sTyIxOfNameTy(nm: string, tyIx: i32): i32 {
   if tyIx >= 0 { return tyIx }
   const di = cUserTypes[nm] ?? -1
   if di >= 0 { return di }
-  // The inline-shape fallback: only a bare `{...}` spelling (not a map `{[`)
-  // resolves. This runs at INTERN time inside `collectS`'s row-minting loop and
-  // `resolveAnnot` mints arena types per call — the #961 runaway shape — so the
-  // cost was MEASURED, not assumed: self-compile 11.8s with this fallback vs 13.2s
-  // without (noise — the annotation-name memo #961 added is doing its job). A name
-  // that resolves through neither path stays -1 and `slotCanonId` falls through to
-  // its existing name behaviour.
+  // The inline-shape fallback: only a bare `{...}` spelling (not a map `{[`) resolves.
+  // This runs at INTERN time inside `collectS`'s row-minting loop and `resolveAnnot` mints
+  // arena types per call — the #961 runaway shape — so the cost was checked rather than
+  // assumed, and came out in the noise: the annotation-name memo is doing its job. A name
+  // that resolves through neither path stays -1 and `slotCanonId` falls through to its
+  // existing name behaviour.
   if nameIsShapeSpanEnds(nm) { return resolveAnnot(nm, repNoTyparams) }
   // The GENERIC-APPLICATION fallback (`Box<i32>`), the same rung one spelling wider.
   // `gaeEnsure` mints a row for every concrete application it interns and records the
   // sidecar THROUGH THIS FUNCTION, and until here the ladder had no arm for a `Head<…>`
-  // spelling at all: `cUserTypes` holds the generic BASE (`Box`), never an application,
-  // and the shape test above wants a leading `{`. So every application row banked -1 and
-  // `slotCanonId` returned -1 for it — the "never merged" degenerate — which
-  // `buildStructTwins` tests FIRST (`keys[i] >= 0`), so an application was never compared
-  // against ANY row. A layout twin of a declared struct (`type Box<T> = {v: T}` at
-  // `Box<i32>` beside `type IBox = {v: i32}`) therefore got its own heap type and the
-  // assignment was check-clean INVALID WASM (`generics/genapp-instance-twins-declared.vl`).
-  //
-  // SAFE BY CONSTRUCTION, the standard this key is held to: `resolveAnnot` IS the
-  // resolution the checker performed at every annotation spelled `Box<i32>`, so the
-  // recorded index is the type the row's name denotes — the sidecar's stated contract —
-  // not a new equivalence. Nothing is merged by this arm; it only stops declining to
-  // answer, and `buildStructTwins`' second gate (`structFieldCodesEq`, positional) still
-  // has to agree before two rows share a heap type. An application whose argument is an
-  // unbound type parameter never reaches a row at all (`gaeEnsure` returns before the
-  // mint on `gaeArgIsTyParam`), and an unresolvable spelling still answers -1.
+  // spelling at all: `cUserTypes` holds the generic BASE, never an application, and the
+  // shape test above wants a leading `{`. So every application row banked -1, which
+  // `buildStructTwins` tests FIRST, so an application was never compared against ANY row
+  // and a layout twin of a declared struct got its own heap type — check-clean INVALID
+  // WASM. SAFE BY CONSTRUCTION: `resolveAnnot` IS the resolution the checker performed at
+  // every annotation spelled `Box<i32>`, so the recorded index is the type the row's name
+  // denotes, not a new equivalence. Nothing is merged by this arm; `buildStructTwins`'
+  // second gate (`structFieldCodesEq`, positional) still has to agree before two rows
+  // share a heap type, and an unresolvable spelling still answers -1.
   if annGenAppSpanEnds(nm) { return resolveAnnot(nm, repNoTyparams) }
   -1
 }
 
-// Record `v` as the arena type index of the struct row JUST pushed onto `sNames`
-// (phase D0). Pads with -1 so a mint site that does not call this self-heals to
-// "uncovered" — `slotCanonId` then falls through to the legacy name path rather
-// than reading a mis-aligned entry.
-// (The header below belongs to `recordSTyIx`, which follows this function.)
-//
 // Whether the struct row JUST pushed came from a DECLARED type name, decided from its own
 // spelling at the MINT — the one moment it is in scope. Pads with 0 so a mint site that
 // does not call this reads "not declared", the conservative answer.
 //
 // THIS IS `cUserTypes` MEMBERSHIP, WHICH INCLUDES UNION DECLARATIONS. It is the right
-// predicate for `repSlotCacheSync` ("is this row's name a declared TYPE" — measured 602/0
-// there) and the WRONG one for `structIdxOfElemName`, which needs "is it a declared
-// STRUCT" and must keep `nameIsStructDecl`. See the note at that gate: a swap was tried,
-// and a struct-alias union opened it.
+// predicate for `repSlotCacheSync` ("is this row's name a declared TYPE") and the WRONG
+// one for `structIdxOfElemName`, which needs "is it a declared STRUCT" and must keep
+// `nameIsStructDecl`. See the note at that gate: a swap was tried, and a struct-alias
+// union opened it.
 export function recordSRowDeclOfName(nm: string) {
   let v = 0
   if cUserTypes.has(nm) { v = 1 }
@@ -2295,6 +1982,9 @@ export function recordSRowDeclOfName(nm: string) {
   0
 }
 
+// Record `v` as the arena type index of the struct row JUST pushed onto `sNames`. Pads
+// with -1 so a mint site that does not call this self-heals to "uncovered" — `slotCanonId`
+// then falls through to the legacy name path rather than reading a mis-aligned entry.
 export function recordSTyIx(v: i32) {
   while sTyIx.length + 1 < sNames.length { sTyIx.push(-1) }
   sTyIx.push(v)
@@ -2320,51 +2010,18 @@ export function fieldElemTyIxOfName(nm: string): i32 {
   declTyIxOfName(nm)
 }
 
-// The emit side's NAME → ARENA-TYPE bridge, and the one home for its three rungs:
-// the DECLARED-name table answers a nominal spelling directly, the PRIMITIVE leaf
-// answers a bare keyword, and ONLY a spelling neither carries reaches the annotation
-// grammar. Guard-free by design — each caller keeps its own empty-name and runaway-cap
-// policy above this call, because those policies differ (-1 · "" · -2) and one of them
-// caps a spelling this function never sees (`repRowOfName` caps the raw name and
-// resolves the RENDER).
-//
-// **THE RUNGS ARE PARSE ELIMINATORS, NOT CACHES.** `resolveAnnot` memoizes per
-// spelling, so a repeat query is already a map lookup either way; what a rung removes
-// is the FIRST resolution of a spelling — the one call that actually reads the
-// annotation grammar. Measured over the corpus, rung 1 is 219 of `repNameCanonId`'s
-// 228 annotation-grammar reads and 12 of `repRowOfName`'s 180; rung 2 is 803 of
-// `unMemAtomTyIx`'s 1,229 and 151 more across this function's other callers.
-//
-// **RUNG 2 IS ARENA-NEUTRAL, WHICH IS WHY IT CANNOT RENUMBER ANYTHING.** Skipping a
-// parse that MINTS shifts every later arena index; the 803 union-member parses it
-// takes mint nothing — measured, `T.tys.length` unchanged across all 803 — because
-// the seeded primitive already exists before the first annotation resolves. The
-// spellings are exactly the closed leaf vocabulary: `string` 259 · `i32` 152 ·
-// `null` 125 · `i64` 87 · `f64` 82 · `boolean` 76 · `f32` 22.
-//
-// **IT IS NOT SOUND EVERYWHERE, AND THE PLACE IT IS NOT IS `repElemIdOfNameTy`.**
-// A `new` NEWTYPE over a struct has TWO LIVE ARENA INDICES OVER ONE `Ty`: pass 0a
-// registers the BASE in `cUserTypes`, and the annotation grammar bottoms out at
-// `declaredTyOfName`, which returns `nwBrand(name, base)` — a second `addTy` of that
-// same `Ty` value, carrying the nominal identity the brand exists to give. NEITHER IS
-// STALE: `nwBrand` memoizes on (name, base), so a fresh resolution returns the same
-// brand a memoized one does. But only the BASE owns an `sNames` row, so `repElemKey`
-// keys it NOMINALLY (`S0`) and keys the brand STRUCTURALLY (`{base:i32,length:i32,}`)
-// — one spelling, two reps. Measured over the 1,773 corpus programs, dual-written on
-// the raw index: 0 disagreements in 294 covered `repNameCanonId` reaches and 0 in 66
-// `repRowOfName` reaches, against 28 in 1,034 here, every one of them a `new` struct
-// newtype. That site therefore keeps asking the grammar; see
-// `docs/internals/destringify-types-program.md` (D-DECLRUNG, D-NWBRANDKEY).
-//
-// **RUNG 2 IS SOUND AT EVERY CALLER, INCLUDING THAT ONE, AND FOR A REASON RUNG 1 IS
-// NOT**: its key space is the primitive keywords, none of which a declaration can be
-// spelled with, so the brand skew has nothing to bite on. Dual-written against the
-// ladder's own answer on the RAW arena index — the tightest tolerance there is, since
-// equal indices make every consumer projection equal — over the corpus: **0 disagreements
-// in 1,481 covered `unMemAtomTyIx` reaches and 2,447 covered reaches here**, on the
-// memo-HIT path as well as the parse path. `repElemIdOfNameTy` is measured too and
-// its coverage is **0 of 3,660** — a ref-list element is never spelled as a bare
-// primitive — so the rung is not offered there.
+// The emit side's NAME → ARENA-TYPE bridge, and the one home for its three rungs: the
+// DECLARED-name table answers a nominal spelling directly, the PRIMITIVE leaf answers a
+// bare keyword, and ONLY a spelling neither carries reaches the annotation grammar.
+// Guard-free by design — each caller keeps its own empty-name and runaway-cap policy above
+// this call, because those policies differ (-1 · "" · -2). THE RUNGS ARE PARSE ELIMINATORS,
+// NOT CACHES: `resolveAnnot` memoizes per spelling, so what a rung removes is the FIRST
+// resolution of a spelling, the one call that actually reads the grammar. Rung 2 is
+// ARENA-NEUTRAL and so can renumber nothing — the primitive it answers with is seeded
+// before any annotation resolves. Rung 1 is NOT sound at `repElemIdOfNameTy`: a `new`
+// NEWTYPE has two live arena indices over one `Ty` (base and `nwBrand`), only the base owns
+// an `sNames` row, so one spelling gets two reps there and that site keeps asking the
+// grammar. See `docs/internals/destringify-types-program.md` (D-DECLRUNG, D-NWBRANDKEY).
 export function declTyIxOfName(nm: string): i32 {
   const di = cUserTypes[nm] ?? -1
   if di >= 0 { return di }
@@ -2501,32 +2158,17 @@ function unMemKindOf(atom: string, ty: i32): i32 {
 }
 
 // ── D-UNION ATOM-KIND — the member's value-atom kind, banked at the recorder ──
-// `valueAtomKind(atom)` is the union box ABI's 14-way code (i32 · boolean · string ·
-// i64 · f64 · f32 · null · six scalar-element list flavours, the packed `u8[]` being the
-// sixth · closure, and -1 for "not a value atom"). Three emitter decisions are pure
-// projections of it — the box
-// TAG (`scalarTagOf` = `uVariants.length + kind`), the scalar VALUE-BOX heap index
-// (`vbHeapIdxOfKind`) and the list WRAPPER heap index — and every one of them was
-// reached by PARSING the member's rendered spelling, once per decision.
-//
-// `recordUnMemTys` already holds each member's atom TEXT while it walks the set (it
-// is the one place a member set is ever split — the intern side, where this program
-// has always said a parse belongs), so it banks the code here, in lock-step with the
-// other member columns. A consumer that can name the member by (row, index) — or by
-// a SET of the row's members — then reads the code instead of re-deriving it.
-//
-// **EXACT, never a fold** (#1095). The banked value is the very `valueAtomKind(atom)`
-// result the consumers computed, not a re-classification: `unMemKinds`' 5-way
-// null/nominal/scalar/composite/unresolved split cannot produce an ABI code, and a
-// folding predicate would hand `scalarTagOf` a tag NO producer interned — a runtime
-// `ref.cast` trap, not a loud reject.
-//
-// LIFETIME (method note 7). The column is index-parallel to `unMemAtoms`, which the
-// top of `emitProgram` and `collectU` clear without knowing this column exists. The
-// lock-step guard in `recordUnMemTys` re-empties it the moment the two lengths
-// disagree, and `unMemValKindAt` answers UNCOVERED while they do — so a previous
-// program's kind can never be read as this one's. -2 is the uncovered sentinel
-// because -1 is a real kind.
+// `valueAtomKind(atom)` is the union box ABI's 14-way code (i32 · boolean · string · i64 ·
+// f64 · f32 · null · six scalar-element list flavours, the packed `u8[]` being the sixth ·
+// closure, and -1 for "not a value atom"). The box TAG (`scalarTagOf`), the scalar
+// VALUE-BOX heap index (`vbHeapIdxOfKind`) and the list WRAPPER heap index are pure
+// projections of it, each of which used to re-PARSE the member's rendered spelling.
+// `recordUnMemTys` already holds each member's atom TEXT while it walks the set — the one
+// place a member set is ever split — so it banks the code there instead. EXACT, never a
+// fold: a folding predicate would hand `scalarTagOf` a tag NO producer interned, a runtime
+// `ref.cast` trap rather than a loud reject. LIFETIME: the column is index-parallel to
+// `unMemAtoms`, which `emitProgram` and `collectU` clear without knowing it exists, so the
+// lock-step guard re-empties it and `unMemValKindAt` answers -2 (uncovered; -1 is a kind).
 export let unMemValKind: i32[] = []
 
 // The banked value-atom kind of recorded member `m`, or -2 when the bank does not
@@ -2605,35 +2247,18 @@ export function msMemberValKindsOf(s: i32, out: i32[]): boolean {
   true
 }
 
-// MEMBERSHIP of a SCALAR value atom, by its ABI KIND — `msHasNull`'s generalization
-// from the `null` keyword to the whole scalar keyword row, answered from the banked
-// kind column with no spelling anywhere. 1 present · 0 absent · -1 uncovered (the
-// caller keeps its name-keyed `unionHasAtomTy` path).
-//
-// D-VALKIND. `unionHasAtomTy(name, kw, false)` asks "has this union a member whose ARENA
-// type is exactly `TyPrim(kw)`" of a NAME — resolving the row through `unionRowOf` (linear
-// whole-string scans of `unNames` then `unMemberSet`) and materializing every member type —
-// where its callers already hold the set id (`msSetOfText`, once at the top of the lowering)
-// and, at four of them, the KIND itself (`eak` / `lak` / the coerce ladder's `cak` are the
-// very codes `valueAtomKind(kw)` returns). Here the keyword is only the decline argument.
-//
-// **Restricted to kinds 0-6 BY CONSTRUCTION.** `unMemHasAtom` is deliberately EXACT (a
-// `TyPrim` spelled exactly `want` — see its header), and only across the seven scalar
-// keywords is the kind map a bijection: `valueAtomKind` answers 0 for `i32` and for
-// nothing else, 2 for `string`, … 6 for `null`. Kind 7 folds `i32[]` / `boolean[]` /
-// litunion-`K[]` into ONE code — precisely the fold `unMemHasAtom`'s header forbids —
-// and every list member's arena type is a `TyArray`, so the primitive test answers NO
-// for a list spelling where a kind test would answer YES. The -1 makes that structural
-// rather than a convention a caller has to remember.
-//
-// **The ALIAS arm is the reason a 0 here can be believed** (a divergence a probe
-// found, not a hypothetical): a member spelled `MyInt` under `type MyInt = i32`
-// resolves — through `cUserTypes`, in `unMemAtomTyIx` — to the arena's `TyPrim("i32")`,
-// so `unMemHasAtom(…, "i32")` answers YES, while `valueAtomKind("MyInt")` is -1 and the
-// kind column would answer NO. The bank cannot see through an alias, so a set holding
-// ANY member the kind column does not classify but whose RECORDED ARENA TYPE is a
-// primitive is declared UNCOVERED and the caller keeps the name path. That test costs
-// one arena read per unclassified member and reads nothing textual.
+// MEMBERSHIP of a SCALAR value atom, by its ABI KIND — `msHasNull`'s generalization from
+// the `null` keyword to the whole scalar keyword row, answered from the banked kind column
+// with no spelling anywhere. 1 present · 0 absent · -1 uncovered (the caller keeps its
+// name-keyed `unionHasAtomTy` path). D-VALKIND: the same question, asked of the BANK — its
+// callers already hold the set id and usually the KIND, so the keyword is only the decline
+// argument. RESTRICTED TO KINDS 0-6 BY CONSTRUCTION: only across the seven scalar keywords
+// is the kind map a bijection, while kind 7 folds `i32[]` / `boolean[]` / litunion-`K[]`
+// into ONE code and every list member's arena type is a `TyArray`, so an EXACT `TyPrim`
+// test would answer NO where a kind test answers YES. The ALIAS arm is why a 0 here can be
+// believed: a member spelled `MyInt` under `type MyInt = i32` resolves to `TyPrim("i32")`
+// while `valueAtomKind("MyInt")` is -1, so a set holding ANY member the kind column cannot
+// classify but whose RECORDED ARENA TYPE is primitive is declared UNCOVERED.
 export function msHasValKind(s: i32, k: i32): i32 {
   if k < 0 || k > 6 { return -1 }
   if s < 0 || s >= msSetRow.length { return -1 }
@@ -2666,26 +2291,18 @@ export function msHasValKind(s: i32, k: i32): i32 {
   hit
 }
 
-// IS the interned member set `s` a VALUE union — one this emitter boxes into the
-// shared `{tag, payload}` rep? Tri-state: 1 yes · 0 no · -1 the pool or the kind bank
-// does not cover `s`, and the caller keeps its member-NAME path.
+// IS the interned member set `s` a VALUE union — one this emitter boxes into the shared
+// `{tag, payload}` rep? Tri-state: 1 yes · 0 no · -1 the pool or the kind bank does not
+// cover `s`, and the caller keeps its member-NAME path.
 //
 // D-VALUNION: `isValueUnionName`'s question asked of the BANK instead of of a rendering.
-// That resolver takes a union SPELLING apart three ways — `unionMemberCount` (a whole-string
-// all-grouper depth scan), then `splitUnionAtoms` (the same scan again, materializing every
-// atom), then `valueAtomKind` per atom — to reach an answer that reads nothing but ABI codes
-// already recorded, one per member, in the row's box-tag ABI order, by `recordUnMemTys`
-// (`unMemValKind`).
-//
-// **EXACT, not an approximation.** `msSetOfText(text) == s` hands back a set only when `text`
-// IS that set's members joined in recorded order, and those members were split from exactly
-// such a string once, at registration — the contract `msMemberAtomsOf` already runs on in
-// production. So `msMemberValKindsOf(s)` is `[valueAtomKind(a) for a in splitUnionAtoms(text)]`
-// member for member; and `unionMemberCount` is `splitUnionAtoms`' own counting dual (same
-// scanner, same arms, separators counted instead of materialized), so the cardinality gate
-// matches too. The predicate below is `isValueUnionName`'s body with the derivation replaced by
-// the column read, arm for arm — including its short-circuit on a member that is not a value
-// atom at all.
+// That resolver takes a union SPELLING apart three ways — `unionMemberCount`, then
+// `splitUnionAtoms` re-running the same scan and materializing every atom, then
+// `valueAtomKind` per atom — to reach an answer that reads nothing but ABI codes
+// `recordUnMemTys` already recorded per member in box-tag order (`unMemValKind`). EXACT,
+// not an approximation: `msSetOfText(text) == s` hands back a set only when `text` IS that
+// set's members joined in recorded order, so the column read is `isValueUnionName`'s body
+// arm for arm, short-circuit on a non-value-atom member included.
 export function msIsValueUnion(s: i32): i32 {
   const kinds: i32[] = []
   if !msMemberValKindsOf(s, kinds) { return -1 }
@@ -2770,18 +2387,17 @@ export function tyDenotesFunc(m: i32): boolean {
   false
 }
 
-// The interned scalar VALUE-BOX heap index for a value atom of kind `k`, or -1 when
-// the kind rides the box's `anyref` payload directly (string, the five list flavours,
-// closure) or is not a value atom at all. The kind-keyed twin of `emit_classify`'s
+// The interned scalar VALUE-BOX heap index for a value atom of kind `k`, or -1 when the
+// kind rides the box's `anyref` payload directly (string, the five list flavours, closure)
+// or is not a value atom at all. The kind-keyed twin of `emit_classify`'s
 // `vbHeapIdxOfAtom(atom)`, which delegates here over `valueAtomKind(atom)` — so the
 // kind→box table has exactly ONE home and cannot drift.
 //
 // UNMINTED IS -1, NOT 0, AND THE DIFFERENCE IS A SILENT CLASS. `vb*Idx` initialises to 0
 // and is assigned only when `mAssignTypeIndices` sees the matching `vb*Used` flag, so a
-// module whose value unions never use a rep answered **heap type 0** for it — a real type
-// in every module, and the wrong one. Every caller here already guards `< 0` and takes a
-// loud reject on it; none could distinguish "box 0" from "no box", so the guard was dead
-// for exactly the case it was written for and a `ref.cast (ref 0)` shipped instead
+// module whose value unions never use a rep answered heap type 0 for it — a real type in
+// every module, and the wrong one. Every caller guards `< 0` and takes a loud reject, but
+// none could distinguish "box 0" from "no box", so a `ref.cast (ref 0)` shipped instead
 // (silent-class-inventory D221). The flag is the mint's own condition, read back.
 export function vbHeapIdxOfKind(k: i32): i32 {
   if k == 0 || k == 1 {
@@ -2931,32 +2547,18 @@ export function recordUnMemTys(set: string) {
 // partition, proven; same two rungs and neither-rung fall-through, untouched.
 function slotCanonId(si: i32): i32 {
   if si < 0 || si >= sNames.length { return -1 }
-  // RUNG 1 — the ARENA-INDEX sidecar (`sTyIx`, recorded at every row mint in D0),
-  // consulted FIRST (destringify D-SLOTARENA). This row's type is known
-  // structurally, so there is nothing to re-derive from its name; the rung the
-  // header below has called "authoritative" since D1 now actually runs first.
-  // Covers the `#anon` literal rows (recorded from the literal's context-resolved
-  // rep type), which the name path cannot resolve at all and which previously
-  // needed a separate key-string sidecar.
-  //
-  // CONFIRM-ONLY, exactly like `nulBaseStructRow`'s arena rung: an uncovered row
-  // (-1, the pad-on-push self-heal) or a covered row whose recorded type is not a
-  // `TyObj` falls through to the name ladder below, unchanged and in its old order.
-  // The only cell where the two rungs can BOTH answer is a row that is covered AND
-  // whose name resolves — dual-write measured **0 divergences over 12,469 arena
-  // answers in 13,341 entries** (`tests/cases` + `std`), and that zero is graded:
-  // the same rung reading `sTyIx[si + 1]` diverges on **6,567** of them, first
-  // witness `row=P A={x:i32,y:i32,} L={x:i32,}` (the grading run was taken at the
-  // census base `01dfb205`, where the same probe read 12,467 / 13,339).
-  //
-  // WHAT MOVING IT BUYS is not tidiness: the name ladder's inline-shape fallback is
-  // a `resolveAnnot` RE-PARSE of a spelling whose answer this table already banked,
-  // and `slotCanonId` is the hottest of `emit_rep`'s seven `resolveAnnot` callers
-  // (`repRowOfTyStruct` and `buildStructTwins` both scan it over every row). The
-  // re-parse count over `tests/cases` falls **8,811 -> 54**, and with it 30.5% of
-  // this module's whole emit-time name-resolution traffic (28,719 -> 19,962 calls
-  // across the seven sites; the other six move by exactly zero — the control, and
-  // it holds to the unit: 4,667 · 1,060 · 9,805 · 2,083 · 624 · 1,669 on both sides).
+  // RUNG 1 — the ARENA-INDEX sidecar (`sTyIx`, recorded at every row mint), consulted
+  // FIRST (destringify D-SLOTARENA). This row's type is known structurally, so there is
+  // nothing to re-derive from its name, and it covers the `#anon` literal rows the name
+  // path cannot resolve at all. CONFIRM-ONLY, exactly like `nulBaseStructRow`'s arena
+  // rung: an uncovered row (-1, the pad-on-push self-heal) or a covered row whose
+  // recorded type is not a `TyObj` falls through to the name ladder below, unchanged and
+  // in its old order — the two rungs agree wherever both can answer, and an off-by-one
+  // read of the sidecar diverges loudly, which is what makes that agreement gradeable
+  // rather than vacuous. WHAT MOVING IT BUYS is not tidiness: the name ladder's
+  // inline-shape fallback is a `resolveAnnot` RE-PARSE of a spelling this table already
+  // banked, and `slotCanonId` is the hottest of `emit_rep`'s seven `resolveAnnot`
+  // callers, so the re-parse traffic collapses here and nowhere else.
   if si < sTyIx.length {
     const dix = sTyIx[si]
     if dix >= 0 {
@@ -2965,20 +2567,15 @@ function slotCanonId(si: i32): i32 {
     }
   }
   // RUNG 2 — the NAME ladder, for a row the sidecar does not cover: a mint site that
-  // does not call `recordSTyIx` (pad-on-push -1 / a column shorter than `sNames`), or
-  // a name that had not resolved yet when the row was interned. Unchanged, and STILL
-  // LIVE — measured, not assumed. Over `tests/cases`: rung 1 answers 12,455 · control
-  // reaches rung 2 **872** times · rung 2 returns a non-"" key **32** times · its
-  // `resolveAnnot` fires **54** times · the `TyObj` gate above declines a COVERED row
-  // **12** times. So the fall-through is not decoration and the rung is not deletable.
-  //
-  // TWO OF ITS PROPERTIES ARE NEVERTHELESS INVISIBLE TO THE CORPUS, and that is stated
-  // rather than banked as a zero: making rung 1 TOTAL wherever the column covers the
-  // row (never falling through) and dropping the `TyObj` gate each move **0 files on
-  // all six channels** (1,692 at the census base), while `sTyIx[si + 1]` moves **106**
-  // and deleting rung 1 outright moves **5** — both re-run on the shipped bytes over
-  // 1,695. The 32 answers therefore all come from rows PAST the column's end, which is
-  // the only decline the corpus can see.
+  // does not call `recordSTyIx` (pad-on-push -1 / a column shorter than `sNames`), or a
+  // name that had not resolved yet when the row was interned. Unchanged, and STILL LIVE:
+  // control reaches it and it returns a non-"" key on the corpus, so the fall-through is
+  // not decoration and the rung is not deletable. Two of its properties are nevertheless
+  // INVISIBLE to the corpus, and that is stated rather than banked as a zero — making
+  // rung 1 TOTAL wherever the column covers the row, and dropping the `TyObj` gate, each
+  // move nothing there, while an off-by-one sidecar read and deleting rung 1 outright
+  // both move files. Every answer this rung gives therefore comes from a row PAST the
+  // column's end, which is the only decline the corpus can see.
   const nm = sNames[si]
   let di = cUserTypes[nm] ?? -1
   if di < 0 {
@@ -3080,31 +2677,15 @@ const sfceStkB: i32[] = []
 // The field CODES whose emitted storage is a `(ref [null] <heap>)` the code alone does
 // NOT name — the heap comes from the field's own recorded element spelling
 // (`sFieldElemName` / the D5 `sFieldElemTyIx` sidecar), so two rows may agree on every
-// top-level code and still store DIFFERENT heap types. Every one of them needs the
-// referenced-layer descent below before its rows may share a WasmGC type.
-//
-//   15  a nested struct / nullable struct  — `(ref null $S)`
-//    5  a struct / union / closure ref LIST — `(ref $rlWrapper)` over the element heap
-//   28  the `S[] | null` niche             — `(ref null $rlWrapper)`, same element
-//
-// CODE 15 WAS THE ONLY ONE GATED, AND D64 IS WHAT THE OTHER TWO COST. `type Box =
-// {xs: Circle[]}` beside `type Box2 = {xs: Dot[]}`, with `Circle` an arm of a declared
-// union and `Dot` its exact layout twin, canon-key-match and code-match at the top
-// level; the ref-list layer keeps them APART (two slots, element heaps
-// `uVarHeap[Circle]` and `$Dot`) while this test merged the two Box rows onto one heap
-// type, so `Box2`'s `struct.new` pushed a `(ref $DotListWrapper)` into a field typed
-// `(ref $CircleListWrapper)`: `vl check` rc 0, "type mismatch: expected (ref $type),
-// found (ref $type)". The `| null` spelling of the same field (code 28) is the same
-// defect at the same coordinate and was measured separately (`Circle[] | null` beside
-// `Dot[] | null`, identical message).
-//
-// THE OTHER NAMED-HEAP CODES ARE NOT HERE BECAUSE THEY CANNOT REACH THIS TEST TODAY.
-// A map-valued field (19) and its niche (29) over a union arm are a LOUD reject before
-// any row is merged ("unsupported map value type … no rep for a union-member struct"),
-// and a code-15 field over an arm is the equally loud "only i32 / boolean / string /
-// array struct fields are supported" — measured, one file each. Adding them would be an
-// unwitnessed widening of a MERGE gate, which is exactly the direction that cannot be
-// graded; they belong here the day a witness reaches the test.
+// top-level code and still store DIFFERENT heap types: 15 a nested / nullable struct, 5 a
+// struct / union / closure ref LIST, 28 the `S[] | null` niche. Every one needs the
+// referenced-layer descent below before its rows may share a WasmGC type — gating only
+// code 15 is what D64 cost: two `{xs: <arm>[]}` rows merged onto one heap type while the
+// ref-list layer kept their element heaps apart, giving check-clean invalid wasm. The
+// other named-heap codes (a map-valued field 19 and its niche 29, and a code-15 field over
+// a union arm) are absent because they are a LOUD reject before any row is merged; adding
+// them would be an unwitnessed widening of a MERGE gate, which cannot be graded. They
+// belong here the day a witness reaches the test.
 function fieldCodeRefsElemHeap(code: i32): boolean {
   code == 15 || code == 5 || code == 28
 }
@@ -3126,19 +2707,17 @@ function structFieldCodesEq(a: i32, b: i32): i32 {
       return 0
     }
     if fieldCodeRefsElemHeap(sFieldTypes[sFieldStart[a] + i]) {
-      // A NAMED-HEAP field stores a `(ref [null] <elem heap>)` — the code alone
-      // does NOT pin the layout; the referenced rows must share one
-      // heap type too (the `variantFieldLayoutEq` referenced-layer discipline,
-      // which the struct layer lacked). Same key + same TOP-LEVEL codes is NOT
-      // enough: an `#anon` row's canon-key sidecar carries the literal's
-      // ADOPTED type (`{a:i32,f:{b:f32}}`) while its interned fields came from
-      // the SELF-classified spelling (`3.5` → an f64 inner row) — merging it
-      // with the annotation row stored a `(ref ${b:f32})` into a field typed
-      // `(ref null ${b:f64})`: INVALID-WASM (fuzz seed 451870974 d5,
-      // `() => {f: {a: i64, f: {a: i32, f: boolean, z: f32}, z: boolean}} | f64`).
-      // Byte-equal elem names trivially share a row; distinct names must
-      // resolve and be twins themselves. An unresolvable elem name DECLINES
-      // the merge (never-merged is the safe degenerate, the "" key discipline).
+      // A NAMED-HEAP field stores a `(ref [null] <elem heap>)` — the code alone does
+      // NOT pin the layout; the referenced rows must share one heap type too (the
+      // `variantFieldLayoutEq` referenced-layer discipline, which the struct layer
+      // lacked). Same key + same TOP-LEVEL codes is NOT enough: an `#anon` row's
+      // canon-key sidecar carries the literal's ADOPTED type (`{a:i32,f:{b:f32}}`)
+      // while its interned fields came from the SELF-classified spelling (`3.5` → an
+      // f64 inner row), so merging it with the annotation row stored a `(ref ${b:f32})`
+      // into a field typed `(ref null ${b:f64})` — INVALID WASM. Byte-equal elem names
+      // trivially share a row; distinct names must resolve and be twins themselves. An
+      // unresolvable elem name DECLINES the merge (never-merged is the safe degenerate,
+      // the "" key discipline).
       const ea = sFieldElemName[sFieldStart[a] + i]
       const eb = sFieldElemName[sFieldStart[b] + i]
       if ea != eb {
@@ -3194,19 +2773,17 @@ export function repStructSlotsTwin(a: i32, b: i32): i32 {
   structFieldCodesEq(a, b)
 }
 
-// The canonical (smallest `sTwin`-equivalent) representative of struct slot `si` —
-// the smallest slot `j <= si` sharing `si`'s `slotCanonId` under the
-// `structFieldCodesEq` layout guard, or `si` itself when `si` is the first (or only)
-// of its structure / does not participate in dedup (`""` key). This is the SAME
-// equivalence `buildStructTwins` records in `sTwin[]`, computed on demand and
-// TIMING-INDEPENDENTLY: `repSigSlotTokOfKind` renders it into `$fnsig` struct tokens
-// during `collectCloSigs` (sig interning) — BEFORE `mAssignTypeIndices` has built
-// `sTwin[]` — and again at emit time, and the two must agree. Reads only
-// `slotCanonId` (memoized per arena index) so a spelling-twin row keys the SAME sig
-// digit as its representative, making structurally-identical shapes intern one
-// functype key. Memoized per `tyMutEpoch` (canon keys drop on any arena mutation;
-// `sNames` only APPENDS later slots, which never change an existing slot's rep, so
-// growth needs no reset).
+// The canonical (smallest `sTwin`-equivalent) representative of struct slot `si` — the
+// smallest slot `j <= si` sharing `si`'s `slotCanonId` under the `structFieldCodesEq`
+// layout guard, or `si` itself when it is the first of its structure or does not
+// participate in dedup (empty key). This is the SAME equivalence `buildStructTwins` records
+// in `sTwin[]`, computed on demand and TIMING-INDEPENDENTLY: `repSigSlotTokOfKind` renders
+// it into `$fnsig` struct tokens during `collectCloSigs` — BEFORE `mAssignTypeIndices` has
+// built `sTwin[]` — and again at emit time, and the two must agree. Reads only
+// `slotCanonId` (memoized per arena index) so a spelling-twin row keys the SAME sig digit
+// as its representative, making structurally-identical shapes intern one functype key.
+// Memoized per `tyMutEpoch`; `sNames` only APPENDS later slots, which never change an
+// existing slot's rep, so growth needs no reset.
 let repSlotRepMemo: i32[] = []
 let repSlotRepEpoch = -1
 
@@ -3241,19 +2818,17 @@ export function repStructSlotRep(si: i32): i32 {
   rep
 }
 
-// Rep-twin phase 2 — the STRUCTURAL row resolver for `structIndexOfObjCtx`'s
-// ambiguity arm (matches >= 2). Given the checker's recorded arena type for an
-// `ObjLit` (`repTyIx`, from `nodeRepTyIxOf`), the UNIQUE struct row `si` in
-// `[0, lim)` whose canonical structural key equals `repCanonKey(repTyIx)` and
-// whose emitted field-code layout is consistent (`structFieldCodesEq`) — the
-// `repStructSlotsTwin` double gate lifted to a whole-table scan keyed on an
-// arena type rather than a second slot. -1 when: `repTyIx` is uncovered / not a
-// `TyObj`, the key is empty (a shape that never participates in dedup), no row
-// matches, or two matched rows differ in emitted layout (a genuinely AMBIGUOUS
-// atom-vs-plain collision this resolver must NOT guess through — the caller
-// falls back to its name path). The scan mirrors `slotCanonId`'s own cost
-// discipline (declared rows read a memoized arena key; inline `{…}` spellings
-// resolve through the checker's memoized `resolveAnnot`).
+// Rep-twin phase 2 — the STRUCTURAL row resolver for `structIndexOfObjCtx`'s ambiguity
+// arm (matches >= 2). Given the checker's recorded arena type for an `ObjLit` (`repTyIx`,
+// from `nodeRepTyIxOf`), the UNIQUE struct row `si` in `[0, lim)` whose canonical
+// structural key equals `repCanonKey(repTyIx)` and whose emitted field-code layout is
+// consistent (`structFieldCodesEq`) — the `repStructSlotsTwin` double gate lifted to a
+// whole-table scan keyed on an arena type rather than a second slot. -1 when: `repTyIx` is
+// uncovered or not a `TyObj`, the key is empty, no row matches, or two matched rows differ
+// in emitted layout — a genuinely AMBIGUOUS collision this resolver must NOT guess through,
+// so the caller falls back to its name path. The scan mirrors `slotCanonId`'s own cost
+// discipline: declared rows read a memoized arena key, inline shape spellings resolve
+// through the checker's memoized `resolveAnnot`.
 export function repRowOfTyStruct(repTyIx: i32, lim: i32): i32 {
   if repTyIx < 0 { return -1 }
   const t = T.tys[repTyIx]
@@ -3279,31 +2854,18 @@ export function repRowOfTyStruct(repTyIx: i32, lim: i32): i32 {
   best
 }
 
-// Normalize a checker RENDER (`tyToStr`, which spaces fields `{f: T}` and spells a
-// nullable with a `?` suffix) into the canonical spelling the annotation grammar
-// (`resolveAnnot`) parses — SCOPED to `repRowOfName` below, NEVER a global
-// `nameToTy` change. Two fidelity gaps a raw render trips:
-//   · SPACES — `nameToTy`'s inline-shape parser slices a field type
-//     `field.slice(colonAt+1)` = ` {f: …}` WITH the leading space, and its
-//     `name[0]=='{'` nested-shape test then fails → `TyErr`, so `repCanonKey`
-//     reads a spaced nested field as `!` (proven-mismatch vs every row). Dropping
-//     all spaces makes the render parse identically to `tyToEmitName`.
-//   · `?` NULLABLE — a rendered `i64?` is unparseable as an atom; rewriting it to
-//     the `i64|null` union spelling `repCanonKey` keys resolves it.
-// Both are position-independent textual rewrites over a canonical type render (no
-// string-literal atoms with internal spaces/`?` appear in the fuzz/corpus grammar;
-// the run-diff gate is the net for any exotic spelling).
-// The SPACE half is `tyname.nameStripSpaces` (W7) — the same ENFORCEMENT
-// `emit_classify.shapeFieldParse` asks for, and the census's own residue note called this
-// body "W7's fifth, listed by hand" because its alphabet is `' '` / `'?'` rather than type
-// punctuation. The `?` half stays: it is a SPELLING rewrite, not a normalisation, and it
-// has one writing.
-//
-// The two rewrites COMMUTE, which is what makes splitting them exact rather than similar:
-// `"|null"` contains no space and `'?'` is not a space, so dropping spaces before expanding
-// `?` and expanding before dropping agree on every input. The cost is one extra scan, and
-// only that: `nameStripSpaces` returns `nm` itself without allocating when there is no
-// space, which its own header measures as the 79% case.
+// Normalize a checker RENDER (`tyToStr`, which spaces fields `{f: T}` and spells a nullable
+// with a `?` suffix) into the canonical spelling the annotation grammar (`resolveAnnot`)
+// parses — SCOPED to `repRowOfName` below, NEVER a global `nameToTy` change. Two fidelity
+// gaps a raw render trips: SPACES, because `nameToTy`'s inline-shape parser slices a field
+// type WITH its leading space and then fails its nested-shape test on the leading brace, so
+// `repCanonKey` reads a spaced nested field as a proven mismatch; and the `?` NULLABLE,
+// unparseable as an atom until rewritten to the `i64|null` union spelling. Both are
+// position-independent textual rewrites over a canonical type render. The SPACE half is
+// `tyname.nameStripSpaces` (W7), the same ENFORCEMENT `emit_classify.shapeFieldParse` asks
+// for; the `?` half stays here because it is a SPELLING rewrite, not a normalisation. The
+// two COMMUTE — `"|null"` holds no space and a `?` is not a space — which is what makes
+// splitting them exact rather than similar, at the cost of one extra non-allocating scan.
 function renderFaithful(nm: string): string {
   const ns = nameStripSpaces(nm)
   let out = ""
@@ -3316,92 +2878,18 @@ function renderFaithful(nm: string): string {
   out
 }
 
-// The struct-table row a checker RENDER `nm` names, after `renderFaithful`
-// normalization, resolved through the ONE `repRowOfTyStruct` vocabulary — the
-// name-input twin of the node route (which consumes `nodeRepTyIxOf` directly).
-// Tri-state so a caller CAN tell "the spelling did not resolve, feed a node type
-// instead" (-2) from "resolved, but names no dedup-participating row" (-1):
-//   -2  the spelling did not resolve through the annotation grammar
-//   -1  resolved to a non-`TyObj` / a shape that participates in no row
-//   >=0 the unique matching row (`repRowOfTyStruct`'s pick, `[0, lim)`)
-// **NO CALLER ACTUALLY CONSULTS IT.** All four test `>= 0` / `< 0` and collapse -1 with
-// -2 (verified site-by-site, D-NULBASEROW). The -2 state IS reachable (1 of 1,410 corpus
-// files, `closures/generic-nulclosure-return-sig-skip.vl`, and 0 of 7,200 fuzz programs);
-// it is the DISTINCTION that is dead, not the state.
-// So an arena-index replacement does not have to reproduce it — the hard part the
-// hand-off warned about is not load-bearing. Do not add a consumer without re-measuring.
-//
-// **CALL-SITE COUNT, RE-DERIVED — this header said "six" and was WRONG for four merges.**
-// #1146 (`2fae030`) collapsed `structIndexOfTypeRef`'s duplicated nullable arm and dropped
-// a fifth site; the count was **four** from then until D-SLOTARENA, and is **three** now:
-// `nulBaseStructRow`, `structIdxOfElemName`, `shapeElemDeclaredStructIdx`
-// — all in `emit_classify.vl`, all on classification paths. (Counted comment-stripped, own
-// definition header excluded; the import line is not a call.) The stale six is exactly the
-// pathology this program keeps rediscovering: **a header comment is not evidence.**
-//
-// **THE FOURTH WAS UNREACHABLE AND IS NOW DELETED (D-MONOISTY, filed; D-SLOTARENA, taken).**
-// `monoIsRowMatch`'s only caller — `wasmEmit.monoStaticIsResult` — took the ARENA route
-// (`repIsRowMatchTy`, below) at D-MONOISTY, leaving the function with ZERO callers and a
-// `repRowOfName` round trip that could never run. It was filed for deletion there because
-// `emit_classify.vl` was outside that slice's partition; D-SLOTARENA deletes it. Graded, not
-// assumed. A dual-write probe running BOTH legs at that seam and failing loudly on
-// any disagreement reached **9 of 1,448 corpus files** with **0 divergences** — the reach is the
-// positive control that the comparison was live. The FUZZ channel is covered end-to-end instead
-// (an A/B of the name-leg build against this one over **50,400 programs, 0 divergences**), not by
-// that probe: the probe was swept over the corpus only, and this comment says which is which
-// because a probe result and a differential result are not interchangeable evidence.
-// The zero is AGREEMENT, not coverage: inverting `repIsRowMatchTy`'s answer moves **4 corpus
-// rows** (3 build failures plus a byte+stdout diff on `generics/mono-is-anon-shape-guard.vl`, the
-// pin minted for this seam).
-// Live round-trip consumers: **3** (`nulBaseStructRow`, `shapeElemDeclaredStructIdx`, plus
-// `structIdxOfElemName`, itself measured dead below its first rung — see the table below).
-//
-// The `resolveAnnot` below — one of `emit_rep`'s seven, the post-canon P4 population — runs
-// at every one of them: a spelling put through a character-level normalization
-// (`renderFaithful`) and then RE-PARSED by the checker's annotation grammar. That round trip
-// is this module's largest remaining destringify debt; the arena entry (`repRowOfTyStruct`)
-// is right below and takes the index directly at **five** sites other than this function's
-// own tail call, all in `emit_classify`: `rlElemStructRow`, `structIndexOfObjCtxGo` (×2),
-// `nulBaseStructRow`'s arena rung (added by D-NULBASEROW), and the read-side row consult in
-// `structIndexOfExpr`. (Named, not line-numbered — the count above went stale precisely
-// because a header recorded a number nothing re-derived.)
-//
-// **AND `renderFaithful` NORMALIZES NOTHING.** Its header claims the input is a checker
-// RENDER (`tyToStr`, which spaces fields and spells a nullable `T?`). Measured with a poison
-// probe at this call site (so it covers all four consumers): the rewritten spelling is
-// BYTE-EQUAL to the input on every call — **0 hits over 1,410 corpus files AND 7,200 fuzz
-// programs** — while a sabotage forcing one byte of difference reddens **178 corpus + 460
-// fuzz**, so the zero is agreement, not blindness. Every live caller hands in an
-// ALREADY-CANONICAL annotation spelling; none hands in a render. The normalization is
-// retained (it is cheap, and 8,610 programs are not proof of a total) but it is NOT what
-// makes this a round trip — the `resolveAnnot` re-parse is. See the hand-off in
-// `docs/internals/destringify-types-program.md`.
-//
-// **AND ONE OF THE FOUR CONSUMERS IS DEAD — A REACH CENSUS, NOT A READING** (D-PARENCLASSIFY).
-// A poison probe at each call site in turn, over 1,416 corpus files and 50,400 fuzz programs:
-//
-//   | consumer                    | corpus files | fuzz dirs / programs |
-//   | `nulBaseStructRow`          |     105      |  84 / 2,003          |
-//   | `structIdxOfElemName`       |     **0**    |  **0 / 0**           |
-//   | `monoIsRowMatch` (deleted)  |       6      |   0 / 0              |
-//   | `shapeElemDeclaredStructIdx`|      44      |  79 /   633          |
-//
-// The zeros are GRADED, not assumed: consumers 1 and 4 fire on both channels from the same
-// probe mechanism, so neither the probe nor either population is blind.
-//
-// `structIdxOfElemName`'s zero has an exact cause. Its ONE caller is
-// `forInRefArrayStructIdx`, reached on 8 of 1,416 corpus files, and on all 8 the NOMINAL
-// `structIndexByName` consult one rung above answers — so control never arrives here. In the
-// fuzz population the function is never called at all (a positive control firing on ENTRY
-// reads 0/84), so that leg is blindness and only the corpus number is evidence.
-//
-// And the blocker recorded for it in D-NULBASEROW — "a multi-arm resolver with no slot behind
-// it" — is NOT the operative one: the caller HOLDS the iterable expression node, and
-// `tyRefArrElemOf(nodeRepTyIxOf(iterIx))` resolves a ref-array element type on all 8 of those
-// files. The arena route exists and is one line. What is missing is a REASON: a rung inserted
-// above a call that never executes buys nothing and can be graded by nothing. Re-measure this
-// census before building it — the day a program reaches the round trip, the node is already
-// there.
+// The struct-table row a checker RENDER `nm` names, after `renderFaithful` normalization,
+// resolved through the ONE `repRowOfTyStruct` vocabulary — the name-input twin of the node
+// route. Tri-state: -2 the spelling did not resolve through the annotation grammar, -1
+// resolved to a non-`TyObj` or a shape participating in no row, >=0 the unique matching
+// row in `[0, lim)`. NO CALLER CONSULTS THE DISTINCTION — every one tests `>= 0` / `< 0`
+// and collapses -1 with -2 — so an arena-index replacement need not reproduce it; do not
+// add a consumer without re-grading. The `resolveAnnot` here (a spelling normalized
+// character-by-character, then RE-PARSED by the checker's annotation grammar) is this
+// module's largest destringify debt, and the arena entry `repRowOfTyStruct` just below
+// takes the index directly. `renderFaithful` itself normalizes NOTHING in practice —
+// every live caller hands in an already-canonical spelling — and is kept only because it
+// is cheap. Hand-off: `docs/internals/destringify-types-program.md`.
 export function repRowOfName(nm: string, lim: i32): i32 {
   if nm == "" { return -2 }
   // The `repNameCanonId` runaway cap (a render this long is never a legit key and
@@ -3414,23 +2902,17 @@ export function repRowOfName(nm: string, lim: i32): i32 {
   repRowOfTyStruct(di, lim)
 }
 
-// The ARENA-INPUT twin of `emit_classify.monoIsRowMatch` (destringify D-MONOISTY).
-// Does a monomorphized instance's bound argument row — named `sk`, a genuinely
-// NOMINAL row key (`#anon0`, minted by `collectAnonShapes`), which is why that side
-// stays a name — SATISFY an `is` test whose type the checker already banked
-// (`isVarTyIxOf`)? 1 yes · 0 no · -1 neither side names a row (the caller keeps the
-// string compare's answer).
-//
-// The `want` side is the whole point: `monoIsRowMatch` took `IsExpr.isVariant`, a raw
-// SOURCE SPELLING, and put it through `repRowOfName` — `renderFaithful` character
-// surgery plus a `resolveAnnot` RE-PARSE by the checker's annotation grammar, to
-// recover a type the checker had already resolved AT THAT NODE and banked. Handing in
-// the arena index skips both. `isVarTyIxOf` is the same bank `isArmTagOfTy` and the
-// narrow-push already read at this node, so no new sidecar and no new producer.
-//
-// `lim` is the caller's struct-table scan bound. It is passed rather than computed so
-// this stays the SAME contract as `repRowOfTyStruct`'s other five call sites; the one
-// caller runs at emit time, after `collectS` has closed every row.
+// The ARENA-INPUT twin of the deleted `monoIsRowMatch` (destringify D-MONOISTY, see
+// `docs/internals/destringify-types-program.md`). Does a monomorphized instance's bound
+// argument row — named `sk`, a genuinely NOMINAL row key (`#anon0`, minted by
+// `collectAnonShapes`), which is why that side stays a name — SATISFY an `is` test whose
+// type the checker already banked (`isVarTyIxOf`)? 1 yes · 0 no · -1 neither side names a
+// row. The `want` side is the whole point: that resolver took a raw SOURCE SPELLING and
+// put it through `renderFaithful` character surgery plus a `resolveAnnot` RE-PARSE to
+// recover a type the checker had already resolved AT THAT NODE; handing in the arena index
+// skips both, and `isVarTyIxOf` is the same bank this node's `isArmTagOfTy` and the
+// narrow-push already read. `lim` is the caller's struct-table scan bound, PASSED rather
+// than computed so this keeps the SAME contract as `repRowOfTyStruct`'s other call sites.
 export function repIsRowMatchTy(sk: string, wantTy: i32, lim: i32): i32 {
   const skSi = repStructRowByName(sk)
   if skSi < 0 { return -1 }
@@ -3489,23 +2971,17 @@ export function buildStructTwins() {
 }
 
 // ── The descriptor: tree-PRIMARY over the flat arms (Stage B wave 1) ─────────
-// The recursive Rep tree is AUTHORITATIVE at this seam: wherever the flat
-// arms claim coverage, the returned kind / null discipline / list-element
-// vocabulary are the TREE's projections (`repTreeVKind` / `repTreeNulOf` /
-// `repTreeListElemName` — certified byte-equivalent to the flat answers by
-// the Stage A `$VL_REP_SHADOW` sweeps), and the `$fnsig` token follows the
-// kind through the one token table. The flat derivation still decides two
-// things the tree deliberately does not own yet:
-//   · COVERAGE — a shape the flat alphabet cannot name keeps rejecting
-//     through the legacy path even where the tree knows more (`rdCovered ==
-//     0` stays 0; widening compositions is wave b2+, family by family);
-//   · the nominal SLOT (`rdSlot`) — the tree's hash-cons may surface a TWIN
-//     slot (same layout, different index), never guaranteed byte-identity.
-// The flat facts remain as the debug-mode CROSS-CHECK (`$VL_REP_SHADOW` — see
-// the shadow harness at the end of this file). Where the tree has no flat
-// spelling at a flat-covered type
-// (`repTreeVKind` = null — proven empty by the sweeps) the flat answer
-// stands, a defensive fallback rather than a policy.
+// The recursive Rep tree is AUTHORITATIVE at this seam: wherever the flat arms claim
+// coverage, the returned kind / null discipline / list-element vocabulary are the TREE's
+// projections (`repTreeVKind` / `repTreeNulOf` / `repTreeListElemName`, certified
+// equivalent to the flat answers by the `$VL_REP_SHADOW` sweeps), and the `$fnsig` token
+// follows the kind through the one token table. The flat derivation still decides two
+// things the tree does not own yet: COVERAGE — a shape the flat alphabet cannot name keeps
+// rejecting through the legacy path even where the tree knows more — and the nominal SLOT
+// (`rdSlot`), since the tree's hash-cons may surface a TWIN slot, same layout at a
+// different index. The flat facts remain as the debug-mode CROSS-CHECK (the shadow harness
+// at the end of this file); where the tree has no flat spelling at a flat-covered type
+// (`repTreeVKind` = null) the flat answer stands, a defensive fallback, not a policy.
 export function repOfTy(ty: i32): RepDesc {
   const d = repOfTyFlat(ty)
   if d.rdCovered == 0 { return d }
@@ -3760,21 +3236,15 @@ function repOfArray(elem: i32): RepDesc {
   // is also a ref-list element; the slot layer resolves which).
   if et is TyObj { return repMk("reflist", 0, "struct") }
   if et is TyUnion {
-    // `K[]` over a DECLARED litunion alias, a provenanced COPY of one (b1), OR
-    // a genuinely INLINE `("a" | "b")[]` — all three are atom-id elements
-    // riding the i32 list. **The alias gate that used to stand here was the
-    // root home of the #1198 miscompile** (an inline litunion array emitted an
-    // unparseable module in 25 of that slice's 40 census cells; 9 of the 40 in
-    // this slice's own grid — different position sets, one defect): the canon
-    // pass softens a BARE inline union to `string`, so the annotation renders
-    // `string[]` and every NAME-driven classifier coded the binding a string
-    // list while every ARENA-driven path built i32 atom ids — a split that
-    // inverted polarity by binding position. The softening is a fact about the BARE position; at the
-    // ELEMENT position the two spellings are one type, exactly as
-    // `repOfNullable`'s list arm (`tyIsLitUnion(it.aElem)` → `nullist`),
-    // `tyIsI32LeafElem` and `rtNulDiscOf` have always had it — ungated. This
-    // arm was the last alias-gated element classifier, and the asymmetry with
-    // its own nullable twin was the tell. Union-BOX-element lists keep their
+    // `K[]` over a DECLARED litunion alias, a provenanced COPY of one, OR a genuinely
+    // INLINE `("a" | "b")[]` — all three are atom-id elements riding the i32 list. The
+    // alias gate that used to stand here was the root home of the #1198 miscompile: the
+    // canon pass softens a BARE inline union to `string`, so the annotation renders
+    // `string[]` and every NAME-driven classifier coded the binding a string list while
+    // every ARENA-driven path built i32 atom ids. That softening is a fact about the BARE
+    // position; at the ELEMENT position the two spellings are one type, exactly as
+    // `repOfNullable`'s list arm (`tyIsLitUnion(it.aElem)` → `nullist`), `tyIsI32LeafElem`
+    // and `rtNulDiscOf` have always had it — ungated. Union-BOX-element lists keep their
     // still-irregular legacy seams.
     if tyIsLitUnion(elem) { return repMk("list", 0, "i32") }
     return repUncovered()
@@ -3825,19 +3295,14 @@ function repOfMap(mKey: i32, mVal: i32, mSet: i32): RepDesc {
           if tyIsLitUnion(mVal) {
             if tyLitUnionAliasIx(mVal) >= 0 { return repMk("map", 0, "") }
           }
-          // COMPOSITE values whose ladder admission is UNCONDITIONAL — each maps to
-          // an mv kind with no name-domain gate, so the descriptor decides
-          // identically:
-          //  · a FUNCTION value (`{[string]: (i32) => i32}`) — kind 14 (any
-          //    arrow-carrying name),
-          //  · an ARRAY value (`{[string]: i32[]}`, `S[]`, `(C|D)[]`, nested) —
-          //    kind 6 (the scalar-array names and `nameIsRefArray` between them
-          //    admit every `…[]` spelling),
-          //  · a NESTED map value (`{[string]: {[string]: V}}`) — kind 6.
-          // A STRUCT value stays uncovered (`structIndexByValName` is an
-          // INTERN-state gate the arena cannot mirror); a NULLABLE value stays
-          // uncovered (the -3 remainder — the un-repped list/closure niches —
-          // lives in that family).
+          // COMPOSITE values whose ladder admission is UNCONDITIONAL — a FUNCTION
+          // value (kind 14, any arrow-carrying name), an ARRAY value (kind 6: the
+          // scalar-array names and `nameIsRefArray` between them admit every `…[]`
+          // spelling) and a NESTED map value (kind 6) — each map to an mv kind with
+          // no name-domain gate, so the descriptor decides identically. A STRUCT
+          // value stays uncovered (`structIndexByValName` is an INTERN-state gate the
+          // arena cannot mirror), and so does a NULLABLE value (the -3 remainder —
+          // the un-repped list/closure niches — lives in that family).
           if vt is TyFunc { return repMk("map", 0, "") }
           if vt is TyArray { return repMk("map", 0, "") }
           if vt is TyMap { return repMk("map", 0, "") }
@@ -4018,15 +3483,13 @@ export function repTyScalarMask(root: i32) {
               // through the ONE home for that rule (`litBaseTy`) so the mask agrees with
               // every other consumer of it.
               //
-              // "Its inhabitants must be SPELLED as that literal in source, so
-              // `scanPrintUse`'s own `NumLit` / `numLexIsFloat` arm has already claimed
-              // the import" is FALSE for the one inhabitant that is not a member: `null`.
-              // `type N = 1.5 | 2.5` then `function g(p: N | null) { if p is N { print(p) } }`
-              // called ONLY as `g(null)` spells no float value anywhere, while the
-              // `is`-narrowed read of `p` IS an f64 — so `print` routed to `__print_f64__`
-              // at an index the import section never declared. `vl check` rc 0, INVALID
-              // WASM (`type mismatch: expected i32, found f64`). Passing a member literal
-              // at any one call site hid it, which is why the assumption held for so long.
+              // Do NOT assume the inhabitants are all SPELLED in source, so that
+              // `scanPrintUse`'s `NumLit` / `numLexIsFloat` arm has already claimed the
+              // import: `null` inhabits `N | null` without being a member, so `g(null)`
+              // over `type N = 1.5 | 2.5` spells no float value anywhere while the
+              // `is`-narrowed read IS an f64 — `print` then routed to a `__print_f64__`
+              // the import section never declared, giving check-clean invalid wasm.
+              // Passing a member literal at any one call site hides it.
               work.push(litBaseTy(t))
             }
             TyErr => {
@@ -4074,71 +3537,18 @@ export function repMemLoadScalarMask(name: string) {
   0
 }
 
-// ── The RECURSIVE rep tree (rep-rewrite Stage A — audit Part II / Phase 2) ───
-// `repTreeOfTy` is the TOTAL, compositional successor of the flat descriptor
-// above. Where `RepDesc` classifies at most one wrapper deep and answers
-// `rdCovered == 0` for every composition it cannot name, the tree gives EVERY
-// post-mono type a full denotation:
-//
-//   Rep ::= Scalar(i32|i64|f32|f64) | Bool | Str | Atom | Struct(fields)
-//         | List(elem) | Map(val) | Box(members) | Closure(params, result)
-//         | Nullable(inner, discipline) | Unsupported(reason)
-//
-// (`Bool` shares the i32 VALTYPE but keeps its own leaf: the canonical slot
-// key distinguishes `{f:boolean}` from `{f:i32}`, so tree identity must too.)
-//
-// — never a silent fallthrough: a shape whose ABI policy does not exist yet is
-// an EXPLICIT `unsup` node carrying a stable reason-code (the Stage B burn-down
-// unit; see the code list at `rtGo`). Checker METADATA the arena structure
-// alone cannot express — litunion alias-ness (atom vs canon-softened string),
-// union-variant membership — enters as explicit inputs, exactly as the flat
-// arms consult it.
-//
-// SHAPE. The tree is an index-linked ARENA (parallel arrays + i32 links — the
-// `Ty` arena's own pattern; VL has no self-referential aliases). Nodes are
-// HASH-CONSED: a node completes by looking up its structural key (kind +
-// discriminator + child node INDICES + field names) in `rtIntern`, so two
-// types with an identical layout tree share ONE node index — tree identity is
-// layout identity. The key is built from already-interned CHILD indices (not a
-// recursive string render), which keeps interning O(size), and it reuses the
-// flat layer's canonical vocabulary where nominal identity matters: `rtSlot`
-// is claimed through `repSlotOfTy`, and slot agreement across a hash-cons
-// merge is exactly the shipped `repStructSlotsTwin` equivalence.
-//
-// CYCLES. Recursive structural types are real arena cycles, so construction
-// memoizes by `Ty` index (`rtByTy`) and stamps the memo BEFORE recursing into
-// children: re-entering an in-progress type returns its already-allocated node
-// index, producing a real index CYCLE in the tree (again the arena pattern).
-// A cycle participant's completion key contains its own (or an in-progress
-// descendant's) index, so it can never falsely merge with an earlier node; two
-// ISOMORPHIC cyclic types therefore keep distinct nodes in Stage A (unlike
-// `repCanonKey`'s de Bruijn render — a documented, sound under-merge: never a
-// false share, only a missed one).
-//
-// LIFETIME. Generation-stamped on the CHECKER axes of the flat layer's memos
-// (#917): `tyMutEpoch` (in-place arena mutation re-keys everything) and
-// `cUserTypesVer` (which arena index a spelling resolves to). Any bump drops
-// the whole tree — conservative, like the key memo. `sNames.length` (slot
-// claims) is deliberately NOT an axis: the AUTHORITY projections (kind / null
-// discipline / list-element — what `repOfTy` reads on the normal compile
-// path) never consult `rtSlot`, and slot interning happens constantly during
-// emit, so stamping on it would rebuild the tree once per interned slot. The
-// only `rtSlot` consumer is the armed shadow harness, and `repShadowSweep`
-// forces a full drop first, so its slot assertions always run over a tree
-// built against the FINAL slot table. A returned node index is valid only
-// until the next checker mutation: consume it immediately, or re-query.
-// Building is LAZY — nothing pays for the tree until it asks.
-// The node-kind alphabet, as a named literal union rather than a bare
-// `string`: a litunion reps as an INTERNED i32 atom, so the eleven-arm
-// `k == "…"` ladders below (`repTreeVKind` and friends, on `repOfTy`'s hot
-// path) lower to `i32.eq` instead of a `__str_eq__` call each. The set is
-// closed by construction — `rtAlloc` and `rtLeafOf` are the only writers, and
-// both now take an `RtKind` — and the checker holds it closed at every
-// reader too: comparing against a non-member is a type error, not a silently
-// false branch. Atoms widen back to `string` transparently, which is what
-// keeps `rtInternKeyOf`'s key concatenation and the `string`-returning
-// accessors (`repTreeKindOf`, `repTreeListElemName`) unchanged.
-// (`PushKind` / `BtKind` in `emit_classify.vl` are the same pattern.)
+// ── The RECURSIVE rep tree (rep-rewrite Stage A — see `ROADMAP.md`) ──────────
+// `repTreeOfTy` is the TOTAL, compositional successor of the flat descriptor above:
+// where `RepDesc` classifies at most one wrapper deep and answers `rdCovered == 0` for
+// every composition it cannot name, the tree denotes EVERY post-mono type — never a
+// silent fallthrough, since a shape whose ABI policy does not exist yet becomes an
+// EXPLICIT `unsup` node carrying a stable reason code (the Stage B burn-down unit; code
+// list at `rtGo`). It is an index-linked ARENA hash-consed on a key of already-interned
+// CHILD indices, not a recursive render, so interning stays O(size) and tree identity IS
+// layout identity; construction memoizes by `Ty` index and stamps BEFORE recursing, so an
+// arena cycle yields an index cycle that no participant can falsely merge into an earlier
+// node. `RtKind` is a litunion, so it reps as an INTERNED i32 atom and the `k == "…"`
+// ladders on `repOfTy`'s hot path lower to `i32.eq`; `rtAlloc`/`rtLeafOf` keep it closed.
 type RtKind = "i32"
   | "bool"
   | "i64"
@@ -4180,6 +3590,17 @@ function repTreeDrop() {
   0
 }
 
+// LIFETIME. Generation-stamped on the CHECKER axes of the flat layer's memos:
+// `tyMutEpoch` (in-place arena mutation re-keys everything) and `cUserTypesVer` (which
+// arena index a spelling resolves to). Any bump drops the whole tree — conservative,
+// like the key memo. `sNames.length` (slot claims) is deliberately NOT an axis: the
+// AUTHORITY projections (kind / null discipline / list element — what `repOfTy` reads on
+// the normal compile path) never consult `rtSlot`, and slot interning happens constantly
+// during emit, so stamping on it would rebuild the tree once per interned slot. The only
+// `rtSlot` consumer is the armed shadow harness, and `repShadowSweep` forces a full drop
+// first, so its slot assertions always run over a tree built against the FINAL slot table.
+// Building is LAZY, and a returned node index is valid only until the next checker
+// mutation: consume it immediately, or re-query.
 function rtSync() {
   if (rtEpoch == tyMutEpoch && rtUserVer == cUserTypesVer) { return 0 }
   rtKind = []
@@ -4778,23 +4199,16 @@ export function repTreeUnsupReason(root: i32): string {
 }
 
 // ── The differential SHADOW harness ──────────────────────────────────────────
-// A debug-only sweep asserting the FLAT arms agree with the tree on every
-// fact BOTH can express, wherever the flat side claims coverage
-// (`rdCovered == 1`): top kind, null discipline, list-element vocabulary,
-// `$fnsig` token, and struct-slot identity (up to the shipped
-// `repStructSlotsTwin` equivalence — a hash-cons merge may surface a TWIN
-// slot, never a different layout). Since Stage B wave 1 the tree is the
-// AUTHORITY at the `repOfTy` seam and the flat arms are the shadow (Stage A
-// ran the same comparison in the other direction, flat authoritative, to
-// zero disagreements first); a disagreement still means one side is wrong —
-// triage against the emitted behavior. The sweep also tallies the COVERAGE
-// report — how much of the post-mono arena gets a fully-real tree, and which
-// policy gaps (`repTreeUnsupReason` buckets) block the rest: the Stage B
-// burn-down list.
-//
-// OFF by default. The host arms it (`setRepShadow`, the `setEmitNames`
-// pattern) when `$VL_REP_SHADOW` is set and reads the report back through the
-// `diagMsgAt`-style accessors below; an unarmed compile pays ONE boolean test.
+// A debug-only sweep asserting the FLAT arms agree with the tree on every fact BOTH
+// can express wherever the flat side claims coverage (`rdCovered == 1`): top kind,
+// null discipline, list-element vocabulary, `$fnsig` token, and struct-slot identity
+// — up to `repStructSlotsTwin` equivalence, since a hash-cons merge may surface a
+// TWIN slot but never a different layout. The tree is the AUTHORITY at the `repOfTy`
+// seam and the flat arms are the shadow; a disagreement still means one side is wrong,
+// so triage against the emitted behavior. It also tallies the COVERAGE report: which
+// policy gaps (`repTreeUnsupReason` buckets) block a fully-real tree. OFF by default —
+// the host arms it (`setRepShadow`) when `$VL_REP_SHADOW` is set and reads the report
+// back through the `diagMsgAt`-style accessors; an unarmed compile pays ONE boolean test.
 export let repShadowOn = false
 
 export function setRepShadow(v: i32) {
@@ -4828,23 +4242,17 @@ export let hcMergeBad = 0
 export let hcSplitBad = 0
 export let hcLenBad = 0
 
-// The sweep — called once per program from `emitProgram` AFTER the module
-// bytes are final (the arena is complete then; monomorphization and the
-// collect passes have minted every late type). Restarts its tallies each run,
-// so an instance that compiles more than one program reports the last sweep.
-// THE MEMO'S OWN ORACLE — every banked depth-0 answer recomputed from scratch and compared.
-// Run BEFORE the sweep touches anything, because the sweep's first `repElemKey` call runs
-// `repElemMemoSync`, which CLEARS both id memos if the generation moved: check afterwards and you
-// validate a memo you just rebuilt, which is a tautology rather than a test.
+// THE MEMO'S OWN ORACLE — every banked depth-0 answer recomputed from scratch and
+// compared. Run BEFORE the sweep touches anything: the sweep's first `repElemKey`
+// call runs `repElemMemoSync`, which CLEARS both id memos if the generation moved,
+// so checking afterwards validates a memo you just rebuilt — a tautology, not a test.
 //
-// This is the check the three id walks did not have. `hcCheckKey` compares the WALKS against
-// their string twins and says nothing about the CACHE in front of them, and `repElemMemo`'s own
-// header cites a "every memo HIT recomputed and compared — 54,906 agree / 0 disagree" harness
-// that exists nowhere in the tree: it was one-off instrumentation, and the promise outlived it.
-// A stale entry here is a wrong slot, so the walk that resolves slots should not inherit a
-// guarantee on trust.
+// This is the check the three id walks did not have: `hcCheckKey` compares the WALKS
+// against their string twins and says nothing about the CACHE in front of them. A
+// stale entry here is a wrong slot, so the walk that resolves slots must not inherit
+// a guarantee on trust.
 //
-// Recomputation is done with the memo column SWAPPED OUT rather than cleared, so a disagreement
+// Recomputation swaps the memo column OUT rather than clearing it, so a disagreement
 // is reported instead of silently repaired, and the banked column is restored either way.
 function repMemoCheck() {
   const bankedMv = hcMvMemo
@@ -4877,6 +4285,10 @@ function repMemoCheck() {
   0
 }
 
+// The sweep — called once per program from `emitProgram` AFTER the module bytes are
+// final (the arena is complete then; monomorphization and the collect passes have
+// minted every late type). Restarts its tallies each run, so an instance that compiles
+// more than one program reports the last sweep.
 export function repShadowSweep() {
   if !repShadowOn { return 0 }
   // Force a FRESH tree: the normal-compile tree deliberately survives slot
@@ -5042,7 +4454,7 @@ function repShadowNoteRaw(msg: string) {
 function repShadowCheckTy(ty: i32) {
   hcCheckKey("canon", repCanonKey(ty), repCanonId(ty))
   hcCheckKey("elem", repElemKey(ty), repElemId(ty))
-  // The MAP-VALUE leg. `repMvValKey` has no functional caller any more — `mvSlotOfTyKArm` compares
+  // The MAP-VALUE leg. `repMvValKey` has no functional caller now — `mvSlotOfTyKArm` compares
   // ids — and this is where it earns its keep, as the SHADOW of the id it was replaced by. The
   // other two keys are kept for exactly this reason; leaving mv out would have made it the one
   // key with no oracle at the moment it stopped being load-bearing, which is when drift stops
