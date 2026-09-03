@@ -4824,3 +4824,57 @@ a LATER import binding of the same name shadows: two import bindings of one loca
 the same declaration in any program that compiles (this rule refuses the other case), so the
 twin's use is this one's use, and where the name really is unused the LAST binding still
 reports it once. One mistake, one diagnostic, at the specifier the fix should delete.
+
+## An else-less `if` used as a VALUE is `T | null` in every position (owner, 2026-09-02) — D1086, TO BUILD
+
+**Ruling.** An `if` expression with no `else` has the value of its arm when the condition
+holds and `null` otherwise, so its type is `T | null` — at a binding, in return position, as
+a `??` operand, as an argument, everywhere a value is consumed. In STATEMENT position it stays
+`void`, as today. The checker must give ONE answer: today it types `const x = if c { "hi" }`
+as `string | null` and accepts it, but calls the same expression `void` in return position
+(`return if c { "hi" }` → `return type mismatch: expected string | null, got void`) and as
+a `??` left operand. Those cannot both be right, and the value answer is the one the
+language already implements at the position people write first.
+
+**Why this and not "an else-less `if` is never a value".** The alternative (Kotlin's rule:
+require `else` to use `if` as an expression, loud check error otherwise) is tighter, but it
+takes away a spelling that RUNS today at bindings — a `runs → not-runs` change over the
+tree — and it contradicts the Elixir model this language follows for `if` (`if cond, do: x`
+is `nil` when the condition fails). `T | null` is what the binding position already means;
+the ruling makes the other positions agree with it.
+
+**Build (D1086, [inventory](docs/internals/silent-class-inventory.md#d1086)).** Two halves,
+in this order: (1) the CHECKER types an else-less `if` in every value position as `T | null`
+(return, `??` operand, argument, struct-field init, array element, assignment RHS), with
+the existing binding rule unchanged; (2) the EMITTER lowers a synthesized `null` else arm at
+every rep and both scopes — the row's 2×12 scope × rep grid is the grading list (18 of 24
+cells refuse today; module scope refuses at every rep, function scope at the six composite
+reps), plus the annotated and un-annotated face of each cell. Build the lowering and wire
+every position BEFORE narrowing anything at the checker (D965's rule). Held by the
+compile-goal track (vl-07).
+
+## UFCS is never implicit: the compiler resolves `x.f(…)` only against names IN SCOPE; the LSP surfaces the import (owner, 2026-09-02)
+
+**Ruling.** `expect(1).toEqual(3)` needs `toEqual` imported, and that stays the rule. The
+compiler does NOT look into the module that defines the receiver's type for an exported
+`f(self: T, …)` — a type-directed fallback was proposed and declined as "potentially buggy;
+for now we don't need it". What changes is the TOOLING: the LSP must be able to find the
+free function — completion after `expect(x).` offers `toEqual` from `std:test` and inserts
+the import; the `no field 'toEqual' on Expectation<i32>` diagnostic (D1230) gets a quick-fix
+that adds the name to the existing import from that module — and the compiler's diagnostic
+names the missing import rather than blaming the receiver (D1230's fix, compile-goal track).
+
+**Why.** Implicit resolution adds a second name-resolution source the reader cannot see in
+the file (a name from an un-imported module becomes callable), and every such rule is a
+place for two answers to disagree. The papercut is real — one assertion needs two imports —
+but it is an EDITOR problem: the editor knows the receiver's type and the module that
+exports its methods, and can write the import for the author. Revisit only if the explicit
+rule proves unworkable in practice.
+
+**Build.** Tooling track (vl-b7): (1) completion — after `.` on a receiver whose type comes
+from module M, list M's exported functions whose first parameter accepts the receiver, with
+an `additionalTextEdit` that adds the name to an existing `import { … } from M` or inserts
+one; (2) code action on the D1230 diagnostic — `Import \`toEqual\` from "std:test"`; (3) the
+same for a user module in the workspace graph, not only `std:`. Compile-goal track (vl-07):
+D1230's diagnostic text and a stable diagnostic code carrying module + name, so the quick-fix
+keys on the code rather than parsing the sentence.
