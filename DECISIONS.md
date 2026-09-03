@@ -4905,20 +4905,50 @@ rule proves unworkable in practice.
 from module M, list M's exported functions whose first parameter accepts the receiver, with
 an `additionalTextEdit` that adds the name to an existing `import { … } from M` or inserts
 one; (2) code action on the D1230 diagnostic — `Import \`toEqual\` from "std:test"`; (3) the
-same for a user module in the workspace graph, not only `std:`.
+same for a user module in the workspace graph, not only `std:`. Compile-goal track (vl-07):
+D1230's diagnostic text and a stable diagnostic code carrying module + name, so the quick-fix
+keys on the code rather than parsing the sentence.
 
-**The compiler half is DONE (D1230, [inventory](docs/internals/silent-class-inventory.md#d1260)).**
-The refusal names the missing import and carries the quick-fix's whole answer on the existing
-`diagCodeLen`/`diagCodeByte` channel, so the code action never parses the sentence:
+**BUILT 2026-09-02 — BOTH HALVES.** The three tooling items ship, and so does the
+compile-goal half: the refusal names the missing import and carries the quick-fix's whole
+answer on the existing `diagCodeLen`/`diagCodeByte` channel, so the code action never parses
+the sentence. The fallback on the old message shape is therefore retired.
 
     ufcs-not-imported;member=toEqual;modules=std:test;recv=Expectation<i32>
 
-`;`-separated, fixed order, `,` between module specifiers, `recv=` LAST because a rendered
-type is the only field that can itself contain those characters (`A | B`, `{a: i32, b: i32}`)
-— read it as everything after the first `;recv=`. ONE diagnostic lists every candidate module,
-so the quick-fix emits one code action per entry in `modules=` rather than answering N
-squiggles on one token. Specifiers are spelled the way the file can write them TODAY: the
-file's own import text where it already imports the module, and the bare `std:` key where it
-does not. A RELATIVE module the file does not import is deliberately NOT offered — its key is
-a normalized path, and reconstructing a specifier relative to the entry is `..`-arithmetic
-that can name a different module.
+`;`-separated, fixed order, `,` between module specifiers, and **`recv=` LAST** because a
+rendered type is the only field that can itself contain those characters (`A | B`,
+`{a: i32, b: i32}`) — read it as everything after the first `;recv=`. ONE diagnostic lists
+every candidate module, so the quick-fix emits one code action per entry in `modules=`
+rather than answering N squiggles on one token. Specifiers are spelled the way the file can
+write them TODAY: the file's own import text where it already imports the module, and the
+bare `std:` key where it does not. A RELATIVE module the file does not import is deliberately
+NOT offered — its key is a normalized path, and reconstructing a specifier relative to the
+entry is `..`-arithmetic that can name a different module.
+
+Three things the build settled that the ruling could not have known:
+
+* **The candidate set is the CHECKER's, not the host's.** `Expectation<i32>` fits
+  `self: Expectation<T>`, and nothing the host holds — a rendered type string — can decide
+  that. So the LSP gained one query, `ufcsCandidatesAt`, which asks `declFirstParamIsSelf` +
+  `assignable` of every declared `self`-function: literally the pair `ufcsCallTy` applies to a
+  written call, so the offered set cannot advertise a call the checker would then refuse.
+  Nothing about type matching moved into TypeScript.
+* **Reaching an UN-IMPORTED module needs a NAMED import, not a bare one.** `import "std:str"`
+  resolves the specifier and merges NOTHING — measured, and the scan comes back empty. One
+  ALIASED named specifier (`import { trim as __vlUfcsProbe0 } from "std:str"`) merges the whole
+  module while binding a name that cannot collide with the author's, and the declaration's own
+  name — what the scan reports — is untouched by the alias. Eleven std modules cost ~20 ms.
+* **A MODULE KEY IS NOT A SPECIFIER.** The checker reports `/proj/shapes.vl`; the import
+  statement spells `./shapes`. Writing the key would have produced a wrong edit rather than a
+  missing one, and only the workspace-module test caught it — `std:` keys ARE their specifiers,
+  so every std case passed either way. `importSpecifierForKey` is the inverse of
+  `resolveImportSpecifier`, and prefers a spelling the file already uses over any it derives.
+
+Two capabilities fell out of the second one and are worth naming, because neither was asked
+for. A CALL receiver — `expect(1).`, the papercut's own shape — now completes at all: the
+field scan STRIPS the trailing `.` and re-resolves the receiver as a BINDING, which only works
+for a bare identifier, while the UFCS probe APPENDS a property and keeps a real member access.
+And the same appended-property trick is what lets the quick-fix ask about
+`expect(1 + 2).toEqual(3)` without repairing anything: the diagnostic points AT the member, and
+the receiver is that access's object, whatever expression it is.

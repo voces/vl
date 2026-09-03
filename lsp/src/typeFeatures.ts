@@ -1245,6 +1245,36 @@ const escapeRegExp = (s: string): string =>
   s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 /**
+ * Resolve an import specifier written in the module at `fromKey` to a module
+ * key, or `""` for a kind the compiler's resolver rejects. A pure-string-math
+ * mirror of `modResolveSpecifier` (`compiler/driver.vl`): a well-formed `std:`
+ * specifier IS its key (verbatim); a relative specifier resolves against
+ * `fromKey`'s directory with `.`/`..` normalization and `.vl` appended;
+ * everything else (bare specifiers, relative-inside-std) is unresolvable.
+ */
+export const resolveImportSpecifier = (spec: string, fromKey: string): string => {
+  if (/^std:[a-z0-9_]+(\/[a-z0-9_]+)*$/.test(spec)) return spec;
+  if (!spec.startsWith("./") && !spec.startsWith("../")) return "";
+  if (fromKey.startsWith("std:")) return "";
+  const slash = fromKey.lastIndexOf("/");
+  const base = slash >= 0 ? fromKey.slice(0, slash) : "";
+  const joined = base !== "" ? `${base}/${spec}` : spec;
+  // Normalize, collapsing `.` and `..` segments (leading `..` that escape the
+  // root are kept — the key stays distinct and the reader won't find it).
+  const absolute = joined.startsWith("/");
+  const segs: string[] = [];
+  for (const seg of joined.split("/")) {
+    if (seg === "" || seg === ".") continue;
+    if (seg === ".." && segs.length > 0 && segs[segs.length - 1] !== "..") {
+      segs.pop();
+    } else {
+      segs.push(seg);
+    }
+  }
+  return (absolute ? "/" : "") + segs.join("/") + ".vl";
+};
+
+/**
  * The edit that makes `name` (exported by the module at `moduleKey`) imported
  * in `source`:
  *   - an existing `import { … } from "<moduleKey>"` (single- or multi-line) is
@@ -1321,6 +1351,180 @@ export const importInsertionEdit = (
     range: { start: insertAt, end: insertAt },
     newText: stmt + (needsBlankAbove(insertAt.line) ? "\n\n" : "\n"),
   };
+};
+
+// ---- UFCS method completion + auto-import ------------------------------------
+//
+// `x.f(a)` is `f(x, a)` over a free `function f(self: T, …)`, and VL resolves it
+// against names IN SCOPE — never by looking into the module that declares `T`
+// (DECISIONS.md, owner 2026-09-02: "UFCS is never implicit; the LSP surfaces the
+// import"). So the compiler is right to say `no field 'toEqual' on
+// Expectation<i32>` and the EDITOR owes the author the missing import. The
+// checker answers which functions dispatch (`ufcsCandidatesAt` — a receiver's fit
+// against a generic `self` is a question only it can answer); the two helpers
+// below are the host's half: reach the modules the file has not imported, and
+// turn a candidate into an item that writes its own import.
+
+/** The property the probe appends after the author's `.` — see `ufcsProbeSource`. */
+export const UFCS_PROBE_PROP = "__vlUfcsProbe";
+
+/**
+ * One module the UFCS probe may reach into: its key and ANY one of its exported
+ * names. One named specifier is all it takes — importing a single name merges the
+ * whole module into the checked program, so every `self`-function it declares
+ * becomes visible to the scan (a BARE `import "std:str"` does NOT: measured
+ * 2026-09-02, it resolves the specifier and merges nothing, and the scan comes
+ * back empty).
+ */
+export type UfcsProbeModule = { key: string; anyExport: string };
+
+/**
+ * The source the UFCS candidate scan is asked about, and the line the cursor
+ * moves to in it. Two rewrites, each for a reason the plain document cannot
+ * serve:
+ *
+ *   - a probe PROPERTY at `insertPropAt` (the cursor, right after the `.` the
+ *     author just typed). The native parser is not error-tolerant for a trailing
+ *     `receiver.`, and the sibling field scan handles that by STRIPPING the dot —
+ *     which only works for a bare-identifier receiver, because it then re-resolves
+ *     the receiver as a binding. Appending a name instead keeps a real member
+ *     ACCESS, so `expect(1 + 2).` — a CALL receiver, the case the papercut is
+ *     actually about — resolves like any other. Pass `undefined` for a document
+ *     that already has the member written (the quick-fix's).
+ *   - one ALIASED import per probe module the file does not already import, so a
+ *     `self`-function in a module nothing has imported yet is still offered. The
+ *     alias is what keeps this safe: the local name never collides with the
+ *     author's, and the DECLARATION's own name — which is what the scan reports —
+ *     is untouched by it.
+ *
+ * `lineOffset` is how far down the cursor moved; the caller adds it to the query
+ * line and leaves the character alone (the prepended block is whole lines).
+ */
+export const ufcsProbeSource = (
+  source: string,
+  modules: UfcsProbeModule[],
+  insertPropAt?: { line: number; character: number },
+): { source: string; lineOffset: number } => {
+  let text = source;
+  if (insertPropAt !== undefined) {
+    const lines = text.split("\n");
+    const l = lines[insertPropAt.line];
+    if (l !== undefined) {
+      const at = Math.min(insertPropAt.character, l.length);
+      lines[insertPropAt.line] = l.slice(0, at) + UFCS_PROBE_PROP + l.slice(at);
+      text = lines.join("\n");
+    }
+  }
+  // A module the file already imports is in the graph already; importing it twice
+  // is a `duplicate-import` the probe does not need.
+  const fresh = modules.filter((m) =>
+    m.anyExport.length > 0 &&
+    !new RegExp(`from\\s*"${escapeRegExp(m.key)}"`).test(text)
+  );
+  if (fresh.length === 0) return { source: text, lineOffset: 0 };
+  const prefix = fresh
+    .map((m, i) => `import { ${m.anyExport} as ${UFCS_PROBE_PROP}${i} } from "${m.key}"\n`)
+    .join("");
+  return { source: prefix + text, lineOffset: fresh.length };
+};
+
+/**
+ * How to SPELL `moduleKey` as an import specifier inside the module at
+ * `entryKey`, or `""` when it cannot be spelled from here.
+ *
+ * A MODULE KEY IS NOT A SPECIFIER, and for a workspace module the two never
+ * match: `import { Circle } from "./shapes"` resolves to `/proj/shapes.vl`, and
+ * that key is what the checker reports a UFCS candidate's module as. Writing the
+ * key into an import statement produces a specifier the compiler rejects (a bare
+ * one), which is a wrong edit rather than a missing one — so this is the inverse
+ * of `resolveImportSpecifier`, and it is asked BEFORE any import is written.
+ *
+ * The file's OWN spelling wins when it has one. If some statement already
+ * resolves to this key, that statement's specifier is the answer — that is the
+ * statement `importInsertionEdit` will merge into, and reusing the author's
+ * spelling (`./shapes` over a re-derived `./shapes`, but also `../lib/shapes`
+ * over anything this could invent) keeps the merge on the line they can see.
+ * Otherwise the specifier is derived relative to the entry's directory.
+ */
+export const importSpecifierForKey = (
+  source: string,
+  entryKey: string,
+  moduleKey: string,
+): string => {
+  if (moduleKey === "" || moduleKey === entryKey) return "";
+  if (moduleKey.startsWith("std:")) return moduleKey;
+  const stmtRe = /import\s*(?:\{[^}]*\}\s*from\s*)?"([^"]*)"/g;
+  for (let m = stmtRe.exec(source); m !== null; m = stmtRe.exec(source)) {
+    if (resolveImportSpecifier(m[1], entryKey) === moduleKey) return m[1];
+  }
+  if (!moduleKey.endsWith(".vl")) return "";
+  const stem = moduleKey.slice(0, -".vl".length);
+  const slash = entryKey.lastIndexOf("/");
+  const dir = slash >= 0 ? entryKey.slice(0, slash) : "";
+  if (dir !== "" && stem.startsWith(`${dir}/`)) {
+    return `./${stem.slice(dir.length + 1)}`;
+  }
+  // Outside the entry's directory: walk up to the common prefix, then down. A
+  // key with no shared root at all is left unspelt rather than guessed.
+  const from = dir.split("/").filter((s) => s !== "");
+  const to = stem.split("/").filter((s) => s !== "");
+  let i = 0;
+  while (i < from.length && i < to.length && from[i] === to[i]) i++;
+  if (i === 0) return "";
+  const up = from.length - i;
+  return `${"../".repeat(up === 0 ? 1 : up)}${to.slice(i).join("/")}`;
+};
+
+/** One UFCS candidate the completion pass turns into an item. */
+export type UfcsCandidate = { name: string; detail: string; moduleKey: string };
+
+/**
+ * Completion items for the UFCS methods `candidates` names, each carrying the
+ * declaring module as `description` and — when the name is not already usable in
+ * `source` — the import rewrite as `extraEdits`.
+ *
+ * `taken` is the set of names the FIELD scan already offered: a field of the same
+ * name wins at a real call (field precedence), so offering the free function
+ * under that label would advertise a call that resolves elsewhere. Two modules
+ * exporting the same `self`-function each get their own item, because either
+ * import is a different program and the author has to pick.
+ *
+ * A candidate whose `moduleKey` is the entry's (or empty — a single-file check has
+ * no module table) is declared in this very file: in scope, no edit. So is one
+ * whose name the file already imports from that module, which is exactly what
+ * `importInsertionEdit` returning `undefined` means.
+ */
+export const ufcsCompletions = (
+  source: string,
+  entryKey: string,
+  candidates: UfcsCandidate[],
+  taken: (name: string) => boolean,
+  formatImport?: (stmt: string) => string | undefined,
+): Completion[] => {
+  const out: Completion[] = [];
+  const seen = new Set<string>();
+  for (const c of candidates) {
+    const local = c.moduleKey === "" || c.moduleKey === entryKey;
+    // The SPECIFIER, never the key — see `importSpecifierForKey`. A module that
+    // cannot be spelled from here is dropped rather than offered with an import
+    // statement the compiler would reject.
+    const spec = local ? "" : importSpecifierForKey(source, entryKey, c.moduleKey);
+    if (!local && spec === "") continue;
+    const dedupe = `${c.name} ${spec}`;
+    if (taken(c.name) || seen.has(dedupe)) continue;
+    seen.add(dedupe);
+    const edit = local
+      ? undefined
+      : importInsertionEdit(source, spec, c.name, formatImport);
+    out.push({
+      name: c.name,
+      kind: "function",
+      detail: c.detail.length > 0 ? c.detail : undefined,
+      description: local ? undefined : spec,
+      ...(edit === undefined ? {} : { extraEdits: [edit] }),
+    });
+  }
+  return out;
 };
 
 /** One std-module export the auto-import pass may offer. */

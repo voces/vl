@@ -68,14 +68,26 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   with the binding rule), then the emitter's synthesized `null` else arm over the row's 2×12
   scope × rep grid, both faces. DECISIONS.md §"An else-less `if` used as a VALUE". Compile-goal
   track.
-- **UFCS is never implicit; the LSP surfaces the import — RULED (owner, 2026-09-02).**
-  `expect(x).toEqual(y)` keeps needing `toEqual` imported. **The COMPILER half is DONE
-  (D1230):** the refusal names the missing import and carries
-  `ufcs-not-imported;member=…;modules=…;recv=…` on the `diagCodeLen`/`diagCodeByte` channel,
-  so a quick-fix keys on the code instead of parsing the sentence. Still to build, tooling
-  track: completion after `.` offering a module's exported `f(self: T, …)` with an
-  auto-import edit, and the code action on that diagnostic. DECISIONS.md §"UFCS is never
-  implicit".
+- **UFCS is never implicit; the LSP surfaces the import — RULED (owner, 2026-09-02);
+  TOOLING HALF SHIPPED the same day.** `expect(x).toEqual(y)` keeps needing `toEqual`
+  imported. DECISIONS.md §"UFCS is never implicit".
+  - **DONE.** Completion after `.` offers every free `f(self: T, …)` the receiver
+    dispatches to, from the file's whole module graph plus every `std:*` module, each
+    labelled with its module and carrying the import rewrite as an `additionalTextEdit`;
+    a quick-fix on the missing-import diagnostic adds the name to the import, one action
+    per candidate module. The candidate set is the CHECKER's (`ufcsCandidatesAt`, a new
+    LSP query over the same `declFirstParamIsSelf` + `assignable` pair `ufcsCallTy`
+    applies), so a generic `self` fits a concrete receiver without the host doing type
+    matching. Two capabilities fell out: a CALL receiver (`expect(1).`) completes at all,
+    which the field scan's bare-identifier lookup never could; and the import edit spells
+    a SPECIFIER (`./shapes`), not the module key the checker reports.
+  - **DONE (compile-goal half).** The diagnostic names the missing import and carries
+    `ufcs-not-imported;member=…;modules=…;recv=…` on the `diagCodeLen`/`diagCodeByte`
+    channel, so the quick-fix keys on the code and its message-shape fallback is retired.
+    `recv=` is last and is read as everything after the first `;recv=`. D1230.
+  - **REMAINS.** Workspace modules the file does not already import are not probed — the
+    500-file crawl is too expensive per keystroke — so a workspace `f(self: T, …)` is
+    offered only from a module already in the graph.
 - **Driver lossless-recovery flag — STAGE 1 DONE #2210** (ruled 2026-09-01, shipped the
   same day). A file whose EVERY parse diagnostic is a lossless recovery's is typechecked
   and linted anyway, so "missing brace" and "type error four lines down" are reported

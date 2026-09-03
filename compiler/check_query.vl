@@ -7,12 +7,15 @@ import {
   CharLit,
   FuncDecl,
   Ident,
+  Member,
   NullLit,
   NumLit,
+  OptMember,
   P,
   Param,
   StrLit,
   Unary,
+  declHasExportKw,
   declNameTokOf,
   nodeToks,
   paramDefaultOf,
@@ -73,6 +76,10 @@ import {
   symVisNode,
   symVisSC,
   symVisSL,
+  ufcDetail,
+  ufcExported,
+  ufcName,
+  ufcTok,
 } from "./check_state"
 // Every rendered type string this module hands out is READ BY A PERSON (hover,
 // inlay, completion details), so it renders through the USER pathway —
@@ -85,9 +92,11 @@ import {
   TyNullable,
   TyObj,
   TyPrim,
+  assignable,
   cUserTypes,
   demangleName,
   inlayHole,
+  nodeTyIxOf,
   tyToStrUser,
   tyToStructStrUser,
 } from "./typecheck"
@@ -718,6 +727,190 @@ export function symMemberScanTypeCharAt(i: i32, j: i32) {
 export function symMemberScanIsFn(i: i32) {
   if i < 0 || i >= memcIsFn.length { return 0 }
   memcIsFn[i]
+}
+// ── UFCS candidates at (line, col) — the sibling scan `symMemberScanAt` cannot do ─
+//
+// Same receiver, other half of the answer: `symMemberScanAt` lists what the
+// receiver's TYPE carries, this lists the free `self`-functions the receiver
+// DISPATCHES to. See `check_state.vl`'s `ufcName` header for why the editor asks.
+//
+// THE TEST IS `ufcsCallTy`'S, NOT A LOOKALIKE. A written `x.f(a)` dispatches when
+// the declaration's first parameter is NAMED `self` (`declFirstParamIsSelf` — the
+// rule `emit_rewrite.drwSelfFnOf` applies) and the receiver is `assignable` to it.
+// Both are asked here, so the offered set cannot advertise a call the checker
+// would then refuse. ARITY is deliberately not asked — the author has typed a
+// `.` and no arguments yet — which is the same choice `sigSelfFnDeclOf` makes.
+//
+// `assignable` is permissive at a `TyVar` on either side, and that is the RIGHT
+// answer here rather than a hole: `self: Expectation<T>` must accept
+// `Expectation<i32>` (the pin re-asks the real question at the call — see
+// `ufcsCstrTy`), and a completion list that dropped every generic `self` would
+// hide `toEqual`, which is the whole papercut.
+//
+// FIELD PRECEDENCE IS NOT APPLIED HERE. A field of the same name wins at a real
+// call, and the host merges the two lists field-first, so applying it twice would
+// only make this scan disagree with `symMemberScanAt` about which list an entry
+// came from.
+function ufcSigStr(declNode: i32, ty: i32) {
+  // `fnSigStr` with the receiver row dropped, the same `skip = 1` signature help
+  // applies (`sigFill`): the reader has already supplied `self`, so showing it
+  // would label argument 1 with parameter 0's name.
+  if declNode < 0 || declNode >= P.nodes.length { return "" }
+  const nd = P.nodes[declNode]
+  if !(nd is FuncDecl) { return "" }
+  if ty < 0 { return "" }
+  const t = T.tys[ty]
+  if !(t is TyFunc) { return "" }
+  const pts = t.fnParamTypes
+  let s = "("
+  let i = 1
+  while i < pts.length {
+    if i > 1 { s = s + ", " }
+    let nm = ""
+    if nd.fnParams.length == pts.length {
+      const pn = P.nodes[nd.fnParams[i]]
+      if pn is Param { nm = pn.parName }
+    }
+    if nm == "" {
+      s = s + tyToStrUser(pts[i])
+    } else {
+      s = s + nm + ": " + tyToStrUser(pts[i])
+    }
+    i = i + 1
+  }
+  s + ") => " + tyToStrUser(t.fnRet)
+}
+// The RECEIVER type for a UFCS query at (line, col), by the two routes a caller
+// can name a receiver — and it takes BOTH because the two callers point at
+// different things.
+//
+//   1. A MEMBER ACCESS whose property name is under the cursor: the receiver is
+//      that access's OBJECT, whatever expression it is. This is the route the
+//      quick-fix needs — the `no field 'toEqual' on Expectation<i32>` diagnostic
+//      points AT `toEqual`, and the receiver `expect(1 + 2)` is a CALL, which no
+//      binding lookup can answer. Completion reaches it too, by appending a probe
+//      property to the `.` the author just typed instead of stripping it.
+//   2. A tracked BINDING occurrence, `symMemberScanAt`'s route — the receiver is
+//      a plain name (`p.`), the source has had its trailing `.` stripped, and the
+//      cursor sits on the name.
+//
+// Route 1 is tried first: when the cursor is on a member's property the author is
+// asking about that member, and a bare identifier there would be the property
+// name itself, whose own type says nothing about the receiver.
+function ufcRecvTyAt(line: i32, col: i32) {
+  let i = 0
+  while i < P.nodes.length {
+    const nd = P.nodes[i]
+    let obj = -1
+    let pl = 0
+    if nd is Member {
+      obj = nd.memObj
+      pl = nd.memProp.length
+    } else if nd is OptMember {
+      obj = nd.omObj
+      pl = nd.omProp.length
+    }
+    if obj >= 0 && i < nodeToks.length {
+      // The member node's `nodeToks` entry IS the property token (the parser
+      // creates the node right after consuming the prop IDENT) — the same anchor
+      // `symMem` spans, so this covers exactly what member hover covers, and
+      // additionally the members `symMem` never records because they did not
+      // resolve. Those are precisely the ones a missing import produces.
+      const tk = nodeToks[i]
+      if tk >= 0 && tk < P.toks.length {
+        const t = P.toks[tk]
+        if t.line == line && col >= t.col && col <= t.col + pl {
+          const rt = nodeTyIxOf(obj)
+          if rt >= 0 { return rt }
+        }
+      }
+    }
+    i = i + 1
+  }
+  const occ = symOccAt(line, col)
+  if occ < 0 { return -1 }
+  symOccQueryTy(occ)
+}
+export function symUfcsScanAt(line: i32, col: i32) {
+  ufcName = []
+  ufcDetail = []
+  ufcTok = []
+  ufcExported = []
+  let ty = ufcRecvTyAt(line, col)
+  if ty < 0 { return 0 }
+  ty = memcSoften(ty)
+  if ty < 0 { return 0 }
+  let i = 0
+  while i < symBindNode.length {
+    if symBindKind[i] == 2 {
+      const d = symBindNode[i]
+      if d >= 0 && d < P.nodes.length {
+        const nd = P.nodes[d]
+        if nd is FuncDecl {
+          if nd.fnParams.length > 0 {
+            const p0 = P.nodes[nd.fnParams[0]]
+            if p0 is Param {
+              if p0.parName == "self" {
+                const fty = symBindType[i]
+                if fty >= 0 {
+                  const ft = T.tys[fty]
+                  if ft is TyFunc {
+                    if ft.fnParamTypes.length > 0 {
+                      if assignable(ty, ft.fnParamTypes[0]) {
+                        ufcName.push(demangleName(nd.fnName))
+                        ufcDetail.push(ufcSigStr(d, fty))
+                        ufcTok.push(declNameTokOf(d))
+                        if declHasExportKw(d) {
+                          ufcExported.push(1)
+                        } else {
+                          ufcExported.push(0)
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  ufcName.length
+}
+export function symUfcsScanCount() { ufcName.length }
+export function symUfcsScanNameLen(i: i32) {
+  if i < 0 || i >= ufcName.length { return 0 }
+  ufcName[i].length
+}
+export function symUfcsScanNameCharAt(i: i32, j: i32) {
+  if i < 0 || i >= ufcName.length { return 0 }
+  ufcName[i][j]
+}
+export function symUfcsScanDetailLen(i: i32) {
+  if i < 0 || i >= ufcDetail.length { return 0 }
+  ufcDetail[i].length
+}
+export function symUfcsScanDetailCharAt(i: i32, j: i32) {
+  if i < 0 || i >= ufcDetail.length { return 0 }
+  ufcDetail[i][j]
+}
+// Candidate `i`'s decl-name TOKEN — the driver maps it to the owning module
+// (`modOfTok`), which is the module key the host writes an import from.
+export function symUfcsScanTokAt(i: i32) {
+  if i < 0 || i >= ufcTok.length { return -1 }
+  ufcTok[i]
+}
+// 1 when candidate `i`'s declaration carried an `export` modifier. A candidate in
+// a DEP module that is not exported cannot be imported and must not be offered
+// (`std:str`'s private `mapAsciiCase` fits `self: string` exactly like its
+// exported neighbours); one in the ENTRY module needs no import either way, so
+// the caller — which is the side that knows which module is the entry — applies
+// the flag rather than this scan dropping the row.
+export function symUfcsScanExportedAt(i: i32) {
+  if i < 0 || i >= ufcExported.length { return 0 }
+  ufcExported[i]
 }
 // ── Signature help (D9.10): the callee's parameter table at (line, col) ───────
 // `fnSigStr` above answers "what does this function look like"; this answers
