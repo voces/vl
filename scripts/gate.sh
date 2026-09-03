@@ -72,6 +72,12 @@ run "lint-self + fmt"          bash scripts/lint-self.sh
 # fall. lint-self.sh holds those codes out of its own `info` gate while the baseline
 # is non-zero, so this is what stops the tree drifting back up meanwhile.
 run "comment budget"           python3 scripts/comment-budget.py --check
+# The seed-size RATCHET: the compiler's own bytes, against a committed baseline, so a
+# jump names the landing that bought it rather than being found weeks later. It reads
+# the seed built above — ONE self-compile, which off a stale seed is the OLD codegen's
+# output; ci-native runs it straight after `--prove-fixpoint`, and that reading is the
+# deciding one. Milliseconds; a `stat` and a comparison.
+run "seed size"                python3 scripts/seed-size.py --check
 # The arena-scan RATCHET, same shape and the same reason: `arena-scan-outside-pass`
 # is a `warning` lint-self.sh holds out while the baseline is non-zero, so this is
 # what stops a whole-program scan being added outside a pass. #2419's class.

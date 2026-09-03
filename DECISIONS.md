@@ -5081,3 +5081,43 @@ It needs two extra locals, a loop-entry hook, a materialisation at every loop EX
 materialisation anyway, so it either copies once more or lands in the same place this does.
 The in-place form is strictly smaller and strictly more general.
 
+
+## The seed's size is a per-landing number, gated at +3% (2026-09-03)
+
+`build/vl-compiler.wasm` is the compiler's codegen of its own source, so it prices every
+emitter change in bytes — and it was measured only when somebody went looking. The reported
+move is **1,834,521 → 1,996,118 (+8.8%)** across four landings on 2026-09-03 (#2448, #2449,
+#2450, #2452), found because a peer asked rather than because anything reported it. The
+endpoint is confirmed here — the fixpoint ladder at `ff4b5f04` prints 1,996,118 — and the
+starting figure is as reported, not re-derived.
+
+`scripts/seed-size.py` makes it a gated number, in the shape `scripts/comment-budget.py`
+already proved: a committed baseline, `--check` in `scripts/gate.sh` and in ci-native, and
+`--write-baseline` in the SAME PR as the change that earned the growth. A jump then names its
+own landing instead of being attributed weeks later.
+
+### Why +3%, and why it does not block on shrinkage
+
+The bar is deliberately loose. What this gate defends is *nobody noticed* — not a byte budget —
+and a gate that reds on ordinary work is a gate people delete. 3% is wide enough that a normal
+landing passes in silence and narrow enough that the run which prompted this would have had to
+say something.
+
+What makes a loose per-landing bar bite anyway is that the growth it measures is **cumulative**:
+the baseline moves only when a human runs `--write-baseline`, so an unattended series of
+landings faces 3% TOTAL, not 3% each. That is the property worth having — it is exactly the
+four-landing drift that went unreported.
+
+Shrinkage prints and passes, and so does growth under the bar. A size TARGET is a different
+instrument with a different failure mode: it would make a legitimate feature look like a
+regression, and it would give a shrink the same ceremony as a jump. The only event this gate
+owes an alarm for is unexplained growth.
+
+### The reading is the FIXPOINT's, and one rung short measures the previous compiler
+
+A single `refresh-compiler.sh` off a stale seed compiles current source with the OLD compiler,
+so its byte count describes that compiler's codegen, not this one's. Measured at `ff4b5f04` on
+2026-09-03: one rung gave **1,842,901** bytes and the fixpoint **1,996,118** — 8.3% apart at
+one commit, which is larger than the bar itself. So ci-native runs `--check` immediately after
+`--prove-fixpoint`, and that reading is the deciding one; `gate.sh`'s row grades whatever seed
+is on disk and is informational when the local seed is one rung short.

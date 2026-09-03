@@ -58,6 +58,7 @@ import {
   TyObj,
   TyPrim,
   TyUnion,
+  TyVar,
   annUnionAtomsOf,
   anyLitUnionUsed,
   canonRewroteNode,
@@ -11105,6 +11106,14 @@ export function moduleHasUnionAs(): boolean {
       modUnionAsHit = true
       return true
     }
+    // …AND THE HOLE OPERAND, over-approximated. This scan has no `fnIx`, so it cannot ask the
+    // rep question `asExprIsUnionCastIn` asks; the safe direction is RESERVATION ⊇ LOWERING,
+    // because an unreserved slot the union arm writes is invalid wasm while an unused one
+    // costs the same "one unused local" this function's own header already prices. D1251.
+    if asExprOperandIsHole(i) {
+      modUnionAsHit = true
+      return true
+    }
     i = i + 1
   }
   modUnionAsSeen = P.nodes.length
@@ -11128,6 +11137,38 @@ export function asExprIsUnionCast(ix: i32): boolean {
   // arm expands it before deciding. This gate must agree or the cast falls to the numeric
   // ladder and emits an i32 conversion over a ref.
   if ot is TyNullable { return true }
+  false
+}
+
+// D1251 — the operand's recorded type is an unresolved inference HOLE. The checker solves an
+// un-annotated parameter from its own BODY (`unannotParamTy`), so a parameter only the CALL
+// SITE pins keeps a `TyVar` on every read of it — while the monomorphizer has already pinned
+// the INSTANCE's parameter to the argument's union, and every other box consumer reads that
+// pin. So `asExprIsUnionCast` declined, the cast fell past the union arm to the plain
+// conversion ladder where source and target are both unnamed, and NOTHING was emitted: the
+// box went straight into the i32 consumer — `vl check` rc 0, `expected i32, found (ref
+// $type)`, at `as`, `as?` and `as!` alike.
+export function asExprOperandIsHole(ix: i32): boolean {
+  if ix < 0 { return false }
+  const n = P.nodes[ix]
+  if !(n is AsExpr) { return false }
+  const oty = nodeTyIxOf(n.asObj)
+  if oty < 0 { return true }
+  const ot = T.tys[oty]
+  if ot is TyVar { return true }
+  false
+}
+
+// THE GATE THE LOWERING AND EVERY CAST-RESULT CLASSIFIER ASK: `asExprIsUnionCast`'s
+// node-local answer, plus the rung the recorded type cannot carry — a HOLE operand whose box
+// the emitter's own rep answer knows about. `exprUnion` is that answer, the same one the
+// union arm's own "needs a BOXED union operand" check already asks of the identical node, so
+// the gate and the arm cannot disagree about which operands carry a tag. D1251.
+export function asExprIsUnionCastIn(ix: i32, fnIx: i32): boolean {
+  if asExprIsUnionCast(ix) { return true }
+  if !asExprOperandIsHole(ix) { return false }
+  const n = P.nodes[ix]
+  if n is AsExpr { return exprUnion(n.asObj, fnIx) }
   false
 }
 
@@ -19616,6 +19657,44 @@ export function arrLitNestedElemKind(arrIx: i32): i32 {
   refArrElemKind(refElemArrName(en))
 }
 
+// D1270 — the ref-list element NAME of an array literal whose recorded ELEMENT is a NULLABLE
+// CONTAINER (`[f(0)]` where `f(): i32[] | null`), or "". The nullable-NICHE twin of
+// `arrLitNestedElemName`, and the same contract: the name is the emit render of the checker's
+// recorded element, which is the string the annotated `(i32[] | null)[]` spelling reduces to,
+// so both spellings intern ONE row. `nodeArrayElemName` renders a nullable element only when
+// its inner is a CLOSURE, so every other niche came back "" and the literal fell to the i32
+// list with a `(ref null $wrapper)` stored into it — `vl check` rc 0, invalid wasm.
+//
+// TWO GATES, both `arrLitNestedElemName`'s: the render must exist, and the REF-LIST LAYER must
+// be able to name it. `refElemArrName` re-groups only the niches it has a rep for, so a
+// nullable STRUCT or SCALAR element munges into a name no arm claims and declines — as does a
+// value-union BOX (kind 2), which is no niche. Declining leaves the program where it was.
+export function arrLitNulRefElemName(arrIx: i32): string {
+  const ty = nodeTyIxOf(arrIx)
+  if ty < 0 { return "" }
+  const t = T.tys[ty]
+  if t is TyArray {
+    if t.aElem >= 0 {
+      const el = T.tys[t.aElem]
+      if el is TyNullable {
+        const nen = tyToEmitName(t.aElem)
+        if nen == "" { return "" }
+        const an = refElemArrName(nen)
+        if !nameIsRefArray(an) { return "" }
+        if refArrElemKind(an) == 2 { return "" }
+        return nen
+      }
+    }
+  }
+  ""
+}
+
+// The element KIND for `arrLitNulRefElemName`'s literal — asked of the ONE producer the
+// annotation route asks, exactly as `arrLitNestedElemKind` is. D1270.
+export function arrLitNulRefElemKind(arrIx: i32): i32 {
+  refArrElemKind(refElemArrName(arrLitNulRefElemName(arrIx)))
+}
+
 // True if the array literal at `arrIx` has ref ELEMENTS — its first element is a
 // struct object literal (a `T[]` element) or a union-variant object literal (an
 // `N[]` element). An empty literal is NOT detectable here (it has no elements); its
@@ -19684,6 +19763,17 @@ export function arrLitIsRef(arrIx: i32) {
     // `tyNestedArrLeafSupported` bounding the leaf set. LAST, because a literal whose FIRST
     // ELEMENT is itself an array is already claimed by the `e0 is ArrayLit` rung above.
     if arrLitNestedElemName(arrIx) != "" { return true }
+    // D1270 — THE NULLABLE-NICHE ELEMENT, the sixth rung of the same shape and the one the
+    // list rung above is one peel short of: `[f(0)]` where `f(): i32[] | null` is no object
+    // literal, no nested LITERAL, no lambda, no map and no declared shape, and its recorded
+    // element is a `TyNullable`, not the `TyArray` that rung reads. So every probe missed it
+    // and the literal built the mono i32 list with a `(ref null $wrapper)` element stored
+    // into it — `vl check` rc 0 and `expected i32, found (ref null $type)`, while the
+    // annotated `(i32[] | null)[]` spelling runs at every position.
+    //
+    // LAST, for the reason the four rungs above state: it only ever claims a literal that
+    // was falling through to the i32 default.
+    if arrLitNulRefElemName(arrIx) != "" { return true }
   }
   false
 }
@@ -19954,6 +20044,14 @@ export function arrLitElemKind(arrIx: i32) {
     // into the union in any program that declares one — the same placement, and the same
     // reason, as the three rungs above.
     if arrLitNestedElemName(arrIx) != "" { return arrLitNestedElemKind(arrIx) }
+    // The checker-typed NULLABLE-CONTAINER element (`arrLitIsRef`'s last rung): the niche
+    // kinds 3 / 4 / 5 / 6 / 7 / 8 / 9 / 10 / 11, keyed off the ARENA render through the same
+    // authority the annotated `(i32[] | null)[]` spelling resolves by. ARM FOR ARM with
+    // `arrLitElemName`'s rung of the same shape — the two must answer per slot. D1270.
+    //
+    // BEFORE the `uDeclared` fall-through, which would otherwise box a niche element into the
+    // union in any program that declares one — the same placement as the four rungs above.
+    if arrLitNulRefElemName(arrIx) != "" { return arrLitNulRefElemKind(arrIx) }
   }
   if uDeclared { return 2 }
   1
@@ -20235,6 +20333,12 @@ export function arrLitElemName(arrIx: i32) {
     // `arrLitIsRef` and `arrLitElemKind`, which ask the identical predicate.
     const anl = arrLitNestedElemName(arrIx)
     if anl != "" { return anl }
+    // The checker-typed NULLABLE-CONTAINER element (`arrLitIsRef`'s last rung): the element's
+    // own emit render IS the table key — the same string `refArrElemName` yields for the
+    // annotated `(i32[] | null)[]` spelling, so both spellings intern ONE row. ARM FOR ARM
+    // with `arrLitIsRef` and `arrLitElemKind`, which ask the identical predicate. D1270.
+    const anr = arrLitNulRefElemName(arrIx)
+    if anr != "" { return anr }
   }
   ""
 }
@@ -26799,7 +26903,7 @@ export function exprVariantIndex(exprIx: i32, fnIx: i32) {
   // a `const c = mk(a) as Circle` binding fell past `letIsVariant` to the i32 slot default,
   // and the correct `ref.cast` the cast emits landed in a slot its consumer typed i32.
   if e is AsExpr {
-    if asExprIsUnionCast(exprIx) {
+    if asExprIsUnionCastIn(exprIx, fnIx) {
       const anm = nominalStructNameOfTy(nodeTyIxOf(exprIx))
       if anm != "" { return variantIndexOf(anm) }
     }
@@ -27620,7 +27724,7 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
       // `as!` and a bare `as` yield `T` itself — a plain scalar, never a box.
       return false
     }
-    if asExprIsUnionCast(exprIx) {
+    if asExprIsUnionCastIn(exprIx, fnIx) {
       const cty = nodeTyIxOf(exprIx)
       if cty >= 0 {
         const ct = T.tys[cty]
@@ -28188,7 +28292,19 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
     // hot path (declared / param / binding unions resolve from the cheap annotation above).
     return nodeUnionName(exprIx)
   }
-  if e is Ident { return unionNameOfIdent(e.identName, fnIx) }
+  // D1252 — THE IDENT ARM CARRIES THE SAME DECLINE ITS `Index` AND `Member` SIBLINGS DO.
+  // A binding narrowed to ONE arm reads UNBOXED, so it is no longer a union VALUE here and
+  // carries no union NAME either; `exprUnion`'s Ident arm already declines all three arms
+  // (scalar atom / ref array / map) and the two must answer together. Without it a rebind
+  // under the narrow (`if u != null { const v = u … }`) took the unboxed scalar CELL from
+  // `letIsUnion` while `letUnionNameOf` still named the union, so a later narrowed read of
+  // the rebind unboxed a slot that holds no box: `vl check` rc 0, invalid wasm.
+  if e is Ident {
+    if narrowedValueAtomOf(e.identName) != "" { return "" }
+    if narrowedRefArrayOf(e.identName) != "" { return "" }
+    if narrowedMapOf(e.identName) != "" { return "" }
+    return unionNameOfIdent(e.identName, fnIx)
+  }
   // A `?.` whose LEAF is a value-union field (code 16): the chain is that union plus `null`,
   // and the CHECKER's own type for the node is exactly that set — so it is rendered rather
   // than assembled here, which is what keeps the `null` member and the arm order right.
