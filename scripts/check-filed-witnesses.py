@@ -51,17 +51,19 @@ DOC SHAPE IT READS
 
         <4-space-indented VL program>
 
-The block a `Repro` lead-in introduces WINS over any earlier indented block, and lines
-inside it that begin with `//` are kept (they may be directives), so the program is used
-verbatim. Without that preference D957 graded on an indented ENGLISH paragraph that
-happened to precede its real witness.
+A `Repro` LEAD-IN IS THE ONLY WAY IN, and lines inside the block that begin with `//` are
+kept (they may be directives), so the program is used verbatim. The lead-in was once
+optional — the first indented block after the status line stood in for it — and prose is
+indented too: D957 graded for weeks on a numbered list's continuation lines, which are five
+spaces in. The rule is now retired BY CONSTRUCTION, every row carrying a label, so an
+unlabelled block is `no Repro block`, which `--strict` fails and names.
 
 A WITNESS THAT DOES NOT PARSE IS ITS OWN OUTCOME, `witness_unparsed` — never
 `check_reject`. Prose is a parse error, and a row declaring a check reject therefore
-graded `as filed` on a program that was never a program: `--strict` passed for the wrong
-reason on the one row whose repro was English. A row whose FILED outcome really is a
-parse-stage refusal (D46, D444, D471) says `parse error` in its status line and grades
-normally; every other unparsed witness lands in the fourth column and fails `--strict`.
+graded `as filed` on a program that was never a program. This is the SECOND half of that
+fix and it survives the first: a label can still be put above a paragraph, and only
+RUNNING the block tells you. A row whose FILED outcome really is a parse-stage refusal
+(D46, D444, D471) says `parse error` in its status line and grades normally.
 
 A witness that needs MORE THAN ONE MODULE splits the block with `// file: <name>.vl` marker
 lines; each marker starts a file and the LAST one is the entry that is checked, run and
@@ -349,19 +351,18 @@ def unparsed_row_heads(doc):
 # ANY heading, row or not. A row's scope has to END at one: `SEC` alone only closes a row at
 # the NEXT ROW, so the last row of a doc absorbed everything after it — in
 # `silent-class-inventory.md` that is the whole of `## 3. Shared-root analysis`, whose
-# `### Root A — …` headings are deliberately not rows. Harmless while every row led with an
-# explicit `Repro:` (the lead-in came first, so the right block won); the moment the FIRST
-# INDENTED BLOCK is accepted as a fallback it stops being harmless, because the last row
-# would take a program out of the analysis prose and grade THAT. Found by sabotage: deleting
-# a row's repro entirely left it still reporting as gradeable.
+# `### Root A — …` headings are deliberately not rows. That still bounds a `Repro:` lead-in
+# written BELOW such a heading, which belongs to no row and must not be handed to the one
+# above it. Found by sabotage: deleting a row's repro entirely left it reporting as
+# gradeable, because a block far below stood in.
 ANYHEAD = re.compile(r"^#{1,6}\s")
 
-def block_at(lines, i, at_line):
-    """The indented program a trigger at `lines[i]` introduces, or "". The `Repro:` lead-in
+def block_at(lines, i):
+    """The indented program the `Repro` lead-in at `lines[i]` introduces, or "". The lead-in
     may WRAP onto further prose lines before the block (D16 does), so scan forward for the
     first indented line, bounded so a section with no block at all cannot swallow the next
-    one's. When the INDENTED LINE is itself the trigger the scan starts AT it, not after."""
-    body, j, scanned = [], (i if at_line else i + 1), 0
+    one's."""
+    body, j, scanned = [], i + 1, 0
     while j < len(lines) and scanned < 6 and not lines[j].startswith("    "):
         if lines[j].strip() and re.match(r"^#{2,4}\s", lines[j]):
             break
@@ -373,20 +374,6 @@ def block_at(lines, i, at_line):
     return src + "\n" if src.strip() else ""
 
 
-# THE `Repro:` BLOCK WINS OVER AN EARLIER INDENTED ONE. Both are accepted (see the lead-in
-# comment in `parse`), but a row that took the trouble to LABEL its witness has said which
-# block is the program, and an indented paragraph above it is prose. D957 is the worked
-# instance: a numbered list wrote its continuation lines five spaces in, the fallback took
-# that English as the witness, `vl check` called it a parse error, and the row's declared
-# `check reject` matched — `--strict` green on a program nobody wrote.
-def close_row(cur):
-    """Settle which block is the witness, and record WHICH RULE supplied it."""
-    cur["rule"] = "Repro block" if cur["repro_labeled"] else (
-        "indented fallback" if cur["repro_fallback"] else None)
-    cur["repro"] = cur["repro_labeled"] or cur["repro_fallback"]
-    return cur
-
-
 def parse(doc):
     """Yield (id, title, declared_status_line, repro_source) per section."""
     lines = Path(doc).read_text().splitlines()
@@ -394,13 +381,13 @@ def parse(doc):
     for i, ln in enumerate(lines):
         m = SEC.match(ln)
         if m:
-            if cur: rows.append(close_row(cur))
+            if cur: rows.append(cur)
             cur = {"id": m.group(1), "title": m.group(2).strip(), "status": None,
-                   "repro_labeled": "", "repro_fallback": "", "doc": doc, "line": i + 1}
+                   "repro": "", "doc": doc, "line": i + 1}
             continue
         if ANYHEAD.match(ln):
             # A non-row heading CLOSES the row it follows; see `ANYHEAD`.
-            if cur: rows.append(close_row(cur))
+            if cur: rows.append(cur)
             cur = None
             continue
         if not cur:
@@ -422,26 +409,17 @@ def parse(doc):
                     if not lines[k].strip():
                         break
                     k += 1
-        # A `Repro:` LEAD-IN, or — where a doc does not use one — the FIRST INDENTED
-        # BLOCK after the status line. `silent-class-inventory-2.md` writes every row that
-        # way ("every defect below carries its minimal program ... pasted in full", its own
-        # header), and requiring the lead-in meant this could not parse a single one of its
-        # 14 rows: they reported as `not graded` and that file has read as live ever since.
-        # Taking the FIRST block of each kind is what keeps a row's `**Control**` program
-        # from being mistaken for its defect program — the defect's always comes first.
-        labeled = re.match(r"^Repro\b", ln) is not None
-        if cur["repro_labeled"] or not (
-            labeled or (not cur["repro_fallback"]
-                        and cur["status"] is not None and ln.startswith("    "))
-        ):
+        # A `Repro:` LEAD-IN AND NOTHING ELSE. The first indented block after the status
+        # line used to stand in where a doc wrote no lead-in, and an indented block is not
+        # a program — a numbered list's continuation lines are five spaces in, which is
+        # correct Markdown, and D957 graded on that English for weeks. The 25 rows that
+        # relied on the fallback now carry labels over their own unchanged programs, so the
+        # rule is retired with nothing to catch. Taking the FIRST labelled block is what
+        # keeps a row's `**Control**` program from being mistaken for its defect program.
+        if cur["repro"] or not re.match(r"^Repro\b", ln):
             continue
-        src = block_at(lines, i, ln.startswith("    "))
-        if src:
-            if labeled:
-                cur["repro_labeled"] = src
-            else:
-                cur["repro_fallback"] = src
-    if cur: rows.append(close_row(cur))
+        cur["repro"] = block_at(lines, i)
+    if cur: rows.append(cur)
     return rows
 
 def main(argv):
@@ -469,13 +447,12 @@ def main(argv):
             # AN UNPARSED WITNESS IS NOT A GRADE, it is a row with no program. A status may
             # file a parse-stage refusal deliberately (D46, D444, D471 all do) and those
             # grade as the check reject they declare; anything else lands in the fourth
-            # column NAMING which rule supplied the block, because the fallback picking up
-            # prose is how this happened and the row's author cannot see that from here.
+            # column. Retiring the indented fallback did not retire this: a label can be
+            # written above a paragraph too, and only running the block says so.
             if got == "witness_unparsed":
                 if not names_parse_error(r["status"]):
-                    ungradable.append((r, f"the witness does not PARSE, and the status does "
-                                          f"not file a parse error as the outcome "
-                                          f"(block came from the {r['rule']})"))
+                    ungradable.append((r, "the witness does not PARSE, and the status does "
+                                          "not file a parse error as the outcome"))
                     continue
                 got = "check_reject"
             # A WRONG VALUE IS INVISIBLE ON THE THREE CHANNELS `run_program` reads: the
