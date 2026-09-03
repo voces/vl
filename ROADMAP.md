@@ -73,12 +73,30 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   proceeds past a parse diagnostic (a recovered program checks, it does not build), and
   `formatSrc` keeps the ANY reading because `fmt -w` would otherwise re-spell the mistake.
   **STAGE 2 is the remainder and needs no further ruling**: convert the lossy skip sites
-  one at a time — `expectClose`'s skip-to-closer first, then the `then`-removal arm, which
-  is already single-statement — each conversion making a recovery faithful and then
-  deleting its pin from `tests/vl_lossless_recovery_test.ts`. The five phantom cases that
-  suite pins are the standing regression floor; widening the gate without making the
-  recovery faithful is exactly what they exist to stop. DECISIONS.md §"A recovered parse
-  IS typechecked" is the durable home.
+  one at a time — each conversion making a recovery faithful and then deleting its pin from
+  `tests/vl_lossless_recovery_test.ts`. The phantom cases that suite pins are the standing
+  regression floor; widening the gate without making the recovery faithful is exactly what
+  they exist to stop. DECISIONS.md §"A recovered parse IS typechecked" is the durable home.
+  - **`expectClose`'s skip-to-closer — DONE #2397.** The defect was never the arity: the
+    parser had no separator arm, so an element-starting token ended the list and
+    `expectClose`'s scan DELETED it on the way to the closer. A missing list separator is
+    now diagnosed and INSERTED (`parseArgs` / `parseArrayLit` / `parseObjLit` /
+    `parseParamList`, each gated on its own element-start test), and `expectClose` marks
+    LOSSLESS exactly when its scan consumed nothing — a closer that is merely missing drops
+    no token. `f(1 2)`, `f(1 2 3)`, `g(f(1 2), 3)`, `[1 2]`, `{x: 1 y: 2}` and
+    `function f(a: i32 b: i32)` all typecheck now, and `f(1 2 3)` against a two-parameter
+    `f` reports the TRUE `expected 2, got 3`. `[{x: 1} {x: 2}]` is correctly still gated —
+    `{` is not an element start, by the same argument that makes it `expectClose`'s scan
+    bound. **The insert is SAME-LINE ONLY**, and the first cut of the change proved why:
+    every list site skips NEWLINEs, so an ungated insert read a missing CLOSER at end of
+    line as a missing COMMA and swallowed the next statement as an element
+    (`const xs = [1, 2` / `print(xs.length)` invented two type errors) — the exact phantom
+    class the pins exist to stop. The price is that a missing comma at a line end inside a
+    MULTI-LINE list is not inserted either; a missing closer and a missing separator are
+    indistinguishable there, and that spelling behaves exactly as master does. Four pins
+    remain. DECISIONS.md §"A missing list separator is inserted, never skipped past".
+  - **NEXT: the `then`-removal arm in `parseIf`**, which is already single-statement and was
+    called out at stage 1 as the cheapest remaining candidate.
 - **Width subtyping — RULED (owner, 2026-09-01): the non-prefix refusal is a GAP, closed
   the Roc way** — shape-monomorphization of narrow-typed consumers (offsets constant per
   caller shape; zero runtime cost; paid in instance count — the variant-count tradeoff
@@ -192,13 +210,15 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   error. DECISIONS.md §"Numeric `as` to an INTEGER target is exact-or-fail
   under the trio" has the survey (Julia's `Int(3.9)` InexactError / `trunc(Int, x)` is the
   model adopted) and the cost. Compiler-side; the compile-goal session's surface.
-- **A subsumed literal arm COLLAPSES — RULED (owner, 2026-09-02); THE COLLAPSE IS BUILT, the
-  two dedicated HINTS are not.** The bare-literal half shipped as **D1024** and the MIRROR
+- **A subsumed literal arm COLLAPSES — RULED (owner, 2026-09-02); DONE — the collapse AND
+  both hints.** The bare-literal half shipped as **D1024** and the MIRROR
   (`Kind | string` is `string`) as **D1048**, which needed the drop in BOTH producers — at
   type construction (`unionDropSubsumedArms`) and on the annotation SPELLING
-  (`canonDropSubsumedParts`), each alone a `runs → not-runs` veto. The first hint arrives
-  free (the existing redundant-annotation hint now fires at a collapsed annotation); the
-  `is <literal>`-whose-operand-collapsed hint is still to write. A union is a
+  (`canonDropSubsumedParts`), each alone a `runs → not-runs` veto. The first hint arrived
+  free (the existing redundant-annotation hint fires at a collapsed annotation); the
+  SECOND — at an `is <literal>` whose operand collapsed — is now built, keyed on the
+  provenance the collapse RECORDS (`collapsedTy` / `collapsedAliases`), because the
+  collapsed type itself carries no trace of the dropped arm. A union is a
   set of values; an arm that adds none adds no arm, decided per arm after flattening and
   through aliases: `string | "err"` is `string`, `Name | "err"` (alias) is `Name`,
   `Json | "err"` is `Json`, `Kind | string` is `string`; `Kind | "err"` (three atoms) and
@@ -210,9 +230,18 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   **D1024** (`function f(): string | "err"` is check-clean invalid wasm today because the
   literal widens to a DUPLICATE `string` atom); then the two hints. Grade on D1024's spelling
   table (`return`, parameter, alias, `Json | "err"`, `Kind | string`, module-scope binding)
-  and on `is "err"` answering as `==` at each. The generic-instantiation refusal that shared
-  D1024's table (`orErr<T>(): T | "err"` at `T = i32` → `no recorded members`) is NOT this
-  item: it is about mono-minted unions, struct arm or literal alike — **D1042**.
+  and on `is "err"` answering as `==` at each. The second hint's own grade is the 18-program
+  A/B in `tests/cases/literal-unions/is-literal-over-collapsed-arm.vl` plus that file's
+  negatives (a real litunion, a real two-arm box, a plainly-declared `string`, a shadowing
+  inner binding, a generic instantiation, and a non-literal check type). The generic-instantiation refusal that shared
+  D1024's table (`orErr<T>(): T | "err"` at `T = i32` → `no recorded members`) was NOT this
+  item — it is about mono-minted unions, struct arm or literal alike — and it has since
+  CLOSED as **D1042**: the pin registers its union through `canonEmitName`, so the clone and
+  the direct spelling meet on ONE row. Closing it exposed **D1193** (a literal `is` narrowed
+  neither branch, so every position that READ the value rather than printing it was
+  check-clean invalid wasm at the direct spelling too), which shipped with it. The residue is
+  **D1194**: an inferred return that takes its union from a callee's declared `i32 | "err"`
+  is still a loud check reject conceding codegen.
   DECISIONS.md §"A subsumed literal arm COLLAPSES". Compiler-side; compile-goal surface.
 - **`is A` over same-shape struct arms is a DISCRIMINANT-VALUE test — RULED (owner,
   2026-09-02), DONE (#2365).** `type Circle = { kind: "circle", r: f64 }` /
@@ -238,11 +267,18 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   numbering would have forced interning per base type. Two arms the tag already merged also
   had to be merged in `buildVariantTwins`, whose canon key preserves each arm's literal set:
   a shared tag with two heap types reproduced the filed trap from the other side.
-  **Residue, named:** a named litunion ALIAS in one arm beside an inline set in the other is
-  legal by the ruling and still refuses, because the two litunion reps (interned atom /
-  string ref) share no layout — **D1050**, the litunion rep cliff. D1023's RULED paragraph
-  has the six-row table and the grading list; DECISIONS.md §"`is A` over same-shape struct
-  arms is a DISCRIMINANT-VALUE test". The std rule that was interim is now only a style
+  **Residue, named and now CLOSED (D1050, 2026-09-02):** a named litunion ALIAS in one arm
+  beside an inline set in the other is legal by the ruling and refused, because the two
+  litunion reps (interned atom / string ref) share no layout. The close lays the mixed field
+  out under ONE rep — the interned ATOM — in the variant row and the arm's declared struct
+  row, so the arms fold onto a single heap type; the WHOLE-TREE litunion unification (the rep
+  cliff proper) was NOT needed and remains unbuilt. **The cliff was smaller than its name**:
+  scoped to the arms of a mixed pair, it moved 0 of 255,504 corpus cells and emits master's
+  own source byte-identically. Its BOUND is `tyIsLitUnion` on both arms — a set beside its
+  own BASE (`{kind: K1} | {kind: string}`) and a BARE single literal are not atom material and
+  keep the loud refusal, so the message literal stays counted. D1023's RULED paragraph has the
+  six-row table and the grading list; DECISIONS.md §"`is A` over same-shape struct arms is a
+  DISCRIMINANT-VALUE test" and §"a mixed-spelling variant field carries the ATOM". The std rule that was interim is now only a style
   preference: a std error struct no longer NEEDS a unique field name, since a unique `kind`
   literal discriminates. Compiler-side; compile-goal surface.
 - **A `type` declared in a function body is LEGAL and lexically scoped — SHIPPED (#2391).**

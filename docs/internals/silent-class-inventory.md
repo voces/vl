@@ -33059,9 +33059,10 @@ Repro:
 
 ### D1042 — a union RETURN TYPE minted by GENERIC INSTANTIATION (`T | "err"` / `T | E` at a scalar `T`) has "no recorded members": check-clean, refused at emit on the `is` test or the box; the same union spelled directly runs
 
-**loud emit reject on a `vl check`-clean program — OPEN, clause 2 · found 2026-09-02 (vl-b7)
-ablating the `i32 | "err"` face D1024's row had filed as the literal arm's numeric twin; the
-literal is SCENERY — a struct arm refuses identically**
+**CLOSED 2026-09-02 — the repro now RUNS and prints `5`. Was: loud emit reject on a
+`vl check`-clean program · clause 2 · found 2026-09-02 (vl-b7) ablating the `i32 | "err"` face
+D1024's row had filed as the literal arm's numeric twin; the literal is SCENERY — a struct arm
+refused identically**
 
 Repro:
 
@@ -33137,6 +33138,40 @@ Repro:
   and so never hit it). It should close by registering the clone's union where the direct
   spelling registers its own — not by an emit arm — and grade on every row above plus the
   D965 delivery matrix for the instantiated value.
+
+* **HOW IT CLOSED (2026-09-02) — the registration is AT THE PIN, and it goes THROUGH CANON.**
+  `monoMakeInstance` already substitutes the return annotation per instance
+  (`nret = synthTypeRefTy(rs, -1, retTy)`); the two lines added there render `rs` through
+  `canonEmitName` when it splits to 2+ atoms (`monoPinUnionName`) and register the result
+  (`monoRegisterPinUnion` → `registerInlineUnion(monoProgStmts, …)`). That is ingredients (1)
+  and (2) in one place, which is why no retry at the failing lookup was needed: the clone's
+  key is now the DIRECT spelling's key, so `registerInlineUnion`'s own `isUName` gate reuses
+  the existing row wherever one exists and mints exactly one otherwise. The trap the row
+  above records is avoided for the same reason — one row per union, never one per call site.
+  `assignTags()` re-runs only when the registration pushed a VARIANT (a struct-armed union);
+  a value union pushes none and the global ranking is untouched.
+
+  **AND THE PARAGRAPH ABOVE ABOUT `mkFunc(specName, …, fn.fnRet, …)` DESCRIBES THE OTHER
+  CLONE.** That line is the CALLBACK specialization path (`name$cbN`); the generic path
+  substitutes its return through `monoSubstAnn` + `substTyDeep` and mints a fresh
+  `TypeRef`, which is exactly the per-instance node the row said did not exist. Probed at
+  the pin on seed 8a7820e2: `rn=[T|"err"] rs=[i32|"err"] canon=[i32|string] rowRs=-1
+  rowCanon=-1`.
+
+* **AND THE THIRD REFUSAL WAS NOT IN THIS FAMILY — it was a SECOND defect at the DIRECT
+  spelling, filed as [D1193](#d1193).** With the registry closed, every position that merely
+  *printed* the box ran, and every position that READ the narrowed value (`r * 2`, `b.r`) was
+  check-clean invalid wasm — at the pin, at the direct spelling and at the bare annotated
+  binding alike. `const r: i32 | "err" = 21` + `if r is "err" {} else { print(r * 2) }` is
+  the witness, with no generic anywhere. Both are fixed in this PR, because shipping the
+  registry alone would have moved seven of the nine delivery positions loud → silent.
+
+* **THE GRADE, 46 cells, `git archive origin/master` vs the candidate.** 30 cells moved
+  not-runs → RUNS, 0 runs → not-runs, 0 → silent. The three that do not run are correct
+  refusals: `is string` over `i32 | "err"` and `*` over `i32 | string` are checker rules, and
+  an INFERRED union return carrying a literal arm (`function wrap(n, b) { return orErr(n, b) }`)
+  is a pre-existing checker refusal unchanged by this PR — the one piece of residue, and it is
+  the inferred-return family, not this one.
 
 ### D1043 — a litunion beside an EXTRA literal of its own base is a loud emit reject at the INLINE spelling and RUNS at the declared one: `Kind | "err"` vs `type R = Kind | "err"`
 
@@ -36641,11 +36676,59 @@ Repro (check rc 1, two errors):
   rejected, so exhaustiveness then reports the arm missing. A fix at the membership rule clears
   both.
 
-### D1050 — a union whose two arms spell their literal discriminant DIFFERENTLY (a named alias in one, an inline set in the other) refuses at emit, though both are string literal sets and D1023 rules the pair legal
+### D1050 — [CLOSED 2026-09-02] a union whose two arms spell their literal discriminant DIFFERENTLY (a named alias in one, an inline set in the other) refuses at emit, though both are string literal sets and D1023 rules the pair legal
 
-**loud emit reject · check rc 0 · clause 2 · `emitProgram: union `A|B` discriminates `A` from `B` on a literal field whose two arms rep differently … this program is type-valid but cannot build` · ZERO corpus cells · the ONE spelling of D1023's family the ruling calls legal that the build of it (#2365) did not close, named by that build rather than found later**
+**runs, prints `2` — CLOSED 2026-09-02 by laying the mixed field out under ONE rep (the
+interned ATOM) in the variant row AND the arm's declared struct row · was a loud emit reject,
+clause 2 · a 48-cell spelling/position/face matrix goes 9 → 42 `runs` · zero `runs` lost,
+distilled corpus UNMOVED (0 classes of 255,504 cells, 0 into silent), rep-fuzz exact, fixpoint
+holds, candidate emits master's OWN source byte-identically · probes 63/75 → 64/76 · fixtures
+`unions/discriminant-mixed-litunion-spelling.vl` + `unions/error-discriminant-mixed-rep-no-atom.vl`**
 
-Repro:
+* **THE FIX IS A REP CHANGE AND THE WASM SAYS SO.** Master emitted two struct types for the
+  pair and could fold neither; the candidate emits ONE —
+  `(type $0 (struct (field (mut i32)) (field (mut f64))))`, `kind` the interned id in BOTH
+  arms, where the inline arm was a `(ref $string)`. `unifyMixedLitRepArms` (`emit_collect.vl`)
+  runs at the end of `collectS`, where both field tables are complete, and rewrites the
+  string-coded row's CODE and its D5 arena sidecar in the variant table AND in the arm's
+  declared struct row. Moving only the first is invalid wasm: the declared row is what
+  `variantStructHeapTwinAt` merges the arm with and what `const s: B = { kind: "x", r: 7.0 }`
+  outside the union builds.
+
+* **THE ATOM SIDE WAS CHOSEN BECAUSE ITS CONSUMERS ARE ALREADY BUILT** — measured, not
+  preferred. `emitDiscrimFieldEq`'s code-0 arm already compares interned ids,
+  `emitVariantStruct`'s `variantFieldIsLitUnion` arm already interns the member literal at
+  CONSTRUCTION, `exprIsLitAtom`'s variant/struct member arms already claim the READ off the
+  same field code, and `emitAtomToStr` already widens it back at every string boundary. So
+  the four conversion sites the design needs cost ZERO new lowering; unifying on the STRING
+  side would need all four written from scratch for the alias arm, and would give that alias
+  a rep the rest of the module does not use for it. Design (α), not (β): the whole-tree
+  litunion rep is untouched, and `regress.py` moved 0 classes.
+
+* **`assignTags` ADMITS, `unifyMixedLitRepArms` ACTS, `buildVariantTwins` FOLDS — one
+  predicate, three readers.** `assignTags` runs at the end of `collectU`, one pass BEFORE the
+  struct table exists, so it cannot do the re-lay itself; it admits on
+  `variantLitRepUnifiable`, which is the acting pass's own applicability test.
+  `variantLitDiscriminable` keeps asking the strict "agree as laid out" question, because
+  `buildVariantTwins` runs after the unification and must see the FINAL layout. Both are arms
+  of one walk (`variantLitPairKind`), so the three answers cannot drift.
+
+* **THE BOUND IS `tyIsLitUnion` ON BOTH ARMS, and it keeps two shapes refused ON PURPOSE.**
+  `{kind: K1} | {kind: string}` (a set beside its own base — legal by D1023's amendment) and
+  `{kind: K1} | {kind: "a"}` (a BARE single literal, a `TyLit` rather than a `TyUnion`) are
+  not atom material: the base arm holds an arbitrary string with no interned id, and a bare
+  literal is not a litunion to the read classifier, so an atom stored there would print as its
+  raw id. Both keep the loud message, which is still the right diagnosis — so
+  `goal-scoreboard.py --sites` stays at **22** literals and the SITE narrowed rather than
+  cleared. Probe: `capability-probes/litunion-mixed-arm-with-base-partner.vl` (GAP).
+
+* **TWO RESIDUE ROWS CAME OUT OF THE POSITION MATRIX**, and one of them was already master's:
+  [D1195](#d1195) (a narrowed arm delivered to an inline-SHAPE-annotated param mints a second
+  heap type — reproduces on master at BOTH same-rep spellings, so the D1050 refusal was a
+  loud FLOOR standing over it) and [D1196](#d1196) (the annotated-inline rebind off a
+  promoted field, `emitProgram: only i32 locals are supported`).
+
+Repro (runs, prints `2`):
 
     type K1 = "circle" | "round"
     type A = { kind: K1, r: f64 }
@@ -36658,33 +36741,36 @@ Repro:
 
 Both arms carry a string literal set at `kind`, so by D1023's rule — "treat a pair as
 distinguishable where BOTH arms carry a literal set of the SAME base type at some field" —
-this is a legal discriminated union and `f(1) is B` should be `true`. The CHECKER agrees: it
-asks by base and accepts. The EMITTER refuses, and its reason is real rather than an
-oversight.
+this is a legal discriminated union and `f(1) is B` is `true`. The CHECKER always agreed: it
+asks by base and accepts. The EMITTER refused, and its reason was real rather than an
+oversight — which is why closing it took a layout change and not a relaxed gate.
 
-* **TWO REPS, ONE SEAM.** A string literal union has two representations and
-  `nodeTyIsLitUnionAlias` is the seam between them: a registered ALIAS (`type K1 = …`) is the
-  interned `i32` atom, an inline `"x" | "y"` a `(ref $string)`. Put one of each in two arms
-  and the TYPES agree about everything the ruling asks while the LAYOUTS do not, so there is
-  no single heap type for the arms to share — and a shared tag with two heap types is not a
-  representation (D1023's own second finding, reached from the other direction).
+* **TWO REPS, ONE SEAM — the diagnosis, kept.** A string literal union has two
+  representations and `nodeTyIsLitUnionAlias` is the seam between them: a registered ALIAS
+  (`type K1 = …`) is the interned `i32` atom, an inline `"x" | "y"` a `(ref $string)`. Put one
+  of each in two arms and the TYPES agree about everything the ruling asks while the LAYOUTS
+  do not, so there was no single heap type for the arms to share — and a shared tag with two
+  heap types is not a representation (D1023's own second finding, reached from the other
+  direction). The close gives them one layout rather than one tag over two.
 
-* **WHY IT WAS NOT CLOSED WITH D1023.** Closing it means unifying the two litunion reps,
-  which is the litunion rep cliff — a rep change with corpus-wide byte effects, and the one
-  thing D1023's brief said to stop and report rather than widen into. `variantLitDiscriminable`
-  therefore compares the field's STORAGE CODE, which parts this pair while admitting every
-  same-rep one.
+* **WHY IT WAS NOT CLOSED WITH D1023, AND WHY THE CLIFF WAS SMALLER THAN THE NAME SUGGESTS.**
+  The brief said closing it means unifying the two litunion reps — the rep cliff, with
+  corpus-wide byte effects — so `variantLitDiscriminable` compared the field's STORAGE CODE,
+  parting this pair while admitting every same-rep one. That framing assumed the unification
+  had to be GLOBAL. It does not: unifying only the field of an ARM of a mixed pair moves the
+  two rows that pair actually has, and the distilled corpus moved **0 classes of 255,504
+  cells**. The whole-tree unification (design β) remains unbuilt and is not needed for this.
 
-* **CLAUSE 2, AND IT IS COUNTED.** The refusal concedes the program is type-valid in those
-  words, so `goal-scoreboard.py --sites` sees it (22 → 23 message literals). That is
-  deliberate: the previous sentence for this pair said they "have the same field names but
-  different field types", which is FALSE here — the types agree and only the reps do not —
-  and a gap wearing an invariant's clothes is the direction that hides.
+* **CLAUSE 2, AND THE LITERAL STAYS AT 22.** The refusal concedes the program is type-valid in
+  those words, so `goal-scoreboard.py --sites` sees it. It still does, and should: the same
+  sentence is the right diagnosis for the two shapes that are not atom material (see the bound
+  above). The site NARROWED; a `--sites` row does not clear when part of its domain closes,
+  and the probe runner is the instrument that moved.
 
-* **THE WORKAROUND IS EXACT AND THE MESSAGE NAMES IT**: spell both arms the same way. Two
-  aliases work (`variantLitDiscriminable` admits `K1` beside `K2` — the elem-name column is
-  an identity there, not a storage), and two inline sets work. Probe:
-  `scripts/capability-probes/litunion-alias-and-inline-arms.vl`.
+* **THE OLD WORKAROUND, kept as the control set**: spell both arms the same way. Two aliases
+  work (`variantLitDiscriminable` admits `K1` beside `K2` — the elem-name column is an
+  identity there, not a storage), and two inline sets work. Both are graded in the fixture and
+  both still run. Probe: `scripts/capability-probes/litunion-alias-and-inline-arms.vl` (RUNS).
 ---
 
 ### D1110 — [CLOSED 2026-09-02] an INLINE-SHAPE ANNOTATION lays a literal-union field out as the i32 ATOM while the DECLARED and VARIANT recorders lay it out as a string ref, so passing an identically-spelled struct to such a param is check-clean invalid wasm
@@ -37357,3 +37443,195 @@ Repro (runs today and must keep running — the struct-table half of the same sh
   the reconciliation D1152 installed is the pattern — one length check at the head of the
   consumer, not a guard at each of thirty reads.
 
+
+---
+
+### D1193 — a LITERAL `is` narrows neither branch in the emitter: `i32 | "err"` tested against `"err"` is check-clean invalid wasm the moment either branch READS the value rather than printing it
+
+**CLOSED 2026-09-02 — the repro now RUNS and prints `42`. Was: check-clean invalid wasm ·
+clause 1 · found 2026-09-02 (vl-b7) ablating D1042's delivery matrix — seven of nine positions
+were silent at the DIRECT spelling too, so closing D1042's registry alone would have shipped
+loud → silent**
+
+Repro (now prints `42`; it was `vl check` rc 0 and a module the engine refused with
+`type mismatch: expected i32, found (ref $type)`):
+
+    const r: i32 | "err" = 21
+    if r is "err" { print("failed") } else { print(r * 2) }
+
+* **ABLATED — the LITERAL is the whole ingredient, and no function is needed.** The identical
+  program over `i32 | string` with `is string` RUNS at every position, before and after. So
+  does the same union with a two-literal arm. What fails is a union whose string arm is ONE
+  literal, tested against that literal.
+
+* **ONE MECHANISM, BOTH BRANCHES, AND IT IS THE SAME TWO-PRODUCER SPLIT D1042 NAMED.** The
+  emitter sees the union canon-SOFTENED to `i32|string` (`canonEmitNameAt`'s literal-member
+  arm) while the CHECKER keeps `i32 | "err"` and narrows against it.
+
+  * ELSE: `setNarrowFromCondElse`'s subtraction looks for a member spelled `"err"` in
+    `i32|string`, finds none and pushes nothing — `valueAtomKind("\"err\"")` is -1, so the
+    atom arm never fires either. The binding stays the box and `r * 2` reads a `(ref $uBox)`
+    as an i32.
+  * THEN: `pushNarrowIs` banks a bare `TyLit`, and `narrowedValueAtomOf`'s litunion leg is
+    `tyIsLitUnion` — a `TyUnion` test — so a ONE-literal arm reached neither it nor
+    `valueAtomKind`, and the read stayed the raw box there too.
+
+* **WHY IT LOOKED CLOSED AT `print`.** `print(r)` in the else branch prints `5` correctly
+  from an UN-narrowed box, because print dispatches on the box tag. Every position that
+  merely printed passed; every position that read the narrowed value (`r * 2`, `b.r`, a
+  re-bind `const v: i32 = r`) was silent. A fixture that only prints cannot see this.
+
+* **FIXED** by asking the DECLARED arena type instead of the softened member set
+  (`litElseNarrow`, `emit_classify.vl`): remove the member whose own lexeme IS the tested
+  literal, narrow only when exactly ONE member survives, and render the survivor the way its
+  consumer resolves it (`tyToEmitName` for a value atom, `tyToNominalName` gated on
+  `variantIndexOf` for a struct arm). Plus one line in `narrowedValueAtomOf` for the then
+  branch: a bare string-literal type unboxes as `string`, which is the rep `emitUnionLitIs`
+  already tags it with (`lak = 2`).
+
+  **THE RULE IS THE CHECKER'S, ARM FOR ARM,** which is what makes the subtraction sound
+  rather than a guess. `"a" | "b" | i32` minus `"a"` leaves two members and pushes nothing —
+  the else branch may still hold `"b"`. `i32 | string` matches no member lexeme and pushes
+  nothing — and the checker rejects that program's else-branch arithmetic anyway
+  (`operator '*' is not defined for i32 | string and i32`), which is the control proving the
+  language never narrowed there.
+
+* **GRADED:** 13 cells moved silent → RUNS at the direct, annotated and generic-pinned
+  spellings (binding, function return, parameter, struct field, module global, re-bind, an
+  `f64` survivor and a `Circle` survivor). 0 `runs` lost. Fixture:
+  `tests/cases/literal-unions/literal-arm-narrowed-read.vl`; probe:
+  `scripts/capability-probes/literal-arm-narrowed-read.vl`.
+
+---
+
+### D1194 — an INFERRED return whose union carries a string-LITERAL member is a loud check reject conceding codegen; the plain-`string` twin runs and so does the annotated one
+
+**loud check reject on a type-valid program — OPEN, clause 2 · found 2026-09-02 (vl-b7) as the
+one residue of D1042's delivery matrix: the RETURN position, the only one of nine that does not
+run**
+
+Repro:
+
+    function mk(b: boolean): i32 | "err" {
+      if b { return "err" }
+      return 5
+    }
+    function wrap(b: boolean) {
+      return mk(b)
+    }
+    const r = wrap(false)
+    if r is "err" { print("failed") } else { print(r * 2) }
+
+`'wrap' infers the union return type i32 | "err" — type-valid, but an inferred return of this
+shape is not yet supported by codegen; annotate the return type`. Want `10`.
+
+* **ABLATED — the LITERAL member is the ingredient, not the inference and not the generic.**
+  Same program with `mk(): i32 | string` and `is string`: **RUNS**, prints `10`. Same program
+  with `function wrap(b: boolean): i32 | "err"` annotated: **RUNS**, prints `10`. The generic
+  spelling (`wrap` returning `orErr(n, b)`) gives the identical message, so it is the union's
+  shape and not the pin.
+
+* **NOT the direct literal-return join.** `function wrap(b) { if b { return "err" }; return 5 }`
+  infers `string | i32` — the join SOFTENS a returned literal — so it is a different program
+  and refuses for a different reason (`operator '*' is not defined for string | i32 and i32`,
+  which is the language's own inference rule). The row is about an inferred return that takes
+  its union from a CALLEE's declared type, where the literal survives.
+
+* **The refusal admits it** (`not yet supported by codegen`), so it is one of the literals
+  `goal-scoreboard.py --sites` counts, and it is reached by no corpus cell.
+
+---
+
+### D1195 — a NARROWED union arm delivered to a param annotated with the arm's own INLINE SHAPE mints a SECOND heap type for one layout: check-clean invalid wasm at both same-rep spellings
+
+**check-clean invalid wasm: `type mismatch: expected (ref $type), found (ref $type)` ·
+`vl check` rc 0 · clause 1 · PRE-EXISTING: identical on master (`278e0379`, 2026-09-02) at
+BOTH same-rep spellings · found 2026-09-02 in [D1050](#d1050)'s position matrix, where the
+mixed spelling stopped being a loud refusal and started reaching this instead — the refusal
+was a loud FLOOR standing over an older defect, not a statement about the program**
+
+Repro:
+
+    type A = { kind: "circle" | "round", r: f64 }
+    type B = { kind: "x" | "y", r: f64 }
+    function f(n: i32): A | B {
+      if n == 0 { return { kind: "circle", r: 1.0 } }
+      return { kind: "x", r: 2.0 }
+    }
+    function g(v: { kind: "x" | "y", r: f64 }): i32 { 3 }
+    const b = f(1)
+    if b is B { print(g(b)) } else { print("notB") }
+    // vl check rc 0; vl run -> Invalid input WebAssembly code:
+    //   type mismatch: expected (ref $type), found (ref $type)
+
+* **TWO IDENTICAL STRUCTS IN ONE MODULE, read off `wasm-dis` rather than inferred.** The
+  emitted type section carries `(type $0 …)` and `(type $1 …)` with the SAME field list — the
+  anon shape row the inline-shape ANNOTATION interned, and the arm's own heap type. The
+  narrowed read `ref.cast`s to the second and `g` expects the first.
+
+* **IT IS NOT [D1110](#d1110), which is closed.** That row is the two producers DISAGREEING
+  about a literal field's rep (atom vs string ref); here the two rows agree about the layout
+  completely and are still two heap types. Its control runs on the same seed:
+  `function g(v: {kind:"x"|"y", r:f64})` with a DECLARED `const b: B = {…}` and no union
+  prints `3`.
+
+* **THE ABLATION NAMES BOTH INGREDIENTS**, and each alone runs:
+  * the union must be LIVE — the value has to arrive through it. With `const b: B = { kind:
+    "x", r: 2.0 }` built directly and the union still declared and exercised elsewhere, the
+    same `g(b)` prints `3`.
+  * the receiver must be NARROWED — `if b is B { g(b) }`. That is the `ref.cast` to the arm's
+    heap type, which is the type the param's anon shape row is not.
+
+* **SAME-REP SPELLINGS ARE THE CONTROLS AND THEY BOTH FAIL ON MASTER**: two inline sets (the
+  repro above) and two aliases (`type K1`/`type K2`, `function g(v: { kind: K2, r: f64 })`).
+  So the population is "a narrowed arm into an inline-shape param", with the literal field
+  incidental.
+
+---
+
+### D1196 — an ANNOTATED rebind off a D1050-unified discriminant field is `only i32 locals are supported`; the un-annotated rebind and every other delivery position run
+
+---
+
+**loud emit reject: `emitProgram: only i32 locals are supported` · `vl check` rc 0 · clause 2 ·
+filed 2026-09-02 as the ONE position of [D1050](#d1050)'s delivery matrix that its close does
+not reach · the ANNOTATED face; the un-annotated face of the same line runs**
+
+Repro:
+
+    type K1 = "circle" | "round"
+    type A = { kind: K1, r: f64 }
+    type B = { kind: "x" | "y", r: f64 }
+    function f(n: i32): A | B {
+      if n == 0 { return { kind: "circle", r: 1.0 } }
+      return { kind: "x", r: 2.0 }
+    }
+    const b = f(1)
+    if b is B { const k: "x" | "y" = b.kind print(k) } else { print("notB") }
+    // vl check rc 0; vl run -> emitProgram: only i32 locals are supported
+
+* **DROP THE ANNOTATION AND IT RUNS.** `const k = b.kind` prints `x`, and so does every other
+  position the matrix grades — argument at `string`, return at the inline set, struct field,
+  array element, module global, `Map` value, `+` concatenation, and the ALIAS arm's field at
+  all of them. This is the one cell of 48 that the close leaves refused.
+
+* **THE RUNG.** `collectLocals` claims a litunion local through `letIsLitUnion` (the
+  annotation is a litunion ALIAS) or `letInitIsLitAtom` (UN-annotated, atom initializer). An
+  INLINE-litunion annotation over an atom initializer is neither, so the binding falls past
+  `letIsString` — whose `exprString` declines the now-atom-repped field read — to
+  `checkLocalI32`, whose guard is `nodeTyIsLitUnionAlias` and answers false for the inline
+  spelling.
+
+* **THE ONE-LINE FIX WAS BUILT AND REFUSED, and its price is the reason this row exists rather
+  than a patch.** Gating `letInitIsLitAtom`'s annotated arm on
+  `tyIsLitUnion(nodeTyIxOf(d.letType))` does re-slot the binding as an atom local — and the
+  program becomes **check-clean invalid wasm**, because the `print` widen's str-op scratch
+  frame reservation scan does not see the new atom slot. That is loud → silent, the one trade
+  this repo refuses, so the loud refusal stands. Closing it means teaching the reservation
+  scan about the slot, not the classifier about the annotation. The decline is recorded in
+  `letInitIsLitAtom`'s own header so the next reader does not re-derive it.
+
+* **THE CONTROLS RUN AT BOTH SAME-REP SPELLINGS.** `const k: "x" | "y" = b.kind` with both
+  arms inline, and with both arms aliases, each print `x` — so the gap is specific to a field
+  the unification promoted, and did not exist before D1050 closed (before it, the whole
+  program was D1050's own refusal).

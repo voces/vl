@@ -21,9 +21,9 @@
 // Directive semantics (the corpus's `// @directive` contract), with the wasm
 // tier's documented deltas:
 //   - @warning/@info/@hint are adjudicated on SINGLE-FILE cases that carry no
-//     error-tier directive, against the union of the two streams the CLI itself
+//     error-tier directive, against the union of the streams the CLI itself
 //     reports from: the parse-only lint pass (`lintSrc`) and the TYPE-INFORMED
-//     redundant-annotation findings (`redun*`, populated by the check/compile
+//     findings (`redun*`/`rcoal*`/`isval*`, populated by the check/compile
 //     run — invisible to `lintSrc`, so read separately; see `readRedun`).
 //     Strict per severity in both directions. An error-tier or multi-file case
 //     skips the lint tier — see the gate at the call site for why.
@@ -338,10 +338,11 @@ const driveCase = (
   // and the instance is shared across cases, so don't trust `diagCount` on a
   // success: a stale emit failure could still be sitting in its store.
   const diags = rc === 0 ? [] : readDiags(exp);
-  // Both TYPE-INFORMED finding streams, read HERE while this compile's token table
-  // is still standing: `redunModuleAt` / `rcoalModuleAt` resolve each finding's owner
-  // through `modOfTok`, and the later `lintSrc` re-parse resets that table.
-  const redun = [...readRedun(exp), ...readRcoal(exp)];
+  // All three TYPE-INFORMED finding streams, read HERE while this compile's token
+  // table is still standing: `redunModuleAt` / `rcoalModuleAt` / `isvalModuleAt`
+  // resolve each finding's owner through `modOfTok`, and the later `lintSrc`
+  // re-parse resets that table.
+  const redun = [...readRedun(exp), ...readRcoal(exp), ...readIsval(exp)];
   let bytes: Uint8Array | undefined;
   if (emit && rc === 0) {
     const n = exp.rbyteLen();
@@ -598,6 +599,32 @@ const readRcoal = (exp: Exports): LintDiag[] => {
       line: exp.rcoalLineAt(i),
       col: exp.rcoalColAt(i),
       msg: readString(exp.rcoalMsgLen(i), (j) => exp.rcoalMsgByte(i, j)),
+    });
+  }
+  return out;
+};
+
+/**
+ * The collapsed-operand `is` findings (`isval*`) as lint diagnostics — the third
+ * member of the `readRedun`/`readRcoal` family, type-informed for the same reason:
+ * the checker decides it (from the provenance the subsumed-arm collapse recorded),
+ * so it is invisible to the parse-only `lintSrc` stream. Entry module only, message
+ * over `isvalMsg*` so the wording cannot drift from `cli.vl`'s.
+ *
+ * A seed built before this stream exists lacks the exports; yield [] then, so the
+ * suite still runs against an older seed instead of throwing.
+ */
+const readIsval = (exp: Exports): LintDiag[] => {
+  const out: LintDiag[] = [];
+  if (typeof exp.isvalCount !== "function") return out;
+  const n = exp.isvalCount();
+  for (let i = 0; i < n; i++) {
+    if (exp.isvalModuleAt(i) !== 0) continue;
+    out.push({
+      sev: "hint",
+      line: exp.isvalLineAt(i),
+      col: exp.isvalColAt(i),
+      msg: readString(exp.isvalMsgLen(i), (j) => exp.isvalMsgByte(i, j)),
     });
   }
   return out;

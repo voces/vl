@@ -9763,6 +9763,29 @@ export function uFieldElemTyIxRow(ix: i32): i32 {
   uFieldElemTyIx[ix]
 }
 
+// The two sidecars' WRITE half, by flat row index (D1050). `recordSFieldElemRowTy` /
+// `recordUFieldElemRowTy` APPEND a row's entry at collect time; this rewrites one that is
+// already there, padding the column up to it exactly as they pad.
+//
+// A SECOND PUSH WOULD BE THE WRONG TOOL and is the reason this is a setter. The row's other
+// columns (`*FieldTypes`, `*FieldElemName`, `*FieldNames`) are already in place, so pushing
+// again skews the sidecar against every row after it — the parallel-table skew this table is
+// most fragile to. `unifyMixedLitRepArms` is the one caller: it re-lays an already-recorded
+// literal field under the atom rep and has to move the row's arena entry with the code.
+export function setSFieldElemRowTy(ix: i32, tyIx: i32): i32 {
+  if ix < 0 { return 0 }
+  while sFieldElemTyIx.length <= ix { sFieldElemTyIx.push(-1) }
+  sFieldElemTyIx[ix] = tyIx
+  0
+}
+
+export function setUFieldElemRowTy(ix: i32, tyIx: i32): i32 {
+  if ix < 0 { return 0 }
+  while uFieldElemTyIx.length <= ix { uFieldElemTyIx.push(-1) }
+  uFieldElemTyIx[ix] = tyIx
+  0
+}
+
 // The KEY half of struct `si`'s MAP field `fi` (B6b): true when the field's type is an
 // i32-keyed map. `sFieldElemKeyI32At`'s uncovered answer is FALSE (string-keyed), the
 // same self-heal shape the arena sidecar's -1 has — and the same conservative one, since
@@ -14759,6 +14782,96 @@ function valueUnionNullCmpName(condIx: i32, fnIx: i32) {
   ""
 }
 
+// D1193 — THE ELSE COMPLEMENT OF A LITERAL `is`, ANSWERED FROM THE ARENA because the
+// emitter's own member set cannot answer it. `x is "err"` over `i32 | "err"` reaches the
+// emitter with the union already canon-SOFTENED to `i32|string` (`canonEmitNameAt`'s
+// literal-member arm), so every set-subtraction path looks for a member named `"err"`,
+// finds none, and leaves the binding un-narrowed — while the CHECKER narrowed the else
+// branch to `i32` and typed the body against it. The declared ARENA type still carries the
+// literal, so the subtraction is asked there instead.
+//
+// THE RULE IS THE CHECKER'S, ARM FOR ARM: remove the member whose own lexeme IS the tested
+// literal, and narrow only when exactly ONE member survives. `"a" | "b" | i32` minus `"a"`
+// leaves two, so nothing is pushed — correct, because the else branch may still hold `"b"`.
+// `i32 | string` (a PLAIN string arm) has no member the lexeme matches, so nothing is
+// pushed — also correct, and the checker rejects that program's else-branch arithmetic
+// anyway (`operator '*' is not defined for i32 | string and i32`). The one shape that
+// narrows is the one the checker narrows.
+//
+// VALUE-ATOM SURVIVORS ONLY. The push has to hand `narrowedValueAtomOf` a type it can
+// unbox, and `unMemAtomKind >= 0` is exactly that question; a struct survivor keeps
+// master's behaviour (the struct-union complement below is the arm that owns it, and it
+// reads a rendered set this one deliberately does not touch).
+//
+// True when it pushed.
+// D1193/D1194 — THE SPELLING TO PUSH for the sole survivor of a literal complement, or ""
+// when the survivor is one this narrowing cannot name.
+//
+// TWO SURVIVOR KINDS, TWO RENDERERS, and the split is what the consumers require rather
+// than a preference:
+//
+//  · a VALUE ATOM is read back through `narrowedValueAtomOf`, which hands the pushed
+//    spelling to `valueAtomKind` — so the render has to be the atom's own canonical
+//    spelling, which is exactly `tyToEmitName` of it.
+//  · a STRUCT arm is read back through the variant machinery, which resolves the pushed
+//    spelling by an EXACT compare against `uVariants` — so the render has to be the
+//    NOMINAL one (`Circle`, not the structural `{r: f64}`), and it only counts when the
+//    row is actually registered. `variantIndexOf` is that question, asked in front instead
+//    of pushing a name the downcast would then fail to resolve.
+//
+// Anything else — a list, a map, a closure, an unregistered anonymous shape — answers ""
+// and the caller pushes nothing, which is master's behaviour for every one of them.
+function litElseSurvName(surv: i32): string {
+  if unMemAtomKind(surv) >= 0 { return tyToEmitName(surv) }
+  const nom = tyToNominalName(surv)
+  if nom == "" { return "" }
+  if variantIndexOf(nom) < 0 { return "" }
+  nom
+}
+
+function litElseNarrow(objIx: i32, variant: string): boolean {
+  const ox = unwrapParen(objIx)
+  const recv = P.nodes[ox]
+  if recv is Ident {
+    // The receiver's DECLARED type, un-narrowed — the checker's own resolution of this
+    // very node, which is the only place the literal member still exists. Bound-guarded:
+    // an emitter-synthesized node the checker never saw reads -1, and `T.tys[-1]` traps
+    // the compiler rather than answering.
+    const uty = nodeTyIxOf(ox)
+    if uty < 0 { return false }
+    const ut = T.tys[uty]
+    if ut is TyUnion {
+      // EXACTLY TWO MEMBERS, which is "exactly one survives" said in front. A wider union
+      // minus one literal leaves a SET, and a set narrowing is the interned-`msSubAtom`
+      // path's business — it just cannot see this member. Nothing is pushed there rather
+      // than pushing a rendered rest whose spelling no consumer would resolve.
+      const mems = ut.uMembers
+      if mems.length == 2 {
+        let surv = -1
+        let hit = 0
+        let i = 0
+        while i < mems.length {
+          const lex = tyLitSetMemberLexes(mems[i])
+          if lex.length == 1 && lex[0] == variant {
+            hit = hit + 1
+          } else {
+            surv = mems[i]
+          }
+          i = i + 1
+        }
+        if hit == 1 && surv >= 0 {
+          const nm = litElseSurvName(surv)
+          if nm != "" {
+            pushNarrowRep(recv.identName, nm, surv, -1)
+            return true
+          }
+        }
+      }
+    }
+  }
+  false
+}
+
 // The ELSE-branch dual of `setNarrowFromCond`, for VALUE unions only: the guard
 // was FALSE there, so `is T` strips `T` from the current set (a 2-member union
 // fully discriminates — `string | i32` minus `i32` is `string`, which unboxes),
@@ -14856,6 +14969,14 @@ export function setNarrowFromCondElse(condIx0: i32, fnIx: i32) {
         }
       }
     }
+    // D1193 — THE LITERAL COMPLEMENT, which the atom gate below cannot see. `x is "err"`
+    // over `i32 | "err"` narrows the else branch to `i32` in the CHECKER, and every arm
+    // below misses it: `valueAtomKind("\"err\"")` is -1 (a quoted lexeme is not an atom
+    // spelling), and the struct-union complement subtracts `"err"` from the emitter's
+    // member set — which canon SOFTENED to `i32|string`, so the literal matches no member
+    // and nothing is removed. The else branch therefore read the raw `(ref $uBox)` where
+    // the i32 arm was expected: `vl check` rc 0 and invalid wasm at `else { print(r * 2) }`.
+    if litElseNarrow(c.isObj, c.isVariant) { return true }
     if valueAtomKind(c.isVariant) >= 0 {
       const recv = P.nodes[unwrapParen(c.isObj)]
       if recv is Ident {
@@ -25241,6 +25362,14 @@ export function letInitIsLitAtom(letIx: i32, fnIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
     if d.letType < 0 && d.letInit >= 0 { return exprIsLitAtom(d.letInit, fnIx) }
+    // THE ANNOTATED FACE IS DELIBERATELY NOT CLAIMED HERE, and it was MEASURED rather than
+    // left alone (D1196). `const k: "x" | "y" = b.kind` off a D1050-unified field is an atom
+    // initializer whose annotation softens to `string`, so it reaches neither this arm nor
+    // `letIsLitUnion`'s alias test and refuses LOUDLY in `checkLocalI32`. Gating this arm on
+    // `tyIsLitUnion(nodeTyIxOf(d.letType))` instead does re-slot it as an atom local — and
+    // the binding then becomes check-clean INVALID WASM, because the `print` widen's str-op
+    // frame reservation scan does not see the new atom slot. Loud → silent is the one trade
+    // this repo refuses, so the loud refusal stands and the gap is filed.
   }
   false
 }
@@ -26339,11 +26468,37 @@ export function variantDiscrimFieldNeeded(vi: i32, fi: i32): boolean {
 // two rec-group indices are DISTINCT types in WasmGC, the box was built under whichever row
 // the field-name match hit first, and the other arm's `ref.cast` trapped. One predicate,
 // asked twice, is what keeps the two answers from drifting.
+//
+// SINCE D1050 THE STORAGE TEST IS "AGREE, OR AGREE AFTER THE ATOM UNIFICATION", split across
+// this and `variantLitRepUnifiable` so that `buildVariantTwins` — which runs long after the
+// unification and must see the FINAL layout — keeps asking the strict question it always
+// asked, while `assignTags` (which runs before it) admits the pair the unification will fix.
 export function variantLitDiscriminable(a: i32, b: i32): boolean {
-  if a < 0 || b < 0 { return false }
-  if a >= uFieldCount.length || b >= uFieldCount.length { return false }
-  if uFieldCount[a] != uFieldCount[b] { return false }
+  variantLitPairKind(a, b) == 1
+}
+
+// Would the pair be discriminable if its MIXED literal fields were re-laid under the atom
+// rep? (D1050 — the one spelling of D1023's family the ruling calls legal that the build of
+// it left refused.) True only for a pair that is NOT discriminable as laid out, so the two
+// questions partition rather than overlap.
+//
+// ONE DERIVATION, TWO ANSWERS, for `variantLitDiscriminable`'s own reason: `assignTags`
+// ADMITS on this, `unifyMixedLitRepArms` ACTS on it, and `buildVariantTwins` later folds the
+// arms on the discriminable answer once the layouts agree. Three readers of one walk cannot
+// drift; three hand-written copies of it would.
+export function variantLitRepUnifiable(a: i32, b: i32): boolean {
+  variantLitPairKind(a, b) == 2
+}
+
+// The pair's D1023 status as ONE walk: 1 = discriminable AS LAID OUT, 2 = discriminable only
+// after `unifyMixedLitRepArms` re-lays its mixed literal fields onto the atom rep, 0 =
+// neither (the arms genuinely differ at a field `is` cannot compare).
+function variantLitPairKind(a: i32, b: i32): i32 {
+  if a < 0 || b < 0 { return 0 }
+  if a >= uFieldCount.length || b >= uFieldCount.length { return 0 }
+  if uFieldCount[a] != uFieldCount[b] { return 0 }
   let sawLit = false
+  let sawMixed = false
   let fi = 0
   while fi < uFieldCount[a] {
     const ra = uFieldStart[a] + fi
@@ -26372,14 +26527,56 @@ export function variantLitDiscriminable(a: i32, b: i32): boolean {
     // still parts an alias (atom) from an inline set (a string ref), which genuinely differ.
     if codeEq && eitherLit {
       sawLit = true
+    } else if variantFieldLitRepMixed(a, b, fi) {
+      // The D1050 field: a STRING literal set in BOTH arms, differing only across the
+      // atom/string seam. Not a layout the arms share TODAY — hence kind 2, never 1 — but one
+      // `unifyMixedLitRepArms` can give them, because both sets are interned-atom material.
+      sawLit = true
+      sawMixed = true
     } else if !(storageEq && uFieldTyText[ra] == uFieldTyText[rb]) {
       // Neither a discriminant candidate nor equal — the arms genuinely differ at a field
       // whose values `is` has no way to compare.
-      return false
+      return 0
     }
     fi = fi + 1
   }
-  sawLit
+  if !sawLit { return 0 }
+  if sawMixed { return 2 }
+  1
+}
+
+// Is variant field `fi` a STRING literal set in BOTH arms whose two storages differ only by
+// the litunion rep seam — a registered ALIAS's interned i32 atom (code 0) beside an inline
+// set's `(ref $string)` (code 3)? The exact shape `unifyMixedLitRepArms` re-lays, and the
+// only one it may: both sides must already be atom MATERIAL, or the promotion would have to
+// invent a rep for a value that has none.
+//
+// `tyIsLitUnion` ON BOTH SIDES IS THE BOUND, and it is narrower than `tyIsLitSet` on purpose.
+// It admits only a 2+-member set every one of whose members is a STRING — which is exactly
+// what `internAtom` keys, what `variantFieldIsLitUnion` claims for the read, and what
+// `emitAtomToStr` can widen back. A numeric set (`1 | 2`) reps as its base value and has no
+// atom; a BARE single literal (`kind: "a"`, a `TyLit` rather than a `TyUnion`) is not a
+// litunion to the read classifier, so promoting it would store an atom nothing widens —
+// the raw id printed for the member text. Both stay refused, loudly, as they are today.
+export function variantFieldLitRepMixed(a: i32, b: i32, fi: i32): boolean {
+  if a < 0 || b < 0 { return false }
+  if a >= uFieldCount.length || b >= uFieldCount.length { return false }
+  if fi < 0 || fi >= uFieldCount[a] || fi >= uFieldCount[b] { return false }
+  const ra = uFieldStart[a] + fi
+  const rb = uFieldStart[b] + fi
+  if uFieldTypes[ra] == uFieldTypes[rb] { return false }
+  if !litFieldRowIsAtomisable(ra) { return false }
+  litFieldRowIsAtomisable(rb)
+}
+
+// Can variant field ROW `ix` carry the interned-atom rep? Code 0 already does; code 3 is the
+// inline spelling of the same members and can be made to. Any other code is a different
+// storage entirely and is not this seam.
+function litFieldRowIsAtomisable(ix: i32): boolean {
+  if ix < 0 || ix >= uFieldTypes.length { return false }
+  const code = uFieldTypes[ix]
+  if code != 0 && code != 3 { return false }
+  tyIsLitUnion(uFieldLitTyIx[ix])
 }
 
 // Do `a` and `b` differ at a field where BOTH arms carry a literal set, but the two sets rep
@@ -30852,7 +31049,24 @@ export function narrowedValueAtomOf(name: string) {
       // own name, so it lands on `valueAtomKind` below).
       const nb = numLitUnionBaseName(ty)
       if nb != "" { return nb }
-      if !tyIsLitUnion(ty) { return "" }
+      // D1193 — A BARE STRING-LITERAL arm (`if r is "err"` over `i32 | "err"`) unboxes
+      // as the STRING REF the box holds, exactly as a litunion ALIAS arm does one line
+      // down. The two are the same rep: `emitUnionLitIs` tags a quoted literal `lak = 2`
+      // and `emitUnionCoerce` boxes it under the string tag, so the payload IS a string
+      // array ref. Only the CLASSIFIER parted them — `tyIsLitUnion` requires a `TyUnion`
+      // of literals, so a union whose arm is ONE literal reached neither leg and the
+      // narrowed read stayed the raw `(ref $uBox)`: `vl check` rc 0 and invalid wasm at
+      // `if r is "err" { print(r) }`, while the identical program over a two-literal arm
+      // (`"err" | "bad"`) was correct beside it. `tyIsLitUnionOrLit` is the predicate
+      // that already spells "a literal union OR one string literal" (`typecheck.vl`),
+      // written for the conversion seam and asking exactly this question.
+      if !tyIsLitUnion(ty) {
+        // `tyIsLitUnionOrLit` MINUS the `tyIsLitUnion` already ruled out one line up is
+        // exactly "a bare string-literal type", so the narrower question needs no
+        // predicate of its own.
+        if !tyIsLitUnionOrLit(ty) { return "" }
+        return "string"
+      }
     }
   }
   const k = valueAtomKind(v)

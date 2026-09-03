@@ -2318,7 +2318,9 @@ would have been, so no token is dropped and none invented; a type error read off
 about the program the user wrote. `parseBlock`'s fall-through is NOT marked, because
 `expectClose`'s skip-to-closer drops tokens. The `then`-removal recovery in `parseIf` is
 arguably lossless too and is deliberately left unmarked — it was not in the ruled set, and it is
-the cheapest stage-2 candidate.
+the cheapest stage-2 candidate. (Stage 2's FIRST conversion has since landed and split
+`expectClose` in two — see the section below; the sentence above describes the site as stage 1
+left it.)
 
 **The quantifier is ALL, and that is what makes it safe by construction.** One lossy diagnostic
 anywhere in the file restores the old bail for the whole file, so the five phantoms cannot
@@ -2338,7 +2340,7 @@ corpus cases, each inventing the message beside it:
 
 | case | phantom |
 | --- | --- |
-| `parser/call-missing-comma-recovers.vl` | `wrong number of arguments: expected 2, got 1` |
+| `parser/call-missing-comma-recovers.vl` | `wrong number of arguments: expected 2, got 1` — **RETIRED by stage 2's first conversion; four pins remain** |
 | `functions/trailing-comma-illegal.vl` | `wrong number of arguments: expected 0, got 1` |
 | `objects/error-equality-not-overloadable.vl` | `redeclared ==`, `redeclared !=` |
 | `index/operator-unannotated-self.vl` | `cannot index non-array Box` |
@@ -2363,6 +2365,105 @@ already merged three sources; it now merges four.
 
 Measured: distilled corpus **zero cells moved** (the corpus is parse-clean, so the gate is
 unreachable from it), all eleven gates green, 349/349 filed witnesses as filed.
+
+## A MISSING LIST SEPARATOR IS INSERTED, NEVER SKIPPED PAST
+
+**Stage 2, first conversion. Inside a delimited list, a token that starts another ELEMENT where
+a `,` belongs is diagnosed and the `,` is INSERTED — the list keeps every element the user
+wrote. And `expectClose`'s skip-to-closer is now two events, not one: a scan that consumed
+NOTHING inserted only the closer and is LOSSLESS; a scan that ate tokens on the way is not.**
+(no new ruling needed — ROADMAP's stage-2 entry authorises the conversions; #2397)
+
+`f(1 2)` was the phantom DECISIONS names first, and it was never an arity bug. The parser had no
+separator arm at all: an element-starting token simply ended the list and fell through to
+`expectClose`, whose bounded scan ran forward to the `)` — so the `2` was **deleted**, the call
+re-parsed hole-free as `f(1)`, and `wrong number of arguments: expected 2, got 1` was a count
+nobody had written. Skipping was the defect; the phantom was its symptom, and lifting the bail
+would only have made the symptom visible.
+
+**The insert is gated on the CALLER's element-start test, not on one global predicate**, because
+"another element" is a different set per list: an expression for a call and an array literal
+(`startsExprTok` — `startsStmt` minus the statement keywords, plus `if`), a field key
+(IDENT/STRING) for an object literal, a parameter name (IDENT) for a parameter list. Four sites
+are wired: `parseArgs`, `parseArrayLit`, `parseObjLit`, `parseParamList`.
+
+**`{` is deliberately NOT an element start**, even though an object literal begins with one.
+After a complete element a `{` is far more often a missing closer than a missing comma, and it is
+already `expectClose`'s own scan bound — so `[{x: 1} {x: 2}]` keeps the lossy skip and keeps the
+bail. That is the case `tests/lsp_lossless_recovery_wasm_test.ts` now uses as its LOSSY control,
+having previously used `f(1 2)`: the conversion would otherwise have left that suite green with
+its control no longer controlling anything.
+
+**AND THE INSERT IS SAME-LINE ONLY — the guard is the whole difference between a faithful
+recovery and a phantom, and the first cut of this change was the phantom.** Every list site skips
+NEWLINEs before asking whether the list continues, because a list may legally span lines. Without
+a guard that makes a missing CLOSER at end of line read as a missing COMMA, and the NEXT
+STATEMENT becomes an element:
+
+```
+const xs = [1, 2      →  `expected `,` but found `print``, then
+print(xs.length)         ``xs` is used before it is assigned` and
+                         `list element expects a value, got void`
+```
+
+`expectClose` then reaches EOF having consumed nothing, marks the diagnostic LOSSLESS, and the
+checker runs over a program nobody wrote — **the exact class the phantom pins exist to stop,
+reintroduced by the change that retired one of them.** Master reports one diagnostic there
+(`expected `]` but found `print``) and so does this, because a NEWLINE between the element and
+the element-start token declines the insert. Measured on the built candidate against a pristine
+master control, all three shapes byte-for-byte identical to master: `const xs = [1, 2` / `print(1`
+/ `const a = { x: 1` each followed by a statement.
+
+**THE PRICE IS REAL AND IS THE RIGHT ONE.** A missing comma at the end of a line inside a
+MULTI-LINE list is no longer inserted, so it keeps the old lossy recovery and is not typechecked.
+A closer that is missing and a separator that is missing are *indistinguishable* at a line end —
+the tokens are identical — and guessing "separator" there is what invents a program. On ONE line
+they are distinguishable, because a list that ends on that line has its closer there. The price
+is a capability this change does not GAIN, not one it loses: the multi-line spelling behaves
+exactly as master does. All four shapes are pinned in `tests/vl_lossless_recovery_test.ts`
+(`NEWLINE_GATED`), each against MASTER'S OWN OUTPUT and each requiring a real type error placed
+after the mistake to be ABSENT — the inverse of the positive cases, and the assertion that fails
+if the gate is ever dropped. The pins were validated against the unguarded build, which produces
+every forbidden message.
+
+The guard reads the TOKEN STREAM rather than a flag threaded through the four callers:
+`skipNewlines` leaves the NEWLINE it consumed at `P.pos - 1`, so "was a newline crossed" is
+already recorded where it happened.
+
+**The zero-skip half generalises the marker to all twenty `expectClose` call sites** without
+touching any of them. The contract is unchanged — "the program the checker sees is the program
+the user wrote, up to the inserted token" — and an inserted CLOSER satisfies it exactly as
+`parseBracedBody`'s inserted braces do. `print(1` at end of line and a block whose `}` never
+arrives are now typechecked; anything whose recovery ATE tokens still is not.
+
+Measured on the built candidate, one program per spelling, each with a real type error placed
+after the mistake so "no phantom" cannot be confused with "the checker never ran":
+
+| spelling | diagnostic | checker ran | phantom |
+| --- | --- | --- | --- |
+| `f(1 2)` | ``expected `,` but found `2` `` | yes | none |
+| `f(1 2 3)` (3 params) | two, one per gap | yes | none |
+| `g(f(1 2), 3)` | ``expected `,` but found `2` `` | yes | none |
+| `[1 2]` | ``expected `,` but found `2` `` | yes | none |
+| `{ x: 1 y: 2 }` | ``expected `,` but found `y` `` | yes | none |
+| `function f(a: i32 b: i32)` | ``expected `,` but found `b` `` | yes | none |
+| `[{x: 1} {x: 2}]` | ``expected `]` but found `{` `` | **no — correctly still gated** | none |
+| `const xs = [1, 2` + a statement | ``expected `]` but found `print` `` (master's own) | **no — the newline gate** | none |
+| a multi-line list missing a comma | master's own two | **no — the price** | none |
+
+**The strongest witness is the arity error that DOES fire.** `f(1 2 3)` against a two-parameter
+`f` reports `wrong number of arguments: expected 2, got 3` — the phantom's own message with the
+right number in it, which is what separates "the separator was inserted" from "the checker
+happened not to run".
+
+`vl fmt` is unaffected and must stay so: the comma goes into the TREE, not into the file. The
+formatter keeps the ANY-diagnostic bail, refuses, and leaves the source byte-identical rather
+than silently spelling the missing `,` in.
+
+Measured: distilled corpus **zero cells moved**, all eleven gates green, three corpus fixtures
+re-worded (the message changed from the closer's to the separator's) and one added
+(`parser/call-missing-comma-typechecks.vl`). **Four phantom pins remain**; the next stage-2
+conversion is the `then`-removal arm in `parseIf`.
 
 ## Which channel owns a NARROWED argument's type at a monomorphization pin
 
@@ -4199,6 +4300,30 @@ atom dedup collapses `string|string` — the two producers agreed there BY ACCID
 build note's rule is right and incomplete as written: **a type-level collapse must move the
 arena AND canon, or they agree about the TYPE and disagree about the REP.**
 
+**Note added 2026-09-02 (D1199): BOTH HINTS ARE BUILT, and the second one needs a bank because
+THE COLLAPSE IS INVISIBLE IN ITS OWN RESULT.** The first hint arrived free, exactly as ruled —
+`string | "err"` now infers as `string`, so the existing redundant-annotation hint fires at the
+written spelling with no new code. The second could not be derived that way, and the reason is
+worth writing down: after the collapse `r` IS a `string` — the canonical arena singleton, the
+canon spelling `string` — so the arena, the canon render and the message all agree with a
+`string` nobody wrote a union for. A rule reading the TYPE at the `is` site would fire on every
+legitimate `s is "err"` in the language. **How "collapsed" is recorded:** the annotation route
+banks the arena index it collapsed TO (`collapsedTy`, a third bank on `unkTyPart`'s wire —
+cleared by the outermost `tsToTy`/`nameToTy` frame, restored across `resolveAnnotTs`'s name memo
+like `annotPart`); the DECLARATION route banks the alias NAME (`collapsedAliases`), which
+`declaredTyOfName` re-banks at every later `: R`, so `type R = string | "err"` reaches
+`function f(): R` through the one door every declared-type reference comes through. A `let`,
+a parameter and a declared RETURN each compare their OWN resolved type against the bank —
+so `(string | "err")[]` marks nothing — and an un-annotated `const r = f(…)` inherits the mark
+from the callee's decl node. Marks are depth-tagged sparse rows dropped by `popScope`, paired
+with `lookupDepth` at the read, which is what makes an inner plain `const r: string` shadowing
+an outer collapsed `r` silent without recording anything itself. The generic-instantiation
+decline is STRUCTURAL rather than a special case: substitution mints its collapsed union on the
+third route (`substTyDeep`), which banks nothing, so `orErr<Json>` cannot reach the hint. The
+diagnostic is a non-blocking `hint` under the code `collapsed-arm-value-test`, fires only for a
+LITERAL check type (`is null` / `is string` / `is Circle` still discriminate), and changes no
+codegen — 18 programs graded against a pristine `origin/master` seed emit byte-identical wasm.
+
 ## `is A` over same-shape struct arms is a DISCRIMINANT-VALUE test: a literal-typed field is a type that is also a value, and membership is decided by the value (owner, 2026-09-02)
 
 **Ruling.** Two struct arms that share a field-name set and differ only in a literal-typed
@@ -4279,13 +4404,67 @@ question someone will ask again:
   Admitting the pair without folding it reproduced the filed bug from the other side. One
   predicate now answers for both callers so they cannot drift.
 
-**Residue: the two litunion reps in one union (D1050).** `{kind: K1} | {kind: "x" | "y"}` is
-legal by this ruling and still refuses, because an interned atom and a string ref share no
-layout. Closing it means unifying the litunion reps — the rep cliff — and was out of scope; the
-refusal now says so in words that concede the program is type-valid rather than claiming the
-field types differ. The interim std rule is retired: a std error struct no longer NEEDS a
-unique field name, since a unique `kind` literal now discriminates. `JsonError.path` stays for
-the information it carries, not for discrimination.
+**Residue: the two litunion reps in one union (D1050) — CLOSED 2026-09-02, see the section
+below.** `{kind: K1} | {kind: "x" | "y"}` is legal by this ruling and refused, because an
+interned atom and a string ref share no layout. The refusal was worded to concede the program
+is type-valid rather than to claim the field types differ, which is what kept it visible; it
+is now reached only by the two shapes that have no atom rep at all. The interim std rule is
+retired: a std error struct no longer NEEDS a unique field name, since a unique `kind` literal
+now discriminates. `JsonError.path` stays for the information it carries, not for
+discrimination.
+
+## A MIXED-SPELLING VARIANT FIELD CARRIES THE ATOM
+
+*Decided 2026-09-02 while closing D1050. The question the ruling above left open: when two arms
+of one discriminated union spell their literal discriminant differently — a named literal-union
+ALIAS in one, an inline set in the other — which of the two litunion representations does the
+shared field carry?*
+
+**THE ATOM, and the reason is that its consumers are already built.** A string literal set has
+two reps and `nodeTyIsLitUnionAlias` is the seam: a registered alias is the interned `i32`
+atom, an inline `"x" | "y"` a `(ref $string)`. Either could in principle be the shared one. The
+atom side already has all four sites a unification needs — `emitDiscrimFieldEq`'s code-0 arm
+compares interned ids, `emitVariantStruct`'s `variantFieldIsLitUnion` arm interns the member
+literal at CONSTRUCTION, `exprIsLitAtom`'s variant and struct member arms claim the READ off
+the same field code, and `emitAtomToStr` widens it back at every string boundary — so the
+conversion costs no new lowering. Unifying on the STRING side would need all four written from
+scratch for the arm whose type is the alias, and would then give that alias a rep the rest of
+the module does not use for it.
+
+**THE UNIFICATION IS SCOPED TO THE ARMS OF A MIXED PAIR, NOT TO THE TREE.** This was the
+question that made D1023 stop: "closing it means unifying the two litunion reps", the litunion
+rep cliff, with corpus-wide byte effects. That framing assumed the unification had to be
+GLOBAL. It does not — `unifyMixedLitRepArms` moves the two rows a mixed pair actually has, and
+the distilled corpus moved **0 classes of 255,504 cells** while the candidate compiler emits
+master's own source byte-identically. The whole-tree unification remains unbuilt and is not
+required for this ruling.
+
+**BOTH TABLES MOVE OR NEITHER DOES.** The VARIANT row is what the union box is built and cast
+through; the arm's DECLARED STRUCT row is what `variantStructHeapTwinAt` merges it with and
+what a `const s: B = { … }` outside the union builds. Rewriting only the first gives one
+declaration two heap types, and any value crossing between them is a module the engine refuses.
+The arena sidecar (`*FieldElemTyIx`) moves with the code for the same reason one rung out: the
+read classifiers are code-0-**plus**-`tyIsLitUnion(ety)`, so a promoted row without its sidecar
+entry stores an atom that every reader calls a plain `i32` and `print` emits the raw interned
+id.
+
+**THE BOUND IS "BOTH ARMS ARE ATOM MATERIAL", and two legal pairs stay refused because of it.**
+A field may be re-laid only when both arms carry a 2+-member set every one of whose members is
+a string — what `internAtom` keys and what `emitAtomToStr` can widen back. So `{kind: K1} |
+{kind: string}` (the amendment's set-beside-its-base: the base arm holds an arbitrary string
+with no interned id) and `{kind: K1} | {kind: "a"}` (a BARE single literal, a `TyLit` rather
+than a `TyUnion`, which the read classifier does not treat as a litunion) keep the loud
+refusal. That refusal is still the right diagnosis, so its message literal stays counted by
+`--sites` — the SITE narrowed, it did not clear. Closing those two means the STRING-side
+unification, which is the genuinely open half of this question.
+
+**THE ADMISSION AND THE ACTION ARE ONE PREDICATE ASKED TWICE.** `assignTags` runs at the end of
+`collectU`, one pass before the struct table exists, so it cannot do the re-lay; it admits on
+`variantLitRepUnifiable`, which is the acting pass's own applicability test.
+`variantLitDiscriminable` keeps asking the strict "agree as laid out" question because
+`buildVariantTwins` runs after the unification and must see the FINAL layout. Both are arms of
+one walk (`variantLitPairKind`) — the same discipline the ruling above already imposed on
+`assignTags` and `buildVariantTwins`, one seam further along.
 
 **Amendment (owner, 2026-09-02): a literal set beside its own base is legal.**
 `type A = { kind: "x" | "y" }` beside `type B = { kind: string }` in one union is a LEGAL

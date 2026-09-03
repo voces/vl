@@ -1,0 +1,223 @@
+// @run
+// @log 5
+// @log failed
+// @log err
+// @log bad
+// @log 5
+// @log bad
+// @log 1.5
+// @log failed
+// @log 42
+// @log 42
+// @log failed
+// @log 42
+// @log 42
+// @log 42
+// @log 42
+// @log 3
+// @log 5
+// @log 1.5
+// @log failed-d
+// @log 42
+// @log 5
+// @hint redundant type annotation: `c` is inferred as `{r: f64}`
+// @hint redundant type annotation: `a0` is inferred as `i32 | "err"`
+// @hint redundant type annotation: `bx` is inferred as `{v: i32 | "err"}`
+// @hint redundant type annotation: `xs` is inferred as `(i32 | "err")[]`
+// @hint redundant type annotation: `gb` is inferred as `i32 | "err"`
+// THE HINTS ARE DECLARED, NOT SILENCED. Each names an annotation this fixture exists to
+// exercise — the ANNOTATED face of a position whose UN-ANNOTATED face is beside it — and an
+// annotation pins the rep, so deleting one to quiet the hint would delete the delivery
+// position (D969's rule, and the reason `subsumed-literal-arm-at-the-pin.vl` declares its own).
+// A UNION MINTED BY GENERIC INSTANTIATION IS REGISTERED, AND UNDER THE KEY THE DIRECT
+// SPELLING USES — D1042.
+//
+// `collectU` is the only pass that mints a union row and the pass table orders it BEFORE
+// `monomorphize` (`"monomorphize > … scanArrLitCommit"`); nothing re-runs it afterwards
+// (`collectA#2` rescans annotations for SHAPES, not for unions). So a union that exists only
+// because a generic was pinned had no row at all — `unionRowOf` read -1 for `i32|"err"` AND
+// for `i32|string` — and every consumer of the box hit its loud floor: `vl check` rc 0, then
+// `emitProgram: union box atom test on a union with no recorded members: i32|"err"`.
+//
+// AND THE TWO PRODUCERS SPELT ONE UNION TWO WAYS, which is why a retry at the failing lookup
+// was not the fix. `monoSubstAnn` is a STRING substitution into the DECLARED annotation, so
+// the clone asks for `i32|"err"` with the literal verbatim, while every source annotation has
+// been through `canonEmitTypeNames`, which softens a literal member to its base scalar at
+// `RC_ROOT` — so the DIRECT `function f(bad: boolean): i32 | "err"` registers `i32|string`.
+// Adding that direct spelling to the same module therefore did NOT rescue the generic. The
+// pin now renders through `canonEmitName` before it synthesises the instance's return
+// annotation, so both producers land on ONE row; a second row for one union would be two tag
+// slices for one type, and a union's box tags are positional over its member set.
+//
+// EVERY DELIVERY POSITION, because narrowing a checker gate first is how a loud refusal
+// becomes silent invalid wasm at the positions nobody wired (D965's rule). Binding, argument,
+// struct field, array element, module global and global-to-global assignment each read the
+// value in a way that PROVES the arm was unboxed (`* 2`), not merely that a box arrived.
+
+type E = { msg: string }
+type Circle = { r: f64 }
+
+function orErr<T>(x: T, bad: boolean): T | "err" {
+  if bad { return "err" }
+  return x
+}
+
+function orE<T>(x: T, bad: boolean): T | E {
+  if bad { return { msg: "bad" } }
+  return x
+}
+
+// THE LITERAL ARM at a scalar `T`, un-annotated destination — the row's own witness.
+const r0 = orErr(5, false)
+if r0 is "err" {
+  print("failed") // 5
+} else {
+  print(r0)
+}
+const r1 = orErr(5, true)
+if r1 is "err" {
+  print("failed") // failed
+} else {
+  print(r1)
+}
+
+// NO `is` AT ALL — the box still has to be built, and `print` dispatches on its tag.
+print(orErr(5, true)) // err
+
+// A STRUCT arm at a scalar `T` — the literal is not the ingredient.
+const s0 = orE(5, true)
+if s0 is E {
+  print(s0.msg) // bad
+} else {
+  print(s0)
+}
+const s1 = orE(5, false)
+if s1 is E {
+  print(s1.msg) // 5
+} else {
+  print(s1)
+}
+
+// A STRUCT arm at a STRUCT `T` — two struct arms through the same pin.
+const c: Circle = { r: 1.5 }
+const s2 = orE(c, true)
+if s2 is E {
+  print(s2.msg) // bad
+} else {
+  print(s2.r)
+}
+const s3 = orE(c, false)
+if s3 is E {
+  print(s3.msg) // 1.5
+} else {
+  print(s3.r)
+}
+
+// THE ANNOTATED DESTINATION of the literal face, which the annotation did NOT rescue.
+const a0: i32 | "err" = orErr(5, true)
+if a0 is "err" {
+  print("failed") // failed
+} else {
+  print(a0 * 2)
+}
+
+// ── THE DELIVERY MATRIX ──────────────────────────────────────────────────────
+// binding
+const p1 = orErr(21, false)
+if p1 is "err" {
+  print("failed") // 42
+} else {
+  print(p1 * 2)
+}
+
+// argument
+function takes(u: i32 | "err") {
+  if u is "err" { print("failed") } else { print(u * 2) }
+}
+takes(orErr(21, false)) // 42
+takes(orErr(21, true))  // failed
+
+// struct field
+type Box = { v: i32 | "err" }
+const bx: Box = { v: orErr(21, false) }
+const bv = bx.v
+if bv is "err" {
+  print("failed") // 42
+} else {
+  print(bv * 2)
+}
+
+// array element
+const xs: (i32 | "err")[] = [orErr(21, false)]
+const e0 = xs[0]
+if e0 is "err" {
+  print("failed") // 42
+} else {
+  print(e0 * 2)
+}
+
+// module-scope global, read from inside a function
+const g = orErr(21, false)
+function show() {
+  if g is "err" { print("failed") } else { print(g * 2) }
+}
+show() // 42
+
+// global-to-global ASSIGNMENT — `emitAssign`'s `global.set` arm, the position reading the
+// sibling's call sites does not enumerate (D965).
+let ga: i32 | "err" = 1
+const gb: i32 | "err" = orErr(21, false)
+ga = gb
+if ga is "err" {
+  print("failed") // 42
+} else {
+  print(ga * 2)
+}
+
+// A SECOND SCALAR REP through the same shape — the box is per-union, not per-program.
+const f0 = orErr(1.5, false)
+if f0 is "err" {
+  print("failed") // 3
+} else {
+  print(f0 * 2.0)
+}
+
+// ONE GENERIC PINNED TWICE, at a scalar and at a struct: two DISTINCT registered unions
+// (`i32|string` and `Circle|string`) with no cross-talk between their tag slices.
+const t0 = orErr(5, false)
+if t0 is "err" {
+  print("failed-a") // 5
+} else {
+  print(t0)
+}
+const t1 = orErr(c, false)
+if t1 is "err" {
+  print("failed-b") // 1.5
+} else {
+  print(t1.r)
+}
+const t2 = orErr(c, true)
+if t2 is "err" {
+  print("failed-d") // failed-d
+} else {
+  print(t2.r)
+}
+
+// THE DIRECT SPELLING BESIDE THE PIN, in one module — the observation that ruled out
+// "mono-minted unions are never registered" as a complete account. Both must be the SAME row.
+function direct(bad: boolean): i32 | "err" {
+  if bad { return "err" }
+  return 42
+}
+const d0 = direct(false)
+if d0 is "err" {
+  print("failed") // 42
+} else {
+  print(d0)
+}
+const d1 = orErr(5, false)
+if d1 is "err" {
+  print("failed") // 5
+} else {
+  print(d1)
+}
