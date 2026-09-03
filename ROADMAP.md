@@ -212,7 +212,8 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   hold. Alternating A/B, both arms on master's own source (2026-09-02, contended box, so read
   user): **user 70.8/68.1/49.5 s → 15.0/5.6/10.5 s**; on an idle box, 116.7 s → 6.2 s. The
   ratio held at 6–8× across all five master heads the branch was rebased onto.
-  Guard: `tests/vl_module_predicate_scan_test.ts`, 1–4 s, 1.1× after against 10.0× before.
+  Guard: the `functions` pair of `tests/vl_scaling_shape_test.ts` (folded in from
+  `tests/vl_module_predicate_scan_test.ts`), 1.0× after against 5.8× before.
   Method: `docs/internals/profiling-the-compiler.md` + `scripts/profile-rank.py`. **NEXT on
   this axis**, from the post-fix profile: `__str_eq__` at 19.2% self is the name-keyed
   registries doing linear lookups (`isUName`, `variantIndexOf`, `declaredSlotOf`,
@@ -230,6 +231,25 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   **1,363/2,441 (55.8%)**, because `tyToEmitName` renders structurally where the row records
   declared member names. **That gap is step 4's first job and step 5 blocks on it.**
   `docs/internals/registry-by-type-id.md` §5.
+- ✅ **Modernization program — (6) the #2419 class cannot come back: three guards, DONE.**
+  The owner's question after (5) was "how do we prevent this in the future"; the answer is
+  one guard per moment. **Review time**: `arena-scan-outside-pass` (`compiler/lint.vl`) —
+  a `while` bounded by a whole-program table (`P.nodes`, `fnStmts`, `sNames`, `unNames`,
+  `uVariants`, `globalStmts`) inside a function that is neither a pass-table row nor
+  allow-listed; a scan resuming from a memo is exempt, since that is the fix. 132 stand,
+  ratcheted per file by `scripts/scan-budget.py --check`, which re-derives the pass list
+  from `runEmitPass` so the lint's copy cannot go stale. Byte-identical seed. **Merge
+  time**: `tests/vl_scaling_shape_test.ts` — seven pairs of the same work reshaped along
+  one axis, graded on the TIME RATIO so machine speed and box load cancel. 16–25 s; the
+  `functions` and `closures` pairs red on the pre-#2419 compiler (5.8× and 7.0×).
+  **Bootstrap**: `scripts/self-compile-time.sh`, L2 CPU seconds against
+  `scripts/self-compile-baseline.json` (6.3 s idle), tripping past 4× — half of which pays for
+  contention, since the same build reads 12.2–12.7 s inside the fanned-out ladder. **What the family found
+  on the way in**: three axes are already super-linear, all three on name-keyed registries
+  answering by linear scan — closures 2.2× (`fnStmtsPosOf`, 21.2% self), modules 2.5×
+  (`modIndexOfKey` 47% / `capHas` 35% inclusive, `__str_eq__` 73% self) and generic pins
+  4.4× (`collectA` 68% inclusive through `tyTopIndexOf`). Each carries a bar just above its
+  measurement and names the function; that is item 4's work, now with a number on it.
 - **Width subtyping — RULED (owner, 2026-09-01): the non-prefix refusal is a GAP, closed
   the Roc way** — shape-monomorphization of narrow-typed consumers (offsets constant per
   caller shape; zero runtime cost; paid in instance count — the variant-count tradeoff

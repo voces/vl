@@ -229,7 +229,9 @@ export function lint(progRoot: i32) {
     lintWalk(lintRuleHasGuardReread, progRoot)
     lintWalk(lintRuleUnionLetNoMelt, progRoot)
     lintWalk(lintRuleUnusedPureExpr, progRoot)
-    // Not a walk: comments are not in the arena. Reads the source the driver set.
+    // Not walks: neither comments nor a loop's SHAPE is in the arena. Both read the source
+    // the driver set, and `commentBudget` consumes it, so it runs last.
+    arenaScanLint()
     commentBudget()
   }
   lintCodes.length
@@ -2353,6 +2355,212 @@ function commentBudget() {
       cited,
       cbIsHeader(seenCode, headerTaken),
     )
+  }
+  0
+}
+
+// ── arena-scan-outside-pass ──────────────────────────────────────────────────
+//
+// A loop bounded by a WHOLE-PROGRAM table is O(program). Run once, from a pass, that is
+// what a pass is for; asked once per function / node / module it is O(entities x nodes),
+// which is what #2419 cost (docs/internals/profiling-the-compiler.md). The shape has no
+// other tell: the source reads identically either way, and a wall clock only says so one
+// bootstrap step late.
+//
+// So the rule is structural. A scanner is legitimate when it is a PASS (the ordered table
+// in `emit_sections.vl`'s `runEmitPass`, plus the checker's entry) or on the allow-list
+// below; anything else is reported and carried by `scripts/scan-budget.py`'s ratchet. A
+// scan resuming from a memo (`let i = modUnionAsSeen`) is exempt — that IS the #2419 fix.
+
+// BOUND: this reads the source text, not the arena, so it knows the compiler's own tables
+// by SPELLING. A user program that names a binding `sNames` and loops to its length reads
+// as a hit. The tree this polices is this one, and the six names are distinctive.
+//
+// The whole-program tables: the AST arena and the module-wide registries. Each grows with
+// the program, so a loop bounded by one of them walks the program.
+const asTables = [
+  "P.nodes",
+  "fnStmts",
+  "sNames",
+  "unNames",
+  "uVariants",
+  "globalStmts",
+]
+
+// The emitter's ordered pass table (`emit_sections.vl`, `runEmitPass`) plus `checkProgram`,
+// the checker's entry. `scripts/scan-budget.py` re-derives this list from `runEmitPass` and
+// fails when the two disagree, so the copy here cannot go stale in silence.
+const asPasses = [
+  "collectTyParamNames",
+  "collectU",
+  "collectS",
+  "collectA",
+  "collectFns",
+  "passCheckTopLevel",
+  "buildFnMap",
+  "computeVoidFns",
+  "computeRetInference",
+  "dispatchRewrite",
+  "captureBoxRewrite",
+  "synthRetAnnots",
+  "synthNulListRetAnns",
+  "synthDstPinAnns",
+  "scanArrLitCommit",
+  "monomorphize",
+  "collectGenAliasShapes",
+  "collectAnnShapes",
+  "synthGlobalEmptyListAnns",
+  "synthVoidTwins",
+  "synthParamAnnots",
+  "collectMapFilterUse",
+  "collectFnValUse",
+  "collectCloSigs",
+  "scanPrintUse",
+  "checkFnParams",
+  "capCacheBuild",
+  "capNarrowBuild",
+  "synthCaptureEmptyListAnns",
+  "checkProgram",
+]
+
+// Scanners that are not pass-table rows and still run ONCE per program. Each was graded by
+// counting its callers; a new entry owes the same, and the reason on its own line.
+const asAllow = [
+  "canonEmitTypeNames",
+  "collectAnonShapes",
+  "collectStrPool",
+  "computeGlobalPromotion",
+  "structEmitOrder",
+  "assignTags",
+  "startFnDetectScratch",
+]
+// one caller: `checkProgram`'s rename over the finished arena
+// one caller: the anon-shape intern beside `collectA`
+// one caller: builds the data section once per module
+// one caller: `emitModule`'s global-promotion decision
+// two callers, each once per module: the type section's order
+// variant tags; its second call is its own re-run after the arena grew
+// one caller: sizes the start function's scratch once
+
+// `name` occurs in `xs`.
+function asListHas(xs: string[], name: string) {
+  let i = 0
+  while i < xs.length {
+    if xs[i] == name { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The identifier starting at `i`, or "" when `s[i]` does not begin one. The result is
+// BOUND rather than left in tail position: a bare member call there is an emit refusal
+// (`emitProgram: unsupported member-call statement`) on a `vl check`-clean program.
+function asIdentAt(s: string, i: i32, b: i32) {
+  if !cbWordAt(s, i, b) { return "" }
+  if cbIsDigit(s[i]) { return "" }
+  let j = i
+  while cbWordAt(s, j, b) { j = j + 1 }
+  const out = s.slice(i, j)
+  out
+}
+
+// The whole-program table whose `.length` is read at `i`, or "" when none is.
+function asTableAt(s: string, i: i32, b: i32) {
+  let t = 0
+  while t < asTables.length {
+    const nm = asTables[t]
+    if cbAt(s, i, b, nm) && cbAt(s, i + nm.length, b, ".length") { return nm }
+    t = t + 1
+  }
+  ""
+}
+
+// `while <v> < <table>.length` — the induction variable, or "" when the line is not one.
+// A grow loop (`while xs.length < P.nodes.length { push }`) has no bare identifier here and
+// so is never a hit, which is right: it appends, it does not rescan.
+function asWhileVarOf(s: string, k: i32, b: i32) {
+  if !cbAt(s, k, b, "while ") { return "" }
+  const v = asIdentAt(s, k + 6, b)
+  if v.length == 0 { return "" }
+  let p = cbSpacesEnd(s, k + 6 + v.length, b)
+  if p >= b { return "" }
+  if s[p] != '<' { return "" }
+  p = cbSpacesEnd(s, p + 1, b)
+  if asTableAt(s, p, b).length == 0 { return "" }
+  v
+}
+
+// The name declared by a top-level `function f(` / `export function f(` line, else "".
+function asFnNameOf(s: string, k: i32, b: i32) {
+  let p = k
+  if cbAt(s, p, b, "export ") { p = cbSpacesEnd(s, p + 7, b) }
+  if !cbAt(s, p, b, "function ") { return "" }
+  asIdentAt(s, cbSpacesEnd(s, p + 9, b), b)
+}
+
+// The name a `let x = 0` / `const x = 0` line zeroes, else "". Anything but the bare
+// literal is a resume point, and a scan that resumes has already been banked.
+function asZeroedNameOf(s: string, k: i32, b: i32) {
+  let p = k
+  if cbAt(s, p, b, "let ") { p = p + 4 }
+  else if cbAt(s, p, b, "const ") { p = p + 6 }
+  else { return "" }
+  p = cbSpacesEnd(s, p, b)
+  const v = asIdentAt(s, p, b)
+  if v.length == 0 { return "" }
+  p = cbSpacesEnd(s, p + v.length, b)
+  if p >= b || s[p] != '=' { return "" }
+  p = cbSpacesEnd(s, p + 1, b)
+  if p >= b || s[p] != '0' { return "" }
+  if p + 1 != b { return "" }
+  v
+}
+
+// One pass over the source. Per line: open a function (resetting the zeroed set), record a
+// zeroed local, or grade a `while`. O(bytes), with one array of short names per body.
+function arenaScanLint() {
+  const s = cbSource
+  let i = 0
+  let line = 1
+  let fnName = ""
+  let zeroed: string[] = []
+  while i <= s.length {
+    let e = i
+    while e < s.length && s[e] != '\n' { e = e + 1 }
+    let le = e
+    if le > i && s[le - 1] == '\r' { le = le - 1 }
+    let k = i
+    while k < le && (s[k] == ' ' || s[k] == '\t') { k = k + 1 }
+    const fn = asFnNameOf(s, k, le)
+    if fn.length > 0 {
+      fnName = fn
+      zeroed = []
+    } else {
+      const z = asZeroedNameOf(s, k, le)
+      if z.length > 0 {
+        zeroed.push(z)
+      } else {
+        const v = asWhileVarOf(s, k, le)
+        if (
+          v.length > 0 &&
+          asListHas(zeroed, v) &&
+          !asListHas(asPasses, fnName) &&
+          !asListHas(asAllow, fnName)
+        ) {
+          lintEmitAtPos(
+            "arena-scan-outside-pass",
+            "`" +
+              fnName +
+              "` scans the whole arena but is not a pass — bank the answer in a pass or memoise it on an arena prefix (see #2419)",
+            "warning",
+            line,
+            k - i,
+          )
+        }
+      }
+    }
+    i = e + 1
+    line = line + 1
   }
   0
 }

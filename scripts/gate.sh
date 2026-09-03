@@ -63,11 +63,23 @@ run "lsp suites (ci list)"     env SELFHOST_NATIVE_ALIGN=1 bash -c \
 # those three layouts under deno 2.9.6's nearest-manifest rule.
 run "lsp typecheck"            deno check --node-modules-dir=none --config lsp/deno.json lsp/src/*.ts
 run "native-fixpoint"          bash scripts/native-fixpoint.sh
+# THE L2 TRIPWIRE. Its own build rather than native-fixpoint's stage-4 number, because
+# the rows here are independent by construction and the two run concurrently — one extra
+# self-compile against a row that already does two costs the table nothing.
+run "self-compile time"        bash scripts/self-compile-time.sh
 run "lint-self + fmt"          bash scripts/lint-self.sh
 # The comment-budget RATCHET: per-file counts of the two comment lint codes may only
 # fall. lint-self.sh holds those codes out of its own `info` gate while the baseline
 # is non-zero, so this is what stops the tree drifting back up meanwhile.
 run "comment budget"           python3 scripts/comment-budget.py --check
+# The arena-scan RATCHET, same shape and the same reason: `arena-scan-outside-pass`
+# is a `warning` lint-self.sh holds out while the baseline is non-zero, so this is
+# what stops a whole-program scan being added outside a pass. #2419's class.
+run "arena-scan budget"        python3 scripts/scan-budget.py --check
+# THE SHAPE FAMILY: seven pairs, same work, one axis reshaped, graded on the TIME
+# RATIO so machine speed and box load cancel. ~16-25 s; it is the only gate here
+# whose verdict is a measurement, and it reds on the pre-#2419 compiler.
+run "scaling shape"            deno test -A --no-check tests/vl_scaling_shape_test.ts
 run "deno lint"                deno lint
 run "rep-fuzz"                 bash scripts/rep-fuzz-check.sh
 run "mono-tyaram-grid"         bash scripts/mono-tyaram-grid.sh
