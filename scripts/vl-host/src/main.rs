@@ -875,6 +875,73 @@ fn engine_cache_tag(engine: &Engine) -> String {
     format!("{:016x}", hasher.finish())
 }
 
+/// A seed's IDENTITY, as 16 hex digits — the on-disk counterpart of `build.rs`'s
+/// `$VL_SEED_KEY`, which bakes the same thing for the EMBEDDED seed (where there is
+/// no file to read at startup). The two live in different directories and are never
+/// compared, so they need not agree, and this one does not: it is FNV-1a over 8-byte
+/// WORDS in four independent lanes, because the byte-at-a-time form is one serial
+/// multiply chain and costs ~2 ms over the 1.8 MB seed on EVERY `vl` invocation
+/// (measured; `docs/internals/perf-opportunities-2026-09.md` item 4 has the table).
+///
+/// It only has to be stable and collision-free across seeds, never cryptographic: a
+/// collision costs one wrong-cache deserialize, which `cached_module` already falls
+/// through to a recompile.
+fn seed_content_key(bytes: &[u8]) -> String {
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = [0xcbf2_9ce4_8422_2325u64; 4];
+    let mut chunks = bytes.chunks_exact(32);
+    for c in &mut chunks {
+        for (l, lane) in h.iter_mut().enumerate() {
+            let w = u64::from_le_bytes(c[l * 8..l * 8 + 8].try_into().unwrap());
+            *lane = (*lane ^ w).wrapping_mul(PRIME);
+        }
+    }
+    // The length joins the lanes, so a truncation cannot land on the same key.
+    let mut acc = h[0] ^ h[1].rotate_left(16) ^ h[2].rotate_left(32) ^ h[3].rotate_left(48);
+    acc = (acc ^ bytes.len() as u64).wrapping_mul(PRIME);
+    for b in chunks.remainder() {
+        acc = (acc ^ *b as u64).wrapping_mul(PRIME);
+    }
+    format!("{acc:016x}")
+}
+
+/// Delete the on-disk seed's sidecars that belong to a DIFFERENT seed (and the
+/// mtime-era `<seed>.<tag>.cwasm` names, which belong to no key at all).
+///
+/// Content keys mean a new seed lands at a new path instead of overwriting, so
+/// without this every rebuild would leave ~16 MB per engine tag behind for ever. Ours
+/// is every name under `<seed>.<our key>.`, which is one file per engine tag —
+/// they are worth exactly as long as the seed is, so they retire as a unit.
+/// Best-effort: a read-only directory is not an error, just a cache that does not
+/// shrink.
+fn prune_seed_sidecars(compiler_path: &str, ours: &std::path::Path) {
+    let path = std::path::Path::new(compiler_path);
+    let (Some(dir), Some(stem)) = (path.parent(), path.file_name()) else {
+        return;
+    };
+    let keep = match ours.file_name().and_then(|n| n.to_str()) {
+        Some(n) => match n.rfind('.').and_then(|i| n[..i].rfind('.')) {
+            Some(i) => n[..i + 1].to_string(), // `<stem>.<key>.`
+            None => return,
+        },
+        None => return,
+    };
+    let prefix = format!("{}.", stem.to_string_lossy());
+    let Ok(entries) = std::fs::read_dir(if dir.as_os_str().is_empty() {
+        std::path::Path::new(".")
+    } else {
+        dir
+    }) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with(&prefix) && name.ends_with(".cwasm") && !name.starts_with(&keep) {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
 /// Where the EMBEDDED seed's compilation cache lives — the sidecar's counterpart for
 /// bytes that have no path of their own. A distributed `vl` has no `build/` next to
 /// it, so without this every invocation re-runs Cranelift over the whole ~1 MB seed
@@ -1087,8 +1154,8 @@ fn seed_cmd(rest: &[String]) -> Result<()> {
 /// the error (positioned `source_path:line:col: message` lines where known).
 /// Load + instantiate the self-hosted compiler module, reusing a `.cwasm` SIDECAR
 /// that caches the Cranelift compilation (the dominant fixed cost of every
-/// invocation), keyed by freshness (rebuilt whenever the `.wasm` is newer) and by
-/// engine configuration (a separate sidecar per one). Shared by every subcommand that
+/// invocation), keyed by the seed's CONTENT and by engine configuration (a separate
+/// sidecar per one). Shared by every subcommand that
 /// drives the seed (`compile_vl`, `fmt`). `deserialize_file` is unsafe because a
 /// corrupt/forged artifact is UB — we only ever load a sidecar this same binary wrote
 /// next to the module it was derived from.
@@ -1123,26 +1190,39 @@ fn load_compiler_module(engine: &Engine, source: &CompilerSource) -> Result<Modu
                     .map_err(|e| e.context("loading the embedded compiler seed"))
             },
         )?,
-        // On-disk seed: the sidecar sits next to it and is keyed by FRESHNESS —
-        // rebuilt whenever the `.wasm` is newer than its `.cwasm`.
+        // On-disk seed: the sidecar sits next to it and is CONTENT-KEYED, exactly as
+        // the embedded path above — `<seed>.<seed key>.<engine tag>.cwasm`. It used to
+        // be keyed by mtime, which made every byte-identical rewrite of the seed a full
+        // Cranelift recompile: a `cp` between worktrees, a `fetch-seed.sh`, a CI cache
+        // restore. Content keys have no freshness question to ask (different bytes ⇒
+        // different file), so those all HIT, and two seeds can be alternated without
+        // evicting each other. Price: one read + hash of the ~1.8 MB seed per
+        // invocation, measured in `docs/internals/perf-opportunities-2026-09.md` item 4.
         CompilerSource::Path(compiler_path) => {
-            let sidecar = std::path::PathBuf::from(format!("{compiler_path}.{tag}.cwasm"));
-            let fresh = match (
-                std::fs::metadata(&sidecar),
-                std::fs::metadata(compiler_path),
-            ) {
-                (Ok(c), Ok(w)) => {
-                    matches!((c.modified(), w.modified()), (Ok(cm), Ok(wm)) if cm >= wm)
-                }
-                _ => false,
-            };
-            cached_module(engine, Some(&sidecar), fresh, || {
-                Module::from_file(engine, compiler_path).map_err(|e| {
+            let bytes = std::fs::read(compiler_path).map_err(|e| {
+                Error::from(e).context(format!(
+                    "loading compiler module `{compiler_path}` (build it with: scripts/refresh-compiler.sh)"
+                ))
+            })?;
+            let sidecar = std::path::PathBuf::from(format!(
+                "{compiler_path}.{}.{tag}.cwasm",
+                seed_content_key(&bytes)
+            ));
+            let hit = sidecar.exists();
+            let module = cached_module(engine, Some(&sidecar), hit, || {
+                Module::from_binary(engine, &bytes).map_err(|e| {
                     e.context(format!(
                         "loading compiler module `{compiler_path}` (build it with: scripts/refresh-compiler.sh)"
                     ))
                 })
-            })?
+            })?;
+            // Only after a MISS — the one invocation that just published a new key, and
+            // so the only one that can have orphaned an old seed's entries. Keeping it
+            // off the hit path keeps the warm case at zero directory reads.
+            if !hit {
+                prune_seed_sidecars(compiler_path, &sidecar);
+            }
+            module
         }
     };
     Ok(module)
