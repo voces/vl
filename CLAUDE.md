@@ -239,7 +239,7 @@ tiny program per position, each printing a value that proves the conversion actu
 
 **`scripts/capability-probes/matrix.py` is the instrument — do not hand-write the grid.** One
 `matrix/*.matrix.vl` template (a prelude, the value, its type, a proof that prints) generates
-and grades all twenty positions in both faces, `--before`/`--after` two seeds, exiting
+and grades all twenty-six positions in both faces, `--before`/`--after` two seeds, exiting
 non-zero on `runs → not-runs` or any `SILENT`; `--keep` leaves a red cell ready to file.
 
 ## The goal is `runs`, and making a failure LOUD does not move it
