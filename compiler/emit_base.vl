@@ -254,6 +254,18 @@ let nnfScanned: i32 = 0
 let mlvSet: {[string]: boolean} = Map()
 let mlvBuilt: boolean = false
 
+// The MODULE scope's BLOCK-LOCAL bindings — a `const`/`let` written inside a top-level
+// `if`/`while`/`for`/bare block, which is a start-function local and NOT a global. Behind
+// `moduleLocalLetOf`, filled by the same walk as `mlvSet` because it answers the other half
+// of one question: which binding does a capture from the module frame denote (D1244). A
+// TOP-LEVEL `LetDecl` is deliberately absent — that is a global, addressable directly, and
+// never a capture.
+let mllMap: {[string]: i32} = Map()
+// Is `mllMap` non-empty? `parentBindingOf` consults the module arm on EVERY miss, which is
+// its hot path (see that function's `retCapturedMapShape` caller), so the common answer has
+// to cost a branch rather than a string hash.
+let mllAny: boolean = false
+
 // Record `name` as naming a function WITHOUT waiting for the fold to reach its node — the
 // escape hatch for the one writer that renames a FuncDecl IN PLACE after the arena already
 // holds it (`emit_collect`'s lambda numbering, `n.fnName = "__lambda_" + …`). Every other
@@ -289,6 +301,8 @@ export function resetParentLetCache() {
   nnfScanned = 0
   mlvSet = Map()
   mlvBuilt = false
+  mllMap = Map()
+  mllAny = false
   0
 }
 
@@ -364,12 +378,21 @@ function plRecordLoopVar(name: string, ix: i32) {
 }
 
 // Collect every MODULE-scope `for` variable name reachable from statement `ix` into
-// `mlvSet`. Descends the bodies that share the module's local frame (loops, `if` arms,
-// bare blocks) and stops at a `FuncDecl`, whose loop variables belong to that function.
+// `mlvSet`, and every module-scope BLOCK-LOCAL `LetDecl` into `mllMap` (D1244). Descends
+// the bodies that share the module's local frame (loops, `if` arms, bare blocks) and stops
+// at a `FuncDecl`, whose bindings belong to that function.
+//
+// The `LetDecl` arm never sees a TOP-LEVEL one: `mlvBuild` skips those before descending,
+// because a top-level binding is a module GLOBAL and has its own storage class.
 function mlvScanStmt(ix: i32) {
   if ix < 0 { return 0 }
   const st = P.nodes[ix]
-  if st is ForRange {
+  if st is LetDecl {
+    if (mllMap[st.letName] ?? -1) < 0 {
+      mllMap[st.letName] = ix
+      mllAny = true
+    }
+  } else if st is ForRange {
     if st.frVar != "" { mlvSet[st.frVar] = true }
     mlvScanStmt(st.frBody)
   } else if st is ForIn {
@@ -399,20 +422,40 @@ function mlvScanStmt(ix: i32) {
 // before it can. A top-level loop variable is nonetheless a genuine local of the start
 // function, and a closure written in the loop body captures it.
 export function moduleBindsLoopVar(rootIx: i32, name: string) {
-  if rootIx < 0 { return false }
-  if !mlvBuilt {
-    mlvBuilt = true
-    const r = P.nodes[rootIx]
-    if r is Program {
-      const stmts = r.progStmts
-      let i = 0
-      while i < stmts.length {
-        mlvScanStmt(stmts[i])
-        i = i + 1
-      }
+  mlvBuild(rootIx)
+  mlvSet[name] == true
+}
+
+// Build both module-frame tables once per compile. A top-level `LetDecl` is skipped rather
+// than descended: it is a module GLOBAL, so it belongs to no local frame, and recording it
+// would make `moduleLocalLetOf` answer for a name that is not a capture.
+function mlvBuild(rootIx: i32) {
+  if rootIx < 0 { return 0 }
+  if mlvBuilt { return 0 }
+  mlvBuilt = true
+  const r = P.nodes[rootIx]
+  if r is Program {
+    const stmts = r.progStmts
+    let i = 0
+    while i < stmts.length {
+      const s = P.nodes[stmts[i]]
+      if s is LetDecl {} else { mlvScanStmt(stmts[i]) }
+      i = i + 1
     }
   }
-  mlvSet[name] == true
+  0
+}
+
+// The module-scope BLOCK-LOCAL `LetDecl` binding `name` — a `const`/`let` written inside a
+// top-level `if`/`while`/`for`/bare block — or -1. `parentBindingOf`'s module arm (D1244):
+// the module's top level is not a lifted frame, so the `fnParent` walk runs off the chain
+// before it can type a capture of one of these, and every ref-repped capture then took the
+// i32 default (a loud `field access receiver is not a struct` on a struct, invalid wasm on
+// a list or a string).
+export function moduleLocalLetOf(rootIx: i32, name: string) {
+  mlvBuild(rootIx)
+  if !mllAny { return -1 }
+  mllMap[name] ?? -1
 }
 
 function plBuildLetMap(blockIx: i32) { plScanStmt(blockIx) }

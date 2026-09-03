@@ -253,7 +253,15 @@ Clause 2 is what keeps clause 1 honest. Without it "legal" drifts to mean "whate
 accepts" and the goal is vacuous — any refusal can be relabelled a design rule after the fact.
 That is not hypothetical: **25 inventory rows closed in five days, every one by converting
 `check-clean invalid wasm` into a loud refusal.** Under "fix all miscompiles" each of those
-closes is correct and defensible. Under this goal **they are all still open.**
+closes is correct and defensible. Under this goal **each of them is still open UNLESS the
+refusal is one the design owed** — and the conversion itself is NOT the tell. The 2026-09-03
+audit of all 53 `check_reject` rows (`docs/internals/check-reject-audit-2026-09.md`, #2441)
+graded the converted rows **28 DESIGN / 4 CAPABILITY** and the rows with no such
+conversion **8 DESIGN / 11 CAPABILITY**: eleven of the converted ones were a refusal the
+checker owed at the DIRECT spelling and had merely lost at a monomorphization pin, so the
+program was ill-typed all along. Grade a silent→loud close by whether a NEIGHBOURING
+spelling runs and whether the refusal names a CONTRACT or a MECHANISM, not by the shape of
+the close.
 
 **Count progress in programs that RUN.** `regress.py` already prints it: `runs` was
 **3,704 / 7,021 (52.8%)** on 2026-08-30. Silent→loud is hygiene, belongs in the record, and is
@@ -301,7 +309,7 @@ receives, and the literal unit still overstates messages by ~20%.
 `goal-scoreboard.py` can print `total against the goal 0` while ~500 refusal sites stand, and
 it is the sharpest available statement of the "name the population in the sentence" rule.
 
-**AND THE PHRASE LIST ITSELF NEEDS AUDITING — it was reporting HALF.** Until D958 the predicate
+**AND THE PHRASE LIST ITSELF NEEDS AUDITING — it was reporting HALF.** Until #2122 the predicate
 matched four phrasings and found 12 literals; the compiler carried **12 more** that concede the
 same thing in the other WORD ORDER (`not supported YET` rather than `not YET supported`), plus
 `not yet implemented` and `not yet callable`. Two of the newly-counted were verified by witness
@@ -531,7 +539,14 @@ all — no `Repro:` block, or a status line naming no outcome in its vocabulary 
 in the fourth column and the script still **exits 0**. So `94 graded · 94 as filed · 0 MOVED
 · 2 not graded` and `… · 0 not graded` are the same exit code, and a summary quoting the
 first three numbers reads identically either way. `--strict` makes an ungradeable row a
-failure and names the fix.
+failure and names the fix. **A witness that does not PARSE is its own outcome —
+`witness_unparsed`, in that fourth column** — because prose refuses like a type error, and
+D957 graded `as filed` on an indented English paragraph its declared `check reject` matched
+while the row was already closed; a row whose filed outcome really IS a parse-stage refusal
+says `parse error` in its status line (D46, D444, D471 do). **The rule that reached that
+paragraph is retired**: an unlabelled indented block was once accepted as the witness, all
+25 rows relying on it now carry a `Repro:` label over their own unchanged programs, and a
+block with no label is `no Repro block` — so prose cannot be graded by construction.
 
 **A row whose defect is only reachable under a change that was REFUSED is still gradeable** —
 file it as a REFUTATION PIN: the witness is the program that must keep RUNNING, with the
@@ -539,8 +554,8 @@ status `runs today and must keep running`, so it flips the day someone lands the
 change. D171/D172/D173 are that shape.
 
 `tests/vl_inventory_rows_test.ts` enforces the structural half of this on every PR (a
-known-outcome status line and a real repro BLOCK, not just a `Repro:` label) in ~15ms,
-without running any program.
+known-outcome status line, and a `Repro:` label with a real BLOCK under it — neither half
+alone) in ~15ms, without running any program.
 
 **And `tests/vl_inventory_refs_test.ts` asks the question none of the above can**: of every
 `D<id>` the tree CITES, which one has NO row? #2405 resolved a conflict in the inventory's
