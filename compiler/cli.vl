@@ -419,32 +419,18 @@ export function cliCmdPathLen() { cliCmdPath.length }
 export function cliCmdPathAt(j: i32) { cliCmdPath[j] }
 export function cliCmdDataLen() { cliCmdData.length }
 export function cliCmdDataAt(j: i32) { cliCmdData[j] }
-// The bulk twin of `cliCmdDataAt` — the `<name>Store(off, count)` half of the
-// host's OUT ABI (protocol and staging window: `driver.rbyteStore`'s header).
-// Writes `written` = min(count, cliCmdDataLen() - off) BYTES, PACKED FOUR PER i32
-// WORD (little-endian), into `ioMem[0 .. written)` and returns `written`.
+// The bulk twin of `cliCmdDataAt` — the `<name>Store(off, count)` half of the host's
+// OUT ABI (protocol and staging window: `driver.rbyteStore`'s header). Writes
+// `written` = min(count, cliCmdDataLen() - off) BYTES, PACKED FOUR PER i32 WORD
+// (little-endian), into `ioMem[0 .. written)` and returns `written`.
 //
-// This is the OUT channel `vl fmt` rides: a whole formatted file leaves the module
-// through the CMD_PRINT_OUT / CMD_WRITE_FILE payload, and `vl fmt compiler` moved
-// 4,520,527 code points one host call at a time (87 ms). It also carries every
-// `vl check` diagnostic line and the `--json` report, which are three orders of
-// magnitude smaller and would never have justified it on their own.
-//
-// STAGE 2c PACKED IT. The element used to BE a word — one UTF-32 code point — so
-// there was nothing to pack; now it is a UTF-8 byte, so this is the same four-per-word
-// loop `driver.rbyteStore` has always used, and the host's copy is a `memcpy` of the
-// byte range rather than a strided gather. The window holds `memory_size` bytes, four
-// times what it held, so the host chunks four times less often.
-//
-// `cliCmdPath` gets no `Store` twin on purpose — it carries one path (tens of bytes,
-// 0 ms at every volume measured), and leaving it on the per-element accessor keeps
-// the host's presence probe exercised on every single `vl check` rather than only
-// against an old seed.
-//
-// The tail assembly and the masking argument are `rbyteStore`'s, verbatim: the final
-// word's start is at most `cap - 4`, so its 1-3 padding bytes land inside the window,
-// and a string element is already 0..255 by construction (`array.get_u` on a packed
-// backing zero-extends), so nothing is masked twice.
+// This is the OUT channel `vl fmt` rides — a whole formatted file leaves through the
+// CMD_PRINT_OUT / CMD_WRITE_FILE payload — and it carries every `vl check` diagnostic
+// and the `--json` report, which alone would never have justified it. `cliCmdPath`
+// gets no `Store` twin on purpose: it carries one path, and the per-element accessor
+// keeps the host's presence probe exercised on every `vl check`. The tail assembly and
+// the masking argument are `rbyteStore`'s verbatim — the final word's padding bytes
+// land inside the window, and a string element is already 0..255 by construction.
 export function cliCmdDataStore(off: i32, count: i32): i32 {
   const avail = cliCmdData.length - off
   let n = count
@@ -1235,17 +1221,14 @@ function cliFinishSummary() {
 // The whole runner is policy EXCEPT wasm execution, so this is where all of it
 // lives: discovery reuses the `check`/`fmt` walk with a `*.test.vl` predicate,
 // compilation reuses the module fetch loop, and only three commands cross to the
-// host — stash a compiled module, collect the registries, run the plan.
-//
-// Phases, in order:
+// host — stash a compiled module, collect the registries, run the plan. In order:
 //   1. per file: read → resolve imports → `compileSrc()` → CMD_TEST_STASH
 //      (a compile failure records its diagnostics and the run CONTINUES)
 //   2. CMD_TEST_COLLECT — the host instantiates each module; its start function
 //      runs the file's top level, which is the registration pass; the host reads
 //      the registry back through the `vlt*` exports and commits it here
 //   3. plan — apply `-t`; drop `itSkip` entries into the skipped tally
-//   4. CMD_TEST_RUN — the host runs the plan across its worker pool
-//   5. report + exit code
+//   4. CMD_TEST_RUN — the host runs the plan across its worker pool, then report
 
 // The line `vl test` APPENDS to every test file before compiling it: the runner
 // protocol, re-exported so the host can find it on the test module itself. It is
@@ -1664,22 +1647,17 @@ function cliBeginCheck() {
 }
 
 // ── check --fix (A-impl 4) ──────────────────────────────────────────────────────
-// Apply the auto-fixes to `src` and return the rewritten source, counting fixes
-// into cliFixCount. Exactly ONE fix, the only one that is *always* the right
-// answer with no human judgment:
-//   prefer-const → the `let` keyword (the lint anchors on it) becomes `const`.
-// `--fix` deliberately does NOT touch unused-variable/parameter: the `_`-prefix
-// SILENCES a warning, and whether silencing is correct depends on intent (a
-// genuinely-unused param wants `_`; a forgotten-after-refactor one wants to be
-// removed) — so it stays a deliberate human choice. The lint still reports them.
-// Edits are computed as absolute (offset, len, text) and spliced back-to-front so
-// earlier offsets stay valid; lint is parse-only, so this needs no type info.
-// PRECONDITION: the caller (cliCheckCurFile) has just run the MODULE-AWARE check
-// (`checkSrc`/`compileSrc` over the resolved graph) AND `lintSrc` over `src`, so
-// both the redundant-annotation stream (type-informed, reliable) and the lint
-// stream are populated for `src`. We only read those + compute edits here — no
-// re-check (a per-file check without its imports gives unreliable types, which is
-// exactly what corrupted an empty-array annotation before this was module-aware).
+// Apply the auto-fixes to `src` and return the rewritten source, counting fixes into
+// cliFixCount. Exactly ONE fix, the only one that is *always* right with no human
+// judgment: prefer-const → the `let` keyword (the lint anchors on it) becomes `const`.
+// `--fix` deliberately does NOT touch unused-variable/parameter, because the `_`-prefix
+// SILENCES a warning and whether silencing is correct depends on intent; the lint still
+// reports them. Edits are absolute (offset, len, text), spliced back-to-front so earlier
+// offsets stay valid; lint is parse-only, so this needs no type info.
+// PRECONDITION: the caller (`cliCheckCurFile`) has just run the MODULE-AWARE check over
+// the resolved graph AND `lintSrc` over `src`, so both streams are populated. We only
+// read them and compute edits — a per-file re-check without its imports gives unreliable
+// types, which is exactly what corrupted an empty-array annotation before this.
 function cliComputeFixes(src: string) {
   const n = cliLintCount()
   // The absolute offset where each 0-based line begins.

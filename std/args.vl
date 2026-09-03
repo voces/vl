@@ -1,180 +1,41 @@
-// `std:args` — the program's command-line arguments, and the last piece of
-// VL's I/O tier.
+// `std:args` — the program's command-line arguments, and the last piece of VL's
+// I/O tier. ADMITTED BY `docs/internals/std-design.md` D2's inventory clause —
+// "what the LANGUAGE story needs to be complete without third parties … fs/io/args
+// once WASI lands", which names it outright — and NOT by "a consumer in the tree",
+// because there is none yet; converting `fuzzgen.vl`'s sed-rewritten flags is the
+// FOLLOW-UP, not the warrant. ONE EXPORT, `programArgs()`, is the whole surface.
 //
-// Until `std:fs` landed a VL program could compute and print, nothing else.
-// This is the other half of the same sentence: a program that can read a file
-// but cannot be told WHICH file is still a program with its inputs compiled in.
-// WHAT ADMITS THIS MODULE is `std-design.md`'s inventory clause — "what the
-// LANGUAGE story needs to be complete without third parties … eventually
-// fs/io/args once WASI lands", which names `std:args` outright among the first
-// WASI-era additions. It is NOT admitted by "a consumer in the tree", and the
-// distinction matters because that consumer does not exist yet: `fuzz-vl.sh:82`
-// still sed-rewrites `fuzzgen.vl`'s source
-// (`s/^let RICHVALUES = .*/let RICHVALUES = $VALUES/`), so renaming a `let`
-// still silently disables a flag. ROADMAP ranks `argv` value #1 of the host-ABI
-// dogfooding item for exactly that reason, and converting `fuzzgen.vl` is the
-// FOLLOW-UP rather than the warrant — it is also not free, because the host wart
-// below makes a `--values` flag unspellable without `--`.
+// INDEX 0 IS THE FIRST USER ARGUMENT. There is no program name in the list and
+// no export returns one — that is the FLOOR's shape, not a re-indexing applied
+// here, so `x.slice(1)` is the habit to unlearn rather than a step to keep.
 //
-// ONE EXPORT, and that is the whole surface. `std-design.md` D1's admission
-// principle says nothing lands without a consumer in the tree, and the consumer
-// above needs exactly one thing: the positional arguments, as strings. Every
-// other shape this module could have had is named at the bottom together with
-// the condition that would admit it. Adding a name later is purely additive;
-// std has no deprecation story, so the name that does not exist yet is the only
-// one still free to be right.
+// NAMED `programArgs` AND NOT `args`: VL has no namespace import, and a module
+// that both imports and declares a name is a HARD PARSE ERROR, so an export
+// `args` would make `const args = args()` refuse to compile; `argv` promises the
+// C layout this floor lacks. NOT `self`-FIRST — argv has no receiver.
 //
-// INDEX 0 IS THE FIRST USER ARGUMENT. There is no program name in this list —
-// not at index 0, not anywhere, and no export returns one. That is the FLOOR's
-// shape, not a re-indexing this module applied: `vl run p.vl a b` gives
-// `__args_count__() == 2` with `a` at index 0 (measured). Every language a VL
-// programmer arrives from disagrees — C's `argv[0]`, `sys.argv[0]`,
-// `os.Args[0]` and `process.argv[0..1]` are all the program — so this is the
-// one fact about the module worth reading twice, and `x.slice(1)` is the habit
-// to unlearn rather than a step to keep.
+// A LIST, NOT `argCount()` + `argAt(i)`: `string[]` reaches the generic surface
+// where an index protocol composes with nothing, and `.length` plus VL's ordinary
+// bounds-checked `[i]` dissolves out-of-range instead of answering it.
 //
-// The host is right to omit it. Under `vl run p.vl a b` there is no honest
-// answer: `vl` is the process, `p.vl` is the source, and a program that printed
-// either as its own name would print usage text naming the wrong thing. A
-// compiled VL binary will have a real argv[0] one day and it should arrive as
-// its own export (`programName(): string | null`) rather than as a slot that
-// means different things on different hosts.
+// FALLIBLE, AND THE FAILURE ARM IS CURRENTLY UNREACHABLE: the floor hands over
+// `u8[]` and a POSIX argument is any NUL-free byte string, but both Rust hosts
+// read `std::env::args()`, which panics before VL is instantiated. It ships
+// anyway because widening a return type later is the breaking change std has no
+// deprecation story for. THE FAILURE IS `Utf8Error`, BORROWED not invented: one
+// failure domain, and a new `ArgError = { code: i32, msg: string }` would be
+// structurally identical to `std:fs`'s `IoError`. ALL OR NOTHING — one argument
+// that is not UTF-8 fails the WHOLE call; dropping it would RENUMBER the rest.
 //
-// NAMED `programArgs` AND NOT `args`, and this one is measured rather than
-// preferred. VL has no namespace import, so every export lands in the
-// importer's flat top-level scope — and a module that both imports and declares
-// a name is a HARD PARSE ERROR, not a shadowing warning:
+// THE ERRNO STAYS INSIDE — the empty-plus-errno protocol is read once in the
+// loop, so this API has no ambient state and no order-dependent call. The ONE
+// `__trap__` fires only if the floor refuses an index below its own count.
 //
-//     Duplicate binding "args": module `m.vl` both imports and declares it
-//
-// So an export called `args` makes `const args = args()` — the first line every
-// consumer of this module wants to write — refuse to compile, and the fix
-// (`as` on the import) is a tax on every caller forever. `programArgs` is the
-// same reasoning `std:fs` used for `pathExists` over `exists`, applied to a
-// name whose collision is not hypothetical but the call site itself.
-// `argv` was the other candidate and is worse than either: it is the one
-// spelling that actively promises the C layout this floor does not have.
-//
-// NOT `self`-FIRST, so this is a free function rather than a UFCS method. `self`
-// is the UFCS switch (`std:fs`'s header explains it), and here it is forced
-// rather than chosen: argv has no receiver. There is nothing to be a method ON.
-//
-// A LIST, NOT `argCount()` + `argAt(i)`. The floor is a count plus an indexed
-// getter and this module deliberately does not re-export that shape:
-//
-//   - `string[]` reaches the generic surface and `u8[]` does not. `indexOf`,
-//     `includes`, `mapIndexed` and `reduce` from `std:array`, and `join` from
-//     `std:fmt`, all apply to the result of this call. An index protocol
-//     composes with nothing.
-//   - It dissolves the out-of-range question instead of answering it. `T | null`
-//     for a missing argument would put a check on every read; a trap would kill
-//     a program because its USER forgot an argument, which is not a bug in the
-//     program and so is not what traps are for
-//     (`docs/error-handling-design.md`). With a list there is no third policy to
-//     invent: `.length` is the count, `[i]` is VL's ordinary bounds-checked
-//     index, and indexing past a length you were handed is a bug exactly like
-//     any other out-of-bounds index.
-//   - `listDir(path): string[] | IoError` is the closest structural sibling in
-//     std — a host holding a list of byte strings, handed over as names — and it
-//     materialises the list rather than exposing a cursor. Two modules over one
-//     floor should not disagree about that.
-//
-// FALLIBLE, AND THE FAILURE ARM IS CURRENTLY UNREACHABLE. `__args_get__`
-// returns `u8[]`, so the floor's contract is BYTES, and bytes are not
-// necessarily UTF-8: a POSIX argument is any NUL-free byte string. But no host
-// in this tree can deliver one — both Rust hosts read `std::env::args()`, which
-// PANICS on a non-Unicode argument, so `vl run p.vl $'\xff'` aborts the process
-// with exit 101 before VL is instantiated (measured), and the V8 harness cannot
-// call the intrinsic at all. The error arm is dead code today, and it ships anyway
-// because the two mistakes are not the same size: a total `string[]` that meets
-// a WASI-era host reading `args_get` must either corrupt silently or crash, and
-// widening a return type afterwards is the breaking change std has no
-// deprecation story for. One dead `is` branch is the cheap wrong answer.
-//
-// THE FAILURE IS `Utf8Error`, BORROWED FROM `std:utf8` RATHER THAN INVENTED.
-// This module has exactly ONE failure domain — an argument that is not text —
-// and `std:utf8` already owns both the decoder and the name for it, carrying
-// the offset and the offending byte. Two alternatives were rejected:
-//
-//   - A new `ArgError = { code: i32, msg: string }` is STRUCTURALLY IDENTICAL to
-//     `std:fs`'s `IoError` — VL aliases are structural — so a program spelling
-//     `T | IoError | ArgError` would name one type twice. `std:utf8`'s header
-//     records the same trap being dodged for `ParseError`; walking into it here
-//     would be worse, because the collision is with a type that already exists.
-//   - Importing `IoError` FROM `std:fs` costs five host imports this module
-//     never calls. Measured at this head: a module importing so much as a type
-//     from `std:fs` declares `__fs_read__`, `__fs_write__`, `__fs_list__`,
-//     `__fs_stat__` and `__fs_errno__`, because there is no cross-module dead-
-//     code elimination. As written this module declares three
-//     (`__args_count__`, `__args_get__`, `__fs_errno__`) and every one of them
-//     is called. A host that wants to run an argv program — the playground's
-//     runtime supplies seven print imports and nothing else — should not have to
-//     fake a filesystem to do it.
-//
-// `std:fs` FOLDS its decode failure into `IoError` (EILSEQ) and this module does
-// not, which is a difference in the number of failure domains and not in taste:
-// `readTextFile` can fail as a READ or as a DECODE and one error type spares its
-// caller a two-arm union, while everything here that can go wrong is a decode.
-// Folding would only throw `at` and `byte` away.
-//
-// ALL OR NOTHING. One argument that is not UTF-8 fails the WHOLE call. Dropping
-// it would RENUMBER every argument after it — the second positional silently
-// becomes the first — and in a list whose positions are its meaning that turns a
-// bad input into a wrong answer instead of a loud one. `listDir` refuses for the
-// same reason and the reason is stronger here.
-//
-// THE ERRNO STAYS INSIDE. `std:fs` exposes `__fs_errno__`'s ambient cell in its
-// contract because its callers branch on the code; here no caller can, so the
-// empty-plus-errno protocol is read once inside the loop and never surfaces.
-// This module has no ambient state in its API and no order-dependent call.
-//
-// ONE `__trap__`, AND IT IS NOT A FAILURE MODE. `std:fs` opens by saying its
-// count is zero; this module's is one, so it is named here rather than found.
-// It fires only if the floor refuses an index BELOW the count it just reported —
-// a host contradicting itself, which is a bug and not a condition any caller can
-// cause or handle. Nothing a user can type reaches it.
-//
-// WHAT THIS MODULE DOES NOT DO.
-//
-// NO FLAG PARSING — not "not yet here", but a different module. Every one of
-// short vs long, clustered `-abc`, `--name=value` vs `--name value`, `--` as
-// end-of-options, a repeated flag (last wins, or accumulate), `-1` as a value
-// rather than a flag, and typed/required/defaulted values is a policy decision,
-// and a parser that decides half of them silently disagrees with whatever the
-// caller assumed about the other half. A half-parser is worse than none. It also
-// wants a map to return its results into and `std:map` does not exist yet. None
-// of it needs a new floor intrinsic — a parser is a pure `string[] => …` over
-// what this returns — so deferring costs nothing and buys the whole design.
-//
-// NO BYTES ACCESSOR. `std:fs` offers `readFile` beside `readTextFile` because a
-// PNG must survive the round trip; the argv equivalent would be a non-UTF-8 path
-// argument, and there is nowhere to put one: every `std:fs` entry point takes
-// `path: string`, so the bytes could not be used to open the file they name.
-// When `std:fs` grows a bytes-taking path — or when process spawn arrives — a
-// `programArgBytes(i): u8[]` becomes admissible; today it has no consumer.
-//
-// NO LOSSY VARIANT. `decodeUtf8Lossy` is `std:utf8`'s deliberate opt-out for a
-// caller who would rather render mojibake than stop, and no argv consumer in
-// this tree wants it: a mangled argument is a wrong filename or a wrong number,
-// not a log line to squint at. It becomes admissible on the same day the bytes
-// accessor does, and out of the same export.
-//
-// NO ENVIRONMENT, NO EXIT CODE, NO PROGRAM NAME, NO STDIN. Each is a separate
-// floor intrinsic that does not exist (`env` + `exit` are item 5 of the same
-// ROADMAP list and a process exit code sits inside item 4), and a std wrapper
-// for a syscall VL cannot make is a name that fails at emit.
-//
-// ONE HOST WART, RECORDED BECAUSE IT IS INVISIBLE FROM IN HERE. `vl run p.vl -v x`
-// delivers ONE argument, `x`: the host's own flag loop matches `--compiler`,
-// `-e` and `--`, routes every other non-dash token into the vector, and falls
-// through anything else beginning with `-` to a catch-all that discards it with
-// no diagnostic (measured). `vl run p.vl -- -v x` delivers both. Nothing in this
-// module can tell the two apart — a dropped argument and an un-passed one are
-// the same absence — so a VL program taking dash-led arguments must be invoked
-// after `--`, and `tests/vl_std_args_test.ts` pins the behaviour so a change to
-// it is noticed rather than silently reshaping what programs see. Filed as
-// issue #1818; a fix there makes this paragraph stale rather than wrong, and the
-// pinning test is what will say so.
+// NOT HERE, EACH FOR A REASON. NO FLAG PARSING: clustering, `--name=value`, `--`,
+// repeated flags and typed defaults are each a policy a half-parser would settle
+// silently, and none needs a new floor intrinsic. NO BYTES ACCESSOR and NO LOSSY
+// VARIANT: every `std:fs` entry takes `path: string`, so non-text argument bytes
+// could not open the file they name. NO ENVIRONMENT, EXIT CODE, NAME or STDIN.
 
 import { Utf8Error, decodeUtf8 } from "std:utf8"
 // `toString` is `std:fmt`'s export as of 2026-09-01, not the ambient builtin it was
@@ -193,62 +54,36 @@ import { toString } from "std:fmt"
 // `typecheck.vl` on the same mechanism.
 export { Utf8Error } from "std:utf8"
 
-// `programArgs()` — every argument the program was given, in order, as text.
+// `programArgs()` — every argument the program was given, in order, as text. Index 0
+// is the FIRST USER ARGUMENT and there is no program name in the list (see the
+// header). No arguments is an EMPTY ARRAY, never an error and never null: being given
+// nothing is not a failure, it is the answer. The failure is a single argument that is
+// not UTF-8, reported as `std:utf8`'s `Utf8Error` with `at` and `byte` keeping that
+// module's meanings. WHICH argument is named in `msg` only — a fourth field would fork
+// the error vocabulary for a fact no caller can act on.
 //
-// Index 0 is the FIRST USER ARGUMENT and there is no program name in the list
-// (see the header). No arguments is an EMPTY ARRAY, never an error and never
-// null: being given nothing is not a failure, it is the answer.
-//
-// The failure is a single argument that is not UTF-8, reported as `std:utf8`'s
-// `Utf8Error` with `at` and `byte` keeping the meanings that module gives them —
-// the offset WITHIN the offending argument, and the byte found there. WHICH
-// argument is named in `msg` only, deliberately: a fourth field would fork the
-// error vocabulary for a fact no caller can act on, since an argument that is
-// not text cannot be repaired by knowing its index.
-//
-//     import { programArgs } from "std:args"
-//     import { Utf8Error } from "std:utf8"
-//
-//     const args = programArgs()
-//     if args is Utf8Error { print(args.msg) } else { print(args.length) }
+// ONE HOST WART, INVISIBLE FROM IN HERE: `vl run p.vl -v x` delivers ONE argument,
+// because the host discards unknown dash-led tokens with no diagnostic, while
+// `vl run p.vl -- -v x` delivers both — and nothing here can tell a dropped argument
+// from an un-passed one. `tests/vl_std_args_test.ts` pins it (#1818).
 export function programArgs(): string[] | Utf8Error {
   const n = __args_count__()
   const out: string[] = []
   let i = 0
   while i < n {
     const raw = __args_get__(i)
-    // EMPTY is the floor's failure signal AND a legitimate argument: `""` is a
-    // real thing to pass (`p.vl "" x` reports a count of 2 with a zero-length
-    // argument 0 and errno 0 — measured), so the errno is what separates them,
-    // exactly as `std:fs` separates a failed read from an empty file.
-    //
-    // Inside `0 .. __args_count__()` the floor answers by contract, so a
-    // non-zero errno here is a HOST that contradicted its own count between two
-    // calls. That is the one condition in this module that is a BUG rather than
-    // a failure — nothing the caller passed could cause it and there is no
-    // recovery — so it traps with a reason, which is the same call `std:utf8`
-    // makes for its own provably-unreachable arm. Checking is what stops the
-    // slot silently becoming `""`, which is the failure mode of NOT checking:
-    // `decodeUtf8` of an empty array is `""`, so an unchecked floor violation
-    // would put a blank argument in a real position and renumber nothing.
-    //
-    // This is the ONLY `__trap__` in the module, and it is unreachable at both
-    // Rust hosts because `__args_get__` ZEROES THE SHARED ERRNO CELL on every
-    // success. That cell is `std:fs`'s (`__fs_errno__`) and is per-instance, so
-    // this module's one trap rests on a `std:fs` FLOOR INVARIANT rather than on
-    // anything local: a floor that stopped zeroing on success would turn a
-    // legitimate EMPTY argument into a trap, because empty-plus-errno is exactly
-    // how this protocol spells failure. (An earlier version of this comment
-    // credited `PROGRAM_ARGS` being filled once and never mutated. That is true
-    // and is NOT the guard — the adversarial case is a dirty errno cell left by
-    // an unrelated failed `std:fs` call followed by a legitimately empty
-    // argument, which `PROGRAM_ARGS` immutability does nothing about.)
-    // It needs no `return` behind it — `__trap__` lowers to `unreachable` and
-    // the loop is not a return position, so nothing has to be narrowed. That is
-    // why `decodeUtf8Lossy`'s `return ""` has no twin here: that one exists to
-    // make its `string` return type provable, not to stop execution (verified —
-    // this function checks, emits and runs identically with the `return`
-    // removed, and a `__trap__` inside a loop halts rather than continuing).
+    // EMPTY is the floor's failure signal AND a legitimate argument — `""` is a
+    // real thing to pass — so the errno is what separates them, exactly as
+    // `std:fs` separates a failed read from an empty file. Inside
+    // `0 .. __args_count__()` the floor answers by contract, so a non-zero errno
+    // is a HOST contradicting its own count: a BUG no caller can cause or
+    // recover from, hence a trap. Not checking is what would put a blank
+    // argument in a real position, since `decodeUtf8` of an empty array is `""`.
+    // The trap is unreachable at both Rust hosts only because `__args_get__`
+    // ZEROES THE SHARED ERRNO CELL on success, so it rests on a `std:fs` FLOOR
+    // INVARIANT and not on anything local — `PROGRAM_ARGS` being immutable does
+    // NOT guard it, because the adversarial case is a dirty cell left by an
+    // unrelated failed `std:fs` call followed by a legitimately empty argument.
     if raw.length == 0 {
       if __fs_errno__() != 0 {
         __trap__("std:args: the floor refused an index below __args_count__()")

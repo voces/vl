@@ -3,157 +3,41 @@
 // `self` first parameter, so they read as UFCS methods on the receiver
 // (`n.toString()`, `"1.5".parseF64()`, `parts.join(sep)`).
 //
-// THE EXPORT WAS CALLED `toStr` UNTIL 2026-09-01, AND THE COMPILER CARRIED AN
-// AMBIENT BUILTIN CALLED `toString`. Owner ruling, executed in that change: the
-// builtin is retired and this export takes its name. `toString` is the
-// cross-language-conventional spelling (Java, C#, JS, Kotlin, Scala, Dart all
-// spell it in full; Rust's `to_string` is the same word), and after the ruling
-// there is exactly ONE of it in the language, at the std surface, reached by an
-// ordinary import. DECISIONS.md carries the ruling; what follows is the
-// measurement trail that settled it, kept because a reader asking "why is this
-// not a builtin?" is asking about these three facts.
+// `toString` IS THIS MODULE'S EXPORT, NOT AN AMBIENT BUILTIN: the compiler once
+// carried a builtin of that name over `i32 | boolean`, and the owner retired it
+// so this export could take it (DECISIONS.md). No capability was lost — this
+// domain is a strict superset — and it bought the UFCS spelling, since builtins
+// are not `self`-first. THE ONE BREAK, shipped deliberately: `toString(42)` needs
+// `import { toString } from "std:fmt"` now, and because std has no deprecation
+// story the compiler pays for it with `typecheck.stdFmtMovedNote`, which appends
+// the import line to both refusals, for `toString` and the old `toStr` alike.
 //
-// (1) NO CAPABILITY WAS LOST. The builtin's domain was `i32 | boolean` — a
-// STRICT SUBSET of this export's `i32 | i64 | boolean | f64`; measured
-// 2026-09-01 on the pre-rename compiler, `toString(n)` over an i64 and
-// `toString(1.5)` both refused. Every program the builtin served, this export
-// serves, and two widths more.
+// THE NAME IS BORROWED AND THE DOMAIN IS NOT. Elsewhere `toString` is defined on
+// every value; here it is exactly `i32 | i64 | boolean | f64`, so `"abc".toString()`
+// and `p.toString()` on a struct are refusals. A string identity arm is
+// deliberately absent: an arm that does nothing invites the name to grow into the
+// universal renderer VL has no overloading or traits to deliver (the derived
+// `show<T>` is that future, serde stage 2). The namespace being flat, a file that
+// declares its own `toString` cannot also import this one — `as` is the escape.
 //
-// (2) THE RENAME BOUGHT THE UFCS SPELLING, which is the actual user-facing win.
-// Builtins are not `self`-first, so `n.toString()` refused on the pre-rename
-// compiler (`member access '.toString' on non-object i32`) while `n.toStr()`
-// worked. After it, `n.toString()` is the method spelling and `toString(n)` the
-// free-function one, both reaching the same function.
+// WHAT IS NOT HERE: `f32`, in either direction — its shortest rendering is
+// shorter than its widened f64's, so it is Burger–Dybvig at 24-bit boundaries and
+// never a wrapper (`docs/serde-design.md` stage 0 owns it); any RADIX but ten;
+// and no unsigned, boolean or prefix parser. An `f32` widens losslessly INTO the
+// f64 arm, so `x.toString()` over one now passes the checker and floors at emit —
+// a COMPILER hole older than this module, pinned by
+// `scripts/capability-probes/f32-into-f64-union-arm.vl`.
 //
-// (3) THE ONE BREAK, shipped deliberately and once: `toString(42)` compiled with
-// NO import before and needs `import { toString } from "std:fmt"` now. std has
-// no deprecation story, so the compiler pays for the break with a targeted
-// refusal instead — `typecheck.stdFmtMovedNote` appends the import line to the
-// undeclared-identifier message AND to the member-access-on-a-scalar sentence,
-// for BOTH `toString` and the old `toStr` spelling (four assertions in
-// `tests/cases/tostring/moved-to-std-hint.vl`; the `toStr` note carries an
-// expiry, `toString`'s does not), following the `then`-removal precedent
-// (#2094).
-//
-// WHAT IS WRITTEN HERE is the number rendering — `toString` over the two integer
-// widths, boolean, and `f64` — plus the three inverses that read a number back:
-// `parseI64`, `parseI32` and `parseF64`. Each half has its own design block
-// below and each block is the thing to read before touching its functions:
-// `TEXT → INTEGER` owns the two integer parsers (their grammar is deliberately
-// a strict SUBSET of the float one, so picking between them is a choice of type
-// and never of dialect, and out of range is `null` in the integer block where
-// it is ±Infinity in the float one), and `f64 ↔ TEXT` owns the
-// interesting halves — the shortest-round-trip renderer and its correctly
-// rounded reader.
-//
-// THE NAME IS BORROWED AND THE DOMAIN IS NOT. In the six languages cited above
-// `toString` is defined on every value; here it is exactly `i32 | i64 |
-// boolean | f64`. Measured 2026-09-01: `"abc".toString()` → `no method
-// '.toString' on string`, `[1,2].toString()` → `… on array i32[]`,
-// `p.toString()` on a struct → `no field 'toString' on Point`. A string
-// identity arm is deliberately absent — `s.toString()` is `s`, and an arm that
-// does nothing invites the name to grow into a universal renderer VL has no
-// overloading or traits to deliver (the derived `show<T>` is that future,
-// serde stage 2). And because the namespace is flat, a file that declares its
-// own `toString` cannot also import this one: that is a HARD refusal
-// (`Duplicate binding "toString"` —
-// `tests/cases/tostring/import-and-declare-collide.vl`), and
-// `import { toString as … }` is the escape.
-//
-// WHAT IS NOT, ON THE NUMERIC SIDE: `f32`, in either direction, and any radix
-// but ten. Neither is "later here"; both are a different computation.
-//
-//   `f32` HAS NO ARM AND SHOULD NOT GET A WRAPPER. An f32's shortest rendering
-//   is shorter than its widened f64's — `0.1` against `0.10000000149011612` —
-//   so it is Burger–Dybvig with 24-bit-significand boundaries, not `toString` of
-//   the widened value, and reading one back needs f32-nearest rounding rather
-//   than f64-nearest then a narrowing. `docs/serde-design.md` stage 0 carries
-//   it as the remaining half.
-//
-//   THAT ABSENCE HAS A DIAGNOSTIC PRICE AND IT IS THE F64 ARM'S FAULT, so it
-//   is stated rather than left to be hit. An `f32` widens losslessly into the
-//   `f64` arm, so the checker now ACCEPTS `x.toString()` over an `f32` binding
-//   where it used to refuse it cleanly (`member access '.toString' on non-object
-//   f32`); the emitter then floors with `emitProgram: union atom has no value
-//   box`. Measured 2026-09-01, both spellings. The hole is the COMPILER's and
-//   predates this module — three std-free lines reproduce it, and it refuses
-//   identically on a master-built seed — but it was unreachable from `toString`
-//   until the f64 arm existed. Pinned by
-//   `scripts/capability-probes/f32-into-f64-union-arm.vl`, whose header argues
-//   the end state is to BOX the widened value rather than to re-narrow the
-//   checker: the widening is lossless, so clause 2 says the program must
-//   build. When it does, an `f32` will render as the f64 it became, which is
-//   why an f32 arm is still owed after that.
-//
-//   RADIX: `toString` is decimal only. Hex, binary and octal renderings are a
-//   different function family with their own case and padding questions, and
-//   nothing in the tree asks for one.
-//
-// WHAT IS NOT is the string manipulation. `split`, `join`, `repeat` and
-// `padLeft` used to have their implementations in this file; they now live in
-// `std:str`, which owns the whole string method surface
-// (`docs/guide/strings-design.md` §Methods, step 1), and the names below are a
-// re-export plus one delegating call. Nothing an existing importer spells has
-// changed — `"5".padLeft(4, "ab")` is still `"aba5"` — and `join` got FASTER on
-// the way: `std:str` fills one code-point buffer where the version here ran an
-// `out = out + parts[i]` accumulator, which is O(n²) on this compiler (the B7b
-// fusion that used to hide that lives only in the deleted TS emitter — the
-// measurement is in `std:str`'s header).
-//
-// THE MOVE WAS NOT TIDINESS. VL has no namespace import, so every export lands
-// in the importer's flat top-level scope and a name declared twice across two
-// imported modules is a HARD PARSE ERROR. Two modules each carrying their own
-// `split` would mean a file could import `toString` and `split` from `std:fmt`, or
-// `trim` and `split` from `std:str`, but never `toString` and `trim` and `split` —
-// and whichever module the caller reached for would have silently decided
-// whether their `join` was O(n) or O(n²). One implementation, one home, and
-// this module keeps the names its importers already spell.
-//
-// WHAT THE MOVE COSTS, MEASURED — AND THE NUMBER MOVES WHENEVER THIS FILE
-// GROWS, so it is dated. There is no cross-module dead-code elimination, so a
-// program that imports ONLY `toString` emits `std:str` too AND every byte of the
-// f64 halves below. `import { toString } from "std:fmt"` + one `n.toString()` on an
-// i32, built to wasm on 2026-09-01: **17,645 bytes** — 2,850 before the
-// `std:str` move, 7,548 before the f64 half, 17,062 before the integer parsers,
-// and the breakdown of the 9,514 the f64 half added is in the `f64 ↔ TEXT`
-// header, where it is the argument for `parseF64` living here. The integer
-// parsers' own **583** is an A/B on ONE seed (this file against `HEAD`'s, same
-// binary, `VL_STD` pinned to each) rather than a subtraction across two
-// measurements — and it was re-run after the leading-"+" arm came out, which
-// moved it by 19 bytes from the 602 an earlier draft measured. That is a real
-// regression and it is recorded here rather than
-// left to be discovered, but it is a symptom of the missing DCE and not of the
-// module shape — the same program already carried this module's own unused
-// `split`/`join`/`repeat` before the move, for the same reason. The fix is
-// whole-program dead-code elimination, which nothing in the pipeline does
-// today; the alternative — two implementations of `split`, so that a
-// formatting import stays small — buys the bytes back by paying in the hazard
-// above.
-//
-// AND THAT NUMBER IS THE `none` RUNG — AND THE PROBE IS CONSTANT-FOLDABLE. The
-// same program is 1,041 bytes at `-O` and 542 at `-O3`, but at `-O3` the module
-// holds exactly ONE function (`wasm-dis p.wasm | grep -c '^ (func'` → 1):
-// binaryen evaluated `toString(42)` at compile time, so 542 prices the FOLD,
-// not the renderer. With the value not compile-time known (a loop-accumulated
-// one), `-O3` is 650 for the i32 arm, 5,164 once the f64 arm is live, and
-// 7,806 with `parseF64` live too (the i32 rung re-measured 2026-09-01 with the
-// header's own recipe and this file's own A/B; it read 652 before a `fmt.vl`
-// edit, and two numbers for one rung in one paragraph is unreadable, so the
-// stale one is gone rather than annotated). The integer parsers add NOTHING to
-// that rung when nothing calls them — 650 bytes on both arms of the same A/B,
-// so binaryen drops them entirely, and their 583 is a `none`-rung number only.
-// DCE does find what
-// the VL pipeline does not — but quote the rung AND what the program reaches:
-// the standing cost is ~0.6 KB for integer rendering and ~5 KB once a float is
-// rendered, and the same correction applies to every "importing `std:fmt`
-// costs …" claim in the tree (`std:utf8`'s header carries all three rungs).
-//
-// `padLeft` IS THE ONE NAME THAT DID NOT MOVE VERBATIM. `std:str` spells it
-// `padStart`, matching `padEnd` beside it and the JS pair both are modelled on;
-// `padLeft`/`padRight` is the other convention and picking one mattered less
-// than not shipping both. The wrapper below keeps this module's spelling for
-// its existing callers at the cost of one call, and it is a DELEGATION rather
-// than a copy — there is still exactly one padder in the tree.
+// THE STRING SURFACE LIVES IN `std:str`; the names below are a re-export plus one
+// delegating call, and `padLeft` is the only one that did not move verbatim
+// (`std:str` spells it `padStart`). The move was not tidiness: VL has no
+// namespace import, so two modules each carrying a `split` would let a file
+// import `toString` and `split`, or `trim` and `split`, but never all three — and
+// whichever the caller reached for would silently decide whether their `join` was
+// O(n) or O(n²). It costs bytes, because there is no cross-module dead-code
+// elimination — but quote the OPTIMIZATION RUNG and what the program reaches: at
+// `-O3` an unused parser costs nothing measurable, and a constant-foldable probe
+// prices the FOLD, not the renderer.
 
 import { padStart } from "std:str"
 
@@ -233,180 +117,17 @@ export function padLeft(self: string, width: i32, fill: string) {
 }
 
 // ── TEXT → INTEGER ──────────────────────────────────────────────────────────
-//
-// `parseI64` and `parseI32` are the EXACT inverses of `toString` over the two
-// integer widths, and "exact" is the whole warrant. Until they landed the only
-// text→number path in the tree was the `parseF64` funnel, which cannot be exact
-// wherever the integer is not representable as a double: measured 2026-09-01,
-// `parseF64("9007199254740993")` is `9007199254740992`, and
-// `parseF64("9223372036854775807")` is 2^63 — it PRINTS as
-// `9223372036854776000`, which is the shortest decimal that round-trips and is
-// not itself a double — while `parseI64` of that string is the integer itself.
-//
-// SERDE DECISION B (RULED 2026-09-01: `i64` on the JSON wire is ALWAYS a
-// NUMBER — `docs/internals/serde-critique-synthesis.md` §"Decisions that are
-// the owner's", `docs/serde-design.md` OQ-9) is NOT what admits these two
-// exports, and this module does not depend on it. What admits them is the
-// sentence in that same recommendation: they are needed "regardless … by every
-// option, and today the ONLY number path is the funnel". A decimal-string wire
-// would need an exact integer READER even more than a numeric one does.
-//
-// `std-design.md` D2's inventory clause admits it on the same
-// line that admits `std:fmt` itself — "what the LANGUAGE story needs to be
-// complete without third parties" — and the consumer that will spell it is
-// `std:json`, next in the same slice.
-//
-// ── THE GRAMMAR, a strict SUBSET of `parseF64`'s, deliberately:
-//
-//     "-"? digit+
-//
-// and nothing else — no whitespace at either end, no digit separator, no
-// `0x`/`0b`, no radix point, no exponent, no leading "+". So `"1.0"` and
-// `"1e3"` are `null` here and finite numbers there, while every string these
-// accept `parseF64` accepts too. Choosing between them is therefore a choice of
-// TYPE and never a choice of DIALECT: no string parses here and fails there.
-// A caller with a scruffier input trims and rewrites first; std does not guess.
-// (Same sentence as `parseF64`'s header, and the same reason.)
-//
-//   THE SUBSET IS ABOUT ACCEPTANCE, NOT ABOUT THE VALUE, and the difference is
-//   this module's entire warrant. The two agree wherever the integer is exactly
-//   representable as a double — which is NOT the same as "at or below 2^53":
-//   measured, `"9007199254740994"` and `"18014398509481984"` (2^54) both agree,
-//   because an even integer can be representable well past 2^53. They disagree
-//   exactly where it is not: `parseI64("9223372036854775807")` is that integer
-//   while `parseF64` of it is 2^63. And they disagree at `"-0"`, which is 0
-//   here and −0.0 there — an integer type has no signed zero to preserve. A
-//   caller picks the function whose TYPE it wants and gets that type's best
-//   answer. Reading the subset rule as "the two are interchangeable" is exactly
-//   the mistake the `parseF64` funnel was making before these existed.
-//
-//   "+" IS REFUSED, and this is the deliberate one — `Number("+3")` is 3, C's
-//   `strtol` skips a leading "+", and Rust's `i64::from_str` accepts it, so the
-//   refusal costs a spelling three mainstream readers allow. It is refused
-//   anyway because `parseF64` refuses it (JSON's grammar has none, and RFC
-//   8259's `int` production has none either), and every one of those three
-//   readers is UNIFORM across its integer and float entry points. Accepting it
-//   on only the integer side would make `std:fmt` the one number surface in
-//   that list running two dialects, and would do it for the single character
-//   where the two functions could disagree about a WELL-FORMED number rather
-//   than about a type.
-//
-//   THE DIRECTION IS WHAT SETTLES IT, and it is this module's own argument for
-//   the error channel, applied to the grammar: a std name has no deprecation
-//   story, so a grammar can be WIDENED later and cannot be narrowed. Adding "+"
-//   to both parsers on the day a consumer needs it breaks nothing; removing it
-//   from one of them afterwards breaks every caller that spelled it. Refusing
-//   now keeps both options; accepting now spends one of them on a case no
-//   consumer in the tree has asked for. Note the consequence for the round
-//   trip: `toString` never emits a "+", so nothing about
-//   `parseI64(toString(n)) == n` depends on this choice either way.
-//
-//   LEADING ZEROS ARE ACCEPTED — `"007"` is 7 — matching `Number`, every
-//   `strtol`, and `parseF64`'s own rule two sections down, and costing nothing.
-//   This is the one place the grammar is wider than it strictly needs to be,
-//   and it is inside `parseF64`'s grammar rather than beside it.
-//
-//   `"-0"` IS 0. There is no negative zero integer, so the sign is consumed and
-//   nothing is left to record. (`parseF64` cannot say this: it answers −0.0,
-//   which is a distinct f64 — the one FINITE value its own round trip excepts,
-//   NaN being the other.)
-//
-//   EMPTY AND A LONE "-" ARE `null`, and so is a lone "+", which is simply not
-//   a digit. `parseF64` answers `null` on all three.
-//
-// ── OUT OF RANGE IS `null`, AND THAT IS THE OPPOSITE OF `parseF64`'s RULE —
-// which says out of range is NOT a parse failure and answers ±Infinity or ±0.
-// The two rules disagree because the two TYPES do. A float has values that mean
-// "larger than any of me": `"1e400"` → `Infinity` preserves what can be
-// preserved, and `strtod`, `Number()` and Rust's `parse` all agree. An integer
-// has no such value, so every candidate answer for `"9223372036854775808"` is a
-// lie of a different kind:
-//
-//     wrap      → -9223372036854775808   a silent WRONG VALUE — the class this
-//                                        repo files inventory rows for
-//     saturate  →  9223372036854775807   also wrong, and indistinguishable from
-//                                        the honest parse of the string one
-//                                        smaller
-//     null      →                        "this string denotes no i64", true
-//
-// Only the third is true, and it costs the caller nothing they were not already
-// paying: the return is a union, so the null branch exists whether or not range
-// rides on it. This does NOT put two meanings on one channel the way
-// `parseF64`'s header warns against, because for an integer "out of range" and
-// "not a number of this type" are the SAME statement — the type has no member
-// that could denote the difference. For a float they are different statements,
-// which is exactly why `parseF64` keeps them apart.
-//
-// ── `i64 | null` / `i32 | null` IS THE CHANNEL, for `parseF64`'s reason,
-// unchanged: `error-handling-design.md` rules `T | null` for absence and
-// `T | E` for a failure carrying information the caller needs. There is no such
-// information here. A parse POSITION would be honest only if a prefix could
-// succeed, and it cannot — these consume the whole string or fail — and after
-// the paragraph above there is no second KIND to report either. Rust's
-// `ParseIntError` does distinguish `Empty`/`InvalidDigit`/`PosOverflow`, and
-// that is the alternative that was not taken: every consumer this is being
-// built for branches on success, not on why. `i64 | ParseIntError` is a
-// WIDENING of this signature that would cost existing callers one `is` branch
-// — the direction std can still travel, unlike the reverse.
-//
-// ── TWO NAMES, NOT ONE, and neither is a narrow of the other. Three things
-// forced it:
-//
-//   (1) THE RETURN TYPE IS THE POINT. A caller who wants an `i32` and is handed
-//   an `i64 | null` has to narrow, and `v as i32` on this compiler is an
-//   UNCHECKED wrapping truncation — measured 2026-09-01, `2147483648 as i32` is
-//   `-2147483648` and `4294967296 as i32` is `0`. Handing every i32 caller that
-//   cast is handing them the wrap this module just refused to perform.
-//
-//   (2) VL HAS NO RETURN-TYPE OVERLOADING AND NO RETURN-POSITION GENERIC. A
-//   single `parseInt<T>(self: string): T | null` cannot be CALLED. Measured
-//   2026-09-01, both arms: the DECLARATION alone compiles and runs (rc 0), and
-//   adding `const v = parseInt("1")` is refused with `emitProgram:
-//   monomorphize: a return type parameter of `parseInt` is not bound by any
-//   parameter` — because nothing at the call site carries T. The refusal is at
-//   the use, not the definition, which is why the declaration compiling is not
-//   evidence against it. Type-directed reading is what serde stage 2's deriver
-//   is for; a pair of names is what can be written today.
-//
-//   (3) IT MIRRORS THE RENDERER'S DOMAIN EXACTLY. `toString` renders `i32` and
-//   `i64` (plus `boolean` and `f64`); the integer inverses cover the same two
-//   widths and no more, and `parseF64` is the f64 one. That is the rubric's
-//   "a width-suffixed family stays uniform", read across the two directions.
-//
-// `parseI32` is therefore NOT `parseI64` followed by a narrow: it range-checks
-// in the WIDE type first and truncates only behind that check, where the
-// truncation is provably lossless. The two share `parseBoundedInt`, so the
-// module holds ONE grammar and ONE overflow argument rather than two that can
-// drift apart.
-//
-// ── THE ARITHMETIC NEVER OVERFLOWS, by construction rather than by detection.
-// The accumulator works in the NEGATIVE range — the same trick, and the same
-// reason, as `renderI64` above: the negative half is the wider one, so i64 min
-// is reachable as an intermediate while its positive counterpart never has to
-// be. Each guard runs BEFORE the operation it protects, so nothing ever wraps.
-// A wrapped SIGN is not used as a detector anywhere here and must not be: for a
-// long enough digit string the accumulator wraps more than once and the sign
-// comes back, so that test would pass on a value it should refuse.
-//
-//   AND THERE IS NO DIGIT CAP, unlike `parseF64`'s 800. That cap exists because
-//   the float path holds the significand as a BIG INTEGER, so a megabyte of
-//   digits is a megabyte of allocation — a denial-of-service surface for the
-//   JSON reader both halves are being built for. This path's accumulator is one
-//   fixed-width i64: a megabyte of digits is a megabyte of scanning, constant
-//   memory, and a `null` from the range guard within the first twenty
-//   iterations unless every one of them is a leading zero. Nothing to cap.
-//
-// ── WHAT IS NOT HERE. No radix but ten, matching `toString` — hex and binary
-// reading is a different function family with its own prefix and case
-// questions, and nothing in the tree asks for one. No unsigned parser: VL's
-// integer surface is `i32`/`i64`, so a `u32` reader would be a name for a type
-// this module cannot return. No `parseBoolean`: `"true"`/`"false"` is a
-// two-string comparison a caller writes in one line, and a std name for it
-// would have to rule on `"True"`, `"1"` and `"yes"` — questions the number
-// grammar simply does not have. No prefix or partial parse (a `strtol`-style
-// end position): a TOKENIZER wants that, `std:json` is the consumer that would
-// name its shape, and it waits for that consumer rather than being guessed at
-// now.
+// `parseI64`/`parseI32` are the EXACT inverses of `toString` over the two integer
+// widths; the `parseF64` funnel cannot be wherever the integer is not a double.
+// THE GRAMMAR IS `"-"? digit+` and nothing else — a strict SUBSET of `parseF64`'s,
+// so choosing between them is a choice of TYPE and never of DIALECT, and no string
+// parses here and fails there. Leading zeros are in (`"007"` is seven); a leading
+// "+", whitespace, `"1.0"` and `"1e3"` are out, "+" deliberately, because a grammar
+// can be WIDENED later and never narrowed. `"-0"` is zero: an integer has no signed
+// zero. THE ACCUMULATOR WORKS IN THE NEGATIVE RANGE — the wider half, so i64 min is
+// reachable as an intermediate — and every guard runs BEFORE the operation it
+// protects, so nothing ever wraps. A wrapped SIGN must never be used as a detector:
+// a long enough digit string wraps twice and the sign comes back.
 
 // i64's bounds. i64 min is spelled as max-minus-one because it has no decimal
 // literal: `-9223372036854775808` lexes as a negation of a magnitude that
@@ -482,15 +203,17 @@ function parseBoundedInt(self: string, lo: i64, hi: i64): i64 | null {
 }
 
 // The i64 that the decimal integer `self` spells, or `null` when `self` is not
-// one or does not fit. See the `TEXT → INTEGER` header for the grammar (leading
-// zeros in; a leading `"+"`, whitespace, `"1.0"` and `"1e3"` out), for why out
-// of range is `null` here while it is ±Infinity in `parseF64`, and for why the
-// failure channel is `null` rather than an error struct.
+// one or does not fit. See the `TEXT → INTEGER` header for the grammar.
 //
-// Exact for every accepted input by construction — no float exists at any step
-// — which is the entire difference from routing integer text through
-// `parseF64`: measured 2026-09-01, `parseF64("9223372036854775807")` is
-// `9223372036854776000` while this answers `9223372036854775807`.
+// OUT OF RANGE IS `null`, the OPPOSITE of `parseF64`'s rule, because the two TYPES
+// differ: a float has values meaning "larger than any of me", an integer has none,
+// so wrapping is a silent WRONG VALUE and saturating is indistinguishable from the
+// honest parse of the string one smaller. That does not put two meanings on one
+// channel, because for an integer "out of range" and "not a number of this type"
+// are the SAME statement. `i64 | null` IS THE CHANNEL for `parseF64`'s reason:
+// there is no information to carry — the parse consumes the whole string or fails,
+// so no position is honest — and `i64 | ParseIntError` stays a WIDENING std can
+// still travel to. Exact by construction: no float exists at any step.
 export function parseI64(self: string): i64 | null {
   parseBoundedInt(self, I64_MIN, I64_MAX)
 }
@@ -498,6 +221,15 @@ export function parseI64(self: string): i64 | null {
 // The i32 that the decimal integer `self` spells, or `null` when `self` is not
 // one or does not fit in 32 bits. Same grammar as `parseI64`; `"2147483648"`
 // and `"-2147483649"` are `null` rather than wrapped.
+//
+// TWO NAMES, NOT ONE, and this is NOT `parseI64` followed by a narrow: it
+// range-checks in the WIDE type first and truncates only behind that check, where
+// the truncation is provably lossless. Three things forced the pair. The RETURN
+// TYPE is the point — handing every i32 caller an `i64 | null` hands them a cast.
+// VL has NO return-type overloading and no return-position generic, so a single
+// `parseInt<T>(self: string): T | null` cannot be CALLED (the refusal is at the
+// USE, not the definition). And it mirrors `toString`'s domain exactly, which is
+// the rubric's "a width-suffixed family stays uniform" read across both directions.
 export function parseI32(self: string): i32 | null {
   const v = parseBoundedInt(self, I32_MIN_WIDE, I32_MAX_WIDE)
   if v is null { return null }
@@ -517,215 +249,30 @@ export function parseI32(self: string): i32 | null {
 }
 
 // ── f64 ↔ TEXT ──────────────────────────────────────────────────────────────
-//
 // Serde stage 0 (`docs/serde-design.md` §Recommendation). Until this landed VL
-// could not render or read a float at all: `"v=" + 0.1` was
-// `operator '+' is not defined for string and f64`, and there was no parser
-// anywhere in std. The shortest-round-trip printer that `print(0.1 + 0.2)` uses
-// lives in the HOST's print sink, not in VL, so its result was never available
-// as a VL string value. `docs/internals/std-design.md` D4 item 1 deferred this
-// ("Ryu-class … explicitly DEFERRED — `print` keeps covering floats"); that
-// deferral is now spent, and the paragraph there says so.
-//
-// ── THE STYLE IS ECMAScript `Number::toString`, radix 10, and that is a SPEC,
-// not a preference. Two independent reasons pick it. (1) It is what the two
-// hosts' print sinks already claim to implement — `scripts/vl-host/src/main.rs`
-// names the clause and `tests/support/runWasm.ts` / `playground/src/runtime.ts`
-// sink through JS `String(v)` literally — so `print(x.toString())` and `print(x)`
-// are meant to be indistinguishable, and any other choice would make VL print
-// a float two ways. (2) `String(v)` IS shortest-round-trip by specification, so
-// the rule is pinned by a document rather than by an implementation.
-//
-// The rule, restated because the layout half is easy to get wrong: let `s` be
-// the SHORTEST digit string (k digits, no radix point) and `n` the exponent
-// with value = 0.s × 10^n. Then
-//
-//     k ≤ n ≤ 21   → the digits, then n−k zeros            ("100")
-//     0 < n ≤ 21   → a radix point n digits in             ("1.5")
-//     −6 < n ≤ 0   → "0." then −n zeros then the digits    ("0.000001")
-//     otherwise    → exponential, exponent always signed   ("1e+21", "1e-7")
-//
-// and the specials: NaN → "NaN", ±∞ → "Infinity"/"-Infinity", and BOTH zeros →
-// "0". Among equally short digit strings the spec takes the one closest to the
-// value, and on an exact tie **the one whose last digit is even**.
-//
-// ── THE HOST'S `print` DISAGREES AT EXACT TIES, and it is the host that is
-// wrong. Measured 2026-09-01 over 50,000 pseudo-random bit patterns: this
-// module's rendering equals JS `String(v)` on 50,000 of 50,000, while the Rust
-// host's `print` disagrees with JS on 14 of them — always an exact decimal tie,
-// always rounding AWAY from even where the spec rounds to even. Smallest
-// witness: the double with bits 4835952189745799117 is exactly
-// 2023347301156851.25, so "…851.2" and "…851.3" are equidistant 17-digit
-// candidates; the spec (and V8, and this module) print `2023347301156851.2`,
-// the Rust host prints `2023347301156851.3`. The cause is that
-// `js_number_to_string` re-formats digits it gets from Rust's `{:e}`, and
-// Rust's shortest-formatter breaks that tie the other way; its own doc comment
-// enumerates four Rust-vs-JS FORMATTING differences and does not know about
-// this DIGIT one. Consequence: the same VL program prints differently under the
-// two hosts for those values — a cross-host divergence that predates this
-// module. This file follows the spec and the V8 host; the divergence is pinned
-// by `tests/vl_std_float_text_test.ts` so it flips loudly when the host is
-// fixed.
-//
-// ── ROUND TRIP: `parseF64(x.toString())` is bit-identical to `x` for every finite
-// f64 EXCEPT −0, and returns a NaN for NaN. Both exceptions are the style's,
-// not the algorithm's: the spec renders −0 as `"0"`, so the sign is gone before
-// the parser sees it (JS `Number(String(-0))` is `+0` for the same reason), and
-// NaN renders as `"NaN"` which carries no payload. Measured over the same
-// 50,000 vectors: 50,000 of 50,000 round-trip under that rule, 0 exceptions.
-//
-// ── THE ALGORITHMS, and why these rather than Ryū.
-//
-// FORMATTING is Steele & White / Burger–Dybvig free-format printing over exact
-// rational arithmetic: the value is held as R/S with the two half-ulp
-// boundaries M+ and M−, all four exact big integers, and digits are generated
-// until the emitted prefix already identifies the value uniquely within
-// (v−M−, v+M+). Correctness is by construction rather than by table: no digit
-// is emitted that the interval does not force, and the loop cannot stop early
-// because stopping IS the interval test. Boundary inclusivity follows
-// round-to-nearest-EVEN — an even significand owns its boundaries, an odd one
-// does not — and the final digit takes the spec's closest-then-even rule.
-//
-// Ryū was the alternative and was NOT taken. Ryū is faster, but it needs ~1,240
-// 64-bit table constants (two 128-bit power-of-five tables) and 64×64→128
-// multiplication synthesised from 32-bit halves, and its correctness argument
-// is "the table bounds were proven elsewhere". This one needs no table at all,
-// no 128-bit multiply (limbs are 32 bits inside an i64, so every partial
-// product fits with room), and its correctness argument is one paragraph of
-// exact arithmetic that a reader can check against the code. A std module with
-// no deprecation story should be the one that can be re-derived. The price is
-// speed, and it is MEASURED rather than guessed — 100,000 iterations each, wall
-// clock, minus the same program with the loop body removed:
-//
-//     rendering a random double        ~25 µs   (the 17-digit case; a short one
-//                                                stops the digit loop sooner)
-//     parsing on the fast path         < 1 µs   ("0.1")
-//     parsing on the exact path        ~22 µs   ("2.2250738585072012e-308")
-//
-// Ryū would be roughly two orders faster at rendering. If a consumer ever names
-// a throughput requirement it drops in behind this same signature; until one
-// does, the table-free version is the one that can be checked by reading it.
-//
-// PARSING is Clinger's fast path over an exact fallback. When the significand
-// has ≤ 15 digits and the decimal exponent is within ±22, both operands are
-// exactly representable and one IEEE multiply or divide is one correctly
-// rounded rounding — that is Clinger's theorem, and it covers `"0.1"` and most
-// human-written numbers. Otherwise the value is held EXACTLY as num/den (big
-// integers), the binary exponent is chosen from the bit lengths so the quotient
-// lands in [2^52, 2^53), and a 55-step binary long division produces that
-// quotient plus its exact remainder. Rounding compares 2·remainder against the
-// divisor: greater rounds up, equal is a true tie broken to even, less rounds
-// down. Nothing about that is approximate, so it is correct at every halfway
-// case by construction.
-//
-// SIGNIFICANT DIGITS ARE CAPPED AT 800, with a `truncated` flag. That is the
-// classic bound (767 digits suffice to separate any decimal from a double's
-// rounding boundary; Go's `strconv` uses 800 for the same reason) plus slack:
-// beyond it, dropped digits cannot move the comparison EXCEPT by turning an
-// exact tie into a value strictly above it, which is exactly what the flag
-// does. Without the cap a megabyte of digits would be a megabyte of big
-// integer, which is a denial-of-service surface for the JSON reader this is
-// being built for.
-//
-// ── THE GRAMMAR `parseF64` ACCEPTS is closed under `toString` — every string this
-// module can PRODUCE parses back — and it is JSON's number grammar plus
-// Infinity/NaN, NOT VL's literal grammar. Precisely:
-//
-//     "-"? ( "Infinity" | digits ("." digits)? ([eE] [+-]? digits)? )
-//     "NaN"
-//
-// VL's literals are a strict superset in one direction: digit separators are
-// legal VL (`1_000.5` and `1_0e1_0` both run — measured) and are REFUSED here,
-// because a separator is a source-code affordance and this parser reads DATA.
-// Deliberate exclusions: a leading "+", leading or trailing whitespace, a bare
-// "1." or ".5" (VL's lexer refuses both — measured), "0x10" (a VL INTEGER
-// literal, never a float one), digit separators, and "-NaN". A caller with a
-// scruffier dialect trims and rewrites first; std does not guess.
-// Leading zeros ARE accepted ("007", "0.5"), matching every strtod and costing
-// nothing. If user-defined casts (error-handling-design.md §Future extensions
-// (b), open) ever land, `s as f64` is a two-line delegation to THIS function,
-// not a second parser — and the null channel is precisely what makes
-// `s as? f64` read correctly. One float parser in the tree either way.
-//
-// ── `f64 | null` IS THE CHANNEL, and the reason it is not `f64 | ParseError`
-// is that there is nothing to put in one. `error-handling-design.md` rules
-// `T | null` for absence and `T | E` for "a failure with information the caller
-// needs — an errno, a message, a parse position". A position would be honest
-// only if a prefix could succeed, and it cannot: `parseF64` consumes the WHOLE
-// string or fails, so the only fact is "this string denotes no f64", which the
-// null already says. That is also where every mainstream float parser landed —
-// Rust's `ParseFloatError` carries no position, Go's echoes the input, JS
-// answers `NaN` — and the closest VL precedent is `Map[k]`, absence rather than
-// diagnosis.
-//
-// `std:base64`, landing in the same slice, answers `u8[] | Base64Error`
-// instead, and the two are not a drift: a base64 blob is long, machine-made
-// and has four distinguishable ways to be wrong, so an offset and a kind
-// locate a truncated transfer; a float literal is one token with one way to be
-// wrong. (That module's header also records that `u8[] | null` does not lower
-// on this compiler, which settled it there independently.)
-//
-// ── OUT OF RANGE IS NOT A PARSE FAILURE. Overflow answers ±Infinity and
-// underflow answers ±0 — never null. `null` is the SYNTAX channel and nothing
-// else, so `"1e400"` (a perfectly well-formed number that no f64 represents)
-// answers `Infinity` exactly as `strtod`, `Number()` and Rust's `parse` all do,
-// and a caller who wants overflow rejected tests the result. Reading a range
-// error out of the same null that means "not a number" would have been a second
-// meaning on one channel — the ambiguity `error-handling-design.md` exists to
-// prevent.
-//
-// ── WHY `parseF64` LIVES HERE AND NOT IN A `std:num`, MEASURED. The header's
-// missing-DCE paragraph applies again and the split does not pay. Same probe as
-// that measurement — `import { toString } from "std:fmt"` plus one `n.toString()` on
-// an i32, built to wasm:
-//
-//     before the f64 half               7,548 bytes
-//     + the f64 FORMATTER              14,256   (+6,708 — forced: it IS `toString`)
-//     + the PARSER                     17,062   (+2,806)
-//
-//     This ladder stops where the F64 half ended, which is why its last rung
-//     is 17,062 and the module header's current figure is 17,645: the integer
-//     parsers added 583 after it, and they are not part of the question this
-//     ladder answers (whether `parseF64` should have gone to a `std:num`).
-//     The endpoints are exact (probe below, re-run 2026-09-01); the two
-//     sub-rungs were measured before a 16-byte fmt.vl edit, so their SPLIT is
-//     indicative while their sum is pinned by the endpoints. The probe, run
-//     from the repo root — note VL_STD, without which the host resolves std:
-//     from the BINARY's own checkout and silently measures the wrong tree:
-//       VL_STD=$PWD/std scripts/vl-host/target/release/vl build p.vl -o p.wasm
-//       # optimized rungs (wasm-opt is NOT on PATH — CLAUDE.md):
-//       VL_WASM_OPT=./node_modules/.bin/wasm-opt VL_STD=$PWD/std \
-//         scripts/vl-host/target/release/vl build p.vl -O3 -o p.wasm
-//       # p.vl:  import { toString } from "std:fmt"
-//       #        const n = 42
-//       #        print(n.toString())
-//
-// The formatter cannot move: a flat namespace has one `toString`, so the f64 arm
-// and everything under it are in this module by construction. That makes the
-// parser's own 2,822 bytes (at the `none` rung — at `-O3` the unused parser costs
-// nothing measurable, which strengthens this answer) the entire question, and
-// paying them buys the pair
-// staying in one place — a reader who found `toString` finds its inverse beside it,
-// and the exact-arithmetic helpers have one home rather than being exported from
-// here to be reachable there. The real fix is whole-program dead-code
-// elimination, which this header already names; a second module would buy 2.8 KB
-// back by splitting a symmetric pair across two files forever.
+// could not render or read a float at all: the shortest-round-trip printer
+// `print` uses lives in the HOST's sink, never available as a VL string value.
+// THE STYLE IS ECMAScript `Number::toString`, radix 10, and that is a SPEC rather
+// than a preference — both hosts' print sinks already claim to implement it, so
+// `print(x.toString())` and `print(x)` are meant to be indistinguishable. The
+// layout rule is at `layoutDec`, the digit generator and the Ryū decline at
+// `shortestDigits`, the round trip and the host's tie disagreement at `renderF64`,
+// and the parser's grammar, channel and range rule at `parseF64`. BOTH HALVES LIVE
+// HERE because a flat namespace has one `toString`, so the formatter cannot move,
+// and splitting the parser off would divide a symmetric pair for bytes DCE owes.
 
 // ── exact big naturals ──────────────────────────────────────────────────────
 //
 // Little-endian limbs of 32 bits each, held in an `i64[]` so that a limb×small
-// product has room: (2^32−1) × 10^9 is 4.29e18, inside i64's 9.22e18, which is
-// why every multiplier below is capped at 10^9 and why no 128-bit multiply is
-// needed anywhere in this file.
+// product has room: (2^32−1) × 10^9 is inside i64's range, which is why every
+// multiplier below is capped at 10^9 and no 128-bit multiply is needed here.
 //
 // HIGH ZERO LIMBS ARE LEFT IN PLACE rather than trimmed, because `.pop()` on an
-// `i64[]` does not lower on this compiler. `i32[]` and `string[]` pop and run;
-// an `i64[]` PARAMETER refuses loudly (`emitProgram: .pop receiver is not a
-// list`) and an `i64[]` LOCAL is worse — `vl check` rc 0 and then invalid wasm,
-// in three lines with nothing else in the program. Both arms are pinned by
-// `scripts/capability-probes/i64-list-pop.vl`. `bnLen` is the consequence:
-// every operation reads up to the highest non-zero limb rather than to
-// `.length`. Delete it the day that probe runs; nothing else here depends on it.
+// `i64[]` does not lower on this compiler: an `i64[]` PARAMETER refuses loudly
+// and an `i64[]` LOCAL is check-clean invalid wasm, both pinned by
+// `scripts/capability-probes/i64-list-pop.vl`. `bnLen` is the consequence — every
+// operation reads to the highest non-zero limb, not to `.length`. Delete it the
+// day that probe runs; nothing else here depends on it.
 
 const BN_MASK: i64 = 4294967295
 
@@ -964,7 +511,18 @@ function upperTest(r: i64[], mp: i64[], s: i64[], inclusive: boolean): boolean {
   c > 0
 }
 
-// Burger–Dybvig over exact rationals. `x` must be finite and strictly positive.
+// Burger–Dybvig over exact rationals; `x` must be finite and strictly positive.
+// The value is held as R/S with the two half-ulp boundaries M+ and M−, all four
+// exact big integers, and digits are generated until the emitted prefix already
+// identifies the value uniquely within (v−M−, v+M+). Correctness is by
+// construction, not by table: no digit is emitted that the interval does not
+// force, and the loop cannot stop early because stopping IS the interval test.
+// Boundary inclusivity follows round-to-nearest-EVEN, so an even significand owns
+// its boundaries and an odd one does not.
+//
+// RYŪ WAS DECLINED: faster, but it needs a large power-of-five constant table and
+// a synthesised 128-bit multiply, and its correctness rests on bounds proven
+// elsewhere — a std module with no deprecation story should be re-derivable.
 function shortestDigits(x: f64): DecDigits {
   const bits = f64bits(x)
   const be = ((bits >>> 52) & 2047) as! i32
@@ -1098,7 +656,17 @@ function shortestDigits(x: f64): DecDigits {
 }
 
 // The four-way layout of ECMA-262 `Number::toString` step 5, over a digit list
-// and its exponent. See the rule table in this section's header.
+// and its exponent. With `s` the SHORTEST digit string (k digits, no radix point)
+// and `n` the exponent such that value = 0.s × 10^n:
+//
+//     k ≤ n ≤ 21   → the digits, then n−k zeros            ("100")
+//     0 < n ≤ 21   → a radix point n digits in             ("1.5")
+//     −6 < n ≤ 0   → "0." then −n zeros then the digits    ("0.000001")
+//     otherwise    → exponential, exponent always signed   ("1e+21", "1e-7")
+//
+// The specials belong to `renderF64`. Among equally short digit strings the spec
+// takes the one closest to the value, and on an exact tie the one whose last digit
+// is EVEN; `shortestDigits` is what enforces both.
 function layoutDec(d: i32[], n: i32): string {
   const k = d.length
   const buf: i32[] = []
@@ -1163,7 +731,16 @@ function layoutDec(d: i32[], n: i32): string {
 
 // `toString`'s f64 arm. The sign is read off the BIT PATTERN rather than by
 // comparing with zero, because `-0.0 < 0.0` is false and the exponent/fraction
-// split is already in hand.
+// split is already in hand. Specials: NaN → "NaN", ±∞ → "Infinity"/"-Infinity",
+// both zeros → "0".
+//
+// ROUND TRIP: `parseF64(x.toString())` is bit-identical to `x` for every finite
+// f64 EXCEPT −0, and answers a NaN for NaN. Both exceptions are the STYLE's, not
+// the algorithm's — the spec renders −0 as `"0"`, so the sign is gone before the
+// parser sees it, and `"NaN"` carries no payload. THE RUST HOST'S `print`
+// DISAGREES AT EXACT DECIMAL TIES, rounding away from even where the spec rounds
+// to even; this file follows the spec and the V8 host, and
+// `tests/vl_std_float_text_test.ts` pins the divergence so it flips when it moves.
 function renderF64(x: f64): string {
   const bits = f64bits(x)
   const be = ((bits >>> 52) & 2047) as! i32
@@ -1215,21 +792,17 @@ function pow10f(e: i32): f64 {
 }
 
 // The f64 nearest to the number `self` spells, or `null` when `self` is not a
-// number in this module's grammar. See the `f64 ↔ TEXT` header for the grammar,
-// for why the failure channel is `null` rather than an error struct, and for
-// why an out-of-range number answers ±Infinity or ±0 rather than failing.
+// number in this grammar: `"-"? ( "Infinity" | digits ("." digits)? ([eE][+-]?
+// digits)? )` or `"NaN"` — JSON's number grammar plus the two specials, NOT VL's
+// literal grammar. Digit separators are legal VL and REFUSED here (a separator is
+// a source affordance; this reads DATA), as are a leading "+", whitespace, a bare
+// `"1."` or `".5"`, `"0x10"` and `"-NaN"`. Leading zeros are accepted.
 //
-// Correctly rounded for EVERY accepted input, halfway cases included: the fast
-// path is exact-operands-single-rounding and the slow path is exact integer
-// arithmetic with the tie broken to even. Measured 2026-09-01 against the
-// ECMAScript oracle (`Number(s)`, itself specified as correctly rounded):
-// **205,844 inputs, 0 disagreements** — 200,000 pseudo-random decimals across
-// the whole exponent range and 5,844 adversarial ones, the adversarial set
-// being exact midpoints between adjacent doubles, those midpoints ±1 ulp of
-// decimal, midpoints with a 900-digit zero tail (the truncation path) and with
-// a 1 past it, and the subnormal boundary. `tests/vl_std_float_text_test.ts`
-// carries 3,391 of those plus 33 grammar rejections as the standing gate; the
-// full campaign is a re-runnable measurement, not a merge gate.
+// `f64 | null` IS THE CHANNEL: nothing would go in an error struct, since the
+// parse consumes the WHOLE string or fails, so no position is honest. OUT OF RANGE
+// IS NOT A PARSE FAILURE — overflow answers ±Infinity, underflow ±0, as `strtod`
+// and `Number()` do; `null` is the SYNTAX channel and nothing else. Correctly
+// rounded for EVERY accepted input, halfway cases included.
 export function parseF64(self: string): f64 | null {
   const n = self.length
   if n == 0 { return null }
@@ -1256,7 +829,7 @@ export function parseF64(self: string): f64 | null {
   // `digs` collects SIGNIFICANT digits (leading zeros contribute only to the
   // exponent) and `exp10` is the power of ten the digit string is multiplied
   // by. Digits past the cap move `exp10` when they are integer places and set
-  // `truncated` when they are non-zero — see the 800-digit note in the header.
+  // `truncated` when they are non-zero — see `MAX_SIG_DIGITS`'s block above.
   const digs: i32[] = []
   let exp10 = 0
   let truncated = false
@@ -1288,6 +861,14 @@ export function parseF64(self: string): f64 | null {
       // `"0.0012"` — they move the exponent without becoming significant.
       // Past the cap the exponent must NOT move (the place is already accounted
       // for by the digits that were kept), so only truncation is recorded.
+      //
+      // SIGNIFICANT DIGITS ARE CAPPED, with a `truncated` flag. The bound is the
+      // classic one — enough digits to separate any decimal from a double's
+      // rounding boundary — plus slack: beyond it, dropped digits cannot move the
+      // comparison EXCEPT by turning an exact tie into a value strictly above it,
+      // which is exactly what the flag records. Without a cap a megabyte of digits
+      // would be a megabyte of big integer, a denial-of-service surface for the
+      // JSON reader this half is built for.
       if digs.length >= MAX_SIG_DIGITS {
         if d != 0 { truncated = true }
       } else {
@@ -1330,7 +911,12 @@ export function parseF64(self: string): f64 | null {
   if dmag > 310 { return withSign(f64fromBits(BITS_INF), neg) }
   if dmag < -350 { return withSign(0.0, neg) }
 
-  // Clinger's fast path: both operands exact, one rounding.
+  // Clinger's fast path: both operands exact, one rounding. With at most fifteen
+  // significant digits and a decimal exponent inside ±22, the significand and the
+  // power of ten are each exactly representable, so a single IEEE multiply or
+  // divide is a single correctly rounded rounding — Clinger's theorem. It covers
+  // `"0.1"` and most human-written numbers; everything else falls to the exact
+  // path below, which is integer arithmetic with no rounding until the last step.
   if digs.length <= 15 && exp10 >= -22 && exp10 <= 22 {
     let acc: i64 = 0
     let j = 0

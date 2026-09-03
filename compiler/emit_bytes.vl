@@ -132,7 +132,7 @@ import {
 // Named constants for the raw wasm bytes this encoder emits — instruction
 // opcodes, GC-prefixed sub-opcodes, valtype/reftype/heaptype bytes — so a reader
 // no longer decodes hex from a trailing comment. Each has the SAME value as the
-// literal it replaces, so emitted output is byte-identical. Data bytes (SLEB
+// literal it replaces, so the encoder's output is unchanged. Data bytes (SLEB
 // payloads, counts, indices, memarg align/offset) are NOT named — they are
 // operands, not opcodes.
 // Control flow / blocks.
@@ -336,7 +336,7 @@ export function wSLEB(value: i32) {
   }
   0
 }
-// Write a name: ULEB(byte length) followed by its UTF-8 bytes. For an ASCII
+// Write a name: ULEB(byte length) followed by the name's UTF-8 encoding. For an ASCII
 // identifier each `s[i]` char code IS its byte — and ONLY then: a code point
 // past 0x7F needs a multi-byte UTF-8 encoding this writer does not produce
 // (masking it to a low byte with a code-point length prefix would corrupt the
@@ -419,8 +419,8 @@ export function wSLEB64(hi: i32, lo: i32) {
     // ARITHMETIC 64-bit right shift by 7: low lane gets its top 25 bits plus the
     // low 7 bits of `hi` rotated in; high lane is a SIGNED `>> 7` so a negative
     // value's sign bit propagates (the all-ones tail terminates correctly). For a
-    // non-negative value (top bit 0) signed and unsigned shift agree, so the
-    // Slice-1 non-negative literals are byte-identical.
+    // non-negative value (top bit 0) signed and unsigned shift agree, so a
+    // non-negative literal encodes the same either way.
     const newLo = (l >>> 7) | (h << 25)
     const newHi = h >> 7
     l = newLo
@@ -464,7 +464,7 @@ export function fbI64ExtendI32S() {
   wU8(OP_I64_EXTEND_I32_S) // 0xac i64.extend_i32_s
   0
 }
-// f64.const: 0x44 followed by 8 raw little-endian IEEE-754 bytes (`f64Bytes`).
+// f64.const: 0x44 followed by the raw little-endian IEEE-754 double (`f64Bytes`).
 // A literal whose magnitude overflows f64 is a COMPILE ERROR — the checker
 // rejects it first (`f64LitOverflows`); this `gIeeeOverflow` read is the
 // emitter's defensive backstop on any unchecked path (same flag, same encoder,
@@ -483,7 +483,7 @@ export function fbF64ConvertI32S() {
   wU8(OP_F64_CONVERT_I32_S) // 0xb7 f64.convert_i32_s
   0
 }
-// f32.const: 0x43 followed by 4 raw little-endian IEEE-754 bytes (`f32Bytes`).
+// f32.const: 0x43 followed by the raw little-endian IEEE-754 float (`f32Bytes`).
 // Same overflow backstop as `fbF64Const`, at the f32 range.
 export function fbF32Const(text: string) {
   wU8(OP_F32_CONST) // 0x43 f32.const
@@ -758,7 +758,7 @@ export function fbI32HashMix(srcLocal: i32, tmpLocal: i32) {
   fbI32Bin(113) // 0x71 i32.and
   0
 }
-// i32.store: 0x36 <align-exp> <offset> — fixed align=4 bytes (exponent 2), offset 0,
+// i32.store: 0x36 <align-exp> <offset> — fixed four-byte align (exponent 2), offset 0,
 // matching the host's `__store_i32__` builtin body (`m.i32.store(0, 4, addr, v)`).
 export function fbI32Store() {
   wU8(OP_I32_STORE) // 0x36 i32.store
@@ -869,22 +869,16 @@ export function fbArrayNewFixed(heapIdx: i32, n: i32) {
 }
 // THE PACKED-READ DISPATCH, and the ONE place it lives. `array.get` is not valid on an
 // array whose element is a PACKED storage type — the engine rejects the module outright,
-// because a byte read has to say whether it sign- or zero-extends. `u8[]` zero-extends,
-// so its read is `array.get_u` (0xfb 0x0d) and every element read of a `u8[]` backing
-// must use it.
+// because a byte read has to say whether it sign- or zero-extends. `u8[]` zero-extends, so
+// its read is `array.get_u`; since stage 2c the string backing `$sBackIdx` is `(array
+// (mut i8))` too, so every `s[i]` / `charCodeAt` / hash / eq / order / indexOf / print
+// element read routes through here and comes back ZERO-EXTENDED into 0..255.
 //
 // Keyed on the HEAP INDEX rather than on a kind threaded to each call site, because
-// packedness is a property of the array TYPE and every reader already passes that type.
-// That makes the whole packed-vs-plain difference two lines instead of an arm at each of
-// `fbArrayGet`'s call sites, and it cannot drift: a new element-read site gets the right
-// opcode by construction. Gated on `ba8Used` / `aUsed` so a program with no `u8[]` (and
-// no string) cannot collide with the 0 that `ba8TypeIdx` / `sBackIdx` hold when unminted.
-//
-// STAGE 2c ADDS THE STRING BACKING. `$sBackIdx` is `(array (mut i8))` of UTF-8 bytes, so
-// every `s[i]` / `charCodeAt` / hash / eq / order / indexOf / print element read routes
-// through here and comes back ZERO-EXTENDED into 0..255. This is the L7 site the migration
-// map named as "the only thing between `array.get` and `array.get_u` on a packed array";
-// it is one predicate precisely so the string arm could not be forgotten at ~20 call sites.
+// packedness is a property of the array TYPE and every reader already passes that type:
+// a new element-read site gets the right opcode by construction, and the string arm
+// cannot be forgotten at any of them. Gated on `ba8Used` / `aUsed` so a program with no
+// `u8[]` and no string cannot collide with the 0 the unminted indices hold.
 function heapIsPacked(heapIdx: i32) {
   if ba8Used && heapIdx == ba8TypeIdx { return true }
   aUsed && heapIdx == sBackIdx
@@ -930,8 +924,8 @@ export function fbRefCast(heapIdx: i32) {
   // whose low 7 bits set bit 6 (>= 64) would, under an unsigned write, decode
   // as a negative abstract heaptype (`ref.cast (ref 64)` → `0x40` → -64 →
   // "invalid heap type"). `wSLEB` pads such indices with a `0x00` continuation
-  // byte; for every index < 64 it is byte-identical to `wULEB` (bit 6 clear),
-  // so this is byte-neutral for existing casts (the compiler's own max is 59).
+  // byte; for every index < 64 it emits exactly what `wULEB` would (bit 6 clear),
+  // so this is neutral for existing casts (the compiler's own max is 59).
   wSLEB(heapIdx)
   0
 }
@@ -1176,7 +1170,7 @@ export function fbBeginFunc(nParams: i32, nLocals: i32) {
   mapScratchBase = fbScratchCur
   if fnUsesMap { fbReserve(15) }
   // The i32-KEYED map's extra slots (5), reserved only in a module that has one — so
-  // every frame after it is byte-identical in a string-keyed-only program.
+  // every frame after it keeps its existing index in a string-keyed-only program.
   mapI32Base = fbScratchCur
   if fnUsesMap && mI32Used { fbReserve(5) }
   // `m.keys()` / `for k in m` key-list builder frame (6 slots).
@@ -1209,7 +1203,7 @@ export function fbBeginFunc(nParams: i32, nLocals: i32) {
   // function — mapRef (ref <mv struct>), valsBk (ref <vals backing>), valStash
   // (ref null <value elem>, the pushVal/get value temporary). Allocated for every
   // mv slot rather than per-function-used ones (locals are cheap; an mv-free
-  // module reserves zero, keeping existing layouts byte-identical).
+  // module reserves zero, so existing layouts keep their indices).
   fnMvBase = fbScratchCur
   if fnUsesMap {
     let mvk = 0
@@ -1330,30 +1324,18 @@ export function fbBeginFunc(nParams: i32, nLocals: i32) {
   lhScanRep = []
   fbScratchCur
 }
-// LIST-HEADER HOIST rows. A row caches one binding's list header — the backing
-// array ref and `len` — in two locals of the lazy list frame, so an index
-// lowering inside a loop that provably cannot reallocate that list reads them
-// with a `local.get` instead of re-walking the wrapper with two `struct.get`s
-// per access.
-//
-//   lhName/lhKind/lhSlot — the binding spelling and its list rep (`lhSlot` is
-//     the ref-list table slot for kind "ref", 0 otherwise). The triple is the
-//     row key: two same-named bindings of DIFFERENT rep get different rows, so
-//     a row's slot types always match the header it caches.
-//   lhBack/lhLen        — the two frame locals (`liBack` 3 and 4).
-//   lhStart             — the THIRD local a RAW-STRING row needs (`liBack` 4 as
-//     well: it is an i32). A `string` is a `{backing, start, len}` VIEW since
-//     Stage 2b, so hoisting its header takes three locals where a list's
-//     `{backing, len, cap}` takes two — `start` has no list counterpart and is
-//     -1 on every list row, which is also how `hoistRowIsStr` tells them apart.
-//   lhLive              — how many enclosing loops opened this row. Positive
-//     means the locals hold this binding's live header and an index lowering
-//     may read them; zero means they are stale and must not be.
-//
-// Rows outlive the loop that minted them (their locals are declared once per
-// function and two disjoint loops over the same binding share them); `lhLive`
-// is the only thing that scopes a cached header, and `fbBeginFunc` clears the
-// whole table because slot indices are per-function.
+// LIST-HEADER HOIST rows. A row caches one binding's list header — the backing array
+// ref and `len` — in locals of the lazy list frame, so an index lowering inside a loop
+// that provably cannot reallocate that list reads them with a `local.get` instead of
+// re-walking the wrapper with two `struct.get`s per access. `lhName`/`lhKind`/`lhSlot`
+// is the row KEY, so two same-named bindings of DIFFERENT rep get different rows and a
+// row's slot types always match the header it caches. `lhBack`/`lhLen` are the frame
+// locals; `lhStart` is the third one a RAW-STRING row needs, because a `string` is a
+// `{backing, start, len}` VIEW where a list is `{backing, len, cap}` — `start` has no
+// list counterpart and is -1 on every list row, which is how `hoistRowIsStr` tells them
+// apart. `lhLive` counts the enclosing loops that opened the row: positive means the
+// locals hold a LIVE header, zero that they are stale. Rows outlive the loop that minted
+// them, so `lhLive` alone scopes a cached header; `fbBeginFunc` clears the whole table.
 export let lhName: string[] = []
 export let lhKind: MfKind[] = []
 export let lhSlot: i32[] = []
@@ -1773,19 +1755,18 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
     fbF32Run()
     fbI64Run()
   }
-  // Lazy list scratch frame (appended LAST — after even the frames above,
-  // matching `fbBeginFunc`'s base): the shared i32 index stash, then one
-  // typed slot per entry (ref slots NULLABLE so they are defaultable) —
-  // a WRAPPER ref for a bounds-check slot (`liBack` 0), the raw BACKING array
-  // ref for a chunked LIST-literal destination (`liBack` 1), the raw `$sTypeIdx`
-  // array of a chunked STRING literal (`liBack` 5 — its kind is "i32" too, so the
-  // kind alone cannot pick the slot type), the element
-  // VALUE for an indexed-store stash (`liBack` 2 — the scalar valtype, the
-  // nullable string ref, or the slot's nullable element ref), the HOISTED
-  // backing ref of a cached list header (`liBack` 3 — the same backing typing
-  // as 1, since it holds the same `struct.get 0` result), or that header's
-  // hoisted `len` (`liBack` 4 — always i32), or the shared-union-field receiver stash
-  // (`liBack` 7 — the `(ref null $uBoxIdx)` box a per-tag dispatch reads per arm).
+  // Lazy list scratch frame (appended LAST — after even the frames above, matching
+  // `fbBeginFunc`'s base): the shared i32 index stash, then one typed slot per entry
+  // (ref slots NULLABLE so they are defaultable) — a WRAPPER ref for a bounds-check
+  // slot (`liBack` 0), the raw BACKING array ref for a chunked LIST-literal
+  // destination (`liBack` 1), the raw `$sTypeIdx` array of a chunked STRING literal
+  // (`liBack` 5 — its kind is "i32" too, so the kind alone cannot pick the slot type),
+  // the element VALUE for an indexed-store stash (`liBack` 2 — the scalar valtype, the
+  // nullable string ref, or the slot's nullable element ref), the HOISTED backing ref
+  // of a cached list header (`liBack` 3 — the same backing typing as 1, since it holds
+  // the same `struct.get 0` result), or that header's hoisted `len` (`liBack` 4 —
+  // always i32), or the shared-union-field receiver stash (`liBack` 7 — the
+  // `(ref null $uBoxIdx)` box a per-tag dispatch reads per arm).
   if liKinds.length > 0 {
     fbI32Run()
     let lix = 0
@@ -2088,18 +2069,16 @@ export function fbValtypeNullable(kind: VKind, structIdx: i32) {
   }
   // The declarative VKind -> nullable-cell valtype table, EXHAUSTIVE for the same reason
   // `fbValtype`'s is: a new VKind member without an arm must be a compile error, not a
-  // silent `0x7f`. This body was an `if`-chain whose only default was that i32, while its
-  // own out-of-bounds guard above lists `kind == "variant"` — a ladder half-taught about a
-  // rep it then answered i32 for. `match` over a literal union is checked for
-  // exhaustiveness by the checker (`non-exhaustive match — missing "x"`), so the table below
-  // cannot drift from `VKind` again; no `_` arm, deliberately, because a wildcard restores
-  // exactly the silent default.
+  // silent `0x7f`. `match` over a literal union is checked for exhaustiveness by the
+  // checker (`non-exhaustive match — missing "x"`), so the table cannot drift from
+  // `VKind`; no `_` arm, deliberately, because a wildcard restores exactly the silent
+  // i32 default an `if`-chain used to give.
   //
-  // The three arms an `if`-chain default used to swallow, spelled out: `i32` and `nulbool`
-  // ARE the i32 valtype (`nulbool` rides the i32 sentinel niche, so its cell is a plain
-  // scalar), and `variant` is the CONCRETE-variant struct ref made nullable — the same
-  // `uVarHeap` heap type `fbValtype`'s non-null `variant` arm writes, differing only in the
-  // ref's nullability, exactly like `struct` -> `nulstruct`.
+  // The arms that default used to swallow, spelled out: `i32` and `nulbool` ARE the i32
+  // valtype (`nulbool` rides the i32 sentinel niche, so its cell is a plain scalar), and
+  // `variant` is the CONCRETE-variant struct ref made nullable — the same `uVarHeap` heap
+  // type `fbValtype`'s non-null `variant` arm writes, differing only in the ref's
+  // nullability, exactly like `struct` -> `nulstruct`.
   match kind {
     "i32" => {
       wU8(VT_I32) // 0x7f i32 (scalar, never a nullable ref)
@@ -2348,27 +2327,17 @@ export function fbRefNullOfKind(kind: VKind, structIdx: i32) {
   0
 }
 // ── valtype emission (Phase G — was `pushVT`) ─────────────────────────────────
-// Write a wasm value type onto the CURRENT buffer (`curBuf`). The `kind` tag
-// selects the encoding (the valtype ladder formerly in `pushVT`):
-//   0    → i32 (`0x7f`)
-//   1    → struct ref `(ref $sHeapIdx[structIdx])` — a standalone struct
-//   2    → i32-list ref `(ref $lTypeIdx)` (the growable `i32[]` wrapper struct)
-//   3    → string ref `(ref $sTypeIdx)` — the raw `(array (mut i32))` of code points
-//   4    → union-box ref `(ref $uBoxIdx)` — the `{tag, value}` box
-//   5    → ref-list ref `(ref $rlWrapIdx[structIdx])` — the ref-element list wrapper
-//          for THIS slot. For kind 5, `structIdx` is the ref-list TABLE SLOT (NOT a
-//          struct index): the self-host program has many distinct ref-list element
-//          types, each with its own wrapper, so the valtype must select the caller's
-//          slot — not collapse to slot 0 (`rlTypeIdx == rlWrapIdx[0]`).
-//   6    → map ref `(ref $mStructIdx)` — the string-keyed map struct
-//   7    → string-list ref `(ref $mkListIdx)` — the string-list wrapper
-//   8    → concrete union-variant ref `(ref $uVarHeap[structIdx])` (gap #2)
-// A ref is always non-null (`0x64`), matching binaryen's `(ref $T)` for a value
-// statically known present (a constructed list / struct / string, never `null`).
-// The kind→heap-index resolution reads the interned indices (`sHeapIdx`/`lTypeIdx`/
-// `aTypeIdx`/… — assigned by `emitModule`'s type-index pass). Replaces `pushVT`;
-// callers `wTarget(buf)` the destination buffer first (the writer streams to
-// `curBuf`), matching every other `fb*` method.
+// Write a wasm value type onto the CURRENT buffer (`curBuf`). `kind` is a `VKind`
+// member, not a numeric code: the per-kind encoding is the exhaustive `match` below,
+// and `emit_state.vl`'s `VKind` declaration owns the integer alphabet the emitter's
+// coded columns (`sFieldTypes`, `uFieldTypes`) still use. `structIdx` is the TABLE
+// SLOT the kind resolves through, and the table differs per kind — `struct`/`nulstruct`
+// read `sHeapIdx`, `variant`/`nulvariant` read `uVarHeap`, `reflist`/`nulreflist` read
+// `rlWrapIdx`. A ref-list kind must therefore select the CALLER's slot and never
+// collapse to the first one: the self-host program has many distinct ref-list element
+// types, each with its own wrapper. A ref emitted here is non-null (`0x64`), matching a
+// value statically known present (a constructed list / struct / string, never `null`);
+// callers `wTarget(buf)` the destination buffer first, as every other `fb*` method does.
 export function fbValtype(kind: VKind, structIdx: i32) {
   // Same out-of-bounds guard as `fbValtypeNullable`: a struct/ref-list kind whose
   // table slot never resolved (or overran its table) fails loudly, never traps.
