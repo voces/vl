@@ -28773,6 +28773,142 @@ export function exprNullableRefNiche(exprIx: i32, fnIx: i32) {
   exprNullableVariant(exprIx, fnIx)
 }
 
+// ── THE NON-NULL REF KIND ↔ ITS NULLABLE NICHE (D1115) ───────────────────────────────────
+// Every nullable ref niche is `(ref null $H)` over the SAME heap `$H` its non-null kind is
+// `(ref $H)` over, and the vocabulary spells that relation out: `nul<K>` for each ref `K`.
+// This is the table, and it doubles as "is `K` a NON-NULL REF" — a kind with no niche twin is
+// either not a ref at all (`i32`, `f64`, `f32`, `i64`, the boxed `union`) or already nullable.
+//
+// Stated as a table rather than as `"nul" + k` because a `VKind` is an interned literal-union
+// atom, not a string to build; and stated ONCE because the two halves of a recover site — "is
+// the destination non-null" and "is the value the niche" — drifted apart for eleven of the
+// thirteen ref kinds when they were two hand-written kind lists.
+export function vkNulNicheOf(k: VKind): VKind | null {
+  if k == "struct" { return "nulstruct" }
+  if k == "variant" { return "nulvariant" }
+  if k == "list" { return "nullist" }
+  if k == "reflist" { return "nulreflist" }
+  if k == "strlist" { return "nulstrlist" }
+  if k == "f64list" { return "nulf64list" }
+  if k == "i64list" { return "nuli64list" }
+  if k == "f32list" { return "nulf32list" }
+  if k == "u8list" { return "nulu8list" }
+  if k == "map" { return "nulmap" }
+  if k == "str" { return "nulstr" }
+  if k == "closure" { return "nulclosure" }
+  null
+}
+
+// The rep KIND of the cell an identifier reads, across the four storage classes an
+// emitter-visible name lives in: parameter annotation, declared local, captured env field,
+// module global. The kind-level generalization of `exprNullableStruct`'s four-arm ladder,
+// which asks those same four questions one kind at a time — so a site needing the whole
+// vocabulary does not need a thirteenth copy of the ladder.
+//
+// PARAMETER FIRST IS NOT A SHADOWING BUG: `paramTypeNode` answers -1 the moment a declared
+// local of that name is live on the scope stack, which is the same order `emitIdentNode`
+// resolves in.
+export function identCellVKind(exprIx: i32, fnIx: i32): VKind | null {
+  if exprIx < 0 { return null }
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is Ident {
+    const pt = paramTypeNode(fnIx, e.identName)
+    if pt >= 0 { return vtKindOfType(pt) }
+    const dk = declaredKind(e.identName)
+    if dk != null { return dk }
+    const ck = capturedKindOf(fnIx, e.identName)
+    if ck != null { return ck }
+    const gl = globalLetOf(e.identName)
+    if gl >= 0 { return globalCellKind(gl) }
+  }
+  null
+}
+
+// The result valtype KIND of `fnIx`, read off the SAME ladder `emitOneFuncType` writes the
+// result byte from — annotation first, then the un-annotated closure fact, then the stored
+// inferred kind — so a site repairing the value cannot disagree with the result it repairs.
+// `null` for a VOID function (no result to repair) and for a node that is not a function.
+//
+// THE CLOSURE ARM IS NOT A SPECIAL CASE, it is the one result kind `fRetKind` does not carry:
+// `retAnnKindChain` has no closure producer and `criSetRetKind` never writes one, so an
+// inferred `((i32) => i32)` return reads back as the `"i32"` default while the functype says
+// `(ref $cloStruct)`. `emitOneFuncType` asks `fnReturnsClosure` ahead of the stored kind for
+// exactly that reason; asking it in the other order here would answer `i32` for a ref result.
+export function retResultVKind(fnIx: i32, fnPos: i32): VKind | null {
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    if fn.fnRet >= 0 { return vtKindOfType(fn.fnRet) }
+    if fnPos < 0 { return null }
+    if fnPos < fRetVoid.length {
+      if fRetVoid[fnPos] == 1 { return null }
+    }
+    if fnReturnsClosure(fnPos) { return "closure" }
+    if fnPos < fRetKind.length { return fRetKind[fnPos] }
+  }
+  null
+}
+
+// D1115 — DOES THE RETURN BOUNDARY OWE A `ref.as_non_null` FOR `retArg`?
+//
+// D131 built this guard for the struct/variant half and stated its criterion exactly: "the
+// RESULT VALTYPE is a non-null ref" AND "the value classifies as the nullable niche". The
+// criterion was right and the two lists implementing it were not — they named two kinds of
+// thirteen, so a NARROWED nullable list, map, ref-list, scalar-list or closure parameter
+// returned into its own non-null result put a `(ref null $H)` under a `(ref $H)` result:
+// `vl check` rc 0, `type mismatch: expected (ref $type), found (ref null $type)`. Measured
+// over a 65-cell grid (13 reps × 5 delivery forms) the day this was written: 49 invalid, and
+// the four forms of the nullable-VARIANT spelling were among them despite `variant` being one
+// of the two kinds D131 did name — the value side answered for a parameter only through
+// `exprNullableStruct`.
+//
+// The struct/variant half KEEPS its own classifier rather than folding into the cell-kind
+// question: a nullable struct reaches a return from a call, an `as?` cast, a map read and a
+// `??` merge as well as from a name, and `exprNullableRefNiche` is where all of those live.
+//
+// AND IT CANNOT TRAP WHERE THE OLD CODE WORKED, which is D131's argument unchanged:
+// `ref.as_non_null` traps only on an actual null, and an actual null under a non-null result
+// is a module the engine already refuses to load. Where some inner path already recovered, the
+// extra instruction is a validated no-op on an operand that is already non-null.
+export function retNeedsNonNullRecover(retArg: i32, fnIx: i32, fnPos: i32) {
+  nulNicheRecoverOwed(retResultVKind(fnIx, fnPos), retArg, fnIx)
+}
+
+// Does the value at `exprIx` lower to the nullable REF NICHE `niche`?
+//
+// The CELL question first (`identCellVKind`) — a name's storage class states its rep outright
+// and the answer is exact for all thirteen. The per-rep predicates behind it are what reach a
+// value that is NOT a name: a nullable-struct call result, an `as?` cast, a map read, a `??`
+// merge, a closure-field call. Each is asked only for its own niche, so a `nullist` value can
+// never satisfy a `strlist` destination.
+export function exprIsNulNicheOf(niche: VKind, exprIx: i32, fnIx: i32) {
+  if exprIx < 0 { return false }
+  if identCellVKind(exprIx, fnIx) == niche { return true }
+  if niche == "nulstruct" { return exprNullableStruct(exprIx, fnIx) }
+  if niche == "nulvariant" { return exprNullableVariant(exprIx, fnIx) }
+  if niche == "nulclosure" { return exprNulClosure(exprIx, fnIx) }
+  if niche == "nulstr" { return exprNullableString(exprIx, fnIx) }
+  if niche == "nulmap" { return exprNullableMap(exprIx, fnIx) }
+  if niche == "nullist" { return exprNullableList(exprIx, fnIx) }
+  if niche == "nulreflist" { return exprNullableRefArray(exprIx, fnIx) }
+  exprNulScalarListKind(exprIx, fnIx) == niche
+}
+
+// D1115 — DOES A DESTINATION OF KIND `dk` OWE `ref.as_non_null` ON THE VALUE AT `exprIx`?
+//
+// A nullable niche READ deliberately keeps its raw `(ref null $H)` — narrowing is type-level,
+// and `emitCapturedReadRecover`'s header states the rule as "the USE site recovers". So every
+// DELIVERY into a `(ref $H)` destination owes the recover, and this is the one question all of
+// them ask. The ARGUMENT boundary grew its own copy rep by rep (`cParamStruct` /
+// `cParamNonNullList` / `cParamClosure` / `cParamVariant`, four hand-kept kind lists); every
+// position wired after it asks here instead, so a rep added to `vkNulNicheOf` lands at all of
+// them at once.
+export function nulNicheRecoverOwed(dk: VKind | null, exprIx: i32, fnIx: i32) {
+  if dk == null { return false }
+  const niche = vkNulNicheOf(dk)
+  if niche == null { return false }
+  exprIsNulNicheOf(niche, exprIx, fnIx)
+}
+
 // True if `name` is a declared NULLABLE function-value local (`fn | null`, kind 19) — the
 // closure dual of `declaredNulRef`.
 function declaredNulClosure(name: string) { declaredKind(name) == "nulclosure" }

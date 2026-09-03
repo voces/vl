@@ -34445,6 +34445,24 @@ Repro (one program; the merge is the last two lines):
   whatever closes this position has to carry an early-out, the way `anonLeafNarrowUseMark` and
   `anonLeafCloBindMark` do.
 
+* **RE-MEASURED 2026-09-02 ON A 13-CELL DELIVERY MATRIX, and the veto's own arm is now named per
+  cell.** The five positions plus D1090's three closed controls (argument / binding / annotated
+  binding) plus a NO-MERGE twin of each of the five. Standing: **5 invalid, 8 runs** — and every
+  no-merge twin RUNS, so the container delivery itself is fine and the merge is the whole
+  ingredient. `anonLeafAnyIndirectCall` vetoes four of the five through its `else { return true }`
+  arm (a non-`Ident` callee: `o.f(…)` is a `Member`, `a[0](…)` an `Index`, `pick()(…)` a `Call`);
+  the wrapping LAMBDA is vetoed one level in, because the argument is not a plain function NAME
+  and `anonLeafParamFnTargetAt` answers "".
+
+* **AND LAYER TWO IS THE `??` RESULT'S OWN ROW READER, which is a new fact.** With the veto forced
+  off, the struct-FIELD cell's `call_indirect` DOES use the moved functype — and the local the
+  `??` binds is still declared at the PRE-merge row, so `br_on_non_null` disagrees with its own
+  block result (`expected (ref null $type), found (ref null $type)`, offset 0x1a3, disassembled).
+  So closing this needs the merged-row redirect at an ELEVENTH owner — the local bound to a `??`
+  whose left operand is a field-closure call — beside the stored closure carrying the moved
+  `$fnsig`. That is why narrowing the veto alone is not the fix, and it is the D965 order again:
+  build the lowering, wire every delivery, THEN narrow the gate.
+
 Probe: `scripts/capability-probes/coalesce-moved-fn-value-through-container.vl`.
 
 ---
@@ -34485,7 +34503,25 @@ Probe: `scripts/capability-probes/closure-field-map-result-call.vl`.
 
 ### D1063 — two instantiations of ONE generic that must dispatch a member call DIFFERENTLY share a single AST node, so the disagreeing pair is check-clean invalid wasm
 
-**check-clean invalid wasm · `type mismatch: expected (ref $type), found (ref $type)` · ZERO corpus cells · reproduces on master · the PRICE [D1002](#d1002) declined to pay, named by the candidate that would have paid it**
+**CLOSED as `runs` 2026-09-02 — the repro prints `<C>` then `<fld>`. Fixture `tests/cases/generics/mixed-member-dispatch-per-instance.vl`. Was: check-clean invalid wasm (`type mismatch: expected (ref $type), found (ref $type)`) · ZERO corpus cells · the PRICE [D1002](#d1002) declined to pay, named by the candidate that would have paid it**
+
+* **THE PRICE WAS REAL AND IT WAS THE PRICE OF ONE PARTICULAR DEFER — not of deferring.** The nine
+  `runs -> not-runs` cells below are what an UNCONDITIONAL pre-mono defer costs, because the UFCS side then
+  reaches emission unrewritten and the classifiers were the thing the pre-mono rewrite existed to feed.
+  `monoPinBinOps` already re-runs two of `drwWalk`'s arms over ONE instance body with the pin in hand (D511/D512,
+  the `??` fold and the operator dispatch); the member-call arm is the third, and it is the one place where the
+  deferred question HAS an answer. Field first — the checker's precedence, asked with the same `tyFieldTyOf` the
+  gate asks of the call-site argument types — else the free `self`-function, and the call is rebuilt as the plain
+  direct call every classifier already understands. **NONE of the nine came back.**
+
+* **MEASURED ON A 70-CELL POSITION MATRIX** — 10 receiver shapes (a `self`-function struct, two field-carrying
+  structs, the disagreeing MIXED pair, string, i32, f64, boolean, `i32[]`, a generic `self`-function) x 7
+  positions (`"<" + … + ">"`, `return`, tail, `const s = …`, `print(…)`, an argument, a bare statement). Before:
+  56 runs / 7 check-reject / **7 check-clean invalid wasm, all of them the mixed shape**. After: **63 runs**, the
+  same 7 check-rejects, 0 invalid. The 7 check-rejects are [D1221](#d1221) and are not this row.
+
+* **`drwEveryInstanceTakesField` IS NOW `drwAnyInstanceTakesField`.** The gate defers whenever ANY instantiation
+  takes the field, because the disagreement is now answerable one pass later. Unanimity is no longer the bound.
 
 `g<T>(x: T) { x.tag() }` called once at a `Circle` (no such field — the free `self`-function
 `tag` answers) and once at a `Boxed` (the field answers) needs two different lowerings of one
@@ -34522,7 +34558,7 @@ source expression. Each spelling runs ALONE; it is the disagreement that has no 
 * **NOT A REGRESSION.** This cell was invalid wasm before D1002 and is invalid wasm after it;
   D1002 moved the UNANIMOUS-field shape and deliberately left this one. `scripts/capability-probes/generic-mixed-member-dispatch.vl` is the standing probe.
 
-Repro (check rc 0, then invalid wasm):
+Repro (RUNS and prints `<C>` then `<fld>`):
 
     type Circle = { r: f64 }
     type Boxed = { tag: () => string }
@@ -34535,8 +34571,6 @@ Repro (check rc 0, then invalid wasm):
     const b: Boxed = { tag: () => "fld" }
     print(describe(c))
     print(describe(b))
-    // vl check -> rc 0; vl run -> Invalid input WebAssembly code, type mismatch
-    // Either print ALONE runs, and prints <C> / <fld> respectively.
 
 ### D1071 — a union `==` against a CONCRETE operand that is not a value atom reads the WRONG arm's payload: check-clean invalid wasm
 
@@ -36622,9 +36656,34 @@ prints `false`):
 ---
 ### D1115 — returning a NARROWED nullable LIST or MAP parameter is check-clean invalid wasm, and the `is` is SCENERY
 
-**check-clean invalid wasm · `type mismatch: expected (ref $type), found (ref null $type)` · `vl check` rc 0 · ZERO corpus cells · found by D951's instantiation sweep, and INDEPENDENT of it (base and branch behave identically) · NOT D1038: that row is a map READ's own rep and its own ablation records `const g: i32[] | null = [5]; g is i32[]` as RUNNING**
+**CLOSED as `runs` 2026-09-02 — the repro prints `2`. Fixture `tests/cases/types/narrowed-nullable-ref-into-non-null-destination.vl`. Was: check-clean invalid wasm (`type mismatch: expected (ref $type), found (ref null $type)`) on `vl check` rc 0 · ZERO corpus cells · found by D951's instantiation sweep, and INDEPENDENT of it (base and branch behave identically) · NOT D1038: that row is a map READ's own rep and its own ablation records `const g: i32[] | null = [5]; g is i32[]` as RUNNING**
 
-Repro (check rc 0, then the engine refuses the module):
+* **THE FILED SCOPE WAS ELEVEN REPS SHORT, and a 65-cell grid says so** (13 reps x 5 delivery forms: `is`-return,
+  `!= null` return, bind-then-return, tail-`if`, inferred return). **49 of 65 were check-clean invalid wasm** and
+  **65 of 65 run** on the fix. `i32[]` and `{[string]: i32}` are the two the row names; `string[]`, `f64[]`,
+  `i64[]`, `boolean[]`, `C[]`, `i32[][]`, `{[string]: string}` and the CLOSURE spelling were all in it, and so was
+  the nullable-VARIANT one.
+
+* **THE CRITERION WAS RIGHT AND THE TWO LISTS IMPLEMENTING IT WERE NOT.** D131 built this recover and stated it
+  exactly — *"the RESULT VALTYPE is a non-null ref" AND "the value classifies as the nullable niche"* — with
+  `retNonNullRefResult` naming `struct`/`variant` and `exprNullableRefNiche` answering for those two. Every
+  nullable ref niche is spelled `nul<K>` over its non-null `K`, so the relation is a TABLE (`vkNulNicheOf`), and
+  stating it once is what stops the two halves drifting again. `identCellVKind` answers the value side across the
+  four storage classes a name lives in.
+
+* **THREE MECHANISMS, NOT ONE — the ablation separates them.** (1) the missing reps above; (2) the nullable
+  VARIANT, which fails at all four ANNOTATED forms while its INFERRED form runs, because a `: Circle` result
+  routes through `emitVariantCoerce` and never reaches the recover guard's `else` branch at all; (3) an INFERRED
+  CLOSURE result, which reads back as the `"i32"` default because `fRetKind` has no closure producer —
+  `emitOneFuncType` asks `fnReturnsClosure` ahead of the stored kind, and `retResultVKind` now mirrors that.
+
+* **THE POSITION MATRIX FOUND THE SIBLINGS, AND HALF OF THEM ARE [D1222](#d1222).** 4 reps x 11 delivery
+  positions: return, argument, binding, local assignment, global assignment, struct field, field store, array
+  element, map value, lambda return, global init. 24 of 44 ran before, 31 after — the BINDING, local-ASSIGNMENT
+  and global-ASSIGNMENT boundaries now ask `nulNicheRecoverOwed` too. The struct-FIELD and field-STORE positions
+  are keyed by field CODE rather than by kind and are filed separately.
+
+Repro (RUNS and prints `2`):
 
     function pick(x: i32[], y: i32[] | null): i32[] { if y is i32[] { return y } x }
     print(pick([1], [2])[0])
@@ -36657,9 +36716,26 @@ Repro (check rc 0, then the engine refuses the module):
 ---
 ### D1116 — a lambda nested INSIDE a lambda in a generic body is shared across instances: D943's rule does not reach one level down
 
-**check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` · `vl check` rc 0 · ZERO corpus cells · found by D951's position matrix, and the witness carries NO `is` at all — the `is` version fails identically, so this is the LAMBDA-TEMPLATING rule and not the `is` ladder**
+**CLOSED as `runs` 2026-09-02 — the repro prints `1` then `a`. Fixture `tests/cases/generics/nested-lambda-in-generic-body-per-instance.vl`. Was: check-clean invalid wasm (`type mismatch: expected i32, found (ref $type)`) on `vl check` rc 0 · ZERO corpus cells · found by D951's position matrix, and the witness carries NO `is` at all**
 
-Repro (check rc 0, then the engine refuses the module):
+* **IT IS A SEPARATE DEFECT FROM [D1117](#d1117), AND THE ORDER PROVES IT BOTH WAYS.** D1117's fourth rung landed
+  first and this witness did NOT move; this fix landed second and D1117's witness stayed fixed. Two rungs of one
+  rule, two defects.
+
+* **THE FIX IS THE RECURSION `monoPinBodyLambdas` NEVER HAD.** `monoCloneLambdaSubst` now walks the body it is
+  about to clone, so nesting is covered at every depth and in the named-nested `function` spelling too.
+
+* **AND THE PARENT POINTER IS THE HALF READING THE CALL SITES DOES NOT GIVE YOU.** `monoMakeInstance` re-points
+  every slot left in `monoLamMintedSlots` at the INSTANCE function — right for a lambda bound directly in the
+  instance body, wrong one frame down, where a nested clone's free names resolve up the chain THROUGH the lambda
+  that encloses it. `monoReparentNestedLams` re-points them at their enclosing clone and retires them from the
+  ledger so the outer pass cannot undo it.
+
+* **GRADED ON 18 CELLS WITH A PROVING VALUE EACH**: eleven instantiations (i32, string, f64, boolean, i64,
+  struct, list, map, nullable, value union, literal union) at depth 2, four at depth 3, three through a named
+  nested function.
+
+Repro (RUNS and prints `1` then `a`):
 
     function f<T>(v: T): T {
       const g = () => {
@@ -36686,9 +36762,23 @@ Repro (check rc 0, then the engine refuses the module):
 ---
 ### D1117 — a lambda that neither CAPTURES nor ANNOTATES a type parameter but NAMES one in its body is shared across instances
 
-**check-clean silently wrong · `vl check` rc 0 · ZERO corpus cells · the last unmoved position in D951's matrix, and its own mechanism: `monoLamNodeIsTemplate` reads a lambda's ANNOTATIONS and its capture COUNT, and never its body**
+**CLOSED as `runs` 2026-09-02 — the repro prints `true`. Fixture `tests/cases/generics/lambda-body-names-type-param-per-instance.vl`. Was: check-clean SILENTLY WRONG on `vl check` rc 0 · ZERO corpus cells · the last unmoved position in D951's matrix, and its own mechanism: `monoLamNodeIsTemplate` reads a lambda's ANNOTATIONS and its capture COUNT, and never its body**
 
-Repro (runs, printing the wrong answer):
+* **THE FOURTH RUNG IS A BODY SCAN**, over the two spellings `monoFoldTyParamLayout` substitutes: an `is` whose
+  check type mentions a type parameter, and a `T.field` layout constant. Walked through `ast.nodeChildren` rather
+  than a second copy of the fold's arm ladder, so the two cannot drift and a nested `FuncDecl`'s parameters,
+  return and body are covered for free.
+
+* **THE CLONE GATE NEEDED THE SAME QUESTION.** With `any` and `capOnly` both false `monoCloneLambdaSubst`
+  declined to clone, which with the widened predicate would have left the prune stubbing a template no clone
+  replaced.
+
+* **GRADED AT TEN INSTANTIATIONS AND IN BOTH CALL ORDERS.** i32 -> `true`, and string / f64 / boolean / i64 /
+  struct / list / map -> `false`, with the i32 pin FIRST and again LAST (a shared body answers the same for both
+  orders; a cloned one does not). `i32 | null` and `i32 | string` answer `false`, which AGREES with the direct
+  spelling: `gi is i32 | null` is a check reject (`can never match a value of type i32`).
+
+Repro (RUNS and prints `true`):
 
     let gv = 1
     function f<T>(_v: T): boolean {
@@ -36696,7 +36786,6 @@ Repro (runs, printing the wrong answer):
       g()
     }
     print(f(2))
-    // PRINTS false
 
 `gv` is an `i32` and `T` is `i32`, so the answer is `true`.
 
@@ -37886,3 +37975,131 @@ Repro (refuses on a program that does nothing but declare it):
   this file — `i32[]` arrays and struct/union element arrays. The gap is every other element
   rep at the nested spelling, and `u8` is simply the one a witness exists for.
 
+### D1220 — a void-tail function whose last statement is an `if` assigning a STRUCT module global infers a non-void return and TRAPS on `unreachable`
+
+**loads then traps · clause 1 · OPEN · found 2026-09-02 by [D1115](#d1115)'s position matrix, where the
+global-ASSIGNMENT cells stopped being invalid wasm and started reporting this instead · present on
+master and INDEPENDENT of D1115: the witness below carries no nullable anything**
+
+Repro (check rc 0, then `wasm trap: wasm 'unreachable' instruction executed`):
+
+    type C = { v: i32 }
+    let g: C = {v: 1}
+    function set(y: C) { if y.v > 0 { g = y } }
+    set({v: 7})
+    print(g.v)
+
+* **THE ABLATION IS A DESTINATION-KIND SWEEP, and only one kind moves.** One program, five arms,
+  everything else held:
+
+  | destination of the `if`-arm assignment | outcome |
+  | --- | --- |
+  | `let gi = 0` — an i32 GLOBAL | runs |
+  | `let gs = "a"` — a string GLOBAL | runs |
+  | `let gl: i32[] = [0]` — a list GLOBAL | runs |
+  | `let z: C` — a struct LOCAL | runs |
+  | `let gc: C = {v: 1}` — a struct GLOBAL | **TRAP** |
+
+* **AND THE `if` IS LOAD-BEARING, WHICH THE `return` CONTROL SHOWS.** `function noIf(y: C) { g = y }`
+  runs; `function withIfRet(y: C) { if y.v > 0 { g = y } return }` — the SAME body with a bare
+  `return` appended — runs; only the tail-`if` spelling traps. So the function's result is inferred
+  from the tail statement, the struct-global assignment makes that tail read as a VALUE, the
+  functype declares a REF result over a body that leaves nothing, and the emitter closes the
+  function with `unreachable`. Disassembled: `(func $0 (param $0 (ref $0)) (result (ref null $0))
+  (if … (then (global.set $global$0 (local.get $0)))) (unreachable))` — the result is the
+  assigned global's own type, so the tail-`if` was read as this function's value.
+
+* **IT WAS HIDING BEHIND D1115.** Those cells were check-clean INVALID WASM before the recover
+  landed, so the module never loaded and the trap could not be reached. Refusals come in layers;
+  this is the next one, not a regression — the witness above traps on master too.
+
+---
+### D1221 — a generic member call on a type-parameter receiver whose instantiation carries the field is a check reject with a BLANK message, unless a `self`-function of that name is also in scope
+
+**loud check reject · clause 2 · OPEN · the diagnostic has NO TEXT (`[ERROR]:` followed by the
+caret line and nothing else) · found 2026-09-02 while building [D1063](#d1063)'s position matrix,
+as the `nofn` shape — 7 of its 70 cells, one per position**
+
+Repro (check rc 1, with an empty message):
+
+    type Boxed = { tag: () => string }
+    function g<T>(x: T): string { x.tag() }
+    const b: Boxed = { tag: () => "fld" }
+    print(g(b))
+
+* **THE ABLATION IS ONE LINE, AND IT IS THE ONE NOBODY WOULD WRITE.** Add a free
+  `function tag(self: Circle): string { "C" }` — for a type the program never instantiates `g`
+  at — and the SAME program compiles and prints `fld`. That is D1002's own witness, which is why
+  the shape looked covered: every fixture for the field-dispatch family carries a `self`-function
+  because the family is ABOUT the precedence between the two. With no `self`-function there is no
+  precedence question at all, and that is the case that refuses.
+
+* **IT IS NOT [D1063](#d1063), AND THE MATRIX SEPARATES THEM.** D1063's cells were check-clean
+  INVALID WASM at all seven positions and now run; these seven are `check rc 1` before and after,
+  unchanged by the per-instance dispatch. One is an emitter disagreement, the other is upstream of
+  the emitter entirely.
+
+* **AN EMPTY DIAGNOSTIC IS ITS OWN DEFECT.** Whatever the ruling on the capability, a `[ERROR]:`
+  with no sentence cannot be acted on by a user and cannot be grouped by any inventory. Grade the
+  message as well as the outcome.
+
+---
+### D1222 — the struct-FIELD and field-STORE deliveries of a narrowed nullable ref are check-clean invalid wasm: they are keyed by field CODE, not by rep KIND
+
+**check-clean invalid wasm · `type mismatch: expected (ref $type), found (ref null $type)` · clause 1 ·
+OPEN · the named residue of [D1115](#d1115), measured on its own position matrix rather than
+predicted from it**
+
+Repro (check rc 0, then the engine refuses the module):
+
+    type Box = { f: i32[] }
+    function go(y: i32[] | null, d: i32[]): Box { if y != null { return {f: y} } {f: d} }
+    print(go([7], [0]).f[0])
+
+* **THE POSITION MATRIX IS WHERE IT COMES FROM, AND THE NUMBERS ARE MEASURED.** 4 reps
+  (`i32[]`, `{[string]: i32}`, `C[]`, a nullable VARIANT) x 11 delivery positions. D1115 took the
+  running count from 24 to 31 of 44 by wiring the RETURN, BINDING, local-ASSIGNMENT and
+  global-ASSIGNMENT boundaries. What is left is struct-FIELD and field-STORE at the three
+  non-variant reps — six cells, one message. (The matrix's own `map-value` cells are check
+  rejects from the generator's spelling, not from this family, and are not counted.)
+
+* **THE REASON IT WAS NOT WIRED WITH THE OTHERS IS THE KEY, NOT THE LOWERING.** Every position
+  D1115 wired names its destination by rep KIND (`localIsRef[slot]`, `globalCellKind`,
+  `retResultVKind`), so it asks `nulNicheRecoverOwed` in one line. A struct field names its
+  destination by field CODE (`sFieldTypes`), and the code-to-kind mapping is a second table with
+  its own drift risk — exactly the drift `vkNulNicheOf` was written to end. Closing this means
+  giving the field layer a kind, not adding a thirteenth code list.
+
+* **THE VARIANT REP ALREADY RUNS AT BOTH POSITIONS** (measured, both cells print the narrowed
+  value's own payload), which is what says the recover instruction is reachable from here and
+  only the list / map / ref-list niches were never hooked to it.
+
+---
+### D1223 — a bare `Map()` ARGUMENT into a non-i32-valued map parameter builds the mono map struct: check-clean invalid wasm
+
+**check-clean invalid wasm · `type mismatch: expected (ref $type), found (ref $type)` · clause 1 ·
+OPEN · found 2026-09-02 while writing [D1115](#d1115)'s fixture, by CONSTRUCTING an argument at a
+shape the fixture had only ever passed a variable at**
+
+Repro (check rc 0, then the engine refuses the module):
+
+    function take(m: {[string]: string}): i32 { m.size }
+    print(take(Map()))
+
+* **THE ARGUMENT BOUNDARY IS THE MISSING SEED, and the sibling positions all have it.** A bare
+  `Map()` self-identifies nothing, so it needs the destination's shape seeded before it builds —
+  `emitLetDeclStmt` seeds `pendingMapSlot` from a `const m: {[string]: string} = Map()`
+  annotation, the global arm of `emitAssign` seeds it from the cell, and `emitReturnValue`'s
+  `retMap` arm seeds it from the result annotation *("without it the constructor read the ambient
+  `pendingMapSlot` (-1 — the mono i32 map) while the functype result is the value-typed map
+  struct: INVALID-WASM … for EVERY non-mono value type")*. The ARGUMENT position is the one that
+  never grew the seed, and the sentence quoted from the return arm describes it exactly.
+
+* **THE i32-VALUED SPELLING ESCAPES**, which is why no fixture caught it: `{[string]: i32}` IS the
+  mono shape, so the default the constructor reads is the right one. `takeI(Map())` at
+  `{[string]: i32}` runs; `{[string]: string}` and `{[string]: f64}` are both measured invalid,
+  and the return arm's own comment says the population is every non-mono value type.
+
+* **A VARIABLE ARGUMENT RUNS.** `const m: {[string]: string} = Map()` … `take(m)` compiles and
+  runs — the binding boundary seeded the shape and the argument just passes the ref along. The
+  ingredient is the LITERAL at the argument position, not the map type.
