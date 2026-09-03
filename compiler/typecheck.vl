@@ -5484,6 +5484,17 @@ function placeCurTy(ix: i32, names: string[], tys: i32[]) {
   -1
 }
 
+// The VALUE type of an array ELEMENT type `et`: `et` itself, except that the `u8` STORAGE
+// type widens to `i32` (D1211). ONE HOME for the widened-read rule the index arm already
+// applies — a `u8[]` read is the zero-extended byte `array.get_u` produces, and `u8` may
+// not stand in a value position at all (`const v: u8 | null = …` is a check reject saying
+// so). `.pop()` / `.get(i)` are that read one nullable out, and `mkNullableTy(u8)` would
+// put `u8` in a UNION MEMBER — a type the checker refuses to let anyone write.
+function arrElemValueTy(et: i32): i32 {
+  if primNameOf(et) == "u8" { return TY_I32 }
+  et
+}
+
 // The type of an ELEMENT read off `baseTy` for narrowing purposes (no diagnostics) —
 // `placeFieldTy`'s index twin. -1 when unresolvable, which is how "no fact" is spelled.
 //
@@ -5492,7 +5503,7 @@ function placeCurTy(ix: i32, names: string[], tys: i32[]) {
 // emitter would have to learn a map-cell channel to lower the narrowed read — a different
 // landing on a different rep (inventory-2 D451). A `u8[]`/`string` element is an i32 with
 // no nullable to peel, so answering the element type for those buys nothing and would put
-// the widened-read rule (`checkIndexNode`'s `u8` arm) in a second place.
+// the widened-read rule (`arrElemValueTy`) in a second place.
 function placeElemTy(baseTy: i32) {
   if baseTy < 0 { return -1 }
   const bt = T.tys[baseTy]
@@ -24520,12 +24531,14 @@ function checkCallNode(n: Call, ix: i32) {
         return TY_ERR
       }
       // `.pop()` / `.get(i)` yield `T | null` (an empty pop / out-of-range get is
-      // normal absence); `.clear()` empties in place and yields nothing.
+      // normal absence); `.clear()` empties in place and yields nothing. The element is
+      // its VALUE type (`arrElemValueTy`), so a `u8[]` answers `i32 | null` — the same
+      // widening `xs[i]` takes, and the rep `emitPopNulBox` already builds (D1211).
       if cfn.memProp == "pop" {
         if margs.length != 0 {
           tErr("pop expects 0 arguments, got " + i32ToStr(margs.length), ix)
         }
-        return mkNullableTy(rt.aElem)
+        return mkNullableTy(arrElemValueTy(rt.aElem))
       }
       if cfn.memProp == "get" {
         if margs.length != 1 {
@@ -24536,7 +24549,7 @@ function checkCallNode(n: Call, ix: i32) {
             tErr(bmArgMsg(BM_INDEXMUST, "get", gat, TY_I32, -1), ix)
           }
         }
-        return mkNullableTy(rt.aElem)
+        return mkNullableTy(arrElemValueTy(rt.aElem))
       }
       if cfn.memProp == "clear" {
         if margs.length != 0 {
@@ -38663,13 +38676,10 @@ function checkIndexNode(n: Index, ix: i32) {
     tErr("array index must be i32, got " + tyToStr(idxTy), ix)
   }
   if at is TyArray {
-    // A `u8[]` READ yields an `i32`, never a `u8` — the storage is one byte and the
-    // VALUE is the widened i32 `array.get_u` produces (0..255). This is the same shape
-    // the string arm below has: `string` is `(array i32)` and `s[i]` is an i32 code
-    // point with no `char` type above it (DECISIONS A7). Returning `at.aElem` here
-    // would put a `u8` into a value position, which is exactly what `u8` may not be.
-    if primNameOf(at.aElem) == "u8" { return TY_I32 }
-    return at.aElem
+    // The element's VALUE type — a `u8[]` READ is an `i32`, never a `u8`. Same shape as
+    // the string arm below: `string` is `(array i32)` and `s[i]` is an i32 code point with
+    // no `char` type above it (DECISIONS A7).
+    return arrElemValueTy(at.aElem)
   }
   if at is TyErr { return TY_ERR }
   // Indexing a string yields the i32 code point at that position.
