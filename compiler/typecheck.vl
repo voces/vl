@@ -585,6 +585,13 @@ let holeCastTgtTy: i32[] = []
 let holeCastTgtName: string[] = []
 let holeCastIx: i32[] = []
 let holeCastRet: i32[] = []
+// The parked cast's ARGUMENT DESTINATION — the parameter position and the concrete type the
+// body handed the cast's value to, or -1 when it went somewhere else. The body validated that
+// hand-over at the PRE-PIN type, so the compare passed and is never re-asked; the pin is the
+// first moment the operand's type exists, which is where it has to be asked again. D1371.
+let holeCastArgN: i32[] = []
+let holeCastArgExp: i32[] = []
+let holeCastArgIx: i32[] = []
 // Hole NAMES whose body used the MAP/SET SURFACE (`self.set(k, v)`, `.get`, `.has`,
 // `.delete`, `.add`, `.keys()`, `.values()`) — so the hole demands a map, and the parallel
 // `holeMapTys` entry IS that map: an open `{[?]: ?}` the body's own operations pin in place.
@@ -3053,6 +3060,9 @@ export function initChecker() {
   holeCastTgtName = []
   holeCastIx = []
   holeCastRet = []
+  holeCastArgN = []
+  holeCastArgExp = []
+  holeCastArgIx = []
   holeMapNames = []
   holeMapTys = []
   holeAltNames = []
@@ -22680,6 +22690,11 @@ function checkCallNode(n: Call, ix: i32) {
         // The `as` cast the body parked on this hole, re-asked under the argument. D1342.
         holeCastPinCheck(pHole.tvName, at, declParamNameAt(dParams, i))
       }
+      // …AND THE CAST THIS ARGUMENT *IS*, whose destination the pin has to re-ask. D1371.
+      // NOT INTO A HOLE PARAMETER: `id(a as? i32)` over `function id(x)` pins `x` from this
+      // very argument, so `expected` is the PRE-PIN answer rather than a declared demand, and
+      // holding the cast to it refuses a program whose annotated `take` twin runs.
+      if !tyIsHole(params[i]) { noteCastArgDest(args[i], i + 1, expected) }
       // Passing an empty-collection argument into a concrete `T[]` / map param pins
       // its element type from the param (`len(empty)` resolves `empty` to `i32[]`),
       // clearing its uninferred floor — pure downstream-usage inference, no push.
@@ -32997,7 +33012,12 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
     // whole tree: without the exemption every firing is that fixture's contract; with it, the rule
     // fires nowhere in `compiler/*.vl`, `std/*.vl` or the corpus — i.e. only on the shape it names.
     if tyExcludesNull(lt) {
-      if !coalNarrowedPlace(n.binLeft) { recordDeadCoalesce(ix, lt) }
+      // …AND A PARKED HOLE CAST HAS NO ANSWER YET. `a as? i32` inside a hole's body types `i32`
+      // until the call PINS the operand (`castPinAdjudicate`), so a `??` over it looks dead
+      // here and is not — `(a as? i32) ?? 0` under `take(u)` needs its default. D1371.
+      if !coalNarrowedPlace(n.binLeft) && !coalParkedHoleCast(n.binLeft) {
+        recordDeadCoalesce(ix, lt)
+      }
     }
     const lt2 = T.tys[lt]
     if lt2 is TyNullable {
@@ -34561,7 +34581,57 @@ function noteCastDemand(name: string, n: AsExpr, ix: i32, target: i32) {
   holeCastTgtName.push(n.asTy)
   holeCastIx.push(ix)
   holeCastRet.push(T.curRet)
+  holeCastArgN.push(0 - 1)
+  holeCastArgExp.push(0 - 1)
+  holeCastArgIx.push(0 - 1)
   0
+}
+
+// The ARGUMENT the body delivered a parked cast to, recorded so the pin can re-ask the compare
+// the body already passed. `argIx` is the argument NODE — the cast itself, through parens — so
+// the re-ask anchors exactly where the annotated twin's `argument N:` does. Last write wins:
+// one cast SITE has one destination, and a body that re-delivers it is the same node again.
+function noteCastArgDest(argIx: i32, argN: i32, exp: i32) {
+  // FREE WHEN NOTHING IS PARKED, which is every call in almost every program: this runs once
+  // per ARGUMENT of every call in the module, so the peel below must sit behind the emptiness
+  // test rather than in front of it.
+  if holeCastIx.length < 1 { return 0 }
+  if exp < 0 { return 0 }
+  if tyIsHole(exp) { return 0 }
+  let cix = argIx
+  let peeled = false
+  while !peeled {
+    const cn = P.nodes[cix]
+    if cn is Paren { cix = cn.parInner } else { peeled = true }
+  }
+  let i = 0
+  while i < holeCastIx.length {
+    if holeCastIx[i] == cix {
+      holeCastArgN[i] = argN
+      holeCastArgExp[i] = exp
+      holeCastArgIx[i] = argIx
+    }
+    i = i + 1
+  }
+  0
+}
+
+// True when `ix` is (through parens) an `as` cast this body PARKED on a hole — a cast whose
+// result type the pin can still widen to `T | null`, so no reader may treat it as settled.
+function coalParkedHoleCast(ix: i32): boolean {
+  if holeCastIx.length < 1 { return false }
+  let cix = ix
+  let peeled = false
+  while !peeled {
+    const cn = P.nodes[cix]
+    if cn is Paren { cix = cn.parInner } else { peeled = true }
+  }
+  let i = 0
+  while i < holeCastIx.length {
+    if holeCastIx[i] == cix { return true }
+    i = i + 1
+  }
+  false
 }
 
 // Record / read a hole binding the body wrote to, by `<holeName>.<ident>`. Idempotent.
@@ -34643,14 +34713,14 @@ function castPinAdjudicate(k: i32, at: i32) {
     if !unionCoversTy(argT, target) { return 0 }
     const rest = subtractTy(argU, target)
     if rest < 0 { return 0 }
-    if mode == "null" { return castPinNullResult(castIx, target) }
+    if mode == "null" { return castPinNullLand(k, castIx, target) }
     castPropagationFits(rest, holeCastTgtName[k], castIx, holeCastRet[k])
     return 0
   }
   const sn = primNameStr(primNameOf(at))
   const tn = primNameStr(primNameOf(target))
   if !numCastCanFail(sn, tn) { return 0 }
-  if mode == "null" { return castPinNullResult(castIx, target) }
+  if mode == "null" { return castPinNullLand(k, castIx, target) }
   castPropagationFits(TY_NULL, holeCastTgtName[k], castIx, holeCastRet[k])
   0
 }
@@ -34665,6 +34735,24 @@ function castPinNullResult(castIx: i32, target: i32) {
   const nt = mkNullableTy(target)
   if nt < 0 { return 0 }
   if castIx >= 0 && castIx < nodeTyIx.length { nodeTyIx[castIx] = nt }
+  0
+}
+
+// D1371 — THE RE-RECORD IS NOT THE WHOLE ANSWER: the body already HANDED the cast's value
+// somewhere, at the pre-pin type. `id(a as? i32)` into `function id(x: i32)` passed
+// `assignableExpr` against `i32` and is never re-asked, so the box goes into an `i32`
+// parameter — `vl check` rc 0, invalid wasm. Re-ask it here, through `argMismatchErr`, the one
+// home of the wording AND the anchor, so the hole reports character-for-character what the
+// annotated `function take(a: i32 | null)` twin reports at the same position. `as?` yielding
+// `T | null` is `docs/error-handling-design.md` §Trio; the destination is what is wrong.
+function castPinNullLand(k: i32, castIx: i32, target: i32) {
+  castPinNullResult(castIx, target)
+  const exp = holeCastArgExp[k]
+  if exp < 0 { return 0 }
+  const nt = nodeTyIxOf(castIx)
+  if nt < 0 { return 0 }
+  if assignable(nt, exp) { return 0 }
+  argMismatchErr(holeCastArgN[k], exp, nt, holeCastArgIx[k])
   0
 }
 
