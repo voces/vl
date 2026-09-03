@@ -46,23 +46,27 @@ const CITE = /(?<![A-Za-z0-9_])D(\d{1,4})(?![0-9A-Za-z_])/g;
 // exemption the way a bare allowlist does.
 const UNFILED_MARK = /unfiled:\s*(D\d{1,4})/g;
 
-// PRE-EXISTING, MEASURED 2026-09-02 ON MASTER `745c8d21`: 11,787 citations resolve, these
-// nine do not, and each says why. Two kinds — a number that was never a row id at all, and
-// a row id used in shipped work that never got a row. A gate that reds for debt in files
-// the author is not editing gets bypassed rather than obeyed, so the debt is NAMED here
-// instead of being left to red the tree; the list may only SHRINK, because an entry that
-// starts resolving is a failure below. That is what stops it becoming the kind of allowlist
-// that would hide the next D1230 — which is deliberately NOT in it.
+// NOT ROW IDS AT ALL — and that is now the ONLY reason an entry may be here. This list
+// landed holding nine: three numbers that were never row ids, and six ids that shipped work
+// cited with no row behind them. The six are gone. Four turned out to be real defects and
+// are FILED under their original ids — D705, D949, D973, D974 — witnesses re-measured rather
+// than copied from the citation. Two were WORK LABELS a row would have fictionalised, and
+// their citations now name the PR that did the work: the scoreboard phrase-list audit is
+// #2122, the `is <literal>` hint is #2404.
+
+// A CODE RULE WAS CONSIDERED AND IS WORSE THAN THE LIST. Skipping the right side of a
+// `D<n>–D<n>` range covers two of the three and would also hide a genuinely missing row cited
+// as a range end; nothing syntactic covers `U+D800`, `(D800)` and `D800..DFFF` at once. So
+// the exemption stays NAMED and may only SHRINK — an entry that starts resolving is a
+// failure below, which is what stops this becoming the allowlist that would hide the next
+// D1230, deliberately NOT in it. Counts are citations OUTSIDE this file, measured 2026-09-03.
 const KNOWN_UNFILED = new Map<string, string>([
-  ["D800", "x7 — the UTF-16 surrogate range D800–DFFF, in strings-design.md / emit_base.vl"],
-  ["D1000", "x2 — the endpoint of the reservation range `D981–D1000`, not a citation"],
-  ["D174", "x1 — the endpoint of `D171–D174` in scripts/silent-sweep/d156/README.md"],
-  ["D973", "x15 — struct-union `==`; shipped, cited in compiler and docs, never a row"],
-  ["D974", "x5 — nested-shape `==`; shipped, cited in wasmEmit and docs, never a row"],
-  ["D949", "x5 — generic-application provenance; shipped, cited in typecheck, never a row"],
-  ["D958", "x7 — the concedes-phrase audit; cited in CLAUDE.md and six more, never a row"],
-  ["D1199", "x3 — the second `is <literal>` hint; in DECISIONS and CHANGELOG, never a row"],
-  ["D705", "x1 — a test comment claims `it is FILED (D705)`; no such row exists"],
+  ["D800", "x5 — the UTF-16 surrogate range D800–DFFF / the code point U+D800: " +
+    "strings-design.md, emit_base.vl, emit_sections.vl, two string fixtures"],
+  ["D1000", "x2 — the CLOSING endpoint of the reservation range `D981–D1000` in " +
+    "inventory/README.md. The opening endpoint D981 is a real row and resolves"],
+  ["D174", "x1 — the CLOSING endpoint of `D171–D174` in silent-sweep/d156/README.md. " +
+    "D171 is a real row and resolves"],
 ]);
 
 type Cite = { id: string; where: string };
