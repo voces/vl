@@ -93,6 +93,7 @@ import {
   nameIsMemBulkIntrinsic,
   nameIsMemStoreIntrinsic,
   nameIsNewtypeBrand,
+  nodeArrayElemIsBareStrLit,
   nodeArrayElemIsLitUnion,
   nodeArrayElemIsNulLitUnion,
   nodeArrayElemIsNulStr,
@@ -165,6 +166,7 @@ import {
   tyIsNewtypeBrand,
   tyIsNullableLitUnion,
   tyIsU8ArrayTy,
+  tyLitMemberTexts,
   tyLitSetMemberLexes,
   tyLitUnionAliasIx,
   tyNestedArrLeafRenders,
@@ -9981,8 +9983,12 @@ export function sFieldIsLitUnion(si: i32, fi: i32) {
   // fall-through to the recorded name is untouched, so an uncovered row (-1 — a
   // plain field's "" element, or a spelling that resolved through neither path)
   // still answers exactly as before.
+  // `tyIsLitUnionOrLit`, NOT `tyIsLitUnion`: the ONE-MEMBER set is atom material at both of
+  // its spellings (D1460). The bare `TyLit` reaches this classifier only on a row
+  // `promoteLitFieldToAtom` re-laid — a bare `"a"` ANNOTATION codes 3 — so the widening is
+  // scoped to the promotion and cannot move a declared field's rep.
   const ety = sFieldElemTyIxAt(si, fi)
-  if ety >= 0 { return tyIsLitUnion(ety) }
+  if ety >= 0 { return tyIsLitUnionOrLit(ety) }
   const r = nameIsLitUnionType(sFieldElemNameAt(si, fi))
   r
 }
@@ -10022,8 +10028,9 @@ export function variantFieldIsLitUnionArray(vi: i32, fj: i32) {
 // arena answer from one place.
 export function variantFieldIsLitUnion(vi: i32, fj: i32) {
   if variantFieldTypeAt(vi, fj) != 0 { return false }
+  // `tyIsLitUnionOrLit` for `sFieldIsLitUnion`'s reason (D1460).
   const ety = uFieldElemTyIxAt(vi, fj)
-  if ety >= 0 { return tyIsLitUnion(ety) }
+  if ety >= 0 { return tyIsLitUnionOrLit(ety) }
   nameIsLitUnionType(variantFieldElemName(vi, fj))
 }
 
@@ -16488,6 +16495,16 @@ function shapeFieldTypeCompatK(
     return true
   }
   if want != code {
+    // A LITERAL UNION HAS TWO REPS AND A RENDER NAMES THE TYPE, so `K` against a code-3 row is
+    // no longer a proven mismatch (D1460): `unifyMixedLitRepArms` lays a litunion discriminant
+    // out as the STRING when the partner arm carries the base, while canon still renders the
+    // arm's field as its declared alias, which `nameFieldCode` codes 0. Without this the arm's
+    // OWN render names no variant and a shared-field read over the pair takes the emitter's
+    // `field access but no struct type declared` floor. Every level, since the pass can re-lay
+    // any discriminant and `variantIndexOfTypeName` only ever asks level 0.
+    if want == 0 && code == 3 {
+      if nameIsLitUnionType(t) { return true }
+    }
     // THE UNION-BOX FIELD ACCEPTS EVERY ATOM — the NAME resolver's half of the leniency
     // `anonValueFitsField` has always applied on the NODE side (D461), and the two answer ONE
     // question: which struct row does a `{r: 7}` literal build at. `structIndexOfObjCtx` matches
@@ -20095,6 +20112,12 @@ export function arrLitIsStr(arrIx: i32, fnIx: i32) {
     // annotation on the atom list, and BESIDE the nullable twin below, which is this arm for
     // the `(string | null)[]` spelling and is the reason that spelling already worked.
     if nodeArrayElemIsStr(arrIx) { return true }
+    // The ONE-MEMBER set spelled BARE (`("a")[]`) — a string list for the reason
+    // `nodeArrayElemIsBareStrLit` states, and here for the reason the arm above is: a literal
+    // whose only element is a promoted one-member discriminant field READS as an atom, so the
+    // first-element probe below misses it and the literal built the i32 list into a string-list
+    // slot. Beside the `string[]` arm, after the two litunion exclusions (D1460).
+    if nodeArrayElemIsBareStrLit(arrIx) { return true }
     // A `(string | null)[]` literal with NO string-typed first element (`[null]`, `[null,
     // "x"]`): the recorded context-adoption type is the only signal — it IS the string-ref
     // niche list (`emitArr` seeds `pendingNulString` off the same recorded type), so the
@@ -23594,6 +23617,23 @@ export function litAtomMemberTy(exprIx: i32, fnIx: i32) {
   litAtomMemberTyAt(exprIx, fnIx, 0)
 }
 
+// The member TEXTS to spell atom-repped node `ix` with — one home for the ladder the two
+// widen consumers (`emitAtomToStr`, `print`'s atom arm) each wrote out. `exprIsLitAtom` has
+// already decided the value IS an atom; this only answers what to widen it WITH, so an empty
+// answer is a genuine disagreement and both callers still refuse loudly on it.
+//
+// THE THIRD RUNG IS THE ONE-MEMBER SET (D1460). `nodeLitUnionMemberTexts` declines a bare
+// `TyLit` on purpose — its OTHER callers read an empty list as "not a widenable atom" — but a
+// promoted one-member discriminant field is exactly a bare `TyLit` whose value is an atom, and
+// `tyLitMemberTexts` is the kind-blind reading of the same node.
+export function litAtomWidenTexts(ix: i32, fnIx: i32) {
+  const direct = nodeLitUnionMemberTexts(ix)
+  if direct.length > 0 { return direct }
+  const decl = tyLitMemberTexts(litAtomMemberTy(ix, fnIx))
+  if decl.length > 0 { return decl }
+  tyLitMemberTexts(nodeTyIxOf(ix))
+}
+
 function litAtomMemberTyAt(exprIx: i32, fnIx: i32, depth: i32): i32 {
   if exprIx < 0 { return 0 - 1 }
   const ix = unwrapParen(exprIx)
@@ -24451,28 +24491,31 @@ export function variantLitDiscriminable(a: i32, b: i32): boolean {
   variantLitPairKind(a, b) == 1
 }
 
-// Would the pair be discriminable if its MIXED literal fields were re-laid under the atom
-// rep? (D1050 — the one spelling of D1023's family the ruling calls legal that the build of
-// it left refused.) True only for a pair that is NOT discriminable as laid out, so the two
-// questions partition rather than overlap.
+// Would the pair be discriminable if its MIXED literal fields were RE-LAID? (D1050 / D1460 —
+// the spellings of D1023's family the ruling calls legal that the build of it left refused.)
+// True only for a pair that is NOT discriminable as laid out, so the two questions partition
+// rather than overlap.
 //
 // ONE DERIVATION, TWO ANSWERS, for `variantLitDiscriminable`'s own reason: `assignTags`
 // ADMITS on this, `unifyMixedLitRepArms` ACTS on it, and `buildVariantTwins` later folds the
 // arms on the discriminable answer once the layouts agree. Three readers of one walk cannot
 // drift; three hand-written copies of it would.
 export function variantLitRepUnifiable(a: i32, b: i32): boolean {
-  variantLitPairKind(a, b) == 2
+  variantLitPairKind(a, b) >= 2
 }
 
-// The pair's D1023 status as ONE walk: 1 = discriminable AS LAID OUT, 2 = discriminable only
-// after `unifyMixedLitRepArms` re-lays its mixed literal fields onto the atom rep, 0 =
-// neither (the arms genuinely differ at a field `is` cannot compare).
+// The pair's D1023 status as ONE walk: 1 = discriminable AS LAID OUT, 2 = discriminable after
+// `unifyMixedLitRepArms` re-lays its mixed literal fields onto the ATOM rep, 3 = after it
+// re-lays them onto the STRING rep (a set beside its own BASE — D1460), 0 = neither (the arms
+// genuinely differ at a field `is` cannot compare). The ACTION is per FIELD, so a pair
+// carrying one of each is admitted here and re-laid twice there.
 function variantLitPairKind(a: i32, b: i32): i32 {
   if a < 0 || b < 0 { return 0 }
   if a >= uFieldCount.length || b >= uFieldCount.length { return 0 }
   if uFieldCount[a] != uFieldCount[b] { return 0 }
   let sawLit = false
   let sawMixed = false
+  let sawStrMixed = false
   let fi = 0
   while fi < uFieldCount[a] {
     const ra = uFieldStart[a] + fi
@@ -24506,6 +24549,13 @@ function variantLitPairKind(a: i32, b: i32): i32 {
       // `unifyMixedLitRepArms` can give them, because both sets are interned-atom material.
       sawLit = true
       sawMixed = true
+    } else if variantFieldLitRepStrMixed(a, b, fi) {
+      // The D1460 field: an atom-repped SET beside its own BASE. The base arm holds an
+      // arbitrary string with no interned id, so the atom is the rep they CANNOT share and
+      // the string is the one they can — the same layout the pair already has when the set
+      // arm is spelled INLINE, which runs today.
+      sawLit = true
+      sawStrMixed = true
     } else if !(storageEq && uFieldTyText[ra] == uFieldTyText[rb]) {
       // Neither a discriminant candidate nor equal — the arms genuinely differ at a field
       // whose values `is` has no way to compare.
@@ -24514,6 +24564,11 @@ function variantLitPairKind(a: i32, b: i32): i32 {
     fi = fi + 1
   }
   if !sawLit { return 0 }
+  // The kinds are reported most-constrained first, but the ACTION is per FIELD and both
+  // re-lays run, so a pair carrying one field of each is served correctly either way. The
+  // demotion is a SINK — a base partner cannot be atomised — which is what makes the pair
+  // loop converge on a three-arm group whatever order it visits the arms in.
+  if sawStrMixed { return 3 }
   if sawMixed { return 2 }
   1
 }
@@ -24524,11 +24579,12 @@ function variantLitPairKind(a: i32, b: i32): i32 {
 // may: both sides must already be atom MATERIAL, or the promotion would have to invent a rep for
 // a value that has none.
 //
-// `tyIsLitUnion` ON BOTH SIDES IS THE BOUND, and it is narrower than `tyIsLitSet` on purpose. It
-// admits only a 2+-member set every one of whose members is a STRING — what `internAtom` keys,
-// what `variantFieldIsLitUnion` claims for the read, and what `emitAtomToStr` can widen back. A
-// numeric set reps as its base value and has no atom; a BARE single literal is not a litunion to
-// the read classifier, so promoting it would store an atom nothing widens. Both stay refused.
+// `tyIsLitUnionOrLit` ON BOTH SIDES IS THE BOUND, and it is narrower than `tyIsLitSet` on
+// purpose. It admits only a STRING literal set — what `internAtom` keys, what
+// `variantFieldIsLitUnion` claims for the read, and what `emitAtomToStr` can widen back. A
+// NUMERIC set reps as its base value and has no atom, and stays refused. The MEMBER COUNT is
+// not part of the bound (D1460): a one-member set is atom material at both spellings, and the
+// alias spelling of it has carried the atom rep all along.
 export function variantFieldLitRepMixed(a: i32, b: i32, fi: i32): boolean {
   if a < 0 || b < 0 { return false }
   if a >= uFieldCount.length || b >= uFieldCount.length { return false }
@@ -24547,20 +24603,48 @@ function litFieldRowIsAtomisable(ix: i32): boolean {
   if ix < 0 || ix >= uFieldTypes.length { return false }
   const code = uFieldTypes[ix]
   if code != 0 && code != 3 { return false }
-  tyIsLitUnion(uFieldLitTyIx[ix])
+  tyIsLitUnionOrLit(uFieldLitTyIx[ix])
 }
 
-// Do `a` and `b` differ at a field where BOTH arms carry a literal set, but the two sets rep
-// DIFFERENTLY? The one shape D1023's ruling calls legal that this emitter still cannot build,
-// separated out so the refusal can say what is actually wrong.
+// Is variant field `fi` an atom-repped literal SET in one arm and its own BASE — a plain
+// `string` — in the other? The pair the owner's amendment makes legal
+// (`{kind: K1} | {kind: string}`), and the one `variantFieldLitRepMixed` cannot serve: the
+// base arm holds an ARBITRARY string with no interned id, so the atom is the rep the two
+// CANNOT share (D1460).
 //
-// A string literal set has two reps and `nodeTyIsLitUnionAlias` is the seam: a registered
-// ALIAS (`type KC = "circle"`) is the interned i32 atom, an inline `"x" | "y"` a `(ref
-// $string)`. Put one of each in two arms of a union and the TYPES agree about everything the
-// ruling asks — same base, comparable values — while the LAYOUTS do not, so there is no
-// single heap type for the arms to share. Unifying the two reps is the litunion rep cliff and
-// a representation change; until then this pair is a capability gap, and calling it "the same
-// field names but different field types" would be false.
+// THE STRING IS THE REP THEY CAN, and it is not a new one: this pair with the set arm spelled
+// INLINE is already two code-3 rows, already discriminable as laid out, and already runs. The
+// demotion puts the alias arm where the inline spelling of it has always been.
+export function variantFieldLitRepStrMixed(a: i32, b: i32, fi: i32): boolean {
+  if a < 0 || b < 0 { return false }
+  if a >= uFieldCount.length || b >= uFieldCount.length { return false }
+  if fi < 0 || fi >= uFieldCount[a] || fi >= uFieldCount[b] { return false }
+  const ra = uFieldStart[a] + fi
+  const rb = uFieldStart[b] + fi
+  if uFieldTypes[ra] == uFieldTypes[rb] { return false }
+  if litFieldRowIsAtomisable(ra) { return litFieldRowIsPlainString(rb) }
+  if litFieldRowIsAtomisable(rb) { return litFieldRowIsPlainString(ra) }
+  false
+}
+
+// Is variant field ROW `ix` a plain `string` — the BASE a string literal set softens to?
+// THREE COLUMNS, because no one of them says it. The code alone is shared with every
+// string-slot field, the DISCRIMINANT column parts a set from a non-set, and the IDENTITY
+// column is what keeps a nominal `type Id = new string` — which also codes 3 and also carries
+// no set — from being read as the base its brand exists to be distinct from.
+function litFieldRowIsPlainString(ix: i32): boolean {
+  if ix < 0 || ix >= uFieldTypes.length { return false }
+  if uFieldTypes[ix] != 3 { return false }
+  if uFieldLitTyIx[ix] >= 0 { return false }
+  uFieldTyText[ix] == "string"
+}
+
+// Do `a` and `b` differ at a field where a literal set meets a DIFFERENT storage? Since D1050
+// and D1461 every such pair is re-laid onto one rep before this runs — the atom when both arms
+// are atom material, the string when one arm carries the base — so this is the floor's own
+// applicability test and no longer describes a program anyone can write. It stays a separate
+// predicate because the OTHER refusal beside it (arms nothing tells apart) is live, and one
+// sentence covering both said the wrong thing about this one.
 export function variantLitRepMismatch(a: i32, b: i32): boolean {
   if a < 0 || b < 0 { return false }
   if a >= uFieldCount.length || b >= uFieldCount.length { return false }
@@ -24569,17 +24653,31 @@ export function variantLitRepMismatch(a: i32, b: i32): boolean {
   while fi < uFieldCount[a] {
     const ra = uFieldStart[a] + fi
     const rb = uFieldStart[b] + fi
-    // EITHER arm carrying a set is enough, because the amendment made the BASE arm a legal
-    // partner: `{kind: K1} | {kind: string}` is a set beside its own base — legal by the
-    // ruling, and still two reps (interned atom / string ref), so it lands here too and
-    // deserves this sentence rather than the "different field types" one. The pairs where
-    // neither is a set never reach here: the checker refuses them.
     if uFieldLitTyIx[ra] >= 0 || uFieldLitTyIx[rb] >= 0 {
       if uFieldTypes[ra] != uFieldTypes[rb] { return true }
     }
     fi = fi + 1
   }
   false
+}
+
+// The NAME of the first field at which `a` and `b` disagree, for `assignTags`' floor — or ""
+// when nothing does. A floor that cannot say WHERE sends its reader to re-derive the walk it
+// just ran; the pair and the field together are the whole of what it knows (D1461).
+export function variantFirstLayoutDisagreeField(a: i32, b: i32): string {
+  if a < 0 || b < 0 { return "" }
+  if a >= uFieldCount.length || b >= uFieldCount.length { return "" }
+  if uFieldCount[a] != uFieldCount[b] { return "" }
+  let fi = 0
+  while fi < uFieldCount[a] {
+    const ra = uFieldStart[a] + fi
+    const rb = uFieldStart[b] + fi
+    if uFieldTypes[ra] != uFieldTypes[rb] { return uFieldNames[ra] }
+    if uFieldElemName[ra] != uFieldElemName[rb] { return uFieldNames[ra] }
+    if uFieldTyText[ra] != uFieldTyText[rb] { return uFieldNames[ra] }
+    fi = fi + 1
+  }
+  ""
 }
 
 // Does variant `vi` carry ANY field whose value `is` must test — i.e. is `vi` one of a set
