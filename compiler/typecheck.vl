@@ -20537,7 +20537,7 @@ function memberFloorMsg(objTy: i32, prop: string) {
       return "no field '" + prop + "' on string"
     }
   }
-  if ot is TyVar { return "" }
+  if ot is TyVar { return tpMemberFloorMsg(ot.tvName, prop) }
   // The receiver is a scalar, so `.toString` / `.toStr` on it is almost certainly the
   // MIGRATION and not a typo — `stdFmtMovedNote` says which import brings the name back.
   // Deliberately only on THIS arm: a struct missing a `.toString` field is a different
@@ -20602,7 +20602,17 @@ function memberFloorErr(objTy: i32, prop: string, ix: i32) {
       ufcsNotImportedData(prop, specs, objTy),
     )
   }
-  tErr(memberFloorMsg(objTy, prop), ix)
+  // NEVER RAISE A WORDLESS DIAGNOSTIC. `memberFloorMsg`'s "" means "this read is fine or
+  // is deferred" — a sentinel its two constraint-pin callers TEST and this one, the only
+  // one that raises, formatted unconditionally. So a rung that answered "" while its own
+  // arm went on to refuse printed `[ERROR]:`, a caret, and nothing else (D1004 / D1221).
+  // The floor below is the class's fix, not the instance's: the rung is answered too, but
+  // a future one that forgets to now costs a vague sentence rather than no sentence.
+  const msg = memberFloorMsg(objTy, prop)
+  if msg == "" {
+    return tErr("member access '." + prop + "' on " + tyToStr(objTy), ix)
+  }
+  tErr(msg, ix)
 }
 
 // D1230's SENTENCE. The fault is the missing import, so the sentence leads with it
@@ -23882,6 +23892,38 @@ function boundMemberFloorMsg(tvName: string, prop: string) {
     boundText(bAnn) +
     "` grants " +
     has
+}
+
+// EVERY type-parameter receiver's floor — `memberFloorMsg`'s `TyVar` rung, and where D1004's
+// and D1221's wordless `[ERROR]:` came from. `boundMemberFloorMsg` is the bounded half; this
+// adds the unbounded one, which had no sentence at all.
+//
+// THE RULE, AND WHERE IT IS WRITTEN: a type parameter's members come from its BOUND
+// (`docs/constraints-design.md` OQ-5, strict bodies). A generic body is checked ONCE, so
+// `x.n` needs a type the DECLARATION supplies and an unbounded `<T>` has none — which is why
+// `.length` (one type, always) and a free `self`-function (its own signature) are the two
+// members that resolve without a bound. Whether an unbounded `<T>` should instead INFER its
+// bound is an owner question on ROADMAP; this states today's rule rather than settling it.
+// The suggested spelling is measured on both rows' witnesses, not guessed.
+function tpMemberFloorMsg(tvName: string, prop: string) {
+  const bMsg = boundMemberFloorMsg(tvName, prop)
+  if bMsg != "" { return bMsg }
+  // An inference HOLE is not a declared parameter and owns no bound to add: it carries a
+  // minted `?`-name the author never wrote, and `checkMemberNode` grows its shape rather
+  // than reaching this floor. `memberFloorErr`'s own floor words it if one ever does.
+  if tvName.length == 0 { return "" }
+  if tvName[0] == '?' { return "" }
+  "no `" +
+    prop +
+    "` on `" +
+    tvName +
+    "` — `" +
+    tvName +
+    "` is a type parameter with no bound, and a parameter's members come from its bound. Declare one: `<" +
+    tvName +
+    ": { " +
+    prop +
+    ": … }>`"
 }
 
 // Would a UFCS call with `argc` explicit arguments on a receiver of type `recvTy`
