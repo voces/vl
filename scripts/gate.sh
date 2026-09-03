@@ -95,6 +95,7 @@ run "filed witnesses"          python3 scripts/check-filed-witnesses.py --strict
 # names it rather than burying it in a suite of hundreds.
 run "inventory refs"           deno test -A --no-check tests/vl_inventory_refs_test.ts
 run "conflict markers"         deno test -A --no-check tests/vl_no_conflict_markers_test.ts
+run "splice scan"              bash -c "python3 scripts/inventory/splice-scan.py --self-test >/dev/null && python3 scripts/inventory/splice-scan.py"
 run "distilled corpus"         python3 scripts/silent-sweep/distilled/regress.py build/vl-compiler.wasm
 
 # ON MASTER ONLY: the committed baseline must describe the committed seed exactly. A branch

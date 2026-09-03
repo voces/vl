@@ -38,6 +38,7 @@ one fire on a specimen whose fault is known by construction.
 import difflib
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -341,6 +342,14 @@ def main(argv):
     if bad:
         return die(f"unknown flag(s) {' '.join(sorted(bad))}\n{__doc__}")
 
+    # A spliced row (two status lines, a duplicated id, a status too far from its
+    # heading) splits into a bad file; refuse before reading a single row (#2431).
+    if mode & {"--verify", "--apply"}:
+        scan = subprocess.run([sys.executable, "scripts/inventory/splice-scan.py"],
+                              capture_output=True, text=True)
+        if scan.returncode != 0:
+            return die("splice-scan found a spliced row — fix it before splitting:\n"
+                       + scan.stdout + scan.stderr)
     plans = [Plan(s, d) for s, d in SOURCES
              if only is None or only in s or only in d]
     if not plans:
