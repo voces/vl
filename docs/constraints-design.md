@@ -11,6 +11,10 @@
 > same call shape (`{ "+"(other: self): self }`) is recorded as the direction, with the
 > self-type reference as its one open spelling question — reopen when a real API needs it.
 >
+> **AND RULED AGAIN 2026-09-03 — §7.7**: an UNBOUNDED `<T>` is an entirely open hole and
+> answers exactly as an inferred one does. That settles the line §7.6 left open and closes
+> D1004 / D1221; OQ-5's strictness is a property of BOUNDED parameters and is unchanged.
+>
 > **SHIPPED 2026-09-01 — §7 is the record.** Read it before quoting anything above it: §7.5
 > lists three things the plan did not know, two of which change what a sentence in §4/§6
 > means (UFCS satisfaction is judged where the generic BODY is written, not at the
@@ -47,11 +51,11 @@ needs operator `+`" beside field-of / return-of / element-of / guarded-alternati
 derivations (`compiler/typecheck.vl`, the derived-hole table). So the planned
 "`(a) => a + a` demands `+`" concept exists, implicitly, with no spelling.
 
-**Member demands split by spelling.** An unannotated parameter infers a demanded shape
-(`function getN(x): i32 { x.n }` accepts `{n: 3}`, refuses mismatches at the call). A
-DECLARED `<T>` refuses member access at the declaration — with an EMPTY diagnostic (filed
-as D952, whose row also records the trap: the author's likely reaction is deleting `<T>`,
-which silently changes the program's meaning).
+~~**Member demands split by spelling.**~~ **THEY NO LONGER SPLIT — §7.7 (2026-09-03).** An
+unannotated parameter infers a demanded shape (`function getN(x): i32 { x.n }` accepts
+`{n: 3}`, refuses mismatches at the call), and an unbounded DECLARED `<T>` now does the same,
+in the same words. When this was written the declared spelling refused at the declaration with
+an EMPTY diagnostic (D952, then D1004 / D1221 for the unbounded half).
 
 **A structural spelling exists for function-typed FIELDS, and UFCS does not satisfy it.**
 
@@ -422,8 +426,9 @@ boolean }` with `<T: Eq<T>>`) are not in phase 1; the inline form covers the sam
 * **Phase 2, per-site UFCS satisfaction** — needs the dispatch decision to move past
   monomorphization for the DISAGREEING instantiation pair (D1063). D1002 closed the
   unanimous-field half without moving the pass, by asking the call sites at rewrite time.
-* **D1004** — the UNBOUNDED half of the empty member-access diagnostic. Closed for a bounded
-  parameter, open by ruling for an unbounded one.
+* ~~**D1004** — the UNBOUNDED half of the empty member-access diagnostic.~~ **RULED AND
+  CLOSED 2026-09-03 — see §7.7.** An unbounded parameter is an entirely open hole, so there
+  is no member-access refusal left to word.
 * **D1005 — CLOSED 2026-09-02.** The unbounded half of the unsatisfied instantiation, closed
   the way the row prescribed: a deferred UFCS-RECEIVER constraint (`ufcsCstr*`) beside
   `memCstr*`, re-asked at both pins, guarded by field precedence asked of the SUBSTITUTED
@@ -435,3 +440,66 @@ boolean }` with `<T: Eq<T>>`) are not in phase 1; the inline form covers the sam
   `tpBoundOfName` → `boundObjRootOf` → `boundMembersOf` walk the checker now has, with the
   bound environment kept live past the body check (today it is pushed and popped inside
   `checkFuncDeclNode`) or re-derived from `fnTpBoundOf` at the query's enclosing function.
+
+### 7.7 RULED (owner, 2026-09-03): an unbounded `<T>` is an entirely open hole
+
+> **VL's banner feature is inference. An explicit generic `T` should function the same as an
+> inferred generic (hole). If `T` is not clarified, it is treated as an entirely open hole.
+> The error message shouldn't be passive aggressive.**
+
+This settles the "UNBOUNDED half … open by ruling" line §7.6 carried, and closes D1221 and
+D1004. **OQ-5 is untouched**: a BOUNDED body still uses only what its bound grants, and both
+bound rungs answer before the open-hole one, so declaring a bound is still the stricter
+spelling and still the one whose errors name a contract.
+
+**What the ruling cost to implement was routing, not inference.** The hole parameter already
+carried the whole mechanism — `function g(x) { x.tag() }` grew a demanded shape, typed the
+member off a derived hole, and refused a bad argument AT THE CALL with `argument 1: expected
+{tag: _}, got {r: f64}`. What a declared `<T>` did instead was fall past
+`checkMemberNode`'s `?`-hole branch to `memberFloorErr`. The two now meet: an unbounded
+parameter mints the same `HD_FLD` derived hole, and `substHoleTy` already resolved one
+through the generic binding, so the body needed no new machinery.
+
+**The DEMAND does not ride the hole-shape table, and that is the one real difference between
+the spellings.** `holeShape*` is keyed by hole NAME, which is unique per parameter for an
+inference hole (`?g.0`) and emphatically not for a declared one — two declarations may both
+spell theirs `T`, and a shared key would let one generic's demand refuse the other's calls.
+The demand rides the deferred `memCstr` table instead: keyed by the receiver's ARENA type,
+stamped with the owning declaration, re-asked at every pin the other eight tables are.
+
+**The message is the hole's, verbatim.** The refusal that survives is the one an ARGUMENT
+earns, not one the declaration earns — `argument 1: expected {tag: _}, got {r: f64}`, at the
+argument, byte-identical to what the un-annotated spelling of the same program prints. The
+sentence that preceded it (`… a parameter's members come from its bound. Declare one: …`) is
+what the ruling called passive aggressive: it explained a concept and prescribed an edit for
+a program that was legal. `tests/cases/constraints/unbounded-generic-matches-hole-spelling.vl`
+holds the agreement as a fixture, because a message assertion cannot.
+
+**THE MEMBER FLOOR'S REMAINING DOMAIN IS "THE ANNOTATION IS NOT A BOUND", AND IT TOOK TWO
+TRIES TO SAY SO WITHOUT ASSERTING SOMETHING FALSE.** With `<T>` routed onto the hole, the only
+receiver still reaching `tpMemberFloorMsg` is one whose bound annotation fails
+`boundObjRootOf` — and that is NOT the same as "a bound with no members". Three of its four
+sub-cases have members: a struct alias (`Circle = { r: f64 }`), a FIELD-member alias
+(`Showable = { show: () => string }`), and an undeclared name about which nothing is known;
+only `<T: i32>` has none. A named alias is a bound only when it declares METHOD members
+(OQ-1's call shape), so a field-member alias is a type with members that is still not a
+bound. The sentence is therefore `no \`other\` on \`T\` — \`Showable\` is not a bound`,
+and the RULE and the spelling that fixes it stay in the instantiation's own diagnostic —
+one fault, two anchors, no repetition.
+
+**A REAL BOUND MISSING THE MEMBER NEVER REACHED THAT RUNG and did not change.** It is
+`boundMemberFloorMsg`'s: `no \`other\` on \`T\` — its bound \`Showable\` grants
+\`show()\``, which is already the register the ruling asks for. The two rungs are pinned
+apart by `error-member-on-malformed-bound.vl`, `error-member-on-field-member-alias-bound.vl`
+(which also holds the named-vs-INLINE asymmetry: an inline `{ show: () => string }` IS a
+bound, because it is an object spelling rather than a name lookup) and OQ-5's
+`error-strict-body-member-not-in-bound.vl`.
+
+**And the ruling exposed a clause-1 defect in the OTHER direction (D1430).** The emitter's
+dispatch rewrite read `fnTyParams.length == 0` as "not generic", so the question it asks of a
+generic's call sites — does any instantiation carry this member as a FIELD? — was never asked
+for the un-annotated spelling. `function g(x) { x.tag() }` beside a `tag(self: Circle)` for a
+type `g` is never called at was `vl check` rc 0 and invalid wasm. Closed in the same change,
+and necessarily so: routing `<T>` onto a hole that miscompiles would have traded a loud
+refusal for a silent one.
+
