@@ -10419,21 +10419,18 @@ function tyEmitNameIsString(ix: i32): boolean {
   if t is TyUnion {
     const members = t.uMembers
     if members.length == 0 { return false }
-    // THE MIRROR OF THE UNION ARM, AND IT GREW BACK WITH IT (owner ruling 2026-07-29,
-    // reversing 2026-07-28). These two tests — the flattened-alias REGROUP and the
-    // per-member litunion-ALIAS lookup — are here because the render this predicts can
-    // substitute a declared alias NAME for a literal run, and a name that is not `string`
-    // makes the answer false. Both legs are back in `tyToEmitNameGo`'s union arm, so both
-    // are back here. DUAL-WRITTEN in the same slice, deliberately — the header's contract
-    // is `tyToEmitName(ix) == "string"` decided structurally, and it is a contract only if
-    // the two move together.
-    //
-    // The answer this MOVES back is exactly the mixed union whose non-lit members all
-    // render `string` (`"a" | "b" | string`, a litunion alias beside its own base): #1296
-    // rendered `string` and answered true, this build renders `K0|string` and answers
-    // false. NO CORPUS PROGRAM REACHES IT — restoring these legs moved 0 of 1,700 files on
-    // all six A/B channels, in this slice exactly as in #1296's — so it is carried as a
-    // CONTRACT obligation, not as a measured cell, and reported that way.
+    // THE MIRROR OF THE UNION ARM, AND IT GREW BACK WITH IT (owner ruling, reversing the
+    // soften). These two tests — the flattened-alias REGROUP and the per-member
+    // litunion-ALIAS lookup — are here because the render this predicts can substitute a
+    // declared alias NAME for a literal run, and a name that is not `string` makes the answer
+    // false. Both legs are back in `tyToEmitNameGo`'s union arm, so both are back here.
+    // DUAL-WRITTEN in the same slice, deliberately: the header's contract is
+    // `tyToEmitName(ix) == "string"` decided structurally, and it is a contract only if the two
+    // move together.
+    // The answer this MOVES back is exactly the mixed union whose non-lit members all render
+    // `string` (`"a" | "b" | string`, a litunion alias beside its own base). NO CORPUS PROGRAM
+    // REACHES IT — restoring these legs moved no file on any A/B channel — so it is carried as
+    // a CONTRACT obligation, not as a graded cell, and reported that way.
     const rgTexts: string[] = []
     let rgNonLit = false
     let rg = 0
@@ -10479,29 +10476,17 @@ function tyEmitNameIsString(ix: i32): boolean {
 }
 
 // THE RENDER-CONTEXT VOCABULARY — the `ctx` half of the one agreed emit renderer
-// (`renderEmit(ty, ctx)`), threaded here in phase P1 with NO consumer reading it for a
-// decision yet.
-//
+// (`renderEmit(ty, ctx)`).
 // WHY A PARAMETER AT ALL. The three producers of the emitter's type vocabulary
-// (`canonEmitName`, `tyToEmitName`, `tyToNominalName`) disagree with each other on 853 of
-// 5,172 resolvable corpus annotations, and the disagreement is TWO-DIRECTIONAL: 41 where
-// canon rewrites and the renderer does not, 108 the other way, 5 where both move
-// differently. Both answers are already right SOMEWHERE — #1124 shipped the STRUCTURAL
-// expansion for a generic application standing as a multi-member union member, while
-// #1122 measured the NOMINAL route and found it regresses `type MyCat = Cat`. The same
-// construct family sits on both sides: a litunion alias `K0` SOFTENS to `string` in a
-// direct union and is PRESERVED inside a closure result, a map value, an array element and
-// a struct field (four distinct fuzz-nightly invalid-wasm seeds are cited in
-// `tyToEmitNameGo`'s arms for exactly that), and a NULLABLE litunion is preserved by canon
-// and softened by the renderer. So the policy cannot be global — the POSITION decides, and
-// a renderer that cannot say where it is cannot state the rule. See the `renderEmit`
-// design in `docs/internals/destringify-types-program.md`.
-//
-// THE ENCODING. Powers of two, and a render carries EXACTLY ONE position bit — the
-// IMMEDIATE position it occupies in its parent — plus the sticky `RC_NULLABLE` below.
-// Bits rather than an enum because the rules these will state quantify over SETS of
-// positions ("preserved in a field, an element, a map value or a closure result"), which
-// is one `&` against a bit union.
+// (`canonEmitName`, `tyToEmitName`, `tyToNominalName`) disagree with each other on a real
+// slice of the corpus's resolvable annotations, and the disagreement is TWO-DIRECTIONAL — canon
+// rewriting where the renderer does not, and the reverse. Both answers are already right
+// SOMEWHERE: the STRUCTURAL expansion is what a generic application standing as a multi-member
+// union member needs, while the NOMINAL route regresses `type MyCat = Cat`. The same construct
+// family sits on both sides — a litunion alias SOFTENS in a direct union and is PRESERVED
+// inside a closure result, a map value, an array element and a struct field. So the policy
+// cannot be global: the POSITION decides, and a renderer that cannot say where it is cannot
+// state the rule. Bits, not an enum, because the rules quantify over SETS of positions.
 const RC_ROOT = 0        // a top-level render: no enclosing position at all
 const RC_UNION_MEM = 1   // a member of a union
 const RC_NULLABLE = 2    // under a nullable — see the STICKY note below
@@ -10513,62 +10498,18 @@ const RC_FN_PARAM = 64   // a function type's parameter
 const RC_FN_RES = 128    // a function type's result
 const RC_UNION_KEY = 256 // a member of a union being spelled as the registry KEY
 
-// `RC_NULLABLE` IS STICKY ACROSS A UNION JOIN, AND IT HAS TO BE, BECAUSE THE TWO
-// SPELLINGS PUT THE NULLABLE AT DIFFERENT DEPTHS. Structurally `A | B | null` is a
-// `TyNullable` OVER a `TyUnion`, so `A` sits two levels down; in the STRING spelling
-// `canonEmitName` splits one flat top-level `|` and `A` and `null` are siblings. A rule
-// that reads "am I under a nullable" must get the same answer from both or the one agreed
-// renderer is not one renderer. So the union arm of every producer below passes
-// `RC_UNION_MEM | (ctx & RC_NULLABLE)`, and canon's flat split re-derives the bit from a
-// `null` sibling (`partsHaveNull`). Every other bit is REPLACED at each descent: a field
-// of a struct that is itself an array element is a field, not both.
-//
-// ANCESTRY BEYOND THAT ONE STICKY BIT IS NOT MODELLED HERE, AND THE SECOND ONE THAT WAS
-// ADDED CAME BACK OUT. #1271 gave this file `RC_UNDER_FUNC` (256) — "anywhere inside a
-// function type, at any depth" — because the numeric-litunion-alias rule below could not
-// fire under a function type without breaking `(Z) => i32`:
-//
-//   type Z = 0 | 1
-//   function run(m: (Z) => i32): i32 { const v = m(1); return v }
-//   function mk(x: Z): i32 { x + 2 }
-//   print(run(mk))
-//
-// The DEFECT that bit worked around was not in this renderer. `canonEmitName` left a
-// top-level function type VERBATIM unless its result happened to be parenthesized, so the
-// annotation pipeline's key for that parameter was `(Z)=>i32` — alias name and all — while
-// `mk`'s OWN parameter annotation, an `RC_ROOT` `Z`, canon'd to `i32`. The two `$fnsig`
-// spellings of one closure forked, and a producer that softened anywhere inside a function
-// type simply moved WHICH spelling was the odd one out. Gating this renderer against
-// softening made the two AGREE on the un-softened spelling and left eight other shapes
-// (`(i32) => Z`, `(i32) => {a:Z}`, …) invalid: they fork the other way, because the thing
-// on their side of the fork is a DECLARATION whose annotations canon at `RC_ROOT`.
-//
-// So the rule is now stated once, at the place that decides it: the interior of a function
-// TYPE is CANON'D — params and result, bare result or parenthesized
-// (`canonEmitNameAt`'s function-type arm), at `RC_FN_PARAM` and `RC_FN_RES`. Those two
-// positions now agree with the `RC_ROOT` a DECLARATION's annotations canon at on EVERY rule
-// this file states, and the one exception that used to sit here is gone: `ctxKeepsLitUnion`
-// held at `RC_FN_RES` and not at `RC_ROOT`, so an INLINE `() => "a"|"b"` kept its members
-// while `function mk(): "a"|"b"` softened to `string`.
-//
-// THAT ASYMMETRY WAS A MISCOMPILE AND IT IS CLOSED. This paragraph once said it "is not
-// reachable as a miscompile — the soundness floor refuses the shape ('function-value call
-// arity has no interned signature') identically before and after, measured both ways"; the
-// floor refused it at no arity measured, and `const f: (i32) => ("a" | "b") = toAB` followed
-// by `f(1)` was `vl check` rc 0 and a module the engine would not load (`type mismatch:
-// expected i32, found (ref $type)`) — the interned signature promised the ATOM the rule
-// preserved while the declaration bound to it returned the string ref the rule softened to.
-// `ctxKeepsLitUnion` is now false at `RC_FN_RES` as well (see its own header: the three
-// surviving preserve positions are CONTAINERS, and a function RESULT is the same scalar
-// position a declaration's return annotation occupies). The whole grid runs, folded into
-// `tests/cases/literal-unions/fntype-litunion-result-controls.vl`. With that,
-// nothing under a function type needs to know it is under one — the alias softens on both
-// sides and the spellings meet. Measured: removing the bit ALONE reddens six grid cells
-// (`(Z) => i32` and `({a:Z}) => i32` through all three call forms); removing it WITH the
-// canon fix moves zero, and the canon fix takes 38 cells forward.
-//
-// Every OTHER bit is REPLACED at each descent: a field of a struct that is itself an array
-// element is a field, not both. Only `RC_NULLABLE` rides through.
+// `RC_NULLABLE` IS STICKY ACROSS A UNION JOIN, AND IT HAS TO BE, BECAUSE THE TWO SPELLINGS PUT
+// THE NULLABLE AT DIFFERENT DEPTHS. Structurally `A | B | null` is a `TyNullable` OVER a
+// `TyUnion`, so `A` sits two levels down; in the STRING spelling `canonEmitName` splits one flat
+// top-level `|` and `A` and `null` are siblings. A rule reading "am I under a nullable" must get
+// the same answer from both or the one agreed renderer is not one renderer. So every union arm
+// passes `RC_UNION_MEM | (ctx & RC_NULLABLE)` and canon's flat split re-derives the bit from a
+// `null` sibling (`partsHaveNull`). Every OTHER bit is REPLACED at each descent: a field of a
+// struct that is itself an array element is a field, not both.
+// ANCESTRY BEYOND THAT ONE STICKY BIT IS NOT MODELLED, and the second bit that was added came
+// back out. The rule it worked around is now stated where it is decided: the interior of a
+// function TYPE is CANON'D — params and result, bare or parenthesized — at `RC_FN_PARAM` and
+// `RC_FN_RES`, which agree with the `RC_ROOT` a DECLARATION's annotations canon at on every rule.
 
 // The TOP-LEVEL atom count of the name the LAST `tyToEmitName` call returned — the
 // number `unionMemberCount` would report for it, produced BY THE RENDERER instead of
@@ -10583,22 +10524,18 @@ const RC_UNION_KEY = 256 // a member of a union being spelled as the registry KE
 // programs.
 let emitNameAtoms = 1
 
-// The ANCESTOR stack of the render in progress — `isEquatable`'s `seen` guard, for the
-// renderer. A RECURSIVE type (`type Node = {v: i32, next: Node | null}`) is a CYCLE in
-// the arena, and a structural render of a cycle is an infinite string: every arm below
-// recurses into the field / element / member / result types, so without this the render
-// does not terminate and the COMPILER dies with `wasm trap: call stack exhausted`. That
-// is not hypothetical — two single-file, well-typed programs reach it on a stock build:
-// `const n: Node & {v: i32} = …` (the `&`-fold arm of `canonEmitName`) and
-// `type U = Box<Node> | {w: i32}` (`unionMemberGenAppShape`). A cyclic type simply has
-// no finite emit NAME, which is exactly what "" already means to every caller — the
-// recursive shapes the emitter does lower ride their NOMINAL annotation spelling
-// (`Node`), never a structural render, so declining here takes nothing away.
-//
-// Push/pop balanced around the recursive entry, so it holds ANCESTORS only: a shape that
-// mentions one struct TWICE as siblings (`{a: S, b: S}`) still renders both — `S` is
-// popped when the first field finishes. Not an arena-lifetime sidecar (method note 7):
-// it is empty on entry and on exit of every top-level call, by that balance.
+// The ANCESTOR stack of the render in progress — `isEquatable`'s `seen` guard, for the renderer.
+// A RECURSIVE type (`type Node = {v: i32, next: Node | null}`) is a CYCLE in the arena, and a
+// structural render of a cycle is an infinite string: every arm below recurses into the field /
+// element / member / result types, so without this the render does not terminate and the
+// COMPILER dies with `wasm trap: call stack exhausted`. That is not hypothetical — two
+// single-file, well-typed programs reach it on a stock build: `const n: Node & {v: i32} = …`
+// (canon's `&`-fold arm) and `type U = Box<Node> | {w: i32}` (`unionMemberGenAppShape`). A
+// cyclic type simply has no finite emit NAME, which is exactly what "" already means to every
+// caller — the recursive shapes the emitter does lower ride their NOMINAL annotation spelling.
+// Push/pop balanced around the recursive entry, so it holds ANCESTORS only: a shape mentioning
+// one struct TWICE as siblings (`{a: S, b: S}`) still renders both. Not an arena-lifetime
+// sidecar: it is empty on entry and on exit of every top-level call, by that balance.
 const emitNameSeen: i32[] = []
 
 // Render a RESOLVED arena type as an emitter-classifiable synthetic name, or
@@ -10616,22 +10553,17 @@ const emitNameSeen: i32[] = []
 export function tyToEmitName(ix: i32) { tyToEmitNameAt(ix, RC_ROOT) }
 
 // The same render, told the POSITION it occupies in its parent. The cycle guard lives here
-// rather than on the entry above so the RECURSIVE calls below — which are the only ones
-// that can close a cycle — keep passing through it.
-// D1021 — THE SELF-REFERENCE'S OWN NAME, when a caller knows it. The cycle guard below
-// answers "" on a revisit, which is right for an anonymous shape and wrong for a DECLARED
-// recursive alias: `type Json = … | Json[] | {[string]: Json}` has a perfectly good emitter
-// name for its self-reference — `Json` — and the emitter already handles `Json[]` and
-// `{[string]: Json}` at every position the value tree runs at. Answering "" made
-// `unionAliasMembers` decline the whole alias, so `Json | E` never flattened, the composed
-// union never registered a member table, and a return through it landed the raw struct in a
-// slot typed for the box: check-clean invalid wasm.
-//
-// ANY revisited DECLARED alias, not only the outermost one. A named composition
-// (`type JR = Json | E`) renders `Json` structurally, and the cycle then closes on `Json`
-// while the outermost name is `JR` — so keying on a single "self" index fixed the direct
-// spelling and left the named one broken. The reverse lookup runs ONLY on a cycle hit,
-// which is rare, and answers "" for an anonymous shape exactly as before.
+// rather than on the entry above so the RECURSIVE calls below — the only ones that can close a
+// cycle — keep passing through it.
+// D1021 — THE SELF-REFERENCE'S OWN NAME, when a caller knows it. The cycle guard answers "" on a
+// revisit, which is right for an anonymous shape and wrong for a DECLARED recursive alias:
+// `type Json = … | Json[] | {[string]: Json}` has a perfectly good emitter name for its
+// self-reference, and the emitter already handles `Json[]` and `{[string]: Json}` at every
+// position the value tree runs at. Answering "" made `unionAliasMembers` decline the whole
+// alias, so `Json | E` never flattened and a return through it was check-clean invalid wasm.
+// ANY revisited DECLARED alias, not only the outermost one: a named composition
+// (`type JR = Json | E`) closes its cycle on `Json` while the outermost name is `JR`. The
+// reverse lookup runs ONLY on a cycle hit, and answers "" for an anonymous shape as before.
 function aliasNameOfTyIx(ix: i32): string {
   for k in cUserTypes.keys() {
     if (cUserTypes[k] ?? -1) == ix { return k }
@@ -10718,27 +10650,18 @@ function nulFoldWrapperNameOf(ix: i32): string {
   ""
 }
 
-// The position a composite's INTERIOR stands at, for the STRUCTURAL renderer — normally
-// the interior's own position, but `RC_ROOT` when `ix` is a registered generic-APPLICATION
-// instance (`Box<"a"|"b">`).
-//
+// The position a composite's INTERIOR stands at, for the STRUCTURAL renderer — normally the
+// interior's own position, but `RC_ROOT` when `ix` is a registered generic-APPLICATION instance
+// (`Box<"a"|"b">`).
 // WHY THE EXPANSION IS A ROOT AND NOT A FIELD. Canon never sees this shape structurally: it
-// spells the annotation `Box<` + `canonEmitNameAt(arg, RC_ROOT)` + `>` and hands the
-// EXPANSION to `gaeBases`, so the emitter's row for `Box<"a"|"b">` carries whatever
-// `RC_ROOT` produced — a softened `string` field. This renderer walks the arena and sees
-// only the expanded `{v: …}`, where the argument now stands at `RC_FIELD` and the inline
-// litunion leg would keep it. That fork is invalid wasm and it was MEASURED, not feared: a
-// lambda whose inferred return is `Box<"aa"|"zz">` builds a module whose functype names the
-// atom-field row while the annotation registered the string-field one
-// (`type mismatch: expected (ref $type), found (ref $type)`, `vl check` rc 0). Teaching
-// CANON the argument's real position was built too (`canonarg`) and is worse: the same cell
-// becomes `emitProgram: ref valtype with no interned shape` and a green global moves 489 →
-// 564 bytes. Canon's own application arm says why — *"an ARGUMENT stands where the parameter
-// it binds stands, which is a position this rewrite has no way to know"* — so the renderer
-// agrees with the position canon actually used, rather than inventing a better one.
-//
-// The NOMINAL renderer needs none of this: `genAppNameOfTy` short-circuits ahead of its
-// composite arms, so an application instance never reaches them.
+// spells the annotation `Box<` + `canonEmitNameAt(arg, RC_ROOT)` + `>` and hands the EXPANSION
+// to `gaeBases`, so the emitter's row carries whatever `RC_ROOT` produced — a softened `string`
+// field. This renderer walks the arena and sees only the expanded `{v: …}`, where the argument
+// stands at `RC_FIELD` and the inline litunion leg would keep it. That fork is invalid wasm and
+// it was GRADED, not feared. Teaching CANON the argument's real position was built too and is
+// worse: canon's own application arm says why — an ARGUMENT stands where the PARAMETER it binds
+// stands, which that rewrite has no way to know — so the renderer agrees with the position canon
+// actually used. The NOMINAL renderer needs none of this: `genAppNameOfTy` short-circuits first.
 function appKidCtx(ix: i32, ctx: i32): i32 {
   if cTyIxSetHas(gaAppTyIxSet, ix) { return RC_ROOT }
   ctx
@@ -10766,19 +10689,16 @@ function tyToEmitNameGo(ix: i32, ctx: i32) {
       const members = t.uMembers
       // THE PURE INLINE LITERAL UNION KEEPS ITS MEMBERS — canon's `litUnionPreserve` /
       // `nulLitUnionPreserve` pair, mirrored off the arena. Without it every `TyLit` member
-      // below rendered its BASE (`string`) and the dedup collapsed the run to that one
-      // scalar, so an inline `{tag: "a" | "b"}` rendered `{tag:string}` while the ANNOTATION
-      // side spelled it `{tag:"a"|"b"}` — one arena type, two names, and every name-keyed
-      // registry downstream (struct layouts, `$fnsig` keys, mv slots, union rows) holds a
-      // row for each.
-      //
-      // THE TWO GATES ARE CANON'S TWO RUNGS, NOT A NEW POLICY. `nulLitUnionPreserve` fires
-      // on any top-level split holding a `null` sibling, at EVERY position; the bare form
-      // reaches `litUnionPreserve` only under `ctxKeepsLitUnion`, because a bare inline
-      // litunion at `RC_ROOT` / `RC_FN_PARAM` has no param-valtype or struct-field ladder arm
-      // (the measurement is on `ctxKeepsLitUnion` itself). Rendering it at those two
-      // positions would spell a name the emitter rejects; rendering it at neither leaves the
-      // disagreement this leg exists to close.
+      // below rendered its BASE (`string`) and the dedup collapsed the run to that one scalar,
+      // so an inline `{tag: "a" | "b"}` rendered `{tag:string}` while the ANNOTATION side
+      // spelled it `{tag:"a"|"b"}` — one arena type, two names, and every name-keyed registry
+      // downstream (struct layouts, `$fnsig` keys, mv slots, union rows) holds a row for each.
+      // THE TWO GATES ARE CANON'S TWO RUNGS, NOT A NEW POLICY. `nulLitUnionPreserve` fires on
+      // any top-level split holding a `null` sibling, at EVERY position; the bare form reaches
+      // `litUnionPreserve` only under `ctxKeepsLitUnion`, because a bare inline litunion at
+      // `RC_ROOT` / `RC_FN_PARAM` has no param-valtype or struct-field ladder arm. Rendering it
+      // at those two positions would spell a name the emitter rejects; rendering it at neither
+      // leaves the disagreement this leg exists to close.
       const luiN = litUnionInlineNameOfTy(ix)
       if luiN != "" {
         if luiHasNull {
@@ -10790,49 +10710,18 @@ function tyToEmitNameGo(ix: i32, ctx: i32) {
           return luiN
         }
       }
-      // THE MIXED-UNION PRESERVE — the OWNER'S RULING of 2026-07-29, which REVERSES the
-      // soften ruling of 2026-07-28: *"I'm reverting the softening. `K | f64` should be
-      // preserved as `K | f64` (or flattened to the constituent parts of `K | f64`).
-      // Softening to a string is just wrong as I see it."*
-      //
-      // So a string-litunion ALIAS standing as a MEMBER of a union keeps its ALIAS name:
-      // `K0 | f64` is `K0|f64`, not `string|f64`. The two legs below are the rule, and
-      // `canonEmitNameAt`'s union arm carries its MIRROR (`mixedUnionLitAliasRegroup`) so
-      // the ANNOTATION side spells the same union the same way — that mirror is what makes
-      // this a unification rather than a return to the 55-row disagreement #1296 closed.
-      //
-      // WHICH OF THE OWNER'S TWO SPELLINGS THIS IS, AND WHY. The ruling allows the ALIAS or
-      // the FLATTENED members; this is the ALIAS, chosen by measurement, not by taste. The
-      // flattened spelling `"a"|"b"|f64` is not in the EMITTER's union grammar: a union ATOM
-      // that is a single quoted literal fails `nameIsLitUnionType` (`nameIsInlineLitUnion`
-      // needs 2+ quoted atoms), so `canonLitUnionArms`, `unionHasValueAtom` and
-      // `isVariantBoxUnionAtoms` all classify it as a non-atom "other" member and the box
-      // loses its string arm. The alias spelling is the one every one of those ladders
-      // already has a leg for — it is what this renderer produced for the whole of the
-      // project's history before #1296, and the emitter consumed it.
-      //
-      // A LIT RUN WITH NO REGISTERED ALIAS STILL SOFTENS, on both producers, and that is the
-      // ruling read exactly: there is no `K` to preserve for an un-aliased inline
-      // `"a"|"b"|f64`, and softening it is the behaviour master and pre-#1296 master share.
-      // The rule is therefore "spell the run by its alias where the program gave it one".
-      //
-      // THE DATA REP DOES NOT MOVE IN EITHER DIRECTION, which is why the spelling is free to:
-      // `emitUnionCoerce`'s atom ladder classifies the incoming value by EXPRESSION
-      // (`exprString` → value-atom kind 2), never by the union's spelling, and
-      // `repCanonKey`'s union arm mix-widens the member in the ARENA before any rep key is
-      // minted. The rep key for `K0|f64` is `(string|f64)` under both rulings — see the
-      // re-derived coercion census in `docs/internals/destringify-types-program.md`.
-      //
-      // FLATTENED-alias regroup: a litunion-ALIAS member's literals flatten into sibling
-      // TyLit members (`flattenVariantsInto`: `K0 | i64` → ["64","bjtvb","tt", i64]), so
-      // the per-member alias lookup below never sees the alias and each lit softened to
-      // `string` — the widened spelling minted TWIN field/slot rows beside the
-      // annotation-spelled ones (divergent structs/mv slots — INVALID-WASM; fuzz-nightly
-      // seed 658239060 d5). In a MIXED union (at least one non-TyLit member) regroup the
-      // str-lit members into their exactly-matching registered alias, rendered at the
-      // FIRST lit's position. A PURE litunion keeps the historical `string` softening
-      // (the `canonEmitTypeNames` invariant), and a lit set matching no alias keeps the
-      // per-member path unchanged.
+      // THE MIXED-UNION PRESERVE — the OWNER'S RULING, reversing an earlier soften: a
+      // string-litunion ALIAS standing as a MEMBER of a union keeps its ALIAS name, so `K0 | f64`
+      // is `K0|f64` and not `string|f64`. `canonEmitNameAt`'s union arm carries the MIRROR
+      // (`mixedUnionLitAliasRegroup`) so the ANNOTATION side spells the same union the same way.
+      // WHICH OF THE TWO ALLOWED SPELLINGS THIS IS: the ALIAS, chosen by measurement. The
+      // FLATTENED spelling `"a"|"b"|f64` is not in the EMITTER's union grammar — a single quoted
+      // literal fails `nameIsLitUnionType`, so `canonLitUnionArms`, `unionHasValueAtom` and
+      // `isVariantBoxUnionAtoms` all classify it as a non-atom member and the box loses its
+      // string arm. A LIT RUN WITH NO REGISTERED ALIAS STILL SOFTENS, on both producers.
+      // THE DATA REP DOES NOT MOVE EITHER WAY, which is why the spelling is free to:
+      // `emitUnionCoerce` classifies by EXPRESSION, and `repCanonKey`'s union arm mix-widens the
+      // member in the ARENA before any rep key is minted. Regroup renders at the FIRST lit.
       let rgAlias = ""
       const rgTexts: string[] = []
       let rgNonLit = false
@@ -11131,36 +11020,18 @@ export function unionAliasDeclNameOfTy(ty: i32): string {
   ""
 }
 
-// The GENERIC APPLICATION arena index `ty` was produced by, rendered nominally
-// (`Box<i32>`, `Pair<i32,string>`), or "" when `ty` is not a recorded application — the
-// third leg of the `structNameOfTy` / `unionAliasDeclNameOfTy` family, over the sidecar
-// `applyGenAliasArgs` banks. First-match wins, exactly as on the two siblings; the memo
-// there makes at most one row per index anyway.
-//
-// The ARGUMENTS render through `tyToNominalNameAt` in FIELD position, so a nested
-// application (`Box<Box<i32>>`) spells in full and a declared struct argument keeps its
-// own name. The ancestor stack inside that entry is what makes the recursion safe on a
-// recursive alias — the cycle answers "" and this arm declines with it, rather than
-// producing a half-name a consumer would key on.
-//
-// The separator is `,` with no space, which is the spelling `gaeArgsTextOf` cuts on and
-// the one `canonEmitName` keeps — so an agreeing render is byte-equal, not merely
-// equivalent.
-// Does arena type `ix` REACH ITSELF — is its expansion CYCLIC?
-//
-// This is the guard the nominal short-circuit cannot do without. `type L<T> = {head: T,
-// tail: L<T>[]}` applied at `i32` mints a `TyObj` whose `tail` element IS that very index,
-// so the application has a perfectly finite nominal NAME (`L<i32>`) while its EXPANSION has
-// none. `tyToNominalNameAt`'s ancestor stack discovers that by descending into the body; a
-// head-first short-circuit returns before the descent and so never sees it, which silently
-// clears `nomNameCycle` — the bank `guardFiniteUserTypes` rejects such a program from.
-// Measured: without this guard all three `tests/cases/generics/recursive-generic-alias-*`
-// fixtures move from master's clean reject to a compiler TRAP (a wasm backtrace), because
-// the emitter is then handed a name whose shape it descends forever.
-//
-// A VISITED set (not a depth counter alone) is what makes this cheap: each reachable index
-// is expanded once, so a shared sub-shape costs once and a cycle terminates on the revisit.
-// The depth cap is a second belt for a pathologically deep acyclic type.
+// The GENERIC APPLICATION arena index `ty` was produced by, rendered nominally (`Box<i32>`,
+// `Pair<i32,string>`), or "" when `ty` is not a recorded application — the third leg of the
+// `structNameOfTy` / `unionAliasDeclNameOfTy` family, over the sidecar `applyGenAliasArgs` banks.
+// The ARGUMENTS render through `tyToNominalNameAt` in FIELD position, so a nested application
+// spells in full and a declared struct argument keeps its own name; the ancestor stack inside
+// that entry is what makes the recursion safe. The separator is `,` with no space, the spelling
+// `gaeArgsTextOf` cuts on and `canonEmitName` keeps, so an agreeing render is byte-equal.
+// Does arena type `ix` REACH ITSELF — is its expansion CYCLIC? This is the guard the nominal
+// short-circuit cannot do without: `type L<T> = {head: T, tail: L<T>[]}` at `i32` mints a `TyObj`
+// whose `tail` element IS that index, so the application has a finite nominal NAME while its
+// EXPANSION has none, and a head-first short-circuit silently clears `nomNameCycle` — the bank
+// `guardFiniteUserTypes` rejects such a program from. A VISITED set makes it cheap.
 function tyReachesSelf(ix: i32): boolean {
   if ix < 0 { return false }
   const seen: i32[] = []
@@ -11299,35 +11170,18 @@ export function genAppNameOfTy(ty: i32): string {
   ""
 }
 
-// NAME-FAITHFUL renderer (rep-adoption name-faithful-renderer slice). Like `tyToEmitName`,
-// but NOMINAL-FIRST: a TyObj that IS a registered declared struct renders as its NAME (via
-// `structNameOfTy`) and a TyUnion that IS a registered declared union alias renders as its
-// alias name (via `unionAliasDeclNameOfTy`), rather than the structural `{…}` / `A|B`
-// expansion `tyToEmitName` always produces. So an ARENA walk that renders each reachable
-// union with THIS function reproduces the name walk's exact `registerInlineUnion` keys — a
-// declared struct/union keeps the name the source annotation spelled (`tyNameOf`), never a
-// structural twin that a nominal `structIndexByName`/`isUName` lookup can't resolve. Litunion
-// aliases, nullable spelling, and grouping-paren preservation are inherited from `tyToEmitName`'s
-// arms (recursing into `tyToNominalName` for composites). Nominal-first ALSO tames recursion: a
-// named recursive struct (`type Tree = {children: Tree[]}`) short-circuits to "Tree" before its
-// self-referential field re-enters. NOTHING consumes this in emitted output yet — it is a
-// byte-identical foundation for the (deferred) arena registration walk.
-// The TOP-LEVEL atom width of the name the LAST `tyToNominalName` call returned — the
-// nominal renderer's `emitNameAtoms`, produced BY the renderer instead of re-derived by
-// scanning the finished string. Same invariant as its structural sibling: a rendered name
-// gains a top-level `|` at exactly two places (the union arm's join and the nullable arm's
-// `|null` suffix), and every other arm builds a name whose separators sit inside a grouper
-// or behind a top-level `=>` — ONE atom.
-//
-// It exists so `arrElemRender` — the ONE array-grouping home all three renderers share —
-// can be told the element's width instead of scanning the element name for a top-level
-// `|` (the display renderer's bank is `tyStrAtoms`, the third of the set). That
-// site could not convert while only ONE of the two renderers banked a width (#1191's
-// hand-off names exactly this gap: "only one of them covers `tyToNominalName`, which has no
-// bank at all").
-//
-// Not an arena-lifetime sidecar (method note 7): a scalar written on the way out of every
-// non-empty return and read by the immediate caller, never carried between programs.
+// NAME-FAITHFUL renderer. Like `tyToEmitName`, but NOMINAL-FIRST: a TyObj that IS a registered
+// declared struct renders as its NAME (`structNameOfTy`) and a TyUnion that IS a registered
+// declared union alias renders as its alias name (`unionAliasDeclNameOfTy`), rather than the
+// structural expansion `tyToEmitName` always produces. So an ARENA walk rendering each reachable
+// union with THIS function reproduces the name walk's exact `registerInlineUnion` keys — never a
+// structural twin a nominal `structIndexByName`/`isUName` lookup cannot resolve. Litunion
+// aliases, nullable spelling and grouping-paren preservation are inherited. Nominal-first ALSO
+// tames recursion: `type Tree = {children: Tree[]}` short-circuits before its field re-enters.
+// The TOP-LEVEL atom width of the name the LAST `tyToNominalName` call returned — the nominal
+// renderer's `emitNameAtoms`, produced BY the renderer instead of re-derived by scanning the
+// finished string, so `arrElemRender` (the ONE array-grouping home all three renderers share)
+// can be told the element's width. Written on every non-empty return, read by the caller.
 let nomNameAtoms = 1
 
 // The ANCESTOR stack of the nominal render in progress — `emitNameSeen`'s twin, O1 of the
@@ -11412,56 +11266,18 @@ function tyToNominalNameGo(ix: i32, ctx: i32): string {
   }
   const udn = unionAliasDeclNameOfTy(ix)
   if udn != "" {
-    // …EXCEPT a declared alias for a NUMERIC literal union (`type Z = 0 | 1`, the
-    // one-member `type One = 1`, the alias-of-an-alias `type Y = Z`), which denotes its
-    // BASE SCALAR — `i32` / `i64` / `f64`, never the alias name. The name is not a
-    // spelling the emitter's vocabulary can classify: `collectU` registers such a decl in
-    // `unNames` (a `UnionDecl` whose single variant is not a `{…}` shape is not skipped),
-    // so `isUName` claims the annotation for the `{tag, value}` UNION BOX while every READ
-    // of the value lowers as the plain scalar the checker's algebra says it is — the silent
-    // invalid wasm `numLitUnionAliasName` was written against
+    // …EXCEPT a declared alias for a NUMERIC literal union (`type Z = 0 | 1`, the one-member
+    // `type One = 1`, the alias-of-an-alias `type Y = Z`), which denotes its BASE SCALAR —
+    // `i32` / `i64` / `f64`, never the alias name. The name is not a spelling the emitter's
+    // vocabulary can classify: `collectU` registers such a decl in `unNames`, so `isUName`
+    // claims the annotation for the `{tag, value}` UNION BOX while every READ of the value
+    // lowers as the plain scalar the checker's algebra says it is — the silent invalid wasm
+    // `numLitUnionAliasName` was written against
     // (`tests/cases/literal-unions/numeric-litunion-alias.vl`).
-    //
-    // ONE RULE, ONE HOME, TWO ENTRIES. `canonEmitName` reaches it through the NAME-keyed
-    // `numLitUnionAliasName` (a `cUserTypes` lookup, then this); the renderer reaches it
-    // through the arena index it is already holding. So the two producers cannot drift, and
-    // the renderer takes the destringified route — no name, no second parse.
-    //
-    // UNCONDITIONAL IN THE POSITION, INCLUDING INSIDE A FUNCTION TYPE, and #1271's
-    // `RC_UNDER_FUNC` gate on exactly this arm is the thing that came out to make it so.
-    // The gate said "not under a function type — that region is `canonEmitName`'s VERBATIM
-    // region"; `canonEmitNameAt`'s function-type arm no longer HAS a verbatim region, so
-    // the alias softens on both sides of every `$fnsig` fork instead of on neither. See
-    // the position-bit note above for the measurement.
-    // THE STRING-LITUNION TWIN OF THIS ARM IS THE OWNER'S 2026-07-28 SOFTEN, AND IT IS
-    // BLOCKED HERE BY A DEFECT THAT IS NOT THIS RULE'S. `tyToEmitNameGo`'s union arm now
-    // spells a string-litunion ALIAS member `string`; the same soften belongs on this
-    // renderer, and the shape it takes is this short-circuit gaining
-    // `if (ctx & RC_UNION_MEM) != 0 && tyIsLitUnion(ix) { fall through }`. Built and
-    // measured: it takes B2's Lsoft class from 56 rows to 0 and B3's from 58 to 2 — and it
-    // makes ONE fuzz shape in 6,000 stop compiling, because `IsExpr.isVariant` is not in
-    // the emitter's vocabulary and master's DUPLICATE variant row was hiding that:
-    //
-    //   type K0 = "080" | "lp" | "hp"                              // fuzz seed 1000003 d6,
-    //   const v: ((i32) => {f: K0 | i64} | string)[] = [(q0) => ({f: 5000000077})]
-    //   const t0 = v[0](1)                                         // case_00039
-    //   if t0 is {f: K0 | i64} { … }
-    //   // master: registers BOTH `{f:K0|i64}` (this render) and `{f:string|i64}` (the
-    //   // canon'd annotation) as variants, and the `is` spelling matches the first.
-    //   // With the soften: one row, `{f:string|i64}`, and the raw `is` spelling matches
-    //   // nothing → `emitProgram: `is` names a type that is not a union variant`.
-    //
-    // `canonEmitTypeNames`'s `IsExpr` arm rewrites `isVariant` for a union operand through
-    // TWO partial pieces of canon already (`unionMemberGenAppShape`, the transparency
-    // render); the completion is to canon the whole spelling. That was built too, and it is
-    // NOT a small gate: `canonEmitNameAt(isVariant, RC_ROOT)` softens a bare string LITERAL
-    // test as well (`is "lhrf"` → `is string`), and past a `tyIsLitUnion` /
-    // `numLitUnionBaseName` / `tyIsNullableLitUnion` guard it still reddens four corpus
-    // files, one of them a WRONG ANSWER (`soundness/literal-is-runtime-value.vl`, RUNOUT).
-    // So the `is` spelling needs its own slice — most likely rendering the checker's banked
-    // `isVarTyIxOf` type rather than growing a fourth exclusion — and this arm waits for it.
-    // Until then this renderer stays SOURCE-FAITHFUL and the two producers agree on B1's
-    // axis only.
+    // ONE RULE, ONE HOME, TWO ENTRIES: `canonEmitName` reaches it through the NAME-keyed
+    // `numLitUnionAliasName`, the renderer through the arena index it already holds, so the two
+    // producers cannot drift. UNCONDITIONAL IN THE POSITION, function types included — the
+    // function-type region is no longer VERBATIM, so the alias softens on both sides of a fork.
     const nlb = numLitUnionBaseName(ix)
     if nlb != "" { return nlb }
     return udn
@@ -11498,21 +11314,17 @@ function tyToNominalNameGo(ix: i32, ctx: i32): string {
           return luiN
         }
       }
-      // SOURCE-FAITHFUL (alias-preserving) render: a litunion-ALIAS member keeps its alias
-      // name (`K0` in `K0 | {w:i32}`), reconstructing a flattened lit run into its registered
-      // alias via the regroup. The POSITION-DEPENDENT litunion softening (`canonEmitName`
-      // softens `K0` in a DIRECT union but keeps it inside a closure RESULT) is NOT
-      // re-implemented here — a consumer applies `canonEmitName` once over the WHOLE rendered
-      // name, where the func-type structure is visible; softening per-arm in isolation would
-      // lose that context. So this arm produces exactly the source spelling the name walk
-      // started from, and `canonEmitName(render)` reproduces the name walk's key.
-      //
+      // SOURCE-FAITHFUL (alias-preserving) render: a litunion-ALIAS member keeps its alias name
+      // (`K0` in `K0 | {w:i32}`), reconstructing a flattened lit run into its registered alias
+      // via the regroup. The POSITION-DEPENDENT litunion softening (`canonEmitName` softens `K0`
+      // in a DIRECT union but keeps it inside a closure RESULT) is NOT re-implemented here — a
+      // consumer applies `canonEmitName` once over the WHOLE rendered name, where the func-type
+      // structure is visible, and softening per-arm in isolation would lose that context. So
+      // this arm produces exactly the source spelling the name walk started from, and
+      // `canonEmitName(render)` reproduces the name walk's key.
       // IT NO LONGER MIRRORS `tyToEmitNameGo`'s UNION ARM, AND THAT IS RECORDED RATHER THAN
-      // TIDIED. That arm lost both of these legs to the owner's 2026-07-28 mixed-union
-      // soften; this one keeps them because the SOURCE-FAITHFUL property is load-bearing for
-      // one consumer that the ruling did not reach — see the blocked-soften note on the
-      // `unionAliasDeclNameOfTy` short-circuit above, which carries the fuzz shape, the two
-      // measured fix attempts and what the next slice has to do first.
+      // TIDIED: that arm lost both of these legs to the owner's mixed-union ruling, and this
+      // renderer's contract is the SOURCE spelling rather than the emit one.
       let rgAlias = ""
       const rgTexts: string[] = []
       let rgNonLit = false
@@ -11716,14 +11528,13 @@ function tyToNominalNameGo(ix: i32, ctx: i32): string {
   ""
 }
 
-// Canonicalize one inline `{…}` shape name (an object `{f:T,…}` or a map
-// `{[K]:V}`): each field/key/value type recurses through `canonEmitName`, the
-// surrounding structure is rebuilt with the parser's exact conventions (no
-// spaces), so a shape with no literal field is reproduced byte-identical.
-//
-// Takes no `ctx` of its own and needs none: it OVERRIDES the position for everything it
-// recurses into. A field is a field and a map value is a map value whatever the shape
-// itself is standing in, so the shape's own position never reaches a child.
+// Canonicalize one inline `{…}` shape name (an object `{f:T,…}` or a map `{[K]:V}`): each
+// field/key/value type recurses through `canonEmitName`, and the surrounding structure is
+// rebuilt with the parser's exact conventions (no spaces), so a shape with no literal field is
+// reproduced unchanged.
+// Takes no `ctx` of its own and needs none: it OVERRIDES the position for everything it recurses
+// into. A field is a field and a map value is a map value whatever the shape itself is standing
+// in, so the shape's own position never reaches a child.
 function canonShapeName(name: string) {
   // A map `{[K]:V}` — the OPEN, the key-end WALK and the two CUTS are the MAP-NAME
   // grammar's, at its home. This ran the same `tyGroupEndIndex` walk over the shape's
@@ -11776,24 +11587,23 @@ function canonShapeName(name: string) {
   out + "}"
 }
 
-// Rewrite one synthetic annotation name into the emitter's vocabulary (see the
-// block comment above). Structure-preserving: only literal members, `&` folds
-// and whole-name parens change; any name without those constructs is returned
-// byte-identical (the `nameNeedsCanon` fast path).
+// Rewrite one synthetic annotation name into the emitter's vocabulary (see the block comment
+// above). Structure-preserving: only literal members, `&` folds and whole-name parens change;
+// any name without those constructs is returned unchanged (the `nameNeedsCanon` fast path).
 // If `name` is a declared UNION ALIAS (`type AB = A | B`), its flattened member-set emit name
 // (`"A|B"`); "" for a struct alias / primitive / generic / unknown (which keep their own name).
 // `canonEmitName` uses this to FLATTEN a union-alias member of an OUTER union — `AB | null`
-// canonicalizes to `A | B | null`, the same name the inline `(A | B) | null` produces, which
-// the emitter's union machinery recognizes (an un-expanded alias name is not a union name, so
-// `AB | null` otherwise fell through to the i32-local default — "only i32 locals are supported").
+// canonicalizes to `A | B | null`, the same name the inline `(A | B) | null` produces, which the
+// emitter's union machinery recognizes (an un-expanded alias name is not a union name, so
+// `AB | null` otherwise fell through to the i32-local default).
 export function unionAliasMembers(name: string) {
   const ix = cUserTypes[name] ?? -1
   if ix < 0 { return "" }
   const t = T.tys[ix]
   if t is TyUnion {
-    // THE DECLARED MEMBER SPELLINGS FIRST — see `declaredStructUnionMembers`. "" from it
-    // means "not a union of declared structs", which keeps every other alias on the
-    // structural render below byte-identically.
+    // THE DECLARED MEMBER SPELLINGS FIRST — see `declaredStructUnionMembers`. "" from it means
+    // "not a union of declared structs", which keeps every other alias on the structural render
+    // below, unchanged.
     const dsm = declaredStructUnionMembers(name)
     if dsm != "" { return dsm }
     // D1021 — RENDER A SELF-REFERENCE AS THE ALIAS NAME rather than letting the cycle guard
@@ -11819,29 +11629,18 @@ export function unionAliasMembers(name: string) {
   ""
 }
 
-// The `|`-joined DECLARED member SPELLINGS of union alias `name` (`type Shape = Circle |
-// Rect` -> "Circle|Rect"), when every member names a declared STRUCT or is `null`; "" for
-// anything else.
-//
-// WHY THE SPELLING AND NOT THE RENDER. `tyToEmitNameGo`'s `TyObj` arm has no nominal rung:
-// it renders a member as its SHAPE (`{kind:string,r:f64}`) — anonymous, and with the
-// literal tag SOFTENED through the field arm. So `Shape | null` canon'd to
-// `{…}|{…}|null` and registered two ANONYMOUS shape variants unrelated to `Circle` and
-// `Rect`, while the INLINE spelling of the same type — `Circle | Rect | null` — registered
-// the real ones and ran. Two spellings of one type carrying two reps is exactly the split
-// this flatten was written to prevent, so the flatten was reintroducing it one level down.
-//
-// THE DECLARATION ALREADY HOLDS THE ANSWER (`udVariants`), which is why this asks the
-// parser rather than reverse-mapping the arena shape. `nominalNameOfObj` matches by
-// bidirectional assignability and returns the FIRST structurally-equal user type — the
-// wrong tag the moment two variants share a field set, and a `cast failure` trap rather
-// than a type error when it is wrong.
-//
-// `null` IS AN ACCEPTED MEMBER (`type N = Circle | null`) because it is what the outer
-// union spells too: the atom rides the tag, and dropping the alias here would leave that
-// spelling on the structural render for no reason. A member that is neither — a scalar, a
-// literal, a nested alias, an inline shape — returns "" for the WHOLE alias rather than a
-// partial join, so a mixed union is unchanged rather than half-rewritten.
+// The `|`-joined DECLARED member SPELLINGS of union alias `name` (`type Shape = Circle | Rect`
+// -> "Circle|Rect"), when every member names a declared STRUCT or is `null`; "" for anything
+// else.
+// WHY THE SPELLING AND NOT THE RENDER. `tyToEmitNameGo`'s `TyObj` arm has no nominal rung: it
+// renders a member as its SHAPE, anonymous and with the literal tag SOFTENED. So `Shape | null`
+// canon'd to `{…}|{…}|null` and registered two ANONYMOUS shape variants unrelated to `Circle`
+// and `Rect`, while the INLINE spelling registered the real ones and ran. Two spellings of one
+// type carrying two reps is exactly the split this flatten was written to prevent.
+// THE DECLARATION ALREADY HOLDS THE ANSWER (`udVariants`), which is why this asks the parser
+// rather than reverse-mapping the arena shape: `nominalNameOfObj` matches by bidirectional
+// assignability and returns the FIRST structurally-equal user type. `null` IS an accepted
+// member; anything else returns "" for the WHOLE alias rather than a partial join.
 function declaredStructUnionMembers(name: string) {
   let si = 0
   while si < gRootStmts.length {
@@ -11875,40 +11674,18 @@ function declaredStructUnionMembers(name: string) {
   ""
 }
 
-// True if the one-member alias BODY at SPELLING ROOT `root` is a bare type NAME (`Cat`,
-// `i32`, `null`) or a generic APPLICATION (`Box<i32>`, `Pair<i32,string>`) — the two
-// spellings that make `type N = …` a plain alias REFERENCE. Everything else a one-member
-// `UnionDecl` can carry is excluded, and each exclusion is load-bearing: an inline shape /
-// object INTERSECTION (`{a:i32}&{b:i32}`, `A & B`) must keep its alias name (the emitter
-// interns it as a named struct through `unionStructAliasShape` — expanding it would lose
-// that registration), while a list / map / function-type / literal body (`i32[]`,
-// `(i32) => i32`) is left exactly as master had it (those are rejected in the CHECKER
-// today — a clean error, not a miscompile — so widening them is a separate change with its
-// own evidence).
-//
-// **THIS ASKS THE PARSER, NOT THE STRING (D-ALIASREF).** It was a hand-written
-// identifier-RUN scanner over the member's rendered spelling — 13 character-grammar tests,
-// the largest single block of them left in this file — that re-derived "bare identifier, or
-// identifier then `<…>` closing the whole spelling" from characters the parser had just
-// concatenated. `parseVariantName` banks each member's spelling ROOT on the `UnionDecl`
-// (D-PARSETY P2, `udTsRootAt`), so the question is one array read of what the parser
-// actually saw. The owner's rule names this exact shape: *a name is a name, but a parsable
-// type? no.*
-//
-// **`TS_NULL` is in the accepted set, and that is the routing being EXACT rather than a
-// tightening dressed as a dedup.** `type X = null` renders as the four identifier
-// characters `null`, so the character scanner could not tell it from a type NAME and
-// answered true; the tree can, and answers `TS_NULL`. Dropping it here would silently make
-// one alias shape opaque — the pass-0a lesson from D-BRACEDOWN, in the other direction.
-// (`TS_ERR` is NOT accepted: its spelling is `""`, which the scanner's `length == 0` guard
-// already rejected, so the two agree.)
-//
-// A root of -1 (`tsPop` on an empty stack) answers false. Every arm of `parseTypeAtom`
-// finishes a node — including its `expect("IDENT")` recovery arm, which pushes `TS_ERR`
-// precisely so a malformed annotation still leaves exactly one root — so this is
-// unreachable from the parser as written, and measured 0/1,502 on the corpus; false is the
-// conservative answer either way (an alias that is not transparent is the pre-D-PARSETY
-// default and cannot mis-resolve a program that compiles).
+// True if the one-member alias BODY at SPELLING ROOT `root` is a bare type NAME (`Cat`, `i32`,
+// `null`) or a generic APPLICATION (`Box<i32>`) — the two spellings that make `type N = …` a
+// plain alias REFERENCE. Every exclusion is load-bearing: an inline shape / object INTERSECTION
+// must keep its alias name (the emitter interns it as a named struct through
+// `unionStructAliasShape`), while a list / map / function-type / literal body is left exactly as
+// it was — those are rejected in the CHECKER today, a clean error rather than a miscompile.
+// THIS ASKS THE PARSER, NOT THE STRING (D-ALIASREF). It was a hand-written identifier-RUN
+// scanner over the member's rendered spelling that re-derived structure from characters the
+// parser had just concatenated; `parseVariantName` banks each member's spelling ROOT on the
+// `UnionDecl` (`udTsRootAt`), so the question is one array read. `TS_NULL` is in the accepted
+// set — `type X = null` renders as four identifier characters and the scanner could not tell it
+// from a NAME. A root of -1 answers false, the conservative direction.
 function aliasRefIsPlainRoot(root: i32) {
   if root < 0 { return false }
   const k = tsKind[root]
@@ -11940,19 +11717,15 @@ function flatIndexOf(name: string) {
 }
 
 // The byte width of a SCALAR flat field type, or -1 for anything else.
-//
-// This reads the RESOLVED arena type rather than the field's spelling, which is
-// what makes a nominal newtype over a scalar (`type EntityId = new i32`) work with
-// no code for it: a brand is a second index over the SAME `Ty` payload, so
-// `is TyPrim` and `primName` answer exactly as the base answers
-// (`newtype-design.md` §3.1).
-//
-// `boolean` is deliberately ABSENT. It is an i32 at the wasm level, so 4 would be
-// the consistent answer — but C's `bool` is 1 byte, and this tier exists to match
-// foreign layouts byte-for-byte, so a `boolean` field silently occupying 4 is a
-// 3-byte drift in exactly the code whose value is byte-comparability. `flag: i32`
-// is a one-word fix and the reject says so. Widening a reject later is
-// backward-compatible; narrowing an accept is not.
+// This reads the RESOLVED arena type rather than the field's spelling, which is what makes a
+// nominal newtype over a scalar (`type EntityId = new i32`) work with no code for it: a brand is
+// a second index over the SAME `Ty` payload, so `is TyPrim` and `primName` answer exactly as the
+// base answers (`newtype-design.md` §3.1).
+// `boolean` is deliberately ABSENT. It is an i32 at the wasm level, so four would be the
+// consistent answer — but C's `bool` is one byte, and this tier exists to match foreign layouts
+// byte for byte, so a `boolean` field silently occupying four is a drift in exactly the code
+// whose value is byte-comparability. `flag: i32` is a one-word fix and the reject says so.
+// Widening a reject later is backward-compatible; narrowing an accept is not.
 function flatScalarWidth(tyIx: i32) {
   if tyIx < 0 { return -1 }
   const t = T.tys[tyIx]
@@ -11981,30 +11754,18 @@ function flatFieldTyName(fdIx: i32) {
   ""
 }
 
-// Measure every `flat type` in the program. Runs after the declaration passes have
-// filled each record's field types, so scalars can be read off the arena.
-//
-// TWO PHASES, and they are separate so that an INVALID declaration is never also
-// reported as a RECURSIVE one:
-//   A. validate + stage each declaration's fields (scalars get a width now, a
-//      nested flat record is deferred);
-//   B. a fixpoint over the staged declarations, resolving a record once every
-//      nested record it contains has resolved. Anything still unresolved when the
-//      fixpoint stops making progress is part of a CYCLE — an infinite layout —
-//      and is reported by name rather than hung on.
-// ── D1023 pass 0d: a union's arms must be tellable apart ──────────────────────────────
+// Measure every `flat type` in the program. Runs after the declaration passes have filled each
+// record's field types, so scalars can be read off the arena. TWO PHASES, separate so that an
+// INVALID declaration is never also reported as a RECURSIVE one: (A) validate + stage each
+// declaration's fields, deferring a nested flat record; (B) a fixpoint resolving a record once
+// every nested record it contains has resolved, with anything still unresolved when progress
+// stops reported BY NAME as a cycle rather than hung on.
+// —— D1023 pass 0d: a union's arms must be tellable apart ————————————————————————
 // The BASE SCALAR of a literal-set type — `TY_STR` for `"a" | "b"`, `TY_I32` / `TY_I64` /
-// `TY_F64` for a numeric set — or -1 when `ty` is not a literal set. `litBaseTy` lifted from
-// one member to the whole set.
-//
-// The base is the COMPARABILITY question the ruling asks: two arms are discriminable at a
-// field when both carry a literal set there AND the sets are comparable, which is what having
-// one base means. `{k: "a"} | {k: 1}` has a literal field in both arms and is still refused,
-// because no single compare answers across a string and an integer.
-//
-// A set is read off its FIRST member: `tyLitSetMemberLexes` has already rejected any type
-// with a non-literal member, and a set mixing bases (`"a" | 1`) takes its first member's base
-// and then fails to match the other arm — which is the refusal it should get.
+// `TY_F64` for a numeric set — or -1 when `ty` is not a literal set. `litBaseTy` lifted from one
+// member to the whole set, because the base IS the comparability question the ruling asks: two
+// arms are discriminable at a field when both carry a literal set there AND the sets are
+// comparable. A set is read off its FIRST member; `tyLitSetMemberLexes` has rejected the rest.
 function litSetBaseTy(ty: i32): i32 {
   if ty < 0 { return -1 }
   if tyLitSetMemberLexes(ty).length == 0 { return -1 }
@@ -12059,15 +11820,14 @@ function objArmsDiscriminable(a: TyObj, b: TyObj): boolean {
     const bb = litSetBaseTy(fb)
     // Both arms carry a literal set, and the sets are comparable.
     if ba >= 0 && ba == bb { return true }
-    // A LITERAL SET BESIDE ITS OWN BASE (owner's amendment, 2026-09-02). `{kind: "x" | "y"}`
-    // beside `{kind: string}` is the overlapping-set case with the second arm's set being
-    // the WHOLE base: `v is A` is `v.kind ∈ {"x","y"}`, `v is B` is true for every value of
-    // the shared shape, and `else` after `is A` narrows to B. The tag cannot answer and the
-    // value can, which is the ruling's principle line.
-    //
+    // A LITERAL SET BESIDE ITS OWN BASE (owner's amendment). `{kind: "x" | "y"}` beside
+    // `{kind: string}` is the overlapping-set case with the second arm's set being the WHOLE
+    // base: `v is A` is `v.kind ∈ {"x","y"}`, `v is B` is true for every value of the shared
+    // shape, and `else` after `is A` narrows to B. The tag cannot answer and the value can,
+    // which is the ruling's principle line.
     // The BASE has to be the one this set softens to, not merely another primitive:
-    // `{v: i32} | {v: "a" | "b"}` is a string set beside an `i32` and stays refused, which
-    // is the pair the ruling names and a different question from this one.
+    // `{v: i32} | {v: "a" | "b"}` is a string set beside an `i32` and stays refused, which is
+    // the pair the ruling names and a different question from this one.
     if ba >= 0 && tySame(fb, ba) { return true }
     if bb >= 0 && tySame(fa, bb) { return true }
     i = i + 1
@@ -12096,23 +11856,18 @@ function objArmsSameType(a: TyObj, b: TyObj): boolean {
   true
 }
 
-// THE DESIGN RULE `docs/guide/unions.md` HAS ALWAYS PROMISED, now owed by the checker
-// (D1023). VL's structural unions discriminate on the field-NAME set, so two arms sharing
-// that set need something else to part them; the ruling says a literal-typed field is that
-// something, and that a pair with none is refused. "" when `ty` is fine, or the message.
-//
+// THE DESIGN RULE `docs/guide/unions.md` HAS ALWAYS PROMISED, now owed by the checker (D1023).
+// VL's structural unions discriminate on the field-NAME set, so two arms sharing that set need
+// something else to part them; the ruling says a literal-typed field is that something, and that
+// a pair with none is refused. "" when `ty` is fine, or the message.
 // IT IS A CHECK ERROR AND NOT AN EMIT ONE BECAUSE IT IS A RULE, NOT A GAP. The emitter still
-// carries `assignTags`' `cannot be discriminated` reject and that is deliberate — a floor,
-// not a diagnosis. Every `loud emit reject` is a clause-2 violation by construction, since
-// `check` returned 0 to reach the emitter: either the program is legal and should compile, or
-// it is illegal and the CHECKER owed the diagnosis. This is the checker paying that debt.
-//
-// ONE MESSAGE PER UNION, not one per pair: a six-arm union all of one shape has fifteen bad
-// pairs and one problem. Pairwise and quadratic in the arm count, like `nomUnionRepClashMsg`.
-//
-// `spellings` is the declaration's own arm names when the caller has them and they still line
-// up index for index. `nominalStructNameOfTy` is not an option: it answers with the FIRST
-// structurally-equal user type, which is the wrong tag for exactly this population.
+// carries `assignTags`' `cannot be discriminated` reject, deliberately — a floor, not a
+// diagnosis. Every loud emit reject is a clause-2 violation by construction, since `check`
+// returned 0 to reach the emitter; this is the checker paying that debt.
+// ONE MESSAGE PER UNION, not one per pair: a six-arm union all of one shape has one problem.
+// Pairwise and quadratic in the arm count, like `nomUnionRepClashMsg`. `spellings` is the
+// declaration's own arm names when the caller has them; `nominalStructNameOfTy` is not an
+// option, since it answers with the FIRST structurally-equal user type.
 function unionDiscrimMsgNamed(ty: i32, spellings: string[]): string {
   if ty < 0 { return "" }
   const pt = T.tys[ty]
@@ -12488,28 +12243,18 @@ export function flatConstOfNameProp(name: string, prop: string) {
   v
 }
 
-// The `N.size` / `N.field` interception at the top of `checkMemberNode`, and the
-// only place the layout sidecar is READ. Answers 0 for an ordinary field access
-// (which the rest of `checkMemberNode` then handles), 1 when the node was FOLDED
-// to its constant, 2 when it reported an error, and 3 when the receiver is a live
-// type PARAMETER whose fold belongs to the monomorphizer (typed `i32` here).
-//
-// THREE GUARDS, and together they make this unreachable from any program that
-// compiles today:
-//   1. the receiver is a BARE IDENTIFIER — `TValue.size`, never `f().size`;
-//   2. the identifier does NOT resolve as a value. A local named `TValue` shadows
-//      the layout constants, and every `x.f` in an existing program has a value
-//      `x` by construction, so no existing access can be diverted;
-//   3. the identifier names a FLAT type. A declared NON-flat type gets a targeted
-//      message naming `flat` — master answers `undeclared identifier 'N'` here,
-//      which teaches nothing, and that message is the feature's discoverability
-//      path.
-//
-// The FOLD is an in-place arena rewrite to a `NumLit`, the technique
-// `desugarMatchAt` already uses for `match`. It is what keeps the emitter at zero
-// lines: by the time emit runs there is no `Member` node left to lower. It is also
-// idempotent — a second visit sees a `NumLit` and never reaches here — which
-// matters because the checker re-walks nodes in its speculative windows.
+// The `N.size` / `N.field` interception at the top of `checkMemberNode`, and the only place the
+// layout sidecar is READ. Answers 0 for an ordinary field access, 1 when the node was FOLDED to
+// its constant, 2 when it reported an error, and 3 when the receiver is a live type PARAMETER
+// whose fold belongs to the monomorphizer.
+// THREE GUARDS, and together they make this unreachable from any program that compiles today:
+// the receiver is a BARE IDENTIFIER (`TValue.size`, never `f().size`); the identifier does NOT
+// resolve as a value, so a local named `TValue` shadows the constants and no existing `x.f` can
+// be diverted; and the identifier names a FLAT type, a declared NON-flat one getting a targeted
+// message naming `flat` where master answered `undeclared identifier`.
+// The FOLD is an in-place arena rewrite to a `NumLit`, the technique `desugarMatchAt` already
+// uses. It is what keeps the emitter at zero lines, and it is idempotent — which matters
+// because the checker re-walks nodes in its speculative windows.
 function flatMemberFold(n: Member, ix: i32) {
   const obj = P.nodes[n.memObj]
   if obj is Ident {
@@ -12620,39 +12365,18 @@ function nomErasedTyIx(ix: i32) {
   cur
 }
 
-// ── unions whose arms share ONE runtime representation ──────────────────────────────
-// The diagnostic for a union two of whose members are DISTINCT to the checker but ONE
-// value shape to the emitter, or "" when every member is separable.
-//
-// A union box carries a single tag, and `emitIs` answers `x is T` by comparing it. A
-// nominal brand is minted as a SECOND arena index over the SAME `Ty` value and is ERASED
-// before the emitter runs (`canonEmitTypeNames`; `newtype-design.md` §3), so `N` and its
-// base — and two newtypes over one base — reach that tag identically. No membership
-// predicate can separate them the way #1340's separates a literal-union arm from a
-// `string` arm: a litunion member is a runtime-observable SUBSET of its base, whereas a
-// brand has no runtime witness at all. Every construction of such a union therefore
-// answers TRUE to `is` for both arms, whichever arm the value came from — measured across
-// i32/i64/f64/f32/boolean/string/array/struct bases and in local, parameter and struct-field
-// position, and the two cells that appear to survive are masked (their inverted twins,
-// built through the other arm, are wrong).
-//
-// So the union is not a type this language can represent, and the honest answer is to
-// refuse the SPELLING rather than to answer `is` wrongly. Giving the arm its own tag is
-// the escalation this declines: it requires the brand to survive into the emitter, which
-// is precisely the cost `newtype-design.md` exists to avoid.
-//
-// THE COMPARATOR IS THE MEMBER LIST'S OWN DEDUP, APPLIED ONE ERASURE DOWN, and that is
-// what bounds the rule to brands without naming them. Both member builders drop a member
-// that is `sameVariantTy` with one already kept, so every pair that reaches here is
-// already NOT mutually assignable; a pair whose ERASED forms then are can differ by
-// nothing but a brand. Index equality alone is not enough — it catches a scalar base,
-// whose name resolves to one canonical arena entry, and misses a STRUCTURAL one
-// (`new i32[]` beside `i32[]`, `new {a: i32}` beside `{a: i32}`), where each resolution
-// mints its own index over the same shape.
-//
-// INERT WITHOUT `new`: the sidecar is empty for every program that declares no newtype, so
-// this answers "" before looking at a member — a brand-free program cannot reach the
-// mutual-assignability calls below, let alone a diagnostic.
+// —— unions whose arms share ONE runtime representation ————————————————————————
+// The diagnostic for a union two of whose members are DISTINCT to the checker but ONE value
+// shape to the emitter, or "" when every member is separable.
+// A union box carries a single tag, and `emitIs` answers `x is T` by comparing it. A nominal
+// brand is a SECOND arena index over the SAME `Ty` value and is ERASED before the emitter runs
+// (`newtype-design.md` §3), so `N` and its base — and two newtypes over one base — reach that tag
+// identically. No membership predicate can separate them the way a litunion arm separates from a
+// `string` arm: a litunion member is a runtime-observable SUBSET of its base, a brand has no
+// runtime witness at all. So the union is not a type this language can represent, and the honest
+// answer is to refuse the SPELLING rather than answer `is` wrongly.
+// THE COMPARATOR IS THE MEMBER LIST'S OWN DEDUP, APPLIED ONE ERASURE DOWN, which bounds the rule
+// to brands without naming them. INERT WITHOUT `new`: the sidecar is empty, so this answers "".
 function nomUnionRepClashMsg(members: i32[]) {
   if nwTyIxs.length == 0 { return "" }
   let i = 1
@@ -12674,21 +12398,18 @@ function nomUnionRepClashMsg(members: i32[]) {
   ""
 }
 
-// Would the assignment `srcExpr : srcTy -> dstTy` succeed if the NOMINAL brands in
-// `dstTy` were ignored? True only for a syntactic scalar LITERAL source (§2.3 of
-// the design doc): a literal carries no prior identity, so it adopts whatever brand
-// the destination asks for, at whatever depth the destination wears it — a bare
-// `EntityId`, an `EntityId?` map read, an `EntityId` map value slot.
-//
-// Relaxing the WHOLE walk is safe precisely because the source is a scalar literal:
-// there is no nested value under it whose own brand could be waived along with the
-// destination's. An object / array literal is deliberately NOT admitted here — it
-// adapts element-wise through `assignableExpr`, which re-applies the brand rule to
-// every component.
-//
-// The first line is the feature's INERTNESS statement: a program with no `new`
-// declaration has an empty sidecar, so this answers `false` without doing any work
-// and nothing anywhere else in the checker can observe the newtype rules at all.
+// Would the assignment `srcExpr : srcTy -> dstTy` succeed if the NOMINAL brands in `dstTy` were
+// ignored? True only for a syntactic scalar LITERAL source (`newtype-design.md` §2.3): a literal
+// carries no prior identity, so it adopts whatever brand the destination asks for, at whatever
+// depth the destination wears it — a bare `EntityId`, an `EntityId?` map read, an `EntityId` map
+// value slot.
+// Relaxing the WHOLE walk is safe precisely because the source is a scalar literal: there is no
+// nested value under it whose own brand could be waived along with the destination's. An object
+// / array literal is deliberately NOT admitted here — it adapts element-wise through
+// `assignableExpr`, which re-applies the brand rule to every component.
+// The first line is the feature's INERTNESS statement: a program with no `new` declaration has
+// an empty sidecar, so this answers `false` without doing any work and nothing anywhere else in
+// the checker can observe the newtype rules at all.
 function nomLitAdopts(srcExpr: i32, srcTy: i32, dstTy: i32) {
   if nwTyIxs.length == 0 { return false }
   if srcExpr < 0 { return false }
@@ -12723,25 +12444,18 @@ function tyReachesBrand(ty: i32, d: i32) {
   false
 }
 
-// The expression-aware retry for a slot checked with the BARE structural
-// `assignable` — now ONE such slot, the map `.set` KEY. `assignableExpr` is where
-// every contextual coercion lives — the scalar-literal brand adoption AND the
-// object-literal field-wise adaptation, which is the one a nominal STRUCT slot
-// needs and which `nomLitAdopts` deliberately cannot supply (relaxing a whole walk
-// under an object literal would waive the brands of its field VALUES too).
-//
-// Gated on the destination actually carrying a brand, so a program with no `new`
-// — and a newtype program's brand-free slots — keep the bare structural check
-// they have today, byte for byte. Without the gate this would widen every map
-// slot to `assignableExpr`'s coercions, which is a real behaviour change and an
-// unrelated one.
-//
-// THE `.set` VALUE NO LONGER COMES HERE: that slot took the full `assignableExpr`
-// (the twin-grid slice below), which SUBSUMES this retry. The KEY deliberately did
-// not follow it — `checkIndexNode`'s map arm checks `m[k]`'s key with the bare
-// `assignable` too, so widening the key would make `.set` diverge from the
-// assignment path in the OTHER direction, which is the defect this pairing exists
-// to remove.
+// The expression-aware retry for a slot checked with the BARE structural `assignable` — now ONE
+// such slot, the map `.set` KEY. `assignableExpr` is where every contextual coercion lives: the
+// scalar-literal brand adoption AND the object-literal field-wise adaptation, which is the one a
+// nominal STRUCT slot needs and which `nomLitAdopts` deliberately cannot supply (relaxing a whole
+// walk under an object literal would waive the brands of its field VALUES too).
+// Gated on the destination actually carrying a brand, so a program with no `new` — and a newtype
+// program's brand-free slots — keep the bare structural check they have today. Without the gate
+// this would widen every map slot to `assignableExpr`'s coercions, an unrelated change.
+// THE `.set` VALUE NO LONGER COMES HERE: that slot took the full `assignableExpr`, which
+// SUBSUMES this retry. The KEY deliberately did not follow — `checkIndexNode`'s map arm checks
+// `m[k]`'s key with the bare `assignable` too, so widening the key would make `.set` diverge
+// from the assignment path in the OTHER direction, the defect this pairing exists to remove.
 function nomSlotAccepts(srcExpr: i32, srcTy: i32, dstTy: i32) {
   if nwTyIxs.length == 0 { return false }
   if srcExpr < 0 { return false }
@@ -12749,30 +12463,18 @@ function nomSlotAccepts(srcExpr: i32, srcTy: i32, dstTy: i32) {
   assignableExpr(srcExpr, srcTy, dstTy)
 }
 
-// The branded arena index for newtype `name` over base `base` — minted once per
-// (name, base) pair and reused, so `assignable`'s `src == dst` fast path still
-// fires and `resolveAnnot`'s name-keyed memo stays stable across resolutions.
-//
-// The branded index is a SECOND index over the SAME `Ty` value, not a deep copy:
-// a `TyObj` placeholder filled in pass 0b pushes into the very field arrays the
-// brand shares, so a forward reference through the newtype name sees the finished
-// shape. The NOMINAL sidecars are mirrored onto the new index for the same reason
-// — `structNameOfTy` / `unionAliasDeclNameOfTy` must answer about the brand
-// exactly as they answer about its base, or a declared struct reached through its
-// newtype name would lose its declared name in the renderers.
-// Is arena index `ty` a newtype BRAND — the second index `nwBrand` minted over a base's
-// `Ty`, rather than the base itself? The brand and its base are structurally identical by
-// construction, so no structural reader can tell them apart; this table is the only record
-// that they are different types.
-// Is `nm` the NAME of a declared newtype brand? The NAME-side reader of the same
-// `nwNames` sidecar `tyIsNewtypeBrand` reads by INDEX, and it is needed wherever a table
-// holds a brand's name beside its BASE row: `sNames[si]` is `PView` while `sTyIx[si]` is
-// the unbranded `{base: i32, length: i32}`, so the index test reads FALSE and only the
-// name carries the distinction.
-//
-// `newtype-design.md` §3 — a brand is a SECOND arena index over the same `Ty`, erased
-// before the emitter runs, so no structural reader can tell a brand from its base and
-// this sidecar is the one place the difference survives.
+// The branded arena index for newtype `name` over base `base` — minted once per (name, base)
+// pair and reused, so `assignable`'s `src == dst` fast path still fires and `resolveAnnot`'s
+// name-keyed memo stays stable across resolutions.
+// The branded index is a SECOND index over the SAME `Ty` value, not a deep copy: a `TyObj`
+// placeholder filled in pass 0b pushes into the very field arrays the brand shares, so a forward
+// reference through the newtype name sees the finished shape. The NOMINAL sidecars are mirrored
+// onto the new index for the same reason — `structNameOfTy` / `unionAliasDeclNameOfTy` must
+// answer about the brand exactly as they answer about its base.
+// `tyIsNewtypeBrand` asks the INDEX side of `nwNames`; the NAME side is needed wherever a table
+// holds a brand's name beside its BASE row (`sNames[si]` is `PView` while `sTyIx[si]` is the
+// unbranded shape, so the index test reads FALSE). `newtype-design.md` §3: a brand is erased
+// before the emitter runs, and this sidecar is the one place the difference survives.
 export function nameIsNewtypeBrand(nm: string): boolean {
   if nm == "" { return false }
   let i = 0
@@ -12828,110 +12530,18 @@ function isPlainAliasRef(name: string) {
   false
 }
 
-// True if the one-member alias `name` (arena index `ti`, already known to be a `TyUnion`)
-// denotes its member TRANSPARENTLY. Two populations, and the pair below is the WHOLE rule —
-// `nameToTy` and `singleMemberAliasTyIx` must agree exactly or the checker and the emitter
-// diverge on the same annotation:
-//   - a PRIMITIVE member (`type Id = i32`, `type Name = string`) — always transparent;
-//   - a FUNCTION member (`type F = (i32) => i32`) — always transparent; see below;
-//   - an OBJECT member reached through a plain alias REFERENCE (`type MyCat = Cat`,
-//     `type Y = Box<i32>`) — transparent, because the emitter has no named-struct route to
-//     such an alias at all: it registers `N` as a one-variant union row (`unNames`), so
-//     `isUName(N)` claims the annotation for the union BOX while the initializer lowers a
-//     plain struct — silent INVALID WASM for `type Y = Box<i32>`, and a
-//     "field access but no struct type declared" / "ref valtype with no interned shape"
-//     emit reject for `type MyCat = Cat`.
-// An object member whose body is NOT a plain reference is the canonicalized INTERSECTION
-// (`type AB = {a:i32} & {b:i32}`) — that one IS interned as a named struct
-// (`unionStructAliasShape`) and works today, so it is deliberately left opaque.
-//
-// WHY THE FUNCTION MEMBER (D-ALIASFN). An arrow-bodied `type F = (i32) => i32` is a
-// one-member `UnionDecl` like every other non-`{…}` body, so without this arm `F` denotes
-// `TyUnion[TyFunc]` — and a union is not callable. Measured on the parent commit: EVERY
-// call through an alias-spelled function type is a CHECKER error, in every position
-// (global / local / param / return / narrowed-from-nullable), with the message
-// ``called value is not a function ((i32) -> i32)`` — which reads as nonsense precisely
-// because `tyToStr` renders a one-member union as its member. Downstream, the emitter's
-// `nulCloFlag` wants `TyNullable(TyFunc)` and gets `TyNullable(TyUnion[TyFunc])`, so an
-// alias-spelled nullable closure is a clean emit REJECT as a local, a param and a return
-// (#1133's four remaining located cells). Both are one defect: the degenerate wrapper. A
-// function type has no nominal emit route to lose — there is no `unNames`/`sNames` row a
-// declared function type could resolve THROUGH — so the transparency is unconditional
-// (no `isPlainAliasRef` gate, which exists only to keep the canonicalized intersection's
-// named-struct route alive).
-//
-// WHY THE ARRAY MEMBER (D-ALIASARR), AND WHY ONLY OVER A SCALAR SPINE. `type L = i32[]` is the
-// same degenerate wrapper one arm over, and #1137 handed it on with a caution: that an array,
-// UNLIKE a function, might have a nominal emit route to lose. Measured, that caution is right
-// for EXACTLY ONE element kind and wrong for the rest — which is why the gate below is a
-// property of the ELEMENT and not of the array.
-//
-// Method: a 17-position alias-vs-inline twin table over six alias bodies (`i32[]`, `string[]`,
-// `f64[]`, `boolean[]`, `Cat[]`, `i32[][]`), 102 cells, run against a parent-built compiler and
-// against this one. On the parent, 17/17 positions differ for every body and there are 0 cells
-// where the alias spelling works and the inline spelling does not — there is no working route
-// to lose because there is no working route at all: `xs[0]` reads ``cannot index non-array
-// i32[]``, `.length`/`.push` read ``field '…' is not on every member of i32[]``, and a RETURN
-// whose result is never read builds an INVALID MODULE, the same silent-miscompile shape
-// D-ALIASFN found one arm over.
-//
-// The ONE exception is a NOMINAL element. `singleMemberAliasTyIx`'s consumers hand the member
-// to `tyToEmitNameAt`, which renders a declared struct element STRUCTURALLY — `Cat[]` becomes
-// `{n:i32}[]` — so the declared name the emitter's element tables key on is dropped. That is a
-// real route, and it is load-bearing: `type Cat = {n: i32}; type L = Cat[]` used as a UNION ARM
-// in a parameter (`f(x: L | i32)`) COMPILES AND RUNS on the parent and becomes an emit reject
-// if the render is substituted. So the arm is gated on `arrSpineIsScalar` — peel the array
-// spine and require a `TyPrim` leaf, the condition under which `tyToEmitName` is
-// name-faithful. Five of the six bodies qualify; `Cat[]` keeps the parent's behaviour exactly,
-// in both directions, and is handed off rather than forced.
-//
-// The corpus population is empty either way: 0 array-bodied aliases in the 1,314 `tests/cases`
-// files, and `singleAliasMemberTyIx` meets a one-member union over a `TyArray` 0 times in a
-// `vl check --codegen` sweep of them (against 67 `TyPrim`, 48 `TyFunc`, 41 `TyObj` and 18
-// `TyLit` members of 178 one-member unions, out of 2,551 `TyUnion` meets). So the arm cannot
-// regress anything extant and its entombment comes from new fixtures.
-//
-// WHY THE MAP MEMBER (D-ALIASMAP), AND WHY WITH NO GATE AT ALL. `type M = {[string]: i32}` is
-// the same degenerate wrapper once more, and it became spellable only at #1201 — before that
-// `parseTypeDecl` sent every `{`-leading body to the struct-field path and the declaration was a
-// hard parse error, which is why the arm above could defer it as "unobservable". The deferral
-// named its price: "it has its own twin table to build and its own value-name family to check".
-// Both were built, and BOTH ANSWERS CAME BACK DIFFERENT FROM THE ARRAY ARM'S.
-//
-// Twin table A — 41 cells: four map VALUE kinds (`i32`, `string`, `f64`, `boolean`) x eight
-// annotation POSITIONS (global, param, return, struct field, array element, `| null`, map value,
-// function-local) plus nine shape variants (index read, `.has`, map-of-map-alias, alias-of-alias,
-// `{[i32]: …}` key, closure param, closure result, union member, field read+write). Twin table B
-// — 32 cells: the four value kinds that ask the NOMINAL-render question the array arm's gate came
-// from (a declared struct `Cat`, a literal-union alias `K0`, an inline `{n:i32}` shape, `i32 |
-// null`) x the same eight positions. Every cell exists twice: once spelled through the alias and
-// once with the alias-free INLINE spelling, the two programs identical character for character
-// apart from the annotation. Graded on the RUN VALUE, not on an exit code.
-//
-// On the parent, the alias leg is 1 OK / 24 checker rejects / 16 emit rejects / 0 invalid modules
-// (table A) and 4 / 12 / 16 / 0 (table B). With this arm it is 35 / 1 / 1 / 4 and 26 / 0 / 0 / 6.
-// **Both tables land on the alias-free control's PARENT verdict in every one of their 73 cells**,
-// and the control itself is unmoved by this arm — so the alias spelling stops being a distinct
-// dialect rather than acquiring one. All five cells that ran on the parent still run.
-//
-// THE GATE THE HAND-OFF PREDICTED DOES NOT EXIST, and table B is what refutes it. #1137 handed
-// this arm on with "the gate is probably `mapValue` non-nominal", by analogy with `Cat[]`. The
-// analogy fails at the render: `tyToEmitName`'s ARRAY arm re-renders its element, so a declared
-// element's NAME is dropped and `Cat[]` has a nominal route to lose — its MAP arm emits
-// `{[K]:V}` for every value there is (and deliberately preserves a litunion-alias value), so a
-// map alias has no nominal route to lose because a map name is never a route. Measured, not
-// reasoned: `type M = {[string]: Cat}` works in six of eight positions with this arm and its two
-// failures are the inline spelling's own, on the parent, cell for cell.
-//
-// The two failing POSITIONS are array-element and map-value, and they are one PRE-EXISTING emit
-// defect that this arm merely makes reachable through the alias: a map whose value is not the
-// mono-i32 kind (`f64`, `string`, a struct, a nullable — but not `i32`, `boolean` or a litunion
-// alias) is INVALID WASM as an array element or as another map's value. All ten cells fail
-// identically with NO alias in the program on the parent, so the arm converts an emit reject
-// that was an artifact of the union box into the inline spelling's own miscompile. Loud, not
-// silent: `vl build` reports `is not a valid WebAssembly module … (this is a compiler emit bug)`
-// and exits 1. Filed for the emitter; not gated around here, because a gate would buy two cells
-// by re-breaking six and would put the alias back into a dialect of its own.
+// True if the one-member alias `name` (arena index `ti`, already known to be a `TyUnion`) denotes
+// its member TRANSPARENTLY. `nameToTy` and `singleMemberAliasTyIx` must agree exactly or the
+// checker and the emitter diverge on the same annotation. Transparent for: a PRIMITIVE member; a
+// FUNCTION member (D-ALIASFN — a union is not callable, and `nulCloFlag` wants `TyNullable(
+// TyFunc)`); an OBJECT member reached through a plain alias REFERENCE, because the emitter has no
+// named-struct route to such an alias at all and registers `N` as a one-variant union row; an
+// ARRAY member over a SCALAR spine (D-ALIASARR, gated by `arrSpineIsScalar` because
+// `tyToEmitName` re-renders an array's element and would drop a declared element NAME); and a MAP
+// member with no gate at all (D-ALIASMAP — `tyToEmitName`'s MAP arm emits `{[K]:V}` for every
+// value, so a map name is never a nominal route to lose). NOT transparent: the canonicalized
+// object INTERSECTION, which IS interned as a named struct (`unionStructAliasShape`) and works.
+// Each arm's twin table is in `docs/internals/destringify-types-program.md`.
 function singleAliasMemberTyIx(ti: i32, name: string) {
   const t = T.tys[ti]
   if t is TyUnion {
@@ -12942,28 +12552,18 @@ function singleAliasMemberTyIx(ti: i32, name: string) {
       if mt is TyFunc { return m0 }
       if mt is TyArray {
         if arrSpineIsScalar(m0) { return m0 }
-        // D-ALIASARRNOM: the NOMINAL leaf `arrSpineIsScalar` excluded, admitted through
-        // the renderer that keeps the name instead of the one that drops it. #1137's
-        // caution — "an array, UNLIKE a function, might have a nominal emit route to
-        // lose" — was right about the ROUTE and its gate was written against the only
-        // renderer that existed: `tyToEmitName` re-renders an array's element, so
-        // `Cat[]` becomes `{n:i32}[]` and the declared name the emitter's element tables
-        // key on is gone. `arrSpineIsScalar`'s own header says exactly that — it is
-        // "the exact condition under which `tyToEmitName` renders the type
-        // name-faithfully", a property of the RENDERER, not of the language.
-        //
-        // `tyToNominalName` is that renderer's name-faithful twin and it was already
-        // written, already documented correct, and had no consumer at all ("NOTHING
-        // consumes this in emitted output yet — it is a byte-identical foundation").
-        // Under it `type L = Cat[]` renders `Cat[]`, which is character for character
-        // the DIRECT spelling — the one that compiles and runs today. So the route is
-        // kept rather than lost, which is what the gate was protecting.
-        //
-        // The half this closes is the SILENT one D-ALIASARR itself measured and handed
-        // on: "a RETURN whose result is never read builds an INVALID MODULE". For a
-        // declared-struct leaf that is still true on master, and where the leaf is a
-        // union ARM it is `expected i32, found (ref $type)` — the i32-list catch-all
-        // taking a `(ref $Circle)` element, `vl check` rc 0.
+        // D-ALIASARRNOM: the NOMINAL leaf `arrSpineIsScalar` excludes, admitted through the
+        // renderer that keeps the name instead of the one that drops it. The gate was right
+        // about the ROUTE and was written against the only renderer that existed:
+        // `tyToEmitName` re-renders an array's element, so `Cat[]` becomes `{n:i32}[]` and the
+        // declared name the emitter's element tables key on is gone. `arrSpineIsScalar`'s own
+        // header says exactly that — it is the condition under which `tyToEmitName` renders
+        // name-faithfully, a property of the RENDERER and not of the language.
+        // `tyToNominalName` is that renderer's name-faithful twin: under it `type L = Cat[]`
+        // renders `Cat[]`, character for character the DIRECT spelling that compiles and runs
+        // today, so the route is KEPT rather than lost. The half this closes is the SILENT one
+        // D-ALIASARR handed on — a RETURN whose result is never read building an INVALID
+        // MODULE, and, where the leaf is a union ARM, the i32-list catch-all taking a ref.
         if arrSpineIsNominal(m0) { return m0 }
         // D-ALIASARRMAP: the MAP leaf, admitted for the reason the bare `TyMap` arm
         // directly below is admitted with NO gate — see `arrSpineIsMap`. The two arms
@@ -12987,24 +12587,18 @@ function singleAliasMemberTyIx(ti: i32, name: string) {
       if mt is TyObj {
         if isPlainAliasRef(name) { return m0 }
       }
-      // D-ALIASLU: a UNION member (`type A = K` over a litunion, `type A = U` over a
-      // declared value union, and the `new` form of either — `type NK = new K`). The
-      // degenerate wrapper once more, and for a litunion it was the LAST rep whose
-      // alias spelling was a dialect of its own: a litunion reps as an interned i32
-      // ATOM, so the union ROW this alias minted made `isUName` claim every
-      // `A`-annotated slot for the `{tag, anyref}` BOX while every READ classified
-      // from the arena and lowered the atom — `call __print_i32__` on a `(ref $box)`,
-      // i.e. INVALID WASM with `vl check` rc 0, at every position and for every use.
-      //
-      // TWO GATES, which are `transparentMemberEmitName`'s two legs read backwards:
-      //   - a DECLARED union renders as its own NAME, so nothing nominal is dropped
-      //     and the render is what canon leaves the direct spelling as. This includes
-      //     a NUMERIC litunion, whose nominal leg declines ON PURPOSE so that both
-      //     spellings get `numLitUnionAliasName`'s base scalar (`type Z = 0 | 1` is
-      //     `i32` to the emitter, never `Z`).
-      //   - an INLINE union has no declared name to drop, but its MEMBERS may — see
-      //     `unionAliasMembersFaithful`, which is #1137's `Cat[]` caution landing on
-      //     the one member kind that really does have it.
+      // D-ALIASLU: a UNION member (`type A = K` over a litunion, `type A = U` over a declared
+      // value union, and the `new` form of either). The degenerate wrapper once more, and for a
+      // litunion it was the LAST rep whose alias spelling was a dialect of its own: a litunion
+      // reps as an interned i32 ATOM, so the union ROW this alias minted made `isUName` claim
+      // every `A`-annotated slot for the `{tag, anyref}` BOX while every READ classified from
+      // the arena and lowered the atom — invalid wasm at `vl check` rc 0, at every position.
+      // TWO GATES, which are `transparentMemberEmitName`'s two legs read backwards: a DECLARED
+      // union renders as its own NAME, so nothing nominal is dropped (a NUMERIC litunion's
+      // nominal leg declines ON PURPOSE, so both spellings get `numLitUnionAliasName`'s base
+      // scalar); an INLINE union has no declared name to drop, but its MEMBERS may — see
+      // `unionAliasMembersFaithful`, which is the `Cat[]` caution landing on the one member
+      // kind that really does have a name to lose.
       if unionAliasDeclNameOfTy(m0) != "" { return m0 }
       if unionAliasMembersFaithful(m0) { return m0 }
       // D-ALIASNUL: a NULLABLE member — `type A = (K | null)`, `type A = (string | null)`,
@@ -13023,21 +12617,17 @@ function singleAliasMemberTyIx(ti: i32, name: string) {
   -1
 }
 
-// True when the emit render of UN-NAMED UNION type `ty` is NAME-FAITHFUL — the union
-// analogue of `arrSpineIsScalar`, and likewise a property of the MEMBERS rather than of
-// the wrapper. `tyToEmitNameGo`'s union arm re-renders every member, so the render
-// substitutes for the alias exactly when each member's own render is name-faithful: a
-// `TyLit` renders as its base scalar (or, for a run matching a registered alias, as that
-// litunion ALIAS) and a `TyPrim` as its own `primName`. So `("a" | "b")` and `(K | f64)`
-// qualify, and `(i32 | string)` does too.
-//
-// A DECLARED STRUCT member is the exception #1137's `Cat[]` caution predicted, and it is
-// MEASURED here rather than reasoned: with this gate absent, a one-member alias over
-// `(Cat | Dog)` renders `{n:i32}|{m:i32}`, the variant names `emitIs` dispatches on are
-// dropped, and `x is Cat` becomes `emitProgram: \`is\` receiver is not a union` — at the
-// module cell and inside a function alike, where the alias-free spelling runs. The
-// DECLARED union of the same structs is unaffected: it is claimed by the nominal leg
-// above and renders as its name.
+// True when the emit render of UN-NAMED UNION type `ty` is NAME-FAITHFUL — the union analogue of
+// `arrSpineIsScalar`, and likewise a property of the MEMBERS rather than of the wrapper.
+// `tyToEmitNameGo`'s union arm re-renders every member, so the render substitutes for the alias
+// exactly when each member's own render is name-faithful: a `TyLit` renders as its base scalar
+// (or, for a run matching a registered alias, as that litunion ALIAS) and a `TyPrim` as its own
+// `primName`. So `("a" | "b")` and `(K | f64)` qualify, and `(i32 | string)` does too.
+// A DECLARED STRUCT member is the exception the `Cat[]` caution predicted, and it is GRADED here
+// rather than reasoned: with this gate absent, a one-member alias over `(Cat | Dog)` renders
+// `{n:i32}|{m:i32}`, the variant names `emitIs` dispatches on are dropped, and `x is Cat` becomes
+// `emitProgram: \`is\` receiver is not a union` where the alias-free spelling runs. The DECLARED
+// union of the same structs is unaffected: the nominal leg above claims it.
 function unionAliasMembersFaithful(ty: i32) {
   if ty < 0 { return false }
   const t = T.tys[ty]
@@ -13063,43 +12653,18 @@ function unionAliasMembersFaithful(ty: i32) {
   false
 }
 
-// True when a ONE-MEMBER alias over NULLABLE member `ty` denotes that member — the
-// nullable arm of `singleAliasMemberTyIx`, and the arm with NO GATE ON THE INNER.
-//
+// True when a ONE-MEMBER alias over NULLABLE member `ty` denotes that member — the nullable arm
+// of `singleAliasMemberTyIx`, and the arm with NO GATE ON THE INNER.
 // `type T = (S | null)` interns `TyUnion[S?]`, so the wrapper is a NAME and not a type
-// constructor and the alias denotes `S?`. Both sides read that from here: the CHECKER
-// through `declaredTyOfName` (so `x: T` is a plain `S?`, which `nonNullTy` then peels
-// like any other niche) and the EMITTER through `singleMemberAliasTyIx`. Declining here
-// diverges them — the alias's union ROW claims the slot for the `{tag, anyref}` box
-// while every read of the value lowers the niche — which is what the two consumers'
-// notes describe and what `nonNullTy` must NEVER be taught to paper over: peeling the
-// wrapper in the narrow while this predicate still declines it is the CHECKER moving
-// alone, measured at 47 loud emit rejects and 15 check-clean-invalid-wasm cells and
-// **zero** new running programs.
-//
-// WHY NO INNER GATE, MEASURED. A 1,020-cell twin grid — 15 inners × (8 positions + 9
-// uses) × {3 alias spellings, the alias-free INLINE oracle}, graded on the RUN at both
-// runtime inputs — reads **+100 oracle-parity cells and 0 regressions** against an inner
-// gate of a primitive or litunion inner only. Every inner that gate's note called
-// structurally-rendered lands on the oracle cell for cell: an inline struct, a list, a
-// map, a generic application, a closure, a declared union, a numeric litunion, a nested
-// nullable.
-//
-// The `| null` DECLARATION fold is UNGATED for the same reason and cannot be gated
-// separately: it decides which shape a declaration INTERNS, and an inner this arm calls
-// transparent while the declaration keeps the two-member union is the same divergence one
-// layer down — `collectU` mints the alias a union ROW that no read of the value lowers as.
-// So the two questions are one question, and `annUnionTy` answers it for all four
-// spellings.
-//
-// A DECLARED STRUCT inner is the ONE residue and it is 3 axes of 17, both verdicts LOUD
-// and never a wrong answer: at a module `const` (`emitProgram: ref valtype with no
-// interned shape`), at a generic instantiation (`only i32, … parameters are supported`)
-// and as a list ELEMENT (`a nullable-{v:i32} list element has no rep`, where the inline
-// spelling rejects too). Gating it out costs 13 oracle-parity cells — including the
-// parameter-position field read this predicate exists to make work — to convert three
-// loud emit rejects into three loud check rejects, so the render's dropped struct name
-// is filed against the emitter rather than bought here.
+// constructor and the alias denotes `S?`. Both sides read that from here: the CHECKER through
+// `declaredTyOfName` (so `x: T` is a plain `S?`, which `nonNullTy` then peels like any other
+// niche) and the EMITTER through `singleMemberAliasTyIx`. Declining here diverges them — the
+// alias's union ROW claims the slot for the `{tag, anyref}` box while every read of the value
+// lowers the niche — and that is what `nonNullTy` must NEVER be taught to paper over: peeling
+// the wrapper in the narrow while this predicate declines it is the CHECKER moving alone.
+// NO INNER GATE, and the `| null` DECLARATION fold is UNGATED for the same reason: the fold
+// decides which shape a declaration INTERNS, so an inner this arm calls transparent while the
+// declaration keeps the two-member union is the same divergence one layer down.
 function nulAliasMemberFaithful(ty: i32) {
   if ty < 0 { return false }
   const t = T.tys[ty]
@@ -13167,19 +12732,16 @@ function arrSpineIsScalar(ty: i32) {
   false
 }
 
-// THE SPINE PEEL ITSELF, with the leaf test lifted out of it — the ONE walk the three
-// `arrSpineIs*` predicates share (`arrSpineIsScalar` above, `arrSpineIsNominal` and
-// `arrSpineIsMap` below). Each of them is a property of ONE leaf kind and of the renderer
-// that is faithful for it; the peel is not a property of any of them, and it would have
-// been written out a THIRD time when the map leaf was added. Returns the arena index of
-// the element reached by removing every `TyArray` layer — `ty` itself when `ty` is not an
-// array — or -1 for an absent type.
-//
-// The factoring is not free-standing tidying: it is proven behaviour-preserving by its own
-// ablation compiler. Built with `arrSpineIsMap` DEFINED and never called, it moves 0 cells
-// of the 1,200-cell D181 grid and 0 of the 1,088-cell alias-vs-inline twin table — which is
-// what says the two rewritten predicates answer exactly what their loops answered.
-//
+// THE SPINE PEEL ITSELF, with the leaf test lifted out of it — the ONE walk the `arrSpineIs*`
+// predicates share (`arrSpineIsScalar`, `arrSpineIsNominal`, `arrSpineIsMap`, `arrSpineIsObj`,
+// `arrSpineIsUnionAlias`). Each of them is a property of ONE leaf kind and of the renderer that
+// is faithful for it; the peel is not a property of any of them, and it would have been written
+// out a third time when the map leaf was added. Returns the arena index of the element reached
+// by removing every `TyArray` layer — `ty` itself when `ty` is not an array — or -1 for an absent
+// type.
+// The factoring is not free-standing tidying: it was proven behaviour-preserving by its own
+// ablation compiler, built with the new predicate DEFINED and never called, which moved no cell
+// of either grid it was graded on.
 // Bounded by the arena walk itself: an array's element is always a strictly earlier
 // construction, so the spine cannot cycle.
 function arrSpineLeafTy(ty: i32) {
@@ -13196,22 +12758,18 @@ function arrSpineLeafTy(ty: i32) {
   cur
 }
 
-// True when `ty` is an ARRAY (of arrays, of arrays…) whose LEAF element is a DECLARED
-// STRUCT — the exact condition under which `tyToNominalName` renders the type
-// name-faithfully, and `arrSpineIsScalar`'s twin one renderer over. Same walk, same
-// bound (an array's element is a strictly earlier construction, so the spine cannot
-// cycle); only the leaf test differs, which is the whole content of the distinction.
-//
-// A UNION-ALIAS leaf (`type L = Shape[]`) is deliberately NOT claimed here, and is claimed
-// by `arrSpineIsUnionAlias` instead — the FIFTH twin, D362, landed 2026-08-28. The two
-// cautions this header raised were half right: the nominal renderer does spell it
-// `Shape[]`, which is the direct spelling character for character, and the
-// numeric-litunion exception `unionAliasDeclNameOfTy` carries is REAL but already
-// discharged one layer down (`tyToNominalNameGo` softens such an alias to its base
-// scalar), so the fifth predicate needs no copy of it. What the caution got wrong is the
-// cost of waiting: the leaf sits in the arena as a one-member `TyUnion`, so ALL FOUR
-// declared-alias leaf kinds fell through all four predicates at once, and the
-// intersection one was check-clean INVALID WASM.
+// True when `ty` is an ARRAY (of arrays, of arrays…) whose LEAF element is a DECLARED STRUCT —
+// the exact condition under which `tyToNominalName` renders the type name-faithfully, and
+// `arrSpineIsScalar`'s twin one renderer over. Same walk, same bound (an array's element is a
+// strictly earlier construction, so the spine cannot cycle); only the leaf test differs, which
+// is the whole content of the distinction.
+// A UNION-ALIAS leaf (`type L = Shape[]`) is deliberately NOT claimed here, and is claimed by
+// `arrSpineIsUnionAlias` instead (D362). The two cautions this header raised were half right:
+// the nominal renderer does spell it `Shape[]`, character for character the direct spelling, and
+// the numeric-litunion exception `unionAliasDeclNameOfTy` carries is REAL but already discharged
+// one layer down (`tyToNominalNameGo` softens such an alias to its base scalar). What the
+// caution got wrong is the cost of waiting: the leaf sits in the arena as a one-member
+// `TyUnion`, so ALL FOUR declared-alias leaf kinds fell through all four predicates at once.
 function arrSpineIsNominal(ty: i32) {
   const leaf = arrSpineLeafTy(ty)
   if leaf < 0 { return false }
@@ -13219,31 +12777,17 @@ function arrSpineIsNominal(ty: i32) {
 }
 
 // True when `ty` is an ARRAY (of arrays, of arrays…) whose LEAF element is a MAP —
-// `arrSpineIsScalar`'s and `arrSpineIsNominal`'s third twin, and the ONE leaf kind for
-// which the faithfulness question has ALREADY been answered, one arm below in
-// `singleAliasMemberTyIx`: the bare `TyMap` member is claimed there with NO GATE AT ALL,
-// and D-ALIASMAP's header says why in a sentence that is about the MAP and not about the
-// wrapper — *"a map alias has no nominal route to lose because a map name is never a
-// route"*. `tyToEmitNameGo`'s map arm emits `{[K]:V}` for every value there is, so the
-// render of `{[string]: Cat}` is what canon leaves the DIRECT spelling as, and putting an
-// array layer or three on top of it does not create a name to drop: the array arm
-// re-renders its element, and the element's render is already the annotation's own
-// spelling.
-//
-// SO THE ARRAY ARM'S GATE WAS A PROPERTY OF THE LEAF AND THE MAP LEAF HAD NO ARM.
-// `arrSpineIsScalar` claims a `TyPrim` leaf (faithful under `tyToEmitName`),
-// `arrSpineIsNominal` a declared-struct leaf (faithful under `tyToNominalName`) — and a
-// MAP leaf, which is faithful under the SAME renderer as the scalar one, fell through
-// both and stayed opaque. `arrSpineIsNominal`'s header names the leaf it deliberately
-// leaves unclaimed (a union alias) and does not name this one, because nobody had asked:
-// `{[string]: T}[]` is only spellable as an alias body since #1201, and the census is the
-// first grid that crossed a container alias with a list-of-map container.
-//
-// The cost of the gap was `collectU` minting the alias a one-variant union ROW —
-// `uDeclared`, the shared `{tag, anyref}` box, and `isUName` claiming every
-// `Box1`-annotated binding for that box while the initializer lowered a list wrapper.
-// `vl check` rc 0, INVALID WASM at the `global.set` / `local.set`: **D181**, the largest
-// single rescue family in the census (2,254 silent coordinates, all at `cont=list_of_map`).
+// `arrSpineIsScalar`'s and `arrSpineIsNominal`'s third twin, and the ONE leaf kind for which the
+// faithfulness question has ALREADY been answered one arm below in `singleAliasMemberTyIx`: the
+// bare `TyMap` member is claimed there with NO GATE AT ALL, because a map alias has no nominal
+// route to lose — a map name is never a route. `tyToEmitNameGo`'s map arm emits `{[K]:V}` for
+// every value there is, so the render of `{[string]: Cat}` is what canon leaves the DIRECT
+// spelling as, and putting an array layer on top does not create a name to drop.
+// SO THE ARRAY ARM'S GATE WAS A PROPERTY OF THE LEAF AND THE MAP LEAF HAD NO ARM: the scalar
+// leaf is faithful under `tyToEmitName`, the declared-struct leaf under `tyToNominalName`, and a
+// MAP leaf — faithful under the SAME renderer as the scalar one — fell through both and stayed
+// opaque. The cost was `collectU` minting the alias a one-variant union ROW, so `isUName`
+// claimed every annotated binding for the box while the initializer lowered a list wrapper: D181.
 function arrSpineIsMap(ty: i32) {
   const leaf = arrSpineLeafTy(ty)
   if leaf < 0 { return false }
@@ -13252,50 +12796,18 @@ function arrSpineIsMap(ty: i32) {
   false
 }
 
-// True when `ty` is an ARRAY (of arrays, of arrays…) whose LEAF element is an INLINE
-// OBJECT SHAPE — the FOURTH `arrSpineIs*` twin, and the residue
-// `arrSpineIsScalar`'s header named as D188. Same walk, same bound; only the leaf test
-// differs, which is the whole content of the distinction.
-//
-// IT TAKES THE NOMINAL LEG, AND THE PREDICTION THAT IT WOULD NOT WAS BUILT AND REFUTED.
-// The reasoning that says it should not is sound as far as it goes: an inline shape has no
-// declared name to drop, so `tyToEmitName` renders `{n:i32}[]`, which is the annotation
-// character for character. Both variants were built and graded on the 322-cell
-// alias-vs-inline twin table below — `transparentMemberEmitName` falling through to
-// `tyToEmitNameAt`, and the same predicate added to its `tyToNominalNameAt` leg beside
-// `arrSpineIsNominal` / `arrSpineIsMap`. The two differ on exactly **2 of 322 cells** and
-// the nominal leg wins both: `type L = {p: Cat}[]` at an UNREAD binding and at a UNION
-// MEMBER is `emitProgram: only i32[] arrays and struct/union element arrays are supported`
-// under the structural render and RUNS under the nominal one. The reason is one rung in:
-// the shape is inline but its FIELD is a declared struct, `tyToEmitNameAt` re-renders that
-// field to `{p:{n:i32}}[]`, and the emitter's element tables key on the name canon leaves
-// the DIRECT spelling with — `{p:Cat}[]`. So the leaf's own name is not the only name an
-// array leaf can drop, and the renderer question is about the whole leaf, not its head.
-//
-// THE DECLARED-STRUCT LEAF IS EXCLUDED, and it has to be even though `arrSpineIsNominal`
-// is tested first. The two predicates are read INDEPENDENTLY by
-// `transparentMemberEmitName`, which has no ordering to lean on: were this one to answer
-// true for a `Cat` leaf, the `||` there would still hand `Cat[]` to the nominal renderer
-// (the left disjunct wins) but the predicate itself would have stopped being a statement
-// about ONE leaf kind, which is the property the whole family is built on. `structNameOfTy`
-// is the same test `arrSpineIsNominal` makes, read the other way round.
-//
-// THE CANONICALIZED INTERSECTION IS NOT CLAIMED HERE, AND THIS HEADER SAID THE OPPOSITE
-// UNTIL D362 MEASURED IT. It read: *"`type AB = {a:i32} & {b:i32}` interns as a NAMED
-// struct (`unionStructAliasShape`), so `structNameOfTy` answers `AB` for it and the
-// exclusion above sends `type L = AB[]` to `arrSpineIsNominal` — not here."* At an ARRAY
-// LEAF neither half holds. `structNameOfTy(leaf)` answers `""`, so `arrSpineIsNominal`
-// declines too, and the leaf's own arena entry is a one-member `TyUnion` — the alias
-// declaration's wrapper — whose INNER member is an ANONYMOUS `TyObj`. Had that wrapper
-// been peeled, this predicate and not the nominal one would have taken it. Neither did,
-// and `type AB = …; type L = AB[]; const _sp1: L = []` was `vl check` rc 0 and a module
-// the engine refuses. `arrSpineIsUnionAlias` is the arm that claims it: the leaf's
-// `unionAliasDeclNameOfTy`, which is what the arena actually holds.
-//
-// The bare `TyObj` arm's `isPlainAliasRef` gate one arm below is still the syntactic
-// hand-off it always was — there the gate is syntactic because the arena cannot tell an
-// intersection from a plain reference. That much of the old paragraph was about a
-// DIFFERENT arm and remains true.
+// True when `ty` is an ARRAY (of arrays, of arrays…) whose LEAF element is an INLINE OBJECT
+// SHAPE — the FOURTH `arrSpineIs*` twin, the residue `arrSpineIsScalar`'s header named as D188.
+// Same walk, same bound; only the leaf test differs.
+// IT TAKES THE NOMINAL LEG, AND THE PREDICTION THAT IT WOULD NOT WAS BUILT AND REFUTED. The
+// reasoning that says it should not is sound as far as it goes — an inline shape has no declared
+// name to drop — but the leaf's own name is not the only name an array leaf can drop:
+// `type L = {p: Cat}[]` has a FIELD that names a declared struct, `tyToEmitNameAt` re-renders it
+// to `{p:{n:i32}}[]`, and the emitter's element tables key on the name canon leaves the DIRECT
+// spelling with. The renderer question is about the whole leaf, not its head.
+// THE DECLARED-STRUCT LEAF IS EXCLUDED even though `arrSpineIsNominal` is tested first: the two
+// are read INDEPENDENTLY by `transparentMemberEmitName`, and each must stay a statement about
+// ONE leaf kind. The canonicalized INTERSECTION is `arrSpineIsUnionAlias`'s (D362).
 function arrSpineIsObj(ty: i32) {
   const leaf = arrSpineLeafTy(ty)
   if leaf < 0 { return false }
@@ -13304,39 +12816,18 @@ function arrSpineIsObj(ty: i32) {
   false
 }
 
-// True when `ty` is an ARRAY (of arrays, of arrays…) whose LEAF element is ITSELF A
-// DECLARED ALIAS — the FIFTH and last `arrSpineIs*` twin, and the residue
-// `arrSpineIsNominal`'s header named by hand: *"a UNION-ALIAS leaf (`type L = Shape[]`)
-// is deliberately NOT claimed here."* Same walk, same bound; only the leaf test differs.
-//
-// THE LEAF IS A `TyUnion`, NOT A `TyObj`, AND THAT IS WHY FOUR LEAF KINDS FELL THROUGH
-// FOUR PREDICATES. `parseTypeDecl` encodes every non-struct-bodied `type N = …` as a
-// one-member `UnionDecl`, so a declared alias standing at an array leaf is in the arena
-// as a `TyUnion` carrying the alias's registered name — never as the leaf's own
-// constructor. A `reach=1 ans=0` probe at `singleAliasMemberTyIx`'s array arm reads the
-// same row for all four kinds (`leaf=TyUnion struct=[] uname=[<the alias>] ans=0`):
-// a string litunion `K0`, a numeric litunion `Z`, a declared value union `U1`, and a
-// canonicalized INTERSECTION `AB` (`{a:i32} & {b:i32}`).
-//
-// **`arrSpineIsObj`'s HEADER CLAIMED THE INTERSECTION AND THE CLAIM IS FALSE HERE.** It
-// says `type AB = {a:i32} & {b:i32}` "interns as a NAMED struct (`unionStructAliasShape`),
-// so `structNameOfTy` answers `AB` for it and the exclusion above sends `type L = AB[]`
-// to `arrSpineIsNominal`". At an array LEAF neither half holds: `structNameOfTy` answers
-// `""`, so `arrSpineIsNominal` declines, and the leaf's inner member is an ANONYMOUS
-// `TyObj` — had the one-member wrapper been peeled, `arrSpineIsObj` and not
-// `arrSpineIsNominal` would have taken it. That gap is the ONE SILENT cell in the
-// 322-cell alias-vs-inline twin grid: `type AB = …; type L = AB[]; const _sp1: L = []`
-// is `vl check` rc 0 and a module the engine refuses (`type mismatch: expected
-// (ref $type), found (ref $type)`) — D181's landing at the leaf kind D181's fix and
-// D188's both left unclaimed, and it needs NO twin binding to reach.
-//
-// THE GATE IS `unionAliasDeclNameOfTy` UNGATED, WHICH IS THE D-ALIASLU ARM'S OWN FIRST
-// GATE ONE CONSTRUCTOR OUT. The numeric-litunion exception `arrSpineIsNominal`'s header
-// worried about is real and is ALREADY DISCHARGED BY THE RENDERER: `tyToNominalNameGo`
-// short-circuits a declared alias for a numeric literal union to its BASE SCALAR
-// (`numLitUnionBaseName`), so `type Z = 0 | 1; type L = Z[]` renders `i32[]` — the
-// direct spelling canon leaves, character for character — and not `Z[]`. Repeating the
-// exception here would be a second copy of a rule that has one home.
+// True when `ty` is an ARRAY (of arrays, of arrays…) whose LEAF element is ITSELF A DECLARED
+// ALIAS — the FIFTH and last `arrSpineIs*` twin, and the residue `arrSpineIsNominal`'s header
+// named by hand. Same walk, same bound; only the leaf test differs.
+// THE LEAF IS A `TyUnion`, NOT A `TyObj`, AND THAT IS WHY FOUR LEAF KINDS FELL THROUGH FOUR
+// PREDICATES. `parseTypeDecl` encodes every non-struct-bodied `type N = …` as a one-member
+// `UnionDecl`, so a declared alias standing at an array leaf is in the arena as a `TyUnion`
+// carrying the alias's registered name, never as the leaf's own constructor — a string litunion,
+// a numeric litunion, a declared value union and a canonicalized INTERSECTION all read the same
+// row. The intersection is the one that was SILENT: `type L = AB[]` was `vl check` rc 0 over a
+// module the engine refuses (D181's landing at the leaf kind D181 and D188 both left unclaimed).
+// THE GATE IS `unionAliasDeclNameOfTy` UNGATED: the numeric-litunion exception is ALREADY
+// DISCHARGED BY THE RENDERER (`tyToNominalNameGo` softens `type Z = 0 | 1` to its base scalar).
 function arrSpineIsUnionAlias(ty: i32) {
   const leaf = arrSpineLeafTy(ty)
   if leaf < 0 { return false }
@@ -13344,51 +12835,17 @@ function arrSpineIsUnionAlias(ty: i32) {
 }
 
 // The ARENA TYPE a declared one-member union ALIAS denotes TRANSPARENTLY (`type Id = i32`,
-// `type Name = string`, `type Y = Box<i32>`, `type M = {[string]: i32}`), or -1 when `name`
-// is not such an alias (`singleAliasMemberTyIx` is the rule). Such an alias denotes its
-// member, so the emitter resolves it to the member's own vocabulary rather than registering
-// a one-variant union box.
-//
-// A TYPE INDEX, not a NAME, and that is renderEmit P4 (route (3) of #1199's six
-// transformations). Its `singleMemberAliasName` predecessor RENDERED here
-// (`tyToEmitName(m)`) and canon then fed the render straight back into its own string
-// rewriter — `canonEmitNameAt(sma, ctx)` — which is W9's whole thesis in one line: *the
-// checker re-parsing a name it had just rendered*. The two consumers below now render the
-// member ONCE, at the position it stands in, and nothing re-parses the answer.
-//
-// The substitution is EXACT rather than similar, and it was measured before it was made: a
-// site comparator computing BOTH legs at every reach read **0 disagreements in 129 reaches**
-// — 124 at this arm (positions `RC_ROOT` 87, `RC_UNION_MEM|RC_NULLABLE` 16, `RC_UNION_MEM` 6,
-// `RC_MAP_VAL` 6, `RC_ELEM` 5, `RC_FIELD` 4) and 5 at the `is`-variant site — on the VALUE
-// and on the atom WIDTH bank alike. The re-canon was a no-op at this arm for every input the
-// corpus can produce, which is the honest shape of this phase: **P4 does not move an answer,
-// it moves who decides it.**
-//
-// THE POPULATION IS CORPUS-ONLY, AND THAT IS MEASURED RATHER THAN ASSUMED. The same
-// comparator reads **0 reaches over 9,600 generated fuzz programs** (`scripts/fuzzgen.vl`
-// mints declared STRUCTS, never a one-member `type N = …` alias) and **0 over the compiler's
-// own 29 modules, `std` and `scripts`**. Fuzz is COVERAGE for this arm, not agreement — the
-// distinction #1207 had to draw for its own second target, and it is why the graded channel
-// here is the corpus A/B, where cutting the arm reddens 21 rows and cutting the `is` site 2.
-//
-// NOMINAL-vs-STRUCTURAL was load-bearing and IS NO LONGER — the paragraph below is kept
-// because the fix is the row it names. Resolving a declared-struct member to its declared NAME
-// (`type MyCat = Cat` → "Cat", via `structNameOfTy`) looked strictly better — it keeps nominal
-// identity — and it REGRESSED both `type MyCat = Cat` and `type Y = B` to `emitProgram: ref
-// valtype with no interned shape`. The reason is the very row this fix routed around: the
-// emitter's `collectU` registered the one-member alias as a union (its variant `Cat` is not a
-// `{…}` shape, so `unionStructAliasShape` did not skip it) and PUSHED `Cat` into `uVariants` —
-// so the name `Cat` classified as a union VARIANT box, not a plain struct. The named route was
-// poisoned; the inline shape was the one that resolved.
-//
-// THAT ROW IS GONE. Under this ruling `MyCat` is not a union — it denotes `Cat` — so the row
-// was never owed, and `collectU` now skips it (`isTransparentAlias`, below). The OBJECT arm
-// therefore renders NOMINALLY (`transparentMemberEmitName`, below), and the entombment is the
-// pair of sabotages that reproduce this paragraph and its mirror: restoring the row is
-// `ref valtype with no interned shape` on `types/struct-alias-transparent.vl`, and keeping the
-// row's absence with the STRUCTURAL render is `only i32, …, or string parameters are supported`
-// on the same file. Every other arm (`TyPrim` / `TyFunc` / `TyArray` / `TyMap`) renders exactly
-// as before.
+// `type Y = Box<i32>`, `type M = {[string]: i32}`), or -1 when `name` is not such an alias
+// (`singleAliasMemberTyIx` is the rule). Such an alias denotes its member, so the emitter
+// resolves it to the member's own vocabulary rather than registering a one-variant union box.
+// A TYPE INDEX, not a NAME, and that is renderEmit P4. Its `singleMemberAliasName` predecessor
+// RENDERED here and canon then fed the render straight back into its own string rewriter — the
+// checker re-parsing a name it had just rendered. The two consumers below now render the member
+// ONCE, at the position it stands in, and nothing re-parses the answer. P4 does not move an
+// answer, it moves who decides it: a site comparator computing BOTH legs at every reach read no
+// disagreements at all. NOMINAL-vs-STRUCTURAL was load-bearing and IS NO LONGER — resolving a
+// declared-struct member to its declared NAME regressed only while `collectU` still minted the
+// alias a poison union row, and under this ruling that row was never owed (`isTransparentAlias`).
 function singleMemberAliasTyIx(name: string) {
   if !cUserTypes.has(name) { return -1 }
   const ti = cUserTypes[name] ?? -1
@@ -13397,86 +12854,33 @@ function singleMemberAliasTyIx(name: string) {
 }
 
 // True when the DECLARED name `name` is a TRANSPARENT one-member alias — `singleAliasMemberTyIx`
-// claims it, in ANY of its arms (`type MyCat = Cat`, `type Y = Box<i32>`, `type Id = i32`,
-// `type F = (i32) => i32`, `type L = i32[]`, `type M = {[string]: i32}`). The object arm is
-// gated there on `isPlainAliasRef`, so the canonicalized intersection (`type AB = {a} & {b}`)
-// is NOT claimed by any of this.
-//
-// EXPORTED FOR `collectU`'S SKIP, AND THAT SKIP IS THE POISON #1122's RULING NAMES. The note
-// over `singleMemberAliasTyIx` records why the transparent member had to render STRUCTURALLY
-// rather than as its declared NAME: routing `type MyCat = Cat` to "Cat" regressed to
-// `ref valtype with no interned shape`, *because* `collectU` registered the alias as a
-// one-variant union and pushed `Cat` into `uVariants`, so the NAME classified as a union
-// VARIANT box. That row is not a fact about the language — under that very ruling `MyCat` is
-// not a union at all, it DENOTES `Cat` — so the emitter stops minting it, and the nominal
-// route it was poisoning comes back.
-//
-// THE GATE USED TO BE THE `TyObj` ARM ALONE, AND ITS PRICE WAS THE EMPTY ROW'S BOX. #1308
-// claimed only the object arm, reasoning that a `TyPrim` / `TyFunc` / `TyArray` / `TyMap`
-// member is not an `isStructAtom`, so its alias row carries ZERO variants and poisons no name.
-// True about `uVariants` and WRONG about the row: an empty row still sets `uDeclared`, which
-// mints the shared union box `(struct (field i32) (field anyref))` — plus the value-atom boxes
-// `markValueUnionAtoms` hangs off it, the ref-array slots `markRefArrayArms` does, and the map
-// slots `markMapUnionArms` does — for a program that HAS NO UNION. Dropping the gate moves 37
-// corpus files, every one of them SMALLER, **-437 bytes**, with check / check-msg / build-rc /
-// RUN identical on all 1,707; 26 of the 37 lose exactly that box and 36 lose at least one heap
-// type. Its widening-guard sweep is 19 member kinds x 17 positions x {alias, alias-free
-// control} = 608 cells graded on the RUN: **0 cells move**, while the same grid rebuilt on the
-// MODULE reaches 140 cells (every widened kind, no unclaimed kind), all 140 smaller, and the
-// inverted control — this predicate answering false, i.e. #1308 reverted — reddens 11 of them
-// (2 silent invalid wasm). So the grid can see this population and reads zero for the widening.
+// claims it, in ANY of its arms. The object arm is gated there on `isPlainAliasRef`, so the
+// canonicalized intersection (`type AB = {a} & {b}`) is NOT claimed by any of this.
+// EXPORTED FOR `collectU`'S SKIP, AND THAT SKIP IS THE POISON THE RULING NAMES. Routing
+// `type MyCat = Cat` to "Cat" regressed to `ref valtype with no interned shape` *because*
+// `collectU` registered the alias as a one-variant union and pushed `Cat` into `uVariants`, so
+// the NAME classified as a union VARIANT box. That row is not a fact about the language — under
+// that ruling `MyCat` DENOTES `Cat` — so the emitter stops minting it and the nominal route it
+// was poisoning comes back.
+// THE GATE USED TO BE THE `TyObj` ARM ALONE, AND ITS PRICE WAS THE EMPTY ROW'S BOX: an empty row
+// still sets `uDeclared`, which mints the shared union box plus the value-atom, ref-array and
+// map slots hung off it, for a program that HAS NO UNION. Dropping the gate only shrinks modules.
 export function isTransparentAlias(name: string) {
   singleMemberAliasTyIx(name) >= 0
 }
 
 // The emit SPELLING of a transparent alias's member — the ONE producer read by both the
-// annotation rewriter (`canonEmitNameTs`) and the `is` rewriter. D-ISALIAS is the reason it
-// is one function and not two call sites: those two spell the union's VARIANT and the test
-// that names it, and a divergence between them is `is` naming a variant the emitter does not
-// have (an emit reject for the object arm, an INVALID MODULE for the scalar and array arms).
-//
-// NOMINAL-FIRST FOR AN OBJECT MEMBER, WHICH IS THE HALF #1122 COULD NOT HAVE. That ruling
-// BUILT the declared-NAME render, measured it regressing `type MyCat = Cat` to
-// `ref valtype with no interned shape`, and named the cause in the same paragraph: `collectU`
-// minted the alias as a one-variant union and pushed the member's own name into `uVariants`.
-// The consequence is one rung further on, in `collectS`, and it is what the measurement
-// actually saw: that pass skips a `TypeDecl` whose name `variantIndexOf` claims, so the poison
-// row stopped `Cat` from interning as a standalone STRUCT, and the only interned spelling left
-// was the inline shape `collectAnnShapes` put there. With the row gone (`isTransparentAlias`
-// above, read by `collectU`) the member interns under its own name — and the inline shape stops
-// being interned, because `collectAnnShapes` dedups it against the declared struct. So the two
-// halves are ONE change in both directions: with the row, only the structural spelling
-// resolves; without it, only the nominal one does.
-//
-// The gate is the member's own arena entry, not a second reading of the alias: the `TyObj` arm
-// of `singleAliasMemberTyIx` is already `isPlainAliasRef`-gated, so a `TyObj` here IS the
-// plain-reference population and the canonicalized intersection never reaches it. A member with
-// no declared name (an inline shape behind a generic application) falls through to the
-// structural render unchanged, which is every other arm's behaviour too.
-//
-// THE GENERIC-APPLICATION RUNG SITS UNDER THE DECLARED NAME, AND IT IS THE SAME NOMINAL
-// RULE ONE RUNG WIDER. `type Y = Box<i32>` has no declared struct to name — no `TypeDecl` is
-// spelled `Box<i32>` — but the application IS a nominal spelling: the head is a declared name
-// and `genAppNameOfTy` renders the arguments nominally under it, which is exactly the order
-// `tyToNominalNameGo` asks the two in. It closes nine census rows on the nominal axis
-// (B2 20 → 11, B3 126 → 117) and moves nothing on the six-channel corpus.
-//
-// IT HAS TWO CONSUMERS THAT MUST BE READY FOR THE NAME IT PRODUCES, AND ALONE IT IS THREE
-// CELLS DOWN — measured on a 13-position × 2-spelling alias-vs-application sweep, this arm
-// against the alias-free control:
-//   - the FIELD-CODE ladder. Under the structural render a field typed by the alias
-//     (`type Holder = { c: Y }`, and its `| null` twin) reached `fieldTypeCode` as an inline
-//     shape; under the application name it arrives as `Box<i32>`, which types only because
-//     `emit_classify.nameIsGenAppDecl` routes an application to code 15. Without it, both
-//     field cells take the reject the DIRECT spelling `{ c: Box<i32> }` used to take.
-//   - the `is` REWRITER's rewrite ORDER. `canonEmitTypeNames`' variant arm resolves a
-//     transparent member and only THEN expands an application to its shape, so `Y` lands in
-//     `uVariants` as `{v:i32}`; the `is` arm has to apply the same two rewrites in the same
-//     order or it names `Box<i32>` against that table. Inert until this arm existed, because
-//     a leading expansion cannot see a name the rung below it has not yet produced.
-// The `collectU` skip the OBJECT arm is inseparable from is NOT a third dependency here:
-// `isTransparentAlias` claims every transparent arm, so the alias's poison row is already
-// not minted, and this arm changes no emitter table at all.
+// annotation rewriter (`canonEmitNameTs`) and the `is` rewriter. D-ISALIAS is the reason it is
+// one function and not two call sites: those two spell the union's VARIANT and the test that
+// names it, and a divergence between them is `is` naming a variant the emitter does not have.
+// NOMINAL-FIRST FOR AN OBJECT MEMBER, and the half that made it possible is `collectU`'s skip:
+// with the poison row minted, `collectS` skipped `Cat`'s standalone struct row and only the
+// inline shape resolved; without it, the member interns under its own name and
+// `collectAnnShapes` dedups the inline shape away. The two halves are ONE change in both
+// directions. The gate is the member's own arena entry, so the canonicalized intersection never
+// reaches it and a member with no declared name falls through structurally.
+// THE GENERIC-APPLICATION RUNG SITS UNDER THE DECLARED NAME — `type Y = Box<i32>` has no declared
+// struct to name, but the application IS a nominal spelling (`genAppNameOfTy`).
 function transparentMemberEmitName(smt: i32, ctx: i32): string {
   const mt = T.tys[smt]
   if mt is TyObj {
@@ -13498,22 +12902,18 @@ function transparentMemberEmitName(smt: i32, ctx: i32): string {
       return gan
     }
   }
-  // A DECLARED UNION member renders as its own ALIAS NAME, at EVERY position — the
-  // same nominal-first rule the object arm above applies, and the one that makes
-  // `type A = K` spell byte-identically to `K`. It cannot be left to the structural
-  // render below, for the same reason the object arm cannot: that render drops the
-  // declared name the emitter's tables key on. For a LITUNION the loss is a
-  // position-dependent one — `tyToEmitNameGo`'s litunion leg is
-  // `ctxKeepsLitUnion`-gated, so at `RC_ROOT` / `RC_FN_PARAM` it softens to `string`
-  // while the ALIAS spelling canon leaves untouched stays `K`: one type, two names,
-  // and the atom/string rep split that follows. That gate belongs to the INLINE member
-  // list (a name the emitter has no root/param ladder arm for), never to an identifier.
-  //
-  // A NUMERIC litunion alias is DELIBERATELY NOT NOMINAL, and the guard is the one
-  // home that owns the rule: `numLitUnionAliasName` rewrites `type Z = 0 | 1` to its
-  // BASE SCALAR, so `Z` is not the emitter's name for it and the structural render
-  // (`i32`, via `tyLitBaseName`) is. Rendering the alias here would spell a union name
-  // for a plain i32 slot — the very shape this arm exists to remove.
+  // A DECLARED UNION member renders as its own ALIAS NAME, at EVERY position — the same
+  // nominal-first rule the object arm above applies, and the one that makes `type A = K` spell
+  // identically to `K`. It cannot be left to the structural render below, for the same reason
+  // the object arm cannot: that render drops the declared name the emitter's tables key on. For
+  // a LITUNION the loss is position-dependent — `tyToEmitNameGo`'s litunion leg is
+  // `ctxKeepsLitUnion`-gated, so at `RC_ROOT` / `RC_FN_PARAM` it softens to `string` while the
+  // ALIAS spelling canon leaves untouched stays `K`: one type, two names, and the atom/string
+  // rep split that follows. That gate belongs to the INLINE member list, never to an identifier.
+  // A NUMERIC litunion alias is DELIBERATELY NOT NOMINAL, and the guard is the one home that
+  // owns the rule: `numLitUnionAliasName` rewrites `type Z = 0 | 1` to its BASE SCALAR, so `Z` is
+  // not the emitter's name for it and the structural render (`tyLitBaseName`) is. Rendering the
+  // alias here would spell a union name for a plain i32 slot.
   const uan = unionAliasDeclNameOfTy(smt)
   if uan != "" {
     if numLitUnionAliasName(uan) == "" {
@@ -13522,48 +12922,18 @@ function transparentMemberEmitName(smt: i32, ctx: i32): string {
       return uan
     }
   }
-  // D-ALIASARRNOM: an ARRAY member over a DECLARED-STRUCT leaf renders through the
-  // NOMINAL renderer — the same nominal-first rule the object arm above applies, one
-  // constructor out. `tyToEmitNameAt` re-renders the element structurally (`Cat[]` ->
-  // `{n:i32}[]`), which drops the declared name the emitter's element tables key on;
-  // `tyToNominalName` keeps it, and the name it produces is the DIRECT annotation
-  // spelling character for character. Gated on the same predicate that admits the arm in
-  // `singleAliasMemberTyIx`, so the two cannot disagree about which arrays are claimed —
-  // the `nameToTy` / `singleMemberAliasTyIx` agreement invariant, held by construction.
-  //
-  // A SCALAR-leaf array is untouched: `arrSpineIsNominal` declines for a `TyPrim` leaf,
-  // and the two renderers agree there anyway (`i32[]` either way), which is what
-  // `arrSpineIsScalar`'s header means by name-faithful.
-  //
-  // D-ALIASARRMAP TAKES THE SAME LEG, AND ITS SHARE OF IT IS MEASURED RATHER THAN
-  // INHERITED. A MAP leaf renders identically under both renderers for every SCALAR value
-  // (`{[string]:i32}[]` either way) and for a litunion-alias value (both preserve `K0`),
-  // so the leg is a no-op for all but one value kind: a DECLARED-STRUCT value, where
-  // `tyToEmitNameAt` spells `{[string]:{n:i32}}[]` and the nominal renderer spells
-  // `{[string]:Cat}[]` — the direct annotation, character for character. Without it the
-  // alias-vs-inline twin table loses THREE cells that ran on the parent, all four bodies
-  // at `unionmem` (`f(x: L | i32)`): `emitProgram: array value does not match any array
-  // member of the union`, the union's array member being keyed on the dropped name. With
-  // it, all four land on the inline control.
-  //
-  // D188 (`arrSpineIsObj`) IS THE THIRD SHARER OF THIS LEG, and it is here on a
-  // measurement rather than on the analogy. An INLINE-SHAPE leaf has no name of its own
-  // to drop, so the expectation was that it would fall through to the structural render
-  // like a scalar leaf does; the twin table says otherwise on 2 of its 322 cells, both
-  // `type L = {p: Cat}[]` — the leaf's FIELD names a declared struct, and
-  // `tyToEmitNameAt` re-renders it to `{p:{n:i32}}[]` while canon leaves the DIRECT
-  // spelling `{p:Cat}[]`. The element tables key on the latter. Read `arrSpineIsObj`'s
-  // header for the two cells and the messages.
-  //
-  // D362 IS THE FOURTH SHARER, and it is the leg's whole content for that leaf rather than
-  // a two-cell correction. A leaf that is itself a DECLARED ALIAS has a name to drop at
-  // every position: `tyToEmitNameAt` re-renders `type AB = {a:i32} & {b:i32}` structurally
-  // to `{a:i32,b:i32}[]` while canon leaves the DIRECT spelling `AB[]`, so with the claim
-  // in `singleAliasMemberTyIx` and WITHOUT this leg the intersection leaf is
-  // `emitProgram: only i32[] arrays and struct/union element arrays are supported` at six
-  // of its seven positions — a loud reject where the inline control runs. The numeric
-  // litunion needs no exclusion here: `tyToNominalNameGo` softens `Z` to its base scalar
-  // itself, so `type L = Z[]` renders `i32[]` through this leg.
+  // D-ALIASARRNOM: an ARRAY member over a DECLARED-STRUCT leaf renders through the NOMINAL
+  // renderer — the same nominal-first rule the object arm above applies, one constructor out.
+  // `tyToEmitNameAt` re-renders the element structurally (`Cat[]` -> `{n:i32}[]`), which drops
+  // the declared name the emitter's element tables key on; `tyToNominalName` keeps it, and what
+  // it produces is the DIRECT annotation spelling character for character. Gated on the same
+  // predicate that admits the arm in `singleAliasMemberTyIx`, so the two cannot disagree about
+  // which arrays are claimed — the `nameToTy` / `singleMemberAliasTyIx` agreement invariant.
+  // A SCALAR-leaf array is untouched: `arrSpineIsNominal` declines a `TyPrim` leaf, and the two
+  // renderers agree there anyway. THREE OTHER LEAF KINDS SHARE THIS LEG, each on its own
+  // measurement rather than by analogy: a MAP leaf (only its DECLARED-STRUCT value kind moves),
+  // an INLINE-SHAPE leaf whose FIELD names a declared struct (D188), and a leaf that is ITSELF a
+  // declared alias, which has a name to drop at every position (D362).
   if mt is TyArray {
     const nomLeaf = arrSpineIsNominal(smt) ||
       arrSpineIsMap(smt) ||
@@ -13583,35 +12953,18 @@ function transparentMemberEmitName(smt: i32, ctx: i32): string {
   tyToEmitNameAt(smt, ctx)
 }
 
-// The BASE-SCALAR emit name of a NUMERIC literal-union type (`0 | 1` → "i32",
-// `1.5 | 2.5` → "f64", the one-member `1` → "i32"), or "" for anything else —
-// a string litunion, a mixed-base union, a union with a non-literal member.
-//
-// `softenLitTy` IS the rule (host: "a numeric-literal union is its base type for
-// ARITHMETIC and ordering — the union constrains what may be ASSIGNED, not what may
-// be computed"), so this is a projection of the checker's own algebra, not a second
-// answer: it returns the type unchanged for every set it does not claim, and only a
-// homogeneous all-`TyLit` union moves.
-//
-// The STRING base is excluded on purpose. `type K = "a" | "b"` keeps its alias NAME at
-// emit because that name IS the atom identity (`nodeTyIsLitUnionAlias` → the interned
-// i32 atom rep); softening it to `string` would store an atom id in a `(ref $array)`
-// cell. A numeric literal union has no such identity to keep — its members ARE i32s.
-//
-// A one-member union WRAPPER is peeled first (`type Y = Z`): the parser encodes every
-// non-`{`-bodied `type N = …` as a one-member `UnionDecl`, so an alias-of-an-alias is a
-// union over a union. Depth-bounded rather than free recursion — a declared type may be
-// cyclic (`applyGenAlias` registers an instance under its own index; see #1127's
-// `guardFiniteUserTypes`) and this runs BEFORE any emit-side finiteness guard.
-// EXPORTED for `emit_rewrite.unionParamPinName`, the un-annotated callback-param pin, which
-// needs this rule for a reason canon cannot cover for it: canon rewrites NAMES in annotations,
-// and that selector reads the type ARENA (this entry) and the registered `unNames` ROWS (the
-// name-keyed entry below) — neither of which is an annotation. Same rule, same home, no second
-// answer; see that call site for the wasm it got wrong without it.
-// The base ROW, which is what the walk actually computes — `softenLitTy` hands back an
-// arena index and the name forms below read `primName` off it. A consumer that wants a
-// TYPE was going type -> name -> type through `primTyOfName`'s eight string compares; the
-// row it wanted was in hand the whole time.
+// The BASE-SCALAR emit name of a NUMERIC literal-union type (`0 | 1` → "i32", `1.5 | 2.5` →
+// "f64", the one-member `1` → "i32"), or "" for anything else — a string litunion, a mixed-base
+// union, a union with a non-literal member. `softenLitTy` IS the rule (a numeric-literal union
+// is its base type for ARITHMETIC and ordering; the union constrains what may be ASSIGNED, not
+// what may be computed), so this is a projection of the checker's own algebra.
+// The STRING base is excluded on purpose: `type K = "a" | "b"` keeps its alias NAME at emit
+// because that name IS the atom identity, and softening it to `string` would store an atom id in
+// a `(ref $array)` cell. A numeric literal union has no such identity — its members ARE i32s.
+// A one-member union WRAPPER is peeled first, on a DEPTH BOUND rather than free recursion: a
+// declared type may be cyclic and this runs BEFORE any emit-side finiteness guard. EXPORTED for
+// `emit_rewrite.unionParamPinName`, which reads the type ARENA and the registered `unNames` rows
+// rather than an annotation, so canon cannot cover the rule for it.
 export function numLitUnionBaseTy(ty: i32): i32 {
   let cur = ty
   let peels = 0
@@ -13663,25 +13016,17 @@ export function numLitUnionBaseName(ty: i32): string {
   primNameStr(numLitUnionBasePrim(ty))
 }
 
-// The single base NUMERIC scalar every value of `ty` reps as at emit — `"i32"` /
-// `"i64"` / `"f64"` — or "" when `ty` is not uniformly one of the three.
-//
-// This is the RECEIVER side of the numeric-litunion `is` membership test, and it has to
-// answer for the MIXED spellings the tested type never carries: `K | i32` and `K | f64`
-// (a numeric litunion beside its own base) collapse to that base with NO union box —
-// every member softens to the same scalar, so the union has exactly one rep and the
-// emitter gives the binding a plain `i32` / `f64` local. `numLitUnionBaseName` cannot
-// answer for those: `softenLitTy` leaves a union alone the moment a member is not a
-// `TyLit`, which is precisely what the `i32` arm of `K | i32` is.
-//
-// A `boolean` / `char` / `string` / `f32` member answers "" — they are not one of the
-// three names, so an i32-repped `boolean` never presents as the i32 a numeric compare
-// would then be emitted against.
-//
-// The walk is an explicit WORKLIST rather than recursion, and it is STEP-BOUNDED for the
-// same reason `numLitUnionBaseName` peels under a bound: a declared type may be cyclic
-// (`applyGenAlias` registers an instance under its own index) and this runs with no
-// finiteness guard in front of it. Exceeding the bound answers "" — the conservative
+// The single base NUMERIC scalar every value of `ty` reps as at emit — `"i32"` / `"i64"` /
+// `"f64"` — or "" when `ty` is not uniformly one of the three.
+// This is the RECEIVER side of the numeric-litunion `is` membership test, and it has to answer
+// for the MIXED spellings the tested type never carries: `K | i32` and `K | f64` (a numeric
+// litunion beside its own base) collapse to that base with NO union box, so the emitter gives
+// the binding a plain local. `numLitUnionBaseName` cannot answer for those — `softenLitTy`
+// leaves a union alone the moment a member is not a `TyLit`, which is what the `i32` arm is.
+// A `boolean` / `char` / `string` / `f32` member answers "": they are not one of the three, so
+// an i32-repped `boolean` never presents as the i32 a numeric compare would be emitted against.
+// The walk is an explicit WORKLIST rather than recursion, and STEP-BOUNDED for the reason
+// `numLitUnionBaseName` peels under a bound. Exceeding the bound answers "", the conservative
 // direction, since every consumer treats "" as "not my shape".
 function tyNumScalarBaseName(ty: i32): string {
   const work: i32[] = [ty]
@@ -13713,26 +13058,16 @@ function tyNumScalarBaseName(ty: i32): string {
 
 // The base scalar type `ty` REPS AS, or `null` for anything that is not a scalar rep — the
 // kind-agnostic sibling of `tyNumScalarBaseName`, which answers only for the numeric bases.
-//
-// Three arena shapes rep as one base scalar and the emitter cannot tell them apart at a
-// param cell, which is exactly why the softened SPELLING used to be the thing consulted:
-//   - `TyPrim`                         — `string`, `i32`, ...
-//   - `TyLit`                          — a SINGLE-member literal type (`"world"`, `7`, `1.5`),
-//                                        which reps as its base (`single-literal-type.vl`)
-//   - `TyUnion` of `TyLit`s, one base  — a literal union, inline or aliased
-// The one-member `UnionDecl` wrapper the parser mints for every non-`{`-bodied `type N = ...`
-// is peeled on the same bound the numeric extractors peel on, so an alias-of-an-alias answers.
-//
-// This is the ONE home for "which base scalar does this type lower as" across all literal
-// kinds. `canonEmitTypeNames` computes the same collapse on the RENDERING side; a reader that
-// wants the answer should ask here rather than pattern-match the softened name.
-// The ATOM form, and the only implementation. `PrimName` is a literal union, so this
-// returns an INTERNED ATOM and a caller's `== "string"` is an `i32.eq` — the same
-// conversion `tyIsPrimNamed` records over `tyPrimNameOf`, on the sibling that also peels
-// LITERALS and literal unions. Declaring a return `string` is not a passive annotation
-// here: it widens the atom into a materialized string (that is what `fnTailWidensAtomToStr`
-// detects, and why such a function reserves the string scratch frame), so every caller
-// that only wanted to COMPARE was paying for a string it then threw away.
+// Three arena shapes rep as one base scalar and the emitter cannot tell them apart at a param
+// cell, which is exactly why the softened SPELLING used to be the thing consulted: a `TyPrim`; a
+// `TyLit`, a SINGLE-member literal type that reps as its base
+// (`literal-unions/single-literal-type.vl`); and a `TyUnion` of `TyLit`s over one base, inline
+// or aliased. The one-member `UnionDecl` wrapper is peeled on the same bound the numeric
+// extractors peel on, so an alias-of-an-alias answers. This is the ONE home for "which base
+// scalar does this type lower as" across all literal kinds.
+// The ATOM form is the only implementation: `PrimName` is a literal union, so this returns an
+// INTERNED ATOM and a caller's `== "string"` is an `i32.eq`. Declaring a return `string` is not
+// a passive annotation here — it widens the atom into a materialized string.
 export function tyScalarBasePrim(ty: i32): PrimName | null {
   let cur = ty
   let peels = 0
@@ -13893,22 +13228,17 @@ function nameIsGenAppOfDecl(name: string) {
 }
 
 // The STRUCTURAL emit name of a generic-alias APPLICATION standing as one member of a
-// MULTI-member declared union (`type U = Box<i32> | Tag` → "{v:i32}"), or "" when `member`
-// is not such an application or its instance is not an object type.
-//
-// Same shape of defect, and same resolution, as the one-member alias above: the emitter has
-// no route to a union MEMBER under an application name. `collectU` asks `isStructAtom`, which
-// answers from the `TypeDecl` names — and a generic alias declares `Box<T>`, never `Box<i32>`
-// — so the member is dropped from `uVariants` while the alias still registers in `unNames`.
-// The annotation then classifies as the union BOX and the initializer lowers the plain
-// struct: silent INVALID WASM, for every construction site of that member (global, local,
-// argument, return, reassignment).
-//
-// STRUCTURAL for the reason #1122 measured: the application's own name resolves nothing
-// downstream (the instance interns under it only when a TypeRef spells it, which a union
-// member is not), whereas the inline shape is the vocabulary `isStructAtom` already accepts —
-// `type U = {v:i32} | Tag` compiles and runs today, and so does the `type A = Box<i32>;
-// type U = A | Tag` spelling, which reaches exactly this shape through `singleMemberAliasTyIx`.
+// MULTI-member declared union (`type U = Box<i32> | Tag` → "{v:i32}"), or "" when `member` is
+// not such an application or its instance is not an object type.
+// Same shape of defect, and same resolution, as the one-member alias above: the emitter has no
+// route to a union MEMBER under an application name. `collectU` asks `isStructAtom`, which
+// answers from the `TypeDecl` names — and a generic alias declares `Box<T>`, never `Box<i32>` —
+// so the member is dropped from `uVariants` while the alias still registers in `unNames`. The
+// annotation then classifies as the union BOX and the initializer lowers the plain struct:
+// silent INVALID WASM at every construction site of that member.
+// STRUCTURAL because the application's own name resolves nothing downstream (the instance
+// interns under it only when a TypeRef spells it, which a union member is not), whereas the
+// inline shape is the vocabulary `isStructAtom` already accepts.
 function unionMemberGenAppShape(member: string) {
   if !nameIsGenAppOfDecl(member) { return "" }
   const ti = nameToTy(member)
@@ -13919,57 +13249,32 @@ function unionMemberGenAppShape(member: string) {
 }
 
 // The TOP-LEVEL atom count of the name the LAST `canonEmitName` call returned, and its
-// `nulLitUnionPreserve` sibling. `canonEmitTypeNames` — the pass that PRODUCES every
-// emit-time annotation spelling — reads it instead of re-splitting the string it has just
-// joined (#1113, retiring the `unionMemberCount(c)` #1112 banked with).
-//
-// The invariant that makes it total: a canon'd name gains a TOP-LEVEL `|` at exactly two
-// places, the union arm's join and `nulLitUnionPreserve`'s `|null` suffix. Every other arm
-// either recurses (and inherits the recursive count) or builds a name whose separators
-// are inside a grouper / behind a top-level `=>` — ONE atom. The `!nameNeedsCanon`
-// early-out is the load-bearing case, and it is exact by that predicate's own shape: it
-// returns TRUE on any `|` ANYWHERE in the name, so a name that reaches the early-out has
-// no `|` at all.
-//
-// Neither is an arena-lifetime sidecar (method note 7): both are scalars written on the
-// way out of a call and read by the immediate caller, never carried between programs.
+// `nulLitUnionPreserve` sibling. `canonEmitTypeNames` — the pass that PRODUCES every emit-time
+// annotation spelling — reads it instead of re-splitting the string it has just joined.
+// The invariant that makes it total: a canon'd name gains a TOP-LEVEL `|` at exactly two places,
+// the union arm's join and `nulLitUnionPreserve`'s `|null` suffix. Every other arm either
+// recurses (and inherits the recursive count) or builds a name whose separators are inside a
+// grouper / behind a top-level `=>` — ONE atom. The `!nameNeedsCanon` early-out is the
+// load-bearing case, and it is exact by that predicate's own shape: it returns TRUE on any `|`
+// ANYWHERE in the name, so a name that reaches the early-out has no `|` at all.
+// Neither is an arena-lifetime sidecar: both are scalars written on the way out of a call and
+// read by the immediate caller, never carried between programs.
 let canonAtoms = 1
 let nluAtoms = 1
 let lupAtoms = 1
 
-// THE PRE-CANON SPELLING of every annotation inside a GENERIC DECLARATION — a generic
-// alias's field annotations and a generic function's parameter/return annotations — as a
-// node-index column and the name each node carried BEFORE `canonEmitTypeNames` rewrote it.
-// Read by `emit_collect.gaeCollectDecls` and `emit_mono` through `declAnnRawTyName`.
-//
-// The canon pass is a NAME rewrite with no SCOPE: it resolves `Id` through the declared
-// registry wherever `Id` is written. Inside the body of `type Box<Id> = { v: Id }` that is
-// the wrong answer — there `Id` is the alias's own type PARAMETER, and the checker says so
-// (`tsLeafTy` asks `tpEnvTyOfName` before `declaredTyOfName`, so it reports `Box<string>`
-// as `{v: string}`). Transparency rewrote the field annotation to `i32` before the emitter
-// ever saw it, so `gaeCollectDecls` recorded `i32` against a parameter list holding `Id` and
-// `emit_base.gaeApplyFieldTy` had nothing left to match: the field kept the ALIAS's body
-// type while the checker had bound the parameter to the ARGUMENT. Two answers for one field,
-// `vl check` rc=0, and a module that does not parse.
-//
-// A SIDECAR rather than a suppression, and that is MEASURED. Teaching `canonEmitNameAt` to
-// leave a live parameter name alone fixes the same 84 cells but REDDENS 8 that are green on
-// master — every depth-2 field at the no-op instantiation (`type Id = i32` +
-// `type Box<Id> = { v: Id[][] }` at `Box<i32>`). Surviving in the ARENA, `Id[][]` is a
-// nested list whose ELEMENT is a name `collectU` has registered (a one-member alias is still
-// a `UnionDecl`), so the ref-list intern gave the inner row a union BOX element and the
-// literal `[[1]]` lowered into it — `expected i32, found (ref $type)`. The substitution is
-// the only consumer that wants the parameter name back; every other pass wants exactly what
-// canon produces. So the arena keeps its single vocabulary and the substitutions get a
-// second column.
-//
-// THE FuncDecl HALF IS THE SAME DEFECT AT A DIFFERENT DECLARATION, and it was measured as
-// its own 11 x 6 grid (the shadowed name's KIND x the CALL ARGUMENT's type, each against a
-// `<T>`-named control): `type Id = i32` + `function ident<Id>(v: Id): Id` was invalid wasm
-// in 49 of 66 cells with a CORRECT control in every one. The green 17 are the diagonal —
-// where the argument's type happens to equal what the alias names, so the erasure is a
-// no-op — plus the two rows canon does not rewrite (a declared struct, and a STRING literal
-// union, whose alias name canon deliberately keeps).
+// THE PRE-CANON SPELLING of every annotation inside a GENERIC DECLARATION — a generic alias's
+// field annotations and a generic function's parameter/return annotations — as a node-index
+// column and the name each node carried BEFORE `canonEmitTypeNames` rewrote it. Read by
+// `emit_collect.gaeCollectDecls` and `emit_mono` through `declAnnRawTyName`.
+// The canon pass is a NAME rewrite with no SCOPE: it resolves `Id` through the declared registry
+// wherever `Id` is written. Inside the body of `type Box<Id> = { v: Id }` that is the wrong
+// answer — there `Id` is the alias's own type PARAMETER, and the checker says so (`tsLeafTy`
+// asks `tpEnvTyOfName` before `declaredTyOfName`). Transparency rewrote the field annotation
+// before the emitter ever saw it, so `gaeApplyFieldTy` had nothing left to match and the field
+// kept the ALIAS's body type while the checker had bound the parameter to the ARGUMENT.
+// A SIDECAR rather than a suppression, and that is MEASURED: teaching `canonEmitNameAt` to leave
+// a live parameter name alone fixes the same cells and reddens cells that are green on master.
 let cgpFieldNodes: i32[] = []
 let cgpFieldRaw: string[] = []
 
@@ -14003,30 +13308,18 @@ function nulLitUnionPreserve(parts: string[], ctx: i32) {
     nluAtoms = rest.length + 1
     return core + "|null"
   }
-  // THE SAME QUESTION, THROUGH ONE GROUPING PAREN — and it is the SIBLING CLASSIFIER'S
-  // RUNG, not a new one. A top-level `|` split hands out a part that still carries the
-  // grouper the source wrote: `(("a" | "b") | null)[]` splits its ELEMENT into
-  // `("a"|"b")` + `null`, so `core` arrives GROUPED and `nameIsLitUnionType` declines it
-  // by construction — its inline leg (`nameIsInlineLitUnion`) opens with an O(1) reject
-  // that requires the name to BEGIN with a quote. `litRunPartTexts`, the 2026-07-29
-  // ruling's own member classifier 130 lines below, already states the rule this arm was
-  // missing — *"a GROUPER is not a member: `("a"|"b")` contributes exactly what its
-  // interior does"* — and carries the identical two-conjunct guard, exact on a split part
-  // because such a part can hold no top-level `|` of its own.
-  //
-  // WITHOUT IT, ONE ARENA TYPE GOT TWO SPELLINGS AND THE CORPUS HELD BOTH:
-  // `("a"|"b")[]|null` canon'd to `K[]|null` (preserved, aliased) while its sibling
-  // `(("a"|"b")|null)[]` canon'd to `(string|null)[]` (softened) — the same litunion, one
-  // grouping paren apart, and BOTH renderers spelled the second `(K|null)[]`.
-  // `tests/cases/lists/litunion-inline-nullable-element.vl`'s own header records what the
-  // softened spelling cost: `nameIsStringArray` accepted `(string|null)[]` as its niche, so
-  // atom ids built into a string-list slot were read back through the string backing, and
-  // the rejects had to be re-derived STRUCTURALLY because the name had nothing left to
-  // reject on.
-  //
-  // The interior goes to the NON-NULL sibling rather than being re-tested here, so the
-  // declared-ALIAS preference (`litUnionAliasOfLitTexts`, "a name that is an intern KEY
-  // must be one name per type") keeps exactly one home and cannot drift from it.
+  // THE SAME QUESTION, THROUGH ONE GROUPING PAREN — and it is the SIBLING CLASSIFIER'S RUNG, not
+  // a new one. A top-level `|` split hands out a part that still carries the grouper the source
+  // wrote: `(("a" | "b") | null)[]` splits its ELEMENT into `("a"|"b")` + `null`, so `core`
+  // arrives GROUPED and `nameIsLitUnionType` declines it by construction — its inline leg opens
+  // with an O(1) reject requiring the name to BEGIN with a quote. `litRunPartTexts`, the
+  // ruling's own member classifier below, already states the rule this arm was missing: a
+  // GROUPER is not a member, and `("a"|"b")` contributes exactly what its interior does.
+  // WITHOUT IT, ONE ARENA TYPE GOT TWO SPELLINGS AND THE CORPUS HELD BOTH: `("a"|"b")[]|null`
+  // canon'd preserved while `(("a"|"b")|null)[]` canon'd softened, one grouping paren apart
+  // (`tests/cases/lists/litunion-inline-nullable-element.vl`). The interior goes to the NON-NULL
+  // sibling rather than being re-tested here, so the declared-ALIAS preference
+  // (`litUnionAliasOfLitTexts`) keeps exactly one home and cannot drift from it.
   if nameIsParenSpanEnds(core) && !isTopLevelFuncTypeName(core) {
     const iparts: string[] = []
     tyTopLevelSplit(groupInnerOf(core), '|', false, iparts)
@@ -14054,53 +13347,27 @@ function nulLitUnionPreserve(parts: string[], ctx: i32) {
       return cCore + "|null"
     }
   }
-  // A NULLABLE UNION OF LITERAL UNIONS (`K | K2 | null`) DELIBERATELY DOES NOT FLATTEN
-  // HERE, and the gate is the ARENA's: `annUnionInnerTy` declines a `null`-carrying
-  // annotation, so flattening the SPELLING alone would put the two producers back in the
-  // state this slice exists to end — canon naming an atom niche while every arena
-  // classifier answers "not a literal union". Measured, on the 20-cell nullable row:
-  // canon-only is 4 cells DOWN, arena+canon together is 10 UP and 3 DOWN, and the 3 are
-  // the declared-alias control's own pre-existing holes. The niche half ships with those,
-  // not before — see `annUnionInnerTy`'s header for the numbers.
+  // A NULLABLE UNION OF LITERAL UNIONS (`K | K2 | null`) DELIBERATELY DOES NOT FLATTEN HERE, and
+  // the gate is the ARENA's: `annUnionInnerTy` declines a `null`-carrying annotation, so
+  // flattening the SPELLING alone would put the two producers back in the state this slice
+  // exists to end — canon naming an atom niche while every arena classifier answers "not a
+  // literal union". The niche half ships when the declared-alias control's own holes close; see
+  // `annUnionInnerTy`'s header.
   ""
 }
 
-// True at the render POSITIONS where a literal union keeps its members — the four the
+// True at the render POSITIONS where a literal union keeps its members — the CONTAINERS the
 // structural renderer already preserves a litunion ALIAS at (`tyToEmitNameGo`'s `TyArray`
-// element, `TyObj` field, `TyMap` value and `TyFunc` result arms each call
-// `litUnionAliasNameOfTy` before recursing). O3 of the one-agreed-renderer design states the
-// policy as position-dependent in BOTH directions, and this is its positive half.
-//
-// FALSE at `RC_ROOT` and `RC_FN_PARAM`, and that is MEASURED, not stylistic: an ungated
-// preserve reddens four cells that are green on master — a bare inline litunion as a
-// function PARAM (`emitProgram: only i32, i64, f64, f32, boolean, struct, union, array, or
-// string parameters are supported`) and as a DECLARED struct field (`emitProgram: only i32 /
-// boolean / string / array struct fields are supported`), because those two valtype ladders
-// have an arm for the litunion ALIAS name and none for the inline member spelling. The
-// renderer softens at exactly those two positions too, for the same reason.
-// FALSE AT `RC_FN_RES` TOO, and that is a CORRECTION rather than a fourth measurement. The
-// three surviving positions are CONTAINERS — an element, a field, a map value — whose slot
-// really does hold the interned atom, so a value crossing into one needs a narrow and a value
-// read out of one needs a widen, and the emitter has both. A function RESULT is not a
-// container: it is the same scalar position a DECLARATION's return annotation occupies, and
-// that one is `RC_ROOT`, where this answers false. Keeping the two apart made one type two
-// reps ACROSS ONE BOUNDARY —
-//
-//   function toAB(x: i32): "a" | "b"        // `RC_ROOT`  — a string ref, and the emitted
-//                                           // functype says so
-//   const f: (i32) => ("a" | "b") = toAB    // `RC_FN_RES` — the interned i32 ATOM, and the
-//                                           // `$fnsig` the `call_ref` casts to says so
-//
-// — so `f(1)` pushed a `(ref $array)` where the signature promised an i32: `vl check` rc 0
-// (the only command that missed it) and a module the engine refuses at load. The STORE was
-// always fine; only the call met the disagreement.
-//
-// THE ALIAS IS UNAFFECTED, which is why this is not the refuted "soften everywhere". A
-// litunion ALIAS at a function result keeps its name through `litUnionAliasNameOfTy`, called
-// by `tyToEmitNameGo`'s `TyFunc` arm before it consults this and by `canonEmitNameAt`'s
-// `lupAlias` leg — so `(i32) => K` still reps the atom at both ends, exactly as the controls
-// file pins. What moves is only the INLINE member spelling, and only at the one position
-// where its counterpart across the boundary softens.
+// element, `TyObj` field and `TyMap` value arms each call `litUnionAliasNameOfTy` before
+// recursing). O3 of the one-agreed-renderer design states the policy as position-dependent in
+// BOTH directions, and this is its positive half.
+// FALSE at `RC_ROOT`, `RC_FN_PARAM` and `RC_FN_RES`. The first two are measured: an ungated
+// preserve reddens cells that are green on master, because those valtype ladders have an arm for
+// the litunion ALIAS name and none for the inline member spelling. `RC_FN_RES` is a CORRECTION
+// rather than a fourth measurement — a container's slot really does hold the interned atom, so a
+// value crossing in needs a narrow and one read out needs a widen, and the emitter has both,
+// while a function RESULT is the same scalar position a DECLARATION's return occupies. Keeping
+// them apart made one type two reps across one boundary. THE ALIAS IS UNAFFECTED either way.
 function ctxKeepsLitUnion(ctx: i32) {
   if (ctx & RC_ELEM) != 0 { return true }
   if (ctx & RC_FIELD) != 0 { return true }
@@ -14108,44 +13375,18 @@ function ctxKeepsLitUnion(ctx: i32) {
   false
 }
 
-// THE MIXED-UNION SPELLING HAS NO POSITION GATE, AND THAT IS A MEASURED RESULT, NOT AN
-// OMISSION. The 2026-07-29 preserve ruling does not fully land today because the EMITTER
-// holds a THIRD copy of the soften rule — `emit_classify.canonLitUnionArms`, reached from
-// `rlCanonLitUnionAtoms` (ref-list ELEMENT names) and `mvCanonValName` (map VALUE names) —
-// which rewrites a litunion ATOM of a mixed union to `string`. The union ROW, meanwhile,
-// is registered under the CANON'D ANNOTATION, so preserving here makes the row and the
-// query two different strings:
-//
-//   type K = "a" | "b"
-//   function mk(): (K | f64)[] { return ["a", 2.5] }
-//   function go() { const xs = mk(); const v = xs[0]; if v is K { print(v) } }
-//   go()
-//   // emitProgram: union box atom test on a union with no recorded members: string|f64
-//
-// TWO POSITION GATES WERE BUILT AND BOTH ARE REFUTED, which is why neither is here:
-//
-//  · soften at `RC_ELEM` only — the emitter's normalizer DESCENDS (`X[]` → element,
-//    `{[K]:V}` → value, `{f:T}` → field), so a field under an element still forks:
-//    `tests/cases/maps/litunion-struct-field-array-value-closure-factory.vl`
-//    (`{[string]: {f: K0 | f64}[]}`) stays rc 0 → 1.
-//  · soften at `RC_ELEM | RC_FIELD | RC_MAP_VAL` — the normalizer's whole reach — fixes
-//    that one and breaks TWO OTHERS (`types/declared-vs-inline-mixed-union-field-twin`,
-//    `unions/struct-field-array-of-struct-union`), because the union REGISTRY is keyed by
-//    NAME and is blind to position: a rule that spells one arena type `K0|{w:i32}` at the
-//    root and `string|{w:i32}` as a field mints TWO rows for ONE type, which is the very
-//    fragmentation both rulings exist to prevent.
-//
-// So the spelling must be position-INDEPENDENT, and the only two position-independent
-// rules are "soften everywhere" (master) and "preserve everywhere" (this file). The
-// emitter half is filed with its exact diff in
-// `docs/internals/destringify-types-program.md` (2026-07-29).
-//
-// A PURE literal union's preserved canonical name, or "" if `parts` (the top-level `|`-split
-// members of a union annotation) are not one. The non-null sibling of `nulLitUnionPreserve`:
-// `"a" | "b"` must keep its members intact, because softening each to `string` and deduping
-// erases the litunion identity and reps the annotation as a STRING REF where its `K` alias
-// spelling reps as the interned i32 ATOM. Duplicate members collapse (`"a" | "a"` is one atom),
-// which is what the softening path's own `kept` dedup did and what the arena does.
+// THE MIXED-UNION SPELLING HAS NO POSITION GATE, AND THAT IS A MEASURED RESULT, NOT AN OMISSION.
+// The preserve ruling does not fully land today because the EMITTER holds a THIRD copy of the
+// soften rule — `emit_classify.canonLitUnionArms`, reached from `rlCanonLitUnionAtoms` (ref-list
+// ELEMENT names) and `mvCanonValName` (map VALUE names) — which rewrites a litunion ATOM of a
+// mixed union to `string`, while the union ROW is registered under the CANON'D ANNOTATION. So
+// preserving here makes the row and the query two different strings.
+// TWO POSITION GATES WERE BUILT AND BOTH ARE REFUTED: softening at `RC_ELEM` alone leaves a
+// field under an element forked, because the emitter's normalizer DESCENDS; softening at the
+// normalizer's whole reach mints TWO rows for ONE type, since the union REGISTRY is keyed by NAME
+// and blind to position. So the spelling must be position-INDEPENDENT, and the only two such
+// rules are "soften everywhere" and "preserve everywhere". The emitter half is filed with its
+// exact diff in `docs/internals/destringify-types-program.md`.
 function litUnionPreserve(parts: string[]) {
   const kept: string[] = []
   let i = 0
@@ -14168,19 +13409,15 @@ function litUnionPreserve(parts: string[]) {
   }
   if nameIsLitUnionType(core) {
     // A DECLARED alias with exactly these members WINS the spelling — the same preference
-    // `litUnionAliasNameOfTy` gives the structural renderer, for the same reason: a name
-    // that is an intern KEY must be one name per type. Without it the two spellings of one
-    // litunion map type mint TWO `{[string]:…}` shape slots, so a `{[string]: ("a"|"b")[]}`
-    // value handed to a `{[string]: K[]}` parameter is still invalid wasm — preserved or
-    // softened, a second spelling is a second row.
-    //
-    // The member texts are recovered by dropping each kept member's surrounding quotes —
-    // the exact inverse of the `"\"" + litText + "\""` every literal RENDER writes
-    // (`tyToStr`), on a member `nameIsLitUnionType` has just confirmed is a quoted literal.
-    // That drop is the GROUP-INTERIOR cut at its home (`tyname.groupInnerOf`, W1): the
-    // operand is one top-level atom of a litunion type NAME, and the guard is the
-    // `nameIsLitUnionType(core)` test on the line above — a SIXTH guard shape, and the
-    // only one in the family whose receiver is an INDEX expression rather than a name.
+    // `litUnionAliasNameOfTy` gives the structural renderer, for the same reason: a name that is
+    // an intern KEY must be one name per type. Without it the two spellings of one litunion map
+    // type mint TWO shape slots, so a `{[string]: ("a"|"b")[]}` value handed to a
+    // `{[string]: K[]}` parameter is still invalid wasm — preserved or softened, a second
+    // spelling is a second row.
+    // The member texts are recovered by dropping each kept member's surrounding quotes, the exact
+    // inverse of the `"\"" + litText + "\""` every literal RENDER writes (`tyToStr`), on a member
+    // `nameIsLitUnionType` has just confirmed is a quoted literal. That drop is the GROUP-INTERIOR
+    // cut at its home (`tyname.groupInnerOf`, W1).
     const texts: string[] = []
     let q = 0
     while q < kept.length {
@@ -14203,42 +13440,18 @@ function litUnionPreserve(parts: string[]) {
   litUnionFlatten(parts)
 }
 
-// ── the FLATTEN: a union all of whose members are literal unions IS a literal union ──
-// `K | K2` spells the litunion whose members are the UNION of `K`'s and `K2`'s
-// (`"aa"|"bb"|"cc"|"dd"`), which reps as the interned i32 ATOM and never boxes. Returns
-// that spelling, or "" when some part of `parts` is not literal-derived.
-//
-// THIS IS `annUnionInnerTy`'s RULE, MIRRORED ONTO THE STRING SIDE, and the two ship
-// together for a measured reason. With the arena arm in place `K | K2` interns as ONE
-// `TyUnion` of `TyLit` members, so `litUnionInlineNameOfTy` — the structural renderer's
-// litunion leg — spells it as its flattened member set. Canon has no arena to read: its
-// `litUnionPreserve` asks `nameIsLitUnionType` of the joined PART SPELLINGS (`"K|K2"`),
-// and an alias-named part is not a quoted lexeme, so without this leg the union still
-// fell through to the per-member softening below — every member widened to `string`, the
-// dedup collapsed it to the bare scalar, and one arena type had two spellings again. That
-// is the exact disagreement #1296/#1300 and both renderers' preserve legs exist to
-// prevent. (Deleting this tail while KEEPING the arena arm is sabotage C: the fixture
-// fails in both tiers.)
-//
-// The tail below is `litUnionInlineNameOfTy`'s tail character-for-character — dedup the
-// member TEXTS, prefer a DECLARED alias with exactly that set (a name that is an intern KEY
-// must be one name per type), else join the quoted members and bank the width. The two
-// producers agree because they run the same three steps in the same order on the same set.
-//
+// —— the FLATTEN: a union all of whose members are literal unions IS a literal union ——
+// `K | K2` spells the litunion whose members are the UNION of `K`'s and `K2`'s, which reps as
+// the interned i32 ATOM and never boxes. Returns that spelling, or "" when some part of `parts`
+// is not literal-derived.
+// THIS IS `annUnionInnerTy`'s RULE, MIRRORED ONTO THE STRING SIDE, and the two ship together for
+// a measured reason: canon has no arena to read, its `litUnionPreserve` asks `nameIsLitUnionType`
+// of the joined PART SPELLINGS, and an alias-named part is not a quoted lexeme — so without this
+// leg every member widened to `string` and one arena type had two spellings again.
 // EVERY part must be literal-derived (`LRP_LITS`). `LRP_NEUTRAL` is NOT enough and that is
-// load-bearing: a NUMERIC literal member classifies neutral and pushes no text, so
-// accepting it would silently DROP the member from the flattened set (`"a" | "b" | 1`
-// would spell `"a"|"b"`, a narrower type than the program wrote). The `null` arm is neutral
-// for the same reason and is handled by `nulLitUnionPreserve`, which strips it before
-// asking. `litRunPartTexts` is the shared member classifier, so a grouper
-// (`K | ("aa"|"bb")`), a nested union (`(K | K2) | K3`) and a bare quoted lexeme all reach
-// here through the one grammar.
-//
-// SET UNION IS THE MEANING, and `is K` stays a SUBSET test: `emitIs`'s `laTexts` ladder
-// emits `id == m0 || id == m1 || …` over the TESTED type's own members, so `x is K` over a
-// flattened `KO1 | KO2` answers true for exactly `K`'s members and false for the rest —
-// which is what an overlapping pair (`"oa"|"ob" | "ob"|"oc"`) needs and what a duplicate
-// pair (`K | K`, `K | ("aa"|"bb")`) collapses to.
+// load-bearing: a NUMERIC literal member classifies neutral and pushes no text, so accepting it
+// would silently DROP the member. SET UNION IS THE MEANING, and `is K` stays a SUBSET test:
+// `emitIs`'s `laTexts` ladder compares against the TESTED type's own members.
 function litUnionFlatten(parts: string[]) {
   const texts: string[] = []
   let i = 0
@@ -14279,17 +13492,16 @@ function litUnionFlatten(parts: string[]) {
   out
 }
 
-// ── the mixed-union literal-run REGROUP, canon's side (owner ruling 2026-07-29) ───────
-// `tyToEmitNameGo`'s union arm regroups the flattened string-LITERAL members of a MIXED
-// union back into their registered alias (`K0 | f64` renders `K0|f64`). Canon must spell
-// the same union the same way or the ruling re-opens the 55-row disagreement #1296 closed,
-// so this is that rule on the STRING side: same three-way member classification, same
-// `litUnionAliasOfLitTexts` lookup, same "at the FIRST literal member's position".
-//
-// IT IS A MIRROR, AND THE MIRROR IS THE POINT. The renderer classifies ARENA members
-// (`rm is TyLit` / `litKind == "str"` / the `null` prim); this classifies member
-// SPELLINGS. The two must partition identically or one producer regroups where the other
-// softens — which is the exact defect shape both rulings were about.
+// —— the mixed-union literal-run REGROUP, canon's side (owner ruling) ————————
+// `tyToEmitNameGo`'s union arm regroups the flattened string-LITERAL members of a MIXED union
+// back into their registered alias (`K0 | f64` renders `K0|f64`). Canon must spell the same
+// union the same way or the ruling re-opens the disagreement it closed, so this is that rule on
+// the STRING side: same three-way member classification, same `litUnionAliasOfLitTexts` lookup,
+// same "at the FIRST literal member's position".
+// IT IS A MIRROR, AND THE MIRROR IS THE POINT. The renderer classifies ARENA members (`rm is
+// TyLit` / `litKind == "str"` / the `null` prim); this classifies member SPELLINGS. The two must
+// partition identically or one producer regroups where the other softens — the exact defect
+// shape both rulings were about.
 
 // A member spelling that is NOT literal-derived: the member that makes a union MIXED.
 const LRP_OTHER = 0
@@ -14371,22 +13583,18 @@ function litRunPartTexts(p: string, out: string[]): i32 {
   LRP_OTHER
 }
 
-// ── the SUBSUMED-ARM COLLAPSE, canon's side (D1048) ──────────────────────────────────
-// The arena drops a union arm that adds no values (`unionDropSubsumedArms`). Canon has to
-// drop the SAME arms or the two producers agree about the TYPE and disagree about the REP:
-// with the arena saying `string` and canon still spelling `Kind|string`, the emitter
-// reserves a union box for a plain-string binding. That is the whole of D1048, and it is
-// why `armLiteralBaseTy`'s litunion mirror could not ship on its own.
-//
-// ONLY THE STRING-LITUNION ARM NEEDS AN EXPLICIT RULE, and the reason the others do not is
-// worth stating because it is luck, not design. Canon's per-member render already softens a
-// bare literal (`"err"` → `string`) and a NUMERIC litunion alias (`numLitUnionAliasName`:
-// `type N = 0|1` → `i32`), and its atom dedup then collapses `string|string` / `i32|i32` to
-// the bare scalar — so those spellings agree with the arena BY ACCIDENT. A string litunion
-// is different: `nameIsLitUnionType` is the interned-atom identity, `litUnionPreserve` keeps
-// it, and `mixedUnionLitAliasRegroup` puts an alias name back even for the INLINE spelling.
-// Writing the rule out covers all three anyway, so the two producers now run one rule rather
-// than meeting in the middle.
+// —— the SUBSUMED-ARM COLLAPSE, canon's side (D1048) ————————————————————————————
+// The arena drops a union arm that adds no values (`unionDropSubsumedArms`). Canon has to drop
+// the SAME arms or the two producers agree about the TYPE and disagree about the REP: with the
+// arena saying `string` and canon still spelling `Kind|string`, the emitter reserves a union box
+// for a plain-string binding. That is the whole of D1048, and it is why `armLiteralBaseTy`'s
+// litunion mirror could not ship on its own.
+// ONLY THE STRING-LITUNION ARM NEEDS AN EXPLICIT RULE, and the reason the others do not is worth
+// stating because it is luck, not design: canon's per-member render already softens a bare
+// literal and a NUMERIC litunion alias, and its atom dedup then collapses the result — so those
+// spellings agree with the arena BY ACCIDENT. A string litunion is different, because
+// `nameIsLitUnionType` is the interned-atom identity and `litUnionPreserve` keeps it. Writing
+// the rule out covers all three anyway, so the two producers run one rule.
 
 // Does the union-member spelling `p` denote a set of STRING LITERALS and nothing else? The
 // canon-side twin of `homogLitUnionBase` over the `string` base — a quoted lexeme, a
@@ -14675,22 +13883,17 @@ function canonEmitNameAt(name: string, ctx: i32) {
 }
 
 // D-CANONFOLD — the same rewrite, told the parser's SPELLING ROOT for `name`.
-//
-// `canonEmitTypeNames`'s two rewrite sites are the only callers that hold one: a
-// `TypeRef`'s root is `annTsOf(nodeIx)` and a `UnionDecl` member's is
-// `udTsRootAt(nodeIx, k)`, and #1288 measured both funnels at 100% coverage. The
-// root is consumed by exactly ONE arm — the intersection fold — because that arm
-// is the only place canon still asks the checker to take a whole annotation
-// SPELLING apart (`nameToTy`). Everything else canon does with the name is either
-// a leaf question with a `tyname.vl` home or a recursion, and a recursion has no
-// root to be handed.
-//
-// `root < 0` is therefore the total and unchanged behaviour, which is what every
-// recursive entry, `canonEmitName`'s render callers and any un-banked annotation
-// get. The fold's ladder is `annotResolve` — the SAME two-leg ladder every
-// positioned annotation, the `is` test and the `UnionDecl` member registration
-// already climb — so the tree route here is not a second resolver, it is the one
-// the checker already uses one pass earlier on this very spelling.
+// `canonEmitTypeNames`'s two rewrite sites are the only callers that hold one: a `TypeRef`'s root
+// is `annTsOf(nodeIx)` and a `UnionDecl` member's is `udTsRootAt(nodeIx, k)`, both funnels
+// measured at full coverage. The root is consumed by exactly ONE arm — the intersection fold —
+// because that arm is the only place canon still asks the checker to take a whole annotation
+// SPELLING apart (`nameToTy`). Everything else canon does with the name is either a leaf question
+// with a `tyname.vl` home or a recursion, and a recursion has no root to be handed.
+// `root < 0` is therefore the total and unchanged behaviour, which is what every recursive entry,
+// `canonEmitName`'s render callers and any un-banked annotation get. The fold's ladder is
+// `annotResolve` — the SAME two-leg ladder every positioned annotation, the `is` test and the
+// `UnionDecl` member registration already climb — so the tree route here is not a second
+// resolver, it is the one the checker already uses one pass earlier on this very spelling.
 function canonEmitNameTs(name: string, ctx: i32, root: i32) {
   canonAtoms = 1
   if name.length == 0 { return name }
@@ -14702,30 +13905,18 @@ function canonEmitNameTs(name: string, ctx: i32, root: i32) {
   // which is the whole reason this arm can render AT `ctx` instead of at `RC_ROOT`.
   const smt = singleMemberAliasTyIx(name)
   if smt >= 0 {
-    // A DECLARED UNION OF DECLARED STRUCTS RENDERS AS ITS MEMBER SPELLINGS, never as their
-    // shapes — `declaredStructUnionMembers`, asked HERE as well as from `unionAliasMembers`.
-    // The two routes reach the same alias by different doors: a `Shape | null` ANNOTATION
-    // splits on the pipe and expands `Shape` through `unionAliasMembers`, which has carried
-    // this rule since it was written, while `type U = Circle | Rect | null` — the `null`
-    // INSIDE the declaration — interns as a one-member wrapper over `TyNullable(TyUnion[…])`,
-    // is claimed transparent by `nulAliasMemberFaithful` (ungated in the inner, by
-    // measurement), and reached the structural render below.
-    //
-    // That render drops the arm NAMES, and every emitter table keyed on the union's name
-    // then holds rows for two ANONYMOUS shapes: `unionArmVariantForObj` /
-    // `unionArmVariantForStructExpr` answer -1 for the real arm, so an un-annotated
-    // arm-valued binding is raw-passed into a `(ref $uBox)` parameter and an inline object
-    // literal falls to `objVariantName`'s global FIRST-MATCH field-set scan — which picks
-    // another union's same-named arm when one exists. Both are `vl check` rc 0 and a module
-    // the engine refuses (D1172, D1173). The same union spelled `Circle | Rect | null`
-    // inline, or `U | null` over a null-free `U`, renders `Circle|Rect|null` and runs; this
-    // makes the third spelling agree with those two rather than inventing a fourth.
-    //
-    // `nulAliasMemberFaithful`'s own header files this residue against the render — *"the
-    // render's dropped struct name is filed against the emitter rather than bought here"* —
-    // and its grid graded the declared-struct inner as "both verdicts LOUD and never a wrong
-    // answer". These two cells are SILENT, so that reading was of a population that did not
-    // contain them; the fix goes where the header said it would.
+    // A DECLARED UNION OF DECLARED STRUCTS RENDERS AS ITS MEMBER SPELLINGS, never as their shapes
+    // — `declaredStructUnionMembers`, asked HERE as well as from `unionAliasMembers`. The two
+    // routes reach the same alias by different doors: a `Shape | null` ANNOTATION splits on the
+    // pipe and expands `Shape` through `unionAliasMembers`, while `type U = Circle | Rect | null`
+    // — the `null` INSIDE the declaration — interns as a one-member wrapper over
+    // `TyNullable(TyUnion[…])`, is claimed transparent by `nulAliasMemberFaithful`, and reached
+    // the structural render below.
+    // That render drops the arm NAMES, so `unionArmVariantForObj` /
+    // `unionArmVariantForStructExpr` answer -1 for the real arm and an inline object literal
+    // falls to `objVariantName`'s global FIRST-MATCH field-set scan — `vl check` rc 0 and a module
+    // the engine refuses (D1172, D1173). The same union spelled inline runs; this makes the third
+    // spelling agree with the other two rather than inventing a fourth.
     const dsu = declaredStructUnionMembers(name)
     if dsu != "" {
       canonAtoms = emitNameAtoms
@@ -14745,41 +13936,17 @@ function canonEmitNameTs(name: string, ctx: i32, root: i32) {
     }
   }
   // A declared alias for a NUMERIC literal union (`type Z = 0 | 1`, and the one-member
-  // `type Z = 1`) denotes its BASE SCALAR here — the identical name the INLINE spelling
-  // produces (the union arm below canons `0` and `1` to `i32` through the literal arm's
-  // `softenLitTy` and dedups them to one atom). Before the `nameNeedsCanon` early-out,
-  // which sees a bare
-  // alias name with no digit/pipe/quote in it and returns it untouched.
-  //
-  // Untouched, the emitter received the ALIAS NAME, `collectU` had registered it in
-  // `unNames` (a `UnionDecl` whose single variant is not a `{…}` shape is not skipped),
-  // so `isUName` claimed the annotation for the `{tag, value}` UNION BOX while every READ
-  // of the value lowered as the plain i32 the checker's own algebra says it is —
-  // `global.get` of a `(ref $box)` handed to `__print_i32__`, SILENT INVALID WASM at
-  // every read position (top level, function body, struct field, array element), with
-  // `vl check` clean. The compiler named the mis-classification itself on `==`:
-  // "`==` over a struct union is not supported yet".
-  //
-  // Both halves of the split were already right on their own: `isValueUnionBox` excludes
-  // a homogeneous literal union ("all-`str` (`"a"|"b"`) or all-numeric (`0|1|2`)") and
-  // `nodeTyIsUnionAlias`'s comment already asserted that `0 | 1 | 2` "canon-names i32".
-  // It did not — for the ALIAS spelling — until here.
-  // A GENERIC APPLICATION `Head<a1, a2>`: canon each ARGUMENT and re-render. This arm did
-  // not exist, so the argument position was the ONE place in an annotation the emitter's
-  // vocabulary never reached: `type Nm = string` + `type Box<T> = {v: T}` + `Box<Nm>` was
-  // `vl check` rc=0 (the checker resolves `Nm` through its own registry and reports
-  // `{v: string}`) and invalid wasm, because `gaeApplyFieldTy` substituted the ARGUMENT
-  // TEXT verbatim and the field was recorded as `Nm` — a name `collectU` had registered as
-  // a one-member `UnionDecl`, so the field interned as a union BOX while every read lowered
-  // as the string it is. Swept over 9 alias-body kinds against a concrete-argument control:
-  // 8 of 9 invalid wasm, all 9 controls CORRECT, and the one green row is a DECLARED struct
-  // (a name canon does not rewrite, and one the emitter resolves on its own).
-  //
-  // BEFORE the `nameNeedsCanon` early-out, which sees no digit, pipe or quote in `Box<Nm>`
-  // and returns it untouched — the same reason `numLitUnionAliasName` sits above it.
-  //
-  // The HEAD is deliberately NOT canon'd: it names a generic alias DECLARATION, and the
-  // emitter's registry (`gaeBases`) is keyed by that declared name.
+  // `type Z = 1`) denotes its BASE SCALAR here — the identical name the INLINE spelling produces.
+  // Placed before the `nameNeedsCanon` early-out, which sees a bare alias name with no
+  // digit/pipe/quote in it and returns it untouched.
+  // Untouched, the emitter received the ALIAS NAME, `collectU` had registered it in `unNames`, so
+  // `isUName` claimed the annotation for the `{tag, value}` UNION BOX while every READ of the
+  // value lowered as the plain i32 the checker's own algebra says it is — SILENT INVALID WASM at
+  // every read position, with `vl check` clean. Both halves of the split were already right on
+  // their own: `isValueUnionBox` excludes a homogeneous literal union, and
+  // `nodeTyIsUnionAlias`'s comment already asserted that `0 | 1 | 2` canon-names i32. It did not,
+  // for the ALIAS spelling, until here. A GENERIC APPLICATION `Head<a1, a2>` canons each ARGUMENT
+  // and re-renders — the argument position was the ONE place canon's vocabulary never reached.
   if annGenAppSpanEnds(name) {
     const gLt = gaeLtAt(name)
     const gArgs: string[] = []
@@ -14848,25 +14015,18 @@ function canonEmitNameTs(name: string, ctx: i32, root: i32) {
     // beside the alias name, and the `| null` form has been arriving here preserved since
     // `nulLitUnionPreserve` was written.
     const lup = litUnionPreserve(parts)
-    // …and a preserve whose answer is a DECLARED ALIAS NAME is kept at EVERY position,
-    // which is `ctxKeepsLitUnion`'s own measurement read exactly rather than widened.
-    // That gate exists because an ungated preserve reddens four cells — a bare INLINE
-    // litunion spelling as a function PARAM and as a DECLARED struct field, "because
-    // those two valtype ladders have an arm for the litunion ALIAS name and none for the
-    // inline member spelling". So the thing the two positions cannot take is the INLINE
-    // spelling, and the ALIAS name is what they already have an arm for; gating on the
-    // SHAPE OF THE ANSWER is strictly more precise than gating on the position.
-    //
-    // IT IS ALSO WHAT THE ARENA NOW REQUIRES. `annUnionInnerTy` gives `K | K2` the
-    // DECLARED alias's own arena index when one matches, so the value's REP at every
-    // position is the interned atom; leaving `RC_ROOT` spelling it `string` puts an i32
-    // atom in a `(ref $array)` local — the `P15atom_store` cell, RUN-WRONG on master and
-    // INVALID-WASM without this line (measured, both for `K | K2` and for the pure inline
-    // spelling of an aliased set).
-    //
-    // `nameHasPipe` IS the alias test here: `litUnionPreserve` returns either one
-    // identifier (its `litUnionAliasOfLitTexts` preference) or a `|`-joined member run,
-    // and only the second is the spelling those two ladders lack.
+    // …and a preserve whose answer is a DECLARED ALIAS NAME is kept at EVERY position, which is
+    // `ctxKeepsLitUnion`'s own measurement read exactly rather than widened. That gate exists
+    // because an ungated preserve reddens a bare INLINE litunion spelling as a function PARAM and
+    // as a DECLARED struct field, since those two valtype ladders have an arm for the litunion
+    // ALIAS name and none for the inline member spelling. So the thing the two positions cannot
+    // take is the INLINE spelling, and gating on the SHAPE OF THE ANSWER is strictly more precise
+    // than gating on the position.
+    // IT IS ALSO WHAT THE ARENA NOW REQUIRES: `annUnionInnerTy` gives `K | K2` the DECLARED
+    // alias's own arena index when one matches, so the value's REP at every position is the
+    // interned atom, and leaving `RC_ROOT` spelling it `string` puts an i32 atom in a
+    // `(ref $array)` local. `nameHasPipe` IS the alias test here: `litUnionPreserve` returns
+    // either one identifier or a `|`-joined member run, and only the second is the missing arm.
     if lup != "" {
       const lupAlias = !nameHasPipe(lup)
       if ctxKeepsLitUnion(ctx) || lupAlias {
@@ -14875,14 +14035,13 @@ function canonEmitNameTs(name: string, ctx: i32, root: i32) {
       }
     }
     const kept: string[] = []
-    // THE MIXED-UNION LITERAL-RUN REGROUP — the OWNER'S RULING of 2026-07-29, on the
-    // annotation side. `tyToEmitNameGo`'s union arm spells a mixed union's string-literal
-    // run by its registered ALIAS (`K0 | f64` → `K0|f64`); without this the same union
-    // canon'd to `string|f64` here, because a `K0` member is expanded through
-    // `unionAliasMembers` (which renders the alias's own PURE-litunion arena type, and a
-    // pure litunion softens) and a quoted member softens through the literal arm below.
-    // That canon-softens / renderer-preserves split IS the 55-row Lsoft class, so the two
-    // halves of the reversal ship in one slice.
+    // THE MIXED-UNION LITERAL-RUN REGROUP — the OWNER'S RULING, on the annotation side.
+    // `tyToEmitNameGo`'s union arm spells a mixed union's string-literal run by its registered
+    // ALIAS (`K0 | f64` → `K0|f64`); without this the same union canon'd to `string|f64` here,
+    // because a `K0` member is expanded through `unionAliasMembers` (which renders the alias's
+    // own PURE-litunion arena type, and a pure litunion softens) and a quoted member softens
+    // through the literal arm below. That canon-softens / renderer-preserves split IS the class
+    // the reversal exists to close, so the two halves ship in one slice.
     const rgCls: i32[] = []
     const rgAlias = mixedUnionLitAliasRegroup(parts, rgCls)
     let rgDone = false
@@ -14970,27 +14129,18 @@ function canonEmitNameTs(name: string, ctx: i32, root: i32) {
     canonAtoms = atoms
     return out
   }
-  // A top-level INTERSECTION: fold through the checker algebra (`intersectTy`),
-  // then render the fold. An unrenderable fold leaves the name unchanged — the
-  // emitter reports its own coverage gap.
-  //
-  // D-CANONFOLD: the fold asks the PARSER's spelling tree where one is banked for
-  // this name, and re-parses the concatenation only where none is. `annotResolve`
-  // is the shared ladder (`tsToTy(root)` on a root, `nameToTy(name)` otherwise) —
-  // the same one `checkProgram`'s `UnionDecl` registration used on this very
-  // member spelling one pass earlier, and the same one every positioned annotation
-  // funnel climbs. So this is not a second resolver arriving; it is the sole
-  // remaining whole-annotation re-parse in the canon pass reaching the route the
-  // rest of the checker already takes.
-  //
-  // WHAT THE ROOT IS AND IS NOT: it describes `name` exactly when canon was
-  // ENTERED with `name` — the whole `TypeRef` spelling, or the whole `UnionDecl`
-  // member. Every recursion enters through `canonEmitNameAt` with `root = -1`, so
-  // a fold reached from inside a union member / array element / function param
-  // takes the NAME leg unchanged. Measured over `tests/cases` (`vl check
-  // --codegen`, the ZZFR counter probe): 25 fold reaches, 23 of them at the entry
-  // depth and 2 nested — so the tree route is what the arm mostly gets, and the
-  // name route is what it keeps for the rest.
+  // A top-level INTERSECTION: fold through the checker algebra (`intersectTy`), then render the
+  // fold. An unrenderable fold leaves the name unchanged — the emitter reports its own coverage
+  // gap.
+  // D-CANONFOLD: the fold asks the PARSER's spelling tree where one is banked for this name, and
+  // re-parses the concatenation only where none is. `annotResolve` is the shared ladder
+  // (`tsToTy(root)` on a root, `nameToTy(name)` otherwise) — the same one `checkProgram`'s
+  // `UnionDecl` registration used on this very member spelling one pass earlier. So this is not a
+  // second resolver arriving; it is the sole remaining whole-annotation re-parse in the canon
+  // pass reaching the route the rest of the checker already takes.
+  // WHAT THE ROOT IS AND IS NOT: it describes `name` exactly when canon was ENTERED with `name`.
+  // Every recursion enters through `canonEmitNameAt` with `root = -1`, so a fold reached from
+  // inside a union member / array element / function param takes the NAME leg unchanged.
   if (nameHasSep(name, '&')) {
     const folded = annotResolve(name, root)
     if folded >= 0 {
