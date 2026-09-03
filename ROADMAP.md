@@ -199,6 +199,19 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   #2406 missed the un-annotated return face and the early-return guard. Four templates ship
   as the harness's own controls, D1197's `array_push` cell grading `SILENT` among them
   (`tests/vl_capability_matrix_test.ts`). README §"The position matrix".
+- **Modernization program — (5) compile-time: the self-compile is ~7× faster, DONE.** 72% of
+  the run was three whole-arena scans asked once per emitted FUNCTION — `moduleHasUnionAs`
+  (29.8% self) and `moduleHasNumCast` (29.4%), both module-wide booleans, now memoised on an
+  arena PREFIX and cleared in `emitProgram`; and `fieldClosureFeOfRecv` (12.8%), now gated on
+  `fnValUsed`, which is what its answer already depended on. Byte-identical, both fixpoints
+  hold. Alternating A/B, both arms on master's own source (2026-09-02, contended box, so read
+  user): **user 70.8/68.1/49.5 s → 15.0/5.6/10.5 s**; on an idle box, 116.7 s → 6.2 s. The
+  ratio held at 6–8× across all five master heads the branch was rebased onto.
+  Guard: `tests/vl_module_predicate_scan_test.ts`, 1–4 s, 1.1× after against 10.0× before.
+  Method: `docs/internals/profiling-the-compiler.md` + `scripts/profile-rank.py`. **NEXT on
+  this axis**, from the post-fix profile: `__str_eq__` at 19.2% self is the name-keyed
+  registries doing linear lookups (`isUName`, `variantIndexOf`, `declaredSlotOf`,
+  `__map_probe__`) — the registry-keying design track item 4 opened, not a hot-spot fix.
 - **Width subtyping — RULED (owner, 2026-09-01): the non-prefix refusal is a GAP, closed
   the Roc way** — shape-monomorphization of narrow-typed consumers (offsets constant per
   caller shape; zero runtime cost; paid in instance count — the variant-count tradeoff

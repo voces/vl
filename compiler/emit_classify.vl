@@ -427,6 +427,10 @@ import {
   mfSrcBases,
   mfSrcKinds,
   mfSrcSlots,
+  modNumCastHit,
+  modNumCastSeen,
+  modUnionAsHit,
+  modUnionAsSeen,
   monoOrigNode,
   msGen,
   msRowChain,
@@ -1216,6 +1220,15 @@ function fieldClosureFeOf(si: i32, prop: string) {
 // monomorphized makers each resolve their OWN closure), else by the receiver's
 // struct SHAPE (`fieldClosureFeOf`). -1 when neither resolves.
 export function fieldClosureFeOfRecv(recvIx: i32, prop: string, fnIx: i32) {
+  // NO FUNCTION VALUE MODULE-WIDE, NO CLOSURE FIELD — the gate is not an optimisation of
+  // the answer, it IS the answer. Every terminal below is `fieldValueFeOf(objFieldVal(…))`,
+  // which resolves only a LAMBDA field (flipped by the lift) or a bare function-NAME field
+  // (`collectFnValUse`'s `FieldInit` arm), so with the flag clear this family cannot return
+  // anything but -1. It cost 12.8% of the self-compile to prove that over 18 call sites
+  // (docs/internals/profiling-the-compiler.md): the
+  // hole-param arm below scans the WHOLE arena per member call, and the compiler's own
+  // source is the `fnValUsed == 0` case. Same shape and reason as `capturedBindingOf`'s.
+  if !fnValUsed { return -1 }
   const e = P.nodes[unwrapParen(recvIx)]
   if e is Ident {
     let li = -1
@@ -12186,11 +12199,21 @@ export function fnHasMap(fnIx: i32) {
 // the other functions of a module that uses the cast anywhere, which is the same trade the
 // `aUsed` flag's header already records ("one unused 3-byte type").
 export function moduleHasUnionAs(): boolean {
-  let i = 0
+  // MEMOISED ON AN ARENA PREFIX, and it has to be: asked once per emitted function, this
+  // was 29.8% of the self-compile on its own (docs/internals/profiling-the-compiler.md;
+  // the compiler's 4,399 functions, no
+  // union-`as` anywhere, so every scan ran to the end). `emit_state.vl`'s memo header has
+  // why a prefix rather than a plain boolean, and `emitProgram` is where it clears.
+  if modUnionAsHit { return true }
+  let i = modUnionAsSeen
   while i < P.nodes.length {
-    if asExprIsUnionCast(i) { return true }
+    if asExprIsUnionCast(i) {
+      modUnionAsHit = true
+      return true
+    }
     i = i + 1
   }
+  modUnionAsSeen = P.nodes.length
   false
 }
 
@@ -12268,13 +12291,19 @@ export function exprIsIntegralFloat(exprIx: i32, _fnIx: i32): boolean {
 
 // Does the MODULE contain a fallible numeric cast? The `moduleHasUnionAs` twin, reserving the
 // three staging slots for the same reason and by the same linear arena walk — the operand of
-// an exactness test is read twice and is typically not a re-readable place.
+// an exactness test is read twice and is typically not a re-readable place. Memoised on an
+// arena prefix for `moduleHasUnionAs`'s reason and by its rule.
 export function moduleHasNumCast(): boolean {
-  let i = 0
+  if modNumCastHit { return true }
+  let i = modNumCastSeen
   while i < P.nodes.length {
-    if asExprNumFallible(i) { return true }
+    if asExprNumFallible(i) {
+      modNumCastHit = true
+      return true
+    }
     i = i + 1
   }
+  modNumCastSeen = P.nodes.length
   false
 }
 
