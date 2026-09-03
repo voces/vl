@@ -64,11 +64,13 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   lands on merge day.** See the fuller row below; `scripts/inventory/split.py --apply
   --relink` against fresh master under an append freeze.
 - 🟡 **4. Key the union/variant registries by arena type id, and collapse the kind ladders —
-  DESIGN + a measured shim landed #2417.** Registries keyed by SPELLED names are why one union
-  has three construction sites that can disagree (see CLAUDE.md's "arena and canon are two
-  producers" and the union member-set ABI note). The remainder is the variant registry, the
-  rest of the union one, and replacing the per-resolver kind ladders with ONE storage-class
-  dispatch table.
+  DESIGN + shim #2417, steps 1-3 and 4a landed since.** Registries keyed by SPELLED names are
+  why one union has three construction sites that can disagree (see CLAUDE.md's "arena and
+  canon are two producers" and the union member-set ABI note). Both PRODUCERS now reach the
+  same key — the spelling route at 2,447/2,447 and the arena route at 2,422/2,447 — so the
+  remaining work is 4b (`registerInlineUnion`'s 11 recursions, under an `emit_collect.vl`
+  freeze) and then the switch. The variant registry and the per-resolver kind ladders
+  (ONE storage-class dispatch table) are still ahead of both.
 
 
 ### Ruled and sequenced (owner decisions already made, waiting only on order)
@@ -223,17 +225,22 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   registries doing linear lookups (`isUName`, `variantIndexOf`, `declaredSlotOf`,
   `__map_probe__`) — the registry-keying design track item 4 opened, not a hot-spot fix.
 - **Modernization program, item 4 — the registries keyed by an interned REP KEY. STEPS 1-3
-  SHIPPED (additive, byte-identical); 4-6 need the freeze.** `canonUnionKey` is minted in
-  canon and pushed as `unKey` beside `unTyIx` at all three mint sites with **no reader**;
+  AND 4a SHIPPED (additive, byte-identical); 4b-6 need the freeze.** `canonUnionKey` is minted
+  in canon and pushed as `unKey` beside `unTyIx` at all three mint sites with **no reader**;
   every name-keyed union read has an arena-keyed twin beside it, and 22 sites offer an arena
   id through a per-site A/B seam that still ships the name answer. **The counters say the
   switch cannot be taken on the key the tree had**: over 2,782 corpus programs the
   `repCanonId` twin DIFFERS from the name key at **2,103 reaches** and answers alone at 107
-  more, so the ID-FREE sites were deliberately not converted to id-first. The new key grades
-  **2,441/2,441 covered, 2,441/2,441 agreeing with the row's own member set, and ZERO merges
-  across different member SETS** (`repCanonId`: 65) — but its ARENA route agrees only
-  **1,363/2,441 (55.8%)**, because `tyToEmitName` renders structurally where the row records
-  declared member names. **That gap is step 4's first job and step 5 blocks on it.**
+  more, so the ID-FREE sites were deliberately not converted to id-first. The key grades
+  **2,447/2,447 covered, 2,447/2,447 agreeing with the row's own member set, and ZERO merges
+  across different member SETS** (`repCanonId`: 65). **Step 4a built the ARENA-side
+  member-sequence renderer** (`canonUnionKeyOfTy`) — the declared names were never lost, they
+  are in the `cStructNames`/`cUnionNames` sidecar `tyToNominalName` already reads — taking the
+  type route from **1,369/2,447 (55.9%) to 2,422/2,447 (98.98%)**, with all 25 misses
+  categorised. **The per-site counter re-keyed on it (mode 3) moves `differ` 2,207 → 1,587 and
+  `name-only` 426 → 1,026**: the arena key stops naming the WRONG row but does not yet name
+  the right one, because a call site holds a different type from the one the row was minted
+  under. **That residue is 4b's, and step 5 still blocks on it.**
   `docs/internals/registry-by-type-id.md` §5.
 - ✅ **Modernization program — (6) the #2419 class cannot come back: three guards, DONE.**
   The owner's question after (5) was "how do we prevent this in the future"; the answer is
