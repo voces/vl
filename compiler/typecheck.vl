@@ -927,6 +927,13 @@ let ufcsMissSpecs: string[] = []
 // identity: the pass-1 hoist and `checkFuncDeclNode` mint the same name for the same
 // parameter, so both read one answer out of `unannotParamTy`.
 let solvedParamTys: {[string]: i32} = Map()
+// THE PIN A HOLE TOOK AT THE CALL THAT RESOLVED IT, keyed by the hole's own name — the
+// UN-SOFTENED arena type the emitter's literal complement cannot re-derive. The union
+// registry renders `i32 | "err"` as `i32|string`, so an `else` over `a is "err"` has no
+// member to subtract there and the arm reads the raw box (D1412). `-2` marks a hole two
+// calls pinned DIFFERENTLY: one wasm function serves both, so a narrowing derived from
+// either pin would be wrong at the other, and the reader must decline.
+let holePinTys: {[string]: i32} = Map()
 // Declarations whose solve has been ATTEMPTED, keyed by decl node index — a body is
 // probed at most once, whether or not the probe found anything to solve.
 let paramSolveTried: {[string]: boolean} = Map()
@@ -3132,6 +3139,7 @@ export function initChecker() {
   ufcsMissAt = []
   ufcsMissSpecs = []
   solvedParamTys = Map()
+  holePinTys = Map()
   paramSolveTried = Map()
   holeFlowSrc = []
   holeFlowDst = []
@@ -5686,7 +5694,6 @@ function collectThenNarrows(condIx: i32, names: string[], tys: i32[]) {
 // `noteHoleAlt`.
 function holeElseRemainderOk(tIdx: i32): boolean {
   if tIdx < 0 { return false }
-  if isLitBearing(tIdx) { return false }
   const t = T.tys[tIdx]
   if t is TyObj { return false }
   true
@@ -19684,6 +19691,37 @@ function rebaseDerivedHole(row: i32, innerTy: i32) {
   -1
 }
 
+// Bank the pin `ty` a hole named `name` took. FIRST pin wins and a DISAGREEING second pin
+// poisons the row to `-2`, which `pinnedHoleTyOf` reads as "no answer": the emitter lowers
+// ONE body for every call, so a rep read off one call's pin is a miscompile at the other.
+// Never banked from a quiet probe — `solveUnannotParams` re-checks the body with its tables
+// truncated afterwards, and this one is not on that list by design.
+function notePinnedHole(name: string, ty: i32) {
+  if inferQuiet { return 0 }
+  if ty < 0 { return 0 }
+  const cur = holePinTys[name] ?? -1
+  if cur == -1 {
+    holePinTys[name] = ty
+    return 0
+  }
+  if cur == ty { return 0 }
+  if cur >= 0 {
+    if tySame(cur, ty) { return 0 }
+  }
+  holePinTys[name] = -2
+  0
+}
+
+// The pin behind arena type `tyIx` when it is a HOLE, or -1 for anything else — a
+// non-hole, an unpinned hole, or one two calls pinned differently. The emitter's route to
+// the un-softened member set a hole parameter's own recorded type never carries (D1412).
+export function pinnedHoleTyOf(tyIx: i32): i32 {
+  if tyIx < 0 { return -1 }
+  const t = T.tys[tyIx]
+  if !(t is TyVar) { return -1 }
+  holePinTys[t.tvName] ?? -1
+}
+
 // Resolve a (possibly DERIVED) hole against a call's bindings: a direct binding on its name wins;
 // a RETURN derivation collapses to the pinned function's return (the host's
 // instantiate-and-collapse, which keeps `functions/inferred-return-soundness.vl` rejecting); a
@@ -19700,7 +19738,10 @@ function substHoleTy(tyIx: i32, bNames: string[], bTys: i32[]) {
   const t = T.tys[tyIx]
   if !(t is TyVar) { return -1 }
   const b = bindOf(bNames, bTys, t.tvName)
-  if b >= 0 { return b }
+  if b >= 0 {
+    notePinnedHole(t.tvName, b)
+    return b
+  }
   const row = hdRowOf(tyIx)
   if row < 0 { return -1 }
   const kind = hdKind[row]
