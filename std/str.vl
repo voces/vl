@@ -1,189 +1,43 @@
 // `std:str` — the string method surface VL's core does not have.
 //
-// The core's whole string vocabulary is FIVE operations — `slice`, `indexOf`,
-// `includes`, `charCodeAt`, `fromCodePoint` — plus `+`, `==`,
-// `.length`, `s[i]` and `for cp in s`. Everything a program actually does to
-// text is missing: you cannot split a string in VL, cannot trim one, cannot
-// replace inside one, cannot ask whether one ends with another.
-// `docs/guide/strings-design.md` §Methods calls this "the largest user-facing
-// gap in the whole area", and this module is its **step 1**.
+// The core has `slice`, `indexOf`, `includes`, `charCodeAt` and `fromCodePoint`, plus `+`,
+// `==`, `.length`, `s[i]` and `for cp in s`; splitting, trimming, replacing and the ends-with
+// questions are missing (`docs/guide/strings-design.md` §Methods, step 1). All of it is
+// expressible over those primitives, so none needs the emitter, an intrinsic or a rep change.
+// SELF-FIRST, so every export is a UFCS METHOD (`self` is the switch, B14); `join` alone takes
+// a `string[]` receiver, which is the shape of the operation and what `std:fmt` spelled.
 //
-// WHY THIS IS A LIBRARY AND NOT COMPILER WORK. Every operation here is
-// expressible over the primitives the core already has, so none of it needs the
-// emitter, a new intrinsic, or a representation change — and that is exactly
-// why the design doc sequences it FIRST. The rep change that follows (UTF-8
-// bytes behind a slice header, §Storage/§Header) has to be validated against
-// something, and six methods' worth of fixtures is a thin instrument against an
-// emitter whose known failure mode is a silently missing ladder arm. The
-// fixtures under `tests/cases/std/str-*.vl` are that instrument; they are
-// written against the SURFACE (`.length`, `s[i]`, `slice`) and not the storage,
-// so they survive the swap unchanged and fail loudly if it goes wrong.
+// EVERY BUILDER HERE FILLS A CODE-POINT BUFFER — READ THIS BEFORE EDITING. `let s = ""` then
+// `s = s + piece` in a loop is QUADRATIC on this compiler: no accumulation fusion in the
+// native emitter, and `tests/cases/strings/accum-*.vl` asserts only the RESULT, so it is blind
+// to the cost class. An `i32[]` GROWS (amortized push); a `string` does not, since `s + c`
+// copies the whole left operand — two `+`s splicing ONE result (`replace`) are fine, O(n) once
+// and not O(n) per element. The second half of the rule is the UNIT: what enters the buffer is
+// a CODE POINT, by `for cp in s` and NEVER by `s[i]` — `fromCodePoints` reads code points (its
+// name is its contract) while `s[i]` is a BYTE, so a byte pushed in comes back out as a
+// different character. `pushStr` enforces it file-wide (`docs/internals/str-byte-semantics.md`).
 //
-// SELF-FIRST, SO EVERY EXPORT IS A METHOD. `self` is VL's UFCS switch (B14): a
-// free function whose first parameter is named `self` is reachable as
-// `receiver.name(rest)`. `"a,b".split(",")` and `split("a,b", ",")` are the
-// same call, and a string RECEIVER resolves it exactly like a struct one
-// (verified — `typecheck.vl`'s string-method arm falls through to `ufcsCallTy`
-// after the four builtins). The one export that breaks the pattern is `join`,
-// whose receiver is a `string[]`; that is not an inconsistency but the shape of
-// the operation, and `std:fmt` already spelled it that way.
+// ASCII IS IN THE NAME WHERE ASCII IS THE BEHAVIOUR: an unqualified `toUpper` that silently
+// leaves `é` alone is the quiet-lie class VL rejects, and full case mapping needs Unicode
+// tables (a future `std:unicode`). `trim` is ASCII-only and NOT named for it — an OPEN RULING,
+// since JS, Python, Rust and Go all strip U+00A0 (§R3 of that audit has both arguments).
 //
-// ── EVERY BUILDER HERE FILLS A CODE-POINT BUFFER. READ THIS BEFORE EDITING. ──
+// THE DEGENERATE INPUTS ARE RULED, NOT LEFT TO FALL OUT, and the rule is FOLLOW THE UNANIMOUS
+// PRECEDENT — `DECISIONS.md` already put the core's string methods in the JS camp, and a std
+// module disagreeing with its own core would be the seam this language avoids. Every export
+// documents its own edges below and is pinned by a fixture. THE ONE LAW is
+// `s.replaceAll(f, t) == s.split(f).join(t)` for a NON-EMPTY `f`, which is why the two share
+// `findFrom` and consume matches left to right without overlap; for an empty `f` it cannot hold.
 //
-// The obvious way to build a string in VL — `let s = ""` then `s = s + piece`
-// in a loop — is **O(n²) on this compiler**, and that is a measured fact rather
-// than a caution. `DECISIONS.md` (B7b) records a string-accumulation fusion
-// that turns exactly that shape into an amortized buffer fill; the fixtures for
-// it still sit in `tests/cases/strings/accum-*.vl`. But that optimization was
-// implemented in `compiler/toWasm.ts` (PR #168) and **deleted with the TS core**
-// (PR #466) — it was never ported to the native emitter, and
-// `grep -rn "accumulat" compiler/*.vl` finds no recognizer. The accum fixtures
-// still pass because they only assert the RESULT, which per-append concat also
-// produces; they are blind to the cost class they were written to pin.
-//
-// Measured on this head, `s = s + "abcdefgh"` in a loop, whole-run wall clock:
-//
-//     n = 20000  →   313 ms
-//     n = 40000  →  1502 ms   (×4.8)
-//     n = 80000  →  7614 ms   (×5.1)
-//
-// Doubling the input quintuples the time. That is quadratic, and it is why no
-// function in this file accumulates into a string. The repo's established
-// answer is a single code-point buffer materialized once — `compiler/format.vl`'s
-// `joinOut`, `fmt_util.vl`'s `collapseWs` and `joinLinesRange` all carry the
-// scar tissue, the last of them noting that the accumulator it replaced "blew
-// the compiler's NON-FREEING null-GC heap" on a large file. `pushRange` /
-// `pushStr` / `fromCodePoints` below are that idiom, factored once.
-//
-// The rule for anyone extending this module: **an `i32[]` grows, a `string`
-// does not.** `buf.push(c)` is an amortized append; `s + c` copies the whole
-// left operand. Two `+`s to splice a result (`replace`) are fine — that is
-// O(n) once, not O(n) per element.
-//
-// And the second half of the rule, which is about the UNIT rather than the
-// cost: **what goes into that buffer is a CODE POINT, and it gets there by
-// `for cp in s`, never by `s[i]`.** `fromCodePoints` reads its argument as code
-// points — its name is its contract — and `for cp in s` yields code points both
-// today and after the UTF-8 swap, so the two move together. `s[i]` does not:
-// §API makes it a BYTE, and a byte pushed into a code-point buffer comes back
-// out as a different character (`fromCodePoints([195, 169])` is `"Ã©"`, not
-// `"é"` — run it). `pushStr` is where that discipline is enforced for the whole
-// file; `docs/internals/str-byte-semantics.md` is the audit that found it.
-//
-// ── ASCII IS IN THE NAME WHERE ASCII IS THE BEHAVIOUR ──
-//
-// `toUpperAscii` / `toLowerAscii` are spelled that way DELIBERATELY, and the
-// design doc rules it: an unqualified `toUpper` that silently leaves `é` alone
-// is the quiet-lie class VL exists to reject — it works on every string the
-// author tests and is wrong on the first one a user types. Full case mapping
-// needs Unicode tables (and is not even a per-code-point map: `ß` upper-cases
-// to two characters, and Turkish dotless-i makes it LOCALE-dependent), so it
-// belongs to a future `std:unicode` alongside `normalize`, `graphemes` and
-// `reverse`. The name here promises exactly what it does.
-//
-// `trim` is ASCII-only and is NOT named for it, which this comment used to call
-// a deliberate asymmetry. **CORRECTION — the precedent it claimed is not
-// there.** It said the six-character set is "the same six C's `isspace` takes
-// and Go's `strings.TrimSpace` starts from". "Starts from" is the tell: Go's
-// six are a FAST PATH, and `TrimSpace` falls through to `TrimFunc(s,
-// unicode.IsSpace)` the moment it meets a byte >= 0x80 — so Go trims NBSP.
-// So do Rust (`char::is_whitespace`, the Unicode White_Space property), Python
-// (`str.strip()`), and JS (`String.prototype.trim`, WhiteSpace + LineTerminator).
-// All four of the languages this module's rulings defer to strip U+00A0; VL
-// implemented Go's optimization and stopped, which is not the same as
-// implementing Go.
-//
-// The behaviour is UNCHANGED here — an audit is not the place to move a shipped
-// answer — but it is now an OPEN RULING rather than a settled asymmetry, and
-// the argument on each side (including the good one for ASCII-only: a lexer
-// wants exactly these six, and White_Space is 25 code points that need no
-// tables) is written up in `docs/internals/str-byte-semantics.md` §R3. Note the
-// question is rep-INDEPENDENT: byte-scanning for ASCII whitespace stays exactly
-// correct after the UTF-8 swap, because no byte of a multi-byte sequence is
-// ever < 0x80. It surfaces here only because the audit had to check it.
-//
-// ── THE DEGENERATE INPUTS ARE RULED, NOT LEFT TO FALL OUT ──
-//
-// Every export below documents its own edges and every one is pinned by a
-// fixture. The rulings all resolve the same way: **follow the unanimous
-// precedent**, because `DECISIONS.md` already put the core's string methods in
-// the JS camp ("`indexOf("")` returns 0") and a std module that disagreed with
-// its own core would be the seam this language is written to avoid. Where JS,
-// Python, Rust and Go agree — and on the empty-needle question all four do —
-// that agreement is the answer. The two consequences worth stating up front:
-//
-//   - An empty separator SPLITS INTO CHARACTERS, so `"".split("")` is `[]`
-//     (nothing to split) while `"".split(",")` is `[""]` (one empty field).
-//     Those look inconsistent side by side and are not: a separator that
-//     appears zero times always yields exactly one field.
-//   - An empty `from` MATCHES AT EVERY BOUNDARY, so `"abc".replaceAll("", "-")`
-//     is `"-a-b-c-"` — `to` before the first character, between each pair, and
-//     after the last. Go's own documentation spells this out ("if old is empty,
-//     it matches at the beginning of the string and after each UTF-8 sequence"),
-//     and Rust/Python/JS produce the identical string.
-//
-// ── THE ONE LAW WORTH REMEMBERING ──
-//
-//     s.replaceAll(from, to) == s.split(from).join(to)      for a non-empty `from`
-//
-// It holds for every input, including the ones people get wrong (a separator at
-// the very start, at the very end, adjacent, or overlapping), and it is pinned
-// as a fixture rather than left as a claim. It is why `split` and `replaceAll`
-// share `findFrom` and agree about overlap: matches are consumed
-// non-overlapping, left to right, so `"aaa".replaceAll("aa", "b")` is `"ba"`
-// and not `"bb"` or `"b"`. For an EMPTY `from` the law does not hold and cannot
-// — the boundary rule above puts `to` at both ends, and `split("")` does not —
-// which is stated here so nobody "fixes" one side into agreement with the other.
-//
-// ── WHAT THIS MODULE DOES NOT DO ──
-//
-// NO REGEX, NO PATTERN ARGUMENT. Every `from`/`sep`/`prefix` here is a literal
-// string. `std:regex` is its own module in the design doc's core-vs-std table,
-// wants a compiled pattern type, and would put a second coordinate system next
-// to these byte offsets; a half-regex hidden behind a `split` overload is worse
-// than none.
-//
-// NO `splitN` / `splitOnce` / `rsplit`, NO `trimPrefix`/`trimSuffix`, NO
-// `replaceFrom(i)`. Each is a real operation with real callers elsewhere, and
-// none has a caller in this tree yet — `docs/internals/std-design.md` D1's
-// admission principle is that nothing lands without one. They are all purely
-// additive over `findFrom`/`lastIndexOf`, so the day a consumer appears they
-// cost a few lines. A name that does not exist yet is the only one still free
-// to be right.
-//
-// NO `contains`, NO `indexOf`, NO `slice`. Those are core builtins on `string`
-// already; re-exporting them would create a SECOND name for one operation and,
-// because VL has no namespace import, a program that imported both would take a
-// hard duplicate-binding parse error. `lastIndexOf` is here because the core has
-// no counterpart at all.
-//
-// NO CODE-POINT-COUNTING ANYWHERE, AND NO UNIT CONVERSION EITHER. `.length`
-// and every index in this file is whatever the core's index unit is — today a
-// code point, after the rep swap a UTF-8 byte — and nothing here converts
-// between the two or asks which one it is. Offsets are produced by `indexOf`/
-// `length` and consumed by `slice`/`matchAt` in the same unit, so they cancel.
-// The one place a unit is NAMED is the builder buffer, which is code points by
-// `fromCodePoints`'s contract and is filled by iteration for exactly that
-// reason (see the buffer rule above).
-//
-// The two places the unit is LOAD-BEARING are now both RULED, and both ruled the
-// same way — CODE POINTS: `padStart`/`padEnd`'s `len`, which is a width rather
-// than an offset and so has nothing to cancel against (§R1), and the EMPTY-needle
-// boundary in `split`/`replaceAll` (§R2, which today's implementation already
-// satisfies because those loops iterate). Nothing else in this file names a unit.
-//
-// ── RELATIONSHIP TO `std:fmt` ──
-//
-// `std:fmt` used to own `split`, `join`, `repeat` and `padLeft`. It no longer
-// implements any of them: it re-exports the first three from here and its
-// `padLeft` is a one-line call into `padStart`, so there is exactly one
-// implementation of each in the tree. That is not tidiness — it is a bug fix.
-// VL has no namespace import, so two modules exporting `split` means
-// `import { toString } from "std:fmt"` and `import { split } from "std:str"` in one
-// file is fine but `import { split } from "std:fmt"` beside it is a HARD PARSE
-// ERROR, and which module a caller reached for would have silently decided
-// whether their join was O(n) or O(n²). `std:fmt` keeps the name for its
-// existing importers; `std:str` keeps the code.
+// WHAT THIS MODULE DOES NOT DO. No regex or pattern argument (`std:regex` is its own module),
+// and no `splitN`/`rsplit`/`trimPrefix`/`replaceFrom(i)`: `docs/internals/std-design.md` D2's
+// admission principle is that nothing lands without a caller in this tree. No `contains`,
+// `indexOf` or `slice` either — core builtins, and with no namespace import a program
+// importing both names takes a hard duplicate-binding parse error, which is also why `std:fmt`
+// re-exports `split`/`join`/`repeat` from here and calls `padStart` for its `padLeft`, leaving
+// one implementation of each. And NO UNIT CONVERSION — every index is the core's index unit,
+// produced by `indexOf`/`length` and consumed by `slice`/`matchAt`, so they cancel; the unit
+// is NAMED in two places, both ruled CODE POINTS: the builder buffer and `len` (§R1).
 
 // ── the shared cores ───────────────────────────────────────────────────────
 
@@ -230,23 +84,16 @@ function findFrom(self: string, needle: string, from: i32): i32 {
   -1
 }
 
-// Append every code point of `s` to `buf`. The single copy primitive of this
-// module — see the header: `buf` GROWS (amortized push), a string would be
-// COPIED WHOLE per append.
+// Append every code point of `s` to `buf`. The single copy primitive of this module — see the
+// header: `buf` GROWS (amortized push), a string would be COPIED WHOLE per append.
 //
-// IT ITERATES RATHER THAN INDEXES, AND THAT IS LOAD-BEARING, NOT STYLE.
-// `buf` is drained by `fromCodePoints`, whose contract is fixed by its name:
-// each `i32` is a CODE POINT. `for cp in s` yields code points too, and
-// `docs/guide/strings-design.md` §Codepoints keeps it yielding code points
-// after the UTF-8 swap — so the producer and the consumer are a matched pair
-// whose meanings move together, i.e. not at all. `buf.push(s[i])` was the
-// SAME VALUE today and a different one after: `s[i]` becomes a BYTE, and
-// pushing the two bytes of `é` into a code-point buffer re-encodes them as
-// two separate characters. `fromCodePoints([195, 169])` is `"Ã©"` on this very
-// build — measured, not predicted — so every builder in this file (`join`,
-// `replaceAll`, `repeat`, `padFill`, `mapAsciiCase`) would have shipped
-// mojibake the day the representation changed. See
-// `docs/internals/str-byte-semantics.md` §Builders.
+// IT ITERATES RATHER THAN INDEXES, AND THAT IS LOAD-BEARING, NOT STYLE. `buf` is drained by
+// `fromCodePoints`, whose contract is fixed by its name: each `i32` is a CODE POINT. `for cp
+// in s` yields code points too, so producer and consumer are a matched pair whose meanings
+// move together. `buf.push(s[i])` would not be: `s[i]` is a BYTE, so pushing the two bytes of
+// `é` into a code-point buffer re-encodes them as two separate characters, and every builder
+// in this file (`join`, `replaceAll`, `repeat`, `padFill`, `mapAsciiCase`) would ship
+// mojibake. See `docs/internals/str-byte-semantics.md` §Builders.
 function pushStr(buf: i32[], s: string) {
   for cp in s { buf.push(cp) }
 }
@@ -343,40 +190,16 @@ export function lastIndexOf(self: string, needle: string): i32 {
 
 // The pieces of `self` between each occurrence of `sep`, left to right.
 //
-// The result ALWAYS has one more element than `sep` has occurrences, which is
-// the single rule every edge below follows from:
+// The result ALWAYS has one more element than `sep` has occurrences, and every edge follows:
+// a separator at the very START gives a leading empty piece, at the very END a trailing one,
+// ADJACENT separators an empty piece between them, a separator that never occurs the whole
+// string as one piece, and an empty input therefore one empty piece (`"".split(",")` is
+// `[""]`). Matches do not OVERLAP: consumed left to right, `"aaa".split("aa")` is `["", "a"]`.
 //
-//   - `"a,b,c".split(",")` → `["a", "b", "c"]`
-//   - a separator at the very START gives a leading empty piece:
-//     `",a".split(",")` → `["", "a"]`
-//   - at the very END, a trailing one: `"a,".split(",")` → `["a", ""]`
-//   - ADJACENT separators give an empty piece between them:
-//     `"a,,b".split(",")` → `["a", "", "b"]`
-//   - a separator that never occurs gives the whole string as one piece:
-//     `"abc".split(",")` → `["abc"]`
-//   - an EMPTY input therefore gives one empty piece: `"".split(",")` → `[""]`
-//   - matches do not OVERLAP, they are consumed left to right:
-//     `"aaa".split("aa")` → `["", "a"]`
-//
-// An EMPTY separator is the one case outside that rule: it splits into single
-// CODE POINTS, so `"abc".split("")` → `["a", "b", "c"]` and — this is the edge
-// people trip on — `"".split("")` → `[]`, an EMPTY list rather than `[""]`.
-// "Code points" is the word that matters after the UTF-8 swap: an empty
-// separator is the only input in this file where "every boundary" has two
-// possible readings, and the loop below iterates rather than indexes so the
-// answer stays the one it gives today — which is also Go's ("if sep is empty,
-// Split splits after each UTF-8 sequence"). `"é".split("")` is one piece, not
-// two half-characters. The alternative reading is an OPEN RULING;
-// `docs/internals/str-byte-semantics.md` §R2 has it.
-// The two empty-input answers differ because the questions differ: splitting
-// "" on "," finds no separator and hands back the one field it was given,
-// while splitting "" into its characters finds none. Every one of JS, Python
-// (via `list(s)`), Rust `.chars()` and Go `strings.Split` agrees; so did the
-// `std:fmt` implementation this replaces.
-//
-// The pieces are `slice`s of `self`, which is O(1) and allocation-free once the
-// rep change lands (§Header) — splitting a 1 MB file into 10k lines will
-// allocate 10k headers and copy zero bytes. It copies today.
+// An EMPTY separator is the one case outside that rule: it splits into single CODE POINTS, so
+// `"abc".split("")` is `["a","b","c"]` and `"".split("")` is `[]`, an EMPTY list. The loop
+// iterates rather than indexes so `"é".split("")` stays one piece, as Go and the rest agree;
+// the byte-boundary reading is an OPEN RULING in `docs/internals/str-byte-semantics.md` §R2.
 export function split(self: string, sep: string): string[] {
   const out: string[] = []
   if sep.length == 0 {
@@ -394,24 +217,18 @@ export function split(self: string, sep: string): string[] {
   out
 }
 
-// The elements of `self` concatenated with `sep` between each adjacent pair —
-// `split`'s inverse, and the receiver is a `string[]` rather than a string
-// because that is what the operation is ON.
+// The elements of `self` concatenated with `sep` between each adjacent pair — `split`'s
+// inverse, with a `string[]` receiver because that is what the operation is ON.
 //
-// An empty list joins to `""` and a one-element list to that element, both
-// without touching `sep` — so `[""].join(",")` is `""` and `["", ""].join("-")`
-// is `"-"`, one separator for the one gap. There is no trailing separator,
-// ever.
+// An empty list joins to `""` and a one-element list to that element, both without touching
+// `sep` — so `[""].join(",")` is `""` and `["", ""].join("-")` is `"-"`, one separator for the
+// one gap. There is never a trailing separator.
 //
-// One buffer, one `fromCodePoints`: the `out = out + parts[i]` spelling of this
-// function is the exact loop that went quadratic and blew the compiler's heap
-// (`compiler/fmt_util.vl:216`). Joining 40,000 eight-character pieces, whole-run
-// wall clock, same 359,999-character result: **28 ms buffered against 12,475 ms
-// accumulated** — the two spellings are not a tuning difference, they are two
-// complexity classes, and this is the A/B behind the header's rule. The single-
-// and zero-element early returns are not micro-optimization either: they are
-// what makes joining a one-piece list allocation-free, which is the common
-// result of splitting on a separator that was not there.
+// ONE BUFFER, ONE `fromCodePoints`: the `out = out + parts[i]` spelling of this function is
+// the exact loop that went quadratic and blew the compiler's non-freeing heap (see
+// `compiler/fmt_util.vl`'s `joinLinesRange`), so the two spellings are complexity classes
+// apart rather than a tuning difference. The zero- and one-element early returns are not
+// micro-optimization either: they make joining a one-piece list allocation-free.
 export function join(self: string[], sep: string): string {
   if self.length == 0 { return "" }
   if self.length == 1 { return self[0] }
@@ -444,30 +261,18 @@ export function replace(self: string, from: string, to: string): string {
   self.slice(0, at) + to + self.slice(at + from.length, self.length)
 }
 
-// `self` with EVERY occurrence of `from` replaced by `to`.
+// `self` with EVERY occurrence of `from` replaced by `to`. A `from` that never occurs returns
+// `self` unchanged with nothing allocated, checked BEFORE the buffer is built.
 //
-// Matches are consumed left to right and never overlap, because the scan
-// resumes PAST the match it just took: `"aaa".replaceAll("aa", "b")` is `"ba"`
-// — the first two characters are consumed, the third is left. This is the same
-// consumption rule `split` uses, which is what makes the law in the header
-// (`replaceAll(f, t) == split(f).join(t)` for a non-empty `f`) hold on exactly
-// these awkward inputs. A `to` that CONTAINS `from` is not rescanned, so
-// `"a".replaceAll("a", "aa")` terminates at `"aa"`.
+// Matches are consumed left to right and never overlap, because the scan resumes PAST the
+// match it just took: `"aaa".replaceAll("aa", "b")` is `"ba"`. That is `split`'s consumption
+// rule, and it is what makes the header's law hold on exactly these awkward inputs. A `to`
+// that CONTAINS `from` is not rescanned, so `"a".replaceAll("a", "aa")` terminates at `"aa"`.
 //
-// An EMPTY `from` matches at every CODE-POINT boundary — before the first
-// character, between each pair, and after the last — so `"abc".replaceAll("",
-// "-")` is `"-a-b-c-"` and `"".replaceAll("", "-")` is `"-"`. That is JS,
-// Python, Rust and Go verbatim (Go documents it as "up to k+1 replacements for
-// a k-rune string" — note *rune*), and it is the one input where the split/join
-// law does not hold. The loop iterates code points rather than indexing, so
-// after the UTF-8 swap it still puts `to` between CHARACTERS and not between
-// the bytes of one: a byte-boundary reading would make `"é".replaceAll("", "-")`
-// the invalid `"-\xC3-\xA9-"`. Same open ruling as `split("")`
-// (`docs/internals/str-byte-semantics.md` §R2).
-//
-// A `from` that never occurs returns `self` unchanged with nothing allocated —
-// checked BEFORE the buffer is built, because "no match" is the common case for
-// a caller sanitizing input that is usually already clean.
+// An EMPTY `from` matches at every CODE-POINT boundary — before the first character, between
+// each pair, after the last — so `"abc".replaceAll("", "-")` is `"-a-b-c-"`. That is JS,
+// Python, Rust and Go verbatim, and the one input where the law does not hold; the loop
+// iterates, so `to` lands between CHARACTERS (`docs/internals/str-byte-semantics.md` §R2).
 export function replaceAll(self: string, from: string, to: string): string {
   const buf: i32[] = []
   if from.length == 0 {
@@ -548,35 +353,18 @@ export function repeat(self: string, n: i32): string {
   fromCodePoints(buf)
 }
 
-// Exactly `n` CODE POINTS of `pad`, tiled and truncated wherever the tiling
-// lands — `padFill(3, "ab")` is `"aba"`. `n <= 0` or an empty `pad` yields
-// `""`, which is what makes both padders return their input untouched instead
-// of special-casing the two degenerate arguments twice.
+// Exactly `n` CODE POINTS of `pad`, tiled and truncated wherever the tiling lands —
+// `padFill(3, "ab")` is `"aba"`. `n <= 0` or an empty `pad` yields `""`, which is what lets
+// both padders return their input untouched without special-casing the degenerate arguments
+// twice. Truncating mid-tile rather than refusing a multi-character pad is what JS does, and
+// it is what makes the result EXACTLY `len` wide — a column that is sometimes one unit wider
+// is not a column.
 //
-// Truncating mid-tile rather than refusing a multi-character pad is what JS
-// does, and it is the behaviour that makes the result EXACTLY `len` wide, which
-// is the entire point of padding (a column that is sometimes one unit wider is
-// not a column).
-//
-// §R1 IS RULED, AND THE UNIT IS CODE POINTS. `docs/internals/str-byte-semantics.md`
-// §R1 laid out bytes / code points / two names and recommended code points; the
-// owner took it. The evidence is that not one surveyed language measures padding
-// in bytes except C, which is also the only one whose columns visibly misalign —
-// and Go, the byte-indexed language VL joins, went out of its way to differ from
-// C on exactly this point and said so in its documentation: *"Width and precision
-// are measured in units of Unicode code points, that is, runes. (This differs from
-// C's printf where the units are always measured in bytes.)"*
-//
-// §API's "one coordinate system" does not reach this. That argument is about
-// OFFSETS — `slice`, `indexOf`, regex match positions, the I/O boundary — which
-// must agree so no converter sits on a hot path. `len` is a WIDTH: it is never
-// handed to `slice`, never compared to a match position, never crosses a
-// boundary. There is nothing for it to be inconsistent with.
-//
-// SO THE TILING IS BY CODE POINT, WHICH ALSO CLOSES `padFill`'s OWN HAZARD: the
-// previous spelling truncated with `slice`, which now takes BYTE offsets, so a
-// multi-byte pad would have been cut mid-character and emitted a partial
-// sequence. Filling from a code-point vector cannot produce one.
+// THE UNIT IS CODE POINTS, RULED (§R1 of `docs/internals/str-byte-semantics.md`): no surveyed
+// language measures padding in bytes except C, and Go went out of its way to differ from C on
+// exactly this point. §API's "one coordinate system" does not reach here, because that is
+// about OFFSETS and `len` is a WIDTH. Tiling from a code-point vector also cannot cut a
+// multi-byte pad mid-character, which the old `slice` truncation could.
 function padFill(n: i32, pad: string): string {
   if n <= 0 { return "" }
   const tile: i32[] = []
@@ -593,23 +381,16 @@ function padFill(n: i32, pad: string): string {
 
 // `self` padded on the LEFT with `pad` until it is `len` long.
 //
-// Returns `self` untouched when it is already `len` wide or wider — padding never
-// TRUNCATES, so `"hello".padStart(3, "0")` is `"hello"` and not `"hel"`. That
-// is JS's rule and the only safe one: a padder that shortened its input would
-// silently destroy data in exactly the logging and table-formatting code that
-// calls it. An empty `pad` is likewise a no-op rather than an infinite loop.
+// Returns `self` untouched when it is already `len` wide or wider — padding never TRUNCATES,
+// so `"hello".padStart(3, "0")` is `"hello"`, not `"hel"`. That is JS's rule and the only safe
+// one: a padder that shortened its input would silently destroy data in exactly the logging
+// and table-formatting code that calls it. An empty `pad` is likewise a no-op rather than an
+// infinite loop.
 //
-// `len` COUNTS CODE POINTS (§R1, ruled — see `padFill`), so the width is measured
-// with `cpLen()` and not with `.length`. That is O(n) and named so at the call
-// site, which is §Codepoints' own principle satisfied: `padStart` is a named
-// call, not a subscript, so paying for a data-dependent measurement inside it is
-// visible exactly where that principle wants it.
-//
-// Code points are still not DISPLAY width — a CJK character is two columns, a
-// combining mark is zero — and Go, Rust and Python all accept the same gap.
-// Grapheme- or width-correct padding belongs to `std:unicode` alongside
-// `graphemes()`; code points are the right floor beneath it, strictly better than
-// bytes and reachable without tables.
+// `len` COUNTS CODE POINTS (§R1, ruled — see `padFill`), so the width is measured with
+// `cpLen()` and not `.length`. That is O(n), and naming it at the call site is §Codepoints'
+// own principle satisfied. Code points are still not DISPLAY width — a CJK character is two
+// columns — and grapheme- or width-correct padding belongs to `std:unicode`.
 export function padStart(self: string, len: i32, pad: string): string {
   const fill = padFill(len - self.cpLen(), pad)
   if fill.length == 0 { return self }
@@ -627,13 +408,12 @@ export function padEnd(self: string, len: i32, pad: string): string {
 
 // ── ASCII case ─────────────────────────────────────────────────────────────
 
-// The distance from `c` to its ASCII case counterpart, or 0 when it has none —
-// the one place the alphabet is named, so `mapAsciiCase` carries no direction
-// logic and neither exported wrapper carries any at all.
+// The distance from `c` to its ASCII case counterpart, or 0 when it has none — the one place
+// the alphabet is named, so `mapAsciiCase` carries no direction logic and neither exported
+// wrapper carries any at all.
 //
-// Every code point outside `a`–`z` / `A`–`Z` maps to 0 and therefore passes
-// through byte-identical. That includes every non-ASCII character, which is the
-// promise the `Ascii` suffix makes.
+// Every code point outside `a`–`z` / `A`–`Z` maps to 0 and therefore passes through UNCHANGED.
+// That includes every non-ASCII character, which is the promise the `Ascii` suffix makes.
 function caseShift(c: i32, up: boolean): i32 {
   if up {
     if c >= 'a' && c <= 'z' { return -32 }

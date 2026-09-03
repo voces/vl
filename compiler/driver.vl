@@ -257,74 +257,30 @@ export function srcSetStr(s: string): i32 {
 }
 // ── THE HOST↔SEED ABI STAMP ─────────────────────────────────────────────────
 //
-// The number a `vl` binary checks before it trusts this seed. A MISMATCH IS AN
-// ERROR, not a warning, for the reason `wasm-opt`-missing is an error: the two
-// artifacts do not fail loudly when they disagree, they produce WRONG OUTPUT AT A
-// SUCCESSFUL EXIT CODE.
-//
-// The bug that forced this. #1848 changed a string's element unit from a UTF-32
-// code point to a UTF-8 byte. It added, removed and re-typed NOTHING — so every
-// export the host probes for is still present with the same signature, the ABI
-// negotiation reports "compatible", and the host reads `4 * count` bytes where the
-// seed wrote `count`. The overshoot lands in the host's own leftover UTF-32 image
-// of the last file it staged, which decodes perfectly — so a stale `vl test`
-// printed readable chunks of `std/test.vl` source and exited 0. Someone graded a
-// working feature as broken on that output before the binary was suspected.
-//
-// WHAT THE NUMBER COVERS: the guest→host string element unit, the bulk
-// `Load`/`Store` packing over the staging window, and the `CMD_*` table. Bump it
-// in the SAME commit that changes any of them. `docs/internals/cli-design.md` has
-// the generation table.
-//
-//   1  strings are UTF-32 code points (pre-#1848)
-//   2  strings are UTF-8 bytes
-//
-// COMPARED WITH `==`, NOT `>=`. A host cannot speak an ABI it was not written for
-// in either direction, and the entire point is to stop guessing. A seed that
-// exports nothing here predates the stamp, which is exactly the vintage that
-// causes the bug above, so the host treats "absent" as a mismatch too.
-//
-// WHY A HAND-BUMPED INTEGER AND NOT A BUILD STAMP. `compile(source)` has to stay a
-// pure function of the source: `refresh-compiler.sh` and `native-fixpoint.sh` are
-// literally `cmp -s compile(X) X`, so a timestamp would make the ladder never find
-// a self-reproducing rung and would turn the project's central integrity gate into
-// a permanent failure. A git hash survives the gate but changes the seed's bytes on
-// every commit, which breaks the rolling `seed-latest` and every worktree agent's
-// locally-minted seed against an exact-match check — and there is no ingress for it
-// anyway, since the compiler is a VL program with no environment access. An integer
-// in the source changes only when the contract changes, and shows up in the diff of
-// the PR that changes it.
+// The number a `vl` binary checks before it trusts this seed, compared with `==`
+// (a host cannot speak an ABI it was not written for in either direction, and an
+// absent export is a mismatch too). A mismatch is an ERROR: the two artifacts do
+// not fail loudly when they disagree, they produce WRONG OUTPUT AT A SUCCESSFUL
+// EXIT CODE — changing a string's element unit adds, removes and re-types nothing,
+// so the negotiation still reports "compatible". It covers the guest→host string
+// element unit, the bulk `Load`/`Store` packing, and the `CMD_*` table; bump it in
+// the SAME commit that changes any of them. A hand-bumped integer, not a build
+// stamp: `compile(source)` must stay a pure function of the source, or the fixpoint
+// ladder never finds a self-reproducing rung. `docs/internals/cli-design.md`.
 export function hostAbi(): i32 { 2 }
 
 // ── BULK SOURCE INTAKE over linear memory (`docs/internals/perf-program.md` §3.1)
 //
-// `srcPush` above is ONE HOST CALL PER SOURCE CODE POINT — staging the compiler's
-// own 4.6 MB of source is ~4.6M wasmtime trampoline crossings, measured at ~10% of
-// a self-compile's wall clock (the `[profile] stage_program` phase). The batched
-// ABI the host has always probed for (`StrIn` in `scripts/vl-host/src/main.rs`)
-// replaces N calls with N/16384: the host writes a chunk of UTF-32LE code points
-// into the module's exported linear memory at byte 0 and calls `<name>Load(count)`
-// once per chunk; this loop copies them out.
-//
-// Three facts make this the shape it is, and none of them are negotiable:
-//   * WasmGC has NO runtime memory→GC-array copy (`memory-gc-design.md` §2 #10 —
-//     `array.new_data` reads a build-time passive segment, not live memory), so
-//     the per-element loop is the ONLY mechanism. What is bought is the CALL
-//     boundary, not the element move.
-//   * `__load_i32__` is a linear-memory intrinsic, so its mere presence sets the
-//     emitter's `memUsed` and forces the memory section + the `memory` export.
-//     That is how a module that never says `std:buffer` acquires an `ioMem`.
-//   * There is no capacity primitive in VL, so no `<name>Reserve` is exported;
-//     `.push`'s 2× growth already bounds the copy at 2N and the host's `StrIn`
-//     treats `Reserve` and `Load` as independently optional.
-//
-// The staging window is `ioMem[0 .. 4*count)` — page 0 of the module's linear
-// memory, owned by this protocol. The compiler uses linear memory for NOTHING
-// else; anything that later does must not claim page 0.
-//
-// A dropped or duplicated code point here is a silently WRONG compile, so the
-// integrity gate is the fixpoint ladder (the compiler reads its own source through
-// this path) plus a content-hash probe over the corpus.
+// `srcPush` above is ONE HOST CALL PER SOURCE CODE POINT; the batched ABI the host
+// probes for (`StrIn`, `scripts/vl-host/src/main.rs`) replaces N calls with N/16384:
+// the host writes a chunk of UTF-32LE code points into the exported linear memory at
+// byte 0 and calls `<name>Load(count)`, and this loop copies them out. WasmGC has no
+// runtime memory→GC-array copy (`memory-gc-design.md` §2 #10), so the per-element
+// loop is the ONLY mechanism — what is bought is the CALL boundary, not the element
+// move. `__load_i32__`'s mere presence sets `memUsed` and forces the memory section:
+// that is how a module that never says `std:buffer` acquires an `ioMem`. No
+// `<name>Reserve` exists — VL has no capacity primitive. The staging window
+// `ioMem[0 .. 4*count)` is page 0, owned by this protocol; nothing else may claim it.
 export function srcLoad(count: i32): i32 {
   let i = 0
   while i < count {
@@ -386,23 +342,17 @@ function vcDgReset() {
 }
 
 // ── The stage-1 lossless-recovery gate ───────────────────────────────────────
-// Whether the pipeline must STOP at the parse stage. Today's rule was "any parse
-// diagnostic stops everything"; it is now "any parse diagnostic that is not a
-// LOSSLESS recovery's". A file whose every parse diagnostic came from the
-// unbraced-body recovery (`parseBracedBody`, parser.vl) has an AST that is
-// exactly what the user wrote, so its type errors are REAL and worth reporting
-// alongside the parse mistake — which is the whole point: the LSP compiles per
-// keystroke, and the old rule dropped ALL type feedback the moment a brace was
-// missing mid-edit.
+// Whether the pipeline must STOP at the parse stage: any parse diagnostic that is not
+// a LOSSLESS recovery's. A file whose every parse diagnostic came from the unbraced-body
+// recovery (`parseBracedBody`, parser.vl) has an AST that is exactly what the user wrote,
+// so its type errors are REAL and worth reporting alongside the parse mistake — the LSP
+// compiles per keystroke, and a blanket bail drops ALL type feedback mid-edit.
 //
-// The quantifier is ALL, not ANY, and that is what makes it safe by
-// construction: one lossy recovery anywhere in the file (a skip-to-closer that
-// dropped tokens) restores today's bail for the whole file. Measured price of
-// the ANY reading — i.e. of lifting the bail wholesale — is five corpus cases,
-// every one a PHANTOM type error over fiction the parser invented (DECISIONS.md).
-//
-// EMIT is not gated on this and never proceeds past a parse diagnostic: a
-// recovered program CHECKS, it does not BUILD.
+// The quantifier is ALL, not ANY, and that is what makes it safe by construction:
+// one lossy recovery anywhere in the file (a skip-to-closer that dropped tokens)
+// restores the bail for the whole file. The ANY reading buys phantom type errors
+// over fiction the parser invented (DECISIONS.md). EMIT is not gated on this and
+// never proceeds past a parse diagnostic: a recovered program CHECKS, not BUILDS.
 function vcParseBlocked(): boolean { P.diags.length > 0 && !dgAllLossless() }
 // Record one tokenless diagnostic's position, owner and span, keyed on the
 // `P.diags` index it is about to occupy. The caller pushes the `P.diags` entry.
@@ -488,17 +438,16 @@ let modLoadStart: i32[] = []
 let modLoadMod: i32[] = []
 // Per-module rename map (`name` → `name$mN`) and the lexical shadow stack.
 // The map is KEYED BY INTERNED ID — `symbols.vl` R6, the dense-array form of a
-// name→row lookup — because it averages ~718 rows over a self-compile and is
-// probed once per identifier, which makes a linear scan the merge's quadratic
-// term. A reader is one `sidLookup` plus one array read.
+// name→row lookup — because it is probed once per identifier over a table large
+// enough that a linear scan would be the merge's quadratic term. A reader is one
+// `sidLookup` plus one array read.
 //
 // TWO index arrays because the map's readers disagree about a DUPLICATE key and
 // the disagreement is pre-existing: `modRenamed` returns at the FIRST matching
 // row, while `modRwTsName` / `modTypeRenamed` keep scanning and so take the LAST.
-// A duplicate `from` needs two imports binding one local (a declaration colliding
-// with an import is diagnosed by `modCheckDupBindings`), but which row wins
-// decides the diagnostic TEXT and which import a reference resolves to, so each
-// reader keeps its own view rather than being quietly normalized onto the other's.
+// Which row wins decides the diagnostic TEXT and which import a reference resolves
+// to, so each reader keeps its own view rather than being quietly normalized onto
+// the other's.
 let modRenameTo: string[] = []
 // The `from` keys, parallel to `modRenameTo`. The sid views index BY name and
 // cannot be walked back to the spellings, and D1191's per-module UFCS scope is
@@ -508,25 +457,18 @@ let modRenameFrom: string[] = []
 let modRenameFirstBySid: i32[] = []
 let modRenameLastBySid: i32[] = []
 let modShadow: string[] = []
-// Registry of every top-level free `self`-function across all modules, keyed by
-// its MANGLED name (`shout$m1`) with its parameter arity. A UFCS call
-// `"x".shout()` is a `Call` whose callee is a `Member` (`memProp == shout`); the
-// native pipeline lowers UFCS at check/emit time (not at parse time like the
-// host). The merge cannot rewrite `memProp` (a same-named struct field must keep
-// precedence, decided by the receiver TYPE the walker lacks), so it records a
-// plain→mangled `ufcsAlias` for every site whose `prop` resolves through this
-// registry to a self-function of matching arity (the host parser's UFCS rule,
-// applied at the merge boundary); the checker/emitter follow the alias AFTER the
-// field check.
+// Registry of every top-level free `self`-function across all modules, keyed by its
+// MANGLED name (`shout$m1`) with its parameter arity. A UFCS call `"x".shout()` is a
+// `Call` whose callee is a `Member` (`memProp == shout`), and the merge cannot rewrite
+// `memProp` — a same-named struct field must keep precedence, decided by the receiver
+// TYPE the walker lacks. So it records a plain→mangled `ufcsAlias` for every site whose
+// `prop` resolves through this registry to a self-function of matching arity; the
+// checker/emitter follow the alias AFTER the field check.
 //
 // TWO arities per row, because a parameter DEFAULT makes a call's arity a RANGE
-// (D1044). `modSelfFnArity` is the declared count (the high end) and
-// `modSelfFnMinArity` is `fnRequiredArity` over the same list (the low end) —
-// the identical range `ufcsCallTy` and `drwSelfFnOf` already accept. A single
-// exact count here is upstream of BOTH of them: with no alias row the plain
-// `prop` never maps to the mangled function, `lookup` answers -1, and the call
-// falls through to `no field 'scale' on Box` on a program whose single-file form
-// runs. `self` is never defaulted (it is the receiver), so the low end is >= 1.
+// (D1044): `modSelfFnArity` is the declared count, `modSelfFnMinArity` is
+// `fnRequiredArity` over the same list — the range `ufcsCallTy` and `drwSelfFnOf`
+// already accept. One exact count admits no alias row for a defaulted call.
 let modSelfFnName: string[] = []
 let modSelfFnArity: i32[] = []
 let modSelfFnMinArity: i32[] = []
@@ -538,16 +480,15 @@ let modTyShadow: string[] = []
 // ── per-INSTANCE module scan/token cache ──────────────────────────────────────
 // A directory check (`vl check <dir>`) rebuilds the module table once PER FILE
 // (modReset + the fetch loop), so a shared dependency is token-scanned
-// (modCommit → modScan) once per dependent. Cache per (module key, source
-// text): the scan's import/export entries replay under the new table index, and
-// its token stream re-pushes with fresh global `pos` anchors — so the parse
-// stage (modCompile → vcLoadToksMod) replays rather than tokenizing, and ONE
-// tokenization serves both stages for every module of every build, single-file
-// included. Slices are FLATTENED into shared
-// arrays with per-slot [off, end) ranges (`string[][]` is not
-// self-host-emittable). The cache spans modReset by design; a slot is keyed on
-// the exact source, so a rewrite (e.g. `check --fix`) misses and a fresh slot
-// is appended.
+// (modCommit → modScan) once per dependent. Cache per (module key, source text):
+// the scan's import/export entries replay under the new table index, and its token
+// stream re-pushes with fresh global `pos` anchors — so the parse stage
+// (modCompile → vcLoadToksMod) replays rather than tokenizing, and ONE tokenization
+// serves both stages for every module of every build, single-file included. Slices
+// are FLATTENED into shared arrays with per-slot [off, end) ranges (`string[][]` is
+// not self-host-emittable). The cache spans modReset by design; a slot is keyed on
+// the exact source, so a rewrite (e.g. `check --fix`) misses and a fresh slot is
+// appended.
 const modCacheKeys: string[] = []
 const modCacheSrcs: string[] = []
 const modCacheImpOff: i32[] = []
@@ -645,18 +586,12 @@ function vcLoadToks(src: string): i32 {
 // SHAPE WALK (`docs/serde-design.md` §"Deep `is` / `as` over a `Json` value").
 // The checker cannot lower one, so pass 1 only RECORDS which sites are that and
 // what they walk; this runs after it, generates one predicate + one builder per
-// distinct target as ordinary VL SOURCE, parses that fragment into the SAME
-// arena, appends its declarations to the program root, rewrites each site into a
-// call, and re-checks. Everything downstream then sees an ordinary program.
-//
-// IT COSTS NOTHING FOR A PROGRAM WITHOUT A DEEP `is` — `jwSiteNode` is empty and
-// this returns on its first line, which is why the compiler (which has none)
-// pays neither the second parse nor the second check.
-//
-// THE REWRITE REFUSING IS A HARD STOP, not a fall-through. A deep `is` the
-// rewrite cannot route would reach the emitter as a bare arm test and answer
-// `false` for every value — D1035 itself — so it is reported as a diagnostic
-// instead.
+// distinct target as ordinary VL SOURCE, parses that fragment into the SAME arena,
+// appends its declarations to the program root, rewrites each site into a call, and
+// re-checks. A program with no deep `is` has an empty `jwSiteNode` and returns on
+// the first line, so it pays neither the second parse nor the second check.
+// THE REWRITE REFUSING IS A HARD STOP: a deep `is` the rewrite cannot route would
+// reach the emitter as a bare arm test and answer `false` for every value (D1035).
 function jwSecondPass(root: i32): i32 {
   if jwSiteNode.length == 0 { return 0 }
   const gen = jwGenerateSource()
@@ -758,35 +693,16 @@ export function rbyteLen(): i32 { W.bytes.length }
 export function rbyteAt(i: i32): i32 { W.bytes[i] }
 // ── BULK RESULT READ-BACK over linear memory — the OUT mirror of `srcLoad`
 // (`docs/internals/perf-program.md` §7) ───────────────────────────────────────
-//
-// `rbyteAt` above is ONE HOST CALL PER EMITTED BYTE: a self-compile hands back
-// 1,112,716 bytes one trampoline crossing at a time (`[profile] readback`, ~19 ms).
-// This is the same trade `srcLoad` makes in the other direction — the host writes
-// the staging window and the guest copies out; here the GUEST writes it and the
-// host copies out — so the protocol, the window and the fallback shape are
-// deliberately identical. Read `srcLoad`'s header first; only the differences are
-// restated here.
-//
-//   `rbyteStore(off, count) -> written`
-//     Writes `written` = min(count, rbyteLen() - off) bytes, starting at
-//     `W.bytes[off]`, PACKED FOUR PER i32 WORD (little-endian) into
-//     `ioMem[0 .. written)`. The host then copies that byte range out in one
-//     `Memory::data` slice and asks again from `off + written`. A return of 0 or
-//     more than `count` is a protocol violation and the host FAILS on it — never
-//     loops, because a re-request loop is a hang, and a hang is a witness that
-//     breaks every comparator (`perf-program.md` §6.7, finding 3).
-//
-// WHY PACKED, when the intake window is one code point per word: the intake's
-// element IS an i32 code point, so it has to be. Here the element is a BYTE, and
-// packing makes the host's copy a `memcpy` of exactly the bytes it wants instead
-// of a strided gather — and it quadruples the chunk to a whole 65,536-byte page,
-// so the self-compile's read-back is 17 calls instead of 68.
-//
-// The tail (`count % 4 != 0`) is assembled high-byte-first into one final word:
-// the word START is the largest multiple of 4 strictly below `count`, hence at
-// most `cap - 4`, so the 1-3 padding bytes it also writes always land INSIDE the
-// window. `W.bytes` elements are masked to 0..255 at the one append site
-// (`emit_bytes.vl`'s `curBuf.push(b & 0xff)`), so no masking is repeated here.
+// `rbyteAt` above is ONE HOST CALL PER EMITTED BYTE. This is `srcLoad`'s trade in the
+// other direction — the GUEST writes the staging window, the host copies out — so
+// protocol, window and fallback are deliberately identical; read `srcLoad`'s header
+// first. `rbyteStore(off, count)` writes min(count, rbyteLen() - off) bytes from
+// `W.bytes[off]` PACKED FOUR PER i32 WORD (little-endian), so the host's copy is a
+// `memcpy` and not a strided gather. A return of 0 or more than `count` is a protocol
+// violation the host FAILS on rather than re-requesting: a re-request loop is a hang,
+// and a hang breaks every comparator. The tail word starts at most at `cap - 4`, so
+// its padding lands INSIDE the window; `W.bytes` is masked to 0..255 at its one
+// append site (`emit_bytes.vl`).
 export function rbyteStore(off: i32, count: i32): i32 {
   const bs = W.bytes
   const avail = bs.length - off
@@ -814,10 +730,10 @@ export function rbyteStore(off: i32, count: i32): i32 {
   n
 }
 // `vl check`: parse + typecheck ONLY, no emit. 0 = ok; 1 = lex/parse; 2 = type.
-// Emit is `vl build`'s job — skipping it makes `check` faster on large inputs
-// (~60% of a full compile of the whole compiler is emit) AND avoids rejecting a
-// type-VALID program the emitter can't yet lower (an emit-coverage gap is not a
-// check failure). Shares the diagnostic stores (`diagLen`/`diagAt`) with compileSrc.
+// Emit is `vl build`'s job — skipping it makes `check` markedly faster on large
+// inputs AND avoids rejecting a type-VALID program the emitter can't yet lower (an
+// emit-coverage gap is not a check failure). Shares the diagnostic stores
+// (`diagLen`/`diagAt`) with compileSrc.
 export function checkSrc(): i32 {
   symSetEnabled(0)
   P.toks = []
@@ -919,13 +835,12 @@ export function lintCol(i: i32): i32 { lintColAt(i) }
 // importer) is reported against THAT file. Each module is re-parsed IN ISOLATION
 // (its own arena — the merged/renamed program would leak `name$mN` mangles into
 // messages and break the token-scan `export` detection), linted, and its findings
-// copied into the accumulators below with the owning module's TABLE index (the
-// same index `diagModule`/`cliModKeys` use). A module that fails to parse is
-// skipped (the error tier already reported it); a missing module (`modFound` 0)
-// likewise. With an EMPTY module table this lints `vcSource()` as module 0 —
-// byte-compatible with `lintSrc` — so callers can use it unconditionally.
-// Returns the total finding count. NOTE: like `lintSrc`, this resets `P.toks`/
-// `nodeToks`, so error-tier anchors (`diagModule`) must be read BEFORE calling.
+// copied into the accumulators below with the owning module's TABLE index. A module
+// that fails to parse is skipped (the error tier already reported it); a missing
+// module (`modFound` 0) likewise. With an EMPTY module table this lints `vcSource()`
+// as module 0, byte-compatible with `lintSrc`, so callers can use it unconditionally.
+// Returns the total finding count. Like `lintSrc` it resets `P.toks`/`nodeToks`, so
+// error-tier anchors (`diagModule`) must be read BEFORE calling.
 let lgCodes: string[] = []
 let lgMsgs: string[] = []
 let lgSevs: string[] = []
@@ -1091,15 +1006,13 @@ export function formatSrc(): i32 {
   if P.diags.length > 0 { return -1 }
   vcFmtOut = formatProgram(root)
   // ── round-trip safety gate ────────────────────────────────────────────────
-  // Re-lex + re-parse the OUTPUT before handing it back: a printer bug that
-  // emits unparseable text must surface as a loud diagnostic (-2, callers keep
-  // the input bytes), never as data loss through `fmt -w`. The gate costs one
-  // extra lex+parse of the formatted text — no re-format, no typecheck. An
-  // output byte-identical to the input needs no gate (the input just parsed):
-  // that keeps the already-clean case — every file of a green `fmt --check`
-  // run — at zero extra cost (which matters under the non-freeing GC, where a
-  // re-lex of each file in a directory run would accumulate for the whole
-  // process life).
+  // Re-lex + re-parse the OUTPUT before handing it back: a printer bug that emits
+  // unparseable text must surface as a loud diagnostic (-2, callers keep the input
+  // bytes), never as data loss through `fmt -w`. The gate costs one extra lex+parse
+  // of the formatted text — no re-format, no typecheck. An output equal to the input
+  // needs no gate (the input just parsed), which keeps every file of a green
+  // `fmt --check` run at zero extra cost — and that matters under the non-freeing GC,
+  // where a re-lex per file in a directory run accumulates for the whole process life.
   if vcFmtOut == src { return vcFmtOut.length }
   P.toks = []
   P.nodes = []
@@ -1124,11 +1037,11 @@ export function fmtByteAt(j: i32): i32 { vcFmtOut[j] }
 // Identical to `checkSrc` but with the symbol table turned ON, so the checker
 // records the occurrence + binding-type tables the query exports below read.
 // Used ONLY by the LSP's go-to-def / find-refs / hover path; every other consumer
-// calls `checkSrc`/`compileSrc`, which force the table OFF (zero cost, and emit
-// stays byte-identical — the tables never feed the emitter). The codes match
-// `checkSrc` (0 ok, 1 lex/parse, 2 type); the symbol tables are populated for a
-// 0 OR 2 result (a type error still yields partial occurrences), and stay valid
-// until the next check. Module mode rides the same `modCompile` path.
+// calls `checkSrc`/`compileSrc`, which force the table OFF (zero cost, and emit is
+// unaffected — the tables never feed the emitter). The codes match `checkSrc`
+// (0 ok, 1 lex/parse, 2 type); the symbol tables are populated for a 0 OR 2 result
+// (a type error still yields partial occurrences), and stay valid until the next
+// check. Module mode rides the same `modCompile` path.
 export function checkSrcSym(): i32 {
   symSetEnabled(1)
   P.toks = []
@@ -1198,29 +1111,16 @@ export function modOfTok(tok: i32): i32 {
 }
 // ── `__callsite__`: mint one location value per CALL, before the checker runs ─
 //
-// Parameter defaults are CALL-SITE SUGAR — the declaration's expression is
-// substituted into each call that omits the argument — and every form v1 allows
-// but one means the same thing at every site, so every form but one can share a
-// single arena node. `__callsite__` is the exception: its value IS the site.
+// Parameter defaults are CALL-SITE SUGAR — the declaration's expression is substituted
+// into each call that omits the argument — and every form but `__callsite__` means the
+// same thing at every site, so every other form shares one node. Its value IS the site.
 //
-// WHY A PRE-PASS AND NOT A REWRITE. `nodeTyIx` is sized to the arena at
-// `checkProgram` entry, so a node minted later reads its type back as -1 forever
-// (D969's recorded cost, and the reason `parseTemplate` desugars in the PARSER).
-// These nodes have to be typed, repped, collected and lowered like any other
-// object literal, so they are minted BEFORE that sizing — the same discipline
-// the template desugar follows, moved to the earliest point that knows a call
-// site exists at all. The checker then splices the banked node into the omitted
-// slot (`fillArgDefaults`), and from there nothing downstream knows this
-// argument was synthesized.
-//
-// USAGE-GATED: a program that declares no `__callsite__` default mints nothing
-// and banks nothing, so the arena — and therefore every byte the emitter writes
-// — is identical to before this pass existed.
-//
-// The value is the SHAPE the track-caller follow-up will alias in std:
-// `{ file: string, line: i32, col: i32 }`. `file` is the module KEY (the merged
-// program's own name for the file); `line`/`col` are 1-based, matching what a
-// diagnostic prints for the same token.
+// A PRE-PASS, NOT A REWRITE: `nodeTyIx` is sized to the arena at `checkProgram` entry,
+// so a node minted later reads its type back as -1 forever (D969, and the reason
+// `parseTemplate` desugars in the PARSER); these are minted BEFORE that sizing, and
+// the checker splices the banked node into the omitted slot (`fillArgDefaults`).
+// USAGE-GATED: a program declaring no `__callsite__` default mints and banks nothing,
+// so the arena — and every byte the emitter writes — is identical to before this pass.
 function csAnyCallsiteDefault(): boolean {
   let i = 0
   while i < P.nodes.length {
@@ -1432,12 +1332,12 @@ export function memberTypeStrCharAt(j: i32): i32 { memTyBuf[j] }
 // Signature help (D9.10): after a `checkSrcSym`, the parameter table of the
 // function whose NAME sits at (line, col) — 1-based line, 0-based col. `sigAt`
 // computes the table and returns its ROW COUNT, or -1 when nothing there is
-// callable; a zero-parameter function is a real signature with 0 rows, so the
-// host must tell the two apart by the sign. The per-index accessors read each
-// parameter's NAME (per-codepoint, zero length when the name is not knowable —
-// a function-typed value carries none) and rendered TYPE; `sigRet*` reads the
-// return type. The host's own tokenizer finds the callee name by walking back
-// from the open paren, and counts the commas that make the ACTIVE parameter —
+// callable; a zero-parameter function is a real signature with an empty table, so
+// the host must tell the two apart by the SIGN, not by emptiness. The per-index
+// accessors read each parameter's NAME (per-codepoint, zero length when the name is
+// not knowable — a function-typed value carries none) and rendered TYPE; `sigRet*`
+// reads the return type. The host's own tokenizer finds the callee name by walking
+// back from the open paren and counts the commas that make the ACTIVE parameter —
 // neither is a question the checker is asked here.
 export function sigAt(line: i32, col: i32): i32 { symSigAt(line, col) }
 export function sigParamNameLen(i: i32): i32 { symSigParamNameLen(i) }
@@ -1470,20 +1370,17 @@ export function memberLenAt(i: i32): i32 { symMemberLen(i) }
 export function memberIsMethodAt(i: i32): i32 { symMemberIsMethod(i) }
 
 // Scope-at-position (completion): after a `checkSrcSym`, the user bindings
-// (var/param/function) visible at (line, col) — 1-based line, 0-based col.
-// `scopeAt` computes the set and returns its count; the per-index accessors read
-// each binding's NAME (per-codepoint), KIND (0=variable 1=parameter 2=function),
-// and rendered TYPE (per-codepoint, zero length when none). Builtins/imports/types
-// are not included — the host folds those in. The native `bindingsInScopeAt`.
+// (var/param/function) visible at (line, col) — 1-based line, 0-based col. `scopeAt`
+// returns the set's count; the per-index accessors read each binding's NAME
+// (per-codepoint), KIND (0=variable 1=parameter 2=function) and rendered TYPE.
+// Builtins/imports/types are not included — the host folds those in.
 //
-// Multi-module: `symScopeAt` walks the MERGED program's visibility table, whose
-// spans are per-module source coordinates — a dep's top-level span contains most
-// entry positions, so every dep binding (exported or internal) would leak into
-// the entry's completion set. Filter to: bindings DECLARED in the entry
-// (`modOfTok(decl tok) == 0` — also 0 throughout for a single-module check,
-// where nothing is filtered), plus the dep declarations the entry actually
-// IMPORTS, matched by their exact MERGED name (`modMergedTargetOf`, so an
-// aliased or re-exported import keeps exactly one, correct, declaration).
+// Multi-module: `symScopeAt` walks the MERGED program's visibility table, whose spans
+// are per-module source coordinates, so a dep's top-level span contains most entry
+// positions and every dep binding would otherwise leak into the entry's set. Filter to
+// bindings DECLARED in the entry (`modOfTok(decl tok) == 0`, also 0 throughout a
+// single-module check) plus the dep declarations the entry IMPORTS, matched by exact
+// MERGED name (`modMergedTargetOf`, so an alias or re-export keeps exactly one).
 export function scopeAt(line: i32, col: i32): i32 {
   const n = symScopeAt(line, col)
   // The merged names the entry's imports denote — the only dep rows kept.
@@ -1553,22 +1450,17 @@ export function memberScanTypeCharAt(i: i32, j: i32): i32 {
 export function memberScanIsFn(i: i32): i32 { symMemberScanIsFn(i) }
 
 // UFCS candidates (LSP): after a `checkSrcSym`, the free `self`-functions the
-// receiver under (line, col) DISPATCHES to — the other half of what `x.` can
-// offer, and the half `memberScanAt` structurally cannot see (it reads the
-// receiver's field set; this reads the program's declarations). The host strips
-// the trailing `.` exactly as it does for `memberScanAt`, so one repaired source
-// serves both. Per-index accessors read each candidate's NAME (per-codepoint,
-// demangled), its rendered SIGNATURE with the receiver row dropped, and the
-// owning MODULE — `modOfTok` over the decl-name token, the same mapping
-// `symOccModuleAt` and `scopeAt`'s entry filter use, and the one thing the host
-// needs to spell `import { name } from "<key>"`.
+// receiver under (line, col) DISPATCHES to — the other half of what `x.` can offer,
+// and the half `memberScanAt` structurally cannot see (it reads the receiver's field
+// set; this reads the program's declarations). The host strips the trailing `.` as it
+// does for `memberScanAt`, so one repaired source serves both. Per-index accessors
+// read each candidate's NAME (demangled), its rendered SIGNATURE with the receiver
+// row dropped, and the owning MODULE — `modOfTok` over the decl-name token, which is
+// what the host needs to spell `import { name } from "<key>"`.
 //
-// A candidate whose module is not the entry is NOT necessarily out of scope: the
-// host decides that, because it is the one holding the file's import statements
-// and it already answers the question for std auto-import (`importInsertionEdit`
-// returns no edit when the name is bound). Reporting scope here would be a second
-// answer to a question the host already answers, with the merge's renames in
-// between.
+// A candidate outside the entry is NOT necessarily out of scope, and the HOST decides
+// that: it holds the file's import statements and already answers the same question
+// for std auto-import. Answering here would be a second answer, renames in between.
 export function ufcsScanAt(line: i32, col: i32): i32 {
   symUfcsScanAt(line, col)
 }
@@ -1590,20 +1482,16 @@ export function ufcsScanExportedAt(i: i32): i32 { symUfcsScanExportedAt(i) }
 
 // Builtin completions (LSP): the compiler's builtin surface the host folds into
 // identifier completion — the numeric/string TYPE names, the builtin FUNCTIONS
-// (`print`/`Map`/`Set`/`fromCodePoint[s]`) and the LINEAR-MEMORY
-// intrinsics. The completion list is maintained HERE, in the native LSP surface,
-// next to the compiler that owns them — the single source of truth the host used
-// to get from the TS `defaultScope`. Static (no source / `checkSrcSym` needed):
-// `builtinScan` fills the table, the per-index accessors read each entry's NAME,
-// KIND (0=type, 1=function), and detail TYPE string.
+// (`print`/`Map`/`Set`/`fromCodePoint[s]`) and the LINEAR-MEMORY intrinsics, kept
+// HERE next to the compiler that owns them as the single source of truth. Static (no
+// source / `checkSrcSym` needed): `builtinScan` fills the table and the per-index
+// accessors read each entry's NAME, KIND (0=type, 1=function) and detail TYPE string.
 //
-// TWO DIFFERENT FAMILIES sit behind "builtin", and the distinction matters for
-// anyone extending this list. `print`/`Map`/… and the numeric-opcode
-// intrinsics are special-cased call arms with NO scope entry — nothing to
-// enumerate, so they can only be listed by hand. The memory intrinsics are not
-// like that: they are `declare`d into `T.scopes[0]`, a real `Map<string,i32>`
-// (`typecheck.vl`'s `declare`), which is trivially enumerable — listing them
-// here is a duplication that a later change could retire by reading that scope.
+// TWO FAMILIES sit behind "builtin", and the distinction matters to anyone extending
+// this list. `print`/`Map`/… and the numeric-opcode intrinsics are special-cased call
+// arms with NO scope entry — nothing to enumerate, so they can only be listed by hand.
+// The memory intrinsics are `declare`d into `T.scopes[0]` (`typecheck.vl`), which is
+// enumerable — listing them here is a duplication a later change could retire.
 let blName: string[] = []
 let blKind: i32[] = []
 let blType: string[] = []
@@ -1628,31 +1516,16 @@ export function builtinScan(): i32 {
   blPush("string", 0, "string")
   // `print` is an OVERLOAD SET, not a polymorphic function: the checker arm accepts a
   // value of any printable type and the emitter picks a `__print_*__` sink per runtime
-  // rep, so there is one signature per rep and no boxed argument is admitted (a value
-  // union is a loud "narrow it first" reject). VL spells neither overloads nor `any`, so
-  // the accepted set is rendered as a union of the reps that actually print. Arity is
-  // exactly one, and the
-  // result is `void` (it binds to nothing and compares to nothing, not even `null`).
-  // Shapes with no single scalar rep — arrays, structs, maps, sets, function values —
-  // are NOT in this set, and the checker AGREES: `tyPrintsAsRef` refuses them as OUTSIDE
-  // THE DOMAIN, a plain `tErr` quoting this same string. This string and that gate are
-  // one statement, and they are now literally
-  // one string — both render `printDomainStr()`, so the domain the compiler advertises
-  // cannot drift from the one it enforces (this list is hand-written, which is exactly the
-  // drift shape the note above warns about).
-  //
-  // WIDENING IT IS A LANGUAGE DECISION, NOT AN EMITTER ONE, and the earlier wording here
-  // ("gated on the emitter learning the rep") had that backwards. A container's rep is an
-  // ordinary `(ref $t)` the emitter already builds and reads; what does not exist is a
-  // defined RENDERING — separators, nesting, a map's key order, what a closure prints as,
-  // and a guest-side f64 formatter that `print(1.5)` does not need because the HOST renders
-  // that one. Measured in `silent-class-inventory` D711: lift both refusal sites and all 19
-  // corpus cells become invalid wasm, not one of them runs.
-  // `toString` IS NOT HERE ANY MORE — it was an ambient builtin over `i32 | boolean`
-  // and is now `std:fmt`'s export over `i32 | i64 | boolean | f64` (owner ruling,
-  // 2026-09-01; DECISIONS.md). Completion for it arrives the way every other std name
-  // does, through the importing file's own scope, so re-adding a hand-written row here
-  // would advertise a name that no longer resolves without an import.
+  // rep, so there is one signature per rep and no boxed argument is admitted. VL spells
+  // neither overloads nor `any`, so the accepted set renders as a union of the reps that
+  // actually print; arity is exactly one and the result is `void`. Shapes with no single
+  // scalar rep — arrays, structs, maps, sets, function values — are OUTSIDE THE DOMAIN,
+  // and `tyPrintsAsRef` refuses them with this same string: advertised and enforced
+  // domain are literally one `printDomainStr()`, so they cannot drift. WIDENING IT IS A
+  // LANGUAGE DECISION, NOT AN EMITTER ONE — a container's rep is an ordinary `(ref $t)`
+  // the emitter already builds; what is missing is a defined RENDERING (D711).
+  // `toString` is NOT here any more: it is `std:fmt`'s export (DECISIONS.md), so
+  // completion for it arrives through the importing file's own scope.
   blPush("print", 1, "(" + printDomainStr() + ") => void")
   blPush("fromCodePoint", 1, "(i32) => string")
   blPush("fromCodePoints", 1, "(i32[]) => string")
@@ -1713,25 +1586,17 @@ export function builtinTypeLen(i: i32): i32 { blType[i].length }
 export function builtinTypeCharAt(i: i32, j: i32): i32 { blType[i][j] }
 
 // ── LSP lexical semantic tokens: keywords / operators / literals / comments ────
-// The lexical highlighting layer the host's TS `tokenize` pass used to own. Unlike
-// the identifier/member slices above it needs no typecheck — `lexScan()` just
-// tokenizes the staged source (srcReset/srcPush first) and records, per COLOURED
-// token, a small lexical CLASS plus its 1-based line / 0-based col / length. The
+// The lexical highlighting layer the host used to own; it needs no typecheck.
+// `lexScan()` tokenizes the staged source (srcReset/srcPush first) and records, per
+// COLOURED token, a lexical CLASS plus its 1-based line / 0-based col / length;
 // retained `//` and `///` comments fold in as class COMMENT. Tokens that get no
-// semantic colour — identifiers (owned by the symbol slice), strings (left to the
-// TextMate grammar so its finer escape scopes survive), and structural punctuation
-// — are dropped (class < 0). The host maps the class onto its token-type legend.
-//
-// TEMPLATE literals are the ONE literal that does get a class, and the reason is
-// the exception above: a template is not one token. Its text runs arrive as
-// `TEMPLATE` / `TEMPLATE_HEAD` / `TEMPLATE_MID` / `TEMPLATE_TAIL` with the hole
-// EXPRESSIONS lexed in between, so leaving them to TextMate would colour a hole's
-// identifiers as string content. Class 5 paints exactly the text parts and the
-// `${` / `}` delimiters that ride on them; every token inside a hole keeps the
-// colour it would have anywhere else.
-//
-//   class: 0 = keyword  1 = operator  2 = number  3 = boolean  4 = comment
-//          5 = string (template parts + hole delimiters only)
+// colour — identifiers (owned by the symbol slice), strings (left to the TextMate
+// grammar, whose finer escape scopes survive) and structural punctuation — drop out
+// at class < 0. TEMPLATE literals are the ONE literal that does get a class, because
+// a template is not one token: its text runs arrive as `TEMPLATE*` with the hole
+// EXPRESSIONS lexed between, so TextMate would colour a hole's identifiers as string
+// content. Class 5 paints only the text parts and the `${` / `}` riding on them.
+//   class: 0 keyword  1 operator  2 number  3 boolean  4 comment  5 template text
 let lexCls: i32[] = []
 let lexLine: i32[] = []
 let lexCol: i32[] = []
@@ -2482,18 +2347,17 @@ function modResolveSpecifier(spec: string, fromKey: string): string {
 }
 
 // ── token-level import/export scan (per committed module) ─────────────────────
-// Tokenizes the committed source with the REAL `tokenize` and walks top-level
-// tokens (brace-depth tracked): each `import { a as b, … } from "spec"` records
-// one import entry per specifier (resolved against THIS module's key); each
-// top-level `export`-modified `function`/`let`/`const`/`type` records an export
-// name. Imports still PARSE as no-ops later — this scan is the only reader.
+// Tokenizes the committed source with the REAL `tokenize` and walks top-level tokens
+// (brace-depth tracked): each `import { a as b, … } from "spec"` records one import
+// entry per specifier (resolved against THIS module's key); each top-level
+// `export`-modified `function`/`let`/`const`/`type` records an export name. Imports
+// still PARSE as no-ops later — this scan is the only reader.
 //
-// The stream this scan tokenizes IS the one the parse stage wants, so it is
-// banked into the cache's flat token storage on the way past and `vcLoadToksMod`
-// replays it instead of tokenizing the same source a second time. Only a CLEAN
-// tokenization is bankable — a cache hit re-pushes tokens and has no lex diags
-// to re-fold — so a source with lex diags banks nothing and the parse stage
-// tokenizes it itself.
+// The stream this scan tokenizes IS the one the parse stage wants, so it is banked
+// into the cache's flat token storage on the way past and `vcLoadToksMod` replays it
+// instead of tokenizing the same source twice. Only a CLEAN tokenization is bankable
+// — a cache hit re-pushes tokens and has no lex diags to re-fold — so a source with
+// lex diags banks nothing and the parse stage tokenizes it itself.
 function modScan(m: i32, src: string): i32 {
   const r = tokenize(src)
   const toks = r.tokens
@@ -2793,29 +2657,17 @@ function modScan(m: i32, src: string): i32 {
     }
   }
   // ── THE INJECTED IMPORT ────────────────────────────────────────────────────
-  // A module holding a template hole gets a `std:fmt` dependency it never wrote.
-  // It is the SAME row shape a bare `import "std:fmt"` pushes (driver.vl's
-  // names-less arm above) — one edge, `impName`/`impLocal` both EMPTY — and that
-  // emptiness is the entire no-pollution mechanism:
-  //   · the host's fetch loop reads `impKey`, so `std:fmt` (and transitively
-  //     `std:str`) is fetched, ordered, parsed and merged with no host change;
-  //   · `modBuildRename` only mints a rename row for `impLocal != ""`, so NO
-  //     user-visible binding is created — `toStr` stays undeclared in this
-  //     module, a user's own `toStr` still renames to its own `$mN`, and
-  //     completion (which filters on the entry's imports) never offers it.
-  // The renderer is reached instead through the unspellable `TPL_RENDER_LOCAL`
-  // rename row, minted beside this edge in `modBuildRename`.
+  // A module holding a template hole gets a `std:fmt` dependency it never wrote — the
+  // SAME row shape a bare `import "std:fmt"` pushes, one edge with `impName`/`impLocal`
+  // both EMPTY. That emptiness is the no-pollution mechanism: the host's fetch loop
+  // reads `impKey`, so the module is fetched, ordered, parsed and merged with no host
+  // change, while `modBuildRename` mints a rename row only for `impLocal != ""`, so no
+  // user-visible binding appears. The renderer is reached through the unspellable
+  // `TPL_RENDER_LOCAL` row beside this edge; `std:fmt` itself is skipped (self-cycle).
   //
-  // NOT PUSHED FROM `std:fmt` ITSELF: a self-edge would be an import cycle. std
-  // uses no template today (measured), so the guard is a floor, not a policy.
-  //
-  // EVERY imp* COLUMN IS PUSHED, including the ones a synthetic row has nothing
-  // to say about. They are POSITIONAL side tables — row `i` of one is row `i` of
-  // all of them — so a column skipped here does not leave this row's entry
-  // missing, it shifts every LATER row's specifier span and char flag onto the
-  // wrong import. The neutral values are the "no span" pair (`impSpecEnd` equal
-  // to `impSpecCol`, which is how `modVisit` reads "point, not span") and `0` for
-  // `impSpecChar` (this specifier is not a char literal, and never can be).
+  // EVERY imp* COLUMN IS PUSHED, including those a synthetic row has nothing to say
+  // about: they are POSITIONAL side tables, so a skipped column shifts every LATER
+  // row's specifier span and char flag onto the wrong import.
   if sawTplHole && modKeys[m] != TPL_RENDER_MODULE {
     impMod.push(m)
     impSpec.push(TPL_RENDER_MODULE)
@@ -2905,17 +2757,15 @@ function modDiagSpan(
 // Is `name` part of module `m`'s PUBLIC surface? The surface is the UNION of two
 // tables, and reading only the first was the whole of the `export … from` gap: a
 // declaration marked `export` lands in `expName`, but a RE-EXPORT
-// (`export { name } from "dep"`) lands in `reExpPublic` and NOTHING ever writes it
-// to `expName` — so a sibling importing a re-exported name was told `"name" is not
+// (`export { name } from "dep"`) lands in `reExpPublic` and NOTHING ever writes it to
+// `expName` — so a sibling importing a re-exported name was told `"name" is not
 // exported by "./mid"` even though `modScan` had recorded the re-export correctly.
 //
 // The two tables stay SEPARATE rather than merging at the scan: `expName` doubles as
-// "declarations that carry the keyword HERE" for the LSP's cross-file
-// go-to-definition (it publishes each entry's decl line/col) and its
-// redundant-export-keyword hint, and a re-export declares nothing in this module —
-// folding it into `expName` would make go-to-definition land on the re-export line
-// and make the hint fire on every re-export. Visibility is the union; provenance is
-// not.
+// "declarations that carry the keyword HERE" for the LSP's cross-file go-to-definition
+// and its redundant-export-keyword hint, and a re-export declares nothing in this
+// module — folding it in would land go-to-definition on the re-export line and fire
+// the hint on every re-export. Visibility is the union; provenance is not.
 function modExportsHas(m: i32, name: string): boolean {
   let i = 0
   while i < expMod.length {
@@ -2933,19 +2783,16 @@ function modExportsHas(m: i32, name: string): boolean {
 }
 // The MERGED (mangled) name of the declaration that module `m`'s public `name`
 // ultimately denotes. Normally `m` DECLARES it and the answer is the `name$mM` the
-// merge rename gave it. When `m` only RE-EXPORTS it, the declaration lives further
-// down — follow the re-export to the module it pulls from and ask again, so a CHAIN
-// (A declares, B re-exports from A, C re-exports from B) resolves to A's mangled
-// name instead of to a `name$mC` that nothing ever defines. Both consumers need
-// this walk: the merge rename (an importer's reference must rewrite to the real
-// declaration) and the emitter's re-export alias table (the wasm export must point
-// at a function that exists).
+// merge rename gave it; when `m` only RE-EXPORTS it, follow the re-export to the
+// module it pulls from and ask again, so a CHAIN (A declares, B re-exports from A,
+// C re-exports from B) resolves to A's mangled name instead of to a `name$mC` that
+// nothing defines. Both consumers need the walk: the merge rename (an importer's
+// reference must rewrite to the real declaration) and the emitter's re-export alias
+// table (the wasm export must point at a function that exists).
 //
 // Each hop reads the import edge the re-export ALSO created (`modScan` pushes both,
 // always paired): its `impName` is the SOURCE name in the module it came from, which
-// is what `as` renaming makes different from the public name. Bounded by
-// MOD_DEPTH_MAX for the same reason `modVisit` is — though a re-export cycle is
-// already an import cycle and is diagnosed before this ever runs.
+// is what `as` renaming makes different from the public name. Bounded by MOD_DEPTH_MAX.
 function modMergedTargetOf(m: i32, name: string): string {
   let cm = m
   let cn = name
@@ -2987,16 +2834,12 @@ function modMergedTargetOf(m: i32, name: string): string {
 // `import { area } from "./a"` beside `import { area } from "./b"` binds ONE name in
 // one scope to two different functions; there is no answer, and until this diagnostic
 // the program was refused at a USE with `no field 'area' on Sq` — a message about a
-// field, at a line that is not the mistake, naming neither module. Whereas the same
-// name imported twice from the SAME module (or through a re-export chain that lands on
-// the same declaration) binds it to ONE thing: redundant, not ambiguous, and it RUNS
-// today. Refusing that too would trade a working program for a tidier rule, so the test
-// is on the resolved merged target — `modMergedTargetOf`, the exact key
-// `modBuildRename` pushes — and not on the specifier text.
-//
-// Anchored at the SECOND occurrence's imported NAME token (the one that introduces the
-// ambiguity), and it names both specifiers, because a diagnostic about two imports that
-// mentions one of them makes the reader go looking for the other.
+// field, at a line that is not the mistake, naming neither module. The same name
+// imported twice from the SAME module (or through a re-export chain landing on the
+// same declaration) binds ONE thing: redundant, not ambiguous, and it RUNS today, so
+// the test is on the resolved merged target (`modMergedTargetOf`) and not on the
+// specifier text. Anchored at the SECOND occurrence's imported NAME token, and it
+// names BOTH specifiers: a diagnostic about two imports must not hide one of them.
 function modDiagDupImport(m: i32, i: i32, d: i32, spec: string): i32 {
   const local = impLocal[i]
   if local == "" { return 0 }
@@ -3031,8 +2874,7 @@ function modDiagDupImport(m: i32, i: i32, d: i32, spec: string): i32 {
 }
 // Visit module `m`: resolve + validate its imports (unsupported specifier,
 // unresolvable key, cycle back-edge, name-not-exported), recursing into deps
-// first. Message texts match the host's `modules.ts` (the corpus `@error`s
-// substring them).
+// first. Message texts are pinned by the corpus `@error`s, which substring them.
 // The DFS recurses once per import-chain link, so an adversarially deep chain
 // would overflow the wasm call stack — an opaque trap. Capped with a real
 // diagnostic instead; genuine dependency chains sit orders of magnitude below.
@@ -3247,27 +3089,17 @@ function modCompile(emit: i32): i32 {
     o2 = o2 + 1
   }
   // 4b. Resolve each of the ROOT module's RE-EXPORTS to its merged (mangled) target —
-  // the exporting module renamed its `name` to `name$mDD`, so a re-export `export { name }
-  // from "dep"` aliases the bare `name` onto that target in the emitter's export
-  // section. The re-export rode in as an import (same module + local binding), so the
-  // target is its `impName$m<depIndex>`.
+  // the exporting module renamed its `name` to `name$mDD`, so `export { name } from
+  // "dep"` aliases the bare `name` onto that target in the emitter's export section.
   //
-  // ONLY module 0's rows. A DEPENDENCY's re-export is that dependency's public surface, not
-  // the program's: `mid.vl` saying `export { fn } from "./home"` publishes `fn` to the
-  // modules that import `mid`, and nothing more. Aliasing every module's row instead puts a
-  // bare dependency name in the ENTRY's wasm ABI — a three-module program whose entry
-  // exports NOTHING still exports `fn` — which is the same leak 4c's rule right below rules
-  // out for every other kind of name. It is not inert either: the compiler's own
-  // `emit_base.vl` republishes seven type-name grammars from `typecheck.vl` for its
-  // siblings, and each one buys an export-section entry (131 B of names for the seven) in a
-  // binary no host reaches them through.
-  //
-  // The root's own row is self-sufficient — `modMergedTargetOf` chases the chain to the
-  // module that DECLARES the name, so a root re-export of a name its dependency also only
-  // re-exports resolves without any dependency row to lean on. A one-hop resolver would
-  // need that crutch, and an UNRENAMED chain would look healthy on it while a renamed one
-  // dropped the entry: `tests/vl_reexport_abi_test.ts` pins the renaming chain resolving
-  // and the dependency name being absent, which no single-module test can separate.
+  // ONLY module 0's rows. A DEPENDENCY's re-export is that dependency's public surface,
+  // not the program's, and aliasing every module's row puts a bare dependency name in
+  // the ENTRY's wasm ABI — a three-module program whose entry exports NOTHING would
+  // still export `fn`. That is the same leak 4c's rule below rules out for every other
+  // kind of name, and it is not inert: each leaked row buys an export-section entry in
+  // a binary no host reaches it through. The root's own row is self-sufficient because
+  // `modMergedTargetOf` chases the chain to the DECLARING module; a one-hop resolver
+  // would look healthy on an unrenamed chain (`tests/vl_reexport_abi_test.ts` pins it).
   reExpName = []
   reExpTarget = []
   let re = 0
@@ -3349,52 +3181,33 @@ function modCompile(emit: i32): i32 {
 
 // ── per-module rename map (state at the top of this file) ─────────────────────
 // `sid(name)` → row → `modRenameTo[row]`: every top-level value/type name of the
-// module maps to `name$mN` (N = the module's TABLE index — entry 0); an imported
-// local maps to the EXPORTING module's mangled export name. A generic TYPE
-// declaration (`Box<T>` — the parser folds alias parameters into the declared
-// name) renames by its BASE segment, so the declaration (→ `Box$mN<T>`) and
-// every application (`Box<i32>` → `Box$mN<i32>`) rewrite consistently through
-// the segment rewriter. Generic FUNCTIONS carry their parameters out-of-name
-// (`fnTyParams`) and rename like any value.
-// D-DECLPARAM — BOTH OF THESE ARE NOW THE PARSER'S OWN LIST.
+// module maps to `name$mN` (N = the module's TABLE index — entry 0); an imported local
+// maps to the EXPORTING module's mangled export name. A generic TYPE declaration
+// (`Box<T>` — the parser folds alias parameters into the declared name) renames by its
+// BASE segment, so the declaration (→ `Box$mN<T>`) and every application (`Box<i32>` →
+// `Box$mN<i32>`) rewrite consistently through the segment rewriter. Generic FUNCTIONS
+// carry their parameters out-of-name (`fnTyParams`) and rename like any value.
 //
-// The base segment of a DECLARED name (`Box` of `Box<T>`), and the type-parameter
-// names folded into it. Master derived both by re-parsing the string
-// `parseTypeDecl` had built by concatenating those very tokens: `modGenBase` was a
-// `<`-scan (`gaeLtAt`) plus the head cut, and `modGenParams` was a second `<`-scan
-// plus a hand-written identifier-RUN walk with its own `fromCodePoints` buffer.
-// The parser banks the base and the list on the declaration node
-// (`ast.setDeclGp`), so both are one array read, keyed by the NODE the caller
-// already holds.
-//
-// Every caller of the old pair passed a name it had just read off a node, so no
-// call site gained an argument it did not have. `modDeclBase` keeps the old
-// fall-through verbatim — a non-generic declaration (and every `FuncDecl` /
-// `LetDecl` name, which never folds parameters: a generic FUNCTION carries them
-// out-of-name in `fnTyParams`) is its own base.
-//
-// The 608-byte measurement in `modGenParams`'s old header — that routing the walk
-// to a run TOKENIZER cost more than it saved — is not refuted by this: it declined
-// a different home. This does not move the walk, it deletes it, because the walk
-// was recovering information that had never needed to be destroyed.
+// The base segment and the folded type-parameter names are the PARSER's own list,
+// banked on the declaration node (`ast.setDeclGp`): both are one array read keyed by
+// the node the caller already holds, never a re-parse of a string the parser built.
 function modDeclBase(ix: i32, name: string): string {
   const b = declGpBaseOf(ix)
   if b != "" { return b }
   name
 }
-// Carry the merge's rename INTO the bank, immediately after it lands in the
-// declared name. `modTypeRenamed` rewrites identifier SEGMENTS under the live
-// `modTyShadow` (the declaration's own parameters, pushed by the caller before
-// the rename), so running it on the bare base gives exactly the head segment it
-// gave the folded name — the two cannot drift.
+// Carry the merge's rename INTO the bank, immediately after it lands in the declared
+// name. `modTypeRenamed` rewrites identifier SEGMENTS under the live `modTyShadow`
+// (the declaration's own parameters, pushed by the caller before the rename), so
+// running it on the bare base gives exactly the head segment it gave the folded name —
+// the two cannot drift.
 //
-// This is the third position of the same discipline, and the reason it is not
-// optional: an in-place string rewrite between a producer and a consumer is what
-// left the spelling tree describing the PRE-merge name (`modRwType`'s note) and
-// what leaves it describing the pre-CANON name after `canonEmitTypeNames`
-// (`ast.clearAnnTs`). A stale base here would register the alias in the checker's
-// generic registry under `Box` while every application spells `Box$m1`.
-// A non-generic declaration has no row and this is a no-op.
+// This is the third position of the same discipline, and why it is not optional: an
+// in-place string rewrite between a producer and a consumer is what left the spelling
+// tree describing the PRE-merge name (`modRwType`'s note) and describing the pre-CANON
+// name after `canonEmitTypeNames` (`ast.clearAnnTs`). A stale base here would register
+// the alias under `Box` while every application spells `Box$m1`. A non-generic
+// declaration has no row, and this is a no-op.
 function modRwDeclBase(ix: i32): i32 {
   const b = declGpBaseOf(ix)
   if b != "" { setDeclGpBase(ix, modTypeRenamed(b)) }
@@ -3571,21 +3384,16 @@ function modCollectSelfFns(roots: i32[]): i32 {
 }
 // One row of D1230's registry: module `m` exports a free `self`-function spelled
 // `base`, merged as `mangled`, and the ENTRY file can name `m` by some specifier.
-// Recorded so the checker can turn `no field 'toEqual' on Expectation<i32>` into
-// a sentence about the missing import (`ast.ufcsImp*`).
+// Recorded so the checker can turn `no field 'toEqual' on Expectation<i32>` into a
+// sentence about the missing import (`ast.ufcsImp*`).
 //
-// THREE GATES, and each one is a different reason a suggestion would be wrong:
-//
-//  * `m == 0` — the entry's OWN self-functions are already in scope, so a call
-//    that failed to resolve one did not fail for want of an import.
-//  * NOT EXPORTED — an un-exported declaration cannot be imported at all, so
-//    naming it would send the reader to a fix that does not exist. `expMod` /
-//    `expName` is the token scan's own export set, the same one `modVisit` uses
-//    to diagnose "not exported".
-//  * NO SPECIFIER THE ENTRY CAN USE — see `modUfcsSpecFromEntry`.
-//
-// What it deliberately does NOT gate on is the receiver: this walk has no types.
-// `typecheck.ufcsWouldDispatch` re-asks the real question per call site.
+// THREE GATES, each a different reason a suggestion would be wrong. `m == 0`: the
+// entry's OWN self-functions are already in scope, so a call that failed to resolve
+// one did not fail for want of an import. NOT EXPORTED: an un-exported declaration
+// cannot be imported at all, so naming it sends the reader to a fix that does not
+// exist (`expMod`/`expName` is the token scan's own export set). NO SPECIFIER THE
+// ENTRY CAN USE: see `modUfcsSpecFromEntry`. It deliberately does NOT gate on the
+// receiver — this walk has no types; `typecheck.ufcsWouldDispatch` re-asks per site.
 function modNoteUfcsImportCand(m: i32, base: string, mangled: string): i32 {
   if m == 0 { return 0 }
   let ex = 0
@@ -3601,24 +3409,17 @@ function modNoteUfcsImportCand(m: i32, base: string, mangled: string): i32 {
   0
 }
 // The specifier the ENTRY FILE can write to name module `m`, or "" when none is
-// KNOWN-correct from there.
-//
-// Two sources, and only two, because a suggested import that resolves somewhere
-// else is worse than no suggestion:
-//
-//  1. The entry already imports `m` — then the entry's own specifier TEXT is by
-//     construction the right one, and the quick-fix extends that statement.
-//  2. `m`'s key is a `std:` specifier — absolute, and therefore identical from
-//     every file in the graph (`modResolveSpecifier` returns a std spec
-//     unchanged), so a fresh `import { … } from "std:x"` in the entry resolves to
-//     the same module.
+// KNOWN-correct from there. Two sources, and only two, because a suggested import that
+// resolves somewhere else is worse than no suggestion: the entry ALREADY imports `m`,
+// so its own specifier TEXT is by construction right and the quick-fix extends that
+// statement; or `m`'s key is a `std:` specifier, absolute and therefore identical from
+// every file in the graph (`modResolveSpecifier` returns a std spec unchanged).
 //
 // A RELATIVE module the entry does not import falls through to "". Its key is a
-// normalized PATH, and turning that back into a specifier relative to the entry
-// is path arithmetic (`..` segments included) that can produce a wrong import —
-// which is the one outcome a mechanically-applied quick-fix must not have. The
-// cost of the omission is a suggestion withheld, and the reader still gets the
-// direct sentence.
+// normalized PATH, and turning that back into a specifier relative to the entry is
+// path arithmetic (`..` segments included) that can produce a WRONG import — the one
+// outcome a mechanically-applied quick-fix must not have. The cost of the omission is
+// a suggestion withheld; the reader still gets the direct sentence.
 function modUfcsSpecFromEntry(m: i32): string {
   const key = modKeys[m]
   let i = 0
@@ -3698,34 +3499,17 @@ function modRenamed(name: string): string {
   modRenameTo[row]
 }
 // A TYPE-position name: annotations are SYNTHETIC strings ("A|B", "Point[]",
-// "Box<i32>"), so rewrite identifier SEGMENTS through the rename map. Quoted
+// "Box<i32>"), so rewrite identifier SEGMENTS through the rename map; quoted
 // string-literal segments (`"a"|"b"`) are copied verbatim.
 //
-// A BLOCK-LOCAL TYPE NEEDS NO SHADOW ENTRY, and since D1045 that is a statement
-// about the mangling rather than about the language: a `type` declared in a body
-// IS legal and lexically scoped, but the parser resolves that scope by minting the
-// declaration under a unique name (`P` → `P$b7`) and spelling every reference at
-// it, so by the time the merge runs there is nothing left for `modShadow` to hide.
-// What the merge must not do is visit such a declaration TWICE — `modRwStmt`'s
-// `Program` arm skips it, because this scanner sees only "an identifier run" and
-// would rename the `P` of `P$b7` against a top-level `P`.
-//
-// Both halves of the walk are the leaf's (W8): the identifier CHARACTER CLASS is
-// `tyname.nameIdentChar`, and where a quoted member ENDS is `tyname.skipQuotedName`, so a
-// `\` escape keeps its quote INSIDE the member (`type T = "a\"b"`, which the compiler
-// accepts and runs) and the `b` after it is never a rename candidate. Only the accumulating
-// run itself is written here; a run TOKENIZER is refuted at the leaf, with the byte count.
-//
-// **THE QUOTE ARM IS UNREACHABLE ON A COMPILING PROGRAM, AND IT IS STILL THE LEAF'S RULE.**
-// The merge runs only on a multi-module program that PARSED, and on a clean parse every
-// quoted spelling reaches its own tree leg first — `modRwType` / `modRwIsType` / the
-// `UnionDecl` member loop / `modRwExpr`'s `as` arm all render from the parser's spelling
-// tree (`setAnnTs` / `setUdTs`, banked unconditionally at every mint) and never call here.
-// What DOES arrive is declaration NAMES — `tdName`, `udName`, `declGpBase` — built from
-// IDENT tokens plus `<`, `,`, `>`, which cannot carry a quote. Measured over the corpus:
-// 187 calls across 1,737 files, 51 distinct arguments, none containing `"`. The arm stays
-// because the pass is total either way, and it holds the leaf's rule so that a future
-// consumer feeding it a rendered name gets the same answer every other scanner gives.
+// A BLOCK-LOCAL TYPE NEEDS NO SHADOW ENTRY, and since D1045 that is a statement about
+// the mangling, not the language: the parser mints such a declaration under a unique
+// name (`P` → `P$b7`) and spells every reference at it, so by merge time there is
+// nothing for `modShadow` to hide. What the merge must not do is visit one TWICE —
+// `modRwStmt`'s `Program` arm skips it, because this scanner sees only "an identifier
+// run" and would rename the `P` of `P$b7` against a top-level `P`. Both halves of the
+// walk are the leaf's (W8): `tyname.nameIdentChar` and `tyname.skipQuotedName`. The
+// quote arm is unreachable on a program that parsed, and stays so the pass is total.
 function modTypeRenamed(tn: string): string {
   const out: i32[] = []
   // STAGE 2c: identifier runs and quoted literal members are SLICED out of `tn` rather
@@ -3775,30 +3559,18 @@ function modTypeRenamed(tn: string): string {
   fromCodePoints(out)
 }
 
-// ── scope-aware arena rewrite (port of the host's moduleRewrite.ts) ───────────
-// Rewrites Name references, call targets, declaration names — and (NATIVE
-// DIVERGENCE, mechanism not semantics) type-annotation references and type
-// declaration names, since the native checker resolves type names from the
-// merged program (the host resolves imported types at parse time, so its
-// rewriter never sees them). A top-level name shadowed by a param, loop var, or
-// block-local `let`/`function` is left alone for that scope's extent
-// (`modShadow`, a save/restore stack).
-// ── D-PARSETY P1: the merge rewrites the SPELLING TREE, not the string ───────
-// Rename every TYPE-position identifier in the spelling subtree rooted at `root`
-// through the module's rename map: the head of a `TS_NAME` / `TS_APP` (`Point`,
-// `Box` of `Box<i32>`) and a `TS_MAP`'s KEY (itself a type name). A live generic
-// type-parameter (`modTyShadow`) is the parameter, never a colliding top-level
-// binding — the same guard `modTypeRenamed` applies per segment.
-//
-// What the TREE knows and the segment scanner cannot: `TS_FIELD.tsText` is a
-// FIELD name and `TS_LITSTR` / `TS_LITNUM` are literal lexemes, so none of them
-// is a rename candidate. `modTypeRenamed` sees only "an identifier run", so an
-// inline object field whose name collides with a top-level type declaration in
-// the same module (`type v = i32` + an annotation `{v: i32}`) had its FIELD
-// renamed to `v$mN` — the annotation then described a struct with a field no
-// literal has, and the diagnostic demangler stripped the `$mN` so the two types
-// RENDERED identically (`cannot assign {v: i32} to 'h' of type {v: i32}`). Pin:
-// `tests/cases/modules/field-name-shadows-type/`.
+// ── scope-aware arena rewrite ────────────────────────────────────────────────
+// Rewrites Name references, call targets, declaration names — and (NATIVE DIVERGENCE,
+// mechanism not semantics) type-annotation references and type declaration names,
+// since the native checker resolves type names from the merged program. A top-level
+// name shadowed by a param, loop var or block-local `let`/`function` is left alone for
+// that scope's extent (`modShadow`, a save/restore stack).
+// ── the merge rewrites the SPELLING TREE, not the string ─────────────────────
+// Rename every TYPE-position identifier in the subtree rooted at `root` — the head of
+// a `TS_NAME` / `TS_APP`, a `TS_MAP`'s KEY — skipping a live generic type-parameter
+// (`modTyShadow`). What the TREE knows and the segment scanner cannot: `TS_FIELD.tsText`
+// is a FIELD name and `TS_LITSTR`/`TS_LITNUM` are lexemes, so neither can be renamed.
+// Pin: `tests/cases/modules/field-name-shadows-type/`.
 function modRwTsName(root: i32): i32 {
   if root < 0 { return 0 }
   const k = tsKind[root]
@@ -3860,7 +3632,7 @@ function modRwFunc(ix: i32): i32 {
   const n = P.nodes[ix]
   if n is FuncDecl {
     n.fnName = modRenamed(n.fnName)
-    // R4 writer 1 of 8: an IN-PLACE name write on a node already in the arena.
+    // R4: an IN-PLACE name write on a node already in the arena, so re-note the name.
     sidNoteNodeName(ix)
     const saved = modShadow.length
     const tySaved = modTyShadow.length
@@ -3978,7 +3750,7 @@ function modRwStmt(ix: i32): i32 {
     if n.letInit >= 0 { modRwExpr(n.letInit) }
     modRwType(n.letType)
     n.letName = modRenamed(n.letName)
-    // R4 writer 2 of 8.
+    // R4: the same in-place name write (see `modRwFunc`).
     sidNoteNodeName(ix)
     return 0
   }
@@ -4107,28 +3879,24 @@ function modRwExpr(ix: i32): i32 {
   const n = P.nodes[ix]
   if n is Ident {
     n.identName = modRenamed(n.identName)
-    // R4 writer 3 of 8 — and the one the self-compile exercises hardest: the merge
-    // renames every colliding top-level reference in all 26 compiler modules.
+    // R4: the in-place name write the self-compile exercises hardest — the merge
+    // renames every colliding top-level reference in every compiler module.
     sidNoteNodeName(ix)
     return 0
   }
   if n is Call {
-    // A UFCS member-call `recv.prop(args)` whose `prop` names a free
-    // `self`-function (matching arity) that the merge MANGLED — same-module
-    // (`inc` → `inc$m0`) or imported (`shout` → `shout$m1`). The property string
-    // on the `Member` is NOT rewritten (a callable field/struct method of the
-    // same name must keep field precedence, which the checker/emitter decide from
-    // the receiver TYPE — info the rename walker lacks). Instead, record the
-    // plain→mangled alias so the checker's/emitter's UFCS resolution (which runs
-    // AFTER the field check, with the plain `prop`) can find the mangled function.
+    // A UFCS member-call `recv.prop(args)` whose `prop` names a free `self`-function
+    // (matching arity) that the merge MANGLED — same-module (`inc` → `inc$m0`) or
+    // imported (`shout` → `shout$m1`). The property string on the `Member` is NOT
+    // rewritten: a callable field of the same name keeps field precedence, decided from
+    // the receiver TYPE the rename walker lacks. Record the plain→mangled alias instead,
+    // so UFCS resolution (which runs AFTER the field check, with the plain `prop`) finds
+    // the mangled function.
     //
-    // D1120 — AND THE ANSWER IS BANKED ON THIS NODE, not under the plain name.
-    // `modSelfFnTarget` resolves `prop` through the LIVE module's rename map, so it
-    // is already this call site's own answer; a flat name-keyed table lost it when a
-    // second merged module exported a self-function of the same name, and D1191
-    // showed it also ANSWERED a module that binds no such name at all. A site whose
-    // `prop` resolves to nothing here banks nothing and falls to this module's own
-    // `ufcsScope` rows, which say the same thing about scope without the arity test.
+    // D1120 — THE ANSWER IS BANKED ON THIS NODE, not under the plain name.
+    // `modSelfFnTarget` resolves `prop` through the LIVE module's rename map, so it is
+    // already this site's own answer; a flat name-keyed table answered the wrong module
+    // (D1191). A site resolving to nothing banks nothing and falls to `ufcsScope`.
     const cf = P.nodes[n.callFn]
     if cf is Member {
       const target = modSelfFnTarget(cf.memProp, n.callArgs.length)
@@ -4192,26 +3960,18 @@ function modRwExpr(ix: i32): i32 {
   }
   if n is AsExpr {
     modRwExpr(n.asObj)
-    // The cast TARGET is renamable. #1121 left this arm operand-only on the
-    // reading that "`asTy` is a numeric primitive, never a renamable import";
-    // what the checker requires is that the target RESOLVE to a numeric scalar
-    // (`primNameOf(nameToTyAt(asTy))`), and a user alias does — `type Id = i32`
-    // + `x as Id` is a legal single-file program. The merge renamed the
-    // declaration to `Id$mN` and left the cast spelling alone, so EVERY module
-    // program casting to a named alias failed with ``unknown type `Id` in `as`
-    // cast`` — whether the alias was declared in the entry module, in another
-    // module, imported, or reached through a chain. Pin:
-    // `tests/cases/modules/as-cast-alias/`.
+    // The cast TARGET is renamable. What the checker requires is that the target
+    // RESOLVE to a numeric scalar (`primNameOf(nameToTyAt(asTy))`), and a user alias
+    // does — `type Id = i32` + `x as Id` is a legal single-file program. Leaving the
+    // cast spelling alone while the declaration renamed to `Id$mN` failed EVERY module
+    // program casting to a named alias with ``unknown type `Id` in `as` cast``, whether
+    // the alias was declared in the entry, in another module, imported, or reached
+    // through a chain. Pin: `tests/cases/modules/as-cast-alias/`.
     //
-    // The TREE leg, not the scanner: `modTypeRenamed` is itself a hand-rolled
-    // identifier-segment parser over a rendered type name (the one this program
-    // is retiring — 5 call sites on master, 3 already arena-first). Routing the
-    // new consumer through it would have added a SIXTH live one. Stated plainly:
-    // the scanner alone WOULD have fixed both pins (measured — a build with the
-    // tree leg deleted runs them), because the checker only admits a cast target
-    // that resolves to a numeric scalar, so no field name and no literal lexeme
-    // — the two things the tree knows and the scanner cannot — can appear here.
-    // The defect was a MISSING CONSUMER, not a scanner defect.
+    // The TREE leg, not the scanner: the scanner alone would have fixed both pins,
+    // because the checker admits only a target resolving to a numeric scalar, so no
+    // field name and no literal lexeme can appear here. The defect was a MISSING
+    // CONSUMER, and routing a new one through the scanner would add a live call site.
     const asRoot = annTsOf(ix)
     if asRoot >= 0 {
       modRwTsName(asRoot)
