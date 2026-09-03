@@ -67,7 +67,17 @@ run "lint-self + fmt"          bash scripts/lint-self.sh
 run "deno lint"                deno lint
 run "rep-fuzz"                 bash scripts/rep-fuzz-check.sh
 run "mono-tyaram-grid"         bash scripts/mono-tyaram-grid.sh
-run "filed witnesses"          python3 scripts/check-filed-witnesses.py --strict docs/internals/silent-class-inventory.md
+# THE DIRECTORY, not the monolith: the inventory is one file per row
+# (`docs/internals/inventory/D1042.md`). The checker reads either form and a directory
+# holding no rows yet falls back to the monolith named in its own README, so this line is
+# the same before and after the split lands and does not need touching on merge day.
+run "filed witnesses"          python3 scripts/check-filed-witnesses.py --strict docs/internals/inventory
+# THE OTHER HALF: a row that stopped EXISTING. #2405 resolved a conflict in the inventory's
+# tail and deleted a ROW, with its citations left standing, and every gate was green —
+# the instruments above all read the rows that are there. ~0.2s, and it also runs inside
+# `deno task test` and the ci-native `vl_*_test.ts` glob; its own row here so the table
+# names it rather than burying it in a suite of hundreds.
+run "inventory refs"           deno test -A --no-check tests/vl_inventory_refs_test.ts
 run "distilled corpus"         python3 scripts/silent-sweep/distilled/regress.py build/vl-compiler.wasm
 
 # ON MASTER ONLY: the committed baseline must describe the committed seed exactly. A branch

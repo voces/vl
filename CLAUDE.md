@@ -471,8 +471,16 @@ For any doc whose rows are `### <ID> — <title>` + a `**<status>**` line + a `R
 that is one command:
 
 ```sh
-python3 scripts/check-filed-witnesses.py --strict docs/internals/silent-class-inventory.md
+python3 scripts/check-filed-witnesses.py --strict docs/internals/inventory
 ```
+
+**The inventory is ONE FILE PER ROW** (`docs/internals/inventory/D1042.md`), because every
+defect PR appended to one file's tail and two concurrent PRs conflicted there nearly every
+hour. The command above takes either form — a directory of `D*.md`, or the monolith — so it
+is the same before and after the split lands. `scripts/inventory/ls.py --status open` is the
+queue, `TEMPLATE.md` is what a new row starts from, and `scripts/inventory/split.py --apply
+--relink` is what performs the split, idempotently and only when its five losslessness
+checks pass.
 
 It runs each row's OWN filed program — never a paraphrase, which is a different program —
 and prints which rows no longer behave as filed; non-zero exit means at least one moved.
@@ -495,3 +503,11 @@ change. D171/D172/D173 are that shape.
 `tests/vl_inventory_rows_test.ts` enforces the structural half of this on every PR (a
 known-outcome status line and a real repro BLOCK, not just a `Repro:` label) in ~15ms,
 without running any program.
+
+**And `tests/vl_inventory_refs_test.ts` asks the question none of the above can**: of every
+`D<id>` the tree CITES, which one has NO row? #2405 resolved a conflict in the inventory's
+tail and deleted a row, leaving ten citations standing in `DECISIONS.md`, `ROADMAP.md`,
+`compiler/check_state.vl` and a test — and every gate was green, because every instrument
+here reads the rows that ARE there. 11,787 citations over 10,827 files in ~230 ms. A row id
+mentioned before its row exists gets an `unfiled: D<id>` marker in the citing file, which
+the test then makes you DELETE the day the row lands.
