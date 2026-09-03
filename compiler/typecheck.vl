@@ -429,7 +429,35 @@ export type Ty = TyPrim |
 // `tcode` is the stable CATEGORY code: "" for a type-soundness rejection (the
 // default), or `CODE_UNSUPPORTED_LOWERING` for a program the type system
 // accepts but codegen cannot lower yet (see `tErrUnsupported`).
-type TDiag = { tmsg: string, tat: i32, tline: i32, tcol: i32, tcode: string }
+// `tdata` is the STRUCTURED PAYLOAD (`diagDataField`), "" for the diagnostics
+// that have none — which is all but D1230's today.
+type TDiag = {
+  tmsg: string,
+  tat: i32,
+  tline: i32,
+  tcol: i32,
+  tcode: string,
+  tdata: string,
+}
+
+// THE DATA CHANNEL'S ENCODING, documented here and nowhere else. `tdata` is a flat
+// sequence of netstrings — `<byte-length> ":" <bytes> ","` — read as alternating
+// KEY and VALUE. The length is authoritative, so a value may hold ANY byte (`;`,
+// `,`, a `"` from a string-literal type member, a newline) and nothing is escaped,
+// quoted or order-dependent: a code is a bare CATEGORY again and the payload rides
+// here. A KEY MAY REPEAT and repetition IS the list — `modules` appears once per
+// candidate module — so no field needs an in-band separator of its own. Decoders:
+// `compiler/diagnostics.ts` `decodeDiagData` (the LSP and every TS consumer).
+function diagDataField(key: string, val: string) {
+  i32ToStr(key.length) +
+    ":" +
+    key +
+    "," +
+    i32ToStr(val.length) +
+    ":" +
+    val +
+    ","
+}
 
 // The stable category code for EMITTER-CAPABILITY rejections: the construct is
 // type-valid, but codegen cannot lower it yet. Machine-distinguishable from a
@@ -438,30 +466,19 @@ type TDiag = { tmsg: string, tat: i32, tline: i32, tcol: i32, tcode: string }
 // pass `vl check`.
 const CODE_UNSUPPORTED_LOWERING = "unsupported-lowering"
 
-// D1230's category code, and the ONE payload channel its quick-fix reads. A UFCS
-// member call whose name is a free `self`-function exported by a module in the
-// graph but not imported by this file carries:
+// D1230's category code — a BARE category, like every code on this channel. Its
+// answer travels on the DATA channel (`ufcsNotImportedData`) under three keys:
 //
-//     ufcs-not-imported;member=<name>;modules=<spec>[,<spec>…];recv=<type>
+//   * `member` — the property AS WRITTEN.
+//   * `modules` — ONE FIELD PER candidate module, each spelled the way the file
+//     can write it TODAY (an existing import's own text, or a `std:` specifier),
+//     in the registry's dependency-first order and deduplicated.
+//   * `recv` — the rendered receiver type, demangled.
 //
-// THE QUICK-FIX MUST NEVER PARSE THE SENTENCE, which is why the payload rides
-// here rather than in the message: the wording is free to improve and the code is
-// not. The contract, in the form a host can implement without a grammar:
-//
-//   * `;` separates fields, and they appear in exactly this order.
-//   * `member=` is the property AS WRITTEN — an identifier, so it carries no
-//     separator.
-//   * `modules=` is a `,`-joined list of module specifiers, each one spelled the
-//     way the file can write it TODAY (an existing import's own text, or a
-//     `std:` specifier). Ordered by the module graph's dependency-first walk and
-//     deduplicated. A specifier is a module key or a `std:` name and can hold
-//     neither `,` nor `;`.
-//   * `recv=` is LAST and is a RENDERED TYPE, which may hold anything at all —
-//     `|`, `,`, `;` inside a string-literal member. Read it as everything after
-//     the first `;recv=`, never as a `;`-split field.
-//
-// ONE DIAGNOSTIC PER CALL, listing every candidate module, because the fix is one
-// choice among them — N diagnostics would stack N squiggles on one token.
+// THE QUICK-FIX MUST NEVER PARSE THE SENTENCE: the wording is free to improve and
+// these keys are not. ONE DIAGNOSTIC PER CALL lists every candidate module,
+// because the fix is one choice among them — N diagnostics would stack N squiggles
+// on one token.
 const CODE_UFCS_NOT_IMPORTED = "ufcs-not-imported"
 
 // ── Checker state (one struct, held in the global `T`) ───────────────────────
@@ -7304,6 +7321,13 @@ function tErrUnsupported(msg: string, at: i32) {
 }
 
 function tErrCoded(msg: string, at: i32, code: string) {
+  tErrCodedData(msg, at, code, "")
+}
+
+// `tErrCoded` PLUS the structured payload — the only raise that fills `tdata`.
+// The code stays a bare category and the answer rides `data` (`diagDataField`),
+// so no consumer has to split a code string and no value's characters can bite.
+function tErrCodedData(msg: string, at: i32, code: string, data: string) {
   let ln = 0
   let co = 0
   if at >= 0 && at < nodeToks.length {
@@ -7314,7 +7338,7 @@ function tErrCoded(msg: string, at: i32, code: string) {
       co = t.col
     }
   }
-  tErrPush(msg, at, ln, co, code)
+  tErrPush(msg, at, ln, co, code, data)
 }
 
 // `tErr`, positioned at node `at`'s START token instead of its `nodeToks`
@@ -7340,13 +7364,20 @@ function tErrAtNodeStartCoded(msg: string, at: i32, code: string) {
   if sp >= 0 {
     const tk = tokIndexAt(sp)
     if tk >= 0 && tk < P.toks.length {
-      return tErrPush(msg, at, P.toks[tk].line, P.toks[tk].col, code)
+      return tErrPush(msg, at, P.toks[tk].line, P.toks[tk].col, code, "")
     }
   }
   tErrCoded(msg, at, code)
 }
 
-function tErrPush(msg: string, at: i32, ln: i32, co: i32, code: string) {
+function tErrPush(
+  msg: string,
+  at: i32,
+  ln: i32,
+  co: i32,
+  code: string,
+  data: string,
+) {
   // An EXACT repeat (same message, same anchor) is noise, not information — two
   // passes can resolve the same annotation (the pass-1.5 hoist and the real pass
   // both report a generic-alias arity/bare-use error, identically positioned).
@@ -7357,7 +7388,9 @@ function tErrPush(msg: string, at: i32, ln: i32, co: i32, code: string) {
     if d.tat == at && d.tmsg == msg { return 0 }
     di = di + 1
   }
-  T.diags.push({ tmsg: msg, tat: at, tline: ln, tcol: co, tcode: code })
+  T.diags.push(
+    { tmsg: msg, tat: at, tline: ln, tcol: co, tcode: code, tdata: data },
+  )
   0
 }
 
@@ -20380,10 +20413,11 @@ function stdFmtMovedNote(name: string) {
 function memberFloorErr(objTy: i32, prop: string, ix: i32) {
   const specs = ufcsMissSpecsAt(ix)
   if specs != "" {
-    return tErrCoded(
+    return tErrCodedData(
       ufcsNotImportedMsg(prop, specs, objTy),
       ix,
-      ufcsNotImportedCode(prop, specs, objTy),
+      CODE_UFCS_NOT_IMPORTED,
+      ufcsNotImportedData(prop, specs, objTy),
     )
   }
   tErr(memberFloorMsg(objTy, prop), ix)
@@ -20416,24 +20450,30 @@ function ufcsNotImportedMsg(prop: string, specs: string, objTy: i32) {
     "` from there"
 }
 
-// D1230's PAYLOAD — the machine half, whose shape `CODE_UFCS_NOT_IMPORTED`
-// documents. `recv=` is last precisely because a rendered type is the one field
-// that can contain the separators.
+// D1230's PAYLOAD — the machine half, on the DATA channel whose keys
+// `CODE_UFCS_NOT_IMPORTED` documents and whose encoding `diagDataField` does.
+// `specs` arrives `,`-joined (`ufcsMissingImportSpecs`'s carrier) and is split
+// back into ONE `modules` field per specifier, so the payload keeps no in-band
+// separator of its own.
 //
 // IT DEMANGLES ITS OWN RECEIVER, and that is not duplication. The MESSAGE is
-// demangled downstream, once, for every diagnostic (`driver.vcDiagMsg`); the CODE
-// is not, because a category code has never carried a program's names. Only this
-// payload does, so it strips the merge's `$mN` here — otherwise the sentence would
-// say `Box` while the field a quick-fix reads says `Box$m1`, which is a type name
-// no source file contains.
-function ufcsNotImportedCode(prop: string, specs: string, objTy: i32) {
-  CODE_UFCS_NOT_IMPORTED +
-    ";member=" +
-    prop +
-    ";modules=" +
-    specs +
-    ";recv=" +
-    demangleMsg(tyToStr(objTy))
+// demangled downstream, once, for every diagnostic (`driver.vcDiagMsg`); the DATA
+// is not, because it never passes through that renderer. So it strips the merge's
+// `$mN` here — otherwise the sentence would say `Box` while the field a quick-fix
+// reads says `Box$m1`, which is a type name no source file contains.
+function ufcsNotImportedData(prop: string, specs: string, objTy: i32) {
+  let out = diagDataField("member", prop)
+  let start = 0
+  let i = 0
+  while i < specs.length {
+    if specs[i] == ',' {
+      out = out + diagDataField("modules", specs.slice(start, i))
+      start = i + 1
+    }
+    i = i + 1
+  }
+  out = out + diagDataField("modules", specs.slice(start, specs.length))
+  out + diagDataField("recv", demangleMsg(tyToStr(objTy)))
 }
 
 // THE INDEX ARM'S OWN SENTENCE, on the same terms — "" when `recv[i]` resolves or defers,
@@ -24729,10 +24769,11 @@ function checkCallNode(n: Call, ix: i32) {
         // rather than banking — `memberFloorErr` never sees a string method call.
         const suSpecs = ufcsMissingImportSpecs(sp, recvTy, n.callArgs.length)
         if suSpecs != "" {
-          tErrCoded(
+          tErrCodedData(
             ufcsNotImportedMsg(sp, suSpecs, recvTy),
             ix,
-            ufcsNotImportedCode(sp, suSpecs, recvTy),
+            CODE_UFCS_NOT_IMPORTED,
+            ufcsNotImportedData(sp, suSpecs, recvTy),
           )
           return TY_ERR
         }

@@ -5,6 +5,12 @@
 // a type-soundness verdict. Both categories are errors (`checkSrc` rc 2): an
 // unbuildable program must not pass `vl check`; only the code differs.
 //
+// AND ITS DATA TWIN (`diagDataLen`/`diagDataByte`). A code is a BARE CATEGORY;
+// anything a category needs to say rides the parallel payload pair, netstring
+// encoded (`typecheck.diagDataField`, decoded by `compiler/diagnostics.ts`
+// `decodeDiagData`). Every diagnostic without one answers a zero-length payload,
+// so "no data" is one path and not two.
+//
 // Loads the real seed (`build/vl-compiler.wasm`) directly — absent (fresh
 // clone, no `refresh-compiler.sh` yet) the tests self-ignore, the same
 // convention as the other seed-driven suites.
@@ -27,7 +33,12 @@ if (ignore) {
   );
 }
 
+import { decodeDiagData } from "../compiler/diagnostics.ts";
+import type { VLDiagnosticData } from "../compiler/diagnostics.ts";
+
 type Exports = Record<string, (...args: number[]) => number>;
+
+type Diag = { message: string; code: string; data: VLDiagnosticData; raw: string };
 
 const instantiate = (): Exports => {
   const bytes = Deno.readFileSync(SEED);
@@ -36,30 +47,40 @@ const instantiate = (): Exports => {
 };
 
 // STAGE 2c: the element is a UTF-8 byte, not a code point.
-const readString = (len: number, at: (j: number) => number): string => {
+const readBytes = (len: number, at: (j: number) => number): Uint8Array => {
   const bytes = new Uint8Array(len);
   for (let j = 0; j < len; j++) bytes[j] = at(j);
-  return new TextDecoder().decode(bytes);
+  return bytes;
+};
+const readString = (len: number, at: (j: number) => number): string =>
+  new TextDecoder().decode(readBytes(len, at));
+
+/** One diagnostic's three channels: sentence, category code, decoded payload.
+ *  `raw` is the payload's undecoded bytes, kept so a format change is visible in
+ *  the failure message rather than only in a decoded field going missing. */
+const diagAt = (exp: Exports, i: number): Diag => {
+  const dataBytes = readBytes(exp.diagDataLen(i), (j) => exp.diagDataByte(i, j));
+  return {
+    message: readString(exp.diagMsgLen(i), (j) => exp.diagMsgAt(i, j)),
+    code: readString(exp.diagCodeLen(i), (j) => exp.diagCodeByte(i, j)),
+    data: decodeDiagData(dataBytes),
+    raw: new TextDecoder().decode(dataBytes),
+  };
 };
 
-/** Check `src` on a fresh store; return each diagnostic's `{ message, code }`. */
+/** Check `src` on a fresh store; return each diagnostic's three channels. */
 const check = (
   exp: Exports,
   src: string,
-): { rc: number; diags: { message: string; code: string }[] } => {
+): { rc: number; diags: Diag[] } => {
   exp.modReset();
   exp.srcReset();
   for (const ch of src) exp.srcPush(ch.codePointAt(0)!);
   const rc = exp.checkSrc();
-  const diags: { message: string; code: string }[] = [];
+  const diags: Diag[] = [];
   if (rc !== 0) {
     const n = exp.diagCount();
-    for (let i = 0; i < n; i++) {
-      diags.push({
-        message: readString(exp.diagMsgLen(i), (j) => exp.diagMsgAt(i, j)),
-        code: readString(exp.diagCodeLen(i), (j) => exp.diagCodeByte(i, j)),
-      });
-    }
+    for (let i = 0; i < n; i++) diags.push(diagAt(exp, i));
   }
   return { rc, diags };
 };
@@ -232,34 +253,43 @@ Deno.test({
   }
 });
 
-// ── D1230/D1230: the `ufcs-not-imported` PAYLOAD ─────────────────────────────
+// ── D1230: the `ufcs-not-imported` PAYLOAD ───────────────────────────────────
 // The other kind of code on this channel. `unsupported-lowering` is a CATEGORY —
 // one word, and everything a consumer needs is in it. `ufcs-not-imported` also
 // has to carry an ANSWER: which name, from which module(s), on what receiver, so
 // an editor's quick-fix can write the import without parsing English.
 //
-// THE FORMAT IS THE CONTRACT, and this test is where it is pinned:
-//
-//     ufcs-not-imported;member=<name>;modules=<spec>[,<spec>…];recv=<type>
-//
-// `;`-separated, fixed order, `,` between module specifiers, and `recv=` LAST
-// because a rendered type is the one field that can itself contain any of those
-// characters (`A | B`, `{a: i32, b: i32}`) — read it as everything after the
-// first `;recv=`.
+// THE CODE STAYS A BARE CATEGORY AND THE ANSWER RIDES `data`, which is what this
+// test is here to pin. The payload is a netstring sequence read as alternating
+// key/value (`typecheck.diagDataField`); a repeated key is a list, so `modules`
+// appears once per candidate and no field needs an in-band separator. Nothing in
+// it is order-dependent and no value's characters can bite the framing — the
+// round-trip test below is the witness, not the argument.
 //
 // Driving it needs a MODULE GRAPH, which `check` above cannot build: the whole
 // point of the diagnostic is a name exported by another module. `checkGraph`
 // serves the fetch loop from an in-memory map, so the fixture is self-contained
 // and does not depend on anything under `std/`.
 
+/** Fail unless `got` deep-equals `want` (both plain string→string[] records). */
+const sameData = (got: VLDiagnosticData, want: VLDiagnosticData, where: string) => {
+  const norm = (d: VLDiagnosticData) =>
+    JSON.stringify(Object.keys(d).sort().map((k) => [k, d[k]]));
+  if (norm(got) !== norm(want)) {
+    throw new Error(
+      `${where}: expected data ${JSON.stringify(want)}, got ${JSON.stringify(got)}`,
+    );
+  }
+};
+
 /** Check `entrySrc` on a fresh store with `mods` (key -> source) served to the
- *  module fetch loop; return each diagnostic's `{ message, code }`. */
+ *  module fetch loop; return each diagnostic's three channels. */
 const checkGraph = (
   exp: Exports,
   entryKey: string,
   entrySrc: string,
   mods: Record<string, string>,
-): { rc: number; diags: { message: string; code: string }[] } => {
+): { rc: number; diags: Diag[] } => {
   const push = (text: string, sink: (cp: number) => number) => {
     for (const ch of text) sink(ch.codePointAt(0)!);
   };
@@ -282,15 +312,10 @@ const checkGraph = (
   exp.srcReset();
   push(entrySrc, exp.srcPush);
   const rc = exp.checkSrc();
-  const diags: { message: string; code: string }[] = [];
+  const diags: Diag[] = [];
   if (rc !== 0) {
     const n = exp.diagCount();
-    for (let i = 0; i < n; i++) {
-      diags.push({
-        message: readString(exp.diagMsgLen(i), (j) => exp.diagMsgAt(i, j)),
-        code: readString(exp.diagCodeLen(i), (j) => exp.diagCodeByte(i, j)),
-      });
-    }
+    for (let i = 0; i < n; i++) diags.push(diagAt(exp, i));
   }
   return { rc, diags };
 };
@@ -317,16 +342,32 @@ Deno.test({
   if (diags.length !== 1) {
     throw new Error(`expected 1 diagnostic, got: ${JSON.stringify(diags)}`);
   }
-  const want = "ufcs-not-imported;member=area;modules=./lib;recv=Box";
-  if (diags[0].code !== want) {
+  // THE CODE IS A BARE CATEGORY. It used to be `ufcs-not-imported;member=area;…`
+  // and a consumer had to cut at the first `;` to compare it; the payload has its
+  // own channel now, so `===` is the whole comparison.
+  if (diags[0].code !== "ufcs-not-imported") {
     throw new Error(
-      `expected code ${JSON.stringify(want)}, got: ${JSON.stringify(diags[0])}`,
+      `expected the bare category, got: ${JSON.stringify(diags[0])}`,
+    );
+  }
+  sameData(
+    diags[0].data,
+    { member: ["area"], modules: ["./lib"], recv: ["Box"] },
+    "one candidate module",
+  );
+  // The wire bytes, exactly — a netstring per field, key then value.
+  const wantRaw = "6:member,4:area,7:modules,5:./lib,4:recv,3:Box,";
+  if (diags[0].raw !== wantRaw) {
+    throw new Error(
+      `expected payload bytes ${JSON.stringify(wantRaw)}, got ${
+        JSON.stringify(diags[0].raw)
+      }`,
     );
   }
   // The MODULE SPECIFIER is the file's own import text, not the resolved key.
   // `/w/lib.vl` would be a path the author never typed and an import they cannot
   // write; `./lib` is the string already in the file.
-  if (diags[0].code.includes("/w/lib.vl")) {
+  if (diags[0].raw.includes("/w/lib.vl")) {
     throw new Error(
       `the payload must carry the SPECIFIER, not the resolved key: ${
         JSON.stringify(diags[0])
@@ -336,7 +377,7 @@ Deno.test({
 });
 
 Deno.test({
-  name: "diag-code: TWO candidate modules ride ONE diagnostic, `,`-joined",
+  name: "diag-code: TWO candidate modules ride ONE diagnostic, one field each",
   ignore,
 }, () => {
   const exp = instantiate();
@@ -372,12 +413,19 @@ Deno.test({
       }`,
     );
   }
-  const want = "ufcs-not-imported;member=area;modules=./lib,./more;recv=Box";
-  if (diags[0].code !== want) {
+  if (diags[0].code !== "ufcs-not-imported") {
     throw new Error(
-      `expected code ${JSON.stringify(want)}, got: ${JSON.stringify(diags[0])}`,
+      `expected the bare category, got: ${JSON.stringify(diags[0])}`,
     );
   }
+  // ONE `modules` FIELD PER CANDIDATE, and that is how a list is spelled here —
+  // there is no `,`-joined value to re-split, so a specifier holding a separator
+  // cannot merge two modules into one or split one into two.
+  sameData(
+    diags[0].data,
+    { member: ["area"], modules: ["./lib", "./more"], recv: ["Box"] },
+    "two candidate modules",
+  );
 });
 
 Deno.test({
@@ -402,9 +450,104 @@ Deno.test({
   if (diags[0].code !== "") {
     throw new Error(`expected an empty code, got: ${JSON.stringify(diags[0])}`);
   }
+  sameData(diags[0].data, {}, "an uncoded diagnostic");
   if (!diags[0].message.includes("no field 'nosuch' on Box")) {
     throw new Error(
       `expected the plain member sentence, got: ${JSON.stringify(diags[0])}`,
     );
+  }
+});
+
+// THE ROUND-TRIP, AND IT IS THE WHOLE REASON THE CHANNEL IS LENGTH-PREFIXED. The
+// receiver renders as `{a: i32, tag: "a;b,c|d" | "éè"}` — every separator the old
+// packed code used (`;` between fields, `,` between modules), the `=` and `"` and
+// `|` besides, and two non-ASCII characters so a byte length and a JS `.length`
+// disagree by two. A reader that split on any character, or that sliced a JS
+// string by the wire length, gets a different answer than the compiler wrote.
+Deno.test({
+  name: "diag-code: a payload holding `;` `,` `|` `\"` and non-ASCII round-trips exactly",
+  ignore,
+}, () => {
+  const exp = instantiate();
+  const recv = '{a: i32, tag: "a;b,c|d" | "éè"}';
+  const { rc, diags } = checkGraph(
+    exp,
+    "/w/entry.vl",
+    'import { mk } from "./n"\nprint(mk().toEqual())\n',
+    {
+      "/w/n.vl": [
+        `export function mk(): ${recv} { return { a: 1, tag: "éè" } }`,
+        `export function toEqual(self: ${recv}): i32 { return 1 }`,
+        "",
+      ].join("\n"),
+    },
+  );
+  if (rc !== 2) throw new Error(`expected rc 2 (type stage), got ${rc}`);
+  if (diags.length !== 1) {
+    throw new Error(`expected 1 diagnostic, got: ${JSON.stringify(diags)}`);
+  }
+  sameData(
+    diags[0].data,
+    { member: ["toEqual"], modules: ["./n"], recv: [recv] },
+    "a receiver full of separators",
+  );
+  // The length is a UTF-8 BYTE count: 31 JS characters, 33 bytes.
+  if (!diags[0].raw.includes(`33:${recv},`)) {
+    throw new Error(
+      `expected a 33-byte netstring for the receiver, got ${
+        JSON.stringify(diags[0].raw)
+      }`,
+    );
+  }
+});
+
+// ── the decoder itself, with no seed ─────────────────────────────────────────
+// `decodeDiagData` is the reader every TS consumer uses, so its edge cases are
+// pinned where the format is documented rather than in whichever consumer noticed
+// first. NOT seed-gated: it is pure.
+
+const enc = (t: string) => new TextEncoder().encode(t);
+
+Deno.test("diag-data: an empty payload decodes to an empty record", () => {
+  const got = decodeDiagData(new Uint8Array(0));
+  if (Object.keys(got).length !== 0) {
+    throw new Error(`expected {}, got ${JSON.stringify(got)}`);
+  }
+});
+
+Deno.test("diag-data: a value may hold the framing characters", () => {
+  // `3:,` is a field whose entire value is a comma; `1::` one that is a colon.
+  const got = decodeDiagData(enc("1:a,3:x,y,1:b,1::,"));
+  if (JSON.stringify(got) !== JSON.stringify({ a: ["x,y"], b: [":"] })) {
+    throw new Error(`expected the literal values back, got ${JSON.stringify(got)}`);
+  }
+});
+
+Deno.test("diag-data: a repeated key is a list, in wire order", () => {
+  const got = decodeDiagData(enc("1:m,1:b,1:m,1:a,"));
+  if (JSON.stringify(got) !== JSON.stringify({ m: ["b", "a"] })) {
+    throw new Error(`expected wire order, got ${JSON.stringify(got)}`);
+  }
+});
+
+// HALF AN ANSWER IS WORSE THAN NONE on a channel between two halves of one
+// toolchain: a malformed payload means the seed and the reader disagree, and a
+// quick-fix acting on the readable prefix would write an import from a module the
+// compiler never named. Every one of these yields `{}`.
+Deno.test("diag-data: a malformed payload decodes to nothing at all", () => {
+  const bad = [
+    "6:member",                 // no terminator
+    "6:member,4:area",          // unterminated final field
+    "6:member,4:area,4:recv,",  // odd field count — a key with no value
+    ":x,",                      // empty length
+    "x:1,",                     // non-digit length
+    "9:short,",                 // length past the end
+    "3:abcX",                   // wrong terminator
+  ];
+  for (const b of bad) {
+    const got = decodeDiagData(enc(b));
+    if (Object.keys(got).length !== 0) {
+      throw new Error(`${JSON.stringify(b)} must decode to {}, got ${JSON.stringify(got)}`);
+    }
   }
 });

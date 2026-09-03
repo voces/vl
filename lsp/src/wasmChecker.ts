@@ -22,6 +22,7 @@
 // which `checkSrc` does NOT reset, so every check calls it).
 
 import type { VLDiagnostic } from "../../compiler/diagnostics.ts";
+import { decodeDiagData } from "../../compiler/diagnostics.ts";
 import type { ModuleReader } from "../../compiler/coreTypes.ts";
 // The module-arming gate — the SHARED TS copy (`compiler/moduleGate.ts`), not a
 // local re-spelling. Its header names all four implementations (this one, the
@@ -560,10 +561,15 @@ const pushString = (push: (cp: number) => number, text: string) => {
  * Lossy by design (`strings-design.md` §Validity): a guest string is bytes that are usually
  * UTF-8, and the editor must render a malformed one rather than throw inside a keystroke.
  */
-const readString = (len: number, at: (j: number) => number): string => {
+const readString = (len: number, at: (j: number) => number): string =>
+  new TextDecoder().decode(readBytes(len, at));
+
+/** The same per-byte pull, left as BYTES — what a length-prefixed payload needs
+ *  (`decodeDiagData`), since its lengths are UTF-8 byte counts. */
+const readBytes = (len: number, at: (j: number) => number): Uint8Array => {
   const bytes = new Uint8Array(len);
   for (let j = 0; j < len; j++) bytes[j] = at(j);
-  return new TextDecoder().decode(bytes);
+  return bytes;
 };
 
 /**
@@ -1324,6 +1330,12 @@ export const createWasmChecker = (
     // code is simply absent (editors show the bare message).
     const hasCodes = typeof exp.diagCodeLen === "function" &&
       typeof exp.diagCodeByte === "function";
+    // The code's STRUCTURED PAYLOAD rides the parallel `diagDataLen`/
+    // `diagDataByte` pair. A seed predating it degrades to no data — which is
+    // also what a seed WITH the pair says for every diagnostic that has none, so
+    // there is one absent-payload path and not two.
+    const hasData = typeof exp.diagDataLen === "function" &&
+      typeof exp.diagDataByte === "function";
     for (let i = 0; i < count; i++) {
       const message = readString(exp.diagMsgLen(i), (j) => exp.diagMsgAt(i, j));
       const line = exp.diagLine(i); // 1-based; 0 = positionless
@@ -1334,11 +1346,16 @@ export const createWasmChecker = (
       const code = hasCodes
         ? readString(exp.diagCodeLen(i), (j) => exp.diagCodeByte(i, j))
         : "";
+      const dataLen = hasData ? exp.diagDataLen(i) : 0;
+      const data = dataLen > 0
+        ? decodeDiagData(readBytes(dataLen, (j) => exp.diagDataByte(i, j)))
+        : undefined;
       diags.push({
         message,
         severity: "error",
         source: "vital",
         ...(code.length > 0 ? { code } : {}),
+        ...(data !== undefined ? { data } : {}),
         range: {
           start: { line: lspLine, character: startChar },
           end: { line: lspLine, character: endChar },

@@ -93,10 +93,18 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
     matching. Two capabilities fell out: a CALL receiver (`expect(1).`) completes at all,
     which the field scan's bare-identifier lookup never could; and the import edit spells
     a SPECIFIER (`./shapes`), not the module key the checker reports.
-  - **DONE (compile-goal half).** The diagnostic names the missing import and carries
-    `ufcs-not-imported;member=…;modules=…;recv=…` on the `diagCodeLen`/`diagCodeByte`
-    channel, so the quick-fix keys on the code and its message-shape fallback is retired.
-    `recv=` is last and is read as everything after the first `;recv=`. D1230.
+  - **DONE (compile-goal half).** The diagnostic names the missing import and carries the
+    quick-fix's whole answer in machine form, so the fix keys on it and its message-shape
+    fallback is retired. D1230.
+  - **DONE (the ABI it needed).** The code is the bare category `ufcs-not-imported` and the
+    payload rides a real DATA channel — `diagDataLen`/`diagDataByte` beside the code pair
+    (`TDiag.tdata`), netstring fields read as alternating key/value, a repeated key being a
+    list. It shipped packed into the code first
+    (`ufcs-not-imported;member=…;modules=…;recv=…`), which made every consumer cut a code at
+    the first `;` before comparing it and put the framing inside the values. `diagCategory`
+    survives as a tolerant reader nothing depends on, and `onCodeAction` is synchronous
+    because the compiler now decides the candidate modules at the raise. DECISIONS.md §"A
+    diagnostic code is a bare CATEGORY".
   - **REMAINS.** Workspace modules the file does not already import are not probed — the
     500-file crawl is too expensive per keystroke — so a workspace `f(self: T, …)` is
     offered only from a module already in the graph.
