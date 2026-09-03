@@ -1889,6 +1889,40 @@ export function letNulMapReadUnionBox(letIx: i32, fnIx: i32) {
   false
 }
 
+// The ref-list ELEMENT KIND a `.pop()` over a NESTED list yields, or -1 (D1210). `xs.pop()`
+// over an `i32[][]` is `i32[] | null` to the checker and the popped value is the inner list's
+// WRAPPER, so the three nullable-list classifiers each claim it at their own element kind —
+// 4 in `exprNullableList`, 6/7/8/10 in `exprNulScalarListKind`, 9 in `exprNullableRefArray`
+// — exactly as they already claim an `Index` read of a `(T[] | null)[]`.
+//
+// UNLIKE THOSE INDEX ARMS THIS ASKS NO `rlElemNullable` BIT: a pop is nullable by
+// construction, so the EMPTINESS carries the null and the element slot need not.
+function popRefElemKind(exprIx: i32, fnIx: i32): i32 {
+  const slot = popRefRecvSlot(exprIx, fnIx)
+  if slot >= 0 && slot < rlElemKindTbl.length { return rlElemKindTbl[slot] }
+  -1
+}
+
+// The RECEIVER's ref-list slot of a `.pop()` over a nested list, or -1 — the row every
+// question about the popped element reads: its kind above, and its INNER slot where the
+// element is itself a ref list (`nulRefArrayInnerSlot`'s pop arm).
+function popRefRecvSlot(exprIx: i32, fnIx: i32): i32 {
+  if exprIx < 0 { return -1 }
+  const e = P.nodes[exprIx]
+  if e is Paren { return popRefRecvSlot(e.parInner, fnIx) }
+  if e is Call {
+    const callee = P.nodes[e.callFn]
+    if callee is Member {
+      if callee.memProp == "pop" {
+        if exprRefArray(callee.memObj, fnIx) {
+          return refListSlotOfExpr(callee.memObj, fnIx)
+        }
+      }
+    }
+  }
+  -1
+}
+
 // True if evaluating the expression at `exprIx` yields a NULLABLE i32-list ref —
 // a nullable-list-annotated param/local/global reference or a `rest: i32[]|null`
 // FIELD read (code 18). The nullable-LIST dual of `exprNullableStruct`: list-op
@@ -1953,6 +1987,9 @@ export function exprNullableList(exprIx: i32, fnIx: i32) {
   // un-annotated `const r = f(…)` infers kind 15 (and narrows with `if r != null`). Mirrors the
   // niche-nullable call inference for bool/string returns.
   if e is Call {
+    // `xs.pop()` over an `i32[][]` — the MEMBER callee the Ident/closure legs below cannot
+    // see, and the one rep D1174's value box does not serve (D1210).
+    if popRefElemKind(exprIx, fnIx) == 4 { return true }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
       const target = fnIndexOfSid(sidOfNode(e.callFn))
@@ -2042,6 +2079,8 @@ export function exprNullableRefArray(exprIx: i32, fnIx: i32) {
   // un-annotated `const t = mk(…)` infers kind 18 and narrows with `if t != null`. Mirrors the nullable-i32
   // -list call inference in `exprNullableList` above.
   if e is Call {
+    // `g.pop()` over an `S[][]` — the nested-ref sibling of `exprNullableList`'s pop leg (D1210).
+    if popRefElemKind(exprIx, fnIx) == 9 { return true }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
       if fnRetNulRefArrayNameSid(sidOfNode(e.callFn)) != "" { return true }
@@ -2107,6 +2146,10 @@ function nulRefArrayInnerSlot(exprIx: i32, fnIx: i32) {
   }
   // A nulreflist-returning CALL (`const t = mk()`): its inner ref-list slot is the return's inner element.
   if e is Call {
+    // `g.pop()` over an `S[][]`: the popped element IS the inner ref list, so the row is the
+    // receiver slot's inner one — the same answer the `Index` arm above gives (D1210).
+    const pes = popRefRecvSlot(exprIx, fnIx)
+    if pes >= 0 && pes < rlElemName.length { return rlElemInnerSlot(pes) }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
       const rn = fnRetNulRefArrayNameSid(sidOfNode(e.callFn))
@@ -2238,6 +2281,14 @@ export function exprNulScalarListKind(exprIx: i32, fnIx: i32): VKind | null {
     if gl >= 0 { return letNulScalarListKind(gl, fnIx) }
   }
   if e is Call {
+    // `xs.pop()` over a `string[][]` / `f64[][]` / `i64[][]` / `f32[][]` — the
+    // distinct-backing siblings of `exprNullableList`'s pop leg (D1210).
+    const pek = popRefElemKind(exprIx, fnIx)
+    if pek == 6 { return "nulstrlist" }
+    if pek == 7 { return "nulf64list" }
+    if pek == 8 { return "nuli64list" }
+    if pek == 10 { return "nulf32list" }
+    if pek == 11 { return "nulu8list" }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
       const target = fnIndexOfSid(sidOfNode(e.callFn))
@@ -2268,6 +2319,7 @@ export function exprNulScalarListKind(exprIx: i32, fnIx: i32): VKind | null {
           if k == 7 { return "nulf64list" }
           if k == 8 { return "nuli64list" }
           if k == 10 { return "nulf32list" }
+          if k == 11 { return "nulu8list" }
         }
       }
     }
@@ -15725,6 +15777,10 @@ export function forInElemKind(iterIx: i32, fnIx: i32): VKind | null {
       if rlElemIsNulNiche(rslot) { return "nulf32list" }
       return "f32list" // f32-inner list -> an f32-list local (kind 21)
     }
+    if rlElemKindTbl[rslot] == 11 {
+      if rlElemIsNulNiche(rslot) { return "nulu8list" }
+      return "u8list" // u8-inner list -> a packed-byte-list local
+    }
     // A CLOSURE-element ref list (`((i32) => i32)[]`, element kind 5): the loop var binds as a
     // kind-14 closure local — `for f in fs { … f(x) … }` calls each via `call_ref`. The element
     // read recovers the closure ref non-null (like a struct); the `#l` temp is the ref-list
@@ -20012,6 +20068,12 @@ function refArrShapeKind(name: string): i32 {
   if arrElemIsArrayOf(name, "f32") {
     return 10 // f32 inner list (element is the `$fl32TypeIdx` wrapper)
   }
+  // The PACKED byte leaf — `u8[][]`, whose element is the `$bl8TypeIdx` wrapper over the
+  // i8 backing (D1241). It is the fifth distinct-backing leaf and had no arm at all, so
+  // `nameIsRefArray` answered false and `checkArrName` refused the DECLARATION with
+  // "only i32[] arrays and struct/union element arrays are supported" — at every value,
+  // with no method involved.
+  if arrElemIsArrayOf(name, "u8") { return 11 }
   // A NESTED REF array (`S[][]`, `(C|D)[][]`, `((i32)=>i32)[][]`, `S[][][]`, …): the element is
   // itself a ref array, stored as the inner list's WRAPPER — kind 9. Recurses to any depth via
   // the interned inner slots. The scalar-leaf 2D names above are NOT ref arrays at the inner
@@ -20064,7 +20126,15 @@ function refArrShapeKind(name: string): i32 {
       // removing it would be a behaviour change no channel can pin (sabotage S6).
       if nameIsArray(nn) {
         const ik = refArrElemKind(nn + "[]")
-        if ik == 4 || ik == 6 || ik == 7 || ik == 8 || ik == 9 || ik == 10 {
+        if (
+          ik == 4 ||
+          ik == 6 ||
+          ik == 7 ||
+          ik == 8 ||
+          ik == 9 ||
+          ik == 10 ||
+          ik == 11
+        ) {
           return ik
         }
       }
@@ -20455,6 +20525,8 @@ function ensureRefElemKindTail(elemName: string, k: i32, ty: i32) {
     ia64Used = true
   } else if k == 10 {
     fa32Used = true
+  } else if k == 11 {
+    ba8Used = true
   }
   rlInternNameTy(elemName, k, ty)
 }
@@ -22231,6 +22303,7 @@ export function refArrElemName(name: string) {
   if arrElemIsArrayOf(name, "i64") { return arrElemNameRaw(name) }
   if arrElemIsArrayOf(name, "f64") { return arrElemNameRaw(name) }
   if arrElemIsArrayOf(name, "f32") { return arrElemNameRaw(name) }
+  if arrElemIsArrayOf(name, "u8") { return arrElemNameRaw(name) }
   if nameIsArray(name) && nameIsStringArray(arrElemNameRaw(name)) {
     return arrElemNameRaw(name)
   }
