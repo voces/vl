@@ -33059,9 +33059,10 @@ Repro:
 
 ### D1042 — a union RETURN TYPE minted by GENERIC INSTANTIATION (`T | "err"` / `T | E` at a scalar `T`) has "no recorded members": check-clean, refused at emit on the `is` test or the box; the same union spelled directly runs
 
-**loud emit reject on a `vl check`-clean program — OPEN, clause 2 · found 2026-09-02 (vl-b7)
-ablating the `i32 | "err"` face D1024's row had filed as the literal arm's numeric twin; the
-literal is SCENERY — a struct arm refuses identically**
+**CLOSED 2026-09-02 — the repro now RUNS and prints `5`. Was: loud emit reject on a
+`vl check`-clean program · clause 2 · found 2026-09-02 (vl-b7) ablating the `i32 | "err"` face
+D1024's row had filed as the literal arm's numeric twin; the literal is SCENERY — a struct arm
+refused identically**
 
 Repro:
 
@@ -33137,6 +33138,40 @@ Repro:
   and so never hit it). It should close by registering the clone's union where the direct
   spelling registers its own — not by an emit arm — and grade on every row above plus the
   D965 delivery matrix for the instantiated value.
+
+* **HOW IT CLOSED (2026-09-02) — the registration is AT THE PIN, and it goes THROUGH CANON.**
+  `monoMakeInstance` already substitutes the return annotation per instance
+  (`nret = synthTypeRefTy(rs, -1, retTy)`); the two lines added there render `rs` through
+  `canonEmitName` when it splits to 2+ atoms (`monoPinUnionName`) and register the result
+  (`monoRegisterPinUnion` → `registerInlineUnion(monoProgStmts, …)`). That is ingredients (1)
+  and (2) in one place, which is why no retry at the failing lookup was needed: the clone's
+  key is now the DIRECT spelling's key, so `registerInlineUnion`'s own `isUName` gate reuses
+  the existing row wherever one exists and mints exactly one otherwise. The trap the row
+  above records is avoided for the same reason — one row per union, never one per call site.
+  `assignTags()` re-runs only when the registration pushed a VARIANT (a struct-armed union);
+  a value union pushes none and the global ranking is untouched.
+
+  **AND THE PARAGRAPH ABOVE ABOUT `mkFunc(specName, …, fn.fnRet, …)` DESCRIBES THE OTHER
+  CLONE.** That line is the CALLBACK specialization path (`name$cbN`); the generic path
+  substitutes its return through `monoSubstAnn` + `substTyDeep` and mints a fresh
+  `TypeRef`, which is exactly the per-instance node the row said did not exist. Probed at
+  the pin on seed 8a7820e2: `rn=[T|"err"] rs=[i32|"err"] canon=[i32|string] rowRs=-1
+  rowCanon=-1`.
+
+* **AND THE THIRD REFUSAL WAS NOT IN THIS FAMILY — it was a SECOND defect at the DIRECT
+  spelling, filed as [D1193](#d1193).** With the registry closed, every position that merely
+  *printed* the box ran, and every position that READ the narrowed value (`r * 2`, `b.r`) was
+  check-clean invalid wasm — at the pin, at the direct spelling and at the bare annotated
+  binding alike. `const r: i32 | "err" = 21` + `if r is "err" {} else { print(r * 2) }` is
+  the witness, with no generic anywhere. Both are fixed in this PR, because shipping the
+  registry alone would have moved seven of the nine delivery positions loud → silent.
+
+* **THE GRADE, 46 cells, `git archive origin/master` vs the candidate.** 30 cells moved
+  not-runs → RUNS, 0 runs → not-runs, 0 → silent. The three that do not run are correct
+  refusals: `is string` over `i32 | "err"` and `*` over `i32 | string` are checker rules, and
+  an INFERRED union return carrying a literal arm (`function wrap(n, b) { return orErr(n, b) }`)
+  is a pre-existing checker refusal unchanged by this PR — the one piece of residue, and it is
+  the inferred-return family, not this one.
 
 ### D1043 — a litunion beside an EXTRA literal of its own base is a loud emit reject at the INLINE spelling and RUNS at the declared one: `Kind | "err"` vs `type R = Kind | "err"`
 
@@ -37337,4 +37372,100 @@ Repro (`vl test t.test.vl` — fails; adding `toEqual` to the import list makes 
   every test file pays. Whether importing `expect` should bring its matcher surface with it
   is a language/std decision, not a compiler defect; the diagnostic above should be fixed
   either way.
+
+---
+
+### D1193 — a LITERAL `is` narrows neither branch in the emitter: `i32 | "err"` tested against `"err"` is check-clean invalid wasm the moment either branch READS the value rather than printing it
+
+**CLOSED 2026-09-02 — the repro now RUNS and prints `42`. Was: check-clean invalid wasm ·
+clause 1 · found 2026-09-02 (vl-b7) ablating D1042's delivery matrix — seven of nine positions
+were silent at the DIRECT spelling too, so closing D1042's registry alone would have shipped
+loud → silent**
+
+Repro (now prints `42`; it was `vl check` rc 0 and a module the engine refused with
+`type mismatch: expected i32, found (ref $type)`):
+
+    const r: i32 | "err" = 21
+    if r is "err" { print("failed") } else { print(r * 2) }
+
+* **ABLATED — the LITERAL is the whole ingredient, and no function is needed.** The identical
+  program over `i32 | string` with `is string` RUNS at every position, before and after. So
+  does the same union with a two-literal arm. What fails is a union whose string arm is ONE
+  literal, tested against that literal.
+
+* **ONE MECHANISM, BOTH BRANCHES, AND IT IS THE SAME TWO-PRODUCER SPLIT D1042 NAMED.** The
+  emitter sees the union canon-SOFTENED to `i32|string` (`canonEmitNameAt`'s literal-member
+  arm) while the CHECKER keeps `i32 | "err"` and narrows against it.
+
+  * ELSE: `setNarrowFromCondElse`'s subtraction looks for a member spelled `"err"` in
+    `i32|string`, finds none and pushes nothing — `valueAtomKind("\"err\"")` is -1, so the
+    atom arm never fires either. The binding stays the box and `r * 2` reads a `(ref $uBox)`
+    as an i32.
+  * THEN: `pushNarrowIs` banks a bare `TyLit`, and `narrowedValueAtomOf`'s litunion leg is
+    `tyIsLitUnion` — a `TyUnion` test — so a ONE-literal arm reached neither it nor
+    `valueAtomKind`, and the read stayed the raw box there too.
+
+* **WHY IT LOOKED CLOSED AT `print`.** `print(r)` in the else branch prints `5` correctly
+  from an UN-narrowed box, because print dispatches on the box tag. Every position that
+  merely printed passed; every position that read the narrowed value (`r * 2`, `b.r`, a
+  re-bind `const v: i32 = r`) was silent. A fixture that only prints cannot see this.
+
+* **FIXED** by asking the DECLARED arena type instead of the softened member set
+  (`litElseNarrow`, `emit_classify.vl`): remove the member whose own lexeme IS the tested
+  literal, narrow only when exactly ONE member survives, and render the survivor the way its
+  consumer resolves it (`tyToEmitName` for a value atom, `tyToNominalName` gated on
+  `variantIndexOf` for a struct arm). Plus one line in `narrowedValueAtomOf` for the then
+  branch: a bare string-literal type unboxes as `string`, which is the rep `emitUnionLitIs`
+  already tags it with (`lak = 2`).
+
+  **THE RULE IS THE CHECKER'S, ARM FOR ARM,** which is what makes the subtraction sound
+  rather than a guess. `"a" | "b" | i32` minus `"a"` leaves two members and pushes nothing —
+  the else branch may still hold `"b"`. `i32 | string` matches no member lexeme and pushes
+  nothing — and the checker rejects that program's else-branch arithmetic anyway
+  (`operator '*' is not defined for i32 | string and i32`), which is the control proving the
+  language never narrowed there.
+
+* **GRADED:** 13 cells moved silent → RUNS at the direct, annotated and generic-pinned
+  spellings (binding, function return, parameter, struct field, module global, re-bind, an
+  `f64` survivor and a `Circle` survivor). 0 `runs` lost. Fixture:
+  `tests/cases/literal-unions/literal-arm-narrowed-read.vl`; probe:
+  `scripts/capability-probes/literal-arm-narrowed-read.vl`.
+
+---
+
+### D1194 — an INFERRED return whose union carries a string-LITERAL member is a loud check reject conceding codegen; the plain-`string` twin runs and so does the annotated one
+
+**loud check reject on a type-valid program — OPEN, clause 2 · found 2026-09-02 (vl-b7) as the
+one residue of D1042's delivery matrix: the RETURN position, the only one of nine that does not
+run**
+
+Repro:
+
+    function mk(b: boolean): i32 | "err" {
+      if b { return "err" }
+      return 5
+    }
+    function wrap(b: boolean) {
+      return mk(b)
+    }
+    const r = wrap(false)
+    if r is "err" { print("failed") } else { print(r * 2) }
+
+`'wrap' infers the union return type i32 | "err" — type-valid, but an inferred return of this
+shape is not yet supported by codegen; annotate the return type`. Want `10`.
+
+* **ABLATED — the LITERAL member is the ingredient, not the inference and not the generic.**
+  Same program with `mk(): i32 | string` and `is string`: **RUNS**, prints `10`. Same program
+  with `function wrap(b: boolean): i32 | "err"` annotated: **RUNS**, prints `10`. The generic
+  spelling (`wrap` returning `orErr(n, b)`) gives the identical message, so it is the union's
+  shape and not the pin.
+
+* **NOT the direct literal-return join.** `function wrap(b) { if b { return "err" }; return 5 }`
+  infers `string | i32` — the join SOFTENS a returned literal — so it is a different program
+  and refuses for a different reason (`operator '*' is not defined for string | i32 and i32`,
+  which is the language's own inference rule). The row is about an inferred return that takes
+  its union from a CALLEE's declared type, where the literal survives.
+
+* **The refusal admits it** (`not yet supported by codegen`), so it is one of the literals
+  `goal-scoreboard.py --sites` counts, and it is reached by no corpus cell.
 

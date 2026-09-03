@@ -1,0 +1,158 @@
+// @run
+// @log 42
+// @log err
+// @log 42
+// @log err
+// @log 1.5
+// @log err
+// @log 3
+// @log 42
+// @log failed
+// @log 42
+// @log 42
+// @log 42
+// @log 42
+// @hint redundant type annotation: `c` is inferred as `{r: f64}`
+// @hint redundant type annotation: `v` is inferred as `i32`
+// THE HINTS ARE DECLARED, NOT SILENCED: `c` pins the nominal `Circle` the struct-survivor
+// narrowing has to name, and `v` IS the re-bind position — deleting either to quiet the hint
+// would delete what the line is here to exercise. A `redundant type annotation` hint is the
+// checker agreeing about the TYPE and says nothing about whether the two spellings agree
+// about the REP, which is the whole subject of this file.
+// A LITERAL `is` NARROWS BOTH BRANCHES — D1193.
+//
+// `if r is "err"` over `i32 | "err"` is `vl check` rc 0 in both directions: the checker keeps
+// the literal, so the THEN branch is the string `"err"` and the ELSE branch is `i32`, and it
+// types `r * 2` against the second. The emitter agreed about neither, and the module did not
+// load — `type mismatch: expected i32, found (ref $type)`, the raw union box standing where
+// the unboxed arm belonged.
+//
+// ONE MECHANISM, TWO BRANCHES, AND IT IS A DISAGREEMENT BETWEEN TWO PRODUCERS OF ONE UNION.
+// The emitter sees the union canon-SOFTENED to `i32|string` (`canonEmitNameAt`'s literal-member
+// arm), so the complement push looks for a member spelled `"err"` in `i32|string`, finds none,
+// and subtracts nothing; the `is` push banks a bare `TyLit`, and `tyIsLitUnion` is a `TyUnion`
+// test, so the then-branch read reached no unboxing arm either. The DECLARED arena type still
+// carries the literal, which is where the complement is asked now: remove the member whose own
+// lexeme is the tested literal, and narrow only when exactly one survives.
+//
+// THE RULE IS THE CHECKER'S, ARM FOR ARM. `"a" | "b" | i32` minus `"a"` leaves two members, so
+// nothing is pushed — the else branch may still hold `"b"`. `i32 | string` has no member the
+// lexeme matches, so nothing is pushed — and the checker rejects that program's else-branch
+// arithmetic anyway (`operator '*' is not defined for i32 | string and i32`), which is the
+// control that proves the language never narrowed there.
+//
+// THE PLAIN-`string` TWIN IS THE OTHER CONTROL and it always ran: `i32 | string` with
+// `is string` narrows through the atom path at every position. The LITERAL is the whole
+// ingredient, and the positions below are the ones D1042's matrix found silent at the direct
+// spelling — a read that merely `print`s the box cannot see this, because `print` dispatches on
+// the box tag and prints the right thing from an un-narrowed value.
+
+type Circle = { r: f64 }
+
+// THE ANNOTATED BINDING — no function anywhere, the two-line witness.
+const r0: i32 | "err" = 21
+if r0 is "err" {
+  print("failed") // 42
+} else {
+  print(r0 * 2)
+}
+
+// THE THEN BRANCH reads the literal arm as the string ref the box holds.
+const r1: i32 | "err" = "err"
+if r1 is "err" {
+  print(r1) // err
+} else {
+  print(r1 * 2)
+}
+
+// THROUGH A FUNCTION RETURN, un-annotated destination — the rep is pinned by inference.
+function mk(bad: boolean): i32 | "err" {
+  if bad { return "err" }
+  return 21
+}
+const m0 = mk(false)
+if m0 is "err" {
+  print("failed") // 42
+} else {
+  print(m0 * 2)
+}
+const m1 = mk(true)
+if m1 is "err" {
+  print(m1) // err
+} else {
+  print(m1 * 2)
+}
+
+// A STRUCT SURVIVOR — the else branch narrows to the declared variant and its FIELD reads
+// through the same downcast the positive arm uses.
+function mkC(c: Circle, bad: boolean): Circle | "err" {
+  if bad { return "err" }
+  return c
+}
+const c: Circle = { r: 1.5 }
+const c0 = mkC(c, false)
+if c0 is "err" {
+  print("failed") // 1.5
+} else {
+  print(c0.r)
+}
+const c1 = mkC(c, true)
+if c1 is "err" {
+  print(c1) // err
+} else {
+  print(c1.r)
+}
+
+// AN f64 SURVIVOR — the atom is read off the arena, not off the `i32` default.
+function mkF(bad: boolean): f64 | "err" {
+  if bad { return "err" }
+  return 1.5
+}
+const f0 = mkF(false)
+if f0 is "err" {
+  print("failed") // 3
+} else {
+  print(f0 * 2.0)
+}
+
+// ── THE POSITIONS ────────────────────────────────────────────────────────────
+// a parameter
+function takes(u: i32 | "err") {
+  if u is "err" { print("failed") } else { print(u * 2) }
+}
+takes(mk(false)) // 42
+takes(mk(true))  // failed
+
+// a re-bound local inside the narrowed branch
+const b0 = mk(false)
+if b0 is "err" {
+  print("failed")
+} else {
+  const v: i32 = b0
+  print(v * 2) // 42
+}
+
+// a struct FIELD's union, read through the path key
+type Box = { v: i32 | "err" }
+const bx: Box = { v: 21 }
+const bv = bx.v
+if bv is "err" {
+  print("failed") // 42
+} else {
+  print(bv * 2)
+}
+
+// a module GLOBAL, read from inside a function
+const g: i32 | "err" = 21
+function show() {
+  if g is "err" { print("failed") } else { print(g * 2) }
+}
+show() // 42
+
+// CONTROL — the plain-`string` arm, which always ran and must keep running unchanged.
+const s0: i32 | string = 21
+if s0 is string {
+  print("failed") // 42
+} else {
+  print(s0 * 2)
+}
