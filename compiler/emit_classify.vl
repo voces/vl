@@ -1923,6 +1923,13 @@ export function exprNullableList(exprIx: i32, fnIx: i32) {
     const mvSh = mapShapeOfExpr(e.idxArr, fnIx)
     if mvSh >= 0 && mvSh < mvValName.length {
       if nameIsI32Array(mvValName[mvSh]) { return true }
+      // D1107 — THE VALUE'S OWN `| null`, WHICH THE NAME TEST CANNOT SEE. `mvValName` banks
+      // the DECLARED spelling, so a `{[string]: i32[] | null}` reads `"i32[] | null"` and
+      // `nameIsI32Array` declines it — while `globalCellKind` classified the same binding
+      // `nullist` off `letNulMapReadValKind`, which reads the ELEMENT KIND. The cell and the
+      // read then disagreed and the compare's bare `null` had no rep. Asked of the element
+      // kind here too, so the two answers come from one home.
+      if mvNulListValKind(mvSh) == "nullist" { return true }
     }
   }
   // A call to a function whose ANNOTATED return is `i32[] | null` yields a nullable list, so an
@@ -1973,6 +1980,9 @@ export function exprNullableRefArray(exprIx: i32, fnIx: i32) {
     const mvSh = mapShapeOfExpr(e.idxArr, fnIx)
     if mvSh >= 0 && mvSh < mvValName.length {
       if nameIsRefArray(mvValName[mvSh]) { return true }
+      // D1107 — the ref twin of the `nullist` rung: a `{[string]: S[] | null}` value name
+      // carries the `| null` the name test cannot read past.
+      if mvNulListValKind(mvSh) == "nulreflist" { return true }
     }
   }
   if e is Ident {
@@ -2186,6 +2196,12 @@ export function exprNulScalarListKind(exprIx: i32, fnIx: i32): VKind | null {
       // `| null` twin.
       const slk = nulScalarListKind(mvValName[mvSh] + "|null")
       if slk != null { return slk }
+      // D1107 — the element-kind rung, for a value spelling that ALREADY carries `| null`
+      // (`{[string]: string[] | null}`): the `+ "|null"` above then builds a doubled
+      // suffix and `nullablePartOf` answers for neither leaf. Same one home as the
+      // `nullist` / `nulreflist` siblings.
+      const mvSlk = mvNulListValKind(mvSh)
+      if isNulScalarListKind(mvSlk) { return mvSlk }
     }
   }
   if e is Ident {
@@ -19769,6 +19785,15 @@ export function globalCellKind(letIx: i32): VKind {
     // arm to fall into. The matching SLOT is in `letAnnRefListSlot`.
     const gMapRead = letNulMapReadValKind(letIx, -1)
     if gMapRead != null { return gMapRead }
+    // D1106 — THE KIND-18 CELL THE UN-ANNOTATED ARM NEVER GREW, the third of the pair the
+    // `nulclosure`/`nullist` note above names. `const r = mk()` with `mk(): S[] | null` fell
+    // through to `globalKind`'s i32 guess, so `exprNullableRefArray`'s global rung (which
+    // asks THIS function) answered false and the `r != null` compare's bare `null` had no
+    // rep: `emitProgram: bare null needs a struct-typed context` on a check-clean program.
+    // BEFORE `nullist`, exactly as the annotated ladder orders the two — `nameIsRefArray`
+    // excludes the i32 backing, so the two arms are disjoint and only the order documents it.
+    // The matching inner-wrapper SLOT is `letAnnRefListSlot`'s un-annotated leg.
+    if letIsNulRefArray(letIx, -1) { return "nulreflist" }
     if letIsNulListInfer(letIx, -1) { return "nullist" }
     // A DISTINCT-backing nullable scalar list (`string[]|null`, `f64[]|null`, `i64[]|null`,
     // `f32[]|null`) bound to a CALL (`const r = mk()`): its own `(ref null $wrapper)` cell,
@@ -28862,6 +28887,32 @@ export function vkNulNicheOf(k: VKind): VKind | null {
   null
 }
 
+// D1222 — THE STRUCT-FIELD DESTINATION'S REP KIND, from its field CODE.
+//
+// A field names its destination by CODE (`sFieldTypes`) while every other delivery names it
+// by KIND (`localIsRef[slot]`, `globalCellKind`, `retResultVKind`), so the field layer could
+// not ask `nulNicheRecoverOwed` at all and the two field deliveries stayed unwired while
+// D1115 wired the other four. This is the code→kind edge, in one place: the answer feeds the
+// SAME `vkNulNicheOf` table, so a rep added there reaches the field positions too.
+//
+// Only the NON-NULL ref codes answer. A scalar code (0/17/23/24), a nullable code (18/20/21/
+// 22/28/29/30/31–34), the union box (16) and an unrepresentable field (-1) are `null` — the
+// destination is not a `(ref $H)`, so nothing is owed.
+export function fieldCodeVKind(code: i32): VKind | null {
+  if code == 3 { return "str" }
+  if code == 4 { return "list" }
+  if code == 5 { return "reflist" }
+  if code == 6 { return "strlist" }
+  if code == 14 { return "closure" }
+  if code == 15 { return "struct" }
+  if code == 19 { return "map" }
+  if code == 25 { return "f64list" }
+  if code == 26 { return "i64list" }
+  if code == 27 { return "f32list" }
+  if code == 35 { return "u8list" }
+  null
+}
+
 // The rep KIND of the cell an identifier reads, across the four storage classes an
 // emitter-visible name lives in: parameter annotation, declared local, captured env field,
 // module global. The kind-level generalization of `exprNullableStruct`'s four-arm ladder,
@@ -35153,6 +35204,16 @@ export function letAnnRefListSlot(letIx: i32) {
     if d.letType < 0 {
       if letNulMapReadValKind(letIx, -1) != null {
         return letNulMapReadSlotArg(letIx, -1)
+      }
+      // D1106 — the same "0 is a WRONG answer, not a missing one" hazard for the OTHER
+      // un-annotated kind-18 source: a call / field read / `??` merge yielding
+      // `S[] | null`. Resolved through the binding's own initializer, the very resolver a
+      // same-typed LOCAL's slot comes from (`nulRefArrayInnerSlotOfLet`), so the global
+      // cell and the local agree on the wrapper heap type. Its -1 for a shape it cannot
+      // name reaches `fbValtypeNullable`'s bounds guard — a loud reject, which is what a
+      // slot this function cannot resolve is supposed to be.
+      if letIsNulRefArray(letIx, -1) {
+        return nulRefArrayInnerSlotOfLet(letIx, -1)
       }
     }
     return tyAnnRefListSlot(d.letType)
