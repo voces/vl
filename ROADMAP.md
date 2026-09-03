@@ -608,10 +608,17 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
 > own standing check (`docs/internals/destringify-types-program.md` § "How to verify"): both greps
 > pass. Do not re-open it from a stale call-site census; run that check first.
 >
-> **The one forward question it leaves, stated and unstarted:** the emitter's registries are keyed on
-> the canon-SOFTENED spelling because that is the REP, not the type. Re-keying them on the precise
-> type would change what the rep layer decides on — a DESIGN change to what the arena records, not a
-> call-site conversion. Unpriced.
+> **The one forward question it leaves — now PRICED, still unstarted** (Modernization program item
+> 4; `docs/internals/registry-by-type-id.md`, 2026-09-02): the emitter's registries are keyed on the
+> canon-SOFTENED spelling because that is the REP, not the type. Measured over 2,389 registered
+> union rows, **neither candidate key in the tree works**: the arena index is not an identity, and
+> `repCanonId` merges **360 row pairs** the positional box-tag ABI needs apart (63 with different
+> member sets) while SPLITTING a nested union from its flattening — which is #2406-d2 exactly. The
+> answer is a new interned rep key minted by canon once, that every producer obtains rather than
+> renders; the shim shows the cheap version closes 1 of 5 filed witness rows, because a MISSING
+> REGISTRATION (D1042 row 1, D1112) is not a key question and a PRODUCER DISAGREEMENT is.
+> **65% of the 81 name-keyed sites are NAME-ONLY** — the name was cut from another name — and
+> `registerInlineUnion` recurses on such a cut at 11 of its 18 sites, which is B277 one layer up.
 >
 > **Before scheduling any remaining boundary-parse cleanup**, ask B277's second question (does the
 > split relocate the work, or remove it?). `registerInlineUnion` is 8,696 reaches and was REFUSED on
