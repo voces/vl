@@ -7865,10 +7865,12 @@ export function nulFieldInnerCode(code: i32): i32 {
   if code == 34 {
     return 27 // `f32[] | null`
   }
-  // `S[] | null` (28) and `fn | null` (22) are DELIBERATELY ABSENT: both were MEASURED under
-  // the guard and both grade check-clean invalid wasm — 28 because its twin's arm re-reads the
-  // wrapper off the field path, 22 because the closure-eq frame is reserved per NON-NULL code
-  // and its stash pair is typed non-null. They stay loud refusals; rows D1291 and D1292.
+  if code == 28 {
+    return 5 // `S[] | null`
+  }
+  if code == 22 {
+    return 14 // `fn | null`
+  }
   -1
 }
 
@@ -8176,7 +8178,12 @@ function shapeHasCloField(row: i32, seen: i32[]) {
   seen.push(row)
   let fi = 0
   while fi < eqRowFieldCount(row) {
-    const code = eqRowFieldTypeAt(row, fi)
+    let code = eqRowFieldTypeAt(row, fi)
+    // A `fn | null` FIELD runs the identity core under a null guard, so it needs the same
+    // 2-slot frame its non-null twin does — resolved through the ONE home the guard opens
+    // from, else the core is a `local.set` into a slot the function never declared (D1292).
+    const cn = nulFieldInnerCode(code)
+    if cn >= 0 { code = cn }
     if code == 14 { return true }
     if code == 15 {
       const nsi = eqRowTgtStructIdx(row, fi)
@@ -18997,6 +19004,41 @@ function fieldCodeOfSpelling(t: string, litNode: i32) {
   // ONE spelling ladder all three refusal sites reach, so the declared, the inline-shape and
   // the generic-instance spellings of one field cannot answer differently.
   if armFieldStructRow(base) >= 0 { return 15 }
+  // D1293 — THE ARENA, once every NAME arm has declined. `nameIsNulRefList` resolves its
+  // element through the struct/union TABLES and `collectU` runs before `collectS` builds
+  // them, so an `S[] | null` VARIANT-ARM field coded -1 while the identical field on a plain
+  // struct coded 28. The non-null spelling never had it: its array arm ends in a table-free
+  // `return 5`. Last, so no spelling a name arm already answers can move.
+  nulRefListFieldCodeOfNode(litNode)
+}
+
+// The `S[] | null` FIELD code (28) the ARENA decides, or -1. Ref-ELEMENT lists only: that is
+// the one nullable-list code whose name test needs a table, and every other element kind is
+// already decided by a spelling that carries its own answer (D1293).
+function nulRefListFieldCodeOfNode(litNode: i32): i32 {
+  if litNode < 0 { return -1 }
+  let ty = nodeTyIxOf(litNode)
+  if canonRewroteNode(litNode) { ty = canonTyIxOf(litNode) }
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyNullable {
+    const inner = t.nInner
+    if inner < 0 { return -1 }
+    // A LITERAL-union element list is the i32 ATOM backing (code 18), never a ref list —
+    // the same subtraction `fieldCodeOfTy`'s array arm makes.
+    if tyIsLitUnionArray(inner) { return -1 }
+    const it = T.tys[inner]
+    if it is TyArray {
+      const e = it.aElem
+      if e < 0 { return -1 }
+      const et = T.tys[e]
+      if et is TyObj { return 28 }
+      if et is TyUnion { return 28 }
+      if et is TyFunc { return 28 }
+      if et is TyArray { return 28 }
+      if et is TyMap { return 28 }
+    }
+  }
   -1
 }
 
@@ -19154,11 +19196,12 @@ export function fieldRefElemName(tyIx: i32) {
       return base
     }
     // A NULLABLE REF-LIST field (code 28, `S[] | null`): its element is the ref-array element of the
-    // non-null part (`refArrElemName(nullablePartOf(name))` — `S[]|null` -> `S`, `(i32|null)[]|null` ->
-    // `i32|null`), so `sFieldRefSlot` (`rlSlotByName`) finds the element's interned slot. No DEFERRED
-    // `[]`-slice fallback here (the shape-text recorder's): this path runs after the struct/union
-    // tables exist, so an element the canonicalizer cannot name is a genuine "".
-    if code == 28 { return refArrElemName(nullablePartOf(ty.tyName)) }
+    // non-null part (`S[]|null` -> `S`, `(i32|null)[]|null` -> `i32|null`), so `sFieldRefSlot`
+    // (`rlSlotByName`) finds the element's interned slot. DEFERRED, exactly as the shape-text
+    // recorder's arm is: `collectVariantFields` reaches this from `collectU`, which runs BEFORE
+    // `collectS` builds the struct table, so `refArrElemName` answers "" for every `S[]` there
+    // and the slot the type section then reads is un-interned (D1293).
+    if code == 28 { return refArrElemKeyDeferred(nullablePartOf(ty.tyName)) }
     // The ATOM codes the shape-text recorder keys and the NODE recorder does not: a
     // code-0 literal-union field and a code-30 `K | null` niche field carry their union
     // name from the annotation interner, not from here.
