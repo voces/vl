@@ -4904,7 +4904,7 @@ tree — and it contradicts the Elixir model this language follows for `if` (`if
 is `nil` when the condition fails). `T | null` is what the binding position already means;
 the ruling makes the other positions agree with it.
 
-**BUILT (D1086, [inventory](docs/internals/silent-class-inventory.md#d1086)).** The checker
+**BUILT (D1086, [inventory](docs/internals/inventory/D1086.md)).** The checker
 rule is ONE line, not a position table: `checkIfStmtNode` returns `thenTy | null` whenever
 the then arm carries a value, and the statement half needs no gate because a statement arm's
 `thenTy` is already `void`. The emitter's synthesized else arm is the rep's own null at the
@@ -4913,7 +4913,7 @@ for arm over `VKind`, so a cell's declaration and its null cannot name different
 The 2×12 scope × rep grid grades **48 of 48** running at both the annotated and the
 un-annotated spelling (it was 14 of 48 when the build started, not the filed 6 of 24 — the
 row's table had gone stale under an unrelated merge), and the position matrix grades 20 of
-21. The residue is [D1250](docs/internals/silent-class-inventory.md#d1250): `??` over an
+21. The residue is [D1250](docs/internals/inventory/D1250.md): `??` over an
 if-expression written IN PLACE, which refuses at the explicit-`else` spelling too and is a
 `??` defect this ruling only made reachable.
 
