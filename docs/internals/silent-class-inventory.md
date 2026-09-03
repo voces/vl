@@ -38103,3 +38103,77 @@ Repro (check rc 0, then the engine refuses the module):
 * **A VARIABLE ARGUMENT RUNS.** `const m: {[string]: string} = Map()` … `take(m)` compiles and
   runs — the binding boundary seeded the shape and the argument just passes the ref along. The
   ingredient is the LITERAL at the argument position, not the map type.
+
+---
+### D1260 — a UFCS method whose free function is exported but NOT imported blamed the receiver; the refusal now names the missing import, under `ufcs-not-imported`
+
+**now a loud check reject, and that is the whole intent — the program is illegal and stays
+illegal · a DIAGNOSTIC-QUALITY row, neither clause 1 nor clause 2 · CLOSED 2026-09-02 ·
+filed as [D1230](../../DECISIONS.md) against the owner's ruling
+§"UFCS is never implicit"**
+
+Repro (check rc 1 — the sentence is the subject of the row, not the exit code):
+
+    import { describe, it, expect } from "std:test"
+    expect(1 + 1).toEqual(2)
+
+Before: `no field 'toEqual' on Expectation<i32>`. Now:
+
+    'toEqual' is not imported — a free `toEqual(self: …)` accepting Expectation<i32> is
+    exported by "std:test"; a UFCS call resolves only names in scope, so import `toEqual`
+    from there
+
+* **THE OLD SENTENCE WAS TRUE, PERMANENT, AND USELESS.** `Expectation<i32>` has no field
+  `toEqual` and never will — UFCS is EXPLICIT by ruling and the compiler will not look into
+  the module that defines the receiver's type (DECISIONS.md §"UFCS is never implicit"; the
+  type-directed fallback was declined as *"potentially buggy; for now we don't need it"*).
+  So there is nothing to FIX in the resolution. What the compiler knew and did not say is
+  that `toEqual` is a free `self`-function exported by a module this very file already
+  names, one word away from working.
+
+* **THE PAYLOAD RIDES THE CODE, NOT THE SENTENCE**, so a quick-fix never parses English:
+
+      ufcs-not-imported;member=toEqual;modules=std:test;recv=Expectation<i32>
+
+  `;`-separated, fixed order, `,` between module specifiers, `recv=` LAST because a rendered
+  type is the one field that can itself contain any of those characters (`A | B`,
+  `{a: i32, b: i32}`) — read it as everything after the first `;recv=`. It rides the existing
+  `diagCodeLen`/`diagCodeByte` ABI (`TDiag.tcode`), the same channel `unsupported-lowering`
+  uses, and is pinned in `tests/selfhost_native_diag_code_test.ts`. ONE diagnostic lists every
+  candidate module: the fix is a choice among them, and N diagnostics would stack N squiggles
+  on one token.
+
+* **THE LOOKUP IS THE ONE UFCS ALREADY DOES, ASKED AGAIN ON THE FAILURE PATH.**
+  `typecheck.ufcsWouldDispatch` mirrors `ufcsCallTy`'s GATE arm for arm — the lookup, the
+  `self`-name rule, the arity RANGE, `assignable(recvTy, params[0])` — and deliberately
+  nothing after it. `ufcsCallTy` forces a pending return, records a deferred constraint,
+  reorders named arguments and reports argument mismatches; running any of that speculatively,
+  over every same-named candidate in the graph, would raise diagnostics for functions the
+  program never calls.
+
+* **THE SCOPE IS THE MODULE GRAPH, AND TWO CASES OUTSIDE THE BASE ONE WERE DECIDED, NOT
+  DRIFTED INTO.** A module the file does NOT import is covered when — and only when — its key
+  is a `std:` specifier, because a `std:` specifier is absolute and therefore the same text
+  from every file (`tests/cases/modules/ufcs-not-imported-transitive-std/`). A RELATIVE module
+  the file does not import gets nothing: its key is a normalized path, and turning that back
+  into a specifier relative to the entry is `..`-arithmetic that can name a different module —
+  a withheld suggestion costs a reader the old sentence, a wrong one costs them an import that
+  resolves somewhere else. A self-function in the SAME FILE that is out of scope also gets
+  nothing (`tests/cases/objects/ufcs-nested-self-fn-out-of-scope.vl`): there is no import that
+  would make it resolve, so the code's own name would be a false promise. Un-EXPORTED is the
+  third exclusion, for the same reason.
+
+* **THE CONTROLS RUN IN THE SAME GRAPH AS THE SUGGESTION**, which is what makes them controls
+  and not vacuous passes. `tests/cases/modules/ufcs-not-imported/entry.vl` holds all three
+  cases in one file: `area` (exported, not imported) gets the new sentence at two delivery
+  positions, `nosuch` (no self-function anywhere) and `hidden` (a self-function in the same
+  imported module, un-exported) both keep `no field '…' on Box`.
+
+* **FOUND WHILE BUILDING IT, NOT FIXED HERE: a name-keyed UFCS alias leaks across modules.**
+  If ANY module contains a member call `x.hidden()` resolving to its own un-exported
+  `hidden(self: Box)`, the merge banks a name-keyed `hidden → hidden$mN` row; the ENTRY's own
+  `b.hidden()` has no per-site alias, falls back to that name-keyed map (`ufcsAliasOf`), and
+  COMPILES — calling a function the entry never imported and cannot name. D1120 built the
+  per-site table for the two-module ambiguity but left the fallback answering for callers that
+  should get nothing. The fixture's `lib.vl` calls `hidden` DIRECTLY for exactly this reason,
+  and says so in a comment, so this row's control cannot silently start measuring that instead.

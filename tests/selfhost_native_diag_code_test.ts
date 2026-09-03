@@ -231,3 +231,180 @@ Deno.test({
     );
   }
 });
+
+// ── D1230/D1260: the `ufcs-not-imported` PAYLOAD ─────────────────────────────
+// The other kind of code on this channel. `unsupported-lowering` is a CATEGORY —
+// one word, and everything a consumer needs is in it. `ufcs-not-imported` also
+// has to carry an ANSWER: which name, from which module(s), on what receiver, so
+// an editor's quick-fix can write the import without parsing English.
+//
+// THE FORMAT IS THE CONTRACT, and this test is where it is pinned:
+//
+//     ufcs-not-imported;member=<name>;modules=<spec>[,<spec>…];recv=<type>
+//
+// `;`-separated, fixed order, `,` between module specifiers, and `recv=` LAST
+// because a rendered type is the one field that can itself contain any of those
+// characters (`A | B`, `{a: i32, b: i32}`) — read it as everything after the
+// first `;recv=`.
+//
+// Driving it needs a MODULE GRAPH, which `check` above cannot build: the whole
+// point of the diagnostic is a name exported by another module. `checkGraph`
+// serves the fetch loop from an in-memory map, so the fixture is self-contained
+// and does not depend on anything under `std/`.
+
+/** Check `entrySrc` on a fresh store with `mods` (key -> source) served to the
+ *  module fetch loop; return each diagnostic's `{ message, code }`. */
+const checkGraph = (
+  exp: Exports,
+  entryKey: string,
+  entrySrc: string,
+  mods: Record<string, string>,
+): { rc: number; diags: { message: string; code: string }[] } => {
+  const push = (text: string, sink: (cp: number) => number) => {
+    for (const ch of text) sink(ch.codePointAt(0)!);
+  };
+  exp.modReset();
+  const commit = (key: string, source: string | undefined) => {
+    push(key, exp.modKeyPush);
+    if (source !== undefined) push(source, exp.modSrcPush);
+    exp.modCommit(source !== undefined ? 1 : 0);
+  };
+  commit(entryKey, entrySrc);
+  for (;;) {
+    const n = exp.modPendingCount();
+    if (n === 0) break;
+    const keys: string[] = [];
+    for (let i = 0; i < n; i++) {
+      keys.push(readString(exp.modPendingLen(i), (j) => exp.modPendingAt(i, j)));
+    }
+    for (const key of keys) commit(key, mods[key]);
+  }
+  exp.srcReset();
+  push(entrySrc, exp.srcPush);
+  const rc = exp.checkSrc();
+  const diags: { message: string; code: string }[] = [];
+  if (rc !== 0) {
+    const n = exp.diagCount();
+    for (let i = 0; i < n; i++) {
+      diags.push({
+        message: readString(exp.diagMsgLen(i), (j) => exp.diagMsgAt(i, j)),
+        code: readString(exp.diagCodeLen(i), (j) => exp.diagCodeByte(i, j)),
+      });
+    }
+  }
+  return { rc, diags };
+};
+
+const LIB_SRC = [
+  "export type Box = { v: i32 }",
+  "export function box(v: i32): Box { return { v: v } }",
+  "export function area(self: Box): i32 { return self.v * self.v }",
+  "",
+].join("\n");
+
+Deno.test({
+  name: "diag-code: an un-imported UFCS method carries `ufcs-not-imported` + payload",
+  ignore,
+}, () => {
+  const exp = instantiate();
+  const { rc, diags } = checkGraph(
+    exp,
+    "/w/entry.vl",
+    'import { box } from "./lib"\nprint(box(5).area())\n',
+    { "/w/lib.vl": LIB_SRC },
+  );
+  if (rc !== 2) throw new Error(`expected rc 2 (type stage), got ${rc}`);
+  if (diags.length !== 1) {
+    throw new Error(`expected 1 diagnostic, got: ${JSON.stringify(diags)}`);
+  }
+  const want = "ufcs-not-imported;member=area;modules=./lib;recv=Box";
+  if (diags[0].code !== want) {
+    throw new Error(
+      `expected code ${JSON.stringify(want)}, got: ${JSON.stringify(diags[0])}`,
+    );
+  }
+  // The MODULE SPECIFIER is the file's own import text, not the resolved key.
+  // `/w/lib.vl` would be a path the author never typed and an import they cannot
+  // write; `./lib` is the string already in the file.
+  if (diags[0].code.includes("/w/lib.vl")) {
+    throw new Error(
+      `the payload must carry the SPECIFIER, not the resolved key: ${
+        JSON.stringify(diags[0])
+      }`,
+    );
+  }
+});
+
+Deno.test({
+  name: "diag-code: TWO candidate modules ride ONE diagnostic, `,`-joined",
+  ignore,
+}, () => {
+  const exp = instantiate();
+  // Both modules export an `area(self: Box)`; the entry imports neither name.
+  // A quick-fix offers one code action per listed module, so the candidates are
+  // a FIELD of one diagnostic — two diagnostics would stack two squiggles on the
+  // single `area` token.
+  const { rc, diags } = checkGraph(
+    exp,
+    "/w/entry.vl",
+    [
+      'import { box } from "./lib"',
+      'import { other } from "./more"',
+      "print(box(5).area())",
+      "print(other())",
+      "",
+    ].join("\n"),
+    {
+      "/w/lib.vl": LIB_SRC,
+      "/w/more.vl": [
+        'import { Box } from "./lib"',
+        "export function area(self: Box): i32 { return self.v + self.v }",
+        "export function other(): i32 { return 1 }",
+        "",
+      ].join("\n"),
+    },
+  );
+  if (rc !== 2) throw new Error(`expected rc 2 (type stage), got ${rc}`);
+  if (diags.length !== 1) {
+    throw new Error(
+      `expected exactly 1 diagnostic for 2 candidates, got: ${
+        JSON.stringify(diags)
+      }`,
+    );
+  }
+  const want = "ufcs-not-imported;member=area;modules=./lib,./more;recv=Box";
+  if (diags[0].code !== want) {
+    throw new Error(
+      `expected code ${JSON.stringify(want)}, got: ${JSON.stringify(diags[0])}`,
+    );
+  }
+});
+
+Deno.test({
+  name: "diag-code: a member with no self-function anywhere keeps the plain sentence",
+  ignore,
+}, () => {
+  const exp = instantiate();
+  // THE CONTROL, and it runs in the SAME graph shape as the two above — the
+  // registry is populated, and `nosuch` is simply not in it. A code here would
+  // mean the enrichment fired on every unresolved member, which is the one way
+  // this feature can be wrong without any fixture noticing.
+  const { rc, diags } = checkGraph(
+    exp,
+    "/w/entry.vl",
+    'import { box } from "./lib"\nprint(box(5).nosuch())\n',
+    { "/w/lib.vl": LIB_SRC },
+  );
+  if (rc !== 2) throw new Error(`expected rc 2 (type stage), got ${rc}`);
+  if (diags.length !== 1) {
+    throw new Error(`expected 1 diagnostic, got: ${JSON.stringify(diags)}`);
+  }
+  if (diags[0].code !== "") {
+    throw new Error(`expected an empty code, got: ${JSON.stringify(diags[0])}`);
+  }
+  if (!diags[0].message.includes("no field 'nosuch' on Box")) {
+    throw new Error(
+      `expected the plain member sentence, got: ${JSON.stringify(diags[0])}`,
+    );
+  }
+});

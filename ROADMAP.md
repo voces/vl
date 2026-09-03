@@ -69,10 +69,13 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   scope × rep grid, both faces. DECISIONS.md §"An else-less `if` used as a VALUE". Compile-goal
   track.
 - **UFCS is never implicit; the LSP surfaces the import — RULED (owner, 2026-09-02).**
-  `expect(x).toEqual(y)` keeps needing `toEqual` imported. Tooling: completion after `.`
-  offers a module's exported `f(self: T, …)` with an auto-import edit; a quick-fix on the
-  D1230 diagnostic adds the name to the import; the diagnostic itself names the missing
-  import (compile-goal, D1230). DECISIONS.md §"UFCS is never implicit". Tooling track.
+  `expect(x).toEqual(y)` keeps needing `toEqual` imported. **The COMPILER half is DONE
+  (D1260):** the refusal names the missing import and carries
+  `ufcs-not-imported;member=…;modules=…;recv=…` on the `diagCodeLen`/`diagCodeByte` channel,
+  so a quick-fix keys on the code instead of parsing the sentence. Still to build, tooling
+  track: completion after `.` offering a module's exported `f(self: T, …)` with an
+  auto-import edit, and the code action on that diagnostic. DECISIONS.md §"UFCS is never
+  implicit".
 - **Driver lossless-recovery flag — STAGE 1 DONE #2210** (ruled 2026-09-01, shipped the
   same day). A file whose EVERY parse diagnostic is a lossless recovery's is typechecked
   and linted anyway, so "missing brace" and "type error four lines down" are reported
