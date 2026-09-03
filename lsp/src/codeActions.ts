@@ -274,6 +274,14 @@ export type FixableDiagnostic = {
   source?: string;
   range: LspRange;
   /**
+   * The code's structured payload (`compiler/diagnostics.ts`
+   * {@link VLDiagnosticData} — every value a list of strings), when the
+   * diagnostic carries one. TYPED `unknown` ON PURPOSE: an editor-supplied
+   * diagnostic has been through the client's JSON and back, so this is a real
+   * untrusted boundary and the reader validates rather than asserts.
+   */
+  data?: unknown;
+  /**
    * The diagnostic's text. Read ONLY by {@link ufcsMissingImportAt}, and only
    * while the missing-UFCS-import diagnostic has no code of its own — every other
    * fix here dispatches on `code`, which is the design and stays it.
@@ -287,22 +295,21 @@ export type FixableDiagnostic = {
 // call against names IN SCOPE and never by looking into the receiver's module
 // (DECISIONS.md, owner 2026-09-02). Today the compiler reports `no field 'toEqual'
 // on Expectation<i32>` — true, and useless to someone who has not met the rule.
-// The fix that helps is the import, and the checker knows which modules could
-// supply it (`wasmChecker.ufcsCandidatesAt`); this is the diagnostic → name →
-// action half.
+// The fix that helps is the import, and the CHECKER already decided which modules
+// could supply it: the diagnostic's `data` carries them, so this file needs no
+// second opinion about types.
 
-/** The stable code D1230's diagnostic is to carry (compile-goal track, vl-07). */
+/** The stable code D1230's diagnostic carries (compile-goal track, vl-07). */
 export const UFCS_NOT_IMPORTED_CODE = "ufcs-not-imported";
 
 /**
  * The CATEGORY of a diagnostic code — everything before the first `;`.
  *
- * The compiler ships one string on the `diagCodeLen`/`diagCodeByte` channel, and a
- * coded diagnostic may append a payload to it
- * (`ufcs-not-imported;member=toEqual;modules=std:test;recv=Expectation<i32>`). There
- * is no second channel to put that on, so a consumer matching a bare category has to
- * cut at the first `;` — an equality test silently stops matching the day a payload
- * is added, which is exactly what happened here (D1230).
+ * KEPT AS A TOLERANT READER, DEPENDED ON BY NOTHING. A code is a bare category
+ * now and the payload rides `data`, so `===` is the comparison every consumer
+ * here makes. This survives because the mistake it guards against is cheap to
+ * make again: a code that quietly grows a `;payload` suffix would silently stop
+ * matching an equality test, which is exactly what happened once (D1230).
  */
 export const diagCategory = (code: string | number | undefined): string =>
   typeof code === "string" ? (code.split(";", 1)[0] ?? "") : "";
@@ -311,21 +318,22 @@ export const diagCategory = (code: string | number | undefined): string =>
  * The member NAME a missing-UFCS-import diagnostic is about, or undefined when
  * `diag` is not one.
  *
- * THE CODE'S CATEGORY IS THE ONLY ROUTE — {@link diagCategory}, not an equality
- * test, because the compiler appends a payload to the same string. The message-shape
- * fallback was retired when the compiler half landed and the sentence stopped being
- * `no field '<name>' on <Type>`. The NAME comes from neither — it is read out of
- * `source` at the diagnostic's own range, which is the property token — so a future
- * rewording needs no re-teaching here.
+ * THE CODE IS THE ONLY ROUTE, compared with `===`. The message-shape fallback was
+ * retired when the compiler half landed and the sentence stopped being
+ * `no field '<name>' on <Type>`. The NAME comes from neither the code nor the
+ * message — it is read out of `source` at the diagnostic's own range, which is the
+ * property token — so a future rewording needs no re-teaching here, and a
+ * diagnostic whose range does not sit on an identifier is not this one.
  *
- * The range read is verified against the message when there is one: a diagnostic
- * whose range does not sit on an identifier is not this diagnostic.
+ * `data.member` says the same thing and is not used: the range read works against
+ * a seed too old to carry `data` at all, and the two must agree or the range is
+ * wrong, which is a bug the edit would land in the wrong place for anyway.
  */
 export const ufcsMissingImportAt = (
   source: string,
   diag: FixableDiagnostic,
 ): string | undefined => {
-  if (diagCategory(diag.code) !== UFCS_NOT_IMPORTED_CODE) return undefined;
+  if (diag.code !== UFCS_NOT_IMPORTED_CODE) return undefined;
   const line = splitLines(source)[diag.range.start.line];
   if (line === undefined) return undefined;
   const end = diag.range.end.line === diag.range.start.line
@@ -337,16 +345,54 @@ export const ufcsMissingImportAt = (
 };
 
 /**
+ * The module SPECIFIERS a missing-UFCS-import diagnostic offers, straight from the
+ * checker's own answer — `data.modules`, one field per candidate, already spelled
+ * the way this file can write it (its own import text, or a `std:` key).
+ *
+ * `cached` IS THE SERVER'S COPY OF THE SAME DIAGNOSTIC, and it is here because
+ * `data` is an LSP 3.16 field a client is not obliged to round-trip. When the
+ * editor-supplied diagnostic lost it, the identically-coded, identically-ranged
+ * cached one still has it. Empty means "offer nothing" — the diagnostic is
+ * unchanged and the reader keeps the sentence, which is the right failure.
+ */
+export const ufcsImportModules = (
+  diag: FixableDiagnostic,
+  cached: readonly FixableDiagnostic[] = [],
+): string[] => {
+  if (diag.code !== UFCS_NOT_IMPORTED_CODE) return [];
+  const own = dataModules(diag.data);
+  if (own !== undefined) return own;
+  for (const d of cached) {
+    if (d.code !== UFCS_NOT_IMPORTED_CODE) continue;
+    if (d.range.start.line !== diag.range.start.line) continue;
+    if (d.range.start.character !== diag.range.start.character) continue;
+    const twin = dataModules(d.data);
+    if (twin !== undefined) return twin;
+  }
+  return [];
+};
+
+/** `data.modules` when it really is a list of strings, else undefined. */
+const dataModules = (data: unknown): string[] | undefined => {
+  if (typeof data !== "object" || data === null) return undefined;
+  const mods = (data as Record<string, unknown>).modules;
+  if (!Array.isArray(mods)) return undefined;
+  if (!mods.every((m) => typeof m === "string")) return undefined;
+  return mods as string[];
+};
+
+/**
  * One `` Import `name` from "M" `` action per candidate module — several modules
  * may export a `self`-function of the same name, and each import is a different
- * program, so the author picks rather than the editor guessing. The candidates
- * come from the checker's UFCS scan at the diagnostic's position, so every one of
- * them really does export a function this receiver dispatches to.
+ * program, so the author picks rather than the editor guessing. The candidates are
+ * the diagnostic's own `data.modules` ({@link ufcsImportModules}), so every one of
+ * them really does export a function this receiver dispatches to: the checker
+ * decided that, not this file.
  *
  * `moduleSpecs` are SPECIFIERS, the thing an import statement spells (`./shapes`),
- * not module keys (`/proj/shapes.vl`) — the caller converts, because only it knows
- * the entry. The title shows the same string, so what the action promises is what
- * lands in the file.
+ * not module keys (`/proj/shapes.vl`) — the payload already carries them that way.
+ * The title shows the same string, so what the action promises is what lands in
+ * the file.
  *
  * A module whose import already binds the name yields no action (`importEdit`
  * returns undefined) — that diagnostic is about something else, and offering a

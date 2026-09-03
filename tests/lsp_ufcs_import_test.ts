@@ -11,14 +11,16 @@
 //   1. completion after `.` offers the method and writes the import on accept;
 //   2. a quick-fix on that diagnostic adds the name to the import.
 //
-// Both rest on ONE checker query — `wasmChecker.ufcsCandidatesAt` — because the
-// receiver's fit against a GENERIC `self` (`Expectation<i32>` into
+// COMPLETION rests on a checker query — `wasmChecker.ufcsCandidatesAt` — because
+// the receiver's fit against a GENERIC `self` (`Expectation<i32>` into
 // `self: Expectation<T>`) is a question only the checker can answer; the host
-// holds rendered strings.
+// holds rendered strings. THE QUICK-FIX ASKS NOTHING: the checker already decided
+// at the raise, and the answer rides the diagnostic's `data.modules` — one field
+// per candidate, spelled as a specifier this file can write.
 //
 // Seed-gated (loads the real `build/vl-compiler.wasm`); the pure helpers
 // (`ufcsProbeSource` / `ufcsCompletions` / `ufcsMissingImportAt` /
-// `ufcsImportFixes`) run unconditionally.
+// `ufcsImportModules` / `ufcsImportFixes`) run unconditionally.
 //   deno test -A --no-check tests/lsp_ufcs_import_test.ts
 
 import {
@@ -30,7 +32,9 @@ import {
   ufcsProbeSource,
 } from "../lsp/src/typeFeatures.ts";
 import {
+  diagCategory,
   ufcsImportFixes,
+  ufcsImportModules,
   ufcsMissingImportAt,
 } from "../lsp/src/codeActions.ts";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
@@ -226,6 +230,99 @@ Deno.test("quick-fix: an unrelated diagnostic is not one of ours", () => {
     range: { start: { line: 0, character: 4 }, end: { line: 0, character: 5 } },
   };
   assert(ufcsMissingImportAt(src, d) === undefined, "prefer-const is not a missing import");
+  assert(ufcsImportModules(d).length === 0, "and it offers no modules");
+});
+
+// ---- the candidate modules come from `data`, never from a parsed code --------
+
+Deno.test("quick-fix: the candidate modules are the diagnostic's own `data.modules`", () => {
+  const src = 'import { expect } from "std:test"\n\nexpect(1).toEqual(3)\n';
+  const d = {
+    ...noFieldDiag(src, "toEqual", 2),
+    code: "ufcs-not-imported",
+    data: { member: ["toEqual"], modules: ["std:test"], recv: ["Expectation<i32>"] },
+  };
+  assert(
+    JSON.stringify(ufcsImportModules(d)) === JSON.stringify(["std:test"]),
+    `one module from data; got ${JSON.stringify(ufcsImportModules(d))}`,
+  );
+});
+
+Deno.test("quick-fix: TWO candidate modules come back in wire order", () => {
+  const src = 'import { A } from "./a"\nimport { B } from "./b"\n\nx.area()\n';
+  const d = {
+    ...noFieldDiag(src, "area", 3),
+    code: "ufcs-not-imported",
+    data: { member: ["area"], modules: ["./a", "./b"], recv: ["X"] },
+  };
+  assert(
+    JSON.stringify(ufcsImportModules(d)) === JSON.stringify(["./a", "./b"]),
+    `both modules; got ${JSON.stringify(ufcsImportModules(d))}`,
+  );
+});
+
+// `Diagnostic.data` is LSP 3.16 and a client is NOT obliged to round-trip it. The
+// server's own cache always has it, so the reader falls back to the identically
+// coded, identically anchored cached twin rather than silently offering nothing.
+Deno.test("quick-fix: a client that dropped `data` is covered by the server's cache", () => {
+  const src = 'import { expect } from "std:test"\n\nexpect(1).toEqual(3)\n';
+  const stripped = { ...noFieldDiag(src, "toEqual", 2), code: "ufcs-not-imported" };
+  const cached = {
+    ...stripped,
+    data: { member: ["toEqual"], modules: ["std:test"], recv: ["Expectation<i32>"] },
+  };
+  assert(ufcsImportModules(stripped).length === 0, "alone it knows nothing");
+  assert(
+    JSON.stringify(ufcsImportModules(stripped, [cached])) === JSON.stringify(["std:test"]),
+    "the cached twin supplies the answer",
+  );
+  // A twin at a DIFFERENT anchor is a different diagnostic and must not be borrowed.
+  const elsewhere = {
+    ...cached,
+    range: { start: { line: 9, character: 0 }, end: { line: 9, character: 1 } },
+  };
+  assert(
+    ufcsImportModules(stripped, [elsewhere]).length === 0,
+    "another diagnostic's payload is not this one's",
+  );
+});
+
+// A payload that is not the shape we wrote — a client that mangled it, a seed
+// that changed the format — yields NOTHING, not a partial read. A wrong import is
+// worse than the sentence the reader already has.
+Deno.test("quick-fix: a malformed `data` offers no modules", () => {
+  const src = 'import { expect } from "std:test"\n\nexpect(1).toEqual(3)\n';
+  const base = { ...noFieldDiag(src, "toEqual", 2), code: "ufcs-not-imported" };
+  const bad: unknown[] = [null, "std:test", { modules: "std:test" }, { modules: [1, 2] }, {}];
+  for (const data of bad) {
+    assert(
+      ufcsImportModules({ ...base, data }).length === 0,
+      `malformed data must offer nothing: ${JSON.stringify(data)}`,
+    );
+  }
+});
+
+// `diagCategory` STAYS, and nothing depends on it. It is a tolerant reader kept
+// against the next packed code — the mistake it guards is cheap to make again —
+// so it must still cut at the first `;` while a bare category passes through.
+Deno.test("quick-fix: diagCategory still tolerates a packed code, and nothing uses it", () => {
+  assert(diagCategory("ufcs-not-imported") === "ufcs-not-imported", "a bare category is itself");
+  assert(
+    diagCategory("ufcs-not-imported;member=toEqual") === "ufcs-not-imported",
+    "a packed code still yields its category",
+  );
+  assert(diagCategory(undefined) === "", "no code, no category");
+  assert(diagCategory(42) === "", "a numeric code has no category");
+  // And the fix keys on EQUALITY now: a packed code no longer identifies it.
+  const src = 'import { expect } from "std:test"\n\nexpect(1).toEqual(3)\n';
+  const packed = {
+    ...noFieldDiag(src, "toEqual", 2),
+    code: "ufcs-not-imported;member=toEqual;modules=std:test;recv=Expectation<i32>",
+  };
+  assert(
+    ufcsMissingImportAt(src, packed) === undefined,
+    "the code is a bare category — a packed one is not this diagnostic",
+  );
 });
 
 Deno.test("quick-fix: one action per candidate module, titled with the module", () => {
@@ -417,6 +514,10 @@ Deno.test({
   );
 });
 
+// THE WHOLE PATH, seed to edit, with NO checker query in it. `checker.check`
+// returns the diagnostic; its `code` is the bare category and its `data` carries
+// the modules; `ufcsImportFixes` writes the import. That is the server's
+// `onCodeAction` arm, which is why it no longer awaits anything.
 Deno.test({
   name: "seed: the quick-fix appears on the D1230 diagnostic and applying it fixes the file",
   ignore,
@@ -424,25 +525,21 @@ Deno.test({
   const { checker, read } = checkerAndReader();
   const src = 'import { expect, it } from "std:test"\n\nit("x", () => {\n  expect(1 + 2).toEqual(3)\n})\n';
   const diags = await checker.check(src, "/proj/main.vl", read);
-  const d1230 = diags.find((d) => (d.code ?? "").startsWith("ufcs-not-imported"));
+  const d1230 = diags.find((d) => d.code === "ufcs-not-imported");
   if (d1230 === undefined) {
     throw new Error(`expected the D1230 diagnostic; got ${JSON.stringify(diags.map((x) => x.message))}`);
   }
+  assert(
+    JSON.stringify(d1230.data) ===
+      JSON.stringify({ member: ["toEqual"], modules: ["std:test"], recv: ["Expectation<i32>"] }),
+    `the payload decodes to all three fields; got ${JSON.stringify(d1230.data)}`,
+  );
   const name = ufcsMissingImportAt(src, d1230);
   assert(name === "toEqual", `the fix knows the member; got ${name}`);
-  // The diagnostic points AT the member, so the receiver is the access's object
-  // and no probe property is needed.
-  const candidates = await checker.ufcsCandidatesAt(
-    ufcsProbeSource(src, stdProbeModules(checker)).source,
-    "/proj/main.vl",
-    read,
-    d1230.range.start.line + ufcsProbeSource(src, stdProbeModules(checker)).lineOffset,
-    d1230.range.start.character,
-  );
   const fixes = ufcsImportFixes(
     src,
     name!,
-    candidates.filter((c) => c.name === name).map((c) => c.moduleKey),
+    ufcsImportModules(d1230),
     (s, key, n) => importInsertionEdit(s, key, n, (stmt) => checker.formatSrc?.(stmt)),
   );
   assert(fixes.length === 1, `one action; got ${JSON.stringify(fixes.map((f) => f.title))}`);
@@ -459,6 +556,57 @@ Deno.test({
     after.length === 0,
     `applying the fix must clear the file; got ${JSON.stringify(after.map((d) => d.message))}`,
   );
+});
+
+// TWO MODULES, END TO END, and this is the case the old route could get wrong: it
+// mapped checker module KEYS back to specifiers in the host. The payload carries
+// the specifiers the compiler already chose, so both actions are offered and
+// neither is preferred — the author picks.
+Deno.test({
+  name: "seed: two candidate modules yield two actions, both from the payload",
+  ignore,
+}, async () => {
+  const mods: Record<string, string> = {
+    "/proj/a.vl":
+      "export type Box = { v: i32 }\nexport function box(v: i32): Box { return { v: v } }\nexport function area(self: Box): i32 { return self.v * self.v }\n",
+    "/proj/b.vl":
+      'import { Box } from "./a"\nexport function area(self: Box): i32 { return self.v + self.v }\nexport function other(): i32 { return 1 }\n',
+  };
+  const { checker, read } = checkerAndReader((key) => mods[key]);
+  const src = 'import { box } from "./a"\nimport { other } from "./b"\n\nprint(box(5).area())\nprint(other())\n';
+  const diags = await checker.check(src, "/proj/main.vl", read);
+  const d1230 = diags.find((d) => d.code === "ufcs-not-imported");
+  if (d1230 === undefined) {
+    throw new Error(`expected the D1230 diagnostic; got ${JSON.stringify(diags.map((x) => x.message))}`);
+  }
+  const specs = ufcsImportModules(d1230);
+  assert(
+    JSON.stringify(specs) === JSON.stringify(["./a", "./b"]),
+    `both specifiers, in the graph's order; got ${JSON.stringify(specs)}`,
+  );
+  const fixes = ufcsImportFixes(
+    src,
+    ufcsMissingImportAt(src, d1230)!,
+    specs,
+    (s, key, n) => importInsertionEdit(s, key, n, (stmt) => checker.formatSrc?.(stmt)),
+  );
+  assert(fixes.length === 2, `two actions; got ${JSON.stringify(fixes.map((f) => f.title))}`);
+  assert(
+    fixes.every((f) => f.isPreferred === undefined),
+    "no default when the author must pick",
+  );
+  // Applying EITHER one clears the file, which is what makes them both real.
+  for (const fix of fixes) {
+    const edit = fix.edits[0];
+    const lines = src.split("\n");
+    lines[edit.range.start.line] = lines[edit.range.start.line].slice(0, edit.range.start.character) +
+      edit.newText + lines[edit.range.end.line].slice(edit.range.end.character);
+    const after = await checker.check(lines.join("\n"), "/proj/main.vl", read);
+    assert(
+      after.length === 0,
+      `${fix.title} must clear the file; got ${JSON.stringify(after.map((d) => d.message))}`,
+    );
+  }
 });
 
 Deno.test({

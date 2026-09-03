@@ -53,6 +53,7 @@ import {
   fixableDiagnosticsForRange,
   quickFixesForDiagnostic,
   ufcsImportFixes,
+  ufcsImportModules,
   ufcsMissingImportAt,
 } from "./codeActions.ts";
 import { dirname, join } from "node:path";
@@ -79,7 +80,6 @@ import {
   flatDocumentSymbols,
   type HighlightKind,
   importInsertionEdit,
-  importSpecifierForKey,
   inlayHintsFromWasm,
   isDisplayableType,
   keywordCompletions,
@@ -228,6 +228,10 @@ const toLspDiagnostic = (d: VLDiagnostic): Diagnostic => ({
   severity: severityMap[d.severity],
   range: d.range,
   code: d.code,
+  // The code's structured payload (LSP 3.16 `Diagnostic.data`) — a client that
+  // round-trips it hands the quick-fix its answer with no second query. One that
+  // does not is covered by `ufcsImportModules`' fall back to the server's cache.
+  data: d.data,
   source: d.source,
   // `unnecessary` → VS Code dims/greys the span (unused/unreachable code).
   tags: d.tags?.map((t) => tagMap[t]),
@@ -1332,7 +1336,10 @@ const kindMatchesOnly = (kind: string, only: string[] | undefined): boolean =>
   only === undefined ||
   only.some((k) => kind === k || kind.startsWith(k + "."));
 
-connection.onCodeAction(async (params): Promise<CodeAction[]> => {
+// SYNCHRONOUS, and that is what the data channel bought: the missing-import fix
+// used to re-ask the checker which modules could supply the name, per lightbulb.
+// The diagnostic now carries that answer, so nothing here awaits.
+connection.onCodeAction((params): CodeAction[] => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return [];
   const source = doc.getText();
@@ -1351,24 +1358,15 @@ connection.onCodeAction(async (params): Promise<CodeAction[]> => {
       const fixes = quickFixesForDiagnostic(source, diag.code, diag.range);
       // A missing UFCS import is the one fix whose candidate set the document
       // cannot supply: which modules export a `self`-function this receiver
-      // dispatches to is the checker's answer, and it is the same scan `.`
-      // completion runs. The diagnostic points AT the member name, so the
-      // receiver is the member access's object and needs no probe property.
+      // dispatches to is the CHECKER's answer, and it already rides the
+      // diagnostic (`data.modules`, spelled as specifiers this file can write).
+      // No second query — the compiler decided it once, at the raise.
       const ufcsName = ufcsMissingImportAt(source, diag);
       if (ufcsName !== undefined) {
-        const candidates = await ufcsCandidatesForCursor(
-          source,
-          uri,
-          diag.range.start,
-          false,
-        );
-        const entryKey = entryKeyOf(uri);
         fixes.push(...ufcsImportFixes(
           source,
           ufcsName,
-          candidates
-            .filter((c) => c.name === ufcsName)
-            .map((c) => importSpecifierForKey(source, entryKey, c.moduleKey)),
+          ufcsImportModules(diag, cached),
           (src, spec, name) =>
             importInsertionEdit(
               src,
