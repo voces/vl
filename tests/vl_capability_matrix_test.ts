@@ -228,7 +228,7 @@ Deno.test({
 // block, so `closure_capture` graded that capability GREEN while the row was live. These two
 // tests are the controls that prove the six new positions can speak: the struct rep is D1244's
 // own LOUD cell, the `i32[]` rep is one of the two the row names as check-clean invalid wasm,
-// and `block_bare` is D1253's floor underneath both. Only the six block positions are run —
+// and `block_bare` is the plain bare block D1253 closed. Only the six block positions are run —
 // `--only` — because three more 52-cell sweeps would cost the gate more than they say.
 
 const BLOCKS =
@@ -251,13 +251,10 @@ Deno.test({
           throw new Error(`${p}/${face}: want D1244's message, got ${grade}`);
         }
       }
-      // D1253's floor: a bare block is `unsupported statement in body` at every scope, so the
-      // plain-read bare cell refuses where its `if` and `while` siblings run.
-      wantVerdict(cells, "block_bare", face, "emit refuses", "D1253, still open");
-      const bare = gradeOf(cells, "block_bare", face);
-      if (!bare.includes("unsupported statement in body")) {
-        throw new Error(`block_bare/${face}: want D1253's message, got ${bare}`);
-      }
+      // D1253 CLOSED the floor that used to sit under all three: a bare block now lowers like
+      // any other scope, so the plain-read bare cell runs with its `if` and `while` siblings
+      // and `block_bare_capture` above reaches D1244's own message instead of the floor's.
+      wantVerdict(cells, "block_bare", face, "RUNS", "D1253 closed");
     }
     // No SILENT cell and no runs lost: a loud refusal is not a failure of the harness, and
     // this is the exit-0 control the orerr template used to be.
@@ -280,6 +277,11 @@ Deno.test({
         "D1244 at `i32[]`: check-clean invalid wasm. When D1244 closes, change this to RUNS",
       );
       wantVerdict(cells, "block_while_capture", face, "SILENT", "D1244 at `i32[]`");
+      // THE PRICE D1253 PAID, PINNED. Closing the bare-block floor made this cell reachable,
+      // so it moved emit-refuses -> SILENT: it is D1244's `i32[]` cell, identical to the two
+      // above, that the floor was hiding. It closes when D1244 does, with them.
+      wantVerdict(cells, "block_bare_capture", face, "SILENT", "D1253's price: D1244 at `i32[]`");
+      wantVerdict(cells, "block_bare", face, "RUNS", "D1253 closed");
     }
     if (code === 0) {
       throw new Error("want a non-zero exit on D1244's silent ref-rep cells, got 0");
