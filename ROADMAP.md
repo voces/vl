@@ -210,13 +210,15 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   error. DECISIONS.md §"Numeric `as` to an INTEGER target is exact-or-fail
   under the trio" has the survey (Julia's `Int(3.9)` InexactError / `trunc(Int, x)` is the
   model adopted) and the cost. Compiler-side; the compile-goal session's surface.
-- **A subsumed literal arm COLLAPSES — RULED (owner, 2026-09-02); THE COLLAPSE IS BUILT, the
-  two dedicated HINTS are not.** The bare-literal half shipped as **D1024** and the MIRROR
+- **A subsumed literal arm COLLAPSES — RULED (owner, 2026-09-02); DONE — the collapse AND
+  both hints.** The bare-literal half shipped as **D1024** and the MIRROR
   (`Kind | string` is `string`) as **D1048**, which needed the drop in BOTH producers — at
   type construction (`unionDropSubsumedArms`) and on the annotation SPELLING
-  (`canonDropSubsumedParts`), each alone a `runs → not-runs` veto. The first hint arrives
-  free (the existing redundant-annotation hint now fires at a collapsed annotation); the
-  `is <literal>`-whose-operand-collapsed hint is still to write. A union is a
+  (`canonDropSubsumedParts`), each alone a `runs → not-runs` veto. The first hint arrived
+  free (the existing redundant-annotation hint fires at a collapsed annotation); the
+  SECOND — at an `is <literal>` whose operand collapsed — is now built, keyed on the
+  provenance the collapse RECORDS (`collapsedTy` / `collapsedAliases`), because the
+  collapsed type itself carries no trace of the dropped arm. A union is a
   set of values; an arm that adds none adds no arm, decided per arm after flattening and
   through aliases: `string | "err"` is `string`, `Name | "err"` (alias) is `Name`,
   `Json | "err"` is `Json`, `Kind | string` is `string`; `Kind | "err"` (three atoms) and
@@ -228,7 +230,10 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   **D1024** (`function f(): string | "err"` is check-clean invalid wasm today because the
   literal widens to a DUPLICATE `string` atom); then the two hints. Grade on D1024's spelling
   table (`return`, parameter, alias, `Json | "err"`, `Kind | string`, module-scope binding)
-  and on `is "err"` answering as `==` at each. The generic-instantiation refusal that shared
+  and on `is "err"` answering as `==` at each. The second hint's own grade is the 18-program
+  A/B in `tests/cases/literal-unions/is-literal-over-collapsed-arm.vl` plus that file's
+  negatives (a real litunion, a real two-arm box, a plainly-declared `string`, a shadowing
+  inner binding, a generic instantiation, and a non-literal check type). The generic-instantiation refusal that shared
   D1024's table (`orErr<T>(): T | "err"` at `T = i32` → `no recorded members`) was NOT this
   item — it is about mono-minted unions, struct arm or literal alike — and it has since
   CLOSED as **D1042**: the pin registers its union through `canonEmitName`, so the clone and

@@ -162,6 +162,12 @@ import {
 } from "./ast"
 import {
   SYM_MEM_METHOD,
+  isvalCol,
+  isvalLine,
+  isvalLit,
+  isvalName,
+  isvalTok,
+  isvalType,
   rcoalCol,
   rcoalLine,
   rcoalTok,
@@ -1140,6 +1146,26 @@ let fnDeclScopes: {[string]: i32}[] = []
 // so it stays unnamed and keeps consulting everything — which is what the HOF case needs, and
 // what #1946's header records as the reason the enclosing-body rule was reverted.
 let fnAliasScopes: {[string]: i32}[] = []
+
+// THE COLLAPSED-BINDING MARKS (D1048's second hint): the bindings whose DECLARED type
+// dropped a subsumed literal arm, and the function declarations whose declared RETURN
+// did. Read at an `is <literal>` to decide whether the test the author wrote is a tag
+// test or — because the arm collapsed — a value compare.
+//
+// DEPTH-TAGGED SPARSE ROWS, not a fourth map per scope frame. Almost every program
+// records NOTHING here, and a parallel `{[string]: …}[]` would allocate an empty map on
+// every `pushScope` for a fact that is usually absent everywhere; these two lists cost
+// one length test on entry and one on exit instead. `popScope` drops the rows whose
+// depth the pop retired, so a name that goes out of scope stops answering — and the
+// read pairs the row's depth with `lookupDepth`, so an inner PLAIN binding shadowing an
+// outer collapsed one answers correctly (different depth ⇒ no match) without the inner
+// one having to record anything.
+let collBindDepth: i32[] = []
+let collBindName: string[] = []
+// The `FuncDecl` NODES whose return annotation collapsed. Module-scoped rather than
+// depth-tagged: a decl node is unique for the whole program, and pass 1 hoists every
+// top-level signature before any body runs, so a forward call is already covered.
+let collRetFnNodes: i32[] = []
 
 // UN-INFERRED EMPTY-COLLECTION FLOOR (mirrors the host's `reportUninferredBinding`
 // in `compiler/typecheck.ts`): an un-annotated empty `[]` / `Map()` / `Set()` whose
@@ -3306,6 +3332,7 @@ function seedExpected(exprIx: i32, expectedTy: i32) {
 export function initChecker() {
   redunReset()
   rcoalReset()
+  isvalReset()
   covarWriteReset()
   cbExpNode = []
   cbExpOff = []
@@ -6400,6 +6427,9 @@ function popScope() {
   constScopes.pop()
   fnDeclScopes.pop()
   fnAliasScopes.pop()
+  // The collapsed-binding marks go with the frame their bindings did (D1048's second
+  // hint). One length test when the list is empty, which is nearly every program.
+  collBindPopTo(T.scopes.length)
   if npFrames.length > 0 {
     const base = npFrames[npFrames.length - 1]
     npFrames.pop()
@@ -6711,6 +6741,114 @@ function rcoalTruncate(n: i32) {
   while rcoalCol.length > n { rcoalCol.pop() }
   while rcoalTok.length > n { rcoalTok.pop() }
   while rcoalType.length > n { rcoalType.pop() }
+  0
+}
+
+// ── `is <literal>` over a COLLAPSED operand (D1048's second hint) ───────────────
+
+function isvalReset() {
+  isvalLine = []
+  isvalCol = []
+  isvalTok = []
+  isvalName = []
+  isvalType = []
+  isvalLit = []
+  collBindDepth = []
+  collBindName = []
+  collRetFnNodes = []
+  collapsedAliases = Map()
+  annotCollapsed = Map()
+  collapsedTy = -1
+  0
+}
+
+function isvalTruncate(n: i32) {
+  while isvalLine.length > n { isvalLine.pop() }
+  while isvalCol.length > n { isvalCol.pop() }
+  while isvalTok.length > n { isvalTok.pop() }
+  while isvalName.length > n { isvalName.pop() }
+  while isvalType.length > n { isvalType.pop() }
+  while isvalLit.length > n { isvalLit.pop() }
+  0
+}
+
+// Mark the binding just declared at the innermost scope as one whose declared type
+// COLLAPSED a subsumed literal arm. Called right after `declare`, so the depth it
+// records is the frame `lookupDepth` will answer with at every use.
+function markCollapsedBinding(name: string) {
+  collBindDepth.push(T.scopes.length - 1)
+  collBindName.push(name)
+  0
+}
+
+// Did `name` resolve to a binding whose declared type collapsed? The depth pairing is
+// what makes this exact under shadowing: an inner PLAIN `const r: string` records
+// nothing, and `lookupDepth` answers ITS frame, which no row names.
+function bindingCollapsed(name: string) {
+  if collBindName.length == 0 { return false }
+  const d = lookupDepth(name)
+  if d < 0 { return false }
+  let i = collBindName.length - 1
+  while i >= 0 {
+    if collBindName[i] == name && collBindDepth[i] == d { return true }
+    i = i - 1
+  }
+  false
+}
+
+// Drop the marks the scope just popped retired. `T.scopes` has already shrunk, so any
+// row recorded at a depth the chain no longer has is gone with its binding.
+function collBindPopTo(depth: i32) {
+  while collBindDepth.length > 0 {
+    if collBindDepth[collBindDepth.length - 1] < depth { return 0 }
+    collBindDepth.pop()
+    collBindName.pop()
+  }
+  0
+}
+
+// Mark / test a function DECLARATION whose return annotation collapsed. Deduped: pass 1
+// hoists the signature and `checkFuncDeclNode` resolves it again, and a probe re-check
+// runs the whole body a third time.
+function markCollapsedRet(fnIx: i32) {
+  if fnIx < 0 { return 0 }
+  if fnRetCollapsed(fnIx) { return 0 }
+  collRetFnNodes.push(fnIx)
+  0
+}
+
+function fnRetCollapsed(fnIx: i32) {
+  if fnIx < 0 { return false }
+  let i = 0
+  while i < collRetFnNodes.length {
+    if collRetFnNodes[i] == fnIx { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Record the finding at an `is <literal>` whose operand's declared type collapsed.
+// `ix` is the `IsExpr` node; `name` the operand binding; `objTy` its (collapsed) type;
+// `lit` the tested spelling exactly as the author wrote it.
+function recordCollapsedIs(ix: i32, name: string, objTy: i32, lit: string) {
+  if ix < 0 || ix >= nodeToks.length { return 0 }
+  const tk = nodeToks[ix]
+  if tk < 0 || tk >= P.toks.length { return 0 }
+  const t = P.toks[tk]
+  // An EXACT repeat (same anchor) is the re-check of one node, not a second finding —
+  // the de-duplication `recordDeadCoalesce` and `tErrCoded` both apply.
+  let i = 0
+  while i < isvalTok.length {
+    if isvalTok[i] == tk { return 0 }
+    i = i + 1
+  }
+  isvalLine.push(t.line)
+  isvalCol.push(t.col)
+  isvalTok.push(tk)
+  isvalName.push(demangleName(name))
+  // User-facing (the finding's message quotes it) — the user render, not the raw one.
+  isvalType.push(tyToStrUser(objTy))
+  isvalLit.push(lit)
   0
 }
 
@@ -9372,6 +9510,7 @@ function declaredTyOfName(name: string) {
     // one — see `forceDeclFill`. Inert outside pass 0b.
     forceDeclFill(name)
     const ut = cUserTypes[name] ?? -1
+    let res = ut
     if ut >= 0 {
       const utt = T.tys[ut]
       if utt is TyUnion {
@@ -9387,10 +9526,21 @@ function declaredTyOfName(name: string) {
         // collapse must stay: it is what the EMITTER's `singleMemberAliasTyIx`
         // twin does with the same annotation, and the brand is invisible to it —
         // which is precisely why the newtype costs nothing to emit.
-        if sm >= 0 { return nwBrand(name, sm) }
+        if sm >= 0 { res = sm }
       }
     }
-    return nwBrand(name, ut)
+    const answer = nwBrand(name, res)
+    // D1048's second-hint provenance, RE-BANKED AT THE REFERENCE. The declaration route
+    // recorded that `type R = string | "err"` dropped an arm; every later `: R` resolves
+    // through here, so this is where that fact rejoins the annotation wire. It banks the
+    // index the reference actually ANSWERS, which is what makes an enclosing spelling
+    // (`R[]`, `R | i32`) decline on its own — the annotation site compares its whole
+    // resolved type against the bank. `forceDeclFill` above is what makes it
+    // order-independent: a `: R` resolved before `type R`'s statement fills it here.
+    if collapsedAliases.has(name) {
+      if answer >= 0 { collapsedTy = answer }
+    }
+    return answer
   }
   // A BARE reference to a generic alias has no concrete type — its parameters
   // were never supplied (host: `Generic type … was used without any`).
@@ -9533,6 +9683,30 @@ let unkTyDepth = 0
 // an arm. Same lifetime as `unkTyPart` — cleared by the outermost resolver frame.
 let unkTyClash = ""
 
+// ── THE SUBSUMED-ARM COLLAPSE'S PROVENANCE (D1048's second hint) ────────────────
+// THE THIRD BANK ON THE SAME WIRE, and it exists because the collapse is INVISIBLE IN
+// ITS OWN RESULT. `string | "err"` resolves to `string`: the arena index is the
+// canonical primitive singleton and the canon spelling is `string`, so nothing about
+// the answer distinguishes it from a `string` nobody ever wrote a union for. The
+// downstream hint (`is "err"` over such an operand) therefore cannot ask the TYPE — it
+// has to be told, at the moment the arm was dropped, and that is this.
+//
+// `collapsedTy` is the arena index the resolution IN FLIGHT collapsed to, or -1. The
+// consuming sites (a `let`/param annotation, a declared return) compare it against their
+// OWN resolved type: `(string | "err")[]` collapses too, and answering "this annotation
+// collapsed" for the array would mark a binding whose `is` is a different question.
+// Same lifetime as `unkTyPart` — cleared by the outermost resolver frame — plus a
+// companion memo across `resolveAnnotTs`'s name cache, for the same reason `annotPart`
+// has one: a memo HIT does not re-enter the resolver, so it must restore the bank.
+let collapsedTy = -1
+// The DECLARED aliases whose union spelling collapsed (`type R = string | "err"`).
+// The declaration route builds its member list itself and never reaches the annotation
+// home, so it records here and `declaredTyOfName` re-banks on every later reference —
+// which is what carries the provenance across `function f(): R`.
+let collapsedAliases: {[string]: boolean} = Map()
+// `annotNameMemo`'s companion: the `collapsedTy` a name's resolution banked.
+let annotCollapsed: {[string]: i32} = Map()
+
 // A STORAGE type named where a VALUE type is required. Banks the reason on the
 // `unkTyClash` wire — the same channel the union rep-clash uses — so every
 // `unknownTyText` caller reports WHY without gaining an arm, and returns the -1 that
@@ -9567,6 +9741,7 @@ function tsToTy(ix: i32) {
   if unkTyDepth == 1 {
     unkTyPart = ""
     unkTyClash = ""
+    collapsedTy = -1
   }
   const r = tsToTyReal(ix)
   if r < 0 {
@@ -9583,6 +9758,7 @@ function nameToTy(name: string) {
   if unkTyDepth == 1 {
     unkTyPart = ""
     unkTyClash = ""
+    collapsedTy = -1
   }
   // THE BARE-NAME RUNG. A name that is a bare identifier cannot enter any composite arm
   // of `nameToTyReal`, so its answer IS the shared leaf ladder — and `tsLeafTy` is that
@@ -10071,7 +10247,13 @@ function annUnionInnerTy(members: i32[], hasNull: boolean): i32 {
   // edge: it is what `string | "err"` itself is).
   const kept: i32[] = []
   if unionDropSubsumedArms(members, kept) {
-    return annUnionInnerTy(kept, hasNull)
+    const collapsed = annUnionInnerTy(kept, hasNull)
+    // BANK THE PROVENANCE (D1048's second hint). The result carries no trace of the
+    // dropped arm — that is the ruling — so the only place that can say a collapse
+    // happened is the collapse. Written AFTER the recursion so a list that collapses
+    // twice banks the final index, which is the one an annotation site compares against.
+    if collapsed >= 0 { collapsedTy = collapsed }
+    return collapsed
   }
   if hasNull {
     annRegisterVariantMembers(members)
@@ -10137,7 +10319,15 @@ function annUnionInnerTy(members: i32[], hasNull: boolean): i32 {
 function annUnionTy(members: i32[], hasNull: boolean): i32 {
   const inner = annUnionInnerTy(members, hasNull)
   if inner < 0 { return -1 }
-  if hasNull { return mkNullableTy(inner) }
+  if hasNull {
+    const wrapped = mkNullableTy(inner)
+    // CARRY THE COLLAPSE BANK THROUGH THE NICHE WRAP. `string | "err" | null` is
+    // `string?` and the arm the ruling dropped is just as invisible there; without
+    // this the bank would still name the unwrapped `string` and no annotation site
+    // would recognise its own type.
+    if collapsedTy == inner { collapsedTy = wrapped }
+    return wrapped
+  }
   inner
 }
 
@@ -20608,6 +20798,7 @@ function solveUnannotParams(fnIx: i32) {
     const savedSym = symEnabled
     const savedRedun = redunName.length
     const savedRcoal = rcoalTok.length
+    const savedIsval = isvalTok.length
     const savedQuiet = inferQuiet
     const savedBinN = binCstrOp.length
     const savedArgN = argCstrAt.length
@@ -20624,6 +20815,7 @@ function solveUnannotParams(fnIx: i32) {
     while T.diags.length > savedDiag { T.diags.pop() }
     redunTruncate(savedRedun)
     rcoalTruncate(savedRcoal)
+    isvalTruncate(savedIsval)
     while binCstrOp.length > savedBinN {
       binCstrLt.pop()
       binCstrOp.pop()
@@ -24860,7 +25052,15 @@ function resolveAnnotTs(name: string, typarams: string[], root: i32) {
   if typarams.length == 0 {
     if tpEnvNames.length == 0 {
       const hit = annotNameMemo[name] ?? -2
-      if hit != -2 { return hit }
+      if hit != -2 {
+        // Restore the COLLAPSE bank (D1048's second hint) for the same reason the
+        // negative leg restores `unkTyPart`: a memo hit never re-enters the resolver,
+        // so a spelling whose FIRST resolution collapsed would answer "no collapse"
+        // at every later one — and pass 1 hoists every signature, so the first
+        // resolution is almost never the one an annotation site is reading.
+        collapsedTy = annotCollapsed[name] ?? -1
+        return hit
+      }
       const negVer = annotNameMemoNegVer[name] ?? -1
       if negVer == cUserTypesVer {
         // Restore the component this name banked when it actually resolved, so the
@@ -24872,6 +25072,9 @@ function resolveAnnotTs(name: string, typarams: string[], root: i32) {
       const r = annotResolve(name, root)
       if r >= 0 {
         annotNameMemo[name] = r
+        // Bank the collapse alongside the index, only when there was one — the read
+        // above defaults to -1, so the absent key IS "this spelling collapses nothing".
+        if collapsedTy >= 0 { annotCollapsed[name] = collapsedTy }
       } else {
         annotNameMemoNegVer[name] = cUserTypesVer
         annotPart[name] = unkTyPart
@@ -25122,6 +25325,7 @@ function inferReturnsPrePass() {
   const savedSym = symEnabled
   const savedRedun = redunName.length
   const savedRcoal = rcoalTok.length
+  const savedIsval = isvalTok.length
   symEnabled = 0
   let i = 0
   while i < topUnannotFns.length {
@@ -25157,6 +25361,7 @@ function inferReturnsPrePass() {
   while T.diags.length > savedDiag { T.diags.pop() }
   redunTruncate(savedRedun)
   rcoalTruncate(savedRcoal)
+  isvalTruncate(savedIsval)
   inferQuiet = false
   0
 }
@@ -25434,16 +25639,23 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   const cbExpect = cbExpectedFor(fnIx)
   const cbExpectUsable = cbExpect.length == params.length
   const paramTys: i32[] = []
+  // Parallel to `paramTys`: did THIS parameter's annotation collapse a subsumed literal
+  // arm (D1048's second hint)? Recorded here, where the annotation resolves, and read in
+  // the declare loop below, which is where the binding — and so the scope depth the mark
+  // is keyed by — comes into existence.
+  const paramCollapsed: boolean[] = []
   let paramUninferable = false
   let pi = 0
   while pi < params.length {
     const pNode = P.nodes[params[pi]]
     let pt = TY_ERR
+    let ptCollapsed = false
     if pNode is Param {
       if pNode.parType >= 0 {
         const ptn = P.nodes[pNode.parType]
         if ptn is TypeRef {
           pt = resolveAnnotAt(ptn.tyName, n.fnTyParams, pNode.parType)
+          if pt >= 0 && pt == collapsedTy { ptCollapsed = true }
           if pt < 0 {
             tErr(unknownTyText(ptn.tyName), pNode.parType)
             pt = TY_ERR
@@ -25499,6 +25711,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       if params[pi] < nodeTyIx.length { nodeTyIx[params[pi]] = pt }
     }
     paramTys.push(pt)
+    paramCollapsed.push(ptCollapsed)
     pi = pi + 1
   }
   // Parameter DEFAULTS (`a: i32 = 0`, and the `a?: T` spelling the parser
@@ -25514,6 +25727,11 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       const rtn = P.nodes[n.fnRet]
       if rtn is TypeRef {
         ret = resolveAnnotAt(rtn.tyName, n.fnTyParams, n.fnRet)
+        // D1048's second hint: a declared return whose spelling collapsed marks the
+        // DECLARATION, so an un-annotated `const r = f(…)` can inherit the provenance.
+        // The pass-1 hoist below records the same fact for a top-level function; this
+        // arm is what covers a NESTED one, which the hoist never walks.
+        if ret >= 0 && ret == collapsedTy { markCollapsedRet(fnIx) }
         if ret < 0 {
           tErr(unknownTyText(rtn.tyName), n.fnRet)
           ret = TY_ERR
@@ -25611,6 +25829,10 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
     const pNode2 = P.nodes[params[dj]]
     if pNode2 is Param {
       declare(pNode2.parName, paramTys[dj])
+      // D1048's second hint: the parameter's annotation collapsed, so the binding the
+      // body sees carries the loss. Marked HERE and not at the resolution because the
+      // mark is keyed by the scope frame, and that frame is this one.
+      if paramCollapsed[dj] { markCollapsedBinding(pNode2.parName) }
       if symEnabled != 0 {
         symDecl(pNode2.parName, params[dj], paramTys[dj], 1)
       }
@@ -27128,7 +27350,15 @@ function fillTypeDeclAt(sx: i32) {
           const survU: i32[] = []
           const nonNullU: i32[] = []
           const declU: i32[] = []
-          unionDropSubsumedArms(surviving, survU)
+          // The DECLARATION route's half of D1048's second-hint provenance. The
+          // annotation route banks the arena index it collapsed to; a declared alias
+          // banks its NAME instead, because the index it produces is re-derived at
+          // every later `: R` and `declaredTyOfName` is the one door all of those come
+          // through. Recorded from the RETURN VALUE, not from a length compare: `out`
+          // is filled unconditionally (see `unionDropSubsumedArms`' header).
+          if unionDropSubsumedArms(surviving, survU) {
+            collapsedAliases[sd.udName] = true
+          }
           let cu = 0
           while cu < survU.length {
             if survU[cu] != TY_NULL { nonNullU.push(survU[cu]) }
@@ -27707,6 +27937,12 @@ function checkProgramNode(n: Program) {
         const hrtn = P.nodes[s.fnRet]
         if hrtn is TypeRef {
           const r = resolveAnnotAt(hrtn.tyName, s.fnTyParams, s.fnRet)
+          // D1048's second hint, recorded ORDER-INDEPENDENTLY. This hoist is the only
+          // pass that resolves every top-level return before any body runs, so a
+          // `const r = f(…)` written ABOVE `function f(): R` still inherits the
+          // provenance — which is what makes the mark a property of the program rather
+          // than of statement order.
+          if r >= 0 && r == collapsedTy { markCollapsedRet(stmts[hi]) }
           if r >= 0 { hret = r } else { hret = TY_VOID }
         }
       }
@@ -36079,10 +36315,16 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
 function checkLetDeclNode(n: LetDecl, ix: i32) {
   // Resolve the annotation (if any) by reading the TypeRef child INLINE.
   let annot = -1
+  // Did the ANNOTATION this binding wrote collapse a subsumed literal arm (D1048's
+  // second hint)? Read immediately after the resolution — `collapsedTy` is a bank with
+  // one outermost-resolution lifetime — and compared against THIS annotation's own
+  // answer, so `(string | "err")[]` marks nothing.
+  let annotCollapsedHere = false
   if n.letType >= 0 {
     const tn = P.nodes[n.letType]
     if tn is TypeRef {
       annot = nameToTyAt(tn.tyName, n.letType)
+      if annot >= 0 && annot == collapsedTy { annotCollapsedHere = true }
       if annot < 0 {
         // A map shape whose KEY is neither `string` nor `i32` (`{[boolean]: V}`,
         // `{[f64]: V}`) has no hash in the map rep — report that directly (with the
@@ -36310,6 +36552,25 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
   // lambda never runs. A PARAMETER of that name is untouched — it is never a callee.
   checkNotEmitterIntrinsic(n.letName, ix)
   declare(n.letName, bound)
+  // D1048's second hint: mark this binding when the type it got came from a spelling
+  // that COLLAPSED a subsumed literal arm. Two routes reach it, and the second is why a
+  // mark is needed at all — `const r = f(false)` writes no annotation, so the collapse
+  // is two hops away (in `f`'s declared return, in `type R`'s spelling) and nothing in
+  // `r`'s own type remembers it. A bare CALL initializer is the whole rung, deliberately:
+  // it is the shape the ruling's example has, and every longer chain (through a field, a
+  // list element, a second binding) would need a taint the checker does not carry.
+  if annotCollapsedHere {
+    markCollapsedBinding(n.letName)
+  } else if n.letType < 0 && n.letInit >= 0 {
+    const cInit = P.nodes[n.letInit]
+    if cInit is Call {
+      const cFn = P.nodes[cInit.callFn]
+      if cFn is Ident {
+        const cDecl = fnDeclIx[cFn.identName] ?? lookupFnDeclNode(cFn.identName)
+        if fnRetCollapsed(cDecl) { markCollapsedBinding(n.letName) }
+      }
+    }
+  }
   // `const f = addT` — record which DECLARATION this binding aliases, for deferred-constraint
   // ownership alone (`fnAliasScopes`' header). A bare Ident initializer that names a declared
   // function is the whole rung: anything else (a lambda, a call result, a field read) leaves
@@ -38081,9 +38342,47 @@ function checkIsExprNode(n: IsExpr, ix: i32) {
           ix,
         )
       }
+    } else {
+      recordCollapsedIsAt(n, ix, objTy, chkTy)
     }
   }
   return TY_BOOL
+}
+
+// D1048's SECOND HINT — `is <literal>` over an operand whose union COLLAPSED.
+//
+// The ruling made `string | "err"` the type `string`, which is right (a union is a set of
+// values and `"err"` adds none) and costs the author the discrimination they thought they
+// had written: `r is "err"` no longer asks a tag, it asks `r == "err"`, and a `string`
+// that happens to read "err" answers yes. The first hint fires at the SPELLING that
+// collapsed — the redundant-annotation one, for free, since the annotation now says
+// nothing. This is the second, at the `is` DOWNSTREAM of it, which is where the loss bites
+// and where the author is looking when they wonder why the branch fired.
+//
+// IT ASKS THE PROVENANCE, NEVER THE TYPE. After the collapse the operand IS a `string` —
+// same arena index, same canon spelling as any other — so a rule reading the type would
+// fire on every legitimate `s is "err"` in the language. `bindingCollapsed` answers from
+// the marks the collapse itself recorded.
+//
+// NO HINT AT A GENERIC INSTANTIATION, per the ruling: `orErr<T>(): T | "err"` at
+// `T = string` collapses on the SUBSTITUTION route (`substTyDeep`), which banks nothing —
+// the caller did not write the union and the author cannot avoid it, so a hint there names
+// a problem with no addressee. That decline is structural, not a special case: the
+// substitution route is simply not one of the two that mark.
+//
+// A LITERAL CHECK TYPE ONLY. `is null`, `is Circle`, `is i32` are all still real tests on
+// a collapsed operand (or already refused above); the value-compare degeneracy belongs to
+// the literal spelling alone, which is the arm the collapse dropped.
+function recordCollapsedIsAt(n: IsExpr, ix: i32, objTy: i32, chkTy: i32) {
+  if collBindName.length == 0 { return 0 }
+  if chkTy < 0 || objTy < 0 { return 0 }
+  const ct = T.tys[chkTy]
+  if !(ct is TyLit) { return 0 }
+  const on = P.nodes[n.isObj]
+  if !(on is Ident) { return 0 }
+  if !bindingCollapsed(on.identName) { return 0 }
+  recordCollapsedIs(ix, on.identName, objTy, n.isVariant)
+  0
 }
 // ── optional member `o?.field` ─────────────────────────────────────────────
 // Null-safe access: a NULLABLE receiver reads the field off its inner type and
