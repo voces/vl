@@ -37294,7 +37294,7 @@ Repro (runs today and must keep running — the struct-table half of the same sh
 
 ### D1230 — a UFCS method whose free function is EXPORTED but not IMPORTED reports `no field 'toEqual' on Expectation<i32>`, naming the receiver instead of the missing import
 
-**loud check reject with a MISLEADING message · the program is genuinely illegal, so this is a DIAGNOSTIC defect, not a clause-1 or clause-2 violation · hit by the OWNER on 2026-09-02 against `~/glean`, and initially mis-diagnosed by two sessions as a stale `dist/vl` seed**
+**loud check reject with a MISLEADING message · the program is genuinely illegal, so this is a DIAGNOSTIC defect, not a clause-1 or clause-2 violation · found 2026-09-02 while investigating an owner incident that turned out to be a DIFFERENT defect with the SAME sentence — see the provenance correction below**
 
 Repro (`vl test t.test.vl` — fails; adding `toEqual` to the import list makes it pass):
 
@@ -37318,12 +37318,23 @@ Repro (`vl test t.test.vl` — fails; adding `toEqual` to the import list makes 
   which is what rules out the defaulted-tail-argument family ([D1044](#d1044), closed) — this
   is scope, not arity.
 
-* **NOT A STALE ARTEFACT, and the mis-diagnosis is worth recording.** Two sessions read it as
-  `dist/vl`'s embedded seed lagging behind post-#2386 std. It reproduces identically on a
-  freshly built `dist/vl` with the current seed embedded, and on the worktree host with
-  `VL_STD` pinned. The four-artefact staleness trap is real and this was not it — **the
-  cheapest disproof is to reproduce on a binary you just built**, which takes one command and
-  was not run before the diagnosis was shared.
+* **PROVENANCE CORRECTED — I FILED THIS ROW OFF A PARAPHRASED WITNESS, and the owner's actual
+  incident was something else.** The owner's file `~/glean/smoke.test.vl` DOES import
+  `toEqual`; its failure was the STALE EMBEDDED SEED in `dist/vl` (09:34, predating #2386's
+  std change), and it passes on any current seed. I wrote my own four-line smoke test to
+  reproduce it, left one import out, hit the same sentence, and concluded the seed diagnosis
+  was wrong. **It was not wrong. I ran a different program.**
+
+  Two mechanisms print `no field 'toEqual' on Expectation<i32>`: an old seed against new std,
+  and a genuinely missing import. This row is the second one and stands on its own; the
+  owner's incident is the first. Measured on the owner's VERBATIM file, one variable per row:
+  old seed + current std → FAIL; seed 278e0379 + current std → passes; and the same file with
+  `toEqual` removed from the import list → FAIL on every seed.
+
+  **This is CLAUDE.md's own two rules colliding**, and I broke both: *a retyped witness is a
+  different program*, and *a validator sentence is not a mechanism — do not group by message*.
+  The staleness trap is real enough to be the reflex hypothesis, which is exactly why the
+  disproof has to be run on the ORIGINAL program and not a reconstruction of it.
 
 * **THE FIX IS THE MESSAGE, and the ingredient is already at the site.** When a member call
   fails to resolve and a free `self`-function of that name is EXPORTED by a module this file
