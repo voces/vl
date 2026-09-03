@@ -41,18 +41,33 @@ VL="${VL:-scripts/vl-host/target/release/vl}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
+# THE COMMENT-BUDGET EXEMPTION. `comment-block-too-long` /
+# `comment-measurement-uncited` are `warning`s this tree still violates in bulk, so
+# they are held out of the `info` gate — but ONLY while
+# `scripts/comment-budget-baseline.json` still owes them. The allow-list is READ
+# FROM that file, so it empties itself the day a trim reaches zero; meanwhile
+# `scripts/comment-budget.py --check` blocks any file going UP. `vl check` has no
+# per-code gate, hence `--json` graded through the filter.
+lint_graded() { # <target> <json path>
+  local rc=0
+  "$VL" check "$1" --severity info --json > "$2" 2> "$2.err" || rc=$?
+  cat "$2.err"
+  if [ "$rc" -gt 1 ]; then cat "$2"; return "$rc"; fi
+  python3 scripts/comment-budget.py --filter-lint "$2"
+}
+
 # std/ goes first: it is near-instant AND its module load warms the seed's
 # `.cwasm` sidecar, so the parallel workers below all deserialize instead of
 # racing to Cranelift-compile (and write the same sidecar) at once.
 echo "== self-lint: std/ =="
-"$VL" check std/ --severity info
+lint_graded std/ "$WORK/std.json"
 
 # The compiler is a real module graph — lint it through its entry, so the
 # checker resolves `import`/`export` across the modules exactly as a build does.
 # Backgrounded across the fmt sweep: it shares no state with fmt (diagnostics
 # buffer to a log, replayed below, so output stays unscrambled).
 echo "== self-lint: the compiler module graph (concurrent with fmt) =="
-"$VL" check compiler/entry.vl --severity info > "$WORK/graph.log" 2>&1 &
+lint_graded compiler/entry.vl "$WORK/graph.json" > "$WORK/graph.log" 2>&1 &
 GRAPH_PID=$!
 
 # fmt gate: the source tree must be `vl fmt`-clean. `--check` exits non-zero on

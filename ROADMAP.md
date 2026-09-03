@@ -37,6 +37,40 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
 
 ## Next (highest leverage)
 
+### Modernization program (owner, 2026-09-02)
+
+Five items, in order. (0) is shipped; the rest are scheduled against it.
+
+- ✅ **0. Guard rails against comment sprawl** — DONE with this PR. The
+  `comment-block-too-long` (12 lines) and `comment-measurement-uncited` lint rules in
+  `compiler/lint.vl`, the per-file ratchet `scripts/comment-budget.py --check` (in
+  `gate.sh` and CI), the baseline `scripts/comment-budget-baseline.json`, and the
+  self-lint exemption that deletes itself when the baseline reaches zero. See CLAUDE.md,
+  "Comments state the invariant; measurements live in the inventory".
+- 🟡 **1. Per-file comment trim — PILOT DONE (#2413), the bulk remains.** `parser.vl`,
+  `format.vl` and `emit_sections.vl` are trimmed; `emit_classify.vl` (397 blocks over
+  budget), `typecheck.vl` (364) and `wasmEmit.vl` (180) are the weight. One PR per file:
+  move every census count, probe output and A/B table to its inventory row or a
+  `DECISIONS.md` section, cite the id from the comment, and lower the baseline in the same
+  PR. **Proof of safety: a byte-identical seed** — a comment-only change that moves one
+  byte of `build/vl-compiler.wasm` was not comment-only. The pilot's 40-line MODULE-HEADER
+  budget is now the rule's (owner ruling, 2026-09-02): the header is the first block with no
+  code before it, blank lines and the leading `import` region allowed, and the diagnostic
+  names which budget it applied. `parser.vl` and `format.vl` read zero.
+- ✅ **2. A position-matrix harness for capability briefs — DONE #2415.**
+  `scripts/capability-probes/matrix.py`; see the fuller row below, and CLAUDE.md's
+  "A CAPABILITY GAP HAS A POSITION MATRIX".
+- 🟡 **3. Split the inventory into one file per row — TOOLING SHIPPED (#2416), the split
+  lands on merge day.** See the fuller row below; `scripts/inventory/split.py --apply
+  --relink` against fresh master under an append freeze.
+- 🟡 **4. Key the union/variant registries by arena type id, and collapse the kind ladders —
+  DESIGN + a measured shim landed #2417.** Registries keyed by SPELLED names are why one union
+  has three construction sites that can disagree (see CLAUDE.md's "arena and canon are two
+  producers" and the union member-set ABI note). The remainder is the variant registry, the
+  rest of the union one, and replacing the per-resolver kind ladders with ONE storage-class
+  dispatch table.
+
+
 ### Ruled and sequenced (owner decisions already made, waiting only on order)
 
 - **Kill the ambient builtin `toString`; rename std:fmt's `toStr` → `toString` in its

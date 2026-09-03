@@ -1,7 +1,8 @@
 # Emitter section notes
 
 Long-form rationale and measurements moved out of `compiler/emit_sections.vl` by
-the 2026-09-02 comment trim (the 12-line comment-block budget). Each section is
+the 2026-09-02 comment trim (the comment-block budget: 12 lines a block, 40 a
+module header — `compiler/lint.vl`'s `comment-block-too-long`). Each section is
 the block's text as it stood in the file; the code keeps the invariant, the WHY,
 and a pointer here. Nothing in this file is graded by a gate — a claim that needs
 grading belongs in `silent-class-inventory.md` as a row with a repro.

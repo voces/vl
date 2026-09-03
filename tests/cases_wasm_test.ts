@@ -630,6 +630,16 @@ const readIsval = (exp: Exports): LintDiag[] => {
   return out;
 };
 
+// Comment-shape rules the CORPUS is exempt from. They police the hygiene of
+// source we maintain (`scripts/comment-budget.py` ratchets compiler/ + std/);
+// a case file's header is documentation OF the case, and hundreds carry a long
+// one. `tests/` is excluded from `lint-self.sh` for the same reason, and these
+// cases pin what the compiler says about a PROGRAM, not about our prose.
+const CORPUS_EXEMPT_CODES = new Set([
+  "comment-block-too-long",
+  "comment-measurement-uncited",
+]);
+
 /** Run the self-hosted lint pass over `src` and read its diagnostics. */
 const driveLint = (exp: Exports, src: string): LintDiag[] => {
   exp.modReset();
@@ -639,6 +649,8 @@ const driveLint = (exp: Exports, src: string): LintDiag[] => {
   const out: LintDiag[] = [];
   if (n < 0) return out; // a lex/parse error — lint needs a valid AST
   for (let i = 0; i < n; i++) {
+    const code = readString(exp.lintCodeLen(i), (j) => exp.lintCodeByte(i, j));
+    if (CORPUS_EXEMPT_CODES.has(code)) continue;
     out.push({
       sev: readString(exp.lintSevLen(i), (j) => exp.lintSevByte(i, j)),
       line: exp.lintLineAt(i),
