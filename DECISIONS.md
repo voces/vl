@@ -4855,6 +4855,25 @@ the same declaration in any program that compiles (this rule refuses the other c
 twin's use is this one's use, and where the name really is unused the LAST binding still
 reports it once. One mistake, one diagnostic, at the specifier the fix should delete.
 
+**AND THE NAME-KEYED UFCS FALLBACK IS GONE (D1191, 2026-09-02).** The rule above is about two
+imports binding one name; this is the same table's other end. The merge's plain→mangled alias
+map was keyed by NAME and global to the whole program, so a row banked by ANY module's
+`b.hidden()` answered every other module's `b.hidden()` — and an UN-EXPORTED `self`-function
+became callable from a file that never imported it, while the direct spelling `hidden(b)`
+stayed `undeclared identifier` two lines away. D1120 built the per-call-site table for the
+ambiguity case and left the fallback serving callers that should get nothing.
+
+Measured before deleting rather than guarded: with an instrumented seed counting every reader
+whose fallback CHANGED the answer, over `tests/cases` + `std/` (2,684 programs) and the
+compiler's own 26-module source through check AND emit, the member-call reader hit it **0
+times** and the generic-bound reader (`witnessOf`) **3 times, all in one file, on a name that
+file imports**. So the map is deleted and the merge's own per-module scope replaces it:
+`ufcsScope*`, one row per (module, plain name) the module binds to a `self`-function, walked
+out of the rename map `modBuildRename` already computes. `ufcsAliasAtSite` = the site's row
+else the CALLER's module scope; `witnessOf` = the PIN's. Nothing about UFCS is name-keyed
+across modules any more, which is what makes "a UFCS candidate must be in the caller's scope"
+a property of the resolver rather than of which module the walk visited first.
+
 ## An else-less `if` used as a VALUE is `T | null` in every position (owner, 2026-09-02) — D1086, BUILT
 
 **Ruling.** An `if` expression with no `else` has the value of its arm when the condition

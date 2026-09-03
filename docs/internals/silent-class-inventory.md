@@ -38616,3 +38616,97 @@ Ablation:
 * **AND A BARE `{ … }` BLOCK INSIDE A FUNCTION IS ITS OWN REFUSAL**, found while ablating the
   block kinds: `emitProgram: unsupported statement in body`, `vl check` rc 0, on a function
   body containing nothing but `{ const p: P = { x: 7 } … }`. Unfiled, and not this row.
+
+### D1191 — a name-keyed UFCS alias LEAKS across modules: an un-exported `self`-function becomes callable from a module that never imported it, while the direct spelling stays `undeclared identifier`
+
+**now a loud check reject, and that is the whole intent — the program was always illegal ·
+CLASS: a soundness hole in NAME RESOLUTION, not a lowering gap · CLOSED 2026-09-02 · closes
+the leak [D1230](#d1230) named and declined to fix, and completes
+[D1120](#d1120)'s per-call-site table · ruling: DECISIONS.md §"UFCS is never implicit"**
+
+Repro (check rc 1 — before this row, rc 0 printing `42`):
+
+    // file: lib.vl
+    export type Box = { v: i32 }
+    function hidden(self: Box): i32 { self.v * 2 }
+    export function mk(v: i32): Box { const b: Box = { v: v }; b.hidden(); b }
+    // file: entry.vl
+    import { mk, Box } from "./lib"
+    const b: Box = mk(21)
+    print(b.hidden())
+
+* **THE MECHANISM, OFF THE RUNG'S INPUT.** An instrumented seed printing what each UFCS
+  reader is handed, on the repro above (`site` = the per-call-site row, `nameKeyed` = the
+  plain-name map, lengths defeat the diagnostic demangler):
+
+      entry's b.hidden()  ix=36  site=[/0]        nameKeyed=[hidden/9]  lookup=43
+      lib's   b.hidden()  ix=22  site=[hidden/9]  nameKeyed=[hidden/9]  lookup=43
+
+  Lib's own call banked `hidden → hidden$m1` under the PLAIN name. The entry's call has no
+  per-site row (`modSelfFnTarget` resolves `prop` through the caller's rename map and the
+  entry's map has no `hidden`), so `ufcsAliasAtSite` fell through to `ufcsAliasOf`, which is
+  keyed by the plain name and global to the merge. `lookup` then found lib's function.
+
+* **THE ABLATION — the bank is the ingredient, not the un-exported declaration.** One change
+  per row, everything else the repro above:
+
+  | change | before | after |
+  | --- | --- | --- |
+  | as filed | **runs, 42** | check reject `no field 'hidden' on Box` |
+  | lib calls `hidden(b)` DIRECTLY instead of `b.hidden()` | check reject | check reject |
+  | lib never mentions `hidden` at all | check reject | check reject |
+  | the entry writes `mk(21).hidden()` (no binding) | **runs, 42** | check reject |
+  | a THIRD module borrows it; the entry never spells `hidden` | **runs, 42** | check reject |
+  | a generic bound `<T: { hidden(): string }>` pinned at `Box` | **runs, H** | `Box does not satisfy` |
+  | `hidden` EXPORTED and imported | runs | runs |
+  | `hidden` EXPORTED, not imported | `ufcs-not-imported` | `ufcs-not-imported` |
+  | the entry spells the DIRECT call `hidden(b)` | `undeclared identifier` | `undeclared identifier` |
+
+  So the leak needs a UFCS member call SOMEWHERE in the merged program spelling that name —
+  and needs it nowhere near the caller it serves. Rows 4 and 5 of the table are why D1230's
+  own fixture calls `hidden` directly and says so: its control would otherwise have measured
+  this instead.
+
+* **A MESSAGE-KEYED COUNT WOULD HAVE MISSED THE SECOND READER.** `witnessOf` — the generic
+  bound's satisfaction test — read the same plain-name map, from a PIN rather than a call,
+  and reported a witness naming a function the pin's file cannot spell. It shares no sentence
+  with the member-call arm and would not have been found by grouping the refusal texts; it
+  was found by counting, with an instrumented compiler, every reader whose fallback CHANGED
+  the answer. Over `tests/cases` + `std/` (2,684 programs) and the compiler's own 26-module
+  source through check AND emit: **`ufcsAliasAtSite` 0 hits, `witnessOf` 3 hits, all three in
+  one file** (`tests/cases/constraints/bound-std-fmt-tostring.vl`, `toString → toString$m1`,
+  a name that file imports). Nothing legitimate reached the member-call fallback, so it is
+  deleted rather than guarded; the one legitimate reader is scope-checked instead.
+
+* **THE RULE THAT REPLACES IT IS THE DIRECT CALL'S RULE.** `hidden(b)` is `undeclared
+  identifier 'hidden'` because the merge rewrites only the names a module BINDS and leaves
+  the rest alone. UFCS now answers from the same fact: `ufcsScope*` holds one row per
+  (module, plain name) that module binds to a `self`-function, built in `modBankUfcsScope`
+  by walking the rename map `modBuildRename` already computes — declarations first, then
+  each import local, alias included. `ufcsModBound` maps a node back to its module (each
+  module's `Program` root is minted last, so the roots ascend and bound the arena in walk
+  order). `ufcsAliasAtSite` = the site's own row (D1120), else the CALLER's module scope;
+  `witnessOf` = the PIN's module scope, which is what its own refusal already claimed
+  ("a `tag(self: Box, …)` function in scope at this call"). `ufcsAliasOf` and the
+  `ufcsAliasFrom`/`ufcsAliasTo` arrays are gone.
+
+* **A NOT-RUNS → RUNS FELL OUT, AND IT IS THE SAME MISTAKE ONE LEVEL DOWN.**
+  `modSelfFnTarget` asks `modRenamed(prop)`, which consults the lexical SHADOW stack — so a
+  `const shown = 5` in the calling function made an IMPORTED `b.shown()` resolve to nothing
+  and the file was refused `'shown' is not imported`, naming an import on its own first
+  line. A property is not a value reference (the merge's own `Member` arm says so: "the
+  property is a field label, never a top-level binding"), and module scope has no shadow
+  stack, so both spellings now coexist. Pinned by
+  `tests/cases/modules/ufcs-import-shadowed-local/`.
+
+* **UN-EXPORTED IS NOT OFFERED BY D1230's SENTENCE, RE-GRADED HERE.** The leak's diagnostic
+  is the plain `no field 'hidden' on Box`, not `ufcs-not-imported`: `modNoteUfcsImportCand`
+  gates on the token scan's export set, so a suggestion is never written for a name no
+  import could reach. The three exported/imported cells above are unmoved.
+
+* **INSTRUMENTS.** Native fixpoint holds byte-for-byte (`compile(seed) == seed`, 1,809,757 B)
+  at both bootstrap levels under `timeout 300` (L1 46 s, L2 46 s); `regress.py` moves **0 of
+  255,504** census cells in any direction, so there is no price to name and nothing to add to
+  `named/`. Fixtures: `tests/cases/modules/ufcs-unexported-not-callable/` (the repro),
+  `ufcs-unexported-third-module/` (the entry spells nothing), `ufcs-unexported-bound-witness/`
+  (the `witnessOf` reader), `ufcs-import-shadowed-local/` (the runs-gained cell).

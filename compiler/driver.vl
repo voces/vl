@@ -100,10 +100,11 @@ import {
   tsText,
   tsToName,
   udTsRootAt,
-  ufcsAliasAdd,
   ufcsAliasReset,
   ufcsImpAdd,
   ufcsImpReset,
+  ufcsModBoundAdd,
+  ufcsScopeAdd,
   ufcsSiteAdd,
 } from "./ast"
 // `isStmtKeyword` is the PARSER's import-clause bound, shared rather than
@@ -498,6 +499,11 @@ let modLoadMod: i32[] = []
 // decides the diagnostic TEXT and which import a reference resolves to, so each
 // reader keeps its own view rather than being quietly normalized onto the other's.
 let modRenameTo: string[] = []
+// The `from` keys, parallel to `modRenameTo`. The sid views index BY name and
+// cannot be walked back to the spellings, and D1191's per-module UFCS scope is
+// exactly a walk of this map: every row whose TARGET is a registered
+// `self`-function is a plain name this module binds to one.
+let modRenameFrom: string[] = []
 let modRenameFirstBySid: i32[] = []
 let modRenameLastBySid: i32[] = []
 let modShadow: string[] = []
@@ -3226,6 +3232,11 @@ function modCompile(emit: i32): i32 {
   let o2 = 0
   while o2 < modOrder.length {
     modBuildRename(modOrder[o2], roots[o2])
+    // D1191 — the module's own UFCS SCOPE, and its arena boundary. Both are read
+    // where a UFCS name is resolved away from a banked call site, so a candidate
+    // is one the CALLER binds rather than one any module happened to bank.
+    modBankUfcsScope(modOrder[o2])
+    ufcsModBoundAdd(modOrder[o2], roots[o2])
     modShadow = []
     modTyShadow = []
     modRwStmt(roots[o2])
@@ -3438,6 +3449,7 @@ function modCheckDupBindings(m: i32, root: i32): i32 {
 function modRenamePush(from: string, to: string): i32 {
   const row = modRenameTo.length
   modRenameTo.push(to)
+  modRenameFrom.push(from)
   const s = sidOf(from)
   if sidArrGet(modRenameFirstBySid, s) < 0 {
     sidArrPut(modRenameFirstBySid, s, row)
@@ -3447,6 +3459,7 @@ function modRenamePush(from: string, to: string): i32 {
 }
 function modBuildRename(m: i32, root: i32): i32 {
   modRenameTo = []
+  modRenameFrom = []
   modRenameFirstBySid = []
   modRenameLastBySid = []
   const impLocals: string[] = []
@@ -3638,6 +3651,32 @@ function modSelfFnTarget(prop: string, argc: i32): string {
     i = i + 1
   }
   ""
+}
+// Is `name` a merged top-level `self`-function? The arity-free half of
+// `modSelfFnTarget`, asked of a rename TARGET rather than of a call.
+function modSelfFnDeclared(name: string): boolean {
+  let i = 0
+  while i < modSelfFnName.length {
+    if modSelfFnName[i] == name { return true }
+    i = i + 1
+  }
+  false
+}
+// D1191 — MODULE `m`'s UFCS SCOPE, from the rename map that is already live for it.
+// Every row is a name `m` binds (its own top-level declarations, then each import
+// local, alias included), so the rows whose TARGET is a `self`-function are exactly
+// the plain names `m` may dispatch `x.name(…)` against. No arity filter: the reader
+// that needs one (`witnessOf`) compares whole function types, and a wrong arity is
+// its refusal to make, not this table's.
+function modBankUfcsScope(m: i32): i32 {
+  let i = 0
+  while i < modRenameFrom.length {
+    if modSelfFnDeclared(modRenameTo[i]) {
+      ufcsScopeAdd(m, modRenameFrom[i], modRenameTo[i])
+    }
+    i = i + 1
+  }
+  0
 }
 // A VALUE reference: shadowed locals win, then the rename map, else unchanged.
 //
@@ -4079,17 +4118,17 @@ function modRwExpr(ix: i32): i32 {
     // plain→mangled alias so the checker's/emitter's UFCS resolution (which runs
     // AFTER the field check, with the plain `prop`) can find the mangled function.
     //
-    // D1120 — AND THE ANSWER IS BANKED ON THIS NODE, not only under the plain name.
+    // D1120 — AND THE ANSWER IS BANKED ON THIS NODE, not under the plain name.
     // `modSelfFnTarget` resolves `prop` through the LIVE module's rename map, so it
-    // is already this call site's own answer; the flat name-keyed table is what lost
-    // it when a second merged module exports a self-function of the same name.
+    // is already this call site's own answer; a flat name-keyed table lost it when a
+    // second merged module exported a self-function of the same name, and D1191
+    // showed it also ANSWERED a module that binds no such name at all. A site whose
+    // `prop` resolves to nothing here banks nothing and falls to this module's own
+    // `ufcsScope` rows, which say the same thing about scope without the arity test.
     const cf = P.nodes[n.callFn]
     if cf is Member {
       const target = modSelfFnTarget(cf.memProp, n.callArgs.length)
-      if target != "" {
-        ufcsAliasAdd(cf.memProp, target)
-        ufcsSiteAdd(ix, target)
-      }
+      if target != "" { ufcsSiteAdd(ix, target) }
     }
     modRwExpr(n.callFn)
     let i = 0
