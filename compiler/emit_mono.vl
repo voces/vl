@@ -16,6 +16,7 @@ import {
   nameIsBraceSpanEnds,
   nameIsParenOpen,
   nameIsParenSpanEnds,
+  splitUnionAtoms,
 } from "./tyname"
 import {
   T,
@@ -23,6 +24,7 @@ import {
   TyFunc,
   TyObj,
   bindGenWalk,
+  canonEmitName,
   flatConstOfNameProp,
   i32TyIx,
   inferRetNameOf,
@@ -219,10 +221,12 @@ import {
 import {
   anonLeafCarryParamMark,
   anonLeafCarryRetMark,
+  assignTags,
   buildFnMap,
   collectA,
   computeRetInference,
   computeVoidFns,
+  registerInlineUnion,
 } from "./emit_collect"
 
 // ── Per-callsite monomorphization (host: toWasm.ts `instantiate`) ────────────
@@ -3498,6 +3502,62 @@ function monoAnonPinDiscrim(pin: string, tyIx: i32): string {
   "=" + rendered
 }
 
+// D1042 — THE EMITTER-VOCABULARY SPELLING of a name `monoSubstAnn` produced, for the ONE
+// shape where the two can disagree: a UNION.
+//
+// `monoSubstAnn` is a STRING substitution into the DECLARED annotation text, so its result
+// carries whatever the source wrote — a literal member stays a literal (`T | "err"` at
+// `T := i32` → `i32|"err"`). Every other producer of a union key in the emitter has been
+// through `canonEmitTypeNames`, which at `RC_ROOT` softens a literal member to its base
+// scalar, so the direct spelling of that same union is keyed `i32|string`. `canonEmitName`
+// is exactly that rewrite applied to a whole render, and it is what `collectTyReachRegister`
+// already uses to make an ARENA-derived key equal the NAME walk's key (`arenaEmitName`) —
+// the same problem, one producer over.
+//
+// GATED ON BEING A UNION, and the gate is what keeps every other pin byte-identical.
+// `splitUnionAtoms` stops at a top-level `=>`, so a function-type return (`(i32) => A|B`) is
+// ONE atom and passes through untouched; a bare `T` pin, an array pin, a struct pin and a
+// generic application all split to one atom too. Only a genuine top-level union is re-rendered.
+function monoPinUnionName(rs: string): string {
+  const atoms: string[] = []
+  splitUnionAtoms(rs, atoms)
+  if atoms.length < 2 { return rs }
+  const c = canonEmitName(rs)
+  if c == "" { return rs }
+  c
+}
+
+// D1042 — REGISTER a union that exists only because a generic was PINNED here.
+//
+// The union registry is minted by `collectU`, which the pass table orders BEFORE
+// `monomorphize` ("collectU > collectTyParams", "monomorphize > … scanArrLitCommit"), and
+// nothing re-runs it afterwards — `collectA#2` rescans annotations for shapes, not for
+// unions. So a `T | E` return at a concrete `T` had no row under EITHER spelling and every
+// consumer of the box (the atom test, the `is` tag, the coerce ladder) hit its loud floor.
+//
+// `registerInlineUnion` self-gates on `isUName`, so a union any earlier producer already
+// registered — a named alias, a direct annotation, an inferred return — is a no-op and this
+// costs the program nothing. That gating is also what keeps ONE row per union: the tags a
+// box carries are the row's, positionally, so reusing an existing row is not an optimisation
+// but the correctness condition.
+//
+// AND THE TAGS ARE RE-RANKED WHEN, AND ONLY WHEN, A VARIANT LANDED. `assignTags` ranks
+// every variant GLOBALLY by structural signature, so a struct-armed union registered after
+// it ran would own variant rows with no tag (`uTags` short of `uVariants`). A VALUE union
+// (`i32|string`) pushes no variant and leaves the ranking untouched, which is why the
+// re-rank is conditional rather than unconditional: re-ranking on every pin would make the
+// pass quadratic in the number of instances for nothing.
+function monoRegisterPinUnion(name: string) {
+  const atoms: string[] = []
+  splitUnionAtoms(name, atoms)
+  if atoms.length < 2 { return 0 }
+  if isUName(name) { return 0 }
+  const before = uVariants.length
+  if registerInlineUnion(monoProgStmts, name) < 0 { return -1 }
+  if uVariants.length != before { return assignTags() }
+  0
+}
+
 function monoMakeInstance(
   origFe: i32,
   pinned: string[],
@@ -3882,7 +3942,26 @@ function monoMakeInstance(
             }
           }
         }
-        nret = synthTypeRefTy(rs, -1, retTy)
+        // D1042 — A UNION THE PIN MINTS IS SPELLED, AND REGISTERED, THE WAY THE DIRECT
+        // SPELLING IS. `rs` is `monoSubstAnn`'s render, which substitutes the type
+        // parameter's BOUND NAME into the DECLARED annotation text — so `T | "err"` at
+        // `T := i32` arrives here as `i32|"err"`, the literal member verbatim. Every
+        // other producer of that union's key has been through `canonEmitTypeNames`,
+        // which softens a literal member to its base scalar at `RC_ROOT`
+        // (`canonEmitNameAt`'s `litMemberTy` arm), and so spells it `i32|string`. Two
+        // spellings of ONE union is the whole of this row's second ingredient: adding a
+        // direct `function f(bad: boolean): i32 | "err"` to the same module registered
+        // `i32|string` and the clone still asked for `i32|"err"`.
+        const rsC = monoPinUnionName(rs)
+        nret = synthTypeRefTy(rsC, -1, retTy)
+        // And REGISTER it: `collectU` — the only pass that mints union rows — runs
+        // BEFORE `monomorphize`, so a union that exists only because a generic was
+        // pinned has no row at all (`unionRowOf` is -1 for both spellings, this row's
+        // first ingredient). Registering under the canon'd key REUSES the row a direct
+        // spelling already minted rather than adding a second one: a union's box tags
+        // are POSITIONAL over its member set, so two rows for one type is a value boxed
+        // under one tag slice and read under the other.
+        if monoRegisterPinUnion(rsC) < 0 { return -1 }
       }
     }
     // An UN-ANNOTATED return whose return expression is a value-call THROUGH a

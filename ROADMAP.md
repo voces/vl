@@ -229,8 +229,14 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   literal widens to a DUPLICATE `string` atom); then the two hints. Grade on D1024's spelling
   table (`return`, parameter, alias, `Json | "err"`, `Kind | string`, module-scope binding)
   and on `is "err"` answering as `==` at each. The generic-instantiation refusal that shared
-  D1024's table (`orErr<T>(): T | "err"` at `T = i32` → `no recorded members`) is NOT this
-  item: it is about mono-minted unions, struct arm or literal alike — **D1042**.
+  D1024's table (`orErr<T>(): T | "err"` at `T = i32` → `no recorded members`) was NOT this
+  item — it is about mono-minted unions, struct arm or literal alike — and it has since
+  CLOSED as **D1042**: the pin registers its union through `canonEmitName`, so the clone and
+  the direct spelling meet on ONE row. Closing it exposed **D1193** (a literal `is` narrowed
+  neither branch, so every position that READ the value rather than printing it was
+  check-clean invalid wasm at the direct spelling too), which shipped with it. The residue is
+  **D1194**: an inferred return that takes its union from a callee's declared `i32 | "err"`
+  is still a loud check reject conceding codegen.
   DECISIONS.md §"A subsumed literal arm COLLAPSES". Compiler-side; compile-goal surface.
 - **`is A` over same-shape struct arms is a DISCRIMINANT-VALUE test — RULED (owner,
   2026-09-02), DONE (#2365).** `type Circle = { kind: "circle", r: f64 }` /
