@@ -26107,6 +26107,45 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
           // emitter, shared with the dispatch, so the two cannot drift about which reps a
           // value-typed `if` can carry.
           const nfCode = sFieldTypeAt(nsi, nfi)
+          // A NESTED-STRUCT field (code 15) spells its `if` result from the field's own
+          // TARGET ROW, which `fbIfForSharedField` cannot give from a code alone (D1170).
+          // TWO NULL TESTS, NOT ONE: a code-15 slot is `(ref null $S)` storage at BOTH
+          // declarations (D1180), and `o?.f ?? d` must yield `d` when the FIELD is null
+          // too — so the test is receiver-null OR field-null, short-circuited through an
+          // i32 `if` so `struct.get` never runs on a null receiver. On a declared `S` the
+          // second arm is constant-false and the answer is unchanged. The receiver is a
+          // re-readable place (`optRecvReReadable` above), so the three reads are
+          // effect-free, and the default is emitted ONCE.
+          if nfCode == 15 {
+            const ntg = sFieldTgtStructIdx(nsi, nfi)
+            if ntg < 0 {
+              return emitFail(
+                "emitProgram: `?.` over a nested-struct field names no struct row",
+              )
+            }
+            const nDefNul = coalesceDefaultNullable(e.binRight, fnIx)
+            if emitExpr(body, lhs.omObj, fnIx) < 0 { return -1 }
+            wU8(209) // 0xd1 ref.is_null — the receiver
+            fbIf(127)
+            ctrlEnter()
+            fbI32Const(1)
+            fbElse()
+            if emitExpr(body, lhs.omObj, fnIx) < 0 { return -1 }
+            fbStructGet(sHeapIdx[nsi], nfi)
+            wU8(209) // 0xd1 ref.is_null — the field slot
+            fbEnd()
+            ctrlLeave()
+            fbIfRefNul(sHeapIdx[ntg], nDefNul)
+            ctrlEnter()
+            if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
+            fbElse()
+            if emitExpr(body, lhs.omObj, fnIx) < 0 { return -1 }
+            fbStructGet(sHeapIdx[nsi], nfi)
+            if !nDefNul { fbRefAsNonNull() }
+            fbEnd()
+            ctrlLeave()
+            return 0
+          }
           if !optChainFieldCodeOk(nfCode) {
             return emitFail(
               "emitProgram: `?.` over a nullable struct has no `if` blocktype for this field's rep",
