@@ -4514,7 +4514,7 @@ the flattened/inline litunion family and blind to how the value got its string r
 **AND THE ALIAS DOES NOT GET A REP THE MODULE DOES NOT USE FOR IT**, which was this section's
 stated objection to the string direction. Only the FIELD moves. In the demoted pair's own
 module `K1` is still the atom at every parameter, list element and map value; the disassembly
-shows one shared `(struct (field (mut (ref $str))) (field (mut f64)))` beside a
+shows one shared `(struct (field (mut (ref <the string struct>))) (field (mut f64)))` beside a
 `(func (param i32) (result i32))` for `takesK(k: K1): K1`, with a real narrow tower between
 them. Measured over 144 ordered discriminant-spelling pairs: 42 -> 50 `runs`, 8 -> 0 emit
 refusals, no check refusal moved.
