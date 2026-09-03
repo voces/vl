@@ -5121,3 +5121,38 @@ so its byte count describes that compiler's codegen, not this one's. Measured at
 one commit, which is larger than the bar itself. So ci-native runs `--check` immediately after
 `--prove-fixpoint`, and that reading is the deciding one; `gate.sh`'s row grades whatever seed
 is on disk and is informational when the local seed is one rung short.
+
+## An unbounded `<T>` is an ENTIRELY OPEN HOLE, and its refusal is the hole's sentence (owner, 2026-09-03) — D1431, BUILT
+
+> VL's banner feature is inference. An explicit generic `T` should function the same as an
+> inferred generic (hole). If `T` is not clarified, it is treated as an entirely open hole.
+> The error message shouldn't be passive aggressive.
+
+Why this over the alternative that was live for two days — an unbounded `<T>` is STRICT and a
+member use demands a bound. That reading is defensible on its own terms (a generic body is
+checked once, so `x.n` needs a type the declaration supplies) and it is what the compiler did.
+It is wrong for VL because the language already answers the question for the OTHER spelling of
+the same generic: `function g(x) { x.tag() }` infers the demand, refuses a bad argument at the
+call, and compiles. Two spellings of one program giving different verdicts is not strictness,
+it is an inconsistency the author cannot predict — and the fix an author reaches for is
+deleting the `<T>`, which silently changes what the program means.
+
+**A bound stays strictly stronger, which is why the ruling costs OQ-5 nothing.** `<T: B>` is a
+PROMISE the body is held to: it uses only what B grants, its errors name a contract rather than
+a shape, and it documents the parameter. What changed is that not writing one is no longer a
+refusal — the parameter is then open, exactly as an un-annotated one is.
+
+**The message half is the part worth stating separately.** The refusal that had to go was not
+wrong, it was addressed to the wrong reader: *"`T` is a type parameter with no bound, and a
+parameter's members come from its bound. Declare one: `<T: { tag: … }>`"* explains a concept
+and prescribes an edit, to an author whose program was legal. What survives is the refusal an
+ARGUMENT earns — `argument 1: expected {tag: _}, got {r: f64}` — which states expected and got
+at the call and nothing else. The standing rule it makes concrete: **a diagnostic reports the
+disagreement it found; it does not teach the feature.**
+
+**Implementation note, because one part is not obvious.** The demand rides the deferred
+`memCstr` table rather than the hole-shape table. `holeShape*` is keyed by hole NAME, unique
+per parameter for an inference hole (`?g.0`) and NOT unique for a declared one — two functions
+may both spell theirs `T`, and a shared key would let one generic's demand refuse the other's
+calls. `docs/constraints-design.md` §7.7 is the record.
+
