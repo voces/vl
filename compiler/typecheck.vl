@@ -11778,15 +11778,16 @@ function tyEmitNameIsString(ix: i32): boolean {
 // Bits rather than an enum because the rules these will state quantify over SETS of
 // positions ("preserved in a field, an element, a map value or a closure result"), which
 // is one `&` against a bit union.
-const RC_ROOT = 0      // a top-level render: no enclosing position at all
-const RC_UNION_MEM = 1 // a member of a union
-const RC_NULLABLE = 2  // under a nullable — see the STICKY note below
-const RC_FIELD = 4     // an object field's type
-const RC_ELEM = 8      // an array element's type
-const RC_MAP_KEY = 16  // a map key's type
-const RC_MAP_VAL = 32  // a map value's type
-const RC_FN_PARAM = 64 // a function type's parameter
-const RC_FN_RES = 128  // a function type's result
+const RC_ROOT = 0        // a top-level render: no enclosing position at all
+const RC_UNION_MEM = 1   // a member of a union
+const RC_NULLABLE = 2    // under a nullable — see the STICKY note below
+const RC_FIELD = 4       // an object field's type
+const RC_ELEM = 8        // an array element's type
+const RC_MAP_KEY = 16    // a map key's type
+const RC_MAP_VAL = 32    // a map value's type
+const RC_FN_PARAM = 64   // a function type's parameter
+const RC_FN_RES = 128    // a function type's result
+const RC_UNION_KEY = 256 // a member of a union being spelled as the registry KEY
 
 // `RC_NULLABLE` IS STICKY ACROSS A UNION JOIN, AND IT HAS TO BE, BECAUSE THE TWO
 // SPELLINGS PUT THE NULLABLE AT DIFFERENT DEPTHS. Structurally `A | B | null` is a
@@ -12675,8 +12676,16 @@ function tyToNominalNameGo(ix: i32, ctx: i32): string {
   // expands to a `TyObj`/`TyUnion` whose structural render is exactly the expansion this
   // renderer exists to avoid producing. Declines ("") for an uninstantiated or cyclic
   // argument, so every shape that had no nominal route before still takes its old one.
-  const gan = genAppNameOfTy(ix)
-  if gan != "" { return gan }
+  // …NOT AT `RC_UNION_KEY`, where canon does the opposite. A generic APPLICATION standing
+  // as a union MEMBER is spelled by its SHAPE on the annotation side (canon's
+  // `unionMemberGenAppShape`), so the registry row for `type U = Box<i32> | Tag` records
+  // `{v:i32}|Tag`. Taking the nominal name at that ONE position would mint a key no row
+  // holds; nested deeper (`{v: Pair<i32,string>[]}`) canon keeps the application, and the
+  // bit does not propagate, so the recursion below is unchanged.
+  if (ctx & RC_UNION_KEY) == 0 {
+    const gan = genAppNameOfTy(ix)
+    if gan != "" { return gan }
+  }
   const udn = unionAliasDeclNameOfTy(ix)
   if udn != "" {
     // …EXCEPT a declared alias for a NUMERIC literal union (`type Z = 0 | 1`, the
@@ -15849,6 +15858,89 @@ export function canonUnionKeyOfName(name: string): i32 {
 export function canonUnionKey(ty: i32): i32 {
   if ty < 0 { return -1 }
   canonUnionKeyOfName(tyToEmitName(ty))
+}
+
+// ONE MEMBER of the key's sequence, spelled the way the DECLARATION spelled it — the
+// NAME-FAITHFUL renderer at the key's own position, never the structural one. A declared
+// struct comes back `Circle`, not `{r:i32}`; a declared union alias comes back by its
+// alias name, which `canonUnionKeyText` then expands exactly as the row's producer did.
+//
+// A FUNCTION member is PARENTHESIZED, the annotation's own atom spelling: bare, the
+// closure's result arms swallow the union's siblings (`()=>f32|null|{w:i32}`) and the
+// atom split reads a different sequence — the same grouping `tyToEmitNameGo`'s union arm
+// applies, at the one position this renderer joins.
+function canonUnionKeyAtomOfTy(m: i32): string {
+  if m < 0 { return "" }
+  // The cycle bank is per top-level render (`tyToNominalName`'s contract), and this is a
+  // top-level render — the entry that resets it is bypassed to pass the position bit.
+  nomNameCycle = false
+  const s = tyToNominalNameAt(m, RC_UNION_KEY)
+  if s == "" { return "" }
+  const t = T.tys[m]
+  if t is TyFunc { return "(" + s + ")" }
+  s
+}
+
+// The member SEQUENCE of an ARENA TYPE, in the registry's ABI order — `canonUnionKeyText`'s
+// arena-side twin, and the producer §5 step 4a owed. NOT deduped and NOT reordered, exactly
+// as the text side: a union's box tags are positional over this sequence.
+//
+// THE NULL-FOLD IS UNWRAPPED WITH `null` FIRST. Pass 0b folds `type J = null | A | B` into a
+// ONE-member `TyUnion` holding a `TyNullable`, so the members the row records are one level
+// down and the declaration's leading `null` is not a member at all. Renders 24 more of the
+// corpus's rows than leaving the fold alone; the residue it cannot reach is a `null` the
+// declaration put in the MIDDLE, which the fold does not record (the miss table in
+// `docs/internals/registry-by-type-id.md` §5).
+function canonUnionKeyTextOfTy(ty: i32): string {
+  if ty < 0 { return "" }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    const ms = t.uMembers
+    if ms.length == 0 { return "" }
+    if ms.length == 1 {
+      const mt = T.tys[ms[0]]
+      if mt is TyNullable {
+        let inr = canonUnionKeyTextOfTy(mt.nInner)
+        if inr == "" { inr = canonUnionKeyAtomOfTy(mt.nInner) }
+        if inr != "" { return "null|" + inr }
+      }
+    }
+    let out = ""
+    let i = 0
+    while i < ms.length {
+      const a = canonUnionKeyAtomOfTy(ms[i])
+      if a == "" { return "" }
+      if i > 0 { out = out + "|" }
+      out = out + a
+      i = i + 1
+    }
+    return out
+  }
+  if t is TyNullable {
+    // A nullable UNION contributes its own members before the `null` arm; a nullable
+    // SCALAR (`i32|null`) is one ATOM plus it, and reaching only the first left the
+    // whole nullable-scalar family of rows unrendered (the miss table, §5).
+    let inr = canonUnionKeyTextOfTy(t.nInner)
+    if inr == "" { inr = canonUnionKeyAtomOfTy(t.nInner) }
+    if inr == "" { return "" }
+    return inr + "|null"
+  }
+  ""
+}
+
+// THE KEY FOR AN ARENA TYPE, obtained rather than rendered — the route a querier holding
+// only a type takes to the row a producer minted from a spelling. `canonUnionKey` above
+// goes through `tyToEmitName`, which renders STRUCTURALLY and reaches barely half the
+// registry's rows; this one is the producer that closes that gap, graded row by row by
+// `unKeySweepRow` and tabled in `docs/internals/registry-by-type-id.md` §5.
+//
+// -1 when `ty` is not a union shape at all — a DIFFERENT answer from a key, counted apart,
+// because a coverage hole that reads as a disagreement is how step 5 picks the wrong row.
+// NO READER YET (§5 step 4a): the sweep grades it, and step 5 is what switches the seams.
+export function canonUnionKeyOfTy(ty: i32): i32 {
+  const text = canonUnionKeyTextOfTy(ty)
+  if text.length == 0 { return -1 }
+  canonUnionKeyOfName(text)
 }
 
 // The same rewrite, told the POSITION the name occupies in the annotation around it,

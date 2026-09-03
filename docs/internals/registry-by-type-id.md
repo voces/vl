@@ -152,7 +152,8 @@ Byte-identical until step 5; steps 1-2 are this PR.
 | 1 | `unionRowOfTy` / `unionRowOfTyRaw` shims + `unionRowOfAB` / `isUNameAB` seams, OFF by default | none | corpus `cmp` per module | **SHIPPED** |
 | 2 | convert the ID-FREE + NODE-IN-SCOPE sites to the seam, still returning the NAME answer | none | agreement counters ≥ 99.9%, `id-only` inspected one by one | **SHIPPED — and the counter REFUSED the ≥ 99.9% premise** |
 | 3 | mint `canonUnionKey` in canon; push `unKey` at all three registry mint sites; **no reader** | none | `unKey` coverage %, and a sweep asserting no two rows with different member SETS share a key | **SHIPPED — 100% covered, 0 different-set merges** |
-| 4 | thread the key into `registerInlineUnion`'s 11 recursive sites — the real work | `emit_collect.vl` | per-site liveness + disagreement, one build per site (B87) | + the ARENA route, below |
+| 4a | the ARENA-side member-sequence renderer, so `canonUnionKeyOfTy` reaches the row's key | none | agreement per row against `unKey`, every miss categorised | **SHIPPED — 1,369 → 2,422 of 2,447 (55.9% → 98.98%)** |
+| 4b | thread the key into `registerInlineUnion`'s 11 recursive sites — the real work | `emit_collect.vl` | per-site liveness + disagreement, one build per site (B87) | blocked on nothing; the freeze is the cost |
 | 5 | **the switch**: seams return the id answer; retire `unNames`-scanning readers | `emit_classify.vl` + `emit_collect.vl`, one PR | rep-fuzz, fixpoint, corpus run-diff, the ABI assertion from step 3 | blocked on 4 |
 | 6 | retire `unMemberSet` as a KEY (it stays as a rendering) | `emit_state.vl` | — | |
 
@@ -224,7 +225,7 @@ The two §2 witnesses grade as the design predicted: `flat.vl`'s `U = J \| E` an
 flattening `V` get **one key** (`repCanonId` splits them — this is #2406-d2), and `merge.vl`'s
 `SA`/`SB` share a key but also share a member set, so the merge is one of §2's benign 297.
 
-**The arena route's 44% miss is step 4's first job, and it is §2's own mechanism.**
+**The arena route's 44% miss was step 4a's job, and it is §2's own mechanism.**
 `tyToEmitName` is one of the four producers and renders STRUCTURALLY: a declared struct
 member comes back as its shape where the source said `S`, and a litunion alias as its
 softened base. Until it can produce the member SEQUENCE a row records, a querier holding only
@@ -234,9 +235,84 @@ that closes**, because a querier that mints a different key silently reads the w
 
 **Order matters, for D965's reason**: lifting the name key at the READER before every PRODUCER
 can supply one turns a loud refusal into a wrong row. Mint, wire every producer, then narrow.
-Only steps 4-6 need a freeze at all — step 4 holds `emit_collect.vl` for the ~11 builds its
-per-site discipline costs, step 5 holds `emit_classify.vl` and `emit_collect.vl` for ONE PR, and
-step 6 holds `emit_state.vl` for one. Steps 1-3 are additive and can land beside other work.
+Only steps 4-6 need a freeze at all — 4a needed none, 4b holds `emit_collect.vl` for the ~11
+builds its per-site discipline costs, step 5 holds `emit_classify.vl` and `emit_collect.vl` for
+ONE PR, and step 6 holds `emit_state.vl` for one. Steps 1-4a are additive.
+
+### Step 4a — the arena renders the member SEQUENCE, and the declared name was in a sidecar
+
+**The arena had NOT lost the declared name; a THIRD renderer already reads it.** The five
+sources for a type question (CLAUDE.md) answer this one on the fourth: `cStructTyIxs` /
+`cStructNames` and `cUnionTyIxs` / `cUnionNames` are the nominal-identity sidecar the checker
+banks at pass 0a, `structNameOfTy` / `unionAliasDeclNameOfTy` are its reverse lookups, and
+**`tyToNominalName` is the name-faithful renderer built on them** — the type-taking twin was
+already written, and step 4a is four rules ON TOP of it rather than a new walk:
+
+| rule | why the row needs it |
+| --- | --- |
+| render each member with `tyToNominalName`, NOT `tyToEmitName` | a declared struct member is `Circle` in the row, `{r:i32}` structurally |
+| **do not dedupe** | `type K = "a" \| "b"` records `string\|string`; the structural renderer collapses the run to one atom, and a union's tags are positional over the sequence |
+| a `TyFunc` member is PARENTHESIZED | bare, the closure's result arms swallow the union's siblings (`()=>f32\|null\|{w:i32}`) and the atom split reads a different sequence |
+| unwrap the NULL FOLD with `null` FIRST, and give a nullable SCALAR its one atom | pass 0b folds `type J = null \| A \| B` into a ONE-member `TyUnion` over a `TyNullable`, so the members are a level down; and `i32\|null` is a `TyNullable(TyPrim)` with no union anywhere — the largest single family of rows |
+
+…plus one SUBTRACTION, which is the only new position bit: at `RC_UNION_KEY` the nominal
+renderer does **not** take a generic application's name. Canon spells a genApp union MEMBER by
+its SHAPE (`unionMemberGenAppShape`), so the row for `type U = Box<i32> | Tag` records
+`{v:i32}|Tag`; nested deeper canon keeps the application, and the bit does not propagate.
+
+Measured over the same 2,790-program corpus (2,447 registered rows, six more than steps 1-3's
+2,441 — three PRs added cases):
+
+| route | agrees with the row's own `unKey` |
+| --- | --- |
+| `canonUnionKey(unTyIx[u])` — the structural render, steps 1-3 | 1,369 / 2,447 (**55.9%**) |
+| **`canonUnionKeyOfTy(unTyIx[u])` — step 4a** | **2,422 / 2,447 (98.98%)** |
+
+`keySweep/merge-diffset` stays **0**: the key's licence is unchanged.
+
+#### The 25 misses, by mechanism
+
+| # | miss | rows | why | is a PRODUCER the fix? |
+| --- | --- | --- | --- | --- |
+| 1 | the row's `unTyIx` is not a UNION at all — `obj` ×5, `func` ×1 | **6** | the mint resolved the row's SPELLING (`A\|B`, `Cat\|Dog`) to a member's shape or to a closure type, so there is no member sequence to render and the renderer answers -1 | **YES, and not this one** — the RESOLVER at the mint (`declTyIxOfName`). A row whose recorded type is not a union is unreachable by ANY type route, including `repCanonId`'s. Step 4b. |
+| 2 | a litunion ALIAS's members are flattened into sibling `TyLit`s | **10** | `type R = Kind \| string` stores three members where the row records two; the alias BOUNDARIES are not an arena fact | partly. The string-lit REGROUP both existing renderers carry was built and measured here: **0 extra rows** — every case in this corpus is either two adjacent runs (`SA\|SB`, which regroup fuses into one atom) or a NUMERIC run, which the regroup does not cover. |
+| 3 | `null`'s declared POSITION | **6** | the fold takes `null` out of the member list, so `null\|f64` and `f64\|null` reach ONE arena type | **YES — but it is a KEY decision, not a renderer one.** Normalising `null` to one end inside `canonUnionKeyText` closes all six; it also re-keys the ROWS and would create `merge-diffset` pairs, and 0 of those is the property the key's licence rests on (§3). Deliberately deferred to step 4b with this evidence. |
+| 4 | a NAMED type nested ONE level inside an anonymous composite member | **3** | canon spells the nesting inconsistently: `{v: Pair<i32,string>[]}` keeps the application, `{v: {v:i32}}` and `{b: Node}` expand it | canon, the annotation-side producer. Both directions are present in this corpus, so no single arena rule wins — measured, not asserted: taking the nominal name inside fixes 2 and breaks 2. |
+
+#### Byte-identity, and the per-site sweep with the arena key on the id side
+
+Additive and dormant: over `tests/cases` the pristine (`origin/master` 76dfcc00) and candidate
+seeds emit **2,289 identical modules, 0 differing, 0 rc-differing** (501 refuse under both), and
+master's own compiler source builds **byte-identical (1,832,652 B) under both seeds**. Both
+seeds are self-compilation fixpoints; the compiler's own wasm grows 1,832,652 → 1,833,871
+(**+1,219 B, +0.067%**), all of it unreachable while the harness is unarmed. L1 6.26 s,
+L2 15.21 s, both rc 0 under `timeout 300` (a loaded box; both are fixpoints).
+
+`unABMode = 3` re-keys the per-site counter's ID side on `unKey` (via `unRowOfKey`) instead of
+`repCanonId`, leaving the shipped answer alone. Over the same corpus, 27 sites, `repCanonId` →
+arena key:
+
+| outcome | `repCanonId` | arena key |
+| --- | --- | --- |
+| agree | 30,225 | 30,245 |
+| **differ** | **2,207** | **1,587** (−28.1%) |
+| name-only | 426 | **1,026** |
+| id-only | 107 | 47 |
+| neither | 990,140 | 990,200 |
+| no-ty | 33,188 | 33,188 |
+
+**The prediction was that `differ` falls toward 0 as the producer agrees. It falls by 620 —
+and 600 of those become `name-only`, not `agree`.** So the arena key stops naming the WRONG
+row; it does not yet name the right one. The residue is concentrated: `arrLitBoxElem`
+1,131 → 786 (with `name-only` 0 → 207), `arrLitUnionElemName` 362 → 253 (0 → 59),
+`letAnnUnionKind` 235 → 165 (0 → 123), `letAnnUnionSlot` 216 → 165 (0 → 109). Four sites are
+UNMOVED — `collectU/inferLetTy` 50, `nliInferIfLet` 32, `emitLetDeclStmt/nli` 35,
+`nliInferOptChainLet` 5 — so their disagreement is not a key question at all.
+
+That gap is the difference between a ROW's recorded type and the type a CALL SITE holds: the
+row-level agreement is 98.98%, but `arrLitBoxElem` holds an ELEMENT type and mints a key no row
+was minted under. **Step 4b is where that closes**, and the reading is the same one step 2
+earned: the counter is the authority, and the plan's premise was again optimistic.
 
 ## 6. The storage-class ladders
 
@@ -313,6 +389,18 @@ timed under `timeout 300`: **L1 (seed builds the spike) ok, L2 (spike builds the
 rc 0**, fixpoint held. An L1-only check is vacuous for this class.
 
 ## 8. What the PRs ship
+
+**Step 4a (the third PR).** In canon: `RC_UNION_KEY` (the one new position bit, and the one
+place `tyToNominalNameGo` consults it), `canonUnionKeyAtomOfTy`, `canonUnionKeyTextOfTy` and
+the exported `canonUnionKeyOfTy`. In `emit_classify.vl`: `unRowOfKey` (the third and last
+candidate reverse index), `unRowOfTyAB` and harness mode 3 — which re-keys the four A/B seams'
+TALLY without touching what they return — and the `keySweep/tykey-*` buckets beside the
+step-3 `keySweep/ty-*` ones, so the two routes are graded on the same rows in the same run.
+Still no reader; arming still rides `$VL_REP_SHADOW`, and mode 3 is armed from SOURCE.
+
+**A one-route table is a number nobody can grade**, which is why `tykey-*` sits BESIDE `ty-*`
+rather than replacing it: 2,422 of 2,447 means nothing until the sentence carries the 1,369
+the same run produced from the same rows.
 
 **Steps 1-3 (the second PR).** `unRowOfName`, `unionMemberTysOfRow`/`…OfTy`,
 `unionHasAtomRow`/`unionHasAtomOfTy`, `unMemHasAtomTy`; the per-site counter (`unABCnt`,
