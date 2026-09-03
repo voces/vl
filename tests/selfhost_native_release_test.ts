@@ -445,8 +445,15 @@ const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3: ShapeP
     // comparing headers rather than element arrays. Two DISTINCT headers over the same
     // backing and range no longer short-circuit and walk instead — a lost optimisation, not
     // a wrong answer, and the pool still gives one header per distinct literal.
-    O: { bytes: 1592, fns: 3, allocs: 16, indirect: 0, refEq: 1 },
-    O3: { bytes: 1513, fns: 3, allocs: 16, indirect: 0, refEq: 1 },
+    //
+    // 2026-09-03, the loop-local accumulator: `main.vl:20-26` builds its keys with
+    // `let s = ""` then `s = s + ALPHA.slice(…)` in a loop, which is exactly the shape the
+    // accumulator lowering claims, so the per-step `call $__str_concat__` becomes an inline
+    // grow-check + `array.copy` + one header. bytes 1600 -> 1650 at `-O` and 1513 -> 1546
+    // at `-O3`, with `fns`/`allocs`/`refEq` unchanged — per-instruction weight, and the
+    // trade is that the key-building loop stops being O(n^2).
+    O: { bytes: 1650, fns: 3, allocs: 16, indirect: 0, refEq: 1 },
+    O3: { bytes: 1546, fns: 3, allocs: 16, indirect: 0, refEq: 1 },
   },
   // STRING HASHING + MAP PROBE. 30M lookups over string keys built as distinct objects, so the
   // probe path is a real hash plus a real content compare rather than a pointer check. This is
@@ -473,7 +480,15 @@ const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3: ShapeP
     // the `-O3` row as this benchmark's real shape and the `-O` row as the cost of the
     // missing pipeline DCE. The pin still fires exactly on any codegen move — it is an
     // equality test — it just has more of std in it now.
-    O: { bytes: 7769, fns: 16, allocs: 91, indirect: 0, refEq: 1 },
+    //
+    // 2026-09-03, n-ary concat: `-O` moves allocs 91 -> 95 and bytes 7792 -> 8005 while
+    // `-O3` is byte-identical (2147/46). The benchmark's own keys are `"key" + toString(i)`
+    // — two operands, untouched — so every moved byte is in the `std:fmt` code `-O` carries
+    // and `-O3` drops. A fused chain writes its `array.new_default` + `struct.new` INLINE
+    // instead of calling `__str_concat__`, so STATIC alloc sites rise where DYNAMIC
+    // allocations fall (n - 1 -> 1 per chain execution): this row counts sites, and the
+    // direction it moves is the opposite of the direction the work moves.
+    O: { bytes: 8005, fns: 16, allocs: 95, indirect: 0, refEq: 1 },
     O3: { bytes: 2147, fns: 5, allocs: 46, indirect: 0, refEq: 1 },
   },
   // MAP PROBE WITHOUT THE STRING COST. i32 keys, so this isolates the bucket walk and the

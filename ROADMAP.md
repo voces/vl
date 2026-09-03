@@ -73,6 +73,20 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   remaining work is 4b (`registerInlineUnion`'s 11 recursions, under an `emit_collect.vl`
   freeze) and then the switch. The variant registry and the per-resolver kind ladders
   (ONE storage-class dispatch table) are still ahead of both.
+- 🟢 **7. String building — BOTH LOWERINGS SHIPPED; module-GLOBAL accumulators remain.**
+  `docs/internals/perf-opportunities-2026-09.md` Part D priced what the owner asked for
+  ("optimize string building at the compiler level, without the user having to use an actual
+  builder pattern"), and its options A and B are both in. **A**: a maximal string `+` chain —
+  every interpolation included, since the parser desugars one into a chain — lowers to ONE
+  sized allocation and one `array.copy` per part. **B**: a proven loop-local accumulator
+  (`let s = ""` then `s = s + piece` inside a loop) appends IN PLACE into slack its own grow
+  path allocated, capacity doubling, so the loop is O(n). Together they take the compiler's
+  own emitted `__str_concat__` call sites **2,649 -> 399** and a 40,000-append loop
+  **0.805 s -> 0.02 s**. The REMAINDER is an accumulator that is a module GLOBAL rather than
+  a function local: the analysis is per function, so `let s = ""` at top level with a
+  top-level `while` still allocates per step (measured unchanged, ratio 5.1 per doubling).
+  Option C (ropes) stays refused — it changes the rep for every program to fix a pattern a
+  static analysis can see.
 
 
 ### Ruled and sequenced (owner decisions already made, waiting only on order)

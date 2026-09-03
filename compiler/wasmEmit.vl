@@ -90,6 +90,7 @@ import {
   RetStmt,
   StrLit,
   TypeDecl,
+  TypeRef,
   Unary,
   UnionDecl,
   WhileStmt,
@@ -318,6 +319,7 @@ import {
   sHeapIdx,
   sTypeIdx,
   slUsed,
+  strCatSlotIx,
   strPushScratchBase,
   strScratchBase,
   tailCallEnd,
@@ -11144,6 +11146,14 @@ function emitStrConcat(body: i32[], binIx: i32, fnIx: i32) {
   }
   const e = P.nodes[binIx]
   if e is BinExpr {
+    // THREE OR MORE PARTS FUSE. `a + b + c + d` is one `+` node per operand pair, so the
+    // pairwise lowering allocates and copies the whole accumulated prefix once per pair —
+    // quadratic in the chain, and every interpolation is such a chain (the parser desugars
+    // `"…\{x}…"` into one). `strCatParts` flattens the maximal chain and `emitStrCatN`
+    // buys it with ONE sized allocation and one `array.copy` per part.
+    const parts: i32[] = []
+    strCatParts(binIx, fnIx, parts)
+    if parts.length > 2 { return emitStrCatN(body, parts, fnIx) }
     // Eval BOTH operands onto the stack (nested string ops complete here) and call
     // the shared `__str_concat__` helper — the allocate+copy core lives once per
     // module (`emitStrConcatFnCode`). A literal-union atom operand widens to its
@@ -11154,6 +11164,425 @@ function emitStrConcat(body: i32[], binIx: i32, fnIx: i32) {
     return 0
   }
   emitFail("emitProgram: expected a string concatenation")
+}
+
+// Flatten the maximal string `+` chain rooted at `binIx` into its operand expressions,
+// left to right, appending each to `parts`. A node is chain INTERIOR exactly when
+// `exprIsStrConcat` claims it — the same predicate that routes `+` here — so the walk and
+// the dispatch cannot disagree about where the chain ends. A parenthesised sub-chain is a
+// `Paren` node and is NOT interior, so it keeps its own lowering.
+function strCatParts(binIx: i32, fnIx: i32, parts: i32[]) {
+  const e = P.nodes[binIx]
+  if e is BinExpr {
+    if exprIsStrConcat(e.binLeft, fnIx) {
+      strCatParts(e.binLeft, fnIx, parts)
+    } else {
+      parts.push(e.binLeft)
+    }
+    if exprIsStrConcat(e.binRight, fnIx) {
+      strCatParts(e.binRight, fnIx, parts)
+    } else {
+      parts.push(e.binRight)
+    }
+  }
+  0
+}
+
+// Part slot `i` of the n-ary concat pool, minted on demand into the lazy list frame
+// (`liBack` code 18) and cached for the rest of the function. ONE pool serves every
+// nesting depth: `emitStrCatN` evaluates every part onto the STACK before it writes a
+// single slot, so a nested chain has finished with the pool before the outer chain
+// touches it.
+function strCatSlot(i: i32) {
+  while strCatSlotIx.length <= i {
+    liKinds.push("i32")
+    liSlots.push(0)
+    liBack.push(18)
+    strCatSlotIx.push(listIdxScratchBase + liKinds.length)
+  }
+  strCatSlotIx[i]
+}
+
+// Lower an n-part (n >= 3) string chain: evaluate the parts left to right, sum their
+// lengths, allocate ONE exact-fit backing, `array.copy` each part in at a running offset,
+// and wrap one header. Side effects run exactly once, in source order — the parts are
+// emitted in the order the pairwise lowering emitted them.
+//
+// The stash order is the nested-op discipline (§G6): all n values reach the stack first,
+// then they are popped into slots deepest-last, so no scratch write ever straddles an
+// operand evaluation. `strScrOut` (+2), `strScrI0` (+3) and `strScrI1` (+4) are borrowed
+// for the backing, the total and the offset — nothing runs between their writes and their
+// reads, which is the same condition every other builder in this file relies on.
+function emitStrCatN(body: i32[], parts: i32[], fnIx: i32) {
+  const n = parts.length
+  let i = 0
+  while i < n {
+    if emitStrValue(body, parts[i], fnIx) < 0 { return -1 }
+    i = i + 1
+  }
+  let j = n - 1
+  while j >= 0 {
+    fbLocalSet(strCatSlot(j))
+    j = j - 1
+  }
+  fbLocalGet(strCatSlot(0))
+  fbStrLen()
+  let k = 1
+  while k < n {
+    fbLocalGet(strCatSlot(k))
+    fbStrLen()
+    fbI32Bin(106) // i32.add
+    k = k + 1
+  }
+  fbLocalTee(strScratchBase + 3) // strScrI0 = the total length
+  fbArrayNewDefault(sBackIdx)
+  fbLocalSet(strScratchBase + 2) // strScrOut = the one exact-fit backing
+  fbI32Const(0)
+  fbLocalSet(strScratchBase + 4) // strScrI1 = the running destination offset
+  let m = 0
+  while m < n {
+    fbLocalGet(strScratchBase + 2)
+    fbLocalGet(strScratchBase + 4)
+    fbLocalGet(strCatSlot(m))
+    fbStrBack()
+    fbLocalGet(strCatSlot(m))
+    fbStrStart()
+    fbLocalGet(strCatSlot(m))
+    fbStrLen()
+    fbArrayCopy(sBackIdx, sBackIdx)
+    if m + 1 < n {
+      fbLocalGet(strScratchBase + 4)
+      fbLocalGet(strCatSlot(m))
+      fbStrLen()
+      fbI32Bin(106) // i32.add
+      fbLocalSet(strScratchBase + 4)
+    }
+    m = m + 1
+  }
+  fbLocalGet(strScratchBase + 2)
+  fbI32Const(0)
+  fbLocalGet(strScratchBase + 3)
+  fbStrNew()
+  0
+}
+
+// ── the loop-local string accumulator ────────────────────────────────────────
+// `let s = ""` then `s = s + piece` inside a loop is O(n^2): every `+` allocates an
+// exact-fit backing and copies the accumulated prefix. `strAccScan` PROVES a binding is
+// an accumulator; `emitStrAccAppend` then appends IN PLACE into slack the binding's own
+// grow path allocated (capacity doubling), so the loop is linear with no builder in the
+// source.
+//
+// SOUNDNESS rests on one invariant: `s` only ever holds a string LITERAL, a fresh concat
+// result, or a buffer this binding allocated. The first two are exact-fit by construction
+// (`collectStrPool` gives every literal its own `array.new_fixed`), so a backing with
+// slack is always ours; every view of `s` has `start + len <= s.len` and the append writes
+// only past it. Full argument: DECISIONS.md "String building is a LOWERING".
+let saNames: string[] = []
+let saDecls: i32[] = []
+let saApps: i32[] = []
+let saBads: i32[] = []
+let saFnIx = 0 - 2
+
+// Find (or start) the row for `name`.
+function saRow(name: string) {
+  let i = 0
+  while i < saNames.length {
+    if saNames[i] == name { return i }
+    i = i + 1
+  }
+  saNames.push(name)
+  saDecls.push(0)
+  saApps.push(0)
+  saBads.push(0)
+  saNames.length - 1
+}
+
+function saMarkBad(name: string) {
+  saBads[saRow(name)] = 1
+  0
+}
+
+// A DECLARATION qualifies only at the one spelling whose value is exact-fit by
+// construction: a mutable `let` whose initialiser is a string LITERAL, annotated
+// `string` or not at all. Anything else — a `const`, a missing or non-literal init, a
+// wider annotation — disqualifies the NAME, because the binding could then be handed a
+// buffer some other accumulator still owns.
+function saNoteDecl(letIx: i32) {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    const r = saRow(d.letName)
+    saDecls[r] = saDecls[r] + 1
+    let ok = d.letKw == "let" && d.letInit >= 0
+    if ok {
+      const init = P.nodes[d.letInit]
+      if !(init is StrLit) { ok = false }
+    }
+    if ok && d.letType >= 0 {
+      const ann = P.nodes[d.letType]
+      if ann is TypeRef {
+        if ann.tyName != "string" { ok = false }
+      } else {
+        ok = false
+      }
+    }
+    if !ok { saBads[r] = 1 }
+  }
+  0
+}
+
+// True if any identifier in the subtree at `ix` spells `name`.
+function exprMentionsName(ix: i32, name: string) {
+  if ix < 0 { return false }
+  const n = P.nodes[ix]
+  if n is Ident { return n.identName == name }
+  const kids = nodeChildren(ix)
+  let i = 0
+  while i < kids.length {
+    if exprMentionsName(kids[i], name) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// True if `rhsIx` is `name + <parts>` — a maximal string chain whose FIRST part is the
+// accumulator itself and none of whose remaining parts mentions it. The second half is
+// what keeps the lowering's evaluation order unobservable: the parts run before `name`
+// is read, which is only sound while they cannot see or change it.
+function saSelfAppendOk(rhsIx: i32, name: string, fnIx: i32) {
+  if !exprIsStrConcat(rhsIx, fnIx) { return false }
+  const parts: i32[] = []
+  strCatParts(rhsIx, fnIx, parts)
+  if parts.length < 2 { return false }
+  const p0 = P.nodes[parts[0]]
+  if p0 is Ident {
+    if p0.identName != name { return false }
+  } else {
+    return false
+  }
+  let i = 1
+  while i < parts.length {
+    if exprMentionsName(parts[i], name) { return false }
+    i = i + 1
+  }
+  true
+}
+
+// The walk. `depth` counts enclosing LOOPS (an accumulator has to earn its buffer in
+// one); `inLambda` is set inside a nested `FuncDecl`, where every mentioned name is
+// disqualified — a captured local does not live in the slot this lowering writes.
+function strAccWalk(ix: i32, fnIx: i32, depth: i32, inLambda: boolean) {
+  if ix < 0 { return 0 }
+  const n = P.nodes[ix]
+  if n is Ident {
+    if inLambda { saMarkBad(n.identName) }
+    return 0
+  }
+  if n is FuncDecl {
+    strAccWalk(n.fnBody, fnIx, 0, true)
+    return 0
+  }
+  if n is LetDecl {
+    if inLambda { saMarkBad(n.letName) } else { saNoteDecl(ix) }
+    strAccWalk(n.letInit, fnIx, depth, inLambda)
+    return 0
+  }
+  if n is BinExpr {
+    if n.binOp == "=" {
+      const t = P.nodes[unwrapParen(n.binLeft)]
+      if t is Ident {
+        if inLambda {
+          saMarkBad(t.identName)
+        } else if saSelfAppendOk(n.binRight, t.identName, fnIx) {
+          if depth > 0 {
+            saApps[saRow(t.identName)] = saApps[saRow(t.identName)] + 1
+          }
+        } else {
+          const rhs = P.nodes[n.binRight]
+          if !(rhs is StrLit) { saMarkBad(t.identName) }
+        }
+      }
+    }
+  }
+  if n is WhileStmt {
+    strAccWalk(n.whileCond, fnIx, depth, inLambda)
+    strAccWalk(n.whileBody, fnIx, depth + 1, inLambda)
+    return 0
+  }
+  if n is ForRange {
+    strAccWalk(n.frFrom, fnIx, depth, inLambda)
+    strAccWalk(n.frTo, fnIx, depth, inLambda)
+    strAccWalk(n.frStep, fnIx, depth, inLambda)
+    strAccWalk(n.frBody, fnIx, depth + 1, inLambda)
+    return 0
+  }
+  if n is ForIn {
+    strAccWalk(n.fiIter, fnIx, depth, inLambda)
+    strAccWalk(n.fiBody, fnIx, depth + 1, inLambda)
+    return 0
+  }
+  const kids = nodeChildren(ix)
+  let i = 0
+  while i < kids.length {
+    strAccWalk(kids[i], fnIx, depth, inLambda)
+    i = i + 1
+  }
+  0
+}
+
+// Prove this function's accumulators. Skipped outright where the function performs no
+// string op at all, which is most of them.
+function strAccScan(blockIx: i32, fnIx: i32) {
+  saNames = []
+  saDecls = []
+  saApps = []
+  saBads = []
+  saFnIx = fnIx
+  if !fnUsesStrOp { return 0 }
+  strAccWalk(blockIx, fnIx, 0, false)
+  0
+}
+
+// Exactly one declaration, no disqualifying use, and at least one self-append inside a
+// loop. The one-declaration rule is what makes the name-keyed answer safe: two bindings
+// of one name in a function would share this row.
+function saNameQualifies(name: string) {
+  let i = 0
+  while i < saNames.length {
+    if saNames[i] == name {
+      return saBads[i] == 0 && saDecls[i] == 1 && saApps[i] > 0
+    }
+    i = i + 1
+  }
+  false
+}
+
+// Does the assignment at `binIx` append to a proven accumulator? Re-asked per SITE, with
+// the emit-time scope populated, so the scan's answer is a filter and never the whole
+// test. `saFnIx` pins the set to the body it was computed for.
+function strAccAppendOk(binIx: i32, fnIx: i32) {
+  if saFnIx != fnIx { return false }
+  if saNames.length == 0 { return false }
+  const a = P.nodes[binIx]
+  if a is BinExpr {
+    const t = P.nodes[unwrapParen(a.binLeft)]
+    if t is Ident {
+      if !saNameQualifies(t.identName) { return false }
+      if localIndexOf(fnIx, t.identName) < 0 { return false }
+      return saSelfAppendOk(a.binRight, t.identName, fnIx)
+    }
+  }
+  false
+}
+
+// `s = s + p1 + … + pk` in place. The parts are evaluated and stashed first (they cannot
+// mention `s`, so reading the accumulator after them is unobservable), then the backing
+// grows only when the parts do not fit, then one `array.copy` per part at a running
+// offset, then ONE new header. Borrows the string frame: OUT (+2) the buffer, I0 (+3) the
+// added length, I1 (+4) the current length, I2 (+5) the offset, I3 (+6) the start, and
+// ABK (+7) the old buffer across the grow.
+function emitStrAccAppend(body: i32[], binIx: i32, fnIx: i32) {
+  const a = P.nodes[binIx]
+  if a is BinExpr {
+    const t = P.nodes[unwrapParen(a.binLeft)]
+    if t is Ident {
+      const slot = localIndexOf(fnIx, t.identName)
+      const parts: i32[] = []
+      strCatParts(a.binRight, fnIx, parts)
+      const n = parts.length
+      let i = 1
+      while i < n {
+        if emitStrValue(body, parts[i], fnIx) < 0 { return -1 }
+        i = i + 1
+      }
+      let j = n - 1
+      while j >= 1 {
+        fbLocalSet(strCatSlot(j - 1))
+        j = j - 1
+      }
+      fbLocalGet(strCatSlot(0))
+      fbStrLen()
+      let k = 2
+      while k < n {
+        fbLocalGet(strCatSlot(k - 1))
+        fbStrLen()
+        fbI32Bin(106) // i32.add
+        k = k + 1
+      }
+      fbLocalSet(strScratchBase + 3) // I0 = the added length
+      fbLocalGet(slot)
+      fbStrLen()
+      fbLocalSet(strScratchBase + 4) // I1 = the current length
+      fbLocalGet(slot)
+      fbStrStart()
+      fbLocalSet(strScratchBase + 6) // I3 = the current start
+      fbLocalGet(slot)
+      fbStrBack()
+      fbLocalSet(strScratchBase + 2) // OUT = the current backing
+      fbLocalGet(strScratchBase + 6)
+      fbLocalGet(strScratchBase + 4)
+      fbI32Bin(106)
+      fbLocalGet(strScratchBase + 3)
+      fbI32Bin(106)
+      fbLocalGet(strScratchBase + 2)
+      fbArrayLen()
+      fbI32Bin(74)                   // i32.gt_s — start + len + added past the backing?
+      fbIf(64)                       // void
+      fbLocalGet(strScratchBase + 2)
+      fbLocalSet(strScratchBase + 7) // ABK = the old buffer
+      fbLocalGet(strScratchBase + 4)
+      fbLocalGet(strScratchBase + 3)
+      fbI32Bin(106)
+      fbI32Const(1)
+      fbI32Bin(116)                  // i32.shl — capacity DOUBLING is what makes the loop linear
+      fbI32Const(16)
+      fbI32Bin(106)
+      fbArrayNewDefault(sBackIdx)
+      fbLocalSet(strScratchBase + 2)
+      fbLocalGet(strScratchBase + 2)
+      fbI32Const(0)
+      fbLocalGet(strScratchBase + 7)
+      fbLocalGet(strScratchBase + 6)
+      fbLocalGet(strScratchBase + 4)
+      fbArrayCopy(sBackIdx, sBackIdx)
+      fbI32Const(0)
+      fbLocalSet(strScratchBase + 6) // the fresh buffer starts at 0
+      fbEnd()
+      fbLocalGet(strScratchBase + 6)
+      fbLocalGet(strScratchBase + 4)
+      fbI32Bin(106)
+      fbLocalSet(strScratchBase + 5) // I2 = the running destination offset
+      let m = 1
+      while m < n {
+        fbLocalGet(strScratchBase + 2)
+        fbLocalGet(strScratchBase + 5)
+        fbLocalGet(strCatSlot(m - 1))
+        fbStrBack()
+        fbLocalGet(strCatSlot(m - 1))
+        fbStrStart()
+        fbLocalGet(strCatSlot(m - 1))
+        fbStrLen()
+        fbArrayCopy(sBackIdx, sBackIdx)
+        if m + 1 < n {
+          fbLocalGet(strScratchBase + 5)
+          fbLocalGet(strCatSlot(m - 1))
+          fbStrLen()
+          fbI32Bin(106)
+          fbLocalSet(strScratchBase + 5)
+        }
+        m = m + 1
+      }
+      fbLocalGet(strScratchBase + 2)
+      fbLocalGet(strScratchBase + 6)
+      fbLocalGet(strScratchBase + 4)
+      fbLocalGet(strScratchBase + 3)
+      fbI32Bin(106)
+      fbStrNew()
+      fbLocalSet(slot)
+      return 0
+    }
+  }
+  emitFail("emitProgram: expected a string accumulator append")
 }
 
 // Lower a string VALUE-equality `a == b` (or `a != b`) onto `body`, leaving a 0/1 i32.
@@ -15879,6 +16308,14 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
     const lhsIx = unwrapParen(a.binLeft)
     const target = P.nodes[lhsIx]
     if target is Ident {
+      // THE LOOP-LOCAL ACCUMULATOR. `s = s + piece` on a binding `strAccScan` has PROVEN
+      // to be an accumulator appends in place into its own buffer's slack instead of
+      // allocating a fresh exact-fit string per step — O(n) where the pairwise lowering
+      // is O(n^2). Nothing else about the assignment changes, and a binding that is not
+      // proven never reaches it.
+      if strAccAppendOk(binIx, fnIx) {
+        return emitStrAccAppend(body, binIx, fnIx)
+      }
       const idx = localIndexOf(fnIx, target.identName)
       if idx < 0 {
         // Not a local — a module global? Store with `global.set` (0x24 <globalidx>).
@@ -20872,6 +21309,10 @@ function emitContinueStmtStmt(
 export function emitFuncBody(body: i32[], blockIx: i32, fnIx: i32) {
   const b = P.nodes[blockIx]
   if b is Block {
+    // Which of this function's string bindings are loop accumulators. Runs here rather
+    // than in `emitFuncCode` because nothing before the body needs the answer, and the
+    // set is stamped with `fnIx` so a body that never scanned cannot read a stale one.
+    strAccScan(blockIx, fnIx)
     // Enter the function's top-level lexical scope (mirrors `collectLocals` on the body
     // block). The emit-time scope stack drives same-named-local resolution.
     scopePush()
