@@ -2775,13 +2775,6 @@ let cObjPinTyIx = -1
 // Only the MINT still bridges from the legacy string form (`synthPinKindOf`).
 let nodePinKind: i32[] = []
 let nodePinPay: string[] = []
-// The node index of the if-EXPRESSION currently being checked as a `let`/`const`
-// INITIALIZER, or -1. The one position outside return-tail where the emitter CAN lower an
-// else-less if-expression's `T | null` value (`emit_collect.nliInferIfLet`), so the one
-// position where `checkIfStmtNode` widens it instead of typing it `TY_VOID`. Written and
-// restored around the initializer check in `checkLetDeclNode`; peeled through `Paren` so
-// `const r = (if c { 5 })` marks the same node `checkNode` reaches.
-let letInitIfIx = -1
 let inferQuiet = false
 let cycleBreakCount = 0
 let inferTentative: string[] = []
@@ -5287,24 +5280,26 @@ function tyMentionsVoid(ty: i32, depth: i32) {
   false
 }
 
-// Whether the expression at `exprIx` (peeled through parens) is an if-EXPRESSION or a
-// `match` — the two void-typed expression FORMS every void-in-value-slot gate exempts,
-// and the one predicate all of them ask.
+// Whether the expression at `exprIx` (peeled through parens) is a `match` — the void-typed
+// expression FORM every void-in-value-slot gate exempts, and the one predicate all of them
+// ask.
 //
-// A statement-`if` and a void-armed `match` type context-free `void`, but that `void` is
-// PROVISIONAL: the `let`/`const` initializer position resolves an else-less if-expression
-// to `T | null` instead (`checkIfStmtNode`'s tail, gated on `letInitIfIx`), so a gate that
-// fired here would refuse a program that path types correctly. In the positions the
-// emitter genuinely cannot lower, it names the real defect — `emitProgram: if-expression
-// requires an else arm` names the missing `else`, which a "got void" wording cannot — so
-// those keep the emitter's message rather than trading it for a vaguer one.
+// AN if-EXPRESSION IS NO LONGER EXEMPT, and the ruling is why. An else-less `if` used as a
+// value is `T | null` in EVERY value position (DECISIONS, 2026-09-02), so `checkIfStmtNode`
+// has already widened any if whose arm carries a value by the time a slot asks — an `if`
+// that still types `void` here has a VOID ARM, which is a real void in a value slot and
+// exactly what these gates exist to catch. The exemption dated from the widening being
+// gated to the binding position, where it stopped a correctly-typed program being refused;
+// with one rule it refuses nothing, and keeping it left `const x = if c { voidCall() }`
+// check-clean and crashing the emitter with `if-expression requires an else arm` — a
+// sentence about the wrong ingredient, since adding an `else` does not give a void arm a
+// value.
 function voidSlotExemptExpr(exprIx: i32) {
   if exprIx < 0 { return false }
   let vi = exprIx
   const vp = P.nodes[vi]
   if vp is Paren { vi = vp.parInner }
   const vn = P.nodes[vi]
-  if vn is IfStmt { return true }
   if vn is MatchExpr { return true }
   false
 }
@@ -36823,14 +36818,7 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
       if liN.fnName == "" { noteValBindLambda(n.letInit) }
     }
   }
-  // The if-EXPRESSION initializer position, marked for `checkIfStmtNode`'s else-less
-  // widening (see its tail). A scalar written on the way IN and restored on the way OUT —
-  // never carried between statements, let alone between programs — and it names ONE node,
-  // so a nested `if` inside the initializer is unaffected.
-  const savedLetInitIf = letInitIfIx
-  letInitIfIx = ifExprNodeOf(n.letInit)
   if n.letInit >= 0 { initTy = checkNode(n.letInit) }
-  letInitIfIx = savedLetInitIf
   // A `void` initializer (`const x = f()` over a void function) has NO value to bind.
   // The assignment path (`x = f()`) already rejects it; the BINDING path did not — an
   // un-annotated binding had no assignability check, and `assignableExpr(void, T)` is
@@ -37605,31 +37593,6 @@ function checkMatchExprNode(n: MatchExpr, ix: i32) {
   return matchTy
 }
 
-// Extracted from `checkNodeReal`'s `IfStmt` arm (C3: thin the dispatcher).
-// The node index of `ix` when it is an if-EXPRESSION (peeling grouping parens), else -1.
-// The producer of `letInitIfIx`; mirrors the `isIfInit` peel `checkLetDeclNode` already
-// runs a few lines below for the inferred-union export, so the two positions are the same
-// position by construction rather than by coincidence.
-function ifExprNodeOf(ix: i32): i32 {
-  if ix < 0 { return -1 }
-  let cur = ix
-  let peels = 0
-  while peels < 8 {
-    const nd = P.nodes[cur]
-    if nd is Paren {
-      cur = nd.parInner
-      if cur < 0 { return -1 }
-      peels = peels + 1
-    } else {
-      peels = 8
-    }
-  }
-  if cur < 0 { return -1 }
-  const fin = P.nodes[cur]
-  if fin is IfStmt { return cur }
-  -1
-}
-
 function checkIfStmtNode(n: IfStmt, ix: i32) {
   // Am I the ELSE ARM of an enclosing `if` (`… else if …`)? Read and cleared here, so
   // the flag reaches exactly one callee and every `if` inside a branch BODY sees `-1`
@@ -37943,39 +37906,31 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
     }
   }
   retTailPos = ifTail
-  // The `if`-expression's VALUE type: the join of the two branch tail values. With no
-  // `else` the `if` may not yield a value (the fall-through has none), so it is valueless
-  // (TY_VOID) — a value-position use without `else` stays as before. A statement `if`
-  // (void branches) joins to TY_VOID, unchanged.
+  // The `if`-expression's VALUE type: with an `else`, the join of the two branch tail
+  // values.
   if daHasElse { return joinTys(thenTy, elseTy) }
-  // An else-less `if` in RETURN-TAIL position: the false fall-through yields no value —
-  // that path is `null` (exactly the #484 function fall-through), so the function's
-  // return is `thenTy | null`. The emitter routes this to `emitIfTail` (the then-arm
-  // returns the value; the false path falls through to the function-end null padding,
-  // `emitNullForRet`).
+  // AN ELSE-LESS `if` USED AS A VALUE IS `T | null`, IN EVERY POSITION — the false
+  // fall-through yields `null`, so the expression's value is the arm's or nothing
+  // (DECISIONS, "An else-less `if` used as a VALUE is `T | null` in every position"; the
+  // Elixir model this language follows for `if`, where `if cond, do: x` is `nil` when the
+  // condition fails).
   //
-  // …AND in a `let`/`const` INITIALIZER (`const r = if c { 5 }`), which is new here. The
-  // comment that stood in this spot said "outside tail position the emitter can't yet
-  // leave a nullable value on the stack, so it stays TY_VOID — a clean `cannot assign
-  // void` at the use site, pending a typed-blocktype if-expression". **THAT REASON IS NO
-  // LONGER TRUE FOR THIS POSITION**: `emit_collect.nliInferIfLet` lowers an if-expression
-  // BINDING against the checker's exported inferred union (`inferLetIx`/`inferLetTy`,
-  // whose own gate — `isIfInit` in `checkLetDeclNode` — is this exact position), so the
-  // capability the decline was waiting for arrived and nothing re-read the decline.
-  // Measured: `const r = if c { 5 }` then `r ?? 0` / `r == null` / `r + 1` / a `string`
-  // arm / an annotated `: i32 | null` binding all ran correctly under the widening, in
-  // and out of a function body; the reported symptom (filed as a `??` bug — `??` is not
-  // involved, it returns its LHS unchanged) was the checker refusing at the BINDING.
+  // ONE RULE, ASKED ONCE. This used to widen behind two POSITION gates — the return tail
+  // and the `let`/`const` initializer — and answer `TY_VOID` everywhere else, so the same
+  // expression was `string | null` at a binding and `void` in `return` position, and the
+  // ONE thing the checker owes about an expression is a single answer.
   //
-  // The widening is POSITION-GATED, not global, and the gate is a measurement: the three
-  // positions the emitter still cannot lower — a call ARGUMENT, an explicit `return`, and
-  // a bare `print(if c { 5 } ?? 0)` — all answer `emitProgram: union if-expression
-  // requires an else arm`, so widening there would trade the checker's clean, positioned
-  // "cannot assign void" for an emit-stage reject. Those keep master's behaviour exactly.
-  if thenTy != TY_VOID && thenTy != TY_ERR {
-    if ifTail { return mkNullableTy(thenTy) }
-    if ix == letInitIfIx { return mkNullableTy(thenTy) }
-  }
+  // AND THE STATEMENT HALF NEEDS NO GATE OF ITS OWN, which is why the position table could
+  // go rather than grow. In statement position an `if`'s arm is a STATEMENT, so `thenTy` is
+  // `TY_VOID` and the line below already answers `void` — the same rule, not an exception
+  // to it. An arm that DOES carry a value in statement position (`if c { sideEffect() }`
+  // over a non-void call) types `T | null` and is simply discarded, exactly as a bare
+  // trailing call is; `types/if-expression-no-else-statement-position.vl` pins that the
+  // discard still compiles and runs. A genuinely VOID arm in a value SLOT is a type error,
+  // reported by `voidValueSlotErr` / the binding's own `cannot bind the void result`.
+  //
+  // TY_ERR is excluded so a cascade does not become `<error> | null`.
+  if thenTy != TY_VOID && thenTy != TY_ERR { return mkNullableTy(thenTy) }
   return TY_VOID
 }
 // ── explicit numeric cast `x as T` ──────────────────────────────────────────

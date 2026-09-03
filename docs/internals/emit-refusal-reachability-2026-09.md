@@ -263,6 +263,12 @@ Thirteen probes, one per LIVE site, under `scripts/capability-probes/`:
 Runner before: `37 of 41 run · 4 still refuse`. After: **`37 of 54 run · 17 still refuse`** — the
 13 new ones all grade GAP, which is the point of a probe.
 
+**A SITE'S VERDICT IS DATED, AND TWO HAVE MOVED.** `wasmEmit.vl:12942` and `:13116` (rows 19
+and 20, D1086) both grade RUNS since the owner's 2026-09-02 ruling that an else-less `if`
+used as a VALUE is `T | null` in every position — the row's own bullet, that the two sites
+are ONE missing `else` lowering, is what the single fix confirmed. The rest of this table is
+the measurement as taken; re-run a row's witness before quoting its verdict.
+
 Ten inventory rows, **D1080 – D1089**, in `docs/internals/silent-class-inventory.md`. Three rows
 carry two sites each where the ablation says one mechanism (D1086, D1087, D1088). All ten grade
 `as filed`; the doc is `419 graded · 419 as filed · 0 MOVED · 0 not graded`.
