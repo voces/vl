@@ -539,7 +539,11 @@ all — no `Repro:` block, or a status line naming no outcome in its vocabulary 
 in the fourth column and the script still **exits 0**. So `94 graded · 94 as filed · 0 MOVED
 · 2 not graded` and `… · 0 not graded` are the same exit code, and a summary quoting the
 first three numbers reads identically either way. `--strict` makes an ungradeable row a
-failure and names the fix.
+failure and names the fix. **A witness that does not PARSE is its own outcome —
+`witness_unparsed`, in that fourth column** — because prose refuses like a type error, and
+D957 graded `as filed` on an indented English paragraph its declared `check reject` matched
+while the row was already closed; a row whose filed outcome really IS a parse-stage refusal
+says `parse error` in its status line (D46, D444, D471 do).
 
 **A row whose defect is only reachable under a change that was REFUSED is still gradeable** —
 file it as a REFUTATION PIN: the witness is the program that must keep RUNNING, with the
@@ -547,8 +551,9 @@ status `runs today and must keep running`, so it flips the day someone lands the
 change. D171/D172/D173 are that shape.
 
 `tests/vl_inventory_rows_test.ts` enforces the structural half of this on every PR (a
-known-outcome status line and a real repro BLOCK, not just a `Repro:` label) in ~15ms,
-without running any program.
+known-outcome status line and a real repro BLOCK, not just a `Repro:` label — and one whose
+first line opens like VL rather than like an English sentence) in ~15ms, without running any
+program.
 
 **And `tests/vl_inventory_refs_test.ts` asks the question none of the above can**: of every
 `D<id>` the tree CITES, which one has NO row? #2405 resolved a conflict in the inventory's

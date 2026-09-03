@@ -338,7 +338,7 @@ list filtered to the rows that do not run.
 | [D954](D954.md) | runs | [CLOSED 2026-09-01] a UNION whose last member is an array read as an ARRAY: one type, two spellings, two answers |
 | [D955](D955.md) | runs | the dead union-atom arm: the FOLD was right and a sound predicate now exists |
 | [D956](D956.md) | runs | [CLOSED 2026-09-01] the inferred nullable MAP, at EVERY value type: D937's restriction outlived the reason for it |
-| [D957](D957.md) | check_reject | the inferred nullable SCALAR LIST: four leaves measured WORKING and backed out, because the return-site seed leaks into two other null contexts |
+| [D957](D957.md) | runs | [CLOSED 2026-09-02] the inferred nullable SCALAR LIST: four leaves measured WORKING and backed out, because the return-site seed leaks into two other null contexts |
 | [D959](D959.md) | runs | [CLOSED 2026-09-01] `==` across two declared types of the SAME shape: one wasm type, one VL type, and only the emitter disagreed |
 | [D960](D960.md) | runs | `??` over a nullable VALUE-UNION box: CLOSED at both spellings, and the two dead-end emit arms failed for a reason that turned out to be fixable |
 | [D962](D962.md) | runs | [CLOSED 2026-09-01 for a re-readable operand] `??` over a nullable VALUE-UNION box, closed as a REWRITE after two emit arms proved it could not be one |

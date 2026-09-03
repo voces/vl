@@ -93,11 +93,19 @@ both inventories.
   repro was rewritten to `{[string]: i32}`, which is refused for an unrelated reason (the map
   equality ruling). The grader sees a row still refusing and reports `as filed`. That is
   correct and it hides a real close.
-* **D957 is graded on PROSE, not on a program.** The row has no `Repro:` block, so the parser
-  takes its first indented block — an English paragraph — and runs it. The result is
+* **D957 is graded on PROSE, not on a program.** The row's first indented block is an English
+  paragraph — a numbered list's continuation lines, five spaces in — so the parser's fallback
+  rule takes that ahead of the `Repro:` block further down and runs it. The result is
   `(parse error)`, which maps to `check_reject`, which matches the declared status, so the row
   passes `--strict` for entirely the wrong reason. It is the only one of the 53 with this
   shape (checked: keyword-density plus lexer tells over all 53 repros).
+
+  **ACTED ON 2026-09-03.** A `Repro` lead-in now wins over an earlier indented block, and a
+  witness that does not PARSE is its own outcome (`witness_unparsed`), which fails `--strict`
+  unless the row's status says `parse error` — D46, D444 and D471 file a parse-stage refusal
+  deliberately and say so. Graded on its REAL witness D957 **runs**, closed by #2381 (D1062),
+  so this audit's population is 52 `check_reject` rows, not 53. The three verdict tables below
+  are otherwise unchanged; only D957's line moves.
 
 ## How each verdict was reached
 
@@ -237,7 +245,7 @@ These need no argument beyond running the neighbour, and all are already filed c
 | D1194 | `'wrap' infers the union return type i32 \| "err" — type-valid, but … not yet supported by codegen` | annotated return runs (prints `10`); plain-`string` union inferred runs (prints `10`) |
 | D1190 | `a deep `is` arm that rebinds or writes `r` is not supported yet` | drop the `r = null` and it runs, printing `3` |
 | D1198 | `` `Tree` is recursive; a recursive JSON shape has no walker yet `` | ROADMAP carries it as named serde residue behind D1197 |
-| D957 | `… is not yet supported by codegen; annotate the return type` | the row records a fix BUILT with all four leaves measured running, then reverted |
+| ~~D957~~ | `… is not yet supported by codegen; annotate the return type` | **not a member of this population** — graded on prose, see the instrument note. Its real witness runs; closed by #2381 (D1062) |
 
 ### 7. The un-annotated face of a narrowing that works annotated (D1243), and the `match` face of an `is` that works (D1118)
 
@@ -339,7 +347,7 @@ D852) are filed CLOSED.
 | D821 | CLOSED | same | correct answer `1`, `1` |
 | D823 | CLOSED | same | correct answer `2`, `2` — the row's own comment says so |
 | D852 | CLOSED | same | correct answer `2`, `2` |
-| D957 | open | `… is not yet supported by codegen; annotate the return type` | message concedes; a fix was built with all four leaves measured RUNNING and reverted for a seed-scoping reason the row names. ALSO: this row has no `Repro:` block — see the instrument note |
+| ~~D957~~ | CLOSED | — | **withdrawn 2026-09-03**: the `check_reject` was the grader running the row's PROSE. On its real witness the row runs, closed by #2381 (D1062) — see the instrument note |
 | D981 | open | `undeclared identifier 'f'` | deleting the unused `import` makes the identical program check clean and print `true` (measured) |
 | D1004 | open | `[ERROR]: ` (no text) | `getN(x: {n: i32})` runs and prints `1` (measured) |
 | D1108 | open | `'pick' infers the nullable return type {[i32]: i32} \| null — type-valid, but … not yet supported by codegen` | the string-keyed twin and the annotated twin both run (measured) |
