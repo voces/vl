@@ -21,7 +21,11 @@
 # that reason: a corpus of deliberately odd programs — being un-idiomatic is what each
 # cell is FOR — graded by `distilled/regress.py` and not shipped. The prune covers the
 # whole directory, not just `cells/`, because `named/` holds curated cells of the same
-# kind and a per-subdirectory prune silently stops covering the next one added. Unlike the lint above, fmt is PER-FILE (it needs no cross-file
+# kind and a per-subdirectory prune silently stops covering the next one added.
+# `scripts/capability-probes/matrix/` is pruned for a different reason: a `*.matrix.vl` is a
+# TEMPLATE, not a program — `// @@SECTION@@` blocks holding a prelude, a bare type spelling
+# and free-text reasons, from which `matrix.py` GENERATES the programs a compiler sees. The
+# hand-written probes beside it are still checked. Unlike the lint above, fmt is PER-FILE (it needs no cross-file
 # resolution), so the files fan out over the cores (`xargs -P`) — the formatter
 # is the dominant cost of this gate and every file is independent — while the
 # module-graph check runs concurrently in the background. Same files, same
@@ -64,6 +68,7 @@ echo "== fmt-check: compiler/ std/ scripts/ (parallel per file) =="
 FMT_RC=0
 find compiler std scripts \
     -path scripts/silent-sweep/distilled -prune -o \
+    -path scripts/capability-probes/matrix -prune -o \
     -name '*.vl' -print0 \
   | xargs -0 -n 1 -P "$(nproc)" "$VL" fmt --check || FMT_RC=$?
 

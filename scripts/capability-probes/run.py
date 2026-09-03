@@ -7,6 +7,9 @@ See README.md.
 
 NOT A MERGE GATE. Today every probe fails, by construction; that is what makes them probes.
 Run it to find out whether a change moved something the corpus could not see.
+
+`matches`, `classify` and `grade` are the shared grading vocabulary; `matrix.py` imports
+them so a generated position cell and a hand-written probe are read on the same scale.
 """
 import argparse, os, re, subprocess, sys
 
@@ -44,6 +47,73 @@ def expected(path):
     return None
 
 
+def classify(chk_rc, err):
+    """Name the refusal channel from `vl check`'s rc and the combined output.
+
+    Classify by what happened to the MODULE, never by the sentence: `failed to parse` and
+    `Invalid input WebAssembly` are one outcome reached by two host paths, and a probe
+    graded `emit refuses` on the absence of one printed "Checked 1 file, no errors" as its
+    detail — the symptom of a SILENT cell, not of a refusal.
+    """
+    # A HINT is advice on a program that type-checked; it is never the refusal, and letting
+    # it through as the fallback labelled the SILENT probe with a note about an annotation.
+    # `Checked N files, no errors.` and a bare `Error: emit error` are scenery for the same
+    # reason: the first is the CHECK phase's success and the second names no cause, and both
+    # sort ahead of the sentence, so an emit reject's detail read "no errors".
+    lines = [re.sub(r"^\S+?:\d+:\d+:\s*", "", l).strip() for l in err.splitlines()
+             if "[HINT]" not in l and not l.startswith(" ")
+             and not re.match(r"^Checked \d+ file|^Error: \w+ error\s*$", l)]
+    lines = [l for l in lines if l and l != "[ERROR]:"]
+    m = re.search(r"(not yet supported|has no lowering|not supported by codegen)"
+                  r"[^\n\"]{0,54}", err)
+    if chk_rc != 0:
+        where = "check refuses"                  # clause 2: the checker owns the diagnosis
+    elif re.search(r"wasm backtrace|call stack exhausted", err):
+        # THE COMPILER ITSELF TRAPPED -- no diagnosis produced, no module written. It used
+        # to land in the `emit refuses` fallback, which reads as an orderly decision.
+        where = "COMPILER TRAP (check rc 0)"
+    elif re.search(r"Invalid input WebAssembly|WebAssembly translation error"
+                   r"|failed to parse WebAssembly", err):
+        where = "SILENT (check rc 0)"            # clause 1, and worse than an emit reject
+    else:
+        where = "emit refuses"
+    inv = re.search(r"(Invalid input WebAssembly code[^\n]{0,60}|"
+                    r"type mismatch: expected [^\n]{0,48})", err)
+    if where.startswith("SILENT") or where.startswith("COMPILER TRAP"):
+        detail = inv.group(0) if inv else (lines[-1][:70] if lines else err[:70])
+    else:
+        detail = m.group(0) if m else (lines[0][:70] if lines else err[:70])
+    return where, detail
+
+
+def grade(path, compiler, want, vl=VL, env=None, timeout=120):
+    """Grade one program: (verdict, detail, stdout).
+
+    ONE `vl` invocation per healthy cell — `run` first, and `check` only when the run
+    failed, since the rc is all a passing cell needs and only a failing one has a channel
+    to name. Verdicts: RUNS · WRONG · check refuses · emit refuses · SILENT (check rc 0) ·
+    COMPILER TRAP (check rc 0) · TIMEOUT.
+    """
+    try:
+        run = subprocess.run([vl, "run", path, "--compiler", compiler],
+                             capture_output=True, text=True, timeout=timeout, env=env)
+    except subprocess.TimeoutExpired:
+        return "TIMEOUT", "no answer in %ss" % timeout, ""
+    out = run.stdout.strip()
+    if run.returncode == 0:
+        if want is None or matches(want, out):
+            return "RUNS", "", out
+        return "WRONG", out, out
+    try:
+        chk = subprocess.run([vl, "check", path, "--compiler", compiler],
+                             capture_output=True, text=True, timeout=timeout, env=env)
+    except subprocess.TimeoutExpired:
+        return "TIMEOUT", "check gave no answer in %ss" % timeout, out
+    err = chk.stdout + chk.stderr + run.stdout + run.stderr
+    where, detail = classify(chk.returncode, err)
+    return where, detail, out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--compiler", default=SEED)
@@ -57,51 +127,14 @@ def main():
     still, now = [], []
     for fn in probes:
         p = os.path.join(HERE, fn)
-        chk = subprocess.run([VL, "check", p, "--compiler", a.compiler],
-                             capture_output=True, text=True, timeout=120)
-        run = subprocess.run([VL, "run", p, "--compiler", a.compiler],
-                             capture_output=True, text=True, timeout=120)
         want = expected(p)
-        out = run.stdout.strip()
-        if run.returncode == 0:
-            ok = want is None or matches(want, out)
-            (now if ok else still).append((fn, "RUNS but output %r, header says %r"
-                                           % (out, want) if not ok else "runs"))
+        verdict, detail, out = grade(p, a.compiler, want)
+        if verdict == "RUNS":
+            now.append((fn, "runs"))
+        elif verdict == "WRONG":
+            still.append((fn, "RUNS but output %r, header says %r" % (out, want)))
         else:
-            err = (chk.stdout + chk.stderr + run.stdout + run.stderr)
-            # A HINT is advice on a program that type-checked; it is never the refusal, and
-            # letting it through as the fallback labelled the SILENT probe with a note about
-            # a redundant annotation.
-            lines = [l for l in err.splitlines()
-                     if l.strip() and "[HINT]" not in l and not l.startswith(" ")]
-            m = re.search(r"(not yet supported|has no lowering|not supported by codegen)"
-                          r"[^\n\"]{0,54}", err)
-            if chk.returncode != 0:
-                where = "check refuses"          # clause 2: the checker owns the diagnosis
-            elif re.search(r"wasm backtrace|call stack exhausted", err):
-                # THE COMPILER ITSELF TRAPPED. Not a refusal at all -- no diagnosis was
-                # produced and no module was written. It used to land in the `emit refuses`
-                # fallback, which reads as an orderly decision the compiler never made.
-                where = "COMPILER TRAP (check rc 0)"
-            elif re.search(r"Invalid input WebAssembly|WebAssembly translation error"
-                           r"|failed to parse WebAssembly", err):
-                # clause 1: worse, and easy to misread as emit. `failed to parse` is the
-                # same outcome as the other two reached by a different host path -- a probe
-                # was graded `emit refuses` on its absence, with the DETAIL line then
-                # printing "Checked 1 file, no errors", which is the symptom of a SILENT
-                # cell and not of a refusal. Classify by what happened to the MODULE.
-                where = "SILENT (check rc 0)"
-            else:
-                where = "emit refuses"
-            inv = re.search(r"(Invalid input WebAssembly code[^\n]{0,60}|"
-                            r"type mismatch: expected [^\n]{0,48})", err)
-            if where.startswith("SILENT") or where.startswith("COMPILER TRAP"):
-                # The validator's own sentence, not the clean `vl check` output that
-                # precedes it -- "Checked 1 file, no errors" is the SYMPTOM, not the detail.
-                detail = inv.group(0) if inv else (lines[-1][:70] if lines else err[:70])
-            else:
-                detail = m.group(0) if m else (lines[0][:70] if lines else err[:70])
-            still.append((fn, f"{where}: {detail}"))
+            still.append((fn, f"{verdict}: {detail}"))
 
     for fn, why in now:
         print(f"  RUNS  {fn}")

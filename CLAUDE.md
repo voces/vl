@@ -237,6 +237,11 @@ not: global ASSIGNMENT (`b = e` between two module globals) lowers through `emit
 tiny program per position, each printing a value that proves the conversion actually happened
 (`b[0] / 2.0` → `1.5`, not `1`) — found it in one run. Reading the call sites did not.
 
+**`scripts/capability-probes/matrix.py` is the instrument — do not hand-write the grid.** One
+`matrix/*.matrix.vl` template (a prelude, the value, its type, a proof that prints) generates
+and grades all twenty positions in both faces, `--before`/`--after` two seeds, exiting
+non-zero on `runs → not-runs` or any `SILENT`; `--keep` leaves a red cell ready to file.
+
 ## The goal is `runs`, and making a failure LOUD does not move it
 
 Standing bar: **every program the language design permits compiles and runs correctly.** Two

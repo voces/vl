@@ -135,6 +135,16 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   either form, so nothing else changes that day. Two gates came out of it:
   `tests/vl_inventory_refs_test.ts` (a cited row must EXIST — #2405 deleted a row and every
   gate stayed green) and the file-stem check in `vl_inventory_rows_test.ts`.
+- **Modernization program — (2) position-matrix harness, DONE #2415**:
+  `scripts/capability-probes/matrix.py` generates a capability's POSITION × FACE matrix from
+  ONE `matrix/*.matrix.vl` template — twenty delivery and discrimination positions, both
+  faces, one program per cell each printing a value only a correct conversion produces —
+  and grades it in `run.py`'s vocabulary, exiting non-zero on `runs → not-runs` between two
+  seeds or any `SILENT` after. Briefs stop hand-writing ~40 programs and stop losing the
+  ones they skip: D965 lost global assignment, D1193 was silent at seven of nine positions,
+  #2406 missed the un-annotated return face and the early-return guard. Four templates ship
+  as the harness's own controls, D1197's `array_push` cell grading `SILENT` among them
+  (`tests/vl_capability_matrix_test.ts`). README §"The position matrix".
 - **Width subtyping — RULED (owner, 2026-09-01): the non-prefix refusal is a GAP, closed
   the Roc way** — shape-monomorphization of narrow-typed consumers (offsets constant per
   caller shape; zero runtime cost; paid in instance count — the variant-count tradeoff
