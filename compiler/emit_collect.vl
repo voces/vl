@@ -626,6 +626,8 @@ import {
   unionNameOfExpr,
   unionSetHasNull,
   variantFieldLitRepMixed,
+  variantFieldLitRepStrMixed,
+  variantFirstLayoutDisagreeField,
   variantIndexOf,
   variantIndexOfLet,
   variantLitDiscriminable,
@@ -11055,18 +11057,18 @@ function variantFieldTysEq(a: i32, b: i32) {
   true
 }
 
-// D1050 — LAY A MIXED-SPELLING DISCRIMINATED PAIR OUT UNDER ONE REP.
+// LAY A MIXED-SPELLING DISCRIMINATED PAIR OUT UNDER ONE REP (D1050, D1460, D1461). A string
+// literal set has two: a registered ALIAS is the interned i32 atom, an inline `"x" | "y"` a
+// `(ref $string)`. D1023's ruling calls one arm of each legal while the two share no heap type.
 //
-// A string literal set has two representations and `nodeTyIsLitUnionAlias` is the seam: a
-// registered ALIAS is the interned i32 atom, an inline `"x" | "y"` a `(ref $string)`. Spell one
-// arm each way and D1023's ruling calls the pair legal — both arms carry a string literal set
-// at `kind`, so `is` is a membership question about the VALUE — while the two arms have no
-// single heap type to share. That was the refusal this pass removes.
+// EACH FIELD GOES TO THE REP ITS ARMS CAN BOTH HOLD. Two sets meet on the ATOM
+// (`variantFieldLitRepMixed`) — its consumers are all built, so the promotion costs no new
+// lowering. A set beside its own BASE meets on the STRING (`variantFieldLitRepStrMixed`): an
+// arbitrary string has no interned id, so the atom is the one rep they cannot share.
 //
-// THE ATOM IS THE REP THEY UNIFY ON, measured rather than aesthetic: the atom side already has
-// every consumer built. TWO ROWS MOVE PER PROMOTED FIELD and moving only the first is invalid
-// wasm — the VARIANT row is what the box is cast through, the arm's DECLARED STRUCT row is what
-// every use outside the union builds. It promotes only what `variantFieldLitRepMixed` names.
+// TWO ROWS MOVE PER FIELD either way and moving only the first is invalid wasm — the VARIANT
+// row is what the box is cast through, the arm's DECLARED STRUCT row is what every use outside
+// the union builds.
 function unifyMixedLitRepArms(): i32 {
   if !uDeclared { return 0 }
   let ui = 0
@@ -11087,6 +11089,12 @@ function unifyMixedLitRepArms(): i32 {
             if variantFieldLitRepMixed(va, vb, fi) {
               if promoteLitFieldToAtom(va, fi) < 0 { return -1 }
               if promoteLitFieldToAtom(vb, fi) < 0 { return -1 }
+            } else if variantFieldLitRepStrMixed(va, vb, fi) {
+              // The DEMOTION is a sink — the base arm is already a string and stays one — so
+              // a three-arm group mixing an alias, an inline set and the base converges on the
+              // string rep whatever order this loop visits its arms in.
+              if demoteLitFieldToString(va, fi) < 0 { return -1 }
+              if demoteLitFieldToString(vb, fi) < 0 { return -1 }
             }
             fi = fi + 1
           }
@@ -11150,6 +11158,38 @@ function promoteLitFieldToAtom(vi: i32, fi: i32): i32 {
   0
 }
 
+// Re-lay variant `vi`'s field `fi` — an atom-repped string literal set — under the STRING rep,
+// in BOTH tables. A row already at code 3 is the base arm (or an inline set) and is left
+// exactly as it is, so the pass is idempotent.
+//
+// THE ROW LANDS WHERE A DECLARED INLINE SET'S ROW ALREADY IS — code 3, the member-set spelling
+// in the elem-NAME column, the set's arena type in the D5 sidecar — which is why no consumer
+// needs a new arm: `emitDiscrimFieldEq`'s code-3 arm compares strings, the read yields a
+// `(ref $string)`, and an atom-typed destination narrows it back through
+// `strReppedLitUnionAt` -> `emitStrToAtom` off the node's own type (D1460). A one-member set
+// has no inline spelling, and "" is exactly what a declared bare-literal row carries.
+function demoteLitFieldToString(vi: i32, fi: i32): i32 {
+  const r = uFieldStart[vi] + fi
+  const lty = uFieldLitTyIx[r]
+  if lty < 0 { return 0 }
+  const nm = litUnionInlineNameOfTy(lty)
+  if uFieldTypes[r] != 3 {
+    uFieldTypes[r] = 3
+    uFieldElemName[r] = nm
+    setUFieldElemRowTy(r, lty)
+  }
+  const si = structIndexOfTypeName(uVariants[vi])
+  if si >= 0 && fi < sFieldCount[si] {
+    const sr = sFieldStart[si] + fi
+    if sFieldTypes[sr] != 3 {
+      sFieldTypes[sr] = 3
+      sFieldElemName[sr] = nm
+      setSFieldElemRowTy(sr, lty)
+    }
+  }
+  0
+}
+
 // Assign each variant its GLOBAL tag = its rank when the variants are ordered by
 // structural signature (`variantSig`, sorted). `uTags[i]` is variant i's tag: the
 // number of variants whose sig sorts strictly before variant i's (sigs are distinct,
@@ -11205,21 +11245,23 @@ export function assignTags() {
             !variantLitDiscriminable(vs0 + a, vs0 + b) &&
             !variantLitRepUnifiable(vs0 + a, vs0 + b)
           ) {
-            // TWO REFUSALS, because they are two different things and one sentence was
-            // saying the wrong one about the second (D1023). The DESIGN rule — arms nothing
-            // tells apart — is the checker's now (`checkUnionDiscriminable`), so reaching it
-            // here is an unreachable floor. What still arrives is the CAPABILITY gap: two
-            // arms the ruling calls legal whose literal sets rep differently (an interned
-            // atom beside a string ref), where the types agree and only the layouts do not.
+            // TWO REFUSALS, and only the SECOND is live. The DESIGN rule — arms nothing
+            // tells apart — reaches here for real (`same-field-names-i32-vs-boolean-reject`
+            // is its pin), so it keeps a sentence about the PROGRAM. The first no longer
+            // describes any program: every mixed literal discriminant is now re-laid onto
+            // one rep, so it is a floor and says so instead of conceding a capability and
+            // prescribing an edit that fixed neither program it was shown to (D1461).
             if variantLitRepMismatch(vs0 + a, vs0 + b) {
               return emitFail(
-                "emitProgram: union `" +
+                "emitProgram: assignTags: union `" +
                   unNames[ui] +
-                  "` discriminates `" +
+                  "` gives `" +
                   uVariants[vs0 + a] +
-                  "` from `" +
+                  "` and `" +
                   uVariants[vs0 + b] +
-                  "` on a literal field whose two arms rep differently (a named literal-union alias is an interned atom, an inline set a string) — this program is type-valid but cannot build; spell both arms the same way",
+                  "` one tag while their literal discriminant at field `" +
+                  variantFirstLayoutDisagreeField(vs0 + a, vs0 + b) +
+                  "` is laid out two ways — `unifyMixedLitRepArms` re-lays a mixed pair onto one rep and did not reach this one, so this is a compiler bug rather than something to change in the program",
               )
             }
             return emitFail(
