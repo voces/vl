@@ -63,6 +63,18 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   (`TPL_RENDER_EXPORT` in `driver.vl`).
 - **`else` requires braces** — DONE #2165; recorded here only because the ruling predates
   the entry above and the DECISIONS entry is the durable home.
+- **An else-less `if` as a VALUE is `T | null` everywhere — RULED (owner, 2026-09-02) and
+  BUILT the same day as D1086.** The checker rule is one line (`thenTy | null` whenever the
+  then arm carries a value; a statement arm's `thenTy` is already `void`, so the statement
+  half needs no gate), the emitter's synthesized else arm is the rep's own null at the four
+  value-`if` sinks, and the row's 2×12 scope × rep grid grades 48 of 48 at both faces. The
+  residue is D1250 — `??` over an if-expression written IN PLACE, which refuses at the
+  explicit-`else` spelling too. DECISIONS.md §"An else-less `if` used as a VALUE".
+- **UFCS is never implicit; the LSP surfaces the import — RULED (owner, 2026-09-02).**
+  `expect(x).toEqual(y)` keeps needing `toEqual` imported. Tooling: completion after `.`
+  offers a module's exported `f(self: T, …)` with an auto-import edit; a quick-fix on the
+  D1230 diagnostic adds the name to the import; the diagnostic itself names the missing
+  import (compile-goal, D1230). DECISIONS.md §"UFCS is never implicit". Tooling track.
 - **An else-less `if` as a VALUE is `T | null` everywhere — RULED (owner, 2026-09-02), TO BUILD
   as D1086.** Checker first (return / `??` / argument / field / element / assignment RHS agree
   with the binding rule), then the emitter's synthesized `null` else arm over the row's 2×12
