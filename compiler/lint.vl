@@ -1,71 +1,33 @@
-// Static lint pass for the self-hosted front end — the VL port of the TS
-// `compiler/lint.ts` rules (roadmap B17, "diagnostics build-out"), reproducing each
-// one's `code`, message text and severity. A post-parse analysis over the AST arena
-// (`P.nodes`), deliberately a SEPARATE module: it consumes the arena the parser
-// already built rather than re-deriving scope/binding information.
+// Static lint pass for the self-hosted front end (roadmap B17, "diagnostics build-out"):
+// a post-parse analysis over the AST arena (`P.nodes`), deliberately a SEPARATE module
+// because it consumes the arena the parser already built rather than re-deriving
+// scope/binding information.
 //
-// ── What this port DOES and DOES NOT cover (the infrastructure gap) ──────────
-// The TS lint consumes a rich `SymbolTable` of `Binding` objects carrying
-// per-binding metadata (`mutable`, `exported`, `isImport`, `kind`, `name`, and
-// per-occurrence `isWrite`) and a `NodeSpans` side-table of full start/stop
-// source ranges. The self-hosted front end carries NEITHER:
-//   - The native symbol table (`typecheck.vl`) is a flat parallel-`i32[]` model
-//     keyed by declaring-node index; it records occurrence/decl/use and a coarse
-//     binding KIND only — not `mutable` / `exported` / `isImport` / `isWrite`.
-//   - The native AST has no full-span side-table: `nodeToks[i]` anchors a node at
-//     its LAST token only (`ast.vl`; full start/stop spans are scoped but not
-//     built — see docs/selfhost-spans-design.md). The native parser also DROPS
-//     the `export` modifier from the AST entirely.
-// So this port reconstructs what the rules need DIRECTLY from the AST + token
-// stream: use/write information by NAME (a name is used iff referenced, written
-// iff an assignment LHS), and the `export` modifier by token scan (an `EXPORT`
-// keyword two tokens before a declaration's name). Consequently EVERY diagnostic
-// below is anchored at a single `line:col` — the node's anchor / name / keyword
-// token — where the TS lint emits a full start-stop range.
+// THE RULE SET IS `lint()`'S CALL SEQUENCE, not this header — a list here goes stale the
+// first time a rule is added. Each rule has its own section header below carrying what it
+// fires on, the bound it accepts and why. `empty-intersection` is deliberately absent: the
+// type checker already emits the equivalent `never`-type error, so a lint would add nothing.
 //
-// Rules ported:
-//   - constant-condition  : `if false {…}` / `if true {…} else {…}` /
-//                           `while false {…}`  (literal-boolean dead branch).
-//   - for-step-zero       : a range `for` with a literal `step 0`  (error).
-//   - unreachable-code    : a statement after one that always stmtDiverges
-//                           (`return`/`break`/`continue`, or an if/else where
-//                           both arms diverge) in the same block.
-//   - unused-function     : a non-exported, never-referenced top-level
-//                           `function` (reference set collected from the AST,
-//                           matching the TS `collectReferencedNames` model).
-//   - unused-variable     : an unread `variable` / `parameter` binding (a `_`
-//                           name downgrades to a `hint`; exported top-level
-//                           bindings are exempt).
-//   - prefer-const        : a `let` that is read but never reassigned.
-//   - unconditional-recursion : a function whose every path calls ITSELF, so it
-//                           can never return (fires with the return type
-//                           annotated — no other diagnostic covers that
-//                           spelling).
-//   - unused-import       : an `ImportDecl` local binding never referenced in
-//                           its own module — by an `Ident` occurrence resolving
-//                           to it (binding-keyed, via the scope stack), a UFCS
-//                           member-call property, or a TYPE position (an
-//                           annotation/`is`/union-variant name segment).
-//   - duplicate-import    : the SAME specifier written twice — one local name
-//                           bound twice from one source by two specifiers that
-//                           also agree about the imported name. The second one
-//                           binds nothing new (D1120 rules it legal); this says
-//                           so. Two DIFFERENT declarations under one name are
-//                           the driver's ERROR, not this.
+// ── What this pass RECONSTRUCTS, and why ─────────────────────────────────────
+// The rules want per-binding metadata (`mutable`, `exported`, `isImport`, per-occurrence
+// `isWrite`) and full start/stop source ranges. The front end carries NEITHER:
+//   - the symbol table (`typecheck.vl`) is a flat parallel-`i32[]` model keyed by
+//     declaring-node index, recording occurrence/decl/use and a coarse binding KIND only;
+//   - the AST has no full-span side-table — `nodeToks[i]` anchors a node at its LAST token
+//     (`ast.vl`; see docs/internals/selfhost-spans-design.md) — and the parser DROPS the
+//     `export` modifier entirely.
+// So this pass derives what the rules need DIRECTLY from the AST + token stream: use/write
+// by NAME (used iff referenced, written iff an assignment LHS), and `export` by token scan
+// (an `EXPORT` keyword two tokens before a declaration's name). Consequently EVERY
+// diagnostic below is anchored at a single `line:col` — the node's anchor, name, or keyword
+// token — never a start-stop range.
 //
-// NOT ported (need metadata the native front end does not produce):
-//   - empty-intersection  : needs the `emptyIntersectionInfo` records the type
-//     checker attaches; the native type checker ALREADY emits the equivalent
-//     `never`-type error itself, so the standalone lint adds nothing here.
-//
-// BINDING IDENTITY: variable/parameter use/write tracking is BINDING-keyed — a
-// lexical scope stack resolves each `Ident` occurrence to the innermost visible
-// declaration (see the binding-scan section) — so an inner binding reusing an
-// outer binding's name no longer masks the outer one. FUNCTION references stay
-// name-keyed (functions are hoisted and dispatch by name — `Call` callees,
-// UFCS `.m(…)` properties, operator methods), which is also the residual
-// divergence: a local shadowing a FUNCTION name attributes the name's uses to
-// the local. Exact for programs that don't shadow function names.
+// BINDING IDENTITY: variable/parameter use/write tracking is BINDING-keyed — a lexical
+// scope stack resolves each `Ident` occurrence to the innermost visible declaration — so an
+// inner binding reusing an outer name no longer masks the outer one. FUNCTION references
+// stay name-keyed (functions hoist and dispatch by name: `Call` callees, UFCS `.m(…)`
+// properties, operator methods), which is the residual divergence — a local shadowing a
+// FUNCTION name attributes the name's uses to the local.
 
 import {
   ArrayLit,
@@ -212,9 +174,9 @@ export function lint(progRoot: i32) {
   if root is Program {
     const stmts = root.progStmts
     // Rule order: unused-variable, unused-imports, duplicate-imports, unused-function,
-    // prefer-const, then one full-program walk per structural rule. Display order is position-sorted
-    // downstream (the CLI's stable sort), so the emit sequence here only breaks
-    // same-position ties. The binding/reference scan drives the binding rules
+    // prefer-const, then one full-program walk per structural rule. Display order is
+    // position-sorted downstream (the CLI's stable sort), so the emit sequence here only
+    // breaks same-position ties. The binding/reference scan drives the binding rules
     // and unused-function alike, so collect it once first.
     collectBindingsAndRefs(progRoot)
     unusedBindings()
@@ -238,38 +200,17 @@ export function lint(progRoot: i32) {
 }
 
 // ── union-let-no-melt ────────────────────────────────────────────────────────
-//
-// A union-typed `let` DECLARED INSIDE A LOOP and written again in the body allocates a
-// union box on every trip that the `const u = if … else …` spelling of the same program
-// does not. Measured, two spellings of one program, 100 M trips
-// (`unboxed-union-rep-design.md` §13.4):
-//
-//     plain `vl build`   1.52x        `vl build -O`   2.54x        `-O3`   2.50x
-//
-// WHY THE COMPILER CANNOT JUST FIX IT — the rule is not a stand-in for missing work.
-// Binaryen's Heap2Local scalarizes per allocation SITE, and only when every local an
-// allocation reaches provably holds that ONE allocation. Two `struct.new` writing one
-// local defeats it for both, and no marker the emitter can add changes that. Collapsing it
-// means holding tag and payload in scalars across a liveness window — a REPRESENTATION
-// change, refused twice (§13.3, and the re-open at §13.6). What is left is that the cheap
-// alternative is invisible in the source, which is a diagnostic's job.
-//
-// LOOP BODIES ONLY, and the bound is deliberate. The cliff costs what it costs PER TRIP,
-// so outside a loop it is one allocation and not worth a word. Restricting here is also
-// what keeps the rule quiet: it fires ZERO times across `compiler/ std/ bench/ tests/` as
-// measured before it was written, because this tree is a compiler and the shape's home is
-// a per-tick simulation loop. That is a known and accepted false-NEGATIVE bound — a `let`
-// declared just outside its own loop is missed — taken because a diagnostic that cries
-// wolf is one nobody reads.
-//
-// SYNTACTIC, because that is all this pass has (see the file header), and the exclusions
-// are chosen so what remains really does box:
-//   - `T | null` (one non-null member) is a NICHE, not a box.
-//   - an all-literal union (`"a" | "b"`, `1 | 2`) interns as an i32 atom, not a box.
-//   - a `|` nested inside `[]` / `()` / `{}` / `<>` belongs to an ELEMENT or a field, not
-//     to this binding's own type.
-// What it cannot see is an ALIAS hiding a literal union (`type N = 1 | 2` then
-// `let x: N | i32`); that would over-report, and it is the residual this bound accepts.
+// A union-typed `let` DECLARED INSIDE A LOOP and written again in the body boxes on every
+// trip where the `const u = if … else …` spelling does not. The compiler cannot just fix
+// it: Heap2Local scalarizes per allocation SITE, two `struct.new` into one local defeat it,
+// and collapsing it is a REPRESENTATION change refused twice (`unboxed-union-rep-design.md`
+// §13.3, §13.6) — so the cheap alternative being invisible in the source is a diagnostic's
+// job. LOOP BODIES ONLY, since outside one it is a single allocation: an accepted
+// false-NEGATIVE bound that also keeps the rule quiet. SYNTACTIC, because that is all this
+// pass has (see the file header), with exclusions so what remains really boxes: `T | null`
+// is a NICHE, an all-literal union interns as an i32 atom, and a `|` nested in
+// `[]`/`()`/`{}` belongs to an element or field. An ALIAS hiding a literal union is the
+// residual it over-reports.
 function unionLetNoMeltVisit(ix: i32) {
   const n = P.nodes[ix]
   let body = -1
@@ -403,31 +344,17 @@ function nameReassignedIn(ix: i32, name: string) {
 }
 
 // ── map-has-guard-reread ─────────────────────────────────────────────────────
-//
 // `if m.has(k) { … m[k] … }` — the guard PROBES the map, then the read probes it AGAIN,
 // and the guard buys nothing: it does not narrow the read.
 //
-// MEASURED, in one loop at `-O3`, in-loop counts (ROADMAP B6d):
-//
-//     const v = m[k]  then `if v is i32`     1 allocation, 1 probe
-//     if m.has(k) { … m[k] … }               1 allocation, 2 probes
-//     m[k] as! i32                           0 allocations, 1 probe
-//
 // WHY IT CANNOT NARROW, so the rule is not asking for a missing feature: `m[k]` is not a
 // stable place. Carrying "present" from the guard to the read needs a proof that nothing
-// mutated `m` and nothing changed `k` in between — including through any call — which is
-// an aliasing analysis, not a narrowing rule. TypeScript declines the same thing for the
-// same reason: it narrows a BINDING, never a repeated call.
-//
-// SO THE FIX IS A SPELLING, and there are two, which is why this is `info` and names both:
-// `m[k] as! V` asserts presence (one probe, no box, and the trap rides the probe's own
-// compare), or bind once — `const v = m[k]` — and narrow `v`, which IS a stable place.
-//
-// CONSERVATIVE ON PURPOSE. It fires only when the receiver is a plain name and the key is
-// a plain name or a literal, and it declines if the guard body assigns to either or calls
-// a mutating method on the receiver — in those cases the second probe may be doing real
-// work. The residual it does NOT model is an opaque call mutating a module-level map
-// between the two; that is why this is a hint rather than a warning.
+// mutated `m` and nothing changed `k` in between — including through any call — which is an
+// aliasing analysis, not a narrowing rule. SO THE FIX IS A SPELLING, and there are two,
+// which is why this is `info` and names both: `m[k] as! V` asserts presence (one probe, no
+// box), or bind once — `const v = m[k]` — and narrow `v`, which IS a stable place.
+// CONSERVATIVE: only a plain-name receiver and a plain-name-or-literal key, and it declines
+// when the guard body assigns to either or calls a mutating method on the receiver.
 function hasGuardRereadVisit(ix: i32) {
   const s = P.nodes[ix]
   if s is IfStmt {
@@ -714,46 +641,17 @@ function blockRereads(ix: i32, recvName: string, key: i32) {
 }
 
 // ── unused-pure-expression ───────────────────────────────────────────────────
-//
 // A NON-FINAL expression statement whose value is discarded and whose evaluation is
-// trivially pure does nothing at all — it is almost always a stray edit, half of a
-// deleted line, or a mistyped assertion:
+// trivially pure does nothing at all — a stray edit, half of a deleted line, a mistyped
+// assertion. FINAL statements are exempt EVERYWHERE: VL is expression-oriented and a
+// block's tail IS its value, so only a statement with another after it in the same list
+// can have its value discarded for sure.
 //
-//     it("fails", () => { 3; expect(1).toEqual(2) })   // the `3` does nothing
-//
-// FINAL statements are exempt EVERYWHERE, not just in function bodies: VL is
-// expression-oriented and a block's tail IS its value — a function tail is the return
-// value, a statement-if's arm tails are the if's value, and this file's own house style
-// ends void-ish functions with a bare `0`. Only a statement with at least one statement
-// AFTER it in the same list can have its value discarded for sure.
-//
-// TRIVIALLY PURE is a closed syntactic whitelist, and the NAME is broader than the
-// detector on purpose — full purity semantics are out of scope for v1:
-//   - a literal (number / string / char / boolean / null);
-//   - a bare identifier (a lone READ: no operator dispatch, no call, no member access);
-//   - `(e)` over pure;
-//   - an OPERATOR expression — unary `-` / `!`, or a binary from a closed op list (`=`
-//     is an assignment, never pure) — ONLY when every leaf operand is a LITERAL;
-//   - an array / struct literal whose every element / field value is pure under these
-//     same rules (an element that is a bare identifier read is fine — reads do not
-//     dispatch; the dead allocation is the waste being reported).
-// NOTHING containing a call, member access, or index anywhere inside qualifies: a call
-// has effects, and a member or index read can trap — so `f()`, `a.b`, `xs[0]`, and
-// everything built over them stays quiet.
-//
-// THE LITERAL-LEAF BOUND ON OPERATORS IS CHOSEN FOR SOUNDNESS, not caution for its own
-// sake: VL has operator overloading (`function +(self, b) { … }`), so `a + b` over
-// identifier operands can dispatch to an arbitrary user FUNCTION with effects, and this
-// tier is syntactic — it cannot resolve the dispatch. Literal leaves are on the safe
-// side of a MEASURED line, not a guessed one: `function +(self: i32, b: i32)` is
-// refused at check with `operator + can never dispatch: self is the LEFT OPERAND and
-// dispatch needs an object, but i32 is not one` (current seed) — dispatch requires an
-// OBJECT-typed left operand, and a literal can never be an object, so an all-literal
-// operator tree provably cannot hit an overload. `1 + 2` flags; `a + 1` and `-x` stay
-// quiet. Growth paths: the same measurement licenses relaxing to "literal LEFT-most
-// leaf" (only the left operand dispatches), and with type information an
-// identifier-operand operator whose dispatch resolves BUILTIN can join the pure set;
-// v1 ships the conservative all-literal-leaves bound.
+// TRIVIALLY PURE is a closed syntactic whitelist — literals, a bare identifier read, `(e)`
+// over pure, an array/struct literal of pure parts, and an operator expression whose every
+// leaf is a LITERAL. Anything holding a call, member access or index stays quiet: a call has
+// effects and a member/index read can trap. The LITERAL-LEAF bound is SOUNDNESS, not
+// caution — VL has operator overloading, and dispatch needs an OBJECT-typed left operand.
 function unusedPureExprVisit(ix: i32) {
   const n = P.nodes[ix]
   if n is Block { reportUnusedPureIn(n.blkStmts) }
@@ -891,19 +789,17 @@ function lintWalk(rule: i32, ix: i32) {
 }
 
 // ── 3. Dead / constant branch (literal-boolean condition) ────────────────────
-// Detect statically-dead branches driven by a LITERAL boolean condition (no
-// general constant folding — only a `BoolLit` in condition position):
+// Detect statically-dead branches driven by a LITERAL boolean condition (no general
+// constant folding — only a `BoolLit` in condition position):
 //   - `if false { … }`            → the then-branch is dead.
 //   - `if true { … } else { … }`  → the else-branch is dead.
 //   - `while false { … }`         → the body never runs.
-// One warning per dead construct, pointing at the dead branch/body. The shared
-// walker (`lintWalk`) carries the recursion, so nested constructs — including
-// the live branch's contents — are still scanned.
+// One warning per dead construct, pointing at the dead branch/body; the shared walker
+// (`lintWalk`) carries the recursion, so nested constructs are still scanned.
 //
-// VL desugars an `else if` chain into a NESTED `IfStmt` in the `ifElse` slot
-// (the TS host keeps a flat `conditionals[]` array). So a chained `else if false`
-// is reached by the ordinary recursion into `ifElse` — each `IfStmt` examines its
-// OWN single condition, which is the natural fit for the desugared shape.
+// VL desugars an `else if` chain into a NESTED `IfStmt` in the `ifElse` slot, so a chained
+// `else if false` is reached by the ordinary recursion into `ifElse`: each `IfStmt` examines
+// its OWN single condition, which is the natural fit for the desugared shape.
 function constantBranchVisit(ix: i32) {
   const s = P.nodes[ix]
   if s is IfStmt { reportConstantIf(s) }
@@ -986,21 +882,17 @@ function reportDegenerateStep(node: ForRange) {
 }
 
 // ── 5. Unreachable code ──────────────────────────────────────────────────────
-// Whether a statement ALWAYS stmtDiverges — control never falls through to a
-// following sibling. Direct diverging statements are `return`/`break`/`continue`.
-// A block stmtDiverges when ANY of its statements stmtDiverges (matching the TS lint's
-// `.some(stmtDiverges)` — everything after the first divergence is itself
-// unreachable, but the block as a whole still stmtDiverges). An `if` stmtDiverges only
-// when it has an `else` AND both the then- and else-arm diverge. Conservative:
-// anything uncertain is treated as fall-through, so reachable code is never
-// reported unreachable.
+// Whether a statement ALWAYS stmtDiverges — control never falls through to a following
+// sibling. Direct diverging statements are `return`/`break`/`continue`. A block diverges
+// when ANY of its statements does (everything after the first divergence is itself
+// unreachable, but the block as a whole still diverges). An `if` diverges only when it has
+// an `else` AND both arms diverge. Conservative: anything uncertain is fall-through, so
+// reachable code is never reported unreachable.
 //
-// NAME: `stmtDiverges`, not `diverges` — when lint.vl joins the full compiler
-// assembly, a bare `diverges` collides with a LOCAL `let diverges` in
-// typecheck.vl, and the seed's capture analysis (which excludes top-level
-// function names from a lambda's captures) then mis-resolves that local,
-// emitting "captured variable not found in enclosing frame". Underlying
-// capScan-shadowing bug is tracked separately; the unique name sidesteps it.
+// NAME: `stmtDiverges`, not `diverges` — a bare `diverges` collides with a LOCAL
+// `let diverges` in typecheck.vl, and the seed's capture analysis (which excludes top-level
+// function names from a lambda's captures) then mis-resolves that local, emitting "captured
+// variable not found in enclosing frame". The unique name sidesteps that bug.
 function stmtDiverges(ix: i32) {
   if ix < 0 || ix >= P.nodes.length { return false }
   const s = P.nodes[ix]
@@ -1053,30 +945,17 @@ function unreachableVisit(ix: i32) {
 }
 
 // ── 6. Unconditional recursion ───────────────────────────────────────────────
-// A function that calls ITSELF on every path through its body can never return:
-// the call recurses until the stack is exhausted. The classic accident is a
-// missing (or unreachable) base case —
+// A function that calls ITSELF on every path through its body can never return -
+// `function loop(n: i32): i32 { return loop(n + 1) }`, a missing base case. The ANNOTATED
+// spelling is the one no other diagnostic sees: without the annotation the checker reports
+// "cannot infer a return type", and annotating it silences that message without fixing the
+// defect, so this rule is deliberately annotation-independent.
 //
-//     function loop(n: i32): i32 { return loop(n + 1) }
-//
-// — and the annotated spelling above is exactly the one no other diagnostic
-// sees: WITHOUT the annotation the checker reports "cannot infer a return type",
-// and annotating it silences that message without fixing the defect. This rule
-// is annotation-independent, so it survives that workaround.
-//
-// The analysis is a clean-PATH existence question, not a "does the body contain
-// a self-call" question: the rule fires only when NO path reaches a function
-// exit without a self-call. That is what keeps every real recursion quiet — a
-// base case (`if n == 0 { return 0 }`) is a clean exit path, a self-call in a
-// loop body or one `if` arm is a path that may skip it, and a self-call behind
-// `&&`/`||`/`??` is a path that short-circuits before it.
-//
-// SCOPE: direct self-recursion, keyed by the declaration's own name, over the
-// body of ONE function — the walk never descends into a NESTED `FuncDecl`, whose
-// body only runs when that inner function is called (the shared walker visits it
-// separately, against its own name). Mutual recursion (`f` → `g` → `f`) is out
-// of scope: proving it needs a must-call graph over the whole module, and this
-// rule's value is in the shape that has no other diagnostic at all.
+// It asks a clean-PATH existence question, not "does the body contain a self-call": it fires
+// only when NO path reaches a function exit without one. That keeps real recursion quiet — a
+// base case is a clean exit, a self-call in a loop body or one `if` arm may be skipped, one
+// behind `&&`/`||`/`??` short-circuits. SCOPE is direct self-recursion over ONE body, never
+// descending into a nested `FuncDecl`; mutual recursion needs a whole-module call graph.
 const URC_EXIT = 1 // some path RETURNS from the function without a self-call
 const URC_FALL = 2 // some path REACHES THE NEXT statement without a self-call
 
@@ -1265,20 +1144,17 @@ function urcBlockFlags(stmts: i32[]) {
 }
 
 // ── 1b. Unused functions ─────────────────────────────────────────────────────
-// A top-level `function` declared but never referenced anywhere in its file is
-// dead code. The TS rule consults the symbol table AND an AST reference-name set;
-// the native symbol table lacks the binding metadata, so this port relies on the
-// AST reference-name set ALONE (matching the TS `collectReferencedNames` model):
-// the callee of every `Call` and every bare `Ident` value reference. The parser
-// desugars every call form — plain `f(…)`, UFCS `x.m(…)`, operator `a + b` — into
-// a `Call` whose callee is an `Ident`, so collecting those names captures method
-// and operator dispatch too. A function referenced by EITHER signal is spared.
+// A top-level `function` declared but never referenced anywhere in its file is dead
+// code. The port relies on an AST reference-name set ALONE, because the symbol table
+// lacks the binding metadata: the callee of every `Call` plus every bare `Ident` value
+// reference. The parser desugars every call form — plain `f(…)`, UFCS `x.m(…)`,
+// operator `a + b` — into a `Call` whose callee is an `Ident`, so those names capture
+// method and operator dispatch too, and a function referenced by EITHER signal is spared.
 //
-// Exemptions matching the TS rule: an `export`ed function is public surface
-// (never flagged); a `_`-prefixed name is the intentionally-unused marker
-// (downgraded to a `hint`, not a warning).
-// A string-keyed presence map (the `idxByName` idiom): O(1) has/add per name,
-// where the previous string-array scan was O(names) per identifier.
+// Exemptions: an `export`ed function is public surface (never flagged); a `_`-prefixed
+// name is the intentionally-unused marker (downgraded to a `hint`, not a warning).
+// A string-keyed presence map (the `idxByName` idiom): O(1) has/add per name, where the
+// previous string-array scan was O(names) per identifier.
 let lintRefNames: {[string]: i32} = Map()
 
 function refNamesHas(name: string) { (lintRefNames[name] ?? 0) != 0 }
@@ -1379,26 +1255,16 @@ function collectTypeNameRefs() {
 
 // ── Binding-keyed use/write tracking (the scope-aware scan) ──────────────────
 // unused-variable and prefer-const key on BINDING IDENTITY, not name: each
-// `let`/`const`/parameter declaration gets an entry in `declNodes`/`declKinds`
-// (source order) with parallel `declUsed`/`declWritten` flags, and every `Ident`
-// occurrence resolves to the INNERMOST visible binding of that name (a lexical
-// scope stack), marking only that binding. So an inner binding reusing an outer
-// binding's name no longer masks the outer one (name-keying's known divergence).
+// `let`/`const`/parameter declaration gets an entry in `declNodes`/`declKinds` (source
+// order) with parallel `declUsed`/`declWritten` flags, and every `Ident` occurrence resolves
+// to the INNERMOST visible binding of that name — so an inner binding reusing an outer name
+// no longer masks the outer one. The name map above still records EVERY referenced name,
+// because function/operator/UFCS dispatch is name-keyed (`unusedFunctions`) and hoists.
 //
-// The name map above still records EVERY referenced name: function/operator/
-// UFCS-method dispatch is name-keyed (`unusedFunctions`), and function names are
-// hoisted — they resolve without a scope position.
-//
-// Scope model (approximations, all conservative for the rules that consume it):
-//   - TOP-LEVEL `let`s are hoisted for resolution: a function body above a
-//     global's declaration still marks it used (functions only run later).
-//   - Block-local `let`s bind from their statement onward (their initializer is
-//     scanned first, so `let x = x + 1` reads the OUTER x).
-//   - A loop variable (`for v in …`) is a scope entry that shadows without
-//     being a reported binding (no unused-loop-variable rule yet).
-//   - FUNCTION names are not scope entries (name-keyed, hoisted, handled by
-//     unusedFunctions); a local `let` shadowing a function name attributes the
-//     name's uses to the `let` — exact for the no-shadowing common case.
+// The scope model is approximate and every approximation is conservative for its consumers:
+// top-level `let`s hoist for resolution; a block-local binds from its own statement onward
+// (so `let x = x + 1` reads the OUTER x); a loop variable shadows without being a reported
+// binding; and a FUNCTION name is not a scope entry at all.
 let declUsed: i32[] = []
 let declWritten: i32[] = []
 
@@ -1482,22 +1348,18 @@ function nameVisit(ix: i32) {
     refNamesAdd(n.identName)
     bindMark(n.identName, 0)
   } else if n is Unary {
-    // THERE IS NO UNARY OPERATOR DISPATCH — this line used to claim there was.
-    // It read "An operator method (`-x` → `function -(self)`) dispatches by
-    // operator name" and added `n.unOp` on that belief, which is how a dead
-    // `function -(self: i32)` escaped the unused-function report as well as the
-    // checker (silent-class-inventory D444). `checkUnaryNode` never looks for an
-    // operator function and `opSelfFnTy` returns -1 below arity 2; the declaration
-    // is now refused at itself in `parseFuncTail`, so nothing reaches here that
-    // wants naming.
+    // THERE IS NO UNARY OPERATOR DISPATCH — this line used to claim there was, and
+    // added `n.unOp` on that belief, which is how a dead `function -(self: i32)`
+    // escaped the unused-function report as well as the checker (D444).
+    // `checkUnaryNode` never looks for an operator function and `opSelfFnTy` returns
+    // -1 below arity 2; the declaration is now refused at itself in `parseFuncTail`,
+    // so nothing reaches here that wants naming.
     //
-    // THE NAME IS STILL RECORDED, and deliberately: `n.unOp` is `"-"`, `"!"`,
-    // `"p+"` or `"p-"`, none of which can name a declaration this linter tracks
-    // (an arity-2 `function -(self, other)` is named by the BinExpr arm below,
-    // which is the arm that really does dispatch). Dropping the call would be a
-    // second, unmeasured change riding along with a comment fix; keeping it costs
-    // one no-op insert and keeps this walk's shape identical to the TS reference
-    // walk it mirrors.
+    // THE NAME IS STILL RECORDED, deliberately: `n.unOp` is `"-"`, `"!"`, `"p+"` or
+    // `"p-"`, none of which can name a declaration this linter tracks (an arity-2
+    // `function -(self, other)` is named by the BinExpr arm below, which IS the arm
+    // that dispatches). Dropping the call would be a second change riding along with
+    // a comment fix; keeping it costs one no-op insert.
     refNamesAdd(n.unOp)
   } else if n is Index {
     lintSawIndexRead = true
@@ -1765,29 +1627,18 @@ function unusedBindings() {
   0
 }
 
-// unused-import: an import local (kind-2 binding) never referenced in its own
-// module. USED means any of the three channels hit:
-//   - an `Ident` occurrence resolved to the binding (binding-keyed — the scope
-//     stack, so a use of a SHADOWING local does not spare the import);
-//   - a UFCS member-call property naming it (`x.m(…)` dispatches to the free
-//     function by name, unaffected by value shadowing);
-//   - a TYPE position naming it (annotation segment, `is` guard, union variant).
-// Message/severity/code mirror the retired TS rule (`Unused import `x` (remove
-// it)`, warning, `unused-import` — the code the LSP remove-import quick-fix
-// dispatches on). No `_`-downgrade: an import has no `_`-prefix suppression
-// (that would need aliasing); the fix is to remove the specifier. Anchored at
-// the imported NAME token. A re-export never registers a binding (it is not an
-// `ImportDecl`), so re-exported names are never flagged.
+// unused-import: an import local (kind-2 binding) never referenced in its own module. USED
+// means any of three channels hit: an `Ident` occurrence resolved to the binding (the scope
+// stack, so a use of a SHADOWING local does not spare the import); a UFCS member-call
+// property naming it (dispatch is by name, so value shadowing does not apply); or a TYPE
+// position (annotation segment, `is` guard, union variant). Anchored at the imported NAME
+// token, under the code the LSP remove-import quick-fix dispatches on. No `_`-downgrade —
+// that would need aliasing, and the fix is to remove the specifier. A re-export registers no
+// binding, so re-exported names are never flagged.
 //
-// A NAME BOUND BY TWO IMPORTS REPORTS ONCE, AT THE LAST OF THEM. Binding-keyed
-// use tracking resolves an occurrence to the INNERMOST visible binding, so with
-// `import { used } from "./h"` written twice the SECOND binding absorbs every
-// use and the FIRST reads unused — `Unused import \`used\`` on a line whose name
-// is referenced two lines down. Two import bindings of one local name are the
-// same declaration in any program that compiles (D1120 refuses the other case),
-// so the twin's use IS this one's use; and where the name is genuinely unused,
-// the last binding still reports it, once. The redundancy itself is
-// `duplicate-import`'s to report — which it does, at the same token.
+// A NAME BOUND BY TWO IMPORTS REPORTS ONCE, AT THE LAST OF THEM: binding-keyed tracking gives
+// every use to the INNERMOST binding, and two import bindings of one local name are the same
+// declaration in any program that compiles (D1120 refuses the other case).
 function unusedImports() {
   let i = 0
   while i < declNodes.length {
@@ -1820,34 +1671,18 @@ function importNameReboundLater(i: i32, name: string) {
   false
 }
 
-// duplicate-import: ONE specifier written twice. Fires when a later import
-// specifier repeats an earlier one in all three of its parts — the SOURCE text
-// (`impPath`, quotes stripped), the imported NAME, and the LOCAL binding — so the
-// second one introduces nothing: `import { area, box } from "./a"` followed by
-// `import { area } from "./a"`, or the same name twice inside one brace list.
+// duplicate-import: ONE specifier written twice — a later specifier repeating an earlier one
+// in all three parts: the SOURCE text (`impPath`, quotes stripped), the imported NAME, and
+// the LOCAL binding, so the second introduces nothing.
 //
-// WHY ALL THREE PARTS AND NOT JUST (source, local). Because the two-part test is
-// the DRIVER's error, not a lint: `import { area as a } from "./a"` beside
-// `import { box as a } from "./a"` binds `a` to two different declarations, which
-// `modDiagDupImport` refuses as `Duplicate binding "a"` (D1120). A rule that fired
-// there too would warn about a program that does not compile, and would suggest
-// "remove one" for a choice the author has to make. Requiring the imported name to
-// agree leaves exactly the redundant case here and the ambiguous case there.
+// ALL THREE PARTS, because the two-part (source, local) test is the DRIVER's error, not a
+// lint: `{ area as a }` beside `{ box as a }` binds `a` to two declarations, which
+// `modDiagDupImport` refuses (D1120) — firing here too would warn about a program that does
+// not compile. And the SPECIFIER TEXT, not the resolved target: a lint reports what the
+// author WROTE, so a name reached through a re-export is one name two ways, not a repeat.
 //
-// WHY THE SPECIFIER TEXT AND NOT THE RESOLVED TARGET. D1120's ERROR tests the
-// resolved merged target on purpose — two spellings that land on one declaration
-// are unambiguous and must keep running. A LINT is a different question: it reports
-// what the author wrote, and `import { area } from "./b"` where `b.vl` re-exports
-// `area` from `./a` is not a repeated specifier, it is one name reached two ways.
-// The owner ruled that shape stays legal and unremarked (2026-09-02), and keying on
-// identical specifier text is what delivers that for free — the lint is per-file and
-// parse-only, so it cannot resolve a re-export chain even if it wanted to. It also
-// means `err-duplicate-import-two-modules` (two different sources) never trips it.
-//
-// Severity `warning`, message in the house style of `Unused import \`x\` (remove
-// it)`, anchored at the SECOND occurrence's imported NAME token — the same anchor
-// `unused-import` uses, so the LSP's remove-import quick-fix (which dispatches on
-// the code and finds the specifier under the range) applies unchanged.
+// Anchored at the SECOND occurrence's imported NAME token, the same anchor `unused-import`
+// uses, so the LSP's remove-import quick-fix applies unchanged.
 function duplicateImports(stmts: i32[]) {
   const seenPath: string[] = []
   const seenName: string[] = []
