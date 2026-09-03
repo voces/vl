@@ -893,7 +893,7 @@ import { nameIsQuotedLeaf, splitUnionAtoms } from "./tyname"
 
 // Emit `exprIx` COERCED to a scalar element kind's value rep — the f64/i64 widen of a
 // narrower literal/`i32` so a list element / `?? d` default matches the backing element
-// type. The i32 kind passes through unchanged (byte-identical to a bare `emitExpr`).
+// type. The i32 kind passes through unchanged — a bare `emitExpr`.
 
 // A `u8[]` element VALUE is an ordinary i32 — there is no widening to do, and the
 // TRUNCATION to one byte is `array.set`'s, not an instruction this has to emit. So the
@@ -1150,19 +1150,17 @@ import { nameIsQuotedLeaf, splitUnionAtoms } from "./tyname"
 // A MAP-typed field (code 19) seeds `pendingMapSlot` so a `Map()` field
 // value constructs THIS field's value-typed map struct (not the mono map).
 
-// A VALUE-UNION field (code 16) coerces a raw scalar/string/null value into
-// the box (`{ y: 5 }` against `{ y: string | i32 }` boxes the 5 with its
-// atom tag); a union-valued field expression passes through unchanged.
+// A VALUE-UNION field (code 16) coerces a raw scalar/string/null value into the box
+// (`{ y: 5 }` against `{ y: string | i32 }` boxes the 5 with its atom tag); a
+// union-valued field expression passes through unchanged.
 //
-// `emitUnionBoxArg`, NOT plain `emitUnionCoerce`, and the cell type is the whole
-// reason: a code-16 field slot IS the `(ref $uBox)`, so it is a BOX-typed position
-// exactly like a call argument / return / list element / map value / push — every
-// one of which routes through this wrapper. `emitUnionCoerce` alone RAW-PASSES a
-// concrete kind-8 VARIANT (`{ s: v }` over `{ s: Shape }` with `v: Circle`) and,
-// since D24's rung landed beside it, the `nulvariant` NICHE too. Both were
-// `vl check` rc 0 and `type mismatch: expected (ref $type), found (ref $type)` at
-// load. The wrapper boxes those two shapes and defers every other one here
-// unchanged, so the scalar / string / null / passthrough cells keep their bytes.
+// `emitUnionBoxArg`, NOT plain `emitUnionCoerce`, because a code-16 field slot IS the
+// `(ref $uBox)` — a BOX-typed position like a call argument / return / list element /
+// map value / push, every one of which routes through this wrapper. `emitUnionCoerce`
+// alone RAW-PASSES a concrete kind-8 VARIANT (`{ s: v }` over `{ s: Shape }` with
+// `v: Circle`) and, since D24's rung landed beside it, the `nulvariant` NICHE too —
+// both check-clean invalid wasm. The wrapper boxes those two shapes and defers every
+// other one here unchanged.
 
 // An f64 field widens its value at the construction boundary (an int
 // literal into `x: f64` re-encodes; an f64 expression passes through).
@@ -1223,18 +1221,16 @@ import { nameIsQuotedLeaf, splitUnionAtoms } from "./tyname"
 // (`gImports + fe`) — the `==` identity token. Mirrors the host's `closureValue`.
 
 // SOUNDNESS FLOOR: a GENERIC function (un-annotated parameters) taken as a VALUE emits its
-// params at the i32 DEFAULT (`vtKindOfParam(-1)` → 0), so the value is only callable at i32 —
-// `g(2.5, …)` / `g("x", …)` then `call_indirect`s at the wrong functype (a signature-check
-// trap), and even the i32 case only "works" by coincidence. A function VALUE must be
-// monomorphic.
-// A `const g = f` used ONLY as a direct-call callee IS sound (each `g(args)` is monomorphized
-// per call site, so the closure is called only at the type its slot was pinned to) and
-// routes through `emitClosureValueCore` directly (the LetDecl emit), skipping this floor.
-// Every OTHER value-use (argument, return, array element) escapes to a call whose type
-// the binding cannot guarantee, and lands here: reject (annotate the parameters, or call it
-// directly by name). NAMED source functions only — a lifted LAMBDA with un-annotated params is
-// either checker-rejected (a bare uninferable binding) or cloned/contextually-pinned per use
-// (a `.map`/`.filter` callback), so its i32 default is sound; `criFnIsAnonLambda` excludes it.
+// params at the i32 DEFAULT (`vtKindOfParam(-1)` → 0), so the value is only callable at i32
+// — `g(2.5, …)` / `g("x", …)` then `call_indirect`s at the wrong functype (a signature-check
+// trap). A function VALUE must be monomorphic.
+//
+// A `const g = f` used ONLY as a direct-call callee IS sound (each `g(args)` is
+// monomorphized per call site, so the closure is called only at the type its slot was pinned
+// to) and routes through `emitClosureValueCore` directly. Every OTHER value-use (argument,
+// return, array element) escapes to a call whose type the binding cannot guarantee, and
+// lands here. NAMED source functions only — a lifted LAMBDA with un-annotated params is
+// checker-rejected or cloned per use, so its i32 default is sound (`criFnIsAnonLambda`).
 
 // A `<T>` TEMPLATE reaches here already resolved or not at all, so it needs no arm of its own:
 // an un-instantiated one is replaced by the monomorphizer's PRUNE (a no-arg void stub) before
@@ -1287,20 +1283,17 @@ import { nameIsQuotedLeaf, splitUnionAtoms } from "./tyname"
 // `call_indirect` operand (imports occupy 0..gImports-1).
 
 // The rep recovery an env-field READ owes after its `struct.get` — the capture twin of the
-// param/local and module-global read rules, and decided by `captureValKind`, THE function that
+// param/local and module-global read rules, decided by `captureValKind`, THE function that
 // chose the field's type, so the recovery cannot disagree with the field it recovers from.
 //
-// A `string | null` (kind 16) field is a `(ref null $array)` cell whose read must recover the
-// non-null value type the rest of codegen expects — exactly what `paramNulString` /
-// `declaredNulString` buy a local and `globalCellKind == "nulstr"` buys a global. Without it a
-// `!= null`-narrowed capture returned `(ref null $array)` where the closure's own `(ref
-// $array)` result was declared: invalid wasm with `vl check` rc 0. The
-// `pendingRawNullRead` / `pendingNulString` gates are those two sites' verbatim, so the
-// `!= null` test itself and a genuinely-nullable read still see the raw cell.
-//
-// The other nullable cells deliberately recover NOTHING here, because they recover nothing on
-// the local and global paths either: a nullable LIST (kind 15/18) and a nullable STRUCT (kind
-// 9) keep nullable reads and the USE site (`emitMem`, the index path) recovers.
+// A `string | null` (kind 16) field is a `(ref null $array)` cell whose read must recover
+// the non-null value type the rest of codegen expects — what `paramNulString` /
+// `declaredNulString` buy a local and `globalCellKind == "nulstr"` buys a global. Without
+// it a `!= null`-narrowed capture returned `(ref null $array)` where the closure's own
+// `(ref $array)` result was declared: check-clean invalid wasm. `pendingRawNullRead` /
+// `pendingNulString` are those two sites' verbatim gates. The other nullable cells recover
+// NOTHING here, because the local and global paths do not either — the USE site
+// (`emitMem`, the index path) recovers.
 
 // 0xd4 ref.as_non_null
 
@@ -1440,20 +1433,14 @@ import { nameIsQuotedLeaf, splitUnionAtoms } from "./tyname"
 // right-hand side: `pendingListKind` picks which (backing, wrapper) pair `emitArr` builds
 // and `pendingListSlot` which interned element row the ref-list codes build THROUGH.
 //
-// ONE home for the seed all THREE `emitAssign` Member receivers share — a plain struct
-// (`w.f = …`), a NARROWED union arm (`if u is A { u.f = … }`) and a variant-typed PARAM
-// (`function put(o: A) { o.f = … }`) — the exact set `emitScalarFieldStoreVal` below is
-// the shared value emit for. Before this, only the plain receiver seeded anything and only
-// for codes 5/6: a bare `[7]` assigned to an `i64[]`/`f32[]` field self-classified as the
-// DEFAULT i32 list and `struct.set` it into the field's own wrapper — `vl check`-clean
-// invalid wasm (#1824). The construct halves (`emitObj`, `emitVariantObj`) keep their own
-// ladders, which differ in arms this one deliberately does not copy.
-//
-// `refSlot` is the field's interned ref-list element row (`sFieldRefSlot` /
-// `variantFieldRefSlot`), read only by the ref-list codes 5 / 28. Returns 0, or -1 after a
-// LOUD fail when that row was never interned: `emitFail` does not halt, so the parallel
-// `rlElemKindTbl` read is bound-checked rather than trapping the compiler on a slot the
-// type section already rejected.
+// ONE home for the seed all THREE `emitAssign` Member receivers share — a plain struct, a
+// NARROWED union arm, a variant-typed PARAM — the set `emitScalarFieldStoreVal` below is
+// the shared value emit for. Seeded by the plain receiver alone and only for codes 5/6, a
+// bare `[7]` assigned to an `i64[]`/`f32[]` field self-classified as the DEFAULT i32 list:
+// check-clean invalid wasm. `emitObj` / `emitVariantObj` keep their own ladders, which
+// differ in arms this one deliberately does not copy. `refSlot` is the field's interned
+// ref-list element row (codes 5 / 28 only); -1 after a LOUD fail when it was never interned,
+// so the parallel `rlElemKindTbl` read is bound-checked — `emitFail` does not halt.
 
 // A NESTED / CLOSURE element under the NULLABLE ref-list code builds through the
 // slot as its own ref list (kind 5), the `emitObj` code-28 reading. Code 5 keeps
@@ -1500,15 +1487,14 @@ import { nameIsQuotedLeaf, splitUnionAtoms } from "./tyname"
 // `sHeapIdx[ssi]`) into union variant `vi`, whose variant struct `uVarHeap[vi]` is a LAYOUT
 // TWIN of but a DISTINCT heap type from it. The raw plain ref cannot be boxed directly: the
 // narrow (`is {…}`) casts the box payload to `uVarHeap[vi]`, which a `(ref sHeapIdx[ssi])`
-// payload fails — invalid wasm for an ident source, a runtime cast TRAP for a call source
-// that boxed the plain ref. Rebuild the variant struct field by field from the source (the
-// two share a layout, so every read is store-compatible with the variant field), then box.
+// payload fails — invalid wasm for an ident source, a runtime cast TRAP for a call source.
+// Rebuild the variant struct field by field from the source (the two share a layout, so
+// every read is store-compatible), then box.
 //
-// A RE-READABLE source (ident / paren / member / index — side-effect-free) or a SINGLE-FIELD
-// variant re-emits the source once per field. A NON-re-readable MULTI-FIELD source (a CALL)
-// is evaluated ONCE into the `variantReboxSlot` stash (a `(ref null struct)` local reserved
-// by `fnUsesVariantRebox`) and each field re-reads it via `ref.cast (ref $plainStruct)`. If
-// the scan somehow left the slot unreserved, floor loudly rather than emit invalid wasm.
+// A RE-READABLE source (ident / paren / member / index) or a SINGLE-FIELD variant re-emits
+// the source once per field. A NON-re-readable MULTI-FIELD source (a CALL) is evaluated
+// ONCE into the `variantReboxSlot` stash reserved by `fnUsesVariantRebox`. An unreserved
+// slot floors loudly rather than emitting invalid wasm.
 
 // evaluate the source struct ref ONCE
 
@@ -1533,24 +1519,18 @@ import { nameIsQuotedLeaf, splitUnionAtoms } from "./tyname"
 // instance where `v` is bound to `i32`, the then-branch's `v.foo` has no struct receiver and
 // fails to emit ("field access but no struct type declared") even though it can never run.
 
-// THE THIRD GATE ON THE `is` SPELLING (#1310), AND IT IS SCOPED BY THE RECEIVER.
-// #1309 found two readers of the RAW tested spelling that both have to resolve it
-// against the rows the emitter actually has (`emitIs`'s own ladder and
-// `pushNarrowIs`); this exclusion — "a declared VARIANT name keeps the loud
-// union-only failure below" — is the third. Asking the RAW string alone made it
-// depend on which SPELLING happened to be registered: with the inferred union's
-// duplicate structural row gone, an inline-shape test (`a is {meow: i32}`) stopped
-// naming a row, this arm claimed it as a non-union static guard and CONST-FOLDED IT
-// TO FALSE — silently, where master rejected.
+// THE THIRD GATE ON THE `is` SPELLING, AND IT IS SCOPED BY THE RECEIVER. Two other readers
+// of the RAW tested spelling resolve it against the rows the emitter actually has
+// (`emitIs`'s own ladder and `pushNarrowIs`); this exclusion — "a declared VARIANT name
+// keeps the loud union-only failure below" — is the third. Asking the RAW string alone made
+// it depend on which SPELLING happened to be registered: with the inferred union's duplicate
+// structural row gone, an inline-shape test (`a is {meow: i32}`) stopped naming a row, this
+// arm claimed it as a non-union static guard and CONST-FOLDED IT TO FALSE, silently.
 //
-// THE SCOPE IS NOT DECORATION AND A 60-CELL GRID SET IT. Resolving the spelling
-// UNCONDITIONALLY over-excludes: `isVariantSpelling` answers about the tested TYPE,
-// not about the receiver, so `v is {meow: i32}` in a `g<T>` instance where `T` is
-// `i32` also stopped folding — 12 monomorphized cells that master decided correctly
-// turned into ``is` receiver is not a union value`. The receiver decides: a value the
-// CHECKER typed as a union (`nodeTyIsUnion` — deliberately not `exprUnion`, which is
-// the emitter's REP classification and is exactly what has the gap here) is a union
-// test whatever the rep layer managed, and belongs to the ladder below.
+// THE SCOPE IS NOT DECORATION. Resolving the spelling UNCONDITIONALLY over-excludes:
+// `isVariantSpelling` answers about the tested TYPE, not the receiver, so `v is {meow: i32}`
+// in a `g<T>` instance pinned to `i32` also stopped folding. The receiver decides: a value
+// the CHECKER typed as a union (`nodeTyIsUnion`, not the emitter's `exprUnion`) belongs below.
 
 // A NULLABLE receiver is NEVER statically decided here, because the only name this fold
 // has for it is its NON-NULL base: `monoArgTyName`'s cascade classifies a
@@ -1565,47 +1545,28 @@ import { nameIsQuotedLeaf, splitUnionAtoms } from "./tyname"
 // A FUNCTION-VALUE receiver's `sk` is a `$fnsig` PIN MARKER (`"=>i>i"`), not a type
 // SPELLING — `monoArgTyName`'s closure arm mints an interned ABI key precisely because a
 // bare function type has no annotation form an instance could carry. Every compare below
-// reads `sk` AS a spelling (the raw `is` name, `tyToEmitName`, the struct-row match), so a
-// pin misses all three by construction and the ladder's `return 0` CONST-FOLDED `x is F`
-// to FALSE for every closure-typed receiver — `vl check --codegen` clean, a module that
-// VALIDATES, and a guard that never fires (#1864). The structurally-identical-alias union
-// `FA | FB` is the sharpest spelling of it (the checker collapses the two arms to one
-// member, so there is no box to tag-compare and both guards fold false), but the union is
-// incidental: the bare `x: FA` / `x is FA` one-liner folds false too.
+// reads `sk` AS a spelling, so a pin misses all three by construction and the ladder's
+// `return 0` CONST-FOLDED `x is F` to FALSE for every closure-typed receiver: a module that
+// VALIDATES and a guard that never fires.
 //
 // The ARENA answers it. A bare closure value has exactly ONE static function type and no
-// runtime discriminant, so `is` over it IS a compile-time question — the same question the
-// collapsed-same-shape tautology arm at the foot of `emitIs` asks, and the same answer.
-// `monoArgPinTyIx` is the documented type-side twin of the very call that produced `sk`, so
-// the NAME and the TYPE of the pin cannot come from two different nodes — which matters for
-// a monomorphized CLONE, whose leaf `v` still carries the original's `T` while the rewritten
-// ANNOTATION carries the instance's `TyFunc`.
-//
-// A STRICT REFINEMENT of the fold: a pin never matched any compare below and
-// `repIsRowMatchTy` names no row for one either, so master answered 0 for EVERY pin. Only
-// the cells whose two types are the same type change, and they change from a wrong FALSE to
-// TRUE. An undecidable receiver keeps the 0 rather than declining to the runtime ladder —
-// `-1` there is a loud "`is` names a type that is not a union variant" emit failure
-// wherever the program happens to declare a union elsewhere (measured on both shapes).
+// runtime discriminant, so `is` over it IS a compile-time question — the same one the
+// collapsed-same-shape tautology arm at the foot of `emitIs` asks. `monoArgPinTyIx` is the
+// type-side twin of the very call that produced `sk`, so the NAME and the TYPE of the pin
+// cannot come from two nodes. An undecidable receiver keeps the 0, never the loud floor.
 
 // THE SAME COMPARE, WITH THE TESTED SPELLING RESOLVED. `sk` is a CANONICAL emit name
 // (`monoArgTyName` reads post-canon annotations) while `nd.isVariant` is the RAW source
 // spelling, so a TRANSPARENT ALIAS compared unequal to the very type it denotes and the
-// guard const-folded FALSE: `x is A` over an `A`-typed receiver answered `no`, with no
-// union anywhere in the program (`type A = i32; function p(x: A) { if x is A … }`), and
-// so did every same-base twin union `A | B`, which the arena collapses to one member.
-// VL is STRUCTURALLY typed — `types/struct-union-same-shape.vl` states the rule and the
-// struct and literal-union spellings already answer TRUE through their own rows — so an
-// alias IS its base and the answer is TRUE. Resolving here is what makes the base and
-// alias spellings of ONE program agree; `tyToEmitName` reads the type the checker already
-// banked at this node (`isVarTyIxOf`, the same bank `isArmTagOfTy` and the narrow push
-// read), so no spelling is re-parsed. A NAMED struct renders as its own name, leaving the
-// struct-row compare below untouched.
-// A tested type carrying a LITERAL is declined (`tyRenderSoftensLits`): its render
-// softens to the base, so `("pp" | "qq")` and `string` render alike while only one of
-// them holds `"zz"` — pinned by `literal-unions/mixed-union-litunion-arm-is-membership
-// .vl`, whose non-member cell folds TRUE without the decline. Those shapes are the
-// membership arms' business, and every one of them runs above this fold.
+// guard const-folded FALSE: `type A = i32; function p(x: A) { if x is A … }` answered `no`,
+// with no union anywhere. VL is STRUCTURALLY typed (`types/struct-union-same-shape.vl`), so
+// an alias IS its base and the answer is TRUE. `tyToEmitName` reads the type the checker
+// banked at this node (`isVarTyIxOf`), so no spelling is re-parsed; a NAMED struct renders
+// as its own name, leaving the struct-row compare below untouched.
+//
+// A tested type carrying a LITERAL is declined (`tyRenderSoftensLits`): its render softens
+// to the base, so `("pp" | "qq")` and `string` render alike while only one holds `"zz"` —
+// pinned by `literal-unions/mixed-union-litunion-arm-is-membership.vl`. Membership's business.
 
 // The names differ — but an ANONYMOUS SHAPE argument binds `sk` to its interned
 // ROW name (`#anon0`) while the test carries the source spelling, so the string
@@ -1618,27 +1579,18 @@ import { nameIsQuotedLeaf, splitUnionAtoms } from "./tyname"
 // from `nd.isVariant`, the raw source spelling, through `repRowOfName`'s
 // `renderFaithful` + `resolveAnnot` RE-PARSE. Same question, one fewer parse.
 
-// ── the `is`-test type, from the CHECKER's bank (destringify D-ISTY) ──────────
-// The union-BOX tag the type `ity` claims as a value-union ARM, or -1 when it claims
-// none (a struct variant, a literal, an un-interned shape — the paths below `emitIs`'s
-// tag compare decide those). `ity` is the arena type `checkIsExprNode` already resolved
-// for the `is` node (`nameToTy(n.isVariant)`, banked as `isVarTyIxOf`), so the four
-// spelling tests this replaces — `valueAtomKind`, `nameIsLitUnionType`, `nameIsMap`
-// (+`mapTagOf`) and `nameIsRefArray` (+`refArrTagOf`) — are all projections of ONE
-// value, exactly the shape #1110 found in the atom algebra.
+// ── the `is`-test type, from the CHECKER's bank (destringify D-ISTY) ──────────────
+// The union-BOX tag the type `ity` claims as a value-union ARM, or -1 when it claims none
+// (a struct variant, a literal, an un-interned shape). `ity` is the arena type
+// `checkIsExprNode` already resolved (`nameToTy(n.isVariant)`, banked as `isVarTyIxOf`), so
+// the four spelling tests this replaces — `valueAtomKind`, `nameIsLitUnionType`, `nameIsMap`
+// (+`mapTagOf`) and `nameIsRefArray` (+`refArrTagOf`) — are projections of ONE value.
 //
-// Arm by arm, and why each is the same question the spelling asked:
-//   · a value ATOM tags by its KIND — `unMemAtomKind` is `valueAtomKind`'s arena dual
-//     (same code space, same order of tests) and `scalarTagOfKind` is the tag;
-//   · a LITUNION (`x is K0` over `type K0 = "a" | "b"`, or an inline all-quoted set)
-//     boxes as the STRING ref its members are, so it claims kind 2's tag — the
-//     structural form of the `isAtom = "string"` rewrite this site used to do;
-//   · a MAP arm tags on its VALUE's interned mv slot, `mapTagOf`'s own composition
-//     with the value name sliced out of the arena instead of out of the spelling;
-//   · a REF-ELEMENT array arm tags on its element's reflist slot — `refArrTagOf`'s
-//     composition, with `nameIsRefArray`'s reflist-nameability folded into the slot
-//     lookup, which is what that predicate actually adds over a shape test (#1116).
-// A slot the reflist layer does not claim answers -1 exactly as `refArrTagOf` does.
+// Arm by arm: a value ATOM tags by its KIND (`unMemAtomKind` is `valueAtomKind`'s arena
+// dual, `scalarTagOfKind` the tag); a LITUNION boxes as the STRING ref its members are, so
+// it claims kind 2's tag; a MAP arm tags on its VALUE's interned mv slot; a REF-ELEMENT
+// array arm tags on its element's reflist slot, folding `nameIsRefArray`'s nameability into
+// the slot lookup. A slot the reflist layer does not claim answers -1, as `refArrTagOf` does.
 
 // A BARE FUNCTION-TYPE arm tags on its interned SIGNATURE slot, not on the flat
 // value-atom kind: a union may carry any number of function-typed arms and kind 11 is
@@ -1681,32 +1633,17 @@ import { nameIsQuotedLeaf, splitUnionAtoms } from "./tyname"
 // 0x46 i32.eq
 
 // The base numeric scalar an `is` RECEIVER reps as IN THIS INSTANCE — `"i32"` / `"i64"` /
-// `"f64"`, or "" for anything else. THE ONE HOME for the receiver half of the
-// numeric-litunion membership test, because that half is what keeps a receiver off a member
-// set of a rep it does not share.
+// `"f64"`, or "" for anything else. THE ONE HOME for the receiver half of the numeric-
+// litunion membership test, which keeps a receiver off a member set of a rep it lacks.
 //
 // TWO CHANNELS, BECAUSE ONE ORDINARY RECEIVER HAS NO BANKED TYPE AT ALL.
-// `nodeNumScalarBaseName` reads the type the CHECKER banked at the node, which answers for
-// every ANNOTATED receiver including the mixed `K | i32` / `K | f64` spellings that collapse
-// to one scalar. An UN-ANNOTATED parameter is pinned by `monoArgTyName`'s `"i32"` catch-all,
-// the one arm of the pin that deliberately mints NO annotation node — so the bank has
-// nothing to answer from, this predicate's first channel said "", the whole membership arm
-// declined, and the guard fell to `monoStaticIsResult`, which CONST-FOLDS a literal tested
-// type to FALSE. `function g(u) { if u is Z { … } }` took the wrong branch with `vl check`
-// rc 0 while the `u: i32` twin of the same program was correct one line away.
-//
-// The second channel is `monoArgTyName` — the emitter's own `fnIx`-SCOPED name for the
-// receiver, and the SAME function the fold reads. Sharing it is what makes this arm claim
-// exactly the receivers the fold would otherwise decide, per INSTANCE: one `v is Z` node in
-// a `g<T>(v: T)` body is emitted once per instance, and an instance pinned to `string` / a
-// struct / a list is named by its own rep and declines here. Gating on the node's banked
-// type alone cannot see an instance at all — the whole point of #1409/#1419's discipline.
-//
-// A NULLABLE receiver is refused on the same line and for the same reason
-// `monoStaticIsResult` refuses one: `monoArgTyName` names a nullable value by its NON-NULL
-// base, so a `K | null` numeric litunion would present as the plain `i32` its sentinel
-// encoding is not. Those keep the loud floor rather than a membership ladder emitted over a
-// sentinel this arm has no lowering for.
+// `nodeNumScalarBaseName` reads the checker's banked node type, which answers for every
+// ANNOTATED receiver including the mixed `K | i32` / `K | f64` spellings. An UN-ANNOTATED
+// parameter is pinned by `monoArgTyName`'s `"i32"` catch-all, the one arm that mints NO
+// annotation node, so the bank had nothing to answer from and the guard fell to
+// `monoStaticIsResult`, which CONST-FOLDS to FALSE. The second channel is `monoArgTyName`
+// itself — `fnIx`-SCOPED, so it answers per INSTANCE. A NULLABLE receiver is refused: the
+// name drops the `null`, presenting a sentinel encoding as the plain scalar it is not.
 
 // The value-union NAME of an `is` RECEIVER, for the box-tag soundness floor in `emitIs`.
 // `unionNameOfExpr` covers every receiver form the tag compare has an arm for EXCEPT the
@@ -1718,40 +1655,27 @@ import { nameIsQuotedLeaf, splitUnionAtoms } from "./tyname"
 // and the `x is null` / `x is <member>` guard ask the identical question of the identical
 // rep. Leaves a 0/1 i32 — 1 = NULL when `invert` is false, 1 = PRESENT when it is true.
 // Returns 1 when the ladder CLAIMS the receiver's rep (bytes emitted), 0 when no arm
-// matches (nothing emitted — the caller keeps its own paths), -1 on an emit failure.
+// matches (nothing emitted), -1 on an emit failure.
 //
 // A REP ANSWERED IN ONLY ONE OF THE TWO CALLERS IS A GUARD THAT NEVER FIRES, and the
-// failure is SILENT: an `is` receiver no arm here claims falls through to
-// `monoStaticIsResult`, whose `monoArgTyName` names a nullable value by its NON-NULL base
-// (`string`, `boolean`, `i32[]`, `K`) — so the fold compares two names that can never be
-// equal and decides FALSE. `vl check` clean, the wrong branch taken in statement position
-// and a `ref.as_non_null` trap wherever the narrowed arm is the value. Adding a rep to one
-// caller's ladder without the other re-opens exactly that.
-//
-// `nicheOnly` restricts the ladder to the SINGLE-non-null-member reps. A value-union BOX
-// and an optional chain can carry several non-null members, so "not null" does not identify
-// one of them — those two arms answer only the `== null` question and are skipped for `is`.
+// failure is SILENT: an `is` receiver no arm here claims falls to `monoStaticIsResult`,
+// which names a nullable value by its NON-NULL base and so compares two names that can
+// never be equal. `nicheOnly` restricts the ladder to the SINGLE-non-null-member reps: a
+// value-union BOX and an optional chain carry several non-null members, so "not null" does
+// not identify one — those two arms answer the `== null` question only.
 
 // A NARROWING THAT EXCLUDES NULL DECIDES THIS STATICALLY, and it is claimed FIRST because
 // every arm below reads the receiver at the DECLARED nullable rep while `emitIdentNode`
 // reads a narrowed binding at the ARM's rep. `let x: i32 | null = null` / `x = 5` / `if x
-// != null` reached no arm at all (the receiver no longer classifies as a union) and fell
-// out to the i32 compare, which emitted a bare `null` with nothing to type it: `bare null
-// needs a struct-typed context`, `vl check` rc 0. The assignment kind is the reachable
-// spelling — a redundant null test inside a live GUARD is a dead test the checker rejects,
-// while the assignment kind's test is deliberately kept meaningful (it asks the DECLARED
-// type), so the emitter is where the two views have to be reconciled.
+// != null` reached no arm at all and fell out to the i32 compare, which emitted a bare
+// `null` with nothing to type it: `bare null needs a struct-typed context`, check rc 0.
+// The assignment kind is the reachable spelling — a redundant null test inside a live GUARD
+// is a dead test the checker rejects — so the emitter reconciles the two views.
 //
-// ONLY THE NULL QUESTION, AND THE MEASUREMENT IS WHY. `nicheOnly` callers are the `is`
-// arms, which read a `true` from this ladder as "the value IS the tested variant" — a
-// reading "not null" only supports when the tested variant IS the narrowed arm, and it
-// need not be. `function tag(a: Cat | Dog) { if a is Cat { return a.meow }   if a is Dog
-// { … } }` post-guard-narrows `a` to `Dog`, and folding its `is Dog` to `true` happens to
-// be right while the same fold of an `is Cat` there would be a silently wrong branch.
-// (13 of 1952 corpus modules took that fold, all of them correctly and none of them
-// because the rule held.) So the PRESENT direction is claimed for the `==`/`!=` callers
-// only, which ask this ladder's own question; `is null` is claimed either way, because a
-// value proved non-null is not null under any caller's reading.
+// ONLY THE NULL QUESTION. `nicheOnly` callers are the `is` arms, which read a `true` here
+// as "the value IS the tested variant" — a reading "not null" supports only when the tested
+// variant IS the narrowed arm, and it need not be. So PRESENT is claimed for the `==`/`!=`
+// callers alone; `is null` is claimed either way, since a value proved non-null is not null.
 
 // present, provably
 
@@ -1774,33 +1698,18 @@ import { nameIsQuotedLeaf, splitUnionAtoms } from "./tyname"
 
 // 0x45 invert: the chain value is present
 
-// A value-union BOX (`i32 | null`, `A | B | null`) is never itself null — the null
-// variant rides the TAG — so compare the box tag against the global null tag (the
-// host's `variantTag(info, null)` path), never `ref.is_null`.
+// A value-union BOX (`i32 | null`, `A | B | null`) is never itself null — the null variant
+// rides the TAG — so compare the box tag against the global null tag, never `ref.is_null`.
 //
-// THE SECOND CHANNEL IS THE CHECKER'S BANKED TYPE, and it is here because a NULLABLE
-// NUMERIC litunion (`1 | 2 | null`) is a box whose registered union NAME the receiver's
-// storage class does not always carry — `exprUnion` resolves through `unionNameOfIdent`,
-// which asks `isUName` of the annotation's rendered name, and a param spelling reaches it
-// canon'd. The rep is settled structurally by `nodeTyIsNulNumLitUnion` (`vtKindOfType`'s
-// own arm reads the same predicate), so both spellings of the null test emit this one tag
-// compare instead of the `!= null` half falling to the i32 tail with an unseeded bare
-// `null` (`bare null needs a struct-typed context`) while `is null` was already correct.
-// A bare SCALAR-valued map read compared straight against `null`, with no binding in
-// between: `if m[k] != null`. The binding spelling (`const v = m[k]; v != null`) is the
-// arm below — it boxes, then tests the tag — but here there is nothing to bind and the
-// read fell through to the i32 compare, which emitted an unseeded bare `null`:
-// `emitProgram: bare null needs a struct-typed context`, a loud reject.
-//
-// IT NEEDS NO BOX AT ALL, which is why this arm sits above the box arm rather than
-// reusing it. `m[k] != null` asks exactly the question the probe already answers — is
-// there a live entry for this key — so the lowering IS the probe, and it is the same
-// code `m.has(k)` emits. Boxing the value only to read a tag back off it would allocate
-// twice to recover a bit the probe already had in a register.
-//
-// The niche-bearing value types never reach here: their reads already compare correctly
-// through the arms above (a `string` map's read is a nullable ref, a `boolean` map's is
-// the `2` sentinel), and `mapReadScalarBoxKindTy` excludes them by construction.
+// THE SECOND CHANNEL IS THE CHECKER'S BANKED TYPE, because a NULLABLE NUMERIC litunion
+// (`1 | 2 | null`) is a box whose registered union NAME the receiver's storage class does
+// not always carry (`exprUnion` asks `isUName` of the annotation's rendered name, and a
+// param spelling reaches it canon'd). `nodeTyIsNulNumLitUnion` settles the rep structurally,
+// so both spellings emit this one tag compare instead of the `!= null` half falling to the
+// i32 tail with an unseeded bare `null`. A bare SCALAR-valued map read (`if m[k] != null`)
+// needs NO box at all, which is why its arm sits above the box arm: the lowering IS
+// `m.has(k)`'s own probe. The niche-bearing value types never reach it —
+// `mapReadScalarBoxKindTy` excludes them by construction.
 
 // `== null` is the probe's negation
 
@@ -1872,19 +1781,15 @@ import { nameIsQuotedLeaf, splitUnionAtoms } from "./tyname"
 // ONE member-literal test `recv == <lex>`, in whichever shape the RECEIVER's rep demands:
 // the tag-gated payload compare over a value-union BOX, the null-guarded string compare over
 // a `string | null` niche, plain string value-equality over a string ref, the numeric compare
-// otherwise. `lex` is a RAW lexeme (quotes kept, escapes unresolved — a `StrLit.strText`),
-// which is what both callers hold.
+// otherwise. `lex` is a RAW lexeme (a `StrLit.strText`), which is what both callers hold.
 //
 // ONE HOME, BECAUSE THE TWO SPELLINGS MUST EMIT THE SAME BYTES. The bare-literal `is "m0"`
 // spelling and the litunion MEMBERSHIP ladder (`is K` → `m0 || m1 || …`) ask the same
 // question of the same value; splitting the per-member lowering is how a rep the membership
-// ladder cannot reach — but the bare literal can — becomes a wrong answer instead of a
-// shared one. Every rep the bare-literal spelling handles, membership handles for free.
+// ladder cannot reach — but the bare literal can — becomes a wrong answer.
 //
-// THE NULL GUARD LIVES HERE FOR THAT REASON. `(string | null) is "x"` and
-// `(string | null) is K` are one question; a guard added at either caller would leave the
-// other spelling trapping (or invalid) on the same value. This is the single source of truth
-// for "a null receiver answers FALSE".
+// THE NULL GUARD LIVES HERE for that reason: a guard added at either caller would leave the
+// other spelling trapping on the same value. Single source of truth for "null answers FALSE".
 
 // The QUOTED-LEAF test at its home (`tyname.nameIsQuotedLeaf`, W3). A synthesized
 // `StrLit` node lowers the lexeme, then the value-eq core.
@@ -1899,18 +1804,12 @@ import { nameIsQuotedLeaf, splitUnionAtoms } from "./tyname"
 //
 // AN ALIAS NAME IS RESOLVED TO ITS MEMBER SET FIRST, AND THAT IS THE WHOLE REASON THIS
 // FUNCTION EXISTS. `nameIsLitUnionArmValueUnion` decides on the SPELLING it is handed by
-// splitting it at top-level `|`, so a declared `type W = K | i32` splits to the single atom
+// splitting at top-level `|`, so a declared `type W = K | i32` splits to the single atom
 // `"W"` and answers FALSE while the INLINE `K | i32` spelling of the identical box answers
-// TRUE. `unionNameOfExpr` hands out whichever spelling the annotation carried, so the two
-// spellings of one program took different lowerings: the alias fell past the membership arm
-// into the box-tag compare, whose `tag == 2` answers `w is KS` TRUE for EVERY string the box
-// holds — members and non-members alike, `vl check` rc 0 and `vl build` clean, while the
-// inline twin one line away was correct. `unionMemberSetOf` is the registered expansion
-// (`type W = K | i32` → `"K|i32"`), which is what makes the two spellings ask one question.
-//
-// The unresolved name is asked FIRST and the expansion only on its miss: an already-joined
-// member set is the common case and resolves to itself, and `unionMemberSetOf` is a linear
-// scan of every registered union row.
+// TRUE. The alias then fell past the membership arm into the box-tag compare, whose
+// `tag == 2` answers `w is KS` TRUE for EVERY string the box holds — check-clean,
+// build-clean, silently wrong. `unionMemberSetOf` is the registered expansion; it is asked
+// only on the unresolved name's miss, being a linear scan of every registered union row.
 
 // `unionStrArmCount` over a union name that may be a declared ALIAS. The count is what
 // decides whether kind 2's box tag discriminates an arm at all (1 arm: exactly; 2+: not at
@@ -1919,27 +1818,18 @@ import { nameIsQuotedLeaf, splitUnionAtoms } from "./tyname"
 // has to see the same arms the membership arm above it does or the two disagree about which
 // shapes have a correct lowering.
 
-// True when `recvIx` is a receiver `emitLitMemberEq` can be applied to REPEATEDLY — i.e.
-// one whose rep that compare reaches. The reps a string literal union can meet: a
-// value-union BOX (payload compare), a string-repped litunion, a plain `string`, and the
-// `string | null` niche (the null-guarded compare, which answers FALSE for null).
+// True when `recvIx` is a receiver `emitLitMemberEq` can be applied to REPEATEDLY — one
+// whose rep that compare reaches: a value-union BOX, a string-repped litunion, a plain
+// `string`, and the `string | null` niche (whose compare answers FALSE for null).
 //
-// THE NULLABLE STRING IS CLAIMED, AND ONLY BECAUSE THE GUARD IS IN THE SHARED COMPARE.
-// `(string | null) is K` and `(string | null) is "m0"` are one question; the membership
-// ladder is nothing but the bare-literal compare repeated, so this bound may only admit a
-// rep `emitLitMemberEq` answers correctly. It admits this one because that helper
-// null-tests the receiver itself (`emitNulStrLitEq`) — claiming the rep while the shared
-// compare still `ref.as_non_null`ed would have spread a TRAP across the whole member set.
-// A receiver NARROWED to non-null (`if s != null { s is K }`) is a different value and
-// reaches the plain compare: `exprNullableString` is declaration-scoped and still calls it
-// nullable, but the CHECKER's banked node type does not, and the read `emitExpr` yields is
-// already recovered — so the two classifiers DISAGREEING is exactly the narrowing signal
-// (`litMemberRecvIsNulString`, which is the same conjunction the guard keys on).
-//
-// A MONOMORPHIZED receiver is why this asks the emitter's REP classifiers (`exprUnion` /
-// `exprString`, both `fnIx`-scoped) and not the node's banked TYPE: one `v is K` node in a
-// `g<T>(v: T)` body is emitted once per instance, and the instance pinned to `i32` must not
-// take a string compare — invalid wasm traded for a wrong answer.
+// THE NULLABLE STRING IS CLAIMED ONLY BECAUSE THE GUARD IS IN THE SHARED COMPARE. The
+// membership ladder is the bare-literal compare repeated, so this bound may only admit a rep
+// `emitLitMemberEq` answers correctly; it admits this one because `emitNulStrLitEq`
+// null-tests the receiver itself. A receiver NARROWED to non-null reaches the plain compare:
+// `exprNullableString` is declaration-scoped and still calls it nullable while the CHECKER's
+// banked node type does not, and that DISAGREEMENT is the narrowing signal
+// (`litMemberRecvIsNulString`). The classifiers asked are the emitter's REP ones
+// (`exprUnion` / `exprString`, `fnIx`-scoped), so a monomorphized instance answers per pin.
 
 // A BOX reaches the per-member compare through `emitUnionLitIs`, and BOTH of that
 // helper's own union-shape rejects are PRE-CHECKED here rather than let fire from inside.
@@ -1957,17 +1847,14 @@ import { nameIsQuotedLeaf, splitUnionAtoms } from "./tyname"
 //
 // Both niche arms of `emitIs` lower `recv is X` to the receiver's null test, on the premise
 // their headers state — "the checker already proved the tested shape is the sole non-null
-// member". THAT PREMISE DOES NOT SURVIVE MONOMORPHIZATION. At the declaration the receiver is
-// `T`, so the checker must accept `v is boolean` beside `v is string`; only the INSTANCE makes
-// one of them impossible, and the instance is not a thing the checker ever saw. So at
-// `T = string | null` all three of `v is boolean`, `v is f64` and `v is string` disassembled to
-// the identical `(i32.eqz (ref.is_null (local.get $0)))` — three mutually exclusive tests
-// answering TRUE on one non-null value, which is not a wrong predicate but no predicate.
+// member". THAT PREMISE DOES NOT SURVIVE MONOMORPHIZATION. At the declaration the receiver
+// is `T`, so the checker must accept `v is boolean` beside `v is string`; only the INSTANCE
+// makes one of them impossible, and the instance is not a thing the checker ever saw. At
+// `T = string | null` three mutually exclusive tests disassembled to the identical
+// `(i32.eqz (ref.is_null (local.get $0)))` — not a wrong predicate but no predicate.
 //
-// The two functions below restore the premise as a CHECKED precondition rather than an assumed
-// one: the null test is emitted only where the tested type still can be the niche's member, and
-// every other tested type folds to `i32.const 0`, which D932's `emittedCondConst` then prunes
-// the dead arm on — the reason a folded guard cannot miscompile the body it guards.
+// The two functions below restore the premise as a CHECKED precondition: every other tested
+// type folds to `i32.const 0`, which D932's `emittedCondConst` then prunes the dead arm on.
 
 // The PRIMITIVE the tested type of an `is` denotes, when it denotes one of the six VALUE
 // primitives; "" for everything else — a struct shape, a list, a map, a closure, a literal, a
@@ -1981,30 +1868,18 @@ import { nameIsQuotedLeaf, splitUnionAtoms } from "./tyname"
 // question asked inside the very ladder this change is repairing. Six arena reads, one branch
 // each.
 
-// The rep CLASS of the sole non-null member of the nullable niche `recvIx` reps as IN THIS
-// INSTANCE: "boolean" / "string" for the two niches whose member is a primitive, "#ref" for
-// every niche whose member is a reference shape (a struct, a union variant, a map, a closure, a
-// list, a distinct-backing scalar list, a ref array), and "" for a receiver the `is` niche
-// ladder does not claim at all.
+// The rep CLASS of the sole non-null member of the nullable niche `recvIx` IN THIS INSTANCE:
+// "boolean" / "string" for the two primitive niches, "#ref" for every reference shape, and
+// "" for a receiver the `is` niche ladder does not claim at all.
 //
-// THE ARMS ARE `emitNulIsNullTest`'S OWN, in its order minus the two that `nicheOnly` drops (a
+// THE ARMS ARE `emitNulIsNullTest`'S OWN, in its order minus the two `nicheOnly` drops (a
 // value-union BOX and an optional chain carry several non-null members, so "not null"
-// identifies none of them) and the litunion `emitIs`'s own `nulOk` excludes. A class claimed
-// here that the ladder does not claim would fold a guard the ladder then emits as a runtime
-// test — so this list and that one are one list, and adding a rep to either means adding it to
-// both.
+// identifies none) and the litunion `emitIs`'s own `nulOk` excludes. A class claimed here
+// that the ladder does not claim would fold a guard the ladder then emits as a runtime test.
 //
-// AND IT IS THE EMITTER'S REP CLASSIFIERS, NOT A NAME. `monoArgTyName` names a nullable value
-// by its NON-NULL base through a cascade that is not scoped to a mono instance, and a fourth
-// attempt at this defect keyed on it: `tests/cases/soundness/narrowing-is-null-sound.vl` and
-// `tests/cases/types/nullable.vl` both broke, because it folded a legitimate non-generic test
-// to false. These classifiers are `fnIx`-scoped, so they answer per INSTANCE — the property the
-// name cascade does not have — and the tested-type side above declines every spelling those two
-// canaries use (`is null`, `is { x: i32 }`) before a receiver is even looked at.
-//
-// The two PRIMITIVE niches are asked ahead of the ref group deliberately: a receiver both
-// groups would claim is answered by the narrower name, which can only make the mismatch test
-// below stricter than the ref answer would.
+// AND IT IS THE EMITTER'S REP CLASSIFIERS, NOT A NAME. `monoArgTyName` is not mono-scoped,
+// and a fourth attempt at this defect keyed on it broke two live canaries. These are
+// `fnIx`-scoped and answer per INSTANCE; primitives ahead of refs, narrower name winning.
 
 // True when the tested type `ity` provably CANNOT be the sole non-null member of the nullable
 // niche `recvIx` reps as — so `recv is <ity>` is statically FALSE, and the niche's null test
@@ -2029,21 +1904,18 @@ import { nameIsQuotedLeaf, splitUnionAtoms } from "./tyname"
 // D950 — the arm's premise, CHECKED. A `Circle | null` instance of `g<T>(v: T)` reaches
 // here for `v is boolean` too, and its member is no primitive at all.
 
-// `k is K` / `k is "x"` over a LITERAL-UNION receiver — an interned i32 ATOM id, NOT a
-// union BOX. Every path below reads the box's tag field (`struct.get 0 0`) off the
-// receiver, and on an i32 atom that is invalid wasm: `unionNameOfIdent` claims the
-// binding because `K` is a registered union NAME, while the value's REP is a bare id.
-// Master emitted an unparseable module for every `z: K` binding form (global / local /
-// param) and for `z is "x"` / `z is <sub-alias>`, and silently const-folded FALSE for
-// every `z: K | null` form — a guard that never fires.
+// `k is K` / `k is "x"` over a LITERAL-UNION receiver — an interned i32 ATOM id, NOT a union
+// BOX. Every path below reads the box's tag field (`struct.get 0 0`) off the receiver, and on
+// an i32 atom that is invalid wasm: `unionNameOfIdent` claims the binding because `K` is a
+// registered union NAME while the value's REP is a bare id. Master emitted an unparseable
+// module for every `z: K` binding form and silently const-folded FALSE for `z: K | null`.
 //
-// The atom's own test is MEMBERSHIP: the id equals one of the TESTED type's interned
-// member ids. The `K | null` null sentinel is `-1`, which is no member's id, so the
-// membership chain IS the non-null test for a nullable receiver — one lowering covers
-// both. Destringify: the receiver's atom-ness is the emitter's own REP question and the
-// tested member set comes from the type the CHECKER banked for this `is` node
-// (`isVarTyIxOf`, total for every emitting program — see `isArmTagOfTy`); the fold's
-// receiver side reads `nodeTyIxOf`. Neither side re-parses a spelling.
+// The atom's own test is MEMBERSHIP: the id equals one of the TESTED type's interned member
+// ids. The `K | null` null sentinel is `-1`, no member's id, so the membership chain IS the
+// non-null test — one lowering covers both. Destringify: the receiver's atom-ness is the
+// emitter's own REP question and the tested member set comes from the type the CHECKER
+// banked for this node (`isVarTyIxOf`); the fold's receiver side reads `nodeTyIxOf`. Neither
+// side re-parses a spelling.
 
 // The receiver's OWN members are all in the tested set: true by construction, and
 // folded without evaluating the receiver — the same shape as the concrete-variant
@@ -2062,77 +1934,47 @@ import { nameIsQuotedLeaf, splitUnionAtoms } from "./tyname"
 // 0x72 i32.or
 
 // `x is K` over a BOXED union carrying `K` as an ARM (`K | string`, `K | f64`) — a
-// MEMBERSHIP test over the payload, NOT a box-tag compare. The litunion arm rides the box
-// as its member STRING (`unionTakesAtomAsStr`), so it shares kind 2's tag with a `string`
-// arm and the tag alone answers `x is K` TRUE for every string in a `K | string` box,
-// members and non-members alike — a `vl check`-clean, `vl build`-clean silent wrong answer.
+// MEMBERSHIP test over the payload, NOT a box-tag compare. The litunion arm rides the box as
+// its member STRING (`unionTakesAtomAsStr`), so it shares kind 2's tag with a `string` arm
+// and the tag alone answers `x is K` TRUE for every string in a `K | string` box, members and
+// non-members alike — a check-clean, build-clean silent wrong answer.
 //
-// Giving the arm its own tag cannot fix that, and this is measured rather than reasoned
+// Giving the arm its own tag cannot fix that, and the grid is why
 // (docs/internals/litunion-compact-rep-design.md §7.1.1): `K ⊆ string`, so the two arms
-// OVERLAP, and a value belonging to both must answer TRUE to `is K` AND to `is string`
-// — which ONE tag field cannot do. A 14th value-atom kind moves the wrong answer from
-// `is K` to `is string`; it does not remove it (2 grid cells UP, 3 DOWN, all three losses
-// the same silent class).
-//
-// The answer that holds for both is the VALUE test `x is "aa" || x is "bb"` — the same
-// membership the atom ladder above emits over interned ids, lowered here through the
-// per-literal tag-gated payload compare (`emitUnionLitIs`), and the same semantics #1306
-// gave the flattened `K | K2`. `unionEqOperandOk` bounds the receiver to a re-readable
-// binding: each member re-reads it (twice — tag, then payload).
+// OVERLAP, and a value belonging to both must answer TRUE to `is K` AND to `is string` —
+// which ONE tag field cannot do. The answer that holds for both is the VALUE test
+// `x is "aa" || x is "bb"`, lowered through the per-literal tag-gated payload compare
+// (`emitUnionLitIs`). `unionEqOperandOk` bounds the receiver: each member re-reads it.
 
 // 0x72 i32.or
 
-// `x is K` over a BOXED union carrying a NUMERIC literal union as an arm
-// (`K | string`, `type K = 1 | 2`) — the numeric twin of the arm above, and membership
-// for the same reason: `K ⊆ i32`, so the arm shares kind 0's tag with any i32 arm and a
-// tag compare cannot separate a member from a non-member. Here it could not even try —
-// `isArmTagOfTy` derives its tag through `tyIsLitUnion`, which is string-only, so a
-// numeric arm claims no tag at all and the guard fell past every path to the loud
-// ``is` names a type that is not a union variant`.
+// `x is K` over a BOXED union carrying a NUMERIC literal union as an arm — the numeric twin
+// of the arm above, and membership for the same reason: `K ⊆ i32`, so the arm shares kind 0's
+// tag with any i32 arm and a tag compare cannot separate a member from a non-member. Here it
+// could not even try — `isArmTagOfTy` derives its tag through `tyIsLitUnion`, which is
+// string-only, so the guard fell past every path to the loud ``is` names a type that is not a
+// union variant`. The per-member compare is `emitUnionLitIs`, what bare `x is 1` emits.
 //
-// The per-member compare is `emitUnionLitIs`, the tag-gated payload test the bare
-// `x is 1` spelling already lowers to over this same box.
-//
-// BOTH OF THAT HELPER'S OWN REJECT CONDITIONS ARE PRE-CHECKED HERE, and that is what
-// makes this arm a candidate test rather than a commitment: `unionEqOperandOk` (each
-// member re-reads the receiver) and the value-union NAME gate. Letting either fire from
-// inside would convert every shape this arm merely fails to claim into a hard emit
-// failure with THIS arm's message, hiding whichever diagnostic the paths below would
-// have given it — and one such shape is live, the `K | i32` PARAM slot, whose rep
-// classifier calls it a box while `RC_ROOT` gives the identical type a plain scalar.
-//
-// The tested type is asked FIRST and the union NAME only after it answers: resolving a
-// name costs `msSetOfText`'s two map probes plus, on a first miss, a linear scan of every
-// registered row (see `isValueUnionOfSet`), and `numLitUnionBaseName` is an arena walk
-// that rejects every non-numeric-literal test — which is nearly all of them — before a
-// probe is charged.
+// BOTH OF THAT HELPER'S REJECT CONDITIONS ARE PRE-CHECKED HERE, which makes this a candidate
+// test rather than a commitment: letting `unionEqOperandOk` or the value-union NAME gate fire
+// from inside would convert every shape this arm merely fails to claim into a hard emit
+// failure with THIS arm's message. The tested type is asked FIRST because `numLitUnionBaseName`
+// is an arena walk that rejects nearly every test before a registry probe is charged.
 
 // 0x72 i32.or
 
 // `x is K` over a STRING literal union `K`, for every receiver rep the per-member compare
 // reaches (`litMembershipRecvOk`): the MEMBERSHIP test `x == m0 || x == m1 || …`, which is
-// what `K` MEANS — its members are a runtime-observable subset of `string`, so the
-// predicate exists as a value test and nothing about the receiver's rep can change the
-// answer, only how each compare is spelled.
+// what `K` MEANS — its members are a runtime-observable subset of `string`.
 //
-// AHEAD OF THE BOX-TAG COMPARE BELOW, AND THAT ORDER IS THE CORRECTNESS ARGUMENT. A
-// litunion tested type claims kind 2's tag (`isArmTagOfTy`), the SAME tag a plain `string`
-// arm claims, so the tag compare answers `x is K` TRUE for every string a `string | i32`
-// box holds — members and non-members alike, `vl check` clean. The floor below only
-// catches a box with TWO string-repped arms; a box whose single string arm is not `K`
-// itself walked straight into the tag compare.
-//
-// A `string` RECEIVER is the same defect one rep over: `if s is K` on a plain `(ref
-// $array)` matched no box, no atom and no litunion rep, fell to `monoStaticIsResult` —
-// which sees a non-union rep and a tested name that is no variant row — and CONST-FOLDED
-// TO FALSE. `if s is "m0"` on the identical value answered correctly one line away, which
-// is the oracle: the two spellings now share `emitLitMemberEq` and cannot disagree.
-//
-// Two or more members RE-READ the receiver, so those need a re-readable place
-// (`unionEqOperandOk`); a one-member tested type evaluates it exactly once and accepts any
-// receiver expression. A receiver the bound declines has NO membership lowering and no
-// spill slot reserved for one, so it takes the loud floor rather than falling through to
-// the tag compare / static fold below, both of which are known wrong for this question.
+// AHEAD OF THE BOX-TAG COMPARE BELOW, AND THAT ORDER IS THE CORRECTNESS ARGUMENT. A litunion
+// tested type claims kind 2's tag (`isArmTagOfTy`), the SAME tag a plain `string` arm claims,
+// so the tag compare answers `x is K` TRUE for every string a `string | i32` box holds. The
+// floor below only catches a box with TWO string-repped arms. A `string` RECEIVER is the same
+// defect one rep over: it matched nothing, fell to `monoStaticIsResult` and CONST-FOLDED TO
+// FALSE while `if s is "m0"` answered correctly one line away — the two spellings now share
+// `emitLitMemberEq` and cannot disagree. Two or more members RE-READ the receiver, so those
+// need `unionEqOperandOk`; a receiver the bound declines takes the loud floor, not the fold.
 
 // The receiver's OWN members are all in the tested set: true by construction, and
 // folded without evaluating the receiver — the atom ladder's twin fold.
@@ -2175,22 +2017,17 @@ import { nameIsQuotedLeaf, splitUnionAtoms } from "./tyname"
 // Ident read would unbox instead of yielding the box.
 
 // THE REGISTRY AND THE STORAGE ARE TWO QUESTIONS, AND THE BOX PATH NEEDS BOTH.
-// `unionNameOfIdentSid` answers about the annotation's registry ROW;
-// `identSlotIsUnionBox` asks the rep layer what the slot holding the value actually
-// is. They disagree in exactly one direction: an annotation the registry holds as a
-// multi-arm union whose arms COLLAPSE to a single rep gets a bare cell, not a box.
-// `type FA = (PA) => i32` beside `type FB = (PB) => i32` over field-permuted
-// parameter objects is that shape — `repCanonIdGo`'s `TyObj` arm sorts its field
-// pairs (the 2026-08 ruling) so the two arms are ONE closure rep and the parameter's
-// valtype is the closure fat pointer, while `tyToEmitNameAt` does not sort and the
+// `unionNameOfIdentSid` answers about the annotation's registry ROW; `identSlotIsUnionBox`
+// asks the rep layer what the slot holding the value actually is. They disagree in exactly
+// one direction: an annotation the registry holds as a multi-arm union whose arms COLLAPSE to
+// a single rep gets a bare cell, not a box. `type FA = (PA) => i32` beside
+// `type FB = (PB) => i32` over field-permuted parameter objects is that shape —
+// `repCanonIdGo`'s `TyObj` arm sorts its field pairs while `tyToEmitNameAt` does not, so the
 // registry still holds a two-arm row. This arm then read `struct.get $uBox 0` off a
 // `(ref $cloStruct)`: check-clean, and a module the engine refuses at load.
 //
-// IT IS THE STORAGE QUESTION AND NOT `exprUnion`, which is the distinction this
-// arm's own existence rests on: a union-typed ident an outer guard has NARROWED to a
-// single atom still HAS box storage, and `exprUnion` — narrowing-sensitive — would
-// say no and unbox. `identSlotIsUnionBox` reads the DECLARATION (param annotation,
-// declared kind, capture kind), which narrowing does not move.
+// IT IS THE STORAGE QUESTION AND NOT `exprUnion`: a union-typed ident an outer guard has
+// NARROWED still HAS box storage, and narrowing does not move the DECLARATION this reads.
 
 // 0xfb 0x02 <box ht> field 0: tag
 
@@ -2248,43 +2085,18 @@ import { nameIsQuotedLeaf, splitUnionAtoms } from "./tyname"
 
 // 0x46 i32.eq
 
-// `x is K` over a NUMERIC literal union (`type K = 1 | 2`, `type K = 1.5 | 2.5`) —
-// the FOURTH rep, and the one no litunion machinery could see. `tyIsLitUnion` requires
-// every member `litKind == "str"` and `tyLitMemberTexts` collects only `"str"` members,
-// so a numeric literal union is not a "litunion" anywhere above: no gate DECLINED it, it
-// was never a candidate. Every arm fell through and the guard reached
-// `monoStaticIsResult`, which CONST-FOLDED IT TO FALSE — `vl check --codegen` clean, and
-// FALSE even for `k: K` tested against its own alias.
-//
-// The rep is the plain BASE SCALAR, read off the disassembly and not off the
-// classification: `const x: K | i32 = k` gives the binding an `i32` local and `K | f64`
-// an `f64` local — no box, no tag, because every member of either union softens to the
-// one scalar (`numeric-litunion-alias.vl` is that contract's pin). So this is NOT the
-// string sibling's lowering with the comparator swapped for a numeric one — that arm
-// tests a `(ref $array)` receiver through `__str_eq__`, and there is no ref here at all.
-//
-// The test is MEMBERSHIP over the value, `recv == m0 || recv == m1 || …`, which is
-// exactly what makes a numeric litunion different from a newtype brand (#1344): its
-// members are a runtime-observable SUBSET of the base, so the predicate EXISTS. The
-// per-member compare is the bare-literal spelling's own (`emitNumLitEq`), so `x is K`
-// and `x is 1 || x is 2` emit the same bytes.
-//
-// BOTH BASES ARE CHECKED AND THEY MUST AGREE. The tested type's base is
-// `numLitUnionBaseName` (all-`TyLit`, homogeneous); the RECEIVER's is
-// `isNumRecvBaseName`, whose header carries why the receiver half needs two channels and
-// what each one claims. Without the receiver half a monomorphized `g<T>(v: T)`
-// instance pinned to `string` would take this arm and compare a string ref with
-// `i32.eq` — invalid wasm traded for a wrong answer, the trap the string sibling's
-// filing walked into by asserting a rep instead of reading it. It is also what keeps an
-// i64 receiver off an i32-based member set and an f64 receiver off an integer one.
-//
-// AHEAD OF THE BARE-LITERAL ARM BELOW, AND THAT ORDER IS LOAD-BEARING FOR THE INLINE
-// SPELLING. `isLitVariantName` decides on the tested spelling's FIRST CHARACTER, so the
-// un-aliased `x is 1 | 2` is a "literal" to it and lowered as the single compare
-// `x == 1` — every non-first member silently dropped. This arm reads the member set off
-// the arena instead, so the alias and the inline spelling answer identically; a tested
-// type that really is ONE literal still reaches `emitNumLitEq` here and emits the same
-// bytes that arm would, which is why taking it first costs that arm nothing.
+// `x is K` over a NUMERIC literal union (`type K = 1 | 2`) — the FOURTH rep, and the one no
+// litunion machinery could see: `tyIsLitUnion` requires every member `litKind == "str"`, so a
+// numeric literal union was never a candidate. Every arm fell through to `monoStaticIsResult`,
+// which CONST-FOLDED IT TO FALSE, even for `k: K` tested against its own alias. The rep is
+// the plain BASE SCALAR, read off the disassembly (`numeric-litunion-alias.vl` pins it) — no
+// box, no tag, so this is NOT the string sibling's lowering with a numeric comparator. The
+// test is MEMBERSHIP through `emitNumLitEq`, so `x is K` and `x is 1 || x is 2` emit the same
+// bytes. BOTH BASES ARE CHECKED AND MUST AGREE (`numLitUnionBaseName` / `isNumRecvBaseName`),
+// which keeps a monomorphized instance pinned to `string` off an `i32.eq`. AHEAD OF THE
+// BARE-LITERAL ARM BELOW: `isLitVariantName` decides on the tested spelling's FIRST
+// CHARACTER, so the un-aliased `x is 1 | 2` lowered as `x == 1` with every later member
+// dropped. This arm reads the member set off the arena, so both spellings answer alike.
 
 // Two or more members RE-READ the receiver, so those need a re-readable place
 // (`unionEqOperandOk`); a one-member tested type evaluates it exactly once and
@@ -2304,29 +2116,18 @@ import { nameIsQuotedLeaf, splitUnionAtoms } from "./tyname"
 // one-member set, through the same `emitLitMemberEq`); what reaches here is the NUMERIC
 // literal spelling and any string one whose receiver the ladder's place bound declined.
 
-// `x is null` / `x is <member>` over a NULLABLE value whose rep is a
-// single-non-null-member NICHE (`string | null`, `boolean | null`, `K | null`, a list /
-// ref-array / map / closure niche): the only runtime distinction IS null vs present, so
-// the guard is the niche's own null test, shared with the `== null` compare
-// (`emitNulIsNullTest` — its header carries why one home is required). `x is <member>`
-// inverts it: the checker already proved the tested shape is the sole non-null member.
+// `x is null` / `x is <member>` over a NULLABLE value whose rep is a single-non-null-member
+// NICHE (`string | null`, `boolean | null`, `K | null`, a list / ref-array / map / closure
+// niche): the only runtime distinction IS null vs present, so the guard is the niche's own
+// null test, shared with the `== null` compare (`emitNulIsNullTest`). `x is <member>` inverts it.
 //
-// THE POSITION IS THE WHOLE CORRECTNESS ARGUMENT AND IT IS MEASURED, NOT REASONED. This
-// arm belongs immediately in front of `monoStaticIsResult` and behind every box / atom /
-// membership path above, because the set it claims is exactly the set that otherwise
-// reaches that fold — which names a nullable receiver by its NON-NULL base and so decides
-// a guard that has to run.
-//
-// Ahead of the box paths it MISCLAIMS: a union BOX narrowed by an outer arm to a single
-// nullable member (`else if x is boolean` at the end of an `A | B | i32 | … | null`
-// chain) reads `exprNulBool` TRUE on a value whose STORAGE is still a `(ref $uBox)`, and
-// the sentinel compare `i32.ne` over a box ref is invalid wasm
-// (`functions/heterogeneous-union.vl` is the live pin). Narrowing is a TYPE fact; the box
-// is the STORAGE, and only the paths above read the storage.
-//
-// The litunion niche takes only the `is null` DIRECTION. `v is K2` over a `K | null` where
-// `K2` is a SUB-alias is a MEMBERSHIP question — one "not null" cannot express — and the
-// atom ladder above answers it exactly.
+// THE POSITION IS THE WHOLE CORRECTNESS ARGUMENT. This arm belongs immediately in front of
+// `monoStaticIsResult` and behind every box / atom / membership path above, because the set it
+// claims is exactly the set that otherwise reaches that fold — which names a nullable receiver
+// by its NON-NULL base and so decides a guard that has to run. Ahead of the box paths it
+// MISCLAIMS: a union BOX narrowed to a single nullable member reads `exprNulBool` TRUE on a
+// value whose STORAGE is still a `(ref $uBox)` (`functions/heterogeneous-union.vl` pins it).
+// The litunion niche takes only `is null`; a SUB-alias test is membership, answered above.
 
 // D950 — the same premise, checked for the reps this arm claims: the `string | null` ref
 // niche and the `boolean | null` sentinel. At `T = string | null` this is the line that
@@ -2342,69 +2143,50 @@ import { nameIsQuotedLeaf, splitUnionAtoms } from "./tyname"
 // a declared VARIANT name keeps the loud union-only failure below.
 
 // `f is (A) => B` over a NULLABLE-closure operand (`f: ((i32) => i32) | null`) is a NON-NULL
-// test — the closure-typed `is` form of `f != null`. Calling `f(x)` in the then-branch
-// already ref-casts the nullable value to non-null, so no narrowing key is needed.
+// test — the closure-typed `is` form of `f != null`. Calling `f(x)` in the then-branch already
+// ref-casts the nullable value to non-null, so no narrowing key is needed.
 //
-// Destringify D-ISTY (the hand-off #1125 filed and declined for want of a pin): the gate
-// asks "is the tested type a FUNCTION type", which master answered by scanning the tested
-// SPELLING for `=>` — blind through a declared alias (`type F = (i32) => i32` then `h is F`
-// carries no arrow), so an aliased test fell past this arm into the variant ladder and hit
-// `emitProgram: `is` names a type that is not a union variant`, a loud reject for a program
-// the checker accepts. The checker's banked type for THIS node (`isVarTyIxOf`, total for
-// every emitting program — see `isArmTagOfTy`) resolves the alias structurally. The opposite
-// direction is #1125's ARROW probe: 111 measured divergences (struct shapes carrying a
-// closure FIELD), every one inert here because `exprNulClosure` is false at all 111.
+// Destringify D-ISTY: the gate asks "is the tested type a FUNCTION type", which master
+// answered by scanning the tested SPELLING for `=>` — blind through a declared alias
+// (`type F = (i32) => i32` then `h is F` carries no arrow), so an aliased test fell past this
+// arm into the variant ladder and hit `emitProgram: `is` names a type that is not a union
+// variant`, a loud reject for a program the checker accepts. The checker's banked type for
+// THIS node (`isVarTyIxOf`) resolves the alias structurally. The opposite direction — struct
+// shapes carrying a closure FIELD — is inert here, `exprNulClosure` being false at all of them.
 
 // 0xd1 ref.is_null
 // invert: non-null
 
 // A COLLAPSED same-shape union: `pick(xs: A[] | B[])` where `A` and `B` are structurally
 // identical. The checker dedupes union members structurally, so the two arms are ONE member
-// and the annotation records a plain type, not a union — and `xs is A[]` then reaches this
-// rung with nothing declared and is rejected, though the program is sound.
+// and the annotation records a plain type, not a union — and `xs is A[]` then reached this
+// rung with nothing declared and was rejected, though the program is sound.
 //
 // It needs no union and no box: if the operand's OWN type is the tested type, the test is a
-// TAUTOLOGY. That is precisely what the collapse means — the arms became one member BECAUSE
-// they denote the same type, so every value of the operand IS the tested type. Emit the
-// operand for its effects, drop it, answer a constant true.
-//
-// The two fixes this fixture recorded both tried to restore the UNION — re-label the collapse
-// (which only MOVED the error), or extend `registerCollapsedUnionName` to `TyArray` (which
+// TAUTOLOGY — which is what the collapse MEANS. Emit the operand for its effects, drop it,
+// answer a constant true. Both earlier fixes tried to restore the UNION — re-labelling the
+// collapse only MOVED the error, and extending `registerCollapsedUnionName` to `TyArray`
 // produced a check-clean INVALID module, because registering the spelling restores the
-// classification but not the BOX, and the collapsed type never takes the union path that
-// interns its ref-array arms). This arm sidesteps the box instead of reconstructing it: a
-// tautology has no arms to intern.
-//
-// A test that is NOT the operand's type (`xs is C[]`) fails `tySame` and falls through to the
-// reject below, which stays loud.
+// classification but not the BOX. A test that is NOT the operand's type (`xs is C[]`) fails
+// `tySame` and falls through to the reject below, which stays loud.
 
 // The tested spelling resolved against the variant rows the emitter actually has
 // (`isVariantSpelling` — the author's spelling when it names one, else the declared
 // name of the struct it equals). The narrowing PUSH is the other gate reading the
 // same rule, so the test and every narrowed receiver downstream of it agree.
 
-// TWO FAILURES, ONE MESSAGE — and the reject is right in both, so this splits only
-// what the reader is TOLD, never the decision. A tested type the receiver's union does
-// NOT hold is the author's spelling mistake, and "not a union variant" names it. A
-// tested type that IS a declared member (`t1 is {f: boolean}[]` where `t1: {f: boolean}[]
-// | {w: i32}`) is the EMITTER's floor: the checker admits the test, the union really has
-// that arm, and what is missing is the arm's REP. Everything above this rung already
-// declined — `isArmTagOfTy` found no value-atom / litunion / map / ref-array tag for it,
-// and no variant row names it — so the arm was never interned. Telling that reader their
-// spelling names no variant sends them to fix a spelling the source already got right:
-// the member is written, verbatim, inside the union they are testing.
+// TWO FAILURES, ONE MESSAGE — and the reject is right in both, so this splits only what the
+// reader is TOLD, never the decision. A tested type the receiver's union does NOT hold is the
+// author's spelling mistake, and "not a union variant" names it. A tested type that IS a
+// declared member is the EMITTER's floor: the checker admits the test, the union really has
+// that arm, and what is missing is the arm's REP — everything above already declined, so the
+// arm was never interned. Telling that reader their spelling names no variant sends them to
+// fix a spelling the source already got right.
 //
-// The observed family WAS a value union reached only through a closure RESULT whose
-// lambda self-inferred its single concrete arm instead of the box, so no producer ever
-// boxed into the arm. That family GRADUATED: `internFuncTypeShapesTy` gained the
-// composite-union arm that interns such a result's arms, `refArmUnionRetName`'s
-// `hasObjSibling` decline came off behind it, and the shape now lowers and runs
-// (`tests/cases/closures/narrow-reflist-arm-of-closure-result-union.vl`, formerly the
-// `@emit-error` pin here). It was the only shape measured to reach this branch (1 of
-// 2,130 corpus cases), so this rung is now UNREACHED by the corpus — kept as a floor,
-// not deleted, because the alternative when an arm has no interned rep is a silently
-// mis-tagged box, which is exactly the miscompile that sat one line behind that reject
-// (`closure-arm-narrow-tag-agreement.vl`).
+// The observed family GRADUATED: `internFuncTypeShapesTy` gained the composite-union arm,
+// `refArmUnionRetName`'s `hasObjSibling` decline came off behind it, and the shape now runs
+// (`tests/cases/closures/narrow-reflist-arm-of-closure-result-union.vl`). The rung is kept as
+// a floor because the alternative to no interned rep is a silently mis-tagged box.
 
 // A CONCRETE-variant receiver (`f0 is Dog` where `f0: Dog`, e.g. a collapsed `.map`
 // element): the value IS exactly one variant, so the test folds to a compile-time
@@ -2504,24 +2286,17 @@ import { nameIsQuotedLeaf, splitUnionAtoms } from "./tyname"
 // 0xd4
 
 // Lower a STANDALONE optional chain `recv?.f` — a `?.` in ordinary VALUE position (a
-// `const`/`let` initializer, an argument, a `??` LHS the niche arms dispatch on by TYPE
-// rather than by node shape) — as the value of its own recorded type `F | null`.
+// `const`/`let` initializer, an argument, a `??` LHS the niche arms dispatch on by TYPE) — as
+// the value of its own recorded type `F | null`.
 //
-// UNTIL THIS EXISTED, `emitExpr` HAD NO `OptMember` ARM AT ALL. `?.` was reachable only
-// where a bigger pattern consumed it whole (`emitCoalesce`'s fused arms, the null-test
-// guards through `emitOptChainIsNull`), and every other position fell out of `emitExpr`'s
-// trailing catch-all — which said `unsupported expression in return`, at the enclosing
-// FUNCTION's line, for a `const t = a?.w` with no `return` anywhere in the program.
+// UNTIL THIS EXISTED, `emitExpr` HAD NO `OptMember` ARM AT ALL. `?.` was reachable only where
+// a bigger pattern consumed it whole (`emitCoalesce`'s fused arms, `emitOptChainIsNull`), and
+// every other position fell out of `emitExpr`'s trailing catch-all — which said `unsupported
+// expression in return`, at the enclosing FUNCTION's line, for a `const t = a?.w`.
 //
-// The shape is the same two-arm select the fused `?? d` arms already emit, with the
-// DEFAULT replaced by the null of the result's own rep — which is why the arms below are a
-// rep dispatch and not a field dispatch. `repOfNode` is that rep, from the checker's arena:
-//   `i32 | null`     -> the value-union BOX (a nullable scalar has no spare value to niche)
-//   `boolean | null` -> the i32 sentinel-2 niche (the VALTYPE is plain i32)
-// Any other leaf rep keeps a loud reject rather than guessing a null encoding.
-//
-// The receiver is read TWICE (the null test, then the field), so it must be a re-readable
-// place — the same `optRecvReReadable` gate the `?.f ?? d` arms hold.
+// The shape is the fused `?? d` two-arm select with the DEFAULT replaced by the null of the
+// result's own rep, which is why the arms below dispatch on REP (`repOfNode`) and not on the
+// field. The receiver is read TWICE, so `optRecvReReadable` bounds it as the `?.f ?? d` arms do.
 
 // The leaf reps a standalone `?.` has a null encoding for: i32/boolean (code 0), and a
 // STRING leaf — plain (code 3) or already-nullable (code 20) — whose `string | null`
@@ -2533,7 +2308,7 @@ import { nameIsQuotedLeaf, splitUnionAtoms } from "./tyname"
 
 // 0x04 if, 0x7f i32 blocktype — a null link selects the sentinel
 
-// 0x05 else — every link present, the 0/1 cell
+// 0x05 else — every link present, the 0/1 result
 
 // 0x0b end
 
@@ -3296,13 +3071,9 @@ function emitCaptureRead(_body: i32[], name: string, fnIx: i32) {
 // it can refuse, so a caller that swallows the `-1` leaves the row a start with no count.
 // `emitFail` RECORDS a failure and keeps emitting, so the next `uFieldStart[vi]` on the
 // byte-writing path reads PAST THE END and traps the compiler instead of delivering the
-// message already recorded. Measured at `emitVariantStruct` with `vi=2` against a two-row
-// span table, from a shared compiler instance compiling a second module (D1152).
-//
-// Every span read that writes bytes asks this first. The passing path is four compares and
-// no allocation; the message is built only when it refuses, and it names the variant count
-// beside every span length, so the next change that lengthens `uVariants` alone gets a
-// DIAGNOSTIC rather than a trap.
+// message already recorded (D1152, on a shared instance compiling a second module). Every
+// span read that writes bytes asks this first, and the refusal names the variant count
+// beside every span length, so lengthening `uVariants` alone gets a DIAGNOSTIC, not a trap.
 function guardVariantFieldSpan(vi: i32, where: string) {
   if vi >= 0 && vi < uFieldStart.length && vi < uFieldCount.length {
     const end = uFieldStart[vi] + uFieldCount[vi]
@@ -3584,17 +3355,15 @@ function monoStaticIsResult(isIx: i32, fnIx: i32) {
       // D951, THE ONE INSTANTIATION THE SPELLING SUBSTITUTION CANNOT BANK A ROW FOR. At
       // `T := (i32) => i32` the monomorphizer binds `T` to the `$fnsig` KEY (`=>i>i`), a name
       // that exists only as a string and that `nameToTy` has never been able to parse back
-      // (`recordClonedNodeTyFb`'s header says so, for the same key). So `isVarTyIxOf` is -1 for
-      // the substituted node and the arena compare above cannot fire — and this arm returned 0,
-      // i.e. `v is T` was silently FALSE at a closure `T` while the hand-written
-      // `v is (i32) => i32` ran and printed `true`.
+      // (`recordClonedNodeTyFb`'s header says so). So `isVarTyIxOf` is -1 for the substituted
+      // node, the arena compare above cannot fire, and this arm returned 0 — `v is T` silently
+      // FALSE at a closure `T` while the hand-written `v is (i32) => i32` printed `true`.
       //
       // The SPELLING is the sound answer here and nowhere else: `sk` is itself a sigkey, and a
       // sigkey is a pure ENCODING of a function type carrying no identity of its own, so two
-      // equal keys ARE the same function type. (That is exactly why `recordClonedNodeTyFb`
-      // accepts the argument's arena `TyFunc` for a SIGKEY pin and refuses it for an `#anonN`
-      // one — an anon key names a specific interned ROW.) Placed inside this arm, not before
-      // it, so it can only add a TRUE the arena compare had no rows to reach.
+      // equal keys ARE the same function type. (That is why `recordClonedNodeTyFb` accepts the
+      // argument's arena `TyFunc` for a SIGKEY pin and refuses it for an `#anonN` one.) Placed
+      // inside this arm so it can only add a TRUE the arena compare had no rows to reach.
       if sk == nd.isVariant { return 1 }
       return 0
     }
@@ -3877,16 +3646,14 @@ function nulNicheIsTestImpossible(recvIx: i32, ity: i32, fnIx: i32) {
 // membership chain is built from, reading the discriminant off the union box.
 //
 // The read is the narrow's own three steps (`struct.get $uBox 1`, `ref.cast` to the arm's
-// heap type, `struct.get` the field), which is sound here for the reason the tag test that
-// precedes it is: this runs only inside the `tag == …` conjunction, so the payload IS the
-// arm's struct by the time the cast executes.
+// heap type, `struct.get` the field), sound here for the reason the tag test that precedes
+// it is: this runs only inside the `tag == …` conjunction, so the payload IS the arm's
+// struct by the time the cast executes.
 //
 // THE COMPARE IS PICKED BY THE FIELD'S STORAGE, NOT BY THE LEXEME'S LOOKS. A string literal
 // set has TWO reps — the interned i32 atom when the field's annotation is a registered
-// ALIAS, a `(ref $string)` when it is inline — and the lexeme is `"circle"` either way. Ask
-// the code column and a quoted lexeme lands on `i32.eq` against `internAtom` at one spelling
-// and `strEq` at the other, which is what makes the ruling's answer independent of how the
-// arm spelled its discriminant.
+// ALIAS, a `(ref $string)` when it is inline — and the lexeme is `"circle"` either way. The
+// code column is what makes the ruling's answer independent of the arm's spelling.
 function emitDiscrimFieldEq(
   body: i32[],
   recvIx: i32,
@@ -3956,25 +3723,18 @@ function emitDiscrimFieldEq(
   )
 }
 
-// The MEMBERSHIP half of `x is A` (D1023) — emitted after the arm's tag test, and `i32.and`ed
-// onto it, for each field the tag alone cannot settle.
+// The MEMBERSHIP half of `x is A` (D1023) — emitted after the arm's tag test and `i32.and`ed
+// onto it, for each field the tag alone cannot settle. `A`'s tag names the SHAPE; where two
+// declared types share a shape, the ruling makes `is` a question about the VALUE. It emits
+// NOTHING when no field needs it (`variantDiscrimFieldNeeded`), so every union that existed
+// before the ruling keeps its bytes.
 //
-// `A`'s tag names the SHAPE. Where two declared types share a shape, the ruling makes `is` a
-// question about the VALUE — `s is Circle` is `tag == shared && s.kind == "circle"` — so this
-// emits the `&& …`. It emits NOTHING when no field needs it (`variantDiscrimFieldNeeded`),
-// which is every union that existed before the ruling, so those modules stay byte-identical.
-//
-// THE RECEIVER IS RE-READ ONCE PER MEMBER, which is `emitStrToAtom`'s bound taken for
-// `emitStrToAtom`'s reason: a chain that re-read a CALL would run it once per member — a
-// wrong number of EVALUATIONS, not merely a wrong value. `unionEqOperandOk` is the place
-// test, and a non-place receiver keeps the loud refusal rather than a silent miscount.
-//
-// IT CONSUMES THE TAG TEST INTO AN `if`, AND `i32.and` WOULD BE WRONG. Both operands of an
-// `i32.and` are evaluated, so conjoining the membership onto the tag ran the discriminant
-// read — a `ref.cast` to THIS arm's heap type — on values of every OTHER arm too. In a
-// two-arm union both arms share the shape and the cast happens to succeed; add a third arm
-// with different field names and `s is Circle` traps on the `Tri` value. The tag test is a
-// GUARD, so it has to be lowered as one.
+// THE RECEIVER IS RE-READ ONCE PER MEMBER — `emitStrToAtom`'s bound, for its reason: a chain
+// that re-read a CALL would run it once per member, a wrong number of EVALUATIONS.
+// `unionEqOperandOk` is the place test; a non-place receiver keeps the loud refusal. And it
+// CONSUMES THE TAG TEST INTO AN `if`, because `i32.and` evaluates both operands: the
+// discriminant read — a `ref.cast` to THIS arm — would then run on every OTHER arm's values
+// too and trap once a third arm has different field names. The tag test is a GUARD.
 function emitVariantDiscrimTest(body: i32[], recvIx: i32, vi: i32, fnIx: i32) {
   if vi < 0 || vi >= uFieldCount.length { return 0 }
   const cnt = uFieldCount[vi]
@@ -4537,19 +4297,14 @@ function emitOptMemberValue(body: i32[], exprIx: i32, fnIx: i32) {
 
     // THE NESTED-STRUCT LEAF (code 15), the arm this ladder was missing (D1084). `o?.f`
     // over `o: T | null` with `T = {f: S}` has type `S | null`, and the rep for that is the
-    // NULLABLE STRUCT REF the whole `nulstruct` family already speaks — so this is a
-    // lowering the module already has everywhere except at the `?.` producer.
+    // NULLABLE STRUCT REF the whole `nulstruct` family already speaks — a lowering the
+    // module already has everywhere except at the `?.` producer.
     //
     // Shape-identical to the `nulstr` arm below it, with the field's own target struct as
-    // the heap type instead of the string array: a null receiver chain yields
-    // `ref.null $S`, and a live one reads the field. The `else` arm leaves a `(ref $S)`
-    // (a code-15 field slot is non-nullable), which is a SUBTYPE of the block's declared
-    // `(ref null $S)`, so the two arms join without a cast.
-    //
-    // The ablation that says this is a missing arm and not a rep gap: every OTHER producer
-    // of `S | null` compares and runs — two locals, two call results, a `(S|null)[]`
-    // element, a plain `x.f == y.f`, a closure value call, a monomorphized `eqN<T>` — and
-    // only the `?.` one refused. `structIndexOfExpr`'s `OptMember` arm is the other half:
+    // the heap type instead of the string array: a null receiver chain yields `ref.null $S`,
+    // and a live one reads the field. The `else` arm leaves a `(ref $S)` (a code-15 field
+    // slot is non-nullable), a SUBTYPE of the block's declared `(ref null $S)`, so the two
+    // arms join without a cast. `structIndexOfExpr`'s `OptMember` arm is the other half:
     // without it the equality classifier cannot name the row this arm emits.
     if oCode == 15 {
       const oti = sFieldTgtStructIdx(osi, ofi)
@@ -4733,58 +4488,34 @@ function listWrapHeapOfKind(k: i32) {
 }
 
 // The BANKED value-atom kind of the single member left when `null` is removed from the
-// member set `s` — the structural form of `valueAtomKind(removeAtomFromSet(set,
-// "null"))`, which four `… | null` peeling sites ask (`x ?? d` over an ident / a call /
-// a union field, and a `scalar | null` map value read with a default).
+// member set `s` — the structural form of `valueAtomKind(removeAtomFromSet(set, "null"))`,
+// which four `… | null` peeling sites ask.
 //
 // `msSubNull` already clears the null members' bits structurally; what the set ADT handed
-// back was a RENDERED residual the callers re-parsed for the ABI code. Here the residual
-// set keeps its identity: a singleton yields the member's kind straight out of the bank
+// back was a RENDERED residual the callers re-parsed for the ABI code. Here the residual set
+// keeps its identity: a singleton yields the member's kind straight out of the bank
 // `recordUnMemTys` filled, a non-singleton -1 — the same answer `valueAtomKind` gives the
 // rendered `""` / `"a|b"`. -2 = the pool does not cover the set (a narrowed subset spelling
-// it never interned) and the caller keeps its rendered-atom path, exactly as
-// `removeAtomFromSet` itself falls through to the string surgery there.
+// it never interned) and the caller keeps its rendered-atom path.
 //
-// D-SETONCE: takes a set ID, never a text — every caller already resolves the same set a
-// line earlier for the value-union gate.
+// D-SETONCE: takes a set ID, never a text — every caller resolves the set a line earlier.
 function unionResidualSoloKindOfSet(s: i32) {
   if s < 0 { return -2 }
   msSoloValKind(msSubNull(s))
 }
 
 // IS this union a VALUE union — the box question, asked of the interned member set the
-// caller already resolved, and of the SPELLING only where the pool declines.
+// caller already resolved, and of the SPELLING only where the pool declines (D-VALUNION).
+// The name path scanned the whole rendering twice and materialized every atom, for a
+// predicate over nothing but the member ABI codes `msIsValueUnion` reads off the bank.
 //
-// D-VALUNION. The nine `isValueUnionName(nm)` sites here scanned the whole rendering twice
-// (`unionMemberCount`, then `splitUnionAtoms`) and classified every atom materialized
-// (`valueAtomKind`) — for a predicate over nothing but the member ABI codes the emitter
-// banked at registration, which `msIsValueUnion` reads. The ONE surviving take-apart of the
-// rendering, reached only where the pool never interned the set.
-//
-// **The set id is not resolved here, on purpose.** `msSetOfText` costs two map probes and,
-// on a first miss, a linear scan of every registered row — charging it inside would bill
-// every caller, including the two below that must NOT pay. Callers thread an id they
-// already hold or resolve one they reuse; it is never re-derived.
-//
-// **The two sites that keep the spelling path, and why** — measured over 1,337 corpus
-// files and 16,800 fuzz programs, not reasoned:
-//   · `emitReturnValue` / the inferred-return `retUNm` pin classify
-//     `inferRetNameOf(fn.fnName)`, a checker RENDER of an inferred return: 79,912 reaches,
-//     of which the pool covers **47** (0.06%). A bank-first ladder would put that
-//     resolution ahead of a path whose own first act (`unionMemberCount < 2`) already
-//     cheap-rejects — a work REGRESSION, so it is left alone.
-//   · `emit_rewrite`'s `synthRetAnnots` asks the same of the same producer
-//     (`inferRetNameByNode`); the pool covers **0** of its 643 reaches.
-// One producer — the inferred-return render — retired by the `inferRetTyByNode` hand-off,
-// not by a consumer-side ladder.
-// THE NAME FALLBACK RESOLVES A DECLARED ALIAS FIRST. `isValueUnionName` decides by splitting
-// the name at top-level `|` and asking `valueAtomKind` of each atom, so an alias splits to ONE
-// atom whose kind is -1 and the answer is a flat NO for every union the bank does not cover —
-// while the INLINE spelling of the identical box answers YES. `type WN = N | string` over a
-// numeric litunion `N` is the live instance: the inline `N | string` receiver took the `is`
-// membership arm and the alias fell past every arm to the loud ``is` names a type that is not
-// a union variant`. `unionMemberSetOf` returns a non-alias name unchanged, so this only ever
-// hands the fallback the arms the working spelling already gave it.
+// The set id is NOT resolved here, on purpose: `msSetOfText` costs two map probes and, on a
+// first miss, a linear scan of every registered row. Two sites keep the SPELLING path
+// because the pool almost never covers what they ask — both classify a checker RENDER of an
+// INFERRED return, retired by the `inferRetTyByNode` hand-off, not by a consumer ladder.
+// THE NAME FALLBACK RESOLVES A DECLARED ALIAS FIRST: `isValueUnionName` splits at top-level
+// `|`, so `type WN = N | string` was ONE atom of kind -1 and answered NO where the inline
+// spelling answered YES — the alias then fell past every `is` arm to the loud floor.
 function isValueUnionOfSet(s: i32, nm: string): boolean {
   const v = msIsValueUnion(s)
   if v >= 0 { return v == 1 }
@@ -4926,18 +4657,15 @@ function emitMapUnionUnboxRead(body: i32[], name: string, fnIx: i32) {
 }
 
 // Route a list LITERAL flowing into a union whose matching arm is a UNION-BOX-ELEMENT
-// ref-array (`(i32 | string)[] | {w: i32}`, `N[] | {w: i32}` over `type N = i32 | string`,
-// `(C | D)[] | {w: i32}`) through that ARM's build: thread `pendingListKind = 2` + the arm's
-// reflist slot so `emitArr` boxes each element into the union box (the same threading an
-// annotated `let x: (i32|string)[] = [...]` binding does), then tag the wrapper with the
-// arm's slot tag. Needed because the literal's OWN classification is a SCALAR list
-// (`["a"]` → `string[]`) or a concrete struct list (`[{a:1}]` → `C[]`) — neither interns
-// the arm's slot, so `emitUnionCoerce`'s slot-match path misses and the literal either
-// mis-boxed through the value-atom ladder (tag `string[]`, every `is` against the arm
-// silently FALSE — a live miscompile) or emitted a RAW wrapper into the box-typed slot
-// (invalid wasm). The union's OWN value-atom list arm still wins (`i32[] | (i32|string)[]`
-// boxes `[1]` as the exact `i32[]` atom — the ladder's job), guarded by `unionHasAtom`.
-// Returns 1 = handled (boxed + tagged), 0 = not applicable (caller continues), -1 = error.
+// ref-array (`(i32 | string)[] | {w: i32}`, `(C | D)[] | {w: i32}`) through that ARM's build:
+// thread `pendingListKind = 2` + the arm's reflist slot so `emitArr` boxes each element into
+// the union box (the same threading an annotated binding does), then tag the wrapper with the
+// arm's slot tag. Needed because the literal's OWN classification is a SCALAR list (`["a"]` →
+// `string[]`) or a concrete struct list — neither interns the arm's slot, so
+// `emitUnionCoerce`'s slot-match path misses and the literal either mis-boxed through the
+// value-atom ladder (every `is` against the arm silently FALSE) or emitted a RAW wrapper into
+// the box-typed slot (invalid wasm). The union's OWN value-atom list arm still wins, guarded
+// by `unionHasAtom`. Returns 1 = handled, 0 = not applicable, -1 = error.
 function emitUnionListLitViaRefArm(
   body: i32[],
   unionName: string,
@@ -5070,13 +4798,11 @@ function emitUnionNestedListLit(
 // THE VALUE'S OWN CHECKED TYPE IS THE ANSWER, NOT THE UNION'S ARM. A union may carry
 // several function-typed arms; taking the arm made every one of them box under the first
 // arm's tag, which is the whole of D6 — `x is F` answered TRUE for a value built through
-// `G`. The checker banks the carrier's resolved type at the node (`nodeTyIxOf`), and for
-// a lambda literal, a named-function reference and a closure-typed binding alike that is
-// the `TyFunc` the value actually has.
-//
-// The union's own arm is the FALLBACK, for a carrier the checker banked no function type
-// for; a union with ONE function arm then tags exactly as it did before, since the sole
-// arm is the only type the value can have.
+// `G`. The checker banks the carrier's resolved type at the node (`nodeTyIxOf`), and for a
+// lambda literal, a named-function reference and a closure-typed binding alike that is the
+// `TyFunc` the value actually has. The union's own arm is the FALLBACK, for a carrier the
+// checker banked no function type for; a union with ONE function arm then tags exactly as
+// before, the sole arm being the only type the value can have.
 function cloBoxArmTy(exprIx: i32, unionName: string): i32 {
   const vt = nodeTyIxOf(exprIx)
   if unMemIsFunc(vt) { return vt }
@@ -5085,28 +4811,18 @@ function cloBoxArmTy(exprIx: i32, unionName: string): i32 {
   unionClosureArmTy(unionName)
 }
 
-// Lower the expression at `exprIx` COERCED into the boxed union `unionName`'s
-// representation (the host's `coerceToUnion` at a flow boundary — a binding init, an
-// assignment, an argument, a return). Pass-through when the value already IS the box (a
-// union-typed ident / call, including a sub-union narrowing); a bare `null` boxes as the
-// null tag with a `ref.null` payload (any boxed union — a value union OR a struct union
-// with a `null` member); a raw scalar/string boxes as its atom's tag + payload. A struct
-// union's object literal falls through to the normal lowering (`emitUnionBox` boxes it via
-// the `uDeclared` path).
-// D1029 — THE MAP ARM'S RE-BOX: the arm's tag, the map ref, one `struct.new`. Returns 1 when
-// it handled the value, 0 when the operand is not a map arm of `unionName`, -1 on error.
+// Lower the expression at `exprIx` COERCED into the boxed union `unionName`'s representation
+// (a binding init, an assignment, an argument, a return). Pass-through when the value already
+// IS the box; a bare `null` boxes as the null tag with a `ref.null` payload; a raw
+// scalar/string boxes as its atom's tag + payload. A struct union's object literal falls
+// through to `emitUnionBox`'s `uDeclared` path. D1029 — THE MAP ARM'S RE-BOX: the arm's tag,
+// the map ref, one `struct.new`. Returns 1 handled, 0 not a map arm, -1 on error.
 //
-// A value narrowed to the union's map arm reads UNBOXED in that scope — that is the point of
-// the narrow — so delivering it to a destination typed at the UNION has to put the box back.
-// The ref-array arm has had this rung all along, which is why it ran at all eight delivery
-// positions while the map arm ran at two; without it `exprUnion` had to keep answering TRUE
-// for a narrowed map so the "already a union" rung would pass the cell through raw, which is
-// right for a map-value store and wrong everywhere the value had actually been unboxed.
-//
-// ONE HOME, because the two boundaries that need it are `emitUnionCoerce` and
-// `emitUnionBoxArg` — and a map-value store reaches only the second. Fixing the first alone
-// turned that position from invalid wasm into a compiler-emitted `unreachable`, which is a
-// different failure and not a better one.
+// A value narrowed to the union's map arm reads UNBOXED in that scope, so delivering it to a
+// destination typed at the UNION has to put the box back. Without this rung `exprUnion` had
+// to keep answering TRUE for a narrowed map so the "already a union" rung passed the cell
+// through raw — right for a map-value store, wrong everywhere it had been unboxed. ONE HOME,
+// because a map-value store reaches only `emitUnionBoxArg`, not `emitUnionCoerce`.
 function emitUnionMapArmBox(
   body: i32[],
   unionName: string,
@@ -5141,18 +4857,16 @@ export function emitUnionCoerce(
   const bareIx = unwrapParen(exprIx)
   const bare = P.nodes[bareIx]
   // An if-EXPRESSION join (`return if c { catVal } else { dogVal }`): each arm is a distinct
-  // union member (a variant struct, a passed-through union, a scalar), so the join can't ride
-  // a single numeric blocktype — emit a value-typed `if` whose result IS the union box,
-  // union-coercing each arm. Without this the join defaults to an i32 blocktype over ref arms
-  // (invalid wasm — a pre-existing gap that hits named functions too).
+  // union member, so the join can't ride a single numeric blocktype — emit a value-typed `if`
+  // whose result IS the union box, union-coercing each arm. Without this the join defaults to
+  // an i32 blocktype over ref arms (invalid wasm, a gap that hits named functions too).
   //
   // D969 — AHEAD OF THE `exprUnion` RAW-PASS BELOW, and the order is the whole fix. An
   // if-expression that IS already a union value hit the raw-pass first and was emitted by
   // `emitExpr`, which picks the join's blocktype from the arms' scalar ladder: `(if (result
-  // i32))` with two REF arms. The two questions were fighting — the binding needs
-  // `exprUnion` true to get a BOX cell, and the raw-pass reads that same true as "nothing to
-  // do here". Only this arm knows the blocktype has to be the box, so it must be asked first.
-  // Raw-passing is right for every other union value; it is never right for an `if`.
+  // i32))` with two REF arms. The two questions were fighting — the binding needs `exprUnion`
+  // true to get a BOX cell, and the raw-pass reads that same true as "nothing to do here".
+  // Only this arm knows the blocktype has to be the box, so it must be asked first.
   if bare is IfStmt { return emitUnionIfValue(body, unionName, bareIx, fnIx) }
   if exprUnion(exprIx, fnIx) { return emitExpr(body, exprIx, fnIx) }
   if bare is NullLit {
@@ -5189,7 +4903,7 @@ export function emitUnionCoerce(
   // plain ref where the box wants the variant struct (invalid wasm for an ident; a runtime
   // cast trap once boxed). Re-box it against the matched arm (`emitStructExprAsVariantBox`,
   // which stashes a non-re-readable multi-field CALL source in the reserved scratch slot).
-  // Gated on the heaps DIFFERING so an already-deduped shape keeps the byte-identical raw pass.
+  // Gated on the heaps DIFFERING, so an already-deduped shape keeps the raw pass unchanged.
   if unionName != "" && exprStruct(exprIx, fnIx) {
     const rbVi = unionArmVariantForStructExpr(unionName, exprIx, fnIx)
     if rbVi >= 0 {
@@ -5266,25 +4980,24 @@ export function emitUnionCoerce(
       "emitProgram: a map value is not a supported union member — use a struct member instead",
     )
   }
-  // A REF-ELEMENT array carrier (`S[]`, `(() => f64)[]`, `(C | D)[]`) flowing into a union with a
-  // matching ref-array arm: the reflist WRAPPER ref rides the box anyref directly (like a scalar-
-  // list wrapper), tagged by its interned slot (`refArrSlotTag`). Checked BEFORE the value-atom
-  // gate below — such a union may have NO value atom (`S[] | {w:i32}`), so that gate would bail and
-  // emit the RAW wrapper ref where a `(ref $uBox)` is expected (the pre-fix invalid-wasm). The slot
-  // match guards against a ref-array whose element is not actually an arm (a checker-impossible case).
-  // D1029 — THE MAP ARM'S RE-BOX, the rung the ref-array arm below has had all along. A
-  // value narrowed to the union's map arm reads UNBOXED in that scope (that is the point of
-  // the narrow), so delivering it to a destination typed at the UNION has to put the box
-  // back: the arm's tag, the map ref, `struct.new`. Without it `exprUnion` had to keep
-  // answering TRUE for a narrowed map so the "already a union" rung would pass the cell
-  // through raw — which is right for a map-value store and wrong at the other five
-  // positions, where the value had already been unboxed.
+  // D1029 — THE MAP ARM'S RE-BOX, the rung the ref-array arm below has had all along. A value
+  // narrowed to the union's map arm reads UNBOXED in that scope (that is the point of the
+  // narrow), so delivering it to a destination typed at the UNION has to put the box back: the
+  // arm's tag, the map ref, `struct.new`. Without it `exprUnion` had to keep answering TRUE for
+  // a narrowed map so the "already a union" rung would pass the cell through raw — right for a
+  // map-value store, wrong at every position where the value had already been unboxed.
   //
   // Written as the exact mirror of the ref-array rung so the two arms of one rule stay one
   // shape: tag from the arm's own slot, value through the ordinary emit, one `struct.new`.
   const d29 = emitUnionMapArmBox(body, unionName, exprIx, fnIx)
   if d29 < 0 { return -1 }
   if d29 == 1 { return 0 }
+  // A REF-ELEMENT array carrier (`S[]`, `(() => f64)[]`, `(C | D)[]`) flowing into a union with
+  // a matching ref-array arm: the reflist WRAPPER ref rides the box anyref directly (like a
+  // scalar-list wrapper), tagged by its interned slot (`refArrSlotTag`). Checked BEFORE the
+  // value-atom gate below — such a union may have NO value atom (`S[] | {w:i32}`), so that gate
+  // would bail and emit the RAW wrapper ref where a `(ref $uBox)` is expected. The slot match
+  // guards against a ref-array whose element is not actually an arm.
   if unionName != "" && exprRefArray(exprIx, fnIx) {
     const raSlot = refListSlotOfExpr(exprIx, fnIx)
     if unionHasRefArrayArmSlot(unionName, raSlot) {
@@ -5421,12 +5134,11 @@ export function emitUnionCoerce(
   // EXPRESSION (`m[k]` is an i32) and has no access to whether the key was found, so it
   // emits an unconditional value tag over `emitMapGet`'s "rep's empty value". For `i32`
   // that empty value is `0` — a real value — and the miss arrives indistinguishable from a
-  // stored zero. The niche-bearing value types (`boolean`, litunions, `string`, structs)
-  // are excluded by the predicate itself: their empty value already MEANS absent.
+  // stored zero. The niche-bearing value types are excluded by the predicate itself: their
+  // empty value already MEANS absent.
   //
-  // Gated on the union actually containing `null`. `m[k]` coerced into a union WITHOUT a
-  // null member is not a nullable consumption — there is no absent to represent — so it
-  // keeps the ladder's plain boxing.
+  // Gated on the union actually containing `null`: without a null member there is no absent
+  // to represent, so `m[k]` keeps the ladder's plain boxing.
   const mrk = mapReadScalarBoxKind(exprIx, fnIx)
   if mrk >= 0 && unionSetHasNull(unionName) {
     // Only when the map's own value atom is a MEMBER of the target union. A widening
@@ -5444,26 +5156,14 @@ export function emitUnionCoerce(
   // `docs/internals/litunion-compact-rep-design.md`, family F1). ABOVE the value-atom
   // ladder, because the ladder cannot classify this value at all: `valueAtomKind("K")` is
   // -1, so a `K`-typed local/param/call result falls past every branch to the numeric
-  // default and then to the union's own promotion rules. Measured on master at `b7566067`,
-  // 184 cells (8 mixed spellings x 3 carriers x 8 positions), ZERO of them correct:
-  //   · `K | f64` — `cak` promotes to 4 and the body is `f64.convert_i32_s` applied to the
-  //     ATOM ID under the f64 tag. `is K` compares tag 2 and is false: SILENT wrong answer.
-  //   · `K | i32` / `K | i64` / `K | boolean` / `K | {w:i32}` — the raw id boxes under the
-  //     wrong tag, same silent miss.
-  //   · `K | string` / `K | i32[]` — the id is pushed at the box's `anyref` payload:
-  //     "type mismatch: expected anyref, found i32". INVALID WASM, `vl check` rc 0.
-  // The value's rep IS the interned i32 id and the box's payload is a REF, so the store has
-  // to WIDEN — `emitAtomToStr`'s `select` tower over the member constants — and tag the box
-  // kind 2, which is the tag `isArmTagOfTy` already hands a litunion arm by hand
-  // (`if tyIsLitUnion(ity) { ak = 2 }`). Store and `is` then resolve one tag.
-  //
-  // THE HAZARD IS THE RESERVATION SCAN, NOT THIS EMIT. `emitAtomToStr` stashes the id in
-  // the string-op scratch frame (`setStrScrI`), reserved by `emit_classify`'s scan — whose
-  // atom-widening predicates all keyed on the target being spelled `string`. A union target
-  // carrying a litunion arm is their missing SIXTH member; `unionTakesAtomAsStr` is the
-  // shared question, asked here and at all six scan sites. Adding this leg without the
-  // reservation is invalid wasm (measured: 96 cells, and the frame is per-FUNCTION so the
-  // miss lands on whichever local the layout put at `strScratchBase + 3`).
+  // default. Every mixed spelling was wrong — `K | f64` boxed the ATOM ID through
+  // `f64.convert_i32_s` under the f64 tag, `K | i32` / `K | i64` / `K | boolean` boxed the
+  // raw id under the wrong tag, and `K | string` / `K | i32[]` pushed an i32 at the box's
+  // `anyref` payload: INVALID WASM, `vl check` rc 0. The value's rep IS the interned i32 id
+  // and the payload is a REF, so the store WIDENS (`emitAtomToStr`) and tags kind 2, the tag
+  // `isArmTagOfTy` already hands a litunion arm. THE HAZARD IS THE RESERVATION SCAN, NOT THIS
+  // EMIT: `emitAtomToStr` stashes the id in the per-FUNCTION string-op scratch frame, whose
+  // reservation predicates all keyed on a `string` target — `unionTakesAtomAsStr` is the fix.
   if unionTakesAtomAsStr(unionName) && exprIsLitAtom(exprIx, fnIx) {
     fbI32Const(scalarTagOfKind(2)) // the string tag — kind 2 rides the anyref directly
     if emitAtomToStr(body, exprIx, fnIx) < 0 { return -1 }
@@ -5483,25 +5183,18 @@ export function emitUnionCoerce(
   // literal compares can produce 0–5, and codes 7 / 8 / 9 / 10 / 12 / 13 name one list backing
   // each. Each arm's comment names the atom it stands for.
   let cak = 0 // "i32"
-  // D209 — THE THIRD END OF THE SAME CHANNEL. When the read site delivered the ATOM
-  // rather than the box (`memReadUnboxAtomKind`, the predicate `exprUnion` also asks),
-  // the value's atom is that predicate's answer and not this ladder's classification of
-  // the expression: every arm below reads the read as a code-16 BOX and declines, so a
-  // `string | i32` field read fell to the numeric default and `struct.new $vbI32` was
-  // applied to a string ref — `vl check` rc 0, "expected i32, found (ref $type)".
-  // Measured: 8 of this rung's own 714-cell grid, all at `string | i32`, all at the four
-  // BOX-WANTING consumers (union binding, another code-16 field, a union param, a union
-  // return) — invisible to the 1,260-cell `d272` grid, whose `unis` cells pin the payload
-  // at `7` and so only ever exercise the i32 default that happens to be right.
+  // D209 — THE THIRD END OF THE SAME CHANNEL. When the read site delivered the ATOM rather
+  // than the box (`memReadUnboxAtomKind`, the predicate `exprUnion` also asks), the value's
+  // atom is that predicate's answer and not this ladder's classification of the expression:
+  // every arm below reads the read as a code-16 BOX and declines, so a `string | i32` field
+  // read fell to the numeric default and `struct.new $vbI32` was applied to a string ref —
+  // `vl check` rc 0, "expected i32, found (ref $type)". The `d272` grid cannot see it: its
+  // `unis` cells pin the payload at `7`, exercising only the i32 default that is right.
   //
-  // D291 — AND THE ATOM IS TAKEN ONLY WHERE **THIS** DESTINATION STORES IT AS ITSELF.
-  // The read delivers the atom the CHECKER typed its consumers against; where the read's
-  // own field widened the payload on the way in, the destination here widens it again on
-  // the way out, and taking the delivered atom raw would tag the box `i32` over a slot
-  // whose only numeric arm is `i64` — VALID wasm, and `is i64` silently false. Asking
-  // `unionStoreAtomKind` is what makes the two sides of the round trip inverses: where the
-  // destination stores the delivered atom unchanged this rung fires exactly as before,
-  // and where it does not, the ladder below re-applies the SAME promotion the read undid.
+  // D291 — AND THE ATOM IS TAKEN ONLY WHERE **THIS** DESTINATION STORES IT AS ITSELF. Where
+  // the read's own field widened the payload on the way in, taking the delivered atom raw
+  // tags the box `i32` over a slot whose only numeric arm is `i64` — VALID wasm, `is i64`
+  // silently false. `unionStoreAtomKind` makes the two sides of the round trip inverses.
   const d209k = memReadUnboxAtomKind(bareIx, fnIx)
   if d209k >= 0 && unionStoreAtomKind(unionName, d209k) == d209k {
     cak = d209k
@@ -5652,18 +5345,16 @@ export function emitUnionCoerce(
 }
 
 // Coerce an expression into a union-BOX position whose wasm rep is `(ref $uBox)` — a call
-// ARGUMENT to a union param, or a RETURN typed as the union. A concrete VARIANT-struct
-// VALUE (`s: S` passed to a `C | S` param, or returned from a `: C | S` function) is a raw
-// `(ref $variant)`: a struct that is a union member is allocated as a kind-8 variant local
-// so it narrows in place, but that raw ref does NOT match the boxed param/return rep —
-// passing / returning it was invalid wasm ("expected (ref $type), found (ref $type)"). Box
-// it into the shared `{tag, payload}` rep exactly as `emitUnionBox` boxes a struct LITERAL
-// (the variant ref IS the payload type the box wants — no field copy). Every other shape —
-// a struct literal, a passed-through union value, a scalar atom — defers to
-// `emitUnionCoerce`. Box-typed positions ONLY; a let-init to a union-annotated-but-
-// variant-init local stays a raw kind-8 variant and calls `emitUnionCoerce` directly.
-// Exported for `emit_sections.vl`'s module-GLOBAL cells, which are box-typed too
-// (`globalCellKind` has no kind-8 variant cell — a union global is always the box).
+// ARGUMENT to a union param, or a RETURN typed as the union. A concrete VARIANT-struct VALUE
+// (`s: S` passed to a `C | S` param) is a raw `(ref $variant)`: a struct that is a union
+// member is allocated as a kind-8 variant local so it narrows in place, but that raw ref does
+// NOT match the boxed param/return rep — passing it was invalid wasm. Box it into the shared
+// `{tag, payload}` rep exactly as `emitUnionBox` boxes a struct LITERAL (the variant ref IS
+// the payload type — no field copy). Every other shape defers to `emitUnionCoerce`.
+//
+// Box-typed positions ONLY; a let-init to a union-annotated-but-variant-init local stays a
+// raw kind-8 variant and calls `emitUnionCoerce` directly. Exported for `emit_sections.vl`'s
+// module-GLOBAL cells, which are box-typed too (`globalCellKind` has no kind-8 variant cell).
 export function emitUnionBoxArg(
   body: i32[],
   unionName: string,
@@ -5709,15 +5400,11 @@ export function emitUnionBoxArg(
       // it); this one did not, and an out-of-bounds read in the compiler is a wasm TRAP with no
       // diagnostic — the compiler dying rather than refusing.
       //
-      // Reported as #1611 ("same-shape union crash"), but the bisect says neither same shapes
-      // nor the `is` test is required: `function f(x: A | i32)` called as `f(mkA())` is enough.
-      // What is required is a CALL result in a union argument position — an inline literal
-      // (`f({...})`) or a const never reach here.
-      //
-      // A row with no heap index cannot be a layout twin of anything, so it simply is not one:
-      // the comparison declines instead of indexing, and the program continues to the existing
-      // loud "ref valtype with no interned shape" reject that its const-bound twin already got.
-      // This makes the two spellings agree; it does not make either compile.
+      // Neither same shapes nor the `is` test is required to reach it: `function f(x: A | i32)`
+      // called as `f(mkA())` is enough. What IS required is a CALL result in a union argument
+      // position — an inline literal or a const never reach here. A row with no heap index
+      // cannot be a layout twin of anything, so the comparison declines instead of indexing and
+      // the program continues to the loud reject its const-bound twin already got.
       if (
         bssi >= 0 &&
         bssi < sHeapIdx.length &&
@@ -5730,24 +5417,18 @@ export function emitUnionBoxArg(
       fbStructNew(uBoxIdx) // { tag, variant-ref }
       return 0
     }
-    // THE NICHE TWIN of the rung above (silent-class-inventory D24). A narrowed `Circle |
-    // null` is the `nulvariant` NICHE — one non-null member, so a bare `(ref null $Circle)`
-    // and NOT a `{tag, value}` box — and `exprVariantIndex` answers -1 for it by
-    // construction: its arms are the kind-8 param, the declared local and the global, none
-    // of which is the nullable cell. So the value fell past this whole gate into
-    // `emitUnionCoerce`, whose own variant rung asks the same -1 question, and was passed
-    // through RAW: `local.get 0 ; return_call $area` with no `struct.new $uBox` between
-    // them, a `(ref null $Circle)` under a `(ref $uBox)` parameter. `vl check` rc 0, and
-    // the engine refuses the module.
+    // THE NICHE TWIN of the rung above (D24). A narrowed `Circle | null` is the `nulvariant`
+    // NICHE — one non-null member, so a bare `(ref null $Circle)` and NOT a `{tag, value}`
+    // box — and `exprVariantIndex` answers -1 for it by construction: its arms are the kind-8
+    // param, the declared local and the global, none of which is the nullable cell. So the
+    // value fell past this whole gate into `emitUnionCoerce`, whose own variant rung asks the
+    // same -1 question, and was passed through RAW under a `(ref $uBox)` parameter: `vl check`
+    // rc 0, and the engine refuses the module.
     //
-    // THE NARROW IS WHAT MAKES IT SOUND: this position is only reachable with the value
-    // proved non-null, and the box's payload field is `anyref`, so the niche rides it
-    // exactly as the non-null variant ref does — same three bytes, one different source.
-    //
-    // GATED ON THE BOOLEAN TWIN, not on the index alone: `exprNullableVariant` and
-    // `nulVariantIdxOfExpr` are a kind/slot PAIR (that helper's header states the rule),
-    // and reading the slot without the kind is how a number from another index space gets
-    // used as a tag.
+    // THE NARROW IS WHAT MAKES IT SOUND: this position is only reachable with the value proved
+    // non-null, and the box's payload field is `anyref`, so the niche rides it exactly as the
+    // non-null variant ref does. GATED ON THE BOOLEAN TWIN, not the index alone —
+    // `exprNullableVariant` and `nulVariantIdxOfExpr` are a kind/slot PAIR.
     if exprNullableVariant(exprIx, fnIx) {
       const nvi = nulVariantIdxOfExpr(exprIx, fnIx)
       if nvi >= 0 && nvi < uTags.length {
@@ -5847,31 +5528,18 @@ function emitUnionIfArm(
   emitFail("emitProgram: union if-expression arm is not a block")
 }
 
-// ── the NARROWED-ARM DELIVERY UNBOX (silent-class-inventory D1031) ───────────────────────
+// ── the NARROWED-ARM DELIVERY UNBOX (D1031) ──────────────────────────────────────────────
 //
 // An `is`-narrowed STRUCT arm is STILL the `{tag, payload}` box at the wasm level. That is the
 // one narrowed rep whose READ does not unbox — `emitIdent` carries an unbox arm for the
 // value-atom, ref-array and map arms and none for the struct one — so every destination typed
-// at the ARM has to recover the payload itself.
+// at the ARM has to recover the payload itself. TWO POSITIONS DID AND THE REST DID NOT
+// (`emitCall`'s variant PARAM and `emitVariantCoerce`'s return arm carry the sequence inline),
+// which is what made this a position matrix rather than one bug.
 //
-// TWO POSITIONS DID AND THE REST DID NOT, which is what made this a TEN-cell position matrix
-// rather than one bug: `emitCall`'s variant PARAM (`if exprUnion(arg) { struct.get; ref.cast }`)
-// and `emitVariantCoerce`'s return arm both carry the sequence inline. An annotated binding, a
-// nullable-arm parameter, a nullable-arm return, a struct field at construct and at assign, a
-// ref-list element, a `push`, a module-global assignment and a map-VALUE store all pushed the
-// box into a `(ref [null] $S)` slot: `vl check` rc 0 and a module the engine refuses.
-//
-// WHY THE DESTINATION'S HEAP AND NOT `uVarHeap[vi]`. The slot is what the store must satisfy,
-// and where D280 merged the arm with a declared twin the two indices are the same anyway
-// (`uVarHeap[vi] = sHeapIdx[uVarSTwinAt(vi)]`). Asking the destination is what keeps the cast
-// target and the slot from disagreeing — a `ref.cast` to some other same-layout row would be a
-// second heap type and `expected (ref $type), found (ref $type)` all over again.
-//
-// NOT A CHANGE TO `exprUnion`. D1029 closed the MAP arm by excluding it there, so its read
-// unboxes and union-typed destinations re-box; doing the same for the struct arm would move
-// every `is`-narrowed struct receiver in the language at once — `emitNarrowedMem`, `emitIs`'s
-// re-narrowing and struct `==` all read the box today. This wires the deliveries instead, and
-// the position matrix is the completeness check.
+// WHY THE DESTINATION'S HEAP AND NOT `uVarHeap[vi]`: the slot is what the store must satisfy,
+// and where D280 merged the arm with a declared twin the indices are the same anyway. NOT A
+// CHANGE TO `exprUnion` — D1029's map exclusion would move every narrowed struct receiver.
 function narrowedArmNeedsUnbox(exprIx: i32, fnIx: i32): boolean {
   if narrowedStructArmVi(exprIx) < 0 { return false }
   exprUnion(exprIx, fnIx)
@@ -6064,19 +5732,18 @@ function emitVariantIfArm(body: i32[], vi: i32, blockIx: i32, fnIx: i32) {
 // union operand is restricted to a simple BINDING read — re-reading an ident is
 // effect-free and yields the same box. Anything effectful fails loudly.
 
-// Unbox a union payload already pushed as `anyref` (`struct.get $box 1`) to the rep
-// of the arm whose value-atom KIND is `k`: a string payload (kind 2) IS the string
-// array (cast only); a scalar rides its per-rep value box (cast + field 0). Mirrors
+// Unbox a union payload already pushed as `anyref` (`struct.get $box 1`) to the rep of the
+// arm whose value-atom KIND is `k`: a string payload (kind 2) IS the string array (cast
+// only); a scalar rides its per-rep value box (cast + field 0). Mirrors
 // `emitValueUnionUnboxRead`.
 //
 // D-UNION-ATOM-KIND: the two questions this asked of the atom's SPELLING —
-// `atom == "string"` and `vbHeapIdxOfAtom(atom)` — are both projections of that one
-// code, and every caller already holds it (the box TAG it emits one instruction
-// earlier IS `scalarTagOfKind` of the same code, and `emitUnionUnionEq`'s arms carry
-// it out of the BANK). `valueAtomKind` answers 2 for the spelling `string` and for
-// nothing else, so the kind test is the same partition, not a widening; a member that
-// is not a value atom at all (a litunion alias `K0`, code -1) reaches
-// `vbHeapIdxOfKind(-1)` = -1 and the same loud reject the spelling path gave.
+// `atom == "string"` and `vbHeapIdxOfAtom(atom)` — are both projections of that one code,
+// and every caller already holds it (the box TAG it emits one instruction earlier IS
+// `scalarTagOfKind` of the same code). `valueAtomKind` answers 2 for the spelling `string`
+// and for nothing else, so the kind test is the same partition, not a widening; a member
+// that is not a value atom at all reaches `vbHeapIdxOfKind(-1)` = -1 and the same loud
+// reject the spelling path gave.
 function emitUnionPayloadUnbox(_body: i32[], k: i32) {
   if k == 2 {
     fbRefCast(sTypeIdx) // the payload IS the string array ref
@@ -6149,20 +5816,6 @@ function emitUnionEqOther(body: i32[], otherIx: i32, k: i32, fnIx: i32) {
   emitExpr(body, otherIx, fnIx)
 }
 
-// The union-box ATOM test, asked of the BANKED member kinds first and of the
-// name-keyed arena row only where the bank declines — D-VALKIND, the ladder every
-// scalar-keyword `unionHasAtomTy(nm, kw, false)` in this file now takes.
-//
-// `s` is the interned member SET the caller already resolved (the whole point: the callee
-// otherwise re-resolves the union from its NAME per call — `unionRowOf`, a linear scan of
-// `unNames` then of `unMemberSet`, both whole-string compares). `k` is the atom's ABI KIND,
-// which at five of these sites the caller ALREADY HOLDS (`eak` / `lak` / the coerce
-// ladder's own codes) and handed over as a spelling for the callee to re-derive. `nm`/`kw`
-// survive ONLY as the fall-through's arguments: `msHasValKind` declines for a kind outside
-// the seven scalar keywords (a list atom, a closure, an unclassified spelling) and for a
-// set the pool or the kind bank does not cover, and the legacy path answers those
-// unchanged — including its LOUD `emitFail` on an unregistered row, which the bank can
-// never mask (a covered set is a registered row by construction).
 // union == concrete (either operand order — equality is symmetric): the box's
 // tag must select the arm whose rep matches the other side, then the unboxed
 // payload value-compares it. A rep with no arm is statically unequal (`==` 0 /
@@ -6218,22 +5871,16 @@ function emitUnionConcreteEq(
   }
   // A MIXED UNION IS COMPARABLE TO A SCALAR LITERAL, and this gate refused it. The compare
   // below is arm-AGNOSTIC: it reads the box's TAG, compares it to the tag of the atom the
-  // OTHER operand names, and on a match compares that one payload. The union's remaining
-  // arms are never touched — a container arm simply has a tag that does not match, which is
-  // the right answer (`false`) and needs no compare core of its own.
-  //
-  // So requiring the WHOLE union to be a value union was stronger than the lowering needs.
-  // `type Json = null | boolean | f64 | string | Json[] | {[string]: Json}` carries a list
-  // and a map arm, so `isValueUnionOfSet` declines and `v == "b"` refused — on the critical
-  // path of every JSON round-trip a consumer writes, which is why the usability critique's
-  // programs hand-roll `deepEquals`.
+  // OTHER operand names, and on a match compares that one payload. The union's remaining arms
+  // are never touched — a container arm simply has a tag that does not match, which is the
+  // right answer (`false`) and needs no compare core of its own. So requiring the WHOLE union
+  // to be a value union was stronger than the lowering needs:
+  // `type Json = null | boolean | f64 | string | Json[] | {[string]: Json}` carries a list and
+  // a map arm, so `isValueUnionOfSet` declined and `v == "b"` refused.
   //
   // WIDENED ONLY WHERE THE OTHER OPERAND NAMES AN ATOM THE UNION ACTUALLY CARRIES.
-  // `unionEqArmPresent` is the same membership test the `eqHasArm` rung below trusts to
-  // decide the static-false fold, so this admits nothing that rung would not immediately
-  // have to answer for. An operand with NO atom at all never reaches here — it took the
-  // variant compare above — so what this gate widens is exactly the set of arms whose
-  // payload the tail below can unbox and compare.
+  // `unionEqArmPresent` is the same membership test the `eqHasArm` rung below trusts for the
+  // static-false fold, so this admits nothing that rung would not immediately answer for.
   const eqMixedOk = unionEqArmPresent(usid, unmArms, atom, eak)
   if (
     uname == "" ||
@@ -6304,17 +5951,14 @@ function emitUnionConcreteEq(
 // EXCEPT a bare closure. A closure arm's tag is keyed on its SIGNATURE (`cloArmTagOfTy` →
 // `cloSigSlotTag`): the FIRST signature a module interns keeps the flat kind-11 offset and
 // each further one claims the band above, so two closure-armed unions in one module tag their
-// arms differently and `scalarTagOfKind(11)` is right for only one of them.
-//
-// MEASURED, NOT REASONED: with `((i32) => i32) | i32` and `(() => i32) | S` in one module, the
-// second union's box writes tag 16 (disassembled) and the compare tested 12 — `false` where
-// the answer is `true` at the union-vs-concrete spelling, and at the union-vs-union one a
-// `ref.cast` TRAP, because the failed test falls through to the next arm's payload cast.
+// arms differently and `scalarTagOfKind(11)` is right for only one of them. With
+// `((i32) => i32) | i32` and `(() => i32) | S` in one module the second union's box writes one
+// tag and the compare tested another — `false` where the answer is `true` at the
+// union-vs-concrete spelling, and a `ref.cast` TRAP at the union-vs-union one.
 //
 // The tag already has ONE HOME — `cloArmTagOfTy`, whose BOX side is `emitUnionCoerce` and
 // whose TEST side is `isArmTagOfTy`. This routes the COMPARE through it too, so all three
-// derive an arm's tag from one render of one arena type. The two callers differ only in where
-// the arm's type comes from, which is the same split `cloBoxArmTy` already names.
+// derive an arm's tag from one render of one arena type (`cloBoxArmTy` names the caller split).
 function unionEqTagOfArmTy(k: i32, armTy: i32): i32 {
   if k == 11 { return cloArmTagOfTy(armTy) }
   scalarTagOfKind(k)
@@ -6336,62 +5980,32 @@ function unionEqArmPresent(
   unionHasAtomK(usid, unmArms, atom, eak)
 }
 
-// D1071 — union `==` a CONCRETE VARIANT (`p == a` with `p: A | i32` and `a: A`). The box's
-// tag selects the arm, and on a match that arm's payload is compared field-wise against the
-// concrete operand — the union-vs-union compare with one side's unbox deleted.
-//
-// THE CONCRETE OPERAND ALREADY HAS THE ARM'S HEAP TYPE. When a union is declared, the union
-// path owns the struct `type`s (the struct table is empty and `uVarHeap` carries them), so a
-// `const a: A = {x: 1}` beside `type A` in a `A | i32` is a `(ref $uVarHeap[vi])` — the very
-// type the box's payload casts to. Disassembled on the row's own witness: the global's cell
-// type and the `ref.cast` target are the same heap index, so no conversion sits between them.
-//
-// THE BOX IS EVALUATED FIRST AND ONCE, keeping the operand order every other arm of this
-// compare uses, and both operands are parked so an effectful operand runs exactly once —
-// which is also what makes an operand that is not a re-readable place (a call) work here
-// without the `unionEqOperandOk` gate `emitUnionConcreteEq`'s scalar path needs.
-//
-// Returns 0 when it emitted and -1 when it DECLINES (the operand is not a concrete variant,
-// or the arm carries a field this lowering cannot compare), so the caller keeps its loud
-// refusal rather than writing a bad module.
 // D1180 / D1181 — THE VARIANT ROW THE CONCRETE OPERAND'S VALUE ACTUALLY HAS, which is not
 // always the row `exprVariantIndex` names. That resolver is REP-AUTHORITATIVE over BINDINGS,
-// so it carries a leg per storage class a binding can take (param, declared local, capture,
-// module global, cast, call, index, `??`) and none for a struct-FIELD read — `h.a` answers
-// -1 there. And an UN-ANNOTATED object literal is declined on purpose the moment the struct
-// table holds a row matching its field set (`objLitVariantIdxNoStructRow`), which one
-// unrelated `type N = { inner: { x: i32 } }` is enough to arrange. Both answer -1 while the
+// so it carries a leg per storage class a binding can take and none for a struct-FIELD read —
+// `h.a` answers -1. And an UN-ANNOTATED object literal is declined the moment the struct table
+// holds a row matching its field set (`objLitVariantIdxNoStructRow`). Both answer -1 while the
 // VALUE is a perfectly good arm-typed ref.
 //
 // THE BRIDGE IS HEAP IDENTITY, NOT SHAPE MATCHING. `sHeapIdx` and `uVarHeap` are two index
 // spaces over ONE wasm type space (DECISIONS.md keeps the namespaces apart on purpose), and
-// two rows that interned to the SAME wasm struct type hold values that are interchangeable
-// byte for byte. That is the whole of what the compare below needs: it casts the box's
-// payload to `uVarHeap[vi]` and parks the concrete operand in a slot typed from the same
-// index, so an equal heap index means no conversion sits between them. Where the two rows
-// interned separately this answers -1 and the caller keeps its loud refusal, which is the
-// honest answer — a cross-heap compare would need a converting read this lowering has not
-// built.
-//
-// EXACTLY ONE MATCH, OR NONE. Two arms of one union can share a heap type when their shapes
-// are identical, and then the HEAP does not determine the TAG — so an ambiguous match
-// declines rather than guessing which arm the payload cast should select.
+// two rows that interned to the SAME wasm struct type hold interchangeable values. Where they
+// interned separately this answers -1 and the caller keeps its loud refusal. EXACTLY ONE
+// MATCH, OR NONE: two arms sharing a heap type do not determine the TAG, so that declines.
 function eqConcreteVariantRow(exprIx: i32, fnIx: i32) {
   const vi = exprVariantIndex(exprIx, fnIx)
   if vi >= 0 { return vi }
-  // THE NULLABLE-NICHE STORAGE CLASS, and the list above did not omit it — it did not
-  // exist. A code-15 field read whose target is a union ARM now binds `nulvariant`
-  // (D1112/D1150), which `exprVariantIndex` declines because that resolver is the NON-NULL
-  // one, and which `structIndexOfExpr` declines because an arm has no `sNames` row. A cell
-  // between the two kinds fell through both rungs and took the caller's loud refusal.
+  // THE NULLABLE-NICHE STORAGE CLASS, and the list above did not omit it — it did not exist.
+  // A code-15 field read whose target is a union ARM now binds `nulvariant` (D1112/D1150),
+  // which `exprVariantIndex` declines because that resolver is the NON-NULL one, and which
+  // `structIndexOfExpr` declines because an arm has no `sNames` row. A cell between the two
+  // kinds fell through both rungs and took the caller's loud refusal.
   //
-  // ASKED AHEAD OF THE HEAP SCAN BECAUSE IT IS THE EXACT ANSWER. The bridge below infers a
-  // row from heap identity and must decline an AMBIGUOUS match (two arms sharing one heap
-  // type); this reads the arm the checker's own type names, so it cannot be ambiguous.
-  //
-  // The value is the same `(ref null $uVarHeap[vi])` niche the `nulstruct` operand the
-  // bridge already serves parks: the arm slot is nullable and the field `struct.get` traps
-  // on null exactly as it does for that one.
+  // ASKED AHEAD OF THE HEAP SCAN BECAUSE IT IS THE EXACT ANSWER: the bridge below infers a row
+  // from heap identity and must decline an AMBIGUOUS match, while this reads the arm the
+  // checker's own type names. The value is the same `(ref null $uVarHeap[vi])` niche the
+  // `nulstruct` operand the bridge already serves parks — the arm slot is nullable and the
+  // field `struct.get` traps on null exactly as it does for that one.
   if exprNullableVariant(exprIx, fnIx) {
     const nvi = nulVariantIdxOfExpr(exprIx, fnIx)
     if nvi >= 0 { return nvi }
@@ -6412,6 +6026,18 @@ function eqConcreteVariantRow(exprIx: i32, fnIx: i32) {
   found
 }
 
+// D1071 — union `==` a CONCRETE VARIANT (`p == a` with `p: A | i32` and `a: A`). The box's tag
+// selects the arm, and on a match that arm's payload is compared field-wise against the
+// concrete operand — the union-vs-union compare with one side's unbox deleted.
+//
+// THE CONCRETE OPERAND ALREADY HAS THE ARM'S HEAP TYPE. When a union is declared, the union
+// path owns the struct `type`s (the struct table is empty and `uVarHeap` carries them), so a
+// `const a: A = {x: 1}` beside `type A` in an `A | i32` is a `(ref $uVarHeap[vi])` — the very
+// type the box's payload casts to, with no conversion between them.
+//
+// THE BOX IS EVALUATED FIRST AND ONCE, and both operands are parked so an effectful operand
+// runs exactly once — which is what makes a non-place operand work here without the
+// `unionEqOperandOk` gate `emitUnionConcreteEq`'s scalar path needs. -1 = DECLINES.
 function emitUnionConcreteVariantEq(
   body: i32[],
   boxIx: i32,
@@ -6461,34 +6087,18 @@ function emitUnionConcreteVariantEq(
   0
 }
 
-// union == union: equal iff the SAME arm (tag) holds AND the unboxed payloads
-// value-compare equal per that arm. Folded as a nested value-typed `if` chain
-// over the SHARED non-null arms, bottoming out at bare tag equality (covers the
-// `null` arm and any non-shared arm: distinct tags ⇒ unequal, equal null tags
-// ⇒ equal). The right payload's unbox short-circuits on ITS tag too.
 // D973 — `==` over a STRUCT UNION (`A | B` of declared shapes), both operands the same set.
 // Tags unequal means different arms and therefore unequal; tags equal selects ONE arm, and
 // that arm's fields are compared through the variant table.
 //
 // WHY NOT `emitStructEqRec`, which already does field-wise struct compares: it is keyed on a
 // STRUCT-TABLE row, and `emit_state`'s own header says that table is EMPTY when a union is
-// declared — "the union path owns the struct `type`s instead (its variant table)". Measured:
-// `sHeapIdx.length` is 0 for this program. The arms' fields live in `uFieldNames` /
-// `uFieldTypes`, so the compare reads them there.
+// declared — the union path owns the struct `type`s instead. The arms' fields live in
+// `uFieldNames` / `uFieldTypes`, so the compare reads them there.
 //
-// D1061 — A SCALAR ARM BESIDE THE STRUCT ONES IS SERVED HERE TOO, and it is the MIXED pair
-// that was the gap: `A | B` over two struct arms already compared and printed `true`, while
-// `A | i32` and `A | string` refused with a message naming the "struct union". The arm loop
-// required a VARIANT ROW per arm and a scalar arm has none (`variantIndexOf("i32")` is -1),
-// so the whole lowering declined for a set it can otherwise serve arm for arm. The dispatch
-// is unchanged — every arm of this box is selected by the SAME tag field, and a scalar arm's
-// tag is `scalarTagOfKind` of its value-atom code, which cannot collide with a variant tag
-// (`scalarTagOfKind(k)` is `uVariants.length + k`). Only the per-arm COMPARE differs: a
-// struct arm compares its fields through the variant table, a scalar arm value-compares the
-// unboxed payload the way `emitUnionUnionEq` does for a pure value union.
-//
-// Returns 0 when it emitted and -1 when it DECLINES, so an arm set it cannot serve keeps the
-// caller's loud message rather than becoming a bad lowering.
+// D1061 — A SCALAR ARM BESIDE THE STRUCT ONES IS SERVED HERE TOO, and the MIXED pair was the
+// gap: the arm loop required a VARIANT ROW per arm and a scalar arm has none. Its tag is
+// `scalarTagOfKind` of its atom code, which cannot collide with a variant tag. -1 = DECLINES.
 function emitStructUnionEq(
   body: i32[],
   lIx: i32,
@@ -6615,20 +6225,16 @@ function variantFieldsComparable(vi: i32): boolean {
 }
 
 // ONE HOME for "can this variant field be compared", MIRRORED ARM FOR ARM by
-// `emitVariantFieldEqCore`: this one decides and that one emits, so a code admitted here
-// with no core there is invalid wasm on a `vl check`-clean program.
+// `emitVariantFieldEqCore`: this one decides and that one emits, so a code admitted here with
+// no core there is invalid wasm on a `vl check`-clean program.
 //
 // D1096 — THE ADMISSION USED TO BE THE THREE CODES THE LADDER HAPPENED TO HAVE ARMS FOR
-// (i32/boolean, string, nested shape), and ONE unservable field declined the WHOLE compare.
-// So `type A = { d: f64 }` inside an `A | i32` refused `p == a` while the identical field
-// compares fine at its direct spelling — and the same for i64, f32, every list rep and a
-// function-valued field. Most of those cores already exist; what was missing was this
-// ladder's route to them, which is the shape D1020 closed for the STRUCT table's
-// scalar-backed list fields.
-//
-// `i64` and `f32` are the two the STRUCT ladder does not serve either (measured: a plain
-// `{d: i64}` struct `==` refuses with "unsupported struct field type in equality"), so their
-// arms are built rather than borrowed.
+// (i32/boolean, string, nested shape), and ONE unservable field declined the WHOLE compare:
+// `type A = { d: f64 }` inside an `A | i32` refused `p == a` while the identical field
+// compares fine at its direct spelling, and the same for i64, f32, every list rep and a
+// function-valued field. Most of those cores already exist; what was missing was this ladder's
+// route to them, the shape D1020 closed for the STRUCT table's scalar-backed list fields.
+// `i64` and `f32` are the two the STRUCT ladder does not serve either, so those arms are built.
 function variantFieldComparable(ufi: i32): boolean {
   const c = uFieldTypes[ufi]
   if c == 0 || c == 21 || c == 30 {
@@ -6909,6 +6515,11 @@ function emitNestedShapeEq(body: i32[], ufi: i32) {
 // path never reaches that, so -1 is the honest argument rather than a borrowed frame.
 function fnIxOfNothing(): i32 { -1 }
 
+// union == union: equal iff the SAME arm (tag) holds AND the unboxed payloads value-compare
+// equal per that arm. Folded as a nested value-typed `if` chain over the SHARED non-null arms,
+// bottoming out at bare tag equality (covers the `null` arm and any non-shared arm: distinct
+// tags ⇒ unequal, equal null tags ⇒ equal). The right payload's unbox short-circuits on ITS
+// tag too.
 function emitUnionUnionEq(
   body: i32[],
   lIx: i32,
