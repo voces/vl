@@ -52,6 +52,8 @@ import {
 import {
   fixableDiagnosticsForRange,
   quickFixesForDiagnostic,
+  ufcsImportFixes,
+  ufcsMissingImportAt,
 } from "./codeActions.ts";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -76,6 +78,8 @@ import {
   exportRefLenses,
   flatDocumentSymbols,
   type HighlightKind,
+  importInsertionEdit,
+  importSpecifierForKey,
   inlayHintsFromWasm,
   isDisplayableType,
   keywordCompletions,
@@ -91,6 +95,9 @@ import {
   stdAutoImportCompletions,
   type StdExportCandidate,
   typeLabelDetail,
+  ufcsCompletions,
+  ufcsProbeSource,
+  type UfcsProbeModule,
 } from "./typeFeatures.ts";
 import { STD_SOURCES } from "../../std/embedded.ts";
 import { invalidNewNameReason, planRenameAt, renameEdits } from "./rename.ts";
@@ -1105,6 +1112,58 @@ const stdExportsForCompletion = async (): Promise<Map<string, StdExportCandidate
   return out;
 };
 
+// ---- UFCS candidate source ---------------------------------------------------
+//
+// The modules the UFCS probe reaches into beyond the ones the file already
+// imports: every std module, named by ONE of its own exports (see
+// `ufcsProbeSource` for why one named specifier is the whole trick). The list
+// rides the same cached per-module surface the std auto-import pass builds, so
+// asking for it costs a Map walk, not a compile — and a module the file already
+// imports is dropped by `ufcsProbeSource` itself, since it is in the graph
+// already.
+//
+// WORKSPACE modules are NOT probed. `enumerateWorkspaceFiles` caps at 500 files
+// and a UFCS probe importing all of them would compile the project on every `.`;
+// what IS covered is every module the file already imports plus every module
+// THOSE reach — which includes the module declaring the receiver's type, because
+// a value of that type had to come from somewhere the file can already see.
+const ufcsProbeModules = async (): Promise<UfcsProbeModule[]> => {
+  const out: UfcsProbeModule[] = [];
+  for (const [key, exports] of await stdExportsForCompletion()) {
+    if (exports.length > 0) out.push({ key, anyExport: exports[0].name });
+  }
+  return out;
+};
+
+// The UFCS methods the receiver at (`line`, `character`) — the cursor, just after
+// the `.` — dispatches to, over the file's own graph PLUS the probe modules.
+// `[]` when the seed predates the export or the receiver resolves to nothing.
+const ufcsCandidatesForCursor = async (
+  text: string,
+  uri: string,
+  position: { line: number; character: number },
+  insertProbeProp: boolean,
+): Promise<{ name: string; detail: string; moduleKey: string }[]> => {
+  if (wasmChecker?.ufcsCandidatesAt === undefined) return [];
+  const probe = ufcsProbeSource(
+    text,
+    await ufcsProbeModules(),
+    insertProbeProp ? position : undefined,
+  );
+  return await wasmChecker
+    .ufcsCandidatesAt(
+      probe.source,
+      entryKeyOf(uri),
+      workspaceReader,
+      position.line + probe.lineOffset,
+      position.character,
+    )
+    .catch((err) => {
+      connection.console.log(`[wasm-checker] ufcsCandidatesAt failed: ${err}`);
+      return [];
+    });
+};
+
 // The identifier `[A-Za-z_][A-Za-z0-9_]*` immediately to the LEFT of `character`
 // on `line`, or null. Used to find a `<name>.` member-completion receiver: we
 // scan back over `.` then the preceding word. (Cursor-on-word extraction is
@@ -1166,17 +1225,22 @@ connection.onCompletion(async (params): Promise<CompletionItem[]> => {
   }
 
   if (charBeforeCursor === ".") {
+    // TWO SCANS, because `x.` has two answers and neither list contains the
+    // other. FIELDS come from the receiver's type; UFCS METHODS come from the
+    // program's free `self`-functions, including ones this file has not imported
+    // — VL never resolves those implicitly (DECISIONS.md, owner 2026-09-02), so
+    // the editor offers them WITH the import as an `additionalTextEdit`.
     const receiver = wordEndingBefore(linePrefix, linePrefix.length - 1);
-    if (!receiver) return [];
+    const dotCol = params.position.character - 1;
     // The native parser isn't error-tolerant for the incomplete `receiver.`, so
     // strip the trailing `.` and resolve the receiver as a bare expression at its
     // own position. Empty for a receiver with no completable members (arrays/maps)
-    // or one that can't resolve.
-    const dotCol = params.position.character - 1;
-    const repaired = removeCharAt(text, params.position.line, dotCol);
-    const members = await wasmChecker
+    // or one that can't resolve. Only a BARE IDENTIFIER receiver can be re-found
+    // this way — the UFCS scan below has no such limit, which is why a null
+    // `receiver` no longer ends the request.
+    const members = receiver === null ? [] : await wasmChecker
       .memberCompletionsAt(
-        repaired,
+        removeCharAt(text, params.position.line, dotCol),
         entryKeyOf(uri),
         workspaceReader,
         params.position.line,
@@ -1186,7 +1250,16 @@ connection.onCompletion(async (params): Promise<CompletionItem[]> => {
         connection.console.log(`[wasm-checker] memberCompletionsAt failed: ${err}`);
         return [];
       });
-    return memberCompletionsFromWasm(members).map((c) => toCompletionItem(c));
+    const fields = memberCompletionsFromWasm(members);
+    const byName = new Set(fields.map((f) => f.name));
+    const ufcs = ufcsCompletions(
+      text,
+      entryKeyOf(uri),
+      await ufcsCandidatesForCursor(text, uri, params.position, true),
+      (name) => byName.has(name),
+      (stmt) => wasmChecker?.formatSrc?.(stmt),
+    );
+    return [...fields, ...ufcs].map((c) => toCompletionItem(c));
   }
 
   // Identifier completion: native in-scope user bindings + native builtins +
@@ -1259,7 +1332,7 @@ const kindMatchesOnly = (kind: string, only: string[] | undefined): boolean =>
   only === undefined ||
   only.some((k) => kind === k || kind.startsWith(k + "."));
 
-connection.onCodeAction((params): CodeAction[] => {
+connection.onCodeAction(async (params): Promise<CodeAction[]> => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return [];
   const source = doc.getText();
@@ -1276,6 +1349,35 @@ connection.onCodeAction((params): CodeAction[] => {
     );
     for (const diag of diagnostics) {
       const fixes = quickFixesForDiagnostic(source, diag.code, diag.range);
+      // A missing UFCS import is the one fix whose candidate set the document
+      // cannot supply: which modules export a `self`-function this receiver
+      // dispatches to is the checker's answer, and it is the same scan `.`
+      // completion runs. The diagnostic points AT the member name, so the
+      // receiver is the member access's object and needs no probe property.
+      const ufcsName = ufcsMissingImportAt(source, diag);
+      if (ufcsName !== undefined) {
+        const candidates = await ufcsCandidatesForCursor(
+          source,
+          uri,
+          diag.range.start,
+          false,
+        );
+        const entryKey = entryKeyOf(uri);
+        fixes.push(...ufcsImportFixes(
+          source,
+          ufcsName,
+          candidates
+            .filter((c) => c.name === ufcsName)
+            .map((c) => importSpecifierForKey(source, entryKey, c.moduleKey)),
+          (src, spec, name) =>
+            importInsertionEdit(
+              src,
+              spec,
+              name,
+              (stmt) => wasmChecker?.formatSrc?.(stmt),
+            ),
+        ));
+      }
       for (const fix of fixes) {
         actions.push({
           title: fix.title,

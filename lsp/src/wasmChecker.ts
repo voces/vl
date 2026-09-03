@@ -164,6 +164,26 @@ export type WasmMemberCompletion = {
 };
 
 /**
+ * One UFCS candidate from the wasm UFCS pass — a free `function f(self: T, …)`
+ * the receiver under the cursor DISPATCHES to (`x.f(a)` is `f(x, a)`), which the
+ * field-set scan behind {@link WasmMemberCompletion} structurally cannot see.
+ * `detail` is the rendered signature with the receiver row dropped (argument N is
+ * parameter N, the same convention {@link WasmSignature} keeps); `moduleKey` is
+ * the resolved key of the module that DECLARES it, `""` for a single-file check
+ * with no module table.
+ *
+ * The candidate's name is NOT necessarily in scope — that is the point. VL never
+ * resolves UFCS implicitly (DECISIONS.md, owner 2026-09-02), so a `self`-function
+ * whose module the entry merely reaches is a call the author must import first,
+ * and `moduleKey` is what lets the editor write that import.
+ */
+export type WasmUfcsCandidate = {
+  name: string;
+  detail: string;
+  moduleKey: string;
+};
+
+/**
  * One inlay-hint candidate from the wasm inlay pass (kill-TS) — an unannotated
  * declaration with its inferred type, the native counterpart of the host's
  * `deriveInlayHints` symbol-table walk. `kind` 0 = a value binding (hint after the
@@ -433,6 +453,27 @@ export type WasmChecker = {
     line: number,
     character: number,
   ) => Promise<WasmMemberCompletion[]>;
+  /**
+   * UFCS candidates (the LSP's half of "UFCS is never implicit"): the free
+   * `self`-functions the receiver under (`line`, `character`) — both 0-based,
+   * LSP — dispatches to, each with the module that declares it. The caller
+   * passes the same `.`-STRIPPED source `memberCompletionsAt` takes and a
+   * position on the receiver name, so one repaired source serves both queries.
+   *
+   * The set spans EVERY module in the checked graph, imported names or not — a
+   * module reached only by a bare `import "std:str"` the caller prepended
+   * contributes its functions while binding nothing, which is exactly the
+   * "offer it, and write the import" shape (see `ufcsProbeSource`). Empty when
+   * the cursor is off a typed binding, nothing dispatches, or the seed predates
+   * the exports.
+   */
+  ufcsCandidatesAt: (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+    line: number,
+    character: number,
+  ) => Promise<WasmUfcsCandidate[]>;
   /**
    * Cross-file imported sources (kill-TS step 3-C): for each LOCAL imported name
    * in `source` (as the entry module at `entryKey`), the exporting sibling
@@ -1040,6 +1081,63 @@ export const createWasmChecker = (
     return out;
   };
 
+  // The UFCS-candidate exports are newer than the member-scan ones, so a seed can
+  // speak member completion and not this; the method then yields [] and the host
+  // offers fields alone (what it offered before this existed).
+  const hasUfcsScan = (exp: Exports): boolean =>
+    typeof exp.ufcsScanAt === "function" &&
+    typeof exp.ufcsScanNameLen === "function" &&
+    typeof exp.ufcsScanModuleAt === "function" &&
+    typeof exp.ufcsScanExportedAt === "function" &&
+    typeof exp.modKeyAtLen === "function";
+
+  const ufcsCandidatesAt = async (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+    line: number,
+    character: number,
+  ): Promise<WasmUfcsCandidate[]> => {
+    const exp = instantiate();
+    if (
+      exp === undefined || !speaksAbi(exp) || !hasSymbols(exp) ||
+      !hasUfcsScan(exp)
+    ) return [];
+    await prepare(exp, source, entryKey, read);
+    exp.checkSrcSym();
+    // Native lines are 1-based; the LSP cursor line is 0-based.
+    const count = exp.ufcsScanAt(line + 1, character);
+    // The module table is read ONCE and indexed — a candidate names its module by
+    // table index, and re-reading the key per candidate would be O(candidates ×
+    // key length) wasm calls for a table of at most a dozen entries.
+    const modCount = exp.modKeyCount();
+    const keyOf: string[] = [];
+    for (let m = 0; m < modCount; m++) {
+      keyOf[m] = readString(exp.modKeyAtLen(m), (j) => exp.modKeyAtCharAt(m, j));
+    }
+    const out: WasmUfcsCandidate[] = [];
+    for (let i = 0; i < count; i++) {
+      // Module 0 is the ENTRY: its own `self`-functions are in scope already and
+      // need no `export` to be callable. Everything else is reached by an import,
+      // so a candidate that is not exported is not offerable — `std:str`'s private
+      // `mapAsciiCase` fits `self: string` exactly like `trim` does, and offering
+      // it would write an import the checker then refuses.
+      const mod = exp.ufcsScanModuleAt(i);
+      if (mod !== 0 && exp.ufcsScanExportedAt(i) !== 1) continue;
+      const name = readString(
+        exp.ufcsScanNameLen(i),
+        (j) => exp.ufcsScanNameCharAt(i, j),
+      );
+      if (name.length === 0) continue; // defensive: a declaration always has a name
+      const detailLen = exp.ufcsScanDetailLen(i);
+      const detail = detailLen <= 0
+        ? ""
+        : readString(detailLen, (j) => exp.ufcsScanDetailCharAt(i, j));
+      out.push({ name, detail, moduleKey: keyOf[mod] ?? "" });
+    }
+    return out;
+  };
+
   // The inlay exports ride the same Stage-2+ seed as the symbol exports; an older
   // seed lacks them, so this yields [] (the host keeps its TS `deriveInlayHints`).
   const hasInlay = (exp: Exports): boolean =>
@@ -1475,6 +1573,7 @@ export const createWasmChecker = (
     inlayHintsAt,
     scopeAt,
     memberCompletionsAt,
+    ufcsCandidatesAt,
     importedNameSources,
     moduleSurface,
     formatSrc,

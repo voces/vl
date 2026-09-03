@@ -273,6 +273,103 @@ export type FixableDiagnostic = {
   code?: string | number;
   source?: string;
   range: LspRange;
+  /**
+   * The diagnostic's text. Read ONLY by {@link ufcsMissingImportAt}, and only
+   * while the missing-UFCS-import diagnostic has no code of its own — every other
+   * fix here dispatches on `code`, which is the design and stays it.
+   */
+  message?: string;
+};
+
+// ---- missing UFCS import ------------------------------------------------------
+//
+// `expect(1 + 2).toEqual(3)` needs `toEqual` imported, because VL resolves a UFCS
+// call against names IN SCOPE and never by looking into the receiver's module
+// (DECISIONS.md, owner 2026-09-02). Today the compiler reports `no field 'toEqual'
+// on Expectation<i32>` — true, and useless to someone who has not met the rule.
+// The fix that helps is the import, and the checker knows which modules could
+// supply it (`wasmChecker.ufcsCandidatesAt`); this is the diagnostic → name →
+// action half.
+
+/** The stable code D1230's diagnostic is to carry (compile-goal track, vl-07). */
+export const UFCS_NOT_IMPORTED_CODE = "ufcs-not-imported";
+
+/**
+ * The member NAME a missing-UFCS-import diagnostic is about, or undefined when
+ * `diag` is not one.
+ *
+ * TWO ROUTES, AND THE CODE IS THE ONE THAT LASTS. When the diagnostic carries
+ * {@link UFCS_NOT_IMPORTED_CODE} that alone identifies it; until then the current
+ * message shape (`no field '<name>' on <Type>`) is the only signal there is. The
+ * NAME comes from neither — it is read out of `source` at the diagnostic's own
+ * range, which is the property token — so the day the message is rewritten to
+ * name the missing import (it is, in vl-07) nothing here needs re-teaching, and
+ * dropping the fallback is deleting the second `if`.
+ *
+ * The range read is verified against the message when there is one: a diagnostic
+ * whose range does not sit on an identifier is not this diagnostic.
+ */
+export const ufcsMissingImportAt = (
+  source: string,
+  diag: FixableDiagnostic,
+): string | undefined => {
+  const coded = diag.code === UFCS_NOT_IMPORTED_CODE;
+  const legacy = diag.code === undefined &&
+    /^no field '[A-Za-z_][A-Za-z0-9_]*' on /.test(diag.message ?? "");
+  if (!coded && !legacy) return undefined;
+  const line = splitLines(source)[diag.range.start.line];
+  if (line === undefined) return undefined;
+  const end = diag.range.end.line === diag.range.start.line
+    ? diag.range.end.character
+    : line.length;
+  const name = line.slice(diag.range.start.character, end);
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) return undefined;
+  return name;
+};
+
+/**
+ * One `` Import `name` from "M" `` action per candidate module — several modules
+ * may export a `self`-function of the same name, and each import is a different
+ * program, so the author picks rather than the editor guessing. The candidates
+ * come from the checker's UFCS scan at the diagnostic's position, so every one of
+ * them really does export a function this receiver dispatches to.
+ *
+ * `moduleSpecs` are SPECIFIERS, the thing an import statement spells (`./shapes`),
+ * not module keys (`/proj/shapes.vl`) — the caller converts, because only it knows
+ * the entry. The title shows the same string, so what the action promises is what
+ * lands in the file.
+ *
+ * A module whose import already binds the name yields no action (`importEdit`
+ * returns undefined) — that diagnostic is about something else, and offering a
+ * no-op edit would be worse than offering nothing.
+ */
+export const ufcsImportFixes = (
+  source: string,
+  name: string,
+  moduleSpecs: string[],
+  importEdit: (
+    source: string,
+    moduleSpec: string,
+    name: string,
+  ) => LspTextEdit | undefined,
+): QuickFix[] => {
+  const fixes: QuickFix[] = [];
+  const seen = new Set<string>();
+  for (const spec of moduleSpecs) {
+    if (spec.length === 0 || seen.has(spec)) continue;
+    seen.add(spec);
+    const edit = importEdit(source, spec, name);
+    if (edit === undefined) continue;
+    fixes.push({
+      title: `Import \`${name}\` from "${spec}"`,
+      kind: "quickfix",
+      // Preferred when it is the only candidate: with two modules exporting the
+      // name there is no default, and marking one would make "Auto Fix" pick it.
+      ...(moduleSpecs.length === 1 ? { isPreferred: true } : {}),
+      edits: [edit],
+    });
+  }
+  return fixes;
 };
 
 /** Whether two ranges share any physical line. */
