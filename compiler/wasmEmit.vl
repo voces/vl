@@ -18250,6 +18250,38 @@ function emitPop(body: i32[], callIx: i32, fnIx: i32, nulBox: boolean) {
             if pnk >= 0 { return emitPopNulBox(body, lIdx, lTy, aTy, pnk) }
           }
         }
+        // AN EMPTY REF / STRING POP ANSWERS `null`, IT DOES NOT TRAP (D1212). Reading
+        // `backing[len - 1]` unguarded indexes -1 on an empty list, so `array.get` trapped
+        // before the `ref.as_non_null` below was reached — while the checker types the call
+        // `T | null` and every scalar rep already answers `null` there. The result is the
+        // backing's own `(ref null $elem)`, which is exactly the cell a `nulstruct` /
+        // `nulstr` / `nullist` / `nulreflist` consumer holds; the non-null recovery moves to
+        // the READ side, where the narrowing is what proves it.
+        if elemIsRef {
+          let popElemHeap = sTypeIdx
+          if popRefSlot >= 0 {
+            if popRefSlot >= rlElemHeap.length {
+              return emitFail("emitProgram: ref .pop element heap not interned")
+            }
+            popElemHeap = rlElemHeap[popRefSlot]
+          }
+          pushListLen(body, lIdx, lTy) // cond: len != 0
+          fbIfRefNul(popElemHeap, true)
+          ctrlEnter()
+          fbLocalGet(lIdx)             // L.len = len - 1
+          pushListLen(body, lIdx, lTy)
+          fbI32Const(1)
+          fbI32Bin(107)                // 0x6b i32.sub
+          fbStructSet(lTy, 1)          // field 1: len
+          pushListBacking(body, lIdx, lTy)
+          pushListLen(body, lIdx, lTy)
+          fbArrayGet(aTy)              // backing[len] — already `(ref null $elem)`
+          fbElse()                     // 0x05 else — empty → the typed null
+          fbRefNull(popElemHeap)
+          fbEnd()                      // 0x0b end
+          ctrlLeave()
+          return 0
+        }
         // L.len = len - 1
         fbLocalGet(lIdx)    // local.get L
         pushListLen(body, lIdx, lTy)
