@@ -465,6 +465,14 @@ BUILD (`timeout 300 <build>`), and sweep for your own survivors before relaunchi
 identically, so the candidate can never reach a red. A change that loops on the compiler has
 an unbounded recursion or a fixpoint that does not converge, and that is the defect.
 
+**Three gates now catch this class, at three different moments.** `arena-scan-outside-pass`
+(`compiler/lint.vl` + `scripts/scan-budget.py`'s ratchet) fires at REVIEW time on a loop
+bounded by a whole-program table outside a pass — 132 stand, the count may only fall.
+`tests/vl_scaling_shape_test.ts` compiles seven pairs of same-work-different-shape programs
+and grades the TIME RATIO, so machine speed and load cancel and the failure NAMES the axis.
+`scripts/self-compile-time.sh` trips past 4× a committed CPU-second baseline for the L2
+build — half the factor pays for contention, which doubles CPU seconds on this box. Details and when each fires: `docs/internals/profiling-the-compiler.md` §Guards.
+
 ## Comments state the invariant; measurements live in the inventory
 
 **A comment block is capped at 12 lines — 40 for a module HEADER — and a comment stating a

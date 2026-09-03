@@ -297,10 +297,14 @@ def cmd_exempt_codes():
     return 0
 
 
-def cmd_filter_lint(path):
-    """Grade a `vl check --json` diagnostic dump against that allow-list."""
+def cmd_filter_lint(path, extra=()):
+    """Grade a `vl check --json` diagnostic dump against that allow-list.
+
+    `extra` names codes a SIBLING ratchet still owes — scripts/scan-budget.py
+    prints its own through `--exempt-codes`, and lint-self.sh passes them here so
+    one filter grades the whole dump rather than two chained ones."""
     total = load_baseline()["total"]
-    exempt = {c for c in CODES if total.get(c, 0) > 0}
+    exempt = {c for c in CODES if total.get(c, 0) > 0} | set(extra)
     with open(path, encoding="utf-8") as fh:
         text = fh.read().strip()
     diags = json.loads(text) if text else []
@@ -336,7 +340,8 @@ def main():
     if "--exempt-codes" in args:
         return cmd_exempt_codes()
     if "--filter-lint" in args:
-        return cmd_filter_lint(args[args.index("--filter-lint") + 1])
+        i = args.index("--filter-lint")
+        return cmd_filter_lint(args[i + 1], args[i + 2:])
     if "--grade" in args:
         return cmd_grade(args[args.index("--grade") + 1])
     cur = current()
