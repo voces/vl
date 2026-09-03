@@ -35696,9 +35696,9 @@ Repro (runs, prints `hi`):
 
 ### D1250 — `??` whose LEFT OPERAND is an if-EXPRESSION written IN PLACE refuses; only the spelling through a BINDING runs
 
-**loud emit reject · check rc 0 · clause 2 · `emitProgram: \`??\` over this nullable value is not supported yet — narrow it first, e.g. \`if v != null { … }\`` · ZERO corpus cells · found 2026-09-02 by [D1086](#d1086)'s position matrix, which made this program check-clean for the first time · PRE-EXISTING and INDEPENDENT of D1086: the explicit-`else` spelling refuses identically**
+**closed — an if-EXPRESSION operand joins the CALL and `as?` shapes in the stash-once arm, its box arrives through `emitUnionCoerce`, and `collectU` registers the union it spells nowhere · was a loud emit reject at check rc 0, clause 2 · ZERO corpus cells · found 2026-09-02 by [D1086](#d1086)'s position matrix, which made this program check-clean for the first time · PRE-EXISTING and INDEPENDENT of D1086: the explicit-`else` spelling refused identically**
 
-Repro (refuses; should print `7`):
+Repro (runs, prints `7`):
 
     function go(): void {
       print((if 1 == 1 { 7 }) ?? -1)
@@ -35709,16 +35709,38 @@ Repro (refuses; should print `7`):
   draws the identical message, and so does a `string` arm and the call-argument position. The
   only spelling that runs is through a BINDING: `const a = if c { 7 }` then `a ?? -1`.
 
-* **WHAT THE ARM NEEDS IS A NAME, and it asks the wrong node for one.** The value-union-box
-  `??` arm reads `unionNameOfExpr` of the `??` NODE, whose own checked type is the COALESCED
-  scalar (`i32`) — not a union name — so it comes back empty and the arm declines to the
-  fall-through. The left operand's type (`i32 | null`) is the one that names the box.
+* **THE MECHANISM IS THREE LAYERS, and the filed one was only the outermost.** Fixing each
+  revealed the next, which is why the row is worth reading as a ladder rather than a diagnosis:
+
+  | layer | what it said | what it was |
+  | --- | --- | --- |
+  | 1 | `` `??` over this nullable value is not supported yet `` | the stash-once arm's gate is `lhs is Call \|\| lhs is AsExpr`; an if-expression is the THIRD non-re-readable box source and was in neither |
+  | 2 | `union box atom test on a union with no recorded members: i32\|null` | nothing registers a member set for a box the checker joined IN PLACE — the `.pop()` walk in `collectU` closes exactly this for a call, and an if-expression needed the same row |
+  | 3 | `if-expression requires an else arm` | `emitExpr` picks the join's blocktype off the arms' SCALAR ladder; the box lowering is `emitUnionCoerce`'s own `IfStmt` arm (`emitUnionIfValue`), whose missing else is the null-tagged box |
+
+  The filed diagnosis — `unionNameOfExpr` of the `??` NODE coming back empty — describes the
+  arm the operand never reached, and is not what was fixed.
 
 * **THE BINDING SPELLING NEVER REACHES THE ARM.** `emit_rewrite` desugars a RE-READABLE left
   operand into an `if` (D962), and a binding is re-readable while an if-expression is not, so
   the two spellings of one program take different lowerings and only one of them was built.
 
-* Probe: `scripts/capability-probes/coalesce-over-if-expression-operand.vl` (GAP).
+* **AND THE OPERAND WAS BEING EVALUATED TWICE AT THE `boolean | null` NICHE**, which is a
+  clause-1 bug the row's own sentence hid: `(if bump() { true }) ?? false` ran `bump` TWICE
+  (measured, `n == 2`). `lhsReEval` was `true` for everything but a `Call`, and an if-expression
+  is not a place. It is false for an if-expression now, and the bool arm gained the stash leg the
+  `K | null` arm beside it already had.
+
+* **GRADED ON A 9-SPELLING x 6-POSITION GRID: 54 of 54 run.** Spellings: else-less true/false, an
+  explicit `else { null }` at both truth values, an `else if` chain, i64 and f64 arms, a
+  side-effecting condition, and a nested `??` default. Positions: `print` argument, binding,
+  arithmetic operand, call argument, `return`, and inside a function. The `string` arm is NOT
+  covered — a `string | null` operand is the NICHE, not the box, and the niche has no
+  stash-once lowering for a non-re-readable operand at any spelling (the emitter says so in its
+  own words for the CALL twin: `` `??` over a string|null call result is not supported yet ``).
+  That is [D1302](#d1302).
+
+* Probe: `scripts/capability-probes/coalesce-over-if-expression-operand.vl` (RUNS).
 
 ### D1087 — the emitter dispatches on a NAME the checker let the user bind, so a user's own parameter or struct field draws a BUILT-IN's arity complaint
 
@@ -38182,11 +38204,11 @@ Repro (loads, then traps — it prints nothing and dies):
   state its vocabulary has precisely because D19 was mis-read the same way), so THIS row is the
   instrument until the runner learns the difference.
 
-### D1240 — a member call in TAIL position is `unsupported member-call statement` at every rep, while the identical call under an explicit `return` RUNS
+### D1240 — a member call whose value no mutator arm claims is `unsupported member-call statement` at EVERY position, not only the tail
 
-**loud emit reject · check rc 0 · clause 2 · `emitProgram: unsupported member-call statement` · ZERO corpus cells · found 2026-09-02 by the D1141/D1142 agent and re-verified by hand on the merged tree**
+**closed — `emitCallStmt` gained the DISCARD fall-through its `Ident` arm always had, and a tail member call in a non-void function takes the tail-value exit · was a loud emit reject at check rc 0, clause 2 · ZERO corpus cells · found 2026-09-02 by the D1141/D1142 agent; the filed TAIL scope was refuted on 2026-09-03**
 
-Repro (refuses; adding `return` in front of the last line makes it print `2`):
+Repro (runs, prints `2`):
 
     function f(): i32[] {
       const xs: i32[] = [1, 2, 3]
@@ -38194,19 +38216,46 @@ Repro (refuses; adding `return` in front of the last line makes it print `2`):
     }
     print(f().length)
 
-* **IT IS NOT ABOUT THE REP.** `i32[]` refuses, which is the rep everything else serves
-  first. The row's own control is one keyword: `return xs.slice(0, 2)` runs and prints `2`.
+* **IT IS NOT ABOUT THE REP.** `i32[]` refused, which is the rep everything else serves
+  first. The row's own control is one keyword: `return xs.slice(0, 2)` ran and printed `2`.
+
+* **AND IT WAS NOT ABOUT THE TAIL EITHER — THE FILED SCOPE WAS WRONG.** The row's control
+  (`return`) is a VALUE position, not a non-tail one, so it could not separate the two. Measured:
+  a NON-TAIL statement (`xs.slice(0, 2)` with `return xs.length` after it), a MODULE-SCOPE
+  statement, and a tail inside a `: void` function all drew the identical sentence. The missing
+  route is the discard, and the tail is one position of it.
 
 * **A TAIL EXPRESSION IS A VALUE EVERYWHERE ELSE IN VL** — a block's last expression is its
   value, which is why `it("x", () => { … })` and every `=>` body work. A member call is the
   one expression form where the tail position is routed to the STATEMENT dispatcher instead,
   and the statement dispatcher's job is to discard.
 
-* **THE SENTENCE NAMES THE DISPATCHER, NOT THE DEFECT** — the same wording D1131 hit at
-  `u8[].clear()`, where the statement dispatcher refused one stage before the emitter that
-  could have served it. Worth checking whether both are the same missing route.
+* **THE SENTENCE NAMES THE DISPATCHER, AND D1131 IS *NOT* THE SAME ROUTE.** Both draw this
+  wording from the same `emitFail`, and that is all they share: D1131 widened a PER-METHOD gate
+  (`.clear`'s receiver-rep test) so more reps reach `emitClear`, an arm that already existed;
+  this row adds the FALL-THROUGH for every method the ladder never claims at all. Neither fix
+  would have moved the other's cells — `.clear` still needs its own gate, and `.slice` has no
+  arm to be gated into.
 
-* Probe: none yet — one is worth adding with the explicit-`return` control beside it.
+* **BOTH HALVES ARE NEEDED, AND THE ORDER IS THE USUAL ONE.** With only the discard,
+  `function f(): i32[] { … xs.slice(0, 2) }` compiles the call, drops it, and pads a
+  `(ref …)`-result functype with `unreachable` — a TRAP where the refusal was. With only the
+  tail exit, every other position stays refused. Build the lowering, wire every delivery.
+
+* **AND THE VOID FIXPOINT HAD TO MOVE WITH THEM.** `stmtIsTailValue` declines every member call
+  and must keep doing so (it feeds `computeVoidFns`, and a tail `xs.push(1)` — typed `i32` by the
+  checker with no value lowering at any position, [D1301](#d1301) — would reclassify a working
+  void procedure non-void and refuse it). So `computeVoidFns` consults
+  `memberCallYieldsValue` directly: without that veto an UN-ANNOTATED
+  `function f(xs) { xs.slice(0, 2) }` classified void while the checker typed it `i32[]`, and a
+  caller reading the result got an empty stack — 8 of 19 methods measured check-clean invalid
+  wasm that way, all of them loud before the fix.
+
+* **TWO SILENT WRONG ANSWERS FELL OUT.** `function p(xs: i32[]) { xs.pop() }` printed `null` for
+  `print(p([1, 2]))` and took the default in `p([1, 2]) ?? 9`; both now answer `2`.
+
+* Probe: `scripts/capability-probes/member-call-statement-and-tail.vl` (RUNS) — five positions
+  with the explicit-`return` control beside them.
 
 ### D1241 — `u8[][]` has no rep at ANY value: `emitProgram: only i32[] arrays and struct/union element arrays are supported`
 
@@ -38231,11 +38280,12 @@ Repro (refuses on a program that does nothing but declare it):
 
 ### D1220 — a void-tail function whose last statement is an `if` assigning a STRUCT module global infers a non-void return and TRAPS on `unreachable`
 
-**loads then traps · clause 1 · OPEN · found 2026-09-02 by [D1115](#d1115)'s position matrix, where the
-global-ASSIGNMENT cells stopped being invalid wasm and started reporting this instead · present on
-master and INDEPENDENT of D1115: the witness below carries no nullable anything**
+**closed — the inferred `S | null` return is PINNED onto `fn.fnRet`, so the fall-through emits this
+rep's `ref.null` instead of dead `unreachable` padding · was `loads then traps`, clause 1 · ZERO corpus
+cells · found 2026-09-02 by [D1115](#d1115)'s position matrix, where the global-ASSIGNMENT cells
+stopped being invalid wasm and started reporting this instead**
 
-Repro (check rc 0, then `wasm trap: wasm 'unreachable' instruction executed`):
+Repro (runs, prints `7`):
 
     type C = { v: i32 }
     let g: C = {v: 1}
@@ -38265,7 +38315,26 @@ Repro (check rc 0, then `wasm trap: wasm 'unreachable' instruction executed`):
 
 * **IT WAS HIDING BEHIND D1115.** Those cells were check-clean INVALID WASM before the recover
   landed, so the module never loaded and the trap could not be reached. Refusals come in layers;
-  this is the next one, not a regression — the witness above traps on master too.
+  this is the next one, not a regression — the witness above trapped on master too.
+
+* **THE FIX IS THE ANNOTATION THE AUTHOR DID NOT WRITE — the same pin [D1062](#d1062) makes for a
+  nullable LIST, one type family over.** The ANNOTATED twin `function set(y: C): C | null { … }`
+  always ran, and so did `: void`; only the inferred face trapped, which is the two-faces shape
+  again. `fnRetNullBearing` and `emitNullForRet` both read `fn.fnRet`, and with no annotation there
+  was nothing for either to read — while the FUNCTYPE producer had already resolved
+  `(ref null $C)` off the inferred NAME. `synthNulListRetAnns` now pins the nullable-struct return
+  too (`snrNulStructRet`, asking `nullablePartOf` + `structIndexOfTypeName` — the pair
+  `inferNulStructRow` asks, so the pin and `retNulRefIndex` cannot resolve different rows), and
+  both readers answer from one place.
+
+* **GRADED ON A 10-DESTINATION x 6-SHAPE GRID: 53 of 54 gradeable cells run.** Destinations: i32 /
+  string / list / struct / `C | null` / map / f64 / i64 / struct-FIELD globals and a struct local;
+  shapes: the un-annotated tail `if`, the `: void` twin, an explicit `else`, a trailing bare
+  `return`, no `if` at all, and a one-iteration `while`. The single hold-out is
+  [D1303](#d1303) — an `i64` GLOBAL assigned in an un-annotated tail `if`, which is check-clean
+  invalid wasm on master too and is a separate rep gap, not this one.
+
+* Probe: `scripts/capability-probes/void-tail-if-struct-global-assign.vl` (RUNS).
 
 ---
 ### D1221 — a generic member call on a type-parameter receiver whose instantiation carries the field is a check reject with a BLANK message, unless a `self`-function of that name is also in scope
@@ -39038,9 +39107,9 @@ Ablation:
 
 ### D1253 — a bare `{ … }` block is `emitProgram: unsupported statement in body` at EVERY scope, while the parser mints it deliberately and the checker gives it a scope
 
-**loud emit reject · clause 2 · `vl check` rc 0 · every scope and every content · ZERO corpus cells · noted in [D1244](#d1244) while ablating the block kinds, filed 2026-09-02 with its own witness**
+**closed — `emit_rewrite` desugars a bare block statement to `if true { … }`, so every per-function scan already walks it · was a loud emit reject at `vl check` rc 0, clause 2 · ZERO corpus cells · noted in [D1244](#d1244) while ablating the block kinds, filed 2026-09-02 with its own witness**
 
-Repro (`vl check` rc 0; deleting the two braces prints `7`):
+Repro (runs, prints `7`):
 
     function go() {
       {
@@ -39075,11 +39144,41 @@ Repro (`vl check` rc 0; deleting the two braces prints `7`):
   first: `block_bare_capture` on the `module-block-capture-list` and `-string` templates
   reports `unsupported statement in body`, not D1244's cell.
 
-* **THE HARNESS GRADES IT NOW.** `matrix.py`'s new `block_bare` position is this row at every
-  template under `matrix/`: **18 of 18 cells** — nine templates, both faces — report
+* **THE HARNESS GRADES IT NOW.** `matrix.py`'s `block_bare` position was this row at every
+  template under `matrix/`: **18 of 18 cells** — nine templates, both faces — reporting
   `emitProgram: unsupported statement in body`. That is what a floor with no exceptions looks
   like from the matrix, and it is the cheapest available proof that content and capability
-  are both irrelevant to it.
+  were both irrelevant to it. All 18 run now.
+
+* **THE FIX IS A REWRITE, NOT AN `emitStmt` ARM, AND THE FIRST ATTEMPT PROVED WHY.** An
+  `emitStmt` `Block` arm plus a matching `collectLocals` arm makes the witness run — and leaves
+  **20 of 90** cells of a scope x content grid check-clean INVALID WASM, every one of them a
+  string op or a `.push` inside the block (`unknown local N: local index out of bounds`). The
+  reason is that ~15 per-function SCANS reserve scratch frames by walking statement kinds
+  (`blockHasStrOpScan`, `blockPushPopBits`, `mfScan`, `leqScanBlock`, …) and NONE has a `Block`
+  arm; an emit-only arm compiles the block against locals nobody declared. `if true { … }` is a
+  statement kind every one of them already walks, so the coverage is by construction rather than
+  by a list of fifteen edits. The checker types a bare block `void` (`{ 5 }` in an `: i32`
+  function is `expected i32, got void`, and so is `{ return 5 }`), which is exactly what a
+  statement-position `if` with no else is — the wrap is meaning-preserving.
+
+* **90 OF 90 CELLS RUN** on a 5-scope x 18-content grid (module / function / inside an `if` /
+  inside a `while` / lambda body, x print, i32 / string / struct / list locals, a `.push`, string
+  concatenation, a capturing closure, a map, a nested block, a `while`, a `for`, shadowing, f64,
+  i64).
+
+* **"EMPTY" WAS NEVER THIS ROW — the filed twelve-spelling list is wrong by one.** `{ }` with
+  nothing in it parses as an empty OBJECT LITERAL, not a `Block`: `looksLikeObject` claims it,
+  and it reports `emitProgram: object literal but no struct type declared` with an unused-value
+  warning, before and after this fix alike.
+
+* **THE PRICE, PINNED.** Removing the floor makes `block_bare_capture` reachable, so on the
+  `module-block-capture-list` and `-string` templates those two cells move loud -> SILENT. They
+  are [D1244](#d1244)'s own `i32[]` cell, byte-identical to the `block_if_capture` and
+  `block_while_capture` cells that were already silent beside them — the floor was hiding one of
+  three. `tests/vl_capability_matrix_test.ts` asserts all three now, so they close together.
+
+* Probe: `scripts/capability-probes/bare-block-statement.vl` (RUNS).
 
 * **AND A BARE BLOCK AFTER A CALL STATEMENT IS A PARSE ERROR INSTEAD**, found while ablating
   the preceding statement: `print(1)` on one line and `{` on the next inside a function body
@@ -39113,3 +39212,116 @@ Ablation:
   `block_bare_capture` cells on all nine matrix templates; the checker's own scoping (the
   block's `n` must keep NOT colliding with an outer `n` once the emitter has an arm); and the
   call-then-block parse error, which is a separate question this row's close does not answer.
+
+### D1301 — `.push` is typed `i32` by the checker and has NO value lowering at any position, so its result is a loud reject where it is bound and INVALID WASM where a function returns it
+
+**loud emit reject · clause 2 · `emitProgram: callee is not a function name` · ZERO corpus cells · found 2026-09-03 while closing [D1240](#d1240), which had to exclude `.push` by name to avoid trading it for a program that runs**
+
+Repro (refuses; should print `2`, the new length):
+
+    const xs: i32[] = [1]
+    const n: i32 = xs.push(2)
+    print(n)
+
+* **THE CHECKER TYPES IT, THE EMITTER CANNOT BUILD IT.** `const n: i32 = xs.push(2)` is `vl
+  check` rc 0 — the annotation is accepted, so the checker's answer for `.push` is `i32` — and
+  `emitExpr` has no member-call arm for it, so it lands on `emitCall`'s Ident-only floor. Every
+  other list method the checker types non-void (`.pop`, `.slice`, `.map`, `.filter`,
+  `.delete`, `.has`, `.keys`) binds and runs.
+
+* **THE TAIL SPELLING IS SILENT, NOT LOUD.** `function g(xs: i32[]) { xs.push(1) }` classifies
+  VOID (correctly — there is no value to leave), the checker types `g` as `i32`, and a caller
+  that reads the result gets `type mismatch: expected i32 but nothing on stack` at `vl check`
+  rc 0. A caller that ignores it runs, which is why this sat unnoticed.
+
+* **IT IS THE ONE NAMED EXCLUSION IN `memberCallYieldsValue`.** D1240 classifies a tail member
+  call by the checker's type; admitting `.push` there would route
+  `function g(xs: i32[]) { xs.push(1) }` to the value exit and refuse a program that runs
+  today. The exclusion is measured, not stylistic, and it deletes itself the day this closes.
+
+Ablation:
+
+| ingredient changed | outcome | needed? |
+| --- | --- | --- |
+| the annotation on `n` removed | still refuses, same message | no |
+| `.push` -> `.pop` | runs | **yes** |
+| the receiver made a parameter / a global | still refuses | no |
+| the element rep (`string[]`, `f64[]`, `P[]`) | still refuses | no |
+
+* **Grading list.** The three spellings above; the tail-with-result-used cell
+  (`const r = g([1])`, today check-clean invalid wasm); and `memberCallYieldsValue`'s `push`
+  line in `compiler/emit_classify.vl`, which must be DELETED by this row's close.
+
+### D1302 — `??` over a `string | null` IF-EXPRESSION operand refuses, while the same operand at every BOXED rep runs and the same `string | null` from a CALL runs
+
+**loud emit reject · clause 2 · `emitProgram: \`??\` over this nullable value is not supported yet — narrow it first, e.g. \`if v != null { … }\`` · ZERO corpus cells · found 2026-09-03 as the residue of [D1250](#d1250)**
+
+Repro (refuses; should print `hi` then `d`):
+
+    function go(): void {
+      print((if 1 == 1 { "hi" }) ?? "d")
+      print((if 1 == 2 { "hi" }) ?? "d")
+    }
+    go()
+
+* **THE REP IS THE INGREDIENT, AND IT IS THE NICHE.** `i32`, `i64`, `f64` and `boolean` arms
+  all run at this exact spelling (D1250 closed 54 of 54 cells over nine spellings and six
+  positions). `string | null` is not the `{tag, anyref}` box — it is the `(ref null $str)`
+  NICHE — and the niche's `??` arm is gated on a RE-READABLE operand (`lhsReEval`), which an
+  if-expression is not.
+
+* **AND THE CALL TWIN OF THE SAME NICHE RUNS**, which is what makes this a gap rather than a
+  design edge: `function pick(c: boolean): string | null { … }` then `pick(true) ?? "d"`
+  prints `hi`. The emitter's own `` `??` over a string|null call result is not supported yet ``
+  is therefore unreachable for that spelling and the sentence above is the live one.
+
+* **`emitCoalesceNulRefCtx` ALREADY EVALUATES ONCE** (D7 replaced the re-read with
+  `br_on_non_null`), so the `lhsReEval` gate on the string arm may simply be stale — the same
+  question the boolean arm answered when D1250 gave it a stash leg. That is the first thing to
+  measure, not a fix to assume.
+
+Ablation:
+
+| ingredient changed | outcome | needed? |
+| --- | --- | --- |
+| the arm's rep -> `i32` / `i64` / `f64` / `boolean` | runs | **yes** |
+| an explicit `else { null }` added | still refuses | no |
+| the operand bound to a `const` first | runs | **yes** |
+| the operand made a CALL returning `string \| null` | runs | **yes** |
+
+* **Grading list.** The four ablation rows; the same operand in binding / argument / return
+  position; and D1250's 54-cell grid, which must stay green.
+
+### D1303 — an `i64` module GLOBAL assigned inside an un-annotated tail `if` is check-clean invalid wasm, while the same assignment at i32 / f64 / string / list / struct runs
+
+**check-clean invalid wasm · clause 1 · `type mismatch: expected i32, found i64` · ZERO corpus cells · found 2026-09-03 by [D1220](#d1220)'s 10-destination grid; present on master, and independent of D1220 (whose struct cell TRAPPED where this one never loads)**
+
+Repro (`vl check` rc 0, then the engine refuses the module; should print `5`):
+
+    type C = { v: i32 }
+    let gq: i64 = 0
+    function set(y: C) { if y.v > 0 { gq = 5 } }
+    set({v: 7})
+    print(gq)
+
+* **THE SHAPE IS THE UN-ANNOTATED TAIL `if`, AND ONLY THAT ONE.** The `: void` twin runs, an
+  explicit `else` runs, a trailing bare `return` runs, the assignment without the `if` runs,
+  and the same assignment inside a `while` runs. So the tail `if` makes the assignment read as
+  the function's VALUE and the inferred `i64 | null` return is boxed at the wrong width.
+
+* **IT IS A WIDTH, NOT A NULLABILITY.** The i32 global in the identical shape runs and returns
+  the assigned value; f64 runs; only i64 disagrees, which points at the union box's payload
+  slot rather than at the tail-`if` classification D1220 fixed.
+
+Ablation:
+
+| ingredient changed | outcome | needed? |
+| --- | --- | --- |
+| the global's type -> `i32` / `f64` / `string` / `i32[]` / a struct | runs | **yes** |
+| `: void` on the function | runs | **yes** |
+| an explicit `else` arm | runs | **yes** |
+| a bare `return` appended | runs | **yes** |
+| the global made a LOCAL | runs | **yes** |
+
+* **Grading list.** The five ablation rows; D1220's 10x6 destination grid, whose one non-green
+  cell this is; and the annotated `: i64 | null` spelling.

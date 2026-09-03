@@ -523,6 +523,7 @@ import {
   markMapUnionArms,
   markRefArrayArms,
   markValueUnionAtoms,
+  memberCallYieldsValue,
   mfCallbackFe,
   mfCbResultIsStrList,
   mfRecordDst,
@@ -3889,6 +3890,17 @@ export function fnIndexOfInScopeChainSid(sid: i32, name: string, fnIx: i32) {
 // value. `stmtIsTailValue` consults `fRetVoid` for tail CALLS, so marking a
 // callee void can make its CALLERS' tails non-values — iterate until stable
 // (the void set only grows; bounded by the function count).
+// The body block's LAST statement is a value-yielding member call (D1240's veto input).
+function blockTailMemberValue(blockIx: i32): boolean {
+  const b = P.nodes[blockIx]
+  if b is Block {
+    const n = b.blkStmts.length
+    if n == 0 { return false }
+    return memberCallYieldsValue(b.blkStmts[n - 1])
+  }
+  false
+}
+
 export function computeVoidFns() {
   let changed = true
   while changed {
@@ -3929,9 +3941,18 @@ export function computeVoidFns() {
               const d34Void = !tailIfNullableIsReal(fn.fnBody, fnStmts[i])
               if (
                 !blockTailIsValue(fn.fnBody, fnStmts[i]) &&
+                !blockTailMemberValue(fn.fnBody) &&
                 (d34Void || !inferRetBearsNull(fn.fnName)) &&
                 !fnReturnsClosure(i)
               ) {
+                // D1240 — A TAIL MEMBER CALL THE CHECKER TYPED NON-VOID KEEPS THIS FUNCTION
+                // NON-VOID. `stmtIsTailValue` declines every member call (it must: it feeds
+                // THIS fixpoint and a tail `.push` has no value lowering), so an un-annotated
+                // `function f(xs) { xs.slice(0, 2) }` classified void here while the checker
+                // typed it `i32[]` — and a caller reading the result got an empty stack.
+                // Eight methods measured silent that way; the annotated face escaped only
+                // because `fn.fnRet >= 0` never enters this arm.
+
                 // A function whose tail is a function VALUE (`(a) => (b) => …`) returns a
                 // closure, NOT void — `blockTailIsValue` ignores a bare lambda tail, so guard
                 // it here (else f's functype is `()->()` and `f(4)` reads as a void result).
@@ -13566,6 +13587,25 @@ export function collectU(stmts: i32[]) {
         if pcf.memProp == "pop" {
           const pun = nulNumScalarUnionName(nodeTyIxOf(ipu))
           if pun != "" { registerValueUnionName(pun) }
+        }
+      }
+    }
+    // D1250 — AN IF-EXPRESSION `??` OPERAND IS THE SECOND PRODUCER OF AN UNSPOKEN SOLO BOX.
+    // `(if c { 7 }) ?? -1` is `i32 | null` to the checker (D1086) and spells the union
+    // nowhere, so `??` refused with `no recorded members: i32|null` — the same missing row
+    // the `.pop()` walk above closes, one node kind over.
+    //
+    // KEYED ON THE `??`, NOT ON THE `if`. Registering every if-NODE whose recorded type is a
+    // solo nullable interns the box for STATEMENT ifs too — D1086 types `if c { xs.push(y) }`
+    // as `i32 | null` because `.push` yields a value — and that is three dead rec-group types
+    // in any module holding one (measured: +14 bytes on `bench/algorithms/map-filter-reduce`,
+    // which has no `??` at all). The consumer is what needs the row.
+    if pn is BinExpr {
+      if pn.binOp == "??" {
+        const lin = P.nodes[unwrapParen(pn.binLeft)]
+        if lin is IfStmt {
+          const iun = nulNumScalarUnionName(nodeTyIxOf(unwrapParen(pn.binLeft)))
+          if iun != "" { registerValueUnionName(iun) }
         }
       }
     }

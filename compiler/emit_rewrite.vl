@@ -87,6 +87,7 @@ import {
   mkArrayLit,
   mkBinary,
   mkBlock,
+  mkBool,
   mkCall,
   mkFunc,
   mkIdent,
@@ -132,6 +133,7 @@ import {
   sFieldIndex,
   shapeNominalOfTy,
   structIndexOfExpr,
+  structIndexOfTypeName,
   synthTypeRefTy,
   tyStructHasMapField,
 } from "./emit_classify"
@@ -488,7 +490,7 @@ function drwWalk(ix: i32, ctx: i32) {
     const bs = n.blkStmts
     let i2 = 0
     while i2 < bs.length {
-      bs[i2] = drwWalk(bs[i2], ctx)
+      bs[i2] = drwBareBlock(drwWalk(bs[i2], ctx))
       i2 = i2 + 1
     }
     return ix
@@ -733,6 +735,23 @@ function drwWalk(ix: i32, ctx: i32) {
   ix
 }
 
+// D1253 — A BARE `{ … }` STATEMENT BECOMES `if true { … }`, and that is why it is a rewrite
+// rather than an `emitStmt` arm. The lowering is trivial (`emitStmts`, one lexical frame) but
+// EVERY per-function scan that reserves a scratch frame — `blockHasStrOpScan`,
+// `blockPushPopBits`, `mfScan`, `leqScanBlock` and the rest — dispatches on statement kind and
+// none has a `Block` arm, so an emit-only arm compiled the block against locals nobody
+// declared: measured 20 of 90 cells check-clean invalid wasm, every one a string op or a
+// `.push` inside the block. An `if` is a statement kind all of them already walk, so the
+// coverage is by construction instead of by a list. The checker types a bare block `void`
+// (`{ 5 }` in an `: i32` function is `expected i32, got void`), which is exactly what a
+// statement-position `if` with no else is, so the wrap is meaning-preserving.
+function drwBareBlock(ix: i32) {
+  if ix < 0 { return ix }
+  const b = P.nodes[ix]
+  if b is Block { return mkIf(mkBool(1, b.pos), ix, -1, b.pos) }
+  ix
+}
+
 // The dispatch-rewrite driver: top-level statements, then every lifted
 // function's body (a nested FuncDecl was lambda-lifted into `fnStmts`).
 export function dispatchRewrite(stmts: i32[]) {
@@ -746,7 +765,7 @@ export function dispatchRewrite(stmts: i32[]) {
     } else if s is UnionDecl {
     } else {
       const oldIx = stmts[i]
-      const newIx = drwWalk(oldIx, -1)
+      const newIx = drwBareBlock(drwWalk(oldIx, -1))
       if newIx != oldIx {
         // The statement node was REPLACED (e.g. `o[k] = v` → the `(o."[]=")(k,v)`
         // write-trap call). `startStmts` captured the OLD arena index during
@@ -1145,13 +1164,29 @@ export function synthRetAnnots() {
 //
 // BEFORE `monomorphize`, like `synthRetAnnots`: an instance is cloned with `nret = fnRet`, so a
 // return pinned after the clone would leave the instance un-pinned.
+// The inferred return of `name` is `S | null` over a DECLARED struct row — the D1220 leg of
+// the pin above. Asks the same pair `inferNulStructRow` does, so the pin and the emitter's
+// `retNulRefIndex` cannot resolve different rows.
+function snrNulStructRet(name: string): boolean {
+  const part = nullablePartOf(inferRetNameOf(name))
+  if part == "" { return false }
+  structIndexOfTypeName(part) >= 0
+}
+
 export function synthNulListRetAnns() {
   let i = 0
   while i < fnStmts.length {
     const fn = P.nodes[fnStmts[i]]
     if fn is FuncDecl {
       if fn.fnRet < 0 && fn.fnName != "" {
-        if inferRetIsNulList(fn.fnName) {
+        // D1220 — AND THE NULLABLE-STRUCT RETURN IS THE SAME PIN, one type family over.
+        // `function set(y: C) { if y.v > 0 { g = y } }` over a struct GLOBAL infers
+        // `C | null`, and the annotated `: C | null` twin runs while the inferred one
+        // declared a `(ref null $C)` result over a body that left nothing — a
+        // compiler-emitted `unreachable`, i.e. a TRAP at `vl check` rc 0.
+        // `fnRetNullBearing` and `emitNullForRet` both read `fn.fnRet`, so the pin is what
+        // lets the fall-through emit this rep's `ref.null` instead of the dead padding.
+        if inferRetIsNulList(fn.fnName) || snrNulStructRet(fn.fnName) {
           const nm = inferRetNameOf(fn.fnName)
           if nm != "" {
             fn.fnRet = synthTypeRefTy(nm, -1, inferRetTyIxOf(fn.fnName))

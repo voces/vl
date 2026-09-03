@@ -639,6 +639,7 @@ import {
   mapRetExprShape,
   mapShapeOfExpr,
   mapSlotTag,
+  memberCallYieldsValue,
   memberUnionFieldNameRead,
   memIsNarrowed,
   memReadBoxedAtomKind,
@@ -21054,7 +21055,17 @@ function emitCallStmt(body: i32[], s: Call, stmtIx: i32, fnIx: i32) {
       }
       return 0
     }
-    return emitFail("emitProgram: unsupported member-call statement")
+    // D1240 — A MEMBER CALL NO MUTATOR ARM CLAIMED IS A DISCARDED VALUE, the same rule the
+    // `Ident` arm below applies to `f(…)` and the `BinExpr` arm applies to `1 + 1`. The
+    // sentence above named the DISPATCHER, not a missing lowering: `xs.slice(0, 2)` has an
+    // expression form (`return xs.slice(0, 2)` runs) and only the statement ladder had no
+    // route to it, at EVERY rep and every position — non-tail, void tail and module scope
+    // alike, which is what makes this a general route rather than D1131's per-method gate.
+    if emitExpr(body, stmtIx, fnIx) < 0 { return -1 }
+    if memberCallYieldsValue(stmtIx) {
+      fbDrop() // 0x1a drop
+    }
+    return 0
   }
   if callee is Ident {
     // A bare call whose RESULT is discarded (a helper invoked for its side
@@ -21832,6 +21843,15 @@ export function emitFuncBody(body: i32[], blockIx: i32, fnIx: i32) {
           scopePop()
           return -1
         }
+      } else if isLast && memberCallYieldsValue(stmts[i]) {
+        // D1240 — the tail member call of a NON-VOID function IS its result (`isLast` is
+        // already gated on `!bodyIsVoid`), so it takes the same exit as any other tail
+        // value. Without this the discard arm in `emitCallStmt` would compile the call and
+        // drop it under a functype that promises a result — a trap where the refusal was.
+        if emitReturnExit(body, stmts[i], fnIx) < 0 {
+          scopePop()
+          return -1
+        }
       } else if isLast && elseLessNullableTail(stmts[i], fnIx) {
         // The body ends in an else-less `if` whose then-arm yields a VALUE and whose
         // return type is NULLABLE (`function f(c) { if c then 5 }` → `i32 | null`): lower
@@ -21975,6 +21995,9 @@ function emitStmtTail(body: i32[], stmtIx: i32, fnIx: i32) {
     // boxes / sentinels per the function's return type) exactly like `emitFuncBody`.
     return emitReturnExit(body, stmtIx, fnIx)
   }
+  // D1240 — an if-ARM tail member call is a value for the same reason a body tail is: this
+  // path is reached only from `emitIfTail`, i.e. only where the arms ARE the result.
+  if memberCallYieldsValue(stmtIx) { return emitReturnExit(body, stmtIx, fnIx) }
   emitStmt(body, stmtIx, fnIx)
 }
 
@@ -25163,6 +25186,11 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // and is handled by the stash-based call path in the `lhs is Call` block below.
   let lhsReEval = true
   if lhs is Call { lhsReEval = false }
+  // D1250 — AN IF-EXPRESSION OPERAND IS NOT RE-READABLE. Its condition can have effects, and
+  // re-reading it re-runs them: `(if bump() { true }) ?? false` bumped TWICE. The arms below
+  // that already carry a stash leg read this flag, so they switch over; the `boolean | null`
+  // arm gained one for the same reason. `coalChainHasCallLhs` reserves the slots.
+  if lhs is IfStmt { lhsReEval = false }
   // `<e> ?? d` over a `boolean | null` NICHE (an ident binding, a `boolean | null` struct
   // FIELD (code 21), or a `(boolean | null)[]` element read) — the i32 cell holds 0/1 or the
   // sentinel 2 (`null`); take the default on 2. Generic in `e.binLeft`, so one arm covers
@@ -25173,9 +25201,15 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // value operands unconditionally, so a side-effecting default ran on the PRESENT path —
   // the same lowering the `K | null` niche below, the `string | null` niche, the boxed
   // `i32 | null` union and every nullable-ref rep already use.
-  if lhsReEval && exprNulBool(e.binLeft, fnIx) {
+  if !(lhs is Call) && exprNulBool(e.binLeft, fnIx) {
     if emitExpr(body, e.binLeft, fnIx) < 0 {
       return -1 // the niche i32
+    }
+    // D1250 — a NON-RE-READABLE operand (an if-EXPRESSION) stashes its ONE evaluation, exactly
+    // as the `K | null` arm below does; a place operand keeps the re-read, byte-identical.
+    if !lhsReEval {
+      fbLocalSet(coalesceCallBoolSlot)
+      fbLocalGet(coalesceCallBoolSlot)
     }
     fbI32Const(2)
     fbI32Bin(70) // 0x46 i32.eq → x == 2 (null)
@@ -25184,9 +25218,13 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
     if emitExpr(body, e.binRight, fnIx) < 0 {
       return -1 // d, reached only on the null path
     }
-    fbElse() // 0x05 else — present → the 0/1 cell, re-read
-    if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
-    fbEnd()  // 0x0b end
+    fbElse() // 0x05 else — present → the 0/1 cell
+    if lhsReEval {
+      if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
+    } else {
+      fbLocalGet(coalesceCallBoolSlot)
+    }
+    fbEnd() // 0x0b end
     ctrlLeave()
     return 0
   }
@@ -25424,9 +25462,15 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // gate is widened rather than a second arm added: the lowering below reads only
   // `unionNameOfExpr` and the box, both of which the cast answers — and it is the SAME
   // predicate `coalChainHasCallLhs` reserves the slot on, so the two cannot disagree.
+  // D1250 — AND AN IF-EXPRESSION OPERAND IS THE THIRD SOURCE OF A BOX THAT CANNOT BE RE-READ,
+  // widened into the same gate for the same reason `as?` was: `(if c { 7 }) ?? -1` names the
+  // operand once, and the D962 desugar (which names it twice) declines it as not re-readable,
+  // so this stash-once arm is the only lowering it can take. The missing `else` is NOT the
+  // ingredient — the explicit-`else` spelling refuses identically. `coalChainHasCallLhs`
+  // carries the same three shapes, so the slot is reserved wherever this fires.
   if (
     lhs is Call ||
-    (lhs is AsExpr &&
+    ((lhs is AsExpr || lhs is IfStmt) &&
       (tyIsNulValueUnionBox(nodeTyIxOf(lhsIx)) || nodeTyIsNulScalarBox(lhsIx)))
   ) {
     const kunm = unionNameOfExpr(e.binLeft, fnIx)
@@ -25450,7 +25494,14 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
               "emitProgram: `??` over a string|null call result is not supported yet",
             )
           }
-          if emitExpr(body, e.binLeft, fnIx) < 0 {
+          // D1250 — AN IF-EXPRESSION OPERAND ARRIVES THROUGH `emitUnionCoerce`, NOT
+          // `emitExpr`. `emitIfExpr` picks the join's blocktype off the arms' SCALAR
+          // ladder, so a `T | null` if-expression came back as a bare i32 (and an
+          // else-less one as `if-expression requires an else arm`); the coerce's own
+          // `IfStmt` arm is `emitUnionIfValue`, whose blocktype IS the box and whose
+          // missing else is the null-tagged one. A call/`as?` operand already yields a
+          // box and raw-passes through the coerce, so both spellings stash the same rep.
+          if emitUnionCoerce(body, kunm, e.binLeft, fnIx) < 0 {
             return -1 // the box, evaluated ONCE
           }
           fbLocalSet(coalesceCallSlot)
