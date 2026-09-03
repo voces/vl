@@ -44,6 +44,7 @@ import {
   recordClonedNodeTy,
   substTyDeep,
   tyExcludesNull,
+  tyFieldTyOf,
   tyHasTyVar,
   tyIsLitUnionArray,
   tyRenderSoftensLits,
@@ -78,6 +79,7 @@ import {
   UnionDecl,
   WhileStmt,
   annTsOf,
+  hasNamedArgs,
   i32ToStr,
   mkArrayLit,
   mkAsExpr,
@@ -108,6 +110,7 @@ import {
   mkWhile,
   nodeChildren,
   tsMentionsAnyName,
+  ufcsAliasAtSite,
 } from "./ast"
 import { PIN_SIGKEY } from "./ast"
 // R4 writers 5-8 of 8 live in this file: monomorphization rewrites a call's callee
@@ -3210,6 +3213,57 @@ function monoPinBinOps(ix: i32, pNames: string[], pTys: i32[]) {
       nargs.push(ca2)
       if ca2 != n.callArgs[ai] { changed = true }
       ai = ai + 1
+    }
+    // D1063 — `drwWalk`'s MEMBER-CALL arm, re-run over ONE instance body with the pin in
+    // hand, exactly as the `BinExpr` arm above re-runs its two.
+    //
+    // `dispatchRewrite` runs BEFORE monomorphization, so it meets `x.tag()` while `x` is
+    // still a type parameter and has to answer for every instance at once. Where the
+    // instantiations DISAGREE — one receiver carrying a callable field of that name, another
+    // taking the free `self`-function — no single answer is right, and
+    // `drwAnyInstanceTakesField` DEFERS. This is where the deferred question is answered,
+    // per instance, off the pin the instance was built from.
+    //
+    // FIELD FIRST, which is the checker's own precedence and the same predicate
+    // `drwAnyInstanceTakesField` asks of the call-site argument types (`tyFieldTyOf`): a
+    // callable field wins and the member call stays, so `exprIsClosure` lowers it as a
+    // `call_ref` per function. Otherwise the free `self`-function answers and the call is
+    // rebuilt as the plain direct call every downstream classifier — local kind, print
+    // routing, string detection — already understands. That is what the pre-mono rewrite was
+    // for; doing it here rather than there is what makes it per-instance.
+    //
+    // COPY-ON-WRITE like every rung in this walker: an instance whose receiver takes the
+    // field, or a body with no such call, returns the SAME node index and shares the arena.
+    const pcallee = P.nodes[n.callFn]
+    if pcallee is Member {
+      const precvTy = monoPinnedOperandTy(pcallee.memObj, pNames, pTys)
+      if precvTy >= 0 && tyFieldTyOf(precvTy, pcallee.memProp) < 0 {
+        // The site's own alias, not the plain property: the module merge mangles a free
+        // `self`-function and leaves the call's property plain, and `ix` is the node the
+        // merge walk banked its answer on.
+        const puName = ufcsAliasAtSite(ix, pcallee.memProp)
+        if drwSelfFnOf(puName, nargs.length + 1) >= 0 {
+          const puArgs: i32[] = []
+          puArgs.push(pcallee.memObj)
+          let pu = 0
+          while pu < nargs.length {
+            puArgs.push(nargs[pu])
+            pu = pu + 1
+          }
+          // The injected receiver is an UNNAMED slot-0 positional; an all-positional call
+          // keeps its empty name list so `hasNamedArgs` stays false downstream.
+          const puNames: string[] = []
+          if hasNamedArgs(n.callArgNames) {
+            puNames.push("")
+            let pn = 0
+            while pn < n.callArgNames.length {
+              puNames.push(n.callArgNames[pn])
+              pn = pn + 1
+            }
+          }
+          return mkCallN(mkIdent(puName, -1), puArgs, puNames, n.pos)
+        }
+      }
     }
     if !changed { return ix }
     return mkCallN(cf, nargs, n.callArgNames, n.pos)
