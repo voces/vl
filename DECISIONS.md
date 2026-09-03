@@ -4490,15 +4490,39 @@ read classifiers are code-0-**plus**-`tyIsLitUnion(ety)`, so a promoted row with
 entry stores an atom that every reader calls a plain `i32` and `print` emits the raw interned
 id.
 
-**THE BOUND IS "BOTH ARMS ARE ATOM MATERIAL", and two legal pairs stay refused because of it.**
-A field may be re-laid only when both arms carry a 2+-member set every one of whose members is
-a string — what `internAtom` keys and what `emitAtomToStr` can widen back. So `{kind: K1} |
-{kind: string}` (the amendment's set-beside-its-base: the base arm holds an arbitrary string
-with no interned id) and `{kind: K1} | {kind: "a"}` (a BARE single literal, a `TyLit` rather
-than a `TyUnion`, which the read classifier does not treat as a litunion) keep the loud
-refusal. That refusal is still the right diagnosis, so its message literal stays counted by
-`--sites` — the SITE narrowed, it did not clear. Closing those two means the STRING-side
-unification, which is the genuinely open half of this question.
+**THE BOUND WAS "BOTH ARMS ARE ATOM MATERIAL", and both pairs it refused are now built
+(D1460, D1461, 2026-09-03). Each of the two reasons this section gave for them was wrong,
+in a different way, and both were wrong about the SAME thing — reading a rep question off
+a spelling.**
+
+*`{kind: K1} | {kind: "a"}` — "a BARE single literal is not a litunion to the read
+classifier".* True of `tyIsLitUnion`, and the MEMBER COUNT was never the rep's question. The
+alias spelling of that same one-member set — `type KC = "a"` — is a one-member `TyUnion`, codes
+0, and emits the interned id today; only the arena SHAPE differed. `tyIsLitUnionOrLit` (which
+already existed, for `emitStrToAtom`'s one-member narrowing) is the predicate that asks what
+the rep needs, and the read classifiers follow it on the rows the promotion makes.
+
+*`{kind: K1} | {kind: string}` — "the STRING side needs the mirror of every atom consumer
+written from scratch".* Three of the four were already built and the fourth is not a mirror.
+A declared INLINE set beside the same base is two code-3 rows, discriminable as laid out, and
+runs — so DEMOTING the alias arm's row to code 3 lands it exactly where a declared inline row
+sits, and the code-3 construct, `is` compare and read serve it unchanged. The widen is not what
+was missing: the field's read is already a string, and it is the ATOM-typed destinations that
+convert, through `strReppedLitUnionAt` -> `emitStrToAtom` — one hook in `emitExpr`, built for
+the flattened/inline litunion family and blind to how the value got its string rep.
+
+**AND THE ALIAS DOES NOT GET A REP THE MODULE DOES NOT USE FOR IT**, which was this section's
+stated objection to the string direction. Only the FIELD moves. In the demoted pair's own
+module `K1` is still the atom at every parameter, list element and map value; the disassembly
+shows one shared `(struct (field (mut (ref <the string struct>))) (field (mut f64)))` beside a
+`(func (param i32) (result i32))` for `takesK(k: K1): K1`, with a real narrow tower between
+them. Measured over 144 ordered discriminant-spelling pairs: 42 -> 50 `runs`, 8 -> 0 emit
+refusals, no check refusal moved.
+
+**What is left at that site is a FLOOR, and its message says so.** It used to concede a
+capability and prescribe "spell both arms the same way" — an edit that fixed neither program
+it was shown to. The refusal beside it (arms nothing tells apart, pinned by
+`same-field-names-i32-vs-boolean-reject.vl`) is live and keeps a sentence about the program.
 
 **THE ADMISSION AND THE ACTION ARE ONE PREDICATE ASKED TWICE.** `assignTags` runs at the end of
 `collectU`, one pass before the struct table exists, so it cannot do the re-lay; it admits on
@@ -4523,7 +4547,9 @@ amendment does not reach. The lowering follows the asymmetry — a membership co
 only for the arm that HAS a set, so `is B` stays the bare tag test — and that asymmetry is what
 makes the `"z"` value (a B that is not an A) the cell which actually grades the rule.
 Fixture: `tests/cases/unions/discriminant-value-is-set-beside-base.vl`, both spellings
-(annotated and inferred), both directions, both bases.
+(annotated and inferred), both directions, both bases. The ALIAS arm of the same pair is
+`tests/cases/unions/discriminant-set-beside-base-alias-arm.vl` (D1461), and the one-member
+arm is `tests/cases/unions/discriminant-mixed-litunion-bare-literal-arm.vl` (D1460).
 
 ## A `type` declared in a function body is legal and lexically scoped, may name the enclosing function's type parameters, and is refused loudly until built (owner, 2026-09-02)
 
