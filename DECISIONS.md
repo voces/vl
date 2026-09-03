@@ -4342,7 +4342,7 @@ atom dedup collapses `string|string` — the two producers agreed there BY ACCID
 build note's rule is right and incomplete as written: **a type-level collapse must move the
 arena AND canon, or they agree about the TYPE and disagree about the REP.**
 
-**Note added 2026-09-02 (D1199): BOTH HINTS ARE BUILT, and the second one needs a bank because
+**Note added 2026-09-02 (#2404): BOTH HINTS ARE BUILT, and the second one needs a bank because
 THE COLLAPSE IS INVISIBLE IN ITS OWN RESULT.** The first hint arrived free, exactly as ruled —
 `string | "err"` now infers as `string`, so the existing redundant-annotation hint fires at the
 written spelling with no new code. The second could not be derived that way, and the reason is
