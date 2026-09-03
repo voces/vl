@@ -37292,3 +37292,49 @@ Repro (runs today and must keep running — the struct-table half of the same sh
   the reconciliation D1152 installed is the pattern — one length check at the head of the
   consumer, not a guard at each of thirty reads.
 
+### D1230 — a UFCS method whose free function is EXPORTED but not IMPORTED reports `no field 'toEqual' on Expectation<i32>`, naming the receiver instead of the missing import
+
+**loud check reject with a MISLEADING message · the program is genuinely illegal, so this is a DIAGNOSTIC defect, not a clause-1 or clause-2 violation · hit by the OWNER on 2026-09-02 against `~/glean`, and initially mis-diagnosed by two sessions as a stale `dist/vl` seed**
+
+Repro (`vl test t.test.vl` — fails; adding `toEqual` to the import list makes it pass):
+
+    import { describe, it, expect } from "std:test"
+
+    describe("smoke", () => {
+      it("compares", () => {
+        expect(1 + 1).toEqual(2)
+      })
+    })
+
+* **THE MESSAGE NAMES THE WRONG THING.** `Expectation<i32>` has no field `toEqual` and never
+  will — `toEqual` is a free `self`-function resolved by UFCS, exactly as `std/test.vl`'s
+  header documents. So the sentence is TRUE and useless: it describes the receiver's shape
+  when the actual fault is that the free function is not in scope. The compiler knows
+  `toEqual` is exported by a module this file already imports from, and says nothing about it.
+
+* **MEASURED, four cells.** `import { expect }` + `expect(1).toEqual(1)` → refused.
+  `import { expect, toEqual }` → runs. The DIRECT spelling `toEqual(expect(1), 1)` runs with
+  only `toEqual` imported. Supplying the defaulted `caller` argument explicitly does NOT help,
+  which is what rules out the defaulted-tail-argument family ([D1044](#d1044), closed) — this
+  is scope, not arity.
+
+* **NOT A STALE ARTEFACT, and the mis-diagnosis is worth recording.** Two sessions read it as
+  `dist/vl`'s embedded seed lagging behind post-#2386 std. It reproduces identically on a
+  freshly built `dist/vl` with the current seed embedded, and on the worktree host with
+  `VL_STD` pinned. The four-artefact staleness trap is real and this was not it — **the
+  cheapest disproof is to reproduce on a binary you just built**, which takes one command and
+  was not run before the diagnosis was shared.
+
+* **THE FIX IS THE MESSAGE, and the ingredient is already at the site.** When a member call
+  fails to resolve and a free `self`-function of that name is EXPORTED by a module this file
+  imports from, say so and name the import to add. The lookup that answers "is there such a
+  `self`-function" is the one UFCS resolution already performs; what is missing is asking it
+  again, across the imported modules, on the failure path.
+
+* **A DESIGN QUESTION SITS BEHIND IT, for the owner.** Every matcher must be imported
+  individually — `expect`, `toEqual`, `toBeTrue`, `toBeFalse`, `not`, `fail`. A jest-shaped
+  API where `expect(x).toEqual(y)` needs two imports to write one assertion is a papercut
+  every test file pays. Whether importing `expect` should bring its matcher surface with it
+  is a language/std decision, not a compiler defect; the diagnostic above should be fixed
+  either way.
+
