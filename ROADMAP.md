@@ -572,8 +572,30 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   answer) and the UFCS receiver's fit is re-asked at the pin by a ninth deferred table
   (`ufcsCstr*`) with a field-precedence guard; **D1063** is the residue those two named,
   the disagreeing instantiation pair that shares one AST node. Still open from this list:
-  D1004 (the wordless member-access diagnostic on an unbounded `<T>`) and LSP bound-member
-  completion/hover on `x: T`.
+  D1004's CAPABILITY half — its wordless diagnostic was fixed 2026-09-03 and the ruling it
+  needs is the next bullet — and LSP bound-member completion/hover on `x: T`.
+- **Does an unbounded `<T>` INFER its bound from the body? (raised 2026-09-03 by D1004 and
+  D1221; `docs/constraints-design.md` OQ-5 is the doc.)** `function getN<T>(x: T): i32 { x.n }`
+  refuses. Three neighbours run: the direct `function getN(x: { n: i32 })`, the UN-ANNOTATED
+  `function getN(x)` (the parameter hole grows an `{n}` shape), and the bounded
+  `<T: { n: i32 }>` — the last at two instantiation shapes. The refusal now STATES the rule
+  (a parameter's members come from its bound) and names the edit, so the wordless half is
+  closed whichever way this goes; what is open is whether the rule should stand.
+  - **The argument for standing pat is mechanical, not aesthetic.** A generic body is checked
+    ONCE, so `x.n` needs ONE type and only the declaration can supply it. Inferring the bound
+    makes the member's type a fresh hole per instantiation — body-level monomorphization of
+    INFERRED shapes, which is the D976 substrate constraints phase 1 declined on the measured
+    ground that "the checker's inferred-shape column does not survive into emit" (§7).
+  - **The argument against is that the two faces disagree.** `function getN(x)` already infers
+    exactly this shape and runs, so a user who ADDS `<T>` — the more explicit spelling — loses
+    a program that worked. That is CLAUDE.md's "two faces, two clauses" pointing at a language
+    rule rather than at a codegen gap.
+  - **The ruling asked for**, one of: (a) today's rule stands and the sentence is the whole
+    answer; (b) an unbounded `<T>` infers a structural bound from its body's demands; (c)
+    member access on a type parameter requires a bound, stated as a hard rule.
+    `tests/cases/constraints/unbounded-type-param-unchanged.vl` is the refutation pin either
+    way, and D1221 is the same question at a member CALL — where a free `self`-function of
+    the name anywhere in the program already makes the refusing program run.
 - **Track-caller — DONE 2026-09-01 (#2235); the ANCHOR moved to the matcher 2026-09-02
   (#2386), so the `expect`-token findings below are the landing's, not today's.** Both halves
   have shipped. The std side is
