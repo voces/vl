@@ -271,7 +271,11 @@ axis("call sites", 2.5, "Callee resolution is scaling with the number of callees
 // them at 73% self. 800 modules against 400 is 4.45x, so a per-module arena scan would
 // roughly double this ratio and still be caught. Each function carries 30 statements so
 // the linear half is not startup-dominated; shrink that once those two stop scanning.
-axis("modules", 4.0, "The module merge is scaling with the file count.", (d) => [
+// The three super-linear axes' bars carry ~2x headroom over the IDLE ratio (modules 2.58,
+// closures 2.22, generic pins 4.58): a ratio is load-tolerant but not load-proof — generic
+// pins read 6.16 against the old bar of 6 inside a fanned-out gate at load 92, a
+// comment-only PR. A doubling of the class (a new scan per pin) still clears every bar.
+axis("modules", 5.0, "The module merge is scaling with the file count.", (d) => [
   writeModules(`${d}/many`, 400, 2, 30),
   writeModules(`${d}/one`, 200, 4, 30),
 ]);
@@ -280,7 +284,7 @@ axis("modules", 4.0, "The module merge is scaling with the file count.", (d) => 
 // super-linear axis, so the bar is set above the measurement rather than at 2.5.
 // `fnStmtsPosOf` (compiler/emit_classify.vl) is 21.2% self time on the many arm and
 // absent from the one arm: a linear scan of `fnStmts` asked once per closure.
-axis("closures", 3.2, "`fnStmtsPosOf` scans `fnStmts` once per closure.", (d) =>
+axis("closures", 4.0, "`fnStmtsPosOf` scans `fnStmts` once per closure.", (d) =>
   twoFiles(d, genClosures(3000, 1), genClosures(3000, 20)));
 
 // 1.68 / 0.38 / 4.37 — the widest gap in the family, and super-linear in the pin count
@@ -288,5 +292,5 @@ axis("closures", 3.2, "`fnStmtsPosOf` scans `fnStmts` once per closure.", (d) =>
 // many arm against nothing on the one arm; its per-annotation intern goes through
 // `tyTopIndexOf` (compiler/tyname.vl) into `__str_eq__`, a linear scan of the type-name
 // registry, so N pins mint N rows and cost N^2 comparisons.
-axis("generic pins", 6.0, "`collectA` interns each pin through a linear registry scan.", (d) =>
+axis("generic pins", 9.0, "`collectA` interns each pin through a linear registry scan.", (d) =>
   twoFiles(d, genPins(400, true), genPins(400, false)));
