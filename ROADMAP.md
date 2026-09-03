@@ -177,17 +177,21 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   - **NEXT: the `then`-removal arm in `parseIf`**, which is already single-statement and was
     called out at stage 1 as the cheapest remaining candidate.
 - **Modernization program — (1) comment trim, PILOT DONE #2413, batch 2 DONE #2428: six
-  files**: `compiler/parser.vl`, `compiler/format.vl` and `compiler/emit_sections.vl` are at
+  files, batch 3 DONE #2433: `emit_collect`**: `compiler/parser.vl`, `compiler/format.vl` and
+  `compiler/emit_sections.vl` are at
   the 12-line comment-block budget (72 blocks over 12 → 2, both of those module headers under
   their own 40-line budget), with a byte-identical seed and the moved text archived verbatim in
   `docs/internals/{parser,format,emit-sections}-notes.md`. **Batch 2 takes `emit_mono.vl`,
   `emit_state.vl`, `emit_base.vl`, `emit_rewrite.vl`, `tyname.vl` and `ast.vl` from 234 blocks
   over budget and 88 uncited to 0 and 0** — no notes-file archive this time, on the owner's
   direction that a claim lives in the GRADED channel (a `D<row>`, a `DECISIONS.md` §, a
-  `docs/internals/*.md`) or not at all; eleven already-false claims fell out of it. **NEXT:
-  `emit_classify.vl` (398/151), `typecheck.vl` (365/69), `wasmEmit.vl` (180/47) and
-  `emit_collect.vl` (124/46)** — the whole remaining 1,255/389, and the four files where the
-  ratchet's `lint-self.sh` exemption still has to hold.
+  `docs/internals/*.md`) or not at all; eleven already-false claims fell out of it. **Batch 3
+  takes `emit_collect.vl` from 124/46 to 0/0** — 1,325 comment lines gone, three ORPHANED
+  function headers moved back to the functions they document (`forceGenAppArgTypes`,
+  `collectA`, `collectTyReachRegister`), two stale citations corrected. **NEXT:
+  `emit_classify.vl` (398/151), `typecheck.vl` (365/69) and `wasmEmit.vl` (180/47)** — the
+  whole remaining 1,131/343, and the three files where the ratchet's `lint-self.sh` exemption
+  still has to hold.
 - **Modernization program, item 3 — the defect inventory is ONE FILE PER ROW. TOOLING SHIPPED;
   the split itself lands on merge day.** `scripts/inventory/split.py --apply --relink` run
   against fresh master, under a freeze on inventory appends; every consumer already reads
