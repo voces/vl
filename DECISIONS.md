@@ -4905,6 +4905,20 @@ rule proves unworkable in practice.
 from module M, list M's exported functions whose first parameter accepts the receiver, with
 an `additionalTextEdit` that adds the name to an existing `import { … } from M` or inserts
 one; (2) code action on the D1230 diagnostic — `Import \`toEqual\` from "std:test"`; (3) the
-same for a user module in the workspace graph, not only `std:`. Compile-goal track (vl-07):
-D1230's diagnostic text and a stable diagnostic code carrying module + name, so the quick-fix
-keys on the code rather than parsing the sentence.
+same for a user module in the workspace graph, not only `std:`.
+
+**The compiler half is DONE (D1230, [inventory](docs/internals/silent-class-inventory.md#d1260)).**
+The refusal names the missing import and carries the quick-fix's whole answer on the existing
+`diagCodeLen`/`diagCodeByte` channel, so the code action never parses the sentence:
+
+    ufcs-not-imported;member=toEqual;modules=std:test;recv=Expectation<i32>
+
+`;`-separated, fixed order, `,` between module specifiers, `recv=` LAST because a rendered
+type is the only field that can itself contain those characters (`A | B`, `{a: i32, b: i32}`)
+— read it as everything after the first `;recv=`. ONE diagnostic lists every candidate module,
+so the quick-fix emits one code action per entry in `modules=` rather than answering N
+squiggles on one token. Specifiers are spelled the way the file can write them TODAY: the
+file's own import text where it already imports the module, and the bare `std:` key where it
+does not. A RELATIVE module the file does not import is deliberately NOT offered — its key is
+a normalized path, and reconstructing a specifier relative to the entry is `..`-arithmetic
+that can name a different module.

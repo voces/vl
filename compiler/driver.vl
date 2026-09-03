@@ -102,6 +102,8 @@ import {
   udTsRootAt,
   ufcsAliasAdd,
   ufcsAliasReset,
+  ufcsImpAdd,
+  ufcsImpReset,
   ufcsSiteAdd,
 } from "./ast"
 // `isStmtKeyword` is the PARSER's import-clause bound, shared rather than
@@ -3158,6 +3160,7 @@ function modCompile(emit: i32): i32 {
   // so a UFCS member-call can resolve its (possibly mangled) callee through the
   // merge; the rewrite records the plain→mangled aliases it discovers.
   ufcsAliasReset()
+  ufcsImpReset()
   modCollectSelfFns(roots)
   let o2 = 0
   while o2 < modOrder.length {
@@ -3469,9 +3472,14 @@ function modCollectSelfFns(roots: i32[]): i32 {
                 // function by that bare segment. A `FuncDecl` never folds one
                 // (`fnTyParams` is out-of-name), so this is the identity here —
                 // kept because the rename map is built through the same call.
-                modSelfFnName.push(modRenamed(modDeclBase(ss[si], st.fnName)))
+                const sfBase = modDeclBase(ss[si], st.fnName)
+                const sfMangled = modRenamed(sfBase)
+                modSelfFnName.push(sfMangled)
                 modSelfFnArity.push(st.fnParams.length)
                 modSelfFnMinArity.push(fnRequiredArity(st.fnParams))
+                // D1230's registry, filled from the one walk that already has
+                // both halves: the module index and its rename map.
+                modNoteUfcsImportCand(m, sfBase, sfMangled)
               }
             }
           }
@@ -3482,6 +3490,68 @@ function modCollectSelfFns(roots: i32[]): i32 {
     o = o + 1
   }
   0
+}
+// One row of D1230's registry: module `m` exports a free `self`-function spelled
+// `base`, merged as `mangled`, and the ENTRY file can name `m` by some specifier.
+// Recorded so the checker can turn `no field 'toEqual' on Expectation<i32>` into
+// a sentence about the missing import (`ast.ufcsImp*`).
+//
+// THREE GATES, and each one is a different reason a suggestion would be wrong:
+//
+//  * `m == 0` — the entry's OWN self-functions are already in scope, so a call
+//    that failed to resolve one did not fail for want of an import.
+//  * NOT EXPORTED — an un-exported declaration cannot be imported at all, so
+//    naming it would send the reader to a fix that does not exist. `expMod` /
+//    `expName` is the token scan's own export set, the same one `modVisit` uses
+//    to diagnose "not exported".
+//  * NO SPECIFIER THE ENTRY CAN USE — see `modUfcsSpecFromEntry`.
+//
+// What it deliberately does NOT gate on is the receiver: this walk has no types.
+// `typecheck.ufcsWouldDispatch` re-asks the real question per call site.
+function modNoteUfcsImportCand(m: i32, base: string, mangled: string): i32 {
+  if m == 0 { return 0 }
+  let ex = 0
+  let exported = false
+  while ex < expMod.length {
+    if expMod[ex] == m && expName[ex] == base { exported = true }
+    ex = ex + 1
+  }
+  if !exported { return 0 }
+  const spec = modUfcsSpecFromEntry(m)
+  if spec == "" { return 0 }
+  ufcsImpAdd(base, mangled, spec)
+  0
+}
+// The specifier the ENTRY FILE can write to name module `m`, or "" when none is
+// KNOWN-correct from there.
+//
+// Two sources, and only two, because a suggested import that resolves somewhere
+// else is worse than no suggestion:
+//
+//  1. The entry already imports `m` — then the entry's own specifier TEXT is by
+//     construction the right one, and the quick-fix extends that statement.
+//  2. `m`'s key is a `std:` specifier — absolute, and therefore identical from
+//     every file in the graph (`modResolveSpecifier` returns a std spec
+//     unchanged), so a fresh `import { … } from "std:x"` in the entry resolves to
+//     the same module.
+//
+// A RELATIVE module the entry does not import falls through to "". Its key is a
+// normalized PATH, and turning that back into a specifier relative to the entry
+// is path arithmetic (`..` segments included) that can produce a wrong import —
+// which is the one outcome a mechanically-applied quick-fix must not have. The
+// cost of the omission is a suggestion withheld, and the reader still gets the
+// direct sentence.
+function modUfcsSpecFromEntry(m: i32): string {
+  const key = modKeys[m]
+  let i = 0
+  while i < impMod.length {
+    if impMod[i] == 0 && impKey[i] == key && impSpec[i] != "" {
+      return impSpec[i]
+    }
+    i = i + 1
+  }
+  if modIsStdSpec(key) { return key }
+  ""
 }
 // The mangled name of a UFCS `self`-function reachable as `.prop(args)` —
 // `prop` mapped through the live module's rename map, matched against the

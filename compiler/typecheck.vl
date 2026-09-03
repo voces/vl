@@ -114,6 +114,9 @@ import {
   tsMentionsAnyName,
   ufcsAliasAtSite,
   ufcsAliasOf,
+  ufcsImpMangled,
+  ufcsImpName,
+  ufcsImpSpec,
 } from "./ast"
 // The free INDEX-OPERATOR declaration-name encoding (B14).
 import { OP_INDEX_GET, OP_INDEX_SET, opDeclLabel, opDeclOpOf } from "./ast"
@@ -434,6 +437,32 @@ type TDiag = { tmsg: string, tat: i32, tline: i32, tcol: i32, tcode: string }
 // `diagCodeByte`), yet still an error — a program that cannot build must not
 // pass `vl check`.
 const CODE_UNSUPPORTED_LOWERING = "unsupported-lowering"
+
+// D1230's category code, and the ONE payload channel its quick-fix reads. A UFCS
+// member call whose name is a free `self`-function exported by a module in the
+// graph but not imported by this file carries:
+//
+//     ufcs-not-imported;member=<name>;modules=<spec>[,<spec>…];recv=<type>
+//
+// THE QUICK-FIX MUST NEVER PARSE THE SENTENCE, which is why the payload rides
+// here rather than in the message: the wording is free to improve and the code is
+// not. The contract, in the form a host can implement without a grammar:
+//
+//   * `;` separates fields, and they appear in exactly this order.
+//   * `member=` is the property AS WRITTEN — an identifier, so it carries no
+//     separator.
+//   * `modules=` is a `,`-joined list of module specifiers, each one spelled the
+//     way the file can write it TODAY (an existing import's own text, or a
+//     `std:` specifier). Ordered by the module graph's dependency-first walk and
+//     deduplicated. A specifier is a module key or a `std:` name and can hold
+//     neither `,` nor `;`.
+//   * `recv=` is LAST and is a RENDERED TYPE, which may hold anything at all —
+//     `|`, `,`, `;` inside a string-literal member. Read it as everything after
+//     the first `;recv=`, never as a `;`-split field.
+//
+// ONE DIAGNOSTIC PER CALL, listing every candidate module, because the fix is one
+// choice among them — N diagnostics would stack N squiggles on one token.
+const CODE_UFCS_NOT_IMPORTED = "ufcs-not-imported"
 
 // ── Checker state (one struct, held in the global `T`) ───────────────────────
 // `tys`     — the type arena (every type is an index into it).
@@ -1082,6 +1111,23 @@ let ufcsCstrProp: string[] = []
 let ufcsCstrIx: i32[] = []
 let ufcsCstrFn: i32[] = []
 let ufcsCstrP0: i32[] = []
+
+// D1230 — the missing-import answer, banked at the CALLEE MEMBER NODE by the call
+// site that computed it and read back by the member arm that raises the sentence.
+//
+// The two halves of the question live in different places and neither can move to
+// the other: only the CALL knows the argument count that decides whether a
+// candidate's arity fits, and only `checkMemberNode` reaches the arm that names
+// the receiver ("no field on a struct", "on array", "on map", …). A sidecar keyed
+// by node index costs nothing and leaves the control flow of a failing call
+// EXACTLY as it was — the arguments are still checked, the same one diagnostic is
+// still raised, at the same anchor.
+//
+// `ufcsMissSpecs[i]` is the `,`-joined specifier list for the callee member node
+// `ufcsMissAt[i]`. A node is banked at most once (the first call wins; a member
+// node belongs to one call).
+let ufcsMissAt: i32[] = []
+let ufcsMissSpecs: string[] = []
 
 // SOLVED un-annotated parameter types — the parameter's own body USAGE, read back as
 // its type. A hole is permissively assignable both ways, so a usage that requires a
@@ -3510,6 +3556,8 @@ export function initChecker() {
   ufcsCstrIx = []
   ufcsCstrFn = []
   ufcsCstrP0 = []
+  ufcsMissAt = []
+  ufcsMissSpecs = []
   solvedParamTys = Map()
   paramSolveTried = Map()
   holeFlowSrc = []
@@ -20314,6 +20362,80 @@ function stdFmtMovedNote(name: string) {
   ""
 }
 
+// RAISE the member arm's sentence at node `ix` — `memberFloorMsg`'s words, unless
+// the call site banked a missing-import answer for this very node, in which case
+// D1230's sentence and its `ufcs-not-imported` code replace them.
+//
+// ONE HOME FOR THE RAISE, for the same reason `memberFloorMsg` is one home for the
+// words: `checkMemberNode` refuses from SEVEN arms (struct, union, array, map,
+// string, bound type parameter, and the final non-object floor), and a UFCS call
+// can fail on any of them. A per-arm enrichment would have covered the struct
+// receiver, which is the witness everybody types, and silently missed the rest.
+//
+// THE OLD SENTENCE SURVIVES WHEREVER THERE IS NO IMPORT TO SUGGEST, which is every
+// single-file program and every member call on a type that genuinely has no such
+// function anywhere. That is the control, not an accident: the substitution is
+// gated on the bank holding this node, and the bank is filled only by a call whose
+// name IS a free `self`-function accepting this receiver.
+function memberFloorErr(objTy: i32, prop: string, ix: i32) {
+  const specs = ufcsMissSpecsAt(ix)
+  if specs != "" {
+    return tErrCoded(
+      ufcsNotImportedMsg(prop, specs, objTy),
+      ix,
+      ufcsNotImportedCode(prop, specs, objTy),
+    )
+  }
+  tErr(memberFloorMsg(objTy, prop), ix)
+}
+
+// D1230's SENTENCE. The fault is the missing import, so the sentence leads with it
+// — `no field 'toEqual' on Expectation<i32>` is true, permanent, and tells a reader
+// nothing they can act on, while the compiler knew the whole time that `toEqual` is
+// a free `self`-function sitting in a module the file already names.
+//
+// ONE TEMPLATE for one and for many candidates: the module list renders as `"a"` or
+// `"a", "b"` and the rest of the words do not change. Two sentences differing only
+// by a count are two literals to keep in step, and the plural one is the one nobody
+// ever reads while writing the fix.
+//
+// The closing clause is the RULE, not a hedge: UFCS in this language is explicit by
+// ruling (DECISIONS.md §"UFCS is never implicit"), so a reader who expected the
+// receiver's own module to be searched is told why it was not.
+function ufcsNotImportedMsg(prop: string, specs: string, objTy: i32) {
+  "'" +
+    prop +
+    "' is not imported — a free `" +
+    prop +
+    "(self: …)` accepting " +
+    tyToStr(objTy) +
+    " is exported by " +
+    specListQuoted(specs) +
+    "; a UFCS call resolves only names in scope, so import `" +
+    prop +
+    "` from there"
+}
+
+// D1230's PAYLOAD — the machine half, whose shape `CODE_UFCS_NOT_IMPORTED`
+// documents. `recv=` is last precisely because a rendered type is the one field
+// that can contain the separators.
+//
+// IT DEMANGLES ITS OWN RECEIVER, and that is not duplication. The MESSAGE is
+// demangled downstream, once, for every diagnostic (`driver.vcDiagMsg`); the CODE
+// is not, because a category code has never carried a program's names. Only this
+// payload does, so it strips the merge's `$mN` here — otherwise the sentence would
+// say `Box` while the field a quick-fix reads says `Box$m1`, which is a type name
+// no source file contains.
+function ufcsNotImportedCode(prop: string, specs: string, objTy: i32) {
+  CODE_UFCS_NOT_IMPORTED +
+    ";member=" +
+    prop +
+    ";modules=" +
+    specs +
+    ";recv=" +
+    demangleMsg(tyToStr(objTy))
+}
+
 // THE INDEX ARM'S OWN SENTENCE, on the same terms — "" when `recv[i]` resolves or defers,
 // otherwise `checkIndexNode`'s `cannot index non-array …`.
 //
@@ -23535,6 +23657,111 @@ function boundMemberFloorMsg(tvName: string, prop: string) {
     has
 }
 
+// Would a UFCS call with `argc` explicit arguments on a receiver of type `recvTy`
+// DISPATCH to the free self-function merged as `mangled`? (D1230.)
+//
+// MIRRORS `ufcsCallTy`'s GATE, arm for arm and in its order — the lookup, the
+// `self`-name rule, the arity RANGE, `assignable(recvTy, params[0])` — and
+// deliberately nothing after it. That cut is the whole safety argument: this runs
+// SPECULATIVELY, on a call that has already failed, over every same-named
+// candidate in the graph, so it must not do any of the things the real dispatch
+// does on the way to an answer. `ufcsCallTy` forces a pending return
+// (`checkNode(dIx)`), records a deferred constraint (`noteUfcsCstr`), reorders
+// named arguments, fills defaults and reports argument mismatches; each of those
+// would raise a diagnostic or mutate inference state for a function the program
+// never calls.
+//
+// So a candidate answering TRUE here is not a promise the call would COMPILE once
+// imported — the arguments are still unchecked. It is the promise the message
+// makes: the name is a self-function, and its `self` takes this receiver.
+function ufcsWouldDispatch(mangled: string, recvTy: i32, argc: i32) {
+  const fnTy = lookup(mangled)
+  if fnTy < 0 { return false }
+  const ft = T.tys[fnTy]
+  if ft is TyFunc {
+    const params = ft.fnParamTypes
+    if params.length < 1 { return false }
+    if !declFirstParamIsSelf(mangled) { return false }
+    const uDecl = declParamsAfterSelf(mangled)
+    let uRequired = params.length - 1
+    if uDecl.length == params.length - 1 { uRequired = fnRequiredArity(uDecl) }
+    if argc < uRequired || argc + 1 > params.length { return false }
+    return assignable(recvTy, params[0])
+  }
+  false
+}
+
+// The `,`-joined module specifiers that would make `recv.prop(argc args)` resolve,
+// or "" when no module in the graph offers one (D1230). Deduplicated, in the
+// registry's own dependency-first order.
+//
+// EMPTY IS THE COMMON ANSWER and is the point: a single-file program has no
+// registry rows at all, and a member call on a type that genuinely has no such
+// function anywhere keeps the direct sentence it has today.
+function ufcsMissingImportSpecs(prop: string, recvTy: i32, argc: i32) {
+  const specs: string[] = []
+  let i = 0
+  while i < ufcsImpName.length {
+    if ufcsImpName[i] == prop {
+      if ufcsWouldDispatch(ufcsImpMangled[i], recvTy, argc) {
+        if !listHasStr(specs, ufcsImpSpec[i]) { specs.push(ufcsImpSpec[i]) }
+      }
+    }
+    i = i + 1
+  }
+  let out = ""
+  let j = 0
+  while j < specs.length {
+    if j > 0 { out = out + "," }
+    out = out + specs[j]
+    j = j + 1
+  }
+  out
+}
+
+// The `,`-joined payload list, rendered for the SENTENCE: `a,b` → `"a", "b"`.
+// The two forms are built from the one string so the message and the code can
+// never name different modules.
+function specListQuoted(list: string) {
+  let out = ""
+  let start = 0
+  let i = 0
+  while i < list.length {
+    if list[i] == ',' {
+      if out != "" { out = out + ", " }
+      out = out + "\"" + list.slice(start, i) + "\""
+      start = i + 1
+    }
+    i = i + 1
+  }
+  if out != "" { out = out + ", " }
+  out + "\"" + list.slice(start, list.length) + "\""
+}
+
+// Bank the callee MEMBER node's missing-import answer for `memberFloorErr`.
+function noteUfcsMiss(memIx: i32, specs: string) {
+  if memIx < 0 { return 0 }
+  if specs == "" { return 0 }
+  let i = 0
+  while i < ufcsMissAt.length {
+    if ufcsMissAt[i] == memIx { return 0 }
+    i = i + 1
+  }
+  ufcsMissAt.push(memIx)
+  ufcsMissSpecs.push(specs)
+  0
+}
+
+// The banked answer for member node `memIx`, or "" when the call site banked none.
+function ufcsMissSpecsAt(memIx: i32) {
+  let i = 0
+  while i < ufcsMissAt.length {
+    if ufcsMissAt[i] == memIx { return ufcsMissSpecs[i] }
+    i = i + 1
+  }
+  ""
+}
+
 function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
   // A UFCS callee names a free `self`-function by its SOURCE name. The module
   // merge mangles such functions (`shout` → `shout$m1`) but leaves the call's
@@ -24497,6 +24724,18 @@ function checkCallNode(n: Call, ix: i32) {
         // UFCS `self`-method on a string receiver (`"hello".first()`).
         const su = ufcsCallTy(sp, recvTy, n, ix)
         if su >= 0 { return su }
+        // D1230 on a STRING receiver. This arm answers before the general one and
+        // raises its own sentence at the CALL node, so it asks and raises here
+        // rather than banking — `memberFloorErr` never sees a string method call.
+        const suSpecs = ufcsMissingImportSpecs(sp, recvTy, n.callArgs.length)
+        if suSpecs != "" {
+          tErrCoded(
+            ufcsNotImportedMsg(sp, suSpecs, recvTy),
+            ix,
+            ufcsNotImportedCode(sp, suSpecs, recvTy),
+          )
+          return TY_ERR
+        }
         tErr("no method '." + sp + "' on string", ix)
         return TY_ERR
       }
@@ -24580,6 +24819,16 @@ function checkCallNode(n: Call, ix: i32) {
     if !ufcsHasField {
       const uu = ufcsCallTy(cfn.memProp, recvTy, n, ix)
       if uu >= 0 { return uu }
+      // D1230 — THE NAME IS A SELF-FUNCTION, JUST NOT ONE IN SCOPE. Asked here
+      // because only the CALL knows the argument count, and banked on the callee
+      // MEMBER node because that is where the sentence is raised. Nothing else
+      // changes: the callee is still checked, the arguments are still checked, and
+      // the one diagnostic the program gets is still the member arm's — with
+      // different words (`memberFloorErr`).
+      noteUfcsMiss(
+        n.callFn,
+        ufcsMissingImportSpecs(cfn.memProp, recvTy, n.callArgs.length),
+      )
     }
   }
   // A memory intrinsic that is DECLARED in the default scope but has no emitter arm
@@ -38060,7 +38309,7 @@ function checkMemberNode(n: Member, ix: i32) {
   if ot is TyObj {
     const ft = objFieldType(ot, n.memProp)
     if ft < 0 {
-      tErr(memberFloorMsg(objTy, n.memProp), ix)
+      memberFloorErr(objTy, n.memProp, ix)
       return TY_ERR
     }
     return symMem(ix, ft)
@@ -38081,13 +38330,13 @@ function checkMemberNode(n: Member, ix: i32) {
     // inline shapes that is the whole work of the diagnostic. The offending member is a
     // per-member fact this seam already has; the JOIN failure (every member HAS the field,
     // at reps that do not join) is NOT, and it correctly appends nothing.
-    tErr(memberFloorMsg(objTy, n.memProp), ix)
+    memberFloorErr(objTy, n.memProp, ix)
     return TY_ERR
   }
   // `.length` on an array, a map, or a string is an i32.
   if ot is TyArray {
     if n.memProp == "length" { return symMem(ix, TY_I32) }
-    tErr(memberFloorMsg(objTy, n.memProp), ix)
+    memberFloorErr(objTy, n.memProp, ix)
     return TY_ERR
   }
   if ot is TyMap {
@@ -38095,13 +38344,13 @@ function checkMemberNode(n: Member, ix: i32) {
     // JS Map/Set name, `.length` the list-consistent alias; both read the same field.
     if n.memProp == "length" { return symMem(ix, TY_I32) }
     if n.memProp == "size" { return symMem(ix, TY_I32) }
-    tErr(memberFloorMsg(objTy, n.memProp), ix)
+    memberFloorErr(objTy, n.memProp, ix)
     return TY_ERR
   }
   if ot is TyPrim {
     if ot.primName == "string" {
       if n.memProp == "length" { return symMem(ix, TY_I32) }
-      tErr(memberFloorMsg(objTy, n.memProp), ix)
+      memberFloorErr(objTy, n.memProp, ix)
       return TY_ERR
     }
   }
@@ -38154,7 +38403,7 @@ function checkMemberNode(n: Member, ix: i32) {
       }
     }
   }
-  tErr(memberFloorMsg(objTy, n.memProp), ix)
+  memberFloorErr(objTy, n.memProp, ix)
   return TY_ERR
 }
 // ── array literal ───────────────────────────────────────────────────────────
