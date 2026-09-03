@@ -46,7 +46,12 @@ def rows_of(target):
             if b.kind != "row":
                 continue
             body = R.strip_separator(b.text)
-            out.append((b.rid, R.declared_outcome(S.status_line(body) or "") or "?",
+            # A status block longer than the six lines `status_line` joins (D1025's is
+            # seven) returns None there; the outcome word opens the block, so the first
+            # bold line alone still classifies it — the grader reads it the same way.
+            first_bold = next((ln.strip("*").strip() for ln in body.split("\n")
+                               if ln.startswith("**")), "")
+            out.append((b.rid, R.declared_outcome(S.status_line(body) or first_bold) or "?",
                         b.title, doc))
     return sorted(out, key=lambda r: R.id_key(r[0]))
 
