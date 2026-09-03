@@ -1,0 +1,107 @@
+// A UNION ALIAS DECLARED WITH ITS OWN `| null` SPELLS ITS ARMS BY NAME (D1172 / D1173).
+//
+// `type U = A | B | null` interns as a one-member wrapper over `TyNullable(TyUnion[A,B])`,
+// which `nulAliasMemberFaithful` calls transparent — so canon rendered the alias through the
+// STRUCTURAL renderer, whose `TyObj` arm has no nominal rung, and the emitter's union name
+// became `{k:i32,a:i32}|{k:i32,b:i32}|null`. Every arm lookup keyed on that name then missed
+// the real arm: `unionArmVariantForStructExpr` answered -1 and an un-annotated arm binding was
+// RAW-PASSED into the `(ref $uBox)` parameter (D1172), while an inline object literal fell to
+// `objVariantName`'s global FIRST-MATCH field-set scan and boxed as ANOTHER union's same-named
+// arm (D1173 — `{k: "aa", a: 1}` built `A`'s two-i32 heap type with a string in it). Both were
+// `vl check` rc 0 over a module the engine refuses.
+//
+// THE OTHER TWO SPELLINGS OF THE SAME TYPE ALWAYS RAN, and they are the reason the fix is a
+// render and not a lookup: `f(u: A | B | null)` and `type U = A | B` + `f(u: U | null)` both
+// reach the emitter as `A|B|null`. This makes the third spelling agree with them.
+//
+// THE `| null` AND THE SECOND ARM ARE BOTH INGREDIENTS: `type U = A | B` runs (no null, so the
+// alias is not transparent), and `type U = A | null` runs (one non-null member, so it is the
+// `nulvariant` NICHE, not the box). Only the box-with-a-null shape reached the render.
+//
+// Each cell PROVES the value arrived as the right arm by reading a field only that arm has.
+// @run
+// @log 1
+// @log 2
+// @log 0
+// @log 1
+// @log 42
+// @log 5
+// @log 1
+// @log 9
+// @log 3
+// @log 7
+// @log aa
+
+type A = { k: i32, a: i32 }
+type B = { k: i32, b: i32 }
+type U = A | B | null
+
+function tag(u: U) {
+  if u is A { return 1 }
+  if u is B { return 2 }
+  return 0
+}
+
+// D1172's own witness: the UN-ANNOTATED module global. An annotation pins the cell's rep, so
+// the annotated spelling could never see this.
+const ga = { k: 7, a: 1 }
+print(tag(ga))
+// The inline literal and the bare `null`, at the same boundary.
+print(tag({ k: 7, b: 2 }))
+print(tag(null))
+
+// The un-annotated LOCAL, the same delivery one scope in.
+function localArm() {
+  const la = { k: 1, a: 2 }
+  tag(la)
+}
+print(localArm())
+
+// The arm's OWN field is readable through the box, which is what proves the payload is the
+// arm's heap type and not a raw struct riding the anyref.
+function readB(u: U) {
+  if u is B { return u.b }
+  return -1
+}
+print(readB({ k: 1, b: 42 }))
+
+// RETURN, annotated GLOBAL, list ELEMENT and global ASSIGNMENT — the deliveries a call
+// argument does not cover.
+function mk(): U {
+  const m = { k: 2, b: 5 }
+  return m
+}
+print(readB(mk()))
+const gann: U = { k: 3, a: 8 }
+print(tag(gann))
+const elems: U[] = [{ k: 4, b: 9 }]
+print(readB(elems[0]))
+let gset: U = null
+function readA(u: U) {
+  if u is A { return u.a }
+  return -1
+}
+function setg() {
+  const s = { k: 5, a: 3 }
+  gset = s
+  readA(gset)
+}
+print(setg())
+
+// D1173: TWO null-bearing unions in one module whose shared field has DIFFERENT reps. The
+// field-name sets collide (`{k, a}` in both), so the global scan that answered when the name
+// lookup missed picked the FIRST match — the i32-keyed arm — for the string-keyed literal.
+type SA = { k: string, a: i32 }
+type SB = { k: string, b: i32 }
+type SU = SA | SB | null
+
+function pickI32(u: U) {
+  if u is A { return u.k }
+  return -1
+}
+function pickStr(u: SU) {
+  if u is SA { return u.k }
+  return "none"
+}
+print(pickI32({ k: 7, a: 1 }))
+print(pickStr({ k: "aa", a: 1 }))
