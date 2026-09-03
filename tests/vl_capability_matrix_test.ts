@@ -4,13 +4,14 @@
 // from a single template. An instrument nobody validates measures nothing (CLAUDE.md: never
 // trust a probe until a control you KNOW should trigger it does), so this suite runs it on
 // four templates whose answers are already known: D1042's generic-pinned union, where every
-// position runs but the INFERRED return (D1194); D1197's narrowed nullable ref, where
-// `.push` is check-clean invalid wasm and eight siblings run; and D1244's module-scope block
-// at two reps, where the STRUCT capture is a loud refusal and the `i32[]` one is silent.
+// position runs but the INFERRED return (D1194); D1197's narrowed nullable ref, all nine
+// delivery positions running since that row closed; and D1244's module-scope block at two
+// reps, where the STRUCT capture is a loud refusal and the `i32[]` one is silent.
 //
-// D1197's cell is the load-bearing one. If it stops grading SILENT the harness has either
-// been fixed or been blinded, and the two must not look the same. D1244's pair is the same
-// discipline for the `block_*` positions, which were added because that row was invisible.
+// D1244's `i32[]` cell is the load-bearing one — the SILENT control that proves the harness
+// can still SEE check-clean invalid wasm. It took that role from D1197's `.push`, which is
+// now the opposite control: the row it was filed against is closed, so an `array_push` cell
+// that stops grading RUNS is a regression rather than a blinded instrument.
 
 const exists = (p: string): boolean => {
   try {
@@ -195,7 +196,7 @@ Deno.test({
 });
 
 Deno.test({
-  name: "matrix: D1197's `.push` cell grades SILENT — the control that proves the instrument",
+  name: "matrix: D1197's `.push` cell RUNS with its eight siblings — the row is closed",
   ignore: !ENABLED,
   fn: async () => {
     const { code, cells } = await runMatrix("narrowed-nullable-ref-push.matrix.vl");
@@ -204,8 +205,8 @@ Deno.test({
         cells,
         "array_push",
         face,
-        "SILENT",
-        "D1197: `.push` drops the non-null recovery. When D1197 closes, change this to RUNS",
+        "RUNS",
+        "D1197 closed: `.push` asks `nulNicheRecoverOwed` like its siblings",
       );
       wantVerdict(cells, "binding", face, "RUNS", "D1197's matrix: eight positions run");
       wantVerdict(cells, "argument", face, "RUNS", "D1197's matrix: eight positions run");
@@ -214,8 +215,8 @@ Deno.test({
       // so rather than reporting a refusal it manufactured itself.
       wantVerdict(cells, "global_init", face, "skipped", "a global init cannot nest in a guard");
     }
-    if (code === 0) {
-      throw new Error("want a non-zero exit on a SILENT cell in the after column, got 0");
+    if (code !== 0) {
+      throw new Error(`want exit 0 with no SILENT cell in the after column, got ${code}`);
     }
   },
 });

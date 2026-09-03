@@ -10,6 +10,18 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 
 ## Types & semantics
 
+- **`T | null` IS VALUE-COMPARABLE EXACTLY WHEN `T` IS** (2026-09-03, D1180). `isEquatable`
+  refused every nullable field on the stated ground that "discriminating the variant would be
+  required first". That is true of a MAP (no defined equality) and of a general union (two arms
+  may mean different things by `==`); it is false of `T | null`, whose equality is fully
+  determined — `null == null` true, one-sided null false, otherwise `T`'s own compare — and the
+  language already agreed, since `string | null == string | null` runs and answers correctly at
+  the direct spelling. The blanket rule was a REP observation (the niche needs a null guard) in
+  a soundness gate's clothes; D101 had already carved out the two i32-sentinel niches for the
+  same reason. Genuinely undefined inners stay refused through the recursion, so
+  `{[string]: i32} | null` is still a check reject. The emitter side is one guard over the
+  non-null twin's core (`nulFieldInnerCode`), shared by the struct and variant field ladders.
+
 - **VOID CONTEXTS DISCARD IMPLICIT TAIL VALUES; AN EXPLICIT `return expr` STAYS AN ERROR,
   ANCHORED AT THE RETURN** (2026-08-31). VL is expression-oriented and effectively
   semicolon-less at line ends — `fmt` normalizes semicolons away — so there is no Rust-style
