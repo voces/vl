@@ -376,6 +376,23 @@ large input, which is exactly what `fmt_util.vl:216` records happening once alre
 which is the shape that hurts; C changes the rep for every program to fix a pattern a
 static analysis can see in most of them.
 
+### D6 · Measured after A and B (2026-09-03)
+
+D2's ladder re-run, 20-byte pieces, best of 3, ratio per doubling. **fn** is D2's loop
+inside a function; **plus** is D2's module-SCOPE spelling, still quadratic (item 7's rest).
+
+| N | fn before | fn after | plus before | plus after | `join` after |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 32,000 | 0.819 s | 0.017 s | 0.707 s | 0.598 s | 0.027 s |
+| 64,000 | 5.052 s | **0.024 s** | 5.932 s | 3.055 s | 0.037 s |
+| ratio | 6.16 | **~1.0** | 8.38 | 5.10 | 1.37 |
+
+In the compiler's own emitted module, `call $__str_concat__` sites **2,649 -> 399** and
+inline `array.copy` **2,366 -> 5,420**; `__str_concat__` self% of a self-compile **0.66% ->
+0.26%**; L2 self-compile CPU **10.04 s -> 7.69 s** interleaved at load ~110, on a seed that
+grew 1,833,871 -> 1,992,504 bytes. `tests/cases` byte-identity: 2,792 modules, 2,184
+identical, 107 differ (each carries a 3+ chain or an accumulator), 501 refuse under both.
+
 ---
 
 ## E · What this survey could NOT measure

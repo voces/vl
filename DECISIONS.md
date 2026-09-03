@@ -5028,3 +5028,56 @@ Three decisions inside that are worth keeping:
 `--json` deliberately carries neither the code nor the payload for a COMPILE diagnostic
 (`compiler/cli.vl`, unchanged): the payload is an editor's answer, and the fix is an edit no
 batch reporter performs. Adding it would store a field nothing reads.
+
+## String building is a LOWERING, not a spelling the user has to know (owner direction, 2026-09-03)
+
+The owner's direction is "optimize string building at the compiler level, without the user
+having to use an actual builder pattern". Two lowerings answer it, and each is EXACT — it
+fires only where its condition is proven, and every other program keeps the bytes it had.
+
+**N-ary concat.** A maximal string `+` chain lowers to ONE sized allocation plus one
+`array.copy` per part, instead of one `__str_concat__` call per `+`. The chain is flattened
+by `exprIsStrConcat` — the same predicate that routes `+` to the string lowering — so the
+walk and the dispatch cannot disagree about where the chain ends. EXACTNESS: parts are
+evaluated left to right, exactly once, before any is stashed, which is the nested-op
+discipline §G6 already imposes; a non-string operand keeps whatever render step it had; a
+parenthesised sub-chain is a `Paren` node and is not interior, so it keeps its own lowering.
+A program with no chain and no accumulator is byte-identical: 2,184 of 2,792 `tests/cases`
+modules, all 107 that moved carrying one, 501 refusing under both seeds.
+
+Two options were NOT taken. A variadic `__str_concat_n__` through a scratch table would
+need a second allocation for the parts array and an `(array (ref $str))` heap type in every
+chain-bearing module; the inline form pays ~46 bytes per part of code instead (the seed
+moves 1.83 MB -> 1.97 MB) and allocates exactly once. Ropes (Part D's option C) change the
+string REP for every program to fix a pattern a static analysis can see in most of them, so
+they stay the owner's held option rather than this PR's.
+
+**The loop-local accumulator.** `let s = ""` then `s = s + piece` inside a loop appends IN
+PLACE into slack the binding's own grow path allocated (capacity doubling), instead of
+allocating an exact-fit backing and copying the prefix per step. **The buffer IS the
+string's own backing** — no separate builder local and no materialisation step, so `s` is a
+valid `string` at every instant and a read, an alias, a `.slice`, a `break`, a `return` or a
+nested loop inside the accumulating loop needs no special case and disqualifies nothing.
+
+EXACTNESS is one invariant: `s` may only ever hold a string LITERAL, a fresh concat result,
+or a buffer this binding allocated. Literals are exact-fit by construction (`collectStrPool`
+gives every one its own `array.new_fixed`) and so is every concat result, so the first append
+after either always grows — a backing with slack is therefore always ours, and every view
+taken of `s` satisfies `start + len <= s.len` while the append writes only past it. The
+analysis enforces the invariant with four conditions: the binding is a function LOCAL
+declared exactly once, as a mutable `let` whose initialiser is a string literal (annotated
+`string` or not); every assignment to it is `s = s + <parts>` or `s = <literal>`; no part of
+an append mentions it (which is what makes evaluating the parts before reading `s`
+unobservable); and no nested function mentions it. At least one self-append must be inside a
+loop, so a straight-line `s = s + x` keeps the bytes it had.
+
+NOT DONE, deliberately: a module GLOBAL accumulator. The declaration and the assignment sit
+in different scope units, so proving the invariant needs a module-wide walk rather than a
+per-function one; the pattern stays quadratic and is filed in ROADMAP item 7.
+
+**Why not a separate buffer with a materialisation point** (Part D's option B as written).
+It needs two extra locals, a loop-entry hook, a materialisation at every loop EXIT including
+`break` and an early `return`, and a rule for nested loops — and its buffer has slack at
+materialisation anyway, so it either copies once more or lands in the same place this does.
+The in-place form is strictly smaller and strictly more general.
+
