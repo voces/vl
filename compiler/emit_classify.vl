@@ -67,6 +67,7 @@ import {
   TyObj,
   TyPrim,
   TyUnion,
+  TyVar,
   annUnionAtomsOf,
   anyLitUnionUsed,
   canonRewroteNode,
@@ -12318,6 +12319,14 @@ export function moduleHasUnionAs(): boolean {
       modUnionAsHit = true
       return true
     }
+    // …AND THE HOLE OPERAND, over-approximated. This scan has no `fnIx`, so it cannot ask the
+    // rep question `asExprIsUnionCastIn` asks; the safe direction is RESERVATION ⊇ LOWERING,
+    // because an unreserved slot the union arm writes is invalid wasm while an unused one
+    // costs the same "one unused local" this function's own header already prices. D1251.
+    if asExprOperandIsHole(i) {
+      modUnionAsHit = true
+      return true
+    }
     i = i + 1
   }
   modUnionAsSeen = P.nodes.length
@@ -12341,6 +12350,38 @@ export function asExprIsUnionCast(ix: i32): boolean {
   // arm expands it before deciding. This gate must agree or the cast falls to the numeric
   // ladder and emits an i32 conversion over a ref.
   if ot is TyNullable { return true }
+  false
+}
+
+// D1251 — the operand's recorded type is an unresolved inference HOLE. The checker solves an
+// un-annotated parameter from its own BODY (`unannotParamTy`), so a parameter only the CALL
+// SITE pins keeps a `TyVar` on every read of it — while the monomorphizer has already pinned
+// the INSTANCE's parameter to the argument's union, and every other box consumer reads that
+// pin. So `asExprIsUnionCast` declined, the cast fell past the union arm to the plain
+// conversion ladder where source and target are both unnamed, and NOTHING was emitted: the
+// box went straight into the i32 consumer — `vl check` rc 0, `expected i32, found (ref
+// $type)`, at `as`, `as?` and `as!` alike.
+export function asExprOperandIsHole(ix: i32): boolean {
+  if ix < 0 { return false }
+  const n = P.nodes[ix]
+  if !(n is AsExpr) { return false }
+  const oty = nodeTyIxOf(n.asObj)
+  if oty < 0 { return true }
+  const ot = T.tys[oty]
+  if ot is TyVar { return true }
+  false
+}
+
+// THE GATE THE LOWERING AND EVERY CAST-RESULT CLASSIFIER ASK: `asExprIsUnionCast`'s
+// node-local answer, plus the rung the recorded type cannot carry — a HOLE operand whose box
+// the emitter's own rep answer knows about. `exprUnion` is that answer, the same one the
+// union arm's own "needs a BOXED union operand" check already asks of the identical node, so
+// the gate and the arm cannot disagree about which operands carry a tag. D1251.
+export function asExprIsUnionCastIn(ix: i32, fnIx: i32): boolean {
+  if asExprIsUnionCast(ix) { return true }
+  if !asExprOperandIsHole(ix) { return false }
+  const n = P.nodes[ix]
+  if n is AsExpr { return exprUnion(n.asObj, fnIx) }
   false
 }
 
@@ -29835,7 +29876,7 @@ export function exprVariantIndex(exprIx: i32, fnIx: i32) {
   // a `const c = mk(a) as Circle` binding fell past `letIsVariant` to the i32 slot default,
   // and the correct `ref.cast` the cast emits landed in a slot its consumer typed i32.
   if e is AsExpr {
-    if asExprIsUnionCast(exprIx) {
+    if asExprIsUnionCastIn(exprIx, fnIx) {
       const anm = nominalStructNameOfTy(nodeTyIxOf(exprIx))
       if anm != "" { return variantIndexOf(anm) }
     }
@@ -30791,7 +30832,7 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
       // `as!` and a bare `as` yield `T` itself — a plain scalar, never a box.
       return false
     }
-    if asExprIsUnionCast(exprIx) {
+    if asExprIsUnionCastIn(exprIx, fnIx) {
       const cty = nodeTyIxOf(exprIx)
       if cty >= 0 {
         const ct = T.tys[cty]
