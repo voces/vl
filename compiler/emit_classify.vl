@@ -4751,12 +4751,81 @@ function capturedBindingFrameOf(fnIx: i32, name: string) {
   parentBindingFrameArenaOf(fe, name)
 }
 
+// The `for-in` node whose LOOP VARIABLE binds a captured `name` of lifted frame `fe`, or
+// -1 (D1142). The third storage class of a capture, and the one with NO declaration node:
+// `parentBindingOf` answers a `Param` or a `LetDecl` and has nothing to return for a loop
+// variable, so `captureValKind` fell to its i32 default and the env FIELD was typed i32
+// whatever the iterated element was — while `declareForInLocals` typed the loop-var LOCAL
+// off `forInElemKind`. `struct.new $env` then pushed a `(ref $str)` / an `f64` into an i32
+// field: `vl check` rc 0, invalid wasm, with no name collision anywhere.
+//
+// ASKED ONLY WHERE `parentBindingOf` DECLINES, which is the right precedence by
+// construction: `parentBindingFrameOf` tries the frame's params, then its body `let`s, and
+// only then its loop variables, so a param or `let` of the same name owns the binding and
+// this never sees it.
+//
+// A `ForRange` loop variable is unconditionally i32 (`declareForInLocals`' sibling declares
+// it so), which is what the default already answers — hence only the `ForIn` arm.
+function captureLoopVarIterOf(fe: i32, name: string): i32 {
+  const par = parentBindingFrameOf(fe, name)
+  if par < 0 || par >= fnStmts.length { return -1 }
+  const pfn = P.nodes[fnStmts[par]]
+  if pfn is FuncDecl {
+    const lv = parentLoopVarOf(pfn.fnBody, name)
+    if lv < 0 { return -1 }
+    const ln = P.nodes[lv]
+    if ln is ForIn {
+      const it = ln.fiIter
+      // A BARE LOCAL ITERABLE IS THE ONE STORAGE CLASS THIS POSITION CANNOT READ. Every
+      // rung of `forInElemKind`'s Ident arm is frame-independent — a param reads
+      // `paramTypeNode`, a global its `LetDecl`, a call its callee's return — EXCEPT
+      // `declaredKind`, which reads the live SCOPE STACK. The type section runs with no
+      // frame's locals bound, so `for z in xs` over a local `xs` classified as the i32
+      // default here while `declareForInLocals` (running with the frame live) typed the
+      // loop-var LOCAL correctly. The disagreement is invisible for a scalar element,
+      // whose Ident rung answers off the arena, and invalid wasm for a REF one.
+      //
+      // Re-ask against the binding's INITIALIZER, which needs no scope stack. WIDENING
+      // ONLY: it fires exactly where the iterable's own answer is the default that made
+      // the field wrong, and never overrides a positive one.
+      const ek = forInElemKind(it, fnStmts[par])
+      if ek == null || ek == "i32" {
+        const itn = P.nodes[unwrapParen(it)]
+        if itn is Ident {
+          const li = parentLetOf(pfn.fnBody, itn.identName)
+          if li >= 0 {
+            const ld = P.nodes[li]
+            if ld is LetDecl {
+              if ld.letInit >= 0 {
+                const iek = forInElemKind(ld.letInit, fnStmts[par])
+                if iek != null && iek != "i32" { return ld.letInit }
+              }
+            }
+          }
+        }
+      }
+      return it
+    }
+  }
+  -1
+}
+
 // The `fbValtype` kind for a captured variable `name` of lifted function `fe`,
 // resolved against the parent frame's binding (a param's annotation, or a local
 // `let`'s annotation / struct-literal initializer). Defaults to i32 (kind 0).
 export function captureValKind(fe: i32, name: string): VKind {
   const b = parentBindingOf(fe, name)
-  if b < 0 { return "i32" }
+  if b < 0 {
+    // A CAPTURED `for-in` LOOP VARIABLE (D1142) — typed off the very ladder
+    // `declareForInLocals` types the loop-var LOCAL with, resolved in the OWNING frame, so
+    // the env field and the local it is built from cannot disagree.
+    const lvIter = captureLoopVarIterOf(fe, name)
+    if lvIter >= 0 {
+      const lvk = forInElemKind(lvIter, parentBindingFrameArenaOf(fe, name))
+      if lvk != null { return lvk }
+    }
+    return "i32"
+  }
   const bn = P.nodes[b]
   if bn is Param { return vtKindOfType(bn.parType) }
   if bn is LetDecl {
@@ -4792,7 +4861,16 @@ export function captureValKind(fe: i32, name: string): VKind {
 // this position never learned, no slot at all — `ref valtype with no interned shape`).
 export function captureValStructIdx(fe: i32, name: string) {
   const b = parentBindingOf(fe, name)
-  if b < 0 { return -1 }
+  if b < 0 {
+    // THE LOOP-VARIABLE PAIR'S SECOND HALF (D1142) — `captureValKind`'s companion, from the
+    // same one home `declareForInLocals` reads. A kind without its slot is a loud reject,
+    // not a fallback (see the `LetDecl` ladder below), so the two arms land together.
+    const lvIter = captureLoopVarIterOf(fe, name)
+    if lvIter >= 0 {
+      return forInVarStructIdx(lvIter, parentBindingFrameArenaOf(fe, name))
+    }
+    return -1
+  }
   const bn = P.nodes[b]
   // D891 — a CAPTURED parameter whose slot the `??` merge moved reads its env field at the
   // merged row too. The third resolver of the same owner; see `anonLeafParamRowOf`.
@@ -15547,6 +15625,31 @@ export function forInRefArrayVariantIdx(iterIx: i32, fnIx: i32) {
   if mvs >= 0 { return mvValVariantOf(mvs) }
   if !exprRefArray(iterIx, fnIx) { return -1 }
   rlElemVariantRow(refListSlotOfExpr(iterIx, fnIx))
+}
+
+// THE COMPANION TABLE SLOT of a `for-in` LOOP VARIABLE's cell — the second `fbValtype`
+// argument for the kind `forInElemKind` answers, and the second half of the pair
+// `declareForInLocals` hands `addLocalName`. Lifted out of that function (D1142) because a
+// captured loop variable needs the SAME pair to type its closure ENV FIELD, and two copies
+// of a kind→slot ladder is the shape `declareForInLocals`' own header warns about: the
+// second copy silently lags every element kind the first one learns.
+//
+// -1 for every kind that needs no slot — the scalars, the leaf scalar lists, `str` /
+// `nulstr`, `list`, `u8list`, `union`, `closure` — exactly as `captureValStructIdx`'s
+// `LetDecl` ladder answers -1 for the same set.
+export function forInVarStructIdx(iterIx: i32, fnIx: i32): i32 {
+  const ek = forInElemKind(iterIx, fnIx)
+  if ek == null { return -1 }
+  if ek == "struct" || ek == "nulstruct" {
+    return forInRefArrayStructIdx(iterIx, fnIx)
+  }
+  if ek == "variant" { return forInRefArrayVariantIdx(iterIx, fnIx) }
+  if ek == "reflist" || ek == "nulreflist" {
+    // A NESTED REF array (`S[][]`): the loop var is the INNER ref list, off the outer
+    // list's element slot.
+    return rlElemInnerSlot(refListSlotOfExpr(iterIx, fnIx))
+  }
+  -1
 }
 
 // True if the map-typed expression at `exprIx` is a SET (`Set()`-seeded binding or
