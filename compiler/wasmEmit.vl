@@ -559,6 +559,7 @@ import {
   exprUnion,
   exprVariantIndex,
   fieldClosureFeOfRecv,
+  fieldCodeVKind,
   fieldValueFeOf,
   fnAssignRetKind,
   fnEnvIdxOf,
@@ -2974,6 +2975,15 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32) {
         if emitExpr(body, valIx, fnIx) < 0 { return -1 }
       }
 
+      // D1222 — THE CONSTRUCT HALF of the field layer's `ref.as_non_null`. A narrowed
+      // nullable ref keeps its `(ref null $H)` (the USE site recovers), so a `{f: y}` under
+      // `if y != null` put one under a `(ref $H)` field: check-clean invalid wasm at every
+      // non-null ref code. Asked through the same `nulNicheRecoverOwed` the return / binding
+      // / local- and global-assign deliveries ask, with `fieldCodeVKind` supplying the KIND
+      // this layer names by CODE. Before the widen sites, which consume the emitted ref.
+      if nulNicheRecoverOwed(fieldCodeVKind(scode), valIx, fnIx) {
+        fbRefAsNonNull()
+      }
       if scode == 5 {
         emitRefListWidenSite(
           body,
@@ -17428,6 +17438,11 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
         // then the value
         if emitExprExpect(body, a.binRight, fnIx, fwCtx) < 0 { return -1 }
       }
+      // D1222 — the STORE half of the construct-side recover in `emitObj`; the two halves of
+      // every field code have to be wired together, as the code-20 arm above records.
+      if nulNicheRecoverOwed(fieldCodeVKind(fscode), a.binRight, fnIx) {
+        fbRefAsNonNull()
+      }
       pendingListKind = 0
       pendingMapSlot = -1
       fbStructSet(sHeapIdx[si], fieldIdx) // 0xfb 0x05 <struct ht> <field index>
@@ -24124,6 +24139,12 @@ function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
     pendingListKind = 0
     pendingListSlot = 0
     pendingI64 = false
+    // D1223 — THE MAP SHAPE IS THE PARAMETER'S, NEVER THE ENCLOSING POSITION'S. A bare
+    // `Map()` self-identifies nothing and builds whatever `pendingMapSlot` names, so the
+    // ambient seed had to be cleared here and re-seeded from the callee's own parameter
+    // below; without the clear an outer destination's shape reaches an argument whose
+    // parameter is a different map (the rule the nullability seeds state at `argCtx`).
+    pendingMapSlot = -1
     // A VARIANT-typed param position (kind 8): the callee wants the CONCRETE variant
     // struct ref, but a union-valued argument (a narrowed local/param, a union-
     // returning call) is the BOX `{tag, value}`. Bridge the boundary by unboxing the
@@ -24240,6 +24261,17 @@ function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
         // the seed. Mirrors the nulstruct `pendingStructIdx` seed above.
         if vtKindOfParam(cParams[i]) == "nulmap" {
           pendingNulRefHeap = mapTypeIdxOf(paramStructIdxOf(cParams[i]))
+        }
+        // D1223 — THE `Map()` CONSTRUCTOR'S SHAPE AT THE ARGUMENT BOUNDARY, the seed the
+        // sibling deliveries all have (`emitLetDeclStmt` from the annotation, `emitAssign`'s
+        // global arm from the cell, `emitReturnValue`'s `retMap` arm from the result). Without
+        // it a bare `take(Map())` read the ambient -1 (the MONO i32 map) while the param slot
+        // is the value-typed map struct: check-clean invalid wasm for EVERY non-mono value
+        // type. Both map kinds, because a `Map()` into a `{[string]: V} | null` param builds
+        // the same struct the `nulmap` null seed above is typed against.
+        const cpMapK = vtKindOfParam(cParams[i])
+        if cpMapK == "map" || cpMapK == "nulmap" {
+          pendingMapSlot = paramStructIdxOf(cParams[i])
         }
         if vtKindOfParam(cParams[i]) == "struct" { cParamStruct = true }
         const cpvk = vtKindOfParam(cParams[i])

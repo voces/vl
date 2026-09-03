@@ -1729,9 +1729,9 @@ now behaves exactly like the value it wraps.
   `tests/cases/maps/nullable-list-valued-map.vl`;
   `tests/cases/maps/nullable-struct-list-valued-map.vl` (the fuzz case that filed the ordering
   hazard, flipped from `@emit-error` to `@run`);
-  `tests/cases/maps/error-inline-null-compare-list-value.vl` and
-  `tests/cases/maps/error-module-scope-list-value-read-bind.vl` (the two residuals, each
-  naming its own non-nullable control and the rung they share — delete them together).
+  `tests/cases/maps/module-scope-list-value-read-bind.vl` (the module-scope residual, with
+  its own non-nullable control; both halves run since [D1107](#d1107) — the inline
+  `m[k] == null` residual's fixture is gone, its rung having closed earlier).
 * **The §1 `loopvar` and `mapval` rows predate this close** and still carry the pre-fix numbers
   (`loopvar` 470/780 correct, silent 0; `mapval` 460/822, silent 0). Both understate `correct`,
   and the `loopvar` one understates SILENT by the trap cells above; re-run the sweep before
@@ -36564,11 +36564,14 @@ Repro (runs, prints `7` then `9`):
 ---
 ### D1106 — an annotated `T[] | null` return with a REF element (`P[]`, `i32[][]`, `{[string]: i32}[]`) refuses at SIX of eleven delivery positions and runs at the other five: `bare null needs a struct-typed context`
 
-**loud emit reject (`emitProgram: bare null needs a struct-typed context`) · check rc 0 ·
-clause 2 · OPEN · found 2026-09-02 on [D1062](#d1062)'s position matrix · PRE-EXISTING: the
-repro annotates the return and reproduces on the `seed-latest` master seed**
+**runs today and must keep running — CLOSED 2026-09-02 by the `nulreflist` rung the
+un-annotated arm of `globalCellKind` lacked, plus `letAnnRefListSlot`'s matching slot leg ·
+THE FILED AXIS WAS WRONG: the delivery position decides nothing, the un-annotated MODULE
+GLOBAL reading the value decides everything · was a loud emit reject (clause 2) and
+check-clean invalid wasm (clause 1) at the same binding left unread · found 2026-09-02 on
+[D1062](#d1062)'s matrix · pin: `tests/cases/globals/inferred-nullable-reflist-global.vl`**
 
-Repro (check rc 0, emit refuses):
+Repro (runs, prints `5`):
 
     type P = {a: i32}
     function f(n: i32): P[] | null {
@@ -36579,32 +36582,50 @@ Repro (check rc 0, emit refuses):
     const r = f(0)
     if r != null { print(r[0].a) }
 
-* **THE POSITION DECIDES, NOT THE ELEMENT.** The same function's value RUNS when it is
-  delivered to an ANNOTATED destination — a call ARGUMENT (`take(f(0))` with
-  `take(x: P[] | null)`), a map VALUE, a global ASSIGNMENT and a local ASSIGNMENT into a
-  `P[] | null` cell all print `5`. It refuses at the six positions where no annotation names
-  the nullable ref-list: a bare `const` binding, a `return` through a second function, a
-  struct FIELD initializer, a list ELEMENT, a global INITIALIZER, and a `.length` read.
+* **THE FILED AXIS WAS WRONG, AND ONE PROGRAM SHOWS IT.** Annotate the READ binding —
+  `const r: P[] | null = f(0)` — and every one of the six "refusing positions" runs
+  UNCHANGED on the pre-fix compiler: the `return` through a second function, the struct
+  FIELD, the list ELEMENT, the `.length` read, the global INITIALIZER. None of them was
+  ever the ingredient. The five "running positions" are the ones that happen not to route
+  the value through an un-annotated module global, and the six refusing ones are the ones
+  that do. A 216-cell matrix (9 element reps × 12 delivery positions × annotated/inferred)
+  separates them: **every** refusing cell carries an un-annotated `const r = …` at module
+  scope, and **no** cell without one refuses.
 
-* **THAT SPLIT IS THE MECHANISM'S SHAPE.** The annotated destination is what interns the
-  ref-list row, so `tyAnnRefListSlot(fn.fnRet)` resolves and `emitReturnValue`'s
-  `retNulRefArr` arm can seed `retNulRefArrHeap`; with no such destination the slot is -1, the
-  seed never lands, and the `return null` reaches `emitNullLitNode` bare. Identical at
-  `i32[][] | null` and `{[string]: i32}[] | null` — every element type whose
-  `vtKindOfType` is `nulreflist`.
+* **AND THE SAME BINDING IS CLAUSE 1 WHEN NOTHING READS IT.** Delete the `if r != null`
+  line and the loud reject becomes check-clean invalid wasm — `expected i32, found
+  (ref null $type)`, the cell's own `global.set`. The two spellings of one binding sit in
+  different clauses, which is why the loud message alone never named the mechanism.
 
-* Measured as 6 refusing of 11 positions × 3 ref element types on the matrix
-  [D1062](#d1062) records; the eight non-ref element types run at every position except the
-  map-value one ([D1107](#d1107)).
+* **THE RUNG, AS WHAT IT RECEIVED.** `globalCellKind`'s un-annotated arm carried
+  `nulclosure`, the map-read kinds, `nullist` and the four distinct-backing scalar lists —
+  and no `nulreflist`. A `const r = mk()` over `mk(): P[] | null` therefore fell to
+  `globalKind`'s i32 guess, and `exprNullableRefArray`'s global rung — which asks
+  `globalCellKind(g) == "nulreflist"` — was handed `"i32"` and answered false. The compare's
+  bare `null` then reached `emitNullLitNode` with no seed. The comment beside that global
+  rung had PREDICTED this exact disagreement and filed it; the prediction was right.
+
+* **THE SLOT IS THE SECOND HALF, and `0` is a wrong answer rather than a missing one.**
+  `letAnnRefListSlot` had an un-annotated leg for a map read only; every other kind-18
+  source returned `tyAnnRefListSlot(-1)` = `0`, which is a REAL row — the first one. Two such
+  globals in one module would share a wrapper heap while their reads produce their own. The
+  pin carries `P[]` and `Q[]` together so a slot-0 answer cannot pass.
+
+* Measured 45 cells refusing before, 9 after — and the 9 are a DIFFERENT family
+  ([D1270](#d1270)), reachable from a function-LOCAL binding too, where every cell this row
+  owns needs module scope.
 
 ---
 ### D1107 — a `{[string]: T[] | null}` MAP VALUE refuses for every SCALAR-backed list element and runs for every REF element — the inverse of [D1106](#d1106)'s split
 
-**loud emit reject (`emitProgram: bare null needs a struct-typed context`) · check rc 0 ·
-clause 2 · OPEN · found 2026-09-02 on [D1062](#d1062)'s position matrix · PRE-EXISTING: the
-repro annotates the return and reproduces on the `seed-latest` master seed**
+**runs today and must keep running — CLOSED 2026-09-02 by the map arms of the three list
+nullability classifiers reading the vals ELEMENT KIND (`mvNulListValKind`) instead of the
+value's DECLARED SPELLING · was a loud emit reject, check rc 0, clause 2 · found 2026-09-02
+on [D1062](#d1062)'s matrix · pins:
+`tests/cases/maps/module-scope-nullable-list-value-reps.vl`, and
+`tests/cases/maps/module-scope-list-value-read-bind.vl` flipped from `@emit-error`**
 
-Repro (check rc 0, emit refuses):
+Repro (runs, prints `10`):
 
     function f(n: i32): i32[] | null {
       if n == 0 { return [10, 20] }
@@ -36615,11 +36636,25 @@ Repro (check rc 0, emit refuses):
     const r = m["z"]
     if r != null { print(r[0]) }
 
-* **THE INVERSE POPULATION OF [D1106](#d1106), which is why the two are separate rows.** The
-  map-value position refuses at `i32[]`, `string[]`, `f64[]`, `boolean[]`, `i64[]` and
-  `f32[]` — the i32-backed and distinct-backing leaves — and RUNS at `P[]`, `i32[][]` and
-  `{[string]: i32}[]`, the three `nulreflist` elements D1106 refuses at six other positions.
-  A fix aimed at either row moves none of the other's cells.
+* **TWO ROWS, MEASURED IN BOTH DIRECTIONS — the complement was a coincidence of
+  populations, not one question.** Landing this row's fix moved exactly its own 6 cells and
+  left all 45 of D1106's untouched; landing D1106's fix afterwards moved 36 of those and
+  none of these. The two share a MESSAGE and a symptom and nothing else: this one is a
+  read/cell DISAGREEMENT (the cell was already `nullist`, the read denied it), D1106 is a
+  MISSING cell kind.
+
+* **THE RUNG, AS WHAT IT RECEIVED.** `mvValName` banks the value's DECLARED spelling, so a
+  `{[string]: i32[] | null}` map hands the read side the string `"i32[] | null"`.
+  `exprNullableList`'s map arm asked `nameIsI32Array` of it — false, the `| null` suffix is
+  not an array spelling — while `globalCellKind` had already typed the same binding
+  `nullist` through `letNulMapReadValKind`, which reads `rlElemKindTbl`. The
+  distinct-backing arm was worse than declining: it built `mvValName + "|null"`, a DOUBLED
+  suffix for a value already carrying one. The ref backings escaped because their global
+  rung asks the cell directly rather than the name.
+
+* **THE `| null` IS THE WHOLE INGREDIENT, ablated.** `{[string]: i32[]}` at the identical
+  module-scope read RAN before the fix; `{[string]: i32[] | null}` did not. Inside a
+  FUNCTION both ran — the local ladder asks `letNulMapReadValKind` on both sides.
 
 * At `u8[]` the same position refuses with a DIFFERENT sentence
   (`emitProgram: unsupported map value type (no rep for … a nullable list over an u8 …)`), so
@@ -38046,29 +38081,42 @@ Repro (check rc 1, with an empty message):
 ---
 ### D1222 — the struct-FIELD and field-STORE deliveries of a narrowed nullable ref are check-clean invalid wasm: they are keyed by field CODE, not by rep KIND
 
-**check-clean invalid wasm · `type mismatch: expected (ref $type), found (ref null $type)` · clause 1 ·
-OPEN · the named residue of [D1115](#d1115), measured on its own position matrix rather than
-predicted from it**
+**runs today and must keep running — CLOSED 2026-09-02 by `fieldCodeVKind`, the field
+layer's code→kind edge, feeding the same `nulNicheRecoverOwed` the other four deliveries ask
+· was check-clean invalid wasm, `type mismatch: expected (ref $type), found (ref null
+$type)`, clause 1 · the named residue of [D1115](#d1115) · THE FILED COUNT WAS 6 AND THE
+MEASURED ONE IS 21 · pin:
+`tests/cases/structs/narrowed-nullable-ref-field-delivery.vl`**
 
-Repro (check rc 0, then the engine refuses the module):
+Repro (runs, prints `7`):
 
     type Box = { f: i32[] }
     function go(y: i32[] | null, d: i32[]): Box { if y != null { return {f: y} } {f: d} }
     print(go([7], [0]).f[0])
 
-* **THE POSITION MATRIX IS WHERE IT COMES FROM, AND THE NUMBERS ARE MEASURED.** 4 reps
-  (`i32[]`, `{[string]: i32}`, `C[]`, a nullable VARIANT) x 11 delivery positions. D1115 took the
-  running count from 24 to 31 of 44 by wiring the RETURN, BINDING, local-ASSIGNMENT and
-  global-ASSIGNMENT boundaries. What is left is struct-FIELD and field-STORE at the three
-  non-variant reps — six cells, one message. (The matrix's own `map-value` cells are check
-  rejects from the generator's spelling, not from this family, and are not counted.)
+* **THE FILED SIX WERE 21, and the gap is the REPS, not the positions.** Re-run on a
+  10-rep × 11-position grid (the 4 reps D1115 used plus `string[]`, `f64[]`, `i64[]`,
+  `f32[]`, `string`, a declared struct): **21 invalid of 110**, and they are SEVEN reps —
+  `i32[]`, `{[string]: i32}`, `C[]`, `string[]`, `f64[]`, `i64[]`, `f32[]` — at THREE
+  positions. The third position is the NESTED literal (`{i: {f: y}}`), which the row's own
+  count never named; it is `emitObj` re-entered, so it was always going to move with the
+  other two, but "six cells" would not have caught it if it had not. `string`, the declared
+  struct and the variant run at all three.
 
-* **THE REASON IT WAS NOT WIRED WITH THE OTHERS IS THE KEY, NOT THE LOWERING.** Every position
-  D1115 wired names its destination by rep KIND (`localIsRef[slot]`, `globalCellKind`,
-  `retResultVKind`), so it asks `nulNicheRecoverOwed` in one line. A struct field names its
-  destination by field CODE (`sFieldTypes`), and the code-to-kind mapping is a second table with
-  its own drift risk — exactly the drift `vkNulNicheOf` was written to end. Closing this means
-  giving the field layer a kind, not adding a thirteenth code list.
+* **A REP THAT ESCAPES IS NOT A REP THAT IS WIRED.** `string` runs because
+  `emitIdentNode`'s kind-16 arm recovers a nullable string non-null at the READ, so the
+  field never sees a nullable ref; the struct and variant run through `emitArmDelivery`.
+  Neither is the field layer asking the question — they are two other layers answering it
+  first, which is why the count of running cells was not evidence about the code path.
+
+* **THE REASON IT WAS NOT WIRED WITH THE OTHERS IS THE KEY, NOT THE LOWERING, and the close
+  is the row's own prescription.** Every position D1115 wired names its destination by rep
+  KIND (`localIsRef[slot]`, `globalCellKind`, `retResultVKind`), so it asks
+  `nulNicheRecoverOwed` in one line. A struct field names its destination by field CODE
+  (`sFieldTypes`). `fieldCodeVKind` is that edge and nothing else — eleven non-null ref
+  codes to their kinds, answering `null` for every scalar, nullable and box code — so the
+  two field sites ask the SAME question through the SAME `vkNulNicheOf` table, and a rep
+  added there reaches them without a thirteenth code list.
 
 * **THE VARIANT REP ALREADY RUNS AT BOTH POSITIONS** (measured, both cells print the narrowed
   value's own payload), which is what says the recover instruction is reachable from here and
@@ -38077,11 +38125,14 @@ Repro (check rc 0, then the engine refuses the module):
 ---
 ### D1223 — a bare `Map()` ARGUMENT into a non-i32-valued map parameter builds the mono map struct: check-clean invalid wasm
 
-**check-clean invalid wasm · `type mismatch: expected (ref $type), found (ref $type)` · clause 1 ·
-OPEN · found 2026-09-02 while writing [D1115](#d1115)'s fixture, by CONSTRUCTING an argument at a
-shape the fixture had only ever passed a variable at**
+**runs today and must keep running — CLOSED 2026-09-02 by the `pendingMapSlot` seed the
+ARGUMENT boundary lacked, plus the per-argument CLEAR that keeps an enclosing destination's
+shape away from a parameter that is a different map · was check-clean invalid wasm, clause 1
+· found 2026-09-02 while writing [D1115](#d1115)'s fixture, by CONSTRUCTING an argument at a
+shape the fixture had only passed a variable at · pin:
+`tests/cases/maps/map-literal-argument-shape.vl`**
 
-Repro (check rc 0, then the engine refuses the module):
+Repro (runs, prints `0`):
 
     function take(m: {[string]: string}): i32 { m.size }
     print(take(Map()))
@@ -38103,3 +38154,54 @@ Repro (check rc 0, then the engine refuses the module):
 * **A VARIABLE ARGUMENT RUNS.** `const m: {[string]: string} = Map()` … `take(m)` compiles and
   runs — the binding boundary seeded the shape and the argument just passes the ref along. The
   ingredient is the LITERAL at the argument position, not the map type.
+
+* **MEASURED AT 14 OF 81** on a 9-value-type × 9-position grid: the direct ARGUMENT and a
+  NESTED argument (`idn(take(Map()))`), at every value type except `i32` and `boolean` —
+  which share the mono i32 rep, so the ambient default they read is already right. All
+  seven other positions ran at every value type. Its OWN FAMILY, both directions: this fix
+  moved 0 of D1106/D1107's 216 cells and 0 of D1222's 110, and neither of theirs moved any
+  of these 14.
+
+* **THE CLEAR IS PART OF THE FIX, not tidiness.** `pendingStructIdx` / `pendingListKind` /
+  `pendingListSlot` / `pendingI64` are all reset at the head of each argument for the reason
+  the `argCtx` nullability seeds state in full — an ambient seed belongs to the enclosing
+  position, and a parameter's shape is the parameter's alone. `pendingMapSlot` was the one
+  container seed not on that list.
+
+---
+### D1270 — an UN-ANNOTATED array literal whose element is a nullable CONTAINER (`[f(0)]` where `f(): i32[] | null`) builds the mono i32 list: check-clean invalid wasm
+
+**check-clean invalid wasm · `type mismatch: expected i32, found (ref null $type)` · clause 1 ·
+OPEN · found 2026-09-02 on [D1106](#d1106)'s 216-cell position matrix, as the 9 cells its close
+did not move · PRE-EXISTING: reproduces on the `seed-latest` master seed**
+
+Repro (check rc 0, then the engine refuses the module):
+
+    function f(n: i32): i32[] | null {
+      if n == 0 { return [5] }
+      return null
+    }
+    const xs = [f(0)]
+    print(xs.length)
+
+* **NOT [D1106](#d1106), AND THE ABLATION SAYS SO IN TWO DIRECTIONS.** D1106's every cell needs
+  MODULE scope — the identical lines inside a function ran throughout. This one fails at BOTH
+  scopes (`function g() { const xs = [f(0)] … }` is the same defect), and it fails at all NINE
+  element reps of that matrix where D1106 refuses at three. Landing D1106's fix moved 36 of the
+  45 refusing cells and left exactly these 9.
+
+* **THE ANNOTATION IS THE WHOLE INGREDIENT.** `const xs: (i32[] | null)[] = [f(0)]` runs at every
+  rep, at both scopes, before and after D1106. The annotation names the ref-list row; the literal
+  has to infer it from its ELEMENTS, and a call returning a nullable container is an element the
+  inference cannot name — so the literal builds the default i32 list into a cell typed from the
+  same missing answer.
+
+* **THE NICHE MUST BE A CONTAINER.** `f(): string | null` at the identical spelling RUNS — the
+  `nulstr` element has a name the inference resolves. `S | null` and `{[string]: i32} | null`
+  elements both refuse, as `i32[] | null` and `P[] | null` do, so the population is the nullable
+  LIST / REF-LIST / MAP / STRUCT niches and not the nullable rep in general.
+
+* **IT HAS A CLAUSE-2 FACE TOO, and which one you get is whether anything reads the binding.**
+  `print(xs.length)` alone is the silent form above; adding `const r = xs[0]` and `if r != null`
+  turns it into the loud `emitProgram: bare null needs a struct-typed context`. Grade both
+  spellings — a fix that only moves the loud one has moved the worse cell nowhere.
