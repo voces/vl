@@ -445,8 +445,15 @@ const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3: ShapeP
     // comparing headers rather than element arrays. Two DISTINCT headers over the same
     // backing and range no longer short-circuit and walk instead — a lost optimisation, not
     // a wrong answer, and the pool still gives one header per distinct literal.
-    O: { bytes: 1592, fns: 3, allocs: 16, indirect: 0, refEq: 1 },
-    O3: { bytes: 1513, fns: 3, allocs: 16, indirect: 0, refEq: 1 },
+    //
+    // 2026-09-03, the loop-local accumulator: `main.vl:20-26` builds its keys with
+    // `let s = ""` then `s = s + ALPHA.slice(…)` in a loop, which is exactly the shape the
+    // accumulator lowering claims, so the per-step `call $__str_concat__` becomes an inline
+    // grow-check + `array.copy` + one header. bytes 1600 -> 1650 at `-O` and 1513 -> 1546
+    // at `-O3`, with `fns`/`allocs`/`refEq` unchanged — per-instruction weight, and the
+    // trade is that the key-building loop stops being O(n^2).
+    O: { bytes: 1650, fns: 3, allocs: 16, indirect: 0, refEq: 1 },
+    O3: { bytes: 1546, fns: 3, allocs: 16, indirect: 0, refEq: 1 },
   },
   // STRING HASHING + MAP PROBE. 30M lookups over string keys built as distinct objects, so the
   // probe path is a real hash plus a real content compare rather than a pointer check. This is
