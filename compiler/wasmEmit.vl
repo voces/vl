@@ -52,6 +52,7 @@ import {
   tyIsNulValueUnionBox,
   tyLitMemberTexts,
   tyLitUnionAliasIx,
+  tyNulNumScalarValKind,
   tyNumLitMemberTexts,
   tyPrimNameOf,
   tyRenderSoftensLits,
@@ -18000,7 +18001,53 @@ function popRecvIsList(recvIx: i32, fnIx: i32) {
   exprArray(recvIx, fnIx)
 }
 
-function emitPop(body: i32[], callIx: i32, fnIx: i32) {
+// `xs.pop()` at a NUMERIC-SCALAR element rep, delivered as the `T | null` the checker
+// gives it (`mkNullableTy(rt.aElem)`): the `{tag, anyref}` value-union BOX, empty list →
+// the null tag. `vk` is the non-null member's value-atom kind (`tyNulNumScalarValKind`).
+//
+// THE SHAPE IS THE BOOLEAN ARM'S, ONE REP OUT. That arm has read `len != 0` and produced
+// the sentinel `2` on the empty branch since B6; i32 / i64 / f64 / f32 have no spare bit
+// pattern to spend on absence, so the same branch produces a null-TAGGED box and the
+// present branch boxes the popped scalar — byte for byte what `function q(): i32 | null
+// { return 3 }` already emits at every delivery position.
+//
+// WITHOUT IT `emitPop` LEFT THE RAW SCALAR under a `(ref $uBox)` destination: `vl check`
+// rc 0 and a module the engine refuses at `return` / `arg` / an annotated binding, and the
+// loud `narrowed union atom has no value box` at `print` / an inferred binding — one gap,
+// two disguises (D1174). The box types are interned by `collectU`'s own `.pop` registration
+// pass, which reads the SAME `nulNumScalarUnionName` this kind comes from.
+function emitPopNulBox(body: i32[], lIdx: i32, lTy: i32, aTy: i32, vk: i32) {
+  const vb = vbHeapIdxOfKind(vk)
+  if vb < 0 {
+    return emitFail(
+      "emitProgram: .pop yields a nullable scalar but its value box was not collected",
+    )
+  }
+  pushListLen(body, lIdx, lTy)    // cond: len != 0
+  wU8(4)                          // 0x04 if
+  fbValtype("union", -1)          // result blocktype: the union box `(ref $uBox)`
+  ctrlEnter()
+  fbI32Const(scalarTagOfKind(vk)) // the present arm's atom tag
+  fbLocalGet(lIdx)                // L.len = len - 1
+  pushListLen(body, lIdx, lTy)
+  fbI32Const(1)
+  fbI32Bin(107)                   // 0x6b i32.sub
+  fbStructSet(lTy, 1)             // field 1: len
+  pushListBacking(body, lIdx, lTy)
+  pushListLen(body, lIdx, lTy)
+  fbArrayGet(aTy)                 // backing[len] — the popped scalar
+  fbStructNew(vb)                 // the per-rep value box
+  fbStructNew(uBoxIdx)            // { tag, value }
+  fbElse()                        // 0x05 else — empty → the null-tagged box
+  fbI32Const(nullBoxTag())
+  fbRefNullNone()                 // the payload slot is unread under the null tag
+  fbStructNew(uBoxIdx)
+  fbEnd()                         // 0x0b end
+  ctrlLeave()
+  0
+}
+
+function emitPop(body: i32[], callIx: i32, fnIx: i32, nulBox: boolean) {
   const c = P.nodes[callIx]
   if c is Call {
     const callee = P.nodes[c.callFn]
@@ -18099,6 +18146,21 @@ function emitPop(body: i32[], callIx: i32, fnIx: i32) {
             fbEnd()                      // 0x0b end
             ctrlLeave()
             return 0
+          }
+          // THE THREE-AND-A-HALF REPS WITH NO NICHE, at a VALUE position (`nulBox`). The
+          // boolean arm above owns the one scalar `T | null` that fits in its own cell;
+          // i32 / i64 / f64 / f32 do not, so their `T | null` IS the shared value box and
+          // this is where it is built. A `u8[]` declines (its element is `i32` STORAGE and
+          // `tyNulNumScalarValKind` answers on the checker's `u8 | null`, which is not a
+          // numeric-scalar prim), keeping master's raw read; so does a `K[]` atom list,
+          // whose nullable rides the `-1` sentinel and whose recorded type is a litunion.
+          //
+          // THE STATEMENT CALLER PASSES `false` and keeps the raw form, because it drops
+          // the value: boxing there would allocate once per discarded pop for a value no
+          // one reads.
+          if nulBox {
+            const pnk = tyNulNumScalarValKind(nodeTyIxOf(callIx))
+            if pnk >= 0 { return emitPopNulBox(body, lIdx, lTy, aTy, pnk) }
           }
         }
         // L.len = len - 1
@@ -20797,7 +20859,7 @@ function emitCallStmt(body: i32[], s: Call, stmtIx: i32, fnIx: i32) {
     // the value it leaves on the stack.
     if callee.memProp == "pop" {
       if popRecvIsList(callee.memObj, fnIx) {
-        if emitPop(body, stmtIx, fnIx) < 0 { return -1 }
+        if emitPop(body, stmtIx, fnIx, false) < 0 { return -1 }
         fbDrop() // 0x1a drop
         return 0
       }
@@ -23233,7 +23295,7 @@ function emitCallNode(body: i32[], e: Call, exprIx: i32, fnIx: i32) {
     // `pop` is a `call_ref` member call like any other (D1087).
     if callee.memProp == "pop" {
       if popRecvIsList(callee.memObj, fnIx) {
-        return emitPop(body, exprIx, fnIx)
+        return emitPop(body, exprIx, fnIx, true)
       }
     }
     // `xs.get(i)` over a STRUCT-element ref list: the checked nullable read —
@@ -24945,14 +25007,25 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
           return emitListGetOr(body, lhsIx, e.binRight, fnIx)
         }
       }
-      // `xs.pop() ?? d` over a SCALAR-element list is the FUSED checked
-      // pop-with-default: `len != 0` selects decrement-and-read or `d`.
+      // `xs.pop() ?? d` over an i32-element list is the FUSED checked pop-with-default:
+      // `len != 0` selects decrement-and-read or `d`.
+      //
+      // GATED ON THE ONE-HOME DISCRIMINATOR, not on an exclusion list. `emitPopOr` reads
+      // `lTypeIdx` / `aTypeIdx` — the i32 list wrapper and backing — unconditionally, and
+      // `exprArray` "claims any i32-element list", which its `scalarListElemKind` neighbour
+      // spells out is TRUE of the packed `u8[]` and of the wider scalar backings too. The
+      // hand-written `!ref && !string && !f64` exclusion therefore let `i64[]`, `f32[]` and
+      // `u8[]` into a lowering that reads their wrapper through the i32 heap type: check-clean
+      // INVALID WASM at i64 / u8, and `emitPopOr`'s own `!lUsed` floor at f32 in a program
+      // whose i32 list type is never interned. `scalarListElemKind` is the discriminator every
+      // other scalar-list op selects a rep with, and "i32" is exactly the one rep this fusion
+      // serves; everything else falls through to the generic `??`, which reads the `T | null`
+      // box `emitPop` now builds.
       if lcallee.memProp == "pop" {
-        if exprArray(lcallee.memObj, fnIx) {
+        if scalarListElemKind(lcallee.memObj, fnIx) == "i32" {
           if (
             !exprRefArray(lcallee.memObj, fnIx) &&
-            !exprStringArray(lcallee.memObj, fnIx) &&
-            !exprF64Array(lcallee.memObj, fnIx)
+            !exprStringArray(lcallee.memObj, fnIx)
           ) {
             return emitPopOr(body, lhsIx, e.binRight, fnIx)
           }

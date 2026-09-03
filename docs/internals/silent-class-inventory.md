@@ -35676,11 +35676,11 @@ Repro (refuses):
 * `{ x: i32 } | null` also runs, so the ingredient is EMPTINESS plus INLINE plus NULLABLE, not
   the nullable position on its own.
 
-### D1172 — an UN-ANNOTATED `const` bound to a nullable struct-union parameter is check-clean invalid wasm, and D1083's refusal used to hide it
+### D1172 — [CLOSED 2026-09-02] an UN-ANNOTATED `const` bound to a nullable struct-union parameter is check-clean invalid wasm, and D1083's refusal used to hide it
 
-**check-clean invalid wasm · check rc 0 · clause 1 · `type mismatch: expected (ref $type), found (ref $type)` · ZERO corpus cells · found 2026-09-02 by closing D1083; verified PRE-EXISTING against the published `seed-latest`**
+**runs, prints `1` then `-1` — CLOSED 2026-09-02: a union ALIAS declared with its own `| null` now renders its arms BY NAME (`declaredStructUnionMembers`, asked from `canonEmitNameTs`'s transparent-alias arm) · was check-clean invalid wasm, clause 1 · ONE FAMILY with [D1173](#d1173) — the same edit moved both, and re-graded D1151 / D1174 did NOT move · a 14-cell delivery matrix goes 3 → 13 `runs` (7 silent + 3 loud emit rejects cleared) · zero `runs` lost, distilled corpus unmoved, rep-fuzz exact · fixture `unions/null-bearing-alias-arm-delivery.vl`**
 
-Repro (check-clean invalid wasm):
+Repro (runs, prints `1` then `-1`):
 
     type A = { k: i32, a: i32 }
     type B = { k: i32, b: i32 }
@@ -35707,11 +35707,34 @@ Repro (check-clean invalid wasm):
   defect" rule arriving from the other side: the annotation is what makes the working spelling
   work, so a fixture written with one hides this entirely.
 
-### D1173 — two null-bearing struct unions whose shared field has DIFFERENT reps are check-clean invalid wasm in one module
+* **THE MECHANISM, AS WHAT THE FAILING RUNG RECEIVED.** An `emitFail` probe at the top of
+  `emitUnionBoxArg` printed, for `g(a)`: `un=[{k:i32,a:i32}|{k:i32,b:i32}|null] svi=-1 eS=1
+  ssi=0 uavo=-1 gk=struct`. The union NAME the boundary was handed is the STRUCTURAL member
+  set, not `U` and not `A|B|null` — so every arm lookup keyed on it missed, `exprVariantIndex`
+  answered -1, and `emitUnionCoerce` raw-passed the struct. The same probe on the `type U = A |
+  B` control printed `un=[U] svi=0 gk=variant`; on the `A | B | null` INLINE param and on `U |
+  null` over a null-free `U` it printed `un=[A|B|null] svi=0`. Three spellings of one type,
+  two names, and only the one that expands structurally fails.
 
-**check-clean invalid wasm · check rc 0 · clause 1 · `type mismatch: expected (ref $type), found (ref $type)` · ZERO corpus cells · found 2026-09-02 by closing D1083; verified PRE-EXISTING against the published `seed-latest`**
+* **WHY THE ALIAS EXPANDS.** `type U = A | B | null` interns as a one-member wrapper over
+  `TyNullable(TyUnion[A,B])`, which `nulAliasMemberFaithful` calls transparent (ungated in the
+  inner, by a 1,020-cell measurement) — so `canonEmitNameTs` rendered it through
+  `transparentMemberEmitName`, whose fall-through is the STRUCTURAL renderer, and
+  `tyToEmitNameGo`'s `TyObj` arm has no nominal rung. `declaredStructUnionMembers` is the
+  answer that already existed for the OTHER door (`unionAliasMembers`, reached when the pipe is
+  in the annotation rather than in the declaration); this asks it one arm earlier.
 
-Repro (check-clean invalid wasm):
+* **THE HEADER THAT PREDICTED THIS ALSO MIS-PRICED IT.** `nulAliasMemberFaithful`'s note files
+  the declared-struct inner as *"the ONE residue … 3 axes of 17, both verdicts LOUD and never a
+  wrong answer"* and concludes *"the render's dropped struct name is filed against the emitter
+  rather than bought here"*. The fix went where that sentence said it would — but these two
+  cells are SILENT, so the grid it was priced on did not contain them.
+
+### D1173 — [CLOSED 2026-09-02] two null-bearing struct unions whose shared field has DIFFERENT reps are check-clean invalid wasm in one module
+
+**runs, prints `7` then `aa` — CLOSED 2026-09-02 by [D1172](#d1172)'s one edit, which is what makes the two ONE FAMILY · was check-clean invalid wasm, clause 1 · the ACTUAL message was `type mismatch: expected i32, found (ref $type)`, not the `(ref $type), found (ref $type)` filed here — a validator sentence read off a neighbour · zero `runs` lost, distilled corpus unmoved, rep-fuzz exact · fixture `unions/null-bearing-alias-arm-delivery.vl`**
+
+Repro (runs, prints `7` then `aa`):
 
     type A = { k: i32, a: i32 }
     type B = { k: i32, b: i32 }
@@ -35746,11 +35769,11 @@ Repro (check-clean invalid wasm):
   aborted the module. No `runs` cell is lost — these programs did not work before and do not
   work now — but the corpus fixture for D1083 is deliberately single-family because of it.
 
-### D1174 — `return xs.pop()` in VALUE position is check-clean invalid wasm at every scalar list rep
+### D1174 — [CLOSED 2026-09-02] `return xs.pop()` in VALUE position is check-clean invalid wasm at every scalar list rep
 
-**check-clean invalid wasm · check rc 0 · clause 1 · `emitProgram: narrowed union atom has no value box` at `print`, invalid wasm at `return` · ZERO corpus cells · found 2026-09-02 beside D1087; verified PRE-EXISTING against the published `seed-latest`**
+**runs, prints `5` — CLOSED 2026-09-02: `emitPop` builds the `T | null` value BOX at a value position and `collectU` interns it from the `.pop` node's own recorded type · was check-clean invalid wasm, clause 1 · a SEPARATE FAMILY from [D1172](#d1172)/[D1173](#d1173) (re-graded after their fix and unmoved) but the SAME family as [D1140](#d1140)/[D1160](#d1160), which this closes · a 72-cell rep×position matrix goes 30 → 60 `runs` with 22 silent cells cleared · zero `runs` lost, distilled corpus unmoved, rep-fuzz exact · fixture `lists/pop-value-position-nullable-scalar.vl`, probe `pop-value-position-scalar-reps.vl` (63/75 → 64/75)**
 
-Repro (check-clean invalid wasm):
+Repro (runs, prints `5`):
 
     function realPopValue() {
       const xs = [1, 5]
@@ -35767,7 +35790,35 @@ Repro (check-clean invalid wasm):
   the `f32[]` and `i64[]` spellings. So it is not a `.map`-collector question either — D1088's
   two remaining cells are this row, not that one.
 
-* `scripts/capability-probes/pop-value-position-scalar-reps.vl` is the standing probe.
+* `scripts/capability-probes/pop-value-position-scalar-reps.vl` is the standing probe, and it
+  moved `RUNS` with this close (`run.py` 63/75 → 64/75).
+
+* **THE CONTROL MATRIX IS WHAT SIZED THE FIX.** The same eight positions, fed a `T | null` from
+  a DECLARED function instead of from `.pop()`, are green at i32 / i64 / f64 / f32 / boolean /
+  string — 48 of 48. So the whole `T | null` delivery machinery already existed and exactly one
+  producer was missing: `emitPop` pushed the raw scalar under a destination that had been
+  pinned to the `{tag, anyref}` box. That is why the fix is a lowering plus a registration and
+  not a position sweep.
+
+* **TWO DISGUISES, ONE GAP.** Where the destination NAMED the union (`return`, an argument, a
+  `T | null` binding) its box types were interned and the raw scalar was check-clean invalid
+  wasm; where nothing else in the program named it (`print(xs.pop())`, an inferred binding) the
+  boxes were never interned at all and the read was the loud `narrowed union atom has no value
+  box`. `collectU` now registers the union from the `.pop` node's own recorded type, keyed
+  through the SAME `nulNumScalarUnionName` the lowering reads its kind from, so the two cannot
+  name different unions.
+
+* **THE EMPTY LIST IS THE CELL THAT GRADES THE NULL ARM**, and the fixture pops past the end at
+  every rep: `[1,5]` popped three times prints `5`, `1`, `null` and leaves `length` 0.
+
+* **THE STATEMENT POSITION KEEPS THE RAW LOWERING ON PURPOSE** — it drops the value, so boxing
+  there would allocate once per discarded pop. `emitPop` takes the destination as a parameter
+  rather than inferring it.
+
+* **PRICE, RECORDED**: two rows of [D1140](#d1140)'s grid do not reach `runs` — the nested
+  `i32[][]` inference ([D1210](#d1210)) and the `u8[]` value-type question ([D1211](#d1211)) —
+  and `.pop()` on an EMPTY ref/string list still traps ([D1212](#d1212)). All three are
+  identical on the published seed.
 
 ### D1130 — a LOCAL sharing a spelling with a function's NAME, captured by a closure, is check-clean invalid wasm — and the loop variable in the filed witness was the narrowest of six faces
 
@@ -36230,9 +36281,24 @@ Repro (runs, prints `0`):
 * Probe: `scripts/capability-probes/clear-over-scalar-list-reps.vl`.
 
 ---
-### D1140 — `.pop()` in VALUE position is check-clean invalid wasm over EVERY numeric element rep, and its four delivery spellings disagree
+### D1140 — [CLOSED 2026-09-02] `.pop()` in VALUE position is check-clean invalid wasm over EVERY numeric element rep, and its four delivery spellings disagree
 
-**check-clean invalid wasm (`type mismatch: expected (ref null $type), found i32` / `found i64` / `found f64` / `found f32`) · clause 1 · OPEN · found 2026-09-02 by the sibling audit [D1131](#d1131)'s close asked for · NOT caused by that close — verified against `git archive origin/master`, and named as a known separate limit by [D977](#d977) ("THE VALUE-USED SPELLING IS A SEPARATE, PRE-EXISTING LIMIT") without ever getting a row**
+**runs, prints `1` — CLOSED 2026-09-02 by [D1174](#d1174)'s fix, the same defect this row
+measured with a grid · this row's OWN 32-cell grid goes 11 → 26 `runs`, 15 silent cells → 1 ·
+zero `runs` lost, distilled corpus unmoved, rep-fuzz exact · fixture
+`lists/pop-value-position-nullable-scalar.vl`**
+
+* **THE FOUR DELIVERY SPELLINGS NOW AGREE** at `i32[]` / `i64[]` / `f64[]` / `f32[]`, `?? d`
+  included. `emitPopOr`'s gate excluded ref / string / f64 BY HAND and so admitted `i64[]`,
+  `f32[]` and `u8[]` into a lowering that reads the i32 wrapper and backing unconditionally;
+  it is gated on `scalarListElemKind == "i32"` now — the discriminator every other scalar-list
+  op selects a rep with — and the rest take the generic `??` over the box.
+
+* **RESIDUE, NAMED RATHER THAN SWEPT.** Two of this grid's rows do not reach `runs`: the
+  `i32[][]` row's un-annotated binding is still the one check-clean invalid-wasm cell and its
+  `!= null` / `??` spellings still refuse ([D1210](#d1210)), and the three `u8[]` cells are
+  [D1211](#d1211). Both are outside the "numeric element rep" this row's own headline names,
+  and both behave identically on the published `seed-latest`.
 
 Repro (check rc 0; the module the engine refuses to load):
 
@@ -37086,9 +37152,14 @@ Repro:
   rung does not serve, because `variantStructHeapTwinAt` declines codes 5 / 15 / 28 by design
   and the nested read needs the target row rather than the field's own code.
 
-### D1160 — DUPLICATE of [D1140](#d1140), filed 40 minutes apart by two workers on the same defect
+### D1160 — [CLOSED 2026-09-02] DUPLICATE of [D1140](#d1140), filed 40 minutes apart by two workers on the same defect
 
-**loud emit reject · check rc 0 · clause 2 · OPEN · `emitProgram: narrowed union atom has no value box` · SAME GAP as [D1140](#d1140) at a different face · graded independently ON PURPOSE, so that closing D1140 and forgetting this row reports as MOVED and names it, rather than leaving a stale copy reading as live (the D1009 / D1009-N failure) · filed 2026-09-02 while an agent was independently measuring the same gap**
+**runs, prints `2` — CLOSED 2026-09-02 by [D1174](#d1174)'s fix, together with [D1140](#d1140) ·
+was a loud emit reject, clause 2 · **the independent grading did exactly what it was filed to
+do**: this row reported MOVED in the same run as D1140, so the duplicate could not be left
+reading as live · `emitProgram: narrowed union atom has no value box` fired because nothing
+else in the program named `i32 | null`, so its box types were never interned — `collectU` now
+registers the union from the `.pop` node's own recorded type**
 
 **THE TWO FACES REALLY DO DIFFER, and that is the one thing the duplication bought.** This
 row's `print(a.pop())` is a LOUD refusal; D1140's unused `const v = xs.pop()` is check-clean
@@ -37235,13 +37306,30 @@ Repro (check rc 0; the module the engine refuses to load):
 
 ---
 
-### D1151 — a literal-union ALIAS declared AFTER an inline-spelled struct carrying the same member set is check-clean invalid wasm; moving the `type K` line to the top of the file makes the identical program run
+### D1151 — [CLOSED 2026-09-02] a literal-union ALIAS declared AFTER an inline-spelled struct carrying the same member set is check-clean invalid wasm; moving the `type K` line to the top of the file makes the identical program run
 
-**check-clean invalid wasm: `type mismatch: expected (ref $type), found (ref $type)` ·
-`vl check` rc 0 · clause 1 · OPEN · found 2026-09-02 while building [D1110](#d1110)'s fixture ·
-PRE-EXISTING: identical on the `seed-latest` master seed, before and after that close**
+**runs, prints `3` then `4` — CLOSED 2026-09-02: a pure STRING-LITERAL union alias fills ahead
+of pass 0b's source-order driver · was check-clean invalid wasm, clause 1 · an 18-cell
+order/spelling grid goes 12 → 17 `runs` · zero `runs` lost, distilled corpus unmoved, rep-fuzz
+exact · fixture `literal-unions/inline-litunion-field-alias-declared-after.vl`**
 
-Repro (check rc 0; the module the engine refuses to load):
+* **THE MECHANISM IS A DEMAND ORDER THAT HAS NO NAME TO DEMAND ON.** `annUnionInnerTy` gives an
+  inline `"a" | "b"` the arena index of a declared alias with exactly those members
+  (`litUnionAliasTyOfMembers`), and that scan can only match a FILLED alias. Pass 0b filled in
+  source order, so `type C` above `type K` minted a fresh unregistered union while the identical
+  spelling in a function signature — resolved after every declaration — adopted `K`. One
+  spelling, two arena types: the declared field coded 3 (a string ref) and the inline-shape
+  parameter 0 (the interned atom). The driver's own comment already states the rule this
+  violated — *"a field's arena type no longer depends on which declaration came first"* — and it
+  is keyed on the NAME a body mentions, which an inline member set does not carry.
+
+* **A SEPARATE FAMILY, MEASURED BOTH WAYS.** Re-graded after [D1172](#d1172)/[D1173](#d1173)'s
+  fix and after [D1174](#d1174)'s: unmoved both times, and its own fix moved neither of theirs.
+
+* The 18th grid cell is a pre-existing CHECK reject — an un-annotated `{ k: "a" }` infers
+  `k: string`, which is not assignable to `"a" | "b"` — identical on the published seed.
+
+Repro (runs, prints `3` then `4`):
 
     type C = { r: i32, k: "a" | "b" }
     function f(c: { r: i32, k: "a" | "b" }): i32 { c.r }
@@ -37570,3 +37658,107 @@ Repro:
   arms inline, and with both arms aliases, each print `x` — so the gap is specific to a field
   the unification promoted, and did not exist before D1050 closed (before it, the whole
   program was D1050's own refusal).
+### D1210 — an UN-ANNOTATED binding of a NESTED-list `.pop()` is check-clean invalid wasm, and its `!= null` / `??` spellings are loud — the one rep [D1174](#d1174)'s box does not reach
+
+**check-clean invalid wasm (`type mismatch: expected i32, found (ref $type)`) · check rc 0 ·
+clause 1 · OPEN · found 2026-09-02 as the named RESIDUE of [D1140](#d1140)'s grid, and
+PRE-EXISTING: byte-identical on the published `seed-latest`**
+
+Repro (check rc 0; the module the engine refuses to load):
+
+    const xs: i32[][] = [[1], [2]]
+    const v = xs.pop()
+    print(xs.length)
+
+* **THE ANNOTATED SPELLING RUNS, AND IT IS THE CONTROL THAT NAMES THE GAP.**
+  `const v: i32[] | null = xs.pop()` prints `1`, and so does the same value delivered from a
+  declared function (`function src(): i32[] | null` + `const v = src()`). So the DELIVERY of a
+  nullable list exists at every position; what is missing is the INFERENCE that a `.pop()` over
+  a ref-element list yields one.
+
+* **THE MECHANISM IS ONE MISSING CALLEE FORM.** `exprNullableList`'s `Call` arm resolves an
+  `Ident` callee through `fnIndexOfSid` and a closure value through `calleeRetKindSid`; a
+  MEMBER callee (`xs.pop()`) reaches neither, so the un-annotated binding falls to the i32-list
+  default and the cell is declared `i32` while the pop pushes a `(ref $listWrapper)`. The
+  `nulreflist` / `nulstrlist` siblings have the same hole (`string[][]`'s pop refuses with
+  `bare null needs a struct-typed context` at the `!= null`).
+
+* **NOT THE SAME FAMILY AS [D1174](#d1174), which closed the four NUMERIC reps.** That fix
+  builds the `{tag, anyref}` value box, which is the rep a `T | null` has only when `T` has no
+  niche of its own; a LIST already reps as a nullable wrapper ref, so it needs the inference
+  arm and not the box. Measured: D1174's fix moved 22 silent cells of D1140's grid and left
+  this one exactly where it was.
+
+* Three cells: the un-annotated binding (silent), `if v != null` over it (loud
+  `bare null needs a struct-typed context`), and `xs.pop() ?? [0]` (loud
+  `` `??` over this nullable value is not supported ``).
+
+---
+### D1211 — `u8[].pop()` in value position refuses at three of four delivery spellings, and the annotated one is a DESIGN reject
+
+**loud emit reject (`emitProgram: bare null needs a struct-typed context` / `` `??` over this
+nullable value is not supported ``) · check rc 0 · clause 2 · OPEN · found 2026-09-02 as the
+named RESIDUE of [D1140](#d1140)'s grid, and PRE-EXISTING: identical on the published
+`seed-latest`**
+
+Repro (check rc 0; the emitter refuses):
+
+    const xs: u8[] = [1, 2]
+    const v = xs.pop()
+    if v != null { print(1) } else { print(0) }
+
+* **THE BOUND-AND-UNUSED SPELLING RUNS AND SO DOES `print(xs.pop())`** — `emitPop` leaves the
+  raw i32 the packed backing widens to, which prints. Only the two spellings that must
+  distinguish an empty pop from a stored `0` refuse.
+
+* **`const v: u8 | null = …` IS A CHECK REJECT BY DESIGN and stays one**: *"`u8` is a storage
+  type, not a value type — it may be an array element (`u8[]`), but a local, parameter, return,
+  field, map value or generic argument is a value, and values are `i32`"*. So the QUESTION this
+  row asks is what `u8[].pop()` denotes: under that rule its value type is `i32 | null`, which
+  is exactly the rep [D1174](#d1174) built — and wiring `u8[]` to it is one arm in
+  `tyNulNumScalarValKind`'s caller plus a `array.get_u` read, not a new lowering.
+
+* **WHY [D1174](#d1174) DECLINED IT RATHER THAN GUESSING.** That fix keys the box on the
+  CHECKER's recorded type for the `.pop()` node, and the checker records `u8 | null`
+  (`mkNullableTy(rt.aElem)` over the storage element). Boxing on a `u8` inner would be the
+  emitter deciding a value-type question the checker has not; the honest fix is for `.pop()`
+  over a `u8[]` to be typed `i32 | null` in `typecheck.vl`, and that is a checker change with
+  its own witness.
+
+---
+### D1212 — `.pop()` on an EMPTY ref- or string-element list TRAPS where the type says `null`
+
+**loads then traps (`wasm trap: out of bounds array access`) · check rc 0 · clause 1 · OPEN ·
+found 2026-09-02 beside [D1174](#d1174), and PRE-EXISTING: identical on the published
+`seed-latest`**
+
+Repro (loads, then traps — it prints nothing and dies):
+
+    const xs: string[] = []
+    print(xs.pop())
+
+* **EVERY OTHER REP ANSWERS `null`.** `i32[]`, `i64[]`, `f64[]`, `f32[]` and `boolean[]` all
+  print `null` for the same program (the first four since [D1174](#d1174), the last since B6's
+  sentinel arm). A STRUCT-element list traps identically to the string one
+  (`const xs: S[] = []` + `xs.pop()`), so this is the ref family, not the string rep.
+
+* **THE MECHANISM IS THE UNCHECKED READ PLUS `ref.as_non_null`.** `emitPop`'s ref/string arm
+  decrements the length and reads `backing[len]` with no `len != 0` test, so an empty list
+  indexes `-1` and `array.get` traps before the `ref.as_non_null` is reached. The boolean arm
+  has had the `len != 0` branch since B6 and the numeric arms have it now; these two do not.
+
+* **THE FIX IS THE SAME BRANCH WITH A `ref.null` ELSE ARM, and its price is the reason it is
+  filed rather than taken here**: the arm currently ends `ref.as_non_null`, so consumers of a
+  ref pop are typed NON-null today. Making the empty case answer `null` means the value's rep
+  becomes `(ref null $heap)` and every consumer position has to be re-graded — the position
+  matrix in `lists/pop-value-position-nullable-scalar.vl`, one rep over. A guard that traps
+  LOUDLY instead is not a close: the program is legal and `null` is the answer the type gives.
+
+* **THIS ROW CANNOT CARRY A CAPABILITY PROBE, and that is a fact about the runner.**
+  `scripts/capability-probes/run.py` classifies any `wasm backtrace` in the output as
+  `COMPILER TRAP (check rc 0)` — it runs `vl run`, which compiles and executes in one process,
+  so it cannot tell the COMPILER trapping from the PROGRAM trapping. A probe filed here would
+  read as "the compiler died", which is the opposite of what happens: the module builds, loads,
+  and the trap is at run time. `check-filed-witnesses.py` grades it correctly (`trap_loads`, a
+  state its vocabulary has precisely because D19 was mis-read the same way), so THIS row is the
+  instrument until the runner learns the difference.
