@@ -273,8 +273,9 @@ function drwIsMapRead(ix: i32) {
   false
 }
 
-// Does EVERY instantiation of the enclosing generic resolve `prop` as a FIELD of the
-// receiver — so field precedence, not UFCS, is what this member call means?
+// Does ANY instantiation of the enclosing generic resolve `prop` as a FIELD of the
+// receiver — so the answer differs per instance and this member call is not one rewrite's
+// to make?
 //
 // THE DISPATCH REWRITE RUNS BEFORE MONOMORPHIZATION (the pass table's
 // `monomorphize > dispatchRewrite` edge, so a rewritten call instantiates per receiver
@@ -291,20 +292,25 @@ function drwIsMapRead(ix: i32) {
 // call to the FIELD-CLOSURE lowering, which resolves per FUNCTION (`exprIsClosure(…, fnIx)`)
 // and is therefore already right at every instance.
 //
-// UNANIMITY IS REQUIRED, and that bound is deliberate. Where the instantiations DISAGREE —
-// one receiver carrying the field, another taking the `self`-function — no single AST can
-// serve both, because `monoCloneBody` SHARES every leaf expression between instances (only
-// the statement spine is rebuilt). Declining unanimity keeps today's behaviour for that
-// shape rather than trading one instance's miscompile for the other's: `emitCall`'s
-// unrewritten-member fallback covers the UFCS side in expression position but NOT in the
-// tail-statement position (`emitProgram: unsupported member-call statement`) nor in the
-// classifier-driven ones (a `const s = x.m()` local takes the i32 default — measured, and
-// invalid wasm). The mixed shape stays filed rather than half-fixed.
+// UNANIMITY USED TO BE REQUIRED, and D1063 was that bound's price: where the instantiations
+// DISAGREE — one receiver carrying the field, another taking the `self`-function — no single
+// AST can serve both, because `monoCloneBody` SHARES every leaf expression between instances
+// (only the statement spine is rebuilt). Deferring anyway left the UFCS side unrewritten at
+// emit, where `emitCall`'s member fallback covers expression position and nothing covers the
+// tail statement (`emitProgram: unsupported member-call statement`) or the classifier-driven
+// positions (a `const s = x.m()` local took the i32 default — measured, and invalid wasm).
+//
+// SO THE DEFERRED QUESTION IS ANSWERED WHERE THE PIN EXISTS, and that is why "any" is now
+// enough: `monoPinBinOps`' member-call arm re-runs the rewrite PER INSTANCE off the pinned
+// receiver type, so the disagreeing instances get different ASTs and each downstream
+// classifier still sees the plain named call the pre-mono rewrite gave it. Measured over a
+// 70-cell position matrix (10 receiver shapes x 7 positions): the mixed shape moved from 7
+// check-clean invalid-wasm cells to 7 running, with zero controls lost.
 //
 // Declines (false) on anything it cannot classify exactly: a receiver that is not the bare
 // parameter, a generic reached by UFCS rather than by name, a call site that does not reach
 // the position, and a generic with no call site at all — each keeps the existing rewrite.
-function drwEveryInstanceTakesField(recvIx: i32, prop: string, ctx: i32) {
+function drwAnyInstanceTakesField(recvIx: i32, prop: string, ctx: i32) {
   if ctx < 0 { return false }
   // ORDERED BY COST, and the order is load-bearing. `tyHasTyVar` fans out over a union's
   // members and an object's fields to depth 12 with no memo, so on a recursive `Node`-shaped
@@ -347,10 +353,9 @@ function drwEveryInstanceTakesField(recvIx: i32, prop: string, ctx: i32) {
           if ce is Ident {
             if ce.identName == gname {
               if pi >= nd.callArgs.length { return false }
-              if tyFieldTyOf(nodeTyIxOf(nd.callArgs[pi]), prop) < 0 {
-                return false
+              if tyFieldTyOf(nodeTyIxOf(nd.callArgs[pi]), prop) >= 0 {
+                seen = seen + 1
               }
-              seen = seen + 1
             }
           }
         }
@@ -438,10 +443,10 @@ function drwWalk(ix: i32, ctx: i32) {
           if drwSelfFnOf(uName, args.length + 1) >= 0 {
             // A TYPE-PARAMETER receiver has no struct row YET, and `si < 0` is the arm
             // that reads that as "no field, so UFCS". It is not the same fact — see
-            // `drwEveryInstanceTakesField`. Asked LAST, after the `self`-function has
+            // `drwAnyInstanceTakesField`. Asked LAST, after the `self`-function has
             // actually matched: the predicate walks the arena and then the node table,
             // and every `.push` / `.slice` receiver in a real program reaches this arm.
-            if !drwEveryInstanceTakesField(callee.memObj, callee.memProp, ctx) {
+            if !drwAnyInstanceTakesField(callee.memObj, callee.memProp, ctx) {
               ufcs = true
             }
           }

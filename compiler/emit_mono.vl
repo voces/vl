@@ -46,6 +46,7 @@ import {
   recordClonedNodeTy,
   substTyDeep,
   tyExcludesNull,
+  tyFieldTyOf,
   tyHasTyVar,
   tyIsLitUnionArray,
   tyRenderSoftensLits,
@@ -80,6 +81,7 @@ import {
   UnionDecl,
   WhileStmt,
   annTsOf,
+  hasNamedArgs,
   i32ToStr,
   mkArrayLit,
   mkAsExpr,
@@ -108,7 +110,9 @@ import {
   mkReturn,
   mkUnary,
   mkWhile,
+  nodeChildren,
   tsMentionsAnyName,
+  ufcsAliasAtSite,
 } from "./ast"
 import { PIN_SIGKEY } from "./ast"
 // R4 writers 5-8 of 8 live in this file: monomorphization rewrites a call's callee
@@ -1966,6 +1970,24 @@ function monoNoteLamNode(xs: i32[], v: i32) {
   0
 }
 
+// D1116 — THE LIFTED SLOTS MINTED WHILE WALKING ONE LAMBDA'S BODY BELONG TO THAT LAMBDA'S
+// CLONE, not to the enclosing instance. `monoMakeInstance` re-points every slot still standing
+// in `monoLamMintedSlots` at the instance function, which is right for a lambda bound directly
+// in the instance body and wrong one frame down: a nested clone's free names resolve up the
+// chain THROUGH the lambda that encloses it, and `captureValKind` types an env field by that
+// chain. Re-point the run from `mark` on, then retire each entry (-1, which the instance loop
+// already skips) so the outer pass cannot undo it.
+function monoReparentNestedLams(mark: i32, parentSlot: i32) {
+  let k = mark
+  while k < monoLamMintedSlots.length {
+    const s = monoLamMintedSlots[k]
+    if s >= 0 && s < fnParent.length { fnParent[s] = parentSlot }
+    monoLamMintedSlots[k] = -1
+    k = k + 1
+  }
+  0
+}
+
 // The lexical frame a lifted function's slot records (`fnParent`), found from its arena node.
 // -1 when the node holds no lifted slot, which is the value `collectFns` itself pushes for a
 // module-scope lift.
@@ -2058,7 +2080,18 @@ function monoCloneLambdaSubst(
         if captureCountOf(feC) > 0 { capOnly = true }
       }
     }
+    // D1220 — A BODY SPELLING IS THE THIRD REASON TO CLONE, and the two above only read the
+    // signature. `() => gv is T` takes no parameter, annotates no return and captures
+    // nothing, so both rungs above answer no — while `monoFoldTyParamLayout` below has an
+    // `is T` to substitute. Sharing one body across instances then answers the FIRST pin's
+    // spelling at every pin: silently wrong, not invalid wasm. This is the same question
+    // `monoLamNodeIsTemplate`'s fourth rung asks, and the two must agree or the prune stubs
+    // a template no clone replaced.
+    let bodyTP = false
     if !any && !capOnly {
+      if monoNodeNamesTyParam(a.fnBody, typarams) { bodyTP = true }
+    }
+    if !any && !capOnly && !bodyTP {
       monoNoteLamNode(monoLamShared, fnIx)
       return -1
     }
@@ -2109,7 +2142,19 @@ function monoCloneLambdaSubst(
     // a SPELLING the body carries rather than a type anything re-derives. Substituted through
     // the same copy-on-write walker the enclosing instance body uses, so a lambda with no
     // type-parameter spelling in it returns the SAME node index and keeps sharing.
-    const nbody = monoFoldTyParamLayout(a.fnBody, typarams, tvN, tvV)
+    const nbodyF = monoFoldTyParamLayout(a.fnBody, typarams, tvN, tvV)
+    // D1116 — A LAMBDA NESTED INSIDE THIS ONE IS A TEMPLATE TOO, and `monoPinBodyLambdas`
+    // walks only the INSTANCE body's spine, which reaches `const g = …` and stops at its
+    // FuncDecl. `const g = () => { const h = () => v; h() }` therefore minted a fresh slot for
+    // `g` per instance and left `h` on the one lifted slot every instance shares — D943's env
+    // defect exactly, one frame down: at `T := i32` `h`'s env is `(struct (field i32))` and the
+    // `T := string` instance emits `struct.new` of a string ref into it.
+    //
+    // Recursing here rather than teaching `monoPinBodyLambdas` a FuncDecl-initializer arm is
+    // what keeps the two facts a clone owns together: the body substitution above and the
+    // frame the nested clones hang off (`monoReparentNestedLams`, below the push).
+    const mark = monoLamMintedSlots.length
+    const nbody = monoPinBodyLambdas(nbodyF, typarams, tvN, tvV, bN, bT)
     const clone = mkFunc(nm, noTP, ps, nret, nbody, a.pos)
     // D1046 — THE FIRST INSTANCE OF A NAMED NESTED FUNCTION REPLACES THE TEMPLATE'S
     // SLOT rather than pushing beside it. See `monoInstIsFirst`: the by-name lookup
@@ -2123,6 +2168,7 @@ function monoCloneLambdaSubst(
         fnStmts[tSlot] = clone
         monoNamedTmplNode.push(fnIx)
         monoNamedTmplSlot.push(tSlot)
+        monoReparentNestedLams(mark, tSlot)
         fnValUsed = true
         monoNoteLamNode(monoLamPinned, fnIx)
         return clone
@@ -2135,7 +2181,9 @@ function monoCloneLambdaSubst(
     // `.map` callback is rebuilt from an ARGUMENT position, not from a lifted slot that has
     // a frame of its own.)
     fnParent.push(monoLamParentOf(fnIx))
-    monoLamMintedSlots.push(fnStmts.length - 1)
+    const mySlot = fnStmts.length - 1
+    monoReparentNestedLams(mark, mySlot)
+    monoLamMintedSlots.push(mySlot)
     fnDispNames.push("")
     fnValUsed = true
     monoNoteLamNode(monoLamPinned, fnIx)
@@ -2322,6 +2370,37 @@ function monoEnclosingTyParams(fe: i32, out: string[]) {
 // WITHOUT THIS THE SUBSTITUTION BUYS NOTHING, because the template is emitted whether or not
 // an instance exists: a generic that is never CALLED still has its lambda lifted, and
 // `checkParams` reaches the slot directly. The two rungs are one landing.
+// Does the subtree at `ix` carry a SPELLING that `monoFoldTyParamLayout` substitutes — an `is`
+// whose check type mentions a type parameter, or a `T.field` layout constant? These are the
+// two places a type parameter reaches the emitter as source text rather than as an operand
+// type the emitter re-derives, so they are exactly the body facts that make one lifted lambda
+// wrong at every pin but the first.
+//
+// Walked through `nodeChildren` rather than a second copy of the fold's arm ladder: the two
+// would drift, and the generic walker already covers a nested `FuncDecl`'s parameters, return
+// annotation and body, which is the shape this has to see through.
+function monoNodeNamesTyParam(ix: i32, typarams: string[]) {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  if typarams.length == 0 { return false }
+  const n = P.nodes[ix]
+  if n is IsExpr {
+    if monoAnnHasTyParam(n.isVariant, typarams) { return true }
+  }
+  if n is Member {
+    const mo = P.nodes[n.memObj]
+    if mo is Ident {
+      if monoTyParamOf(mo.identName, typarams) != "" { return true }
+    }
+  }
+  const kids = nodeChildren(ix)
+  let i = 0
+  while i < kids.length {
+    if monoNodeNamesTyParam(kids[i], typarams) { return true }
+    i = i + 1
+  }
+  false
+}
+
 function monoLamNodeIsTemplate(fnIx: i32, typarams: string[]) {
   if typarams.length == 0 { return false }
   const fn = P.nodes[fnIx]
@@ -2363,6 +2442,14 @@ function monoLamNodeIsTemplate(fnIx: i32, typarams: string[]) {
     if feIx >= 0 {
       if captureCountOf(feIx) > 0 { return true }
     }
+    // D1220 — THE FOURTH RUNG: A TYPE PARAMETER NAMED IN THE BODY. The three above read the
+    // written signature and the capture count, and a lambda can mention `T` in none of them:
+    // `() => gv is T` has no parameters, an inferred return and no captures. Its only mention
+    // of `T` is the `is` SPELLING, which `monoFoldTyParamLayout` substitutes per pin — so one
+    // shared body answers the first instantiation's spelling at every instantiation and the
+    // program is check-clean SILENTLY WRONG. Broad in the direction D943 argued for: an extra
+    // clone is a correct clone, only larger.
+    if monoNodeNamesTyParam(fn.fnBody, typarams) { return true }
   }
   false
 }
@@ -3130,6 +3217,57 @@ function monoPinBinOps(ix: i32, pNames: string[], pTys: i32[]) {
       nargs.push(ca2)
       if ca2 != n.callArgs[ai] { changed = true }
       ai = ai + 1
+    }
+    // D1063 — `drwWalk`'s MEMBER-CALL arm, re-run over ONE instance body with the pin in
+    // hand, exactly as the `BinExpr` arm above re-runs its two.
+    //
+    // `dispatchRewrite` runs BEFORE monomorphization, so it meets `x.tag()` while `x` is
+    // still a type parameter and has to answer for every instance at once. Where the
+    // instantiations DISAGREE — one receiver carrying a callable field of that name, another
+    // taking the free `self`-function — no single answer is right, and
+    // `drwAnyInstanceTakesField` DEFERS. This is where the deferred question is answered,
+    // per instance, off the pin the instance was built from.
+    //
+    // FIELD FIRST, which is the checker's own precedence and the same predicate
+    // `drwAnyInstanceTakesField` asks of the call-site argument types (`tyFieldTyOf`): a
+    // callable field wins and the member call stays, so `exprIsClosure` lowers it as a
+    // `call_ref` per function. Otherwise the free `self`-function answers and the call is
+    // rebuilt as the plain direct call every downstream classifier — local kind, print
+    // routing, string detection — already understands. That is what the pre-mono rewrite was
+    // for; doing it here rather than there is what makes it per-instance.
+    //
+    // COPY-ON-WRITE like every rung in this walker: an instance whose receiver takes the
+    // field, or a body with no such call, returns the SAME node index and shares the arena.
+    const pcallee = P.nodes[n.callFn]
+    if pcallee is Member {
+      const precvTy = monoPinnedOperandTy(pcallee.memObj, pNames, pTys)
+      if precvTy >= 0 && tyFieldTyOf(precvTy, pcallee.memProp) < 0 {
+        // The site's own alias, not the plain property: the module merge mangles a free
+        // `self`-function and leaves the call's property plain, and `ix` is the node the
+        // merge walk banked its answer on.
+        const puName = ufcsAliasAtSite(ix, pcallee.memProp)
+        if drwSelfFnOf(puName, nargs.length + 1) >= 0 {
+          const puArgs: i32[] = []
+          puArgs.push(pcallee.memObj)
+          let pu = 0
+          while pu < nargs.length {
+            puArgs.push(nargs[pu])
+            pu = pu + 1
+          }
+          // The injected receiver is an UNNAMED slot-0 positional; an all-positional call
+          // keeps its empty name list so `hasNamedArgs` stays false downstream.
+          const puNames: string[] = []
+          if hasNamedArgs(n.callArgNames) {
+            puNames.push("")
+            let pn = 0
+            while pn < n.callArgNames.length {
+              puNames.push(n.callArgNames[pn])
+              pn = pn + 1
+            }
+          }
+          return mkCallN(mkIdent(puName, -1), puArgs, puNames, n.pos)
+        }
+      }
     }
     if !changed { return ix }
     return mkCallN(cf, nargs, n.callArgNames, n.pos)
