@@ -207,18 +207,28 @@ let cliFileFixed = 0   // 1 once the current file's fixes were applied — so
 // phases run inside the existing per-file check loop — `cliBeginCheck` restages
 // from the in-memory source and every dependency is already cached, so a trial
 // costs one compile and no host read.
-const FIXP_OFF = 0         // not verifying: the report path
-const FIXP_ALL = 1         // trial = every computed edit at once (the fast path)
-const FIXP_BASE = 2        // trial = the ORIGINAL source (did it build before?)
-const FIXP_ONE = 3         // trial = the accepted set plus edit `cliFixTrial`
+const FIXP_OFF = 0                // not verifying: the report path
+const FIXP_ALL = 1                // trial = every computed edit at once (the fast path)
+const FIXP_BASE = 2               // trial = the ORIGINAL source (did it build before?)
+const FIXP_ONE = 3                // trial = the accepted set plus edit `cliFixTrial`
 let cliFixPhase = 0
-let cliFixTrial = 0        // index under trial in FIXP_ONE
-let cliFixOrig = ""        // the file's source before any edit
-let cliFixPassRc = 0       // compileSrc's rc for the trial just run
+let cliFixTrial = 0               // index under trial in FIXP_ONE
+let cliFixOrig = ""               // the file's source before any edit
+let cliFixPassRc = 0              // compileSrc's rc for the trial just run
 let cliFixEditPos: i32[] = []
 let cliFixEditLen: i32[] = []
 let cliFixEditTxt: string[] = []
-let cliFixKeep: i32[] = [] // 1 = this edit is in the current candidate
+let cliFixEditWhat: string[] = [] // the lint/hint the edit came from, for the report
+let cliFixEditLine: i32[] = []
+let cliFixEditCol: i32[] = []
+let cliFixKeep: i32[] = []        // 1 = this edit is in the current candidate
+// One row per edit verify-and-revert DECLINED, drained into an `info` diagnostic by
+// the report pass. A declined edit is a site where the finding that OFFERED it is
+// wrong, and a count alone cannot be worked on — this is the standing worklist of
+// annotations inference cannot yet do without (D1091).
+let cliFixDeclinedAt: string[] = []
+let cliFixDeclinedLine: i32[] = []
+let cliFixDeclinedCol: i32[] = []
 // ── `vl test` (cliCmd == 2) ────────────────────────────────────────────────────
 // Flags.
 let cliTestFilter = "" // -t <substring>: keep tests whose scope-path contains it
@@ -393,7 +403,13 @@ export function cliArgReset() {
   cliFixEditPos = []
   cliFixEditLen = []
   cliFixEditTxt = []
+  cliFixEditWhat = []
+  cliFixEditLine = []
+  cliFixEditCol = []
   cliFixKeep = []
+  cliFixDeclinedAt = []
+  cliFixDeclinedLine = []
+  cliFixDeclinedCol = []
   cliDirNames = []
   cliDirIsDirs = []
   cliDirNameAcc = []
@@ -1113,6 +1129,25 @@ function cliCheckCurFileRest() {
     )
     k = k + 1
   }
+  // `--fix` DECLINED an edit here (an `info`): applying it stopped the file
+  // building, so the diagnostic that offered it is wrong about this site. Reported
+  // per SITE, not as a count, because a count cannot be worked on — this list is
+  // the standing worklist of annotations inference cannot yet do without (D1091).
+  let fd = 0
+  while fd < cliFixDeclinedAt.length {
+    cliAddDiag(
+      "info",
+      "fix-declined",
+      cliFixDeclinedLine[fd],
+      cliFixDeclinedCol[fd],
+      cliFixDeclinedCol[fd] + 1,
+      "`--fix` left this alone: applying the " +
+        cliFixDeclinedAt[fd] +
+        " fix stops this file building, so the finding that offers it is wrong here",
+      0,
+    )
+    fd = fd + 1
+  }
   // Redundant explicit type annotations (a `hint`): `let x: T = e` where the
   // initializer already infers to exactly `T`. Entry module only (`redunModuleAt
   // == 0`) — a graph compile merges every module's AST, but only the entry's
@@ -1667,7 +1702,13 @@ function cliStartFile() {
   cliFixEditPos = []
   cliFixEditLen = []
   cliFixEditTxt = []
+  cliFixEditWhat = []
+  cliFixEditLine = []
+  cliFixEditCol = []
   cliFixKeep = []
+  cliFixDeclinedAt = []
+  cliFixDeclinedLine = []
+  cliFixDeclinedCol = []
   // Already read this run as another file's dependency? Check it straight from
   // the cache — no host round-trip. A cached miss (found = 0) falls through to
   // a real read: the not-found path differs by target kind (see ST_CHECK_READ).
@@ -1734,6 +1775,9 @@ function cliCollectFixes(src: string) {
   cliFixEditPos = []
   cliFixEditLen = []
   cliFixEditTxt = []
+  cliFixEditWhat = []
+  cliFixEditLine = []
+  cliFixEditCol = []
   const n = cliLintCount()
   // The absolute offset where each 0-based line begins.
   const starts = [0]
@@ -1745,6 +1789,9 @@ function cliCollectFixes(src: string) {
   const pos = cliFixEditPos
   const len = cliFixEditLen
   const txt = cliFixEditTxt
+  const what = cliFixEditWhat
+  const eln = cliFixEditLine
+  const ecl = cliFixEditCol
   let k = 0
   while k < n {
     const code = cliLintCodeAt(k)
@@ -1765,6 +1812,9 @@ function cliCollectFixes(src: string) {
           pos.push(off)
           len.push(3)
           txt.push("const")
+          what.push("prefer-const")
+          eln.push(ln + 1)
+          ecl.push(col)
         }
       }
     }
@@ -1791,6 +1841,9 @@ function cliCollectFixes(src: string) {
           pos.push(so)
           len.push(eo - so)
           txt.push(" ")
+          what.push("redundant type annotation")
+          eln.push(sl + 1)
+          ecl.push(redunSColAt(rk))
         }
       }
     }
@@ -1804,16 +1857,25 @@ function cliCollectFixes(src: string) {
     const kp = pos[a]
     const kl = len[a]
     const kt = txt[a]
+    const kw = what[a]
+    const kln = eln[a]
+    const kcl = ecl[a]
     let b = a - 1
     while b >= 0 && pos[b] > kp {
       pos[b + 1] = pos[b]
       len[b + 1] = len[b]
       txt[b + 1] = txt[b]
+      what[b + 1] = what[b]
+      eln[b + 1] = eln[b]
+      ecl[b + 1] = ecl[b]
       b = b - 1
     }
     pos[b + 1] = kp
     len[b + 1] = kl
     txt[b + 1] = kt
+    what[b + 1] = kw
+    eln[b + 1] = kln
+    ecl[b + 1] = kcl
     a = a + 1
   }
   0
@@ -1899,9 +1961,18 @@ function cliFixVerdict(ok: i32) {
 // result to the report path — writing the file only when it actually changed.
 function cliFixCommit() {
   let kept = 0
+  cliFixDeclinedAt = []
+  cliFixDeclinedLine = []
+  cliFixDeclinedCol = []
   let ki = 0
   while ki < cliFixKeep.length {
-    if cliFixKeep[ki] != 0 { kept = kept + 1 }
+    if cliFixKeep[ki] != 0 {
+      kept = kept + 1
+    } else if ki < cliFixEditWhat.length {
+      cliFixDeclinedAt.push(cliFixEditWhat[ki])
+      cliFixDeclinedLine.push(cliFixEditLine[ki])
+      cliFixDeclinedCol.push(cliFixEditCol[ki])
+    }
     ki = ki + 1
   }
   cliFixCount = cliFixCount + kept
