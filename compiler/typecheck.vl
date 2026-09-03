@@ -14694,6 +14694,47 @@ export function nodeScalarBaseIs(ix: i32, nm: PrimName): boolean {
   tyScalarBasePrim(nodeTyIxOf(ix)) == nm
 }
 
+// The value-atom KIND (`valueAtomKind`'s code) of the non-null member of a `<numeric
+// scalar> | null` arena type — `0` i32, `3` i64, `4` f64, `5` f32 — else -1.
+//
+// THE FOUR REPS THAT HAVE NO NICHE, and the reason this is EXACT rather than peeling.
+// `boolean | null` rides the i32 sentinel `2`, `string | null` a `ref.null`, a litunion
+// niche the sentinel `-1`, and a struct/variant its own nullable ref; each of those is a
+// bare cell, not the `{tag, anyref}` box. Only these four have every bit pattern taken by
+// a real value, so `i32 | null` IS the box — which is what `function q(): i32 | null`
+// already emits at every position. `tyScalarBasePrim` would be the wrong instrument here:
+// it peels a literal union to its base, so `("a"|"b") | null` would answer `string` and a
+// caller would box a value whose rep is the atom niche. A plain `TyPrim` inner, and
+// nothing else.
+export function tyNulNumScalarValKind(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyNullable {
+    const ii = t.nInner
+    if ii < 0 { return -1 }
+    const it = T.tys[ii]
+    if it is TyPrim {
+      if it.primName == "i32" { return 0 }
+      if it.primName == "i64" { return 3 }
+      if it.primName == "f64" { return 4 }
+      if it.primName == "f32" { return 5 }
+    }
+  }
+  -1
+}
+
+// The pipe-joined UNION NAME the four kinds above register under (`registerValueUnionName`
+// keys on the member-set spelling), or "" for every other type. One home, so the collect
+// pass's registration and the emitter's box lowering cannot name two different unions.
+export function nulNumScalarUnionName(ty: i32): string {
+  const k = tyNulNumScalarValKind(ty)
+  if k == 0 { return "i32|null" }
+  if k == 3 { return "i64|null" }
+  if k == 4 { return "f64|null" }
+  if k == 5 { return "f32|null" }
+  ""
+}
+
 // The base numeric scalar node `ix`'s recorded type reps as, or "" — `tyNumScalarBaseName`
 // as the node query the emitter asks (it holds nodes, not arena indices, and reads every
 // other type fact of an `is` receiver through a wrapper of exactly this shape).
@@ -15425,6 +15466,35 @@ function canonEmitNameTs(name: string, ctx: i32, root: i32) {
   // which is the whole reason this arm can render AT `ctx` instead of at `RC_ROOT`.
   const smt = singleMemberAliasTyIx(name)
   if smt >= 0 {
+    // A DECLARED UNION OF DECLARED STRUCTS RENDERS AS ITS MEMBER SPELLINGS, never as their
+    // shapes — `declaredStructUnionMembers`, asked HERE as well as from `unionAliasMembers`.
+    // The two routes reach the same alias by different doors: a `Shape | null` ANNOTATION
+    // splits on the pipe and expands `Shape` through `unionAliasMembers`, which has carried
+    // this rule since it was written, while `type U = Circle | Rect | null` — the `null`
+    // INSIDE the declaration — interns as a one-member wrapper over `TyNullable(TyUnion[…])`,
+    // is claimed transparent by `nulAliasMemberFaithful` (ungated in the inner, by
+    // measurement), and reached the structural render below.
+    //
+    // That render drops the arm NAMES, and every emitter table keyed on the union's name
+    // then holds rows for two ANONYMOUS shapes: `unionArmVariantForObj` /
+    // `unionArmVariantForStructExpr` answer -1 for the real arm, so an un-annotated
+    // arm-valued binding is raw-passed into a `(ref $uBox)` parameter and an inline object
+    // literal falls to `objVariantName`'s global FIRST-MATCH field-set scan — which picks
+    // another union's same-named arm when one exists. Both are `vl check` rc 0 and a module
+    // the engine refuses (D1172, D1173). The same union spelled `Circle | Rect | null`
+    // inline, or `U | null` over a null-free `U`, renders `Circle|Rect|null` and runs; this
+    // makes the third spelling agree with those two rather than inventing a fourth.
+    //
+    // `nulAliasMemberFaithful`'s own header files this residue against the render — *"the
+    // render's dropped struct name is filed against the emitter rather than bought here"* —
+    // and its grid graded the declared-struct inner as "both verdicts LOUD and never a wrong
+    // answer". These two cells are SILENT, so that reading was of a population that did not
+    // contain them; the fix goes where the header said it would.
+    const dsu = declaredStructUnionMembers(name)
+    if dsu != "" {
+      canonAtoms = emitNameAtoms
+      return dsu
+    }
     const smr = transparentMemberEmitName(smt, ctx)
     // The EMPTINESS guard the predecessor carried implicitly: it tested its own render for
     // "" (`sma != ""`) and fell through to the rest of the rewriter when the member had no
@@ -27378,6 +27448,21 @@ function fillDone(declIx: i32) {
   cFillDoneAt[declIx] == 1
 }
 
+// True when every member SPELLING of a `UnionDecl` is a quoted string literal and there are
+// at least two — the shape `litUnionAliasTyOfMembers` can adopt (its own scan declines any
+// member that is not a `TyLit` of `litKind == "str"`). The pre-fill in pass 0b is scoped to
+// exactly that set: a NUMERIC literal union is not adoptable by member set, and a union with
+// any other member kind gains nothing from filling early.
+function udVariantsAllStrLit(vs: string[]): boolean {
+  if vs.length < 2 { return false }
+  let i = 0
+  while i < vs.length {
+    if !nameIsQuotedLeaf(vs[i]) { return false }
+    i = i + 1
+  }
+  true
+}
+
 // Mark arena entry `declIx` filled, extending the flag column to cover it. The column only
 // ever grows, so the extension costs O(highest arena index marked) across the whole pass.
 function markFillDone(declIx: i32) {
@@ -27643,6 +27728,30 @@ function checkProgramNode(n: Program) {
   // transparent alias to its member either way, so the two channels used to disagree.
   cFillDoneAt = []
   cFillActive = true
+  // A PURE STRING-LITERAL UNION ALIAS FILLS AHEAD OF THE DRIVER, because the reference to
+  // it is by MEMBER SET and not by NAME (D1151). Demand order is keyed on the name a body
+  // mentions — `declaredTyOfName` re-enters the fill for `k: K` — and an INLINE spelling of
+  // the same set mentions no name at all: `annUnionInnerTy` reaches for the alias through
+  // `litUnionAliasTyOfMembers`, which scans `cUnionTyIxs` for a FILLED litunion with exactly
+  // these members. Pass 0a registers `K` as an EMPTY placeholder, so before its fill that
+  // scan cannot match, and `type C = { k: "a" | "b" }` written above `type K = "a" | "b"`
+  // minted a fresh unregistered union while the identical spelling in a function signature —
+  // resolved after every declaration — adopted `K`. One spelling, two arena types, so
+  // `fieldCodeOfSpelling`'s node arm coded the declared field 3 (a string ref) and the
+  // inline-shape parameter 0 (the interned atom): `vl check` rc 0 over a module the engine
+  // refuses, and moving the `type K` line to the top of the file made it run.
+  //
+  // This is the set-keyed analogue of the name-keyed demand the driver's own comment states
+  // — *"a field's arena type no longer depends on which declaration came first"* — applied to
+  // the one reference form that carries no name to demand on.
+  let li = 0
+  while li < stmts.length {
+    const ls = P.nodes[stmts[li]]
+    if ls is UnionDecl {
+      if udVariantsAllStrLit(ls.udVariants) { fillTypeDeclAt(stmts[li]) }
+    }
+    li = li + 1
+  }
   let ti = 0
   while ti < stmts.length {
     fillTypeDeclAt(stmts[ti])
