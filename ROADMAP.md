@@ -81,10 +81,11 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
     matching. Two capabilities fell out: a CALL receiver (`expect(1).`) completes at all,
     which the field scan's bare-identifier lookup never could; and the import edit spells
     a SPECIFIER (`./shapes`), not the module key the checker reports.
-  - **REMAINS.** (a) The diagnostic itself — D1230's text and the stable
-    `ufcs-not-imported` code (compile-goal track, vl-07); the quick-fix already keys on
-    that code and falls back to the current `no field '<name>' on <T>` shape until it
-    lands. (b) Workspace modules the file does not already import are not probed — the
+  - **DONE (compile-goal half).** The diagnostic names the missing import and carries
+    `ufcs-not-imported;member=…;modules=…;recv=…` on the `diagCodeLen`/`diagCodeByte`
+    channel, so the quick-fix keys on the code and its message-shape fallback is retired.
+    `recv=` is last and is read as everything after the first `;recv=`. D1230.
+  - **REMAINS.** Workspace modules the file does not already import are not probed — the
     500-file crawl is too expensive per keystroke — so a workspace `f(self: T, …)` is
     offered only from a module already in the graph.
 - **Driver lossless-recovery flag — STAGE 1 DONE #2210** (ruled 2026-09-01, shipped the

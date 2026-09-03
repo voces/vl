@@ -295,16 +295,28 @@ export type FixableDiagnostic = {
 export const UFCS_NOT_IMPORTED_CODE = "ufcs-not-imported";
 
 /**
+ * The CATEGORY of a diagnostic code — everything before the first `;`.
+ *
+ * The compiler ships one string on the `diagCodeLen`/`diagCodeByte` channel, and a
+ * coded diagnostic may append a payload to it
+ * (`ufcs-not-imported;member=toEqual;modules=std:test;recv=Expectation<i32>`). There
+ * is no second channel to put that on, so a consumer matching a bare category has to
+ * cut at the first `;` — an equality test silently stops matching the day a payload
+ * is added, which is exactly what happened here (D1230).
+ */
+export const diagCategory = (code: string | number | undefined): string =>
+  typeof code === "string" ? (code.split(";", 1)[0] ?? "") : "";
+
+/**
  * The member NAME a missing-UFCS-import diagnostic is about, or undefined when
  * `diag` is not one.
  *
- * TWO ROUTES, AND THE CODE IS THE ONE THAT LASTS. When the diagnostic carries
- * {@link UFCS_NOT_IMPORTED_CODE} that alone identifies it; until then the current
- * message shape (`no field '<name>' on <Type>`) is the only signal there is. The
- * NAME comes from neither — it is read out of `source` at the diagnostic's own
- * range, which is the property token — so the day the message is rewritten to
- * name the missing import (it is, in vl-07) nothing here needs re-teaching, and
- * dropping the fallback is deleting the second `if`.
+ * THE CODE'S CATEGORY IS THE ONLY ROUTE — {@link diagCategory}, not an equality
+ * test, because the compiler appends a payload to the same string. The message-shape
+ * fallback was retired when the compiler half landed and the sentence stopped being
+ * `no field '<name>' on <Type>`. The NAME comes from neither — it is read out of
+ * `source` at the diagnostic's own range, which is the property token — so a future
+ * rewording needs no re-teaching here.
  *
  * The range read is verified against the message when there is one: a diagnostic
  * whose range does not sit on an identifier is not this diagnostic.
@@ -313,10 +325,7 @@ export const ufcsMissingImportAt = (
   source: string,
   diag: FixableDiagnostic,
 ): string | undefined => {
-  const coded = diag.code === UFCS_NOT_IMPORTED_CODE;
-  const legacy = diag.code === undefined &&
-    /^no field '[A-Za-z_][A-Za-z0-9_]*' on /.test(diag.message ?? "");
-  if (!coded && !legacy) return undefined;
+  if (diagCategory(diag.code) !== UFCS_NOT_IMPORTED_CODE) return undefined;
   const line = splitLines(source)[diag.range.start.line];
   if (line === undefined) return undefined;
   const end = diag.range.end.line === diag.range.start.line
