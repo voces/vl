@@ -778,6 +778,15 @@ let printCstrFn: i32[] = []
 let arrDefCallIx: i32[] = []
 let arrDefCallTy: i32[] = []
 
+// TWO OPEN ARRAY HOLES THAT MET AT A STORE (`b = a` between two un-annotated bindings, and
+// every other position `constrainEmpty` covers). Neither pins the other at the time, and a
+// later use pins only ONE of the two rows — so a DEFAULT applied to the other silently
+// disagrees with it. Recorded as an unordered pair and read by `arrDefHoleToI32` before it
+// reaches for `i32`. Only the intrinsic's own rows consult it, which is why this is a side
+// list and not a union-find over the arena. D1470.
+let holeLinkA: i32[] = []
+let holeLinkB: i32[] = []
+
 // DEFERRED RETURN-TYPE constraints — the DECLARED return re-asked at the pin, because neither
 // layer owns the question in the body: `assignable(T, V)` is vacuous over a hole, so
 // `checkRetStmtNode`'s mismatch check passes, and `substTyDeep` then hands the substituted
@@ -1384,8 +1393,16 @@ function constrainEmptyD(srcTy: i32, dstTy: i32, depth: i32) {
   if s is TyArray {
     if d is TyArray {
       if s.aElem < 0 {
-        s.aElem = d.aElem
-        tyMutEpoch = tyMutEpoch + 1 // in-place element pin — canonical keys change
+        // BOTH SIDES OPEN is not a pin, it is a LINK — `s.aElem = d.aElem` writes the `-1`
+        // back and loses the fact that these two rows must agree. Nothing read that fact
+        // until an unpinned hole acquired a DEFAULT (`arrDefHoleToI32`), which without the
+        // link defaults one side while a later use pins the other to something else. D1470.
+        if d.aElem < 0 {
+          noteHoleLink(srcTy, dstTy)
+        } else {
+          s.aElem = d.aElem
+          tyMutEpoch = tyMutEpoch + 1 // in-place element pin — canonical keys change
+        }
       } else {
         constrainEmptyD(s.aElem, d.aElem, depth - 1)
       }
@@ -1442,7 +1459,8 @@ function arrDefHoleToI32(ty: i32) {
       const t = T.tys[ty]
       if t is TyArray {
         if t.aElem < 0 {
-          t.aElem = TY_I32
+          const partner = holeLinkElemOf(ty)
+          if partner >= 0 { t.aElem = partner } else { t.aElem = TY_I32 }
           tyMutEpoch = tyMutEpoch + 1 // in-place element pin — canonical keys change
           return true
         }
@@ -1452,6 +1470,42 @@ function arrDefHoleToI32(ty: i32) {
     j = j + 1
   }
   false
+}
+
+// Record that the two array rows `a` and `b` must carry the same element. Deduped, because
+// one `b = a` inside a loop body is checked once but a repeated store spelling is not.
+function noteHoleLink(a: i32, b: i32) {
+  if a < 0 || b < 0 || a == b { return 0 }
+  let i = 0
+  while i < holeLinkA.length {
+    if holeLinkA[i] == a && holeLinkB[i] == b { return 0 }
+    if holeLinkA[i] == b && holeLinkB[i] == a { return 0 }
+    i = i + 1
+  }
+  holeLinkA.push(a)
+  holeLinkB.push(b)
+  0
+}
+
+// The element a row LINKED to `ty` resolved to, or -1. ONE HOP, in both directions: a chain
+// of three still-open bindings takes the `i32` default, which is the honest answer for it —
+// nothing in that chain ever said otherwise. The pairs are read at flush time, i.e. after
+// every pin, so a partner that was going to resolve already has.
+function holeLinkElemOf(ty: i32) {
+  let i = 0
+  while i < holeLinkA.length {
+    let other = -1
+    if holeLinkA[i] == ty { other = holeLinkB[i] }
+    if holeLinkB[i] == ty { other = holeLinkA[i] }
+    if other >= 0 {
+      const o = T.tys[other]
+      if o is TyArray {
+        if o.aElem >= 0 { return o.aElem }
+      }
+    }
+    i = i + 1
+  }
+  -1
 }
 
 // Does the element type `el` have a ZERO — a default value that is itself a member of `el`?
@@ -3252,6 +3306,8 @@ export function initChecker() {
   printCstrFn = []
   arrDefCallIx = []
   arrDefCallTy = []
+  holeLinkA = []
+  holeLinkB = []
   retCstrGot = []
   retCstrWant = []
   retCstrIx = []
