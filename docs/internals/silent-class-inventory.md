@@ -32531,11 +32531,11 @@ Repro:
 
 ### D1035 — `is` admits a REFINEMENT of a union arm on its right-hand side and answers `false` unconditionally: `["xyz"] is string[]` over a `Json` is check-clean, runs, and prints `false`, while the struct spelling `r is { users: string[] }` is refused as "not a variant"
 
-**check-clean silently wrong — prints `0` where the list under test holds only strings ·
-filed 2026-09-02 (vl-b7) while answering the owner's "why one `is` test per level?" on
-`json-design.md` §6 q1 · the FIX is the deep `is` / `as` build item
-(`docs/serde-design.md` §"Deep `is` / `as` over a `Json` value"), not a checker refusal:
-under it this witness prints `3`**
+**runs, prints `3` — CLOSED 2026-09-02 by BUILDING the deep `is` the design ruled: a
+JSON-SHAPE target is a runtime shape walk plus a conversion, generated as one VL walker
+pair per distinct target · `compiler/json_walk.vl` + `driver.jwSecondPass` ·
+`tests/cases/unions/deep-is-json-shape-walk.vl` + 7 more ·
+`scripts/capability-probes/deep-is-json-*.vl` grade RUNS · was clause 1**
 
 Repro:
 
@@ -32543,7 +32543,40 @@ Repro:
     function d(r: Json): i32 { if r is string[] { return r[0].length }  0 }
     const l: Json = ["xyz"]
     print(d(l))
-    // PRINTS 0
+    // PRINTS 3
+
+* **ALL SEVEN FAMILY CELLS MOVED, and the three silent ones are the reason the close is a
+  BUILD rather than a checker refusal.** Refusing the admitted refinements would have made
+  three rows loud and left two refused — hygiene, and not the goal.
+
+  | RHS spelling | before | after |
+  | --- | --- | --- |
+  | `r is Json[]` | `true` (a registered arm) | `true`, unchanged — an arm is still a tag test |
+  | `r is { [string]: Json }` | `true` (a registered arm) | `true`, unchanged |
+  | `r is string[]` | check-clean, **`false`** | **`true`**, and `r[0].length` reads a real `string[]` |
+  | `r is { [string]: string }` | check-clean, **`false`** | **`true`**, a real `{[string]: string}` |
+  | `r is { [string]: Json[] }` | check-clean, **`false`** | **`true`** |
+  | `r is { users: string[] }` | check reject, "not a variant of Json" | **runs** |
+  | `r is Cfg` | check reject, same sentence | **runs**, `cfg.port` reads an `i32` |
+
+* **THE MECHANISM IS A GENERATED WALKER, NOT A NEW EMITTER REP.** The checker decides which
+  sites are deep (`jsonUnionRootOf` finds the canonical `Json` a receiver is a view of;
+  `jsonShapeBad` says whether the target has a JSON shape) and RECORDS them. The driver then
+  generates, per distinct target, `__vlJsonIs_<k>(v: Json): boolean` and
+  `__vlJsonGet_<k>(v: Json): T` as ordinary VL SOURCE, parses that fragment onto the same
+  token stream and arena, appends its declarations to the program root, rewrites each site
+  into a call, and re-checks. Nothing in `wasmEmit.vl` learns a rep, and no delivery position
+  needs wiring, because the arm's binding is an ORDINARY local of the target type — which is
+  how D965's rule is satisfied rather than sidestepped.
+
+* **A PROGRAM WITH NO DEEP `is` PAYS NOTHING, MEASURED.** `jwSiteNode` is empty and the
+  second pass returns on its first line, so there is no second parse and no second check.
+  Five control programs (an ordinary-union `is`, `is string` over `Json`, an `as?` numeric,
+  `is Json[]`, `is {[string]: Json}`) emit **byte-identical** modules before and after.
+
+* **THE PRICE, NAMED.** A deep `is` arm that REBINDS or WRITES the tested place is now a
+  loud refusal (D1190) where master ran it and printed the wrong answer, and a RECURSIVE
+  JSON shape target is refused (D1198). Both are recorded rows with witnesses, not silent.
 
 * **THE FAMILY, MEASURED** — seed 0ff2587f, `VL_STD` pinned, every cell against
   `type Json = null | boolean | f64 | string | Json[] | { [string]: Json }`:
@@ -32567,15 +32600,136 @@ Repro:
   passes. The struct spellings fail the same membership test outright, which is the
   honest half of the behaviour.
 
-* **WHAT THE FIX IS, AND IS NOT.** Refusing the refinement at the checker would make the
-  three admitted rows loud and leave the two refused rows refused — hygiene, and not the
-  goal. The owner's direction (2026-09-02) is that a complex, nested type on the right of
-  `is` is what a `Json` consumer should be able to write, so the close is the derived
-  SHAPE WALK: `r is string[]` walks the list and answers `true` when every element is a
-  string, and `r is { users: string[] }` walks the map. This row's witness then prints `3`
-  and the two refused rows run. Grade the close on all seven cells, and on the position
-  matrix the design names (`is` in `if` / `while` / `&&` / `!`; `as` at binding / return /
-  argument / assignment) before narrowing anything at the checker.
+* **WHAT THE FIX WAS, AND WAS NOT.** The owner's direction (2026-09-02) is that a complex,
+  nested type on the right of `is` is what a `Json` consumer should be able to write, so the
+  close is the derived SHAPE WALK and not a checker refusal. It was graded on all seven
+  cells above AND on the position matrix the design names — `is` in `if` / `while` / `&&` /
+  `!` / `else if` / a closure body, over a struct field, an index, a call result and a map
+  read — before anything at the checker was narrowed. The `as` trio (S4) is the REMAINDER
+  and is not built: `ROADMAP.md` carries it.
+
+---
+
+### D1197 — `.push` is the ONE delivery that drops the non-null recovery for a narrowed nullable REF: `out.push(e)` under `if e != null` is check-clean invalid wasm, while eight other positions for the same value all run
+
+**check-clean invalid wasm — `type mismatch: expected (ref $type), found (ref null $type)`
+· filed 2026-09-02 (vl-b7) while building deep `is` (D1035), which is why the generated
+walkers return `T` + a separate `boolean` instead of the `T | null` the shape wants ·
+clause 1**
+
+Repro:
+
+    type Item = { name: string }
+    function mk(i: i32): Item | null {
+      if i > 0 { return { name: "a" } }
+      null
+    }
+    const out: Item[] = []
+    const e = mk(1)
+    if e != null { out.push(e) }
+    print(out.length)
+    // check rc 0, then: Invalid input WebAssembly code: type mismatch: expected (ref $type), found (ref null $type)
+
+* **A NINE-POSITION MATRIX, AND ONLY ONE CELL IS RED.** One tiny program per delivery of the
+  SAME narrowed value, each printing something the delivery had to produce:
+
+  | position | outcome |
+  | --- | --- |
+  | `out.push(e)` | **check-clean invalid wasm** |
+  | `const c: Item = e` | runs |
+  | `const c = e` | runs |
+  | `take(e)` (argument) | runs |
+  | `return e` from an `Item` function | runs |
+  | `{ it: e }` (struct field init) | runs |
+  | `[e]` (array literal element) | runs |
+  | `m["k"] = e` (map value) | runs |
+  | `e.name.length` (read only) | runs |
+
+  So this is NOT the D965/D1031 shape of "a capability served in one place and delivered in
+  many". Eight positions already recover the non-null; `emitPush` is the one that does not.
+
+* **WHY IT MATTERS BEYOND ITS OWN WITNESS.** It is what makes a deep-`is` walker that
+  returns `T | null` unusable: the natural generated shape is `const e = walk(v[i])  if e !=
+  null { out.push(e) } else { return null }`, which is exactly this cell. The build works
+  around it by generating a PREDICATE and a BUILDER whose return is non-null, at the cost of
+  walking twice; closing this row is what would let a walker be one function, and with it a
+  RECURSIVE target (D1198).
+
+* **THE LIKELY SHAPE OF THE FIX.** `emitPush` already carries `narrowedArmNeedsUnbox` /
+  `emitNarrowedArmUnboxTo` for the union-ARM case (D1031). The niche case wants the same
+  hook one predicate over: a value whose slot is `(ref null $S)` and whose live narrowing
+  excludes null needs `0xd4 ref.as_non_null` before `local.set` into the push quad's
+  non-null scratch. Grade it on the matrix above, and on `arrays/` + `unions/` corpus cells.
+
+---
+
+### D1198 — a RECURSIVE JSON shape on the right of a deep `is` is refused: `type Tree = { v: f64, kids: Tree[] }` has no walker because the generator INLINES each level
+
+**loud check reject on a `vl check`-clean type — `` `Tree` is recursive; a recursive JSON
+shape has no walker yet`` · filed 2026-09-02 (vl-b7) with the deep-`is` build (D1035) ·
+`tests/cases/unions/error-deep-is-recursive-shape.vl` · clause 2**
+
+Repro:
+
+    type Json = null | boolean | f64 | string | Json[] | { [string]: Json }
+    type Tree = { v: f64, kids: Tree[] }
+    const j: Json = null
+    print(j is Tree)
+    // check reject: `is` check type 'Tree' is not a JSON shape — field `kids`: `Tree` is recursive; a recursive JSON shape has no walker yet
+
+* **A RECURSIVE DOCUMENT IS PERFECTLY GOOD JSON**, so this is a capability gap and not a
+  design rule — which is why it refuses with a sentence that says "yet" and carries a row.
+
+* **THE INGREDIENT IS THE GENERATOR'S SHAPE, NOT THE TYPE.** `compiler/json_walk.vl` emits
+  the walk by INLINING each level of the target into one function body, which a cycle makes
+  unbounded. The fix is a per-target function whose recursive call is a CALL — one walker
+  per level, not one per nesting — and that needs a walker that can say "no match" from a
+  nested position, i.e. a `T | null` return, i.e. D1197 closed first.
+
+* **NON-RECURSIVE NESTING IS UNAFFECTED and is covered**: `{ items: Item[], total: f64 }`
+  with `Item = { name: string, price: f64 }` walks and runs
+  (`tests/cases/unions/deep-is-json-shape-walk.vl` §NESTED).
+
+---
+
+### D1190 — a deep `is` arm that REBINDS or WRITES the tested place is refused, where master ran the same program and printed the wrong answer
+
+**loud check reject positioned at the `is` site — `a deep `is` arm that rebinds or writes
+`r` is not supported yet — bind the converted value first` · filed 2026-09-02 (vl-b7) with
+the deep-`is` build (D1035) ·
+`tests/cases/unions/error-deep-is-arm-rebinds-receiver.vl` · clause 2, and a named
+loud→refused price**
+
+Repro:
+
+    type Json = null | boolean | f64 | string | Json[] | { [string]: Json }
+    function d(r: Json): i32 {
+      if r is string[] {
+        const n = r[0].length
+        r = null
+        return n
+      }
+      0
+    }
+    const l: Json = ["xyz"]
+    print(d(l))
+    // check reject: a deep `is` arm that rebinds or writes `r` is not supported yet — bind the converted value first
+
+* **THE PRICE IS NAMED, NOT HIDDEN.** On master this program RAN and printed `0` — because
+  `r is string[]` answered `false` for every value, so the arm was dead. It is a wrong
+  answer that happens to run, and the row records the transition rather than leaving it to
+  be discovered.
+
+* **WHY THE REWRITE REFUSES.** A deep `is` arm reads the CONVERTED copy through a binding the
+  rewrite prepends, and every read of the tested place inside the arm is rewritten to it. A
+  write to that place falsifies the narrowing part-way through the arm — which is exactly
+  what `retireNarrowingsForWrite` encodes for the ordinary case — so the reads before and
+  after the write want DIFFERENT bindings, and a blanket rewrite would give them one.
+
+* **THE FIX IS A SCOPED SUBSTITUTION, and it is bounded work**: walk the arm in statement
+  order, stop rewriting the place at the first write or shadowing declaration, and let the
+  reads after it keep the receiver's declared type. The refusal is conservative on purpose
+  until that walk exists — it is loud, positioned at the `is` site, and it names the fix.
 
 ---
 
@@ -38168,6 +38322,79 @@ Repro (runs, prints `0`):
   position, and a parameter's shape is the parameter's alone. `pendingMapSlot` was the one
   container seed not on that list.
 
+---
+### D1230 — a UFCS method whose free function is exported but NOT imported blamed the receiver; the refusal now names the missing import, under `ufcs-not-imported`
+
+**now a loud check reject, and that is the whole intent — the program is illegal and stays
+illegal · a DIAGNOSTIC-QUALITY row, neither clause 1 nor clause 2 · CLOSED 2026-09-02 ·
+filed as [D1230](../../DECISIONS.md) against the owner's ruling
+§"UFCS is never implicit"**
+
+Repro (check rc 1 — the sentence is the subject of the row, not the exit code):
+
+    import { describe, it, expect } from "std:test"
+    expect(1 + 1).toEqual(2)
+
+Before: `no field 'toEqual' on Expectation<i32>`. Now:
+
+    'toEqual' is not imported — a free `toEqual(self: …)` accepting Expectation<i32> is
+    exported by "std:test"; a UFCS call resolves only names in scope, so import `toEqual`
+    from there
+
+* **THE OLD SENTENCE WAS TRUE, PERMANENT, AND USELESS.** `Expectation<i32>` has no field
+  `toEqual` and never will — UFCS is EXPLICIT by ruling and the compiler will not look into
+  the module that defines the receiver's type (DECISIONS.md §"UFCS is never implicit"; the
+  type-directed fallback was declined as *"potentially buggy; for now we don't need it"*).
+  So there is nothing to FIX in the resolution. What the compiler knew and did not say is
+  that `toEqual` is a free `self`-function exported by a module this very file already
+  names, one word away from working.
+
+* **THE PAYLOAD RIDES THE CODE, NOT THE SENTENCE**, so a quick-fix never parses English:
+
+      ufcs-not-imported;member=toEqual;modules=std:test;recv=Expectation<i32>
+
+  `;`-separated, fixed order, `,` between module specifiers, `recv=` LAST because a rendered
+  type is the one field that can itself contain any of those characters (`A | B`,
+  `{a: i32, b: i32}`) — read it as everything after the first `;recv=`. It rides the existing
+  `diagCodeLen`/`diagCodeByte` ABI (`TDiag.tcode`), the same channel `unsupported-lowering`
+  uses, and is pinned in `tests/selfhost_native_diag_code_test.ts`. ONE diagnostic lists every
+  candidate module: the fix is a choice among them, and N diagnostics would stack N squiggles
+  on one token.
+
+* **THE LOOKUP IS THE ONE UFCS ALREADY DOES, ASKED AGAIN ON THE FAILURE PATH.**
+  `typecheck.ufcsWouldDispatch` mirrors `ufcsCallTy`'s GATE arm for arm — the lookup, the
+  `self`-name rule, the arity RANGE, `assignable(recvTy, params[0])` — and deliberately
+  nothing after it. `ufcsCallTy` forces a pending return, records a deferred constraint,
+  reorders named arguments and reports argument mismatches; running any of that speculatively,
+  over every same-named candidate in the graph, would raise diagnostics for functions the
+  program never calls.
+
+* **THE SCOPE IS THE MODULE GRAPH, AND TWO CASES OUTSIDE THE BASE ONE WERE DECIDED, NOT
+  DRIFTED INTO.** A module the file does NOT import is covered when — and only when — its key
+  is a `std:` specifier, because a `std:` specifier is absolute and therefore the same text
+  from every file (`tests/cases/modules/ufcs-not-imported-transitive-std/`). A RELATIVE module
+  the file does not import gets nothing: its key is a normalized path, and turning that back
+  into a specifier relative to the entry is `..`-arithmetic that can name a different module —
+  a withheld suggestion costs a reader the old sentence, a wrong one costs them an import that
+  resolves somewhere else. A self-function in the SAME FILE that is out of scope also gets
+  nothing (`tests/cases/objects/ufcs-nested-self-fn-out-of-scope.vl`): there is no import that
+  would make it resolve, so the code's own name would be a false promise. Un-EXPORTED is the
+  third exclusion, for the same reason.
+
+* **THE CONTROLS RUN IN THE SAME GRAPH AS THE SUGGESTION**, which is what makes them controls
+  and not vacuous passes. `tests/cases/modules/ufcs-not-imported/entry.vl` holds all three
+  cases in one file: `area` (exported, not imported) gets the new sentence at two delivery
+  positions, `nosuch` (no self-function anywhere) and `hidden` (a self-function in the same
+  imported module, un-exported) both keep `no field '…' on Box`.
+
+* **FOUND WHILE BUILDING IT, NOT FIXED HERE: a name-keyed UFCS alias leaks across modules.**
+  If ANY module contains a member call `x.hidden()` resolving to its own un-exported
+  `hidden(self: Box)`, the merge banks a name-keyed `hidden → hidden$mN` row; the ENTRY's own
+  `b.hidden()` has no per-site alias, falls back to that name-keyed map (`ufcsAliasOf`), and
+  COMPILES — calling a function the entry never imported and cannot name. D1120 built the
+  per-site table for the two-module ambiguity but left the fallback answering for callers that
+  should get nothing. The fixture's `lib.vl` calls `hidden` DIRECTLY for exactly this reason,
+  and says so in a comment, so this row's control cannot silently start measuring that instead.
 ---
 ### D1270 — an UN-ANNOTATED array literal whose element is a nullable CONTAINER (`[f(0)]` where `f(): i32[] | null`) builds the mono i32 list: check-clean invalid wasm
 

@@ -4150,6 +4150,36 @@ annotation pins a rep the walk must not depend on): `{"port": 1} is Cfg` → `tr
 `cfg.host == null`; `{"port": 1, "host": null}` → `true`; `{"host": "x"}` → `false`; the
 two-arm union above refused at the checker.
 
+## Deep `is` over a `Json` value is a SHAPE WALK plus a conversion, and its walker is generated VL (2026-09-02)
+
+**Standing.** `r is T` where `r`'s type is a JSON-shaped union and `T` is not one of its
+arms is a RUNTIME SHAPE WALK, not a tag test. `docs/serde-design.md` §"Deep `is` / `as` over
+a `Json` value" is the design; **S1, S2 and S3 stand as built, S4 (the `as` trio) is the
+remainder**. S1: the arm binds one converted COPY, so mutating it never writes back to the
+tree — a `{[string]: Json}` map and a `Cfg` struct are different wasm reps, so the arm
+cannot be a view, and narrowing already changes rep silently for a value-union arm. S2: an
+integer target matches iff the value is integral and in range, and it is not a second
+definition — the walk asks `v as? i32`, so it IS §"Numeric `as` to an INTEGER target is
+exact-or-fail under the trio". S3 (RULED by the owner): an ABSENT key matches a `T | null`
+field as `null`, because the source's object level is a MAP and VL's own map read already
+says absent is `null`; a walk that refused it would be stricter than reading the map by hand.
+
+**Why the walker is GENERATED VL SOURCE rather than emitted wasm.** The walk must BUILD
+every target rep — a `string[]`, a struct, a `{[string]: i32}` map — and the emitter already
+knows how to build each of those out of ordinary VL. Generating the walk as source (one
+`__vlJsonIs_<k>` + `__vlJsonGet_<k>` pair per distinct target, parsed into the same arena and
+appended to the program root) means the arm's binding is an ORDINARY local of the target
+type, so no delivery position needs wiring and `wasmEmit.vl` learns no new rep. That is
+D965's rule satisfied by construction rather than by a nine-cell matrix. The cost is a
+second parse and a second check, paid ONLY by a program that has a deep `is` — a program
+without one emits byte-identical wasm.
+
+**Why a PAIR and not one function returning `T | null`.** The arm would then bind a nullable
+narrowed to non-null, and `.push` is a delivery that drops the non-null recovery for exactly
+that value (D1197, check-clean invalid wasm; eight other positions run). The pair costs a
+second walk and owes nothing to a standing defect. When D1197 closes, the pair collapses to
+one function and a RECURSIVE target (D1198) becomes expressible.
+
 ## Numeric `as` to an INTEGER target is exact-or-fail under the trio; a float target rounds; nothing ships in std (owner, 2026-09-02)
 
 **Ruling.** `x as T` with a numeric operand and an INTEGER target (`i32`, `i64`) succeeds
@@ -4878,3 +4908,47 @@ one; (2) code action on the D1230 diagnostic — `Import \`toEqual\` from "std:t
 same for a user module in the workspace graph, not only `std:`. Compile-goal track (vl-07):
 D1230's diagnostic text and a stable diagnostic code carrying module + name, so the quick-fix
 keys on the code rather than parsing the sentence.
+
+**BUILT 2026-09-02 — BOTH HALVES.** The three tooling items ship, and so does the
+compile-goal half: the refusal names the missing import and carries the quick-fix's whole
+answer on the existing `diagCodeLen`/`diagCodeByte` channel, so the code action never parses
+the sentence. The fallback on the old message shape is therefore retired.
+
+    ufcs-not-imported;member=toEqual;modules=std:test;recv=Expectation<i32>
+
+`;`-separated, fixed order, `,` between module specifiers, and **`recv=` LAST** because a
+rendered type is the only field that can itself contain those characters (`A | B`,
+`{a: i32, b: i32}`) — read it as everything after the first `;recv=`. ONE diagnostic lists
+every candidate module, so the quick-fix emits one code action per entry in `modules=`
+rather than answering N squiggles on one token. Specifiers are spelled the way the file can
+write them TODAY: the file's own import text where it already imports the module, and the
+bare `std:` key where it does not. A RELATIVE module the file does not import is deliberately
+NOT offered — its key is a normalized path, and reconstructing a specifier relative to the
+entry is `..`-arithmetic that can name a different module.
+
+Three things the build settled that the ruling could not have known:
+
+* **The candidate set is the CHECKER's, not the host's.** `Expectation<i32>` fits
+  `self: Expectation<T>`, and nothing the host holds — a rendered type string — can decide
+  that. So the LSP gained one query, `ufcsCandidatesAt`, which asks `declFirstParamIsSelf` +
+  `assignable` of every declared `self`-function: literally the pair `ufcsCallTy` applies to a
+  written call, so the offered set cannot advertise a call the checker would then refuse.
+  Nothing about type matching moved into TypeScript.
+* **Reaching an UN-IMPORTED module needs a NAMED import, not a bare one.** `import "std:str"`
+  resolves the specifier and merges NOTHING — measured, and the scan comes back empty. One
+  ALIASED named specifier (`import { trim as __vlUfcsProbe0 } from "std:str"`) merges the whole
+  module while binding a name that cannot collide with the author's, and the declaration's own
+  name — what the scan reports — is untouched by the alias. Eleven std modules cost ~20 ms.
+* **A MODULE KEY IS NOT A SPECIFIER.** The checker reports `/proj/shapes.vl`; the import
+  statement spells `./shapes`. Writing the key would have produced a wrong edit rather than a
+  missing one, and only the workspace-module test caught it — `std:` keys ARE their specifiers,
+  so every std case passed either way. `importSpecifierForKey` is the inverse of
+  `resolveImportSpecifier`, and prefers a spelling the file already uses over any it derives.
+
+Two capabilities fell out of the second one and are worth naming, because neither was asked
+for. A CALL receiver — `expect(1).`, the papercut's own shape — now completes at all: the
+field scan STRIPS the trailing `.` and re-resolves the receiver as a BINDING, which only works
+for a bare identifier, while the UFCS probe APPENDS a property and keeps a real member access.
+And the same appended-property trick is what lets the quick-fix ask about
+`expect(1 + 2).toEqual(3)` without repairing anything: the diagnostic points AT the member, and
+the receiver is that access's object, whatever expression it is.

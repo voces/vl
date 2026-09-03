@@ -1,63 +1,35 @@
 import { pushCps } from "./strutil"
 import { demangleSpelling } from "./tyname"
 
-// AST-driven source formatter for the self-hosted VL front end — the VL port of
-// `compiler/format.ts` (kill-TS step 1).
+// AST-driven source formatter for the self-hosted VL front end.
 //
 // `formatProgram(progRoot)` walks the parser arena (`P.nodes`) and *generates*
-// canonical VL source from it. Like the host it is a HYBRID:
+// canonical VL source from it. It is a HYBRID:
 //   - EXPRESSIONS are printed structurally (operator spacing, list reflow), with
 //     TYPE syntax (variable / parameter / return annotations, `is` check-types,
 //     `type`/union declarations) recovered VERBATIM from source via per-node
 //     `[start, stop)` spans (`pos` .. `nodeEndOf`), since the AST stores types as
 //     synthetic NAME strings only.
 //   - CONTROL FLOW / BLOCKS / statement sequencing are pretty-printed, placing
-//     comments (own-line vs trailing) around them, mirroring the host's `Printer`.
+//     comments (own-line vs trailing) around them.
 //
 // SOURCE + COMMENTS are supplied by the driver through module globals before the
 // call: `fmtSetSource(src)` and `fmtAddComment(...)` (the lexer's retained
-// comments). A driver (`scripts/vl-compiler-driver.vl`) lexes → parses → calls
-// `formatProgram`, then the host reads the result string char-by-char.
+// comments). The driver lexes → parses → calls `formatProgram`, then the host reads
+// the result string char-by-char.
 //
 // ── WIDTHS ARE CODE POINTS, OFFSETS ARE BYTES ────────────────────────────────
 // Every number in this file that is compared against `fmtWidth`, or added to
 // something that will be (a `column`), is a WIDTH and is spelled `dispWidth(s)`
-// (`fmt_util.vl`, which carries the argument). Every number that indexes or
-// slices a string is an OFFSET and stays `s.length` / `s[i]`. Stage 2c split the
-// two — `.length` is a byte count now — and `.length` left in a width position
-// wraps any line holding a non-ASCII character early, silently: a 60-column line
-// of em dashes measures 132 and breaks into three. An emptiness test (`s.length
-// == 0`) and an ARRAY length are neither, and are left alone.
+// (`fmt_util.vl`). Every number that indexes or slices a string is an OFFSET and
+// stays `s.length` / `s[i]`. `.length` is a BYTE count, so one left in a width
+// position wraps any line holding a non-ASCII character early, and silently: a
+// 60-column line of em dashes measures 132 and breaks into three. An emptiness test
+// and an ARRAY length are neither, and are left alone.
 //
-// ── COVERAGE (what this port DOES and DOES NOT yet cover) ────────────────────
-// Covered: top-level + nested let/const (with `export` recovered by token scan),
-// function declarations (block + single-expression bodies), `type` struct decls
-// and union decls (verbatim), if / else if / else (with one-line collapse of a
-// single plain `if`), while, for-range, for-in, break/continue/return, blocks,
-// and the full expression grammar (names, literals, unary, binary chains with
-// precedence-minimal parens, `is`, member / optional / index access, calls,
-// object / array literals, parenthesised expressions, function expressions,
-// `if`-expressions), with own-line and trailing comment placement, blank-line
-// preservation, list reflow at the width, the multi-line trailing-comma policy,
-// and fit-or-break layout of member/call CHAINS (two links or more — see the
-// "member / call CHAIN layout" section for the threshold and why the fit is
-// measured flat).
-//
-// SURFACE-FORM RECOVERY: the self-host parser DESUGARS several constructs in the
-// arena. Most carry a faithful-surface MARKER on the node so the printer reprints
-// the written form directly: compound assignment and prefix increment (`a += b` /
-// `++x`, via `binCompound`), the negated guard (`x !is T`, via `IsExpr.isNeg`);
-// postfix `x++` rides a `Unary "p+"`. `else if` is the one chain form (no fused
-// `elseif` keyword). The remaining token-scanned forms are quoted operator /
-// index-trap object keys (`"[]"`, `"*"` — the parser strips the quotes), the
-// `export` modifier, and `import` statements (which the parser consumes without a
-// node) re-emitted from the token stream. The self-host KEEPS explicit `Paren`
-// nodes, so a paren round-trips as written.
-//
-// RESIDUAL host divergences (semantics-preserving, so they still satisfy the
-// idempotent / AST-round-trip / comment guarantees): object-literal method
-// shorthand `m(a) { … }` is expanded to `m: function(a) { … }`, and short
-// `else if` chains are not collapsed onto one line. See docs/vl-tech-debt.md.
+// What the port covers, the surface forms it recovers by marker or token scan, and
+// the residual divergences from the retired host formatter:
+// docs/internals/format-notes.md §"module contract".
 
 import {
   ArrayLit,
@@ -264,20 +236,17 @@ function stopLineOf(ix: i32) {
 }
 
 // ── trailing-comment alignment (a whole-text post-pass) ───────────────────────
-// `vl fmt` normalizes the spacing before a trailing `//`/`///` comment to a
-// SINGLE space per line; this pass re-aligns runs of them to a common column so
-// hand-aligned comment groups survive a format. It runs over the FINISHED text
-// so it treats EVERY trailing comment uniformly — both the ones the printer
-// emits (`trailerSuffix`) and the ones reproduced verbatim inside a `type`/union
-// slice — without the printer having to special-case any node.
+// `vl fmt` normalizes the spacing before a trailing `//`/`///` comment to a SINGLE
+// space per line; this pass re-aligns runs of them to a common column so
+// hand-aligned comment groups survive a format. It runs over the FINISHED text, so
+// it treats EVERY trailing comment uniformly — the ones the printer emits and the
+// ones reproduced verbatim inside a `type`/union slice — with no per-node case.
 //
-// A BLOCK is a maximal run of lines that are neither blank nor an own-line
-// comment; a comment-LESS code line inside it is tolerated (it neither breaks
-// the block nor pulls the column). Within a block, every trailing comment aligns
-// to `max(code width of the commented lines that still leave room before the
-// width) + 1`. A commented line whose code is already too wide keeps its single
-// space and does NOT drag the column out. The column is recomputed identically
-// on a re-run, so the pass is idempotent.
+// A BLOCK is a maximal run of lines that are neither blank nor an own-line comment;
+// a comment-LESS code line inside it is tolerated. Within a block every trailing
+// comment aligns to `max(code width of the commented lines that still leave room
+// before the width) + 1`; a line whose code is already too wide keeps its single
+// space and does NOT drag the column out. Recomputed identically ⇒ idempotent.
 
 function alignComments(text: string) {
   const lines = splitLines(text)
@@ -554,11 +523,10 @@ export function formatProgram(progRoot: i32) {
     //
     // D1045 — A BODY-SCOPED `type` IS FILTERED FOR THE SAME REASON, one scope in.
     // The parser hoists such a declaration into `progStmts` so the checker and the
-    // emitter register it (they read that list and only that list), and it stays at
-    // its lexical position inside the block as well — so the walk reaches it TWICE
-    // and printed it a second time at the end of the file. Measured, not reasoned:
-    // `vl fmt` on `scripts/capability-probes/body-scope-type-decl.vl` appended a
-    // stray `type P = { x: i32, y: i32 }` after the last statement.
+    // emitter register it, and it stays at its lexical position inside the block as
+    // well — so the walk reaches it TWICE and printed it a second time at the end
+    // of the file (measured on `scripts/capability-probes/body-scope-type-decl.vl`,
+    // which grew a stray `type P = { x: i32, y: i32 }` after the last statement).
     topPrevLine = emitImports()
     const stmts: i32[] = []
     let fi = 0
@@ -1015,28 +983,16 @@ function splitTopLevel(s: string, sep: string) {
 
 // Wrap an over-width single-line type decl `codeLine` (already carrying its
 // `export ` prefix) across lines, emitting at `indent`; `suffix` (a trailing
-// comment) goes on the final line. Returns `true` when it wrapped, `false` when
-// the decl is not a shape we know how to wrap (a non-union alias) — the caller
-// then falls back to the verbatim path. A UNION (`type N = A | B | …`) keeps its
-// first member on the `=` line and gives each remaining member its own `| …` line
-// (the form the parser accepts — a NEWLINE right after `=` does not parse). A
-// struct RECORD (`type N = { a: T, … }`) opens the brace, one field per line with
-// a trailing comma, then a closing `}`.
+// comment) goes on the final line. Returns `true` when it wrapped, `false` for a
+// shape we do not know how to wrap (a non-union alias) — the caller then falls back
+// to the verbatim path. A UNION keeps its first member on the `=` line and gives
+// each remaining member its own `| …` line; a struct RECORD opens the brace, one
+// field per line with a trailing comma, then a closing `}`.
 //
-// `isRecord` is the PARSER's own verdict, threaded down from the `n is TypeDecl` /
-// `n is UnionDecl` test at the statement dispatch — not re-derived here from the
-// rendered spelling. `parseTypeDecl` emits a `TypeDecl` for exactly one RHS shape,
-// a `{ … }` with NO `&`/`|` continuation, and a `UnionDecl` for every other,
-// INCLUDING `{ … } & { … }` and `{ … } | { … }`, which it re-encodes as a union
-// over synthetic member names. Asking the text instead (`body[0] == '{'`) called
-// both of those re-encoded shapes a record and peeled `body.slice(1, len - 1)` off
-// a body whose first `}` is not its last, producing a decl that does not re-parse:
-// `vl fmt` failed with "formatter produced invalid output — file left unchanged,
-// please report" (rc 3) on valid source. The wrapped shapes it now emits are pinned
-// by `tests/cases/parser/type-decl-brace-{union,intersection}-multiline.vl`, which
-// are the PARSER half; the fmt half has no corpus pin because `tests/` is excluded
-// from the `vl fmt --check` gate by construction (see the D-FMTDECL hand-off).
-// The parser has already decided this; the spelling is not asked a second time.
+// `isRecord` IS THE PARSER'S OWN VERDICT, threaded down from the statement dispatch
+// — not re-derived here from the rendered spelling. Asking the text instead
+// (`body[0] == '{'`) made `vl fmt` emit a decl that does not re-parse:
+// docs/internals/format-notes.md §wrapTypeDecl.
 function wrapTypeDecl(
   codeLine: string,
   indent: i32,
@@ -1331,10 +1287,8 @@ function inlineBlockBody(blockIx: i32, indent: i32) {
 //     …
 //   }
 // A chain is a nested `IfStmt` in the `ifElse` slot (`else if` — there is no fused
-// `elseif` keyword), detected by `elseIsIf`. Returns false when the node is not
-// such a chain (no nested-if else, or some branch is not a brace block) — the
-// caller then uses the plain `if`/`else` forms. Every chain keeps this stable
-// multi-line block form (no one-line collapse).
+// `elseif` keyword), detected by `elseIsIf`. Returns false when the node is not such
+// a chain — the caller then uses the plain forms. No one-line collapse.
 function emitIfChain(ix: i32, node: IfStmt, indent: i32) {
   if !elseIsIf(node.ifElse) { return false }
   // Collect clause condition + body arena indices walking the chain.
@@ -1922,23 +1876,18 @@ function isExpr(ix: i32, node: IsExpr, indent: i32, column: i32) {
   value + " is " + ty
 }
 
-// `x as T` — the target is stored canonically on the node (`asTy`), so it needs
-// no source recovery (unlike `is`). The operand renders through `primary`, which
+// `x as T` — the target is stored canonically on the node (`asTy`), so it needs no
+// source recovery (unlike `is`). The operand renders through `primary`, which
 // parenthesizes a composite (`(a + b) as f64`) so the cast keeps binding the whole
-// value; a chained `x as i32 as i64` stays flat (an `AsExpr` operand is not
-// composite), which round-trips idempotently.
+// value; a chained `x as i32 as i64` stays flat and round-trips idempotently.
 //
-// THE SUFFIX IS PART OF THE OPERATOR, AND DROPPING IT CHANGED THE PROGRAM. This printed
-// a bare `" as "` for all three members of the trio, so `vl fmt` silently rewrote
-// `x as! T` and `x as? T` to `x as T` — turning a TRAP into a propagation, or a coalesce
-// into one, with no diagnostic. That is the one thing a formatter may never do, and it was
-// reachable on any file using the error-handling trio at all: the three differ only in
-// this token (`error-handling-design.md` §Trio — `as` propagates, `as?` coalesces to null,
-// `as!` traps).
-//
-// The mode rides the node (`asMode`, set by the parser from the token it consumed), so
-// like `asTy` it needs no source recovery — the bug was simply never asking. Pinned by
-// `tests/cases/fmt/as-trio-suffix-preserved.vl`, which formats all three and diffs.
+// THE SUFFIX IS PART OF THE OPERATOR, AND DROPPING IT CHANGED THE PROGRAM. A bare
+// `" as "` for all three members of the trio silently rewrote `x as! T` and
+// `x as? T` to `x as T` — turning a TRAP into a propagation — which is the one thing
+// a formatter may never do (`error-handling-design.md` §Trio). The mode rides the
+// node (`asMode`), so like `asTy` it needs no source recovery; the bug was never
+// asking. Pinned by `tests/cases/fmt/as-trio-suffix-preserved.vl`, which formats all
+// three and diffs.
 function asExpr(_ix: i32, node: AsExpr, indent: i32, column: i32) {
   let kw = " as "
   if node.asMode == "trap" { kw = " as! " }
@@ -1970,41 +1919,17 @@ function recoverIsType(ix: i32) {
 }
 
 // ── member / call CHAIN layout (fit-or-break) ─────────────────────────────────
+// A postfix chain of TWO OR MORE `.name` / `?.name` links is laid out fit-or-break
+// against `fmtWidth`: inline while it fits from its start column, else ONE LINK PER
+// LINE at `indent + 1`, from the FIRST link. The broken form is printable only
+// because a leading `.` / `?.` on a new line CONTINUES the chain (DECISIONS.md,
+// owner 2026-09-02).
 //
-// A postfix chain of TWO OR MORE `.name` / `?.name` links is laid out fit-or-
-// break — the same policy `wrapList` gives an argument list, measured against the
-// same `fmtWidth`. Inline while the chain fits from its start column; otherwise
-// ONE LINK PER LINE at `indent + 1`, starting from the FIRST link:
-//
-//   expect(build(cfg))
-//     .toEqual(want)
-//
-// The broken form is only printable because a leading `.` / `?.` on a new line
-// CONTINUES the chain (DECISIONS.md, owner 2026-09-02); before that ruling the
-// formatter had no choice but to re-join one, which is what made the spelling
-// unusable in a `fmt --check`ed tree.
-//
-// THE THRESHOLD IS TWO LINKS, and a LINK STARTS AT THE FIRST CALLED STEP. It is
-// a threshold on structure, not on width. `(args)` and `[i]` suffixes RIDE the
-// step they follow, and every `.field` step BEFORE the first step that carries a
-// call belongs to the chain's HEAD — so
-//
-//   P.toks.push({ … })          head `P.toks`, ONE link — never breaks
-//   node.callArgNames.length    head, no link at all — never breaks
-//   xs.filter(f).map(g).length  head `xs`, THREE links — breaks when wide
-//
-// That merge is what keeps the rule off the dominant shape in this tree. Without
-// it a plain field path whose only call takes a long object literal breaks into
-// `P` / `.toks` / `.push({ … })`, which is worse at every width: the overflow
-// lives in the ARGUMENT, and `wrapList` already had the right answer for it.
-//
-// AND THE FIT IS MEASURED FLAT. The width policy being decided here is the
-// CHAIN's, so the measurement forbids the interior lists to wrap first —
-// otherwise a long final argument list absorbs every overflow (`wrapList` runs
-// before the chain is ever consulted) and no chain is ever wide enough to break.
-// A flat form that fits is what the ordinary path would have produced anyway, so
-// a fitting chain prints byte-for-byte as it did before this rule existed, and
-// costs one render.
+// THE THRESHOLD IS TWO LINKS AND A LINK STARTS AT THE FIRST CALLED STEP —
+// structure, not width: `(args)` and `[i]` RIDE the step they follow, and every
+// `.field` step BEFORE the first calling step belongs to the chain's HEAD. AND THE
+// FIT IS MEASURED FLAT, or a long final argument list absorbs every overflow and no
+// chain ever breaks. Worked cases: docs/internals/format-notes.md §"chain layout".
 const FMT_CHAIN_FLAT = 1000000
 
 // Walk the postfix chain rooted at `ix` down to its head, recording each postfix
@@ -2247,21 +2172,17 @@ function callArgText(node: Call, i: i32, argIndent: i32, column: i32) {
 }
 
 // ── the trailing-lambda exception ─────────────────────────────────────────────
-//
-// The generic list rule is "an argument spans lines ⇒ break EVERY argument",
-// which is right for every multi-line argument but one: a BLOCK-bodied lambda in
-// FINAL position already carries its own vertical structure in its braces, so
-// breaking the list around it adds four lines and a level of indent to say
-// nothing, at ANY width — `it("adds", () => { … })` became a six-line vertical
-// list in a 34-column call. Every JS formatter carves this exception; the three
-// rulings behind ours (LAST argument only / two lambdas ⇒ no hug / a lambda
-// followed by another argument ⇒ not trailing ⇒ no hug) and the corpus
+// The generic list rule is "an argument spans lines ⇒ break EVERY argument", which
+// is right for every multi-line argument but one: a BLOCK-bodied lambda in FINAL
+// position already carries its own vertical structure in its braces, so breaking
+// the list around it adds four lines and a level of indent to say nothing, at ANY
+// width. The three rulings behind ours (LAST argument only / two lambdas ⇒ no hug /
+// a lambda followed by another argument ⇒ not trailing ⇒ no hug) and the corpus
 // measurement behind each live in `docs/internals/fmt-trailing-lambda-design.md`.
 //
 // The guards below are what make those three rulings ONE rule: an EARLIER lambda
-// renders multi-line, so it fails "every preceding argument fits on one line"
-// and the whole call breaks; a lambda that is not last fails "the last argument
-// is a block lambda". Neither needs a rule of its own.
+// renders multi-line and so fails "every preceding argument fits on one line", and
+// a lambda that is not last fails "the last argument is a block lambda".
 
 // Is node `ix` a lambda whose body is a braced BLOCK? An expression-bodied
 // lambda (`(v) => v + 1`) renders on one line and is already untouched by the

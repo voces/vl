@@ -68,11 +68,26 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   with the binding rule), then the emitter's synthesized `null` else arm over the row's 2×12
   scope × rep grid, both faces. DECISIONS.md §"An else-less `if` used as a VALUE". Compile-goal
   track.
-- **UFCS is never implicit; the LSP surfaces the import — RULED (owner, 2026-09-02).**
-  `expect(x).toEqual(y)` keeps needing `toEqual` imported. Tooling: completion after `.`
-  offers a module's exported `f(self: T, …)` with an auto-import edit; a quick-fix on the
-  D1230 diagnostic adds the name to the import; the diagnostic itself names the missing
-  import (compile-goal, D1230). DECISIONS.md §"UFCS is never implicit". Tooling track.
+- **UFCS is never implicit; the LSP surfaces the import — RULED (owner, 2026-09-02);
+  TOOLING HALF SHIPPED the same day.** `expect(x).toEqual(y)` keeps needing `toEqual`
+  imported. DECISIONS.md §"UFCS is never implicit".
+  - **DONE.** Completion after `.` offers every free `f(self: T, …)` the receiver
+    dispatches to, from the file's whole module graph plus every `std:*` module, each
+    labelled with its module and carrying the import rewrite as an `additionalTextEdit`;
+    a quick-fix on the missing-import diagnostic adds the name to the import, one action
+    per candidate module. The candidate set is the CHECKER's (`ufcsCandidatesAt`, a new
+    LSP query over the same `declFirstParamIsSelf` + `assignable` pair `ufcsCallTy`
+    applies), so a generic `self` fits a concrete receiver without the host doing type
+    matching. Two capabilities fell out: a CALL receiver (`expect(1).`) completes at all,
+    which the field scan's bare-identifier lookup never could; and the import edit spells
+    a SPECIFIER (`./shapes`), not the module key the checker reports.
+  - **DONE (compile-goal half).** The diagnostic names the missing import and carries
+    `ufcs-not-imported;member=…;modules=…;recv=…` on the `diagCodeLen`/`diagCodeByte`
+    channel, so the quick-fix keys on the code and its message-shape fallback is retired.
+    `recv=` is last and is read as everything after the first `;recv=`. D1230.
+  - **REMAINS.** Workspace modules the file does not already import are not probed — the
+    500-file crawl is too expensive per keystroke — so a workspace `f(self: T, …)` is
+    offered only from a module already in the graph.
 - **Driver lossless-recovery flag — STAGE 1 DONE #2210** (ruled 2026-09-01, shipped the
   same day). A file whose EVERY parse diagnostic is a lossless recovery's is typechecked
   and linted anyway, so "missing brace" and "type error four lines down" are reported
@@ -107,6 +122,19 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
     remain. DECISIONS.md §"A missing list separator is inserted, never skipped past".
   - **NEXT: the `then`-removal arm in `parseIf`**, which is already single-statement and was
     called out at stage 1 as the cheapest remaining candidate.
+- **Modernization program — (1) comment trim, PILOT DONE #2413**: `compiler/parser.vl`,
+  `compiler/format.vl` and `compiler/emit_sections.vl` are at the 12-line comment-block
+  budget (72 blocks over 12 → 2, both of those module headers under their own 40-line
+  budget), with a byte-identical seed and the moved text archived verbatim in
+  `docs/internals/{parser,format,emit-sections}-notes.md`. `emit_bytes.vl` and the large
+  emitter/checker files come later, under a freeze; the lint + ratchet
+  (`scripts/comment-budget.py`) lands separately.
+- **Modernization program, item 3 — the defect inventory is ONE FILE PER ROW. TOOLING SHIPPED;
+  the split itself lands on merge day.** `scripts/inventory/split.py --apply --relink` run
+  against fresh master, under a freeze on inventory appends; every consumer already reads
+  either form, so nothing else changes that day. Two gates came out of it:
+  `tests/vl_inventory_refs_test.ts` (a cited row must EXIST — #2405 deleted a row and every
+  gate stayed green) and the file-stem check in `vl_inventory_rows_test.ts`.
 - **Width subtyping — RULED (owner, 2026-09-01): the non-prefix refusal is a GAP, closed
   the Roc way** — shape-monomorphization of narrow-typed consumers (offsets constant per
   caller shape; zero runtime cost; paid in instance count — the variant-count tradeoff
@@ -118,8 +146,26 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
   repeat silently; the mitigation is an INSTRUMENT, not hesitation (a per-build instance
   report making mono growth visible — filed as part of the implementation's grading).
   Compiler-side work; the compile-goal session's surface.
-- **Deep `is` / `as` over a `Json` value — RULED (owner, 2026-09-02): "why would it have to
-  be one `is` test per level? … get that working"** — `std:json` v1 (#2322) ships NO
+- **Deep `is` over a `Json` value — `is` BUILT 2026-09-02 (PR-DEEPIS); the `as` TRIO IS THE
+  REMAINDER.** `r is T` for a JSON-SHAPE `T` is now a runtime shape walk plus a conversion:
+  the checker records the deep sites, the driver generates one `__vlJsonIs_<k>` +
+  `__vlJsonGet_<k>` pair per distinct target as ordinary VL SOURCE, splices it into the
+  program and re-checks, so the arm binds a real `string[]` / `Cfg` / `{[string]: i32}` and
+  no delivery position had to be wired. S1 (copy), S2 (integral, in-range — literally
+  `v as? i32`) and S3 (absent key matches `T | null` as `null`) all hold; D1035 CLOSED.
+  **Still to build: S4, the `as` trio** — `r as T` yielding `T | JsonError` with
+  `JsonError { kind: "shape", path: "<json pointer to the first mismatch>" }`, `as!`
+  trapping with the same message, `as? ` yielding `T | null`. That needs the walker to track
+  a POINTER (the current pair returns a bare boolean and a bare `T`), and adding `"shape"` to
+  the exported `JsonError.kind` literal set is a std API change that must go through
+  `std-api-reviewer` first. Three residue rows carry the rest: **D1197** (`.push` drops the
+  non-null recovery for a narrowed nullable ref — the reason the walker is a PAIR rather
+  than one `T | null` function), **D1198** (a recursive JSON shape target has no walker,
+  because the generator inlines each level), **D1190** (a deep `is` arm that rebinds or
+  writes the tested place refuses). Closing D1197 is the unlock for both of the others.
+  Design + the built/not-built split: `docs/serde-design.md` §"Deep `is` / `as` over a
+  `Json` value" §"WHAT WAS BUILT"; DECISIONS.md has the standing rule.
+- **`as` trio over a `Json` value — the remainder of the item above, NOT BUILT** — `std:json` v1 (#2322) ships NO
   accessor helper (json-design §6 q1 = (a), "until we have an actual consumer"); the
   decoder is the operator: `if doc is Cfg { doc.server.port }` / `doc as Cfg` (trio
   semantics), a compiler-derived per-`T` shape walk that BUILDS the `T`-repped value from
@@ -562,10 +608,17 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
 > own standing check (`docs/internals/destringify-types-program.md` § "How to verify"): both greps
 > pass. Do not re-open it from a stale call-site census; run that check first.
 >
-> **The one forward question it leaves, stated and unstarted:** the emitter's registries are keyed on
-> the canon-SOFTENED spelling because that is the REP, not the type. Re-keying them on the precise
-> type would change what the rep layer decides on — a DESIGN change to what the arena records, not a
-> call-site conversion. Unpriced.
+> **The one forward question it leaves — now PRICED, still unstarted** (Modernization program item
+> 4; `docs/internals/registry-by-type-id.md`, 2026-09-02): the emitter's registries are keyed on the
+> canon-SOFTENED spelling because that is the REP, not the type. Measured over 2,389 registered
+> union rows, **neither candidate key in the tree works**: the arena index is not an identity, and
+> `repCanonId` merges **360 row pairs** the positional box-tag ABI needs apart (63 with different
+> member sets) while SPLITTING a nested union from its flattening — which is #2406-d2 exactly. The
+> answer is a new interned rep key minted by canon once, that every producer obtains rather than
+> renders; the shim shows the cheap version closes 1 of 5 filed witness rows, because a MISSING
+> REGISTRATION (D1042 row 1, D1112) is not a key question and a PRODUCER DISAGREEMENT is.
+> **65% of the 81 name-keyed sites are NAME-ONLY** — the name was cut from another name — and
+> `registerInlineUnion` recurses on such a cut at 11 of its 18 sites, which is B277 one layer up.
 >
 > **Before scheduling any remaining boundary-parse cleanup**, ask B277's second question (does the
 > split relocate the work, or remove it?). `registerInlineUnion` is 8,696 reaches and was REFUSED on

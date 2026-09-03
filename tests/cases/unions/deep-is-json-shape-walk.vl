@@ -1,0 +1,192 @@
+// @run
+// @log IF
+// @log 3
+// @log AND
+// @log 3
+// @log NOT
+// @log 3
+// @log ELIF
+// @log 3
+// @log CLOSURE
+// @log 3
+// @log FIELD
+// @log 2
+// @log INDEX
+// @log 2
+// @log CALL
+// @log 1
+// @log MAPREAD
+// @log 2
+// @log VALUE
+// @log true
+// @log WHILE
+// @log 3
+// @log I32LIST
+// @log 3
+// @log F64LIST
+// @log 1.25
+// @log CFGLIST
+// @log 2
+// @log I32MAP
+// @log 4
+// @log NESTED
+// @log 3
+// @log CFGORNULL
+// @log 1
+// @log 2
+// @log JSONFIELD
+// @log 1
+// @hint redundant type annotation: `inIf` is inferred as `i32`
+// @hint redundant type annotation: `inAnd` is inferred as `i32`
+// @hint redundant type annotation: `inNot` is inferred as `i32`
+// @hint redundant type annotation: `inElseIf` is inferred as `i32`
+// @hint redundant type annotation: `bx` is inferred as `{payload: Json}`
+// @hint redundant type annotation: `arr` is inferred as `Json[]`
+// @hint redundant type annotation: `inWhile` is inferred as `i32`
+// The seven hints above are DECLARED rather than deleted: each annotation is the
+// un-inferred face of a cell, and removing it would make the fixture blind to the
+// half of this feature that depends on a destination being pinned.
+// DEEP `is` OVER A `Json` VALUE — the position/target matrix
+// (`docs/serde-design.md` §"Deep `is` / `as` over a `Json` value"; closes D1035).
+//
+// `r is string[]` over a `Json` is not an arm test: a `Json[]` holding strings is not a
+// `string[]` in the heap, so no tag says yes. Before this it was check-clean and printed
+// `false` for every value; the struct spellings (`r is Cfg`) were refused outright as "not
+// a variant of Json". Both halves are one build — the test is a runtime SHAPE WALK, and a
+// successful arm binds a CONVERTED COPY of the value (S1), so the reads below are reads of
+// a real `string[]` / `Cfg` / `{[string]: i32}` and never of the tree.
+//
+// EVERY CELL PRINTS SOMETHING THE CONVERSION HAD TO PRODUCE — a `.length` off a converted
+// string, an `i32` field plus one, an `f64` halved — rather than the boolean, because a
+// boolean cell cannot tell a walk that matched from a walk that built the wrong rep.
+
+type Json = null | boolean | f64 | string | Json[] | { [string]: Json }
+type Cfg = { port: i32, host: string | null }
+type Item = { name: string, price: f64 }
+type Doc = { items: Item[], total: f64 }
+type Box = { payload: Json }
+type Env = { payload: Json, tag: string }
+
+function mkCfg(): Json {
+  const m: { [string]: Json } = Map()
+  m["port"] = 1.0
+  m
+}
+
+// ── `is` POSITIONS ───────────────────────────────────────────────────────────
+function inIf(r: Json): i32 {
+  if r is string[] { return r[0].length }
+  0
+}
+print("IF")
+const lst: Json = ["xyz"]
+print(inIf(lst))
+
+function inAnd(r: Json, ok: boolean): i32 {
+  if ok && r is string[] { return r[0].length }
+  0
+}
+print("AND")
+print(inAnd(lst, true))
+
+function inNot(r: Json): i32 {
+  if !(r is string[]) { return 0 } else { return r[0].length }
+}
+print("NOT")
+print(inNot(lst))
+
+function inElseIf(r: Json): i32 {
+  if r is boolean { return 1 } else if r is string[] { return r[0].length }
+  0
+}
+print("ELIF")
+print(inElseIf(lst))
+
+print("CLOSURE")
+const inClosure = (r: Json) => {
+  if r is string[] { return r[0].length }
+  0
+}
+print(inClosure(lst))
+
+print("FIELD")
+const bx: Box = { payload: mkCfg() }
+if bx.payload is Cfg { print(bx.payload.port + 1) } else { print(-1) }
+
+print("INDEX")
+const arr: Json[] = [mkCfg()]
+if arr[0] is Cfg { print(arr[0].port + 1) } else { print(-1) }
+
+print("CALL")
+if mkCfg() is Cfg { print(1) } else { print(-1) }
+
+print("MAPREAD")
+const holder: { [string]: Json } = Map()
+holder["k"] = mkCfg()
+if holder["k"] is Cfg { print(holder["k"].port + 1) } else { print(-1) }
+
+print("VALUE")
+const asBool = lst is string[]
+print(asBool)
+
+// A LOOP CONDITION gets the boolean and no binding, exactly as an ordinary union does:
+// `checkWhileStmt` carries only null strips into a loop body, never an `is T` variant pin
+// (a pin would reject the assignment that flips the variant, which is how a loop over a
+// union terminates). `error-deep-is-while-body-read.vl` pins the refused half.
+function inWhile(r: Json): i32 {
+  let n = 0
+  while r is string[] {
+    n = n + 3
+    if n > 2 { return n }
+  }
+  n
+}
+print("WHILE")
+print(inWhile(lst))
+
+// ── TARGETS ──────────────────────────────────────────────────────────────────
+print("I32LIST")
+const nums: Json = [1.0, 2.0]
+if nums is i32[] { print(nums[1] + 1) } else { print(-1) }
+
+print("F64LIST")
+const reals: Json = [1.5, 2.5]
+if reals is f64[] { print(reals[1] / 2.0) } else { print(-1.0) }
+
+print("CFGLIST")
+const cfgs: Json = [mkCfg()]
+if cfgs is Cfg[] { print(cfgs[0].port + 1) } else { print(-1) }
+
+print("I32MAP")
+const counts: { [string]: Json } = Map()
+counts["a"] = 3.0
+const countsJ: Json = counts
+if countsJ is { [string]: i32 } {
+  const v = countsJ["a"]
+  if v != null { print(v + 1) } else { print(-2) }
+} else { print(-1) }
+
+print("NESTED")
+const it: { [string]: Json } = Map()
+it["name"] = "pen"
+it["price"] = 1.5
+const items: Json[] = [it]
+const doc: { [string]: Json } = Map()
+doc["items"] = items
+doc["total"] = 1.5
+const docJ: Json = doc
+if docJ is Doc { print(docJ.items[0].name.length) } else { print(-1) }
+
+print("CFGORNULL")
+const someCfg = mkCfg()
+if someCfg is Cfg | null { print(1) } else { print(-1) }
+const noneJ: Json = null
+if noneJ is Cfg | null { print(2) } else { print(-2) }
+
+// A field typed `Json` matches ANYTHING and is copied by reference — no walk.
+print("JSONFIELD")
+const env: { [string]: Json } = Map()
+env["payload"] = 42.0
+env["tag"] = "t"
+const envJ: Json = env
+if envJ is Env { print(envJ.tag.length) } else { print(-1) }

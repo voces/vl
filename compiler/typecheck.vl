@@ -114,6 +114,9 @@ import {
   tsMentionsAnyName,
   ufcsAliasAtSite,
   ufcsAliasOf,
+  ufcsImpMangled,
+  ufcsImpName,
+  ufcsImpSpec,
 } from "./ast"
 // The free INDEX-OPERATOR declaration-name encoding (B14).
 import { OP_INDEX_GET, OP_INDEX_SET, opDeclLabel, opDeclOpOf } from "./ast"
@@ -434,6 +437,32 @@ type TDiag = { tmsg: string, tat: i32, tline: i32, tcol: i32, tcode: string }
 // `diagCodeByte`), yet still an error — a program that cannot build must not
 // pass `vl check`.
 const CODE_UNSUPPORTED_LOWERING = "unsupported-lowering"
+
+// D1230's category code, and the ONE payload channel its quick-fix reads. A UFCS
+// member call whose name is a free `self`-function exported by a module in the
+// graph but not imported by this file carries:
+//
+//     ufcs-not-imported;member=<name>;modules=<spec>[,<spec>…];recv=<type>
+//
+// THE QUICK-FIX MUST NEVER PARSE THE SENTENCE, which is why the payload rides
+// here rather than in the message: the wording is free to improve and the code is
+// not. The contract, in the form a host can implement without a grammar:
+//
+//   * `;` separates fields, and they appear in exactly this order.
+//   * `member=` is the property AS WRITTEN — an identifier, so it carries no
+//     separator.
+//   * `modules=` is a `,`-joined list of module specifiers, each one spelled the
+//     way the file can write it TODAY (an existing import's own text, or a
+//     `std:` specifier). Ordered by the module graph's dependency-first walk and
+//     deduplicated. A specifier is a module key or a `std:` name and can hold
+//     neither `,` nor `;`.
+//   * `recv=` is LAST and is a RENDERED TYPE, which may hold anything at all —
+//     `|`, `,`, `;` inside a string-literal member. Read it as everything after
+//     the first `;recv=`, never as a `;`-split field.
+//
+// ONE DIAGNOSTIC PER CALL, listing every candidate module, because the fix is one
+// choice among them — N diagnostics would stack N squiggles on one token.
+const CODE_UFCS_NOT_IMPORTED = "ufcs-not-imported"
 
 // ── Checker state (one struct, held in the global `T`) ───────────────────────
 // `tys`     — the type arena (every type is an index into it).
@@ -1083,6 +1112,23 @@ let ufcsCstrIx: i32[] = []
 let ufcsCstrFn: i32[] = []
 let ufcsCstrP0: i32[] = []
 
+// D1230 — the missing-import answer, banked at the CALLEE MEMBER NODE by the call
+// site that computed it and read back by the member arm that raises the sentence.
+//
+// The two halves of the question live in different places and neither can move to
+// the other: only the CALL knows the argument count that decides whether a
+// candidate's arity fits, and only `checkMemberNode` reaches the arm that names
+// the receiver ("no field on a struct", "on array", "on map", …). A sidecar keyed
+// by node index costs nothing and leaves the control flow of a failing call
+// EXACTLY as it was — the arguments are still checked, the same one diagnostic is
+// still raised, at the same anchor.
+//
+// `ufcsMissSpecs[i]` is the `,`-joined specifier list for the callee member node
+// `ufcsMissAt[i]`. A node is banked at most once (the first call wins; a member
+// node belongs to one call).
+let ufcsMissAt: i32[] = []
+let ufcsMissSpecs: string[] = []
+
 // SOLVED un-annotated parameter types — the parameter's own body USAGE, read back as
 // its type. A hole is permissively assignable both ways, so a usage that requires a
 // concrete type (`const r: K = u`, `return u` under a declared return, `q(u)` into an
@@ -1364,6 +1410,17 @@ let tyStrAtoms = 1
 // already spent when the narrowing installs, so it does not block the write.
 const NAR_KIND_ASG = 0
 const NAR_KIND_GUARD = 1
+// THE POST-GUARD FALL-THROUGH's shadow, banked under a kind of its own.
+//
+// `if r is JsonError { return }` narrows the REST OF THE BLOCK by a plain `declare` in the
+// enclosing scope — no `applyNarrows`, so no `NAR_KIND_GUARD` row — and that is the second
+// producer of a complement view over a union binding. The deep-`is` walker has to spell its
+// parameter with the DECLARED union (the emitter holds no complement), so it needs this
+// shadow banked too. A THIRD kind rather than reusing `NAR_KIND_GUARD`: `narGuardSlot`
+// writes retirement through the guard slot and `dead-??` reads the guard kind, and neither
+// should start seeing a row where it never had one. `narDeclaredTy(name, -1)` takes any
+// kind, which is the only reader that wants these.
+const NAR_KIND_POSTGUARD = 2
 let narFnEpoch = 0
 let asgDeclKeys: string[] = []
 let asgDeclTys: i32[] = []
@@ -3327,9 +3384,68 @@ function seedExpected(exprIx: i32, expectedTy: i32) {
   0
 }
 
+// ── DEEP `is` OVER A `Json` VALUE — the sites the checker ADMITS and RECORDS ──
+// (`docs/serde-design.md` §"Deep `is` / `as` over a `Json` value`; closes
+// silent-class-inventory D1035.)
+//
+// `r is T` where `r`'s type is a JSON-SHAPED UNION and `T` is not one of its arms is a
+// RUNTIME SHAPE WALK, not a tag test. The checker's whole job is to say WHICH sites are
+// that — it cannot lower one — so it records the site and the target here, and
+// `json_walk.vl` turns each distinct target into one generated VL walker and rewrites the
+// site into a call. The tables are ARENA-PARALLEL to nothing and node-parallel to nothing:
+// they are a per-compile worklist, so they reset exactly where the arena does.
+//
+// `jwTgt*` is DEDUPED by (target spelling, receiver spelling) — that pair is the walker's
+// identity, and it is why two `is Cfg` sites in one module emit ONE walker.
+export let jwTgtSpell: string[] = []
+export let jwTgtRecv: string[] = []
+export let jwTgtTy: i32[] = []
+// The canonical `Json` the walk is written against, which is NOT always the walker's
+// parameter type: `parseJson` answers `Json | JsonError`, and a value of that type is not
+// assignable to `Json`, so the walker takes the WIDER union and tests its container arms
+// directly (they flatten through the nesting — `doc is {[string]: Json}` over
+// `Json | JsonError` runs today, while `doc is Json` does not). The root is what the shape
+// predicate, the wildcard leaf and the two arm spellings are read from.
+export let jwTgtRootTy: i32[] = []
+// One row per admitted SITE: the `IsExpr` arena index, and the `jwTgt*` row it walks.
+export let jwSiteNode: i32[] = []
+export let jwSiteTgt: i32[] = []
+// The last "not a JSON shape" reason, banked rather than raised — see `jsonDeepIsSite`.
+let jwBadMsg = ""
+// THE FIRST TOKEN OF THE GENERATED WALKERS, or -1 before the driver appends them.
+//
+// The walker fragment is parsed onto the END of the token stream, so one comparison
+// separates a finding about the USER's source from one about code they never wrote. The
+// STYLE tier is where that matters: the generated `let __vjp14: string = ""` is a redundant
+// annotation by the letter of the rule, and reporting it would put a hint in the editor at
+// a position no source file has — eight of them on a nine-line program. Errors are NOT
+// filtered: a diagnostic inside a walker means the generator emitted something the checker
+// refuses, and that has to stay LOUD.
+export let jwGenTokStart = -1
+export function jwSetGenTokStart(t: i32): i32 {
+  jwGenTokStart = t
+  0
+}
+function jwTokIsGenerated(tok: i32): boolean {
+  if jwGenTokStart < 0 { return false }
+  tok >= jwGenTokStart
+}
+
+export function jwReset() {
+  jwGenTokStart = -1
+  jwTgtSpell = []
+  jwTgtRecv = []
+  jwTgtTy = []
+  jwTgtRootTy = []
+  jwSiteNode = []
+  jwSiteTgt = []
+  0
+}
+
 // Reset all checker module state, then intern the well-known primitives and the
 // global scope. Call once before checking.
 export function initChecker() {
+  jwReset()
   redunReset()
   rcoalReset()
   isvalReset()
@@ -3440,6 +3556,8 @@ export function initChecker() {
   ufcsCstrIx = []
   ufcsCstrFn = []
   ufcsCstrP0 = []
+  ufcsMissAt = []
+  ufcsMissSpecs = []
   solvedParamTys = Map()
   paramSolveTried = Map()
   holeFlowSrc = []
@@ -6720,6 +6838,7 @@ function recordDeadCoalesce(ix: i32, lt: i32) {
   if ix < 0 || ix >= nodeToks.length { return 0 }
   const tk = nodeToks[ix]
   if tk < 0 || tk >= P.toks.length { return 0 }
+  if jwTokIsGenerated(tk) { return 0 }
   const t = P.toks[tk]
   // An EXACT repeat (same anchor) is the re-check of one node, not a second finding —
   // the same de-duplication `tErrCoded` applies to the error tier.
@@ -6879,6 +6998,7 @@ function recordRedundantAnnot(
   if !tyEq(initTy, annot) { return 0 }
   const nameTok = declNameTokOf(declIx)
   if nameTok < 0 { return 0 }
+  if jwTokIsGenerated(nameTok) { return 0 }
   // The fix deletes the annotation, so the span runs from just after the NAME to
   // the assignment `=`. Find that `=` by scanning the tokens between (the
   // annotation can be multi-token — `{[string]: i32}[]`, a function type — so the
@@ -6993,6 +7113,7 @@ function recordRedundantRet(n: FuncDecl, fnIx: i32, ret: i32) {
     bi = bi + 1
   }
   if braceTok < 0 { return 0 }
+  if jwTokIsGenerated(nameTok) { return 0 }
   redunSLine.push(P.toks[colonTok].line)
   redunSCol.push(P.toks[colonTok].col)
   redunELine.push(P.toks[braceTok].line)
@@ -18962,7 +19083,12 @@ function litShapeDropSrcExpr(claimedExpr: i32) {
   false
 }
 
-function assignable(src: i32, dst: i32) {
+// EXPORTED for the LSP query layer's UFCS candidate scan (`check_query.symUfcsScanAt`),
+// which asks exactly the question `ufcsCallTy` asks of a written call — "does this
+// receiver fit that `self` parameter" — of every declared `self`-function, so that the
+// editor can offer the ones whose import is missing. Nothing else outside this file
+// calls it; the export is a visibility change, not a new answer.
+export function assignable(src: i32, dst: i32) {
   if src < 0 || dst < 0 { return true }
   if src == dst { return true }
   let gi = asgSrcStack.length - 1
@@ -20239,6 +20365,80 @@ function stdFmtMovedNote(name: string) {
     return " — `toStr` was renamed to `toString`: add `import { toString } from \"std:fmt\"`"
   }
   ""
+}
+
+// RAISE the member arm's sentence at node `ix` — `memberFloorMsg`'s words, unless
+// the call site banked a missing-import answer for this very node, in which case
+// D1230's sentence and its `ufcs-not-imported` code replace them.
+//
+// ONE HOME FOR THE RAISE, for the same reason `memberFloorMsg` is one home for the
+// words: `checkMemberNode` refuses from SEVEN arms (struct, union, array, map,
+// string, bound type parameter, and the final non-object floor), and a UFCS call
+// can fail on any of them. A per-arm enrichment would have covered the struct
+// receiver, which is the witness everybody types, and silently missed the rest.
+//
+// THE OLD SENTENCE SURVIVES WHEREVER THERE IS NO IMPORT TO SUGGEST, which is every
+// single-file program and every member call on a type that genuinely has no such
+// function anywhere. That is the control, not an accident: the substitution is
+// gated on the bank holding this node, and the bank is filled only by a call whose
+// name IS a free `self`-function accepting this receiver.
+function memberFloorErr(objTy: i32, prop: string, ix: i32) {
+  const specs = ufcsMissSpecsAt(ix)
+  if specs != "" {
+    return tErrCoded(
+      ufcsNotImportedMsg(prop, specs, objTy),
+      ix,
+      ufcsNotImportedCode(prop, specs, objTy),
+    )
+  }
+  tErr(memberFloorMsg(objTy, prop), ix)
+}
+
+// D1230's SENTENCE. The fault is the missing import, so the sentence leads with it
+// — `no field 'toEqual' on Expectation<i32>` is true, permanent, and tells a reader
+// nothing they can act on, while the compiler knew the whole time that `toEqual` is
+// a free `self`-function sitting in a module the file already names.
+//
+// ONE TEMPLATE for one and for many candidates: the module list renders as `"a"` or
+// `"a", "b"` and the rest of the words do not change. Two sentences differing only
+// by a count are two literals to keep in step, and the plural one is the one nobody
+// ever reads while writing the fix.
+//
+// The closing clause is the RULE, not a hedge: UFCS in this language is explicit by
+// ruling (DECISIONS.md §"UFCS is never implicit"), so a reader who expected the
+// receiver's own module to be searched is told why it was not.
+function ufcsNotImportedMsg(prop: string, specs: string, objTy: i32) {
+  "'" +
+    prop +
+    "' is not imported — a free `" +
+    prop +
+    "(self: …)` accepting " +
+    tyToStr(objTy) +
+    " is exported by " +
+    specListQuoted(specs) +
+    "; a UFCS call resolves only names in scope, so import `" +
+    prop +
+    "` from there"
+}
+
+// D1230's PAYLOAD — the machine half, whose shape `CODE_UFCS_NOT_IMPORTED`
+// documents. `recv=` is last precisely because a rendered type is the one field
+// that can contain the separators.
+//
+// IT DEMANGLES ITS OWN RECEIVER, and that is not duplication. The MESSAGE is
+// demangled downstream, once, for every diagnostic (`driver.vcDiagMsg`); the CODE
+// is not, because a category code has never carried a program's names. Only this
+// payload does, so it strips the merge's `$mN` here — otherwise the sentence would
+// say `Box` while the field a quick-fix reads says `Box$m1`, which is a type name
+// no source file contains.
+function ufcsNotImportedCode(prop: string, specs: string, objTy: i32) {
+  CODE_UFCS_NOT_IMPORTED +
+    ";member=" +
+    prop +
+    ";modules=" +
+    specs +
+    ";recv=" +
+    demangleMsg(tyToStr(objTy))
 }
 
 // THE INDEX ARM'S OWN SENTENCE, on the same terms — "" when `recv[i]` resolves or defers,
@@ -23462,6 +23662,111 @@ function boundMemberFloorMsg(tvName: string, prop: string) {
     has
 }
 
+// Would a UFCS call with `argc` explicit arguments on a receiver of type `recvTy`
+// DISPATCH to the free self-function merged as `mangled`? (D1230.)
+//
+// MIRRORS `ufcsCallTy`'s GATE, arm for arm and in its order — the lookup, the
+// `self`-name rule, the arity RANGE, `assignable(recvTy, params[0])` — and
+// deliberately nothing after it. That cut is the whole safety argument: this runs
+// SPECULATIVELY, on a call that has already failed, over every same-named
+// candidate in the graph, so it must not do any of the things the real dispatch
+// does on the way to an answer. `ufcsCallTy` forces a pending return
+// (`checkNode(dIx)`), records a deferred constraint (`noteUfcsCstr`), reorders
+// named arguments, fills defaults and reports argument mismatches; each of those
+// would raise a diagnostic or mutate inference state for a function the program
+// never calls.
+//
+// So a candidate answering TRUE here is not a promise the call would COMPILE once
+// imported — the arguments are still unchecked. It is the promise the message
+// makes: the name is a self-function, and its `self` takes this receiver.
+function ufcsWouldDispatch(mangled: string, recvTy: i32, argc: i32) {
+  const fnTy = lookup(mangled)
+  if fnTy < 0 { return false }
+  const ft = T.tys[fnTy]
+  if ft is TyFunc {
+    const params = ft.fnParamTypes
+    if params.length < 1 { return false }
+    if !declFirstParamIsSelf(mangled) { return false }
+    const uDecl = declParamsAfterSelf(mangled)
+    let uRequired = params.length - 1
+    if uDecl.length == params.length - 1 { uRequired = fnRequiredArity(uDecl) }
+    if argc < uRequired || argc + 1 > params.length { return false }
+    return assignable(recvTy, params[0])
+  }
+  false
+}
+
+// The `,`-joined module specifiers that would make `recv.prop(argc args)` resolve,
+// or "" when no module in the graph offers one (D1230). Deduplicated, in the
+// registry's own dependency-first order.
+//
+// EMPTY IS THE COMMON ANSWER and is the point: a single-file program has no
+// registry rows at all, and a member call on a type that genuinely has no such
+// function anywhere keeps the direct sentence it has today.
+function ufcsMissingImportSpecs(prop: string, recvTy: i32, argc: i32) {
+  const specs: string[] = []
+  let i = 0
+  while i < ufcsImpName.length {
+    if ufcsImpName[i] == prop {
+      if ufcsWouldDispatch(ufcsImpMangled[i], recvTy, argc) {
+        if !listHasStr(specs, ufcsImpSpec[i]) { specs.push(ufcsImpSpec[i]) }
+      }
+    }
+    i = i + 1
+  }
+  let out = ""
+  let j = 0
+  while j < specs.length {
+    if j > 0 { out = out + "," }
+    out = out + specs[j]
+    j = j + 1
+  }
+  out
+}
+
+// The `,`-joined payload list, rendered for the SENTENCE: `a,b` → `"a", "b"`.
+// The two forms are built from the one string so the message and the code can
+// never name different modules.
+function specListQuoted(list: string) {
+  let out = ""
+  let start = 0
+  let i = 0
+  while i < list.length {
+    if list[i] == ',' {
+      if out != "" { out = out + ", " }
+      out = out + "\"" + list.slice(start, i) + "\""
+      start = i + 1
+    }
+    i = i + 1
+  }
+  if out != "" { out = out + ", " }
+  out + "\"" + list.slice(start, list.length) + "\""
+}
+
+// Bank the callee MEMBER node's missing-import answer for `memberFloorErr`.
+function noteUfcsMiss(memIx: i32, specs: string) {
+  if memIx < 0 { return 0 }
+  if specs == "" { return 0 }
+  let i = 0
+  while i < ufcsMissAt.length {
+    if ufcsMissAt[i] == memIx { return 0 }
+    i = i + 1
+  }
+  ufcsMissAt.push(memIx)
+  ufcsMissSpecs.push(specs)
+  0
+}
+
+// The banked answer for member node `memIx`, or "" when the call site banked none.
+function ufcsMissSpecsAt(memIx: i32) {
+  let i = 0
+  while i < ufcsMissAt.length {
+    if ufcsMissAt[i] == memIx { return ufcsMissSpecs[i] }
+    i = i + 1
+  }
+  ""
+}
+
 function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
   // A UFCS callee names a free `self`-function by its SOURCE name. The module
   // merge mangles such functions (`shout` → `shout$m1`) but leaves the call's
@@ -24424,6 +24729,18 @@ function checkCallNode(n: Call, ix: i32) {
         // UFCS `self`-method on a string receiver (`"hello".first()`).
         const su = ufcsCallTy(sp, recvTy, n, ix)
         if su >= 0 { return su }
+        // D1230 on a STRING receiver. This arm answers before the general one and
+        // raises its own sentence at the CALL node, so it asks and raises here
+        // rather than banking — `memberFloorErr` never sees a string method call.
+        const suSpecs = ufcsMissingImportSpecs(sp, recvTy, n.callArgs.length)
+        if suSpecs != "" {
+          tErrCoded(
+            ufcsNotImportedMsg(sp, suSpecs, recvTy),
+            ix,
+            ufcsNotImportedCode(sp, suSpecs, recvTy),
+          )
+          return TY_ERR
+        }
         tErr("no method '." + sp + "' on string", ix)
         return TY_ERR
       }
@@ -24507,6 +24824,16 @@ function checkCallNode(n: Call, ix: i32) {
     if !ufcsHasField {
       const uu = ufcsCallTy(cfn.memProp, recvTy, n, ix)
       if uu >= 0 { return uu }
+      // D1230 — THE NAME IS A SELF-FUNCTION, JUST NOT ONE IN SCOPE. Asked here
+      // because only the CALL knows the argument count, and banked on the callee
+      // MEMBER node because that is where the sentence is raised. Nothing else
+      // changes: the callee is still checked, the arguments are still checked, and
+      // the one diagnostic the program gets is still the member arm's — with
+      // different words (`memberFloorErr`).
+      noteUfcsMiss(
+        n.callFn,
+        ufcsMissingImportSpecs(cfn.memProp, recvTy, n.callArgs.length),
+      )
     }
   }
   // A memory intrinsic that is DECLARED in the default scope but has no emitter arm
@@ -37579,6 +37906,11 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
         }
         pgPreKeys.push(gKey)
         pgPreTys.push(lookup(gKey))
+        // …and bank the shadowed DECLARATION under the post-guard kind, so a consumer
+        // that needs the union the EMITTER still holds can find it (deep `is`, D1035).
+        // Idempotent per (name, depth, kind), so a SEQUENCE of guard clauses banks the
+        // first — the widest — and the later subtractions add nothing.
+        noteNarShadow(gKey, lookup(gKey), NAR_KIND_POSTGUARD)
         // ONE LEG FOR BOTH KINDS. A null STRIP (`gTy == nonNullTy(lookup(gKey))`)
         // and a union SUBTRACTION are the same shadowing `declare`; they were split
         // here only so the strip could skip the subtraction bank, and the bank is
@@ -37596,6 +37928,7 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
       let pu = pgUpKeys.length
       while pu > pgUpMark {
         pu = pu - 1
+        noteNarShadow(pgUpKeys[pu], lookup(pgUpKeys[pu]), NAR_KIND_POSTGUARD)
         declare(pgUpKeys[pu], pgUpTys[pu])
       }
     }
@@ -37981,7 +38314,7 @@ function checkMemberNode(n: Member, ix: i32) {
   if ot is TyObj {
     const ft = objFieldType(ot, n.memProp)
     if ft < 0 {
-      tErr(memberFloorMsg(objTy, n.memProp), ix)
+      memberFloorErr(objTy, n.memProp, ix)
       return TY_ERR
     }
     return symMem(ix, ft)
@@ -38002,13 +38335,13 @@ function checkMemberNode(n: Member, ix: i32) {
     // inline shapes that is the whole work of the diagnostic. The offending member is a
     // per-member fact this seam already has; the JOIN failure (every member HAS the field,
     // at reps that do not join) is NOT, and it correctly appends nothing.
-    tErr(memberFloorMsg(objTy, n.memProp), ix)
+    memberFloorErr(objTy, n.memProp, ix)
     return TY_ERR
   }
   // `.length` on an array, a map, or a string is an i32.
   if ot is TyArray {
     if n.memProp == "length" { return symMem(ix, TY_I32) }
-    tErr(memberFloorMsg(objTy, n.memProp), ix)
+    memberFloorErr(objTy, n.memProp, ix)
     return TY_ERR
   }
   if ot is TyMap {
@@ -38016,13 +38349,13 @@ function checkMemberNode(n: Member, ix: i32) {
     // JS Map/Set name, `.length` the list-consistent alias; both read the same field.
     if n.memProp == "length" { return symMem(ix, TY_I32) }
     if n.memProp == "size" { return symMem(ix, TY_I32) }
-    tErr(memberFloorMsg(objTy, n.memProp), ix)
+    memberFloorErr(objTy, n.memProp, ix)
     return TY_ERR
   }
   if ot is TyPrim {
     if ot.primName == "string" {
       if n.memProp == "length" { return symMem(ix, TY_I32) }
-      tErr(memberFloorMsg(objTy, n.memProp), ix)
+      memberFloorErr(objTy, n.memProp, ix)
       return TY_ERR
     }
   }
@@ -38075,7 +38408,7 @@ function checkMemberNode(n: Member, ix: i32) {
       }
     }
   }
-  tErr(memberFloorMsg(objTy, n.memProp), ix)
+  memberFloorErr(objTy, n.memProp, ix)
   return TY_ERR
 }
 // ── array literal ───────────────────────────────────────────────────────────
@@ -38395,6 +38728,463 @@ function isWidenNotVariant(chkTy: i32, baseTy: i32) {
 }
 
 // Extracted from `checkNodeReal`'s `IsExpr` arm (C3: thin the dispatcher).
+// ── the DEEP-`is` predicates (D1035) ─────────────────────────────────────────
+//
+// THE RECEIVER SIDE. A JSON-SHAPED UNION is one carrying BOTH a `<self>[]` member and a
+// `{[string]: <self>}` member — the two recursive arms that make `Json` a tree rather than
+// a flat union. That is a STRUCTURAL question and deliberately not a name test: nothing in
+// the language privileges the spelling `Json`, and `std:json` exports the alias under a
+// merge-mangled name anyway.
+export function jsonUnionTy(ix: i32): boolean { jsonUnionRootOf(ix) >= 0 }
+
+// The ARRAY arm's element (`want` 0) or the string-keyed MAP arm's value (`want` 1) of a
+// union, or -1 when it has none.
+function jsonArmElemOf(ix: i32, want: i32): i32 {
+  const ms = jsonUnionMembers(ix)
+  let i = 0
+  while i < ms.length {
+    const m = T.tys[ms[i]]
+    if m is TyArray {
+      if want == 0 { return m.aElem }
+    } else if m is TyMap {
+      if want == 1 {
+        if m.mSet == 0 {
+          if primNameOf(m.mKey) == "string" { return m.mVal }
+        }
+      }
+    }
+    i = i + 1
+  }
+  -1
+}
+
+// THE CANONICAL `Json` a receiver type is a view of, or -1 when it is not a JSON tree at
+// all. Two answers, and the second is the one a first cut misses: a receiver is very often
+// a COMPLEMENT NARROWING of `Json` rather than `Json` itself — `if r is boolean { return }`
+// leaves every later read of `r` typed `Json` MINUS boolean, a fresh union whose container
+// arms still point at the whole tree. The walk is the same walk and the walker's parameter
+// is the same type, so the complement resolves to the union its arms are made of, and the
+// memo key stays one per real target.
+export function jsonUnionRootOf(ix: i32): i32 {
+  const e = jsonArmElemOf(ix, 0)
+  const v = jsonArmElemOf(ix, 1)
+  if e < 0 { return -1 }
+  if v < 0 { return -1 }
+  if !jsonSelfRef(e, v) {
+    if !tySame(e, v) { return -1 }
+  }
+  if jsonSelfRef(e, ix) { return ix }
+  const e2 = jsonArmElemOf(e, 0)
+  if e2 < 0 { return -1 }
+  if jsonSelfRef(e2, e) { return e }
+  -1
+}
+
+// `jsonUnionRootOf` with the WIDER receiver admitted: `Json | JsonError` holds no container
+// arm of its own, so the direct question answers -1 and the tree has to be found one member
+// in. Bounded to one hop deliberately — a union of two JSON trees has no single root and is
+// not a thing to guess at.
+export function jsonUnionRootIn(ix: i32): i32 {
+  const direct = jsonUnionRootOf(ix)
+  if direct >= 0 { return direct }
+  const ms = jsonUnionMembers(ix)
+  let i = 0
+  while i < ms.length {
+    const r = jsonUnionRootOf(ms[i])
+    if r >= 0 { return r }
+    i = i + 1
+  }
+  -1
+}
+
+// The member list of a union type, PEELING a `TyNullable` wrapper. `type Json = null |
+// boolean | … ` normalises to a nullable over the five non-null arms, so a predicate that
+// only reads `TyUnion.uMembers` answers `false` for the very type it is about — which is
+// how the first cut of this missed every real `Json`.
+export function jsonUnionMembers(ix: i32): i32[] {
+  const none: i32[] = []
+  if ix < 0 { return none }
+  let cur = ix
+  let g = 0
+  while g < 8 {
+    if cur < 0 { return none }
+    const t = T.tys[cur]
+    if t is TyNullable {
+      cur = t.nInner
+    } else if t is TyUnion {
+      if t.uMembers.length == 1 {
+        cur = t.uMembers[0]
+      } else {
+        return t.uMembers
+      }
+    } else {
+      return none
+    }
+    g = g + 1
+  }
+  none
+}
+
+// Does `m` denote the union `ix` itself — the recursion that makes `Json` a tree? The
+// nullable peel above means the ARM's element type is the OUTER index while the member
+// scan reads the INNER union, so identity alone is not enough.
+export function jsonSelfRef(m: i32, ix: i32): boolean {
+  if m < 0 { return false }
+  let cur = ix
+  let g = 0
+  while g < 8 {
+    if cur < 0 { return tySame(m, ix) }
+    if m == cur { return true }
+    const t = T.tys[cur]
+    if t is TyNullable {
+      cur = t.nInner
+    } else if t is TyUnion {
+      if t.uMembers.length == 1 {
+        cur = t.uMembers[0]
+      } else {
+        return tySame(m, ix)
+      }
+    } else {
+      return tySame(m, ix)
+    }
+    g = g + 1
+  }
+  tySame(m, ix)
+}
+
+// Is `mt` one of `ut`'s members BY IDENTITY? The membership question `is` asks today is
+// answered by ASSIGNABILITY, which is what admits a REFINEMENT of an arm (`string[]` into
+// `Json[]`) and then answers `false` for it — D1035's mechanism. The deep route needs the
+// EXACT question instead: an arm is a tag, and only an arm has one.
+function jsonExactMemberOf(ut: i32, mt: i32): boolean {
+  if ut < 0 || mt < 0 { return false }
+  // `null` is an arm of every nullable spelling and is tested by the ordinary route.
+  if primNameOf(mt) == "null" { return true }
+  const ms = jsonUnionMembers(ut)
+  let i = 0
+  while i < ms.length {
+    if ms[i] == mt { return true }
+    if tySame(ms[i], mt) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// A `seen` membership test for the recursion guard below (VL lists carry no `.has`).
+function jwSeenHas(seen: i32[], ix: i32): boolean {
+  let i = 0
+  while i < seen.length {
+    if seen[i] == ix { return true }
+    i = i + 1
+  }
+  false
+}
+
+// THE TARGET SIDE. "" when `ix` is a JSON shape the walker can build; otherwise the
+// OFFENDING COMPONENT, in words that name what the author wrote — the refusal blames the
+// `is` site's `T` and never a std file. The vocabulary is `docs/serde-design.md`'s:
+// `null` / `boolean` / `f64` / `i32` / `i64` / `string`, `T[]`, `{[string]: T}`, structs of
+// those, `T | null`, and the JSON union itself (which matches anything and is copied by
+// reference — no walk).
+export function jsonShapeBad(ix: i32, recvTy: i32, seen: i32[]): string {
+  if ix < 0 { return "an unresolved type" }
+  // The JSON union itself is the WILDCARD leaf: `x is Json` inside a shape is trivially
+  // true and the value is taken by reference. Asked FIRST so a recursive `Json` never
+  // reaches the cycle guard below.
+  if jsonSelfRef(ix, recvTy) { return "" }
+  const nw = nomNameOfTy(ix)
+  if nw != "" {
+    return "`" + nw + "` is a newtype; a JSON shape carries no brand"
+  }
+  if jwSeenHas(seen, ix) {
+    return "`" +
+      tyToStr(ix) +
+      "` is recursive; a recursive JSON shape has no walker yet"
+  }
+  const t = T.tys[ix]
+  if t is TyPrim {
+    const p = t.primName
+    if p == "boolean" { return "" }
+    if p == "f64" { return "" }
+    if p == "i32" { return "" }
+    if p == "i64" { return "" }
+    if p == "string" { return "" }
+    if p == "null" { return "" }
+    return "`" + p + "` has no JSON shape"
+  }
+  if t is TyErr { return "an unresolved type" }
+  if t is TyFunc {
+    return "`" + tyToStr(ix) + "` is a closure; a JSON shape cannot hold one"
+  }
+  if t is TyVar {
+    return "`" +
+      tyToStr(ix) +
+      "` is a type parameter; a JSON shape must be concrete"
+  }
+  if t is TyLit {
+    return "`" +
+      tyToStr(ix) +
+      "` is a literal type; a JSON shape has no literal walker yet"
+  }
+  if t is TyNeg { return "`" + tyToStr(ix) + "` is a negation" }
+  seen.push(ix)
+  if t is TyNullable {
+    const r = jsonShapeBad(t.nInner, recvTy, seen)
+    seen.pop()
+    return r
+  }
+  if t is TyArray {
+    if t.aElem < 0 {
+      seen.pop()
+      return "an array whose element type is unknown"
+    }
+    const r = jsonShapeBad(t.aElem, recvTy, seen)
+    seen.pop()
+    return r
+  }
+  if t is TyMap {
+    if t.mSet == 1 {
+      seen.pop()
+      return "`" + tyToStr(ix) + "` is a Set; a JSON object is a map"
+    }
+    if primNameOf(t.mKey) != "string" {
+      seen.pop()
+      return "`" +
+        tyToStr(ix) +
+        "` has a non-string map key; a JSON object's keys are strings"
+    }
+    const r = jsonShapeBad(t.mVal, recvTy, seen)
+    seen.pop()
+    return r
+  }
+  if t is TyObj {
+    const ftys = t.objFieldTypes
+    const fnames = t.objFieldNames
+    let i = 0
+    while i < ftys.length {
+      const r = jsonShapeBad(ftys[i], recvTy, seen)
+      if r != "" {
+        seen.pop()
+        return "field `" + fnames[i] + "`: " + r
+      }
+      i = i + 1
+    }
+    seen.pop()
+    return ""
+  }
+  if t is TyUnion {
+    // `T | null` spelled as a two-member union is the ONE union shape the walker reads
+    // unambiguously (OQ-7's required-key rule reduces to "present or absent" for it).
+    // Every wider union needs the arm discriminator the design defers, so it refuses
+    // by NAMING the ambiguity rather than by guessing an arm.
+    const ms = t.uMembers
+    if ms.length == 2 {
+      if primNameOf(ms[0]) == "null" {
+        const r = jsonShapeBad(ms[1], recvTy, seen)
+        seen.pop()
+        return r
+      }
+      if primNameOf(ms[1]) == "null" {
+        const r = jsonShapeBad(ms[0], recvTy, seen)
+        seen.pop()
+        return r
+      }
+    }
+    seen.pop()
+    // The STRUCTURAL render, not the nominal one: the reader needs to see the ARMS to see
+    // why they cannot be told apart, and `Amb` on its own names nothing.
+    return "`" +
+      tyToStructStr(ix) +
+      "` is an ambiguous union of shapes; a JSON walker can only tell `T | null` apart"
+  }
+  seen.pop()
+  "`" + tyToStr(ix) + "` has no JSON shape"
+}
+
+// The DEDUPING record: one `jwTgt*` row per (target, receiver) pair, one `jwSite*` row per
+// admitted site. Returns the target row.
+function jwRecordSite(ix: i32, chkTy: i32, recv: string, rootTy: i32): i32 {
+  const spell = tyToStr(chkTy)
+  let ti = -1
+  let i = 0
+  while i < jwTgtSpell.length {
+    if jwTgtSpell[i] == spell && jwTgtRecv[i] == recv { ti = i }
+    i = i + 1
+  }
+  if ti < 0 {
+    ti = jwTgtSpell.length
+    jwTgtSpell.push(spell)
+    jwTgtRecv.push(recv)
+    jwTgtTy.push(chkTy)
+    jwTgtRootTy.push(rootTy)
+  }
+  // ONE ROW PER SITE, HOWEVER MANY TIMES THE CHECKER VISITS IT. A function with an
+  // UN-ANNOTATED return is checked more than once — the return-inference pass re-walks the
+  // body — so a site recorded per visit produced two rows for one `is`. The rewrite is
+  // in-place, so the second row found a `Call` where it expected an `IsExpr` and reported
+  // `internal: deep \`is\` site is not an \`is\` expression` on a perfectly legal program.
+  // An `internal:` sentence must not be reachable from one, and the annotated spelling of
+  // the same program ran, which is the two-faces rule at the RETURN position.
+  let j = 0
+  while j < jwSiteNode.length {
+    if jwSiteNode[j] == ix { return ti }
+    j = j + 1
+  }
+  jwSiteNode.push(ix)
+  jwSiteTgt.push(ti)
+  ti
+}
+
+// `x is T` over a JSON-shaped union where `T` is not one of its arms: 1 when the site is
+// an admitted DEEP walk (recorded), -1 when it is not a deep site at all (the caller runs
+// the ordinary arm-membership gate), 0 when it IS a deep site whose target has no JSON
+// shape — diagnosed here, so the caller must not add a second voice.
+// THE RECEIVER'S DECLARED UNION, NOT THE GUARD'S VIEW OF IT.
+//
+// `if r is JsonError { … } else if r is Cfg { … }` — the first-class `std:json` read —
+// leaves `r` narrowed in the else arm, and the checker's type there is the complement:
+// `Json`'s arms with `JsonError` gone. The EMITTER has no such view. It sees the binding's
+// DECLARED union and, handed a walker whose parameter is the narrowed one, has to convert
+// between two unions — keyed on a flattened spelling nothing registered, which is a loud
+// emit reject (`union box atom test on a union with no recorded members`) on a `vl check`-
+// clean program.
+//
+// `applyNarrows` banks the shadowed declaration exactly for questions like this
+// (`noteNarShadow` → `narDeclaredTy`), so the walker is spelled against what the emitter
+// holds. A non-name receiver has no bank and answers with the type it was given, which is
+// its declaration.
+function jsonReceiverDeclTy(objIx: i32, objTy: i32): i32 {
+  if objIx < 0 { return objTy }
+  let cur = objIx
+  let g = 0
+  while g < 4 {
+    const n = P.nodes[cur]
+    if n is Paren { cur = n.parInner }
+    else if n is Ident { return jsonWidestDeclTy(n.identName, objTy) }
+    else { return objTy }
+    g = g + 1
+  }
+  objTy
+}
+
+// THE OUTERMOST live shadow banked for `name`, or `objTy`.
+//
+// NOT `narDeclaredTy`, and the difference is the point. That reader keys on
+// `lookupDepth(name)` and answers the INNERMOST shadow, whose banked type may itself already
+// be narrowed once two producers stack — an `else if` inside a function that has already
+// early-returned on another arm banks the complement, not the declaration. The bank is
+// append-ordered and every row records what the name held BEFORE the narrowing above it, so
+// the FIRST live row is the declaration and every later one is a step down from it.
+//
+// AND NOT "THE ONE WITH THE MOST MEMBERS", which is the answer that reads right and is
+// exactly backwards: `Json | JsonError` has TWO members while the complement view of it is
+// the union FLATTENED — seven — so a most-members rule picks the narrowed type every time.
+// It did, and it re-broke the `else if` form this reader had already fixed.
+//
+// `popScope` truncates the bank and the epoch excludes an enclosing function's rows, so
+// every row this walks is live. No row at all answers `objTy`, which is the un-narrowed
+// declaration in every program that has no guard.
+function jsonWidestDeclTy(name: string, objTy: i32): i32 {
+  let i = 0
+  while i < asgDeclKeys.length {
+    if asgDeclKeys[i] == name {
+      if asgDeclEpochs[i] == narFnEpoch {
+        if asgDeclTys[i] >= 0 { return asgDeclTys[i] }
+      }
+    }
+    i = i + 1
+  }
+  objTy
+}
+
+function jsonDeepIsSite(ix: i32, chkTy: i32, objIx: i32, objTy0: i32): i32 {
+  jwBadMsg = ""
+  if chkTy < 0 { return -1 }
+  const objTy = jsonReceiverDeclTy(objIx, objTy0)
+  const root = jsonUnionRootIn(objTy)
+  if root < 0 { return -1 }
+  // `x is Json` is the whole union and is trivially true — left to the ordinary route so
+  // its behaviour does not move. Membership is asked of the ROOT, not of the receiver's
+  // possibly-narrowed view, so an ARM stays an arm test after a complement narrowing.
+  if jsonSelfRef(chkTy, root) { return -1 }
+  if jsonExactMemberOf(root, chkTy) { return -1 }
+  // AND an arm of the RECEIVER, which is not the same set when the receiver is wider than
+  // the tree — `type U = Json | Payload` makes `x is Payload` a TAG test, and walking it
+  // would answer `true` for any map whose keys happen to fit `Payload`.
+  if jsonExactMemberOf(objTy, chkTy) { return -1 }
+  const seen: i32[] = []
+  const bad = jsonShapeBad(chkTy, root, seen)
+  if bad != "" {
+    // NOT AN ERROR ON ITS OWN. A JSON-shaped union is still an ORDINARY union, and the
+    // existing route answers plenty of non-shape spellings over one — a literal member
+    // (`x is "err"`), a numeric widening, an arm. Raising here refused a fixture that had
+    // always run (`literal-unions/is-literal-over-mixed-union.vl`). The reason is BANKED
+    // instead and used only where the ordinary gate is about to reject anyway, so the
+    // refusal gains a better sentence and no program changes verdict.
+    jwBadMsg = bad
+    return 0
+  }
+  jwRecordSite(ix, chkTy, jsonParamSpell(objTy, root), root)
+  1
+}
+
+// THE WALKER'S PARAMETER, SPELLED THROUGH NAMES THE PROGRAM ALREADY CARRIES.
+//
+// The ROOT wherever the receiver can reach it — the plain `Json` and every COMPLEMENT
+// narrowing of it, which is what lets those share one walker. Otherwise the receiver is
+// WIDER than the tree (`parseJson` answers `Json | JsonError`) and the parameter has to
+// admit the extra arms.
+//
+// IT IS NOT `tyToStr(objTy)`, and that is the whole point. A receiver narrowed by an
+// earlier guard — `if r is JsonError { … } else if r is Cfg { … }`, the first-class
+// `std:json` shape — has an ANONYMOUS arena type whose render is the union FLATTENED,
+// `boolean|f64|string|Json[]|{[string]:Json}|null|JsonError`. Emitting a walker with that
+// parameter mints a union spelling nothing registered, and the atom test inside it is a
+// loud emit reject (`union box atom test on a union with no recorded members`) on a
+// `vl check`-clean program. Rebuilding the spelling as ROOT + the members that are not the
+// tree's gives `Json | JsonError` — the spelling `parseJson`'s own return type declares —
+// so the walker meets the row the direct spelling already has, and the two sites share one
+// walker instead of minting a second.
+function jsonParamSpell(objTy: i32, root: i32): string {
+  if assignable(objTy, root) { return tyToStr(root) }
+  let s = tyToStr(root)
+  const ms = jsonUnionMembers(objTy)
+  let i = 0
+  while i < ms.length {
+    if !jsonSelfRef(ms[i], root) {
+      if !jsonExactMemberOf(root, ms[i]) {
+        const m = tyToStr(ms[i])
+        if !jsonSpellHas(s, m) { s = s + " | " + m }
+      }
+    }
+    i = i + 1
+  }
+  s
+}
+
+// Is `m` already one of the ` | `-joined members of `s`? A flattened receiver can name the
+// same arm twice, and a duplicated member is a DIFFERENT union to the tables that hold
+// one (`docs/internals/` — the member set is positional and must never be deduped AFTER
+// registration; this dedupes the SPELLING before any registration happens).
+function jsonSpellHas(s: string, m: string): boolean {
+  let i = 0
+  while i + m.length <= s.length {
+    if s.slice(i, i + m.length) == m {
+      let leftOk = i == 0
+      if i >= 3 {
+        if s.slice(i - 3, i) == " | " { leftOk = true }
+      }
+      let rightOk = i + m.length == s.length
+      if i + m.length + 3 <= s.length {
+        if s.slice(i + m.length, i + m.length + 3) == " | " { rightOk = true }
+      }
+      if leftOk && rightOk { return true }
+    }
+    i = i + 1
+  }
+  false
+}
+
 function checkIsExprNode(n: IsExpr, ix: i32) {
   const objTy = checkNode(n.isObj)
   const chkTy = isTypeTy(n.isVariant, ix)
@@ -38433,8 +39223,23 @@ function checkIsExprNode(n: IsExpr, ix: i32) {
       inUnion = true
       baseTy = ot.nInner
     }
+    // THE DEEP-`is` ROUTE, ASKED BEFORE THE ARM GATE (D1035). `r is string[]` over a
+    // `Json` PASSES the assignability gate below (a `string[]` widens into `Json[]`), so
+    // it never reaches an error — it is admitted and then answered `false` for every
+    // value. The deep site has to be taken out of the stream here, ahead of both the
+    // admitting and the refusing legs, or half the family would keep the old answer.
+    const jwDeep = jsonDeepIsSite(ix, chkTy, n.isObj, objTy)
+    if jwDeep == 1 { return TY_BOOL }
     if !assignable(chkTy, baseTy) || isWidenNotVariant(chkTy, baseTy) {
-      if inUnion {
+      if jwBadMsg != "" {
+        tErr(
+          "`is` check type '" +
+            n.isVariant +
+            "' is not a JSON shape — " +
+            jwBadMsg,
+          ix,
+        )
+      } else if inUnion {
         tErr(
           "`is` check type '" +
             n.isVariant +

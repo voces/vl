@@ -38,14 +38,50 @@
 // D14 given the witness it had never had — and the doc admitted here in the same change. Both
 // now report `... · 0 MOVED · 0 not graded` under `--strict`.
 //
-// Adding a doc here is cheap and it is the point: this test is what stops a NEW row landing
-// without a runnable witness. A doc of this shape that is not in this list is enforced by
-// nothing.
-const DOCS = [
-  "docs/internals/silent-class-inventory.md",
-  "docs/internals/silent-class-inventory-2.md",
+// Adding an inventory here is cheap and it is the point: this test is what stops a NEW row
+// landing without a runnable witness. An inventory of this shape that is not in this list is
+// enforced by nothing.
+
+// ONE FILE PER ROW. The inventories are `docs/internals/inventory/D1042.md` and friends:
+// every defect PR appended to one file's tail, so two concurrent PRs conflicted there
+// nearly every hour, once splicing two rows into the middle of a third. This reads a
+// DIRECTORY of one-row files, and a directory holding none yet falls back to the monolith
+// named in its own README — the same rule `check-filed-witnesses.py`'s `resolve` applies,
+// and read from the same marker line, so the two cannot answer differently while the split
+// is in flight. Two directories, not one: the inventories number independently and D1..D14
+// exist in both, which is also why the duplicate-id check below is per document.
+const DIRS = [
+  "docs/internals/inventory",
+  "docs/internals/inventory-2",
 ];
 const CHECKER = "scripts/check-filed-witnesses.py";
+const SOURCE_MARK = /^<!--\s*inventory-split:\s*source\s+(\S+)\s*-->\s*$/m;
+
+/** The docs a directory stands for: its `D*.md` rows, or the monolith it came from. */
+async function docsOf(dir: string): Promise<string[]> {
+  const rows: string[] = [];
+  try {
+    for await (const e of Deno.readDir(dir)) {
+      if (e.isFile && /^D\d.*\.md$/.test(e.name)) rows.push(`${dir}/${e.name}`);
+    }
+  } catch {
+    throw new Error(`${dir}: not readable — the inventory directory must exist`);
+  }
+  if (rows.length > 0) {
+    return rows.sort((a, b) =>
+      Number(a.match(/D(\d+)/)![1]) - Number(b.match(/D(\d+)/)![1]) || a.localeCompare(b)
+    );
+  }
+  const readme = await Deno.readTextFile(`${dir}/README.md`);
+  const m = SOURCE_MARK.exec(readme);
+  if (m === null) {
+    throw new Error(
+      `${dir}: holds no D*.md rows and ${dir}/README.md carries no ` +
+        `\`<!-- inventory-split: source ... -->\` line to fall back to`,
+    );
+  }
+  return [m[1]];
+}
 
 // `### D12 — title` / `## A1 - title`, the same shape `check-filed-witnesses.py`'s `SEC`
 // matches. Analysis sections (`### Root A — …`) are deliberately NOT rows and are not
@@ -149,24 +185,37 @@ Deno.test("every filed inventory row carries a witness the checker can run", asy
   let total = 0;
 
   const ids: Array<[string, string, string]> = [];
-  for (const doc of DOCS) {
-    for (const r of parseRows(await Deno.readTextFile(doc))) {
-      total++;
-      ids.push([doc, r.id, `${doc}:${r.line}`]);
-      const status = (r.status ?? "").toLowerCase();
-      if (!phrases.some((p) => status.includes(p))) {
-        bad.push(
-          `${doc}:${r.line}  ${r.id} — status line names no known outcome\n` +
-            `      want: a status containing one of [${phrases.join(", ")}]\n` +
-            `      got:  ${r.status ?? "(no **bold** status line at all)"}`,
-        );
-      }
-      if (!r.hasRepro) {
-        bad.push(
-          `${doc}:${r.line}  ${r.id} — no repro block\n` +
-            `      want: a \`Repro:\` block, or an indented program after the status line\n` +
-            `      got:  neither`,
-        );
+  for (const dir of DIRS) {
+    for (const doc of await docsOf(dir)) {
+      // ONE FILE PER ROW MEANS THE FILE NAME IS PART OF THE ROW. Everything that cites a
+      // row by id resolves it as `<dir>/D<id>.md`, so a file whose heading disagrees with
+      // its stem is a row nothing can find — and it is the failure a rename makes.
+      const stem = doc.match(/\/(D\d[^/]*)\.md$/)?.[1];
+      for (const r of parseRows(await Deno.readTextFile(doc))) {
+        total++;
+        ids.push([dir, r.id, `${doc}:${r.line}`]);
+        if (stem !== undefined && stem !== r.id) {
+          bad.push(
+            `${doc}:${r.line}  ${r.id} — file name and row id disagree\n` +
+              `      want: the heading id to equal the file stem\n` +
+              `      got:  heading ${r.id}, file ${stem}.md`,
+          );
+        }
+        const status = (r.status ?? "").toLowerCase();
+        if (!phrases.some((p) => status.includes(p))) {
+          bad.push(
+            `${doc}:${r.line}  ${r.id} — status line names no known outcome\n` +
+              `      want: a status containing one of [${phrases.join(", ")}]\n` +
+              `      got:  ${r.status ?? "(no **bold** status line at all)"}`,
+          );
+        }
+        if (!r.hasRepro) {
+          bad.push(
+            `${doc}:${r.line}  ${r.id} — no repro block\n` +
+              `      want: a \`Repro:\` block, or an indented program after the status line\n` +
+              `      got:  neither`,
+          );
+        }
       }
     }
   }
@@ -178,9 +227,11 @@ Deno.test("every filed inventory row carries a witness the checker can run", asy
   // fine INDIVIDUALLY. What breaks is everything that refers to a row BY ITS NUMBER:
   // a brief, a CHANGELOG entry, a `named/` set, the next agent told to "read D626".
   //
-  // PER DOCUMENT, not across both: the two inventories number independently and each has
-  // its own D1, D2, D3. A global check reds 14 rows that are correct, which is how this
-  // check was first written and what running it caught.
+  // PER INVENTORY, not across both: the two number independently and each has its own D1,
+  // D2, D3. A global check reds 14 rows that are correct, which is how this check was first
+  // written and what running it caught. On the split form the key is the DIRECTORY, not the
+  // file — one file per row would otherwise make every id trivially unique and the check
+  // vacuous exactly when it starts to matter, since two PRs can now each add a `D626.md`.
   //
   // Cheap and structural, so it belongs here rather than in the python.
   const seen = new Map<string, string>();
@@ -200,7 +251,7 @@ Deno.test("every filed inventory row carries a witness the checker can run", asy
 
   if (total === 0) {
     throw new Error(
-      `parsed 0 rows from ${DOCS.join(", ")} — the heading shape moved and this test ` +
+      `parsed 0 rows from ${DIRS.join(", ")} — the heading shape moved and this test ` +
         `would now pass vacuously. want: > 0 rows, got: 0`,
     );
   }

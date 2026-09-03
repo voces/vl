@@ -1,0 +1,198 @@
+// @run
+// @log 11
+// @log 12
+// @log 13
+// @log 14
+// @log 15
+// @log 16
+// @log 17
+// @log 18
+// @log 19
+// @log 20
+// @log 21
+// @log 24
+// @log 23
+// @log 101
+// @hint redundant type annotation: `annotatedReturn` is inferred as `i32`
+// @hint redundant type annotation: `readsNullableField` is inferred as `i32`
+// @hint redundant type annotation: `breakGuard` is inferred as `i32`
+// @hint redundant type annotation: `continueGuard` is inferred as `i32`
+// @hint redundant type annotation: `elseIfArm` is inferred as `i32`
+// @hint redundant type annotation: `nestedIfArm` is inferred as `i32`
+// @hint redundant type annotation: `notAndChain` is inferred as `i32`
+// @hint redundant type annotation: `notGuardThenTest` is inferred as `i32`
+// @hint redundant type annotation: `whileGuard` is inferred as `i32`
+// @hint redundant type annotation: `stackedGuards` is inferred as `i32`
+// @hint redundant type annotation: `noGuard` is inferred as `i32`
+// @hint redundant type annotation: `errorArm` is inferred as `i32`
+// The twelve hints are DECLARED, not deleted: each `: i32` is the ANNOTATED face of
+// its cell, and `inferredReturn` right beside the first one is the un-annotated face.
+// Deleting them would make the fixture blind to the half of this feature that depends
+// on the enclosing function's return being inferred rather than pinned.
+// CHECK THE ERROR ARM, THEN THE SHAPE — the first-class `std:json` read, and the shape that
+// found the deep-`is` walker's PARAMETER SPELLING wrong twice.
+//
+// A guard on `JsonError` leaves `r` narrowed for everything after it, and the CHECKER's type
+// there is the complement: `Json`'s arms with `JsonError` gone. The EMITTER has no such view
+// — it holds the binding's DECLARED union. A walker whose parameter was spelled from the
+// narrowed type made the call a conversion between two unions, keyed on a FLATTENED spelling
+// nothing registered:
+//
+//   emitProgram: union box atom test on a union with no recorded members:
+//     boolean|f64|string|Json[]|{[string]:Json}|null|JsonError
+//
+// `vl check` rc 0, and the same program WITHOUT the guard ran — so the ingredient is the
+// complement view and not the shape, the target, or the scope.
+//
+// THE COMPLEMENT HAS TWO PRODUCERS IN THE CHECKER, and fixing one is what made the first cut
+// look fixed. `applyNarrows` (an else arm, a `while` body, a match arm, an `&&` conjunct)
+// banks the shadowed declaration under `NAR_KIND_GUARD`; the POST-GUARD FALL-THROUGH — the
+// `if r is JsonError { return }` shape a std:json consumer writes first — narrows the rest of
+// the block with a bare `declare` in the ENCLOSING scope and banked nothing. It banks under
+// `NAR_KIND_POSTGUARD` now, a third kind so that `narGuardSlot`'s retirement and the dead-`??`
+// reader keep seeing exactly the rows they saw before.
+//
+// AND THE READER TAKES THE OUTERMOST ROW, NOT THE INNERMOST OR THE WIDEST. `narDeclaredTy`
+// answers the innermost shadow, whose banked type is itself already narrowed once two guards
+// stack (`h14` below). "Most union members" reads right and is exactly backwards —
+// `Json | JsonError` has TWO members and its complement view is the union FLATTENED, seven —
+// and picking it re-broke the `else if` form that was already fixed. The bank is
+// append-ordered, so the FIRST live row is the declaration.
+//
+// Every cell prints a DISTINCT value, so no cell can pass on another's answer.
+import { JsonError, parseJson } from "std:json"
+
+type Cfg = { port: i32, host: string | null }
+
+// ── the EARLY-RETURN guard, both faces ───────────────────────────────────────
+function annotatedReturn(s: string): i32 {
+  const r = parseJson(s)
+  if r is JsonError { return -1 }
+  if r is Cfg { return r.port }
+  -2
+}
+print(annotatedReturn("{\"port\": 11}"))
+
+function inferredReturn(s: string) {
+  const r = parseJson(s)
+  if r is JsonError { return -1 }
+  if r is Cfg { return r.port }
+  -2
+}
+print(inferredReturn("{\"port\": 12}"))
+
+// …and the arm reading the NULLABLE field rather than the i32 one.
+function readsNullableField(s: string): i32 {
+  const r = parseJson(s)
+  if r is JsonError { return -1 }
+  if r is Cfg {
+    const h = r.host
+    if h != null { return h.length }
+    return r.port
+  }
+  -2
+}
+print(readsNullableField("{\"port\": 13}"))
+
+// ── the guard that diverges by BREAK and by CONTINUE ─────────────────────────
+function breakGuard(s: string): i32 {
+  let out = -2
+  let i = 0
+  while i < 1 {
+    const r = parseJson(s)
+    if r is JsonError { break }
+    if r is Cfg { out = r.port }
+    i = i + 1
+  }
+  out
+}
+print(breakGuard("{\"port\": 14}"))
+
+function continueGuard(s: string): i32 {
+  let out = -2
+  let i = 0
+  while i < 1 {
+    i = i + 1
+    const r = parseJson(s)
+    if r is JsonError { continue }
+    if r is Cfg { out = r.port }
+  }
+  out
+}
+print(continueGuard("{\"port\": 15}"))
+
+// ── the ELSE-ARM producer: `else if`, and a nested `if` in the else block ─────
+function elseIfArm(s: string): i32 {
+  const r = parseJson(s)
+  if r is JsonError { return -1 } else if r is Cfg { return r.port }
+  -2
+}
+print(elseIfArm("{\"port\": 16}"))
+
+function nestedIfArm(s: string): i32 {
+  const r = parseJson(s)
+  if r is JsonError { return -1 } else {
+    if r is Cfg { return r.port }
+  }
+  -2
+}
+print(nestedIfArm("{\"port\": 17}"))
+
+// ── the `!` and `&&` forms ───────────────────────────────────────────────────
+function notAndChain(s: string): i32 {
+  const r = parseJson(s)
+  if !(r is JsonError) && r is Cfg { return r.port }
+  -2
+}
+print(notAndChain("{\"port\": 18}"))
+
+function notGuardThenTest(s: string): i32 {
+  const r = parseJson(s)
+  if !(r is JsonError) { if r is Cfg { return r.port } }
+  -2
+}
+print(notGuardThenTest("{\"port\": 19}"))
+
+// ── a `while` used as the guard ──────────────────────────────────────────────
+function whileGuard(s: string): i32 {
+  const r = parseJson(s)
+  while r is JsonError { return -1 }
+  if r is Cfg { return r.port }
+  -2
+}
+print(whileGuard("{\"port\": 20}"))
+
+// ── module scope ─────────────────────────────────────────────────────────────
+const atModule = parseJson("{\"port\": 21}")
+if atModule is JsonError { print(-1) } else if atModule is Cfg {
+  print(atModule.port)
+} else { print(-2) }
+
+// ── TWO GUARDS STACKED: an early return, then an `else if` below it. This is the cell
+// that separates "the outermost banked row" from "the innermost one" — the second guard
+// banks the FIRST guard's complement, and reading that would spell the walker wrong again.
+function stackedGuards(s: string): i32 {
+  const r = parseJson(s)
+  if r is JsonError { return -1 }
+  if r is string { return -3 } else if r is Cfg { return r.port }
+  -2
+}
+print(stackedGuards("{\"port\": 24}"))
+
+// ── the CONTROL that ran throughout: no guard before the shape test ───────────
+function noGuard(s: string): i32 {
+  const r = parseJson(s)
+  if r is Cfg { return r.port }
+  -2
+}
+print(noGuard("{\"port\": 23}"))
+
+// ── and the error arm is still reachable, still the error arm, through the
+// early-return shape that used to refuse.
+function errorArm(s: string): i32 {
+  const r = parseJson(s)
+  if r is JsonError { return r.at + 100 }
+  if r is Cfg { return r.port }
+  -2
+}
+print(errorArm("{oops"))
