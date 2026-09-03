@@ -23703,7 +23703,7 @@ export function internShapeDeepTy(nm: string, ty: i32) {
   // here the null is a union ATOM (a tag in a non-null box), NOT a nullable-niche wrapper. Checked AFTER
   // the parens peel (so `(i32|null)` reaches here) but BEFORE the `| null` peel (which would lose the atom).
   if isValueUnionName(nm) {
-    registerValueUnionName(nm)
+    registerValueUnionNameAB(7, nm, ty)
     // A CLOSURE atom of the value union (`((i32) => {a: f64, f: K0, z: string}[]) | f64`)
     // may bury inline shapes in its params/result — unreachable through the box
     // registration (the arm is one spelling inside the union name), so a narrowed arm's
@@ -23716,7 +23716,7 @@ export function internShapeDeepTy(nm: string, ty: i32) {
       // Paired with the row's arena members by the same D-UNION seam the composite-arm
       // branch uses — see `internShapeArms` for why the two splits are the same split.
       const vTys: i32[] = []
-      let vCov = unionMemberTysOf(nm, vTys)
+      let vCov = unionMemberTysOfAB(10, nm, ty, vTys)
       if vTys.length != vArms.length { vCov = false }
       let va = 0
       while va < vArms.length {
@@ -24081,7 +24081,7 @@ function internFuncTypeShapesTy(nm: string, ty: i32): i32 {
   // cast — `ref.cast` to a default type-0 index, INVALID-WASM at the `print` read
   // (fuzz-nightly run 29808029476, seed 100113225 d4).
   if isValueUnionName(nm) {
-    registerValueUnionName(nm)
+    registerValueUnionNameAB(8, nm, ty)
     return 0
   }
   // The ARROW split runs BEFORE the `| null` peel: a TOP-LEVEL arrow (`()=>f64|null`)
@@ -26875,7 +26875,7 @@ export function vbHeapIdxOfAtom(atom: string) {
 // the caller has only a name. The row's `unTyIx` entry is that index, so the registry can be asked
 // by type rather than by spelling once its readers move (step 3).
 export function registerValueUnionNameTy(name: string, tyIx: i32) {
-  if isUNameAB(name, tyIx) { return 0 }
+  if isUNameAB(1, name, tyIx) { return 0 }
   // A value union with a litunion-ALIAS arm (`K0 | i64`) registers here too: the alias
   // arm rides the box as its member-string atom (tag `string`, the litunion box rep), so
   // the union is value-box-shaped even though `valueAtomKind("K0")` is -1 — without the
@@ -28628,14 +28628,21 @@ export function annRowOfNode(ix: i32): i32 {
   nodeTyIxOf(ix)
 }
 
-export function isUName(name: string) {
+// The `unNames` row a SPELLING names, or -1. `isUName`'s row-valued sibling, so the
+// registry-by-id seams can compare the two keys ROW to ROW rather than boolean to
+// boolean: "both said yes" and "both named the same row" are different findings, and a
+// predicate cannot tell them apart. `unionRowOf` is a WIDER lookup (it also scans
+// `unMemberSet`), so this one is the exact row `isUName` is answering about.
+export function unRowOfName(name: string): i32 {
   let u = 0
   while u < unNames.length {
-    if unNames[u] == name { return true }
+    if unNames[u] == name { return u }
     u = u + 1
   }
-  false
+  -1
 }
+
+export function isUName(name: string) { unRowOfName(name) >= 0 }
 
 // The union alias name that owns global variant `vi` (assumes `vi` is a variant of some
 // declared union), or "" if none. Used to intern a ref-list-of-union by the SPECIFIC
@@ -29239,7 +29246,7 @@ export function letAnnIsUnion(letIx: i32) {
         // claimed via `annUnionAtomsOf(ix) >= 2`, and a nullable NUMERIC literal union via
         // `nulNumLitUnionBaseName`. Both are wider than `isUName`, and this site needs the
         // narrower set.
-        return isUNameAB(lt.tyName, annRowOfNode(d.letType)) &&
+        return isUNameAB(2, lt.tyName, annRowOfNode(d.letType)) &&
           !nodeTyIsLitUnionAlias(d.letType)
       }
     }
@@ -31008,7 +31015,7 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
     const acn = tyToEmitName(nodeTyIxOf(unwrapParen(exprIx)))
     if acn != "" {
       if isValueUnionName(acn) { return acn }
-      if isUNameAB(acn, nodeTyIxOf(unwrapParen(exprIx))) { return acn }
+      if isUNameAB(3, acn, nodeTyIxOf(unwrapParen(exprIx))) { return acn }
     }
     return ""
   }
@@ -31021,7 +31028,7 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
     const icn = tyToEmitName(nodeTyIxOf(unwrapParen(exprIx)))
     if icn != "" {
       if isValueUnionName(icn) { return icn }
-      if isUNameAB(icn, nodeTyIxOf(unwrapParen(exprIx))) { return icn }
+      if isUNameAB(4, icn, nodeTyIxOf(unwrapParen(exprIx))) { return icn }
     }
     return ""
   }
@@ -31802,20 +31809,20 @@ export function unionRowOf(name: string): i32 {
 // switch belongs to a later PR under a freeze rather than to a runtime flag.
 export let unABMode: i32 = 0
 
-// The emit-time tallies. They are COUNTERS rather than reason-bucket bumps because
-// `repShadowSweep` resets the bucket table before this spike's own sweep runs — a bump made
-// during emit does not survive to the report, which is what the first control run showed.
-let unABAgree: i32 = 0
-let unABDiffer: i32 = 0
-let unABNameOnly: i32 = 0
-let unABIdOnly: i32 = 0
-let unABNeither: i32 = 0
-let unABNoTy: i32 = 0
-let unUNAgree: i32 = 0
-let unUNNameOnly: i32 = 0
-let unUNIdOnly: i32 = 0
-let unUNNeither: i32 = 0
-let unUNNoTy: i32 = 0
+// The emit-time tallies, PER CONVERTED SITE. They are COUNTERS rather than reason-bucket
+// bumps because `repShadowSweep` resets the bucket table before this spike's own sweep runs
+// — a bump made during emit does not survive to the report, which is what the first control
+// run showed. Per site, because a pooled bucket cannot say WHICH site the residue belongs
+// to, and step 5 flips the seams site by site: `unABCnt[site * UNAB_K + k]`, six outcomes.
+let unABCnt: i32[] = []
+const UNAB_K = 6
+// 0 agree · 1 differ · 2 name-only · 3 id-only · 4 neither · 5 no-ty.
+const UNAB_AGREE = 0
+const UNAB_DIFFER = 1
+const UNAB_NAMEONLY = 2
+const UNAB_IDONLY = 3
+const UNAB_NEITHER = 4
+const UNAB_NOTY = 5
 let unRetryHit: i32 = 0
 let unRetryMiss: i32 = 0
 
@@ -31823,6 +31830,90 @@ function unABOn(): i32 {
   if unABMode > 0 { return unABMode }
   if repShadowOn { return 1 }
   0
+}
+
+// One reach recorded. Called only when armed, so the growth loop and the read-modify-write
+// are off the unarmed path entirely.
+function unABBump(site: i32, k: i32) {
+  const at = site * UNAB_K + k
+  while unABCnt.length <= at { unABCnt.push(0) }
+  unABCnt[at] = unABCnt[at] + 1
+  0
+}
+
+// Classify one reach: `n` the row the SPELLING named, `d` the row the ARENA ID named, both
+// -1 for "no row". `ty < 0` is its OWN bucket — "this site had no id to offer" and "the id
+// disagreed" are different findings, and collapsing them is how a coverage gap reads as
+// agreement.
+function unABProbe(site: i32, n: i32, d: i32, ty: i32) {
+  if ty < 0 { return unABBump(site, UNAB_NOTY) }
+  if n >= 0 && d >= 0 {
+    if n == d { return unABBump(site, UNAB_AGREE) }
+    return unABBump(site, UNAB_DIFFER)
+  }
+  if n >= 0 { return unABBump(site, UNAB_NAMEONLY) }
+  if d >= 0 { return unABBump(site, UNAB_IDONLY) }
+  unABBump(site, UNAB_NEITHER)
+}
+
+// The WRITE side's probe. At a mint site no row exists yet, so the rows are both -1 and
+// `unABProbe` would report "neither" for every reach. The question there is whether the id
+// the caller OFFERS is the same type the name RESOLVES to, so the comparison is on the
+// arena types, at `repCanonId` — the structural id duplicate arena indices share.
+function unABTyProbe(site: i32, dTy: i32, oTy: i32) {
+  if oTy < 0 { return unABBump(site, UNAB_NOTY) }
+  if dTy < 0 { return unABBump(site, UNAB_IDONLY) }
+  if repCanonId(dTy) == repCanonId(oTy) { return unABBump(site, UNAB_AGREE) }
+  unABBump(site, UNAB_DIFFER)
+}
+
+// The converted sites, by name. A site id is an i32 CONSTANT at the call, so an unarmed
+// compile pushes a constant and returns; the spelling is needed only by the report. Ids
+// 1-10 are step 1 (the seams the shim landed, plus the ID-FREE sites, whose argument is
+// an arena id already in scope); 11+ are step 2's one-hop threading. `UNAB_N` bounds the
+// report loop.
+const UNAB_N = 30
+function unABSiteName(s: i32): string {
+  if s == 1 { return "regValueUnionTy" }
+  if s == 2 { return "letAnnUnionKind" }
+  if s == 3 { return "unionNameOfExpr/as" }
+  if s == 4 { return "unionNameOfExpr/is" }
+  if s == 5 { return "letAnnUnionRetSink" }
+  if s == 6 { return "letAnnUnionSlot" }
+  if s == 7 { return "internShapeDeep/valueUnion" }
+  if s == 8 { return "internFuncTypeShapes/valueUnion" }
+  if s == 9 { return "inferRetArenaUnionIsDup" }
+  if s == 10 { return "internShapeDeep/armTys" }
+  if s == 11 { return "exprIsUnionStrEq/l" }
+  if s == 12 { return "exprIsUnionStrEq/r" }
+  if s == 13 { return "memberUnionFieldName" }
+  if s == 14 { return "writeRhsIsNullBearing" }
+  if s == 15 { return "fnUnionRetSinkOk" }
+  if s == 16 { return "arrLitUnionElemName" }
+  if s == 17 { return "arrLitBoxElem" }
+  if s == 18 { return "unionNameOfExpr/callee" }
+  if s == 19 { return "unionNameOfExpr/closure" }
+  if s == 20 { return "unionNameOfExpr/method" }
+  if s == 21 { return "nliInferIfLet" }
+  if s == 22 { return "nliInferOptChainLet" }
+  if s == 23 { return "collectU/inferLetTy" }
+  if s == 24 { return "collectU/arrLitInferElem" }
+  if s == 25 { return "emitUnionUnionEq" }
+  if s == 26 { return "emitReturnValue/inferRet" }
+  if s == 27 { return "emitLetDeclStmt/union" }
+  if s == 28 { return "emitLetDeclStmt/nli" }
+  "site?"
+}
+
+// One bucket's name. Split out so the report loop reads as a table rather than as a
+// six-armed ladder inside two nested loops.
+function unABKindName(k: i32): string {
+  if k == UNAB_AGREE { return "agree" }
+  if k == UNAB_DIFFER { return "differ" }
+  if k == UNAB_NAMEONLY { return "name-only" }
+  if k == UNAB_IDONLY { return "id-only" }
+  if k == UNAB_NEITHER { return "neither" }
+  "no-ty"
 }
 
 // The id-keyed twin of `unionRowOf(name)`. `unRowOfCanon` is the reverse index this repo
@@ -31849,24 +31940,13 @@ export function unionRowOfTyRaw(ty: i32): i32 {
 // id-keyed twin would have said. `ty < 0` is counted SEPARATELY — "this call site has no
 // arena id to offer" and "the id disagrees" are different findings, and collapsing them is
 // how a coverage gap reads as agreement.
-export function unionRowOfAB(name: string, ty: i32): i32 {
+export function unionRowOfAB(site: i32, name: string, ty: i32): i32 {
   const n = unionRowOf(name)
   const m = unABOn()
   if m == 0 { return n }
-  if ty < 0 {
-    unABNoTy = unABNoTy + 1
-    return n
-  }
-  const d = unionRowOfTy(ty)
-  if n >= 0 && d >= 0 {
-    if n == d { unABAgree = unABAgree + 1 } else { unABDiffer = unABDiffer + 1 }
-  } else if n >= 0 {
-    unABNameOnly = unABNameOnly + 1
-  } else if d >= 0 {
-    unABIdOnly = unABIdOnly + 1
-  } else {
-    unABNeither = unABNeither + 1
-  }
+  let d = -1
+  if ty >= 0 { d = unionRowOfTy(ty) }
+  unABProbe(site, n, d, ty)
   if m == 2 && d >= 0 { return d }
   n
 }
@@ -31874,21 +31954,74 @@ export function unionRowOfAB(name: string, ty: i32): i32 {
 // `isUName`'s seam. The two predicates do NOT scan the same column — `isUName` reads
 // `unNames` only, `unionRowOfTy` reads `unTyIx` — so a disagreement here is as likely to be
 // a coverage hole as a key disagreement, and the buckets are named apart for that reason.
-export function isUNameAB(name: string, ty: i32): boolean {
+export function isUNameAB(site: i32, name: string, ty: i32): boolean {
   const n = isUName(name)
   const m = unABOn()
   if m == 0 { return n }
-  if ty < 0 {
-    unUNNoTy = unUNNoTy + 1
-    return n
-  }
-  const d = unionRowOfTy(ty) >= 0
-  if n && d { unUNAgree = unUNAgree + 1 }
-  if n && !d { unUNNameOnly = unUNNameOnly + 1 }
-  if !n && d { unUNIdOnly = unUNIdOnly + 1 }
-  if !n && !d { unUNNeither = unUNNeither + 1 }
-  if m == 2 { return d }
+  let d = -1
+  if ty >= 0 { d = unionRowOfTy(ty) }
+  let nr = -1
+  if n { nr = unRowOfName(name) }
+  unABProbe(site, nr, d, ty)
+  if m == 2 { return d >= 0 }
   n
+}
+
+// The MEMBER-TYPE seam. Mode 2 is an additive RETRY — it fills `out` from the id-keyed row
+// only where the spelling found none — because the name leg has already appended to `out`
+// by the time the id answer is known, and a seam that both fills and re-fills is measuring
+// its own double write rather than the key.
+export function unionMemberTysOfAB(
+  site: i32,
+  name: string,
+  ty: i32,
+  out: i32[],
+): boolean {
+  const r = unionMemberTysOf(name, out)
+  const m = unABOn()
+  if m == 0 { return r }
+  let d = -1
+  if ty >= 0 { d = unionRowOfTy(ty) }
+  unABProbe(site, unRowOfName(name), d, ty)
+  if m == 2 && !r { return unionMemberTysOfRow(d, out) }
+  r
+}
+
+// `unionHasAtom`'s seam. That predicate is a SPELLING scan, not a registry read — it walks
+// the pipe-separated spans of `name` — so its id-keyed twin walks the row's recorded
+// `unMemAtoms` instead, which is the same member list the mint recorded verbatim.
+export function unionHasAtomAB(
+  site: i32,
+  name: string,
+  ty: i32,
+  atom: string,
+): boolean {
+  const n = unionHasAtom(name, atom)
+  const m = unABOn()
+  if m == 0 { return n }
+  let d = -1
+  if ty >= 0 { d = unionRowOfTy(ty) }
+  unABProbe(site, unRowOfName(name), d, ty)
+  if m == 2 && d >= 0 { return unionHasAtomRow(d, atom) }
+  n
+}
+
+// The value-union MINT's seam. `registerValueUnionName` resolves the spelling ONCE at the
+// boundary (`declTyIxOfName`); this records whether the id the caller could have offered
+// names the same type, and under mode 2 mints from the caller's id instead. The shipped
+// answer is the name's, so a converted mint site is byte-identical when unarmed — graded
+// per site in `docs/internals/registry-by-type-id.md` §5.
+export function registerValueUnionNameAB(
+  site: i32,
+  name: string,
+  ty: i32,
+): i32 {
+  const d = declTyIxOfName(name)
+  const m = unABOn()
+  if m == 0 { return registerValueUnionNameTy(name, d) }
+  unABTyProbe(site, d, ty)
+  if m == 2 && ty >= 0 { return registerValueUnionNameTy(name, ty) }
+  registerValueUnionNameTy(name, d)
 }
 
 // The whole-registry measurement, run once per program beside `repShadowSweep`: every row
@@ -31899,30 +32032,24 @@ export function isUNameAB(name: string, ty: i32): boolean {
 // `name-dup` is the opposite direction: two rows one spelling already fails to tell apart.
 export function unionRegistryABSweep() {
   if unABOn() == 0 { return 0 }
-  repShadowAddReason("unionAB/agree", unABAgree)
-  repShadowAddReason("unionAB/differ", unABDiffer)
-  repShadowAddReason("unionAB/name-only", unABNameOnly)
-  repShadowAddReason("unionAB/id-only", unABIdOnly)
-  repShadowAddReason("unionAB/neither", unABNeither)
-  repShadowAddReason("unionAB/no-ty", unABNoTy)
-  repShadowAddReason("isUNameAB/agree", unUNAgree)
-  repShadowAddReason("isUNameAB/name-only", unUNNameOnly)
-  repShadowAddReason("isUNameAB/id-only", unUNIdOnly)
-  repShadowAddReason("isUNameAB/neither", unUNNeither)
-  repShadowAddReason("isUNameAB/no-ty", unUNNoTy)
+  let s = 1
+  while s < UNAB_N {
+    let k = 0
+    while k < UNAB_K {
+      const at = s * UNAB_K + k
+      if at < unABCnt.length {
+        repShadowAddReason(
+          "unionAB/" + unABSiteName(s) + "/" + unABKindName(k),
+          unABCnt[at],
+        )
+      }
+      k = k + 1
+    }
+    s = s + 1
+  }
   repShadowAddReason("atomRetry/id-hit", unRetryHit)
   repShadowAddReason("atomRetry/id-miss", unRetryMiss)
-  unABAgree = 0
-  unABDiffer = 0
-  unABNameOnly = 0
-  unABIdOnly = 0
-  unABNeither = 0
-  unABNoTy = 0
-  unUNAgree = 0
-  unUNNameOnly = 0
-  unUNIdOnly = 0
-  unUNNeither = 0
-  unUNNoTy = 0
+  unABCnt = []
   unRetryHit = 0
   unRetryMiss = 0
   let u = 0
@@ -31999,6 +32126,33 @@ export function unMemHasAtomRow(u: i32, want: string, arr: boolean): i32 {
   0
 }
 
+// `unionHasAtom`'s row-keyed twin: does row `u` record a member whose VERBATIM atom
+// spelling is `atom`? The name-keyed original scans the pipe-separated spans of a
+// spelling; this scans `unMemAtoms`, which the mint recorded from exactly those spans, so
+// the two answer the same question off the same text. Bounded through `unMemRowStart`
+// (D1152) — a row named by a key the columns never grew is what traps there.
+export function unionHasAtomRow(u: i32, atom: string): boolean {
+  const st = unMemRowStart(u)
+  if st < 0 { return false }
+  const n = unMemTyCount[u]
+  let i = 0
+  while i < n {
+    if unMemAtoms[st + i] == atom { return true }
+    i = i + 1
+  }
+  false
+}
+
+export function unionHasAtomOfTy(ty: i32, atom: string): boolean {
+  unionHasAtomRow(unionRowOfTy(ty), atom)
+}
+
+// `unMemHasAtom`'s arena-keyed entry point, beside the spelling-keyed one. The four read
+// resolvers now each have a `…Ty` twin over the same row core, which is what step 5 flips.
+export function unMemHasAtomTy(ty: i32, want: string, arr: boolean): i32 {
+  unMemHasAtomRow(unionRowOfTy(ty), want, arr)
+}
+
 // The registry row for a SPELLING, keyed by rep identity rather than by text: the name is
 // used only as a ROUTE to the arena (`declTyIxOfName`), and the comparison is `repCanonId`.
 // This is the query a registry keyed on an interned rep key would perform, written so the
@@ -32033,7 +32187,18 @@ export function unABAtomRetry(name: string, want: string, arr: boolean): i32 {
 // classify each member STRUCTURALLY (`T.tys[m] is TyMap`, …) instead of re-deriving the
 // shape from the member's rendered spelling.
 export function unionMemberTysOf(name: string, out: i32[]): boolean {
-  const u = unionRowOf(name)
+  unionMemberTysOfRow(unionRowOf(name), out)
+}
+
+// The same walk from a ROW — the id-keyed twin's core, and the one place the member
+// columns are read. `unionMemberTysOfTy` is the arena-keyed entry point beside the
+// spelling-keyed one above; both bottom out here, so the two keys cannot drift into two
+// readings of the columns.
+export function unionMemberTysOfTy(ty: i32, out: i32[]): boolean {
+  unionMemberTysOfRow(unionRowOfTy(ty), out)
+}
+
+export function unionMemberTysOfRow(u: i32, out: i32[]): boolean {
   if u < 0 { return false }
   if u >= unMemTyStart.length { return false }
   const st = unMemTyStart[u]
@@ -34338,7 +34503,7 @@ export function letIsRefArray(letIx: i32, fnIx: i32) {
         // local, NOT a reflist local — the init coerces into the box. Return false so a ref-array
         // INIT below does not mis-pick the reflist valtype (an invalid boxed-store otherwise).
         // A declared union NAME is nominal identity, so this stays a name lookup.
-        if isUNameAB(lt.tyName, annRowOfNode(d.letType)) { return false }
+        if isUNameAB(5, lt.tyName, annRowOfNode(d.letType)) { return false }
         // ARENA-FIRST: the arena's `"reflist"` arm is exactly `nameIsRefArray`'s settled base
         // cases (an array over a struct / variant / inline shape / closure element); the
         // spellings it declines — nested arrays, niche-nullable elements, union-box elements,
@@ -36905,7 +37070,7 @@ export function letIsMap(letIx: i32, fnIx: i32) {
         // (`const v: {[string]: i32} | f64 = h0`). Return false — the annotation is
         // authoritative — so the `exprMap(init)` fall-through below cannot reclaim the box as a
         // bare map; `collectLocals` then reaches `letIsUnion` and the cell rides its union box.
-        if isUNameAB(lt.tyName, annRowOfNode(d.letType)) { return false }
+        if isUNameAB(6, lt.tyName, annRowOfNode(d.letType)) { return false }
       }
     }
     return exprMap(d.letInit, fnIx)
