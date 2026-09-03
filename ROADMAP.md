@@ -180,9 +180,9 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
     remain. DECISIONS.md §"A missing list separator is inserted, never skipped past".
   - **NEXT: the `then`-removal arm in `parseIf`**, which is already single-statement and was
     called out at stage 1 as the cheapest remaining candidate.
-- **Modernization program — (1) comment trim, PILOT DONE #2413, batch 2 DONE #2428: six
-  files, batch 3 DONE #2433: `emit_collect`, batch 4 DONE #2444: `typecheck`,
-  batch 6 DONE #2440: `wasmEmit`**:
+- **Modernization program — (1) comment trim, COMPLETE for `compiler/*`. PILOT DONE #2413,
+  batch 2 DONE #2428: six files, batch 3 DONE #2433: `emit_collect`, batch 4 DONE #2444:
+  `typecheck`, batch 5 DONE #2446: `emit_classify`, batch 6 DONE #2440: `wasmEmit`**:
   `compiler/parser.vl`, `compiler/format.vl` and `compiler/emit_sections.vl` are at
   the 12-line comment-block budget (72 blocks over 12 → 2, both of those module headers under
   their own 40-line budget), with a byte-identical seed and the moved text archived verbatim in
@@ -204,9 +204,17 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   seven) and an eighth dropped because its function had moved to `emit_classify.vl`, eight
   citations to the `toWasm.ts` / `parser.ts` deleted in #466 removed, and two multi-page
   FILINGS graded rather than trimmed: the `print(m["k"])` map note and the
-  assignment-as-expression residue table both RUN today. **NEXT: `emit_classify.vl`
-  (398/151)** — the whole remaining 586/227, and the last file where the ratchet's
-  `lint-self.sh` exemption still has to hold.
+  assignment-as-expression residue table both RUN today. **Batch 5 takes `emit_classify.vl`
+  — the worst file in the tree — from 398/151 to 0/0**: 4,009 comment lines gone, TWENTY-TWO
+  orphaned function headers moved back to functions that had none, and six stale claims
+  dropped (three EMITTER headers in a file that writes no bytes, one of them citing
+  `toWasm.ts`; a `True if …` boolean header above a shape-returning function; a
+  "PRE-EXISTING DEFECT LIVES NEXT DOOR" paragraph D1087 closed; a duplicated header; a
+  migration note for a deleted wrapper; and a `collectAnnShapes` paragraph left behind when
+  its function moved out). **The ratchet is 188/76 and every file over 50 is gone**: the
+  largest remaining are `emit_rep.vl` (48/13) and `driver.vl` (29/8), then a tail of
+  single-digit rows across `std/*` and the small compiler modules. NEXT: those two, then
+  the tail — at zero, `lint-self.sh`'s exemption deletes itself.
 - **Modernization program, item 3 — the defect inventory is ONE FILE PER ROW. TOOLING SHIPPED;
   the split itself lands on merge day.** `scripts/inventory/split.py --apply --relink` run
   against fresh master, under a freeze on inventory appends; every consumer already reads
