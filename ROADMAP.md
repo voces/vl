@@ -47,18 +47,20 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   `gate.sh` and CI), the baseline `scripts/comment-budget-baseline.json`, and the
   self-lint exemption that deletes itself when the baseline reaches zero. See CLAUDE.md,
   "Comments state the invariant; measurements live in the inventory".
-- 🟡 **1. Per-file comment trim — PILOT DONE (#2413), batches 2-4 and 6 DONE (#2428, #2433,
-  #2444, #2440); `emit_classify.vl` (398 blocks over budget) is the last one.**
-  `parser.vl`, `format.vl`, `emit_sections.vl`, `emit_mono.vl`, `emit_state.vl`,
-  `emit_base.vl`, `emit_rewrite.vl`, `tyname.vl`, `ast.vl`, `emit_collect.vl`,
-  `typecheck.vl` and `wasmEmit.vl` are trimmed. One PR per file:
-  move every census count, probe output and A/B table to its inventory row or a
-  `DECISIONS.md` section, cite the id from the comment, and lower the baseline in the same
-  PR. **Proof of safety: a byte-identical seed** — a comment-only change that moves one
-  byte of `build/vl-compiler.wasm` was not comment-only. The pilot's 40-line MODULE-HEADER
-  budget is now the rule's (owner ruling, 2026-09-02): the header is the first block with no
-  code before it, blank lines and the leading `import` region allowed, and the diagnostic
-  names which budget it applied. `parser.vl` and `format.vl` read zero.
+- ✅ **1. Per-file comment trim — DONE. The ratchet is 0/0 over all 40 files and the
+  self-lint exemption has deleted itself.** Pilot #2413 (`parser`, `format`,
+  `emit_sections`), batch 2 #2428 (`emit_mono`, `emit_state`, `emit_base`, `emit_rewrite`,
+  `tyname`, `ast`), batch 3 #2433 (`emit_collect`), batch 4 #2444 (`typecheck`), batch 5
+  #2446 (`emit_classify`), batch 6 #2440 (`wasmEmit`), batch 7 (the remaining sixteen small
+  `compiler/*` modules and all ten `std/*`, 188/76 → 0/0). Every census count, probe output
+  and A/B table is gone; what survives is the invariant, the why, and a `D<row>` /
+  `DECISIONS.md` § / `docs/**.md` pointer. **Proof of safety: a byte-identical seed** — a
+  comment-only change that moves one byte of `build/vl-compiler.wasm` was not comment-only.
+  A std trim is the one exception, and the mechanism is filed in the batch-7 CHANGELOG entry:
+  `emitNumCastTrapMsg` embeds an `as!` site's `line:col`, so a downstream module's bytes move
+  while its behaviour does not. The 40-line MODULE-HEADER budget is the rule's (owner ruling,
+  2026-09-02): the header is the first block with no code before it, blank lines and the
+  leading `import` region allowed, and the diagnostic names which budget it applied.
 - ✅ **2. A position-matrix harness for capability briefs — DONE #2415.**
   `scripts/capability-probes/matrix.py`; see the fuller row below, and CLAUDE.md's
   "A CAPABILITY GAP HAS A POSITION MATRIX".
@@ -194,9 +196,10 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
     remain. DECISIONS.md §"A missing list separator is inserted, never skipped past".
   - **NEXT: the `then`-removal arm in `parseIf`**, which is already single-statement and was
     called out at stage 1 as the cheapest remaining candidate.
-- **Modernization program — (1) comment trim, COMPLETE for `compiler/*`. PILOT DONE #2413,
-  batch 2 DONE #2428: six files, batch 3 DONE #2433: `emit_collect`, batch 4 DONE #2444:
-  `typecheck`, batch 5 DONE #2446: `emit_classify`, batch 6 DONE #2440: `wasmEmit`**:
+- **Modernization program — (1) comment trim, DONE. PILOT #2413, batch 2 #2428: six files,
+  batch 3 #2433: `emit_collect`, batch 4 #2444: `typecheck`, batch 5 #2446: `emit_classify`,
+  batch 6 #2440: `wasmEmit`, batch 7: the remaining sixteen small `compiler/*` modules and
+  all ten of `std/*`**:
   `compiler/parser.vl`, `compiler/format.vl` and `compiler/emit_sections.vl` are at
   the 12-line comment-block budget (72 blocks over 12 → 2, both of those module headers under
   their own 40-line budget), with a byte-identical seed and the moved text archived verbatim in
@@ -225,10 +228,17 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   `toWasm.ts`; a `True if …` boolean header above a shape-returning function; a
   "PRE-EXISTING DEFECT LIVES NEXT DOOR" paragraph D1087 closed; a duplicated header; a
   migration note for a deleted wrapper; and a `collectAnnShapes` paragraph left behind when
-  its function moved out). **The ratchet is 188/76 and every file over 50 is gone**: the
-  largest remaining are `emit_rep.vl` (48/13) and `driver.vl` (29/8), then a tail of
-  single-digit rows across `std/*` and the small compiler modules. NEXT: those two, then
-  the tail — at zero, `lint-self.sh`'s exemption deletes itself.
+  its function moved out). **Batch 7 finishes the campaign: the last twenty-six files from
+  188/76 to 0/0**, 4,699 comment lines gone (`std/array.vl`'s module header alone 1,079 lines
+  → 40), four orphaned headers moved back, twenty stale claims corrected — one of them
+  `lint.vl`'s own header, whose rule LIST was missing five rules including both
+  comment-budget ones, now a pointer to `lint()`'s call sequence. **The baseline is
+  `{"total": {…: 0, …: 0}, "files": {}}` and `--exempt-codes` prints nothing, so
+  `lint-self.sh` gates both rules at `info` with no change to the script** — proved by
+  planting a 13-line block and an uncited measurement and watching it exit 1 at each. A std
+  trim moves a DOWNSTREAM module's bytes without moving its behaviour, because
+  `emitNumCastTrapMsg` embeds an `as!` site's `line:col`: over all 67 `tests/cases/std/*.vl`,
+  15 modules differ, 0 beyond that print-char stream, 0 at runtime.
 - **Modernization program, item 3 — the defect inventory is ONE FILE PER ROW. TOOLING SHIPPED;
   the split itself lands on merge day.** `scripts/inventory/split.py --apply --relink` run
   against fresh master, under a freeze on inventory appends; every consumer already reads
