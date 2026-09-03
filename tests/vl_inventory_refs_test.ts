@@ -13,7 +13,6 @@
 // new file beside it. No assertion library, per CLAUDE.md — every failure is a
 // `throw new Error` naming want, got, and the file:line of each citation.
 //
-// unfiled: D1230 — this file NAMES the deleted row, above and in the KNOWN_UNFILED note,
 // and those mentions are not what the gate should red on. Delete this marker the day the
 // restoring PR lands: the test fails while a marker names a row that EXISTS, so it cannot
 // be left behind.
