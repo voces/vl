@@ -75,6 +75,10 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   remaining work is 4b (`registerInlineUnion`'s 11 recursions, under an `emit_collect.vl`
   freeze) and then the switch. The variant registry and the per-resolver kind ladders
   (ONE storage-class dispatch table) are still ahead of both.
+- ✅ **8. A ladder over a closed kind set is exhaustive or names its default — DONE.**
+  `kind-ladder-incomplete` / `kind-ladder-split` in `compiler/lint.vl`, the ratchet
+  `scripts/ladder-budget.py --check` (440 + 9 today), the census `scripts/ladder-census.py`.
+  See the fuller row below.
 - 🟢 **7. String building — BOTH LOWERINGS SHIPPED; module-GLOBAL accumulators remain.**
   `docs/internals/perf-opportunities-2026-09.md` Part D priced what the owner asked for
   ("optimize string building at the compiler level, without the user having to use an actual
@@ -307,6 +311,24 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   (`modIndexOfKey` 47% / `capHas` 35% inclusive, `__str_eq__` 73% self) and generic pins
   4.4× (`collectA` 68% inclusive through `tyTopIndexOf`). Each carries a bar just above its
   measurement and names the function; that is item 4's work, now with a number on it.
+- ✅ **Modernization program — (8) a KIND LADDER WITH A HOLE is a lint, DONE.** Four
+  instances in one week — `eqConcreteVariantRow`'s missing `nulvariant` (#2400),
+  `modRwExpr`'s missing `IfStmt` (D981/#2447), `tpMemberFloorMsg`'s wordless `TyVar` default
+  (D1004/D1221) and `captureValKind`'s i32 fallback for a module-block capture (D1370) —
+  and the same rule covers all four. **`kind-ladder-incomplete`** (`compiler/lint.vl`,
+  `warning`): a run of `if`/`else if` arms testing ONE subject against ≥2 members of one
+  closed set (`Node`, `Ty`, `VKind`, `TokKind`, `PrimName`, `RtKind`, `EqCmpKind`, `MfKind`,
+  `PushKind`, `BtKind`, `LitKind`, `AsMode`) must be exhaustive over that set, or end in a
+  default that NAMES what it excludes — an `emitFail`, a sentence, or a delegation to the
+  ladder that owns the rest. **`kind-ladder-split`**: two ladders over one set where the
+  first's default hands the rest to the second, the second's hands none back, and the second
+  drops a kind the first tests — D981's exact shape, and the control (`urcExprClean` /
+  `urcStmtFlags`, which hand back both ways) stays silent. **440 + 9 stand**, ratcheted per
+  file by `scripts/ladder-budget.py --check`, which re-derives every closed set from the
+  `export type` that declares it and FAILS when the lint's copy has drifted.
+  `scripts/ladder-census.py` is the discovery instrument — `--sets`, the ladder table,
+  `--split`, and `--pred` for the form with no kind literal in it at all (#2400's).
+  Byte-identical seed. See CLAUDE.md, "A LADDER OVER A CLOSED KIND SET".
 - **Width subtyping — RULED (owner, 2026-09-01): the non-prefix refusal is a GAP, closed
   the Roc way** — shape-monomorphization of narrow-typed consumers (offsets constant per
   caller shape; zero runtime cost; paid in instance count — the variant-count tradeoff

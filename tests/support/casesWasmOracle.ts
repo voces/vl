@@ -638,14 +638,22 @@ const readIsval = (exp: Exports): LintDiag[] => {
   return out;
 };
 
-// Comment-shape rules the CORPUS is exempt from. They police the hygiene of
-// source we maintain (`scripts/comment-budget.py` ratchets compiler/ + std/);
-// a case file's header is documentation OF the case, and hundreds carry a long
-// one. `tests/` is excluded from `lint-self.sh` for the same reason, and these
-// cases pin what the compiler says about a PROGRAM, not about our prose.
+// Rules the CORPUS is exempt from. They police the hygiene of source WE maintain
+// (`scripts/comment-budget.py` and `scripts/ladder-budget.py` ratchet it); these
+// cases pin what the compiler says about a PROGRAM, not about our prose or our
+// dispatch tables. `tests/` is excluded from `lint-self.sh` for the same reason.
+//
+// The comment rules: a case file's header is documentation OF the case, and
+// hundreds carry a long one. The kind-ladder rules: their closed sets are the
+// COMPILER's (`VKind`, `Node`, `MfKind`, …), read out of `compiler/*.vl`, so a
+// case declaring `type Kind = "i32" | "str" | "bool"` is graded against a
+// vocabulary that is not its own — `literal-unions/atom-basics.vl` is exactly
+// that collision, and its `classify` covers its OWN union completely.
 const CORPUS_EXEMPT_CODES = new Set([
   "comment-block-too-long",
   "comment-measurement-uncited",
+  "kind-ladder-incomplete",
+  "kind-ladder-split",
 ]);
 
 /** Run the self-hosted lint pass over `src` and read its diagnostics. */

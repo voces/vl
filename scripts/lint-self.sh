@@ -41,13 +41,14 @@ VL="${VL:-scripts/vl-host/target/release/vl}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-# THE RATCHET EXEMPTIONS. `comment-block-too-long` / `comment-measurement-uncited`
-# and `arena-scan-outside-pass` are `warning`s this tree still violates in bulk, so
-# they are held out of the `info` gate — but ONLY while their baselines still owe
-# them. Each allow-list is READ FROM its own baseline, so it empties itself the day a
-# trim or a banked scan reaches zero; meanwhile `comment-budget.py --check` and
-# `scan-budget.py --check` block any file going UP. `vl check` has no per-code gate,
-# hence `--json` graded through one filter carrying both lists.
+# THE RATCHET EXEMPTIONS. `comment-block-too-long` / `comment-measurement-uncited`,
+# `arena-scan-outside-pass` and `kind-ladder-incomplete` / `kind-ladder-split` are
+# `warning`s this tree still violates in bulk, so they are held out of the `info`
+# gate — but ONLY while their baselines still owe them. Each allow-list is READ FROM
+# its own baseline, so it empties itself the day a trim, a banked scan or a named
+# default reaches zero; meanwhile the three `--check` runs block any file going UP.
+# `vl check` has no per-code gate, hence `--json` graded through one filter carrying
+# every list.
 lint_graded() { # <target> <json path>
   local rc=0
   "$VL" check "$1" --severity info --json > "$2" 2> "$2.err" || rc=$?
@@ -55,7 +56,8 @@ lint_graded() { # <target> <json path>
   if [ "$rc" -gt 1 ]; then cat "$2"; return "$rc"; fi
   # shellcheck disable=SC2046  # the word split is the point: zero or more codes
   python3 scripts/comment-budget.py --filter-lint "$2" \
-    $(python3 scripts/scan-budget.py --exempt-codes)
+    $(python3 scripts/scan-budget.py --exempt-codes) \
+    $(python3 scripts/ladder-budget.py --exempt-codes)
 }
 
 # std/ goes first: it is near-instant AND its module load warms the seed's
