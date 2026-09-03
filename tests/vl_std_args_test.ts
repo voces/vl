@@ -4,7 +4,7 @@
 // WHY THIS IS NOT A `tests/cases/` FIXTURE, which is the whole reason the file
 // exists. The corpus RUN tier is adjudicated two ways and NEITHER can hand a case
 // an argv:
-//   • `tests/cases_wasm_test.ts` drives the case under V8, where `__args_get__`
+//   • `tests/cases_wasm_*_test.ts` drives the case under V8, where `__args_get__`
 //     returns a WasmGC array JS can neither read nor build — the harness stubs it
 //     with a throw, which is why `tests/cases/std/args-none.vl` carries `@skip`.
 //   • `tests/selfhost_native_align_test.ts` honours no `@skip` and runs the case

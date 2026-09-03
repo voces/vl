@@ -30,6 +30,27 @@ const isSeedBacked = (src: string): boolean =>
   src.includes("vl-compiler.wasm") &&
   (src.includes("statSync") || src.includes("exists("));
 
+// A test whose driver lives in `tests/support/` INHERITS its seed-backing. The
+// corpus-oracle shards are three lines each (`registerCorpusOracle(k, n)`) and
+// mention neither the seed nor a stat, so on the source test alone every one of
+// them would read as pure — and a shard that runs nowhere in CI is exactly the
+// hole this guard exists to close.
+//
+// It has to be the IMPORT SPECIFIER and not a mention: `module_gate_agreement_test.ts`
+// names `tests/support/casesWasmOracle.ts` as a string it READS, and a `.includes`
+// rule called that pure test seed-backed and failed the guard.
+const seedBackedSupport = (): RegExp[] => {
+  const out: RegExp[] = [];
+  for (const entry of Deno.readDirSync(`${TESTS_DIR}/support`)) {
+    if (!entry.isFile || !entry.name.endsWith(".ts")) continue;
+    const src = Deno.readTextFileSync(`${TESTS_DIR}/support/${entry.name}`);
+    if (!isSeedBacked(src)) continue;
+    const spec = entry.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    out.push(new RegExp(`from\\s+"[^"]*support/${spec}"`));
+  }
+  return out;
+};
+
 // The two auto-discovery globs `ci-native` runs (see ci.yml's native-suites step).
 const coveredByGlob = (name: string): boolean =>
   /^selfhost_native_.*_test\.ts$/.test(name) || /^vl_.*_test\.ts$/.test(name);
@@ -37,18 +58,27 @@ const coveredByGlob = (name: string): boolean =>
 Deno.test("ci-seed-coverage: every seed-backed test runs in ci-native (glob or explicit)", () => {
   const ci = Deno.readTextFileSync(CI_YML);
 
+  const support = seedBackedSupport();
   const seedBacked: string[] = [];
   for (const entry of Deno.readDirSync(TESTS_DIR)) {
     if (!entry.isFile || !entry.name.endsWith("_test.ts")) continue;
     if (entry.name === SELF) continue;
     const src = Deno.readTextFileSync(`${TESTS_DIR}/${entry.name}`);
-    if (isSeedBacked(src)) seedBacked.push(entry.name);
+    const viaSupport = support.some((re) => re.test(src));
+    if (isSeedBacked(src) || viaSupport) seedBacked.push(entry.name);
   }
 
   if (seedBacked.length === 0) {
     throw new Error(
       "found no seed-backed tests — the detection heuristic likely broke; " +
         "verify it still matches the seed self-ignore convention",
+    );
+  }
+  if (support.length === 0) {
+    throw new Error(
+      "found no seed-backed module under tests/support/ — the inheritance rule " +
+        "above matches nothing, so a shard whose driver lives there would read " +
+        "as pure. Verify the detection still matches the self-ignore convention.",
     );
   }
 
