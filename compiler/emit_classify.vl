@@ -12639,6 +12639,151 @@ export function sigParamSlotAt(key: string, idx: i32): i32 {
   sigSlotAtTok(key, sigParamTokIx(key, idx))
 }
 
+// D1100 — THE LIFTED FUNCTION A CALL HANDS BACK, or -1: `pick()(…)` where `pick`'s body
+// returns a bare function name. The callee-position twin of `fieldClosureFeOfRecv` (a struct
+// field) and `anonLeafArrElemFe` (an array element), and the third CONTAINER a `??`-moved
+// function is delivered through.
+//
+// ONE HOP, DELIBERATELY. Following a call in callee position with the ARENA-scanning
+// attribution resolvers is what stopped the compiler's own self-compile finishing (D1100's
+// own measurement); this reads the callee's `FuncDecl` by name and its single return
+// expression, both O(1) against the tables, and answers -1 for anything else.
+export function anonLeafRetCallFe(calleeIx: i32): i32 {
+  const ix = unwrapParen(calleeIx)
+  if ix < 0 { return -1 }
+  const e = P.nodes[ix]
+  if e is Call {
+    const inner = P.nodes[unwrapParen(e.callFn)]
+    if inner is Ident {
+      const t = anonLeafFeDeclNode(
+        fnIndexOfSid(sidOfNode(unwrapParen(e.callFn))),
+      )
+      if t >= 0 {
+        const rx = fnRetExprOf(t)
+        if rx >= 0 { return fieldValueFeOf(unwrapParen(rx)) }
+      }
+    }
+  }
+  -1
+}
+
+// D1100 — THE ARENA NODE of lifted-function position `fe`, or -1. Every parallel-table read
+// the container-delivery redirects make goes through it: a position past the end of `fnStmts`
+// is an OOB read, which TRAPS the compiler rather than refusing (the `emitFail does not halt`
+// discipline, D1152).
+export function anonLeafFeDeclNode(fe: i32): i32 {
+  if fe < 0 { return -1 }
+  if fe >= fnStmts.length { return -1 }
+  fnStmts[fe]
+}
+
+// D1100 — DID THE `??` MERGE MOVE EITHER ROW of the function declared at `fnDeclIx`? The
+// gate every container-delivery redirect takes, so a program with no merge keeps every byte.
+// `anonLeafFnNameMoved`'s question asked of a NODE rather than of a name.
+export function anonLeafFnRowsMovedOf(fnDeclIx: i32): boolean {
+  if fnDeclIx < 0 { return false }
+  if anonLeafRetMovedOf(fnDeclIx) { return true }
+  const n = P.nodes[fnDeclIx]
+  if n is FuncDecl {
+    let pj = 0
+    while pj < n.fnParams.length {
+      const px = n.fnParams[pj]
+      if px < anonLeafParamMoved.length {
+        if anonLeafParamMoved[px] == 1 { return true }
+      }
+      pj = pj + 1
+    }
+  }
+  false
+}
+
+// D1100 — THE `$fnsig` AN INDEXED CLOSURE-ARRAY CALL MUST USE when the array holds a function
+// whose rows a `??` merge MOVED. `cloArrSlotSigKey` reads the ref-list slot's element type
+// NAME, which is the DECLARATION's spelling — the pre-move one — so `fs[0](x)` keyed a
+// signature nothing interned and the call reached `function-value call arity has no interned
+// signature`. The array's own elements name the function; ONE function for every element, or
+// "" (two functions in one slot are one wasm signature and only agree by accident).
+//
+// The Member arm's twin at a struct field is `fieldClosureFeOfRecv`; this is the same
+// resolution over an `ArrayLit`, and `fieldValueFeOf` is the shared terminal.
+function anonLeafArrElemSigKey(arrIx: i32, fnIx: i32): string {
+  const fe = anonLeafArrElemFe(arrIx, fnIx)
+  if fe < 0 { return "" }
+  // GATED ON THE MOVE, so every other indexed closure call keeps `cloArrSlotSigKey`'s
+  // element-name route byte for byte.
+  if !anonLeafFnRowsMovedOf(anonLeafFeDeclNode(fe)) { return "" }
+  const k = cloSigKeyExt(fe)
+  // An un-interned key is one nothing can `call_indirect` at — the same refusal
+  // `anonLeafMovedFnSigKey` makes, for the same reason.
+  if k != "" && cloSigPosOfKey(k) >= 0 { return k }
+  ""
+}
+
+// The ONE lifted function every element of the array behind `arrIx` holds, or -1 — the
+// closure-ARRAY twin of `fieldClosureFeOfRecv`. Two different functions in one slot answer -1:
+// a ref-list slot is one wasm signature, and they agree only by accident. D1100.
+export function anonLeafArrElemFe(arrIx: i32, fnIx: i32): i32 {
+  const li = anonLeafArrLitOf(arrIx, fnIx)
+  if li < 0 { return -1 }
+  const a = P.nodes[li]
+  if a is ArrayLit {
+    const els = a.arrElems
+    if els.length == 0 { return -1 }
+    let fe = -1
+    let i = 0
+    while i < els.length {
+      const ei = fieldValueFeOf(unwrapParen(els[i]))
+      if ei < 0 { return -1 }
+      if fe < 0 { fe = ei }
+      if fe != ei { return -1 }
+      i = i + 1
+    }
+    return fe
+  }
+  -1
+}
+
+// The `ArrayLit` node an indexed callee's RECEIVER was built from — the literal itself, or the
+// initializer of the binding that names it. -1 for anything this cannot follow, which is the
+// answer that keeps every other indexed closure call on `cloArrSlotSigKey`'s route.
+function anonLeafArrLitOf(arrIx: i32, fnIx: i32): i32 {
+  const ix = unwrapParen(arrIx)
+  if ix < 0 { return -1 }
+  const e = P.nodes[ix]
+  if e is ArrayLit { return ix }
+  anonLeafArrBindingLitOf(ix, fnIx)
+}
+
+// The array literal a BINDING's initializer is — the one hop `anonLeafArrLitOf`'s own arm
+// does not cover, and that ladder's default. -1 for a name this cannot follow: a parameter,
+// a global built elsewhere, an initializer that is not a literal.
+function anonLeafArrBindingLitOf(ix: i32, fnIx: i32): i32 {
+  const e = P.nodes[ix]
+  if e is Ident {
+    let li = -1
+    if fnIx >= 0 {
+      const fn = P.nodes[fnIx]
+      if fn is FuncDecl { li = parentLetOf(fn.fnBody, e.identName) }
+    }
+    if li < 0 { li = globalLetOfIn(fnIx, e.identName) }
+    if li >= 0 {
+      const d = P.nodes[li]
+      if d is LetDecl {
+        // GUARDED BEFORE `unwrapParen`: a binding with no initializer is -1, and peeling
+        // parens off it reads `P.nodes[-1]` — a compiler TRAP, not a refusal (D1152).
+        if d.letInit >= 0 {
+          const iv = unwrapParen(d.letInit)
+          if iv >= 0 {
+            const ivn = P.nodes[iv]
+            if ivn is ArrayLit { return iv }
+          }
+        }
+      }
+    }
+  }
+  -1
+}
+
 // The callee's interned `$fnsig` KEY for a value call (`f(x)`, `(o.field)(x)`, `fs[i](x)`), or "" —
 // the param tokens drive argument coercion and the key resolves the functype the `call_ref` casts to.
 export function cloCallSigKey(callIx: i32, fnIx: i32) {
@@ -12687,6 +12832,17 @@ export function cloCallSigKey(callIx: i32, fnIx: i32) {
         if mfn is FuncDecl { mfArity = mfn.fnParams.length }
         if mfArity == c.callArgs.length {
           const mfk = cloSigKeyExt(mfe)
+          // D1100 — A MOVED FUNCTION'S OWN KEY IS AUTHORITATIVE, ahead of the divergence
+          // override below. The field holds a function whose rows a `??` merge moved, so its
+          // interned `$fnsig` is the one the table entry carries; the callee NODE's arena type
+          // is the field's DECLARED arrow, the pre-move row. Where nothing else interned that
+          // arrow the override already declined (`cloSigPosOfKey(mtk) < 0`) — but ONE unused
+          // `(cb: ({r: i32}) => {r: i32} | null)` parameter anywhere in the module interns it,
+          // and the override then handed the `call_indirect` the narrow functype while the row
+          // redirect had already moved: `expected (ref null $type), found (ref null $type)`.
+          if anonLeafFnRowsMovedOf(anonLeafFeDeclNode(mfe)) {
+            if mfk != "" && cloSigPosOfKey(mfk) >= 0 { return mfk }
+          }
           // The arity guard alone cannot split SAME-ARITY twin fields: two shapes
           // spelling the fieldset `{a, f, z}` (a nullable arm `{a: {f: i64},
           // f: (i32,i32,i32) => K0, z: f32}` beside a closure-result row
@@ -12718,8 +12874,29 @@ export function cloCallSigKey(callIx: i32, fnIx: i32) {
         }
       }
     }
+    // D1100 — THE CALLEE IS A CALL that hands a `??`-moved function back (`pick()(…)`). Its
+    // own `$fnsig` is the one the table entry carries; the general fallback below keys the
+    // callee's ARENA function type, which is `pick`'s DECLARED arrow — the pre-move row — and
+    // the `call_indirect` then trapped `indirect call type mismatch`. Gated on the move, so a
+    // returned closure in any other program keeps that fallback.
+    if cre is Call {
+      const rfe = anonLeafRetCallFe(c.callFn)
+      if rfe >= 0 {
+        if anonLeafFnRowsMovedOf(anonLeafFeDeclNode(rfe)) {
+          const rk = cloSigKeyExt(rfe)
+          if rk != "" && cloSigPosOfKey(rk) >= 0 { return rk }
+        }
+      }
+    }
     if cre is Index {
       if exprRefArray(cre.idxArr, fnIx) {
+        // D1100 — THE MOVED-ROW OVERRIDE, ahead of the slot's own key: `cloArrSlotSigKey`
+        // reads the ref-list slot's element type NAME, which is the DECLARATION's spelling,
+        // and a merge that moved the element function's rows makes that spelling name the
+        // wrong functype. `anonLeafArrElemSigKey` is "" for every array outside such a
+        // family, so no other indexed closure call changes a byte.
+        const ek = anonLeafArrElemSigKey(cre.idxArr, fnIx)
+        if ek != "" { return ek }
         const k = cloArrSlotSigKey(refListSlotOfExpr(cre.idxArr, fnIx))
         if k != "" { return k }
       }
@@ -27492,8 +27669,43 @@ export function structIndexOfExpr(exprIx: i32, fnIx: i32) {
         const cfe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
         if cfe >= 0 {
           if fRetKind[cfe] == "struct" || fRetKind[cfe] == "nulstruct" {
-            return fRetStructIdx[cfe]
+            // D1100 — THROUGH THE `??` MERGE'S RETURN-ROW REDIRECT, exactly as the Ident
+            // callee above reaches it through `anonLeafCloBindSigKey`. The field holds a
+            // function whose return row the merge MOVED, so the call yields the merged row
+            // while `fRetStructIdx` still names the declaration's. `anonLeafRetRowOf` is
+            // `si` unchanged for every field closure outside such a family.
+            return anonLeafRetRowOf(anonLeafFeDeclNode(cfe), fRetStructIdx[cfe])
           }
+        }
+      }
+    }
+    // D1100 — A CALL THAT HANDS THE FUNCTION BACK (`pick()({r: 4})`), same shape as the
+    // indexed arm below: only where the redirect moves the row.
+    if callee is Call {
+      const rfe = anonLeafRetCallFe(e.callFn)
+      if rfe >= 0 && rfe < fRetKind.length && rfe < fRetStructIdx.length {
+        if fRetKind[rfe] == "struct" || fRetKind[rfe] == "nulstruct" {
+          const rrr = anonLeafRetRowOf(
+            anonLeafFeDeclNode(rfe),
+            fRetStructIdx[rfe],
+          )
+          if rrr != fRetStructIdx[rfe] { return rrr }
+        }
+      }
+    }
+    // D1100 — AN INDEXED CLOSURE-ARRAY CALL whose element is a function the `??` merge MOVED.
+    // Only where the redirect actually MOVES the row, so every other indexed closure call keeps
+    // the fallbacks below: the row is what the `??` binding declares its local at, and the
+    // declaration's row is the pre-move one.
+    if callee is Index {
+      const efe = anonLeafArrElemFe(callee.idxArr, fnIx)
+      if efe >= 0 && efe < fRetKind.length && efe < fRetStructIdx.length {
+        if fRetKind[efe] == "struct" || fRetKind[efe] == "nulstruct" {
+          const err = anonLeafRetRowOf(
+            anonLeafFeDeclNode(efe),
+            fRetStructIdx[efe],
+          )
+          if err != fRetStructIdx[efe] { return err }
         }
       }
     }

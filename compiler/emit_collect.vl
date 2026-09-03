@@ -8113,6 +8113,9 @@ function anonLeafFrameBodyOf(n: i32): i32 {
 // THEM: `const f = src; f({r: 9})` puts its argument at a call site as plainly as `src(…)`, and
 // the hop is a `LetDecl` the same scan reads. A name bound to anything else still counts.
 function anonLeafAnyIndirectCall(): boolean {
+  // D1100 — the delivery resolver's declaration index, built here because this is the one
+  // whole-arena walk it rides on. Resumes; a second call in the same program costs nothing.
+  anonLeafDeclIndex()
   let ci = 0
   while ci < P.nodes.length {
     const cn = P.nodes[ci]
@@ -8155,7 +8158,251 @@ function anonLeafCalleeIsFnValue(cf: i32): boolean {
     if ot < 0 { return true }
     if anonLeafBuiltinMethodRecv(ot) { return false }
   }
-  true
+  // D1100 — AND A CONTAINER DELIVERY THIS PASS CAN NAME is not an unattributable indirect
+  // call either. A struct FIELD, an array ELEMENT and a returned VALUE each reach the
+  // delivered function's own `$fnsig` and its moved return ROW at emit
+  // (`fieldClosureFeOfRecv`, `anonLeafArrElemFe`, `anonLeafRetCallFe`), so the argument this
+  // rung says no mark can read IS read. Anything the resolver cannot name — a lambda in the
+  // field, two functions in one array, a receiver built where this cannot follow — keeps the
+  // veto, which is the safe direction: the family would move the declaration's rows while
+  // such a call kept the annotation's.
+  anonLeafDeliveredFnName(cf) == ""
+}
+
+// D1100 — THE FUNCTION A CONTAINER DELIVERS TO CALLEE `cf`, by NAME, or "".
+//
+// BY NAME AND OFF THE DECLARATION INDEX, because `fnStmts` is not populated when
+// `collectAnonShapes` runs — the same constraint `anonLeafJoinCallee` records for itself.
+// The three arms are the three containers D1100 names, and each has an emit-side twin that
+// must agree with it: a struct FIELD (`fieldClosureFeOfRecv`), an array ELEMENT
+// (`anonLeafArrElemFe`) and the value a CALL hands back (`anonLeafRetCallFe`).
+function anonLeafDeliveredFnName(cf: i32): string {
+  const cn = P.nodes[cf]
+  if cn is Member { return anonLeafFieldFnNameOf(cn.memObj, cn.memProp) }
+  if cn is Index { return anonLeafElemFnNameOf(cn.idxArr) }
+  anonLeafRetFnNameOf(cf)
+}
+
+// The ONE function every binding of the receiver could deliver at `prop`. TWO frames each
+// declaring `const o = { f: src }` is ordinary code and a module-wide name key cannot scope
+// them, so the answer must AGREE across every candidate rather than be refused the moment
+// there are two — the emit side resolves the SCOPED one, which is always one of them.
+function anonLeafFieldFnNameOf(recvIx: i32, prop: string): string {
+  const lits: i32[] = []
+  anonLeafContainerLits(recvIx, 0, lits)
+  // `xs[i].f(…)` — the receiver is an INDEX into the array of literals, so the array itself
+  // is the container and every element must agree at the field.
+  const rn = P.nodes[unwrapParen(recvIx)]
+  if rn is Index { anonLeafContainerLits(rn.idxArr, 0, lits) }
+  let nm = ""
+  let i = 0
+  while i < lits.length {
+    const en = anonLeafLitFieldFnName(lits[i], prop)
+    if en == "" { return "" }
+    if nm == "" { nm = en }
+    if nm != en { return "" }
+    i = i + 1
+  }
+  nm
+}
+
+// One candidate literal's answer at `prop`: an OBJECT literal's own field.
+function anonLeafLitFieldFnName(lit: i32, prop: string): string {
+  const l = P.nodes[lit]
+  if l is ObjLit { return anonLeafFnNameOfVal(objFieldVal(lit, prop)) }
+  anonLeafArrFieldFnName(lit, prop)
+}
+
+// …and an ARRAY of objects', which is `anonLeafLitFieldFnName`'s default: every element must
+// hold the same function at the field, for the reason `anonLeafSameFieldFnName` states.
+function anonLeafArrFieldFnName(lit: i32, prop: string): string {
+  const l = P.nodes[lit]
+  if l is ArrayLit { return anonLeafSameFieldFnName(l.arrElems, prop) }
+  ""
+}
+
+// The ONE function every element of `els` holds at field `prop`, or "" — a container slot is
+// one wasm signature, so two different functions in it agree only by accident.
+function anonLeafSameFieldFnName(els: i32[], prop: string): string {
+  let nm = ""
+  let i = 0
+  while i < els.length {
+    const ei = unwrapParen(els[i])
+    const e = P.nodes[ei]
+    if !(e is ObjLit) { return "" }
+    const en = anonLeafFnNameOfVal(objFieldVal(ei, prop))
+    if en == "" { return "" }
+    if nm == "" { nm = en }
+    if nm != en { return "" }
+    i = i + 1
+  }
+  nm
+}
+
+// The ONE function every element of every candidate array IS, or "".
+function anonLeafElemFnNameOf(arrIx: i32): string {
+  const lits: i32[] = []
+  anonLeafContainerLits(arrIx, 0, lits)
+  let nm = ""
+  let i = 0
+  while i < lits.length {
+    const en = anonLeafLitElemFnName(lits[i])
+    if en == "" { return "" }
+    if nm == "" { nm = en }
+    if nm != en { return "" }
+    i = i + 1
+  }
+  nm
+}
+
+// One candidate literal's answer: every element of an array is the same named function.
+function anonLeafLitElemFnName(lit: i32): string {
+  const l = P.nodes[lit]
+  if l is ArrayLit {
+    const els = l.arrElems
+    let nm = ""
+    let i = 0
+    while i < els.length {
+      const en = anonLeafFnNameOfVal(unwrapParen(els[i]))
+      if en == "" { return "" }
+      if nm == "" { nm = en }
+      if nm != en { return "" }
+      i = i + 1
+    }
+    return nm
+  }
+  ""
+}
+
+// The function the callee of `cf` HANDS BACK — one hop, through a named declaration's single
+// return expression (`pick()(…)`). "" for every other callee kind, which is also this
+// ladder's default: a bare `Ident` callee is answered by the arm above this one's caller,
+// and nothing else carries a delivery this pass can follow.
+function anonLeafRetFnNameOf(cf: i32): string {
+  const cn = P.nodes[cf]
+  if cn is Call {
+    const inner = P.nodes[unwrapParen(cn.callFn)]
+    if inner is Ident {
+      const fd = anonLeafDeclFnNodeOf(inner.identName)
+      if fd >= 0 {
+        const rx = fnRetExprOf(fd)
+        if rx >= 0 { return anonLeafFnNameOfVal(unwrapParen(rx)) }
+      }
+    }
+  }
+  ""
+}
+
+// EVERY literal a container expression could be: itself, or — one binding hop at a time,
+// under a depth cap — the initializer of every binding that spells its name. The recursion
+// IS this ladder's default: a name whose initializer is another name is the same question one
+// hop in.
+function anonLeafContainerLits(ix0: i32, depth: i32, out: i32[]) {
+  if depth > 3 { return 0 }
+  // BEFORE `unwrapParen`: the recursion feeds it a binding's -1 initializer, and
+  // `unwrapParen(-1)` reads `P.nodes[-1]` — a compiler TRAP, not a refusal (D1152).
+  if ix0 < 0 { return 0 }
+  const ix = unwrapParen(ix0)
+  if ix < 0 { return 0 }
+  const e = P.nodes[ix]
+  if e is ObjLit {
+    out.push(ix)
+    return 0
+  }
+  if e is ArrayLit {
+    out.push(ix)
+    return 0
+  }
+  anonLeafBindingLits(ix, depth, out)
+}
+
+// The binding hop: every initializer recorded for the name this `Ident` spells. Not "the one
+// binding" — see `anonLeafFieldFnNameOf` for why the candidates are collected rather than
+// refused.
+function anonLeafBindingLits(ix: i32, depth: i32, out: i32[]) {
+  const e = P.nodes[ix]
+  if e is Ident {
+    let i = 0
+    while i < anonLeafDeclBindName.length {
+      if anonLeafDeclBindName[i] == e.identName {
+        anonLeafContainerLits(anonLeafDeclBindInit[i], depth + 1, out)
+      }
+      i = i + 1
+    }
+  }
+  0
+}
+
+// A value that IS a named function: a bare identifier the module declares as one. A LAMBDA
+// answers "" — it has no name for the moved-`$fnsig` lookups to key on, and the safe
+// direction here is the veto.
+function anonLeafFnNameOfVal(valIx: i32): string {
+  if valIx < 0 { return "" }
+  const v = P.nodes[unwrapParen(valIx)]
+  if v is Ident {
+    if nameNamesFunction(v.identName) { return v.identName }
+  }
+  ""
+}
+
+// ── the declaration index (D1100) ────────────────────────────────────────────
+// Binding NAME to its initializer node, and function NAME to its `FuncDecl` node. Built once
+// per program and RESUMED on arena growth, which is what keeps the delivery resolver off
+// `P.nodes`: asking the arena per callee is the O(callees x nodes) shape #2419 measured and
+// `arena-scan-outside-pass` reports. Cleared per program beside the other `anonLeaf` tables.
+let anonLeafDeclSeen = 0
+let anonLeafDeclBindName: string[] = []
+let anonLeafDeclBindInit: i32[] = []
+let anonLeafDeclFnName: string[] = []
+let anonLeafDeclFnNode: i32[] = []
+
+function anonLeafDeclIndex() {
+  let i = anonLeafDeclSeen
+  while i < P.nodes.length {
+    anonLeafDeclIndexBind(i)
+    anonLeafDeclIndexFn(i)
+    i = i + 1
+  }
+  anonLeafDeclSeen = P.nodes.length
+  0
+}
+
+// Node `i`'s BINDING row, or nothing. Split from the walk so each half asks about ONE node
+// kind: the two questions are independent, and a node is never both.
+function anonLeafDeclIndexBind(i: i32) {
+  const n = P.nodes[i]
+  if n is LetDecl {
+    anonLeafDeclBindName.push(n.letName)
+    // The RAW node: `unwrapParen` of a binding with no initializer reads `P.nodes[-1]`.
+    // Every reader peels its own parens, and every reader guards -1.
+    anonLeafDeclBindInit.push(n.letInit)
+  }
+  0
+}
+
+// Node `i`'s FUNCTION row, or nothing. The `FuncDecl` half of `anonLeafDeclIndexBind`.
+function anonLeafDeclIndexFn(i: i32) {
+  const n = P.nodes[i]
+  if n is FuncDecl {
+    anonLeafDeclFnName.push(n.fnName)
+    anonLeafDeclFnNode.push(i)
+  }
+  0
+}
+
+// The `FuncDecl` node named `nm`, or -1 when the module declares none or two.
+function anonLeafDeclFnNodeOf(nm: string): i32 {
+  if nm == "" { return 0 - 1 }
+  let found = 0 - 1
+  let i = 0
+  while i < anonLeafDeclFnName.length {
+    if anonLeafDeclFnName[i] == nm {
+      if found >= 0 { return 0 - 1 }
+      found = anonLeafDeclFnNode[i]
+    }
+    i = i + 1
+  }
+  found
 }
 
 // CAN A `.m(…)` ON A RECEIVER OF THIS KIND BE A CALL THROUGH A FUNCTION VALUE? Exhaustive over
@@ -8168,7 +8415,7 @@ function anonLeafBuiltinMethodRecv(ot: i32): boolean {
   if o is TyArray { return true }
   if o is TyMap { return true }
   if o is TyPrim { return true }
-  if o is TyObj { return false }
+  if o is TyObj { return true }
   if o is TyFunc { return false }
   if o is TyUnion { return false }
   if o is TyNullable { return false }
@@ -10412,6 +10659,13 @@ export function collectS(stmts: i32[]) {
   anonLeafCloBindName = []
   anonLeafCloBindFn = []
   anonLeafSupersede = []
+  // D1100's declaration index is keyed by arena NODE, so a surviving row would answer the
+  // next program with this one's nodes — the same reason every column above it resets here.
+  anonLeafDeclSeen = 0
+  anonLeafDeclBindName = []
+  anonLeafDeclBindInit = []
+  anonLeafDeclFnName = []
+  anonLeafDeclFnNode = []
   // The struct-row NAME index keys THIS table's spellings — reset it with the table, or the
   // next program's rows answer with this one's names (see its header). MEASURED, not
   // defensive: without this line hundreds of the shared-instance wasm harness's cases fail.
