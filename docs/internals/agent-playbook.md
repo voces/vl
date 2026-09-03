@@ -26,7 +26,7 @@ subsystem-avoidance notes.
   LONGER EXISTS** (`grep -rln REJECT_CASES tests/ scripts/` returns nothing) —
   gating on it is the vacuous pass this file warns about two bullets up. The live
   equivalents are the corpus `@error` cases adjudicated by
-  `tests/cases_wasm_test.ts`, and the REJECT tier of
+  `tests/cases_wasm_*_test.ts`, and the REJECT tier of
   `tests/selfhost_native_align_test.ts`, which discovers its members rather than
   listing them.
 
@@ -136,7 +136,7 @@ Two consequences worth stating:
         tests/selfhost_native_*_test.ts tests/vl_*_test.ts
       deno test -A --no-check tests/lsp_inlay_hint_test.ts \
         tests/lsp_semantic_tokens_test.ts tests/lsp_undisplayable_type_test.ts
-      deno test -A tests/cases_wasm_test.ts
+      deno test -A --parallel tests/cases_wasm_*_test.ts
 
   **The env var is load-bearing on the first line**: without it that command reads
   **62 passed / 2050 ignored**; with it, **2112 passed / 0 failed**. CI sets it in the
@@ -200,8 +200,8 @@ Two consequences worth stating:
   branch's baseline means binaryen is missing, not that anything changed. Diff the
   ignored NAME SET against the baseline with both files asserted non-empty — an
   empty-vs-empty diff is clean and means nothing, which has happened here.
-- Per commit, if the checker got more permissive: `deno test -A
-  tests/cases_wasm_test.ts` (the `@error` cases) plus the align suite's REJECT
+- Per commit, if the checker got more permissive: `deno test -A --parallel
+  tests/cases_wasm_*_test.ts` (the `@error` cases) plus the align suite's REJECT
   tier. Not "the REJECT_CASES loop" — see the reject-parity bullet above.
   (~~`git status tests/golden/` empty~~ — that directory is GONE; see above.)
 - ~~Before finishing: `deno test -A --no-check tests/selfhost_emit_fixpoint_test.ts`
@@ -252,10 +252,10 @@ Two consequences worth stating:
 - A new corpus `@error`/`@run` case whose verdict the WASM oracle reaches by a
   different message — or that the native emitter loud-rejects while the host
   accepts (the native long tail) — must be registered in
-  `tests/cases_wasm_test.ts`'s `EXPECTED_DIVERGENCES` IN THE SAME PR. Skipping
+  `tests/support/casesWasmOracle.ts`'s `EXPECTED_DIVERGENCES` IN THE SAME PR. Skipping
   this turns master red the moment the case merges (the slice-0 intrinsics
   corpus did exactly this — 5 cases red on master until #358). Run
-  `deno test -A tests/cases_wasm_test.ts` before opening any corpus-adding PR.
+  `deno test -A --parallel tests/cases_wasm_*_test.ts` before opening any corpus-adding PR.
 - **A `$fnsig` interning KEY that is coarser than the `$fnsig` BYTES is a
   miscompile, not a missed dedup.** The bytes for a `$fnsig` slot come from the
   key's REPRESENTATIVE function (`cloSigRepFn` → `cloRetValKind`), not from the

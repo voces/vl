@@ -8,7 +8,7 @@
 // difference, and `wasm-opt --closed-world -O3 --gufa` does not undo it.
 //
 // The two corpus fixtures this file builds already pin the BEHAVIOUR (their `@log`
-// oracles run in `cases_wasm_test.ts` and the native-align suite). What a corpus case
+// oracles run in `cases_wasm_*_test.ts` and the native-align suite). What a corpus case
 // cannot pin is that the promotion HAPPENED, and that the safety predicate REFUSED when
 // it had to. Both are visible in one number: how many entries the module's global
 // section declares.

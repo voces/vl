@@ -170,4 +170,24 @@ else
     fi
   done
 fi
-echo "refreshed $OUT ($(wc -c < "$OUT") bytes) from current compiler/*.vl"
+
+# WARM EVERY ENGINE TAG, not just the one this script happened to make. The host
+# compiles the seed under TWO engine configurations (`gc_engine`, main.rs): a null
+# collector for `build`/`run`, a collecting one for the `check`/`fmt`/`test` pump —
+# and each keeps its own sidecar. Only `run`'s was ever carried forward, so the
+# `check` tag was cold at the start of every ci-native step and every worker that
+# started before the first JIT published re-compiled the 1.8 MB seed itself.
+# Measured: ~280 s of redundant CPU per step, 45% of it
+# (docs/internals/perf-opportunities-2026-09.md §A5, item 3).
+# Concurrent because the publish is an atomic rename, and NON-FATAL: a warm sidecar
+# is a cache, so a failure here costs one JIT, never a refresh.
+warm() {
+  "$VL" "$1" "$WORK/hello.vl" --compiler "$OUT" > /dev/null 2>&1 ||
+    echo "  note: could not warm the \`$1\` sidecar — its first use re-JITs the seed" >&2
+}
+warm run & warm check & wait
+sidecars=0
+for side in "$OUT".*.cwasm; do
+  if [ -f "$side" ]; then sidecars=$((sidecars + 1)); fi
+done
+echo "refreshed $OUT ($(wc -c < "$OUT") bytes) from current compiler/*.vl; $sidecars engine-tag sidecar(s) warm"

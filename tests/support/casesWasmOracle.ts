@@ -58,22 +58,30 @@
 //
 // The seed is built by `bash scripts/refresh-compiler.sh`. Absent (fresh
 // clone, or the `ci` job, which has no seed) every test here self-ignores —
-// the `ci-native` job runs this file explicitly after refreshing the seed.
+// the `ci-native` job runs the shards explicitly after refreshing the seed.
 //
-// Run with:  deno test -A tests/cases_wasm_test.ts
+// SHARDED. `registerCorpusOracle(k, n)` registers every n-th case, and the
+// `tests/cases_wasm_<k>_test.ts` files are the n callers — one FILE per shard
+// because `deno test --parallel` gives one worker per file, and this corpus
+// was 44 s of the ci-native job on one core. The adjudication below is
+// untouched by the split: a case is graded by the same code in the same order
+// against its own fresh `modReset`/`srcReset`, and the shards partition the
+// case list so every case is graded exactly once.
+//
+// Run with:  deno test -A --parallel tests/cases_wasm_*_test.ts
 
-import { runWasm, VLRuntimeError } from "./support/runWasm.ts";
+import { runWasm, VLRuntimeError } from "./runWasm.ts";
 // The module-arming gate — the SHARED TS copy. `compiler/moduleGate.ts` is a LEAF
 // (it imports nothing and carries no runtime), so this oracle keeps its "no
 // dependency on the TS front end" property while stopping being a second hand-
 // maintained spelling of the predicate. Four implementations exist across three
 // languages; that file's header names them and `tests/module_gate_agreement_test.ts`
 // is the guard that keeps them agreeing.
-import { needsModules } from "../compiler/moduleGate.ts";
+import { needsModules } from "../../compiler/moduleGate.ts";
 
-const CASES_DIR = new URL("./cases/", import.meta.url);
-const STD_DIR = new URL("../std/", import.meta.url);
-const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
+const CASES_DIR = new URL("../cases/", import.meta.url);
+const STD_DIR = new URL("../../std/", import.meta.url);
+const SEED = new URL("../../build/vl-compiler.wasm", import.meta.url).pathname;
 
 const seedExists = (() => {
   try {
@@ -702,56 +710,87 @@ const caseName = (c: Case): string =>
   (c.kind === "single" ? c.url.href : c.dir.href).slice(CASES_DIR.href.length);
 cases.sort((a, b) => caseName(a).localeCompare(caseName(b)));
 
-const seen = new Set<string>();
-for (const c of cases) {
-  const name = caseName(c);
-  seen.add(name);
-  const srcUrl = c.kind === "single" ? c.url : c.entry;
-  const src = Deno.readTextFileSync(srcUrl);
-  const d = parseDirectives(src);
-
-  const skip = !seedExists
-    ? "no seed — bash scripts/refresh-compiler.sh"
-    : d.skip !== null
-    ? d.skip
-    : EXPECTED_DIVERGENCES[name];
-
-  Deno.test({
-    name,
-    ignore: skip !== undefined && skip !== null,
-    fn: async () => {
-      const entryKey = (c.kind === "single" ? c.url : c.entry).pathname;
-      const r = driveCase(
-        exports!,
-        entryKey,
-        src,
-        // @emit-error pins the EMIT stage, so it needs the full compile too.
-        d.mode === "run" || d.emitErrors.length > 0,
-        c.kind === "module",
-      );
-      await assertCase(d, r);
-      // The lint tier (.vl lint pass) — adjudicated on SINGLE-FILE cases that
-      // type-check cleanly (no `@error`/`@error-at`). Lint is a quality pass over
-      // WELL-FORMED code; on an erroring program the native lint over-reports
-      // (e.g. "unused variable" on a redeclared/ill-typed binding) relative to the
-      // TS host, which doesn't lint a failed compile — so error cases skip the
-      // lint tier here (module-graph lint is a later slice too).
-      if (
-        c.kind === "single" && d.errors.length === 0 &&
-        d.errorsAt.length === 0 && d.emitErrors.length === 0
-      ) {
-        assertLint(d, [...driveLint(exports!, src), ...r.redun]);
-      }
-    },
-  });
-}
-
-// Stale-entry tripwire: every expected-divergence key must still name a
-// discovered case, so a renamed/deleted corpus file surfaces here instead of
-// silently skipping nothing.
-Deno.test("EXPECTED_DIVERGENCES entries name existing cases", () => {
-  const stale = Object.keys(EXPECTED_DIVERGENCES).filter((k) => !seen.has(k));
-  if (stale.length) {
-    throw new Error(`stale EXPECTED_DIVERGENCES entries: ${stale.join(", ")}`);
+/**
+ * Register shard `shard` of `shards` (0-based) — a CONTIGUOUS equal-count block
+ * of the sorted case list, which keeps every case's PREDECESSOR on the shared
+ * instance, all but the `shards - 1` block-first ones.
+ *
+ * That is load-bearing, not tidiness. Cases run on one instance by design (it is
+ * what makes this oracle able to see a state leak at all — D986, D1003), and a
+ * `index % shards` round-robin, which balances better, reordered
+ * `unions/paren-narrowed-receiver-read.vl` behind
+ * `unions/nullable-variant-positions.vl` and turned it red with
+ * `emitProgram: object literal is missing a union-variant field`. Both pass alone
+ * and in the corpus order; the leak is real and predates the split.
+ *
+ * Only the owned cases are READ: the walk is a directory listing, so a shard pays
+ * 1/n of the corpus read rather than all of it. The stale-entry tripwire needs the
+ * WHOLE case list, so shard 0 alone registers it — that keeps the total test COUNT
+ * independent of `shards`.
+ */
+export const registerCorpusOracle = (shard: number, shards: number): void => {
+  if (!Number.isInteger(shards) || shards < 1) {
+    throw new Error(`registerCorpusOracle: shards must be >= 1, got ${shards}`);
   }
-});
+  if (!Number.isInteger(shard) || shard < 0 || shard >= shards) {
+    throw new Error(
+      `registerCorpusOracle: shard must be in [0, ${shards}), got ${shard}`,
+    );
+  }
+  const lo = Math.floor((shard * cases.length) / shards);
+  const hi = Math.floor(((shard + 1) * cases.length) / shards);
+  for (let i = lo; i < hi; i++) {
+    const c = cases[i];
+    const name = caseName(c);
+    const srcUrl = c.kind === "single" ? c.url : c.entry;
+    const src = Deno.readTextFileSync(srcUrl);
+    const d = parseDirectives(src);
+
+    const skip = !seedExists
+      ? "no seed — bash scripts/refresh-compiler.sh"
+      : d.skip !== null
+      ? d.skip
+      : EXPECTED_DIVERGENCES[name];
+
+    Deno.test({
+      name,
+      ignore: skip !== undefined && skip !== null,
+      fn: async () => {
+        const entryKey = (c.kind === "single" ? c.url : c.entry).pathname;
+        const r = driveCase(
+          exports!,
+          entryKey,
+          src,
+          // @emit-error pins the EMIT stage, so it needs the full compile too.
+          d.mode === "run" || d.emitErrors.length > 0,
+          c.kind === "module",
+        );
+        await assertCase(d, r);
+        // The lint tier (.vl lint pass) — adjudicated on SINGLE-FILE cases that
+        // type-check cleanly (no `@error`/`@error-at`). Lint is a quality pass over
+        // WELL-FORMED code; on an erroring program the native lint over-reports
+        // (e.g. "unused variable" on a redeclared/ill-typed binding) relative to the
+        // TS host, which doesn't lint a failed compile — so error cases skip the
+        // lint tier here (module-graph lint is a later slice too).
+        if (
+          c.kind === "single" && d.errors.length === 0 &&
+          d.errorsAt.length === 0 && d.emitErrors.length === 0
+        ) {
+          assertLint(d, [...driveLint(exports!, src), ...r.redun]);
+        }
+      },
+    });
+  }
+
+  if (shard !== 0) return;
+  // Stale-entry tripwire: every expected-divergence key must still name a
+  // discovered case, so a renamed/deleted corpus file surfaces here instead of
+  // silently skipping nothing.
+  const seen = new Set(cases.map(caseName));
+  Deno.test("EXPECTED_DIVERGENCES entries name existing cases", () => {
+    const stale = Object.keys(EXPECTED_DIVERGENCES).filter((k) => !seen.has(k));
+    if (stale.length) {
+      throw new Error(`stale EXPECTED_DIVERGENCES entries: ${stale.join(", ")}`);
+    }
+  });
+};
