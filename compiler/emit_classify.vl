@@ -18707,17 +18707,30 @@ export function ensureRefElemTy(elemName: string, ty: i32) {
 // diverged — an `f32[]` leaf was 4 here and 10 there, a nested `i32[][]` leaf 4 here and 9
 // there — which is why the intern half had to be bounded by an allow-list
 // (`tyNestedArrLeafSupported`) instead of simply answering. One producer, no allow-list.
+// Whether `nn` — the non-null part of a nullable ELEMENT — is the niche `refArrShapeKind`
+// answers kind 1 for: a declared struct, or a union VARIANT (whose arm and layout twin are one
+// heap since D280). The two rungs and their order are that function's, read here so the
+// re-grouping and the kind cannot disagree about which elements have a niche. D1340.
+function nulStructElemNiche(nn: string): boolean {
+  if structIndexByName(nn) >= 0 { return true }
+  variantIndexOf(nn) >= 0
+}
+
 export function refElemArrName(elemName: string): string {
   // Re-form the element's ARRAY name to read its kind. A nullable-LIST element (`i32[] | null`) needs its
   // grouping parens back (`(elem)[]`) — without them `refArrElemKind` mis-reads `i32[] | null[]` as a
-  // plain struct element (kind 1) instead of the kind-4 nullable-i32-list element. Scoped to a nullable
-  // element whose non-null part is an ARRAY, so value-union (`i32 | null`) / nullable-struct (`P | null`)
-  // elements keep their existing (munged-name) kind and are unaffected.
+  // plain struct element (kind 1) instead of the kind-4 nullable-i32-list element. The set re-grouped
+  // here is exactly the set `refArrShapeKind` has a NICHE kind for — list, closure, map and the
+  // declared-struct / union-variant niche (D1340). A value-union element (`i32 | null`) has no niche
+  // and is not re-grouped here; the arm below claims it, as kind 2, on its own gate.
   let arrName = elemName + "[]"
   const enp = nullablePartOf(elemName)
   if (
     enp != "" &&
-    (nameIsArray(enp) || nameIsFuncTypeAtom(enp) || nameIsBareMap(enp))
+    (nameIsArray(enp) ||
+      nameIsFuncTypeAtom(enp) ||
+      nameIsBareMap(enp) ||
+      nulStructElemNiche(enp))
   ) {
     // A nullable-LIST element (`i32[] | null`), a nullable-CLOSURE element
     // (`((i32) => boolean) | null` — the kind-5 niche), and a nullable-MAP element
@@ -19672,8 +19685,27 @@ export function arrLitNestedElemKind(arrIx: i32): i32 {
 //
 // TWO GATES, both `arrLitNestedElemName`'s: the render must exist, and the REF-LIST LAYER must
 // be able to name it. `refElemArrName` re-groups only the niches it has a rep for, so a
-// nullable STRUCT or SCALAR element munges into a name no arm claims and declines — as does a
+// nullable SCALAR element munges into a name no arm claims and declines — as does a
 // value-union BOX (kind 2), which is no niche. Declining leaves the program where it was.
+
+// D1340 — the element NAME of a nullable element, NOMINAL where the niche needs it.
+// `tyToEmitName` renders a `TyObj` structurally, so a nullable-STRUCT element arrives as
+// `{a:i32}|null` — and `refArrShapeKind`'s niche rung resolves the nullable part through
+// `structIndexByName`, which answers for a DECLARED name. The structural spelling fell past
+// the niche and the literal took the i32 default, while the annotated spelling keyed `S|null`
+// and ran: two producers, two rows, one element. The reverse map (`nominalStructNameOfTy`, the
+// same one an inferred struct-union return is spelled with) puts both on the declared name.
+function nulRefElemEmitName(nulTy: i32, innerTy: i32): string {
+  if innerTy >= 0 {
+    const it = T.tys[innerTy]
+    if it is TyObj {
+      const nom = nominalStructNameOfTy(innerTy)
+      if nom != "" { return nom + "|null" }
+    }
+  }
+  tyToEmitName(nulTy)
+}
+
 export function arrLitNulRefElemName(arrIx: i32): string {
   const ty = nodeTyIxOf(arrIx)
   if ty < 0 { return "" }
@@ -19682,7 +19714,7 @@ export function arrLitNulRefElemName(arrIx: i32): string {
     if t.aElem >= 0 {
       const el = T.tys[t.aElem]
       if el is TyNullable {
-        const nen = tyToEmitName(t.aElem)
+        const nen = nulRefElemEmitName(t.aElem, el.nInner)
         if nen == "" { return "" }
         const an = refElemArrName(nen)
         if !nameIsRefArray(an) { return "" }
