@@ -9,12 +9,17 @@ scripts/comment-budget.py and scripts/scan-budget.py — a committed baseline, a
 the change that earned the growth. See CLAUDE.md, "Gates", and DECISIONS.md
 "The seed's size is a per-landing number".
 
-THE NUMBER IS THE FIXPOINT'S. One self-compile off a stale seed reads the OLD
-compiler's codegen of current source, which is a different artifact: measured
-2026-09-03 at ff4b5f04, one rung gave 1,842,901 bytes and the fixpoint 1,996,118
-(8.3% apart). ci-native runs `--check` straight after `--prove-fixpoint`, so the
-deciding reading is always the fixpoint's; a local `gate.sh` seed one rung short
-reads its own seed and can differ. See DECISIONS.md.
+THE NUMBER IS THE FIXPOINT'S — size only a converged seed (`--prove-fixpoint`, or
+two passes that agree). One self-compile off a stale seed reads the OLD compiler's
+codegen of current source, which is a different artifact: 1,842,901 bytes at one
+rung against 1,996,118 at the fixpoint, and on another branch the same day one
+pass read 1,844,776 where three converged at 1,997,993. That second pair is why
+this is an invariant and not a caveat: the error has a SIGN, so the one-rung
+reading says the compiler SHRUNK ~7.5%, and a gate that alarms only on growth
+passes it in silence. ci-native runs `--check` straight after `--prove-fixpoint`,
+so the deciding reading is always the fixpoint's; a local `gate.sh` seed one rung
+short reads its own seed and can differ. Both pairs: DECISIONS.md, "The seed's
+size is a per-landing number" / "The reading is the FIXPOINT's".
 
 Absent seed is not a failure: the `ci` job never builds one, and every seed-backed
 test there self-ignores on the same reasoning.

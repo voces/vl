@@ -99,6 +99,19 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   top-level `while` still allocates per step (measured unchanged, ratio 5.1 per doubling).
   Option C (ropes) stays refused — it changes the rep for every program to fix a pattern a
   static analysis can see.
+  **A's UNROLL was re-opened and re-closed by measurement**: a fixed-arity helper family
+  `__str_cat3__ … __str_cat8__` (the shape that needs no parts array and no new heap type)
+  was built, self-compiled to its own fixpoint and A/B'd against inline and a 5..8 hybrid,
+  every timing running all three arms simultaneously on pinned cores with a same-code
+  CONTROL cell in each grid. The COMPILE side already decides: a `--codegen` sweep of all
+  2,792 `tests/cases` programs puts inline first in all four rounds (+0.5-1.6% for the
+  helper) and the L2 self-compile is a dead heat, so the seed-size tie-breaker never
+  applies. The runtime price is a fixed call, decaying like one: +10.7% at arity 3, +6.2%
+  at 5, +2.4% at 8 against a ±2% control, and 85.0% of the compiler's own 652 chains are
+  arity <= 5. The helper's 121,085 fewer seed bytes are worth ~1 s of CPU a native step
+  now that #2451 warms both engine tags, against +1,669 B on every string-using module at
+  the default rung. INLINE STAYS (survey §D7, DECISIONS.md). The variant that could change
+  it, named and not built: mint the family per arity, only where such a chain exists.
 
 
 ### Ruled and sequenced (owner decisions already made, waiting only on order)
