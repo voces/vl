@@ -37,6 +37,7 @@ import {
   intLexemeIsExactF32,
   numLexIsFloat,
   parseI32,
+  parseI64Pair,
 } from "./emit_bignum"
 import {
   ArrayLit,
@@ -21349,8 +21350,14 @@ function paramDefaultIsLiteral(dIx: i32) {
     // A SIGNED numeric literal (`-1`): the sign is a `Unary` over the literal,
     // and it is still name-free.
     if d.unOp == "-" || d.unOp == "+" {
-      const inner = P.nodes[d.unArg]
-      if inner is NumLit { return true }
+      // BOUND-TESTED, because `unArg` is a NODE INDEX and an unbounded `P.nodes[…]` on one is a
+      // COMPILER TRAP rather than a diagnostic — the shape of D1440/D1462/D1500/#2498. The
+      // rule is docs/internals/sentinel-index-lint.md; the sign arm answers `false` for an
+      // operand that is not there, which is what "not a literal" already means here.
+      if d.unArg >= 0 && d.unArg < P.nodes.length {
+        const inner = P.nodes[d.unArg]
+        if inner is NumLit { return true }
+      }
     }
   }
   if d is Ident {
@@ -34858,13 +34865,250 @@ function unionHasLitMember(mems: i32[]) {
 }
 
 // Why a scrutinee is refused, named for the type it actually is. A `match` needs a closed
-// member SET to be complete over, and every member must have an arm spelling that lowers.
+// member SET to be complete over, and every member must have an arm spelling that lowers —
+// or it is an INTEGER, which has no member set and takes a `_` instead (D1572).
 function matchScrutRejectMsg(st: i32, mems: i32[]) {
   if unionHasLitMember(mems) {
     return "match over a union with literal members is not supported — compare them with `==` in an if-chain, got " +
       tyToStr(st)
   }
-  "match scrutinee must be a union, got " + tyToStr(st)
+  "match scrutinee must be a union or an integer, got " + tyToStr(st)
+}
+
+// An integer `match` (D1572, VL-020): the scrutinee types whose arms are integer LITERALS
+// rather than member types or member strings. `i32` and `i64` and nothing else — `u8` is a
+// STORAGE type no local, parameter or return may hold, and a float is excluded because
+// dispatching on `==` over one is a trap rather than a feature.
+function tyIsIntMatchScrut(st: i32) {
+  const p = primNameOf(st)
+  p == "i32" || p == "i64"
+}
+
+// Does every pattern read as an integer LITERAL or the `_` wildcard, with at least one literal?
+// The question a HOLE scrutinee is dispatched on: an UN-ANNOTATED parameter's type is a `TyVar`
+// no vocabulary can be chosen from, so the ARMS choose, and each arm then defers a `==`
+// constraint the CALL adjudicates — which is what the hand-written if-chain twin already did,
+// and the consumer's own VL-020 probe is un-annotated. A hole with TYPE or STRING patterns is
+// untouched and still refused at the scrutinee.
+function matchArmsAreIntLits(n: MatchExpr) {
+  let lits = 0
+  let i = 0
+  while i < n.matchPats.length {
+    const patIx = n.matchPats[i]
+    const num = matchPatIntNumOf(patIx)
+    if num >= 0 {
+      lits = lits + 1
+    } else {
+      // The parser mints an `Ident` pattern ONLY for `_`.
+      let wild = false
+      const pn = P.nodes[patIx]
+      if pn is Ident { wild = true }
+      if !wild { return false }
+    }
+    i = i + 1
+  }
+  lits > 0
+}
+
+// What an integer scrutinee refuses in pattern position, named for the type it actually is.
+// Two callers — a node kind that is no literal at all, and a `Unary` that is not `-` over one.
+function intArmRejectMsg(st: i32) {
+  "invalid match pattern — a pattern over " +
+    tyToStr(st) +
+    " is an integer literal or the `_` wildcard"
+}
+
+// The `NumLit` an integer-literal PATTERN delivers — the pattern node itself, or the operand
+// of the `Unary "-"` the negative spelling mints — or -1 for any other pattern. `patIx` back
+// means positive, anything else negative, which is the `neg` flag every reader below takes.
+function matchPatIntNumOf(patIx: i32) {
+  if patIx < 0 { return -1 }
+  const pn = P.nodes[patIx]
+  if pn is NumLit { return patIx }
+  matchNegPatNum(patIx)
+}
+
+// The `NumLit` a NEGATIVE integer pattern negates, or -1 when the `Unary` is not that shape.
+// `parseMatchPattern` mints a `Unary` in pattern position only as `-` over a NUMBER, so the
+// miss is a defensive floor rather than a spelling a program can reach — and the operand read
+// is BOUND-TESTED for the reason docs/internals/sentinel-index-lint.md gives: an unbounded
+// `P.nodes[…]` on a node index traps the COMPILER instead of diagnosing the program.
+function matchNegPatNum(patIx: i32) {
+  const pn = P.nodes[patIx]
+  if pn is Unary {
+    if pn.unOp == "-" && pn.unArg >= 0 && pn.unArg < P.nodes.length {
+      const inner = P.nodes[pn.unArg]
+      if inner is NumLit { return pn.unArg }
+    }
+  }
+  -1
+}
+
+// An integer-literal pattern's LEXEME, sign included, for a diagnostic that quotes it back.
+function matchIntPatLexeme(numIx: i32, neg: boolean) {
+  const nn = P.nodes[numIx]
+  if nn is NumLit {
+    if neg { return "-" + nn.numText }
+    return nn.numText
+  }
+  ""
+}
+
+// An integer-literal pattern's 64-bit VALUE as `[hi, lo]`, or an EMPTY list when it has none.
+// Two arms are duplicates iff their pairs agree, so `0x10` and `16` are ONE arm and `-1` is
+// not `1` — a duplicate check over the lexeme would miss both. `parseI64Pair` folds the
+// lexeme exactly as `i64.const` does; the negative spelling takes its two's complement, which
+// also makes `-0` and `0` one key, as the emitted compare chain would.
+function matchIntPatValue(numIx: i32, neg: boolean) {
+  const empty: i32[] = []
+  const nn = P.nodes[numIx]
+  if nn is NumLit {
+    if numLexIsFloat(nn.numText) { return empty }
+    const pair = parseI64Pair(nn.numText)
+    if !neg { return pair }
+    const hi0 = pair[0]
+    const lo0 = pair[1]
+    let negHi = ~hi0
+    if lo0 == 0 { negHi = ~hi0 + 1 }
+    const out: i32[] = []
+    out.push(negHi)
+    out.push(~lo0 + 1)
+    return out
+  }
+  empty
+}
+
+// ONE integer-literal arm pattern: type-check it against the scrutinee and CLAIM its value,
+// reporting a mismatch or a duplicate at the pattern. `numIx` is the `NumLit` the pattern
+// delivers and `neg` whether a `-` precedes it; `keyHi`/`keyLo` are the values already claimed
+// (VL arrays are references, so the push is the caller's).
+//
+// Answers false only for a TYPE mismatch — the one refusal that makes the pattern cover
+// nothing, so the caller suppresses its missing-`_` report. A duplicate still covers its value.
+function checkIntArmLit(
+  patIx: i32,
+  numIx: i32,
+  neg: boolean,
+  st: i32,
+  keyHi: i32[],
+  keyLo: i32[],
+) {
+  // CHECKED as the expression it is, so `nodeTyIx` is filled for the `==` the desugar builds
+  // over it and the arm-type rule is the ordinary assignability one: an `i32` literal reaches
+  // an `i64` scrutinee by the widening lattice, never the reverse.
+  const pt = checkNode(patIx)
+  if !assignable(pt, st) {
+    tErr(
+      "match pattern type mismatch: expected " +
+        tyToStr(st) +
+        ", found " +
+        tyToStr(pt),
+      patIx,
+    )
+    return false
+  }
+  // A HOLE scrutinee cannot decide the compare's form here, so record the deferred `==` the
+  // desugared chain will emit and let the CALL that pins the parameter adjudicate it — the
+  // same constraint, in the same table, that the hand-written if-chain twin records.
+  // `noteBinCstr` gates itself on a hole, so a concrete scrutinee pays nothing.
+  noteBinCstr(st, "==", pt)
+  const key = matchIntPatValue(numIx, neg)
+  if key.length != 2 { return true }
+  let ki = 0
+  while ki < keyHi.length {
+    if keyHi[ki] == key[0] && keyLo[ki] == key[1] {
+      tErr(
+        "redundant match arm: `" +
+          matchIntPatLexeme(numIx, neg) +
+          "` is already covered",
+        patIx,
+      )
+      return true
+    }
+    ki = ki + 1
+  }
+  keyHi.push(key[0])
+  keyLo.push(key[1])
+  true
+}
+
+// `match` over an INTEGER scrutinee (D1572, VL-020) — arms are integer LITERALS of the
+// scrutinee's type plus a MANDATORY `_`, since 2^32 cases is not a member set to be complete
+// over. Duplicate arms and an arm after the `_` are errors; the ruling, and what is out of
+// scope, is DECISIONS.md §"`match` over an integer scrutinee".
+//
+// No emitter path of its own: `desugarMatchAt` already turns a non-`IsExpr` pattern into
+// `scrut == pat`, so the chain is the hand-written if-chain node for node.
+function checkMatchIntArms(n: MatchExpr, ix: i32, st: i32) {
+  // The literal values already claimed, as parallel high/low halves of the 64-bit key.
+  const keyHi: i32[] = []
+  const keyLo: i32[] = []
+  let hasWild = false
+  let wildArm = -1
+  // A pattern that is not an integer literal covers nothing — report it AT THE PATTERN and
+  // suppress the missing-`_` report below, which would mis-blame coverage for it.
+  let sawBadPat = false
+  // -1 is the "unset" join seed (`joinTys` returns the other operand); the positive TY_ERR
+  // sentinel would POISON the join, so never seed with it.
+  let matchTy = -1
+  const nArms = n.matchArmStart.length
+  let ai = 0
+  while ai < nArms {
+    let pj = 0
+    while pj < n.matchArmCount[ai] {
+      const patIx = n.matchPats[n.matchArmStart[ai] + pj]
+      const pn = P.nodes[patIx]
+      if pn is Ident {
+        // The parser mints an `Ident` pattern ONLY for `_`, so this arm is the wildcard.
+        hasWild = true
+        if wildArm < 0 { wildArm = ai }
+      } else {
+        const numIx = matchPatIntNumOf(patIx)
+        if numIx < 0 {
+          // ANY OTHER PATTERN is another vocabulary's arm — a type pattern's `IsExpr`, a
+          // member string's `StrLit` — or a parse-recovery node. Named here rather than left
+          // to read as a missing member, which an integer scrutinee has no notion of.
+          sawBadPat = true
+          tErr(intArmRejectMsg(st), patIx)
+        } else if (
+          !checkIntArmLit(patIx, numIx, numIx != patIx, st, keyHi, keyLo)
+        ) {
+          sawBadPat = true
+        }
+      }
+      pj = pj + 1
+    }
+    // AN ARM AFTER THE `_` IS DEAD, and silently REORDERED if it were allowed: the wildcard
+    // arm becomes the chain's bare `else` (`matchElseArmOf`), so a later arm would be tested
+    // FIRST and `match` promises first-match-wins. Rejected rather than reordered.
+    if wildArm >= 0 && ai > wildArm {
+      tErr(
+        "unreachable match arm — the `_` wildcard must be the last arm",
+        n.matchPats[n.matchArmStart[ai]],
+      )
+    }
+    const body = n.matchBodies[ai]
+    const bt = checkNode(body)
+    let armTy = bt
+    const bn = P.nodes[body]
+    if bn is Block {
+      armTy = blockTailTy
+      // A statement-tail block has `blockTailTy == -1` ("no value") — that is VOID, not the
+      // sentinel TY_ERR (both are -1), so a void-arm `match` must not be read as an error.
+      if armTy < 0 { armTy = TY_VOID }
+    }
+    matchTy = joinTys(matchTy, armTy)
+    ai = ai + 1
+  }
+  if matchTy < 0 { matchTy = TY_VOID }
+  // EXHAUSTIVENESS IS THE WILDCARD, and it is REQUIRED — an integer has no closed member set,
+  // so there is no arm list that could stand in for one.
+  if !hasWild && !sawBadPat {
+    tErr("non-exhaustive match — an integer `match` needs a `_` arm", ix)
+  }
+  // Lower to an if/else chain in place (real pass only) so lint + emit see only if-chains.
+  if !inferQuiet { desugarMatchAt(ix) }
+  matchTy
 }
 
 // `match` over a VALUE union — a struct union (`C | D`), a scalar union (`i32 | string`), a mixed
@@ -35196,11 +35440,11 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
 
 // Extracted from `checkNodeReal`'s `MatchExpr` arm (C3: thin the dispatcher).
 function checkMatchExprNode(n: MatchExpr, ix: i32) {
-  // `match scrut { pat => body … }` — exhaustive dispatch over a union. Two arm vocabularies,
-  // decided by the SCRUTINEE: a literal union (`"a" | "b"`) dispatches on member STRINGS
-  // (phase 1, below); any other union dispatches on member TYPES (`checkMatchTypeArms`).
-  // Both check that every pattern is a member, enforce EXHAUSTIVENESS (all members covered, or
-  // a `_` wildcard), reject REDUNDANT arms, and join the arm VALUE types so a value-position
+  // `match scrut { pat => body … }` — exhaustive dispatch. THREE arm vocabularies, decided by
+  // the SCRUTINEE: an INTEGER dispatches on integer LITERALS (`checkMatchIntArms`, D1572); a
+  // literal union (`"a" | "b"`) on member STRINGS (phase 1, below); any other union on member
+  // TYPES (`checkMatchTypeArms`). All three check that every pattern belongs, enforce
+  // EXHAUSTIVENESS, reject REDUNDANT arms, and join the arm VALUE types so a value-position
   // `match` (`const x = match …`) and a return-tail `match` both type.
   // The scrutinee and the arm bodies are NOT in return-tail position; RESTORE the flag on
   // every exit (mirroring `checkIfStmtNode`) so a `match` subexpression is transparent to a
@@ -35209,6 +35453,15 @@ function checkMatchExprNode(n: MatchExpr, ix: i32) {
   const mTail = retTailPos
   retTailPos = false
   const st = checkNode(n.matchScrut)
+  // A THIRD arm vocabulary (D1572): an INTEGER scrutinee dispatches on integer LITERALS.
+  // Asked before the union tests, which have no member set for one and would refuse it.
+  // A HOLE takes it too when the ARMS are integer literals — an un-annotated parameter has no
+  // type to choose a vocabulary from, and each arm then defers a `==` the CALL adjudicates.
+  if tyIsIntMatchScrut(st) || (tyIsHole(st) && matchArmsAreIntLits(n)) {
+    const ri = checkMatchIntArms(n, ix, st)
+    retTailPos = mTail
+    return ri
+  }
   if !tyIsLitUnion(st) {
     // Any OTHER union — struct, scalar, mixed, and the `| null` spellings both `TyUnion` and
     // `TyNullable` produce — takes the type-pattern path. The old blanket gate rejected all of

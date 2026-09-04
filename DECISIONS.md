@@ -5563,3 +5563,81 @@ raises without them). The name is imprecise for the zero-step case, which never 
 rather than never *running*; that was accepted over splitting one rule across two codes. The
 `step 0` diagnostic is anchored at the STEP and the direction one at the `to` keyword — each
 caret sits on what the sentence tells the reader to change.
+
+## `match` over an integer scrutinee (2026-09-03) — D1572, BUILT
+
+**A `match` whose scrutinee is `i32` or `i64` dispatches on integer LITERALS, and its `_` arm
+is MANDATORY.** Asked for by the language's first external consumer as VL-020: its decoders
+switch on integer tags, and before this a 105-way command-id dispatch had to be an if-chain or
+a table filled by 105 assignments at module init. This is a ruling the owner can overturn.
+
+**The surface, in full.**
+
+```vl
+match tag {
+  0x10 => 14          // an integer literal of the scrutinee's type
+  0x12 | 0x13 => 30   // `match`'s existing or-group, not new pattern syntax
+  -1 => 99            // negative literals are patterns
+  _ => 0              // REQUIRED
+}
+```
+
+* **Scrutinee**: `i32` or `i64` — and an UN-ANNOTATED one, which is neither. An un-annotated
+  parameter's type is a hole, so nothing can be decided from the scrutinee at all; there the
+  ARMS choose the vocabulary (all-integer-literal arms, at least one), and each arm DEFERS the
+  same `==` constraint the hand-written `if id == 0x10` twin defers, for the call that pins the
+  parameter to adjudicate. `match` neither invents an annotation the author did not write nor
+  loses the refusal the twin already gives: `len("a")` reports
+  `argument 1: operator '==' is not defined for string and i32` either way. This half is not a
+  nicety — the consumer's own VL-020 probe annotates nothing. Nothing else joins them. `u8`
+  cannot, because it is a STORAGE
+  type that no local, parameter, return, field or map value may hold — there is no `u8` value
+  to be the scrutinee of. `f64`/`f32` are refused deliberately: dispatching on `==` over a
+  float is a trap rather than a feature, and no language worth copying encourages it. `string`
+  is a real future ask and is NOT decided here. A numeric literal UNION (`type N = 0 | 1 | 2`)
+  is unchanged and still refused at the scrutinee — its arms would need a literal `is`, which
+  has no rep — so this ruling admits the OPEN integer types and not the closed literal sets.
+* **Arms** are integer literals *of the scrutinee's type*, decided by ordinary assignability:
+  an `i32` literal reaches an `i64` scrutinee by the widening lattice, and neither an
+  out-of-`i32`-range literal nor a float reaches an `i32` one. Any radix the lexer accepts is
+  an arm, and `0x10` and `16` are the SAME arm — duplicates are decided on the literal's
+  64-bit value, not on its lexeme.
+* **Bodies and the value form follow the existing `match` rules exactly** — statement form and
+  expression form, a bare expression or a block whose tail is its value, the expression form's
+  type the join of the arms, and D1086's `T | null` rule where an arm is `null`.
+* **Duplicate arms are a check error**, at the pattern, as they are for the other two
+  vocabularies.
+
+**THE WILDCARD IS MANDATORY, and that is the whole exhaustiveness story.** For a union,
+exhaustiveness means naming every member of a closed set, and `_` is allowed but never
+required. An `i32` has 2^32 values: there is no arm list that could stand in for the default,
+so exhaustiveness here IS the wildcard and a `match` without one is
+``non-exhaustive match — an integer `match` needs a `_` arm``. The alternative — letting an
+integer `match` fall through to void — would make the one property that distinguishes `match`
+from an if-chain untrue for the scrutinee kind most likely to grow a case later.
+
+**An arm AFTER the `_` is a hard error**, and for a sharper reason than deadness.
+`matchElseArmOf` makes the wildcard arm the desugared chain's bare `else`, so a later arm would
+be tested FIRST — allowing it would silently REORDER the program against the first-match-wins
+rule this construct promises. Refusing is the only reading that keeps the promise.
+
+**Lowering: the compare chain, and no `br_table`.** `desugarMatchAt` already turns a
+non-`IsExpr` pattern into `scrut == pat`, so an integer `match` rewrites in place to the
+if/else chain of `i32.eq`/`i64.eq` compares a hand-written if-chain produces, node for node —
+no emitter path of its own, and the exhaustive-last-arm rule still means n arms emit n−1 tests.
+A `br_table` over a dense non-negative arm set is a constant-factor win on top and is NOT built
+here: the emitter has no general jump-table helper (its one `br_table` is a hand-written
+three-way niche print), so building one is a codegen project with its own grid, not a rider on
+a surface decision. It stays where the design doc already had it, as
+`docs/internals/match-design.md`'s phasing item 5.
+
+**Out of scope, and why.** RANGE patterns (`0..9 => …`) are a separate surface decision: a
+range needs its own grammar, an ordering rule at the type tier, and an overlap check that is
+not the equality check duplicates use — three decisions that should be taken together and with
+a concrete need, not smuggled in beside an equality dispatch. GUARDS (`pat if cond`) are
+likewise unchanged and remain item 4 of the same phasing. What is NOT out of scope, and is
+worth naming because the brief for this work assumed otherwise: the `|` OR-GROUP is not new
+pattern syntax. It is `match`'s arm separator, shipped in phase 1 and already the spelling a
+literal union uses (`"b" | "c" => 2`); it applies to integer literals for the same reason, and
+refusing it here would have meant writing code to break a general feature at one scrutinee
+kind. The consumer's own example uses it.
