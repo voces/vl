@@ -204,6 +204,8 @@ export const runWasm = async (wasm: Uint8Array): Promise<RunResult> => {
         ...Object.fromEntries(
           [
             "__fs_read__",
+            "__fs_read_range__",
+            "__fs_size__",
             "__fs_write__",
             "__fs_list__",
             "__fs_stat__",

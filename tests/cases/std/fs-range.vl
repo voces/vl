@@ -1,0 +1,104 @@
+// @run
+// @skip the fs floor needs a host that can build a WasmGC value — V8 cannot; asserted natively by tests/selfhost_native_align_test.ts
+// @log wrote
+// @log 5
+// @log 4
+// @log 8
+// @log 4
+// @log 12
+// @log 0
+// @log 0
+// @log 28
+// @log 28
+// @log 44
+// @log 16
+// @log 31
+// @log 44
+// `readFileRange` AND `fileSize` — reading part of a file, and knowing where it ends.
+//
+// Every read before this one was whole-file, which makes a file larger than memory
+// unreadable at all. A window is `offset` + `length` in BYTES, and this case pins the
+// four answers a caller has to be able to tell apart: a full window, a SHORT one at the
+// end of the file, an EMPTY one past it, and a genuine failure.
+//
+// It is `@skip`ped under the V8 harness and asserted natively for the same reason
+// `tests/cases/std/fs-roundtrip.vl` is: the floor's intrinsics take and return `u8[]`,
+// a WasmGC array JS can neither read nor build.
+//
+// HERMETIC AS FAR AS IT CAN BE, on the same terms as the roundtrip case: one file at a
+// FIXED path under `/tmp` with FIXED contents, so a concurrent second run of this case
+// writes the same sixteen bytes. Nothing outside `/tmp` is touched.
+import { IoError, fileSize, readFileRange, writeFile } from "std:fs"
+import { toString } from "std:fmt"
+
+const p = "/tmp/vl-std-fs-range.bin"
+
+// Byte `i` holds `i`, so a window's FIRST BYTE is its own offset: an off-by-one in the
+// seek changes every number below, which a run of identical bytes would hide.
+const data: u8[] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+const w = writeFile(p, data)
+if w != null { print("write failed: " + w.msg) } else { print("wrote") }
+
+// A window in the middle: five bytes from offset 4, so 4 through 8.
+const mid = readFileRange(p, 4, 5)
+if mid is IoError {
+  print("mid failed: " + mid.msg)
+} else {
+  print(mid.length)
+  print(mid[0])
+  print(mid[4])
+}
+
+// STRADDLING THE END is short, not an error: four bytes exist from offset 12, not the
+// hundred asked for. A caller that treated a short answer as failure would stop early
+// on every file whose length is not a multiple of its window.
+const tail = readFileRange(p, 12, 100)
+if tail is IoError {
+  print("tail failed: " + tail.msg)
+} else {
+  print(tail.length)
+  print(tail[0])
+}
+
+// AT OR PAST THE END is empty and still not an error — that is how a scan knows it has
+// finished, and it is the one place the empty-plus-errno protocol has to answer "no
+// bytes, no reason" rather than reporting a failure that did not happen.
+const past = readFileRange(p, 16, 8)
+if past is IoError {
+  print("past failed: " + past.msg)
+} else {
+  print(past.length)
+}
+
+// A zero-length window is empty and legal, at an offset that exists.
+const none = readFileRange(p, 0, 0)
+if none is IoError {
+  print("none failed: " + none.msg)
+} else {
+  print(none.length)
+}
+
+// A negative offset and a negative length are both EINVAL (28), refused by the module
+// before the syscall so the answer does not depend on the host.
+const negOff = readFileRange(p, 0 - 1, 4)
+if negOff is IoError { print(negOff.code) } else { print("should have failed") }
+const negLen = readFileRange(p, 0, 0 - 4)
+if negLen is IoError { print(negLen.code) } else { print("should have failed") }
+
+// A missing file is ENOENT (44), the same code `readFile` answers for it.
+const miss = readFileRange("/tmp/vl-std-fs-range-absent.bin", 0, 4)
+if miss is IoError { print(miss.code) } else { print("should have failed") }
+
+// The size is what tells a scan when to stop, and it is a separate call rather than a
+// field on a read: a scan asks once and then reads windows.
+const n = fileSize(p)
+if n is IoError { print("size failed: " + n.msg) } else { print(toString(n)) }
+
+// A DIRECTORY is EISDIR (31) rather than the dirent's own byte count, which is a block
+// figure no caller can act on. `pathKind` is the function that answers what a path is.
+const dir = fileSize("/tmp")
+if dir is IoError { print(dir.code) } else { print("should have failed") }
+
+// And a missing path is ENOENT here too, so one `code` comparison serves both readers.
+const gone = fileSize("/tmp/vl-std-fs-range-absent.bin")
+if gone is IoError { print(gone.code) } else { print("should have failed") }
