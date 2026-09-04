@@ -21816,6 +21816,17 @@ export function anonFieldCode(valIx: i32) {
   // type the checker cannot spell here (an unsolved parameter, a hole) out of both paths.
   // Dual-run over the corpus, the two rungs split the reaches between them and never disagree.
   const c = nameFieldCodeTy(tn, anonTy)
+  // A NESTED-STRUCT FIELD FED BY A NON-LITERAL (D1543). The name ladder codes a field by its
+  // RENDERED type, and an anonymous literal's struct-valued field renders STRUCTURALLY
+  // (`{name: string, n: i32}`) even where the value carries a declared alias — a spelling
+  // `fieldCodeOfSpelling` has no code for, so `c` is -1 and the whole OUTER literal is refused
+  // a row. Gated on the companion resolving, which is the bargain `anonCodeIsSelfContained`'s
+  // header names for admitting a code that needs one — paid rather than relaxed.
+  if c < 0 {
+    if fieldCodeForMatch(anonTy) == 15 {
+      if anonFieldElemName(valIx, 15) != "" { return 15 }
+    }
+  }
   if !anonCodeAdmitsValue(c, valIx) { return -1 }
   c
 }
@@ -22026,6 +22037,33 @@ export function anonFieldElemName(valIx: i32, code: i32) {
   if code != 15 { return "" }
   const si = structIndexOfObj(valIx)
   if si >= 0 { return sNames[si] }
+  // THE VALUE IS NOT ALWAYS A LITERAL, AND ITS ROW USUALLY ALREADY EXISTS (D1543). A field
+  // fed by a binding, a call or a member read — `{ item: r }` — has no child literal to read
+  // a row off, so this column answered "" and `anonFieldCode` refused the OUTER literal a row
+  // entirely. The reverse lookup from the value's recorded TYPE to the row is what was
+  // missing, not the row: the two rungs `structIndexOfExpr`'s Call fallback uses, in its
+  // order — the declared NAME first (nominal identity the arena cannot recover), then the
+  // field-set match on the type.
+  const nvt = nodeTyIxOf(valIx)
+  if nvt < 0 { return "" }
+  if nodeTyIsObj(valIx) {
+    const cn = nodeTyCanonObjName(valIx)
+    if cn != "" {
+      const bn = structIndexByName(cn)
+      if bn >= 0 { return sNames[bn] }
+    }
+    const fsr = structRowOfObjFieldSet(nvt)
+    if fsr >= 0 { return sNames[fsr] }
+    return ""
+  }
+  // The NULLABLE twin, which `fieldCodeForMatch` already folds onto the same code 15 and
+  // whose declared companion is `nonNulBaseOf(ftxt)` — the non-null base. Peel and ask the
+  // inner's row, so `{ item: mkMaybe() }` over a `Rec | null` names `Rec` too.
+  const nvr = T.tys[nvt]
+  if nvr is TyNullable {
+    const inr = structRowOfObjFieldSet(nvr.nInner)
+    if inr >= 0 { return sNames[inr] }
+  }
   ""
 }
 
@@ -23938,14 +23976,26 @@ export function letInitIsLitAtom(letIx: i32, fnIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
     if d.letType < 0 && d.letInit >= 0 { return exprIsLitAtom(d.letInit, fnIx) }
-    // THE ANNOTATED FACE IS DELIBERATELY NOT CLAIMED HERE, and it was MEASURED rather than
-    // left alone (D1196). `const k: "x" | "y" = b.kind` off a D1050-unified field is an atom
-    // initializer whose annotation softens to `string`, so it reaches neither this arm nor
-    // `letIsLitUnion`'s alias test and refuses LOUDLY in `checkLocalI32`. Gating this arm on
-    // `tyIsLitUnion(nodeTyIxOf(d.letType))` instead does re-slot it as an atom local — and
-    // the binding then becomes check-clean INVALID WASM, because the `print` widen's str-op
-    // frame reservation scan does not see the new atom slot. Loud → silent is the one trade
-    // this repo refuses, so the loud refusal stands and the gap is filed.
+    // THE MODULE GLOBAL'S FACE, AND ONLY IT (D1541). A top-level `const v: "a" | "b" = xs[0]`
+    // is ALREADY slotted as the atom by the global cell ladder, so declining here made the
+    // READ side disagree with the STORE side: `print(v)` took the plain-i32 arm and printed
+    // the interned ID. The gate is `globalLetOf`, not `fnIx < 0` — a module-scope `for`/`if`
+    // BODY has `fnIx == -1` too and its binding is a start-fn LOCAL, where the slot ladder
+    // still picks the string ref and claiming the atom here is invalid wasm.
+    if d.letInit >= 0 {
+      if globalLetOf(d.letName) == letIx {
+        if tyIsLitUnion(nodeTyIxOf(d.letType)) {
+          return exprIsLitAtom(d.letInit, fnIx)
+        }
+      }
+    }
+    // THE ANNOTATED FACE INSIDE A FRAME IS DELIBERATELY NOT CLAIMED, and it was MEASURED
+    // rather than left alone (D1196). `const k: "x" | "y" = b.kind` off a D1050-unified field
+    // is an atom initializer whose annotation softens to `string`, so it reaches neither this
+    // arm nor `letIsLitUnion`'s alias test and refuses LOUDLY in `checkLocalI32`. Claiming it
+    // re-slots the binding as an atom local and the STORE then writes the softened string ref
+    // into it — check-clean INVALID WASM, measured at four positions. Loud → silent is the
+    // one trade this repo refuses, so the loud refusal stands and the gap is filed.
   }
   false
 }
@@ -37594,6 +37644,21 @@ function exprIsClosureNoLocal(exprIx: i32, fnIx: i32) {
       return false
     }
     if moduleBindsLoopVar(emitRootIx, e.identName) { return false }
+    // THE MODULE IS THE OUTERMOST FRAME, AND THE CHAIN ABOVE NEVER REACHES IT (D1542).
+    // `identBindingNoLocal` walks `fnParent`, which ends at -1 for a top-level lambda, so
+    // `const get = () => held` over a module-scope `held` fell to the module-wide function
+    // lookup — and a LIFTED lambda is not named `held`, so the tail read as a non-closure.
+    // The caller's `exprIsClosure` reads this same predicate for a Call result, which is why
+    // the symptom is `call to unknown function` at `const v = get()` rather than a wrong
+    // valtype. `letDeclIsClosureNoLocal` is non-recursive by design, so `const a = a` cannot
+    // spin here. Asked AFTER the frame chain, so a shadowing binding still wins.
+    //
+    // BOTH module storage classes, block-local BEFORE global (D1244's rule: a module-scope
+    // `if`/`for`/bare BLOCK is a frame, and its binding shadows a top-level one of the name).
+    const mll = moduleLocalLetOf(emitRootIx, e.identName)
+    if mll >= 0 { return letDeclIsClosureNoLocal(mll) }
+    const gcl = globalLetOf(e.identName)
+    if gcl >= 0 { return letDeclIsClosureNoLocal(gcl) }
     return fnIndexOfSid(sidOfNode(exprIx)) >= 0
   }
   if e is ObjLit { return false }

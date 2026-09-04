@@ -33557,6 +33557,16 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
     // DECISIONS: assignment-as-expression).
     return rt
   }
+  // AN UNPINNED ELEMENT HOLE IS `-1`, AND EVERY ARM BELOW INDEXES `T.tys` WITH IT. `checkNode`
+  // of `xs[0]` over an `[]` whose element is still open answers `-1` — the in-band "no answer"
+  // `arrElemValueTy` hands back — and `T.tys[-1]` is an out-of-bounds array access that traps
+  // the COMPILER, printing a wasm backtrace where a diagnostic belongs (D1462, the checker-side
+  // sibling of D1440/D1500). Bound-tested HERE rather than at each reader: the arms above are
+  // the ones that must still see the hole (`xs[i] = v` PINS the element from the RHS in place,
+  // and returning early would delete that inference — `tests/cases/types/infer-empty-*`).
+  // `TY_ERR` and no second diagnostic: the binding that owns the open element already reports
+  // `cannot infer a type for 'xs'`, which is the answer `print(xs[0])` gives without the operator.
+  if lt < 0 { return TY_ERR }
   // Nullish coalescing: `a ?? d` — the result is `a`'s NON-NULL part unioned with `d`'s type (host
   // `NullCoalesce`: `a ?? b` with a nullable `b` stays nullable; a non-null default collapses to
   // the inner type). A non-nullable LHS just yields itself.
@@ -36410,7 +36420,11 @@ function checkIsExprNode(n: IsExpr, ix: i32) {
   }
   if chkTy < 0 {
     tErr("unknown type '" + n.isVariant + "' in 'is'", ix)
-  } else if n.isVariant != "null" {
+    // `objTy < 0` IS THE OPERAND'S OWN "no answer", NOT A TYPE — `xs[0]` over an `[]` whose
+    // element is still open answers `-1`, and `T.tys[-1]` traps the COMPILER (D1462). The gate
+    // below already treats an un-inferred operand (`TyErr`) as freely testable, so declining to
+    // run it for an unresolved one is the same ruling, not a new one.
+  } else if n.isVariant != "null" && objTy >= 0 {
     // SOUNDNESS: `x is T` is meaningful only when the value can actually BE a `T` — i.e. `T` is
     // assignable to `x`'s type (its non-null part when `x` is nullable). Otherwise the test can
     // never hold, and since the THEN branch narrows `x` to `T` VERBATIM (`collectThenNarrows`), an
@@ -36431,6 +36445,11 @@ function checkIsExprNode(n: IsExpr, ix: i32) {
       inUnion = true
       baseTy = ot.nInner
     }
+    // A NULLABLE WHOSE INNER IS STILL OPEN carries the in-band `-1` too: a bare `Map()`
+    // reads `m["a"]` as `V | null` with `V` unpinned, and `assignable` would index `T.tys`
+    // with it — the same compiler trap one operand shape over (D1462). Answered the way the
+    // header answers `TyErr`: an operand with no resolved type is freely testable.
+    if baseTy < 0 { return TY_BOOL }
     // THE DEEP-`is` ROUTE, ASKED BEFORE THE ARM GATE (D1035). `r is string[]` over a
     // `Json` PASSES the assignability gate below (a `string[]` widens into `Json[]`), so
     // it never reaches an error — it is admitted and then answered `false` for every
