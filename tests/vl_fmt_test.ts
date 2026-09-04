@@ -1636,7 +1636,7 @@ const diffFirstLine = (a: string, b: string): string => {
 // Asserted as a ROUND TRIP rather than against an expected string: the point is that the
 // input survives, and a round-trip test cannot pass by agreeing with a wrong expectation.
 Deno.test({
-  name: "vl-fmt: `as` / `as?` / `as!` keep their suffix through a round trip",
+  name: "vl-fmt: `as` / `as?` / `as!` / `as%` keep their suffix through a round trip",
   ignore: !ENABLED,
   fn: async () => {
     const src = [
@@ -1655,14 +1655,21 @@ Deno.test({
       "  const v = mk() as? A",
       '  if v is A { print(v.x) } else { print("no") }',
       "}",
+      "function wrap(n: i64) {",
+      "  const v = n as% i32",
+      "  print(v % 7)",
+      "}",
       "propagate()",
       "trap()",
       "coalesce()",
+      "wrap(5000000000)",
       "",
     ].join("\n");
     const r = await run([], src);
     if (r.code !== 0) throw new Error(`fmt exited ${r.code}`);
-    for (const want of ["as A", "as! A", "as? A"]) {
+    // `as% i32` beside a `%` remainder in the next line: the formatter must keep the suffix
+    // attached to the cast and print the binary operator spaced, not merge the two readings.
+    for (const want of ["as A", "as! A", "as? A", "as% i32", "v % 7"]) {
       if (!r.out.includes(want)) {
         throw new Error(`formatted output lost \`${want}\`:\n${r.out}`);
       }
@@ -1676,7 +1683,7 @@ Deno.test({
     // Idempotent: formatting the formatted source changes nothing.
     const again = await run([], r.out);
     if (again.code !== 0 || again.out !== r.out) {
-      throw new Error("fmt is not idempotent over the `as` trio");
+      throw new Error("fmt is not idempotent over the `as` family");
     }
   },
 });

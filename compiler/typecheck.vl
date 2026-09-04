@@ -35238,6 +35238,9 @@ function castPinAdjudicate(k: i32, at: i32) {
   const mode = holeCastMode[k]
   if mode == "trap" { return 0 }
   const castIx = holeCastIx[k]
+  // `as%` picks no arm and cannot fail, so the pin answers only the two questions a hole hid:
+  // is the pinned operand a number at all, and is either side a float.
+  if mode == "wrap" { return castPinWrapCheck(at, target, castIx) }
   // A NULLABLE OPERAND IS A UNION OPERAND, expanded exactly as `checkCastNode`'s arm expands
   // it — one rule, two entry points, so the hole and the annotation cannot disagree.
   let argU = at
@@ -35344,6 +35347,36 @@ export function numCastDomainName(asTy: string, target: i32): string {
   primNameStr(primNameOf(target))
 }
 
+// Reports and answers true when a wrap cast names a float on either side. `as%` is integers
+// only by ruling, and the refusal names the family that does convert a float. One home for the
+// wording, because a hole operand re-asks it at the call site that pins the width.
+function wrapCastFloatRefused(argTy: i32, target: i32, ix: i32): boolean {
+  const sn = primNameStr(primNameOf(argTy))
+  const tn = primNameStr(primNameOf(target))
+  let bad = ""
+  if sn == "f32" || sn == "f64" { bad = sn }
+  if tn == "f32" || tn == "f64" { bad = tn }
+  if bad == "" { return false }
+  tErr(
+    "`as%` wraps between integer widths, and " +
+      bad +
+      " is a float — use the exact family (`as!` traps, `as?` yields null)",
+    ix,
+  )
+  true
+}
+
+// One parked `as%` cast, re-asked under the type its call site pinned the hole to. Reported in
+// `checkCastNode`'s own words, so the pin and the direct spelling cannot disagree.
+function castPinWrapCheck(at: i32, target: i32, castIx: i32) {
+  if !isNumeric(at) {
+    tErr("`as` supports numeric conversions only", castIx)
+    return 0
+  }
+  if wrapCastFloatRefused(at, target, castIx) { return 0 }
+  0
+}
+
 function checkCastNode(n: AsExpr, ix: i32) {
   const arg = checkNode(n.asObj)
   let target = nameToTyAt(n.asTy, ix)
@@ -35389,7 +35422,9 @@ function checkCastNode(n: AsExpr, ix: i32) {
       }
     }
   }
-  if argU >= 0 {
+  // `as%` picks no arm — it is the wrap cast over two integer widths, so a union operand is
+  // simply not a number and takes the numeric ladder's own refusal below.
+  if argU >= 0 && n.asMode != "wrap" {
     const argT = T.tys[argU]
     if argT is TyUnion {
       // `as u8` NARROWS A NUMBER, IT DOES NOT PICK AN ARM (D1587). A union operand would take
@@ -35454,6 +35489,12 @@ function checkCastNode(n: AsExpr, ix: i32) {
   if !isNumeric(arg) || !targetIsScalar {
     tErr("`as` supports numeric conversions only", ix)
     return TY_ERR
+  }
+  // `as%` keeps the low bits and cannot fail, so it owes none of the trio's sad-path answers
+  // and the target type is the whole result (`DECISIONS.md` §"`as%` is the wrap cast").
+  if n.asMode == "wrap" {
+    if wrapCastFloatRefused(arg, target, ix) { return TY_ERR }
+    return target
   }
   // THE NUMERIC ARM HONOURS THE TRIO TOO (json-design §6 q2, owner 2026-09-02). Until now
   // this arm returned `target` whatever the suffix said, so `3.9 as? i32`, `3.9 as! i32` and

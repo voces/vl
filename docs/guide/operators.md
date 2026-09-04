@@ -10,7 +10,7 @@ than left to be re-derived. The precedence ladder is the parser's own
 ```
 
 Assignment (`=`, and the compound forms `+= -= *= /=`) binds loosest of all and is
-right-associative. `as` / `as?` / `as!` bind tighter than every binary operator, so
+right-associative. `as` / `as?` / `as!` / `as%` bind tighter than every binary operator, so
 `a + b as! i32` is `a + (b as! i32)`. Unary `-` `!` `~` bind tighter still.
 
 ## Arithmetic
@@ -72,11 +72,12 @@ These are about BIT PATTERNS, so a float operand is refused: `1.0 & 2` is
 `operator '&' is integer-only, got f64 and i32`. `%` is deliberately **not** in this family —
 a float remainder is a meaningful number, and VL computes it.
 
-## `as` / `as?` / `as!` — the conversion trio
+## `as` / `as?` / `as!` / `as%` — the conversion family
 
 A cast to a FLOAT target rounds and cannot fail. A cast to an INTEGER target is
 **exact-or-fail**: it succeeds only if the value is integral *and* in range. The suffix says
-what happens when it fails, and the three spellings are three different programs:
+what happens when it fails, and these three spellings are three different programs. The
+fourth, `as%`, cannot fail at all and has its own section below:
 
 | spelling | on success | on failure |
 | --- | --- | --- |
@@ -108,3 +109,32 @@ Storing into a `u8[]` **without** the cast still keeps the low byte and never co
 A cast whose operand is a UNION picks an ARM instead, with the same three suffixes and the
 same meanings; `x as u8` is not that cast, and refuses a union operand rather than silently
 skipping the range test.
+
+### `x as% T` — the fourth spelling, which WRAPS
+
+`as%` keeps the target width's low bits instead of checking them, so it never fails: no null,
+no trap, nothing to propagate. It is how a bit pattern is written down.
+
+| spelling | result |
+| --- | --- |
+| `i64 as% i32` | the low 32 bits, two's complement |
+| `i32 as% u8`, `i64 as% u8` | the low 8 bits — an `i32` in 0..255, `u8` naming the domain |
+| `i32 as% i64` | sign-extend, the same as `as` |
+| `i32 as% i32`, `i64 as% i64` | identity |
+
+```vl
+print(0xb81a1aaa as% i32)          // -1206248790 — a hex literal is typed i64, this is its i32 bits
+print(300 as% u8)                  // 44
+print((0 - 1) as% u8)              // 255
+bytes.push((v >>> 24) as% u8)      // the top byte of any word, sign bit included
+```
+
+Integers only: a float on either side is a compile error naming `as!` and `as?`, which are the
+spellings that convert one. A non-numeric operand — a string, a struct, a union — gets the same
+`` `as` supports numeric conversions only `` the exact casts give it; `as%` picks no arm, so two
+casts say what one cannot (`(u as! i32) as% u8`).
+
+A LITERAL operand is folded, so `0xb81a1aaa as% i32` is a constant and can be used as one. And
+`%` here can never be read as the remainder: the suffix is read only directly after `as`, and
+`as` only directly after a postfix operand, so `a % b`, `a as% u8 % b` and a binding named `as`
+all keep their meanings.

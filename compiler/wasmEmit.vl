@@ -14177,9 +14177,66 @@ function emitNumExactCast(body: i32[], e: AsExpr, exprIx: i32, fnIx: i32) {
   emitNumExactConvert(src, tgt)
 }
 
+// `x as% T` — the wrap cast (`DECISIONS.md` §"`as%` is the wrap cast"). It cannot fail, so
+// there is no test, no sad path and no staging slot: one conversion opcode, and the byte mask
+// at the `u8` domain. A literal operand folds to the constant it denotes, which is what lets a
+// consumer write a 32-bit bit pattern.
+function emitNumWrapCast(body: i32[], e: AsExpr, exprIx: i32, fnIx: i32) {
+  const obj = e.asObj
+  const dom = asExprNumCastDomain(exprIx)
+  let tgt = asExprNumTgtName(exprIx)
+  if tgt == "" { tgt = e.asTy }
+  // A float on either side and a union operand are both refused at check; these are the
+  // floors for an operand whose width only the emitted rep knows.
+  if (
+    exprIsF32(obj, fnIx) ||
+    exprIsF64(obj, fnIx) ||
+    tgt == "f32" ||
+    tgt == "f64"
+  ) {
+    return emitFail(
+      "emitProgram: `as% " +
+        e.asTy +
+        "` wraps between integer widths, and this cast names a float — use `as!` or `as?`",
+    )
+  }
+  if asExprIsUnionCastIn(exprIx, fnIx) {
+    return emitFail(
+      "emitProgram: `as% " +
+        e.asTy +
+        "` wraps a number, and this operand is a union — take the numeric arm first",
+    )
+  }
+  // An i64 target is the sign-extend, which the i64 helper already is for both sources.
+  if tgt == "i64" { return emitNumIntrArg(body, obj, 3, fnIx) }
+  const lit = P.nodes[unwrapParen(obj)]
+  let folded = false
+  if lit is NumLit {
+    if !numLexIsFloat(lit.numText) {
+      const pr = parseI64Pair(lit.numText)
+      fbI32Const(pr[1])
+      folded = true
+    }
+  }
+  if !folded {
+    if exprIsI64(obj, fnIx) {
+      if emitNumIntrArg(body, obj, 3, fnIx) < 0 { return -1 }
+      fbI32WrapI64()
+    } else if emitNumIntrArg(body, obj, 0, fnIx) < 0 {
+      return -1
+    }
+  }
+  if dom == "u8" {
+    fbI32Const(255)
+    fbI32Bin(113) // 0x71 i32.and
+  }
+  0
+}
+
 function emitAsCast(body: i32[], e: AsExpr, _exprIx: i32, fnIx: i32) {
   const obj = e.asObj
   const tgt = e.asTy
+  if e.asMode == "wrap" { return emitNumWrapCast(body, e, _exprIx, fnIx) }
   // UNION-OPERAND `as` — THE PROPAGATING CAST (`error-handling-design.md` §Trio). Checked
   // ahead of the numeric ladder and disjoint from it by operand, exactly as the checker's arm
   // is: the checker already proved the target is one of the operand's arms and that the
