@@ -923,9 +923,11 @@ hardcoded the shapes as slot NUMBERS (`if fsty == 1 { two u8[] params }`), which
 this a fourth place a signature lives — beside the checker's `declare`, the call
 lowering's operand spine and the host's registration — and the one place a new
 syscall would be forgotten, because nothing here would fail if it were. Reading
-`fsIntrinsicArity` for the param count and `fsArgIsU8List` for each position's type
-means the functype is derived from the SAME tables the call site pushes operands
-from, so a declared type and the stack shape offered to it cannot disagree.
+`fsIntrinsicArity` for the param count and `fsArgIsU8List` / `fsArgIsI64` for each
+position's type means the functype is derived from the SAME tables the call site
+pushes operands from, so a declared type and the stack shape offered to it cannot
+disagree. The RESULT reads the same way, `fsRetIsU8List` then `fsRetIsI64`; every
+position that answers neither is an i32.
 ```
 
 ## #1265 — the export entries that need an ABI wrapper
