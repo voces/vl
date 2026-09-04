@@ -7113,6 +7113,26 @@ function tErrAtNodeStartCoded(msg: string, at: i32, code: string) {
   tErrCoded(msg, at, code)
 }
 
+// THE RESERVED-NAME REFUSAL, RAISED FROM ONE PLACE BY BOTH FACES — a single file's
+// declaration (`checkProgram`'s pass-0 screen) and a module's (`driver.modCheckBuiltinTyDecls`,
+// the only reader that still sees the pre-merge name). Message, channel and anchor are shared:
+// a second copy of the sentence is a second sentence, and the two faces of one rule must not
+// drift apart in wording the way the predicate had. Anchored at the declaration's NAME token,
+// because the `nodeToks` anchor is a struct alias's CLOSING BRACE — a line or more below the
+// name the message tells the reader to rename. D1585.
+export function tErrBuiltinTyDecl(name: string, at: i32): i32 {
+  const msg = "a `type` declaration may not take the built-in type name `" +
+    name +
+    "` — every annotation resolves that name to the primitive, so the declaration " +
+    "can never be referred to; rename it"
+  const tk = declNameTokOf(at)
+  if tk >= 0 && tk < P.toks.length {
+    return tErrPush(msg, at, P.toks[tk].line, P.toks[tk].col, "", "")
+  }
+  tErr(msg, at)
+  0
+}
+
 function tErrPush(
   msg: string,
   at: i32,
@@ -9122,6 +9142,17 @@ export function primTyOfName(name: string) {
   // named "null"); union members spell it through the `|`-split / `TS_NULL`.
   if name == "null" { return TY_NULL }
   -1
+}
+
+// The set of type names an annotation resolves with NO declaration in sight: `primTyOfName`'s
+// spellings plus `u8`, the storage type it deliberately withholds (reachable only as an array
+// element). ONE home, because a second copy is a second answer — the merge's type-position
+// rename asked the same question from `driver.modNameIsBuiltinTy` until D1585, and the two
+// disagreed about `u8`: the merge withheld the rename, the reserved-name screen let the
+// declaration through. Read by that rename and by `tErrBuiltinTyDecl`'s two callers. D1571, D1585.
+export function isBuiltinTyName(name: string) {
+  if name == "u8" { return true }
+  primTyOfName(name) >= 0
 }
 
 // A live type-parameter BINDING (a generic function's `<T>` while its
@@ -26219,38 +26250,26 @@ function checkProgramNode(n: Program) {
   let t0 = 0
   while t0 < stmts.length {
     const sd0 = P.nodes[stmts[t0]]
-    // A `type` DECLARATION MAY NOT TAKE A PRIMITIVE'S NAME, and this is the only place that can
-    // say so: the two resolvers disagree about such a name and neither is wrong on its own. The
-    // checker resolves a bare name through `tsLeafTy`, which asks `primTyOfName` FIRST — so `f64`
-    // in an annotation is the PRIMITIVE — while nothing screened the declaration side, so `udName`
-    // went into `cUnionNames` verbatim and the emitter's alias registry believed `f64` named a
-    // literal union. The value was then stored as an f64 and read as the union's anyref box:
-    // `vl check` rc 0 and a module that does not instantiate, at every primitive spelling.
+    // A `type` DECLARATION MAY NOT TAKE A BUILT-IN TYPE NAME. The two resolvers disagree about
+    // such a name and neither is wrong on its own: the checker resolves a bare name through
+    // `tsLeafTy`, which asks `primTyOfName` FIRST, so `f64` in an annotation is the PRIMITIVE,
+    // while nothing screened the declaration side — `udName` went into `cUnionNames` verbatim
+    // and the emitter's alias registry believed `f64` named a literal union.
     // A REJECT, NOT A RESOLUTION CHANGE: making one side win would silently redefine what a
-    // primitive keyword means inside one file, and the declaration is unusable either way since
-    // no annotation can ever name it. BOTH DECLARATION NODES, because the parser splits them, and
-    // `primTyOfName` is the ONE home of the primitive spellings. The name is compared WHOLE, so a
-    // GENERIC alias — which carries its parameters in the declared name — is untouched.
+    // keyword means inside one file, and the declaration is unusable either way since no
+    // annotation can ever name it. BOTH DECLARATION NODES, because the parser splits them.
+    // The name is compared WHOLE, so a GENERIC alias — which carries its parameters in the
+    // declared name — is untouched. This screen sees a SINGLE FILE's declaration; a module's
+    // is already renamed by the time it arrives, so `driver.modCheckBuiltinTyDecls` is the
+    // other face, and both raise through `tErrBuiltinTyDecl`. D1585.
     if sd0 is TypeDecl {
-      if primTyOfName(sd0.tdName) >= 0 {
-        tErr(
-          "a `type` declaration may not take the built-in type name `" +
-            sd0.tdName +
-            "` — every annotation resolves that name to the primitive, so the declaration " +
-            "can never be referred to; rename it",
-          stmts[t0],
-        )
+      if isBuiltinTyName(sd0.tdName) {
+        tErrBuiltinTyDecl(sd0.tdName, stmts[t0])
       }
     }
     if sd0 is UnionDecl {
-      if primTyOfName(sd0.udName) >= 0 {
-        tErr(
-          "a `type` declaration may not take the built-in type name `" +
-            sd0.udName +
-            "` — every annotation resolves that name to the primitive, so the declaration " +
-            "can never be referred to; rename it",
-          stmts[t0],
-        )
+      if isBuiltinTyName(sd0.udName) {
+        tErrBuiltinTyDecl(sd0.udName, stmts[t0])
       }
     }
     if sd0 is TypeDecl {
