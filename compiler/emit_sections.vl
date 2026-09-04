@@ -134,9 +134,11 @@ import {
   emitErrAt,
   emitFailed,
   emitFnSpanEnd,
+  emitFnSpanKind,
   emitFnSpanNode,
   emitFnSpanPos,
   emitFnSpanStart,
+  emitFnSpanTag,
   emitLetCursor,
   emitRootIx,
   fRetRArrElem,
@@ -1625,6 +1627,10 @@ function emitStartFnCode(out: i32[]) {
   // failure with no owning declaration; a node-anchored caller (`emitFailAt`) overrides it.
   emitCurFnIx = -1
   emitCurFnPos = -1
+  // Where THIS body's span rows begin (D1594). The merge loop below banks one row per
+  // top-level statement at `bodyExpr`-relative offsets; the tail rebases exactly this
+  // suffix onto `out` once the locals vector and the size prefix are known.
+  const spanBase = emitFnSpanStart.length
   const nStartLocals = collectStartLocals()
   if nStartLocals < 0 { return -1 }
   startFnDetectScratch()
@@ -1679,6 +1685,7 @@ function emitStartFnCode(out: i32[]) {
       // ANCHOR any emit failure raised below at the top-level node being lowered (see
       // `emitCurStmtIx`) — the start function has no declaration of its own to name.
       emitCurStmtIx = globalStmts[gi]
+      const gSpanAt = bodyExpr.length
       if globalRunsInStartFn(gi) {
         const g = P.nodes[globalStmts[gi]]
         if g is LetDecl {
@@ -1949,14 +1956,24 @@ function emitStartFnCode(out: i32[]) {
           wTarget(setPrev)
         }
       }
+      // The row the D1594 diagnostic reads: this initializer's own byte range, so an
+      // offset inside it names the `const`/`let` rather than the whole start function.
+      // A global whose init did not run here contributes no bytes and no row.
+      if bodyExpr.length > gSpanAt {
+        bankFnSpan(globalStmts[gi], -1, gSpanAt, bodyExpr.length, 1, "")
+      }
       gi = gi + 1
     } else {
       emitCurStmtIx = startStmts[si]
+      const sSpanAt = bodyExpr.length
       if emitStmt(bodyExpr, startStmts[si], -1) < 0 {
         wTarget(exprPrev)
         return -1
       }
       pushPostGuardNarrow(startStmts[si], -1)
+      if bodyExpr.length > sSpanAt {
+        bankFnSpan(startStmts[si], -1, sSpanAt, bodyExpr.length, 1, "")
+      }
       si = si + 1
     }
   }
@@ -1973,6 +1990,8 @@ function emitStartFnCode(out: i32[]) {
   const body: i32[] = []
   // Locals vector: the start fn's declared locals (for-loop vars), then the scratch frames.
   if fbEmitLocalsVec(body, nStartLocals) < 0 { return -1 }
+  // Where `bodyExpr` lands INSIDE the body — everything before it is the locals vector.
+  const exprInBody = body.length
   appendAll(body, bodyExpr)
   const endPrev = wTarget(body)
   fbEnd() // 0x0b end (void → void: stack already empty)
@@ -1980,6 +1999,17 @@ function emitStartFnCode(out: i32[]) {
 
   const outPrev = wTarget(out)
   wULEB(body.length)
+  // REBASE this body's statement rows off `bodyExpr` and onto the code payload (D1594):
+  // the size prefix is written, so `out.length` is where the body itself begins. The
+  // caller rebases the payload onto the module once `wSection` places it, exactly as it
+  // does for a user function's row.
+  const bodyInOut = out.length
+  let ssp = spanBase
+  while ssp < emitFnSpanStart.length {
+    emitFnSpanStart[ssp] = emitFnSpanStart[ssp] + bodyInOut + exprInBody
+    emitFnSpanEnd[ssp] = emitFnSpanEnd[ssp] + bodyInOut + exprInBody
+    ssp = ssp + 1
+  }
   wBytes(body)
   wTarget(outPrev)
   0
@@ -4355,6 +4385,8 @@ export function emitProgram(rootIx: i32) {
   emitFnSpanPos = []
   emitFnSpanStart = []
   emitFnSpanEnd = []
+  emitFnSpanKind = []
+  emitFnSpanTag = []
   narrowNames = []
   narrowVariants = []
   narrowTys = []
@@ -6149,6 +6181,30 @@ function emitExportSection(_n: i32, wrapBase: i32) {
   0
 }
 
+// Bank one row of the body-span table (D1594): the `[from, to)` byte range, what KIND
+// of body it is, and the name/arena node a diagnostic can read off it. Ranges are
+// payload-relative until `emitCodeSection` rebases them onto the module.
+//
+// EVERY body the code section writes gets a row, not just the user functions: an
+// offset inside a body with no row printed a bare number, which is what D1594 reports.
+// `tag` names a body no `FuncDecl` covers ("" everywhere else).
+function bankFnSpan(
+  node: i32,
+  pos: i32,
+  from: i32,
+  to: i32,
+  kind: i32,
+  tag: string,
+) {
+  emitFnSpanNode.push(node)
+  emitFnSpanPos.push(pos)
+  emitFnSpanStart.push(from)
+  emitFnSpanEnd.push(to)
+  emitFnSpanKind.push(kind)
+  emitFnSpanTag.push(tag)
+  0
+}
+
 // Returns -1 if any function body fails to emit (propagated by the caller), else 0.
 function emitCodeSection(n: i32, hasStart: i32, memFn: i32, nHelpers: i32) {
   // Code section (id 10): one size-prefixed body per function, in index order, then
@@ -6167,43 +6223,78 @@ function emitCodeSection(n: i32, hasStart: i32, memFn: i32, nHelpers: i32) {
     // until `wSection` below places the payload in the module.
     const bodyAt = codePayload.length
     if emitFuncCode(codePayload, fnStmts[ci], ci) < 0 { return -1 }
-    emitFnSpanNode.push(fnStmts[ci])
-    emitFnSpanPos.push(ci)
-    emitFnSpanStart.push(bodyAt)
-    emitFnSpanEnd.push(codePayload.length)
+    bankFnSpan(fnStmts[ci], ci, bodyAt, codePayload.length, 0, "")
     ci = ci + 1
   }
   if hasStart == 1 {
+    // The start function banks a row PER TOP-LEVEL STATEMENT from inside
+    // `emitStartFnCode` (D1594), then this whole-body row as the fallback for the
+    // frame bytes no statement covers. Pushed AFTER them, because `emitFnSpanAt`
+    // returns the FIRST row whose range holds the offset and the narrower answer
+    // is the useful one.
+    const startAt = codePayload.length
     if emitStartFnCode(codePayload) < 0 { return -1 }
+    bankFnSpan(-1, -1, startAt, codePayload.length, 4, "")
   }
   if memLogUsed {
+    const logAt = codePayload.length
     if emitMemLogFnCode(codePayload) < 0 { return -1 }
+    bankFnSpan(-1, -1, logAt, codePayload.length, 3, "__log__")
   }
+  // The shared runtime helpers, each banked under the name the NAME SECTION gives it
+  // (`emitNameSection`'s tail) — one body, one row, so the two cannot disagree about
+  // what a trace and a validate diagnostic call the same function.
   if gHelpStrHash >= 0 {
+    let hAt = codePayload.length
     if emitStrHashFnCode(codePayload) < 0 { return -1 }
+    bankFnSpan(-1, -1, hAt, codePayload.length, 3, "__str_hash__")
+    hAt = codePayload.length
     if emitStrEqFnCode(codePayload) < 0 { return -1 }
+    bankFnSpan(-1, -1, hAt, codePayload.length, 3, "__str_eq__")
+    hAt = codePayload.length
     if emitStrConcatFnCode(codePayload) < 0 { return -1 }
+    bankFnSpan(-1, -1, hAt, codePayload.length, 3, "__str_concat__")
+    hAt = codePayload.length
     if emitUtf8DecFnCode(codePayload) < 0 { return -1 }
+    bankFnSpan(-1, -1, hAt, codePayload.length, 3, "__utf8_dec__")
+    hAt = codePayload.length
     if emitUtf8EncFnCode(codePayload) < 0 { return -1 }
+    bankFnSpan(-1, -1, hAt, codePayload.length, 3, "__utf8_enc__")
+    hAt = codePayload.length
     if emitUtf8CpLenFnCode(codePayload) < 0 { return -1 }
+    bankFnSpan(-1, -1, hAt, codePayload.length, 3, "__utf8_cplen__")
     if gHelpStrBytes >= 0 {
+      hAt = codePayload.length
       if emitStrBytesFnCode(codePayload) < 0 { return -1 }
+      bankFnSpan(-1, -1, hAt, codePayload.length, 3, "__str_bytes__")
     }
   }
   if gHelpMapProbe >= 0 {
+    let mAt = codePayload.length
     if emitMapProbeFnCode(codePayload) < 0 { return -1 }
+    bankFnSpan(-1, -1, mAt, codePayload.length, 3, "__map_probe__")
+    mAt = codePayload.length
     if emitMapResizeFnCode(codePayload) < 0 { return -1 }
+    bankFnSpan(-1, -1, mAt, codePayload.length, 3, "__map_resize__")
   }
   if gHelpMapProbeI32 >= 0 {
+    const miAt = codePayload.length
     if emitMapProbeI32FnCode(codePayload) < 0 { return -1 }
+    bankFnSpan(-1, -1, miAt, codePayload.length, 3, "__map_probe_i32__")
   }
   if gHelpF64Rem >= 0 {
+    const frAt = codePayload.length
     if emitF64RemFnCode(codePayload) < 0 { return -1 }
+    bankFnSpan(-1, -1, frAt, codePayload.length, 3, "__f64_rem__")
   }
   // The export-wrapper bodies LAST, in the same order the function section declared them.
+  // A wrapper's row carries the WRAPPED function's slot and node, so its name and the
+  // `file:line:col` of its declaration fall out of the same readers a user body uses.
   let wci = 0
   while wci < wrapC.length {
+    const wAt = codePayload.length
     emitExportWrapperCode(codePayload, wrapC[wci])
+    bankFnSpan(fnStmts[wrapC[wci]], wrapC[wci], wAt, codePayload.length, 2, "")
     wci = wci + 1
   }
   wSection(10, codePayload)

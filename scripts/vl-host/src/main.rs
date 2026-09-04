@@ -1033,14 +1033,40 @@ struct EmitSpans {
     module_of: TypedFunc<i32, i32>,
     name_len: TypedFunc<i32, i32>,
     name_at: TypedFunc<(i32, i32), i32>,
+    /// D1594's kind column. OPTIONAL, so a seed that predates it still names the
+    /// user functions it always could rather than losing the position entirely.
+    kind: Option<TypedFunc<i32, i32>>,
     keys: Vec<String>,
 }
 
-/// One located function: its name, and the source position of its declaration when the
-/// emitter had one to give (a synthesized body has none, and says so by omitting it).
+/// One located body: what KIND of body it is, its name, and the source position of its
+/// declaration when the emitter had one to give (a synthesized body has none, and says
+/// so by omitting it).
 struct SpanWhere {
+    kind: i32,
     name: String,
     at: Option<(String, i32, i32)>,
+}
+
+impl SpanWhere {
+    /// The clause that follows "the emitted module failed to validate".
+    ///
+    /// THE COMPILER CARRIES THE SAME LADDER IN VL (`emitFnSpanWhere`,
+    /// compiler/driver.vl): `vl check --codegen` renders its verdict inside the CLI
+    /// pump, which this code never enters, so each channel spells the clause for
+    /// itself. They move together, exactly as the offset parsers do.
+    ///
+    /// `entry` names the file for the one kind with no position of its own - the
+    /// synthetic start function outside any statement it recorded.
+    fn what(&self, entry: &str) -> String {
+        match self.kind {
+            1 => " inside the module's top-level code".to_string(),
+            2 => format!(" inside the export wrapper for `{}`", self.name),
+            3 => format!(" inside the shared runtime helper `{}`", self.name),
+            4 => format!(" inside the top-level code of {entry}"),
+            _ => format!(" inside `{}`", self.name),
+        }
+    }
 }
 
 impl EmitSpans {
@@ -1058,18 +1084,26 @@ impl EmitSpans {
             name_at: inst
                 .get_typed_func::<(i32, i32), i32>(&mut *store, "emitFnSpanNameAt")
                 .ok()?,
+            kind: inst
+                .get_typed_func::<i32, i32>(&mut *store, "emitFnSpanKindOf")
+                .ok(),
             keys: read_module_keys(&mut *store, inst).unwrap_or_default(),
         })
     }
 
-    /// The function owning module byte `off`, or `None` when the offset lies in no
-    /// recorded body - a synthetic start function, a shared runtime helper, an export
-    /// wrapper, or a failure outside the code section.
+    /// The body owning module byte `off`, or `None` when the offset lies in no recorded
+    /// body at all - a failure outside the code section. Every body the code section
+    /// writes has a row since D1594; before it, only the user functions did, and an
+    /// offset in the synthetic start function printed a bare number.
     fn locate(&self, store: &mut Store<()>, off: i32, entry: &str) -> Option<SpanWhere> {
         let i = self.at.call(&mut *store, off).ok()?;
         if i < 0 {
             return None;
         }
+        let kind = match &self.kind {
+            Some(k) => k.call(&mut *store, i).ok()?,
+            None => 0,
+        };
         let len = self.name_len.call(&mut *store, i).ok()?;
         let name = read_guest_str(len, |j| Ok(self.name_at.call(&mut *store, (i, j))?)).ok()?;
         let line = self.line.call(&mut *store, i).ok()?;
@@ -1085,7 +1119,7 @@ impl EmitSpans {
         } else {
             None
         };
-        Some(SpanWhere { name, at })
+        Some(SpanWhere { kind, name, at })
     }
 }
 
@@ -2280,12 +2314,12 @@ fn locate_invalid_module(
     let headline = match &located {
         Some(w) => match &w.at {
             Some((file, line, col)) => format!(
-                "{file}:{line}:{col}: the emitted module failed to validate inside `{}`: {sentence}",
-                w.name
+                "{file}:{line}:{col}: the emitted module failed to validate{}: {sentence}",
+                w.what(entry)
             ),
             None => format!(
-                "the emitted module failed to validate inside `{}`: {sentence}",
-                w.name
+                "the emitted module failed to validate{}: {sentence}",
+                w.what(entry)
             ),
         },
         None => format!("the emitted module failed to validate: {sentence}"),
@@ -4225,8 +4259,13 @@ const CMD_VALIDATE: i32 = 10;
 /// so an unknown value has something to be checked against, not as a framework.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Fault {
-    /// Corrupt the module CMD_VALIDATE is about to hand `Module::validate`.
+    /// Corrupt the FIRST function body with room for the rewrite.
     CorruptValidateBytes,
+    /// Corrupt the SYNTHETIC START function's body (D1594). The variant above takes
+    /// whichever body comes first, which is a user function in any program that has
+    /// one - so it can never reach the start function, whose offsets had no span row
+    /// at all until D1594 and printed a bare number.
+    CorruptStartFnBody,
 }
 
 /// Read `$VL_FAULT_INJECT`. Unset or empty is `None` (the state every real run is
@@ -4241,11 +4280,23 @@ fn fault_injection() -> Result<Option<Fault>> {
     match raw.to_str() {
         None | Some("") => Ok(None),
         Some("corrupt-validate-bytes") => Ok(Some(Fault::CorruptValidateBytes)),
+        Some("corrupt-start-fn-body") => Ok(Some(Fault::CorruptStartFnBody)),
         Some(other) => bail!(
-            "vl: unrecognized $VL_FAULT_INJECT fault `{other}` — the only value this binary \
-             knows is `corrupt-validate-bytes`. $VL_FAULT_INJECT is a TEST-ONLY hook for \
-             exercising the module-validation path; unset it."
+            "vl: unrecognized $VL_FAULT_INJECT fault `{other}` — the values this binary \
+             knows are `corrupt-validate-bytes` and `corrupt-start-fn-body`. \
+             $VL_FAULT_INJECT is a TEST-ONLY hook for exercising the module-validation \
+             path; unset it."
         ),
+    }
+}
+
+/// Apply `fault` to `bytes` in place. One entry point, so the two seams that can inject
+/// (`vl check --codegen`'s CMD_VALIDATE and `vl build`'s write-then-validate) cannot
+/// disagree about what a fault name means.
+fn inject_fault(fault: Fault, bytes: &mut [u8]) -> Result<()> {
+    match fault {
+        Fault::CorruptValidateBytes => corrupt_first_function_body(bytes),
+        Fault::CorruptStartFnBody => corrupt_start_function_body(bytes),
     }
 }
 
@@ -4329,12 +4380,7 @@ fn corrupt_first_function_body(bytes: &mut [u8]) -> Result<()> {
                 );
             }
             if body_size >= 3 {
-                bytes[start] = 0x00; // zero local declaration groups
-                bytes[start + 1] = 0x6a; // i32.add, stack empty → type mismatch
-                for b in &mut bytes[(start + 2)..(body_end - 1)] {
-                    *b = 0x00; // unreachable — decodable filler
-                }
-                bytes[body_end - 1] = 0x0b; // end
+                rewrite_body_invalid(bytes, start, body_end);
                 return Ok(());
             }
             p = body_end;
@@ -4348,6 +4394,169 @@ fn corrupt_first_function_body(bytes: &mut [u8]) -> Result<()> {
         "VL_FAULT_INJECT=corrupt-validate-bytes: the {total}-byte module has no code section \
          — nothing to corrupt"
     );
+}
+
+/// The length-preserving rewrite `corrupt_first_function_body` documents, applied to the
+/// body occupying `[start, end)`. Callers guarantee at least 3 bytes.
+fn rewrite_body_invalid(bytes: &mut [u8], start: usize, end: usize) {
+    bytes[start] = 0x00; // zero local declaration groups
+    bytes[start + 1] = 0x6a; // i32.add, stack empty → type mismatch
+    for b in &mut bytes[(start + 2)..(end - 1)] {
+        *b = 0x00; // unreachable — decodable filler
+    }
+    bytes[end - 1] = 0x0b; // end
+}
+
+/// Rewrite the SYNTHETIC START function's body the same way, so the failure lands where
+/// a program's MODULE-SCOPE code lives (D1594).
+///
+/// Which body that is comes off the module itself - the start section (id 8) names a
+/// function index, and subtracting the imported functions gives its position in the code
+/// section - never off a guess about emission order. Every precondition is an error for
+/// the reason `corrupt_first_function_body` gives: this doubles as the injecting test's
+/// proof that real emitted bytes reached the seam.
+fn corrupt_start_function_body(bytes: &mut [u8]) -> Result<()> {
+    const F: &str = "VL_FAULT_INJECT=corrupt-start-fn-body";
+    if bytes.len() < 8 || &bytes[..4] != b"\0asm" {
+        bail!(
+            "{F}: the {} bytes on the emitter's channel are not a wasm module (no `\\0asm` \
+             magic) — the emitter or the readback is broken, which is a real failure and not \
+             something to inject a fault into",
+            bytes.len()
+        );
+    }
+    let total = bytes.len();
+    let (mut imports, mut start_fn, mut code) = (0u32, None, None);
+    let mut p = 8;
+    while p < total {
+        let id = bytes[p];
+        p += 1;
+        let Some(size) = leb_u32(bytes, &mut p) else {
+            bail!("{F}: bad section size LEB at {p}");
+        };
+        let sec_end = p + size as usize;
+        if sec_end > total {
+            bail!("{F}: section {id} runs past the end of the {total}-byte module");
+        }
+        match id {
+            2 => imports = count_imported_funcs(bytes, p, sec_end).unwrap_or(0),
+            8 => {
+                let mut q = p;
+                start_fn = leb_u32(bytes, &mut q);
+            }
+            10 => code = Some((p, sec_end)),
+            _ => {}
+        }
+        p = sec_end;
+    }
+    let Some(start_fn) = start_fn else {
+        bail!("{F}: the module has no start section — this program emits no top-level code");
+    };
+    let Some((mut p, sec_end)) = code else {
+        bail!("{F}: the {total}-byte module has no code section — nothing to corrupt");
+    };
+    let Some(want) = start_fn.checked_sub(imports) else {
+        bail!("{F}: the start function is an IMPORT (index {start_fn} of {imports}) — the \
+               emitter does not do that, so the module is not the one this expects");
+    };
+    let Some(count) = leb_u32(bytes, &mut p) else {
+        bail!("{F}: bad code-section function count");
+    };
+    for i in 0..count {
+        let Some(body_size) = leb_u32(bytes, &mut p) else {
+            bail!("{F}: bad function body size LEB");
+        };
+        let (body_start, body_end) = (p, p + body_size as usize);
+        if body_end > sec_end {
+            bail!("{F}: a function body runs past the code section");
+        }
+        if i == want {
+            // PAST THE LOCALS VECTOR, unlike the first-body fault, which overwrites it
+            // with an empty one. The start function declares locals, so zeroing that
+            // vector shifts the mismatch into bytes no top-level statement covers and
+            // the diagnostic falls back to naming the whole body - which is the coarser
+            // half of what D1594 built. Landing on the first INSTRUCTION lands on the
+            // first module-scope statement.
+            let Some(code_start) = skip_locals_vec(bytes, body_start, body_end) else {
+                bail!("{F}: could not decode the start function's locals vector");
+            };
+            if body_end < code_start + 2 {
+                bail!("{F}: the start function's body has no room after its locals vector");
+            }
+            bytes[code_start] = 0x6a; // i32.add, stack empty → type mismatch
+            for b in &mut bytes[(code_start + 1)..(body_end - 1)] {
+                *b = 0x00; // unreachable — decodable filler
+            }
+            bytes[body_end - 1] = 0x0b; // end
+            return Ok(());
+        }
+        p = body_end;
+    }
+    bail!("{F}: the start function is body {want} of {count} — the code section is too short")
+}
+
+/// The offset of a body's FIRST INSTRUCTION: past the `vec(locals)` that opens it.
+///
+/// Every valtype is one byte except the two general reference forms, `ref null <ht>`
+/// (0x63) and `ref <ht>` (0x64), which carry a heap type - and a WasmGC module's start
+/// function is full of them, so skipping the pair is not optional here.
+fn skip_locals_vec(bytes: &[u8], mut p: usize, end: usize) -> Option<usize> {
+    let groups = leb_u32(bytes, &mut p)?;
+    for _ in 0..groups {
+        leb_u32(bytes, &mut p)?; // how many locals of this type
+        let t = *bytes.get(p)?;
+        p += 1;
+        if t == 0x63 || t == 0x64 {
+            leb_u32(bytes, &mut p)?; // the heap type index
+        }
+        if p > end {
+            return None;
+        }
+    }
+    (p <= end).then_some(p)
+}
+
+/// How many of a module's function indices come from the IMPORT section, which is the
+/// offset between a function index and its position in the code section.
+fn count_imported_funcs(bytes: &[u8], mut p: usize, end: usize) -> Option<u32> {
+    let n = leb_u32(bytes, &mut p)?;
+    let mut funcs = 0;
+    for _ in 0..n {
+        for _ in 0..2 {
+            let len = leb_u32(bytes, &mut p)? as usize;
+            p = p.checked_add(len)?;
+        }
+        if p >= end {
+            return None;
+        }
+        let kind = *bytes.get(p)?;
+        p += 1;
+        match kind {
+            0 => {
+                funcs += 1;
+                leb_u32(bytes, &mut p)?;
+            }
+            1 => {
+                p += 1; // reftype
+                let flags = *bytes.get(p)?;
+                p += 1;
+                leb_u32(bytes, &mut p)?;
+                if flags & 1 != 0 {
+                    leb_u32(bytes, &mut p)?;
+                }
+            }
+            2 => {
+                let flags = *bytes.get(p)?;
+                p += 1;
+                leb_u32(bytes, &mut p)?;
+                if flags & 1 != 0 {
+                    leb_u32(bytes, &mut p)?;
+                }
+            }
+            _ => p += 2, // global: valtype + mutability
+        }
+    }
+    Some(funcs)
 }
 
 /// The host↔seed contract generation this binary speaks. Checked against the seed's
@@ -4748,8 +4957,8 @@ fn cli_pump(args: &[String]) -> Result<()> {
                 // THE SEAM. Between the emitter's bytes and the engine's verdict,
                 // and nowhere else — everything below this line is the real path.
                 // `fault` is `None` unless $VL_FAULT_INJECT named this fault.
-                if fault == Some(Fault::CorruptValidateBytes) {
-                    corrupt_first_function_body(&mut bytes)?;
+                if let Some(f) = fault {
+                    inject_fault(f, &mut bytes)?;
                 }
                 match Module::validate(&engine, &bytes) {
                     Ok(()) => {
@@ -4996,7 +5205,7 @@ fn build_cmd(args: &[String]) -> Result<()> {
     let names = args.iter().any(|a| a == "--names");
     // `_located`, so a written module the engine refuses names the function it came
     // from (D1578). The instance is read only on that failure path.
-    let (bytes, session) = compile_vl_located(
+    let (mut bytes, session) = compile_vl_located(
         &compile_engine,
         &compiler,
         &read_source()?,
@@ -5004,6 +5213,14 @@ fn build_cmd(args: &[String]) -> Result<()> {
         "compileSrc",
         names,
     )?;
+    // THE SECOND SEAM (D1594). `None` on every real run — see the `$VL_FAULT_INJECT`
+    // block. `vl check --codegen` renders the engine's refusal through cli.vl and this
+    // path through `locate_invalid_module`, so a control that exercises only the other
+    // one proves nothing about this sentence. Between the emitter's bytes and the
+    // engine's verdict, and nowhere else.
+    if let Some(f) = fault_injection()? {
+        inject_fault(f, &mut bytes)?;
+    }
     std::fs::write(&out, &bytes)?;
     // Optimize the written module in place (wasm-opt, when present). Two
     // rungs, and `-O3` WINS when both are given — it is a superset of `-O`'s

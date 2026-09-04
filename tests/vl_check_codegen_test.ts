@@ -1067,6 +1067,65 @@ Deno.test({
 //     needs an unmistakable variable name AND a named value, and an unrecognized
 //     value is a hard error (asserted below) so a typo cannot silently disarm it.
 const FAULT_INVALID_MODULE = { VL_FAULT_INJECT: "corrupt-validate-bytes" };
+// D1594's second fault: the SYNTHETIC START function's body, past its locals vector so
+// the mismatch lands on the first module-scope statement. The fault above takes the
+// FIRST body with room, which is a user function in any program that has one — so it
+// can never reach the start function, and the start function is where a program's
+// module-scope code lives. Two faults over one source is what makes the pair below a
+// discriminating test rather than two spellings of the same one.
+const FAULT_START_FN = { VL_FAULT_INJECT: "corrupt-start-fn-body" };
+// A user function AND module-scope code, so "which body did the fault reach" has two
+// possible answers and the assertions can tell them apart.
+const TWO_BODY_SRC = `function add(a: i32, b: i32): i32 {\n  return a + b\n}\nprint(add(1, 2))\n`;
+
+// --- naming the body, not just the offset (D1594) -----------------------------
+//
+// A module the engine refuses reports a byte offset into bytes the author never sees.
+// D1578 mapped that offset back to the USER FUNCTION that owns it; the bodies with no
+// `FuncDecl` behind them — the synthetic start function above all — still had no span
+// row at all, so a module-scope failure printed a bare number and nothing else. The
+// external report this closes (VL-042, `glean`) is exactly that: an hour of bisecting a
+// 480-line file for `at offset 39223`.
+//
+// The pair below is the discriminating pin. Same source, same flags, one environment
+// variable apart, and the two faults must name DIFFERENT bodies — if the start-fn fault
+// silently fell back to the first body, both would say `add` and the test that "the
+// start function is named now" would be passing by looking at nothing.
+
+Deno.test({
+  name: "vl-check-codegen (fault-injected): the two faults name the two different bodies",
+  ignore: !ENABLED,
+  fn: async () => {
+    const control = await check(TWO_BODY_SRC, ["--codegen"]);
+    if (control.code !== 0) {
+      throw new Error(
+        `the control run must be clean or the injected runs prove nothing, got ${control.code}:\n${control.err}`,
+      );
+    }
+    // The named-function form D1578 built, still exact: body 0 is `add`.
+    const named = await check(TWO_BODY_SRC, ["--codegen"], FAULT_INVALID_MODULE);
+    if (named.code === 0) throw new Error(`expected non-zero exit:\n${named.err}`);
+    if (!named.err.includes("failed to validate inside `add`")) {
+      throw new Error(`expected the failure to name \`add\`, got:\n${named.err}`);
+    }
+    // The start function, over the SAME source. Before D1594 this said nothing at all
+    // after "failed to validate".
+    const top = await check(TWO_BODY_SRC, ["--codegen"], FAULT_START_FN);
+    if (top.code === 0) throw new Error(`expected non-zero exit:\n${top.err}`);
+    if (!top.err.includes("failed to validate inside the module's top-level code")) {
+      throw new Error(`expected the failure to name the top-level code, got:\n${top.err}`);
+    }
+    if (top.err.includes("inside `add`")) {
+      throw new Error(`the start-fn fault reached a user function instead:\n${top.err}`);
+    }
+    // ANCHORED at the module-scope statement, not at line 1: `print(add(1, 2))` is on
+    // line 4, and a diagnostic that names the body but points at the wrong line is the
+    // half of this that a substring check would miss.
+    if (!top.err.includes("error [4:")) {
+      throw new Error(`expected the position of the top-level statement (line 4), got:\n${top.err}`);
+    }
+  },
+});
 
 Deno.test({
   name: "vl-check-codegen --codegen (fault-injected): the engine's refusal renders as `invalid-module`",
@@ -1101,6 +1160,11 @@ Deno.test({
     }
     if (err.includes("emit error")) {
       throw new Error(`expected no emit-stage error — the emitter succeeded:\n${err}`);
+    }
+    // D1594 — CLEAN_SRC is module-scope only, so the one body this fault can reach IS
+    // the synthetic start function. It used to render with no `inside …` clause at all.
+    if (!err.includes("top-level code")) {
+      throw new Error(`expected the failure to name the top-level code, got:\n${err}`);
     }
   },
 });
