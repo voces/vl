@@ -41,16 +41,17 @@ VL="${VL:-scripts/vl-host/target/release/vl}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-# THE RATCHET EXEMPTIONS. `comment-block-too-long` / `comment-measurement-uncited`,
+# THE RATCHET EXEMPTIONS. The four comment codes (`comment-block-too-long`,
+# `comment-measurement-uncited`, `comment-shouting`, `comment-history`),
 # `arena-scan-outside-pass`, `kind-ladder-incomplete` / `kind-ladder-split` and
 # `sentinel-index-unguarded` / `sentinel-index-strict-untested` are `warning`s this tree
 # still violates in bulk, so they are held out of the `info` gate — but ONLY while their
 # baselines still owe them. Each allow-list is READ FROM its own baseline, so it empties
 # itself the day a trim, a banked scan, a named default or a bound test reaches zero;
-# meanwhile the four `--check` runs block any file going UP. (`sentinel-index-strict-
-# untested` is already at zero and so is already gated, which is the exemption's whole
-# design working one code at a time.) `vl check` has no per-code gate, hence `--json`
-# graded through one filter carrying every list.
+# meanwhile the four `--check` runs block any file going UP. (`comment-measurement-uncited`
+# and `sentinel-index-strict-untested` are already at zero and so are already gated, which
+# is the exemption's whole design working one code at a time.) `vl check` has no per-code
+# gate, hence `--json` graded through one filter carrying every list.
 #
 # `std-comment-audience` is deliberately NOT on that list. It is the std half of the
 # comment rules (std-api-review.md §4) and it landed at zero, so it has no baseline to

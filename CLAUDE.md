@@ -521,28 +521,31 @@ and grades the TIME RATIO, so machine speed and load cancel and the failure NAME
 `scripts/self-compile-time.sh` trips past 4× a committed CPU-second baseline for the L2
 build — half the factor pays for contention, which doubles CPU seconds on this box. Details and when each fires: `docs/internals/profiling-the-compiler.md` §Guards.
 
-## Comments state the invariant; measurements live in the inventory
+## Comments state the contract; measurements live in the inventory
 
-**A comment block is capped at 12 lines — 40 for a module HEADER — and a comment stating a
-MEASUREMENT must cite where it is graded.** Both are lint rules, tier `warning`:
-`comment-block-too-long` and `comment-measurement-uncited` in `compiler/lint.vl`. The header
-is the FIRST block with no code before it (blank lines and the leading `import` region may
-precede it — owner ruling, 2026-09-02), and the message names the budget it applied.
+**The six rules are `docs/internals/comment-style.md`** — contract and the non-obvious why,
+nothing else; 4 lines a block and 12 a module header; no history; at most one `D<id>`; no
+emphasis by capitalisation; no cross-block narration. Four are lint rules, tier `warning`, in
+`compiler/lint.vl`: `comment-block-too-long`, `comment-measurement-uncited`,
+`comment-shouting` and `comment-history`. The header is the FIRST block with no code before
+it (blank lines and the leading `import` region may precede it — owner ruling, 2026-09-02),
+and the too-long message names the budget it applied.
 
-What belongs in a code comment: the INVARIANT, the WHY (what breaks without it), and the id
-where the evidence lives — `D<row>`, a `DECISIONS.md` section, a `docs/**.md`. What does not:
-census counts, probe outputs, A/B tables, dates, history. **A comment is never re-graded; a
-row is re-run by every gate**, so a number in a comment goes stale in silence. Three wrong
-fixes on 2026-09-02 came from comments that were confidently STALE, not long — a length
-budget alone would have corrected none of them.
+What belongs in a code comment: the CONTRACT (inputs, the sentinel it returns and when, the
+invariant it keeps), the WHY (what breaks without it), and the id where the evidence lives —
+`D<row>`, a `DECISIONS.md` section, a `docs/**.md`. What does not: census counts, probe
+outputs, A/B tables, dates, history. **A comment is never re-graded; a row is re-run by every
+gate**, so a number in a comment goes stale in silence. Three wrong fixes on 2026-09-02 came
+from comments that were confidently STALE, not long — a length budget alone would have
+corrected none of them.
 
-The tree cannot reach zero in one PR, so both rules ride a RATCHET.
+The tree cannot reach zero in one PR, so all four codes ride ONE RATCHET.
 `python3 scripts/comment-budget.py --check` (a gate in `gate.sh` and in CI) fails when any
-FILE's count goes up; `--write-baseline` lowers it, in the same PR as the trim that earned it.
-`scripts/lint-self.sh` holds exactly these two codes out of its own `info` gate while the
-baseline still owes them — read FROM the baseline, so the exemption deletes itself at zero.
-**The baseline IS zero now (batch 7), so the exemption is gone and both rules gate at `info`
-like every other lint: a 13-line block or an uncited number fails `lint-self.sh` outright.**
+FILE's count for any code goes up; `--write-baseline` lowers it, in the same PR as the trim
+that earned it, and `--list <code>` names the blocks. `scripts/lint-self.sh` holds a code out
+of its own `info` gate only while the baseline still owes it — read FROM the baseline, so the
+exemption deletes itself at zero, one code at a time (`comment-measurement-uncited` is
+already there and already gates).
 
 **A comment-only change must produce a BYTE-IDENTICAL seed.** That is the trim campaign's
 whole safety proof: `scripts/refresh-compiler.sh`, then `cmp` against a seed built from the

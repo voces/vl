@@ -1,11 +1,12 @@
-// THE TWO COMMENT-BUDGET IMPLEMENTATIONS MUST AGREE.
+// THE TWO COMMENT-RULE IMPLEMENTATIONS MUST AGREE.
 //
 // `compiler/lint.vl` grades one module at a time from the source the driver hands
 // it; `scripts/comment-budget.py` grades the whole tree for the per-file ratchet.
-// They carry the same block definition, the same two clauses and the same two
-// budgets (12 lines a block, 40 a module header), and nothing else ties them
+// They carry the same block definition, the same four clauses and the same two
+// budgets (4 lines a block, 12 a module header), and nothing else ties them
 // together — so a change to either that moves a count silently un-ratchets the
-// tree. This runs BOTH over four fixtures and compares the hit LINES, not totals.
+// tree. This runs BOTH over five fixtures and compares the hit LINES, not totals.
+// The rules themselves are docs/internals/comment-style.md.
 //
 // GATING: env-gated (`SELFHOST_NATIVE_ALIGN=1`) AND requires the built binary +
 // seed wasm, like the other native `vl_*` suites.
@@ -25,7 +26,10 @@ const COMPILER = `${ROOT}/build/vl-compiler.wasm`;
 const SCRIPT = `${ROOT}/scripts/comment-budget.py`;
 const TOO_LONG = "comment-block-too-long";
 const UNCITED = "comment-measurement-uncited";
-const CODES = [TOO_LONG, UNCITED] as const;
+const SHOUTING = "comment-shouting";
+const HISTORY = "comment-history";
+const CODES = [TOO_LONG, UNCITED, SHOUTING, HISTORY] as const;
+type Code = typeof CODES[number];
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER);
@@ -36,9 +40,9 @@ if (GATED && !ENABLED) {
 const dull = (n: number, tag: string) =>
   Array.from({ length: n }, (_, i) => `// ${tag} line ${i + 1} of the block`).join("\n");
 
-// Every `dull` line reads "line N of the block" — no unit, no date, no verdict — so a
-// long run of them trips clause 1 ONLY. That separation is the point: it pins that the
-// two clauses are counted independently.
+// Every `dull` line reads "line N of the block" — no unit, no date, no verdict, no
+// capitals, no history phrase — so a long run of them trips clause 1 ONLY. That
+// separation is the point: it pins that the four clauses are counted independently.
 //
 // The row id in `dirty.vl` is D1230, a row that EXISTS. An invented one resolves nowhere
 // and `tests/vl_inventory_refs_test.ts` reds on it — correctly; a fixture is not an
@@ -47,8 +51,7 @@ const dull = (n: number, tag: string) =>
 type Fixture = {
   name: string;
   src: string;
-  long: number[];
-  uncited: number[];
+  want: Partial<Record<Code, number[]>>;
   /** A substring the ONE too-long message must contain (the budget it applied). */
   says?: string;
 };
@@ -64,13 +67,13 @@ export function add(a: i32, b: i32): i32 { a + b }
 // Scale by a constant; see DECISIONS.md for why the factor is not a parameter.
 export function scale(a: i32): i32 { a * 10 }
 `,
-    long: [],
-    uncited: [],
+    want: {},
   },
   {
     // A 3-line header (so the 13-line run below is a plain BLOCK, not the header),
     // a 13-line block, a 40-line block, an uncited measurement, and the same
-    // measurement cited two ways — neither citation may fire.
+    // measurement cited two ways — neither citation may fire clause 2, and all
+    // three fire clause 3 on their date.
     name: "dirty.vl",
     src: `${dull(3, "head")}
 export function hdr(): i32 { 0 }
@@ -90,38 +93,60 @@ export function d(): i32 { 4 }
 // Measured 2026-09-02: 48 cells moved loud to silent — DECISIONS.md has the shape.
 export function e(): i32 { 5 }
 `,
-    long: [6, 21],
-    uncited: [63],
+    want: { [TOO_LONG]: [6, 21], [UNCITED]: [63], [HISTORY]: [63, 66, 69] },
   },
   {
-    // THE HEADER SPLIT, in one file: 30 lines at the top passes on the 40-line
-    // header budget, and the SAME 30 lines below code fires on the 12-line one.
+    // THE HEADER SPLIT, in one file: 10 lines at the top passes on the 12-line
+    // header budget, and the SAME 10 lines below code fires on the 4-line one.
     name: "headers.vl",
-    src: `${dull(30, "head")}
+    src: `${dull(10, "head")}
 export function a(): i32 { 1 }
 
-${dull(30, "mid")}
+${dull(10, "mid")}
 export function b(): i32 { 2 }
 `,
-    long: [33],
-    uncited: [],
-    says: "comment block of 30 lines exceeds the 12-line budget",
+    want: { [TOO_LONG]: [13] },
+    says: "comment block of 10 lines exceeds the 4-line budget",
   },
   {
     // A header over its own budget, and the message has to name WHICH budget. The
-    // multi-line `import` above it is the `format.vl` shape (#2413's header sits at
-    // line 4, under two imports): a header may follow the import region.
+    // multi-line `import` above it is the `format.vl` shape (a header may follow the
+    // import region).
     name: "bigheader.vl",
     src: `import {
   dep,
 } from "./dep"
 
-${dull(45, "head")}
+${dull(20, "head")}
 export function a(): i32 { dep() }
 `,
-    long: [5],
-    uncited: [],
-    says: "module header of 45 lines exceeds the 40-line budget",
+    want: { [TOO_LONG]: [5] },
+    says: "module header of 20 lines exceeds the 12-line budget",
+  },
+  {
+    // VOICE: rules 3 and 5. Both are LINE facts reported where they stand, once per
+    // block per code — and every negative here is a way the scan could over-fire.
+    name: "voice.vl",
+    src: `// A quiet first line, so the hit cannot just be the block's start.
+// It lands on THE SECOND LINE, where the capitals are.
+// A quiet third line, to pin that one block reports once.
+export function a(): i32 { 1 }
+
+// The pair WASM ABI is on the allow-list; \`ALPHA BETA\` sits in backticks.
+// Neither fires, and one shouted word alone is not a run: ONLY this.
+export function b(): i32 { 2 }
+
+// This line used to say something else.
+// A second line that was history too, to pin one report per block.
+export function c(): i32 { 3 }
+
+// The word \`was\` in backticks names a field, so this line is quiet.
+export function d(): i32 { 4 }
+
+// A date is history with no verb: 2026-09-02.
+export function e(): i32 { 5 }
+`,
+    want: { [UNCITED]: [17], [SHOUTING]: [2], [HISTORY]: [10, 17] },
   },
 ];
 
@@ -177,7 +202,7 @@ const lint = async (path: string, file: string): Promise<Hits> => {
 const eq = (a: number[], b: number[]) => JSON.stringify(a) === JSON.stringify(b);
 
 Deno.test({
-  name: "comment-budget: the lint and the ratchet script agree, both budgets",
+  name: "comment rules: the lint and the ratchet script agree, all four codes",
   ignore: !ENABLED,
   fn: async () => {
     const dir = await Deno.makeTempDir({ prefix: "vl_comment_budget_" });
@@ -198,21 +223,16 @@ Deno.test({
               `and the same budgets; whichever moved has to move back, or both together.`,
           );
         }
+        // Pin the fixture's own arithmetic, so an agreeing pair of ZEROS cannot pass.
+        const want = f.want[c] ?? [];
+        if (!eq(s.lines[c], want)) {
+          throw new Error(
+            `${f.name}: want ${c} at lines ${JSON.stringify(want)}, got ` +
+              `${JSON.stringify(s.lines[c])}`,
+          );
+        }
       }
 
-      // Pin the fixture's own arithmetic, so an agreeing pair of ZEROS cannot pass.
-      if (!eq(s.lines[TOO_LONG], f.long)) {
-        throw new Error(
-          `${f.name}: want ${TOO_LONG} at lines ${JSON.stringify(f.long)}, got ` +
-            `${JSON.stringify(s.lines[TOO_LONG])}`,
-        );
-      }
-      if (!eq(s.lines[UNCITED], f.uncited)) {
-        throw new Error(
-          `${f.name}: want ${UNCITED} at lines ${JSON.stringify(f.uncited)}, got ` +
-            `${JSON.stringify(s.lines[UNCITED])}`,
-        );
-      }
       if (f.says !== undefined) {
         if (l.msgs.length !== 1 || !l.msgs[0].includes(f.says)) {
           throw new Error(

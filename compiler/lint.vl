@@ -1826,23 +1826,23 @@ function unusedFunctions(stmts: i32[]) {
   0
 }
 
-// ── comment budget: comment-block-too-long, comment-measurement-uncited ───────
+// ── comment rules: the four codes over one block walk ─────────────────────────
 //
-// A BLOCK is a maximal run of lines whose first non-space token is `//`; a blank
-// line, code, or a trailing comment ends it. Clause 1 caps it. Clause 2 fires at ANY
-// length when the block states a measurement and cites no graded home — a comment is
-// never re-graded, so its number goes stale in silence, while a row is re-run by
-// every gate.
+// A block is a maximal run of lines whose first non-space token is `//`; a blank
+// line, code, or a trailing comment ends it. Four clauses read it, each a rule of
+// `docs/internals/comment-style.md`: length (rule 2), a measurement with no graded
+// home (a comment is never re-graded, so its number goes stale in silence),
+// emphasis by capitalisation (rule 5), and history (rule 3).
 //
-// `scripts/comment-budget.py` is the same two clauses over the whole tree, for the
+// `scripts/comment-budget.py` is the same four clauses over the whole tree, for the
 // per-file ratchet; `tests/vl_comment_budget_test.ts` pins the two to agree.
-const cbBudget = 12
+const cbBudget = 4
 
-// THE MODULE HEADER is the FIRST block with no code before it — blank lines and
-// `import` declarations may precede it, which is what #2413's `format.vl` header
-// (line 4, under two imports) needs. It is the file's contract rather than a note
-// beside one line, so it earns more room; the trim pilot set the number.
-const cbHeaderBudget = 40
+// The module header is the first block with no code before it — blank lines and
+// `import` declarations may precede it, which is what `format.vl`'s header needs.
+// It is the file's contract rather than a note beside one line, so it earns more
+// room: what the module is for, and what it deliberately does not do.
+const cbHeaderBudget = 12
 
 // The module SOURCE, handed in by the driver before `lint(root)` (the
 // `fmtSetSource` idiom). Comments are lexer trivia the parse path never carries —
@@ -2076,6 +2076,143 @@ function cbLineFlags(s: string, a: i32, b: i32) {
   m + d * 2
 }
 
+// `s[i, e)` is exactly `w`.
+function cbSpanIs(s: string, i: i32, e: i32, w: string) {
+  if e - i != w.length { return false }
+  let k = 0
+  while k < w.length {
+    if s[i + k] != w[k] { return false }
+    k = k + 1
+  }
+  true
+}
+
+// The acronyms a comment may spell in capitals — the whole allow-list, in one
+// place. A word under three letters never reaches here, so `GC` needs no entry.
+function cbIsAcronym(s: string, i: i32, e: i32) {
+  cbSpanIs(s, i, e, "ABI") ||
+    cbSpanIs(s, i, e, "API") ||
+    cbSpanIs(s, i, e, "ASCII") ||
+    cbSpanIs(s, i, e, "AST") ||
+    cbSpanIs(s, i, e, "CLI") ||
+    cbSpanIs(s, i, e, "IEEE") ||
+    cbSpanIs(s, i, e, "JSON") ||
+    cbSpanIs(s, i, e, "LEB") ||
+    cbSpanIs(s, i, e, "LSP") ||
+    cbSpanIs(s, i, e, "OOB") ||
+    cbSpanIs(s, i, e, "RFC") ||
+    cbSpanIs(s, i, e, "UFCS") ||
+    cbSpanIs(s, i, e, "UTF") ||
+    cbSpanIs(s, i, e, "WASM")
+}
+
+// `s[i, e)` is three or more letters, every one a capital, and not an acronym —
+// the unit rule 5 forbids two of in a row.
+function cbIsShoutWord(s: string, i: i32, e: i32) {
+  if e - i < 3 { return false }
+  let k = i
+  while k < e {
+    const c = s[k]
+    if c < 'A' || c > 'Z' { return false }
+    k = k + 1
+  }
+  !cbIsAcronym(s, i, e)
+}
+
+// Whether the comment line `[a, b)` shouts: two shout words in a row. A backticked
+// span is SKIPPED rather than treated as a break, so `THE `x` NAME` still shouts —
+// an identifier in backticks is not what rule 5 is about.
+//
+// BOUND: an unpaired backtick hides the rest of its line, and a span opened on one
+// line never closes on the next. The ratchet script carries the same bound.
+function cbShoutLine(s: string, a: i32, b: i32) {
+  let i = a
+  let tick = 0
+  let prev = 0
+  while i < b {
+    const c = s[i]
+    if c == '`' {
+      if tick == 0 { tick = 1 } else { tick = 0 }
+      i = i + 1
+    } else if cbIsWordChar(c) {
+      let e = i
+      while e < b && cbIsWordChar(s[e]) { e = e + 1 }
+      if tick == 0 {
+        if cbIsShoutWord(s, i, e) {
+          if prev == 1 { return true }
+          prev = 1
+        } else {
+          prev = 0
+        }
+      }
+      i = e
+    } else {
+      i = i + 1
+    }
+  }
+  false
+}
+
+// `w`, given lower-case, at `i` as a whole word with the source side's case folded.
+// The caller owns the LEADING boundary; this owns the trailing one.
+function cbHistWordAt(s: string, i: i32, b: i32, w: string) {
+  cbAtI(s, i, b, w) && !cbWordAt(s, i + w.length, b)
+}
+
+// The letters rule 3's phrases start with, so the list is consulted only where one
+// could begin.
+function cbHistStart(c: i32) {
+  c == 'n' ||
+    c == 'N' ||
+    c == 'u' ||
+    c == 'U' ||
+    c == 'p' ||
+    c == 'P' ||
+    c == 'm' ||
+    c == 'M' ||
+    c == 'l' ||
+    c == 'L' ||
+    c == 'w' ||
+    c == 'W'
+}
+
+// The history phrase at `i`, or "". `was`/`were` earn their place on volume: they
+// are how a past state gets told, and the passive-voice contract sentence they also
+// match reads better rewritten active.
+function cbHistPhraseAt(s: string, i: i32, b: i32): string {
+  if cbHistWordAt(s, i, b, "no longer") { return "no longer" }
+  if cbHistWordAt(s, i, b, "used to") { return "used to" }
+  if cbHistWordAt(s, i, b, "previously") { return "previously" }
+  if cbHistWordAt(s, i, b, "measured") { return "measured" }
+  if cbHistWordAt(s, i, b, "landed") { return "landed" }
+  if cbHistWordAt(s, i, b, "was") { return "was" }
+  if cbHistWordAt(s, i, b, "were") { return "were" }
+  ""
+}
+
+// The first history phrase the comment line `[a, b)` carries, or "". A date is
+// history with no verb. Backticked spans are skipped, so `` `was` `` naming a field
+// is not narration; same bound on an unpaired backtick as `cbShoutLine`.
+function cbHistLine(s: string, a: i32, b: i32): string {
+  let i = a
+  let tick = 0
+  while i < b {
+    const c = s[i]
+    if c == '`' {
+      if tick == 0 { tick = 1 } else { tick = 0 }
+    } else if tick == 0 {
+      if cbIsDigit(c) {
+        if cbDateAt(s, i, b) { return "a date" }
+      } else if cbHistStart(c) && !cbWordAt(s, i - 1, b) {
+        const w = cbHistPhraseAt(s, i, b)
+        if w.length > 0 { return w }
+      }
+    }
+    i = i + 1
+  }
+  ""
+}
+
 // The decimal spelling of `n`. The compiler graph reaches no i32→string builtin —
 // the CLI's number printers are host-side.
 function cbNumStr(n: i32) {
@@ -2089,8 +2226,9 @@ function cbNumStr(n: i32) {
   out
 }
 
-// Report one finished block. Both codes are `warning`; `scripts/lint-self.sh`
-// holds them out of its own `info` gate while the ratchet baseline is non-zero.
+// Report one finished block's LENGTH and its uncited measurement. All four codes are
+// `warning`; `scripts/lint-self.sh` holds each out of its own `info` gate while the
+// ratchet baseline still owes it.
 function cbReport(n: i32, ln: i32, co: i32, meas: i32, cited: i32, hdr: i32) {
   let cap = cbBudget
   let what = "comment block of "
@@ -2105,7 +2243,7 @@ function cbReport(n: i32, ln: i32, co: i32, meas: i32, cited: i32, hdr: i32) {
         cbNumStr(n) +
         " lines exceeds the " +
         cbNumStr(cap) +
-        "-line budget — state the invariant and the why here, cite the inventory row / DECISIONS section for the measurements",
+        "-line budget — state the contract and the non-obvious why here, and leave the rest to the inventory row (docs/internals/comment-style.md rule 2)",
       "warning",
       ln,
       co,
@@ -2114,7 +2252,7 @@ function cbReport(n: i32, ln: i32, co: i32, meas: i32, cited: i32, hdr: i32) {
   if meas == 1 && cited == 0 {
     lintEmitAtPos(
       "comment-measurement-uncited",
-      "a comment states a measurement but cites no inventory row or DECISIONS section — a comment is never re-graded; put the number in a row and cite it",
+      "a comment states a measurement but cites no inventory row or DECISIONS section — a comment is never re-graded; put the number in a row and cite it (docs/internals/comment-style.md rule 1)",
       "warning",
       ln,
       co,
@@ -2132,8 +2270,10 @@ function cbIsHeader(seenCode: i32, headerTaken: i32) {
 }
 
 // Walk the source line by line, accumulating own-line `//` runs. O(bytes); the only
-// per-line state is a handful of counters, and a block stops being scanned for tells
-// once both flags are set.
+// per-line state is a handful of counters, and a block stops being scanned for a tell
+// once that tell's flag is set. Length and the uncited measurement are block facts,
+// so they report when the block closes; shouting and history are LINE facts and
+// report where they stand, once per block per code.
 function commentBudget() {
   const s = cbSource
   cbSource = ""
@@ -2144,6 +2284,8 @@ function commentBudget() {
   let blockCol = 0
   let meas = 0
   let cited = 0
+  let shouted = 0
+  let told = 0
   let seenCode = 0
   let headerTaken = 0
   let inImport = 0
@@ -2165,6 +2307,31 @@ function commentBudget() {
         if f == 1 || f == 3 { meas = 1 }
         if f == 2 || f == 3 { cited = 1 }
       }
+      if shouted == 0 && cbShoutLine(s, k, le) {
+        shouted = 1
+        lintEmitAtPos(
+          "comment-shouting",
+          "a comment line shouts — two or more words in capitals in a row; put identifiers in backticks and ordinary words in lower case (docs/internals/comment-style.md rule 5)",
+          "warning",
+          line,
+          k - i,
+        )
+      }
+      if told == 0 {
+        const w = cbHistLine(s, k, le)
+        if w.length > 0 {
+          told = 1
+          lintEmitAtPos(
+            "comment-history",
+            "a comment line narrates history (\"" +
+              w +
+              "\") — what the code did before belongs in the inventory row, and `git log -S` finds the rest (docs/internals/comment-style.md rule 3)",
+            "warning",
+            line,
+            k - i,
+          )
+        }
+      }
     } else {
       if n > 0 {
         const hdr = cbIsHeader(seenCode, headerTaken)
@@ -2173,6 +2340,8 @@ function commentBudget() {
         n = 0
         meas = 0
         cited = 0
+        shouted = 0
+        told = 0
       }
       // A non-blank, non-comment line: still the import region, or the first code.
       if k < le {
