@@ -16,6 +16,7 @@ import {
   f64LitOverflows,
   intLexemeIsExactF32,
   numLexIsFloat,
+  numLexRadixBits,
   parseI32,
   parseI64Pair,
 } from "./emit_bignum"
@@ -2241,6 +2242,11 @@ let isParentElseTyIx: i32[] = []
 // `nodeTyIx` keeps the checker's self-inferred type for its existing consumers; the emitter's rep
 // keying reads `nodeRepTyIxOf`, which falls back to `nodeTyIxOf` when nothing is recorded.
 let nodeRepTyIx: i32[] = []
+// Literal-width sidecar, parallel to `nodeTyIx`: true at a radix `NumLit` whose destination is a
+// 64-bit slot, so its bit pattern is read at 64 bits rather than at the width its digits imply.
+// `checkNodeReal` consults it so a re-check keeps the adopted width, and the emitter reads the
+// re-stamped `nodeTyIx` — DECISIONS.md §"A hex literal is a bit pattern".
+let litWide64: boolean[] = []
 // Annotation atom-count sidecar: how many top-level union atoms the annotation node's emit-time
 // spelling is joined from, banked by `canonEmitTypeNames`, the producer of that spelling. The
 // count cannot be recovered from the arena — an annotation over two same-shape declared structs
@@ -3096,6 +3102,7 @@ export function initChecker() {
   isParentTyIx = []
   isParentElseTyIx = []
   nodeRepTyIx = []
+  litWide64 = []
   annUnionAtoms = []
   cFuncPinTyIx = -1
   cObjPinTyIx = -1
@@ -7261,12 +7268,134 @@ function fnValVoidCoerce(srcExpr: i32, srcTy: i32, dstTy: i32) {
   false
 }
 
+// Has this radix literal node adopted a 64-bit destination? Read by `checkNodeReal` so a re-check
+// keeps the adopted width, and by the emitter's union-atom picker.
+export function litWide64Of(ix: i32) {
+  if ix >= 0 {
+    if ix < litWide64.length { return litWide64[ix] }
+  }
+  false
+}
+
+// The integer width a destination pins on a radix literal delivered to it: 64 for an `i64` slot,
+// 32 for an `i32` one, -1 when it has no opinion — `u8` reports through its own arm in
+// `assignableExpr`, and a float or literal-union slot leaves the literal its default width.
+// Nullable wrappers peel; a union pins 64 only when `i64` is its sole integer atom.
+function dstIntWidth(dstTy: i32, depth: i32) {
+  if dstTy < 0 || depth <= 0 { return -1 }
+  const dtix = nonNullTy(dstTy)
+  if dtix < 0 { return -1 }
+  const pn = primNameOf(dtix)
+  if pn == "i64" { return 64 }
+  if pn == "i32" { return 32 }
+  if pn != null { return -1 }
+  const d = T.tys[dtix]
+  if d is TyUnion {
+    const members: i32[] = []
+    flattenVariantsInto(dtix, members)
+    let sawI64 = false
+    let sawNarrow = false
+    let mi = 0
+    while mi < members.length {
+      const mw = dstIntWidth(members[mi], depth - 1)
+      if mw == 64 { sawI64 = true }
+      if mw == 32 { sawNarrow = true }
+      if primNameOf(members[mi]) == "u8" { sawNarrow = true }
+      mi = mi + 1
+    }
+    if sawI64 && !sawNarrow { return 64 }
+  }
+  -1
+}
+
+// The sentence a radix lexeme gets when its pattern is wider than the destination. One home so the
+// no-destination report (64 bits, the widest VL has) and the pinned one read alike.
+function radixLitTooWideMsg(lex: string, width: i32) {
+  let kind = "a hex literal"
+  if lex.length >= 2 {
+    const p = lex[1]
+    if p == 'b' || p == 'B' { kind = "a binary literal" }
+    else if p == 'o' || p == 'O' { kind = "an octal literal" }
+  }
+  if width >= 64 {
+    return lex +
+      " does not fit a 64-bit destination — " +
+      kind +
+      " is a bit pattern of the destination's width, and 64 bits is the widest VL has"
+  }
+  lex +
+    " does not fit a " +
+    i32ToStr(width) +
+    "-bit destination — " +
+    kind +
+    " is a bit pattern of the destination's width; write it in decimal for its value, or give it an i64 destination"
+}
+
+// Pin the radix literal at `litIx` to `width`. Answers 2 when this reported (the caller then
+// answers the flow true, so the opaque width mismatch is not said twice), else 1 when the literal
+// adopted 64 bits, else 0. A pattern past 64 bits reported at the literal itself, so it is silent
+// here.
+function radixLitAdoptWidth(litIx: i32, width: i32) {
+  const t = P.nodes[litIx]
+  if t is NumLit {
+    const bits = numLexRadixBits(t.numText)
+    if bits > 64 { return 2 }
+    if width == 64 {
+      while litWide64.length <= litIx { litWide64.push(false) }
+      litWide64[litIx] = true
+      if litIx < nodeTyIx.length { nodeTyIx[litIx] = TY_I64 }
+      return 1
+    }
+    if bits > width {
+      if !inferQuiet { tErr(radixLitTooWideMsg(t.numText, width), litIx) }
+      return 2
+    }
+  }
+  0
+}
+
+// The innermost node `ix` peels to through parentheses, or `ix` itself.
+function parenPeelIx(ix: i32) {
+  if ix < 0 { return ix }
+  const e = P.nodes[ix]
+  if e is Paren { return parenPeelIx(e.parInner) }
+  ix
+}
+
+// Pin the radix literal `srcExpr` delivers into `dstTy` to the destination's width. An object
+// literal's fields and an array literal's elements reach their own destination sub-type through
+// `assignableExpr`'s field-wise and element-wise recursion, which re-enters here. A unary minus is
+// not peeled: it makes the literal an operand rather than the delivered value.
+function radixLitAdoptDst(srcExpr: i32, dstTy: i32) {
+  if inferQuiet || srcExpr < 0 || dstTy < 0 { return 0 }
+  const lix = parenPeelIx(srcExpr)
+  const e = P.nodes[lix]
+  if e is NumLit {
+    if numLexRadixBits(e.numText) < 0 { return 0 }
+    const w = dstIntWidth(dstTy, 3)
+    if w < 0 { return 0 }
+    return radixLitAdoptWidth(lix, w)
+  }
+  0
+}
+
+// A radix literal takes the OTHER operand's width, so `x >= 0x80000000` over an `i64` compares the
+// 64-bit pattern rather than the i32 one its digits imply. Upward only: a 32-bit peer leaves a
+// wide literal alone, so `x + 0x1_0000_0000` still widens the expression to i64.
+function radixLitAdoptPeer64(exprIx: i32, peerTy: i32) {
+  if dstIntWidth(peerTy, 3) != 64 { return 0 }
+  radixLitAdoptDst(exprIx, peerTy)
+}
+
 export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   // A generic function value meeting a concrete function type is decided by instantiation inside
   // `assignable`'s `TyFunc` case (`genericFnAssignable`), so it governs nested positions like an
   // array element too, not just this expression-level entry.
   recordElemRepArrayLit(srcExpr, dstTy, 6)
   recordNullHoleObjAdopt(srcExpr, dstTy, 6)
+  // A hex / binary / octal literal is a bit pattern of the destination's width, and this seam is
+  // where every binding / argument / return / field / element / store position delivers one.
+  if radixLitAdoptDst(srcExpr, dstTy) == 2 { return true }
   // Rep sidecar: an ObjLit/ArrayLit whose source type reaches an unresolved empty-collection hole
   // (`{nodes: []}`, `{m: Map()}`) is plainly `assignable` to its concrete destination, so the
   // short-circuit below returns before the adoption block. Record the destination here so the
@@ -7576,36 +7705,22 @@ function u8LexValue(t: string) {
   v
 }
 
-// Does the non-negative integer lexeme `t` (decimal, `0x`, `0b`, `0o`, with `_` separators skipped)
-// fit the i32 range? An un-annotated integer literal defaults to i32 when its value fits and widens
-// to i64 otherwise, since defaulting an out-of-range literal to i32 would silently wrap. A `NumLit`
-// lexeme never carries a sign, so only the positive bound is checked.
+// Does the non-negative integer lexeme `t` default to i32? A DECIMAL lexeme denotes a value and
+// defaults by its magnitude, widening to i64 rather than silently wrapping. A RADIX lexeme
+// (`0x`, `0b`, `0o`) denotes a bit pattern and defaults by its width (`numLexRadixBits`), which
+// is the ruled literal rule — DECISIONS.md §"A hex literal is a bit pattern".
 export function intLexemeFitsI32(t: string) {
+  const rb = numLexRadixBits(t)
+  if rb >= 0 { return rb <= 32 }
   let v = 0
   let i = 0
-  let base = 10
-  if t.length >= 2 && t[0] == '0' {
-    const p = t[1]
-    if p == 'x' || p == 'X' {
-      base = 16
-      i = 2
-    } else if p == 'b' || p == 'B' {
-      base = 2
-      i = 2
-    } else if p == 'o' || p == 'O' {
-      base = 8
-      i = 2
-    }
-  }
+  const base = 10
   while i < t.length {
     const c = t[i]
     if c == '_' {
       i = i + 1
     } else {
-      let d = 0
-      if c >= '0' && c <= '9' { d = c - '0' }
-      else if c >= 'a' && c <= 'f' { d = c - 'a' + 10 }
-      else { d = c - 'A' + 10 }
+      const d = c - '0'
       if v > (2147483647 - d) / base { return false }
       v = v * base + d
       i = i + 1
@@ -26159,6 +26274,13 @@ function checkNodeReal(ix: i32) {
       if f64LitOverflows(n.numText) { tErr("float literal overflows f64", ix) }
       return TY_F64
     }
+    // A radix literal that adopted a 64-bit destination keeps that width across re-checks; one
+    // wider than 64 bits has no destination at all, and says so here rather than wrapping.
+    if litWide64Of(ix) { return TY_I64 }
+    if numLexRadixBits(n.numText) > 64 {
+      tErr(radixLitTooWideMsg(n.numText, 64), ix)
+      return TY_I64
+    }
     if intLexemeFitsI32(n.numText) { return TY_I32 }
     return TY_I64
   } else if n is StrLit {
@@ -33023,6 +33145,12 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
     // typed slot is on the LEFT of the operator, which is why the delivery had no pin
     // while every annotated-destination sibling had one (D1591).
     constrainEmptyExpr(n.binRight, rt, nonNullTy(lt))
+  }
+  // A radix literal operand takes the other side's width (the ruled literal rule). Assignment is
+  // excluded: its destination is `assignableExpr`'s, which pins the narrowing direction too.
+  if op != "=" && op != "&&" && op != "||" {
+    if radixLitAdoptPeer64(n.binLeft, rt) == 1 { lt = TY_I64 }
+    if radixLitAdoptPeer64(n.binRight, lt) == 1 { rt = TY_I64 }
   }
   // A binary op with a HOLE operand can't decide its form until the hole is bound at the call —
   // record the deferred constraint (skipping assignment / logical, handled by their own arms).

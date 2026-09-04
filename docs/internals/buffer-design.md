@@ -870,10 +870,12 @@ callee-position skip) still needs no such pairing.
   while the one page was barely addressable; with the load matrix and `memory.grow` it is the
   ordinary way a raw address goes wrong. Fixed, with the memory branch ahead of the array branch;
   array cases are untouched.
-- **A VL integer literal with the top bit set is an i64.** `0xC0100000` — an ordinary f32 bit
-  pattern — cannot be passed to `__store_i32__`, because an integer literal takes the narrowest type
-  that holds it EXACTLY. It must be spelled as the signed i32 (`-1072693248`). This will hit every
-  consumer laying down float bit patterns and is worth knowing before `Buffer` ships a store surface.
+- **A VL integer literal with the top bit set was an i64.** `0xC0100000` — an ordinary f32 bit
+  pattern — could not be passed to `__store_i32__`, and had to be spelled as the signed i32
+  (`-1072693248`). *Ruled away 2026-09-04*: a hex or binary literal is a BIT PATTERN of its
+  destination's width, so `__store_i32__(8, 0xC0100000)` is now the i32 with those bits. Every
+  consumer laying down float bit patterns writes the pattern it means. DECISIONS.md
+  §"A hex literal is a bit pattern of its destination's width".
 
 ### H8. The detachment contract (B5), ruled for the hosts
 

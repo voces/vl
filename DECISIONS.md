@@ -10,6 +10,49 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 
 ## Types & semantics
 
+- **A HEX OR BINARY LITERAL IS A BIT PATTERN OF ITS DESTINATION'S WIDTH; A DECIMAL LITERAL IS
+  A VALUE** (2026-09-04, owner ruling: *"Let's take the literal rule"*). A radix literal
+  (`0x…`, `0b…`, `0o…`) must FIT the destination's width; a decimal literal must fit the
+  destination's value RANGE, exactly as before. Width comes from CONTEXT first — the declared
+  type of the binding, parameter, field, return or array element it is delivered to, or the
+  type of the other operand in a binary operation or comparison — and, with no context, from
+  the digit count: up to 8 significant hex digits (32 binary) is `i32`, up to 16 (64) is
+  `i64`, more is an error. Leading zeros and `_` separators are not significant. `u8` is an
+  8-bit destination and keeps its own range message. Unary minus applies to the pattern's
+  value afterwards, so `-0xFF` is −255, as in Java.
+
+  | spelling | before | ruled |
+  | --- | --- | --- |
+  | `const k: i32 = 0xb81a1aaa` | error (i64 does not fit) | −1206248790 |
+  | `fbI32Const(0x85ebca6b)` (param `i32`) | error | the pattern |
+  | `x >= 0x80000000` with `x: i64` | 2147483648 | unchanged |
+  | `const m: i64 = 0xFFFFFFFF` | 4294967295 | unchanged (low 32 bits of a 64-bit word) |
+  | `const seed = 0xEEEEEEEE` (no context) | i64 4008636142 | i32 −286331154 |
+  | `print(0xDEAD_BEEF)` (no context) | 3735928559 | −559038737 |
+  | `const big = 0x1_0000_0000` | i64 | unchanged (9 digits) |
+  | `const c: i32 = 0x1_0000_0000` | error | error (does not fit 32 bits) |
+  | `bytes.push(0xFF)` / `bytes.push(0x1FF)` (u8) | 255 / error | unchanged |
+  | `4294967295` anywhere i32 | error | unchanged |
+  | `0xFFFFFFFF == -1` (i32 peer) | false/error | true |
+
+  Precedent is Java, which is also unsigned-free and reads hex as a pattern; VL improves on it
+  by taking the width from the DESTINATION first, so a `byte b = 0xFF`-shaped case works
+  rather than needing a cast. **Declined**, for the record: an intrinsic `lo32` (owner:
+  *"intrinsics are a mystery"*), and `as%` alone — the wrap cast landed
+  alongside this and stays the answer for a COMPUTED value, where there is no pattern to
+  read; a literal is where the pattern is written and does not need a cast to say so. Reported by glean,
+  the language's first external consumer, as VL-023 (a 32-bit pattern with the top bit set
+  cannot be written as an i32) and VL-044 (`as!` traps on one, with no non-trapping form).
+
+  **The refusal the rule owes** names the width it applied and both ways out:
+  `` 0x1_0000_0000 does not fit a 32-bit destination — a hex literal is a bit pattern of the
+  destination's width; write it in decimal for its value, or give it an i64 destination ``.
+  A pattern past 64 bits is refused at the literal itself, since no VL destination is wider.
+  **Upward adoption only at an operand peer**: an i64 peer widens the literal, a 32-bit peer
+  leaves a wider one alone, so `x + 0x1_0000_0000` over an `i32` still widens to i64 rather
+  than becoming a new refusal. And unary minus is NOT peeled — the literal is then an operand
+  rather than the delivered value — which is also Java's answer (`long x = -0xFFFFFFFF` is 1).
+
 - **`T | null` IS VALUE-COMPARABLE EXACTLY WHEN `T` IS** (2026-09-03, D1180). `isEquatable`
   refused every nullable field on the stated ground that "discriminating the variant would be
   required first". That is true of a MAP (no defined equality) and of a general union (two arms
