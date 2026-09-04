@@ -2,7 +2,8 @@
 // Freshness is gated by tests/std_embedded_test.ts; regenerate after any
 // std source change. See docs/std-design.md D3 for who consumes this map
 // (the LSP checkers via `withStd`, the playground) and who does NOT (the
-// CLI and the Rust host read the `std/` dir directly).
+// CLI reads a std DIRECTORY when it has one — scripts/vl-host/src/std_embedded.rs
+// is its own copy of this same tree, written by the same generator).
 
 /** Module key (`std:NAME`) → that std module's source. */
 export const STD_SOURCES: Record<string, string> = {

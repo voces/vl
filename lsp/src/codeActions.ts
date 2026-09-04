@@ -293,7 +293,7 @@ export type FixableDiagnostic = {
 //
 // `expect(1 + 2).toEqual(3)` needs `toEqual` imported, because VL resolves a UFCS
 // call against names IN SCOPE and never by looking into the receiver's module
-// (DECISIONS.md, owner 2026-09-02). Today the compiler reports `no field 'toEqual'
+// (DECISIONS.md, owner 2026-09-02). The compiler USED to report `no field 'toEqual'
 // on Expectation<i32>` — true, and useless to someone who has not met the rule.
 // The fix that helps is the import, and the CHECKER already decided which modules
 // could supply it: the diagnostic's `data` carries them, so this file needs no

@@ -501,6 +501,159 @@ Deno.test({
   }
 });
 
+// ── D1570: the `ufcs-not-method` PAYLOAD ────────────────────────────
+// The NEAR MISS D1230 does not cover. `ufcs-not-imported` fires when the name is a
+// `self`-function in a module this file does not import; this one fires when the name is
+// already IN SCOPE and the UFCS rule turned it down anyway — a first parameter that is not
+// named `self`, an arity outside the range, or a `self` of another type.
+//
+// `reason` IS THE FIELD A QUICK-FIX DISPATCHES ON, so the rename is offered for `self-name`
+// and for nothing else; `declLine`/`declCol` are where that rename lands. Both are here so
+// no consumer has to parse the sentence, which is free to improve.
+
+Deno.test({
+  name: "diag-code: a non-`self` first parameter carries `ufcs-not-method` + payload",
+  ignore,
+}, () => {
+  const exp = instantiate();
+  const { rc, diags } = check(
+    exp,
+    [
+      "type Cursor = { pos: i32 }",
+      "function skipTags(c: Cursor): i32 { return c.pos + 1 }",
+      "const cur: Cursor = { pos: 3 }",
+      "print(cur.skipTags())",
+      "",
+    ].join("\n"),
+  );
+  if (rc !== 2) throw new Error(`expected rc 2 (type stage), got ${rc}`);
+  if (diags.length !== 1) {
+    throw new Error(`expected 1 diagnostic, got: ${JSON.stringify(diags)}`);
+  }
+  if (diags[0].code !== "ufcs-not-method") {
+    throw new Error(
+      `expected the bare category, got: ${JSON.stringify(diags[0])}`,
+    );
+  }
+  // `declLine` is 1-based and `declCol` 0-based — the front end's own convention, the one
+  // `diagLine`/`diagCol` carry. It points at the PARAMETER, which is what a rename edits.
+  sameData(
+    diags[0].data,
+    {
+      member: ["skipTags"],
+      recv: ["Cursor"],
+      reason: ["self-name"],
+      param: ["c"],
+      declLine: ["2"],
+      declCol: ["18"],
+    },
+    "the `self`-name gate",
+  );
+  if (
+    !diags[0].message.includes("its first parameter is named `c`, not `self`")
+  ) {
+    throw new Error(
+      `expected the rule in the sentence, got: ${JSON.stringify(diags[0])}`,
+    );
+  }
+});
+
+Deno.test({
+  name: "diag-code: a `self` of another type reports `receiver`, not a missing field",
+  ignore,
+}, () => {
+  const exp = instantiate();
+  const { rc, diags } = check(
+    exp,
+    [
+      "type Cursor = { pos: i32 }",
+      "type Span = { lo: i32, hi: i32 }",
+      "function widen(self: Span): i32 { return self.hi - self.lo }",
+      "const cur: Cursor = { pos: 3 }",
+      "print(cur.widen())",
+      "",
+    ].join("\n"),
+  );
+  if (rc !== 2) throw new Error(`expected rc 2 (type stage), got ${rc}`);
+  if (diags.length !== 1) {
+    throw new Error(`expected 1 diagnostic, got: ${JSON.stringify(diags)}`);
+  }
+  if (diags[0].code !== "ufcs-not-method") {
+    throw new Error(
+      `expected the bare category, got: ${JSON.stringify(diags[0])}`,
+    );
+  }
+  // `param` is `self` here and the RENAME is not the fix — `reason` is what says so.
+  sameData(
+    diags[0].data,
+    {
+      member: ["widen"],
+      recv: ["Cursor"],
+      reason: ["receiver"],
+      param: ["self"],
+      declLine: ["3"],
+      declCol: ["15"],
+    },
+    "the receiver gate",
+  );
+});
+
+Deno.test({
+  name:
+    "diag-code: an unresolved member with no function of that name keeps the plain sentence",
+  ignore,
+}, () => {
+  const exp = instantiate();
+  // THE CONTROL for D1570, the twin of D1230's. `nowhere` is not a field and not a function,
+  // so no code and no payload — an enrichment that fired here would have widened into every
+  // missing member, which is the one way this can be wrong with every fixture still green.
+  const { rc, diags } = check(
+    exp,
+    [
+      "type Cursor = { pos: i32 }",
+      "const cur: Cursor = { pos: 3 }",
+      "print(cur.nowhere())",
+      "",
+    ].join("\n"),
+  );
+  if (rc !== 2) throw new Error(`expected rc 2 (type stage), got ${rc}`);
+  if (diags.length !== 1) {
+    throw new Error(`expected 1 diagnostic, got: ${JSON.stringify(diags)}`);
+  }
+  if (diags[0].code !== "") {
+    throw new Error(`expected an empty code, got: ${JSON.stringify(diags[0])}`);
+  }
+  sameData(diags[0].data, {}, "an uncoded diagnostic");
+  if (!diags[0].message.includes("no field 'nowhere' on Cursor")) {
+    throw new Error(
+      `expected the plain member sentence, got: ${JSON.stringify(diags[0])}`,
+    );
+  }
+});
+
+Deno.test({
+  name: "diag-code: `ufcs-not-imported` still wins when the name is not in scope",
+  ignore,
+}, () => {
+  const exp = instantiate();
+  // PRECEDENCE, pinned. Both enrichments read the same member node, and D1230's answer is
+  // the actionable one when the name can be imported — so it is asked first, and that has
+  // to stay true as D1570's bank grows.
+  const { rc, diags } = checkGraph(
+    exp,
+    "/w/entry.vl",
+    'import { box } from "./lib"\nprint(box(5).area())\n',
+    { "/w/lib.vl": LIB_SRC },
+  );
+  if (rc !== 2) throw new Error(`expected rc 2 (type stage), got ${rc}`);
+  if (diags.length !== 1) {
+    throw new Error(`expected 1 diagnostic, got: ${JSON.stringify(diags)}`);
+  }
+  if (diags[0].code !== "ufcs-not-imported") {
+    throw new Error(`D1230 must keep winning, got: ${JSON.stringify(diags[0])}`);
+  }
+});
+
 // ── the decoder itself, with no seed ─────────────────────────────────────────
 // `decodeDiagData` is the reader every TS consumer uses, so its edge cases are
 // pinned where the format is documented rather than in whichever consumer noticed
