@@ -169,6 +169,7 @@ import {
   tyLitMemberTexts,
   tyLitSetMemberLexes,
   tyLitUnionAliasIx,
+  tyMutEpoch,
   tyNestedArrLeafRenders,
   tyPrimNameOf,
   tySame,
@@ -18414,6 +18415,84 @@ export function globalNameIsNonConstSid(sid: i32) {
   globalIsNonConst(globalLetOfSid(sid))
 }
 
+// ── THE `globalCellKind` WALK MEMO (D1513) ───────────────────────────────────
+// This ladder RE-ENTERS itself: a rung asks an `expr*` predicate, the predicate reaches a
+// referenced module global, and that global's kind comes back through here. Each of the ~40
+// rungs asks the same referenced global its own question, so one link in a global→global
+// reference chain MULTIPLIES the work rather than adding to it — until the compiler exhausts
+// the GC heap and TRAPS on a `vl check`-clean program (D1513, which grades the scaling).
+//
+// TWO LAYERS, and both are needed. WITHIN one walk the columns always hold — that is what
+// collapses the exponential. ACROSS walks they survive only while the generation does:
+// `repCanonKey`'s idiom, widened, because this ladder reads the collect tables as well as the
+// arena and `collectS`'s in-flight rows are the `repScanLim` hazard. A walk that moves its own
+// generation drops the columns at the top rather than banking an answer under either.
+let gckHave: i32[] = []
+let gckVal: VKind[] = []
+let gckDepth = 0
+let gckGenTy = -1
+let gckGenS = -1
+let gckGenSF = -1
+let gckGenU = -1
+let gckGenV = -1
+let gckGenN = -1
+
+// Has any input the ladder reads moved since the columns were stamped? The arena's in-place
+// epoch plus the LENGTH of every append-only collect table a rung consults.
+function gckStale() {
+  if gckGenTy != tyMutEpoch { return true }
+  if gckGenS != sNames.length { return true }
+  if gckGenSF != sFieldCount.length { return true }
+  if gckGenU != unNames.length { return true }
+  if gckGenV != uVariants.length { return true }
+  gckGenN != P.nodes.length
+}
+
+function gckStamp() {
+  gckGenTy = tyMutEpoch
+  gckGenS = sNames.length
+  gckGenSF = sFieldCount.length
+  gckGenU = unNames.length
+  gckGenV = uVariants.length
+  gckGenN = P.nodes.length
+  0
+}
+
+export function globalCellKind(letIx: i32): VKind {
+  if letIx < 0 { return "i32" }
+  // Only the TOP of a walk re-stamps: inside one, the columns are what stops the ladder
+  // re-deriving the same global once per rung, which is the exponential.
+  if gckDepth == 0 {
+    if gckStale() {
+      gckHave = []
+      gckVal = []
+      gckStamp()
+    }
+  }
+  if letIx < gckHave.length {
+    if gckHave[letIx] != 0 { return gckVal[letIx] }
+  }
+  gckDepth = gckDepth + 1
+  const k = globalCellKindGo(letIx)
+  gckDepth = gckDepth - 1
+  while gckHave.length <= letIx {
+    gckHave.push(0)
+    gckVal.push("i32")
+  }
+  gckHave[letIx] = 1
+  gckVal[letIx] = k
+  // A rung that re-parses a spelling MINTS rows, so a walk can move its own generation. Drop
+  // the columns at the top when it did: nothing computed under the old one may persist.
+  if gckDepth == 0 {
+    if gckStale() {
+      gckHave = []
+      gckVal = []
+      gckStamp()
+    }
+  }
+  k
+}
+
 // The `fbValtype` kind for a module global's CELL. When the binding has a TYPE
 // ANNOTATION (const init OR not), the kind is derived from that annotation via the
 // `letIs*` ladder — so a global agrees with a same-typed local/param/field on its
@@ -18424,7 +18503,7 @@ export function globalNameIsNonConstSid(sid: i32) {
 // meaningless (member/index/call), so it likewise rides the annotation ladder. Mirrors
 // `buildLocals`' annotation→kind ladder (map 6, string-array 7, ref-array 5, struct 1,
 // array 2, string 3, else i32 0).
-export function globalCellKind(letIx: i32): VKind {
+function globalCellKindGo(letIx: i32): VKind {
   const d = P.nodes[letIx]
   if d is LetDecl {
     if globalHasTypeAnn(letIx) {
@@ -21575,7 +21654,7 @@ export function anonFieldCode(valIx: i32) {
   const anonTy = nodeTyIxOf(valIx)
   const anonArena = fieldCodeOfTy(anonTy)
   if anonArena != -2 {
-    if !anonCodeIsSelfContained(anonArena) { return -1 }
+    if !anonCodeAdmitsValue(anonArena, valIx) { return -1 }
     return anonArena
   }
   const tn = nodeTyName(valIx)
@@ -21589,8 +21668,25 @@ export function anonFieldCode(valIx: i32) {
   // type the checker cannot spell here (an unsolved parameter, a hole) out of both paths.
   // Dual-run over the corpus, the two rungs split the reaches between them and never disagree.
   const c = nameFieldCodeTy(tn, anonTy)
-  if !anonCodeIsSelfContained(c) { return -1 }
+  if !anonCodeAdmitsValue(c, valIx) { return -1 }
   c
+}
+
+// The struct ROW a code-5 (struct-ref list) field's ELEMENT names, read from the ARENA — or -1.
+//
+// D1443 built the code-5 pair for one PRODUCER of that list: an array LITERAL of object
+// literals, whose elements already carry rows. Every other producer of the same list — a call
+// result, a bound list handed on by name, a field read — fell to -1, so the OWNER literal got
+// no row at all and refused with a sentence about its own field count. The type is not missing:
+// the checker recorded `Rec[]` on the field value, and `repRowOfTyStruct` is this compiler's
+// home for turning that element type into the row the emitter interns through. D1515.
+function anonRefListElemRow(valIx: i32): i32 {
+  if valIx < 0 { return -1 }
+  const ty = nodeTyIxOf(valIx)
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyArray { return repRowOfTyStruct(t.aElem, sScanLim()) }
+  -1
 }
 
 // Is field code `c`'s wasm slot decided by the CODE ALONE, with no COMPANION column beside it?
@@ -21611,6 +21707,15 @@ function anonCodeIsSelfContained(c: i32) {
     return true
   }
   c == 14
+}
+
+// The admission rule the recorded-type rung actually applies: `anonCodeIsSelfContained`, PLUS
+// the one code that needs a companion and can now supply it. The gate above stays a property
+// of the CODE; this is the pair the header there demands — "widening the set means widening
+// `anonFieldElemName` in the same change" — stated where the value is in hand. D1515.
+function anonCodeAdmitsValue(c: i32, valIx: i32) {
+  if anonCodeIsSelfContained(c) { return true }
+  c == 5 && anonRefListElemRow(valIx) >= 0
 }
 
 // The SYNTAX half of `anonFieldCode` — the field value's own literal form. Kept separate
@@ -21763,6 +21868,11 @@ export function anonFieldElemName(valIx: i32, code: i32) {
       const esi = structIndexOfObj(av.arrElems[0])
       if esi >= 0 { return sNames[esi] }
     }
+    // D1515 — THE ARENA, once the literal route has declined. A list produced by anything but
+    // an array literal of object literals (a call, a bound list, a field read) has no element
+    // NODE to read a row off, and the recorded element type names the same row.
+    const ari = anonRefListElemRow(valIx)
+    if ari >= 0 { return sNames[ari] }
     return ""
   }
   if code != 15 { return "" }
