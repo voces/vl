@@ -1393,6 +1393,54 @@ function arrDefOperandElemPeek(exprIx: i32) {
   -1
 }
 
+// The array row an enclosing index store is about to pin, live only while that store's value is
+// checked; -1 everywhere else.
+let asgOpenElemRow = -1
+
+// The row of an index store's receiver when its element is still open — the row a value in the
+// store's own right-hand side may pin. -1 for every other target.
+function asgOpenElemRowOf(tgtIx: i32) {
+  if tgtIx < 0 { return -1 }
+  const g = P.nodes[tgtIx]
+  if g is Index {
+    const at = nodeTyIxOf(g.idxArr)
+    if at < 0 { return -1 }
+    const t = T.tys[at]
+    if t is TyArray {
+      if t.aElem < 0 { return at }
+    }
+  }
+  -1
+}
+
+// Pin `asgOpenElemRow`'s open element from a store's value type `vt` when `exprIx` reads that same
+// row, and answer the element's value type; -1 when it is some other read. A store whose value
+// reads the place it writes (`xs[i] += v`, or that spelled out) has no other moment to pin: the
+// read answers `-1`, the operator floor turns that into `TY_ERR`, and the store banks it. D1603.
+function asgReadElemPin(exprIx: i32, vt: i32) {
+  if asgOpenElemRow < 0 || exprIx < 0 { return -1 }
+  if vt < 0 || vt == TY_ERR || vt == TY_VOID { return -1 }
+  if tyHasHole(vt) { return -1 }
+  const e = P.nodes[exprIx]
+  if e is Index {
+    if nodeTyIxOf(e.idxArr) != asgOpenElemRow { return -1 }
+    const t = T.tys[asgOpenElemRow]
+    if t is TyArray {
+      if t.aElem >= 0 { return -1 }
+      t.aElem = vt
+      tyMutEpoch = tyMutEpoch + 1 // the store's own value pinned the element in place
+      const el = arrElemValueTy(vt)
+      // The read's recorded type too, for `arrDefOperandElemPeek`'s reason: `checkNode` banked
+      // the `-1` a moment ago and the emitter reads that entry.
+      if !inferQuiet {
+        if exprIx < nodeTyIx.length { nodeTyIx[exprIx] = el }
+      }
+      return el
+    }
+  }
+  -1
+}
+
 // D1512 — the one place an unpinned intrinsic hole acquires its element: whatever the link graph
 // can still reach (`resolveHoleLinks`, run first), else the `i32` default. Returns the row's
 // element after the pin, or -1 when the row is not an array. Both sites that default such a hole
@@ -33124,7 +33172,13 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
   // read to `(i32) => i32 | null`, then seeds `q2: i32`). Without it the bare `(q2) => …` default is
   // an uninferable-param reject. Mirrors the `=` seeding; the LHS non-null shape drives the lambda.
   if op == "??" { seedExpected(n.binRight, lt) }
+  // Name the row an index store is about to pin, for the length of that store's value only, so a
+  // read of the same place inside the value can pin the element rather than answer `TY_ERR`.
+  const savedAsgRow = asgOpenElemRow
+  asgOpenElemRow = -1
+  if op == "=" { asgOpenElemRow = asgOpenElemRowOf(n.binLeft) }
   let rt = checkNode(n.binRight)
+  asgOpenElemRow = savedAsgRow
   // The RIGHT operand takes the same answer, for the same reason and under the same bar. The
   // guard below covers only `lt`, so without this `print(1 + a[0])` refuses where its annotated
   // face runs and `print("v=" + a[0])` is check-clean INVALID WASM. D1566.
@@ -33132,6 +33186,15 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
     if rt < 0 {
       const peekR = arrDefOperandElemPeek(n.binRight)
       if peekR >= 0 { rt = peekR }
+    }
+    // A store's value reading the place it writes: the value is what the program said the
+    // element is, and the read has no answer of its own until this pins one.
+    if lt < 0 {
+      const asgPin = asgReadElemPin(n.binLeft, rt)
+      if asgPin >= 0 {
+        lt = asgPin
+        ltOut[0] = asgPin // the out-column is the left operand's exact type, pin included
+      }
     }
   }
   // The `??` DEFAULT is the value the expression yields when the LHS is null, so a `void`
