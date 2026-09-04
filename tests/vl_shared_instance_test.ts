@@ -47,20 +47,22 @@ const VICTIM = Deno.readTextFileSync(
 );
 
 Deno.test({
-  name: "shared-instance: D1380's pair still leaks — pinned so the day it stops is visible",
+  name: "shared-instance: D1380's pair no longer leaks — the poisoner's variant seed is cleared",
   ignore: !assertSeed(),
   fn: () => {
     if (alone(POISONER) !== 0) throw new Error("the poisoner must compile clean alone");
     if (alone(VICTIM) !== 0) throw new Error("the victim must compile clean alone");
     const [p, v] = shared([POISONER, VICTIM]);
     if (p !== 0) throw new Error(`poisoner rc ${p} on the shared instance, want 0`);
-    // WHEN D1380 CLOSES, CHANGE THIS TO `v !== 0`. Pinned as still-leaking rather than
-    // deleted: a test asserting the bug is what makes the fix legible as a fix, and the
-    // alternative — no test — is how this survived every gate until now.
-    if (v === 0) {
+    // CLOSED by D1563. The poisoner's `const gn: Circle | null = null` is a `nulvariant`
+    // cell, so the start-fn init loop seeded `pendingVariantIdx` with `Circle`'s arm index
+    // and never cleared it; the seed is module-level emit state, which `modReset()` does not
+    // reach, so the NEXT program's object literal built that stale arm. The assertion is now
+    // the fixed direction — a test asserting the bug is what made the fix legible as a fix.
+    if (v !== 0) {
       throw new Error(
-        "D1380 appears FIXED: the victim now compiles after the poisoner. " +
-          "Flip this assertion to `v !== 0` and close the row.",
+        `D1380 REGRESSED: victim rc ${v} after the poisoner on one instance, want 0. ` +
+          "Some boundary is arming an emit seed it does not clear (see D1563).",
       );
     }
   },
