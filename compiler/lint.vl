@@ -192,10 +192,11 @@ export function lint(progRoot: i32) {
     lintWalk(lintRuleUnionLetNoMelt, progRoot)
     lintWalk(lintRuleUnusedPureExpr, progRoot)
     // Not walks: neither comments, nor a loop's SHAPE, nor a ladder's DEFAULT is in the
-    // arena. All three read the source the driver set, and `commentBudget` consumes it,
-    // so it runs last.
+    // arena. All four read the source the driver set, and `commentBudget` consumes it,
+    // so it runs last — after the std audience pass, which reads the same text.
     arenaScanLint()
     kindLadderLint()
+    stdCommentAudience()
     commentBudget()
   }
   lintCodes.length
@@ -2192,6 +2193,232 @@ function commentBudget() {
       cited,
       cbIsHeader(seenCode, headerTaken),
     )
+  }
+  0
+}
+
+// ── std-comment-audience ─────────────────────────────────────────────────────
+//
+// A std comment is API SURFACE: the person reading it imports the module, so a
+// header says what the module is for in a few lines, an export's doc comment
+// says what it does and what its edges are, and nothing cites a defect row, a
+// pull request, a date or the vocabulary of how VL is BUILT — that material
+// belongs in `docs/internals/`. Rubric: `docs/internals/std-api-review.md` §4.
+//
+// Scoped to `std/` by the module path the driver sets beside the source, so
+// every other tree keeps only the ordinary comment budget above.
+const scaHeaderBudget = 10
+const scaDocBudget = 4
+
+// The path or module key the current source belongs to. CONSUMED by the scan,
+// so a caller that forgets the setter lints nothing rather than grading this
+// module against the previous one's path.
+let scaPath = ""
+export function lintSetPath(p: string) {
+  scaPath = p
+  0
+}
+
+// Whether `p` names a VL std module: the `std:` KEY the graph walk hands over, or
+// a target rooted at `std/` — which is how `lint-self.sh`'s `vl check std/` names
+// each file. A bare `/std/` ANYWHERE was tried and dropped: it would hold someone
+// else's `src/std/` to this rubric, and this rule is about VL's own std. ONE
+// residue is accepted knowingly: a user with their own top-level `std/` still
+// matches, and keying on the module key alone costs the gate its own scoping.
+function scaIsStd(p: string): boolean {
+  const b = p.length
+  cbAt(p, 0, b, "std/") || cbAt(p, 0, b, "std:")
+}
+
+// `cbWordIs` folding the SOURCE side's case, so `DECISIONS` and `decisions` are
+// the same word.
+function scaWordIsI(s: string, i: i32, b: i32, w: string) {
+  if cbWordAt(s, i - 1, b) { return false }
+  cbAtI(s, i, b, w) && !cbWordAt(s, i + w.length, b)
+}
+
+// The letters the jargon words start with, so the whole list is consulted only
+// where one could begin.
+function scaJargonStart(c: i32) {
+  c == 'd' ||
+    c == 'D' ||
+    c == 'i' ||
+    c == 'I' ||
+    c == 'e' ||
+    c == 'E' ||
+    c == 'a' ||
+    c == 'A' ||
+    c == 'r' ||
+    c == 'R'
+}
+
+// A word that names how VL is BUILT rather than how it is used.
+function scaJargonAt(s: string, i: i32, b: i32) {
+  scaWordIsI(s, i, b, "decisions") ||
+    scaWordIsI(s, i, b, "inventory") ||
+    scaWordIsI(s, i, b, "emitter") ||
+    scaWordIsI(s, i, b, "emitters") ||
+    scaWordIsI(s, i, b, "arena") ||
+    scaWordIsI(s, i, b, "arenas") ||
+    scaWordIsI(s, i, b, "rep") ||
+    scaWordIsI(s, i, b, "reps")
+}
+
+// `#` + 3-4 digits as a whole token — a pull-request number.
+function scaPrAt(s: string, i: i32, b: i32) {
+  if s[i] != '#' { return false }
+  const e = cbPlainDigitsEnd(s, i + 1, b)
+  e - i - 1 >= 3 && e - i - 1 <= 4
+}
+
+// The first thing on the comment line `[a, b)` a consumer should not have to
+// read, named as a phrase — or "" when the line is clean.
+function scaLineTell(s: string, a: i32, b: i32): string {
+  let i = a
+  while i < b {
+    const c = s[i]
+    if c == 'D' && cbRowIdAt(s, i, b) { return "an inventory row id" }
+    if c == '#' && scaPrAt(s, i, b) { return "a pull-request number" }
+    if cbIsDigit(c) && cbDateAt(s, i, b) { return "a date" }
+    if scaJargonStart(c) && scaJargonAt(s, i, b) {
+      return "compiler-internal vocabulary"
+    }
+    i = i + 1
+  }
+  ""
+}
+
+// Report one finished block. `hdr` = it is the module header; `isExp` = the next
+// declaration is an `export`, so the block documents one.
+function scaReport(
+  n: i32,
+  ln: i32,
+  co: i32,
+  tell: string,
+  tellLine: i32,
+  hdr: i32,
+  isExp: i32,
+) {
+  if hdr == 1 && n > scaHeaderBudget {
+    lintEmitAtPos(
+      "std-comment-audience",
+      "a std module header of " +
+        cbNumStr(n) +
+        " lines exceeds the " +
+        cbNumStr(scaHeaderBudget) +
+        "-line budget — say what the module is for, how to import it, and what it deliberately does not do; the rest belongs in docs/internals/",
+      "warning",
+      ln,
+      co,
+    )
+  }
+  if hdr == 0 && isExp == 1 && n > scaDocBudget {
+    lintEmitAtPos(
+      "std-comment-audience",
+      "a std doc comment of " +
+        cbNumStr(n) +
+        " lines exceeds the " +
+        cbNumStr(scaDocBudget) +
+        "-line budget — say what the export does, what its arguments mean, what it returns, and the edge case a caller must know",
+      "warning",
+      ln,
+      co,
+    )
+  }
+  if tell.length > 0 {
+    lintEmitAtPos(
+      "std-comment-audience",
+      "a std comment cites " +
+        tell +
+        " — std is API surface, read by a consumer of VL; move the compiler-internal material to docs/internals/",
+      "warning",
+      tellLine,
+      co,
+    )
+  }
+  0
+}
+
+// Walk the source line by line, resolving each block against what FOLLOWS it: a
+// block whose next non-blank line declares an `export` documents that export and
+// takes the tighter budget. A block followed by another comment block documents
+// nothing, so a section banner is not held to it. O(bytes), like the scan above.
+function stdCommentAudience() {
+  const p = scaPath
+  scaPath = ""
+  if !scaIsStd(p) { return 0 }
+  const s = cbSource
+  let i = 0
+  let line = 1
+  let n = 0
+  let blockLine = 0
+  let blockCol = 0
+  let tell = ""
+  let tellLine = 0
+  let pend = 0
+  let pendHdr = 0
+  let seenCode = 0
+  let headerTaken = 0
+  let inImport = 0
+  while i <= s.length {
+    let e = i
+    while e < s.length && s[e] != '\n' { e = e + 1 }
+    let le = e
+    if le > i && s[le - 1] == '\r' { le = le - 1 }
+    let k = i
+    while k < le && (s[k] == ' ' || s[k] == '\t') { k = k + 1 }
+    if k + 1 < le && s[k] == '/' && s[k + 1] == '/' {
+      // A new block starting while one is pending settles the pending one: what
+      // follows it is a comment, not a declaration.
+      if pend == 1 {
+        scaReport(n, blockLine, blockCol, tell, tellLine, pendHdr, 0)
+        pend = 0
+        n = 0
+        tell = ""
+      }
+      if n == 0 {
+        blockLine = line
+        blockCol = k - i
+      }
+      n = n + 1
+      if tell.length == 0 {
+        const t = scaLineTell(s, k, le)
+        if t.length > 0 {
+          tell = t
+          tellLine = line
+        }
+      }
+    } else {
+      if n > 0 && pend == 0 {
+        pendHdr = cbIsHeader(seenCode, headerTaken)
+        if pendHdr == 1 { headerTaken = 1 }
+        pend = 1
+      }
+      if k < le {
+        if pend == 1 {
+          let isExp = 0
+          if cbAt(s, k, le, "export ") { isExp = 1 }
+          scaReport(n, blockLine, blockCol, tell, tellLine, pendHdr, isExp)
+          pend = 0
+          n = 0
+          tell = ""
+        }
+        if inImport == 1 {
+          if cbFind(s, k, le, "} from ") { inImport = 0 }
+        } else if cbAt(s, k, le, "import ") {
+          if !cbFind(s, k, le, " from ") { inImport = 1 }
+        } else {
+          seenCode = 1
+        }
+      }
+    }
+    i = e + 1
+    line = line + 1
+  }
+  // A file with no trailing newline can end inside a block the loop never closed.
+  if pend == 0 && n > 0 { pendHdr = cbIsHeader(seenCode, headerTaken) }
+  if pend == 1 || n > 0 {
+    scaReport(n, blockLine, blockCol, tell, tellLine, pendHdr, 0)
   }
   0
 }
