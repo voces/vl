@@ -2707,6 +2707,19 @@ seed from current `compiler/*.vl` in ~40s.*
 ## Track F — Infrastructure & hygiene
 *Independent; do continuously.*
 
+- ⬜ **F-day-one. Grow the day-one sampler's grammar, and aim the next run by hit rate.**
+  `scripts/day-one/` generates ORDINARY programs in PAIRS and grades agree/disagree, which is
+  the only instrument here that can find a shape nobody named — the others each sample a
+  population somebody already wrote down. First run (2026-09-03, 640 programs) filed D1474,
+  D1475 and D1476 and reproduced both of its controls. **What it cannot sample is the whole
+  backlog**: no multi-parameter generics, no recursive types, no multi-module programs, no
+  `match`, no operator overloading, no `std:json`/`buffer`/`fs`, no mixed-width arithmetic,
+  nothing over ~25 lines, and nothing whose expected output Python cannot compute. Each is one
+  record in `grammar.py`. Aim by the per-feature rate the run prints — `discriminant` 27.8%,
+  `is_narrow` 26.1%, `closure_capture` 17.9% at the top; `scalar`, `string`, `forin`,
+  `map_value`, `global_init` at zero. Details and the untriaged hit list:
+  `docs/internals/day-one-sampler.md`.
+
 - ✅ **F2. Gate debug `console.log`s** — moot: `toWasm.ts` is deleted (the `.vl` emitter has no such logs).
 - ✅ **F4. Re-enable inline `m.validate()`** — moot, and superseded by something stronger.
   `m.validate()` is the **binaryen-JS `Module` API**, which no compile path uses any more: the

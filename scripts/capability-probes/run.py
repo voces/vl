@@ -55,14 +55,16 @@ def classify(chk_rc, err):
     graded `emit refuses` on the absence of one printed "Checked 1 file, no errors" as its
     detail — the symptom of a SILENT cell, not of a refusal.
     """
-    # A HINT is advice on a program that type-checked; it is never the refusal, and letting
-    # it through as the fallback labelled the SILENT probe with a note about an annotation.
+    # A HINT or a WARNING is advice on a program that type-checked; neither is ever the
+    # refusal, and letting one through as the fallback labelled a SILENT probe with a note
+    # about an annotation and a day-one emit reject with `Unused variable`.
     # `Checked N files, no errors.` and a bare `Error: emit error` are scenery for the same
     # reason: the first is the CHECK phase's success and the second names no cause, and both
     # sort ahead of the sentence, so an emit reject's detail read "no errors".
     lines = [re.sub(r"^\S+?:\d+:\d+:\s*", "", l).strip() for l in err.splitlines()
-             if "[HINT]" not in l and not l.startswith(" ")
-             and not re.match(r"^Checked \d+ file|^Error: \w+ error\s*$", l)]
+             if "[HINT]" not in l and "[WARNING]" not in l and not l.startswith(" ")
+             and not re.match(r"^Checked \d+ file|^Found \d+ error|"
+                              r"^Error: \w+ error\s*$", l)]
     lines = [l for l in lines if l and l != "[ERROR]:"]
     m = re.search(r"(not yet supported|has no lowering|not supported by codegen)"
                   r"[^\n\"]{0,54}", err)
