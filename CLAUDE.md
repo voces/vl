@@ -22,6 +22,17 @@ compared.
 Not required for: a change that only touches a std function BODY without altering its
 signature, name, or documented behaviour.
 
+**A std COMMENT is API surface, written for a CONSUMER of VL** (owner ruling, 2026-09-03,
+after the headers had grown into internal commentary). Header at most **10 lines** — what
+the module is for, how to import it, what it deliberately does not do. Every `export` gets
+**1 to 4 lines** directly above it: what it does, what its arguments mean, what it returns,
+and the edge case a caller must know. A private helper gets 0 or 1. Anything true about the
+COMPILER rather than the API — a defect id, a PR number, a date, a mechanism, an argument
+with an earlier version of the file — leaves std for `docs/internals/std-notes.md`, and
+**std does not link there**. `std-comment-audience` in `compiler/lint.vl` enforces the
+mechanical half (module-scoped to `std/`, **no baseline**: it landed at zero and stays
+there); the rest is the review's, and the full rubric is `std-api-review.md` §4.
+
 ## Agent concurrency — the cap was calibrated against a run nobody makes any more
 
 **Up to 6 concurrent worktree agents at `JOBS=6` / `DENO_JOBS=4`.** The old cap of 3 came from an

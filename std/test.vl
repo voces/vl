@@ -1,118 +1,58 @@
-// `std:test` v2 — the in-language testing surface (docs/internals/std-design.md D5), in two
-// halves over the intrinsic floor:
-//   1. REGISTRATION — jest-shaped `describe`/`it`/`beforeEach`/`afterEach`. Calling
-//      them at a file's top level REGISTERS into the parallel arrays below and does
-//      nothing else; the wasm start function runs that top level at instantiation,
-//      after which the registry is complete (two-phase collection — `describe`
-//      bodies are REGISTRATION-ONLY, the Deno-steps lesson).
-//   2. ASSERTION — `expect(...)` matchers, read jest-shaped through STRUCT-RECEIVER
-//      UFCS: `.toEqual` is a free `self`-function resolved by self+arity, a RANGE of
-//      arities since the matchers grew a defaulted `caller` tail. A failed assertion
-//      records its message and calls `__trap__()`; a passing one is a no-op.
+// `std:test` — the in-language test surface.
 //
-// The `vlt*` exports at the bottom are the RUNNER PROTOCOL: the host reads the
-// registry through them and drives one test per call, which is what buys per-test
-// trap isolation, output attribution and filtering (docs/internals/test-runner-design.md).
-// `vl test` appends the re-export line; under bare `vl run` green exits 0, red aborts.
+//     import { describe, it, beforeEach, expect } from "std:test"
 //
-// `expect` is GENERIC — `expect<T>(value: T)` builds an `Expectation<T>`, so ONE
-// entry point covers every `==`-comparable value rather than v1's enumerated
-// `i32 | i64 | f64 | boolean | string`. `.toEqual` compares with the SAME `==` the
-// operands get outside a test, with ONE class of exception: a union T holding a
-// NON-ATOM member is check-clean invalid wasm where v1 refused it loudly at check
-// (the D941 family, inventory D947). By design, a cross-variant pair
-// (`expect(4).toEqual("4")`) is now a COMPILE-TIME refusal since no single T fits
-// both operands, a literal-union receiver keeps its own T and renders the
-// `<value>` sentinel, and a failure emits a SECOND LINE `  at <file>:<line>:<col>`.
-//
-// THE RECEIPT IS EAGER, and that deviation is chosen. The five atoms keep v1's
-// exact rendering; any other T renders the honest sentinel `"<value>"` until
-// reflection exists. Every T-dependent fact is computed ONCE inside `expect` from
-// the RAW parameter, because the LAZY spellings are the miscompiling ones (D941
-// re-forwards a generic param, D942 mis-answers `is` on the carrier field, D943
-// captures the generic value, D944 widens then narrows), so the render ladder lives
-// once in `vltShow<T>(value: T)` over a raw value. The private `VltAtomReps` alias
-// is the same family: an `is`-atom arm a union T cannot hold is dead but still
-// EMITS and needs an atom value box a module mints only for its own unions (D947).
-//
-// ONE VL RULE GOVERNS THIS FILE'S SHAPE: a function's result type is its TAIL
-// statement's and a test BODY is `() => void`, so every function a body can end
-// with must be void — hence `vltDone()` and matchers closing with a call, not an `if`.
+// Calling `describe`/`it`/`beforeEach`/`afterEach` at a file's top level
+// REGISTERS; nothing runs until `vl test` drives the file. `expect(value)`
+// builds the receiver for the matchers, which read as methods:
+// `expect(x).toEqual(y)`. A failed assertion aborts that one test and reports
+// its own call site; a passing one does nothing. The `vlt*` exports at the
+// bottom are the runner's protocol, not part of the authoring surface.
 
-// ── WHERE THE FAILURE HAPPENED — `CallerLoc` and the one-hop rule ──────────────
-// A failed assertion names its own call site, through default arguments v1
-// (DECISIONS "Default arguments v1"): each MATCHER's trailing
-// `caller: CallerLoc = __callsite__` is filled by the compiler AT THE CALL, in
-// the caller's frame. THE MATCHER IS THE ANCHOR, NOT `expect` — `expect(x)` and
-// `not()` are setup and decide nothing, so `expect(x).not().toEqual(y)` anchors
-// on the FINAL matcher's token, which is where the assertion actually is. A
-// second hand-in point would need a precedence rule defaults v1 cannot express,
-// since a callee cannot tell a supplied argument from an omitted one. ONE HOP,
-// NEVER A CHAIN: a wrapper takes its own `caller: CallerLoc = __callsite__` and
-// forwards it EXPLICITLY; nothing here walks a parent link. `vltFail`'s `loc` is
-// REQUIRED, not defaulted, so a matcher added later cannot report without one.
-
-// A CALL SITE, as a value. `file` is the caller's module key — the same string
-// `vl test` prints as its file header, spelled exactly as the CLI target was;
-// `line`/`col` are 1-based and anchor on the CALLEE's own token, which is what
-// Swift's `#line` and Rust's `Location::caller()` name for the same call.
-//
-// THE NAME IS STD'S, THE SHAPE IS THE COMPILER'S: `__callsite__` is checked
-// STRUCTURALLY against exactly `{ file: string, line: i32, col: i32 }` (field
-// order free), so any identical alias satisfies it and growing `CallerLoc` is a
-// COMPILER change, not a std one. It is exported because a forwarding helper has
-// to name the type in its signature; it is not in `std:fmt` because this module's
-// dependency surface is deliberately ZERO, and not its own module because one
-// three-field alias does not earn a module key a version-locked std cannot undo.
+// A call site, as a value: `file` is the module key `vl test` prints as its
+// header and `line`/`col` are 1-based. Every MATCHER takes a trailing
+// `caller: CallerLoc = __callsite__`, which the compiler fills at the call —
+// pass it explicitly to forward a helper's own location one hop, never a chain.
 export type CallerLoc = { file: string, line: i32, col: i32 }
 
-// ── the registry ────────────────────────────────────────────────────────────────
-// PARALLEL ARRAYS, the compiler driver's own idiom (`modKeys`/`modPending`/…): one
-// entry per registered test, index `i` is the protocol's test id.
+// ── the registry ─────────────────────────────────────────────────────────────
+
+// Parallel arrays, one entry per registered test; index `i` is the runner's id.
 const vltNames: string[] = []        // the test's full path (scope > … > name)
 const vltBodies: (() => void)[] = [] // its body
 const vltSkips: i32[] = []           // 1 = registered by `itSkip`
 const vltScopes: string[] = []       // the enclosing `describe` path (hook matching)
 
-// The `describe` path currently being registered into ("" at file scope). Saved and
-// restored around each `describe` body, so nesting composes.
+// The `describe` path currently being registered into ("" at file scope), saved
+// and restored around each `describe` body so nesting composes.
 let vltScope = ""
 
-// Hooks, also parallel: each records the `describe` scope it was declared in, and
-// runs around every test at or beneath that scope.
+// Hooks, also parallel: each records the `describe` scope it was declared in,
+// and runs around every test at or beneath that scope.
 const vltBeforeScopes: string[] = []
 const vltBeforeFns: (() => void)[] = []
 const vltAfterScopes: string[] = []
 const vltAfterFns: (() => void)[] = []
 
-// The rendered message of the assertion that just aborted the running test. The
-// runner reads it AFTER catching the trap (`vltFailLen`/`vltFailAt`) — a trap
-// unwinds the call but leaves the instance readable — so a failure reports its
-// message structurally instead of being scraped out of print output.
+// The message of the assertion that aborted the running test. The runner reads
+// it AFTER catching the trap, so a failure is reported structurally.
 let vltFailMsg = ""
 
-// A VOID no-op — the tail that makes a function whose real work ends in an
-// assignment or a `.push` still type as `() -> void`. See the rule above.
+// A void no-op, so a function whose real work ends in an assignment or a push
+// still types as `() -> void`.
 function vltDone() {}
 
-// The same no-op, EXPORTED, for closing a test body whose last real statement
-// yields a value:
-//
-//   beforeEach(() => { hits = hits + 1  done() })
-//
-// Without it that body types as `() => i32` and the registration call rejects it
-// with `expected () -> void, got () -> i32`. A body ending in an `expect(…)`
-// matcher — the overwhelming majority — needs nothing. (The language-level fix is
-// void-return covariance on function values, which is not free: the array's
-// element type IS the interned `$fnsig`, so it needs a real coercion, not a
-// relaxed check. Filed in docs/internals/vl-test-design.md §Known gaps.)
+// The same no-op, exported, for closing a test body whose last statement yields
+// a value: `beforeEach(() => { hits = hits + 1  done() })`. Without it that
+// body types as `() => i32` and the registration call rejects it. A body ending
+// in an `expect(…)` matcher — nearly all of them — needs nothing.
 export function done() {}
 
-// ── registration ────────────────────────────────────────────────────────────────
+// ── registration ─────────────────────────────────────────────────────────────
 
-// Group the tests registered by `body` under `name`. REGISTRATION ONLY: the body
-// runs at collect time, so it must do nothing but declare tests and hooks (any
-// real work would run once, at the wrong time, for every test in the file).
+// Group the tests registered by `body` under `name`. REGISTRATION ONLY: the
+// body runs at collect time, so real work in it would run once, at the wrong
+// time, for every test in the file.
 export function describe(name: string, body: () => void) {
   const saved = vltScope
   if vltScope.length > 0 {
@@ -125,8 +65,8 @@ export function describe(name: string, body: () => void) {
   vltDone()
 }
 
-// The shared registration path. `path` is the scope-qualified name the report and
-// the `-t` filter both match against.
+// The shared registration path. `path` is the scope-qualified name the report
+// and the `-t` filter both match against.
 function vltRegister(name: string, body: () => void, skip: i32) {
   let path = name
   if vltScope.length > 0 { path = vltScope + " > " + name }
@@ -142,9 +82,8 @@ export function it(name: string, body: () => void) {
   vltRegister(name, body, 0)
 }
 
-// Register one test as SKIPPED — it is collected, reported, and never run (the
-// `#[ignore]`/`@Disabled` analog; `.skip` is not spellable because VL has no
-// property access on a function value).
+// Register one test as SKIPPED: it is collected and reported, and never run.
+// (`.skip` is not spellable — VL has no property access on a function value.)
 export function itSkip(name: string, body: () => void) {
   vltRegister(name, body, 1)
 }
@@ -157,18 +96,17 @@ export function beforeEach(body: () => void) {
 }
 
 // Run `body` after each test at or beneath the enclosing `describe` scope.
-// Registration order is preserved; `vltRun` fires them in REVERSE, so hooks nest
-// like scopes do (outermost `before` first, outermost `after` last).
+// These fire in REVERSE registration order, so hooks nest the way scopes do:
+// outermost `before` first, outermost `after` last.
 export function afterEach(body: () => void) {
   vltAfterScopes.push(vltScope)
   vltAfterFns.push(body)
   vltDone()
 }
 
-// Does a hook declared at scope `hook` apply to a test whose scope is `test`? The
-// file scope ("") applies to everything; otherwise `test` must be `hook` itself or
-// one of its descendants — a PATH-SEGMENT prefix test, so a `describe("list")`
-// hook does not leak into `describe("listener")`.
+// Does a hook declared at scope `hook` apply to a test whose scope is `test`?
+// The file scope applies to everything; otherwise it is a PATH-SEGMENT prefix
+// test, so a `describe("list")` hook does not leak into `describe("listener")`.
 function vltInScope(hook: string, test: string) {
   if hook.length == 0 { return 1 }
   if hook == test { return 1 }
@@ -180,20 +118,12 @@ function vltInScope(hook: string, test: string) {
   0
 }
 
-// ── assertion ───────────────────────────────────────────────────────────────────
+// ── assertion ────────────────────────────────────────────────────────────────
 
-// The RECEIPT (see the header): the value at its own type, plus every T-dependent
-// fact the matchers will need, computed once in `expect` from the raw parameter.
-//   shown    — the failure-message rendering (v1's atom forms; `"<value>"` otherwise)
-//   isBool / boolVal — `toBeTrue`/`toBeFalse` decide from these, so a non-boolean
-//              receiver keeps v1's semantics (compiles, fails at runtime)
-//   hasEcho / echo   — an f64's digits, printed on failure because the message
-//              renders f64 as `<f64>`: this module's dependency surface is zero
-//              by design, so it will not import `std:fmt` to render one
-//
-// The receipt carries NO location: the MATCHER owns it (the `CallerLoc` section
-// above), so it is the matcher's own parameter, filled at its own call, and reaches
-// `vltFail` straight from there without entering the receipt.
+// The receiver `expect` builds: the value at its own type, its rendering for a
+// failure message, and the two facts the matchers need — which boolean it
+// holds, and an f64's digits, which the message itself cannot show. It carries
+// no location: the MATCHER owns that.
 type Expectation<T> = {
   actual: T,
   negated: boolean,
@@ -204,27 +134,16 @@ type Expectation<T> = {
   echo: f64
 }
 
-// PRIVATE, and never named by a signature: its REGISTRATION is the point (the
-// header's union paragraph, inventory D947). Declaring this five-atom value
-// union mints the i32/i64/f64 value-box heap types and the string payload type
-// in every module that links std:test, so a generic `is` ladder instantiated
-// at a union T that lacks some atom still VALIDATES (the missing-atom arms are
-// dead at runtime; only their emitted casts need the types to exist). This is
-// the side effect v1's five-atom receiver union had by existing, kept as one
-// line. Remove only when D947 closes compiler-side.
+// Private and never named by a signature. Declaring it is what registers the
+// scalar value types this module's generic matchers need in every module that
+// links `std:test`, so a matcher instantiated at a type lacking one of them
+// still validates.
 type VltAtomReps = i32 | i64 | f64 | boolean | string
 
-// `expect(value)` — the receiver for the matchers. T is inferred from the
-// argument, so a call site reads exactly as it did under the v1 union. The
-// `is`-dispatch here is over the RAW parameter — the one placement today's
-// monomorphizer answers correctly for every T (see the header); the rendering
-// lives in `vltShow`, and the two arms kept here bank the receipt facts a
-// rendering cannot carry (which boolean; the f64 echo). Each non-atom
-// instantiation prunes the atom arms and keeps the defaults.
-//
-// `expect` takes no location. It is the SETUP — it decides nothing, so it
-// reports nothing — and the matcher that decides is the surface that asks
-// (the `CallerLoc` section above).
+// The receiver for the matchers. `T` is inferred from the argument, so a call
+// site reads the same for every type. The five scalar types render as
+// themselves in a failure message; anything else renders `"<value>"` until VL
+// has reflection. `expect` decides nothing, so it reports no location.
 export function expect<T>(value: T): Expectation<T> {
   let isBool = false
   let boolVal = false
@@ -249,15 +168,9 @@ export function expect<T>(value: T): Expectation<T> {
   }
 }
 
-// Inverts the pass/fail sense: `expect(5).not().toEqual(6)` passes. Returns a
-// fresh `Expectation` (the receiver is a value; no aliasing) carrying the same
-// receipt.
-//
-// NO `caller` OF ITS OWN, and that is the matcher rule holding rather than an
-// omission: `not()` decides nothing either, and the matcher after it is the one
-// that reports. `expect(1).not().toEqual(1)` anchors on the `.toEqual` token,
-// the FINAL matcher and the position the ruling names. A `caller` here would be
-// a second location for one failure with no rule saying which wins.
+// Invert the pass/fail sense: `expect(5).not().toEqual(6)` passes. It answers a
+// fresh receiver carrying the same receipt, and reports nothing itself — the
+// matcher after it is what anchors the failure location.
 export function not<T>(self: Expectation<T>): Expectation<T> {
   return {
     actual: self.actual,
@@ -271,24 +184,13 @@ export function not<T>(self: Expectation<T>): Expectation<T> {
 }
 
 // Record the rendered message and abort the test. The runner catches the trap,
-// reads `vltFailMsg` back, and continues with the next test. Void: its tail is
-// `__trap__()`, which yields nothing (and never returns).
+// reads the message back, and continues with the next test.
 function vltAbort(msg: string) {
   vltFailMsg = msg
   __trap__()
 }
 
-// One decimal digit as its character. i64 so both integer widths share the
-// renderer (i64 cannot narrow to i32, so a string-index lookup is not expressible
-// for the wide path). Mirrors `std:fmt`'s technique rather than importing it —
-// and the reason is INDEPENDENCE, not import inability (std modules do import
-// each other: `fmt` ← `str`, `utf8` ← `fmt`, measured): this is the assertion
-// surface that reports failures in everything else, `std:fmt` included. A defect
-// in fmt's renderer must not be able to corrupt the very message that reports
-// it, and the D941-family history around this module's receipt machinery says
-// keep its dependency surface at zero. The knowingly-kept copy is named in
-// `std:utf8`'s one-renderer ruling, and `tests/cases/std/renderers-agree.vl`
-// pins the two against each other at i64 min so they cannot drift silently.
+// One decimal digit as its character.
 function vltDigit(d: i64) {
   if d == 0 { return "0" }
   if d == 1 { return "1" }
@@ -302,9 +204,9 @@ function vltDigit(d: i64) {
   "9"
 }
 
-// Decimal rendering of any i64, i64 min included: the accumulator works in the
-// NEGATIVE range (positive inputs are negated first) because the negative range
-// covers i64 min, whose magnitude overflows when negated.
+// Decimal rendering of any i64, i64 min included. Kept here rather than
+// imported so this module — the surface that reports every other module's
+// failures — has no dependencies of its own to be broken by.
 function vltI64Str(v: i64) {
   if v == 0 { return "0" }
   let n = v
@@ -320,13 +222,8 @@ function vltI64Str(v: i64) {
   out
 }
 
-// THE render ladder — one home (the header): v1's exact atom forms, the
-// `"<value>"` sentinel for any other T. Generic over a RAW value, the one
-// placement today's monomorphizer answers correctly for every T measured, and
-// called from both `expect` (the receipt's `shown`) and `toEqual` (its
-// `expected` side). NO side effects: an f64 renders `<f64>` here and its
-// digits are echoed by the FAILURE paths alone, so the eager receipt call
-// cannot print.
+// The one render ladder: the scalar forms, and `"<value>"` for anything else.
+// It has no side effects — an f64's digits are echoed by the failure paths.
 function vltShow<T>(value: T): string {
   let shown = "<value>"
   if value is string { shown = "\"" + value + "\"" }
@@ -339,11 +236,8 @@ function vltShow<T>(value: T): string {
   shown
 }
 
-// `file:line:col`, or "" when the location cannot name a file. The empty case is
-// unreachable through this module — every consumer imports `std:test`, which is a
-// module table, and only a table-less single-source compile answers `""` — but a
-// message reading `at :9:1` would be worse than one with no location at all, so
-// the guard is here rather than assumed away.
+// `file:line:col`, or `""` when the location cannot name a file — a message
+// reading `at :9:1` would be worse than one with no location at all.
 function vltLocStr(loc: CallerLoc) {
   if loc.file.length == 0 { return "" }
   loc.file +
@@ -353,18 +247,10 @@ function vltLocStr(loc: CallerLoc) {
     vltI64Str(loc.col as! i64)
 }
 
-// Assemble the failure message from ALREADY-RENDERED strings and abort. Reached
-// ONLY on failure. Non-generic on purpose: everything T-shaped was resolved by
-// the callers, so this is one shared body, not one per instantiation.
-// `kind`: 0 = toEqual, 1 = toBeTrue, 2 = toBeFalse.
-//
-// The location rides on its OWN LINE, `"\n  at <file>:<line>:<col>"`, and it is
-// the LAST line. **THIS MODULE OWNS THE INVARIANT "THE LOCATION LINE IS LAST",
-// AND NOTHING MAY BE APPENDED AFTER IT** — a rendered operand is arbitrary user
-// text and can carry a perfectly anchored forgery, so the reader gets the right
-// line only because `lsp/src/testDiscovery.ts` takes the LAST match. A line
-// appended here silently re-anchors every failure in the editor; add it BEFORE
-// the location. A handed-in `CallerLoc` is the caller's CLAIM, not std's finding.
+// Assemble the failure message from already-rendered strings and abort.
+// `kind`: 0 = toEqual, 1 = toBeTrue, 2 = toBeFalse. THE LOCATION LINE IS LAST
+// AND NOTHING MAY BE APPENDED AFTER IT — the editor reads the last match, so a
+// line added here silently re-anchors every failure. Add it BEFORE the location.
 function vltFail(
   shownA: string,
   negated: boolean,
@@ -383,18 +269,10 @@ function vltFail(
   vltAbort(msg)
 }
 
-// `.toEqual` — equality at T's own `==`, jest semantics: value equality per
-// element/field wherever the language defines it. Both operands are T, so a
-// cross-variant pair (`expect(4).toEqual("4")`) refuses at compile time — see the
-// header. `self.actual` binds to a local first: `==` requires binding operands,
-// not a raw field read. The failure path renders `expected` from the raw
-// parameter (never from a field — the header's placement rule) and echoes f64
-// operands in v1's order: actual first, expected second, message last.
-// `caller` is the ONE parameter a call site normally omits: the compiler fills
-// it with THIS call's own position, which on a UFCS spelling is the `.toEqual`
-// token (the `CallerLoc` section above). Pass it explicitly to forward a
-// wrapper's location — `expect(v).toEqual(1, caller)` inside a helper that took
-// `caller: CallerLoc = __callsite__`.
+// Equality at `T`'s own `==`, jest-style: value equality per element or field
+// wherever the language defines it. Both operands are `T`, so a cross-type pair
+// (`expect(4).toEqual("4")`) is refused at compile time. `caller` is normally
+// omitted; pass it to forward a wrapper's own location.
 export function toEqual<T>(
   self: Expectation<T>,
   expected: T,
@@ -412,17 +290,9 @@ export function toEqual<T>(
   vltDone()
 }
 
-// `.toBeTrue` — the receiver holds boolean `true`. A non-boolean receiver is
-// never true (its receipt has `isBool = false`), so `expect(5).toBeTrue()` still
-// compiles and still fails at runtime with `expected 5 to be true` — v1's
-// semantics, kept. IT STAYS GENERIC (`Expectation<T>`) rather than taking the
-// strict `Expectation<boolean>`: tightening would turn that documented runtime
-// failure into a compile-time break, which is a surface decision to make on its
-// own rather than a rider, so it is DEFERRED deliberately.
-//
-// Takes the same trailing `caller: CallerLoc = __callsite__` as `toEqual` (the
-// `CallerLoc` section above). Forwarding a wrapper's location is
-// `expect(v).toBeTrue(caller)`, where it is the ONLY argument.
+// The receiver holds boolean `true`. A NON-boolean receiver is never true, so
+// `expect(5).toBeTrue()` compiles and fails at run time. Forward a wrapper's
+// location with `expect(v).toBeTrue(caller)`, where it is the only argument.
 export function toBeTrue<T>(
   self: Expectation<T>,
   caller: CallerLoc = __callsite__,
@@ -435,9 +305,8 @@ export function toBeTrue<T>(
   vltDone()
 }
 
-// `.toBeFalse` — the receiver holds boolean `false`. Non-boolean receivers fail
-// at runtime, as in `toBeTrue`. Same trailing
-// `caller: CallerLoc = __callsite__`, forwarded as `expect(v).toBeFalse(caller)`.
+// The receiver holds boolean `false`. Non-boolean receivers fail at run time,
+// as in `toBeTrue`, and `caller` forwards the same way.
 export function toBeFalse<T>(
   self: Expectation<T>,
   caller: CallerLoc = __callsite__,
@@ -450,24 +319,17 @@ export function toBeFalse<T>(
   vltDone()
 }
 
-// Fail the running test outright with `msg` — the escape hatch for a condition no
-// matcher expresses (`if !reachedTheBranch { fail("unreachable") }`). It takes NO
-// `CallerLoc` in this version: one surface at a time, and its argument is the
-// author's own sentence rather than a rendered assertion. The deferral is cheap by
-// the mechanism track-caller introduced — a trailing default is ADDITIVE, so
-// `fail(msg, caller: CallerLoc = __callsite__)` can land later without breaking a
-// caller. Until it does, `msg` is a wire format the author can WRITE: a hand-typed
-// `"\n  at /not/real.vl:1:1"` reaches the editor as a location, and std does not
-// vouch for it there.
-// No `toBe`, `toThrow` or `toBeNull` yet: they wait on `===` (ROADMAP A15), the
-// error model and `null` handling (std-design OD6).
+// Fail the running test outright with `msg` — the escape hatch for a condition
+// no matcher expresses. It takes no `CallerLoc`, so `msg` is the whole report
+// and std does not vouch for a location typed into it. No `toBe`, `toThrow`
+// or `toBeNull` yet.
 export function fail(msg: string) { vltAbort(msg) }
 
-// ── the runner protocol ─────────────────────────────────────────────────────────
-// Read by the host after instantiation (the start function has just registered
-// everything). Strings cross one code point at a time — the driver's
-// `modPendingCount`/`modPendingLen`/`modPendingAt` idiom, which the host already
-// speaks. `vl test` re-exports these into each `*.test.vl` module it compiles.
+// ── the runner protocol ──────────────────────────────────────────────────────
+
+// Read by the host after instantiation, once the start function has registered
+// everything. `vl test` re-exports these into each `*.test.vl` module it
+// compiles; a test file never calls them.
 
 // How many tests this file registered.
 export function vltCount(): i32 { vltNames.length }
@@ -482,7 +344,7 @@ export function vltNameAt(i: i32, j: i32): i32 { vltNames[i][j] }
 export function vltSkipped(i: i32): i32 { vltSkips[i] }
 
 // Run test `i` with its hook chain. 0 = passed, 1 = skipped; a FAILURE does not
-// return — the assertion traps, and the host reads `vltFail*` for the message.
+// return, because the assertion traps and the host reads the message back.
 export function vltRun(i: i32): i32 {
   vltFailMsg = ""
   if vltSkips[i] != 0 { return 1 }
@@ -508,8 +370,8 @@ export function vltRun(i: i32): i32 {
   0
 }
 
-// Code-point length of the last failure message (0 = the trap carried none, e.g. a
-// raw `__trap__()` or an out-of-bounds index rather than a failed expectation).
+// Code-point length of the last failure message. 0 means the trap carried none
+// — a bare `__trap__()` or an out-of-bounds index rather than an assertion.
 export function vltFailLen(): i32 { vltFailMsg.length }
 
 // Code point `j` of the last failure message.
