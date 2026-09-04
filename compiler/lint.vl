@@ -196,6 +196,7 @@ export function lint(progRoot: i32) {
     // so it runs last — after the std audience pass, which reads the same text.
     arenaScanLint()
     kindLadderLint()
+    sentinelIndexLint()
     stdCommentAudience()
     commentBudget()
   }
@@ -3563,5 +3564,638 @@ function kindLadderLint() {
     f = f + 1
   }
   klSplitWalks(s)
+  0
+}
+
+// ── sentinel-index-unguarded / sentinel-index-strict-untested ────────────────
+//
+// A TABLE READ `<table>[<idx>]` whose index arrived from something that answers an
+// in-band "no answer" — a call, an arena field that is -1 while open, or a caller's
+// argument reached on a fall-through — with NO bound test between the arrival and the
+// read. `vl check` returns 0 and the COMPILER dies with an anonymous out-of-bounds
+// read: D1440, D1462 and D1500 are three of those, with a fourth on PR #2498 — all found
+// on one day, each at a different site. The rule, the derivation, the five controls and
+// the census numbers: docs/internals/sentinel-index-lint.md. Ratcheted per file by
+// scripts/sentinel-budget.py, whose analysis is this same walk in Python.
+
+// A TABLE is a subscript base the reading function did NOT declare — not a parameter of
+// its own, not one of its `let` / `const` / `for` names. A function that built the list
+// can bound it from what it can see; one that did not is trusting a length that nothing
+// in front of it states.
+
+// The FIELDS this module admits can be absent: every `x.f` it compares against 0 or a
+// negative somewhere. Read from the module rather than written down, so `nInner` earns
+// its place from the guards the module already spells — D1440's whole shape is
+// `T.tys[t.nInner]` carrying the guard its sibling had and it did not.
+let siHoleF: string[] = []
+// This module's MAP globals — a key subscript, never an index.
+let siMapG: string[] = []
+
+// Per top-level function, PARALLEL to `klFnName` — this pass reuses the kind-ladder
+// module index. 1 when the function answers -1 in band, directly or by handing back a
+// reader's answer. The parameter arm is scoped by it: a function whose contract is "-1
+// where nothing answers" is called with values that may not answer.
+let siFnReader: i32[] = []
+
+// The forwarding edges, flat and already RESOLVED: `siEdgeFrom[k]` hands its answer to
+// function `siEdgeTo[k]`. Resolved once through a name index rather than re-scanned per
+// round — the fixpoint below runs four times, and a name scan inside it would be
+// O(edges x functions), which is #2419's shape.
+let siEdgeFrom: i32[] = []
+let siEdgeTo: i32[] = []
+let siFnIx: {[string]: i32} = Map()
+
+// Per-function state, reset by `siGradeFn`. Module globals rather than locals threaded
+// through: the read grader wants seven of them, and a parameter list that long is how a
+// walk stops being readable.
+let siDeclared: string[] = []
+let siParams: string[] = []
+let siPName: string[] = []
+let siPKind: i32[] = []
+let siPText: string[] = []
+let siGuarded: string[] = []
+let siReturned = false
+
+// The identifier at `i` and, if a `.` follows it, the field after that — `name`, `a.b`.
+// "" when nothing starts here.
+function siPathAt(s: string, i: i32, b: i32) {
+  const a = asIdentAt(s, i, b)
+  if a.length == 0 { return "" }
+  const p = i + a.length
+  if p < b && s[p] == '.' {
+    const f = asIdentAt(s, p + 1, b)
+    if f.length > 0 { return a + "." + f }
+  }
+  a
+}
+
+// The FIELD half of a path, or "" when the path has none.
+function siFieldOf(path: string) {
+  let i = 0
+  while i < path.length {
+    if path[i] == '.' { return path.slice(i + 1, path.length) }
+    i = i + 1
+  }
+  ""
+}
+
+// A path may START at `i`: the char before neither continues a name nor is a `.`.
+function siFreshAt(s: string, i: i32) {
+  if i == 0 { return true }
+  const c = s[i - 1]
+  !cbIsWordChar(c) && c != '.'
+}
+
+// `name` is already in `xs`.
+function siHas(xs: string[], name: string) { asListHas(xs, name) }
+
+// Record `name` once. "" is never recorded, which is what makes an emptied slot below
+// unmatchable rather than a wildcard.
+function siAdd(xs: string[], name: string) {
+  if name.length > 0 && !asListHas(xs, name) { xs.push(name) }
+  0
+}
+
+// The index of `name` in `xs`, or -1. Every caller tests it: a 0 here is the FIRST row
+// and not "absent", which is the clamp D1500 was built out of.
+function siIndexOf(xs: string[], name: string) {
+  let i = 0
+  while i < xs.length {
+    if xs[i] == name { return i }
+    i = i + 1
+  }
+  -1
+}
+
+// Blank `name` where it occurs, so a rebinding drops the guard and the parameter status
+// the OLD value earned.
+function siDrop(xs: string[], name: string) {
+  const k = siIndexOf(xs, name)
+  if k >= 0 { xs[k] = "" }
+  0
+}
+
+// A BOUND: `0` (not the head of a longer number), `-1`, or any `x.length` — the three
+// spellings an index is allowed to be tested against. Index just past it, or -1.
+function siBoundAt(s: string, i: i32, b: i32) {
+  if i >= b { return -1 }
+  if s[i] == '0' && !cbWordAt(s, i + 1, b) && cbCharOr(s, i + 1, b) != '.' {
+    return i + 1
+  }
+  if s[i] == '-' {
+    const p = cbSpacesEnd(s, i + 1, b)
+    if p < b && s[p] == '1' && !cbWordAt(s, p + 1, b) { return p + 1 }
+    return -1
+  }
+  const path = siPathAt(s, i, b)
+  if path.length > 0 {
+    // `siPathAt` already ATE the `.length` of a bare `xs.length`; only `a.b.length`
+    // still has one to find. Missing this read `while xs.length <= k { push }` as no
+    // guard at all and reported eleven grow-then-write loops that are correct.
+    if siFieldOf(path) == "length" { return i + path.length }
+    if cbAt(s, i + path.length, b, ".length") { return i + path.length + 7 }
+  }
+  -1
+}
+
+// A COMPARISON operator at `i` — `<` `>` `<=` `>=` `==` `!=`. Its width, or 0.
+function siCmpAt(s: string, i: i32, b: i32) {
+  if i >= b { return 0 }
+  const c = s[i]
+  const n = cbCharOr(s, i + 1, b)
+  if (c == '<' || c == '>' || c == '=' || c == '!') && n == '=' { return 2 }
+  if c == '<' || c == '>' { return 1 }
+  0
+}
+
+// Mark whichever name a comparison at `i` tests, either way round: `idx < 0`,
+// `idx >= xs.length`, `0 <= idx`. Both orders, because the tree spells both.
+function siMarkGuards(s: string, i: i32, e: i32) {
+  const path = siPathAt(s, i, e)
+  if path.length > 0 {
+    const p = cbSpacesEnd(s, i + path.length, e)
+    const w = siCmpAt(s, p, e)
+    if w > 0 {
+      if siBoundAt(s, cbSpacesEnd(s, p + w, e), e) >= 0 {
+        siAdd(siGuarded, path)
+      }
+    }
+  }
+  const be = siBoundAt(s, i, e)
+  if be >= 0 {
+    const q = cbSpacesEnd(s, be, e)
+    const w2 = siCmpAt(s, q, e)
+    if w2 > 0 { siAdd(siGuarded, siPathAt(s, cbSpacesEnd(s, q + w2, e), e)) }
+  }
+  0
+}
+
+// ── pass 1: the module's hole fields ─────────────────────────────────────────
+// At every `.` whose left side is a name, read the field and ask whether the module
+// tests it against 0 or a negative. That test IS the module saying the field can be
+// absent, which is why the set is read and never listed.
+
+// A HOLE TEST: `< 0` or `>= 0` — the two comparisons that separate "absent" from "a
+// row" — or any operator against a NEGATIVE literal. `x.length > 0` is a non-empty test
+// and deliberately not one: taking it made `length` a hole field and turned eleven
+// `const id = xs.length` bindings into producers.
+function siHoleTestAt(s: string, p: i32, e: i32) {
+  const w = siCmpAt(s, p, e)
+  if w == 0 { return false }
+  const q = cbSpacesEnd(s, p + w, e)
+  if q >= e { return false }
+  if s[q] == '-' { return true }
+  if s[q] != '0' || cbWordAt(s, q + 1, e) || cbCharOr(s, q + 1, e) == '.' {
+    return false
+  }
+  (w == 1 && s[p] == '<') || (w == 2 && s[p] == '>')
+}
+
+// The module's own MAP globals. A map subscript cannot go out of bounds — a miss reads
+// back null — so `m[k]` is not this rule's shape however the key arrived. Collected in
+// the same walk, at column 0 only, since a map global is a module-level declaration.
+function siMapGlobalOf(s: string, a: i32, e: i32) {
+  if a >= e || s[a] == ' ' { return "" }
+  let p = a
+  if cbAt(s, p, e, "export ") { p = cbSpacesEnd(s, p + 7, e) }
+  if cbAt(s, p, e, "let ") { p = cbSpacesEnd(s, p + 4, e) }
+  else if cbAt(s, p, e, "const ") { p = cbSpacesEnd(s, p + 6, e) }
+  else { return "" }
+  const nm = asIdentAt(s, p, e)
+  if nm.length == 0 { return "" }
+  const q = cbSpacesEnd(s, p + nm.length, e)
+  if q >= e || s[q] != ':' { return "" }
+  const r = cbSpacesEnd(s, q + 1, e)
+  if !cbAt(s, r, e, "{[") { return "" }
+  nm
+}
+
+function siScanHoles(s: string) {
+  siHoleF = []
+  siMapG = []
+  let n = 0
+  while n < klLnStart.length {
+    const a = klLnStart[n]
+    const e = klCodeEnd(s, a, klLnEnd[n])
+    siAdd(siMapG, siMapGlobalOf(s, a, e))
+    let i = a
+    while i < e {
+      const c = s[i]
+      if c == '"' || c == '\'' {
+        i = klSkipLit(s, i, e)
+      } else {
+        if c == '.' && cbWordAt(s, i - 1, e) {
+          const f = asIdentAt(s, i + 1, e)
+          if f.length > 0 {
+            if siHoleTestAt(s, cbSpacesEnd(s, i + 1 + f.length, e), e) {
+              siAdd(siHoleF, f)
+            }
+          }
+        }
+        i = i + 1
+      }
+    }
+    n = n + 1
+  }
+  0
+}
+
+// ── pass 2: which functions answer -1 ────────────────────────────────────────
+// `return -1`, a bare `-1` tail, or `return 0 - 1`.
+function siNegAnswerLine(s: string, a: i32, e: i32) {
+  const k = cbSpacesEnd(s, a, e)
+  if cbAt(s, k, e, "-1") && cbSpacesEnd(s, k + 2, e) >= e { return true }
+  let i = a
+  while i < e {
+    const c = s[i]
+    if c == '"' || c == '\'' {
+      i = klSkipLit(s, i, e)
+    } else {
+      if cbAt(s, i, e, "return ") && !cbWordAt(s, i - 1, e) {
+        const p = cbSpacesEnd(s, i + 7, e)
+        if cbAt(s, p, e, "-1") && !cbWordAt(s, p + 2, e) { return true }
+        if p < e && s[p] == '0' {
+          const q = cbSpacesEnd(s, p + 1, e)
+          if q < e && s[q] == '-' {
+            const r = cbSpacesEnd(s, q + 1, e)
+            if cbAt(s, r, e, "1") && !cbWordAt(s, r + 1, e) { return true }
+          }
+        }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// The name a line hands its answer to: a bare two-space tail `f(…)`, or `return f(…)`.
+function siRetCallOf(s: string, a: i32, e: i32) {
+  if a + 2 < e && s[a] == ' ' && s[a + 1] == ' ' && s[a + 2] != ' ' {
+    const t = asIdentAt(s, a + 2, e)
+    if t.length > 0 {
+      if cbCharOr(s, cbSpacesEnd(s, a + 2 + t.length, e), e) == '(' { return t }
+    }
+  }
+  let i = a
+  while i < e {
+    const c = s[i]
+    if c == '"' || c == '\'' {
+      i = klSkipLit(s, i, e)
+    } else {
+      if cbAt(s, i, e, "return ") && !cbWordAt(s, i - 1, e) {
+        const p = cbSpacesEnd(s, i + 7, e)
+        const t = asIdentAt(s, p, e)
+        if t.length > 0 {
+          if cbCharOr(s, cbSpacesEnd(s, p + t.length, e), e) == '(' { return t }
+        }
+      }
+      i = i + 1
+    }
+  }
+  ""
+}
+
+// A `return` opening a token on this line — the tell that what follows is a FALL-THROUGH.
+function siLineReturns(s: string, a: i32, e: i32) {
+  let i = a
+  while i < e {
+    const c = s[i]
+    if c == '"' || c == '\'' {
+      i = klSkipLit(s, i, e)
+    } else {
+      const prev = cbCharOr(s, i - 1, e)
+      const lead = i == a || prev == ' ' || prev == '\t' || prev == '{'
+      if lead && cbAt(s, i, e, "return") && !cbWordAt(s, i + 6, e) {
+        return true
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// Mark every function answering -1 directly, record the forwarding edges, then close
+// under them four rounds deep: a function handing back a reader's answer is one too.
+function siScanReaders(s: string) {
+  siFnReader = []
+  siEdgeFrom = []
+  siEdgeTo = []
+  siFnIx = Map()
+  let g = 0
+  while g < klFnName.length {
+    siFnIx[klFnName[g]] = g
+    g = g + 1
+  }
+  let f = 0
+  while f < klFnName.length {
+    siFnReader.push(0)
+    let n = klFnLo[f]
+    while n <= klFnHi[f] {
+      const a = klLnStart[n]
+      const e = klCodeEnd(s, a, klLnEnd[n])
+      if siNegAnswerLine(s, a, e) { siFnReader[f] = 1 }
+      const t = siRetCallOf(s, a, e)
+      if t.length > 0 {
+        const to = siFnIx[t]
+        if to != null {
+          siEdgeFrom.push(f)
+          siEdgeTo.push(to)
+        }
+      }
+      n = n + 1
+    }
+    f = f + 1
+  }
+  let round = 0
+  while round < 4 {
+    let k = 0
+    while k < siEdgeFrom.length {
+      const from = siEdgeFrom[k]
+      const to = siEdgeTo[k]
+      if (
+        from >= 0 &&
+        from < siFnReader.length &&
+        to >= 0 &&
+        to < siFnReader.length
+      ) {
+        if siFnReader[from] == 0 && siFnReader[to] == 1 { siFnReader[from] = 1 }
+      }
+      k = k + 1
+    }
+    round = round + 1
+  }
+  0
+}
+
+// ── pass 3: one function's declarations ──────────────────────────────────────
+// Every name the function's HEADER LINE declares — a parameter is `name:`, and with
+// `i32Only` only an `i32` one, the only kind that can be an index. A header continued
+// onto a second line contributes nothing, in both implementations alike.
+function siHeaderNames(s: string, f: i32, i32Only: boolean, out: string[]) {
+  const a = klLnStart[klFnLo[f]]
+  const e = klCodeEnd(s, a, klLnEnd[klFnLo[f]])
+  let i = a
+  while i < e && s[i] != '(' { i = i + 1 }
+  while i < e {
+    const c = s[i]
+    if c == '"' || c == '\'' {
+      i = klSkipLit(s, i, e)
+    } else {
+      const nm = asIdentAt(s, i, e)
+      if nm.length > 0 {
+        const p = cbSpacesEnd(s, i + nm.length, e)
+        if p < e && s[p] == ':' {
+          const q = cbSpacesEnd(s, p + 1, e)
+          if !i32Only || (cbAt(s, q, e, "i32") && !cbWordAt(s, q + 3, e)) {
+            siAdd(out, nm)
+          }
+        }
+        i = i + nm.length
+      } else {
+        i = i + 1
+      }
+    }
+  }
+  0
+}
+
+// The name a `let` / `const` / `for … in` line declares, or "".
+function siDeclNameOf(s: string, a: i32, e: i32) {
+  const p = cbSpacesEnd(s, a, e)
+  if cbAt(s, p, e, "let ") { return asIdentAt(s, cbSpacesEnd(s, p + 4, e), e) }
+  if cbAt(s, p, e, "const ") {
+    return asIdentAt(s, cbSpacesEnd(s, p + 6, e), e)
+  }
+  if cbAt(s, p, e, "for ") {
+    const v0 = cbSpacesEnd(s, p + 4, e)
+    const v = asIdentAt(s, v0, e)
+    if v.length > 0 {
+      const q = cbSpacesEnd(s, v0 + v.length, e)
+      if cbAt(s, q, e, "in") && !cbWordAt(s, q + 2, e) { return v }
+    }
+  }
+  ""
+}
+
+// ── pass 3: the bindings ─────────────────────────────────────────────────────
+// The line's single-target binding, if it has one. `siBindKind` is 1 for a CALL
+// right-hand side, 2 for a bare field read, 3 for anything else — which UNBINDS the
+// name — and 0 for a line that is no binding at all.
+let siBindName = ""
+let siBindKind = 0
+let siBindText = ""
+
+function siBindAt(s: string, a: i32, e: i32) {
+  siBindKind = 0
+  siBindName = ""
+  siBindText = ""
+  let p = cbSpacesEnd(s, a, e)
+  if cbAt(s, p, e, "let ") { p = cbSpacesEnd(s, p + 4, e) }
+  else if cbAt(s, p, e, "const ") { p = cbSpacesEnd(s, p + 6, e) }
+  const nm = asIdentAt(s, p, e)
+  if nm.length == 0 { return 0 }
+  let q = cbSpacesEnd(s, p + nm.length, e)
+  // An annotation runs to the `=`. Only a ONE-WORD one leaves the right-hand side
+  // readable as an index: `const x: i32[] = f()` binds a LIST, never an index, and is
+  // taken here as an unbind.
+  let simple = true
+  if q < e && s[q] == ':' {
+    q = cbSpacesEnd(s, q + 1, e)
+    const ty = asIdentAt(s, q, e)
+    if ty.length == 0 { simple = false } else { q = q + ty.length }
+    while q < e && s[q] != '=' {
+      if s[q] != ' ' { simple = false }
+      q = q + 1
+    }
+  }
+  if q >= e || s[q] != '=' { return 0 }
+  if cbCharOr(s, q + 1, e) == '=' { return 0 }
+  siBindName = nm
+  siBindKind = 3
+  if !simple { return 0 }
+  const r = cbSpacesEnd(s, q + 1, e)
+  const callee = asIdentAt(s, r, e)
+  if (
+    callee.length > 0 &&
+    cbCharOr(s, cbSpacesEnd(s, r + callee.length, e), e) == '('
+  ) {
+    siBindKind = 1
+    siBindText = callee
+    return 0
+  }
+  const path = siPathAt(s, r, e)
+  if path.length > 0 && siFieldOf(path).length > 0 {
+    if cbSpacesEnd(s, r + path.length, e) >= e {
+      siBindKind = 2
+      siBindText = path
+    }
+  }
+  0
+}
+
+// ── the report ───────────────────────────────────────────────────────────────
+// Which producer handed the index over — the half of the message that says where to
+// look, since the fix is at the PRODUCER as often as at the read.
+function siWhy(kind: i32, idx: string, text: string) {
+  if kind == 1 { return "`" + text + "`, which can answer in band" }
+  if kind == 2 {
+    return "`" + idx + "`, a field this module tests against 0 elsewhere"
+  }
+  "the parameter `" + idx + "` on a fall-through path"
+}
+
+// A `*Strict` producer's -1 is its DOCUMENTED answer, not a clamp that happens to be in
+// range, so an untested read of one is a weaker finding under its own code — reported,
+// and not what the ratchet gates on.
+function siReport(
+  table: string,
+  idx: string,
+  kind: i32,
+  text: string,
+  ln: i32,
+  co: i32,
+) {
+  let code = "sentinel-index-unguarded"
+  if kind == 1 && text.length >= 6 {
+    if text.slice(text.length - 6, text.length) == "Strict" {
+      code = "sentinel-index-strict-untested"
+    }
+  }
+  lintEmitAtPos(
+    code,
+    "`" +
+      table +
+      "[" +
+      idx +
+      "]` indexes a table with " +
+      siWhy(kind, idx, text) +
+      " and never bound-tests it — test `" +
+      idx +
+      "` against 0 and `" +
+      table +
+      ".length`, or take a reader whose miss cannot be a real row (D1440/D1500)",
+    "warning",
+    ln,
+    co,
+  )
+  0
+}
+
+// ── pass 3: the walk ─────────────────────────────────────────────────────────
+// One table read, graded. The index is sentinel-bearing when it is a hole FIELD path, a
+// local last bound from a call or a hole field, or — inside a reader, past that
+// function's first `return` — one of its own `i32` parameters.
+function siGradeRead(table: string, idx: string, line: i32, col: i32) {
+  let base = table
+  const dot = siFieldOf(table)
+  if dot.length > 0 { base = table.slice(0, table.length - dot.length - 1) }
+  if siHas(siDeclared, base) { return 0 }
+  if siHas(siMapG, table) { return 0 }
+  if siHas(siGuarded, idx) { return 0 }
+  const fld = siFieldOf(idx)
+  if fld.length > 0 {
+    if siHas(siHoleF, fld) { siReport(table, idx, 2, idx, line, col) }
+    return 0
+  }
+  const k = siIndexOf(siPName, idx)
+  if k >= 0 {
+    if siPKind[k] == 1 || siPKind[k] == 2 {
+      siReport(table, idx, siPKind[k], siPText[k], line, col)
+    }
+    return 0
+  }
+  if siReturned && siHas(siParams, idx) {
+    siReport(table, idx, 3, idx, line, col)
+  }
+  0
+}
+
+// One linear pass per function: guards and bindings are read as the lines go by, so a
+// guard counts only where it PRECEDES the read. That approximates dominance the way
+// `arenaScanLint` does — a guard in an `else` arm marks the name and the read goes
+// unreported, a false NEGATIVE, which is the safe direction for a ratcheted warning.
+function siGradeFn(s: string, f: i32) {
+  siDeclared = []
+  siParams = []
+  siPName = []
+  siPKind = []
+  siPText = []
+  siGuarded = []
+  siReturned = false
+  siHeaderNames(s, f, false, siDeclared)
+  if siFnReader[f] == 1 { siHeaderNames(s, f, true, siParams) }
+  let n = klFnLo[f]
+  while n <= klFnHi[f] {
+    siAdd(
+      siDeclared,
+      siDeclNameOf(s, klLnStart[n], klCodeEnd(s, klLnStart[n], klLnEnd[n])),
+    )
+    n = n + 1
+  }
+  let ln = klFnLo[f]
+  while ln <= klFnHi[f] {
+    const a = klLnStart[ln]
+    const e = klCodeEnd(s, a, klLnEnd[ln])
+    let i = a
+    while i < e {
+      const c = s[i]
+      if c == '"' || c == '\'' {
+        i = klSkipLit(s, i, e)
+      } else {
+        if siFreshAt(s, i) {
+          siMarkGuards(s, i, e)
+          const prev = cbCharOr(s, i - 1, e)
+          if prev != ']' && prev != ')' {
+            const table = siPathAt(s, i, e)
+            if table.length > 0 && cbCharOr(s, i + table.length, e) == '[' {
+              const j = cbSpacesEnd(s, i + table.length + 1, e)
+              const idx = siPathAt(s, j, e)
+              if idx.length > 0 {
+                if cbCharOr(s, cbSpacesEnd(s, j + idx.length, e), e) == ']' {
+                  siGradeRead(table, idx, ln + 1, i - a)
+                }
+              }
+            }
+          }
+        }
+        i = i + 1
+      }
+    }
+    if siLineReturns(s, a, e) { siReturned = true }
+    siBindAt(s, a, e)
+    if siBindKind > 0 {
+      let kind = siBindKind
+      if kind == 2 && !siHas(siHoleF, siFieldOf(siBindText)) { kind = 3 }
+      const k = siIndexOf(siPName, siBindName)
+      if k < 0 {
+        siPName.push(siBindName)
+        siPKind.push(kind)
+        siPText.push(siBindText)
+      } else {
+        siPKind[k] = kind
+        siPText[k] = siBindText
+      }
+      siDrop(siGuarded, siBindName)
+      siDrop(siParams, siBindName)
+    }
+    ln = ln + 1
+  }
+  0
+}
+
+// Two module passes and one per function, all linear in bytes. The kind-ladder module
+// index is rebuilt here rather than inherited, so this pass does not depend on running
+// after that one.
+function sentinelIndexLint() {
+  const s = cbSource
+  klIndexLines(s)
+  klIndexFns(s)
+  siScanHoles(s)
+  siScanReaders(s)
+  let f = 0
+  while f < klFnName.length {
+    siGradeFn(s, f)
+    f = f + 1
+  }
   0
 }
