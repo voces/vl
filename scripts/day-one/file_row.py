@@ -27,6 +27,7 @@ ROOT = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 
 import minimise as M  # noqa: E402
+import modules as MOD  # noqa: E402
 import sample as S  # noqa: E402
 
 INV = os.path.join(ROOT, "docs", "internals", "inventory")
@@ -98,9 +99,12 @@ def main():
     side = "a" if pair["a"]["grade"] != "RUNS" else "b"
     twin = "b" if side == "a" else "a"
 
+    # A GENERATOR AXIS ABLATES BY ITS OWN GRAMMAR. `ablate` re-renders a plan at each
+    # other face and would fail on a `modules_split` pair, whose faces are a file count.
+    ablator = M.ablate_modules if pair["axis"] == "modules_split" else M.ablate
     with tempfile.TemporaryDirectory(prefix="vl-day-one-file-") as td:
         wit, base = M.minimise(pair[side]["src"], pair[side]["want"], a.compiler, td)
-        _, rows = M.ablate(pair, side, a.compiler, td)
+        _, rows = ablator(pair, side, a.compiler, td)
 
     status = {"emit refuses": "loud emit reject",
               "check refuses": "loud check reject",
@@ -139,6 +143,13 @@ def main():
     open(rowpath, "w", encoding="utf-8").write(body)
     print("wrote " + rowpath)
     if a.probe_name:
+        # A capability probe is ONE file — `run.py` hands `vl` a single path. A
+        # multi-module witness belongs in `tests/cases/modules/<name>/` instead, so say
+        # so rather than writing a `// file:`-marked probe nothing can run.
+        if len(MOD.split_files(wit)) > 1:
+            print("no probe written: the witness is multi-module. File it as a fixture "
+                  "directory under tests/cases/modules/ and cite it on the row.")
+            return 0
         pp = os.path.join(PROBES, a.probe_name + ".vl")
         open(pp, "w", encoding="utf-8").write(probe)
         print("wrote " + pp)
