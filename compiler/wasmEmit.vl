@@ -13995,6 +13995,15 @@ function emitRefIfArm(
     if tv >= 0 {
       if ifArmIsValue(tv, fnIx) {
         if emitIfArmOpen(body, blockIx, fnIx) < 0 { return emitIfArmClose(-1) }
+        // A bare `null` ARM lowers as the JOIN's OWN null, not through `emitNullLitNode`'s
+        // seed ladder: `fbRefNullOfKind` is `fbValtypeNullable`'s value twin, so the arm and
+        // the blocktype cannot name different heap types — the identity the else-LESS
+        // spelling of the same value already lowers by. Without it the explicit
+        // `else { null }` twin floored on `bare null needs a struct-typed context` at every
+        // ref kind whose null no boundary seed carries (D1560), while its else-less twin ran.
+        if P.nodes[unwrapParen(tv)] is NullLit {
+          return emitIfArmClose(fbRefNullOfKind(kind, slot))
+        }
         if kind == "struct" { pendingStructIdx = slot }
         if kind == "reflist" {
           pendingListKind = 5
@@ -14049,7 +14058,24 @@ function emitIfExprAs(body: i32[], ifIx: i32, fnIx: i32, kind: i32) {
       if els is IfStmt {
         rc = emitIfExprAs(body, s.ifElse, fnIx, kind)
       } else {
+        // THE EXPLICIT `else { null }` SPELLING OF THE SAME VALUE. It reaches
+        // `emitNullLitNode`, whose niche arms read a BOUNDARY seed that an un-annotated
+        // binding's initializer position never sets — so this spelling floored on
+        // `bare null needs a struct-typed context` while its else-LESS twin, which writes
+        // the sentinel three lines up, ran (D1560). Seeded from the join's own type, and
+        // only for a bare-`null` tail, so no other value in the arm can read it.
+        const savedNB = pendingNulBool
+        const savedNL = pendingNulLitUnion
+        const enull = ifArmValueExpr(s.ifElse)
+        if enull >= 0 {
+          if P.nodes[unwrapParen(enull)] is NullLit {
+            if nodeTyIsNulBool(ifIx) { pendingNulBool = true }
+            if nodeTyIsNulLitUnion(ifIx) { pendingNulLitUnion = true }
+          }
+        }
         rc = emitBlockValueAs(body, s.ifElse, fnIx, kind)
+        pendingNulBool = savedNB
+        pendingNulLitUnion = savedNL
       }
     }
     if narrowedElse { restoreNarrow(savedElseTop) }
