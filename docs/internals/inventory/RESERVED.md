@@ -21,9 +21,16 @@ agent filed.
 
 A range is cheap. Take one before minting, release it when the work lands.
 
+**THE HOLDER IS THE SESSION NAME OTHER SESSIONS CAN MESSAGE** — the one `ListAgents` prints,
+not a name recalled from memory. The first version of this file had every holder inverted:
+each block was labelled with the OTHER session's name, so the column that exists to answer
+"who do I talk to" sent the reader to the wrong session for all four. A session that has
+restarted may answer to a new name (`vl-6a` became `vl-cb` here); check rather than assume,
+and if a block is filed by one session and fixed by another, say both.
+
 <!-- reservations below; the marker is what --reserve/--release edit around -->
 
-D1480-D1499  vl-6a sweep agent  2026-09-03  ordinary-program sweep, D1480-D1486 filed
-D1500-D1509  vl-cb glean agent  2026-09-03  VL-016, the compiler trap (D1500 filed)
+D1480-D1499  vl-d2 sweep agent  2026-09-03  ordinary-program sweep, D1480-D1486 filed
+D1500-D1509  vl-d2 filed, vl-cb fixing  2026-09-03  VL-016, the compiler trap (D1500 filed)
 D1510-D1519  vl-cb glean agents  2026-09-03  VL-018 (D1510), VL-017 (D1511)
-D1520-D1539  vl-6a glean agent  2026-09-03  VL-003, VL-004, VL-005
+D1520-D1539  vl-d2 glean agent  2026-09-03  VL-003, VL-004, VL-005
