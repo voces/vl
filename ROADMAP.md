@@ -68,13 +68,19 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   lands on merge day.** See the fuller row below; `scripts/inventory/split.py --apply
   --relink` against fresh master under an append freeze.
 - 🟡 **4. Key the union/variant registries by arena type id, and collapse the kind ladders —
-  DESIGN + shim #2417, steps 1-3 and 4a landed since.** Registries keyed by SPELLED names are
-  why one union has three construction sites that can disagree (see CLAUDE.md's "arena and
-  canon are two producers" and the union member-set ABI note). Both PRODUCERS now reach the
-  same key — the spelling route at 2,447/2,447 and the arena route at 2,422/2,447 — so the
-  remaining work is 4b (`registerInlineUnion`'s 11 recursions, under an `emit_collect.vl`
-  freeze) and then the switch. The variant registry and the per-resolver kind ladders
-  (ONE storage-class dispatch table) are still ahead of both.
+  DESIGN + shim #2417, steps 1-3, 4a and 4b landed since.** Registries keyed by SPELLED names
+  are why one union has three construction sites that can disagree (see CLAUDE.md's "arena and
+  canon are two producers" and the union member-set ABI note). Both PRODUCERS reach the same
+  key — the spelling route at 2,447/2,447 and the arena route at 2,422/2,447 — and 4b threaded
+  it into `registerInlineUnion`'s recursions: 18 registration sites now obtain the key from
+  canon, 16 of them at `differ` 0 and `name-only` 0. **The per-site counter's 1,587 `differ`
+  was 1,499 key-EQUAL sibling rows** (D1491) and 88 real, of which 87 are a `repCanonId`
+  comparison at a MINT that no key re-keys. **Step 5 (the switch) is blocked on ONE thing**:
+  the key's licence is `merge-diffset` AND `merge-diffvar`, and the second reads 1 on master —
+  `type AS = (Sc | Dg)` shares a key with the inline `Sc | Dg` and holds an EMPTY variant
+  slice (D1492). Two candidate re-keyings were measured and refused with their price (D1492's
+  `null` normalisation, D1493's alias expansion). The variant registry and the per-resolver
+  kind ladders (ONE storage-class dispatch table) are still ahead of both.
 - ✅ **8. A ladder over a closed kind set is exhaustive or names its default — DONE.**
   `kind-ladder-incomplete` / `kind-ladder-split` in `compiler/lint.vl`, the ratchet
   `scripts/ladder-budget.py --check` (440 + 9 today), the census `scripts/ladder-census.py`.
