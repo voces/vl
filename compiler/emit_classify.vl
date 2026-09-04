@@ -373,6 +373,9 @@ import {
   cnVariant,
   criChanged,
   ctrlDepth,
+  dupScanActive,
+  dupSlotBias,
+  dupSlotMore,
   emitCurFnIx,
   emitCurFnPos,
   emitRootIx,
@@ -8885,15 +8888,70 @@ function declaredSlotLive(name: string) {
   -1
 }
 
+// Could two SAME-NAMED slots in one frame give a type-directed detector different answers?
+// True when they differ on any axis a classifier reads off the slot: the rep, the struct
+// row, the literal-atom flag, the declaration node (which is where a union's member set
+// lives) or the loop iterable. Same on every one means the flat scan's choice between them
+// cannot matter, so the detection owes no second pass. D1595.
+function localRepDiffers(a: i32, b: i32) {
+  if a < 0 || b < 0 { return true }
+  if localIsRef[a] != localIsRef[b] { return true }
+  if localStructIdx[a] != localStructIdx[b] { return true }
+  if localLitUnion[a] != localLitUnion[b] { return true }
+  if localDeclIx[a] != localDeclIx[b] { return true }
+  localLoopIter[a] != localLoopIter[b]
+}
+
+// Does this frame bind any name to more than one slot? The one condition under which
+// `declaredSlotOf`'s scope-less answer is a GUESS. The detection drivers ask once per frame,
+// so a frame with no shadowing keeps the flat scan's first-match early return unchanged —
+// which is every frame in most programs. D1595.
+export function frameHasDupLocalName() {
+  let i = 1
+  while i < localNames.length {
+    let j = 0
+    while j < i {
+      if localNames[j] == localNames[i] { return true }
+      j = j + 1
+    }
+    i = i + 1
+  }
+  false
+}
+
 function declaredSlotOf(name: string) {
   const scoped = scopeSlotOf(name)
   if scoped >= 0 { return scoped }
-  let pos = 0
-  while pos < localNames.length {
-    if localNames[pos] == name { return pos }
-    pos = pos + 1
+  if !dupScanActive {
+    let pos = 0
+    while pos < localNames.length {
+      if localNames[pos] == name { return pos }
+      pos = pos + 1
+    }
+    return -1
   }
-  -1
+  // Under a detection driver's disambiguation loop: hand back the `dupSlotBias`-th
+  // same-named slot (the first when the name is bound once, or when the bias has run past
+  // the match count), and tell the driver when a later match of a different rep is still
+  // unvisited — that is the pass it has yet to run.
+  let p = 0
+  let first = -1
+  let pick = -1
+  let seen = 0
+  while p < localNames.length {
+    if localNames[p] == name {
+      if first < 0 { first = p }
+      if seen == dupSlotBias {
+        pick = p
+      } else if seen > dupSlotBias && pick >= 0 {
+        if localRepDiffers(pick, p) { dupSlotMore = true }
+      }
+      seen = seen + 1
+    }
+    p = p + 1
+  }
+  if pick >= 0 { return pick }
+  first
 }
 
 // The `VKind` of declared local `name`, or `null` if there is no such declared local. The

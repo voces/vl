@@ -127,6 +127,9 @@ import {
   cloSigTwin,
   ctrlDepth,
   curBuf,
+  dupScanActive,
+  dupSlotBias,
+  dupSlotMore,
   emitCurFnIx,
   emitCurFnPos,
   emitCurStmtIx,
@@ -425,6 +428,7 @@ import {
   fnUnionLetSinkOk,
   fnUnionRetSinkOk,
   forInMapRecv,
+  frameHasDupLocalName,
   globalCellKind,
   globalCellStructIdx,
   globalIndexOf,
@@ -834,33 +838,21 @@ function emitFuncCode(out: i32[], fnIx: i32, fnPos: i32) {
     fnUsesU8Push = false
     fnUsesU8Push = false
     fnUsesAtomStage = false
-    applyPushPopBits(blockPushPopBits(fn.fnBody, fnIx))
-    fnUsesStrOp = fnHasStrOp(fnIx)
-    fnUsesArrNew = fnHasArrNew(fnIx)
-    fnUsesCoalesceCall = fnHasCoalesceCall(fnIx)
-    fnUsesMap = fnHasMap(fnIx)
-    // `fnHasMap` only scans LOCALS/params; also reserve the frame when a map op runs
-    // on a GLOBAL struct-field map-array element (e.g. `T.scopes[top][k] = v`).
-    if !fnUsesMap { fnUsesMap = fnHasGlobalMapOp(fnIx) }
+    fnUsesStrOp = false
+    fnUsesArrNew = false
+    fnUsesCoalesceCall = false
+    fnUsesMap = false
     // A function-value call (`call_ref`) anywhere in the body reserves the closure
     // scratch slot. Only detected when a function value exists module-wide (lambdas).
     fnUsesCallRef = false
-    if fnValUsed { fnUsesCallRef = blockHasCallRef(fn.fnBody, fnIx) }
     fnUsesUnionAs = moduleHasUnionAs()
     // The numeric exact-or-fail staging slots, module-wide for `moduleHasUnionAs`'s reason.
     fnUsesNumCast = moduleHasNumCast()
-    // A multi-field CALL result re-boxed into a variant-box union arm stashes the call
-    // in the `variantReboxSlot` (a call cannot be re-read per field).
-    fnUsesVariantRebox = blockHasVariantRebox(fn.fnBody, fnIx)
+    fnUsesVariantRebox = false
     // Collect the DISTINCT ref-list element-type slots this function pushes onto (each
     // gets its own typed 4-slot scratch frame). Empty unless `fnUsesRefPush`.
     fnRefPushSlots = []
     refPushBaseBySlot = []
-    collectRefPushSlots(fn.fnBody, fnIx)
-    // A Member-receiver ref-list `.pop` (`T.scopes.pop()`) needs the SAME typed scratch
-    // frame as a ref `.push` onto that slot — record its slot too, so a pop-only function
-    // reserves the frame whose `recvRef` holds the field's wrapper ref.
-    collectMemberPopRefSlots(fn.fnBody, fnIx)
     // Collect the `.map`/`.filter` HOF sites this body lowers (each reserves the
     // shared 4-slot frame + one typed src/dst slot per distinct receiver/result type).
     fnUsesMapFilter = false
@@ -873,10 +865,9 @@ function emitFuncCode(out: i32[], fnIx: i32, fnPos: i32) {
     mfDstKinds = []
     mfDstSlots = []
     mfDstBases = []
-    mfScan(fn.fnBody, fnIx)
     // List `==`/`!=`/`+` frames (collections-design §VL.4/§VL.6). May also flip
-    // `fnUsesStrOp` (a string-list compare rides the string-op frame), so it
-    // runs AFTER the `fnHasStrOp` assignment above.
+    // `fnUsesStrOp` (a string-list compare rides the string-op frame), so its scan runs
+    // AFTER the `fnHasStrOp` leg inside the sweep.
     fnUsesListEqI = false
     fnUsesListEqS = false
     fnListEqRSlots = []
@@ -885,7 +876,7 @@ function emitFuncCode(out: i32[], fnIx: i32, fnPos: i32) {
     fnListEqGKinds = []
     fnListEqGSlots = []
     fnUsesCloEq = false
-    leqScanBlock(fn.fnBody, fnIx)
+    dupScanRun(fnIx)
     const nLocals = localNames.length
     // Union-box SINK: reserve the shared tag/payload pair when this function's result is
     // the box and it has two or more exits (the RETURN sink), or it binds a union box from
@@ -1342,17 +1333,82 @@ export function globalRunsInStartFn(gi: i32) {
   globalIsNonConst(globalStmts[gi])
 }
 
-// Detect, over the non-const global inits AND the top-level statements, the scratch
-// frames the start function's body needs — the start-fn analogue of `emitFuncCode`'s
-// per-function `fnHas*` detection. A `.push` is a statement-level void call (never in
-// an init VALUE position), so an init's push frames are driven by Member-receiver
-// `.pop`s instead (`let x = T.scopes.pop()`, via `exprPopBits`); string and map ops
-// are detected over the same exprs. Sets the `fnUses*` flags +
+// ONE scratch-detection sweep of user function `fnIx`'s body, at whatever same-named-slot
+// bias `dupScanRun` has set. Split from the resets in `emitFuncCode` so it can be re-run per
+// candidate binding of a shadowed name (D1595): every flag it touches is set and never
+// cleared, and every list it appends to dedupes, so the passes OR. `fnUsesUnionAs` /
+// `fnUsesNumCast` are module-wide and stay with the resets — no sweep decides them.
+function fnDetectScratch(fnIx: i32) {
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    // ONE body walk (`blockPushPopBits`) classifies every `.push`/Member-`.pop` receiver
+    // once and yields all six kind flags together.
+    applyPushPopBits(blockPushPopBits(fn.fnBody, fnIx))
+    if fnHasStrOp(fnIx) { fnUsesStrOp = true }
+    if fnHasArrNew(fnIx) { fnUsesArrNew = true }
+    if fnHasCoalesceCall(fnIx) { fnUsesCoalesceCall = true }
+    if fnHasMap(fnIx) { fnUsesMap = true }
+    // `fnHasMap` only scans LOCALS/params; also reserve the frame when a map op runs
+    // on a GLOBAL struct-field map-array element (e.g. `T.scopes[top][k] = v`).
+    if !fnUsesMap { fnUsesMap = fnHasGlobalMapOp(fnIx) }
+    if fnValUsed {
+      if blockHasCallRef(fn.fnBody, fnIx) { fnUsesCallRef = true }
+    }
+    // A multi-field CALL result re-boxed into a variant-box union arm stashes the call
+    // in the `variantReboxSlot` (a call cannot be re-read per field).
+    if blockHasVariantRebox(fn.fnBody, fnIx) { fnUsesVariantRebox = true }
+    collectRefPushSlots(fn.fnBody, fnIx)
+    // A Member-receiver ref-list `.pop` (`T.scopes.pop()`) needs the SAME typed scratch
+    // frame as a ref `.push` onto that slot — record its slot too, so a pop-only function
+    // reserves the frame whose `recvRef` holds the field's wrapper ref.
+    collectMemberPopRefSlots(fn.fnBody, fnIx)
+    mfScan(fn.fnBody, fnIx)
+    leqScanBlock(fn.fnBody, fnIx)
+  }
+  0
+}
+
+// Run a frame's scratch detection until every SAME-NAMED declared-local slot has had its
+// turn — `fnIx < 0` sweeps the start function, otherwise that function's body.
+//
+// The detectors classify identifiers through `declaredSlotOf`, which runs with the scope
+// stack EMPTY and so answers a shadowed name by a flat first-match scan — a GUESS, and the
+// wrong one leaves a frame unreserved for the emit pass that writes into it. So the sweep
+// REPEATS at each bias while a same-named candidate of a different rep is still unvisited.
+// The flags OR and the lists dedupe, so a frame with no shadowing runs exactly once and
+// emits the bytes it always did; over-reserving is the safe direction, since an unused
+// frame is spare locals and an unreserved one is invalid wasm. D1595.
+function dupScanRun(fnIx: i32) {
+  dupScanActive = frameHasDupLocalName()
+  dupSlotBias = 0
+  dupSlotMore = false
+  let again = true
+  while again {
+    if fnIx < 0 { startFnDetectScratch() } else { fnDetectScratch(fnIx) }
+    again = false
+    // The bias can only run past the match count, so `dupSlotMore` falls on its own;
+    // `localNames.length` is the belt-and-braces bound (one pass per slot at most).
+    if dupSlotMore && dupSlotBias + 1 < localNames.length {
+      dupSlotBias = dupSlotBias + 1
+      dupSlotMore = false
+      again = true
+    }
+  }
+  dupScanActive = false
+  dupSlotBias = 0
+  dupSlotMore = false
+  0
+}
+
+// Clear every start-function scratch flag, then detect the frames its body needs over the
+// non-const global inits AND the top-level statements — the start-fn analogue of
+// `emitFuncCode`'s per-function `fnHas*` detection. Sets the `fnUses*` flags +
 // `fnRefPushSlots`/`refPushBaseBySlot` exactly as `emitFuncCode` does, so the shared
 // `fbBeginFunc`/`fbEmitLocalsVec` lay out an identical frame. For the common `curBuf =
 // W.bytes` shape (a plain `global.get`+`struct.get`) every flag is false and the
-// locals vector is empty.
-function startFnDetectScratch() {
+// locals vector is empty. The sweep itself is `startFnDetectScratch`, which `dupScanRun`
+// may run more than once — the resets therefore live HERE, above the loop.
+function startFnDetectFrames() {
   fnUsesPush = false
   fnUsesRefPush = false
   fnUsesStrPush = false
@@ -1381,6 +1437,28 @@ function startFnDetectScratch() {
   mfDstKinds = []
   mfDstSlots = []
   mfDstBases = []
+  // List `==`/`!=`/`+` frames (collections-design §VL.4/§VL.6) — non-const
+  // global inits and every top-level statement run in the start function.
+  fnUsesListEqI = false
+  fnUsesListEqS = false
+  fnListEqRSlots = []
+  fnListCatKinds = []
+  fnListCatSlots = []
+  fnListEqGKinds = []
+  fnListEqGSlots = []
+  fnUsesCloEq = false
+  dupScanRun(-1)
+  0
+}
+
+// ONE scratch-detection sweep of the start function, at whatever same-named-slot bias
+// `dupScanRun` has set. A `.push` is a statement-level void call (never in an init VALUE
+// position), so an init's push frames are driven by Member-receiver `.pop`s instead (`let x
+// = T.scopes.pop()`, via `exprPopBits`); string and map ops are detected over the same
+// exprs. Split from the resets in `startFnDetectFrames` so it can be re-run per candidate
+// binding of a shadowed name (D1595): every flag it touches is set and never cleared, and
+// every list it appends to dedupes, so the passes OR.
+function startFnDetectScratch() {
   let gi = 0
   while gi < globalStmts.length {
     // A PROMOTED binding's init runs here too (its `local.set` replaces the cell's
@@ -1492,16 +1570,6 @@ function startFnDetectScratch() {
     if blockHasVariantRebox(startStmts[vrs], -1) { fnUsesVariantRebox = true }
     vrs = vrs + 1
   }
-  // List `==`/`!=`/`+` frames (collections-design §VL.4/§VL.6) — non-const
-  // global inits and every top-level statement run in the start function.
-  fnUsesListEqI = false
-  fnUsesListEqS = false
-  fnListEqRSlots = []
-  fnListCatKinds = []
-  fnListCatSlots = []
-  fnListEqGKinds = []
-  fnListEqGSlots = []
-  fnUsesCloEq = false
   let lgi = 0
   while lgi < globalStmts.length {
     if globalRunsInStartFn(lgi) {
@@ -1633,7 +1701,7 @@ function emitStartFnCode(out: i32[]) {
   const spanBase = emitFnSpanStart.length
   const nStartLocals = collectStartLocals()
   if nStartLocals < 0 { return -1 }
-  startFnDetectScratch()
+  startFnDetectFrames()
   // The start function is void, so it has no union-box return to sink, and its top-level
   // bindings take neither sink; clear the flags the last user function left set, or
   // `fbBeginFunc`/`fbLocalsCount`/`fbEmitLocalsVec` would each reserve a frame for it.
