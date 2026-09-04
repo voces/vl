@@ -534,6 +534,10 @@ every .vl file under it.
   {c}--codegen{r}           Also run the emitter and VALIDATE the emitted module
   {c}--no-validate{r}       (with --codegen) skip the engine's verdict
   {c}--fix{r}               Apply safe autofixes, writing files in place
+  {c}--include-std{r}       Report warnings and hints inside imported std: modules
+                      too. Without it they are withheld (a count is printed) —
+                      nothing in std is yours to fix. std ERRORS are always
+                      shown: one means the toolchain itself is broken.
   {c}--exclude{r} <glob>    Skip matching paths (repeatable; also --exclude=<glob>)
   {c}--color={r}<when>      always | never | auto (default: color iff stdout is a
                       terminal); an explicit value overrides NO_COLOR

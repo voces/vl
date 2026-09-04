@@ -349,7 +349,15 @@ def read_source(path):
 
 
 def sources():
-    for d in ("compiler", "std"):
+    """The tree this ratchet owns: `compiler/` only.
+
+    `std/` is deliberately absent. comment-style.md is the COMPILER's rubric; a
+    std comment is consumer API surface and is graded by `std-comment-audience`
+    against std-api-review.md §4, which has no baseline. compiler/lint.vl skips
+    the four codes for a std module for the same reason (D1601), so walking std
+    here would ratchet a count the lint no longer produces.
+    """
+    for d in ("compiler",):
         p = os.path.join(ROOT, d)
         for name in sorted(os.listdir(p)):
             if name.endswith(".vl"):
@@ -442,7 +450,11 @@ def cmd_filter_lint(path, extra=()):
 
 def cmd_grade(path):
     """One file's hits as JSON — the shape tests/vl_comment_budget_test.ts
-    compares against the lint's own diagnostics."""
+    compares against the lint's own diagnostics.
+
+    Path-blind on purpose: it grades the text it is handed. Which trees the four
+    codes APPLY to is `sources()` here and the module-path test in
+    compiler/lint.vl, and the test pins that pair separately."""
     print(json.dumps(grade(read_source(path))))
     return 0
 
