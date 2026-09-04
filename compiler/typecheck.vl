@@ -36,6 +36,7 @@ import {
   f64LitOverflows,
   intLexemeIsExactF32,
   numLexIsFloat,
+  parseI32,
 } from "./emit_bignum"
 import {
   ArrayLit,
@@ -430,6 +431,16 @@ const CODE_UFCS_NOT_IMPORTED = "ufcs-not-imported"
 //     file unless the name arrived by import.
 // `declLine` is `0` when the declaration has no source position.
 const CODE_UFCS_NOT_METHOD = "ufcs-not-method"
+
+// D1588's category code — a constant range descriptor that cannot complete as
+// written. Its answer rides the DATA channel under three keys:
+//   * `from` / `to` — the folded bounds, decimal. ABSENT when a bound is not a
+//     constant (only the `step 0` arm raises without them).
+//   * `step` — the folded step, decimal; `1` for a defaulted step.
+// A quick-fix reads `step`: a non-zero one flips sign to give the `step -1`
+// spelling the message names, a `0` has no such fix. THE FIX MUST NEVER PARSE THE
+// SENTENCE — the wording is free to improve and these keys are not.
+const CODE_RANGE_NEVER_RUNS = "range-never-runs"
 
 // ── Checker state (one struct, held in the global `T`) ───────────────────────
 // `tys`     — the type arena (every type is an index into it).
@@ -37275,6 +37286,169 @@ function checkWhileStmtNode(n: WhileStmt, ix: i32) {
   return TY_VOID
 }
 // ── for range ──────────────────────────────────────────────────────────────
+// Is the expression at `ix` an integer LITERAL this pass folds — a `NumLit` with an
+// integer lexeme that fits i32, a unary `+`/`-` over one, or either inside parens?
+// A `const` binding is NOT folded: the checker keeps no constant-VALUE scope
+// (`constScopes` records which names are `const`, not what they hold), and giving
+// one to the direction rule alone would make the checker's notion of "constant"
+// wider than the emitter's for no rule that reads it. D1588.
+function constIntExprIs(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const e = P.nodes[ix]
+  if e is Paren { return constIntExprIs(e.parInner) }
+  if e is Unary {
+    if e.unOp == "-" || e.unOp == "+" { return constIntExprIs(e.unArg) }
+    return false
+  }
+  constIntLeafIs(ix)
+}
+
+// The LEAF the sign/paren peel above delegates to, and the arm that owns every kind it
+// does not: a `NumLit` answers from its lexeme, and a name, a call, an operator or an
+// index is simply not constant — "no compile-time value" is the whole answer for them,
+// not a hole, because the direction rule then does not apply and the range keeps its
+// runtime contract. D1588.
+function constIntLeafIs(ix: i32) {
+  const e = P.nodes[ix]
+  if e is NumLit {
+    if numLexIsFloat(e.numText) { return false }
+    return intLexemeFitsI32(e.numText)
+  }
+  false
+}
+
+// The folded i32 value of a `constIntExprIs` node. ASK THE PREDICATE FIRST: every
+// i32 is a legal bound and a legal step, so no value here could mean "not constant"
+// — an in-band sentinel would make each caller-side guard dead code. Anything else
+// folds to 0, which is why it must not be reached. D1588.
+function constIntExprVal(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const e = P.nodes[ix]
+  if e is Paren { return constIntExprVal(e.parInner) }
+  if e is Unary {
+    if e.unOp == "-" { return 0 - constIntExprVal(e.unArg) }
+    if e.unOp == "+" { return constIntExprVal(e.unArg) }
+    return 0
+  }
+  constIntLeafVal(ix)
+}
+
+// `constIntLeafIs`'s value twin, split for the same reason and paired with it arm for
+// arm: the `NumLit` its predicate accepted folds through the lexeme's own base, and
+// every other kind answers 0 — which is a REAL bound, so it is reachable only by a
+// caller that skipped the predicate. D1588.
+function constIntLeafVal(ix: i32) {
+  const e = P.nodes[ix]
+  if e is NumLit { return parseI32(e.numText) }
+  0
+}
+
+// The soft `to` KEYWORD's token index, recovered from the end bound's own start:
+// `parseFor` advances past `to` and parses the bound immediately after it, so the
+// keyword is the token BEFORE the bound's first — the same recovery
+// `exportPrefix`/`declHasExportKw` make for the dropped `export`. VERIFIED at the
+// token rather than assumed: anything but the soft `to` means the arena and the
+// token stream disagree, and the caller then falls back to the bound's own anchor
+// instead of pointing at a token it did not identify. D1588.
+function forToKwTok(toIx: i32) {
+  const p = nodePos(toIx)
+  if p < 0 { return -1 }
+  const i = tokIndexAt(p)
+  if i <= 0 || i - 1 >= P.toks.length { return -1 }
+  const t = P.toks[i - 1]
+  if t.kind == "IDENT" && t.text == "to" { return i - 1 }
+  -1
+}
+
+// The refusal's sentence. `stepWritten` is false for a defaulted step, which keeps
+// the quoted range spelled the way the author WROTE it (`3 to 0`, not `3 to 0 step
+// 1`) while the parenthetical still names the step that decides the direction. The
+// suggested spelling flips the step's sign and drops it entirely when the flip is
+// the default `+1`, so the advice is always something the author could have typed.
+// D1588.
+function rangeNeverRunsMsg(
+  from: i32,
+  to: i32,
+  step: i32,
+  stepWritten: boolean,
+) {
+  const bounds = i32ToStr(from) + " to " + i32ToStr(to)
+  let written = bounds
+  if stepWritten { written = bounds + " step " + i32ToStr(step) }
+  const flipped = 0 - step
+  let fix = bounds
+  if flipped != 1 { fix = bounds + " step " + i32ToStr(flipped) }
+  let dir = "down"
+  let rel = "below"
+  let other = "up"
+  if step > 0 {
+    dir = "up"
+    rel = "above"
+    other = "down"
+  }
+  "this range never runs: `" +
+    written +
+    "` counts " +
+    dir +
+    " (step " +
+    i32ToStr(step) +
+    ") from a start " +
+    rel +
+    " its end — write `" +
+    fix +
+    "` to count " +
+    other +
+    ", or swap the bounds"
+}
+
+// THE DIRECTION RULE (D1588, reported by glean as VL-038). A range whose bounds and
+// step are all compile-time constants and whose step contradicts its direction can
+// never produce an iteration; so can a `step 0`, which never advances at all. Both
+// are refused here, on one category, because both are the same rule: a constant
+// descriptor that cannot complete as written. RUNTIME SEMANTICS ARE UNTOUCHED — a
+// non-constant wrong-order range still runs zero times, which is the loop's
+// contract and what every `for i in 0 to n - 1` with an empty `n` relies on.
+// `stepIx` is -1 for a defaulted `+1` step.
+function checkRangeNeverRuns(fromIx: i32, toIx: i32, stepIx: i32) {
+  let stepK = 1
+  const stepWritten = stepIx >= 0
+  if stepWritten {
+    if !constIntExprIs(stepIx) { return 0 }
+    stepK = constIntExprVal(stepIx)
+  }
+  // Anchored at the STEP, not the `to`: this sentence names `step 0`, so the caret
+  // belongs on the token the reader has to change. Fires whatever the bounds are.
+  if stepK == 0 {
+    return tErrCodedData(
+      "a range with `step 0` never advances",
+      stepIx,
+      CODE_RANGE_NEVER_RUNS,
+      diagDataField("step", "0"),
+    )
+  }
+  if !constIntExprIs(fromIx) || !constIntExprIs(toIx) { return 0 }
+  const from = constIntExprVal(fromIx)
+  const to = constIntExprVal(toIx)
+  if stepK > 0 && from <= to { return 0 }
+  if stepK < 0 && from >= to { return 0 }
+  const msg = rangeNeverRunsMsg(from, to, stepK, stepWritten)
+  const data = diagDataField("from", i32ToStr(from)) +
+    diagDataField("to", i32ToStr(to)) +
+    diagDataField("step", i32ToStr(stepK))
+  const tk = forToKwTok(toIx)
+  if tk >= 0 {
+    return tErrPush(
+      msg,
+      toIx,
+      P.toks[tk].line,
+      P.toks[tk].col,
+      CODE_RANGE_NEVER_RUNS,
+      data,
+    )
+  }
+  tErrCodedData(msg, toIx, CODE_RANGE_NEVER_RUNS, data)
+}
+
 // Extracted from `checkNodeReal`'s `ForRange` arm (C3: thin the dispatcher).
 function checkForRangeNode(n: ForRange, ix: i32) {
   const frFrom = checkNode(n.frFrom)
@@ -37293,15 +37467,8 @@ function checkForRangeNode(n: ForRange, ix: i32) {
     if !assignable(frStep, TY_I32) {
       tErr("for-range step must be i32, got " + tyToStr(frStep), ix)
     }
-    // A range `for` with a LITERAL `step 0` never advances its loop variable —
-    // a degenerate / infinite loop. Catch only a literal integer 0 (a negative
-    // step parses as a Unary wrapping the NumLit, and a runtime-0 step is not
-    // statically known, so neither is matched here).
-    const stepNode = P.nodes[n.frStep]
-    if stepNode is NumLit {
-      if stepNode.numText == "0" { tErr("`for` step is 0", n.frStep) }
-    }
   }
+  checkRangeNeverRuns(n.frFrom, n.frTo, n.frStep)
   // A `for` body re-executes with no condition to re-establish anything, so every
   // narrowing live here predates it — see `pushReBarrier`.
   pushReBarrier()

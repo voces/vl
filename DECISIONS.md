@@ -5521,3 +5521,45 @@ cells, and `u8` joins the reserved set in the single-file face too — the check
 and the merge's had been two copies that disagreed about exactly that name. The paragraph
 above ("Why not REFUSE the export instead") argued from the cost, and the owner accepted the
 cost: a user type that shadows `i32` / `f64` / `u8` has no upside and confuses at a distance.
+
+## A CONSTANT range that cannot run is refused; a computed one still runs zero times (D1588, 2026-09-04)
+
+**The report.** glean's GF(2) Gaussian elimination was written high-bit-down —
+`for bit in 31 to 0 { … }` — and the loop never ran. The solver answered "no preimage" for
+every input, including one it had built by applying the very map it was inverting; a
+self-check is the only reason anybody found out. `vl run` printed nothing, `vl check` exited
+0, and the wrong answer was confident (`~/glean/docs/vl-issues.md` §VL-038).
+
+**The rule.** When `from`, `to` and the step are ALL compile-time constants and the direction
+contradicts the step, the range is refused at the `to` token: `from > to` with a positive or
+defaulted step, `from < to` with a negative one, or a step of 0. Equal bounds run once in
+either direction and are not touched. The descending spelling that already worked
+(`3 to 0 step -1`) is what the message names, so the fix is in the sentence.
+
+**Why an ERROR and not a warning.** The TS core warned here (`range is empty and never
+iterates`, retired with that compiler and never ported), and a warning is exactly what this
+reporter would not have seen: `vl run` prints none, and `vl check` exits 0 on one. A rule that
+only fires in a command the author was not running is a rule that does not fire.
+
+**Why the runtime is UNTOUCHED, and this is the load-bearing half.** A non-constant
+wrong-order range still runs zero times, silently. `for i in lo to hi` with `hi < lo` is how
+"iterate a possibly-empty span" is spelled in every language with an inclusive range, and both
+alternatives are worse: a trap breaks the idiom at runtime, and a compile-time refusal cannot
+even be stated (the bounds are not known). Only what is knowable is refused.
+
+**Why LITERALS and not a folder.** The checker keeps no constant-VALUE scope — `constScopes`
+records which names are `const`, not what they hold — so `const hi = 0` is not folded and its
+range still runs zero times silently. Building a folder for one rule would give the checker a
+notion of "constant" wider than the emitter's (whose own range-step fold is a `NumLit` or a
+unary minus over one) with nothing else reading it. The fold peels parens and both signs,
+which is a superset only in spellings the emitter already refuses LOUDLY, so no program moves
+from a refusal to silence. Widening this to a real folder is a later, separate decision.
+
+**One category for both halves.** `step 0` and a contradicting direction ride the same
+`range-never-runs` code, because they are one rule — a constant range descriptor that cannot
+complete as written — and an editor wants one lightbulb, not two matches. The payload carries
+`from`/`to`/`step`, `from`/`to` absent when a bound is not constant (only the `step 0` arm
+raises without them). The name is imprecise for the zero-step case, which never *advances*
+rather than never *running*; that was accepted over splitting one rule across two codes. The
+`step 0` diagnostic is anchored at the STEP and the direction one at the `to` keyword — each
+caret sits on what the sentence tells the reader to change.
