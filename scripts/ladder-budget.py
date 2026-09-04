@@ -9,10 +9,17 @@ only FALL: `--check` fails when a file exceeds its baseline, `--write-baseline`
 lowers it after a ladder is closed. Sibling of scripts/comment-budget.py and
 scripts/scan-budget.py; see CLAUDE.md, "A LADDER OVER A CLOSED KIND SET".
 
-Why a ratchet and not a gate at zero: 440 of these stand today, and most are a
-resolver that legitimately answers about three of thirty-seven node kinds. What
-the rule buys is that a NEW one has to say what it excludes, and that the number
-never goes up.
+Why a ratchet and not a gate at zero: most of these are a resolver that
+legitimately answers about three of thirty-seven node kinds. What the rule buys
+is that a NEW one has to say what it excludes, and that the number never goes up.
+
+WHY THE FLOOR IS TWO ARMS, AND WHAT RAISING IT WOULD DROP. D1370's ladder —
+`captureValKind`, `Param` and `LetDecl` and a silent `"i32"` for a module-BLOCK
+capture — has EXACTLY TWO ARMS, so a floor of three cannot see it and the row
+that motivated this rule would go unreported. A floor of one reports the
+`const n = P.nodes[ix]; if n is X { … }` guard idiom, which is not a dispatch at
+all. The baseline carries the same sentence in `why_min_arms`, beside the number
+it explains; raise the floor only knowingly, and re-read D1370 first.
 
 The analysis itself lives in scripts/ladder-census.py — one implementation, two
 front ends, so the census a reader runs and the number the gate reads cannot
@@ -23,7 +30,10 @@ import importlib.util
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASELINE = os.path.join(ROOT, "scripts", "ladder-budget-baseline.json")
@@ -31,6 +41,14 @@ LINT = os.path.join(ROOT, "compiler", "lint.vl")
 INCOMPLETE = "kind-ladder-incomplete"
 SPLIT = "kind-ladder-split"
 CODES = (INCOMPLETE, SPLIT)
+# Committed INTO the baseline beside `min_arms`, so a future tidy-up raising the floor
+# reads the row it would drop in the very file it is editing.
+WHY_MIN_ARMS = (
+    "D1370's ladder (captureValKind: Param, LetDecl, and a silent \"i32\" for a "
+    "module-block capture) has EXACTLY TWO ARMS, so a floor of 3 cannot see it. A "
+    "floor of 1 reports the `if n is X` guard idiom, which is not a dispatch. Raise "
+    "the floor only knowingly, and re-read D1370 first."
+)
 
 
 def census():
@@ -100,6 +118,60 @@ def current(lc):
     return out
 
 
+def named(lc, root):
+    """{code: {name: hits}} for one tree — the NAMED entries. An incomplete ladder
+    is `file:function`, a split walk `file:first->second`.
+
+    HITS PER NAME, not a bare set: one function may carry SEVERAL ladders (a
+    different subject each), so the tree's 442 hits are 400 names. A name that keeps
+    its place while its count falls is a function that closed one of two, which a
+    set would show as no movement at all."""
+    saved, lc.ROOT = lc.ROOT, root
+    try:
+        sets = lc.closed_sets()
+        idx = lc.member_index(sets)
+        out = {INCOMPLETE: {}, SPLIT: {}}
+        for lad in lc.all_ladders(sets, idx):
+            if lad.ending == "silent":
+                k = f"{lad.rel}:{lad.fn}"
+                out[INCOMPLETE][k] = out[INCOMPLETE].get(k, 0) + 1
+        for rel, _sn, x, y, _g, _s, _ow in lc.split_pairs(sets, idx):
+            k = f"{rel}:{x.fn}->{y.fn}"
+            out[SPLIT][k] = out[SPLIT].get(k, 0) + 1
+        return out
+    finally:
+        lc.ROOT = saved
+
+
+def tree_at(commit):
+    """`compiler/` as of `commit`, unpacked into a temp directory by
+    `archive | tar -x` and NEVER by a checkout: this runs beside a working tree
+    somebody is editing, and a checkout would move their files under them. The
+    caller removes the directory."""
+    tmp = tempfile.mkdtemp(prefix="ladder-budget-")
+    try:
+        arch = subprocess.run(["git", "-C", ROOT, "archive", commit, "compiler"],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if arch.returncode != 0:
+            raise SystemExit(f"ladder-budget: `archive {commit}` failed: "
+                             + arch.stderr.decode(errors="replace").strip())
+        tar = subprocess.run(["tar", "-x", "-C", tmp], input=arch.stdout,
+                             stderr=subprocess.PIPE)
+        if tar.returncode != 0:
+            raise SystemExit("ladder-budget: could not unpack the archive: "
+                             + tar.stderr.decode(errors="replace").strip())
+        return tmp
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+
+
+def head_commit():
+    r = subprocess.run(["git", "-C", ROOT, "rev-parse", "--short", "HEAD"],
+                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    return r.stdout.decode().strip() if r.returncode == 0 else ""
+
+
 def load_baseline():
     with open(BASELINE, encoding="utf-8") as fh:
         return json.load(fh)
@@ -111,6 +183,8 @@ def write_baseline(cur):
     body = "\n".join([
         "{",
         f'"min_arms": {census().MIN_ARMS},',
+        f'"why_min_arms": {json.dumps(WHY_MIN_ARMS)},',
+        f'"commit": {json.dumps(head_commit())},',
         f'"total": {json.dumps(total)},',
         '"files": {',
         ",\n".join(rows),
@@ -143,8 +217,59 @@ def cmd_check(cur):
         )
         return 1
     tot = {c: sum(v[c] for v in cur.values()) for c in CODES}
+    was = load_baseline()["total"]
     print(f"kind-ladder budget ok — {tot[INCOMPLETE]} silent ladders, {tot[SPLIT]} "
           "split walks (baseline or below)")
+    # A FALL is where `--why` earns its place: "it went down" and "it went down
+    # because that function grew the arm" are different confidence levels, and only
+    # the second rules out a detector that stopped seeing something.
+    if any(tot[c] < was.get(c, 0) for c in CODES):
+        print("  below baseline — `python3 scripts/ladder-budget.py --why` names "
+              "which entries left")
+    return 0
+
+
+def cmd_why(lc, since):
+    """What LEFT and what ENTERED the reported set since the baseline was written.
+
+    The baseline's `commit` says which tree its numbers describe; `--why <rev>`
+    overrides it. Both sides are re-derived by the SAME walk, so a name that left
+    is a name that stopped qualifying — not a parser that stopped matching."""
+    base = load_baseline()
+    at = since or base.get("commit", "")
+    if not at:
+        raise SystemExit(
+            "ladder-budget: the baseline records no `commit`, so a fall cannot be\n"
+            "attributed. Pass one — `--why <rev>` — or re-run `--write-baseline`,\n"
+            "which records the tree its numbers were taken from.")
+    tmp = tree_at(at)
+    try:
+        was = named(lc, tmp)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    now = named(lc, ROOT)
+    print(f"kind-ladder: {at} -> working tree\n")
+    moved = 0
+    for code in CODES:
+        a, b = was[code], now[code]
+        print(f"{code}  {sum(a.values())} hits over {len(a)} names -> "
+              f"{sum(b.values())} over {len(b)}")
+        for n in sorted(set(a) - set(b)):
+            print(f"  LEFT     {n}" + (f"  (x{a[n]})" if a[n] > 1 else ""))
+            moved += 1
+        for n in sorted(set(b) - set(a)):
+            print(f"  ENTERED  {n}" + (f"  (x{b[n]})" if b[n] > 1 else ""))
+            moved += 1
+        for n in sorted(set(a) & set(b)):
+            if a[n] != b[n]:
+                print(f"  {n}  {a[n]} -> {b[n]}")
+                moved += 1
+        if sum(a.values()) == sum(b.values()) and set(a) == set(b):
+            print("  (the same entries, by name)")
+        print()
+    if moved == 0:
+        print("Nothing moved by name. A count that differs without a name moving is "
+              "the instrument, not the tree.")
     return 0
 
 
@@ -200,6 +325,9 @@ def main():
         return cmd_exempt_codes()
     lc = census()
     check_sets(lc)
+    if "--why" in args:
+        i = args.index("--why")
+        return cmd_why(lc, args[i + 1] if len(args) > i + 1 else "")
     if "--grade" in args:
         return cmd_grade(lc, args[args.index("--grade") + 1])
     if "--list" in args:
