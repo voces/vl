@@ -1,101 +1,40 @@
-// `std:args` — the program's command-line arguments, and the last piece of VL's
-// I/O tier. ADMITTED BY `docs/internals/std-design.md` D2's inventory clause —
-// "what the LANGUAGE story needs to be complete without third parties … fs/io/args
-// once WASI lands", which names it outright — and NOT by "a consumer in the tree",
-// because there is none yet; converting `fuzzgen.vl`'s sed-rewritten flags is the
-// FOLLOW-UP, not the warrant. ONE EXPORT, `programArgs()`, is the whole surface.
+// `std:args` — the program's command-line arguments, as text.
 //
-// INDEX 0 IS THE FIRST USER ARGUMENT. There is no program name in the list and
-// no export returns one — that is the FLOOR's shape, not a re-indexing applied
-// here, so `x.slice(1)` is the habit to unlearn rather than a step to keep.
+//     import { programArgs, Utf8Error } from "std:args"
 //
-// NAMED `programArgs` AND NOT `args`: VL has no namespace import, and a module
-// that both imports and declares a name is a HARD PARSE ERROR, so an export
-// `args` would make `const args = args()` refuse to compile; `argv` promises the
-// C layout this floor lacks. NOT `self`-FIRST — argv has no receiver.
-//
-// A LIST, NOT `argCount()` + `argAt(i)`: `string[]` reaches the generic surface
-// where an index protocol composes with nothing, and `.length` plus VL's ordinary
-// bounds-checked `[i]` dissolves out-of-range instead of answering it.
-//
-// FALLIBLE, AND THE FAILURE ARM IS CURRENTLY UNREACHABLE: the floor hands over
-// `u8[]` and a POSIX argument is any NUL-free byte string, but both Rust hosts
-// read `std::env::args()`, which panics before VL is instantiated. It ships
-// anyway because widening a return type later is the breaking change std has no
-// deprecation story for. THE FAILURE IS `Utf8Error`, BORROWED not invented: one
-// failure domain, and a new `ArgError = { code: i32, msg: string }` would be
-// structurally identical to `std:fs`'s `IoError`. ALL OR NOTHING — one argument
-// that is not UTF-8 fails the WHOLE call; dropping it would RENUMBER the rest.
-//
-// THE ERRNO STAYS INSIDE — the empty-plus-errno protocol is read once in the
-// loop, so this API has no ambient state and no order-dependent call. The ONE
-// `__trap__` fires only if the floor refuses an index below its own count.
-//
-// NOT HERE, EACH FOR A REASON. NO FLAG PARSING: clustering, `--name=value`, `--`,
-// repeated flags and typed defaults are each a policy a half-parser would settle
-// silently, and none needs a new floor intrinsic. NO BYTES ACCESSOR and NO LOSSY
-// VARIANT: every `std:fs` entry takes `path: string`, so non-text argument bytes
-// could not open the file they name. NO ENVIRONMENT, EXIT CODE, NAME or STDIN.
+// `programArgs()` is the whole surface. Index 0 is the FIRST user argument —
+// the program name is not in the list, so there is nothing to slice off — and
+// nothing here parses flags: the arguments arrive as the host passed them.
 
 import { Utf8Error, decodeUtf8 } from "std:utf8"
-// `toString` is `std:fmt`'s export as of 2026-09-01, not the ambient builtin it was
-// (owner ruling, DECISIONS.md). One index rendering here needs it. `std:utf8` above
-// already pulls `std:fmt` in for the same reason, so this import adds a NAME and no
-// bytes; the price and why a private renderer was refused are in `std:utf8`'s header.
 import { toString } from "std:fmt"
 
-// RE-EXPORTED so a caller of the fallible export can spell its own error arm from
-// the module it imported: `import { Utf8Error, programArgs } from "std:args"`.
-// Without this the caller needs a second import from `std:utf8` to write the `is`
-// branch, which is a tax this module otherwise works hard to avoid. It is not a
-// second `Utf8Error` — a re-export records a NAME, so there is exactly one type;
-// and it costs nothing, measured: the import section stays at three host imports,
-// all of them called. `compiler/emit_base.vl` republishes seven type names from
-// `typecheck.vl` on the same mechanism.
+// Re-exported so a caller of `programArgs` can spell its error arm without
+// a second import. It is the same type `std:utf8` exports, not a copy.
 export { Utf8Error } from "std:utf8"
 
-// `programArgs()` — every argument the program was given, in order, as text. Index 0
-// is the FIRST USER ARGUMENT and there is no program name in the list (see the
-// header). No arguments is an EMPTY ARRAY, never an error and never null: being given
-// nothing is not a failure, it is the answer. The failure is a single argument that is
-// not UTF-8, reported as `std:utf8`'s `Utf8Error` with `at` and `byte` keeping that
-// module's meanings. WHICH argument is named in `msg` only — a fourth field would fork
-// the error vocabulary for a fact no caller can act on.
-//
-// ONE HOST WART, INVISIBLE FROM IN HERE: `vl run p.vl -v x` delivers ONE argument,
-// because the host discards unknown dash-led tokens with no diagnostic, while
-// `vl run p.vl -- -v x` delivers both — and nothing here can tell a dropped argument
-// from an un-passed one. `tests/vl_std_args_test.ts` pins it (#1818).
+// Every argument the program was given, in order. No arguments is an EMPTY
+// list, never an error and never null. The one failure is a single argument
+// that is not UTF-8: it fails the WHOLE call with `std:utf8`'s `Utf8Error`
+// naming which one, because dropping it would renumber the rest.
 export function programArgs(): string[] | Utf8Error {
   const n = __args_count__()
   const out: string[] = []
   let i = 0
   while i < n {
     const raw = __args_get__(i)
-    // EMPTY is the floor's failure signal AND a legitimate argument — `""` is a
-    // real thing to pass — so the errno is what separates them, exactly as
-    // `std:fs` separates a failed read from an empty file. Inside
-    // `0 .. __args_count__()` the floor answers by contract, so a non-zero errno
-    // is a HOST contradicting its own count: a BUG no caller can cause or
-    // recover from, hence a trap. Not checking is what would put a blank
-    // argument in a real position, since `decodeUtf8` of an empty array is `""`.
-    // The trap is unreachable at both Rust hosts only because `__args_get__`
-    // ZEROES THE SHARED ERRNO CELL on success, so it rests on a `std:fs` FLOOR
-    // INVARIANT and not on anything local — `PROGRAM_ARGS` being immutable does
-    // NOT guard it, because the adversarial case is a dirty cell left by an
-    // unrelated failed `std:fs` call followed by a legitimately empty argument.
+    // An empty argument is both the floor's failure signal and a legitimate
+    // value, so the errno is what separates them.
     if raw.length == 0 {
       if __fs_errno__() != 0 {
-        __trap__("std:args: the floor refused an index below __args_count__()")
+        __trap__(
+          "internal error in std:args: an argument below the reported count cannot be read; please report",
+        )
       }
     }
     const s = decodeUtf8(raw)
     if s is Utf8Error {
-      // Re-spelled as a literal rather than forwarded, so the message names the
-      // argument; a struct produced by a CALL and flowing into a union position
-      // does not lower at this head (`std:fs`'s header records the same
-      // constraint), so every error out of this module is written where it is
-      // returned.
+      // Re-spelled here so the message names which argument failed.
       return {
         at: s.at,
         byte: s.byte,

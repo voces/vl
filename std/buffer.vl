@@ -1,73 +1,30 @@
-// `std:buffer` — the linear-memory tier's allocator and access surface, in pure VL over the
-// `__load_*__` / `__store_*__` / `__memory_*__` intrinsic floor
-// (`docs/internals/buffer-design.md` §C, sequencing item S5). The compiler owns exactly what
-// an INSTRUCTION is; allocation POLICY is ordinary code and lives here (O1 = (c): `Buffer` is
-// std VL, not a compiler-known type).
+// `std:buffer` — allocating and reading raw bytes in linear memory.
 //
-// TWO HEAPS. A `Buf` VALUE is an ordinary WasmGC struct with ordinary VL value semantics; a
-// `Buf`'s CONTENTS live in linear memory, which the host can read directly through the
-// module's exported `memory`. `.length` is a plain field read — no call, no side table.
+//     import { Buffer, bufferMark, bufferRelease, loadI32, storeI32 } from "std:buffer"
 //
-// BOUNDS: there are none here, by design (§A4). An access past the end of the memory traps in
-// the ENGINE — that trap is the memory-safety proof, and adding a VL-level check would only
-// make it quieter. An access past the end of a `Buf` but still inside the memory is NOT
-// caught: `Buf` describes an extent, it does not fence it. (The typed VIEWS further down are
-// the one exception, and that section says why.)
-//
-// HOST CONTRACT (O5 = lazy growth, no epoch export). `Buffer(n)` grows the memory when it
-// must, and a `memory.grow` DETACHES every host view of `exports.memory.buffer`. A host must
-// therefore re-take its typed-array views after any guest call that may allocate; a stale view
-// is detectable by `view.byteLength === 0` (a detached view yields `undefined` on an indexed
-// read rather than throwing). This is what Emscripten's `updateMemoryViews()`, wasm-bindgen's
-// `byteLength === 0` probe and Go's `wasm_exec.js` buffer-identity check all do; none of them
-// exports a growth counter, and neither does this module.
-//
-// RECLAMATION IS MARK/RELEASE, AND IT CAN DANGLE (O6). There is no per-object `free`;
-// `bufferMark()` / `bufferRelease(mark)` move the one bump pointer, so reclamation is LIFO and
-// costs nothing. The hazard is stated here rather than in a footnote because it is the FIRST
-// way a VL program can hold a dangling reference at all: a `Buf` held across a `bufferRelease`
-// that undoes its allocation still points at live, in-bounds, since-reused linear memory.
-// Reads through it return another buffer's bytes and writes through it corrupt them —
-// SILENTLY. No trap fires, because nothing is out of bounds. Treat a released mark as
-// invalidating every `Buf` allocated after it.
-//
-// PERFORMANCE. Every access below is a real wasm `call`, and every body is ONE instruction
-// plus its address arithmetic. `wasm-opt -O` (what `vl build -O` runs) does NOT inline these
-// wrappers; `-O3 --closed-world` does (§O1).
+// A `Buf` is an ordinary value describing an extent of linear memory, and a host
+// reads those bytes directly through the module's exported `memory`. NOTHING here
+// bounds-checks except the typed views: a read past the end of a `Buf` but still
+// inside the memory is not caught. Reclamation is LIFO — `bufferRelease(mark)`
+// invalidates every `Buf` allocated after `mark`.
 
-// A `Buf` is a linear-memory extent: the byte address of its first byte, and
-// the number of bytes the caller ASKED for (the allocator may reserve a few
-// more for alignment; those are invisible here).
+// A linear-memory extent: the byte address of its first byte, and the number of
+// bytes the caller asked for. `.length` is a plain field read.
 export type Buf = { base: i32, length: i32 }
 
-// A wasm page is 64 KiB; `__memory_size__` / `__memory_grow__` count pages.
+// A wasm page is 64 KiB, and the memory intrinsics count pages.
 const PAGE_SHIFT = 16
 const PAGE_MASK = 65535
 
-// POLICY 1 — the reserved low region. Byte addresses below `HEAP_BASE` are
-// never handed out. Three reasons, none of them cosmetic:
-//   - address 0 stays outside every allocation, so `base == 0` cannot be a
-//     legitimate `Buf` and a zeroed/garbage descriptor is distinguishable;
-//   - a program may still poke raw addresses through the bare intrinsics
-//     (that is the §A3 "two users collide" hazard), and this leaves it a
-//     documented kilobyte that `std:buffer` promises never to touch;
-//   - the host's staging ABI probe (`ioMem`, `scripts/vl-host/src/main.rs`)
-//     wants a fixed low window it can own later without moving the heap.
-// 1 KiB, not one page: reserving a whole page would force a `memory.grow`
-// during init for programs that fit comfortably in the default one.
+// Byte addresses below this are never handed out, so `base == 0` is never a
+// real `Buf` and a program poking raw addresses has a window std will not touch.
 const HEAP_BASE = 1024
 
-// POLICY 2 — alignment. Every allocation's SIZE is rounded up to `ALIGN` and `HEAP_BASE` is a
-// multiple of it, so every `Buf` starts aligned and each width's natural alignment is
-// satisfied at offset 0 and at every multiple of `ALIGN`. This is a PERFORMANCE choice, not a
-// correctness one — wasm's alignment immediate is a hint and every load/store here is legal at
-// any address (pinned by the unaligned cases in `tests/cases/memory/`). The value is the
-// widest scalar VL can store (i64 / f64).
+// Every allocation's size rounds up to this, so each `Buf` starts aligned and
+// every width's natural alignment is satisfied at offset 0.
 const ALIGN = 8
 
-// The bump pointer: the address one past the last byte handed out. Module-level
-// mutable state, which is exactly what makes the allocator's policy ordinary
-// VL code (§C4).
+// The bump pointer: the address one past the last byte handed out.
 let bumpPtr = HEAP_BASE
 
 // `n` rounded up to the next multiple of `ALIGN`.
@@ -78,39 +35,22 @@ function alignUp(n: i32): i32 {
 }
 
 // Grow the memory until byte `end` (exclusive) is addressable. Page arithmetic
-// throughout — computing `pages * 65536` would itself overflow i32 at 2 GiB,
-// which is inside the range this can be asked about.
+// throughout, because a byte count would overflow an i32 at 2 GiB.
 function ensureCapacity(end: i32) {
   let needPages = end >> PAGE_SHIFT
   if (end & PAGE_MASK) != 0 { needPages = needPages + 1 }
   const havePages = __memory_size__()
   if needPages > havePages {
-    // `memory.grow` answers with the size BEFORE the growth, or -1 on failure.
-    // A refused allocation cannot be papered over — the caller is about to write
-    // through a `Buf` that has no memory behind it.
-    //
-    // MEASURED, this branch is defensive rather than routine: `Buffer`'s i32
-    // overflow guard caps `end` at 2^31, i.e. at most 32768 pages, and wasm32's
-    // own ceiling is 65536 — so the SPEC limit is unreachable from here and only
-    // host resource exhaustion can produce the -1. Both hosts grow a 2 GiB
-    // request without complaint (wasmtime 47 and V8 alike, measured), which is
-    // why no corpus fixture pins this line: there is no request that fails
-    // deterministically on every host.
+    // A refused growth cannot be papered over: the caller is about to write through
+    // a `Buf` with no memory behind it.
     if __memory_grow__(needPages - havePages) < 0 { __trap__() }
   }
 }
 
-// `Buffer(n)` — reserve `n` zero-filled bytes and describe them.
-//
-// ZERO-FILL: a wasm memory starts zeroed and freshly grown pages are zeroed, so
-// bytes that have never been handed out before are zero for free — no fill loop
-// runs here. That guarantee ends at the first `bufferRelease`: addresses handed
-// out a SECOND time carry whatever the previous owner wrote. Call
-// `buf.fill(0, buf.length, 0)` when reusing a released region and zeros matter.
-//
-// Traps on a negative length and on an allocation that would carry the bump
-// pointer past 2 GiB (where an i32 byte address stops being orderable), because
-// either would silently corrupt every later allocation.
+// Reserve `n` zero-filled bytes and describe them. Bytes never handed out
+// before are zero for free; a region reclaimed by `bufferRelease` holds
+// whatever was written there. Traps on a negative length or a total past 2 GiB.
+// Growing the memory DETACHES a host's views of it — re-take them afterwards.
 export function Buffer(byteLength: i32): Buf {
   if byteLength < 0 { __trap__() }
   const base = bumpPtr
@@ -121,47 +61,40 @@ export function Buffer(byteLength: i32): Buf {
   return { base: base, length: byteLength }
 }
 
-// `bufferMark()` — the current bump pointer, to hand back to `bufferRelease`.
+// The current bump pointer, to hand back to `bufferRelease`.
 export function bufferMark(): i32 { return bumpPtr }
 
-// `bufferRelease(mark)` — reclaim everything allocated since `mark` in one
-// move. LIFO, no free list, no fragmentation, and NO liveness check: see this
-// module's header for the dangling-`Buf` hazard this opens, which is silent
-// corruption rather than a trap.
-//
-// Traps on a mark outside `[HEAP_BASE, bumpPtr]` — below the base it would let
-// allocations walk into the reserved region, above the pointer it re-reserves
-// bytes that are already free. Both are bugs at the call site, not recoverable
-// states.
+// Reclaim everything allocated since `mark`, in one move. Every `Buf` allocated
+// after `mark` DANGLES: reads answer another buffer's bytes and writes corrupt
+// them silently, because nothing is out of bounds. Traps on a `mark` outside
+// `[heap base, bump pointer]` — which a mark held across an earlier release is.
 export function bufferRelease(mark: i32) {
   if mark < HEAP_BASE { __trap__() }
   if mark > bumpPtr { __trap__() }
   bumpPtr = mark
 }
 
-// ── Loads: eight widths, four of them signed/unsigned pairs. ──
-//
-// The signed/unsigned split is REAL here and is kept: `i32.load8_s` and
-// `i32.load8_u` are two different instructions, and of the byte 0xFF the first
-// answers -1 while the second answers 255. (The stores below have no such
-// split — see `store8`.)
+// ── loads ────────────────────────────────────────────────────────────────────
 
-// The byte at `off`, sign-extended into an i32 (0xFF → -1).
+// Eight widths, four of them signed/unsigned pairs: of the byte 0xFF, `loadI8`
+// answers -1 and `loadU8` answers 255.
+
+// The byte at `off`, sign-extended into an i32.
 export function loadI8(self: Buf, off: i32): i32 {
   return __load_i8__(self.base + off)
 }
 
-// The byte at `off`, zero-extended into an i32 (0xFF → 255).
+// The byte at `off`, zero-extended into an i32.
 export function loadU8(self: Buf, off: i32): i32 {
   return __load_u8__(self.base + off)
 }
 
-// The 16-bit halfword at `off`, sign-extended (0xFFFF → -1).
+// The 16-bit halfword at `off`, sign-extended.
 export function loadI16(self: Buf, off: i32): i32 {
   return __load_i16__(self.base + off)
 }
 
-// The 16-bit halfword at `off`, zero-extended (0xFFFF → 65535).
+// The 16-bit halfword at `off`, zero-extended.
 export function loadU16(self: Buf, off: i32): i32 {
   return __load_u16__(self.base + off)
 }
@@ -186,13 +119,10 @@ export function loadF64(self: Buf, off: i32): f64 {
   return __load_f64__(self.base + off)
 }
 
-// ── Stores: six widths, and no signed/unsigned split (O2). ──
-//
-// A store is sign-AGNOSTIC. There is exactly one instruction per width and it
-// TRUNCATES — `i32.store8` cannot tell a signed byte from an unsigned one — so
-// naming these `storeU8`/`storeI8` would falsely imply a signed twin exists.
-// Hence `store8` / `store16` against the loads' `loadI8` / `loadU8`: the
-// asymmetry is the instruction set's, and it is deliberate.
+// ── stores ───────────────────────────────────────────────────────────────────
+
+// Six widths and no signed/unsigned split: a store truncates, so `store8` has
+// no signed twin for its name to distinguish it from.
 
 // The 32-bit word at `off`.
 export function storeI32(self: Buf, off: i32, v: i32) {
@@ -214,59 +144,31 @@ export function storeF64(self: Buf, off: i32, v: f64) {
   __store_f64__(self.base + off, v)
 }
 
-// The low 8 bits of `v` at `off`. Higher bits are discarded, exactly as `i32.store8` discards
-// them — because this IS `i32.store8` (0x3a).
-//
-// It must stay ONE instruction rather than a read-modify-write over the containing word: a
-// wider access is unobservable from VL (no threads, no shared memory) but NOT from the host,
-// and `tests/vl_exported_memory_test.ts` reads the untouched neighbours through the exported
-// memory.
+// The low 8 bits of `v` at `off`; higher bits are discarded. It writes ONE byte
+// and never a wider word, so a host reading the neighbours sees them untouched.
 export function store8(self: Buf, off: i32, v: i32) {
   __store_i8__(self.base + off, v)
 }
 
-// The low 16 bits of `v` at `off`, little-endian — `i32.store16` (0x3b).
-//
-// This was two byte-wide read-modify-writes rather than one word-level one,
-// because a halfword at an address congruent to 3 mod 4 STRADDLES two words. The
-// instruction has no such difficulty: wasm's alignment immediate is a hint, and
-// a 16-bit store is legal and correct at every address, straddle included.
+// The low 16 bits of `v` at `off`, little-endian. Legal and correct at every
+// address, including one where the halfword straddles two words.
 export function store16(self: Buf, off: i32, v: i32) {
   __store_i16__(self.base + off, v)
 }
 
-// ── Bulk ops: one instruction each. ──
-//
-// THE ONE PLACE THIS MODULE DOES NOT PASS ITS ARGUMENT STRAIGHT THROUGH. Both instructions
-// take an UNSIGNED byte count and VL has no unsigned i32, so a negative `len` is ~4 GiB and
-// traps in the engine. The byte loops these bodies replaced treated a non-positive `len` as
-// "write nothing", and that behaviour is pinned (`tests/cases/std/buffer-bulk.vl`), so the
-// guard stays — which is the right layering anyway: the intrinsic IS the instruction
-// (`__memory_fill__` traps on -5, per `tests/cases/memory/bulk-negative-length-traps.vl`),
-// and softening it is POLICY, which is std's job (O1 = (c)).
-//
-// Nothing else is guarded. There is still no per-access bounds check, exactly as for every
-// load and store above: `Buf` describes an extent, it does not fence it.
+// ── bulk ─────────────────────────────────────────────────────────────────────
 
-// Set `len` bytes starting at `off` to the low 8 bits of `byte` — `memory.fill`
-// (0xfc 11). A non-positive `len` writes nothing.
-// (Spelled as a positive `if` rather than an early `return`: a BARE `return` in a
-// void function type-checks and then fails at emit — `emitProgram: bare return is
-// not supported`. Worth knowing before reaching for a guard clause here.)
+// Nothing here bounds-checks either; a non-positive `len` writes nothing.
+
+// Set `len` bytes starting at `off` to the low 8 bits of `byte`.
 export function fill(self: Buf, off: i32, len: i32, byte: i32) {
   if len > 0 { __memory_fill__(self.base + off, byte, len) }
 }
 
-// Copy `len` bytes from `src` at `srcOff` into `self` at `dstOff` — the DESTINATION is the
-// receiver (O3), matching `dst.fill(...)` and the self-first UFCS shape `std:array` /
-// `std:fmt` already establish. (`Buffer.copy` is not spellable: VL has no static methods.)
-//
-// OVERLAP IS HANDLED, by the INSTRUCTION. `memory.copy` (0xfc 10) is defined to behave as if
-// the bytes went through a temporary — memmove semantics, not memcpy — so an overlapping copy
-// never reads a byte it has already overwritten, in either direction. `self` and `src` may be
-// the same `Buf`, and may overlap partially either way. The direction-choosing loop this
-// replaced is gone rather than merely optimized, and both directions stay pinned by value in
-// `tests/cases/std/buffer-bulk.vl`.
+// Copy `len` bytes from `src` at `srcOff` into `self` at `dstOff` — the
+// DESTINATION is the receiver, matching `dst.fill(…)`. Overlapping ranges are
+// handled: the copy behaves as if the bytes went through a temporary, so `src`
+// and `self` may be the same `Buf`, overlapping either way.
 export function copyFrom(
   self: Buf,
   dstOff: i32,
@@ -277,61 +179,35 @@ export function copyFrom(
   if len > 0 { __memory_copy__(self.base + dstOff, src.base + srcOff, len) }
 }
 
-// ── Typed views (webcraft P1.1) ──────────────────────────────────────────────
-//
-// A VIEW re-describes a `Buf` sub-range in ELEMENTS rather than bytes: a byte address, an
-// element COUNT (`.length`, a plain struct field), and the element WIDTH IN THE TYPE, so a
-// further width is one more `new` rather than one more name hack. That `new` is load-bearing
-// (`docs/internals/newtype-design.md`): VL is STRUCTURALLY typed, so spelled plainly the two
-// views would be ONE type, and `iv.getF32(0)` would silently reinterpret integer bytes as a
-// float. Erasure makes the brand free; `docs/internals/buffer-design.md` §M has the rulings.
-//
-// BOUNDS ARE CHECKED HERE — the one place in `std:buffer` that checks, because an out-of-range
-// ELEMENT index usually stays inside the memory, so §A4's engine trap never fires and the read
-// returns a NEIGHBOUR'S BYTES. Each accessor traps on an index outside `[0, length)`.
+// ── typed views ──────────────────────────────────────────────────────────────
 
-// The largest element count whose byte size fits in a positive i32, per width.
-// `count << 2` at 2^29 is already negative, so the count must be rejected BEFORE
-// the shift rather than after it.
+// A view re-describes a `Buf` sub-range in ELEMENTS rather than bytes. These
+// ARE bounds-checked, because an out-of-range element index usually stays inside
+// the memory and nothing else would catch it. `F32View` and `I32View` are
+// distinct types on purpose: identically shaped, they would let a float read
+// integer bytes.
+
+// The largest element count whose byte size fits in a positive i32.
 const MAX_COUNT_4 = 536870911
 
-// A view of 4-byte floats. `base` is the byte address of element 0; `length` is
-// the element count. `new` is what keeps this distinct from `I32View`, which has
-// the identical shape — see this section's header.
+// A view of 4-byte floats. `base` is element 0's byte address and `length` is
+// the element count, both plain field reads.
 export type F32View = new { base: i32, length: i32 }
 
 // A view of 4-byte signed integers.
 export type I32View = new { base: i32, length: i32 }
 
-// THE BASE ADDRESS OF A VIEW, BRANDED BY WIDTH — the handle the `*At` accessors below take,
-// minted by `f32base` / `i32base`.
-//
-// Same reason `F32View` and `I32View` are `new`: the two are structurally identical (both an
-// address) and nothing but a nominal brand tells them apart. Unbranded,
-// `getF32At(iv.byteAddrI32(0), iv.length, 0)` would type-check and reinterpret integer bytes
-// as a float, silently — the same hazard the view section's header spends its `new` on.
-//
-// IT IS A SEPARATE MINTER, NOT `byteAddrF32`'s RETURN TYPE. Branding that one was tried and is
-// wrong: it exists for raw address ARITHMETIC, and a brand makes `a + (i << 2)` a type error
-// (`operator '+' mixes F32Base and i32`) at every use in this tree. A raw accessor answers a
-// raw address; the brand belongs on the handle whose only purpose is a fenced accessor call.
+// The base address of an f32 view, branded by width — the handle the `*At`
+// accessors below take. Only `f32base` mints one, so a base that came from
+// there was range-checked when its view was built.
 export type F32Base = new i32
 
-// The i32 twin. Distinct from `F32Base` only nominally — that is the whole job.
+// The i32 twin, distinct from `F32Base` only by name — which is the whole job.
 export type I32Base = new i32
 
-// Shared construction check for a 4-byte-element view over `self`: `off` is a
-// BYTE offset into the `Buf` and `count` is an ELEMENT count. Traps unless the
-// whole range `[off, off + count*4)` lies inside the `Buf`.
-//
-// This is the ALLOCATION-TIME check §J3 puts in std's hands, taken once per view
-// rather than once per access. It is what makes the per-access check able to be
-// just `0 <= i < length`: if the extent was validated when the view was made,
-// an in-range index cannot leave the `Buf`.
-//
-// A view may be EMPTY (`count == 0`), which is in-range for every offset up to
-// `length` and satisfies no index at all — the natural base case for a loop over
-// a column that happens to have no rows.
+// Check that `count` 4-byte elements starting at BYTE offset `off` lie inside
+// `self`, and answer their address. Taken once per view, which is what lets
+// each access check only `0 <= i < length`. An empty view is in range.
 function view4Base(self: Buf, off: i32, count: i32): i32 {
   if off < 0 { __trap__() }
   if count < 0 { __trap__() }
@@ -343,13 +219,15 @@ function view4Base(self: Buf, off: i32, count: i32): i32 {
   return self.base + off
 }
 
-// `buf.f32view(off, count)` — `count` f32 elements starting at byte `off`.
+// `count` f32 elements starting at byte `off`. Traps unless the whole range
+// lies inside `self`. A `count` of 0 is in range and satisfies no index.
 export function f32view(self: Buf, off: i32, count: i32): F32View {
   const b = view4Base(self, off, count)
   return { base: b, length: count }
 }
 
-// `buf.i32view(off, count)` — `count` i32 elements starting at byte `off`.
+// `count` i32 elements starting at byte `off`. Traps unless the whole range
+// lies inside `self`. A `count` of 0 is in range and satisfies no index.
 export function i32view(self: Buf, off: i32, count: i32): I32View {
   const b = view4Base(self, off, count)
   return { base: b, length: count }
@@ -383,19 +261,10 @@ export function setI32(self: I32View, i: i32, v: i32) {
   __store_i32__(self.base + (i << 2), v)
 }
 
-// ── the bracket (webcraft P1.1's spelling) ───────────────────────────────────
-// `x[i]` / `x[i] = v` over a view, as free INDEX-OPERATOR functions (B14). Each is a one-line
-// forward to the accessor above: same bounds check, same single load/store, so the bracket is
-// SPELLING, not a second access path, and the two spellings mix freely in one loop.
-//
-// THE FORWARD IS A REAL FRAME AT THE UNOPTIMIZED RUNG — `x[i]` emits a call to this function,
-// which then calls `getF32`, where `x.getF32(i)` emits one call. Both `-O` and `-O3` inline
-// the forward away and the two spellings converge, so it is a `vl build`-with-no-flags effect
-// only; `docs/internals/buffer-design.md` §M2 has the number.
-//
-// Two `"[]"` declarations coexist because an index operator dispatches on its `self`
-// parameter's TYPE, and the two views are distinct nominal brands.
+// ── the bracket spelling ─────────────────────────────────────────────────────
 
+// `v[i]` and `v[i] = x` over a view: the same bounds check and the same single
+// load or store as the accessors above, so the two spellings mix in one loop.
 export function "[]"(self: F32View, i: i32): f32 { return getF32(self, i) }
 
 export function "[]="(self: F32View, i: i32, v: f32) { setF32(self, i, v) }
@@ -404,48 +273,33 @@ export function "[]"(self: I32View, i: i32): i32 { return getI32(self, i) }
 
 export function "[]="(self: I32View, i: i32, v: i32) { setI32(self, i, v) }
 
-// The byte offset of element `i` RELATIVE TO the `Buf` the view was cut from is
-// not recoverable from the view alone (a view knows an absolute address, not its
-// parent). These two return the ABSOLUTE byte address of element `i`, which is
-// what a caller mixing view access with the bare intrinsics or with a host-side
-// typed array needs. No bounds check: this computes an address, it does not
-// dereference one, and `byteAddrF32(v, v.length)` — the one-past-the-end address
-// — is the useful answer for a range, not an error.
+// The ABSOLUTE byte address of element `i` — what a caller mixing view access
+// with the raw intrinsics, or with a host-side typed array, needs. NOT bounds
+// checked: it computes an address rather than dereferencing one, and the
+// one-past-the-end address is the useful answer for a range.
 export function byteAddrF32(self: F32View, i: i32): i32 {
   return self.base + (i << 2)
 }
 
+// The i32 twin.
 export function byteAddrI32(self: I32View, i: i32): i32 {
   return self.base + (i << 2)
 }
 
-// ── hoisted accessors: the same fence, without the per-access descriptor read ─
-//
-// The view accessors take the VIEW, so each access re-reads that struct's `base` and `length`,
-// and nothing hoists those reads out of a loop; the compiler-side repairs were measured and
-// REFUTED, so this is a library answer (`docs/internals/buffer-design.md` §M8). These four
-// take base and length as SCALARS — the caller hoists them once, the loop body holds no
-// reference, and the traps, loads and stores are identical. TWO THINGS ARE GIVEN UP, which is
-// why `v[i]` stays the default and these are an opt-in: the pair can be MISMATCHED across two
-// same-width columns (take both from one view, on adjacent lines), and `view4Base`'s
-// construction-time extent check does NOT transfer, so these fence against a CLAIMED extent —
-// a base from `f32base` carries the guarantee, one you computed does not.
+// ── hoisted accessors ────────────────────────────────────────────────────────
 
-// SELF-FIRST IS NOMINAL HERE, and that is the one place this module leaves the convention:
-// `base` leads to match `setF32(self, i, v)`, but the convention's PURPOSE is out of reach —
-// an `F32Base` is an i32 newtype, an i32 is not a UFCS receiver, and `pb.getF32At(n, i)` is
-// `member access '.getF32At' on non-object F32Base`. Kept in the leading slot for uniformity
-// with the tier these mirror, the same call `bufferMark()` / `bufferRelease(mark)` makes. The
-// medial width in `getF32At` is deliberate: the VERB carries the unit, `At` says the caller
-// supplies the index.
+// These take the base and the length as SCALARS, so a loop hoists them once
+// instead of re-reading the view on every access. Same traps, same loads and
+// stores. Two things are given up, which is why `v[i]` stays the default: the
+// pair can be MISMATCHED across two same-width columns, and the extent is the
+// one you CLAIM — only a base from `f32base`/`i32base` carries the view's check.
+// They are also NOT methods: a base is a plain address, not a receiver, so
+// `getF32At(b, n, i)` is the only spelling and `b.getF32At(n, i)` is a type error.
 
-// `f32base(v)` — the branded base of an f32 view, for the accessors below. This is
-// the ONLY public way to mint an `F32Base`, which is what makes the brand carry
-// PROVENANCE as well as width: a base that came from here was validated by
-// `view4Base` when the view was constructed.
+// The branded base of an f32 view. The only public way to mint an `F32Base`.
 export function f32base(self: F32View): F32Base { return self.base as F32Base }
 
-// `i32base(v)` — the i32 twin.
+// The i32 twin.
 export function i32base(self: I32View): I32Base { return self.base as I32Base }
 
 // Element `i` of the f32 extent `[base, base + length*4)`. Traps on an index

@@ -103,6 +103,26 @@ const genCallSites = (n: number, k: number): string => {
   return o.join("\n") + "\n";
 };
 
+// CALLBACK SLOTS: N higher-order functions each taking a callback, against N/K taking the
+// same N callbacks over K call sites each. Both arms declare N callbacks and place N call
+// sites; only the number of function-TYPED PARAMETER SLOTS differs, and that is the entity
+// the `??`-merge family's resolvers are asked about once each (`anonLeafCloSlotMark`).
+const genCallbacks = (n: number, k: number): string => {
+  const m = Math.max(1, Math.floor(n / k));
+  const o: string[] = [];
+  for (let i = 0; i < n; i++) o.push(`function cb${i}(x: i32): i32 { x + ${i % 13} }`);
+  for (let i = 0; i < m; i++) {
+    o.push(`function hof${i}(fn${i}: (i32) => i32, x: i32): i32 { fn${i}(x) + ${i % 7} }`);
+  }
+  o.push("let acc = 0");
+  for (let i = 0; i < n; i++) {
+    o.push(`acc = acc + hof${i % m}(cb${i}, ${i % 5})`);
+    fill(o, i, 6);
+  }
+  o.push("print(acc)");
+  return o.join("\n") + "\n";
+};
+
 const genClosures = (n: number, k: number): string => {
   const m = Math.max(1, Math.floor(n / k));
   const o: string[] = [];
@@ -286,6 +306,22 @@ axis("modules", 5.0, "The module merge is scaling with the file count.", (d) => 
 // absent from the one arm: a linear scan of `fnStmts` asked once per closure.
 axis("closures", 4.0, "`fnStmtsPosOf` scans `fnStmts` once per closure.", (d) =>
   twoFiles(d, genClosures(3000, 1), genClosures(3000, 20)));
+
+// 2.06 / 1.03 / 1.92, stable over three runs (1.92 / 1.89 / 1.97) and holding at load 57.
+// D1514's axis, and the one the whole family was blind to: `anonLeafCloSlotMark` asks
+// `anonLeafParamFnTarget` of every callback-typed parameter, that asks `anonLeafParamFnTargetAt`
+// of every `Param` sharing the name, and THAT scanned every `Call` in the arena asking
+// `anonLeafOneDeclNamed` — itself a whole-arena scan. Cubic in the node count, and the
+// compiler's own source has no callback-typed parameter, so `self-compile-time.sh` never saw
+// it. On the pre-D1514 compiler this pair is red at a SEVENTH of N: at 40 the many arm does
+// not finish in 200 s against 0.037 s for the one arm, where the fixed compiler reads
+// 0.035 / 0.029. The residual ~1.9 here is the many arm's extra function declarations.
+axis(
+  "callback slots",
+  4.0,
+  "`anonLeafCloSlotMark` / `anonLeafParamFnTargetAt` are scaling with the callback-parameter count (D1514).",
+  (d) => twoFiles(d, genCallbacks(300, 1), genCallbacks(300, 20)),
+);
 
 // 1.68 / 0.38 / 4.37 — the widest gap in the family, and super-linear in the pin count
 // (0.23s at 200 pins, 0.84s at 400, 3.23s at 800). `collectA` is 68% inclusive on the

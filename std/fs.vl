@@ -1,80 +1,32 @@
-// `std:fs` — the filesystem, and VL's first FALLIBLE std module.
+// `std:fs` — reading and writing whole files, and listing directories.
 //
-// A missing file is not a BUG, so this module cannot trap the way `std:fmt` / `std:array` /
-// `std:buffer` do; `docs/error-handling-design.md` says how VL spells the alternative:
-// **errors are values, carried in the return type as a union**. There is no `throw` and no
-// `try`, and `__trap__` appears in this file zero times. `T | IoError` is reasoned failure on
-// every read/list/stat surface; `T | null` is expected absence, never an I/O failure — only
-// "it succeeded and has nothing to report" (`writeFile` returns `IoError | null`).
+//     import { readTextFile, writeTextFile, listDir, IoError } from "std:fs"
 //
-// `IoError = { code: i32, msg: string }` is the ruled shape: `code` is the WASI errno as a
-// POSITIVE number (the constants below name the ones worth testing), `msg` a human sentence
-// naming the operation and the path. It is meant to EXTEND the design doc's floor shape
-// `{ msg: string }` but does not at this compiler head: a `{code, msg}` value does not satisfy
-// a `{msg}` parameter, and `x is Err` over an `IoError` arm is a hard type error. So a caller
-// handles `IoError` BY NAME and "any error" has to spell the union. The `as` trio works over
-// these unions; the bodies keep `if e is IoError { return e }` — the boilerplate this measures.
-//
-// TWO DELIBERATE BREAKS WITH std HOUSE STYLE, justified here as `std-api-review.md` requires.
-// (1) NOT `self`-FIRST, so these are free functions and not UFCS methods: `self` is the UFCS
-// SWITCH, matched on the literal parameter name, so calling the first parameter `path` makes
-// `"hello".readTextFile()` unspellable by construction — the thing operated on is the FILE,
-// not the string naming it. (2) NOUN-FIRST for the two questions, `pathKind`/`pathExists` not
-// `kind`/`exists`: VL has no namespace import, so every export lands in the importer's flat
-// top-level scope where a bare `exists` collides with every other existence check. And
-// `pathKind` is not `stat`, which would promise the size, mtime and mode this cannot report.
-//
-// WHAT CROSSES THE FLOOR. The intrinsics take and return `u8[]` — packed GC byte arrays, no
-// linear memory, no pointers, no capacities. Paths cross as UTF-8 bytes because that is what
-// POSIX stores; CONTENT crosses as bytes because a file is bytes and a PNG or a zip must
-// survive a round trip. Text is a DECODING on top, which is why `readFile`/`readTextFile` are
-// two functions and not one with a flag; `std:utf8` owns the conversion and the policy.
-//
-// WHAT THIS MODULE DOES NOT DO. No path manipulation (a future `std:fs/path`; until then
-// `dir + "/" + name` is the join). No open handles, seeking, streaming or partial reads:
-// every read is whole-file, so a file larger than memory is not readable here. No metadata
-// beyond file-or-directory, no mkdir, remove, rename or symlink inspection — each is a floor
-// intrinsic that does not exist yet, and a std wrapper for a syscall VL cannot make is a name
-// that fails at emit. And nothing here is atomic against another process, which is why
-// nothing pre-checks for the caller: `readFile` does not stat first for a prettier error, it
-// reads and reports what the host said — a pre-check costs a syscall and buys a race.
+// Errors are VALUES: every fallible export answers `T | IoError` and nothing here
+// traps. These are FREE functions and not methods — the thing operated on is the
+// FILE, so `path` leads and `"a.txt".readTextFile()` is deliberately unspellable.
+// Paths are strings and contents are bytes; text is a decoding on top, which is
+// why `readFile` and `readTextFile` are two functions rather than one with a flag.
+// No path manipulation, no open handles, no partial reads: every read is whole-file.
 
 import { Utf8Error, decodeUtf8, decodeUtf8At, encodeUtf8 } from "std:utf8"
-// `toString` is `std:fmt`'s export as of 2026-09-01, not the ambient builtin it was
-// (owner ruling, DECISIONS.md). Two errno/offset renderings here need it. `std:utf8`
-// above already pulls `std:fmt` in for the same reason, so this import adds a NAME and
-// no bytes; the price and why a private renderer was refused are in `std:utf8`'s header.
 import { toString } from "std:fmt"
 
-// The blessed I/O error shape (`docs/error-handling-design.md` O3). `code` is
-// the WASI errno as a POSITIVE number — the floor reports `-errno` and this
-// module negates once, at the boundary, so a caller never sees a sign
-// convention.
+// A failed operation. `code` is the WASI errno as a POSITIVE number — the
+// constants below name the ones worth branching on — and `msg` is a sentence
+// naming the operation and the path.
 export type IoError = { code: i32, msg: string }
 
-// The result of an operation that has NOTHING to report when it succeeds: a reason, or `null`
-// for "it worked". This is the `T | null` layer doing exactly what it is for — a successful
-// whole-file write has no value to hand back, and inventing one (a byte count the floor never
-// reported, a boolean that is only ever `true`) would be fabricating information.
-//
-// Spelled as a NAMED alias rather than inline as `IoError | null` in each signature. That WAS
-// a constraint and is now a preference: a struct appearing both in an inline `S | null` and in
-// another union of the same module used to fail at emit with `ref valtype with no interned
-// shape`, because only the declaration route interned the shape. Both routes intern it now,
-// the inline spelling lowering as the `nulvariant` niche. The alias stays because it names the
-// concept once and reads better at every call site.
+// What an operation answers when success has nothing to report: a reason, or
+// `null` for "it worked". Call sites read `if e != null { … }`.
 export type IoResult = IoError | null
 
-// What a path names. A literal union rather than a struct or an i32: it is one
-// closed question with two answers today, `match` dispatches it exhaustively,
-// and a third answer (`"symlink"`) is a one-word edit that makes every existing
-// `match` fail loudly instead of silently falling through.
+// What a path names. A literal union, so `match` over it is exhaustive and a
+// third answer added later makes every existing `match` fail loudly.
 export type FileKind = "file" | "dir"
 
-// The errno numbers worth naming, in WASI preview1's numbering (which is what
-// the host reports and what `docs/error-handling-design.md` already uses when it
-// writes `{ code: 44, msg: "no such file" }`). These are the codes a program
-// actually branches on; the rest are rendered by number.
+// The errnos worth naming, in WASI preview1's numbering. Everything else is
+// reported by number.
 export const EACCES = 2
 export const EILSEQ = 25
 export const EINVAL = 28
@@ -85,9 +37,7 @@ export const ENOSPC = 51
 export const ENOTDIR = 54
 export const EPERM = 63
 
-// The errno as a short name, or `"errno N"` for everything else. Deliberately
-// not a 76-arm table: these are the ones a caller can do something about, and a
-// number is a perfectly good rendering of a code nobody branches on.
+// The errno as a short name, or `"errno N"` for the rest.
 function errName(code: i32) {
   if code == EACCES { return "EACCES (permission denied)" }
   if code == EILSEQ { return "EILSEQ (invalid byte sequence)" }
@@ -101,62 +51,33 @@ function errName(code: i32) {
   "errno " + toString(code)
 }
 
-// The one message shape, so every error out of this module reads the same and a
-// grep for one of them finds all of them. The operation is named because the
-// path alone does not say whether the read or the decode failed.
+// The one message shape, so every error out of this module reads the same.
 function failed(op: string, path: string, code: i32) {
   "fs." + op + " " + path + ": " + errName(code)
 }
 
-// The errno for a floor call that answered EMPTY.
-//
-// The module's one piece of GLOBAL STATE, a DEVIATION knowingly taken:
-// `docs/internals/std-api-review.md` §2 flags ambient state and requires the constraint that
-// forced it be named. Neither in-band shape lowered, so the reason travels out of band through
-// `__fs_errno__()` — read it IMMEDIATELY after the failed call, never otherwise. That
-// constraint has since lifted (`u8[] | i32` lowers and runs); this wrapper keeps the swap cheap.
-//
-// RETURNS 0 WHEN THE LAST CALL DID NOT FAIL, and that zero is load-bearing: the floor signals
-// failure with an EMPTY `u8[]`, which an empty FILE and an empty DIRECTORY also produce, so
-// the errno is what tells them apart. A negative errno is folded, so `-ENOENT` and `ENOENT`
-// from two floors are the same to every caller.
+// The errno of the call that just answered empty, as a positive number; 0 when
+// that call did not fail.
 function lastErrno(): i32 {
   const e = __fs_errno__()
   if e < 0 { return 0 - e }
   e
 }
 
-// Whether an EMPTY result from a `u8[]`-returning intrinsic is a failure, and if
-// so which. Returns 0 for "not a failure — the file or directory really is
-// empty". One home for the empty-plus-errno protocol, so the three call sites
-// cannot drift, and so the swap to an in-band `u8[] | i32` floor (now expressible
-// — see #1806) is a change to this function rather than to every caller.
+// Whether an empty result from the floor was a failure, and if so which. 0
+// means the file or directory really is empty.
 function emptyErrno(): i32 { lastErrno() }
 
-// The message for an empty path, which every entry point rejects before it reaches the floor.
-// This is the ONLY policy this module applies ahead of the syscall, and it earns its place
-// twice: `""` names nothing on any host (POSIX `openat` answers ENOENT, other hosts vary),
-// and answering identically everywhere is worth one comparison.
-//
-// Only the MESSAGE is factored out, not the error value, and that is a constraint rather than
-// a preference: a struct produced by a CALL and flowing into a union position does not lower
-// — `return someHelper()` from a function returning `T | IoError` fails at emit with `ref
-// valtype with no interned shape`. Every `IoError` in this file is therefore an object
-// LITERAL written at the site that returns it; factoring them into a constructor is the
-// obvious tidy-up and it does not compile.
+// Every entry point rejects an empty path before the syscall — the one policy
+// applied ahead of the host, so the answer is the same everywhere.
 function emptyPathMsg(op: string) { "fs." + op + ": the path is empty" }
 
-// `readFile(path)` — the whole file as bytes, or why not.
-//
-// BYTES, not text: this is the function that reads a PNG. Whole-file only —
-// there is no handle, no offset and no way to read part of one, so the result is
-// as large as the file and a file that does not fit in memory is not readable
-// here.
+// The whole file as bytes, or why not. This is the function that reads a PNG.
+// Whole-file only: the result is as large as the file.
 export function readFile(path: string): u8[] | IoError {
   if path.length == 0 { return { code: EINVAL, msg: emptyPathMsg("readFile") } }
   const r = __fs_read__(encodeUtf8(path))
-  // EMPTY is the floor's failure signal AND a legitimate empty file, so the
-  // errno is the disambiguator — see `emptyErrno`.
+  // Empty is both the floor's failure signal and a legitimately empty file.
   if r.length == 0 {
     const e = emptyErrno()
     if e != 0 { return { code: e, msg: failed("readFile", path, e) } }
@@ -164,19 +85,10 @@ export function readFile(path: string): u8[] | IoError {
   r
 }
 
-// `readTextFile(path)` — the whole file, decoded as UTF-8.
-//
-// Two failures, one type: the read can fail (any errno the host reports) and the
-// DECODE can fail (`EILSEQ`, with the byte offset in the message). The second is
-// the honest answer to "this file is not text" — see `std:utf8` for why the
-// strict decode is the default and `decodeUtf8Lossy` is the opt-out. A caller
-// who wants the lossy behaviour reads bytes and decodes them itself; that is two
-// lines and it is not this function's decision to make.
+// The whole file decoded as UTF-8, or why not. Two failures share one type:
+// the read can fail with any errno, and the DECODE fails with `EILSEQ` when
+// the file is not text. Read bytes and decode them yourself to be lossy.
 export function readTextFile(path: string): string | IoError {
-  // Guarded here as well as in `readFile`, so the message names the function the
-  // caller actually called. Every OTHER error below is forwarded verbatim from
-  // the call that produced it, and keeps that call's operation name — which is
-  // where the failure really happened, and is more useful than a re-wrap.
   if path.length == 0 {
     return { code: EINVAL, msg: emptyPathMsg("readTextFile") }
   }
@@ -189,31 +101,22 @@ export function readTextFile(path: string): string | IoError {
   text
 }
 
-// `writeFile(path, data)` — replace the file's contents with `data`.
-//
-// Returns `IoResult` — `null` IS the success case, because a successful write
-// has nothing to report; no partial-write count exists at this floor, so
-// returning one would be a fabrication. The call site reads
-// `if e != null { … }`.
-//
-// Whether the file is created, truncated or replaced atomically is the HOST's
-// policy, not this module's, and it is documented where the intrinsic is.
+// Replace the file's contents with `data`. Answers `null` on success, since a
+// whole-file write has nothing to report. Whether the file is created,
+// truncated or replaced atomically is the host's policy, not this module's.
 export function writeFile(path: string, data: u8[]): IoResult {
   if path.length == 0 {
     return { code: EINVAL, msg: emptyPathMsg("writeFile") }
   }
   const rc = __fs_write__(encodeUtf8(path), data)
   if rc == 0 { return null }
-  // Negative is `-errno`. A POSITIVE non-zero is a floor protocol violation —
-  // reported as EIO rather than trapped, because a std module has no business
-  // killing the instance over a host that answered out of contract.
   let code = EIO
   if rc < 0 { code = 0 - rc }
   { code: code, msg: failed("writeFile", path, code) }
 }
 
-// `writeTextFile(path, text)` — the same, encoding `text` as UTF-8 first.
-// Encoding cannot fail (`std:utf8`'s header), so this adds no failure mode.
+// The same, encoding `text` as UTF-8 first. Encoding cannot fail, so this adds
+// no failure mode.
 export function writeTextFile(path: string, text: string): IoResult {
   if path.length == 0 {
     return { code: EINVAL, msg: emptyPathMsg("writeTextFile") }
@@ -221,22 +124,14 @@ export function writeTextFile(path: string, text: string): IoResult {
   writeFile(path, encodeUtf8(text))
 }
 
-// `listDir(path)` — the entries of a directory, as NAMES.
-//
-// Names, not paths: that is what the syscall reports, it is what you print, and re-attaching
-// the directory is one `+` (`dir + "/" + name`) which the caller can skip when it is about to
-// match on the name. Returning joined paths would be a lossy convenience — you cannot recover
-// the name from a path without a path parser, and `std:fs/path` does not exist yet. `"."` and
-// `".."` are NOT included (the host filters them); the order is the host's and is not sorted.
-//
-// A single entry that is not valid UTF-8 fails the WHOLE call with `EILSEQ`. That is
-// deliberate: the alternative is silently dropping a file that exists, which turns a listing
-// into a wrong answer instead of a loud one. The message carries the byte offset within the
-// block so the entry is identifiable.
+// The entries of a directory, as NAMES rather than paths — re-attach the
+// directory with `dir + "/" + name`. `"."` and `".."` are not included and
+// the order is the host's. One entry that is not UTF-8 fails the whole call,
+// because silently dropping a file that exists is a wrong answer.
 export function listDir(path: string): string[] | IoError {
   if path.length == 0 { return { code: EINVAL, msg: emptyPathMsg("listDir") } }
   const block = __fs_list__(encodeUtf8(path))
-  // An EMPTY block is a failure or an empty directory; the errno separates them.
+  // An empty block is a failure or an empty directory; the errno separates them.
   if block.length == 0 {
     const e = emptyErrno()
     if e != 0 { return { code: e, msg: failed("listDir", path, e) } }
@@ -244,17 +139,13 @@ export function listDir(path: string): string[] | IoError {
   const out: string[] = []
   let start = 0
   let i = 0
-  // `i` runs one PAST the end so the final entry — which has no separator after
-  // it — is emitted by the same block as every other. `atSep` is computed in two
-  // steps rather than folded into one `||`, so nothing indexes the array at
-  // `length`.
+  // One past the end, so the final entry — which has no separator after it — is
+  // emitted by the same branch as every other.
   while i <= block.length {
     let atSep = i == block.length
     if !atSep { atSep = block[i] == 0x00 }
     if atSep {
-      // Empty runs are skipped rather than yielded, which makes this agnostic
-      // to whether the host treats 0x00 as a SEPARATOR or a TERMINATOR — a
-      // filename is never empty, so a zero-length run carries no information.
+      // A filename is never empty, so a zero-length run carries no information.
       if i > start {
         const name = decodeUtf8At(block, start, i - start)
         if name is Utf8Error {
@@ -276,13 +167,9 @@ export function listDir(path: string): string[] | IoError {
   out
 }
 
-// `pathKind(path)` — what `path` names, or why the question could not be answered.
-//
-// A missing path is an ERROR here (`ENOENT`), not a third `FileKind`: "there is
-// nothing here" is not a kind of thing, and folding it into the success arm is
-// what makes callers forget that `EACCES` is also possible. `pathExists` is the
-// function that turns ENOENT into a boolean, and it is separate precisely so
-// that decision is made once and visibly.
+// What `path` names, or why the question could not be answered. A missing path
+// is an ERROR here (`ENOENT`), not a third kind — `pathExists` is the function
+// that turns that into a boolean, and it is separate on purpose.
 export function pathKind(path: string): FileKind | IoError {
   if path.length == 0 { return { code: EINVAL, msg: emptyPathMsg("pathKind") } }
   const k = __fs_stat__(encodeUtf8(path))
@@ -293,18 +180,9 @@ export function pathKind(path: string): FileKind | IoError {
   { code: code, msg: failed("pathKind", path, code) }
 }
 
-// `pathExists(path)` — whether `path` names anything, or why that is unanswerable.
-//
-// `boolean | IoError`, NOT `boolean`, and that is the whole reason the function is worth
-// writing down. "Does not exist" and "you are not allowed to look" are different facts, and a
-// `boolean` return has to lie about one of them. `Path::exists()` in Rust and `os.path.exists`
-// in Python both answer `false` for a permission error, and both ship a documented footgun
-// where a program creates a file it was told was absent, or reports a config missing when the
-// truth is that the directory is unreadable.
-//
-// So exactly two errnos become `false`, and both mean "nothing is there": ENOENT, and ENOTDIR
-// (a component of the path is not a directory, so nothing can be at the end of it). Everything
-// else — EACCES, EPERM, EIO, a loop, a name too long — propagates with its reason intact.
+// Whether `path` names anything, or why that is unanswerable. Only `ENOENT`
+// and `ENOTDIR` become `false`; everything else — a permission error above
+// all — propagates with its reason intact, rather than reading as absence.
 export function pathExists(path: string): boolean | IoError {
   const k = pathKind(path)
   if k is IoError {

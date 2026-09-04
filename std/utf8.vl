@@ -1,116 +1,33 @@
-// `std:utf8` — the boundary between VL's strings and the byte world.
+// `std:utf8` — turning VL strings into UTF-8 byte lists, and back.
 //
-// A VL `string` IS its UTF-8 bytes: `s.length` is a byte count and `s[i]` is a byte
-// (`docs/guide/strings-design.md` §Storage/§API; code points live on `for cp in s` and
-// `s.cpAt(i)`). A `u8[]` is bytes too — `u8` is a STORAGE type, so an element reads out
-// widened to `i32` (0..255) and truncates on write. The two sides no longer differ in
-// STORAGE, so what is left here is the part that never was storage: VALIDATION, POSITIONED
-// ERROR REPORTING AND SANITIZATION. §Validity is deliberately Go-lean — the core does no
-// validation at the host boundary and lets malformed bytes read as U+FFFD — so nothing in
-// the core will ever do those three. The module's audit is `docs/internals/utf8-byte-ready.md`.
+//     import { encodeUtf8, decodeUtf8, decodeUtf8Lossy, Utf8Error } from "std:utf8"
 //
-// It is its own module rather than private to `std:fs` because `std:fs` is merely the FIRST
-// consumer: every boundary VL grows (files, paths, argv, stdin) is bytes, and a private copy
-// is how a program ends up with two decoders holding two opinions about invalid input.
-//
-// THE INVALID-INPUT RULING, both directions, because it is the whole design:
-//
-//   ENCODE IS TOTAL, AND RAW. `encodeUtf8` cannot fail and never repairs: it hands back the
-//   storage bytes unexamined (§Wrap), so a string holding a partial sequence round-trips
-//   through `encodeUtf8`/`decodeUtf8` as itself. A caller who wants a well-formed result
-//   composes it — `decodeUtf8Lossy(s.bytes())` — and pays visibly. A non-scalar cannot reach
-//   here at all: the core substitutes U+FFFD in `fromCodePoints` (§NonScalar), so this
-//   module keeps no substitution branch that could drift from that one.
-//
-//   DECODE IS FALLIBLE, AND STRICT BY DEFAULT. `decodeUtf8` returns `string | Utf8Error` and
-//   rejects every ill-formed sequence: bad lead byte, bad continuation, overlong form,
-//   surrogate, beyond U+10FFFF, truncated tail. That is Rust's `from_utf8`, not
-//   `from_utf8_lossy`, and strict is the DEFAULT because a decode failure is information:
-//   those bytes are not text, and the program about to treat them as text is about to be
-//   wrong. Substituting silently would turn "this is a PNG" into question marks that compare
-//   unequal to everything and explain nothing. `decodeUtf8Lossy` is the deliberate opt-out
-//   for a caller who would rather render mojibake than stop — a log tailer, an editor — and
-//   substitutes one U+FFFD per maximal ill-formed subpart, which is the WHATWG rule.
-//
-// WHAT THIS MODULE DOES NOT DO. No UTF-16, no other encodings, no BOM handling (a leading
-// U+FEFF decodes to U+FEFF and stays in the string — stripping it is a policy for whoever
-// knows the format), no normalization, no grapheme or display-width analysis. Those are not
-// "later here"; they are a different module.
+// Encoding is total and never repairs. Decoding is STRICT by default: an
+// ill-formed sequence is an error, not a silent replacement character — reach
+// for `decodeUtf8Lossy` when rendering something beats stopping. No UTF-16, no
+// other encodings, no byte-order-mark handling and no normalization.
 
-// `toString` is `std:fmt`'s export, not the ambient compiler builtin it once was (owner
-// ruling, DECISIONS.md), so the two digit renderings in `decodeCore`'s error message make
-// `std:fmt` a module dependency of this one.
-//
-// A private decimal renderer here — and another in `std:fs`, and another in `std:args` — is
-// REFUSED for the reason `std:fmt`'s header gives about `split`: one implementation beats
-// smaller output, and three copies that must agree about i32 min is exactly the drift that
-// ruling protects against. VL has no cross-module dead-code elimination, so an unoptimized
-// module carries all of `std:str` and `std:fmt` for one i32 rendering; binaryen's DCE at
-// `-O3` removes almost all of it. ONE copy is knowingly kept: `std:test`'s `vltI64Str`, so
-// the assertion surface stays dependency-free and a fmt defect cannot corrupt its own
-// failure report; `tests/cases/std/renderers-agree.vl` pins the two at i64 min.
 import { toString } from "std:fmt"
 
-// A decode failure, carrying the position AND the offending byte.
-//
-// `at` is a BYTE OFFSET — ruled, see `docs/internals/utf8-byte-ready.md` §at — and RELATIVE
-// to the `off` passed in, never an absolute index, so it stays meaningful to a caller
-// decoding a slice out of a larger array, exactly as Rust's `Utf8Error::valid_up_to()` is.
-// `s.slice(0, e.at)` is therefore the valid prefix with no converter, and — decode being a
-// byte identity — `at` is at the same time the byte length of that prefix
-// (`tests/cases/std/utf8-invariant.vl` §6). `byte` is the lead byte that failed to decode.
-//
-// `byte` ALSO KEEPS THIS TYPE DISTINCT: VL aliases are STRUCTURAL, so the `{ at, msg }` shape
-// `error-handling-design.md` §90 blesses as `ParseError` is literally this type, and a union
-// naming both would fail at emit with no recorded members.
+// Why a decode failed. `at` is a byte offset RELATIVE to the `off` handed in,
+// so it stays meaningful over a slice and is also the length of the valid
+// prefix; `byte` is the lead byte that failed; `msg` is prose for a human.
 export type Utf8Error = { at: i32, byte: i32, msg: string }
 
-// U+FFFD, substituted in both directions.
+// U+FFFD, the character `decodeUtf8Lossy` substitutes.
 const REPLACEMENT = 0xFFFD
 
-// THE ENCODE SIDE'S NON-SCALAR RULING LIVES IN THE CORE, NOT HERE. A string can no longer
-// hold a lone surrogate or a value past U+10FFFF: `fromCodePoints` substitutes U+FFFD, and
-// `print` streams the stored replacement bytes rather than dropping them
-// (`docs/internals/utf8-byte-ready.md` §NonScalar). `scalar`/`utf8Width` were deleted rather
-// than kept as defensive documentation of that rule, because a second copy of a rule is a
-// thing that can disagree with the first, and dead code cannot be caught disagreeing.
-
-// `s.utf8Length()` — the exact length of `s.encodeUtf8()`. A string IS its UTF-8 bytes, so
-// this is `self.length` and O(1) (`docs/internals/utf8-byte-ready.md` §utf8Length).
-//
-// The collapse is sound only because §Wrap ruled `encodeUtf8` RAW: a string holding
-// malformed bytes — legal, since slicing off a character boundary is permitted (§Validity) —
-// keeps those bytes through `encodeUtf8`, so `.length` counts exactly what the encoder
-// emits. Decoding to code points and re-measuring each would instead answer 3 per
-// replacement character and disagree with this module's own encoder.
+// The number of bytes `self.encodeUtf8()` produces. O(1): a VL string already
+// IS its own UTF-8 encoding.
 export function utf8Length(self: string) { self.length }
 
-// `s.encodeUtf8()` — `s` as UTF-8 bytes. A string is already its UTF-8 bytes, so this is
-// `self.bytes()`: one `array.copy`, at memcpy speed.
-//
-// RAW, not sanitized (`docs/internals/utf8-byte-ready.md` §Wrap): `bytes()` hands back the
-// storage bytes unexamined, so a string holding a partial sequence round-trips through
-// `encodeUtf8`/`decodeUtf8` as itself rather than being silently repaired. A caller who
-// wants the guarantee composes it — `decodeUtf8Lossy(s.bytes())` — and pays visibly.
-//
-// FRESH, not a view (§Ownership), so the contract is unchanged: `s.bytes()` COPIES, because
-// a `u8[]` wrapper has no `start` field and cannot express a view of a sliced string, and
-// because a `u8[]` is MUTABLE — an aliasing `bytes()` would hand out a writable pointer into
-// an immutable string's storage. The result is the fresh, growable array callers always got.
+// `self` as a fresh, mutable list of UTF-8 byte values. Cannot fail and never
+// repairs: a string holding ill-formed bytes round-trips through
+// `encodeUtf8`/`decodeUtf8` as itself.
 export function encodeUtf8(self: string): u8[] { return self.bytes() }
 
-// The one decode loop. The strict/lossy fork is a PARAMETER rather than two copies, so the
-// two public spellings cannot disagree about what "ill-formed" means.
-//
-// The validity table is the standard one; every row rejects a sequence a naive shift-and-or
-// would decode. Accepting one is the classic security bug — two byte strings decoding to one
-// string is how a path check that already ran gets walked past.
-//   C0 C1        overlong two-byte forms of ASCII
-//   E0 80..9F    overlong three-byte forms
-//   ED A0..BF    the surrogate block
-//   F0 80..8F    overlong four-byte forms
-//   F4 90..BF    beyond U+10FFFF
-//   F5..FF       no such lead byte
+// The one decode loop; `lossy` picks which of the two public spellings it is
+// serving, so they cannot disagree about what ill-formed means.
 function decodeCore(
   self: u8[],
   off: i32,
@@ -121,9 +38,8 @@ function decodeCore(
   let i = 0
   while i < len {
     const b0 = self[off + i]
-    // The sequence length comes from the lead byte, together with the TIGHTENED
-    // bounds the FIRST continuation byte must satisfy (every later one is the
-    // plain 0x80..0xBF).
+    // The lead byte gives the sequence length, and the tighter bounds the FIRST
+    // continuation byte must satisfy; every later one is the plain 0x80..0xBF.
     let size = 0
     let cp = 0
     let lo = 0x80
@@ -145,11 +61,8 @@ function decodeCore(
       if b0 == 0xF0 { lo = 0x90 }
       if b0 == 0xF4 { hi = 0x8F }
     }
-    // `good` counts the MAXIMAL VALID SUBPART — how far the sequence got before
-    // it went wrong, never less than 1. It is what the lossy path advances by,
-    // so a truncated 4-byte sequence at the end of the range yields ONE U+FFFD
-    // rather than one per leftover byte. That is the WHATWG rule, and it is also
-    // the only advance that cannot loop: `good >= 1` always.
+    // `good` is the maximal valid subpart and never less than 1 — what the lossy
+    // path advances by, so one bad sequence yields one U+FFFD and cannot stall.
     let ok = size > 0
     let good = 1
     let k = 1
@@ -190,16 +103,15 @@ function decodeCore(
   fromCodePoints(cps)
 }
 
-// `b.decodeUtf8()` — the whole array as a string, or the position of the first
-// ill-formed sequence. STRICT; see the header for why strict is the default.
+// The whole array as a string, or a `Utf8Error` locating the first ill-formed
+// sequence. Overlong forms, surrogates, values past U+10FFFF and truncated
+// tails are all refused.
 export function decodeUtf8(self: u8[]): string | Utf8Error {
   decodeCore(self, 0, self.length, false)
 }
 
-// `b.decodeUtf8At(off, len)` — the same, over one range. The range form exists
-// because a consumer that splits a byte block into records (`std:fs`'s
-// directory listing, a line reader) must attribute a decode failure to the
-// RECORD, not to the block.
+// The same over one range, so a caller splitting a byte block into records can
+// attribute a failure to the RECORD rather than to the block.
 export function decodeUtf8At(
   self: u8[],
   off: i32,
@@ -208,26 +120,16 @@ export function decodeUtf8At(
   decodeCore(self, off, len, false)
 }
 
-// `b.decodeUtf8Lossy()` — the whole array, with one U+FFFD per maximal ill-formed subpart.
-// Total: there is no input this rejects.
-//
-// IT IS A SANITIZER, NOT A DECODER, and that is why it does not collapse into the core's
-// lenient wrap. §Validity is Go-lean: a string is bytes that are *usually* UTF-8, so the core
-// will wrap ill-formed bytes and let them read as U+FFFD only when something iterates them —
-// and that wrap KEEPS THE ORIGINAL BYTES, which `s.bytes()` hands back unchanged and
-// `s.length` counts. This function REWRITES them: what comes out is guaranteed well-formed
-// UTF-8, whose bytes are EF BF BD where the bad bytes were, and the original is gone. Go
-// draws the same line between `string(b)` and `strings.ToValidUTF8`. A caller who wants
-// "show me something" wants the wrap; one who wants "bytes I can hand onward as text" wants
-// this.
+// The whole array with one U+FFFD per MAXIMAL ill-formed subpart, which is the
+// WHATWG rule. Total — no input is rejected — and the result is guaranteed
+// well-formed UTF-8, the original bytes gone. Use `decodeUtf8` to find out.
 export function decodeUtf8Lossy(self: u8[]) {
   const r = decodeCore(self, 0, self.length, true)
-  // Unreachable: the lossy path substitutes rather than returning the error arm.
-  // The narrowing is what makes the `string` return type provable, and the trap
-  // is what makes a future edit that breaks the invariant loud instead of
-  // silent — VL has no way to say "this arm cannot happen" in a type.
+  // Unreachable: the lossy path substitutes rather than failing.
   if r is Utf8Error {
-    __trap__("std:utf8: lossy decode reported an error")
+    __trap__(
+      "internal error in std:utf8: the lossy decode rejected an input it must accept; please report",
+    )
     return ""
   }
   r
