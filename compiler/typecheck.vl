@@ -8333,6 +8333,194 @@ function unknownTyTextIn(name: string, tail: string) {
     tyDidYouMean(part)
 }
 
+// The method twin of `tySpellFrom`/`tySpellTo`, one table per receiver kind: a list, a
+// string and a map answer the same typo with a different name. A target whose ARGUMENTS
+// differ from what was typed (`charAt` takes an index, `slice` a range) is stored as the
+// whole call shape, never a bare name.
+const strMethodSpellFrom = [
+  "charat",
+  "substring",
+  "substr",
+  "touppercase",
+  "tolowercase",
+  "size",
+  "count",
+]
+const strMethodSpellTo = [
+  "slice(i, i + 1)",
+  "slice",
+  "slice",
+  "toUpperAscii",
+  "toLowerAscii",
+  "length",
+  "length",
+]
+const listMethodSpellFrom = ["append", "add", "size", "count", "contains"]
+const listMethodSpellTo = ["push", "push", "length", "length", "includes"]
+const mapMethodSpellFrom = ["put", "containskey", "size"]
+const mapMethodSpellTo = ["set", "has", "length"]
+
+// The intrinsic call-able names `checkCallNode` tests for a string/array receiver, in
+// that order — a tie in the edit distance below keeps the earlier (intrinsic) candidate.
+const strMethodNames = [
+  "slice",
+  "indexOf",
+  "includes",
+  "charCodeAt",
+  "cpAt",
+  "cpLen",
+  "isCharBoundary",
+  "bytes",
+  "length",
+]
+const listMethodNames = [
+  "push",
+  "map",
+  "filter",
+  "pop",
+  "get",
+  "clear",
+  "slice",
+  "length",
+]
+
+// Map/set intrinsic names, gated exactly as `checkCallNode`'s own arms gate them: `set`/
+// `get`/`keys` are a map surface a set must not leak, and `add` is admitted by the value
+// type rather than by flavor.
+function mapMethodNames(recvTy: i32) {
+  const out = ["has", "delete", "values", "length", "size"]
+  const rt = T.tys[recvTy]
+  if rt is TyMap {
+    if rt.mSet == 0 {
+      out.push("set")
+      out.push("get")
+      out.push("keys")
+    }
+    if rt.mSet == 1 || tyIsPrimNamed(rt.mVal, "boolean") { out.push("add") }
+  }
+  out
+}
+
+// Free `self`-functions dispatchable on `recvTy` — the in-scope half of the edit-distance
+// pool, mirroring `ufcsCallTy`'s own lookup without its arity gate: a name search asks
+// whether the function exists, not how many arguments it takes.
+function selfFnNamesFor(recvTy: i32) {
+  const out: string[] = []
+  for name in fnDeclIx.keys() {
+    if declFirstParamIsSelf(name) {
+      const fnTy = lookup(name)
+      if fnTy >= 0 {
+        const ft = T.tys[fnTy]
+        if ft is TyFunc {
+          if ft.fnParamTypes.length > 0 {
+            if assignable(recvTy, ft.fnParamTypes[0]) {
+              const un = demangleName(name)
+              if un.length >= 2 && nameIsBareIdent(un) { out.push(un) }
+            }
+          }
+        }
+      }
+    }
+  }
+  out
+}
+
+// One receiver kind's two-source lookup: the newcomer map above (exact, case-folded)
+// first, then an edit distance (`tyEditDist`, D1590's budget) over `names` plus every
+// in-scope self-function `recvTy` could dispatch to.
+function methodSuggestFrom(
+  spellFrom: string[],
+  spellTo: string[],
+  names: string[],
+  recvTy: i32,
+  prop: string,
+) {
+  let si = 0
+  while si < spellFrom.length {
+    if tyFoldedEq(prop, spellFrom[si]) { return spellTo[si] }
+    si = si + 1
+  }
+  const budget = tySuggestBudget(prop.length)
+  let best = ""
+  let bestD = budget + 1
+  let ni = 0
+  while ni < names.length {
+    const nd = tyEditDist(prop, names[ni])
+    if nd < bestD {
+      bestD = nd
+      best = names[ni]
+    }
+    ni = ni + 1
+  }
+  const cand = selfFnNamesFor(recvTy)
+  let ci = 0
+  while ci < cand.length {
+    if cand[ci].length >= 2 && cand[ci] != prop {
+      const ud = tyEditDist(prop, cand[ci])
+      if ud < bestD {
+        bestD = ud
+        best = cand[ci]
+      }
+    }
+    ci = ci + 1
+  }
+  best
+}
+
+// The name to offer for a missed method call `prop` on `recvTy`, or "" for none —
+// dispatched by receiver kind (string / array / map). A kind with no table (struct,
+// union, an unresolved generic) still gets the edit distance over its self-functions.
+function methodSuggestFor(recvTy: i32, prop: string) {
+  if recvTy < 0 { return "" }
+  if prop.length < 2 { return "" }
+  if !nameIsBareIdent(prop) { return "" }
+  const rt = T.tys[recvTy]
+  if rt is TyPrim {
+    if rt.primName == "string" {
+      return methodSuggestFrom(
+        strMethodSpellFrom,
+        strMethodSpellTo,
+        strMethodNames,
+        recvTy,
+        prop,
+      )
+    }
+  }
+  if rt is TyArray {
+    return methodSuggestFrom(
+      listMethodSpellFrom,
+      listMethodSpellTo,
+      listMethodNames,
+      recvTy,
+      prop,
+    )
+  }
+  if rt is TyMap {
+    // `put`/`containsKey` name the MAP surface — offering them on a set would suggest a
+    // call `checkCallNode`'s own arm refuses, so a set gets the edit distance alone.
+    if rt.mSet == 1 {
+      return methodSuggestFrom([], [], mapMethodNames(recvTy), recvTy, prop)
+    }
+    return methodSuggestFrom(
+      mapMethodSpellFrom,
+      mapMethodSpellTo,
+      mapMethodNames(recvTy),
+      recvTy,
+      prop,
+    )
+  }
+  methodSuggestFrom([], [], [], recvTy, prop)
+}
+
+// The `; did you mean '.<name>'?` clause for a missed method call, or "" when nothing is
+// near enough — the method twin of `tyDidYouMean`, a SUFFIX so `no method '.<prop>' on
+// <type>` stays the prefix every consumer matches on (glean VL-045, D1599).
+function methodDidYouMean(recvTy: i32, prop: string) {
+  const s = methodSuggestFor(recvTy, prop)
+  if s.length == 0 { return "" }
+  "; did you mean '." + s + "'?"
+}
+
 // The SPELLING-TREE resolver, wrapped: bank this subtree's spelling if it is the
 // innermost frame that failed. `tsToName` re-renders the parser's own tree, so the part
 // is quoted in the same canonical spacing the whole name is.
@@ -18771,8 +18959,10 @@ function validateUfcsCstrs(
         if tyFieldTyOf(ur, ufcsCstrProp[ci]) < 0 {
           if !assignable(ur, ufcsCstrP0[ci]) {
             let uMsg = memberFloorMsg(ur, ufcsCstrProp[ci])
+            let uSuggest = ""
             if uMsg == "" {
               uMsg = "no method '." + ufcsCstrProp[ci] + "' on " + tyToStr(ur)
+              uSuggest = methodDidYouMean(ur, ufcsCstrProp[ci])
             }
             let uWho = "the callee's body"
             if who != "" { uWho = "the body of `" + who + "`" }
@@ -18784,7 +18974,8 @@ function validateUfcsCstrs(
                 tyToStr(ufcsCstrP0[ci]) +
                 " (" +
                 uWho +
-                " at the call's argument types)",
+                " at the call's argument types)" +
+                uSuggest,
               ix,
             )
           }
@@ -21683,7 +21874,14 @@ function checkCallNode(n: Call, ix: i32) {
       // directly — the array dual of the string/struct/union UFCS paths.
       const au = ufcsCallTy(cfn.memProp, recvTy, n, ix)
       if au >= 0 { return au }
-      tErr("no method '." + cfn.memProp + "' on array " + tyToStr(recvTy), ix)
+      tErr(
+        "no method '." +
+          cfn.memProp +
+          "' on array " +
+          tyToStr(recvTy) +
+          methodDidYouMean(recvTy, cfn.memProp),
+        ix,
+      )
       return TY_ERR
     }
     // Map/Set methods over the `{[K]: V}` rep, gated by FLAVOR: a map exposes
@@ -21802,7 +22000,14 @@ function checkCallNode(n: Call, ix: i32) {
         if rt.mSet == 1 { return mkArrayTy(rt.mKey) }
         return mkArrayTy(rt.mVal)
       }
-      tErr("unknown property `" + mp + "` on " + tyToStr(recvTy), ix)
+      tErr(
+        "unknown property `" +
+          mp +
+          "` on " +
+          tyToStr(recvTy) +
+          methodDidYouMean(recvTy, mp),
+        ix,
+      )
       return TY_ERR
     }
     // String methods: `.slice(i32,i32)->string`, `.indexOf(string)->i32`,
@@ -21968,7 +22173,10 @@ function checkCallNode(n: Call, ix: i32) {
           )
           return TY_ERR
         }
-        tErr("no method '." + sp + "' on string", ix)
+        tErr(
+          "no method '." + sp + "' on string" + methodDidYouMean(recvTy, sp),
+          ix,
+        )
         return TY_ERR
       }
     }
