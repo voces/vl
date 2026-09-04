@@ -563,6 +563,7 @@ import {
   exprNulLitUnion,
   exprNulScalarListKind,
   exprNulStrArray,
+  exprPopBits,
   exprRefArray,
   exprReReadable,
   exprString,
@@ -17692,7 +17693,20 @@ function pushDestVKind(rslot: i32): VKind | null {
   null
 }
 
-function emitPush(body: i32[], callIx: i32, fnIx: i32) {
+// RECEIVER RESOLUTION for `.push` — `listOpRecvLocal`, the one home the four list ops share,
+// at the arguments `.push` always passes. Its frame base is already resolved (a push reads
+// the quad whatever the receiver is), and it is the only op that accepts an INDEXED receiver.
+// Called from TWO points because a push whose value stages a receiver must resolve its own
+// after that value (D1280); one function so the two cannot pass different arguments.
+function pushRecvLocal(body: i32[], objIx: i32, fnIx: i32, base: i32) {
+  listOpRecvLocal(body, objIx, fnIx, base, -1, ".push", true)
+}
+
+// D1592 — `wantValue` is the VALUE-POSITION flag. The checker types `.push` `i32` (the new
+// length), so a bound / returned / argument push owes that value while a bare statement owes
+// an empty stack. ONE lowering serves both: the value is read back from the `len` field this
+// same sequence writes, so the two cannot disagree about what was stored.
+function emitPush(body: i32[], callIx: i32, fnIx: i32, wantValue: boolean) {
   const c = P.nodes[callIx]
   if c is Call {
     const callee = P.nodes[c.callFn]
@@ -17841,23 +17855,23 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32) {
       } else if !lUsed {
         return emitFail("emitProgram: .push but list type not collected")
       }
-      // RECEIVER RESOLUTION — `listOpRecvLocal`, the one home the four list ops share.
-      const lIdx = listOpRecvLocal(
-        body,
-        callee.memObj,
-        fnIx,
-        base,
-        -1,
-        ".push",
-        true,
-      )
-      // `.push` always needs the frame, so its base is already resolved
-
-      if lIdx < 0 { return -1 }
+      if c.callArgs.length != 1 {
+        return emitFail("emitProgram: .push takes exactly one argument")
+      }
+      // THE RECEIVER IS STAGED AFTER THE VALUE WHEN THE VALUE ITSELF STAGES ONE (D1280).
+      // `listOpRecvLocal` parks a non-local receiver in the frame's ONE `recvRef` slot, so a
+      // nested list op inside the pushed value overwrites it and the append lands on the
+      // INNER list — `xs.push(ys.pop() ?? 0)` over two globals left `xs` empty, `vl check`
+      // rc 0. Emitting the value first leaves the slot free for this push's own receiver.
+      // Bit 512 is `listOpRecvStages` carried by the walk that already visits every value
+      // position, so source order is kept for every program that was already right.
+      const lateStage = (exprPopBits(c.callArgs[0], fnIx) & 512) != 0
+      let lIdx = -1
+      if !lateStage {
+        lIdx = pushRecvLocal(body, callee.memObj, fnIx, base)
+        if lIdx < 0 { return -1 }
+      }
       if true {
-        if c.callArgs.length != 1 {
-          return emitFail("emitProgram: .push takes exactly one argument")
-        }
         const valIdx = base
         const capIdx = base + 1
         const backIdx = base + 2
@@ -17944,6 +17958,10 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32) {
           fbRefAsNonNull()
         }
         fbLocalSet(valIdx) // local.set
+        if lateStage {
+          lIdx = pushRecvLocal(body, callee.memObj, fnIx, base)
+          if lIdx < 0 { return -1 }
+        }
         // if len(L) == cap(L)
         pushListLen(body, lIdx, lTy)
         pushListCap(body, lIdx, lTy)
@@ -17991,6 +18009,10 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32) {
         fbI32Const(1)       // i32.const 1
         fbI32Bin(106)       // 0x6a i32.add
         fbStructSet(lTy, 1) // 0xfb 0x05 <lTy> field 1: len
+        // D1592 — the NEW LENGTH, read back from the field the line above wrote. Emitted
+        // only in value position; a bare `.push` statement leaves the stack empty, and
+        // `memberCallYieldsValue` is the one predicate both sides consult.
+        if wantValue { pushListLen(body, lIdx, lTy) }
         return 0
       }
     }
@@ -20835,7 +20857,9 @@ function emitCallStmt(body: i32[], s: Call, stmtIx: i32, fnIx: i32) {
   // call whose value is discarded) is out of scope.
   const callee = P.nodes[s.callFn]
   if callee is Member {
-    if callee.memProp == "push" { return emitPush(body, stmtIx, fnIx) }
+    // A `.push` STATEMENT discards the new length — emit the append with no value (D1592),
+    // rather than emitting one and dropping it.
+    if callee.memProp == "push" { return emitPush(body, stmtIx, fnIx, false) }
     // A `.pop()` STATEMENT discards the popped element — emit the pop, then `drop`
     // the value it leaves on the stack.
     if callee.memProp == "pop" {
@@ -23202,6 +23226,16 @@ function emitCallNode(body: i32[], e: Call, exprIx: i32, fnIx: i32) {
     if callee.memProp == "pop" {
       if popRecvIsList(callee.memObj, fnIx) {
         return emitPop(body, exprIx, fnIx, true, -1)
+      }
+    }
+    // `xs.push(v)` in VALUE position yields the NEW LENGTH — the `i32` the checker has
+    // always given it, which no position could deliver (D1592). It rides the SAME receiver
+    // test as `.pop`: the two admit the same seven list reps, so a receiver one lowers and
+    // the other refuses cannot exist, and a function-valued struct FIELD named `push` still
+    // falls through to `emitCall` exactly as D1087 requires.
+    if callee.memProp == "push" {
+      if popRecvIsList(callee.memObj, fnIx) {
+        return emitPush(body, exprIx, fnIx, true)
       }
     }
     // `xs.get(i)` — the checked nullable list read, at EVERY list rep. It is `.pop()`
