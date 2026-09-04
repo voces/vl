@@ -1,27 +1,23 @@
-// A recursive-descent parser for VL, written in VL: it consumes the token stream
-// on the global `P` (filled by the driver from `lexer.vl`) and builds the
-// discriminated-union arena AST of `compiler/ast.vl`. The grammar it covers is
-// listed in docs/internals/parser-notes.md §"Grammar covered".
+// A recursive-descent parser for VL, written in VL: it consumes the token stream on the
+// global `P` (filled by the driver from `lexer.vl`) and builds the discriminated-union
+// arena AST of `compiler/ast.vl`. The grammar it covers is listed in
+// `docs/internals/parser-notes.md` §"Grammar covered".
 //
-// TWO INVARIANTS THE CODE MAINTAINS:
-//   • Every parser function DECLARES `: i32` (the arena index it produces).
-//     Recursive descent is mutually recursive by construction — the expression
-//     levels re-enter through `(expr)` and call args, a block re-enters
-//     statements — and a forward-referenced function must declare its return type.
-//   • The walk always TERMINATES. VL has no exceptions: an error appends a `Diag`
-//     and recovers by synthesizing an `ErrExpr` leaf or skipping a token.
+// Two invariants the code maintains. Every parser function declares `: i32`, the arena
+// index it produces: recursive descent is mutually recursive by construction, and a
+// forward-referenced function must declare its return type. And the walk always
+// terminates — VL has no exceptions, so an error appends a `Diag` and recovers by
+// synthesizing an `ErrExpr` leaf or skipping a token.
 //
-// All parser state lives in `Parser` struct fields reached through the module
-// global `P` (`ast.vl`, which carries the STYLE note for why it is a global and
-// not a struct parameter); constructors `.push` onto the struct-field arena.
+// All parser state lives in `Parser` struct fields reached through the module global `P`.
 
 // The AST data layer (`compiler/ast.vl`): the token type, the global parser state
 // `P`, and the arena `mk*` constructors. The parser's own `advance`/`peekTok`
-// cursor primitives stay PRIVATE to this module.
+// cursor primitives stay private to this module.
 import { TokKind, tplPartStrLex } from "./lexer"
 import { isBinOpFuncName, mkMatch } from "./ast"
 import { BinExpr, Ident, P, Tok, dgMarkLossless, mkDeclNameTok } from "./ast"
-// The free INDEX-OPERATOR declaration-name encoding (B14) — the parser is where
+// The free index-operator declaration-name encoding — the parser is where
 // `function "[]"(self: T, …)` gets the receiver-carrying name it declares under.
 import {
   OP_INDEX_GET,
@@ -31,7 +27,7 @@ import {
   i32ToStr,
   opDeclName,
 } from "./ast"
-// The type-SPELLING side arena — the structure `parseTypeName` builds while it
+// The type-spelling side arena — the structure `parseTypeName` builds while it
 // recurses, recorded instead of being thrown away with the string it returns.
 import {
   TS_APP,
@@ -123,7 +119,7 @@ export function peekTok(): Tok {
 // The current token's kind — the common discriminating `==` compare.
 function peekKind(): TokKind { peekTok().kind }
 
-// The kind of the token AFTER the current one (one-token lookahead) — used to spot a
+// The kind of the token after the current one (one-token lookahead), for spotting a
 // two-token sequence like `=>` (`EQUAL` `GT`) without consuming. EOF past the end.
 function peek2Kind(): TokKind {
   if P.pos + 1 >= P.toks.length { return P.toks[P.toks.length - 1].kind }
@@ -137,12 +133,10 @@ function advance(): Tok {
   t
 }
 
-// The kind of the token `i` positions from the stream START (absolute index),
-// clamped to the trailing EOF so a lookahead never indexes out of range. Unlike
-// `peekKind` (cursor-relative), this reads an ABSOLUTE index WITHOUT moving the
-// cursor — the multi-token lookaheads (`looksLikeObject`, the newline-tolerant
-// `else` scan in `parseIf`) scan ahead with raw indices. Mirrors the host's
-// `kind(j)` closure.
+// The kind of the token `i` positions from the stream start (an absolute index), clamped
+// to the trailing EOF so a lookahead never indexes out of range. Unlike the
+// cursor-relative `peekKind`, this reads an absolute index without moving the cursor, for
+// the multi-token lookaheads that scan ahead with raw indices.
 function kindAt(i: i32): TokKind {
   let j = i
   if j >= P.toks.length { j = P.toks.length - 1 }
@@ -159,12 +153,10 @@ export function accept(kind: TokKind) {
   false
 }
 
-// Skip any run of NEWLINE / SEMI tokens at the cursor. Used inside the BRACED
-// constructs (type-decl field lists, union-variant lists) that may span several
-// source lines — a multiline `type N = {\n f: T,\n ... }` carries NEWLINE tokens
-// between fields, and a multiline `type N = A\n | B\n | C` carries them before
-// each `|`. Statement-sequence parsers (`parseBlock`, `parseProgram`) already skip
-// newlines in their own loops; this gives the brace/`|` parsers the same tolerance.
+// Skip any run of NEWLINE or SEMI tokens at the cursor, for the braced constructs
+// (type-declaration field lists, union-variant lists) that may span several source lines.
+// The statement-sequence parsers already skip newlines in their own loops; this gives the
+// brace and `|` parsers the same tolerance.
 function skipNewlines() {
   let going = peekKind() == "NEWLINE" || peekKind() == "SEMI"
   while going {
@@ -174,26 +166,18 @@ function skipNewlines() {
   0
 }
 
-// The statement-boundary tokens (panic-mode SYNC points): NEWLINE/SEMI end the
-// statement, `}` closes an enclosing block, EOF ends the input. The enclosing
-// statement loops recover at these, so the `expect` error paths must never
-// consume them — eating a closer is how one mis-parse cascades.
+// The statement-boundary tokens, the panic-mode sync points: NEWLINE and SEMI end the
+// statement, `}` closes an enclosing block, EOF ends the input. The enclosing statement
+// loops recover at these, so the `expect` error paths must never consume them — eating a
+// closer is how one mis-parse cascades.
 function isSyncKind(k: TokKind) {
   k == "NEWLINE" || k == "SEMI" || k == "RBRACE" || k == "EOF"
 }
 
-// Whether the token kind plausibly STARTS a statement — the mirror of `isSyncKind`
-// (those are where a mis-parse recovers AT, these are where it may resume FROM),
-// and the gate on `parseBracedBody`'s unbraced-body recovery. Membership is
-// `isStmtKeyword` plus the leading tokens of `parsePrimary` / `parseUnary`, minus
-// two deliberate exclusions:
-//   • `{` — a braced body is the ORDINARY path, so it never reaches the gate;
-//   • `else` — `if c else { … }` is a missing then-branch, not an unbraced body.
-//
-// THREE MEMBERS (`(`, `[`, `-`) ARE UNREACHABLE FROM A BODY POSITION and are still
-// listed, because the predicate answers about STATEMENTS, not about this one
-// caller: dropping them would encode the caller's precedence accident into a
-// general predicate. The measurement: docs/internals/parser-notes.md §startsStmt.
+// Whether the token kind plausibly starts a statement — the mirror of `isSyncKind` (those
+// are where a mis-parse recovers at, these where it may resume from), and the gate on
+// `parseBracedBody`'s unbraced-body recovery. `{` is excluded because a braced body is the
+// ordinary path, and `else` because `if c else { … }` is a missing then-branch.
 function startsStmt(k: TokKind) {
   if isStmtKeyword(k) { return true }
   k == "IDENT" ||
@@ -215,36 +199,23 @@ function startsStmt(k: TokKind) {
     k == "MINUSMINUS"
 }
 
-// Whether the token kind plausibly starts an EXPRESSION — `startsStmt`'s set
-// minus the statement keywords, plus `if` (`match` is already in the set): those
-// two are the value-returning keyword forms `parsePrimary` dispatches, and the
-// other eight (`let`/`const`/`return`/`while`/`for`/`break`/`continue`/`type`/
-// `function`) start a statement and no expression.
-//
-// The delimited-list separator recovery below is the only caller, and `{` is
-// left OUT on purpose even though an object literal starts with one: after a
-// complete element a `{` is far more often a missing closer than a missing
-// comma, and it is already `expectClose`'s own scan bound — so `[1 {x: 2}]`
-// keeps the lossy recovery rather than guessing a separator into it.
+// Whether the token kind plausibly starts an expression — `startsStmt`'s set minus the
+// statement keywords, plus `if`, since those are the value-returning keyword forms
+// `parsePrimary` dispatches. `{` is left out on purpose: after a complete element a `{` is
+// far more often a missing closer than a missing comma, so a lossy recovery is kept.
 function startsExprTok(k: TokKind) {
   if k == "IF" { return true }
   if isStmtKeyword(k) { return false }
   startsStmt(k)
 }
 
-// The kind TAG as text — the ONE place a `TokKind` atom is turned back into its
-// spelling. Every renderer goes through here so the atom→string materialisation
-// (a chain over the whole 68-member vocabulary) is emitted ONCE, in a function
-// only the diagnostic paths call, instead of inlined into the hot parser bodies
-// that name a kind in a message.
-//
-// The `return` is LOAD-BEARING: an atom→string materialisation reached as a
-// function's tail EXPRESSION emits an out-of-range local and the module fails to
-// instantiate (`unknown local N`); the explicit-return spelling is correct. Same
-// defect, same shape, for `{ const s = k \n s }`.
+// The kind tag as text — the one place a `TokKind` atom is turned back into its spelling,
+// so the chain over the whole vocabulary is emitted once, in a function only the
+// diagnostic paths call. The `return` is load-bearing: an atom-to-string materialisation
+// reached as a tail expression emits an out-of-range local and the module fails to load.
 function kindTag(k: TokKind): string { return k }
 
-// The display form of a token KIND in an `expected …` message: the concrete
+// The display form of a token kind in an `expected …` message: the concrete
 // lexeme for punctuation, a noun for the open classes, the raw kind tag as the
 // fallback for the rest.
 function kindDesc(k: TokKind): string {
@@ -264,8 +235,8 @@ function kindDesc(k: TokKind): string {
   kindTag(k)
 }
 
-// The display form of the OFFENDING token: its source lexeme, backticked
-// (NEWLINE/EOF have no printable lexeme and get a noun instead).
+// The display form of the offending token: its source lexeme, backticked. NEWLINE and EOF
+// have no printable lexeme and get a noun instead.
 function foundDesc(t: Tok) {
   if t.kind == "NEWLINE" { return "end of line" }
   if t.kind == "EOF" { return "end of input" }
@@ -274,7 +245,7 @@ function foundDesc(t: Tok) {
 }
 
 // Consume a token of the expected `kind`; on mismatch record a diagnostic and
-// advance PAST the offender — unless it is a sync token (or a `{` opening a
+// advance past the offender — unless it is a sync token (or a `{` opening a
 // nested construct), which is left for the enclosing recovery to handle.
 function expect(kind: TokKind) {
   if peekKind() == kind {
@@ -292,18 +263,10 @@ function expect(kind: TokKind) {
   false
 }
 
-// `expect` for a structural CLOSER (`)`, `]`, `}`, the generic `>`): on mismatch,
-// diagnose once and skip forward to the closer, consuming it — so `f(a b)` costs
-// one diagnostic and the `)` still closes the call. The skip is bounded by the sync
-// tokens, a statement-start keyword and `{`, so a genuinely MISSING closer abandons
-// at the boundary instead of swallowing following code.
-//
-// A ZERO-TOKEN SKIP IS A FAITHFUL RECOVERY AND IS MARKED LOSSLESS (DECISIONS.md
-// §"A recovered parse IS typechecked"): the tree then holds every token the user
-// wrote plus ONE inserted closer, so a type error read off it is real. A skip that
-// CONSUMED tokens is not marked — those tokens are gone and any count or type read
-// off what is left is fiction, which is what the phantom pins in
-// `tests/vl_lossless_recovery_test.ts` exist to hold.
+// `expect` for a structural closer (`)`, `]`, `}`, the generic `>`): on mismatch, diagnose
+// once and skip forward to the closer, consuming it, bounded by the sync tokens, a
+// statement-start keyword and `{`. A zero-token skip is a faithful recovery and is marked
+// lossless; a skip that consumed tokens is not, because those tokens are gone.
 function expectClose(kind: TokKind) {
   if peekKind() == kind {
     P.pos = P.pos + 1
@@ -333,18 +296,10 @@ function expectClose(kind: TokKind) {
   false
 }
 
-// Whether a delimited list CONTINUES past the element just parsed. A real `,` is
-// consumed; a MISSING one (`f(1 2)`, `[1 2]`) is diagnosed and INSERTED, so every
-// element the user wrote lands in the tree. `startsElem` is the CALLER's
-// element-start test — "another element" is a different set per list.
-//
-// THE INSERT IS SAME-LINE ONLY, and that guard is the whole difference between a
-// faithful recovery and a phantom: every caller skips NEWLINEs before asking, so
-// without it a missing CLOSER at end of line reads as a missing COMMA and swallows
-// the next statement as an element. THE PRICE IS DELIBERATE — a missing comma at
-// the end of a line inside a multi-line list keeps the old lossy recovery. The
-// worked witness, and why the newline is read off `P.pos - 1` rather than threaded
-// through the four callers: docs/internals/parser-notes.md §takeSep.
+// Whether a delimited list continues past the element just parsed. A real `,` is consumed;
+// a missing one (`f(1 2)`) is diagnosed and inserted, so every element lands in the tree,
+// and `startsElem` is the caller's element-start test. The insert is same-line only, or a
+// missing closer at end of line reads as a missing comma and swallows the next statement.
 function takeSep(startsElem: boolean): boolean {
   if peekKind() == "COMMA" {
     advance()
@@ -359,18 +314,10 @@ function takeSep(startsElem: boolean): boolean {
   true
 }
 
-// ── operator precedence ──────────────────────────────────────────────────────
-// Binary-operator binding power; higher binds tighter. `0` means "not a binary
-// operator", which is also the loop-terminating sentinel in the climber. The
-// ladder, looser→tighter:
-//   ??/|| < && < `|` < `^` < `&` < ==/!= < relational < shifts < +/- < * / %
-// So `a & b == c` is `a & (b == c)` and `a + b >> c` is `(a + b) >> c`.
-//
-// A FLAT `==` LADDER over the atoms, and the shape is load-bearing: the climber
-// asks this of EVERY token that could follow an operand and the overwhelmingly
-// common answer is `0`, so the tokens that most often END an operand chain are
-// rejected up front. Why the first-character bucketing it replaced is gone:
-// docs/internals/parser-notes.md §binPrec.
+// Binary-operator binding power; higher binds tighter, and `0` means "not a binary
+// operator", which is also the climber's loop-terminating sentinel. The ladder, loosest
+// first: `??`/`||` < `&&` < `|` < `^` < `&` < `==`/`!=` < relational < shifts < `+`/`-` <
+// `*` `/` `%`. A flat `==` ladder, since the common answer is `0`.
 function binPrec(kind: TokKind): i32 {
   // The frequent non-operators, so the common `0` exits early.
   if (
@@ -405,7 +352,7 @@ function binPrec(kind: TokKind): i32 {
   if kind == "EQUAL" {
     return 1 // assignment (right-associative)
   }
-  // Compound assignment (`+=` etc.) sits WITH assignment; the climber desugars it.
+  // Compound assignment (`+=` etc.) sits with assignment; the climber desugars it.
   if kind == "PLUSEQ" { return 1 }
   if kind == "MINUSEQ" { return 1 }
   if kind == "STAREQ" { return 1 }
@@ -431,19 +378,16 @@ function binPrec(kind: TokKind): i32 {
   0
 }
 
-// D1581 — how many `(` / `[` / object-literal `{` are open around the expression
-// being parsed. Inside one there is no statement a NEWLINE could be ending, so a
-// continuation line may LEAD with a binary operator; at depth 0 the newline is the
-// statement terminator and `a` NEWLINE `-b` stays two statements. A BLOCK resets it
-// to 0, because a `{ … }` inside a call argument holds statements exactly as the top
-// level does. Ruling: DECISIONS.md, "Newlines inside brackets are whitespace".
+// D1581 — how many `(`, `[` or object-literal `{` are open around the expression being
+// parsed. Inside one there is no statement a NEWLINE could end, so a continuation line may
+// lead with a binary operator; at depth 0 the newline is the statement terminator. A block
+// resets it to 0, because a `{ … }` inside a call argument holds statements.
 let brDepth = 0
 
-// The ABSOLUTE index of the binary OPERATOR a NEWLINE run at the cursor leads to, or
-// -1 when it leads to anything else. Sibling of `chainDotAfterNewlines`, and the same
-// look-before-consume discipline: the cursor moves only once the answer is known, so a
-// run leading to a closer or another element is LEFT IN PLACE — `takeSep` reads that
-// newline off `P.pos - 1` to refuse a cross-line missing-comma insert.
+// The absolute index of the binary operator a NEWLINE run at the cursor leads to, or -1
+// when it leads to anything else. Sibling of `chainDotAfterNewlines`, with the same
+// look-before-consume discipline: the cursor moves only once the answer is known, so a run
+// leading to a closer is left in place for `takeSep` to read off `P.pos - 1`.
 function binOpAfterNewlines(): i32 {
   let j = P.pos
   while kindAt(j) == "NEWLINE" { j = j + 1 }
@@ -451,7 +395,7 @@ function binOpAfterNewlines(): i32 {
   -1
 }
 
-// The right-associative operators (assignment): their RHS parses at the SAME
+// The right-associative operators (assignment): their RHS parses at the same
 // precedence, not `prec + 1`, so `a = b = c` nests as `a = (b = c)`.
 function rightAssoc(kind: TokKind) {
   kind == "EQUAL" ||
@@ -463,11 +407,9 @@ function rightAssoc(kind: TokKind) {
 
 // ── type annotations ─────────────────────────────────────────────────────────
 
-// `>`s still owed by a consumed `>>` / `>>>` token. The host's lexer keeps each
-// `>` a separate token (fusing shifts only in expression position), but THIS
-// lexer fuses `>>`/`>>>` into one SHR/USHR token — so a nested generic close
-// (`Box<Pair<i32, string>>`) arrives as a single token that must close TWO
-// levels. Consuming it credits the extra `>`s here; the enclosing close(s)
+// `>`s still owed by a consumed `>>` or `>>>` token. This lexer fuses them into one token,
+// so a nested generic close (`Box<Pair<i32, string>>`) arrives as a single token that must
+// close two levels. Consuming it credits the extra `>`s here, and the enclosing closes
 // drain the credit before reading another token.
 let pendingGt = 0
 
@@ -494,48 +436,30 @@ function expectTypeGt() {
   0
 }
 
-// True when the NEXT token is `kind` AND it may extend the type just parsed — i.e.
-// no `>` is still owed by a consumed `>>`/`>>>`.
-//
-// A BANKED CREDIT IS AN UNCLOSED ENCLOSING GENERIC, AND THE CLOSE IS THE ONLY THING
-// THAT MAY HAPPEN NEXT. The lexer fuses `>>` into one token, so in
-// `Box<Box<i32>> | i32` the inner close consumes the whole `>>` and a raw
-// `peekKind()` would let the OUTER `|` extend the ARGUMENT, folding the type into
-// `Box<Box<i32>|i32>`. The credit is what discriminates, not the token: the same
-// type spelled with a plain `>` banks nothing and its `|` DOES extend the argument.
-// The three continuation loops (`|`, `&`, `[]`) and the generic argument list's `,`
-// loop all read the token through here, which is why the test has one home. The
-// worked pair: docs/internals/parser-notes.md §atTypeCont.
+// True when the next token is `kind` and it may extend the type just parsed — that is, no
+// `>` is still owed. A banked credit is an unclosed enclosing generic, and the close is the
+// only thing that may happen next: in `Box<Box<i32>> | i32` a raw `peekKind` would let the
+// outer `|` extend the argument. The three continuation loops all read the token here.
 function atTypeCont(kind: TokKind) { pendingGt == 0 && peekKind() == kind }
 
-// ── D1045: block-scoped `type` declarations ──────────────────────────────────
-// A `type` declared inside a block is LEXICALLY SCOPED (DECISIONS.md §"A `type`
-// declared in a function body is legal and lexically scoped"; D1045).
-//
-// THE MECHANISM IS THE MODULE MERGE'S, not a second one: the declaration is minted
-// under a unique name (`P` → `P$b7`), every reference in its lexical extent is
-// spelled at that name, and the node is HOISTED into `progStmts` (`parseProgram`).
-// Every consumer that looks a type up BY NAME then works unchanged — which is what
-// makes this a SCOPING change and not a rep change. It is implemented in the parser
-// because recursive descent is lexical by construction. Only the type parameters
-// the declaration MENTIONS are captured, making it a generic alias. Full rationale:
-// docs/internals/parser-notes.md §"block-scoped type declarations".
+// D1045 — a `type` declared inside a block is lexically scoped. The mechanism is the module
+// merge's, not a second one: the declaration is minted under a unique name (`P` → `P$b7`),
+// every reference in its lexical extent is spelled at that name, and the node is hoisted
+// into `progStmts`, so every consumer that looks a type up by name works unchanged.
 let btDepth = 0
-// The scope chain, innermost LAST: the SOURCE name as written, the mangled base
-// it was minted under, and the captured type parameters comma-joined ("" when the
-// declaration captured none).
+// The scope chain, innermost last: the source name as written, the mangled base it is
+// minted under, and the captured type parameters comma-joined ("" when there are none).
 let btNames: string[] = []
 let btBases: string[] = []
 let btArgs: string[] = []
-// Whether the row's name is also spelled in VALUE position. Two forms are: a
-// `flat type TV` answers `TV.size` / `TV.field` as a constant fold, and a nominal
-// `type Id = new …` is the declaration whose name a future constructor spelling
-// would take. Set after the `new` marker is read (it sits past the `=`), which is
-// why it is a column rather than part of the push.
+// Whether the row's name is also spelled in value position. Two forms are: a `flat type TV`
+// answers `TV.size` and `TV.field` as a constant fold, and a nominal `type Id = new …` is
+// the declaration a future constructor spelling would take. Set after the `new` marker is
+// read, which sits past the `=`, so it is a column rather than part of the push.
 let btIsNew: boolean[] = []
 // The enclosing functions' live type parameters, outermost first.
 let btTyParams: string[] = []
-// The mint counter and the hoist list, both per PROGRAM (`parseProgram` resets
+// The mint counter and the hoist list, both per program (`parseProgram` resets
 // them): a name only has to be unique within its module, because the merge
 // renames each module's top-level declarations — these included — apart.
 let btSeq = 0
@@ -558,7 +482,7 @@ function btLookup(name: string): i32 {
 }
 
 // Trim the three scope columns back to `saved` rows (rebuilt rather than popped —
-// a bare `.pop()` STATEMENT is an emit gap in the native pipeline, the same reason
+// a bare `.pop()` statement is an emit gap in the native pipeline, the same reason
 // `driver.modTrimTo` exists).
 function btTrimTo(saved: i32) {
   const ns: string[] = []
@@ -591,18 +515,10 @@ function btTyParamsTrimTo(saved: i32) {
   0
 }
 
-// The live type parameters the REST of this declaration mentions, in declaration
-// order — the capture set of a body-scoped `type` (D1045).
-//
-// A TOKEN LOOKAHEAD, not a walk of the parsed body, because the answer is needed
-// BEFORE the body is parsed: a self-reference (`type N = { next: N | null }`) is
-// spelled while the body is being read and has to carry the same arguments every
-// other reference does. Deciding afterwards would leave the self-reference at the
-// wrong arity with no way to widen a finished spelling node.
-//
-// The scan ends at a NEWLINE/`;` at nesting depth 0 or at the enclosing `}`, and
-// steps over a newline that a multiline union continues with a leading `|`.
-// Over-scanning costs an unused alias parameter; under-scanning leaves `T` unbound.
+// The live type parameters the rest of this declaration mentions, in declaration order —
+// the capture set of a body-scoped `type` (D1045). A token lookahead, not a walk of the
+// parsed body, because a self-reference (`type N = { next: N | null }`) is spelled while
+// the body is read and must carry the same arguments every other reference does.
 function btCaptureScan(): string[] {
   const out: string[] = []
   if btTyParams.length == 0 { return out }
@@ -678,16 +594,10 @@ function btPushCaptureLeaves(capt: string) {
   0
 }
 
-// A `flat type` and a nominal `new` type are the `type` forms whose declared name
-// is also spelled in EXPRESSION position — `TV.size` / `TV.field` fold against the
-// flat layout — so an identifier naming one renames like its annotation does. This
-// is the same answer the module merge gives: `modBuildRename` reads `fnName`,
-// `letName`, `tdName` and `udName` into ONE table, so a module-scope declaration's
-// name is already renamed by the VALUE reader (`modRenamed`) wherever it appears.
-//
-// Restricted to those rows on purpose. A plain struct / union / alias name has no
-// meaning in expression position, so renaming one could only ever capture an
-// unrelated binding that happens to share the spelling.
+// A `flat type` and a nominal `new` type are the `type` forms whose declared name is also
+// spelled in expression position — `TV.size` folds against the flat layout — so an
+// identifier naming one renames like its annotation does. Restricted to those rows: a plain
+// struct, union or alias name has no meaning in expression position.
 function btValueName(name: string): string {
   const row = btLookup(name)
   if row < 0 { return name }
@@ -705,25 +615,23 @@ function btNoteDecl(ix: i32) {
   0
 }
 
-// A type-name leaf (`i32`, `string`, a user type), optionally followed by one or
-// more `[]` array suffixes (`i32[]`, `i32[][]`). Each `[]` appends the literal
-// chars to the type-name, so an array type is a `TypeRef` whose name carries the
-// brackets (e.g. `"i32[]"`) — the emitter discriminates an array annotation by that
-// `[]` suffix, needing no separate annotation node. Single-token lookahead only:
-// after a base name, an `LBRACK` must be immediately followed by `RBRACK`.
+// A type-name leaf (`i32`, `string`, a user type), optionally followed by one or more `[]`
+// array suffixes. Each `[]` appends the literal characters to the type name, so an array
+// type is a `TypeRef` whose name carries the brackets and the emitter discriminates on that
+// suffix. Single-token lookahead only: after a base name an `[` must be followed by `]`.
 export function parseType() {
   const p0 = peekTok().start
   const nm = parseTypeName()
-  // The spelling tree the name was built from — recorded on the annotation node
-  // it becomes, so a later pass can read the STRUCTURE instead of re-deriving it
-  // from `tyName`. Popped before the node is made: `mkTypeRef` pushes no
-  // spelling, and the producer left exactly one root on the stack.
+  // The spelling tree the name comes from — recorded on the annotation node it becomes, so
+  // a later pass can read the structure instead of re-deriving it from `tyName`. Popped
+  // before the node is made: `mkTypeRef` pushes no spelling, and the producer left exactly
+  // one root on the stack.
   const root = tsPop()
   const ix = mkTypeRef(nm, p0)
   setAnnTs(ix, root)
   // A well-formed annotation drains every `>` a `>>`/`>>>` banked (the credits
   // are consumed by the enclosing generic closes inside the recursion above).
-  // A credit left here is an EXTRA `>` — report it and drop it, or it would
+  // A credit left here is an extra `>` — report it and drop it, or it would
   // silently close some later unrelated generic annotation.
   if pendingGt > 0 {
     pendingGt = 0
@@ -732,9 +640,9 @@ export function parseType() {
   ix
 }
 
-// Parse a type ANNOTATION and return its synthetic NAME string (the lexeme the
+// Parse a type annotation and return its synthetic name string (the lexeme the
 // emitter discriminates on), without building a node. Splitting the name out lets the
-// map case embed the value type's name into its own synthetic name WITHOUT a
+// map case embed the value type's name into its own synthetic name without a
 // `P.nodes[...] is TypeRef` round-trip (an arena-element read `is` can't narrow here).
 export function parseTypeName() {
   // The spelling stack mark: every member `parseTypeIsect` returns pushes its
@@ -742,12 +650,10 @@ export function parseTypeName() {
   const tm = tsMark()
   let members = 1
   let name = parseTypeIsect()
-  // Inline UNION annotation `A | B | null`. In TYPE position (after a `:`), `|` is a
-  // union separator (vs the bitwise-OR operator in expression position). Encoded as
-  // the synthetic name `"A|B"` (mirroring the `i32[]` / `{[K]:V}` synthetic names);
-  // the checker splits on `|` to build the union/nullable type. A member is an
-  // INTERSECTION chain (`A & B` binds tighter than `|`, host `parseType` /
-  // `parseIntersectionType` precedence), so `A | B & C` is `A | (B & C)`.
+  // Inline union annotation `A | B | null`. In type position a `|` is a union separator,
+  // against the bitwise-or operator in expression position. Encoded as the synthetic name
+  // `"A|B"`, which the checker splits to build the union or nullable type. A member is an
+  // intersection chain, so `A | B & C` is `A | (B & C)`.
   let more = atTypeCont("PIPE")
   while more {
     advance() // "|"
@@ -761,11 +667,9 @@ export function parseTypeName() {
   name
 }
 
-// An INTERSECTION chain `A & B [& …]` — `&` binds tighter than the union
-// `|` and looser than the prefix `!` / `[]` suffix (host
-// `parseIntersectionType`). Encoded as the synthetic name `"A&B"`; the checker
-// splits on top-level `&` and folds the operands through `intersectTy` (so a
-// finite annotation like `(0 | 1 | 2) & !2` simplifies to a concrete union).
+// An intersection chain `A & B [& …]` — `&` binds tighter than the union `|` and looser
+// than the prefix `!` and the `[]` suffix. Encoded as the synthetic name `"A&B"`; the
+// checker splits on the top-level `&` and folds the operands through `intersectTy`.
 function parseTypeIsect() {
   const tm = tsMark()
   let operands = 1
@@ -781,18 +685,10 @@ function parseTypeIsect() {
   name
 }
 
-// A METHOD MEMBER's tail, shared by the two grammars that read a `{ … }` member
-// list: `parseTypeAtom`'s inline object arm and `parseTypeDecl`'s declaration body.
-// The caller has already consumed the member NAME and holds its spelling mark; this
-// consumes `( argument types ) : result`.
-//
-// The parameters listed are the CALL's arguments and the receiver is IMPLICIT —
-// there is no `self` (ruled 2026-09-01; `docs/constraints-design.md` OQ-1). A
-// zero-ary closure FIELD satisfies `{ f(): string }` and takes no receiver at all,
-// so writing the receiver into the bound would describe only one of the witnesses.
-//
-// Renders to the name segment `f(A,B):R` and leaves ONE `TS_METHOD` root on the
-// spelling stack — kids = argument types, then the RESULT last (`TS_FUNC`'s layout).
+// A method member's tail, shared by the two grammars that read a `{ … }` member list. The
+// caller has already consumed the member name and holds its spelling mark; this consumes
+// `( argument types ) : result`. The parameters are the call's arguments and the receiver is
+// implicit. Renders to `f(A,B):R` and leaves one `TS_METHOD` root, result kid last.
 function parseMethodMemberTail(fname: string, fm: i32) {
   advance() // "("
   let inner = ""
@@ -811,7 +707,7 @@ function parseMethodMemberTail(fname: string, fm: i32) {
   }
   expectClose("RPAREN")
   expect("COLON")
-  // The result extends as far RIGHT as it can, exactly as a function type's does
+  // The result extends as far right as it can, exactly as a function type's does
   // (`(i32) => i32 | null`): `{ find(): Circle | null }` is a method returning a
   // nullable, not a nullable method.
   const retName = parseTypeName()
@@ -819,16 +715,12 @@ function parseMethodMemberTail(fname: string, fm: i32) {
   fname + "(" + inner + "):" + retName
 }
 
-// One type "atom": a map `{[K]:V}`, the `null` type, a LITERAL type (`"a"`,
-// `0`, `1.5` — host `StringLiteral`/`IntegerLiteral`/`RealLiteral`), a
-// parenthesized group `(A | B)`, a prefix negation `!A` (A4), or a bare name —
-// each with any number of trailing `[]` array suffixes. (The union `|` and
-// intersection `&` chains are handled by the callers `parseTypeName` /
-// `parseTypeIsect`.) Literals/parens/negation join the synthetic-name scheme:
-// a string literal keeps its QUOTED lexeme (`"a"|"b"`), so the checker's
-// depth-aware name scanners skip quoted segments.
+// One type atom: a map `{[K]:V}`, the `null` type, a literal type (`"a"`, `0`, `1.5`), a
+// parenthesized group `(A | B)`, a prefix negation `!A`, or a bare name — each with any
+// number of trailing `[]` suffixes. The union and intersection chains belong to the callers.
+// A string literal keeps its quoted lexeme, so the depth-aware name scanners skip it.
 function parseTypeAtom() {
-  // Each arm below closes ONE spelling node over the region above this mark, so
+  // Each arm below closes one spelling node over the region above this mark, so
   // the atom leaves exactly one root on the stack — including the error arm,
   // which pushes `TS_ERR` for the `""` name it returns.
   const tm = tsMark()
@@ -840,7 +732,7 @@ function parseTypeAtom() {
     name = "!" + parseTypeAtom()
     tsMk(TS_NEG, "", tm)
   } else if peekKind() == "STRING" {
-    // A string-literal type: the raw lexeme KEEPS its quotes, so the synthetic
+    // A string-literal type: the raw lexeme keeps its quotes, so the synthetic
     // name is `"a"` and the checker decodes the member with the quotes intact.
     name = advance().text
     tsMk(TS_LITSTR, name, tm)
@@ -850,10 +742,10 @@ function parseTypeAtom() {
     name = advance().text
     tsMk(TS_LITNUM, name, tm)
   } else if peekKind() == "LPAREN" {
-    // Either a FUNCTION TYPE `(params) => ret` (`() => void`, `(i32, i32) => i32` —
-    // disambiguated by an `=>` after the `)`) or a parenthesized GROUP `(A | B)` (kept in
-    // the synthetic name so the checker's `|`/`&` splitters honor the grouping). Parse the
-    // paren contents as a COMMA-separated type list either way.
+    // Either a function type `(params) => ret`, disambiguated by an `=>` after the `)`, or
+    // a parenthesized group `(A | B)`, kept in the synthetic name so the checker's `|` and
+    // `&` splitters honour the grouping. The paren contents parse as a comma-separated type
+    // list either way.
     advance() // "("
     let inner = ""
     if peekKind() != "RPAREN" {
@@ -873,20 +765,13 @@ function parseTypeAtom() {
     if peekKind() == "EQUAL" && peek2Kind() == "GT" {
       advance() // "="
       advance() // ">"
-      // The return type extends as far RIGHT as it can (`parseTypeName`): `(i32) => i32
-      // | null` is a function returning `i32 | null`, NOT a nullable function —
-      // parenthesize the FUNCTION for that. Synthetic name `"(params)=>ret"`; the `=>`
-      // marks it a function type.
-      //
-      // THIS GROUPING IS `nameToTy`'s, NOT A CHOICE: the checker takes a top-level `=>`
-      // as binding LOOSER than `|`/`&` (`isTopLevelFuncTypeName` guards the union
-      // split), so `(i32)=>i32|null` has ALWAYS denoted a function returning `i32?`.
-      // Reading the RETURN as a single atom builds the opposite tree from the same
-      // tokens — invisible while the tree was thrown away, and measured once the parser
-      // started keeping it (docs/internals/parser-notes.md §"function-type return").
+      // The return type extends as far right as it can: `(i32) => i32 | null` is a function
+      // returning `i32 | null`, not a nullable function — parenthesize the function for
+      // that. This grouping is `nameToTy`'s, not a choice: the checker takes a top-level
+      // `=>` as binding looser than `|` and `&` (`parser-notes.md` §"function-type return").
       const retName = parseTypeName()
       name = "(" + inner + ")=>" + retName
-      // Kids = the parameter list in order, then the RETURN atom LAST (it is the
+      // Kids = the parameter list in order, then the return atom last (it is the
       // one child every function spelling has; a zero-param `() => T` has only it).
       tsMk(TS_FUNC, "", tm)
     } else {
@@ -896,7 +781,7 @@ function parseTypeAtom() {
   } else if peekKind() == "LBRACE" {
     advance() // "{"
     if peekKind() == "LBRACK" {
-      // An index-signature MAP type `{ [K]: V }` (e.g. `{[string]: i32}`). Encoded
+      // An index-signature map type `{ [K]: V }` (e.g. `{[string]: i32}`). Encoded
       // as the synthetic name `"{[K]:V}"` — the emitter discriminates a map
       // annotation by that brace/bracket shape, mirroring how `i32[]` carries its
       // `[]` suffix, so no separate annotation node is needed.
@@ -912,20 +797,14 @@ function parseTypeAtom() {
       const valName = parseTypeName() // the value type's name (recurses for nesting)
       expectClose("RBRACE")           // "}"
       name = "{[" + keyName + "]:" + valName + "}"
-      // The KEY is a bare identifier token, not a parsed type, so it stays text
-      // on the node; the one kid is the VALUE spelling.
+      // The key is a bare identifier token, not a parsed type, so it stays text
+      // on the node; the one kid is the value spelling.
       tsMk(TS_MAP, keyName, tm)
     } else {
-      // An INLINE OBJECT type `{ x: i32, y: string }` (an anonymous structural
-      // annotation, e.g. a `{ x: i32 } | null` return). Encoded as the synthetic
-      // name `"{x:i32,y:string}"`; the checker splits it back into a TyObj.
-      //
-      // A member may also be a METHOD (`{ toString(): string }`, constraints phase
-      // 1) — the same production, discriminated by the `(` where a `:` would be.
-      // The spelling is FREE: before this both `{f(): string}` and `{f(self):
-      // string}` were parse errors at the `(` in every type position. Only a BOUND
-      // can consume one; `typecheck.nameToTyReal` refuses a method member in value
-      // position with a sentence.
+      // An inline object type `{ x: i32, y: string }`, encoded as the synthetic name
+      // `"{x:i32,y:string}"` which the checker splits back into a `TyObj`. A member may also
+      // be a method (`{ toString(): string }`) — the same production, discriminated by the
+      // `(` where a `:` would be. Only a bound can consume one; value position is refused.
       name = "{"
       let first = true
       let fgoing = peekKind() != "RBRACE"
@@ -973,11 +852,10 @@ function parseTypeAtom() {
     tsMk(TS_NULL, "null", tm)
   } else if peekKind() == "IDENT" {
     name = advance().text
-    // D1045 — A BLOCK-SCOPED `type` NAME RESOLVES HERE, and this is the only site
-    // that has to: every type-position identifier in the language reaches this
-    // atom, so the substitution is total by the grammar rather than by a list of
-    // positions. An unbound name is returned unchanged and resolves module-wide,
-    // which is what makes an outer/module `P` visible until a local one shadows it.
+    // D1045 — a block-scoped `type` name resolves here, and this is the only site that has
+    // to: every type-position identifier reaches this atom, so the substitution is total by
+    // the grammar rather than by a list of positions. An unbound name is returned unchanged
+    // and resolves module-wide, keeping an outer `P` visible until a local one shadows it.
     const btRow = btLookup(name)
     let capt = ""
     if btRow >= 0 {
@@ -986,11 +864,10 @@ function parseTypeAtom() {
     }
     const head = name // the identifier alone — the name grows a `<…>` below
     if peekKind() == "LT" {
-      // A generic-alias APPLICATION `Box<i32>` / `Pair<i32, string>` — in TYPE
-      // position the `<` is unambiguous (no comparison can appear here). The
-      // arguments join into the synthetic name (`Box<i32>`). One trailing comma
-      // before the `>` is tolerated (`Pair<i32, i32,>`), and `>>`/`>>>` close
-      // nested applications via `expectTypeGt`.
+      // A generic-alias application `Box<i32>` — in type position the `<` is unambiguous,
+      // since no comparison can appear here. The arguments join into the synthetic name.
+      // One trailing comma before the `>` is tolerated, and `>>`/`>>>` close nested
+      // applications through `expectTypeGt`.
       advance() // "<"
       name = name + "<" + parseTypeName()
       let gmore = peekKind() == "COMMA"
@@ -1005,8 +882,8 @@ function parseTypeAtom() {
         }
       }
       expectTypeGt() // ">"
-      // A body-scoped GENERIC alias that also captured the enclosing function's
-      // type parameters takes them as TRAILING arguments, after its own.
+      // A body-scoped generic alias that also captured the enclosing function's
+      // type parameters takes them as trailing arguments, after its own.
       if capt != "" {
         name = name + "," + capt
         btPushCaptureLeaves(capt)
@@ -1014,8 +891,8 @@ function parseTypeAtom() {
       name = name + ">"
       tsMk(TS_APP, head, tm)
     } else if capt != "" {
-      // A body-scoped `type` that names the enclosing `T` was minted as the
-      // generic alias `P$b7<T>`; every reference to it is that application.
+      // A body-scoped `type` naming the enclosing `T` is minted as the generic alias
+      // `P$b7<T>`; every reference to it is that application.
       btPushCaptureLeaves(capt)
       name = name + "<" + capt + ">"
       tsMk(TS_APP, head, tm)
@@ -1065,10 +942,10 @@ function parsePrimary() {
     return mkNull("null", p0)
   }
   if k == "FUNCTION" {
-    // The `function(...)` EXPRESSION form was removed: an anonymous function is an
-    // arrow lambda `(params) => body`. (A named `function f(...)` DECLARATION is a
-    // statement — `parseStmt` dispatches it before expression parsing is reached —
-    // so a `function` token here is always a misplaced lambda.)
+    // There is no `function(...)` expression form: an anonymous function is an arrow lambda
+    // `(params) => body`. A named `function f(...)` declaration is a statement, dispatched
+    // by `parseStmt` before expression parsing, so a `function` token here is a misplaced
+    // lambda.
     P.diags.push(
       {
         msg: "anonymous functions use arrow syntax `(params) => body`, not `function(...)`",
@@ -1079,7 +956,7 @@ function parsePrimary() {
     return mkErr("expr", P.pos, p0)
   }
   if k == "IF" {
-    // `if` as an EXPRESSION (`print(if a > b { a } else { b })`) — the host's
+    // `if` as an expression (`print(if a > b { a } else { b })`) — the host's
     // `parsePrimary` dispatches `IF` to `parseIf` in expression position; the
     // same If node serves as statement and expression downstream.
     return parseIf()
@@ -1105,15 +982,15 @@ function parsePrimary() {
     return mkParen(inner, p0)
   }
   if k == "LBRACE" {
-    // A `{` in EXPRESSION position is an object literal `{ name: value, ... }`.
-    // (A block statement is dispatched by `parseStmt`'s `LBRACE` case BEFORE
+    // A `{` in expression position is an object literal `{ name: value, ... }`.
+    // (A block statement is dispatched by `parseStmt`'s `LBRACE` case before
     // any expression is parsed, so a `{` ever reaching `parsePrimary` — an
     // expression context — is unambiguously an object literal, never a block.)
     return parseObjLit()
   }
   if k == "LBRACK" {
-    // A `[` in EXPRESSION position is an array literal `[e, e, ...]`. (Index
-    // access `a[i]` is a POSTFIX in `parsePostfix`, where the `[` follows an
+    // A `[` in expression position is an array literal `[e, e, ...]`. (Index
+    // access `a[i]` is a postfix in `parsePostfix`, where the `[` follows an
     // already-parsed expression — so a `[` reaching `parsePrimary` always starts
     // a literal.)
     return parseArrayLit()
@@ -1125,29 +1002,20 @@ function parsePrimary() {
   mkErr("expr", P.pos, p0)
 }
 
-// AN INTERPOLATED LITERAL, DESUGARED HERE into the string concatenation it means:
-// `` `v=\{x} ok` `` becomes `"v=" + <render>(x) + " ok"`, and so does
-// `"v=\{x} ok"` — ONE hole syntax serves both quoted forms, and nothing below asks
-// which delimiter opened the literal.
-//
-// WHY THE DESUGAR IS HERE AND NOT A `TemplateLit` NODE KIND: `nodeTyIx` is sized to
-// the arena at `checkProgram` entry, so a node minted by a LATER desugar reads its
-// type back as -1 forever (D969 is the recorded cost). Minting the whole chain in
-// the parser puts every node inside the checker's own numbering. The other two
-// measurements behind the choice: docs/internals/parser-notes.md §parseTemplate.
-//
-// The renderer is `TPL_RENDER_LOCAL`, which no program can spell — see its header.
+// An interpolated literal, desugared here into the string concatenation it means: both
+// `` `v=\{x} ok` `` and `"v=\{x} ok"` become `"v=" + <render>(x) + " ok"`, and nothing below
+// asks which delimiter opened it. The desugar is here rather than a `TemplateLit` node kind
+// because `nodeTyIx` is sized at `checkProgram` entry, so a later-minted node reads -1 (D969).
 function parseTemplate(p0: i32) {
   const t0 = advance()
   // No hole: one `TEMPLATE` token, and the string literal it becomes keeps the
   // template's own span, so `vl fmt` reprints the author's bytes for free.
   if t0.kind == "TEMPLATE" { return mkStr(tplPartStrLex(t0.text), p0) }
 
-  // The concat operands, in order: the leading text part, then per hole a render
-  // call and (unless it is empty) the text part after it. An EMPTY part is
-  // dropped — `` `${a}${b}` `` is `"" + r(a) + r(b)`, not four `+`s over three
-  // empty strings — except the leading one, which stays so the result is a
-  // `string` concatenation and the root is always a `+` to mark.
+  // The concat operands in order: the leading text part, then per hole a render call and,
+  // unless it is empty, the text part after it. An empty part is dropped — except the
+  // leading one, which stays so the result is a `string` concatenation and the root is
+  // always a `+` to mark.
   const ops: i32[] = []
   ops.push(mkStr(tplPartStrLex(t0.text), -1))
   let going = true
@@ -1156,7 +1024,7 @@ function parseTemplate(p0: i32) {
     const hk = peekKind()
     let hole = -1
     if hk == "TEMPLATE_MID" || hk == "TEMPLATE_TAIL" {
-      // `\{}` — the delimiters with nothing between them. Reported HERE rather
+      // `\{}` — the delimiters with nothing between them. Reported here rather
       // than left to "expected an expression but found TEMPLATE_TAIL", which
       // names a token the author never typed.
       P.diags.push(
@@ -1170,9 +1038,9 @@ function parseTemplate(p0: i32) {
     const args: i32[] = []
     args.push(hole)
     ops.push(mkCall(mkIdent(TPL_RENDER_LOCAL, holePos), args, holePos))
-    // The hole's expression must end AT the closing `}` — the lexer only mints a
-    // MID/TAIL there. Anything else is leftover input; skip to the next
-    // delimiter so one bad hole does not swallow the rest of the file.
+    // The hole's expression must end at the closing `}` — the lexer only mints a `MID` or
+    // `TAIL` there. Anything else is leftover input; skip to the next delimiter so one bad
+    // hole does not swallow the rest of the file.
     let k2 = peekKind()
     if k2 != "TEMPLATE_MID" && k2 != "TEMPLATE_TAIL" && k2 != "EOF" {
       P.diags.push(
@@ -1198,8 +1066,8 @@ function parseTemplate(p0: i32) {
     }
   }
 
-  // Folded AFTER the closing token is consumed, so every `+` anchors at it and
-  // the ROOT's `[pos, nodeEndOf)` is the template's own source span.
+  // Folded after the closing token is consumed, so every `+` anchors at it and
+  // the root's `[pos, nodeEndOf)` is the template's own source span.
   let acc = ops[0]
   let i = 1
   while i < ops.length {
@@ -1213,36 +1081,28 @@ function parseTemplate(p0: i32) {
   acc
 }
 
-// The per-argument NAMES of the argument list parseArgs LAST completed ("" =
-// positional), parallel to its returned values. A module global rather than a
-// second return (VL functions return one value): safe against nesting because
-// parseArgs assigns it at the END — an inner call's list is finished (and its
-// `mkCallN` consumed the global in `parsePostfix`) before the outer list
-// resumes collecting into its own local.
+// The per-argument names of the argument list `parseArgs` last completed ("" for
+// positional), parallel to its returned values. A module global rather than a second return
+// value, and safe against nesting because `parseArgs` assigns it at the end: an inner call's
+// list is finished before the outer list resumes collecting into its own local.
 let gCallArgNames: string[] = []
 
-// A comma-separated argument list, already past the "(". Consumes the ")".
-// Returns the argument node indices. (A string-returning call can't drive a
-// `while` condition directly — a tracked gap — so the comma test is read into a
-// local `more` and re-checked in the body.)
-//
-// Each argument may carry a NAME — `f(a: 2, b: 1)` — recognized exactly as the
-// host does (parser.ts `parseArguments`): an IDENT immediately followed by a
-// COLON names the argument; the name binds to the parameter with that name in
-// the checker/emitter, not to its source position. Names collect into
-// `gCallArgNames` ("" for a positional entry).
+// A comma-separated argument list, already past the `(`, consuming the `)`; returns the
+// argument node indices. Each argument may carry a name — `f(a: 2, b: 1)` — recognized as an
+// IDENT immediately followed by a COLON. The name binds to the parameter with that name in
+// the checker and emitter, not to its source position; names collect into `gCallArgNames`.
 function parseArgs() {
   const args: i32[] = []
   const names: string[] = []
   const brSavedA = brDepth
   brDepth = brDepth + 1
-  // An argument list may span lines and allow ONE trailing comma before `)`.
+  // An argument list may span lines and allow one trailing comma before `)`.
   skipNewlines()
   if peekKind() != "RPAREN" {
     parseOneArg(args, names)
     skipNewlines()
-    // `takeSep` consumes a real `,` and INSERTS a missing one (`f(1 2)`), so the
-    // `advance()` that used to head this loop now lives there.
+    // `takeSep` consumes a real `,` and inserts a missing one (`f(1 2)`), so the loop's
+    // element advance lives there rather than here.
     let more = takeSep(startsExprTok(peekKind()))
     while more {
       skipNewlines()
@@ -1277,23 +1137,18 @@ function parseOneArg(args: i32[], names: string[]) {
   0
 }
 
-// An object literal `{ name: value, ... }`, the cursor on the leading `{`. Each
-// field is `IDENT ":" expr`, a STRING key `"+": expr` (operator / index-trap
-// fields — the key is the decoded string, quotes stripped), a method shorthand
-// `add(a, b) { … }` (sugar for `add: function(a, b) { … }`, mirroring the host's
-// `parsePair`), or a bare-IDENT shorthand `{ x }` (→ `x: x`). Fields are
-// comma-separated (a trailing comma is tolerated). Returns an `ObjLit` whose
-// `objFields` are the `FieldInit` node indices in source order — the emitter
-// relies on that order to bind values to the declared fields.
+// An object literal `{ name: value, … }`, the cursor on the leading `{`. A field is
+// `IDENT ":" expr`, a string key `"+": expr` (operator and index-trap fields, decoded with
+// quotes stripped), a method shorthand `add(a, b) { … }`, or a bare-IDENT shorthand `{ x }`.
+// `objFields` are the `FieldInit` indices in the source order the emitter binds by.
 function parseObjLit() {
   const p0 = peekTok().start // the opening `{`
   expect("LBRACE")
   const brSavedO = brDepth
   brDepth = brDepth + 1
-  // An object literal may span several source lines (`{` NEWLINE `k: v,` NEWLINE
-  // `}`). Mirror the host's `parseObjectLiteral`: skip NEWLINEs after `{`, before
-  // each field, after each field (before the `,`/`}`), after the `,`, and before
-  // the closing `}` so a field/`,`/`}` may sit on any line.
+  // An object literal may span several source lines. Newlines are skipped after `{`, before
+  // each field, after each field (before the `,` or `}`), after the `,`, and before the
+  // closing `}`, so a field, a comma or the closer may sit on any line.
   skipNewlines()
   const fields: i32[] = []
   let going = peekKind() != "RBRACE"
@@ -1326,7 +1181,7 @@ function parseObjLit() {
     }
     if badKey {
       // Recover from a malformed field key (e.g. a doubled comma `{ x: 1,, y }`):
-      // skip to the next `,`/`}` so it yields ONE diagnostic ("expected IDENT …")
+      // skip to the next `,`/`}` so it yields one diagnostic ("expected IDENT …")
       // rather than a cascade of mis-parses from the leftover tokens.
       while (
         peekKind() != "COMMA" &&
@@ -1354,7 +1209,7 @@ function parseObjLit() {
       fields.push(mkFieldInit(name, value, fp0))
     }
     skipNewlines()
-    // An object literal's element starts with its KEY — an IDENT or a STRING
+    // An object literal's element starts with its key — an IDENT or a STRING
     // (`"+": fn`) — so `{x: 1 y: 2}` is a missing separator, not a missing `}`.
     if takeSep(peekKind() == "IDENT" || peekKind() == "STRING") {
       skipNewlines()
@@ -1377,8 +1232,8 @@ function parseArrayLit() {
   expect("LBRACK")
   const brSavedL = brDepth
   brDepth = brDepth + 1
-  // A literal may span lines (`[` NEWLINE `1,` NEWLINE `]`) and allow ONE
-  // trailing comma before `]` — newlines are insignificant until the `]`.
+  // A literal may span lines and allows one trailing comma before `]` — a line break is
+  // insignificant until the `]`.
   skipNewlines()
   const elems: i32[] = []
   let going = peekKind() != "RBRACK"
@@ -1397,11 +1252,10 @@ function parseArrayLit() {
   mkArrayLit(elems, p0)
 }
 
-// The ABSOLUTE index of the `.` / `?.` a NEWLINE run at the cursor leads to, or
-// -1 when it leads to anything else. Reads with `kindAt` (which clamps to the
-// trailing EOF) so the scan neither moves the cursor nor runs off the stream —
-// the caller only commits once the answer is known. Comments are trivia and never
-// reach `P.toks`, so a comment line between two links costs nothing here.
+// The absolute index of the `.` or `?.` a NEWLINE run at the cursor leads to, or -1 when it
+// leads to anything else. It reads with `kindAt`, which clamps to the trailing EOF, so the
+// scan neither moves the cursor nor runs off the stream. Comments never reach `P.toks`, so a
+// comment line between two links costs nothing.
 function chainDotAfterNewlines(): i32 {
   let j = P.pos
   while kindAt(j) == "NEWLINE" { j = j + 1 }
@@ -1410,8 +1264,8 @@ function chainDotAfterNewlines(): i32 {
   -1
 }
 
-// `primary` then a chain of call `(args)` / member `.name` / index `[i]` postfixes.
-// A leading `.` / `?.` on a LATER LINE continues the chain (see the NEWLINE arm).
+// `primary` then a chain of call `(args)`, member `.name` and index `[i]` postfixes. A
+// leading `.` or `?.` on a later line continues the chain — see the NEWLINE arm.
 function parsePostfix() {
   // The whole postfix chain anchors at the leading token of its primary operand
   // (`f` in `f(a).b[i]`), captured before the primary is parsed.
@@ -1453,25 +1307,20 @@ function parsePostfix() {
       expectClose("RBRACK")
       node = mkIndex(node, index, p0)
     } else if k == "NEWLINE" {
-      // A NEWLINE run whose next real token is `.` / `?.` CONTINUES this chain
-      // (DECISIONS.md, owner 2026-09-02): skip to that dot and let the loop's
-      // DOT / QUESTION_DOT arm take it on the next pass. Anything else ends the
-      // chain with the newlines LEFT IN PLACE for the statement loop — `(` on a
-      // new line is a legal parenthesised statement and `[` a legal array
-      // literal, so consuming the newline before either would silently join two
-      // statements. Hence the look-before-consume, and hence NEWLINE only: a
-      // `;` ends the statement outright, so `a;` / `.b` is not a chain.
+      // A NEWLINE run whose next real token is `.` or `?.` continues this chain: skip to
+      // that dot and let the loop take it next pass. Anything else ends the chain with the
+      // newlines left in place, since `(` on a new line is a legal parenthesised statement.
+      // Hence the look-before-consume, and hence NEWLINE only — a `;` ends the statement.
       const j = chainDotAfterNewlines()
       if j < 0 { going = false } else { P.pos = j }
     } else {
       going = false
     }
   }
-  // Postfix `x++` / `x--` on an IDENT. The increment itself is `x = x ± 1`, but a
-  // postfix EXPRESSION must yield the OLD value (unlike prefix, which yields the
-  // new one), so the assignment is wrapped in a postfix `Unary` (`"p+"`/`"p-"`):
-  // the emitter unwraps it to the plain assignment in STATEMENT position and
-  // recovers the pre-increment value (new ∓ 1) in EXPRESSION position.
+  // Postfix `x++` / `x--` on an IDENT. The increment is `x = x ± 1`, but a postfix
+  // expression must yield the old value, so the assignment is wrapped in a postfix `Unary`
+  // (`"p+"`/`"p-"`): the emitter unwraps it to the plain assignment in statement position
+  // and recovers the pre-increment value in expression position.
   const pk2 = peekKind()
   if pk2 == "PLUSPLUS" || pk2 == "MINUSMINUS" {
     const pt = P.nodes[node]
@@ -1492,7 +1341,7 @@ function parsePostfix() {
       )
     } else {
       // A postfix `++`/`--` on a non-identifier (`a.b++`, `a[i]++`) isn't
-      // supported: say so and CONSUME the operator — left in the stream it
+      // supported: say so and consume the operator — left in the stream it
       // would silently re-parse as a prefix operator on whatever follows.
       let opTxt = "++"
       if pk2 == "MINUSMINUS" { opTxt = "--" }
@@ -1508,7 +1357,7 @@ function parsePostfix() {
 // Prefix `!` / `-`, else fall through to postfix, then an optional trailing type
 // guard `<postfix> is TypeName` (A6). `is` binds looser than the postfix operators
 // (so `n.x is A` is `(n.x) is A`) but tighter than the binary operators, matching
-// its use as an `if` condition `if n is A {`. The RHS is a bare type NAME.
+// its use as an `if` condition `if n is A {`. The RHS is a bare type name.
 function parseUnary() {
   // The operator token (or, falling through, the operand's first token) is the
   // construct's start — captured before anything is consumed.
@@ -1519,7 +1368,7 @@ function parseUnary() {
     return mkUnary("!", parseUnary(), p0)
   }
   // Prefix `++x` / `--x` desugars to `x = x + 1` / `x = x - 1` (assignment-as-
-  // expression yields the NEW value - the prefix semantics exactly), tagged with
+  // expression yields the new value - the prefix semantics exactly), tagged with
   // the surface `++`/`--` so the printer reprints the prefix form (`mkPreIncr`).
   if k == "PLUSPLUS" || k == "MINUSMINUS" {
     advance()
@@ -1532,32 +1381,22 @@ function parseUnary() {
     advance()
     return mkUnary("-", parseUnary(), p0)
   }
-  // Prefix bitwise NOT `~x` — flips every bit (lowered as `x ^ -1` in emit).
+  // Prefix bitwise not `~x` — flips every bit (lowered as `x ^ -1` in emit).
   if k == "TILDE" {
     advance()
     return mkUnary("~", parseUnary(), p0)
   }
   let node = parsePostfix()
-  // `x as T` — an explicit numeric CAST (B2). `as` is a CONTEXTUAL keyword: it stays
-  // a plain `IDENT` token (so it remains usable as an identifier and
-  // `import { a as b }` is untouched), special ONLY here, directly after a postfix
-  // operand on the same line. It shares the `is` guard's precedence slot: looser than
-  // the POSTFIX operators, tighter than every BINARY one, so `a + b as f64` is
-  // `a + (b as f64)`. A PREFIX unary recurses through `parseUnary` and so binds
-  // LOOSER (`-b as i64` is `-(b as i64)`) — the reverse of Rust, unobservable for
-  // numeric casts. CHAINABLE (`x as i64 as f64`). A newline before `as` ends the
-  // statement (no `skipNewlines` here), so a following `as = 1` reassignment of the
-  // soft-keyword identifier is unaffected.
+  // `x as T` — an explicit numeric cast. `as` is a contextual keyword: it stays a plain
+  // IDENT token and is special only here, directly after a postfix operand on the same
+  // line. It shares the `is` guard's precedence slot, looser than postfix and tighter than
+  // every binary operator, and is chainable. A newline before `as` ends the statement.
   while peekKind() == "IDENT" && peekTok().text == "as" {
     advance() // `as`
-    // THE TRIO'S SUFFIX (`error-handling-design.md` §Trio): `as` propagates, `as?` coalesces
+    // The trio's suffix (`error-handling-design.md` §Trio): `as` propagates, `as?` coalesces
     // to null, `as!` traps. Read immediately after the keyword, before the type, so the
-    // happy-path grammar is identical in all three — only the sad path differs.
-    //
-    // `as !T` (a cast to a NEGATION type) tokenizes the same as `as! T`, and is read as the
-    // trap form. That is not a collision worth a lookahead: a negation names "anything but T",
-    // which is not a type a value can be cast INTO, and the checker rejects it either way —
-    // whereas `as!` is a ruled spelling with a stated purpose.
+    // happy-path grammar is identical in all three. `as !T` tokenizes the same as `as! T`
+    // and is read as the trap form; a negation is not a type a value can be cast into.
     let asMode: AsMode = "prop"
     if peekKind() == "QUESTION" {
       advance()
@@ -1566,12 +1405,10 @@ function parseUnary() {
       advance()
       asMode = "trap"
     }
-    // The cast target's SPELLING is recorded on the `AsExpr` node, exactly as
-    // the `is` arm below records its check type (D-PARSETY P3): the root travels
-    // in `lastTyTsRoot` and is banked immediately after the node is minted, so
-    // `annTsNode` stays strictly increasing. The consumer is the module merge —
-    // an `as` target may be a user type ALIAS (`type Id = i32`), which the merge
-    // renames to `Id$mN` at its declaration.
+    // The cast target's spelling is recorded on the `AsExpr` node, exactly as the `is` arm
+    // records its check type: the root travels in `lastTyTsRoot` and is banked immediately
+    // after the node is minted, so `annTsNode` stays strictly increasing. The consumer is
+    // the module merge — an `as` target may be a user alias it renames at the declaration.
     const asNm = parseAsType()
     const asRoot = lastTyTsRoot
     const asIx = mkAsExpr(node, asNm, asMode, p0)
@@ -1579,15 +1416,13 @@ function parseUnary() {
     node = asIx
   }
   const pk = peekKind()
-  // `x is T` / `x !is T` — the RHS is a TYPE, not an expression (host: `parseType`
-  // after the `is`), so `x is {x: i32}`, `x is A | B` and `x is null` all parse.
-  // `!is` (the negated guard, two tokens `!` `is`) inverts the boolean: it
-  // desugars to `!(x is T)`, which the checker's narrowing already understands
-  // (a `Unary "!"` contributes the inverted branch's narrowings).
+  // `x is T` / `x !is T` — the right side is a type, not an expression, so `x is {x: i32}`,
+  // `x is A | B` and `x is null` all parse. `!is` inverts the boolean by desugaring to
+  // `!(x is T)`, which the checker's narrowing already understands.
   if pk == "IS" {
     advance() // "is"
-    // The check type's SPELLING is recorded on the `IsExpr` node (D-PARSETY P2):
-    // the root must be taken from `lastTyTsRoot` BEFORE the node is minted, and
+    // The check type's spelling is recorded on the `IsExpr` node (D-PARSETY P2):
+    // the root must be taken from `lastTyTsRoot` before the node is minted, and
     // banked immediately after, so `annTsNode` stays strictly increasing.
     const isNm = parseIsType()
     const isRoot = lastTyTsRoot
@@ -1607,21 +1442,16 @@ function parseUnary() {
   node
 }
 
-// The spelling root of the type the last STRING-returning type producer built.
-// `parseIsType` / `parseVariantName` / `parseVariantAtom` return a name, not a
-// node, and their callers mint the owning node afterwards — so the root travels
-// in this one-slot channel (the `pendingGt` shape) and the caller banks it on
-// the node it just made. Read IMMEDIATELY after the call; any further type
-// parsing overwrites it.
+// The spelling root of the type the last string-returning type producer built. Those
+// producers return a name, not a node, and their callers mint the owning node afterwards, so
+// the root travels in this one-slot channel and the caller banks it on the node it just
+// made. Read immediately after the call; any further type parsing overwrites it.
 let lastTyTsRoot = -1
 
-// The TYPE on the right of `is` / `!is`, as the synthetic NAME string the
-// checker resolves with `nameToTy`. `null` is its own one-token type; anything
-// else is a full annotation (`parseTypeName`: names, inline objects, unions, …).
-// D-PARSETY P2: the spelling is KEPT and banked on the `IsExpr` node by the
-// caller (`annTsOf` keys on any node, not only a `TypeRef`). The `null` arm
-// builds its `TS_NULL` leaf directly — the one-token type never enters
-// `parseTypeName`, so no producer left a root on the stack for it.
+// The type on the right of `is` / `!is`, as the synthetic name string the checker resolves
+// with `nameToTy`. `null` is its own one-token type; anything else is a full annotation. The
+// spelling is kept and banked on the `IsExpr` node by the caller. The `null` arm builds its
+// `TS_NULL` leaf directly, since the one-token type never enters `parseTypeName`.
 function parseIsType() {
   if peekKind() == "NULL" {
     advance()
@@ -1633,18 +1463,10 @@ function parseIsType() {
   nm
 }
 
-// The TARGET type of an `x as T` cast, as a synthetic NAME string. A single type
-// ATOM (`parseTypeAtom`), NOT a full `parseTypeName`: a top-level `|` or `&` must
-// stay a binary OPERATOR after the cast (so `a as i32 | b` is `(a as i32) | b`,
-// honouring `as`'s tighter-than-binary precedence). The checker rejects a
-// non-numeric-scalar atom, so an unusual target still parses here and errors
-// cleanly at the type tier.
-//
-// D-PARSETY P3: the spelling is KEPT and banked on the `AsExpr` node by the caller
-// (`annTsOf` keys on any node, not only a `TypeRef`) — the same one-slot channel
-// `parseIsType` uses. #1121 deferred this leg on the reading that a cast target is
-// a numeric primitive; it is whatever `nameToTy` resolves to one, which includes a
-// user ALIAS (`type Id = i32`) whose DECLARATION the module merge renames.
+// The target type of an `x as T` cast, as a synthetic name string. A single type atom, not a
+// full `parseTypeName`: a top-level `|` or `&` must stay a binary operator after the cast, so
+// `a as i32 | b` is `(a as i32) | b`. The spelling is kept and banked on the `AsExpr` node by
+// the caller, because a cast target may be a user alias whose declaration the merge renames.
 function parseAsType() {
   const nm = parseTypeAtom()
   lastTyTsRoot = tsPop()
@@ -1668,7 +1490,7 @@ function parseVariantAtom() {
 }
 
 // Precedence climbing from `minPrec`, seeded by an already-parsed `left`. A
-// binary expression anchors at its LEFT operand's start offset (`leftPos`, the
+// binary expression anchors at its left operand's start offset (`leftPos`, the
 // char offset of `left`'s first token) — every node built here carries it, so
 // `a + b * c` and its `b * c` subtree both point at their own leftmost token.
 function parseBinary(left: i32, minPrec: i32, leftPos: i32) {
@@ -1676,12 +1498,10 @@ function parseBinary(left: i32, minPrec: i32, leftPos: i32) {
   let going = true
   while going {
     let k = peekKind()
-    // D1581 — a NEWLINE inside an open bracket is whitespace before a binary
-    // operator, so the continuation line may LEAD with the operator. Gated on
-    // `brDepth` because at statement level the newline is the terminator: `a`
-    // NEWLINE `-b` is two statements and must stay so. Look-before-consume, like
-    // `chainDotAfterNewlines` — a newline run leading anywhere but to an operator
-    // is left in place for the caller (a list's `takeSep` reads it off `P.pos - 1`).
+    // D1581 — a NEWLINE inside an open bracket is whitespace before a binary operator, so
+    // the continuation line may lead with the operator. Gated on `brDepth`, because at
+    // statement level the newline is the terminator. Look-before-consume, like
+    // `chainDotAfterNewlines`: a run leading anywhere else is left in place for the caller.
     if brDepth > 0 {
       if k == "NEWLINE" {
         const jb = binOpAfterNewlines()
@@ -1697,12 +1517,10 @@ function parseBinary(left: i32, minPrec: i32, leftPos: i32) {
     } else {
       const opTok = P.pos // the operator token (anchors the mixing diagnostic)
       const opText = advance().text
-      // A binary operator at END of a line continues onto the next: the operand is on
-      // the following source line, so a NEWLINE (or SEMI) token may sit between the
-      // operator and the right operand. Skip it — the operator already commits the
-      // expression to continue, so the line break is not a statement terminator. This
-      // lets the self-host sources break a long `+`-concatenation (e.g. a multi-line
-      // diagnostic message `tErr("…" +\n  tyToStr(x) …)`) across lines.
+      // A binary operator at the end of a line continues onto the next, so a NEWLINE or
+      // SEMI may sit between the operator and the right operand. Skip it: the operator
+      // already commits the expression to continue, so the line break is not a statement
+      // terminator, which is what lets a long `+`-concatenation break across lines.
       skipNewlines()
       let nextMin = prec + 1
       if rightAssoc(k) { nextMin = prec }
@@ -1713,12 +1531,10 @@ function parseBinary(left: i32, minPrec: i32, leftPos: i32) {
         // with the surface op so the printer reprints `a += b` (see `mkCompoundAssign`).
         acc = mkCompoundAssign(opText.slice(0, 1), acc, right, leftPos)
       } else {
-        // `??` never shares an UNPARENTHESIZED operand chain with `||`/`&&`
-        // (the JS rule): `??` and `||` sit on one precedence tier here, so
-        // `a ?? b || c` would silently group left-to-right — a coin-flip for
-        // the reader. Demand explicit parentheses instead. A `Paren` operand
-        // is explicit grouping; only a DIRECT `BinExpr` operand of the other
-        // family trips the error.
+        // `??` never shares an unparenthesized operand chain with `||` or `&&`: they sit on
+        // one precedence tier here, so `a ?? b || c` would group left to right, a coin flip
+        // for the reader. A `Paren` operand is explicit grouping; only a direct `BinExpr`
+        // operand of the other family trips the error.
         const mixed = coalesceMixOp(opText, acc, right)
         if mixed != "" {
           P.diags.push(
@@ -1746,18 +1562,10 @@ function binOpOf(ix: i32) {
   ""
 }
 
-// Building `l op r`: does the coalesce-vs-logical mixing rule fire? Returns the
-// CONFLICTING operator's text (for the diagnostic), or "" when the mix is fine.
-//
-// The rule's vocabulary is closed — `??`, `||`, `&&`, and nothing else — and
-// every caller of this reaches it for EVERY binary node, so the dismissal of the
-// other twenty-odd operators is the path that matters. It uses `binPrec`'s
-// dispatch: a width test drops every single-character operator, one first-char
-// compare picks the family, and the exact lexeme compare only ever runs on the
-// three-operator population it confirms. The families are disjoint by first
-// character because `||` and `&&` are the lexer's ONLY multi-character lexemes
-// opening with `|` / `&` (`twoCharKind`), and `?`'s other one (`?.`) is postfix,
-// so `binPrec` answers 0 for it and it never reaches here.
+// Building `l op r`: does the coalesce-versus-logical mixing rule fire? Returns the
+// conflicting operator's text for the diagnostic, or "" when the mix is fine. The rule's
+// vocabulary is closed — `??`, `||`, `&&` — and every binary node reaches this, so it
+// dismisses by width and first character before comparing a lexeme.
 function coalesceMixOp(op: string, l: i32, r: i32) {
   if op.length < 2 { return "" }
   const c0 = op[0]
@@ -1807,18 +1615,10 @@ function parseLet() {
   ix
 }
 
-// `"type" IDENT "=" "{" (IDENT ":" type ("," IDENT ":" type)*)? "}"`
-// A struct type declaration. Each field is `IDENT ":" type` (the `type` reuses the
-// single-name `parseType`); fields are comma-separated with a tolerated trailing
-// comma. Returns a `TypeDecl` whose `tdFields` are the `FieldDef` indices in order.
-// `flatAt` is the source offset of a preceding `flat` modifier (webcraft P1.2), or
-// -1 when there is none. It doubles as the declaration's POSITION when present, and
-// that is load-bearing rather than cosmetic: the formatter reprints a type
-// declaration from a VERBATIM SOURCE SLICE starting at `pos` (`emitTypeOrUnionDecl`
-// → `sliceNode`), so a `pos` left on the `type` keyword would put `flat` outside the
-// slice and `vl fmt` would SILENTLY DELETE IT — turning a checked layout back into a
-// plain record. `exportPrefix` still recovers a preceding `export` correctly,
-// because it reads the token immediately before `pos` and that is now the `flat`.
+// A struct type declaration `type N = { field: type, … }`; fields are comma-separated with a
+// tolerated trailing comma, and `tdFields` are the `FieldDef` indices in order. `flatAt` is
+// the source offset of a preceding `flat` modifier, or -1, and doubles as the declaration's
+// position: the formatter reprints from a verbatim slice at `pos`, which would drop `flat`.
 function parseTypeDecl(flatAt: i32) {
   let p0 = peekTok().start // the `type` keyword
   if flatAt >= 0 { p0 = flatAt }
@@ -1832,17 +1632,10 @@ function parseTypeDecl(flatAt: i32) {
   } else {
     expect("IDENT")
   }
-  // Generic alias parameters `type Box<T> = …` (A10). The parameter names fold
-  // into the DECLARED name (`Box<T>`); the checker splits them back out when it
-  // registers the alias and substitutes the type arguments at an application
-  // site (`Box<i32>`).
-  //
-  // D-DECLPARAM: they are also KEPT, exactly as the annotation spelling tree is
-  // (D-PARSETY) — the base name and the parameter list, banked on the declaration
-  // node by every `mkTypeDecl`/`mkUnionDecl` exit below (`ast.setDeclGp`). The
-  // consumers that used to re-derive them from this very concatenation read the
-  // bank instead. `gpBase` doubles as the "did a `<` follow" marker: it is "" for
-  // a non-generic declaration, and the parser records nothing for one.
+  // Generic alias parameters `type Box<T> = …`. The names fold into the declared name
+  // (`Box<T>`), and are also kept: the base name and the parameter list are banked on the
+  // declaration node by every `mkTypeDecl`/`mkUnionDecl` exit below. `gpBase` doubles as the
+  // "did a `<` follow" marker — "" for a non-generic declaration, which records nothing.
   let gpBase = ""
   const gpNames: string[] = []
   if peekKind() == "LT" {
@@ -1867,17 +1660,10 @@ function parseTypeDecl(flatAt: i32) {
     expectClose("GT") // ">"
     name = name + ">"
   }
-  // D1045 — A BODY-SCOPED DECLARATION IS MINTED UNIQUE, AND THE SCOPE ROW GOES IN
-  // BEFORE THE BODY IS PARSED. `btDepth > 0` is "inside a block", which is exactly
-  // the ruling's scope and is the parser's own nesting rather than a list of the
-  // positions a statement can stand in — `parseStmt` is one production shared by
-  // module and block scope, so a position list is the mistake this avoids.
-  //
-  // The row is pushed here, not at the return, so a RECURSIVE local type
-  // (`type N = { next: N | null }`) resolves its own name; the row is not popped
-  // here either — the enclosing block's `btTrimTo` is what ends the scope, which
-  // is what makes the name visible to every LATER statement of the block and to
-  // the lambdas and nested functions inside them.
+  // D1045 — a body-scoped declaration is minted unique, and the scope row goes in before the
+  // body is parsed. `btDepth > 0` is "inside a block", the parser's own nesting rather than a
+  // list of positions. The row is pushed here so a recursive local type resolves its own
+  // name, and popped by the enclosing block's `btTrimTo`, not here.
   btPendingBase = ""
   if btDepth > 0 {
     let srcName = name
@@ -1886,8 +1672,8 @@ function parseTypeDecl(flatAt: i32) {
     const mangled = srcName + "$b" + i32ToStr(btSeq)
     const caps = btCaptureScan()
     if caps.length > 0 || gpBase != "" {
-      // Declared generic, or made generic by CAPTURE: the captured parameters are
-      // appended AFTER the declaration's own, which is the order every reference
+      // Declared generic, or made generic by capture: the captured parameters are
+      // appended after the declaration's own, which is the order every reference
       // spells them in (`parseTypeAtom`).
       let ci = 0
       while ci < caps.length {
@@ -1912,11 +1698,10 @@ function parseTypeDecl(flatAt: i32) {
     btIsNew.push(false)
     btPendingBase = mangled
   }
-  // A bodyless `type Bar` (no `= body`) is reported ONCE, at the declaration,
-  // with an actionable message — instead of cascading "expected EQUAL …" from
-  // mis-parsing the following line as the body. Recover as a sentinel TypeDecl
-  // (`tdFields == [-1]`) that the checker registers as an error type, so the use
-  // site (`let y: Bar = …`) does not cascade either.
+  // A bodyless `type Bar` is reported once, at the declaration, instead of cascading
+  // "expected EQUAL" from mis-parsing the following line as the body. Recovery is a sentinel
+  // `TypeDecl` (`tdFields == [-1]`) the checker registers as an error type, so the use site
+  // does not cascade either.
   const eqHere = peekKind() == "EQUAL"
   if !eqHere {
     P.diags.push(
@@ -1938,18 +1723,10 @@ function parseTypeDecl(flatAt: i32) {
     return blix
   }
   expect("EQUAL")
-  // NOMINAL NEWTYPE (webcraft P1.5): `type EntityId = new i32` /
-  // `type F32View = new { … }` declares a type DISTINCT from its body in the checker
-  // and ERASED at emit (`docs/internals/newtype-design.md`).
-  //
-  // `new` is a CONTEXTUAL keyword, recognized only here — one position, one token of
-  // lookahead — so it stays a legal identifier everywhere else and no existing
-  // program can be broken by the addition. A hard lexer keyword would have been free
-  // against the corpus but reserves a common word language-wide for one form.
-  //
-  // The GUARD is the second token: `new` is the marker only when a type FOLLOWS it on
-  // the same construct. `type N = new` alone still means "alias of the type named
-  // `new`", which is what it means today.
+  // A nominal newtype: `type EntityId = new i32` declares a type distinct from its body in
+  // the checker and erased at emit. `new` is a contextual keyword recognized only here, one
+  // token of lookahead, so it stays a legal identifier everywhere else. The guard is the
+  // second token: `type N = new` alone still means an alias of the type named `new`.
   let isNew = 0
   if peekKind() == "IDENT" {
     if peekTok().text == "new" {
@@ -1960,25 +1737,17 @@ function parseTypeDecl(flatAt: i32) {
       }
     }
   }
-  // D1045: mark the scope row as having a VALUE-position spelling, so a `TV.size`
+  // D1045: mark the scope row as having a value-position spelling, so a `TV.size`
   // fold renames with its annotation (`btValueName`). Read here rather than at the
   // push because `new` sits after the `=`, and the row has to exist before the
   // body is parsed.
   if btPendingBase != "" && (isNew == 1 || isFlat) {
     if btIsNew.length > 0 { btIsNew[btIsNew.length - 1] = true }
   }
-  // `type N = A | B | C` — a discriminated-union ALIAS (the RHS is a type name, not a
-  // `{`). Parse `member (PIPE member)*` into a `UnionDecl`; a member is an
-  // intersection chain of atoms (bare names, literal types, inline objects). A single
-  // bare name is a one-member union. A compound `{ … } & { … }` RHS takes the LBRACE
-  // path below and re-encodes as a UnionDecl.
-  //
-  // A `{`-LEADING RHS IS THE STRUCT BODY BELOW — EXCEPT AN INDEX-SIGNATURE MAP
-  // (`{[K]: V}`), whose `{` opens a map, not a field list, and which died on
-  // `expected an identifier but found [` in every declaration position (the 7-of-7
-  // census is in docs/internals/parser-notes.md §"map type in a type declaration").
-  // The lookahead here is exactly `parseTypeAtom`'s own (`{` then `[`, no newline
-  // skip between them), so the two grammars cannot disagree about what opens a map.
+  // `type N = A | B | C` — a discriminated-union alias, parsed as `member (PIPE member)*`
+  // into a `UnionDecl`; a single bare name is a one-member union. A `{`-leading right side is
+  // the struct body below, except an index-signature map (`{[K]: V}`), whose `{` opens a map.
+  // The lookahead is exactly `parseTypeAtom`'s, so the two grammars cannot disagree.
   const afterEq = peekKind()
   if afterEq != "LBRACE" || peek2Kind() == "LBRACK" {
     const variants: string[] = []
@@ -1987,11 +1756,10 @@ function parseTypeDecl(flatAt: i32) {
     const vroots: i32[] = []
     variants.push(parseVariantName())
     vroots.push(lastTyTsRoot)
-    // A multiline union puts each `|` on its own line, so a NEWLINE may precede
-    // the next `|` — skip newlines before testing for the pipe. `endTok` pins the
-    // cursor just past the LAST variant so the trailing newline-skip below does
-    // not stretch the decl's end-token (`nodeEndOf`) onto a following blank /
-    // comment line — which would make the formatter's verbatim slice swallow it.
+    // A multiline union puts each `|` on its own line, so newlines are skipped before
+    // testing for the pipe. `endTok` pins the cursor just past the last variant so the
+    // trailing skip does not stretch the declaration's end token onto a following blank or
+    // comment line, which would make the formatter's verbatim slice swallow it.
     let endTok = P.pos
     skipNewlines()
     let more = peekKind() == "PIPE"
@@ -2015,23 +1783,20 @@ function parseTypeDecl(flatAt: i32) {
   }
   expect("LBRACE")
   const fields: i32[] = []
-  // `synth` mirrors the field list as the inline-object SYNTHETIC name
+  // `synth` mirrors the field list as the inline-object synthetic name
   // (`{a:i32,b:i32}`), so a `{ … } & …` / `{ … } | …` continuation can
   // re-encode the whole RHS as a UnionDecl alias without re-parsing.
   let synth = ""
-  // The field NAMES and their type spelling ROOTS, kept for the `{ … } & … | …`
-  // re-encode below: that path's FIRST union member is the synthetic `{…}` text,
-  // assembled from this list rather than returned by a type producer, so its
-  // spelling tree has to be assembled the same way (D-PARSETY P2). Nothing is
-  // built unless the continuation fires — a plain `type X = { … }` struct
-  // declaration adds no spelling node here.
+  // The field names and their type spelling roots, kept for the `{ … } & … | …` re-encode
+  // below: that path's first union member is the synthetic `{…}` text, assembled from this
+  // list rather than returned by a type producer, so its spelling tree is assembled the same
+  // way. Nothing is built unless the continuation fires.
   const fNames: string[] = []
   const fRoots: i32[] = []
-  // EVERY member in source order — the BOUND body, assembled into a spelling tree
-  // below and ONLY when a method member was actually seen, so an ordinary `type X =
-  // { … }` pays three pushes per field and mints no node. A separate column from
-  // `fRoots`, which is the FIELD list (1:1 with `fNames`, for the `& … | …`
-  // re-encode); a method member contributes no field.
+  // Every member in source order — the bound body, assembled into a spelling tree below and
+  // only if a method member appears, so an ordinary `type X = { … }` mints no node. A
+  // separate column from `fRoots`, which is the field list for the `& … | …` re-encode; a
+  // method member contributes no field.
   const mNames: string[] = []
   const mRoots: i32[] = []
   const mIsMethod: boolean[] = []
@@ -2042,11 +1807,10 @@ function parseTypeDecl(flatAt: i32) {
     const fp0 = peekTok().start // the field's name token
     let fname = ""
     if peekKind() == "IDENT" { fname = advance().text } else { expect("IDENT") }
-    // A METHOD member (`toString(): string`) — constraints phase 1, the same
-    // production `parseTypeAtom`'s inline object arm reads, so the two spellings
-    // of one bound cannot drift. It declares a CALL, not a field, so it pushes no
-    // `FieldDef`: the declaration is minted with the fields it has (usually none)
-    // and the whole body travels as the bound annotation assembled below.
+    // A method member (`toString(): string`) — the same production `parseTypeAtom`'s inline
+    // object arm reads, so the two spellings of one bound cannot drift. It declares a call,
+    // not a field, so it pushes no `FieldDef`: the declaration is minted with the fields it
+    // has and the whole body travels as the bound annotation assembled below.
     if peekKind() == "LPAREN" {
       const mm = tsMark()
       if synth != "" { synth = synth + "," }
@@ -2089,18 +1853,10 @@ function parseTypeDecl(flatAt: i32) {
     }
   }
   expectClose("RBRACE")
-  // A BOUND ALIAS — `type Showable = { toString(): string }` (constraints phase 1).
-  // A body with a method member declares a CALL CONTRACT, not a layout, so it exits
-  // here rather than continuing into the struct/`&`/`|` machinery below: none of
-  // those compose with it (`Showable & {n: i32}` would have to mean intersecting a
-  // contract with a shape, which phase 1 does not define), and a `[]` suffix would
-  // be an array of a thing that has no values.
-  //
-  // What is minted is an EMPTY-field `TypeDecl` — the exact shape `type E = {}` has
-  // today, so nothing downstream meets a construct it has not already seen — plus
-  // the whole body as ONE object annotation on the `declBound*` side table. `<T:
-  // Showable>` and `<T: { toString(): string }>` therefore reach the identical
-  // spelling tree, and `typecheck` has one decoder rather than two.
+  // A bound alias — `type Showable = { toString(): string }`. A body with a method member
+  // declares a call contract, not a layout, so it exits here rather than continuing into the
+  // struct, `&` and `|` machinery, none of which composes with it. What is minted is an
+  // empty-field `TypeDecl` plus the whole body as one object annotation on `declBound*`.
   if sawMethod {
     if (
       atTypeCont("LBRACK") ||
@@ -2138,18 +1894,10 @@ function parseTypeDecl(flatAt: i32) {
     btNoteDecl(bix)
     return bix
   }
-  // D188 — AN ARRAY SUFFIX ON A `{ … }` BODY, WHICH WAS SILENTLY DROPPED.
-  // `type L = {n: i32}[]` reached here with `[` `]` still on the stream, no
-  // continuation arm claimed them, and the declaration completed as the plain STRUCT
-  // `{n: i32}` — one reading a loud check reject, the other a program that compiles
-  // and means something other than what it says. Both outcomes, and the counter build
-  // that named the mechanism: silent-class-inventory D188.
-  //
-  // The suffix is consumed HERE rather than in a continuation arm because it binds
-  // tighter than `&` and `|`: `{a: i32}[] | null` is a nullable ARRAY, and the union
-  // loop below must see `{a:i32}[]` as its first member. `atTypeCont` is
-  // `parseTypeAtom`'s own suffix test, so the two grammars cannot disagree, and NO
-  // newline is skipped ahead of it — a `[` on the next line opens a statement.
+  // D188 — an array suffix on a `{ … }` body: `type L = {n: i32}[]` reaches here with `[`
+  // `]` still on the stream and, unclaimed, would complete as the plain struct `{n: i32}`.
+  // It is consumed here rather than in a continuation arm because it binds tighter than `&`
+  // and `|`, and no newline is skipped ahead of it — a `[` on the next line is a statement.
   let arrSuffix = 0
   let asGoing = atTypeCont("LBRACK")
   while asGoing {
@@ -2158,27 +1906,17 @@ function parseTypeDecl(flatAt: i32) {
     arrSuffix = arrSuffix + 1
     asGoing = atTypeCont("LBRACK")
   }
-  // Object-type structural intersection `type AB = { … } & { … }`, or a union whose
-  // FIRST variant is an inline object: the struct body was only the first operand.
-  // Re-encode the RHS as a `UnionDecl` over synthetic names — the checker's `nameToTy`
-  // folds the `&` chain into a merged TyObj.
-  //
-  // A multiline union puts each `|` on its own line, so SKIP NEWLINES before testing
-  // for the continuation and RESTORE the cursor when nothing follows, so a plain
-  // `type N = { … }` does not swallow the newline that terminates it. Without the skip
-  // a brace-leading union was the ONE union that could not be wrapped across lines,
-  // which in turn made `vl fmt` fail its own re-parse check on an over-width one. The
-  // widening is total: `|` and `&` cannot begin a statement, so every token sequence
-  // this newly accepts was previously a hard parse error.
+  // Object-type structural intersection `type AB = { … } & { … }`, or a union whose first
+  // variant is an inline object: the struct body is only the first operand. The right side
+  // re-encodes as a `UnionDecl` over synthetic names, which `nameToTy` folds. Newlines are
+  // skipped before testing for the continuation and the cursor restored when none follows.
   const afterBrace = P.pos
   skipNewlines()
   if arrSuffix > 0 || peekKind() == "AMPERSAND" || peekKind() == "PIPE" {
     let first = "{" + synth + "}"
-    // The same object, as a spelling: a `TS_FIELD` per field over the type root
-    // the field already recorded, under one `TS_OBJ`. `tsToName` renders it back
-    // to exactly `"{" + synth + "}"` — `TS_FIELD` is `name + ":" + type` and
-    // `TS_OBJ` is `"{" + comma-joined + "}"`, the same concatenations `synth` is
-    // built by.
+    // The same object, as a spelling: a `TS_FIELD` per field over the type root the field
+    // already recorded, under one `TS_OBJ`. `tsToName` renders it back to exactly
+    // `"{" + synth + "}"`, the same concatenations `synth` is built by.
     const fkids: i32[] = []
     let fk = 0
     while fk < fNames.length {
@@ -2188,11 +1926,10 @@ function parseTypeDecl(flatAt: i32) {
       fk = fk + 1
     }
     let firstRoot = tsMkKids(TS_OBJ, "", fkids)
-    // …and the `[]`s the suffix loop above counted, appended to the synthetic name
-    // and wrapped around the spelling root in the SAME order `parseTypeAtom` does
-    // (`name + "[]"`, then `TS_ARR` over the node so far), so `tsToName` renders
-    // this member back to exactly the characters `first` holds. Off-stack, because
-    // the root is already popped — the case `tsMkKids`' own header names.
+    // …and the `[]`s the suffix loop counted, appended to the synthetic name and wrapped
+    // around the spelling root in the same order `parseTypeAtom` uses, so `tsToName` renders
+    // this member back to exactly the characters `first` holds. Off-stack, because the root
+    // is already popped.
     let asLeft = arrSuffix
     while asLeft > 0 {
       first = first + "[]"
@@ -2250,12 +1987,10 @@ function parseTypeDecl(flatAt: i32) {
   tdix
 }
 
-// `flat` on a body that is not a `{ … }` record. Reported HERE, at the syntactic
-// fork that decides the declaration form, because that is where the fact is: a
-// scalar alias, a union and an intersection do not have a layout, so there is
-// nothing for the checker to measure and no reason to carry the marker onto a
-// `UnionDecl`. Recovery is total — the declaration is parsed as the ordinary
-// non-flat alias it would otherwise be, so nothing cascades.
+// `flat` on a body that is not a `{ … }` record. Reported here, at the syntactic fork that
+// decides the declaration form, because that is where the fact is: a scalar alias, a union
+// and an intersection have no layout, so there is nothing to measure and no reason to carry
+// the marker onto a `UnionDecl`. Recovery is total — it parses as the ordinary alias.
 function flatNeedsRecord(name: string, nameTok: i32) {
   P.diags.push(
     {
@@ -2268,22 +2003,16 @@ function flatNeedsRecord(name: string, nameTok: i32) {
   0
 }
 
-// `"?" ":" type` — the OPTIONAL-parameter annotation, desugared here to the
-// union `T | null`. The `?` is pure surface: VL has real null unions, so one
-// mechanism (a default value) serves both spellings and nothing downstream of
-// this function needs to know which one was written.
-//
-// The synthetic NAME and the spelling TREE are built together, because
-// `tsToName(annTsOf(ix))` must reproduce `TypeRef.tyName` character for
-// character. `parseTypeName` leaves exactly one root on the spelling stack; it
-// is popped and re-parented under a `TS_UNION` beside a fresh `TS_NULL` leaf,
-// which is what `A | null` spelled by hand builds.
+// `"?" ":" type` — the optional-parameter annotation, desugared here to `T | null`. The `?`
+// is pure surface, so one mechanism serves both spellings. The synthetic name and the
+// spelling tree are built together, because `tsToName(annTsOf(ix))` must reproduce
+// `TypeRef.tyName` exactly: the root is re-parented under a `TS_UNION` beside a `TS_NULL`.
 function parseOptionalParamType(name: string) {
   const p0 = peekTok().start
   const nm = parseTypeName()
   const inner = tsPop()
-  // A FUNCTION type would need grouping parens to survive the `| null` suffix
-  // (`((i32) => i32) | null` — bare, the trailing union binds into the RESULT),
+  // A function type would need grouping parens to survive the `| null` suffix
+  // (`((i32) => i32) | null` — bare, the trailing union binds into the result),
   // and `?` has no place to put them. Reject rather than mint a name whose
   // spelling tree and text disagree.
   if inner >= 0 && inner < tsKind.length {
@@ -2306,18 +2035,10 @@ function parseOptionalParamType(name: string) {
   ix
 }
 
-// `IDENT "?"? (":" type)? ("=" expr)?`
-//
-// Two surface spellings, ONE mechanism. `a?: T` is sugar for `a: T | null =
-// null`, desugared right here — so `parType` already carries the `| null` and
-// `parDefault` already holds the `null` literal, and only `parOpt` (a
-// faithful-surface marker for the printer) remembers which was written.
-//
-// A DEFAULT is filled in at each DIRECT call site that omits the argument
-// (`emit_rewrite`'s call normalization), so the expression is emitted in the
-// CALLER's frame. That is why the checker restricts it to a literal: the
-// callee's parameters and locals do not exist where the default is evaluated,
-// and a bare name there would silently capture the caller's binding of it.
+// `IDENT "?"? (":" type)? ("=" expr)?` — two surface spellings, one mechanism. `a?: T` is
+// sugar for `a: T | null = null`, desugared right here, so `parType` already carries the
+// `| null` and only `parOpt` records which form the author wrote. A default is filled in at
+// each direct call site that omits the argument, so it is evaluated in the caller's frame.
 function parseParam() {
   const p0 = peekTok().start // the parameter's name token
   let name = ""
@@ -2369,11 +2090,10 @@ function parseParam() {
   ix
 }
 
-// `"(" params? ")"` — the parameter list shared by every function form (and the
-// arrow lambda). The cursor is on the `(`. A signature may span several source
-// lines (`function f(` NEWLINE `a: T,` NEWLINE `b: U` NEWLINE `)`): NEWLINEs are
-// skipped after `(`, around each `,`, and before `)`, so the list tolerates line
-// breaks anywhere a separator may appear. A trailing comma before `)` is allowed.
+// `"(" params? ")"` — the parameter list shared by every function form and the arrow lambda,
+// the cursor on the `(`. A signature may span several source lines: newlines are skipped
+// after `(`, around each `,` and before `)`, so the list tolerates line breaks anywhere a
+// separator may appear. A trailing comma before `)` is allowed.
 function parseParamList() {
   expect("LPAREN")
   skipNewlines()
@@ -2381,7 +2101,7 @@ function parseParamList() {
   if peekKind() != "RPAREN" {
     params.push(parseParam())
     skipNewlines()
-    // A parameter's element start is its NAME, so `function f(a: i32 b: i32)` is
+    // A parameter's element start is its name, so `function f(a: i32 b: i32)` is
     // a missing separator; `takeSep` inserts it and consumes a real `,`.
     let more = takeSep(peekKind() == "IDENT")
     while more {
@@ -2400,16 +2120,10 @@ function parseParamList() {
   params
 }
 
-// Parse a function BODY and build the `FuncDecl` — the cursor on the first token of
-// the body (past the signature and any `=>`). The body is:
-//   • a bare EXPRESSION (no `{`) — implicit return, wrapped in a one-stmt Block;
-//   • empty braces `{}` — a BLOCK (a void function), never an empty object;
-//   • braces that shape up as an object literal (`function makePoint() { x: 3 }`)
-//     — an object-literal EXPRESSION body (implicit return), per `looksLikeObject`;
-//   • otherwise a braced statement BLOCK.
-// Shared by `parseFuncTail` (the `function`-keyword forms) and `parseArrowLambda`
-// (the `=>` form), so both bodies parse identically. `funcPos` is the form's START
-// offset, stamped on the FuncDecl; `nameTok` is the name token (`-1` when anonymous).
+// Parse a function body and build the `FuncDecl`, the cursor on the body's first token. The
+// body is a bare expression (implicit return, wrapped in a one-statement `Block`), empty
+// braces (a block, never an empty object), braces that shape up as an object literal (an
+// implicit-return expression), or a braced statement block. `funcPos` is the form's start.
 function parseFuncBodyAndBuild(
   name: string,
   typarams: string[],
@@ -2418,17 +2132,10 @@ function parseFuncBodyAndBuild(
   nameTok: i32,
   funcPos: i32,
 ) {
-  // A BARE-EXPRESSION body (`function dbl(x: i32) x * 2`): no `{` after the signature
-  // means a single expression with an implicit return, wrapped in a synthetic
-  // one-statement Block so downstream passes see the braced shape. An OBJECT-LITERAL
-  // body is the same implicit-return shape; EMPTY braces `{}` stay a block.
-  //
-  // D1045 — THE BODY'S live type parameters. A `type` declared in this body may NAME
-  // them and captures them by becoming a generic alias; the enclosing generics'
-  // parameters stay live too, so a nested function's body sees both. Pushed HERE
-  // rather than in `parseFuncHead` because this is the one entry every body —
-  // `function`, method and arrow lambda — goes through, and the signature's own
-  // annotations are already parsed.
+  // A bare-expression body (`function dbl(x: i32) x * 2`) is a single expression with an
+  // implicit return, wrapped in a synthetic one-statement `Block`; empty braces stay a block.
+  // D1045 — the body's live type parameters are pushed here rather than in `parseFuncHead`,
+  // because this is the one entry every body goes through and the signature is already parsed.
   const btTpSaved = btTyParams.length
   let tpi = 0
   while tpi < typarams.length {
@@ -2478,7 +2185,7 @@ function parseFuncBodyAndBuild(
 
 // The shared tail of every `function`-keyword form — the cursor on the `(` of the
 // param list. Parses `"(" params? ")" (":" type)? body` and builds the `FuncDecl`.
-// `funcPos` is the function form's START offset (the `function` keyword, or the
+// `funcPos` is the function form's start offset (the `function` keyword, or the
 // method-shorthand key) — captured by the caller and stamped on the FuncDecl.
 function parseFuncTail(
   name: string,
@@ -2487,25 +2194,17 @@ function parseFuncTail(
   funcPos: i32,
 ) {
   const params = parseParamList()
-  // An INDEX-OPERATOR declaration is named for its RECEIVER as well as its
-  // operator, so several may coexist (`ast.vl`'s `opDeclName`). The receiver is
-  // the `self` parameter, which is why the mint waits for the parameter list.
+  // An index-operator declaration is named for its receiver as well as its operator, so
+  // several may coexist (`ast.opDeclName`). The receiver is the `self` parameter, which is
+  // why the mint waits for the parameter list.
   let dname = name
   if name == OP_INDEX_GET || name == OP_INDEX_SET {
     dname = indexOpDeclName(name, params, nameTok)
   }
-  // ARITY of a NON-INDEX operator declaration (silent-class-inventory D444).
-  // Operator dispatch is binary and only binary — `checkBinary`'s `opSelfFnTy`
-  // returns -1 unless the declaration is exactly `(self, other)`, and
-  // `checkUnaryNode` has no operator lookup at all — so a declaration at any other
-  // arity can never fire at any receiver, and no call can be written for it either
-  // (`-` is not an identifier, and the quoted spelling mints the identical name). It
-  // is exactly "a name no reference could ever be written for", the criterion this
-  // file already applies to a quoted NON-operator.
-  //
-  // REPORTED HERE, not at the checker's hoist where the index operator's twin lives,
-  // because arity is SYNTACTIC: the index rule needs the resolved receiver TYPE
-  // (D445), this one needs nothing the parser does not hold.
+  // D444 — the arity of a non-index operator declaration. Operator dispatch is binary and
+  // only binary: `checkBinary`'s `opSelfFnTy` returns -1 unless the declaration is exactly
+  // `(self, other)`, so a declaration at any other arity can never fire and no call can be
+  // written for it. Reported here because arity is syntactic.
   if isBinOpFuncName(name) {
     if params.length != 2 {
       P.diags.push(
@@ -2519,18 +2218,10 @@ function parseFuncTail(
         },
       )
     } else {
-      // THE POLLUTION RULE, SAID OUT LOUD (silent-class-inventory D471). At the right
-      // arity, `opSelfFnTy` still returns -1 unless the FIRST parameter is NAMED `self` —
-      // before it consults any type — so an arity-2 declaration whose first parameter is
-      // named anything else is inert at EVERY receiver, an object one included (D471
-      // carries the 380-cell grid).
-      //
-      // A REJECT AND NOT AN OPEN DESIGN QUESTION, measured rather than argued: `-` is not
-      // an identifier, so `-(7, 1)` is a parse error and the quoted spelling mints the
-      // identical name — there is no call syntax at any arity. Same criterion as the
-      // arity gate above, as `indexOpDeclName`'s `"[]"`/`"[]="`, and as a quoted
-      // NON-operator. SYNTACTIC, so it belongs here: the rule is about the parameter's
-      // NAME. D425's twin needs the resolved TYPE and lives at the checker's hoist.
+      // D471 — at the right arity, `opSelfFnTy` still returns -1 unless the first parameter
+      // is named `self`, before it consults any type, so an arity-2 declaration whose first
+      // parameter is named anything else is inert at every receiver. A reject and not an open
+      // question: there is no call syntax at any arity. Syntactic, so it belongs here.
       const bp0 = P.nodes[params[0]]
       if bp0 is Param {
         if bp0.parName != "self" {
@@ -2553,11 +2244,10 @@ function parseFuncTail(
   parseFuncBodyAndBuild(dname, typarams, params, ret, nameTok, funcPos)
 }
 
-// The minted declaration name for an index-operator function — the operator
-// plus the `self` parameter's ANNOTATION SPELLING. The annotation is REQUIRED:
-// the operator dispatches on the receiver's type, and an un-annotated `self` is
-// an inference hole that would accept every receiver, which is both an
-// un-mintable name and a dispatch nobody could predict.
+// The minted declaration name for an index-operator function — the operator plus the `self`
+// parameter's annotation spelling. The annotation is required: the operator dispatches on the
+// receiver's type, and an un-annotated `self` is an inference hole that would accept every
+// receiver, which is both an unmintable name and a dispatch nobody could predict.
 function indexOpDeclName(op: string, params: i32[], nameTok: i32) {
   let recv = ""
   if params.length > 0 {
@@ -2585,13 +2275,10 @@ function indexOpDeclName(op: string, params: i32[], nameTok: i32) {
   opDeclName(op, recv)
 }
 
-// Lookahead from a `(` in expression position: is this an arrow-lambda parameter
-// list (`(params) => …` or `(params): Ret => …`) rather than a grouped expression
-// (`(expr)`)? Scan to the `)` that matches the opening `(` (paren-depth 0) and test
-// whether `=>` (`EQUAL` `GT`) — or a return-type `:` (`COLON`) — immediately
-// follows. A grouped expression's `)` is never followed by either (`vl` has no
-// `?:` ternary, so no `(group):` arises in expression position), so this is
-// unambiguous. The cursor stays put — pure lookahead.
+// Lookahead from a `(` in expression position: is this an arrow-lambda parameter list rather
+// than a grouped expression? Scan to the `)` that matches the opening `(` and test whether
+// `=>` or a return-type `:` immediately follows. A grouped expression's `)` is never followed
+// by either, so this is unambiguous. The cursor stays put — pure lookahead.
 function looksLikeArrowLambda() {
   let depth = 0
   let i = P.pos
@@ -2614,13 +2301,10 @@ function looksLikeArrowLambda() {
   kindAt(i + 1) == "EQUAL" && kindAt(i + 2) == "GT"
 }
 
-// `"(" params? ")" (":" type)? "=>" body` — an arrow lambda: anonymous, equivalent
-// to `function(params)(: Ret)? body` but with `=>` before the body. An optional
-// return-type annotation (`(n: i32): i32 => …`) parses into `fnRet` exactly like a
-// `function`-form return type. It parses to the SAME nameless `FuncDecl` (no
-// generics, no name token), so the checker and emitter treat the two forms
-// identically (lifted to a top-level function, a closure value built at each use
-// site). `p0` is the `(`'s offset, stamped on the node.
+// `"(" params? ")" (":" type)? "=>" body` — an arrow lambda: anonymous, with an optional
+// return annotation that parses into `fnRet` exactly like a `function`-form return type. It
+// parses to the same nameless `FuncDecl`, so the checker and emitter treat the two forms
+// identically. `p0` is the `(`'s offset, stamped on the node.
 function parseArrowLambda(p0: i32) {
   const params = parseParamList()
   let ret = -1
@@ -2631,9 +2315,9 @@ function parseArrowLambda(p0: i32) {
   parseFuncBodyAndBuild("", noTyParams, params, ret, -1, p0)
 }
 
-// The operator tokens a FUNCTION NAME may be (`function +(self, b)` — a free
-// operator function; `a + b` on user objects dispatches to it). Mirrors the
-// host's `OPERATOR_FUNC_NAMES` set (DIV/MOD/comparisons under this lexer's kinds).
+// The operator tokens a function name may be (`function +(self, b)` — a free operator
+// function; `a + b` on user objects dispatches to it). Mirrors the host's
+// `OPERATOR_FUNC_NAMES` set.
 function isOpFuncName(kind: TokKind) {
   kind == "PLUS" ||
     kind == "MINUS" ||
@@ -2649,8 +2333,8 @@ function isOpFuncName(kind: TokKind) {
     kind == "NE"
 }
 
-// The operator names a QUOTED function name may spell — `isBinOpFuncName`'s
-// symbol-token set (`ast.vl`) plus the two BRACKET operators, which have no token
+// The operator names a quoted function name may spell — `isBinOpFuncName`'s
+// symbol-token set (`ast.vl`) plus the two bracket operators, which have no token
 // spelling at all.
 function isStrFuncName(name: string) {
   name == OP_INDEX_GET ||
@@ -2682,20 +2366,18 @@ function parseFuncHead(requireName: boolean) {
     nameTok = P.pos
     name = advance().text
   } else if isOpFuncName(peekKind()) {
-    // An operator-symbol name (`function +(self, b)`); checked AFTER the IDENT
+    // An operator-symbol name (`function +(self, b)`); checked after the IDENT
     // case, so `function <(a, b)` reads the `<` as the name (host order).
     nameTok = P.pos
     name = advance().text
   } else if peekKind() == "STRING" {
-    // A STRING-LITERAL operator name (`function "[]"(self: V, i: i32)`). This is
-    // the ONLY spelling the bracket operators have — `[` and `]` open an index
-    // expression everywhere else, so they cannot be a name TOKEN — and it is the
-    // same spelling their closure-FIELD form already uses (`{ "[]": … }`). The
-    // symbol-token operators accept it too, so `function "+"(self, b)` and
-    // `function +(self, b)` name the same function.
+    // A string-literal operator name (`function "[]"(self: V, i: i32)`). This is the only
+    // spelling the bracket operators have — `[` and `]` open an index expression everywhere
+    // else — and it is the same spelling their closure-field form uses. The symbol-token
+    // operators accept it too, so `function "+"` and `function +` name the same function.
     nameTok = P.pos
-    // A token's `text` is its RAW source span, so strip the quotes — the same
-    // equivalence the STRING object-literal KEY relies on (an operator lexeme
+    // A token's `text` is its raw source span, so strip the quotes — the same
+    // equivalence the STRING object-literal key relies on (an operator lexeme
     // carries no escapes).
     const rawName = advance().text
     name = rawName.slice(1, rawName.length - 1)
@@ -2716,18 +2398,10 @@ function parseFuncHead(requireName: boolean) {
   } else if requireName {
     expect("IDENT")
   }
-  // `==` AND `!=` ARE NOT OVERLOADABLE, and this is the ONE place both spellings
-  // converge — the symbol-token arm and the quoted arm land on the same `name`, so
-  // one test covers both.
-  //
-  // THE DECLARATION USED TO PARSE, TYPE-CHECK AND DO NOTHING, printing the STRUCTURAL
-  // compare's answer — a `vl check`-clean WRONG VALUE — while `eqRefusals` ENDED ITS
-  // REFUSAL with an instruction to write exactly this declaration (D46).
-  //
-  // REJECTED RATHER THAN IMPLEMENTED because the refusal's own customer is a
-  // CONTAINER, whose compare recurses through three cores with no per-element
-  // dispatch hook: honouring the top-level struct case alone MOVES the trap one
-  // container deep instead of removing it. The remedy clause is retired with it.
+  // D46 — `==` and `!=` are not overloadable, and this is the one place both spellings
+  // converge, so one test covers the symbol-token arm and the quoted arm. Rejected rather
+  // than implemented because the refusal's own customer is a container, whose compare
+  // recurses through three cores with no per-element dispatch hook.
   if name == "==" || name == "!=" {
     P.diags.push(
       {
@@ -2740,16 +2414,10 @@ function parseFuncHead(requireName: boolean) {
       },
     )
   }
-  // Generic type parameters `<T, U>` (declaration position only — no ambiguity
-  // with the `<` comparison operator here). Names collected for the checker.
-  //
-  // A parameter may carry a BOUND — `<T: Showable>` or `<T: { toString(): string }>`
-  // (constraints phase 1, OQ-4 as ruled). The bound is parsed by the ORDINARY
-  // annotation producer, so an alias name, an inline object and a method-member
-  // literal all arrive the same way and the module merge renames it through
-  // `modRwType` like every other `TypeRef`. The bounds are banked against the
-  // `FuncDecl` node once it exists — `parseFuncTail` mints it — so they travel as
-  // parallel columns rather than as a widened node.
+  // Generic type parameters `<T, U>` — declaration position only, so there is no ambiguity
+  // with the `<` comparison. A parameter may carry a bound (`<T: Showable>`), parsed by the
+  // ordinary annotation producer so an alias name, an inline object and a method-member
+  // literal all arrive the same way. Bounds are banked against the `FuncDecl` once it exists.
   const typarams: string[] = []
   const tpBoundIxs: i32[] = []
   const tpBoundAnns: i32[] = []
@@ -2797,13 +2465,12 @@ function parseFuncTailBounded(
 
 function parseFunc() { parseFuncHead(true) }
 
-// The recovered arm: exactly ONE statement, wrapped in a SYNTHESIZED Block
-// (`-1` = no `{` source token). Every consumer downstream — the checker, the
-// printer, the LSP — then sees the shape the BRACED form would have produced,
-// so nothing past the parser needs to know a body was recovered. Every unbraced
-// body rides this, `else` included since the bare-statement `else` was removed.
+// The recovered arm: exactly one statement, wrapped in a synthesized `Block` (`-1` for no
+// `{` source token). Every consumer downstream then sees the shape the braced form produces,
+// so nothing past the parser can tell a recovered body from a written one. Every unbraced
+// body rides this, `else` included.
 function oneStmtBlock(): i32 {
-  // The recovered one-statement arm is a BLOCK, so it opens a `type` scope like
+  // The recovered one-statement arm is a block, so it opens a `type` scope like
   // any other (`parseBlock`) — a `type` declared in it is scoped to it.
   const btSaved = btNames.length
   btDepth = btDepth + 1
@@ -2814,18 +2481,10 @@ function oneStmtBlock(): i32 {
   mkBlock(one, -1)
 }
 
-// A body that REQUIRES braces — `if` / `while` / `for`, and since 2026-09-01 `else`
-// too (DECISIONS.md) — with BOUNDED recovery for the unbraced form.
-// Without it one missing brace CASCADES into a second, phantom diagnostic naming a
-// position the user never wrote. So when the offending token plausibly STARTS a
-// statement, take it as the body: ONE diagnostic anchored there and exactly one
-// statement as the arm, bounded by `parseStmt` — never a scan. The gate is
-// `startsStmt`, so a closer or a truncated construct keeps the plain `expected
-// `{`` diagnostic rather than having an arm invented for it.
-//
-// THE RECOVERED ARM IS LOSSLESS and says so (`dgMarkLossless`): no token is dropped
-// and none invented, so the driver may run the checker anyway. The `parseBlock`
-// fall-through carries no mark — that is `expectClose`'s SKIP answer, not this one.
+// A body that requires braces — `if`, `while`, `for` and `else` — with bounded recovery for
+// the unbraced form, since one missing brace otherwise cascades into a phantom diagnostic.
+// When the offending token plausibly starts a statement, take it as the body: one diagnostic
+// anchored there and exactly one statement, and the arm is marked lossless.
 function parseBracedBody(msg: string): i32 {
   if peekKind() != "LBRACE" && startsStmt(peekKind()) {
     dgMarkLossless(P.diags.length) // the index this push is about to occupy
@@ -2835,19 +2494,17 @@ function parseBracedBody(msg: string): i32 {
   parseBlock()
 }
 
-// `"if" expr block ("else" (ifStmt | block))?`
-// Serves statement AND expression position (the host's `parseIf` is reached from
-// `parsePrimary`); a recovered else branch wraps in a one-statement Block so
-// every branch downstream is a Block / If. A chain is `else if` — `else` whose
-// branch is another `if` (there is no fused `elseif` keyword).
+// `"if" expr block ("else" (ifStmt | block))?`, serving statement and expression position. A
+// recovered else branch wraps in a one-statement `Block`, so every branch downstream is a
+// `Block` or an `If`. A chain is `else if` — an `else` whose branch is another `if`, since
+// there is no fused `elseif` keyword.
 function parseIf() {
   const p0 = peekTok().start // the `if` keyword
   advance()                  // "if"
   const cond = parseExpr()
-  // The `then` single-statement sugar was REMOVED (2026-08-31, see
-  // DECISIONS.md): the branch is a brace block. Old code gets a targeted
-  // refusal naming the fix — the generic "expected {" would strand it — and
-  // then recovery-parses the old shape so later errors still surface.
+  // There is no `then` single-statement sugar: the branch is a brace block. Source that
+  // spells it gets a targeted refusal naming the fix — the generic "expected {" would strand
+  // it — and then recovery-parses that shape so later errors still surface (DECISIONS.md).
   let thenB = -1
   if peekKind() == "IDENT" && peekTok().text == "then" {
     P.diags.push(
@@ -2862,11 +2519,10 @@ function parseIf() {
     thenB = parseBracedBody("an `if` body requires braces: `if cond { … }`")
   }
   let els = -1
-  // The `else` may sit on a new line after the then-block's `}` (`}` NEWLINE
-  // `else {`). Mirror the host: scan PAST any NEWLINEs to look for it, but only
-  // CONSUME them if an `else` actually follows — a trailing block whose `}` is
-  // merely followed by a newline (no else) must leave the cursor on that newline
-  // so the enclosing statement loop sees the next statement.
+  // The `else` may sit on a new line after the then-block's `}`. Scan past any newlines to
+  // look for it, but consume them only if an `else` actually follows: a trailing block whose
+  // `}` is merely followed by a newline must leave the cursor on that newline so the
+  // enclosing statement loop sees the next statement.
   let look = P.pos
   let scanning = kindAt(look) == "NEWLINE" || kindAt(look) == "SEMI"
   while scanning {
@@ -2875,8 +2531,8 @@ function parseIf() {
   }
   if kindAt(look) == "ELSE" {
     P.pos = look + 1 // consume the skipped newlines and the `else`
-    // An `else {`-brace is a BLOCK unless it shapes up as an object literal —
-    // and EMPTY braces (`else {}`) stay a block (the same tie-break as a
+    // An `else {`-brace is a block unless it shapes up as an object literal —
+    // and empty braces (`else {}`) stay a block (the same tie-break as a
     // function body: `looksLikeObject` calls `{}` an object, which here would
     // synthesize a spurious `{}` expression).
     let ebraceBlock = false
@@ -2894,31 +2550,25 @@ function parseIf() {
     } else if ebraceBlock {
       els = parseBlock()
     } else if peekKind() == "LBRACE" {
-      // `else { a: 1 }` — an OBJECT LITERAL, not a block (`looksLikeObject`
-      // above is what tells the two readings apart). It IS braced, so the rule
-      // below is satisfied and this arm keeps the reading it has always had,
-      // diagnostic-free; `vl fmt` renders it as the unambiguous `else { { … } }`.
+      // `else { a: 1 }` is an object literal, not a block — `looksLikeObject` above tells the
+      // two readings apart. It is braced, so the rule below is satisfied and this arm keeps
+      // its reading, diagnostic-free; `vl fmt` renders it as the unambiguous `else { { … } }`.
       els = oneStmtBlock()
     } else {
-      // The `else <stmt>` single-statement form was REMOVED (2026-09-01, see
-      // DECISIONS.md): an `else` takes a brace block or another `if`, the same
-      // rule the `then` removal left the other bodies with. It rides the shared
-      // required-brace recovery, so `else print(2)` costs ONE diagnostic and the
-      // parse continues — and `else` followed by something that does not start a
-      // statement keeps the plain `expected `{`` reading, as `if`/`while`/`for` do.
+      // There is no `else <stmt>` single-statement form: an `else` takes a brace block or
+      // another `if`, the same rule the other bodies have. It rides the shared required-brace
+      // recovery, so `else print(2)` costs one diagnostic and the parse continues; an `else`
+      // followed by something that starts no statement keeps the plain `expected `{`` reading.
       els = parseBracedBody("an `else` body requires braces: `else { … }`")
     }
   }
   mkIf(cond, thenB, els, p0)
 }
 
-// `match scrut { pat [| pat]* => body … }` — exhaustive value dispatch. Reached from
-// `parsePrimary` (expression position), so a bare `match` statement is an expression statement.
-// Each arm is one-or-more patterns (a STRING or INTEGER literal, a TYPE, or `_`) joined by
-// `|`, then `=>` and a body (a `{` block, or a bare expression for the value-mapping case).
-// Arms are newline- or comma-separated. The SCRUTINEE node is threaded into the pattern parser:
-// a TYPE pattern is minted as a real `IsExpr` over it (see `parseMatchPattern`), which is what
-// makes the value-union arm ride the `x is T` machinery instead of a second one.
+// `match scrut { pat [| pat]* => body … }` — exhaustive value dispatch, reached from
+// `parsePrimary`, so a bare `match` statement is an expression statement. An arm is one or
+// more patterns joined by `|`, then `=>` and a body; arms are newline- or comma-separated.
+// The scrutinee node is threaded into the pattern parser, so a type pattern rides `x is T`.
 function parseMatch(): i32 {
   const p0 = peekTok().start // "match"
   advance()                  // "match"
@@ -2927,7 +2577,7 @@ function parseMatch(): i32 {
   skipNewlines()
   const pats: i32[] = []
   // Parallel to `pats`: each pattern's payload-binding clause (a `Block` of `const` decls) or -1.
-  // `parseMatchPattern` pushes exactly one entry per pattern, on EVERY exit including its error
+  // `parseMatchPattern` pushes exactly one entry per pattern, on every exit including its error
   // arm — the two columns are indexed by the same `armStart`/`armCount`, so a missed push would
   // silently shift every later arm's bindings onto the wrong pattern.
   const binds: i32[] = []
@@ -2971,13 +2621,10 @@ function parseMatch(): i32 {
   mkMatch(scrut, pats, binds, armStart, armCount, bodies, p0)
 }
 
-// Whether the token at the cursor can START a match arm's TYPE pattern: a name
-// (`C`, `i32`, `Box<i32>`), an inline object (`{c: i32}`) or the `null` type. Kept
-// a closed set so a token that starts NO type still gets the pattern diagnostic
-// below rather than `parseTypeAtom`'s generic "expected IDENT" recovery.
-//
-// A NUMBER is deliberately NOT here (D1572): a numeric lexeme in pattern position is
-// the integer LITERAL it reads as, taken by `parseMatchPattern` before this is asked.
+// Whether the token at the cursor can start a match arm's type pattern: a name, an inline
+// object or the `null` type. Kept a closed set so a token that starts no type still gets the
+// pattern diagnostic below rather than `parseTypeAtom`'s generic recovery. A number is
+// deliberately not here (D1572): a numeric lexeme in pattern position is the integer literal.
 function matchPatStartsType() {
   const k = peekKind()
   if k == "IDENT" { return true }
@@ -2986,18 +2633,10 @@ function matchPatStartsType() {
   false
 }
 
-// One match arm pattern: a STRING literal (a litunion member), an INTEGER literal
-// (D1572), `_` (the wildcard, lexed as the identifier `_`), or a TYPE (a VALUE-union
-// arm). Anything else is a parse error.
-//
-// A TYPE pattern is minted as a real `IsExpr` over the SCRUTINEE node — exactly what
-// `scrut is T` produces — so the spelling tree, the module merge, the lint walker
-// and the checker's `narrowTys`/`isVarTyIxOf` ABI are all filled from the same
-// place; there is no second narrowing path and no second type-name channel. It is
-// minted HERE, not at desugar time, because `isVarTyIx`/`nodeTyIx` are sized to the
-// arena at `checkProgram` entry. It is ONE type ATOM, not a `parseTypeName`; why
-// `|` and `(` cannot start a pattern is in
-// docs/internals/parser-notes.md §parseMatchPattern.
+// One match arm pattern: a string literal, an integer literal, `_` (the wildcard, lexed as
+// the identifier), or a type. A type pattern is minted as a real `IsExpr` over the scrutinee
+// — exactly what `scrut is T` produces — so there is no second narrowing path, and it is
+// minted here because `isVarTyIx` and `nodeTyIx` are sized at `checkProgram` entry.
 function parseMatchPattern(scrut: i32, binds: i32[]): i32 {
   const pp = peekTok().start
   if peekKind() == "STRING" {
@@ -3008,12 +2647,10 @@ function parseMatchPattern(scrut: i32, binds: i32[]): i32 {
     binds.push(-1)
     return mkIdent(advance().text, pp)
   }
-  // An INTEGER-LITERAL pattern (D1572): `0x10 => …`, `-1 => …`. Minted as the NUMBER
-  // EXPRESSION it reads as — a `NumLit`, or a `Unary "-"` over one — never as a numeric
-  // literal TYPE, so `desugarMatchAt`'s non-`IsExpr` arm turns it into `scrut == pat`
-  // and an integer match IS the hand-written if-chain, node for node.
-  // The `-` belongs to the PATTERN, not to a prefix expression: a pattern is ONE
-  // literal, so only an immediately-following NUMBER is taken.
+  // D1572 — an integer-literal pattern (`0x10 => …`, `-1 => …`), minted as the number
+  // expression it reads as rather than a numeric literal type, so `desugarMatchAt`'s
+  // non-`IsExpr` arm turns it into `scrut == pat` and an integer match is the hand-written
+  // if-chain. The `-` belongs to the pattern, so only an immediately-following number is taken.
   if peekKind() == "NUMBER" {
     binds.push(-1)
     return mkNum(advance().text, pp)
@@ -3026,14 +2663,14 @@ function parseMatchPattern(scrut: i32, binds: i32[]): i32 {
     return mkUnary("-", numIx, pp)
   }
   if matchPatStartsType() {
-    // The spelling root must be taken off the stack BEFORE the node is minted and banked
+    // The spelling root must be taken off the stack before the node is minted and banked
     // immediately after — `parseIsType`'s contract, with `parseTypeAtom` in place of
     // `parseTypeName` (the atom leaves exactly one root, including on its error arm).
     const nm = parseTypeAtom()
     const root = tsPop()
     const isIx = mkIsExpr(scrut, nm, pp)
     setAnnTs(isIx, root)
-    // The PAYLOAD clause is parsed after the pattern node is minted and banked, so it mints no
+    // The payload clause is parsed after the pattern node is minted and banked, so it mints no
     // type spelling of its own and `annTsNode` stays strictly increasing.
     binds.push(parseMatchPayload(scrut))
     return isIx
@@ -3045,18 +2682,10 @@ function parseMatchPattern(scrut: i32, binds: i32[]): i32 {
   mkErr("pat", P.pos, pp)
 }
 
-// The optional PAYLOAD clause of a variant pattern (phase 2b): `Move{x, y}` binds
-// one arm-local `const x = <scrut>.x` per named field. Returns a `Block` holding
-// those `LetDecl`s, or -1 when the pattern carries no clause. Punned field names
-// only — renaming and nesting are deferred in docs/internals/match-design.md.
-//
-// The clause is unambiguous exactly where it is legal: after a pattern's type atom
-// the only tokens the arm grammar allows are `|`, `=` (of `=>`) and this `{`. The
-// arm BODY's `{` is on the far side of the `=>`, and an inline object TYPE pattern
-// is consumed WHOLE by `parseTypeAtom` before this ever peeks.
-//
-// The initializer reads the SHARED scrutinee node — the same node every arm's
-// `IsExpr` tests — so the binding narrows through that arm's `is` fact.
+// The optional payload clause of a variant pattern: `Move{x, y}` binds one arm-local
+// `const x = <scrut>.x` per named field, returning a `Block` of those `LetDecl`s or -1. The
+// clause is unambiguous where it is legal — after a pattern's type atom the arm grammar
+// allows only `|`, `=` and this `{`. The initializer reads the shared scrutinee node.
 function parseMatchPayload(scrut: i32): i32 {
   if peekKind() != "LBRACE" { return -1 }
   const bp = peekTok().start
@@ -3099,11 +2728,10 @@ function parseWhile(label: string) {
   mkWhile(cond, body, label, p0)
 }
 
-// `for v in <from> to <to> [step <s>] { body }`  (numeric range), OR
-// `for v in <iterable> { body }`  (for-in over an array). `in`, `to` and `step` are
-// SOFT keywords (lexed as IDENT, matched by text). The form is decided after the
-// `in`-expression: a following soft `to` means a range, otherwise it is a for-in.
-// `label` is the loop's label from the `name: for …` form ("" otherwise).
+// `for v in <from> to <to> [step <s>] { body }` (a numeric range) or
+// `for v in <iterable> { body }` (a for-in over an array). `in`, `to` and `step` are soft
+// keywords, lexed as IDENT and matched by text; the form is decided after the `in`-expression,
+// a following soft `to` meaning a range. `label` is the label from the `name: for …` form.
 function parseFor(label: string) {
   const p0 = peekTok().start // the `for` keyword
   advance()                  // "for"
@@ -3145,7 +2773,7 @@ function parseFor(label: string) {
   fiix
 }
 
-// `"break" [label]` — a loop-control statement with an optional loop LABEL after
+// `"break" [label]` — a loop-control statement with an optional loop label after
 // the keyword (an IDENT on the same line — a NEWLINE token stops the lookahead,
 // exactly as the host's `at("ID")` does). Mirrors the `case "BREAK"` arm in
 // `parser.ts`.
@@ -3182,11 +2810,11 @@ function parseReturn() {
 function parseBlock() {
   const p0 = peekTok().start // the opening `{`
   expect("LBRACE")
-  // D1045: a block opens a `type` SCOPE. The mark is taken here and trimmed at
+  // D1045: a block opens a `type` scope. The mark is taken here and trimmed at
   // the close, which is the whole of "lexically scoped to the block".
   const btSaved = btNames.length
   btDepth = btDepth + 1
-  // D1581 — a block holds STATEMENTS, so its newlines are terminators again even
+  // D1581 — a block holds statements, so its newlines are terminators again even
   // inside `f(() => { … })`. Without the reset, `a` NEWLINE `-b` in a lambda body
   // nested in a call argument would join into one subtraction.
   const brSavedB = brDepth
@@ -3207,7 +2835,7 @@ function parseBlock() {
 }
 
 // The statement-leading keywords: a `{` whose first token (after newlines) is
-// one of these is a BLOCK, never an object literal (mirrors the host's
+// one of these is a block, never an object literal (mirrors the host's
 // `STATEMENT_KEYWORDS` set, consulted by `looksLikeObject`).
 export function isStmtKeyword(kind: TokKind) {
   kind == "LET" ||
@@ -3222,18 +2850,10 @@ export function isStmtKeyword(kind: TokKind) {
     kind == "FUNCTION"
 }
 
-// Decide whether the `{` at absolute token index `bracePos` opens an OBJECT LITERAL
-// (an expression) rather than a BLOCK. At statement position a `{` is otherwise
-// dispatched as a block, so this lookahead recovers the bare object-literal /
-// implicit-return case. Skip NEWLINEs after `{`, then
-//   • `}`            ⇒ object  (empty `{}`)
-//   • a stmt keyword ⇒ block
-//   • IDENT then (past newlines) `:` / `,` / `}`  ⇒ object
-//   • IDENT then a balanced `( … )` then (past an optional `: type`) `{` ⇒ object
-//     (method shorthand, distinguishing it from a block that starts with a call)
-//   • STRING then (past newlines) `:`             ⇒ object
-//   • otherwise      ⇒ block
-// The computed-key `{ [e]: v }` form does not occur in the self-host sources.
+// Decide whether the `{` at absolute token index `bracePos` opens an object literal rather
+// than a block, which at statement position is otherwise the dispatch. Skipping newlines
+// after `{`: a `}` or an IDENT or STRING followed by `:` (or an IDENT followed by a balanced
+// `( … )` and a `{`) is an object; a statement keyword or anything else is a block.
 function looksLikeObject(bracePos: i32) {
   let i = bracePos + 1
   let going = kindAt(i) == "NEWLINE"
@@ -3253,12 +2873,10 @@ function looksLikeObject(bracePos: i32) {
     }
     const nk = kindAt(j)
     if first == "STRING" { return nk == "COLON" }
-    // An object literal is identified by a KEY-VALUE pair (`name:`). A bare
-    // `{ name }` or `{ a, b }` (property shorthand) is NOT treated as an object
-    // in the ambiguous body/statement positions this gates: it is a BLOCK, so a
-    // function/lambda body returning a bare binding (`function f() { x }`) reads
-    // as a block whose tail expression is the value — not a one-field shorthand
-    // object. A genuine shorthand object there must be parenthesized: `({ x })`.
+    // An object literal is identified by a key-value pair. A bare `{ name }` or `{ a, b }`
+    // shorthand is not treated as one in the ambiguous body positions this gates: it is a
+    // block, so a body returning a bare binding reads as a block whose tail expression is
+    // the value. A genuine shorthand object there must be parenthesized: `({ x })`.
     if nk == "COLON" { return true }
     // Method shorthand `{ add(a,b){…} }`: an IDENT directly followed by a
     // balanced `( … )` and then a `{` body. An optional return annotation
@@ -3309,11 +2927,11 @@ function looksLikeObject(bracePos: i32) {
 
 // One statement: dispatch on the leading keyword, else an expression statement.
 export function parseStmt() {
-  // No type annotation spans statements, so any `>` credit still banked here
-  // was abandoned by a malformed generic in an EARLIER declaration — drop it
-  // rather than let it silently close some later unrelated `Box<T` annotation.
+  // No type annotation spans statements, so any `>` credit still banked here belongs to a
+  // malformed generic in an earlier declaration — drop it rather than let it silently close
+  // some later unrelated `Box<T` annotation.
   pendingGt = 0
-  // `export` is a top-level visibility MODIFIER — the back end exports every
+  // `export` is a top-level visibility modifier — the back end exports every
   // top-level function by name regardless, so the AST drops the modifier and
   // parses the underlying `function`/`type`/`let`/`const` declaration.
   if peekKind() == "EXPORT" { advance() }
@@ -3321,15 +2939,10 @@ export function parseStmt() {
   if k == "LET" || k == "CONST" { return parseLet() }
   if k == "FUNCTION" { return parseFunc() }
   if k == "TYPE" { return parseTypeDecl(-1) }
-  // FLAT RECORD (webcraft P1.2): `flat type TValue = { … }`. `flat` is a CONTEXTUAL
-  // keyword — it stays a legal identifier everywhere else in the language — and the
-  // guard here is EXACT rather than heuristic, because `type` is a hard lexer
-  // keyword: an IDENT followed by the `type` keyword is not a legal statement in VL
-  // under any parse. Verified on master, where `flat type X = { … }` parses as the
-  // expression statement `flat` plus the declaration and dies at
-  // `undeclared identifier 'flat'`. So the widening is TOTAL — every token sequence
-  // this newly accepts was previously a hard error — and no existing program can
-  // change meaning. `docs/internals/flat-records-design.md` §1.
+  // A flat record: `flat type TValue = { … }`. `flat` is a contextual keyword — it stays a
+  // legal identifier everywhere else — and the guard is exact rather than heuristic, because
+  // `type` is a hard lexer keyword and an IDENT followed by it is not a legal statement under
+  // any parse, so the widening is total (`docs/internals/flat-records-design.md` §1).
   if k == "IDENT" && kindAt(P.pos + 1) == "TYPE" {
     if peekTok().text == "flat" {
       const flatAt = peekTok().start
@@ -3344,10 +2957,9 @@ export function parseStmt() {
   if k == "CONTINUE" { return parseContinue() }
   if k == "RETURN" { return parseReturn() }
   if k == "LBRACE" {
-    // A `{` at statement position is a BLOCK, UNLESS it shapes up as an object
-    // literal (`{ k: v, … }` — an expression statement / implicit return).
-    // Mirror the host: disambiguate with `looksLikeObject`, parsing the object
-    // form as an expression (which re-enters `parseObjLit` via `parsePrimary`).
+    // A `{` at statement position is a block unless it shapes up as an object literal
+    // (`{ k: v, … }` — an expression statement or implicit return). `looksLikeObject`
+    // disambiguates, and the object form parses as an expression through `parsePrimary`.
     if looksLikeObject(P.pos) { return parseExpr() }
     return parseBlock()
   }
@@ -3370,18 +2982,10 @@ export function parseStmt() {
   parseExpr()
 }
 
-// THE SENTENCE for a char-quoted module specifier (`from 'std:fs'`), in ONE home
-// because the parser and the driver's token-level `modScan` both have to say it —
-// two scanners over one statement drifting apart is the whole of the defect that
-// made a char-quoted specifier adopt the next string literal in the file.
-//
-// `raw` is the char literal's RAW LEXEME, quotes included: the suggestion is built
-// from the source text rather than the decoded value so an escape survives verbatim
-// (`'a\tb'` suggests `"a\tb"`, not a literal tab), and so both callers can pass the
-// one thing they both have.
-//
-// It names the SPELLING, not the resolution — single quotes are a char literal (one
-// code point, an i32) and a specifier is a string, so the repair is the quote.
+// The sentence for a char-quoted module specifier (`from 'std:fs'`), in one home because the
+// parser and the driver's token-level `modScan` both say it, and two scanners over one
+// statement drifting apart is the whole defect. `raw` is the char literal's raw lexeme,
+// quotes included, so an escape survives verbatim; it names the spelling, not the resolution.
 export function importSpecCharMsg(raw: string): string {
   let inner = raw
   if inner.length >= 2 { inner = inner.slice(1, inner.length - 1) }
@@ -3390,18 +2994,10 @@ export function importSpecCharMsg(raw: string): string {
     "\""
 }
 
-// Parse an `import { a, b as c, … } from "path"` (or `import x from "path"`) into
-// an `ImportDecl`, the cursor on the leading `import`. Import BINDING stays the
-// module front end's job (the driver's token-level `modScan` is the resolver and
-// never reads this node) — the node exists for AST consumers (the lint tier).
-//
-// Token consumption is IDENTICAL to the old skip (`skipModuleClause`): up to and
-// INCLUDING the trailing path STRING, BOUNDED by a NEWLINE/SEMI outside the braces
-// or a statement-start keyword — so a malformed clause missing its path literal is
-// diagnosed here instead of swallowing code up to the next unrelated string literal.
-//
-// Only brace-list names are recorded; a bare `import x from "path"` records none —
-// a pure graph edge. A CHAR literal in the path gets `importSpecCharMsg`.
+// Parse an `import { a, b as c, … } from "path"` into an `ImportDecl`, the cursor on the
+// leading `import`. Binding stays the driver's `modScan`, which never reads this node; the
+// node exists for AST consumers. Token consumption runs to and including the trailing path
+// STRING, bounded by a line break or `;` outside the braces, or a statement-start keyword.
 function parseImport(): i32 {
   const kwAt = P.pos // the `import` keyword, anchor for the diagnostic
   const p0 = peekTok().start
@@ -3428,7 +3024,7 @@ function parseImport(): i32 {
       found = true
       going = false
     } else if k == "CHAR" && depth == 0 {
-      // A CHAR literal where the path belongs — the statement HAS a specifier
+      // A CHAR literal where the path belongs — the statement has a specifier
       // (so this is not the `malformed import` case), it is just spelled with the
       // wrong quotes. Report it here and stop: this is the specifier.
       P.diags.push({ msg: importSpecCharMsg(peekTok().text), at: P.pos })
@@ -3445,10 +3041,8 @@ function parseImport(): i32 {
       if k == "LBRACE" { depth = depth + 1 }
       if k == "RBRACE" && depth > 0 { depth = depth - 1 }
       if k == "IDENT" && depth == 1 {
-        // One name-list item: `a` or `a as b` (the `as` rides as an IDENT).
-        // On the rename form, consume through the `as` so the loop's shared
-        // `advance()` below lands past the alias — the same tokens the old
-        // skip consumed one at a time.
+        // One name-list item: `a` or `a as b`, the `as` riding as an IDENT. On the rename
+        // form, consume through the `as` so the loop's shared `advance()` lands past the alias.
         const nmTok = P.pos
         const nm = peekTok().text
         let loc = nm
@@ -3474,21 +3068,16 @@ function parseImport(): i32 {
   mkImport(path, names, locals, nameToks, p0)
 }
 
-// Consume a RE-EXPORT `export { a, b as c, … } from "path"`, the cursor on the
-// leading `export`. Like an import, it is a module-front-end concern (the merge
-// pulls the named symbols from `path` and the emitter aliases them under their
-// public names) and produces NO AST node. Tokens up to and INCLUDING the trailing
-// path STRING are skipped (the `from` keyword rides as an `IDENT`). Distinguished
-// from an `export function/let/const/type` by the `{` immediately after `export`.
+// Consume a re-export `export { a, b as c, … } from "path"`, the cursor on the leading
+// `export`. Like an import it is a module-front-end concern and produces no AST node; tokens
+// up to and including the trailing path STRING are skipped, the `from` riding as an IDENT.
+// Distinguished from an `export function`/`let`/`type` by the `{` immediately after `export`.
 function skipReexport() { skipModuleClause("re-export") }
 
-// The bounded skip for the re-export form, the cursor on the leading
-// `export` keyword. Skips the clause — a brace-enclosed name list
-// `{ … }` (which may span lines) or a bare name — then the `from` identifier
-// and the path string literal. The skip is BOUNDED: a NEWLINE/SEMI outside the
-// braces or a statement-start keyword anywhere ends it, so a malformed clause
-// missing its path literal is diagnosed here instead of silently swallowing
-// all following code up to the next unrelated string literal.
+// The bounded skip for the re-export form, the cursor on the leading `export`. It skips the
+// clause — a brace-enclosed name list, which may span lines, or a bare name — then the `from`
+// identifier and the path string. Bounded by a line break or `;` outside the braces, or by a
+// statement-start keyword, so a clause missing its path cannot swallow the following code.
 function skipModuleClause(what: string) {
   const kwAt = P.pos // the `import`/`export` keyword, anchor for the diagnostic
   advance()
@@ -3536,11 +3125,11 @@ export function parseProgram() {
   // malformed) run: a banked `>` credit would silently close some later
   // unrelated generic.
   pendingGt = 0
-  // D1581: bracket depth is per PROGRAM too. An unclosed `(` in an earlier
+  // D1581: bracket depth is per program too. An unclosed `(` in an earlier
   // (malformed) parse would otherwise leave it raised and make every later
   // statement break newline-terminate at a leading operator.
   brDepth = 0
-  // D1045: the block-scope machinery is per PROGRAM. A mint counter only has to
+  // D1045: the block-scope machinery is per program. A mint counter only has to
   // be unique within its module — the merge renames each module's top-level
   // declarations, these included, apart — and a leaked scope row from an earlier
   // (possibly malformed) parse would silently rename an unrelated annotation.
@@ -3564,18 +3153,10 @@ export function parseProgram() {
     else if k == "EXPORT" && kindAt(P.pos + 1) == "LBRACE" { skipReexport() }
     else { stmts.push(parseStmt()) }
   }
-  // D1045 — THE HOIST. A body-scoped declaration is ALSO a top-level statement of the
-  // program: that is what makes the checker's passes 0a–0d register it and the
-  // emitter's per-declaration walks mint its rep, all of which read `progStmts` and
-  // only `progStmts`. Widening those ~15 walks instead is the position-matrix
-  // mistake; one unique name in the list they already read is the same result with
-  // nothing to keep in step.
-  //
-  // APPENDED, so a hoisted declaration registers AFTER every module-scope one. A
-  // local type may name a module type (pass 0b fills in DEMAND order); a module type
-  // can never name a local one. The node stays where it lexically is too — it is
-  // reachable twice, and `ast.isBodyTyDecl` is what the two consumers that must not
-  // double-count it ask (the module merge; the formatter re-slices the source).
+  // D1045 — the hoist. A body-scoped declaration is also a top-level statement of the
+  // program, which is what makes the checker's passes register it and the emitter mint its
+  // rep, all of which read `progStmts` and only `progStmts`. Appended, so a hoisted
+  // declaration registers after every module-scope one; the node stays where it lexically is.
   let hi = 0
   while hi < btHoisted.length {
     stmts.push(btHoisted[hi])
