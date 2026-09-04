@@ -4999,6 +4999,16 @@ Three things the build settled that the ruling could not have known:
   so every std case passed either way. `importSpecifierForKey` is the inverse of
   `resolveImportSpecifier`, and prefers a spelling the file already uses over any it derives.
 
+**AND THE NEAR MISS IS ITS OWN SENTENCE (D1570, 2026-09-03).** D1230 answers when the name is
+NOT in scope. The complementary case — the name is right there, and the UFCS rule turned it
+down anyway — kept `no field 'f' on T` until glean hit it (VL-021): a first parameter named
+`c` rather than `self`, and the reader goes hunting for a field the type will never have. The
+`self`-name rule is unchanged and is the design; what was wrong is that `checkCallNode` learned
+which gate refused and threw the answer away. `ufcs-not-method` now carries it, with `reason`
+(`self-name` / `arity` / `receiver`) and the parameter's own line and column, so a rename
+quick-fix needs no second search and no consumer parses the sentence. D1230 keeps precedence:
+"import it" is the more actionable answer wherever it applies.
+
 Two capabilities fell out of the second one and are worth naming, because neither was asked
 for. A CALL receiver — `expect(1).`, the papercut's own shape — now completes at all: the
 field scan STRIPS the trailing `.` and re-resolves the receiver as a BINDING, which only works
@@ -5340,3 +5350,38 @@ came from, and the commit the binary was built from.
 they are wanted for reading or editing, `vl std --hash`/`--list` say what is in there, and
 `$VL_STD` is for hacking on std. A `std/` left beside an old two-file pin is ignored, and is
 told once that it is being ignored — going silently inert is the same failure mode reversed.
+## A VALUE may take a builtin type name; the TYPE keeps it (D1571, 2026-09-03)
+
+**Ruling, read off the tree rather than invented.** VL keeps the value and type namespaces
+apart. `type Circle` beside `function Circle` is legal in one file, `type Circle` beside
+`const Circle` is legal, and a module exporting BOTH is legal — the importer spells `Circle`
+as a type and calls `Circle(3)` on the next line. `export function u8(x: i32): i32` is
+therefore legal too, and `u8[]` in the importer is the storage type, not a mistake.
+
+**What was wrong was the merge, not the export.** `modBuildRename` mints one rename row per
+top-level declaration and per import, and the type-position rewrite reads that one map. For a
+user name it cannot go wrong — a type and a value of one name mint the same `Circle$mN`
+target, so the two readings agree by construction. A BUILTIN name has no declaration and so no
+row of its own, which left the VALUE row as the only answer: `import { u8 }` rewrote every
+`u8[]` in the importer to `u8$m1[]` and the checker said `unknown type 'u8' within 'u8[]'`
+about a name that had never left the primitive. glean lost a five-program bisect to it
+(VL-015) and worked around it by renaming the export.
+
+**The rule, narrowly.** A BUILTIN type name is renamed in TYPE position only by a row a `type`
+declaration minted (`modTyRenamedSeg`, `modBuiltinTyTargets`); every other segment keeps the
+last-row rule byte for byte. Registering on the merged TARGET is what lets an import row carry
+no kind of its own — it renames onto the dep's own `u8$mN`, which the dep's row registered
+when its map was built, dependency-first.
+
+**Why not REFUSE the export instead.** That was the other option on the desk, and it is the
+right shape for a language whose namespaces are ONE — it is not this one. Refusing would also
+have cost a program that runs today: an exported `type u8` still shadows the storage type
+across the merge, and a rule spelled "a builtin name is never renamed" deletes it. The `type`
+side already HAS its reservation rule ("a `type` declaration may not take the built-in type
+name `f64`"), which is what makes the value side's freedom coherent rather than an oversight:
+the name means the primitive in every annotation, and a value binding cannot change that.
+
+**Still open, and deliberately not closed here.** The same rename lets an exported
+`type f64 = { x: i32 }` DODGE that reservation rule — it refuses in its own file and runs
+across an import. It runs and prints correctly today, so closing it is a `runs → not-runs` and
+an owner ruling rather than a defect fix (recorded in `docs/internals/inventory/D1571.md`).
