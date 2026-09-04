@@ -65,18 +65,24 @@ const errorBlock = (out: string): string => {
   return lines.slice(start, end).join("\n");
 };
 
-// A COLLECT-phase refusal: `B` is a union arm whose OWN field is a nested struct, so it has no
-// cross-table heap twin and a field typed as it is refused while the declarations are being
-// registered — before any function body arms a cursor.
+// A COLLECT-phase refusal: `A` is a union arm whose OWN field is typed as `A`, so its layout is
+// not finished being decided when the field asks for a rep, and the refusal fires while the
+// declarations are being registered — before any function body arms a cursor.
+//
+// THE NESTED-STRUCT ARM FIELD USED TO BE THIS WITNESS and D1579 made it RUN, which is this
+// test's own failure mode working: the guard said so rather than passing green over a compiling
+// program. The self-referential arm is `armDeferStack`'s decline (D1518) and is the collect
+// phase's remaining loud refusal.
 const COLLECT_WITNESS = `type E = { msg: string }
-type C = { q: i32 }
-type B = { c: C }
-type Z1 = B | E
-type Z2 = C | E
-type A = { f: B }
+
+// A SELF-REFERENTIAL ARM: \`A\`'s own field is typed as \`A\`, so the arm's layout is not
+// finished being decided when the field asks for its rep (\`armDeferStack\`, D1518) and
+// the refusal fires while \`collectU\` is registering this declaration.
+type A = { n: i32, f: A | null }
+
 function h(ok: boolean): A | E {
   if !ok { return { msg: "e" } }
-  return { f: { c: { q: 1 } } }
+  return { n: 1, f: null }
 }
 print(h(true) is A)
 `;
@@ -102,8 +108,8 @@ Deno.test({
           `expected the emit refusal to carry collect.vl:<line>:<col>, got:\n${blk}`,
         );
       }
-      // The anchor is the FIELD whose type has no rep (`f: B` on line 6), not the union and
-      // not the last function in the file.
+      // The anchor is the FIELD whose type has no rep (`f: A | null` on line 6), not the
+      // declaration's own name and not the last function in the file.
       if (!/at \S*collect\.vl:6:\d+/.test(blk)) {
         throw new Error(
           `expected the anchor on line 6 (the offending field), got:\n${blk}`,
