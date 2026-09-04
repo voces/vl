@@ -418,6 +418,19 @@ const CODE_UNSUPPORTED_LOWERING = "unsupported-lowering"
 // one choice among them — N diagnostics would stack N squiggles on one token.
 const CODE_UFCS_NOT_IMPORTED = "ufcs-not-imported"
 
+// D1570's category code — the name IS a function in scope and is NOT a method. Its answer
+// rides the DATA channel under five keys:
+//   * `member` — the property AS WRITTEN.
+//   * `recv`   — the rendered receiver type, demangled.
+//   * `reason` — `self-name`, `arity` or `receiver`: WHICH gate of the UFCS rule refused.
+//   * `param`  — the first parameter's declared name (`self-name` only; "" when it takes none).
+//   * `declLine` / `declCol` — that parameter's own position, so a rename quick-fix needs no
+//     second search. 1-based line, 0-based column — the front end's convention, the one
+//     `diagLine`/`diagCol` carry — and in the module that DECLARES the function, which is this
+//     file unless the name arrived by import.
+// `declLine` is `0` when the declaration has no source position.
+const CODE_UFCS_NOT_METHOD = "ufcs-not-method"
+
 // ── Checker state (one struct, held in the global `T`) ───────────────────────
 // `tys`     — the type arena (every type is an index into it).
 // `scopes`  — the scope chain: an array of `name → type-index` maps. Index 0 is
@@ -942,6 +955,14 @@ let ufcsCstrP0: i32[] = []
 // belongs to one call).
 let ufcsMissAt: i32[] = []
 let ufcsMissSpecs: string[] = []
+
+// D1570 — the "the function EXISTS and is not a method" answer, banked the same way and for
+// the same reason: the CALL knows the argument count, the member arm raises the sentence.
+// The MESSAGE is banked rather than the ingredients D1230 banks, because three arms of one
+// mirror produce it and re-deriving the arm at the raise would be the ladder written twice.
+let ufcsWhyAt: i32[] = []
+let ufcsWhyMsg: string[] = []
+let ufcsWhyData: string[] = []
 
 // SOLVED un-annotated parameter types — the parameter's own body USAGE, read back as its type.
 // A hole is permissively assignable both ways, so a usage that requires a concrete type
@@ -3395,6 +3416,9 @@ export function initChecker() {
   ufcsCstrP0 = []
   ufcsMissAt = []
   ufcsMissSpecs = []
+  ufcsWhyAt = []
+  ufcsWhyMsg = []
+  ufcsWhyData = []
   solvedParamTys = Map()
   holePinTys = Map()
   paramSolveTried = Map()
@@ -18365,6 +18389,18 @@ function memberFloorErr(objTy: i32, prop: string, ix: i32) {
       ufcsNotImportedData(prop, specs, objTy),
     )
   }
+  // D1570 — THE NAME IS A FUNCTION IN SCOPE THAT IS NOT A METHOD. Second, so D1230 keeps
+  // winning wherever it applies: a name that is not in scope AT ALL cannot reach this bank,
+  // and "import it" is the actionable answer where it can.
+  const whyRow = ufcsWhyRow(ix)
+  if whyRow >= 0 {
+    return tErrCodedData(
+      ufcsWhyMsg[whyRow],
+      ix,
+      CODE_UFCS_NOT_METHOD,
+      ufcsWhyData[whyRow],
+    )
+  }
   // NEVER RAISE A WORDLESS DIAGNOSTIC. `memberFloorMsg`'s "" means "this read is fine or
   // is deferred" — a sentinel its two constraint-pin callers TEST and this one, the only
   // one that raises, formatted unconditionally. So a rung that answered "" while its own
@@ -18427,6 +18463,196 @@ function ufcsNotImportedData(prop: string, specs: string, objTy: i32) {
   }
   out = out + diagDataField("modules", specs.slice(start, specs.length))
   out + diagDataField("recv", demangleMsg(tyToStr(objTy)))
+}
+
+// D1570's GATE CLASSIFIER — WHICH arm of the UFCS rule refused `recv.prop(argc args)`, given
+// that `prop` names a function IN SCOPE. 0 = no answer, 1 = the `self`-NAME rule, 2 = the
+// arity RANGE, 3 = the receiver type.
+// MIRRORS `ufcsWouldDispatch`, arm for arm and in its order, and stops where that one stops:
+// this runs on a call that has ALREADY failed, so it must not force a pending return, record a
+// deferred constraint or reorder arguments the way `ufcsCallTy` does on its way to an answer.
+// A NAME WITH NO DECLARATION ANSWERS 0 — a closure-valued binding (`const f = (a) => …`) is a
+// function VALUE, `TyFunc` carries no parameter names, and every sentence below names one.
+function ufcsNotMethodKind(name: string, recvTy: i32, argc: i32) {
+  if (fnDeclIx[name] ?? -1) < 0 { return 0 }
+  const fnTy = lookup(name)
+  if fnTy < 0 { return 0 }
+  const ft = T.tys[fnTy]
+  if ft is TyFunc {
+    const params = ft.fnParamTypes
+    if params.length < 1 { return 1 }
+    if !declFirstParamIsSelf(name) { return 1 }
+    const uDecl = declParamsAfterSelf(name)
+    let uRequired = params.length - 1
+    if uDecl.length == params.length - 1 { uRequired = fnRequiredArity(uDecl) }
+    if argc < uRequired || argc + 1 > params.length { return 2 }
+    if !assignable(recvTy, params[0]) { return 3 }
+    return 0
+  }
+  0
+}
+
+// The TOKEN spelling the first parameter's NAME in `name`'s declaration, or -1.
+// THE IDENTIFIER'S OWN START, not the `Param` node's `nodeToks` anchor — that anchor is the
+// annotation's LAST token, so a rename quick-fix built on it would edit `Cursor`, not `c`.
+function ufcsDeclParamTok(name: string) {
+  const dIx = fnDeclIx[name] ?? -1
+  if dIx < 0 { return -1 }
+  const d = P.nodes[dIx]
+  if d is FuncDecl {
+    if d.fnParams.length == 0 { return -1 }
+    const sp = nodePos(d.fnParams[0])
+    if sp >= 0 { return tokIndexAt(sp) }
+  }
+  -1
+}
+
+function ufcsDeclParamLine(name: string) {
+  const tk = ufcsDeclParamTok(name)
+  if tk >= 0 && tk < P.toks.length { return P.toks[tk].line }
+  0
+}
+
+function ufcsDeclParamCol(name: string) {
+  const tk = ufcsDeclParamTok(name)
+  if tk >= 0 && tk < P.toks.length { return P.toks[tk].col }
+  0
+}
+
+// D1570's SENTENCE, one per gate. The fault is never "no such field" — the function the author
+// wrote EXISTS, in scope, and the compiler knew which rule turned it down — so each sentence
+// names the rule, the offending ingredient, and the edit that fixes it.
+// THE `self`-NAME RULE STANDS (DECISIONS.md §"UFCS is never implicit"): what was wrong here was
+// only the diagnostic, which sent a reader hunting for a FIELD on a type that will never have
+// one (glean VL-021).
+function ufcsNotMethodMsg(
+  prop: string,
+  name: string,
+  recvTy: i32,
+  argc: i32,
+  kind: i32,
+) {
+  const plain = demangleMsg(name)
+  if kind == 1 {
+    const pns = fnParamNamesOf(name)
+    if pns.length == 0 {
+      return "'" +
+        prop +
+        "' is not a method — it takes no parameters, and a UFCS call `x." +
+        prop +
+        "(…)` dispatches only to a function whose FIRST parameter is named `self`; call `" +
+        plain +
+        "(…)` directly"
+    }
+    return "'" +
+      prop +
+      "' is not a method — its first parameter is named `" +
+      pns[0] +
+      "`, not `self`, and a UFCS call `x." +
+      prop +
+      "(…)` dispatches only to a `self` first parameter; rename it to `self`, or call `" +
+      plain +
+      "(…)` directly"
+  }
+  if kind == 2 {
+    const ft2 = T.tys[lookup(name)]
+    if ft2 is TyFunc {
+      const uDecl2 = declParamsAfterSelf(name)
+      let lo = ft2.fnParamTypes.length - 1
+      if uDecl2.length == ft2.fnParamTypes.length - 1 {
+        lo = fnRequiredArity(uDecl2)
+      }
+      return "`" +
+        plain +
+        "` expects " +
+        arityWantText(lo, ft2.fnParamTypes.length - 1) +
+        " arguments after `self`, got " +
+        i32ToStr(argc) +
+        " — a UFCS call `x." +
+        prop +
+        "(…)` passes the receiver as `self`"
+    }
+  }
+  const p0Str = ufcsSelfParamStr(name)
+  "no method '" +
+    prop +
+    "' for " +
+    tyToStr(recvTy) +
+    " — the free function `" +
+    plain +
+    "` takes `self: " +
+    p0Str +
+    "`"
+}
+
+// The rendered type of `name`'s `self` parameter — the half of the receiver-mismatch sentence
+// that says which type it IS a method on. "?" only for a callee this ladder never reaches.
+function ufcsSelfParamStr(name: string) {
+  const fnTy = lookup(name)
+  if fnTy >= 0 {
+    const ft = T.tys[fnTy]
+    if ft is TyFunc {
+      if ft.fnParamTypes.length > 0 { return tyToStr(ft.fnParamTypes[0]) }
+    }
+  }
+  "?"
+}
+
+// D1570's PAYLOAD — the machine half, keyed as `CODE_UFCS_NOT_METHOD` documents. `reason` is
+// the gate, so a quick-fix can offer the rename for `self-name` and nothing for the other two
+// WITHOUT parsing a sentence; `declLine`/`declCol` are where that rename lands.
+function ufcsNotMethodData(prop: string, name: string, recvTy: i32, kind: i32) {
+  let reason = "receiver"
+  if kind == 1 { reason = "self-name" }
+  if kind == 2 { reason = "arity" }
+  let pn = ""
+  const pns = fnParamNamesOf(name)
+  if pns.length > 0 { pn = pns[0] }
+  let out = diagDataField("member", prop)
+  out = out + diagDataField("recv", demangleMsg(tyToStr(recvTy)))
+  out = out + diagDataField("reason", reason)
+  out = out + diagDataField("param", pn)
+  out = out + diagDataField("declLine", i32ToStr(ufcsDeclParamLine(name)))
+  out + diagDataField("declCol", i32ToStr(ufcsDeclParamCol(name)))
+}
+
+// Bank D1570's answer for `memberFloorErr`, computed HERE because only the call knows `argc`.
+// Answers nothing when no gate claims the call, which is every member access that really is a
+// missing field — the control the enrichment must not widen past.
+function noteUfcsNotMethod(
+  memIx: i32,
+  prop: string,
+  name: string,
+  recvTy: i32,
+  argc: i32,
+) {
+  const kind = ufcsNotMethodKind(name, recvTy, argc)
+  if kind == 0 { return 0 }
+  noteUfcsWhy(
+    memIx,
+    ufcsNotMethodMsg(prop, name, recvTy, argc, kind),
+    ufcsNotMethodData(prop, name, recvTy, kind),
+  )
+}
+
+// The banked row for member node `memIx`, or -1. A node is banked at most once.
+function ufcsWhyRow(memIx: i32) {
+  let i = 0
+  while i < ufcsWhyAt.length {
+    if ufcsWhyAt[i] == memIx { return i }
+    i = i + 1
+  }
+  -1
+}
+
+function noteUfcsWhy(memIx: i32, msg: string, data: string) {
+  if memIx < 0 { return 0 }
+  if msg == "" { return 0 }
+  if ufcsWhyRow(memIx) >= 0 { return 0 }
+  ufcsWhyAt.push(memIx)
+  ufcsWhyMsg.push(msg)
+  ufcsWhyData.push(data)
+  0
 }
 
 // THE INDEX ARM'S OWN SENTENCE, on the same terms — "" when `recv[i]` resolves or defers,
@@ -22641,6 +22867,20 @@ function checkCallNode(n: Call, ix: i32) {
           )
           return TY_ERR
         }
+        // D1570 on a STRING receiver, raised here for the reason D1230's arm is: this arm
+        // answers before the general one, so `memberFloorErr` never sees a string method call
+        // and there is nothing to bank for.
+        const suName = ufcsAliasAtSite(ix, sp)
+        const suKind = ufcsNotMethodKind(suName, recvTy, n.callArgs.length)
+        if suKind != 0 {
+          tErrCodedData(
+            ufcsNotMethodMsg(sp, suName, recvTy, n.callArgs.length, suKind),
+            ix,
+            CODE_UFCS_NOT_METHOD,
+            ufcsNotMethodData(sp, suName, recvTy, suKind),
+          )
+          return TY_ERR
+        }
         tErr("no method '." + sp + "' on string", ix)
         return TY_ERR
       }
@@ -22731,6 +22971,16 @@ function checkCallNode(n: Call, ix: i32) {
       noteUfcsMiss(
         n.callFn,
         ufcsMissingImportSpecs(cfn.memProp, recvTy, n.callArgs.length),
+      )
+      // D1570 — AND WHEN THE NAME IS ALREADY IN SCOPE, WHICH GATE TURNED IT DOWN. Banked
+      // beside D1230's answer and read after it, on the same member node and for the same
+      // reason: `argc` is known here and the sentence is raised there.
+      noteUfcsNotMethod(
+        n.callFn,
+        cfn.memProp,
+        ufcsAliasAtSite(ix, cfn.memProp),
+        recvTy,
+        n.callArgs.length,
       )
     }
   }

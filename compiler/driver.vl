@@ -133,6 +133,7 @@ import {
   initChecker,
   jwSetGenTokStart,
   jwSiteNode,
+  primTyOfName,
   printDomainStr,
 } from "./typecheck"
 import {
@@ -478,6 +479,17 @@ let modSelfFnMinArity: i32[] = []
 // segment matching one must NOT rewrite through the rename map — it names the
 // parameter, not a top-level binding.
 let modTyShadow: string[] = []
+// D1571 — the merged targets of `type` declarations that TOOK A BUILTIN TYPE NAME, and the
+// only rows allowed to rewrite such a name in TYPE position (`modTypeRenamed`).
+// THE RENAME MAP IS ONE NAMESPACE AND THE LANGUAGE IS TWO. A `type Circle` and a
+// `function Circle` coexist — in one file and across an import — and they are harmless to
+// each other here because both mint the same `Circle$mN` target. A BUILTIN name has no
+// declaration and therefore no row of its own, so the VALUE row was the only one and
+// `import { u8 } from "./lib"` rewrote every `u8[]` in the importer to `u8$m1[]`:
+// `unknown type 'u8' within 'u8[]'`, on an annotation naming the primitive (glean VL-015).
+// Filled dependency-first by `modBuildRename`, so an importer's map is built with its deps'
+// rows already registered; almost always EMPTY, which is what makes the test free.
+let modBuiltinTyTargets: string[] = []
 // ── per-INSTANCE module scan/token cache ──────────────────────────────────────
 // A directory check (`vl check <dir>`) rebuilds the module table once PER FILE
 // (modReset + the fetch loop), so a shared dependency is token-scanned
@@ -3084,6 +3096,9 @@ function modCompile(emit: i32): i32 {
   // merge; the rewrite records the plain→mangled aliases it discovers.
   ufcsAliasReset()
   ufcsImpReset()
+  // D1571's set spans every module of ONE program, so it is cleared with the other
+  // program-scoped merge state and refilled by the collect pass below.
+  modBuiltinTyTargets = []
   modCollectSelfFns(roots)
   let o2 = 0
   while o2 < modOrder.length {
@@ -3268,6 +3283,32 @@ function modCheckDupBindings(m: i32, root: i32): i32 {
   }
   0
 }
+// Does `seg` name a type the language provides with no declaration? `primTyOfName` is the ONE
+// home of the primitive spellings and `u8` is the storage type it deliberately withholds from
+// it (it is reachable only as an array element), so the pair IS the set of names an annotation
+// resolves without a `type` in sight. D1571.
+function modNameIsBuiltinTy(seg: string) {
+  if seg == "u8" { return true }
+  primTyOfName(seg) >= 0
+}
+// The TYPE-position rename of one identifier segment — the LAST matching row's target, or the
+// segment unchanged. D1571's gate lives HERE rather than in either reader: the spelling TREE
+// (`modRwTsName`, the live path for an annotation) and the character scanner
+// (`modTypeRenamed`, its fall-through and the route for `tdName`/`isVariant`/`asTy`) are two
+// spellings of one question, and a guard in only one of them is the same defect on the other
+// route. Both keep their own `modTyShadow` test, which is about the generic parameter in scope
+// and not about the map.
+function modTyRenamedSeg(seg: string) {
+  const row = sidArrGet(modRenameLastBySid, sidLookup(seg))
+  if row < 0 { return seg }
+  // A BUILTIN TYPE NAME IS RENAMED ONLY BY A `type` ROW. Every other segment keeps the
+  // last-row rule byte for byte: a user name that is both a type and a value mints ONE target
+  // for both, so the two readings never disagreed and this test never fires for it.
+  if modNameIsBuiltinTy(seg) {
+    if !capHas(modBuiltinTyTargets, modRenameTo[row]) { return seg }
+  }
+  modRenameTo[row]
+}
 // Append one row to the rename map and index it under its interned `from`.
 // The two sid views are FRESH ARRAYS per module (below), so a row index is only
 // ever read against the map that produced it and no cross-program row can
@@ -3309,7 +3350,22 @@ function modBuildRename(m: i32, root: i32): i32 {
       if st is UnionDecl { nm = st.udName }
       if nm != "" {
         const base = modDeclBase(ss[si], nm)
-        if !capHas(impLocals, base) { modRenamePush(base, base + suffix) }
+        if !capHas(impLocals, base) {
+          modRenamePush(base, base + suffix)
+          // D1571 — a `type` declaration that took a BUILTIN name is the one row that may
+          // rewrite that name in type position. Registered on the TARGET, so an IMPORT of it
+          // needs no kind of its own: the import row renames onto this same `base$mN`.
+          if modNameIsBuiltinTy(base) {
+            let isTyDecl = false
+            if st is TypeDecl { isTyDecl = true }
+            if st is UnionDecl { isTyDecl = true }
+            if isTyDecl {
+              if !capHas(modBuiltinTyTargets, base + suffix) {
+                modBuiltinTyTargets.push(base + suffix)
+              }
+            }
+          }
+        }
       }
       si = si + 1
     }
@@ -3543,10 +3599,7 @@ function modTypeRenamed(tn: string): string {
         let rep = seg
         // A live generic type-parameter name is the PARAMETER here, never the
         // top-level binding it may textually collide with.
-        if !capHas(modTyShadow, seg) {
-          const row = sidArrGet(modRenameLastBySid, sidLookup(seg))
-          if row >= 0 { rep = modRenameTo[row] }
-        }
+        if !capHas(modTyShadow, seg) { rep = modTyRenamedSeg(seg) }
         pushCps(out, rep)
       }
       runStart = 0 - 1
@@ -3587,8 +3640,7 @@ function modRwTsName(root: i32): i32 {
   if k == TS_NAME || k == TS_APP || k == TS_MAP {
     const seg = tsText[root]
     if seg.length > 0 && !capHas(modTyShadow, seg) {
-      const row = sidArrGet(modRenameLastBySid, sidLookup(seg))
-      if row >= 0 { tsText[root] = modRenameTo[row] }
+      tsText[root] = modTyRenamedSeg(seg)
     }
   }
   const start = tsKidStart[root]
