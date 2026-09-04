@@ -147,7 +147,9 @@ import {
   nameIsNulLitUnion,
   nulCloFlag,
   nullablePartOf,
+  objFieldSrcOrder,
   objFieldVal,
+  objLitNeedsOrderStash,
   quoteLex,
   retF32Flag,
   retF64Flag,
@@ -693,6 +695,7 @@ import {
   nulScalarListKindOfNode,
   nulVariantIdxOfExpr,
   nulVariantIndexOf,
+  objOrderStashSlot,
   objVariantName,
   optChainStructIdxOf,
   paramStructIdxOf,
@@ -759,6 +762,7 @@ import {
   tyPeelNul,
   tyRefArrElemOf,
   uFieldMapShape,
+  uFieldStorageSlot,
   uFieldTgtStructIdx,
   unionArmVariantForObj,
   unionArmVariantForStructExpr,
@@ -2449,91 +2453,16 @@ export function sFieldRefSlot(si: i32, fi: i32) {
   rlSlotByNameTy(sFieldElemNameAt(si, fi), sFieldElemTyIxAt(si, fi))
 }
 
-export function pushFieldStorage(code: i32, refSlot: i32) {
-  if code == 3 {
-    wU8(100)
-    wSLEB(sTypeIdx)
-  } else if code == 4 {
-    wU8(100)
-    wSLEB(lTypeIdx)
-  } else if code == 5 {
-    if refSlot < 0 || refSlot >= rlWrapIdx.length {
-      wU8(127)
-      return emitFail(
-        "emitProgram: ref-list field element type is not interned",
-      )
-    }
-    wU8(100)
-    wSLEB(rlWrapIdx[refSlot])
-  } else if code == 6 {
-    wU8(100)
-    wSLEB(mkListIdx)
-  } else if code == 14 {
-    wU8(100)
-    wSLEB(cloStructIdx)
-  } else if code == 15 {
-    if refSlot < 0 || refSlot >= sHeapIdx.length {
-      wU8(127)
-      return emitFail(
-        "emitProgram: nested-struct field element type is not interned",
-      )
-    }
-    wU8(99)
-    wSLEB(sHeapIdx[refSlot])
-  } else if code == 16 {
-    wU8(100)
-    wSLEB(uBoxIdx)
-  } else if code == 17 {
-    wU8(124)
-  } else if code == 23 {
-    wU8(126)
-  } else if code == 24 {
-    wU8(125)
-  } else if code == 35 {
-    // D1008 — the packed byte list field: a non-null ref to the u8 list WRAPPER, the same
-    // heap type the `u8[]` global / param / return / binding already store.
-    wU8(100)
-    wSLEB(bl8TypeIdx)
-  } else if code == 25 {
-    wU8(100)
-    wSLEB(fl64TypeIdx)
-  } else if code == 26 {
-    wU8(100)
-    wSLEB(il64TypeIdx)
-  } else if code == 27 {
-    wU8(100)
-    wSLEB(fl32TypeIdx)
-  } else if code == 18 {
-    wU8(99)
-    wSLEB(lTypeIdx)
-  } else if isNulScalarListFieldCode(code) {
-    wU8(99)
-    wSLEB(nulScalarListFieldWrapHeap(code))
-  } else if code == 28 {
-    if refSlot < 0 || refSlot >= rlWrapIdx.length {
-      wU8(127)
-      return emitFail(
-        "emitProgram: nullable ref-list field element type is not interned",
-      )
-    }
-    wU8(99)
-    wSLEB(rlWrapIdx[refSlot])
-  } else if code == 19 {
-    wU8(100)
-    wSLEB(mapTypeIdxOf(refSlot))
-  } else if code == 29 {
-    wU8(99)
-    wSLEB(mapTypeIdxOf(refSlot))
-  } else if code == 20 {
-    wU8(99)
-    wSLEB(sTypeIdx)
-  } else if code == 22 {
-    wU8(99)
-    wSLEB(cloStructIdx)
-  } else {
-    wU8(127)
-  }
-  0
+// The `pushFieldStorage` SLOT argument for struct `si`'s field `fi` — the ONE place the
+// three tables a field code can name are chosen between (nested-struct row, map shape,
+// ref-list row). `emitTypeSection`, the supertype prefix test and the object-literal ORDER
+// STASH (D1510) all read it, so the field's declared slot and the stash local that has to
+// hold its value cannot disagree. `uFieldStorageSlot` is the union-variant twin.
+export function sFieldStorageSlot(si: i32, fi: i32): i32 {
+  const code = sFieldTypeAt(si, fi)
+  if code == 15 { return sFieldTgtStructIdx(si, fi) }
+  if code == 19 || code == 29 { return sFieldMapShape(si, fi) }
+  sFieldRefSlot(si, fi)
 }
 
 function emitOmittedFieldNull(_body: i32[], si: i32, fi: i32, scode: i32) {
@@ -2592,6 +2521,187 @@ function emitOmittedFieldNull(_body: i32[], si: i32, fi: i32, scode: i32) {
   -1
 }
 
+// ONE STRUCT FIELD's value, from the pending-context seed through the emission arm its
+// code selects to the two widen sites — the body `emitObj`'s layout loop used to hold
+// inline. Carved out so the SOURCE-ORDER stash pass (D1510) can run exactly the same
+// lowering, once per field, before the layout loop reads the slots back.
+//
+// The caller has already resolved `valIx` (>= 0) and consumed `pendingStructIdx` into `si`.
+function emitStructFieldValue(
+  body: i32[],
+  si: i32,
+  fi: i32,
+  valIx: i32,
+  fnIx: i32,
+) {
+  const scode = sFieldTypeAt(si, fi)
+  if scode != 15 && scode != 16 {
+    if exprStruct(valIx, fnIx) {
+      return emitFail("emitProgram: nested struct fields are not supported")
+    }
+  }
+
+  if scode == 14 {
+    const cav = P.nodes[unwrapParen(valIx)]
+    if cav is ArrayLit {
+      return emitFail(
+        "emitProgram: a closure-array struct-field literal is not supported",
+      )
+    }
+  }
+
+  if scode != 14 && scode != 22 && scode != 16 {
+    const cfv = P.nodes[unwrapParen(valIx)]
+    if cfv is FuncDecl {
+      return emitFail(
+        "emitProgram: a lambda field value resolved to a non-closure field slot",
+      )
+    }
+  }
+
+  pendingListKind = 0
+  pendingListSlot = 0
+  pendingNulRefHeap = -1
+  if scode == 5 {
+    let fslot = sFieldRefSlot(si, fi)
+    if fslot < 0 { fslot = 0 }
+
+    if fslot >= rlElemKindTbl.length {
+      return emitFail(
+        "emitProgram: ref-list field element type is not interned",
+      )
+    }
+    pendingListSlot = fslot
+    if rlElemKindTbl[fslot] == 2 { pendingListKind = 2 }
+    else if rlElemKindTbl[fslot] == 1 { pendingListKind = 1 }
+    else { pendingListKind = 5 }
+  } else if scode == 6 {
+    pendingListKind = 3
+  } else if scode == 35 {
+    pendingListKind = 10
+  } else if scode == 25 {
+    pendingListKind = 4
+  } else if scode == 26 {
+    pendingListKind = 6
+  } else if scode == 27 {
+    pendingListKind = 7
+  } else if scode == 18 {
+    pendingNulRefHeap = lTypeIdx
+  } else if isNulScalarListFieldCode(scode) {
+    pendingListKind = nulScalarListBuildKind(nulScalarListCodeKind(scode))
+
+    const nslV = P.nodes[unwrapParen(valIx)]
+    if nslV is NullLit { pendingNulRefHeap = nulScalarListFieldWrapHeap(scode) }
+  } else if scode == 28 {
+    let fslot28 = sFieldRefSlot(si, fi)
+    if fslot28 < 0 { fslot28 = 0 }
+    pendingListSlot = fslot28
+    if rlElemKindTbl[fslot28] == 2 { pendingListKind = 2 }
+    else if rlElemKindTbl[fslot28] == 1 { pendingListKind = 1 }
+    else { pendingListKind = 5 }
+
+    if fslot28 < rlWrapIdx.length {
+      const nraF = P.nodes[unwrapParen(valIx)]
+      if nraF is NullLit { pendingNulRefHeap = rlWrapIdx[fslot28] }
+    }
+  } else if scode == 29 {
+    const mslot29 = sFieldMapShape(si, fi)
+    pendingMapSlot = mslot29
+    pendingNulRefHeap = mapTypeIdxOf(mslot29)
+  }
+
+  const savedPSI = pendingStructIdx
+  if scode == 15 { pendingStructIdx = sFieldTgtStructIdx(si, fi) }
+
+  if scode == 19 { pendingMapSlot = sFieldMapShape(si, fi) }
+
+  if scode == 16 {
+    if emitUnionBoxArg(body, sFieldElemNameAt(si, fi), valIx, fnIx) < 0 {
+      return -1
+    }
+  } else if scode == 17 {
+    if emitExprAsF64(body, valIx, fnIx) < 0 { return -1 }
+  } else if scode == 23 {
+    if emitExprAsI64(body, valIx, fnIx) < 0 { return -1 }
+  } else if scode == 24 {
+    if emitExprAsF32(body, valIx, fnIx) < 0 { return -1 }
+  } else if scode == 20 && exprIsLitAtom(valIx, fnIx) {
+    if emitStrValue(body, valIx, fnIx) < 0 { return -1 }
+  } else if scode == 20 {
+    const svNS = pendingNulString
+    pendingNulString = true
+    const rcNS = emitExpr(body, valIx, fnIx)
+    pendingNulString = svNS
+    if rcNS < 0 { return -1 }
+  } else if scode == 21 {
+    const svNB = pendingNulBool
+    pendingNulBool = true
+    const rcNB = emitExpr(body, valIx, fnIx)
+    pendingNulBool = svNB
+    if rcNB < 0 { return -1 }
+  } else if scode == 30 {
+    const nluCtx = expCtxHere()
+    nluCtx.litUnion = 1
+    nluCtx.nulLitUnion = true
+    if emitExprExpect(body, valIx, fnIx, nluCtx) < 0 { return -1 }
+  } else if scode == 22 {
+    const svNC = pendingNulClosure
+    pendingNulClosure = true
+    const rcNC = emitExpr(body, valIx, fnIx)
+    pendingNulClosure = svNC
+    if rcNC < 0 { return -1 }
+  } else if scode == 3 && exprIsLitAtom(valIx, fnIx) {
+    if emitAtomToStr(body, valIx, fnIx) < 0 { return -1 }
+  } else if sFieldIsLitUnion(si, fi) {
+    const fluCtx = expCtxHere()
+    fluCtx.litUnion = 1
+    if emitExprExpect(body, valIx, fnIx, fluCtx) < 0 { return -1 }
+  } else if sFieldIsLitUnionArray(si, fi) {
+    const flaCtx = expCtxHere()
+    flaCtx.litUnion = 1
+    if emitExprExpect(body, valIx, fnIx, flaCtx) < 0 { return -1 }
+  } else if scode == 15 {
+    // A NARROWED ARM into a nested-struct field (`{ g: s }` after `if s is Circle`) —
+    // see `emitArmDelivery`. Inert for every other code-15 value.
+    if emitArmDelivery(body, valIx, fnIx, sFieldTgtHeapOf(si, fi)) < 0 {
+      return -1
+    }
+  } else {
+    if emitExpr(body, valIx, fnIx) < 0 { return -1 }
+  }
+
+  // D1222 — THE CONSTRUCT HALF of the field layer's `ref.as_non_null`. A narrowed
+  // nullable ref keeps its `(ref null $H)` (the USE site recovers), so a `{f: y}` under
+  // `if y != null` put one under a `(ref $H)` field: check-clean invalid wasm at every
+  // non-null ref code. Asked through the same `nulNicheRecoverOwed` the return / binding
+  // / local- and global-assign deliveries ask, with `fieldCodeVKind` supplying the KIND
+  // this layer names by CODE. Before the widen sites, which consume the emitted ref.
+  if nulNicheRecoverOwed(fieldCodeVKind(scode), valIx, fnIx) {
+    fbRefAsNonNull()
+  }
+  if scode == 5 {
+    emitRefListWidenSite(
+      body,
+      valIx,
+      exprEmittedRefListSlot(valIx, fnIx),
+      pendingListSlot,
+    )
+  }
+
+  if (scode == 4 || scode == 25 || scode == 26 || scode == 27 || scode == 35) {
+    let sfk: VKind = "list"
+    if scode == 35 { sfk = "u8list" }
+    if scode == 25 { sfk = "f64list" }
+    if scode == 26 { sfk = "i64list" }
+    if scode == 27 { sfk = "f32list" }
+    emitScalarListWidenSite(body, valIx, fnIx, sfk)
+  }
+  if scode == 15 { pendingStructIdx = savedPSI }
+  if scode == 19 { pendingMapSlot = -1 }
+  pendingListKind = 0
+  0
+}
+
 function emitObj(body: i32[], objIx: i32, fnIx: i32) {
   if !sDeclared {
     return emitFail("emitProgram: object literal but no struct type declared")
@@ -2607,11 +2717,41 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32) {
       )
     }
     const cnt = sFieldCount[si]
+    // D1510 — SOURCE-ORDER EVALUATION. `struct.new` takes its operands in LAYOUT order
+    // (sorted by field name, D622), and evaluating each initialiser at the moment it is
+    // pushed therefore ran a literal written in any other order permuted. When the
+    // permutation is observable, evaluate in SOURCE order into one scratch local per field
+    // and push the locals; `stash` is empty otherwise, which keeps every already-ordered or
+    // effect-free literal on the push-in-place path, byte for byte.
+    const stash: i32[] = []
+    if objLitNeedsOrderStash(objIx, sFieldNames, sFieldStart[si], cnt) {
+      let pi = 0
+      while pi < cnt {
+        stash.push(0 - 1)
+        pi = pi + 1
+      }
+      const ord = objFieldSrcOrder(objIx, sFieldNames, sFieldStart[si], cnt)
+      let oi = 0
+      while oi < ord.length {
+        const ofi = ord[oi]
+        const ovIx = objFieldVal(objIx, sFieldNames[sFieldStart[si] + ofi])
+        if emitStructFieldValue(body, si, ofi, ovIx, fnIx) < 0 { return -1 }
+        const oslot = objOrderStashSlot(
+          sFieldTypeAt(si, ofi),
+          sFieldStorageSlot(si, ofi),
+        )
+        stash[ofi] = oslot
+        fbLocalSet(oslot)
+        oi = oi + 1
+      }
+    }
     let fi = 0
     while fi < cnt {
       const valIx = objFieldVal(objIx, sFieldNames[sFieldStart[si] + fi])
       const scode = sFieldTypeAt(si, fi)
       if valIx < 0 {
+        // AN OMITTED FIELD PUSHES A CONSTANT, so it has no source position to keep and
+        // stays in the layout loop even under the stash.
         if emitOmittedFieldNull(body, si, fi, scode) < 0 {
           return emitFail(
             "emitProgram: object literal is missing a struct field",
@@ -2620,179 +2760,12 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32) {
         fi = fi + 1
         continue
       }
-
-      if scode != 15 && scode != 16 {
-        if exprStruct(valIx, fnIx) {
-          return emitFail("emitProgram: nested struct fields are not supported")
-        }
+      if stash.length > 0 {
+        fbLocalGet(stash[fi])
+        fi = fi + 1
+        continue
       }
-
-      if scode == 14 {
-        const cav = P.nodes[unwrapParen(valIx)]
-        if cav is ArrayLit {
-          return emitFail(
-            "emitProgram: a closure-array struct-field literal is not supported",
-          )
-        }
-      }
-
-      if scode != 14 && scode != 22 && scode != 16 {
-        const cfv = P.nodes[unwrapParen(valIx)]
-        if cfv is FuncDecl {
-          return emitFail(
-            "emitProgram: a lambda field value resolved to a non-closure field slot",
-          )
-        }
-      }
-
-      pendingListKind = 0
-      pendingListSlot = 0
-      pendingNulRefHeap = -1
-      if scode == 5 {
-        let fslot = sFieldRefSlot(si, fi)
-        if fslot < 0 { fslot = 0 }
-
-        if fslot >= rlElemKindTbl.length {
-          return emitFail(
-            "emitProgram: ref-list field element type is not interned",
-          )
-        }
-        pendingListSlot = fslot
-        if rlElemKindTbl[fslot] == 2 { pendingListKind = 2 }
-        else if rlElemKindTbl[fslot] == 1 { pendingListKind = 1 }
-        else { pendingListKind = 5 }
-      } else if scode == 6 {
-        pendingListKind = 3
-      } else if scode == 35 {
-        pendingListKind = 10
-      } else if scode == 25 {
-        pendingListKind = 4
-      } else if scode == 26 {
-        pendingListKind = 6
-      } else if scode == 27 {
-        pendingListKind = 7
-      } else if scode == 18 {
-        pendingNulRefHeap = lTypeIdx
-      } else if isNulScalarListFieldCode(scode) {
-        pendingListKind = nulScalarListBuildKind(nulScalarListCodeKind(scode))
-
-        const nslV = P.nodes[unwrapParen(valIx)]
-        if nslV is NullLit {
-          pendingNulRefHeap = nulScalarListFieldWrapHeap(scode)
-        }
-      } else if scode == 28 {
-        let fslot28 = sFieldRefSlot(si, fi)
-        if fslot28 < 0 { fslot28 = 0 }
-        pendingListSlot = fslot28
-        if rlElemKindTbl[fslot28] == 2 { pendingListKind = 2 }
-        else if rlElemKindTbl[fslot28] == 1 { pendingListKind = 1 }
-        else { pendingListKind = 5 }
-
-        if fslot28 < rlWrapIdx.length {
-          const nraF = P.nodes[unwrapParen(valIx)]
-          if nraF is NullLit { pendingNulRefHeap = rlWrapIdx[fslot28] }
-        }
-      } else if scode == 29 {
-        const mslot29 = sFieldMapShape(si, fi)
-        pendingMapSlot = mslot29
-        pendingNulRefHeap = mapTypeIdxOf(mslot29)
-      }
-
-      const savedPSI = pendingStructIdx
-      if scode == 15 { pendingStructIdx = sFieldTgtStructIdx(si, fi) }
-
-      if scode == 19 { pendingMapSlot = sFieldMapShape(si, fi) }
-
-      if scode == 16 {
-        if emitUnionBoxArg(body, sFieldElemNameAt(si, fi), valIx, fnIx) < 0 {
-          return -1
-        }
-      } else if scode == 17 {
-        if emitExprAsF64(body, valIx, fnIx) < 0 { return -1 }
-      } else if scode == 23 {
-        if emitExprAsI64(body, valIx, fnIx) < 0 { return -1 }
-      } else if scode == 24 {
-        if emitExprAsF32(body, valIx, fnIx) < 0 { return -1 }
-      } else if scode == 20 && exprIsLitAtom(valIx, fnIx) {
-        if emitStrValue(body, valIx, fnIx) < 0 { return -1 }
-      } else if scode == 20 {
-        const svNS = pendingNulString
-        pendingNulString = true
-        const rcNS = emitExpr(body, valIx, fnIx)
-        pendingNulString = svNS
-        if rcNS < 0 { return -1 }
-      } else if scode == 21 {
-        const svNB = pendingNulBool
-        pendingNulBool = true
-        const rcNB = emitExpr(body, valIx, fnIx)
-        pendingNulBool = svNB
-        if rcNB < 0 { return -1 }
-      } else if scode == 30 {
-        const nluCtx = expCtxHere()
-        nluCtx.litUnion = 1
-        nluCtx.nulLitUnion = true
-        if emitExprExpect(body, valIx, fnIx, nluCtx) < 0 { return -1 }
-      } else if scode == 22 {
-        const svNC = pendingNulClosure
-        pendingNulClosure = true
-        const rcNC = emitExpr(body, valIx, fnIx)
-        pendingNulClosure = svNC
-        if rcNC < 0 { return -1 }
-      } else if scode == 3 && exprIsLitAtom(valIx, fnIx) {
-        if emitAtomToStr(body, valIx, fnIx) < 0 { return -1 }
-      } else if sFieldIsLitUnion(si, fi) {
-        const fluCtx = expCtxHere()
-        fluCtx.litUnion = 1
-        if emitExprExpect(body, valIx, fnIx, fluCtx) < 0 { return -1 }
-      } else if sFieldIsLitUnionArray(si, fi) {
-        const flaCtx = expCtxHere()
-        flaCtx.litUnion = 1
-        if emitExprExpect(body, valIx, fnIx, flaCtx) < 0 { return -1 }
-      } else if scode == 15 {
-        // A NARROWED ARM into a nested-struct field (`{ g: s }` after `if s is Circle`) —
-        // see `emitArmDelivery`. Inert for every other code-15 value.
-        if emitArmDelivery(body, valIx, fnIx, sFieldTgtHeapOf(si, fi)) < 0 {
-          return -1
-        }
-      } else {
-        if emitExpr(body, valIx, fnIx) < 0 { return -1 }
-      }
-
-      // D1222 — THE CONSTRUCT HALF of the field layer's `ref.as_non_null`. A narrowed
-      // nullable ref keeps its `(ref null $H)` (the USE site recovers), so a `{f: y}` under
-      // `if y != null` put one under a `(ref $H)` field: check-clean invalid wasm at every
-      // non-null ref code. Asked through the same `nulNicheRecoverOwed` the return / binding
-      // / local- and global-assign deliveries ask, with `fieldCodeVKind` supplying the KIND
-      // this layer names by CODE. Before the widen sites, which consume the emitted ref.
-      if nulNicheRecoverOwed(fieldCodeVKind(scode), valIx, fnIx) {
-        fbRefAsNonNull()
-      }
-      if scode == 5 {
-        emitRefListWidenSite(
-          body,
-          valIx,
-          exprEmittedRefListSlot(valIx, fnIx),
-          pendingListSlot,
-        )
-      }
-
-      if (
-        scode == 4 ||
-        scode == 25 ||
-        scode == 26 ||
-        scode == 27 ||
-        scode == 35
-      ) {
-        let sfk: VKind = "list"
-        if scode == 35 { sfk = "u8list" }
-        if scode == 25 { sfk = "f64list" }
-        if scode == 26 { sfk = "i64list" }
-        if scode == 27 { sfk = "f32list" }
-        emitScalarListWidenSite(body, valIx, fnIx, sfk)
-      }
-      if scode == 15 { pendingStructIdx = savedPSI }
-      if scode == 19 { pendingMapSlot = -1 }
-      pendingListKind = 0
+      if emitStructFieldValue(body, si, fi, valIx, fnIx) < 0 { return -1 }
       fi = fi + 1
     }
     fbStructNew(sHeapIdx[si])
@@ -3107,10 +3080,168 @@ function guardVariantFieldSpan(vi: i32, where: string) {
   )
 }
 
+// ONE UNION-VARIANT FIELD's value — `emitStructFieldValue`'s twin, one table over, carved
+// out for the same reason: the SOURCE-ORDER stash pass (D1510) runs exactly this lowering
+// once per field before the layout loop reads the slots back.
+function emitVariantFieldValue(
+  body: i32[],
+  vi: i32,
+  fj: i32,
+  valIx: i32,
+  fnIx: i32,
+) {
+  pendingListKind = 0
+  pendingListSlot = 0
+  pendingNulRefHeap = -1
+  const vcode = variantFieldTypeAt(vi, fj)
+
+  const vcfv = P.nodes[unwrapParen(valIx)]
+  if vcfv is FuncDecl {
+    if vcode != 14 && vcode != 22 && vcode != 16 {
+      return emitFail(
+        "emitProgram: a lambda field value resolved to a non-closure variant field slot",
+      )
+    }
+  }
+  if vcode == 5 {
+    let vslot = variantFieldRefSlot(vi, fj)
+    if vslot < 0 { vslot = 0 }
+    pendingListSlot = vslot
+    if rlElemKindTbl[vslot] == 2 {
+      pendingListKind = 2
+    } else {
+      pendingListKind = 1
+    }
+  } else if vcode == 18 {
+    pendingNulRefHeap = lTypeIdx
+  } else if vcode == 28 {
+    let vslot28 = variantFieldRefSlot(vi, fj)
+    if vslot28 < 0 { vslot28 = 0 }
+    pendingListSlot = vslot28
+    if rlElemKindTbl[vslot28] == 2 { pendingListKind = 2 }
+    else if rlElemKindTbl[vslot28] == 1 { pendingListKind = 1 }
+    else { pendingListKind = 5 }
+    if vslot28 < rlWrapIdx.length { pendingNulRefHeap = rlWrapIdx[vslot28] }
+  } else if isNulScalarListFieldCode(vcode) {
+    // A nullable SCALAR-BACKED list ARM field — the struct literal's arm, which this
+    // ladder never grew: a bare `null` written here reached `emitNullLitNode` with every
+    // seed at its default and took the loud `bare null needs a struct-typed context`
+    // reject (D1294).
+    pendingListKind = nulScalarListBuildKind(nulScalarListCodeKind(vcode))
+    const vnslV = P.nodes[unwrapParen(valIx)]
+    if vnslV is NullLit {
+      pendingNulRefHeap = nulScalarListFieldWrapHeap(vcode)
+    }
+  } else if vcode == 29 {
+    const vmslot29 = uFieldMapShape(vi, fj)
+    pendingMapSlot = vmslot29
+    pendingNulRefHeap = mapTypeIdxOf(vmslot29)
+  } else if vcode == 6 {
+    pendingListKind = 3
+  } else if vcode == 35 {
+    pendingListKind = 10
+  } else if vcode == 25 {
+    pendingListKind = 4
+  } else if vcode == 26 {
+    pendingListKind = 6
+  } else if vcode == 27 {
+    pendingListKind = 7
+  }
+
+  const savedVPSI = pendingStructIdx
+  if vcode == 15 { pendingStructIdx = uFieldTgtStructIdx(vi, fj) }
+  if vcode == 19 { pendingMapSlot = uFieldMapShape(vi, fj) }
+
+  if vcode == 17 {
+    if emitExprAsF64(body, valIx, fnIx) < 0 { return -1 }
+  } else if vcode == 23 {
+    if emitExprAsI64(body, valIx, fnIx) < 0 { return -1 }
+  } else if vcode == 24 {
+    if emitExprAsF32(body, valIx, fnIx) < 0 { return -1 }
+  } else if vcode == 20 {
+    const svNS = pendingNulString
+    pendingNulString = true
+    const rcNS = emitExpr(body, valIx, fnIx)
+    pendingNulString = svNS
+    if rcNS < 0 { return -1 }
+  } else if vcode == 21 {
+    const svNB = pendingNulBool
+    pendingNulBool = true
+    const rcNB = emitExpr(body, valIx, fnIx)
+    pendingNulBool = svNB
+    if rcNB < 0 { return -1 }
+  } else if vcode == 30 {
+    const vnluCtx = expCtxHere()
+    vnluCtx.litUnion = 1
+    vnluCtx.nulLitUnion = true
+    if emitExprExpect(body, valIx, fnIx, vnluCtx) < 0 { return -1 }
+  } else if vcode == 22 {
+    const svNC = pendingNulClosure
+    pendingNulClosure = true
+    const rcNC = emitExpr(body, valIx, fnIx)
+    pendingNulClosure = svNC
+    if rcNC < 0 { return -1 }
+  } else if variantFieldIsLitUnionArray(vi, fj) {
+    const vlaCtx = expCtxHere()
+    vlaCtx.litUnion = 1
+    if emitExprExpect(body, valIx, fnIx, vlaCtx) < 0 { return -1 }
+  } else if vcode == 16 {
+    if emitUnionBoxArg(body, variantFieldElemName(vi, fj), valIx, fnIx) < 0 {
+      return -1
+    }
+  } else if vcode == 0 && variantFieldIsLitUnion(vi, fj) {
+    const fluCtx = expCtxHere()
+    fluCtx.litUnion = 1
+    if emitExprExpect(body, valIx, fnIx, fluCtx) < 0 { return -1 }
+  } else if vcode == 4 && variantFieldIsLitUnionArray(vi, fj) {
+    const flaCtx = expCtxHere()
+    flaCtx.litUnion = 1
+    if emitExprExpect(body, valIx, fnIx, flaCtx) < 0 { return -1 }
+  } else if (vcode == 3 || vcode == 20) && exprIsLitAtom(valIx, fnIx) {
+    if emitStrValue(body, valIx, fnIx) < 0 { return -1 }
+  } else {
+    if emitExpr(body, valIx, fnIx) < 0 { return -1 }
+  }
+  if vcode == 15 { pendingStructIdx = savedVPSI }
+  if vcode == 19 || vcode == 29 { pendingMapSlot = -1 }
+  pendingListKind = 0
+  0
+}
+
 function emitVariantStruct(body: i32[], objIx: i32, vi: i32, fnIx: i32) {
   if guardVariantFieldSpan(vi, "emitVariantStruct") < 0 { return -1 }
   const start = uFieldStart[vi]
   const cnt = uFieldCount[vi]
+  // D1510 — SOURCE-ORDER EVALUATION, `emitObj`'s rule for the union-arm literal. A variant
+  // row's fields are laid out sorted by name too, so `{ kind: "rect", w: f(), h: g() }` is
+  // pushed `h, kind, w` and would run its initialisers permuted without this.
+  const stash: i32[] = []
+  if objLitNeedsOrderStash(objIx, uFieldNames, start, cnt) {
+    let pj = 0
+    while pj < cnt {
+      stash.push(0 - 1)
+      pj = pj + 1
+    }
+    const ord = objFieldSrcOrder(objIx, uFieldNames, start, cnt)
+    let oj = 0
+    while oj < ord.length {
+      const ofj = ord[oj]
+      const ovIx = objFieldVal(objIx, uFieldNames[start + ofj])
+      if ovIx < 0 {
+        return emitFail(
+          "emitProgram: object literal is missing a union-variant field",
+        )
+      }
+      if emitVariantFieldValue(body, vi, ofj, ovIx, fnIx) < 0 { return -1 }
+      const oslot = objOrderStashSlot(
+        variantFieldTypeAt(vi, ofj),
+        uFieldStorageSlot(vi, ofj),
+      )
+      stash[ofj] = oslot
+      fbLocalSet(oslot)
+      oj = oj + 1
+    }
+  }
   let fj = 0
   while fj < cnt {
     const valIx = objFieldVal(objIx, uFieldNames[start + fj])
@@ -3119,122 +3250,12 @@ function emitVariantStruct(body: i32[], objIx: i32, vi: i32, fnIx: i32) {
         "emitProgram: object literal is missing a union-variant field",
       )
     }
-
-    pendingListKind = 0
-    pendingListSlot = 0
-    pendingNulRefHeap = -1
-    const vcode = variantFieldTypeAt(vi, fj)
-
-    const vcfv = P.nodes[unwrapParen(valIx)]
-    if vcfv is FuncDecl {
-      if vcode != 14 && vcode != 22 && vcode != 16 {
-        return emitFail(
-          "emitProgram: a lambda field value resolved to a non-closure variant field slot",
-        )
-      }
+    if stash.length > 0 {
+      fbLocalGet(stash[fj])
+      fj = fj + 1
+      continue
     }
-    if vcode == 5 {
-      let vslot = variantFieldRefSlot(vi, fj)
-      if vslot < 0 { vslot = 0 }
-      pendingListSlot = vslot
-      if rlElemKindTbl[vslot] == 2 {
-        pendingListKind = 2
-      } else {
-        pendingListKind = 1
-      }
-    } else if vcode == 18 {
-      pendingNulRefHeap = lTypeIdx
-    } else if vcode == 28 {
-      let vslot28 = variantFieldRefSlot(vi, fj)
-      if vslot28 < 0 { vslot28 = 0 }
-      pendingListSlot = vslot28
-      if rlElemKindTbl[vslot28] == 2 { pendingListKind = 2 }
-      else if rlElemKindTbl[vslot28] == 1 { pendingListKind = 1 }
-      else { pendingListKind = 5 }
-      if vslot28 < rlWrapIdx.length { pendingNulRefHeap = rlWrapIdx[vslot28] }
-    } else if isNulScalarListFieldCode(vcode) {
-      // A nullable SCALAR-BACKED list ARM field — the struct literal's arm, which this
-      // ladder never grew: a bare `null` written here reached `emitNullLitNode` with every
-      // seed at its default and took the loud `bare null needs a struct-typed context`
-      // reject (D1294).
-      pendingListKind = nulScalarListBuildKind(nulScalarListCodeKind(vcode))
-      const vnslV = P.nodes[unwrapParen(valIx)]
-      if vnslV is NullLit {
-        pendingNulRefHeap = nulScalarListFieldWrapHeap(vcode)
-      }
-    } else if vcode == 29 {
-      const vmslot29 = uFieldMapShape(vi, fj)
-      pendingMapSlot = vmslot29
-      pendingNulRefHeap = mapTypeIdxOf(vmslot29)
-    } else if vcode == 6 {
-      pendingListKind = 3
-    } else if vcode == 35 {
-      pendingListKind = 10
-    } else if vcode == 25 {
-      pendingListKind = 4
-    } else if vcode == 26 {
-      pendingListKind = 6
-    } else if vcode == 27 {
-      pendingListKind = 7
-    }
-
-    const savedVPSI = pendingStructIdx
-    if vcode == 15 { pendingStructIdx = uFieldTgtStructIdx(vi, fj) }
-    if vcode == 19 { pendingMapSlot = uFieldMapShape(vi, fj) }
-
-    if vcode == 17 {
-      if emitExprAsF64(body, valIx, fnIx) < 0 { return -1 }
-    } else if vcode == 23 {
-      if emitExprAsI64(body, valIx, fnIx) < 0 { return -1 }
-    } else if vcode == 24 {
-      if emitExprAsF32(body, valIx, fnIx) < 0 { return -1 }
-    } else if vcode == 20 {
-      const svNS = pendingNulString
-      pendingNulString = true
-      const rcNS = emitExpr(body, valIx, fnIx)
-      pendingNulString = svNS
-      if rcNS < 0 { return -1 }
-    } else if vcode == 21 {
-      const svNB = pendingNulBool
-      pendingNulBool = true
-      const rcNB = emitExpr(body, valIx, fnIx)
-      pendingNulBool = svNB
-      if rcNB < 0 { return -1 }
-    } else if vcode == 30 {
-      const vnluCtx = expCtxHere()
-      vnluCtx.litUnion = 1
-      vnluCtx.nulLitUnion = true
-      if emitExprExpect(body, valIx, fnIx, vnluCtx) < 0 { return -1 }
-    } else if vcode == 22 {
-      const svNC = pendingNulClosure
-      pendingNulClosure = true
-      const rcNC = emitExpr(body, valIx, fnIx)
-      pendingNulClosure = svNC
-      if rcNC < 0 { return -1 }
-    } else if variantFieldIsLitUnionArray(vi, fj) {
-      const vlaCtx = expCtxHere()
-      vlaCtx.litUnion = 1
-      if emitExprExpect(body, valIx, fnIx, vlaCtx) < 0 { return -1 }
-    } else if vcode == 16 {
-      if emitUnionBoxArg(body, variantFieldElemName(vi, fj), valIx, fnIx) < 0 {
-        return -1
-      }
-    } else if vcode == 0 && variantFieldIsLitUnion(vi, fj) {
-      const fluCtx = expCtxHere()
-      fluCtx.litUnion = 1
-      if emitExprExpect(body, valIx, fnIx, fluCtx) < 0 { return -1 }
-    } else if vcode == 4 && variantFieldIsLitUnionArray(vi, fj) {
-      const flaCtx = expCtxHere()
-      flaCtx.litUnion = 1
-      if emitExprExpect(body, valIx, fnIx, flaCtx) < 0 { return -1 }
-    } else if (vcode == 3 || vcode == 20) && exprIsLitAtom(valIx, fnIx) {
-      if emitStrValue(body, valIx, fnIx) < 0 { return -1 }
-    } else {
-      if emitExpr(body, valIx, fnIx) < 0 { return -1 }
-    }
-    if vcode == 15 { pendingStructIdx = savedVPSI }
-    if vcode == 19 || vcode == 29 { pendingMapSlot = -1 }
-    pendingListKind = 0
+    if emitVariantFieldValue(body, vi, fj, valIx, fnIx) < 0 { return -1 }
     fj = fj + 1
   }
   fbStructNew(uVarHeap[vi])
