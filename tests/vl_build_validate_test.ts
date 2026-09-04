@@ -13,8 +13,11 @@
 //   vl run   x.wasm            rc 1   same error, on the file build blessed
 //
 // `vl build` now runs `Module::validate` (the same check `vl run` fails on, minus
-// the Cranelift codegen) over the written artifact and exits 1 when it fails.
-// `--no-validate` restores the old write-and-bless path.
+// the Cranelift codegen) over the written artifact and exits 70 when it fails —
+// EX_SOFTWARE, the compiler-bug code, because `vl check` said rc 0 to reach the emitter
+// at all, so an invalid module is the compiler's fault by construction (D1578; it was 1
+// until that row, which is the code a bad PROGRAM gets). `--no-validate` restores the
+// old write-and-bless path.
 //
 // The artifact is deliberately LEFT ON DISK on failure and validation runs after
 // `--wat`: a module that fails to validate is exactly the one a compiler dev needs
@@ -151,14 +154,23 @@ Deno.test({
             `  build stdout: ${built.out.trim()}\n  run stderr: ${ran.err.trim().split("\n")[0]}`,
         );
       }
-      if (built.code !== 1) {
+      if (built.code !== 70) {
         throw new Error(
-          `expected rc 1 (vl run's code for an unusable module; 2 is reserved for usage errors), got ${built.code}`,
+          `expected rc 70 (EX_SOFTWARE — a vl bug, D1578; 1 is a bad program, 2 a usage error), got ${built.code}`,
         );
       }
-      if (!/not a valid WebAssembly module/.test(built.err)) {
+      if (!/failed to validate/.test(built.err)) {
         throw new Error(
           `the failure must name the artifact as invalid, got:\n${built.err}`,
+        );
+      }
+      // …and it must say WHERE (D1578): the owning function, and the position of its
+      // declaration. `b` is the binding whose store is refused, inside the synthesized
+      // start function, so only the sentence is asserted here — the per-function
+      // positions are pinned in tests/vl_invalid_module_position_test.ts.
+      if (!/this is a bug in vl, not in your program/.test(built.err)) {
+        throw new Error(
+          `the failure must say the program is not at fault, got:\n${built.err}`,
         );
       }
       // Left on disk on purpose — it is the thing you disassemble to debug.
