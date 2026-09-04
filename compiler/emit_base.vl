@@ -75,6 +75,8 @@ import {
 } from "./tyname"
 import {
   ArrayLit,
+  AsExpr,
+  BinExpr,
   Block,
   BoolLit,
   Call,
@@ -86,8 +88,10 @@ import {
   Ident,
   IfStmt,
   Index,
+  IsExpr,
   LetDecl,
   Member,
+  NullLit,
   NumLit,
   ObjLit,
   OptMember,
@@ -98,6 +102,7 @@ import {
   StrLit,
   TypeDecl,
   TypeRef,
+  Unary,
   WhileStmt,
   i32ToStr,
 } from "./ast"
@@ -771,6 +776,139 @@ export function objFieldVal(objIx: i32, fieldName: string) {
     }
   }
   -1
+}
+// True when evaluating `exprIx` cannot be OBSERVED by anything evaluated around it: it
+// calls nothing and writes nothing. READS qualify — permuting a set of reads cannot change
+// an answer when no member of that set writes — and so does a TRAP, which is not an effect
+// in this sense: effect-free operands have nothing to lose and the program dies at one of
+// them either way.
+//
+// `a += b` and `a++` DESUGAR to `a = …` in the parser, so the one assignment arm covers
+// every compound form; a `Call` and a lambda `FuncDecl` fall to the named default below.
+//
+// The gate on the object-literal ORDER STASH (D1510): a literal whose source order differs
+// from its sorted layout order keeps today's push-in-place lowering, byte for byte, when
+// every initialiser answers true here.
+export function exprEffectFree(ix: i32): boolean {
+  if ix < 0 { return false }
+  const e = P.nodes[ix]
+  if e is NumLit { return true }
+  if e is StrLit { return true }
+  if e is CharLit { return true }
+  if e is BoolLit { return true }
+  if e is NullLit { return true }
+  if e is Ident { return true }
+  if e is Paren { return exprEffectFree(e.parInner) }
+  if e is Unary { return exprEffectFree(e.unArg) }
+  if e is BinExpr {
+    if e.binOp == "=" { return false }
+    return exprEffectFree(e.binLeft) && exprEffectFree(e.binRight)
+  }
+  if e is Member { return exprEffectFree(e.memObj) }
+  if e is OptMember { return exprEffectFree(e.omObj) }
+  if e is Index {
+    return exprEffectFree(e.idxArr) && exprEffectFree(e.idxIndex)
+  }
+  if e is IsExpr { return exprEffectFree(e.isObj) }
+  if e is AsExpr { return exprEffectFree(e.asObj) }
+  if e is ArrayLit {
+    const es = e.arrElems
+    let i = 0
+    while i < es.length {
+      if !exprEffectFree(es[i]) { return false }
+      i = i + 1
+    }
+    return true
+  }
+  if e is ObjLit {
+    const fs = e.objFields
+    let j = 0
+    while j < fs.length {
+      const f = P.nodes[fs[j]]
+      if f is FieldInit {
+        if !exprEffectFree(f.fiValue) { return false }
+      }
+      j = j + 1
+    }
+    return true
+  }
+  // THE DEFAULT IS NAMED, not fallen through — `kind-ladder-incomplete`'s ask, and here it
+  // is also the soundness statement: see `exprEffectFreeUnclassified`.
+  exprEffectFreeUnclassified()
+}
+// Every `Node` kind `exprEffectFree`'s ladder does not test, as one answer: POSSIBLY
+// EFFECTFUL. A `Call` and a lambda `FuncDecl` are exactly what the whitelist exists to
+// exclude; `MatchExpr` and the statement kinds that reach expression position carry control
+// flow and bindings this predicate does not walk. FAIL-CLOSED ON PURPOSE — a kind nobody has
+// classified must never have its literal silently reordered — which is why the default is
+// written here, named, rather than left as a bare `false` a later reader has to interpret.
+function exprEffectFreeUnclassified(): boolean { false }
+// The LAYOUT field indices of `objIx`'s initialisers, ordered by SOURCE position — the
+// order [D1510](../../docs/internals/inventory/D1510.md)'s stash pass evaluates in.
+// `names`/`start`/`cnt` is the layout name span (`sFieldNames` + `sFieldStart[si]` for a
+// struct row, `uFieldNames` + `uFieldStart[vi]` for a union variant), so one walk serves
+// both field loops. A field the literal omits contributes no entry.
+export function objFieldSrcOrder(
+  objIx: i32,
+  names: string[],
+  start: i32,
+  cnt: i32,
+): i32[] {
+  const ord: i32[] = []
+  const o = P.nodes[objIx]
+  if o is ObjLit {
+    const fs = o.objFields
+    let j = 0
+    while j < fs.length {
+      const f = P.nodes[fs[j]]
+      if f is FieldInit {
+        let k = 0
+        while k < cnt {
+          if names[start + k] == f.fiName { ord.push(k) }
+          k = k + 1
+        }
+      }
+      j = j + 1
+    }
+  }
+  ord
+}
+// True when the object literal at `objIx` must evaluate its initialisers into scratch
+// locals before it constructs. `struct.new` takes its operands in LAYOUT order — sorted by
+// field NAME (D622) — so a literal written in any other order runs its initialisers
+// permuted, which DECISIONS "evaluation order is source order" forbids.
+//
+// TWO CONDITIONS, and the second is what keeps the tree byte-identical: the layout order
+// must actually reorder something, AND some initialiser must be observable
+// (`exprEffectFree`). A permutation of reads alone changes nothing.
+export function objLitNeedsOrderStash(
+  objIx: i32,
+  names: string[],
+  start: i32,
+  cnt: i32,
+): boolean {
+  const o = P.nodes[objIx]
+  if o is ObjLit {
+    const fs = o.objFields
+    if fs.length < 2 { return false }
+    const ord = objFieldSrcOrder(objIx, names, start, cnt)
+    let inOrder = true
+    let i = 1
+    while i < ord.length {
+      if ord[i] < ord[i - 1] { inOrder = false }
+      i = i + 1
+    }
+    if inOrder { return false }
+    let j = 0
+    while j < fs.length {
+      const f = P.nodes[fs[j]]
+      if f is FieldInit {
+        if !exprEffectFree(f.fiValue) { return true }
+      }
+      j = j + 1
+    }
+  }
+  false
 }
 // True when an `is` RHS names a LITERAL type (`"a"`, `0`, `1.5`) — the runtime
 // value-test arm of `emitIs` (the place's literal-union ANNOTATION softened to
