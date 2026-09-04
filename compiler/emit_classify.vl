@@ -28892,6 +28892,29 @@ function paramUnionRetName(fnIx: i32, name: string) {
   ""
 }
 
+// THE REGISTERED UNION A NODE'S OWN TYPE IS, when its RENDER cannot name it. Every arm below
+// asks `tyToEmitName` and then a name-keyed registry scan, which answers for a spelling the
+// program wrote and misses one INFERENCE minted: a `??` desugared to an `if`, or a hole-param
+// call, carries the union's arena type with the arms rendered STRUCTURALLY (`{kind:string,…}`),
+// so `isUName` sees no `Shape`. `unRowOfCanon` is the canon-keyed reverse index over the same
+// rows, so it names the row from the TYPE — and the name it hands back is the registered
+// spelling every downstream member-set, narrow and variant lookup keys on. D1561.
+// THE STRUCTURAL GATE IS NOT AN OPTIMISATION. `unRowOfCanon` scans every registered row, so
+// asking it of a node that is no union at all costs an ordinary CALL one pass over the union
+// table — a per-expression price scaling with the type table, which is what
+// `tests/vl_scaling_shape_test.ts`'s `types` pair grades and what it caught here.
+function nodeRegisteredUnionName(ix: i32): string {
+  const ty = nodeTyIxOf(unwrapParen(ix))
+  if ty < 0 { return "" }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    if t.uMembers.length < 2 { return "" }
+    const u = unRowOfCanon(ty)
+    if u >= 0 { return unNames[u] }
+  }
+  ""
+}
+
 // The union NAME the expression at `exprIx` produces (the name-typed mirror of the
 // boolean `exprUnion`): a union-returning call's return annotation, a union-typed
 // ident, a parenthesized union. "" when the expression is not union-valued.
@@ -28923,7 +28946,10 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
       if isValueUnionName(icn) { return icn }
       if isUNameAB(4, icn, nodeTyIxOf(unwrapParen(exprIx))) { return icn }
     }
-    return ""
+    // D1561 — the STRUCT-union rung the render cannot reach. A `??` over a declared struct
+    // union desugars to this `if` and its recorded type renders structurally, so the two
+    // rungs above decline a union the registry holds. Named off the type instead.
+    return nodeRegisteredUnionName(exprIx)
   }
   // D960 — A `??` NAMES ITS UNION FROM ITS OWN CHECKED TYPE. The re-readable spelling is
   // desugared away before emit, so what reaches here is the CALL-operand form that keeps its
@@ -29036,7 +29062,13 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
     // union from the checker's per-node type, for the value-union UNBOX. The name-typed dual of
     // `exprUnion`'s Call `nodeTyIsUnion` fallback; reached only here, so the costly render is off the
     // hot path (declared / param / binding unions resolve from the cheap annotation above).
-    return nodeUnionName(exprIx)
+    const crun = nodeUnionName(exprIx)
+    if crun != "" { return crun }
+    // D1561 — `nodeUnionName` gates itself to a VALUE union before rendering, so a call whose
+    // result is a declared STRUCT union (a hole parameter's `passh(mkval())`, whose inferred
+    // return has no annotation to read) reached here with no name and the binding it
+    // initialised carried none either.
+    return nodeRegisteredUnionName(exprIx)
   }
   // D1252 — THE IDENT ARM CARRIES THE SAME DECLINE ITS `Index` AND `Member` SIBLINGS DO.
   // A binding narrowed to ONE arm reads UNBOXED, so it is no longer a union VALUE here and
