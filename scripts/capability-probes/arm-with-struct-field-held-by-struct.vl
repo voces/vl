@@ -1,0 +1,81 @@
+// A union ARM whose OWN field is a struct, read through a struct that HOLDS the arm — the
+// shape the first external consumer's lexer wanted: `lex(): Tokens | LexError` with `Tokens`
+// carrying a `Buf`, so the parser's state struct could hold a `Tokens` field instead of
+// wrapping the payload a second time.
+//
+// CLOSED by D1579. D1518 gave an arm a struct-table row; the CROSS-TABLE layout guard
+// (`variantStructHeapTwinAt`) still declined any arm carrying a ref the field CODE does not
+// name — 15 a nested struct, 5 a ref list, 28 its `| null` niche — while both of its sibling
+// comparators (`structFieldCodesEq`, `variantFieldLayoutEq`) already descended into the
+// referenced layer. The two sides spell one field differently: the variant row banks the
+// declared `Inner`, the arm's minted anon row the structural `{base:i32,length:i32}`, and the
+// referenced rows are layout twins.
+//
+//   emitProgram: a struct field typed as the union ARM `A` has no field rep …
+//
+// BOTH HOLDERS ARE HERE. `S` is a plain struct, coded from `collectS` after the arm's row is
+// minted; `S2` is ITSELF an arm, coded from `collectU` before it — two rungs, and the fix is
+// order-independent only if both answer.
+//
+// Reported as VL-032 by the first external consumer (`~/glean/docs/vl-issues.md`).
+//
+// Should print: 3 1 16 make 25 4 20 42
+import { Buf, Buffer, loadI32, storeI32 } from "std:buffer"
+
+type Inner = { base: i32, length: i32 }
+type A = { n: i32, inner: Inner }
+type E = { msg: string }
+type S = { a: A, p: i32 }
+type S2 = { a: A, q: i32 }
+type E2 = { code: i32 }
+
+function make(ok: boolean): A | E {
+  if !ok { return { msg: "make" } }
+  return { n: 3, inner: { base: 1, length: 16 } }
+}
+
+function mk2(ok: boolean): S2 | E2 {
+  if !ok { return { code: 7 } }
+  return { a: { n: 4, inner: { base: 2, length: 8 } }, q: 6 }
+}
+
+function use(s: S): i32 {
+  return s.a.n + s.a.inner.base + s.a.inner.length + s.p
+}
+
+const m = make(true)
+if m is A {
+  print(m.n)
+  print(m.inner.base)
+  print(m.inner.length)
+}
+const me = make(false)
+if me is E { print(me.msg) }
+if m is A { print(use({ a: m, p: 5 })) }
+
+const s2 = mk2(true)
+if s2 is S2 {
+  print(s2.a.n)
+  print(s2.a.n + s2.a.inner.base + s2.a.inner.length + s2.q)
+}
+
+// AND THE STD STRUCT, which is what made this bite: `Buf` is a struct, so an arm holding one
+// is this same cell. The read goes THROUGH the buffer so the field's slot has to name the heap
+// the buffer was built under.
+type Tokens = { buf: Buf, count: i32 }
+type LexError = { msg: string, line: i32 }
+type ParserState = { toks: Tokens, pos: i32 }
+
+function lex(ok: boolean): Tokens | LexError {
+  if !ok { return { msg: "lex", line: 1 } }
+  const b = Buffer(16)
+  storeI32(b, 0, 40)
+  return { buf: b, count: 2 }
+}
+
+function peek(st: ParserState): i32 {
+  return loadI32(st.toks.buf, st.pos * 4) + st.toks.count
+}
+
+const t = lex(true)
+if t is Tokens { print(peek({ toks: t, pos: 0 })) }

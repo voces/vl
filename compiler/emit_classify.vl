@@ -22726,19 +22726,18 @@ export function armFieldDeferredRowOk(base: string): boolean {
     g = g + 1
   }
   armDeferStack.push(base)
-  const ok = armPlainLayoutShapeOk(armMintShapeName(tyToEmitName(aty)))
+  const ok = armPlainLayoutShapeOk(armMintShapeName(tyToEmitName(aty)), 0)
   armDeferStack.pop()
   ok
 }
 
 // The arm render's fields, coded, WITH `variantStructHeapTwinAt`'s OWN LAYOUT GUARD APPLIED.
-// That guard declines a merge for an arm carrying a ref the code does not name (5 / 15 / 28),
-// so an arm with one shares no heap with any struct row — and admitting it above would code the
-// field 15 against a row the arm does not emit: check-clean INVALID WASM, which is exactly what
-// a gate narrowed ahead of its lowering buys (D965's shape, D1518's own measurement). This is
-// stricter than `variantNestedShapeOk` on purpose: that predicate answers "will this INTERN",
-// this one "will the interned row BE the arm's".
-function armPlainLayoutShapeOk(nm: string): boolean {
+// Acceptance here OBLIGATES that comparator to answer, and a gate narrowed ahead of its
+// lowering buys check-clean INVALID WASM instead (D965's shape, D1518's own measurement) — so
+// the two must apply the same rule. This is stricter than `variantNestedShapeOk` on purpose:
+// that predicate answers "will this INTERN", this one "will the interned row BE the arm's".
+function armPlainLayoutShapeOk(nm: string, depth: i32): boolean {
+  if depth > 8 { return false }
   if !nameIsShapeSpanEnds(nm) { return false }
   const fnames: string[] = []
   const ftexts: string[] = []
@@ -22748,11 +22747,45 @@ function armPlainLayoutShapeOk(nm: string): boolean {
   while fi < fnames.length {
     if fnames[fi] == "" { return false }
     const c = nameFieldCode(ftexts[fi])
-    if c < 0 { return false }
-    if c == 5 || c == 15 || c == 28 { return false }
+    // A -1 IS NOT A REFUSAL HERE, IT IS THE RENDER'S OWN SPELLING. `tyToEmitName` writes a
+    // declared target STRUCTURALLY (`inner: Inner` renders `inner: {base:i32,length:i32}`), and
+    // an inline shape has no code until it is interned — which happens in the very mint this
+    // predicate is the mirror of. The VARIANT row codes the same field from the annotation NODE,
+    // where the declared name is still there, so it is 15 either way and the leaf below is what
+    // both sides have to agree about.
+    if c < 0 || c == 5 || c == 15 || c == 28 {
+      if !armRefFieldLeafOk(ftexts[fi], depth + 1) { return false }
+    }
     fi = fi + 1
   }
   true
+}
+
+// THE REFERENCED LAYER, ONE PHASE BEFORE THE STRUCT TABLE EXISTS (D1579) — the mirror of the
+// descent `variantStructHeapTwinAt` now makes into a 15 / 5 / 28 field. That comparator merges
+// when the two sides' referenced ROWS are twins, and the two sides spell the same target
+// differently: the variant row banks the declared name (`Inner`), the arm's minted anon row the
+// structural render (`{base:i32,length:i32}`). A DECLARED struct always has a row for the render
+// to twin with; an ARM answers through the same deferred predicate, whose `armDeferStack` is what
+// keeps a self-referential chain from re-entering forever. Every other leaf keeps its refusal.
+//
+// The peel is `internArmShapeAt`'s, minus the map-value arm a map field never reaches (19 / 29).
+function armRefFieldLeafOk(txt: string, depth: i32): boolean {
+  if depth > 8 { return false }
+  if txt == "" { return false }
+  const base = nonNulBaseOf(txt)
+  if base != txt { return armRefFieldLeafOk(base, depth + 1) }
+  if nameIsArray(txt) {
+    return armRefFieldLeafOk(arrElemNameRaw(txt), depth + 1)
+  }
+  // A DECLARED STRUCT NAME SURVIVING IN A STRUCTURAL RENDER IS `tyToEmitName`'s RECURSION STOP.
+  // Every other declared target is rendered structurally (`inner: Inner` becomes
+  // `inner:{base:i32,length:i32}`), so a NAME here means the walk closed a cycle — and the anon
+  // row minted from that render does not twin the declared row, which is the residue this row
+  // leaves open (D1579, `type N = {v: i32, next: N | null}` as an arm's field type).
+  if nameIsStructDecl(txt) { return false }
+  if nameIsShapeSpanEnds(txt) { return armPlainLayoutShapeOk(txt, depth + 1) }
+  armFieldDeferredRowOk(txt)
 }
 
 // Intern the PLAINLY-LOWERABLE inline shapes buried in the params / result of a function-type
@@ -24617,6 +24650,18 @@ export function variantFieldRefSlot(vi: i32, fi: i32) {
   rlSlotByNameKeyTy(uFieldElemName[uFieldStart[vi] + fi], ety)
 }
 
+// The ref-list table SLOT of struct `si`'s ref-list field `fi` — `variantFieldRefSlot`'s
+// struct-table twin, and it lives beside it because the CROSS-TABLE layout guard
+// (`variantStructHeapTwinAt`) asks both of them about one field position (D1579). Same two
+// rungs: the field's recorded element TYPE through the interned rep key, then the recorded
+// element NAME for a row the D5 sidecar does not cover.
+export function sFieldRefSlot(si: i32, fi: i32) {
+  const a = rlSlotOfTy(sFieldElemTyIxAt(si, fi))
+  if a >= 0 { return a }
+
+  rlSlotByNameTy(sFieldElemNameAt(si, fi), sFieldElemTyIxAt(si, fi))
+}
+
 // `sFieldStorageSlot`'s union-variant twin — the `pushFieldStorage` slot argument for
 // variant `vi`'s field `fj`, read by the type section and by the object-literal ORDER
 // STASH (D1510) alike.
@@ -24835,8 +24880,8 @@ export function buildVariantTwins() {
 // SAME function of `vi` and agree without either observing the other. That is what keeps it
 // TIMING-INDEPENDENT, which `rlSlotsLayoutTwin` requires of anything it consults.
 //
-// THE LAYOUT GUARD IS DELIBERATELY CONSERVATIVE: a field whose emitted storage is a ref the CODE
-// does not name (5 / 15 / 28) declines outright rather than descending into the referenced layer.
+// THE LAYOUT GUARD DESCENDS INTO THE REFERENCED LAYER (D1579), as both sibling comparators do:
+// a 15 / 5 / 28 field merges only when the row or slot it names is itself a twin.
 const vshtPairVi: i32[] = []
 const vshtPairSi: i32[] = []
 
@@ -24884,7 +24929,34 @@ export function variantStructHeapTwinAt(vi: i32): i32 {
   while fi < uFieldCount[vi] {
     const cv = uFieldTypes[uFieldStart[vi] + fi]
     if cv != sFieldTypes[sFieldStart[si] + fi] { return vshtPop(0 - 1) }
-    if cv == 5 || cv == 15 || cv == 28 { return vshtPop(0 - 1) }
+    // THE REFERENCED-LAYER DESCENT BOTH SIBLING COMPARATORS ALREADY HAD (D1579). A field
+    // whose storage is a ref the CODE does not name (15 a nested struct, 5 a ref list, 28 its
+    // `| null` niche) declined outright here, so an arm carrying one shared a heap with no
+    // struct row and a field typed as that arm had no rep. `structFieldCodesEq` descends for
+    // exactly these codes and `variantFieldLayoutEq` does too; only this CROSS-TABLE seam
+    // asked the code alone. The two sides record the same field under different SPELLINGS —
+    // the variant row banks the declared name (`Inner`), the arm's minted anon row the
+    // structural render (`{base:i32,length:i32}`) — so the question has to be asked of the
+    // referenced ROWS, which are layout twins, not of the names.
+    if cv == 15 {
+      if (
+        repStructSlotsTwin(
+          uFieldTgtStructIdx(vi, fi),
+          sFieldTgtStructIdx(si, fi),
+        ) ==
+        0
+      ) {
+        return vshtPop(0 - 1)
+      }
+    }
+    if cv == 5 || cv == 28 {
+      if (
+        rlSlotsLayoutTwin(variantFieldRefSlot(vi, fi), sFieldRefSlot(si, fi)) ==
+        0
+      ) {
+        return vshtPop(0 - 1)
+      }
+    }
     if cv == 19 || cv == 29 {
       const um = uFieldMapShape(vi, fi)
       if um == -3 { return vshtPop(0 - 1) }
