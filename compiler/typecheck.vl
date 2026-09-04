@@ -1459,9 +1459,7 @@ function arrDefHoleToI32(ty: i32) {
       const t = T.tys[ty]
       if t is TyArray {
         if t.aElem < 0 {
-          const partner = holeLinkElemOf(ty)
-          if partner >= 0 { t.aElem = partner } else { t.aElem = TY_I32 }
-          tyMutEpoch = tyMutEpoch + 1 // in-place element pin — canonical keys change
+          arrDefPinHoleElem(ty)
           return true
         }
       }
@@ -1470,6 +1468,27 @@ function arrDefHoleToI32(ty: i32) {
     j = j + 1
   }
   false
+}
+
+// THE ONE PLACE AN UNPINNED INTRINSIC HOLE ACQUIRES ITS ELEMENT: a LINKED partner's, else the
+// `i32` default. Returns the row's element after the pin, or -1 when the row is not an array.
+// Two sites default such a hole — `arrDefHoleToI32` at scope flush and
+// `checkArrayNewDefaultElems` at program end — and only the first consulted the link, so an
+// intrinsic delivered into a plain `v = __array_new_default__(3)` (a CALL row, never a
+// binding, so the flush never sees it) took `i32` while `v` took `f64` from a later store:
+// check-clean invalid wasm. D1512.
+function arrDefPinHoleElem(ty: i32) {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyArray {
+    if t.aElem < 0 {
+      const partner = holeLinkElemOf(ty)
+      if partner >= 0 { t.aElem = partner } else { t.aElem = TY_I32 }
+      tyMutEpoch = tyMutEpoch + 1 // in-place element pin — canonical keys change
+    }
+    return t.aElem
+  }
+  -1
 }
 
 // Record that the two array rows `a` and `b` must carry the same element. Deduped, because
@@ -1559,17 +1578,18 @@ function checkArrayNewDefaultElems() {
   while i < arrDefCallTy.length {
     const t = T.tys[arrDefCallTy[i]]
     if t is TyArray {
-      if t.aElem < 0 {
-        t.aElem = TY_I32
-        tyMutEpoch = tyMutEpoch + 1 // nothing pinned it — the intrinsic's base element
-      } else if arrDefElemDeferred(t.aElem) {
+      // PIN FIRST, THEN GRADE — one order, not two paths. This arm used to default an
+      // unpinned hole to `i32` and skip the grade, which was both halves of D1512: the link
+      // went unread, and an element a partner supplies was never asked for its zero.
+      const el = arrDefPinHoleElem(arrDefCallTy[i])
+      if arrDefElemDeferred(el) {
         // An ERROR element already has its own diagnostic and a HOLE element is a generic
         // body's, where this question has no answer until the pin — the same deferral every
         // other floor in this file makes over a `TyVar` (see `notePrintCstr`).
-      } else if !elemHasZero(t.aElem) {
+      } else if !elemHasZero(el) {
         tErr(
           "__array_new_default__ fills every slot with the element's default value, and " +
-            tyToStr(t.aElem) +
+            tyToStr(el) +
             " has none — use __array_new__(n, fill)",
           arrDefCallIx[i],
         )

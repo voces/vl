@@ -5242,4 +5242,38 @@ disagreement it found; it does not teach the feature.**
 per parameter for an inference hole (`?g.0`) and NOT unique for a declared one — two functions
 may both spell theirs `T`, and a shared key would let one generic's demand refuse the other's
 calls. `docs/constraints-design.md` §7.7 is the record.
+## Evaluation order is SOURCE order, for every expression list in the language (2026-09-03) — D1510, BUILT
 
+**Argument lists, list literals, map stores, struct-literal initialisers, union-arm initialisers
+and binary / n-ary operands all evaluate left to right in the order they are WRITTEN, whatever
+order the emitted code stores or constructs them in.** A lowering that must deliver values in
+some other order — a layout, a fused copy, a rewritten call — evaluates them into scratch
+locals first and then delivers; it does not reorder the evaluation.
+
+**The rule is stated at the level of expression lists on purpose.** It was reached from ONE
+construct: [D1510](docs/internals/inventory/D1510.md), where a struct literal ran its
+initialisers in LAYOUT order — fields sorted by name (D622) — because `struct.new` takes its
+operands that way and the emitter evaluated each one at the moment it pushed it. Writing the
+ruling as "struct literal initialisers evaluate in source order" would answer that construct
+and leave the next one open, and there is no shortage of next ones: every lowering in this
+compiler that fuses, sorts, or re-associates an operand list is a candidate. A rule stated at
+the one construct that broke is how the next construct breaks.
+
+**Why this and not "the order is unspecified".** C and C++ left argument order unspecified and
+spent thirty years on the consequences; the languages VL reads like — JavaScript, Python, Rust,
+Go, Swift — all guarantee left to right, and a VL author writing `{ a: c.readU8(), b:
+c.readU8() }` is entitled to the reading their eye gives it. The cost of the guarantee is
+bounded and measured: an out-of-order literal whose initialisers are all effect-free keeps the
+push-in-place lowering byte for byte, so only the literals that can actually observe the
+difference pay for it. Across `compiler/*.vl` and `std/*.vl` that is **14 of 82** out-of-order
+literals, and 272 bytes of seed.
+
+**A TRAP is not an effect for this purpose.** Two effect-free operands that both trap die at one
+of the two either way; nothing observable is lost, and buying an ordering guarantee for trap
+messages would put every literal on the scratch path. What the rule protects is a WRITE and a
+CALL — the two things another initialiser can see.
+
+**The soundness direction of the gate is fail-CLOSED.** `exprEffectFree` (`emit_base.vl`) is a
+whitelist over literals, identifier reads, places and arithmetic; every kind it does not name —
+a call, a lambda, a `MatchExpr`, every statement kind — answers "possibly effectful" and puts
+its literal on the scratch path. A kind nobody has classified is never silently reordered.

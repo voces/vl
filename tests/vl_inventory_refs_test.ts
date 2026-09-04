@@ -23,9 +23,25 @@ const SOURCE_MARK = /^<!--\s*inventory-split:\s*source\s+(\S+)\s*-->\s*$/m;
 // Where a citation may appear. `scripts/inventory/` is the split TOOLING: the ids in its
 // template and its self-test are specimens, not citations, and it is the one place in the
 // tree that mints ids it never intends to file.
+//
+// `RESERVED.md` IS THE SECOND SUCH PLACE, AND FOR THE SAME REASON — it is a ledger of id
+// ranges CLAIMED AHEAD OF THEIR ROWS, so naming an id no row carries is its normal and
+// correct state, not a dangling citation. Every reservation would fail this test on the day
+// it is taken and pass only once the work lands, which inverts what the file is for. It is
+// exempt by PATH, and deliberately so: do not "fix" this by filing placeholder rows for
+// reserved ids, and do not delete the exemption because the file happens to be green — a
+// range is usually unfiled at exactly the moment it matters most.
+//
+// The range spelling (`D<lo>-D<hi>`) also reads as two separate citations to `CITE`, which
+// is why this comment writes it with placeholders: spelling a real reserved range here
+// failed THIS test from inside the paragraph explaining the exemption, because `tests/`
+// is scanned too.
+// the path exemption makes moot; if this file ever stops being exempt, that is the second
+// thing to handle. Staleness is caught elsewhere: `tests/vl_inventory_rows_test.ts` fails
+// when every id in a reserved range IS filed, which is the real hazard here.
 const ROOT_FILES = ["DECISIONS.md", "ROADMAP.md", "CLAUDE.md", "CHANGELOG.md"];
 const ROOT_DIRS = ["docs", "std", "compiler", "tests", "scripts"];
-const SKIP_PREFIX = ["scripts/inventory/"];
+const SKIP_PREFIX = ["scripts/inventory/", "docs/internals/inventory/RESERVED.md"];
 const SCAN_EXT = /\.(md|vl|ts|py|sh|rs|yml)$/;
 
 // A row heading, in ANY doc: `docs/internals/std-design.md` and

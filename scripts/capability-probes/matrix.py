@@ -212,6 +212,28 @@ def p_array_push(t, face):
     return assemble(t, pre=pre, body=body)
 
 
+@position("local_assign", "the reassigned local")
+def p_local_assign(t, face):
+    """`v = VALUE` into a FUNCTION-local `let`: emitAssign's `local.set` arm.
+
+    The sibling `global_assign` has covered the `global.set` arm since D965 and this one
+    had no cell. They are NOT the same lowering — the global arm returns before the
+    classifier pair the local arm runs — and D1500 is a compiler TRAP at exactly this
+    position: module scope, and all twenty-six other cells, run the same value fine. The
+    delivery is inside a function for that reason, so SETUP and GUARD go in with it.
+    """
+    inner = [t.setup] if t.setup else []
+    decl = ("let v: %s = %s" % (t.ty, t.value)) if face == "ann" else "let v = %s" % t.value
+    deliver = [decl, "v = %s" % t.value, t.proof]
+    if t.guard:
+        inner += ["if %s {" % t.guard, ind("\n".join(deliver), 2), "}"]
+    else:
+        inner += deliver
+    decls = ["function __la() {", ind("\n".join(inner), 2), "}"]
+    prog = "\n".join(([t.prelude] if t.prelude else []) + decls + ["__la()"]) + "\n"
+    return prog
+
+
 @position("global_init", "the global")
 def p_global_init(t, face):
     if t.guard:

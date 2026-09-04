@@ -133,6 +133,7 @@ Deno.test({
         "array_element",
         "array_element_assign",
         "array_push",
+        "local_assign",
         "global_init",
         "global_assign",
         "map_value",
@@ -297,5 +298,27 @@ Deno.test({
       wantVerdict(cells, "block_bare", face, "RUNS", "D1253 closed");
     }
     if (code !== 0) throw new Error(`want exit 0 once the ref reps run, got ${code}`);
+  },
+});
+
+// D1500 — THE `local_assign` POSITION, GRADED AGAINST THE ROW THAT NAMED IT.
+//
+// `emitAssign` has two arms and the matrix had a cell for one: `global_assign` covers the
+// `global.set` arm (D965's missed position), and the `local.set` arm — the plainest
+// reassignment in the language — had none. D1500 is a compiler TRAP that lives at exactly
+// that position: `let len = 0; len = xs[0]` over an `i32[]` crashed the compiler while the
+// same value graded RUNS at all twenty-six other cells, in both faces. Only the one position
+// is run: this is the control for the POSITION, not a second sweep of the value.
+Deno.test({
+  name: "matrix: D1500's `local_assign` position exists and its own template runs there",
+  ignore: !ENABLED,
+  fn: async () => {
+    const { cells } = await runMatrix("index-read-into-local-assign.matrix.vl", "local_assign");
+    for (const face of ["annotated", "un-annotated"]) {
+      wantVerdict(cells, "local_assign", face, "RUNS", "D1500 closed 2026-09-03");
+    }
+    if (cells.length !== 2) {
+      throw new Error(`want the 2 local_assign cells, got ${cells.length}`);
+    }
   },
 });

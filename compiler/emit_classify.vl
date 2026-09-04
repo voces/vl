@@ -9400,9 +9400,16 @@ export function rlElemCloSigKeyAt(slot: i32): string {
 // readers share. ARENA first (`rlElemTyIx` then the `TyArray`'s element then
 // `rlSlotOfTy`, the layer's own `repElemKey` lookup); the element-NAME surgery is the
 // untouched fall-through for a slot the sidecar does not cover (D1 leg C).
+//
+// THE NAME FALL-THROUGH IS BOUND-GUARDED, the idiom `refListElemNameOfExpr`'s sibling
+// reads already spell (D227, D179): callers reach here through `refListSlotOfExpr`,
+// which CLAMPS a miss to `0`, so `slot >= 0` alone cannot see one — and a module that
+// interns no ref list has an EMPTY `rlElemName`, so `rlElemName[0]` traps the COMPILER
+// on a `vl check`-clean program (D1500). -1 is the fall-through's own no-row answer.
 export function rlElemInnerSlot(slot: i32): i32 {
   const ar = rlInnerSlotOfElem(slot)
   if ar >= 0 { return ar }
+  if slot < 0 || slot >= rlElemName.length { return -1 }
   rlSlotOfArrName(rlElemName[slot])
 }
 
@@ -11720,6 +11727,23 @@ export function unionEqStashSlot() {
   listIdxScratchBase + liKinds.length
 }
 
+// D1510 — THE OBJECT-LITERAL ORDER STASH, codes `100 + <field code>`. A struct / variant
+// literal written out of layout order evaluates each initialiser here, in SOURCE order, and
+// the `struct.new` reads the slots back in layout order. The slot must hold exactly what the
+// field slot accepts, so the code CARRIES the field's type code and `liSlots` its storage
+// slot; `fbFieldStorageRun` types it off the one `pushFieldStorage` table the type section
+// uses, which is why the two can never disagree.
+//
+// FRESH PER FIELD, never shared — `liBack` 1's rule, for its reason: a nested literal is
+// emitted DURING one of the outer literal's initialisers, while the outer literal's earlier
+// stashes are live, and two writers of one slot is how a stash gets clobbered.
+export function objOrderStashSlot(code: i32, storageSlot: i32) {
+  liKinds.push("i32") // unread — `liBack` alone carries the field code
+  liSlots.push(storageSlot)
+  liBack.push(100 + code)
+  listIdxScratchBase + liKinds.length
+}
+
 // D1060 — THE LITERAL-`is` RECEIVER STASH, code 17. A `v is <literal>` over a boxed union
 // reads its receiver TWICE (the tag, then the payload inside the tag-matched arm), so a
 // receiver that is not a re-readable place is parked here at its first read and re-read out
@@ -13405,7 +13429,22 @@ function pushDiscrimNarrow(
   let dTy = isParentTyIxOf(condIx)
   if elseArm { dTy = isParentElseTyIxOf(condIx) }
   if dTy < 0 { return false }
-  const dNm = nominalStructNameOfTy(dTy)
+  // AN ANONYMOUS ARM HAS NO NOMINAL NAME, AND ITS VARIANT ROW IS SPELLED BY ITS RENDER
+  // (D1473). `type Shape = {kind:"circle",r:f64} | {kind:"rect",w:f64,h:f64}` interns one
+  // variant row per arm exactly as the named spelling does — the rows are keyed on the ATOM
+  // SPELLING, not on a declaration — so the only thing the reverse map cannot supply is a
+  // `type` name that was never written. `variantIndexOfOwnRender` is the same question asked
+  // of canon's own render of the arm, and the row's OWN spelling is what is banked so the
+  // read side's exact `variantIndexOf` compare cannot miss it.
+  //
+  // THE FALLBACK ALSO RUNS WHEN THE NOMINAL NAME IS NOT A VARIANT. A `type Rect = {…}` that
+  // merely EQUALS an inline arm is found by the reverse map and is registered under no
+  // variant row at all, so a nominal-only ladder declined a union it could serve.
+  let dNm = nominalStructNameOfTy(dTy)
+  if dNm == "" || variantIndexOf(dNm) < 0 {
+    const dvr = variantIndexOfOwnRender(tyToEmitName(dTy))
+    if dvr >= 0 { dNm = uVariants[dvr] }
+  }
   if dNm == "" { return false }
   if variantIndexOf(dNm) < 0 { return false }
   // THE NAME MUST BE A MEMBER OF THIS RECEIVER'S OWN SET, and skipping that check was a
@@ -19940,6 +19979,37 @@ export function arrLitNestedElemKind(arrIx: i32): i32 {
   refArrElemKind(refElemArrName(en))
 }
 
+// D1511 — the ref-list element NAME of an array literal whose recorded ELEMENT is a SHAPE
+// (`const xs = []` then `xs.push({y: 1, x: 2})`), or "" when it is not. The STRUCT twin of
+// `arrLitUnionElemName` / `arrLitNestedElemName`, and it exists for the identical reason: an
+// EMPTY literal has no element for `arrLitIsRef` to classify, so nothing minted the ref-list
+// row and the binding took the i32-list default.
+//
+// THE NAME IS `shapeNominalOfTy`'s, NOT the render, because `synthEmptyListAnn` spells its
+// synthesized `<elem>[]` annotation with exactly that producer (`arrElemNominalOfTy`) and then
+// RESOLVES the row by that name. One producer on both sides is what makes the intern here and
+// the resolve there land on ONE row; a render (`{y: i32, x: i32}`) keys a different one.
+export function arrLitShapeElemName(arrIx: i32): string {
+  const ty = nodeTyIxOf(arrIx)
+  if ty < 0 { return "" }
+  const t = T.tys[ty]
+  if t is TyArray {
+    if t.aElem >= 0 {
+      const el = T.tys[t.aElem]
+      if el is TyObj {
+        const nom = shapeNominalOfTy(t.aElem)
+        if nom == "" { return "" }
+        // …AND THE REF-LIST LAYER MUST BE ABLE TO NAME IT — `arrLitNestedElemName`'s second
+        // gate, for its reason: `refArrElemKind` answers a kind for EVERY spelling, so a
+        // render alone is not enough to key a row the annotation half would decline.
+        if !nameIsRefArray(refElemArrName(nom)) { return "" }
+        return nom
+      }
+    }
+  }
+  ""
+}
+
 // D1270 — the ref-list element NAME of an array literal whose recorded ELEMENT is a NULLABLE
 // type (`[f(0)]` where `f(): i32[] | null`), or "". The nullable twin of
 // `arrLitNestedElemName`, and the same contract: the name is the emit render of the checker's
@@ -24093,6 +24163,16 @@ export function variantFieldRefSlot(vi: i32, fi: i32) {
   // for a live share of entries here, so it stays laddered — `sFieldRefSlot`'s stronger
   // `rlSlotByNameTy` claim is not this caller's.
   rlSlotByNameKeyTy(uFieldElemName[uFieldStart[vi] + fi], ety)
+}
+
+// `sFieldStorageSlot`'s union-variant twin — the `pushFieldStorage` slot argument for
+// variant `vi`'s field `fj`, read by the type section and by the object-literal ORDER
+// STASH (D1510) alike.
+export function uFieldStorageSlot(vi: i32, fj: i32): i32 {
+  const code = variantFieldTypeAt(vi, fj)
+  if code == 15 { return uFieldTgtStructIdx(vi, fj) }
+  if code == 19 || code == 29 { return uFieldMapShape(vi, fj) }
+  variantFieldRefSlot(vi, fj)
 }
 
 // The ELEMENT/atom-set NAME recorded for variant `vi`'s field `fi` — a union-box field
@@ -31996,8 +32076,14 @@ export function exprEmittedRefListSlot(exprIx: i32, fnIx: i32): i32 {
   // AN INDEXED READ's row is the OUTER list's ELEMENT slot — again the table the value's
   // cell was typed from, not a spelling: `outer[0]` holds whatever `outer`'s backing was
   // minted to hold.
+  //
+  // THE STRICT READER, because this function's contract is "-1 where nothing answers" and
+  // `refListSlotOfExpr` CLAMPS a miss to row 0 — a real row, the first one interned. Over
+  // a bare-scalar array (`xs: i32[]`) nothing answers, and the clamp made slot 0 the reply:
+  // an unrelated row where the table has one, an OUT-OF-BOUNDS read where it is empty
+  // (D1500, the D227/D451/D721 hazard `refListSlotOfExprStrict`'s own header names).
   if e is Index {
-    const osl = refListSlotOfExpr(e.idxArr, fnIx)
+    const osl = refListSlotOfExprStrict(e.idxArr, fnIx)
     if osl >= 0 { return rlElemInnerSlot(osl) }
   }
   -1
