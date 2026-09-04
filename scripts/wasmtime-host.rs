@@ -92,7 +92,7 @@ fn main() -> Result<()> {
     })?;
 
     // ── the filesystem floor (`std:fs`) ──────────────────────────────────────
-    // The seven fs imports, registered only when the module declares them. This spike
+    // The nine fs imports, registered only when the module declares them. This spike
     // is not in CI and is built by nothing (see the header) — it carries them because
     // ROADMAP's host-ABI item requires every new import to land in all three hosts, and
     // because a parity harness that cannot instantiate a file-touching module cannot
@@ -236,6 +236,29 @@ fn main() -> Result<()> {
             Ok(())
         })?;
     }
+    if let Some(ft) = fs_ty("__fs_size__") {
+        let e = fs_errno.clone();
+        linker.func_new("imports", "__fs_size__", ft, move |mut c, a, r| {
+            let p = to_path(&bytes_of(&mut c, &a[0])?);
+            // A DIRECTORY is -EISDIR rather than the dirent's own byte count, and a size
+            // past `i64::MAX` is -EFBIG. A size is never negative, so one i64 carries both.
+            let code = match std::fs::metadata(&p) {
+                Ok(m) if m.is_dir() => 31,
+                Ok(m) => match i64::try_from(m.len()) {
+                    Ok(n) => {
+                        *e.lock().unwrap() = 0;
+                        r[0] = Val::I64(n);
+                        return Ok(());
+                    }
+                    Err(_) => 22,
+                },
+                Err(err) => errno_of(&err),
+            };
+            *e.lock().unwrap() = code;
+            r[0] = Val::I64(-i64::from(code));
+            Ok(())
+        })?;
+    }
     if let Some(ft) = fs_ty("__fs_write__") {
         let e = fs_errno.clone();
         linker.func_new("imports", "__fs_write__", ft, move |mut c, a, r| {
@@ -273,6 +296,47 @@ fn main() -> Result<()> {
                         Vec::new()
                     }
                 };
+                r[0] = mk_list(&mut c, &st, &at, &out)?;
+                Ok(())
+            })?;
+        }
+        if let Some(ft) = fs_ty("__fs_read_range__") {
+            let e = fs_errno.clone();
+            let (st, at) = (st.clone(), at.clone());
+            linker.func_new("imports", "__fs_read_range__", ft, move |mut c, a, r| {
+                use std::io::{Read, Seek, SeekFrom};
+                let p = to_path(&bytes_of(&mut c, &a[0])?);
+                let Val::I64(off) = a[1] else {
+                    bail!("__fs_read_range__: expected an i64 offset")
+                };
+                let Val::I32(len) = a[2] else {
+                    bail!("__fs_read_range__: expected an i32 length")
+                };
+                // Short at the end of the file and empty past it, neither being an error;
+                // a negative offset or length is EINVAL.
+                let mut out: Vec<u8> = Vec::new();
+                let mut code = 0i32;
+                if off < 0 || len < 0 {
+                    code = 28;
+                } else {
+                    match std::fs::File::open(&p) {
+                        Err(err) => code = errno_of(&err),
+                        Ok(mut f) => match f.seek(SeekFrom::Start(off as u64)) {
+                            Err(err) => code = errno_of(&err),
+                            Ok(_) => {
+                                if let Err(err) =
+                                    f.take(u64::from(len as u32)).read_to_end(&mut out)
+                                {
+                                    code = errno_of(&err);
+                                }
+                            }
+                        },
+                    }
+                }
+                if code != 0 {
+                    out.clear();
+                }
+                *e.lock().unwrap() = code;
                 r[0] = mk_list(&mut c, &st, &at, &out)?;
                 Ok(())
             })?;

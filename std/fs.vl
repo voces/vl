@@ -1,13 +1,13 @@
-// `std:fs` — reading and writing whole files, and listing directories.
+// `std:fs` — reading and writing files, whole or by byte range, and listing directories.
 //
 //     import { readTextFile, writeTextFile, listDir, IoError } from "std:fs"
 //
 // Errors are VALUES: every fallible export answers `T | IoError` and nothing here
 // traps. These are FREE functions and not methods — the thing operated on is the
 // FILE, so `path` leads and `"a.txt".readTextFile()` is deliberately unspellable.
-// Paths are strings and contents are bytes; text is a decoding on top, which is
-// why `readFile` and `readTextFile` are two functions rather than one with a flag.
-// No path manipulation, no open handles, no partial reads: every read is whole-file.
+// Paths are strings and contents are bytes; text is a decoding on top, which is why
+// `readFile` and `readTextFile` are two functions rather than one with a flag, and
+// why a byte range has no text sibling. No path manipulation, no open handles.
 
 import { Utf8Error, decodeUtf8, decodeUtf8At, encodeUtf8 } from "std:utf8"
 import { toString } from "std:fmt"
@@ -56,8 +56,8 @@ function failed(op: string, path: string, code: i32) {
   "fs." + op + " " + path + ": " + errName(code)
 }
 
-// The errno of the call that just answered empty, as a positive number; 0 when
-// that call did not fail.
+// The errno the last floor call recorded, as a positive number; 0 when it did not
+// fail.
 function lastErrno(): i32 {
   const e = __fs_errno__()
   if e < 0 { return 0 - e }
@@ -99,6 +99,46 @@ export function readTextFile(path: string): string | IoError {
     return { code: EILSEQ, msg: "fs.readTextFile " + path + ": " + text.msg }
   }
   text
+}
+
+// A window of the file as bytes, or why not. `offset` is a byte position from the
+// start of the file and `length` a count of BYTES, not elements. The result is
+// shorter than `length` near the end of the file, and empty at or past it or whenever
+// `length` is 0 — none of which is an error; a negative `offset` or `length` is `EINVAL`.
+export function readFileRange(
+  path: string,
+  offset: i64,
+  length: i32,
+): u8[] | IoError {
+  if path.length == 0 {
+    return { code: EINVAL, msg: emptyPathMsg("readFileRange") }
+  }
+  if offset < 0 || length < 0 {
+    return {
+      code: EINVAL,
+      msg: "fs.readFileRange " + path + ": a negative offset or length",
+    }
+  }
+  const r = __fs_read_range__(encodeUtf8(path), offset, length)
+  // Empty is the floor's failure signal, an empty window, and the end of the file
+  // alike; the errno is what separates the first from the other two.
+  if r.length == 0 {
+    const e = emptyErrno()
+    if e != 0 { return { code: e, msg: failed("readFileRange", path, e) } }
+  }
+  r
+}
+
+// The file's size in bytes, or why not. Ask it before `readFile`, which allocates the
+// whole file, and to address a window near the END, which `readFileRange`'s
+// from-the-start offset cannot. A directory answers `EISDIR` rather than a size.
+export function fileSize(path: string): i64 | IoError {
+  if path.length == 0 { return { code: EINVAL, msg: emptyPathMsg("fileSize") } }
+  const n = __fs_size__(encodeUtf8(path))
+  if n >= 0 { return n }
+  let code = lastErrno()
+  if code == 0 { code = EIO }
+  { code: code, msg: failed("fileSize", path, code) }
 }
 
 // Replace the file's contents with `data`. Answers `null` on success, since a

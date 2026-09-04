@@ -35,4 +35,4 @@ D1500-D1509  vl-d2 filed, vl-cb fixing  2026-09-03  VL-016, the compiler trap (D
 D1520-D1539  vl-d2 glean agent  2026-09-03  VL-003, VL-004, VL-005
 D1540-D1559  vl-d2  2026-09-03  sampler triage
 D1560-D1579  vl-cb  2026-09-03  glean rows VL-025 (D1560), sampler residue (D1561, D1562), glean VL-021 (D1570) and VL-015 (D1571)
-D1580-D1599  vl-cb  2026-09-04  glean JASS-front-end rows VL-031..VL-035 and follow-ups
+D1600-D1619  vl-cb  2026-09-04  glean VL-046 (D1600), the comment sweep's residue rows and follow-ups
