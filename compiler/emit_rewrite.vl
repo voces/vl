@@ -127,6 +127,7 @@ import {
   exprIsClosure,
   exprReReadable,
   fnIndexOf,
+  letDeclIsClosureNoLocal,
   nameIsWholeSpanShape,
   resolveShapeToNominal,
   sFieldIndex,
@@ -136,6 +137,7 @@ import {
   synthTypeRefTy,
   tyStructHasMapField,
 } from "./emit_classify"
+import { paramIsClosure, paramNulClosure } from "./emit_query"
 
 // ── self-method / operator / index-trap dispatch rewrite ─────────────────────
 // The host resolves these in its type-aware parser; the native parser is
@@ -164,6 +166,21 @@ export function drwSelfFnOf(name: string, argc: i32) {
   -1
 }
 
+// The closure-typed `let`/`const` names the walk has open, innermost last, truncated when
+// a block ends. This pass runs before `buildLocals`, so the locals registry cannot say
+// which binding a call denotes and the walk's own scope has to (D1602).
+const drwCloNames: string[] = []
+
+// Is a closure `let`/`const` of `name` open at the walk's current point?
+function drwCloShadowed(name: string) {
+  let i = 0
+  while i < drwCloNames.length {
+    if drwCloNames[i] == name { return true }
+    i = i + 1
+  }
+  false
+}
+
 // Normalizes a direct call to its callee's full arity, appending the declaration's
 // default expressions for the trailing arguments the call omitted — runs before
 // monomorphization, so every later pass sees an ordinary full-arity call and no
@@ -175,6 +192,12 @@ function drwFillDefaults(ix: i32, ctx: i32) {
     if cf is Ident {
       const fe = fnIndexOfInScopeChain(cf.identName, ctx)
       if fe < 0 { return 0 }
+      // A closure binding of the name is what the call denotes, so the module function's
+      // defaults are not this call's: filling them hands the closure an argument its
+      // signature has no parameter for (D1602).
+      if paramIsClosure(ctx, cf.identName) { return 0 }
+      if paramNulClosure(ctx, cf.identName) { return 0 }
+      if drwCloShadowed(cf.identName) { return 0 }
       const fn = P.nodes[fnStmts[fe]]
       if fn is FuncDecl {
         const ps = fn.fnParams
@@ -395,10 +418,18 @@ function drwWalk(ix: i32, ctx: i32) {
   if n is Block {
     const bs = n.blkStmts
     let i2 = 0
+    // A closure binding opens where it is declared and closes with the block, so the
+    // stack grows as the statements are walked and truncates on the way out.
+    const cloMark = drwCloNames.length
     while i2 < bs.length {
+      const bst = P.nodes[bs[i2]]
+      if bst is LetDecl {
+        if letDeclIsClosureNoLocal(bs[i2]) { drwCloNames.push(bst.letName) }
+      }
       bs[i2] = drwBareBlock(drwWalk(bs[i2], ctx))
       i2 = i2 + 1
     }
+    while drwCloNames.length > cloMark { drwCloNames.pop() }
     return ix
   }
   if n is LetDecl {
@@ -634,7 +665,10 @@ export function dispatchRewrite(stmts: i32[]) {
   let fe = 0
   while fe < fnStmts.length {
     const fn = P.nodes[fnStmts[fe]]
-    if fn is FuncDecl { fn.fnBody = drwWalk(fn.fnBody, fnStmts[fe]) }
+    if fn is FuncDecl {
+      drwCloNames.clear()
+      fn.fnBody = drwWalk(fn.fnBody, fnStmts[fe])
+    }
     fe = fe + 1
   }
   0
