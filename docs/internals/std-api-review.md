@@ -33,11 +33,11 @@ taste.
 
 | convention | evidence |
 | --- | --- |
-| **`self` first, so exports read as UFCS methods** | `array.indexOf(self: T[], needle)`, `fmt.join(self: string[], sep)`, `buffer.loadI32(self: Buf, off)`, `utf8.encodeUtf8(self: string)` — and `fmt.vl`'s header says so outright |
+| **`self` first, so exports read as UFCS methods** | `array.indexOf(self: T[], needle)`, `fmt.join(self: string[], sep)`, `buffer.loadI32(self: Buf, off)`, `utf8.encodeUtf8(self: string)` — and `array.vl`'s and `str.vl`'s headers say so outright (`fmt.vl`'s did until the 2026-09-03 audience rewrite deleted the sentence: the third time this row has gone stale, and the first time it went stale in the same commit that rewrote the file beneath it) |
 | **lowerCamelCase**, except a constructor | `Buffer(byteLength: i32): Buf` is the one capitalised export |
 | **generic in the element type** where it varies | all of `array.vl` |
-| **union returns are ALWAYS explicit; scalar returns are usually elided** | re-measured 2026-09-01 across all **123** std exports — the counting rule, stated because two reviewers derived two numbers from it: `grep -h '^export' std/*.vl` gives 124 statements, minus `std/seed.vl`'s `stdSmoke` (a smoke hook, not a surface); count exported NAMES and it is 126. The row said 77 and 10 of 10 when std was smaller, then 12 of 12 over 121 before `std:fmt`'s integer parsers. **14 of 14** union-returning exports annotate — `decodeUtf8`, `decodeUtf8At`, `readFile`, `readTextFile`, `writeFile`, `writeTextFile`, `listDir`, `pathKind`, `pathExists`, `programArgs`, `parseF64`, `parseI64`, `parseI32`, `decodeBase64` — while `utf8Length`/`join`/`repeat`/`padLeft`/`toString` elide. Check the union half — it is exceptionless. The scalar half is taste, not convention. (`toString`'s union is in its PARAMETER, which this row does not govern.) |
-| **the module header explains WHY and names what it does NOT do** | `base64.vl`: *"WHAT IS NOT HERE: the URL-safe alphabet … when one arrives it gets its OWN NAME, never a boolean parameter"*. (`fmt.vl` used to be the example here, for *"f64→string … is deliberately absent"* — that deferral was spent on 2026-09-01, and a citation going stale is itself the reason to re-read the header rather than the rubric.) |
+| **union returns are ALWAYS explicit; scalar returns are usually elided** | **QUOTE THE COMMAND, NOT THE NUMBER** — this row's counts have been re-derived four times and three of the four were stale within a month. `grep -h '^export' std/*.vl` gives **128** statements (2026-09-03), minus `std/seed.vl`'s `stdSmoke` (a smoke hook, not a surface); an exported-NAMES count is a different number again, because of the four `"[]"`/`"[]="` operator forms and the re-exports in `std:args` and `std:fmt`. The half that IS the convention is exceptionless and worth checking: **16 of 16** union-returning exports annotate — `decodeUtf8`, `decodeUtf8At`, `readFile`, `readTextFile`, `writeFile`, `writeTextFile` (both via the `IoResult` alias), `listDir`, `pathKind`, `pathExists`, `programArgs`, `parseF64`, `parseI64`, `parseI32`, `decodeBase64`, `parseJson`, `toJson` — while `utf8Length`/`join`/`repeat`/`padLeft`/`toString`/`decodeUtf8Lossy` elide. The scalar half is taste, not convention. (`toString`'s union is in its PARAMETER, which this row does not govern.) |
+| **the module header names what the module does NOT do** | `base64.vl`: *"The URL-safe alphabet is not here; when it arrives it gets its own name rather than a boolean parameter."* (`fmt.vl` used to be the example here, for *"f64→string … is deliberately absent"* — that deferral was spent on 2026-09-01, and a citation going stale is itself the reason to re-read the header rather than the rubric. The `base64.vl` line was re-quoted on 2026-09-03 for the same reason: §4's audience rewrite reworded it.) |
 | **a width-suffixed family stays uniform** | `loadI8/loadU8/loadI16/loadU16/loadI32/loadI64/loadF32/loadF64` |
 
 **The name must be self-sufficient in a flat namespace.** VL has **no namespace import**
@@ -50,15 +50,23 @@ import is load-bearing here — do not "simplify" it away.
 
 ## 2. Patterns to be critical of
 
-Each is **allowed with a stated reason in the module header**. A reviewer who finds one
-without a reason should ask for the reason, not the removal.
+Each is **allowed with a stated reason** — and §4 decides WHERE that reason lives. A
+deviation a CALLER can see keeps its one line in the module header (`std:buffer`'s
+LIFO/dangling contract, `std:fs`'s non-`self`-first spelling, `std:str`'s ASCII-only
+`trim`): the caller meets it, so the caller is told. A deviation a caller cannot see moves
+to `docs/internals/std-notes.md` in full — `std:fs`'s errno global is the worked case,
+since `__fs_errno__` is not exported and nothing about the surface changes because of it.
+A reviewer who finds a deviation with no reason anywhere should ask for the reason, not
+the removal.
 
 - **Ambient/stateful APIs.** A result that depends on a previous call, or on a global.
   Present in std twice and both are justified in place: `bufferMark()`/`bufferRelease(mark)`
   is a LIFO arena whose whole point is the ambient stack, and `std:fs`'s errno read exists
-  only because `u8[] | i32` does not lower yet (#1806) — with a comment saying so and a
-  note that the swap is three lines. **The test is whether the header names the constraint
-  that forced it.**
+  only because `u8[] | i32` did not lower when it was written (#1806). **The test is
+  whether the constraint that forced it is named where §4 puts it** — the header when a
+  caller can see the deviation, `std-notes.md` when only a maintainer can. `bufferMark`'s
+  ambient stack is in the header because every caller pairs the two calls; `std:fs`'s errno
+  is in `std-notes.md` because no signature mentions it.
 - **Order-dependent calls.** If `b` is only valid after `a`, the types should say so where
   they can, and the header must where they cannot.
 - **Boolean parameters.** `f(path, true)` is unreadable at the call site. Prefer two
@@ -118,17 +126,56 @@ without a reason should ask for the reason, not the removal.
 
 ---
 
-## 4. Documentation
+## 4. Documentation — a std comment is written for a CONSUMER, and it is API surface
 
-The house style is dense and explanatory, and it is a **review criterion, not a courtesy**:
+**The audience is the person who imports the module, not the person who maintains the
+compiler.** This is a review criterion, not a courtesy: a std comment ships with the
+name, and a name is close to permanent. Owner ruling, 2026-09-03 — the module headers had
+grown into internal commentary (defect ids, PR numbers, dates, arguments with earlier
+versions of the file), which is the wrong audience for the one file a caller actually
+reads.
 
-- The module header states what the module is, what it is built on, and **what it
-  deliberately does not do**.
-- Every non-obvious decision carries its WHY at the point of the decision.
-- Failure modes are stated. `std:buffer` says a `Buf` held across a release is *"a dangling
-  reference into linear memory: silent corruption, not a trap"* — that sentence is the
-  standard to match.
-- Where a measurement drove the design, the number is in the comment.
+The rule, and `std-comment-audience` in `compiler/lint.vl` enforces the mechanical half of
+it (scoped by module path — the `std:` key, or a target rooted at `std/` — tier `warning`,
+**no baseline**: it lands and stays at zero, so a regression reds `lint-self.sh` outright):
+
+1. **The module header is at most 10 lines**: what the module is for, how to import it, and
+   any one-line contract the whole module shares — plus **what it deliberately does not
+   do**, which is the one thing the old style got right. No history, no defect ids, no PR
+   numbers, no dates, no "used to", no mechanism, no argument with a previous version.
+2. **Every `export` carries a doc comment of 1 to 4 lines directly above it**: what it does,
+   what its arguments mean, what it returns, and the edge case a caller must know — empty
+   input, null, not-found, in-place vs copy, traps, allocates. Present tense, written for a
+   caller, with no internal vocabulary (no reps, arenas, emitters, kinds, rows, hints). A
+   FAMILY comment on the first member counts for the rest of the family (`std:fs`'s errno
+   constants, `std:buffer`'s four bracket forms); a family whose members differ in a way a
+   caller acts on gets a line each (`loadI8` answers -1 where `loadU8` answers 255).
+3. **A non-exported helper is NOT API surface**, so the audience rule and the 4-line budget
+   do not bind it: give it what a maintainer needs in order not to break it, normally 1 to 4
+   lines, and CLAUDE.md's standing comment rule governs the rest. What DOES bind it is the
+   ban in rule 4 — a private helper cites no row id, PR number, date or compiler vocabulary
+   either, because it sits in the same file a caller reads.
+4. **Anything true about the COMPILER rather than the API leaves std entirely.** Why a shape
+   was chosen, what a defect did, which row graded it, what a refused candidate cost: it
+   goes to `docs/internals/std-notes.md`, one section per module. **std does not link
+   there** — the pointer goes one way, so a caller never lands in the internals.
+5. **A contract is an API fact and STAYS** — as one or two consumer-facing lines on the
+   declaration it belongs to, never as a paragraph. `array.reverse` is not in place;
+   `JsonError.path` names the container on parse and the value on render; `programArgs` is
+   `std:args`'s whole surface; `std:buffer`'s hoisted accessors are not `self`-first (a base
+   is an address, not a receiver, so `b.getF32At(n, i)` is a type error); a `Buf` held across a
+   release is *"a dangling reference into linear memory: silent corruption, not a trap"* —
+   that sentence is still the standard to match, and it is one line.
+
+**What the reviewer checks.** Does every export have a doc comment? Does each one name its
+edge case? Does any comment cite a row, a PR, a date, or how the compiler works? Is the
+header something a caller could read in twenty seconds and know whether this is the module
+they want?
+
+**The lint is not the rubric.** It catches a header over 10 lines, a doc comment over 4
+lines on an export, and a line citing a row id, a PR number, a date or compiler vocabulary.
+It cannot tell whether a comment is *useful*, whether an export is documented at all, or
+whether the edge case named is the one that bites. That half is the review's.
 
 ---
 

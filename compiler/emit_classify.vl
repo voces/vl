@@ -9971,11 +9971,19 @@ export function sFieldTgtStructIdx(si: i32, fi: i32): i32 {
   structIndexByName(sFieldElemNameAt(si, fi))
 }
 
-// The `sFieldTgtStructIdx` twin for a VARIANT's nested-struct field.
+// The `sFieldTgtStructIdx` twin for a VARIANT's nested-struct field, with one rung the struct
+// side does not need: the ARM TWIN (D1518). `fieldRefElemName` records a code-15 field's target
+// under the twin ROW'S name where it can, but a variant's fields are recorded from `collectU`,
+// before the struct table exists — so an arm-typed field banks the ARM's own name and no
+// `sNames` row ever carries it. `armFieldStructRow` is the same resolver that column would have
+// used, asked one phase later, when the mint has run.
 export function uFieldTgtStructIdx(vi: i32, fi: i32): i32 {
   const a = structIndexOfTy(uFieldElemTyIxAt(vi, fi))
   if a >= 0 { return a }
-  structIndexByName(uFieldElemName[uFieldStart[vi] + fi])
+  const nm = uFieldElemName[uFieldStart[vi] + fi]
+  const bn = structIndexByName(nm)
+  if bn >= 0 { return bn }
+  armFieldStructRow(nm)
 }
 
 // True if struct `si`'s field `fi` is a literal-union ATOM field (code 0 whose recorded elem name
@@ -19350,6 +19358,11 @@ function fieldCodeOfSpelling(t: string, litNode: i32) {
   // ONE spelling ladder all three refusal sites reach, so the declared, the inline-shape and
   // the generic-instance spellings of one field cannot answer differently.
   if armFieldStructRow(base) >= 0 { return 15 }
+  // THE SAME FIELD ONE PHASE EARLIER (D1518). The rung above reads the struct table; a field
+  // on a declaration that is ITSELF a union arm is coded from `collectU`, where that table
+  // does not exist yet, so the arm's row has not been minted and the rung declines. The pure
+  // predicate says the mint WILL answer, and `collectNestedFieldShapes` is what owes it.
+  if armFieldDeferredRowOk(base) { return 15 }
   // D1293 — THE ARENA, once every NAME arm has declined. `nameIsNulRefList` resolves its
   // element through the struct/union TABLES and `collectU` runs before `collectS` builds
   // them, so an `S[] | null` VARIANT-ARM field coded -1 while the identical field on a plain
@@ -22351,6 +22364,97 @@ export function variantNestedShapeOk(nm: string): boolean {
     fi = fi + 1
   }
   okAll && fieldCount > 0
+}
+
+// THE ARM'S RENDER, SPELLED THE WAY THE ARM'S OWN ROW IS CODED (silent-class-inventory D1093).
+// `tyToEmitName` renders a field's INLINE literal union faithfully and `internInlineShapeTy`
+// codes that text through the NAME ladder, where `nameIsLitUnionType` claims it as the interned
+// i32 ATOM (code 0). The VARIANT recorder codes the SAME field from the annotation NODE, where
+// canon has softened it, so it codes 3 — and 3 is what the arm's wasm struct is laid out with.
+// `variantStructHeapTwinAt` compares the two tables' codes POSITIONALLY, so the mint could never
+// be recognised as the arm's own row and a field typed as that arm had no rep.
+//
+// NOT A REP CHANGE AND IT DOES NOT SOFTEN THE TYPE: the checker type keeps its member set, the
+// VARIANT row keeps the unsoftened text in the IDENTITY column, and the emitted slot is the
+// string ref it was. What softens is the anonymous ROW'S OWN KEY, which must describe the layout
+// it carries. The render is returned UNCHANGED unless a field actually substitutes.
+export function armMintShapeName(nm: string) {
+  if !nameIsShapeSpanEnds(nm) { return nm }
+  const fnames: string[] = []
+  const ftexts: string[] = []
+  shapeInnerFieldSplit(groupInnerOf(nm), fnames, ftexts)
+  let changed = false
+  let out = "{"
+  let i = 0
+  while i < fnames.length {
+    if i > 0 { out = out + "," }
+    let tx = ftexts[i]
+    if nameIsInlineLitUnion(tx) {
+      tx = "string"
+      changed = true
+    }
+    out = out + fnames[i] + ":" + tx
+    i = i + 1
+  }
+  if !changed { return nm }
+  out + "}"
+}
+
+const armDeferStack: string[] = []
+
+// THE ARM'S STRUCT ROW, ONE PHASE BEFORE IT EXISTS (D1518) — the PURE mirror of
+// `collectNestedFieldShapes`'s arm-field mint, the way `variantNestedShapeOk` mirrors
+// `internInlineShape`. `armFieldStructRow` reads the struct table, and `collectVariantFields`
+// codes an arm's fields during `collectU`, which runs BEFORE `collectS` builds it — so a field
+// typed as an arm, on a declaration that is ITSELF an arm, had no code in one declaration order
+// and a code whose target row never existed in the other. Acceptance here OBLIGATES the mint,
+// which is why that pass now walks every `TypeDecl`'s fields rather than only a non-arm's, and
+// it renders through the SAME `armMintShapeName` the mint interns so the two cannot disagree.
+export function armFieldDeferredRowOk(base: string): boolean {
+  const vi = variantIndexOf(base)
+  if vi < 0 { return false }
+  if vi >= uVarTyIx.length { return false }
+  const aty = uVarTyIx[vi]
+  if aty < 0 { return false }
+  // THE RE-ENTRANCY STACK (`repCanonKey`'s idiom, and for the same reason). The predicate
+  // below codes the arm's own fields through `nameFieldCode`, which walks back into the
+  // spelling ladder and reaches this rung again — so a SELF-REFERENTIAL arm
+  // (`type A = {f: A | null}` as an arm of `A | E`) asked about itself forever and the
+  // compiler TRAPPED rather than refusing. Declining on re-entry keeps that arm's existing
+  // loud refusal instead of inventing a row whose layout is not finished being decided.
+  let g = 0
+  while g < armDeferStack.length {
+    if armDeferStack[g] == base { return false }
+    g = g + 1
+  }
+  armDeferStack.push(base)
+  const ok = armPlainLayoutShapeOk(armMintShapeName(tyToEmitName(aty)))
+  armDeferStack.pop()
+  ok
+}
+
+// The arm render's fields, coded, WITH `variantStructHeapTwinAt`'s OWN LAYOUT GUARD APPLIED.
+// That guard declines a merge for an arm carrying a ref the code does not name (5 / 15 / 28),
+// so an arm with one shares no heap with any struct row — and admitting it above would code the
+// field 15 against a row the arm does not emit: check-clean INVALID WASM, which is exactly what
+// a gate narrowed ahead of its lowering buys (D965's shape, D1518's own measurement). This is
+// stricter than `variantNestedShapeOk` on purpose: that predicate answers "will this INTERN",
+// this one "will the interned row BE the arm's".
+function armPlainLayoutShapeOk(nm: string): boolean {
+  if !nameIsShapeSpanEnds(nm) { return false }
+  const fnames: string[] = []
+  const ftexts: string[] = []
+  shapeInnerFieldSplit(groupInnerOf(nm), fnames, ftexts)
+  if fnames.length == 0 { return false }
+  let fi = 0
+  while fi < fnames.length {
+    if fnames[fi] == "" { return false }
+    const c = nameFieldCode(ftexts[fi])
+    if c < 0 { return false }
+    if c == 5 || c == 15 || c == 28 { return false }
+    fi = fi + 1
+  }
+  true
 }
 
 // Intern the PLAINLY-LOWERABLE inline shapes buried in the params / result of a function-type
