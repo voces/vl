@@ -242,17 +242,34 @@ Annotating `v`, or spelling the union inline, each make it run; `is`-narrowing i
 shared read makes it check-clean invalid wasm. Not filed — no reserved id left in this
 session's block — and listed here for triage.
 
+### Taken by the coordinator's triage — D1515, D1516, D1517 (closed)
+
+The three the coordinator took are closed, and **two of the three lines below were wrong
+about their own witness** — which is why each was re-minimised against a FRESH seed before
+being fixed. The sampler is right; a hand-written summary of it goes stale like any other
+citation, and one of the three had already closed under it.
+
+* **D1515** was filed as "reached through `pass<T>`". The generic pin is SCENERY: the
+  ingredient is the list's PRODUCER — a call result or a bound list rather than an array
+  literal of object literals — and the filed witness itself had already closed with D1443 by
+  the time it was re-run.
+* **D1516** was filed as "two hole parameters in a chain". That shape does refuse, and so
+  does a single hole fed by any PROJECTION (`xs[0]`, `b.it`, `m[k] ?? d`); the chain is one
+  member of that family, not the family.
+* **D1517** was filed as "over a module-scope global … the same program inside a function
+  runs". It refuses at every scope. The ingredient is the `??` fused onto an `as?` whose
+  target arm is NUMERIC — `as? string` and `as? boolean` run, their `T | null` being a niche
+  that needs no box row.
+
 ### Not filed — for the coordinator to triage
 
 Each was minimised and ablated; none is filed here, either because it is a documented
 inference limit, because both spellings fail, or because the session ran out of reserved
 ids. Cited by the pair that produced them; every one still reproduces on `d109927a`.
+**Re-minimise against a fresh seed before scheduling one** — see the three above.
 
 | what | witness (minimised) | note |
 | --- | --- | --- |
-| `emitProgram: object literal field count does not match struct` — an inferred struct-field or list-element destination reached through `pass<T>` | `const box = { item: pass([{ name: "ada", n: 3 }]) }` / `box.item[0].n` | annotating the destination runs; direct (unpinned) runs |
-| `emitProgram: monomorphize: unsupported argument type for 'p' in a call` — two hole parameters in a chain | `take(passh(mkval()))` with `take(p)` and `passh(x)` both un-annotated, value `i32 \| null` or a struct union | annotating EITHER runs; `pass<T>` also runs |
-| `emitProgram: union box atom test on a union with no recorded members` — `as?` over a module-scope global of a value union | `const gv = mkval()` (`i32 \| string`) then `gv as? i32 ?? -1` inside a function | `is i32` and a bare read both run — the `as?` spelling is the ingredient |
 | `emitProgram: ref valtype with no interned shape` — a nullable struct through a hole param into an inferred struct field | `const box = { item: passh(mkval()) }`, `box.item`, `!= null` | annotating the destination runs |
 | `emitProgram: only i32 locals are supported` — a literal union spelled INLINE, read out of a list element and `==`-narrowed inside a block | `const arr: ("red" \| "green")[] = [mkval()]` / `arr[0]` / `== "red"` | the `type Color` spelling runs; at MODULE scope the same program is check-clean invalid wasm instead |
 | `emitProgram: object literal matches no union variant` — a struct through a hole param into an inferred struct field | `const box = { item: passh({ name: "ada", n: 3 }) }` / `box.item.name` | direct runs; `pass<T>` refuses differently |
