@@ -9,10 +9,17 @@ only FALL: `--check` fails when a file exceeds its baseline, `--write-baseline`
 lowers it after a ladder is closed. Sibling of scripts/comment-budget.py and
 scripts/scan-budget.py; see CLAUDE.md, "A LADDER OVER A CLOSED KIND SET".
 
-Why a ratchet and not a gate at zero: 440 of these stand today, and most are a
-resolver that legitimately answers about three of thirty-seven node kinds. What
-the rule buys is that a NEW one has to say what it excludes, and that the number
-never goes up.
+Why a ratchet and not a gate at zero: most of these are a resolver that
+legitimately answers about three of thirty-seven node kinds. What the rule buys
+is that a NEW one has to say what it excludes, and that the number never goes up.
+
+WHY THE FLOOR IS TWO ARMS, AND WHAT RAISING IT WOULD DROP. D1370's ladder —
+`captureValKind`, `Param` and `LetDecl` and a silent `"i32"` for a module-BLOCK
+capture — has EXACTLY TWO ARMS, so a floor of three cannot see it and the row
+that motivated this rule would go unreported. A floor of one reports the
+`const n = P.nodes[ix]; if n is X { … }` guard idiom, which is not a dispatch at
+all. The baseline carries the same sentence in `why_min_arms`, beside the number
+it explains; raise the floor only knowingly, and re-read D1370 first.
 
 The analysis itself lives in scripts/ladder-census.py — one implementation, two
 front ends, so the census a reader runs and the number the gate reads cannot
@@ -31,6 +38,14 @@ LINT = os.path.join(ROOT, "compiler", "lint.vl")
 INCOMPLETE = "kind-ladder-incomplete"
 SPLIT = "kind-ladder-split"
 CODES = (INCOMPLETE, SPLIT)
+# Committed INTO the baseline beside `min_arms`, so a future tidy-up raising the floor
+# reads the row it would drop in the very file it is editing.
+WHY_MIN_ARMS = (
+    "D1370's ladder (captureValKind: Param, LetDecl, and a silent \"i32\" for a "
+    "module-block capture) has EXACTLY TWO ARMS, so a floor of 3 cannot see it. A "
+    "floor of 1 reports the `if n is X` guard idiom, which is not a dispatch. Raise "
+    "the floor only knowingly, and re-read D1370 first."
+)
 
 
 def census():
@@ -111,6 +126,7 @@ def write_baseline(cur):
     body = "\n".join([
         "{",
         f'"min_arms": {census().MIN_ARMS},',
+        f'"why_min_arms": {json.dumps(WHY_MIN_ARMS)},',
         f'"total": {json.dumps(total)},',
         '"files": {',
         ",\n".join(rows),
