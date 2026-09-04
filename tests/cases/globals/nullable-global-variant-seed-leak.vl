@@ -1,0 +1,85 @@
+// @run
+// @log 7
+// @log 0
+// @log 3
+// @log 5
+// @log 0
+// @info `c` is never reassigned; use `const` instead of `let`
+// @info `d` is never reassigned; use `const` instead of `let`
+// @hint redundant type annotation: `go` is inferred as `i32` — remove it to lean on inference
+// @hint redundant type annotation: `getC` is inferred as `i32` — remove it to lean on inference
+// @hint redundant type annotation: `assignBoth` is inferred as `i32` — remove it to lean on inference
+// @hint redundant type annotation: `sameArm` is inferred as `i32` — remove it to lean on inference
+// @hint redundant type annotation: `readD` is inferred as `i32` — remove it to lean on inference
+// THE VARIANT TWIN of `nullable-global-seed-leak.vl` (D1563; reported by the glean session
+// as VL-029). That file pinned `pendingNulRefHeap` leaking from one global to the next;
+// `pendingVariantIdx` leaked the same way and out of THREE boundaries, not one.
+//
+// `emitNullLitNode` reads the variant seed BEFORE `pendingStructIdx` and does not consume
+// it (deliberately — a tail-position `null` needs it to persist), so whoever arms it owes
+// the clear. The `let` and return boundaries pay; the two global-init loops and
+// `emitAssign`'s `global.set` arm did not. A `T | null` cell whose `T` is an arm of
+// `T | E` therefore left the arm armed, and the NEXT nullable-struct global's bare `null`
+// lowered as `ref.null $T` into a `(ref null $C)` cell: `type mismatch: expected (ref null
+// $type), found (ref null $type)` with BOTH names elided, `vl check` clean.
+//
+// Order is load-bearing in both directions: the ARM cell must come first and the victim
+// second, and the two struct types must DIFFER (identical field lists are still distinct
+// heap types — same rec group, different index).
+
+type E = { msg: string }
+type T = { n: i32, m: i32 }
+type C = { a: i32, b: i32 }
+type D = { p: i32, q: i32 }
+
+function mk(x: i32): T | E {
+  if x < 0 { return { msg: "no" } }
+  return { n: x, m: x }
+}
+
+// (1) THE FILED SHAPE — the arm-typed global's `= null` init arms the seed in the START
+// FUNCTION's loop, and `c`'s own `= null` took it.
+let t: T | null = null
+let c: C | null = null
+
+export function go(x: i32): i32 {
+  const r = mk(x)
+  if r is E { return 0 }
+  t = r
+  r.n
+}
+export function getC(): i32 { if c != null { c.a } else { 0 } }
+print(go(7))
+print(getC())
+
+// (2) THE ASSIGNMENT POSITION — `t = r` arms the seed inside a function body, where the
+// declaration order above is already safe, so this cell survives the swap that rescues (1).
+let c2: C | null = null
+function assignBoth(x: i32): i32 {
+  const r = mk(x)
+  if r is E { return 0 }
+  t = r
+  c2 = null
+  r.n
+}
+print(assignBoth(3))
+
+// (3) CONTROL — a second global of the SAME arm type ran on master and must keep running:
+// the seed and the cell agree there, which is what makes "two nullable globals" the wrong
+// name for this family and "two DIFFERENT struct rows" the right one.
+let t2: T | null = null
+function sameArm(x: i32): i32 {
+  const r = mk(x)
+  if r is E { return 0 }
+  t2 = r
+  r.n
+}
+print(sameArm(5))
+
+// (4) a THIRD struct row, declared after both, read through its own guard.
+let d: D | null = null
+function readD(): i32 {
+  if d != null { return d.p }
+  0
+}
+print(readD())
