@@ -190,6 +190,7 @@ import {
   gF64PrintIdx,
   gFsIdx,
   gFsUse,
+  gHelpF64Rem,
   gHelpMapProbe,
   gHelpMapProbeI32,
   gHelpMapResize,
@@ -204,6 +205,7 @@ import {
   gMemLogIdx,
   gNeedsF32Print,
   gNeedsF64Print,
+  gNeedsF64Rem,
   gNeedsI64Print,
   gPromoInStart,
   gPromoOk,
@@ -387,6 +389,7 @@ import {
   applyPushPopBits,
   asExprNumFallible,
   asExprNumTgtName,
+  binRemFloatNeed,
   blockHasCallRef,
   blockHasMapOp,
   blockHasStrOp,
@@ -3210,6 +3213,125 @@ function emitMapResizeFnCode(out: i32[]) {
   helpFrameBody(out, body)
 }
 
+// `__f64_rem__(x, y) -> f64`: the TRUNCATED remainder — `x - y * trunc(x / y)` in value,
+// with the sign of the DIVIDEND. Rust's `f64::rem`, JavaScript's `%` and C's `fmod` are the
+// same function, and wasm has no instruction for it (D1586).
+// Params: x(0), y(1). Locals: a(2), b(3), t(4), s(5, a scratch).
+//
+// EXACT, NOT `x - y * trunc(x / y)` EVALUATED. That identity is off by an ulp wherever the
+// quotient passes 2^53 and overflows at the top of the range, so this is the scaled
+// repeated-subtraction form instead: double `b` to the largest `b * 2^k <= a`, then halve
+// back down subtracting where it fits. Both steps are EXACT — doubling and halving a binary
+// float move only the exponent, and each subtraction lands in Sterbenz's range (`t <= a < 2t`
+// is the loop's invariant), so no rounding enters and the answer is the true remainder.
+function emitF64RemFnCode(out: i32[]) {
+  const body: i32[] = []
+  const prev = wTarget(body)
+  wULEB(1) // one locals run
+  wULEB(4) // four of them
+  wU8(124) // 0x7c f64 — a, b, t, s
+  // x NOT FINITE (NaN or ±inf) → NaN. `v - v` is NaN for both and 0 for every finite v,
+  // which is the whole finiteness test and needs no `inf` constant to compare against.
+  fbLocalGet(0)
+  fbLocalGet(0)
+  fbI32Bin(161) // 0xa1 f64.sub
+  fbLocalTee(5)
+  fbLocalGet(5)
+  fbI32Bin(98) // 0x62 f64.ne
+  fbIf(64)
+  fbF64Const("0.0")
+  fbF64Const("0.0")
+  fbI32Bin(163) // 0xa3 f64.div — 0/0 is the NaN this returns
+  fbReturn()
+  fbEnd()
+  // b = |y|; y NaN, or y zero → NaN. The NaN arm is separate because `|NaN| == 0.0` is FALSE.
+  fbLocalGet(1)
+  fbI32Bin(153) // 0x99 f64.abs
+  fbLocalTee(3)
+  fbF64Const("0.0")
+  fbI32Bin(97) // 0x61 f64.eq
+  fbLocalGet(1)
+  fbLocalGet(1)
+  fbI32Bin(98) // 0x62 f64.ne
+  fbI32Bin(114) // 0x72 i32.or
+  fbIf(64)
+  fbF64Const("0.0")
+  fbF64Const("0.0")
+  fbI32Bin(163) // 0xa3 f64.div
+  fbReturn()
+  fbEnd()
+  // y INFINITE → x. y is not NaN by here, so the same `v - v` test names ±inf alone.
+  fbLocalGet(1)
+  fbLocalGet(1)
+  fbI32Bin(161) // 0xa1 f64.sub
+  fbLocalTee(5)
+  fbLocalGet(5)
+  fbI32Bin(98) // 0x62 f64.ne
+  fbIf(64)
+  fbLocalGet(0)
+  fbReturn()
+  fbEnd()
+  // a = |x|; |x| < |y| → x itself, which is what carries `-0.0 % 1` through unharmed (D1586).
+  fbLocalGet(0)
+  fbI32Bin(153) // 0x99 f64.abs
+  fbLocalTee(2)
+  fbLocalGet(3)
+  fbI32Bin(99) // 0x63 f64.lt
+  fbIf(64)
+  fbLocalGet(0)
+  fbReturn()
+  fbEnd()
+  // SCALE UP: t = b, doubling while `t * 2 <= a`. A double that overflows lands on +inf,
+  // which is `> a` for every finite a, so the loop exits rather than looping forever.
+  fbLocalGet(3)
+  fbLocalSet(4)
+  fbBlock(64)
+  fbLoop(64)
+  fbLocalGet(4)
+  fbF64Const("2.0")
+  fbI32Bin(162) // 0xa2 f64.mul
+  fbLocalTee(5)
+  fbLocalGet(2)
+  fbI32Bin(100) // 0x64 f64.gt
+  fbBrIf(1)
+  fbLocalGet(5)
+  fbLocalSet(4)
+  fbBr(0)
+  fbEnd()
+  fbEnd()
+  // DESCEND: subtract t where it fits, halve, stop at t == b. `a < 2t` holds at every step,
+  // so each subtraction is exact and `a` ends in [0, b) — the remainder's magnitude.
+  fbBlock(64)
+  fbLoop(64)
+  fbLocalGet(2)
+  fbLocalGet(4)
+  fbI32Bin(102) // 0x66 f64.ge
+  fbIf(64)
+  fbLocalGet(2)
+  fbLocalGet(4)
+  fbI32Bin(161) // 0xa1 f64.sub
+  fbLocalSet(2)
+  fbEnd()
+  fbLocalGet(4)
+  fbLocalGet(3)
+  fbI32Bin(97) // 0x61 f64.eq
+  fbBrIf(1)
+  fbLocalGet(4)
+  fbF64Const("0.5")
+  fbI32Bin(162) // 0xa2 f64.mul
+  fbLocalSet(4)
+  fbBr(0)
+  fbEnd()
+  fbEnd()
+  // The SIGN IS THE DIVIDEND'S, including on a zero result (`-4.0 % 2.0` is `-0.0`; D1586).
+  fbLocalGet(2)
+  fbLocalGet(0)
+  fbI32Bin(166) // 0xa6 f64.copysign
+  fbEnd() // end (function)
+  wTarget(prev)
+  helpFrameBody(out, body)
+}
+
 // Emit the wasm "name" custom section (section id 0, name "name") so a wasmtime trap
 // backtrace shows real function names instead of `<wasm function N>`. GATED on
 // `gEmitNames` — a no-op when off, so the default emit path (goldens + fixpoints) is
@@ -3236,6 +3358,7 @@ function emitNameSection(n: i32) {
   if gHelpStrBytes >= 0 { count = count + 1 }
   if gHelpMapProbe >= 0 { count = count + 2 }
   if gHelpMapProbeI32 >= 0 { count = count + 1 }
+  if gHelpF64Rem >= 0 { count = count + 1 }
   wULEB(count)
   if gImports > 0 {
     wULEB(0)
@@ -3330,6 +3453,10 @@ function emitNameSection(n: i32) {
   if gHelpMapProbeI32 >= 0 {
     wULEB(gHelpMapProbeI32)
     wName("__map_probe_i32__")
+  }
+  if gHelpF64Rem >= 0 {
+    wULEB(gHelpF64Rem)
+    wName("__f64_rem__")
   }
   wTarget(mapPrev)
 
@@ -3451,6 +3578,7 @@ function emitModule(_stmts: i32[]) {
   gHelpMapProbe = -1
   gHelpMapProbeI32 = -1
   gHelpMapResize = -1
+  gHelpF64Rem = -1
   let nHelpers = 0
   const helpBase = gImports + n + hasStart + memFn
   if aUsed {
@@ -3488,6 +3616,13 @@ function emitModule(_stmts: i32[]) {
   // the i32-keyed map shares it and only the probe needs a twin).
   if mI32Used {
     gHelpMapProbeI32 = helpBase + nHelpers
+    nHelpers = nHelpers + 1
+  }
+  // The FLOAT REMAINDER helper (D1586), LAST for the reason its neighbour above gives: no
+  // existing helper index moves in a program without one. It is the first helper whose gate
+  // is neither `aUsed` nor a map flag — a float program touches no string and no map.
+  if gNeedsF64Rem {
+    gHelpF64Rem = helpBase + nHelpers
     nHelpers = nHelpers + 1
   }
 
@@ -3752,6 +3887,12 @@ function scanPrintUse() {
   let sawI64Ann = false
   let sawF64 = false
   let sawF32 = false
+  // D1586 — the `__f64_rem__` reservation, on the same terms as the import reservation this
+  // pass exists for: a helper INDEX cannot be discovered mid-emit either. `sawFloatRem` is a
+  // `%` the checker recorded at a float type; `sawRemUnknown` is a `%` with no recorded type
+  // at all, which only counts once the module is known to mention a float.
+  let sawFloatRem = false
+  let sawRemUnknown = false
   while pscan < P.nodes.length {
     const pn = P.nodes[pscan]
     // D1041 — THE NUMERIC EXACT-OR-FAIL CAST, both of the things this pass is for.
@@ -3901,6 +4042,16 @@ function scanPrintUse() {
         if pcallee.memProp == "bytes" { ba8Used = true }
       }
     }
+    // A FLOAT `%` reserves the `__f64_rem__` helper (D1586). The node's own recorded type
+    // decides it: `%` yields the WIDER operand's type, so a float result is exactly a float
+    // operand. `binRemFloatNeed` is the three-answer vocabulary, its own header says why.
+    if pn is BinExpr {
+      if pn.binOp == "%" {
+        const rneed = binRemFloatNeed(pscan)
+        if rneed > 0 { sawFloatRem = true }
+        else if rneed < 0 { sawRemUnknown = true }
+      }
+    }
     // Any type annotation CONTAINING an i64/f64/f32 leaf anywhere — bare, `T[]`
     // element, union member, `{[…]: T}` map value, `() => T` closure result,
     // struct field, nullable inner — flags the program as using that scalar.
@@ -3981,6 +4132,10 @@ function scanPrintUse() {
     }
     pscan = pscan + 1
   }
+  // D1586 — the float-remainder helper. A `%` with no recorded type is only counted when
+  // the module mentions a float somewhere, which is what keeps an integer-only program's
+  // bytes unchanged; the flags this reads are final only now, hence after the loop.
+  gNeedsF64Rem = sawFloatRem || (sawRemUnknown && (sawF64 || sawF32))
   // When the program both prints (`gImports == 4`, the print family) and names
   // an i64 type, add the 5th `__print_i64__` import.
   if gImports == 4 {
@@ -4123,6 +4278,10 @@ export function emitProgram(rootIx: i32) {
   fa32Used = false
   fa64Used = false
   ia64Used = false
+  // Same per-compile rule as `ba8Used` above, and the same failure if it is skipped: the
+  // helper INDEX is recomputed every compile while a surviving `true` would declare a
+  // `__f64_rem__` this module's tail never emits. `scanPrintUse` writes it (D1586).
+  gNeedsF64Rem = false
   // The module-predicate memo (`moduleHasUnionAs` / `moduleHasNumCast`) is keyed on an arena
   // PREFIX, so it must be cleared per compile for the reason above and one more: the next
   // program's arena can be LONGER than this one's, and a surviving `…Seen` would then start
@@ -4357,6 +4516,13 @@ function helpFuncType(params: string, res: string) {
 function helpValtype(c: i32) {
   if c == 'i' {
     wU8(127) // 0x7f i32
+    return 0
+  }
+  if c == 'f' {
+    // 'f' = f64 — `__f64_rem__`'s two operands and its result (D1586). The only SCALAR
+    // descriptor besides 'i', and the reason the two are handled before the ref block:
+    // everything below writes a `(ref ht)` prefix and an index, which a number has none of.
+    wU8(124) // 0x7c f64
     return 0
   }
   wU8(100) // 0x64 (ref ht) — non-null
@@ -5368,6 +5534,9 @@ function emitTypeSection(
     // five operands with an i32 keys backing (`a`) and an i32 KEY (`i`).
     helpFuncType("aaaai", "i")
   }
+  if gHelpF64Rem >= 0 {
+    helpFuncType("ff", "f") // __f64_rem__: (f64, f64) -> f64
+  }
   // The EXPORT-WRAPPER functypes LAST (#1265), one per export entry, each the target's
   // own signature emitted with `withEnv` FALSE — the clean ABI shape, produced by the
   // same `emitOneFuncType` the main loop uses, so a wrapper's published type cannot drift
@@ -6019,6 +6188,9 @@ function emitCodeSection(n: i32, hasStart: i32, memFn: i32, nHelpers: i32) {
   }
   if gHelpMapProbeI32 >= 0 {
     if emitMapProbeI32FnCode(codePayload) < 0 { return -1 }
+  }
+  if gHelpF64Rem >= 0 {
+    if emitF64RemFnCode(codePayload) < 0 { return -1 }
   }
   // The export-wrapper bodies LAST, in the same order the function section declared them.
   let wci = 0

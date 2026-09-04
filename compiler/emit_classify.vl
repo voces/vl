@@ -11328,6 +11328,18 @@ export function asExprNumTgtName(ix: i32): string {
   primNameStr(primNameOf(tyPeelNul(nodeTyIxOf(ix))))
 }
 
+// The EXACTNESS DOMAIN, which is the target name except at `u8` — the emitter's half of the
+// checker's `numCastDomainName`, and the one place `n.asTy` outranks the arena (D1587).
+// `x as u8` RECORDS `i32`, because that is the value it produces; the `u8` spelling survives
+// canonicalisation precisely so this can read it. The TARGET name still decides the
+// conversion opcode and the `i32 | null` box row, so the two must not be merged.
+export function asExprNumCastDomain(ix: i32): string {
+  const n = P.nodes[ix]
+  if !(n is AsExpr) { return "" }
+  if n.asTy == "u8" { return "u8" }
+  asExprNumTgtName(ix)
+}
+
 // Whether the `AsExpr` at `ix` is a numeric cast that CAN FAIL — the emitter's half of the
 // checker's `numCastCanFail`, asked of the same two names. Disjoint from
 // `asExprIsUnionCast` by OPERAND (a union operand is never a primitive), so the two gates
@@ -11337,7 +11349,7 @@ export function asExprNumFallible(ix: i32): boolean {
   const n = P.nodes[ix]
   if !(n is AsExpr) { return false }
   if asExprIsUnionCast(ix) { return false }
-  numCastCanFail(asExprNumSrcName(ix), asExprNumTgtName(ix))
+  numCastCanFail(asExprNumSrcName(ix), asExprNumCastDomain(ix))
 }
 
 // THE PEEPHOLE'S PREDICATE: is `exprIx` an expression whose f64/f32 value is INTEGRAL by
@@ -12438,10 +12450,11 @@ export function exprIsF32(exprIx: i32, fnIx: i32) {
     return globalIsF32Sid(fnIx, sidOfNode(exprIx))
   }
   // Arithmetic yields f32 when EITHER operand is f32. Comparisons / logical connectives
-  // produce an i32 BOOL even over f32 operands, so they are NOT f32.
+  // produce an i32 BOOL even over f32 operands, so they are NOT f32. `%` is here for the
+  // reason `exprIsF64`'s arm gives (D1586).
   if e is BinExpr {
     const op = e.binOp
-    if op == "+" || op == "-" || op == "*" || op == "/" {
+    if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" {
       // f32 arithmetic yields f32 only when NO operand is a genuine f64 — a genuine f64 side makes
       // the op f64 (the f32 side widens). A float literal does not count (it adapts down to f32).
       if binMixHardF64(e.binLeft, e.binRight, fnIx) { return false }
@@ -12575,10 +12588,11 @@ export function exprIsF64(exprIx: i32, fnIx: i32) {
     return globalIsF64Sid(fnIx, sidOfNode(exprIx))
   }
   // Arithmetic yields f64 when EITHER operand is f64. Comparisons / logical connectives
-  // produce an i32 BOOL even over f64 operands, so they are NOT f64.
+  // produce an i32 BOOL even over f64 operands, so they are NOT f64. `%` is here because
+  // float remainder has a form (D1586) and its result is the dividend's width.
   if e is BinExpr {
     const op = e.binOp
-    if op == "+" || op == "-" || op == "*" || op == "/" {
+    if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" {
       if exprIsF64(e.binLeft, fnIx) { return true }
       return exprIsF64(e.binRight, fnIx)
     }
@@ -21924,6 +21938,22 @@ function anonCodeAdmitsValue(c: i32, valIx: i32) {
   c == 5 && anonRefListElemRow(valIx) >= 0
 }
 
+// The WIDTH of an ARITHMETIC field value, from the arena, falling back to i32 (D1586).
+//
+// The syntax ladder used to code every `- * / %` field 0 outright, which is a claim about
+// the OPERATOR where the truth is a fact about the OPERANDS: `{ f: mkF64() - mkF64() }`
+// stored an f64 into an i32 field — check-clean invalid wasm on `- * /` before float `%`
+// existed, and the one SILENT cell of `%`'s own position matrix. The i32 fall-back stays
+// because this rung has to answer for a value whose type the checker never recorded (a
+// monomorphized instance body), and i32 is what the surrounding ladder assumes there.
+function anonArithFieldCode(valIx: i32) {
+  const bk = tyKindOf(nodeTyIxOf(valIx))
+  if bk == 10 { return 23 }
+  if bk == 11 { return 17 }
+  if bk == 13 { return 24 }
+  0
+}
+
 // The SYNTAX half of `anonFieldCode` — the field value's own literal form. Kept separate
 // so the recorded-type fallback above cannot shadow a context-adopted literal rep: every
 // arm here is a fact about the LITERAL that the checker's recorded type either does not
@@ -21963,18 +21993,20 @@ function anonFieldCodeSyn(valIx: i32) {
     return -1
   }
   // An ARITHMETIC field value (`x: x * s` — an operator-overload maker scaling
-  // its params) is i32 too; a `+` whose operand is a string literal is a concat
-  // (not classifiable here).
+  // its params) is i32 unless the arena says otherwise; a `+` whose operand is a string
+  // literal is a concat (not classifiable here).
   if e is BinExpr {
     const bop = e.binOp
-    if bop == "-" || bop == "*" || bop == "/" || bop == "%" { return 0 }
+    if bop == "-" || bop == "*" || bop == "/" || bop == "%" {
+      return anonArithFieldCode(valIx)
+    }
     if bop == "+" {
       // WHOLE CHAIN, not one level: `"a" + f(x) + g(y)` associates left, so its
       // OUTERMOST `+` has a BinExpr on the left and a Call on the right and neither
       // operand is a string LITERAL. Reading that as arithmetic coded the field i32 and
       // then stored a string ref into it.
       if plusChainHasStrLit(valIx) { return -1 }
-      return 0
+      return anonArithFieldCode(valIx)
     }
     return -1
   }
@@ -34114,6 +34146,19 @@ function tyScalarBackedListKind(tyIx: i32): VKind | null {
     }
   }
   null
+}
+
+// D1586 — how a `%` node votes on the `__f64_rem__` reservation, in the vocabulary
+// `scanPrintUse` needs: 1 = float, so the helper must exist; 0 = definitely an integer `%`,
+// which needs nothing; -1 = the checker recorded no SCALAR type for this node, and the
+// caller resolves that by asking whether the module mentions a float anywhere.
+// The third answer is not a defensive floor — a monomorphized instance body carries its
+// ORIGINAL's `T`, whose kind is -1, and that is exactly D493's pinned `a % b`.
+export function binRemFloatNeed(ix: i32): i32 {
+  const k = tyKindOf(nodeTyIxOf(ix))
+  if k == 11 || k == 13 { return 1 }
+  if k == 0 || k == 10 { return 0 }
+  -1
 }
 
 function tyKindOf(tyIx: i32) {

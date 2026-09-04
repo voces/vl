@@ -9371,14 +9371,6 @@ function storageTyLeafFail() {
   -1
 }
 
-// D1583 — the same rule at the one position whose remedy is DIFFERENT. In an annotation
-// the answer is "write `i32`"; in `x as u8` there is nothing to write, because the
-// conversion the author is reaching for is what the STORE already does. So the message
-// names the truncation and both spellings of it rather than repeating the rule.
-function u8CastText() {
-  "`u8` is a storage type, not a value type — a `u8[]` stores the low byte of an `i32`; push the `i32` directly (300 stores as 44), or `x & 0xff` to make the truncation explicit"
-}
-
 // D1582 — `Map`/`Set` name a CONSTRUCTOR, never a type: the type each makes is
 // spelled with the index signature. The map type is spellable and nothing said so,
 // so `type S = { index: Map }` answered `unknown type 'Map'` — honest and useless,
@@ -15098,8 +15090,14 @@ export function canonEmitTypeNames() {
       // IS the emitter's vocabulary here — no parse, and no second answer. The four-way gate
       // repeats `checkCastNode`'s admission rule so a REJECTED cast leaves the author's spelling
       // alone for the diagnostic that already quotes it.
+
+      // `u8` KEEPS ITS SPELLING (D1587): `x as u8` types as `i32`, so this pass would
+      // canonicalise the one string that still carries the cast's DOMAIN and the emitter would
+      // lower a full-width `i32` narrowing with no 0..255 test at all. It is not an alias of
+      // `i32`; it is a range inside it, and `numCastDomainName` is the reader.
       const at = primNameOf(nodeTyIxOf(i))
-      if at == "i32" || at == "i64" || at == "f32" || at == "f64" {
+      const atCanon = at == "i32" || at == "i64" || at == "f32" || at == "f64"
+      if n.asTy != "u8" && atCanon {
         // `n.asTy` is the author's SPELLING, a plain string on the node, so the atom is
         // materialized here rather than the node's field changing type.
         const ats = primNameStr(at)
@@ -18894,20 +18892,17 @@ function noteUfcsCstr(recv: i32, prop: string, ix: i32, p0: i32) {
   0
 }
 
-// THE INTEGER-ONLY OPERATORS — the bitwise ops, the shifts, and `%`. ONE list, read by
+// THE INTEGER-ONLY OPERATORS — the bitwise ops and the shifts. ONE list, read by
 // `checkBinary`'s reject and by `binOpDefinedFor`'s pin mirror, because those are the two
 // homes that have to agree about it and they drifted apart precisely by holding the list
 // twice: `checkBinary` had all seven names and the pin had none of them (D492's `^`) or the
 // wrong half of the rule (D493's `%`). A shared predicate makes the mirror STRUCTURAL —
 // adding an operator to the family now reaches both sites or neither.
+// `%` LEFT THE FAMILY (D1586): float remainder is the truncated one Rust / JavaScript / C
+// `fmod` compute, and the emitter now has a form for it. Bit patterns are what the rest of
+// this list is about, and a float has no bits to shift.
 function binIntOnlyOp(op: string) {
-  op == "&" ||
-    op == "|" ||
-    op == "^" ||
-    op == "<<" ||
-    op == ">>" ||
-    op == ">>>" ||
-    op == "%"
+  op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>" || op == ">>>"
 }
 
 // Is either operand a FLOAT primitive? The other half of the integer-only rule, in one home
@@ -19073,6 +19068,15 @@ function binOpDefinedFor(op: string, lt0: i32, rt0: i32) {
     return isNumeric(lt) && isNumeric(rt)
   }
   if op == "-" || op == "*" || op == "/" {
+    return isNumeric(lt) && isNumeric(rt)
+  }
+  if op == "%" {
+    // `%` USED TO RIDE THE INTEGER-ONLY ARM BELOW and now rides the arithmetic rule, because
+    // float remainder has a form (D1586). It keeps its own arm rather than joining `- * /`
+    // so the operator-FIELD dispatch route the integer-only arm served it is not silently
+    // dropped: `checkBinary` reaches that route before any numeric rule, and a pin that
+    // refuses what the direct spelling dispatches is the D531 shape.
+    if objOpDispatchTy(op, lt) { return true }
     return isNumeric(lt) && isNumeric(rt)
   }
   if binIntOnlyOp(op) {
@@ -34366,16 +34370,14 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
     )
     return TY_ERR
   }
-  // BITWISE / SHIFT / REMAINDER are INTEGER-ONLY: a float operand (i32↔f64 mixing or even same-type
-  // f64) has no form for any of these. Reject before the numeric-widening rules so `1.0 & 2` and
-  // `5.5 % 2.0` error. Arithmetic (`+ - * /`) and comparisons are unaffected.
-  // `%` is here for a DIFFERENT reason than the bitwise ops, and the difference is the whole
-  // rationale. Float remainder is a meaningful operation — it is just one wasm has no instruction
-  // for, and the one-line `a - trunc(a / b) * b` identity is NOT it: against C/Rust `fmod` it
-  // disagrees on a large share of random operand pairs, on every quotient past 2^53, on a `-0.0`
-  // dividend, on an infinite divisor, and it overflows at the top of the range. Accepting `%` on
-  // floats via that identity would trade a LOUD reject for silent numeric corruption. Exact float
-  // remainder belongs with the other float intrinsics when it lands.
+  // BITWISE / SHIFT are INTEGER-ONLY: a float operand (i32↔f64 mixing or even same-type f64)
+  // has no form for any of these — they are about BIT PATTERNS, and a float has no bits to
+  // shift. Reject before the numeric-widening rules so `1.0 & 2` errors.
+  // `%` IS NOT IN THIS FAMILY ANY MORE (D1586). Float remainder is the TRUNCATED one Rust,
+  // JavaScript and C `fmod` compute, and it is now lowered exactly by the `__f64_rem__`
+  // intrinsic rather than by the `a - trunc(a / b) * b` identity that made refusing it right
+  // — that identity is off by an ulp past 2^53 and wrong at `-0.0`, an infinite divisor and
+  // the top of the range. DECISIONS.md §"`%` over floats is the truncated remainder".
   // THE FAMILY AND THE FLOAT TEST ARE `binIntOnlyOp` / `binFloatOperandPair`, shared with
   // `binOpDefinedFor`'s pin mirror rather than spelled twice — the drift D492 / D493 were.
   if binIntOnlyOp(op) {
@@ -35763,7 +35765,20 @@ function castPinAdjudicate(k: i32, at: i32) {
     }
   }
   const argT = T.tys[argU]
+  const dom = numCastDomainName(holeCastTgtName[k], target)
   if argT is TyUnion {
+    // `as u8` over a union, refused at the PIN in `checkCastNode`'s own words (D1587) — the
+    // hole is where the operand's union first becomes visible, and declining silently here
+    // would accept at the pin what the direct spelling refuses.
+    if dom == "u8" {
+      tErr(
+        "`as u8` narrows a number into 0..255, and " +
+          tyToStr(argU) +
+          " is a union — take the numeric arm first, then the range (`(x as! i32) as! u8`)",
+        castIx,
+      )
+      return 0
+    }
     if !unionCoversTy(argT, target) { return 0 }
     const rest = subtractTy(argU, target)
     if rest < 0 { return 0 }
@@ -35772,8 +35787,7 @@ function castPinAdjudicate(k: i32, at: i32) {
     return 0
   }
   const sn = primNameStr(primNameOf(at))
-  const tn = primNameStr(primNameOf(target))
-  if !numCastCanFail(sn, tn) { return 0 }
+  if !numCastCanFail(sn, dom) { return 0 }
   if mode == "null" { return castPinNullLand(k, castIx, target) }
   castPropagationFits(TY_NULL, holeCastTgtName[k], castIx, holeCastRet[k])
   0
@@ -35819,31 +35833,46 @@ function castPinNullLand(k: i32, castIx: i32, target: i32) {
 // Reading the SOURCE by name keeps this total: an operand the ladder above admitted but
 // `primNameOf` cannot name (a `TyErr` from an already-reported error) answers false, so a broken
 // operand collects one diagnostic rather than two.
-// THE FIVE PAIRS, and the list is CLOSED. The emitter (`emitNumExactCast`) covers exactly these
-// five, and that is not a coincidence to be maintained by hand — a pair admitted HERE and not
+
+// `u8` IS A DOMAIN, NOT A TARGET TYPE (D1587): `x as u8` produces an `i32`, and what the `u8`
+// spelling names is the RANGE 0..255 the value must already be in. So every numeric source can
+// fail it, `i32` included — which is the one pair with no float and no width change in it.
+// THE NINE PAIRS, and the list is CLOSED. The emitter (`emitNumExactCast`) covers exactly
+// these, and that is not a coincidence to be maintained by hand — a pair admitted HERE and not
 // lowered THERE is the "narrow the checker first" trade this repo has paid for repeatedly (D965).
 export function numCastCanFail(src: string, tgt: string): boolean {
   if tgt == "f64" || tgt == "f32" { return false }
+  if tgt == "u8" {
+    return src == "i32" || src == "i64" || src == "f32" || src == "f64"
+  }
   if tgt == "i32" { return src == "f64" || src == "f32" || src == "i64" }
   if tgt == "i64" { return src == "f64" || src == "f32" }
   false
 }
 
+// The EXACTNESS DOMAIN a numeric cast narrows into — the target's primitive name, except where
+// the AUTHOR wrote `u8`, whose value type is the `i32` this returns "u8" instead of (D1587).
+// Two names for one cast, because they answer different questions: the REP target decides the
+// conversion opcode and the `T | null` box row, the DOMAIN decides the range test and the
+// `as!` message. Collapsing them either loses the range or registers a `u8|null` box.
+export function numCastDomainName(asTy: string, target: i32): string {
+  if asTy == "u8" { return "u8" }
+  primNameStr(primNameOf(target))
+}
+
 function checkCastNode(n: AsExpr, ix: i32) {
   const arg = checkNode(n.asObj)
-  const target = nameToTyAt(n.asTy, ix)
+  let target = nameToTyAt(n.asTy, ix)
+  // `x as u8` IS THE i64→i32 NARROWING WITH A DIFFERENT DOMAIN (D1587, owner 2026-09-04).
+  // `u8` is a STORAGE type, so it resolves to nothing in a VALUE position — but the cast the
+  // author is writing is real: narrow this number into 0..255, exactly-or-fail, under the
+  // same trio. The RESULT is the `i32` in that range; only the domain is the `u8` spelling's,
+  // and `numCastDomainName` is where the two names part. A program declaring its own
+  // `type u8` resolves above and is unaffected, which is why this is gated on the miss.
+  const isU8Cast = target < 0 && n.asTy == "u8"
+  if isU8Cast { target = TY_I32 }
   if target < 0 {
-    // D1583 — `u8` names something (`u8[]` is spellable, `std:fs` answers one), so
-    // `unknown type` was the one thing it is not. It is a STORAGE type: the element
-    // position exists, the VALUE position does not, so there is no cast to write and
-    // none is needed — a `u8[]` store keeps the low byte of the `i32` it is given.
-    // Reached only when the name did NOT resolve, so a program declaring its own
-    // `type u8` is unaffected. Gate: `storageTyLeafFail`, the annotation-position twin.
-    if n.asTy == "u8" {
-      tErr(u8CastText(), ix)
-    } else {
-      tErr("unknown type `" + n.asTy + "` in `as` cast", ix)
-    }
+    tErr("unknown type `" + n.asTy + "` in `as` cast", ix)
     return TY_ERR
   }
   // A HOLE OPERAND ANSWERS NEITHER OF THE TRIO'S TYPE-LEVEL QUESTIONS, and the numeric ladder
@@ -35879,6 +35908,18 @@ function checkCastNode(n: AsExpr, ix: i32) {
   if argU >= 0 {
     const argT = T.tys[argU]
     if argT is TyUnion {
+      // `as u8` NARROWS A NUMBER, IT DOES NOT PICK AN ARM (D1587). A union operand would take
+      // the arm ladder below and hand back the arm's own `i32` with NO range test — `x as! u8`
+      // over an `i32 | null` holding 300 would answer 300. Two casts say what one cannot.
+      if isU8Cast {
+        tErr(
+          "`as u8` narrows a number into 0..255, and " +
+            tyToStr(argU) +
+            " is a union — take the numeric arm first, then the range (`(x as! i32) as! u8`)",
+          ix,
+        )
+        return TY_ERR
+      }
       if !unionCoversTy(argT, target) {
         tErr(
           "`as " +
@@ -35935,7 +35976,8 @@ function checkCastNode(n: AsExpr, ix: i32) {
   // a bare `3.9 as i32` all type-checked identically and all printed 3 — the suffix was
   // accepted and IGNORED (D1041). A cast that can fail owes the same three answers the union
   // arm gives, from the same words.
-  if numCastCanFail(primNameStr(primNameOf(arg)), primNameStr(tn)) {
+  const castDom = numCastDomainName(n.asTy, target)
+  if numCastCanFail(primNameStr(primNameOf(arg)), castDom) {
     // `as!` TRAPS on a miss, so nothing is propagated and the enclosing return is not
     // consulted — the same reading as the union arm's trap mode.
     if n.asMode == "trap" { return target }
