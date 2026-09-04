@@ -34,4 +34,4 @@ D1480-D1499  vl-d2 sweep agent  2026-09-03  ordinary-program sweep, D1480-D1486 
 D1500-D1509  vl-d2 filed, vl-cb fixing  2026-09-03  VL-016, the compiler trap (D1500 filed)
 D1520-D1539  vl-d2 glean agent  2026-09-03  VL-003, VL-004, VL-005
 D1540-D1559  vl-d2  2026-09-03  sampler triage
-D1560-D1579  vl-cb  2026-09-03  glean rows VL-025 (D1560) and sampler residue (D1561, D1562)
+D1560-D1579  vl-cb  2026-09-03  glean rows VL-025 (D1560), sampler residue (D1561, D1562), glean VL-021 (D1570) and VL-015 (D1571)
