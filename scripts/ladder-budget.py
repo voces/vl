@@ -30,7 +30,10 @@ import importlib.util
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASELINE = os.path.join(ROOT, "scripts", "ladder-budget-baseline.json")
@@ -115,6 +118,60 @@ def current(lc):
     return out
 
 
+def named(lc, root):
+    """{code: {name: hits}} for one tree — the NAMED entries. An incomplete ladder
+    is `file:function`, a split walk `file:first->second`.
+
+    HITS PER NAME, not a bare set: one function may carry SEVERAL ladders (a
+    different subject each), so the tree's 442 hits are 400 names. A name that keeps
+    its place while its count falls is a function that closed one of two, which a
+    set would show as no movement at all."""
+    saved, lc.ROOT = lc.ROOT, root
+    try:
+        sets = lc.closed_sets()
+        idx = lc.member_index(sets)
+        out = {INCOMPLETE: {}, SPLIT: {}}
+        for lad in lc.all_ladders(sets, idx):
+            if lad.ending == "silent":
+                k = f"{lad.rel}:{lad.fn}"
+                out[INCOMPLETE][k] = out[INCOMPLETE].get(k, 0) + 1
+        for rel, _sn, x, y, _g, _s, _ow in lc.split_pairs(sets, idx):
+            k = f"{rel}:{x.fn}->{y.fn}"
+            out[SPLIT][k] = out[SPLIT].get(k, 0) + 1
+        return out
+    finally:
+        lc.ROOT = saved
+
+
+def tree_at(commit):
+    """`compiler/` as of `commit`, unpacked into a temp directory by
+    `archive | tar -x` and NEVER by a checkout: this runs beside a working tree
+    somebody is editing, and a checkout would move their files under them. The
+    caller removes the directory."""
+    tmp = tempfile.mkdtemp(prefix="ladder-budget-")
+    try:
+        arch = subprocess.run(["git", "-C", ROOT, "archive", commit, "compiler"],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if arch.returncode != 0:
+            raise SystemExit(f"ladder-budget: `archive {commit}` failed: "
+                             + arch.stderr.decode(errors="replace").strip())
+        tar = subprocess.run(["tar", "-x", "-C", tmp], input=arch.stdout,
+                             stderr=subprocess.PIPE)
+        if tar.returncode != 0:
+            raise SystemExit("ladder-budget: could not unpack the archive: "
+                             + tar.stderr.decode(errors="replace").strip())
+        return tmp
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+
+
+def head_commit():
+    r = subprocess.run(["git", "-C", ROOT, "rev-parse", "--short", "HEAD"],
+                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    return r.stdout.decode().strip() if r.returncode == 0 else ""
+
+
 def load_baseline():
     with open(BASELINE, encoding="utf-8") as fh:
         return json.load(fh)
@@ -127,6 +184,7 @@ def write_baseline(cur):
         "{",
         f'"min_arms": {census().MIN_ARMS},',
         f'"why_min_arms": {json.dumps(WHY_MIN_ARMS)},',
+        f'"commit": {json.dumps(head_commit())},',
         f'"total": {json.dumps(total)},',
         '"files": {',
         ",\n".join(rows),
@@ -159,8 +217,59 @@ def cmd_check(cur):
         )
         return 1
     tot = {c: sum(v[c] for v in cur.values()) for c in CODES}
+    was = load_baseline()["total"]
     print(f"kind-ladder budget ok — {tot[INCOMPLETE]} silent ladders, {tot[SPLIT]} "
           "split walks (baseline or below)")
+    # A FALL is where `--why` earns its place: "it went down" and "it went down
+    # because that function grew the arm" are different confidence levels, and only
+    # the second rules out a detector that stopped seeing something.
+    if any(tot[c] < was.get(c, 0) for c in CODES):
+        print("  below baseline — `python3 scripts/ladder-budget.py --why` names "
+              "which entries left")
+    return 0
+
+
+def cmd_why(lc, since):
+    """What LEFT and what ENTERED the reported set since the baseline was written.
+
+    The baseline's `commit` says which tree its numbers describe; `--why <rev>`
+    overrides it. Both sides are re-derived by the SAME walk, so a name that left
+    is a name that stopped qualifying — not a parser that stopped matching."""
+    base = load_baseline()
+    at = since or base.get("commit", "")
+    if not at:
+        raise SystemExit(
+            "ladder-budget: the baseline records no `commit`, so a fall cannot be\n"
+            "attributed. Pass one — `--why <rev>` — or re-run `--write-baseline`,\n"
+            "which records the tree its numbers were taken from.")
+    tmp = tree_at(at)
+    try:
+        was = named(lc, tmp)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    now = named(lc, ROOT)
+    print(f"kind-ladder: {at} -> working tree\n")
+    moved = 0
+    for code in CODES:
+        a, b = was[code], now[code]
+        print(f"{code}  {sum(a.values())} hits over {len(a)} names -> "
+              f"{sum(b.values())} over {len(b)}")
+        for n in sorted(set(a) - set(b)):
+            print(f"  LEFT     {n}" + (f"  (x{a[n]})" if a[n] > 1 else ""))
+            moved += 1
+        for n in sorted(set(b) - set(a)):
+            print(f"  ENTERED  {n}" + (f"  (x{b[n]})" if b[n] > 1 else ""))
+            moved += 1
+        for n in sorted(set(a) & set(b)):
+            if a[n] != b[n]:
+                print(f"  {n}  {a[n]} -> {b[n]}")
+                moved += 1
+        if sum(a.values()) == sum(b.values()) and set(a) == set(b):
+            print("  (the same entries, by name)")
+        print()
+    if moved == 0:
+        print("Nothing moved by name. A count that differs without a name moving is "
+              "the instrument, not the tree.")
     return 0
 
 
@@ -216,6 +325,9 @@ def main():
         return cmd_exempt_codes()
     lc = census()
     check_sets(lc)
+    if "--why" in args:
+        i = args.index("--why")
+        return cmd_why(lc, args[i + 1] if len(args) > i + 1 else "")
     if "--grade" in args:
         return cmd_grade(lc, args[args.index("--grade") + 1])
     if "--list" in args:
