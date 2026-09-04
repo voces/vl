@@ -197,11 +197,44 @@ Each now says so, in the shape the `concat`-vs-`+` bullet uses.
   `nulvariant` niche.
 - **Nothing pre-checks for the caller.** `readFile` does not stat first for a prettier
   error: a pre-check costs a syscall and buys a race, and nothing here is atomic against
-  another process.
+  another process. `fileSize`'s `EISDIR` for a directory is decided in the HOST for the
+  same reason — deciding it in std would cost a second syscall and a TOCTOU window.
+- **`readFileRange` is positional, not a handle**, and that is what keeps the module's
+  "errors are values, nothing is ambient" shape: every call carries its own offset, so
+  there is no cursor to get wrong, no order dependence between two calls, and nothing to
+  close. The price is one `open`+`seek` per window, paid deliberately. Its failure
+  channel is `readFile`'s unchanged — empty plus a non-zero `__fs_errno__()` — which is
+  why a short read and an empty read at end of file can both be successes.
+- **`fileSize` answers off the i64 SIGN, and its reason off the errno cell — to keep the
+  header's no-trap promise.** The floor returns `-errno` for a failure and a size is never
+  negative, so one i64 carries both. `writeFile` and `pathKind` negate their floor's
+  return directly, and `fileSize` deliberately does not: its return is an i64 and the only
+  narrowing to the `i32` `code` field is `as!`, which ABORTS when the value does not fit.
+  The header promises *nothing here traps*, so the reason comes from `__fs_errno__()`
+  instead — which costs nothing, since the host writes the cell on every failure path.
+- **The `i64` offset and `i32` length are not an oversight.** `length` bounds an
+  allocation that has to fit in a `u8[]`, whose own `.length` is an `i32`; an `i64` length
+  would be a type able to express a request the RESULT type cannot represent. `offset`
+  addresses the file, which is not bounded by memory. The asymmetry costs the caller
+  nothing — `off = off + w.length` widens the i32 silently — and the i64 survives the host
+  boundary, which is the half worth checking: offset 2^32 answers empty rather than the
+  file's head, and 2^31 answers empty rather than `EINVAL`.
+- **`EFBIG` (22) is by number, deliberately.** `__fs_size__` answers `-EFBIG` for a size
+  past `i64::MAX` rather than clamping, but the constant is not exported: it needs an 8 EiB
+  file, so naming it would add a permanent std name for a branch no caller can take.
+- **Naming, and the precedent that did NOT win.** `readFileRange` pairs with `readFile` and
+  repeats its module, as the flat namespace requires. The tree's suffix for the same
+  operation over a range is `At` (`decodeUtf8At`), and it is deliberately not followed
+  here: `readFileAt` reads as "read the file at [a path]" against a first parameter that is
+  a path. `fileSize` continues `pathKind`/`pathExists`'s noun-first split of what `stat`
+  would have promised, and changes the noun on purpose — a PATH has no size, and the
+  function refuses (`EISDIR`) when the path names something that is not a file.
 - **Not here, and why:** no path manipulation (a future `std:fs/path`); no open handles,
-  seeking, streaming or partial reads; no metadata beyond file-or-directory; no mkdir,
-  remove, rename or symlink inspection — each is a floor intrinsic that does not exist,
-  and a std wrapper for a syscall VL cannot make is a name that fails at emit.
+  seeking or streaming (`readFileRange` is positional, so a scan needs none); no ranged
+  TEXT read, since a byte range can split a UTF-8 sequence; no metadata beyond
+  file-or-directory and size; no mkdir, remove, rename or symlink inspection — each is a
+  floor intrinsic that does not exist, and a std wrapper for a syscall VL cannot make is
+  a name that fails at emit.
 
 ## `std:fmt`
 
