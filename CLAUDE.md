@@ -559,6 +559,35 @@ across two functions where only one hands back. Ratchet: `python3 scripts/ladder
 drift). `scripts/ladder-census.py` is the discovery half — `--sets`, `--split`, and `--pred`
 for the form with no kind literal in it, which is the only place #2400's hole is visible.
 
+## A TABLE READ BOUND-TESTS ITS INDEX, OR TAKES A READER WHOSE MISS CANNOT BE A REAL ROW
+
+Four compiler TRAPS in one day, four sites: `T.tys[t.nInner]` on a `-1` arena hole (D1440),
+`T.tys[lt]` on a laundered element hole (D1462, D1566), `rlElemName[slot]` on a slot CLAMPED to
+0 into an EMPTY table (D1500). Every one returned `vl check` **rc 0** and then died inside the
+seed with an anonymous `out of bounds array access` — the error a user reads as THEIR index
+being out of range (the host banner now says which module trapped, exit 70).
+**`sentinel-index-unguarded`** is the rule (`compiler/lint.vl`, `warning`): within one function,
+a read `<t>[<idx>]` whose base the function did not declare and whose index is a call result, a
+HOLE FIELD (one the module itself compares `< 0` / `>= 0`), or a fall-through `i32` parameter
+of a reader, with no comparison of `<idx>` against `0`, `-1` or any `.length` before it.
+Ratchet: `python3 scripts/sentinel-budget.py --check` (386 + 0 when it landed, #2499), census
+`scripts/sentinel-census.py`, `--why` names what left since the baseline's commit.
+`docs/internals/sentinel-index-lint.md`.
+
+**The reader set is a CENSUS OUTPUT, not a filter, and that is measured.** 842 readers derive
+from the tree; only **29 of 386** hits have a producer among them, and filtering on the set
+drops two of the four controls — D1462's producer `checkNode` carries no `-1` of its own, it
+launders `TyArray.aElem`'s hole four hops down. **A laundered sentinel is still a sentinel**:
+derive the population from the SHAPE, and use the reader census to triage a hit, not to find one.
+
+**And a hit count is not a bug count.** A seeded 10-hit sample graded **2 DEFENSIVE, 0 LIVE, 8
+UNDECIDED**; the LIVE evidence is the controls, none of which was found by reading code.
+D1513 — the same week's other trap, an unmemoised exponential — is the NEGATIVE control and
+reports nothing, which is what makes this a family rather than a bucket labelled "compiler
+trap". Ask a new trap which of the two it is before auditing the readers again. And the
+premise of a trap brief is RUN on the current seed before the brief is written: a program's own
+`out of bounds` (exit 1, no banner) was relayed as a compiler trap once (D1569's brief).
+
 ## Claims about the tree
 
 `ROADMAP.md` and the design docs go stale one-directionally — a fixed defect keeps reading
