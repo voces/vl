@@ -1,6 +1,7 @@
-// `check_query.vl` — the read-only LSP QUERY layer over a finished check: symbol
-// occurrences / def / refs / hover (`sym*`), redundant-type reports (`redun*`), inlay
-// hints. Reads `check_state` + the checker's `T`/types, never drives checking.
+// `check_query.vl` — the read-only LSP query layer over a finished check: symbol
+// occurrences, definition, references and hover (`sym*`), redundant-annotation and
+// dead-`??` reports, inlay hints, completion and signature help. Reads
+// `check_state.vl` and the checker's `T` / types; it never drives checking.
 
 import {
   BoolLit,
@@ -81,11 +82,10 @@ import {
   ufcName,
   ufcTok,
 } from "./check_state"
-// Every rendered type string this module hands out is READ BY A PERSON (hover,
-// inlay, completion details), so it renders through the USER pathway —
-// `tyToStrUser`/`tyToStructStrUser`, demangle ∘ render — never the raw
-// `tyToStr`, whose spelling doubles as canon/interner keys and keeps its `$mN`
-// mangles. The boundary is documented at the pair's definition (typecheck.vl).
+// Every rendered type string this module hands out is read by a person (hover, inlay,
+// completion detail), so it renders through the user pathway — `tyToStrUser` /
+// `tyToStructStrUser`, demangle then render — never the raw `tyToStr`, whose spelling
+// doubles as a canon and interner key and keeps its `$mN` mangles.
 import {
   T,
   TyFunc,
@@ -111,9 +111,9 @@ export function symBindKindOf(declNode: i32) {
   }
   -1
 }
-// ── symbol-table QUERY API (consumed by the driver's exports) ────────────────
-// Turn the LSP symbol machinery on/off. The driver flips it on before a
-// symbol-aware `checkProgram`; everything else leaves it off (free, no recording).
+// ── symbol-table query API (consumed by the driver's exports) ────────────────
+// Turn the LSP symbol machinery on or off. The driver flips it on before a
+// symbol-aware `checkProgram`; everything else leaves it off and records nothing.
 export function symSetEnabled(on: i32) {
   symEnabled = on
   0
@@ -130,24 +130,23 @@ export function symOccIsDeclAt(i: i32) {
   if i >= 0 && i < symOccIsDecl.length { return symOccIsDecl[i] }
   0
 }
-// The binding KIND of occurrence `i` (0=variable 1=parameter 2=function), or -1
-// when out of range — semantic-token coloring reads this per identifier.
+// The binding kind of occurrence `i` (0 = variable, 1 = parameter, 2 = function), or
+// -1 when out of range — semantic-token coloring reads this per identifier.
 export function symOccKindAt(i: i32) {
   if i >= 0 && i < symOccDecl.length { return symBindKindOf(symOccDecl[i]) }
   -1
 }
-// The FLOW-NARROWED type retained at occurrence `i`, or -1 when that use sat under
-// no narrowing (or the index is out of range). Bounds-safe so an older recording
-// that never filled the column degrades to "not narrowed".
+// The flow-narrowed type retained at occurrence `i`, or -1 when that use sits under
+// no narrowing or the index is out of range. Bounds-safe, so an unfilled column
+// degrades to "not narrowed".
 export function symOccNarrowTy(i: i32) {
   if i < 0 || i >= symOccTy.length { return -1 }
   symOccTy[i]
 }
-// The TYPE to answer a position query with for occurrence `i`: its flow-narrowed
-// type when one was in force there, else the retained type of the binding it
-// resolves to. THE ONE PLACE the narrowed-vs-declared choice is made, so hover and
-// member completion cannot disagree about what `result` is inside an `is` arm.
-// -1 when neither is known.
+// The type to answer a position query with for occurrence `i`: its flow-narrowed type
+// when one is in force there, else the retained type of the binding it resolves to,
+// and -1 when neither is known. The one place that choice is made, so hover and member
+// completion cannot disagree about what `result` is inside an `is` arm.
 export function symOccQueryTy(i: i32) {
   const nt = symOccNarrowTy(i)
   if nt >= 0 { return nt }
@@ -158,9 +157,9 @@ export function symOccTokOf(i: i32) {
   if i >= 0 && i < symOccTok.length { return symOccTok[i] }
   -1
 }
-// Occurrence `i`'s anchor TOKEN index (into `P.toks`), or -1. The driver maps it
-// to the owning MODULE (a module's tokens occupy a contiguous range of `P.toks`
-// after the merge) for cross-file find-references.
+// Occurrence `i`'s anchor token index (into `P.toks`), or -1. The driver maps it to
+// the owning module — a module's tokens occupy a contiguous range of `P.toks` after
+// the merge — for cross-file find-references.
 export function symOccTokAt(i: i32) { symOccTokOf(i) }
 // The four span coordinates of occurrence `i` (`symOccStartLine`/`StartCol`/
 // `EndLine`/`EndCol`), derived from its anchor token: a lexeme never spans lines,
@@ -214,8 +213,8 @@ export function symOccAt(line: i32, col: i32) {
   }
   best
 }
-// The DECLARATION occurrence index for the binding under (line, col), or -1.
-// Drives go-to-definition: jump to this occurrence's span.
+// The declaration occurrence index for the binding under (line, col), or -1. Drives
+// go-to-definition: jump to this occurrence's span.
 export function symDefAt(line: i32, col: i32) {
   const occ = symOccAt(line, col)
   if occ < 0 { return -1 }
@@ -229,9 +228,9 @@ export function symDefAt(line: i32, col: i32) {
   // the cursor is itself the best available anchor.
   occ
 }
-// The count of occurrences (declaration + uses) of the binding under (line, col)
-// — find-references. `symRefAt(line, col, k)` returns the k-th such occurrence
-// INDEX (read its span via the `symOcc*` accessors).
+// The count of occurrences (declaration plus uses) of the binding under (line, col)
+// — find-references. `symRefAt(line, col, k)` returns the k-th such occurrence index,
+// whose span is read through the `symOcc*` accessors.
 export function symRefsCountAt(line: i32, col: i32) {
   const occ = symOccAt(line, col)
   if occ < 0 { return 0 }
@@ -259,7 +258,7 @@ export function symRefAt(line: i32, col: i32, k: i32) {
   }
   -1
 }
-// The retained type-arena index of binding `binding`, or -1 when none was kept.
+// The retained type-arena index of binding `binding`, or -1 when it kept none.
 export function bindTypeOf(binding: i32) {
   let i = 0
   while i < symBindNode.length {
@@ -268,18 +267,12 @@ export function bindTypeOf(binding: i32) {
   }
   -1
 }
-// ── Named function signature (hover) ─────────────────────────────────────────
-// A FUNCTION binding hovers with its parameter NAMES: `TyFunc` deliberately carries
-// none (`{ fnParamTypes, fnRet }` — the names live on the declaration), so zip the
-// binding's FuncDecl parameter names with the type's parameter types, giving
-// `(name: string, body: () => void) => void`. Returns "" when the render does not
-// apply and the caller falls back to the bare type: the binding is not
-// FuncDecl-declared (a lambda-bound value or a function-typed parameter keeps the
-// bare structural type), the retained type is not a TyFunc, or the decl's param
-// count disagrees with the type's. IMPORTED functions work through the same tables:
-// the merged program shares one node arena, so a dep module's FuncDecl is addressable
-// here and its parameter names are source names (the merge mangles only top-level
-// DECL names). Renders through the user pathway, like every string leaving this file.
+// ── named function signature (hover) ─────────────────────────────────────────
+
+// A function binding hovers with its parameter names, which `TyFunc` does not carry,
+// so this zips the binding's `FuncDecl` parameter names with the type's parameter
+// types. "" when that does not apply and the caller falls back to the bare type: not
+// `FuncDecl`-declared, not a `TyFunc`, or a parameter count the two disagree on.
 function fnSigStr(declNode: i32, ty: i32) {
   if declNode < 0 || declNode >= P.nodes.length { return "" }
   const nd = P.nodes[declNode]
@@ -299,17 +292,10 @@ function fnSigStr(declNode: i32, ty: i32) {
   }
   s + ") => " + tyToStrUser(t.fnRet)
 }
-// The rendered TYPE STRING of the binding under (line, col), or "" when the
-// cursor is off any tracked binding or its type was not retained. The arena
-// `T.tys` persists for the whole check, so the retained index renders even after
-// the binding's scope closed (hover-types). A FuncDecl-declared binding renders
-// as its NAMED signature (`fnSigStr` above); everything else as the bare type.
-//
-// A use under a FLOW NARROWING renders the narrowed type: hovering `result` inside
-// `if result is string { … }` says `string`, not the declared `string | IoError`.
-// The named-signature path is skipped for such a use — `fnSigStr` zips the DECL's
-// parameter names against the binding's own type, which is not what is in force
-// here — so a narrowed occurrence renders bare.
+// The rendered type string of the binding under (line, col), or "" when the cursor is
+// off any tracked binding or its type is not retained. A `FuncDecl`-declared binding
+// renders as its named signature (`fnSigStr`); a use under a flow narrowing renders
+// the narrowed type bare, since `fnSigStr` would zip names against a type not in force.
 export function symTypeStrAt(line: i32, col: i32) {
   const occ = symOccAt(line, col)
   if occ < 0 { return "" }
@@ -369,9 +355,9 @@ export function redunEColAt(i: i32) { redunECol[i] }
 export function redunNameAt(i: i32) { redunName[i] }
 export function redunTypeAt(i: i32) { redunType[i] }
 export function redunTokAt(i: i32) { redunTok[i] }
-// The finding's human message. THE single spelling of this diagnostic: the CLI
-// report, `--fix`'s companion output and the wasm driver's `redunMsg*` byte ABI
-// all read it here, so no consumer can drift from another's wording.
+// The finding's human message, and the single spelling of it: the CLI report,
+// `--fix`'s companion output and the wasm driver's `redunMsg*` byte ABI all read it
+// here, so no consumer can drift from another's wording.
 export function redunMsgAt(i: i32) {
   "redundant type annotation: `" +
     redunName[i] +
@@ -379,33 +365,32 @@ export function redunMsgAt(i: i32) {
     redunType[i] +
     "` — remove it to lean on inference"
 }
-// ── Dead `??` defaults ──────────────────────────────────────────────────────────
-// The checker's `rcoal*` findings (a `??` whose left operand can never be null), read
-// exactly as `redun*` is: count + per-index position, with the message BUILT here so
-// the CLI report and the corpus oracle share one spelling.
+// ── dead `??` defaults ───────────────────────────────────────────────────────
+// The checker's `rcoal*` findings, read exactly as `redun*` is: count plus per-index
+// position, with the message built here so the CLI report and the corpus oracle share
+// one spelling.
 export function rcoalCount() { rcoalTok.length }
 export function rcoalLineAt(i: i32) { rcoalLine[i] }
 export function rcoalColAt(i: i32) { rcoalCol[i] }
 export function rcoalTokAt(i: i32) { rcoalTok[i] }
-// THE single spelling of this diagnostic. Says what is dead (the default), why (the
-// left operand's type), and what to do — the message convention the emitter-capability
-// errors already follow: name the construct, then the action after an em dash.
+// The single spelling of this diagnostic. It says what is dead (the default), why (the
+// left operand's type), and what to do — the convention the emitter-capability errors
+// follow: name the construct, then the action after an em dash.
 export function rcoalMsgAt(i: i32) {
   "this `??` default is never used: `" +
     rcoalType[i] +
     "` is never null — drop the `??` and its default"
 }
-// ── `is <literal>` over a COLLAPSED operand ─────────────────────────────────────
-// The checker's `isval*` findings, read exactly as `redun*`/`rcoal*` are.
+// ── `is <literal>` over a collapsed operand ──────────────────────────────────
+// The checker's `isval*` findings, read exactly as `redun*` and `rcoal*` are.
 export function isvalCount() { isvalTok.length }
 export function isvalLineAt(i: i32) { isvalLine[i] }
 export function isvalColAt(i: i32) { isvalCol[i] }
 export function isvalTokAt(i: i32) { isvalTok[i] }
-// THE single spelling of this diagnostic. It states the type the operand ACTUALLY
-// has (the collapse is invisible in the source, so the reader has to be told), what
-// the test therefore degenerates to, and the fix — a distinguishable arm — which is
-// the whole point of the ruling: `string | "err"` cannot tell a failure from a
-// string that happens to read "err", and no compiler can make it.
+// The single spelling of this diagnostic. It states the type the operand actually has
+// (the collapse is invisible in the source), what the test therefore degenerates to,
+// and the fix — a distinguishable arm, since `string | "err"` cannot tell a failure
+// from a string that reads "err".
 export function isvalMsgAt(i: i32) {
   "`" +
     isvalName[i] +
@@ -416,15 +401,10 @@ export function isvalMsgAt(i: i32) {
     "` is a value test (`==`) and cannot tell a failure from data; give the failure a distinguishable arm (`| null` or a struct)"
 }
 
-// Type-alias hover: the rendered type of the user TYPE NAME (a `type`-declared
-// struct/union alias) whose token covers (line, col) — the decl name or a use in
-// an annotation. A type name isn't a value-binding occurrence, so this scans the
-// token stream for the identifier at the cursor and resolves it through the
-// declared-types map (`cUserTypes`), reusing existing state (no occurrence table).
-// "" when the cursor is off a known user type. Builtins (`i32`, …) are NOT user
-// types — the host serves those from its builtin list. Line is 1-based, col 0-based.
-// End-INCLUSIVE containment, like every position query here (`symOccCovers`,
-// `visContainsPos`): a cursor just past the name's last char still resolves.
+// Type-alias hover: the rendered type of the user type name (a `type`-declared struct
+// or union alias) whose token covers (line, col), or "" when the cursor is off one. A
+// type name is not a value-binding occurrence, so this scans the token stream and
+// resolves through `cUserTypes`. Builtins are the host's list; containment is end-inclusive.
 export function symTypeAliasAt(line: i32, col: i32) {
   let i = 0
   while i < P.toks.length {
@@ -435,32 +415,21 @@ export function symTypeAliasAt(line: i32, col: i32) {
       col >= t.col &&
       col <= t.col + t.text.length
     ) {
-      // In a MULTI-MODULE compile the merge renames the entry's own type decls
-      // too (`W` → `W$m0`), so the map's key is the mangled spelling while the
-      // token still reads `W` — without the `$m0` fallback the alias hover
-      // simply goes dark wherever the entry imports anything at all.
-      // An alias's arena index is never negative, so -1 is a clean miss sentinel.
+      // A multi-module merge renames the entry's own type decls (`W` → `W$m0`), so the
+      // map's key is mangled while the token still reads `W`. -1 is a clean miss.
       let ty = cUserTypes[t.text] ?? (-1)
       if ty < 0 { ty = cUserTypes[t.text + "$m0"] ?? (-1) }
-      // THE ONE DISPLAY QUERY THAT WANTS THE STRUCTURAL RENDER, and the reason is
-      // its question. Every other surface asks "what type is this VALUE", and the
-      // useful answer is the name the source gives it. This one is handed the NAME
-      // and asks what it stands for, so the nominal render would answer `Pt` for a
-      // hover over `Pt` — the alias's body is the whole content of the reply.
-      // `tyToStructStrUser` is that render (through the user pathway — the body
-      // can embed a mangled NEWTYPE name), and it is source-spelled — the
-      // structural entry has no second spelling to pick from.
+      // The one display query that wants the structural render: it is handed the name
+      // and asks what it stands for, so a nominal render would answer `Pt` for `Pt`.
       if ty >= 0 { return tyToStructStrUser(ty) }
     }
     i = i + 1
   }
   ""
 }
-// The rendered TYPE STRING of the member access whose PROPERTY NAME covers
-// (line, col) — member hover (`o.x` / `o?.y`). The narrowest covering span wins
-// (defensive against any overlap). "" when the cursor is off any recorded member.
-// End-INCLUSIVE containment, like every position query here (`symOccCovers`,
-// `visContainsPos`): a cursor just past the name's last char still resolves.
+// The rendered type string of the member access whose property name covers (line,
+// col) — member hover (`o.x` / `o?.y`). The narrowest covering span wins, and "" means
+// the cursor is off any recorded member. End-inclusive, like every position query here.
 export function symMemTypeStrAt(line: i32, col: i32) {
   const best = symMemIxAt(line, col)
   if best < 0 { return "" }
@@ -468,11 +437,10 @@ export function symMemTypeStrAt(line: i32, col: i32) {
   if ty < 0 { return "" }
   tyToStrUser(ty)
 }
-// The recorded member access whose PROPERTY NAME covers (line, col), narrowest
-// span first, or -1. One home for the walk, because signature help asks the same
-// question of the same table (`o.cb(…)` — a struct field holding a function) and
-// two copies of a containment rule is how two surfaces come to disagree about
-// which member a cursor is on.
+// The recorded member access whose property name covers (line, col), narrowest span
+// first, or -1. One home for the walk, because signature help asks the same question
+// of the same table, and two copies of a containment rule is how two surfaces come to
+// disagree about which member a cursor is on.
 export function symMemIxAt(line: i32, col: i32) {
   let best = -1
   let bestW = 0
@@ -498,12 +466,10 @@ export function symMemIsFn(ty: i32) {
   if t is TyNullable { return symMemIsFn(t.nInner) }
   t is TyFunc
 }
-// Member-access enumeration (semantic tokens): every recorded member-access
-// property name, in record order, with its span and method/property class — the
-// native equivalent of the host's AST member walk. The host reads
-// `symMemberCount()` then the per-index accessors. Line is 1-based, col 0-based;
-// `symMemberLen` is the property name's length; `symMemberIsMethod` is 1 for a
-// function-typed member, else 0.
+// Member-access enumeration (semantic tokens): every recorded property name in record
+// order, with its span and method-or-property class. The host reads `symMemberCount()`
+// then the per-index accessors; line is 1-based, col 0-based, `symMemberLen` is the
+// property name's length, and `symMemberIsMethod` is 1 for a function-typed member.
 export function symMemberCount() { symMemNode.length }
 export function symMemberLine(i: i32) { symMemLine[i] }
 export function symMemberCol(i: i32) { symMemCol[i] }
@@ -513,11 +479,10 @@ export function symMemberIsMethod(i: i32) {
   if symMemIsFn(symMemTy[i]) { return 1 }
   0
 }
-// The rendered TYPE STRING of binding `declNode`, or "" when no type was retained.
-// The arena persists for the whole check, so the index renders post-scope-close.
-// A USER-FACING render (its one consumer is the completion detail `symScopeAt`
-// fills), so it goes through the user pathway — this is where `symScopeAt`'s
-// former inline `demangleMsg` wraps (#2074) collapsed to.
+// The rendered type string of binding `declNode`, or "" when no type is retained. The
+// arena persists for the whole check, so the index renders after the scope closes. A
+// user-facing render — its one consumer is the completion detail `symScopeAt` fills —
+// so it goes through the user pathway.
 export function symBindTypeStr(declNode: i32) {
   let i = 0
   while i < symBindNode.length {
@@ -539,9 +504,9 @@ export function visContainsPos(i: i32, line: i32, col: i32) {
     (line == symVisEL[i] && col <= symVisEC[i])
   afterStart && beforeEnd
 }
-// Whether entry `a`'s scope is TIGHTER (more deeply nested) than entry `b`'s —
-// the lexical-shadowing tiebreak: a same-line scope compares by column width, a
-// multi-line scope by line count. Mirrors the host `spanShorter`.
+// Whether entry `a`'s scope is tighter (more deeply nested) than entry `b`'s — the
+// lexical-shadowing tiebreak: a same-line scope compares by column width, a multi-line
+// scope by line count.
 export function visTighter(a: i32, b: i32) {
   const aSame = symVisSL[a] == symVisEL[a]
   const bSame = symVisSL[b] == symVisEL[b]
@@ -559,14 +524,10 @@ function visDeclTok(declNode: i32): i32 {
   if declNode >= 0 && declNode < nodeToks.length { return nodeToks[declNode] }
   -1
 }
-// Scope-at-position (completion): the user bindings (var/param/function) visible
-// at (line, col) — 1-based line, 0-based col. Computes the result into the
-// `scopeRes*` arrays (read by the per-index accessors) and returns the count.
-// One binding per name: when several of a name are visible, the TIGHTEST scope
-// wins (an inner `let` shadows an outer). The host folds in builtins/imports.
-// An imported name is recorded under its mangled merge name (`add$m1`); it's
-// de-mangled to its source name (`add`) for display, and de-dup is keyed on that
-// source name so a local and a same-named import collapse (tightest wins).
+// Scope-at-position (completion): the user bindings visible at (line, col), computed
+// into the `scopeRes*` arrays and returning the count. One binding per name — the
+// tightest scope wins. An imported name is recorded mangled (`add$m1`), demangled for
+// display, and de-duped on the source name so a local and a same-named import collapse.
 export function symScopeAt(line: i32, col: i32) {
   scopeResName = []
   scopeResKind = []
@@ -584,9 +545,8 @@ export function symScopeAt(line: i32, col: i32) {
         idxByName[nm] = scopeResName.length
         scopeResName.push(nm)
         scopeResKind.push(symVisKind[i])
-        // `symBindTypeStr` renders through the user pathway, so a MANGLED user
-        // type name (`Expectation$m1`) from a dep-module binding never reaches
-        // the completion detail.
+        // `symBindTypeStr` renders through the user pathway, so a mangled type name
+        // from a dep-module binding never reaches the completion detail.
         scopeResType.push(symBindTypeStr(symVisNode[i]))
         scopeResRaw.push(symVisName[i])
         scopeResTok.push(visDeclTok(symVisNode[i]))
@@ -662,11 +622,8 @@ export function symMemberScanAt(line: i32, col: i32) {
   memcIsFn = []
   const occ = symOccAt(line, col)
   if occ < 0 { return 0 }
-  // The SAME choice hover makes (`symOccQueryTy`): a receiver under a flow
-  // narrowing offers the NARROWED arm's members. `result.` inside `if result is
-  // IoError { … }` offers `msg`/`code`; on the declared `string | IoError` the
-  // scan below finds neither a `TyObj` nor a `string` and offers nothing, which is
-  // what it used to do at both spellings.
+  // The same choice hover makes (`symOccQueryTy`): a receiver under a flow narrowing
+  // offers the narrowed arm's members, and the declared union offers none at all.
   let ty = symOccQueryTy(occ)
   if ty < 0 { return 0 }
   ty = memcSoften(ty)
@@ -686,16 +643,14 @@ export function symMemberScanAt(line: i32, col: i32) {
     }
   } else if t is TyPrim {
     if t.primName == "string" {
-      // The string builtin methods the host surfaces (call-arms in this file).
-      // HAND-WRITTEN INTO THE SAME COLUMN `tyToStr` FILLS above, so they carry the same
-      // rule: a signature a reader sees is spelled the way VL source spells it (`=>`).
+      // The string builtin methods the host surfaces, hand-written into the column
+      // `tyToStr` fills above, so a signature reads the way VL source spells it (`=>`).
       memcPush("slice", "(i32, i32) => string", 1)
       memcPush("indexOf", "(string) => i32", 1)
       memcPush("includes", "(string) => boolean", 1)
       memcPush("charCodeAt", "(i32) => i32", 1)
-      // The Stage 2c codec trio — offered here as well as typed in `typecheck`, because
-      // the completion table is the sibling ladder that has silently lagged before
-      // (`.length` is typed on a string and STILL not offered; §2.7 L6).
+      // The Stage 2c codec trio, offered here as well as typed in `typecheck`: the
+      // completion table is a sibling ladder that can lag the type rules (§2.7 L6).
       memcPush("cpAt", "(i32) => i32", 1)
       memcPush("cpLen", "() => i32", 0)
       memcPush("isCharBoundary", "(i32) => boolean", 1)
@@ -725,22 +680,15 @@ export function symMemberScanIsFn(i: i32) {
   if i < 0 || i >= memcIsFn.length { return 0 }
   memcIsFn[i]
 }
-// ── UFCS candidates at (line, col) — the sibling scan `symMemberScanAt` cannot do ─
-// Same receiver, other half of the answer: `symMemberScanAt` lists what the receiver's
-// TYPE carries, this lists the free `self`-functions it DISPATCHES to; `check_state.vl`'s
-// `ufcName` header says why the editor asks. THE TEST IS `ufcsCallTy`'S, NOT A LOOKALIKE:
-// the declaration's first parameter must be NAMED `self` (`declFirstParamIsSelf`, the rule
-// `emit_rewrite.drwSelfFnOf` applies) and the receiver `assignable` to it, so the offered
-// set cannot advertise a call the checker would then refuse. ARITY is deliberately not
-// asked — the author has typed a `.` and no arguments yet. `assignable` is permissive at a
-// `TyVar`, which is RIGHT here rather than a hole: `self: Expectation<T>` must accept
-// `Expectation<i32>` (`ufcsCstrTy` re-asks the real question at the call), and dropping
-// every generic `self` would hide `toEqual`. FIELD PRECEDENCE is left to the host, which
-// merges the two lists field-first; doing it here too would only make the scans disagree.
+// ── UFCS candidates at (line, col) ───────────────────────────────────────────
+
+// The other half of `symMemberScanAt`'s answer: the free `self`-functions the receiver
+// dispatches to. The test is `ufcsCallTy`'s — first parameter named `self` and the
+// receiver assignable to it — so the set cannot advertise a call the checker would
+// refuse. Arity is not asked; field precedence is the host's, merging field-first.
 function ufcSigStr(declNode: i32, ty: i32) {
   // `fnSigStr` with the receiver row dropped, the same `skip = 1` signature help
-  // applies (`sigFill`): the reader has already supplied `self`, so showing it
-  // would label argument 1 with parameter 0's name.
+  // applies (`sigFill`): `self` is supplied, so showing it would misname argument 1.
   if declNode < 0 || declNode >= P.nodes.length { return "" }
   const nd = P.nodes[declNode]
   if !(nd is FuncDecl) { return "" }
@@ -766,18 +714,10 @@ function ufcSigStr(declNode: i32, ty: i32) {
   }
   s + ") => " + tyToStrUser(t.fnRet)
 }
-// The RECEIVER type for a UFCS query at (line, col), by the two routes a caller can
-// name a receiver — and it takes BOTH because the two callers point at different things.
-//
-//   1. A MEMBER ACCESS whose property name is under the cursor: the receiver is that
-//      access's OBJECT, whatever expression it is — the route the quick-fix needs, since
-//      `no field 'toEqual' on Expectation<i32>` points AT `toEqual` while the receiver
-//      `expect(1 + 2)` is a CALL no binding lookup can answer.
-//   2. A tracked BINDING occurrence, `symMemberScanAt`'s route — a plain name (`p.`)
-//      whose trailing `.` the host stripped, with the cursor on the name.
-//
-// Route 1 is tried first: on a member's property the author is asking about that member,
-// and a bare identifier there is the property name, saying nothing about the receiver.
+// The receiver type for a UFCS query at (line, col), by either route a caller names
+// one: a member access whose property name is under the cursor (the receiver is that
+// access's object, whatever expression it is), or a tracked binding occurrence. Route
+// 1 first — a bare identifier on a member's property is the property name, not the receiver.
 function ufcRecvTyAt(line: i32, col: i32) {
   let i = 0
   while i < P.nodes.length {
@@ -792,11 +732,8 @@ function ufcRecvTyAt(line: i32, col: i32) {
       pl = nd.omProp.length
     }
     if obj >= 0 && i < nodeToks.length {
-      // The member node's `nodeToks` entry IS the property token (the parser
-      // creates the node right after consuming the prop IDENT) — the same anchor
-      // `symMem` spans, so this covers exactly what member hover covers, and
-      // additionally the members `symMem` never records because they did not
-      // resolve. Those are precisely the ones a missing import produces.
+      // The member node's `nodeToks` entry is the property token — the anchor `symMem`
+      // spans, plus the unresolved members it never records, which a missing import makes.
       const tk = nodeToks[i]
       if tk >= 0 && tk < P.toks.length {
         const t = P.toks[tk]
@@ -877,31 +814,28 @@ export function symUfcsScanDetailCharAt(i: i32, j: i32) {
   if i < 0 || i >= ufcDetail.length { return 0 }
   ufcDetail[i][j]
 }
-// Candidate `i`'s decl-name TOKEN — the driver maps it to the owning module
+// Candidate `i`'s decl-name token — the driver maps it to the owning module
 // (`modOfTok`), which is the module key the host writes an import from.
 export function symUfcsScanTokAt(i: i32) {
   if i < 0 || i >= ufcTok.length { return -1 }
   ufcTok[i]
 }
-// 1 when candidate `i`'s declaration carried an `export` modifier. A candidate in
-// a DEP module that is not exported cannot be imported and must not be offered
-// (`std:str`'s private `mapAsciiCase` fits `self: string` exactly like its
-// exported neighbours); one in the ENTRY module needs no import either way, so
-// the caller — which is the side that knows which module is the entry — applies
-// the flag rather than this scan dropping the row.
+// 1 when candidate `i`'s declaration carried an `export` modifier. An unexported
+// candidate in a dep module cannot be imported and must not be offered; one in the
+// entry module needs no import either way, so the caller — the side that knows which
+// module is the entry — applies the flag rather than this scan dropping the row.
 export function symUfcsScanExportedAt(i: i32) {
   if i < 0 || i >= ufcExported.length { return 0 }
   ufcExported[i]
 }
-// ── Signature help (D9.10): the callee's parameter table at (line, col) ───────
-// `fnSigStr` above answers "what does this function look like"; this answers
-// "…and which of its parameters is argument 3". Same zip, kept in COLUMNS — see
-// `check_state.vl`'s header for why the rendered string cannot serve the second
-// question. A pure QUERY over what the check already recorded: it reads
-// `symOcc*` / `symBind*` / `symMem*` and the type arena, records nothing, and
-// changes no program's diagnostics or bytes.
+// ── signature help: the callee's parameter table at (line, col) ──────────────
 
-// One parameter row. The type renders through the USER pathway like every other
+// `fnSigStr` answers what a function looks like; this answers which of its parameters
+// is argument 3. The same zip kept in columns — `check_state.vl`'s `sigParName` block
+// says why the rendered string cannot serve the second question. A pure query over
+// what the check recorded: it records nothing and changes no diagnostics or bytes.
+
+// One parameter row. The type renders through the user pathway, like every other
 // string leaving this file.
 function sigPush(nm: string, ty: i32, dflt: string) {
   sigParName.push(nm)
@@ -910,15 +844,10 @@ function sigPush(nm: string, ty: i32, dflt: string) {
   0
 }
 
-// A parameter DEFAULT as source text, or "" when the parameter has none.
-//
-// A LOCAL RENDERER, not `format.vl`'s `expr`: the formatter is a LATER layer
-// (it imports this one's neighbours, not the other way round), and the whole set
-// v1 admits is four leaf shapes plus a sign. That set is closed by the checker's
-// own rule (`paramDefaultIsLiteral`), so the ladder cannot silently fall short
-// of the language — a form this does not know is a form the checker refuses.
-// The `Ident` arm DEMANGLES, because a module `const` default reads `SEP$m1` in
-// the merged arena and `SEP` in the file the user is looking at.
+// A parameter default as source text, or "" when the parameter has none. A local
+// renderer rather than `format.vl`'s `expr`, since the formatter is a later layer and
+// the admitted set is closed by the checker's own `paramDefaultIsLiteral`. The `Ident`
+// arm demangles: a module `const` default reads `SEP$m1` in the merged arena.
 function sigDefaultText(pIx: i32): string {
   const dIx = paramDefaultOf(pIx)
   if dIx < 0 { return "" }
@@ -939,12 +868,9 @@ function sigDefaultText(pIx: i32): string {
   ""
 }
 // Fill the table from function type `ty`, naming the parameters off `declNode`'s
-// `FuncDecl` when there is one and it agrees on arity (`fnSigStr`'s defensive
-// gate, and for the same reason: a disagreeing pair would label argument k with
-// parameter k+1's name). `skip` drops leading parameters — 1 for a UFCS call,
-// whose `self` the receiver already supplied. Returns the ROW COUNT, or -1 when
-// `ty` is not a function; the two are distinguishable because a parameterless
-// function is a real signature with an empty table.
+// `FuncDecl` when there is one and it agrees on arity — a disagreeing pair would label
+// argument k with parameter k+1's name. `skip` drops leading parameters, 1 for a UFCS
+// call. Returns the row count, or -1 when `ty` is not a function.
 function sigFill(declNode: i32, ty: i32, skip: i32) {
   if ty < 0 { return -1 }
   const t = T.tys[ty]
@@ -981,18 +907,10 @@ function sigFill(declNode: i32, ty: i32, skip: i32) {
   sigRet = tyToStrUser(t.fnRet)
   pts.length - skip
 }
-// The declaring node of a free SELF-FUNCTION named `nm` — the UFCS rule the
-// emitter applies (`emit_rewrite.vl`'s `drwSelfFnOf`): a top-level function whose
-// FIRST parameter is NAMED `self`. Matched on the DEMANGLED name, because a
-// multi-module merge renames every declaration (`shout` → `shout$m1`) while the
-// property token still reads `shout` — the same mangling `symTypeAliasAt` has to
-// see through. -1 when no such function is declared.
-//
-// ARITY IS DELIBERATELY NOT CHECKED, where the emitter's rule checks it: the emitter
-// knows how many arguments the call HAS, and a signature-help query is asked halfway
-// through typing them. Nor is the receiver's type: this is a display query, and a
-// `self`-function of the right NAME is what the user is mid-way through calling. First
-// match wins — two modules may each declare one, and either beats no answer.
+// The declaring node of a free `self`-function named `nm`, or -1 — the emitter's UFCS
+// rule (`emit_rewrite.drwSelfFnOf`): a top-level function whose first parameter is
+// named `self`, matched on the demangled name since a merge renames declarations but
+// not the property token. A display query: neither arity nor receiver type is asked.
 function sigSelfFnDeclOf(nm: string) {
   let i = 0
   while i < symBindNode.length {
@@ -1014,7 +932,7 @@ function sigSelfFnDeclOf(nm: string) {
   }
   -1
 }
-// The IDENT token text at (line, col), or "" — the member PROPERTY name a
+// The identifier token text at (line, col), or "" — the member property name a
 // position query lands on when the cursor is not on a tracked occurrence.
 // End-inclusive, like every position query in this file.
 function sigIdentAt(line: i32, col: i32) {
@@ -1033,18 +951,10 @@ function sigIdentAt(line: i32, col: i32) {
   }
   ""
 }
-// The parameter table of the function being CALLED, whose name is at (line, col).
-// Returns the parameter count, or -1 when nothing there is callable. Three routes, in
-// the order a call site can name a callee:
-//
-//   1. A tracked BINDING — `greet(…)`, an import, or a function-typed local.
-//   2. A member whose type RESOLVED — a struct field holding a function (`o.cb(…)`).
-//      A UFCS callee carries the `SYM_MEM_METHOD` sentinel instead, so it falls past.
-//   3. UFCS — `x.f(…)` over a free `function f(self, …)`, `self` row dropped.
-//
-// Not served: a BUILTIN method (`xs.push`, `s.slice`) — the checker types those in the
-// call arms without recording a member type. Closing it wants the builtin table to grow
-// a parameter column, not a second resolver here.
+// The parameter table of the function being called, whose name is at (line, col);
+// returns the parameter count, or -1 when nothing there is callable. Three routes: a
+// tracked binding; a member whose type resolved (a UFCS callee carries
+// `SYM_MEM_METHOD` and falls past); UFCS itself, `self` row dropped.
 export function symSigAt(line: i32, col: i32) {
   sigParName = []
   sigParType = []

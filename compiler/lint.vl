@@ -1,33 +1,15 @@
-// Static lint pass for the self-hosted front end (roadmap B17, "diagnostics build-out"):
-// a post-parse analysis over the AST arena (`P.nodes`), deliberately a SEPARATE module
-// because it consumes the arena the parser already built rather than re-deriving
-// scope/binding information.
+// Static lint pass for the self-hosted front end: a post-parse analysis over the AST
+// arena (`P.nodes`), separate from the checker because it consumes the arena the
+// parser already built rather than re-deriving scope and binding information. The
+// rule set is `lint()`'s call sequence, not this header; each rule's own section says
+// what it fires on and the bound it accepts.
 //
-// THE RULE SET IS `lint()`'S CALL SEQUENCE, not this header — a list here goes stale the
-// first time a rule is added. Each rule has its own section header below carrying what it
-// fires on, the bound it accepts and why. `empty-intersection` is deliberately absent: the
-// type checker already emits the equivalent `never`-type error, so a lint would add nothing.
-//
-// ── What this pass RECONSTRUCTS, and why ─────────────────────────────────────
-// The rules want per-binding metadata (`mutable`, `exported`, `isImport`, per-occurrence
-// `isWrite`) and full start/stop source ranges. The front end carries NEITHER:
-//   - the symbol table (`typecheck.vl`) is a flat parallel-`i32[]` model keyed by
-//     declaring-node index, recording occurrence/decl/use and a coarse binding KIND only;
-//   - the AST has no full-span side-table — `nodeToks[i]` anchors a node at its LAST token
-//     (`ast.vl`; see docs/internals/selfhost-spans-design.md) — and the parser DROPS the
-//     `export` modifier entirely.
-// So this pass derives what the rules need DIRECTLY from the AST + token stream: use/write
-// by NAME (used iff referenced, written iff an assignment LHS), and `export` by token scan
-// (an `EXPORT` keyword two tokens before a declaration's name). Consequently EVERY
-// diagnostic below is anchored at a single `line:col` — the node's anchor, name, or keyword
-// token — never a start-stop range.
-//
-// BINDING IDENTITY: variable/parameter use/write tracking is BINDING-keyed — a lexical
-// scope stack resolves each `Ident` occurrence to the innermost visible declaration — so an
-// inner binding reusing an outer name no longer masks the outer one. FUNCTION references
-// stay name-keyed (functions hoist and dispatch by name: `Call` callees, UFCS `.m(…)`
-// properties, operator methods), which is the residual divergence — a local shadowing a
-// FUNCTION name attributes the name's uses to the local.
+// The rules want per-binding metadata and full source ranges, and the front end
+// carries neither: the symbol table is keyed by declaring-node index with a coarse
+// kind only, `nodeToks[i]` anchors a node at its last token, and the parser drops the
+// `export` modifier. So this pass resolves each `Ident` through a lexical scope stack
+// for use and write, and finds `export` by token scan; every diagnostic below is
+// anchored at a single line:col, and function references stay name-keyed.
 
 import {
   ArrayLit,
@@ -72,15 +54,15 @@ import {
   nodeChildren,
   nodeToks,
 } from "./ast"
-// The free INDEX-OPERATOR declaration-name encoding (B14).
+// The free index-operator declaration-name encoding.
 import { OP_INDEX_GET, OP_INDEX_SET, opDeclLabel, opDeclOpOf } from "./ast"
 
-// ── Diagnostic sink ──────────────────────────────────────────────────────────
-// Parallel arrays, mirroring the native checker's `T.diags` shape but kept as a
-// module global (the lint pass has no `Checker` struct of its own). Each entry is
-// one diagnostic: its `code`, human message, severity ("error"/"warning"/
-// "info"/"hint"), and a single-point source position (line/col of the anchor
-// token — the native AST carries no full span; see the header).
+// ── diagnostic sink ──────────────────────────────────────────────────────────
+
+// Parallel arrays, mirroring the native checker's `T.diags` shape but kept as module
+// globals. Each entry is one diagnostic: its code, human message, severity, and a
+// single-point source position — the anchor token's line and col, since the AST
+// carries no full span.
 let lintCodes: string[] = []
 export let lintMsgs: string[] = []
 let lintSevs: string[] = []
@@ -103,9 +85,9 @@ export function lintSevAt(i: i32) { lintSevs[i] }
 export function lintLineAt(i: i32) { lintLines[i] }
 export function lintColAt(i: i32) { lintCols[i] }
 
-// The anchor token of arena node `ix` (its LAST consumed token — the native AST
-// has no full span). `lintLineOf`/`lintColOf` read its source position, falling
-// back to 0 on an out-of-range index (the same bounds-check contract as `tErr`).
+// The anchor token of arena node `ix` — its last consumed token, since the AST has no
+// full span. `lintLineOf` / `lintColOf` read its source position, falling back to 0
+// on an out-of-range index (the same bounds-check contract as `tErr`).
 function lintLineOf(ix: i32) {
   if ix >= 0 && ix < nodeToks.length {
     const tk = nodeToks[ix]
@@ -143,9 +125,9 @@ function lintEmitAtPos(
   0
 }
 
-// Append one diagnostic positioned directly at TOKEN index `tk` (used where the
-// anchor token of the node is the wrong point — e.g. a declaration's NAME token
-// or the `let` keyword, which the unused-variable / prefer-const rules point at).
+// Append one diagnostic positioned directly at token index `tk`, for a rule whose
+// point is not the node's anchor — a declaration's name token, or the `let` keyword
+// the prefer-const fix rewrites.
 function lintEmitAtTok(code: string, msg: string, sev: string, tk: i32) {
   let ln = 0
   let co = 0
@@ -162,22 +144,19 @@ function startsUnderscore(name: string) {
   name.slice(0, 1) == "_"
 }
 
-// ── Lint entrypoint ──────────────────────────────────────────────────────────
+// ── lint entrypoint ──────────────────────────────────────────────────────────
 // Run all AST-derivable rules over the parsed program rooted at `progRoot` (a
-// `Program` arena index). Appends to the diagnostic sink (read via the
-// `lint*At`/`lintCount` exports); returns the diagnostic count. Never traps:
-// every arena access is bounds-checked or guarded by an `is`-narrowing.
+// `Program` arena index). Appends to the diagnostic sink and returns the diagnostic
+// count. Never traps: every arena access is bounds-checked or guarded by `is`.
 export function lint(progRoot: i32) {
   lintReset()
   if progRoot < 0 || progRoot >= P.nodes.length { return 0 }
   const root = P.nodes[progRoot]
   if root is Program {
     const stmts = root.progStmts
-    // Rule order: unused-variable, unused-imports, duplicate-imports, unused-function,
-    // prefer-const, then one full-program walk per structural rule. Display order is
-    // position-sorted downstream (the CLI's stable sort), so the emit sequence here only
-    // breaks same-position ties. The binding/reference scan drives the binding rules
-    // and unused-function alike, so collect it once first.
+    // Rule order: the binding and reference scan first, since the binding rules and
+    // unused-function share it. Display order is position-sorted downstream, so the
+    // emit sequence here only breaks same-position ties.
     collectBindingsAndRefs(progRoot)
     unusedBindings()
     unusedImports()
@@ -191,9 +170,9 @@ export function lint(progRoot: i32) {
     lintWalk(lintRuleHasGuardReread, progRoot)
     lintWalk(lintRuleUnionLetNoMelt, progRoot)
     lintWalk(lintRuleUnusedPureExpr, progRoot)
-    // Not walks: neither comments, nor a loop's SHAPE, nor a ladder's DEFAULT is in the
-    // arena. All four read the source the driver set, and `commentBudget` consumes it,
-    // so it runs last — after the std audience pass, which reads the same text.
+    // Not walks: neither comments, nor a loop's shape, nor a ladder's default is in
+    // the arena. All four read the source the driver set, and `commentBudget` consumes
+    // it, so it runs last — after the std audience pass, which reads the same text.
     arenaScanLint()
     kindLadderLint()
     sentinelIndexLint()
@@ -204,17 +183,16 @@ export function lint(progRoot: i32) {
 }
 
 // ── union-let-no-melt ────────────────────────────────────────────────────────
-// A union-typed `let` DECLARED INSIDE A LOOP and written again in the body boxes on every
-// trip where the `const u = if … else …` spelling does not. The compiler cannot just fix
-// it: Heap2Local scalarizes per allocation SITE, two `struct.new` into one local defeat it,
-// and collapsing it is a REPRESENTATION change refused twice (`unboxed-union-rep-design.md`
-// §13.3, §13.6) — so the cheap alternative being invisible in the source is a diagnostic's
-// job. LOOP BODIES ONLY, since outside one it is a single allocation: an accepted
-// false-NEGATIVE bound that also keeps the rule quiet. SYNTACTIC, because that is all this
-// pass has (see the file header), with exclusions so what remains really boxes: `T | null`
-// is a NICHE, an all-literal union interns as an i32 atom, and a `|` nested in
-// `[]`/`()`/`{}` belongs to an element or field. An ALIAS hiding a literal union is the
-// residual it over-reports.
+
+// A union-typed `let` declared inside a loop and written again in the body boxes on
+// every trip, where the `const u = if … else …` spelling does not. Collapsing the two
+// allocation sites is a representation change refused in `unboxed-union-rep-design.md`
+// §13.3, so the cheap alternative being invisible in the source is a diagnostic's job.
+
+// Loop bodies only — outside one it is a single allocation — and syntactic, with the
+// exclusions that keep what remains really boxing: `T | null` is a niche, an
+// all-literal union interns as an i32 atom, and a `|` nested in `[]` / `()` / `{}`
+// belongs to an element or field. An alias hiding a literal union is over-reported.
 function unionLetNoMeltVisit(ix: i32) {
   const n = P.nodes[ix]
   let body = -1
@@ -226,8 +204,8 @@ function unionLetNoMeltVisit(ix: i32) {
   0
 }
 
-// Report every qualifying `let` DIRECTLY in this loop body's statement list. Nested loops
-// are reached by the walker's own visit of them, so this does not recurse into one.
+// Report every qualifying `let` directly in this loop body's statement list. Nested
+// loops are reached by the walker's own visit of them, so this does not recurse in.
 function reportUnionLetsIn(blockIx: i32, loopBody: i32) {
   if blockIx < 0 || blockIx >= P.nodes.length { return 0 }
   const b = P.nodes[blockIx]
@@ -261,8 +239,8 @@ function reportUnionLetsIn(blockIx: i32, loopBody: i32) {
   0
 }
 
-// Whether the annotation at `tyIx` is a union that reps as a BOX: two or more non-`null`
-// members at the TOP level, not all of them literals.
+// Whether the annotation at `tyIx` is a union that reps as a box: two or more
+// non-`null` members at the top level, not all of them literals.
 function boxUnionAnnotation(tyIx: i32) {
   if tyIx < 0 || tyIx >= P.nodes.length { return false }
   const t = P.nodes[tyIx]
@@ -286,8 +264,8 @@ function boxUnionAnnotation(tyIx: i32) {
   true
 }
 
-// Split a rendered type name on TOP-LEVEL `|` only — a bar inside `[]`, `()`, `{}` or `<>`
-// belongs to an element or a field, not to this type.
+// Split a rendered type name on top-level `|` only — a bar inside `[]`, `()`, `{}` or
+// `<>` belongs to an element or a field, not to this type.
 function topLevelUnionParts(name: string) {
   const out: string[] = []
   let depth = 0
@@ -318,8 +296,8 @@ function trimSpaces(s: string) {
 }
 
 // A literal member of a union spelling: a quoted string, or something starting with a
-// digit or `-` (a numeric literal). `true`/`false` are the boolean TYPE's values, not a
-// literal-union member spelling, so they are not treated as literals here.
+// digit or `-`. `true` / `false` are the boolean type's values, not a literal-union
+// member spelling, so they are not treated as literals here.
 function looksLiteral(p: string) {
   if p.length == 0 { return false }
   const c = p.slice(0, 1)
@@ -348,17 +326,14 @@ function nameReassignedIn(ix: i32, name: string) {
 }
 
 // ── map-has-guard-reread ─────────────────────────────────────────────────────
-// `if m.has(k) { … m[k] … }` — the guard PROBES the map, then the read probes it AGAIN,
-// and the guard buys nothing: it does not narrow the read.
-//
-// WHY IT CANNOT NARROW, so the rule is not asking for a missing feature: `m[k]` is not a
-// stable place. Carrying "present" from the guard to the read needs a proof that nothing
-// mutated `m` and nothing changed `k` in between — including through any call — which is an
-// aliasing analysis, not a narrowing rule. SO THE FIX IS A SPELLING, and there are two,
-// which is why this is `info` and names both: `m[k] as! V` asserts presence (one probe, no
-// box), or bind once — `const v = m[k]` — and narrow `v`, which IS a stable place.
-// CONSERVATIVE: only a plain-name receiver and a plain-name-or-literal key, and it declines
-// when the guard body assigns to either or calls a mutating method on the receiver.
+
+// `if m.has(k) { … m[k] … }` probes the map twice, and the guard buys nothing: it does
+// not narrow the read, and cannot — `m[k]` is not a stable place, so carrying
+// "present" across needs an aliasing analysis. The fix is a spelling and there are
+// two, which is why this is `info` and names both.
+
+// Conservative: a plain-name receiver and a plain-name-or-literal key only, and it
+// declines when the guard body assigns to either or calls a mutating method on it.
 function hasGuardRereadVisit(ix: i32) {
   const s = P.nodes[ix]
   if s is IfStmt {
@@ -370,22 +345,13 @@ function hasGuardRereadVisit(ix: i32) {
     if rn == "" { return 0 }
     if !isPlainKey(key) { return 0 }
     if blockMutates(s.ifThen, rn, key) { return 0 }
-    // A CALL BETWEEN THE GUARD AND THE READ DISQUALIFIES IT, and this is a CORRECTNESS
-    // bound on the advice rather than politeness. The suggested fix — bind once, before
-    // the guard — reads the map EARLIER; if anything in between mutates it, the binding
-    // holds a stale value and the rewrite changes behaviour. A call is opaque here (this
-    // pass has no call graph), so any statement holding one, ahead of the read's own
-    // statement, is enough to decline.
-    //
-    // Found by running the rule on this compiler: `declaredTyOfName` is
-    // `if cUserTypes.has(name) { forceDeclFill(name)  … cUserTypes[name] … }`, and
-    // `forceDeclFill` FILLS the entry the guard just tested. Suggesting a bind-once there
-    // would have been actively wrong.
+    // A call between the guard and the read disqualifies it, and that is a correctness
+    // bound rather than politeness: the suggested bind-once reads the map earlier, so
+    // anything mutating it in between makes the rewrite change behaviour. A call is
+    // opaque here, since this pass has no call graph.
     if stmtsCallBeforeRead(s.ifThen, rn, key) { return 0 }
-    // THE ADVICE DEPENDS ON WHAT THE BODY ALREADY DOES. A body that has reached for
-    // `as!` is not being told to reach for it — it is being told the GUARD is the
-    // redundant half, since `as!` already asserts presence and traps without one. Naming
-    // the fix a caller has already applied is how a lint teaches people to ignore it.
+    // The advice depends on what the body already does: a body reaching for `as!` is
+    // told the guard is the redundant half, since `as!` asserts presence on its own.
     const bang = blockRereadsAsBang(s.ifThen, rn, key)
     if bang >= 0 {
       lintEmit(
@@ -419,18 +385,10 @@ function hasGuardRereadVisit(ix: i32) {
   0
 }
 
-// The map RECEIVER a `m.has(k)` guard probes, or -1.
-//
-// `.has` ONLY — NOT the `m[k] != null` spelling, and the exclusion is a PRECISION bound
-// rather than an oversight. This pass is AST-only (see this file's header), so it cannot
-// tell a MAP from an ARRAY, and `xs[0] != null` over a `(string | null)[]` followed by
-// `xs[0]` is a perfectly ordinary element read with no probe in it at all. Measured: the
-// `!= null` form fired on three corpus files, every one of them an array. `.has` is a map
-// method, so requiring it is what makes the receiver a map without needing a type.
-//
-// The lost case is `if m[k] != null { … m[k] … }` over a real map, which does double-probe
-// and is not reported. A false NEGATIVE in a hint costs a missed suggestion; the false
-// POSITIVE it replaces costs the rule's credibility.
+// The map receiver a `m.has(k)` guard probes, or -1. `.has` only, never the
+// `m[k] != null` spelling: this pass is AST-only and cannot tell a map from an array,
+// so `xs[0] != null` over a `(string | null)[]` would read as a probe. The lost case
+// is a real map spelled `!= null` — a false negative in a hint, not a false positive.
 function guardProbeRecv(condIx: i32) {
   if condIx < 0 || condIx >= P.nodes.length { return -1 }
   const c = P.nodes[condIx]
@@ -446,7 +404,7 @@ function guardProbeRecv(condIx: i32) {
   -1
 }
 
-// The KEY a `m.has(k)` guard probes with — the mirror of `guardProbeRecv`.
+// The key a `m.has(k)` guard probes with — the mirror of `guardProbeRecv`.
 function guardProbeKey(condIx: i32) {
   if condIx < 0 || condIx >= P.nodes.length { return -1 }
   const c = P.nodes[condIx]
@@ -462,18 +420,10 @@ function guardProbeKey(condIx: i32) {
   -1
 }
 
-// A plain binding NAME, or "" for anything else (a call result, a field read, …). The rule
-// compares receiver and key SYNTACTICALLY, so it only accepts shapes it can compare.
 // Peel any nested parentheses, returning the innermost wrapped expression index — the
-// front-end twin of `emit_base.unwrapParen`, written here because `lint` is a POST-PARSE
-// pass over the arena and does not import the emit layer.
-//
-// It exists for the ASSIGNMENT-TARGET question below. `(x) = 5` writes `x`, and every rule
-// in this file that asks "which binding does this assignment write" read the LHS node RAW,
-// so a parenthesised target marked nothing: prefer-const then reported ``x` is never
-// reassigned; use `const` instead of `let`` about a binding that is (D1089's front-end
-// half — the emitter had the identical omission, and the two were found by the same
-// program).
+// front-end twin of `emit_base.unwrapParen`, written here because this is a post-parse
+// pass over the arena and does not import the emit layer. It exists for the
+// assignment-target question: `(x) = 5` writes `x`, which a raw LHS read misses (D1089).
 function lintUnwrapParen(ix: i32) {
   if ix < 0 || ix >= P.nodes.length { return ix }
   const n = P.nodes[ix]
@@ -481,6 +431,9 @@ function lintUnwrapParen(ix: i32) {
   ix
 }
 
+// A plain binding name, or "" for anything else (a call result, a field read, …). The
+// rule compares receiver and key syntactically, so it only accepts shapes it can
+// compare.
 function plainIdentName(ix: i32) {
   const px = lintUnwrapParen(ix)
   if px < 0 || px >= P.nodes.length { return "" }
@@ -559,9 +512,9 @@ function blockMutates(ix: i32, recvName: string, key: i32) {
   false
 }
 
-// Whether a STATEMENT holding a call precedes the statement holding the read. Statement
-// granularity is the point: `print(m[k])` is one statement whose call CONTAINS the read
-// (fine), while `f(x)` on the line above is a statement that does not (not fine).
+// Whether a statement holding a call precedes the statement holding the read.
+// Statement granularity is the point: `print(m[k])` is one statement whose call
+// contains the read, while `f(x)` on the line above is a statement that does not.
 function stmtsCallBeforeRead(blockIx: i32, recvName: string, key: i32) {
   if blockIx < 0 || blockIx >= P.nodes.length { return false }
   const b = P.nodes[blockIx]
@@ -591,8 +544,8 @@ function subtreeHasCall(ix: i32) {
   false
 }
 
-// The first `recvName[key]` read that is ALREADY the operand of an `as!`. Separate from
-// `blockRereads` so the two can carry different advice — see the caller.
+// The first `recvName[key]` read that is already the operand of an `as!`. Separate
+// from `blockRereads` so the two can carry different advice — see the caller.
 function blockRereadsAsBang(ix: i32, recvName: string, key: i32) {
   if ix < 0 || ix >= P.nodes.length { return -1 }
   const n = P.nodes[ix]
@@ -624,8 +577,8 @@ function unparen(ix: i32) {
   ix
 }
 
-// The arena index of the first `recvName[key]` READ inside the block, or -1. The read is
-// what the diagnostic points at — the guard is fine, it is the second probe that is not.
+// The arena index of the first `recvName[key]` read inside the block, or -1. The read
+// is what the diagnostic points at: the guard is fine, the second probe is not.
 function blockRereads(ix: i32, recvName: string, key: i32) {
   if ix < 0 || ix >= P.nodes.length { return -1 }
   const n = P.nodes[ix]
@@ -645,17 +598,16 @@ function blockRereads(ix: i32, recvName: string, key: i32) {
 }
 
 // ── unused-pure-expression ───────────────────────────────────────────────────
-// A NON-FINAL expression statement whose value is discarded and whose evaluation is
-// trivially pure does nothing at all — a stray edit, half of a deleted line, a mistyped
-// assertion. FINAL statements are exempt EVERYWHERE: VL is expression-oriented and a
-// block's tail IS its value, so only a statement with another after it in the same list
-// can have its value discarded for sure.
-//
-// TRIVIALLY PURE is a closed syntactic whitelist — literals, a bare identifier read, `(e)`
-// over pure, an array/struct literal of pure parts, and an operator expression whose every
-// leaf is a LITERAL. Anything holding a call, member access or index stays quiet: a call has
-// effects and a member/index read can trap. The LITERAL-LEAF bound is SOUNDNESS, not
-// caution — VL has operator overloading, and dispatch needs an OBJECT-typed left operand.
+
+// A non-final expression statement whose value is discarded and whose evaluation is
+// trivially pure does nothing at all. Final statements are exempt everywhere: VL is
+// expression-oriented and a block's tail is its value, so only a statement with
+// another after it in the same list can have its value discarded for sure.
+
+// Trivially pure is a closed syntactic whitelist — literals, a bare identifier read,
+// `(e)` over pure, an array or struct literal of pure parts, and an operator
+// expression whose every leaf is a literal. The literal-leaf bound is soundness: VL
+// has operator overloading, and dispatch needs an object-typed left operand.
 function unusedPureExprVisit(ix: i32) {
   const n = P.nodes[ix]
   if n is Block { reportUnusedPureIn(n.blkStmts) }
@@ -663,7 +615,7 @@ function unusedPureExprVisit(ix: i32) {
   0
 }
 
-// Report every trivially-pure NON-FINAL statement of one statement list. `i + 1 <
+// Report every trivially-pure non-final statement of one statement list. `i + 1 <
 // length` is the whole final-statement exemption: the last entry is never examined.
 function reportUnusedPureIn(stmts: i32[]) {
   let i = 0
@@ -682,8 +634,8 @@ function reportUnusedPureIn(stmts: i32[]) {
 }
 
 // The closed binary-operator whitelist: every value-producing operator the parser
-// climbs (`binPrec`), and nothing else. `=` (and the compound assignments, which
-// desugar to it) is absent — an assignment is an effect, not a discarded value.
+// climbs (`binPrec`), and nothing else. `=` and the compound assignments that desugar
+// to it are absent — an assignment is an effect, not a discarded value.
 function upePureBinOp(op: string) {
   if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" {
     return true
@@ -696,11 +648,10 @@ function upePureBinOp(op: string) {
   false
 }
 
-// The operator-expression sub-language whose LEAVES are all literals: a literal, `(e)`
-// over one, unary `-` / `!` over one, or a whitelisted binary over two. This — not
-// `upeIsPure` — is what an operator's operands are held to, because an IDENTIFIER
-// operand could carry a user type and dispatch the operator to an overload (see the
-// section comment); a literal cannot.
+// The operator-expression sub-language whose leaves are all literals: a literal, `(e)`
+// over one, unary `-` / `!` over one, or a whitelisted binary over two. This, and not
+// `upeIsPure`, is what an operator's operands are held to, because an identifier
+// operand could carry a user type and dispatch the operator to an overload.
 function upeLitOperand(ix: i32) {
   if ix < 0 || ix >= P.nodes.length { return false }
   const e = P.nodes[ix]
@@ -721,11 +672,10 @@ function upeLitOperand(ix: i32) {
   false
 }
 
-// Whether the expression at `ix` is trivially pure — see the section comment for the
-// whitelist. Anything unrecognized (a call, a member, an index, `is`/`as`, a block, a
-// recovery node, an absent slot) answers `false`: the rule only fires on shapes it can
-// vouch for. Operator expressions fall through to `upeLitOperand`, which demands
-// literal leaves.
+// Whether the expression at `ix` is trivially pure. Anything unrecognized — a call, a
+// member, an index, `is` / `as`, a block, a recovery node, an absent slot — answers
+// false: the rule only fires on shapes it can vouch for. Operator expressions fall
+// through to `upeLitOperand`, which demands literal leaves.
 function upeIsPure(ix: i32) {
   if ix < 0 || ix >= P.nodes.length { return false }
   const e = P.nodes[ix]
@@ -753,16 +703,12 @@ function upeIsPure(ix: i32) {
   upeLitOperand(ix)
 }
 
-// ── Generic AST walk (one child-enumerator, per-rule visit dispatch) ──────────
-// Every structural rule needs the same full recursive traversal of the node
-// arena. One shared walker carries the recursion: `nodeChildren` is the ONE
-// place that knows each variant's child slots, and `lintWalk` drives a pre-order
-// traversal calling one rule's per-node visit, selected by a rule id (module-
-// level function dispatch — the codebase's no-closures idiom). Growing the AST
-// means extending `nodeChildren` once; every rule picks the new kind up. (The
-// binding/reference scan is the one traversal NOT driven through `lintWalk`: it
-// needs scope enter/exit and statement ordering — see `bindScan` — but its
-// default case still recurses through `nodeChildren`.)
+// ── generic AST walk (one child-enumerator, per-rule visit dispatch) ─────────
+
+// Every structural rule needs the same recursive traversal of the node arena, so one
+// shared walker carries it: `nodeChildren` is the one place that knows each variant's
+// child slots, and `lintWalk` drives a pre-order visit selected by a rule id. The
+// binding scan is the one traversal not driven through it — it needs scope enter/exit.
 const lintRuleConstBranch = 0
 const lintRuleStepZero = 1
 const lintRuleUnreachable = 2
@@ -792,18 +738,16 @@ function lintWalk(rule: i32, ix: i32) {
   0
 }
 
-// ── 3. Dead / constant branch (literal-boolean condition) ────────────────────
-// Detect statically-dead branches driven by a LITERAL boolean condition (no general
-// constant folding — only a `BoolLit` in condition position):
-//   - `if false { … }`            → the then-branch is dead.
-//   - `if true { … } else { … }`  → the else-branch is dead.
-//   - `while false { … }`         → the body never runs.
-// One warning per dead construct, pointing at the dead branch/body; the shared walker
-// (`lintWalk`) carries the recursion, so nested constructs are still scanned.
-//
-// VL desugars an `else if` chain into a NESTED `IfStmt` in the `ifElse` slot, so a chained
-// `else if false` is reached by the ordinary recursion into `ifElse`: each `IfStmt` examines
-// its OWN single condition, which is the natural fit for the desugared shape.
+// ── 3. dead / constant branch (literal-boolean condition) ────────────────────
+
+// A statically-dead branch driven by a literal boolean condition, with no general
+// constant folding: `if false`, the `else` of `if true`, and `while false`. One
+// warning per dead construct, pointing at the dead branch or body; the shared walker
+// carries the recursion, so nested constructs are still scanned.
+
+// VL desugars an `else if` chain into a nested `IfStmt` in the `ifElse` slot, so each
+// `IfStmt` examines its own single condition and a chained `else if false` is reached
+// by the ordinary recursion.
 function constantBranchVisit(ix: i32) {
   const s = P.nodes[ix]
   if s is IfStmt { reportConstantIf(s) }
@@ -855,16 +799,12 @@ function reportConstantWhile(node: WhileStmt) {
   0
 }
 
-// ── 4. Degenerate `for` step (literal `step 0`) ──────────────────────────────
-// A range `for` written with a literal `step 0` never advances its loop variable
-// — a degenerate / infinite loop. Reported as an ERROR. The shared walker
-// reaches nested bodies. (The native type checker ALSO flags this — see
-// `checkRangeNeverRuns` in `typecheck.vl` — so the two would double-report if
-// combined; this port reproduces the lint rule's own diagnostic for the
-// standalone-lint differential. ONE SENTENCE FOR ONE RULE: the wording is the
-// checker's, so the two streams cannot drift into two names for one condition.
-// The checker's fold is WIDER — it reaches `step -0` and `step (0)` — because
-// the lint pass reads no expression it did not lex. D1588.)
+// ── 4. degenerate `for` step (literal `step 0`) ──────────────────────────────
+
+// A range `for` written with a literal `step 0` never advances its loop variable — a
+// degenerate loop, reported as an error. The wording is `checkRangeNeverRuns`'s, so
+// the lint and the checker cannot drift into two names for one condition; the
+// checker's fold is wider, since this pass reads no expression it did not lex (D1588).
 function degenerateStepVisit(ix: i32) {
   const s = P.nodes[ix]
   if s is ForRange { reportDegenerateStep(s) }
@@ -888,18 +828,16 @@ function reportDegenerateStep(node: ForRange) {
   0
 }
 
-// ── 5. Unreachable code ──────────────────────────────────────────────────────
-// Whether a statement ALWAYS stmtDiverges — control never falls through to a following
-// sibling. Direct diverging statements are `return`/`break`/`continue`. A block diverges
-// when ANY of its statements does (everything after the first divergence is itself
-// unreachable, but the block as a whole still diverges). An `if` diverges only when it has
-// an `else` AND both arms diverge. Conservative: anything uncertain is fall-through, so
-// reachable code is never reported unreachable.
-//
-// NAME: `stmtDiverges`, not `diverges` — a bare `diverges` collides with a LOCAL
-// `let diverges` in typecheck.vl, and the seed's capture analysis (which excludes top-level
-// function names from a lambda's captures) then mis-resolves that local, emitting "captured
-// variable not found in enclosing frame". The unique name sidesteps that bug.
+// ── 5. unreachable code ──────────────────────────────────────────────────────
+
+// Whether a statement always diverges — control never falls through to a following
+// sibling. `return` / `break` / `continue` diverge directly; a block diverges when any
+// of its statements does; an `if` only when it has an `else` and both arms diverge.
+// Conservative: anything uncertain is fall-through, so live code is never reported.
+
+// The name is `stmtDiverges` and not `diverges`, because a bare `diverges` collides
+// with a local of that name in typecheck.vl and the seed's capture analysis then
+// mis-resolves it.
 function stmtDiverges(ix: i32) {
   if ix < 0 || ix >= P.nodes.length { return false }
   const s = P.nodes[ix]
@@ -924,11 +862,10 @@ function stmtDiverges(ix: i32) {
   false
 }
 
-// Report the FIRST unreachable statement in each block (one diagnostic per
-// block). The shared walker reaches every block — nested blocks, `if` branches,
-// loop bodies, blocks in expression position, function bodies — and still
-// recurses into an already-dead tail, so unreachable code nested deeper is
-// reported too.
+// Report the first unreachable statement in each block, one diagnostic per block. The
+// shared walker reaches every block — nested, `if` branches, loop bodies, blocks in
+// expression position, function bodies — and still recurses into an already-dead
+// tail, so unreachable code nested deeper is reported too.
 function unreachableVisit(ix: i32) {
   const s = P.nodes[ix]
   if s is Block {
@@ -951,18 +888,17 @@ function unreachableVisit(ix: i32) {
   0
 }
 
-// ── 6. Unconditional recursion ───────────────────────────────────────────────
-// A function that calls ITSELF on every path through its body can never return -
-// `function loop(n: i32): i32 { return loop(n + 1) }`, a missing base case. The ANNOTATED
-// spelling is the one no other diagnostic sees: without the annotation the checker reports
-// "cannot infer a return type", and annotating it silences that message without fixing the
-// defect, so this rule is deliberately annotation-independent.
-//
-// It asks a clean-PATH existence question, not "does the body contain a self-call": it fires
-// only when NO path reaches a function exit without one. That keeps real recursion quiet — a
-// base case is a clean exit, a self-call in a loop body or one `if` arm may be skipped, one
-// behind `&&`/`||`/`??` short-circuits. SCOPE is direct self-recursion over ONE body, never
-// descending into a nested `FuncDecl`; mutual recursion needs a whole-module call graph.
+// ── 6. unconditional recursion ───────────────────────────────────────────────
+
+// A function that calls itself on every path through its body can never return. The
+// annotated spelling is the one no other diagnostic sees: without the annotation the
+// checker reports "cannot infer a return type", and annotating it silences that
+// message without fixing the defect, so this rule is annotation-independent.
+
+// It asks a clean-path existence question, not "does the body contain a self-call", so
+// a base case, a self-call in a loop body or one `if` arm, and one behind a short
+// circuit all stay quiet. Direct self-recursion over one body only; mutual recursion
+// needs a whole-module call graph.
 const URC_EXIT = 1 // some path RETURNS from the function without a self-call
 const URC_FALL = 2 // some path REACHES THE NEXT statement without a self-call
 
@@ -977,14 +913,13 @@ function uncondRecursionVisit(ix: i32) {
     if s.fnName.length == 0 || s.fnBody < 0 { return 0 }
     urcName = s.fnName
     if urcStmtFlags(s.fnBody) == 0 {
-      // Falling off the end of the body IS a return (the block's implicit
-      // value), so `0` — neither a clean exit nor a clean fall-through — means
-      // every path recurses.
+      // Falling off the end of the body is a return (the block's implicit value), so
+      // `0` — neither a clean exit nor a clean fall-through — means every path recurses.
       const msg = "This function always recurses: every path through `" +
         opDeclLabel(s.fnName) +
         "` calls it again, so the call never returns"
-      // Anchor at the declaration's NAME token: the node's own anchor is its
-      // closing `}`, which points at the wrong line.
+      // Anchor at the declaration's name token: the node's own anchor is its closing
+      // `}`, which points at the wrong line.
       const nameTok = declNameTokOf(ix)
       if nameTok >= 0 {
         lintEmitAtTok("unconditional-recursion", msg, "warning", nameTok)
@@ -996,11 +931,10 @@ function uncondRecursionVisit(ix: i32) {
   0
 }
 
-// Is `ix` the callee position of a call to the function under analysis? Every
-// call form the parser produces — plain `f(…)`, UFCS `x.m(…)`, an operator — is
-// a `Call` with an `Ident` callee, so the one name test covers them all. Like
-// the unused-function rule this is NAME-keyed, so a local shadowing the
-// function's name would be read as the function (documented in the header).
+// Is `ix` the callee position of a call to the function under analysis? Every call
+// form the parser produces — plain `f(…)`, UFCS `x.m(…)`, an operator — is a `Call`
+// with an `Ident` callee, so one name test covers them all. Name-keyed, so a local
+// shadowing the function's name reads as the function.
 function urcIsSelfCallee(ix: i32) {
   if ix < 0 || ix >= P.nodes.length { return false }
   const c = P.nodes[ix]
@@ -1061,10 +995,9 @@ function urcExprClean(ix: i32) {
   } else if e is AsExpr {
     return urcExprClean(e.asObj)
   } else if e is Block {
-    // VL's block-valued forms reach expression position; their clean paths are
-    // the statement analysis's. The delegation is ONE-WAY by construction — the
-    // three kinds below are handled EXPLICITLY in `urcStmtFlags`, so it never
-    // bounces an expression back here and the two functions cannot spin.
+    // VL's block-valued forms reach expression position; their clean paths are the
+    // statement analysis's. The delegation is one-way by construction — the three kinds
+    // below are handled explicitly in `urcStmtFlags` — so the two cannot spin.
     return urcStmtFlags(ix) != 0
   } else if e is IfStmt {
     return urcStmtFlags(ix) != 0
@@ -1150,29 +1083,23 @@ function urcBlockFlags(stmts: i32[]) {
   exits | URC_FALL
 }
 
-// ── 1b. Unused functions ─────────────────────────────────────────────────────
+// ── 1b. unused functions ─────────────────────────────────────────────────────
+
 // A top-level `function` declared but never referenced anywhere in its file is dead
-// code. The port relies on an AST reference-name set ALONE, because the symbol table
-// lacks the binding metadata: the callee of every `Call` plus every bare `Ident` value
-// reference. The parser desugars every call form — plain `f(…)`, UFCS `x.m(…)`,
-// operator `a + b` — into a `Call` whose callee is an `Ident`, so those names capture
-// method and operator dispatch too, and a function referenced by EITHER signal is spared.
-//
-// Exemptions: an `export`ed function is public surface (never flagged); a `_`-prefixed
-// name is the intentionally-unused marker (downgraded to a `hint`, not a warning).
-// A string-keyed presence map (the `idxByName` idiom): O(1) has/add per name, where the
-// previous string-array scan was O(names) per identifier.
+// code. The signal is an AST reference-name set alone: the callee of every `Call`
+// plus every bare `Ident`. The parser folds every call form — plain, UFCS, operator —
+// into a `Call` with an `Ident` callee, so those names capture dispatch too.
+
+// Exemptions: an `export`ed function is public surface and never flagged; a
+// `_`-prefixed name is the intentionally-unused marker and downgrades to a `hint`.
 let lintRefNames: {[string]: i32} = Map()
 
 function refNamesHas(name: string) { (lintRefNames[name] ?? 0) != 0 }
 
-// Did the file use a bracket at all — a READ `x[i]`, a WRITE `x[i] = v`? An
-// INDEX OPERATOR (B14) has no callable name, so the reference-NAME set above
-// structurally cannot see it referenced: its only use spelling is the bracket,
-// which resolves to a declaration by the receiver's TYPE, and lint runs on the
-// parse tree with no types. These two flags are the whole signal this walk can
-// honestly give — enough to keep flagging an operator in a file that brackets
-// nothing, and never enough to flag one that might be the bracket's target.
+// Did the file use a bracket at all — a read `x[i]`, a write `x[i] = v`? An index
+// operator has no callable name, so the reference-name set above structurally cannot
+// see it referenced: its only use spelling is the bracket, which resolves by the
+// receiver's type, and lint runs on the parse tree with no types.
 let lintSawIndexRead = false
 let lintSawIndexWrite = false
 
@@ -1181,18 +1108,12 @@ function refNamesAdd(name: string) {
   0
 }
 
-// ── Import-use side channels (unused-import) ─────────────────────────────────
-// An import can be used in ways an `Ident` occurrence never captures:
-//   - a UFCS member-call `x.m(…)` dispatching to an imported free function `m`
-//     (the property is a string on the `Member`, not an `Ident` — and it names
-//     the FUNCTION regardless of any local shadowing, so it must not ride the
-//     binding-keyed channel);
-//   - a TYPE position: an annotation (`p: Point`, `Box<Point>`, `Tok[]`), an
-//     `x is T` guard, or a union alias's variant list — type names never appear
-//     as value `Ident`s.
-// Two name SETS collect those (populated by `nameVisit` and the flat arena scan
-// `collectTypeNameRefs`); `unusedImports` consults them alongside the
-// binding-keyed `declUsed` flag.
+// ── import-use side channels (unused-import) ─────────────────────────────────
+
+// An import can be used in ways an `Ident` occurrence never captures: a UFCS
+// member-call whose property is a string on the `Member` and names the function
+// regardless of shadowing, and a type position, since type names are never value
+// `Ident`s. `unusedImports` consults both sets alongside the binding-keyed `declUsed`.
 let lintPropNames: {[string]: i32} = Map()
 
 function propNamesHas(name: string) { (lintPropNames[name] ?? 0) != 0 }
@@ -1233,11 +1154,10 @@ function typeNamesAddSegments(name: string) {
   0
 }
 
-// Flat arena scan for TYPE-position name references. Position-independent (type
-// names have no value scope here), so a flat pass over `P.nodes` covers every
-// annotation slot — including the ones the scope-aware `bindScan` skips (a
-// `let`'s/param's/return's `TypeRef` child) — plus `is` guards and union
-// variant lists. Struct-field annotations are `TypeRef` arena nodes too.
+// Flat arena scan for type-position name references. Position-independent — type
+// names have no value scope here — so a flat pass over `P.nodes` covers every
+// annotation slot, including the ones the scope-aware `bindScan` skips, plus `is`
+// guards and union variant lists.
 function collectTypeNameRefs() {
   let i = 0
   while i < P.nodes.length {
@@ -1260,18 +1180,17 @@ function collectTypeNameRefs() {
   0
 }
 
-// ── Binding-keyed use/write tracking (the scope-aware scan) ──────────────────
-// unused-variable and prefer-const key on BINDING IDENTITY, not name: each
-// `let`/`const`/parameter declaration gets an entry in `declNodes`/`declKinds` (source
-// order) with parallel `declUsed`/`declWritten` flags, and every `Ident` occurrence resolves
-// to the INNERMOST visible binding of that name — so an inner binding reusing an outer name
-// no longer masks the outer one. The name map above still records EVERY referenced name,
-// because function/operator/UFCS dispatch is name-keyed (`unusedFunctions`) and hoists.
-//
-// The scope model is approximate and every approximation is conservative for its consumers:
-// top-level `let`s hoist for resolution; a block-local binds from its own statement onward
-// (so `let x = x + 1` reads the OUTER x); a loop variable shadows without being a reported
-// binding; and a FUNCTION name is not a scope entry at all.
+// ── binding-keyed use/write tracking (the scope-aware scan) ──────────────────
+
+// unused-variable and prefer-const key on binding identity, not name: each declaration
+// gets an entry in `declNodes` / `declKinds` with parallel `declUsed` / `declWritten`
+// flags, and every `Ident` occurrence resolves to the innermost visible binding of
+// that name. The name map above still records every referenced name, since it hoists.
+
+// The scope model is approximate and every approximation is conservative: top-level
+// `let`s hoist for resolution; a block-local binds from its own statement onward, so
+// `let x = x + 1` reads the outer `x`; a loop variable shadows without being a
+// reported binding; and a function name is not a scope entry at all.
 let declUsed: i32[] = []
 let declWritten: i32[] = []
 
@@ -1280,11 +1199,10 @@ let declWritten: i32[] = []
 let visNames: string[] = []
 let visIds: i32[] = []
 
-// Register the declaration at node `ix` (kind 0 = let/const, 1 = param, 2 =
-// import local) and push it onto the scope stack. `tok` is the binding's NAME
-// token when the node itself can't provide it (an `ImportDecl` declares SEVERAL
-// names, so `declNameTokOf` is ambiguous — kind 2 passes its per-name token);
-// kinds 0/1 pass -1 and their consumers keep reading `declNameTokOf`.
+// Register the declaration at node `ix` (kind 0 = let/const, 1 = param, 2 = import
+// local) and push it onto the scope stack. `tok` is the binding's name token when the
+// node cannot provide it — an `ImportDecl` declares several names, so kind 2 passes
+// its per-name token while kinds 0 and 1 pass -1 and read `declNameTokOf`.
 function bindPush(name: string, ix: i32, kind: i32, tok: i32) {
   declNodes.push(ix)
   declKinds.push(kind)
@@ -1324,19 +1242,16 @@ function bindMark(name: string, flag: i32) {
   0
 }
 
-// Record the node-local names exactly as the TS walk does — the callee IDENT of
-// a `Call`, any bare `Ident` value reference, and operator-method dispatch —
-// into the name map, AND resolve Ident occurrences to their binding.
+// Record the node-local names — the callee `Ident` of a `Call`, any bare `Ident` value
+// reference, and operator-method dispatch — into the name map, and resolve `Ident`
+// occurrences to their binding.
 function nameVisit(ix: i32) {
   const n = P.nodes[ix]
   if n is Call {
-    // The TS `collectReferencedNames` records the callee NAME of every
-    // `FunctionCall` — and the TS parser has ALREADY desugared a UFCS method call
-    // (`x.m(…)`) and an operator method (`a + b`) into a `FunctionCall` whose
-    // `function` is the bare method/operator name. The native parser does NOT
-    // desugar at parse time: `x.m(…)` stays `Call { callFn: Member(x, "m") }`. So
-    // to capture the SAME reference set, record an Ident callee's name AND a
-    // Member callee's property name (the UFCS method name the call dispatches to).
+    // Record an `Ident` callee's name and a `Member` callee's property name: the
+    // native parser does not desugar at parse time, so `x.m(…)` stays
+    // `Call { callFn: Member(x, "m") }` and the property is the UFCS method name the
+    // call dispatches to.
     if n.callFn >= 0 && n.callFn < P.nodes.length {
       const fn = P.nodes[n.callFn]
       if fn is Ident {
@@ -1349,24 +1264,15 @@ function nameVisit(ix: i32) {
       }
     }
   } else if n is Ident {
-    // Every occurrence counts as a use — including an assignment LHS (the TS
-    // model, where a write occurrence is also a use, keeping a write-only
-    // binding off the unused-variable list).
+    // Every occurrence counts as a use, an assignment LHS included, which keeps a
+    // write-only binding off the unused-variable list.
     refNamesAdd(n.identName)
     bindMark(n.identName, 0)
   } else if n is Unary {
-    // THERE IS NO UNARY OPERATOR DISPATCH — this line used to claim there was, and
-    // added `n.unOp` on that belief, which is how a dead `function -(self: i32)`
-    // escaped the unused-function report as well as the checker (D444).
-    // `checkUnaryNode` never looks for an operator function and `opSelfFnTy` returns
-    // -1 below arity 2; the declaration is now refused at itself in `parseFuncTail`,
-    // so nothing reaches here that wants naming.
-    //
-    // THE NAME IS STILL RECORDED, deliberately: `n.unOp` is `"-"`, `"!"`, `"p+"` or
-    // `"p-"`, none of which can name a declaration this linter tracks (an arity-2
-    // `function -(self, other)` is named by the BinExpr arm below, which IS the arm
-    // that dispatches). Dropping the call would be a second change riding along with
-    // a comment fix; keeping it costs one no-op insert.
+    // The name is recorded although there is no unary operator dispatch: `n.unOp` is
+    // `"-"`, `"!"`, `"p+"` or `"p-"`, none of which can name a declaration this linter
+    // tracks, and an arity-2 `function -(self, other)` is named by the `BinExpr` arm
+    // below, which is the arm that dispatches (D444).
     refNamesAdd(n.unOp)
   } else if n is Index {
     lintSawIndexRead = true
@@ -1391,9 +1297,9 @@ function nameVisit(ix: i32) {
   0
 }
 
-// Scan the initializer (and inert type slot) of the `LetDecl` at `six`, WITHOUT
-// binding its name — the Program arm hoists top-level bindings up front, and
-// the sequential arms bind AFTER the initializer, so `let x = x` reads outer x.
+// Scan the initializer (and inert type slot) of the `LetDecl` at `six` without binding
+// its name — the `Program` arm hoists top-level bindings up front, and the sequential
+// arms bind after the initializer, so `let x = x` reads the outer `x`.
 function bindScanLetInit(six: i32) {
   const s = P.nodes[six]
   if s is LetDecl { bindScan(s.letInit) }
@@ -1407,10 +1313,9 @@ function bindScan(ix: i32) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
   const n = P.nodes[ix]
   if n is Program {
-    // Hoist top-level `let`s AND import locals: bind them all first, so a use
-    // inside a function declared ABOVE the global still resolves to it, then
-    // scan statements. An `ImportDecl` registers one kind-2 binding PER LOCAL
-    // (its `as` alias, else the name), each with its own name token.
+    // Hoist top-level `let`s and import locals: bind them all first, so a use inside a
+    // function declared above the global still resolves to it, then scan statements. An
+    // `ImportDecl` registers one kind-2 binding per local, each with its own name token.
     const mark = visNames.length
     let h = 0
     while h < n.progStmts.length {
@@ -1457,15 +1362,10 @@ function bindScan(ix: i32) {
     bindScanLetInit(ix)
     bindPush(n.letName, ix, 0, -1)
   } else if n is FuncDecl {
-    // A function scope: parameter DEFAULTS, then parameters, then the body.
-    //
-    // THE DEFAULTS ARE SCANNED BEFORE THE PARAMETERS ARE BOUND, and the order is
-    // the rule rather than a convenience: a default's names resolve at the
-    // DECLARATION, in the ENCLOSING scope — the parameters do not exist yet when
-    // the substituted expression is evaluated. Scanning them after the binds
-    // would attribute `function f(K: i32, b: i32 = K)`'s use to the parameter,
-    // which is the reading the checker refuses. Without scanning them at all, a
-    // module `const` named ONLY by a default reads as "Unused variable".
+    // A function scope: parameter defaults, then parameters, then the body. The defaults
+    // are scanned before the parameters bind, because a default's names resolve at the
+    // declaration in the enclosing scope — scanning them after would attribute
+    // `function f(K: i32, b: i32 = K)`'s use to the parameter, which the checker refuses.
     const mark = visNames.length
     let pd = 0
     while pd < n.fnParams.length {
@@ -1536,28 +1436,23 @@ function collectBindingsAndRefs(progRoot: i32) {
   0
 }
 
-// Whether the top-level declaration at arena node `ix` carried an `export`
-// modifier — `ast.declHasExportKw`, which is where the token-stream recovery
-// moved when the LSP's UFCS-candidate scan needed the same answer (see its
-// header). Kept as a local name because three rules below read it.
+// Whether the top-level declaration at arena node `ix` carried an `export` modifier —
+// `ast.declHasExportKw`, which is where the token-stream recovery lives, since the
+// LSP's UFCS-candidate scan needs the same answer. Kept as a local name because three
+// rules below read it.
 function declIsExported(ix: i32) { declHasExportKw(ix) }
 
-// ── 1. Unused variables / parameters + 2. prefer-const ───────────────────────
-// These two rules consume the per-BINDING use/write flags the scope-aware scan
-// (`bindScan` above) reconstructs from the AST — the native front end produces
-// no symbol table with `Binding` identity / occurrence `isWrite`, so the lint
-// derives the equivalent: `declUsed[i]` iff some `Ident` occurrence resolved to
-// declaration `i`, `declWritten[i]` iff such an occurrence was an assignment
-// LHS. Residual divergences vs the TS oracle's symbol table: function names
-// stay name-keyed (a local shadowing a function name attributes its uses to the
-// local), and a use the scan cannot resolve to a scope entry marks no binding.
+// ── 1. unused variables / parameters + 2. prefer-const ───────────────────────
 
-// Declarations to consider, registered by `bindPush` in scan order (source
-// order). Parallel arrays: the declaring node index, a KIND (0 = variable
-// `let`/`const`, 1 = parameter, 2 = import local), the declared NAME, and the
-// name TOKEN (kind 2 only; -1 elsewhere — kinds 0/1 read `declNameTokOf`).
-// De-dup is unnecessary — each declaration is one node, bound exactly once
-// (one entry PER NAME for an `ImportDecl`, which declares several).
+// Both rules consume the per-binding use and write flags `bindScan` reconstructs from
+// the AST: `declUsed[i]` iff some `Ident` occurrence resolved to declaration `i`, and
+// `declWritten[i]` iff such an occurrence is an assignment LHS. Function names stay
+// name-keyed, and a use the scan cannot resolve to a scope entry marks no binding.
+
+// Declarations to consider, registered by `bindPush` in scan order. Parallel arrays:
+// the declaring node index, a kind (0 = variable, 1 = parameter, 2 = import local),
+// the declared name, and the name token (kind 2 only; -1 elsewhere). No de-dup needed
+// — one node per declaration, with one entry per name for an `ImportDecl`.
 let declNodes: i32[] = []
 let declKinds: i32[] = []
 let declNames: string[] = []
@@ -1634,18 +1529,14 @@ function unusedBindings() {
   0
 }
 
-// unused-import: an import local (kind-2 binding) never referenced in its own module. USED
-// means any of three channels hit: an `Ident` occurrence resolved to the binding (the scope
-// stack, so a use of a SHADOWING local does not spare the import); a UFCS member-call
-// property naming it (dispatch is by name, so value shadowing does not apply); or a TYPE
-// position (annotation segment, `is` guard, union variant). Anchored at the imported NAME
-// token, under the code the LSP remove-import quick-fix dispatches on. No `_`-downgrade —
-// that would need aliasing, and the fix is to remove the specifier. A re-export registers no
-// binding, so re-exported names are never flagged.
-//
-// A NAME BOUND BY TWO IMPORTS REPORTS ONCE, AT THE LAST OF THEM: binding-keyed tracking gives
-// every use to the INNERMOST binding, and two import bindings of one local name are the same
-// declaration in any program that compiles (D1120 refuses the other case).
+// unused-import: an import local never referenced in its own module. Used means any
+// of three channels hit — an `Ident` occurrence resolved to the binding, a UFCS
+// member-call property naming it, or a type position. Anchored at the imported name
+// token, under the code the LSP remove-import quick-fix dispatches on.
+
+// A name bound by two imports reports once, at the last of them: binding-keyed
+// tracking gives every use to the innermost binding, and two import bindings of one
+// local name are the same declaration in any program that compiles (D1120).
 function unusedImports() {
   let i = 0
   while i < declNodes.length {
@@ -1667,8 +1558,8 @@ function unusedImports() {
   0
 }
 
-// True when a LATER import binding (kind 2) binds `name` too — i.e. the entry at
-// `i` is shadowed by an identical-named import further down the module.
+// True when a later import binding (kind 2) binds `name` too — the entry at `i` is
+// shadowed by an identically-named import further down the module.
 function importNameReboundLater(i: i32, name: string) {
   let k = i + 1
   while k < declNodes.length {
@@ -1678,18 +1569,15 @@ function importNameReboundLater(i: i32, name: string) {
   false
 }
 
-// duplicate-import: ONE specifier written twice — a later specifier repeating an earlier one
-// in all three parts: the SOURCE text (`impPath`, quotes stripped), the imported NAME, and
-// the LOCAL binding, so the second introduces nothing.
-//
-// ALL THREE PARTS, because the two-part (source, local) test is the DRIVER's error, not a
-// lint: `{ area as a }` beside `{ box as a }` binds `a` to two declarations, which
-// `modDiagDupImport` refuses (D1120) — firing here too would warn about a program that does
-// not compile. And the SPECIFIER TEXT, not the resolved target: a lint reports what the
-// author WROTE, so a name reached through a re-export is one name two ways, not a repeat.
-//
-// Anchored at the SECOND occurrence's imported NAME token, the same anchor `unused-import`
-// uses, so the LSP's remove-import quick-fix applies unchanged.
+// duplicate-import: one specifier written twice — a later specifier repeating an
+// earlier one in all three parts, the source text, the imported name and the local
+// binding, so the second introduces nothing. Anchored at the second occurrence's
+// imported name token, so the LSP's remove-import quick-fix applies unchanged.
+
+// All three parts, because the two-part (source, local) test is the driver's error
+// and not a lint (D1120). And the specifier text, not the resolved target: a lint
+// reports what the author wrote, so a name reached through a re-export is one name
+// two ways, not a repeat.
 function duplicateImports(stmts: i32[]) {
   const seenPath: string[] = []
   const seenName: string[] = []
@@ -1744,11 +1632,10 @@ function duplicateImports(stmts: i32[]) {
   0
 }
 
-// prefer-const: a `let` (reassignable) that is referenced but never reassigned
-// should be the immutable `const`. Skips `const` declarations, `_`-prefixed
-// names, and an UNUSED binding (the more specific unused-variable rule owns it).
-// Emitted as `info`, pointed at the `let` keyword (the token the fix rewrites),
-// which is the token immediately before the declaration's name token.
+// prefer-const: a `let` that is referenced but never reassigned should be the
+// immutable `const`. Skips `const` declarations, `_`-prefixed names, and an unused
+// binding, which the more specific unused-variable rule owns. Emitted as `info` at
+// the `let` keyword — the token the fix rewrites, just before the name token.
 function preferConst() {
   let i = 0
   while i < declNodes.length {
@@ -1756,10 +1643,8 @@ function preferConst() {
     const kind = declKinds[i]
     if kind == 0 {
       const name = declNameOf(ix, kind)
-      // Skip EXPORTED bindings: an exported `let` is public surface that another
-      // module may reassign, which a single-file pass can't see (e.g. the compiler
-      // assembly's `export let declNameTok`, rebound by the driver) — so `const`
-      // can't be proven safe. (Mirrors the unused-variable rule's export skip.)
+      // Skip exported bindings: an exported `let` is public surface another module may
+      // reassign, which a single-file pass cannot see, so `const` is not provably safe.
       if !declIsConst(ix) && !startsUnderscore(name) && !declIsExported(ix) {
         // Used (else unused-variable owns it) and never written.
         if declUsed[i] != 0 && declWritten[i] == 0 {
@@ -1786,17 +1671,17 @@ function unusedFunctions(stmts: i32[]) {
     if ix >= 0 && ix < P.nodes.length {
       const s = P.nodes[ix]
       if s is FuncDecl {
-        // A referenced function (called, passed as a value, method/operator
-        // dispatch) is not dead. Exported functions are public surface. An
-        // INDEX OPERATOR is spared by the bracket's mere presence — the walk
-        // cannot say which declaration a bracket resolves to.
+        // A referenced function (called, passed as a value, method or operator dispatch)
+        // is not dead, and an exported one is public surface. An index operator is
+        // spared by the bracket's mere presence — the walk cannot say which declaration
+        // a bracket resolves to.
         let opUsed = false
         const opk = opDeclOpOf(s.fnName)
         if opk == OP_INDEX_GET { opUsed = lintSawIndexRead }
         if opk == OP_INDEX_SET { opUsed = lintSawIndexWrite }
         if !refNamesHas(s.fnName) && !declIsExported(ix) && !opUsed {
-          // The declaration reads back in its SOURCE spelling (`"[]" for V`),
-          // never as the name the parser minted for it.
+          // The declaration reads back in its source spelling (`"[]" for V`), never as
+          // the name the parser minted for it.
           const label = opDeclLabel(s.fnName)
           let sev = "warning"
           let msg = "Unused function `" +
@@ -1808,10 +1693,10 @@ function unusedFunctions(stmts: i32[]) {
               label +
               "` (leading `_` marks it unused)"
           }
-          // Anchor at the declaration's NAME token (like unused-variable /
-          // prefer-const): the node's own anchor is its LAST token — the closing
-          // `}` — which points the diagnostic at the wrong line. Fall back to
-          // the node anchor when no name token was stamped.
+          // Anchor at the declaration's name token, like unused-variable and
+          // prefer-const: the node's own anchor is its closing `}`, which points the
+          // diagnostic at the wrong line. Fall back to the node anchor when no name
+          // token is stamped.
           const nameTok = declNameTokOf(ix)
           if nameTok >= 0 {
             lintEmitAtTok("unused-function", msg, sev, nameTok)
@@ -1826,16 +1711,12 @@ function unusedFunctions(stmts: i32[]) {
   0
 }
 
-// ── comment rules: the four codes over one block walk ─────────────────────────
-//
-// A block is a maximal run of lines whose first non-space token is `//`; a blank
-// line, code, or a trailing comment ends it. Four clauses read it, each a rule of
-// `docs/internals/comment-style.md`: length (rule 2), a measurement with no graded
-// home (a comment is never re-graded, so its number goes stale in silence),
-// emphasis by capitalisation (rule 5), and history (rule 3).
-//
-// `scripts/comment-budget.py` is the same four clauses over the whole tree, for the
-// per-file ratchet; `tests/vl_comment_budget_test.ts` pins the two to agree.
+// ── comment rules: the four codes over one block walk ────────────────────────
+
+// A block is a maximal run of lines whose first non-space token is `//`; a blank line,
+// code, or a trailing comment ends it. Four clauses read it, each a rule of
+// `docs/internals/comment-style.md`: length, a measurement with no graded home,
+// emphasis by capitalisation, and history. `scripts/comment-budget.py` mirrors them.
 const cbBudget = 4
 
 // The module header is the first block with no code before it — blank lines and
@@ -1844,14 +1725,10 @@ const cbBudget = 4
 // room: what the module is for, and what it deliberately does not do.
 const cbHeaderBudget = 12
 
-// The module SOURCE, handed in by the driver before `lint(root)` (the
-// `fmtSetSource` idiom). Comments are lexer trivia the parse path never carries —
-// the per-module token cache banked none — so the text is the only reader here.
-// The scan CONSUMES it, so a caller that forgets the setter reports nothing rather
-// than the previous module's blocks.
-//
-// BOUND: a `//` opening a line inside a multi-line template literal reads as a
-// comment here. The ratchet script carries the same bound, so the two agree.
+// The module source, handed in by the driver before `lint(root)`. Comments are lexer
+// trivia the parse path never carries, so the text is the only reader here. The scan
+// consumes it, so a caller that forgets the setter reports nothing rather than the
+// previous module's blocks. A `//` opening a line inside a template literal reads as one.
 let cbSource = ""
 export function lintSetSource(src: string) {
   cbSource = src
@@ -1924,8 +1801,8 @@ function cbDigitsEnd(s: string, i: i32, b: i32) {
   j
 }
 
-// End of the run of PLAIN digits at `i` — a row id's digits, where a comma ends
-// the id rather than continuing it.
+// End of the run of plain digits at `i` — a row id's digits, where a comma ends the
+// id rather than continuing it.
 function cbPlainDigitsEnd(s: string, i: i32, b: i32) {
   let j = i
   while j < b && cbIsDigit(s[j]) { j = j + 1 }
@@ -1938,8 +1815,8 @@ function cbSpacesEnd(s: string, i: i32, b: i32) {
   j
 }
 
-// A UNIT a count can carry. `i32` never reads as the number 32: the caller only
-// asks on a digit run that starts at a word boundary (CLAUDE.md's `iN` lesson).
+// A unit a count can carry. `i32` never reads as the number 32: the caller only asks
+// on a digit run that starts at a word boundary (CLAUDE.md's `iN` lesson).
 function cbUnitAt(s: string, i: i32, b: i32) {
   cbWordIs(s, i, b, "cells") ||
     cbWordIs(s, i, b, "cell") ||
@@ -1957,8 +1834,8 @@ function cbVerdictAt(s: string, i: i32, b: i32) {
 }
 
 // A count at `i` carrying a unit (`12 cells`), a denominator (`4 of 315`), or a
-// graded verdict (`48 loud`) — the three shapes a measured number takes, per
-// CLAUDE.md's comment-budget section. (The examples are why this block cites it.)
+// graded verdict (`48 loud`) — the three shapes a claimed number takes, per
+// CLAUDE.md's comment-budget section.
 function cbCountAt(s: string, i: i32, b: i32) {
   const d = cbDigitsEnd(s, i, b)
   const k = cbSpacesEnd(s, d, b)
@@ -1996,8 +1873,8 @@ function cbPercentAt(s: string, i: i32, a: i32) {
   j > a && cbIsDigit(s[j - 1])
 }
 
-// `measured` with a digit before the sentence ends. The bare verb ("the arms are
-// measured against") is prose, not a claim, and matching it drowns the rule.
+// `measured` with a digit before the sentence ends: the bare verb is ordinary prose
+// rather than a claim, and matching it on its own drowns the rule.
 function cbMeasuredAt(s: string, i: i32, b: i32) {
   if cbWordAt(s, i - 1, b) || !cbAtI(s, i, b, "measured") { return false }
   if cbWordAt(s, i + 8, b) { return false }
@@ -2039,7 +1916,7 @@ function cbVerdictCountAt(s: string, i: i32, b: i32) {
 }
 
 // One left-to-right pass over the comment line `[a, b)`: 1 = states a measurement,
-// 2 = cites a graded home, 3 = both. Every clause is a LOCAL test at one index, so
+// 2 = cites a graded home, 3 = both. Every clause is a local test at one index, so
 // fusing them gives the same answer as the script's separate scans.
 function cbLineFlags(s: string, a: i32, b: i32) {
   let m = 0
@@ -2120,11 +1997,9 @@ function cbIsShoutWord(s: string, i: i32, e: i32) {
 }
 
 // Whether the comment line `[a, b)` shouts: two shout words in a row. A backticked
-// span is SKIPPED rather than treated as a break, so `THE `x` NAME` still shouts —
-// an identifier in backticks is not what rule 5 is about.
-//
-// BOUND: an unpaired backtick hides the rest of its line, and a span opened on one
-// line never closes on the next. The ratchet script carries the same bound.
+// span is skipped rather than treated as a break, since an identifier in backticks is
+// not what rule 5 is about. An unpaired backtick hides the rest of its line, a bound
+// the ratchet script carries too.
 function cbShoutLine(s: string, a: i32, b: i32) {
   let i = a
   let tick = 0
@@ -2154,7 +2029,7 @@ function cbShoutLine(s: string, a: i32, b: i32) {
 }
 
 // `w`, given lower-case, at `i` as a whole word with the source side's case folded.
-// The caller owns the LEADING boundary; this owns the trailing one.
+// The caller owns the leading boundary; this owns the trailing one.
 function cbHistWordAt(s: string, i: i32, b: i32, w: string) {
   cbAtI(s, i, b, w) && !cbWordAt(s, i + w.length, b)
 }
@@ -2226,7 +2101,7 @@ function cbNumStr(n: i32) {
   out
 }
 
-// Report one finished block's LENGTH and its uncited measurement. All four codes are
+// Report one finished block's length and its uncited measurement. All four codes are
 // `warning`; `scripts/lint-self.sh` holds each out of its own `info` gate while the
 // ratchet baseline still owes it.
 function cbReport(n: i32, ln: i32, co: i32, meas: i32, cited: i32, hdr: i32) {
@@ -2261,19 +2136,18 @@ function cbReport(n: i32, ln: i32, co: i32, meas: i32, cited: i32, hdr: i32) {
   0
 }
 
-// Whether the block just closed is THE module header: the first one, with no code
-// yet seen. `seenCode` stays 0 across blank lines and the leading import region,
-// which is the whole reason a multi-line `import { … } from "…"` is tracked here.
+// Whether the block just closed is the module header: the first one, with no code yet
+// seen. `seenCode` stays 0 across blank lines and the leading import region, which is
+// why a multi-line `import { … } from "…"` is tracked here.
 function cbIsHeader(seenCode: i32, headerTaken: i32) {
   if seenCode == 0 && headerTaken == 0 { return 1 }
   0
 }
 
 // Walk the source line by line, accumulating own-line `//` runs. O(bytes); the only
-// per-line state is a handful of counters, and a block stops being scanned for a tell
-// once that tell's flag is set. Length and the uncited measurement are block facts,
-// so they report when the block closes; shouting and history are LINE facts and
-// report where they stand, once per block per code.
+// per-line state is a handful of counters. Length and the uncited measurement are
+// block facts and report when the block closes; shouting and history are line facts
+// and report where they stand, once per block per code.
 function commentBudget() {
   const s = cbSource
   cbSource = ""
@@ -2371,40 +2245,37 @@ function commentBudget() {
 }
 
 // ── std-comment-audience ─────────────────────────────────────────────────────
-//
-// A std comment is API SURFACE: the person reading it imports the module, so a
-// header says what the module is for in a few lines, an export's doc comment
-// says what it does and what its edges are, and nothing cites a defect row, a
-// pull request, a date or the vocabulary of how VL is BUILT — that material
-// belongs in `docs/internals/`. Rubric: `docs/internals/std-api-review.md` §4.
-//
-// Scoped to `std/` by the module path the driver sets beside the source, so
-// every other tree keeps only the ordinary comment budget above.
+
+// A std comment is API surface: the person reading it imports the module, so a header
+// says what the module is for in a few lines, an export's doc comment says what it
+// does and what its edges are, and nothing cites a defect row, a pull request, a date
+// or the vocabulary of how VL is built. Rubric: `docs/internals/std-api-review.md` §4.
+
+// Scoped to `std/` by the module path the driver sets beside the source, so every
+// other tree keeps only the ordinary comment budget above.
 const scaHeaderBudget = 10
 const scaDocBudget = 4
 
-// The path or module key the current source belongs to. CONSUMED by the scan,
-// so a caller that forgets the setter lints nothing rather than grading this
-// module against the previous one's path.
+// The path or module key the current source belongs to. The scan consumes it, so a
+// caller that forgets the setter lints nothing rather than grading this module
+// against the previous one's path.
 let scaPath = ""
 export function lintSetPath(p: string) {
   scaPath = p
   0
 }
 
-// Whether `p` names a VL std module: the `std:` KEY the graph walk hands over, or
-// a target rooted at `std/` — which is how `lint-self.sh`'s `vl check std/` names
-// each file. A bare `/std/` ANYWHERE was tried and dropped: it would hold someone
-// else's `src/std/` to this rubric, and this rule is about VL's own std. ONE
-// residue is accepted knowingly: a user with their own top-level `std/` still
-// matches, and keying on the module key alone costs the gate its own scoping.
+// Whether `p` names a VL std module: the `std:` key the graph walk hands over, or a
+// target rooted at `std/`, which is how `lint-self.sh`'s `vl check std/` names each
+// file. A bare `/std/` anywhere would hold someone else's `src/std/` to this rubric.
+// One residue is accepted knowingly: a user's own top-level `std/` still matches.
 function scaIsStd(p: string): boolean {
   const b = p.length
   cbAt(p, 0, b, "std/") || cbAt(p, 0, b, "std:")
 }
 
-// `cbWordIs` folding the SOURCE side's case, so `DECISIONS` and `decisions` are
-// the same word.
+// `cbWordIs` folding the source side's case, so `DECISIONS` and `decisions` are the
+// same word.
 function scaWordIsI(s: string, i: i32, b: i32, w: string) {
   if cbWordAt(s, i - 1, b) { return false }
   cbAtI(s, i, b, w) && !cbWordAt(s, i + w.length, b)
@@ -2425,7 +2296,7 @@ function scaJargonStart(c: i32) {
     c == 'R'
 }
 
-// A word that names how VL is BUILT rather than how it is used.
+// A word that names how VL is built rather than how it is used.
 function scaJargonAt(s: string, i: i32, b: i32) {
   scaWordIsI(s, i, b, "decisions") ||
     scaWordIsI(s, i, b, "inventory") ||
@@ -2512,10 +2383,10 @@ function scaReport(
   0
 }
 
-// Walk the source line by line, resolving each block against what FOLLOWS it: a
-// block whose next non-blank line declares an `export` documents that export and
-// takes the tighter budget. A block followed by another comment block documents
-// nothing, so a section banner is not held to it. O(bytes), like the scan above.
+// Walk the source line by line, resolving each block against what follows it: a block
+// whose next non-blank line declares an `export` documents that export and takes the
+// tighter budget. A block followed by another comment block documents nothing, so a
+// section banner is not held to it. O(bytes), like the scan above.
 function stdCommentAudience() {
   const p = scaPath
   scaPath = ""
@@ -2597,24 +2468,23 @@ function stdCommentAudience() {
 }
 
 // ── arena-scan-outside-pass ──────────────────────────────────────────────────
-//
-// A loop bounded by a WHOLE-PROGRAM table is O(program). Run once, from a pass, that is
-// what a pass is for; asked once per function / node / module it is O(entities x nodes),
-// which is what #2419 cost (docs/internals/profiling-the-compiler.md). The shape has no
-// other tell: the source reads identically either way, and a wall clock only says so one
-// bootstrap step late.
-//
-// So the rule is structural. A scanner is legitimate when it is a PASS (the ordered table
-// in `emit_sections.vl`'s `runEmitPass`, plus the checker's entry) or on the allow-list
-// below; anything else is reported and carried by `scripts/scan-budget.py`'s ratchet. A
-// scan resuming from a memo (`let i = modUnionAsSeen`) is exempt — that IS the #2419 fix.
 
-// BOUND: this reads the source text, not the arena, so it knows the compiler's own tables
-// by SPELLING. A user program that names a binding `sNames` and loops to its length reads
-// as a hit. The tree this polices is this one, and the six names are distinctive.
-//
-// The whole-program tables: the AST arena and the module-wide registries. Each grows with
-// the program, so a loop bounded by one of them walks the program.
+// A loop bounded by a whole-program table is O(program). Run once from a pass, that is
+// what a pass is for; asked once per function or node it is O(entities × nodes), and
+// the shape has no other tell — the source reads identically either way, and a wall
+// clock only says so one bootstrap step late (docs/internals/profiling-the-compiler.md).
+
+// So the rule is structural: a scanner is legitimate when it is a pass (the ordered
+// table in `emit_sections.vl`'s `runEmitPass`, plus the checker's entry) or on the
+// allow-list below; anything else is reported and carried by `scripts/scan-budget.py`'s
+// ratchet. A scan resuming from a memo is exempt — that is the fix, not the shape.
+
+// This reads the source text, not the arena, so it knows the compiler's own tables by
+// spelling: a user program naming a binding `sNames` and looping to its length reads
+// as a hit. The tree this polices is this one, and the names below are distinctive.
+
+// The whole-program tables: the AST arena and the module-wide registries. Each grows
+// with the program, so a loop bounded by one of them walks the program.
 const asTables = [
   "P.nodes",
   "fnStmts",
@@ -2624,9 +2494,9 @@ const asTables = [
   "globalStmts",
 ]
 
-// The emitter's ordered pass table (`emit_sections.vl`, `runEmitPass`) plus `checkProgram`,
-// the checker's entry. `scripts/scan-budget.py` re-derives this list from `runEmitPass` and
-// fails when the two disagree, so the copy here cannot go stale in silence.
+// The emitter's ordered pass table (`emit_sections.vl`, `runEmitPass`) plus
+// `checkProgram`, the checker's entry. `scripts/scan-budget.py` re-derives this list
+// from `runEmitPass` and fails when the two disagree, so this copy cannot go stale.
 const asPasses = [
   "collectTyParamNames",
   "collectU",
@@ -2660,8 +2530,8 @@ const asPasses = [
   "checkProgram",
 ]
 
-// Scanners that are not pass-table rows and still run ONCE per program. Each was graded by
-// counting its callers; a new entry owes the same, and the reason on its own line.
+// Scanners that are not pass-table rows and still run once per program. Each entry is
+// graded by counting its callers, and a new one owes the same.
 const asAllow = [
   "canonEmitTypeNames",
   "collectAnonShapes",
@@ -2672,14 +2542,10 @@ const asAllow = [
   "startFnDetectScratch",
   "anonLeafIxBuild",
 ]
-// one caller: `checkProgram`'s rename over the finished arena
-// one caller: the anon-shape intern beside `collectA`
-// one caller: builds the data section once per module
-// one caller: `emitModule`'s global-promotion decision
-// two callers, each once per module: the type section's order
-// variant tags; its second call is its own re-run after the arena grew
-// one caller: `dupScanRun`, once per module per shadowed-name candidate (D1595)
-// one caller: `collectAnonShapes` banks the `??` family's name-keyed index (D1514)
+// Each entry above has one caller, or two that each run once per module: the arena
+// rename after `checkProgram`, the anon-shape intern, the data section, the
+// global-promotion decision, the type section's order, the variant tags,
+// `dupScanRun`'s per-candidate scan, and `collectAnonShapes`'s name-keyed index.
 
 // `name` occurs in `xs`.
 function asListHas(xs: string[], name: string) {
@@ -2692,8 +2558,8 @@ function asListHas(xs: string[], name: string) {
 }
 
 // The identifier starting at `i`, or "" when `s[i]` does not begin one. The result is
-// BOUND rather than left in tail position: a bare member call there is an emit refusal
-// (`emitProgram: unsupported member-call statement`) on a `vl check`-clean program.
+// bound rather than left in tail position: a bare member call there is an emit refusal
+// on a `vl check`-clean program.
 function asIdentAt(s: string, i: i32, b: i32) {
   if !cbWordAt(s, i, b) { return "" }
   if cbIsDigit(s[i]) { return "" }
@@ -2714,9 +2580,9 @@ function asTableAt(s: string, i: i32, b: i32) {
   ""
 }
 
-// `while <v> < <table>.length` — the induction variable, or "" when the line is not one.
-// A grow loop (`while xs.length < P.nodes.length { push }`) has no bare identifier here and
-// so is never a hit, which is right: it appends, it does not rescan.
+// `while <v> < <table>.length` — the induction variable, or "" when the line is not
+// one. A grow loop (`while xs.length < P.nodes.length { push }`) has no bare
+// identifier here and so is never a hit: it appends, it does not rescan.
 function asWhileVarOf(s: string, k: i32, b: i32) {
   if !cbAt(s, k, b, "while ") { return "" }
   const v = asIdentAt(s, k + 6, b)
@@ -2755,8 +2621,8 @@ function asZeroedNameOf(s: string, k: i32, b: i32) {
   v
 }
 
-// One pass over the source. Per line: open a function (resetting the zeroed set), record a
-// zeroed local, or grade a `while`. O(bytes), with one array of short names per body.
+// One pass over the source. Per line: open a function (resetting the zeroed set),
+// record a zeroed local, or grade a `while`. O(bytes), one array of names per body.
 function arenaScanLint() {
   const s = cbSource
   let i = 0
@@ -2805,23 +2671,21 @@ function arenaScanLint() {
 }
 
 // ── kind-ladder-incomplete / kind-ladder-split ───────────────────────────────
-//
-// A LADDER is a run of `if` / `else if` arms, inside ONE function, testing the SAME
-// subject against members of ONE closed set. It must be exhaustive over that set, or end
-// in a default that NAMES what it excludes — a refusal channel, a sentence, or a
-// delegation to the ladder that owns the rest. A bare fall-through to `-1` / `""` /
-// `false` / `0` names nothing: D1004/D1221, D981 and D1370 are three ways one did.
-//
-// `scripts/ladder-census.py` is the same walk over the whole tree; `ladder-budget.py` is
-// the per-file ratchet, and it RE-DERIVES every set below from the `export type` that
-// declares it, refusing to run when one has drifted.
 
-// BOUND: this reads the source text, not the arena, so a USER program declaring its own
+// A ladder is a run of `if` / `else if` arms, inside one function, testing the same
+// subject against members of one closed set. It must be exhaustive over that set, or
+// end in a default that names what it excludes — a refusal channel, a sentence, or a
+// delegation to the ladder that owns the rest. A fall-through to `-1` names nothing.
+
+// `scripts/ladder-census.py` is the same walk over the whole tree; `ladder-budget.py`
+// is the per-file ratchet, and it re-derives every set below from the `export type`
+// that declares it, refusing to run when one has drifted.
+
+// This reads the source text, not the arena, so a user program declaring its own
 // `type Node = …` is graded against the compiler's. The tree this polices is this one.
-//
-// Two arms, not three: the floor is measured, not chosen. At one arm the
-// `const n = P.nodes[ix]; if n is X { … }` guard idiom floods (1,901 silent ladders);
-// two is 408 and three 248, and D1370's ladder has exactly two.
+
+// Two arms, not three: at one arm the `const n = P.nodes[ix]; if n is X { … }` guard
+// idiom floods the report, and D1370's ladder has exactly two.
 const klMinArms = 2
 // A quoted run at least this long is a SENTENCE — a default that said something.
 const klMsgLen = 12
@@ -3051,8 +2915,8 @@ const klTokKind = [
   "USHR",
 ]
 
-// SMALLEST FIRST, so `klSetOf` can take the FIRST set that holds every arm and land on the
-// same answer the census's "smallest set containing them all" does.
+// Smallest first, so `klSetOf` can take the first set that holds every arm and land
+// on the same answer the census's "smallest set containing them all" does.
 const klSetNames = [
   "AsMode",
   "BtKind",
@@ -3067,11 +2931,11 @@ const klSetNames = [
   "Node",
   "TokKind",
 ]
-// 1 when the set's members are TYPE names (`x is TyObj`), 0 when they are string literals.
+// 1 when the set's members are type names (`x is TyObj`), 0 when string literals.
 const klSetIsType = [0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0]
 
-// The i-th set's members. A dispatch on an INDEX, not on a kind — the lint's own ladders
-// are over `i32`, so this rule cannot report itself.
+// The i-th set's members. A dispatch on an index, not on a kind — the lint's own
+// ladders are over `i32`, so this rule cannot report itself.
 function klSetMembers(i: i32): string[] {
   if i == 0 { return klAsMode }
   if i == 1 { return klBtKind }
@@ -3088,10 +2952,10 @@ function klSetMembers(i: i32): string[] {
   []
 }
 
-// The refusal channels a default may speak through. A ladder whose tail reaches one of
-// these has NAMED what it excludes, whatever it says. A FIXED-SENTENCE `tErr` variant
-// belongs here for the same reason `tErrUnsupported` does: extracting a raise's message into
-// one home must not make the raise invisible to this rule (D1585).
+// The refusal channels a default may speak through. A ladder whose tail reaches one
+// of these has named what it excludes, whatever it says. A fixed-sentence `tErr`
+// variant belongs here for the same reason `tErrUnsupported` does: extracting a
+// raise's message into one home must not make the raise invisible here (D1585).
 const klNamingCalls = [
   "emitFail",
   "emitFailAt",
@@ -3130,10 +2994,11 @@ function klIndexLines(s: string) {
 }
 
 // ── reading a line without building one ──────────────────────────────────────
-// Every helper below walks the RAW source and steps over string / char literals in place.
-// Blanking each line into a fresh string would be quadratic in a pass that runs on every
-// keystroke; skipping is linear and reads the same, which is what lets the census (which
-// does blank, in Python, where it is cheap) agree with this walk line for line.
+
+// Every helper below walks the raw source and steps over string and char literals in
+// place. Blanking each line into a fresh string would be quadratic in a pass that
+// runs on every keystroke; skipping is linear and reads the same, which is what lets
+// the census agree with this walk line for line.
 
 // Index just past the literal opening at `i`, or `b`.
 function klSkipLit(s: string, i: i32, b: i32) {
@@ -3147,8 +3012,8 @@ function klSkipLit(s: string, i: i32, b: i32) {
   b
 }
 
-// Where the line's CODE ends: at its `//` comment, or at `b`. A `//` inside a literal is
-// text, not a comment, which is why this walks rather than searching.
+// Where the line's code ends: at its `//` comment, or at `b`. A `//` inside a literal
+// is text, not a comment, which is why this walks rather than searching.
 function klCodeEnd(s: string, a: i32, b: i32) {
   let i = a
   while i < b {
@@ -3227,9 +3092,9 @@ function klCloser(s: string, i: i32, b: i32, op: i32, cl: i32) {
   -1
 }
 
-// End of a SUBJECT starting at `i`: an identifier, then any run of `.field`, `[…]` and
-// `(…)`. The four spellings the tree dispatches on — `n`, `ot.primName`, `P.nodes[ix]`,
-// `kindAt(k)` — and nothing that is not one.
+// End of a subject starting at `i`: an identifier, then any run of `.field`, `[…]`
+// and `(…)`. The four spellings the tree dispatches on — `n`, `ot.primName`,
+// `P.nodes[ix]`, `kindAt(k)` — and nothing that is not one.
 function klSubjEnd(s: string, i: i32, b: i32) {
   let j = klIdentEnd(s, i, b)
   if j < 0 { return -1 }
@@ -3250,9 +3115,9 @@ function klSubjEnd(s: string, i: i32, b: i32) {
   j
 }
 
-// Where an ARM's test begins on this line, or -1. A test anywhere else — a `||`
-// continuation, an assignment, a `while` — is part of ONE boolean expression and not a
-// rung: `startsStmt` asks about seventeen token kinds in a single `||` chain and
+// Where an arm's test begins on this line, or -1. A test anywhere else — a `||`
+// continuation, an assignment, a `while` — is part of one boolean expression and not
+// a rung: `startsStmt` asks about seventeen token kinds in a single `||` chain and
 // dispatches on none of them.
 function klArmLead(s: string, a: i32, e: i32) {
   const k = klIndentEnd(s, a, e)
@@ -3262,16 +3127,16 @@ function klArmLead(s: string, a: i32, e: i32) {
   -1
 }
 
-// `klTestAt`'s answer: the subject text, the member text, and 1 when the member is a TYPE
-// name. Read only after it returns true; it writes all three on every true.
+// `klTestAt`'s answer: the subject text, the member text, and 1 when the member is a
+// type name. Read only after it returns true; it writes all three on every true.
 let klTSubj = ""
 let klTMem = ""
 let klTIsType = 0
 
-// The arm test beginning at `k`: a STRICT FORWARD PARSE — subject, then `is` / `!is` /
-// `==` / `!=`. So `if !p(x)`, `if i >= 0` and `if a && b is C` are not arms. A scan that
-// searched ANYWHERE past the `if` would read the second conjunct of a compound condition
-// as the ladder's rung, and the census would then disagree with this walk.
+// The arm test beginning at `k`: a strict forward parse — subject, then `is` / `!is` /
+// `==` / `!=`. So `if !p(x)`, `if i >= 0` and `if a && b is C` are not arms. A scan
+// searching anywhere past the `if` would read the second conjunct of a compound
+// condition as the ladder's rung, and the census would then disagree with this walk.
 function klTestAt(s: string, k: i32, b: i32) {
   klTSubj = ""
   klTMem = ""
@@ -3307,8 +3172,8 @@ function klTestAt(s: string, k: i32, b: i32) {
 }
 
 // ── functions ────────────────────────────────────────────────────────────────
-// TOP-LEVEL functions only, by a column-0 `function` / `export function` header; each body
-// runs to the line before the next header.
+// Top-level functions only, by a column-0 `function` / `export function` header; each
+// body runs to the line before the next header.
 let klFnName: string[] = []
 let klFnLo: i32[] = []
 let klFnHi: i32[] = []
@@ -3332,13 +3197,11 @@ function klIndexFns(s: string) {
 }
 
 // ── the default region ───────────────────────────────────────────────────────
-// What runs when no arm matched. From the last arm, count braces: the arm's own block is
-// skipped, and a `} else {` at the chain's depth hands the region to the ELSE BODY, which
-// IS the default. Everything from there to the end of the function is the tail.
-//
-// Without the brace walk the region is the whole rest of the function, and a message
-// inside the LAST ARM reads as a named default — the hole then hides behind the one arm
-// that does have words.
+
+// What runs when no arm matched. From the last arm, count braces: the arm's own block
+// is skipped, and a `} else {` at the chain's depth hands the region to the else body,
+// which is the default. Without the brace walk the region is the whole rest of the
+// function, and a message inside the last arm would read as a named default.
 
 // `else` occurs before this line's first `{` — the `} else {` that continues a chain.
 function klElseBeforeBrace(s: string, k: i32, e: i32) {
@@ -3415,8 +3278,8 @@ function klLineCallsAny(s: string, a: i32, e: i32) {
   false
 }
 
-// True when the DEFAULT names what the ladder excludes: a refusal channel, a sentence long
-// enough to be one, or a delegation to another function of this module.
+// True when the default names what the ladder excludes: a refusal channel, a sentence
+// long enough to be one, or a delegation to another function of this module.
 function klTailNames(s: string, last: i32, hi: i32) {
   const ts = klTailStart(s, last, hi)
   let i = ts
@@ -3435,9 +3298,9 @@ function klTailNames(s: string, last: i32, hi: i32) {
   false
 }
 
-// True when the tail of the ladder ending at `last` calls `target` — a DELEGATING default,
-// which is what makes a pair of ladders one split walk rather than two functions that
-// happen to call each other.
+// True when the tail of the ladder ending at `last` calls `target` — a delegating
+// default, which is what makes a pair of ladders one split walk rather than two
+// functions that happen to call each other.
 function klTailCalls(s: string, last: i32, hi: i32, target: string) {
   let i = klTailStart(s, last, hi)
   while i <= hi {
@@ -3449,8 +3312,8 @@ function klTailCalls(s: string, last: i32, hi: i32, target: string) {
   false
 }
 
-// True when function `f`'s BODY calls `target` anywhere — the reachability half of the
-// split rule, where the tail is the delegation half.
+// True when function `f`'s body calls `target` anywhere — the reachability half of
+// the split rule, where the tail is the delegation half.
 function klBodyCalls(s: string, f: i32, target: string) {
   let i = klFnLo[f]
   while i <= klFnHi[f] {
@@ -3463,9 +3326,9 @@ function klBodyCalls(s: string, f: i32, target: string) {
 }
 
 // ── grading a group of arms ──────────────────────────────────────────────────
-// The closed set a group of arms is a ladder over: the FIRST — so, the smallest — set
-// holding every one of them. -1 when no set holds them all, which means the arms are not
-// one vocabulary and the group is not a ladder.
+// The closed set a group of arms is a ladder over: the first, and so the smallest, set
+// holding every one of them. -1 when no set holds them all, which means the arms are
+// not one vocabulary and the group is not a ladder.
 function klSetOf(mems: string[], a: i32, n: i32, isType: i32) {
   let si = 0
   while si < klSetNames.length {
@@ -3649,20 +3512,19 @@ function klScanFn(s: string, f: i32) {
 }
 
 // ── the split walk ───────────────────────────────────────────────────────────
-// One walk over one enum, SPLIT by syntactic position into two ladders that cover
-// disjoint subsets and hand the rest to each other. D981 is the worked instance: the
-// statement half tested `IfStmt` and delegated its default to the expression half, which
-// tested none and handed nothing back, so an `if`-expression arm fell out of the rename.
-//
-// THE UNION GAP — kinds NEITHER half tests — IS DELIBERATELY NOT A CLAUSE HERE, and the
-// omission is not an oversight to repair. It fires on `urcExprClean` / `urcStmtFlags`
-// below, a pair that hands back in BOTH directions and legitimately omits the leaf kinds
-// neither can reach. And it could not have caught D981 anyway: `IfStmt` was IN
-// `modRwStmt`'s arms, so it was never in that pair's gap — only the ONE-WAY drop sees it.
-// `scripts/ladder-census.py --split` prints the gap beside the drop, for reading.
 
-// Report `x` and `y` when x's DEFAULT delegates to y, y's body calls x back, and y drops
-// a kind x tests.
+// One walk over one enum, split by syntactic position into two ladders that cover
+// disjoint subsets and hand the rest to each other. D981 is the worked instance: the
+// statement half tested `IfStmt` and delegated its default to the expression half,
+// which tested none and handed nothing back, so an `if`-expression arm fell out.
+
+// The union gap — kinds neither half tests — is deliberately not a clause: it fires
+// on `urcExprClean` / `urcStmtFlags` below, a pair that hands back in both directions
+// and legitimately omits the leaf kinds neither can reach. Only the one-way drop is
+// the defect this rule is for.
+
+// Report `x` and `y` when x's default delegates to y, y's body calls x back, and y
+// drops a kind x tests.
 function klGradePair(s: string, x: i32, y: i32) {
   const fx = klLadFn[x]
   const fy = klLadFn[y]
@@ -3694,9 +3556,9 @@ function klGradePair(s: string, x: i32, y: i32) {
   1
 }
 
-// ONE diagnostic per FUNCTION PAIR, not per ladder pair: `parseBlock` and `parseStmt`
-// each carry two TokKind ladders and reported the same sentence twice at the same
-// position, which reads as a doubled finding rather than one split walk.
+// One diagnostic per function pair, not per ladder pair: `parseBlock` and `parseStmt`
+// each carry two `TokKind` ladders, and one sentence twice at one position reads as a
+// doubled finding rather than one split walk.
 let klSplitDone: string[] = []
 
 function klSplitWalks(s: string) {
@@ -3743,39 +3605,38 @@ function kindLadderLint() {
 }
 
 // ── sentinel-index-unguarded / sentinel-index-strict-untested ────────────────
-//
-// A TABLE READ `<table>[<idx>]` whose index arrived from something that answers an
+
+// A table read `<table>[<idx>]` whose index arrived from something that answers an
 // in-band "no answer" — a call, an arena field that is -1 while open, or a caller's
-// argument reached on a fall-through — with NO bound test between the arrival and the
-// read. `vl check` returns 0 and the COMPILER dies with an anonymous out-of-bounds
-// read: D1440, D1462 and D1500 are three of those, with a fourth on PR #2498 — all found
-// on one day, each at a different site. The rule, the derivation, the five controls and
-// the census numbers: docs/internals/sentinel-index-lint.md. Ratcheted per file by
-// scripts/sentinel-budget.py, whose analysis is this same walk in Python.
+// argument reached on a fall-through — with no bound test between the arrival and the
+// read. `vl check` returns 0 and the compiler dies with an anonymous out-of-bounds read.
 
-// A TABLE is a subscript base the reading function did NOT declare — not a parameter of
-// its own, not one of its `let` / `const` / `for` names. A function that built the list
-// can bound it from what it can see; one that did not is trusting a length that nothing
-// in front of it states.
+// The rule, the derivation and its controls: docs/internals/sentinel-index-lint.md.
+// Ratcheted per file by scripts/sentinel-budget.py, the same walk in Python.
 
-// The FIELDS this module admits can be absent: every `x.f` it compares against 0 or a
-// negative somewhere. Read from the module rather than written down, so `nInner` earns
-// its place from the guards the module already spells — D1440's whole shape is
+// A table is a subscript base the reading function did not declare — not a parameter
+// of its own, not one of its `let` / `const` / `for` names. A function that built the
+// list can bound it from what it can see; one that did not is trusting a length that
+// nothing in front of it states.
+
+// The fields this module admits can be absent: every `x.f` it compares against 0 or a
+// negative somewhere. Read from the module rather than written down, so `nInner`
+// earns its place from the guards the module already spells — D1440's whole shape is
 // `T.tys[t.nInner]` carrying the guard its sibling had and it did not.
 let siHoleF: string[] = []
 // This module's MAP globals — a key subscript, never an index.
 let siMapG: string[] = []
 
-// Per top-level function, PARALLEL to `klFnName` — this pass reuses the kind-ladder
+// Per top-level function, parallel to `klFnName` — this pass reuses the kind-ladder
 // module index. 1 when the function answers -1 in band, directly or by handing back a
-// reader's answer. The parameter arm is scoped by it: a function whose contract is "-1
-// where nothing answers" is called with values that may not answer.
+// reader's answer. The parameter arm is scoped by it: a function whose contract is
+// "-1 where nothing answers" is called with values that may not answer.
 let siFnReader: i32[] = []
 
-// The forwarding edges, flat and already RESOLVED: `siEdgeFrom[k]` hands its answer to
-// function `siEdgeTo[k]`. Resolved once through a name index rather than re-scanned per
-// round — the fixpoint below runs four times, and a name scan inside it would be
-// O(edges x functions), which is #2419's shape.
+// The forwarding edges, flat and already resolved: `siEdgeFrom[k]` hands its answer to
+// function `siEdgeTo[k]`. Resolved once through a name index rather than re-scanned
+// per round — the fixpoint below runs four times, and a name scan inside it would be
+// O(edges × functions), which is the shape this file's arena-scan rule refuses.
 let siEdgeFrom: i32[] = []
 let siEdgeTo: i32[] = []
 let siFnIx: {[string]: i32} = Map()
@@ -3831,8 +3692,8 @@ function siAdd(xs: string[], name: string) {
   0
 }
 
-// The index of `name` in `xs`, or -1. Every caller tests it: a 0 here is the FIRST row
-// and not "absent", which is the clamp D1500 was built out of.
+// The index of `name` in `xs`, or -1. Every caller tests it: a 0 here is the first row
+// and not "absent", which is the clamp D1500 names.
 function siIndexOf(xs: string[], name: string) {
   let i = 0
   while i < xs.length {
@@ -3864,9 +3725,9 @@ function siBoundAt(s: string, i: i32, b: i32) {
   }
   const path = siPathAt(s, i, b)
   if path.length > 0 {
-    // `siPathAt` already ATE the `.length` of a bare `xs.length`; only `a.b.length`
-    // still has one to find. Missing this read `while xs.length <= k { push }` as no
-    // guard at all and reported eleven grow-then-write loops that are correct.
+    // `siPathAt` already ate the `.length` of a bare `xs.length`; only `a.b.length`
+    // still has one to find. Missing it reads `while xs.length <= k { push }` as no
+    // guard at all, and reports a correct grow-then-write loop.
     if siFieldOf(path) == "length" { return i + path.length }
     if cbAt(s, i + path.length, b, ".length") { return i + path.length + 7 }
   }
@@ -3907,13 +3768,13 @@ function siMarkGuards(s: string, i: i32, e: i32) {
 
 // ── pass 1: the module's hole fields ─────────────────────────────────────────
 // At every `.` whose left side is a name, read the field and ask whether the module
-// tests it against 0 or a negative. That test IS the module saying the field can be
+// tests it against 0 or a negative. That test is the module saying the field can be
 // absent, which is why the set is read and never listed.
 
-// A HOLE TEST: `< 0` or `>= 0` — the two comparisons that separate "absent" from "a
-// row" — or any operator against a NEGATIVE literal. `x.length > 0` is a non-empty test
-// and deliberately not one: taking it made `length` a hole field and turned eleven
-// `const id = xs.length` bindings into producers.
+// A hole test: `< 0` or `>= 0` — the two comparisons that separate "absent" from a
+// row — or any operator against a negative literal. `x.length > 0` is a non-empty
+// test and deliberately not one: taking it would make `length` a hole field and turn
+// every `const id = xs.length` binding into a producer.
 function siHoleTestAt(s: string, p: i32, e: i32) {
   const w = siCmpAt(s, p, e)
   if w == 0 { return false }
@@ -3926,9 +3787,9 @@ function siHoleTestAt(s: string, p: i32, e: i32) {
   (w == 1 && s[p] == '<') || (w == 2 && s[p] == '>')
 }
 
-// The module's own MAP globals. A map subscript cannot go out of bounds — a miss reads
-// back null — so `m[k]` is not this rule's shape however the key arrived. Collected in
-// the same walk, at column 0 only, since a map global is a module-level declaration.
+// The module's own map globals. A map subscript cannot go out of bounds — a miss
+// reads back null — so `m[k]` is not this rule's shape however the key arrived.
+// Collected in the same walk, at column 0, since a map global is module-level.
 function siMapGlobalOf(s: string, a: i32, e: i32) {
   if a >= e || s[a] == ' ' { return "" }
   let p = a
@@ -4030,7 +3891,7 @@ function siRetCallOf(s: string, a: i32, e: i32) {
   ""
 }
 
-// A `return` opening a token on this line — the tell that what follows is a FALL-THROUGH.
+// A `return` opening a token on this line — the tell that what follows is a fall-through.
 function siLineReturns(s: string, a: i32, e: i32) {
   let i = a
   while i < e {
@@ -4103,7 +3964,7 @@ function siScanReaders(s: string) {
 }
 
 // ── pass 3: one function's declarations ──────────────────────────────────────
-// Every name the function's HEADER LINE declares — a parameter is `name:`, and with
+// Every name the function's header line declares — a parameter is `name:`, and with
 // `i32Only` only an `i32` one, the only kind that can be an index. A header continued
 // onto a second line contributes nothing, in both implementations alike.
 function siHeaderNames(s: string, f: i32, i32Only: boolean, out: string[]) {
@@ -4153,8 +4014,8 @@ function siDeclNameOf(s: string, a: i32, e: i32) {
 }
 
 // ── pass 3: the bindings ─────────────────────────────────────────────────────
-// The line's single-target binding, if it has one. `siBindKind` is 1 for a CALL
-// right-hand side, 2 for a bare field read, 3 for anything else — which UNBINDS the
+// The line's single-target binding, if it has one. `siBindKind` is 1 for a call
+// right-hand side, 2 for a bare field read, 3 for anything else — which unbinds the
 // name — and 0 for a line that is no binding at all.
 let siBindName = ""
 let siBindKind = 0
@@ -4170,8 +4031,8 @@ function siBindAt(s: string, a: i32, e: i32) {
   const nm = asIdentAt(s, p, e)
   if nm.length == 0 { return 0 }
   let q = cbSpacesEnd(s, p + nm.length, e)
-  // An annotation runs to the `=`. Only a ONE-WORD one leaves the right-hand side
-  // readable as an index: `const x: i32[] = f()` binds a LIST, never an index, and is
+  // An annotation runs to the `=`. Only a one-word one leaves the right-hand side
+  // readable as an index: `const x: i32[] = f()` binds a list, never an index, and is
   // taken here as an unbind.
   let simple = true
   if q < e && s[q] == ':' {
@@ -4210,7 +4071,7 @@ function siBindAt(s: string, a: i32, e: i32) {
 
 // ── the report ───────────────────────────────────────────────────────────────
 // Which producer handed the index over — the half of the message that says where to
-// look, since the fix is at the PRODUCER as often as at the read.
+// look, since the fix is at the producer as often as at the read.
 function siWhy(kind: i32, idx: string, text: string) {
   if kind == 1 { return "`" + text + "`, which can answer in band" }
   if kind == 2 {
@@ -4219,9 +4080,9 @@ function siWhy(kind: i32, idx: string, text: string) {
   "the parameter `" + idx + "` on a fall-through path"
 }
 
-// A `*Strict` producer's -1 is its DOCUMENTED answer, not a clamp that happens to be in
-// range, so an untested read of one is a weaker finding under its own code — reported,
-// and not what the ratchet gates on.
+// A `*Strict` producer's -1 is its documented answer, not a clamp that happens to be
+// in range, so an untested read of one is a weaker finding under its own code —
+// reported, and not what the ratchet gates on.
 function siReport(
   table: string,
   idx: string,
@@ -4257,8 +4118,8 @@ function siReport(
 }
 
 // ── pass 3: the walk ─────────────────────────────────────────────────────────
-// One table read, graded. The index is sentinel-bearing when it is a hole FIELD path, a
-// local last bound from a call or a hole field, or — inside a reader, past that
+// One table read, graded. The index is sentinel-bearing when it is a hole field path,
+// a local last bound from a call or a hole field, or — inside a reader, past that
 // function's first `return` — one of its own `i32` parameters.
 function siGradeRead(table: string, idx: string, line: i32, col: i32) {
   let base = table
@@ -4286,9 +4147,9 @@ function siGradeRead(table: string, idx: string, line: i32, col: i32) {
 }
 
 // One linear pass per function: guards and bindings are read as the lines go by, so a
-// guard counts only where it PRECEDES the read. That approximates dominance the way
+// guard counts only where it precedes the read. That approximates dominance the way
 // `arenaScanLint` does — a guard in an `else` arm marks the name and the read goes
-// unreported, a false NEGATIVE, which is the safe direction for a ratcheted warning.
+// unreported, a false negative, which is the safe direction for a ratcheted warning.
 function siGradeFn(s: string, f: i32) {
   siDeclared = []
   siParams = []
