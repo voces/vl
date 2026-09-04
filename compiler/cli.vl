@@ -165,6 +165,7 @@ let cliColor = 0
 let cliSeverity = "error"
 let cliSeverityGiven = 0
 let cliExcludes: string[] = [] // --exclude glob patterns (normalized)
+let cliIncludeStd = 0          // --include-std: report std's own warnings too
 let cliArgErr = ""             // a fatal arg-parse message (printed, exit 2)
 
 // ── work + output ──────────────────────────────────────────────────────────────
@@ -193,6 +194,10 @@ let cliLastStage = ""           // failing stage of the LAST file compiled (sing
 let cliErrors = 0
 let cliWarnings = 0
 let cliGating = 0
+// Running tally of the std diagnostics `--include-std` would have shown, so the
+// summary can say what was withheld rather than dropping it in silence (D1601).
+let cliStdHidden = 0
+let cliStdHiddenWarn = 0
 // fmt mode (A-impl 3): the walk + file collection are shared with `check`; only
 // the per-file action and the finish differ.
 let cliCmd = 0         // subcommand: 0 = check, 1 = fmt
@@ -368,6 +373,7 @@ export function cliArgReset() {
   cliSeverity = "error"
   cliSeverityGiven = 0
   cliExcludes = []
+  cliIncludeStd = 0
   cliArgErr = ""
   cliEntrySrc = ""
   cliModMode = 0
@@ -388,6 +394,8 @@ export function cliArgReset() {
   cliErrors = 0
   cliWarnings = 0
   cliGating = 0
+  cliStdHidden = 0
+  cliStdHiddenWarn = 0
   cliCmd = 0
   cliFmtWrite = 0
   cliFmtCheck = 0
@@ -653,6 +661,20 @@ function cliDiagFile(d: i32) {
   if cliModMode != 0 && m >= 0 && m < cliModKeys.length { return cliModKeys[m] }
   cliCurFile
 }
+// Whether diagnostic `d` is one the target's author cannot act on: a non-error
+// located in a `std:` module, which the target only reached by importing it. A std
+// ERROR means the toolchain itself is broken and is never withheld; `--include-std`
+// keeps the rest. The `std:` spelling is the one an import resolves to, so
+// `vl check std/fmt.vl` — std's own author, and `lint-self.sh`'s std run — is
+// unaffected (D1601).
+function cliDiagStdHidden(d: i32) {
+  if cliIncludeStd != 0 { return 0 }
+  if dgSev[d] == "error" { return 0 }
+  const f = cliDiagFile(d)
+  if f.length < 4 { return 0 }
+  if f.slice(0, 4) != "std:" { return 0 }
+  1
+}
 // The source lines of diagnostic `d`'s owning module (its caret-context line),
 // memoized by module index. Falls back to `cliSrcLines` outside module mode.
 function cliDiagSrcLines(d: i32) {
@@ -807,6 +829,8 @@ function cliParseArgs() {
       cliNoValidate = 1
     } else if sub == "check" && a == "--json" {
       cliJson = 1
+    } else if sub == "check" && a == "--include-std" {
+      cliIncludeStd = 1
     } else if sub == "check" && a == "--severity" {
       cliSeverityGiven = 1
       if i + 1 < cliArgs.length && !cliIsFlag(cliArgs[i + 1]) {
@@ -1192,16 +1216,25 @@ function cliCheckCurFileRest() {
   // Fold this file's counts into the running tally (gating + error/warning).
   let gi = 0
   while gi < dgSev.length {
-    if cliSevRank(dgSev[gi]) >= thr { cliGating = cliGating + 1 }
-    if dgSev[gi] == "error" { cliErrors = cliErrors + 1 }
-    if dgSev[gi] == "warning" { cliWarnings = cliWarnings + 1 }
+    // A withheld std diagnostic counts nowhere — not in the tally, not in the gate:
+    // a comment in std must not fail a consumer's build.
+    if cliDiagStdHidden(gi) != 0 {
+      cliStdHidden = cliStdHidden + 1
+      if dgSev[gi] == "warning" { cliStdHiddenWarn = cliStdHiddenWarn + 1 }
+    } else {
+      if cliSevRank(dgSev[gi]) >= thr { cliGating = cliGating + 1 }
+      if dgSev[gi] == "error" { cliErrors = cliErrors + 1 }
+      if dgSev[gi] == "warning" { cliWarnings = cliWarnings + 1 }
+    }
     gi = gi + 1
   }
   // Display: those at or above the floor, stable-sorted by position, appended.
   const order: i32[] = []
   let oj = 0
   while oj < dgSev.length {
-    if cliSevRank(dgSev[oj]) >= disp { order.push(oj) }
+    if cliSevRank(dgSev[oj]) >= disp && cliDiagStdHidden(oj) == 0 {
+      order.push(oj)
+    }
     oj = oj + 1
   }
   cliStableSort(order)
@@ -1215,6 +1248,23 @@ function cliCheckCurFileRest() {
   // This file is done (reported); advance to the next.
   cliFileIdx = cliFileIdx + 1
   cliStartFile()
+}
+
+// Say what `--include-std` withheld, so a hidden diagnostic is never a silent one.
+// It rides `cliOut` (stderr) rather than the report, so a `--json` caller is told
+// too without a non-diagnostic entering the array on stdout (D1601).
+function cliStdHiddenNote() {
+  if cliStdHidden == 0 { return 0 }
+  let noun = "std diagnostic"
+  if cliStdHiddenWarn == cliStdHidden { noun = "std warning" }
+  cliOut.push(
+    cliAnsi(
+      cliColor,
+      "2",
+      "(" + cliPlural(cliStdHidden, noun) + " hidden — --include-std shows them)",
+    ),
+  )
+  0
 }
 
 // The aggregate summary line, once every file is checked. A single-file target keeps
@@ -1254,7 +1304,7 @@ function cliFinishSummary() {
     buf.push(']')
     buf.push('\n')
     cliJsonOut = fromCodePoints(buf)
-    return 0
+    return cliStdHiddenNote()
   }
   let summary = ""
   if cliErrors == 0 && cliWarnings == 0 {
@@ -1288,6 +1338,7 @@ function cliFinishSummary() {
     summary = cliAnsi(cliColor, code, text)
   }
   cliOut.push(summary)
+  cliStdHiddenNote()
   cliExit = 0
   if cliGating > 0 { cliExit = 1 }
   if cliInvalidModule > 0 { cliExit = 70 }

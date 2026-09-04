@@ -4,6 +4,9 @@ A comment is read by someone changing the code beside it, and is never re-graded
 anything that can go stale belongs where a gate re-runs it. The mechanical half of rules
 1, 2, 3 and 5 is `compiler/lint.vl`, ratcheted by `scripts/comment-budget.py`. (`std/`
 has its own consumer-facing rubric: `std-comment-audience`, `std-api-review.md` §4.)
+The two are DISJOINT and both halves enforce it: the lint skips the four codes for a std
+module and the ratchet walks `compiler/` alone, so a consumer's `vl check` never reads
+std's comments against this page (D1601).
 
 1. **Contract and the non-obvious why, nothing else.** What a caller may rely on —
    inputs, the sentinel it returns and when, the invariant it keeps — and what breaks
