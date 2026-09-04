@@ -65,6 +65,12 @@ AXIS for the same reason, and prints `NOT EXERCISED` rather than a zero.
 8. **`init_vs_assign`** — `const v = e` against `let v = <literal>` then `v = e`. The
    literal pins the `let`'s rep and the assignment is where a differently-repped source
    disagrees with that pin.
+9. **`modules_split`** — the same program as ONE file and as TWO modules. A GENERATOR axis:
+   it has its own grammar (`modules.py`) rather than a face flipped on a plan drawn from the
+   tables above, because module scope has two storage classes (wasm globals and
+   start-function locals), every module's top level is lowered into ONE start function, and
+   several by-name scans see only one class or only one module. D1593 / D1595 / D1596 all
+   needed two files to appear and every instrument here was blind to them.
 
 Crossed with a **SOURCE** dimension — where the value comes from: a literal, a call, an
 index read, a field read, a map read, a `??`. Not interchangeable at the emitter: D1476
@@ -75,10 +81,14 @@ needs a projection specifically, and a call initialiser runs.
 Stated plainly, because a zero from an instrument is only as good as its frame.
 
 * **Anything outside the grammar.** Seventeen value shapes, six sources, nine delivery
-  positions, six scopes, five neighbours. No generics with more than one parameter, no
-  recursive types, no multi-module programs, no `match`, no operator overloading, no
-  `std:json`/`std:buffer`/`std:fs`, no i32/f64 mixed arithmetic, no strings beyond
-  `+`/`.length`. Each is a grammar record away, and none is there today.
+  positions, six scopes, five neighbours; the module axis adds twenty-four units and nine
+  reports. No generics with more than one parameter, no recursive types, no `match`, no
+  operator overloading, no `std:json`/`std:fs`, no i32/f64 mixed arithmetic, no strings
+  beyond `+`/`.length`. Each is a grammar record away, and none is there today.
+* **More than TWO modules, and a print from an imported one.** The split moves a
+  dependency-closed subset into one imported module and every `print` stays in the entry,
+  so the two faces cannot differ merely because a module's start function ran first. A
+  three-module graph, a re-export, and a module that prints are all out of frame.
 * **Programs longer than ~25 lines.** The generator builds one value, delivers it once and
   reads it once. A defect that needs two interacting values is out of frame.
 * **Anything whose expected output Python cannot compute.** That is the price of grading on
@@ -108,6 +118,10 @@ So the controls split in two, and the split is the lesson:
 | `synthetic/wrong` | `print(2)` vs `print(12)`, both wanting `2` | `RUNS-WRONG`, `RUNS` / `RUNS-WRONG` |
 | `D1473/agree` | named arms vs INLINE arms, from the grammar | `AGREE-RUNS`, `RUNS` / `RUNS` |
 | `D1500/agree` | `const v = xs[0]` vs `let v = 0` / `v = xs[0]` | `AGREE-RUNS`, `RUNS` / `RUNS` |
+| `synthetic/modules-check` | an imported `i32` into `const v: i32` vs `const v: string` | `DISAGREE`, `RUNS` / `check refuses` |
+| `D1593/agree` | a module's loop variable beside the importer's block `const n` | `AGREE-RUNS`, `RUNS` / `RUNS` |
+| `D1595/agree` | the same collision at a string, where the scratch frame is detected | `AGREE-RUNS`, `RUNS` / `RUNS` |
+| `D1596/agree` | a hole parameter fed from a block `const` across the import | `AGREE-RUNS`, `RUNS` / `RUNS` |
 
 The three **synthetic** ones prove the sampler can still SEE and CLASSIFY a disagreement, and
 each rests on a rule the design will always enforce: a type error, a bounds-checked index, an
@@ -115,11 +129,16 @@ exact output contract. Nothing can "fix" them into agreeing. The two **agree** c
 the closed rows, kept as regression pins — which is the right shape for a closed row anyway:
 it pins the fix instead of depending on the bug.
 
-Two of them earn their place beyond liveness. `synthetic/trap` is the only control that
+Three of them earn their place beyond liveness. `synthetic/trap` is the only control that
 exercises the extra `vl build` this script runs to tell a PROGRAM trap from a COMPILER trap,
 which is the one piece of grading it adds to `capability-probes/run.py`'s. `synthetic/wrong`
 is the only one that would fail if the output contract went back to `run.py`'s SUBSTRING
-test, which passes `"2"` against a printed `"12"`.
+test, which passes `"2"` against a printed `"12"`. `synthetic/modules-check` is the only one
+that says outright that the multi-file WRITER delivered two files: the three module agree
+pins would also fail if the imported section were dropped — their import would not resolve —
+but they would fail for a reason nobody could read off the exit code. Validated by sabotage:
+making `split_files` return only the last section makes all four say `NOT SPEAKING`, and the
+synthetic one names the difference (`BOTH-FAIL-SAME`, both faces `check refuses`).
 
 **There is no synthetic EMIT-refusal control, and that is a statement about the language.**
 By CLAUDE.md's standing rule every `loud emit reject` is a clause-2 violation by
@@ -275,6 +294,42 @@ ids. Cited by the pair that produced them; every one still reproduces on `d10992
 | `emitProgram: object literal matches no union variant` — a struct through a hole param into an inferred struct field | `const box = { item: passh({ name: "ada", n: 3 }) }` / `box.item.name` | direct runs; `pass<T>` refuses differently |
 | `emitProgram: call to unknown function` — a closure captured and returned inside a MODULE-scope block | `if true { const held = (x: i32) => x + 1; const get = () => held; print(get()(4)) }` | function body and `fn_block` both run; D1475's neighbour |
 | `[ERROR]: argument 1: expected {size: _}, got {[string]: i32}` and `for-in expects an array or map, got _` and `member access '.n' on non-object _ \| null` | an un-annotated parameter used as a map, iterated, or read through `??` | hole-param inference limits; the checker's own sentences say so, and each has an annotated twin that runs. A DESIGN question, not obviously a gap |
+
+## The `modules_split` sample — 1,640 pairs, one disagreement mechanism
+
+Graded on 2026-09-04 in four runs, because a discovery run that cannot look PAST the family
+it has already named stops measuring after the first one. `--replay` re-grades all 3,280
+programs against this branch's own proved fixpoint seed with **0 moved and 0 RUNS lost**, so
+the table is not one self-compile off a stale seed:
+
+| run | pairs | `DISAGREE` | `AGREE-RUNS` | `BOTH-FAIL` |
+| --- | --- | --- | --- | --- |
+| `--axis modules_split`, seeds 101–104 | 640 | 23 | 577 | 40 |
+| mixed, seeds 201–202 (the axis's own share of 320) | 40 | 2 | 34 | 4 |
+| `--axis modules_split --exclude rep_global_ann,rep_global_infer`, seeds 301–303 | 480 | **0** | 444 | 36 |
+| …also `--exclude` the three hole-parameter reports, seeds 401–403 | 480 | **0** | 480 | **0** |
+| total | **1,640** | **25** | **1,535** | **80** |
+
+**Every one of the 25 disagreements is D1597 and every one of the 80 both-fails is D1598** —
+attributed by re-rendering the spec, not by the message, which is why the two `--exclude`
+runs are in the table: they are what says the axis's whole yield at this grammar is two
+mechanisms and not a tail. The mixed run also gives the axis's natural share, **40 of 320
+pairs (12.5%)**, which is what a plain `sample.py --count N` will spend on it.
+
+* **D1597** — a module GLOBAL and a same-named binding in a top-level BLOCK are one slot.
+  Check-clean SILENTLY WRONG VALUE at a numeric or string global, check-clean invalid wasm
+  struct-on-struct, a loud emit reject at mixed reps. **The defect needs the program to have
+  NO IMPORTS**: any second module, including an unused `import { trim } from "std:str"`,
+  makes it run, because the merge mangles top-level names per module. That is why the pair
+  is a disagreement with the SINGLE face failing, and why no cross-module fixture in the
+  tree could see it.
+* **D1598** — two sibling top-level blocks binding one name make a hole parameter's
+  module-frame pin decline even when both bindings have the SAME type. It fails identically
+  in both faces, so it is a both-fail rather than a hit; the axis's contribution is that it
+  is 80 of 80 of them.
+
+Neither is reachable by the single-file axes: the `scope` axis picks ONE scope for the whole
+program, so no plan it draws composes a module-scope block with a module-scope global.
 
 ## Running it
 

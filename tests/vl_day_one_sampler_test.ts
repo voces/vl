@@ -17,7 +17,8 @@
 // Axis coverage is the second half of the same rule (a zero-disagreement axis and an axis
 // the sample never reached must not print the same), and it is asserted against the
 // grammar's OWN list, so adding an axis nothing can generate fails here rather than
-// silently narrowing every future run.
+// silently narrowing every future run. `modules_split` needs one assertion of its own:
+// its faces differ by the NUMBER OF FILES, which axis coverage cannot see.
 
 const exists = (p: string): boolean => {
   try {
@@ -59,6 +60,7 @@ type Summary = {
   verdicts: Record<string, number>;
   grade_vocabulary: string[];
   verdict_vocabulary: string[];
+  multi_file: number;
 };
 
 let cached: Promise<Summary> | undefined;
@@ -118,6 +120,26 @@ Deno.test({
         `want every axis varied at least once, got ${JSON.stringify(s.axes)} — ` +
           `never reached: ${JSON.stringify(missing)}. An axis no sample exercises makes ` +
           `its zero unreadable: it cannot be told from an axis that found nothing.`,
+      );
+    }
+  },
+});
+
+Deno.test({
+  name: "day-one: the modules_split axis really writes TWO files",
+  ignore: !ENABLED,
+  fn: async () => {
+    const s = await sample();
+    // The axis table above cannot say this. A `modules_split` pair whose split face
+    // silently stopped carrying a second `// file:` section would still be counted as an
+    // exercised axis, and both its faces would then be the same single-module program —
+    // an AGREE that no defect can disturb. Three clause-1 rows this week needed two files
+    // to appear at all, so a sample that writes one is the frame quietly narrowing.
+    if (s.multi_file < 1) {
+      throw new Error(
+        `want at least one multi-module program in the fixed-seed sample, got ` +
+          `${s.multi_file}. The modules_split axis is declared and varied, so its split ` +
+          `face is rendering as a single file — see scripts/day-one/modules.py's render.`,
       );
     }
   },

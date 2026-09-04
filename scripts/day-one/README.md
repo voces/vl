@@ -36,6 +36,7 @@ never reached.
 | file | what it is |
 | --- | --- |
 | `grammar.py` | the ordinary shapes, as DATA — values, reads, positions, sources, scopes, scenery, axes |
+| `modules.py` | the `modules_split` axis's OWN grammar — one program as one file and as two |
 | `render.py` | plan + axis faces → one program; `make_pair` is the unit |
 | `sample.py` | draw, grade, tabulate, JSONL, `--replay`, `--control`, `--report` |
 | `minimise.py` | greedy line removal to a minimal witness, then ablation BY AXIS |
@@ -56,11 +57,22 @@ D1473 for liveness, D1473 closed two days later, its pair started grading `AGREE
 gate read a closed row as a broken instrument for six CI rounds. A closed row belongs on the
 agree side; liveness belongs on something nobody can fix.
 
+## A GENERATOR AXIS BRINGS ITS OWN GRAMMAR
+
+Most axes flip one face on a plan drawn from `grammar.py`'s tables. `modules_split` cannot:
+its two faces differ by the NUMBER OF FILES, and the shapes worth generating there — a
+module's loop variable colliding with the importer's block `const`, a hole parameter called
+across the import, an exported `type` read annotated and un-annotated — are not a face of
+any single-file plan. So its record in `AXES` carries `"generator": "modules"`, `render.py`
+delegates to `modules.make_pair`, and its split face is one source string carrying
+`// file:` markers — the same spelling `scripts/check-filed-witnesses.py` grades a two-file
+witness with, so a hit can be pasted into an inventory row without being re-typed.
+
 ## Adding to the grammar
 
-Add a record to `VALUES`, `SOURCES`, `POSITIONS`, `SCOPES` or `SCENERY` — nothing else
-needs touching, and `tests/vl_day_one_sampler_test.ts` will tell you if an axis you add
-cannot be generated. Weight toward what a TUTORIAL would contain: the 1-in-20 rate came
+Add a record to `VALUES`, `SOURCES`, `POSITIONS`, `SCOPES` or `SCENERY` — or to `modules.py`'s
+`UNITS` / `REPORTS` — nothing else needs touching, and `tests/vl_day_one_sampler_test.ts`
+will tell you if an axis you add cannot be generated. Weight toward what a TUTORIAL would contain: the 1-in-20 rate came
 from programs written to be ordinary, and the hit was the most textbook shape in the
 batch. A grammar that optimises for coverage of the type lattice drifts exotic and the
 rate falls.

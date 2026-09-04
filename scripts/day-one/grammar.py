@@ -297,6 +297,12 @@ AXES = [
     # `const len = xs[0]` runs. Pinned to `bound`: an assignment IS a bound destination.
     {"id": "init_vs_assign", "weight": 5, "faces": ["init", "assign"],
      "needs": "assignable", "pins": {"fusion": "bound"}},
+    # ONE FILE vs TWO MODULES. A `generator` axis is not a face flipped on a plan drawn
+    # from the tables above — it has its own grammar (`modules.py`), because module scope
+    # has two storage classes and every module's top level is merged into ONE start
+    # function, which no single-file plan can express. D1593 / D1595 / D1596.
+    {"id": "modules_split", "weight": 5, "faces": ["single", "split"],
+     "generator": "modules"},
 ]
 
 AXIS_IDS = [a["id"] for a in AXES]

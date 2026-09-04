@@ -13,6 +13,7 @@ import difflib
 import random
 
 import grammar as G
+import modules as M
 
 IND = "  "
 
@@ -48,6 +49,9 @@ def applicable_axes(plan):
     val, pos, read = plan["value"], plan["position"], plan["read"]
     out = []
     for ax in G.AXES:
+        if ax.get("generator"):
+            # A generator axis brings its own grammar; a plan cannot vary it.
+            continue
         need = ax.get("needs")
         if need == "decls" and not val["decls"]:
             continue
@@ -410,8 +414,30 @@ def render_spec(spec, faces):
     return render(plan_of(spec), faces)
 
 
+# Axes with a grammar of their own, keyed by the `generator` their record names.
+GENERATORS = {"modules": M.make_pair}
+
+
+def _generator_axes():
+    return [a for a in G.AXES if a.get("generator") and a["id"] not in EXCLUDE]
+
+
 def make_pair(rng, axis_id=None):
-    """One sample: two spellings of one program, plus what was varied."""
+    """One sample: two spellings of one program, plus what was varied.
+
+    A GENERATOR AXIS IS DRAWN BY ITS OWN WEIGHT, not only when `--axis` or the coverage
+    list asks for it. Routing it through the cover list alone would give it exactly one
+    pair per sample however large the sample is, and a rate over one draw is not a rate.
+    """
+    gen = _generator_axes()
+    if axis_id is None and gen:
+        share = sum(a["weight"] for a in gen) / sum(a["weight"] for a in G.AXES)
+        if rng.random() < share:
+            axis_id = _weighted(rng, gen)["id"]
+    if axis_id is not None:
+        ax = next((a for a in G.AXES if a["id"] == axis_id), None)
+        if ax is not None and ax.get("generator"):
+            return GENERATORS[ax["generator"]](rng)
     got = plan_pair(rng, axis_id)
     if got is None:
         return None
