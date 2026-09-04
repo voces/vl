@@ -1,17 +1,28 @@
-// Generates `std/embedded.ts` — the checked-in module-key → source map of
-// every `std/*.vl` (recursive) — for the consumers with no filesystem access
-// to the repo `std/` dir: the LSP bundle (both checkers, via `withStd`) and
-// the browser playground. The CLI and the Rust host read `std/` directly, so
-// only the embedded consumers depend on this file being fresh; freshness is
-// gated by `tests/std_embedded_test.ts` (the goldens pattern).
+// Generates the two CHECKED-IN copies of `std/*.vl`, from one walk of one tree:
+//
+//   std/embedded.ts               the LSP bundle's + playground's module map
+//   scripts/vl-host/src/std_embedded.rs   the `vl` binary's baked-in std
+//
+// ONE GENERATOR, because a release `vl` now ships std inside it (D1573) and the
+// editor already did: two generators reading the same directory would still be
+// two things to keep fresh, and the pair going out of step is invisible — the
+// editor and the CLI would simply disagree about std. Both files are written by
+// the same invocation and gated by the same test (tests/std_embedded_test.ts),
+// so staleness is one failure, not two.
 //
 //   deno task gen-std
 //
-// Deterministic output: module names sorted, sources embedded verbatim via
-// JSON.stringify, so the file is byte-stable for a given `std/` tree.
+// Deterministic output: module names sorted, sources embedded verbatim, so both
+// files are byte-stable for a given `std/` tree.
+//
+// `stdHash` is the identity `vl std --hash` and `vl --version` print. The Rust
+// host recomputes it over its own copy (`std_hash` in main.rs), so the two
+// implementations are cross-checked by tests/vl_std_cmd_test.ts rather than
+// trusted.
 
 const STD_DIR = new URL("../std/", import.meta.url);
 const OUT = new URL("embedded.ts", STD_DIR);
+const OUT_RS = new URL("../scripts/vl-host/src/std_embedded.rs", import.meta.url);
 
 /** Every `.vl` under `std/` (recursive), as `[moduleName, source]` pairs —
  * `moduleName` is the `std:`-less, extension-less relative path (`a/b.vl` →
@@ -33,6 +44,28 @@ export const collectStdSources = async (): Promise<[string, string][]> => {
   return out;
 };
 
+/** The identity of a std TREE: FNV-1a 64 over `<name>\0<byte length>\0<source>\0`
+ * per module, in sorted name order, as 16 hex digits. The length joins the fields
+ * so no rename can forge another tree's digest. Not cryptographic — it answers
+ * "is this the std that binary was built with", and a wrong answer costs a
+ * confusing line in `vl --version`, never a wrong compile. */
+export const stdHash = (sources: [string, string][]): string => {
+  const MASK = (1n << 64n) - 1n;
+  const PRIME = 0x100000001b3n;
+  const enc = new TextEncoder();
+  let h = 0xcbf29ce484222325n;
+  const feed = (bytes: Uint8Array): void => {
+    for (const b of bytes) h = ((h ^ BigInt(b)) * PRIME) & MASK;
+  };
+  for (const [name, src] of sources) {
+    const body = enc.encode(src);
+    feed(enc.encode(`${name}\0${body.length}\0`));
+    feed(body);
+    feed(new Uint8Array([0]));
+  }
+  return h.toString(16).padStart(16, "0");
+};
+
 /** Render the full `std/embedded.ts` text for the given `[name, source]`
  * pairs. Exported so the freshness test asserts the checked-in file equals
  * exactly what this generator would write today. */
@@ -44,7 +77,8 @@ export const renderEmbedded = (sources: [string, string][]): string => {
 // Freshness is gated by tests/std_embedded_test.ts; regenerate after any
 // std source change. See docs/std-design.md D3 for who consumes this map
 // (the LSP checkers via \`withStd\`, the playground) and who does NOT (the
-// CLI and the Rust host read the \`std/\` dir directly).
+// CLI reads a std DIRECTORY when it has one — scripts/vl-host/src/std_embedded.rs
+// is its own copy of this same tree, written by the same generator).
 
 /** Module key (\`std:NAME\`) → that std module's source. */
 export const STD_SOURCES: Record<string, string> = {
@@ -53,8 +87,58 @@ ${entries}
 `;
 };
 
+/** One VL source as a Rust string literal. Backslash and quote are escaped, the
+ * three whitespace controls take their short forms, any other control byte takes
+ * `\\u{..}`, and every other character rides through as UTF-8 — which a Rust
+ * source file is. One module per line, matching `embedded.ts`, so a std diff has
+ * the same shape in both generated files. */
+const rustString = (s: string): string => {
+  let out = '"';
+  for (const ch of s) {
+    const c = ch.codePointAt(0) as number;
+    if (ch === "\\") out += "\\\\";
+    else if (ch === '"') out += '\\"';
+    else if (ch === "\n") out += "\\n";
+    else if (ch === "\r") out += "\\r";
+    else if (ch === "\t") out += "\\t";
+    else if (c < 0x20 || c === 0x7f) out += `\\u{${c.toString(16)}}`;
+    else out += ch;
+  }
+  return out + '"';
+};
+
+/** Render `scripts/vl-host/src/std_embedded.rs` — the `vl` binary's own copy of
+ * `std/*.vl`, in the same sorted order and with the same `std:`-less names the
+ * host's module reader is handed. */
+export const renderEmbeddedRust = (sources: [string, string][]): string => {
+  const entries = sources
+    .map(([name, src]) => `    (${rustString(name)}, ${rustString(src)}),`)
+    .join("\n");
+  return `// GENERATED by \`deno task gen-std\` from \`std/*.vl\` — do not edit.
+// Freshness is gated by tests/std_embedded_test.ts, which regenerates both this
+// file and std/embedded.ts from the tree and demands byte equality. Regenerate
+// after any std source change: \`deno task gen-std\`.
+//
+// WHY THE BINARY CARRIES std AT ALL: a pinned \`vl\` is one file, and a release
+// binary that read \`std/\` off the filesystem paired a master seed with a stale
+// checkout's sources without a word (D1573). Resolution order and the
+// development overrides that outrank this copy live in main.rs (\`std_source\`).
+
+/// Every \`std/*.vl\`, as \`(module name without the \`std:\` prefix, source)\`,
+/// sorted by name — the order \`stdHash\` in scripts/gen-std.ts folds them in.
+pub static STD_MODULES: &[(&str, &str)] = &[
+${entries}
+];
+`;
+};
+
 if (import.meta.main) {
-  const text = renderEmbedded(await collectStdSources());
+  const sources = await collectStdSources();
+  const text = renderEmbedded(sources);
   await Deno.writeTextFile(OUT, text);
+  const rust = renderEmbeddedRust(sources);
+  await Deno.writeTextFile(OUT_RS, rust);
   console.error(`wrote ${OUT.pathname} (${text.length} bytes)`);
+  console.error(`wrote ${OUT_RS.pathname} (${rust.length} bytes)`);
+  console.error(`std hash ${stdHash(sources)} over ${sources.length} modules`);
 }

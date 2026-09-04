@@ -100,7 +100,7 @@ Deno.test({
   name: "vl-help: `vl help <cmd>` and `vl <cmd> --help` agree, stdout, exit 0",
   ignore: !ENABLED,
   fn: async () => {
-    for (const cmd of ["run", "build", "check", "fmt", "test", "seed"]) {
+    for (const cmd of ["run", "build", "check", "fmt", "test", "seed", "std"]) {
       const a = await run(["help", cmd]);
       const b = await run([cmd, "--help"]);
       if (a.code !== 0 || b.code !== 0) {
@@ -136,14 +136,26 @@ Deno.test({
   },
 });
 
+// The FIRST line stays `vl <version> (host ABI N)` and nothing else — the shape
+// `--version | head -1` and every `startsWith("vl ")` reader depends on. The
+// lines under it are D1573/D1574's answer to "which seed and which std is this
+// binary", which was previously unanswerable from outside.
 Deno.test({
-  name: "vl-help: --version prints one line, exit 0",
+  name: "vl-help: --version leads with one `vl <version>` line, then names seed and std",
   ignore: !ENABLED,
   fn: async () => {
     for (const flag of ["--version", "-V"]) {
       const r = await run([flag]);
-      if (r.code !== 0 || !r.out.startsWith("vl ") || r.out.trimEnd().includes("\n")) {
-        throw new Error(`want one \`vl <version>\` line at exit 0 from ${flag}, got ${r.code}:\n${r.out}`);
+      const lines = r.out.trimEnd().split("\n");
+      if (r.code !== 0 || !/^vl \S+ \(host ABI \d+\)$/.test(lines[0] ?? "")) {
+        throw new Error(
+          `want a \`vl <version> (host ABI N)\` first line at exit 0 from ${flag}, got ${r.code}:\n${r.out}`,
+        );
+      }
+      for (const want of ["commit:", "seed:", "std:"]) {
+        if (!lines.some((l) => l.startsWith(want))) {
+          throw new Error(`${flag} should carry a \`${want}\` line, got:\n${r.out}`);
+        }
       }
     }
   },
