@@ -9944,7 +9944,11 @@ export function blockHasCallRef(ix: i32, fnIx: i32) {
     const callee = P.nodes[n.callFn]
     let isVal = false
     if callee is Ident {
-      const t = fnIndexOfSid(sidOfNode(n.callFn))
+      let t = fnIndexOfSid(sidOfNode(n.callFn))
+      // A live closure binding of the name is what the call denotes, so the frame needs
+      // the scratch even though a module function carries the name — without it the
+      // `call_ref` spills into a local the vector never declared (D1602).
+      if t >= 0 && identIsBoundClosure(callee.identName, fnIx) { t = -1 }
       if t < 0 {
         if exprIsClosure(n.callFn, fnIx) { isVal = true }
         // `t()` where `t` is a union binding with a bare-closure arm (`const t = p.f; t()`,
@@ -14115,7 +14119,11 @@ export function stmtIsTailValue(stmtIx: i32, fnIx: i32) {
       if callee.identName == "__array_copy__" { return false }
       if callee.identName == "__trap__" { return false }
       const target = fnIndexOf(callee.identName)
-      if target >= 0 { return fRetVoid[target] == 0 }
+      // A live closure binding of the name is what the tail denotes, so the voidness is
+      // that closure's and the module function of the name settles nothing (D1602).
+      if target >= 0 && !identIsBoundClosure(callee.identName, fnIx) {
+        return fRetVoid[target] == 0
+      }
       // A CLOSURE-VALUE callee (a `() => void` param / a void-function binding, invisible
       // to `fnIndexOf`): a void one (`>v` sig) yields nothing, so it is a STATEMENT tail,
       // not a value — the signal that makes `run(g: () => void) { g() }` infer void.
@@ -34848,6 +34856,40 @@ export function letIsClosure(letIx: i32, fnIx: i32) {
   false
 }
 
+// Does `name` denote a live binding holding a closure in frame `fnIx` — a narrowed arm, a
+// closure-typed param, a nullable one, or a `let`/`const` whose cell is a closure? The rungs
+// of `exprIsClosure`'s `Ident` arm that read a binding, asked without the module-function
+// rung above them, so a call site can let the binding win (D1602).
+export function identIsBoundClosure(name: string, fnIx: i32): boolean {
+  if narrowedClosureOf(name) != "" { return true }
+  if paramIsClosure(fnIx, name) { return true }
+  if paramNulClosure(fnIx, name) { return true }
+  const slot = declaredSlotLive(name)
+  if slot >= 0 {
+    return localIsRef[slot] == "closure" || localIsRef[slot] == "nulclosure"
+  }
+  // The arena rung, for a pass that runs before `buildLocals` fills the registry, and only
+  // for a name a module function also carries: nothing else asks the registry to be beaten.
+  // A binding declared directly in the frame body covers every call in it; one inside a
+  // nested block does not, and such a pass holds no scope stack to tell them apart.
+  if fnIx < 0 || fnIndexOf(name) < 0 { return false }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const li = parentLetOf(fn.fnBody, name)
+    if li >= 0 && blockDeclaresStmt(fn.fnBody, li) {
+      const ld = P.nodes[li]
+      if ld is LetDecl {
+        if ld.letType >= 0 { return tyIsFuncType(ld.letType) }
+        // `exprIsClosureNoLocal`, not `letDeclIsClosureNoLocal`: an ALIAS of a closure
+        // param or global (`const v = a`) is a closure binding too, and that one hop is
+        // what the registry-free classifier is for.
+        return exprIsClosureNoLocal(ld.letInit, fnIx)
+      }
+    }
+  }
+  false
+}
+
 // True if the expression at `exprIx` evaluates to a function value (a closure
 // fat-pointer): a `function(...)` literal, a bare reference to a top-level/lifted
 // function name, a reference to a closure-typed param/local, or a call returning a
@@ -34866,20 +34908,12 @@ export function exprIsClosure(exprIx: i32, fnIx: i32) {
   }
   if e is Ident {
     if fnIndexOf(e.identName) >= 0 { return true }
-    // A union binding NARROWED to a bare-closure arm (`if x is () => i64 { x() }`): its box
-    // payload IS the closure fat-pointer (`emitValueUnionUnboxRead` casts to `$cloStructIdx`),
-    // so it calls via `call_ref` exactly like a closure local — route the CALL here. Checked
-    // FIRST since the binding's DECLARED type is a union, so the param/local closure tests miss it.
-    if narrowedClosureOf(e.identName) != "" { return true }
-    // A closure-typed param/local (kind 14), or a NULLABLE one (kind 19) — both call via
-    // `call_ref`; the nullable cell is recovered to non-null at the call site (after the
-    // `if c != null` narrowing the checker requires).
-    if paramIsClosure(fnIx, e.identName) { return true }
-    if paramNulClosure(fnIx, e.identName) { return true }
-    const slot = declaredSlotOf(e.identName)
-    if slot >= 0 {
-      return localIsRef[slot] == "closure" || localIsRef[slot] == "nulclosure"
-    }
+    // A narrowed closure arm, a closure-typed param (kind 14) or a nullable one (kind 19),
+    // or a closure-celled local: every one calls via `call_ref`, and the nullable cell is
+    // recovered to non-null at the call site.
+    if identIsBoundClosure(e.identName, fnIx) { return true }
+    // A declared local of the name that is not a closure cell denotes no module global.
+    if declaredSlotLive(e.identName) >= 0 { return false }
     // A module-global closure cell — a bare closure (kind 14) or a NULLABLE one (kind 19).
     const gl = globalLetOfIn(fnIx, e.identName)
     if gl >= 0 {
@@ -36369,7 +36403,7 @@ function blockTailIsClosure(blockIx: i32, fnIx: i32) {
 // DELIBERATELY NOT RECURSIVE. A chained initializer (`const a = b`) is left to the
 // registry-backed `exprIsClosure`, which reaches it through a table read (`localIsRef`) and
 // so cannot spin; a scan from here would loop on `const a = a`, which the parser accepts.
-function letDeclIsClosureNoLocal(letIx: i32) {
+export function letDeclIsClosureNoLocal(letIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
     if d.letType >= 0 { return tyIsFuncType(d.letType) }
