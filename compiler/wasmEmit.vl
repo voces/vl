@@ -5380,12 +5380,51 @@ export function emitUnionCoerce(
 // Box-typed positions ONLY; a let-init to a union-annotated-but-variant-init local stays a
 // raw kind-8 variant and calls `emitUnionCoerce` directly. Exported for `emit_sections.vl`'s
 // module-GLOBAL cells, which are box-typed too (`globalCellKind` has no kind-8 variant cell).
+
+// D1567 — IS THE FUNCTION AT `fnStmts` POSITION `pos` ONE WHOSE EVERY RETURNED VALUE IS A
+// BARE `null`? The checker types such a return `TyPrim:null` and the emitter reps it as
+// `nullref`. THE ONE HOME for that question: the two sites that must convert the result —
+// the union BOX destination in `emitUnionBoxArg` and the two i32 niches in `emitDirectCall`
+// — read it here rather than each spelling the kind compare itself.
+export function fnPosRetIsNulNone(pos: i32): boolean {
+  if pos < 0 || pos >= fRetKind.length { return false }
+  fRetKind[pos] == "nulnone"
+}
+
+// `fnPosRetIsNulNone` asked of an EXPRESSION: true for a direct call to such a function.
+// An indirect call is deliberately not claimed — its result rides a `$fnsig` this does not
+// resolve, and the loud reject it already gets is the honest answer (D1567's residue).
+function exprIsNulNoneCall(exprIx: i32): boolean {
+  if exprIx < 0 { return false }
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is Call {
+    const cf = P.nodes[unwrapParen(e.callFn)]
+    if cf is Ident {
+      return fnPosRetIsNulNone(fnIndexOfSid(sidOfNode(e.callFn)))
+    }
+  }
+  false
+}
+
 export function emitUnionBoxArg(
   body: i32[],
   unionName: string,
   exprIx: i32,
   fnIx: i32,
 ) {
+  // D1567 — A `null`-TYPED CALL AT A BOX DESTINATION IS THE NULL-TAGGED BOX. `i32 | null`
+  // and every other value union reps as `{tag, anyref}`, so a `nullref` result cannot ride
+  // the cell raw and must not be boxed as its own arm either — the classifier below reads a
+  // Call's kind and, finding none, boxed it as an i32: `type mismatch: expected i32, found
+  // nullref` on a `vl check`-clean program. The shape is `emitUnionIfValue`'s else-less arm
+  // exactly, except the PAYLOAD is the call itself: `nullref` is an `anyref`, so it rides
+  // the slot the null tag leaves unread, and the call's side effects still happen.
+  if exprIsNulNoneCall(exprIx) {
+    fbI32Const(nullBoxTag())
+    if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
+    fbStructNew(uBoxIdx) // { null tag, the call's nullref — unread under this tag }
+    return 0
+  }
   // D1009 — A MAP READ OF A UNION-VALUED MAP DELIVERS ITS MISS AS A TAGGED BOX. `v[k]` on a
   // `{[string]: J}` has type `J | null` — the miss sentinel — and where `J` itself carries
   // `null` that IS a `J`, which is why `assignable` now accepts it. At the REP the two nulls
@@ -17164,6 +17203,15 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
       // construct-side seed, carrying the same defect the ident arms above describe.
       pendingMapSlot = -1
       if fscode == 19 { pendingMapSlot = sFieldMapShape(si, fieldIdx) }
+      // D1568 — A CODE-15 FIELD SEEDS ITS TARGET STRUCT ROW, the write twin of the
+      // construct-side seed in `emitObjField`, off the same chokepoint
+      // (`sFieldTgtStructIdx`). Without it `w.f = null` over an `f: C | null` field reached
+      // `emitNullLitNode` with every seed unset — `emitProgram: bare null needs a
+      // struct-typed context` on a `vl check`-clean program, while `{ f: null }` at the
+      // SAME field lowered. Restored below beside the other per-store seeds, so it never
+      // outlives this store (D1563's rule: every seed has a home in the reset block).
+      const savedWPSI = pendingStructIdx
+      if fscode == 15 { pendingStructIdx = sFieldTgtStructIdx(si, fieldIdx) }
       // A BOX-union field (code 16) coerces a raw scalar/struct/null RHS into the box; the
       // NICHE fields seed their null rep for a bare `null` RHS (the table at
       // `emitNullLitNode`). A non-null value passes through.
@@ -17247,6 +17295,7 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
       }
       pendingListKind = 0
       pendingMapSlot = -1
+      pendingStructIdx = savedWPSI
       fbStructSet(sHeapIdx[si], fieldIdx) // 0xfb 0x05 <struct ht> <field index>
       return 0
     }
@@ -23133,6 +23182,27 @@ function emitNullLitNode(_body: i32[], _e: NullLit, _exprIx: i32, fnIx: i32) {
       return 0
     }
   }
+  // D1567 — THE `null` TYPE'S OWN REP, and the table's true last resort: a function whose
+  // every returned value is a bare `null` types `TyPrim:null`, so no boundary above seeds
+  // anything and this node was the loud reject on a `vl check`-clean program. `nullref` is
+  // the bottom of the GC hierarchy — one value, a subtype of every nullable ref valtype —
+  // which is what makes the result usable at a `C | null` / `string | null` / list / map /
+  // closure destination with no coercion (`emitDirectCall` converts for the three i32-repped
+  // ones). BELOW every seed, so a program that compiles today is byte-identical.
+  if fnIx >= 0 {
+    const nnFn = P.nodes[fnIx]
+    if nnFn is FuncDecl {
+      if nnFn.fnRet < 0 {
+        const nnPos = fnStmtsPosOf(fnIx)
+        if nnPos >= 0 && nnPos < fRetKind.length {
+          if fRetKind[nnPos] == "nulnone" {
+            fbRefNullNone()
+            return 0
+          }
+        }
+      }
+    }
+  }
   return emitFail("emitProgram: bare null needs a struct-typed context")
 }
 
@@ -24057,6 +24127,22 @@ function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
   // rewrites the pair into `return_call`.
   tailCallIdx = gImports + target
   tailCallEnd = wLen()
+  // D1567 — A `nulnone` RESULT AT AN i32-REPPED NULLABLE DESTINATION. `nullref` is a
+  // subtype of every nullable REF valtype, so the struct / variant / string / list / map /
+  // closure destinations take the result unchanged; the two NICHE nullables do not — a
+  // `boolean | null` cell is the i32 sentinel 2 and a `K | null` cell the sentinel -1, and
+  // storing a ref into either is invalid wasm the checker cannot see. Re-derive the rep at
+  // the SITE from the same two seeds `emitNullLitNode` reads, exactly as `emitMapGet`'s
+  // miss arm does for its own null. The cursor is disarmed because these bytes follow the
+  // call, so the `return_call` rewrite would drop them.
+  if fnPosRetIsNulNone(target) {
+    if pendingNulBool || pendingNulLitUnion {
+      fbDrop()
+      if pendingNulBool { fbI32Const(2) } else { fbI32Const(0 - 1) }
+      tailCallIdx = -1
+    }
+  }
+
   return 0
 }
 

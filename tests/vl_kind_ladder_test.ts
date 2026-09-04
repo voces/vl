@@ -92,7 +92,7 @@ function guard(k: string): boolean {
     split: [],
   },
   {
-    // One silent ladder: three arms of thirty, and a bare `-1`.
+    // One silent ladder: three arms of the whole `VKind` set, and a bare `-1`.
     name: "holed.vl",
     src: `function holed(k: string): i32 {
   if k == "nulbool" { return 1 }
@@ -103,7 +103,7 @@ function guard(k: string): boolean {
 `,
     incomplete: [2],
     split: [],
-    says: { code: INCOMPLETE, text: "tests 3 of 30 VKind kinds and ends without naming the rest" },
+    says: { code: INCOMPLETE, text: "tests 3 of 31 VKind kinds and ends without naming the rest" },
   },
   {
     // D981's shape. `walkStmt`'s default hands the rest to `walkExpr`; `walkExpr`
