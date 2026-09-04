@@ -3309,7 +3309,7 @@ Probed on the tip, each against the shape its own row names:
 * **`function g() { return voidCall() }`** — still a type error. This is a **design change request**, not a defect: #1435 took the reject deliberately under a reject-more mandate. Needs an owner ruling, not a brief.
 * **D1f** — a `while` GUARD's body and an ELEMENT place, both still loud.
 
-**Probe note, since it cost me a reading:** `match` over an `i32` scrutinee rejects with *"match scrutinee must be a union, got i32"* — a mis-shape, not the wording defect. The scrutinee must be a union.
+**Probe note, since it cost me a reading:** `match` over an `i32` scrutinee rejects with *"match scrutinee must be a union, got i32"* — a mis-shape, not the wording defect. The scrutinee must be a union. *(Superseded 2026-09-03 by D1572: an `i32`/`i64` scrutinee dispatches on integer literals with a mandatory `_`, and the refusal for the rest reads "must be a union or an integer".)*
 
 ## Queue re-derivation, round 4 — litunion rows (2026-08-17, `fed8693b`)
 

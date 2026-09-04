@@ -123,6 +123,18 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
 
 ### Ruled and sequenced (owner decisions already made, waiting only on order)
 
+- **`match` over an INTEGER scrutinee — RULED and BUILT 2026-09-03 as D1572**, the consumer
+  ask VL-020 (glean's decoders switch on integer tags; a 105-way command-id dispatch was an
+  if-chain or a table filled by 105 assignments at module init). `i32`/`i64` scrutinees,
+  integer-literal arms in any radix, negative literals, the existing `|` or-group, and a
+  MANDATORY `_` — 2^32 values is not a member set to be complete over, so exhaustiveness here
+  IS the wildcard, and an arm after the `_` is refused because it would silently REORDER
+  against first-match-wins. No emitter path: `desugarMatchAt` already turns a non-`IsExpr`
+  pattern into `scrut == pat`, so it lowers to the `i32.eq`/`i64.eq` if-chain the hand-written
+  twin produces (position matrix 0 → 54 of 54, both faces). RANGE patterns and a `br_table`
+  jump table are explicitly NOT taken — `docs/internals/match-design.md` phasing items 4 and 5
+  still stand. DECISIONS.md §"`match` over an integer scrutinee" is the ruling the owner can
+  overturn.
 - **Kill the ambient builtin `toString`; rename std:fmt's `toStr` → `toString` in its
   place** — DONE #2199 (ruled 2026-09-01, shipped the same day). Default scope, all six
   emit/classify/collect arms and `emitToString` are gone; `std:fmt` exports `toString`;
@@ -1148,7 +1160,9 @@ type the string-keyed rep lowers and every position but a union member (B6b exte
 identity from the VALUE to the (KEY, VALUE) pair, then gave the struct/variant FIELD row the same
 key column); ~~contextual f32 literals~~ **DONE**; ~~`match` phase 2 — variant payload
 binding~~ **DONE** (`match cmd { Move{x, y} => … }`, punned fields; renaming + nested destructuring
-measured and deferred — B21 item 1); literal-union compact representation (A16) — **DESIGNED
+measured and deferred — B21 item 1); ~~`match` over an INTEGER scrutinee~~ **DONE** (D1572, the
+consumer ask VL-020 — integer-literal arms and a mandatory `_`; ranges and a `br_table` still
+deferred); literal-union compact representation (A16) — **DESIGNED
 AND FILED**, its allocation rationale refuted by measurement and its correctness half (81 of 244
 cells) blocked on three owner rulings; readonly
 fields / A9 variance; ~~default params (B15a)~~ **DONE** (direct calls AND the UFCS spelling, which

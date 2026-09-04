@@ -199,6 +199,70 @@ Deno.test({
 });
 
 Deno.test({
+  name: "vl-fmt: integer `match` arms keep their lexeme, sign and or-group (D1572)",
+  ignore: !ENABLED,
+  fn: async () => {
+    // An integer-literal pattern is a `NumLit` (or a `Unary "-"` over one), not the `IsExpr` a
+    // TYPE pattern is, so it renders through `expr` rather than `matchPatFmt`'s verbatim-slice
+    // arm. Two things that path must not do: RE-BASE the lexeme (`0x10` printed as `16` is a
+    // different file from the one the user wrote) and DROP the sign (`-1` printed as `1` is a
+    // different PROGRAM). Both are asserted, then idempotency, then that the formatted text
+    // still runs and prints what the original did — a round-trip that only compares text
+    // cannot tell a preserved arm from a silently rewritten one.
+    const src = "function len(id: i32): i32 {\n" +
+      "  match id { 0x10 => 14\n" +
+      "    0x12 | 0x13 => 30\n" +
+      "    -1 => 99 _ => 0 }\n" +
+      "}\n" +
+      "print(len(0x10))\n" +
+      "print(len(0x13))\n" +
+      "print(len(-1))\n" +
+      "print(len(7))\n";
+    const r = await run([], src);
+    if (r.code !== 0) throw new Error(`fmt failed: ${r.err}`);
+    if (!/ {4}0x10 => 14\n/.test(r.out)) {
+      throw new Error(`hex arm lexeme not preserved:\n${r.out}`);
+    }
+    if (!/ {4}0x12 \| 0x13 => 30\n/.test(r.out)) {
+      throw new Error(`integer or-group arm not preserved:\n${r.out}`);
+    }
+    if (!/ {4}-1 => 99\n/.test(r.out)) {
+      throw new Error(`negative arm lost its sign:\n${r.out}`);
+    }
+    if (!/ {4}_ => 0\n/.test(r.out)) {
+      throw new Error(`wildcard arm not preserved:\n${r.out}`);
+    }
+    const r2 = await run([], r.out);
+    if (r2.out !== r.out) {
+      throw new Error(`integer match formatting not idempotent:\n${r2.out}`);
+    }
+    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_intmatch_" });
+    try {
+      const f = `${dir}/a.vl`;
+      await Deno.writeTextFile(f, r.out);
+      const cmd = new Deno.Command(VL, {
+        args: ["run", f, "--compiler", COMPILER],
+        stdout: "piped",
+        stderr: "piped",
+        env: { RUST_BACKTRACE: "0", NO_COLOR: "1" },
+      });
+      const { code, stdout, stderr } = await cmd.output();
+      const out = new TextDecoder().decode(stdout);
+      if (code !== 0) {
+        throw new Error(
+          `formatted integer match does not run: ${new TextDecoder().decode(stderr)}`,
+        );
+      }
+      if (out !== "14\n30\n99\n0\n") {
+        throw new Error(`formatted integer match changed the answers: ${out}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
   name: "vl-fmt: a `match` arm's payload clause round-trips and canonicalizes its spacing",
   ignore: !ENABLED,
   fn: async () => {

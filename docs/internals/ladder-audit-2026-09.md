@@ -34,6 +34,10 @@ sabotage measurements (§1.2) edited a type declaration, measured, and reverted.
 | struct / variant union (`A \| B \| C`) | **works**, exhaustive | `non-exhaustive match — missing C (add the arm or a \`_\`)` |
 | bare `i32` | **REFUSED** | `match scrutinee must be a union, got i32` |
 | bare `string` | **REFUSED** | `match scrutinee must be a union, got string` |
+<!-- SUPERSEDED for the `i32` row, 2026-09-03 (D1572): `i32`/`i64` are scrutinees now, with
+     integer-literal arms and a mandatory `_`, and the message for the rest reads `must be a
+     union or an integer`. `string`, `boolean`, the floats and the numeric literal union are
+     unchanged. Left in the table because this file is a dated measurement, not a live claim. -->
 | NUMERIC literal union (`type N = 1 \| 2 \| 3`) | **REFUSED** | `match over a union with literal members is not supported — compare them with \`==\` in an if-chain, got N` |
 | litunion with a `null` member (`"a" \| "b" \| null`) | **REFUSED** | same message, `got "a" \| "b" \| null` |
 | `boolean` | **REFUSED** — `true`/`false` do not even parse as union members | `expected an identifier but found \`true\`` |

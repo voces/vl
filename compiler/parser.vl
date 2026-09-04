@@ -2914,7 +2914,7 @@ function parseIf() {
 
 // `match scrut { pat [| pat]* => body … }` — exhaustive value dispatch. Reached from
 // `parsePrimary` (expression position), so a bare `match` statement is an expression statement.
-// Each arm is one-or-more patterns (a STRING literal, a TYPE, or the `_` wildcard) joined by
+// Each arm is one-or-more patterns (a STRING or INTEGER literal, a TYPE, or `_`) joined by
 // `|`, then `=>` and a body (a `{` block, or a bare expression for the value-mapping case).
 // Arms are newline- or comma-separated. The SCRUTINEE node is threaded into the pattern parser:
 // a TYPE pattern is minted as a real `IsExpr` over it (see `parseMatchPattern`), which is what
@@ -2972,22 +2972,23 @@ function parseMatch(): i32 {
 }
 
 // Whether the token at the cursor can START a match arm's TYPE pattern: a name
-// (`C`, `i32`, `Box<i32>`), an inline object (`{c: i32}`), the `null` type, or a
-// numeric-literal-type lexeme (`0`, `1.5` — a numeric literal union's arms). Kept
+// (`C`, `i32`, `Box<i32>`), an inline object (`{c: i32}`) or the `null` type. Kept
 // a closed set so a token that starts NO type still gets the pattern diagnostic
 // below rather than `parseTypeAtom`'s generic "expected IDENT" recovery.
+//
+// A NUMBER is deliberately NOT here (D1572): a numeric lexeme in pattern position is
+// the integer LITERAL it reads as, taken by `parseMatchPattern` before this is asked.
 function matchPatStartsType() {
   const k = peekKind()
   if k == "IDENT" { return true }
   if k == "LBRACE" { return true }
   if k == "NULL" { return true }
-  if k == "NUMBER" { return true }
   false
 }
 
-// One match arm pattern: a STRING literal (a litunion member), `_` (the wildcard,
-// lexed as the identifier `_`), or a TYPE (a VALUE-union arm). Anything else is a
-// parse error.
+// One match arm pattern: a STRING literal (a litunion member), an INTEGER literal
+// (D1572), `_` (the wildcard, lexed as the identifier `_`), or a TYPE (a VALUE-union
+// arm). Anything else is a parse error.
 //
 // A TYPE pattern is minted as a real `IsExpr` over the SCRUTINEE node — exactly what
 // `scrut is T` produces — so the spelling tree, the module merge, the lint walker
@@ -3007,6 +3008,23 @@ function parseMatchPattern(scrut: i32, binds: i32[]): i32 {
     binds.push(-1)
     return mkIdent(advance().text, pp)
   }
+  // An INTEGER-LITERAL pattern (D1572): `0x10 => …`, `-1 => …`. Minted as the NUMBER
+  // EXPRESSION it reads as — a `NumLit`, or a `Unary "-"` over one — never as a numeric
+  // literal TYPE, so `desugarMatchAt`'s non-`IsExpr` arm turns it into `scrut == pat`
+  // and an integer match IS the hand-written if-chain, node for node.
+  // The `-` belongs to the PATTERN, not to a prefix expression: a pattern is ONE
+  // literal, so only an immediately-following NUMBER is taken.
+  if peekKind() == "NUMBER" {
+    binds.push(-1)
+    return mkNum(advance().text, pp)
+  }
+  if peekKind() == "MINUS" && peek2Kind() == "NUMBER" {
+    advance() // "-"
+    const np = peekTok().start
+    const numIx = mkNum(advance().text, np)
+    binds.push(-1)
+    return mkUnary("-", numIx, pp)
+  }
   if matchPatStartsType() {
     // The spelling root must be taken off the stack BEFORE the node is minted and banked
     // immediately after — `parseIsType`'s contract, with `parseTypeAtom` in place of
@@ -3021,9 +3039,8 @@ function parseMatchPattern(scrut: i32, binds: i32[]): i32 {
     return isIx
   }
   binds.push(-1)
-  P.diags.push(
-    { msg: "match pattern must be a type, a string literal, or `_`", at: P.pos },
-  )
+  const patMsg = "match pattern must be a type, a string literal, an integer literal, or `_`"
+  P.diags.push({ msg: patMsg, at: P.pos })
   advance()
   mkErr("pat", P.pos, pp)
 }

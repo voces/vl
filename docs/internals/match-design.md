@@ -29,9 +29,10 @@ expr may be a block** (Rust/Kotlin/Java/F#); the colon-`case:`-with-`break` styl
   its value). Simple mapping (`"a" => 1`) and block bodies (`"a" => { …; v }`) are the same rule.
 - **No fallthrough.** Exactly one arm runs (the first whose pattern matches). No `break`.
 - **Exhaustive over closed sets** (literal unions, registered unions): a missing member/variant is
-  a compile error. Open scalars (`i32`, `string`) require a `_` wildcard. (As built: an open scalar
-  is not a scrutinee at all — `match scrutinee must be a union, got i32`. A bare `i32` has no closed
-  member set, so a `_`-only match over one would be an `if` with extra syntax.)
+  a compile error. Open scalars require a `_` wildcard — and as built that is now literal:
+  `i32`/`i64` ARE scrutinees (D1572, "An integer scrutinee" below) and the `_` is MANDATORY over
+  one, because 2^32 values is not a member set to be complete over. `string`, `boolean` and the
+  floats are still not scrutinees at all — `match scrutinee must be a union or an integer, got …`.
 - **Redundancy check.** A pattern already covered by an earlier arm is a compile error (dead arm).
 - **Scrutinee evaluated once.** ⚠️ **NOT WHAT WAS BUILT — measured 2026-07-28.** Phase 2a mints
   each arm's pattern as an `IsExpr` over the SHARED scrutinee NODE, and the desugar uses those
@@ -63,10 +64,17 @@ Phase 2b (now):
   one arm-local `const` per named field. Field punning only (`{x, y}`, not `{x: a}` and not nested
   patterns) — see "Phase 2b as built" for why the two richer forms are deferred rather than absent.
 
+Phase 3 (now):
+- **Integer literal** — `0x10 => 14`, `-1 => 99` over an `i32`/`i64` scrutinee, with a MANDATORY
+  `_`. See "An integer scrutinee" below; the ruling is DECISIONS.md §"`match` over an integer
+  scrutinee".
+
 Deferred (follow-ups, captured here so we don't reinvent them):
 - **Guards** — `pat if cond => …` (`when`-style). Keep `if`-conditions OUT of the pattern grammar
   otherwise; arbitrary-condition `when` (Kotlin) would make exhaustiveness meaningless.
-- **Ranges** — `0..9 => …` for `i32`.
+- **Ranges** — `0..9 => …` for `i32`. Explicitly NOT taken with D1572: a range needs its own
+  grammar, an ordering rule at the type tier and an overlap check that is not the equality check
+  duplicates use — three decisions to take together, with a need.
 - **Nested destructuring**, **`@`-bindings**, **tuple/multi-scrutinee** — ML-style richness, only if
   a concrete need appears.
 
@@ -98,8 +106,13 @@ Deferred (follow-ups, captured here so we don't reinvent them):
    - **2b — payload binding** (`Move{x, y} => x + y`). **SHIPPED.** See "Phase 2b as built".
 3. **Expression-position polish** — ensure arms-yield-value works everywhere `if`-expressions do.
    **A BINDING arm in value position: SHIPPED.** See "A binding arm in value position" below.
+   **An INTEGER scrutinee: SHIPPED** (D1572, the consumer ask VL-020). See below.
 4. **Guards** (`pat if cond =>`).
-5. (Maybe) ranges / `i32` density → `br_table` codegen.
+5. (Maybe) ranges / `i32` density → `br_table` codegen. D1572 built the integer scrutinee and
+   left BOTH halves of this item standing: it lowers to the compare chain, because the emitter
+   has no general jump-table helper (its one `br_table` is a hand-written three-way niche
+   print), and a jump table is a codegen project with its own grid rather than a rider on a
+   surface decision.
 
 ## Phase 2a as built
 
@@ -253,6 +266,63 @@ in the emitter's evaluation order; the pre-order is the whole cost.
 other index columns. A stale index that happens to name a node in the next program grants
 permission collect never gave — reachable only when one instance lowers several programs, which is
 why the corpus driver (not the CLI, not the fixpoint ladder) is where it showed.
+
+## An integer scrutinee (D1572, the consumer ask VL-020)
+
+**For a VL author.** A `match` whose scrutinee is an `i32` or an `i64` dispatches on integer
+LITERALS, and its `_` arm is required:
+
+```vl
+function len(id: i32) {
+  match id {
+    0x10 => 14          // any radix the lexer takes; `0x10` and `16` are the SAME arm
+    0x12 | 0x13 => 30   // the same or-group every other vocabulary uses
+    -1 => 99            // negative literals are patterns
+    _ => -1             // REQUIRED — an integer has no closed member set
+  }
+}
+```
+
+Arm bodies, the statement/expression forms and the value join are `match`'s existing rules, so
+`const v = match tag { 1 => "a", _ => "b" }` types like any other `match` and an arm yielding
+`null` gives the whole thing `T | null` (D1086). A duplicate literal and an arm after the `_`
+are compile errors. Not admitted: `string`/`boolean`/float scrutinees, a numeric literal UNION
+(`type N = 0 | 1 | 2` — its arms would need a literal `is`, which has no rep), and range
+patterns. The full ruling, including why each of those is out, is DECISIONS.md §"`match` over
+an integer scrutinee".
+
+**An UN-ANNOTATED scrutinee works, and costs no annotation the if-chain twin does not.**
+`function len(id) { match id { 0x10 => 14, _ => -1 } }` runs. A hole names no vocabulary, so
+the ARMS choose it, and each arm then defers the same `==` constraint `if id == 0x10` defers —
+the parameter stays open and the CALL adjudicates, so `len("a")` is
+`argument 1: operator '==' is not defined for string and i32` at both spellings. Nothing here
+guesses an `i32` the author did not write.
+
+**As built.** A third arm vocabulary in `checkMatchExprNode`, asked before the union tests:
+`checkMatchIntArms`. Two things were genuinely new and nothing else was. The PARSER used to
+mint a NUMBER in pattern position as a numeric literal TYPE (`mkIsExpr(scrut, "0")`); it now
+mints the `NumLit` itself, plus a `Unary "-"` over one for the negative spelling, which had no
+pattern form at all. Nothing regressed by that move — a numeric literal union is refused at the
+scrutinee, so its arms were never validated as types. And the CHECKER type-checks each pattern
+as the EXPRESSION it is (so assignability is the arm-type rule: an `i32` literal reaches an
+`i64` scrutinee by the widening lattice, never the reverse) and claims its 64-bit VALUE through
+`parseI64Pair`, which is what makes `0x10` and `16` one arm and `-1` not `1`. The HOLE route is
+one extra clause on the same dispatch (`matchArmsAreIntLits`) plus one `noteBinCstr` per arm —
+the deferral, not a solve.
+
+**No emitter path.** `desugarMatchAt`'s `matchArmCond` already had a non-`IsExpr` arm building
+`scrut == pat` — the rung a literal union's `StrLit` pattern takes — so an integer match
+rewrites in place to the `i32.eq`/`i64.eq` if-chain the hand-written twin produces, node for
+node, and the exhaustive-last-arm rule still emits n−1 tests for n arms. The two 26-position
+capability matrices (`matrix/int-match-expression.matrix.vl` and
+`matrix/int-match-unannotated-scrutinee.matrix.vl`) read 0 → 54 of 54 in both faces for that
+reason rather than by luck: by the time a delivery position sees the node, it is an if-chain.
+
+**Why the wildcard is mandatory, and why an arm after it is refused.** Exhaustiveness over a
+union means naming every member; an `i32` has 2^32 values, so here exhaustiveness IS the
+wildcard. And `matchElseArmOf` makes the wildcard arm the chain's bare `else`, so an arm after
+it would be tested FIRST — allowing it would silently REORDER the program against
+first-match-wins. Both are hard errors at the pattern.
 
 ## Pipeline touch-points (per the language-features playbook)
 
