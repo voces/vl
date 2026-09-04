@@ -562,7 +562,7 @@ for the form with no kind literal in it, which is the only place #2400's hole is
 ## A TABLE READ BOUND-TESTS ITS INDEX, OR TAKES A READER WHOSE MISS CANNOT BE A REAL ROW
 
 Four compiler TRAPS in one day, four sites: `T.tys[t.nInner]` on a `-1` arena hole (D1440),
-`T.tys[lt]` on a laundered element hole (D1462, D1566), `rlElemName[slot]` on a slot CLAMPED to
+`T.tys[lt]` on a laundered element hole (D1462, and the operand-hole row that followed it), `rlElemName[slot]` on a slot CLAMPED to
 0 into an EMPTY table (D1500). Every one returned `vl check` **rc 0** and then died inside the
 seed with an anonymous `out of bounds array access` — the error a user reads as THEIR index
 being out of range (the host banner now says which module trapped, exit 70).
@@ -586,7 +586,7 @@ D1513 — the same week's other trap, an unmemoised exponential — is the NEGAT
 reports nothing, which is what makes this a family rather than a bucket labelled "compiler
 trap". Ask a new trap which of the two it is before auditing the readers again. And the
 premise of a trap brief is RUN on the current seed before the brief is written: a program's own
-`out of bounds` (exit 1, no banner) was relayed as a compiler trap once (D1569's brief).
+`out of bounds` (exit 1, no banner) was relayed as a compiler trap once, and the fix agent had to refute its own brief.
 
 ## Claims about the tree
 
