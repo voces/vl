@@ -130,6 +130,7 @@ import {
   annObjFieldSplit,
   annRetNameOf,
   drwDispatchOp,
+  moduleLocalLetAll,
   moduleLocalLetOfUnique,
   monoAnnHasTyParam,
   monoBindFromAnn,
@@ -377,20 +378,22 @@ function monoStructAnnName(name: string) {
   ""
 }
 
-// The module-scope `LetDecl` for `name`, or -1. Declines by a shadow test — a binding or
-// parameter of this name in the body — never on `fnIx >= 0`. Module scope has two storage
-// classes: a top-level block's binding is a start-function local, absent from
+// Is `name` still the module's binding when read from inside `fnIx` (-1 = module scope)?
+// False when that body binds it or takes a parameter of it — the shadow test, which is not
+// the same question as `fnIx >= 0` (D703).
+function monoModuleNameVisible(name: string, fnIx: i32) {
+  if fnIx < 0 { return true }
+  if paramTypeNode(fnIx, name) >= 0 { return false }
+  const shf = P.nodes[fnIx]
+  if shf is FuncDecl { return parentLetOf(shf.fnBody, name) < 0 }
+  false
+}
+
+// The module-scope `LetDecl` for `name` as seen from `fnIx`, or -1. Module scope has two
+// storage classes: a top-level block's binding is a start-function local, absent from
 // `monoProgStmts`, so `moduleLocalLetOfUnique` is the other table (D1596).
 function monoModuleLetOf(name: string, fnIx: i32) {
-  if fnIx >= 0 {
-    if paramTypeNode(fnIx, name) >= 0 { return -1 }
-    const shf = P.nodes[fnIx]
-    if shf is FuncDecl {
-      if parentLetOf(shf.fnBody, name) >= 0 { return -1 }
-    } else {
-      return -1
-    }
-  }
+  if !monoModuleNameVisible(name, fnIx) { return -1 }
   let i = 0
   while i < monoProgStmts.length {
     const s = P.nodes[monoProgStmts[i]]
@@ -400,6 +403,66 @@ function monoModuleLetOf(name: string, fnIx: i32) {
     i = i + 1
   }
   moduleLocalLetOfUnique(emitRootIx, name)
+}
+
+// Does the module-block binding at `letIx` carry `want`, the emit name of what the checker
+// recorded for a call site? Both of the binding's spellings answer: an alias puts `Box` on
+// the annotation and the inline shape on the initializer, and only one renders as `want`.
+function monoModuleLetTyIs(letIx: i32, want: string) {
+  if want == "" { return false }
+  const gd = P.nodes[letIx]
+  if gd is LetDecl {
+    if gd.letType >= 0 {
+      if tyNameOf(gd.letType) == want { return true }
+    }
+    if gd.letInit >= 0 {
+      if tyToEmitName(nodeTyIxOf(gd.letInit)) == want { return true }
+    }
+  }
+  false
+}
+
+// The pin a module-block binding gives, or "" — its annotation, else its initializer's own
+// answer. "" rather than a third fall-through state, so a candidate that names nothing
+// cannot stop `monoArgTyName`'s ladder.
+function monoModuleLetPin(letIx: i32, fnIx: i32) {
+  const gd = P.nodes[letIx]
+  if gd is LetDecl {
+    if gd.letType >= 0 { return monoAnnPinName(tyNameOf(gd.letType)) }
+    if gd.letInit >= 0 {
+      const inner = monoArgTyName(gd.letInit, fnIx)
+      if inner != "i32" { return inner }
+    }
+  }
+  ""
+}
+
+// The pin for the call site `siteIx` when the module frame binds `name` in more than one
+// block, or "". The first-wins table declines there; the candidate carrying the type the
+// checker recorded for the site is the one it denotes, and a set of candidates that all pin
+// one spelling has no disagreement left to decline over (D1598).
+function monoModuleDupPin(name: string, fnIx: i32, siteIx: i32) {
+  if !monoModuleNameVisible(name, fnIx) { return "" }
+  const cands: i32[] = []
+  moduleLocalLetAll(emitRootIx, name, cands)
+  if cands.length < 2 { return "" }
+  const want = tyToEmitName(nodeTyIxOf(siteIx))
+  let i = 0
+  while i < cands.length {
+    if monoModuleLetTyIs(cands[i], want) {
+      const dp = monoModuleLetPin(cands[i], fnIx)
+      if dp != "" { return dp }
+    }
+    i = i + 1
+  }
+  const agreed = monoModuleLetPin(cands[0], fnIx)
+  if agreed == "" { return "" }
+  let j = 1
+  while j < cands.length {
+    if monoModuleLetPin(cands[j], fnIx) != agreed { return "" }
+    j = j + 1
+  }
+  agreed
 }
 
 // The one home for "which annotation name can serve as a monomorphization pin". Both
@@ -824,6 +887,9 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
           if ginner == "" { return "" }
         }
       }
+    } else {
+      const dpn = monoModuleDupPin(argN.identName, fnIx, cax)
+      if dpn != "" { return dpn }
     }
   }
   // An indexed element argument (`id(xs[0])`): the array's own name resolves above through
