@@ -8884,7 +8884,10 @@ export function applyGenAlias(head: string, inner: string) {
 // because the two routes must not be able to drift.
 function applyGenAliasArgs(head: string, inner: string, appIx: i32) {
   const gi = gaIndexOf(head)
-  if gi < 0 { return -1 }
+  // D1582 — `Map<string, i32>` reaches the alias-application door, not the leaf
+  // ladder, so the same hint has to be banked here too or the spelling a consumer
+  // is most likely to try is the one that stays unhelpful.
+  if gi < 0 { return builtinCtorTyLeafFail(head) }
   // The declared parameter names, read as a SLICE of the flat column — split
   // once when the alias registered (D-GAPARAM), not re-split here per
   // application. `pcount` is the declared ARITY.
@@ -9164,7 +9167,9 @@ function tsLeafTy(name: string) {
   if pv >= 0 { return pv }
   const tv = tpEnvTyOfName(name)
   if tv >= 0 { return tv }
-  declaredTyOfName(name)
+  const dv = declaredTyOfName(name)
+  if dv >= 0 { return dv }
+  builtinCtorTyLeafFail(name)
 }
 
 // D-MAPKEYDIAG — the spelling node whose KEY the unsupported-map-key diagnostic names, or -1
@@ -9252,6 +9257,32 @@ let annotCollapsed: {[string]: i32} = Map()
 // design: wasm has i8 as a STORAGE type and not as a value type, and VL mirrors that.
 function storageTyLeafFail() {
   unkTyClash = "`u8` is a storage type, not a value type — it may be an array element (`u8[]`), but a local, parameter, return, field, map value or generic argument is a value, and values are `i32`"
+  -1
+}
+
+// D1583 — the same rule at the one position whose remedy is DIFFERENT. In an annotation
+// the answer is "write `i32`"; in `x as u8` there is nothing to write, because the
+// conversion the author is reaching for is what the STORE already does. So the message
+// names the truncation and both spellings of it rather than repeating the rule.
+function u8CastText() {
+  "`u8` is a storage type, not a value type — a `u8[]` stores the low byte of an `i32`; push the `i32` directly (300 stores as 44), or `x & 0xff` to make the truncation explicit"
+}
+
+// D1582 — `Map`/`Set` name a CONSTRUCTOR, never a type: the type each makes is
+// spelled with the index signature. The map type is spellable and nothing said so,
+// so `type S = { index: Map }` answered `unknown type 'Map'` — honest and useless,
+// because the remedy is a spelling the reporter had no way to guess. Banks on the
+// `unkTyClash` wire so all six `unknownTyText` sites report it without gaining an arm.
+// Reached only AFTER the declared-name rung, so a program that declares its own
+// `type Map = …` keeps it (`emit_base.isBuiltinFnName` grants the same freedom to
+// the value name). The wording ends in the EXAMPLE because two call sites append
+// their own clause (`… for field 'index'`, `… in union 'U'`).
+function builtinCtorTyLeafFail(name: string) {
+  if name == "Map" {
+    unkTyClash = "`Map` is not a type name — `Map()` is the constructor and the map TYPE is spelled `{[K]: V}`, e.g. `{[string]: i32}`"
+  } else if name == "Set" {
+    unkTyClash = "`Set` is not a type name — `Set()` is the constructor and the set TYPE is spelled `{[K]: boolean}`, e.g. `{[string]: boolean}`"
+  }
   -1
 }
 
@@ -10088,7 +10119,9 @@ function nameToTyReal(name: string) {
     const ltAt = gaeLtAt(name)
     return applyGenAlias(gaeHeadNameOf(name, ltAt), gaeArgsTextOf(name, ltAt))
   }
-  declaredTyOfName(name)
+  const dvn = declaredTyOfName(name)
+  if dvn >= 0 { return dvn }
+  builtinCtorTyLeafFail(name)
 }
 
 // The collection FLAVOR of a binding initializer: "Set" when the init is a
@@ -26734,8 +26767,27 @@ function desugarMatchAt(ix: i32) {
   0
 }
 
+// D1580 — the return tail is a SPINE, not a subtree. `retTailPos` may follow only
+// the chain of nodes whose OWN value IS the function's return: a block (its last
+// statement), an if-expression (its arms), a `return` (its argument), a paren. Every
+// other parent — an object literal's field value, a list element, a call argument —
+// merely CONTAINS the expression, so its `if` arms are arms of the FIELD's type, not
+// of the function's. Without the clear they were unioned into the inferred return and
+// the error landed on the caller (`field 'i' is not on every member of i32|{i: i32}`),
+// naming a union the author never wrote.
+function tailSpineNode(ix: i32) {
+  if ix < 0 { return false }
+  const nd = P.nodes[ix]
+  nd is Block || nd is IfStmt || nd is RetStmt || nd is Paren
+}
+
 function checkNode(ix: i32) {
+  const savedTail = retTailPos
+  if retTailPos {
+    if !tailSpineNode(ix) { retTailPos = false }
+  }
   const t = checkNodeReal(ix)
+  retTailPos = savedTail
   if !inferQuiet {
     if ix >= 0 {
       if ix < nodeTyIx.length { nodeTyIx[ix] = t }
@@ -35659,7 +35711,17 @@ function checkCastNode(n: AsExpr, ix: i32) {
   const arg = checkNode(n.asObj)
   const target = nameToTyAt(n.asTy, ix)
   if target < 0 {
-    tErr("unknown type `" + n.asTy + "` in `as` cast", ix)
+    // D1583 — `u8` names something (`u8[]` is spellable, `std:fs` answers one), so
+    // `unknown type` was the one thing it is not. It is a STORAGE type: the element
+    // position exists, the VALUE position does not, so there is no cast to write and
+    // none is needed — a `u8[]` store keeps the low byte of the `i32` it is given.
+    // Reached only when the name did NOT resolve, so a program declaring its own
+    // `type u8` is unaffected. Gate: `storageTyLeafFail`, the annotation-position twin.
+    if n.asTy == "u8" {
+      tErr(u8CastText(), ix)
+    } else {
+      tErr("unknown type `" + n.asTy + "` in `as` cast", ix)
+    }
     return TY_ERR
   }
   // A HOLE OPERAND ANSWERS NEITHER OF THE TRIO'S TYPE-LEVEL QUESTIONS, and the numeric ladder

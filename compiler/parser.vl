@@ -431,6 +431,26 @@ function binPrec(kind: TokKind): i32 {
   0
 }
 
+// D1581 — how many `(` / `[` / object-literal `{` are open around the expression
+// being parsed. Inside one there is no statement a NEWLINE could be ending, so a
+// continuation line may LEAD with a binary operator; at depth 0 the newline is the
+// statement terminator and `a` NEWLINE `-b` stays two statements. A BLOCK resets it
+// to 0, because a `{ … }` inside a call argument holds statements exactly as the top
+// level does. Ruling: DECISIONS.md, "Newlines inside brackets are whitespace".
+let brDepth = 0
+
+// The ABSOLUTE index of the binary OPERATOR a NEWLINE run at the cursor leads to, or
+// -1 when it leads to anything else. Sibling of `chainDotAfterNewlines`, and the same
+// look-before-consume discipline: the cursor moves only once the answer is known, so a
+// run leading to a closer or another element is LEFT IN PLACE — `takeSep` reads that
+// newline off `P.pos - 1` to refuse a cross-line missing-comma insert.
+function binOpAfterNewlines(): i32 {
+  let j = P.pos
+  while kindAt(j) == "NEWLINE" { j = j + 1 }
+  if binPrec(kindAt(j)) > 0 { return j }
+  -1
+}
+
 // The right-associative operators (assignment): their RHS parses at the SAME
 // precedence, not `prec + 1`, so `a = b = c` nests as `a = (b = c)`.
 function rightAssoc(kind: TokKind) {
@@ -1075,9 +1095,12 @@ function parsePrimary() {
     // otherwise a grouped expression `(expr)`.
     if looksLikeArrowLambda() { return parseArrowLambda(p0) }
     advance()
+    const brSavedP = brDepth
+    brDepth = brDepth + 1
     skipNewlines() // a newline may immediately follow `(`
     const inner = parseExpr()
     skipNewlines() // …and immediately precede `)`
+    brDepth = brSavedP
     expectClose("RPAREN")
     return mkParen(inner, p0)
   }
@@ -1211,6 +1234,8 @@ let gCallArgNames: string[] = []
 function parseArgs() {
   const args: i32[] = []
   const names: string[] = []
+  const brSavedA = brDepth
+  brDepth = brDepth + 1
   // An argument list may span lines and allow ONE trailing comma before `)`.
   skipNewlines()
   if peekKind() != "RPAREN" {
@@ -1230,6 +1255,7 @@ function parseArgs() {
       }
     }
   }
+  brDepth = brSavedA
   expectClose("RPAREN")
   gCallArgNames = names
   args
@@ -1262,6 +1288,8 @@ function parseOneArg(args: i32[], names: string[]) {
 function parseObjLit() {
   const p0 = peekTok().start // the opening `{`
   expect("LBRACE")
+  const brSavedO = brDepth
+  brDepth = brDepth + 1
   // An object literal may span several source lines (`{` NEWLINE `k: v,` NEWLINE
   // `}`). Mirror the host's `parseObjectLiteral`: skip NEWLINEs after `{`, before
   // each field, after each field (before the `,`/`}`), after the `,`, and before
@@ -1335,6 +1363,7 @@ function parseObjLit() {
       going = false
     }
   }
+  brDepth = brSavedO
   expectClose("RBRACE")
   mkObjLit(fields, p0)
 }
@@ -1346,6 +1375,8 @@ function parseObjLit() {
 function parseArrayLit() {
   const p0 = peekTok().start // the opening `[`
   expect("LBRACK")
+  const brSavedL = brDepth
+  brDepth = brDepth + 1
   // A literal may span lines (`[` NEWLINE `1,` NEWLINE `]`) and allow ONE
   // trailing comma before `]` — newlines are insignificant until the `]`.
   skipNewlines()
@@ -1361,6 +1392,7 @@ function parseArrayLit() {
       going = false
     }
   }
+  brDepth = brSavedL
   expectClose("RBRACK")
   mkArrayLit(elems, p0)
 }
@@ -1414,7 +1446,10 @@ function parsePostfix() {
       node = mkOptMember(node, oprop, p0)
     } else if k == "LBRACK" {
       advance()
+      const brSavedI = brDepth
+      brDepth = brDepth + 1
       const index = parseExpr()
+      brDepth = brSavedI
       expectClose("RBRACK")
       node = mkIndex(node, index, p0)
     } else if k == "NEWLINE" {
@@ -1640,7 +1675,22 @@ function parseBinary(left: i32, minPrec: i32, leftPos: i32) {
   let acc = left
   let going = true
   while going {
-    const k = peekKind()
+    let k = peekKind()
+    // D1581 — a NEWLINE inside an open bracket is whitespace before a binary
+    // operator, so the continuation line may LEAD with the operator. Gated on
+    // `brDepth` because at statement level the newline is the terminator: `a`
+    // NEWLINE `-b` is two statements and must stay so. Look-before-consume, like
+    // `chainDotAfterNewlines` — a newline run leading anywhere but to an operator
+    // is left in place for the caller (a list's `takeSep` reads it off `P.pos - 1`).
+    if brDepth > 0 {
+      if k == "NEWLINE" {
+        const jb = binOpAfterNewlines()
+        if jb >= 0 {
+          P.pos = jb
+          k = peekKind()
+        }
+      }
+    }
     const prec = binPrec(k)
     if prec == 0 || prec < minPrec {
       going = false
@@ -3119,6 +3169,11 @@ function parseBlock() {
   // the close, which is the whole of "lexically scoped to the block".
   const btSaved = btNames.length
   btDepth = btDepth + 1
+  // D1581 — a block holds STATEMENTS, so its newlines are terminators again even
+  // inside `f(() => { … })`. Without the reset, `a` NEWLINE `-b` in a lambda body
+  // nested in a call argument would join into one subtraction.
+  const brSavedB = brDepth
+  brDepth = 0
   const stmts: i32[] = []
   let going = true
   while going {
@@ -3127,6 +3182,7 @@ function parseBlock() {
     else if k == "NEWLINE" || k == "SEMI" { advance() }
     else { stmts.push(parseStmt()) }
   }
+  brDepth = brSavedB
   expectClose("RBRACE")
   btDepth = btDepth - 1
   btTrimTo(btSaved)
@@ -3463,6 +3519,10 @@ export function parseProgram() {
   // malformed) run: a banked `>` credit would silently close some later
   // unrelated generic.
   pendingGt = 0
+  // D1581: bracket depth is per PROGRAM too. An unclosed `(` in an earlier
+  // (malformed) parse would otherwise leave it raised and make every later
+  // statement break newline-terminate at a leading operator.
+  brDepth = 0
   // D1045: the block-scope machinery is per PROGRAM. A mint counter only has to
   // be unique within its module — the merge renames each module's top-level
   // declarations, these included, apart — and a leaked scope row from an earlier
