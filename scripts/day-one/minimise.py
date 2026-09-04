@@ -27,8 +27,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import grammar as G  # noqa: E402
+import modules as M  # noqa: E402
 import render as R  # noqa: E402
 import sample as S  # noqa: E402
+
+# The names a `// file:` section imports from a sibling section. A removal that takes the
+# `export` out from under a surviving import leaves a program that no longer compiles for
+# a reason that has nothing to do with the defect.
+IMPORTED = re.compile(r'^import \{([^}]*)\} from "\./', re.M)
 
 
 def _key(res):
@@ -62,10 +68,15 @@ def _declared(text):
 def _context(src):
     """What a removal may not break: a declaration whose call survives, and a call whose
     declaration survives. Guarding only one direction leaves witnesses that call an
-    undeclared `mkval` — the refusal holds, and the program is no longer a program."""
+    undeclared `mkval` — the refusal holds, and the program is no longer a program.
+
+    `files` is the same rule for a MULTI-MODULE witness: a `// file:` marker is the
+    program's shape, and deleting one merges two modules into a single file — which is
+    the other face of the pair, not a smaller version of this one."""
     return {"declared": _declared(src),
             "must_call": {m for m in _declared(src)
-                          if len(re.findall(r"\b%s\(" % m, src)) > 1}}
+                          if len(re.findall(r"\b%s\(" % m, src)) > 1},
+            "files": len([l for l in src.splitlines() if M.FILE_MARK.match(l)])}
 
 
 def _plausible(lines, keep_chains, ctx):
@@ -79,6 +90,12 @@ def _plausible(lines, keep_chains, ctx):
         if a.rstrip().endswith("{") and b.strip() == "}":
             return False
     text = "\n".join(lines)
+    if len([l for l in lines if M.FILE_MARK.match(l)]) != ctx["files"]:
+        return False
+    for m in IMPORTED.finditer(text):
+        for nm in [x.strip() for x in m.group(1).split(",") if x.strip()]:
+            if not re.search(r"^export \w+ %s\b" % re.escape(nm), text, re.M):
+                return False
     here = _declared(text)
     for name in ctx["declared"]:
         calls = len(re.findall(r"\b%s\(" % name, text))
@@ -132,6 +149,8 @@ def ablate(pair, side, compiler, tmpdir):
     rows, k = [], 0
     val = R.plan_of(spec)["value"]
     for ax in G.AXES:
+        if ax.get("generator"):
+            continue
         opts = ax["faces"]
         if ax["id"] == "narrowing":
             opts = [r["id"] for r in val["reads"]]
@@ -155,12 +174,36 @@ def ablate(pair, side, compiler, tmpdir):
     return base, rows
 
 
+def ablate_modules(pair, side, compiler, tmpdir):
+    """One UNIT at a time, for a `modules_split` pair.
+
+    Line removal cannot answer this axis's question: the units are spread over two files,
+    dropping one has to drop everything that depends on it, and the collision the three
+    module rows all need is a NAME shared by two scopes rather than a line. `ablations`
+    re-renders the spec without each unit, with the names un-collided, and with each
+    moved unit kept in the entry instead.
+    """
+    spec, face = pair["spec"], pair[side]["face"]
+    src, want = M.render(spec, face)
+    base = S.grade_src(src, want, compiler, tmpdir, "abm0")
+    rows = []
+    for k, (label, trial) in enumerate(M.ablations(spec), 1):
+        tsrc, twant = M.render(trial, face)
+        if tsrc == src:
+            continue
+        got = S.grade_src(tsrc, twant, compiler, tmpdir, "abm%d" % k)
+        rows.append(("units", label, got["grade"],
+                     "same" if _key(got) == _key(base) else "MOVED"))
+    return base, rows
+
+
 def report_one(pair, compiler):
     side = "a" if pair["a"]["grade"] != "RUNS" else "b"
     other = "b" if side == "a" else "a"
+    ablator = ablate_modules if pair["axis"] == "modules_split" else ablate
     with tempfile.TemporaryDirectory(prefix="vl-day-one-min-") as td:
         wit, base = minimise(pair[side]["src"], pair[side]["want"], compiler, td)
-        baseline, rows = ablate(pair, side, compiler, td)
+        baseline, rows = ablator(pair, side, compiler, td)
     print("=" * 72)
     print("s%d/%d  axis=%s  %s(%s)=%s   twin %s(%s)=%s" % (
         pair["seed"], pair["index"], pair["axis"], side, pair[side]["face"],

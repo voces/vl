@@ -35,6 +35,7 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(ROOT, "scripts", "capability-probes"))
 
 import grammar as G  # noqa: E402
+import modules as M  # noqa: E402
 import render as R  # noqa: E402
 import run as probes  # noqa: E402
 
@@ -50,6 +51,29 @@ def env():
     return e
 
 
+def write_program(src, tmpdir, name):
+    """Materialise `src` and return the ENTRY path.
+
+    A source carrying `// file:` markers is a MULTI-MODULE program — the `modules_split`
+    axis, and the same marker `check-filed-witnesses.py` grades a two-file witness with,
+    so a hit here can be pasted into an inventory row verbatim. Its sections go in a
+    directory of their own so relative imports resolve and two pairs graded in parallel
+    cannot collide on a module's name; the LAST section is the entry.
+    """
+    parts = M.split_files(src)
+    if len(parts) == 1:
+        path = os.path.join(tmpdir, name + ".vl")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(src)
+        return path
+    here = os.path.join(tmpdir, name)
+    os.makedirs(here, exist_ok=True)
+    for fn, body in parts:
+        with open(os.path.join(here, fn), "w", encoding="utf-8") as fh:
+            fh.write(body)
+    return os.path.join(here, parts[-1][0])
+
+
 def grade_src(src, want, compiler, tmpdir, name):
     """One program's verdict, in run.py's vocabulary plus a program TRAP.
 
@@ -57,9 +81,7 @@ def grade_src(src, want, compiler, tmpdir, name):
     reach the host as a wasm backtrace out of one `vl run`. One extra `vl build` on
     that path settles it: a module that was written means the trap was the program's.
     """
-    path = os.path.join(tmpdir, name + ".vl")
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(src)
+    path = write_program(src, tmpdir, name)
     # `want=None` so run.py grades the CHANNEL only; the output contract is checked
     # here and it is EXACT. run.py's is a substring test, which a generated `want` of
     # "2" would pass against a printed "2.5" — a RUNS-WRONG read as a RUNS.
@@ -190,8 +212,17 @@ def feature_table(pairs):
         print("  %-20s %3d/%-4d %5.1f%%" % (f, hit[f], n, 100.0 * hit[f] / n))
 
 
+def multi_file(pairs):
+    """Programs spelled as more than one module. A `modules_split` pair whose split face
+    stopped carrying a second file would still be counted as an exercised axis, so the
+    axis table alone cannot say the two-module path ran."""
+    return sum(1 for p in pairs for s in (p["a"], p["b"])
+               if len(M.split_files(s["src"])) > 1)
+
+
 def report(pairs):
-    print("\n%d pairs = %d programs" % (len(pairs), 2 * len(pairs)))
+    print("\n%d pairs = %d programs · %d of them multi-module"
+          % (len(pairs), 2 * len(pairs), multi_file(pairs)))
     table(pairs, "pair verdicts", lambda p: p["verdict"])
     table([s for p in pairs for s in (p["a"], p["b"])],
           "program grades", lambda s: s["grade"])
@@ -289,6 +320,92 @@ def _rendered(spec, faces, axis, other_face):
     return out
 
 
+# THE THREE MODULE ROWS, AS TWO-FILE AGREE PINS. Each is its own row's cross-module
+# witness in the `// file:` form the sampler grades, paired with the SAME program spelled
+# as one file — so the pin also proves the multi-file writer still delivers the imported
+# module rather than silently grading one file.
+D1593_PAIR = ("""type E = { msg: string }
+function pick(): i32 | E { return 7 }
+const T = __array_new__(4, 0)
+for n in 0 to 3 {
+  let c = n
+  c = c + 1
+  T[n] = c
+}
+print(T[3])
+if true {
+  const n = pick()
+  if n is E { print(0) } else { print(n) }
+}
+""", """// file: table.vl
+export const T = __array_new__(4, 0)
+for n in 0 to 3 {
+  let c = n
+  c = c + 1
+  T[n] = c
+}
+// file: entry.vl
+import { T } from "./table"
+type E = { msg: string }
+function pick(): i32 | E { return 7 }
+print(T[3])
+if true {
+  const n = pick()
+  if n is E { print(0) } else { print(n) }
+}
+""", ["4", "7"])
+
+D1595_PAIR = ("""const T = __array_new__(2, 0)
+for n in 0 to 1 { T[n] = n }
+print(T[1])
+if true {
+  const n = "hi"
+  print(n)
+}
+""", """// file: loop.vl
+export const T = __array_new__(2, 0)
+for n in 0 to 1 { T[n] = n }
+// file: entry.vl
+import { T } from "./loop"
+print(T[1])
+if true {
+  const n = "hi"
+  print(n)
+}
+""", ["1", "hi"])
+
+D1596_PAIR = ("""type Cell = { base: i32 }
+function mk(n: i32): Cell { return { base: n } }
+function ld(self: Cell) { self.base }
+function adler32(buf) { buf.ld() }
+if true {
+  const out = mk(1)
+  print(adler32(out))
+}
+""", """// file: buf.vl
+export type Cell = { base: i32 }
+export function mk(n: i32): Cell { return { base: n } }
+export function ld(self: Cell) { self.base }
+// file: entry.vl
+import { Cell, ld, mk } from "./buf"
+function adler32(buf) { buf.ld() }
+if true {
+  const out = mk(1)
+  print(adler32(out))
+}
+""", ["1"])
+
+
+MODULE_SIX = ('// file: a.vl\nexport function six(): i32 { return 6 }\n'
+              '// file: main.vl\nimport { six } from "./a"\n')
+
+
+def _split_pin(pair):
+    single, split, want = pair
+    return {"a": {"src": single, "want": want, "face": "single"},
+            "b": {"src": split, "want": want, "face": "split"}}
+
+
 def _controls():
     """(id, why, pair, want_verdict, want_grades) for every control."""
     return [
@@ -327,6 +444,31 @@ def _controls():
         ("D1500/agree", "closed #2479 — `let v = 0` then `v = xs[0]` must run",
          _rendered(*D1500_SPEC, "init_vs_assign", "assign"),
          "AGREE-RUNS", ("RUNS", "RUNS")),
+
+        # SYNTHETIC, check channel, ACROSS A MODULE BOUNDARY. The agree pins below would
+        # also fail if the module file were never written — the import would not resolve
+        # — but they would fail that way for a reason nobody could read off the exit
+        # code. This one says outright that the multi-file writer delivered two files and
+        # that the grader still classifies a disagreement between them, and it rests on a
+        # rule the design will always enforce.
+        ("synthetic/modules-check",
+         "an imported `i32` into a `string` destination is a design type error",
+         {"a": {"src": MODULE_SIX + "const v: i32 = six()\nprint(v * 7)\n",
+                "want": ["42"], "face": "legal"},
+          "b": {"src": MODULE_SIX + "const v: string = six()\nprint(v * 7)\n",
+                "want": ["42"], "face": "ill-typed"}},
+         "DISAGREE", ("RUNS", "check refuses")),
+
+        # AGREE pins for the modules_split axis — the three rows the axis was built for.
+        ("D1593/agree", "closed #2521 — a module's loop variable must not claim the "
+                        "importer's block binding",
+         _split_pin(D1593_PAIR), "AGREE-RUNS", ("RUNS", "RUNS")),
+        ("D1595/agree", "closed #2523 — scratch-frame detection across the merged start "
+                        "function",
+         _split_pin(D1595_PAIR), "AGREE-RUNS", ("RUNS", "RUNS")),
+        ("D1596/agree", "closed #2524 — a hole parameter pinned from a block binding "
+                        "across the import",
+         _split_pin(D1596_PAIR), "AGREE-RUNS", ("RUNS", "RUNS")),
     ]
 
 
@@ -373,7 +515,7 @@ def main():
     ap.add_argument("--json", action="store_true", help="machine-readable summary only")
     a = ap.parse_args()
 
-    R.EXCLUDE = {x for x in a.exclude.split(",") if x}
+    R.EXCLUDE = M.EXCLUDE = {x for x in a.exclude.split(",") if x}
     if a.control:
         return control(a.compiler, a.jobs)
     if a.report:
@@ -399,6 +541,7 @@ def main():
             "grade_vocabulary": sorted(GRADES),
             "grades": collections.Counter(s["grade"] for p in pairs
                                           for s in (p["a"], p["b"])),
+            "multi_file": multi_file(pairs),
         }, sort_keys=True))
         return 0
     report(pairs)
