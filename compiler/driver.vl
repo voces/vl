@@ -131,10 +131,11 @@ import {
   checkProgram,
   demangleMsg,
   initChecker,
+  isBuiltinTyName,
   jwSetGenTokStart,
   jwSiteNode,
-  primTyOfName,
   printDomainStr,
+  tErrBuiltinTyDecl,
 } from "./typecheck"
 import {
   jwGenerateSource,
@@ -3084,6 +3085,9 @@ function modCompile(emit: i32): i32 {
   let dc = 0
   while dc < modOrder.length {
     modCheckDupBindings(modOrder[dc], roots[dc])
+    // D1585 — the same pre-rename window, and the only one: after `modBuildRename` the
+    // declared name is `f64$mN` and the reserved-name rule has nothing left to recognise.
+    modCheckBuiltinTyDecls(roots[dc])
     dc = dc + 1
   }
   // A duplicate binding is never lossless-flagged, so this stays a hard stop —
@@ -3283,13 +3287,31 @@ function modCheckDupBindings(m: i32, root: i32): i32 {
   }
   0
 }
-// Does `seg` name a type the language provides with no declaration? `primTyOfName` is the ONE
-// home of the primitive spellings and `u8` is the storage type it deliberately withholds from
-// it (it is reachable only as an array element), so the pair IS the set of names an annotation
-// resolves without a `type` in sight. D1571.
-function modNameIsBuiltinTy(seg: string) {
-  if seg == "u8" { return true }
-  primTyOfName(seg) >= 0
+// A `type` DECLARATION MAY NOT TAKE A BUILT-IN TYPE NAME, IN A MODULE EITHER — and this is
+// the only reader that can still say so. `checkProgram`'s pass-0 screen does walk every
+// module's declarations (the merge concatenates them into one `Program`), but `modRwStmt` has
+// by then rewritten `tdName` to `f64$mN`, which names no builtin, so the screen never fired
+// and an EXPORTED `type f64` ran while its single-file twin was refused. Runs BEFORE the
+// rename, per module, over exported and private declarations alike; raises on the checker's
+// own channel through `tErrBuiltinTyDecl`, so the two faces share message and anchor and the
+// verdict is a type error at both. Owner ruling 2026-09-04, D1585.
+function modCheckBuiltinTyDecls(root: i32): i32 {
+  const r = P.nodes[root]
+  if r is Program {
+    const ss = r.progStmts
+    let si = 0
+    while si < ss.length {
+      const st = P.nodes[ss[si]]
+      let nm = ""
+      if st is TypeDecl { nm = st.tdName }
+      if st is UnionDecl { nm = st.udName }
+      if nm != "" {
+        if isBuiltinTyName(nm) { tErrBuiltinTyDecl(nm, ss[si]) }
+      }
+      si = si + 1
+    }
+  }
+  0
 }
 // The TYPE-position rename of one identifier segment — the LAST matching row's target, or the
 // segment unchanged. D1571's gate lives HERE rather than in either reader: the spelling TREE
@@ -3304,7 +3326,7 @@ function modTyRenamedSeg(seg: string) {
   // A BUILTIN TYPE NAME IS RENAMED ONLY BY A `type` ROW. Every other segment keeps the
   // last-row rule byte for byte: a user name that is both a type and a value mints ONE target
   // for both, so the two readings never disagreed and this test never fires for it.
-  if modNameIsBuiltinTy(seg) {
+  if isBuiltinTyName(seg) {
     if !capHas(modBuiltinTyTargets, modRenameTo[row]) { return seg }
   }
   modRenameTo[row]
@@ -3355,7 +3377,7 @@ function modBuildRename(m: i32, root: i32): i32 {
           // D1571 — a `type` declaration that took a BUILTIN name is the one row that may
           // rewrite that name in type position. Registered on the TARGET, so an IMPORT of it
           // needs no kind of its own: the import row renames onto this same `base$mN`.
-          if modNameIsBuiltinTy(base) {
+          if isBuiltinTyName(base) {
             let isTyDecl = false
             if st is TypeDecl { isTyDecl = true }
             if st is UnionDecl { isTyDecl = true }
