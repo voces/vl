@@ -364,6 +364,7 @@ import {
   fbValtypeNullable,
   mapTypeIdxOf,
   nulScalarListWrapHeap,
+  pushFieldStorage,
   wBytes,
   wLen,
   wName,
@@ -453,8 +454,6 @@ import {
   retStructIndex,
   retVariantFlag,
   rlSlotByName,
-  sFieldMapShape,
-  sFieldTgtStructIdx,
   sFieldTypeAt,
   scopeBind,
   scopePop,
@@ -467,11 +466,9 @@ import {
   stmtPushBits,
   structEmitOrder,
   tyAnnRefListSlot,
-  uFieldMapShape,
-  uFieldTgtStructIdx,
+  uFieldStorageSlot,
   uVarSTwinAt,
   unionRegistryABSweep,
-  variantFieldRefSlot,
   variantFieldTypeAt,
   variantRowOfTy,
   vtKindOfParam,
@@ -536,8 +533,7 @@ import {
   emitUnionRetSink,
   emitUserGlobalSet,
   mvValsWrapOf,
-  pushFieldStorage,
-  sFieldRefSlot,
+  sFieldStorageSlot,
 } from "./wasmEmit"
 
 // Host opt-in for the name section (see `gEmitNames`). The driver does NOT call
@@ -4639,13 +4635,9 @@ function emitOneFuncType(ti: i32, withEnv: boolean) {
 // exactly when both halves agree, so this is the comparison the prefix test has to make —
 // the CODE alone is not the storage (a code-15 nested struct, a code-5 ref list and a
 // code-19 map each carry a slot that decides which heap the field points at).
+// The SLOT half is `wasmEmit.sFieldStorageSlot` — the same helper `emitTypeSection` and the
+// object-literal ORDER STASH read, so the prefix test compares what is actually emitted.
 function sFieldStoreCode(si: i32, fi: i32): i32 { sFieldTypeAt(si, fi) }
-function sFieldStoreSlot(si: i32, fi: i32): i32 {
-  const c = sFieldTypeAt(si, fi)
-  if c == 15 { return sFieldTgtStructIdx(si, fi) }
-  if c == 19 || c == 29 { return sFieldMapShape(si, fi) }
-  sFieldRefSlot(si, fi)
-}
 
 // Is struct row `p`'s emitted field list a PROPER PREFIX of row `c`'s — same names, same
 // emitted storage, in the same positions, and strictly shorter?
@@ -4667,7 +4659,7 @@ function structRowIsProperPrefix(p: i32, c: i32): boolean {
       return false
     }
     if sFieldStoreCode(p, k) != sFieldStoreCode(c, k) { return false }
-    if sFieldStoreSlot(p, k) != sFieldStoreSlot(c, k) { return false }
+    if sFieldStorageSlot(p, k) != sFieldStorageSlot(c, k) { return false }
     k = k + 1
   }
   true
@@ -4780,18 +4772,15 @@ function emitTypeSection(
         wULEB(cnt)
         let fj = 0
         while fj < cnt {
-          const fjCode = sFieldTypeAt(si, fj)
-          let fjSlot = sFieldRefSlot(si, fj)
-          // A NESTED-STRUCT field (code 15) passes its TARGET struct table index.
-          if fjCode == 15 { fjSlot = sFieldTgtStructIdx(si, fj) }
-          // A MAP-typed field (code 19) — and its NULLABLE twin (code 29) — passes
-          // its map SHAPE: the (KEY, VALUE) pair the field row records, not the value
-          // alone. `pushFieldStorage` turns it into the field's storage heap type
-          // through `mapTypeIdxOf`, which is where an i32-keyed map field would
-          // otherwise have named the STRING-keyed map struct — the whole reason the
-          // position was a loud reject before the row grew its key column (B6b).
-          if fjCode == 19 || fjCode == 29 { fjSlot = sFieldMapShape(si, fj) }
-          pushFieldStorage(fjCode, fjSlot)
+          // WHICH TABLE THE CODE NAMES lives once, in `sFieldStorageSlot`: a
+          // nested-struct field (code 15) passes its TARGET struct row, a map field
+          // (19, and its nullable twin 29) its map SHAPE — the (KEY, VALUE) pair the row
+          // records, which `mapTypeIdxOf` turns into the storage heap type and which an
+          // i32-keyed map field needs to avoid naming the STRING-keyed map struct (B6b)
+          // — and everything else its ref-list row. The object-literal ORDER STASH
+          // (D1510) reads the same helper, so a stash local cannot be typed against a
+          // different slot than the field it feeds.
+          pushFieldStorage(sFieldTypeAt(si, fj), sFieldStorageSlot(si, fj))
           wU8(1) // mutable
           fj = fj + 1
         }
@@ -4820,14 +4809,8 @@ function emitTypeSection(
       wULEB(cnt)
       let fj = 0
       while fj < cnt {
-        const vjCode = variantFieldTypeAt(vi, fj)
-        let vjSlot = variantFieldRefSlot(vi, fj)
-        // A NESTED-STRUCT variant field (code 15) passes its struct table index.
-        if vjCode == 15 { vjSlot = uFieldTgtStructIdx(vi, fj) }
-        // A MAP-typed variant field (code 19) — and its NULLABLE twin (code 29) —
-        // passes its map SHAPE (the struct loop's rule, one table over).
-        if vjCode == 19 || vjCode == 29 { vjSlot = uFieldMapShape(vi, fj) }
-        pushFieldStorage(vjCode, vjSlot)
+        // The struct loop's rule, one table over — `uFieldStorageSlot`.
+        pushFieldStorage(variantFieldTypeAt(vi, fj), uFieldStorageSlot(vi, fj))
         wU8(1) // mutable
         fj = fj + 1
       }
