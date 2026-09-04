@@ -1090,3 +1090,41 @@ Deno.test({ name: "wasm-checker: a template with an i32 hole checks clean (std:f
     );
   }
 });
+
+// D1585 — THE RESERVED-NAME REFUSAL CROSSES A MODULE BOUNDARY IN THE EDITOR TOO.
+//
+// The refusal is raised from the driver's pre-rename window rather than from `checkProgram`,
+// and the sibling that carries the offending declaration is one the EDITOR fetched — so a
+// rule wired only into the checker's own pass, or one that read only the entry file, would be
+// reported by `vl check` and be silently absent here. The entry below is clean.
+Deno.test({
+  name: "wasm-checker: a dependency's built-in-named `type` is diagnosed across the boundary",
+  ignore,
+}, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const lib = "export type f64 = { x: i32 }\n\nexport function ping(): i32 { return 1 }\n";
+  const entry = 'import { ping } from "./lib"\nprint(ping())\n';
+  const read = (key: string) => (key.endsWith("lib.vl") ? lib : undefined);
+  const diags = await checker.check(entry, "/proj/main.vl", read);
+  const hit = diags.find((d) => d.message.includes("may not take the built-in type name"));
+  if (hit === undefined) {
+    throw new Error(
+      "expected the reserved-name refusal from the sibling, got " + diags.length + ": " +
+        (diags.map((d) => d.message).join("; ") || "(none)"),
+    );
+  }
+  // The CONTROL, one thing changed: the same declaration under a name no annotation resolves
+  // on its own. It must stay clean, or the rule is refusing ordinary user types.
+  const okLib = "export type Cell = { x: i32 }\n\nexport function ping(): i32 { return 1 }\n";
+  const clean = await checker.check(
+    entry,
+    "/proj/main.vl",
+    (key: string) => (key.endsWith("lib.vl") ? okLib : undefined),
+  );
+  if (clean.length !== 0) {
+    throw new Error(
+      "a user-named sibling type must check clean, got: " +
+        clean.map((d) => d.message).join("; "),
+    );
+  }
+});

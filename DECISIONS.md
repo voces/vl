@@ -5508,3 +5508,16 @@ the name means the primitive in every annotation, and a value binding cannot cha
 `type f64 = { x: i32 }` DODGE that reservation rule — it refuses in its own file and runs
 across an import. It runs and prints correctly today, so closing it is a `runs → not-runs` and
 an owner ruling rather than a defect fix (recorded in `docs/internals/inventory/D1571.md`).
+
+**RULED, 2026-09-04 ("agreed"): the TYPE side loses it, in every module (D1585).** A user type
+named after a built-in type is refused at its DECLARATION — exported or not, entry module or
+dependency — so the importer's use never arises. Nothing above changes: the VALUE side keeps
+its freedom, and the `type` side's reservation rule is what makes that coherent; what changes
+is that the reservation is now enforced where the merge cannot get in front of it, in
+`modCompile`'s pre-rename window, sharing `tErrBuiltinTyDecl` with the single-file screen so
+the two faces cannot drift. The price is paid knowingly and is bounded by the shape: an
+exported `type u8` and an exported `type f64` stop running, the distilled corpus moves zero
+cells, and `u8` joins the reserved set in the single-file face too — the checker's predicate
+and the merge's had been two copies that disagreed about exactly that name. The paragraph
+above ("Why not REFUSE the export instead") argued from the cost, and the owner accepted the
+cost: a user type that shadows `i32` / `f64` / `u8` has no upside and confuses at a distance.

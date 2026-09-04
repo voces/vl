@@ -43,8 +43,9 @@ MSG_LEN = 12
 # Refusal channels a default may speak through. A tail reaching one of these has
 # NAMED what the ladder excludes, whatever it says.
 NAMING_CALLS = (
-    "emitFail", "emitFailAt", "tErr", "tErrAt", "tErrUnsupported", "pErr",
-    "lintEmit", "panic", "unreachable", "diagPush", "cliFail",
+    "emitFail", "emitFailAt", "tErr", "tErrAt", "tErrBuiltinTyDecl",
+    "tErrUnsupported", "pErr", "lintEmit", "panic", "unreachable", "diagPush",
+    "cliFail",
 )
 
 

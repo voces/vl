@@ -33,6 +33,13 @@ import {
   diagEndCol,
   diagLine,
   diagModule,
+  emitFnSpanAt,
+  emitFnSpanCol,
+  emitFnSpanLine,
+  emitFnSpanModule,
+  emitFnSpanName,
+  emitFnSpanNameLen,
+  engineFailOffset,
   isvalModuleAt,
   lintGraph,
   lintGraphCodeAt,
@@ -145,6 +152,11 @@ let cliResultAcc: i32[] = [] // the host pushes a file's contents here
 let cliFileSrc = ""          // last committed file contents
 let cliFileFound = 0         // 1 = the host read the file, 0 = missing
 let cliExit = 0              // the process exit code, read after CMD_DONE
+// A `--codegen` file whose emitted module the ENGINE refused. `vl check` said rc 0 to
+// reach the emitter, so an invalid module is the compiler's fault by construction and
+// exits 70 (EX_SOFTWARE — the code `report` uses for a compiler trap, #2483) rather
+// than 1: a caller can tell a vl BUG from a bad program without parsing stderr (D1578).
+let cliInvalidModule = 0
 
 // ── parsed `check` configuration ───────────────────────────────────────────────
 let cliFile = ""
@@ -357,6 +369,7 @@ export function cliArgReset() {
   cliFileSrc = ""
   cliFileFound = 0
   cliExit = 0
+  cliInvalidModule = 0
   cliFile = ""
   cliConcise = 0
   cliCodegen = 0
@@ -1046,23 +1059,32 @@ function cliCheckCurFileRest() {
     )
     i = i + 1
   }
-  // The engine rejected the module this file emitted. POSITIONLESS: the offset the
-  // validator names is a wasm offset, and no map from it back to a VL span exists —
-  // so the diagnostic says which FILE and what the engine said, and stops there.
+  // The engine rejected the module this file emitted. POSITIONED since D1578: the
+  // emitter banked each function body's module byte range, so the offset the validator
+  // names maps back to the FUNCTION that owns those bytes and to its declaration. An
+  // unmapped offset (a synthetic body, or a failure outside the code section) keeps the
+  // old positionless form rather than pointing somewhere it cannot justify.
+  //
   // It is an `error` because the alternative is what this gate was built to end: a
   // clean `check --codegen` over a program that cannot load.
   if cliValidateMsg.length > 0 {
+    const vsp = emitFnSpanAt(engineFailOffset(cliValidateMsg))
+    let vwhere = ""
+    if vsp >= 0 { vwhere = " inside `" + emitFnSpanName(vsp) + "`" }
     cliAddDiag(
       "error",
       "invalid-module",
-      0,
-      0,
-      0,
-      "the emitted module is not valid wasm (a compiler emit bug, not an error " +
-        "in this file): " +
+      emitFnSpanLine(vsp),
+      emitFnSpanCol(vsp),
+      emitFnSpanCol(vsp) + emitFnSpanNameLen(vsp),
+      "the emitted module failed to validate" +
+        vwhere +
+        " — this is a bug in vl, not in your program; please report it with this " +
+        "file: " +
         cliValidateMsg,
-      0,
+      emitFnSpanModule(vsp),
     )
+    cliInvalidModule = 1
     cliValidateMsg = ""
   }
 
@@ -1270,6 +1292,7 @@ function cliFinishSummary() {
   if cliJson != 0 {
     cliExit = 0
     if cliGating > 0 { cliExit = 1 }
+    if cliInvalidModule > 0 { cliExit = 70 }
     const buf: i32[] = []
     buf.push('[')
     let ji = 0
@@ -1320,6 +1343,7 @@ function cliFinishSummary() {
   cliOut.push(summary)
   cliExit = 0
   if cliGating > 0 { cliExit = 1 }
+  if cliInvalidModule > 0 { cliExit = 70 }
   0
 }
 

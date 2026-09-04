@@ -46,11 +46,19 @@ import {
   W,
   emitErr,
   emitErrAt,
+  emitFnSpanEnd,
+  emitFnSpanNode,
+  emitFnSpanPos,
+  emitFnSpanStart,
+  fnDispNames,
   fnIndices,
   fnNames,
   globalNames,
   globalStmts,
   localNames,
+  monoInstFe,
+  monoInstOrig,
+  monoOrigNode,
   reExpName,
   reExpTarget,
 } from "./emit_state"
@@ -131,10 +139,11 @@ import {
   checkProgram,
   demangleMsg,
   initChecker,
+  isBuiltinTyName,
   jwSetGenTokStart,
   jwSiteNode,
-  primTyOfName,
   printDomainStr,
+  tErrBuiltinTyDecl,
 } from "./typecheck"
 import {
   jwGenerateSource,
@@ -1845,17 +1854,163 @@ export function diagCol(i: i32): i32 {
 // The token index the emit-failure diagnostic anchors at (its function's decl),
 // or -1 for a positionless (module-level) failure — the `emitErrAt` node resolved
 // through `nodeToks`, mirroring a type diag's node→token resolution.
-function emitErrTokIx(): i32 {
-  if emitErrAt < 0 { return -1 }
-  // Prefer the DECLARING-NAME token (the function name) — `nodeToks` anchors a
-  // FuncDecl at its CLOSING brace (the last token), the wrong span to point a
-  // reader at; the name is where an editor jumps. Fall back to the node anchor.
-  const nm = declNameTokOf(emitErrAt)
+function emitErrTokIx(): i32 { declAnchorTokIx(emitErrAt) }
+
+// The token an emit-side diagnostic anchors arena node `nodeIx` at, or -1.
+//
+// Prefer the DECLARING-NAME token (the function name) — `nodeToks` anchors a FuncDecl at
+// its CLOSING brace (the last token), the wrong span to point a reader at; the name is
+// where an editor jumps. Fall back to the node anchor.
+//
+// ONE SPELLER for the two emit-side channels: the refusal (`emitErrTokIx`) and the
+// VALIDATE diagnostic's function spans (`emitFnSpanTokIx`, D1578). They anchor the same
+// kind of node and must not drift into naming different tokens for it.
+function declAnchorTokIx(nodeIx: i32): i32 {
+  if nodeIx < 0 { return -1 }
+  const nm = declNameTokOf(nodeIx)
   if nm >= 0 && nm < P.toks.length { return nm }
-  if emitErrAt >= nodeToks.length { return -1 }
-  const at = nodeToks[emitErrAt]
+  if nodeIx >= nodeToks.length { return -1 }
+  const at = nodeToks[nodeIx]
   if at >= 0 && at < P.toks.length { return at }
   -1
+}
+
+// ── the emitted module's byte offset → the function that owns it (D1578) ─────
+// A module the engine REFUSES reports a byte offset into bytes the author never sees, so
+// the failure was unreadable. The emit channel got positions in D1519; this is the same
+// for the VALIDATE channel. `emitCodeSection` banked each user body's module byte range;
+// these turn the engine's offset into `file:line:col` plus the function's own name.
+//
+// LOOKUP IS A SCAN, deliberately: at most once per compile and only on the failure
+// path, where the module is already known not to load.
+//
+// -1 / 0 for an offset inside no recorded body — a synthetic start, a shared runtime
+// helper, an export wrapper, or a failure in another section. The caller then prints
+// the engine's own text, which is what it printed before.
+export function emitFnSpanAt(off: i32): i32 {
+  let i = 0
+  while i < emitFnSpanStart.length {
+    if off >= emitFnSpanStart[i] && off < emitFnSpanEnd[i] { return i }
+    i = i + 1
+  }
+  -1
+}
+function emitFnSpanTokIx(i: i32): i32 {
+  if i < 0 || i >= emitFnSpanNode.length { return -1 }
+  // THE SLOT'S PRE-MONOMORPHIZATION ORIGINAL FIRST. An instance, a lifted lambda copy
+  // and a pruned stub are all minted AFTER parsing, so `addNode` anchors them at the EOF
+  // token — a position that reads as real and points at the last line of the file.
+  // `monoOrigNode` holds the pristine declaration for the slot, and the STAMP is the
+  // test: only a parsed declaration carries a `declNameTok`, so requiring one is what
+  // keeps a synthesized body positionless instead of confidently wrong.
+  const orig = monoOrigNodeOfSlot(emitFnSpanPos[i])
+  if declNameTokOf(orig) >= 0 { return declAnchorTokIx(orig) }
+  const nd = emitFnSpanNode[i]
+  if declNameTokOf(nd) >= 0 { return declAnchorTokIx(nd) }
+  -1
+}
+// The pristine pre-pass `FuncDecl` for `fnStmts` slot `fe`, or -1: the slot's own entry
+// when the pass froze one, else the ORIGIN slot's when `fe` is an appended instance.
+function monoOrigNodeOfSlot(fe: i32): i32 {
+  if fe < 0 { return -1 }
+  if fe < monoOrigNode.length { return monoOrigNode[fe] }
+  let q = 0
+  while q < monoInstFe.length {
+    if monoInstFe[q] == fe {
+      const of = monoInstOrig[q]
+      if of >= 0 && of < monoOrigNode.length { return monoOrigNode[of] }
+      return -1
+    }
+    q = q + 1
+  }
+  -1
+}
+export function emitFnSpanLine(i: i32): i32 {
+  const t = emitFnSpanTokIx(i)
+  if t >= 0 { return P.toks[t].line }
+  0
+}
+export function emitFnSpanCol(i: i32): i32 {
+  const t = emitFnSpanTokIx(i)
+  if t >= 0 { return P.toks[t].col }
+  0
+}
+export function emitFnSpanModule(i: i32): i32 {
+  const t = emitFnSpanTokIx(i)
+  if t >= 0 { return modOfTok(t) }
+  0
+}
+// The name the NAME SECTION gives this body — a lambda's binding display name where it
+// has one, else the declared name — so the host's sentence and the engine's own
+// `function[N]::<name>` cannot disagree about what to call it.
+export function emitFnSpanName(i: i32): string {
+  if i < 0 || i >= emitFnSpanPos.length { return "" }
+  const p = emitFnSpanPos[i]
+  if p >= 0 && p < fnDispNames.length {
+    if fnDispNames[p].length > 0 { return fnDispNames[p] }
+  }
+  const fn = P.nodes[emitFnSpanNode[i]]
+  if fn is FuncDecl { return fn.fnName }
+  ""
+}
+export function emitFnSpanNameLen(i: i32): i32 { emitFnSpanName(i).length }
+export function emitFnSpanNameAt(i: i32, j: i32): i32 {
+  const s = emitFnSpanName(i)
+  if j >= 0 && j < s.length { return s[j] }
+  0
+}
+
+// The BYTE OFFSET an engine validation message names, or -1 when it names none.
+//
+// wasmtime spells it two ways and both arrive here: `(at offset 0x11b)` from
+// `Module::validate` (the CMD_VALIDATE round-trip) and `at offset 188` from
+// `Module::new`'s translation error. The LAST occurrence wins — a `Caused by:` chain
+// repeats the inner message under the outer one.
+//
+// THE HOST CARRIES THE SAME PARSER IN RUST (`engine_fail_offset`,
+// scripts/vl-host/src/main.rs): `vl build` / `vl run` never enter the CLI pump, so each
+// channel reads the engine's own spelling for itself. They move together.
+export function engineFailOffset(msg: string): i32 {
+  const key = "at offset "
+  let at = -1
+  let i = 0
+  while i + key.length <= msg.length {
+    let k = 0
+    let same = true
+    while k < key.length {
+      if msg[i + k] != key[k] {
+        same = false
+        break
+      }
+      k = k + 1
+    }
+    if same { at = i + key.length }
+    i = i + 1
+  }
+  if at < 0 { return -1 }
+  let p = at
+  let hex = false
+  if p + 1 < msg.length {
+    if msg[p] == '0' && msg[p + 1] == 'x' {
+      hex = true
+      p = p + 2
+    }
+  }
+  let v = 0
+  let n = 0
+  while p < msg.length {
+    const c = msg[p]
+    let d = -1
+    if c >= '0' && c <= '9' { d = c - '0' }
+    else if hex && c >= 'a' && c <= 'f' { d = c - 'a' + 10 }
+    else if hex && c >= 'A' && c <= 'F' { d = c - 'A' + 10 }
+    if d < 0 { break }
+    if hex { v = v * 16 + d } else { v = v * 10 + d }
+    n = n + 1
+    p = p + 1
+  }
+  if n == 0 { return -1 }
+  v
 }
 // The diagnostic's END column: the anchor token's start + its lexeme length
 // (lexemes never span lines, so the end LINE is `diagLine`). A parse diag is
@@ -3087,6 +3242,9 @@ function modCompile(emit: i32): i32 {
   let dc = 0
   while dc < modOrder.length {
     modCheckDupBindings(modOrder[dc], roots[dc])
+    // D1585 — the same pre-rename window, and the only one: after `modBuildRename` the
+    // declared name is `f64$mN` and the reserved-name rule has nothing left to recognise.
+    modCheckBuiltinTyDecls(roots[dc])
     dc = dc + 1
   }
   // A duplicate binding is never lossless-flagged, so this stays a hard stop —
@@ -3286,13 +3444,31 @@ function modCheckDupBindings(m: i32, root: i32): i32 {
   }
   0
 }
-// Does `seg` name a type the language provides with no declaration? `primTyOfName` is the ONE
-// home of the primitive spellings and `u8` is the storage type it deliberately withholds from
-// it (it is reachable only as an array element), so the pair IS the set of names an annotation
-// resolves without a `type` in sight. D1571.
-function modNameIsBuiltinTy(seg: string) {
-  if seg == "u8" { return true }
-  primTyOfName(seg) >= 0
+// A `type` DECLARATION MAY NOT TAKE A BUILT-IN TYPE NAME, IN A MODULE EITHER — and this is
+// the only reader that can still say so. `checkProgram`'s pass-0 screen does walk every
+// module's declarations (the merge concatenates them into one `Program`), but `modRwStmt` has
+// by then rewritten `tdName` to `f64$mN`, which names no builtin, so the screen never fired
+// and an EXPORTED `type f64` ran while its single-file twin was refused. Runs BEFORE the
+// rename, per module, over exported and private declarations alike; raises on the checker's
+// own channel through `tErrBuiltinTyDecl`, so the two faces share message and anchor and the
+// verdict is a type error at both. Owner ruling 2026-09-04, D1585.
+function modCheckBuiltinTyDecls(root: i32): i32 {
+  const r = P.nodes[root]
+  if r is Program {
+    const ss = r.progStmts
+    let si = 0
+    while si < ss.length {
+      const st = P.nodes[ss[si]]
+      let nm = ""
+      if st is TypeDecl { nm = st.tdName }
+      if st is UnionDecl { nm = st.udName }
+      if nm != "" {
+        if isBuiltinTyName(nm) { tErrBuiltinTyDecl(nm, ss[si]) }
+      }
+      si = si + 1
+    }
+  }
+  0
 }
 // The TYPE-position rename of one identifier segment — the LAST matching row's target, or the
 // segment unchanged. D1571's gate lives HERE rather than in either reader: the spelling TREE
@@ -3307,7 +3483,7 @@ function modTyRenamedSeg(seg: string) {
   // A BUILTIN TYPE NAME IS RENAMED ONLY BY A `type` ROW. Every other segment keeps the
   // last-row rule byte for byte: a user name that is both a type and a value mints ONE target
   // for both, so the two readings never disagreed and this test never fires for it.
-  if modNameIsBuiltinTy(seg) {
+  if isBuiltinTyName(seg) {
     if !capHas(modBuiltinTyTargets, modRenameTo[row]) { return seg }
   }
   modRenameTo[row]
@@ -3358,7 +3534,7 @@ function modBuildRename(m: i32, root: i32): i32 {
           // D1571 — a `type` declaration that took a BUILTIN name is the one row that may
           // rewrite that name in type position. Registered on the TARGET, so an IMPORT of it
           // needs no kind of its own: the import row renames onto this same `base$mN`.
-          if modNameIsBuiltinTy(base) {
+          if isBuiltinTyName(base) {
             let isTyDecl = false
             if st is TypeDecl { isTyDecl = true }
             if st is UnionDecl { isTyDecl = true }
