@@ -1358,8 +1358,8 @@ export const importInsertionEdit = (
 // `x.f(a)` is `f(x, a)` over a free `function f(self: T, …)`, and VL resolves it
 // against names IN SCOPE — never by looking into the module that declares `T`
 // (DECISIONS.md, owner 2026-09-02: "UFCS is never implicit; the LSP surfaces the
-// import"). So the compiler is right to say `no field 'toEqual' on
-// Expectation<i32>` and the EDITOR owes the author the missing import. The
+// import"). So the compiler is right to REFUSE `expect(1).toEqual(2)` — it says
+// so under `ufcs-not-imported` (D1230) — and the EDITOR owes the missing import. The
 // checker answers which functions dispatch (`ufcsCandidatesAt` — a receiver's fit
 // against a generic `self` is a question only it can answer); the two helpers
 // below are the host's half: reach the modules the file has not imported, and

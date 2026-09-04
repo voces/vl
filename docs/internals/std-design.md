@@ -239,9 +239,9 @@ per-consumer (the hybrid):
 
 | Consumer | Mechanism |
 |---|---|
-| Native `vl` (build/check/run/test) | The driver lists `std:fmt` as a PENDING key like any other; the Rust fetch loop recognizes the `std:` prefix and reads `<stdDir>/fmt.vl`, where `stdDir` = `$VL_STD`, else the repo `std/` (dev tree, resolved off the exe path), else `<exe dir>/std` (release layout). ~10 lines beside main.rs:209. |
+| Native `vl` (build/check/run/test) | The driver lists `std:fmt` as a PENDING key like any other; the Rust fetch loop recognizes the `std:` prefix and serves it from the resolved std source: `$VL_STD`, else a DEVELOPMENT tree's `std/` (resolved off the exe path), else the copy BAKED INTO THE BINARY. A release build takes no development rung — see `cli-design.md` §"Where a `vl` binary finds std and its seed" (D1573). |
 | TS CLI | Wrap `fsRead` (cli.ts:66-72): `std:` keys read from the repo `std/` dir resolved off `import.meta.url`. |
-| LSP (both checkers) + playground | A GENERATED, checked-in `std/embedded.ts` (name → source map, built by `deno task gen-std`, freshness-gated by a test — the goldens pattern). One shared `withStd(read)` wrapper serves `std:` keys before consulting buffers/disk, in BOTH the TS moduleGraph and the wasm checker's reader. The browser playground (no fs) works for free. |
+| LSP (both checkers) + playground | A GENERATED, checked-in `std/embedded.ts` (name → source map, built by `deno task gen-std`, freshness-gated by a test — the goldens pattern). One shared `withStd(read)` wrapper serves `std:` keys before consulting buffers/disk, in BOTH the TS moduleGraph and the wasm checker's reader. The browser playground (no fs) works for free. **The same invocation writes `scripts/vl-host/src/std_embedded.rs`**, the native host's copy, so the editor and the CLI come from one generator and one test (`tests/std_embedded_test.ts`) gates both. |
 
 Explicitly NOT in Phase 2: baking std texts into `build/vl-compiler.wasm`.
 Weighed: wasm-embedding makes the compiler self-contained but taxes the std

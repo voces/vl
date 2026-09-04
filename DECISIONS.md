@@ -4999,6 +4999,16 @@ Three things the build settled that the ruling could not have known:
   so every std case passed either way. `importSpecifierForKey` is the inverse of
   `resolveImportSpecifier`, and prefers a spelling the file already uses over any it derives.
 
+**AND THE NEAR MISS IS ITS OWN SENTENCE (D1570, 2026-09-03).** D1230 answers when the name is
+NOT in scope. The complementary case — the name is right there, and the UFCS rule turned it
+down anyway — kept `no field 'f' on T` until glean hit it (VL-021): a first parameter named
+`c` rather than `self`, and the reader goes hunting for a field the type will never have. The
+`self`-name rule is unchanged and is the design; what was wrong is that `checkCallNode` learned
+which gate refused and threw the answer away. `ufcs-not-method` now carries it, with `reason`
+(`self-name` / `arity` / `receiver`) and the parameter's own line and column, so a rename
+quick-fix needs no second search and no consumer parses the sentence. D1230 keeps precedence:
+"import it" is the more actionable answer wherever it applies.
+
 Two capabilities fell out of the second one and are worth naming, because neither was asked
 for. A CALL receiver — `expect(1).`, the papercut's own shape — now completes at all: the
 field scan STRIPS the trailing `.` and re-resolves the receiver as a BINDING, which only works
@@ -5287,3 +5297,91 @@ CALL — the two things another initialiser can see.
 whitelist over literals, identifier reads, places and arithmetic; every kind it does not name —
 a call, a lambda, a `MatchExpr`, every statement kind — answers "possibly effectful" and puts
 its literal on the scratch path. A kind nobody has classified is never silently reordered.
+
+## std ships inside the binary; a pin is one file; development overrides are explicit and announced (owner question 2026-09-03) — D1573/D1574, BUILT
+
+The owner asked whether `vl` should distribute with std baked in. It should, and the reason is
+that both halves of the question had already failed in the field on the same day, silently, at
+the first external consumer:
+
+* **D1573 (glean VL-022)** — `~/vl/dist/vl` embeds a seed built from master, and the host
+  resolved `std:` by walking the EXE's ancestors, so it read `~/vl/std` from a checkout **37+
+  commits behind**. std is version-locked to the compiler; nothing compared them and nothing
+  warned. (VL-007 is the same defect from the other side: a `dist/vl` copied anywhere else
+  resolved no std at all.)
+* **D1574 (glean VL-006)** — `dist/vl seed | wc -c` read **1,832,652** inside `~/vl` (a
+  CWD-relative `./build/vl-compiler.wasm`) and **2,046,575** from `~/glean` (the embedded
+  seed). One binary, two compilers, chosen by `cd`.
+
+**The ruling.** std is generated into the binary; a distribution build pairs only with the
+copies it carries; the on-disk copies are DEVELOPMENT overrides, which are explicit and
+announced; and the release binary never consults the current directory for a seed. Resolution
+is `$VL_STD` → a development tree's `std/` → embedded, and `--compiler` → `$VL_COMPILER_WASM`
+→ a development tree's `build/vl-compiler.wasm` → embedded, with a **DISTRIBUTION build
+(`--features embed-seed`) taking neither development rung**. The full table is
+`docs/internals/cli-design.md` §"Where a `vl` binary finds std and its seed".
+
+**Why the `embed-seed` feature is also the distribution marker, rather than a second flag.**
+The feature bakes the ~2 MB seed in, and a binary carrying its own compiler IS the shipped
+artifact rather than a checkout's build output — so one condition decides both "carry your
+own" and "do not read the filesystem", and there is no `embed-std`-without-`embed-seed`
+configuration to reason about. std itself is embedded UNCONDITIONALLY (109 KB against a
+~27 MB binary): the development binary then has the same `vl std` surface, the same last
+resort, and the round-trip test runs in every gate rather than only in `ci-embed-seed`.
+
+**Why a checked-in generated Rust source, not a build script.** `build.rs` reading `../../std`
+would be fresh by construction — and would make every std edit need a cargo rebuild before the
+gates could grade it, which is a toolchain tax on the people who edit std most. So
+`scripts/gen-std.ts` writes `scripts/vl-host/src/std_embedded.rs` in the same invocation, from
+the same walk, that writes the editor's `std/embedded.ts`: ONE generator, so the CLI and the
+editor cannot disagree about std, and `tests/std_embedded_test.ts` fails on either being stale
+with no binary and no seed in the loop. A development build reads the tree anyway, so a stale
+BINARY is harmless there; `ci-embed-seed` builds fresh and diffs `vl std --dump` against
+`std/`, which is where the end-to-end byte-identity is actually gated.
+
+**Why the announcement is distribution-only.** On a released `vl` an on-disk std is the
+exception and the silence was the defect, so `$VL_STD` and `$VL_COMPILER_WASM` each print one
+stderr line. A development build IS the exception — `$VL_STD` is how `scripts/gate.sh` pins
+the tree under test on every invocation — so it announces nothing and answers the question in
+`vl --version` instead, which now names the seed, the std, the digest of each, the rung each
+came from, and the commit the binary was built from.
+
+**What a consumer does now.** Copy one file. `vl std --dump <dir>` writes the sources out if
+they are wanted for reading or editing, `vl std --hash`/`--list` say what is in there, and
+`$VL_STD` is for hacking on std. A `std/` left beside an old two-file pin is ignored, and is
+told once that it is being ignored — going silently inert is the same failure mode reversed.
+## A VALUE may take a builtin type name; the TYPE keeps it (D1571, 2026-09-03)
+
+**Ruling, read off the tree rather than invented.** VL keeps the value and type namespaces
+apart. `type Circle` beside `function Circle` is legal in one file, `type Circle` beside
+`const Circle` is legal, and a module exporting BOTH is legal — the importer spells `Circle`
+as a type and calls `Circle(3)` on the next line. `export function u8(x: i32): i32` is
+therefore legal too, and `u8[]` in the importer is the storage type, not a mistake.
+
+**What was wrong was the merge, not the export.** `modBuildRename` mints one rename row per
+top-level declaration and per import, and the type-position rewrite reads that one map. For a
+user name it cannot go wrong — a type and a value of one name mint the same `Circle$mN`
+target, so the two readings agree by construction. A BUILTIN name has no declaration and so no
+row of its own, which left the VALUE row as the only answer: `import { u8 }` rewrote every
+`u8[]` in the importer to `u8$m1[]` and the checker said `unknown type 'u8' within 'u8[]'`
+about a name that had never left the primitive. glean lost a five-program bisect to it
+(VL-015) and worked around it by renaming the export.
+
+**The rule, narrowly.** A BUILTIN type name is renamed in TYPE position only by a row a `type`
+declaration minted (`modTyRenamedSeg`, `modBuiltinTyTargets`); every other segment keeps the
+last-row rule byte for byte. Registering on the merged TARGET is what lets an import row carry
+no kind of its own — it renames onto the dep's own `u8$mN`, which the dep's row registered
+when its map was built, dependency-first.
+
+**Why not REFUSE the export instead.** That was the other option on the desk, and it is the
+right shape for a language whose namespaces are ONE — it is not this one. Refusing would also
+have cost a program that runs today: an exported `type u8` still shadows the storage type
+across the merge, and a rule spelled "a builtin name is never renamed" deletes it. The `type`
+side already HAS its reservation rule ("a `type` declaration may not take the built-in type
+name `f64`"), which is what makes the value side's freedom coherent rather than an oversight:
+the name means the primitive in every annotation, and a value binding cannot change that.
+
+**Still open, and deliberately not closed here.** The same rename lets an exported
+`type f64 = { x: i32 }` DODGE that reservation rule — it refuses in its own file and runs
+across an import. It runs and prints correctly today, so closing it is a `runs → not-runs` and
+an owner ruling rather than a defect fix (recorded in `docs/internals/inventory/D1571.md`).
