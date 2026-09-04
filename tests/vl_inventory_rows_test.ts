@@ -357,3 +357,54 @@ Deno.test("only a labelled indented block counts as a repro", () => {
     throw new Error(`the repro-shape rule misroutes:\n  ${bad.join("\n  ")}`);
   }
 });
+
+// A RESERVED RANGE WHOSE WORK HAS LANDED MUST GO BACK. `RESERVED.md` is what `ls.py --next`
+// skips, so a forgotten reservation silently widens the gap between the highest filed row and
+// the next id anyone is handed — the block is invisible to everyone except the tool that
+// steps over it. Stale means every id in the range is filed: the work it was taken for is
+// done. Structural, no program run, ~1 ms.
+Deno.test("no reserved inventory range is stale", async () => {
+  const path = "docs/internals/inventory/RESERVED.md";
+  let text = "";
+  try {
+    text = await Deno.readTextFile(path);
+  } catch {
+    return; // no reservations file is a valid state: nothing is reserved.
+  }
+  // Mirrors ls.py's RANGE. The holder runs non-greedily to the date because it may contain
+  // spaces — a `\S+` holder parses zero lines and every check built on it passes vacuously.
+  const RANGE = /^D(\d+)-D(\d+)\s+(.+?)\s+(\d{4}-\d{2}-\d{2})\s*(.*)$/;
+  const filed = new Set<number>();
+  for (const dir of DIRS) {
+    for await (const e of Deno.readDir(dir)) {
+      const m = e.name.match(/^D(\d+)[A-Za-z0-9-]*\.md$/);
+      if (m) filed.add(Number(m[1]));
+    }
+  }
+  const stale: string[] = [];
+  let parsed = 0;
+  for (const line of text.split("\n")) {
+    const m = line.trim().match(RANGE);
+    if (!m) continue;
+    parsed++;
+    const lo = Number(m[1]), hi = Number(m[2]);
+    let all = true;
+    for (let n = lo; n <= hi; n++) if (!filed.has(n)) all = false;
+    if (all) {
+      stale.push(`D${lo}-D${hi} (${m[3]}, ${m[4]}) — every id filed; release it with ` +
+        `scripts/inventory/ls.py --release D${lo}-D${hi}`);
+    }
+  }
+  // A file with reservation-shaped lines that parse to nothing is the failure this guard is
+  // most likely to have: it would report "no stale ranges" forever.
+  const shaped = text.split("\n").filter((l) => /^\s*D\d+-D\d+\s/.test(l)).length;
+  if (shaped !== parsed) {
+    throw new Error(
+      `${path}: ${shaped} reservation-shaped lines but ${parsed} parsed — the pattern and ` +
+        `the file disagree, so every check over them is vacuous`,
+    );
+  }
+  if (stale.length > 0) {
+    throw new Error(`stale reserved ranges:\n  ${stale.join("\n  ")}`);
+  }
+});

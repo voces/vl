@@ -49,6 +49,12 @@ trap 'rm -rf "$WORK"' EXIT
 # default reaches zero; meanwhile the three `--check` runs block any file going UP.
 # `vl check` has no per-code gate, hence `--json` graded through one filter carrying
 # every list.
+#
+# `std-comment-audience` is deliberately NOT on that list. It is the std half of the
+# comment rules (std-api-review.md §4) and it landed at zero, so it has no baseline to
+# exempt it from: a header over 10 lines, a doc comment over 4 lines on an export, or a
+# line citing a row id / PR number / date / compiler vocabulary under `std/` fails this
+# gate outright. The `std/` run below is where it fires.
 lint_graded() { # <target> <json path>
   local rc=0
   "$VL" check "$1" --severity info --json > "$2" 2> "$2.err" || rc=$?
@@ -62,7 +68,8 @@ lint_graded() { # <target> <json path>
 
 # std/ goes first: it is near-instant AND its module load warms the seed's
 # `.cwasm` sidecar, so the parallel workers below all deserialize instead of
-# racing to Cranelift-compile (and write the same sidecar) at once.
+# racing to Cranelift-compile (and write the same sidecar) at once. It is also the
+# only run `std-comment-audience` can fire in — the rule is scoped by module path.
 echo "== self-lint: std/ =="
 lint_graded std/ "$WORK/std.json"
 

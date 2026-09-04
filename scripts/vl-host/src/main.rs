@@ -33,6 +33,7 @@
 //   --compiler <path>  |  $VL_COMPILER_WASM  |  ./build/vl-compiler.wasm  |  embedded
 // The embedded copy exists only in a release build (`--features embed-seed`, which
 // bakes the seed in via build.rs), so a shipped `vl` is one self-contained file.
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use wasmtime::*;
 
@@ -57,7 +58,9 @@ use wasmtime::*;
 //
 // Exit 2 is this CLI's usage-error code everywhere (`arg_error` below,
 // `cliUsageErr` in compiler/cli.vl); 1 means the program or its compilation
-// failed, and an unusable command line never got that far.
+// failed, and an unusable command line never got that far. 70 means THE COMPILER
+// ITSELF crashed (`EXIT_COMPILER_BUG`, and a banner saying so): a seed trap and a
+// program trap render the same, and D1500's reporter lost a session to that.
 //
 // COLOR IS GATED PER STREAM, at the moment of printing: ANSI reaches a stream
 // only when that stream is a terminal, `NO_COLOR` is unset, and `TERM` is not
@@ -351,7 +354,8 @@ vl — the VL toolchain: compile, run, check, format and test VL programs
                     terminal, or TERM=dumb). `run`, `check`, `fmt` and `test`
                     take `--color=always|never|auto`, which overrides it
 
-A bare `vl` is reserved for a future REPL and exits 2.
+A bare `vl` is reserved for a future REPL and exits 2. Exit 70 anywhere means the
+COMPILER crashed — that is a vl bug, not your program's; please report it.
 Run `{c}vl help <command>{r}` (or `vl <command> --help`) for details on one command.
 "
     );
@@ -402,7 +406,8 @@ program verbatim — the only way to pass one that starts with `-`.
   {c}NO_COLOR{r}            Disable ANSI in printed values (also off when stdout is
                       not a terminal, or TERM=dumb); --color= overrides it
 
-{b}Exit:{r} 0 the program ran; 1 compile or runtime failure; 2 usage error.
+{b}Exit:{r} 0 the program ran; 1 compile or runtime failure; 2 usage error;
+      70 the compiler itself crashed (a vl bug — please report it).
 
 {b}Examples:{r}
   vl run main.vl one two            {d}the program sees arguments `one`, `two`{r}
@@ -434,7 +439,8 @@ program verbatim — the only way to pass one that starts with `-`.
   {c}VL_WASM_OPT{r} / {c}VL_WASM_DIS{r}   Explicit binaryen tool paths (else PATH)
   {c}VL_COMPILER_WASM{r}, {c}VL_STD{r}    As in `vl help run`
 
-{b}Exit:{r} 0 wrote a valid module; 1 compile/optimize/validate failure; 2 usage.
+{b}Exit:{r} 0 wrote a valid module; 1 compile/optimize/validate failure; 2 usage;
+      70 the compiler itself crashed (a vl bug — please report it).
 
 {b}Examples:{r}
   vl build main.vl                  {d}writes main.wasm{r}
@@ -468,7 +474,8 @@ every .vl file under it.
   {c}VL_COMPILER_WASM{r}, {c}VL_STD{r}   As in `vl help run`
   {c}NO_COLOR{r}                   Disable ANSI in diagnostics
 
-{b}Exit:{r} 0 clean; 1 diagnostics at or above the gate; 2 usage error.
+{b}Exit:{r} 0 clean; 1 diagnostics at or above the gate; 2 usage error;
+      70 the compiler itself crashed (a vl bug — please report it).
 
 {b}Examples:{r}
   vl check
@@ -492,7 +499,8 @@ prints the formatted source to stdout and writes nothing.
   {c}--compiler{r} <wasm>   Compiler seed to use (see `vl help seed`)
 
 {b}Exit:{r} 0 clean; 1 --check found drift; 2 unreadable input or usage error;
-      3 internal formatter bug (the formatted output failed to re-parse).
+      3 internal formatter bug (the formatted output failed to re-parse);
+      70 the compiler itself crashed (a vl bug — please report it).
 
 {b}Examples:{r}
   vl fmt -w main.vl
@@ -523,7 +531,8 @@ tests continue in a fresh instance.
   {c}VL_TEST_TRACE{r}=1     Print per-file scheduling stamps to stderr
   {c}VL_COMPILER_WASM{r}, {c}VL_STD{r}   As in `vl help run`
 
-{b}Exit:{r} 0 all selected tests passed; 1 any failure; 2 usage error.
+{b}Exit:{r} 0 all selected tests passed; 1 any failure; 2 usage error;
+      70 the compiler itself crashed (a vl bug — please report it).
 
 {b}Examples:{r}
   vl test
@@ -1063,6 +1072,17 @@ fn prune_seed_cache(dir: &std::path::Path, ours: &std::path::Path) {
 /// `vl` runs anywhere. With no flag/env, no disk seed, and no embedded copy, return
 /// the default path so the loader emits its build-the-seed hint.
 fn resolve_compiler(explicit: Option<String>) -> CompilerSource {
+    let source = resolve_compiler_source(explicit);
+    // Sized HERE, on the one path every subcommand takes, so a compiler-trap
+    // banner names the seed that crashed whichever command was running.
+    note_seed_size(match &source {
+        CompilerSource::Path(p) => std::fs::metadata(p).map(|m| m.len() as usize).unwrap_or(0),
+        CompilerSource::Embedded(b) => b.len(),
+    });
+    source
+}
+
+fn resolve_compiler_source(explicit: Option<String>) -> CompilerSource {
     if let Some(p) = explicit.or_else(|| std::env::var("VL_COMPILER_WASM").ok()) {
         return CompilerSource::Path(p);
     }
@@ -1163,7 +1183,7 @@ fn load_compiler(engine: &Engine, source: &CompilerSource) -> Result<(Store<()>,
     let module = load_compiler_module(engine, source)?;
     let mut store = Store::new(engine, ());
     let linker = Linker::new(engine);
-    let inst = linker.instantiate(&mut store, &module)?;
+    let inst = from_compiler(linker.instantiate(&mut store, &module))?;
     check_seed_abi(&mut store, &inst, source)?;
     Ok((store, inst))
 }
@@ -1776,7 +1796,7 @@ fn compile_vl_guest_profiled(
         }
         Ok(UpdateDeadline::Continue(1))
     });
-    let inst = Linker::new(&engine).instantiate(&mut store, &module)?;
+    let inst = from_compiler(Linker::new(&engine).instantiate(&mut store, &module))?;
 
     let result = compile_vl_instance(&mut store, &inst, source, source_path, entry, emit_names);
     stop.store(true, Ordering::Relaxed);
@@ -1803,9 +1823,10 @@ fn compile_vl_instance(
     emit_names: bool,
 ) -> Result<Vec<u8>> {
     let mut store = store;
+    note_compiling(source_path);
 
-    let compile = inst.get_typed_func::<(), i32>(&mut store, entry)?;
-    let result = BytesOut::probe(&mut store, inst, "rbyte")?;
+    let compile = from_compiler(inst.get_typed_func::<(), i32>(&mut store, entry))?;
+    let result = from_compiler(BytesOut::probe(&mut store, inst, "rbyte"))?;
 
     // Opt into the wasm "name" custom section so trap backtraces name functions.
     // The export is OFF by default (the compiler leaves goldens byte-identical);
@@ -1830,20 +1851,25 @@ fn compile_vl_instance(
         }
     }
 
-    phase!("stage_program", stage_program(store, inst, source, source_path))?;
-    let rc = phase!("compile.call", compile.call(&mut store, ()))?;
+    from_compiler(phase!(
+        "stage_program",
+        stage_program(store, inst, source, source_path)
+    ))?;
+    // THE D1500 CALL. A non-zero `rc` is the compiler REPORTING on the program and
+    // is not a fault; an `Err` here is the compiler dying mid-compile, which is.
+    let rc = from_compiler(phase!("compile.call", compile.call(&mut store, ())))?;
     if rc != 0 {
         let stage = match rc {
             1 => "parse",
             2 => "type",
             _ => "emit",
         };
-        let diags = render_diags(inst, store, source_path)?;
+        let diags = from_compiler(render_diags(inst, store, source_path))?;
         bail!("{stage} error\n{}", diags.trim_end());
     }
-    let bytes = phase!("readback", result.read(&mut store))?;
+    let bytes = from_compiler(phase!("readback", result.read(&mut store)))?;
     if rep_shadow {
-        report_rep_shadow(inst, &mut store, source_path)?;
+        from_compiler(report_rep_shadow(inst, &mut store, source_path))?;
     }
     Ok(bytes)
 }
@@ -2089,7 +2115,7 @@ fn run_program_with(
     sink: impl Fn(&str) + Send + Sync + Clone + 'static,
     palette: Palette,
 ) -> Result<()> {
-    let module = Module::new(engine, bytes)?;
+    let module = from_user(Module::new(engine, bytes))?;
     // The instance is dropped: `vl run` runs the start function (the program's top
     // level) and exits. `vl test` needs the instance back to call exports on it, so
     // it goes through `instantiate_program` directly.
@@ -2671,7 +2697,7 @@ fn instantiate_program(
     // ever naming the instance — which does not exist yet. `tests/support/runWasm.ts`
     // has no such handle (measured: `instance` is `undefined` for every import call made
     // from a VL top level), and V8 gives JS no way to build a WasmGC object regardless.
-    let instance = linker.instantiate(&mut store, module)?;
+    let instance = from_user(linker.instantiate(&mut store, module))?;
     Ok((store, instance))
 }
 
@@ -2736,14 +2762,14 @@ fn run_batch(args: &[String]) -> Result<()> {
     let run_engine = gc_engine(run_collector()?)?;
     let module = load_compiler_module(&compile_engine, &compiler)?;
     // Pre-link once; `instantiate_pre` re-checks nothing per case.
-    let pre = Linker::new(&compile_engine).instantiate_pre(&module)?;
+    let pre = from_compiler(Linker::new(&compile_engine).instantiate_pre(&module))?;
     // `run_batch` is the ONE loader that bypasses `load_compiler` (it holds the
     // Module engine-level and instantiates per case for isolation), so the ABI
     // check has to be repeated here or a stale seed reaches every case unchecked.
     // Once, against a throwaway store — not per case.
     {
         let mut probe = Store::new(&compile_engine, ());
-        let inst = pre.instantiate(&mut probe)?;
+        let inst = from_compiler(pre.instantiate(&mut probe))?;
         check_seed_abi(&mut probe, &inst, &compiler)?;
     }
 
@@ -2774,7 +2800,7 @@ fn run_batch(args: &[String]) -> Result<()> {
                         .context(format!("`{f}` is neither UTF-8 VL source nor a wasm module"))
                 })?;
                 let mut store = Store::new(&compile_engine, ());
-                let inst = pre.instantiate(&mut store)?;
+                let inst = from_compiler(pre.instantiate(&mut store))?;
                 compile_vl_instance(&mut store, &inst, &source, f, "compileSrc", true)?
             };
             // `Palette::OFF`, and NOT the resolved one: a `.out` file is a machine
@@ -3974,6 +4000,14 @@ fn cli_pump(args: &[String]) -> Result<()> {
             }
             CMD_READ_FILE => {
                 let path = cmd_path.read(&mut store)?;
+                // The pump compiles what it is handed, so the file most recently
+                // delivered is the one a trap after this point died inside — the
+                // closest the HOST can get to a name the guest owns. A `std:` key
+                // is EXCLUDED: it is a dependency of the file under compilation,
+                // never the thing a reporter should be told to send.
+                if !path.starts_with("std:") {
+                    note_compiling(&path);
+                }
                 // A `std:` key maps to `<stdDir>/<name>.vl` (slash segments are
                 // subdirectories); every other key is a filesystem path read as-is.
                 // A missing file commits `found = 0` (the VL program raises its own
@@ -4168,20 +4202,97 @@ fn cli_pump(args: &[String]) -> Result<()> {
 }
 
 
+// ── which module trapped ─────────────────────────────────────────────────────
+//
+// A wasm trap renders identically whichever module raised it, so the COMPILER's
+// own crash arrives wearing the PROGRAM's error: D1500's reporter read the seed's
+// `out of bounds array access` as their own index and went looking inside their
+// DEFLATE decoder. Attribution is therefore RECORDED AT THE CALL BOUNDARY, where
+// the instance is known, and never inferred from the message text.
+
+/// `true` when the most recent failing wasm call went INTO the compiler module,
+/// `false` when it went into the user's program. Both `from_compiler` and
+/// `from_user` WRITE it, so a failure that is caught and discarded (`vl test`
+/// discards one per trapping test) cannot leave a stale attribution behind for a
+/// later error to inherit.
+static FAULT_IN_COMPILER: AtomicBool = AtomicBool::new(false);
+
+/// The source file the host last handed the compiler, for the banner to name.
+static COMPILING: Mutex<Option<String>> = Mutex::new(None);
+
+/// The resolved seed's size in bytes — with the version, the pair that identifies
+/// WHICH compiler crashed in a report from a checkout we cannot see.
+static SEED_SIZE: AtomicUsize = AtomicUsize::new(0);
+
+/// A crash INSIDE the compiler, as its own exit code. Distinct from 1 (the program
+/// or its compilation failed) and 2 (usage) so a caller — a build script, a test
+/// harness, an editor — can tell a vl BUG from a bad program without parsing
+/// stderr. 70 is sysexits(3)'s `EX_SOFTWARE`, "an internal software error has been
+/// detected", which is exactly the claim being made.
+const EXIT_COMPILER_BUG: i32 = 70;
+
+/// Record the file whose compile is under way, for `report`'s banner.
+fn note_compiling(path: &str) {
+    if let Ok(mut slot) = COMPILING.lock() {
+        *slot = Some(path.to_string());
+    }
+}
+
+/// Record the resolved seed's size, for `report`'s banner.
+fn note_seed_size(n: usize) {
+    SEED_SIZE.store(n, Ordering::Relaxed);
+}
+
+/// Tag a failed call into the COMPILER instance / into the USER program's
+/// instance. Wrap the wasm call itself rather than the enclosing function: what
+/// the banner claims is which MODULE was executing, and only the call site knows.
+fn from_compiler<T>(r: Result<T>) -> Result<T> {
+    attribute(r, true)
+}
+
+fn from_user<T>(r: Result<T>) -> Result<T> {
+    attribute(r, false)
+}
+
+fn attribute<T>(r: Result<T>, compiler: bool) -> Result<T> {
+    if r.is_err() {
+        FAULT_IN_COMPILER.store(compiler, Ordering::Relaxed);
+    }
+    r
+}
+
 /// Print a failed run the way anyhow would, plus — when a wasm TRAP is anywhere in
 /// the cause chain — the VL-level `note:` that says which source construct stops
 /// here. Without it a trap reaches the author as an opcode name over an address
 /// backtrace, with nothing naming the VL operation that refused.
+///
+/// A trap out of the COMPILER module gets a banner and `EXIT_COMPILER_BUG` ahead
+/// of all that, because the sentence a user reads otherwise is about their own
+/// code (D1500). The TRAP is required on top of the attribution flag: a link or
+/// I/O failure never wears a program's error, and the flag is only as fresh as the
+/// last wasm call — so requiring both leaves a stale `true` unable to blame vl for
+/// a failure that never entered the compiler at all.
 fn report(err: Error) -> ! {
+    let trap = err.chain().find_map(|c| c.downcast_ref::<Trap>()).copied();
+    let compiler_bug = trap.is_some() && FAULT_IN_COMPILER.load(Ordering::Relaxed);
+    if compiler_bug {
+        let what = COMPILING.lock().ok().and_then(|p| p.clone());
+        eprintln!(
+            "vl: the compiler itself trapped while compiling {}. This is a bug in vl, not in your program.",
+            what.as_deref().unwrap_or("your program")
+        );
+        eprintln!(
+            "    please report it with this file and the output below (vl {}, seed {} bytes)",
+            env!("CARGO_PKG_VERSION"),
+            SEED_SIZE.load(Ordering::Relaxed)
+        );
+        eprintln!();
+    }
     eprintln!("Error: {err:?}");
-    if let Some(note) = err
-        .chain()
-        .find_map(|c| c.downcast_ref::<Trap>())
-        .and_then(|t| trap_explanation(*t))
-    {
+    if let Some(note) = trap.and_then(trap_explanation) {
         eprintln!("\nnote: {note}");
     }
-    std::process::exit(1);
+    std::process::exit(if compiler_bug { EXIT_COMPILER_BUG } else { 1 });
 }
 
 fn main() {
@@ -4233,7 +4344,7 @@ fn real_main() -> Result<()> {
                 print_command_help(cmd);
                 return Ok(());
             }
-            cli_pump(&args[1..])
+            from_compiler(cli_pump(&args[1..]))
         }
         Some("run") => {
             // `stop_at_positional`: after the source file, tokens are the
