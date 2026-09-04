@@ -356,6 +356,7 @@ import {
   anonLeafSupersede,
   arrLitCommitName,
   ba8Used,
+  blockLetHidden,
   capCacheOn,
   capCountTbl,
   capNamesFlat,
@@ -420,6 +421,7 @@ import {
   liKinds,
   liSlots,
   listIdxScratchBase,
+  localBlockLet,
   localDeclIx,
   localIsRef,
   localLitUnion,
@@ -1495,6 +1497,14 @@ export function globalLetOfSid(sid: i32) {
 // The arena index of the `LetDecl` for the global `name`, or -1 if not a global.
 export function globalLetOf(name: string) { globalLetOfSid(sidLookup(name)) }
 
+// Has the walk's own scope stack already had its say about which binding a read denotes?
+// True while a scope frame is active (the collect and lowering walks keep it in lockstep,
+// so every live block binding resolves through `scopeSlotOf`) and during the detection
+// sweep that hides them. Where it holds, a block binding a name scan finds is out of scope.
+export function blockBindingHidden() {
+  blockLetHidden || scopeFrames.length > 0
+}
+
 // True when the bare identifier `name`, read from inside function `fnIx`, is bound by
 // that FRAME — a declared local, a param or a capture — so a module global of the same
 // name is NOT what the reference denotes. Asked of `localIndexOf` and `capturedKindOf`,
@@ -1512,13 +1522,44 @@ export function identBoundInFrame(fnIx: i32, name: string) {
   // the un-annotated RETURN face the two rungs above both answer -1 and the module table won
   // again (`function f() { const sh = 7  sh + 1 }` under a `sh: string` global: `expected
   // (ref $type), found i32`, the annotated face running all along). `parentLetOfSid` answers
-  // the same question off the body block, cached per block. LOOP VARIABLES are deliberately
+  // the same question off the body block, cached per block. Loop variables are deliberately
   // NOT asked (`parentLoopVarOfSid`): `localIndexOf`'s own flat rung skips them, so adding
   // them here would make the classifier claim a frame binding for a read the LOWERING sends
   // to the global — a `for sh in …` beside a `sh: string` global read after the loop.
   if fnIx < 0 { return false }
   const fnb = P.nodes[fnIx]
-  if fnb is FuncDecl { return parentLetOfSid(fnb.fnBody, sidOf(name)) >= 0 }
+  if fnb is FuncDecl { return frameLetOfLive(fnb.fnBody, name) >= 0 }
+  false
+}
+
+// The `LetDecl` a read of `name` denotes in the frame whose body is `bodyIx`, or -1.
+// `parentLetOf` answers for the whole body including nested blocks, so where
+// `blockBindingHidden` holds the live binding outranks that name scan and a nested hit that
+// is not live is out of scope. Scope-less passes keep the whole body. D1597.
+export function frameLetOfLive(bodyIx: i32, name: string) {
+  const li = parentLetOf(bodyIx, name)
+  if li < 0 { return -1 }
+  if !blockBindingHidden() { return li }
+  const slot = scopeSlotOf(name)
+  if slot >= 0 && slot < localDeclIx.length {
+    if localDeclIx[slot] >= 0 { return localDeclIx[slot] }
+  }
+  if blockDeclaresStmt(bodyIx, li) { return li }
+  -1
+}
+
+// Is `stmtIx` a direct statement of the block at `blockIx`, rather than one inside a nested
+// block of it? The lexical-extent half of `frameLetOfLive`.
+function blockDeclaresStmt(blockIx: i32, stmtIx: i32) {
+  const b = P.nodes[blockIx]
+  if b is Block {
+    const ss = b.blkStmts
+    let i = 0
+    while i < ss.length {
+      if ss[i] == stmtIx { return true }
+      i = i + 1
+    }
+  }
   false
 }
 
@@ -6621,6 +6662,12 @@ export function addLocalName(name: string, isRef: VKind, structIdx: i32) {
   localIsRef.push(isRef)
   localStructIdx.push(structIdx)
   localLoopVar.push(0)
+  // Block-scoped when the collect walk is inside a nested block: depth 1 is the frame's own
+  // statement list, deeper is a block whose bindings die at its `}`. Every call site sits
+  // inside `collectLocals` or `collectStartLocals`, so the depth is the caller's answer.
+  let inBlk = 0
+  if scopeFrames.length > 1 { inBlk = 1 }
+  localBlockLet.push(inBlk)
   localLoopIter.push(-1)
   localDeclIx.push(-1)
   localLitUnion.push(0)
@@ -8880,9 +8927,17 @@ function arrNewDefaultKind(callIx: i32) {
 function declaredSlotLive(name: string) {
   const scoped = scopeSlotOf(name)
   if scoped >= 0 { return scoped }
+  // `flatScanSkips` states for a block binding what `localLoopVar` states for a loop
+  // variable: a flat hit the scope stack could have answered for is out of scope.
   let pos = 0
   while pos < localNames.length {
-    if localNames[pos] == name && localLoopVar[pos] == 0 { return pos }
+    if (
+      localNames[pos] == name &&
+      localLoopVar[pos] == 0 &&
+      !flatScanSkips(pos)
+    ) {
+      return pos
+    }
     pos = pos + 1
   }
   -1
@@ -8919,13 +8974,36 @@ export function frameHasDupLocalName() {
   false
 }
 
+// Does the flat scan have to pass slot `pos` over? True for a block-scoped binding asked
+// while the scope stack is authoritative, since every live one resolves through
+// `scopeSlotOf` and reaching the flat scan means this one's `}` has passed. Scope-less
+// passes keep the whole registry, which is what they are for. D1597.
+function flatScanSkips(pos: i32) {
+  if localBlockLet[pos] == 0 { return false }
+  blockBindingHidden()
+}
+
+// Does this frame bind a name in a nested block that a module global also binds? The one
+// condition under which the scope-less detection sweep and the lowering can disagree about
+// which home a read denotes, so the one condition `dupScanRun` owes a second sweep. D1597.
+export function frameHasBlockLetOverGlobal() {
+  let i = 0
+  while i < localNames.length {
+    if localBlockLet[i] == 1 {
+      if globalLetOf(localNames[i]) >= 0 { return true }
+    }
+    i = i + 1
+  }
+  false
+}
+
 function declaredSlotOf(name: string) {
   const scoped = scopeSlotOf(name)
   if scoped >= 0 { return scoped }
   if !dupScanActive {
     let pos = 0
     while pos < localNames.length {
-      if localNames[pos] == name { return pos }
+      if localNames[pos] == name && !flatScanSkips(pos) { return pos }
       pos = pos + 1
     }
     return -1
@@ -17321,7 +17399,9 @@ function boundBoolByName(name: string, fnIx: i32) {
         }
         i = i + 1
       }
-      const li = parentLetOf(fn.fnBody, name)
+      // `frameLetOfLive`, not `parentLetOf`: a `boolean` bound in a block this read is
+      // not inside is out of scope, and the read denotes the module global. D1597.
+      const li = frameLetOfLive(fn.fnBody, name)
       if li >= 0 {
         const d = P.nodes[li]
         if d is LetDecl {

@@ -85,20 +85,19 @@ import {
 } from "./cli_util"
 
 // ── `vl` CLI — the brain in VL (docs/cli-design.md) ──────────────────────────
-// The command-queue half of the CLI. The host (scripts/vl-host) is a thin PUMP:
-// it calls `cliNext()` until it returns CMD_DONE, services the one raw I/O
-// command each step asks for (read a file, print a line), commits the result
-// back, and loops. ALL POLICY lives here — arg parsing, running the checker
-// IN-MODULE, diagnostic formatting, severity gating, the exit code — so it
-// survives the host's planned shrink to a WASI shim (each command maps 1:1 onto
-// a WASI call). The linker stays EMPTY: this is a state machine over the globals
-// below, identical in shape to the H3 module-fetch loop.
+// The command-queue half of the CLI. The host (`scripts/vl-host`) is a thin pump: it
+// calls `cliNext()` until it returns `CMD_DONE`, services the one raw I/O command each
+// step asks for, commits the result back, and loops. All policy lives here — arg
+// parsing, running the checker in-module, diagnostic formatting, severity gating, the
+// exit code — so it survives the host's planned shrink to a WASI shim, each command
+// mapping 1:1 onto a WASI call. The linker stays empty: this is a state machine over
+// the globals below, identical in shape to the module-fetch loop.
 //
-// cli.vl is joined into the compiled compiler, so it calls the lexer/parser/
-// checker/lint and the driver's diagnostic accessors DIRECTLY — no second copy
-// of the compiler, no ABI marshalling inside the module.
-//
-// The command codes `cliNext` returns to the host pump (mirror docs/cli-design.md).
+// `cli.vl` is joined into the compiled compiler, so it calls the lexer, parser,
+// checker and lint and the driver's diagnostic accessors directly — no second copy of
+// the compiler, and no ABI marshalling inside the module.
+
+// The command codes `cliNext` returns to the host pump (`docs/cli-design.md`).
 const CMD_DONE = 0
 const CMD_LIST_DIR = 1
 const CMD_READ_FILE = 2
@@ -106,20 +105,17 @@ const CMD_WRITE_FILE = 3
 const CMD_PRINT_OUT = 4
 const CMD_PRINT_ERR = 5
 const CMD_READ_STDIN = 6
-// `vl test` (docs/internals/vl-test-design.md). Wasm EXECUTION is the one thing a
-// VL program cannot do for itself — instances, threads and trap catching are the
-// engine's, and the engine lives in the host — so the runner's policy (discovery,
-// the plan, the report, the exit code) stays here and exactly three raw mechanisms
-// cross to Rust. cli-design.md anticipated this as `CMD_RUN_WASM`.
+// `vl test` (docs/internals/vl-test-design.md). Wasm execution is the one thing a VL
+// program cannot do for itself — instances, threads and trap catching are the
+// engine's, and the engine lives in the host — so the runner's policy (discovery, the
+// plan, the report, the exit code) stays here and three raw mechanisms cross to Rust.
 const CMD_TEST_STASH = 7   // keep the module now in rbyte* as test file `cliCmdPath`
 const CMD_TEST_COLLECT = 8 // instantiate every stashed module; report its registry
 const CMD_TEST_RUN = 9     // run the pushed plan (in parallel); report each result
-// `vl check --codegen`. The wasm VALIDATOR lives in the engine, and the engine is
-// the host's — a VL program has none — so "did the emitter produce a MODULE?" is
-// the second thing (after execution) this brain cannot decide for itself. The
-// emitter running to completion is not the same claim, and the gap between them is
-// the check-clean-invalid-wasm class. The bytes are already in the driver's `rbyte*`
-// buffer, exactly where CMD_TEST_STASH reads them, so nothing new crosses.
+// `vl check --codegen`. The wasm validator lives in the engine, and the engine is the
+// host's, so "did the emitter produce a module?" is the second thing this brain cannot
+// decide for itself: the emitter returning 0 is not the same claim, and the gap between
+// them is the check-clean-invalid-wasm class. The bytes are already in `rbyte*`.
 const CMD_VALIDATE = 10 // validate the module now in rbyte*; report engine verdict
 
 // The state-machine states (cliState). `*_RECV` states resume after the host has
@@ -152,10 +148,10 @@ let cliResultAcc: i32[] = [] // the host pushes a file's contents here
 let cliFileSrc = ""          // last committed file contents
 let cliFileFound = 0         // 1 = the host read the file, 0 = missing
 let cliExit = 0              // the process exit code, read after CMD_DONE
-// A `--codegen` file whose emitted module the ENGINE refused. `vl check` said rc 0 to
+// A `--codegen` file whose emitted module the engine refused. `vl check` said rc 0 to
 // reach the emitter, so an invalid module is the compiler's fault by construction and
-// exits 70 (EX_SOFTWARE — the code `report` uses for a compiler trap, #2483) rather
-// than 1: a caller can tell a vl BUG from a bad program without parsing stderr (D1578).
+// exits 70 (EX_SOFTWARE, the code `report` uses for a compiler trap) rather than 1: a
+// caller can tell a vl bug from a bad program without parsing stderr (D1578).
 let cliInvalidModule = 0
 
 // ── parsed `check` configuration ───────────────────────────────────────────────
@@ -211,15 +207,15 @@ let cliFixCount = 0    // total safe fixes applied across the run
 let cliFixDeclined = 0 // total edits VERIFY-AND-REVERT threw away across the run
 let cliLintGraphed = 0 // 1 = the current file's lint ran module-aware (lintGraph)
 let cliFileFixed = 0   // 1 once the current file's fixes were applied — so
-// the module-aware re-check (for the report) doesn't
-// re-fix. Reset per file in cliStartFile.
-// ── verify-and-revert (D1091) ──────────────────────────────────────────────────
-// An autofix must never ship a program that stops working, so every candidate
-// rewrite is COMPILED (emit + engine validation, not just `check`) before it
-// reaches the disk, and an edit that breaks a file that built is dropped. The
-// phases run inside the existing per-file check loop — `cliBeginCheck` restages
-// from the in-memory source and every dependency is already cached, so a trial
-// costs one compile and no host read.
+// the module-aware re-check (for the report) does not re-fix. Reset per file in
+// `cliStartFile`.
+
+// ── verify-and-revert (D1091) ────────────────────────────────────────────────
+
+// An autofix must never ship a program that stops working, so every candidate rewrite
+// is compiled (emit plus engine validation, not just `check`) before it reaches the
+// disk, and an edit that breaks a file that built is dropped. The phases run inside
+// the per-file check loop, so a trial costs one compile and no host read.
 const FIXP_OFF = 0                // not verifying: the report path
 const FIXP_ALL = 1                // trial = every computed edit at once (the fast path)
 const FIXP_BASE = 2               // trial = the ORIGINAL source (did it build before?)
@@ -235,8 +231,8 @@ let cliFixEditWhat: string[] = [] // the lint/hint the edit came from, for the r
 let cliFixEditLine: i32[] = []
 let cliFixEditCol: i32[] = []
 let cliFixKeep: i32[] = []        // 1 = this edit is in the current candidate
-// One row per edit verify-and-revert DECLINED, drained into an `info` diagnostic by
-// the report pass. A declined edit is a site where the finding that OFFERED it is
+// One row per edit verify-and-revert declined, drained into an `info` diagnostic by
+// the report pass. A declined edit is a site where the finding that offered it is
 // wrong, and a count alone cannot be worked on — this is the standing worklist of
 // annotations inference cannot yet do without (D1091).
 let cliFixDeclinedAt: string[] = []
@@ -246,18 +242,17 @@ let cliFixDeclinedCol: i32[] = []
 // Flags.
 let cliTestFilter = "" // -t <substring>: keep tests whose scope-path contains it
 let cliTestJobs = 0    // --jobs N (0 = let the host pick, one worker per core)
-// Per collected FILE (parallel to cliFiles): the compile error text, "" when the
-// file compiled. A file that fails to compile is one FAILING entry in the report
-// and does not stop the run — the design's "compile failure of a test file = that
-// file FAILs and the run continues".
+// Per collected file (parallel to `cliFiles`): the compile error text, "" when the
+// file compiled. A file that fails to compile is one failing entry in the report and
+// does not stop the run.
 let cliTestFileErr: string[] = []
 // The files whose modules the host holds, in stash order. Not every entry of
 // cliFiles is here (a compile failure stashes nothing), so this is the index space
 // the collect/run protocol speaks in; cliTestStashOf maps back to cliFiles.
 let cliTestStash: string[] = []
 let cliTestStashOf: i32[] = []
-// Per STASHED file, from CMD_TEST_COLLECT: 0 = instantiated and its registry read,
-// 1 = instantiation failed (the file's top level trapped) — message in ...Msg.
+// Per stashed file, from `CMD_TEST_COLLECT`: 0 = instantiated and its registry read,
+// 1 = instantiation failed (the file's top level trapped), message in `...Msg`.
 let cliTestFileStatus: i32[] = []
 let cliTestFileMsg: string[] = []
 // The collected registry, flattened across files (parallel arrays).
@@ -274,7 +269,7 @@ let cliResOut: string[] = []
 // In-flight accumulators the host pushes into.
 let cliTestNameAcc: i32[] = []
 let cliTestOutAcc: i32[] = []
-// The index WITHIN the file currently being collected — what `vltRun(i)` takes.
+// The index within the file currently being collected — what `vltRun(i)` takes.
 let cliTestLocalNext = 0
 // Tallies for the summary line.
 let cliTestPassed = 0
@@ -287,49 +282,41 @@ let cliDirIsDirs: i32[] = []
 let cliDirNameAcc: i32[] = []
 let cliDirWasDir = 0 // 1 if the last CMD_LIST_DIR target was a directory
 
-// The reported diagnostics, as PARALLEL arrays (the compiler's own idiom — cf.
-// lint.vl's lintMsgs/lintLines/…): severity, 1-based line (0 = positionless),
-// 0-based col, 0-based end col, message. One entry per index.
+// The reported diagnostics, as parallel arrays (the compiler's own idiom): severity,
+// 1-based line (0 = positionless), 0-based col, 0-based end col, message. One entry
+// per index.
 let dgSev: string[] = []
 let dgLine: i32[] = []
 let dgCol: i32[] = []
 let dgEnd: i32[] = []
 let dgMsg: string[] = []
-// The table index of the module that OWNS each diagnostic (parallel to the arrays
-// above) — so a graph-compile error in an IMPORTED module is labelled (and its caret
-// context drawn) against THAT file, not the entry. 0 = the entry / a positionless
-// diagnostic / single-file (non-module) mode.
+// The table index of the module that owns each diagnostic (parallel to the arrays
+// above), so a graph-compile error in an imported module is labelled — and its caret
+// context drawn — against that file, not the entry. 0 = the entry, a positionless
+// diagnostic, or single-file mode.
 let dgMod: i32[] = []
-// The diagnostic's STABLE code (parallel): the lint rule id ("prefer-const", …)
-// or "redundant-type" for the annotation hint; "" for a compile error (those
-// carry no code — `--json` omits the field).
-//
-// AND NO `data` COLUMN, deliberately. A compile diagnostic's structured payload
-// (`diagDataLen`/`diagDataByte`) exists for an EDITOR: it is the quick-fix's
-// answer, and the fix is an edit no batch reporter performs. Since `--json`
-// already omits the compile-error CODE, carrying the payload would report a
-// field nothing reads. Add both together the day a consumer needs them.
+// The diagnostic's stable code (parallel): the lint rule id, or "redundant-type" for
+// the annotation hint; "" for a compile error, which carries none and whose field
+// `--json` omits. No `data` column deliberately: a compile diagnostic's structured
+// payload is the quick-fix's answer for an editor, and no batch reporter edits.
 let dgCode: string[] = []
-// The committed modules' keys + sources, in COMMIT order (so the index matches the
-// driver's module-table index, what `diagModule`/`modOfTok` return) — the per-module
-// file label + caret-context source for a graph-compile diagnostic. Reset + filled by
-// the module fetch loop (`cliBeginCheck` / each `cliModCommitOne`).
+// The committed modules' keys and sources, in commit order, so the index matches the
+// driver's module-table index (what `diagModule` / `modOfTok` return) — the per-module
+// file label and caret-context source for a graph-compile diagnostic. Reset and filled
+// by the module fetch loop.
 let cliModKeys: string[] = []
 let cliModSrcs: string[] = []
-// Memo for `cliDiagSrcLines`: the last module whose source was split into lines (a
-// file's diagnostics cluster, so this avoids re-splitting per diagnostic).
+// Memo for `cliDiagSrcLines`: the last module whose source this split into lines. A
+// file's diagnostics cluster, so this avoids re-splitting per diagnostic.
 let cliDiagLineCacheMod = -1
 let cliDiagLineCache: string[] = []
 let cliSrcLines: string[] = []
-// ── per-RUN module source cache ─────────────────────────────────────────────────
-// A directory check runs the module fetch loop once PER FILE, and a shared
-// dependency is imported by many dependents — without a cache it is re-read from
-// disk and re-pushed across the host boundary one code point at a time, once per
-// dependent (O(files × closure) boundary traffic). Keyed on the module key; holds
-// every source read this run (deps AND entries — an entry is often another file's
-// dep). `found = 0` is cached too, so a missing module is asked of the host once.
-// The cache spans `modReset()` calls by design: within one run the tree is stable
-// (`--fix` updates the entry it rewrote).
+// ── per-run module source cache ──────────────────────────────────────────────
+
+// A directory check runs the module fetch loop once per file, and a shared dependency
+// is imported by many dependents, so without a cache it is re-read and re-pushed
+// across the host boundary once per dependent. Keyed on the module key; `found = 0`
+// is cached too, and the cache spans `modReset()` because a run's tree is stable.
 let cliSrcCacheKeys: string[] = []
 let cliSrcCacheSrcs: string[] = []
 let cliSrcCacheFound: i32[] = []
@@ -354,11 +341,12 @@ function cliSrcCachePut(key: string, src: string, found: i32) {
   0
 }
 
-// ── argv intake (host pushes each arg before the run loop) ─────────────────────
-// The COMPLETE instance reset: every CLI global above returns to its declared
-// state, so a reused compiler instance starts each run clean. (A partial reset
-// is a latent desync — e.g. `dgMod` surviving while its parallel siblings
-// dgSev…dgMsg clear, or a prior run's `--exclude` patterns still filtering.)
+// ── argv intake (host pushes each arg before the run loop) ───────────────────
+
+// The complete instance reset: every CLI global above returns to its declared state,
+// so a reused compiler instance starts each run clean. A partial reset is a latent
+// desync — `dgMod` surviving while its parallel siblings clear, or a prior run's
+// `--exclude` patterns still filtering.
 export function cliArgReset() {
   cliArgs = []
   cliArgAcc = []
@@ -479,17 +467,9 @@ export function cliCmdPathAt(j: i32) { cliCmdPath[j] }
 export function cliCmdDataLen() { cliCmdData.length }
 export function cliCmdDataAt(j: i32) { cliCmdData[j] }
 // The bulk twin of `cliCmdDataAt` — the `<name>Store(off, count)` half of the host's
-// OUT ABI (protocol and staging window: `driver.rbyteStore`'s header). Writes
-// `written` = min(count, cliCmdDataLen() - off) BYTES, PACKED FOUR PER i32 WORD
-// (little-endian), into `ioMem[0 .. written)` and returns `written`.
-//
-// This is the OUT channel `vl fmt` rides — a whole formatted file leaves through the
-// CMD_PRINT_OUT / CMD_WRITE_FILE payload — and it carries every `vl check` diagnostic
-// and the `--json` report, which alone would never have justified it. `cliCmdPath`
-// gets no `Store` twin on purpose: it carries one path, and the per-element accessor
-// keeps the host's presence probe exercised on every `vl check`. The tail assembly and
-// the masking argument are `rbyteStore`'s verbatim — the final word's padding bytes
-// land inside the window, and a string element is already 0..255 by construction.
+// out ABI (protocol and staging window: `driver.rbyteStore`'s header). Writes
+// `written` = min(count, cliCmdDataLen() - off) bytes, packed four per i32 word
+// little-endian, into `ioMem[0 .. written)` and returns `written`.
 export function cliCmdDataStore(off: i32, count: i32): i32 {
   const avail = cliCmdData.length - off
   let n = count
@@ -523,9 +503,8 @@ export function cliResultPush(c: i32) {
 }
 // The bulk twin of `cliResultPush` — the `<name>Load(count)` half of the host's
 // `StrIn` ABI (protocol, staging window and the why-a-loop in `driver.srcLoad`'s
-// header). This is the channel every `vl check` / `vl fmt` / `vl test` file read
-// arrives on, so it is the LSP's own intake: the pump's CMD_READ_FILE result used
-// to cross the host boundary one code point at a time, per file, per run.
+// header). Every `vl check` / `vl fmt` / `vl test` file read arrives on this channel,
+// so it is the LSP's own intake.
 export function cliResultLoad(count: i32) {
   let i = 0
   while i < count {
@@ -566,19 +545,20 @@ export function cliDirEntryPush(isDir: i32) {
   cliDirNameAcc = []
   0
 }
-// `isDir = 1` when the listed path was a directory (entries pushed above); `0`
-// when it was a file or did not exist (no entries) — the VL program then treats
-// the path as a single file.
+// `isDir = 1` when the listed path is a directory (entries pushed above); 0 when it
+// is a file or does not exist (no entries) — the VL program then treats the path as a
+// single file.
 export function cliDirCommit(isDir: i32) {
   cliDirWasDir = isDir
   0
 }
 
-// ── lint-stream adapters ────────────────────────────────────────────────────────
-// The current file's lint findings, read from whichever stream the lint run above
+// ── lint-stream adapters ─────────────────────────────────────────────────────
+
+// The current file's lint findings, read from whichever stream the lint run
 // populated: the module-aware graph accumulators (`cliLintGraphed`, one entry per
-// finding with its owning module index) or lint.vl's single-module sink (module 0
-// throughout — the entry).
+// finding with its owning module index), or lint.vl's single-module sink, which is
+// module 0 throughout.
 function cliLintCount() {
   if cliLintGraphed != 0 { return lintGraphCount() }
   lintCount()
@@ -641,11 +621,10 @@ function cliFmtConcise(d: i32) {
     "] " +
     dgMsg[d]
 }
-// One diagnostic as a JSON object (the `--json` schema — docs/internals/
-// cli-design.md): file, severity, the stable code where one exists (lint rule
-// id / "redundant-type"; compile errors carry none, the field is omitted),
-// 1-based line + col with an EXCLUSIVE 1-based endCol (endCol - col = the caret
-// span; all three omitted for a positionless diagnostic), message.
+// One diagnostic as a JSON object (the `--json` schema, `docs/internals/cli-design.md`):
+// file, severity, the stable code where one exists (a compile error carries none and
+// the field is omitted), 1-based line and col with an exclusive 1-based endCol (endCol
+// - col is the caret span; all three omitted for a positionless one), and the message.
 function cliFmtJson(d: i32) {
   let out = "{\"file\":\"" + cliJsonEsc(cliDiagFile(d)) + "\""
   out = out + ",\"severity\":\"" + cliJsonEsc(dgSev[d]) + "\""
@@ -666,16 +645,16 @@ function cliFmtJson(d: i32) {
   }
   out + ",\"message\":\"" + cliJsonEsc(dgMsg[d]) + "\"}"
 }
-// The FILE PATH to label diagnostic `d` with: the owning module's key in module mode
-// (so a graph-compile error in an imported file points at THAT file, not the entry),
-// else the entry path. `dgMod[d]` is 0 (the entry) for lint/redundant + single-file.
+// The file path to label diagnostic `d` with: the owning module's key in module mode,
+// so a graph-compile error in an imported file points at that file rather than the
+// entry, else the entry path. `dgMod[d]` is 0 for lint, redundant and single-file.
 function cliDiagFile(d: i32) {
   const m = dgMod[d]
   if cliModMode != 0 && m >= 0 && m < cliModKeys.length { return cliModKeys[m] }
   cliCurFile
 }
-// The SOURCE LINES of diagnostic `d`'s owning module (its caret-context line), memoized
-// by module index. Falls back to the entry's lines (`cliSrcLines`) outside module mode.
+// The source lines of diagnostic `d`'s owning module (its caret-context line),
+// memoized by module index. Falls back to `cliSrcLines` outside module mode.
 function cliDiagSrcLines(d: i32) {
   const m = dgMod[d]
   if cliModMode != 0 && m >= 0 && m < cliModSrcs.length {
@@ -734,9 +713,9 @@ function cliFmtPretty(d: i32) {
   out
 }
 
-// Stable insertion sort of a diagnostic-INDEX array by (line, col): ties keep
+// Stable insertion sort of a diagnostic-index array by (line, col): ties keep
 // insertion order, so error-tier diagnostics precede lint-tier ones at the same
-// position (matching the host's stable `sort_by_key`).
+// position.
 function cliDiagLess(a: i32, b: i32) {
   if dgLine[a] != dgLine[b] { return dgLine[a] < dgLine[b] }
   dgCol[a] < dgCol[b]
@@ -756,10 +735,9 @@ function cliStableSort(order: i32[]) {
   0
 }
 
-// ── the `check` policy ─────────────────────────────────────────────────────────
-// Parse `check`'s args. `--compiler <path>` is the host's concern (it selects the
-// module) — skip it and its value here.
-// ── --exclude glob filtering (A-impl 2b) ───────────────────────────────────────
+// ── the `check` policy ───────────────────────────────────────────────────────
+
+// ── `--exclude` glob filtering ───────────────────────────────────────────────
 // Normalize a pattern (strip a leading `./` and trailing `/`s) and record it.
 function cliAddExclude(pat: string) {
   let p = pat
@@ -768,8 +746,8 @@ function cliAddExclude(pat: string) {
   cliExcludes.push(p)
   0
 }
-// True if any exclude pattern matches the path RELATIVE TO THE CHECK ROOT or its
-// BASENAME — so `--exclude tests` prunes a whole subtree and `--exclude '*.gen.vl'`
+// True if any exclude pattern matches the path relative to the check root or its
+// basename — so `--exclude tests` prunes a whole subtree and `--exclude '*.gen.vl'`
 // matches generated files anywhere.
 function cliExcluded(relPath: string, basename: string) {
   let i = 0
@@ -805,10 +783,10 @@ function cliUsageErr(msg: string) {
   if cliArgErr == "" { cliArgErr = msg }
   0
 }
-// Parse the subcommand's args STRICTLY: an unknown flag or a second positional
-// argument is a usage error (exit 2), never silently ignored — `vl check a.vl
-// b.vl` must not quietly check only `a.vl`. Flags are validated per subcommand
-// (cliArgs[0]); a value-taking flag requires a non-flag value.
+// Parse the subcommand's args strictly: an unknown flag or a second positional
+// argument is a usage error (exit 2), never silently ignored — `vl check a.vl b.vl`
+// must not quietly check only `a.vl`. Flags are validated per subcommand; a
+// value-taking flag requires a non-flag value.
 function cliParseArgs() {
   let sub = "check"
   if cliArgs.length > 0 && cliArgs[0] == "fmt" { sub = "fmt" }
@@ -824,9 +802,8 @@ function cliParseArgs() {
     } else if sub == "check" && a == "--codegen" {
       cliCodegen = 1
     } else if sub == "check" && a == "--no-validate" {
-      // Mirrors `vl build --no-validate`: run the emitter, skip the engine's
-      // verdict on its output. For anyone measuring emitter reach on a corpus
-      // where invalid modules are the point.
+      // Mirrors `vl build --no-validate`: run the emitter, skip the engine's verdict on
+      // its output, for anyone sizing emitter reach on a corpus of invalid modules.
       cliNoValidate = 1
     } else if sub == "check" && a == "--json" {
       cliJson = 1
@@ -920,12 +897,9 @@ function cliParseArgs() {
   0
 }
 
-// Stage `cliEntrySrc` into the compiler's single-source input.
-//
-// ONE CALL, NOT A PER-ELEMENT LOOP — see `driver.srcSetStr`, which explains why the loop
-// was not just slow but WRONG after Stage 2c. The second copy of that loop (in the lint
-// path below) went with it; they were a twin pair and a fix to one and not the other would
-// have left `vl check --lint` double-encoding the source that `vl check` no longer does.
+// Stage `cliEntrySrc` into the compiler's single-source input. One call, not a
+// per-element loop: `driver.srcSetStr`'s header explains why the loop spelling
+// double-encodes a non-ASCII source.
 function cliStageEntry() {
   srcReset()
   srcSetStr(cliEntrySrc)
@@ -948,10 +922,9 @@ function cliSortFiles() {
   0
 }
 // Ingest one committed directory listing rooted at `base` (full path) / `relBase`
-// (relative to the check root): queue non-skipped, non-excluded subdirectories
-// onto the walk stack, collect non-excluded `.vl` files onto the work-list. The
-// exclude test sees the path relative to the root and the basename, matching the
-// host's `makeExcludeMatcher`.
+// (relative to the check root): queue non-skipped, non-excluded subdirectories onto
+// the walk stack and collect non-excluded `.vl` files onto the work-list. The exclude
+// test sees the path relative to the root and the basename.
 function cliIngestEntries(base: string, relBase: string) {
   let i = 0
   while i < cliDirNames.length {
@@ -965,8 +938,8 @@ function cliIngestEntries(base: string, relBase: string) {
         cliWalkRel.push(rel)
       }
     } else {
-      // `check`/`fmt` collect every `.vl`; `test` collects only `*.test.vl` — the
-      // discovery predicate is the ONLY thing the walk does differently.
+      // `check` and `fmt` collect every `.vl`; `test` collects only `*.test.vl` — the
+      // discovery predicate is the one thing the walk does differently.
       let wanted = cliEndsVl(name)
       if cliCmd == 2 { wanted = cliEndsTestVl(name) }
       if wanted && !cliExcluded(rel, name) { cliFiles.push(child) }
@@ -976,17 +949,15 @@ function cliIngestEntries(base: string, relBase: string) {
   0
 }
 
-// ── per-file check (appends to cliOut + folds into the tally) ───────────────────
-// Run the checker over the CURRENT file (cliEntrySrc / cliCurFile), append its
-// formatted diagnostics to cliOut, and add its error/warning/gating counts to the
-// running tally. The summary is built once at the end (cliFinishSummary).
+// ── per-file check (appends to cliOut + folds into the tally) ────────────────
+// Run the checker over the current file, append its formatted diagnostics to `cliOut`,
+// and add its error, warning and gating counts to the running tally. The summary is
+// built once at the end (`cliFinishSummary`).
 function cliCheckCurFile() {
   if cliModMode == 0 { cliStageEntry() }
   let rc = 0
-  // A `--fix` VERIFY pass compiles rather than checks: the annotation the hint
-  // calls redundant is load-bearing for the EMITTER in more files than for the
-  // checker, so a `check`-only verification would wave 87 of 159 breakages
-  // through (D1091).
+  // A `--fix` verify pass compiles rather than checks: an annotation the hint calls
+  // redundant is load-bearing for the emitter far more often than for the checker (D1091).
   if cliCodegen != 0 || cliFixPhase != FIXP_OFF {
     rc = compileSrc()
   } else {
@@ -998,18 +969,12 @@ function cliCheckCurFile() {
   else if rc == 2 { cliLastStage = "type" }
   else if rc == 3 { cliLastStage = "emit" }
 
-  // `--codegen` is the promise that the program LOWERS, and the emitter returning
-  // 0 does not establish it — the validator is the engine's, so the bytes have to
-  // cross. Hand them over and resume in `cliCheckCurFileRest` with the verdict in
-  // `cliValidateMsg`. A host round-trip is safe HERE and nowhere later: it reads
-  // `rbyte*` and commits a string, never re-entering the compiler, so the driver's
-  // diagnostic stores the rest of this function reads are untouched.
+  // `--codegen` promises the program lowers, which the emitter returning 0 does not
+  // establish, so the bytes cross to the engine. The round-trip reads `rbyte*` and
+  // commits a string, never re-entering the compiler, so it is safe here and not later.
   cliValidateMsg = ""
-  // A verify pass ALWAYS hands the bytes over, even for a nonzero `rc` whose
-  // verdict is already decided: the round-trip is what unwinds the stack between
-  // trials, so a file with many candidate edits costs one frame, not one per
-  // trial. `--no-validate` is a `--codegen` reporting flag and does not weaken a
-  // fix's safety net.
+  // A verify pass always hands the bytes over, even for a nonzero `rc`: the round-trip
+  // is what unwinds the stack between trials, so many edits cost one frame, not one each.
   if cliFixPhase != FIXP_OFF {
     cliState = ST_CHECK_VALIDATE
     return CMD_VALIDATE
@@ -1022,20 +987,18 @@ function cliCheckCurFile() {
 }
 
 // The rest of the per-file check, after the engine has had its say (see
-// `cliCheckCurFile`). Split out ONLY so the validate round-trip has somewhere to
-// resume; nothing else about the ordering changed.
+// `cliCheckCurFile`). Split out only so the validate round-trip has somewhere to resume.
 function cliCheckCurFileRest() {
-  // A VERIFY pass produces a verdict, never a report: the diagnostics it just
-  // computed describe a CANDIDATE source that may never reach the disk.
+  // A verify pass produces a verdict, never a report: the diagnostics it just computed
+  // describe a candidate source that may never reach the disk.
   if cliFixPhase != FIXP_OFF {
     let ok = 0
     if cliFixPassRc == 0 && cliValidateMsg.length == 0 { ok = 1 }
     cliValidateMsg = ""
     return cliFixVerdict(ok)
   }
-  // Error-tier diagnostics (all `error`) — capture them NOW, straight from the
-  // driver stores, BEFORE `lintSrc` below: that re-parses the entry source and
-  // resets the diagnostic stores, which would otherwise drop module-compile errors.
+  // Error-tier diagnostics — capture them now, straight from the driver stores, before
+  // `lintSrc` re-parses the entry source and resets those stores.
   dgSev = []
   dgLine = []
   dgCol = []
@@ -1046,8 +1009,8 @@ function cliCheckCurFileRest() {
   const n = diagCount()
   let i = 0
   while i < n {
-    // Capture the owning module NOW — before `lintSrc` below resets `P.toks`/`nodeToks`
-    // (the anchor `diagModule` resolves through). Single-file mode → 0 (the entry).
+    // Capture the owning module before `lintSrc` resets `P.toks` / `nodeToks`, which
+    // `diagModule` resolves through. Single-file mode is 0, the entry.
     cliAddDiag(
       "error",
       "",
@@ -1059,14 +1022,10 @@ function cliCheckCurFileRest() {
     )
     i = i + 1
   }
-  // The engine rejected the module this file emitted. POSITIONED since D1578: the
-  // emitter banked each function body's module byte range, so the offset the validator
-  // names maps back to the FUNCTION that owns those bytes and to its declaration. An
-  // unmapped offset (a synthetic body, or a failure outside the code section) keeps the
-  // old positionless form rather than pointing somewhere it cannot justify.
-  //
-  // It is an `error` because the alternative is what this gate was built to end: a
-  // clean `check --codegen` over a program that cannot load.
+  // The engine rejected the module this file emitted. Positioned: the emitter banks
+  // each function body's module byte range, so the offset the validator names maps back
+  // to the function owning those bytes; an unmapped offset keeps the positionless form.
+  // An `error`, because the alternative is a clean `check --codegen` that cannot load.
   if cliValidateMsg.length > 0 {
     const vsp = emitFnSpanAt(engineFailOffset(cliValidateMsg))
     const vwhere = emitFnSpanWhere(vsp)
@@ -1091,15 +1050,10 @@ function cliCheckCurFileRest() {
     cliValidateMsg = ""
   }
 
-  // Lint (parse-only). Run BEFORE the --fix block (which needs the lint stream)
-  // and reused by the report below. (The redundant-annotation stream is type-
-  // populated and survives this re-parse.) SCOPE policy:
-  //   - a SINGLE-FILE target in module mode lints the WHOLE graph (`lintGraph`),
-  //     so an unused local in an imported module — or an unused import in the
-  //     importer — is reported, attributed to the owning file;
-  //   - a DIRECTORY run lints the ENTRY module only: every file in the walk gets
-  //     its turn as the entry, so per-module coverage is complete WITHOUT
-  //     re-reporting a shared dependency's findings once per importer.
+  // Lint (parse-only), run before the `--fix` block that needs the stream and reused by
+  // the report. Scope: a single-file target in module mode lints the whole graph, so an
+  // unused local in an imported module is reported against its owner; a directory run
+  // lints the entry module only, since every file gets its turn as the entry.
   cliStageEntry()
   // The path is what scopes `std-comment-audience` to `std/`; the graph walk
   // re-sets it per module, so this is the single-file and directory path.
@@ -1112,13 +1066,10 @@ function cliCheckCurFileRest() {
     lintSrc()
   }
 
-  // --fix (MODULE-AWARE): the redundant-annotation stream (from the resolved check
-  // above) + the lint stream are now reliable, so apply the safe edits, write the
-  // file, and re-check it (ST_FIX_WROTE → cliBeginCheck) so the report reflects the
-  // fixed source. `cliFileFixed` guards the re-check from re-fixing. Doing the fix
-  // HERE — after imports are resolved — is what makes it safe: a per-file check
-  // without its imports gives unreliable types (it once mangled `let x: i32[] = []`
-  // into `let x: []`).
+  // `--fix`, module-aware: the redundant-annotation and lint streams are reliable after
+  // the resolved check, so apply the safe edits, write the file and re-check so the
+  // report reflects the fixed source. `cliFileFixed` guards the re-check from re-fixing.
+  // Fixing after imports resolve is what makes it safe; without them the types are not.
   if cliFix != 0 && cliFileFixed == 0 {
     cliFileFixed = 1
     cliCollectFixes(cliEntrySrc)
@@ -1140,8 +1091,8 @@ function cliCheckCurFileRest() {
 
   // ── report ──────────────────────────────────────────────────────────────────
   // Lint-tier diagnostics (from the lint run above; read the stored count).
-  // Module-aware: a graph lint's finding carries the owning module's index, so
-  // the report labels it (and draws its caret context) against THAT file.
+  // Module-aware: a graph lint's finding carries the owning module's index, so the
+  // report labels it, and draws its caret context, against that file.
   const ln = cliLintCount()
   let k = 0
   while k < ln {
@@ -1158,10 +1109,9 @@ function cliCheckCurFileRest() {
     )
     k = k + 1
   }
-  // `--fix` DECLINED an edit here (an `info`): applying it stopped the file
-  // building, so the diagnostic that offered it is wrong about this site. Reported
-  // per SITE, not as a count, because a count cannot be worked on — this list is
-  // the standing worklist of annotations inference cannot yet do without (D1091).
+  // `--fix` declined an edit here (an `info`): applying it stopped the file building,
+  // so the diagnostic that offered it is wrong about this site. Reported per site and
+  // not as a count, because a count cannot be worked on (D1091).
   let fd = 0
   while fd < cliFixDeclinedAt.length {
     cliAddDiag(
@@ -1178,9 +1128,9 @@ function cliCheckCurFileRest() {
     fd = fd + 1
   }
   // Redundant explicit type annotations (a `hint`): `let x: T = e` where the
-  // initializer already infers to exactly `T`. Entry module only (`redunModuleAt
-  // == 0`) — a graph compile merges every module's AST, but only the entry's
-  // findings carry positions that map onto the file being reported/rewritten.
+  // initializer already infers to exactly `T`. Entry module only — a graph compile
+  // merges every module's AST, but only the entry's findings carry positions that map
+  // onto the file being reported or rewritten.
   let ri = 0
   while ri < redunCount() {
     if redunModuleAt(ri) == 0 {
@@ -1196,11 +1146,10 @@ function cliCheckCurFileRest() {
     }
     ri = ri + 1
   }
-  // Dead `??` defaults (a `warning`): `x ?? d` where `x`'s type admits no null, so the
-  // default can never be selected. Same stream discipline as the redundant-annotation
-  // hint above — entry module only, one spelling of the message (`rcoalMsgAt`). The
-  // severity matches the parse-only lint pass's `constant-condition`, which reports the
-  // same family (a branch that is never taken) at `warning`.
+  // Dead `??` defaults (a `warning`): `x ?? d` where `x`'s type admits no null. Same
+  // stream discipline as the hint above — entry module only, one spelling of the
+  // message (`rcoalMsgAt`). The severity matches the lint pass's `constant-condition`,
+  // the same family of a branch never taken.
   let ci = 0
   while ci < rcoalCount() {
     if rcoalModuleAt(ci) == 0 {
@@ -1216,12 +1165,10 @@ function cliCheckCurFileRest() {
     }
     ci = ci + 1
   }
-  // `is <literal>` over an operand whose union COLLAPSED (a `hint`): the subsumed-arm
-  // ruling made `string | "err"` the type `string`, so the test is a value compare. Same
-  // stream discipline as the two above — entry module only, one spelling of the message
-  // (`isvalMsgAt`). A `hint` and not a warning: the program is correct and the compiler
-  // is right about the type; what the author needs is to be told the discrimination they
-  // wrote is not one, which is advice about the DESIGN of their error channel.
+  // `is <literal>` over an operand whose union collapsed (a `hint`): the subsumed-arm
+  // ruling makes `string | "err"` the type `string`, so the test is a value compare.
+  // Same stream discipline as the two above. A `hint` and not a warning: the program is
+  // correct, and the advice is about the design of the author's error channel.
   let vi = 0
   while vi < isvalCount() {
     if isvalModuleAt(vi) == 0 {
@@ -1270,14 +1217,13 @@ function cliCheckCurFileRest() {
   cliStartFile()
 }
 
-// The aggregate summary line, once every file is checked. A single-FILE target
-// (cliDirMode == 0) keeps the per-stage note (`(type error)`) tooling greps for;
-// a directory run aggregates across files and omits it.
+// The aggregate summary line, once every file is checked. A single-file target keeps
+// the per-stage note (`(type error)`) tooling greps for; a directory run aggregates
+// across files and omits it.
 function cliFinishSummary() {
-  // --fix: note how many safe fixes were written, ahead of the check report.
-  // A DECLINED edit is one verify-and-revert threw away because the rewritten
-  // file stopped building — the count is the standing measure of how often an
-  // annotation a hint calls redundant is load-bearing (D1091).
+  // `--fix`: note how many safe fixes this run applied, ahead of the check report. A
+  // declined edit is one verify-and-revert threw away because the rewritten file
+  // stopped building (D1091).
   if cliFix != 0 && (cliFixCount > 0 || cliFixDeclined > 0) {
     let note = "Applied " + i32ToStr(cliFixCount) + " fix(es)."
     if cliFixDeclined > 0 {
@@ -1288,10 +1234,9 @@ function cliFinishSummary() {
     }
     cliOut.push(cliAnsi(cliColor, "2", note))
   }
-  // --json: the diagnostics ARE the report — one JSON array on a single stdout
-  // line, no human summary (the exit code carries the gate, unchanged). Built
-  // in a code-point buffer: string concat per item is quadratic copy churn on
-  // a large directory run.
+  // `--json`: the diagnostics are the report — one JSON array on a single stdout line,
+  // no human summary, with the exit code carrying the gate. Built in a code-point
+  // buffer, since string concat per item is quadratic on a large directory run.
   if cliJson != 0 {
     cliExit = 0
     if cliGating > 0 { cliExit = 1 }
@@ -1301,9 +1246,8 @@ function cliFinishSummary() {
     let ji = 0
     while ji < cliJsonItems.length {
       if ji > 0 { buf.push(',') }
-      // `pushCps`, not `buf.push(item[ci])`: the buffer is drained through
-      // `fromCodePoints`, whose element is a CODE POINT, and `item[ci]` is a BYTE since
-      // Stage 2c. See `strutil`.
+      // `pushCps`, not `buf.push(item[ci])`: the buffer drains through `fromCodePoints`,
+      // whose element is a code point, while `item[ci]` is a byte. See `strutil`.
       pushCps(buf, cliJsonItems[ji])
       ji = ji + 1
     }
@@ -1350,25 +1294,17 @@ function cliFinishSummary() {
   0
 }
 
-// ── `vl test` — the runner brain (docs/internals/vl-test-design.md) ─────────────
-// The whole runner is policy EXCEPT wasm execution, so this is where all of it
-// lives: discovery reuses the `check`/`fmt` walk with a `*.test.vl` predicate,
-// compilation reuses the module fetch loop, and only three commands cross to the
-// host — stash a compiled module, collect the registries, run the plan. In order:
-//   1. per file: read → resolve imports → `compileSrc()` → CMD_TEST_STASH
-//      (a compile failure records its diagnostics and the run CONTINUES)
-//   2. CMD_TEST_COLLECT — the host instantiates each module; its start function
-//      runs the file's top level, which is the registration pass; the host reads
-//      the registry back through the `vlt*` exports and commits it here
-//   3. plan — apply `-t`; drop `itSkip` entries into the skipped tally
-//   4. CMD_TEST_RUN — the host runs the plan across its worker pool, then report
+// ── `vl test` — the runner brain (docs/internals/vl-test-design.md) ──────────
 
-// The line `vl test` APPENDS to every test file before compiling it: the runner
-// protocol, re-exported so the host can find it on the test module itself. It is
-// appended (never prepended) so every diagnostic position in the user's file is
-// unchanged. This is why a `*.test.vl` never writes the boilerplate — and why a
-// file that defines its own `vltCount` gets a duplicate-export error, which
-// reports as that file's failure like any other compile error.
+// The whole runner is policy except wasm execution: discovery reuses the `check` walk
+// with a `*.test.vl` predicate, compilation reuses the module fetch loop, and three
+// commands cross to the host — stash a compiled module, collect the registries, run
+// the plan. A file that fails to compile records its diagnostics and the run goes on.
+
+// The line `vl test` appends to every test file before compiling it: the runner
+// protocol, re-exported so the host can find it on the test module itself. Appended
+// and never prepended, so every diagnostic position in the user's file is unchanged. A
+// file defining its own `vltCount` gets a duplicate-export error, reported as failure.
 function cliTestProtocol() {
   "\nexport { vltCount, vltNameLen, vltNameAt, vltSkipped, vltRun, vltFailLen, vltFailAt } from \"std:test\"\n"
 }
@@ -1388,17 +1324,17 @@ function cliStartTestFile() {
   CMD_READ_FILE // — the test file's source
 }
 
-// Record why the current file produced no tests and move to the next one. The
-// message IS the file's report entry; the run never stops for it.
+// Record why the current file produced no tests and move to the next one. The message
+// is the file's report entry; the run never stops for it.
 function cliTestFileFailed(msg: string) {
   cliTestFileErr[cliFileIdx] = msg
   cliFileIdx = cliFileIdx + 1
   cliStartTestFile()
 }
 
-// Set up the module table for the current test file and drive its fetch loop. A
-// test file ALWAYS imports (the appended protocol re-export is one), so module
-// mode is unconditional — no `cliHasImports` gate.
+// Set up the module table for the current test file and drive its fetch loop. A test
+// file always imports (the appended protocol re-export is one), so module mode is
+// unconditional — no `cliHasImports` gate.
 function cliTestBeginCompile() {
   modReset()
   cliModMode = 1
@@ -1473,19 +1409,18 @@ function cliTestCompileNow() {
   CMD_TEST_STASH // — the host keeps the module now in rbyte*
 }
 
-// Every file compiled: ask the host to instantiate the stashed modules and read
-// their registries back. Nothing stashed (every file failed to compile, or there
-// were none) skips straight to the report.
+// Every file compiled: ask the host to instantiate the stashed modules and read their
+// registries back. Nothing stashed — every file failed to compile, or none exist —
+// skips straight to the report.
 function cliTestBeginCollect() {
   if cliTestStash.length == 0 { return cliTestReport() }
   cliState = ST_TEST_COLLECT
   CMD_TEST_COLLECT
 }
 
-// The plan: every collected test, in collection order, minus the ones `-t`
-// filters out. `itSkip` entries STAY in the plan — the host reports them skipped
-// off `vltRun`'s return value, so the skip decision has exactly one owner
-// (`std:test`) instead of two that can disagree.
+// The plan: every collected test, in collection order, minus the ones `-t` filters
+// out. `itSkip` entries stay in the plan — the host reports them skipped off
+// `vltRun`'s return value, so the skip decision has exactly one owner (`std:test`).
 function cliTestPlanRun() {
   cliPlanEntry = []
   let i = 0
@@ -1600,15 +1535,15 @@ function cliTestEmitFileTests(f: i32) {
   0
 }
 
-// ── the `vl test` protocol: what the host READS ────────────────────────────────
+// ── the `vl test` protocol: what the host reads ──────────────────────────────
 // The plan, as (stashed file, test index within that file) pairs, plus the worker
-// count. `cliTestJobsWanted() == 0` means "host's choice" (one per core).
+// count. `cliTestJobsWanted() == 0` means the host's choice, one per core.
 export function cliTestPlanCount(): i32 { cliPlanEntry.length }
 export function cliTestPlanFile(k: i32): i32 { cliTestOwner[cliPlanEntry[k]] }
 export function cliTestPlanTest(k: i32): i32 { cliTestLocal[cliPlanEntry[k]] }
 export function cliTestJobsWanted(): i32 { cliTestJobs }
 
-// ── the `vl test` protocol: what the host COMMITS ──────────────────────────────
+// ── the `vl test` protocol: what the host commits ────────────────────────────
 // A test name, one code point at a time (the `cliDirNamePush` idiom).
 export function cliTestNamePush(c: i32) {
   cliTestNameAcc.push(c)
@@ -1625,10 +1560,10 @@ export function cliTestNameCommit(skip: i32) {
   cliTestNameAcc = []
   0
 }
-// End of one stashed file's registry. `status` 0 = instantiated and read, 1 = its
-// top level trapped (the message rides in on the shared `cliResult` channel).
-// Files commit IN STASH ORDER, so `cliTestFileStatus.length` is the stash index
-// being collected — that is what the names above were attributed to.
+// End of one stashed file's registry. `status` 0 = instantiated and read, 1 = its top
+// level trapped, with the message on the shared `cliResult` channel. Files commit in
+// stash order, so `cliTestFileStatus.length` is the stash index being collected, which
+// is what the names above attribute to.
 export function cliTestFileCommit(status: i32) {
   cliTestFileStatus.push(status)
   cliTestFileMsg.push(fromCodePoints(cliResultAcc))
@@ -1659,10 +1594,10 @@ export function cliTestResultCommit(k: i32, status: i32) {
   0
 }
 
-// ── the state machine ──────────────────────────────────────────────────────────
+// ── the state machine ────────────────────────────────────────────────────────
 // Transition into the print phase and return the first output command. A pending
-// `--json` payload goes FIRST, to stdout (machine output; the stderr lines —
-// notes like the --fix count — drain after it).
+// `--json` payload goes first, to stdout; the stderr lines — notes like the `--fix`
+// count — drain after it.
 function cliBeginPrint() {
   cliOutIdx = 0
   cliState = ST_PRINT
@@ -1740,9 +1675,8 @@ function cliStartFile() {
   cliFixDeclinedAt = []
   cliFixDeclinedLine = []
   cliFixDeclinedCol = []
-  // Already read this run as another file's dependency? Check it straight from
-  // the cache — no host round-trip. A cached miss (found = 0) falls through to
-  // a real read: the not-found path differs by target kind (see ST_CHECK_READ).
+  // Already read this run as another file's dependency? Check it from the cache, with
+  // no host round-trip. A cached miss (found = 0) falls through to a real read.
   const ci = cliSrcCacheGet(cliCurFile)
   if ci >= 0 && cliSrcCacheFound[ci] != 0 {
     cliEntrySrc = cliSrcCacheSrcs[ci]
@@ -1791,17 +1725,12 @@ function cliBeginCheck() {
   cliFetchOrCheckFile()
 }
 
-// ── check --fix (A-impl 4) ──────────────────────────────────────────────────────
-// Collect the auto-fix edits for `src` into `cliFixEdit*`, ordered by start offset.
-// Two fixes: prefer-const → the `let` keyword (the lint anchors on it) becomes
-// `const`; a redundant type annotation → the `: T ` span becomes one space.
-// `--fix` deliberately does NOT touch unused-variable/parameter, because the `_`-prefix
-// SILENCES a warning and whether silencing is correct depends on intent; the lint still
-// reports them. Edits are absolute (offset, len, text).
-// PRECONDITION: the caller (`cliCheckCurFile`) has just run the MODULE-AWARE check over
-// the resolved graph AND `lintSrc` over `src`, so both streams are populated. We only
-// read them and compute edits — a per-file re-check without its imports gives unreliable
-// types, which is exactly what corrupted an empty-array annotation before this.
+// ── check --fix ──────────────────────────────────────────────────────────────
+
+// Collect the auto-fix edits for `src` into `cliFixEdit*`, ordered by start offset,
+// from the two safe fixes: prefer-const, and a redundant annotation's `: T ` span
+// becoming one space. Unused-variable is not fixed — the `_` prefix silences a
+// warning. Precondition: the module-aware check and `lintSrc` have run over `src`.
 function cliCollectFixes(src: string) {
   cliFixEditPos = []
   cliFixEditLen = []
@@ -1828,9 +1757,8 @@ function cliCollectFixes(src: string) {
     const code = cliLintCodeAt(k)
     const ln = cliLintLineAt(k) - 1
     const col = cliLintColAt(k)
-    // Entry module only (like the redundant-annotation block below): a graph
-    // lint carries other modules' findings, whose positions do not map onto
-    // `src` (the entry source being rewritten).
+    // Entry module only, like the redundant-annotation block below: a graph lint
+    // carries other modules' findings, whose positions do not map onto `src`.
     if cliLintModAt(k) == 0 && ln >= 0 && ln < starts.length {
       const off = starts[ln] + col
       if code == "prefer-const" {
@@ -1851,15 +1779,10 @@ function cliCollectFixes(src: string) {
     }
     k = k + 1
   }
-  // Redundant type annotations: rewrite `let x: T = init` → `let x = init` by
-  // replacing the span [name-end, `=`-start) — i.e. `: T ` — with a single space
-  // (the `= init` is kept). The checker computed the span (its end is the
-  // assignment `=`, found by a depth-aware token scan, so a multi-token or
-  // function-type annotation is handled correctly).
-  // Entry module only: in a graph compile every module's AST is merged, but only
-  // the ENTRY's findings (`redunModuleAt == 0`) carry positions that map onto `src`
-  // (the entry source being rewritten). Single-file mode has no module table, so
-  // `modOfTok` returns 0 throughout and nothing is filtered.
+  // Redundant type annotations: rewrite `let x: T = init` → `let x = init` by replacing
+  // the span from the name end to the `=` with a single space. The checker computed
+  // that span with a depth-aware token scan, so a multi-token or function-type
+  // annotation is handled. Entry module only: only the entry's positions map onto `src`.
   let rk = 0
   while rk < redunCount() {
     if redunModuleAt(rk) == 0 {
@@ -1880,9 +1803,8 @@ function cliCollectFixes(src: string) {
     }
     rk = rk + 1
   }
-  // Order the edits by start offset ASCENDING (insertion sort over the three
-  // parallel columns), so `cliApplyFixEdits` can splice in one forward pass and
-  // so an edit's INDEX is stable across the verify trials.
+  // Order the edits by start offset ascending, so `cliApplyFixEdits` can splice in one
+  // forward pass and an edit's index stays stable across the verify trials.
   let a = 1
   while a < pos.length {
     const kp = pos[a]
@@ -1912,11 +1834,10 @@ function cliCollectFixes(src: string) {
   0
 }
 
-// `src` with every edit whose `keep` flag is set applied. A SINGLE forward pass
-// into a code-point buffer: copy the gap before each edit, append its replacement,
-// skip the replaced span — O(n + edits). (Splicing the whole string per edit was
-// O(edits × len), pathological on the large compiler files.) The two safe fixes
-// never overlap; a defensive `>= cur` guard drops any that somehow would.
+// `src` with every edit whose `keep` flag is set applied. A single forward pass into a
+// code-point buffer: copy the gap before each edit, append its replacement, skip the
+// replaced span. The two safe fixes never overlap; a defensive `>= cur` guard drops
+// any that somehow would.
 function cliApplyFixEdits(src: string, keep: i32[]) {
   const buf: i32[] = []
   let cur = 0
@@ -1924,9 +1845,8 @@ function cliApplyFixEdits(src: string, keep: i32[]) {
   while e < cliFixEditPos.length {
     const p = cliFixEditPos[e]
     if keep[e] != 0 && p >= cur {
-      // The gap and the replacement both go in as CODE POINTS. `src.slice(cur, p)` is an
-      // O(1) view since Stage 2b, so routing the gap through a slice costs nothing and
-      // buys the unit: `buf.push(src[g])` would push bytes into a code-point buffer.
+      // The gap and the replacement both go in as code points: `buf.push(src[g])` would
+      // push bytes into a code-point buffer, and `src.slice` is an O(1) view.
       pushCps(buf, src.slice(cur, p))
       pushCps(buf, cliFixEditTxt[e])
       cur = p + cliFixEditLen[e]
@@ -1937,16 +1857,12 @@ function cliApplyFixEdits(src: string, keep: i32[]) {
   fromCodePoints(buf)
 }
 
-// ── verify-and-revert: the trial ladder (D1091) ─────────────────────────────────
-// `ok` is the verdict on the candidate `cliEntrySrc` just COMPILED (emit + engine
-// validation). Advance the phase and either start the next trial (re-enter the
-// per-file check over a new in-memory candidate) or commit.
-//   ALL  ok → commit everything; broken → ask whether the file built at all.
-//   BASE broken → the file did not build BEFORE, so no edit can have broken it:
-//        commit everything, exactly as `--fix` behaved before this ladder.
-//   BASE ok  → greedy: start from the empty (known-good) set and offer one edit
-//        at a time, keeping only those that leave the file building.
-//   ONE  → record the verdict for `cliFixTrial`, then offer the next edit.
+// ── verify-and-revert: the trial ladder (D1091) ──────────────────────────────
+
+// `ok` is the verdict on the candidate `cliEntrySrc` just compiled. Advance the phase
+// and either start the next trial or commit: `ALL` ok commits everything, broken asks
+// whether the file built at all; `BASE` broken commits everything, since no edit can
+// have broken it; `BASE` ok starts greedy from the empty set; `ONE` records one edit.
 function cliFixVerdict(ok: i32) {
   const n = cliFixEditPos.length
   if cliFixPhase == FIXP_ALL {
@@ -2030,10 +1946,9 @@ function cliStartFmtFile() {
   cliState = ST_FMT_READ
   CMD_READ_FILE
 }
-// One stderr line for a failed `fmt` of `path`; `status` is `cliFormatNow`'s
-// nonzero result. An unparseable INPUT (1) reports its first parse diagnostic;
-// a round-trip gate trip (2) is a FORMATTER bug — the file was left unchanged,
-// and the message says so loudly.
+// One stderr line for a failed `fmt` of `path`; `status` is `cliFormatNow`'s nonzero
+// result. An unparseable input (1) reports its first parse diagnostic; a round-trip
+// gate trip (2) is a formatter bug and leaves the file unchanged, which it says loudly.
 function cliFmtFailNote(path: string, status: i32) {
   if status == 2 {
     cliFmtBug = cliFmtBug + 1
@@ -2057,11 +1972,10 @@ function cliFmtFailNote(path: string, status: i32) {
   0
 }
 
-// End of the fmt work-list: compute the exit code and drain any accumulated
-// stderr lines (`--check` drift reports, parse-error / gate-trip notes). Drift
-// gates only under `--check` (exit 1); an unparseable input outranks drift
-// (exit 2); a round-trip gate trip outranks both (exit 3 — a formatter bug must
-// never look like mere drift).
+// End of the fmt work-list: compute the exit code and drain any accumulated stderr
+// lines. Drift gates only under `--check` (exit 1); an unparseable input outranks
+// drift (exit 2); a round-trip gate trip outranks both (exit 3), since a formatter bug
+// must never look like mere drift.
 function cliFmtFinish() {
   cliExit = 0
   if cliFmtCheck != 0 && cliFmtDrift > 0 { cliExit = 1 }
@@ -2073,10 +1987,8 @@ function cliFmtFinish() {
 }
 
 export function cliNext() {
-  // Dispatch on a LOCAL copy of the state: `cliState == N` would narrow the
-  // global to the literal `N`, and a later `cliState = …` write would then be
-  // checked against that narrowed singleton. Narrowing the local instead leaves
-  // the global free to take the next state.
+  // Dispatch on a local copy of the state: `cliState == N` would narrow the global to
+  // the literal `N`, and a later `cliState = …` write is then checked against that.
   const st = cliState
   if st == ST_INIT {
     cliParseArgs()
@@ -2162,16 +2074,16 @@ export function cliNext() {
       cliFileIdx = cliFileIdx + 1
       return cliStartFile()
     }
-    // Check the file MODULE-AWARE (resolving its imports). For --fix, cliCheckCurFile
-    // applies the safe edits AFTER the resolved check (so the types are reliable),
-    // writes the fixed source, and re-enters here via ST_FIX_WROTE.
+    // Check the file module-aware, resolving its imports. For `--fix`,
+    // `cliCheckCurFile` applies the safe edits after the resolved check, writes the
+    // source, and re-enters here via `ST_FIX_WROTE`.
     cliEntrySrc = cliFileSrc
     cliSrcCachePut(cliCurFile, cliFileSrc, 1)
     return cliBeginCheck()
   }
   if st == ST_FIX_WROTE {
-    // The fixed file was written; re-check the fixed source (already in cliEntrySrc)
-    // module-aware for the report. cliFileFixed == 1 stops cliCheckCurFile re-fixing.
+    // Re-check the fixed source (already in `cliEntrySrc`) module-aware for the report.
+    // `cliFileFixed == 1` stops `cliCheckCurFile` re-fixing.
     return cliBeginCheck()
   }
   if st == ST_CHECK_FETCH {
@@ -2182,10 +2094,9 @@ export function cliNext() {
     return cliFetchOrCheckFile()
   }
   if st == ST_FMT_STDIN {
-    // stdin formatted to stdout (`… | vl fmt`); `--check` reports drift via exit.
-    // A failed format (parse error / gate trip) passes the INPUT through so a
-    // mid-pipeline `vl fmt` never eats the data — the note + nonzero exit carry
-    // the failure. Finishing through the (empty) work-list drains the note.
+    // stdin formatted to stdout; `--check` reports drift through the exit code. A
+    // failed format passes the input through so a mid-pipeline `vl fmt` never eats the
+    // data — the note and nonzero exit carry the failure.
     cliCurFile = "<stdin>"
     cliFiles = []
     cliFileIdx = 0
