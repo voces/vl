@@ -366,6 +366,19 @@ CHECKER owed the diagnosis.
 interleaves two halves; only `self-lint + fmt-check clean` means both passed. Never put a
 gate and a commit in the same command — a non-zero exit scrolls past unread.
 
+**QUOTE THE INSTRUMENT'S OUTPUT, NOT ITS SUMMARY — and a subset check has to say what it
+compared.** Three ways a correct tool produced a wrong sentence on 2026-09-02/03. A grader was
+run on a PARAGRAPH and its "no Repro block" was relayed as the row's defect; one `grep` on the
+row refuted it, so check the INPUT has the defect before blaming the instrument (D957). Two
+versions of a function were compared by their `is X` arm NAMES, read "identical", and were one
+step from being reported as "the detector lost a pair" — the BODIES differed by 35 lines and
+the fall was a genuine merge (#2465): a check that is a strict subset of the right one returns a
+result indistinguishable from the right one's, so say what was compared. And a ratchet's FALL
+is not self-explaining: "it went down" and "it went down because #2465 added the arm" are
+different confidence levels, and only the second rules out a detector that stopped seeing
+something — `scripts/ladder-budget.py --why` names the entries that left since the baseline's
+commit, and every ratchet with a baseline should be able to.
+
 `vl fmt -w` takes **one path per run**; a multi-path call fails and formats nothing.
 
 ## Disassembly — `wasm-dis` is here, it is just not on `PATH`
