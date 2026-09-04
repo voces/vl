@@ -5242,6 +5242,16 @@ disagreement it found; it does not teach the feature.**
 per parameter for an inference hole (`?g.0`) and NOT unique for a declared one — two functions
 may both spell theirs `T`, and a shared key would let one generic's demand refuse the other's
 calls. `docs/constraints-design.md` §7.7 is the record.
+
+**And the ruling applies to what an open hole may be SOLVED to, not only to what it may be
+asked for — D1520.** The un-annotated-parameter solve took the first concrete destination a
+hole flowed into, and a multi-arm UNION destination is not one: `assignable` admits a hole
+against `i32 | Err` because ANY arm would do, so adopting the whole union states something the
+position never said. `function tryParse(x): i32 | Err { if x > 5 { … }; x * 2 }` then refused
+its own `x > 5` — a diagnostic upstream of the return that caused the pin, which is what made
+it unreadable. A union destination defers to the call, exactly as a member read does. A
+LITERAL union (`"a" | "b"`, `0 | 1`) is the exception and stays solvable: one rep, one base,
+one answer.
 ## Evaluation order is SOURCE order, for every expression list in the language (2026-09-03) — D1510, BUILT
 
 **Argument lists, list literals, map stores, struct-literal initialisers, union-arm initialisers
