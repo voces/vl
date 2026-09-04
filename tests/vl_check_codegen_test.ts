@@ -1090,8 +1090,11 @@ Deno.test({
     // this a real replacement for its MECHANISM half: the wording that says the
     // program is not at fault, the engine's own reason passed through, and NO
     // emit-stage marker (the emitter ran to completion; the corruption is after it).
-    if (!err.includes("not valid wasm")) {
+    if (!err.includes("failed to validate")) {
       throw new Error(`expected the invalid-module diagnostic, got:\n${err}`);
+    }
+    if (!err.includes("this is a bug in vl, not in your program")) {
+      throw new Error(`expected the "not your program" wording (D1578), got:\n${err}`);
     }
     if (!err.includes("type mismatch")) {
       throw new Error(`expected the engine's own reason to be passed through, got:\n${err}`);

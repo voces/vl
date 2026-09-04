@@ -13893,14 +13893,15 @@ function emitIfExprRef(
     // WASM (`expected (ref $type), found (ref null $type)`) — measured at `str`, `strlist`,
     // `list` and `map`. A non-nullable join, or a binding annotated `T | null` whose arms
     // are both non-null, stays non-null: the value widens on store.
-    if noElse || nodeTyIsNullable(ifIx) {
+    const nulJoin = noElse || nodeTyIsNullable(ifIx)
+    if nulJoin {
       fbValtypeNullable(kind, slot) // `(ref null $ht)` result blocktype
     } else {
       fbValtype(kind, slot) // ref result blocktype `(ref $ht)`
     }
     const savedTop = narrowTop
     const narrowed = setNarrowFromCond(s.ifCond, fnIx)
-    const rcT = emitRefIfArm(body, s.ifThen, fnIx, kind, slot)
+    const rcT = emitRefIfArm(body, s.ifThen, fnIx, kind, slot, nulJoin)
     if narrowed { restoreNarrow(savedTop) }
     if rcT < 0 { return -1 }
     fbElse() // 0x05 else
@@ -13917,7 +13918,7 @@ function emitIfExprRef(
       if els is IfStmt {
         rc = emitIfExprRef(body, s.ifElse, fnIx, kind, slot)
       } else {
-        rc = emitRefIfArm(body, s.ifElse, fnIx, kind, slot)
+        rc = emitRefIfArm(body, s.ifElse, fnIx, kind, slot, nulJoin)
       }
     }
     if narrowedElse { restoreNarrow(savedElseTop) }
@@ -14021,12 +14022,16 @@ function ifArmNoValueFail(what: string, blockIx: i32) {
 // emitted in the join rep. Re-seeds `pendingStructIdx` (struct arms) /
 // `pendingListKind`+`pendingListSlot` (ref-list arms) after the prelude — the previous
 // arm's emit consumed the pending seed, and so can a prelude statement.
+//
+// `nulJoin` is the blocktype the caller wrote, threaded rather than re-derived so the
+// declaration and the arm's recover cannot disagree about the result's nullness (D1577).
 function emitRefIfArm(
   body: i32[],
   blockIx: i32,
   fnIx: i32,
   kind: VKind,
   slot: i32,
+  nulJoin: boolean,
 ) {
   const b = P.nodes[blockIx]
   if b is Block {
@@ -14054,7 +14059,17 @@ function emitRefIfArm(
         if kind == "str" && exprIsLitAtom(tv, fnIx) {
           return emitIfArmClose(emitAtomToStr(body, tv, fnIx))
         }
-        return emitIfArmClose(emitExpr(body, tv, fnIx))
+        // D1577 — A NON-NULL BLOCKTYPE IS A DELIVERY, so an arm whose REP is the join
+        // kind's nullable niche owes the same `ref.as_non_null` the return / argument /
+        // binding boundaries make (`nulNicheRecoverOwed`, D1115). A nested-struct field is
+        // STORED `(ref null $S)` while its TYPE is not nullable, so two `s.ret` arms pushed
+        // `(ref null $S)` under a `(ref $S)` result: `vl check` rc 0, invalid wasm. Under a
+        // NULLABLE blocktype nothing is owed — there the niche IS the join's own rep.
+        const rcV = emitExpr(body, tv, fnIx)
+        if rcV >= 0 && !nulJoin {
+          if nulNicheRecoverOwed(kind, tv, fnIx) { fbRefAsNonNull() }
+        }
+        return emitIfArmClose(rcV)
       }
     }
     return ifArmNoValueFail("if-expression arm", blockIx)
