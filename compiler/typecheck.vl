@@ -1082,6 +1082,17 @@ let nhPendTys: i32[] = []
 let nhPendDepths: i32[] = []
 let nhUnfilledIxs: i32[] = []
 
+// A `??` TYPED AGAINST AN OPEN HOLE IS A PROMISE, NOT AN ANSWER (D1589). `x ?? d` read
+// BEFORE the fill takes `nonNullTy` of a `nInner == -1` nullable, which is the HOLE ITSELF —
+// so the bank aliases the very node the fill later mutates, and `print(x ?? 0)` reads back
+// `i32 | null` for an expression the `??` lowers unboxed. These three parallel arrays hold the
+// `??` NODE, the hole's arena index and the ANSWER the read was given, until the fill;
+// `fillCoalHoleNodes` re-derives each one against the resolved inner, and refuses a fill that
+// does not fit the answer already checked against.
+let chPendNodes: i32[] = []
+let chPendTys: i32[] = []
+let chPendGiven: i32[] = []
+
 // FLOW-NARROWED PROPERTY PATHS (the host's `narrowedPaths` overlay): a stack of
 // `key → type-arena index` entries (`"o.v" → i32`) overlaid while a branch body is checked,
 // plus per-scope frame marks so `popScope` unwinds what that scope pushed. Bare-NAME
@@ -1314,6 +1325,74 @@ function noteNullHole(ty: i32, at: i32) {
   nhPendIxs.push(at)
   nhPendTys.push(ty)
   nhPendDepths.push(T.scopes.length - 1)
+  0
+}
+
+// May a `??` over an OPEN hole answer with its DEFAULT's type (D1589)? Only for a default
+// that is itself a settled non-null type: a nullable default keeps the whole `??` nullable
+// (the rule the arm below states), and a hole-bearing or error default has no answer to
+// borrow. Everything else falls through to the pre-existing `nonNullTy` path unchanged.
+function coalHoleDeferOk(rt: i32) {
+  if rt < 0 { return false }
+  if rt == TY_ERR { return false }
+  if isNullTy(rt) { return false }
+  if tyHasHole(rt) { return false }
+  const r = T.tys[rt]
+  if r is TyNullable { return false }
+  true
+}
+
+// Record a `??` whose LHS was still an open A-infer-null hole when it was typed, with the
+// answer it was given (D1589).
+function noteCoalHole(at: i32, ty: i32, given: i32) {
+  chPendNodes.push(at)
+  chPendTys.push(ty)
+  chPendGiven.push(given)
+  0
+}
+
+// Re-derive every pending `??` over the hole `ty`, now that its inner is known. Runs at the
+// FILL, the first moment the answer exists — and it is a VALIDATION as much as a re-bank:
+// the read was already checked against `given`, so a fill whose inner does not fit is a
+// disagreement that has to be named, not banked over.
+//
+// The derivation is the `??` arm's own tail, re-asked: the result IS the non-null inner when
+// the default fits it, else their join. `assignableExpr` (not `assignable`) so an inline
+// object-literal default coerces field-wise, exactly as it does at the original site.
+function fillCoalHoleNodes(ty: i32) {
+  let i = 0
+  while i < chPendNodes.length {
+    if chPendTys[i] == ty {
+      const cn = chPendNodes[i]
+      const nd = P.nodes[cn]
+      if nd is BinExpr {
+        const inner = nonNullTy(ty)
+        const dft = nodeTyIxOf(nd.binRight)
+        let res = inner
+        if dft >= 0 {
+          if !assignableExpr(nd.binRight, dft, inner) {
+            res = joinTys(inner, dft)
+          }
+        }
+        const given = chPendGiven[i]
+        if assignable(res, given) {
+          if cn < nodeTyIx.length { nodeTyIx[cn] = res }
+        } else {
+          tErr(
+            "`??` here was typed " +
+              tyToStr(given) +
+              " — the assignment below makes the binding " +
+              tyToStr(ty) +
+              ", so the read is " +
+              tyToStr(res) +
+              "; annotate the binding",
+            cn,
+          )
+        }
+      }
+    }
+    i = i + 1
+  }
   0
 }
 
@@ -3659,6 +3738,9 @@ export function initChecker() {
   nhPendTys = []
   nhPendDepths = []
   nhUnfilledIxs = []
+  chPendNodes = []
+  chPendTys = []
+  chPendGiven = []
   npKeys = []
   npTys = []
   npInvBy = []
@@ -34316,6 +34398,9 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
             if asgCt.nInner < 0 {
               asgCt.nInner = rt
               tyMutEpoch = tyMutEpoch + 1 // nullable inner pinned in place
+              // D1589 — A READ TYPED BEFORE THE FILL BANKED THE HOLE ITSELF. Re-derive
+              // every such `??` here, the moment its non-null part exists.
+              fillCoalHoleNodes(asgCur)
             }
             // Bank the DECLARED type before shadowing it. The narrowing itself is
             // unchanged — reads still see the non-null type, which is what the
@@ -34377,6 +34462,22 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
     }
     const lt2 = T.tys[lt]
     if lt2 is TyNullable {
+      // D1589 — AN OPEN HOLE HAS NO NON-NULL PART YET, so `nonNullTy` hands the NULLABLE
+      // back and every answer below aliases the arena node the fill later mutates: the read
+      // banked `_ | null`, the fill made that `i32 | null`, and `print(x ?? 0)` delivered
+      // the box into a slot `emitCoalesce` had lowered unboxed.
+      //
+      // THE ANSWER `??` CAN ALWAYS GIVE IS THAT THE RESULT IS NOT NULL — a non-null default
+      // is what the null path yields, whatever the hole becomes. So the default's type is
+      // the answer, and `fillCoalHoleNodes` re-derives it against the resolved inner the
+      // moment the fill arrives; a fill that does NOT fit is refused there rather than
+      // silently keeping a type the read has already been checked against.
+      if lt2.nInner < 0 {
+        if coalHoleDeferOk(rt) {
+          noteCoalHole(ix, lt, rt)
+          return rt
+        }
+      }
       const innerFull = nonNullTy(lt)
       // A LITERAL default re-encodes at an inner `f32`, so keep the result f32 — else
       // `joinTys` widens `f32 + f64` (or `f32 + i32`) and a downstream `f32` slot rejects
