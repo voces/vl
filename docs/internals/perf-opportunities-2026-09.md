@@ -393,6 +393,93 @@ inline `array.copy` **2,366 -> 5,420**; `__str_concat__` self% of a self-compile
 grew 1,833,871 -> 1,992,504 bytes. `tests/cases` byte-identity: 2,792 modules, 2,184
 identical, 107 differ (each carries a 3+ chain or an accumulator), 501 refuse under both.
 
+### D7 · Inline unroll or a runtime helper? INLINE STAYS (measured 2026-09-03)
+
+A's fuse is UNROLLED at every site, which is a large part of why the seed has grown. The
+alternative was BUILT and measured rather than argued: a FIXED-ARITY family `__str_cat3__`
+… `__str_cat8__`, one function per arity, minted under `aUsed` beside the string trio, its
+body the SAME emitter the inline unroll uses. That is the helper's BEST case — a site's
+parts are already on the wasm stack in left-to-right order, which is a call's operand
+order, so a site is `n` evaluations plus a `call`, with no parts array to allocate, no new
+heap type and no pool. A THIRD arm brackets the crossover: the same family over arities
+**5..8 only**, leaving 3 and 4 inline. All three reached their own self-compilation
+fixpoint at `a94037b0` and move **0 of 7,564** distilled-corpus cells.
+
+ARITY HISTOGRAM of the compiler's own fused chains — an `i32.const 1000000+n` marker
+emitted per site by a throwaway instrumented compiler, counted in the disassembly of the
+module it produced. **652 chains, 2,751 parts, mean 4.22:**
+
+| arity | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| sites | **331** | 113 | 110 | 36 | 28 | 9 | 10 | 5 | 3 | 1 | 1 | 1 | 4 |
+
+50.8% at arity 3, 68.1% at <= 4, 85.0% at <= 5, 94.8% at <= 7; only **5.2% at >= 8**.
+
+| | inline (shipped) | hybrid [5,8] | helper [3,8] |
+| --- | ---: | ---: | ---: |
+| fixpoint seed | 2,043,139 B | 1,994,687 (−2.37%) | **1,922,054 (−5.93%)** |
+| `vl check --codegen tests/cases` (2,792 programs), min user CPU of 4 | **51.43 s** | 51.62 | 51.70 |
+| … per-round ratio against inline, 4 rounds | 1.000 | 1.006 / 1.017 / 1.005 / 1.004 | 1.008 / 1.016 / 1.011 / 1.005 |
+| L2 self-compile, same source, min / med user CPU of 6 | 7.86 / 12.04 s | 7.88 / 11.93 | 7.84 / 12.12 |
+| 100M × arity-3 chain, min / med user of 8 | **1.780 / 2.200 s** | *1.750 / 2.230* | 1.970 / 2.300 |
+| 100M × arity-5 | **2.400 / 3.045 s** | 2.570 / 3.275 | 2.550 / 3.265 |
+| 100M × arity-8 | **3.800 / 4.385 s** | 3.830 / 4.420 | 3.890 / 4.515 |
+| 100M × arity-15 — CONTROL, all three inline | 7.430 / 9.520 s | *7.330 / 9.380* | *7.300 / 9.565* |
+| seed COLD Cranelift (`vl check tiny.vl`, no sidecar), min user of 5 | 11.14 s | — | **10.66 s** |
+| seed WARM (`.cwasm` sidecar), wall | 0.01 s | — | 0.01 s |
+| Deno `new Module` + `Instance`, min of 15 | 3.1 + 1.3 ms | 3.1 + 1.3 | **2.9 + 1.3** |
+| a string module with NO 3+ chain — default / `-O` / `-O3` | **1,902** / 275 / 196 B | — | 3,571 / 275 / 196 B |
+| `std/json.vl` — default / `-O` / `-O3` | **34,589** / 22,176 / 22,392 | — | 35,483 / **21,841** / **22,164** |
+| `std/fmt.vl` — default / `-O` / `-O3` | **19,175** / 11,810 / 11,318 | — | 20,385 / **11,741** / **11,272** |
+
+Every timing runs ALL THREE ARMS SIMULTANEOUSLY, one pinned core each, cores rotated per
+round, so whatever else the box is doing is common-mode. Corpus loads 6–43, runtime 13–45,
+self-compile 8–40. Base: `a94037b0`.
+
+**THE ITALIC CELLS ARE CONTROLS, AND THEY SET THE RESOLUTION.** At arity 15 no arm's window
+applies and at arity 3 the hybrid is inline, so those cells duplicate the inline arm's own
+code — they read **0.983 / 0.987 / 0.983** on the minimum, so the runtime floor is **±2%**.
+Every treated cell sits outside it and the two treated arms AGREE where both fire: arity 5
+reads 1.071 / 1.062, arity 8 reads 1.008 / 1.024.
+
+**THE HELPER'S PRICE IS A FIXED CALL, AND IT DECAYS EXACTLY LIKE ONE:** **+10.7% at arity 3,
++6.2% at arity 5, +2.4% at arity 8**, against a ±2% control. **85.0% of the compiler's own
+652 chains are arity 5 or below**, which is where the call is worth the most.
+
+**AND THE COMPILE SIDE NEVER FAVOURS IT.** The 2,792-program `--codegen` sweep puts inline
+first in ALL FOUR rounds (+0.5% to +1.6% for the helper, +0.4% to +1.7% for the hybrid), and
+the one-big-program L2 self-compile is a dead heat (0.997 min / 1.007 med). So the rule's
+FIRST term already decides, and the seed-size tie-breaker never applies.
+
+**WHAT THE 121 KB WOULD HAVE BOUGHT, NOW THAT #2451 HAS LANDED.** The warm `.cwasm` path —
+what every `vl` in a native step pays since both engine tags are warmed — reads **0.01 s in
+both arms**, so seed size is not a cost there at all. The one seed-size-sensitive path is
+the cold Cranelift compile, **11.14 → 10.66 s user (−4.3%)**, tracking the −5.93% size, and
+#2451 removed ~33 of those per step. In Deno, `new WebAssembly.Module` + `Instance` moves
+**4.4 → 4.2 ms**. §A6's "shrinking the seed buys the Rust host's cold path and nothing else"
+is unchanged; the cold path is now gone.
+
+**AND THE FAMILY IS A COMPILER-SCALE WIN ONLY.** Its six functions are ~1,669 bytes every
+string-using module pays whether or not it holds a 3+ chain — **+88%** on a two-part-concat
+module, **+2.6%** on `std/json.vl`, **+6.3%** on `std/fmt.vl` at the DEFAULT rung. Only a
+module with hundreds of chain sites earns them back, and the compiler is the only one here.
+
+**AND BINARYEN DOES NOT FOLD THE INLINE COPIES**, so "`-O3` erases the difference" is false:
+at `-O3` the helper arm stays 0.2–1.0% smaller. What `wasm-opt` DOES do is delete an unused
+family entirely (the chainless module is 196 B in both arms), so the fixed cost above is a
+default-rung cost only.
+
+**THE RULE, AS A NUMBER.** A helper window pays only where the fixed call is smaller than
+the noise it hides in — measured, that is **arity 8 and above (+2.4%, against a ±2%
+control)**, and **only 5.2% of the compiler's chains are there**, worth ~15 KB of a 2.04 MB
+seed against ~5.9 KB added to every string-using module without such a chain. Below arity 8
+the call costs 6–11% of the chain's own time and the compile-side sweep 1%. So no window
+pays, and the unroll stays. The variant that could change this is named and NOT built: mint
+the family PER ARITY and only where a chain of that arity exists, from a syntactic pre-scan
+in `collectA`. That restores byte-identity for a chainless module and keeps the seed win, at
+the cost of a whole-arena pass and a `scan-budget` entry — for a seed saving now worth
+≈1 s of CPU a native step.
+
 ---
 
 ## E · What this survey could NOT measure

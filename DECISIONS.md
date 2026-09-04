@@ -5078,6 +5078,50 @@ moves 1.83 MB -> 1.97 MB) and allocates exactly once. Ropes (Part D's option C) 
 string REP for every program to fix a pattern a static analysis can see in most of them, so
 they stay the owner's held option rather than this PR's.
 
+**The fuse stays INLINE, and the helper was BUILT before being refused (2026-09-03).** The
+paragraph above declined a variadic `__str_concat_n__` on the cost of its CARRIER — a parts
+array to allocate, an `(array (ref $str))` heap type to mint. That is a reason about one
+helper SHAPE, and the best shape has neither cost, so the best shape was implemented and
+measured: a FIXED-ARITY family `__str_cat3__` … `__str_cat8__`, one function per arity,
+minted under `aUsed`, its body the same emitter the unroll uses. A site's parts are already
+on the wasm stack in left-to-right order, which is a call's operand order, so a site is `n`
+evaluations plus a `call`. A third arm covered arities 5..8 only, leaving 3 and 4 inline.
+All three reached their own self-compilation fixpoint at `a94037b0` and moved 0 of 7,564
+distilled-corpus cells.
+
+THE RULE'S FIRST TERM ALREADY DECIDES, SO THE SEED-SIZE TIE-BREAKER NEVER APPLIES. A
+`vl check --codegen` sweep of all 2,792 `tests/cases` programs, three arms pinned to a core
+each and run SIMULTANEOUSLY so the box is common-mode, puts INLINE first in **all four
+rounds** (helper +0.8 / +1.6 / +1.1 / +0.5%); the one-big-program L2 self-compile is a dead
+heat (0.997 min, 1.007 median of six). Nothing on the compile side favours the helper.
+
+AND THE RUNTIME PRICE IS A FIXED CALL, DECAYING EXACTLY LIKE ONE: over 100,000,000 chains,
+**+10.7% at arity 3, +6.2% at arity 5, +2.4% at arity 8**. The CONTROLS are what make those
+readable — at arity 15 no arm's window applies and at arity 3 the hybrid is inline, so those
+cells duplicate the inline arm's own code and read 0.983 / 0.987 / 0.983, a **±2% floor** —
+and the two treated arms agree wherever both fire (arity 5: 1.071 / 1.062). **85.0% of the
+compiler's own 652 fused chains are arity 5 or below**, which is exactly where the call
+costs the most. An earlier UNPINNED run had put the arity-3 penalty at +11.9% and then, on a
+loaded box, at "inside the noise"; only the pinned design with its own control settled it.
+
+THE 121 KB THE HELPER SAVES (2,043,139 → 1,922,054, −5.93%; the 5..8 window reads 1,994,687)
+IS ALSO WORTH LESS THAN IT LOOKS. Since #2451 warms both engine tags, the warm `.cwasm` path
+is what every `vl` in a native step pays, and it reads **0.01 s in both arms**. The one
+size-sensitive path left is the cold Cranelift compile — 11.14 → 10.66 s user, −4.3%, which
+#2451 removed ~33 of per step — and Deno's `new WebAssembly.Module` + `Instance`, 4.4 → 4.2
+ms. Against that the family's six functions are **+1,669 B on every string-using module at
+the default rung**, chain or no chain: +88% on a two-part-concat module, +2.6% on
+`std/json.vl`, +6.3% on `std/fmt.vl`. (`wasm-opt` does not outline the repeated copy
+sequence — at `-O3` the helper arm is still 0.2–1.0% smaller — but it does delete an unused
+family, so that fixed cost is a default-rung cost only.)
+
+THE VARIANT THAT COULD CHANGE THIS IS NAMED AND NOT BUILT: mint the family PER ARITY and
+only where a chain of that arity exists, from a syntactic pre-scan in `collectA`. That
+restores byte-identity for a chainless module and keeps the seed win, at the cost of a
+whole-arena pass and a `scan-budget` entry, for a saving now worth ≈1 s of CPU a native
+step. Numbers, loads, controls and the arity histogram:
+`docs/internals/perf-opportunities-2026-09.md` §D7.
+
 **The loop-local accumulator.** `let s = ""` then `s = s + piece` inside a loop appends IN
 PLACE into slack the binding's own grow path allocated (capacity doubling), instead of
 allocating an exact-fit backing and copying the prefix per step. **The buffer IS the
@@ -5147,6 +5191,23 @@ so its byte count describes that compiler's codegen, not this one's. Measured at
 one commit, which is larger than the bar itself. So ci-native runs `--check` immediately after
 `--prove-fixpoint`, and that reading is the deciding one; `gate.sh`'s row grades whatever seed
 is on disk and is informational when the local seed is one rung short.
+
+**THE INVARIANT: size only a fixpoint-converged seed — `--prove-fixpoint`, or two passes that
+agree.** A second instance was measured on a different branch the same day: ONE
+`refresh-compiler.sh` pass off a stale seed read **1,844,776** bytes, and two further passes
+converged at **1,997,993** — an under-report of ~150 KB, or 7.7%. The failure mode is not a
+near miss but a SIGN ERROR: anyone sizing the seed at that first rung would have reported the
+compiler had SHRUNK by 7.5% against the 1,996,118 baseline, and a gate that only alarms on
+growth would have passed it in silence. One rung is not a small sample of the right number; it
+is the right measurement of a different artifact.
+
+**The baseline moved to 2,043,139 at `a94037b0`, and the +2.4% it absorbs is NOT one
+landing's.** It was earned between `ff4b5f04` and `a94037b0` — the clause-1 branch read
+1,997,993, the `as` trio 2,001,850, #2467 2,037,320, #2468 2,039,920 — so the rewrite is
+bookkeeping for a series, not a price this ruling paid. It is recorded here because the
+n-ary unroll's share of those bytes is now a DECIDED cost (see the string-building section:
+the helper that would have removed ~121 KB of them was built, measured and refused), and a
+ratchet carrying a stale baseline reds on the next landing for reasons that are not its own.
 
 ## An unbounded `<T>` is an ENTIRELY OPEN HOLE, and its refusal is the hole's sentence (owner, 2026-09-03) — D1431, BUILT
 
