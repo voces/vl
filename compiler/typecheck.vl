@@ -2320,6 +2320,10 @@ let nwBodyScopedNames: {[string]: i32} = Map()
 // sentence. Saved and restored beside `T.curRet` in `checkFuncDeclNode`; "" at
 // module scope and for an anonymous lambda.
 let curFnEscName = ""
+// Is the enclosing function's void return the bare-`return` pin rather than an annotation?
+// Read only to explain a `return <expr>` mismatch no written `: void` accounts for. Saved
+// and restored beside `curFnEscName`.
+let curFnBareRetVoid = false
 // Flat-record sidecar: the layout of every `flat type N = { … }`, built by `resolveFlatLayouts`
 // and read by the `N.size` / `N.field` fold in `checkMemberNode`. Offsets are the running sum of
 // the declared field widths and the compiler never inserts a byte — no alignment, no pad, no
@@ -23381,6 +23385,51 @@ function ifChainExhausts(ifIx: i32) {
   true
 }
 
+// Does the block hold a bare `return`, recursing into if/while/for bodies but never into a
+// nested function, whose returns are its own? A bare `return` is legal only where nothing is
+// owed, so one anywhere in a body is the author writing `: void`; the checker pins the return
+// type from it and `computeVoidFns` asks this same predicate for the functype (D1600).
+export function blockHasBareReturn(blockIx: i32): boolean {
+  const b = P.nodes[blockIx]
+  if b is Block {
+    const stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      const st = P.nodes[stmts[i]]
+      if st is RetStmt {
+        if st.retArg < 0 { return true }
+      } else if st is IfStmt {
+        if ifChainHasBareReturn(stmts[i]) { return true }
+      } else if st is WhileStmt {
+        if blockHasBareReturn(st.whileBody) { return true }
+      } else if st is ForRange {
+        if blockHasBareReturn(st.frBody) { return true }
+      } else if st is ForIn {
+        if blockHasBareReturn(st.fiBody) { return true }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// The `else if` hop of `blockHasBareReturn`: a chain's arms are the same question.
+export function ifChainHasBareReturn(ifIx: i32): boolean {
+  const st = P.nodes[ifIx]
+  if st is IfStmt {
+    if blockHasBareReturn(st.ifThen) { return true }
+    if st.ifElse >= 0 {
+      const els = P.nodes[st.ifElse]
+      if els is Block {
+        if blockHasBareReturn(st.ifElse) { return true }
+      } else if els is IfStmt {
+        if ifChainHasBareReturn(st.ifElse) { return true }
+      }
+    }
+  }
+  false
+}
+
 // A function declaration: resolve param/return annotations (narrowing the Param/
 // TypeRef children), bind the signature, and check the body in a fresh scope.
 // An UN-ANNOTATED return type is INFERRED from the body — its `return`s and
@@ -23419,6 +23468,15 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
     if isVoidTy(cbExpectedRetFor(fnIx)) {
       inferring = false
       noteVoidCtxLambda(fnIx)
+    }
+  }
+  // The same flip for the same reason: a bare `return` writes `: void`, so stop inferring and
+  // take the `!inferring` ladder's `TY_VOID` default, which already discards a valued tail.
+  let bareRetVoid = false
+  if inferring {
+    if blockHasBareReturn(n.fnBody) {
+      inferring = false
+      bareRetVoid = true
     }
   }
   // The infer-stack KEY: a named function uses its name (so self-recursion is detected); an
@@ -23659,6 +23717,10 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   // is actually inside.
   const savedEscName = curFnEscName
   if n.fnName != "" { curFnEscName = n.fnName }
+  // Why this body's return type is void, for the return that disagrees with it: nobody wrote
+  // `: void`, so the mismatch has to name the bare `return` that decided it.
+  const savedBareRetVoid = curFnBareRetVoid
+  curFnBareRetVoid = bareRetVoid
   // LSP: the function name binds in the OUTER scope (decl-scope chain), but its
   // body — params + statements — is checked under this pushed scope. Record the
   // name occurrence against the enclosing decl scope before descending.
@@ -23861,6 +23923,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   const bodyTotalForRet = nodeIsTotal(n.fnBody)
   T.curRet = savedRet
   curFnEscName = savedEscName
+  curFnBareRetVoid = savedBareRetVoid
   daRestore(daSavedUnassigned)
   let tpPop = 0
   while tpPop < n.fnTyParams.length {
@@ -24916,7 +24979,11 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
     !retNaturalErr
   ) {
     if !inlayHole(retNatural) && !isNeverTy(retNatural) && ret != TY_ERR {
-      if tyEq(retNatural, ret) { recordRedundantRet(n, fnIx, ret) }
+      // A bare `return` in the body makes the un-annotated spelling void, so the annotation
+      // is load-bearing however well its type matches the tail (D1600).
+      if tyEq(retNatural, ret) && !blockHasBareReturn(n.fnBody) {
+        recordRedundantRet(n, fnIx, ret)
+      }
     }
   }
   retNatural = savedRetNatural
@@ -36953,12 +37020,29 @@ function checkForInNode(n: ForIn, ix: i32) {
 }
 // ── return ─────────────────────────────────────────────────────────────────
 
+// Where an "expected void" comes from when nobody wrote `: void`: the bare `return`
+// elsewhere in the body, which pins the return type (D1600). Empty for every other want.
+function bareRetVoidNote(want: i32): string {
+  if !curFnBareRetVoid { return "" }
+  if !isVoidTy(want) { return "" }
+  " — a bare `return` in this body makes the function void; drop it, or return no value here"
+}
+
 // Extracted from `checkNodeReal`'s `RetStmt` arm (C3: thin the dispatcher).
 function checkRetStmtNode(n: RetStmt, ix: i32) {
   const want = T.curRet
   if n.retArg < 0 {
-    if want >= 0 && !assignable(TY_VOID, want) {
-      tErr("return needs a value of type " + tyToStr(want), ix)
+    // `tyIsHole` because `assignable` waves a `TyVar` past any destination, so a declared
+    // `: T` accepted the bare return here and the emitter refused the instance (D1600).
+    if want >= 0 && (tyIsHole(want) || !assignable(TY_VOID, want)) {
+      // Both route-arounds, because either can be intended: the annotation is what makes this
+      // return illegal, so dropping it is as valid a fix as supplying a value.
+      tErr(
+        "return needs a value of type " +
+          tyToStr(want) +
+          " — return a value, or annotate this function `: void`",
+        ix,
+      )
     }
     return TY_VOID
   }
@@ -37010,6 +37094,7 @@ function checkRetStmtNode(n: RetStmt, ix: i32) {
         tyToStr(want) +
         ", got " +
         tyToStr(got) +
+        bareRetVoidNote(want) +
         charLitForStringNote(n.retArg, want),
       ix,
     )
