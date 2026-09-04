@@ -111,6 +111,28 @@ do not cross-contaminate.
 
 - sound: `is-generic-param-sound.vl`
 
+### A constant range must be able to run
+`for v in <from> to <to> [step <s>]` counts by `s` (default `+1`) and `to` is
+**inclusive**. When `from`, `to` and `s` are all compile-time constants — integer
+literals, signed or parenthesised — a range whose direction contradicts its step
+is **refused**, at the `to` token: `for i in 3 to 0 { … }` counts up from a start
+above its end, so its body can never execute. Write `3 to 0 step -1` to count
+down, or swap the bounds. A `step 0` is refused for the same reason, whether or
+not the bounds are constant. Both carry the `range-never-runs` diagnostic code
+with the folded `from`/`to`/`step` on the data channel.
+
+**A NON-CONSTANT wrong-order range still runs zero times, and says nothing.**
+That is the loop's contract, not an oversight: `for i in lo to hi { … }` with
+`hi < lo` is how "iterate a possibly-empty span" is spelled, and refusing it —
+at compile time or with a trap — would break every such idiom. Only what is
+knowable at compile time is refused. A `const` binding is *not* folded, so
+`const hi = 0; for i in 3 to hi { … }` still runs zero times silently.
+
+- rejected: `loops/range-never-runs-reject.vl`, `loops/empty-range.vl`,
+  `lint/for-step-zero.vl`
+- sound: `loops/range-direction-legal.vl` (ascending, `step -1`, equal bounds,
+  and both non-constant wrong-order forms), `loops/for-step.vl`
+
 ### Operators over inference holes
 
 An operator whose operand is an unresolved hole cannot be decided in the body — a

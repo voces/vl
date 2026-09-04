@@ -654,6 +654,75 @@ Deno.test({
   }
 });
 
+// ── D1588: the `range-never-runs` PAYLOAD ────────────────────────────────────
+// The third code on this channel, and the second to carry an answer. A constant
+// range whose direction contradicts its step never produces an iteration; the
+// three folded numbers ride `data` so a quick-fix can write the `step -1` spelling
+// without parsing the sentence. `step` is `1` for a DEFAULTED step — the message
+// spells the range the way the author wrote it, the payload spells what the loop
+// would actually do, and those are deliberately different.
+
+Deno.test({
+  name: "diag-code: a never-running constant range carries `range-never-runs` + from/to/step",
+  ignore,
+}, () => {
+  const exp = instantiate();
+  const { rc, diags } = check(exp, "let n = 0\nfor i in 3 to 0 { n = n + i }\nprint(n)\n");
+  if (rc !== 2) throw new Error(`expected rc 2 (type stage), got ${rc}`);
+  if (diags.length !== 1) {
+    throw new Error(`expected 1 diagnostic, got: ${JSON.stringify(diags)}`);
+  }
+  if (diags[0].code !== "range-never-runs") {
+    throw new Error(`expected the D1588 category, got: ${JSON.stringify(diags[0])}`);
+  }
+  sameData(diags[0].data, { from: ["3"], to: ["0"], step: ["1"] }, "defaulted step");
+  if (!diags[0].message.startsWith("this range never runs: `3 to 0` counts up (step 1)")) {
+    throw new Error(`unexpected sentence: ${JSON.stringify(diags[0])}`);
+  }
+});
+
+// A `step 0` never advances at all, which is the same rule's other half and so the
+// same category. Its bounds need not be constant, and here they are not — so the
+// payload carries `step` ALONE. A reader that assumed three keys would break on
+// this one; the absence is the point.
+Deno.test({
+  name: "diag-code: `step 0` carries the same category with `step` alone",
+  ignore,
+}, () => {
+  const exp = instantiate();
+  const { rc, diags } = check(
+    exp,
+    "let lo = 0\nlet hi = 9\nfor i in lo to hi step 0 { print(i) }\n",
+  );
+  if (rc !== 2) throw new Error(`expected rc 2 (type stage), got ${rc}`);
+  if (diags.length !== 1) {
+    throw new Error(`expected 1 diagnostic, got: ${JSON.stringify(diags)}`);
+  }
+  if (diags[0].code !== "range-never-runs") {
+    throw new Error(`expected the D1588 category, got: ${JSON.stringify(diags[0])}`);
+  }
+  sameData(diags[0].data, { step: ["0"] }, "non-constant bounds");
+  if (diags[0].message !== "a range with `step 0` never advances") {
+    throw new Error(`unexpected sentence: ${JSON.stringify(diags[0])}`);
+  }
+});
+
+// THE RUNTIME CONTRACT IS UNTOUCHED, and this is where that is pinned on the
+// diagnostic channel: a NON-CONSTANT wrong-order range raises nothing at all. It
+// still runs zero times, which is what `for i in lo to hi` over a possibly-empty
+// span has always meant.
+Deno.test({
+  name: "diag-code: a non-constant wrong-order range raises no diagnostic",
+  ignore,
+}, () => {
+  const exp = instantiate();
+  const { rc, diags } = check(
+    exp,
+    "let lo = 3\nlet hi = 0\nlet n = 0\nfor i in lo to hi { n = n + 1 }\nprint(n)\n",
+  );
+  if (rc !== 0) throw new Error(`expected rc 0, got ${rc}: ${JSON.stringify(diags)}`);
+});
+
 // ── the decoder itself, with no seed ─────────────────────────────────────────
 // `decodeDiagData` is the reader every TS consumer uses, so its edge cases are
 // pinned where the format is documented rather than in whichever consumer noticed

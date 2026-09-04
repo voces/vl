@@ -109,8 +109,6 @@ const EXPECTED_DIVERGENCES: Record<string, string> = {
     "type-aware `unreachable: exhaustive is-chain` @info — TS-only (see lint/exhaustive-is-chain-dead-else)",
   "types/struct-union-same-shape.vl":
     "type-aware `unreachable: exhaustive is-chain` @info — TS-only (see lint/exhaustive-is-chain-dead-else)",
-  "loops/empty-range.vl":
-    "the empty-range @warning is a const-eval rule the native lint pass does not implement yet — TS-only",
   "lint/generic-intersection-no-warn.vl":
     "wasm CHECKER gap: a generic intersection `T & S` reports `unknown type 'T&S'` where the TS checker accepts it (not a lint divergence)",
   "soundness/README.vl":
