@@ -10,6 +10,49 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 
 ## Types & semantics
 
+- **A HEX OR BINARY LITERAL IS A BIT PATTERN OF ITS DESTINATION'S WIDTH; A DECIMAL LITERAL IS
+  A VALUE** (2026-09-04, owner ruling: *"Let's take the literal rule"*). A radix literal
+  (`0x…`, `0b…`, `0o…`) must FIT the destination's width; a decimal literal must fit the
+  destination's value RANGE, exactly as before. Width comes from CONTEXT first — the declared
+  type of the binding, parameter, field, return or array element it is delivered to, or the
+  type of the other operand in a binary operation or comparison — and, with no context, from
+  the digit count: up to 8 significant hex digits (32 binary) is `i32`, up to 16 (64) is
+  `i64`, more is an error. Leading zeros and `_` separators are not significant. `u8` is an
+  8-bit destination and keeps its own range message. Unary minus applies to the pattern's
+  value afterwards, so `-0xFF` is −255, as in Java.
+
+  | spelling | before | ruled |
+  | --- | --- | --- |
+  | `const k: i32 = 0xb81a1aaa` | error (i64 does not fit) | −1206248790 |
+  | `fbI32Const(0x85ebca6b)` (param `i32`) | error | the pattern |
+  | `x >= 0x80000000` with `x: i64` | 2147483648 | unchanged |
+  | `const m: i64 = 0xFFFFFFFF` | 4294967295 | unchanged (low 32 bits of a 64-bit word) |
+  | `const seed = 0xEEEEEEEE` (no context) | i64 4008636142 | i32 −286331154 |
+  | `print(0xDEAD_BEEF)` (no context) | 3735928559 | −559038737 |
+  | `const big = 0x1_0000_0000` | i64 | unchanged (9 digits) |
+  | `const c: i32 = 0x1_0000_0000` | error | error (does not fit 32 bits) |
+  | `bytes.push(0xFF)` / `bytes.push(0x1FF)` (u8) | 255 / error | unchanged |
+  | `4294967295` anywhere i32 | error | unchanged |
+  | `0xFFFFFFFF == -1` (i32 peer) | false/error | true |
+
+  Precedent is Java, which is also unsigned-free and reads hex as a pattern; VL improves on it
+  by taking the width from the DESTINATION first, so a `byte b = 0xFF`-shaped case works
+  rather than needing a cast. **Declined**, for the record: an intrinsic `lo32` (owner:
+  *"intrinsics are a mystery"*), and `as%` alone — the wrap cast landed
+  alongside this and stays the answer for a COMPUTED value, where there is no pattern to
+  read; a literal is where the pattern is written and does not need a cast to say so. Reported by glean,
+  the language's first external consumer, as VL-023 (a 32-bit pattern with the top bit set
+  cannot be written as an i32) and VL-044 (`as!` traps on one, with no non-trapping form).
+
+  **The refusal the rule owes** names the width it applied and both ways out:
+  `` 0x1_0000_0000 does not fit a 32-bit destination — a hex literal is a bit pattern of the
+  destination's width; write it in decimal for its value, or give it an i64 destination ``.
+  A pattern past 64 bits is refused at the literal itself, since no VL destination is wider.
+  **Upward adoption only at an operand peer**: an i64 peer widens the literal, a 32-bit peer
+  leaves a wider one alone, so `x + 0x1_0000_0000` over an `i32` still widens to i64 rather
+  than becoming a new refusal. And unary minus is NOT peeled — the literal is then an operand
+  rather than the delivered value — which is also Java's answer (`long x = -0xFFFFFFFF` is 1).
+
 - **`T | null` IS VALUE-COMPARABLE EXACTLY WHEN `T` IS** (2026-09-03, D1180). `isEquatable`
   refused every nullable field on the stated ground that "discriminating the variant would be
   required first". That is true of a MAP (no defined equality) and of a general union (two arms
@@ -5641,3 +5684,50 @@ pattern syntax. It is `match`'s arm separator, shipped in phase 1 and already th
 literal union uses (`"b" | "c" => 2`); it applies to integer literals for the same reason, and
 refusing it here would have meant writing code to break a general feature at one scrutinee
 kind. The consumer's own example uses it.
+
+## `as%` is the wrap cast, the fourth member of the `as` family (owner, 2026-09-04)
+
+**"Let's do as% I guess."** `x as% T` wraps `x` to the target width. It never fails, so it has
+no null, no trap and no propagation — the three sad paths the exact family is built around are
+all absent, and what is left is one conversion opcode:
+
+| source → target | meaning |
+| --- | --- |
+| `i64 as% i32` | the low 32 bits, two's complement (`i32.wrap_i64`) |
+| `i32 as% u8`, `i64 as% u8` | the low 8 bits (an `i32` in 0..255 — `u8` is the domain, as in `as! u8`) |
+| `i32 as% i64` | sign-extend, same as `as`; allowed so the family is total over the integer pairs |
+| `i32 as% i32`, `i64 as% i64` | identity |
+| a float on either side | refused at check, naming `as!` / `as?` |
+| a non-numeric operand | refused at check, in the words the exact casts already use |
+
+**Why it was needed.** Every numeric cast is exact-or-fail under the 2026-09-02 ruling, so the
+one spelling that looks like "reinterpret these 32 bits" was the one that could not: the
+language's first external consumer filed it twice. `~/glean/docs/vl-issues.md` §VL-023 —
+`0xEEEEEEEE` is typed `i64` and `const x: i32 = 0xFFFFFFFF` is a lossy-conversion error, so a
+Storm hash seed, an MPQ block flag or a CRC polynomial has no spelling. §VL-044 — `f(0xb81a1aaa
+as! i32)` compiles and traps, and the workaround in three separate tools was a hand-written
+`parseHex32` shift-and-or loop. Both rows name `as% i32` as the fix they want.
+
+**Why a suffix and not a function.** The alternative was an intrinsic (`lo32(x)`, or an
+`i32bits` twin of `f32bits`). Declined: the operation is a CAST — it takes a target type, it
+composes with the same precedence, and the family already teaches that the suffix is where the
+failure mode is spelled. A fourth suffix costs one parser arm and one emitter arm; a builtin
+costs a name in the global scope forever, and would have needed a second one the day someone
+wanted `u8`.
+
+**Why the checker FOLDS a literal operand.** `0xb81a1aaa as% i32` is the constant −1206248790,
+not a runtime `i64.const` plus a wrap. The bit-pattern use is a CONSTANT use — a mask, a seed, a
+polynomial — so the fold is what makes the feature answer the request rather than approximate
+it. The fold is a `NumLit` peel, the same one the range-step fold uses, not a constant folder.
+
+**Not implemented here, and still open: a hex literal is a bit pattern.** The other declined
+alternative was to let a hex literal with 32 significant digits infer `i32` where one is
+required, which VL-023 also asks for. That is a rule about LITERAL TYPING, it interacts with
+`i64` inference everywhere and not just at a cast, and it is still under discussion — `as%`
+does not settle it and does not depend on it.
+
+**Why `%` cannot collide with the remainder operator.** The suffix is read only directly after
+the `as` keyword, and `as` is read only directly after a postfix operand — so a `%` that opens a
+binary operator always has a left operand and a `%` that spells the cast never does. `as` stays
+a contextual keyword, so a binding may still be named `as` and take an ordinary remainder.
+`tests/cases/numerics/as-pct-precedence.vl` is the fixture that pins both readings.

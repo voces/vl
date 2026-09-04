@@ -1,7 +1,7 @@
-// `emit_query.vl` — PURE classification QUERIES over the AST: binding/value-kind
-// predicates (`param*`/`let*`/`is*`/`union*`) and control-flow / valued-return /
-// arr-new scans (`if*`/`block*`/`expr*`/`nli*`). State-free; depends only on
-// `emit_base` + the lower modules. Carved out of `wasmEmit.vl`.
+// `emit_query.vl` — pure classification queries over the AST: binding/value-kind
+// predicates (`param*`/`let*`/`is*`/`union*`) and control-flow, valued-return and
+// arr-new scans (`if*`/`block*`/`expr*`/`nli*`). State-free, depending only on
+// `emit_base` and the lower modules.
 
 import {
   inferRetNameOf,
@@ -66,16 +66,15 @@ import {
 } from "./emit_base"
 import { scopeSlotOf } from "./emit_state"
 
-// True if param `name` of function `fnIx` is a NULLABLE function value (`fn | null`, kind
-// 19) — the closure dual of `paramNulRef`.
+// True if param `name` of function `fnIx` is a nullable function value (`fn | null`,
+// kind 19) — the closure dual of `paramNulRef`.
 export function paramNulClosure(fnIx: i32, name: string) {
   nulCloFlag(paramTypeNode(fnIx, name)) == 1
 }
-// True if the `LetDecl` at `letIx` declares a nullable i32-list local/global
-// (`i32[] | null`, kind 15). ANNOTATION-ONLY: an initializer cannot produce one
-// (no call returns a nullable list yet), and a `[…]` init under the annotation
-// keeps the NULLABLE slot — narrowing is type-level, the slot type is the
-// annotation's.
+// True if the `LetDecl` at `letIx` declares a nullable i32-list local or global
+// (`i32[] | null`, kind 15). Annotation-only: no call yet returns a nullable list,
+// and a `[…]` init under the annotation keeps the nullable slot — narrowing is
+// type-level, the slot type is the annotation's.
 export function letIsNulList(letIx: i32, _fnIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
@@ -92,8 +91,8 @@ export function paramNulList(fnIx: i32, name: string) {
 export function paramNulString(fnIx: i32, name: string) {
   retNulStringFlag(paramTypeNode(fnIx, name)) == 1
 }
-// Does the block contain a `return e` WITH a value (recursing into if/while/for
-// bodies)? A bare `return` does not count — a void function may bare-return.
+// True if the block contains a `return e` with a value (recursing into if/while/for
+// bodies) — a bare `return` does not count, since a void function may bare-return.
 export function blockHasValuedReturn(blockIx: i32) {
   const b = P.nodes[blockIx]
   if b is Block {
@@ -117,53 +116,6 @@ export function blockHasValuedReturn(blockIx: i32) {
   }
   false
 }
-// D1032 — Does the block contain a BARE `return` (recursing the same way)? A bare return is a
-// statement only a VOID function can write — you cannot `return;` out of one that owes a
-// value — so its presence is the author saying, in the source, that this function returns
-// nothing. The void fixpoint reads it as a veto on the nullable INFERENCE, which otherwise
-// makes a body non-void for reasons nobody wrote down: a tail `if n == 1 { buf.push(1) }`
-// ends in a `push`, the else-less `if` infers `i32 | null`, and a bare return four lines
-// above is then refused at the FUNCTION NAME with `bare return is not supported`.
-export function blockHasBareReturn(blockIx: i32): boolean {
-  const b = P.nodes[blockIx]
-  if b is Block {
-    const stmts = b.blkStmts
-    let i = 0
-    while i < stmts.length {
-      const st = P.nodes[stmts[i]]
-      if st is RetStmt {
-        if st.retArg < 0 { return true }
-      } else if st is IfStmt {
-        if ifChainHasBareReturn(stmts[i]) { return true }
-      } else if st is WhileStmt {
-        if blockHasBareReturn(st.whileBody) { return true }
-      } else if st is ForRange {
-        if blockHasBareReturn(st.frBody) { return true }
-      } else if st is ForIn {
-        if blockHasBareReturn(st.fiBody) { return true }
-      }
-      i = i + 1
-    }
-  }
-  false
-}
-
-export function ifChainHasBareReturn(ifIx: i32): boolean {
-  const st = P.nodes[ifIx]
-  if st is IfStmt {
-    if blockHasBareReturn(st.ifThen) { return true }
-    if st.ifElse >= 0 {
-      const els = P.nodes[st.ifElse]
-      if els is Block {
-        if blockHasBareReturn(st.ifElse) { return true }
-      } else if els is IfStmt {
-        if ifChainHasBareReturn(st.ifElse) { return true }
-      }
-    }
-  }
-  false
-}
-
 export function ifChainHasValuedReturn(ifIx: i32) {
   const st = P.nodes[ifIx]
   if st is IfStmt {
@@ -255,11 +207,9 @@ export function collectValuedReturnsInIf(ifIx: i32, out: i32[]) {
   0
 }
 // ── parameter resolution ─────────────────────────────────────────────────────
-// A returned `Ident` is a parameter reference; its wasm `local.get` index is the
-// param's position in `fnParams` (params occupy locals 0..n-1, before any declared
-// locals). `paramIndexOf` scans the FuncDecl's `fnParams` for the param whose
-// `parName` matches `name`, returning its 0-based position or -1 if not a param.
-// The caller adds `envSlotShift` for a module that carries the hidden env param.
+// Scans the FuncDecl's `fnParams` for the param named `name`, returning its 0-based
+// position (params occupy wasm locals `0..n-1`, before any declared locals) or -1.
+// The caller adds `envSlotShift` for a module carrying the hidden env param.
 export function paramIndexOf(fnIx: i32, name: string) {
   if fnIx < 0 {
     return -1 // module-scope initializer (no enclosing function)
@@ -311,12 +261,8 @@ export function exprHasArrNew(exprIx: i32) {
   if e is Paren { return exprHasArrNew(e.parInner) }
   if e is IsExpr { return exprHasArrNew(e.isObj) }
   if e is AsExpr { return exprHasArrNew(e.asObj) }
-  // An if-EXPRESSION (`const a = if c { __array_new__(n, 0) } else { … }`) is an
-  // `IfStmt` node in a VALUE slot; `emitExpr` lowers its arms through the ordinary
-  // path, so an allocator there stages its length in the arrNew scratch slot.
-  // Without this arm the walk fell off the end of its dispatch and `fnUsesArrNew`
-  // stayed false — there is no "frame not reserved" floor on this frame, so the
-  // slot was never handed out and the module was silently INVALID.
+  // An if-expression (`if c { __array_new__(n,0) } else {…}`) is an `IfStmt` node in
+  // value position; without this arm its allocator length never reaches the arrNew slot.
   if e is IfStmt { return ifChainHasArrNew(exprIx) }
   if e is ObjLit {
     const fields = e.objFields
@@ -341,18 +287,10 @@ export function exprHasArrNew(exprIx: i32) {
   }
   false
 }
-// True if any statement in the block at `blockIx` (descending into if/else arms
-// and loop bodies) contains an intrinsic allocator call.
-//
-// The EXPRESSION-statement case is a FALL-THROUGH, not an enumeration. Naming a
-// fixed set of shapes (`BinExpr` / `Call` / `ObjLit`) silently skips every other way
-// a block's trailing VALUE can be spelled — `(__array_new__(n, 0))`,
-// `[__array_new__(n, 0)]`, `x as T`, `-e` — and the parser wraps a bare-expression
-// function body in a SYNTHETIC one-statement Block whose only statement is a
-// `Paren`, so an expression-bodied lambda holding the function's only allocator
-// reserved nothing and emitted invalid wasm. Handing every non-statement shape to
-// the expression walker cannot over-reach: it answers false for the statement kinds
-// it does not know.
+// True if any statement in the block at `blockIx` (descending into if/else arms and
+// loop bodies) contains an intrinsic allocator call. The non-statement case falls
+// through to the expression walker rather than enumerating shapes — an expression-
+// bodied lambda's synthetic one-statement Block is exactly what a fixed set would miss.
 export function blockHasArrNew(blockIx: i32) {
   const b = P.nodes[blockIx]
   if b is Block {
@@ -406,41 +344,25 @@ export function fnHasArrNew(fnIx: i32) {
   if fn is FuncDecl { return blockHasArrNew(fn.fnBody) }
   false
 }
-// ── `f(x) ?? d` (a CALL-LHS null-coalesce) scratch detection ───────────────────
-// A `??` whose left operand is a CALL cannot RE-EVALUATE its LHS the way an ident/field
-// `x ?? d` does (a call has effects + cost), so it stashes the call's result (a value-union
-// box) in a 1-slot `(ref $uBoxIdx)` frame and tests the tag off the ONE evaluation. The scan
-// reserves that slot for any function containing such a `??`; over-approximating to ANY
-// call-LHS `??` is safe, since an unhandled rep reserves-but-skips and stays valid.
-// True if any operand of the `??` CHAIN at `binIx` that BECOMES a `??` LHS is a Call.
-// `a ?? b ?? d` parses LEFT-associative and `emitCoalesce` (wasmEmit.vl) RE-ASSOCIATES it to
-// `a ?? (b ?? d)`, so the MIDDLE operand becomes an LHS in a node that does not exist when
-// this scan runs. Asking only "is `binLeft` a Call?" therefore missed `x ?? f() ?? d`, which
-// reserved nothing and ran `fbLocalSet(coalesceCallSlot)` against an undeclared local — so
-// the scan walks the LEFT SPINE: every operand except the outermost `binRight`.
+// `f(x) ?? d` scratch slot: a `??` whose left operand is a call cannot re-evaluate its
+// lhs like `x ?? d` can, so it stashes the call's result in a 1-slot `(ref $uBoxIdx)`
+// frame. `coalChainHasCallLhs` walks the left spine of a `??` chain (excluding the
+// outermost `binRight`) since `emitCoalesce` re-associates `a ?? b ?? d` before this runs.
 function coalChainHasCallLhs(binIx: i32) {
   const e = P.nodes[binIx]
   if e is BinExpr {
     const lIx = unwrapParen(e.binLeft)
     const l = P.nodes[lIx]
     if l is Call { return true }
-    // D1041 — AN `as?` YIELDING A BOX IS THE OTHER NON-RE-READABLE BOX SOURCE. `(d as? i32)
-    // ?? 0` cannot take the re-readable desugar (that names the operand twice, and re-runs the
-    // exactness test with it), so it lowers through the same stash-once arm a call LHS does and
-    // needs the same slot reserved. The PREDICATE is the one the emit arm's gate reads, not a
-    // second reading of the same question: a shape the reservation walk misses is an undeclared
-    // local, not a missed optimisation.
-    // D1250 — AN IF-EXPRESSION OPERAND CANNOT BE RE-READ EITHER, at any of its reps: the box
-    // arm stashes it like a call, and the `boolean | null` / `K | null` niches stash it to stop
-    // evaluating the condition TWICE (measured: a side-effecting condition ran twice). Claimed
-    // unconditionally rather than per rep — this walk RESERVES slots, and a shape it misses is
-    // an undeclared local, while one it over-claims is three unused i32s.
+    // Two more non-re-readable lhs shapes need this slot reserved too: an if-expression
+    // operand — any rep stashes once, so a side-effecting condition is not evaluated
+    // twice (D1250) — and an `as?` yielding a box, which cannot re-run the exactness
+    // test on `(d as? i32) ?? 0` and so stashes like a call.
     if l is IfStmt { return true }
     if l is AsExpr {
       if tyIsNulValueUnionBox(nodeTyIxOf(lIx)) { return true }
-      // The SOLO-numeric nullable (`i32 | null`) is a box too — `isValueUnionName`'s solo
-      // rule — and `tyIsNulValueUnionBox` deliberately answers false for it (it counts
-      // two-or-more non-null members, because every OTHER one-member nullable is a niche).
+      // A solo numeric nullable (`i32 | null`) is a box too, but `tyIsNulValueUnionBox`
+      // answers false for it (it counts two-or-more members; a lone nullable is a niche).
       if nodeTyIsNulScalarBox(lIx) { return true }
     }
     if l is BinExpr {
@@ -483,13 +405,8 @@ export function exprHasCoalesceCall(exprIx: i32) {
   if e is Paren { return exprHasCoalesceCall(e.parInner) }
   if e is IsExpr { return exprHasCoalesceCall(e.isObj) }
   if e is AsExpr { return exprHasCoalesceCall(e.asObj) }
-  // An if-EXPRESSION (`const v = if c { f(n) ?? 0 } else { 0 }`) is an `IfStmt`
-  // node sitting in a VALUE slot (`exprIsIfStmt`), and `emitExpr` lowers its arms
-  // through the ordinary statement path — so a `??` in an arm reaches
-  // `emitCoalesce` and stashes into `coalesceCallSlot`. Without this arm the walk
-  // fell off the end of its dispatch and the frame was never reserved: `vl check`
-  // rc 0, `vl build` rc 1 "unknown local N". Hand the whole chain (condition,
-  // then-arm, `else`/`else if`) to the statement-level walker.
+  // An if-expression (`if c { f(n) ?? 0 } else { 0 }`) is an `IfStmt` in value
+  // position; without this arm its `??` never reserves `coalesceCallSlot`.
   if e is IfStmt { return ifChainHasCoalesceCall(exprIx) }
   if e is ObjLit {
     const fields = e.objFields
@@ -515,12 +432,9 @@ export function exprHasCoalesceCall(exprIx: i32) {
   false
 }
 // True if any statement in the block at `blockIx` (descending into if/else arms and
-// loop bodies) contains a call-LHS `??`. Mirrors `blockHasArrNew` — including its
-// expression-statement FALL-THROUGH, for the same reason: the three named shapes
-// missed `(f(n) ?? 0)`, `f(n) ?? 0 as i32`, `mk(f(n) ?? 0).v`, `[f(n) ?? 0]`, and
-// above all the SYNTHETIC one-statement Block the parser wraps a bare-expression
-// function body in — so `(n) => (f(n) ?? 0)` reserved no stash and emitted a
-// `local.set` against an undeclared local.
+// loop bodies) contains a call-lhs `??`. Mirrors `blockHasArrNew`'s expression-statement
+// fall-through: naming a fixed set of shapes missed cases like `[f(n) ?? 0]` and, above
+// all, the synthetic one-statement Block a bare-expression lambda body parses into.
 export function blockHasCoalesceCall(blockIx: i32) {
   const b = P.nodes[blockIx]
   if b is Block {
@@ -580,30 +494,18 @@ export function exprIsIfStmt(ix: i32) {
   if e is IfStmt { return true }
   false
 }
-// `exprIsBool` (defined in emit_classify) answers "is the expression BOOLEAN-
-// producing?", which drives the `print` import choice — `__print_bool__` renders
-// true/false, everything else prints as i32. A bool rides in an i32 at the wasm
-// level, so it is a SYNTACTIC classification: bool literals, comparisons, logical
-// connectives, `!`, `is` guards, and calls to a function that returns a boolean
-// (annotated `boolean`/`bool`, or inferred — `fRetBool` via `computeRetInference`).
-// Identifiers are NOT classified (a bool-typed local prints as 0/1 for now —
-// annotation threading through the local registry is a later slice).
-// True if the PARAMETER `name` of the function at `fnIx` is annotated `i64`.
+// True if the parameter `name` of the function at `fnIx` is annotated `i64`.
 export function paramIsI64(fnIx: i32, name: string) {
   retI64Flag(paramTypeNode(fnIx, name)) == 1
 }
-// True if the PARAMETER `name` of the function at `fnIx` is annotated `f32`. (Slice 5.)
+// True if the parameter `name` of the function at `fnIx` is annotated `f32`.
 export function paramIsF32(fnIx: i32, name: string) {
   retF32Flag(paramTypeNode(fnIx, name)) == 1
 }
-// The tail VALUE expression of an if-expression arm — the LAST statement of the arm
-// Block, or -1 for an empty arm / a non-block. (`exprIs*` guard `< 0`, so -1 classifies
-// as the i32 default.) The parser wraps `then <expr>` as a Block of one statement, but an
-// arm may carry leading STATEMENTS before its value (`if c { const a = u.a; a }`, which is
-// also what a `match` payload-binding arm desugars to) — those are the arm's PRELUDE,
-// lowered by `emitIfArmOpen`, and only the last statement is the arm's value. This is the
-// same "a block's value is its last statement" rule `blockTailIsValue` applies in tail
-// position; the if-EXPRESSION arm reads it through here.
+// The tail value expression of an if-expression arm — the last statement of the arm
+// Block, or -1 for an empty arm or non-block (`exprIs*` guards `< 0`, reading it as the
+// i32 default). An arm may carry leading statements before its value (its prelude,
+// lowered by `emitIfArmOpen`); only the block's last statement is the arm's value.
 export function ifArmValueExpr(blockIx: i32) {
   const b = P.nodes[blockIx]
   if b is Block {
@@ -612,14 +514,14 @@ export function ifArmValueExpr(blockIx: i32) {
   }
   -1
 }
-// True if the PARAMETER `name` of the function at `fnIx` is annotated `f64`. (Slice 3.)
+// True if the parameter `name` of the function at `fnIx` is annotated `f64`.
 export function paramIsF64(fnIx: i32, name: string) {
   retF64Flag(paramTypeNode(fnIx, name)) == 1
 }
-// True if EVERY control path through the block at `blockIx` returns: a direct
-// `return` statement, or an `if`/`else` (incl. an `else if` chain) whose arms
-// all return. Conservative — a `while` etc. never counts (mirrors the host's
-// flow analysis only as far as the post-guard narrowing below needs).
+// True if every control path through the block at `blockIx` returns: a direct
+// `return` statement, or an `if`/`else` (including an `else if` chain) whose arms
+// all return. Conservative — a `while` etc. never counts, only as far as the
+// post-guard narrowing below needs.
 export function blockAlwaysReturns(blockIx: i32) {
   const b = P.nodes[blockIx]
   if b is Block {
@@ -636,14 +538,10 @@ export function blockAlwaysReturns(blockIx: i32) {
   }
   false
 }
-// True if the LAST statement of the block at `blockIx` leaves the enclosing path —
-// `return`, `break` or `continue`. The checker's post-guard narrowing uses exactly this
-// test (`checkIfStmtNode`'s guard-clause arm), and `blockAlwaysReturns` above does NOT
-// cover it: inside a loop a guard clause is spelled `if e == null { break }`, whose then
-// block holds no `return` at all. Emit has to agree with check on which guards post-narrow
-// or the rest of the block reads a boxed union the checker already unboxed — check-clean,
-// invalid wasm. Kept separate from `blockAlwaysReturns` so the two callers of that
-// function (the `if`-tail classification) keep their return-only meaning.
+// True if the last statement of the block at `blockIx` leaves the enclosing path via
+// `return`, `break` or `continue`. Must agree with the checker's own post-guard-narrowing
+// test (`checkIfStmtNode`'s guard-clause arm) — a loop guard like `if e == null { break }`
+// has no `return`, and disagreeing here reads a boxed union the checker already unboxed.
 export function blockLastStmtExits(blockIx: i32) {
   const b = P.nodes[blockIx]
   if b is Block {
@@ -656,9 +554,8 @@ export function blockLastStmtExits(blockIx: i32) {
   }
   false
 }
-// True if the `if` at `ifIx` returns on EVERY path: it has an else, the
-// then-block always returns, and the else (a block or a chained `else if`)
-// always returns too.
+// True if the `if` at `ifIx` returns on every path: it has an else, the then-block
+// always returns, and the else (a block or a chained `else if`) always returns too.
 export function ifAlwaysReturns(ifIx: i32) {
   const s = P.nodes[ifIx]
   if s is IfStmt {
@@ -671,17 +568,10 @@ export function ifAlwaysReturns(ifIx: i32) {
   }
   false
 }
-// Does this loop BODY contain a `continue` that binds to THIS loop (whose label is
-// `label`, "" when unlabelled)? Two binding forms:
-//   • an UNLABELLED `continue` binds to the innermost loop — so it counts only when
-//     not `nested` inside another loop (descends `if` arms, a conditional continue,
-//     but NOT nested loops: their `continue` is their own);
-//   • a LABELLED `continue l` binds to the loop labelled `l` from ANYWHERE in the
-//     body, including inside nested loops — so when this loop HAS a label the scan
-//     also descends nested loop bodies looking for it.
-// Drives the for-range/for-in INNER continue block: a body without a binding
-// `continue` keeps the original (golden-pinned) two-frame shape, and an unlabelled
-// loop scans exactly as before, the nested-loop descent being gated on `label != ""`.
+// Whether the loop body at `blockIx` contains a `continue` binding to this loop
+// (labelled `label`, "" when unlabelled). An unlabelled `continue` binds to the
+// innermost loop, so it counts only when not `nested`; a labelled `continue l` binds
+// to the loop labelled `l` from anywhere, including inside nested loops.
 export function blockHasContinueFor(
   blockIx: i32,
   label: string,
@@ -741,8 +631,8 @@ export function letIsNulBoolAnn(letIx: i32) {
   false
 }
 // Whether the module global declared by the `LetDecl` at `letIx` has a non-const
-// initializer (so its cell is zero-initialized and set by the synthetic start
-// function). False for a non-`LetDecl` or a missing init.
+// initializer, so its cell is zero-initialized and set later by the synthetic start
+// function. False for a non-`LetDecl` or a missing init.
 export function globalIsNonConst(letIx: i32) {
   if letIx < 0 { return false }
   const d = P.nodes[letIx]
@@ -752,21 +642,19 @@ export function globalIsNonConst(letIx: i32) {
   }
   false
 }
-// True if the module global `LetDecl` at `letIx` carries a TYPE ANNOTATION (`let g: T
-// = …`). When it does, the cell's wasm type must come from that annotation — exactly as
-// a local/param resolves its valtype — so a global agrees with a same-typed local/param/
-// field on the struct table index (otherwise a `global.get g` of an init-inferred struct
-// type mismatches a `local.set`/call of the annotation's struct type).
+// True if the module global `LetDecl` at `letIx` carries a type annotation (`let g: T
+// = …`). When it does, the cell's wasm type must come from the annotation, the same way
+// a local or param resolves its valtype — otherwise `global.get g` on an init-inferred
+// struct type mismatches a same-typed local's `local.set`/call struct table index.
 export function globalHasTypeAnn(letIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl { return d.letType >= 0 }
   false
 }
-// The value-union ATOM name an assignment RHS fills a null hole with ("i32",
+// The value-union atom name an assignment RHS fills a null hole with ("i32",
 // "boolean", "string", "f64", "i64"), or "" when the RHS is not classifiable at
-// collection time (an ident, a member read, …). A function-call RHS reads the
-// callee's declared return annotation straight from the arena (the fn tables are
-// not populated yet when this scan runs).
+// collection time (an ident, a member read, …). A call RHS reads the callee's
+// declared return annotation straight from the arena; the fn tables are not built yet.
 export function nliAtomOfExpr(exprIx: i32) {
   if exprIx < 0 { return "" }
   const e = P.nodes[unwrapParen(exprIx)]
@@ -787,18 +675,10 @@ export function nliAtomOfExpr(exprIx: i32) {
         if f is FuncDecl {
           if f.fnName == cn {
             let rn = tyNameOf(f.fnRet)
-            // AN UN-ANNOTATED CALLEE IS NOT AN UNKNOWN CALLEE. `tyNameOf` answers "" for
-            // `f.fnRet < 0`, and this arm returned "" with it — so `nliInferLet` never called
-            // `registerValueUnionName` and the `T | null` box was never interned. A MINTING
-            // flag answering FALSE for "I have no annotation" is the hazard B60 step 5 names;
-            // the checker banks every inferred return in `inferRetIdx`, and
-            // `elaborateInferRets` fills it before the emitter runs. WITNESS:
-            // `types/infer-null-conditional-assign.vl` with `: i32` deleted from `f`.
-            //
-            // THE NAME, NOT THE ARENA, AND THAT IS NOT AN OVERSIGHT: what this returns is a
-            // registry key, and `registerValueUnionName` is name-keyed, so an atom NAME is the
-            // currency the consumer needs. Converting it to `inferRetTyIxOf` is blocked on the
-            // union registry (prerequisite B-1), not on this site.
+            // An un-annotated callee is not an unknown callee: `tyNameOf` answers "" both
+            // for "no return type" and for "checker inferred one" (`inferRetIdx`, filled by
+            // `elaborateInferRets`), so falling back to `inferRetNameOf` here recovers the
+            // inferred name — `registerValueUnionName` is name-keyed, so a name is what it needs.
             if rn == "" { rn = inferRetNameOf(f.fnName) }
             if valueAtomKind(rn) >= 0 && rn != "null" { return rn }
             return ""
@@ -849,10 +729,10 @@ export function nliScanBlock(blockIx: i32, name: string) {
   if blockIx < 0 { return "" }
   nliScanStmt(blockIx, name)
 }
-// Classify one if-EXPRESSION arm (`blockIx`, a one-statement Block) at REGISTRATION
-// time — a static pre-pass, so only LITERAL / annotated-call atoms resolve (the same
-// `nliAtomOfExpr` the `let x = null` hole uses). Returns 1 for a bare `null` arm, 0 for
-// a classified value atom (pushed onto `atoms`), or -2 if the arm is unclassifiable.
+// Classifies one if-expression arm (`blockIx`, a one-statement Block) at registration
+// time — a static pre-pass, so only literal or annotated-call atoms resolve. Returns 1
+// for a bare `null` arm, 0 for a classified atom (pushed onto `atoms`), or -2 if the
+// arm is unclassifiable.
 export function collectArmAtom(blockIx: i32, atoms: string[]) {
   const v = ifArmValueExpr(blockIx)
   if v < 0 { return -2 }
@@ -863,9 +743,9 @@ export function collectArmAtom(blockIx: i32, atoms: string[]) {
   pushUniqueAtom(atoms, atom)
   0
 }
-// Gather the value atoms of every arm of the if-expression at `ifIx` into `atoms`
+// Gathers the value atoms of every arm of the if-expression at `ifIx` into `atoms`
 // (deduped), recursing through an `else if` chain. Returns -2 if any arm is
-// unclassifiable, else whether a `null` arm / else-less false path was seen (0/1).
+// unclassifiable, else 0/1 for whether a `null` arm or an else-less false path exists.
 export function ifExprCollectAtoms(ifIx: i32, atoms: string[]) {
   const s = P.nodes[unwrapParen(ifIx)]
   if s is IfStmt {
@@ -889,18 +769,10 @@ export function ifExprCollectAtoms(ifIx: i32, atoms: string[]) {
   }
   -2
 }
-// The TYPE-annotation node index of parameter `name` of function `fnIx` (its `parType`), or
-// -1 (no such param / module scope / un-annotated param / `name` SHADOWED by a live lexical
-// binding). The single param-scan the whole `param*` type-predicate family shares.
-//
-// A LIVE LEXICAL BINDING SUPPRESSES THE PARAM ANSWER — the type half of the rule
-// `localIndexOf` applies to the local INDEX. In `f(v: string) { if n > 0 { const v = 99 } }`
-// the inner `v` is an i32 local with its own slot, so a `param*` predicate must stop calling
-// the read a `string`: when the two disagreed the emitter took the sink from the PARAM's type
-// and the operand from the LOCAL's slot and built an invalid module. Gating the ONE shared
-// scan keeps the family in agreement. It is INERT where the scope stack is not live (the
-// classifier and mono passes run scope-less, so `scopeSlotOf` answers -1), and a binding
-// enters the stack only AFTER its declaration, so `const v = v + 1` still reads the param.
+// The type-annotation node index of parameter `name` of function `fnIx` (its `parType`),
+// or -1 (no such param, module scope, un-annotated, or `name` shadowed by a live lexical
+// binding). The one param-scan the whole `param*` type-predicate family shares, so they
+// agree with `localIndexOf` on the same shadowing — a disagreement there built invalid wasm.
 export function paramTypeNode(fnIx: i32, name: string) {
   if fnIx < 0 { return -1 }
   if scopeSlotOf(name) >= 0 { return -1 }
@@ -919,18 +791,10 @@ export function paramTypeNode(fnIx: i32, name: string) {
   -1
 }
 
-// True if the parameter `name` of function `fnIx` is an array type.
-//
-// D-PARAMARR — the `param*Array` family asks the LIST-REP question of a parameter's
-// annotation NODE, and it used to answer by RENDERING that node to a synthetic name
-// (`tyNameOf`) and parsing the render back. The node is right there, and `emit_base`'s
-// `ret*ArrFlag` family answers the identical question STRUCTURALLY off
-// `nodeTyArrayElemRepName`.
-//
-// THE ARENA LEG IS NOT A GAMBLE — it had to be shown covering this node population first,
-// because `ret*ArrFlag` DECLINES to 0 when `nodeTyIx` is unset and a gap would silently lose
-// a list. `vtKindOfType` already classifies `Param.parType` through `retArrFlag`/… with no
-// name fall-through, so these five predicates were the render's last consumers.
+// True if the parameter `name` of function `fnIx` is an array type. Answers the
+// list-rep question structurally off the parameter's annotation node
+// (`emit_base`'s `ret*ArrFlag` via `nodeTyArrayElemRepName`), which declines to 0
+// when `nodeTyIx` is unset rather than silently dropping a list.
 export function paramArray(fnIx: i32, name: string) {
   retArrFlag(paramTypeNode(fnIx, name)) == 1
 }
@@ -938,12 +802,10 @@ export function paramArray(fnIx: i32, name: string) {
 export function paramStringArray(fnIx: i32, name: string) {
   retStrArrFlag(paramTypeNode(fnIx, name)) == 1
 }
-// USAGE-DRIVEN element inference for an UN-ANNOTATED EMPTY `[]` binding: the
-// element type comes from what is PUSHED — a string-literal argument makes the
-// binding a `string[]` (`const xs = []; xs.push("hi")`), mirroring the host
-// checker's usage-driven inference. Scans the whole arena for a
-// `<name>.push("…")` call; string LITERAL arguments only (a richer operand would
-// need the full classifier, which would recurse back into this binding).
+// Usage-driven element inference for an un-annotated empty `[]` binding: a
+// string-literal `.push` argument makes it a `string[]` (`const xs = []; xs.push("hi")`),
+// mirroring the checker's own usage-driven inference. Only string-literal push
+// arguments count — a richer operand would need the full classifier, recursing back here.
 export function letInfStrListByUse(letIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
@@ -977,9 +839,8 @@ export function letInfStrListByUse(letIx: i32) {
   }
   false
 }
-// True if the parameter `name` of function `fnIx` is an `f64[]` type. The three
-// scalar-element siblings of `paramArray`, migrated onto the same arena classifiers by
-// the same measurement (D-PARAMARR — see `paramArray`'s header).
+// True if the parameter `name` of function `fnIx` is an `f64[]` type. One of
+// `paramArray`'s scalar-element siblings, sharing its arena classifier.
 export function paramF64Array(fnIx: i32, name: string) {
   retF64ArrFlag(paramTypeNode(fnIx, name)) == 1
 }
@@ -990,26 +851,17 @@ export function paramF32Array(fnIx: i32, name: string) {
 export function paramI64Array(fnIx: i32, name: string) {
   retI64ArrFlag(paramTypeNode(fnIx, name)) == 1
 }
-// True if the parameter `name` of function `fnIx` is a map type.
-//
-// A UNION param whose FIRST atom is a map (`{[string]: V} | X`) has a NAME that starts with
-// `{[`, so the old `nameIsMap` probe matched the whole union spelling and every consumer had
-// to subtract the false positive with a second scan. It is a union BOX param, not a bare map
-// — the map arm boxes into the union, and an un-annotated copy of the param (`const t0 = p`)
-// must ride the box so the map arm reads through the `is`-narrowing.
-//
-// The ARENA never had that false positive to subtract: a bare map is a `TyMap`, a map-member
-// union is a `TyUnion`, and `nodeTyIsMap` IS that test, already in production for EXPRESSION
-// nodes. D-PARAMARR left this predicate rendering because its coverage was unestablished;
-// D-BAREMAP established it, so the render and BOTH name scans go, not just one of them.
+// True if the parameter `name` of function `fnIx` is a bare map type — `nodeTyIsMap`
+// on the arena, not a name test. A union param whose first atom is a map (`{[string]:
+// V} | X`) is NOT a bare map: it boxes into the union, so an un-annotated copy of the
+// param must ride the box and read the map arm through `is`-narrowing.
 export function paramMap(fnIx: i32, name: string) {
   nodeTyIsMap(paramTypeNode(fnIx, name))
 }
-// True if the `LetDecl` at `letIx` binds a SET — its initializer is the `Set()`
+// True if the `LetDecl` at `letIx` binds a set — its initializer is the `Set()`
 // constructor. Set-ness is an emitter-side flavor bit over the shared map rep: a
-// set's `.values()` yields its ELEMENTS (the keys list), not the membership
-// booleans in `vals`. Mirrors the checker's `mSet` pin (typecheck.vl), which is
-// likewise seeded only by the `Set()` constructor form.
+// set's `.values()` yields its elements (the keys list), not the membership booleans
+// in `vals`. Mirrors the checker's `mSet` pin, seeded the same way.
 export function letIsSet(letIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
@@ -1021,25 +873,19 @@ export function letIsSet(letIx: i32) {
   }
   false
 }
-// True if the `LetDecl`/global at `letIx` declares an `f32` binding. ANNOTATION-ONLY:
+// True if the `LetDecl`/global at `letIx` declares an `f32` binding. Annotation-only:
 // a bare float literal stays f64 by default, so only an explicit `: f32` annotation
-// selects the f32 slot (valtype `0x7d`, kind 13) and lowers the initializer literal as
-// `f32.const`.
+// selects the f32 slot (valtype `0x7d`, kind 13) and lowers the initializer as `f32.const`.
 export function letIsF32(letIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
     if d.letType >= 0 {
       const lt = P.nodes[d.letType]
       if lt is TypeRef {
-        // THE ARENA WHERE IT COVERS THE NODE, the spelling where it does not — the B78 shape,
-        // and the guard is load-bearing for the same reason it was there. `nodeTyPrimName`
-        // answers "" both for "not an f32" and for "no type recorded", and this picks a REP: the
-        // f32 slot, valtype 0x7d, kind 13. Under-answering drops an f32 local into the f64 slot.
-        //
-        // The disagreement shape would be an f32 ALIAS (`type G = f32; const x: G = 2.5`), and
-        // it cannot arise: `canonEmitTypeNames` rewrites a one-member alias to its body in the
-        // `TypeRef` itself, so the spelling reads `f32` before this ever sees it — the same
-        // mechanism B72 named, and why this conversion is equal by construction, not by luck.
+        // `nodeTyPrimName` answers "" both for "not f32" and for "no type recorded", so this
+        // picks the arena leg only where `nodeTyIxOf` covers the node, falling back to the raw
+        // spelling otherwise — under-answering would drop an f32 local into the f64 slot. An f32
+        // alias cannot disagree between the two: `canonEmitTypeNames` rewrites it to `f32` first.
         if nodeTyIxOf(d.letType) >= 0 {
           if nodeTyPrimName(d.letType) == "f32" { return true }
         } else if lt.tyName == "f32" {
@@ -1050,10 +896,10 @@ export function letIsF32(letIx: i32) {
   }
   false
 }
-// True if the `LetDecl` at `letIx` declares a NULLABLE function-value local (`fn | null`,
-// kind 19). ANNOTATION-ONLY (the closure dual of `letIsNulList`): no call yet returns a
-// nullable function, and a bare-function or `null` init under the annotation keeps the
-// nullable `(ref null $cloStruct)` slot — narrowing is type-level, the slot stays nullable.
+// True if the `LetDecl` at `letIx` declares a nullable function-value local (`fn | null`,
+// kind 19) — the closure dual of `letIsNulList`. Annotation-only: no call yet returns a
+// nullable function, so the slot stays `(ref null $cloStruct)` regardless of the init;
+// narrowing is type-level only.
 export function letIsNulClosure(letIx: i32, _fnIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {

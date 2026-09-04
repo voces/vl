@@ -246,3 +246,114 @@ Deno.test({
     await Deno.remove(dir, { recursive: true });
   },
 });
+
+// WHICH TREE THE FOUR CODES APPLY TO.
+//
+// docs/internals/comment-style.md is the COMPILER's rubric. A std comment is
+// consumer API surface, graded by `std-comment-audience` against
+// std-api-review.md §4 — so the four codes skip a std module, and a consumer's
+// `vl check` stops burying its own diagnostics under std's house style (D1601).
+//
+// Both implementations carry that scoping, in the only place each can: the lint
+// tests the MODULE PATH the driver hands it, and comment-budget.py's `sources()`
+// walks `compiler/` alone. `--grade` stays path-blind (it grades the text it is
+// handed), which is why the pair is pinned here and not through the comparison
+// above. The compiler-path twin is the same source, so the std side cannot pass
+// by grading nothing at all.
+const SCOPED = `// A header of three lines, so the run below is a plain block.
+// It is not the block under test; the block under test is the next one.
+// Two of these lines exist only to take the header slot.
+export function hdr(): i32 { 0 }
+
+${dull(13, "body")}
+export function long(): i32 { 1 }
+
+// This line SHOUTS TWICE in capitals, which is rule 5.
+export function loud(): i32 { 2 }
+
+// This one narrates: the field used to be an i32 before the widening.
+export function told(): i32 { 3 }
+`;
+
+const lintIn = async (dir: string, rel: string): Promise<Record<string, number[]>> => {
+  const { code, stdout, stderr } = await new Deno.Command(VL, {
+    args: ["check", rel, "--severity", "info", "--json", "--compiler", COMPILER],
+    cwd: dir,
+    stdout: "piped",
+    stderr: "piped",
+    env: { RUST_BACKTRACE: "0", NO_COLOR: "1" },
+  }).output();
+  if (code > 1) {
+    throw new Error(`vl check ${rel} exited ${code}: ${new TextDecoder().decode(stderr)}`);
+  }
+  const all = JSON.parse(new TextDecoder().decode(stdout)) as {
+    code?: string;
+    line: number;
+  }[];
+  const lines: Record<string, number[]> = {};
+  for (const c of CODES) {
+    lines[c] = all.filter((d) => d.code === c).map((d) => d.line).sort((x, y) => x - y);
+  }
+  return lines;
+};
+
+Deno.test({
+  name: "comment rules: the four codes skip a std module and fire on a compiler one",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_comment_scope_" });
+    try {
+      await Deno.mkdir(`${dir}/std`);
+      await Deno.mkdir(`${dir}/compiler`);
+      await Deno.writeTextFile(`${dir}/std/scoped.vl`, SCOPED);
+      await Deno.writeTextFile(`${dir}/compiler/scoped.vl`, SCOPED);
+
+      const inCompiler = await lintIn(dir, "compiler/scoped.vl");
+      const fired = CODES.filter((c) => inCompiler[c].length > 0);
+      if (fired.length !== 3) {
+        throw new Error(
+          `the compiler-path twin must fire three of the four codes (the fixture ` +
+            `carries no measurement), got ${JSON.stringify(inCompiler)}`,
+        );
+      }
+
+      const inStd = await lintIn(dir, "std/scoped.vl");
+      for (const c of CODES) {
+        if (inStd[c].length !== 0) {
+          throw new Error(
+            `${c} fired on a std module at lines ${JSON.stringify(inStd[c])} — ` +
+              `comment-style.md is the compiler's rubric; std is graded by ` +
+              `std-comment-audience (D1601)`,
+          );
+        }
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
+  name: "comment rules: the ratchet walks compiler/ only",
+  ignore: !ENABLED,
+  fn: async () => {
+    const { code, stdout, stderr } = await new Deno.Command("python3", {
+      args: [SCRIPT],
+      stdout: "piped",
+      stderr: "piped",
+    }).output();
+    if (code !== 0) {
+      throw new Error(
+        `comment-budget.py exited ${code}: ${new TextDecoder().decode(stderr)}`,
+      );
+    }
+    const rows = new TextDecoder().decode(stdout).split("\n");
+    const std = rows.filter((r) => r.startsWith("std/"));
+    if (std.length > 0) {
+      throw new Error(
+        `the ratchet must not walk std/ — the lint no longer produces those ` +
+          `counts, so a baseline for them can never fall. Rows: ${JSON.stringify(std)}`,
+      );
+    }
+  },
+});

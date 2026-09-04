@@ -259,7 +259,7 @@ subcommands (`test`) reuse the same pump unchanged.
 A `cli.vl` module, joined into the compile alongside the driver, that:
 
 1. reads argv, classifies the subcommand and flags (`--severity`, `--concise`,
-   `--exclude`, `-w`, `--fix`, …);
+   `--exclude`, `--include-std`, `-w`, `--fix`, …);
 2. drives the work: for `check`/`fmt`, push the target onto a work-stack; while it
    has pending directories, emit `CMD_LIST_DIR` and, on each committed entry,
    apply `SKIP_DIRS` + the glob matcher (VL) to decide recurse / collect / skip;
@@ -335,6 +335,36 @@ cannot-read errors keep their stderr message and emit no JSON). ANSI is never
 emitted in `--json` mode regardless of the host-resolved `--color`; the human
 summary line is suppressed (stderr keeps only notes like the `--fix` count, so
 stdout stays pure JSON).
+
+## `std:` diagnostics are withheld unless asked for (`--include-std`)
+
+A `vl check` target resolves its whole module graph, so every `import … from
+"std:…"` puts std's own source under the same lint tier as the file being
+checked. None of it is the author's to fix: `vl check tools/replay-info.vl` in an
+external consumer printed 44 warnings, **42 of them inside std**, burying the two
+that were about the target (glean VL-014, `~/glean/docs/vl-issues.md`; D1601).
+
+So a diagnostic whose owning module key starts with `std:` — the spelling an
+import resolves to — is withheld unless `--include-std` is passed. It counts
+nowhere while withheld: not in the error/warning tally, not in the `--severity`
+gate, not in the JSON array. A withheld run says so on stderr in both human and
+`--json` mode (`(3 std warnings hidden — --include-std shows them)`), so nothing
+is dropped in silence.
+
+Two boundaries the rule keeps:
+
+- **Errors are always shown.** A type error inside std means the toolchain is
+  broken, not the program, and hiding it would leave a build failing with no
+  diagnostic at all.
+- **std's own author is unaffected.** `vl check std/fmt.vl` names its target
+  `std/fmt.vl`, not `std:fmt`, so `scripts/lint-self.sh`'s `std/` run still
+  gates on everything std reports.
+
+The complementary half is in the lint: `comment-block-too-long`,
+`comment-shouting`, `comment-history` and `comment-measurement-uncited` implement
+`docs/internals/comment-style.md`, which is the **compiler's** rubric, and are
+skipped for a std module — std's comments are consumer API surface and are graded
+by `std-comment-audience` against `std-api-review.md` §4 instead.
 
 ## Where a `vl` binary finds std and its seed
 

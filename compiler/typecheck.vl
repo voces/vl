@@ -16,6 +16,7 @@ import {
   f64LitOverflows,
   intLexemeIsExactF32,
   numLexIsFloat,
+  numLexRadixBits,
   parseI32,
   parseI64Pair,
 } from "./emit_bignum"
@@ -1392,6 +1393,54 @@ function arrDefOperandElemPeek(exprIx: i32) {
   -1
 }
 
+// The array row an enclosing index store is about to pin, live only while that store's value is
+// checked; -1 everywhere else.
+let asgOpenElemRow = -1
+
+// The row of an index store's receiver when its element is still open — the row a value in the
+// store's own right-hand side may pin. -1 for every other target.
+function asgOpenElemRowOf(tgtIx: i32) {
+  if tgtIx < 0 { return -1 }
+  const g = P.nodes[tgtIx]
+  if g is Index {
+    const at = nodeTyIxOf(g.idxArr)
+    if at < 0 { return -1 }
+    const t = T.tys[at]
+    if t is TyArray {
+      if t.aElem < 0 { return at }
+    }
+  }
+  -1
+}
+
+// Pin `asgOpenElemRow`'s open element from a store's value type `vt` when `exprIx` reads that same
+// row, and answer the element's value type; -1 when it is some other read. A store whose value
+// reads the place it writes (`xs[i] += v`, or that spelled out) has no other moment to pin: the
+// read answers `-1`, the operator floor turns that into `TY_ERR`, and the store banks it. D1603.
+function asgReadElemPin(exprIx: i32, vt: i32) {
+  if asgOpenElemRow < 0 || exprIx < 0 { return -1 }
+  if vt < 0 || vt == TY_ERR || vt == TY_VOID { return -1 }
+  if tyHasHole(vt) { return -1 }
+  const e = P.nodes[exprIx]
+  if e is Index {
+    if nodeTyIxOf(e.idxArr) != asgOpenElemRow { return -1 }
+    const t = T.tys[asgOpenElemRow]
+    if t is TyArray {
+      if t.aElem >= 0 { return -1 }
+      t.aElem = vt
+      tyMutEpoch = tyMutEpoch + 1 // the store's own value pinned the element in place
+      const el = arrElemValueTy(vt)
+      // The read's recorded type too, for `arrDefOperandElemPeek`'s reason: `checkNode` banked
+      // the `-1` a moment ago and the emitter reads that entry.
+      if !inferQuiet {
+        if exprIx < nodeTyIx.length { nodeTyIx[exprIx] = el }
+      }
+      return el
+    }
+  }
+  -1
+}
+
 // D1512 — the one place an unpinned intrinsic hole acquires its element: whatever the link graph
 // can still reach (`resolveHoleLinks`, run first), else the `i32` default. Returns the row's
 // element after the pin, or -1 when the row is not an array. Both sites that default such a hole
@@ -2241,6 +2290,11 @@ let isParentElseTyIx: i32[] = []
 // `nodeTyIx` keeps the checker's self-inferred type for its existing consumers; the emitter's rep
 // keying reads `nodeRepTyIxOf`, which falls back to `nodeTyIxOf` when nothing is recorded.
 let nodeRepTyIx: i32[] = []
+// Literal-width sidecar, parallel to `nodeTyIx`: true at a radix `NumLit` whose destination is a
+// 64-bit slot, so its bit pattern is read at 64 bits rather than at the width its digits imply.
+// `checkNodeReal` consults it so a re-check keeps the adopted width, and the emitter reads the
+// re-stamped `nodeTyIx` — DECISIONS.md §"A hex literal is a bit pattern".
+let litWide64: boolean[] = []
 // Annotation atom-count sidecar: how many top-level union atoms the annotation node's emit-time
 // spelling is joined from, banked by `canonEmitTypeNames`, the producer of that spelling. The
 // count cannot be recovered from the arena — an annotation over two same-shape declared structs
@@ -2320,6 +2374,10 @@ let nwBodyScopedNames: {[string]: i32} = Map()
 // sentence. Saved and restored beside `T.curRet` in `checkFuncDeclNode`; "" at
 // module scope and for an anonymous lambda.
 let curFnEscName = ""
+// Is the enclosing function's void return the bare-`return` pin rather than an annotation?
+// Read only to explain a `return <expr>` mismatch no written `: void` accounts for. Saved
+// and restored beside `curFnEscName`.
+let curFnBareRetVoid = false
 // Flat-record sidecar: the layout of every `flat type N = { … }`, built by `resolveFlatLayouts`
 // and read by the `N.size` / `N.field` fold in `checkMemberNode`. Offsets are the running sum of
 // the declared field widths and the compiler never inserts a byte — no alignment, no pad, no
@@ -3092,6 +3150,7 @@ export function initChecker() {
   isParentTyIx = []
   isParentElseTyIx = []
   nodeRepTyIx = []
+  litWide64 = []
   annUnionAtoms = []
   cFuncPinTyIx = -1
   cObjPinTyIx = -1
@@ -7257,12 +7316,134 @@ function fnValVoidCoerce(srcExpr: i32, srcTy: i32, dstTy: i32) {
   false
 }
 
+// Has this radix literal node adopted a 64-bit destination? Read by `checkNodeReal` so a re-check
+// keeps the adopted width, and by the emitter's union-atom picker.
+export function litWide64Of(ix: i32) {
+  if ix >= 0 {
+    if ix < litWide64.length { return litWide64[ix] }
+  }
+  false
+}
+
+// The integer width a destination pins on a radix literal delivered to it: 64 for an `i64` slot,
+// 32 for an `i32` one, -1 when it has no opinion — `u8` reports through its own arm in
+// `assignableExpr`, and a float or literal-union slot leaves the literal its default width.
+// Nullable wrappers peel; a union pins 64 only when `i64` is its sole integer atom.
+function dstIntWidth(dstTy: i32, depth: i32) {
+  if dstTy < 0 || depth <= 0 { return -1 }
+  const dtix = nonNullTy(dstTy)
+  if dtix < 0 { return -1 }
+  const pn = primNameOf(dtix)
+  if pn == "i64" { return 64 }
+  if pn == "i32" { return 32 }
+  if pn != null { return -1 }
+  const d = T.tys[dtix]
+  if d is TyUnion {
+    const members: i32[] = []
+    flattenVariantsInto(dtix, members)
+    let sawI64 = false
+    let sawNarrow = false
+    let mi = 0
+    while mi < members.length {
+      const mw = dstIntWidth(members[mi], depth - 1)
+      if mw == 64 { sawI64 = true }
+      if mw == 32 { sawNarrow = true }
+      if primNameOf(members[mi]) == "u8" { sawNarrow = true }
+      mi = mi + 1
+    }
+    if sawI64 && !sawNarrow { return 64 }
+  }
+  -1
+}
+
+// The sentence a radix lexeme gets when its pattern is wider than the destination. One home so the
+// no-destination report (64 bits, the widest VL has) and the pinned one read alike.
+function radixLitTooWideMsg(lex: string, width: i32) {
+  let kind = "a hex literal"
+  if lex.length >= 2 {
+    const p = lex[1]
+    if p == 'b' || p == 'B' { kind = "a binary literal" }
+    else if p == 'o' || p == 'O' { kind = "an octal literal" }
+  }
+  if width >= 64 {
+    return lex +
+      " does not fit a 64-bit destination — " +
+      kind +
+      " is a bit pattern of the destination's width, and 64 bits is the widest VL has"
+  }
+  lex +
+    " does not fit a " +
+    i32ToStr(width) +
+    "-bit destination — " +
+    kind +
+    " is a bit pattern of the destination's width; write it in decimal for its value, or give it an i64 destination"
+}
+
+// Pin the radix literal at `litIx` to `width`. Answers 2 when this reported (the caller then
+// answers the flow true, so the opaque width mismatch is not said twice), else 1 when the literal
+// adopted 64 bits, else 0. A pattern past 64 bits reported at the literal itself, so it is silent
+// here.
+function radixLitAdoptWidth(litIx: i32, width: i32) {
+  const t = P.nodes[litIx]
+  if t is NumLit {
+    const bits = numLexRadixBits(t.numText)
+    if bits > 64 { return 2 }
+    if width == 64 {
+      while litWide64.length <= litIx { litWide64.push(false) }
+      litWide64[litIx] = true
+      if litIx < nodeTyIx.length { nodeTyIx[litIx] = TY_I64 }
+      return 1
+    }
+    if bits > width {
+      if !inferQuiet { tErr(radixLitTooWideMsg(t.numText, width), litIx) }
+      return 2
+    }
+  }
+  0
+}
+
+// The innermost node `ix` peels to through parentheses, or `ix` itself.
+function parenPeelIx(ix: i32) {
+  if ix < 0 { return ix }
+  const e = P.nodes[ix]
+  if e is Paren { return parenPeelIx(e.parInner) }
+  ix
+}
+
+// Pin the radix literal `srcExpr` delivers into `dstTy` to the destination's width. An object
+// literal's fields and an array literal's elements reach their own destination sub-type through
+// `assignableExpr`'s field-wise and element-wise recursion, which re-enters here. A unary minus is
+// not peeled: it makes the literal an operand rather than the delivered value.
+function radixLitAdoptDst(srcExpr: i32, dstTy: i32) {
+  if inferQuiet || srcExpr < 0 || dstTy < 0 { return 0 }
+  const lix = parenPeelIx(srcExpr)
+  const e = P.nodes[lix]
+  if e is NumLit {
+    if numLexRadixBits(e.numText) < 0 { return 0 }
+    const w = dstIntWidth(dstTy, 3)
+    if w < 0 { return 0 }
+    return radixLitAdoptWidth(lix, w)
+  }
+  0
+}
+
+// A radix literal takes the OTHER operand's width, so `x >= 0x80000000` over an `i64` compares the
+// 64-bit pattern rather than the i32 one its digits imply. Upward only: a 32-bit peer leaves a
+// wide literal alone, so `x + 0x1_0000_0000` still widens the expression to i64.
+function radixLitAdoptPeer64(exprIx: i32, peerTy: i32) {
+  if dstIntWidth(peerTy, 3) != 64 { return 0 }
+  radixLitAdoptDst(exprIx, peerTy)
+}
+
 export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   // A generic function value meeting a concrete function type is decided by instantiation inside
   // `assignable`'s `TyFunc` case (`genericFnAssignable`), so it governs nested positions like an
   // array element too, not just this expression-level entry.
   recordElemRepArrayLit(srcExpr, dstTy, 6)
   recordNullHoleObjAdopt(srcExpr, dstTy, 6)
+  // A hex / binary / octal literal is a bit pattern of the destination's width, and this seam is
+  // where every binding / argument / return / field / element / store position delivers one.
+  if radixLitAdoptDst(srcExpr, dstTy) == 2 { return true }
   // Rep sidecar: an ObjLit/ArrayLit whose source type reaches an unresolved empty-collection hole
   // (`{nodes: []}`, `{m: Map()}`) is plainly `assignable` to its concrete destination, so the
   // short-circuit below returns before the adoption block. Record the destination here so the
@@ -7572,36 +7753,22 @@ function u8LexValue(t: string) {
   v
 }
 
-// Does the non-negative integer lexeme `t` (decimal, `0x`, `0b`, `0o`, with `_` separators skipped)
-// fit the i32 range? An un-annotated integer literal defaults to i32 when its value fits and widens
-// to i64 otherwise, since defaulting an out-of-range literal to i32 would silently wrap. A `NumLit`
-// lexeme never carries a sign, so only the positive bound is checked.
+// Does the non-negative integer lexeme `t` default to i32? A DECIMAL lexeme denotes a value and
+// defaults by its magnitude, widening to i64 rather than silently wrapping. A RADIX lexeme
+// (`0x`, `0b`, `0o`) denotes a bit pattern and defaults by its width (`numLexRadixBits`), which
+// is the ruled literal rule — DECISIONS.md §"A hex literal is a bit pattern".
 export function intLexemeFitsI32(t: string) {
+  const rb = numLexRadixBits(t)
+  if rb >= 0 { return rb <= 32 }
   let v = 0
   let i = 0
-  let base = 10
-  if t.length >= 2 && t[0] == '0' {
-    const p = t[1]
-    if p == 'x' || p == 'X' {
-      base = 16
-      i = 2
-    } else if p == 'b' || p == 'B' {
-      base = 2
-      i = 2
-    } else if p == 'o' || p == 'O' {
-      base = 8
-      i = 2
-    }
-  }
+  const base = 10
   while i < t.length {
     const c = t[i]
     if c == '_' {
       i = i + 1
     } else {
-      let d = 0
-      if c >= '0' && c <= '9' { d = c - '0' }
-      else if c >= 'a' && c <= 'f' { d = c - 'a' + 10 }
-      else { d = c - 'A' + 10 }
+      const d = c - '0'
       if v > (2147483647 - d) / base { return false }
       v = v * base + d
       i = i + 1
@@ -8350,6 +8517,194 @@ function unknownTyTextIn(name: string, tail: string) {
     "'" +
     tail +
     tyDidYouMean(part)
+}
+
+// The method twin of `tySpellFrom`/`tySpellTo`, one table per receiver kind: a list, a
+// string and a map answer the same typo with a different name. A target whose ARGUMENTS
+// differ from what was typed (`charAt` takes an index, `slice` a range) is stored as the
+// whole call shape, never a bare name.
+const strMethodSpellFrom = [
+  "charat",
+  "substring",
+  "substr",
+  "touppercase",
+  "tolowercase",
+  "size",
+  "count",
+]
+const strMethodSpellTo = [
+  "slice(i, i + 1)",
+  "slice",
+  "slice",
+  "toUpperAscii",
+  "toLowerAscii",
+  "length",
+  "length",
+]
+const listMethodSpellFrom = ["append", "add", "size", "count", "contains"]
+const listMethodSpellTo = ["push", "push", "length", "length", "includes"]
+const mapMethodSpellFrom = ["put", "containskey", "size"]
+const mapMethodSpellTo = ["set", "has", "length"]
+
+// The intrinsic call-able names `checkCallNode` tests for a string/array receiver, in
+// that order — a tie in the edit distance below keeps the earlier (intrinsic) candidate.
+const strMethodNames = [
+  "slice",
+  "indexOf",
+  "includes",
+  "charCodeAt",
+  "cpAt",
+  "cpLen",
+  "isCharBoundary",
+  "bytes",
+  "length",
+]
+const listMethodNames = [
+  "push",
+  "map",
+  "filter",
+  "pop",
+  "get",
+  "clear",
+  "slice",
+  "length",
+]
+
+// Map/set intrinsic names, gated exactly as `checkCallNode`'s own arms gate them: `set`/
+// `get`/`keys` are a map surface a set must not leak, and `add` is admitted by the value
+// type rather than by flavor.
+function mapMethodNames(recvTy: i32) {
+  const out = ["has", "delete", "values", "length", "size"]
+  const rt = T.tys[recvTy]
+  if rt is TyMap {
+    if rt.mSet == 0 {
+      out.push("set")
+      out.push("get")
+      out.push("keys")
+    }
+    if rt.mSet == 1 || tyIsPrimNamed(rt.mVal, "boolean") { out.push("add") }
+  }
+  out
+}
+
+// Free `self`-functions dispatchable on `recvTy` — the in-scope half of the edit-distance
+// pool, mirroring `ufcsCallTy`'s own lookup without its arity gate: a name search asks
+// whether the function exists, not how many arguments it takes.
+function selfFnNamesFor(recvTy: i32) {
+  const out: string[] = []
+  for name in fnDeclIx.keys() {
+    if declFirstParamIsSelf(name) {
+      const fnTy = lookup(name)
+      if fnTy >= 0 {
+        const ft = T.tys[fnTy]
+        if ft is TyFunc {
+          if ft.fnParamTypes.length > 0 {
+            if assignable(recvTy, ft.fnParamTypes[0]) {
+              const un = demangleName(name)
+              if un.length >= 2 && nameIsBareIdent(un) { out.push(un) }
+            }
+          }
+        }
+      }
+    }
+  }
+  out
+}
+
+// One receiver kind's two-source lookup: the newcomer map above (exact, case-folded)
+// first, then an edit distance (`tyEditDist`, D1590's budget) over `names` plus every
+// in-scope self-function `recvTy` could dispatch to.
+function methodSuggestFrom(
+  spellFrom: string[],
+  spellTo: string[],
+  names: string[],
+  recvTy: i32,
+  prop: string,
+) {
+  let si = 0
+  while si < spellFrom.length {
+    if tyFoldedEq(prop, spellFrom[si]) { return spellTo[si] }
+    si = si + 1
+  }
+  const budget = tySuggestBudget(prop.length)
+  let best = ""
+  let bestD = budget + 1
+  let ni = 0
+  while ni < names.length {
+    const nd = tyEditDist(prop, names[ni])
+    if nd < bestD {
+      bestD = nd
+      best = names[ni]
+    }
+    ni = ni + 1
+  }
+  const cand = selfFnNamesFor(recvTy)
+  let ci = 0
+  while ci < cand.length {
+    if cand[ci].length >= 2 && cand[ci] != prop {
+      const ud = tyEditDist(prop, cand[ci])
+      if ud < bestD {
+        bestD = ud
+        best = cand[ci]
+      }
+    }
+    ci = ci + 1
+  }
+  best
+}
+
+// The name to offer for a missed method call `prop` on `recvTy`, or "" for none —
+// dispatched by receiver kind (string / array / map). A kind with no table (struct,
+// union, an unresolved generic) still gets the edit distance over its self-functions.
+function methodSuggestFor(recvTy: i32, prop: string) {
+  if recvTy < 0 { return "" }
+  if prop.length < 2 { return "" }
+  if !nameIsBareIdent(prop) { return "" }
+  const rt = T.tys[recvTy]
+  if rt is TyPrim {
+    if rt.primName == "string" {
+      return methodSuggestFrom(
+        strMethodSpellFrom,
+        strMethodSpellTo,
+        strMethodNames,
+        recvTy,
+        prop,
+      )
+    }
+  }
+  if rt is TyArray {
+    return methodSuggestFrom(
+      listMethodSpellFrom,
+      listMethodSpellTo,
+      listMethodNames,
+      recvTy,
+      prop,
+    )
+  }
+  if rt is TyMap {
+    // `put`/`containsKey` name the MAP surface — offering them on a set would suggest a
+    // call `checkCallNode`'s own arm refuses, so a set gets the edit distance alone.
+    if rt.mSet == 1 {
+      return methodSuggestFrom([], [], mapMethodNames(recvTy), recvTy, prop)
+    }
+    return methodSuggestFrom(
+      mapMethodSpellFrom,
+      mapMethodSpellTo,
+      mapMethodNames(recvTy),
+      recvTy,
+      prop,
+    )
+  }
+  methodSuggestFrom([], [], [], recvTy, prop)
+}
+
+// The `; did you mean '.<name>'?` clause for a missed method call, or "" when nothing is
+// near enough — the method twin of `tyDidYouMean`, a SUFFIX so `no method '.<prop>' on
+// <type>` stays the prefix every consumer matches on (glean VL-045, D1599).
+function methodDidYouMean(recvTy: i32, prop: string) {
+  const s = methodSuggestFor(recvTy, prop)
+  if s.length == 0 { return "" }
+  "; did you mean '." + s + "'?"
 }
 
 // The SPELLING-TREE resolver, wrapped: bank this subtree's spelling if it is the
@@ -18790,8 +19145,10 @@ function validateUfcsCstrs(
         if tyFieldTyOf(ur, ufcsCstrProp[ci]) < 0 {
           if !assignable(ur, ufcsCstrP0[ci]) {
             let uMsg = memberFloorMsg(ur, ufcsCstrProp[ci])
+            let uSuggest = ""
             if uMsg == "" {
               uMsg = "no method '." + ufcsCstrProp[ci] + "' on " + tyToStr(ur)
+              uSuggest = methodDidYouMean(ur, ufcsCstrProp[ci])
             }
             let uWho = "the callee's body"
             if who != "" { uWho = "the body of `" + who + "`" }
@@ -18803,7 +19160,8 @@ function validateUfcsCstrs(
                 tyToStr(ufcsCstrP0[ci]) +
                 " (" +
                 uWho +
-                " at the call's argument types)",
+                " at the call's argument types)" +
+                uSuggest,
               ix,
             )
           }
@@ -21702,7 +22060,14 @@ function checkCallNode(n: Call, ix: i32) {
       // directly — the array dual of the string/struct/union UFCS paths.
       const au = ufcsCallTy(cfn.memProp, recvTy, n, ix)
       if au >= 0 { return au }
-      tErr("no method '." + cfn.memProp + "' on array " + tyToStr(recvTy), ix)
+      tErr(
+        "no method '." +
+          cfn.memProp +
+          "' on array " +
+          tyToStr(recvTy) +
+          methodDidYouMean(recvTy, cfn.memProp),
+        ix,
+      )
       return TY_ERR
     }
     // Map/Set methods over the `{[K]: V}` rep, gated by FLAVOR: a map exposes
@@ -21821,7 +22186,14 @@ function checkCallNode(n: Call, ix: i32) {
         if rt.mSet == 1 { return mkArrayTy(rt.mKey) }
         return mkArrayTy(rt.mVal)
       }
-      tErr("unknown property `" + mp + "` on " + tyToStr(recvTy), ix)
+      tErr(
+        "unknown property `" +
+          mp +
+          "` on " +
+          tyToStr(recvTy) +
+          methodDidYouMean(recvTy, mp),
+        ix,
+      )
       return TY_ERR
     }
     // String methods: `.slice(i32,i32)->string`, `.indexOf(string)->i32`,
@@ -21987,7 +22359,10 @@ function checkCallNode(n: Call, ix: i32) {
           )
           return TY_ERR
         }
-        tErr("no method '." + sp + "' on string", ix)
+        tErr(
+          "no method '." + sp + "' on string" + methodDidYouMean(recvTy, sp),
+          ix,
+        )
         return TY_ERR
       }
     }
@@ -23173,6 +23548,51 @@ function ifChainExhausts(ifIx: i32) {
   true
 }
 
+// Does the block hold a bare `return`, recursing into if/while/for bodies but never into a
+// nested function, whose returns are its own? A bare `return` is legal only where nothing is
+// owed, so one anywhere in a body is the author writing `: void`; the checker pins the return
+// type from it and `computeVoidFns` asks this same predicate for the functype (D1600).
+export function blockHasBareReturn(blockIx: i32): boolean {
+  const b = P.nodes[blockIx]
+  if b is Block {
+    const stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      const st = P.nodes[stmts[i]]
+      if st is RetStmt {
+        if st.retArg < 0 { return true }
+      } else if st is IfStmt {
+        if ifChainHasBareReturn(stmts[i]) { return true }
+      } else if st is WhileStmt {
+        if blockHasBareReturn(st.whileBody) { return true }
+      } else if st is ForRange {
+        if blockHasBareReturn(st.frBody) { return true }
+      } else if st is ForIn {
+        if blockHasBareReturn(st.fiBody) { return true }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// The `else if` hop of `blockHasBareReturn`: a chain's arms are the same question.
+export function ifChainHasBareReturn(ifIx: i32): boolean {
+  const st = P.nodes[ifIx]
+  if st is IfStmt {
+    if blockHasBareReturn(st.ifThen) { return true }
+    if st.ifElse >= 0 {
+      const els = P.nodes[st.ifElse]
+      if els is Block {
+        if blockHasBareReturn(st.ifElse) { return true }
+      } else if els is IfStmt {
+        if ifChainHasBareReturn(st.ifElse) { return true }
+      }
+    }
+  }
+  false
+}
+
 // A function declaration: resolve param/return annotations (narrowing the Param/
 // TypeRef children), bind the signature, and check the body in a fresh scope.
 // An UN-ANNOTATED return type is INFERRED from the body — its `return`s and
@@ -23211,6 +23631,15 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
     if isVoidTy(cbExpectedRetFor(fnIx)) {
       inferring = false
       noteVoidCtxLambda(fnIx)
+    }
+  }
+  // The same flip for the same reason: a bare `return` writes `: void`, so stop inferring and
+  // take the `!inferring` ladder's `TY_VOID` default, which already discards a valued tail.
+  let bareRetVoid = false
+  if inferring {
+    if blockHasBareReturn(n.fnBody) {
+      inferring = false
+      bareRetVoid = true
     }
   }
   // The infer-stack KEY: a named function uses its name (so self-recursion is detected); an
@@ -23451,6 +23880,10 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   // is actually inside.
   const savedEscName = curFnEscName
   if n.fnName != "" { curFnEscName = n.fnName }
+  // Why this body's return type is void, for the return that disagrees with it: nobody wrote
+  // `: void`, so the mismatch has to name the bare `return` that decided it.
+  const savedBareRetVoid = curFnBareRetVoid
+  curFnBareRetVoid = bareRetVoid
   // LSP: the function name binds in the OUTER scope (decl-scope chain), but its
   // body — params + statements — is checked under this pushed scope. Record the
   // name occurrence against the enclosing decl scope before descending.
@@ -23653,6 +24086,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   const bodyTotalForRet = nodeIsTotal(n.fnBody)
   T.curRet = savedRet
   curFnEscName = savedEscName
+  curFnBareRetVoid = savedBareRetVoid
   daRestore(daSavedUnassigned)
   let tpPop = 0
   while tpPop < n.fnTyParams.length {
@@ -24708,7 +25142,11 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
     !retNaturalErr
   ) {
     if !inlayHole(retNatural) && !isNeverTy(retNatural) && ret != TY_ERR {
-      if tyEq(retNatural, ret) { recordRedundantRet(n, fnIx, ret) }
+      // A bare `return` in the body makes the un-annotated spelling void, so the annotation
+      // is load-bearing however well its type matches the tail (D1600).
+      if tyEq(retNatural, ret) && !blockHasBareReturn(n.fnBody) {
+        recordRedundantRet(n, fnIx, ret)
+      }
     }
   }
   retNatural = savedRetNatural
@@ -25883,6 +26321,13 @@ function checkNodeReal(ix: i32) {
       // yields ±inf per IEEE-754 — this rejects only literal text.
       if f64LitOverflows(n.numText) { tErr("float literal overflows f64", ix) }
       return TY_F64
+    }
+    // A radix literal that adopted a 64-bit destination keeps that width across re-checks; one
+    // wider than 64 bits has no destination at all, and says so here rather than wrapping.
+    if litWide64Of(ix) { return TY_I64 }
+    if numLexRadixBits(n.numText) > 64 {
+      tErr(radixLitTooWideMsg(n.numText, 64), ix)
+      return TY_I64
     }
     if intLexemeFitsI32(n.numText) { return TY_I32 }
     return TY_I64
@@ -32727,7 +33172,13 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
   // read to `(i32) => i32 | null`, then seeds `q2: i32`). Without it the bare `(q2) => …` default is
   // an uninferable-param reject. Mirrors the `=` seeding; the LHS non-null shape drives the lambda.
   if op == "??" { seedExpected(n.binRight, lt) }
+  // Name the row an index store is about to pin, for the length of that store's value only, so a
+  // read of the same place inside the value can pin the element rather than answer `TY_ERR`.
+  const savedAsgRow = asgOpenElemRow
+  asgOpenElemRow = -1
+  if op == "=" { asgOpenElemRow = asgOpenElemRowOf(n.binLeft) }
   let rt = checkNode(n.binRight)
+  asgOpenElemRow = savedAsgRow
   // The RIGHT operand takes the same answer, for the same reason and under the same bar. The
   // guard below covers only `lt`, so without this `print(1 + a[0])` refuses where its annotated
   // face runs and `print("v=" + a[0])` is check-clean INVALID WASM. D1566.
@@ -32735,6 +33186,15 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
     if rt < 0 {
       const peekR = arrDefOperandElemPeek(n.binRight)
       if peekR >= 0 { rt = peekR }
+    }
+    // A store's value reading the place it writes: the value is what the program said the
+    // element is, and the read has no answer of its own until this pins one.
+    if lt < 0 {
+      const asgPin = asgReadElemPin(n.binLeft, rt)
+      if asgPin >= 0 {
+        lt = asgPin
+        ltOut[0] = asgPin // the out-column is the left operand's exact type, pin included
+      }
     }
   }
   // The `??` DEFAULT is the value the expression yields when the LHS is null, so a `void`
@@ -32748,6 +33208,12 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
     // typed slot is on the LEFT of the operator, which is why the delivery had no pin
     // while every annotated-destination sibling had one (D1591).
     constrainEmptyExpr(n.binRight, rt, nonNullTy(lt))
+  }
+  // A radix literal operand takes the other side's width (the ruled literal rule). Assignment is
+  // excluded: its destination is `assignableExpr`'s, which pins the narrowing direction too.
+  if op != "=" && op != "&&" && op != "||" {
+    if radixLitAdoptPeer64(n.binLeft, rt) == 1 { lt = TY_I64 }
+    if radixLitAdoptPeer64(n.binRight, lt) == 1 { rt = TY_I64 }
   }
   // A binary op with a HOLE operand can't decide its form until the hole is bound at the call —
   // record the deferred constraint (skipping assignment / logical, handled by their own arms).
@@ -35030,6 +35496,9 @@ function castPinAdjudicate(k: i32, at: i32) {
   const mode = holeCastMode[k]
   if mode == "trap" { return 0 }
   const castIx = holeCastIx[k]
+  // `as%` picks no arm and cannot fail, so the pin answers only the two questions a hole hid:
+  // is the pinned operand a number at all, and is either side a float.
+  if mode == "wrap" { return castPinWrapCheck(at, target, castIx) }
   // A NULLABLE OPERAND IS A UNION OPERAND, expanded exactly as `checkCastNode`'s arm expands
   // it — one rule, two entry points, so the hole and the annotation cannot disagree.
   let argU = at
@@ -35136,6 +35605,36 @@ export function numCastDomainName(asTy: string, target: i32): string {
   primNameStr(primNameOf(target))
 }
 
+// Reports and answers true when a wrap cast names a float on either side. `as%` is integers
+// only by ruling, and the refusal names the family that does convert a float. One home for the
+// wording, because a hole operand re-asks it at the call site that pins the width.
+function wrapCastFloatRefused(argTy: i32, target: i32, ix: i32): boolean {
+  const sn = primNameStr(primNameOf(argTy))
+  const tn = primNameStr(primNameOf(target))
+  let bad = ""
+  if sn == "f32" || sn == "f64" { bad = sn }
+  if tn == "f32" || tn == "f64" { bad = tn }
+  if bad == "" { return false }
+  tErr(
+    "`as%` wraps between integer widths, and " +
+      bad +
+      " is a float — use the exact family (`as!` traps, `as?` yields null)",
+    ix,
+  )
+  true
+}
+
+// One parked `as%` cast, re-asked under the type its call site pinned the hole to. Reported in
+// `checkCastNode`'s own words, so the pin and the direct spelling cannot disagree.
+function castPinWrapCheck(at: i32, target: i32, castIx: i32) {
+  if !isNumeric(at) {
+    tErr("`as` supports numeric conversions only", castIx)
+    return 0
+  }
+  if wrapCastFloatRefused(at, target, castIx) { return 0 }
+  0
+}
+
 function checkCastNode(n: AsExpr, ix: i32) {
   const arg = checkNode(n.asObj)
   let target = nameToTyAt(n.asTy, ix)
@@ -35181,7 +35680,9 @@ function checkCastNode(n: AsExpr, ix: i32) {
       }
     }
   }
-  if argU >= 0 {
+  // `as%` picks no arm — it is the wrap cast over two integer widths, so a union operand is
+  // simply not a number and takes the numeric ladder's own refusal below.
+  if argU >= 0 && n.asMode != "wrap" {
     const argT = T.tys[argU]
     if argT is TyUnion {
       // `as u8` NARROWS A NUMBER, IT DOES NOT PICK AN ARM (D1587). A union operand would take
@@ -35246,6 +35747,12 @@ function checkCastNode(n: AsExpr, ix: i32) {
   if !isNumeric(arg) || !targetIsScalar {
     tErr("`as` supports numeric conversions only", ix)
     return TY_ERR
+  }
+  // `as%` keeps the low bits and cannot fail, so it owes none of the trio's sad-path answers
+  // and the target type is the whole result (`DECISIONS.md` §"`as%` is the wrap cast").
+  if n.asMode == "wrap" {
+    if wrapCastFloatRefused(arg, target, ix) { return TY_ERR }
+    return target
   }
   // THE NUMERIC ARM HONOURS THE TRIO TOO (json-design §6 q2, owner 2026-09-02). Until now
   // this arm returned `target` whatever the suffix said, so `3.9 as? i32`, `3.9 as! i32` and
@@ -36704,12 +37211,29 @@ function checkForInNode(n: ForIn, ix: i32) {
 }
 // ── return ─────────────────────────────────────────────────────────────────
 
+// Where an "expected void" comes from when nobody wrote `: void`: the bare `return`
+// elsewhere in the body, which pins the return type (D1600). Empty for every other want.
+function bareRetVoidNote(want: i32): string {
+  if !curFnBareRetVoid { return "" }
+  if !isVoidTy(want) { return "" }
+  " — a bare `return` in this body makes the function void; drop it, or return no value here"
+}
+
 // Extracted from `checkNodeReal`'s `RetStmt` arm (C3: thin the dispatcher).
 function checkRetStmtNode(n: RetStmt, ix: i32) {
   const want = T.curRet
   if n.retArg < 0 {
-    if want >= 0 && !assignable(TY_VOID, want) {
-      tErr("return needs a value of type " + tyToStr(want), ix)
+    // `tyIsHole` because `assignable` waves a `TyVar` past any destination, so a declared
+    // `: T` accepted the bare return here and the emitter refused the instance (D1600).
+    if want >= 0 && (tyIsHole(want) || !assignable(TY_VOID, want)) {
+      // Both route-arounds, because either can be intended: the annotation is what makes this
+      // return illegal, so dropping it is as valid a fix as supplying a value.
+      tErr(
+        "return needs a value of type " +
+          tyToStr(want) +
+          " — return a value, or annotate this function `: void`",
+        ix,
+      )
     }
     return TY_VOID
   }
@@ -36761,6 +37285,7 @@ function checkRetStmtNode(n: RetStmt, ix: i32) {
         tyToStr(want) +
         ", got " +
         tyToStr(got) +
+        bareRetVoidNote(want) +
         charLitForStringNote(n.retArg, want),
       ix,
     )

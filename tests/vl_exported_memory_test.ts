@@ -133,15 +133,15 @@ Deno.test({
     // The guest writes a small header of i32 words, then an f32 column — the
     // shape webcraft's render-publish path wants to read without marshalling.
     // f32 1.0 / 1.5 / -2.25 / 0.5 as raw bit patterns, laid down by i32 stores.
-    // (-2.25 is 0xC0100000, whose top bit is set: a VL integer literal takes the
-    // NARROWEST type that holds it exactly, so the hex spelling would be an i64
-    // and `__store_i32__` would reject it. Spelled as the signed i32 it is.)
+    // (-2.25 is 0xC0100000, whose top bit is set. A hex literal is a bit pattern
+    // of its destination's width and `__store_i32__`'s parameter is i32, so the
+    // hex spelling is the i32 with those bits.)
     const { exports } = await runWasm(await build(`
 __store_i32__(0, 0x0000BEEF)
 __store_i32__(4, 4)
 __store_i32__(16, 0x3F800000)
 __store_i32__(20, 0x3FC00000)
-__store_i32__(24, -1072693248)
+__store_i32__(24, 0xC0100000)
 __store_i32__(28, 0x3F000000)
 print(__load_i32__(0))
 `));

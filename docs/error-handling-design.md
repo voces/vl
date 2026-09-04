@@ -299,6 +299,24 @@ behaviors on one happy path; the happy-path type is identical in all three
 | `x as? T` | yields `null` | a miss is expected and the reason is not needed |
 | `x as! T` | **traps** | a miss is a bug; or there is no caller (`main`) |
 
+**The family is FOUR, not three (owner, 2026-09-04): `x as% T` WRAPS.** The trio
+above is exact-or-fail, so all three of its rows are about a sad path. `as%`
+has none — it keeps the target width's low bits and always succeeds, which is
+the operation a binary format needs and the one no exact cast can express
+(DECISIONS.md §"`as%` is the wrap cast, the fourth member of the `as` family";
+asked for as `~/glean/docs/vl-issues.md` §VL-023 and §VL-044). Integers only,
+by ruling — a float on either side is refused at check and the message names
+`as!` / `as?`, and a non-numeric operand takes the sentence the exact casts
+already give it. A literal operand FOLDS, so `0xb81a1aaa as% i32` is the
+constant −1206248790 and a mask, a seed or a polynomial can be written down.
+
+| source → target | meaning |
+| --- | --- |
+| `i64 as% i32` | the low 32 bits, two's complement |
+| `i32 as% u8`, `i64 as% u8` | the low 8 bits (an `i32` in 0..255 — `u8` is the domain) |
+| `i32 as% i64` | sign-extend, the same as `as`; allowed for uniformity |
+| `i32 as% i32`, `i64 as% i64` | identity |
+
 This is Swift's `try` / `try?` / `try!` trio with `as` as the keyword, and it
 matches how Rust (`?` / `.ok()` / `unwrap()`) and Zig (`try` / `catch null` /
 `catch unreachable`) each ended up with all three on three spellings. The

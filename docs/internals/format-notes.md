@@ -184,16 +184,17 @@ value; a chained `x as i32 as i64` stays flat (an `AsExpr` operand is not
 composite), which round-trips idempotently.
 
 THE SUFFIX IS PART OF THE OPERATOR, AND DROPPING IT CHANGED THE PROGRAM. This printed
-a bare `" as "` for all three members of the trio, so `vl fmt` silently rewrote
+a bare `" as "` for every member of the family, so `vl fmt` silently rewrote
 `x as! T` and `x as? T` to `x as T` — turning a TRAP into a propagation, or a coalesce
 into one, with no diagnostic. That is the one thing a formatter may never do, and it was
 reachable on any file using the error-handling trio at all: the three differ only in
 this token (`error-handling-design.md` §Trio — `as` propagates, `as?` coalesces to null,
-`as!` traps).
+`as!` traps, `as%` wraps). `as%` is the fourth suffix and carries the same risk: dropping
+its `%` turns a wrap into an exact-or-fail propagation.
 
 The mode rides the node (`asMode`, set by the parser from the token it consumed), so
 like `asTy` it needs no source recovery — the bug was simply never asking. Pinned by
-`tests/cases/fmt/as-trio-suffix-preserved.vl`, which formats all three and diffs.
+`tests/vl_fmt_test.ts`, which round-trips all four beside a `%` remainder.
 ```
 
 ## member / call CHAIN layout — the threshold and the flat fit

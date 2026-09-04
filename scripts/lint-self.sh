@@ -10,8 +10,10 @@
 # the entry covers all of compiler/*.vl with source-file positions.
 # `prefer-const` stays safe on cross-module reassignment because EXPORTED
 # bindings are exempt (another module may rebind them). `std/` is linted as
-# ordinary modules. `tests/` — the corpus of deliberately-malformed fixtures —
-# is excluded by construction (never passed in).
+# ordinary modules EXCEPT for the four comment codes, which implement the
+# compiler's rubric and skip a std module — `std-comment-audience` grades std's
+# comments instead (D1601). `tests/` — the corpus of deliberately-malformed
+# fixtures — is excluded by construction (never passed in).
 #
 # fmt IS gated here too (below): `vl fmt --check` over the source `.vl`
 # (compiler/, std/, scripts/) — only `.vl` files are gathered, so the `.ts`/`.sh`
