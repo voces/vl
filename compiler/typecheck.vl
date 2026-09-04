@@ -1070,6 +1070,23 @@ let pendTys: i32[] = []
 let pendAts: i32[] = []
 let pendDepths: i32[] = []
 
+// EMPTY-COLLECTION HOLES DELIVERED TO AN INFERRED RETURN (D1591). At a DECLARED return the
+// destination is known when the delivery is checked, so `constrainEmptyExpr` pins there and
+// then; under inference the destination is the JOIN of every return, which is not final until
+// the body's last statement has run — and a `return none` written BEFORE the arm that supplies
+// the type has nothing to pin against at all. Each such delivery is recorded here and pinned
+// once, with the body scope still live, so the pin lands before `flushUninferred` grades the
+// binding's hole. `irhMarks` scopes the rows to ONE body: a nested function's deliveries must
+// never pin against the enclosing function's join.
+// AND THE JOIN IS NOT THE DESTINATION. `joinRetTys` collapses `f64[]` against an OPEN `[]` by
+// mutual assignability and can keep the open side, so pinning against `inferObserved` would
+// pin a row against itself. `irhConcrete` banks the first return witness that is a shape holes
+// can pin THROUGH, which is the type the concrete arm actually named.
+const irhExprs: i32[] = []
+const irhTys: i32[] = []
+const irhMarks: i32[] = []
+const irhConcrete: i32[] = []
+
 // THE NEVER-FILLED A-INFER-NULL HOLE (D1576). `let x = null` binds `mkNullableTy(-1)` and
 // the first non-null assignment fills the inner IN PLACE, so at the DECLARATION nobody can
 // say whether the binding is `T | null` or just `null`. These three parallel arrays record
@@ -1526,6 +1543,64 @@ function constrainEmptyExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   constrainEmpty(srcTy, dstTy)
 }
 
+// The shapes `constrainEmptyD` descends — a destination witness worth banking for the
+// deferred inferred-return pin. A scalar witness would occupy the slot and pin nothing.
+function tyPinsEmptyHoles(ty: i32, depth: i32): boolean {
+  if ty < 0 || depth <= 0 { return false }
+  const t = T.tys[ty]
+  if t is TyNullable { return tyPinsEmptyHoles(t.nInner, depth - 1) }
+  t is TyArray || t is TyMap || t is TyObj
+}
+
+// Open the deferred-pin frame for one function body (D1591). Pushed and popped with the
+// body scope, so the rows a nested body records are its own.
+function pushInferRetHoles() {
+  irhMarks.push(irhExprs.length)
+  irhConcrete.push(-1)
+  0
+}
+
+// Record a value delivered to an INFERRED return — a `return e`, the body's trailing
+// expression, or a tail `if`/`else` arm. One that still reaches an open collection hole
+// becomes a row to pin; the first one that does NOT is this body's destination witness,
+// which is what the rows are pinned against at the flush (D1591).
+function noteInferRetWitness(srcExpr: i32, srcTy: i32) {
+  if irhMarks.length == 0 { return 0 }
+  if srcTy < 0 { return 0 }
+  if tyReachesEmptyHole(srcTy, 8) {
+    irhExprs.push(srcExpr)
+    irhTys.push(srcTy)
+    return 0
+  }
+  const top = irhConcrete.length - 1
+  if irhConcrete[top] < 0 && tyPinsEmptyHoles(srcTy, 8) {
+    irhConcrete[top] = srcTy
+  }
+  0
+}
+
+// Pin every delivery this body recorded against the shape a concrete return witness named,
+// and retire the frame. With NO such witness nothing is pinned — the program never said what
+// the element type is, so the binding keeps its own `cannot infer a type` floor (D1591).
+function flushInferRetHoles() {
+  if irhMarks.length == 0 { return 0 }
+  const top = irhMarks.length - 1
+  const mark = irhMarks[top]
+  const dst = irhConcrete[top]
+  irhMarks.pop()
+  irhConcrete.pop()
+  let i = mark
+  while i < irhTys.length {
+    if dst >= 0 { constrainEmptyExpr(irhExprs[i], irhTys[i], dst) }
+    i = i + 1
+  }
+  while irhTys.length > mark {
+    irhExprs.pop()
+    irhTys.pop()
+  }
+  0
+}
+
 function constrainEmptyD(srcTy: i32, dstTy: i32, depth: i32) {
   if srcTy < 0 || dstTy < 0 || depth <= 0 { return 0 }
   const s = T.tys[srcTy]
@@ -1896,10 +1971,41 @@ function flushNullHoles(depth: i32) {
   0
 }
 
+// The FIX CLAUSE of the uninferable-binding diagnostic: what the binding is missing, and the
+// two ways to supply it. `add a type annotation` alone read as though the annotation were the
+// ONLY route, and the route that keeps inference — deliver the value where its type is known —
+// is the one every usage-driven pin serves (D1591). Spelled with the binding's own name so the
+// suggested line can be pasted, and with the constructor its flavor actually uses.
+function uninferredFixText(name: string, ty: i32) {
+  const useIt = " until it is used; use it where its type is known, or annotate the binding ("
+  if ty >= 0 {
+    const t = T.tys[ty]
+    if t is TyMap {
+      if t.mSet == 1 {
+        return "an empty Set has no element type" +
+          useIt +
+          "`const " +
+          name +
+          ": {[string]: boolean} = Set()`)"
+      }
+      return "an empty Map has no key or value type" +
+        useIt +
+        "`const " +
+        name +
+        ": {[string]: i32} = Map()`)"
+    }
+  }
+  "an empty array literal has no element type" +
+    useIt +
+    "`const " +
+    name +
+    ": i32[] = []`)"
+}
+
 // Flush every pending binding recorded at scope `depth` (called just before the
 // scope is popped, and for the global scope at program end). A binding whose hole is
 // still open at this point will never be pinned, so report the unified
-// "cannot infer a type" diagnostic — the same wording the host raises.
+// "cannot infer a type" diagnostic.
 function flushUninferred(depth: i32) {
   flushNullHoles(depth)
   const keepN: string[] = []
@@ -1914,7 +2020,8 @@ function flushUninferred(depth: i32) {
           tErr(
             "cannot infer a type for '" +
               pendNames[i] +
-              "' — add a type annotation",
+              "' — " +
+              uninferredFixText(pendNames[i], pendTys[i]),
             pendAts[i],
           )
         }
@@ -2410,6 +2517,10 @@ let inferSawErr = false
 // tail value out-of-band so an `if … { v } else { w }` EXPRESSION can join its branch
 // values. Read immediately after a `checkNode(block)`.
 let blockTailTy = -1
+// The NODE `blockTailTy` came from, or -1 for a valueless block. Written in the same place
+// and read in the same breath, so a tail `if`/`else` arm can hand its own expression to
+// `constrainEmptyExpr` rather than the arms' join, which is a different arena row (D1591).
+let blockTailIx = -1
 // True while checking a node whose VALUE is the enclosing function's return (an
 // implicit-return tail position): the function-body tail statement, and — propagated —
 // the tail of each branch of a tail `if`/`else`. Gates seeding `inferObserved` from a
@@ -24810,6 +24921,9 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   narFnEpoch = narFnEpoch + 1
   // Check the body in a fresh scope sharing the parameters.
   pushScope(n.fnBody)
+  // Paired with the `flushInferRetHoles` below, which must run while this scope is still
+  // live — `popScope` is what raises the uninferable-binding floor (D1591).
+  pushInferRetHoles()
   // OWN the deferred constraints this body records, so a call site can tell whose type
   // parameters they speak about (`cstrOwnedBy`). Only a REGISTERED top-level declaration is
   // pushed: a nested function or lambda has no `fnDeclIx` entry for a call site to match
@@ -24950,6 +25064,9 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
           // D1045 — the IMPLICIT return of the same rule: the trailing expression
           // is what a caller receives, so a body-scoped nominal escapes here too.
           if !isStmtNode(stmts[s]) { refuseLocalNomEscape(stTy, stmts[s]) }
+          // The IMPLICIT return of the deferred pin, for the reason the explicit one
+          // states: under inference the destination is the join, not this witness (D1591).
+          noteInferRetWitness(stmts[s], stTy)
           noteInferredRet(inferRetTyOf(stmts[s], stTy))
         } else {
           // Redundant-return rule: witness the trailing expression's NATURAL type
@@ -25064,6 +25181,10 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
     tpPop = tpPop + 1
   }
   if cstrOwnerPushed { cstrOwnerStack.pop() }
+  // Every return witness is in, so the inferred return type is final — pin the empty
+  // collections this body delivered to it, BEFORE `popScope` grades their bindings. An
+  // ANNOTATED body recorded nothing (those positions pin at the delivery) (D1591).
+  flushInferRetHoles()
   popScope()
   if !inferQuiet {
     // Mark only the registered TOP-LEVEL decl (not a nested/shadowing namesake).
@@ -34141,6 +34262,10 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
   // operands rather than demanding a shape of them.
   if op == "??" {
     if voidValueSlotErr(rt, n.binRight, "`??` default", ix) { rt = TY_ERR }
+    // The DEFAULT's destination is the LHS's non-null shape — the one position where a
+    // typed slot is on the LEFT of the operator, which is why the delivery had no pin
+    // while every annotated-destination sibling had one (D1591).
+    constrainEmptyExpr(n.binRight, rt, nonNullTy(lt))
   }
   // A binary op with a HOLE operand can't decide its form until the hole is bound at the call —
   // record the deferred constraint (skipping assignment / logical, handled by their own arms).
@@ -36008,6 +36133,7 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
   if guardedRet { guardAltStack.pop() }
   retTailPos = false
   const thenTy = blockTailTy
+  const thenIx = blockTailIx
   if tnNames.length > 0 { popScope() }
   // SEED the inferred return from the then-branch value BEFORE the else is checked, so
   // a recursive call in the else (`fib(n-1)+fib(n-2)`) resolves against the base-case
@@ -36023,6 +36149,9 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
       // The then-arm's implicit-return value is guarded exactly like an explicit
       // `return` inside it (`if v is T { v.foo } else { v.bar }`).
       if guardedRet { guardAltStack.push(guardRows[guardRows.length - 1]) }
+      // The ARM, not the arms' join: a tail `if`/`else` whose one arm is an open `[]` needs
+      // the SIBLING arm's shape, and the join is a third arena row (D1591).
+      noteInferRetWitness(thenIx, thenTy)
       noteInferredRet(thenTy)
       if guardedRet { guardAltStack.pop() }
     }
@@ -36059,10 +36188,19 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
     pgUpArmIx = -1
     retTailPos = false
     elseTy = blockTailTy
-    if enElse is IfStmt { elseTy = elseRes }
+    let elseIx = blockTailIx
+    // A CHAIN link's value is the whole inner `if`'s join, and `blockTailIx` then names the
+    // innermost block's tail — a node the join did not come from, so it names none (D1591).
+    if enElse is IfStmt {
+      elseTy = elseRes
+      elseIx = -1
+    }
     if enNames.length > 0 { popScope() }
     if ifTail {
-      if elseTy != TY_VOID && elseTy != TY_ERR { noteInferredRet(elseTy) }
+      if elseTy != TY_VOID && elseTy != TY_ERR {
+        noteInferRetWitness(elseIx, elseTy)
+        noteInferredRet(elseTy)
+      }
     }
     daElseEnd = daSnapshot()
   }
@@ -38109,6 +38247,10 @@ function checkRetStmtNode(n: RetStmt, ix: i32) {
     if voidValueSlotErr(rArgTy, n.retArg, "return", ix) { return TY_VOID }
     // D1045 — a body-scoped NOMINAL type may not escape through an INFERRED return.
     refuseLocalNomEscape(rArgTy, ix)
+    // An empty-collection hole returned here has a destination — the join this return is
+    // one witness of — that is not final until the body ends, so the pin is deferred to
+    // `flushInferRetHoles` rather than skipped (D1591).
+    noteInferRetWitness(n.retArg, rArgTy)
     noteInferredRet(inferRetTyOf(n.retArg, rArgTy))
     return TY_VOID
   }
@@ -38161,6 +38303,7 @@ function checkBlockNode(n: Block, ix: i32) {
   const stmts = n.blkStmts
   const savedRTP = retTailPos
   let tailTy = TY_VOID
+  let tailIx = -1
   let i = 0
   while i < stmts.length {
     // Only the LAST statement is the block's value (and inherits tail position); the
@@ -38176,6 +38319,7 @@ function checkBlockNode(n: Block, ix: i32) {
       // STATEMENT (return / let / assignment / loop) leaves the block valueless.
       if !isStmtNode(stmts[i]) {
         tailTy = sty
+        tailIx = stmts[i]
       } else {
         // An if-EXPRESSION tail (`{ … if c { v1 } else { v2 } }`) IS the block's value, even
         // though an `IfStmt` is otherwise a statement node — `checkNode` already returned the
@@ -38185,7 +38329,10 @@ function checkBlockNode(n: Block, ix: i32) {
         const lastN2 = P.nodes[stmts[i]]
         if lastN2 is IfStmt {
           if lastN2.ifElse >= 0 {
-            if sty != TY_VOID && sty != TY_ERR { tailTy = sty }
+            if sty != TY_VOID && sty != TY_ERR {
+              tailTy = sty
+              tailIx = stmts[i]
+            }
           }
         }
       }
@@ -38195,5 +38342,6 @@ function checkBlockNode(n: Block, ix: i32) {
   retTailPos = savedRTP
   popScope()
   blockTailTy = tailTy
+  blockTailIx = tailIx
   return TY_VOID
 }
