@@ -42,13 +42,15 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 # THE RATCHET EXEMPTIONS. `comment-block-too-long` / `comment-measurement-uncited`,
-# `arena-scan-outside-pass` and `kind-ladder-incomplete` / `kind-ladder-split` are
-# `warning`s this tree still violates in bulk, so they are held out of the `info`
-# gate — but ONLY while their baselines still owe them. Each allow-list is READ FROM
-# its own baseline, so it empties itself the day a trim, a banked scan or a named
-# default reaches zero; meanwhile the three `--check` runs block any file going UP.
-# `vl check` has no per-code gate, hence `--json` graded through one filter carrying
-# every list.
+# `arena-scan-outside-pass`, `kind-ladder-incomplete` / `kind-ladder-split` and
+# `sentinel-index-unguarded` / `sentinel-index-strict-untested` are `warning`s this tree
+# still violates in bulk, so they are held out of the `info` gate — but ONLY while their
+# baselines still owe them. Each allow-list is READ FROM its own baseline, so it empties
+# itself the day a trim, a banked scan, a named default or a bound test reaches zero;
+# meanwhile the four `--check` runs block any file going UP. (`sentinel-index-strict-
+# untested` is already at zero and so is already gated, which is the exemption's whole
+# design working one code at a time.) `vl check` has no per-code gate, hence `--json`
+# graded through one filter carrying every list.
 #
 # `std-comment-audience` is deliberately NOT on that list. It is the std half of the
 # comment rules (std-api-review.md §4) and it landed at zero, so it has no baseline to
@@ -63,7 +65,8 @@ lint_graded() { # <target> <json path>
   # shellcheck disable=SC2046  # the word split is the point: zero or more codes
   python3 scripts/comment-budget.py --filter-lint "$2" \
     $(python3 scripts/scan-budget.py --exempt-codes) \
-    $(python3 scripts/ladder-budget.py --exempt-codes)
+    $(python3 scripts/ladder-budget.py --exempt-codes) \
+    $(python3 scripts/sentinel-budget.py --exempt-codes)
 }
 
 # std/ goes first: it is near-instant AND its module load warms the seed's
