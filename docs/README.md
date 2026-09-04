@@ -11,7 +11,7 @@ The language and CLI as a user mental model.
 - [`guide/soundness.md`](guide/soundness.md) — the type-safety guarantees.
 - [`guide/narrowing.md`](guide/narrowing.md) — flow narrowing (`is` / `?.` / null).
 - [`guide/unions.md`](guide/unions.md) — union types and variant discrimination.
-- [`guide/collections-design.md`](guide/collections-design.md) — `T[]` / `Map` / `Set` syntax and semantics.
+- [`guide/collections-design.md`](guide/collections-design.md) — `T[]` / `Map` / `Set` syntax and semantics; §"What you write TODAY" is the shipped spelling table (a map TYPE is `{[K]: V}`, `Map()` is the constructor).
 - [`guide/strings-design.md`](guide/strings-design.md) — string representation and API.
 - [`guide/lambda-param-skip-design.md`](guide/lambda-param-skip-design.md) — lambda param-skip ergonomics.
 - [`guide/language-todo.md`](guide/language-todo.md) — language feature backlog.

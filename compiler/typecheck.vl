@@ -2319,6 +2319,9 @@ const IR_RUNG_LITUNION_ALIAS = 27
 const IR_REC_CLASSIFIABLE = 40 // `isClassifiableRetName` — NOT "scalar": it admits `i32[]`/`string[]` too
 const IR_REC_OBJ_SHAPE = 41 // `isObjShapeName`
 const IR_REC_SCALAR_LIST = 42 // `isScalarListRetName`
+// D1567 — the `null` TYPE, which is not a nullable of anything: a function whose every
+// returned value is a bare `null` types `TyPrim:null`, so no other producer here answers.
+const IR_REC_NULL_ONLY = 43
 // The NAMED-function loop is a SECOND cascade over the same producers, and it must bank the same
 // codes: a rung identifies the PRODUCER, not the cascade it was reached through. Leaving it
 // unbanked made every named row read `IR_RUNG_NONE` — "no producer answered" for rows where one
@@ -8881,7 +8884,10 @@ export function applyGenAlias(head: string, inner: string) {
 // because the two routes must not be able to drift.
 function applyGenAliasArgs(head: string, inner: string, appIx: i32) {
   const gi = gaIndexOf(head)
-  if gi < 0 { return -1 }
+  // D1582 — `Map<string, i32>` reaches the alias-application door, not the leaf
+  // ladder, so the same hint has to be banked here too or the spelling a consumer
+  // is most likely to try is the one that stays unhelpful.
+  if gi < 0 { return builtinCtorTyLeafFail(head) }
   // The declared parameter names, read as a SLICE of the flat column — split
   // once when the alias registered (D-GAPARAM), not re-split here per
   // application. `pcount` is the declared ARITY.
@@ -9161,7 +9167,9 @@ function tsLeafTy(name: string) {
   if pv >= 0 { return pv }
   const tv = tpEnvTyOfName(name)
   if tv >= 0 { return tv }
-  declaredTyOfName(name)
+  const dv = declaredTyOfName(name)
+  if dv >= 0 { return dv }
+  builtinCtorTyLeafFail(name)
 }
 
 // D-MAPKEYDIAG — the spelling node whose KEY the unsupported-map-key diagnostic names, or -1
@@ -9249,6 +9257,32 @@ let annotCollapsed: {[string]: i32} = Map()
 // design: wasm has i8 as a STORAGE type and not as a value type, and VL mirrors that.
 function storageTyLeafFail() {
   unkTyClash = "`u8` is a storage type, not a value type — it may be an array element (`u8[]`), but a local, parameter, return, field, map value or generic argument is a value, and values are `i32`"
+  -1
+}
+
+// D1583 — the same rule at the one position whose remedy is DIFFERENT. In an annotation
+// the answer is "write `i32`"; in `x as u8` there is nothing to write, because the
+// conversion the author is reaching for is what the STORE already does. So the message
+// names the truncation and both spellings of it rather than repeating the rule.
+function u8CastText() {
+  "`u8` is a storage type, not a value type — a `u8[]` stores the low byte of an `i32`; push the `i32` directly (300 stores as 44), or `x & 0xff` to make the truncation explicit"
+}
+
+// D1582 — `Map`/`Set` name a CONSTRUCTOR, never a type: the type each makes is
+// spelled with the index signature. The map type is spellable and nothing said so,
+// so `type S = { index: Map }` answered `unknown type 'Map'` — honest and useless,
+// because the remedy is a spelling the reporter had no way to guess. Banks on the
+// `unkTyClash` wire so all six `unknownTyText` sites report it without gaining an arm.
+// Reached only AFTER the declared-name rung, so a program that declares its own
+// `type Map = …` keeps it (`emit_base.isBuiltinFnName` grants the same freedom to
+// the value name). The wording ends in the EXAMPLE because two call sites append
+// their own clause (`… for field 'index'`, `… in union 'U'`).
+function builtinCtorTyLeafFail(name: string) {
+  if name == "Map" {
+    unkTyClash = "`Map` is not a type name — `Map()` is the constructor and the map TYPE is spelled `{[K]: V}`, e.g. `{[string]: i32}`"
+  } else if name == "Set" {
+    unkTyClash = "`Set` is not a type name — `Set()` is the constructor and the set TYPE is spelled `{[K]: boolean}`, e.g. `{[string]: boolean}`"
+  }
   -1
 }
 
@@ -10085,7 +10119,9 @@ function nameToTyReal(name: string) {
     const ltAt = gaeLtAt(name)
     return applyGenAlias(gaeHeadNameOf(name, ltAt), gaeArgsTextOf(name, ltAt))
   }
-  declaredTyOfName(name)
+  const dvn = declaredTyOfName(name)
+  if dvn >= 0 { return dvn }
+  builtinCtorTyLeafFail(name)
 }
 
 // The collection FLAVOR of a binding initializer: "Set" when the init is a
@@ -10406,6 +10442,11 @@ export function tyIsNulValueUnionBox(ix: i32): boolean {
     // the interned i32 ATOM with `-1` for null — a niche, not a box. Admitting it broke
     // `literal-unions/nullable-litunion-coalesce.vl` with `bare null needs a struct-typed
     // context`, which is what a niche looks like when something treats it as a box.
+    // D1575 — THE A-INFER-NULL HOLE, and the first rung a witness reaches on master. `let x
+    // = null` binds `mkNullableTy(-1)`, so `nInner` is -1 until a write fills it; every
+    // reader of it in this file bound-tests before indexing the arena, or the COMPILER traps
+    // on a `vl check`-clean program (D1440's shape, D1500's family rule).
+    if t0.nInner < 0 || t0.nInner >= T.tys.length { return false }
     if tyIsLitUnion(t0.nInner) { return false }
     const inner = T.tys[t0.nInner]
     if inner is TyUnion { return inner.uMembers.length >= 2 }
@@ -26726,8 +26767,27 @@ function desugarMatchAt(ix: i32) {
   0
 }
 
+// D1580 — the return tail is a SPINE, not a subtree. `retTailPos` may follow only
+// the chain of nodes whose OWN value IS the function's return: a block (its last
+// statement), an if-expression (its arms), a `return` (its argument), a paren. Every
+// other parent — an object literal's field value, a list element, a call argument —
+// merely CONTAINS the expression, so its `if` arms are arms of the FIELD's type, not
+// of the function's. Without the clear they were unioned into the inferred return and
+// the error landed on the caller (`field 'i' is not on every member of i32|{i: i32}`),
+// naming a union the author never wrote.
+function tailSpineNode(ix: i32) {
+  if ix < 0 { return false }
+  const nd = P.nodes[ix]
+  nd is Block || nd is IfStmt || nd is RetStmt || nd is Paren
+}
+
 function checkNode(ix: i32) {
+  const savedTail = retTailPos
+  if retTailPos {
+    if !tailSpineNode(ix) { retTailPos = false }
+  }
   const t = checkNodeReal(ix)
+  retTailPos = savedTail
   if !inferQuiet {
     if ix >= 0 {
       if ix < nodeTyIx.length { nodeTyIx[ix] = t }
@@ -27620,6 +27680,7 @@ function tyIsNulI32BackedListInner(itIx: i32) {
     // (`boolean[]`) disagrees with the value call's nullable-list `ref.cast` (TRAP). The
     // litunion niches stay excluded per the sig-producer note above.
     if el is TyNullable {
+      if el.nInner < 0 || el.nInner >= T.tys.length { return false }
       const ei = T.tys[el.nInner]
       if ei is TyPrim { return ei.primName == "boolean" }
     }
@@ -27631,6 +27692,7 @@ function nullableRetName(er: i32, stmts: i32[]) {
   if er < 0 { return "" }
   const t = T.tys[er]
   if t is TyNullable {
+    if t.nInner < 0 || t.nInner >= T.tys.length { return "" }
     const it = T.tys[t.nInner]
     if it is TyObj {
       const nm = nominalNameOfObj(t.nInner, stmts)
@@ -27745,6 +27807,7 @@ function nulListRetName(er: i32) {
   if er < 0 { return "" }
   const t = T.tys[er]
   if t is TyNullable {
+    if t.nInner < 0 || t.nInner >= T.tys.length { return "" }
     const it = T.tys[t.nInner]
     if it is TyArray {
       const lnm = tyToEmitName(t.nInner)
@@ -27849,6 +27912,7 @@ function nulClosureElemListRetName(er: i32) {
     if t.aElem < 0 { return "" }
     const et = T.tys[t.aElem]
     if et is TyNullable {
+      if et.nInner < 0 || et.nInner >= T.tys.length { return "" }
       const it = T.tys[et.nInner]
       if it is TyFunc {
         const en = nullableRetName(t.aElem, gRootStmts)
@@ -27940,6 +28004,7 @@ function nulStructElemListRetName(er: i32) {
     if t.aElem < 0 { return "" }
     const et = T.tys[t.aElem]
     if et is TyNullable {
+      if et.nInner < 0 || et.nInner >= T.tys.length { return "" }
       const it = T.tys[et.nInner]
       if it is TyObj {
         // A BOXED-UNION-FIELD element (`({f: i64|string|{q:i64}} | null)[]` — the element
@@ -27979,6 +28044,7 @@ function nulMapElemListRetName(er: i32) {
     if t.aElem < 0 { return "" }
     const et = T.tys[t.aElem]
     if et is TyNullable {
+      if et.nInner < 0 || et.nInner >= T.tys.length { return "" }
       const it = T.tys[et.nInner]
       if it is TyMap { return irRendered(tyToEmitName(er)) }
     }
@@ -28003,6 +28069,7 @@ function nulListElemListRetName(er: i32) {
     if t.aElem < 0 { return "" }
     const et = T.tys[t.aElem]
     if et is TyNullable {
+      if et.nInner < 0 || et.nInner >= T.tys.length { return "" }
       const it = T.tys[et.nInner]
       if it is TyArray {
         if it.aElem < 0 { return "" }
@@ -29071,7 +29138,20 @@ export function checkProgram(rootIx: i32) {
                 }
               }
             }
-            if isClassifiableRetName(recNm) {
+            if enm == "null" {
+              // D1567 — A RETURN WHOSE ONLY VALUE IS A BARE `null` is the `null` TYPE, not a
+              // nullable of anything, so every producer below declines and the emitter kept
+              // `fRetKind`'s `"i32"` default while the body handed back a ref: the null
+              // reached `emitNullLitNode` with no seed at all, `vl check` rc 0. The rep is
+              // `nullref`, which the emitter reads off this row.
+              //
+              // AHEAD of the erasure rungs below, which would otherwise be asked to erase a
+              // primitive that is already its own base. `null` is deliberately NOT added to
+              // `isClassifiableRetName`: that set is six SCALAR spellings plus two arrays,
+              // every one an i32/ref cell the emitter's cascade classifies by name, and
+              // `null` has no name arm there.
+              recordInferRet(efn.fnName, "null", er, 1, IR_REC_NULL_ONLY)
+            } else if isClassifiableRetName(recNm) {
               // `isClassifiableRetName`'s admitted set is six scalar spellings plus
               // `i32[]`/`string[]` — every one of them a single atom (#1115).
               recordInferRet(efn.fnName, recNm, recTy, 1, IR_REC_CLASSIFIABLE)
@@ -30075,6 +30155,7 @@ export function nodeTyArrayElemRepName(ix: i32) {
       // backing (0/1, spare 2 = null), so its list reps as an i32 list. Only the
       // `null → 2` element coercion + sentinel read/print differ.
       if et is TyNullable {
+        if et.nInner < 0 || et.nInner >= T.tys.length { return "" }
         const en = T.tys[et.nInner]
         if en is TyPrim {
           if en.primName == "boolean" { return "i32" }
@@ -30154,6 +30235,7 @@ export function nodeTyIsNulString(ix: i32) {
   if ty < 0 { return false }
   const t = T.tys[ty]
   if t is TyNullable {
+    if t.nInner < 0 || t.nInner >= T.tys.length { return false }
     const inner = T.tys[t.nInner]
     if inner is TyPrim { return inner.primName == "string" }
   }
@@ -30343,6 +30425,10 @@ export function nodeTyIsNulScalarBox(ix: i32) {
   if ty < 0 { return false }
   const t = T.tys[ty]
   if t is TyNullable {
+    // D1575 — `nInner` is -1 while the A-infer-null HOLE is open (`let x = null`, a bare
+    // `null` list element): unguarded this is an arena read at -1 and the COMPILER traps on
+    // a `vl check`-clean program. An open hole is no prim, so the answer is `false`.
+    if t.nInner < 0 || t.nInner >= T.tys.length { return false }
     const inner = T.tys[t.nInner]
     if inner is TyPrim {
       return (inner.primName == "i32" ||
@@ -30364,6 +30450,7 @@ export function nodeTyIsNulI32List(ix: i32) {
   if ty < 0 { return false }
   const t = T.tys[ty]
   if t is TyNullable {
+    if t.nInner < 0 || t.nInner >= T.tys.length { return false }
     const it = T.tys[t.nInner]
     if it is TyArray {
       const e = it.aElem
@@ -30382,6 +30469,7 @@ export function nodeTyIsNulI32List(ix: i32) {
         // the arena dual of `nameIsI32Array`'s nul-litunion/nul-boolean arms.
         if tyIsNullableLitUnion(e) { return true }
         if et is TyNullable {
+          if et.nInner < 0 || et.nInner >= T.tys.length { return false }
           const ei = T.tys[et.nInner]
           if ei is TyPrim { return ei.primName == "boolean" }
         }
@@ -31181,6 +31269,7 @@ export function nodeTyIsNulClosure(ix: i32) {
   if ty < 0 { return false }
   const t = T.tys[ty]
   if t is TyNullable {
+    if t.nInner < 0 || t.nInner >= T.tys.length { return false }
     const inner = T.tys[t.nInner]
     if inner is TyFunc { return true }
   }
@@ -31329,6 +31418,7 @@ export function nodeArrayElemName(ix: i32) {
       // result (no direct binding annotation) still interns/resolves the niche slot and the
       // element `$fnsig` key the annotation side derives.
       if el is TyNullable {
+        if el.nInner < 0 || el.nInner >= T.tys.length { return "" }
         const ni = T.tys[el.nInner]
         if ni is TyFunc {
           const stmts: i32[] = []
@@ -31739,6 +31829,7 @@ export function nodeArrayElemIsNulBool(ix: i32) {
     if e >= 0 {
       const et = T.tys[e]
       if et is TyNullable {
+        if et.nInner < 0 || et.nInner >= T.tys.length { return false }
         const en = T.tys[et.nInner]
         if en is TyPrim { return en.primName == "boolean" }
       }
@@ -31809,6 +31900,7 @@ export function nodeArrayElemIsNulStr(ix: i32) {
     if e >= 0 {
       const et = T.tys[e]
       if et is TyNullable {
+        if et.nInner < 0 || et.nInner >= T.tys.length { return false }
         const en = T.tys[et.nInner]
         if en is TyPrim { return en.primName == "string" }
       }
@@ -31991,6 +32083,7 @@ function tyIsNicheNulScalarElem(ty: i32): boolean {
   if ty < 0 { return false }
   const t = T.tys[ty]
   if t is TyNullable {
+    if t.nInner < 0 || t.nInner >= T.tys.length { return false }
     const inn = T.tys[t.nInner]
     if inn is TyPrim {
       return inn.primName == "boolean" || inn.primName == "string"
@@ -32403,6 +32496,7 @@ export function nodeTyMapKeyIsI32(ix: i32) {
   if ty < 0 { return false }
   const t = T.tys[ty]
   if t is TyNullable {
+    if t.nInner < 0 || t.nInner >= T.tys.length { return false }
     const it = T.tys[t.nInner]
     if it is TyMap { return mapKeyRepTy(it.mKey) == TY_I32 }
     return false
@@ -32420,6 +32514,7 @@ export function nodeTyIsNullableStruct(ix: i32) {
   if ty < 0 { return false }
   const t = T.tys[ty]
   if t is TyNullable {
+    if t.nInner < 0 || t.nInner >= T.tys.length { return false }
     const it = T.tys[t.nInner]
     return it is TyObj
   }
@@ -32441,6 +32536,10 @@ export function nodeTyIsNullableOneRep(ix: i32) {
   if ty < 0 { return false }
   const t = T.tys[ty]
   if t is TyNullable {
+    // D1575 — an OPEN hole is not "one rep", it is no rep at all: answer false so the `??`
+    // rewrite declines and the loud refusal it already owes lands, rather than reading the
+    // arena at -1.
+    if t.nInner < 0 || t.nInner >= T.tys.length { return false }
     if tyIsLitUnion(t.nInner) { return true }
     if T.tys[t.nInner] is TyUnion { return false }
     return true
@@ -32524,6 +32623,7 @@ export function nodeNulStructInnerName(ix: i32) {
   if ty < 0 { return "" }
   const t = T.tys[ty]
   if t is TyNullable {
+    if t.nInner < 0 || t.nInner >= T.tys.length { return "" }
     const it = T.tys[t.nInner]
     if it is TyObj { return tyToEmitName(t.nInner) }
   }
@@ -32613,6 +32713,7 @@ export function nodeUnionName(ix: i32) {
     // atom) — render the same spelling `variantBoxUnionRetName` pins on the adopted
     // lambda, so the narrowed read unboxes and `!= null` tag-tests like the annotated
     // path. `mixedVariantBoxGate` pre-gates before any member renders (#494 discipline).
+    if t.nInner < 0 || t.nInner >= T.tys.length { return "" }
     const nit = T.tys[t.nInner]
     if nit is TyUnion {
       if mixedVariantBoxGate(nit.uMembers) {
@@ -35610,7 +35711,17 @@ function checkCastNode(n: AsExpr, ix: i32) {
   const arg = checkNode(n.asObj)
   const target = nameToTyAt(n.asTy, ix)
   if target < 0 {
-    tErr("unknown type `" + n.asTy + "` in `as` cast", ix)
+    // D1583 — `u8` names something (`u8[]` is spellable, `std:fs` answers one), so
+    // `unknown type` was the one thing it is not. It is a STORAGE type: the element
+    // position exists, the VALUE position does not, so there is no cast to write and
+    // none is needed — a `u8[]` store keeps the low byte of the `i32` it is given.
+    // Reached only when the name did NOT resolve, so a program declaring its own
+    // `type u8` is unaffected. Gate: `storageTyLeafFail`, the annotation-position twin.
+    if n.asTy == "u8" {
+      tErr(u8CastText(), ix)
+    } else {
+      tErr("unknown type `" + n.asTy + "` in `as` cast", ix)
+    }
     return TY_ERR
   }
   // A HOLE OPERAND ANSWERS NEITHER OF THE TRIO'S TYPE-LEVEL QUESTIONS, and the numeric ladder
