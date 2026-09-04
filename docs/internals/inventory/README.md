@@ -55,6 +55,9 @@ is how two ids got minted twice on 2026-09-01. Check the id against MASTER, not 
 > D1240–D1242; `git grep -nE 'D124[0-2]\b'` on the merged tree found D1240 and D1241
 > already minted, and `scripts/inventory/ls.py --next` answered D1242, so the block moved
 > up by two. Three ids, not a block of 20, because three is what was minted.
+> RESERVED D1474–D1476 — the day-one sampler session. `ls.py --next` answered D1474 on
+> master `cdfdc14e` and a grep of the tree found no higher id. Three ids, minted: two
+> filed here, the third left for the sampler's next run.
 > RESERVED D1251–D1253 — the follow-on session (vl-b7v): the three defects #2420's agent
 > found and could not file, plus the `block_*` position family D1244 asked the harness
 > for. `ls.py --next` answered D1251 and a sweep of every live worktree's inventory put

@@ -234,6 +234,7 @@ import {
   cloSigWalkRoots,
   cloStructIdx,
   criChanged,
+  emitCurStmtIx,
   emitFailed,
   fRetBool,
   fRetKind,
@@ -378,7 +379,7 @@ import {
   vbI64Idx,
   vbI64Used,
 } from "./emit_state"
-import { emitFail } from "./emit_bytes"
+import { emitFail, emitFailAt } from "./emit_bytes"
 import {
   anonRowTyIx,
   buildStructTwins,
@@ -404,6 +405,7 @@ import {
   anonLeafServingRow,
   anonLeafSupersedeOf,
   armLayoutContested,
+  armMintShapeName,
   arrElemIsClosureTy,
   arrElemNominalOfTy,
   arrLitElemHintTy,
@@ -10666,40 +10668,6 @@ function internArmShapeAt(nm: string, depth: i32) {
   internArmShapeOf(nm)
 }
 
-// THE ARM'S RENDER, SPELLED THE WAY THE ARM'S OWN ROW IS CODED (silent-class-inventory D1093).
-// `tyToEmitName` renders a field's INLINE literal union faithfully and `internInlineShapeTy`
-// codes that text through the NAME ladder, where `nameIsLitUnionType` claims it as the interned
-// i32 ATOM (code 0). The VARIANT recorder codes the SAME field from the annotation NODE, where
-// canon has softened it, so it codes 3 — and 3 is what the arm's wasm struct is laid out with.
-// `variantStructHeapTwinAt` compares the two tables' codes POSITIONALLY, so the mint could never
-// be recognised as the arm's own row and a field typed as that arm had no rep.
-//
-// NOT A REP CHANGE AND IT DOES NOT SOFTEN THE TYPE: the checker type keeps its member set, the
-// VARIANT row keeps the unsoftened text in the IDENTITY column, and the emitted slot is the
-// string ref it was. What softens is the anonymous ROW'S OWN KEY, which must describe the layout
-// it carries. The render is returned UNCHANGED unless a field actually substitutes.
-function armMintShapeName(nm: string) {
-  if !nameIsShapeSpanEnds(nm) { return nm }
-  const fnames: string[] = []
-  const ftexts: string[] = []
-  shapeInnerFieldSplit(groupInnerOf(nm), fnames, ftexts)
-  let changed = false
-  let out = "{"
-  let i = 0
-  while i < fnames.length {
-    if i > 0 { out = out + "," }
-    let tx = ftexts[i]
-    if nameIsInlineLitUnion(tx) {
-      tx = "string"
-      changed = true
-    }
-    out = out + fnames[i] + ":" + tx
-    i = i + 1
-  }
-  if !changed { return nm }
-  out + "}"
-}
-
 function internArmShapeOf(nm: string) {
   const vi = variantIndexOf(nm)
   if vi < 0 { return 0 }
@@ -10719,14 +10687,21 @@ function internArmShapeOf(nm: string) {
 function collectNestedFieldShapes(stmts: i32[]) {
   let i = 0
   while i < stmts.length {
+    emitCurStmtIx = stmts[i] // the declaration cursor (D1519 — see `collectU`)
     const s = P.nodes[stmts[i]]
     if s is TypeDecl {
-      if variantIndexOf(s.tdName) < 0 && gaeLtAt(s.tdName) < 0 {
-        const fields = s.tdFields
-        let fi = 0
-        while fi < fields.length {
-          const fnode = P.nodes[fields[fi]]
-          if fnode is FieldDef {
+      // THE ARM-FIELD MINT IS NOT GATED ON THE OWNER (D1518). The rest of this pass belongs
+      // to a declaration that owns a struct-table row, but the arm mint below answers for the
+      // field's TARGET, and a declaration that is itself a union arm has exactly the same
+      // targets. Gating both together is what left `type M = {a: B}` with `M|E` and `B|E`
+      // refusing in two different sentences depending on which union was declared first.
+      const ownsRow = variantIndexOf(s.tdName) < 0 && gaeLtAt(s.tdName) < 0
+      const fields = s.tdFields
+      let fi = 0
+      while fi < fields.length {
+        const fnode = P.nodes[fields[fi]]
+        if fnode is FieldDef {
+          if ownsRow {
             // `internShapeDeep` peels the composition wrappers itself (nullable,
             // arrays, grouping) AND descends a MAP field's VALUE position — so a
             // declared `type T0 = {f: {[string]: {f: string}} | null}` interns the
@@ -10749,26 +10724,26 @@ function collectNestedFieldShapes(stmts: i32[]) {
               }
             }
             internShapeDeepTy(tyNameOf(fnode.fdType), fdRoot)
-            // AND THE ARM-TYPED FIELD'S OWN SHAPE (silent-class-inventory D761). A field
-            // typed as a union ARM stores through the struct row whose heap the arm shares
-            // (`armFieldStructRow` → D280's `uVarSTwin`), and an arm with no DECLARED layout
-            // twin has no such row for the same reason the field has no code: `collectS`
-            // skips a `type X = {…}` that is a union member. Interning the arm's OWN
-            // canonical render mints it, and `variantStructHeapTwinAt`'s anonymous-claimant
-            // rung (D282) then merges the two, so the mint costs the module no heap type —
-            // `mAssignTypeIndices` allocates for the struct row and the arm reuses it.
-            //
-            // DEMAND-DRIVEN: only a field that NAMES an arm interns anything, so every
-            // module without one is byte-identical. Idempotent (`annShapeIndexOf` dedups),
-            // and a no-op where a declared twin already exists.
-            internArmFieldShape(tyNameOf(fnode.fdType))
           }
-          fi = fi + 1
+          // AND THE ARM-TYPED FIELD'S OWN SHAPE (silent-class-inventory D761). A field
+          // typed as a union ARM stores through the struct row whose heap the arm shares
+          // (`armFieldStructRow` → D280's `uVarSTwin`), and an arm with no DECLARED layout
+          // twin has no such row for the same reason the field has no code: `collectS`
+          // skips a `type X = {…}` that is a union member. Interning the arm's OWN
+          // canonical render mints it, and `variantStructHeapTwinAt`'s anonymous-claimant
+          // rung (D282) then merges the two, so the mint costs the module no heap type —
+          // `mAssignTypeIndices` allocates for the struct row and the arm reuses it.
+          //
+          // DEMAND-DRIVEN: only a field that NAMES an arm interns anything, so every
+          // module without one is byte-identical, and idempotent (`annShapeIndexOf`).
+          internArmFieldShape(tyNameOf(fnode.fdType))
         }
+        fi = fi + 1
       }
     }
     i = i + 1
   }
+  emitCurStmtIx = -1
   0
 }
 
@@ -10918,6 +10893,7 @@ export function collectS(stmts: i32[]) {
   // standalone struct and is interned here, so standalone structs coexist with a union.
   let i = 0
   while i < stmts.length {
+    emitCurStmtIx = stmts[i] // the declaration cursor (D1519 — see `collectU`)
     const s = P.nodes[stmts[i]]
     // A STRUCT-ALIAS union decl (a canonicalized object intersection — single
     // inline-shape variant) is a plain named struct: intern it here (collectU
@@ -11030,6 +11006,11 @@ export function collectS(stmts: i32[]) {
     }
     i = i + 1
   }
+  // THE CURSOR IS THE DECLARATION LOOP'S AND ENDS WITH IT (D1519). The shape passes below walk
+  // the ARENA, not `stmts`, so the last declaration is not their anchor — and a confidently
+  // WRONG position is worse than none. Their honest anchor is the annotation node, which they
+  // hold and could hand to `emitFailAt`; until they do they stay positionless, on purpose.
+  emitCurStmtIx = -1
   // D1050 — give a MIXED-SPELLING discriminated pair ONE layout, now that BOTH field tables
   // are complete. Here rather than in `collectU` because the declared struct row has to move
   // with the variant row (see the pass's header), and before the shape passes below because a
@@ -11103,9 +11084,12 @@ function collectShapeVariantFields(nm: string, shapeTy: i32) {
       if variantNestedShapeOk(nonNulBaseOf(ftxt)) { fc = 15 }
     }
     if fc < 0 {
-      return emitFail(
-        "emitProgram: only i32 / boolean / string / array union-variant fields are supported",
-      )
+      // D734's SENTENCE, one table over (D1518). The allow-list this used to print was false
+      // of f64, i64, f32, map, nested-struct, struct-list, nullable-struct, union-box and
+      // closure variant fields — every one of them supported, none of them named. What
+      // actually reaches here is `fieldTypeRefusalMsg`'s own ablation: an arm-typed field
+      // whose ARM has no cross-table heap twin.
+      return emitFail(fieldTypeRefusalMsg(ftxt))
     }
     // The ROW is `pushFieldRow`'s (the variant table) — the same four columns and the same
     // two per-row side effects the two NODE recorders push. Only the elem-NAME derivation
@@ -11196,9 +11180,9 @@ function collectVariantFields(stmts: i32[], name: string) {
               if variantNestedShapeOk(nonNulBaseOf(ftxt)) { code = 15 }
             }
             if code < 0 {
-              return emitFail(
-                "emitProgram: only i32 / boolean / string / array union-variant fields are supported",
-              )
+              // The shape-text recorder's sentence, from the FIELD's own node so the reader is
+              // pointed at the field and not at the union (D734's wording, D1519's anchor).
+              return emitFailAt(fieldTypeRefusalMsg(ftxt), fields[fi])
             }
             // The struct twin's ladder exactly (`fieldRecElemName` for the name,
             // `pushFieldRow` for the row) — the variant table records the SAME name per code.
@@ -12702,6 +12686,14 @@ export function collectU(stmts: i32[]) {
   uFieldElemKeyI32 = []
   let i = 0
   while i < stmts.length {
+    // THE DECLARATION CURSOR (D1519). `emitFail` anchors at `emitCurStmtIx`, and this pass runs
+    // before any function body arms one — so every refusal a program-wide COLLECT raises was
+    // POSITIONLESS, and `vl check --codegen` printed the file with no line at all. The
+    // declaration being registered is the honest anchor, and it is what the reader needs: none
+    // of these refusals is about a call site. Cleared at the pass's normal exit, so a later
+    // body refusal cannot inherit a stale one (a failure freezes the anchor, so the early
+    // `return -1` paths cannot leak an anchor that matters).
+    emitCurStmtIx = stmts[i]
     const s = P.nodes[stmts[i]]
     if s is UnionDecl {
       // A STRUCT-ALIAS union (single inline-shape variant — a canonicalized
@@ -12950,6 +12942,7 @@ export function collectU(stmts: i32[]) {
     }
     ipu = ipu + 1
   }
+  emitCurStmtIx = -1
   if uDeclared {
     if assignTags() < 0 { return -1 }
   }
