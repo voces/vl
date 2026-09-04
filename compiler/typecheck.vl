@@ -9254,7 +9254,7 @@ function applyGenAliasArgs(head: string, inner: string, appIx: i32) {
               }
             } else {
               tErr(
-                unknownTyText(ftn.tyName) + " for field '" + fd.fdName + "'",
+                unknownTyTextIn(ftn.tyName, " for field '" + fd.fdName + "'"),
                 dfields[fi],
               )
             }
@@ -9314,10 +9314,31 @@ export function primTyOfName(name: string) {
 // element). ONE home, because a second copy is a second answer — the merge's type-position
 // rename asked the same question from `driver.modNameIsBuiltinTy` until D1585, and the two
 // disagreed about `u8`: the merge withheld the rename, the reserved-name screen let the
-// declaration through. Read by that rename and by `tErrBuiltinTyDecl`'s two callers. D1571, D1585.
+// declaration through.
+//
+// A LIST and not a predicate, because the `did you mean` suggester (D1590) has to ENUMERATE the
+// names in scope rather than test one, and a second list would be that second answer again. A
+// spelling added to `primTyOfName` and not here stops being a reserved name. D1571, D1585.
+const builtinTyNames = [
+  "i32",
+  "i64",
+  "f64",
+  "f32",
+  "boolean",
+  "string",
+  "void",
+  "null",
+  "u8",
+]
+
+// Read by the merge's type-position rename and by `tErrBuiltinTyDecl`'s two callers.
 export function isBuiltinTyName(name: string) {
-  if name == "u8" { return true }
-  primTyOfName(name) >= 0
+  let i = 0
+  while i < builtinTyNames.length {
+    if builtinTyNames[i] == name { return true }
+    i = i + 1
+  }
+  false
 }
 
 // A live type-parameter BINDING (a generic function's `<T>` while its
@@ -9554,18 +9575,188 @@ function builtinCtorTyLeafFail(name: string) {
   -1
 }
 
+// The spellings OTHER LANGUAGES give VL's primitives — a map for newcomers, not aliases: none
+// of these names becomes a type, the refusal stands, and the message merely names the VL
+// spelling the author wanted (glean VL-039, D1590). Matched with ASCII case folded, so
+// `Boolean`, `String` and `Number` land on the lower-case entries. Positional pair:
+// `tySpellTo[i]` answers `tySpellFrom[i]`.
+const tySpellFrom = [
+  "bool",
+  "boolean",
+  "int",
+  "integer",
+  "int32",
+  "i32_t",
+  "long",
+  "int64",
+  "float",
+  "double",
+  "number",
+  "str",
+  "string",
+  "byte",
+]
+const tySpellTo = [
+  "boolean",
+  "boolean",
+  "i32",
+  "i32",
+  "i32",
+  "i32",
+  "i64",
+  "i64",
+  "f64",
+  "f64",
+  "f64",
+  "string",
+  "string",
+  "u8",
+]
+
+// `a` equals `b` with ASCII case folded. `b` is given lower-case — every `tySpellFrom` entry is,
+// which is what lets one table answer `bool`, `Bool` and `BOOL`.
+function tyFoldedEq(a: string, b: string) {
+  if a.length != b.length { return false }
+  let i = 0
+  while i < a.length {
+    let c = a[i]
+    if c >= 'A' && c <= 'Z' { c = c + 32 }
+    if c != b[i] { return false }
+    i = i + 1
+  }
+  true
+}
+
+// Levenshtein with adjacent TRANSPOSITION (optimal string alignment). The transposition arm is
+// not decoration: `i23` for `i32` is exactly the typo this exists for, and plain Levenshtein
+// charges it two — over the budget any three-character name has. Runs once per unresolved name
+// on the DIAGNOSTIC path, so the (n+1)x(m+1) grid costs nothing a compile can feel. D1590.
+function tyEditDist(a: string, b: string) {
+  const n = a.length
+  const m = b.length
+  if n == 0 { return m }
+  if m == 0 { return n }
+  const w = m + 1
+  const d: i32[] = []
+  let k = 0
+  while k < (n + 1) * w {
+    d.push(0)
+    k = k + 1
+  }
+  let j0 = 0
+  while j0 <= m {
+    d[j0] = j0
+    j0 = j0 + 1
+  }
+  let i = 1
+  while i <= n {
+    d[i * w] = i
+    let j = 1
+    while j <= m {
+      let cost = 1
+      if a[i - 1] == b[j - 1] { cost = 0 }
+      let best = d[(i - 1) * w + j] + 1
+      const ins = d[i * w + j - 1] + 1
+      if ins < best { best = ins }
+      const sub = d[(i - 1) * w + j - 1] + cost
+      if sub < best { best = sub }
+      if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+        const tr = d[(i - 2) * w + j - 2] + 1
+        if tr < best { best = tr }
+      }
+      d[i * w + j] = best
+      j = j + 1
+    }
+    i = i + 1
+  }
+  d[n * w + m]
+}
+
+// How far a suggestion may sit from what was typed: one edit up to four characters, two up to
+// eight, three beyond. The budget SCALES because a fixed one is wrong at both ends — at 1 it
+// mutes `Cricle` → `Circle`, at 3 it lets a three-letter name reach half the built-ins. D1590.
+function tySuggestBudget(len: i32) {
+  if len <= 4 { return 1 }
+  if len <= 8 { return 2 }
+  3
+}
+
+// The name to offer for the unresolved spelling `name`, or "" for none. Two sources, in order:
+// the newcomer spelling map above (exact, case-folded), then an edit distance over the names in
+// SCOPE — `builtinTyNames` and every declared `type`/struct/union. ONE suggestion at most; the
+// built-ins are walked first and a tie keeps the earlier candidate, so declared types break ties
+// in registration order. A candidate is offered under the spelling its SOURCE holds
+// (`demangleName` cuts the module-merge mangle); a composite key is never a candidate. D1590.
+function tySuggestFor(name: string) {
+  if name.length < 2 { return "" }
+  if !nameIsBareIdent(name) { return "" }
+  let si = 0
+  while si < tySpellFrom.length {
+    if tyFoldedEq(name, tySpellFrom[si]) { return tySpellTo[si] }
+    si = si + 1
+  }
+  const budget = tySuggestBudget(name.length)
+  let best = ""
+  let bestD = budget + 1
+  let bi = 0
+  while bi < builtinTyNames.length {
+    const bn = builtinTyNames[bi]
+    const bd = tyEditDist(name, bn)
+    if bd < bestD {
+      bestD = bd
+      best = bn
+    }
+    bi = bi + 1
+  }
+  for k in cUserTypes.keys() {
+    const un = demangleName(k)
+    if un.length >= 2 && un != name && nameIsBareIdent(un) {
+      const ud = tyEditDist(name, un)
+      if ud < bestD {
+        bestD = ud
+        best = un
+      }
+    }
+  }
+  best
+}
+
+// The `; did you mean '<name>'?` clause, or "" when nothing is near enough. A SUFFIX by
+// construction, so every consumer matching the `unknown type '<name>'` PREFIX keeps matching —
+// which is why the two callers with a clause of their own route through `unknownTyTextIn`
+// rather than concatenating after this. D1590.
+function tyDidYouMean(name: string) {
+  const s = tySuggestFor(name)
+  if s.length == 0 { return "" }
+  "; did you mean '" + s + "'?"
+}
+
 // The `unknown type` diagnostic text for the whole annotation `name`, naming the
 // offending COMPONENT when the bank holds one that is not the whole name. Read
 // immediately after the failing resolution (every call site is a resolve/`tErr` pair).
-function unknownTyText(name: string) {
-  if unkTyClash.length > 0 { return unkTyClash }
+function unknownTyText(name: string) { unknownTyTextIn(name, "") }
+
+// The same text with the caller's OWN trailing clause (`… for field 'a'`, `… in union 'U'`)
+// placed before the suggestion, so `did you mean` always ends the sentence. D1590.
+function unknownTyTextIn(name: string, tail: string) {
+  if unkTyClash.length > 0 { return unkTyClash + tail }
   const part = unkTyPart
-  if part.length == 0 { return "unknown type '" + name + "'" }
-  if part == name { return "unknown type '" + name + "'" }
+  if part.length == 0 {
+    return "unknown type '" + name + "'" + tail + tyDidYouMean(name)
+  }
+  if part == name {
+    return "unknown type '" + name + "'" + tail + tyDidYouMean(name)
+  }
   // "within", not "in": two of the six call sites already append their own `in …` clause
   // (`… for field 'a'`, `… in union 'Both<T>'`), and "unknown type 'T' in 'T&S' in union
   // 'Both<T>'" reads as one clause too many.
-  "unknown type '" + part + "' within '" + name + "'"
+  "unknown type '" +
+    part +
+    "' within '" +
+    name +
+    "'" +
+    tail +
+    tyDidYouMean(part)
 }
 
 // The SPELLING-TREE resolver, wrapped: bank this subtree's spelling if it is the
@@ -26004,7 +26195,7 @@ function fillTypeDeclAt(sx: i32) {
                   }
                 } else {
                   tErr(
-                    unknownTyText(ftn.tyName) + " for field '" + fd.fdName + "'",
+                    unknownTyTextIn(ftn.tyName, " for field '" + fd.fdName + "'"),
                     dfields[fi],
                   )
                 }
@@ -26104,7 +26295,7 @@ function fillTypeDeclAt(sx: i32) {
               }
             } else {
               tErr(
-                unknownTyText(variants[vi]) + " in union '" + sd.udName + "'",
+                unknownTyTextIn(variants[vi], " in union '" + sd.udName + "'"),
                 sx,
               )
             }
