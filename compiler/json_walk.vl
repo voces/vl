@@ -1,43 +1,15 @@
-// `json_walk.vl` — DEEP `is` OVER A `Json` VALUE: the walker GENERATOR and the
-// site REWRITE (`docs/serde-design.md` §"Deep `is` / `as` over a `Json` value";
-// closes `docs/internals/silent-class-inventory.md` D1035).
+// `json_walk.vl` — the per-target-type derive of a shape walk for `is` / `as` over a
+// JSON-shaped union: a generator that writes the walk as VL source, plus the site
+// rewrite that routes the test through it. Design: `docs/serde-design.md` §"Deep
+// `is` / `as` over a `Json` value".
 //
-// WHAT THIS SOLVES. `r is string[]` where `r: Json` is not an arm test — a
-// `Json[]` holding strings is not a `string[]` in the heap, so no tag says yes,
-// and the emitter answered `false` for every value on a `vl check`-clean
-// program. The design rules the test a RUNTIME SHAPE WALK plus a conversion: on
-// success the arm binds a real `string[]` built out of the tree.
-//
-// WHY THE WALKER IS GENERATED VL AND NOT EMITTED WASM. The walk has to BUILD
-// every target rep — a `string[]`, a struct, a `{[string]: i32}` map — and the
-// emitter already knows how to build each of those from ordinary VL. Writing the
-// walk as VL SOURCE and handing it back to the pipeline reuses all of it: the
-// generator emits text, the driver parses it into the SAME arena and appends the
-// declarations to the program root, and check/emit run over the result. Nothing
-// in `wasmEmit.vl` learns a new rep, and no delivery position has to be wired,
-// because the narrowed value is an ORDINARY local of the target type — which is
-// the whole point of D965's rule, reached by making the lowering something the
-// emitter already serves at every position rather than a new one.
-//
-// TWO FUNCTIONS PER TARGET, MEMOISED BY (target spelling, receiver spelling):
-//
-//   __vlJsonIs_<k>(v: Json): boolean   — the predicate, allocation-free
-//   __vlJsonGet_<k>(v: Json): T        — the builder, called only under it
-//
-// The predicate is what `r is T` becomes; the builder is what the ARM's reads of
-// `r` become, bound ONCE at the top of the arm so S1 holds exactly (the narrowed
-// value is one converted COPY, and mutating it does not write back to the tree).
-// `jwTgt*` is deduped by that pair, so two `is Cfg` sites in one module emit ONE
-// pair of walkers.
-//
-// WHY NOT ONE FUNCTION RETURNING `T | null`. The arm would then bind a nullable
-// narrowed to non-null, and DELIVERING that into a non-null slot is a standing
-// clause-1 defect (D1197). The pair sidesteps it: every value the generated code
-// delivers is a literal or a narrowed union ARM, and the emitter wires both (D1031).
-//
-// THE FAILURE PATH IS A `return`. Each shape test opens `if <src> is <arm> {`
-// and closes `} else { return <fail> }`, so a mismatch anywhere unwinds the whole
-// walk in one step and no partial value escapes.
+// `r is string[]` over `r: Json` is not an arm test — a `Json[]` of strings is not a
+// `string[]` in the heap — so the design rules it a runtime shape walk plus a
+// conversion. Generating VL source rather than wasm means the emitter serves every
+// target rep and delivery position it already serves (D965). Two functions per target,
+// deduped by (target spelling, receiver spelling): `__vlJsonIs_<k>` is the predicate
+// `r is T` becomes, `__vlJsonGet_<k>` the builder bound once at the top of the arm so
+// the narrowed value is one converted copy. Each test closes `} else { return <fail> }`.
 
 import {
   ArrayLit,
@@ -99,11 +71,12 @@ import {
   tyToStr,
 } from "./typecheck"
 
-// ── generator state ─────────────────────────────────────────────────────────
-// Module-level rather than threaded: the recursion below already carries the two
-// arguments that VARY (the type and the source name), and the four that do not —
-// build mode, the failure expression, the receiver union and its two container
-// arm spellings — are constant for a whole function body.
+// ── generator state ──────────────────────────────────────────────────────────
+
+// Module-level rather than threaded: the recursion carries the two arguments that
+// vary (the type and the source name), and the four that do not — build mode, the
+// failure expression, the receiver union and its two container arm spellings — are
+// constant for a whole function body.
 let jwCtr = 0
 let jwBuild = false
 let jwFail = "false"
@@ -116,9 +89,9 @@ function jwFresh(p: string): string {
   p + i32ToStr(jwCtr)
 }
 
-// The receiver union's ARRAY (`want` 0) or MAP (`want` 1) arm, spelled. Read off
-// the arena rather than spelled by hand: nothing privileges the name `Json`, and
-// a merged module's alias is `Json$mN`.
+// The receiver union's array (`want` 0) or map (`want` 1) arm, spelled. Read off the
+// arena rather than spelled by hand: nothing privileges the name `Json`, and a merged
+// module's alias is `Json$mN`.
 function jwRecvArmSpell(recvTy: i32, want: i32): string {
   if recvTy < 0 { return "" }
   const ms = jsonUnionMembers(recvTy)
@@ -139,10 +112,10 @@ function jwRecvArmSpell(recvTy: i32, want: i32): string {
   ""
 }
 
-// A DEFAULT value of `ty`, spelled as VL source. Two consumers: the builder's
-// failure `return`, and the pre-declared accumulator every container case needs
-// so the value survives the `if` that guards it. Every JSON shape has one, which
-// is why the builder never needs a nullable carrier.
+// A default value of `ty`, spelled as VL source. Two consumers: the builder's failure
+// `return`, and the pre-declared accumulator every container case needs so the value
+// survives the `if` that guards it. Every JSON shape has one, which is why the builder
+// never needs a nullable carrier.
 function jwDefault(ty: i32): string {
   if ty < 0 { return "null" }
   if jsonSelfRef(ty, jwRecvTy) { return "null" }
@@ -174,9 +147,9 @@ function jwDefault(ty: i32): string {
   "null"
 }
 
-// The nullable INNER of `ty` when `ty` is `X | null`, else -1. The checker's
-// shape predicate already refused every wider union, so this is the only union
-// shape the generator can meet.
+// The nullable inner of `ty` when `ty` is `X | null`, else -1. The checker's shape
+// predicate refuses every wider union, so this is the only union shape the generator
+// can meet.
 function jwNullableInner(ty: i32): i32 {
   if ty < 0 { return -1 }
   const t = T.tys[ty]
@@ -207,10 +180,9 @@ function jwAppend(dst: string[], src: string[]) {
   0
 }
 
-// The container guard: `if <src> is <spell> { <inner> } else { return <fail> }`.
-// An EMPTY inner would print an empty block, so it collapses to the negated leaf
-// form instead — same meaning, and a shape the checker and the formatter both
-// already accept.
+// The container guard: `if <src> is <spell> { <inner> } else { return <fail> }`. An
+// empty inner would print an empty block, so it collapses to the negated leaf form
+// instead — same meaning, and a shape the checker and the formatter both accept.
 function jwGuard(out: string[], src: string, spell: string, inner: string[]) {
   if inner.length == 0 {
     out.push("if !(" + src + " is " + spell + ") { return " + jwFail + " }")
@@ -222,23 +194,18 @@ function jwGuard(out: string[], src: string, spell: string, inner: string[]) {
   0
 }
 
-// THE WALK. Appends to `out` the statements that test `src` (a NAME bound to a
-// `Json`-typed value) against `ty` and, in build mode, bind the converted value.
-// Returns the name holding it, or "" in check mode.
-//
-// `src` IS ALWAYS A NAME, never an expression. Re-binding a NARROWED value to a
-// fresh `const` is a standing emitter defect (`const s = v` under `if v is Json[]`
-// loses the list rep and refuses at `emitProgram: map op receiver is not a map`),
-// so every recursive step binds the SOURCE first and narrows the binding in
-// place, never the other way round.
+// The walk: appends to `out` the statements testing `src` (a name bound to a `Json`
+// value) against `ty` and, in build mode, binding the converted value; returns the
+// name holding it, or "" in check mode. `src` is always a name and never an
+// expression, because re-binding a narrowed value to a fresh `const` loses its rep.
 function jwWalk(ty: i32, src: string, out: string[]): string {
-  // The JSON union itself is the WILDCARD leaf: it matches anything and is taken
-  // BY REFERENCE — no walk, no copy (`docs/serde-design.md`, the "Deep" clause).
+  // The JSON union itself is the wildcard leaf: it matches anything and is taken by
+  // reference — no walk, no copy (`docs/serde-design.md`, the "Deep" clause).
   if jsonSelfRef(ty, jwRecvTy) { return jwWildcard(src) }
   const nin = jwNullableInner(ty)
   if nin >= 0 {
-    // S3: an ABSENT key and an explicit JSON `null` are the same fact here — a
-    // map read answers `null` for both — and both match `T | null`.
+    // S3: an absent key and an explicit JSON `null` are the same fact here — a map
+    // read answers `null` for both — and both match `T | null`.
     const inner: string[] = []
     const iv = jwWalk(nin, src, inner)
     if jwBuild {
@@ -263,9 +230,9 @@ function jwWalk(ty: i32, src: string, out: string[]): string {
   if t is TyObj {
     return jwWalkObj(ty, t.objFieldNames, t.objFieldTypes, src, out)
   }
-  // Unreachable: `jsonShapeBad` refused every other arena shape at the `is` site,
-  // so the generator is never asked for one. A `return <fail>` rather than
-  // silence, so a shape that ever slips past the checker fails LOUD.
+  // Unreachable: `jsonShapeBad` refuses every other arena shape at the `is` site, so
+  // the generator is never asked for one. A `return <fail>` rather than silence, so a
+  // shape that slips past the checker fails loudly.
   out.push("return " + jwFail)
   ""
 }
@@ -277,10 +244,10 @@ function jwWildcard(src: string): string {
 
 function jwWalkPrim(p: PrimName, ty: i32, src: string, out: string[]): string {
   if p == "i32" || p == "i64" {
-    // S2: an integer target takes an INTEGRAL, IN-RANGE JSON number and nothing
-    // else — the same predicate the exact `as?` conversion applies (DECISIONS.md
-    // §"Numeric `as` to an INTEGER target is exact-or-fail under the trio"), so
-    // the two definitions cannot drift apart.
+    // S2: an integer target takes an integral, in-range JSON number and nothing else —
+    // the same predicate the exact `as?` conversion applies (DECISIONS.md §"Numeric
+    // `as` to an INTEGER target is exact-or-fail under the trio"), so the two cannot
+    // drift apart.
     const c = jwFresh("__vjc")
     const inner: string[] = []
     inner.push("const " + c + " = " + src + " as? " + p)
@@ -404,7 +371,11 @@ function jwWalkObj(
   g
 }
 
-// ── the generated SOURCE ─────────────────────────────────────────────────────
+// ── the generated source ─────────────────────────────────────────────────────
+
+// A predicate and a builder rather than one function returning `T | null`: the arm
+// would then bind a nullable narrowed to non-null, whose delivery is a standing
+// clause-1 defect (D1197).
 export function jwWalkerName(k: i32): string { "__vlJsonGet_" + i32ToStr(k) }
 export function jwPredName(k: i32): string { "__vlJsonIs_" + i32ToStr(k) }
 
@@ -423,8 +394,8 @@ export function jwGenerateSource(): string {
   let src = ""
   let k = 0
   while k < jwTgtSpell.length {
-    // The ROOT, not the parameter: the walk's tests and its wildcard leaf are about the
-    // JSON tree, while the parameter is only what the site can hand it.
+    // The root type, not the parameter: the walk's tests and its wildcard leaf are
+    // about the JSON tree, while the parameter is only what the site can hand it.
     jwRecvTy = jwTgtRootTy[k]
     jwArrSpell = jwRecvArmSpell(jwRecvTy, 0)
     jwMapSpell = jwRecvArmSpell(jwRecvTy, 1)
@@ -467,18 +438,12 @@ export function jwGenerateSource(): string {
   jwReplaceAll(src, "$", JW_DOLLAR)
 }
 
-// ── THE MERGE-MANGLING ESCAPE ────────────────────────────────────────────────
-//
-// A MODULE BUILD renames every top-level declaration `Json` → `Json$m1`, and `tyToStr`
-// renders those names — which is exactly what makes the generated fragment resolve in the
-// merged scope. But `$` IS NOT AN IDENTIFIER CHARACTER: the lexer refuses it deliberately,
-// so that the template renderer's `$tpl$render` cannot be spelled by a user. Handing the
-// lexer a `Json$m1` is a parse error on a program that used to run.
-//
-// So the generator writes a LEXABLE stand-in and the driver puts the `$` back ON THE TOKEN
-// STREAM, before `parseProgram` sees it. At the token level rather than on the parsed
-// strings, because the parser builds the annotation SPELLING TREE out of the same tokens it
-// builds `TypeRef.tyName` from — the drift `ast.clearAnnTs` exists to warn about.
+// ── the merge-mangling escape ────────────────────────────────────────────────
+
+// A module build renames `Json` → `Json$m1`, and `tyToStr` renders that name, which
+// is what makes the fragment resolve in the merged scope. `$` is not an identifier
+// character, so the generator writes a lexable stand-in and the driver restores the
+// `$` on the token stream, which `TypeRef.tyName` and the spelling tree both read.
 const JW_DOLLAR = "__jwmangle__"
 
 function jwReplaceAll(s: string, from: string, to: string): string {
@@ -514,18 +479,16 @@ export function jwRestoreMangling(from: i32): i32 {
   0
 }
 
-// ── the SITE REWRITE ─────────────────────────────────────────────────────────
-// `r is T` becomes `__vlJsonIs_k(r)`, in place — the node index is overwritten,
-// so every parent slot that pointed at the `IsExpr` keeps pointing at the call
-// and no parent surgery is needed. Where the receiver is a narrowable PLACE and
-// the test governs a branch, the arm additionally gets
-// `const __vljvN = __vlJsonGet_k(r)` prepended and every read of the place in
-// that arm rewritten to `__vljvN` — which is what makes the arm see a converted
-// `T` instead of the `Json` the checker no longer narrows.
+// ── the site rewrite ─────────────────────────────────────────────────────────
 
-// The PLACE a node spells (`r`, `o.p`, `xs[0]`, `m[k]`), or "" for anything that
-// is not a stable place. The same grammar the checker's `placeKeyOf` spells, cut
-// to what this rewrite has to match.
+// `r is T` becomes `__vlJsonIs_k(r)` in place — the node index is overwritten, so
+// every parent slot pointing at the `IsExpr` keeps pointing at the call. Where the
+// receiver is a narrowable place and the test governs a branch, the arm also gets
+// `const __vljvN = __vlJsonGet_k(r)` prepended and every read of the place rewritten.
+
+// The place a node spells (`r`, `o.p`, `xs[0]`, `m[k]`), or "" for anything that is
+// not a stable place. The same grammar the checker's `placeKeyOf` spells, cut to what
+// this rewrite has to match.
 function jwPlaceKey(ix: i32): string {
   if ix < 0 { return "" }
   const n = P.nodes[ix]
@@ -555,8 +518,8 @@ function jwIndexKey(ix: i32): string {
   ""
 }
 
-// The ROOT identifier of a place key — what a shadowing declaration would have
-// to be named.
+// The root identifier of a place key — what a shadowing declaration would have to be
+// named.
 function jwKeyRoot(key: string): string {
   let i = 0
   while i < key.length {
@@ -606,9 +569,9 @@ function jwCopyIndex(ix: i32, tok: i32): i32 {
   -1
 }
 
-// The CHILD node indices of `ix`. Unlisted kinds are treated as leaves: a missed
-// kind loses a substitution, and a lost substitution is a LOUD type error in the
-// second check pass (the arm reads the place at `Json`), never a silent one.
+// The child node indices of `ix`. Unlisted kinds are treated as leaves: a missed kind
+// loses a substitution, and a lost substitution is a loud type error in the second
+// check pass (the arm reads the place at `Json`), never a silent one.
 function jwKids(ix: i32): i32[] {
   const ks: i32[] = []
   if ix < 0 { return ks }
@@ -681,9 +644,9 @@ function jwPushAll(dst: i32[], src: i32[]) {
   0
 }
 
-// Replace every occurrence of the place `key` under `ix` with `name`, IN PLACE.
-// A matched node is overwritten and NOT descended into — `o.p.q` matches at
-// `o.p` and becomes `<name>.q`, which is the read the arm wanted.
+// Replace every occurrence of the place `key` under `ix` with `name`, in place. A
+// matched node is overwritten and not descended into — `o.p.q` matches at `o.p` and
+// becomes `<name>.q`, which is the read the arm wants.
 function jwSubst(ix: i32, key: string, name: string) {
   if ix < 0 { return 0 }
   if jwPlaceKey(ix) == key {
@@ -700,9 +663,9 @@ function jwSubst(ix: i32, key: string, name: string) {
   0
 }
 
-// Does the arm REBIND or WRITE the place? Either would make a blanket
-// substitution wrong (the checker retires a narrowing for exactly these), so the
-// rewrite refuses LOUDLY instead of guessing.
+// Does the arm rebind or write the place? Either would make a blanket substitution
+// wrong (the checker retires a narrowing for exactly these), so the rewrite refuses
+// loudly instead of guessing.
 function jwArmDisturbs(ix: i32, key: string, root: string): boolean {
   if ix < 0 { return false }
   const n = P.nodes[ix]
@@ -737,10 +700,10 @@ function jwArmDisturbs(ix: i32, key: string, root: string): boolean {
   false
 }
 
-// Where does the site sit in `c0`? 1 = a positive position (the THEN arm sees
-// the narrowing), -1 = under an odd number of `!` at the top (the ELSE arm sees
-// it), 0 = nowhere the narrowing reaches. `&&` propagates only the positive
-// answer: the else of `a && (r is T)` proves nothing about `r`.
+// Where does the site sit in `c0`? 1 = a positive position (the then arm sees the
+// narrowing), -1 = under an odd number of `!` at the top (the else arm sees it), 0 =
+// nowhere the narrowing reaches. `&&` propagates only the positive answer: the else
+// of `a && (r is T)` proves nothing about `r`.
 function jwPolarity(c0: i32, siteIx: i32): i32 {
   if c0 < 0 { return 0 }
   if c0 == siteIx { return 1 }
@@ -766,9 +729,8 @@ function jwPolarity(c0: i32, siteIx: i32): i32 {
   0
 }
 
-// Prepend `stmt` to `blk`'s statement list, in place. The list is mutated
-// through `.push`/`.pop` rather than replaced, so no field write is needed on a
-// narrowed arm.
+// Prepend `stmt` to `blk`'s statement list, in place. The list is mutated through
+// `.push` / `.pop` rather than replaced, so no field write is needed on a narrowed arm.
 function jwPrependStmt(blk: i32, stmt: i32): boolean {
   if blk < 0 { return false }
   const b = P.nodes[blk]
@@ -791,8 +753,8 @@ function jwPrependStmt(blk: i32, stmt: i32): boolean {
   false
 }
 
-// The BLOCK the narrowing governs for the innermost conditional enclosing the
-// site, or -1 when the test is used as a plain boolean.
+// The block the narrowing governs for the innermost conditional enclosing the site,
+// or -1 when the test is used as a plain boolean.
 function jwArmBlockOf(siteIx: i32): i32 {
   let c = siteIx + 1
   while c < P.nodes.length {
@@ -808,12 +770,8 @@ function jwArmBlockOf(siteIx: i32): i32 {
         return -1
       }
     } else if n is WhileStmt {
-      // A LOOP BODY GETS NO BINDING, and that is the language's rule rather than a gap
-      // here: `checkWhileStmt` carries only NULL STRIPS into a loop body, never an
-      // `is T` variant pin, because a pin would reject the assignment that flips the
-      // variant and that is how a loop over a union terminates. `while x is Circle {
-      // x.r }` is refused for an ordinary union today, so a deep `is` in the same
-      // position gives the BOOLEAN and nothing else — matching, not extending.
+      // A loop body gets no binding: `checkWhileStmt` carries only null strips into a
+      // loop body, never an `is T` pin, which would reject the assignment flipping it.
       const p = jwPolarity(n.whileCond, siteIx)
       if p != 0 { return -1 }
     }
@@ -824,9 +782,9 @@ function jwArmBlockOf(siteIx: i32): i32 {
 
 let jwVarCtr = 0
 
-// Rewrite one recorded site. "" on success, otherwise a message that stops the
-// compile LOUDLY — a deep `is` that cannot be routed must never fall through to
-// the emitter, which would answer `false` for every value (D1035 itself).
+// Rewrite one recorded site. "" on success, otherwise a message that stops the compile
+// loudly — a deep `is` that cannot be routed must never fall through to the emitter,
+// which would answer `false` for every value (D1035).
 function jwRewriteSite(siteIx: i32, k: i32): string {
   if siteIx < 0 || siteIx >= P.nodes.length {
     return "internal: deep `is` site is out of range"
@@ -837,9 +795,8 @@ function jwRewriteSite(siteIx: i32, k: i32): string {
     const tok = nodeToks[siteIx]
     const arm = jwArmBlockOf(siteIx)
     const key = jwPlaceKey(recvIx)
-    // The narrowed BINDING, prepended to the arm. Only a stable PLACE can carry
-    // one: a call result has no place for the checker to narrow either, so the
-    // test there is a plain boolean and nothing in the arm refers to it.
+    // The narrowed binding, prepended to the arm. Only a stable place can carry one; a
+    // call result has none, so the test there is a plain boolean.
     if arm >= 0 && key != "" {
       const root = jwKeyRoot(key)
       if jwArmDisturbs(arm, key, root) {
@@ -877,10 +834,9 @@ function jwRewriteSite(siteIx: i32, k: i32): string {
   "internal: deep `is` site is not an `is` expression"
 }
 
-// Rewrite every recorded site. Returns the number of sites that REFUSED; each refusal is
-// raised as a positioned type error at its own `is` site rather than returned as a string,
-// because a rewrite refusal is a fact about the program the author wrote and belongs in the
-// channel every other verdict on that line arrives in.
+// Rewrite every recorded site; returns the number of sites that refused. Each refusal
+// is raised as a positioned type error at its own `is` site rather than returned as a
+// string, because a rewrite refusal is a fact about the program the author wrote.
 export function jwRewriteAll(): i32 {
   jwVarCtr = 0
   let bad = 0

@@ -1,57 +1,28 @@
-// `symbols.vl` — the compiler's ONE identifier-intern table, and the arena-node
-// side table that carries an identifier's id so it is computed ONCE per node
-// rather than once per lookup.
+// `symbols.vl` — the compiler's one identifier-intern table, and the arena-node side
+// table that carries an identifier's id so it is computed once per node rather than
+// once per lookup. `docs/internals/identifier-interning-design.md` holds the rulings;
+// each is restated below at the code it constrains.
 //
-// `docs/internals/identifier-interning-design.md` holds the rulings; this file is
-// their implementation and each ruling is restated at the code it constrains.
-// Read that design's §0 first: the table was DEFERRED at #1314 on the measurement
-// that the symbol layer's four biggest costs were avoidable CALLS, not identity —
-// this is the phase that follows, once those were removed and the re-baseline
-// still read the three whole-program name→index maps at 6.3%.
+// R1 — one table, in a leaf under `ast`: a mutable global with a reset protocol does
+// not belong in the arena's shape module, and a fresh leaf has no illegal down-edge.
 //
-// ── R1: ONE table, in a NEW LEAF ─────────────────────────────────────────────
-// The consumers are in `lexer`, `parser`, `typecheck`, `emit_*`, `driver` and
-// `cli`. `ast.vl` is the only module every one of them already imports and it owns
-// `P.nodes` — but it is the AST SHAPE module, and a mutable global side table with
-// a reset protocol does not belong in the arena's own header. A fresh leaf under
-// `ast` is importable by all of them with no direction problem (the recurring
-// hazard: `emit_base` imports FROM `typecheck`, so several plausible "route it to
-// the home" moves are illegal DOWN-moves; a new leaf has no such edge to get
-// wrong).
-//
-// ── R2: the ID SPACE is WHOLE-PROGRAM, minted per compile ────────────────────
-// One space for the whole compile; `sidReset` runs where `P.nodes = []` runs. Ids
-// are dense from 0 and are NOT stable across compiles, so **nothing may depend on
-// an id's numeric VALUE** — no `id < K` range tests, no sorting by id, no
-// serialization. (`keywordKind` was the one place that temptation appeared, and
-// design §4.1 rejected interning there on its own measurement before this ruling
-// had to.)
-//
-// Why whole-program and not per-module: the driver MERGES every module into one
-// arena and RENAMES the colliding top-level names. A per-module space would need a
-// remap applied to every id in every node at the merge — and `modRenamed` is
-// itself a top symbol consumer, so the merge is a place to make cheaper, not a
-// place to add a pass. With one space the merge needs nothing: a renamed name is a
-// DIFFERENT STRING, so it gets a different id the first time anyone interns it,
-// which is the correct answer. The merge does not have to know this file exists.
+// R2 — the id space is whole-program, minted per compile, dense from 0 and not stable
+// across compiles, so nothing may depend on an id's numeric value. The driver merges
+// modules into one arena and renames colliding top-level names; a renamed name is a
+// different string, so it interns to a different id and the merge needs no remap.
 import { ForIn, ForRange, FuncDecl, Ident, LetDecl, P, Param } from "./ast"
 
 // ── the table ────────────────────────────────────────────────────────────────
 // `sidMap` is the only place a name→id decision is made, and it probes before it
-// mints, so "same string ⇒ same id" is true of `sidOf` by construction. The
-// breakable half is the CARRIER below (R4).
+// mints, so "same string ⇒ same id" holds of `sidOf` by construction. The breakable
+// half is the carrier below (R4).
 let sidMap: {[string]: i32} = Map()
 let sidTexts: string[] = []
 
-// The interned id of `text`, minting on first sight. THE ONLY MINTER.
-//
-// COST NOTE, and the reason R3 exists: this is one `__str_hash__` plus one probe —
-// i.e. exactly the cost of the map lookup a converted consumer is giving up. So
-// `sidOf(name)` AT THE POINT OF USE is a wash against a single-probe consumer and
-// a loss against nothing. It pays in exactly two shapes, and every conversion in
-// this arc is one of them:
-//   (a) the caller already HAS the id (from `sidOfNode`, or from an outer intern);
-//   (b) one intern feeds TWO OR MORE id-keyed lookups in the same call.
+// The interned id of `text`, minting on first sight — the only minter. One hash plus
+// one probe, i.e. exactly the map lookup a converted consumer gives up, so it pays in
+// two shapes only: the caller already has the id (from `sidOfNode` or an outer
+// intern), or one intern feeds two or more id-keyed lookups in the same call.
 export function sidOf(text: string) {
   const hit = sidMap[text] ?? -1
   if hit >= 0 { return hit }
@@ -61,22 +32,14 @@ export function sidOf(text: string) {
   id
 }
 
-// The id of `text` IF IT HAS ALREADY BEEN INTERNED, else -1. **Never mints.**
-//
-// **USE THIS ONLY WHERE THE TABLE IT FEEDS IS ALREADY FULLY BUILT**, and prefer
-// `sidOf` when in doubt. Two teeth, both of which bit during the conversion:
-//  1. A LAZILY BUILT table must mint. `parentLetOfSid` BUILDS its block's rows on the
-//     miss, so resolving the query name with `sidLookup` FIRST passes -1 for a name
-//     the build is about to intern — a silent wrong resolution, not a slow one.
-//  2. A sid form that recovers its own spelling with `sidText` must mint, or the text
-//     it recovers is "" instead of the caller's name.
-//
-// Where it IS exact — an eagerly built table like `globalIndexBySid` — a text with no
-// id cannot be a key, so -1 reads "absent" (R6 backwards).
+// The id of `text` if it has already been interned, else -1; never mints. Use it only
+// where the table it feeds is already fully built, and prefer `sidOf` in doubt: a
+// lazily built table (`parentLetOfSid`) resolves -1 for a name its own build is about
+// to intern, and a form recovering its spelling with `sidText` gets "" instead.
 export function sidLookup(text: string) { sidMap[text] ?? -1 }
 
-// The inverse: an ARRAY READ, not a probe. -1 renders as "" so a caller that got
-// its id from a name-less node can print it without a guard.
+// The inverse: an array read, not a probe. -1 renders as "" so a caller that got its
+// id from a name-less node can print it without a guard.
 export function sidText(id: i32) {
   if id < 0 { return "" }
   if id >= sidTexts.length { return "" }
@@ -87,33 +50,17 @@ export function sidText(id: i32) {
 // needs to cover every name interned up to now (R6).
 export function sidCount() { sidTexts.length }
 
-// ── R3: the CARRIER is an arena-node side table ──────────────────────────────
-// `sidNode[ix]` is the interned id of the node's PRIMARY NAME (`Ident.identName`,
-// `FuncDecl.fnName`, `LetDecl.letName`, `Param.parName`, `ForRange.frVar`,
-// `ForIn.fiVar`), -1 for a node with no name, and `SID_UNFILLED` for a slot no one has
-// asked about yet. Filled LAZILY, grown on demand (append-only, amortized O(1)).
-//
-// AN ARENA SIDE TABLE, not a token or AST field, because the arena index is what the
-// emitter and checker already thread everywhere (`emitExpr(body, ix, fnIx)`); one node's
-// name is asked for many times per compile, so one intern amortizes over all of them;
-// and it needs no change to `ast.vl`'s node shapes, which every `is`-narrowing site, the
-// parser, the formatter and the LSP read. An id field ON THE NODE cannot desynchronize
-// and is filed as the END STATE — its writer set is unbounded where this one's is (R4).
+// R3 — `sidNode[ix]` is the interned id of node `ix`'s primary name (`identName`,
+// `fnName`, `letName`, `parName`, `frVar`, `fiVar`), -1 when it has none and
+// `SID_UNFILLED` when unasked; filled lazily and grown on demand. A side table, not a
+// node field, because the arena index is what every pass already threads.
 const SID_UNFILLED = -2
 let sidNode: i32[] = []
 
-// ── R4: the INVARIANT ────────────────────────────────────────────────────────
-// `sidNode[ix]` must equal `sidOf(<the node's name RIGHT NOW>)`. Two clauses:
-//  1. A NODE ARRIVES FULLY BUILT. `ast.addNode(n)` appends a complete `Node`, there is
-//     one append and nothing removes, so a lazily-filled slot is correct for every
-//     node that is never rewritten.
-//  2. EVERY IN-PLACE WRITE TO A NODE'S NAME CALLS `sidNoteNodeName(ix)`. That writer
-//     set is enumerable and must be RE-DERIVED, never trusted from here:
-//     `grep -n '\.identName = \|\.fnName = \|\.letName = \|\.parName = \|\.frVar = \|\.fiVar = ' compiler/*.vl`.
-//     Type-position names (`tyName`, `isVariant`, `asTy`) are OUT OF SCOPE.
-// A STALE SLOT RESOLVES AN IDENTIFIER TO THE WRONG SYMBOL — a silent miscompile. Which
-// instrument catches a poisoned writer is graded in `docs/internals/perf-program.md`
-// §9.6/§9.6.1; the fixpoint ladder is NOT one. Eager would need a re-run per pass.
+// R4 — `sidNode[ix]` must equal `sidOf` of the node's name right now, or an identifier
+// resolves to the wrong symbol and the miscompile is silent. Nodes arrive fully built,
+// so a lazy slot is correct until a name is rewritten in place; every such write calls
+// `sidNoteNodeName(ix)`, and that writer set is re-grepped from R3's six fields.
 export function sidNoteNodeName(ix: i32) {
   if ix < 0 { return 0 }
   if ix >= sidNode.length { return 0 }
@@ -141,18 +88,10 @@ export function sidOfNode(ix: i32) {
   s
 }
 
-// Per-compile reset (R2). Called wherever `P.nodes = []` is — the carrier is keyed by
-// ARENA INDEX, so a reset arena reusing an index for a different identifier would
-// otherwise read the previous program's answer, and `lintGraph`'s per-module loop walks
-// straight onto that edge.
-//
-// **EVERY SID-KEYED TABLE IN THE COMPILER MUST BE DROPPED WITH THIS CALL**, and the
-// driver does it by pairing every `sidReset()` with `sidKeyedTablesReset()`
-// (`emit_sections.vl`). That obligation is NOT the one the string-keyed maps had: a
-// NAME-keyed row survives a program boundary harmlessly, colliding only on the SAME
-// SPELLING, while a SID-keyed row collides whenever the next program mints the same
-// NUMBER — and the space is dense from 0. The standing witness is the wasm harness,
-// whose ONE `WebAssembly.Instance` over the corpus fails without the pairing.
+// Per-compile reset (R2), called wherever `P.nodes = []` is: the carrier is keyed by
+// arena index, so a reset arena reusing an index reads the previous program's answer.
+// Every sid-keyed table must be dropped with it — the driver pairs each `sidReset()`
+// with `sidKeyedTablesReset()`, since a sid-keyed row collides on a number, not a name.
 export function sidReset() {
   sidMap = Map()
   sidTexts = []
@@ -160,17 +99,10 @@ export function sidReset() {
   0
 }
 
-// ── R6: a name → INDEX map becomes a SYM-INDEXED DENSE ARRAY ─────────────────
-// Not an i32-keyed map. VL has those (B6a/B6b) and they would work, but a dense
-// array is a bounds check plus a load where a map is a hash plus a probe, and the
-// id space is dense from 0 by construction (R2).
-//
-// THE EXACTNESS ARGUMENT, which is R2's clearest payoff and belongs at every use:
-// the array is sized at its map's BUILD point, interning every key as it goes. A
-// symbol minted AFTERWARDS is, by the interning invariant, a DIFFERENT STRING from
-// every key present — so `sid >= arr.length ⇒ absent` is exact, not an
-// approximation. (The caveat that goes with it: the array must be rebuilt or
-// EXTENDED wherever the map is WRITTEN, not only where it is built.)
+// R6 — a name→index map becomes a sid-indexed dense array (a bounds check and a load,
+// against a hash and a probe) over an id space dense from 0. Sized at its map's build
+// point with every key interned, so a later symbol is a different string and
+// `sid >= a.length` is exactly "absent" — provided the array is extended on every write.
 export function sidArrGet(a: i32[], sid: i32) {
   if sid < 0 { return -1 }
   if sid >= a.length { return -1 }
@@ -186,8 +118,8 @@ export function sidArrPut(a: i32[], sid: i32, v: i32) {
   0
 }
 
-// Reset `a` to a dense all-(-1) array covering every id minted so far — the
-// BUILD-point sizing the exactness argument above rests on.
+// Reset `a` to a dense all-(-1) array covering every id minted so far — the build-point
+// sizing R6's exactness argument rests on.
 export function sidArrClear(a: i32[]) {
   let i = 0
   while i < a.length {

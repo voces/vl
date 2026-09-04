@@ -1,43 +1,22 @@
-// AST + token model for the VL-in-VL parser (the H3 self-hosting track). The data
-// layer the parser builds onto; `compiler/parser.vl` imports the token type, the
-// parser state `P`, and the arena constructors from here.
+// AST and token model for the VL-in-VL parser — the data layer the parser builds onto.
+// `compiler/parser.vl` imports the token type, the parser state `P` and the arena
+// constructors from here.
 //
-// ── A discriminated-union AST ────────────────────────────────────────────────
-// Each node KIND is its own struct `type` (`NumLit`, `BinExpr`, `Call`, …); the
-// `Node` alias unions them, and the parser/printer discriminate with `is`. The
-// kind is the runtime VARIANT, not a tag field, so a mis-parse can't silently
-// read the wrong slot.
+// Each node kind is its own struct `type`; the `Node` alias unions them and every pass
+// discriminates with `is`, so the kind is the runtime variant rather than a tag field.
+// Discrimination is by structural shape — WasmGC erases field names but the variant tag
+// is field-name-aware — so every variant uses a distinct field-name prefix (`num*`,
+// `bin*`, `call*`, …) and no variant's fields may become a subset of another's.
 //
-// Discrimination is by structural SHAPE (WasmGC erases field names but the variant
-// tag is field-name-aware): two variants tell apart iff their field-name sets
-// differ. So every variant uses a DISTINCT field-name prefix (`num*`, `bin*`,
-// `call*`, …) — no variant's fields are a subset of another's — which keeps `is`
-// unambiguous across all kinds. (A discriminant `tag` field would also work for
-// genuinely same-shape variants; here the natural shapes already differ.)
-//
-// ── Children by ARENA INDEX ──────────────────────────────────────────────────
-// A node references its children by their `i32` position in a flat `Node[]` arena
-// (`-1` == none), and child LISTS by `i32[]`. This is orthogonal to the union: it
-// sidesteps needing a *recursive* type alias (`BinExpr` holding `left: Node`),
-// which VL's alias resolver can't express yet (a union alias can't forward- or
-// self-reference its members), and is how many production self-hosted parsers
-// represent their AST anyway. The arena lives in a STRUCT FIELD (`Parser.nodes`),
-// and constructors `.push` straight onto it. (The struct is reached via a module
-// GLOBAL rather than a parameter — see the `Parser` note below for why.)
+// Children are referenced by `i32` position in the flat `Node[]` arena (`-1` for none)
+// and child lists by `i32[]`, which sidesteps a recursive type alias VL cannot express.
 
 import { TokKind } from "./lexer"
 
-// ── Token ────────────────────────────────────────────────────────────────────
-// A token consumed by the parser. `kind` is the lexer's closed `TokKind` literal
-// union — an i32 atom, so a `kind == "IDENT"` test is an `i32.eq` and a kind that
-// is not in the vocabulary is a type error rather than a silent never-match.
-//
-// `pos` is the token's INDEX in the stream (the cursor unit the parser and diags
-// use); `start` / `line` / `col` are the SOURCE position of its first char (char
-// offset 0-based, line 1-based, column 0-based), mirroring the lexer's `LexTok`.
-// The parser never reads those three — diagnostics reach them through the
-// `nodeToks` side table below — so a hand-built token stream with no real source
-// (a self-host test harness) may pass `0` / `1` / `0` for them.
+// A token consumed by the parser. `kind` is the lexer's closed `TokKind` atom, `pos` its
+// index in the stream (the cursor unit the parser and diagnostics use), and
+// `start`/`line`/`col` the source position of its first char. The parser never reads those
+// three — diagnostics reach them through `nodeToks` — so a test stream may pass zeros.
 export type Tok = {
   kind: TokKind,
   text: string,
@@ -47,18 +26,10 @@ export type Tok = {
   col: i32,
 }
 
-// ── AST node variants ──────────────────────────────────────────────────────
-// One struct per kind. `i32` fields holding a child are an arena INDEX (`-1` ==
-// none); `i32[]` fields are a child list. Literal payloads keep their source
-// `text` (the parser has no reason to evaluate a number, and keeping the lexeme
-// also sidesteps int→f64 field coercion). `boolVal` is `0`/`1` (no `boolean`
-// field needed). Field names are per-variant prefixed so `is` discriminates.
-//
-// `pos` is on EVERY variant — the CHAR OFFSET of the construct's START token
-// (captured before its children are parsed), or -1 for a synthesized node. One
-// shared field is safe for `is` because each variant pair still differs by its
-// prefixed field names, so no variant's name set becomes a subset of another's.
-// Only the diagnostics layer reads it; no pass discriminates on it.
+// One struct per node kind. An `i32` field holding a child is an arena index (`-1` for
+// none) and an `i32[]` field a child list; a literal payload keeps its source `text`.
+// `pos` is on every variant — the char offset of the construct's start token, or -1 for a
+// synthesized node — and only the diagnostics layer reads it; no pass discriminates on it.
 
 // Expressions ----------------------------------------------------------------
 export type NumLit = { numText: string, pos: i32 }         // 12, 3.14
@@ -68,18 +39,10 @@ export type BoolLit = { boolVal: i32, pos: i32 }           // true=1 / false=0
 export type NullLit = { nullKw: string, pos: i32 }         // null
 export type Ident = { identName: string, pos: i32 }        // x
 export type Unary = { unOp: string, unArg: i32, pos: i32 } // !x  -x
-// `binCompound` is the SURFACE compound-assignment operator (`+`/`-`/`*`/`/`) for
-// an `a += b` that desugars to `a = a + b`, else "" — a faithful-surface marker
-// (the host's `compoundOperator`) the printer reads to reprint the written form
-// without re-scanning tokens. Typecheck/emit ignore it (they read the desugared
-// `binLeft`/`binRight`).
-// `binTpl` is the second faithful-surface marker beside `binCompound`: 1 marks
-// the ROOT `+` of the concatenation a backtick TEMPLATE literal desugared to, so
-// the printer reprints the template's own source bytes instead of the concat.
-// Its span covers the whole template (the node is built after the closing
-// backtick is consumed, so `pos` .. `nodeEndOf` is `` ` `` .. `` ` ``), which is
-// all `format.vl` needs. Typecheck/emit ignore it, exactly as they ignore
-// `binCompound`.
+// `binCompound` is the surface compound-assignment operator (`+`/`-`/`*`/`/`) for an
+// `a += b` that desugars to `a = a + b`, else "". `binTpl` is 1 on the root `+` of the
+// concatenation a backtick template desugared to, its span covering the whole template.
+// Both are faithful-surface markers the printer reads; typecheck and emit ignore them.
 export type BinExpr = {
   binOp: string,
   binLeft: i32,
@@ -88,12 +51,10 @@ export type BinExpr = {
   binCompound: string,
   binTpl: i32,
 } // a + b,  a = b,  a += b
-// A call `f(a, b)` / `f(a: 2, b: 1)`. `callArgs` are the argument VALUE nodes in
-// SOURCE order; `callArgNames` is the parallel per-argument NAME list ("" = a
-// positional argument). An all-positional call may carry an EMPTY names list
-// (the common case — every consumer treats a missing entry as ""). Mirrors the
-// host's `VLArgumentNode.name` (`makeArgument` in parser.ts); binding to
-// parameters happens in the checker/emitter via `orderArgsByParamNames`.
+// A call `f(a, b)` or `f(a: 2, b: 1)`. `callArgs` are the argument value nodes in source
+// order and `callArgNames` the parallel per-argument name list ("" for a positional one);
+// an all-positional call may carry an empty names list, and every consumer treats a
+// missing entry as "". Binding to parameters is `orderArgsByParamNames`'s.
 export type Call = {
   callFn: i32,
   callArgs: i32[],
@@ -113,12 +74,10 @@ export type LetDecl = { // let/const x: T = e
   letInit: i32,  // initializer node, -1 if none
   pos: i32,
 }
-// A parameter `a: i32`, optionally carrying a DEFAULT VALUE (`a: i32 = 0`).
-// `parDefault` is the default expression's arena index (-1 = none); `parOpt` is
-// 1 for the surface spelling `a?: i32`, which is sugar for `a: i32 | null =
-// null` — a faithful-surface marker the printer reads to reprint `?`, exactly
-// as `IsExpr.isNeg` marks a surface `!is`. Everything downstream of the parser
-// reads the desugared `parType` + `parDefault` and ignores `parOpt`.
+// A parameter `a: i32`, optionally carrying a default value. `parDefault` is the default
+// expression's arena index (-1 for none); `parOpt` is 1 for the surface `a?: i32`, sugar
+// for `a: i32 | null = null` and a faithful-surface marker the printer reads. Everything
+// downstream reads the desugared `parType` and `parDefault` and ignores `parOpt`.
 export type Param = {
   parName: string,
   parType: i32,
@@ -141,7 +100,7 @@ export type IfStmt = { // if c {..} else {..}
   ifElse: i32, // else node (block or nested if), -1 if none
   pos: i32,
 }
-// Loops carry an optional LABEL (`outer: while …` / `outer: for …`; "" = none),
+// Loops carry an optional label (`outer: while …` / `outer: for …`; "" = none),
 // the target of a labelled `break`/`continue` — mirroring the host's
 // `label: string | undefined` on `VLWhileNode`/`VLForNode`/`VLForInNode`.
 export type WhileStmt = {
@@ -150,15 +109,14 @@ export type WhileStmt = {
   whileLabel: string,
   pos: i32,
 } // [l:] while c { body }
-// `break` / `continue` loop-control statements. Each carries the optional loop
-// LABEL it targets (`break outer`; "" = the innermost loop) plus a marker field
-// (`brkKw` / `contKw`, the source keyword text) that gives the `brk`/`cont`
-// prefixes a distinct field-name SET — the header's discrimination rule. Mirrors
-// `VLBreakNode` / `VLContinueNode` (whose `label` is undefined when absent).
+// `break` / `continue` loop-control statements. Each carries the optional loop label it
+// targets ("" for the innermost loop) plus a marker field (`brkKw` / `contKw`, the source
+// keyword text) that gives the two prefixes distinct field-name sets, which the header's
+// discrimination rule needs.
 export type BreakStmt = { brkKw: string, brkLabel: string, pos: i32 } // break [label]
 export type ContinueStmt = { contKw: string, contLabel: string, pos: i32 } // continue [label]
-// `for v in A to B [step S] { body }` — a numeric RANGE loop; `frStep` is the step
-// EXPRESSION node index, or -1 for the implicit +1. `for v in iterable { body }` —
+// `for v in A to B [step S] { body }` — a numeric range loop; `frStep` is the step
+// expression node index, or -1 for the implicit +1. `for v in iterable { body }` —
 // a for-IN loop over an array, binding `v` to the element type.
 export type ForRange = {
   frVar: string,
@@ -176,16 +134,10 @@ export type ForIn = {
   fiLabel: string,
   pos: i32,
 } // [l:] for v in arr { body }
-// `match scrut { pat => body … }` — exhaustive value dispatch. Each arm `i` matches one of the
-// patterns in `matchPats[matchArmStart[i] .. +matchArmCount[i]]` (an OR-group; a wildcard `_` is an
-// `Ident "_"` pattern) and runs `matchBodies[i]` (an expr, often a Block). Value-returning.
-//
-// `matchBinds` is PARALLEL TO `matchPats` (not to the arms): entry `matchBinds[p]` is pattern `p`'s
-// payload-binding clause `{x, y}` — a `Block` node holding one `const x = scrut.x` per bound field
-// — or -1 when the pattern has none. The `LetDecl`s are minted in the PARSER beside the pattern
-// (phase 2b; `nodeTyIx` is sized to the arena at `checkProgram` entry, so a node minted at desugar
-// time reads back -1 forever), and the desugar prepends them to the arm's block. They are NOT in
-// the body until then, so the formatter prints the arm the user wrote.
+// `match scrut { pat => body … }` — exhaustive value dispatch. Arm `i` matches one of
+// `matchPats[matchArmStart[i] .. +matchArmCount[i]]` and runs `matchBodies[i]`.
+// `matchBinds` is parallel to `matchPats`, not the arms: entry `p` is that pattern's
+// payload-binding `Block` or -1, entering the body only at desugar (the formatter's need).
 export type MatchExpr = {
   matchScrut: i32,
   matchPats: i32[],
@@ -199,18 +151,10 @@ export type RetStmt = { retArg: i32, pos: i32 }      // return e?  (-1 bare)
 export type Block = { blkStmts: i32[], pos: i32 }    // { stmt* }
 export type Program = { progStmts: i32[], pos: i32 } // top-level stmt*
 
-// Modules ---------------------------------------------------------------------
-// An `import { a, b as c, … } from "path"` statement. A TOOLING node: module
-// RESOLUTION stays the driver's token-level `modScan` (which never reads the
-// AST), the checker/emitter skip it, and the formatter keeps reproducing
-// imports from the token stream — the node exists so AST consumers (the lint
-// tier) can SEE imports (e.g. flag a never-referenced imported name).
-//   impPath     — the module specifier, quotes stripped ("" when malformed).
-//   impNames    — the imported (source) names, in source order.
-//   impLocals   — parallel local bindings (the `as` alias, else the name).
-//   impNameToks — parallel TOKEN indices of each name token (diagnostic anchors).
-// A bare `import x from "path"` records NO names (a pure graph edge, exactly
-// `modScan`'s reading); a re-export `export { … } from "path"` stays a no-op.
+// An `import { a, b as c, … } from "path"` statement, a tooling node: module resolution
+// stays the driver's token-level `modScan`, the checker and emitter skip it, and the
+// formatter reproduces imports from the token stream. `impNames` are the imported source
+// names, `impLocals` the parallel local bindings, `impNameToks` the parallel name tokens.
 export type ImportDecl = {
   impPath: string,
   impNames: string[],
@@ -219,22 +163,15 @@ export type ImportDecl = {
   pos: i32,
 }
 
-// Structs --------------------------------------------------------------------
-// A struct TYPE declaration `type Name = { field: Type, ... }` and the OBJECT
-// LITERAL `{ field: value, ... }` that constructs one. Prefixes: `td`/`fd` for
-// the type decl + its fields, `obj`/`fi` for the literal + its field inits. A
-// struct-type ANNOTATION (`p: Point`) reuses the existing `TypeRef` (a bare name).
+// A struct type declaration `type Name = { field: Type, … }` and the object literal that
+// constructs one. Prefixes: `td`/`fd` for the type declaration and its fields, `obj`/`fi`
+// for the literal and its field inits. A struct-type annotation (`p: Point`) reuses
+// `TypeRef`, a bare name.
 export type FieldDef = { fdName: string, fdType: i32, pos: i32 } // x: i32  (in a type decl)
-// `tdNew` marks a NOMINAL NEWTYPE body (`type F32View = new { … }`) and `tdFlat` a
-// FLAT RECORD body (`flat type TValue = { … }`) — two declaration-surface markers
-// read by exactly ONE consumer, the checker's declaration pre-pass, and erased
-// before emit. A newtype's emit vocabulary is the un-branded shape's; a flat type
-// is an ORDINARY record that has additionally been validated (scalars / newtypes
-// over scalars / nested flat only) and MEASURED (byte offsets, total size), so
-// nothing is subtracted and `flat` emits exactly as the same declaration without
-// it. There is no `udFlat` twin: the parser's syntactic fork rejects a non-record
-// body, so the marker never has to travel on a `UnionDecl`. See
-// `docs/internals/newtype-design.md` §3 and `docs/internals/flat-records-design.md`.
+// `tdNew` marks a nominal newtype body (`type F32View = new { … }`) and `tdFlat` a flat
+// record body — declaration-surface markers read only by the checker's declaration
+// pre-pass and erased before emit, so `flat` emits exactly as the same declaration
+// without it. No `udFlat` twin: the parser's syntactic fork rejects a non-record body.
 export type TypeDecl = {
   tdName: string,
   tdFields: i32[],
@@ -245,24 +182,17 @@ export type TypeDecl = {
 export type FieldInit = { fiName: string, fiValue: i32, pos: i32 } // x: 7    (in an object literal)
 export type ObjLit = { objFields: i32[], pos: i32 }                // { x: 7, y: 9 }
 
-// Arrays ---------------------------------------------------------------------
-// An ARRAY LITERAL `[e, e, ...]` that constructs a fixed-length WasmGC array and
-// an INDEX access `a[i]` (read, or — when the LHS of a `=` — write). Prefixes:
-// `arr` for the literal's element list, `idx` for the index's array+index pair. An
-// array TYPE annotation (`a: i32[]`) reuses `TypeRef` with a synthetic `"i32[]"`
-// name — see `parseType` — so no new annotation node is needed.
+// An array literal `[e, e, …]` constructing a fixed-length WasmGC array, and an index
+// access `a[i]` (a read, or a write when it is the left side of a `=`). Prefixes: `arr`
+// for the literal's element list, `idx` for the index's array and index pair. An array
+// type annotation reuses `TypeRef` with a synthetic `"i32[]"` name — see `parseType`.
 export type ArrayLit = { arrElems: i32[], pos: i32 }         // [1, 2, 3]
 export type Index = { idxArr: i32, idxIndex: i32, pos: i32 } // a[i]
 
-// Unions ---------------------------------------------------------------------
-// A discriminated-union TYPE ALIAS `type Name = A | B | C` (a `UnionDecl` whose
-// `udVariants` are the member type-NAMES, in source order) and the type-guard
-// EXPRESSION `x is T` (an `IsExpr` testing whether `isObj` is currently the
-// variant named `isVariant`, yielding a boolean and — in an `if` — narrowing
-// `isObj` to that variant). Prefixes: `ud` for the union decl, `is` for the guard.
-// `udNew` is the `tdNew` twin for the non-`{`-bodied forms: every
-// `type N = <not a brace body>` parses as a one-member `UnionDecl`, so a scalar
-// newtype (`type EntityId = new i32`) is a one-member union carrying this marker.
+// A discriminated-union type alias `type Name = A | B | C` (`udVariants` are the member
+// type names in source order) and the type-guard expression `x is T`. Prefixes: `ud` for
+// the declaration, `is` for the guard. `udNew` is `tdNew`'s twin for the non-brace forms:
+// every `type N = <not a brace body>` parses as a one-member `UnionDecl`.
 export type UnionDecl = {
   udName: string,
   udVariants: string[],
@@ -274,20 +204,15 @@ export type UnionDecl = {
 // ignore it (the wrapping `Unary "!"` carries the negation).
 export type IsExpr = { isObj: i32, isVariant: string, pos: i32, isNeg: i32 } // x is T,  x !is T
 
-// EXPRESSION `x as T` — an explicit, CHECKED numeric conversion (B2). `asObj` is
-// the arena index of the operand expression; `asTy` is the target type stored as
-// a synthetic NAME STRING (mirroring `IsExpr.isVariant`), which the checker
-// resolves with `nameToTy`. The `as` field prefix keeps this variant's field-name
-// set distinct so `is`-discrimination stays unambiguous.
-// Which member of the ruled `as` TRIO this cast is (`error-handling-design.md` §Trio):
-// `"prop"` early-returns the remainder to the caller, `"null"` yields `null`, `"trap"` traps.
-// The happy path is identical in all three — `x as T`, `x as? T` and `x as! T` all yield a `T`
-// when `x` is a `T`; only the sad path differs, which is why one node carries all three.
+// The expression `x as T` — an explicit, checked numeric conversion. `asObj` is the
+// operand's arena index and `asTy` the target type as a synthetic name string the checker
+// resolves with `nameToTy`. `asMode` names which member of the `as` trio this is
+// (`error-handling-design.md` §Trio): only the sad path differs, so one node carries all.
 export type AsMode = "prop" | "null" | "trap"
 export type AsExpr = { asObj: i32, asTy: string, asMode: AsMode, pos: i32 } // x as T
 
-// The unified node type. Declared AFTER its members (a union alias can't forward-
-// reference). Discriminated with `is`.
+// The unified node type. Declared after its members, since a union alias cannot
+// forward-reference. Discriminated with `is`.
 export type Node = NumLit |
   StrLit |
   CharLit |
@@ -326,17 +251,14 @@ export type Node = NumLit |
   MatchExpr |
   ImportDecl
 
-// A parse diagnostic: a message plus the token index it was raised at. VL has no
-// exceptions, so errors are accumulated, not thrown.
+// A parse diagnostic: a message plus the token index it is raised at. VL has no
+// exceptions, so errors accumulate rather than throw.
 export type Diag = { msg: string, at: i32 }
 
-// ── Parser state (all in STRUCT FIELDS, held in a module GLOBAL) ──────────────
-// The whole parser state is one struct: the token stream, the node arena, the
-// diagnostics, and the cursor. The arena and diagnostics live in struct fields
-// and the constructors `.push` straight onto them.
-//
-// The struct is reached through a module GLOBAL `P` — a STYLE choice: it keeps
-// every call site free of a boilerplate state argument.
+// The whole parser state as one struct: the token stream, the node arena, the diagnostics
+// and the cursor, with the constructors pushing straight onto the arena and diagnostics
+// fields. It is reached through the module global `P`, which keeps every call site free of
+// a state argument.
 export type Parser = {
   toks: Tok[],
   nodes: Node[],
@@ -348,18 +270,10 @@ export type Parser = {
 // reads `P.nodes` / `P.diags` back out.
 export let P: Parser = { toks: [], nodes: [], diags: [], pos: 0 }
 
-// ── The LOSSLESS column, beside `P.diags` ────────────────────────────────────
-// The `P.diags` INDICES whose diagnostic came from a recovery that PROVABLY
-// preserved the program the user wrote: no token dropped, none invented. The
-// driver's stage-1 rule (DECISIONS.md, 2026-09-01) lets the checker run past
-// parse diagnostics IFF EVERY one is in here — so a real type error after a
-// recovered mistake is reported rather than swallowed, without the PHANTOM
-// errors a lossy recovery invents (`f(1 2)` re-parses to a hole-free `f(1)`).
-// SPARSE and index-keyed like the driver's `vcDg*` table: a dense column would
-// need pushing in LOCKSTEP by every `P.diags.push` in the tree, and the one that
-// forgot would mis-key every later entry — absent is the safe default. Reset per
-// compile from `vcDgReset`; the LSP re-enters `checkSrc` per keystroke on one
-// instance, so a stale index would vouch for the PREVIOUS program's diagnostic.
+// The `P.diags` indices whose diagnostic came from a recovery that provably preserved the
+// program the author wrote: no token dropped, none invented. The driver lets the checker
+// run past parse diagnostics only when every one is in here. Sparse and index-keyed, since
+// a dense column would need pushing in lockstep by every `P.diags.push` in the tree.
 export let dgLossless: i32[] = []
 
 // Clear the column. Paired with `P.diags = []`; see `vcDgReset` in driver.vl.
@@ -369,17 +283,15 @@ export function dgLosslessReset() {
 }
 
 // Mark the `P.diags` index `i` as a lossless recovery's diagnostic. Callers pass
-// the index the push is ABOUT to occupy (`P.diags.length`), matching `vcDgPush`.
+// the index the push is about to occupy (`P.diags.length`), matching `vcDgPush`.
 export function dgMarkLossless(i: i32) {
   dgLossless.push(i)
   0
 }
 
-// Whether EVERY parse diagnostic raised so far is a lossless recovery's. VACUOUSLY
-// TRUE for a clean parse — callers that care about the difference test
-// `P.diags.length` themselves, as the driver's `vcParseBlocked` does. The scan is
-// O(diags × marks) and both are user-error counts, so it is a handful of
-// comparisons on the only path that reaches it.
+// Whether every parse diagnostic raised so far is a lossless recovery's — vacuously true
+// for a clean parse, so a caller that cares tests `P.diags.length` itself, as the driver's
+// `vcParseBlocked` does. The scan is O(diags × marks), both user-error counts.
 export function dgAllLossless(): boolean {
   let i = 0
   while i < P.diags.length {
@@ -395,32 +307,16 @@ export function dgAllLossless(): boolean {
   true
 }
 
-// ── Node → token side table ──────────────────────────────────────────────────
-// `nodeToks[i]` is the TOKEN INDEX of the LAST token consumed when `P.nodes[i]`
-// was constructed (`addNode` records `P.pos - 1`) — exact for single-token leaves,
-// the closing token for larger constructs. Enough to render a `line:col`; a full
-// start/stop span is a later refinement (docs/selfhost-spans-design.md). A SIDE
-// ARRAY, not a field per variant, keeps every node struct — and the
-// `is`-discrimination shape set — untouched.
-//
-// CONSUMERS MUST BOUNDS-CHECK: a harness that resets `P.nodes` without resetting
-// `nodeToks` can leave the table misaligned, so readers (`tErr` in typecheck.vl,
-// the driver's `diagLine`/`diagCol`) treat an index out of range — of this table
-// or of `P.toks` — as "no position". The production driver resets both together.
+// `nodeToks[i]` is the token index of the last token consumed while building `P.nodes[i]`
+// (`addNode` records `P.pos - 1`) — enough to render a `line:col`. A side array, not a
+// field per variant, so no node struct changes. Consumers must bounds-check: a harness
+// that resets `P.nodes` and not this leaves it misaligned, and out of range is "no span".
 export let nodeToks: i32[] = []
 
-// ── Declaration name → token side table (LSP symbols) ────────────────────────
-// `declNameTok[i]` is the TOKEN INDEX of the DECLARING IDENTIFIER for the node
-// `P.nodes[i]`, when that node is a declaration (`let`/`const`, `function`,
-// param, `type`, union, a for-loop variable). `nodeToks[i]` anchors a node at
-// its LAST token (the closing token of `let x = expr` is `expr`'s end, not `x`),
-// which is the wrong span for go-to-definition / find-references: an editor jumps
-// to / highlights the NAME. So the parser records the name token here at the
-// declaration site (`mkDeclNameTok`); a `-1` (the default for non-declarations,
-// or a node whose name token was never stamped) tells readers to fall back to
-// `nodeToks`. PARALLEL to `P.nodes` — grown lazily, so it stays cheap when the
-// symbol table is not being built. BOUNDS-CHECK on read (a misaligned table is
-// "no name token", never a trap), the same contract as `nodeToks`.
+// `declNameTok[i]` is the token index of the declaring identifier for `P.nodes[i]` when
+// that node is a declaration. `nodeToks[i]` anchors a node at its last token, the wrong
+// span for go-to-definition, which jumps to the name. `-1` means fall back to `nodeToks`.
+// Parallel to `P.nodes`, grown lazily, bounds-checked on read like `nodeToks`.
 export let declNameTok: i32[] = []
 
 // Record `tok` as the declaring-identifier token of `nodeIx`. Grows the parallel
@@ -433,25 +329,17 @@ export function mkDeclNameTok(nodeIx: i32, tok: i32) {
   0
 }
 
-// The declaring-identifier token of `nodeIx` (its NAME token), or `-1` when none
-// was stamped — readers then fall back to the node's anchor token (`nodeToks`).
+// The declaring-identifier token of `nodeIx` (its name token), or `-1` when none is
+// stamped — readers then fall back to the node's anchor token (`nodeToks`).
 export function declNameTokOf(nodeIx: i32) {
   if nodeIx >= 0 && nodeIx < declNameTok.length { return declNameTok[nodeIx] }
   -1
 }
 
-// Whether the top-level declaration at arena node `ix` carried an `export`
-// modifier. The native parser DROPS the `export` keyword from the AST (the back
-// end exports every top-level function by name regardless), so it is recovered
-// from the token stream: a top-level `function` is `EXPORT? FUNCTION IDENT`, so
-// the name token `declNameTokOf(ix)` is exported iff the token two positions back
-// is the `EXPORT` keyword.
-//
-// LIVES HERE, next to `declNameTokOf`, because it is that table's reader and has
-// two callers with nothing else in common: `lint.declIsExported`'s three
-// unused-* rules, and `check_query.symUfcsScanAt`, which must not offer a dep
-// module's PRIVATE `self`-function as an importable UFCS method (`std:str`'s
-// `mapAsciiCase` — a helper, not an export, so an import of it is refused).
+// Whether the top-level declaration at arena node `ix` carried an `export` modifier. The
+// parser drops the keyword from the AST, so it is recovered from the token stream: a
+// top-level `function` is `EXPORT? FUNCTION IDENT`, so the name token is exported exactly
+// when the token two positions back is `EXPORT`. Lives here as `declNameTok`'s reader.
 export function declHasExportKw(ix: i32) {
   const t = declNameTokOf(ix)
   if t < 2 { return false }
@@ -460,22 +348,14 @@ export function declHasExportKw(ix: i32) {
   false
 }
 
-// ── Parameter-DEFAULT side tables (default arguments v1) ─────────────────────
-// Two sidecars PARALLEL to `P.nodes`, lazily grown and bounds-checked on read
-// (the `nodeToks` contract), reset by `paramDefaultTablesReset` before each
-// `checkProgram` so a re-parsed arena never reads the previous program's marks.
-// `callSiteLoc[callIx]` — the `__callsite__` `ObjLit` minted for THAT call from
-// its own anchor token. A PRE-PASS (`csPreMintLocs`, driver.vl), not a rewrite:
-// a node minted after `checkProgram` sizes `nodeTyIx` reads its type back as -1
-// forever (D969), and this one must be typed, repped and collected. Every OTHER
-// default is a node shared by every call site; `__callsite__` alone is per-site.
-// `defaultGlobalRef[identIx]` — 1 when this `Ident` default resolved to a
-// MODULE-SCOPE `const` at the DECLARATION, so checker and emitter skip the local
-// scope and a caller-local binding of that name cannot capture the reference.
+// Two sidecars parallel to `P.nodes`, lazily grown, bounds-checked, reset per compile.
+// `callSiteLoc[callIx]` is the `__callsite__` `ObjLit` minted for that call in a pre-pass
+// (a node minted after `nodeTyIx` is sized reads its type back as -1 forever, D969), and
+// `defaultGlobalRef[identIx]` marks a default that resolved to a module-scope `const`.
 export let callSiteLoc: i32[] = []
 export let defaultGlobalRef: i32[] = []
 
-// The spelling of the call-site intrinsic. Legal ONLY as a parameter default
+// The spelling of the call-site intrinsic. Legal only as a parameter default
 // value; anywhere else it is an ordinary (undeclared) identifier, and the
 // checker says so by name.
 export const CALLSITE_NAME = "__callsite__"
@@ -512,9 +392,9 @@ export function isDefaultGlobalRef(nodeIx: i32) {
   false
 }
 
-// Is `dIx` the `__callsite__` intrinsic — the one default form whose value is
-// per-CALL-SITE rather than per-declaration? The parser leaves it as a plain
-// `Ident`; nothing declares that name, so this spelling test is exact.
+// Is `dIx` the `__callsite__` intrinsic — the one default form whose value is per call
+// site rather than per declaration? The parser leaves it a plain `Ident`; nothing declares
+// that name, so this spelling test is exact.
 export function paramDefaultIsCallsite(dIx: i32) {
   if dIx < 0 || dIx >= P.nodes.length { return false }
   const d = P.nodes[dIx]
@@ -522,17 +402,10 @@ export function paramDefaultIsCallsite(dIx: i32) {
   false
 }
 
-// The END char offset (one-past-last) of the source `P.nodes[nodeIx]` spans — the
-// STOP offset of the LAST token consumed when the node was built (its `nodeToks`
-// anchor). Paired with the node's `pos` (its START offset), this is the
-// `[start, stop)` source span the formatter slices verbatim. A token's lexeme IS
-// its exact source slice, so its stop offset is `start + text.length` (offsets and
-// `string.length` count the same unit). Returns `-1` when `nodeIx`, its `nodeToks`
-// entry, or the resolved token is out of range — the same "no span" signal a
-// negative `pos` gives for a synthesized node. BOUNDS-CHECKED, like `nodeToks` /
-// `declNameTok`: a misaligned table is "no span", never a trap. Reads only
-// concrete `Tok` fields (no node-union field access — VL has no common-field read
-// across variants), so it stays a plain index→offset lookup.
+// The end char offset (one past the last) of the source `P.nodes[nodeIx]` spans — the stop
+// offset of the last token consumed while the node is built. Paired with the node's `pos`
+// this is the `[start, stop)` span the formatter slices verbatim. `-1` when `nodeIx`, its
+// `nodeToks` entry or the resolved token is out of range, the "no span" a `pos < 0` gives.
 export function nodeEndOf(nodeIx: i32) {
   if nodeIx < 0 || nodeIx >= nodeToks.length { return -1 }
   const tk = nodeToks[nodeIx]
@@ -541,18 +414,10 @@ export function nodeEndOf(nodeIx: i32) {
   t.start + t.text.length
 }
 
-// ── Type-SPELLING side arena (the parser KEEPS what it parsed) ───────────────
-// `parseTypeName` returns a STRING (`"A|B"`, `"i32[]"`, `"{[string]:i32}"`,
-// `"(i32)=>S"`) that every later pass takes apart again. This arena is what the
-// parser saw, as a flat SPELLING tree: `tsKind[i]` the kind (`TS_*` below),
-// `tsText[i]` the identifier / lexeme / field / map key, children at
-// `tsKids[tsKidStart[i], +tsKidCount[i])`.
-// A SPELLING tree, NOT a type: `Box<i32>` is an APPLICATION of the identifier
-// `Box`. Resolving it needs the declared-type environment (`cUserTypes`, the live
-// `<T>` bindings), which cannot exist while the parser runs — a type may be
-// declared after its use, or in another module — so interning is the checker's
-// job. Children ride a shared STACK that `tsMk` moves into `tsKids` above a
-// caller-taken mark, contiguous by depth-first parsing: four pushes, no allocation.
+// The type-spelling side arena: `parseTypeName` returns a string every later pass takes
+// apart again, so this records what the parser saw as a flat tree — `tsKind[i]` the kind,
+// `tsText[i]` the lexeme, children at `tsKids[tsKidStart[i], +tsKidCount[i])`. A spelling
+// tree, not a type: resolving `Box<i32>` needs an environment the parser cannot have.
 export const TS_NAME = 0    // a bare identifier or primitive name (`i32`, `Cat`, `T`)
 export const TS_APP = 1     // `Head<a, b>` — tsText = head, kids = the arguments
 export const TS_ARR = 2     // `X[]` — one kid
@@ -568,26 +433,16 @@ export const TS_LITSTR = 11 // a string-literal type — tsText keeps the QUOTED
 export const TS_LITNUM = 12 // a numeric-literal type — tsText is the raw lexeme
 export const TS_NULL = 13   // the `null` type
 export const TS_ERR = 14    // the `expect("IDENT")` recovery leaf (the parser's `""` name)
-// `m(A, B): R` — a METHOD member of a type literal (constraints phase 1). tsText
-// is the member's name; the kids are the CALL's argument types, then the RESULT
-// last — `TS_FUNC`'s layout, because a method member IS a call shape with the
-// receiver left implicit (`docs/constraints-design.md`, OQ-1 as ruled). It is a
-// sibling of `TS_FIELD`, not a flavour of it: `{f: () => string}` demands that the
-// value CARRY a closure, `{f(): string}` demands only that `x.f()` type-check.
+// `m(A, B): R` — a method member of a type literal. `tsText` is the member's name and the
+// kids are the call's argument types with the result last, `TS_FUNC`'s layout, because a
+// method member is a call shape with the receiver implicit. A sibling of `TS_FIELD`, not a
+// flavour: `{f: () => string}` demands a closure value, `{f(): string}` only that it types.
 export const TS_METHOD = 15
 
-// ── the synthesized-annotation PIN KINDS (census W11) ────────────────────────
-// An emitter-SYNTHESIZED `TypeRef` (`synthTypeRef`) sometimes carries a name the
-// checker's annotation grammar cannot resolve, because the name is not a type
-// SPELLING at all — it is an emitter-internal handle whose PROVENANCE is the only
-// thing a reader wants. Two such handles exist, and both used to announce
-// themselves by a PREFIX riding the node's `tyName` column (`"=>ii>i"`,
-// `"#anon3"`), decoded by every consumer with its own character compares.
-//
-// A name is a name; a prefix-coded value is not. The provenance now travels in
-// its OWN column — `typecheck`'s pin sidecar, keyed by node index — and these are
-// its vocabulary. The payload (a `$fnsig` key, for `PIN_SIGKEY`) rides the column
-// beside the kind, so a consumer neither slices nor re-parses the name.
+// The synthesized-annotation pin kinds. An emitter-synthesized `TypeRef` can carry a name
+// the annotation grammar cannot resolve, because it is an emitter-internal handle rather
+// than a type spelling. That provenance travels in its own column — `typecheck`'s pin
+// sidecar, keyed by node index — with the payload beside the kind, so no consumer slices.
 export const PIN_NONE = 0   // an ordinary type name — `nameToTy` resolves it
 export const PIN_SIGKEY = 1 // a monomorphized CLOSURE pin; payload = the `$fnsig` key
 export const PIN_ANON = 2   // an interned ANONYMOUS-SHAPE row name (the emitter's `sNames`)
@@ -597,11 +452,11 @@ export let tsText: string[] = []
 export let tsKidStart: i32[] = []
 export let tsKidCount: i32[] = []
 export let tsKids: i32[] = []
-// The child stack. Only ever holds the nodes of the spellings currently OPEN on
+// The child stack. Only ever holds the nodes of the spellings currently open on
 // the parser's recursion, so it is empty between annotations.
 let tsStack: i32[] = []
 
-// The stack mark a producer takes BEFORE parsing its children.
+// The stack mark a producer takes before parsing its children.
 export function tsMark() { tsStack.length }
 
 // Finish a spelling node whose children are the stack region above `mark`: move
@@ -631,12 +486,10 @@ export function tsWrap(kind: i32, text: string) {
   tsMk(kind, text, mark)
 }
 
-// A CHILDLESS spelling node built OFF the stack. `tsMk`'s contract is "the
-// children are the stack region above a mark", which only a producer that is
-// mid-recursion can satisfy; a caller that already holds finished roots (the
-// `type N = {…} & …` re-encode below, the `is null` leaf) needs the plain
-// constructor. Nothing is pushed to `tsStack`, so the recursion's balance is
-// untouched.
+// A childless spelling node built off the stack. `tsMk`'s contract is "the children are
+// the stack region above a mark", which only a producer mid-recursion can satisfy; a
+// caller holding finished roots needs this plain constructor. Nothing is pushed to
+// `tsStack`, so the recursion's balance is untouched.
 export function tsLeaf(kind: i32, text: string) {
   tsKind.push(kind)
   tsText.push(text)
@@ -647,7 +500,7 @@ export function tsLeaf(kind: i32, text: string) {
 
 // The same, with an explicit child list. Used where the parser assembles a
 // spelling from roots it already popped — `parseTypeDecl`'s `{ … } & …`
-// re-encode, whose first union member is built from the FIELD list it just
+// re-encode, whose first union member is built from the field list it just
 // parsed rather than by a `parseTypeName` call.
 export function tsMkKids(kind: i32, text: string, kids: i32[]) {
   const start = tsKids.length
@@ -675,18 +528,10 @@ export function tsPop() {
   ix
 }
 
-// The annotation-node → spelling-root map, as two parallel PUSH columns:
-// `annTsNode[r]` is a `TypeRef` node index and `annTsRoot[r]` its spelling root.
-//
-// SPARSE, not parallel to `P.nodes`, and deliberately: annotations are a small
-// minority of the node arena, so a `declNameTok`-shaped column (lazily grown to
-// the last annotation's index) would cost one `i32` per AST NODE to hold what
-// only annotations have. Two pushed rows per annotation cost what it costs.
-// `annTsNode` is STRICTLY INCREASING by construction — a row is pushed right
-// after the `mkTypeRef` it describes, and the node arena only appends — so
-// `annTsOf` is a binary search. A harness that resets `P.nodes` without resetting
-// these leaves stale rows IN FRONT of the current program's, which the search
-// finds first: a missing reset is a WRONG ANSWER a consumer sees, not a hole.
+// The annotation-node → spelling-root map, as two parallel push columns: `annTsNode[r]` is
+// a `TypeRef` node index and `annTsRoot[r]` its spelling root. Sparse rather than parallel
+// to `P.nodes`, since annotations are a minority. `annTsNode` is strictly increasing by
+// construction, so `annTsOf` is a binary search; a missed reset is a wrong answer, not a hole.
 export let annTsNode: i32[] = []
 export let annTsRoot: i32[] = []
 
@@ -696,18 +541,10 @@ export function setAnnTs(nodeIx: i32, root: i32) {
   0
 }
 
-// The MULTI-root twin, for a node whose type spellings are a LIST: a
-// `UnionDecl`'s members, which live on the node as a `string[]` and so cannot
-// key one root each in the single-root table above. One row per MEMBER, pushed
-// in member order right after the `mkUnionDecl` that owns them, so `udTsNode` is
-// NON-DECREASING (equal within a node, increasing across nodes) and a member's
-// root is `udTsRoot[first(node) + k]`.
-//
-// A member root may be -1 — its producer left nothing on the stack (`tsPop` on
-// an empty stack, reachable only from a malformed parse) — and the consumer
-// keeps the string fall-through, so the pass is total either way. The
-// `type N = { … } & … | …` re-encode's FIRST member is NOT such a case:
-// `parseTypeDecl` assembles its spelling from the field list (`tsMkKids`).
+// The multi-root twin, for a node whose type spellings are a list: a `UnionDecl`'s members
+// live on the node as a `string[]` and cannot key one root each above. One row per member
+// in member order, so `udTsNode` is non-decreasing and a member's root is
+// `udTsRoot[first(node) + k]`. A member root may be -1, and the consumer falls back.
 export let udTsNode: i32[] = []
 export let udTsRoot: i32[] = []
 
@@ -721,18 +558,10 @@ export function setUdTs(nodeIx: i32, roots: i32[]) {
   0
 }
 
-// ── the generic type-DECLARATION's parameter list, as the parser read it ──────
-// `type Box<T>` folds its parameters INTO the declared name (`mkTypeDecl("Box<T>",
-// …)`), and three consumers used to take them back out of that concatenation with
-// a `<`-scan: `typecheck`'s generic-alias registration, and `driver.modGenBase` /
-// `modGenParams`. The parser HAS the list — it advanced over the very `IDENT`
-// tokens it joined — so it hands it over instead (the ANNOTATION half of the same
-// arc is `annTsRoot` above).
-// One row per generic declaration, keyed by the `TypeDecl` / `UnionDecl` node,
-// holding the BASE name (`Box`) and a slice of the flat parameter-name column. A
-// row exists iff the parser consumed a `<`, matching the `gaeLtAt(name) > 0` guard
-// the copies used — a test for the `<`, not for a parameter — so `type Box<> = …`
-// is still a row. Linear-scanned: generic declarations are a handful per program.
+// The generic type declaration's parameter list as the parser read it: `type Box<T>` folds
+// its parameters into the declared name, and the parser hands the list over rather than
+// leaving consumers to take it back out with a `<`-scan. One row per declaration that
+// consumed a `<` — so `type Box<> = …` is a row — holding the base name and a name slice.
 export let declGpNode: i32[] = []
 export let declGpBase: string[] = []
 export let declGpStart: i32[] = []
@@ -762,7 +591,7 @@ function declGpRowOf(nodeIx: i32) {
   -1
 }
 
-// The BASE name of the generic declaration at `nodeIx` (`Box` of `Box<T>`), or
+// The base name of the generic declaration at `nodeIx` (`Box` of `Box<T>`), or
 // "" when the node is not one — which is the answer every caller already treats
 // as "this declared name is its own base".
 export function declGpBaseOf(nodeIx: i32) {
@@ -771,7 +600,7 @@ export function declGpBaseOf(nodeIx: i32) {
   declGpBase[r]
 }
 
-// Its type-PARAMETER names in declaration order; empty for a non-generic node.
+// Its type-parameter names in declaration order; empty for a non-generic node.
 export function declGpParamsOf(nodeIx: i32): string[] {
   const out: string[] = []
   const r = declGpRowOf(nodeIx)
@@ -785,18 +614,10 @@ export function declGpParamsOf(nodeIx: i32): string[] {
   out
 }
 
-// ── D1045: the BODY-SCOPED `type` declarations, marked where they are minted ──
-// A `type` declared inside a block is lexically scoped (DECISIONS.md §"A `type`
-// declared in a function body is legal and lexically scoped"), and the parser
-// implements that scope by MANGLING the declared name unique (`P` → `P$b7`) and
-// HOISTING the declaration into the program's top-level statement list — so every
-// consumer that looks a type up BY NAME works on it unchanged, exactly as the
-// module merge's `name$mN` rename makes two modules' `Pair` two types.
-// The node is therefore reachable TWICE — at its lexical position and in
-// `progStmts` — so the two consumers that must not double-count it ask here: the
-// FORMATTER (which would print the declaration a second time, the reason it also
-// filters `ImportDecl`) and the module merge (whose top-level visit would rename
-// it with the enclosing function's type parameters NOT shadowed). Linear-scanned.
+// D1045 — the body-scoped `type` declarations, marked where they are minted. A `type`
+// declared inside a block is lexically scoped, and the parser implements that by mangling
+// the name unique (`P` → `P$b7`) and hoisting the declaration into `progStmts`. The node
+// is then reachable twice, so the formatter and the merge ask here not to double-count.
 export let bodyTyDeclNode: i32[] = []
 
 export function setBodyTyDecl(nodeIx: i32) {
@@ -804,8 +625,8 @@ export function setBodyTyDecl(nodeIx: i32) {
   0
 }
 
-// Was `nodeIx` declared inside a BLOCK (and hoisted into `progStmts` by the
-// parser)? False for every module-scope declaration and every other node kind.
+// Is `nodeIx` a declaration the parser found inside a block and hoisted into `progStmts`?
+// False for every module-scope declaration and every other node kind.
 export function isBodyTyDecl(nodeIx: i32): boolean {
   let i = 0
   while i < bodyTyDeclNode.length {
@@ -815,18 +636,10 @@ export function isBodyTyDecl(nodeIx: i32): boolean {
   false
 }
 
-// ── constraints phase 1: BOUNDS, kept where annotations are kept ─────────────
-// Two tables, sparse and linear-scanned for `declGp*`'s reason. Both store an
-// ANNOTATION NODE INDEX, never a rendered name, and that is architectural rather
-// than a storage preference: a declared bound IS an annotation — present at
-// parse, no inference — so it rides the path that already works end to end. The
-// merge renames it through `modRwType` like any other `TypeRef`, `tsToName`
-// writes its spelling tree back, and the checker resolves it with the same
-// `nameToTy` every parameter type uses. The alternative is what forced this:
-// D976 records that the column the CHECKER writes for an inferred parameter
-// shape does not survive into emit, and a bound MUST (the monomorphizer
-// re-resolves each instance's member calls against the substituted receiver).
-// One row per BOUNDED type parameter; an unbounded `<T>` gets none, answers -1.
+// Constraints phase 1: bounds, kept where annotations are kept. Both tables store an
+// annotation node index, never a rendered name, because a declared bound is an annotation
+// and rides the path that works end to end — D976 records that the column the checker
+// writes for an inferred shape does not. One row per bounded parameter; `<T>` answers -1.
 export let fnTpBoundFn: i32[] = []
 export let fnTpBoundIx: i32[] = []
 export let fnTpBoundAnn: i32[] = []
@@ -849,7 +662,7 @@ export function fnTpBoundOf(fnIx: i32, k: i32) {
   -1
 }
 
-// Does this function declare ANY bounded type parameter? The cheap gate every
+// Does this function declare any bounded type parameter? The cheap gate every
 // consumer takes before doing bound work, so an unbounded generic pays one scan.
 export function fnHasTpBound(fnIx: i32) {
   let i = 0
@@ -860,13 +673,10 @@ export function fnHasTpBound(fnIx: i32) {
   false
 }
 
-// `declBound*` — one row per BOUND ALIAS declaration (`type Showable = { toString():
-// string }`, i.e. a `type` whose body carries at least one METHOD member). The row
-// holds the whole body as ONE synthetic-object annotation node, so `<T: Showable>`
-// and `<T: { toString(): string }>` reach the identical spelling tree and one
-// decoder serves both. The declaration node itself is minted with an EMPTY field
-// list — a bound is not a value type and has no fields to lay out (see
-// `typecheck.declaredTyOfName`, which turns a value-position use into a sentence).
+// One row per bound alias declaration (`type Showable = { toString(): string }`, a `type`
+// whose body carries at least one method member). The row holds the whole body as one
+// synthetic-object annotation node, so `<T: Showable>` and `<T: { toString(): string }>`
+// reach the identical spelling tree. The declaration itself is minted with no fields.
 export let declBoundNode: i32[] = []
 export let declBoundAnn: i32[] = []
 
@@ -887,12 +697,10 @@ export function declBoundOf(nodeIx: i32) {
   -1
 }
 
-// The module merge renames a declaration's base segment (`Box` → `Box$m1`) and
-// writes the result back into `tdName`/`udName`. The BANK is a second copy of
-// that segment, so it moves with it — the same lockstep `modRwType` keeps
-// between a `TypeRef`'s tree and its name, and the same bug class if it does
-// not (a stale base makes the checker register the alias under a name no
-// application spells).
+// The module merge renames a declaration's base segment (`Box` → `Box$m1`) and writes it
+// back into `tdName`/`udName`. The bank is a second copy of that segment and must move
+// with it — the same lockstep `modRwType` keeps between a `TypeRef`'s tree and its name; a
+// stale base registers the alias under a name no application spells.
 export function setDeclGpBase(nodeIx: i32, base: string) {
   const r = declGpRowOf(nodeIx)
   if r >= 0 { declGpBase[r] = base }
@@ -900,7 +708,7 @@ export function setDeclGpBase(nodeIx: i32, base: string) {
 }
 
 // The `k`-th member spelling root recorded for `nodeIx`, or -1 when the node has
-// none (or fewer than `k + 1`). Binary search for the LEFTMOST row of `nodeIx`
+// none (or fewer than `k + 1`). Binary search for the leftmost row of `nodeIx`
 // over the non-decreasing key column, then index by `k`.
 export function udTsRootAt(nodeIx: i32, k: i32) {
   let lo = 0
@@ -923,18 +731,10 @@ export function udTsRootAt(nodeIx: i32, k: i32) {
   udTsRoot[r]
 }
 
-// DROP the `k`-th member spelling root of `nodeIx` — `clearAnnTs`'s twin for the
-// MULTI-root table, for exactly the reason that one exists: *a live root renders
-// to the spelling the node CURRENTLY carries*.
-//
-// `typecheck.canonEmitTypeNames`'s `UnionDecl` arm rewrites `udVariants[k]` in
-// place (a softened literal member, a folded intersection, a generic APPLICATION
-// replaced by its structural shape), and that rewrite is not a rename any more
-// than the `TypeRef` arm's is. The table had no reader downstream of canon until
-// the intersection fold started reading this root, which is what makes the
-// invariant worth stating on this table too.
-//
-// The same binary search `udTsRootAt` walks; a node/`k` with no row is left alone.
+// Drop the `k`-th member spelling root of `nodeIx` — `clearAnnTs`'s twin for the multi-root
+// table, under the same invariant: a live root renders to the spelling the node currently
+// carries. `canonEmitTypeNames`'s `UnionDecl` arm rewrites `udVariants[k]` in place, which
+// is not a rename. The same binary search `udTsRootAt` walks; a node with no row is spared.
 export function clearUdTs(nodeIx: i32, k: i32) {
   let lo = 0
   let hi = udTsNode.length - 1
@@ -957,10 +757,9 @@ export function clearUdTs(nodeIx: i32, k: i32) {
   0
 }
 
-// The spelling-tree root recorded for `nodeIx`, or `-1` when none was — every
-// non-`TypeRef` node, an emitter-SYNTHESIZED `TypeRef` (`synthTypeRef`, built
-// from a name the emitter computed that never passed through the parser), and
-// the string-only type spellings the parser still drops (`as`).
+// The spelling-tree root recorded for `nodeIx`, or `-1` when none is — every non-`TypeRef`
+// node, an emitter-synthesized `TypeRef` built from a name that never passed through the
+// parser, and the string-only type spellings the parser still drops (`as`).
 export function annTsOf(nodeIx: i32) {
   let lo = 0
   let hi = annTsNode.length - 1
@@ -973,18 +772,10 @@ export function annTsOf(nodeIx: i32) {
   -1
 }
 
-// DROP the spelling root recorded for `nodeIx`, so `annTsOf` answers -1 from
-// here on and every consumer falls back to the node's NAME.
-//
-// The one caller is `typecheck.canonEmitTypeNames`, and the reason is the
-// invariant this table is only useful under: **a live root renders to the node's
-// CURRENT name**. Canon rewrites `TypeRef.tyName` IN PLACE, and it is not a
-// rename — it softens a literal member to its base scalar, folds an intersection,
-// strips a whole-name paren — so the tree it leaves behind describes a DIFFERENT
-// TYPE. The module merge (`driver.modRwType`) hit this one pass earlier and fixed
-// it the other way, by rewriting the TREE and re-rendering; canon cannot
-// (`canonEmitName` is not `tyToEmitName ∘ nameToTy`), so the honest move is to
-// stop claiming a tree for a name the tree no longer describes.
+// Drop the spelling root recorded for `nodeIx`, so `annTsOf` answers -1 and every consumer
+// falls back to the node's name. The invariant this table is only useful under is that a
+// live root renders to the node's current name, and canon rewrites `TypeRef.tyName` in
+// place without renaming it, so the tree it leaves behind describes a different type.
 export function clearAnnTs(nodeIx: i32) {
   let lo = 0
   let hi = annTsNode.length - 1
@@ -1001,7 +792,7 @@ export function clearAnnTs(nodeIx: i32) {
 }
 
 // Clear the spelling arena and its node columns. The driver calls this alongside
-// `P.nodes = []` / `nodeToks = []` — a recorded root indexes THIS program's
+// `P.nodes = []` / `nodeToks = []` — a recorded root indexes this program's
 // arena and means nothing against the next one's.
 export function tsReset() {
   tsKind = []
@@ -1025,32 +816,19 @@ export function tsReset() {
   fnTpBoundAnn = []
   declBoundNode = []
   declBoundAnn = []
-  // D1003 — THE PLAIN→MANGLED UFCS ALIAS TABLE BELONGS TO ONE PROGRAM TOO, and
-  // until this line it was reset ONLY on the module-merge path (`driver`, before
-  // `modCollectSelfFns`). A single-file compile that followed a MODULE compile on
-  // the same instance inherited the previous program's rows, so UFCS resolution
-  // answered with a mangled name no function in the new program declares and the
-  // lookup missed — surfacing as D952's EMPTY `[ERROR]:` at the member call.
-  //
-  // Invisible from the CLI (one process per compile) and reproducible in the two
-  // places that reuse an instance: `tests/cases_wasm_test.ts`'s shared module, and
-  // the LSP server, which compiles on every keystroke. Found by a `tests/cases`
-  // file that passed alone and failed beside its neighbours.
+  // D1003 — the plain→mangled UFCS alias table belongs to one program too. A single-file
+  // compile following a module compile on the same instance would otherwise inherit the
+  // previous program's rows, so UFCS resolution answers with a mangled name no function in
+  // the new program declares. Invisible from the CLI; live in the LSP and the harness.
   ufcsAliasReset()
   ufcsImpReset()
   0
 }
 
-// Render a spelling node back to the synthetic type NAME the parser built from
-// it — arm for arm, the exact concatenations of `parseTypeName` /
-// `parseTypeIsect` / `parseTypeAtom` (`compiler/parser.vl`), so
-// `tsToName(annTsOf(ix))` reproduces `TypeRef.tyName` character for character on
-// every annotation the parser recorded.
-//
-// This is the tree's WRITE-BACK, and it is what lets a pass rewrite the
-// STRUCTURE and hand the string side its result instead of scanning characters
-// (D-PARSETY P1: the module merge). -1 renders "" — the same empty name the
-// parser's recovery arm returns.
+// Render a spelling node back to the synthetic type name the parser built from it — arm
+// for arm, the exact concatenations of `parseTypeName` / `parseTypeIsect` /
+// `parseTypeAtom`, so `tsToName(annTsOf(ix))` reproduces `TypeRef.tyName` character for
+// character. This is the tree's write-back; -1 renders "", the parser's recovery answer.
 export function tsToName(ix: i32): string {
   if ix < 0 { return "" }
   const k = tsKind[ix]
@@ -1074,8 +852,8 @@ export function tsToName(ix: i32): string {
     k == TS_FUNC ||
     k == TS_METHOD
   ) {
-    // The comma-joined child list. `TS_FUNC` and `TS_METHOD` hold their RESULT as
-    // the LAST kid (`parseTypeAtom` / `parseMethodMemberTail`'s contract), so the
+    // The comma-joined child list. `TS_FUNC` and `TS_METHOD` hold their result as
+    // the last kid (`parseTypeAtom` / `parseMethodMemberTail`'s contract), so the
     // join stops one short of it.
     let last = cnt
     if k == TS_FUNC || k == TS_METHOD { last = cnt - 1 }
@@ -1107,15 +885,9 @@ export function tsToName(ix: i32): string {
   out
 }
 
-// Does the spelling tree rooted at `ix` NAME any of `names`? Walks the same
-// structure `resolveAnnotTs` resolves against, so it answers about the
-// annotation the author wrote rather than about a synthetic name string:
-// `T`, `T[]`, `Box<T>` and `{a: T}` all mention `T`, while `Trace` does not
-// (a leaf is compared whole, never as a substring). The `TS_APP` head is
-// compared too, so a type parameter used as an application head counts.
-// Does the spelling tree rooted at `ix` contain a node of kind `kind` ANYWHERE? The
-// structural form of "the rendered name contains `=>`" (`TS_FUNC`) and its siblings — a
-// whole-TREE question, where `tsMentionsAnyName` asks a whole-LEAF one.
+// Does the spelling tree rooted at `ix` contain a node of kind `kind` anywhere? The
+// structural form of "the rendered name contains `=>`" and its siblings — a whole-tree
+// question, where `tsMentionsAnyName` asks a whole-leaf one.
 export function tsHasKind(ix: i32, kind: i32): boolean {
   if ix < 0 || ix >= tsKind.length { return false }
   if tsKind[ix] == kind { return true }
@@ -1129,6 +901,10 @@ export function tsHasKind(ix: i32, kind: i32): boolean {
   false
 }
 
+// Does the spelling tree rooted at `ix` name any of `names`? It walks the structure
+// `resolveAnnotTs` resolves against, so it answers about the annotation the author wrote
+// rather than a synthetic name string: `T`, `T[]`, `Box<T>` and `{a: T}` all mention `T`,
+// while `Trace` does not (a leaf is compared whole). The `TS_APP` head is compared too.
 export function tsMentionsAnyName(ix: i32, names: string[]) {
   if ix < 0 || ix >= tsKind.length || names.length == 0 { return false }
   const k = tsKind[ix]
@@ -1151,10 +927,8 @@ export function tsMentionsAnyName(ix: i32, names: string[]) {
 
 // ── Arena constructors ───────────────────────────────────────────────────────
 // Each appends its variant to `P.nodes` and returns the new node's index. Every
-// constructor takes `pos` — the CHAR OFFSET of the construct's START token (the
-// parser captures it at the construct's parse entry, BEFORE the children parse),
-// or `-1` for a synthesized/desugared node with no source token — and stores it
-// on the built variant.
+// constructor takes `pos` — the char offset of the construct's start token, captured at
+// parse entry before the children parse, or `-1` for a synthesized node.
 
 export function addNode(n: Node) {
   P.nodes.push(n)
@@ -1211,21 +985,13 @@ export function mkBinary(op: string, left: i32, right: i32, pos: i32) {
   addNode(n)
 }
 
-// ── the template renderer's LOCAL NAME (the injected import's near half) ─────
-// The identifier a template hole's desugared call names. It is deliberately
-// UNSPELLABLE — `$` is not an identifier character (`lexer.isIdStart`), so no
-// user program can declare it, shadow it, or reference it — which is the whole
-// mechanism behind "a template's meaning does not depend on the user's imports"
-// (DECISIONS.md, owner ruling 2026-09-01). The module merge rewrites it to the
-// merged `toStr$mN` through an ordinary rename row, so it never reaches the
-// checker's scope and never appears in hover or completion.
-//
-// The FAR half — which std export it denotes — is `TPL_RENDER_EXPORT` in
-// `driver.vl`, and that is the ONE line the queued `toStr` → `toString` rename
-// touches.
+// The identifier a template hole's desugared call names. It is deliberately unspellable —
+// `$` is not an identifier character — so no user program can declare, shadow or reference
+// it, which is what makes a template's meaning independent of the author's imports. The
+// merge rewrites it to `toStr$mN` through an ordinary rename row.
 export const TPL_RENDER_LOCAL = "$tpl$render"
 
-// The ROOT `+` of a template literal's concatenation — `mkBinary` plus the
+// The root `+` of a template literal's concatenation — `mkBinary` plus the
 // faithful-surface marker the printer reads (see `BinExpr.binTpl`).
 export function mkTplConcat(left: i32, right: i32, pos: i32) {
   const n: Node = {
@@ -1239,25 +1005,15 @@ export function mkTplConcat(left: i32, right: i32, pos: i32) {
   addNode(n)
 }
 
-// ── template holes (the parser's record of what a `${…}` was) ────────────────
-// PARALLEL to `P.nodes`, grown lazily, bounds-checked on read — the `nodeToks` /
-// `declNameTok` contract. `1` marks a node that IS a template hole's expression.
-//
-// WHY A SIDE TABLE AND NOT A NODE KIND: the hole is an ORDINARY expression and
-// every pass should treat it as one. The single consumer is the checker's
-// argument-mismatch report, which owes a template hole a sentence about templates
-// rather than about the call the user never wrote — and the mark has to survive
-// the module merge's identifier rewrite, which a callee NAME does not. A
-// `TemplateLit` node kind would instead need an `is` arm in nine files' dispatch
-// chains, each with a SILENTLY failing catch-all, to buy nothing the desugar does
-// not already give (`format.vl` recovers the surface from the source span).
+// Parallel to `P.nodes`, grown lazily, bounds-checked on read — `nodeToks`' contract. `1`
+// marks a node that is a template hole's expression. A side table and not a node kind
+// because the hole is an ordinary expression: the single consumer is the checker's
+// argument-mismatch report, and the mark has to survive the merge's identifier rewrite.
 export let tplHole: i32[] = []
 
-// Mark `nodeIx` as a template hole's expression. Bounds-guarded on the WRITE
-// too, not only the read: every caller passes a constructor's result and so
-// cannot pass a negative, but a `tplHole[-1] = 1` would be an out-of-bounds
-// TRAP inside the compiler — no diagnostic, no position — and this table is not
-// worth that risk.
+// Mark `nodeIx` as a template hole's expression. Bounds-guarded on the write as well as
+// the read: every caller passes a constructor's result and so cannot pass a negative, but
+// a `tplHole[-1] = 1` would trap inside the compiler with no diagnostic and no position.
 export function mkTplHole(nodeIx: i32) {
   if nodeIx < 0 { return 0 }
   while tplHole.length <= nodeIx { tplHole.push(0) }
@@ -1273,7 +1029,7 @@ export function nodeIsTplHole(nodeIx: i32) {
 
 // A compound assignment `target op= value`, desugared to `target = (target op
 // value)` for typecheck/emit but tagged with the SURFACE operator (`binCompound`)
-// so the printer reprints `target op= value`. The target node is SHARED between
+// so the printer reprints `target op= value`. The target node is shared between
 // the read (inner arith) and the write (outer `=`) — arena reads are pure.
 export function mkCompoundAssign(
   op: string,
@@ -1294,7 +1050,7 @@ export function mkCompoundAssign(
 }
 
 // A prefix increment `++target` / `--target` (`incr` is `"++"`/`"--"`), desugared
-// to `target = (target ± 1)` — yielding the NEW value, the prefix semantics — and
+// to `target = (target ± 1)` — yielding the new value, the prefix semantics — and
 // tagged on `binCompound` with the surface `++`/`--` so the printer reprints the
 // prefix form (postfix `x++` rides a `Unary "p+"` instead; see the parser).
 export function mkPreIncr(incr: string, target: i32, pos: i32) {
@@ -1318,7 +1074,7 @@ export function mkCall(fn: i32, args: i32[], pos: i32) {
   mkCallN(fn, args, names, pos)
 }
 
-// A call with per-argument NAMES (parallel to `args`; "" = positional) — the
+// A call with per-argument names (parallel to `args`; "" = positional) — the
 // parser's constructor for argument lists that may carry `name: value` entries.
 export function mkCallN(fn: i32, args: i32[], names: string[], pos: i32) {
   const n: Node = { callFn: fn, callArgs: args, callArgNames: names, pos: pos }
@@ -1336,31 +1092,20 @@ export function hasNamedArgs(names: string[]) {
   false
 }
 
-// ── UFCS resolution across the module merge ──────────────────────────────────
-// A UFCS member-call `recv.prop(args)` whose `prop` names a free `self`-function
-// keeps `prop` plain on its `Member` — so a struct callable-field of the same
-// name keeps precedence, decided by the receiver TYPE in the checker/emitter. The
-// merge MANGLES such functions (`shout` → `shout$m1`), so the merged name has to
-// be recovered where UFCS resolves, AFTER the field check. EMPTY in single-file
-// mode (no merge populates it), so a non-module program takes exactly the paths
-// it took before. Defined here (the foundation file shared by every
-// concatenation) because `typecheck.vl` and `wasmEmit.vl` consult it while the
-// driver — which populates it — is concatenated last.
+// UFCS resolution across the module merge. A member call `recv.prop(args)` whose `prop`
+// names a free `self`-function keeps `prop` plain on its `Member`, so a struct callable
+// field of the same name keeps precedence. The merge mangles such functions, so the merged
+// name is recovered where UFCS resolves, after the field check. Empty in single-file mode.
 
-// D1120 — THE PLAIN NAME IS NOT A KEY. Two merged modules may each export a
-// `self`-function called `area`, so the answer is banked per CALL SITE:
-// `ufcsSiteTo[callIx]`, the node-index sidecar shape `callSiteLoc` uses. Node
-// indices are stable from the merge walk through `checkProgram` and
-// `emitProgram`, which is what lets three consumers in two phases read one answer.
+// D1120 — the plain name is not a key: two merged modules may each export a `self`-function
+// called `area`, so the answer is banked per call site in `ufcsSiteTo[callIx]`. Node indices
+// are stable from the merge walk through `checkProgram` and `emitProgram`, which is what
+// lets three consumers in two phases read one answer.
 
-// D1191 — AND THE PLAIN NAME IS NOT A SCOPE EITHER. The name-keyed map this
-// replaces was GLOBAL: a row banked by lib's own `b.hidden()` answered the ENTRY's
-// `b.hidden()` too, so an un-exported `self`-function became callable from a module
-// that never imported it — while the direct spelling `hidden(b)` stayed `undeclared
-// identifier`. The rule is the direct call's rule: a UFCS candidate must be a name
-// the CALLER binds. `ufcsScope*` is that scope, one row per (module, plain name)
-// the module binds to a `self`-function, built from the rename map that already
-// decides every other reference; `ufcsModBound` maps a node back to its module.
+// D1191 — and the plain name is not a scope either: a global name-keyed map let a module's
+// own un-exported `self`-function answer another module's call. The rule is the direct
+// call's rule, that a UFCS candidate must be a name the caller binds. `ufcsScope*` is that
+// scope, one row per (module, plain name); `ufcsModBound` maps a node back to its module.
 export let ufcsSiteTo: string[] = []
 export let ufcsScopeMod: i32[] = []
 export let ufcsScopeFrom: string[] = []
@@ -1376,7 +1121,7 @@ export function ufcsAliasReset() {
   ufcsModIx = []
   0
 }
-// Bank the mangled self-function the UFCS member-call NODE `callIx` resolves to.
+// Bank the mangled self-function the UFCS member-call node `callIx` resolves to.
 export function ufcsSiteAdd(callIx: i32, mangled: string) {
   if callIx < 0 { return 0 }
   while ufcsSiteTo.length <= callIx { ufcsSiteTo.push("") }
@@ -1415,9 +1160,9 @@ export function ufcsModBoundAdd(m: i32, rootIx: i32) {
   ufcsModBound.push(rootIx)
   0
 }
-// The module owning arena node `ix`, or -1 when no merge ran (single file) or the
-// node was minted AFTER parsing (a desugar's fresh node, past every root). -1
-// means "no scope to check", which the readers below spell as the plain name.
+// The module owning arena node `ix`, or -1 when no merge ran (a single file) or the node
+// is minted after parsing (a desugar's fresh node, past every root). -1 means "no scope to
+// check", which the readers below spell as the plain name.
 export function ufcsModOfNode(ix: i32) {
   let i = 0
   while i < ufcsModBound.length {
@@ -1437,30 +1182,20 @@ export function ufcsAliasInScope(nodeIx: i32, name: string) {
   if t != "" { return t }
   name
 }
-// The mangled self-function the UFCS member-call at `callIx` resolves to: THAT
-// SITE's own answer when the merge walk banked one (D1120), else the CALLER's
-// module scope (D1191). The one entry point for the three consumers that hold a
-// call node — `ufcsCallTy`, `drwWalk`, and `emitCall`'s unrewritten-member
-// fallback — so the checker and the emitter cannot pick different modules'
-// functions for one call.
+// The mangled self-function the UFCS member call at `callIx` resolves to: that site's own
+// answer when the merge walk banked one (D1120), else the caller's module scope. The one
+// entry point for the three consumers that hold a call node, so the checker and the emitter
+// cannot pick different modules' functions for one call.
 export function ufcsAliasAtSite(callIx: i32, name: string) {
   const site = ufcsSiteOf(callIx)
   if site != "" { return site }
   ufcsAliasInScope(callIx, name)
 }
 
-// ── UFCS candidates the entry file has NOT imported (D1230's diagnostic) ─────
-// UFCS is EXPLICIT: `expect(1).toEqual(2)` resolves `toEqual` only against names
-// IN SCOPE, and the compiler does not look into the module that defines the
-// receiver's type (DECISIONS.md §"UFCS is never implicit"). The program is
-// therefore illegal — but `no field 'toEqual' on Expectation<i32>` is a true
-// sentence about a fact that will never change, and the ONE thing the compiler
-// knows and does not say is that `toEqual` sits in a module the file already names.
-// This registry carries that knowledge across the phase boundary: the merge
-// (`driver.modCollectSelfFns`) knows every module's exported free `self`-functions
-// and the specifier the ENTRY file names each module by; the checker knows the
-// receiver type and the call's arity. A ROW IS A CANDIDATE, NOT A VERDICT —
-// whether it would dispatch is `typecheck.ufcsWouldDispatch`'s question, per call.
+// UFCS candidates the entry file has not imported (D1230's diagnostic). UFCS is explicit:
+// `toEqual` resolves only against names in scope, so the program is illegal — but the one
+// thing the compiler knows and does not say is that `toEqual` sits in a module the file
+// already names. A row is a candidate, not a verdict; `ufcsWouldDispatch` decides per call.
 export let ufcsImpName: string[] = []    // the plain source name (`toEqual`)
 export let ufcsImpMangled: string[] = [] // the merged name (`toEqual$m1`)
 export let ufcsImpSpec: string[] = []    // how the ENTRY names that module (`std:test`)
@@ -1482,32 +1217,17 @@ export function ufcsImpAdd(plain: string, mangled: string, spec: string) {
   0
 }
 
-// ── free INDEX-OPERATOR declaration names (B14) ──────────────────────────────
-// `function "[]"(self: T, i: I)` and `function "[]="(self: T, i: I, v: V)` are
-// free functions whose NAME is an operator, so a program may declare several —
-// one per receiver type. Every name-keyed table in the checker and the emitter
-// (`fnDeclIx`, `lookup`, `fnIndexOf`) holds ONE entry per name, so the parser
-// mints a DECLARATION NAME carrying the receiver's annotation spelling:
-// `"[]" for F32View` → `[]@F32View`.
-// The `@` is what makes the encoding total — it cannot occur in an identifier, so
-// no ordinary function's name reads as an operator's, and a genuine duplicate
-// collides on the minted name and is caught by the ordinary redeclaration rule.
-// The merge's `$mN` suffix leaves the prefix intact (`[]@F32View$m1`), so the
-// checker's registry, built from the MERGED program, needs no plain→mangled alias.
+// Free index-operator declaration names. `function "[]"(self: T, i: I)` and `"[]="` are
+// free functions whose name is an operator, so a program may declare one per receiver type,
+// while every name-keyed table holds one entry per name — so the parser mints
+// `[]@F32View`. The `@` cannot occur in an identifier, which makes the encoding total.
 export const OP_INDEX_GET = "[]"
 export const OP_INDEX_SET = "[]="
 
-// The operator names whose DISPATCH is binary — the quoted-function-name set
-// (`parser.vl`'s `isStrFuncName`) minus the two BRACKET operators, whose arity is
-// the index rule's `(self, index[, value])` and is checked at the hoist against
-// the resolved receiver, and minus `==`/`!=`, which `parseFuncHead` already
-// refuses BY NAME (D46). Listing those two here as well would put a second
-// diagnostic on one declaration for one mistake.
-//
-// HERE rather than in `parser.vl` because BOTH declaration-site gates over this
-// family read it and neither may drift from the other: the parser's arity (D444)
-// and first-parameter-NAME (D471) rules are syntactic, and the checker's
-// dead-`self` rule (D425) needs the resolved type. One list, three gates.
+// The operator names whose dispatch is binary: the quoted-function-name set minus the two
+// bracket operators, whose arity is the index rule's and is checked at the hoist, and minus
+// `==`/`!=`, which `parseFuncHead` refuses by name (D46). Here rather than in `parser.vl`
+// because three declaration-site gates read it and none may drift from the others.
 export function isBinOpFuncName(name: string) {
   name == "+" ||
     name == "-" ||
@@ -1534,9 +1254,9 @@ function opDeclAt(name: string): i32 {
   -1
 }
 
-// The INDEX OPERATOR a declaration name implements, or "" when `name` is an
-// ordinary function's. Total over merge-mangled names (the `$mN` rides in the
-// receiver half) and over every identifier (no identifier contains `@`).
+// The index operator a declaration name implements, or "" when `name` is an ordinary
+// function's. Total over merge-mangled names (the `$mN` rides in the receiver half) and
+// over every identifier, since no identifier contains `@`.
 export function opDeclOpOf(name: string): string {
   const at = opDeclAt(name)
   if at < 0 { return "" }
@@ -1554,7 +1274,7 @@ export function opDeclRecvOf(name: string): string {
   recv
 }
 
-// How an operator declaration reads back to a USER: `"[]" for F32View`. Every
+// How an operator declaration reads back to a user: `"[]" for F32View`. Every
 // diagnostic that would otherwise print the minted name routes through this, so
 // the `@` encoding never reaches a message. An ordinary name is returned as-is.
 export function opDeclLabel(name: string): string {
@@ -1563,14 +1283,10 @@ export function opDeclLabel(name: string): string {
   "\"" + op + "\" for " + opDeclRecvOf(name)
 }
 
-// Bind call ARGUMENTS to parameter slots by NAME, then positionally — the exact
-// matching the host's `orderArgumentsByParameters` (typecheck.ts) performs, and
-// the single source of truth shared by the checker and the emitter. Returns one
-// VALUE-node index per parameter (in PARAMETER order; -1 where no argument
-// filled the slot), followed by any leftover/unmatched arguments (a named arg
-// with no matching parameter, a named collision, or surplus positionals) in
-// source order — so the result never silently drops an argument. Pure: callers
-// (`checkNode`'s Call arm, `emitCall`) diagnose arity/name errors themselves.
+// Bind call arguments to parameter slots by name, then positionally — the single source of
+// truth shared by the checker and the emitter. Returns one value-node index per parameter
+// in parameter order (-1 where no argument filled the slot), followed by any leftover
+// arguments in source order, so nothing is silently dropped. Callers diagnose the errors.
 export function orderArgsByParamNames(
   paramNames: string[],
   args: i32[],
@@ -1682,7 +1398,7 @@ export function mkParam(name: string, ty: i32, dflt: i32, opt: i32, pos: i32) {
 }
 
 // The default-value expression of the parameter node `pIx`, or -1 when it has
-// none (or `pIx` is not a `Param`). The ONE reader of `parDefault` outside the
+// none (or `pIx` is not a `Param`). The one reader of `parDefault` outside the
 // parser/printer, so a caller never re-narrows the node itself.
 export function paramDefaultOf(pIx: i32) {
   if pIx < 0 || pIx >= P.nodes.length { return -1 }
@@ -1691,18 +1407,10 @@ export function paramDefaultOf(pIx: i32) {
   -1
 }
 
-// Fill every UNFILLED slot of a PARAMETER-ORDERED argument list with that
-// parameter's DEFAULT expression, in place. Returns the position of the first
-// slot that stays unfilled (no argument supplied and no default declared), or
-// -1 when the list came out complete.
-//
-// The default's arena node is SHARED by every call site that omits the argument
-// rather than cloned: a literal and a module-scope `const` carry no
-// per-occurrence state — their emitted valtype comes from the parameter they land
-// on and their walk is idempotent — so sharing is exact for both. `__callsite__`
-// IS the exception, and `callIx` is why this takes the call node: its value is the
-// CALL's own position, so the slot takes the per-site `ObjLit` `csPreMintLocs`
-// banked on that call. A call with no banked location leaves the slot UNFILLED.
+// Fill every unfilled slot of a parameter-ordered argument list with that parameter's
+// default expression, in place; returns the position of the first slot that stays unfilled,
+// or -1. The default's node is shared by every call site rather than cloned, exact because
+// it carries no per-occurrence state. `__callsite__` is the exception, which `callIx` serves.
 export function fillArgDefaults(slots: i32[], dParams: i32[], callIx: i32) {
   let i = 0
   while i < slots.length {
@@ -1719,12 +1427,10 @@ export function fillArgDefaults(slots: i32[], dParams: i32[], callIx: i32) {
   -1
 }
 
-// How many LEADING arguments a DIRECT call to a function with these parameters
-// must supply: every parameter up to the first one carrying a default. Defaults
-// are trailing-only (the checker rejects a non-defaulted parameter after a
-// defaulted one), so this is the low end of the accepted arity range and
-// `params.length` is the high end. A list with no defaults answers its own
-// length, which is the exact-arity gate every call site had before.
+// How many leading arguments a direct call must supply: every parameter up to the first
+// one carrying a default. Defaults are trailing-only, so this is the low end of the
+// accepted arity range and `params.length` the high end; a list with no defaults answers
+// its own length.
 export function fnRequiredArity(params: i32[]) {
   let i = 0
   while i < params.length {
@@ -1763,7 +1469,7 @@ export function mkIf(cond: i32, thenB: i32, els: i32, pos: i32) {
   addNode(n)
 }
 
-// Loop constructors take the optional loop LABEL last ("" = unlabelled).
+// Loop constructors take the optional loop label last ("" = unlabelled).
 export function mkWhile(cond: i32, body: i32, label: string, pos: i32) {
   const n: Node = {
     whileCond: cond,
@@ -1922,7 +1628,7 @@ export function mkIsExpr(obj: i32, variant: string, pos: i32) {
   addNode(n)
 }
 
-// A NEGATED type guard `x !is T`, desugared to `!(x is T)` (a `Unary "!"` over
+// A negated type guard `x !is T`, desugared to `!(x is T)` (a `Unary "!"` over
 // this node) for typecheck/emit's narrowing, but flagged `isNeg` so the printer
 // reprints the surface `!is` instead of `!(… is …)`.
 export function mkIsExprNeg(obj: i32, variant: string, pos: i32) {
@@ -1930,7 +1636,7 @@ export function mkIsExprNeg(obj: i32, variant: string, pos: i32) {
   addNode(n)
 }
 
-// `x as T` — an explicit numeric cast (B2). `ty` is the target type NAME string.
+// `x as T` — an explicit numeric cast (B2). `ty` is the target type name string.
 export function mkAsExpr(obj: i32, ty: string, mode: AsMode, pos: i32) {
   const n: Node = { asObj: obj, asTy: ty, asMode: mode, pos: pos }
   addNode(n)
@@ -1955,7 +1661,7 @@ function digitChar(d: i32) {
 
 export function i32ToStr(n: i32) {
   if n == 0 { return "0" }
-  // Peel digits in the NEGATIVE range: every i32 (including INT_MIN, whose
+  // Peel digits in the negative range: every i32 (including INT_MIN, whose
   // magnitude overflows i32) is representable as -|n|, so negate positives
   // instead of negatives. Wasm `rem_s` of a negative operand yields -digit.
   const neg = n < 0
@@ -1970,18 +1676,10 @@ export function i32ToStr(n: i32) {
   out
 }
 
-// ── Generic child enumeration ────────────────────────────────────────────────
-// The child arena indices of `P.nodes[ix]`, in source order; a slot holding `-1`
-// (absent) is pushed as-is and the walker's bounds check skips it. Covers VALUE
-// children and type-annotation slots (`TypeRef`/`FieldDef` — inert leaves for
-// every current rule, traversed so a richer type AST is covered automatically).
-// It started in `lint.vl` and lives here because it depends on nothing but the
-// node arena, which is this module — the lint tier, the checker and the emitter share it.
-// A `MatchExpr`'s PATTERNS are deliberately NOT children: a pattern is a literal
-// shape or the wildcard `_`, not a value reference, so a reference rule must not
-// count one as a use. `matchBinds` is out for that reason and one more — a
-// binding's initializer is a `Member` over the SHARED scrutinee node, so walking
-// it would count the scrutinee once per bound field. The desugar covers the loss.
+// The child arena indices of `P.nodes[ix]` in source order; a slot holding `-1` is pushed
+// as-is and the walker's bounds check skips it. Covers value children and type-annotation
+// slots. A `MatchExpr`'s patterns are deliberately not children — a pattern is a shape, not
+// a value reference — and `matchBinds` is out because it reads the shared scrutinee node.
 export function nodeChildren(ix: i32) {
   const out: i32[] = []
   if ix < 0 || ix >= P.nodes.length { return out }
