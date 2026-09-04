@@ -47,9 +47,11 @@ import {
   emitErr,
   emitErrAt,
   emitFnSpanEnd,
+  emitFnSpanKind,
   emitFnSpanNode,
   emitFnSpanPos,
   emitFnSpanStart,
+  emitFnSpanTag,
   fnDispNames,
   fnIndices,
   fnNames,
@@ -63,6 +65,7 @@ import {
   reExpTarget,
 } from "./emit_state"
 import { capHas } from "./emit_base"
+import { nodePos } from "./fmt_util"
 import {
   scopeResKind,
   scopeResName,
@@ -1875,6 +1878,32 @@ function declAnchorTokIx(nodeIx: i32): i32 {
   -1
 }
 
+// The token a MODULE-SCOPE STATEMENT's diagnostic anchors at: its declaring name where
+// it has one, else its FIRST token. `nodeToks` anchors a node at the LAST token it
+// consumed, so a top-level `if` chain spanning thirty lines anchored at its CLOSING
+// BRACE — a position that reads as real and is nowhere near the code (D1594).
+//
+// The scan walks BACK from that last token rather than binary-searching `P.toks`: a
+// merged program concatenates each module's token stream, so `start` offsets restart per
+// module and ascend only WITHIN one. Bounded by the statement's own tokens.
+function stmtAnchorTokIx(nodeIx: i32): i32 {
+  const nm = declNameTokOf(nodeIx)
+  if nm >= 0 && nm < P.toks.length { return nm }
+  if nodeIx < 0 || nodeIx >= nodeToks.length { return -1 }
+  const last = nodeToks[nodeIx]
+  if last < 0 || last >= P.toks.length { return -1 }
+  const at = nodePos(nodeIx)
+  if at < 0 { return last }
+  let t = last
+  while t >= 0 {
+    const s = P.toks[t].start
+    if s == at { return t }
+    if s < at { return last }
+    t = t - 1
+  }
+  last
+}
+
 // ── the emitted module's byte offset → the function that owns it (D1578) ─────
 // A module the engine REFUSES reports a byte offset into bytes the author never sees, so
 // the failure was unreadable. The emit channel got positions in D1519; this is the same
@@ -1884,9 +1913,9 @@ function declAnchorTokIx(nodeIx: i32): i32 {
 // LOOKUP IS A SCAN, deliberately: at most once per compile and only on the failure
 // path, where the module is already known not to load.
 //
-// -1 / 0 for an offset inside no recorded body — a synthetic start, a shared runtime
-// helper, an export wrapper, or a failure in another section. The caller then prints
-// the engine's own text, which is what it printed before.
+// -1 / 0 only for an offset in no body at all — a failure outside the code section.
+// Every body the code section writes has a row since D1594; the caller then prints the
+// engine's own text, which is what it printed before.
 export function emitFnSpanAt(off: i32): i32 {
   let i = 0
   while i < emitFnSpanStart.length {
@@ -1895,8 +1924,24 @@ export function emitFnSpanAt(off: i32): i32 {
   }
   -1
 }
+
+// WHAT the body at row `i` is: 0 a user function, 1 one module-scope statement or
+// global initializer inside the synthetic start function, 2 an export wrapper, 3 a
+// shared runtime helper, 4 the start function outside any statement. -1 for no row.
+//
+// A CLOSED SET, decoded in exactly two places — `emitFnSpanWhere` below and the host's
+// `SpanWhere::what` (scripts/vl-host/src/main.rs). Add a kind and both change.
+export function emitFnSpanKindOf(i: i32): i32 {
+  if i < 0 || i >= emitFnSpanKind.length { return -1 }
+  emitFnSpanKind[i]
+}
 function emitFnSpanTokIx(i: i32): i32 {
   if i < 0 || i >= emitFnSpanNode.length { return -1 }
+  // A MODULE-SCOPE STATEMENT anchors at its OWN node (D1594). The stamp test below
+  // exists to keep a SYNTHESIZED body positionless, and a top-level statement is
+  // parsed, never synthesized — so requiring a `declNameTok` would throw away every
+  // position an expression statement or an `if` has.
+  if emitFnSpanKindOf(i) == 1 { return stmtAnchorTokIx(emitFnSpanNode[i]) }
   // THE SLOT'S PRE-MONOMORPHIZATION ORIGINAL FIRST. An instance, a lifted lambda copy
   // and a pruned stub are all minted AFTER parsing, so `addNode` anchors them at the EOF
   // token — a position that reads as real and points at the last line of the file.
@@ -1945,13 +1990,42 @@ export function emitFnSpanModule(i: i32): i32 {
 // `function[N]::<name>` cannot disagree about what to call it.
 export function emitFnSpanName(i: i32): string {
   if i < 0 || i >= emitFnSpanPos.length { return "" }
+  // A body with no `FuncDecl` behind it carries its name directly (the shared runtime
+  // helpers), spelled as the NAME SECTION spells it.
+  if i < emitFnSpanTag.length {
+    if emitFnSpanTag[i].length > 0 { return emitFnSpanTag[i] }
+  }
   const p = emitFnSpanPos[i]
   if p >= 0 && p < fnDispNames.length {
     if fnDispNames[p].length > 0 { return fnDispNames[p] }
   }
-  const fn = P.nodes[emitFnSpanNode[i]]
+  // A SYNTHETIC body's row carries node -1, and `P.nodes[-1]` is a trap, not a miss.
+  const nd = emitFnSpanNode[i]
+  if nd < 0 || nd >= P.nodes.length { return "" }
+  const fn = P.nodes[nd]
   if fn is FuncDecl { return fn.fnName }
   ""
+}
+
+// The clause a diagnostic puts after "the emitted module failed to validate", for the
+// body at row `i` — "" when no row owns the offset, so the caller keeps its old
+// positionless sentence.
+//
+// THE HOST CARRIES THE SAME LADDER IN RUST (`SpanWhere::what`,
+// scripts/vl-host/src/main.rs): `vl build` / `vl run` never enter the CLI pump, so
+// each channel spells the clause for itself. They move together, exactly as
+// `engineFailOffset` and `engine_fail_offset` do.
+export function emitFnSpanWhere(i: i32): string {
+  const k = emitFnSpanKindOf(i)
+  if k < 0 { return "" }
+  if k == 1 || k == 4 { return " inside the module's top-level code" }
+  if k == 2 {
+    return " inside the export wrapper for `" + emitFnSpanName(i) + "`"
+  }
+  if k == 3 {
+    return " inside the shared runtime helper `" + emitFnSpanName(i) + "`"
+  }
+  " inside `" + emitFnSpanName(i) + "`"
 }
 export function emitFnSpanNameLen(i: i32): i32 { emitFnSpanName(i).length }
 export function emitFnSpanNameAt(i: i32, j: i32): i32 {

@@ -61,13 +61,23 @@ const VALID = `print(6 * 7)\n`;
 const run = async (
   args: string[],
   cwd: string,
+  env: Record<string, string> = {},
 ): Promise<{ code: number; out: string }> => {
   const { code, stdout, stderr } = await new Deno.Command(VL, {
     args: [...args, "--compiler", COMPILER],
     cwd,
     stdout: "piped",
     stderr: "piped",
-    env: { RUST_BACKTRACE: "0", NO_COLOR: "1", VL_STD: `${ROOT}/std` },
+    // `VL_FAULT_INJECT: ""` is pinned rather than inherited: the host's explicit
+    // "no fault", so a stray export in the surrounding shell cannot turn the
+    // uninjected runs below into failures that prove the opposite of what they say.
+    env: {
+      RUST_BACKTRACE: "0",
+      NO_COLOR: "1",
+      VL_STD: `${ROOT}/std`,
+      VL_FAULT_INJECT: "",
+      ...env,
+    },
   }).output();
   return {
     code,
@@ -145,6 +155,72 @@ Deno.test({
     await withDir({ "take.vl": INVALID }, async (dir) => {
       const r = await run(["build", "take.vl", "-o", "take.wasm"], dir);
       assertLocated("build", "take.vl:1:9:", r.code, r.out);
+    });
+  },
+});
+
+// --- the bodies with no `FuncDecl` behind them (D1594) ------------------------
+//
+// D1578 mapped an offset back to the USER FUNCTION owning it. A failure in the
+// SYNTHETIC START function — where every program's module-scope code runs — owned no
+// span row at all, so it printed the bare offset and nothing else. That is the second
+// report from the same consumer (VL-042): `at offset 39223`, no function, no position.
+//
+// The witness is FAULT-INJECTED rather than a live miscompile, for the reason
+// tests/vl_check_codegen_test.ts gives at length: a test that must name a live defect
+// gets re-pointed every time one is fixed. `$VL_FAULT_INJECT=corrupt-start-fn-body`
+// corrupts the start function's body past its locals vector, so the engine's real
+// validator refuses real emitted bytes and only the REASON they are bad is synthetic.
+const START_FN_SRC = `function id(n: i32): i32 {
+  return n
+}
+print(id(41) + 1)
+`;
+
+// The seam is in `vl build` only, and `vl run` is covered anyway: both render through
+// the same `locate_invalid_module`, and the live-witness tests above already drive that
+// function on the run channel. One seam is the smaller test-only surface.
+Deno.test({
+  name: "vl build positions an invalid module inside the module's top-level code",
+  ignore: !ENABLED,
+  fn: async () => {
+    await withDir({ "top.vl": START_FN_SRC }, async (dir) => {
+      // THE CONTROL, same source and same flags: without the fault the module is
+      // valid and the program runs. Otherwise the injected runs prove nothing.
+      const ok = await run(["run", "top.vl"], dir);
+      if (ok.code !== 0 || ok.out.trim() !== "42") {
+        throw new Error(`the control must run clean, got ${ok.code}: ${JSON.stringify(ok.out)}`);
+      }
+      {
+        const what = "build";
+        const r = await run(["build", "top.vl", "-o", "top.wasm"], dir, {
+          VL_FAULT_INJECT: "corrupt-start-fn-body",
+        });
+        if (r.code !== EXIT_COMPILER_BUG) {
+          throw new Error(`${what}: want exit ${EXIT_COMPILER_BUG}, got ${r.code}\n${r.out}`);
+        }
+        if (!r.out.includes("failed to validate inside the module's top-level code")) {
+          throw new Error(`${what}: want the top-level code named, got:\n${r.out}`);
+        }
+        // The module-scope STATEMENT, not the whole body: `print(id(41) + 1)` is on
+        // line 4. A message that names the body but points nowhere is the half of this
+        // a substring check would miss.
+        if (!r.out.includes("top.vl:4:")) {
+          throw new Error(`${what}: want the statement's position (line 4), got:\n${r.out}`);
+        }
+        if (!r.out.includes(BUG_LINE)) {
+          throw new Error(`${what}: want the standing "${BUG_LINE}" line, got:\n${r.out}`);
+        }
+      }
+      // AND THE FAULT REACHED THE START FUNCTION, not merely "a body": the other fault
+      // over the SAME source names `id`, so the pair discriminates. Without this, a
+      // start-fn fault that silently fell back to the first body would still pass.
+      const first = await run(["build", "top.vl", "-o", "top.wasm"], dir, {
+        VL_FAULT_INJECT: "corrupt-validate-bytes",
+      });
+      if (!first.out.includes("failed to validate inside `id`")) {
+        throw new Error(`the first-body fault must name \`id\`, got:\n${first.out}`);
+      }
     });
   },
 });
