@@ -59,5 +59,11 @@ class Vl < Formula
     # Exercises the full pipeline (parse -> typecheck -> emit -> run) inside the
     # installed binary, driving the embedded compiler seed with no out-of-band asset.
     assert_equal "3", shell_output("#{bin}/vl run -e 'print(1 + 2)'").strip
+    # And the OTHER embedded half: a `std:` import must resolve with no `std/`
+    # anywhere near the binary (D1573). `brew test` runs in a scratch directory,
+    # which is exactly the condition that used to fail.
+    assert_equal "7", shell_output(
+      "#{bin}/vl run -e 'import { stdSmoke } from \"std:seed\"\n\nprint(stdSmoke())'",
+    ).strip
   end
 end

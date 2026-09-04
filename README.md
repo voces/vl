@@ -47,10 +47,42 @@ vl run hello.vl
 usage: vl <build|check|run|fmt> <file.vl> [-o out.wasm] [-O|-O3] [-w|--check] [--compiler vl-compiler.wasm]
 ```
 
-The compiler seed is resolved in order:
-`--compiler <path>`  →  `$VL_COMPILER_WASM`  →  `./build/vl-compiler.wasm`  →  *embedded*.
-An explicit `--compiler`/env is honoured strictly; the embedded copy is the final
-fallback and exists only in a release build (next section).
+**std and the compiler seed both ship INSIDE the binary, and every on-disk copy is a
+DEVELOPMENT override that is explicit and announced.** Resolution, first hit wins:
+
+| | seed | std |
+|---|---|---|
+| explicit | `--compiler <wasm>` | — |
+| explicit, announced | `$VL_COMPILER_WASM` | `$VL_STD` |
+| a development tree | `./build/vl-compiler.wasm` | `<tree>/std` |
+| always present | the embedded seed | the embedded std |
+
+A *development tree* is a checkout holding `compiler/entry.vl` and a real `std/`, found by
+walking the **binary's** ancestors. A **release binary** (`--features embed-seed`, the next
+section) takes neither development rung — it pairs only with the copies inside it, so the
+current directory never decides which compiler it is — and prints one stderr line when
+`$VL_STD` or `$VL_COMPILER_WASM` overrides that. `vl --version` names the seed, the std, the
+digest of each and the rung each came from; `vl std` says which std this run will use.
+
+Both halves of that rule are paid for: a `vl` on `PATH` once paired a master seed with a
+checkout 37 commits behind (D1573), and one binary was two compilers depending on `cd`
+(D1574). See [`docs/internals/cli-design.md`](./docs/internals/cli-design.md#where-a-vl-binary-finds-std-and-its-seed).
+
+#### Pinning `vl` in another project
+
+**Copy one file.** A release `vl` carries its own std and its own compiler seed, so a pinned
+toolchain is the binary and nothing else:
+
+```sh
+mkdir -p .vl && cp "$(command -v vl)" .vl/vl
+.vl/vl --version                 # the commit, the seed bytes, the std digest
+```
+
+`vl std --dump .vl/std` writes the std sources out if you want to read or diff them — they
+are not needed to run anything, and a `std/` sitting beside the binary is ignored (`vl` says
+so once). `vl std --list` and `vl std --hash` say what is inside. Set `$VL_STD` only when you
+are hacking on std itself; `vl` will tell you it is in effect, and `vl --version` prints the
+digest of the std in use beside the one the binary was built with.
 
 A **release binary** bakes the seed in, so it has no `build/vl-compiler.wasm` to keep a
 `.cwasm` sidecar beside. It caches the seed's compiled form under `$VL_CACHE_DIR` →

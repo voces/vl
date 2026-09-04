@@ -542,3 +542,59 @@ jobs:
           fi
           echo "embedded-seed build runs with no on-disk seed (got 42), and caches its compile:"
           ls -la "$VL_CACHE_DIR"
+
+      # THE DISTRIBUTION CONTRACT, ASSERTED FROM A DIRECTORY WITH NO TREE ABOVE IT
+      # (D1573/D1574). `$probe` is under /tmp, so no ancestor holds a `std/` or a
+      # `build/` — a std import that resolves here resolved out of the BINARY, which
+      # is the whole claim. The stale-seed row is the other half: a released `vl`
+      # must not become a different compiler because of what sits in the CWD.
+      - name: Verify a released `vl` carries std and ignores the CWD
+        if: steps.docs_check.outputs.docs_only != 'true'
+        run: |
+          set -e
+          export VL_CACHE_DIR="$(mktemp -d)"
+          vl="$GITHUB_WORKSPACE/scripts/vl-host/target/release/vl"
+          probe="$(mktemp -d)"
+          cat > "$probe/pin.vl" <<'EOF'
+          import { sorted } from "std:array"
+          import { toString } from "std:fmt"
+          import { toJson } from "std:json"
+
+          const xs = sorted([3, 1, 2], (a, b) => a < b)
+          const j = toJson(true)
+          if (j is string) {
+            print(toString(xs[0]) + toString(xs[1]) + toString(xs[2]) + " " + j)
+          }
+          EOF
+          out="$(cd "$probe" && "$vl" run pin.vl)"
+          if [ "$out" != "123 true" ]; then
+            echo "a pinned vl must resolve std: out of itself; expected '123 true', got: $out"
+            exit 1
+          fi
+
+          # `vl std --dump` is the sibling of `vl seed`: the sources a consumer would
+          # have copied by hand, read back OUT of the binary, byte for byte.
+          dump="$(mktemp -d)"
+          "$vl" std --dump "$dump" > /dev/null
+          if ! diff -r "$dump" "$GITHUB_WORKSPACE/std" --exclude='*.ts'; then
+            echo "vl std --dump does not round-trip to the tree's std/ — the binary was"
+            echo "built from a stale scripts/vl-host/src/std_embedded.rs (deno task gen-std)"
+            exit 1
+          fi
+
+          # A stale ./build/vl-compiler.wasm must not decide which compiler this is.
+          stale="$(mktemp -d)"
+          mkdir -p "$stale/build"
+          head -c 64 /dev/urandom > "$stale/build/vl-compiler.wasm"
+          where="$(cd "$stale" && "$vl" seed --path)"
+          if [ "$where" != "embedded" ]; then
+            echo "a released vl took a seed from the current directory: $where"
+            exit 1
+          fi
+          bytes="$(cd "$stale" && "$vl" seed | wc -c)"
+          embedded_bytes="$("$vl" seed | wc -c)"
+          if [ "$bytes" != "$embedded_bytes" ]; then
+            echo "the resolved seed changed with the current directory: $bytes vs $embedded_bytes"
+            exit 1
+          fi
+          echo "a released vl: std out of the binary from $probe, dump round-trips, CWD ignored"

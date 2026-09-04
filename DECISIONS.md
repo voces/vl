@@ -5298,6 +5298,58 @@ whitelist over literals, identifier reads, places and arithmetic; every kind it 
 a call, a lambda, a `MatchExpr`, every statement kind — answers "possibly effectful" and puts
 its literal on the scratch path. A kind nobody has classified is never silently reordered.
 
+## std ships inside the binary; a pin is one file; development overrides are explicit and announced (owner question 2026-09-03) — D1573/D1574, BUILT
+
+The owner asked whether `vl` should distribute with std baked in. It should, and the reason is
+that both halves of the question had already failed in the field on the same day, silently, at
+the first external consumer:
+
+* **D1573 (glean VL-022)** — `~/vl/dist/vl` embeds a seed built from master, and the host
+  resolved `std:` by walking the EXE's ancestors, so it read `~/vl/std` from a checkout **37+
+  commits behind**. std is version-locked to the compiler; nothing compared them and nothing
+  warned. (VL-007 is the same defect from the other side: a `dist/vl` copied anywhere else
+  resolved no std at all.)
+* **D1574 (glean VL-006)** — `dist/vl seed | wc -c` read **1,832,652** inside `~/vl` (a
+  CWD-relative `./build/vl-compiler.wasm`) and **2,046,575** from `~/glean` (the embedded
+  seed). One binary, two compilers, chosen by `cd`.
+
+**The ruling.** std is generated into the binary; a distribution build pairs only with the
+copies it carries; the on-disk copies are DEVELOPMENT overrides, which are explicit and
+announced; and the release binary never consults the current directory for a seed. Resolution
+is `$VL_STD` → a development tree's `std/` → embedded, and `--compiler` → `$VL_COMPILER_WASM`
+→ a development tree's `build/vl-compiler.wasm` → embedded, with a **DISTRIBUTION build
+(`--features embed-seed`) taking neither development rung**. The full table is
+`docs/internals/cli-design.md` §"Where a `vl` binary finds std and its seed".
+
+**Why the `embed-seed` feature is also the distribution marker, rather than a second flag.**
+The feature bakes the ~2 MB seed in, and a binary carrying its own compiler IS the shipped
+artifact rather than a checkout's build output — so one condition decides both "carry your
+own" and "do not read the filesystem", and there is no `embed-std`-without-`embed-seed`
+configuration to reason about. std itself is embedded UNCONDITIONALLY (109 KB against a
+~27 MB binary): the development binary then has the same `vl std` surface, the same last
+resort, and the round-trip test runs in every gate rather than only in `ci-embed-seed`.
+
+**Why a checked-in generated Rust source, not a build script.** `build.rs` reading `../../std`
+would be fresh by construction — and would make every std edit need a cargo rebuild before the
+gates could grade it, which is a toolchain tax on the people who edit std most. So
+`scripts/gen-std.ts` writes `scripts/vl-host/src/std_embedded.rs` in the same invocation, from
+the same walk, that writes the editor's `std/embedded.ts`: ONE generator, so the CLI and the
+editor cannot disagree about std, and `tests/std_embedded_test.ts` fails on either being stale
+with no binary and no seed in the loop. A development build reads the tree anyway, so a stale
+BINARY is harmless there; `ci-embed-seed` builds fresh and diffs `vl std --dump` against
+`std/`, which is where the end-to-end byte-identity is actually gated.
+
+**Why the announcement is distribution-only.** On a released `vl` an on-disk std is the
+exception and the silence was the defect, so `$VL_STD` and `$VL_COMPILER_WASM` each print one
+stderr line. A development build IS the exception — `$VL_STD` is how `scripts/gate.sh` pins
+the tree under test on every invocation — so it announces nothing and answers the question in
+`vl --version` instead, which now names the seed, the std, the digest of each, the rung each
+came from, and the commit the binary was built from.
+
+**What a consumer does now.** Copy one file. `vl std --dump <dir>` writes the sources out if
+they are wanted for reading or editing, `vl std --hash`/`--list` say what is in there, and
+`$VL_STD` is for hacking on std. A `std/` left beside an old two-file pin is ignored, and is
+told once that it is being ignored — going silently inert is the same failure mode reversed.
 ## A VALUE may take a builtin type name; the TYPE keeps it (D1571, 2026-09-03)
 
 **Ruling, read off the tree rather than invented.** VL keeps the value and type namespaces
