@@ -1,63 +1,23 @@
-// `std:base64` — RFC 4648 §4 base64, the standard alphabet with padding, in
-// pure VL. Bytes in, text out, and back; `docs/serde-design.md` names it as
-// the answer for `u8[]` in every text format VL reads or writes.
+// `std:base64` — RFC 4648 §4 base64: the standard alphabet, always padded.
 //
-// THE DIRECTIONS READ BACKWARDS FROM `std:utf8` AND THAT IS DELIBERATE:
-// `encodeUtf8` goes text → bytes, `encodeBase64` goes bytes → text; in each
-// domain "encode" is the direction the format's own name describes, and the
-// receiver type disambiguates. ENCODE IS TOTAL, the ruling `std:utf8` makes
-// for the same reason: every `u8[]` has a base64 encoding, so a fallible
-// signature would infect callers for input that cannot exist; `[]` → `""`.
+//     import { encodeBase64, decodeBase64, Base64Error } from "std:base64"
 //
-// DECODE IS STRICT. Each refusal is one `kind` on `Base64Error`:
-//   • `"character"` — any byte outside `A-Za-z0-9+/=`, SPACES AND NEWLINES
-//     INCLUDED: base64's familiar wrapping is MIME's (RFC 2045 §6.8), a
-//     different format, and stripping it is the caller's decision.
-//   • `"length"` — not a multiple of four; padding is REQUIRED, so `"QQ"` is
-//     refused where `"QQ=="` decodes. THIS GATE RUNS FIRST, so wrapped MIME
-//     reports `"length"` at the input's size, not `"character"` at the break.
-//   • `"padding"` — `=` anywhere but the last one or two positions.
-//   • `"bits"` — non-canonical trailing bits: the bits of the final character
-//     past the end of the last byte must be zero (RFC 4648 §3.5 permits the
-//     refusal). It is what makes decode-then-encode an exact identity on every
-//     accepted string, which a lenient decoder cannot offer.
-//
-// WHAT IS NOT HERE: the URL-safe alphabet (RFC 4648 §5) and unpadded decoding.
-// When one arrives it gets its OWN NAME (`encodeBase64Url`), never a boolean
-// parameter — `f(bytes, true)` is the shape `std-api-review.md` §2 names.
-//
-// THE FAILURE CHANNEL IS `u8[] | Base64Error`, not `u8[] | null`: a blob is
-// machine-produced, so an offset locates a truncated transfer or a stray
-// newline, and the four kinds call for different fixes — the "failure with
-// information the caller needs" case `error-handling-design.md` spends `T | E`
-// on, where `parseF64` answers `f64 | null` because a float literal has one
-// way to be wrong. `kind` is a LITERAL UNION, not an i32 code, so `match` sees
-// the arms (`std-api-review.md` §3), and it keeps the type DISTINCT: VL
-// aliases are structural, so bare `{ at: i32, msg: string }` hits `ParseError`.
-//
-// `u8[]` IS OUTSIDE THE GENERIC SURFACE — not a `T[]`, so no `map`/`indexOf`/
-// `sorted`; the loops below are written out for that. `encodeBase64` fills ONE
-// code-point buffer and calls `fromCodePoints` once — `out = out + c` is O(n²).
+// Encoding is total; decoding is strict. Spaces, line wrapping, missing padding
+// and non-canonical trailing bits are each refused, which is what makes
+// decode-then-encode an exact identity. The URL-safe alphabet is not here; when
+// it arrives it gets its own name rather than a boolean parameter.
 
-// Why a decode stopped, where, and in which of the four ways. `at` is a BYTE
-// offset into the string that was handed in — the same coordinate system
-// `slice` and `indexOf` use — and points at the offending character, except
-// for `"length"`, where the fault is the input's size and `at` is that size.
-//
-// `kind` DETERMINES THE BRANCH, `msg` DOES NOT: several `msg` strings share one
-// `kind` (three of them are `"padding"`, which distinguishes `=` in the wrong
-// position from `=` before the last group from `=` that does not run to the
-// end). Branch on `kind`; treat `msg` as prose for a human, the same split
-// `Utf8Error` and `IoError` make.
+// Why a decode stopped. Branch on `kind`: `"character"` for a byte outside the
+// alphabet, `"length"` for an input that is not a multiple of four,
+// `"padding"` for a misplaced `=`, `"bits"` for non-canonical trailing bits.
+// `at` locates it — the input's size for `"length"` — and `msg` is prose.
 export type Base64Error = {
   at: i32,
   kind: "character" | "length" | "padding" | "bits",
   msg: string,
 }
 
-// The RFC 4648 §4 alphabet, index → character. A ladder rather than a string
-// index because it inverts exactly, character → index, in `b64Val` below, and
-// two tables that must agree is one more thing to get wrong.
+// A 6-bit value as its character, over the RFC 4648 §4 alphabet.
 function b64Char(v: i32): i32 {
   if v < 26 { return 65 + v }
   if v < 52 { return 97 + (v - 26) }
@@ -66,10 +26,8 @@ function b64Char(v: i32): i32 {
   47
 }
 
-// The alphabet's inverse: a character's 6-bit value, or -1 for anything that
-// is not in it. `=` is NOT accepted here — padding is positional and the
-// decoder handles it, so letting it through as a value would make `"A=AA"`
-// decode.
+// The inverse: a character's 6-bit value, or -1. `=` is not accepted here,
+// because padding is positional and the decoder handles it.
 function b64Val(c: i32): i32 {
   if c >= 65 && c <= 90 { return c - 65 }
   if c >= 97 && c <= 122 { return c - 97 + 26 }
@@ -87,8 +45,8 @@ function b64Err(
   { at: at, kind: kind, msg: msg }
 }
 
-// `self` as base64 text: RFC 4648 §4, standard alphabet, always padded to a
-// multiple of four characters. Total — every byte sequence has an encoding.
+// `self` as padded base64 text. Total — every byte sequence has an encoding,
+// and `[]` encodes to `""`.
 export function encodeBase64(self: u8[]): string {
   const out: i32[] = []
   const n = self.length
@@ -122,13 +80,10 @@ export function encodeBase64(self: u8[]): string {
   fromCodePoints(out)
 }
 
-// The bytes `self` encodes, or the reason it is not canonical padded base64 —
-// see the module header for the exact refusals. `""` decodes to the empty byte
-// list; it is not an error.
-//
-// Indexing a `string` yields a BYTE, so a multi-byte character arrives as
-// bytes >= 0x80, none of which is in the alphabet: non-ASCII input is refused
-// by the same test that refuses a space, with no separate check.
+// The bytes `self` encodes, or why it is not canonical padded base64 — see
+// `Base64Error` for the four refusals. `""` decodes to an empty list and is
+// not an error. Non-ASCII input is refused by the same test that refuses a
+// space, because indexing a string yields a byte.
 export function decodeBase64(self: string): u8[] | Base64Error {
   const out: u8[] = []
   const n = self.length
@@ -143,8 +98,8 @@ export function decodeBase64(self: string): u8[] | Base64Error {
     const t1 = self[i + 1]
     const t2 = self[i + 2]
     const t3 = self[i + 3]
-    // `=` in either of the first two positions of a group is always wrong: a
-    // group encodes at least one byte, which needs two characters.
+    // A group encodes at least one byte, which needs two characters, so `=` in
+    // either of the first two positions is always wrong.
     if t0 == 61 { return b64Err(i, "padding", "misplaced '=' padding") }
     if t1 == 61 { return b64Err(i + 1, "padding", "misplaced '=' padding") }
     const c0 = b64Val(t0)
@@ -154,8 +109,7 @@ export function decodeBase64(self: string): u8[] | Base64Error {
     if t2 == 61 {
       if !last { return b64Err(i + 2, "padding", "'=' before the last group") }
       if t3 != 61 { return b64Err(i + 3, "padding", "'=' must pad to the end") }
-      // The low four bits of the second character lie past the one byte this
-      // group carries; a canonical encoder leaves them zero.
+      // A canonical encoder leaves the bits past the encoded byte zero.
       if (c1 & 15) != 0 {
         return b64Err(i + 1, "bits", "non-zero bits past the encoded byte")
       }
