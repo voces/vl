@@ -67,6 +67,31 @@ Deno.test({ name: "wasm-checker: a type error carries a message and a non-empty 
   }
 });
 
+// D1590 (glean VL-039) — THE SUGGESTION REACHES THE EDITOR, because it rides the message
+// rather than a second channel. Same `unknown type` diagnostic the CLI prints, arriving
+// through the checker the LSP drives, so the assertion is on the exact text; the negative
+// control beside it is what keeps a wrong guess from being invisible here.
+Deno.test({ name: "wasm-checker: `unknown type` carries the `did you mean` suffix", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const msgs = async (src: string) =>
+    (await checker.check(src, "/tmp/x.vl", noSiblings))
+      .filter((d) => d.severity === "error")
+      .map((d) => d.message);
+
+  // glean's witness, verbatim.
+  const hit = await msgs("const seen: {[i32]: bool} = Map()\nprint(0)\n");
+  const wantHit = ["unknown type 'bool' within '{[i32]:bool}'; did you mean 'boolean'?"];
+  if (JSON.stringify(hit) !== JSON.stringify(wantHit)) {
+    throw new Error(`want ${JSON.stringify(wantHit)}, got ${JSON.stringify(hit)}`);
+  }
+
+  // NEGATIVE CONTROL: nothing near `Zork`, so nothing is offered.
+  const miss = await msgs("type Circle = { r: f64 }\n\nconst z: Zork = 1\nprint(z)\n");
+  if (JSON.stringify(miss) !== JSON.stringify(["unknown type 'Zork'"])) {
+    throw new Error(`want ["unknown type 'Zork'"], got ${JSON.stringify(miss)}`);
+  }
+});
+
 Deno.test({ name: "wasm-checker: an emitter-capability rejection surfaces its stable code", ignore }, async () => {
   const checker = loadWasmChecker(SEED, log)!;
   // Type-valid, but codegen cannot lower an INFERRED nullable i32-KEYED MAP return — raised
