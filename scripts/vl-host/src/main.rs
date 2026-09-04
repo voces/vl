@@ -959,6 +959,28 @@ fn run_collector() -> Result<Collector> {
     }
 }
 
+/// The driver's module-table keys - the paths the host itself committed, in table
+/// order. Read ONCE per consumer: strings cross the no-import boundary one byte at a
+/// time. `None` for a compiler module without the table (a pre-module-mode seed).
+///
+/// TWO consumers, which is why it is not inlined in either: `DiagPaths` labels a
+/// diagnostic with its owning file, and `EmitSpans` (D1578) labels the function whose
+/// body the engine refused. Both need the same index -> path map.
+fn read_module_keys(store: &mut Store<()>, inst: &Instance) -> Option<Vec<String>> {
+    let count = inst.get_typed_func::<(), i32>(&mut *store, "modKeyCount").ok()?;
+    let key_len = inst.get_typed_func::<i32, i32>(&mut *store, "modKeyAtLen").ok()?;
+    let key_at = inst
+        .get_typed_func::<(i32, i32), i32>(&mut *store, "modKeyAtCharAt")
+        .ok()?;
+    let n = count.call(&mut *store, ()).ok()?;
+    let mut keys = Vec::with_capacity(n.max(0) as usize);
+    for m in 0..n {
+        let len = key_len.call(&mut *store, m).ok()?;
+        keys.push(read_guest_str(len, |j| Ok(key_at.call(&mut *store, (m, j))?)).ok()?);
+    }
+    Some(keys)
+}
+
 /// Which FILE each diagnostic belongs to, for a multi-module compile. A
 /// positioned diagnostic carries a line and column that are the OWNING module's,
 /// so labelling every one with the entry path prints a real location against the
@@ -983,23 +1005,7 @@ impl DiagPaths {
         let module_of = inst
             .get_typed_func::<i32, i32>(&mut *store, "diagModule")
             .ok()?;
-        let count = inst
-            .get_typed_func::<(), i32>(&mut *store, "modKeyCount")
-            .ok()?;
-        let key_len = inst
-            .get_typed_func::<i32, i32>(&mut *store, "modKeyAtLen")
-            .ok()?;
-        let key_at = inst
-            .get_typed_func::<(i32, i32), i32>(&mut *store, "modKeyAtCharAt")
-            .ok()?;
-        let n = count.call(&mut *store, ()).ok()?;
-        let mut keys = Vec::with_capacity(n.max(0) as usize);
-        for m in 0..n {
-            let len = key_len.call(&mut *store, m).ok()?;
-            let key = read_guest_str(len, |j| Ok(key_at.call(&mut *store, (m, j))?)).ok()?;
-            keys.push(key);
-        }
-        Some(DiagPaths { module_of, keys })
+        Some(DiagPaths { module_of, keys: read_module_keys(&mut *store, inst)? })
     }
 
     /// The owning module's key for diagnostic `i`, or `None` when the anchor
@@ -1008,6 +1014,112 @@ impl DiagPaths {
         let m = self.module_of.call(&mut *store, i).ok()?;
         self.keys.get(usize::try_from(m).ok()?).map(String::as_str)
     }
+}
+
+/// D1578 - WHERE the engine's byte offset came from, in the author's own file.
+///
+/// A module the engine refuses reports an offset into bytes nobody ever sees, and the
+/// first external consumer spent an hour bisecting a 480-line file for one. The emitter
+/// banks each user function body's module byte range (`emitFnSpan*`, compiler/driver.vl);
+/// this asks it which body owns the offset and reads that function's name and the
+/// `file:line:col` of its declaration.
+///
+/// Probed, never required: a compiler module without the exports answers `None` and the
+/// caller prints the engine's own text, exactly as it did before.
+struct EmitSpans {
+    at: TypedFunc<i32, i32>,
+    line: TypedFunc<i32, i32>,
+    col: TypedFunc<i32, i32>,
+    module_of: TypedFunc<i32, i32>,
+    name_len: TypedFunc<i32, i32>,
+    name_at: TypedFunc<(i32, i32), i32>,
+    keys: Vec<String>,
+}
+
+/// One located function: its name, and the source position of its declaration when the
+/// emitter had one to give (a synthesized body has none, and says so by omitting it).
+struct SpanWhere {
+    name: String,
+    at: Option<(String, i32, i32)>,
+}
+
+impl EmitSpans {
+    fn probe(store: &mut Store<()>, inst: &Instance) -> Option<Self> {
+        Some(EmitSpans {
+            at: inst.get_typed_func::<i32, i32>(&mut *store, "emitFnSpanAt").ok()?,
+            line: inst.get_typed_func::<i32, i32>(&mut *store, "emitFnSpanLine").ok()?,
+            col: inst.get_typed_func::<i32, i32>(&mut *store, "emitFnSpanCol").ok()?,
+            module_of: inst
+                .get_typed_func::<i32, i32>(&mut *store, "emitFnSpanModule")
+                .ok()?,
+            name_len: inst
+                .get_typed_func::<i32, i32>(&mut *store, "emitFnSpanNameLen")
+                .ok()?,
+            name_at: inst
+                .get_typed_func::<(i32, i32), i32>(&mut *store, "emitFnSpanNameAt")
+                .ok()?,
+            keys: read_module_keys(&mut *store, inst).unwrap_or_default(),
+        })
+    }
+
+    /// The function owning module byte `off`, or `None` when the offset lies in no
+    /// recorded body - a synthetic start function, a shared runtime helper, an export
+    /// wrapper, or a failure outside the code section.
+    fn locate(&self, store: &mut Store<()>, off: i32, entry: &str) -> Option<SpanWhere> {
+        let i = self.at.call(&mut *store, off).ok()?;
+        if i < 0 {
+            return None;
+        }
+        let len = self.name_len.call(&mut *store, i).ok()?;
+        let name = read_guest_str(len, |j| Ok(self.name_at.call(&mut *store, (i, j))?)).ok()?;
+        let line = self.line.call(&mut *store, i).ok()?;
+        let at = if line > 0 {
+            let col = self.col.call(&mut *store, i).ok()?;
+            let m = self.module_of.call(&mut *store, i).ok()?;
+            let file = usize::try_from(m)
+                .ok()
+                .and_then(|m| self.keys.get(m))
+                .map(String::as_str)
+                .unwrap_or(entry);
+            Some((file.to_string(), line, col))
+        } else {
+            None
+        };
+        Some(SpanWhere { name, at })
+    }
+}
+
+/// The BYTE OFFSET an engine validation message names, or `None` when it names none.
+///
+/// wasmtime spells it two ways and both arrive here: `(at offset 0x11b)` from
+/// `Module::validate` and `at offset 188` from `Module::new`'s translation error. The
+/// LAST occurrence wins - a `Caused by:` chain repeats the inner message under the outer.
+///
+/// THE COMPILER CARRIES THE SAME PARSER IN VL (`engineFailOffset`, compiler/driver.vl):
+/// `vl check --codegen` renders its verdict inside the CLI pump, which this code never
+/// enters, so each channel reads the engine's own spelling for itself. They move together.
+fn engine_fail_offset(msg: &str) -> Option<i32> {
+    let mut found = None;
+    let mut rest = msg;
+    while let Some(k) = rest.find("at offset ") {
+        let tail = &rest[k + "at offset ".len()..];
+        let (digits, radix) = match tail.strip_prefix("0x") {
+            Some(hex) => (hex, 16),
+            None => (tail, 10),
+        };
+        let end = digits
+            .find(|c: char| !c.is_digit(radix))
+            .unwrap_or(digits.len());
+        if end > 0 {
+            if let Ok(v) = i64::from_str_radix(&digits[..end], radix) {
+                if v >= 0 && v <= i32::MAX as i64 {
+                    found = Some(v as i32);
+                }
+            }
+        }
+        rest = &rest[k + "at offset ".len()..];
+    }
+    found
 }
 
 /// Read one guest string through the per-element `<name>Len(i)` / `<name>At(i, j)` ABI.
@@ -2089,6 +2201,99 @@ fn compile_vl(
     }
     let (mut store, inst) = phase!("load_compiler", load_compiler(engine, compiler))?;
     compile_vl_instance(&mut store, &inst, source, source_path, entry, emit_names)
+}
+
+/// Like `compile_vl`, but hands the live compiler instance BACK so a failure that
+/// happens after the compile - the engine refusing the emitted module - can still ask it
+/// where the offending bytes came from (`locate_invalid_module`, D1578).
+///
+/// ZERO COST ON THE HAPPY PATH, which is why it exists rather than a pre-validate:
+/// nothing is read out of the guest unless the module is already known not to load.
+/// `None` for the `$VL_PROFILE_GUEST` rung, whose store belongs to the profiler.
+fn compile_vl_located(
+    engine: &Engine,
+    compiler: &CompilerSource,
+    source: &str,
+    source_path: &str,
+    entry: &str,
+    emit_names: bool,
+) -> Result<(Vec<u8>, Option<(Store<()>, Instance)>)> {
+    if std::env::var_os("VL_PROFILE_GUEST").is_some() {
+        let bytes = compile_vl(engine, compiler, source, source_path, entry, emit_names)?;
+        return Ok((bytes, None));
+    }
+    let (mut store, inst) = phase!("load_compiler", load_compiler(engine, compiler))?;
+    let bytes = compile_vl_instance(&mut store, &inst, source, source_path, entry, emit_names)?;
+    Ok((bytes, Some((store, inst))))
+}
+
+/// Is `text` the engine refusing a MODULE (rather than a program failing at run time)?
+/// Keyed on the two host paths that produce it - `Module::new`'s translation error and
+/// `validate_written_module`'s context - never on the validator's own sentence, which
+/// says nothing about which module it was reading.
+fn is_invalid_module(text: &str) -> bool {
+    text.contains("Invalid input WebAssembly code")
+        || text.contains("is not a valid WebAssembly module")
+}
+
+/// The validator's own sentence, from the `Caused by:` chain: the LAST line naming an
+/// offset, with wasmtime's `N: ` cause numbering stripped.
+fn validator_sentence(text: &str) -> String {
+    for line in text.lines().rev() {
+        let l = line.trim();
+        if !l.contains("at offset") {
+            continue;
+        }
+        return match l.find(": ") {
+            Some(i) if !l[..i].is_empty() && l[..i].chars().all(|c| c.is_ascii_digit()) => {
+                l[i + 2..].to_string()
+            }
+            _ => l.to_string(),
+        };
+    }
+    text.lines().next().unwrap_or(text).trim().to_string()
+}
+
+/// D1578 - turn "the engine refused the module at offset 188" into a diagnostic that
+/// names the FUNCTION and the line of its declaration, and mark the failure a vl BUG so
+/// it exits 70. Any other error passes through untouched.
+///
+/// `session` is the compiler instance the module came out of; without it (an older seed,
+/// or the profiler rung) the sentence keeps the engine's text and loses only the
+/// position - which is what every such failure printed before this row.
+fn locate_invalid_module(
+    err: Error,
+    session: Option<(Store<()>, Instance)>,
+    entry: &str,
+) -> Error {
+    let text = format!("{err:?}");
+    if !is_invalid_module(&text) {
+        return err;
+    }
+    INVALID_MODULE.store(true, Ordering::Relaxed);
+    let sentence = validator_sentence(&text);
+    let located = session.and_then(|(mut store, inst)| {
+        let spans = EmitSpans::probe(&mut store, &inst)?;
+        let off = engine_fail_offset(&text)?;
+        spans.locate(&mut store, off, entry)
+    });
+    let headline = match &located {
+        Some(w) => match &w.at {
+            Some((file, line, col)) => format!(
+                "{file}:{line}:{col}: the emitted module failed to validate inside `{}`: {sentence}",
+                w.name
+            ),
+            None => format!(
+                "the emitted module failed to validate inside `{}`: {sentence}",
+                w.name
+            ),
+        },
+        None => format!("the emitted module failed to validate: {sentence}"),
+    };
+    Error::msg(format!(
+        "invalid module\n{headline}\nthis is a bug in vl, not in your program; \
+         please report it with this file"
+    ))
 }
 
 /// The `$VL_PROFILE_GUEST` path: like `compile_vl`, but on its own engine with
@@ -3399,8 +3604,14 @@ fn compile_and_run(
     palette: Palette,
 ) -> Result<()> {
     let compile_engine = gc_engine(Collector::Null)?;
-    let bytes = compile_vl(&compile_engine, compiler, source, source_path, "compileSrc", true)?;
-    run_program(run_engine, &bytes, palette)
+    // `_located`, so a module the engine refuses can still be traced back to the
+    // function that emitted it (D1578). The compile itself is unchanged.
+    let (bytes, session) =
+        compile_vl_located(&compile_engine, compiler, source, source_path, "compileSrc", true)?;
+    match run_program(run_engine, &bytes, palette) {
+        Err(e) => Err(locate_invalid_module(e, session, source_path)),
+        ok => ok,
+    }
 }
 
 /// The value of a value-taking `vl run` flag, or a usage error when the flag ended the
@@ -4574,6 +4785,12 @@ fn cli_pump(args: &[String]) -> Result<()> {
 /// later error to inherit.
 static FAULT_IN_COMPILER: AtomicBool = AtomicBool::new(false);
 
+/// A module the emitter produced that the ENGINE refuses. `vl check` returned 0 to reach
+/// the emitter at all, so an invalid module is the compiler's fault by construction: it
+/// exits 70 like a compiler trap (#2483), so a caller can tell a vl BUG from a bad
+/// program without parsing stderr. Set by `locate_invalid_module` (D1578).
+static INVALID_MODULE: AtomicBool = AtomicBool::new(false);
+
 /// The source file the host last handed the compiler, for the banner to name.
 static COMPILING: Mutex<Option<String>> = Mutex::new(None);
 
@@ -4632,6 +4849,10 @@ fn attribute<T>(r: Result<T>, compiler: bool) -> Result<T> {
 fn report(err: Error) -> ! {
     let trap = err.chain().find_map(|c| c.downcast_ref::<Trap>()).copied();
     let compiler_bug = trap.is_some() && FAULT_IN_COMPILER.load(Ordering::Relaxed);
+    // An INVALID MODULE is the other compiler bug that exits 70, and it carries its own
+    // banner inside the message (`locate_invalid_module`, D1578) — it never traps, so it
+    // cannot reach the trap banner above and must not borrow its wording.
+    let invalid_module = INVALID_MODULE.load(Ordering::Relaxed);
     if compiler_bug {
         let what = COMPILING.lock().ok().and_then(|p| p.clone());
         eprintln!(
@@ -4649,7 +4870,11 @@ fn report(err: Error) -> ! {
     if let Some(note) = trap.and_then(trap_explanation) {
         eprintln!("\nnote: {note}");
     }
-    std::process::exit(if compiler_bug { EXIT_COMPILER_BUG } else { 1 });
+    std::process::exit(if compiler_bug || invalid_module {
+        EXIT_COMPILER_BUG
+    } else {
+        1
+    });
 }
 
 fn main() {
@@ -4769,7 +4994,9 @@ fn build_cmd(args: &[String]) -> Result<()> {
     });
     // `--names` embeds a wasm "name" custom section (legible trap backtraces).
     let names = args.iter().any(|a| a == "--names");
-    let bytes = compile_vl(
+    // `_located`, so a written module the engine refuses names the function it came
+    // from (D1578). The instance is read only on that failure path.
+    let (bytes, session) = compile_vl_located(
         &compile_engine,
         &compiler,
         &read_source()?,
@@ -4802,7 +5029,17 @@ fn build_cmd(args: &[String]) -> Result<()> {
     // `validate_written_module`. Runs LAST so `--wat` still dumps a broken
     // module (that dump is how an emit bug gets diagnosed).
     if !args.iter().any(|a| a == "--no-validate") {
-        validate_written_module(&compile_engine, &out)?;
+        if let Err(e) = validate_written_module(&compile_engine, &out) {
+            // An OPTIMIZED artifact is binaryen's bytes, not the emitter's, so the
+            // emitter's byte ranges do not describe it — keep the engine's own text
+            // rather than naming a function off an offset that means something else.
+            let optimized = args.iter().any(|a| a == "-O" || a == "-O3");
+            return Err(locate_invalid_module(
+                e,
+                if optimized { None } else { session },
+                input,
+            ));
+        }
     }
     Ok(())
 }

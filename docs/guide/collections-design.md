@@ -19,6 +19,48 @@
 > surface type. The forcing annotations and their spellings (§VL.7, §OQ.7) are an
 > explicitly uncommitted future surface.
 
+## What you write TODAY (the shipped spellings)
+
+Everything below this section is design vocabulary and a decision record; this block is
+the shipped surface, and it is here because the rest of the document did not state it in
+one place. A consumer building a real program (glean, VL-033) read `Map()` working as a
+value, wrote `type S = { index: Map }`, was told `unknown type 'Map'`, and concluded the
+map type was unspellable. It is spellable — with the index signature, never with the
+constructor's name:
+
+| you want | the TYPE | the VALUE |
+| --- | --- | --- |
+| a sequence | `T[]` — `string[]`, `i32[][]` | `[...]` — `["a", "b"]`, `[]` |
+| a byte sequence | `u8[]` | `[...]` of `i32`s, or `std:fs`'s `readFile` |
+| a map | `{[K]: V}` — `{[string]: i32}` | `Map()` |
+| a set | `{[K]: boolean}` — `{[string]: boolean}` | `Set()` |
+
+`Map` and `Set` are CONSTRUCTOR names, not type names, and `Map<string, i32>` is not a
+spelling either (call-site type arguments do not exist; that is A15, unbuilt). The
+checker says so at every annotation position since D1582. A map is an ordinary field
+type, so the struct VL-033 wanted is:
+
+```vl
+type Interner = { names: string[], index: {[string]: i32} }
+const it: Interner = { names: [], index: Map() }
+it.index.set("main", 0)
+print(it.index["main"] ?? -1)
+```
+
+Keys must be `string` or `i32` (anything else is a named refusal). An EMPTY collection
+still needs its element/value type pinned by an annotation or by a use — `const m = Map()`
+alone is `cannot infer a type for 'm'`, exactly as `const xs = []` is.
+
+**`u8` is an ELEMENT type only, and a `u8[]` store TRUNCATES.** `u8[]` is one byte per
+element (a packed WasmGC `(array (mut i8))`); every value crossing its boundary is an
+ordinary `i32`, so `b[i]` reads back 0..255 (zero-extended) and `b[i] = v` / `b.push(v)`
+keep the LOW BYTE of `v`. `bytes.push(300)` therefore stores 44, and `bytes.push(-1)`
+stores 255. There is no `u8` VALUE — no local, parameter, return, field or map value may
+hold one, and `x as u8` is not a cast to write (D1583): push the `i32` directly, or
+`x & 0xff` to make the truncation explicit. An out-of-range non-negative LITERAL is the
+one case the compiler rejects instead of truncating, because a hand-written `300`
+silently becoming `44` is a typo it can see.
+
 ## Summary / recommendation
 
 **VL has one user-facing collection, spelled `T[]`** — a growable, ordered,

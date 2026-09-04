@@ -133,6 +133,10 @@ import {
   emitErr,
   emitErrAt,
   emitFailed,
+  emitFnSpanEnd,
+  emitFnSpanNode,
+  emitFnSpanPos,
+  emitFnSpanStart,
   emitLetCursor,
   emitRootIx,
   fRetRArrElem,
@@ -4177,6 +4181,13 @@ export function emitProgram(rootIx: i32) {
   emitCurFnIx = -1
   emitCurFnPos = -1
   emitCurStmtIx = -1
+  // The VALIDATE diagnostic's function spans (D1578) — ARENA indices and offsets into
+  // THIS program's module, so a row surviving onto the next program on a shared instance
+  // would name another program's node at another module's offset.
+  emitFnSpanNode = []
+  emitFnSpanPos = []
+  emitFnSpanStart = []
+  emitFnSpanEnd = []
   narrowNames = []
   narrowVariants = []
   narrowTys = []
@@ -5973,7 +5984,16 @@ function emitCodeSection(n: i32, hasStart: i32, memFn: i32, nHelpers: i32) {
   wTarget(codePrev)
   let ci = 0
   while ci < n {
+    // Bank the body's byte range for the VALIDATE diagnostic (D1578). Recorded HERE, at
+    // the one loop that already pairs a `fnStmts` position with the body it writes, so a
+    // span cannot name a different function than the code it brackets. Payload-relative
+    // until `wSection` below places the payload in the module.
+    const bodyAt = codePayload.length
     if emitFuncCode(codePayload, fnStmts[ci], ci) < 0 { return -1 }
+    emitFnSpanNode.push(fnStmts[ci])
+    emitFnSpanPos.push(ci)
+    emitFnSpanStart.push(bodyAt)
+    emitFnSpanEnd.push(codePayload.length)
     ci = ci + 1
   }
   if hasStart == 1 {
@@ -6007,6 +6027,18 @@ function emitCodeSection(n: i32, hasStart: i32, memFn: i32, nHelpers: i32) {
     wci = wci + 1
   }
   wSection(10, codePayload)
+  // REBASE the payload-relative spans onto the MODULE (D1578). `wSection` has just
+  // appended the payload to the module buffer, so `wLen() - codePayload.length` is where
+  // it starts — and a module offset is exactly the coordinate the engine's validator
+  // reports. Derived from the length rather than from the section header's own width so
+  // the ULEB size prefix cannot be counted wrong.
+  const codeBase = wLen() - codePayload.length
+  let sp = 0
+  while sp < emitFnSpanStart.length {
+    emitFnSpanStart[sp] = emitFnSpanStart[sp] + codeBase
+    emitFnSpanEnd[sp] = emitFnSpanEnd[sp] + codeBase
+    sp = sp + 1
+  }
   0
 }
 

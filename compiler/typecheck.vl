@@ -1473,22 +1473,102 @@ function constrainEmptyD(srcTy: i32, dstTy: i32, depth: i32) {
 // had its chance, so a `.push(1.5)` or an `xs[0] = 1.5` still decides the element instead.
 // D1470.
 function arrDefHoleToI32(ty: i32) {
+  if !arrDefRowIsCall(ty) { return false }
+  const t = T.tys[ty]
+  if t is TyArray {
+    if t.aElem < 0 {
+      arrDefPinHoleElem(ty)
+      return true
+    }
+  }
+  false
+}
+
+// Is `ty` the row an `__array_new_default__` CALL returned? That membership is the whole
+// licence to default an open element to `i32`: it says `array.new_default` already promised
+// every slot its zero, which a bare `[]` never did (D1462 — that hole is genuinely
+// under-determined and gets a diagnostic). D1470.
+function arrDefRowIsCall(ty: i32) {
   if ty < 0 { return false }
   let j = 0
   while j < arrDefCallTy.length {
-    if arrDefCallTy[j] == ty {
-      const t = T.tys[ty]
-      if t is TyArray {
-        if t.aElem < 0 {
-          arrDefPinHoleElem(ty)
-          return true
-        }
-      }
-      return false
-    }
+    if arrDefCallTy[j] == ty { return true }
     j = j + 1
   }
   false
+}
+
+// …or ONE HOP from such a row through a recorded hole link, which is what `let b = a` between
+// two open bindings leaves behind (`noteHoleLink`): `b`'s row is not the call's, and the
+// default it is entitled to arrives through the pair. This is the LICENCE question (may an
+// open row take `array.new_default`'s default?), not the propagation `resolveHoleLinks`
+// performs — a row it cannot reach is exactly a row no pin decided.
+function arrDefRowServed(ty: i32) {
+  if arrDefRowIsCall(ty) { return true }
+  let i = 0
+  while i < holeLinkA.length {
+    if holeLinkA[i] == ty {
+      if arrDefRowIsCall(holeLinkB[i]) { return true }
+    }
+    if holeLinkB[i] == ty {
+      if arrDefRowIsCall(holeLinkA[i]) { return true }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// AN OPERATOR OPERAND IS THE ONE USE THAT CANNOT WAIT FOR THE FLUSH — so it PEEKS THE DEFAULT
+// RATHER THAN TAKING IT. Every other position tolerates the in-band `-1` an unpinned element
+// reads back as (`print(a[0])` runs; the emitter reads the row after `flushUninferred` pinned
+// it), but the operator arms index `T.tys` with the operand type and `T.tys[-1]` traps the
+// COMPILER (D1566). A PIN here would answer the arms and cost the STORE its turn: `print(a[0] +
+// 1)` then `a[0] = 1.5` runs, and pinning `i32` at the read makes it `cannot assign f64 to i32`.
+// Peeking answers the arms and leaves the ROW open, so D1470's rule — every pin gets its chance,
+// then `i32` — still decides the element, and no delivery position can lose an inference.
+function arrDefOperandElemPeek(exprIx: i32) {
+  if exprIx < 0 { return -1 }
+  let cur = exprIx
+  let hops = 0
+  while hops < 4 {
+    const p = P.nodes[cur]
+    if p is Paren {
+      cur = p.parInner
+      hops = hops + 1
+    } else {
+      hops = 4
+    }
+  }
+  const e = P.nodes[cur]
+  if e is Index {
+    const at = nodeTyIxOf(e.idxArr)
+    if at < 0 { return -1 }
+    const t = T.tys[at]
+    if t is TyArray {
+      if t.aElem < 0 {
+        if arrDefRowServed(at) {
+          // The element `arrDefPinHoleElem` WOULD write, read without writing THIS row: the
+          // same link fixpoint it runs (`resolveHoleLinks` only propagates an element some pin
+          // already decided, never a default), then `i32` if nothing reached the row.
+          resolveHoleLinks()
+          const t2 = T.tys[at]
+          let el = TY_I32
+          if t2 is TyArray {
+            if t2.aElem >= 0 { el = t2.aElem }
+          }
+          // THE READ'S OWN RECORDED TYPE, NOT THE ROW'S. `checkNode` banked the `-1` this read
+          // answered a moment ago and the emitter reads THAT, so leaving it stale made
+          // `print(a[0] ?? 1)` refuse at emit while its `let a: i32[]` face ran. The ROW stays
+          // open, which is why a later `a[0] = 1.5` still re-decides it.
+          if !inferQuiet {
+            if cur < nodeTyIx.length { nodeTyIx[cur] = el }
+          }
+          return el
+        }
+      }
+    }
+  }
+  -1
 }
 
 // THE ONE PLACE AN UNPINNED INTRINSIC HOLE ACQUIRES ITS ELEMENT: whatever the LINK graph can
@@ -2319,6 +2399,9 @@ const IR_RUNG_LITUNION_ALIAS = 27
 const IR_REC_CLASSIFIABLE = 40 // `isClassifiableRetName` — NOT "scalar": it admits `i32[]`/`string[]` too
 const IR_REC_OBJ_SHAPE = 41 // `isObjShapeName`
 const IR_REC_SCALAR_LIST = 42 // `isScalarListRetName`
+// D1567 — the `null` TYPE, which is not a nullable of anything: a function whose every
+// returned value is a bare `null` types `TyPrim:null`, so no other producer here answers.
+const IR_REC_NULL_ONLY = 43
 // The NAMED-function loop is a SECOND cascade over the same producers, and it must bank the same
 // codes: a rung identifies the PRODUCER, not the cascade it was reached through. Leaving it
 // unbanked made every named row read `IR_RUNG_NONE` — "no producer answered" for rows where one
@@ -8901,7 +8984,10 @@ export function applyGenAlias(head: string, inner: string) {
 // because the two routes must not be able to drift.
 function applyGenAliasArgs(head: string, inner: string, appIx: i32) {
   const gi = gaIndexOf(head)
-  if gi < 0 { return -1 }
+  // D1582 — `Map<string, i32>` reaches the alias-application door, not the leaf
+  // ladder, so the same hint has to be banked here too or the spelling a consumer
+  // is most likely to try is the one that stays unhelpful.
+  if gi < 0 { return builtinCtorTyLeafFail(head) }
   // The declared parameter names, read as a SLICE of the flat column — split
   // once when the alias registered (D-GAPARAM), not re-split here per
   // application. `pcount` is the declared ARITY.
@@ -9192,7 +9278,9 @@ function tsLeafTy(name: string) {
   if pv >= 0 { return pv }
   const tv = tpEnvTyOfName(name)
   if tv >= 0 { return tv }
-  declaredTyOfName(name)
+  const dv = declaredTyOfName(name)
+  if dv >= 0 { return dv }
+  builtinCtorTyLeafFail(name)
 }
 
 // D-MAPKEYDIAG — the spelling node whose KEY the unsupported-map-key diagnostic names, or -1
@@ -9280,6 +9368,32 @@ let annotCollapsed: {[string]: i32} = Map()
 // design: wasm has i8 as a STORAGE type and not as a value type, and VL mirrors that.
 function storageTyLeafFail() {
   unkTyClash = "`u8` is a storage type, not a value type — it may be an array element (`u8[]`), but a local, parameter, return, field, map value or generic argument is a value, and values are `i32`"
+  -1
+}
+
+// D1583 — the same rule at the one position whose remedy is DIFFERENT. In an annotation
+// the answer is "write `i32`"; in `x as u8` there is nothing to write, because the
+// conversion the author is reaching for is what the STORE already does. So the message
+// names the truncation and both spellings of it rather than repeating the rule.
+function u8CastText() {
+  "`u8` is a storage type, not a value type — a `u8[]` stores the low byte of an `i32`; push the `i32` directly (300 stores as 44), or `x & 0xff` to make the truncation explicit"
+}
+
+// D1582 — `Map`/`Set` name a CONSTRUCTOR, never a type: the type each makes is
+// spelled with the index signature. The map type is spellable and nothing said so,
+// so `type S = { index: Map }` answered `unknown type 'Map'` — honest and useless,
+// because the remedy is a spelling the reporter had no way to guess. Banks on the
+// `unkTyClash` wire so all six `unknownTyText` sites report it without gaining an arm.
+// Reached only AFTER the declared-name rung, so a program that declares its own
+// `type Map = …` keeps it (`emit_base.isBuiltinFnName` grants the same freedom to
+// the value name). The wording ends in the EXAMPLE because two call sites append
+// their own clause (`… for field 'index'`, `… in union 'U'`).
+function builtinCtorTyLeafFail(name: string) {
+  if name == "Map" {
+    unkTyClash = "`Map` is not a type name — `Map()` is the constructor and the map TYPE is spelled `{[K]: V}`, e.g. `{[string]: i32}`"
+  } else if name == "Set" {
+    unkTyClash = "`Set` is not a type name — `Set()` is the constructor and the set TYPE is spelled `{[K]: boolean}`, e.g. `{[string]: boolean}`"
+  }
   -1
 }
 
@@ -10116,7 +10230,9 @@ function nameToTyReal(name: string) {
     const ltAt = gaeLtAt(name)
     return applyGenAlias(gaeHeadNameOf(name, ltAt), gaeArgsTextOf(name, ltAt))
   }
-  declaredTyOfName(name)
+  const dvn = declaredTyOfName(name)
+  if dvn >= 0 { return dvn }
+  builtinCtorTyLeafFail(name)
 }
 
 // The collection FLAVOR of a binding initializer: "Set" when the init is a
@@ -26750,8 +26866,27 @@ function desugarMatchAt(ix: i32) {
   0
 }
 
+// D1580 — the return tail is a SPINE, not a subtree. `retTailPos` may follow only
+// the chain of nodes whose OWN value IS the function's return: a block (its last
+// statement), an if-expression (its arms), a `return` (its argument), a paren. Every
+// other parent — an object literal's field value, a list element, a call argument —
+// merely CONTAINS the expression, so its `if` arms are arms of the FIELD's type, not
+// of the function's. Without the clear they were unioned into the inferred return and
+// the error landed on the caller (`field 'i' is not on every member of i32|{i: i32}`),
+// naming a union the author never wrote.
+function tailSpineNode(ix: i32) {
+  if ix < 0 { return false }
+  const nd = P.nodes[ix]
+  nd is Block || nd is IfStmt || nd is RetStmt || nd is Paren
+}
+
 function checkNode(ix: i32) {
+  const savedTail = retTailPos
+  if retTailPos {
+    if !tailSpineNode(ix) { retTailPos = false }
+  }
   const t = checkNodeReal(ix)
+  retTailPos = savedTail
   if !inferQuiet {
     if ix >= 0 {
       if ix < nodeTyIx.length { nodeTyIx[ix] = t }
@@ -29102,7 +29237,20 @@ export function checkProgram(rootIx: i32) {
                 }
               }
             }
-            if isClassifiableRetName(recNm) {
+            if enm == "null" {
+              // D1567 — A RETURN WHOSE ONLY VALUE IS A BARE `null` is the `null` TYPE, not a
+              // nullable of anything, so every producer below declines and the emitter kept
+              // `fRetKind`'s `"i32"` default while the body handed back a ref: the null
+              // reached `emitNullLitNode` with no seed at all, `vl check` rc 0. The rep is
+              // `nullref`, which the emitter reads off this row.
+              //
+              // AHEAD of the erasure rungs below, which would otherwise be asked to erase a
+              // primitive that is already its own base. `null` is deliberately NOT added to
+              // `isClassifiableRetName`: that set is six SCALAR spellings plus two arrays,
+              // every one an i32/ref cell the emitter's cascade classifies by name, and
+              // `null` has no name arm there.
+              recordInferRet(efn.fnName, "null", er, 1, IR_REC_NULL_ONLY)
+            } else if isClassifiableRetName(recNm) {
               // `isClassifiableRetName`'s admitted set is six scalar spellings plus
               // `i32[]`/`string[]` — every one of them a single atom (#1115).
               recordInferRet(efn.fnName, recNm, recTy, 1, IR_REC_CLASSIFIABLE)
@@ -33562,8 +33710,20 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
     if wtgt is Ident { daWriteTarget = n.binLeft }
   }
   let lt = checkNode(n.binLeft)
-  ltOut.push(lt)
   daWriteTarget = savedWriteTarget
+  // AN UNPINNED INTRINSIC ELEMENT ANSWERS THE ARMS WITH THE DEFAULT IT WILL GET, because the
+  // arms below index `T.tys` with this type and `-1` is what an open element reads back as
+  // (D1566). NOT under `=`: that arm's Index case PINS the element from the right-hand side
+  // (`arrT0.aElem = rt`), and answering here would pre-empt the store's own inference —
+  // `const xs = [0]` / `xs[0] = 5` / `print(xs[0] + 1)` must still print `6` (D1462's #2494
+  // guard sits below that arm for the same reason).
+  if op != "=" {
+    if lt < 0 {
+      const peekL = arrDefOperandElemPeek(n.binLeft)
+      if peekL >= 0 { lt = peekL }
+    }
+  }
+  ltOut.push(lt)
   // Contextual typing for an assignment RHS (`m[k] = (x) => …` over a `{[…]: (i32)=>i32}`
   // map, `xs[i] = (n) => …`, `f = (n) => …`): seed the LHS type so an un-annotated lambda
   // param infers from the target (the let-init / arg / return positions already seed).
@@ -33575,6 +33735,15 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
   // an uninferable-param reject. Mirrors the `=` seeding; the LHS non-null shape drives the lambda.
   if op == "??" { seedExpected(n.binRight, lt) }
   let rt = checkNode(n.binRight)
+  // The RIGHT operand takes the same answer, for the same reason and under the same bar. The
+  // guard below covers only `lt`, so without this `print(1 + a[0])` refuses where its annotated
+  // face runs and `print("v=" + a[0])` is check-clean INVALID WASM. D1566.
+  if op != "=" {
+    if rt < 0 {
+      const peekR = arrDefOperandElemPeek(n.binRight)
+      if peekR >= 0 { rt = peekR }
+    }
+  }
   // The `??` DEFAULT is the value the expression yields when the LHS is null, so a `void`
   // default leaves the coalesce with nothing to produce. The other operators reject a
   // `void` operand through their own arms below (`operator '+' is not defined for void and
@@ -33863,9 +34032,11 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
   // of `xs[0]` over an `[]` whose element is still open answers `-1` — the in-band "no answer"
   // `arrElemValueTy` hands back — and `T.tys[-1]` is an out-of-bounds array access that traps
   // the COMPILER, printing a wasm backtrace where a diagnostic belongs (D1462, the checker-side
-  // sibling of D1440/D1500). Bound-tested HERE rather than at each reader: the arms above are
-  // the ones that must still see the hole (`xs[i] = v` PINS the element from the RHS in place,
-  // and returning early would delete that inference — `tests/cases/types/infer-empty-*`).
+  // sibling of D1440/D1500). TWO ORDERING CONSTRAINTS PIN THIS LINE and it is the only place
+  // satisfying both: BELOW the `=` arm, whose Index case PINS the element from the RHS in place
+  // and would lose that inference (`tests/cases/types/infer-empty-*`); and BELOW the operand
+  // peek, which already answered the rows `__array_new_default__` serves, so guarding first
+  // turns D1566's witness into a loud refusal instead of a program that runs.
   // `TY_ERR` and no second diagnostic: the binding that owns the open element already reports
   // `cannot infer a type for 'xs'`, which is the answer `print(xs[0])` gives without the operator.
   if lt < 0 { return TY_ERR }
@@ -35662,7 +35833,17 @@ function checkCastNode(n: AsExpr, ix: i32) {
   const arg = checkNode(n.asObj)
   const target = nameToTyAt(n.asTy, ix)
   if target < 0 {
-    tErr("unknown type `" + n.asTy + "` in `as` cast", ix)
+    // D1583 — `u8` names something (`u8[]` is spellable, `std:fs` answers one), so
+    // `unknown type` was the one thing it is not. It is a STORAGE type: the element
+    // position exists, the VALUE position does not, so there is no cast to write and
+    // none is needed — a `u8[]` store keeps the low byte of the `i32` it is given.
+    // Reached only when the name did NOT resolve, so a program declaring its own
+    // `type u8` is unaffected. Gate: `storageTyLeafFail`, the annotation-position twin.
+    if n.asTy == "u8" {
+      tErr(u8CastText(), ix)
+    } else {
+      tErr("unknown type `" + n.asTy + "` in `as` cast", ix)
+    }
     return TY_ERR
   }
   // A HOLE OPERAND ANSWERS NEITHER OF THE TRIO'S TYPE-LEVEL QUESTIONS, and the numeric ladder
@@ -35829,8 +36010,17 @@ function checkUnaryNode(n: Unary, ix: i32) {
     return arg
   }
   // "-"
-  if !isNumeric(arg) {
-    tErr("unary '-' expects a numeric type, got " + tyToStr(arg), ix)
+  // The negation of an unpinned intrinsic element takes the default its binary siblings take
+  // (D1566): `-a[0]` refused with `expects a numeric type, got _` where `let a: i32[]` runs.
+  // Asked HERE and not above the `!` arm, because `!a[0]` is admitted over an open operand
+  // today and pinning it to `i32` would turn a running program into a reject.
+  let arg2 = arg
+  if arg2 < 0 {
+    const peekU = arrDefOperandElemPeek(n.unArg)
+    if peekU >= 0 { arg2 = peekU }
+  }
+  if !isNumeric(arg2) {
+    tErr("unary '-' expects a numeric type, got " + tyToStr(arg2), ix)
     return TY_ERR
   }
   // Host parity: the host folds `-lit` into a signed literal BEFORE defaulting,
@@ -35839,7 +36029,7 @@ function checkUnaryNode(n: Unary, ix: i32) {
   if n.unOp == "-" {
     if isNegI32MinLit(n.unArg) { return TY_I32 }
   }
-  return arg
+  arg2
 }
 // ── member `o.field` ───────────────────────────────────────────────────────
 

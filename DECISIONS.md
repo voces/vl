@@ -4803,6 +4803,42 @@ breaking chain. The LSP is untouched (no new token kinds). A consequence for the
 above: with the matcher on its own line the failure's LINE moves, not just its column — which
 is the case where anchoring at `expect` would have sent an author to the wrong line.
 
+## Newlines inside brackets are whitespace before a binary operator (D1581, 2026-09-04)
+
+**Ruling.** Inside an open `(`, `[` or object-literal `{`, a NEWLINE run that leads to a BINARY
+OPERATOR is whitespace, so a continuation line may LEAD with the operator:
+
+```vl
+const ok = (a == 1
+  || b == 2)
+```
+
+The trailing-operator spelling (`a == 1 ||` ⏎ `b == 2`) already worked, so the expression form
+was available — just not the one most style guides prefer. glean's JASS front end (VL-031) is a
+run of `||` per precedence test and hit it on the first one.
+
+**Why it is free, and exactly how far it goes.** This is the leading-dot ruling's argument one
+construct over: inside a bracket there is no statement the newline could be ending, so nothing
+legal is reinterpreted. Measured rather than assumed — a newline is NOT a separator in any
+bracketed list (`takeSep` refuses to insert a comma across one), so `[1` ⏎ `2]` and `{a: 1` ⏎
+`b: 2}` are parse errors today and stay parse errors; the only tokens that are both binary
+operators and expression starters are `-` and `+`, and a line leading with either inside a
+bracket is a parse error today too. Three edges are part of the rule:
+
+* **STATEMENT LEVEL IS UNCHANGED.** `a` ⏎ `-b` is still two statements (G8's soft-boundary
+  ruling), and a leading `||` with no left operand is still a parse error. The gate is a parser
+  bracket depth, and `parseBlock` RESETS it to zero — a `{ … }` inside a call argument holds
+  statements exactly as the top level does, so a lambda body nested in a call is not affected.
+* **Look before consuming.** The cursor moves only once the next real token is known to be an
+  operator. A newline run leading to a closer or to another element is left in place, because
+  `takeSep` reads that newline off `P.pos - 1` to refuse a cross-line missing-comma insert —
+  consuming it unconditionally would turn a missing closer at end of line back into a missing
+  comma that swallows the next statement.
+* **`vl fmt` normalises it away, and that is fine.** The formatter prints operators TRAILING,
+  so it rewrites the leading spelling; what the gate requires is that the new spelling parses
+  and that fmt's output for it re-parses and means the same thing (`tests/vl_paren_newline_test.ts`).
+  Author-break preservation stays out, exactly as in the leading-dot ruling.
+
 ## One name may not bind two IMPORTS, and the test is on the resolved DECLARATION (D1120, 2026-09-02)
 
 `import { area } from "./a"` beside `import { area } from "./b"` is refused —

@@ -106,3 +106,84 @@ Deno.test({
     }
   },
 });
+
+// D1581 — a newline inside an open bracket is whitespace before a binary operator, so
+// a continuation line may LEAD with the operator. `vl fmt` prints operators TRAILING,
+// so the leading spelling is one fmt normalises AWAY: what has to hold is that the new
+// spelling parses, that fmt's output for it re-parses and means the same thing, and
+// that STATEMENT level is untouched (a lambda body's `v` NEWLINE `-v` is still two
+// statements, so `sep(1)` is -1 and not 0).
+Deno.test({
+  name: "vl-parse: a continuation line inside brackets may lead with a binary operator",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_leadop_" });
+    try {
+      const src = "const a = 1\nconst b = 2\n" +
+        "const ok = (a == 1\n  || b == 2)\n" +
+        "const xs = [a * 4\n  + 8, 99]\n" +
+        "const obj = { v: a\n  + 1 }\n" +
+        "const sep = (x: i32) => {\n  let v = x\n  v\n  -v\n}\n" +
+        "print(ok)\nprint(xs[0])\nprint(obj.v)\nprint(sep(1))\n";
+      const f = `${dir}/a.vl`;
+      await Deno.writeTextFile(f, src);
+      const r = await runVL("run", f);
+      if (r.code !== 0) {
+        throw new Error(`leading-operator continuation should run, got code ${r.code}:\n${r.err}`);
+      }
+      if (r.out !== "true\n12\n2\n-1\n") {
+        throw new Error(`want "true\\n12\\n2\\n-1\\n", got ${JSON.stringify(r.out)}`);
+      }
+      // fmt rewrites it to the trailing-operator spelling; that output must re-parse
+      // and print the same four lines.
+      const fmt = await runVL("fmt", f);
+      if (fmt.code !== 0) throw new Error(`fmt failed: ${fmt.err}`);
+      const g = `${dir}/a.formatted.vl`;
+      await Deno.writeTextFile(g, fmt.out);
+      const again = await runVL("run", g);
+      if (again.code !== 0) {
+        throw new Error(`formatted output did not re-parse, code ${again.code}:\n${again.err}`);
+      }
+      if (again.out !== r.out) {
+        throw new Error(
+          `fmt changed the meaning: ${JSON.stringify(r.out)} vs ${JSON.stringify(again.out)}`,
+        );
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+// The other half of the same rule: at statement level the newline is still the
+// terminator. `a` NEWLINE `-b` at top level is two statements, and a leading `||` there
+// stays a parse error — neither may be quietly joined.
+Deno.test({
+  name: "vl-parse: statement level still terminates at the newline",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_leadop_" });
+    try {
+      const f = `${dir}/s.vl`;
+      await Deno.writeTextFile(
+        f,
+        "function f() {\n  let a = 1\n  a\n  -a\n}\nprint(f())\n",
+      );
+      const r = await runVL("run", f);
+      if (r.code !== 0) throw new Error(`statement-level probe failed: ${r.err}`);
+      if (r.out !== "-1\n") throw new Error(`want "-1\\n", got ${JSON.stringify(r.out)}`);
+
+      const g = `${dir}/t.vl`;
+      await Deno.writeTextFile(
+        g,
+        "const a = 1\nconst b = 2\nconst ok = a == 1\n  || b == 2\nprint(ok)\n",
+      );
+      const bad = await runVL("check", g);
+      if (bad.code === 0) {
+        throw new Error("a leading `||` at statement level must stay a parse error");
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
