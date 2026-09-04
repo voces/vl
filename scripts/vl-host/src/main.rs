@@ -3032,6 +3032,44 @@ fn register_fs_imports(
         })?;
     }
 
+    // `__fs_size__(path)` — the file's size in bytes, negative = -errno. A size is never
+    // negative, so one i64 carries both answers unambiguously; the errno cell is written
+    // too, so a caller may read the reason the same way every other slot reports it.
+    //
+    // A DIRECTORY IS `-EISDIR` rather than the dirent's own byte count, which is a block
+    // figure no caller can act on. Decided here rather than above, because the alternative
+    // is a second syscall and a TOCTOU window — the same reason `__fs_read__` does not
+    // pre-stat. A size past `i64::MAX` is `-EFBIG` rather than a silent clamp.
+    if let Some((_, ft)) = has("__fs_size__") {
+        let e = errno.clone();
+        linker.func_new("imports", "__fs_size__", ft, move |mut c, args, results| {
+            let path = read_u8_list(&mut c, &args[0])?;
+            let p = match os_path(&path) {
+                Ok(p) => p,
+                Err(code) => {
+                    *e.lock().unwrap() = code;
+                    results[0] = Val::I64(-i64::from(code));
+                    return Ok(());
+                }
+            };
+            let code = match std::fs::metadata(&p) {
+                Ok(m) if m.is_dir() => 31, // EISDIR
+                Ok(m) => match i64::try_from(m.len()) {
+                    Ok(n) => {
+                        *e.lock().unwrap() = 0;
+                        results[0] = Val::I64(n);
+                        return Ok(());
+                    }
+                    Err(_) => 22, // EFBIG
+                },
+                Err(err) => wasi_errno(&err),
+            };
+            *e.lock().unwrap() = code;
+            results[0] = Val::I64(-i64::from(code));
+            Ok(())
+        })?;
+    }
+
     // `__fs_write__(path, data)` — 0 = ok, negative = -errno. Whole-file, truncating,
     // creating when absent: `std::fs::write`'s own semantics, which are `O_WRONLY |
     // O_CREAT | O_TRUNC`. No parent directories are created — a missing parent is
@@ -3103,6 +3141,64 @@ fn register_fs_imports(
             results[0] = make_u8_list(&mut c, &st, &at, &out)?;
             Ok(())
         })?;
+    }
+
+    // `__fs_read_range__(path, offset, length)` — at most `length` bytes starting at byte
+    // `offset`, or EMPTY with `errno` set. Fewer than `length` near the end of the file and
+    // EMPTY at or past it, neither of which is an error: a scan walks a file by advancing
+    // the offset until the answer is empty with `errno == 0`. A negative offset or length is
+    // `EINVAL`, matching the check `std:fs` makes before the call.
+    //
+    // `take(length).read_to_end` rather than a `length`-sized zeroed buffer, because the
+    // length is the caller's WINDOW and not the file's: eagerly allocating it would cost a
+    // gigabyte to read ten bytes from a short file. Reading a directory is `-EISDIR` from
+    // the OS's own failed read, exactly as `__fs_read__` above.
+    if let Some((_, ft)) = has("__fs_read_range__") {
+        let e = errno.clone();
+        let (st, at) = (st.clone(), at.clone());
+        linker.func_new(
+            "imports",
+            "__fs_read_range__",
+            ft,
+            move |mut c, args, results| {
+                use std::io::{Read, Seek, SeekFrom};
+                let path = read_u8_list(&mut c, &args[0])?;
+                let Val::I64(off) = args[1] else {
+                    bail!("fs intrinsic: __fs_read_range__ expected an i64 offset");
+                };
+                let Val::I32(len) = args[2] else {
+                    bail!("fs intrinsic: __fs_read_range__ expected an i32 length");
+                };
+                let mut out: Vec<u8> = Vec::new();
+                let mut code = 0i32;
+                if off < 0 || len < 0 {
+                    code = 28; // EINVAL
+                } else {
+                    match os_path(&path) {
+                        Err(bad) => code = bad,
+                        Ok(p) => match std::fs::File::open(&p) {
+                            Err(err) => code = wasi_errno(&err),
+                            Ok(mut f) => match f.seek(SeekFrom::Start(off as u64)) {
+                                Err(err) => code = wasi_errno(&err),
+                                Ok(_) => {
+                                    if let Err(err) =
+                                        f.take(u64::from(len as u32)).read_to_end(&mut out)
+                                    {
+                                        code = wasi_errno(&err);
+                                    }
+                                }
+                            },
+                        },
+                    }
+                }
+                if code != 0 {
+                    out.clear();
+                }
+                *e.lock().unwrap() = code;
+                results[0] = make_u8_list(&mut c, &st, &at, &out)?;
+                Ok(())
+            },
+        )?;
     }
 
     // `__fs_list__(path)` — the directory's entry NAMES, separated by 0x00 (NUL), or EMPTY
