@@ -2003,13 +2003,14 @@ in-language GC knobs.
   niche-bearing value too (`{[K]: K}` / `{[K]: boolean}`, not just the `| null` spellings) — `0`
   was a real value there (atom id 0 is the first-interned member, boolean 0 is `false`), so
   `m[missing] == <that member>` read TRUE and the `!= null` narrow saw a miss as present.
-  REMAINING on that axis, both loud: a **plain-`i32`-valued** map's narrowed bare read
+  REMAINING on that axis: a **plain-`i32`-valued** map's narrowed bare read
   (`const g = m[k]; if g != null`) is `emitProgram: bare null needs a struct-typed context` — every
-  i32 is a legal value so there is no spare sentinel, and `m[k] ?? d` is the spelling; and a
-  **BARE `m.get(k)` with no `??`** is `emitProgram: callee is not a function name` in every
-  position, on both key reps and for every value rep (only the FUSED `m.get(k) ?? d` lowers —
-  routing the bare method spelling would need the `.get` twin at every `expr*` Index arm, not just
-  the `??` ones). Also:
+  i32 is a legal value so there is no spare sentinel, and `m[k] ?? d` is the spelling.
+  A **BARE `m.get(k)` with no `??`** is CLOSED ([D1522](docs/internals/inventory/D1522.md),
+  glean VL-003): `dispatchRewrite` turns it into `m[k]`, so it reaches every classifier and
+  lowering the bracket spelling already passes rather than needing a `.get` twin at each
+  `expr*` Index arm. 0 → 49 of 52 positions RUN, and the three that do not are a strict subset
+  of the six the BRACKET spelling refuses at. Also:
   `map`/`filter` over Map/Set (A10); clean diagnostic polish for unannotated/used `Map()`.
   (Self-host native parity: string-keyed maps, delete, `Set`/`.add`/`.get`, and ref-valued maps
   (string/struct values, #319) landed; map-typed params are the remaining native map gap.)
