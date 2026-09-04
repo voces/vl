@@ -56,10 +56,27 @@ element (a packed WasmGC `(array (mut i8))`); every value crossing its boundary 
 ordinary `i32`, so `b[i]` reads back 0..255 (zero-extended) and `b[i] = v` / `b.push(v)`
 keep the LOW BYTE of `v`. `bytes.push(300)` therefore stores 44, and `bytes.push(-1)`
 stores 255. There is no `u8` VALUE — no local, parameter, return, field or map value may
-hold one, and `x as u8` is not a cast to write (D1583): push the `i32` directly, or
-`x & 0xff` to make the truncation explicit. An out-of-range non-negative LITERAL is the
-one case the compiler rejects instead of truncating, because a hand-written `300`
-silently becoming `44` is a typo it can see.
+hold one. An out-of-range non-negative LITERAL is the one case the compiler rejects
+instead of truncating, because a hand-written `300` silently becoming `44` is a typo it
+can see.
+
+**`x as u8` is a CAST you can write, and it is the range check the store is not (D1587).**
+It narrows a number into 0..255 exactly-or-fails, under the same trio as `big as i32`, and
+the value it produces is an `i32` in that range:
+
+```vl
+const bytes: u8[] = []
+bytes.push(v as! u8)          // traps: `as! u8 at L:C: not exact`, if v is not a byte
+const b = v as? u8            // `i32 | null` — null when v is not a byte
+function byteOf(v: i32): i32 | null { return v as u8 }   // bare `as` propagates the null
+```
+
+Every numeric source can fail it — `i32` included, since 300 is a perfectly good `i32` and
+not a byte — and a float source must be integral as well as in range (`3.9 as! u8` traps,
+`200.0 as! u8` is 200). The cast and the store are **two different answers to one
+question**: `bytes.push(v)` keeps the low byte and never complains, `bytes.push(v as! u8)`
+insists the value was already a byte. Whether the implicit store should require the cast is
+NOT decided — the store's truncation is unchanged by this ruling.
 
 ## Summary / recommendation
 

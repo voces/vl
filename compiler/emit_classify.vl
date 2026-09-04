@@ -85,6 +85,7 @@ import {
   isValueUnionName,
   isValueUnionTyOr,
   isVarTyIxOf,
+  letNullHoleUnfilled,
   litUnionAliasNameOfTy,
   nameIsEmitterIntrinsic,
   nameIsInlineLitUnion,
@@ -2997,6 +2998,11 @@ function fnParamNodeOf(fnIx: i32, name: string) {
 // slot from the SAME binding. THE ORDER IS `collectLocals`' ORDER, comments and all, because
 // every arm there is placed against a specific miscompile: read the reasons there.
 function letInitCellKind(letIx: i32, fnIx: i32): VKind {
+  // A never-filled `let x = null` is the `null` type, cell `nullref` — FIRST, as in
+  // `collectLocals` (D1576). Reaching this ladder is what types a CAPTURED such binding's
+  // env field: without it the field was an i32 holding 0 and the lambda's `x ?? d` / `x ==
+  // null` / `print(x)` read a present value out of it.
+  if letIsNulNone(letIx, fnIx) { return "nulnone" }
   // A literal-union binding is an i32-backed interned ATOM, not a value-union box — FIRST,
   // ahead of `letIsVariant` / `letIsUnion` / `letIsString`.
   if letIsLitUnion(letIx) || letInitIsLitAtom(letIx, fnIx) { return "i32" }
@@ -11328,6 +11334,18 @@ export function asExprNumTgtName(ix: i32): string {
   primNameStr(primNameOf(tyPeelNul(nodeTyIxOf(ix))))
 }
 
+// The EXACTNESS DOMAIN, which is the target name except at `u8` — the emitter's half of the
+// checker's `numCastDomainName`, and the one place `n.asTy` outranks the arena (D1587).
+// `x as u8` RECORDS `i32`, because that is the value it produces; the `u8` spelling survives
+// canonicalisation precisely so this can read it. The TARGET name still decides the
+// conversion opcode and the `i32 | null` box row, so the two must not be merged.
+export function asExprNumCastDomain(ix: i32): string {
+  const n = P.nodes[ix]
+  if !(n is AsExpr) { return "" }
+  if n.asTy == "u8" { return "u8" }
+  asExprNumTgtName(ix)
+}
+
 // Whether the `AsExpr` at `ix` is a numeric cast that CAN FAIL — the emitter's half of the
 // checker's `numCastCanFail`, asked of the same two names. Disjoint from
 // `asExprIsUnionCast` by OPERAND (a union operand is never a primitive), so the two gates
@@ -11337,7 +11355,7 @@ export function asExprNumFallible(ix: i32): boolean {
   const n = P.nodes[ix]
   if !(n is AsExpr) { return false }
   if asExprIsUnionCast(ix) { return false }
-  numCastCanFail(asExprNumSrcName(ix), asExprNumTgtName(ix))
+  numCastCanFail(asExprNumSrcName(ix), asExprNumCastDomain(ix))
 }
 
 // THE PEEPHOLE'S PREDICATE: is `exprIx` an expression whose f64/f32 value is INTEGRAL by
@@ -12438,10 +12456,11 @@ export function exprIsF32(exprIx: i32, fnIx: i32) {
     return globalIsF32Sid(fnIx, sidOfNode(exprIx))
   }
   // Arithmetic yields f32 when EITHER operand is f32. Comparisons / logical connectives
-  // produce an i32 BOOL even over f32 operands, so they are NOT f32.
+  // produce an i32 BOOL even over f32 operands, so they are NOT f32. `%` is here for the
+  // reason `exprIsF64`'s arm gives (D1586).
   if e is BinExpr {
     const op = e.binOp
-    if op == "+" || op == "-" || op == "*" || op == "/" {
+    if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" {
       // f32 arithmetic yields f32 only when NO operand is a genuine f64 — a genuine f64 side makes
       // the op f64 (the f32 side widens). A float literal does not count (it adapts down to f32).
       if binMixHardF64(e.binLeft, e.binRight, fnIx) { return false }
@@ -12575,10 +12594,11 @@ export function exprIsF64(exprIx: i32, fnIx: i32) {
     return globalIsF64Sid(fnIx, sidOfNode(exprIx))
   }
   // Arithmetic yields f64 when EITHER operand is f64. Comparisons / logical connectives
-  // produce an i32 BOOL even over f64 operands, so they are NOT f64.
+  // produce an i32 BOOL even over f64 operands, so they are NOT f64. `%` is here because
+  // float remainder has a form (D1586) and its result is the dividend's width.
   if e is BinExpr {
     const op = e.binOp
-    if op == "+" || op == "-" || op == "*" || op == "/" {
+    if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" {
       if exprIsF64(e.binLeft, fnIx) { return true }
       return exprIsF64(e.binRight, fnIx)
     }
@@ -18661,6 +18681,11 @@ export function globalCellKind(letIx: i32): VKind {
 function globalCellKindGo(letIx: i32): VKind {
   const d = P.nodes[letIx]
   if d is LetDecl {
+    // D1576 — A NEVER-FILLED `const x = null` at MODULE scope is the `null` type, cell
+    // `nullref`. FIRST, and outside the annotation split: the binding has no annotation by
+    // construction, and the un-annotated arm below would read its `null` init as the i32
+    // default — the same disagreement the local ladder had before its own `nulnone` arm.
+    if letIsNulNone(letIx, -1) { return "nulnone" }
     if globalHasTypeAnn(letIx) {
       // A NULLABLE-function global (`let g: ((i32) => i32) | null = inc`) is a nullable
       // closure cell (kind 19) — checked BEFORE the bare-function kind 14, mirroring
@@ -21924,6 +21949,22 @@ function anonCodeAdmitsValue(c: i32, valIx: i32) {
   c == 5 && anonRefListElemRow(valIx) >= 0
 }
 
+// The WIDTH of an ARITHMETIC field value, from the arena, falling back to i32 (D1586).
+//
+// The syntax ladder used to code every `- * / %` field 0 outright, which is a claim about
+// the OPERATOR where the truth is a fact about the OPERANDS: `{ f: mkF64() - mkF64() }`
+// stored an f64 into an i32 field — check-clean invalid wasm on `- * /` before float `%`
+// existed, and the one SILENT cell of `%`'s own position matrix. The i32 fall-back stays
+// because this rung has to answer for a value whose type the checker never recorded (a
+// monomorphized instance body), and i32 is what the surrounding ladder assumes there.
+function anonArithFieldCode(valIx: i32) {
+  const bk = tyKindOf(nodeTyIxOf(valIx))
+  if bk == 10 { return 23 }
+  if bk == 11 { return 17 }
+  if bk == 13 { return 24 }
+  0
+}
+
 // The SYNTAX half of `anonFieldCode` — the field value's own literal form. Kept separate
 // so the recorded-type fallback above cannot shadow a context-adopted literal rep: every
 // arm here is a fact about the LITERAL that the checker's recorded type either does not
@@ -21963,18 +22004,20 @@ function anonFieldCodeSyn(valIx: i32) {
     return -1
   }
   // An ARITHMETIC field value (`x: x * s` — an operator-overload maker scaling
-  // its params) is i32 too; a `+` whose operand is a string literal is a concat
-  // (not classifiable here).
+  // its params) is i32 unless the arena says otherwise; a `+` whose operand is a string
+  // literal is a concat (not classifiable here).
   if e is BinExpr {
     const bop = e.binOp
-    if bop == "-" || bop == "*" || bop == "/" || bop == "%" { return 0 }
+    if bop == "-" || bop == "*" || bop == "/" || bop == "%" {
+      return anonArithFieldCode(valIx)
+    }
     if bop == "+" {
       // WHOLE CHAIN, not one level: `"a" + f(x) + g(y)` associates left, so its
       // OUTERMOST `+` has a BinExpr on the left and a Call on the right and neither
       // operand is a string LITERAL. Reading that as arithmetic coded the field i32 and
       // then stored a string ref into it.
       if plusChainHasStrLit(valIx) { return -1 }
-      return 0
+      return anonArithFieldCode(valIx)
     }
     return -1
   }
@@ -27492,6 +27535,80 @@ export function identCellVKind(exprIx: i32, fnIx: i32): VKind | null {
     if gl >= 0 { return globalCellKind(gl) }
   }
   null
+}
+
+// D1576 — IS THIS EXPRESSION'S VALUE THE `null` TYPE, whose rep is `nullref`? TWO producers
+// mint one and they are the same value: a never-filled `let x = null` binding (this row) and
+// a call to a function whose every returned value is a bare `null` ([D1567](D1567.md)). THE
+// ONE HOME for the question, so the consumers that must treat the value as STATICALLY null —
+// `??`, the null-equality boundary, `print` — ask once instead of each learning both
+// spellings. An INDIRECT call is deliberately not claimed: its result rides a `$fnsig` this
+// does not resolve, and the loud reject it gets is the honest answer (D1567's residue).
+export function exprIsNulNone(exprIx: i32, fnIx: i32): boolean {
+  if exprIx < 0 { return false }
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is Call {
+    const cf = P.nodes[unwrapParen(e.callFn)]
+    if cf is Ident {
+      const t = fnIndexOfSid(sidOfNode(e.callFn))
+      if t >= 0 && t < fRetKind.length { return fRetKind[t] == "nulnone" }
+    }
+    return false
+  }
+  // An if-EXPRESSION whose every arm is itself `null`-typed is `null`-typed: the join of
+  // `null` with `null` is `null`, and `(if c { x } else { x }) ?? 0` is seventeen of D1575's
+  // thirty-five witnesses. One arm carrying a real value is NOT this — its join is a genuine
+  // `T | null` and the niche paths own it. An ELSE-LESS `if` used as a value is `T | null`,
+  // and here `T` is already `null`.
+  if e is IfStmt {
+    const tvNN = ifArmValueExpr(e.ifThen)
+    if tvNN < 0 { return false }
+    if !exprIsNulNone(tvNN, fnIx) { return false }
+    if e.ifElse < 0 { return true }
+    const evNN = ifArmValueExpr(e.ifElse)
+    return evNN >= 0 && exprIsNulNone(evNN, fnIx)
+  }
+  // EVERY OTHER NODE KIND ASKS THE CELL, which is the named default and not a fall-through:
+  // an Ident, a captured read and a module global all resolve through `identCellVKind`, and
+  // for a kind that names no cell it answers `null` — "this expression has no `nulnone`
+  // storage", which is the right answer for every remaining kind.
+  identCellVKind(exprIx, fnIx) == "nulnone"
+}
+
+// D1576 — `x ?? d` WHERE `x` IS THE `null` TYPE IS EXACTLY `d`, so a classifier asked about
+// the `??` must answer about the DEFAULT: the value that survives is the default's, at the
+// default's rep. Returns `d`'s node index, or -1 when this is not that shape. The consumer
+// half of `emitCoalesce`'s fold, in the shape `exprNullableString` / `exprNulBool` state for
+// their own reps — without it `print(x ?? "d")` classified i32 over a string ref.
+export function coalesceNulNoneDefaultIx(exprIx: i32, fnIx: i32): i32 {
+  if exprIx < 0 { return -1 }
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is BinExpr {
+    if e.binOp == "??" {
+      if exprIsNulNone(e.binLeft, fnIx) { return e.binRight }
+    }
+  }
+  -1
+}
+
+// The BINDING half of `exprIsNulNone`: is the LetDecl at `letIx` a binding whose only value
+// is `null`? TWO producers, matching the expression side arm for arm — a never-filled
+// A-infer-null hole (`let x = null`, banked by the checker at scope close and asked through
+// `letNullHoleUnfilled`, D1576), and an un-annotated binding to a `null`-typed VALUE, which
+// is a call to a `nulnone`-returning function (D1567). The gate `collectLocals`,
+// `letInitCellKind` and `globalCellKindGo` all give the slot the `nulnone` cell on. An
+// ANNOTATED binding never lands here: its annotation pins the rep, and `C | null = null` is
+// the `nulstruct` niche, not this.
+export function letIsNulNone(letIx: i32, fnIx: i32): boolean {
+  if letIx < 0 { return false }
+  const s = P.nodes[letIx]
+  if s is LetDecl {
+    if s.letType >= 0 || s.letInit < 0 { return false }
+    const ini = P.nodes[unwrapParen(s.letInit)]
+    if ini is NullLit { return letNullHoleUnfilled(letIx) }
+    return exprIsNulNone(s.letInit, fnIx)
+  }
+  false
 }
 
 // The result valtype KIND of `fnIx`, read off the SAME ladder `emitOneFuncType` writes the
@@ -34116,6 +34233,19 @@ function tyScalarBackedListKind(tyIx: i32): VKind | null {
   null
 }
 
+// D1586 — how a `%` node votes on the `__f64_rem__` reservation, in the vocabulary
+// `scanPrintUse` needs: 1 = float, so the helper must exist; 0 = definitely an integer `%`,
+// which needs nothing; -1 = the checker recorded no SCALAR type for this node, and the
+// caller resolves that by asking whether the module mentions a float anywhere.
+// The third answer is not a defensive floor — a monomorphized instance body carries its
+// ORIGINAL's `T`, whose kind is -1, and that is exactly D493's pinned `a % b`.
+export function binRemFloatNeed(ix: i32): i32 {
+  const k = tyKindOf(nodeTyIxOf(ix))
+  if k == 11 || k == 13 { return 1 }
+  if k == 0 || k == 10 { return 0 }
+  -1
+}
+
 function tyKindOf(tyIx: i32) {
   if tyIx < 0 { return -1 }
   const t = T.tys[tyIx]
@@ -35965,6 +36095,9 @@ export function exprString(exprIx: i32, fnIx: i32) {
     // recovers the non-null array ref, so `.length`/`+`/etc. on the result work.
     if e.binOp == "??" {
       if exprNullableString(e.binLeft, fnIx) { return true }
+      // …and over a `null`-TYPED LHS the value IS the default, at the default's rep (D1576).
+      const cnnS = coalesceNulNoneDefaultIx(exprIx, fnIx)
+      if cnnS >= 0 { return exprString(cnnS, fnIx) }
     }
     // G6: string concatenation `a + b` produces a string; no other binary operator
     // does (`==`/`!=` yield an i32).
@@ -37167,6 +37300,12 @@ export function cloCallUnionResultUnrepresentable(
   // narrow below keeps its clean `is` chain.)
   const tn = T.tys[ty]
   if tn is TyNullable {
+    // D1576 — [D1575](D1575.md)'s rule, at the reader OUTSIDE `typecheck.vl` that its sweep
+    // could not see. A never-filled `let x = null` captured by a lambda gives that lambda the
+    // open A-infer-null hole as its inferred RESULT, so `nInner` is `-1` here and `T.tys[-1]`
+    // traps the compiler on a `vl check`-clean program. An unfilled hole is representable —
+    // it is the `null` type, whose rep is `nullref` — so the answer is `false`, not a refusal.
+    if tn.nInner < 0 || tn.nInner >= T.tys.length { return false }
     const nit = T.tys[tn.nInner]
     let nulBoxScalar = false
     if nit is TyPrim {

@@ -230,6 +230,7 @@ import {
   gF32PrintIdx,
   gF64PrintIdx,
   gFnTableIdx,
+  gHelpF64Rem,
   gHelpMapProbe,
   gHelpMapProbeI32,
   gHelpMapResize,
@@ -299,6 +300,7 @@ import {
   pendingNulClosure,
   pendingNulList,
   pendingNulLitUnion,
+  pendingNulNone,
   pendingNulRefHeap,
   pendingNulString,
   pendingRawNullRead,
@@ -369,6 +371,7 @@ import {
   fbF32DemoteF64,
   fbF32Eq,
   fbF32Ge,
+  fbF32Le,
   fbF32Lt,
   fbF32Trunc,
   fbF64Const,
@@ -464,6 +467,7 @@ import {
   asExprIsUnionCastIn,
   asExprNumFallible,
   asExprNumSrcName,
+  asExprNumCastDomain,
   asExprNumTgtName,
   binEqNulVariantRow,
   binEqStructRow,
@@ -533,6 +537,7 @@ import {
   exprIsI64,
   exprIsIntegralFloat,
   exprIsLitAtom,
+  exprIsNulNone,
   exprIsStrBytes,
   exprIsStrCharBoundary,
   exprIsStrCharCode,
@@ -624,6 +629,7 @@ import {
   letIsF64,
   letIsI64,
   letIsMap,
+  letIsNulNone,
   letIsNulString,
   letListBuildKind,
   letListBuildSlot,
@@ -4900,6 +4906,16 @@ export function emitUnionCoerce(
     fbStructNew(uBoxIdx)
     return 0
   }
+  // D1576 — A `null`-TYPED VALUE at a box destination is the same null-tagged box, with the
+  // VALUE in the payload slot instead of a fresh `ref.null none`: `nullref` is an `anyref`,
+  // so it rides the slot the null tag leaves unread and a call's side effects still happen.
+  // The binding twin of `emitUnionBoxArg`'s arm (D1567), which is the argument boundary's.
+  if exprIsNulNone(exprIx, fnIx) {
+    fbI32Const(nullBoxTag())
+    if emitNulNoneBoxPayload(body, exprIx, fnIx) < 0 { return -1 }
+    fbStructNew(uBoxIdx)
+    return 0
+  }
   // A STRUCT value (an object literal, or a struct-typed expr) auto-boxes through
   // `emitExpr`'s `uDeclared` variant path; only a SCALAR value is value-boxed below.
   // This is what lets a MIXED union (`A | i32`) coerce either kind of member: an object
@@ -5391,19 +5407,51 @@ export function fnPosRetIsNulNone(pos: i32): boolean {
   fRetKind[pos] == "nulnone"
 }
 
-// `fnPosRetIsNulNone` asked of an EXPRESSION: true for a direct call to such a function.
-// An indirect call is deliberately not claimed — its result rides a `$fnsig` this does not
-// resolve, and the loud reject it already gets is the honest answer (D1567's residue).
-function exprIsNulNoneCall(exprIx: i32): boolean {
-  if exprIx < 0 { return false }
-  const e = P.nodes[unwrapParen(exprIx)]
-  if e is Call {
-    const cf = P.nodes[unwrapParen(e.callFn)]
-    if cf is Ident {
-      return fnPosRetIsNulNone(fnIndexOfSid(sidOfNode(e.callFn)))
-    }
+// The PAYLOAD of a null-tagged box holding a `null`-typed value: the value itself when
+// evaluating it can have EFFECTS (a call), and a fresh `ref.null none` otherwise. The slot is
+// unread under the null tag, so its only job is to be an `anyref` — which is why an IDENT read
+// must not route through the seed table here: a `boolean | null` seed in force would put an
+// i32 in that slot. D1567 built the arm; D1576 widened it past the call spelling.
+function emitNulNoneBoxPayload(body: i32[], exprIx: i32, fnIx: i32) {
+  const n = P.nodes[unwrapParen(exprIx)]
+  if n is Call { return emitExpr(body, exprIx, fnIx) }
+  fbRefNullNone()
+  0
+}
+
+// D1576 — DOES THIS `==`/`!=` COMPARE THE `null` TYPE AGAINST A `null`? True when at least
+// one operand is a `null`-typed value (`exprIsNulNone` — a never-filled `let x = null`, or a
+// `nulnone`-returning call) and BOTH sides are either that or a bare `null` literal. Both
+// operands then denote the one value `null`, so the compare folds to a constant and needs no
+// core. A genuinely nullable operand on the other side is deliberately excluded: there the
+// answer is that operand's null-ness, which the niche path already lowers.
+function nulNoneEqSides(leftIx: i32, rightIx: i32, fnIx: i32): boolean {
+  if !exprIsNulNone(leftIx, fnIx) && !exprIsNulNone(rightIx, fnIx) {
+    return false
   }
+  nulNoneEqSide(leftIx, fnIx) && nulNoneEqSide(rightIx, fnIx)
+}
+
+// One side of `nulNoneEqSides`: a `null`-typed value, or a bare `null` literal.
+function nulNoneEqSide(exprIx: i32, fnIx: i32): boolean {
+  if exprIsNulNone(exprIx, fnIx) { return true }
+  const n = P.nodes[unwrapParen(exprIx)]
+  if n is NullLit { return true }
   false
+}
+
+// Evaluate a `null`-typed operand for its EFFECTS and drop it, where the answer is already
+// decided. Only a CALL has any: an ident read has none, and emitting one would CONSUME the
+// destination seed (`emitNullBySeed`'s one-shot `pendingNulRefHeap`) that the surviving value
+// still needs. A bare `null` literal has neither effects nor, unseeded, a lowering. Shared by
+// `??`, the folded null compare, and `print`.
+function emitNulNoneForEffect(body: i32[], exprIx: i32, fnIx: i32) {
+  const n = P.nodes[unwrapParen(exprIx)]
+  if n is Call {
+    if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
+    fbDrop()
+  }
+  0
 }
 
 export function emitUnionBoxArg(
@@ -5419,10 +5467,12 @@ export function emitUnionBoxArg(
   // nullref` on a `vl check`-clean program. The shape is `emitUnionIfValue`'s else-less arm
   // exactly, except the PAYLOAD is the call itself: `nullref` is an `anyref`, so it rides
   // the slot the null tag leaves unread, and the call's side effects still happen.
-  if exprIsNulNoneCall(exprIx) {
+  // D1576 widened the question from a CALL to the value: a never-filled `let x = null` reps
+  // `nullref` too, and boxes here identically.
+  if exprIsNulNone(exprIx, fnIx) {
     fbI32Const(nullBoxTag())
-    if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
-    fbStructNew(uBoxIdx) // { null tag, the call's nullref — unread under this tag }
+    if emitNulNoneBoxPayload(body, exprIx, fnIx) < 0 { return -1 }
+    fbStructNew(uBoxIdx) // { null tag, a nullref — unread under this tag }
     return 0
   }
   // D1009 — A MAP READ OF A UNION-VALUED MAP DELIVERS ITS MISS AS A TAGGED BOX. `v[k]` on a
@@ -14667,14 +14717,28 @@ function emitExprAsKind(body: i32[], exprIx: i32, k: i32, fnIx: i32) {
 // `f64.convert_i64_s` puts the ENGINE's rounding on the path, and that rounding decides each
 // upper test (`<=` where `convert(MAX)` is exact, `<` where it rounds up); every MINIMUM is a
 // power of two, so the lower test is `>=` at all four. NaN fails integrality for free.
-function emitNumExactTest(src: string, tgt: string) {
+
+// `dom` is the EXACTNESS DOMAIN, not the rep target: `u8` names 0..255 inside the `i32` the
+// cast produces (D1587), so it is a third set of bounds over the same two comparisons. Both
+// `u8` bounds convert EXACTLY at f32 and f64, which is why its upper test is `<=` at both.
+function emitNumExactTest(src: string, dom: string) {
+  const u8Dom = dom == "u8"
   if src == "i64" {
-    // `i64 -> i32`: a pure range test, and never a wrap. The bounds are exact i64 literals.
+    // `i64 -> i32` / `i64 -> u8`: a pure range test, and never a wrap. The bounds are exact
+    // i64 literals. An i32 SOURCE arrives here too — `emitNumExactCast` widens it, exactly.
     fbLocalGet(numCastI64Slot)
-    fbI64Const(-1, -2147483648) // i64.const -2147483648
+    if u8Dom {
+      fbI64Const(0, 0) // i64.const 0
+    } else {
+      fbI64Const(-1, -2147483648) // i64.const -2147483648
+    }
     fbI64GeS()
     fbLocalGet(numCastI64Slot)
-    fbI64Const(0, 2147483647) // i64.const 2147483647
+    if u8Dom {
+      fbI64Const(0, 255) // i64.const 255
+    } else {
+      fbI64Const(0, 2147483647) // i64.const 2147483647
+    }
     fbI64LeS()
     fbI32And()
     return 0
@@ -14688,9 +14752,12 @@ function emitNumExactTest(src: string, tgt: string) {
   if isF32 { fbF32Trunc() } else { fbF64Trunc() }
   fbLocalGet(slot)
   if isF32 { fbF32Eq() } else { fbF64Eq() }
-  // IN RANGE, lower: `d >= convert(<target>::MIN)`. ±Inf fails one side or the other.
+  // IN RANGE, lower: `d >= convert(<domain>::MIN)`. ±Inf fails one side or the other.
   fbLocalGet(slot)
-  if tgt == "i32" {
+  if u8Dom {
+    fbI32Const(0)
+    if isF32 { fbF32ConvertI32S() } else { fbF64ConvertI32S() }
+  } else if dom == "i32" {
     fbI32Const(-2147483648)
     if isF32 { fbF32ConvertI32S() } else { fbF64ConvertI32S() }
   } else {
@@ -14701,16 +14768,25 @@ function emitNumExactTest(src: string, tgt: string) {
   fbI32And()
   // IN RANGE, upper — `<=` only where the converted maximum is exact (see the table above).
   fbLocalGet(slot)
-  if tgt == "i32" {
+  if u8Dom {
+    fbI32Const(255)
+    if isF32 { fbF32ConvertI32S() } else { fbF64ConvertI32S() }
+  } else if dom == "i32" {
     fbI32Const(2147483647)
     if isF32 { fbF32ConvertI32S() } else { fbF64ConvertI32S() }
   } else {
     fbI64Const(2147483647, -1) // i64.const 9223372036854775807
     if isF32 { fbF32ConvertI64S() } else { fbF64ConvertI64S() }
   }
-  if isF32 { fbF32Lt() }
-  else if tgt == "i64" { fbF64Lt() }
-  else { fbF64Le() }
+  if u8Dom {
+    if isF32 { fbF32Le() } else { fbF64Le() }
+  } else if isF32 {
+    fbF32Lt()
+  } else if dom == "i64" {
+    fbF64Lt()
+  } else {
+    fbF64Le()
+  }
   fbI32And()
   0
 }
@@ -14787,8 +14863,16 @@ function numCastNullNode(): i32 { mkNull("null", -1) }
 //           union arm's propagating mode uses, with the null built by the RETURN path so
 //           every nullable rep (box / niche / variant) is served by one ladder.
 function emitNumExactCast(body: i32[], e: AsExpr, exprIx: i32, fnIx: i32) {
-  const src = asExprNumSrcName(exprIx)
   const tgt = asExprNumTgtName(exprIx)
+  // THE DOMAIN AND THE TARGET ARE TWO NAMES (D1587): the domain decides the range test and the
+  // `as!` message, the target decides the conversion opcode and the box row. At `u8` they
+  // differ, everywhere else they are the same string.
+  const dom = asExprNumCastDomain(exprIx)
+  // AN i32 SOURCE EXISTS ONLY AT THE `u8` DOMAIN, and it rides the i64 path rather than a
+  // fourth scratch slot: `i64.extend_i32_s` is exact for every i32, the range test is the
+  // same two compares, and `i32.wrap_i64` brings the proven 0..255 value back unchanged.
+  let src = asExprNumSrcName(exprIx)
+  if src == "i32" { src = "i64" }
   // Stage the operand ONCE — the test reads it up to three times and it is typically a call.
   if src == "i64" {
     if emitNumIntrArg(body, e.asObj, 3, fnIx) < 0 { return -1 }
@@ -14800,7 +14884,7 @@ function emitNumExactCast(body: i32[], e: AsExpr, exprIx: i32, fnIx: i32) {
     if emitNumIntrArg(body, e.asObj, 4, fnIx) < 0 { return -1 }
     fbLocalSet(numCastF64Slot)
   }
-  if emitNumExactTest(src, tgt) < 0 { return -1 }
+  if emitNumExactTest(src, dom) < 0 { return -1 }
   if e.asMode == "null" {
     const nck = valueAtomKind(tgt)
     const nvb = vbHeapIdxOfKind(nck)
@@ -14832,7 +14916,8 @@ function emitNumExactCast(body: i32[], e: AsExpr, exprIx: i32, fnIx: i32) {
   fbIf(64) // if (void) — the SAD path, the only place the two remaining modes differ
   ctrlEnter()
   if e.asMode == "trap" {
-    if emitNumCastTrapMsg(exprIx, tgt) < 0 { return -1 }
+    // The DOMAIN is what the author wrote, so `x as! u8` says `as! u8`, not `as! i32`.
+    if emitNumCastTrapMsg(exprIx, dom) < 0 { return -1 }
     fbUnreachable()
   } else {
     // A bare `as` PROPAGATES. The checker proved the enclosing function returns something
@@ -14904,9 +14989,13 @@ function emitAsCast(body: i32[], e: AsExpr, _exprIx: i32, fnIx: i32) {
     // that. So the spelled lossy truncation costs the one instruction it always cost, with no
     // test in front of it. `as?` and a bare `as` do NOT take this door: they owe a `null` on
     // an out-of-range value, which a trap cannot produce.
-    if !(e.asMode == "trap" && exprIsIntegralFloat(obj, fnIx)) {
-      return emitNumExactCast(body, e, _exprIx, fnIx)
-    }
+    // NOR DOES `u8` (D1587). The peephole rests on the conversion instruction enforcing the
+    // range on its own, and `i32.trunc_f64_s` enforces i32's range, not 0..255 — so
+    // `trunc(d) as! u8` over 300.0 would answer 300 with no trap in sight.
+    const peep = e.asMode == "trap" &&
+      asExprNumCastDomain(_exprIx) != "u8" &&
+      exprIsIntegralFloat(obj, fnIx)
+    if !peep { return emitNumExactCast(body, e, _exprIx, fnIx) }
   }
   if asExprIsUnionCastIn(_exprIx, fnIx) {
     // The target arm's TYPE is the cast node's own recorded type — the checker set it to
@@ -15699,6 +15788,18 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
       if !userOwnsName && callee.identName == "print" {
         if c.callArgs.length != 1 {
           return emitFail("emitProgram: print takes exactly one argument")
+        }
+        // D1576 — `print(<the `null` type>)` prints the word `null`, like the two nullable
+        // NICHE prints below and unlike everything after them: the value is STATICALLY null,
+        // so there is no arm to select and nothing the ladder below can classify. Without
+        // this a `nulnone` argument fell through to `__print_i32__` — `type mismatch:
+        // expected i32, found nullref` for a `nulnone`-returning call (D1567's shape), and a
+        // printed `0` for the never-filled `let x = null` this row reps. FIRST in the ladder:
+        // every classifier under it reads a rep this value does not have. The argument is
+        // still evaluated and dropped, so a call's side effects happen.
+        if exprIsNulNone(c.callArgs[0], fnIx) {
+          if emitNulNoneForEffect(body, c.callArgs[0], fnIx) < 0 { return -1 }
+          return emitPrintNullWord()
         }
         // print(literal-union ATOM): WIDEN it to its member STRING — a per-member `if id == <id> { print
         // "<name>" }` chain (exactly one matches, so at most one prints). The atom→string widening in
@@ -16595,6 +16696,11 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
           ) {
             // A literal-union atom assigned to a `string` global widens to its member string.
             if emitAtomToStr(body, a.binRight, fnIx) < 0 { return -1 }
+          } else if gaKind == "nulnone" {
+            // D1576 — the module-GLOBAL twin of the local arm's `nulnone` store: a
+            // `null`-typed cell takes `ref.null none` and nothing else.
+            if emitNulNoneForEffect(body, a.binRight, fnIx) < 0 { return -1 }
+            fbRefNullNone()
           } else {
             // A NICHE `X | null` global seeds its null rep for a bare `null` RHS (the table
             // at `emitNullLitNode`); a non-null RHS ignores the seed.
@@ -16748,6 +16854,15 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
       } else if exprString(lhsIx, fnIx) && exprIsLitAtom(a.binRight, fnIx) {
         // A literal-union atom assigned to a `string` local widens to its member string.
         if emitAtomToStr(body, a.binRight, fnIx) < 0 { return -1 }
+      } else if identCellVKind(lhsIx, fnIx) == "nulnone" {
+        // D1576 — THE ONLY VALUE A `null`-TYPED CELL CAN TAKE IS `null`, so this store needs
+        // no rep decision from either side: `ref.null none`, with a CALL right-hand side
+        // still evaluated for its effects. The seeds in the arm below all answer "WHICH
+        // nullable rep", a question this cell has already answered — so `x = null` over a
+        // never-filled `let x = null` reached them with nothing armed and took the bare-null
+        // reject on a `vl check`-clean program.
+        if emitNulNoneForEffect(body, a.binRight, fnIx) < 0 { return -1 }
+        fbRefNullNone()
       } else {
         // A NICHE `X | null` local seeds its null rep for a bare `null` RHS, as the global
         // arm above does. A non-null RHS ignores the seed (a boolean is a `BoolLit`, a
@@ -20373,21 +20488,18 @@ function emitLetDeclStmt(body: i32[], s: LetDecl, stmtIx: i32, fnIx: i32) {
       }
     }
   }
-  // A degenerate UN-ANNOTATED `let x = null` (A-infer-null): when NO later
-  // assignment fills the hole (`nliNameOf` recorded nothing), the binding's
-  // type is the plain `null` type — it is never read as a non-null value, so
-  // its i32 cell just zero-inits. A FILLED hole (`x = 5` later) is a `T|null`
-  // value-union binding (kind 4) and takes the union-coerce path below.
-  if s.letType < 0 {
-    const bareN = P.nodes[unwrapParen(s.letInit)]
-    if bareN is NullLit {
-      if nliNameOf(stmtIx) == "" {
-        fbI32Const(0)
-        fbLocalSet(idx) // 0x21 local.set
-        scopeBind(s.letName, slot)
-        return 0
-      }
-    }
+  // A degenerate UN-ANNOTATED `let x = null` (A-infer-null): when NO later assignment fills
+  // the hole, the binding's type is the plain `null` type. D1576 — ITS VALUE IS `ref.null
+  // none`, not a zero i32. The i32 cell this used to seed was a rep the value does not have:
+  // every delivery of it to a nullable REF destination was check-clean invalid wasm
+  // (`expected (ref null $type), found i32`) and every delivery to an i32-repped one read the
+  // 0 as a present value. A FILLED hole (`x = 5` later) is a `T|null` value-union binding
+  // (kind 4) and takes the union-coerce path below.
+  if letIsNulNone(stmtIx, fnIx) {
+    fbRefNullNone()
+    fbLocalSet(idx) // 0x21 local.set
+    scopeBind(s.letName, slot)
+    return 0
   }
   // Asked BEFORE the init ladder below: an init carrying its own `if` pushes and pops the
   // narrowing stack, and this boundary's question is about the value it receives. Consumed
@@ -22679,6 +22791,17 @@ function emitCharLitNode(_body: i32[], e: CharLit, _exprIx: i32, _fnIx: i32) {
 // threaded in and UNUSED (`_exprIx`) — so the id is one array read and the other
 // six lookups become array reads too.
 function emitIdentNode(body: i32[], e: Ident, exprIx: i32, fnIx: i32) {
+  // D1576 — A READ OF A NEVER-FILLED `let x = null` IS THE VALUE `null`, so it takes the
+  // DESTINATION'S null rep from the same table a bare `null` literal does rather than
+  // pushing its own `nullref` cell. That is the whole position matrix in one arm: the
+  // boundary that seeded the table did not care whether the value it is about to receive
+  // is a literal or a binding, so every position the literal already reaches — the two
+  // i32 niches, the string / closure / list / variant / struct nulls — is reached here
+  // too. With no seed the read is `ref.null none` (the `nulNoneOk` last resort), which is
+  // the GC bottom and a subtype of every nullable ref cell.
+  if identCellVKind(exprIx, fnIx) == "nulnone" {
+    return emitNullBySeed(fnIx, true)
+  }
   const isid = sidOfNode(exprIx)
   // A MODULE-`const` PARAMETER DEFAULT READS ITS GLOBAL, NOT A CALLER-LOCAL OF
   // THE SAME NAME. This node is the DECLARATION's expression, substituted into
@@ -23119,6 +23242,17 @@ function emitCallNode(body: i32[], e: Call, exprIx: i32, fnIx: i32) {
 //   pendingStructIdx    `S | null`         → `ref.null $S`
 // ORDER is load-bearing: the four NICHE arms come first, or the struct seed would claim them.
 function emitNullLitNode(_body: i32[], _e: NullLit, _exprIx: i32, fnIx: i32) {
+  emitNullBySeed(fnIx, false)
+}
+
+// The table above, asked of a value rather than of a literal. `nulNoneOk` is set by the ONE
+// caller that holds a value whose TYPE is `null` — a read of a never-filled `let x = null`
+// (D1576) — and only changes the LAST RESORT: with no seed at all such a read is
+// `ref.null none`, while a bare literal the position failed to seed must stay the loud
+// reject. `pendingNulNone` is the same answer reached the other way, from a boundary whose
+// CELL is `nulnone`. Everything above it is one table, so the binding and the literal
+// cannot drift.
+function emitNullBySeed(fnIx: i32, nulNoneOk: boolean) {
   if pendingNulBool {
     fbI32Const(2)
     return 0
@@ -23218,6 +23352,10 @@ function emitNullLitNode(_body: i32[], _e: NullLit, _exprIx: i32, fnIx: i32) {
       }
     }
   }
+  if nulNoneOk || pendingNulNone {
+    fbRefNullNone()
+    return 0
+  }
   return emitFail("emitProgram: bare null needs a struct-typed context")
 }
 
@@ -23288,6 +23426,40 @@ function emitMemberNode(body: i32[], e: Member, exprIx: i32, fnIx: i32) {
     }
   }
   return emitMem(body, exprIx, fnIx)
+}
+
+// The `%` LOWERING over two float operands: both operands at f64, then a call into the
+// shared `__f64_rem__` helper (D1586). `atF32` is the f32 slice's face — operands are
+// emitted AT f32 first so a literal re-encodes at f32 (`x % 0.1` must use f32's `0.1`, not
+// f64's), promoted, and the exact result demoted back.
+//
+// THE RESERVATION IS THE ONE THING THAT CAN GO WRONG: `scanPrintUse` decides whether the
+// helper exists, and a `%` it did not classify as float would be a `call` to index -1 —
+// check-clean invalid wasm. So an unreserved helper fails LOUDLY here instead.
+function emitF64RemCall(
+  body: i32[],
+  lIx: i32,
+  rIx: i32,
+  fnIx: i32,
+  atF32: boolean,
+) {
+  if gHelpF64Rem < 0 {
+    return emitFail(
+      "emitProgram: a float '%' reached the emitter with no __f64_rem__ helper reserved",
+    )
+  }
+  if atF32 {
+    if emitExprAsF32(body, lIx, fnIx) < 0 { return -1 }
+    fbF64PromoteF32()
+    if emitExprAsF32(body, rIx, fnIx) < 0 { return -1 }
+    fbF64PromoteF32()
+  } else {
+    if emitExprAsF64(body, lIx, fnIx) < 0 { return -1 }
+    if emitExprAsF64(body, rIx, fnIx) < 0 { return -1 }
+  }
+  fbCall(gHelpF64Rem)
+  if atF32 { fbF32DemoteF64() }
+  0
 }
 
 function emitBinExprNode(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
@@ -23465,6 +23637,21 @@ function emitBinExprNode(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // checker's acceptance reads. This has to come BEFORE the string / list / struct / closure
   // compares below, because every one of them classifies its operands by their NON-NULL rep and
   // would lower the niche as though the null could not be there.
+
+  // D1576 — `x == null` WHERE `x` IS THE `null` TYPE IS STATICALLY TRUE (and `!=` false).
+  // Both operands are the one value `null`, so there is no compare core to run: the niche
+  // dispatch below reads each operand at a nullable rep, and the bare `null` beside a
+  // `nulnone` value has no seed at all — the loud reject this arm replaces, and D1567's
+  // residue (a) and (b). `nulNoneEqSides` scopes it; the non-literal side is evaluated and
+  // dropped so a call's side effects still happen.
+  if e.binOp == "==" || e.binOp == "!=" {
+    if nulNoneEqSides(e.binLeft, e.binRight, fnIx) {
+      if emitNulNoneForEffect(body, e.binLeft, fnIx) < 0 { return -1 }
+      if emitNulNoneForEffect(body, e.binRight, fnIx) < 0 { return -1 }
+      if e.binOp == "==" { fbI32Const(1) } else { fbI32Const(0) }
+      return 0
+    }
+  }
   if e.binOp == "==" || e.binOp == "!=" {
     if binEqHasNoLowering(exprIx) {
       return emitFail(
@@ -23653,6 +23840,16 @@ function emitBinExprNode(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // so route to the f64 slice below instead of demoting the f64 here (which trapped). A float
   // literal still adapts DOWN to the f32 operand, so `f32 + 1.0` stays on the f32 slice.
   if (lF32 || rF32) && !binMixHardF64(e.binLeft, e.binRight, fnIx) {
+    // FLOAT REMAINDER at f32 rides the f64 helper (D1586): an f32 operand is exact in f64,
+    // the remainder of two f32-representable values is itself f32-representable, and every
+    // step of the helper is exact — so promote / call / demote loses nothing. A second
+    // helper would be the same algorithm at a narrower width for no gain.
+    if e.binOp == "%" {
+      if emitF64RemCall(body, e.binLeft, e.binRight, fnIx, true) < 0 {
+        return -1
+      }
+      return 0
+    }
     const opcF32 = binOpcodeF32(e.binOp)
     // NO f32 FORM ⇒ FAIL, never fall through. The ops with no float form (`%`, bitwise,
     // shift) are integer-only in the checker, so this is unreachable from accepted source;
@@ -23672,6 +23869,14 @@ function emitBinExprNode(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
   const lF64 = exprIsF64(e.binLeft, fnIx)
   const rF64 = exprIsF64(e.binRight, fnIx)
   if lF64 || rF64 {
+    // FLOAT REMAINDER — the one f64 operator with no instruction, so it calls the shared
+    // `__f64_rem__` helper instead of taking an opcode from the table below (D1586).
+    if e.binOp == "%" {
+      if emitF64RemCall(body, e.binLeft, e.binRight, fnIx, false) < 0 {
+        return -1
+      }
+      return 0
+    }
     const opcF = binOpcodeF64(e.binOp)
     // NO f64 FORM ⇒ FAIL, never fall through — the f32 slice's reasoning, one width up.
     if opcF < 0 {
@@ -24644,6 +24849,15 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
         fnIx,
       )
     }
+  }
+  // D1576 — THE `null` TYPE ON THE LEFT MAKES THE OPERAND DEAD, the mirror of the narrowing
+  // rule below. A never-filled `let x = null` binding (and a `nulnone`-returning call, D1567)
+  // is STATICALLY null, so `x ?? d` IS `d`: there is no niche to test, and every arm below
+  // would read the operand at a nullable rep this value does not have. The operand is still
+  // EVALUATED and dropped — an Ident read has no effects, a call's do happen.
+  if exprIsNulNone(lhsIx, fnIx) {
+    if emitNulNoneForEffect(body, lhsIx, fnIx) < 0 { return -1 }
+    return emitExpr(body, e.binRight, fnIx)
   }
   // A NARROWING THAT EXCLUDES NULL MAKES THE DEFAULT DEAD: `x ?? d` IS `x` there, and the
   // read is the only lowering whose rep can be right. Every niche arm below evaluates its LHS
