@@ -1,8 +1,7 @@
 import { cpCount, pushCps } from "./strutil"
 
-// Pure formatting helpers extracted from `compiler/format.vl` (kill-TS step 1
-// split). These reference no format.vl module-state globals — only the parser
-// arena (`P`) / AST node variants, each other, and one deterministic memo
+// Pure formatting helpers: they reference no `format.vl` module state — only the
+// parser arena (`P`) and AST node variants, each other, and one deterministic memo
 // (`indentCache`) — so they live in a leaf module that `format.vl` imports back.
 
 import {
@@ -46,12 +45,10 @@ import {
   WhileStmt,
 } from "./ast"
 
-// Two-space indent strings, memoized per depth. `emitLine` asks for one per
-// emitted line, and the rebuild-every-call `s = s + "  "` loop allocated
-// O(depth) intermediate strings each time — under wasmtime every intermediate
-// is an `array.new` + `array.copy` libcall pair, so the memo removes a
-// per-line native allocation hotspot. The cache is deterministic (depth `n`
-// always maps to `2n` spaces), so persisting it across formats is invisible.
+// Two-space indent strings, memoized per depth. `emitLine` asks for one per emitted
+// line, and rebuilding with `s = s + "  "` allocates O(depth) intermediate strings —
+// each an `array.new` plus `array.copy` under wasmtime. Depth `n` always maps to `2n`
+// spaces, so persisting the cache across formats is invisible.
 const indentCache: string[] = []
 export function indentStr(n: i32) {
   if n <= 0 { return "" }
@@ -65,12 +62,10 @@ export function indentStr(n: i32) {
   indentCache[n]
 }
 
-// The START char offset (`pos`) of arena node `ix` — narrows to read the common
-// `pos` field (VL has no cross-variant field read). `-1` only for an
-// out-of-range or synthesized node. The chain is EXHAUSTIVE over `Node` with an
-// annotated return, so adding an AST variant without listing it here is a
-// checker error (a non-exhaustive `is`-chain), not a silent `-1` that degrades
-// the formatter's verbatim slices.
+// The start char offset (`pos`) of arena node `ix`; -1 only for an out-of-range or
+// synthesized node. It narrows per variant because VL has no cross-variant field read,
+// and the chain is exhaustive over `Node` with an annotated return, so a new AST
+// variant is a checker error here rather than a silent -1 the formatter slices on.
 export function nodePos(ix: i32): i32 {
   if ix < 0 || ix >= P.nodes.length { return -1 }
   const n = P.nodes[ix]
@@ -128,7 +123,7 @@ export function trimWs(s: string) {
   r
 }
 
-// Trim only LEADING whitespace.
+// Trim only leading whitespace.
 export function trimWsStart(s: string) {
   let a = 0
   while a < s.length && isWs(s[a]) { a = a + 1 }
@@ -156,17 +151,15 @@ export function rstrip(s: string) {
   r
 }
 
-// Collapse every run of ASCII whitespace to a single space and trim — the port of
-// the host's `.trim().replace(/\s+/g, " ")` type-slice normalization. Collects
-// code points into a buffer and materializes ONCE: the per-char `out = out + c`
-// accumulator it replaces was O(n²) allocation under the non-freeing GC (the
-// same cost class `joinLinesRange` documents).
+// Collapse every run of ASCII whitespace to a single space and trim — the type-slice
+// normalization the host spells as a regex. It collects code points into a buffer and
+// materializes once; a per-char `out = out + c` accumulator is O(n²) allocation under
+// the non-freeing GC, the cost class `joinLinesRange` explains.
 export function collapseWs(s: string) {
   const out: i32[] = []
   let inWs = false
-  // ITERATES. The buffer is a CODE-POINT buffer (`fromCodePoints` below); `s[i]` is a byte
-  // since Stage 2c, and this function runs over doc comments, which is exactly where the
-  // compiler's 105 non-ASCII characters live.
+  // `for c in s` yields code points, and the buffer is a code-point buffer
+  // (`fromCodePoints` below); indexing `s[i]` would push bytes into it instead.
   for c in s {
     if isWs(c) {
       inWs = true
@@ -212,25 +205,15 @@ export function spaces(n: i32) {
   fromCodePoints(buf)
 }
 
-// Concatenate `parts[lo..hi)` with a `\n` between every adjacent pair by sizing
-// ONE code-point buffer exactly and materializing it once — O(n) total
-// allocation and copying. The history here matters: a running `s = s + parts[i]`
-// accumulator was O(n²) and blew the compiler's NON-FREEING null-GC heap on a
-// large file (the 6940-line typecheck.vl: "allocation size too large" or
-// minutes of runtime); the divide-and-conquer concat that replaced it was
-// O(n log n) intermediate strings — fine under V8, but still the dominant
-// native cost, because under wasmtime every intermediate string is an
-// `array.new` plus per-element-cost `array.copy` libcalls. The single
-// preallocated buffer leaves one `fromCodePoints` conversion as the only
-// string allocation.
+// Concatenate `parts[lo..hi)` with a `\n` between adjacent pairs by sizing one
+// code-point buffer and materializing it once — O(n) allocation and copying. A running
+// `s = s + parts[i]` accumulator is O(n²) and exhausts the non-freeing heap on a large
+// file; even a divide-and-conquer concat leaves O(n log n) `array.new`/`array.copy`.
 export function joinLinesRange(parts: string[], lo: i32, hi: i32) {
   if hi - lo <= 0 { return "" }
   if hi - lo == 1 { return parts[lo] }
-  // STAGE 2c: a GROWING code-point buffer, not an exact-fit `__array_new__(Σ .length)`.
-  // The pre-size was in BYTES while the elements are CODE POINTS, so the two disagree on
-  // any non-ASCII input — and the indexed copy `buf[k] = p[j]` was pushing bytes into that
-  // code-point buffer besides. `.push`'s 2x growth bounds the copying at 2N, which is the
-  // same trade `srcLoad` makes for the same reason (VL has no capacity primitive).
+  // A growing code-point buffer, not an exact-fit `__array_new__`: a byte pre-size and
+  // code-point elements disagree on non-ASCII input; `.push`'s 2x growth bounds copying.
   const buf: i32[] = []
   let i = lo
   while i < hi {
@@ -262,19 +245,17 @@ export function isOwnLineComment(line: string) {
   i + 1 < line.length && line[i] == '/' && line[i + 1] == '/'
 }
 
-// First non-space char is `}` — a closing-brace line (e.g. the close of a wrapped
-// struct/union decl). It carries its own trailing-comment spacing and must NOT join
-// a trailing-comment ALIGNMENT run, else a short `}` line gets its comment dragged
-// out to the column of the wide sibling declarations around it.
+// First non-space char is `}` — a closing-brace line. It carries its own
+// trailing-comment spacing and must not join a trailing-comment alignment run, else a
+// short `}` line gets its comment dragged out to the column of the wide siblings.
 export function isCloseBraceLine(line: string) {
   let i = 0
   while i < line.length && (line[i] == ' ' || line[i] == '\t') { i = i + 1 }
   i < line.length && line[i] == '}'
 }
 
-// The char offset where a line's trailing comment begins, or -1 if it has none.
-// A `//` inside a string/char literal does not count; an own-line comment does
-// not count (it's not TRAILING any code).
+// The char offset where a line's trailing comment begins, or -1 if it has none. A `//`
+// inside a string or char literal does not count, and neither does an own-line comment.
 export function trailingCommentAt(line: string) {
   if isOwnLineComment(line) { return -1 }
   let i = 0
@@ -304,50 +285,39 @@ export function trailingCommentAt(line: string) {
   -1
 }
 
-// ── the formatter's WIDTH unit ────────────────────────────────────────────────
-//
-// The DISPLAY WIDTH of `s` in columns — the ONLY unit the formatter measures a line in:
-// everything compared against `fmtWidth`, and every `column` added to something that will be.
-// It is NOT `s.length`, which since Stage 2c is a BYTE count answering a different question:
-// an OFFSET, handed back to `slice`/`[i]`. Offsets cancel — whatever unit produced one is the
-// unit that consumes it — widths do not, so a width must say which unit it means, and
-// `.length` read as a width wraps any line holding a non-ASCII character far too early. That
-// is §R1 of `docs/internals/str-byte-semantics.md` applied to the formatter, where it was
-// missed. Code points are still not TRUE display width (CJK takes two terminal columns,
-// combining marks zero, emoji vary) — §Width in the same doc, deliberately not solved here.
-// `cpCount`, not `s.cpLen()`: the bootstrap rung's PREVIOUS compiler cannot lower it.
+// ── the formatter's width unit ───────────────────────────────────────────────
+// The display width of `s` in columns — the only unit compared against `fmtWidth`.
+// Not `s.length`, a byte count and so an offset for `slice`: read as a width it wraps
+// any line with a non-ASCII character far too early (`str-byte-semantics.md` §R1/§Width).
 export function dispWidth(s: string) { cpCount(s) }
 
-// The code width of a line up to offset `c`, with trailing spaces/tabs removed.
-//
-// A BYTE OFFSET — it is what `line.slice(0, …)` consumes. For the COLUMN the same code ends
-// at, see `codeColumnBefore` below; a caller that both slices and aligns needs both.
+// The code width of a line up to offset `c`, with trailing spaces and tabs removed.
+// A byte offset — what `line.slice(0, …)` consumes. For the column the same code ends
+// at, see `codeColumnBefore`; a caller that both slices and aligns needs both.
 export function codeWidthBefore(line: string, c: i32) {
   let w = c
   while w > 0 && (line[w - 1] == ' ' || line[w - 1] == '\t') { w = w - 1 }
   w
 }
 
-// The COLUMN a line's code ends at, before its trailing comment at byte offset `c`.
-//
-// The WIDTH twin of `codeWidthBefore`. Before Stage 2c one number served both questions; it
-// no longer does, so the two get two names. This is the one compared against `fmtWidth` and
-// used as the alignment target — measuring it in bytes pushes a trailing comment one column
-// right per non-ASCII byte on the line, and drags the whole run's column with it.
+// The column a line's code ends at, before its trailing comment at byte offset `c` —
+// the width twin of `codeWidthBefore`, and the one compared against `fmtWidth` and used
+// as the alignment target. Measuring it in bytes pushes a trailing comment one column
+// right per non-ASCII byte on the line, dragging the whole run's column with it.
 export function codeColumnBefore(line: string, c: i32) {
   dispWidth(line.slice(0, codeWidthBefore(line, c)))
 }
 
-// The count of leading spaces on a line (its indentation depth in columns).
-// Offset and column coincide here and always will: the counted bytes are literal `' '`,
-// so the byte count IS the code-point count. No `dispWidth` conversion is possible or needed.
+// The count of leading spaces on a line (its indentation depth in columns). Offset and
+// column coincide here and always will: the counted bytes are literal `' '`, so the byte
+// count is the code-point count and no `dispWidth` conversion is possible or needed.
 export function leadingSpaces(line: string) {
   let i = 0
   while i < line.length && line[i] == ' ' { i = i + 1 }
   i
 }
 
-// Strip ALL trailing ASCII whitespace (spaces, tabs, CR, and newlines).
+// Strip all trailing ASCII whitespace (spaces, tabs, CR, and newlines).
 export function rstripWsAll(s: string) {
   let b = s.length
   while b > 0 && isWs(s[b - 1]) { b = b - 1 }
@@ -365,9 +335,8 @@ export function rstripNl(s: string) {
 // lines to one, strip leading blank lines, ensure a single trailing newline.
 export function normalizeProgram(text: string) {
   const lines = splitLines(text)
-  // Collect the kept lines, then join ONCE — a running `out = out + line`
-  // accumulator here is O(n²) (and on a large file blew the non-freeing heap, the
-  // last fmt scalability hotspot alongside joinOut/lineOf/exportPrefix).
+  // Collect the kept lines and join once — a running `out = out + line` accumulator
+  // here is O(n²) and exhausts the non-freeing heap on a large file.
   const out: string[] = []
   let blanks = 0
   let started = false
@@ -406,10 +375,9 @@ export function isBlockNode(ix: i32) {
   false
 }
 
-// Index of the token whose `start` is exactly `pos`, or -1. Tokens are in source
-// order (ascending, distinct `start`), so binary-search it. The linear scans this
-// replaces were O(tokens) per call and run per declaration/field → O(n²) on a
-// large file.
+// Index of the token whose `start` is exactly `pos`, or -1. Tokens are in source order
+// with distinct ascending `start`, so this binary-searches; a linear scan is O(tokens)
+// per call and runs per declaration and field, which is O(n²) on a large file.
 export function tokIndexAt(pos: i32) {
   let lo = 0
   let hi = P.toks.length - 1
@@ -423,7 +391,7 @@ export function tokIndexAt(pos: i32) {
 }
 
 // `export`-modifier recovery: the parser drops `export`, so look at the token
-// immediately before the declaration's start token for an EXPORT keyword.
+// immediately before the declaration's start token for an `EXPORT` keyword.
 export function exportPrefix(ix: i32) {
   const p = nodePos(ix)
   if p < 0 { return "" }
@@ -453,7 +421,7 @@ export function isLeafStmt(ix: i32) {
   true
 }
 
-// Binary operator precedence (mirrors the parser / host PRECEDENCE table).
+// Binary operator precedence (mirrors the parser / host precedence table).
 export function binPrecOf(op: string) {
   if op == "||" { return 4 }
   if op == "&&" { return 6 }
@@ -477,7 +445,7 @@ export function binPrecOf(op: string) {
   0
 }
 
-// Parenthesize a chain operand when its own operator binds LOOSER than the chain.
+// Parenthesize a chain operand when its own operator binds looser than the chain.
 export function parenForChain(ix: i32, rendered: string, parentPrec: i32) {
   const n = P.nodes[ix]
   if n is BinExpr {
@@ -487,17 +455,10 @@ export function parenForChain(ix: i32, rendered: string, parentPrec: i32) {
   rendered
 }
 
-// ── conditional heads (`if` / `else if` / `while`) ────────────────────────────
-// A condition that fits prints inline (`if cond {`); one that would overflow the
-// line wraps in PARENTHESES, with one operand per line, so the `)` row cleanly
-// separates the condition from the body (the body and a hanging continuation
-// would otherwise share an indent):
-//   if (
-//     cond1 &&
-//     cond2
-//   ) {
-// fmt ADDS the parens, so on a re-format the condition is a `Paren` node; we peel
-// one layer before re-wrapping to keep the output idempotent.
+// ── conditional heads (`if` / `else if` / `while`) ───────────────────────────
+// A condition that would overflow wraps in parentheses, one operand per line, so the
+// `)` row separates it from the body. fmt adds those parens, so on a re-format the
+// condition is a `Paren` node: peel one layer before re-wrapping, or output drifts.
 export function unwrapOuterParen(ix: i32) {
   if ix < 0 || ix >= P.nodes.length { return ix }
   const n = P.nodes[ix]
@@ -517,7 +478,7 @@ export function calleePrimary(ix: i32, rendered: string) {
   rendered
 }
 
-// Whether a synthesized one-statement branch holds a SIMPLE expression.
+// Whether a synthesized one-statement branch holds a simple expression.
 export function branchIsSimple(blockIx: i32) {
   const n = P.nodes[blockIx]
   if n is Block {

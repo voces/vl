@@ -1,64 +1,42 @@
-// `check_state.vl` — the type-checker's LSP-query STATE: symbol-occurrence tables
-// (`symOcc*`), redundant-type findings (`redun*`), inlay buffers. Declarations-only
-// LEAF; the checker WRITES these, `check_query` READS them. Carved out of typecheck.
+// `check_state.vl` — the type-checker's LSP-query state: symbol-occurrence
+// tables (`symOcc*`), redundant-annotation and dead-`??` findings, inlay hints,
+// member and UFCS completion buffers, signature-help columns. A declarations-only
+// leaf — the checker writes these, `check_query.vl` reads them.
 
 // ── LSP symbol table (occurrences + binding types) ───────────────────────────
-// Off by default (`symEnabled == 0`), so every existing consumer records nothing
-// and checking is unperturbed. The driver's symbol-query path sets it to 1 before
-// `checkProgram`. READ ONLY by the driver query exports — the emitter re-derives
-// its own information and never consults them, so filling them cannot change
-// `emitProgram`'s output. A flat OCCURRENCE list over a binding set: a BINDING is
-// its DECLARING NODE INDEX, stable and unique because no two source declarations
-// share a node; an OCCURRENCE is one identifier appearance, in parallel arrays for
-// token index, resolved binding, declaration-or-use, and the flow-narrowed type in
-// force (-1 when none). `symDeclScope` pushes and pops in lockstep with `T.scopes`,
-// so a use resolves to the SAME binding the checker did, shadowing included, and
-// `symBindNode`/`symBindType` retain the arena index past scope-close, for hover.
+
+// Off by default (`symEnabled == 0`), and read only by the driver's query exports,
+// so filling these cannot change `emitProgram`'s output. A binding is its declaring
+// node index; an occurrence is one identifier appearance. `symDeclScope` pushes and
+// pops in lockstep with `T.scopes`, so a use resolves to the binding the checker did.
 export let symEnabled = 0
 export let symOccTok: i32[] = []
 export let symOccDecl: i32[] = []
 export let symOccIsDecl: i32[] = []
-// Parallel to `symOccTok`: the FLOW-NARROWED type-arena index in force AT THIS
-// OCCURRENCE, or -1 for "no narrowing — the binding's retained type is the answer".
-//
-// WHY PER-OCCURRENCE AND NOT A SECOND PER-BINDING COLUMN: `symBindType` keeps ONE type
-// per binding and the last write wins, but narrowing is FLOW-SENSITIVE — inside `if result
-// is string { … }` the same binding is a `string`, and one slot cannot hold that and the
-// declared `string | IoError` too. A position query asks AT an occurrence, so store there.
-//
-// The value is the CHECKER'S OWN, never re-derived: the `Ident` arm's `lookup` already
-// resolved through the narrowing SHADOW `applyNarrows` declared, and hands that same index
-// to `symUse`. Filled only under a live shadow (`narDeclaredTy`); an ordinary use, and a
-// declaration occurrence (which IS the binding), stores -1.
+// Parallel to `symOccTok`: the flow-narrowed type-arena index in force at this
+// occurrence, or -1 when the binding's retained type is the answer. Per-occurrence
+// because narrowing is flow-sensitive while `symBindType` holds one type per binding.
+// Filled only under a live narrowing shadow; an ordinary use and a declaration store -1.
 export let symOccTy: i32[] = []
 export let symBindNode: i32[] = []
 export let symBindType: i32[] = []
-// Parallel to `symBindNode`: each binding's KIND, for semantic-token coloring
-// (the LSP classifies an identifier by what it binds to, which a lexer can't).
-// 0 = variable (let/const/loop var), 1 = parameter, 2 = function. Types and
-// properties aren't recorded as bindings here, so they never appear (the host
-// leaves those identifiers to its lexical pass). Looked up by occurrence via
-// `symBindKindOf` and exported as `tokBindKindAt`.
+// Parallel to `symBindNode`: each binding's kind, for semantic-token coloring —
+// 0 = variable, 1 = parameter, 2 = function. Types and properties are not recorded
+// as bindings, so they never appear here. Read by occurrence via `symBindKindOf`.
 export let symBindKind: i32[] = []
-// Member-access node types for hover (`o.x` / `o?.y`) — the property-name span
-// (1-based line, 0-based [col, endCol)) and the resolved member type-arena index,
-// keyed by the member node. Recorded in the Member/OptMember check arms when
-// `symEnabled`; queried by position via `symMemTypeStrAt`. The member node's
-// `nodeToks` entry IS the property token (the parser creates the node right after
-// consuming the prop IDENT), so its span pins the `.member` half, not the receiver.
+// Member-access node types for hover (`o.x` / `o?.y`): the property-name span
+// (1-based line, 0-based `[col, endCol)`) and the resolved member type, keyed by the
+// member node. That node's `nodeToks` entry is the property token, so the span pins
+// the `.member` half rather than the receiver.
 export let symMemNode: i32[] = []
 export let symMemTy: i32[] = []
 export let symMemLine: i32[] = []
 export let symMemCol: i32[] = []
 export let symMemEndCol: i32[] = []
-// Scope-at-position (completion). Each binding recorded by `symDecl` while
-// `symEnabled` also stamps its VISIBILITY scope — the [start, stop] source span
-// (1-based line, 0-based col) of the lexical scope it is visible in — keyed
-// positionally. `symVisNode` is the decl node (for the type lookup at query
-// time); `symVisKind` is 0=variable 1=parameter 2=function. Queried by
-// `symScopeAt`, which keeps the tightest-scoped binding per name (lexical
-// shadowing). Builtins/imports/types are NOT recorded here (the host folds those
-// in); this is the user-binding half — the native `bindingsInScopeAt`.
+// Scope-at-position (completion): every binding `symDecl` records also stamps the
+// `[start, stop]` source span of the lexical scope it is visible in. `symVisKind` is
+// 0 = variable, 1 = parameter, 2 = function. `symScopeAt` keeps the tightest-scoped
+// binding per name; builtins, imports and types are the host's half, not recorded.
 export let symVisName: string[] = []
 export let symVisNode: i32[] = []
 export let symVisKind: i32[] = []
@@ -66,48 +44,36 @@ export let symVisSL: i32[] = []
 export let symVisSC: i32[] = []
 export let symVisEL: i32[] = []
 export let symVisEC: i32[] = []
-// The last `symScopeAt` result — parallel per-binding arrays the driver reads by
-// index (name/kind/type are independent lookups, so name and type reads for one
-// index never clobber each other). Type strings are rendered once here.
-// `scopeResRaw` keeps the UNdemangled merge name and `scopeResTok` the decl-name
-// token: the driver's `scopeAt` uses them to drop dep-module bindings that only
-// leak in through the merged program's colliding per-module coordinates (a dep's
-// top-level span contains most entry positions), keeping entry bindings plus the
-// entry's actual imports.
+// The last `symScopeAt` result, as parallel per-binding arrays the driver reads by
+// index, so a name read and a type read for one index never clobber each other.
+// `scopeResRaw` keeps the undemangled merge name and `scopeResTok` the decl-name
+// token, which is how the driver drops a dep module's bindings from a merged program.
 export let scopeResName: string[] = []
 export let scopeResKind: i32[] = []
 export let scopeResType: string[] = []
 export let scopeResRaw: string[] = []
 export let scopeResTok: i32[] = []
 // ── Inlay hints (LSP): the inferred type at an UNANNOTATED declaration ─────────
-// The native counterpart of the host's `deriveInlayHints`. `symInlayScan` walks
-// the declaration occurrences and records, per binding with a concrete retained
-// type, a hint: KIND 0 = a value binding (`let`/`const`/parameter) → its type,
-// anchored at the NAME end; KIND 1 = a function → its RETURN type, anchored at the
-// name end (the host walks forward to the `)` and places the hint there). The
-// host applies the source-scan filters it already owns — skip an annotation the
-// user wrote, honor the request range — so only the typing moves to the checker.
-// A type that's still an inference hole (a type variable / error placeholder) is
-// skipped (matching the host's `isHole`).
+
+// The inferred type at an unannotated declaration. Kind 0 is a value binding — its
+// type, anchored at the name end; kind 1 is a function — its return type. The host
+// keeps the source-scan filters it owns (skip an annotation the user wrote, honor the
+// request range). A type still an inference hole or an error placeholder is skipped.
 export let inlayKind: i32[] = []
 export let inlayLine: i32[] = []
 export let inlayCol: i32[] = []
 export let inlayType: string[] = []
-// The occurrence index each hint was recorded from, so the driver can map the
-// hint back to its owning module (`symOccModuleAt`) and the host can drop a
-// dependency's hints — a multi-module compile records hints for EVERY module,
-// each with module-local line/col that would otherwise render against the entry.
+// The occurrence index each hint came from, so the driver can map the hint back to
+// its owning module (`symOccModuleAt`). A multi-module compile records hints for
+// every module, each with module-local line and col that would otherwise render
+// against the entry.
 export let inlayOcc: i32[] = []
 // ── Redundant explicit type annotations (lint: lean on inference) ───────────────
-// A `let x: T = init` whose annotation T is EXACTLY the type inference gives the
-// initializer ON ITS OWN is redundant — removing `: T` yields the identical type.
-// The init is typed by `checkNode` BEFORE the annotation is consulted (the LetDecl
-// arm), so its context-free type is in hand; we compare the two there and record a
-// finding here. cli.vl surfaces each as a `hint` + a `--fix` that rewrites
-// `let x: T = init` → `let x = init` (replace the span [name-end, init-start) with
-// " = "). Empty-collection / `null` holes are excluded for free: their pre-constrain
-// init type never RENDERS equal to the concrete annotation, so the string compare
-// below skips them; a hole/error/`never` init is also skipped explicitly.
+
+// A `let x: T = init` whose annotation is exactly the type inference gives the
+// initializer on its own: removing `: T` yields the identical type. The `LetDecl` arm
+// types the init before consulting the annotation, so both are in hand there. A hole,
+// error or `never` init is skipped, and an empty-collection init never renders equal.
 export let redunSLine: i32[] = []   // replace-span start (just after the name) — line
 export let redunSCol: i32[] = []    //                                          — col
 export let redunELine: i32[] = []   // replace-span end (the initializer start) — line
@@ -116,79 +82,57 @@ export let redunName: string[] = [] // the binding name (for the message)
 export let redunType: string[] = [] // the inferred type (for the message)
 export let redunTok: i32[] = []     // the name token — its module is the finding's owner.
 // ── Dead `??` defaults (a `??` whose left operand can never be null) ────────────
-// `x ?? d` over a left operand whose type admits no `null` yields `x` for every
-// input: the default is unreachable code. The emitter FOLDS the node away
-// (`emit_rewrite.vl`), so the program runs — this is the channel that still says so.
-// Recorded by the checker, which is the only pass that holds the operand's type;
-// `cli.vl` surfaces each as a `warning`, the severity the parse-only lint pass
-// already gives the same family (`constant-condition`, a branch never taken).
-// Positions are the `??` node's anchor; `rcoalTok` names the owning module.
+
+// `x ?? d` over a left operand whose type admits no `null` yields `x` for every input,
+// so the default is unreachable. The emitter folds the node away (`emit_rewrite.vl`)
+// and the program runs, which is why this channel exists to say so. Positions are the
+// `??` node's anchor; `rcoalTok` names the owning module.
 export let rcoalLine: i32[] = []    // 1-based line of the `??` node's anchor token
 export let rcoalCol: i32[] = []     // 0-based column
 export let rcoalTok: i32[] = []     // the anchor token — its module owns the finding
 export let rcoalType: string[] = [] // the left operand's rendered type (for the message)
-// ── `is <literal>` over an operand whose union COLLAPSED (D1048's second hint) ──
-// The ruling "a subsumed literal arm COLLAPSES" makes `string | "err"` the type
-// `string`, and the FIRST hint (redundant-annotation) already fires at the written
-// spelling that collapsed. This is the second: at the `is "err"` DOWNSTREAM of that
-// collapse, where the loss actually bites — the test the author believes discriminates
-// a failure is a value compare against ordinary data.
-//
-// It fires only where a collapse was RECORDED for the operand's binding (see
-// `collBindName` in typecheck.vl), never off the operand's type: after the collapse the
-// arena type and the canon spelling are both `string`, indistinguishable from a `string`
-// nobody wrote a union for — and hinting on THAT would fire at every legitimate
-// compare-by-`is`. Positions are the `is` anchor; `isvalTok` names the owning module.
+// ── `is <literal>` over an operand whose union collapsed ─────────────────────
+
+// A subsumed literal arm collapses, so `string | "err"` is the type `string` and an
+// `is "err"` downstream compares against ordinary data. It fires only where a collapse
+// is recorded for the operand's binding (`collBindName` in typecheck.vl), never off
+// the operand's type, which after the collapse is indistinguishable from a `string`.
 export let isvalLine: i32[] = []    // 1-based line of the `is` node's anchor token
 export let isvalCol: i32[] = []     // 0-based column
 export let isvalTok: i32[] = []     // the anchor token — its module owns the finding
 export let isvalName: string[] = [] // the operand binding's name (for the message)
 export let isvalType: string[] = [] // the operand's rendered COLLAPSED type
 export let isvalLit: string[] = []  // the tested literal spelling, as written
-// The `symMemTy` sentinel for a method-CALL callee whose member name is recorded
-// for semantic tokens but whose type is not (method hover is not served
-// natively). Distinct from `-1` (unresolved) so `symMemberIsMethod` can tell a
-// recorded method apart while `symMemTypeStrAt` still treats it as un-typed.
+// The `symMemTy` sentinel for a method-call callee whose member name is recorded for
+// semantic tokens but whose type is not. Distinct from -1 (unresolved) so
+// `symMemberIsMethod` can tell a recorded method apart while `symMemTypeStrAt` still
+// treats it as un-typed.
 export const SYM_MEM_METHOD = -2
 // ── Member completion (LSP): the members of the receiver type under the cursor ──
-// The native counterpart of the host's `receiverObjectType` + `memberCompletions`.
-// `symMemberScanAt(line, col)` resolves the binding under the cursor (the receiver
-// identifier — the host strips the trailing `.` so it parses as a bare expression),
-// reads its retained type, softens a nullable, and records each completable member:
-// a `TyObj`'s identifier-named fields, or a `string`'s builtin methods. The result
-// lands in the `memc*` arrays, read by the per-index accessors. Arrays/maps expose
-// no members here (parity with the host, which surfaces none for them).
+
+// `symMemberScanAt(line, col)` resolves the binding under the cursor, reads its
+// retained type, softens a nullable, and records each completable member: a `TyObj`'s
+// identifier-named fields, or a `string`'s builtin methods. The results land in the
+// `memc*` arrays. Arrays and maps expose no members here, matching the host.
 export let memcName: string[] = []
 export let memcType: string[] = []
 export let memcIsFn: i32[] = []
 // ── UFCS candidates (LSP): the free `self`-functions a receiver dispatches to ──
-// The OTHER half of what `x.` can offer, and the half no field scan can see: VL resolves
-// `x.f(a)` against a free `function f(self: T, …)` whose name is IN SCOPE, so an
-// un-imported one is invisible to the author and reports `no field 'f' on T` (D1230).
-// UFCS is never implicit — the compiler keeps resolving names, not types (DECISIONS.md)
-// — so the EDITOR surfaces the import instead, and the receiver's TYPE decides the set,
-// which only the checker can answer (`Expectation<i32>` fits `self: Expectation<T>`;
-// the host holds rendered strings and cannot).
-//
-// The set is every `self`-function DECLARED IN THE MERGED PROGRAM, in scope or not — a
-// module the entry merely mentions contributes its functions while binding no name, the
-// "offer it, write the import" shape. `ufcTok` is the decl-name token, for attribution.
+
+// The other half of what `x.` can offer, and the half no field scan sees: `x.f(a)`
+// resolves against a free `function f(self: T, …)` whose name is in scope, so an
+// un-imported one reports `no field 'f' on T` (D1230). The set is every `self`-function
+// declared in the merged program, in scope or not; `ufcTok` is the decl-name token.
 export let ufcName: string[] = []
 export let ufcDetail: string[] = []
 export let ufcTok: i32[] = []
 export let ufcExported: i32[] = []
-// ── Signature help (LSP D9.10): the callee's parameters, AS DATA ──────────────
-// The structural counterpart of `fnSigStr`'s rendered string, and the reason it is not
-// just that string: signature help has to highlight ONE parameter, so a host handed
-// `(cmp: (i32, i32) => i32, xs: i32[]) => i32` would have to parse VL's type grammar back
-// out to learn which `,` separates parameters and which sits inside one. The columns cost
-// one zip the checker already writes and remove a whole parser from the host. Filled by
-// `symSigAt(line, col)` at the CALLEE NAME's position; `sigParName[i]` is "" when the name
-// is not knowable (`TyFunc` carries no parameter names by design), and the host renders
-// the type alone. A UFCS member call drops its `self` row HERE rather than at the host,
-// so argument index N is parameter index N at BOTH spellings. `sigParDefault[i]` is the
-// default's source text ("" when none) — a column rather than a boolean, because
-// `b: i32 = 10` is the useful render, and is what makes a defaulted parameter READ optional.
+// ── Signature help (LSP): the callee's parameters as data ────────────────────
+
+// The structural counterpart of `fnSigStr`'s rendered string: the columns a host
+// would otherwise recover by parsing VL's type grammar. Filled by `symSigAt` at the
+// callee name; a UFCS member call drops its `self` row, so argument index N is
+// parameter index N at both spellings. `sigParName[i]`/`sigParDefault[i]` are "" when none.
 export let sigParName: string[] = []
 export let sigParType: string[] = []
 export let sigParDefault: string[] = []

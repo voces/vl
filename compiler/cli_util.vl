@@ -1,9 +1,9 @@
 import { cpCount } from "./strutil"
 
-// `cli_util.vl` — pure string/format/glob helpers for the CLI: ANSI colouring, detab /
-// visual-width, line splitting, severity rank/validation, `--exclude` glob matching,
-// and import-line detection. State-free (no `cli.vl` module global) — a leaf the CLI
-// imports. Carved out of `cli.vl`.
+// `cli_util.vl` — pure string, format and glob helpers for the CLI: ANSI colouring,
+// detab and visual width, line splitting, severity rank, `--exclude` glob matching,
+// JSON escaping, module-mode detection and directory-walk predicates. State-free —
+// it holds no `cli.vl` module global, so it is a leaf the CLI imports.
 
 import { i32ToStr } from "./ast"
 import {
@@ -14,8 +14,7 @@ import {
   srcSetStr,
 } from "./driver"
 
-// Directories skipped when walking broadly (build output, deps, vendored,
-// retired ts-interpreter) — mirrors the host's former SKIP_DIRS.
+// Directories skipped when walking broadly: build output, deps, vendored trees.
 export function cliSkipDir(name: string) {
   name == "node_modules" ||
     name == ".git" ||
@@ -42,7 +41,7 @@ export function cliUpper(s: string) {
   fromCodePoints(out)
 }
 // Tabs → 4 columns so carets line up under tab-indented source (the shown line is
-// detabbed to match). Mirrors the host's former `detab`.
+// detabbed to match).
 export function cliDetab(s: string) {
   const out: i32[] = []
   for cp in s {
@@ -59,13 +58,10 @@ export function cliDetab(s: string) {
   }
   fromCodePoints(out)
 }
-// The visual column the prefix `[0, n)` of `raw` ends at, after detabbing.
-//
-// `n` is a BYTE offset (it comes from the lexer's columns, which are byte columns since
-// Stage 2c) but the answer is a COLUMN — a width — so it is counted in code points. This is
-// the §R1 distinction: the offset that selects the prefix and the number that positions the
-// caret are different kinds of integer, and only the first one cancels against `slice`.
-// Getting this wrong puts the caret one column right per non-ASCII byte before the error.
+// The visual column the prefix `[0, n)` of `raw` ends at, after detabbing. `n` is a
+// byte offset (the lexer's columns are byte columns) but the answer is a width, so it
+// counts code points: the offset selecting the prefix and the number positioning the
+// caret are different kinds of integer, and confusing them shifts the caret per byte.
 export function cliVisualWidth(raw: string, n: i32) {
   let m = n
   if m > raw.length { m = raw.length }
@@ -76,11 +72,8 @@ export function cliVisualWidth(raw: string, n: i32) {
 // empty line for a final newline.
 export function cliSplitLines(s: string) {
   const out: string[] = []
-  // SLICES, NOT A CODE-POINT BUFFER. Splitting is a pure OFFSET operation — `\n` and `\r`
-  // are ASCII, so they are found at the same places in either unit, and every piece is a
-  // range of the input handed straight back to `slice`. Rebuilding each line through
-  // `fromCodePoints` would have re-encoded every non-ASCII byte as its own character; a
-  // slice cannot, because it never names a unit at all. It is also O(1) per line now.
+  // Slices, not a code-point buffer: `\n` and `\r` are ASCII, so splitting is a pure
+  // offset operation and each piece is a range handed straight back to `slice`.
   let lineStart = 0
   let i = 0
   while i < s.length {
@@ -103,9 +96,10 @@ export function cliSplitLines(s: string) {
   }
   out
 }
-// ── severity model (mirror the host's SEVERITIES / severity_rank) ──────────────
-// Low → high, so the rank IS the index (hint=0 … error=3). An unknown lexeme
-// falls back to `warning` (still surfaces).
+// ── severity model ───────────────────────────────────────────────────────────
+
+// Low → high, so the rank is the index (hint = 0 … error = 3). An unknown lexeme
+// falls back to `warning`, which still surfaces.
 export function cliSevRank(s: string) {
   if s == "hint" { return 0 }
   if s == "info" { return 1 }
@@ -169,16 +163,12 @@ export function cliPlural(n: i32, w: string) {
   out
 }
 // ── module-mode detection (mirror the host's cheap textual gate) ───────────────
-//
-// THE GATE EXISTS FOUR TIMES, IN THREE LANGUAGES, and the four must agree — a host that
-// does not arm the fetch loop leaves the guest asking for a module nobody will fetch, and
-// the symptom is SILENCE rather than an error: HERE (`cliLineIsImport` / `cliHasTplHole` /
-// `cliNeedsModules`); the inline gate in `scripts/vl-host/src/main.rs`;
-// `compiler/moduleGate.ts`; and its two TS consumers, `lsp/src/wasmChecker.ts` and
-// `tests/cases_wasm_test.ts`. The first two cannot import the TS, so they stay MIRRORED
-// and `tests/module_gate_agreement_test.ts` guards them: it extracts THIS function's arm
-// set from this source and fails when it drifts.
-//
+
+// The gate exists four times in three languages and the four must agree: a host that
+// does not arm the fetch loop leaves the guest asking for a module nobody will fetch,
+// and the symptom is silence, not an error. `scripts/vl-host/src/main.rs` and
+// `compiler/moduleGate.ts` mirror it; `tests/module_gate_agreement_test.ts` guards it.
+
 // True if `line`'s first non-space token is `kw`, then optional whitespace, then `{`.
 export function cliLineStartsKwBrace(line: string, kw: string) {
   let i = 0
@@ -194,8 +184,8 @@ export function cliLineStartsKwBrace(line: string, kw: string) {
   if i < line.length && line[i] == '{' { return 1 }
   0
 }
-// A module-dependency line: `import { … }` OR a RE-EXPORT `export { … } from "…"`
-// (both pull another module, so both must arm the fetch loop for `check`/`--fix`).
+// A module-dependency line: `import { … }`, or a re-export `export { … } from "…"` —
+// both pull another module, so both must arm the fetch loop for `check` and `--fix`.
 export function cliLineIsImport(line: string) {
   if cliLineStartsKwBrace(line, "import") != 0 { return 1 }
   if cliLineStartsKwBrace(line, "export") != 0 { return 1 }
@@ -210,18 +200,10 @@ export function cliHasImports(s: string) {
   }
   0
 }
-// True when `s` holds an INTERPOLATION HOLE `\{…}` — in EITHER quoted form, a `"…"`
-// string or a `` `…` `` template. The second construct (after an `import`/re-export
-// line) that makes a file need the MODULE pipeline. A hole desugars to a call into
-// `std:fmt`, and `std:fmt` reaches the compiler only through the module FETCH LOOP,
-// which every host arms from a cheap textual scan of the entry source before any
-// lexing — so this rides `cliLineIsImport`'s four-site mirror above, under the same
-// guard, and THE NAME UNDERSELLS IT deliberately: renaming buys a word at the price
-// of every mirror. IT IS A REAL SCAN, NOT `contains("`")`: a backtick in a comment is
-// ordinary, and arming module mode for one would change the compilation path of a
-// program with nothing to do with interpolation. THE `\{` TEST IS INSIDE THE LITERAL
-// SCANS, NOT BESIDE THEM, because `\\{` inside a literal is an escaped backslash
-// before an ordinary brace — hence the backslash arm looking at the NEXT character.
+// True when `s` holds an interpolation hole `\{…}`, in either a `"…"` string or a
+// `` `…` `` template: a hole desugars into `std:fmt`, which reaches the compiler only
+// through the module fetch loop, so this arms module mode beside `cliLineIsImport`.
+// The `\{` test sits inside the literal scans, so `\\{` reads as a backslash then a brace.
 export function cliHasTplHole(s: string) {
   const n = s.length
   let i = 0
@@ -262,14 +244,10 @@ export function cliNeedsModules(s: string) {
   if cliHasImports(s) != 0 { return 1 }
   cliHasTplHole(s)
 }
-// Match glob `pat` against `text`. `*` matches a run of non-`/` characters,
-// `**` crosses separators, every other char is literal. A completed match
-// succeeds when the remaining text is empty OR begins a new `/`-segment —
-// encoding the host's `^<pat>(/.*)?$` anchoring, so `tests` gates `tests` and
-// everything beneath it. Iterative O(|pat| × |text|) dynamic program — one
-// row per pattern token, `row[t]` = "the tokens so far match text[0, t)" — so
-// an adversarial `*a*a*a…` pattern stays polynomial (backtracking recursion
-// is exponential there) and nothing recurses on the wasm call stack.
+// Match glob `pat` against `text`: `*` matches a run of non-`/` characters, `**` crosses
+// separators, every other character is literal. A match succeeds when the rest of the
+// text is empty or begins a new `/`-segment, so `tests` gates everything beneath it.
+// An iterative row-per-token dynamic program: no backtracking, no wasm-stack recursion.
 export function cliGlob(pat: string, text: string) {
   const n = text.length
   let row: i32[] = []
@@ -289,7 +267,7 @@ export function cliGlob(pat: string, text: string) {
     }
     const pc = pat[pi]
     if pc == '*' && pi + 1 < pat.length && pat[pi + 1] == '*' {
-      // `**` — zero+ of ANY character: carry the previous row's match forward
+      // `**` — zero or more of any character: carry the previous row's match forward
       // across every text position.
       let k = 0
       while k <= n {
@@ -299,7 +277,7 @@ export function cliGlob(pat: string, text: string) {
       }
       pi = pi + 2
     } else if pc == '*' {
-      // `*` — zero+ NON-`/` characters: the carry stops at a separator.
+      // `*` — zero or more non-`/` characters: the carry stops at a separator.
       let k = 0
       while k <= n {
         if row[k] != 0 { cur[k] = 1 }
@@ -326,24 +304,16 @@ export function cliGlob(pat: string, text: string) {
   }
   false
 }
-// Commit one (key, src, found) into the module table (the fetch protocol).
-// STAGE 2c: this hands the STRINGS over directly instead of re-pushing them element by
-// element into the driver's code-point accumulators. The old spelling was the §Builders
-// defect on the compiler's own PARSE path — `src[j]` became a byte while `modCommit`'s
-// `fromCodePoints(modSrcAcc)` still meant code points, so every module of a graph compile
-// was double-encoded before the lexer ever saw it, and `'é'` in a source file lexed as two
-// characters. The accumulators still exist for the HOST channel (`modSrcLoad` stages UTF-32
-// words); a caller that already holds the string has no reason to go through them, and now
-// does not — which also removes two full copies of every module's source per compile.
+// Commit one (key, src, found) into the module table (the fetch protocol). It hands the
+// strings over directly; the driver's code-point accumulators stay for the host channel
+// (`modSrcLoad` stages UTF-32 words), and a caller already holding the string skips them.
 export function cliModCommitOne(key: string, src: string, found: i32) {
   let body = ""
   if found != 0 { body = src }
   modCommitStr(key, body, found)
   0
 }
-// The k-th pending module key, read per-code-point from the driver's accessors.
-// STAGE 2c: reads the key as a STRING rather than reassembling it from `modPendingAt`
-// elements, which are bytes now and were being re-encoded one per character.
+// The k-th pending module key, read as a string from the driver's accessors.
 export function cliPendingKey(k: i32) { modPendingKeyAt(k) }
 // ── directory walk ──────────────────────────────────────────────────────────
 // True when `name` ends in `.vl`.
@@ -352,10 +322,9 @@ export function cliEndsVl(name: string) {
   const a = name.length - 3
   name[a] == '.' && name[a + 1] == 'v' && name[a + 2] == 'l'
 }
-// True when `name` ends in `.test.vl` — the `vl test` discovery predicate. A
-// SUFFIX test, not a glob: `x.test.vl` and `a/b.test.vl` match, `test.vl` alone
-// does not (the dot is required, so a file merely NAMED `test.vl` is an ordinary
-// module, matching jest/vitest's `*.test.*`).
+// True when `name` ends in `.test.vl` — the `vl test` discovery predicate. A suffix
+// test, not a glob: `x.test.vl` and `a/b.test.vl` match, `test.vl` alone does not, so a
+// file merely named `test.vl` stays an ordinary module.
 export function cliEndsTestVl(name: string) {
   if name.length < 9 { return false }
   const a = name.length - 8
@@ -368,10 +337,9 @@ export function cliEndsTestVl(name: string) {
     name[a + 6] == 'v' &&
     name[a + 7] == 'l'
 }
-// True when `needle` occurs anywhere in `hay` (an empty needle always does) —
-// the `vl test -t` name filter. Naive O(|hay| × |needle|) scan: the corpus of
-// test NAMES is short strings, and `cliGlob` is the tool when a pattern is
-// wanted instead.
+// True when `needle` occurs anywhere in `hay`; an empty needle always does. The
+// `vl test -t` name filter — a naive scan, since test names are short strings and
+// `cliGlob` is the tool when a pattern is wanted instead.
 export function cliContains(hay: string, needle: string) {
   if needle.length == 0 { return true }
   if needle.length > hay.length { return false }
@@ -403,8 +371,8 @@ export function cliStrGt(a: string, b: string) {
   }
   a.length > b.length
 }
-// All but the last element of a stack (rebuild — a bare `.pop()` is an emit gap
-// in the native pipeline; the driver uses the same idiom).
+// All but the last element of a stack, rebuilt: a bare `.pop()` is an emit gap in the
+// native pipeline, and the driver uses the same idiom.
 export function cliPopLast(xs: string[]) {
   const out: string[] = []
   let i = 0
@@ -414,22 +382,15 @@ export function cliPopLast(xs: string[]) {
   }
   out
 }
-// ── fmt per-file (A-impl 3) ─────────────────────────────────────────────────────
-// Format `src` via the AST formatter (format.vl / formatSrc), single-file and
-// purely syntactic — no module resolution. Returns a STATUS the caller branches
-// on (the formatted text itself is read from `vcFmtOut`):
-//   0 — formatted; `vcFmtOut` holds the output (already round-trip-verified).
-//   1 — the INPUT does not lex/parse; nothing was formatted (the parse
-//       diagnostics stay readable via `diagCount`/`vcDiagMsg`/…).
-//   2 — the round-trip gate tripped: the OUTPUT does not re-parse (a formatter
-//       bug) — the caller must keep the original bytes and report loudly.
+// ── fmt per-file ─────────────────────────────────────────────────────────────
+
+// Format `src` through the AST formatter, single-file and purely syntactic. Returns a
+// status: 0 formatted, with the output in `vcFmtOut` and already round-trip-verified;
+// 1 the input does not lex or parse, so nothing is formatted and the parse diagnostics
+// stay readable; 2 the output does not re-parse — the caller must keep the input bytes.
 export function cliFormatNow(src: string): i32 {
-  // `srcSetStr`, not a `srcPush(src[i])` loop — the THIRD copy of that loop, and the one
-  // that outlived the other two by a full gate cycle: `vl check` was already correct while
-  // `vl fmt` still re-encoded every non-ASCII character in the file it was formatting
-  // (`—` came back as `â\u{80}\u{94}`). `scripts/lint-self.sh` caught it as "not formatted"
-  // on 26 files at once, which is the only reason it was not shipped. Three writings of one
-  // fact, and the third had no reason to exist: see `driver.srcSetStr`.
+  // `srcSetStr`, not a `srcPush(src[i])` loop: the loop spelling re-encodes every
+  // non-ASCII character in the file being formatted. See `driver.srcSetStr`.
   srcReset()
   srcSetStr(src)
   const len = formatSrc()

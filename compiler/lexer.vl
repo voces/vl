@@ -1,44 +1,22 @@
 import { cpCount } from "./strutil"
 
-// A lexer for VL, written in VL — the self-hosted scanner the whole pipeline runs
-// on. It scans:
-//   - identifiers and keywords,
-//   - integer / real number literals (`12`, `3.14`, `1.5e-7`),
-//   - char literals `'a'` and string literals `"..."`, both with the shared
-//     escape grammar `\n \t \r \\ \" \' \0 \b \f \v \xXX \uXXXX \u{…}`,
-//   - INTERPOLATION HOLES, spelled `\{expr}` and legal in BOTH quoted forms —
-//     `"v=\{x}"` and `` `v=\{x}` `` are the same construct. A literal holding
-//     one is scanned as a SPLIT token run (`TEMPLATE_HEAD` / `TEMPLATE_MID` /
-//     `TEMPLATE_TAIL`) with the hole EXPRESSIONS lexed as ordinary tokens in
-//     between, the JS-lexer shape; a literal holding none stays ONE token
-//     (`STRING` or `TEMPLATE`). The run kinds keep their `TEMPLATE_` spelling
-//     because the machinery is one and it was built for templates — both forms
-//     mint them, and every consumer treats them identically.
-//   - backtick TEMPLATE literals `` `text` `` — the multiline form: a raw
-//     newline is CONTENT there and a terminator inside `"`, which is the ONLY
-//     rule the two literal grammars still disagree about,
-//   - the full one- and two-char operator / punctuation set,
-//   - `//` line comments and `///` doc comments (retained as trivia in
-//     `gComments`, not emitted into the token stream),
-//   - whitespace and significant newlines (NEWLINE is a real token; the parser
-//     treats it as a statement terminator).
+// A lexer for VL, written in VL — the self-hosted scanner the whole pipeline runs on. It
+// scans identifiers and keywords, integer and real literals (`12`, `3.14`, `1.5e-7`, and
+// `0x`/`0b`/`0o`), char and string literals over one shared escape grammar, backtick
+// templates, the one- to three-char operator set, `//` line and `///` doc comments
+// (retained as trivia in `gComments`, never emitted as tokens), and significant newlines.
 //
-// Positions follow the diagnostics convention: `line` is 1-based, `col` is
-// 0-based; `start`/`stop` are char offsets into the source (first char, and one
-// past the last) so a token span measures source extent.
+// An interpolation hole is spelled `\{expr}` and is legal in both quoted forms: a literal
+// holding one scans as a split run (`TEMPLATE_HEAD`/`MID`/`TAIL`) with the hole
+// expressions lexed as ordinary tokens between, one holding none stays a single token.
+// A raw newline is content in a backtick literal and a terminator inside `"` — the only
+// rule the two grammars still disagree about. Positions follow the diagnostics
+// convention: `line` 1-based, `col` 0-based, `start`/`stop` offsets [first, past-last).
 
-// ---- token kinds ---------------------------------------------------------
-// The CLOSED token vocabulary, as a literal union. This is the token-kind ENUMERATION: a
-// literal-union value is an i32 ATOM, so `kind` costs one i32 field, every `kind == "IDENT"`
-// lowers to `i32.eq` against a constant, and no `__str_eq__` runs on the token path.
-//
-// The SPELLING is minted FROM the atom, never carried beside it: a `TokKind` in a `string`
-// position (the `kindDesc`/`foundDesc` fallbacks) materialises the pooled literal from the
-// atom, so a token never holds both representations and the two cannot drift apart. The
-// checker is a COMPLETE ORACLE here — comparing a `TokKind` against a non-member is a hard
-// type error — which makes a vocabulary this wide safe to thread everywhere. `""` is the
-// NO-MATCH sentinel `oneCharKind`/`twoCharKind`/`threeCharKind` return, and is a member so
-// those stay total; the grouping below is for reading only, nothing depends on the ORDER.
+// The closed token vocabulary as a literal union: `kind` is one i32 field, `kind ==
+// "IDENT"` lowers to `i32.eq`, and a spelling is minted from the atom rather than carried
+// beside it, so the two cannot drift. `""` is the no-match sentinel the `*CharKind` tables
+// return and is a member so those stay total; nothing depends on the grouping or order.
 export type TokKind = ""
   | "IDENT"
   | "NUMBER"
@@ -112,18 +90,10 @@ export type TokKind = ""
   | "SHR"
   | "USHR"
 
-// A lexer diagnostic: a message plus the 1-based line / 0-based column where it was
-// raised. Positions stay numeric and are rendered at the harness, mirroring the
-// structured `VLDiagnostic` of `compiler/diagnostics.ts`.
-//
-// `endCol` is the 0-based EXCLUSIVE end column of the offending SPAN, on the same line
-// as `col` (`endCol - col` is the caret width the CLI draws, and the LSP range's end).
-// A lex diag carries no token anchor, so `diagEndCol` has nothing to derive a width
-// from and every one of these used to render as a single-column caret; a literal that
-// IS the offence (`'xy'`) has to carry its own end. `endCol == col` means "no span" —
-// the point rendering, right for a diagnostic about one character (a stray `_`, a bad
-// escape) and what `diag`/`diagAt` supply. A quoted literal never spans lines (a raw
-// newline terminates it), so one column pair covers every span this type carries.
+// A lexer diagnostic: a message plus the 1-based line and 0-based column it is raised at.
+// `endCol` is the 0-based exclusive end column of the offending span on the same line as
+// `col` (the caret width the CLI draws); `endCol == col` means no span. One column pair
+// covers every span here because a quoted literal never spans lines.
 type Diag = {
   msg: string,
   line: i32,
@@ -131,15 +101,10 @@ type Diag = {
   endCol: i32
 }
 
-// A lexed token.
-//   kind  — the closed `TokKind` tag (keyword/literal/operator/structural name),
-//           an i32 atom.
-//   text  — the raw source lexeme (quotes + backslashes kept for STRING/CHAR).
-//   value — for STRING/CHAR: the decoded literal with escapes resolved
-//           (including `\xXX` / `\uXXXX` / `\u{…}` via `fromCodePoint`); ""
-//           otherwise.
-//   start/stop — char offsets [first, one-past-last).
-//   line/col   — 1-based line, 0-based column of the first char.
+// A lexed token: `kind` the closed `TokKind` atom, `text` the raw source lexeme (quotes
+// and backslashes kept for a `STRING` or `CHAR`), `value` the decoded literal with escapes
+// resolved for those two and "" otherwise, `start`/`stop` char offsets
+// [first, one-past-last), and `line`/`col` the 1-based line and 0-based column.
 type Tok = {
   kind: TokKind,
   text: string,
@@ -150,15 +115,10 @@ type Tok = {
   col: i32
 }
 
-// A retained `//` (or doc `///`) comment. Kept OUT of `tokens` so the parser's
-// peek/lookahead is untouched — comments are metadata for the formatter / doc
-// cross-refs, not grammar tokens. `text` is the VERBATIM lexeme including the
-// leading `//`; `start`/`line`/`col` anchor it (char offset, 1-based line,
-// 0-based col); `trailing` is true when it sits on the SAME source line AFTER a
-// real token (`let x = 1 // c`), false when it stands on its own line. Native
-// counterpart of the host lexer's `Comment` (`kind`/`placement`). Defined BEFORE
-// `LexResult` so the frozen TS host (which does not hoist type aliases) resolves
-// the forward reference.
+// A retained `//` or `///` comment, kept out of `tokens` so the parser's lookahead is
+// untouched: comments are formatter metadata, not grammar. `text` is the verbatim lexeme
+// including the leading `//`; `trailing` is true when it sits on the same source line
+// after a real token. Declared before `LexResult` because the host does not hoist aliases.
 type Comment = {
   doc: boolean,
   text: string,
@@ -188,18 +148,10 @@ let gCol = 0
 export let gDiags: Diag[] = []
 let gComments: Comment[] = []
 
-// ---- interpolated-literal scanner state ----------------------------------
-// An interpolated literal is CONTEXT-SENSITIVE: the `}` that ends a hole is spelled
-// exactly like the `}` that closes a block. Two numbers separate them — the `{` nesting
-// depth (`gBrace`) and, per OPEN hole, the depth that hole started at (`gTplBrace`); a `}`
-// resumes the literal iff the depth matches the innermost open hole's. Holes therefore NEST
-// for free, and the stack is why no re-lexing or bracket-matching pre-pass exists.
-//
-// `gTplOpenLine`/`gTplOpenCol`/`gTplOpenPos` are parallel rows holding the OPENING
-// DELIMITER's position, so an unterminated literal reports THERE, not at the `}` of whichever
-// part ran off the end (the char OFFSET rides along because a SPAN needs it). `gTplQuote` is
-// the run's delimiter, and it is what lets ONE split-run machinery serve both literal forms:
-// the `}` arm resumes in the mode the run opened in, so no second escape decoder is needed.
+// An interpolated literal is context-sensitive: the `}` that ends a hole is spelled like
+// the one that closes a block, and the `{` depth (`gBrace`) against the depth each open
+// hole started at (`gTplBrace`) separates them, so holes nest for free. The parallel
+// `gTplOpen*` rows hold the opening delimiter, so an unterminated literal reports there.
 let gTplStop = 0 // why the last part stopped: 0 = closing delimiter, 1 = `\{`, 2 = ran out of input
 let gTplOpenLine: i32[] = []
 let gTplOpenCol: i32[] = []
@@ -307,14 +259,14 @@ export function diag(msg: string) {
 }
 
 // Record a diagnostic at an explicit position (1-based line, 0-based column) —
-// for reports that anchor at a construct's START (an opening quote, a
+// for reports that anchor at a construct's start (an opening quote, a
 // backslash) after the scanner has already moved past it.
 function diagAt(msg: string, line: i32, col: i32) {
   gDiags.push({ msg: msg, line: line, col: col, endCol: col })
   gDiags.length
 }
 
-// `diagAt` with a SPAN: the report covers `[col, endCol)` on `line` rather than
+// `diagAt` with a span: the report covers `[col, endCol)` on `line` rather than
 // rendering as a point. For a diagnostic whose subject is a whole lexeme the
 // scanner has just consumed — a char literal of the wrong length, an unterminated
 // quote — where `gCol` is already sitting one past it.
@@ -324,21 +276,13 @@ function diagSpan(msg: string, line: i32, col: i32, endCol: i32) {
 }
 
 // ---- keyword + operator tables -------------------------------------------
-// Linear `==` chains: a string-keyed map over ~22 keywords / ~31 operators would
-// not pay here, and both vocabularies are CLOSED, so the chain cannot fall behind.
+// Linear `==` chains: a string-keyed map over ~22 keywords or ~31 operators would not pay
+// here, and both vocabularies are closed, so the chain cannot fall behind.
 
-// THE VOCABULARY IS CLOSED AND THE DISPATCH IS ON THE FIRST CHARACTER, not on the whole
-// string. A first-character bucket (only `if`/`is` and `type`/`true` need a second character)
-// costs a non-keyword one character read plus a run of i32 compares, where the `==` chain it
-// replaced ran the whole `__str_eq__` ladder to answer "IDENT". Interning the identifiers is
-// the same question backwards and the answer is NO — it moves the cost to a HASH of every
-// identifier token, at the pipeline's densest point, to settle what two characters settle
-// (`docs/internals/identifier-interning-design.md` §4.1).
-// THIS FUNCTION IS ALSO THE AUTHORITY FOR "WHAT IS A HARD KEYWORD", and four other lists copy
-// it: `lexClassOf` (`driver.vl`), `VL_HARD_KEYWORDS` (`lsp/src/typeFeatures.ts`), the TextMate
-// grammar and the playground's Monarch table. `tests/keyword_vocabulary_test.ts` DERIVES the
-// set from the `return "…"` arms below and reddens for any list that disagrees; a CONTEXTUAL
-// keyword (`as`, `in`, `to`, `step`, `new`, `flat`) is not reserved and must not move here.
+// The authority for what is a hard keyword: four other lists copy it (`driver.lexClassOf`,
+// the LSP's `VL_HARD_KEYWORDS`, the TextMate grammar, the playground's Monarch table), and
+// `tests/keyword_vocabulary_test.ts` derives the set from the `return "…"` arms below and
+// reddens on disagreement. A contextual keyword (`as`, `in`, `to`) must not move here.
 function keywordKind(text: string): TokKind {
   const n = text.length
   if n < 2 || n > 8 { return "IDENT" }
@@ -404,10 +348,10 @@ function keywordKind(text: string): TokKind {
   "IDENT"
 }
 
-// Single-char operator/punctuation kind for char code `c`, or "" if none.
-// `;` lexes as `SEMI`, an OPTIONAL statement separator the block / top-level loops
-// treat exactly like a NEWLINE (so `a(); b()` works) — a standalone `?` is still not
-// a token and falls through to the unexpected-character path.
+// Single-char operator/punctuation kind for char code `c`, or "" if none. `;` lexes as
+// `SEMI`, an optional statement separator the block and top-level loops treat exactly like
+// a NEWLINE (so `a(); b()` works); a standalone `?` is not a token and falls through to
+// the unexpected-character path.
 function oneCharKind(c: i32): TokKind {
   if c == '+' { return "PLUS" }
   if c == '-' { return "MINUS" }
@@ -431,8 +375,8 @@ function oneCharKind(c: i32): TokKind {
   if c == ':' { return "COLON" }
   if c == '|' { return "PIPE" }
   if c == '&' { return "AMPERSAND" }
-  // A lone `?` — the OPTIONAL-PARAMETER marker (`a?: i32`). `?.` and `??` are
-  // longer matches and are taken first, so this only fires where neither does.
+  // A lone `?` — the optional-parameter marker (`a?: i32`). `?.` and `??` are longer
+  // matches and are taken first, so this only fires where neither does.
   if c == '?' { return "QUESTION" }
   if c == '~' { return "TILDE" }
   ""
@@ -448,7 +392,7 @@ function twoCharKind(a: i32, b: i32): TokKind {
   if a == '*' && b == '=' { return "STAREQ" }
   if a == '/' && b == '=' { return "SLASHEQ" }
   // `<<` left shift. Unlike the closing `>>` of a nested generic, `<<` never
-  // collides with generics (two OPENING angles never abut), so it is one token.
+  // collides with generics (two opening angles never abut), so it is one token.
   if a == '<' && b == '<' { return "SHL" }
   if a == '&' && b == '&' { return "AND" }
   if a == '|' && b == '|' { return "OR" }
@@ -474,13 +418,10 @@ function threeCharKind(a: i32, b: i32, c: i32): TokKind {
   ""
 }
 
-// ---- escape decoding -----------------------------------------------------
-// Decode a simple escape character `e` (the char after a backslash) to the
-// string it denotes, for the single-char escapes. `\xXX` / `\uXXXX` / `\u{…}`
-// are handled by the scanner before calling this (they need hex digits + a
-// `fromCodePoint`). Returns the decoded fragment, or "" for an unknown escape,
-// which the caller renders as the verbatim char (matching the TS lexer's
-// lenient policy).
+// Decode a simple escape character `e` (the char after a backslash) to the string it
+// denotes. `\xXX` / `\uXXXX` / `\u{…}` are handled by the scanner before this is called,
+// since they need hex digits and a `fromCodePoint`. "" for an unknown escape, which the
+// caller renders as the verbatim char.
 function decodeSimpleEscape(e: i32) {
   if e == 'n' { return "\n" }
   if e == 't' { return "\t" }
@@ -515,15 +456,10 @@ export function mkTok(
   }
 }
 
-// Scan the digit run of a base-prefixed integer (`0x`/`0b`/`0o`), the prefix
-// ALREADY consumed. Validates digits + `_` separators and emits at most one lex
-// diagnostic; consumes any trailing identifier run so a malformed suffix (`0xG`,
-// `0x_FF`) never cascades into a separate "undeclared identifier". The caller
-// pushes the (recovery) NUMBER token from the span. Returns the diag count.
-// NOTE: condition expressions store each `isRadixDigit`/`isIdPart` call in a
-// BOOL LOCAL first — the frozen TS host emitter drops a bare boolean call used
-// directly as an `if` condition (the native emitter handles it), so mirror the
-// existing lexer's `let c = peek(); if isIdStart(c)` shape.
+// Scan the digit run of a base-prefixed integer (`0x`/`0b`/`0o`), the prefix already
+// consumed. It validates digits and `_` separators, emits at most one diagnostic, and eats
+// a trailing identifier run so `0xG` never cascades into "undeclared identifier". Each
+// `isRadixDigit`/`isIdPart` call goes in a bool local: the host drops a bare call as an `if`.
 function scanRadix(base: i32, baseName: string, prefixChar: i32) {
   let any = false
   let bad = false
@@ -535,7 +471,7 @@ function scanRadix(base: i32, baseName: string, prefixChar: i32) {
       advance()
       any = true
     } else if p == '_' && any && p2IsDigit {
-      // A separator is legal only BETWEEN two digits.
+      // A separator is legal only between two digits.
       advance()
     } else if p == '_' {
       // A separator at the start, doubled, or trailing (`0x_F`, `0xF__F`, `0xF_`).
@@ -574,34 +510,19 @@ function scanRadix(base: i32, baseName: string, prefixChar: i32) {
   gDiags.length
 }
 
-// ---- string / char scanning ----------------------------------------------
-// Scan a quoted literal (the cursor is on the opening quote). `quote` is the
-// quote char code. Returns the decoded `value` with escapes resolved; `\xXX` /
-// `\uXXXX` / `\u{…}` decode to the actual code point via `fromCodePoint`.
-//
-// The decoded value is built from `[runStart, gPos)` RUNS of escape-free text —
-// one slice per run, concatenating only at escape boundaries — rather than one
-// slice per character (which is O(k²) on immutable strings). Every branch that
-// consumes non-run input (an escape, the closing quote) flushes the pending run
-// first and re-anchors `runStart`; the tail flush after the loop covers the
-// unterminated paths.
+// Scan a quoted literal, the cursor on the opening quote; `quote` is the quote char code.
+// Returns the decoded `value` with escapes resolved. The value is built from
+// `[runStart, gPos)` runs of escape-free text — one slice per run, concatenating only at
+// escape boundaries — because one slice per character is O(k²) on immutable strings.
 export function scanQuoted(quote: i32) {
   // The opening quote anchors the unterminated-literal diagnostic: reporting
   // there (not wherever scanning stopped) keeps a missing quote a local error.
   const openLine = gLine
   const openCol = gCol
-  // TEMPLATE MODE — `quote == '`'`. Exactly TWO rules differ from `"`: a raw
-  // newline is CONTENT (templates are multiline, the one thing `"` still refuses),
-  // and ``\` `` joins the escape set because a backtick is the delimiter there.
-  //
-  // HOLE MODE — `"` and `` ` ``, never `'`. A `\{` ENDS the part (recorded in
-  // `gTplStop`, since VL functions return one value); the "opening quote" the
-  // scan consumes is the literal's own delimiter for a HEAD/whole run and a `}`
-  // for a MID/TAIL part. ONE scanner for all of it, which is what keeps the
-  // escape grammar single-sourced across two literal forms and four part kinds.
-  //
-  // A char literal is deliberately NOT in hole mode: `'\{'` keeps its "Unknown
-  // escape sequence", because a char literal is one code point and a hole is not.
+  // Template mode (`quote` is a backtick) differs from `"` in exactly two rules: a raw
+  // newline is content, and an escaped backtick joins the escape set. Hole mode covers `"`
+  // and the backtick but never `'`: a `\{` ends the part (recorded in `gTplStop`, since a
+  // VL function returns one value), and `'\{'` keeps its unknown-escape diagnostic.
   const tpl = quote == '`'
   const holes = tpl || quote == '"'
   if holes { gTplStop = 2 }
@@ -616,14 +537,10 @@ export function scanQuoted(quote: i32) {
     // so one missing quote yields a single local error at the opening quote
     // instead of masking every later error up to EOF.
     if !tpl && (ch == '\n' || ch == '\r') { break }
-    // A HOLE OPENS. The trigger lives in the ESCAPE NAMESPACE — `\{`, not `${`
-    // — and that is what makes interpolation additive to the `"` form at zero
-    // cost: `{` stays an ordinary character in every string forever (4,821
-    // in-tree literals carry one), while `"a\{b"` was an "Unknown escape
-    // sequence" error before this and so had no meaning to break. Tested BEFORE
-    // the escape arm below, so `\{` never reaches `decodeSimpleEscape`; `\\{` is
-    // therefore a literal backslash followed by a literal brace, since the first
-    // backslash is consumed by the `\\` escape and the `{` is read as text.
+    // A hole opens. The trigger lives in the escape namespace — `\{`, not `${` — so `{`
+    // stays an ordinary character in every string, while `\{` had no prior meaning to
+    // break. Tested before the escape arm, so `\{` never reaches `decodeSimpleEscape`;
+    // `\\{` is a literal backslash then a literal brace.
     if holes && ch == '\\' && peek2() == '{' {
       value = value + gSrc.slice(runStart, gPos)
       advance() // backslash
@@ -645,16 +562,10 @@ export function scanQuoted(quote: i32) {
         break
       }
       const e = peek()
-      // The ONE template-only escape: a template's own delimiter. Handled before
-      // `decodeSimpleEscape` so the `"` grammar is unchanged — ``"\`"`` keeps
-      // warning "Unknown escape sequence" exactly as it did.
-      //
-      // `\$` USED TO BE THE OTHER ONE and is RETIRED: with the hole trigger in
-      // the escape namespace, `$` is an ordinary character in a template again
-      // and needs no escape, so keeping `\$` would be a second spelling for
-      // "the character `$`" that only one of the two literal forms accepted —
-      // exactly the grammar split this change exists to close. It falls through
-      // to the unknown-escape arm below, which names it.
+      // The one template-only escape: a template's own delimiter, handled before
+      // `decodeSimpleEscape` so the `"` grammar is unchanged. `\$` is not an escape in
+      // either form — `$` is an ordinary character in both — so it falls through to the
+      // unknown-escape arm below, which names it.
       if tpl && e == '`' {
         advance() // the escaped delimiter
         value = value + fromCodePoint(e)
@@ -743,16 +654,9 @@ export function scanQuoted(quote: i32) {
       advance() // the escaped char
       const dec = decodeSimpleEscape(e)
       if dec == "" {
-        // Unknown escape: keep the char after the backslash verbatim, and warn.
-        //
-        // `\$` gets its own sentence — and gets it in BOTH literal forms, so no
-        // second escape grammar appears. It is the one spelling this change
-        // RETIRED (it was a template escape for the week `${` was the hole
-        // trigger), so the generic message would leave a reader with working
-        // code from six days ago no idea what happened. `${` needs no such arm:
-        // it does not become an error, it becomes ordinary text, and inventing a
-        // diagnostic for a legal program to warn about a week-old spelling is
-        // speculative — measured, ZERO `${` remain in tree after the migration.
+        // Unknown escape: keep the char after the backslash verbatim, and warn. `\$` gets
+        // its own sentence in both literal forms, so no second escape grammar appears;
+        // `${` needs no arm, because it is ordinary text rather than an error.
         if e == '$' {
           diagAt(
             "`\\$` is not an escape — write `$` (an interpolation hole is `\\{…}`)",
@@ -781,17 +685,10 @@ export function scanQuoted(quote: i32) {
   }
   value = value + gSrc.slice(runStart, gPos)
   if !closed {
-    // AN INTERPOLABLE LITERAL'S "unterminated" REPORT IS THE CALLER'S — only the
-    // caller knows where the OPENING DELIMITER was (a MID/TAIL part opens at a
-    // `}`, a whole literal away), and only the caller can measure a span for a
-    // literal that may be MULTILINE. `gTplStop` carries the verdict there, and
-    // `gTplQuote` tells the caller which literal to name.
-    //
-    // A char literal still reports HERE, spanning the opening quote through
-    // whatever the scan reached (the raw newline that broke the loop, or EOF).
-    // That is sound for `'` precisely because a raw newline terminates it, so
-    // `gCol` is still on `openLine`; a `"` run's caller re-derives the identical
-    // pair (see the `"` arm in `tokenize`).
+    // An interpolable literal's unterminated report is the caller's: only the caller knows
+    // where the opening delimiter is (a `MID` or `TAIL` part opens at a `}`) and can
+    // measure a span for a literal that may be multiline. `gTplStop` carries the verdict
+    // and `gTplQuote` names the literal; a char literal still reports here.
     if holes {
       gTplStop = 2
     } else {
@@ -801,24 +698,16 @@ export function scanQuoted(quote: i32) {
   value
 }
 
-// The `"`-quoted STRING LEXEME that means what template part `raw` means — the one
-// bridge between the two literal grammars, and a purely LEXICAL rewrite, so no second
-// escape decoder exists to drift from `scanQuoted`'s.
-//
-// `raw` is a part's verbatim source lexeme, delimiters included (`` `a\{ ``, `}b\{`,
-// `}c"`, or a whole `"d"`); DELIMITER-AGNOSTIC on purpose, since both literal forms mint
-// the same part kinds. The two grammars share their escape set, so an escape is copied
-// WHOLE (the escaped character included, so a `\\` can never re-open one) and exactly
-// three characters have a rule: ``\` `` drops its backslash, `"` gains one, and a raw
-// newline / CR becomes `\n` / `\r`.
-// Built from RUNS, not characters: `.length` is a BYTE count, so a multi-byte character
-// must be copied by SLICE — `fromCodePoint` would re-encode one byte of it as a char.
+// The `"`-quoted string lexeme meaning what template part `raw` means — the one bridge
+// between the two literal grammars, purely lexical, so no second escape decoder can drift.
+// An escape is copied whole, so a `\\` cannot re-open one; an escaped backtick loses its
+// backslash, `"` gains one, a newline becomes `\n`. Built from slices: `.length` is bytes.
 export function tplPartStrLex(raw: string): string {
   const n = raw.length
   const q = "\""
   if n < 1 { return q + q }
   // The trailing delimiter: the literal's own quote (1 char) or a hole-opening
-  // `\{` (2). A part that ends with NEITHER came from an unterminated literal —
+  // `\{` (2). A part that ends with neither came from an unterminated literal —
   // already a lex error — and keeps everything, which is what leaves the
   // recovery lexeme well-formed.
   let stop = n
@@ -869,10 +758,9 @@ export function tplPartStrLex(raw: string): string {
 }
 
 // ---- main scanner --------------------------------------------------------
-// Tokenize `source`, returning the tokens in order, terminated by an EOF token,
-// plus any diagnostics. Whitespace is skipped; NEWLINE is emitted as a real
-// token; `//` / `///` comments are retained as trivia in `gComments` (for the
-// formatter and doc tooling), never emitted into the token stream.
+// Tokenize `source`, returning the tokens in order terminated by an EOF token, plus any
+// diagnostics. Whitespace is skipped, NEWLINE is emitted as a real token, and `//` / `///`
+// comments are retained as trivia in `gComments` rather than emitted into the stream.
 export function tokenize(source: string): LexResult {
   // Reset the module-global scanner state for this run.
   gSrc = source
@@ -908,12 +796,10 @@ export function tokenize(source: string): LexResult {
     if c == '\r' || c == '\n' {
       if c == '\r' && peek2() == '\n' { advance() }
       advance()
-      // SUPPRESSED INSIDE A TEMPLATE HOLE, at the hole's own brace depth. A hole
-      // is an EXPRESSION, so a newline there can never be the statement
-      // terminator NEWLINE means everywhere else — emitting one would end the
-      // hole's expression mid-way. Dropping it is what lets a hole span lines.
-      // A newline INSIDE a `{ … }` nested in the hole is deeper than the hole's
-      // depth and keeps its NEWLINE: a block there really does hold statements.
+      // Suppressed inside a template hole, at the hole's own brace depth: a hole is an
+      // expression, so a newline there cannot be the statement terminator NEWLINE means
+      // elsewhere, and emitting one would end the hole's expression mid-way. A newline
+      // inside a `{ … }` nested in the hole is deeper and keeps its NEWLINE.
       if atTplHoleDepth() { continue }
       toks.push(mkTok("NEWLINE", "", startPos, startLine, startCol))
       continue
@@ -926,7 +812,7 @@ export function tokenize(source: string): LexResult {
     }
 
     // Line comment `// ...` (and doc `/// ...`) — consumed up to the newline and
-    // RETAINED as trivia in `gComments` (not emitted into `toks`, so the parser
+    // retained as trivia in `gComments` (not emitted into `toks`, so the parser
     // is untouched). A doc comment is `///`; a comment is `trailing` when the
     // last emitted token sits on this same source line (`let x = 1 // c`).
     if c == '/' && peek2() == '/' {
@@ -958,17 +844,14 @@ export function tokenize(source: string): LexResult {
       continue
     }
 
-    // Number. Hex `0x`/`0X` (digits `[0-9a-fA-F]`) and binary `0b`/`0B` (digits
-    // `[01]`) integer forms, plus decimal
-    // `[0-9]+ ('.' [0-9]+)? ([eE] [+-]? [0-9]+)?` — the fractional part is taken
-    // only when a digit follows the dot, so `a.5` / `p.x` keep `.` as
-    // a separate DOT. The NUMBER token's `text` is the RAW source lexeme (via
-    // `mkTok`'s span slice), including any `0x`/`0b` prefix; the base is folded at
-    // value time in `parseI32`, which decodes it from that prefix.
+    // Number. Hex `0x`, binary `0b` and octal `0o` integer forms, plus decimal
+    // `[0-9]+ ('.' [0-9]+)? ([eE] [+-]? [0-9]+)?` — the fractional part is taken only when
+    // a digit follows the dot, so `a.5` and `p.x` keep `.` as a separate DOT. The token's
+    // `text` is the raw lexeme; the base is folded at value time in `parseI32`.
     if isDigit(c) {
       // Base-prefixed integer: `0x`/`0X` hex, `0b`/`0B` binary, `0o`/`0O` octal.
-      // The prefix is recognized REGARDLESS of what follows, so a malformed
-      // literal (`0x`, `0xG`, `0x_FF`) becomes ONE clear lex error via `scanRadix`
+      // The prefix is recognized regardless of what follows, so a malformed
+      // literal (`0x`, `0xG`, `0x_FF`) becomes one clear lex error via `scanRadix`
       // instead of silently splitting into `0` + an identifier.
       if c == '0' && (peek2() == 'x' || peek2() == 'X') {
         advance() // '0'
@@ -992,7 +875,7 @@ export function tokenize(source: string): LexResult {
         continue
       }
       // Plain decimal, optional fractional part. A `_` separator is legal only
-      // BETWEEN digits (consumed when a digit follows).
+      // between digits (consumed when a digit follows).
       while (
         gPos < gSrc.length &&
         (isDigit(peek()) || (peek() == '_' && isDigit(peek2())))
@@ -1008,18 +891,10 @@ export function tokenize(source: string): LexResult {
           advance()
         }
       }
-      // SCIENTIFIC NOTATION — `e`/`E`, an optional sign, then a decimal digit run
-      // with the same `_`-between-digits rule. `1e3`, `1.5e-7`, `2E+10`, `1e0`.
-      //
-      // Only the DECIMAL arm reaches here: a radix literal returned above, so the
-      // `e` of `0x1e5` is a hex digit and is never an exponent marker. The mantissa
-      // grammar is UNCHANGED — VL has no bare `.5` or `1.` float, so `.5e3` stays
-      // DOT + `5e3` and `1.e3` stays `1` + DOT + `e3` (member access).
-      //
-      // Taken EAGERLY: once an `e`/`E` follows the mantissa the literal is committed
-      // to being a float, so `1e` / `1e+` / `1e_5` report AT THE LITERAL rather than
-      // splitting into a NUMBER plus a stray identifier the PARSER then blames. The
-      // recovery consumes the identifier run as `scanRadix` does — no cascade.
+      // Scientific notation: `e`/`E`, an optional sign, then a decimal digit run with the
+      // same `_`-between-digits rule. Only the decimal arm reaches here, so the `e` of
+      // `0x1e5` is a hex digit. Taken eagerly — once an `e` follows the mantissa the
+      // literal is committed — so `1e` and `1e+` report at the literal, with no cascade.
       let expBad = false
       if peek() == 'e' || peek() == 'E' {
         advance() // 'e' / 'E'
@@ -1043,7 +918,7 @@ export function tokenize(source: string): LexResult {
       // A misplaced separator (doubled `1__0`, trailing `1_`, `1e5_`) — a `_` left
       // here sits at the start, end, or against another `_`, never between digits.
       // Skipped when the exponent already reported: its recovery ate the id run, so
-      // a `_` here would be a SECOND diagnostic for one broken literal.
+      // a `_` here would be a second diagnostic for one broken literal.
       if !expBad && peek() == '_' {
         diag("`_` may only separate digits in a numeric literal")
         while gPos < gSrc.length && isIdPart(peek()) { advance() }
@@ -1055,25 +930,16 @@ export function tokenize(source: string): LexResult {
     // Char literal `'...'`.
     if c == '\'' {
       const value = scanQuoted('\'')
-      // A char literal must decode to exactly one code point. Empty `''` or
-      // multi-char `'ab'` is an error (we still emit a CHAR token to recover).
-      //
-      // COUNTED IN CODE POINTS, NOT IN `.length`. Since Stage 2c `.length` is a BYTE
-      // count, so `'é'` — one code point, two UTF-8 bytes — would be rejected as
-      // multi-character and `'\u{1F600}'` as four. This is the exact seam
-      // `string-rep-measurements.md` §2.7 L3 warned Stage 2c would open between the two
-      // escape decoders: `decodeStr` must start producing BYTES while `emitCharLitNode`
-      // keeps counting CODE POINTS, so the lexer's half has to say which unit it means.
-      // `cpCount` is that statement, and it is rep-STABLE (it iterates), which the
-      // bootstrap needs — this same source is compiled by a code-point-rep compiler on
-      // the seed rung and by a byte-rep one thereafter.
+      // A char literal must decode to exactly one code point; empty `''` or multi-char
+      // `'ab'` is an error, and a CHAR token is still emitted to recover. Counted in code
+      // points, not `.length`, which is a byte count that would reject `'é'` as
+      // multi-character. `cpCount` is rep-stable, which the bootstrap ladder needs.
       const cpn = cpCount(value)
       if cpn != 1 {
-        // Span the WHOLE literal, opening quote through closing quote: the
-        // scanner already sits one past it, so `startCol` is the open quote and
-        // `gCol` is the exclusive end. The offence is the literal's LENGTH, so a
-        // one-column caret at the open quote (what anchoring alone gave) points
-        // at the one character that is not the problem.
+        // Span the whole literal, opening quote through closing quote: the scanner sits
+        // one past it, so `startCol` is the open quote and `gCol` the exclusive end. The
+        // offence is the literal's length, so a one-column caret would point at the one
+        // character that is not the problem.
         if cpn == 0 {
           diagSpan("Empty char literal", startLine, startCol, gCol)
         } else {
@@ -1090,7 +956,7 @@ export function tokenize(source: string): LexResult {
     }
 
     // String literal `"..."` — and, since the hole trigger `\{` lives in the
-    // ESCAPE namespace, the same split-run opener a backtick is. A string with
+    // escape namespace, the same split-run opener a backtick is. A string with
     // no hole is one `STRING` token and nothing downstream changes for it; one
     // with a hole opens a `TEMPLATE_HEAD` and rides the identical machinery.
     if c == '"' {
@@ -1099,8 +965,8 @@ export function tokenize(source: string): LexResult {
         tplOpenPush(startLine, startCol, startPos, '"')
         toks.push(mkTok("TEMPLATE_HEAD", value, startPos, startLine, startCol))
       } else {
-        // The span `scanQuoted` used to report for itself: the scan stopped at a
-        // raw newline (still on `startLine`) or at EOF, so `gCol` is the honest
+        // The span `scanQuoted` reports for a non-interpolable literal: the scan stopped
+        // at a raw newline (still on `startLine`) or at EOF, so `gCol` is the honest
         // exclusive end either way.
         if gTplStop == 2 {
           diagSpan("Unterminated string literal", startLine, startCol, gCol)
@@ -1110,7 +976,7 @@ export function tokenize(source: string): LexResult {
       continue
     }
 
-    // Template literal — the OPENING backtick. A template with no hole is one
+    // Template literal — the opening backtick. A template with no hole is one
     // `TEMPLATE` token; one with holes opens a `TEMPLATE_HEAD` and pushes a row
     // onto the hole stack, which the `}` arm below closes.
     if c == '`' {
@@ -1132,9 +998,9 @@ export function tokenize(source: string): LexResult {
       continue
     }
 
-    // `{` / `}` — intercepted ahead of the operator tables so the brace DEPTH is
+    // `{` / `}` — intercepted ahead of the operator tables so the brace depth is
     // tracked (see the template-scanner state block). A `}` at the innermost
-    // open hole's depth is not a closer at all: it RESUMES the template.
+    // open hole's depth is not a closer at all: it resumes the template.
     if c == '{' {
       gBrace = gBrace + 1
       advance()
@@ -1143,7 +1009,7 @@ export function tokenize(source: string): LexResult {
     }
     if c == '}' {
       if atTplHoleDepth() {
-        // Resumed in the mode the run OPENED in — a `"` run still refuses a raw
+        // Resumed in the mode the run opened in — a `"` run still refuses a raw
         // newline, a backtick run still takes one as content. This is the one
         // read of `gTplQuote` that makes one machinery serve two literal forms.
         const tv2 = scanQuoted(gTplQuote[gTplQuote.length - 1]) // the `}` is this part's opener
@@ -1162,13 +1028,10 @@ export function tokenize(source: string): LexResult {
       continue
     }
 
-    // Three-char operator (`>>>`) — longest match first.
-    //
-    // The three no-match tests below run for EVERY token in the input. A
-    // `TokKind` is an i32 atom, so `x != ""` is one `i32.ne` against a constant
-    // — nothing is called and nothing is measured. (`.length` is not even
-    // spellable on a `TokKind`: the checker rejects a field read that is not on
-    // every member of the union.)
+    // Three-char operator (`>>>`) — longest match first. The three no-match tests below
+    // run for every token: a `TokKind` is an i32 atom, so `x != ""` is one `i32.ne` against
+    // a constant. (`.length` is not spellable on a `TokKind` — the checker rejects a field
+    // read that is not on every member of the union.)
     const three = threeCharKind(c, peek2(), peekN(2))
     if three != "" {
       advance()
@@ -1202,7 +1065,7 @@ export function tokenize(source: string): LexResult {
     toks.push(mkTok("ERROR", "", startPos, startLine, startCol))
   }
 
-  // Input ran out INSIDE a hole (`` `a${x ``): no part ever scanned to EOF, so
+  // Input ran out inside a hole (`` `a${x ``): no part ever scanned to EOF, so
   // nothing above reported it. One diagnostic per still-open template.
   while gTplOpenLine.length > 0 {
     tplOpenDiag()
@@ -1213,13 +1076,17 @@ export function tokenize(source: string): LexResult {
   { tokens: toks, diags: gDiags, comments: gComments }
 }
 
+// The 0-based exclusive end column of the source line the character at offset `pos`
+// (column `col`) sits on. A template is the one literal that spans lines, so the whole-run
+// span `scanQuoted` gives `"` and `'` is not expressible for it — `diagSpan`'s columns are
+// one pair on one line — and the honest span for an unterminated one is its first line.
 function tplLineEndCol(pos: i32, col: i32) {
   let p = pos
   while p < gSrc.length && gSrc[p] != '\n' && gSrc[p] != '\r' { p = p + 1 }
   col + (p - pos)
 }
 
-// True when the scanner sits inside a template HOLE at that hole's own brace
+// True when the scanner sits inside a template hole at that hole's own brace
 // depth — the test that tells a hole-closing `}` from a block-closing one, and
 // the same test that suppresses NEWLINE there.
 function atTplHoleDepth() {
@@ -1238,8 +1105,8 @@ function tplOpenPush(line: i32, col: i32, pos: i32, quote: i32) {
   0
 }
 
-// Report the innermost open run as unterminated, AT ITS OPENING DELIMITER —
-// naming the literal the AUTHOR opened, which is the only one they can fix.
+// Report the innermost open run as unterminated, at its opening delimiter — naming the
+// literal the author opened, which is the only one they can fix.
 function tplOpenDiag() {
   const oi = gTplOpenLine.length - 1
   if oi >= 0 {
@@ -1254,19 +1121,6 @@ function tplOpenDiag() {
   }
   gDiags.length
 }
-
-// The 0-based EXCLUSIVE end column of the source line the character at offset
-// `pos` (column `col`) sits on — `col` plus the characters left before the line
-// break.
-//
-// A TEMPLATE IS THE ONE LITERAL THAT SPANS LINES, so the "whole run" span
-// `scanQuoted` hands `"` and `'` is not expressible for it: `diagSpan`'s columns
-// are one pair on ONE line by construction, and that is sound for a quoted
-// literal only because a raw newline terminates one. The honest span for an
-// unterminated template is therefore its FIRST line — it opens here and does not
-// close before the line ends — which is exactly the run a reader scans for the
-// missing backtick. Reported at the OPENING backtick either way, so a
-// multi-line template still points at the character that needs fixing.
 
 // Close the innermost open run (the four stacks move together).
 function tplOpenPop() {

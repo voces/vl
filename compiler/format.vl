@@ -1,35 +1,18 @@
 import { pushCps } from "./strutil"
 import { demangleSpelling } from "./tyname"
 
-// AST-driven source formatter for the self-hosted VL front end.
+// AST-driven source formatter for the self-hosted VL front end. `formatProgram(progRoot)`
+// walks the parser arena and generates canonical VL source from it, as a hybrid:
+// expressions are printed structurally (operator spacing, list reflow) with type syntax
+// recovered verbatim from source `[start, stop)` spans, since the AST stores types as
+// synthetic name strings only; control flow, blocks and statement sequencing are
+// pretty-printed, with comments placed around them. The driver supplies source and
+// comments through `fmtSetSource` and `fmtAddComment` before the call.
 //
-// `formatProgram(progRoot)` walks the parser arena (`P.nodes`) and *generates*
-// canonical VL source from it. It is a HYBRID:
-//   - EXPRESSIONS are printed structurally (operator spacing, list reflow), with
-//     TYPE syntax (variable / parameter / return annotations, `is` check-types,
-//     `type`/union declarations) recovered VERBATIM from source via per-node
-//     `[start, stop)` spans (`pos` .. `nodeEndOf`), since the AST stores types as
-//     synthetic NAME strings only.
-//   - CONTROL FLOW / BLOCKS / statement sequencing are pretty-printed, placing
-//     comments (own-line vs trailing) around them.
-//
-// SOURCE + COMMENTS are supplied by the driver through module globals before the
-// call: `fmtSetSource(src)` and `fmtAddComment(...)` (the lexer's retained
-// comments). The driver lexes → parses → calls `formatProgram`, then the host reads
-// the result string char-by-char.
-//
-// ── WIDTHS ARE CODE POINTS, OFFSETS ARE BYTES ────────────────────────────────
-// Every number in this file that is compared against `fmtWidth`, or added to
-// something that will be (a `column`), is a WIDTH and is spelled `dispWidth(s)`
-// (`fmt_util.vl`). Every number that indexes or slices a string is an OFFSET and
-// stays `s.length` / `s[i]`. `.length` is a BYTE count, so one left in a width
-// position wraps any line holding a non-ASCII character early, and silently: a
-// 60-column line of em dashes measures 132 and breaks into three. An emptiness test
-// and an ARRAY length are neither, and are left alone.
-//
-// What the port covers, the surface forms it recovers by marker or token scan, and
-// the residual divergences from the retired host formatter:
-// docs/internals/format-notes.md §"module contract".
+// Widths are code points, offsets are bytes. Every number compared against `fmtWidth`, or
+// added to a `column`, is a width and is spelled `dispWidth(s)`; every number that indexes
+// or slices stays `s.length`. One `.length` left in a width position wraps a line holding
+// a non-ASCII character early and silently. What the port covers: `format-notes.md`.
 
 import {
   ArrayLit,
@@ -68,8 +51,8 @@ import {
   WhileStmt,
 } from "./ast"
 import { P, isBodyTyDecl, nodeEndOf } from "./ast"
-// The free INDEX-OPERATOR declaration-name encoding (B14) — the formatter prints
-// the operator back in its SOURCE spelling, not the name it declares under.
+// The free index-operator declaration-name encoding — the formatter prints the operator
+// back in its source spelling, not the name it declares under.
 import { opDeclOpOf } from "./ast"
 import { fnTpBoundOf } from "./ast"
 import {
@@ -110,11 +93,10 @@ import {
 // ── Configuration ─────────────────────────────────────────────────────────────
 let fmtWidth = 80
 
-// ── Source + comments (filled by the driver before `formatProgram`) ───────────
-// The source text whose spans we slice, plus the lexer's retained comments as
-// PARALLEL arrays (one entry per comment): verbatim `//`/`///` text, char-offset
-// start, 1-based start line, and a `trailing` flag (1 = sits after code on its
-// line, 0 = own-line). `cmtCursor` is the next unconsumed comment in order.
+// The source text whose spans are sliced, plus the lexer's retained comments as parallel
+// arrays (one entry per comment): verbatim `//` or `///` text, char-offset start, 1-based
+// start line, and a `trailing` flag (1 for after code on its line, 0 for own-line).
+// `cmtCursor` is the next unconsumed comment in order.
 let fmtSrc = ""
 let cmtText: string[] = []
 let cmtStart: i32[] = []
@@ -167,10 +149,10 @@ export function fmtAddComment(
 // `outBuf` so the inner statements render into a fresh buffer.
 let outBuf: string[] = []
 
-// Seed for the TOP-LEVEL `emitStatements`' `prevLine`: the stop line of the last
-// recovered import (0 when there are none). It lets the blank-line policy between
-// the import block and the first statement match the source. `emitStatements`
-// consumes it on entry and resets it to 0, so nested calls are unaffected.
+// Seed for the top-level `emitStatements`' `prevLine`: the stop line of the last recovered
+// import (0 when there are none). It lets the blank-line policy between the import block
+// and the first statement match the source. `emitStatements` consumes it on entry and
+// resets it to 0, so nested calls are unaffected.
 let topPrevLine = 0
 
 function fmtEmitRaw(s: string) {
@@ -186,11 +168,9 @@ function emitLine(indent: i32, text: string) {
 
 // ── low-level source access ───────────────────────────────────────────────────
 
-// The 1-based source line containing char offset `off` (a scan over `lineStart`).
-// `lineStart` is ascending, so binary-search the largest index whose offset is
-// `<= off`. The old linear scan was O(lines) PER call and is hit per node
-// (start/stopLineOf), so over a whole file it was O(n²) — minutes + heap blow-up
-// on the 6940-line typecheck.vl.
+// The 1-based source line containing char offset `off`. `lineStart` is ascending, so this
+// binary-searches the largest index whose offset is `<= off`; a linear scan is O(lines) per
+// call and runs per node, which is O(n²) over a whole file.
 function lineOf(off: i32) {
   let lo = 1
   let hi = lineStart.length - 1
@@ -220,14 +200,14 @@ function sliceNode(ix: i32) {
   r
 }
 
-// The 1-based START line of node `ix`, or 0 when it has no span.
+// The 1-based start line of node `ix`, or 0 when it has no span.
 function startLineOf(ix: i32) {
   const p = nodePos(ix)
   if p < 0 { return 0 }
   lineOf(p)
 }
 
-// The 1-based STOP line of node `ix` (line of the last source char), or 0.
+// The 1-based stop line of node `ix` (line of the last source char), or 0.
 function stopLineOf(ix: i32) {
   const e = nodeEndOf(ix)
   if e < 0 { return 0 }
@@ -235,18 +215,10 @@ function stopLineOf(ix: i32) {
   lineOf(e - 1)
 }
 
-// ── trailing-comment alignment (a whole-text post-pass) ───────────────────────
-// `vl fmt` normalizes the spacing before a trailing `//`/`///` comment to a SINGLE
-// space per line; this pass re-aligns runs of them to a common column so
-// hand-aligned comment groups survive a format. It runs over the FINISHED text, so
-// it treats EVERY trailing comment uniformly — the ones the printer emits and the
-// ones reproduced verbatim inside a `type`/union slice — with no per-node case.
-//
-// A BLOCK is a maximal run of lines that are neither blank nor an own-line comment;
-// a comment-LESS code line inside it is tolerated. Within a block every trailing
-// comment aligns to `max(code width of the commented lines that still leave room
-// before the width) + 1`; a line whose code is already too wide keeps its single
-// space and does NOT drag the column out. Recomputed identically ⇒ idempotent.
+// Trailing-comment alignment, a whole-text post-pass. `vl fmt` normalizes the spacing
+// before a trailing comment to a single space; this re-aligns runs of them to a common
+// column, over the finished text so it treats every trailing comment uniformly. A comment
+// aligns to the widest commented line still leaving room; a wider one keeps its space.
 
 function alignComments(text: string) {
   const lines = splitLines(text)
@@ -261,18 +233,10 @@ function alignComments(text: string) {
       out.push(lines[i])
       i = i + 1
     } else {
-      // A RUN is consecutive code lines at the SAME indent (a comment-less line is
-      // tolerated; a blank, an own-line comment, or an indent change ends it — so a
-      // struct's fields don't align against the surrounding declarations). The run
-      // is aligned only when the author signalled intent — some commented line has
-      // ≥2 spaces before its `//`; otherwise each comment normalizes to one space.
-      // The widest fitting commented line sets the column; one too wide to leave
-      // room keeps its single space rather than dragging the column out.
-      //
-      // COLUMNS, NOT OFFSETS. `codeColumnBefore` is the width twin of the byte offset
-      // `codeWidthBefore` returns; only the offset may be handed to `slice`, and only the
-      // column may be compared to `fmtWidth` or used as the alignment target. Measuring the
-      // target in bytes pushes a run's comments right by one column per non-ASCII byte.
+      // A run is consecutive code lines at the same indent; a blank, an own-line comment or
+      // an indent change ends it, so a struct's fields do not align against the surrounding
+      // declarations. It aligns only when some commented line carries two or more spaces
+      // before its `//`. Columns, not offsets: measuring in bytes drags a run rightwards.
       const runIndent = leadingSpaces(lines[i])
       let j = i
       let alignCol = 0
@@ -290,7 +254,7 @@ function alignComments(text: string) {
         }
         j = j + 1
       }
-      // Intent = a line NARROWER than the widest carries padding (>1 space) — the
+      // Intent = a line narrower than the widest carries padding (>1 space) — the
       // act of aligning is padding the short lines up to a column, so that is the
       // real signal. The widest line ends at one space regardless, so its own
       // spacing doesn't count (else a single stray gap would drag the run).
@@ -299,7 +263,7 @@ function alignComments(text: string) {
       while m < j {
         const c = trailingCommentAt(lines[m])
         if c >= 0 {
-          // `c - w` is the author's GAP, and it is spaces/tabs — ASCII — so the byte
+          // `c - w` is the author's gap, and it is spaces/tabs — ASCII — so the byte
           // difference is the column difference. It is the only place the two units meet.
           const w = codeWidthBefore(lines[m], c)
           if codeColumnBefore(lines[m], c) < alignCol && c - w >= 2 {
@@ -313,7 +277,7 @@ function alignComments(text: string) {
       while k < j {
         const c = trailingCommentAt(lines[k])
         if c >= 0 {
-          // `w` SLICES (a byte offset); `wc` POSITIONS (a column). The pad is the column
+          // `w` slices (a byte offset); `wc` positions (a column). The pad is the column
           // gap `col - wc`, never `col - w` — those differ by the line's non-ASCII bytes.
           const w = codeWidthBefore(lines[k], c)
           const wc = codeColumnBefore(lines[k], c)
@@ -342,13 +306,10 @@ function alignComments(text: string) {
 // Comments are consumed in source order. `cmtCursor` is the next unconsumed
 // comment; all placement helpers advance it monotonically (host `pending` shift).
 
-// Char spans the printer reproduced VERBATIM in the output (the comment-bearing
-// slice fallbacks — see `sliceFallback`). A pending comment that starts inside
-// one was already emitted as part of that verbatim text, so the placement
-// helpers SKIP it instead of re-emitting it after the statement. Spans are
-// RECORDED rather than the comments consumed at render time because expression
-// rendering is speculative (a one-line attempt may be discarded and the node
-// re-rendered) — marking is idempotent where consuming would lose the comment.
+// Char spans the printer reproduced verbatim in the output (`sliceFallback`). A pending
+// comment starting inside one already appears in that text, so the placement helpers skip
+// it rather than re-emit it. Spans are recorded rather than the comments consumed, because
+// expression rendering is speculative and marking is idempotent where consuming is not.
 let vbStart: i32[] = []
 let vbStop: i32[] = []
 
@@ -442,11 +403,10 @@ function gapBefore(off: i32) {
   g
 }
 
-// Suffix form of `trailingOn`: " <comment>" or "". The author's spacing before
-// the comment is peeked first: ≥2 spaces signals an intent to align, preserved as
-// two spaces so the alignment post-pass can detect it even on a RECONSTRUCTED line
-// (where the original gap would otherwise be normalized away). A run with no such
-// signal is left at one space.
+// Suffix form of `trailingOn`: " <comment>" or "". The author's spacing before the comment
+// is peeked first — two or more spaces signal an intent to align, preserved as two spaces
+// so the alignment post-pass can detect it even on a reconstructed line, where the original
+// gap would otherwise be normalized away. A run with no such signal stays at one space.
 function trailerSuffix(line: i32) {
   skipCovered()
   let wide = false
@@ -474,14 +434,10 @@ function flushRemaining(indent: i32) {
   0
 }
 
-// Comment-aware verbatim fallback for a construct printed from its source slice.
-// A slice with no comment inside collapses to one line (the canonical inline
-// form). One that CONTAINS a `//` comment must keep its line structure —
-// collapsing would splice the following code AND the closing brace onto the
-// comment's line, commenting them out (unparseable output). Such a slice is
-// reproduced verbatim (interior lines keep their source indentation, which makes
-// a re-format reproduce them unchanged — idempotent) and its span recorded so
-// the placement helpers skip the comments it already carries.
+// Comment-aware verbatim fallback for a construct printed from its source slice. A slice
+// with no comment inside collapses to one line; one containing a `//` must keep its line
+// structure, since collapsing would splice the following code and the closing brace onto
+// the comment's line. Such a slice is reproduced verbatim and its span recorded.
 function sliceFallback(ix: i32) {
   const start = nodePos(ix)
   const stop = nodeEndOf(ix)
@@ -515,18 +471,10 @@ export function formatProgram(progRoot: i32) {
   if progRoot < 0 || progRoot >= P.nodes.length { return "" }
   const root = P.nodes[progRoot]
   if root is Program {
-    // Imports are emitted from the TOKEN stream (verbatim slice / reflow — the
-    // strategy that keeps comment-bearing imports byte-exact), so the parser's
-    // `ImportDecl` nodes are FILTERED out of the statement walk: emitting them
-    // there too would duplicate every import. Seed the top-level blank-line
-    // policy with the last import's line.
-    //
-    // D1045 — A BODY-SCOPED `type` IS FILTERED FOR THE SAME REASON, one scope in.
-    // The parser hoists such a declaration into `progStmts` so the checker and the
-    // emitter register it, and it stays at its lexical position inside the block as
-    // well — so the walk reaches it TWICE and printed it a second time at the end
-    // of the file (measured on `scripts/capability-probes/body-scope-type-decl.vl`,
-    // which grew a stray `type P = { x: i32, y: i32 }` after the last statement).
+    // Imports are emitted from the token stream, so the parser's `ImportDecl` nodes are
+    // filtered out of the statement walk; emitting them there too would duplicate every
+    // import. D1045 — a body-scoped `type` is filtered one scope in for the same reason:
+    // the parser hoists it into `progStmts` and it stays at its lexical position as well.
     topPrevLine = emitImports()
     const stmts: i32[] = []
     let fi = 0
@@ -544,12 +492,10 @@ export function formatProgram(progRoot: i32) {
   alignComments(normalizeProgram(text))
 }
 
-// Format one recovered `import`/re-export spanning tokens `[kw .. pathTok]`. A BRACED
-// form (`import { a, b } from "p"` / `export { … } from "p"`) is reconstructed and reflowed
-// through `wrapList` — it stays one line when it fits in `fmtWidth`, else wraps ONE NAME PER
-// LINE with a trailing comma (the convention every other list uses). This both wraps the
-// pathologically long imports AND normalizes an already-wrapped one. A non-braced form
-// (`import x from "p"`) has no name list to reflow, so it is kept verbatim.
+// Format one recovered `import` or re-export spanning tokens `[kw .. pathTok]`. A braced
+// form is reconstructed and reflowed through `wrapList` — one line when it fits in
+// `fmtWidth`, else one name per line with a trailing comma — which both wraps a long import
+// and normalizes an already-wrapped one. A non-braced form is kept verbatim.
 function fmtImport(kw: i32, pathTok: i32) {
   const t = P.toks[kw]
   const endTok = P.toks[pathTok]
@@ -558,9 +504,9 @@ function fmtImport(kw: i32, pathTok: i32) {
     return fmtSrc.slice(t.start, endTok.start + endTok.text.length)
   }
   // A comment inside the braces cannot ride the reflowed list — rebuilt on one
-  // line, the `//` would swallow the names after it AND the `} from "…"` tail
+  // line, the `//` would swallow the names after it and the `} from "…"` tail
   // (and the wrapped form would tear it off its name). Keep such an import
-  // VERBATIM; the caller consumes the comments the slice reproduces.
+  // verbatim; the caller consumes the comments the slice reproduces.
   if importHasComment(t.start, endTok.start) {
     return fmtSrc.slice(t.start, endTok.start + endTok.text.length)
   }
@@ -586,7 +532,7 @@ function fmtImport(kw: i32, pathTok: i32) {
   }
   const last = trimWs(collapseWs(cur))
   if last.length > 0 { items.push(last) }
-  // Sort the names (a `{ … }` list is a SET — order is not significant), so the wrapped
+  // Sort the names (a `{ … }` list is a set — order is not significant), so the wrapped
   // one-per-line block reads alphabetically and duplicate/stale imports are easy to spot.
   // Case-sensitive ASCII: capitalised types/singletons (`P`, `T`, `Tok`) sort before
   // lowercase functions. An `a as b` item sorts by its full text (i.e. the source name `a`).
@@ -635,13 +581,10 @@ function fmtSortNames(items: string[]) {
   0
 }
 
-// Recover `import { … } from "path"` AND re-export `export { … } from "path"`
-// statements from `P.toks` (the parser consumes both without building a node).
-// Each runs from its leading keyword to its path `STRING`; slice that span
-// verbatim, placing own-line comments and a single source blank line before each.
-// Returns the last one's stop line, or 0 when the file has none. A re-export is an
-// `EXPORT` immediately followed by `{` (an `export function`/`let`/… is a normal
-// declaration the parser DOES keep, so it is not recovered here).
+// Recover `import { … } from "path"` and re-export `export { … } from "path"` statements
+// from `P.toks`, which the parser consumes without building a node — a re-export being an
+// `EXPORT` immediately followed by `{`, since `export function` is a declaration the parser
+// keeps. Each is sliced verbatim from keyword to path; returns the last stop line, or 0.
 function emitImports() {
   let prevLine = 0
   let i = 0
@@ -671,7 +614,7 @@ function emitImports() {
       }
       emitLeadingComments(0, startLine)
       const src = fmtImport(i, found)
-      // A comment-bearing import came back VERBATIM with its interior comments
+      // A comment-bearing import came back verbatim with its interior comments
       // reproduced in place — consume them so they are not re-emitted after it
       // (no-op for the reflowed form: no pending comment lies in its span).
       consumeInlineSpan(startLine, endTok.line)
@@ -698,11 +641,10 @@ function joinOut() {
     total = total + outBuf[i].length
     i = i + 1
   }
-  // STAGE 2c: a GROWING code-point buffer. `total` is a sum of `.length`s, which are BYTE
-  // counts now, while `fromCodePoints`'s element is a CODE POINT — so the exact-fit
-  // `__array_new__` was sized in the wrong unit AND filled with bytes. `.push`'s 2x growth
-  // bounds the copying at 2N; the O(n^2) `s = s + p` accumulator this replaced is still the
-  // thing being avoided, and still is.
+  // A growing code-point buffer: `total` sums `.length`s, which are byte counts, while
+  // `fromCodePoints` takes code points, so an exact-fit `__array_new__` would be sized in
+  // the wrong unit. `.push`'s 2x growth bounds the copying at 2N, and the O(n²) `s = s + p`
+  // accumulator is what both forms avoid.
   const buf: i32[] = []
   i = 0
   while i < outBuf.length {
@@ -714,11 +656,9 @@ function joinOut() {
 
 // ── statements ────────────────────────────────────────────────────────────────
 
-// Emit a sequence of statements at `indent`, preserving a single user blank line
-// between them and placing own-line / trailing comments.
-// The end index (exclusive) of a maximal run `stmts[from..]` the user wrote on ONE source
-// line as a `;`-joined sequence (every member a leaf statement). `from + 1` when there is no
-// such run (the next statement is on another line or is not a leaf).
+// The end index (exclusive) of a maximal run `stmts[from..]` the author wrote on one source
+// line as a `;`-joined sequence, every member a leaf statement. `from + 1` when there is no
+// such run — the next statement is on another line, or is not a leaf.
 function sameLineRunEnd(stmts: i32[], from: i32) {
   const line0 = startLineOf(stmts[from])
   if line0 == 0 || !isLeafStmt(stmts[from]) { return from + 1 }
@@ -735,10 +675,12 @@ function sameLineRunEnd(stmts: i32[], from: i32) {
   j
 }
 
+// Emit a sequence of statements at `indent`, preserving a single source blank line between
+// them and placing own-line and trailing comments.
 function emitStatements(stmts: i32[], indent: i32) {
   let prevLine = topPrevLine
   topPrevLine = 0
-  // A non-zero seed means THIS walk starts right after the top-level import
+  // A non-zero seed means this walk starts right after the top-level import
   // block: guarantee exactly one blank line between it and the first statement
   // (or its leading comment block), whatever the source had. Consumed on the
   // first statement; nested walks see a zero seed and are unaffected.
@@ -746,7 +688,7 @@ function emitStatements(stmts: i32[], indent: i32) {
   let i = 0
   while i < stmts.length {
     const ix = stmts[i]
-    // A comment reproduced inside the PREVIOUS statement's verbatim slice must
+    // A comment reproduced inside the previous statement's verbatim slice must
     // not steer this statement's blank-line policy — skip covered ones first.
     skipCovered()
     let sLine = startLineOf(ix)
@@ -755,8 +697,8 @@ function emitStatements(stmts: i32[], indent: i32) {
     // trips a frozen-host emitter quirk — see the format.vl header gotchas.)
     if sLine < 1 { sLine = prevLine + 1 }
     // Preserve a single blank line before this statement's leading comment block
-    // (or the statement itself, if none): measure the gap to the FIRST pending
-    // comment, not the statement, so a blank line WITHIN the comment block is
+    // (or the statement itself, if none): measure the gap to the first pending
+    // comment, not the statement, so a blank line within the comment block is
     // accounted for there (emitLeadingComments) rather than mistaken for one here.
     let gapTo = sLine
     if cmtCursor < cmtText.length && cmtLine[cmtCursor] < sLine {
@@ -767,10 +709,10 @@ function emitStatements(stmts: i32[], indent: i32) {
     }
     afterImports = false
     emitLeadingComments(indent, sLine)
-    // PRESERVE a `;`-joined one-liner: a run of leaf statements the user put on one source
+    // Preserve a `;`-joined one-liner: a run of leaf statements the user put on one source
     // line is re-emitted joined by `; ` IF it fits in the width (else each on its own line).
     // Bail when a comment sits on that line (a trailing `// …` would be lost) — the per-
-    // statement path below handles it. Never INTRODUCE a join across separate source lines.
+    // statement path below handles it. Never introduce a join across separate source lines.
     let grouped = false
     const runEnd = sameLineRunEnd(stmts, i)
     if runEnd - i >= 2 && !commentInSpan(sLine, sLine) {
@@ -787,8 +729,8 @@ function emitStatements(stmts: i32[], indent: i32) {
       if ok && indent * 2 + dispWidth(joined) <= fmtWidth {
         emitLine(indent, joined)
       } else {
-        // The one-liner is over the width (or an item went multi-line): expand the WHOLE
-        // run to one statement per line — never a PARTIAL regroup of the tail.
+        // The one-liner is over the width (or an item went multi-line): expand the whole
+        // run to one statement per line — never a partial regroup of the tail.
         let e = i
         while e < runEnd {
           emitStatement(stmts[e], indent)
@@ -849,13 +791,10 @@ function emitStatement(ix: i32, indent: i32) {
   0
 }
 
-// Emit a possibly-multiline rendering at `indent`, attaching a trailing comment
-// on `line` to the LAST emitted line. Only the FIRST line is indented here: an
-// expression renders its CONTINUATION lines already carrying their absolute
-// indentation (wrapList's `indentStr(indent + 1)`, binaryChain's
-// `indentStr(indent + 1)`, a block/function body's `emitStatements`), so
-// re-indenting them too would double-count the statement's own indent — the
-// wrapped-object over-indentation bug.
+// Emit a possibly-multiline rendering at `indent`, attaching a trailing comment on `line`
+// to the last emitted line. Only the first line is indented here: an expression renders its
+// continuation lines already carrying their absolute indentation, so re-indenting them
+// would double-count the statement's own indent.
 function emitMultiline(rendered: string, indent: i32, line: i32) {
   const suffix = trailerSuffix(line)
   const lines = splitLines(rendered)
@@ -872,12 +811,10 @@ function emitMultiline(rendered: string, indent: i32, line: i32) {
   0
 }
 
-// The visual column a statement's expression starts at is the leading indent
-// (`indent * 2`) plus any keyword/binding prefix already on the line. Pass that
-// ABSOLUTE column into `expr` so the width checks in `wrapList` / `binaryChain`
-// (which compare `column + dispWidth(text)` against `fmtWidth`) account for the
-// indentation — otherwise a deeply-indented over-width call or `+`-chain measures
-// as if it began at column 0 and is left un-wrapped past 80.
+// The visual column a statement's expression starts at is the leading indent plus any
+// keyword or binding prefix already on the line. That absolute column is passed into `expr`
+// so the width checks in `wrapList` and `binaryChain` account for the indentation;
+// otherwise a deeply-indented over-width call measures as if it began at column 0.
 function emitExpressionStatement(ix: i32, indent: i32) {
   const line = stopLineOf(ix)
   const rendered = expr(ix, indent, indent * 2)
@@ -928,15 +865,10 @@ function emitBreakContinue(kw: string, label: string, indent: i32, ix: i32) {
   0
 }
 
-// A `type`/union declaration: recover verbatim from source (the AST discards the
-// field/variant type syntax). Multi-line decls keep their interior layout. The
-// span may include a trailing NEWLINE (a union's last consumed token is the line
-// break after the final variant name) — strip it so no empty line is emitted.
-// Consume the comments the verbatim slice of a type/union decl already reproduces
-// inline — every pending comment on lines [startLine, stopLine] EXCEPT a trailing
-// comment on the closing line (which sits AFTER the `}`, outside the slice, and is
-// emitted by `trailerSuffix`). Without this they'd be re-emitted as own-line
-// comments after the decl (the formatter re-flushes any comment it didn't consume).
+// Consume the comments the verbatim slice of a type or union declaration already reproduces
+// inline — every pending comment on lines [startLine, stopLine] except a trailing comment on
+// the closing line, which sits after the `}` and is emitted by `trailerSuffix`. Without this
+// they are re-emitted as own-line comments after the declaration.
 function consumeInlineSpan(startLine: i32, stopLine: i32) {
   while cmtCursor < cmtText.length && cmtLine[cmtCursor] <= stopLine {
     if cmtLine[cmtCursor] < startLine { return 0 }
@@ -948,11 +880,10 @@ function consumeInlineSpan(startLine: i32, stopLine: i32) {
   0
 }
 
-// Split `s` at every top-level occurrence of `sep`, returning each part trimmed.
-// "Top-level" = not nested inside `()`/`[]`/`{}`/`<>` and not inside a `"…"` string.
-// The `>` of a `=>` arrow is NOT a bracket close (function types in a field stay
-// intact). Used to break a union's `|` members and a struct's `,` fields when a
-// single-line decl is too wide.
+// Split `s` at every top-level occurrence of `sep`, returning each part trimmed. Top-level
+// means not nested inside `()`/`[]`/`{}`/`<>` and not inside a string; the `>` of a `=>`
+// arrow is not a bracket close, so a function type in a field stays intact. It breaks a
+// union's `|` members and a struct's `,` fields when a single-line declaration is too wide.
 function splitTopLevel(s: string, sep: string) {
   const parts: string[] = []
   let depth = 0
@@ -981,18 +912,10 @@ function splitTopLevel(s: string, sep: string) {
   parts
 }
 
-// Wrap an over-width single-line type decl `codeLine` (already carrying its
-// `export ` prefix) across lines, emitting at `indent`; `suffix` (a trailing
-// comment) goes on the final line. Returns `true` when it wrapped, `false` for a
-// shape we do not know how to wrap (a non-union alias) — the caller then falls back
-// to the verbatim path. A UNION keeps its first member on the `=` line and gives
-// each remaining member its own `| …` line; a struct RECORD opens the brace, one
-// field per line with a trailing comma, then a closing `}`.
-//
-// `isRecord` IS THE PARSER'S OWN VERDICT, threaded down from the statement dispatch
-// — not re-derived here from the rendered spelling. Asking the text instead
-// (`body[0] == '{'`) made `vl fmt` emit a decl that does not re-parse:
-// docs/internals/format-notes.md §wrapTypeDecl.
+// Wrap an over-width single-line type declaration across lines at `indent`; `suffix` goes
+// on the final line. Returns `true` when it wrapped, `false` for a shape with no wrapping
+// rule, so the caller falls back to verbatim. `isRecord` is the parser's own verdict,
+// threaded down: asking the rendered text instead emits a declaration that re-parses wrong.
 function wrapTypeDecl(
   codeLine: string,
   indent: i32,
@@ -1043,21 +966,24 @@ function wrapTypeDecl(
   true
 }
 
+// A `type` or union declaration, recovered verbatim from source because the AST discards
+// the field and variant type syntax. A multi-line declaration keeps its interior layout.
+// The span may include a trailing newline — a union's last consumed token is the line break
+// after the final variant name — which is stripped so no empty line is emitted.
 function emitTypeOrUnionDecl(ix: i32, indent: i32, isRecord: boolean) {
   const raw = rstripWsAll(sliceNode(ix))
   const lines = splitLines(raw)
   const stopLine = stopLineOf(ix)
-  // The slice reproduces the decl VERBATIM (including any inline comments inside
+  // The slice reproduces the decl verbatim (including any inline comments inside
   // it — the trailing comment on the opening line and per-field comments), so mark
   // those consumed before reading the closing trailer. The parser drops `export`,
   // so recover it from the token stream (like let/function).
   consumeInlineSpan(startLineOf(ix), stopLine)
   const suffix = trailerSuffix(stopLine)
-  // A single-line decl whose CODE (the slice, sans the trailing comment in
-  // `suffix`) overflows the width gets wrapped: union members / struct fields go
-  // one per line. Comments are allowed to be long, so the width test ignores
-  // `suffix` — a decl that fits in code but only overflows via its trailing
-  // comment stays on one line. An already multi-line decl keeps its layout.
+  // A single-line declaration whose code overflows the width gets wrapped, one union member
+  // or struct field per line. The width test ignores `suffix`, so a declaration that fits in
+  // code and only overflows via its trailing comment stays on one line. An already
+  // multi-line declaration keeps its layout.
   if lines.length == 1 {
     const codeLine = exportPrefix(ix) + trimWsStart(lines[0])
     if indent * 2 + dispWidth(codeLine) > fmtWidth {
@@ -1126,7 +1052,7 @@ function emitBlockBody(blockIx: i32, indent: i32) {
   const n = P.nodes[blockIx]
   if n is Block {
     emitStatements(n.blkStmts, indent + 1)
-    // Flush comments that sit INSIDE the block after its last statement (or in an
+    // Flush comments that sit inside the block after its last statement (or in an
     // empty block) but before the closing `}`. Without this they stay pending and
     // bind to the next statement emitted — e.g. a `// skip` in an empty `if` branch
     // would reappear inside the following `else if` branch.
@@ -1192,10 +1118,9 @@ function emitIf(ix: i32, node: IfStmt, indent: i32) {
   // per line, or the block layout).
   const didChain = emitIfChain(ix, node, indent)
   if didChain { return 0 }
-  // Every branch renders BRACED — a branch parsed from the bare single-statement
-  // sugar (a synthesized one-statement Block, `pos < 0`) folds to the same
-  // one-line `if cond { stmt }` a braced source does. There is no `then`
-  // spelling: the keyword was removed (see DECISIONS.md, 2026-08-31).
+  // Every branch renders braced — a branch parsed from the bare single-statement sugar (a
+  // synthesized one-statement `Block`, `pos < 0`) folds to the same one-line
+  // `if cond { stmt }` a braced source does. There is no `then` spelling (DECISIONS.md).
   const oneLine = collapseSingleIf(ix, node, indent)
   if oneLine.length > 0 {
     emitLine(indent, oneLine)
@@ -1247,11 +1172,10 @@ function inlineBlockBody(blockIx: i32, indent: i32) {
     if sl > 0 && commentInSpan(sl, el) { return "" }
     const st = n.blkStmts
     if st.length == 0 { return "{}" }
-    // A MULTI-statement body inlines ONLY when the user wrote every statement on the SAME
-    // source line — i.e. a `;`-joined one-liner (`if c { f(); return x }`). We PRESERVE that
-    // (rejoined with `; `) but never INTRODUCE a join across statements on separate lines.
-    // The caller width-checks the result, so an over-width one-liner is expanded there. A
-    // SINGLE statement inlines regardless (the long-standing single-statement collapse).
+    // A multi-statement body inlines only when the author wrote every statement on the
+    // same source line — a `;`-joined one-liner. That is preserved, rejoined with `; `,
+    // but never introduced across separate lines; the caller width-checks the result. A
+    // single statement inlines regardless.
     if st.length > 1 {
       const line0 = startLineOf(st[0])
       if line0 == 0 { return "" }
@@ -1277,18 +1201,10 @@ function inlineBlockBody(blockIx: i32, indent: i32) {
   }
 }
 
-// Render an `if … else if … [else]` chain whose every branch is a brace block, in
-// the canonical multi-conditional layout:
-//   if cond {
-//     …
-//   } else if cond {
-//     …
-//   } else {
-//     …
-//   }
-// A chain is a nested `IfStmt` in the `ifElse` slot (`else if` — there is no fused
-// `elseif` keyword), detected by `elseIsIf`. Returns false when the node is not such
-// a chain — the caller then uses the plain forms. No one-line collapse.
+// Render an `if … else if … [else]` chain whose every branch is a brace block, in the
+// canonical multi-conditional layout (`if cond {` / `} else if cond {` / `} else {` / `}`).
+// A chain is a nested `IfStmt` in the `ifElse` slot, detected by `elseIsIf`. Returns false
+// when the node is not such a chain, and the caller then uses the plain forms. No collapse.
 function emitIfChain(ix: i32, node: IfStmt, indent: i32) {
   if !elseIsIf(node.ifElse) { return false }
   // Collect clause condition + body arena indices walking the chain.
@@ -1327,11 +1243,10 @@ function emitIfChain(ix: i32, node: IfStmt, indent: i32) {
   if hasElse {
     if !isBlockNode(elseBodyIx) { return false }
   }
-  // Per-clause inline layout: when no comment falls inside the chain and EVERY
-  // clause body is a single simple statement whose `if c { x }` line fits, render
-  // one clause per line — `if c { x }` / `else if c { y }` / `else { z }`. The
-  // parser accepts `else` on a new line, so this round-trips. Otherwise fall
-  // through to the stable block layout below.
+  // Per-clause inline layout: when no comment falls inside the chain and every clause body
+  // is a single simple statement whose `if c { x }` line fits, render one clause per line.
+  // The parser accepts `else` on a new line, so this round-trips; otherwise fall through to
+  // the block layout below.
   if !commentInSpan(startLineOf(ix), stopLineOf(ix)) {
     const clauseLines: string[] = []
     let ok = true
@@ -1367,8 +1282,8 @@ function emitIfChain(ix: i32, node: IfStmt, indent: i32) {
       return true
     }
   }
-  // Block layout: `if cond {` / `} else if cond {` / `} else {` / `}`. A chain is
-  // always `else if` (the fused `elseif` keyword was removed — one canonical form).
+  // Block layout: `if cond {` / `} else if cond {` / `} else {` / `}`. A chain is always
+  // `else if`; there is no fused `elseif` keyword.
   let m = 0
   while m < condIxs.length {
     let prefix = "if "
@@ -1408,7 +1323,7 @@ function emitFunction(ix: i32, node: FuncDecl, indent: i32) {
       }
       // `emitBlockBody`, not a bare `emitStatements`: it also flushes the
       // comments after the body's last statement, so a comment on the final
-      // line of a function stays INSIDE the closing `}` instead of leaking
+      // line of a function stays inside the closing `}` instead of leaking
       // after it (at top level: after the program's final `}`).
       emitLine(indent, header + " {")
       emitBlockBody(body, indent)
@@ -1422,20 +1337,17 @@ function emitFunction(ix: i32, node: FuncDecl, indent: i32) {
   0
 }
 
-// The function signature `function name<T>(params): Ret`. Parameter type and
-// return type are TYPE syntax (synthetic-name in the AST), recovered verbatim per
-// node; parameter names + their `:` annotations are rebuilt with canonical spacing.
-// `reserved` is the columns the header line uses OUTSIDE `prefix(params)ret` — the
-// leading indent, the `export ` modifier (added by the caller), and the trailing
-// ` {` — so the param list wraps when the WHOLE line would overflow, not just the
-// bare signature.
+// The function signature `function name<T>(params): Ret`. Parameter and return types are
+// type syntax and are recovered verbatim per node; parameter names and their `:`
+// annotations are rebuilt with canonical spacing. `reserved` is the columns the header line
+// uses outside `prefix(params)ret`, so the list wraps when the whole line would overflow.
 function functionHeader(ix: i32, node: FuncDecl, reserved: i32) {
   let name = "function"
   if node.fnName.length > 0 { name = "function " + node.fnName }
-  // An INDEX-OPERATOR declaration is stored under a name that also carries its
-  // receiver (`[]@F32View`); the SOURCE spelled the operator alone, quoted. The
-  // receiver half is reprinted anyway, as the `self` parameter's annotation, so
-  // the quoted operator is a faithful round trip and not a lossy one.
+  // An index-operator declaration is stored under a name that also carries its receiver
+  // (`[]@F32View`), while the source spelled the operator alone, quoted. The receiver half
+  // is reprinted anyway as the `self` parameter's annotation, so the quoted operator is a
+  // faithful round trip.
   const opk = opDeclOpOf(node.fnName)
   if opk != "" { name = "function \"" + opk + "\"" }
   let typarams = ""
@@ -1445,7 +1357,7 @@ function functionHeader(ix: i32, node: FuncDecl, reserved: i32) {
     while i < node.fnTyParams.length {
       if i > 0 { typarams = typarams + ", " }
       typarams = typarams + node.fnTyParams[i]
-      // A BOUND (`<T: Showable>`) recovers VERBATIM from source, the same way
+      // A bound (`<T: Showable>`) recovers verbatim from source, the same way
       // every other annotation in this header does — so an inline bound literal
       // reprints with the spacing the author wrote rather than the synthetic
       // name the parser rendered.
@@ -1474,15 +1386,10 @@ function functionHeader(ix: i32, node: FuncDecl, reserved: i32) {
   prefix + paramList + ret
 }
 
-// One parameter `name: Type` (or `name` when untyped), with any DEFAULT value
-// (`name: Type = 0`).
-//
-// `name?: Type` reprints from the surface marker `parOpt`: the parser desugared
-// the annotation to `Type | null` and the default to `null`, and BOTH of those
-// are what the `?` says, so neither is printed beside it. The annotation node's
-// source span still covers exactly the `Type` the author wrote (it is minted
-// after `parseTypeName` consumed it), so the recovery below prints that and not
-// the synthetic union name.
+// One parameter `name: Type` (or `name` when untyped), with any default value. A
+// `name?: Type` reprints from the surface marker `parOpt`: the parser desugared the
+// annotation to `Type | null` and the default to `null`, and both are what the `?` says, so
+// neither is printed beside it. The annotation node's span still covers exactly the `Type`.
 function paramText(ix: i32) {
   const n = P.nodes[ix]
   if n is Param {
@@ -1537,11 +1444,10 @@ function letInline(_ix: i32, node: LetDecl, indent: i32) {
 function expr(ix: i32, indent: i32, column: i32) {
   if ix < 0 || ix >= P.nodes.length { return "" }
   const n = P.nodes[ix]
-  // D1045 — DEMANGLED. This is one of three places the formatter prints a name the
-  // NODE carries rather than the source span, and a body-scoped `type` renames
-  // through all three: a `flat type TV` declared in a body becomes `TV$b1`, and its
-  // `TV.size` fold is an `Ident`. `demangleSpelling` is a no-op on every other name
-  // (`$` is not a legal identifier character).
+  // D1045 — demangled. This is one of three places the formatter prints a name the node
+  // carries rather than the source span, and a body-scoped `type` renames through all
+  // three: a `flat type TV` declared in a body becomes `TV$b1`. `demangleSpelling` is a
+  // no-op on every other name, since `$` is not a legal identifier character.
   if n is Ident { return demangleSpelling(n.identName) }
   if n is NumLit { return literalSlice(ix, n.numText) }
   if n is StrLit { return literalSlice(ix, n.strText) }
@@ -1569,31 +1475,25 @@ function expr(ix: i32, indent: i32, column: i32) {
   sliceFallback(ix)
 }
 
-// One match arm PATTERN. A string literal / the `_` wildcard render as the expression they
-// are; a TYPE pattern is an `IsExpr` the parser minted over the scrutinee (`parseMatchPattern`)
-// and must NOT go through `expr` — that renders the guard surface `scrut is C`, which is not
-// what was written and does not re-parse as a pattern. Its `[pos, end)` span is exactly the
-// type's source text (the node is minted immediately after `parseTypeAtom`, so its `nodeToks`
-// anchor is the type's last token), so the verbatim slice round-trips it.
+// One match arm pattern. A string literal or the `_` wildcard render as the expression they
+// are; a type pattern is an `IsExpr` the parser minted over the scrutinee and must not go
+// through `expr`, which would render the guard surface `scrut is C`. Its `[pos, end)` span
+// is exactly the type's source text, so the verbatim slice round-trips it.
 function matchPatFmt(patIx: i32, bindIx: i32, indent: i32) {
   const pn = P.nodes[patIx]
   if pn is IsExpr {
     const raw = trimWs(recoverType(patIx))
     if raw.length > 0 { return raw + matchBindFmt(bindIx) }
-    // No span (a synthesized pattern): the check-type NAME is the canonical spelling.
+    // No span (a synthesized pattern): the check-type name is the canonical spelling.
     return demangleSpelling(pn.isVariant) + matchBindFmt(bindIx)
   }
   expr(patIx, indent, 0)
 }
 
-// A pattern's PAYLOAD-BINDING clause (phase 2b): `{x, y}`, or "" when there is none.
-//
-// Rendered STRUCTURALLY, from the bound names the parser banked as `const` decls — NOT from a
-// source slice. The pattern node's `[pos, end)` span stops at its type atom (the `IsExpr` is minted
-// before the clause is parsed), so the verbatim slice `matchPatFmt` uses for the type DROPS the
-// clause entirely; printing it from the span would silently delete every binding from a formatted
-// file. Structural rendering also canonicalizes the spacing (`Move{x,y}` → `Move{x, y}`), which a
-// whitespace-collapsing slice cannot do.
+// A pattern's payload-binding clause `{x, y}`, or "" when there is none. Rendered
+// structurally from the bound names the parser banked as `const` declarations, not from a
+// source slice: the pattern node's span stops at its type atom, so printing from the span
+// would silently delete every binding. Structural rendering also canonicalizes the spacing.
 function matchBindFmt(bindIx: i32) {
   if bindIx < 0 { return "" }
   const bn = P.nodes[bindIx]
@@ -1613,7 +1513,7 @@ function matchBindFmt(bindIx: i32) {
   ""
 }
 
-// A `match` (value- or statement-position): the scrutinee on the header line, then ONE arm per
+// A `match` (value- or statement-position): the scrutinee on the header line, then one arm per
 // line — `<pat> [| <pat>]* => <body>` — at `indent + 1`, closed by `}` at `indent`. The arm body
 // renders through `expr` (a bare expression, an `if`-expr, or a `{ … }` block — `blockExpr` inlines
 // a short one). Mirrors `match`'s parse shape so it round-trips idempotently.
@@ -1621,10 +1521,9 @@ function matchExprFmt(_ix: i32, n: MatchExpr, indent: i32) {
   const scrut = expr(n.matchScrut, indent, 0)
   const pad = indentStr(indent + 1)
   const closePad = indentStr(indent)
-  // One line per arm, joined once — a running `out = out + line` accumulator
-  // here was O(arms²) allocation under the non-freeing GC (`joinLinesRange`'s
-  // documented cost class). Or-pattern lists stay a plain accumulator: arms
-  // hold a handful of patterns.
+  // One line per arm, joined once — a running `out = out + line` accumulator here is
+  // O(arms²) allocation under the non-freeing GC. Or-pattern lists stay a plain
+  // accumulator: an arm holds a handful of patterns.
   const out: string[] = []
   out.push("match " + scrut + " {")
   let k = 0
@@ -1655,17 +1554,10 @@ function literalSlice(ix: i32, fallback: string) {
   fallback
 }
 
-// The binary-chain cluster, defined in DEPENDENCY ORDER (callee before caller) so
-// no function within it forward-references another: the frozen TS host resolves a
-// single-level forward reference (`expr` → `renderBinary` below), but a TRANSITIVE
-// forward reference (a forward-referenced function that itself forward-references)
-// does not resolve.
-//
-// The operand collectors `ops`/`txt` are passed as PARAMETERS (VL arrays are
-// reference types — a push mutates the caller's array), NOT module globals: the
-// flattening is RE-ENTRANT (an operand may itself be a nested chain via
-// `expr` → `renderBinary` → `binaryChain`), and a shared global would be clobbered
-// by the inner call.
+// The binary-chain cluster, defined in dependency order (callee before caller) so no
+// function within it forward-references another: the host resolves a single-level forward
+// reference but not a transitive one. The operand collectors `ops`/`txt` are parameters,
+// not module globals, because the flattening is re-entrant and a global would be clobbered.
 
 // Recurse into a binary node, flattening same-precedence left-assoc operands into
 // the parallel `ops`/`txt` arrays (`ops[k]` = operator leading operand k, "" for
@@ -1681,7 +1573,7 @@ function flattenChain(
 ) {
   const n = P.nodes[ix]
   if n is BinExpr {
-    // A TEMPLATE root is NOT a chain link even when its `+` matches the
+    // A TEMPLATE root is not a chain link even when its `+` matches the
     // precedence: flattening through it would print the desugared concatenation
     // (`"a" + $tpl$render(x)`) in place of the template the author wrote. It
     // falls through to `expr` → `renderBinary`, which slices the source.
@@ -1717,7 +1609,7 @@ function binaryChain(ix: i32, node: BinExpr, indent: i32, column: i32) {
   if column + dispWidth(oneLine) <= fmtWidth && !hasNewline(oneLine) {
     return oneLine
   }
-  // Reflow: operator at END of previous line; each operand after the first on its
+  // Reflow: operator at end of previous line; each operand after the first on its
   // own continuation line, one indent deeper.
   let result = txt[0] + " " + ops[1]
   let j = 1
@@ -1731,15 +1623,10 @@ function binaryChain(ix: i32, node: BinExpr, indent: i32, column: i32) {
 }
 
 function renderBinary(ix: i32, node: BinExpr, indent: i32, column: i32) {
-  // A TEMPLATE LITERAL's concatenation reprints as the template the author wrote
-  // — its own source bytes, verbatim, exactly as a string literal does. The
-  // parser gave the root `+` the template's whole `[pos, nodeEndOf)` span for
-  // this, and `sliceNode` is the same reader `literalSlice` uses.
-  //
-  // VERBATIM RATHER THAN REFORMATTED, and the rule is the string literal's: the
-  // bytes between the delimiters are DATA. Re-spacing `${ x + 1 }` would change
-  // nothing about the program and everything about a multiline template, whose
-  // newlines and indentation are its content.
+  // A template literal's concatenation reprints as the template the author wrote — its own
+  // source bytes, verbatim, as a string literal does. The parser gave the root `+` the
+  // template's whole span for this. The rule is the string literal's: the bytes between the
+  // delimiters are data, and a multiline template's newlines and indentation are content.
   if node.binTpl == 1 {
     const raw = sliceNode(ix)
     if raw.length > 0 { return raw }
@@ -1748,7 +1635,7 @@ function renderBinary(ix: i32, node: BinExpr, indent: i32, column: i32) {
   binaryChain(ix, node, indent, column)
 }
 
-// Emit possibly-multiline `text` with only its FIRST line indented (continuation
+// Emit possibly-multiline `text` with only its first line indented (continuation
 // lines already carry their absolute indentation — the `emitMultiline` contract).
 function emitFirstIndented(indent: i32, text: string) {
   const lines = splitLines(text)
@@ -1876,18 +1763,10 @@ function isExpr(ix: i32, node: IsExpr, indent: i32, column: i32) {
   value + " is " + ty
 }
 
-// `x as T` — the target is stored canonically on the node (`asTy`), so it needs no
-// source recovery (unlike `is`). The operand renders through `primary`, which
-// parenthesizes a composite (`(a + b) as f64`) so the cast keeps binding the whole
-// value; a chained `x as i32 as i64` stays flat and round-trips idempotently.
-//
-// THE SUFFIX IS PART OF THE OPERATOR, AND DROPPING IT CHANGED THE PROGRAM. A bare
-// `" as "` for all three members of the trio silently rewrote `x as! T` and
-// `x as? T` to `x as T` — turning a TRAP into a propagation — which is the one thing
-// a formatter may never do (`error-handling-design.md` §Trio). The mode rides the
-// node (`asMode`), so like `asTy` it needs no source recovery; the bug was never
-// asking. Pinned by `tests/cases/fmt/as-trio-suffix-preserved.vl`, which formats all
-// three and diffs.
+// `x as T` — the target and the mode ride the node (`asTy`, `asMode`), so neither needs
+// source recovery, unlike `is`. The operand renders through `primary`, which parenthesizes
+// a composite so the cast keeps binding the whole value. The suffix is part of the
+// operator: a bare `" as "` turns `x as! T` into a propagation, pinned by a `fmt` case.
 function asExpr(_ix: i32, node: AsExpr, indent: i32, column: i32) {
   let kw = " as "
   if node.asMode == "trap" { kw = " as! " }
@@ -1900,9 +1779,8 @@ function recoverIsType(ix: i32) {
   const start = nodePos(ix)
   const stop = nodeEndOf(ix)
   if start < 0 || stop < 0 { return "" }
-  // Seat the scan at the node's start token (binary search) and stop once past
-  // the node's end: this runs once per `is` expression, and the old scan from
-  // token 0 was O(tokens) each — measurably superlinear on a large file. A
+  // Seat the scan at the node's start token by binary search and stop once past the node's
+  // end: this runs once per `is` expression, and a scan from token 0 is O(tokens) each. A
   // `pos` not landing exactly on a token start degrades to the full scan.
   let i = tokIndexAt(start)
   if i < 0 { i = 0 }
@@ -1918,23 +1796,15 @@ function recoverIsType(ix: i32) {
   ""
 }
 
-// ── member / call CHAIN layout (fit-or-break) ─────────────────────────────────
-// A postfix chain of TWO OR MORE `.name` / `?.name` links is laid out fit-or-break
-// against `fmtWidth`: inline while it fits from its start column, else ONE LINK PER
-// LINE at `indent + 1`, from the FIRST link. The broken form is printable only
-// because a leading `.` / `?.` on a new line CONTINUES the chain (DECISIONS.md,
-// owner 2026-09-02).
-//
-// THE THRESHOLD IS TWO LINKS AND A LINK STARTS AT THE FIRST CALLED STEP —
-// structure, not width: `(args)` and `[i]` RIDE the step they follow, and every
-// `.field` step BEFORE the first calling step belongs to the chain's HEAD. AND THE
-// FIT IS MEASURED FLAT, or a long final argument list absorbs every overflow and no
-// chain ever breaks. Worked cases: docs/internals/format-notes.md §"chain layout".
+// Member and call chain layout, fit-or-break. A postfix chain of two or more `.name` or
+// `?.name` links is laid out against `fmtWidth`: inline while it fits from its start column,
+// else one link per line at `indent + 1`, from the first link. The threshold is two links
+// and a link starts at the first called step; the fit is taken flat (`format-notes.md`).
 const FMT_CHAIN_FLAT = 1000000
 
-// Walk the postfix chain rooted at `ix` down to its head, recording each postfix
-// op OUTERMOST-FIRST into `kinds` (0 = `.p`, 1 = `?.p`, 2 = `(args)`, 3 = `[i]`)
-// and `nodes`. Returns the head — the first node that is not a postfix.
+// Walk the postfix chain rooted at `ix` down to its head, recording each postfix op
+// outermost-first into `kinds` (0 = `.p`, 1 = `?.p`, 2 = `(args)`, 3 = `[i]`) and `nodes`.
+// Returns the head — the first node that is not a postfix.
 function chainWalk(ix: i32, kinds: i32[], nodes: i32[]): i32 {
   let cur = ix
   let going = true
@@ -1967,8 +1837,8 @@ function chainWalk(ix: i32, kinds: i32[], nodes: i32[]): i32 {
   cur
 }
 
-// The `kinds` index where the chain's LINKS begin: the LAST `.` / `?.` step in
-// the array — the FIRST in source order, since `chainWalk` records outermost
+// The `kinds` index where the chain's links begin: the last `.` / `?.` step in
+// the array — the first in source order, since `chainWalk` records outermost
 // first — that is immediately followed by a call. -1 when no step carries one,
 // which makes the whole postfix run a head (`a.b.c` has no links at all).
 function chainLinkStart(kinds: i32[]): i32 {
@@ -1999,7 +1869,7 @@ function chainStep(text: string, kind: i32, ix: i32, indent: i32, column: i32) {
   text
 }
 
-// The chain on ONE line. `kinds`/`nodes` are outermost-first, so this replays
+// The chain on one line. `kinds`/`nodes` are outermost-first, so this replays
 // them in reverse — source order.
 function chainInline(
   headIx: i32,
@@ -2017,11 +1887,10 @@ function chainInline(
   text
 }
 
-// The chain BROKEN: the head (with any suffixes that precede the first `.`) on
-// its own line, then one `.link(args)` per line at `indent + 1`. Each link is
-// rendered at that deeper indent and its own start column, so a link whose
-// argument list still overflows wraps beneath the link rather than beneath the
-// chain.
+// The chain broken: the head, with any suffixes preceding the first `.`, on its own line,
+// then one `.link(args)` per line at `indent + 1`. Each link is rendered at that deeper
+// indent and its own start column, so a link whose argument list still overflows wraps
+// beneath the link rather than beneath the chain.
 function chainBroken(
   headIx: i32,
   kinds: i32[],
@@ -2076,11 +1945,10 @@ function chainLayout(ix: i32, indent: i32, column: i32) {
     i = i - 1
   }
   if links < 2 { return "" }
-  // A comment inside the chain would be CONSUMED by the flat measurement below
-  // and lost the moment that render is discarded (`cmtCursor` is one-way, and a
-  // block-lambda argument is where a comment actually lives). Such a chain takes
-  // the ordinary inline path instead — one render, exactly as before. Same
-  // guard, same reason, as the one-line `if` collapse and `ifExpr`.
+  // A comment inside the chain would be consumed by the flat measurement below and lost the
+  // moment that render is discarded, since `cmtCursor` is one-way. Such a chain takes the
+  // ordinary inline path instead — one render — the same guard the one-line `if` collapse
+  // and `ifExpr` carry.
   const start = nodePos(ix)
   const stop = nodeEndOf(ix)
   if start < 0 || stop < 0 { return "" }
@@ -2134,18 +2002,15 @@ function callExpr(ix: i32, node: Call, indent: i32, column: i32) {
   callTail(node, head, indent, column)
 }
 
-// `head` with the call's ARGUMENT LIST appended, at `indent` starting from
-// `column` (the column `head` itself begins at). Split out of `callExpr` because
-// the chain layout needs the same tail under a DIFFERENT head — `.filter` rather
-// than a rendered callee — and a second spelling of the trailing-lambda hug plus
-// the width test is exactly the "one width test" this file already has.
+// `head` with the call's argument list appended, at `indent` starting from `column`, the
+// column `head` itself begins at. Split out of `callExpr` because the chain layout needs the
+// same tail under a different head, and a second spelling of the trailing-lambda hug plus
+// the width test is exactly the one width test this file already has.
 function callTail(node: Call, head: string, indent: i32, column: i32) {
   const n = node.callArgs.length
-  // Every argument BUT the last, at the wrapped list's continuation depth. The
-  // LAST one is rendered exactly ONCE, at the depth whichever form wins needs —
-  // rendering a lambda body CONSUMES the comments inside it (`cmtCursor` is a
-  // one-way cursor), so a speculative render that is thrown away would delete
-  // those comments from the output.
+  // Every argument but the last, at the wrapped list's continuation depth. The last is
+  // rendered exactly once, at the depth whichever form wins needs: rendering a lambda body
+  // consumes the comments inside it, so a speculative render thrown away would delete them.
   const args: string[] = []
   let i = 0
   while i + 1 < n {
@@ -2162,7 +2027,7 @@ function callTail(node: Call, head: string, indent: i32, column: i32) {
   head + wrapList("(", args, ")", indent, column + dispWidth(head))
 }
 
-// Argument `i` as a list item: the value, with its optional NAME prefix.
+// Argument `i` as a list item: the value, with its optional name prefix.
 function callArgText(node: Call, i: i32, argIndent: i32, column: i32) {
   let nm = ""
   if i < node.callArgNames.length { nm = node.callArgNames[i] }
@@ -2171,20 +2036,12 @@ function callArgText(node: Call, i: i32, argIndent: i32, column: i32) {
   v
 }
 
-// ── the trailing-lambda exception ─────────────────────────────────────────────
-// The generic list rule is "an argument spans lines ⇒ break EVERY argument", which
-// is right for every multi-line argument but one: a BLOCK-bodied lambda in FINAL
-// position already carries its own vertical structure in its braces, so breaking
-// the list around it adds four lines and a level of indent to say nothing, at ANY
-// width. The three rulings behind ours (LAST argument only / two lambdas ⇒ no hug /
-// a lambda followed by another argument ⇒ not trailing ⇒ no hug) and the corpus
-// measurement behind each live in `docs/internals/fmt-trailing-lambda-design.md`.
-//
-// The guards below are what make those three rulings ONE rule: an EARLIER lambda
-// renders multi-line and so fails "every preceding argument fits on one line", and
-// a lambda that is not last fails "the last argument is a block lambda".
+// The trailing-lambda exception. The generic list rule is "an argument spans lines ⇒ break
+// every argument", right for every multi-line argument but one: a block-bodied lambda in
+// final position already carries its own vertical structure, so breaking around it says
+// nothing at any width. The three rulings: `docs/internals/fmt-trailing-lambda-design.md`.
 
-// Is node `ix` a lambda whose body is a braced BLOCK? An expression-bodied
+// Is node `ix` a lambda whose body is a braced block? An expression-bodied
 // lambda (`(v) => v + 1`) renders on one line and is already untouched by the
 // list rule, so it is deliberately not a hug candidate.
 function isBlockLambda(ix: i32) {
@@ -2194,13 +2051,10 @@ function isBlockLambda(ix: i32) {
   false
 }
 
-// The hugged rendering `head(pre…, (p) => {` / body / `})`, or "" when a guard
-// declines it (the caller then falls through to the vertical list).
-//
-// DECIDES BEFORE IT RENDERS. The decision needs only the lambda's HEADER — the
-// parameter list and the return annotation, both recovered from source spans
-// with no side effects — so a DECLINED hug never touches the comment cursor and
-// the fall-through render is the argument's first and only one.
+// The hugged rendering `head(pre…, (p) => {` / body / `})`, or "" when a guard declines it,
+// and the caller then falls through to the vertical list. It decides before it renders: the
+// decision needs only the lambda's header, recovered from source spans with no side effects,
+// so a declined hug never touches the comment cursor.
 function hugTrailingLambda(
   node: Call,
   pre: string[],
@@ -2230,7 +2084,7 @@ function hugTrailingLambda(
     }
     if nm.length > 0 { nm = nm + ": " }
     // `functionExpr` builds its first line as `arrowHeader(…) + " => {"` from
-    // the SAME `indent` we are about to hand it, so this predicts that line
+    // the same `indent` we are about to hand it, so this predicts that line
     // exactly rather than guessing at it.
     const header = arrowHeader(lam, indent * 2 + 6)
     if hasNewline(header) { return "" }
@@ -2263,7 +2117,7 @@ function fieldInitText(ix: i32, indent: i32, column: i32) {
   ""
 }
 
-// A field key as written. The parser STRIPS the quotes from a string-literal key
+// A field key as written. The parser strips the quotes from a string-literal key
 // (`"[]"`, `"*"`, `"=="` — operator / index-trap method fields), so an
 // identifier-keyed field prints bare while a string-keyed one is recovered with
 // its quoted lexeme from source (host parity; those keys carry no escapes).
@@ -2298,11 +2152,10 @@ function parenExpr(_ix: i32, node: Paren, indent: i32, column: i32) {
   "(" + expr(node.parInner, indent, column + 1) + ")"
 }
 
-// An anonymous function value in expression position is always an ARROW lambda
-// `(params) => body` — the `function(...)` expression form was removed, so arrow
-// is the sole lambda syntax. Any `fnName` on the node is an INTERNAL debug name
-// (stamped from a `const`/`let` binding so a trap backtrace reads `foo`, not
-// `__lambda_N`); the source has no name there, so it is not printed.
+// An anonymous function value in expression position is always an arrow lambda
+// `(params) => body`; arrow is the sole lambda syntax. Any `fnName` on the node is an
+// internal debug name, stamped from a binding so a trap backtrace reads `foo` rather than
+// `__lambda_N`; the source has no name there, so it is not printed.
 function functionExpr(_ix: i32, node: FuncDecl, indent: i32) {
   const header = arrowHeader(node, indent * 2 + 6)
   const body = node.fnBody
@@ -2318,8 +2171,8 @@ function functionExpr(_ix: i32, node: FuncDecl, indent: i32) {
       emitLeadingComments(indent + 1, stopLineOf(body))
       const inner = joinOut()
       outBuf = saved
-      // Rejoin the body ONCE — a running `result = result + line` accumulator
-      // here was O(lines²) allocation under the non-freeing GC.
+      // Rejoin the body once — a running `result = result + line` accumulator here is
+      // O(lines²) allocation under the non-freeing GC.
       const out: string[] = []
       out.push(header + " => {")
       const lines = splitLines(rstripNl(inner))
@@ -2335,12 +2188,10 @@ function functionExpr(_ix: i32, node: FuncDecl, indent: i32) {
   header + " => " + bareBodyInline(body, indent)
 }
 
-// The parameter list `(a: T, b: U)` of an arrow lambda — and its OPTIONAL return
-// annotation `: Ret` (`(n: i32): i32 => …`), preserved verbatim so `vl fmt` never
-// drops a load-bearing return type. Like `functionHeader` but with no `function`
-// keyword, name, or generics. `reserved` is the columns the line uses outside the
-// param list (here the `: Ret`, the ` => `, and the body), so the list wraps only
-// when the whole line would overflow.
+// The parameter list `(a: T, b: U)` of an arrow lambda, and its optional return annotation
+// `: Ret`, preserved verbatim so `vl fmt` never drops a load-bearing return type. Like
+// `functionHeader` but with no keyword, name or generics. `reserved` is the columns the line
+// uses outside the param list, so the list wraps only when the whole line would overflow.
 function arrowHeader(node: FuncDecl, reserved: i32) {
   const params: string[] = []
   let p = 0
@@ -2354,11 +2205,10 @@ function arrowHeader(node: FuncDecl, reserved: i32) {
 }
 
 function ifExpr(ix: i32, node: IfStmt, indent: i32) {
-  // An `if` as an expression value: single-line braced-inline
-  // `if c { a } else { b }` when every branch is a simple expression AND no
-  // comment lives inside the expression (a comment cannot ride the inline form —
-  // keep it anchored by falling through to the verbatim slice); else fall back
-  // to the source slice.
+  // An `if` as an expression value: single-line braced-inline `if c { a } else { b }` when
+  // every branch is a simple expression and no comment lives inside the expression — a
+  // comment cannot ride the inline form, so it stays anchored by falling through to the
+  // verbatim slice.
   const hasCmt = commentInCharSpan(nodePos(ix), nodeEndOf(ix))
   let elseOk = node.ifElse < 0
   if !elseOk { elseOk = branchIsSimple(node.ifElse) || elseIsIf(node.ifElse) }
@@ -2409,8 +2259,8 @@ function blockExpr(ix: i32, node: Block, indent: i32) {
   emitLeadingComments(indent + 1, stopLineOf(ix))
   const inner = joinOut()
   outBuf = saved
-  // Rejoin the body ONCE — a running `result = result + line` accumulator here
-  // was O(lines²) allocation under the non-freeing GC.
+  // Rejoin the body once — a running `result = result + line` accumulator here is
+  // O(lines²) allocation under the non-freeing GC.
   const out: string[] = []
   out.push("{")
   const lines = splitLines(rstripNl(inner))
@@ -2426,7 +2276,7 @@ function blockExpr(ix: i32, node: Block, indent: i32) {
 // ── list wrapping (calls / arrays / objects / params) ─────────────────────────
 
 // Render `open item, item, … close`, collapsing to one line when it fits from
-// `column`, else one item per continuation line with a trailing comma after EVERY
+// `column`, else one item per continuation line with a trailing comma after every
 // item (the wrapped form). An empty list is `open+close` trimmed.
 function wrapList(
   open: string,
@@ -2436,14 +2286,10 @@ function wrapList(
   column: i32,
 ) {
   if items.length == 0 { return trimWs(open) + trimWs(close) }
-  // Sum the one-line WIDTH first — no string allocation. If it can't possibly fit
-  // `fmtWidth`, skip straight to the wrapped form below without ever materializing
-  // `oneLine`. `dispWidth` is O(text) rather than O(1), but it is still strictly
-  // cheaper than the concatenation it guards, and it is a width: `.length` here
-  // counted an em dash as three columns. A running
-  // `s = s + item` accumulator here (and in the wrapped `body` accumulator
-  // below) was O(n²) and blew the compiler's non-freeing GC heap on a
-  // 10,001-element single-line array literal (`allocation size too large`).
+  // Sum the one-line width first — no string allocation. When it cannot fit `fmtWidth`,
+  // skip straight to the wrapped form without materializing `oneLine`. `dispWidth` is
+  // O(text) but still cheaper than the concatenation it guards, and it is a width:
+  // `.length` counts an em dash as three columns. A running `s = s + item` is O(n²).
   let oneLineLen = dispWidth(open) + dispWidth(close) + (items.length - 1) * 2
   let li = 0
   while li < items.length {
