@@ -1,27 +1,38 @@
 #!/usr/bin/env python3
-"""The comment-budget ratchet — the tree-wide half of `comment-block-too-long`.
+"""The comment-budget ratchet — the tree-wide half of the four comment rules.
 
-Same two clauses as compiler/lint.vl's rules, over the same block definition and
-the same two budgets — 12 lines a block, 40 a module header — so the numbers agree
+Same four clauses as compiler/lint.vl's rules, over the same block definition and
+the same two budgets — 4 lines a block, 12 a module header — so the numbers agree
 file by file (tests/vl_comment_budget_test.ts pins that).
 Per-file counts may only FALL: `--check` fails when any file exceeds its
-baseline, `--write-baseline` lowers it after a trim lands. See CLAUDE.md,
-"Comments state the invariant; measurements live in the inventory".
+baseline, `--write-baseline` lowers it after a trim lands. The rules themselves
+are docs/internals/comment-style.md.
 """
 
 import json
 import os
 import sys
 
-BUDGET = 12
-# A module HEADER earns more room: it is the file's contract, not a note beside one
-# line. #2413's trim pilot set the number; both implementations read it from here.
-HEADER_BUDGET = 40
+BUDGET = 4
+# A module header earns more room: it is the file's contract, not a note beside one
+# line. Both implementations read both budgets from here.
+HEADER_BUDGET = 12
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASELINE = os.path.join(ROOT, "scripts", "comment-budget-baseline.json")
 TOO_LONG = "comment-block-too-long"
 UNCITED = "comment-measurement-uncited"
-CODES = (TOO_LONG, UNCITED)
+SHOUTING = "comment-shouting"
+HISTORY = "comment-history"
+CODES = (TOO_LONG, UNCITED, SHOUTING, HISTORY)
+
+# The acronyms a comment may spell in capitals (rule 5) — the whole allow-list, in
+# one place. A word under three letters never reaches it, so `GC` needs no entry.
+ACRONYMS = frozenset(
+    "ABI API ASCII AST CLI IEEE JSON LEB LSP OOB RFC UFCS UTF WASM".split()
+)
+# Rule 3's phrases, longest first so `no longer` is not read as two words.
+HISTORY_PHRASES = ("no longer", "used to", "previously", "measured", "landed", "was", "were")
+HISTORY_STARTS = frozenset("nNuUpPmMlLwW")
 
 WORD = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
 DIGIT = set("0123456789")
@@ -174,6 +185,97 @@ def has_citation(s):
     return False
 
 
+def _iat(s, i, b, w):
+    """`w`, given lower-case, at `i` with the SOURCE side's case folded — the
+    ratchet's copy of `cbAtI`."""
+    if i < 0 or i + len(w) > b:
+        return False
+    for k, ch in enumerate(w):
+        c = s[i + k]
+        if "A" <= c <= "Z":
+            c = chr(ord(c) + 32)
+        if c != ch:
+            return False
+    return True
+
+
+def _word_at(s, i, b):
+    return 0 <= i < b and s[i] in WORD
+
+
+def _date_at(s, i, b):
+    """`yyyy-mm-dd` at `i` — the ratchet's copy of `cbDateAt`."""
+    if i + 10 > b:
+        return False
+    for k in range(10):
+        c = s[i + k]
+        if k == 4 or k == 7:
+            if c != "-":
+                return False
+        elif c not in DIGIT:
+            return False
+    return True
+
+
+def is_shout_word(s, i, e):
+    """`s[i, e)` is three or more letters, every one a capital, and not an acronym."""
+    if e - i < 3:
+        return False
+    for k in range(i, e):
+        if not ("A" <= s[k] <= "Z"):
+            return False
+    return s[i:e] not in ACRONYMS
+
+
+def shouts(line):
+    """Whether the comment line has two shout words in a row (rule 5).
+
+    A backtick TOGGLES an in-ticks state, per line, starting outside: a backticked
+    span is skipped rather than treated as a break, and an unpaired backtick hides
+    the rest of its line. compiler/lint.vl's `cbShoutLine` scans identically."""
+    b = len(line)
+    i, tick, prev = 0, False, False
+    while i < b:
+        c = line[i]
+        if c == "`":
+            tick = not tick
+            i += 1
+        elif c in WORD:
+            e = i
+            while e < b and line[e] in WORD:
+                e += 1
+            if not tick:
+                sh = is_shout_word(line, i, e)
+                if sh and prev:
+                    return True
+                prev = sh
+            i = e
+        else:
+            i += 1
+    return False
+
+
+def hist_phrase(line):
+    """The first history phrase the comment line carries, or "" (rule 3). A date is
+    history with no verb. Same in-ticks scan as `shouts`."""
+    b = len(line)
+    i, tick = 0, False
+    while i < b:
+        c = line[i]
+        if c == "`":
+            tick = not tick
+        elif not tick:
+            if c in DIGIT:
+                if _date_at(line, i, b):
+                    return "a date"
+            elif c in HISTORY_STARTS and not _word_at(line, i - 1, b):
+                for w in HISTORY_PHRASES:
+                    if _iat(line, i, b, w) and not _word_at(line, i + len(w), b):
+                        return w
+        i += 1
+    return ""
+
+
 def blocks(src):
     """Maximal runs of consecutive lines whose first non-space token is `//`.
     A blank line, code, or a trailing comment's own line ends the run. Yields
@@ -211,15 +313,33 @@ def blocks(src):
         yield start, cur, not seen_code and not header_taken
 
 
+def _first(b, pred):
+    """The 0-based offset of the first line of `b` satisfying `pred`, or -1."""
+    for k, ln in enumerate(b):
+        if pred(ln):
+            return k
+    return -1
+
+
 def grade(src):
-    """(too-long hits, uncited-measurement hits) as (line, length) lists."""
-    long_hits, uncited_hits = [], []
+    """One hit list per code, each of (line, block length).
+
+    Length and the uncited measurement are BLOCK facts and report at the block's
+    first line; shouting and history are LINE facts and report where they stand,
+    once per block per code — the same positions compiler/lint.vl emits."""
+    hits = {c: [] for c in CODES}
     for start, b, is_header in blocks(src):
         if len(b) > (HEADER_BUDGET if is_header else BUDGET):
-            long_hits.append((start, len(b)))
+            hits[TOO_LONG].append((start, len(b)))
         if any(states_measurement(x) for x in b) and not any(has_citation(x) for x in b):
-            uncited_hits.append((start, len(b)))
-    return long_hits, uncited_hits
+            hits[UNCITED].append((start, len(b)))
+        k = _first(b, shouts)
+        if k >= 0:
+            hits[SHOUTING].append((start + k, len(b)))
+        k = _first(b, hist_phrase)
+        if k >= 0:
+            hits[HISTORY].append((start + k, len(b)))
+    return hits
 
 
 def read_source(path):
@@ -239,9 +359,9 @@ def sources():
 def current():
     out = {}
     for rel, path in sources():
-        lo, un = grade(read_source(path))
-        if lo or un:
-            out[rel] = {TOO_LONG: len(lo), UNCITED: len(un)}
+        hits = grade(read_source(path))
+        if any(hits[c] for c in CODES):
+            out[rel] = {c: len(hits[c]) for c in CODES}
     return out
 
 
@@ -264,7 +384,7 @@ def write_baseline(cur):
     lines += ["}", "}"]
     with open(BASELINE, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
-    print(f"wrote {BASELINE}: {total[TOO_LONG]} over budget, {total[UNCITED]} uncited")
+    print(f"wrote {BASELINE}: " + ", ".join(f"{total[c]} {c}" for c in CODES))
 
 
 def cmd_check(cur):
@@ -285,7 +405,10 @@ def cmd_check(cur):
         )
         return 1
     tot = {c: sum(v[c] for v in cur.values()) for c in CODES}
-    print(f"comment budget ok — {tot[TOO_LONG]} over budget, {tot[UNCITED]} uncited (baseline or below)")
+    print(
+        "comment budget ok (baseline or below) — "
+        + ", ".join(f"{tot[c]} {c}" for c in CODES)
+    )
     return 0
 
 
@@ -320,17 +443,17 @@ def cmd_filter_lint(path, extra=()):
 def cmd_grade(path):
     """One file's hits as JSON — the shape tests/vl_comment_budget_test.ts
     compares against the lint's own diagnostics."""
-    lo, un = grade(read_source(path))
-    print(json.dumps({TOO_LONG: lo, UNCITED: un}))
+    print(json.dumps(grade(read_source(path))))
     return 0
 
 
 def cmd_list(cur, code):
+    if code not in CODES:
+        raise SystemExit(f"comment-budget: --list wants one of {' '.join(CODES)}")
     for rel, path in sources():
         if rel not in cur:
             continue
-        lo, un = grade(read_source(path))
-        for start, n in (lo if code == TOO_LONG else un):
+        for start, n in grade(read_source(path))[code]:
             print(f"{rel}:{start}  ({n} lines)")
     return 0
 
@@ -353,10 +476,11 @@ def main():
     if "--list" in args:
         return cmd_list(cur, args[args.index("--list") + 1])
     tot = {c: sum(v[c] for v in cur.values()) for c in CODES}
-    print(f"{'file':<32}{TOO_LONG:>26}{UNCITED:>30}")
-    for rel, v in sorted(cur.items(), key=lambda kv: -kv[1][TOO_LONG]):
-        print(f"{rel:<32}{v[TOO_LONG]:>26}{v[UNCITED]:>30}")
-    print(f"{'TOTAL':<32}{tot[TOO_LONG]:>26}{tot[UNCITED]:>30}")
+    head = "".join(f"{c.removeprefix('comment-'):>14}" for c in CODES)
+    print(f"{'file':<28}{head}")
+    for rel, v in sorted(cur.items(), key=lambda kv: -sum(kv[1].values())):
+        print(f"{rel:<28}" + "".join(f"{v[c]:>14}" for c in CODES))
+    print(f"{'TOTAL':<28}" + "".join(f"{tot[c]:>14}" for c in CODES))
     return 0
 
 

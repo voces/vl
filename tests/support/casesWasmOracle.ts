@@ -641,15 +641,19 @@ const readIsval = (exp: Exports): LintDiag[] => {
 // cases pin what the compiler says about a PROGRAM, not about our prose or our
 // dispatch tables. `tests/` is excluded from `lint-self.sh` for the same reason.
 //
-// The comment rules: a case file's header is documentation OF the case, and
-// hundreds carry a long one. The kind-ladder rules: their closed sets are the
-// COMPILER's (`VKind`, `Node`, `MfKind`, …), read out of `compiler/*.vl`, so a
-// case declaring `type Kind = "i32" | "str" | "bool"` is graded against a
-// vocabulary that is not its own — `literal-unions/atom-basics.vl` is exactly
-// that collision, and its `classify` covers its OWN union completely.
+// The four comment rules (docs/internals/comment-style.md): a case file's header is
+// documentation OF the case, and hundreds carry a long one, a shouted emphasis or a
+// sentence about what the compiler used to do — which is the point of the case. The
+// kind-ladder rules: their closed sets are the COMPILER's (`VKind`, `Node`, `MfKind`,
+// …), read out of `compiler/*.vl`, so a case declaring
+// `type Kind = "i32" | "str" | "bool"` is graded against a vocabulary that is not its
+// own — `literal-unions/atom-basics.vl` is exactly that collision, and its `classify`
+// covers its OWN union completely.
 const CORPUS_EXEMPT_CODES = new Set([
   "comment-block-too-long",
   "comment-measurement-uncited",
+  "comment-shouting",
+  "comment-history",
   "kind-ladder-incomplete",
   "kind-ladder-split",
 ]);
