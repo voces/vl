@@ -1470,20 +1470,20 @@ function arrDefHoleToI32(ty: i32) {
   false
 }
 
-// THE ONE PLACE AN UNPINNED INTRINSIC HOLE ACQUIRES ITS ELEMENT: a LINKED partner's, else the
-// `i32` default. Returns the row's element after the pin, or -1 when the row is not an array.
-// Two sites default such a hole — `arrDefHoleToI32` at scope flush and
-// `checkArrayNewDefaultElems` at program end — and only the first consulted the link, so an
-// intrinsic delivered into a plain `v = __array_new_default__(3)` (a CALL row, never a
-// binding, so the flush never sees it) took `i32` while `v` took `f64` from a later store:
-// check-clean invalid wasm. D1512.
+// THE ONE PLACE AN UNPINNED INTRINSIC HOLE ACQUIRES ITS ELEMENT: whatever the LINK graph can
+// still reach (`resolveHoleLinks`, run first), else the `i32` default. Returns the row's
+// element after the pin, or -1 when the row is not an array. Two sites default such a hole —
+// `arrDefHoleToI32` at scope flush and `checkArrayNewDefaultElems` at program end — and only
+// the first consulted the link, so an intrinsic delivered into a plain
+// `v = __array_new_default__(3)` (a CALL row, never a binding, so the flush never sees it)
+// took `i32` while `v` took `f64` from a later store: check-clean invalid wasm. D1512.
 function arrDefPinHoleElem(ty: i32) {
   if ty < 0 { return -1 }
+  resolveHoleLinks()
   const t = T.tys[ty]
   if t is TyArray {
     if t.aElem < 0 {
-      const partner = holeLinkElemOf(ty)
-      if partner >= 0 { t.aElem = partner } else { t.aElem = TY_I32 }
+      t.aElem = TY_I32
       tyMutEpoch = tyMutEpoch + 1 // in-place element pin — canonical keys change
     }
     return t.aElem
@@ -1506,25 +1506,63 @@ function noteHoleLink(a: i32, b: i32) {
   0
 }
 
-// The element a row LINKED to `ty` resolved to, or -1. ONE HOP, in both directions: a chain
-// of three still-open bindings takes the `i32` default, which is the honest answer for it —
-// nothing in that chain ever said otherwise. The pairs are read at flush time, i.e. after
-// every pin, so a partner that was going to resolve already has.
-function holeLinkElemOf(ty: i32) {
-  let i = 0
-  while i < holeLinkA.length {
-    let other = -1
-    if holeLinkA[i] == ty { other = holeLinkB[i] }
-    if holeLinkB[i] == ty { other = holeLinkA[i] }
-    if other >= 0 {
-      const o = T.tys[other]
-      if o is TyArray {
-        if o.aElem >= 0 { return o.aElem }
+// Hand `src`'s RESOLVED element to `dst`'s open one, enforcing the link's own invariant
+// ("these two rows must carry the same element"). True when the pin moved, which is what the
+// fixpoint below iterates on.
+function holeLinkPinFrom(src: i32, dst: i32) {
+  if src < 0 || dst < 0 { return false }
+  const s = T.tys[src]
+  if s is TyArray {
+    if s.aElem >= 0 {
+      const d = T.tys[dst]
+      if d is TyArray {
+        if d.aElem < 0 {
+          d.aElem = s.aElem
+          tyMutEpoch = tyMutEpoch + 1 // in-place element pin — canonical keys change
+          return true
+        }
       }
     }
-    i = i + 1
   }
-  -1
+  false
+}
+
+// EVERY LINK PAIR, TO A FIXPOINT — a resolved row hands its element to its open partner and
+// the sweep repeats until no row moves. The consult used to be ONE HOP, read at the pin site,
+// while `flushUninferred` walks pending bindings in DECLARATION order: in `b = a  c = b
+// c[0] = 1.25` the first hole is asked before the second has resolved, finds its partner open,
+// and takes `i32` while the rest of the chain lands on `f64`. D1565.
+//
+// A COMPONENT NOTHING PINS IS UNTOUCHED and still takes `i32` at the pin site — the honest
+// answer the one-hop note gave for it. Propagation is the link INVARIANT and applies to any
+// array row; the DEFAULT is `array.new_default`'s own meaning and stays intrinsic-only.
+//
+// THE BOUND IS STRUCTURAL: a sweep that changes anything pins at least one row, and
+// `holeLinkA.length` pairs name at most twice that many rows.
+function resolveHoleLinks() {
+  if holeLinkA.length == 0 { return 0 }
+  const bound = holeLinkA.length * 2 + 1
+  let sweeps = 0
+  let changed = true
+  while changed {
+    changed = false
+    sweeps = sweeps + 1
+    if sweeps > bound {
+      // UNREACHABLE BY THE BOUND ABOVE, and stated rather than assumed: a sweep only ever
+      // turns an open element into a resolved one, never back. It is here because the
+      // alternative to a named failure is a `while` that spins, and a hang is the one outcome
+      // a checker must never have (CLAUDE.md, "a hanging self-build is the FINDING").
+      tErr("internal: __array_new_default__ hole links did not converge", -1)
+      return 0
+    }
+    let i = 0
+    while i < holeLinkA.length {
+      if holeLinkPinFrom(holeLinkA[i], holeLinkB[i]) { changed = true }
+      if holeLinkPinFrom(holeLinkB[i], holeLinkA[i]) { changed = true }
+      i = i + 1
+    }
+  }
+  0
 }
 
 // Does the element type `el` have a ZERO — a default value that is itself a member of `el`?
