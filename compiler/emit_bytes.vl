@@ -1772,7 +1772,12 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
     let lix = 0
     while lix < liKinds.length {
       const lk = liKinds[lix]
-      if liBack[lix] == 5 {
+      if liBack[lix] >= 100 {
+        // D1510 — an object-literal ORDER STASH slot. The code carries the FIELD code
+        // (`liBack - 100`) and `liSlots` its storage slot, so the local is typed by the one
+        // table the field itself is: `100 + code` cannot collide with a code above.
+        fbFieldStorageRun(liBack[lix] - 100, liSlots[lix])
+      } else if liBack[lix] == 5 {
         // A chunked long STRING literal's destination backing (`arrLitChunkStart`'s
         // `strBack`) — the raw `(ref null $sBackIdx)` element array, NOT a list backing and
         // (since Stage 2b) NOT the finished string either: the header is `struct.new`n around
@@ -2032,6 +2037,110 @@ export function nulScalarListFieldWrapHeap(code: i32): i32 {
   if code == 33 { return il64TypeIdx }
   if code == 34 { return fl32TypeIdx }
   -1
+}
+// The wasm STORAGE valtype of a struct / union-variant FIELD, from the field's type CODE
+// and its ref-table slot — the ONE table both writers read: `emitTypeSection`'s field list
+// and the object-literal ORDER STASH's local ([D1510](../../docs/internals/inventory/D1510.md)),
+// whose slot must hold exactly what the field slot accepts. Lives in the byte layer beside
+// `nulScalarListFieldWrapHeap` so neither writer needs a classifier import.
+//
+// `emitFail` DOES NOT HALT, so every arm that cannot resolve a heap index still writes a
+// well-formed placeholder (`0x7f` i32) before recording the failure — the buffer stays
+// parseable while the error unwinds.
+export function pushFieldStorage(code: i32, refSlot: i32) {
+  if code == 3 {
+    wU8(100)
+    wSLEB(sTypeIdx)
+  } else if code == 4 {
+    wU8(100)
+    wSLEB(lTypeIdx)
+  } else if code == 5 {
+    if refSlot < 0 || refSlot >= rlWrapIdx.length {
+      wU8(127)
+      return emitFail(
+        "emitProgram: ref-list field element type is not interned",
+      )
+    }
+    wU8(100)
+    wSLEB(rlWrapIdx[refSlot])
+  } else if code == 6 {
+    wU8(100)
+    wSLEB(mkListIdx)
+  } else if code == 14 {
+    wU8(100)
+    wSLEB(cloStructIdx)
+  } else if code == 15 {
+    if refSlot < 0 || refSlot >= sHeapIdx.length {
+      wU8(127)
+      return emitFail(
+        "emitProgram: nested-struct field element type is not interned",
+      )
+    }
+    wU8(99)
+    wSLEB(sHeapIdx[refSlot])
+  } else if code == 16 {
+    wU8(100)
+    wSLEB(uBoxIdx)
+  } else if code == 17 {
+    wU8(124)
+  } else if code == 23 {
+    wU8(126)
+  } else if code == 24 {
+    wU8(125)
+  } else if code == 35 {
+    // D1008 — the packed byte list field: a non-null ref to the u8 list WRAPPER, the same
+    // heap type the `u8[]` global / param / return / binding already store.
+    wU8(100)
+    wSLEB(bl8TypeIdx)
+  } else if code == 25 {
+    wU8(100)
+    wSLEB(fl64TypeIdx)
+  } else if code == 26 {
+    wU8(100)
+    wSLEB(il64TypeIdx)
+  } else if code == 27 {
+    wU8(100)
+    wSLEB(fl32TypeIdx)
+  } else if code == 18 {
+    wU8(99)
+    wSLEB(lTypeIdx)
+  } else if nulScalarListFieldWrapHeap(code) >= 0 {
+    wU8(99)
+    wSLEB(nulScalarListFieldWrapHeap(code))
+  } else if code == 28 {
+    if refSlot < 0 || refSlot >= rlWrapIdx.length {
+      wU8(127)
+      return emitFail(
+        "emitProgram: nullable ref-list field element type is not interned",
+      )
+    }
+    wU8(99)
+    wSLEB(rlWrapIdx[refSlot])
+  } else if code == 19 {
+    wU8(100)
+    wSLEB(mapTypeIdxOf(refSlot))
+  } else if code == 29 {
+    wU8(99)
+    wSLEB(mapTypeIdxOf(refSlot))
+  } else if code == 20 {
+    wU8(99)
+    wSLEB(sTypeIdx)
+  } else if code == 22 {
+    wU8(99)
+    wSLEB(cloStructIdx)
+  } else {
+    wU8(127)
+  }
+  0
+}
+// One (1, <field storage valtype>) locals run — the object-literal ORDER STASH's slot
+// (D1510), typed off the SAME `pushFieldStorage` table the type section writes the field
+// itself from. A non-null field gets a non-null local: the stash is `local.set` before it is
+// `local.get`, straight-line and at one block depth, which is what wasm's definite-assignment
+// rule for a non-defaultable local asks for.
+export function fbFieldStorageRun(code: i32, storageSlot: i32) {
+  wU8(1)
+  pushFieldStorage(code, storageSlot)
 }
 // Emit a global cell valtype, NULLABLE for refs (`0x63` instead of `0x64`) so a
 // non-const ref cell can be `ref.null`-initialized. The scalar case (kind 0) is the
