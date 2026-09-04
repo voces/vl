@@ -4278,6 +4278,93 @@ delivery matrix for the `T | null` result of `as?`; `std/fmt.vl` `parseI32`'s co
 which documents `as i32` as "an unchecked wrapping truncation on this compiler" and is
 false the day this lands.
 
+## `%` over floats is the truncated remainder (Rust / JavaScript / C fmod) (owner, 2026-09-04)
+
+**Ruling.** "`%` can follow Rust/JS." `a % b` over `f64` (and `f32`) has the value of
+`a - b * trunc(a / b)` and takes the sign of the DIVIDEND — the TRUNCATED remainder, which is
+what Rust's `f64::rem`, JavaScript's `%` and C's `fmod` all compute. The IEEE corners follow
+from that definition: `x % 0.0` is NaN, `inf % b` is NaN, `a % inf` is `a`, and `-0.0 % 1.0`
+is `-0.0`. `%` therefore leaves the integer-only family (`& | ^ << >> >>>`, which are about
+BIT PATTERNS a float does not have) and joins the ordinary numeric lattice, so the operand
+pairs it accepts and the ones it refuses are now exactly `+`'s.
+
+**The rejected alternative is Python's `%`, which is FLOORED**: `-5.5 % 2.0` is `0.5` there
+and `-1.5` here, and `math.fmod` is Python's spelling of this one. Floored `%` composes better
+with `//` and is what a "clock arithmetic" reader expects, but VL's `/` over integers already
+truncates toward zero, so a floored `%` would make `a == b * (a / b) + a % b` false for a
+negative dividend — the identity is the reason to match the divide, and the divide is Rust's.
+A caller who wants the non-negative answer writes `((a % b) + b) % b`; a caller who wants the
+truncated one has no such rewrite, which settles which is the primitive.
+
+**Why the refusal stood until now, and why the reason did not survive its own restatement.**
+Wasm has no `f64.rem` instruction, and the earlier ruling refused float `%` rather than lower
+it through the `a - b * trunc(a / b)` identity EVALUATED, which is a genuinely bad idea: it is
+off by an ulp past 2^53, loses a `-0.0` dividend's sign, answers NaN for an infinite divisor,
+and overflows at the top of the range. That argument is correct about the identity and says
+nothing about the operation. The lowering that ships is the standard scaled
+repeated-subtraction fmod (`__f64_rem__`, one helper per module): double `|b|` to the largest
+`|b| * 2^k <= |a|`, then halve back down subtracting where it fits. Doubling and halving move
+only the exponent and every subtraction lands in Sterbenz's range, so no rounding enters and
+the result is the exact remainder — measured against Python's `math.fmod` on 20 vectors
+including `1e308 % 3` and ten seeded random pairs, 20 of 20 identical. `f32` rides the same
+helper: an f32 is exact in f64 and the remainder of two f32-representable values is itself
+f32-representable, so promote / call / demote loses nothing.
+
+**Cost.** One module-tail function (~180 bytes), emitted only for a module that has a float
+`%`; the seed grew 1,613 bytes (+0.08%) across this landing, most of it the reservation pass
+and the checker arms rather than the helper. An integer `%` is unchanged, byte for byte.
+
+**Grading list.** D1586 and D493 (the type-parameter pin, which the checker's mirror admits
+because the direct spelling does); `tests/cases/arith/float-remainder.vl`,
+`float-remainder-f32.vl`, `error-float-remainder-mixes.vl` (whose `+` control is what proves
+the refused pairs are the lattice's rule and not `%`'s); `docs/guide/operators.md`.
+
+## `x as u8` is the i64 → i32 narrowing with a byte-sized domain (owner, 2026-09-04)
+
+**Ruling.** "`x as u8` is fine, but it should follow the same logic as downscaling i64 to
+i32." `u8` is a STORAGE type — there is no `u8` local, parameter, return, field or map value,
+and that does not change — but `x as u8` is a real cast all the same: it narrows a number into
+**0..255**, exactly-or-fails, under the same trio every other numeric cast obeys. `x as! u8`
+traps with `as! u8 at L:C: not exact`, `x as? u8` yields `i32 | null`, and a bare `x as u8`
+propagates the `null` out of the enclosing function (and refuses at module scope, naming the
+other two). The RESULT is an `i32` in 0..255, so `bytes.push(x as! u8)` is the consumer's
+spelling and `const b = x as? u8` has type `i32 | null`.
+
+Every numeric source can fail it, `i32` included — 300 is a perfectly good `i32` and not a
+byte — which makes it the one pair in the cast family with no float and no width change in it.
+A float source must be integral as well as in range, exactly as for `i32`: `3.9 as! u8` traps,
+`200.0 as! u8` is 200.
+
+**The rejected alternative is low-byte TRUNCATION**, i.e. `x as u8` meaning `x & 0xff`. That
+is what the STORE does, and it is why the cast was previously refused with "there is nothing
+to write" (D1583): if the cast means what the store means, it adds nothing. The ruling reads
+the request the other way round — an author writing `as u8` is asking for the CHECK the store
+does not do — and that reading is what makes the cast worth having. VL already spells lossy
+truncation two ways (`bytes.push(v)` and `v & 0xff`); it had no way to say "this was supposed
+to be a byte".
+
+**The implicit store still truncates, and whether it SHOULD require the cast is not decided
+here.** `bytes.push(300)` keeps the low byte and stores 44; `bytes.push(-1)` stores 255. Only
+an out-of-range non-negative LITERAL is refused, because a hand-written `300` silently becoming
+`44` is a typo the compiler can see. Making the store demand `as! u8` would be a separate
+ruling with a migration cost this one does not pay, and the two facts are now stated next to
+each other in `docs/guide/collections-design.md` §"What you write TODAY" so a reader meets
+them together.
+
+**Two names for one cast, and they must not be merged.** `x as u8` records `i32` on the node,
+because `i32` is what it produces; the `u8` SPELLING is the only thing left carrying the
+domain. The REP target decides the conversion opcode and the `i32 | null` box row `as?`
+registers, the DOMAIN decides the range test and the `as!` message. Collapsing them either
+loses the range or registers a `u8|null` box that nothing builds — which is why the canon pass
+that rewrites `n.asTy` to the primitive spelling leaves `u8` alone, and why the emitter's
+`trunc(d) as! i32` peephole declines the `u8` domain (its premise is that the conversion
+instruction enforces the range, and `i32.trunc_f64_s` enforces i32's range, not 0..255).
+
+**Grading list.** D1587, and D1583 which it supersedes; the 60-cell trio grid on that row;
+`tests/cases/numerics/as-cast-u8-trio.vl`, `as-cast-u8-trap-range.vl`,
+`as-cast-u8-trap-fraction.vl`, `error-as-cast-u8-refusals.vl`; `error-u8-storage-only.vl`,
+which pins that the ANNOTATION position is untouched.
+
 ## A subsumed literal arm COLLAPSES: `string | "err"` is `string`, through aliases and through a union's arms; `x is <literal>` is a value test everywhere (owner, 2026-09-02)
 
 **Ruling.** A union is a SET of values, and an arm that adds no values adds no arm. A literal

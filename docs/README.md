@@ -9,6 +9,7 @@ root. Agent operating instructions are `AGENTS.md` / `CLAUDE.md` at the root.
 The language and CLI as a user mental model.
 
 - [`guide/soundness.md`](guide/soundness.md) — the type-safety guarantees.
+- [`guide/operators.md`](guide/operators.md) — what every operator means and on what operand types (`%` is the truncated remainder; the `as` / `as?` / `as!` trio).
 - [`guide/narrowing.md`](guide/narrowing.md) — flow narrowing (`is` / `?.` / null).
 - [`guide/unions.md`](guide/unions.md) — union types and variant discrimination.
 - [`guide/collections-design.md`](guide/collections-design.md) — `T[]` / `Map` / `Set` syntax and semantics; §"What you write TODAY" is the shipped spelling table (a map TYPE is `{[K]: V}`, `Map()` is the constructor).
