@@ -5641,3 +5641,50 @@ pattern syntax. It is `match`'s arm separator, shipped in phase 1 and already th
 literal union uses (`"b" | "c" => 2`); it applies to integer literals for the same reason, and
 refusing it here would have meant writing code to break a general feature at one scrutinee
 kind. The consumer's own example uses it.
+
+## `as%` is the wrap cast, the fourth member of the `as` family (owner, 2026-09-04)
+
+**"Let's do as% I guess."** `x as% T` wraps `x` to the target width. It never fails, so it has
+no null, no trap and no propagation — the three sad paths the exact family is built around are
+all absent, and what is left is one conversion opcode:
+
+| source → target | meaning |
+| --- | --- |
+| `i64 as% i32` | the low 32 bits, two's complement (`i32.wrap_i64`) |
+| `i32 as% u8`, `i64 as% u8` | the low 8 bits (an `i32` in 0..255 — `u8` is the domain, as in `as! u8`) |
+| `i32 as% i64` | sign-extend, same as `as`; allowed so the family is total over the integer pairs |
+| `i32 as% i32`, `i64 as% i64` | identity |
+| a float on either side | refused at check, naming `as!` / `as?` |
+| a non-numeric operand | refused at check, in the words the exact casts already use |
+
+**Why it was needed.** Every numeric cast is exact-or-fail under the 2026-09-02 ruling, so the
+one spelling that looks like "reinterpret these 32 bits" was the one that could not: the
+language's first external consumer filed it twice. `~/glean/docs/vl-issues.md` §VL-023 —
+`0xEEEEEEEE` is typed `i64` and `const x: i32 = 0xFFFFFFFF` is a lossy-conversion error, so a
+Storm hash seed, an MPQ block flag or a CRC polynomial has no spelling. §VL-044 — `f(0xb81a1aaa
+as! i32)` compiles and traps, and the workaround in three separate tools was a hand-written
+`parseHex32` shift-and-or loop. Both rows name `as% i32` as the fix they want.
+
+**Why a suffix and not a function.** The alternative was an intrinsic (`lo32(x)`, or an
+`i32bits` twin of `f32bits`). Declined: the operation is a CAST — it takes a target type, it
+composes with the same precedence, and the family already teaches that the suffix is where the
+failure mode is spelled. A fourth suffix costs one parser arm and one emitter arm; a builtin
+costs a name in the global scope forever, and would have needed a second one the day someone
+wanted `u8`.
+
+**Why the checker FOLDS a literal operand.** `0xb81a1aaa as% i32` is the constant −1206248790,
+not a runtime `i64.const` plus a wrap. The bit-pattern use is a CONSTANT use — a mask, a seed, a
+polynomial — so the fold is what makes the feature answer the request rather than approximate
+it. The fold is a `NumLit` peel, the same one the range-step fold uses, not a constant folder.
+
+**Not implemented here, and still open: a hex literal is a bit pattern.** The other declined
+alternative was to let a hex literal with 32 significant digits infer `i32` where one is
+required, which VL-023 also asks for. That is a rule about LITERAL TYPING, it interacts with
+`i64` inference everywhere and not just at a cast, and it is still under discussion — `as%`
+does not settle it and does not depend on it.
+
+**Why `%` cannot collide with the remainder operator.** The suffix is read only directly after
+the `as` keyword, and `as` is read only directly after a postfix operand — so a `%` that opens a
+binary operator always has a left operand and a `%` that spells the cast never does. `as` stays
+a contextual keyword, so a binding may still be named `as` and take an ordinary remainder.
+`tests/cases/numerics/as-pct-precedence.vl` is the fixture that pins both readings.

@@ -123,7 +123,9 @@ rather than picked: `f64 as i32` succeeds iff the value is integral and in range
 otherwise fails the way every other `as` fails — bare `as` propagates `null` (the return
 must carry `| null`), `as?` yields `null`, `as!` traps. `i64 as i32` stops wrapping under the
 same rule; float targets round and never fail; truncation is spelled `trunc(d) as! i32`
-(peepholed to the one instruction). Nothing ships in std. Not yet BUILT — the suffix is
+(peepholed to the one instruction). Wrapping did not disappear, it got its own spelling:
+`x as% i32` keeps the low bits and never fails (owner, 2026-09-04, DECISIONS.md §"`as%` is
+the wrap cast, the fourth member of the `as` family"). Nothing ships in std. Not yet BUILT — the suffix is
 accepted and ignored on a numeric cast today (D1041), and the build item with its
 migrate-`as!`-first sequencing is in ROADMAP §Next. The filing below is kept as it was
 verified; the diagnostic half of the ask (a source-located trap message for `as!`) still
