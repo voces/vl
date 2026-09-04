@@ -6697,18 +6697,23 @@ function pushKindBitsOf(objIx: i32, fnIx: i32) {
   bits
 }
 
-// The receiver-kind bits of a statement-level `recv.push(x)` member-call (the
-// `Call` whose `callFn` is a `Member` with property `push`), or 0 when `stmtIx`
-// is no such statement. Detects which inline-push scratch locals a function
-// needs; the kinds get DISTINCT scratch frames so a function may push onto any mix.
-export function stmtPushBits(stmtIx: i32, fnIx: i32) {
-  const s = P.nodes[stmtIx]
+// The receiver-kind bits of a `recv.push(x)` member-call (the `Call` whose `callFn` is a
+// `Member` with property `push`), or 0 when `callIx` is no such call. Detects which
+// inline-push scratch locals a function needs; the kinds get DISTINCT scratch frames so a
+// function may push onto any mix.
+//
+// ASKED AT VALUE POSITIONS TOO, not only at statement ones (D1592): since `.push` yields the
+// new length, `const n = xs.push(2)` runs the same grow sequence and needs the same frame, so
+// `exprPopBits` — the walk that already descends every value position — asks this here.
+export function callPushBits(callIx: i32, fnIx: i32) {
+  const s = P.nodes[callIx]
   if s is Call {
     const callee = P.nodes[s.callFn]
     if callee is Member {
       if callee.memProp == "push" {
         let b = pushKindBitsOf(callee.memObj, fnIx)
-        if pushStagesAtomNarrow(stmtIx) { b = b | 256 }
+        if pushStagesAtomNarrow(callIx) { b = b | 256 }
+        if listOpRecvStages(callee.memObj, fnIx) { b = b | 512 }
         return b
       }
     }
@@ -6726,7 +6731,7 @@ export function stmtPushBits(stmtIx: i32, fnIx: i32) {
 // of claiming too little is a `local.set` against an index the locals vector never declared,
 // i.e. invalid wasm — so the asymmetry decides the direction.
 //
-// It rides `stmtPushBits`, the SAME walk that reserves the push QUAD, so the staging slot
+// It rides `callPushBits`, the SAME walk that reserves the push QUAD, so the staging slot
 // cannot go missing on its own. `gLitUnionUsed` leaves a module with no litunion untouched.
 function pushStagesAtomNarrow(callIx: i32): boolean {
   if gLitUnionUsed == 0 { return false }
@@ -6740,6 +6745,26 @@ function pushStagesAtomNarrow(callIx: i32): boolean {
     return !unionEqOperandOk(c.callArgs[0])
   }
   false
+}
+
+// True if a list op on receiver `objIx` must MATERIALIZE the wrapper ref into the frame's one
+// `recvRef` slot rather than referencing a local in place. `listOpRecvLocal` reads a bare
+// LOCAL directly and evaluates EVERY other receiver through `emitExpr` into that slot; the
+// kinds it refuses outright stage nothing, because they never emit. A frame slot holding a
+// union BOX narrowed to a list arm stages too, and is asked of the SLOT because this walk
+// runs with no narrowing active (`identSlotIsUnionBox`).
+//
+// TWO READERS THAT MUST AGREE: `callPopBits` reserves the frame for a staging receiver, and
+// `emitPush` asks whether its own staged receiver could be OVERWRITTEN by a nested op in the
+// pushed value — one slot, two ops, and the append landed on the INNER list ([D1280](../docs/internals/inventory/D1280.md)).
+export function listOpRecvStages(objIx: i32, fnIx: i32): boolean {
+  const recv = P.nodes[objIx]
+  if recv is Ident {
+    if identSlotIsUnionBox(fnIx, recv.identName) { return true }
+    if localIndexOf(fnIx, recv.identName) >= 0 { return false }
+    return globalIndexOf(recv.identName) >= 0
+  }
+  true
 }
 
 // The receiver-kind bits of a `recv.pop()` at `callIx` whose receiver is a
@@ -6764,43 +6789,21 @@ function callPopBits(callIx: i32, fnIx: i32) {
         getIsList = mfRecvKindOf(callee.memObj, fnIx) != null
       }
       if callee.memProp == "pop" || callee.memProp == "clear" || getIsList {
-        const recv = P.nodes[callee.memObj]
-        // A struct-FIELD / global-field Member receiver, OR a bare module-GLOBAL list
-        // ident — both materialize the wrapper ref into the `recvRef` scratch slot, so
-        // both need the push frame reserved. A bare LOCAL pop references the local in
-        // place and needs no scratch, so it is NOT counted.
-        let needsScratch = false
-        if recv is Member {
-          needsScratch = true
-        } else if recv is Ident {
-          if identSlotIsUnionBox(fnIx, recv.identName) {
-            // A frame slot holding the union BOX narrowed to a list arm (`if x is i32[] {
-            // x.clear() }`). It resolves through `localIndexOf` like any other local, but
-            // the LIST is the box's anyref payload — so the receiver stages through
-            // `emitExpr`'s unbox into `recvRef`, exactly as a global/field one does, and
-            // needs the frame reserved. THE RESERVATION TWIN OF `listOpRecvNarrowedUnion`:
-            // without it `.pop`/`.clear` staged into a frame `fbBeginFunc` never laid out —
-            // `unknown local`, `vl check` rc 0. Asked of the SLOT because this walk runs
-            // with no narrowing active (see `identSlotIsUnionBox`); an un-narrowed list op
-            // on a union box is a type error, so the slot answer and the live-narrow answer
-            // coincide wherever emission actually reaches.
-            needsScratch = true
-          } else if localIndexOf(fnIx, recv.identName) < 0 {
-            if globalIndexOf(recv.identName) >= 0 { needsScratch = true }
-          }
+        // BIT 512 rides along: this op PARKS its receiver in the frame's one `recvRef`
+        // slot, which is what `emitPush` must know about its own pushed value (D1592).
+        if listOpRecvStages(callee.memObj, fnIx) {
+          return pushKindBitsOf(callee.memObj, fnIx) | 512
         }
-        if needsScratch { return pushKindBitsOf(callee.memObj, fnIx) }
       }
     }
   }
   0
 }
 
-// True if the statement at `stmtIx` is a `recv.push(x)` whose receiver's list
-// kind matches `kind` (the single-kind view of `stmtPushBits`, for the ref-slot
-// collectors).
-export function stmtIsPushKind(stmtIx: i32, fnIx: i32, kind: PushKind) {
-  (stmtPushBits(stmtIx, fnIx) & pushKindBit(kind)) != 0
+// True if the call at `callIx` is a `recv.push(x)` whose receiver's list kind matches
+// `kind` (the single-kind view of `callPushBits`, for the ref-slot collectors).
+export function callIsPushKind(callIx: i32, fnIx: i32, kind: PushKind) {
+  (callPushBits(callIx, fnIx) & pushKindBit(kind)) != 0
 }
 
 // True if `callIx` is a Member/global-receiver `.pop`/`.clear` of list kind
@@ -6863,7 +6866,11 @@ function exprPopBitsGo(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return 0 }
   const e = P.nodes[exprIx]
   if e is Call {
-    let bits = callPopBits(exprIx, fnIx)
+    // D1592 — a `.push` in VALUE position (`const n = xs.push(2)`, `return xs.push(2)`)
+    // runs the same grow sequence a statement one does and needs the same scratch frame.
+    // This walk is the one that descends value positions, so it asks for BOTH here rather
+    // than growing a second walker whose node set could drift from this one's.
+    let bits = callPopBits(exprIx, fnIx) | callPushBits(exprIx, fnIx)
     const args = e.callArgs
     let i = 0
     while i < args.length {
@@ -6940,7 +6947,9 @@ export function blockPushPopBits(blockIx: i32, fnIx: i32) {
       } else if s is BinExpr {
         bits = bits | exprPopBits(stmts[i], fnIx)
       } else if s is Call {
-        bits = bits | stmtPushBits(stmts[i], fnIx) | exprPopBits(stmts[i], fnIx)
+        // `exprPopBits` asks `callPushBits` of every `Call` it reaches (D1592), so the
+        // statement receiver is covered by the same descent as a value-position one.
+        bits = bits | exprPopBits(stmts[i], fnIx)
       } else if s is IfStmt {
         bits = bits | ifChainPushPopBits(stmts[i], fnIx)
       } else if s is WhileStmt {
@@ -6990,6 +6999,7 @@ function ifChainPushPopBits(ifIx: i32, fnIx: i32) {
 
 // OR a push/pop kind mask into the six per-function `fnUses*Push` scratch-frame
 // flags (a `.push` and a Member-receiver `.pop` of the same kind share a frame).
+// Bit 512 — the STAGING tell `emitPush` reads — reserves nothing and is ignored here.
 export function applyPushPopBits(bits: i32) {
   if (bits & 1) != 0 { fnUsesPush = true }
   if (bits & 2) != 0 { fnUsesRefPush = true }
@@ -15495,18 +15505,15 @@ export function fnRetNullBearing(fnIx: i32) {
 // reads an empty stack), `emitFuncBody`/`emitStmtTail` (the tail IS the result), and
 // `emitCallStmt`'s discard (whether anything is on the stack to drop).
 //
-// `.push` IS THE ONE EXCLUSION, and it is measured, not stylistic: the checker types it `i32`
-// while NO position lowers that value — `const n = xs.push(2)` is `callee is not a function
-// name` — so admitting it here would classify a working void procedure non-void and refuse it.
-// The gap is [D1301](../docs/internals/inventory/D1301.md); this line goes when it does.
+// `.push` USED TO BE EXCLUDED BY NAME, because the checker typed it `i32` while no position
+// lowered that value. `emitPush` now delivers the new length in value position, so the
+// exclusion is gone and this predicate is the checker's type at every method
+// ([D1301](../docs/internals/inventory/D1301.md), [D1592](../docs/internals/inventory/D1592.md)).
 export function memberCallYieldsValue(stmtIx: i32) {
   const s = P.nodes[stmtIx]
   if s is Call {
     const callee = P.nodes[s.callFn]
-    if callee is Member {
-      if callee.memProp == "push" { return false }
-      return tyPrimNameOf(nodeTyIxOf(stmtIx)) != "void"
-    }
+    if callee is Member { return tyPrimNameOf(nodeTyIxOf(stmtIx)) != "void" }
   }
   false
 }
