@@ -22,6 +22,17 @@ compared.
 Not required for: a change that only touches a std function BODY without altering its
 signature, name, or documented behaviour.
 
+**A std COMMENT is API surface, written for a CONSUMER of VL** (owner ruling, 2026-09-03,
+after the headers had grown into internal commentary). Header at most **10 lines** — what
+the module is for, how to import it, what it deliberately does not do. Every `export` gets
+**1 to 4 lines** directly above it: what it does, what its arguments mean, what it returns,
+and the edge case a caller must know. A private helper gets 0 or 1. Anything true about the
+COMPILER rather than the API — a defect id, a PR number, a date, a mechanism, an argument
+with an earlier version of the file — leaves std for `docs/internals/std-notes.md`, and
+**std does not link there**. `std-comment-audience` in `compiler/lint.vl` enforces the
+mechanical half (module-scoped to `std/`, **no baseline**: it landed at zero and stays
+there); the rest is the review's, and the full rubric is `std-api-review.md` §4.
+
 ## Agent concurrency — the cap was calibrated against a run nobody makes any more
 
 **Up to 6 concurrent worktree agents at `JOBS=6` / `DENO_JOBS=4`.** The old cap of 3 came from an
@@ -166,13 +177,17 @@ Two ways a refusal's own words misled a brief on 2026-08-31, both costing an age
   the same mistake: a citation is a measurement with a date on it.) The agent built a 100-pair direct/pin grid to prove there was no disagreement
   anywhere. Fixed: a primitive width keeps its digits, every other number still collapses.
 
-* **A refusal's sentence describes the arm that fired, not the feature.** Three in one day were
-  broader than the defect: `nested arrays are not supported` refused only an INFERRED nested
-  array with a ref leaf (annotated `i32[][]` always ran); `only i32 / boolean / string / array
-  struct fields are supported` was false at f64, i64, map and nested-struct; and `a
-  nullable-Circle list element has no rep` is false at every spelling — `(Circle | null)[]`
-  declared, read, and holding a null all work, and the refusal belongs to a two-destination
-  context that the sentence never mentions.
+* **A refusal's sentence describes the arm that fired, not the feature — and a refusal that
+  NAMES A SUPPORTED LIST is graded one member per row before its scope is believed.** Three in
+  one day were broader than the defect: `nested arrays are not supported` refused only an
+  INFERRED nested array with a ref leaf (annotated `i32[][]` always ran), and `a
+  nullable-Circle list element has no rep` was false at every spelling. The third,
+  `only i32 / boolean / string / array union-variant fields are supported`, stood in this
+  paragraph for months as "false at f64, i64, map and nested-struct" — and when D1518 graded
+  one arm-field type per row it was false of FOURTEEN of the fifteen types it excluded, true of
+  exactly one (this row's), and RETIRED rather than narrowed. The method, not the anecdote:
+  write the plainest program the sentence forbids for EACH thing it names, run them, and keep
+  the sentence only for what still refuses.
 
 **Before believing a refusal's scope, run the plainest program the sentence forbids.** It costs
 seconds and it has been wrong three times out of three. Narrowing the message is then part of

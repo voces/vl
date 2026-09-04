@@ -279,6 +279,19 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   as the harness's own controls, D1197's `array_push` cell grading `SILENT` among them
   (`tests/vl_capability_matrix_test.ts`). README §"The position matrix".
 - ✅ **Modernization program — (5) compile-time, the CI half: ci-native's four quick wins, DONE.** The job is 53 s (2026-07-30) -> 250 s today on ~2x the inputs, and the survey `docs/internals/perf-opportunities-2026-09.md` ranked the causes. Items 1-4 are landed and each A/B'd in §F: the corpus oracle is four shard FILES so `--parallel` can spread it (25.7 -> 11.2 s wall, same 2688/0/9), `selfhost_native_release_test.ts` and `vl_buffer_view_bounds_shape_test.ts` are split (64.7 -> 20.9 s, 18.8 -> 14.0 s, counts equal), `refresh-compiler.sh` warms BOTH `.cwasm` engine tags (**681 -> 351 s of user CPU per native step**), and the on-disk sidecar is content-keyed (a byte-identical rewrite: 4.43 s -> 0.02 s, priced at +0.85 ms an invocation). `gate.sh`'s slowest row goes **149.9 s -> 88.8 s** against a pristine master tree, with both suites' counts identical. On GitHub's own runner (§F7, this PR's job against six master runs) the corpus-oracle step is **40.5 -> 24 s** by median, while item 3's estimated −10 s **does not reproduce** — four cores make the JIT storm four workers deep, so warming it costs about what it saves and the local −330 s CPU is a 24-worker effect. **`vl_check_codegen_test.ts` is measured and left**: 19.00 of its 19.08 s is one test whose cost is `vl check` re-checking the std graph per file, which is §B1's cross-program checked-form cache — the next item on this axis, together with §A3's remaining per-file weight. No CI-runner number is claimed.
+- ✅ **Modernization program — (5) compile-time: the `??`-merge family is an INDEX, DONE (D1514).**
+  The second instance of #2419's class and the one both its guards were blind to. `vl check` of
+  a 38-line corpus case was 0.08 s and `vl build` 7.0 s; ablated, the ingredient is two std
+  imports and nothing else — four lines, **5,006 ms → 22 ms**. `anonLeafCloSlotMark` asks
+  `anonLeafParamFnTarget` per callback-typed parameter, that asks `anonLeafParamFnTargetAt` per
+  `Param` of the name, and that scanned every `Call` through `anonLeafCallMayTarget` into
+  `anonLeafOneDeclNamed` — a whole-arena scan (59.2% emitter self time). One index, built once
+  per program, the same nodes in the same arena order; D1100's own declaration index folded in
+  and deleted. Byte-identical on master's 2,046,160-byte compiler; `scan-budget` 132 → 107.
+  Witnesses at load ~32: **7027 → 31 ms**, `std/array-sorted.vl` **4847 → 35**,
+  `generics/mono-callback-bound-arm-beside-layout-twin.vl` **5694 → 39**; corpus oracle
+  **14.5 s → 2.3 s**. Guard: the new `callback slots` pair of `tests/vl_scaling_shape_test.ts`,
+  which does not finish in 200 s on master at a seventh of its N.
 - **Modernization program — (5) compile-time: the self-compile is ~7× faster, DONE.** 72% of
   the run was three whole-arena scans asked once per emitted FUNCTION — `moduleHasUnionAs`
   (29.8% self) and `moduleHasNumCast` (29.4%), both module-wide booleans, now memoised on an

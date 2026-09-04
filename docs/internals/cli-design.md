@@ -469,6 +469,55 @@ rather than an optimization level, and the level itself is measurably not the
 lever. What it buys, what each flag is worth, and the two scratch shapes that do
 NOT melt: `docs/internals/opt-profile-design.md`.
 
+## Exit codes, and which module trapped
+
+The whole table, and it is the host's to answer — the VL side picks between 0, 1
+and 2 (`cliUsageErr`, the severity gate), and the two the host owns alone are the
+two a VL program cannot reach:
+
+| code | meaning | decided by |
+| --- | --- | --- |
+| 0 | success | VL policy / the host's `Ok(())` |
+| 1 | the program or its compilation failed | `report`, `cliExitCode` |
+| 2 | usage — unparseable command line, unreadable input | `arg_error`, `cliUsageErr` |
+| 3 | `vl fmt` only: the formatted output failed to re-parse | `cli.vl` |
+| 70 | **the COMPILER itself crashed** | `report` / `EXIT_COMPILER_BUG` |
+
+**70 exists because a trap does not say which module raised it.** Two wasm modules
+are live in a `vl run`: the seed the host loaded as the compiler, and the module it
+instantiated from the compile result. wasmtime renders a trap out of either one
+identically — `wasm trap: out of bounds array access` over a backtrace of
+`<unknown>!<wasm function N>` frames, since the seed carries no name section — so a
+compiler crash arrives wearing the user's own error. D1500 is the measured cost: the
+first external VL consumer hit a seed bug on the first compile of a DEFLATE decoder
+and went looking for an out-of-range index in their decoder.
+
+**The attribution is recorded at the CALL BOUNDARY, never read off the message.**
+`from_compiler` / `from_user` wrap the failing wasm call itself and write
+`FAULT_IN_COMPILER`; the banner needs that flag AND a `Trap` in the cause chain, so
+a link or I/O failure that never entered a module cannot be blamed on one. Both
+arms write, which is what keeps the flag fresh: `vl test` runs user modules inside
+the same process that drives the compiler and DISCARDS their failures into a
+per-test outcome, so a one-way "the compiler faulted" latch would go stale the first
+time a test trapped.
+
+Where each side is marked:
+
+- **compiler** — `load_compiler`'s instantiate (the seed's own start function),
+  every call in `compile_vl_instance` (`compileSrc`, the staging and readback
+  accessors, `render_diags`), `run_batch`'s per-case instantiate, and `cli_pump` as
+  a whole, since its user modules are loaded only inside the two `*_test_file`
+  functions that swallow their own errors.
+- **user** — `run_program_with`'s `Module::new` and `instantiate_program`'s
+  instantiate, which is the single door into a compiled program from `vl run`,
+  `--batch` and both `vl test` phases.
+
+A non-zero `rc` back from `compileSrc` is the compiler REPORTING on the program and
+is deliberately not a fault: it reaches `report` through the same function as a trap
+would, which is what makes it the control worth keeping in the suite
+(`tests/vl_compiler_trap_banner_test.ts` pins both directions — a host that
+bannered every trap is the same defect with the blame reversed).
+
 ## Migration sequence
 
 1. **Protocol foundation + `vl check` (single file) in VL** — land the

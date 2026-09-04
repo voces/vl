@@ -109,6 +109,32 @@ is the signal. `--no-validate` opts out and restores the old write-and-bless pat
 want the bytes regardless. The opt-out is an exact-string match, so a **misspelled flag still
 validates**: the fail-safe direction is to check.
 
+### Exit codes, and telling a vl bug from yours
+
+| code | meaning |
+|---|---|
+| `0` | success — the program ran, the module was written, the file is clean |
+| `1` | your program failed: a compile diagnostic, a runtime trap, a failing test, `fmt --check` drift |
+| `2` | usage — an unparseable command line, an unreadable input, an unknown flag |
+| `3` | `vl fmt` only: an internal formatter bug (the formatted output failed to re-parse) |
+| `70` | **the compiler itself crashed. This is a vl bug, not your program's** |
+
+A wasm trap renders the same whichever module raised it, so a crash *inside* the
+compiler used to reach you as `wasm trap: out of bounds array access` over anonymous
+frames — indistinguishable from your own array index being out of range, and the first
+external VL consumer lost a session to exactly that. Exit `70` and a banner now say so
+outright:
+
+```
+vl: the compiler itself trapped while compiling decode.vl. This is a bug in vl, not in your program.
+    please report it with this file and the output below (vl 0.1.0, seed 1832652 bytes)
+```
+
+Everything after the banner is the original error, unchanged. If you see it, the file
+you were compiling plus that output is the whole bug report — please
+[open an issue](https://github.com/voces/vl/issues). Nothing you can write in VL
+is supposed to produce it.
+
 The brains live in VL (the seed); `vl` is a thin host (a command-queue pump — all
 CLI policy is VL, see [`docs/cli-design.md`](./docs/internals/cli-design.md)). A `test`
 subcommand is planned (see [`docs/test-runner-design.md`](./docs/internals/test-runner-design.md)).

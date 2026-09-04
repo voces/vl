@@ -1,55 +1,22 @@
-// `std:fmt` — pure-VL number formatting AND number parsing over the intrinsic
-// floor (docs/internals/std-design.md D4 item 1). The exported helpers take a
-// `self` first parameter, so they read as UFCS methods on the receiver
-// (`n.toString()`, `"1.5".parseF64()`, `parts.join(sep)`).
+// `std:fmt` — rendering numbers as text, and parsing them back.
 //
-// `toString` IS THIS MODULE'S EXPORT, NOT AN AMBIENT BUILTIN: the compiler once
-// carried a builtin of that name over `i32 | boolean`, and the owner retired it
-// so this export could take it (DECISIONS.md). No capability was lost — this
-// domain is a strict superset — and it bought the UFCS spelling, since builtins
-// are not `self`-first. THE ONE BREAK, shipped deliberately: `toString(42)` needs
-// `import { toString } from "std:fmt"` now, and because std has no deprecation
-// story the compiler pays for it with `typecheck.stdFmtMovedNote`, which appends
-// the import line to both refusals, for `toString` and the old `toStr` alike.
+//     import { toString, parseI32, parseI64, parseF64 } from "std:fmt"
 //
-// THE NAME IS BORROWED AND THE DOMAIN IS NOT. Elsewhere `toString` is defined on
-// every value; here it is exactly `i32 | i64 | boolean | f64`, so `"abc".toString()`
-// and `p.toString()` on a struct are refusals. A string identity arm is
-// deliberately absent: an arm that does nothing invites the name to grow into the
-// universal renderer VL has no overloading or traits to deliver (the derived
-// `show<T>` is that future, serde stage 2). The namespace being flat, a file that
-// declares its own `toString` cannot also import this one — `as` is the escape.
-//
-// WHAT IS NOT HERE: `f32`, in either direction — its shortest rendering is
-// shorter than its widened f64's, so it is Burger–Dybvig at 24-bit boundaries and
-// never a wrapper (`docs/serde-design.md` stage 0 owns it); any RADIX but ten;
-// and no unsigned, boolean or prefix parser. An `f32` widens losslessly INTO the
-// f64 arm, so `x.toString()` over one now passes the checker and floors at emit —
-// a COMPILER hole older than this module, pinned by
-// `scripts/capability-probes/f32-into-f64-union-arm.vl`.
-//
-// THE STRING SURFACE LIVES IN `std:str`; the names below are a re-export plus one
-// delegating call, and `padLeft` is the only one that did not move verbatim
-// (`std:str` spells it `padStart`). The move was not tidiness: VL has no
-// namespace import, so two modules each carrying a `split` would let a file
-// import `toString` and `split`, or `trim` and `split`, but never all three — and
-// whichever the caller reached for would silently decide whether their `join` was
-// O(n) or O(n²). It costs bytes, because there is no cross-module dead-code
-// elimination — but quote the OPTIMIZATION RUNG and what the program reaches: at
-// `-O3` an unused parser costs nothing measurable, and a constant-foldable probe
-// prices the FOLD, not the renderer.
+// `toString`'s domain is exactly `i32 | i64 | boolean | f64`, and it is this
+// module's export rather than a builtin — a file that declares its own
+// `toString` cannot also import this one. The float style is ECMAScript's, so
+// `print(x.toString())` and `print(x)` agree. `join`, `repeat` and `split` are
+// re-exported from `std:str`. No `f32`, no radix but ten, no unsigned parser.
 
 import { padStart } from "std:str"
 
-// The string surface, re-exported from its owner. A re-export records a NAME,
-// so these are the SAME functions `std:str` exports and not second copies —
-// importing `split` from either module reaches one implementation. (The same
-// mechanism `std:args` uses to republish `Utf8Error`.)
+// The string surface, re-exported from its owner: these ARE `std:str`'s
+// functions, not second copies, so importing `split` from either reaches one
+// implementation.
 export { join, repeat, split } from "std:str"
 
-// Decimal digit d in 0..=9 as its character. Takes i64 so both integer
-// widths share one renderer (i64 cannot narrow to i32, so a string-index
-// lookup is not expressible for the wide path).
+// A decimal digit value as its character. It takes an i64 so both integer
+// widths share one renderer.
 function digitChar(d: i64) {
   if d == 0 { return "0" }
   if d == 1 { return "1" }
@@ -63,10 +30,8 @@ function digitChar(d: i64) {
   "9"
 }
 
-// Decimal rendering of any i64, including i64 min. The accumulator works in
-// the NEGATIVE range (positive inputs are negated first) because the negative
-// range covers i64 min, whose magnitude overflows when negated; `%` on a
-// negative operand yields a digit in -9..=0, negated back per digit.
+// Decimal rendering of any i64, i64 min included: the accumulator works in the
+// NEGATIVE range, which is the half wide enough to hold it.
 function renderI64(n: i64) {
   if n == 0 { return "0" }
   const zero: i64 = 0
@@ -81,18 +46,10 @@ function renderI64(n: i64) {
   out
 }
 
-// Decimal rendering of a number via its receiver: `n.toString()` over an i32, an
-// i64 or an f64 binding. One union receiver covers every width (UFCS resolves
-// by `self`+arity; the value boxes in, `is`-narrows out); i32 widens
-// losslessly into the shared i64 renderer. The boolean arm renders true/false.
-//
-// The f64 arm is the whole `f64 ↔ TEXT` section below, and it is a SEPARATE
-// arm of this same union rather than a separate exported name because a flat
-// namespace has room for exactly one `toString` and a reader who has learned
-// `n.toString()` should not have to learn a second spelling to render a float.
-// Measured, so it is not an assumption: a four-arm receiver `is`-narrows and
-// monomorphizes per arm on this compiler — `f64bits` inside the `is f64`
-// branch reads the narrowed f64, no boxing artefact survives.
+// The decimal rendering of `self`: `n.toString()` over an i32, an i64, an f64
+// or a boolean. Floats follow ECMAScript's `Number::toString` — the shortest
+// text that reads back as the same value — with `"NaN"`, `"Infinity"` and
+// `"-Infinity"` for the specials, and `"0"` for both zeros.
 export function toString(self: i32 | i64 | boolean | f64) {
   if self is boolean {
     if self { return "true" }
@@ -106,86 +63,61 @@ export function toString(self: i32 | i64 | boolean | f64) {
   return renderI64(self)
 }
 
-// `padLeft` is this module's historical spelling of `std:str`'s `padStart` and
-// is kept for its existing importers. Pads `self` on the left with `fill` up to
-// `width`: a multi-character fill is tiled and truncated so the result is
-// exactly `width` long, and `self` comes back unchanged when it is already wide
-// enough or when `fill` is empty. New code should reach for `padStart` (and its
-// `padEnd` twin, which has no name here).
+// This module's older spelling of `std:str`'s `padStart`: pad `self` on the left
+// with `fill` up to `width`, tiling and cutting a multi-character `fill` so the
+// result is exactly `width` wide, and never truncating `self`. New code should
+// reach for `padStart`, which has a `padEnd` twin that this name does not.
 export function padLeft(self: string, width: i32, fill: string) {
   return padStart(self, width, fill)
 }
 
-// ── TEXT → INTEGER ──────────────────────────────────────────────────────────
-// `parseI64`/`parseI32` are the EXACT inverses of `toString` over the two integer
-// widths; the `parseF64` funnel cannot be wherever the integer is not a double.
-// THE GRAMMAR IS `"-"? digit+` and nothing else — a strict SUBSET of `parseF64`'s,
-// so choosing between them is a choice of TYPE and never of DIALECT, and no string
-// parses here and fails there. Leading zeros are in (`"007"` is seven); a leading
-// "+", whitespace, `"1.0"` and `"1e3"` are out, "+" deliberately, because a grammar
-// can be WIDENED later and never narrowed. `"-0"` is zero: an integer has no signed
-// zero. THE ACCUMULATOR WORKS IN THE NEGATIVE RANGE — the wider half, so i64 min is
-// reachable as an intermediate — and every guard runs BEFORE the operation it
-// protects, so nothing ever wraps. A wrapped SIGN must never be used as a detector:
-// a long enough digit string wraps twice and the sign comes back.
+// ── text → integer ───────────────────────────────────────────────────────────
+
+// The grammar is `"-"? digit+` and nothing else. Leading zeros are accepted; a
+// leading "+", whitespace, `"1.0"` and `"1e3"` are not, so this is a strict
+// subset of `parseF64`'s grammar and choosing between them is a choice of TYPE
+// and never of dialect. `"-0"` is zero: an integer has no signed zero.
 
 // i64's bounds. i64 min is spelled as max-minus-one because it has no decimal
-// literal: `-9223372036854775808` lexes as a negation of a magnitude that
-// overflows a positive i64 before the minus applies — the same fact `SIGN_BIT`
-// records for f64 further down.
+// literal of its own — the minus would apply after the magnitude overflowed.
 const I64_MAX: i64 = 9223372036854775807
 const I64_MIN: i64 = -9223372036854775807 - 1
-// i64 min divided by ten, truncated toward zero: the largest magnitude the
-// accumulator may already hold and still survive a multiply by ten.
+// The largest magnitude the accumulator may already hold and still survive a
+// multiply by ten.
 const I64_MIN_DIV10: i64 = -922337203685477580
-// i32's bounds, held WIDE. They are compared against an i64 accumulator, and
-// widening them here is exactly what lets `parseI32` reject before it truncates.
+// i32's bounds, held WIDE: they are compared against an i64 accumulator, which
+// is what lets `parseI32` reject before it truncates.
 const I32_MAX_WIDE: i64 = 2147483647
 const I32_MIN_WIDE: i64 = -2147483648
 
-// The integer `self` spells, as an i64 — or `null` when `self` is not an
-// integer in this section's grammar, or denotes one outside `lo`..=`hi`
-// (inclusive). Both exported parsers ARE this function; they differ only in the
-// bounds they pass and in the width they hand back.
-//
-// `lo <= 0 <= hi` IS A PRECONDITION, because each sign is checked against ONE
-// bound: `lo` on the negative path, `hi` on the positive one. A range that does
-// not contain zero is therefore NOT enforced — `parseBoundedInt("-3", -10, -5)`
-// answers -3, not null. Both callers here straddle zero, so the check is exact
-// for them; a third caller that does not (a bounded `u8`-valued field reader,
-// say) has to add the other half. The symmetric version is not written because
-// it needs `0 - lo`, which overflows at `lo == i64 min`, and no caller wants it.
+// The integer `self` spells, or `null` when it is not one in this grammar or
+// denotes one outside `lo`..=`hi`. `lo <= 0 <= hi` is a PRECONDITION: each sign
+// is checked against one bound only, so a range not containing zero is not
+// enforced. Both callers here straddle zero.
 function parseBoundedInt(self: string, lo: i64, hi: i64): i64 | null {
   const n = self.length
   if n == 0 { return null }
   let i = 0
   let neg = false
-  // Only "-": a leading "+" is not part of this grammar (see the header — the
-  // subset rule), and falls through to the digit loop, which refuses it.
+  // Only "-": a leading "+" is not in this grammar and falls through to the digit
+  // loop, which refuses it.
   if self[0] == 45 {
     neg = true
     i = 1
   }
-  // A sign with no digits after it denotes nothing.
   if i >= n { return null }
 
-  // `acc` holds the value NEGATED — see the header: the negative half reaches
-  // i64 min, so `"-9223372036854775808"` is an ordinary intermediate here while
-  // the magnitude 9223372036854775808 never has to exist.
+  // Held NEGATED, so `"-9223372036854775808"` is an ordinary intermediate and the
+  // magnitude that would overflow never has to exist.
   let acc: i64 = 0
   while i < n {
     const c = self[i]
-    // Spelled inline rather than through `isDigitByte` (which the f64 parser
-    // uses further down) because this is the hot loop's first test and the
-    // negated form lets the refusal return directly. One predicate, two
-    // spellings — if a third appears, collapse them.
     if c < 48 || c > 57 { return null }
     const d: i64 = c - 48
     // Guard, THEN multiply: below this floor the product leaves i64 entirely.
     if acc < I64_MIN_DIV10 { return null }
     acc = acc * 10
-    // Guard, THEN subtract. `I64_MIN + d` adds a value in 0..=9 to i64 min, so
-    // the comparison's own arithmetic is always in range.
+    // Guard, THEN subtract; the comparison's own arithmetic stays in range.
     if acc < I64_MIN + d { return null }
     acc = acc - d
     i = i + 1
@@ -195,89 +127,40 @@ function parseBoundedInt(self: string, lo: i64, hi: i64): i64 | null {
     if acc < lo { return null }
     return acc
   }
-  // `0 - acc` is safe only after this test, because `acc` may be i64 min, whose
-  // magnitude is not an i64. `hi` is at most i64 max, so `0 - hi` is always in
-  // range and the whole comparison can stay in the negative half.
+  // `0 - acc` is safe only after this test, because `acc` may be i64 min.
   if acc < 0 - hi { return null }
   0 - acc
 }
 
-// The i64 that the decimal integer `self` spells, or `null` when `self` is not
-// one or does not fit. See the `TEXT → INTEGER` header for the grammar.
-//
-// OUT OF RANGE IS `null`, the OPPOSITE of `parseF64`'s rule, because the two TYPES
-// differ: a float has values meaning "larger than any of me", an integer has none,
-// so wrapping is a silent WRONG VALUE and saturating is indistinguishable from the
-// honest parse of the string one smaller. That does not put two meanings on one
-// channel, because for an integer "out of range" and "not a number of this type"
-// are the SAME statement. `i64 | null` IS THE CHANNEL for `parseF64`'s reason:
-// there is no information to carry — the parse consumes the whole string or fails,
-// so no position is honest — and `i64 | ParseIntError` stays a WIDENING std can
-// still travel to. Exact by construction: no float exists at any step.
+// The i64 the decimal integer `self` spells, or `null` when `self` is not one
+// or does not fit. Out of range is `null` too: for an integer, "out of range"
+// and "not a number of this type" are the same statement — wrapping would be a
+// silently wrong value and saturating would forge one.
 export function parseI64(self: string): i64 | null {
   parseBoundedInt(self, I64_MIN, I64_MAX)
 }
 
-// The i32 that the decimal integer `self` spells, or `null` when `self` is not
-// one or does not fit in 32 bits. Same grammar as `parseI64`; `"2147483648"`
-// and `"-2147483649"` are `null` rather than wrapped.
-//
-// TWO NAMES, NOT ONE, and this is NOT `parseI64` followed by a narrow: it
-// range-checks in the WIDE type first and truncates only behind that check, where
-// the truncation is provably lossless. Three things forced the pair. The RETURN
-// TYPE is the point — handing every i32 caller an `i64 | null` hands them a cast.
-// VL has NO return-type overloading and no return-position generic, so a single
-// `parseInt<T>(self: string): T | null` cannot be CALLED (the refusal is at the
-// USE, not the definition). And it mirrors `toString`'s domain exactly, which is
-// the rubric's "a width-suffixed family stays uniform" read across both directions.
+// The i32 the decimal integer `self` spells, or `null` when `self` is not one
+// or does not fit in 32 bits. Same grammar as `parseI64`; `"2147483648"` and
+// `"-2147483649"` are `null` rather than wrapped.
 export function parseI32(self: string): i32 | null {
   const v = parseBoundedInt(self, I32_MIN_WIDE, I32_MAX_WIDE)
   if v is null { return null }
-  // The only narrowing cast in this module. It is correct TWICE OVER, and the
-  // second reason arrived after the first: the bounds above already refused
-  // everything outside i32, and since the 2026-09-02 numeric-`as` ruling
-  // (DECISIONS.md §"Numeric `as` to an INTEGER target is exact-or-fail under the
-  // trio") an `i64 -> i32` `as!` is exact-or-fail rather than a wrap, so an
-  // out-of-range value would TRAP here rather than silently wrap. Moving this
-  // line in front of the check would therefore turn the null channel's job into
-  // an abort — still wrong, and now loudly so.
-  //
-  // (Until that ruling landed this comment read "`as i32` is an unchecked
-  // wrapping truncation on this compiler". That was true of the compiler it was
-  // measured against and is false of every one since.)
+  // The bounds above already refused everything outside i32, so this narrowing is
+  // provably lossless.
   v as! i32
 }
 
-// ── f64 ↔ TEXT ──────────────────────────────────────────────────────────────
-// Serde stage 0 (`docs/serde-design.md` §Recommendation). Until this landed VL
-// could not render or read a float at all: the shortest-round-trip printer
-// `print` uses lives in the HOST's sink, never available as a VL string value.
-// THE STYLE IS ECMAScript `Number::toString`, radix 10, and that is a SPEC rather
-// than a preference — both hosts' print sinks already claim to implement it, so
-// `print(x.toString())` and `print(x)` are meant to be indistinguishable. The
-// layout rule is at `layoutDec`, the digit generator and the Ryū decline at
-// `shortestDigits`, the round trip and the host's tie disagreement at `renderF64`,
-// and the parser's grammar, channel and range rule at `parseF64`. BOTH HALVES LIVE
-// HERE because a flat namespace has one `toString`, so the formatter cannot move,
-// and splitting the parser off would divide a symmetric pair for bytes DCE owes.
+// ── f64 ↔ text ───────────────────────────────────────────────────────────────
 
-// ── exact big naturals ──────────────────────────────────────────────────────
-//
-// Little-endian limbs of 32 bits each, held in an `i64[]` so that a limb×small
-// product has room: (2^32−1) × 10^9 is inside i64's range, which is why every
-// multiplier below is capped at 10^9 and no 128-bit multiply is needed here.
-//
-// HIGH ZERO LIMBS ARE LEFT IN PLACE rather than trimmed, because `.pop()` on an
-// `i64[]` does not lower on this compiler: an `i64[]` PARAMETER refuses loudly
-// and an `i64[]` LOCAL is check-clean invalid wasm, both pinned by
-// `scripts/capability-probes/i64-list-pop.vl`. `bnLen` is the consequence — every
-// operation reads to the highest non-zero limb, not to `.length`. Delete it the
-// day that probe runs; nothing else here depends on it.
-
+// The style is ECMAScript `Number::toString`, radix 10. Everything from here to
+// `renderF64` is the exact arithmetic it needs: big naturals held as 32-bit
+// limbs in an `i64[]`, so a limb times a multiplier of at most 10^9 still fits.
+// High zero limbs are left in place, so every operation reads to the highest
+// non-zero limb rather than to `.length`.
 const BN_MASK: i64 = 4294967295
 
-// The number of limbs that carry value — the index of the highest non-zero
-// limb, plus one. Zero is length 0.
+// The number of limbs that carry value. Zero has length 0.
 function bnLen(a: i64[]): i32 {
   let i = a.length - 1
   while i >= 0 && a[i] == 0 { i = i - 1 }
@@ -340,9 +223,8 @@ function bnAddInto(a: i64[], b: i64[]) {
   }
 }
 
-// `a -= b`, in place. The caller guarantees `a >= b`; a smaller `a` would
-// borrow off the top and produce a garbage value rather than trapping, so
-// every call site here is preceded by a `bnCmp`.
+// `a -= b`, in place. The caller guarantees `a >= b`; a smaller `a` borrows off
+// the top and answers garbage rather than trapping.
 function bnSubInto(a: i64[], b: i64[]) {
   let borrow: i64 = 0
   let i = 0
@@ -376,7 +258,7 @@ function bnMulSmall(a: i64[], m: i64) {
   }
 }
 
-// 10^n for n in 0..=18, which is every n this file asks for.
+// 10^n for n in 0..=18.
 function pow10i64(n: i32): i64 {
   let p: i64 = 1
   let i = 0
@@ -387,7 +269,7 @@ function pow10i64(n: i32): i64 {
   p
 }
 
-// `a *= 10^k`, in place, in 10^9 chunks so the per-limb product stays in range.
+// `a *= 10^k`, in place, in 10^9 chunks so each limb product stays in range.
 function bnMulPow10(a: i64[], k: i32) {
   if bnIsZero(a) { return }
   let n = k
@@ -398,8 +280,7 @@ function bnMulPow10(a: i64[], k: i32) {
   if n > 0 { bnMulSmall(a, pow10i64(n)) }
 }
 
-// `a <<= bits`, in place. The sub-limb shift runs first so the whole-limb move
-// only ever relocates finished limbs.
+// `a <<= bits`, in place.
 function bnShlInto(a: i64[], bits: i32) {
   if bnIsZero(a) { return }
   const whole = bits / 32
@@ -453,7 +334,6 @@ function bnBitLen(a: i64[]): i32 {
 }
 
 // The big natural spelled by `d`, a list of decimal digit VALUES (0..=9).
-// Nine digits at a time, so the multiplier stays inside `bnMulSmall`'s range.
 function bnFromDigits(d: i32[]): i64[] {
   const out = bnFromI64(0)
   let i = 0
@@ -472,10 +352,8 @@ function bnFromDigits(d: i32[]): i64[] {
   out
 }
 
-// floor(a / b), leaving the exact remainder in `a`. Shift-and-subtract from
-// the top, so the loop runs once per QUOTIENT bit rather than once per bit of
-// `a`; the caller arranges a quotient of at most ~55 bits, which is what makes
-// the i64 result and the loop bound safe.
+// floor(a / b), leaving the exact remainder in `a`. Shift-and-subtract from the
+// top, so the loop runs once per QUOTIENT bit.
 function bnDivMod(a: i64[], b: i64[]): i64 {
   if bnCmp(a, b) < 0 { return 0 }
   const shift = bnBitLen(a) - bnBitLen(b)
@@ -495,14 +373,14 @@ function bnDivMod(a: i64[], b: i64[]): i64 {
   q
 }
 
-// ── f64 → text ──────────────────────────────────────────────────────────────
+// ── f64 → text ───────────────────────────────────────────────────────────────
 
 // The shortest digit string that identifies a value, with the exponent that
 // places it: value = 0.d[0]d[1]… × 10^n.
 type DecDigits = { d: i32[], n: i32 }
 
 // `r + mp` against `s`, with the comparison inclusive when the significand is
-// even (round-to-nearest-even hands an even significand its own boundaries).
+// even — round-to-nearest-even hands an even significand its own boundaries.
 function upperTest(r: i64[], mp: i64[], s: i64[], inclusive: boolean): boolean {
   const t = bnCopy(r)
   bnAddInto(t, mp)
@@ -512,17 +390,9 @@ function upperTest(r: i64[], mp: i64[], s: i64[], inclusive: boolean): boolean {
 }
 
 // Burger–Dybvig over exact rationals; `x` must be finite and strictly positive.
-// The value is held as R/S with the two half-ulp boundaries M+ and M−, all four
-// exact big integers, and digits are generated until the emitted prefix already
-// identifies the value uniquely within (v−M−, v+M+). Correctness is by
-// construction, not by table: no digit is emitted that the interval does not
-// force, and the loop cannot stop early because stopping IS the interval test.
-// Boundary inclusivity follows round-to-nearest-EVEN, so an even significand owns
-// its boundaries and an odd one does not.
-//
-// RYŪ WAS DECLINED: faster, but it needs a large power-of-five constant table and
-// a synthesised 128-bit multiply, and its correctness rests on bounds proven
-// elsewhere — a std module with no deprecation story should be re-derivable.
+// The value is held as R/S with its two half-ulp boundaries, all exact, and
+// digits are generated until the emitted prefix already identifies the value
+// uniquely — so no digit is emitted that the interval does not force.
 function shortestDigits(x: f64): DecDigits {
   const bits = f64bits(x)
   const be = ((bits >>> 52) & 2047) as! i32
@@ -534,10 +404,8 @@ function shortestDigits(x: f64): DecDigits {
     e = be - 1075
   }
   const evenB = (m & 1) == 0
-  // The gap BELOW is half the gap above exactly when the significand sits at
-  // the bottom of a binade and there is a binade below it to fall into — so
-  // `frac == 0` and an exponent above the subnormal one. Get this wrong and
-  // powers of two render one digit too long.
+  // The gap BELOW is half the gap above exactly at the bottom of a binade with a
+  // binade beneath it. Get this wrong and powers of two render one digit long.
   const smaller = frac == 0 && be > 1
 
   const r = bnFromI64(m)
@@ -567,11 +435,8 @@ function shortestDigits(x: f64): DecDigits {
     }
   }
 
-  // `n` is the smallest integer with value + M+ ≤ 10^n. The float estimate is
-  // deliberately biased LOW (log10(2) times the binary magnitude, minus one),
-  // so the fixup below only ever climbs — which makes the result independent
-  // of how tight the estimate is, and stops at the first n that qualifies, so
-  // it is the minimal one.
+  // `n` is the smallest integer with value + M+ ≤ 10^n. The estimate is biased
+  // LOW, so the fixup below only ever climbs and stops at the minimal one.
   const bl = 64 - (clz(m) as! i32)
   let k = ((floor(((bl + e - 1) as! f64) * 0.3010299956639812)) as! i32) - 1
   if k >= 0 {
@@ -586,16 +451,10 @@ function shortestDigits(x: f64): DecDigits {
     k = k + 1
   }
 
-  // One digit per turn: scale by ten, take the quotient by repeated
-  // subtraction (it is 0..=9 by construction, so at most nine of them), then
-  // ask whether the interval still needs another digit. `low` means the
-  // remainder is already inside the lower boundary, `high` that adding one to
-  // this digit lands inside the upper one; either alone terminates, and both
-  // together take the closer of the two with the spec's even tie-break.
-  //
-  // The 25-digit bound is a floor, not a policy: a double never needs more
-  // than 17, and a hypothetical 25th digit would still name the right value —
-  // just not the shortest one.
+  // One digit per turn, stopping as soon as the interval no longer needs another;
+  // when both boundaries are reached at once, the closer digit wins with the
+  // spec's even tie-break. The 25-digit bound is a floor, not a policy: a double
+  // never needs more than 17.
   const digits: i32[] = []
   let done = false
   while !done && digits.length < 25 {
@@ -630,9 +489,8 @@ function shortestDigits(x: f64): DecDigits {
     }
   }
 
-  // A terminating `d + 1` can carry out of 9. The scaling above is chosen so
-  // this should not be reachable, and it is handled anyway because the failure
-  // mode if it ever were would be a silently wrong digit rather than a crash.
+  // A terminating `d + 1` can carry out of 9. The scaling should make this
+  // unreachable; it is handled anyway, because the alternative is a wrong digit.
   let ci = digits.length - 1
   let carrying = true
   while carrying && ci >= 0 {
@@ -655,18 +513,10 @@ function shortestDigits(x: f64): DecDigits {
   { d: digits, n: k }
 }
 
-// The four-way layout of ECMA-262 `Number::toString` step 5, over a digit list
-// and its exponent. With `s` the SHORTEST digit string (k digits, no radix point)
-// and `n` the exponent such that value = 0.s × 10^n:
-//
-//     k ≤ n ≤ 21   → the digits, then n−k zeros            ("100")
-//     0 < n ≤ 21   → a radix point n digits in             ("1.5")
-//     −6 < n ≤ 0   → "0." then −n zeros then the digits    ("0.000001")
-//     otherwise    → exponential, exponent always signed   ("1e+21", "1e-7")
-//
-// The specials belong to `renderF64`. Among equally short digit strings the spec
-// takes the one closest to the value, and on an exact tie the one whose last digit
-// is EVEN; `shortestDigits` is what enforces both.
+// The four-way layout of ECMA-262 `Number::toString` over a digit list and its
+// exponent: the digits then trailing zeros, a radix point inside them, a
+// leading `"0."` run, or exponential form with an always-signed exponent. The
+// specials belong to `renderF64`.
 function layoutDec(d: i32[], n: i32): string {
   const k = d.length
   const buf: i32[] = []
@@ -729,18 +579,10 @@ function layoutDec(d: i32[], n: i32): string {
   fromCodePoints(buf) + "e-" + renderI64(down)
 }
 
-// `toString`'s f64 arm. The sign is read off the BIT PATTERN rather than by
-// comparing with zero, because `-0.0 < 0.0` is false and the exponent/fraction
-// split is already in hand. Specials: NaN → "NaN", ±∞ → "Infinity"/"-Infinity",
-// both zeros → "0".
-//
-// ROUND TRIP: `parseF64(x.toString())` is bit-identical to `x` for every finite
-// f64 EXCEPT −0, and answers a NaN for NaN. Both exceptions are the STYLE's, not
-// the algorithm's — the spec renders −0 as `"0"`, so the sign is gone before the
-// parser sees it, and `"NaN"` carries no payload. THE RUST HOST'S `print`
-// DISAGREES AT EXACT DECIMAL TIES, rounding away from even where the spec rounds
-// to even; this file follows the spec and the V8 host, and
-// `tests/vl_std_float_text_test.ts` pins the divergence so it flips when it moves.
+// `toString`'s f64 arm. The sign is read off the BIT PATTERN, because `-0.0 <
+// 0.0` is false. NaN renders `"NaN"`, the infinities `"Infinity"` and
+// `"-Infinity"`, and both zeros `"0"` — so `-0` is the one finite value that
+// does not survive a round trip through text.
 function renderF64(x: f64): string {
   const bits = f64bits(x)
   const be = ((bits >>> 52) & 2047) as! i32
@@ -750,8 +592,7 @@ function renderF64(x: f64): string {
     if bits < 0 { return "-Infinity" }
     return "Infinity"
   }
-  // Both zeros render "0" — the spec's rule, and the reason -0 does not
-  // survive a round trip through text.
+  // Both zeros render "0", which is the spec's rule.
   if be == 0 && frac == 0 { return "0" }
   const dd = shortestDigits(abs(x))
   const body = layoutDec(dd.d, dd.n)
@@ -759,15 +600,16 @@ function renderF64(x: f64): string {
   body
 }
 
-// ── text → f64 ──────────────────────────────────────────────────────────────
-
+// ── text → f64 ───────────────────────────────────────────────────────────────
 const ONE64: i64 = 1
-// 0x8000_0000_0000_0000. Spelled as a shift because i64 min has no decimal
-// literal: its magnitude overflows a positive i64 before any minus applies.
+// Spelled as a shift, because i64 min has no decimal literal.
 const SIGN_BIT: i64 = ONE64 << 63
 const BITS_INF: i64 = 9218868437227405312
 const BITS_NAN: i64 = 9221120237041090560
 const TWO53: i64 = 9007199254740992
+// Enough significant digits to separate any decimal from a double's rounding
+// boundary, with slack. Without a cap a megabyte of digits would be a megabyte
+// of big integer, which is a denial-of-service surface for a JSON reader.
 const MAX_SIG_DIGITS = 800
 
 function withSign(v: f64, neg: boolean): f64 {
@@ -777,10 +619,8 @@ function withSign(v: f64, neg: boolean): f64 {
 
 function isDigitByte(c: i32): boolean { c >= 48 && c <= 57 }
 
-// 10^e, exactly, for e in 0..=22 — the range over which a power of ten is
-// representable as an f64 (10^22 = 2^22 · 5^22 and 5^22 < 2^53). Each step is
-// a product of two exactly representable values whose result is exactly
-// representable, so IEEE rounding is a no-op. Callers must not exceed 22.
+// 10^e exactly, for e in 0..=22 — the range over which a power of ten is
+// representable as an f64. Callers must not exceed 22.
 function pow10f(e: i32): f64 {
   let p = 1.0
   let i = 0
@@ -791,18 +631,10 @@ function pow10f(e: i32): f64 {
   p
 }
 
-// The f64 nearest to the number `self` spells, or `null` when `self` is not a
-// number in this grammar: `"-"? ( "Infinity" | digits ("." digits)? ([eE][+-]?
-// digits)? )` or `"NaN"` — JSON's number grammar plus the two specials, NOT VL's
-// literal grammar. Digit separators are legal VL and REFUSED here (a separator is
-// a source affordance; this reads DATA), as are a leading "+", whitespace, a bare
-// `"1."` or `".5"`, `"0x10"` and `"-NaN"`. Leading zeros are accepted.
-//
-// `f64 | null` IS THE CHANNEL: nothing would go in an error struct, since the
-// parse consumes the WHOLE string or fails, so no position is honest. OUT OF RANGE
-// IS NOT A PARSE FAILURE — overflow answers ±Infinity, underflow ±0, as `strtod`
-// and `Number()` do; `null` is the SYNTAX channel and nothing else. Correctly
-// rounded for EVERY accepted input, halfway cases included.
+// The f64 nearest to the number `self` spells, or `null` when `self` is not one:
+// the grammar is JSON's plus `"Infinity"` and `"NaN"`, so `"+1"`, `"1."`,
+// `".5"`, `"0x10"`, whitespace and digit separators are refused. Out of range
+// is NOT a failure — overflow answers ±Infinity, underflow ±0. Correctly rounded.
 export function parseF64(self: string): f64 | null {
   const n = self.length
   if n == 0 { return null }
@@ -819,32 +651,27 @@ export function parseF64(self: string): f64 | null {
     return withSign(f64fromBits(BITS_INF), neg)
   }
   if c0 == 78 {
-    // "NaN" only, unsigned: the renderer never produces a sign on it and VL
-    // has no such literal, so "-NaN" would be a spelling nothing else uses.
+    // "NaN" only, unsigned: the renderer never puts a sign on it and VL has no such
+    // literal.
     if neg { return null }
     if self != "NaN" { return null }
     return f64fromBits(BITS_NAN)
   }
 
-  // `digs` collects SIGNIFICANT digits (leading zeros contribute only to the
-  // exponent) and `exp10` is the power of ten the digit string is multiplied
-  // by. Digits past the cap move `exp10` when they are integer places and set
-  // `truncated` when they are non-zero — see `MAX_SIG_DIGITS`'s block above.
+  // `digs` collects SIGNIFICANT digits and `exp10` is the power of ten they are
+  // multiplied by; `truncated` records a non-zero digit dropped past the cap.
   const digs: i32[] = []
   let exp10 = 0
   let truncated = false
   const istart = i
   while i < n && isDigitByte(self[i]) {
     const d = self[i] - 48
-    // A LEADING zero of the integer part contributes nothing at all — not a
-    // significant digit, and not a place either, so `"007"` is `7` with the
-    // exponent untouched.
+    // A LEADING zero of the integer part is neither a significant digit nor a place,
+    // so `"007"` is `7` with the exponent untouched.
     if digs.length > 0 || d != 0 {
       if digs.length < MAX_SIG_DIGITS {
         digs.push(d)
       } else {
-        // Past the cap an integer digit is still a PLACE, so it moves the
-        // exponent; only a non-zero one moves the value.
         exp10 = exp10 + 1
         if d != 0 { truncated = true }
       }
@@ -857,18 +684,8 @@ export function parseF64(self: string): f64 | null {
     const fstart = i
     while i < n && isDigitByte(self[i]) {
       const d = self[i] - 48
-      // Every fraction digit is a place, INCLUDING the leading zeros of
-      // `"0.0012"` — they move the exponent without becoming significant.
-      // Past the cap the exponent must NOT move (the place is already accounted
-      // for by the digits that were kept), so only truncation is recorded.
-      //
-      // SIGNIFICANT DIGITS ARE CAPPED, with a `truncated` flag. The bound is the
-      // classic one — enough digits to separate any decimal from a double's
-      // rounding boundary — plus slack: beyond it, dropped digits cannot move the
-      // comparison EXCEPT by turning an exact tie into a value strictly above it,
-      // which is exactly what the flag records. Without a cap a megabyte of digits
-      // would be a megabyte of big integer, a denial-of-service surface for the
-      // JSON reader this half is built for.
+      // Every fraction digit is a place, leading zeros included. Past the cap the
+      // place is already accounted for, so only truncation is recorded.
       if digs.length >= MAX_SIG_DIGITS {
         if d != 0 { truncated = true }
       } else {
@@ -891,32 +708,26 @@ export function parseF64(self: string): f64 | null {
     const estart = i
     let ev = 0
     while i < n && isDigitByte(self[i]) {
-      // Saturating: any exponent past a million is already decided by the
-      // range gate below, and letting it run would overflow the i32.
       if ev < 1000000 { ev = ev * 10 + (self[i] - 48) }
       i = i + 1
     }
     if i == estart { return null }
     exp10 = exp10 + es * ev
   }
-  // Trailing anything — a unit, a stray digit separator, whitespace — is a
-  // rejection rather than a partial parse.
+  // Trailing anything — a unit, whitespace, a stray separator — is a rejection
+  // rather than a partial parse.
   if i != n { return null }
 
   if digs.length == 0 { return withSign(0.0, neg) }
-  // The magnitude gate, before any big integer exists: the value lies in
-  // [10^(dmag-1), 10^dmag), the largest f64 is under 10^309 and anything below
-  // 10^-350 is far under half the smallest subnormal.
+  // The magnitude gate, before any big integer exists: the largest f64 is under
+  // 10^309 and anything below 10^-350 is far under half the smallest subnormal.
   const dmag = exp10 + digs.length
   if dmag > 310 { return withSign(f64fromBits(BITS_INF), neg) }
   if dmag < -350 { return withSign(0.0, neg) }
 
-  // Clinger's fast path: both operands exact, one rounding. With at most fifteen
-  // significant digits and a decimal exponent inside ±22, the significand and the
-  // power of ten are each exactly representable, so a single IEEE multiply or
-  // divide is a single correctly rounded rounding — Clinger's theorem. It covers
-  // `"0.1"` and most human-written numbers; everything else falls to the exact
-  // path below, which is integer arithmetic with no rounding until the last step.
+  // Clinger's fast path: with both operands exactly representable, one IEEE
+  // multiply or divide is one correct rounding. It covers most human-written
+  // numbers; everything else falls to the exact path below.
   if digs.length <= 15 && exp10 >= -22 && exp10 <= 22 {
     let acc: i64 = 0
     let j = 0
@@ -931,17 +742,15 @@ export function parseF64(self: string): f64 | null {
     return withSign(v, neg)
   }
 
-  // The exact path. value = num / den, both integers, no rounding yet.
+  // The exact path: value = num / den, both integers, no rounding yet.
   const num = bnFromDigits(digs)
   const den = bnFromI64(1)
   if exp10 > 0 { bnMulPow10(num, exp10) }
   if exp10 < 0 { bnMulPow10(den, 0 - exp10) }
 
-  // Choose the binary exponent so the quotient has 53 bits. The bit-length
-  // difference brackets log2(num/den) within one, so the quotient lands in
-  // [2^52, 2^54) and at most a couple of corrections are needed; -1074 is the
-  // floor because no double has a smaller exponent, and a quotient under 2^52
-  // there is exactly what a subnormal is.
+  // Choose the binary exponent so the quotient has 53 bits. -1074 is the floor,
+  // because no double has a smaller exponent and a short quotient there is
+  // exactly what a subnormal is.
   let e2 = bnBitLen(num) - bnBitLen(den) - 53
   if e2 < -1074 { e2 = -1074 }
   let q: i64 = 0
@@ -958,8 +767,8 @@ export function parseF64(self: string): f64 | null {
     if q >= TWO53 { e2 = e2 + 1 } else { settled = true }
   }
 
-  // Round to nearest, ties to even — except that a truncated tail means the
-  // true value is strictly above the tie, so it rounds up.
+  // Round to nearest, ties to even — except that a truncated tail means the true
+  // value is strictly above the tie, so it rounds up.
   const t = bnCopy(rem)
   bnMulSmall(t, 2)
   const c = bnCmp(t, dn)
@@ -976,10 +785,8 @@ export function parseF64(self: string): f64 | null {
     e2 = e2 + 1
   }
   if e2 + 1075 >= 2047 { return withSign(f64fromBits(BITS_INF), neg) }
-  // One expression for both classes: with q in [2^52, 2^53) the carry out of
-  // the significand IS the exponent field's low bit, and with e2 pinned at
-  // -1074 the term vanishes and q lands in the fraction field, which is the
-  // subnormal encoding.
+  // One expression for both classes: the carry out of the significand IS the
+  // exponent field's low bit, and at the subnormal floor the term vanishes.
   const be2: i64 = e2 + 1074
   return withSign(f64fromBits((be2 << 52) + q), neg)
 }
