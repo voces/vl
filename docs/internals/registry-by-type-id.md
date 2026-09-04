@@ -153,8 +153,8 @@ Byte-identical until step 5; steps 1-2 are this PR.
 | 2 | convert the ID-FREE + NODE-IN-SCOPE sites to the seam, still returning the NAME answer | none | agreement counters ≥ 99.9%, `id-only` inspected one by one | **SHIPPED — and the counter REFUSED the ≥ 99.9% premise** |
 | 3 | mint `canonUnionKey` in canon; push `unKey` at all three registry mint sites; **no reader** | none | `unKey` coverage %, and a sweep asserting no two rows with different member SETS share a key | **SHIPPED — 100% covered, 0 different-set merges** |
 | 4a | the ARENA-side member-sequence renderer, so `canonUnionKeyOfTy` reaches the row's key | none | agreement per row against `unKey`, every miss categorised | **SHIPPED — 1,369 → 2,422 of 2,447 (55.9% → 98.98%)** |
-| 4b | thread the key into `registerInlineUnion`'s 11 recursive sites — the real work | `emit_collect.vl` | per-site liveness + disagreement, one build per site (B87) | blocked on nothing; the freeze is the cost |
-| 5 | **the switch**: seams return the id answer; retire `unNames`-scanning readers | `emit_classify.vl` + `emit_collect.vl`, one PR | rep-fuzz, fixpoint, corpus run-diff, the ABI assertion from step 3 | blocked on 4 |
+| 4b | thread the key into `registerInlineUnion`'s recursive sites, and separate the counter's `differ` from a key-EQUAL sibling | `emit_collect.vl` | per-site liveness + disagreement | **SHIPPED — 18 sites, 16 at `differ` 0 / `name-only` 0; `differ` 1,587 → 88** |
+| 5 | **the switch**: seams return the id answer; retire `unNames`-scanning readers | `emit_classify.vl` + `emit_collect.vl`, one PR | rep-fuzz, fixpoint, corpus run-diff, **both halves of the ABI assertion** | blocked on `merge-diffvar` reaching 0 (D1492) |
 | 6 | retire `unMemberSet` as a KEY (it stays as a rendering) | `emit_state.vl` | — | |
 
 ### What steps 1-3 landed, measured
@@ -314,6 +314,84 @@ row-level agreement is 98.98%, but `arrLitBoxElem` holds an ELEMENT type and min
 was minted under. **Step 4b is where that closes**, and the reading is the same one step 2
 earned: the counter is the authority, and the plan's premise was again optimistic.
 
+### Step 4b — the counter had no word for "the same key, a different row"
+
+Step 4a read **1,587 differing reaches** and called them "a call-site-type-vs-row-type gap".
+Probed reach by reach — what the site HOLDS, what the row RECORDED, and whether the two rows
+share a `unKey` — that is not what they are. A seventh outcome, `alias`, separates them
+(2,790 programs, `unABMode = 3`, the same corpus as 4a):
+
+| outcome | 4a | 4b |
+| --- | --- | --- |
+| agree | 30,245 | 30,279 |
+| **differ** | **1,587** | **88** |
+| **alias** — both rows found, different index, SAME `unKey` | — | **1,499** |
+| name-only | 1,026 | 992 |
+| id-only | 47 | 47 |
+
+`canonUnionKeyText` is the member SEQUENCE, so a declared alias and the inline spelling of the
+same members mint ONE key — the equivalence §2 argues for, and `unRowOfKey` returns the FIRST
+row carrying it. **87 of the 88 remaining are the three WRITE-seam sites** (`collectU/inferLetTy`
+50, `nliInferIfLet` 32, `nliInferOptChainLet` 5), and that answers 4a's "four sites are UNMOVED,
+so their disagreement is not a key question": three of the four probe through `unABTyProbe`, a
+`repCanonId` comparison of two arena TYPES at a MINT, which mode 3 never re-keys, so they could
+not move; the fourth (`emitLetDeclStmt/nli` 35) was 100% `alias`. **One read-seam reach in the
+whole corpus names a different row**, and it is 4a's own miss #3.
+
+`unionDeclTyIxOfIdentSid` is `unionNameOfIdentSid`'s type-taking twin over its two ANNOTATION
+arms, with the node's own type as the fallback (`letUnionNameOf`'s rule on the type side);
+threaded at `memberUnionFieldName` and `writeRhsIsNullBearing`, the two sites asking about a
+declared union while offering a NARROWED arm. The residual 992 `name-only` classify as:
+
+| class | reaches | is "ask a different type" the fix? |
+| --- | --- | --- |
+| a NARROWED receiver or rhs whose binding is not an annotated ident | ~416 | no type in scope names the declared union; needs a narrowed-from link |
+| a union the arena records STRUCTURALLY where the row holds the reverse-mapped NOMINAL spelling (an inferred return, an array-literal element join) | 350 | no — `registerInferRetNominalUnion`'s own note: the string lives ONLY in the name |
+| the row's own key is one of 4a's misses #2/#4 | ~148 | on the PRODUCER side, not the call site |
+| the same-shape collapse (D1490) | ~78 | no — measured, the recorded member type is load-bearing |
+
+### Step 4b — 18 registration sites obtain the key from canon
+
+`registerInlineUnionAt(stmts, name, site, ty)` carries a site id and whatever identity the
+caller has; `isUNameKeyAB`'s id side is `unRowOfTyAB(ty)` where a type was offered and
+`unRowOfKeyId(canonUnionKeyOfName(name))` otherwise — obtained from canon for the sub-spelling,
+never re-cut from the parent's. The key is computed only when armed, so an unarmed compile is
+byte-identical.
+
+| site group | agree | differ | alias | name-only | id-only |
+| --- | --- | --- | --- | --- | --- |
+| `ctr/unionName` (ID-FREE, now offers its type) | 89,649 | **0** | 135 | 120 | 308 |
+| `ctr/nullableName` (ID-FREE) | 45,697 | **0** | 1 | 167 | 0 |
+| the 12 `riu/*` recursions except `mapVal` | 113 | **0** | 3 | **0** | 6 |
+| `riu/mapVal` | 12 | 12 | 0 | 128 | 18 |
+
+`riu/mapVal` is D1493: `canonUnionKeyText` expands an ALIAS through `unionAliasMembers`, whose
+`tyToEmitName` render DEDUPES, so a litunion's `string|string` collapses to one atom, the
+multi-atom guard declines, and the alias NAME stands as its own key — while the ROW was keyed
+on `collectU`'s un-deduped `udSet`.
+
+### The licence is TWO assertions, and one of them reads 1
+
+`keySweep/merge-diffset` compares the member-set STRING. A struct union's tags are positional
+over its VARIANT SLICE, so `keySweep/merge-diffvar` is the other half, and neither alone is the
+licence:
+
+* `type AS = (Sc | Dg)` beside the inline `Sc | Dg` — same key, same set string, slices
+  `[Sc, Dg]` and `[]`. `merge-diffset` **0**, `merge-diffvar` **1**, on master today (D1492).
+  This is what step 5 is blocked on.
+* a VALUE union owns no variants, so only the set compare can see two ATOM sets fused.
+
+Two candidate re-keyings were measured and **refused**, each with its price:
+
+| candidate | buys | costs |
+| --- | --- | --- |
+| normalise `null` to one end of the key (4a's deferred miss #3) | `tykey-agree` 2,422 → 2,427, the last read-seam `differ` | `merge-diffset` 0 → **25**, every pair differing only by where `null` sits; `merge-diffvar` unmoved at 1 |
+| expand a declared alias through `canonUnionKeyTextOfTy` (D1493) | `tykey-agree` 2,422 → 2,427, `riu/mapVal` cleared | `merge-diffset` 0 → **2**, fusing `K\|f64` with `KB\|f64` and `SA\|SB` with `OA\|OB` — §2's literal-softening merge, back |
+
+Re-keying rows while the licence is unmet is the wrong order, so neither ships. The expansion
+the key needs is the DECLARATION's member list with no softening, and neither renderer in the
+tree is that.
+
 ## 6. The storage-class ladders
 
 `VKind` has **30 members** (`emit_state.vl:536`). Measured across `compiler/*.vl`: **119 dispatch
@@ -397,6 +475,28 @@ timed under `timeout 300`: **L1 (seed builds the spike) ok, L2 (spike builds the
 rc 0**, fixpoint held. An L1-only check is vacuous for this class.
 
 ## 8. What the PRs ship
+
+**Step 4b (the fourth PR), and what step 5 needs.** In `emit_classify.vl`: the `alias`
+outcome and `unRowKeySame`; `unRowOfKeyId` and the key-taking seam `isUNameKeyAB`;
+`unionDeclTyIxOfIdentSid` / `unionDeclTyIxOfExpr` and their two converted sites;
+`unRowVariantsSame` and `keySweep/merge-diffvar`; eighteen new site ids. In
+`emit_collect.vl`: `registerInlineUnionAt`, and every `registerInlineUnion` call routed
+through it. In `emit_classify.vl` again: `isUnionOfTy`'s index rung gated on the row's
+recorded type being a union SHAPE (D1490). Still no reader; arming still rides
+`$VL_REP_SHADOW`, and mode 3 is armed from SOURCE.
+
+**Step 5 needs three things, in this order.** (1) **`merge-diffvar` to reach 0** — one pair,
+D1492, and until it does the switch can hand a caller a row with an empty variant slice.
+(2) **A decision for the 87 write-seam `differ`** — `registerValueUnionNameAB`'s probe is
+`unABTyProbe`, a `repCanonId` compare of two TYPES at a mint, which is a different question
+from "which row"; either it becomes a row question or those three sites are a documented
+exception. (3) **A rule for the 992 `name-only`**, which is not one gap: ~416 want a
+narrowed-from link the tree does not have, 350 are unions the arena records structurally
+where the row holds a reverse-mapped nominal spelling, ~148 are the row's own key (4a misses
+#2/#4), ~78 are D1490's collapse. **The seams that return a ROW rather than a boolean
+(`unionMemberTysOfAB`, `unionHasAtomAB`) have `differ` 0 at every site**, which is the single
+most useful fact for sequencing the switch: the sites where a key-equal sibling could change
+an answer are exactly the ones that do not disagree.
 
 **Step 4a (the third PR).** In canon: `RC_UNION_KEY` (the one new position bit, and the one
 place `tyToNominalNameGo` consults it), `canonUnionKeyAtomOfTy`, `canonUnionKeyTextOfTy` and

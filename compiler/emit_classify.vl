@@ -10760,7 +10760,7 @@ export function memberUnionFieldName(memIx: i32, fnIx: i32) {
         let mCov = unionMemberTysOfAB(
           13,
           mun,
-          nodeTyIxOf(unwrapParen(m.memObj)),
+          unionDeclTyIxOfExpr(m.memObj, fnIx),
           mTys,
         )
         if mTys.length != mAtoms.length { mCov = false }
@@ -14495,7 +14495,7 @@ function writeRhsIsNullBearing(rhsIx: i32, fnIx: i32) {
   if nodeTyIsNullable(unwrapParen(rhsIx)) { return true }
   const rn = unionNameOfExpr(rhsIx, fnIx)
   if rn == "" { return false }
-  unionHasAtomAB(14, rn, nodeTyIxOf(unwrapParen(rhsIx)), "null")
+  unionHasAtomAB(14, rn, unionDeclTyIxOfExpr(rhsIx, fnIx), "null")
 }
 
 export function forInElemKind(iterIx: i32, fnIx: i32): VKind | null {
@@ -26416,6 +26416,17 @@ export function variantIndexOf(name: string) {
   -1
 }
 
+// A ROW WHOSE RECORDED TYPE IS EXACTLY `ty` — the index rung of the hybrid identity below,
+// with no kind test of its own so the caller's own arms decide when it may fire (D1490).
+function unRowHasTyIx(ty: i32): boolean {
+  let u = 0
+  while u < unTyIx.length {
+    if unTyIx[u] == ty { return true }
+    u = u + 1
+  }
+  false
+}
+
 // "Is this a registered union", answered WITHOUT the spelling — the hybrid identity (B99).
 //
 // Two kinds of row, two kinds of identity, and that is why every single-mechanism reader failed:
@@ -26429,11 +26440,7 @@ export function variantIndexOf(name: string) {
 // predicate mostly answers NO. Splitting the two identities is what none of those did.
 export function isUnionOfTy(ty: i32): boolean {
   if ty < 0 { return false }
-  let u = 0
-  while u < unTyIx.length {
-    if unTyIx[u] == ty { return true }
-    u = u + 1
-  }
+  if ty >= T.tys.length { return false }
   const t = T.tys[ty]
   // A NULLABLE query against a union row: `A | null` is a SPELLING whose type is
   // `TyNullable(A)`, not `TyUnion[A, null]` — the registry rows come from spellings, where the
@@ -26447,6 +26454,13 @@ export function isUnionOfTy(ty: i32): boolean {
   // compared structurally. That is the difference between teaching a matcher a convention and
   // re-implementing the renderer.
   if t is TyNullable {
+    // THE INDEX RUNG BELONGS INSIDE THE SHAPE ARMS (D1490). The mint resolves a row's
+    // SPELLING, and for a union whose members share a shape that resolver answers a MEMBER —
+    // `A | B` over two identical structs banks `A`'s `TyObj` — so a rung that fired for any
+    // `ty` called a declared STRUCT a union. That entry is load-bearing as the annotation's
+    // handle (`letUnionNameOf` finds the row through it), so it stays; what it must not do is
+    // answer this different question.
+    if unRowHasTyIx(ty) { return true }
     let rn = 0
     while rn < unMemTyCount.length {
       if unDeclIx[rn] < 0 && unMemTyCount[rn] == 2 {
@@ -26466,6 +26480,7 @@ export function isUnionOfTy(ty: i32): boolean {
     }
   }
   if t is TyUnion {
+    if unRowHasTyIx(ty) { return true }
     let r = 0
     while r < unMemTyCount.length {
       if unDeclIx[r] < 0 && unMemTyCount[r] == t.uMembers.length {
@@ -28573,6 +28588,59 @@ function forInIterUnionElemName(iterIx: i32, fnIx: i32) {
   rlElemName[slot]
 }
 
+// THE DECLARATION'S ARENA TYPE FOR A UNION-TYPED IDENT — `unionNameOfIdentSid`'s type-taking
+// twin, ARM FOR ARM over its two ANNOTATION arms (D1491). The row was minted from a
+// DECLARED spelling, so the type that names it is the annotation's, not the expression's:
+// a narrowed read of a `Json` binding has type `string`, and offering that to the registry
+// asks about a member. The inferred / captured / loop-var arms answer -1 — an honest "this
+// site has no id", which the counter banks apart from a disagreement.
+function letUnionDeclTyIxOf(letIx: i32): i32 {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 { return annRowOfNode(d.letType) }
+  }
+  -1
+}
+
+function unionDeclTyIxOfIdentSid(sid: i32, fnIx: i32): i32 {
+  if fnIx >= 0 {
+    const fn = P.nodes[fnIx]
+    if fn is FuncDecl {
+      const body = fn.fnBody
+      const params = fn.fnParams
+      let i = 0
+      while i < params.length {
+        const p = P.nodes[params[i]]
+        if p is Param {
+          if sidOfNode(params[i]) == sid { return annRowOfNode(p.parType) }
+        }
+        i = i + 1
+      }
+      const li = parentLetOfSid(body, sid)
+      if li >= 0 { return letUnionDeclTyIxOf(li) }
+    }
+  }
+  const gi = globalLetOfSid(sid)
+  if gi >= 0 { return letUnionDeclTyIxOf(gi) }
+  const bl = startBlockLetOfSid(sid)
+  if bl >= 0 { return letUnionDeclTyIxOf(bl) }
+  -1
+}
+
+// The same question of an EXPRESSION: the DECLARATION's type where the ident has one, else the
+// node's own. The fallback is `letUnionNameOf`'s rule on the type side — annotation first, the
+// expression second — and it is not optional: dropping it moved 36 reaches that AGREE through
+// the node type into `no-ty`, trading a right answer for an honest silence.
+function unionDeclTyIxOfExpr(exprIx: i32, fnIx: i32): i32 {
+  if exprIx < 0 { return -1 }
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is Ident {
+    const di = unionDeclTyIxOfIdentSid(sidOfNode(unwrapParen(exprIx)), fnIx)
+    if di >= 0 { return di }
+  }
+  nodeTyIxOf(unwrapParen(exprIx))
+}
+
 // The union name of a `LetDecl`: its annotation when that names a union, else the
 // union its (un-annotated) initializer produces (`const r = pick(true)`).
 export function letUnionNameOf(letIx: i32, fnIx: i32) {
@@ -29420,14 +29488,20 @@ export let unABMode: i32 = 0
 // run showed. Per site, because a pooled bucket cannot say WHICH site the residue belongs
 // to, and step 5 flips the seams site by site: `unABCnt[site * UNAB_K + k]`, six outcomes.
 let unABCnt: i32[] = []
-const UNAB_K = 6
-// 0 agree · 1 differ · 2 name-only · 3 id-only · 4 neither · 5 no-ty.
+const UNAB_K = 7
+// 0 agree · 1 differ · 2 name-only · 3 id-only · 4 neither · 5 no-ty · 6 alias.
 const UNAB_AGREE = 0
 const UNAB_DIFFER = 1
 const UNAB_NAMEONLY = 2
 const UNAB_IDONLY = 3
 const UNAB_NEITHER = 4
 const UNAB_NOTY = 5
+// TWO ROWS ONE KEY IS NOT A DISAGREEMENT (D1491). The key FUSES rows that record the same
+// member SEQUENCE and differ only in NAME — a declared alias beside its inline spelling, or
+// two monomorphized instances — and `keySweep/merge-diffset` is 0, so their tag slices are
+// identical and either row answers. Counting those as `differ` is what made step 4a read
+// 1,587 disagreements where 98 are rows that really disagree.
+const UNAB_ALIAS = 6
 let unRetryHit: i32 = 0
 let unRetryMiss: i32 = 0
 
@@ -29446,6 +29520,16 @@ function unABBump(site: i32, k: i32) {
   0
 }
 
+// Two rows the KEY cannot tell apart: both covered, and their minted `unKey` is the same id.
+// Bounded on both sides — a row named by a key the column never grew is exactly the read that
+// trapped at D1152.
+function unRowKeySame(a: i32, b: i32): boolean {
+  if a < 0 || b < 0 { return false }
+  if a >= unKey.length || b >= unKey.length { return false }
+  if unKey[a] < 0 { return false }
+  unKey[a] == unKey[b]
+}
+
 // Classify one reach: `n` the row the SPELLING named, `d` the row the ARENA ID named, both
 // -1 for "no row". `ty < 0` is its OWN bucket — "this site had no id to offer" and "the id
 // disagreed" are different findings, and collapsing them is how a coverage gap reads as
@@ -29454,6 +29538,7 @@ function unABProbe(site: i32, n: i32, d: i32, ty: i32) {
   if ty < 0 { return unABBump(site, UNAB_NOTY) }
   if n >= 0 && d >= 0 {
     if n == d { return unABBump(site, UNAB_AGREE) }
+    if unRowKeySame(n, d) { return unABBump(site, UNAB_ALIAS) }
     return unABBump(site, UNAB_DIFFER)
   }
   if n >= 0 { return unABBump(site, UNAB_NAMEONLY) }
@@ -29477,8 +29562,28 @@ function unABTyProbe(site: i32, dTy: i32, oTy: i32) {
 // 1-10 are step 1 (the seams the shim landed, plus the ID-FREE sites, whose argument is
 // an arena id already in scope); 11+ are step 2's one-hop threading. `UNAB_N` bounds the
 // report loop.
-const UNAB_N = 30
+const UNAB_N = 47
 function unABSiteName(s: i32): string {
+  // 29-46 are step 4b(c): `registerInlineUnion`'s recursions, each keyed on the sub-spelling's
+  // own canon key, plus `collectTyReachRegister`'s two ID-FREE callers, which hold a type.
+  if s == 29 { return "riu/mapVal" }
+  if s == 30 { return "riu/arrayAtom" }
+  if s == 31 { return "riu/pun" }
+  if s == 32 { return "riu/nulRefArray" }
+  if s == 33 { return "riu/nulShape" }
+  if s == 34 { return "riu/nulCloValue" }
+  if s == 35 { return "riu/nulCloVariant" }
+  if s == 36 { return "riu/nulCloRefArray" }
+  if s == 37 { return "riu/nestedArray" }
+  if s == 38 { return "riu/arrayShape" }
+  if s == 39 { return "riu/fnResult" }
+  if s == 40 { return "riu/refArrayArm" }
+  if s == 41 { return "ctr/nullableName" }
+  if s == 42 { return "ctr/unionName" }
+  if s == 43 { return "riu/collapsedName" }
+  if s == 44 { return "riu/inferRetNominal" }
+  if s == 45 { return "riu/arrElemUnion" }
+  if s == 46 { return "riu/api" }
   if s == 1 { return "regValueUnionTy" }
   if s == 2 { return "letAnnUnionKind" }
   if s == 3 { return "unionNameOfExpr/as" }
@@ -29518,6 +29623,7 @@ function unABKindName(k: i32): string {
   if k == UNAB_NAMEONLY { return "name-only" }
   if k == UNAB_IDONLY { return "id-only" }
   if k == UNAB_NEITHER { return "neither" }
+  if k == UNAB_ALIAS { return "alias" }
   "no-ty"
 }
 
@@ -29547,8 +29653,14 @@ export function unionRowOfTyRaw(ty: i32): i32 {
 // MERGES row pairs the box ABI needs apart. It exists only now because step 4a built the
 // arena-side renderer that reaches the row's key
 // (`docs/internals/registry-by-type-id.md` §5).
-export function unRowOfKey(ty: i32): i32 {
-  const k = canonUnionKeyOfTy(ty)
+export function unRowOfKey(ty: i32): i32 { unRowOfKeyId(canonUnionKeyOfTy(ty)) }
+
+// The same reverse index from the KEY ITSELF — the entry point for a producer that holds no
+// arena node at all. `registerInlineUnion`'s 11 recursions are cut SUBSTRINGS of a spelling
+// (§1: 53 of the 81 sites are NAME-ONLY, and this is their centre), so the only identity they
+// can offer is the key canon mints for the sub-spelling. Obtaining it here rather than cutting
+// the parent's is what makes the recursion a key question at all (§5 step 4b).
+export function unRowOfKeyId(k: i32): i32 {
   if k < 0 { return -1 }
   let u = 0
   while u < unKey.length {
@@ -29594,6 +29706,30 @@ export function isUNameAB(site: i32, name: string, ty: i32): boolean {
   let nr = -1
   if n { nr = unRowOfName(name) }
   unABProbe(site, nr, d, ty)
+  if m == 2 { return d >= 0 }
+  n
+}
+
+// `isUName`'s seam for a caller with no arena node: the NAME answer, plus a tally of what the
+// row-by-KEY twin says. The id side takes the caller's TYPE where it has one and otherwise the
+// key canon mints for the spelling — which is an identity, not a re-cut substring. A key of -1
+// (the empty name) is counted as "no id offered", the same bucket a missing type takes.
+export function isUNameKeyAB(site: i32, name: string, ty: i32): boolean {
+  const n = isUName(name)
+  const m = unABOn()
+  if m == 0 { return n }
+  let d = -1
+  let key = -1
+  if ty >= 0 {
+    key = 0
+    d = unRowOfTyAB(ty)
+  } else {
+    key = canonUnionKeyOfName(name)
+    if key >= 0 { d = unRowOfKeyId(key) }
+  }
+  let nr = -1
+  if n { nr = unRowOfName(name) }
+  unABProbe(site, nr, d, key)
   if m == 2 { return d >= 0 }
   n
 }
@@ -29688,6 +29824,28 @@ function unKeySweepRow(u: i32, ty: i32) {
   0
 }
 
+// THE SECOND HALF OF THE KEY'S LICENCE, and `merge-diffset` alone is not it (D1492). A struct
+// union's tags are positional over its VARIANT SLICE, not over the member-set string:
+// `type AS = (Sc | Dg)` records the same set as the inline `Sc | Dg` and an EMPTY slice, which
+// `merge-diffset` scores 0 and this scores 1. The two are COMPLEMENTARY — a VALUE union owns no
+// variants, so only the set compare can see two atom sets fused. Both slices bounded (D1152).
+function unRowVariantsSame(a: i32, b: i32): boolean {
+  if a >= unVarStart.length || b >= unVarStart.length { return false }
+  if a >= unVarCount.length || b >= unVarCount.length { return false }
+  const na = unVarCount[a]
+  if na != unVarCount[b] { return false }
+  const sa = unVarStart[a]
+  const sb = unVarStart[b]
+  if sa < 0 || sb < 0 { return false }
+  if sa + na > uVariants.length || sb + na > uVariants.length { return false }
+  let i = 0
+  while i < na {
+    if uVariants[sa + i] != uVariants[sb + i] { return false }
+    i = i + 1
+  }
+  true
+}
+
 // The ABI assertion §5 step 3 owes: two rows one key would FUSE, and how many of those
 // record a different member SET. A union's box tags are positional over its own member set,
 // so a merge across different sets reads a value tagged under one slice through the other's
@@ -29707,6 +29865,7 @@ function unKeySweepPair(u: i32, v: i32) {
       repShadowBumpReason("keySweep/merge-diffset")
     }
   }
+  if !unRowVariantsSame(u, v) { repShadowBumpReason("keySweep/merge-diffvar") }
   0
 }
 
