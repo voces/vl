@@ -33,6 +33,7 @@ import {
   diagEndCol,
   diagLine,
   diagModule,
+  diagStage,
   emitFnSpanAt,
   emitFnSpanCol,
   emitFnSpanLine,
@@ -153,6 +154,9 @@ let cliExit = 0              // the process exit code, read after CMD_DONE
 // exits 70 (EX_SOFTWARE, the code `report` uses for a compiler trap) rather than 1: a
 // caller can tell a vl bug from a bad program without parsing stderr (D1578).
 let cliInvalidModule = 0
+// Whether the file currently being checked is the one that set it — the per-file half
+// of `cliInvalidModule`, which a `--batch` record reports as its own exit 70.
+let cliFileInvalid = 0
 
 // ── parsed `check` configuration ───────────────────────────────────────────────
 let cliFile = ""
@@ -164,6 +168,7 @@ let cliJson = 0
 let cliColor = 0
 let cliSeverity = "error"
 let cliSeverityGiven = 0
+let cliBatch = 0               // --batch: many paths, one verdict record per file
 let cliExcludes: string[] = [] // --exclude glob patterns (normalized)
 let cliIncludeStd = 0          // --include-std: report std's own warnings too
 let cliArgErr = ""             // a fatal arg-parse message (printed, exit 2)
@@ -179,17 +184,35 @@ let cliOutIdx = 0
 // array cliBeginPrint emits before draining cliOut ("" = nothing pending).
 let cliJsonItems: string[] = []
 let cliJsonOut = ""
+// `--batch --json`: one finished record per input file, drained to stdout ahead of the
+// stderr notes. A list rather than one joined payload, so a corpus-sized batch crosses
+// the host boundary a record at a time instead of as a single multi-megabyte string.
+let cliBatchOut: string[] = []
+let cliBatchIdx = 0
+// A `--batch` entry the host could not read. Its record carries exit 2 (the code a
+// single `vl check <missing>` carries) and so does the run.
+let cliBatchUnread = 0
 
 // ── directory walk + multi-file run (A-impl 2) ──────────────────────────────────
-let cliDirMode = 0              // 1 = the target is a directory (file-count noun, no per-stage note)
+// The paths named on the command line, in argv order. Exactly one without `--batch`;
+// each is classified (file vs directory) and expanded in turn, so a batch record's
+// order is argv order with each directory's own files sorted inside it.
+let cliTargets: string[] = []
+let cliTargetIdx = 0
+let cliTargetFileBase = 0       // where the current target's slice of cliFiles begins
+let cliDirMode = 0              // 1 = the file being checked came from a directory walk (file-count noun, no per-stage note)
 let cliWalkStack: string[] = [] // directories still to list (DFS work-stack, full paths)
 let cliWalkRel: string[] = []   // parallel: each pending dir's path RELATIVE to the check root
 let cliFiles: string[] = []     // collected `.vl` paths — the check work-list
-let cliFileIdx = 0              // cursor into cliFiles for the per-file loop
-let cliCurFile = ""             // the file currently being checked (its path)
-let cliCurDir = ""              // the directory currently being listed (child-path base)
-let cliCurRel = ""              // the directory currently being listed, relative to the root
-let cliLastStage = ""           // failing stage of the LAST file compiled (single-file note)
+// Parallel to cliFiles: 1 for a path a directory walk found, 0 for one the caller
+// NAMED. It is what `cliDirMode` reads per file, so a `--batch` file target is graded
+// exactly as `vl check <file>` alone grades it — same lint scope, same report.
+let cliFileFromDir: i32[] = []
+let cliFileIdx = 0    // cursor into cliFiles for the per-file loop
+let cliCurFile = ""   // the file currently being checked (its path)
+let cliCurDir = ""    // the directory currently being listed (child-path base)
+let cliCurRel = ""    // the directory currently being listed, relative to the root
+let cliLastStage = "" // failing stage of the LAST file compiled (single-file note)
 // Running tally across every file checked.
 let cliErrors = 0
 let cliWarnings = 0
@@ -305,6 +328,11 @@ let dgMod: i32[] = []
 // `--json` omits. No `data` column deliberately: a compile diagnostic's structured
 // payload is the quick-fix's answer for an editor, and no batch reporter edits.
 let dgCode: string[] = []
+// The stage that produced each diagnostic (parallel), as `--json`'s `stage`: the
+// driver's four (`diagStage`) plus this file's `validate`, `lint`, `fix` and `read`.
+// It is what classifies a refusal, since the summary's `(type error)` note is per FILE.
+// The set and each value's meaning: `docs/internals/cli-design.md`.
+let dgStage: string[] = []
 // The committed modules' keys and sources, in commit order, so the index matches the
 // driver's module-table index (what `diagModule` / `modOfTok` return) — the per-module
 // file label and caret-context source for a graph-compile diagnostic. Reset and filled
@@ -363,6 +391,7 @@ export function cliArgReset() {
   cliFileFound = 0
   cliExit = 0
   cliInvalidModule = 0
+  cliFileInvalid = 0
   cliFile = ""
   cliConcise = 0
   cliCodegen = 0
@@ -382,10 +411,18 @@ export function cliArgReset() {
   cliOutIdx = 0
   cliJsonItems = []
   cliJsonOut = ""
+  cliBatchOut = []
+  cliBatchIdx = 0
+  cliBatchUnread = 0
+  cliBatch = 0
+  cliTargets = []
+  cliTargetIdx = 0
+  cliTargetFileBase = 0
   cliDirMode = 0
   cliWalkStack = []
   cliWalkRel = []
   cliFiles = []
+  cliFileFromDir = []
   cliFileIdx = 0
   cliCurFile = ""
   cliCurDir = ""
@@ -599,6 +636,7 @@ function cliLintModAt(k: i32) {
 // ── diagnostic formatting (the policy retired from the Rust host) ──────────────
 function cliAddDiag(
   sev: string,
+  stage: string,
   code: string,
   line: i32,
   col: i32,
@@ -613,6 +651,20 @@ function cliAddDiag(
   dgMsg.push(msg)
   dgMod.push(mod)
   dgCode.push(code)
+  dgStage.push(stage)
+  0
+}
+// Empty the parallel diagnostic columns. One home for the three places that start a
+// fresh report, so a column added here cannot be left stale by one of them.
+function cliClearDiags() {
+  dgSev = []
+  dgLine = []
+  dgCol = []
+  dgEnd = []
+  dgMsg = []
+  dgMod = []
+  dgCode = []
+  dgStage = []
   0
 }
 // Concise one-liner: `<file>: <severity> [<line>:<col>] <message>` (1-based L:C).
@@ -630,12 +682,13 @@ function cliFmtConcise(d: i32) {
     dgMsg[d]
 }
 // One diagnostic as a JSON object (the `--json` schema, `docs/internals/cli-design.md`):
-// file, severity, the stable code where one exists (a compile error carries none and
-// the field is omitted), 1-based line and col with an exclusive 1-based endCol (endCol
-// - col is the caret span; all three omitted for a positionless one), and the message.
+// file, severity, stage, the stable code where one exists (a compile error carries none
+// and the field is omitted), 1-based line and col with an exclusive 1-based endCol
+// (endCol - col is the caret span; all three omitted for a positionless one), message.
 function cliFmtJson(d: i32) {
   let out = "{\"file\":\"" + cliJsonEsc(cliDiagFile(d)) + "\""
   out = out + ",\"severity\":\"" + cliJsonEsc(dgSev[d]) + "\""
+  out = out + ",\"stage\":\"" + cliJsonEsc(dgStage[d]) + "\""
   if dgCode[d].length > 0 {
     out = out + ",\"code\":\"" + cliJsonEsc(dgCode[d]) + "\""
   }
@@ -652,6 +705,29 @@ function cliFmtJson(d: i32) {
       i32ToStr(endc + 1)
   }
   out + ",\"message\":\"" + cliJsonEsc(dgMsg[d]) + "\"}"
+}
+// One input file's `--batch` record: the file, the exit code `vl check <file>` alone
+// would carry, and the diagnostics it appended to `cliJsonItems` from `from` on. A
+// record per file rather than one flat array, in which a CLEAN file reads exactly like
+// one nothing checked.
+function cliBatchRecord(file: string, exit: i32, from: i32) {
+  const buf: i32[] = []
+  pushCps(buf, "{\"file\":\"")
+  pushCps(buf, cliJsonEsc(file))
+  pushCps(buf, "\",\"exit\":")
+  pushCps(buf, i32ToStr(exit))
+  pushCps(buf, ",\"diagnostics\":[")
+  let i = from
+  while i < cliJsonItems.length {
+    if i > from { buf.push(',') }
+    // `pushCps`, not `buf.push(item[ci])`: the buffer drains through `fromCodePoints`,
+    // whose element is a code point, while `item[ci]` is a byte. See `strutil`.
+    pushCps(buf, cliJsonItems[i])
+    i = i + 1
+  }
+  pushCps(buf, "]}\n")
+  cliBatchOut.push(fromCodePoints(buf))
+  0
 }
 // The file path to label diagnostic `d` with: the owning module's key in module mode,
 // so a graph-compile error in an imported file points at that file rather than the
@@ -811,6 +887,16 @@ function cliParseArgs() {
   let sub = "check"
   if cliArgs.length > 0 && cliArgs[0] == "fmt" { sub = "fmt" }
   if cliArgs.length > 0 && cliArgs[0] == "test" { sub = "test" }
+  // `--batch` decides how the POSITIONALS parse, so it is read before the loop rather
+  // than in it: a flag has to mean the same thing wherever on the line it is written,
+  // and `vl check a.vl b.vl --batch` would otherwise fail on `b.vl` first.
+  if sub == "check" {
+    let b = 1
+    while b < cliArgs.length {
+      if cliArgs[b] == "--batch" { cliBatch = 1 }
+      b = b + 1
+    }
+  }
   let i = 1
   while i < cliArgs.length {
     const a = cliArgs[i]
@@ -827,6 +913,8 @@ function cliParseArgs() {
       cliNoValidate = 1
     } else if sub == "check" && a == "--json" {
       cliJson = 1
+    } else if sub == "check" && a == "--batch" {
+      cliBatch = 1
     } else if sub == "check" && a == "--include-std" {
       cliIncludeStd = 1
     } else if sub == "check" && a == "--severity" {
@@ -896,8 +984,8 @@ function cliParseArgs() {
       cliAddExclude(a.slice(10, a.length))
     } else if cliIsFlag(a) {
       cliUsageErr(sub + ": unknown flag `" + a + "`")
-    } else if a.length > 0 && cliFile.length == 0 {
-      cliFile = a
+    } else if a.length > 0 && (cliBatch != 0 || cliTargets.length == 0) {
+      cliTargets.push(a)
     } else if a.length > 0 {
       cliUsageErr(
         sub + ": unexpected extra argument `" + a + "` (one path per run)",
@@ -928,17 +1016,22 @@ function cliStageEntry() {
   0
 }
 
-// Stable insertion sort of the collected file paths (stable output across runs).
-function cliSortFiles() {
-  let i = 1
+// Stable insertion sort of the file paths collected from `base` on — one target's own
+// slice, so a batch's records stay in argv order while each directory sorts inside it
+// (stable output across runs). `cliFileFromDir` rides along, since it is read by index.
+function cliSortFilesFrom(base: i32) {
+  let i = base + 1
   while i < cliFiles.length {
     const key = cliFiles[i]
+    const kd = cliFileFromDir[i]
     let j = i - 1
-    while j >= 0 && cliStrGt(cliFiles[j], key) {
+    while j >= base && cliStrGt(cliFiles[j], key) {
       cliFiles[j + 1] = cliFiles[j]
+      cliFileFromDir[j + 1] = cliFileFromDir[j]
       j = j - 1
     }
     cliFiles[j + 1] = key
+    cliFileFromDir[j + 1] = kd
     i = i + 1
   }
   0
@@ -964,7 +1057,10 @@ function cliIngestEntries(base: string, relBase: string) {
       // discovery predicate is the one thing the walk does differently.
       let wanted = cliEndsVl(name)
       if cliCmd == 2 { wanted = cliEndsTestVl(name) }
-      if wanted && !cliExcluded(rel, name) { cliFiles.push(child) }
+      if wanted && !cliExcluded(rel, name) {
+        cliFiles.push(child)
+        cliFileFromDir.push(1)
+      }
     }
     i = i + 1
   }
@@ -977,6 +1073,7 @@ function cliIngestEntries(base: string, relBase: string) {
 // built once at the end (`cliFinishSummary`).
 function cliCheckCurFile() {
   if cliModMode == 0 { cliStageEntry() }
+  cliFileInvalid = 0
   let rc = 0
   // A `--fix` verify pass compiles rather than checks: an annotation the hint calls
   // redundant is load-bearing for the emitter far more often than for the checker (D1091).
@@ -1021,20 +1118,16 @@ function cliCheckCurFileRest() {
   }
   // Error-tier diagnostics — capture them now, straight from the driver stores, before
   // `lintSrc` re-parses the entry source and resets those stores.
-  dgSev = []
-  dgLine = []
-  dgCol = []
-  dgEnd = []
-  dgMsg = []
-  dgMod = []
-  dgCode = []
+  cliClearDiags()
   const n = diagCount()
   let i = 0
   while i < n {
-    // Capture the owning module before `lintSrc` resets `P.toks` / `nodeToks`, which
-    // `diagModule` resolves through. Single-file mode is 0, the entry.
+    // Capture the owning module and the producing stage before `lintSrc` resets
+    // `P.toks` / `nodeToks`, which `diagModule` and `diagStage` resolve through.
+    // Single-file mode is module 0, the entry.
     cliAddDiag(
       "error",
+      diagStage(i),
       "",
       diagLine(i),
       diagCol(i),
@@ -1057,6 +1150,7 @@ function cliCheckCurFileRest() {
     if vlen == 0 && vsp >= 0 { vlen = 1 }
     cliAddDiag(
       "error",
+      "validate",
       "invalid-module",
       emitFnSpanLine(vsp),
       emitFnSpanCol(vsp),
@@ -1069,6 +1163,7 @@ function cliCheckCurFileRest() {
       emitFnSpanModule(vsp),
     )
     cliInvalidModule = 1
+    cliFileInvalid = 1
     cliValidateMsg = ""
   }
 
@@ -1122,6 +1217,7 @@ function cliCheckCurFileRest() {
     if sev.length == 0 { sev = "warning" }
     cliAddDiag(
       sev,
+      "lint",
       cliLintCodeAt(k),
       cliLintLineAt(k),
       cliLintColAt(k),
@@ -1138,6 +1234,7 @@ function cliCheckCurFileRest() {
   while fd < cliFixDeclinedAt.length {
     cliAddDiag(
       "info",
+      "fix",
       "fix-declined",
       cliFixDeclinedLine[fd],
       cliFixDeclinedCol[fd],
@@ -1158,6 +1255,7 @@ function cliCheckCurFileRest() {
     if redunModuleAt(ri) == 0 {
       cliAddDiag(
         "hint",
+        "type",
         "redundant-type",
         redunSLineAt(ri),
         redunSColAt(ri),
@@ -1177,6 +1275,7 @@ function cliCheckCurFileRest() {
     if rcoalModuleAt(ci) == 0 {
       cliAddDiag(
         "warning",
+        "type",
         "dead-coalesce-default",
         rcoalLineAt(ci),
         rcoalColAt(ci),
@@ -1196,6 +1295,7 @@ function cliCheckCurFileRest() {
     if isvalModuleAt(vi) == 0 {
       cliAddDiag(
         "hint",
+        "type",
         "collapsed-arm-value-test",
         isvalLineAt(vi),
         isvalColAt(vi),
@@ -1211,6 +1311,10 @@ function cliCheckCurFileRest() {
   const thr = cliSevRank(cliSeverity)
   let disp = 0
   if cliSeverityGiven != 0 { disp = thr }
+  // Where this file's contribution to the running tally and to the JSON array begins —
+  // the two things a `--batch` record is a slice of.
+  const gateBase = cliGating
+  const jsonBase = cliJsonItems.length
   // Fold this file's counts into the running tally (gating + error/warning).
   let gi = 0
   while gi < dgSev.length {
@@ -1243,7 +1347,44 @@ function cliCheckCurFileRest() {
     else { cliOut.push(cliFmtPretty(order[os])) }
     os = os + 1
   }
+  // `--batch --json`: this file's own verdict, sliced out of what it just appended.
+  if cliBatch != 0 && cliJson != 0 {
+    let fexit = 0
+    if cliGating > gateBase { fexit = 1 }
+    if cliFileInvalid != 0 { fexit = 70 }
+    cliBatchRecord(cliCurFile, fexit, jsonBase)
+  }
   // This file is done (reported); advance to the next.
+  cliFileIdx = cliFileIdx + 1
+  cliStartFile()
+}
+
+// A `--batch` entry the host could not read. It gets its OWN record — exit 2, the code
+// a single `vl check <missing>` carries — rather than the walk's silent skip: a caller
+// keying on the paths it named must never read an unread file as a clean one.
+function cliBatchUnreadable() {
+  cliModMode = 0
+  const jsonBase = cliJsonItems.length
+  cliClearDiags()
+  cliAddDiag(
+    "error",
+    "read",
+    "cannot-read",
+    0,
+    0,
+    0,
+    "cannot read " + cliCurFile,
+    0,
+  )
+  cliErrors = cliErrors + 1
+  cliGating = cliGating + 1
+  cliBatchUnread = 1
+  if cliJson != 0 {
+    cliJsonItems.push(cliFmtJson(0))
+    cliBatchRecord(cliCurFile, 2, jsonBase)
+  } else {
+    cliOut.push("check: cannot read " + cliCurFile)
+  }
   cliFileIdx = cliFileIdx + 1
   cliStartFile()
 }
@@ -1288,7 +1429,10 @@ function cliFinishSummary() {
   if cliJson != 0 {
     cliExit = 0
     if cliGating > 0 { cliExit = 1 }
+    if cliBatchUnread != 0 { cliExit = 2 }
     if cliInvalidModule > 0 { cliExit = 70 }
+    // `--batch` already wrote a record per file; its stdout is those, not one array.
+    if cliBatch != 0 { return cliStdHiddenNote() }
     const buf: i32[] = []
     buf.push('[')
     let ji = 0
@@ -1327,7 +1471,7 @@ function cliFinishSummary() {
       note = " (failing at severity " + cliSeverity + ")"
     }
     let stageNote = ""
-    if cliDirMode == 0 && cliErrors > 0 && cliLastStage != "" {
+    if cliBatch == 0 && cliDirMode == 0 && cliErrors > 0 && cliLastStage != "" {
       stageNote = " (" + cliLastStage + " error)"
     }
     const text = "Found " + parts + "." + note + stageNote
@@ -1339,6 +1483,7 @@ function cliFinishSummary() {
   cliStdHiddenNote()
   cliExit = 0
   if cliGating > 0 { cliExit = 1 }
+  if cliBatchUnread != 0 { cliExit = 2 }
   if cliInvalidModule > 0 { cliExit = 70 }
   0
 }
@@ -1419,18 +1564,13 @@ function cliTestFetchOrCompile() {
 function cliTestCompileNow() {
   const rc = compileSrc()
   if rc != 0 {
-    dgSev = []
-    dgLine = []
-    dgCol = []
-    dgEnd = []
-    dgMsg = []
-    dgMod = []
-    dgCode = []
+    cliClearDiags()
     const n = diagCount()
     let i = 0
     while i < n {
       cliAddDiag(
         "error",
+        diagStage(i),
         "",
         diagLine(i),
         diagCol(i),
@@ -1658,6 +1798,11 @@ function cliBeginPrint() {
   cliEmitNextOut()
 }
 function cliEmitNextOut() {
+  if cliBatchIdx < cliBatchOut.length {
+    cliCmdData = cliBatchOut[cliBatchIdx]
+    cliBatchIdx = cliBatchIdx + 1
+    return CMD_PRINT_OUT
+  }
   if cliOutIdx < cliOut.length {
     cliCmdData = cliOut[cliOutIdx]
     cliOutIdx = cliOutIdx + 1
@@ -1666,8 +1811,23 @@ function cliEmitNextOut() {
   cliState = ST_DONE
   CMD_DONE
 }
-// Advance the directory walk: list the next pending dir, or — walk done — sort
-// the work-list and begin the per-file check loop.
+// Ask the host whether target `cliTargetIdx` is a directory. One target is the
+// ordinary case; `--batch` names several and each expands the same way, in turn.
+function cliClassifyTarget() {
+  cliFile = cliTargets[cliTargetIdx]
+  // Strip trailing `/`s off the target (keep a bare `/`): child paths are built as
+  // `base + "/" + name`, so `vl check compiler/` would otherwise label every file
+  // `compiler//file.vl`.
+  while cliFile.length > 1 && cliFile[cliFile.length - 1] == '/' {
+    cliFile = cliFile.slice(0, cliFile.length - 1)
+  }
+  cliTargetFileBase = cliFiles.length
+  cliCmdPath = cliFile
+  cliState = ST_CLASSIFY
+  CMD_LIST_DIR
+}
+// Advance the directory walk: list the next pending dir, or — this target done — sort
+// its slice and either classify the next target or begin the per-file check loop.
 function cliWalkStep() {
   if cliWalkStack.length > 0 {
     cliCurDir = cliWalkStack[cliWalkStack.length - 1]
@@ -1680,7 +1840,11 @@ function cliWalkStep() {
     cliState = ST_WALK
     return CMD_LIST_DIR
   }
-  cliSortFiles()
+  cliSortFilesFrom(cliTargetFileBase)
+  if cliTargetIdx + 1 < cliTargets.length {
+    cliTargetIdx = cliTargetIdx + 1
+    return cliClassifyTarget()
+  }
   if cliFiles.length == 0 && cliCmd == 2 {
     cliOut = ["test: no *.test.vl files found under " + cliFile]
     cliExit = 0
@@ -1688,8 +1852,9 @@ function cliWalkStep() {
   }
   if cliFiles.length == 0 && cliCmd == 0 {
     cliOut = ["check: no .vl files found under " + cliFile]
-    // --json still delivers a parseable (empty) array on stdout.
-    if cliJson != 0 { cliJsonOut = "[]\n" }
+    // --json still delivers a parseable (empty) array on stdout. `--batch` says it with
+    // zero records instead — its stdout is records, never an array.
+    if cliJson != 0 && cliBatch == 0 { cliJsonOut = "[]\n" }
     cliExit = 0
     return cliBeginPrint()
   }
@@ -1711,6 +1876,9 @@ function cliStartFile() {
     return cliBeginPrint()
   }
   cliCurFile = cliFiles[cliFileIdx]
+  // A NAMED path is checked as `vl check <file>` checks it (whole-graph lint, a missing
+  // file is an error); one the walk found keeps the directory run's shape.
+  cliDirMode = cliFileFromDir[cliFileIdx]
   cliFileFixed = 0
   cliFixPhase = FIXP_OFF
   cliFixOrig = ""
@@ -2080,20 +2248,13 @@ export function cliNext() {
     cliSrcCacheSrcs = []
     cliSrcCacheFound = []
     // `fmt` with no path formats stdin to stdout; `check` with no path → cwd.
-    if cliCmd == 1 && cliFile.length == 0 {
+    if cliCmd == 1 && cliTargets.length == 0 {
       cliState = ST_FMT_STDIN
       return CMD_READ_STDIN
     }
-    if cliFile.length == 0 { cliFile = "." }
-    // Strip trailing `/`s off the target (keep a bare `/`): child paths are
-    // built as `base + "/" + name`, so `vl check compiler/` would otherwise
-    // label every file `compiler//file.vl`.
-    while cliFile.length > 1 && cliFile[cliFile.length - 1] == '/' {
-      cliFile = cliFile.slice(0, cliFile.length - 1)
-    }
-    cliCmdPath = cliFile
-    cliState = ST_CLASSIFY
-    return CMD_LIST_DIR // — classify the target (dir vs file)
+    if cliTargets.length == 0 { cliTargets = ["."] }
+    cliTargetIdx = 0
+    return cliClassifyTarget() // — classify the target (dir vs file)
   }
   if st == ST_CLASSIFY {
     if cliDirWasDir != 0 {
@@ -2101,9 +2262,12 @@ export function cliNext() {
       cliIngestEntries(cliFile, "")
       return cliWalkStep()
     }
-    // A file (or a missing path) — single-file run.
+    // A file, or a missing path — the caller NAMED it, so it goes on the work-list as
+    // itself and a read miss is reported against it rather than skipped.
     cliDirMode = 0
-    cliFiles = [cliFile]
+    cliFiles.push(cliFile)
+    cliFileFromDir.push(0)
+    if cliBatch != 0 { return cliWalkStep() }
     cliFileIdx = 0
     return cliStartWork()
   }
@@ -2114,7 +2278,9 @@ export function cliNext() {
   if st == ST_CHECK_READ {
     if cliFileFound == 0 {
       // A single-file target that does not exist → cannot read. A collected file
-      // that vanished mid-walk → skip it.
+      // that vanished mid-walk → skip it. Under `--batch` neither: the entry gets a
+      // record of its own, so the caller's file list and the records line up.
+      if cliBatch != 0 { return cliBatchUnreadable() }
       if cliDirMode == 0 {
         cliOut = ["check: cannot read " + cliFile]
         cliExit = 2
