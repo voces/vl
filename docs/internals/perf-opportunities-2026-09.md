@@ -20,7 +20,7 @@ QUICK = a day, no design question. STRUCT = a design track.
 | 5 | `variantIndexOf` → sid-keyed index: 76 call sites, 13/13 in `wasmEmit.vl` per-expression, table FROZEN after `collectU` | **3.6%** of self-compile self time, 7.1% incl | M | union member-set ABI (never dedupe) | byte-identical seed; `regress.py`; `rep-fuzz-check.sh`; the unions scaling axis | STRUCT |
 | 6 | String `+` in a loop is **O(n²)** (§D): a loop-local builder, with n-ary chain fusion as the down payment. The fusion once shipped in the TS core and was never ported | ×4.80 per doubling; 5.4× at 320 KB; ≥129 in-loop sites | M / L | rep layer | corpus byte-identity where the pattern is absent; a scaling pair "append N" vs "join N", ratio bar 2.5 — **a value fixture cannot pin a cost class** | STRUCT |
 | 7 | `unRowOfName`/`isUName` → incrementally maintained sid index (3 push sites, one POST-collect) | **2.9%** self time; 824,867 reaches/corpus | M | index must extend at all 3 pushes | byte-identical seed; `regress.py`; the unions axis | STRUCT |
-| 8 | `vl check` is super-linear in CALL SITES: 8× the sites costs **22.9×**, exponent 1.51 | user-visible on big files and in the LSP | M | — | a 4-rung absolute ladder with an exponent bar (`check-scaling.sh`) | STRUCT |
+| 8 | ✅ **LANDED in part (§B6)** — the shape is module-level BINDINGS, not call sites, and the definite-assignment set was 91% of it. Sid-keyed, the 8,000-rung falls 2.54 s → 1.07 s and `checkProgram` goes 57.5% → 1.8% inclusive; the residual is not the checker | **−58% at 8k, −66% at 16k** | M | — | a 4-rung absolute ladder with an exponent bar (`scripts/perf/check-scaling.sh`) | STRUCT |
 | 9 | LSP re-checks the WHOLE module graph per keystroke — 26 modules = **4.43 s** | editor latency, not CI | M | — | a keystroke ladder at 1 / 4 / 26 modules | STRUCT |
 | 10 | `declaredSlotOf` → per-function side index built in `buildLocals` | **1.1%** self time | M | reset per function, 5 sites | byte-identical seed; `regress.py` | STRUCT |
 | 11 | `fnStmtsPosOf` → reverse index `nodeIx → fe` after mono: 19,106 calls, **25.9 M scan steps** | closures axis 2.22 → ~1 | M | 1 in-place write, `emit_mono.vl:6353` | byte-identical seed; the closures axis under its 3.2 bar | STRUCT |
@@ -255,6 +255,46 @@ An idle-box run (load 1.9) gave ×11.6 / ×23.3 / ×3.1 — absolute times moved
 did not, which is why the ratio is the column. Types are linear. **Call sites are
 ≈O(n^1.5)** — a shape no axis in `vl_scaling_shape_test.ts` covers, because that suite
 grades RESHAPE ratios at fixed total work rather than absolute scale.
+
+**The middle row is mis-named, and the attribution is the checker's definite-assignment set
+(landed 2026-09-05).** The generated shape is `const v$i = g($i, $i)` at MODULE SCOPE, so what
+the ladder varied was the count of module-level *bindings*, not of call sites — the same
+8,000 bindings moved inside one function body scale for an entirely different reason
+(`declaredSlotOf` and friends, item #10). `daUnassigned` was a name-keyed `string[]` that pass 1
+filled with every top-level binding for the TDZ and that `daMarkAssigned` rebuilt in full on
+every write, so N declarations cost N rebuilds of an N-element array of strings. Re-keyed to a
+sid-indexed position column (`daLive` plus its inverse `daPos`, membership and mark one array
+read each), interleaved min-of-5 on one box:
+
+| N at module scope | 1,000 | 2,000 | 4,000 | 8,000 | 16,000 | 4k → 16k |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| before | 0.12 s | 0.19 s | 0.77 s | 2.54 s | 8.22 s | ×10.7 (exp 1.71) |
+| after | 0.03 s | 0.07 s | 0.38 s | 1.07 s | 2.76 s | ×7.3 (exp 1.43) |
+
+Guest profile of `vl build` over the 8,000-binding program, same seed both arms bar the change:
+`checkProgram` **57.51% → 1.80% inclusive**, `typecheck.vl` self **33.47% → 1.29%**, guest samples
+**1,751 → 777**, and no `da*` frame reaches 0.3% after (`daMarkAssigned` alone was 23.87% self,
+with `__str_eq__` under the three helpers another 23.2% of the whole run). **The residual
+super-linearity is real and is not the checker**: at 16,000 bindings the whole of `checkProgram`
+is 0.52% of a 5.26 s build, so the 2.76 s `vl check` still costs is spent outside it, and a
+240 KB file with zero module-level bindings checks in 0.74 s against 2.96 s for a 479 KB file
+with 16,000. That is the part of item #8 still open, and it needs its own attribution rather
+than this one's.
+
+The survey's fix note suggested dropping the pass-1 enrolment for module-level `const`, on the
+grounds that a `const` is assigned by construction. **Refuted by witness** — `const a = b + 1`
+followed by `const b = 2` is a temporal dead-zone error, and `tests/cases/scope/tdz-module-const.vl`
+now pins it; having an initializer says nothing about whether the initializer has RUN. The
+enrolment stays, and with O(1) membership it is a linear fill, not a cost.
+
+**And the `unions` axis of `tests/vl_scaling_shape_test.ts` was BLIND because of this.** Both of
+its arms declare 801 module-level bindings, so both paid the same quadratic, and the quotient
+divided it away: on master at 2,400 bindings the arms read 41.68 s and 37.82 s, ratio 1.10, an
+axis grading nothing. With the constant gone they read 8.50 s and 1.02 s, ratio 8.35, and at the
+committed 800 the ratio is 3.0 – 3.7 across box load 79 to 227. The axis's bar moved 2.5 → 5.5 and
+it takes its own 0.25 s denominator floor, because its cheap arm now costs less than the shared
+0.4 s one and a clamped denominator turns a ratio into an absolute budget. What it grades now is
+the union registry's own per-entity cost — items #5 and #7 — which nothing had measured.
 
 ---
 
