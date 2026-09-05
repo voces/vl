@@ -28,6 +28,11 @@ cd "$(dirname "$0")/.."
 export VL_STD="${VL_STD:-$PWD/std}"
 LOGS="${TMPDIR:-/tmp}/vl-gate.$$"; mkdir -p "$LOGS"
 : "${JOBS:=4}"; : "${DENO_JOBS:=4}"; export JOBS DENO_JOBS
+# Ten rows below shell a python3, and a broken one exits rc=1 in milliseconds — the same
+# code an over-budget ratchet returns, so ten rows red at once and the cause is in none of
+# them. $PYTHON pins an interpreter for every row without editing a script, and the
+# preflight row names the one that answered. Exported for the scripts a row shells.
+PY="${PYTHON:-python3}"; export PYTHON="$PY"
 
 if [ "${1:-}" != "--no-build" ]; then
   echo "== building the seed (everything below reads it) =="
@@ -44,6 +49,9 @@ NAMES=(); PIDS=(); STARTS=()
 # not the gate's — 19 of 21 rows read the same number. No stamp falls back to that reading.
 run() { local i=${#PIDS[@]}; NAMES+=("$1"); STARTS+=("$(date +%s.%N)"); shift
         ( "$@" > "$LOGS/$i.log" 2>&1; rc=$?; date +%s.%N > "$LOGS/$i.t"; exit $rc ) & PIDS+=($!); }
+
+# FIRST ROW, so the table's first line names the cause once instead of ten times.
+run "python preflight"         bash scripts/python-preflight.sh "$LOGS/python.diag"
 
 # THE SUITE ROWS' FILE SETS, derived here so each file runs in exactly ONE row: 46 ran
 # twice and 2 ran three times, which is that much extra contention on the two rows whose
@@ -108,32 +116,32 @@ run "lint-self + fmt"          bash scripts/lint-self.sh
 # The comment-budget RATCHET: per-file counts of the two comment lint codes may only
 # fall. lint-self.sh holds those codes out of its own `info` gate while the baseline
 # is non-zero, so this is what stops the tree drifting back up meanwhile.
-run "comment budget"           python3 scripts/comment-budget.py --check
+run "comment budget"           "$PY" scripts/comment-budget.py --check
 # The seed-size RATCHET: the compiler's own bytes, against a committed baseline, so a
 # jump names the landing that bought it rather than being found weeks later. It reads
 # the seed built above — ONE self-compile, which off a stale seed is the OLD codegen's
 # output; ci-native runs it straight after `--prove-fixpoint`, and that reading is the
 # deciding one. Milliseconds; a `stat` and a comparison.
-run "seed size"                python3 scripts/seed-size.py --check
+run "seed size"                "$PY" scripts/seed-size.py --check
 # The arena-scan RATCHET, same shape and the same reason: `arena-scan-outside-pass`
 # is a `warning` lint-self.sh holds out while the baseline is non-zero, so this is
 # what stops a whole-program scan being added outside a pass. #2419's class.
-run "arena-scan budget"        python3 scripts/scan-budget.py --check
+run "arena-scan budget"        "$PY" scripts/scan-budget.py --check
 # The kind-ladder RATCHET, third of the same shape: a ladder over a closed kind set is
 # exhaustive over it or its default NAMES what it excludes. Also re-derives the lint's
 # copy of every closed set from the `export type` that declares it and FAILS on drift.
-run "kind-ladder budget"       python3 scripts/ladder-budget.py --check
+run "kind-ladder budget"       "$PY" scripts/ladder-budget.py --check
 # The sentinel-index RATCHET, fourth of the same shape: a table read whose index came
 # from a reader that can answer in band is bound-tested, or takes a reader whose miss
 # cannot be a real row. Four compiler TRAPS of that shape landed on 2026-09-03 — `vl
 # check` rc 0, then an anonymous out-of-bounds read inside the seed (D1440, D1462, D1500
 # and #2498 — and docs/internals/sentinel-index-lint.md for the controls).
-run "sentinel-index budget"    python3 scripts/sentinel-budget.py --check
+run "sentinel-index budget"    "$PY" scripts/sentinel-budget.py --check
 # The dead-export RATCHET, fifth of the same shape: `unused-function` exempts an exported
 # declaration ("public surface"), so for a tree whose only consumer is itself the export
 # list is a blind spot — 19 exports were in it when this landed. Its baseline is at ZERO,
 # unlike the four above, because the tree reached zero in the PR that added it.
-run "dead-export budget"       python3 scripts/export-budget.py --check
+run "dead-export budget"       "$PY" scripts/export-budget.py --check
 # THE SHAPE FAMILY: seven pairs, same work, one axis reshaped, graded on the TIME
 # RATIO so machine speed and box load cancel. ~16-25 s; it is the only gate here
 # whose verdict is a measurement, and it reds on the pre-#2419 compiler.
@@ -145,7 +153,7 @@ run "mono-tyaram-grid"         bash scripts/mono-tyaram-grid.sh
 # (`docs/internals/inventory/D1042.md`). The checker reads either form and a directory
 # holding no rows yet falls back to the monolith named in its own README, so this line is
 # the same before and after the split lands and does not need touching on merge day.
-run "filed witnesses"          python3 scripts/check-filed-witnesses.py --strict docs/internals/inventory
+run "filed witnesses"          "$PY" scripts/check-filed-witnesses.py --strict docs/internals/inventory
 # THE OTHER HALF: a row that stopped EXISTING. #2405 resolved a conflict in the inventory's
 # tail and deleted a ROW, with its citations left standing, and every gate was green —
 # the instruments above all read the rows that are there. ~0.2s, and it also runs inside
@@ -153,8 +161,8 @@ run "filed witnesses"          python3 scripts/check-filed-witnesses.py --strict
 # names it rather than burying it in a suite of hundreds.
 run "inventory refs"           deno test -A --no-check tests/vl_inventory_refs_test.ts
 run "conflict markers"         deno test -A --no-check tests/vl_no_conflict_markers_test.ts
-run "splice scan"              bash -c "python3 scripts/inventory/splice-scan.py --self-test >/dev/null && python3 scripts/inventory/splice-scan.py"
-run "distilled corpus"         python3 scripts/silent-sweep/distilled/regress.py build/vl-compiler.wasm
+run "splice scan"              bash -c "\"$PY\" scripts/inventory/splice-scan.py --self-test >/dev/null && \"$PY\" scripts/inventory/splice-scan.py"
+run "distilled corpus"         "$PY" scripts/silent-sweep/distilled/regress.py build/vl-compiler.wasm
 
 # ON MASTER ONLY: the committed baseline must describe the committed seed exactly. A branch
 # is SUPPOSED to disagree with it — that disagreement is the change being measured — so this
@@ -163,7 +171,7 @@ run "distilled corpus"         python3 scripts/silent-sweep/distilled/regress.py
 # reads the baseline, under-reported `runs` by six until an agent noticed while diffing its
 # own corpus run.
 if [ "$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" = "master" ]; then
-  run "baseline freshness"     python3 scripts/silent-sweep/distilled/regress.py build/vl-compiler.wasm --verify-fresh
+  run "baseline freshness"     "$PY" scripts/silent-sweep/distilled/regress.py build/vl-compiler.wasm --verify-fresh
 fi
 
 FAIL=0
@@ -177,5 +185,10 @@ for i in "${!PIDS[@]}"; do
   else FAIL=1; printf '%-22s %7.1fs  FAILED rc=%d   %s\n' "${NAMES[$i]}" "$el" "$rc" "$LOGS/$i.log"; fi
 done
 
-if [ $FAIL -ne 0 ]; then echo; echo "GATE FAILED — logs in $LOGS"; exit 1; fi
+if [ $FAIL -ne 0 ]; then
+  # A broken interpreter reds every python row with the ratchets' own exit code, so say it
+  # once, here, rather than leaving ten identical `rc=1` rows to be read as a regression.
+  [ -s "$LOGS/python.diag" ] && { echo; cat "$LOGS/python.diag"; }
+  echo; echo "GATE FAILED — logs in $LOGS"; exit 1
+fi
 echo; echo "ALL GATES PASS ✅  (logs in $LOGS)"
