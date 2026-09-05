@@ -213,8 +213,19 @@ Three, and they fire at different moments. Profiling is what you do AFTER one of
 
 * **`tests/vl_scaling_shape_test.ts`** — eight pairs, the same work reshaped along one axis
   (functions, types, unions, call sites, closures, callback slots, modules, generic pins),
-  graded on the TIME RATIO so machine speed and box load cancel. Fires when a pass starts
-  multiplying over an axis, and NAMES the axis. ~20–30 s; two of its axes red on the
+  graded on the ratio of the two arms' CPU (user+sys) so machine speed and box load cancel.
+  **The ratio has to be of CPU, because `gate.sh`'s fan-out is not a uniform slowdown**: the
+  two arms run at different moments and a burst inflates whichever one it lands on. Measured
+  2026-09-05 over three fanned-out gate runs, the `functions` pair's WALL ratio read
+  2.95 / 3.34 / 4.51 against a bar of 2.5 while its CPU ratio read 1.14 / 1.18 / 1.19 — the
+  row had gone red on three unrelated PRs that way. A tenth case is the family's own CONTROL,
+  a pair that MUST red: one source with one literal changed, the many arm running its inner
+  loop n times per outer step against the one arm's once, so the quadratic is the PROGRAM's
+  own algorithm and no compiler improvement can retire it. **That is deliberate** — the
+  control was first built on a compiler gap (a struct-field string accumulator, which the
+  loop-local lowering declines, now filed as D1650) and a control built on a gap reds the
+  gate the day someone closes the gap, which teaches people to distrust the row.
+  Fires when a pass starts multiplying over an axis, and NAMES the axis. ~20–30 s; two of its axes red on the
   pre-#2419 compiler and `callback slots` on the pre-D1514 one. Three axes are super-linear
   today and carry a bar above their measurement, each naming the function responsible — read
   those comments before widening a bar; `generic pins` left that list when `collectA` learned
