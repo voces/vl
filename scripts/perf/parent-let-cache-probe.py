@@ -16,6 +16,11 @@ EMPTY linker, so `print` has no import to reach), build that compiler to a scrat
 then compile the compiler with it. The patch is reverted before the measuring build runs,
 so a poisoned seed cannot outlive the script; `build/vl-compiler.wasm` is never written.
 
+The revert restores the BYTES this script read before patching, never `git checkout --`:
+the working tree it runs in is not one it created, and a checkout there discards whatever
+uncommitted edit the caller was measuring. That cost one session its whole change, and the
+green gate that followed was master's.
+
 Anchors are exact source strings and a missing one is a loud failure, not a silent
 no-op probe.
 """
@@ -153,11 +158,19 @@ EDITS = [
 ]
 
 
+# The bytes each patched file held before `patch` touched it, which is what `revert`
+# puts back. Filled by `patch` and read by `revert`, so the two cannot disagree about
+# which files were edited.
+SAVED: dict[pathlib.Path, str] = {}
+
+
 def patch() -> None:
     """Apply every edit, failing loudly on an anchor that no longer matches."""
     texts: dict[pathlib.Path, str] = {}
     for path, old, new in EDITS:
-        s = texts.get(path) or path.read_text()
+        if path not in SAVED:
+            SAVED[path] = path.read_text()
+        s = texts.get(path) or SAVED[path]
         if s.count(old) != 1:
             raise SystemExit(
                 f"anchor not unique in {path.name} ({s.count(old)} matches) — the probe "
@@ -169,9 +182,10 @@ def patch() -> None:
 
 
 def revert() -> None:
-    subprocess.run(
-        ["git", "checkout", "--", str(BASE), str(SECT)], cwd=ROOT, check=True
-    )
+    """Put back the bytes `patch` read. Never `git checkout --`: an uncommitted edit in
+    the tree this runs in is the caller's, and a checkout would take it with the patch."""
+    for path, s in SAVED.items():
+        path.write_text(s)
 
 
 def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
