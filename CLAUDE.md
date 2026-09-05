@@ -38,22 +38,24 @@ there); the rest is the review's, and the full rubric is `std-api-review.md` §4
 **Up to 6 concurrent worktree agents at `JOBS=6` / `DENO_JOBS=4`.** The old cap of 3 came from an
 `earlyoom` kill measured when three agents each ran a FULL CENSUS sweep (~20 GiB in 64 s on
 `nproc=24`). No agent runs the census now — every brief forbids it and the distilled corpus is
-~7 s — so that measurement no longer describes the workload. Measured 2026-08-28 with agents
-running: **78% of 47 GiB available, largest process 1.4 GB**. `earlyoom` still SIGTERMs at 10%
-available, so check `free` before going wide, and drop back to 3 for anything that does run a
-full census block.
+~35 s (2026-09-05) — so that measurement no longer describes the workload. Measured
+2026-08-28 with agents running: **78% of 47 GiB available, largest process 1.4 GB**.
+`earlyoom` still SIGTERMs at 10% available, so check `free` before going wide, and drop back
+to 3 for anything that does run a full census block.
 
 ## Gates
 
 **`scripts/gate.sh` runs the whole ladder and is the thing to run.** Every gate below is
 independent once the seed is built, so it fans them out and reports a per-gate table of wall
-time and exit code. Twenty-one gates; measured 2026-09-04 on a box at load 15, the wall clock
-was **~82 s**, set by three gates that run ~70–80 s each (`distilled corpus`, `ci-native`,
-`deno task test`) — everything else finishes under a minute in parallel. The TIME column has
-been per gate since #2564 (before that it read elapsed-to-report, and the old "68 seconds for
-all nine" was that broken reading). A merge gate that takes longer than a coffee stops being
-run, so treat ~90 s as the budget it has to keep — if a gate is added that pushes the wall past
-a couple of minutes, the gate is what needs rethinking, not the budget.
+time, CPU seconds and exit code. Twenty-four gates (25 on master); measured 2026-09-05 on a
+box at load 27, the wall clock was **79.8 s**, set by `distilled corpus` alone at 79.8 s with
+`ci-native` next at 55.5 s — everything else finishes in well under a minute in parallel. The
+table has been per gate since #2564 (before that it read elapsed-to-report, and the old "68
+seconds for all nine" was that broken reading), and it now carries TWO columns: WALL is still
+each row's contended elapsed, CPU is its own user+sys, so a row that is slow and a row that is
+merely starved (WALL >> CPU) can be told apart. A merge gate that takes longer than a coffee
+stops being run, so treat ~90 s as the budget it has to keep — if a gate is added that pushes
+the wall past a couple of minutes, the gate is what needs rethinking, not the budget.
 
 The parts, and what each is for:
 
@@ -73,10 +75,15 @@ The parts, and what each is for:
 4. `scripts/rep-fuzz-check.sh` — **mandatory** for anything touching the rep layer or the
    interner; the corpus, the suites and the fixpoint are all blind to REJECT→MISMATCH
 5. `scripts/mono-tyaram-grid.sh` for monomorphizer changes
-6. **`scripts/silent-sweep/distilled/regress.py` — the census's content, in ~7 seconds.**
+6. **`scripts/silent-sweep/distilled/regress.py` — the census's content, in ~35 seconds.**
+   (Measured 2026-09-05 at load 33: 35.5 s alone, 269 CPU-s at 759%, so it does fan out; it
+   is the gate's critical path, and 66.3 s of the 2026-09-04 reading was contention.)
    Two halves. `cells/` is DERIVED: 1,477 programs, one per behavioural equivalence class of
-   the 250,238-cell census. `named/` is CURATED: the exact cells some real regression NAMED,
-   kept whole. It exits non-zero **only** on `runs → not-runs`; `→ silent` and every other
+   the 255,505-cell census. `named/` is CURATED: the exact cells some real regression NAMED,
+   kept whole — 6,088 of them, so the corpus is 7,565 cells. (`regress.py`'s own summary
+   splits that 2,061/5,504, which is the pass-2 survey's row 2: 584 curated cells have no
+   `expected.jsonl` row and default to block A. The total and the census count are right.)
+   It exits non-zero **only** on `runs → not-runs`; `→ silent` and every other
    movement is printed and read, not blocked on. A program that did not work before and does
    not work now has not regressed in the sense a gate should stop the world for.
 
@@ -90,8 +97,8 @@ The parts, and what each is for:
 
    Measured, not asserted: over 19 graded compilers, block A's 150,224 programs produce only
    **212 distinct answers** and **4.09 bits** of entropy each — the entire block is ~75 KiB of
-   signal. It collapses to 343 classes, and the census as a whole to **1,477 (99.41%
-   redundant, 169×)**. Validation is in `scripts/silent-sweep/distilled/README.md`: **2,699 of
+   signal. It collapses to 343 classes, and the census as a whole to **1,477 (99.42%
+   redundant, 173×)**. Validation is in `scripts/silent-sweep/distilled/README.md`: **2,699 of
    2,699** transition events across every snapshot pair are covered, including 938 loud→silent
    and 856 runs→not-runs, and leave-one-out over 17 held-out compilers missed **0 of 1,468**
    transition kinds.
