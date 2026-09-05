@@ -47,9 +47,13 @@ full census block.
 
 **`scripts/gate.sh` runs the whole ladder and is the thing to run.** Every gate below is
 independent once the seed is built, so it fans them out and reports a per-gate table of wall
-time and exit code. **68 seconds** for all nine on a loaded box. A merge gate that takes longer
-than a coffee stops being run, so treat that as the budget it has to keep — if a gate is added
-that pushes it over a couple of minutes, the gate is what needs rethinking, not the budget.
+time and exit code. Twenty-one gates; measured 2026-09-04 on a box at load 15, the wall clock
+was **~82 s**, set by three gates that run ~70–80 s each (`distilled corpus`, `ci-native`,
+`deno task test`) — everything else finishes under a minute in parallel. The TIME column has
+been per gate since #2564 (before that it read elapsed-to-report, and the old "68 seconds for
+all nine" was that broken reading). A merge gate that takes longer than a coffee stops being
+run, so treat ~90 s as the budget it has to keep — if a gate is added that pushes the wall past
+a couple of minutes, the gate is what needs rethinking, not the budget.
 
 The parts, and what each is for:
 
