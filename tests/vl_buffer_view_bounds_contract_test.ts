@@ -1,6 +1,8 @@
 // The P1.4 CONTRACT rows of the view-bounds suite — three assertions that hold
 // whatever the exact counts in `TABLE` are. Its own file so `deno test --parallel`
 // runs it beside the table rows; the machinery is in the shared support module.
+//
+// @test-timing opt
 import {
   ENABLED,
   shapeOf,

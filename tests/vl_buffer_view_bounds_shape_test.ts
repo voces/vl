@@ -3,6 +3,8 @@
 // P1.4 contract moved to `vl_buffer_view_bounds_contract_test.ts` so `deno test
 // --parallel` can run the two concurrently; the machinery and the table (with the
 // prose that explains every cell) are in the shared support module.
+//
+// @test-timing opt
 import {
   ENABLED,
   RUNGS,

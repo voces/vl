@@ -7,6 +7,8 @@
 // rows it finds, `vl_inventory_rows_test.ts` checks the shape of the rows it finds. Neither
 // can see a row that stopped being found. This test asks the other question: of every
 // `D<id>` the tree CITES, which one has no row?
+//
+// @test-timing sweep n=12355
 
 // The one-file-per-row split makes that class rare (two PRs filing two rows now touch two
 // files) and cannot remove it: a delete is still a delete, and a rename is a delete with a

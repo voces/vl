@@ -10,6 +10,8 @@
 // One pair per axis a pass could accidentally multiply over. The "many" arm spreads the
 // same work over N entities, the "one" arm over N/K. Method and profiles:
 // docs/internals/profiling-the-compiler.md.
+//
+// @test-timing instrument
 
 // THREE AXES ARE SUPER-LINEAR TODAY and carry a bar above their measured ratio rather
 // than the default. That is recorded DEBT, not tolerance: each names the function that

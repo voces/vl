@@ -1,6 +1,8 @@
 // The ALLOCATION-MELT rows of the release suite (`MELT_TABLE`). Its own file so
 // `deno test --parallel` can run it beside the shape/loop/case rows rather than
 // after them; the machinery and the table are in the shared support module.
+//
+// @test-timing opt
 import {
   ENABLED,
   MELT,

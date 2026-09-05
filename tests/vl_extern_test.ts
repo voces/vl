@@ -15,6 +15,8 @@
 // The `vl_` prefix is load-bearing: it is one of the globs `ci-native` auto-discovers
 // (tests/ci_seed_coverage_test.ts). GATING is the usual one — `SELFHOST_NATIVE_ALIGN=1`
 // plus a built binary and seed, so a fresh clone self-ignores.
+//
+// @test-timing native
 
 import { COMPILER, ROOT, VL, exists } from "./support/tree.ts";
 

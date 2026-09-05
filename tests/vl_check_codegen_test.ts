@@ -52,6 +52,9 @@
 // GATING: env-gated (`SELFHOST_NATIVE_ALIGN=1`) + needs the built binary + seed.
 // The fault-injected tests take the SAME gate — they drive the same binary over the
 // same seed, so there is nothing extra for them to skip on.
+//
+// @test-timing native
+// @test-timing sweep n=2989 name~"the invalid-module gate"
 
 import { COMPILER, ROOT, VL, exists, nativeEnv } from "./support/tree.ts";
 
