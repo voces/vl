@@ -43,6 +43,13 @@
 // `NOTE_WINDOW` lines, by `collectANoteIdentRename(<the old name>)` — before the write, since
 // the note reads the name being replaced — or carry the same exemption line.
 //
+// THE THIRD DISCIPLINE, same file again. `buildFnMap` resumes on the `fnStmts` PREFIX for the
+// same reason, and it reads things a rename cannot touch: `P.nodes[fnStmts[i]]`, `fnParent[i]`
+// and the `FuncDecl`'s own `fnRet`/`fnName`. So every in-place write to one of those must be
+// preceded, within `NOTE_WINDOW` lines, by `buildFnMapNoteFnSlotWrite()` — or carry the
+// exemption line. A `monoArenaTouch()` is NOT a substitute: it makes `monoRebuild` run, and a
+// run whose prefix is still armed re-seeds the stale row rather than re-classifying it.
+//
 // No assertion library, per CLAUDE.md: every failure is a `throw new Error` naming want and got.
 
 import { ROOT } from "./support/tree.ts";
@@ -64,6 +71,15 @@ const EXEMPT_MARK = "arena-tick exempt:";
 const NAME_WRITE = /\.identName\s*=(?!=)/;
 const NOTE_CALL = "collectANoteIdentRename(";
 const NOTE_WINDOW = 3;
+
+// A write that re-points a function SLOT or rewrites a `FuncDecl` field `buildFnMap` classifies,
+// and the call that tells it its per-function row cache no longer covers that function. Above
+// the write, like the rename note. `.fnRet`/`.fnName` have no site in this file today: they are
+// here because `monoArenaTouch()` would make `monoRebuild` RUN while leaving the prefix armed,
+// so a bump is not a substitute for the note.
+const SLOT_WRITE =
+  /\b(?:fnStmts|fnParent)\s*\[[^\]]*\]\s*=(?!=)|\.(?:fnRet|fnName)\s*=(?!=)/;
+const SLOT_NOTE_CALL = "buildFnMapNoteFnSlotWrite(";
 
 /** The code half of a line: everything before an unquoted `//`. */
 const stripComment = (line: string): string => {
@@ -95,6 +111,9 @@ type Hit = {
   /** A callee-name write, and whether `collectANoteIdentRename` sits above it. */
   renames: boolean;
   noted: boolean;
+  /** A `fnStmts`/`fnParent` slot write, and whether the `buildFnMap` note sits above it. */
+  repoints: boolean;
+  slotNoted: boolean;
 };
 
 const classify = (lines: string[]): Hit[] => {
@@ -111,6 +130,8 @@ const classify = (lines: string[]): Hit[] => {
       text: lines[i].trim(),
       renames: NAME_WRITE.test(code),
       noted: above.some((l) => l.includes(NOTE_CALL)),
+      repoints: SLOT_WRITE.test(code),
+      slotNoted: above.some((l) => l.includes(SLOT_NOTE_CALL)),
       ticked: after.some((l) => l.includes("monoArenaTouch()")),
       exempt: mark === undefined ? null : mark.slice(mark.indexOf(EXEMPT_MARK) + EXEMPT_MARK.length).trim(),
     });
@@ -153,6 +174,18 @@ Deno.test("mono arena tick: every in-place write bumps the stamp or is named exe
         `\n\ncollectA resumes on the arena prefix between two monoRebuild calls, and its ` +
         `Call arm reads this name — so a rename must call ${NOTE_CALL}<old name>) within ` +
         `${NOTE_WINDOW} lines ABOVE the write, which is where the old name still exists.`,
+    );
+  }
+
+  const unslotted = hits.filter((h) => h.repoints && !h.slotNoted && h.exempt === null);
+  if (unslotted.length > 0) {
+    throw new Error(
+      `${unslotted.length} function-slot write(s) in compiler/emit_mono.vl do not tell ` +
+        `buildFnMap:\n` +
+        unslotted.map((h) => `  emit_mono.vl:${h.line}  ${h.text}`).join("\n") +
+        `\n\nbuildFnMap resumes on the fnStmts prefix between two monoRebuild calls, and its ` +
+        `row comes off P.nodes[fnStmts[i]] and fnParent[i] — so re-pointing either must call ` +
+        `${SLOT_NOTE_CALL}) within ${NOTE_WINDOW} lines ABOVE the write.`,
     );
   }
 
@@ -213,6 +246,31 @@ Deno.test("mono arena tick: the scanner reports a rename that does not tell coll
     throw new Error(
       `the rename scanner mis-read its own control — want [${want.join(", ")}], got ` +
         `[${got.join(", ")}]. A classifier blind to an untold rename cannot guard the resume.`,
+    );
+  }
+});
+
+Deno.test("mono arena tick: the scanner reports a slot write that does not tell buildFnMap (control)", () => {
+  // The slot rule's own control, both exits exercised, for the reason the other two have one.
+  const control = [
+    "  fnStmts[tSlot] = clone", //                 1 — re-points, unnoted
+    "  monoArenaTouch()",
+    "  buildFnMapNoteFnSlotWrite()",
+    "  fnParent[msl] = instFe", //                 4 — re-points, noted
+    "  monoArenaTouch()",
+    "  cal.identName = specName", //               6 — a rename, so the slot rule ignores it
+    "  monoArenaTouch()",
+    "  fn.fnRet = synthTypeRef(nm, -1)", //         8 — a classified field, and a bump is not a note
+    "  monoArenaTouch()",
+  ];
+  const got = classify(control).map((h) =>
+    `${h.line}:${h.repoints ? (h.slotNoted ? "noted" : "UNNOTED") : "n/a"}`
+  );
+  const want = ["1:UNNOTED", "4:noted", "6:n/a", "8:UNNOTED"];
+  if (got.join(" ") !== want.join(" ")) {
+    throw new Error(
+      `the slot scanner mis-read its own control — want [${want.join(", ")}], got ` +
+        `[${got.join(", ")}]. A classifier blind to an untold slot write cannot guard the resume.`,
     );
   }
 });

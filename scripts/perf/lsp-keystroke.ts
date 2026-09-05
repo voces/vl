@@ -179,3 +179,57 @@ for (const [name, key, base] of CASES) {
   );
 }
 console.log(`# load: ${Deno.readTextFileSync("/proc/loadavg").trim()}`);
+
+// ── the change → hover PAIR, the sequence an editor actually runs ─────────────────────
+// `onDidChangeContent` makes three checker calls and `onHover` a fourth. Only ONE of the
+// three leaves a checked module graph behind, so their ORDER decides whether the hover is
+// free — both orders are timed here, and each arm's row is the one its `server.ts` runs.
+// `checks` is `graphCheckCount()` over the whole pair; it is the robust half, the ms
+// moves with the box.
+const hoverLadder = async (
+  c: NonNullable<ReturnType<typeof loadWasmChecker>>,
+  text: string,
+  key: string,
+  checkLast: boolean,
+): Promise<{ ms: number; checks: number }> => {
+  const before = c.graphCheckCount();
+  const t = performance.now();
+  c.bumpReaderGeneration();
+  if (checkLast) {
+    c.moduleSurface(text, key);
+    c.lint(text);
+    await c.check(text, key, readModule);
+  } else {
+    await c.check(text, key, readModule);
+    c.lint(text);
+    c.moduleSurface(text, key);
+  }
+  // The hover ladder at a cursor no rung answers — `onHover`'s worst case.
+  if (await c.hoverTypeAt(text, key, readModule, 0, 2) === undefined) {
+    if (await c.memberTypeAt(text, key, readModule, 0, 2) === undefined) {
+      await c.typeAliasAt(text, key, readModule, 0, 2);
+    }
+  }
+  return { ms: performance.now() - t, checks: c.graphCheckCount() - before };
+};
+
+console.log("");
+console.log("## PAIR — one keystroke plus the hover after it");
+console.log("| case | handler order | pair ms | graph checks |");
+console.log("| --- | --- | ---: | ---: |");
+for (const [name, key, base] of CASES) {
+  for (const [label, checkLast] of [["hints→lint→check", true], ["check→lint→hints", false]] as const) {
+    const c = loadWasmChecker(SEED, () => {})!;
+    const rows: { ms: number; checks: number }[] = [];
+    for (let r = 0; r <= REPS; r++) {
+      const row = await hoverLadder(c, `${base}\n// edit ${r}\n`, key, checkLast);
+      if (r > 0) rows.push(row); // the first pays for a cold cache
+    }
+    console.log(
+      `| ${name} | ${label} | ${med(rows.map((x) => x.ms)).toFixed(1)} | ${
+        med(rows.map((x) => x.checks))
+      } |`,
+    );
+  }
+}
+console.log(`# load: ${Deno.readTextFileSync("/proc/loadavg").trim()}`);

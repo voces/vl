@@ -14,6 +14,47 @@ the first pass never profiled, re-derives its structural counts, and asks what t
 landings between the two commits left standing. References to the first pass are written
 "first-pass §n"; a bare "§n" is this document.
 
+**Re-graded on the merged tree, `6517412df` + this branch.** Five PRs landed while this was
+being written, one of them (#2613) the `buildFnMap` index §3.2 measures. Every headline was
+re-run against a seed built from the merged source and proved a fixpoint (2,158,740 B); §0
+carries the result. Row 1 stands; §3.2's number is now history, and says what happened to it.
+
+---
+
+## 0 · What the merge changed
+
+| claim | at `153760e1d` | on the merged tree | verdict |
+|---|---|---|---|
+| `variantSig` self, 1,600 unions | 29.98% | **26.62%** | **stands** |
+| `variantSig` self, 3,200 unions | 30.34% | **27.62%** | **stands** |
+| `unions` axis ratio, 800 (shipped) | 2.56 | **2.63** | stands |
+| `unions` axis ratio, 1,600 | 3.86 | **3.88** (bar 4.0) | stands |
+| `buildFnMap` incl, 600 callbacks | 72.42% | **off the frame list** | **closed by #2613** |
+| `callback slots` 600, guest samples | 736 | **277 (0.38×)** | — |
+| `generic pins` 800, guest samples | 1,003 | **827 (0.82×)** | — |
+
+**Row 1 is unaffected and remains the top self frame at both union counts.** `buildVariantTwins`
+is reached from `mAssignTypeIndices`, not from `monoRebuild`, so nothing #2613 did touches it.
+The three-point drop is box load: this reading was taken at load 47 against the earlier one's 6.
+
+**§3.2 is now a historical measurement, and one thing in it is worth keeping.** #2613 sized its
+own fix on the `generic pins` axis — 18.6–20.4% inclusive at 800 pins → 0.25–1.58% — and
+independently reproduced §3.2's 400/800-pin readings (10.61% against this survey's 12.40%,
+18.58–20.38% against 19.94%). What it did not have is the **`callback slots`** number, which is
+where the pass cost most: 72.42% inclusive on a program declaring no generic at all. The fix
+carried there too, and by more than the axis it was sized on — **736 → 277 guest samples,
+0.38×**. That is the reading to quote for #2613's value, and it was only available because a
+survey profiled an axis the fix's author had no reason to.
+
+**What the fall exposes.** With `buildFnMap` gone from the callback arm, the two remaining
+`monoRebuild` legs are visible for the first time: `computeRetInference` **5.05% self** and
+`computeVoidFns` **2.89% self**, beside `buildFnMapReseedPrefix` at 2.89%. Neither resumes.
+That is the next slice of the same row and it is small — worth naming, not worth scheduling
+until something measures it on a bigger arm.
+
+Everything below is as measured at `153760e1d` and is unchanged, since no other landing in the
+five touches a file this survey reads.
+
 **Summary.** Three findings dominate, and none of them appears in the first pass.
 
 * **`variantSig` is 30.34% of a 3,200-union compile** — a string built by concatenation
@@ -27,10 +68,11 @@ landings between the two commits left standing. References to the first pass are
   address-taken set a static ABI split would need is **24.2% of functions**, measured over
   the 611 of 2,440 `tests/cases` modules that carry the convention; and the table section is
   still sized to the function count while the element section beside it is not.
-* **`buildFnMap` is 72.42% inclusive of a 600-callback compile** and is reached from
-  `monoRebuild` on a program declaring no generic at all (§3.2). That row is in flight
-  elsewhere and is **not filed here**; what is filed is the measurement that re-sizes it and
-  names the axis it costs most on, which is `callback slots`, not `generic pins`.
+* **`buildFnMap` was 72.42% inclusive of a 600-callback compile** and was reached from
+  `monoRebuild` on a program declaring no generic at all (§3.2). That row was in flight
+  elsewhere and is **not filed here**; it landed as #2613 mid-survey, sized on the `generic
+  pins` axis, and the callback arm this survey measured fell **736 → 277 samples (0.38×)**
+  with it — a larger fall than the axis the fix was graded on (§0).
 
 Beyond those: the rep-key renderer is written five times (§5.1), four phase flags trace one
 monotone arena timeline with one gate between them (§6), the `select` guard's missing proof
@@ -44,7 +86,7 @@ while the ambient `pending*` write count went **311 → 330** (§8).
 
 | # | finding | evidence | size | risk | proof |
 |---|---|---|---|---|---|
-| 1 | `buildVariantTwins` rebuilds `variantSig` for both operands of every pair in an O(n²) scan; `variantSig(i)` is loop-invariant and `variantSig(d)` is a pure function of tables the loop never writes (§2) | **30.34% self** of a 3,200-union compile, **99.7%** of it from that one loop; the axis reads **3.86 / bar 4.0** at 1,600 unions | XS | none | byte-identical seed; `regress.py`; the `unions` axis ratio |
+| 1 | `buildVariantTwins` rebuilds `variantSig` for both operands of every pair in an O(n²) scan; `variantSig(i)` is loop-invariant and `variantSig(d)` is a pure function of tables the loop never writes (§2) | **30.34% self** of a 3,200-union compile, **99.7%** of it from that one loop; the axis reads **3.86 / bar 4.0** at 1,600 unions — **re-graded on the merged tree at 27.62% and 3.88** (§0) | XS | none | byte-identical seed; `regress.py`; the `unions` axis ratio |
 | 2 | The env-parameter ABI is module-wide: one function value gives **every** function a `structref` param and **every** direct call a `ref.null none` — #2609 named this as "where the next slice is" and it is unsized (§4) | **+82,534 B (+3.83%)** on the compiler, independently reproducing #2609's +82,151; only **24.2%** of functions in the 611 paying `tests/cases` modules are address-taken, so three in four could keep the plain ABI | L | high | `matrix.py`, `regress.py`, corpus byte identity, an owner ruling on the ABI split |
 | 3 | Seven `expr*Array` classifiers each ask `unionIdentReadKind` independently, and each re-interns the identifier's sid (§5.2) | `unionIdentReadKind` **21.12% inclusive** on the `functions` axis; `sidOfNode` 5.90% self, half of it under `unionNameOfIdentSid` | M | med | byte-identical seed; corpus `cmp` |
 | 4 | The rep-key renderer is written five times: three `*KeyGo` bodies at 110/115/98 lines and 85–98% pairwise, three 33-line entry points at 100%, while `repElemIdGo(ty, mv)` already proves the merge (§5.1) | script-measured token similarity; `repCanonId`/`repElemId`/`repMvValId` are identical after normalisation | M | med | byte-identical seed; `rep-fuzz-check.sh` |
@@ -190,7 +232,12 @@ A third reading, for the record: `recordRedundantAnnot` is **9.17% self** at 800
 `typecheck.vl`, not the emitter, and it is not axis-specific — noted here for the front-end
 survey rather than filed as an emitter row.
 
-### 3.2 `buildFnMap` — measurement only, the row is in flight
+### 3.2 `buildFnMap` — measurement only; the row landed as #2613 mid-survey
+
+*Everything in this subsection is as measured at `153760e1d`, before #2613. §0 carries what
+happened to it: the pass is off the frame list on both arms, and the callback arm fell 0.38×.
+It is kept because its `callback slots` reading is the one number the fix was not graded on.*
+
 
 `monoRebuild` (`emit_mono.vl:1992`) skips its four passes on an unmoved arena stamp, and
 #2604 taught the first of them, `collectA`, to resume on the arena prefix. `buildFnMap`
@@ -216,8 +263,10 @@ per-instance rebuild. **Second, its own cost is annotation TEXT.** Under it on t
 annotation is re-rendered and re-parsed through several character grammars on every rebuild.
 
 So the fix has two independent halves — a prefix resume, and reading the return kind from the
-arena rather than the render — and only the first is in flight. The second belongs to the
-destringify program (§9's parse count).
+arena rather than the render. #2613 landed the first. **The second is still open**, and it is
+the half this survey's numbers were about: the return facts are still seeded by rendering
+`fnRet` and re-parsing it, the row cache merely stops doing it once per instance. That belongs
+to the destringify program (§9's parse count).
 
 ---
 
@@ -795,6 +844,13 @@ including the two definitions' calls to each other and 532 excluding them — th
 delegation-wrapper count (102) requires the body to be one call after comments and blanks are
 stripped, which is what separates it from a two-line function; the raw line-count version is
 about 20% higher.
+
+**The merge re-grade (§0).** Master moved five commits during the survey, so the branch was
+merged and every headline re-run: `compiler/entry.vl` built by the old seed, that result used
+to build it again, the two `cmp`-equal at 2,158,740 B (so the merged source self-compiles to a
+fixpoint), and a `--names` seed off that. The unions and callback arms are the same generated
+programs as before, so the only variable is the compiler. Box load 47 for this round against
+6 for the first, which is why every share moved a little and none of the ratios did.
 
 **Not run:** the full census (a discovery instrument, forbidden by the brief), `gate.sh`, and
 any build of a proposed change. Every "proof" column states what such a compile would have to
