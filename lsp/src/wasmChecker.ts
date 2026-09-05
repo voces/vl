@@ -19,7 +19,10 @@
 // steady-state `checkSrc` ~0.1–1.3 ms on editor-sized files, ~75 ms on the
 // full 31k-line compiler assembly — one instance is reused across keystrokes
 // (`checkSrc` resets all compiler state; `modReset` clears the module table,
-// which `checkSrc` does NOT reset, so every check calls it).
+// which `checkSrc` does NOT reset, so a check that changes the graph calls it).
+// What the instance currently holds is memoised in ONE entry (`ensureStaged` /
+// `ensurePrepared`), so the several queries one editor request makes over the
+// same unchanged text share a single graph check.
 
 import type { VLDiagnostic } from "../../compiler/diagnostics.ts";
 import { decodeDiagData } from "../../compiler/diagnostics.ts";
@@ -602,6 +605,29 @@ export type WasmChecker = {
    * imports, so the source is staged directly (no `prepare`).
    */
   lint: (source: string) => VLDiagnostic[];
+  /**
+   * Tell the checker a READER ANSWER may have moved, so the prepared-state memo
+   * stops being reusable.
+   *
+   * The memo is keyed on (source, entryKey, reader, generation), and an entry
+   * file's own text does not change when a module it IMPORTS does — so without
+   * this a hover in A would keep answering with the types A's dependency B had
+   * before B was edited. A DIFFERENT reader is caught by identity; one reader
+   * whose answers move needs telling. The host bumps from
+   * `documents.onDidChangeContent` (any open buffer, not just this entry), from
+   * the workspace pass, and when a document closes and the reader falls back to
+   * disk.
+   */
+  bumpReaderGeneration: () => void;
+  /**
+   * How many whole-module-graph checks this checker has run since it was built.
+   *
+   * An INSTRUMENT, not a feature — nothing user-visible reads it. It is what
+   * distinguishes a memo that is present from one that is live: a hover on an
+   * unchanged document must cost exactly one, and the next query over that same
+   * document zero.
+   */
+  graphCheckCount: () => number;
 };
 
 /** A native 1-based line as an LSP 0-based one; 0 means "no position". */
@@ -691,6 +717,116 @@ export const createWasmChecker = (
     pushString(exp.srcPush, source);
   };
 
+  /**
+   * What the seed instance currently HOLDS: the (source, entryKey, reader,
+   * generation) `prepare` staged into it, and whether `checkSrcSym` has since
+   * run over that staging. One entry, because an editor request asks about one
+   * document.
+   *
+   * The last two components are both about the READER, and they answer
+   * different questions — an entry's own text is unchanged when a DEPENDENCY
+   * moves, so the first two components cannot see a cross-file edit at all.
+   * `read` is WHICH reader (two callers with different sibling sources are two
+   * different programs, and a test that swaps the reader between two checks of
+   * one entry is the case that found this); `generation` is WHEN, for the one
+   * reader whose own answers move under it — the workspace reader, bumped by
+   * the host whenever an open buffer, the disk or the document set changed
+   * (`bumpReaderGeneration`).
+   */
+  type Staged = {
+    exp: Exports;
+    source: string;
+    entryKey: string;
+    read: ModuleReader;
+    generation: number;
+    checked: boolean;
+  };
+  let staged: Staged | undefined;
+  let readerGeneration = 0;
+  // Monotonic id of the last staging STARTED — the publish guard below.
+  let stagingEpoch = 0;
+  // Whole-module-graph checks run since this checker was built. An instrument,
+  // not a feature: it is what proves the memo is live (a second query over an
+  // unchanged document must cost zero) rather than merely present.
+  let graphChecks = 0;
+
+  /**
+   * `prepare`, unless the instance already holds exactly this staging.
+   *
+   * Publishes the new entry only when no OTHER staging started while this one
+   * awaited its module fetches. Two in-flight requests already clobber each
+   * other's module table (`prepare` calls `modReset`) and always have; the guard
+   * keeps that transient rather than letting the loser record a claim about an
+   * instance the winner has since re-staged.
+   */
+  const ensureStaged = async (
+    exp: Exports,
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+  ): Promise<Staged> => {
+    const held = staged;
+    if (
+      held !== undefined && held.exp === exp &&
+      held.read === read && held.generation === readerGeneration &&
+      held.entryKey === entryKey && held.source === source
+    ) return held;
+    const epoch = ++stagingEpoch;
+    staged = undefined;
+    await prepare(exp, source, entryKey, read);
+    const fresh: Staged = {
+      exp,
+      source,
+      entryKey,
+      read,
+      generation: readerGeneration,
+      checked: false,
+    };
+    if (epoch === stagingEpoch) staged = fresh;
+    return fresh;
+  };
+
+  /**
+   * `ensureStaged` + `checkSrcSym` — the whole-module-graph check every symbol
+   * query needs, run once per staging.
+   *
+   * This is the memo's point: `onHover` is a three-rung ladder (`hoverTypeAt` →
+   * `memberTypeAt` → `typeAliasAt`) over one unchanged document, and a graph
+   * check on `compiler/entry.vl` (26 modules) is seconds, not milliseconds.
+   */
+  const ensurePrepared = async (
+    exp: Exports,
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+  ): Promise<void> => {
+    const s = await ensureStaged(exp, source, entryKey, read);
+    if (s.checked) return;
+    graphChecks++;
+    exp.checkSrcSym();
+    s.checked = true;
+  };
+
+  // The module table is gone (`moduleSurface` resets it and commits one module),
+  // so nothing about the previous staging survives.
+  const dropStaging = (): void => {
+    staged = undefined;
+  };
+
+  // A parse-only pass (`lint` / `formatSrc` / `lexicalTokensAt` /
+  // `declExtentsAt`) re-stages the SOURCE and destroys the checked tables while
+  // leaving the module table alone — so the staging survives exactly when the
+  // text it re-stages is the text the instance already held.
+  const restagedSource = (exp: Exports, source: string): void => {
+    const held = staged;
+    if (held === undefined) return;
+    if (held.exp !== exp || held.source !== source) {
+      staged = undefined;
+      return;
+    }
+    held.checked = false;
+  };
+
   // THE HOST<->SEED ABI GENERATION this checker speaks. Kept in step with the Rust
   // host's `HOST_ABI` and the seed's `hostAbi()` — bump all three in the same commit
   // that changes the contract (the guest->host string element unit, the bulk
@@ -778,8 +914,7 @@ export const createWasmChecker = (
   ): Promise<WasmRange | undefined> => {
     const exp = instantiate();
     if (exp === undefined || !speaksAbi(exp) || !hasSymbols(exp)) return undefined;
-    await prepare(exp, source, entryKey, read);
-    exp.checkSrcSym();
+    await ensurePrepared(exp, source, entryKey, read);
     // Native lines are 1-based; the LSP cursor line is 0-based.
     const occ = exp.defAt(line + 1, character);
     return occ >= 0 ? occRange(exp, occ) : undefined;
@@ -795,8 +930,7 @@ export const createWasmChecker = (
   ): Promise<WasmRange[]> => {
     const exp = instantiate();
     if (exp === undefined || !speaksAbi(exp) || !hasSymbols(exp)) return [];
-    await prepare(exp, source, entryKey, read);
-    exp.checkSrcSym();
+    await ensurePrepared(exp, source, entryKey, read);
     const nativeLine = line + 1;
     const count = exp.refsCountAt(nativeLine, character);
     const out: WasmRange[] = [];
@@ -835,8 +969,7 @@ export const createWasmChecker = (
     // Compile this candidate as its own entry (module 0) + its transitive deps,
     // so its committed graph includes the declaring module IFF the candidate
     // reaches it via imports.
-    await prepare(exp, candidateSource, candidateKey, read);
-    exp.checkSrcSym();
+    await ensurePrepared(exp, candidateSource, candidateKey, read);
 
     // The declaring module's table index — the candidate may not reach it (then
     // it holds no occurrence of the target binding) → no refs here. An import-free
@@ -904,8 +1037,7 @@ export const createWasmChecker = (
       typeof exp.typeStrAt !== "function") {
       return undefined;
     }
-    await prepare(exp, source, entryKey, read);
-    exp.checkSrcSym();
+    await ensurePrepared(exp, source, entryKey, read);
     const len = exp.typeStrAt(line + 1, character);
     if (len <= 0) return undefined;
     return readString(len, (j) => exp.typeStrCharAt(j));
@@ -923,8 +1055,7 @@ export const createWasmChecker = (
       typeof exp.memberTypeStrAt !== "function") {
       return undefined;
     }
-    await prepare(exp, source, entryKey, read);
-    exp.checkSrcSym();
+    await ensurePrepared(exp, source, entryKey, read);
     const len = exp.memberTypeStrAt(line + 1, character);
     if (len <= 0) return undefined;
     return readString(len, (j) => exp.memberTypeStrCharAt(j));
@@ -942,8 +1073,7 @@ export const createWasmChecker = (
       typeof exp.sigAt !== "function") {
       return undefined;
     }
-    await prepare(exp, source, entryKey, read);
-    exp.checkSrcSym();
+    await ensurePrepared(exp, source, entryKey, read);
     // -1 is "nothing callable here"; 0 is a real zero-parameter signature, so
     // the sign is the only thing that separates them.
     const count = exp.sigAt(line + 1, character);
@@ -982,8 +1112,7 @@ export const createWasmChecker = (
       typeof exp.typeAliasAt !== "function") {
       return undefined;
     }
-    await prepare(exp, source, entryKey, read);
-    exp.checkSrcSym();
+    await ensurePrepared(exp, source, entryKey, read);
     const len = exp.typeAliasAt(line + 1, character);
     if (len <= 0) return undefined;
     return readString(len, (j) => exp.typeAliasCharAt(j));
@@ -1003,8 +1132,7 @@ export const createWasmChecker = (
   ): Promise<WasmToken[]> => {
     const exp = instantiate();
     if (exp === undefined || !speaksAbi(exp) || !hasSymbols(exp) || !hasTokens(exp)) return [];
-    await prepare(exp, source, entryKey, read);
-    exp.checkSrcSym();
+    await ensurePrepared(exp, source, entryKey, read);
     const count = exp.tokCount();
     // In a multi-module compile the occurrence table spans EVERY committed module,
     // each carrying its own module-local line/col. Keep only the entry module's
@@ -1050,8 +1178,7 @@ export const createWasmChecker = (
   ): Promise<WasmMemberToken[]> => {
     const exp = instantiate();
     if (exp === undefined || !speaksAbi(exp) || !hasSymbols(exp) || !hasMembers(exp)) return [];
-    await prepare(exp, source, entryKey, read);
-    exp.checkSrcSym();
+    await ensurePrepared(exp, source, entryKey, read);
     const count = exp.memberCount();
     const out: WasmMemberToken[] = [];
     for (let i = 0; i < count; i++) {
@@ -1085,8 +1212,7 @@ export const createWasmChecker = (
   ): Promise<WasmScopeBinding[]> => {
     const exp = instantiate();
     if (exp === undefined || !speaksAbi(exp) || !hasSymbols(exp) || !hasScope(exp)) return [];
-    await prepare(exp, source, entryKey, read);
-    exp.checkSrcSym();
+    await ensurePrepared(exp, source, entryKey, read);
     // Native lines are 1-based; the LSP cursor line is 0-based.
     const count = exp.scopeAt(line + 1, character);
     const out: WasmScopeBinding[] = [];
@@ -1126,8 +1252,7 @@ export const createWasmChecker = (
       exp === undefined || !speaksAbi(exp) || !hasSymbols(exp) ||
       !hasMemberScan(exp)
     ) return [];
-    await prepare(exp, source, entryKey, read);
-    exp.checkSrcSym();
+    await ensurePrepared(exp, source, entryKey, read);
     // Native lines are 1-based; the LSP cursor line is 0-based.
     const count = exp.memberScanAt(line + 1, character);
     const out: WasmMemberCompletion[] = [];
@@ -1170,8 +1295,7 @@ export const createWasmChecker = (
       exp === undefined || !speaksAbi(exp) || !hasSymbols(exp) ||
       !hasUfcsScan(exp)
     ) return [];
-    await prepare(exp, source, entryKey, read);
-    exp.checkSrcSym();
+    await ensurePrepared(exp, source, entryKey, read);
     // Native lines are 1-based; the LSP cursor line is 0-based.
     const count = exp.ufcsScanAt(line + 1, character);
     // The module table is read ONCE and indexed — a candidate names its module by
@@ -1218,8 +1342,7 @@ export const createWasmChecker = (
   ): Promise<WasmInlayCandidate[]> => {
     const exp = instantiate();
     if (exp === undefined || !speaksAbi(exp) || !hasSymbols(exp) || !hasInlay(exp)) return [];
-    await prepare(exp, source, entryKey, read);
-    exp.checkSrcSym();
+    await ensurePrepared(exp, source, entryKey, read);
     const count = exp.inlayScan();
     // A whole-program compile records a hint for EVERY committed module's
     // unannotated decls, each carrying its own module-local line/col. Keep only
@@ -1264,9 +1387,12 @@ export const createWasmChecker = (
       exp === undefined || !speaksAbi(exp) || !hasSymbols(exp) ||
       !hasCrossFile(exp)
     ) return {};
-    // `prepare` commits the entry (table index 0) plus its transitive deps, so
-    // the import/export tables below cover every committed module.
-    await prepare(exp, source, entryKey, read);
+    // Staging commits the entry (table index 0) plus its transitive deps, so
+    // the import/export tables below cover every committed module. No
+    // `checkSrcSym`: the tables are filled by the COMMIT (`modScan`), and the
+    // check never rewrites them — so this query reads a staging a symbol query
+    // left behind, and leaves one a symbol query can finish.
+    await ensureStaged(exp, source, entryKey, read);
 
     // Module KEY by table index — the bridge between an import's resolved key and
     // the export entry's owning module.
@@ -1348,7 +1474,10 @@ export const createWasmChecker = (
     // check needs no module table) — the entry must be committed here even when it
     // has no imports, since we read its EXPORTS. A module's own surface (its
     // exports + its imports' resolved keys) comes from its own tokens, so no
-    // dependency fetch is needed; key resolution is pure string math.
+    // dependency fetch is needed; key resolution is pure string math. The
+    // one-module table this leaves is not a staging any query could reuse, so
+    // the memo's entry goes with it.
+    dropStaging();
     exp.modReset();
     pushString(exp.modKeyPush, entryKey);
     pushString(exp.modSrcPush, source);
@@ -1480,8 +1609,14 @@ export const createWasmChecker = (
     // (correctly — it produces a right answer by another route); diagnostics cannot,
     // because every message read from a mismatched seed would be mis-decoded.
     if (!speaksAbi(exp)) return abiMismatchDiag(exp);
-    await prepare(exp, source, entryKey, read);
+    // `checkSrc` always runs — it is not `checkSrcSym` with the symbol table
+    // off. It alone runs the deep-`is` second pass, so it can report a
+    // diagnostic the symbol check does not, and the store it fills is what this
+    // returns. The STAGING is what the memo saves here.
+    const s = await ensureStaged(exp, source, entryKey, read);
+    graphChecks++;
     exp.checkSrc();
+    s.checked = false; // ran with the symbol table off — the sym tables are gone
     return readDiags(exp);
   };
 
@@ -1508,8 +1643,10 @@ export const createWasmChecker = (
     if (!speaksAbi(exp)) {
       return { bytes: undefined, diagnostics: abiMismatchDiag(exp) };
     }
-    await prepare(exp, source, entryKey, read);
+    const staging = await ensureStaged(exp, source, entryKey, read);
+    graphChecks++;
     const status = exp.compileSrc(); // 0 ok; 1 lex/parse; 2 type; 3 emit
+    staging.checked = false; // the emit path leaves no symbol tables behind
     const diagnostics = readDiags(exp);
     if (status !== 0) return { bytes: undefined, diagnostics };
     const n = exp.rbyteLen();
@@ -1532,6 +1669,7 @@ export const createWasmChecker = (
     }
     // No `prepare`: the formatter is purely syntactic (lex → parse → print) and
     // never resolves imports, so the source is staged directly.
+    restagedSource(exp, source);
     exp.srcReset();
     pushString(exp.srcPush, source);
     const len = exp.formatSrc();
@@ -1586,6 +1724,7 @@ export const createWasmChecker = (
     ) {
       return [];
     }
+    restagedSource(exp, source);
     exp.srcReset();
     pushString(exp.srcPush, source);
     const n = exp.lintSrc();
@@ -1632,6 +1771,7 @@ export const createWasmChecker = (
     ) {
       return [];
     }
+    restagedSource(exp, source);
     exp.srcReset();
     pushString(exp.srcPush, source);
     const n = exp.lexScan();
@@ -1662,6 +1802,7 @@ export const createWasmChecker = (
     ) {
       return [];
     }
+    restagedSource(exp, source);
     exp.srcReset();
     pushString(exp.srcPush, source);
     const n = exp.extentScan();
@@ -1707,6 +1848,17 @@ export const createWasmChecker = (
     }
     return out;
   };
+
+  // A reader answer may have moved (an open buffer changed, the workspace pass
+  // ran, a document closed): this is the key component that carries that — see
+  // `WasmChecker.bumpReaderGeneration`.
+  const bumpReaderGeneration = (): void => {
+    readerGeneration++;
+  };
+
+  // The graph-check counter, for the tests that grade the memo (see
+  // `WasmChecker.graphCheckCount`).
+  const graphCheckCount = (): number => graphChecks;
 
   // The builtin-completion export rides the same seed as the Stage-2+ exports; an
   // older seed lacks it, so this yields [] and the host keeps its TS builtins.
@@ -1754,6 +1906,8 @@ export const createWasmChecker = (
     moduleSurface,
     formatSrc,
     lint,
+    bumpReaderGeneration,
+    graphCheckCount,
   };
 };
 

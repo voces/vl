@@ -278,6 +278,11 @@ const runUnusedExportPass = async (): Promise<void> => {
   // and local-use counts). A host that couldn't instantiate the seed has no
   // checker, so it skips the pass rather than crawling the workspace for nothing.
   if (wasmChecker === undefined) return;
+  // The pass reads the workspace off DISK, so it is the one place that sees a
+  // dependency changed by something other than an open buffer (a branch switch,
+  // another editor). Bump before it crawls: the memo must not outlive a graph
+  // this pass is about to read differently.
+  wasmChecker.bumpReaderGeneration();
   // Determine the project root (same logic as onReferences).
   const openUris = documents.all().map((d) => d.uri);
   // Use the first open document's key to detect the root; fall back to an
@@ -324,6 +329,13 @@ documents.onDidChangeContent(async (event) => {
   connection.console.log(
     `[Server(${process.pid}) ${workspaceFolder}] Document changed: ${event.document.uri}`,
   );
+
+  // ANY open buffer changing moves what `workspaceReader` answers, including
+  // for the OTHER documents that import this one — and their own text is
+  // unchanged, so the checker's prepared-state memo cannot see it. This is the
+  // bump that keeps a hover in an importer from answering with the pre-edit
+  // types of the module just edited.
+  wasmChecker?.bumpReaderGeneration();
 
   // Diagnostics only — running a program is explicit (the `vital.runFile`
   // command / Ctrl+F5), never a side effect of editing. (Auto-running on every
@@ -387,6 +399,16 @@ documents.onDidChangeContent(async (event) => {
     useMapDebounceTimer = undefined;
     runUnusedExportPass().catch(() => {});
   }, UNUSED_EXPORT_DEBOUNCE_MS);
+});
+
+// A closed document's reader answer changes from its BUFFER to what is on disk
+// — the two differ whenever the buffer was dirty. Nothing else here notices, so
+// the memo is retired the same way an edit retires it.
+documents.onDidClose((event) => {
+  connection.console.log(
+    `[Server(${process.pid}) ${workspaceFolder}] Document closed: ${event.document.uri}`,
+  );
+  wasmChecker?.bumpReaderGeneration();
 });
 
 // On document SAVE: trigger the workspace pass immediately (clear the debounce
