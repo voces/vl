@@ -37,10 +37,12 @@ was FIXED is the common case and the whole point).
 reported in the fourth column and exits 0, so a doc can gain rows with no witness and every
 gate in the ladder stays green — the row discipline was enforced by nothing. That is the same
 shape as the defects this file exists to catch: a real condition that no instrument reports.
-It is a FLAG rather than the default because `silent-class-inventory-2.md` currently has ten
-rows whose filed behaviour no longer reproduces, and a gate that reds for pre-existing debt in
-a doc the author is not editing gets bypassed rather than obeyed. The per-PR enforcement lives
-in `tests/vl_inventory_rows_test.ts`, which asserts the STRUCTURE (a known-outcome status line
+It is a FLAG rather than the default so a doc carrying pre-existing debt can still be graded
+by an author who is not editing it — a gate that reds for someone else's rows gets bypassed
+rather than obeyed. The debt that made it a flag is gone: both inventories are `--strict` in
+`gate.sh`, and `inventory-2`'s claim of ten unreproducing rows was already false when the
+second directory joined the row. The per-PR enforcement lives in
+`tests/vl_inventory_rows_test.ts`, which asserts the STRUCTURE (a known-outcome status line
 and a repro block) without running anything.
 
 DOC SHAPE IT READS

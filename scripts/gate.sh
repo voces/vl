@@ -158,7 +158,14 @@ run "mono-tyaram-grid"         bash scripts/mono-tyaram-grid.sh
 # (`docs/internals/inventory/D1042.md`). The checker reads either form and a directory
 # holding no rows yet falls back to the monolith named in its own README, so this line is
 # the same before and after the split lands and does not need touching on merge day.
-run "filed witnesses"          "$PY" scripts/check-filed-witnesses.py --strict docs/internals/inventory
+#
+# BOTH INVENTORIES. `inventory-2/` holds the coverage gaps of inventory #1 and numbers
+# independently — D1-D14 exist in both as different defects, which is why it is a second
+# directory and not a merge. Its 17 rows were re-run by NOTHING: both TS halves of the row
+# discipline already list both paths, and this line named one. They graded `17 as filed`
+# the day they were added here, so the gap was latent rather than a live wrong claim —
+# which is exactly the state a filed row is supposed to decay into unnoticed.
+run "filed witnesses"          "$PY" scripts/check-filed-witnesses.py --strict docs/internals/inventory docs/internals/inventory-2
 # THE OTHER HALF: a row that stopped EXISTING. #2405 resolved a conflict in the inventory's
 # tail and deleted a ROW, with its citations left standing, and every gate was green —
 # the instruments above all read the rows that are there. ~0.2s, and it also runs inside
