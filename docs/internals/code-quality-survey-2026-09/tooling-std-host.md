@@ -448,10 +448,34 @@ Four pairs that read like duplicates are KEPT, because each difference is load-b
 named rule and has a witness in the landing PR: `txSpacesEnd` skips spaces where
 `klIndentEnd` skips tabs too, `txDigitsEnd` eats thousands commas where `txPlainDigitsEnd`
 does not, `txWordIs` is case-sensitive where `txWordIsI` folds, and `scaWordIsI` takes the
-leading boundary its caller does not. Left for a second slice: the five per-line
-literal-skipping walks (`siScanHoles`, `siNegAnswerLine`, `siRetCallOf`, `siLineReturns`,
-`siHeaderNames`), which differ only in the body they run at each index, and the
-import-region tracker the two comment scans each keep a copy of.
+leading boundary its caller does not.
+
+**The second slice landed 2026-09-05: one line walk, one header-region step.** The five
+per-line literal-skipping walks (`siScanHoles`, `siNegAnswerLine`, `siRetCallOf`,
+`siLineReturns`, `siHeaderNames`) differed only in the work done at each index, so they are
+one `siWalkLine(s, a, e, kind)` and six named works — each a plain function
+`(s, _a, e, i) -> i32` answering with the next index to visit, a negative answer meaning
+"stop, and the complement is where". `siRetCallOf` reads its name back from the stop index
+rather than carrying a value out of the walk. The import-region tracker the two comment
+scans each kept a copy of is `txHeaderStep(s, k, le, region)`, returning a two-bit region
+(bit 0 inside a multi-line `import … from`, bit 1 code seen), and `txIsHeader` reads the
+region instead of a separate flag.
+
+**And the walk's work is an `i32` kind rather than a function value, which is a MEASUREMENT
+and not a preference.** The natural spelling is
+`siWalkLine(s, a, e, work: (string, i32, i32, i32) => i32)`; VL supports it and it compiles.
+It costs the seed **+92,710 bytes, +4.31%** (2,153,443 → 2,246,153), and the cost is not the
+five conversions — a single unused function-typed parameter with one call, added to master's
+`lint.vl` and nothing else, costs **+92,002 bytes**, and the same probe at a signature
+nothing else in the tree has (`(boolean) => boolean`) costs **+91,982**. The mechanism is in
+the disassembly: the module gains `(table $0 4997 funcref)` and an `elem` segment listing
+**every one of the compiler's functions**, plus 298 more functions (5,003 → 5,301). One
+address-taken function pays for all 4,997. A four-line program pays only +101 bytes
+(164 → 265), so this is a whole-program cost, not a per-call one, and it is why the
+compiler's own source had no function value before this slice. Narrowing the elem segment to
+the functions whose address is actually taken would make the callback spelling free; until
+then the kind selector costs +154 bytes and, at `vl check` over `compiler/typecheck.vl`,
++0.5% against the function value's +2.0%.
 
 ---
 
