@@ -1,0 +1,153 @@
+// @run
+// @skip the fs floor needs a host that can build a WasmGC value — V8 cannot; asserted natively by tests/selfhost_native_align_test.ts
+// @log wrote
+// @log 16
+// @log 0
+// @log 15
+// @log 4
+// @log 0
+// @log 3
+// @log 4
+// @log 12
+// @log 0
+// @log 0
+// @log 44
+// @log 12
+// @log 4
+// @log 11
+// @log 28
+// @log 28
+// @log 28
+// @log 28
+// @log 44
+// @log 31
+// @log true
+// `readFileInto` AND `readFileRangeInto` — a file read straight into linear memory.
+//
+// Every other read in `std:fs` allocates: the bytes arrive in a `u8[]` as large as what
+// was asked for. These two write into a `Buf` the caller already owns, so a file can be
+// read into memory a host or a parser can address without a second copy of it existing.
+// The count is what a caller reads: at most the room left in the buffer, and short when
+// the file ends first.
+//
+// It is `@skip`ped under the V8 harness and asserted natively for the same reason
+// `tests/cases/std/fs-range.vl` is: the floor's intrinsics take a `u8[]`, a WasmGC array
+// JS can neither read nor build.
+//
+// HERMETIC AS FAR AS IT CAN BE, on the same terms as the range case: one file at a FIXED
+// path under `/tmp` with FIXED contents, so a concurrent second run of this case writes
+// the same sixteen bytes. Nothing outside `/tmp` is touched.
+import { Buffer, loadU8 } from "std:buffer"
+import {
+  IoError,
+  readFileInto,
+  readFileRange,
+  readFileRangeInto,
+  writeFile,
+} from "std:fs"
+
+const p = "/tmp/vl-std-fs-into.bin"
+
+// Byte `i` holds `i`, so a byte read back is its own file offset: a seek off by one
+// changes every number below, which a run of identical bytes would hide.
+const data: u8[] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+const w = writeFile(p, data)
+if w != null { print("write failed: " + w.msg) } else { print("wrote") }
+
+// A buffer with room to spare takes the whole file and says how much arrived.
+const big = Buffer(64)
+const all = readFileInto(p, big, 0)
+if all is IoError {
+  print("all failed: " + all.msg)
+} else {
+  print(all)
+  print(loadU8(big, 0))
+  print(loadU8(big, 15))
+}
+
+// A buffer SMALLER than the file fills EXACTLY, and the count says so — this is the
+// truncation the return value is there to report, since no error is raised for it.
+const small = Buffer(4)
+const cut = readFileInto(p, small, 0)
+if cut is IoError {
+  print("cut failed: " + cut.msg)
+} else {
+  print(cut)
+  print(loadU8(small, 0))
+  print(loadU8(small, 3))
+}
+
+// STRADDLING THE END is short, not an error: four bytes exist from offset 12.
+const tail = readFileRangeInto(p, 12, big, 0)
+if tail is IoError {
+  print("tail failed: " + tail.msg)
+} else {
+  print(tail)
+  print(loadU8(big, 0))
+}
+
+// AT OR PAST THE END is 0 and still not an error — that is how a scan knows it has
+// finished. An EMPTY buffer is 0 for the same reason: no room is not a failure.
+const past = readFileRangeInto(p, 16, big, 0)
+if past is IoError { print("past failed: " + past.msg) } else { print(past) }
+const zero = Buffer(0)
+const none = readFileInto(p, zero, 0)
+if none is IoError { print("none failed: " + none.msg) } else { print(none) }
+
+// AND A BUFFER WITH NO ROOM STILL ANSWERS ABOUT THE FILE: a missing one is `ENOENT` even
+// when there is nowhere to put its bytes, which is where these two have to agree with
+// `readFileRange(p, 0, 0)` rather than report a success that never looked.
+const gone = readFileInto("/tmp/vl-std-fs-into-absent.bin", zero, 0)
+if gone is IoError { print(gone.code) } else { print("should have failed") }
+
+// A WINDOW INSIDE THE BUFFER: the file from offset 4 on, landing at byte 3 of the
+// buffer — twelve bytes, since the file ends before the buffer does. What makes a
+// destination offset worth having is exactly this: a caller assembles one buffer out
+// of several reads without moving any bytes afterwards.
+const asm = Buffer(24)
+const part = readFileRangeInto(p, 4, asm, 3)
+if part is IoError {
+  print("part failed: " + part.msg)
+} else {
+  print(part)
+  print(loadU8(asm, 3))
+  print(loadU8(asm, 10))
+}
+
+// A negative file offset, a negative destination offset and one past the end of the
+// buffer are all EINVAL (28), refused by the module before the syscall so the answer
+// does not depend on the host. An empty path is EINVAL too.
+const negOff = readFileRangeInto(p, 0 - 1, big, 0)
+if negOff is IoError { print(negOff.code) } else { print("should have failed") }
+const negDst = readFileInto(p, small, 0 - 1)
+if negDst is IoError { print(negDst.code) } else { print("should have failed") }
+const farDst = readFileInto(p, small, 5)
+if farDst is IoError { print(farDst.code) } else { print("should have failed") }
+const noPath = readFileInto("", big, 0)
+if noPath is IoError { print(noPath.code) } else { print("should have failed") }
+
+// A missing file is ENOENT (44) and a directory is EISDIR (31), the codes the other
+// reads answer, so one `code` comparison serves every reader in the module.
+const miss = readFileInto("/tmp/vl-std-fs-into-absent.bin", big, 0)
+if miss is IoError { print(miss.code) } else { print("should have failed") }
+const dir = readFileInto("/tmp", big, 0)
+if dir is IoError { print(dir.code) } else { print("should have failed") }
+
+// And the bytes are the SAME bytes `readFileRange` answers for the same window, which
+// is the property that lets a caller move a scan from one to the other.
+const win = Buffer(16)
+const got = readFileRangeInto(p, 5, win, 0)
+const want = readFileRange(p, 5, 16)
+if got is IoError {
+  print("got failed: " + got.msg)
+} else if want is IoError {
+  print("want failed: " + want.msg)
+} else {
+  let same = got == want.length
+  let i = 0
+  while i < want.length {
+    if loadU8(win, i) != want[i] { same = false }
+    i = i + 1
+  }
+  print(same)
+}
