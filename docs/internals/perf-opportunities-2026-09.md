@@ -25,7 +25,7 @@ QUICK = a day, no design question. STRUCT = a design track.
 | 10 | `declaredSlotOf` → per-function side index built in `buildLocals` | **1.1%** self time | M | reset per function, 5 sites | byte-identical seed; `regress.py` | STRUCT |
 | 11 | `fnStmtsPosOf` → reverse index `nodeIx → fe` after mono: 19,106 calls, **25.9 M scan steps** | closures axis 2.22 → ~1 | M | 1 in-place write, `emit_mono.vl:6353` | byte-identical seed; the closures axis under its 3.2 bar | STRUCT |
 | 12 | Destringify type names — `tyTopIndexOf` is a per-CHARACTER walk over a type-name string, **4.94% self** | 4.9% plus most of `__str_eq__`'s tail | L | canon / rep | `docs/internals/registry-by-type-id.md` steps 4–6; byte-identity | STRUCT |
-| 13 | ✅ **LANDED (§G1 + §G2)** — but NOT as prescribed: the early-out never fires (0 of 5.4 M walks found a top-level `|`) and the suffix test already ran first. What the measurement supported is a byte pre-scan in front of `tyTopIndexOf`'s ladder, which serves every caller | §G1 `vl build` **0.568× / 0.725×** on the two outliers (medians of six interleaved readings), 0.922× on the control; §G2 a further **0.509× / 0.866×** on top, from the ladder's own 33.7× re-derivation | S | none — a sound over-approximation in front of the walk | byte-identical seed and codegen; `regress.py` no cell moved; all 2,996 corpus modules identical; `rep-fuzz-check.sh` | QUICK |
+| 13 | ✅ **LANDED (§G1 + §G2)** — but NOT as prescribed: the early-out never fires (0 of 5.4 M walks found a top-level `|`) and the suffix test already ran first. What the measurement supported is a byte pre-scan in front of `tyTopIndexOf`'s ladder, which serves every caller | §G1 `vl build` **0.568× / 0.725×** on the two outliers (medians of six interleaved readings), 0.922× on the control; §G2 a further **0.516× / 0.830×** on top, from the ladder's own 33.7× re-derivation | S | none — a sound over-approximation in front of the walk | byte-identical seed and codegen; `regress.py` no cell moved; all 2,996 corpus modules identical; `rep-fuzz-check.sh` | QUICK |
 
 Two corrections are load-bearing: **`vl check std/json.vl` is 40 ms, not 6.5 s** (§B1), and
 **`tyTopIndexOf` is not a name-keyed registry; `collectA` never calls it** (§B4).
@@ -1378,15 +1378,16 @@ predicate; none of them wanted it enough to matter, which is the finding.
 
 §G1's closing paragraph named the next term as the CALL COUNT and guessed at where it
 came from: "`nameIsI32Array` asks five arms that each re-test the same name". A counter
-build says the count is real and the attribution is wrong. Every number below is taken on
-`b437a3ae8` (master with §G1 merged), by the same method §G1 used — counters compiled into
-a scratch artifact, dumped from the tail of `emitProgram` through a distinctive `emitFail`,
-with the seed never written.
+build says the count is real and the attribution is wrong. The counter and profile numbers
+are taken on `b437a3ae8` (master with §G1 merged, before #2648 and #2649 landed) by the
+same method §G1 used — counters compiled into a scratch artifact, dumped from the tail of
+`emitProgram` through a distinctive `emitFail`, with the seed never written; the CPU and
+identity tables are re-taken on the merged tree at `13ae7ff3d`.
 
 `VL_PROFILE_GUEST` first, because it is what points at the entry. Of the first outlier's
-205 samples, **196 (95.6%) have `nameIsRefArray`, `refArrShapeKind` or `refArrElemName`
-somewhere on the stack**, and the frame just above the OUTERMOST of those three is one
-function in 91% of them:
+205 samples, **196 (95.6%) carry `nameIsRefArray`, `refArrShapeKind`, `refArrElemName` or
+`refArrElemNameIf` somewhere on the stack**, and the frame just above the OUTERMOST of
+those is one function in 91% of them:
 
 | entry caller (the frame above the outermost ladder frame) | of the whole profile | of the ladder's samples |
 | --- | ---: | ---: |
@@ -1401,7 +1402,8 @@ node-keyed classifier, and what happens under it is a recursion:
 | counter | `arm-list-elem-pin-at-depth` | `global-reference-chain-cost` |
 | --- | ---: | ---: |
 | OUTERMOST ladder calls (re-entrancy depth 0) | 14,076 | 8,653 |
-| distinct names those outermost calls ask about | **10** | **5** |
+| distinct names the ladder is asked about at all | **11** | **5** |
+| ...of them, distinct at an outermost call | **10** | not taken |
 | `nameIsRefArray` + `refArrShapeKind` + `refArrElemName` calls | 474,202 | 100,471 |
 | ...per outermost call | **33.7×** | **11.6×** |
 | `nameIsArray` calls | 5,251,443 | 1,068,680 |
@@ -1441,20 +1443,31 @@ Measured after, same counters:
 | characters `tyHasSepByte` visited | 17,213,995 | 12,788,698 | 1.35× |
 
 `vl build` CPU, user+sys per build over 25-30-build batches, min over five interleaved
-batches per arm, the whole procedure run twice at loads from 15 to 156:
+batches per arm, and that whole procedure run three times at loads from 7 to 156, because
+one reading of a ratio on this box is not a reading. The table is the merged-tree run at
+load 7-42; the two earlier readings were taken against §G1's seed on the pre-merge pin:
 
-| program | A (§G1's seed) | B (this) | ratio | reading 2 |
+| program | A (master) | B (this) | ratio | the two earlier readings |
 | --- | ---: | ---: | ---: | ---: |
-| `arm-list-elem-pin-at-depth` | 0.1695 s | 0.0863 s | **0.509** (1.96×) | 0.531 (1.88×) |
-| `global-reference-chain-cost` | 0.1626 s | 0.1408 s | **0.866** (1.16×) | 0.880 (1.14×) |
-| control `deep-is-json-shape-walk` | 0.1832 s | 0.1860 s | 1.015 | 0.998 |
+| `arm-list-elem-pin-at-depth` | 0.1707 s | 0.0880 s | **0.516** (1.94×) | 0.509, 0.531 |
+| `global-reference-chain-cost` | 0.1201 s | 0.0997 s | **0.830** (1.20×) | 0.866, 0.880 |
+| control `deep-is-json-shape-walk` | 0.1879 s | 0.1866 s | 0.993 | 1.015, 0.998 |
 
-Per-test wall through the corpus oracle, min of 6 interleaved rounds at load 40-56 (the
-oracle's own per-case work dilutes the ratio, which is why the CPU table above is the one
-to read for the mechanism): 116 → 79 ms, 95 → 86 ms, control 154 → 147 ms. The
-self-compile is 3.72 → 3.74 CPU-s, min of 5 interleaved — unchanged at this box's
-resolution, and expected: the compiler's own type names are shallow, so the recursion this
-removes barely runs on it.
+Per-test wall through the corpus oracle, min of 6 interleaved rounds (the oracle's own
+per-case work dilutes the ratio, which is why the CPU table above is the one to read for
+the mechanism): 115 → 85 ms, 99 → 88 ms, control 157 → 165 ms — the control's 1.05 is the
+same load noise the whole of `test-timing-2026-09.md` §2 is about, and the CPU A/B reads
+0.993 on it. The self-compile is 3.88 → 3.78 CPU-s, min of 6 interleaved (an earlier
+reading 4.23 → 3.85): at or just past this box's resolution, and expected either way —
+the compiler's own type names are shallow, so the recursion this removes barely runs on
+it.
+
+Identity, pinned to `13ae7ff3d`: master is its own fixpoint, the candidate is its own
+fixpoint, and the candidate seed compiling the pinned master source reproduces master's
+fixpoint byte for byte. All 2,998 `tests/cases/**` modules are identical under both seeds
+— 2,452 byte-for-byte, 546 refused with identical text, 0 differences. `regress.py` moved
+no cell and `--verify-fresh` is clean; `rep-fuzz-check.sh` is exact; the seed grows 899
+bytes (+0.04%).
 
 **What is left, named, with the design question each carries.**
 
