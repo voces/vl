@@ -2026,3 +2026,61 @@ Deno.test({
     }
   },
 });
+
+// D1644 — A BARE LAMBDA STATEMENT ROUND-TRIPS, and the way it did not is the printer
+// reading a node's SHAPE where it needed the node's NAME.
+//
+// An arrow lambda parses to a nameless `FuncDecl`, the same node a `function`
+// declaration parses to. `emitStatement`'s `FuncDecl` arm sent both to `emitFunction`,
+// whose header is `function` + the name — so a nameless one printed `function(x: i32) x`,
+// which is not VL syntax (`function` has no nameless spelling). `vl fmt` refuses to write
+// unparseable text, so the symptom was `formatter produced invalid output` (rc 3) on a
+// legal program, at every position: module scope, a function body, annotated or not.
+//
+// The assertions that matter are rc 0 and byte-identity with the canonical source: a
+// `function(` spelling either trips the round-trip gate or shows up in the output.
+Deno.test({
+  name: "vl-fmt: a bare lambda statement round-trips (arrow syntax, not `function(`)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const src = [
+      "(x: i32) => x",
+      "(y: i32): i32 => y",
+      "() => {",
+      "  print(1)",
+      "}",
+      "function outer(): i32 {",
+      "  (n: i32) => n",
+      "  0",
+      "}",
+      "print(outer() + 7)",
+      "",
+    ].join("\n");
+    const r = await run([], src);
+    if (r.code !== 0) {
+      throw new Error(`vl fmt rejected valid source (rc ${r.code}):\n${r.err}`);
+    }
+    if (r.out.includes("function(")) {
+      throw new Error(
+        `a nameless \`function\` header leaked into the output:\n${r.out}`,
+      );
+    }
+    if (r.out !== src) {
+      throw new Error(`already-canonical source was reformatted:\n${r.out}`);
+    }
+    const again = await run([], r.out);
+    if (again.code !== 0 || again.out !== r.out) {
+      throw new Error(`not idempotent (rc ${again.code}):\n${again.out}`);
+    }
+    // The output is not merely parseable — it still means the program it came from.
+    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_lambda_stmt_" });
+    const file = `${dir}/main.vl`;
+    await Deno.writeTextFile(file, r.out);
+    const ran = await runOn("run", file);
+    if (ran.code !== 0 || ran.out !== "7\n") {
+      throw new Error(
+        `formatted output did not run (rc ${ran.code}): ${JSON.stringify(ran.out)}\n${ran.err}`,
+      );
+    }
+  },
+});
