@@ -38,8 +38,12 @@ if [ "${1:-}" != "--no-build" ]; then
 fi
 
 NAMES=(); PIDS=(); STARTS=()
-run() { NAMES+=("$1"); STARTS+=("$(date +%s.%N)"); shift
-        ( "$@" > "$LOGS/${#PIDS[@]}.log" 2>&1 ) & PIDS+=($!); }
+# The TIME column is each gate's OWN wall time, which is why the subshell stamps its
+# finish into `$LOGS/<i>.t`. The report loop `wait`s in index order and a job that already
+# exited returns from `wait` instantly, so an elapsed computed there is the loop's clock,
+# not the gate's — 19 of 21 rows read the same number. No stamp falls back to that reading.
+run() { local i=${#PIDS[@]}; NAMES+=("$1"); STARTS+=("$(date +%s.%N)"); shift
+        ( "$@" > "$LOGS/$i.log" 2>&1; rc=$?; date +%s.%N > "$LOGS/$i.t"; exit $rc ) & PIDS+=($!); }
 
 run "deno task test"           deno task test
 run "ci-native"                env SELFHOST_NATIVE_ALIGN=1 bash -c \
@@ -128,7 +132,9 @@ FAIL=0
 printf '\n%-22s %8s  %s\n' "GATE" "TIME" "RESULT"
 for i in "${!PIDS[@]}"; do
   wait "${PIDS[$i]}"; rc=$?
-  el=$(echo "$(date +%s.%N) - ${STARTS[$i]}" | bc)
+  fin=$(cat "$LOGS/$i.t" 2>/dev/null)
+  [ -n "$fin" ] || fin=$(date +%s.%N)
+  el=$(echo "$fin - ${STARTS[$i]}" | bc)
   if [ $rc -eq 0 ]; then printf '%-22s %7.1fs  ok\n' "${NAMES[$i]}" "$el"
   else FAIL=1; printf '%-22s %7.1fs  FAILED rc=%d   %s\n' "${NAMES[$i]}" "$el" "$rc" "$LOGS/$i.log"; fi
 done
