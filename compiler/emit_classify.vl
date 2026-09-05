@@ -6447,49 +6447,80 @@ function exprIsStructEq(binIx: i32, fnIx: i32) {
 }
 
 // ── list `==` and `+` detection: which functions need the list-op frames ──────
-// The list-op operand kind of an expression: `0` an i32 list, `3` a string list, `4` an
-// `i32[][]`, or -1 for a non-list or an unsupported element kind. Order mirrors `emitIndex`'s
-// receiver dispatch.
-function listOpKindOf(exprIx: i32, fnIx: i32) {
-  if exprIx < 0 { return -1 }
-  if exprString(exprIx, fnIx) { return -1 }
-  if exprStringArray(exprIx, fnIx) { return 3 }
-  // The four distinct-backing scalar lists decline here. Falling through to `exprArray`, which
-  // claims them, would answer `0` — the i32 core, whose wrapper and backing are not theirs.
-  // The `-1` is the right answer rather than a new code: this home means which of the three
-  // old cores, and `eqgListKindOfBin` claims these one ladder over (D755).
-  if exprF64Array(exprIx, fnIx) { return -1 }
-  if exprI64Array(exprIx, fnIx) { return -1 }
-  if exprF32Array(exprIx, fnIx) { return -1 }
-  if exprU8Array(exprIx, fnIx) { return -1 }
+// Which list rep claims an expression: `LR_NONE` 0, string list 1, f64 2, i64 3, f32 4, u8 5,
+// ref 6, the i32 core 7. `lrSlot` is the ref list's `rlElemKindTbl` slot (-1 on every other
+// arm), read here because both consumers need it and neither may ask twice.
+type ListRep = { lrRep: i32, lrSlot: i32 }
+const LR_NONE = 0
+const LR_STR = 1
+const LR_F64 = 2
+const LR_I64 = 3
+const LR_F32 = 4
+const LR_U8 = 5
+const LR_REF = 6
+const LR_I32 = 7
+
+// The one ladder `listOpKindOf` and `catListKindOfExpr` run, so the two cannot classify one
+// expression two ways. `exprArray` claims the four distinct-backing scalar lists, so it asks
+// last or a scalar list answers as the i32 core. The other `expr*Array` consumers run their
+// own orders and are deliberately not this ladder.
+function exprListRep(exprIx: i32, fnIx: i32): ListRep {
+  const none: ListRep = { lrRep: LR_NONE, lrSlot: -1 }
+  if exprIx < 0 { return none }
+  if exprString(exprIx, fnIx) { return none }
+  if exprStringArray(exprIx, fnIx) { return lrOf(LR_STR) }
+  if exprF64Array(exprIx, fnIx) { return lrOf(LR_F64) }
+  if exprI64Array(exprIx, fnIx) { return lrOf(LR_I64) }
+  if exprF32Array(exprIx, fnIx) { return lrOf(LR_F32) }
+  if exprU8Array(exprIx, fnIx) { return lrOf(LR_U8) }
   if exprRefArray(exprIx, fnIx) {
-    const slot = refListSlotOfExpr(exprIx, fnIx)
-    if slot >= 0 && slot < rlElemKindTbl.length {
-      if rlElemKindTbl[slot] == 4 { return 4 }
+    const ref: ListRep = {
+      lrRep: LR_REF,
+      lrSlot: refListSlotOfExpr(exprIx, fnIx),
     }
+    return ref
+  }
+  if exprArray(exprIx, fnIx) { return lrOf(LR_I32) }
+  none
+}
+
+// A rep with no ref slot — every arm but `LR_REF`.
+function lrOf(rep: i32): ListRep {
+  const r: ListRep = { lrRep: rep, lrSlot: -1 }
+  r
+}
+
+// The list-op operand kind of an expression: `0` an i32 list, `3` a string list, `4` an
+// `i32[][]`, or -1 for a non-list or an unsupported element kind. The four distinct-backing
+// scalar lists decline: `-1` is the right answer rather than a new code, since this home means
+// which of the three old cores and `eqgListKindOfBin` claims them one ladder over (D755).
+function listOpKindOf(exprIx: i32, fnIx: i32) {
+  const lr = exprListRep(exprIx, fnIx)
+  if lr.lrRep == LR_STR { return 3 }
+  if lr.lrRep == LR_REF {
+    if rlSlotIsKindList(lr.lrSlot, 4) { return 4 }
     return -1
   }
-  if exprArray(exprIx, fnIx) { return 0 }
+  if lr.lrRep == LR_I32 { return 0 }
   -1
 }
 
 // ── list `+` concat rep detection — the one home ──────────────────────────────
 // The list rep an expression concatenates over, in `listBuildKindOfVKind`'s alphabet, or -1
-// for a non-list. Same ladder order as `listOpKindOf`, so the two cannot classify one
-// expression two ways; what differs is the accept set, since a concat inspects no element.
+// for a non-list. `listOpKindOf`'s ladder, read through a wider accept set: a concat inspects
+// no element, so the four scalar reps answer here where the list-op home declines them.
 export function catListKindOfExpr(exprIx: i32, fnIx: i32) {
-  if exprIx < 0 { return -1 }
-  if exprString(exprIx, fnIx) { return -1 }
-  if exprStringArray(exprIx, fnIx) { return 3 }
-  if exprF64Array(exprIx, fnIx) { return 4 }
-  if exprI64Array(exprIx, fnIx) { return 6 }
-  if exprF32Array(exprIx, fnIx) { return 7 }
-  if exprU8Array(exprIx, fnIx) { return 10 }
-  if exprRefArray(exprIx, fnIx) {
-    if refListSlotOfExpr(exprIx, fnIx) >= 0 { return 1 }
+  const lr = exprListRep(exprIx, fnIx)
+  if lr.lrRep == LR_STR { return 3 }
+  if lr.lrRep == LR_F64 { return 4 }
+  if lr.lrRep == LR_I64 { return 6 }
+  if lr.lrRep == LR_F32 { return 7 }
+  if lr.lrRep == LR_U8 { return 10 }
+  if lr.lrRep == LR_REF {
+    if lr.lrSlot >= 0 { return 1 }
     return -1
   }
-  if exprArray(exprIx, fnIx) { return 0 }
+  if lr.lrRep == LR_I32 { return 0 }
   -1
 }
 
