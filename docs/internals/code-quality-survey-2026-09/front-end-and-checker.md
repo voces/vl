@@ -37,7 +37,7 @@ live clause-2 violation with a three-arm witness (§3.1).
 | 7 | `checkCallNode` (996 lines) splits three ways at 2 live locals each; the 525-line member arm holds 31 of the 52 untested diagnostics (§6.2, §8) | readability plus a named test target | M | low | byte-identical seed |
 | 8 | `jwKids` (`json_walk.vl:575`) is `nodeChildren` minus the annotation slots, maintained by hand (§2.2) — **landed** | a new `Node` variant must be added twice, once outside the ladder ratchet | S | low | byte-identical seed |
 | 9 | 66 of 750 exports have no cross-module use, 5 have none anywhere; no gate sees this (§4.2) | 21 exported mutable tables in `ast.vl` alone | S | none | `lint-self.sh` + `deno task test`; the LSP's own `unused-export` pass |
-| 10 | `initChecker`'s contract says it resets all checker state; it resets 244 bindings and `checkProgramNode`'s prologue resets a **disjoint** 37 (§7.1) | no rule says where a new table goes | S | low | byte-identical seed if only the comment changes |
+| 10 | `initChecker`'s contract says it resets all checker state; it resets 244 bindings and `checkProgramNode`'s prologue resets a **disjoint** 37 (§7.1) — **landed** | no rule says where a new table goes | S | low | byte-identical seed if only the comment changes |
 
 ## 2 · Duplication
 
@@ -208,6 +208,19 @@ deep-`is` pass, so the pass-0 collect tables want resetting per walk rather than
 invocation — but nothing says so, and `initChecker`'s sentence is false as written. A new
 module-level table has two places it could go and no rule to choose by. Size S (a comment, or a
 `resetPerProgram()` named function). Risk low.
+
+**Done 2026-09-05**, by moving the 37 into `initChecker` rather than by naming a second
+surface — and the guess above does not hold. That second `checkProgram` runs its own
+`initChecker()` first (`jwSecondPass`, `driver.vl:580`), as do all four other call sites
+(`compileSrc`, `checkSrc`, `checkSrcSym`, and `modCompile` through its caller), so the two
+sets had the same lifetime and the split was drift, not design. Measured, not argued: with
+the 37 moved, `compile(candidate, pre-change source)` is byte-identical to the pre-change
+compiler and all 2,972 `tests/cases` fixtures emit identical modules, which is what a write
+between `initChecker` and the walk would have broken. `checkProgram` now carries the
+precondition in its own header and enforces it: `initChecker` arms `checkerArmed`,
+`checkProgram` consumes it, and an unarmed entry is an `internal:` diagnostic on the
+checker's own channel rather than a trap. `checkProgramNode` is 410 lines to 373,
+`initChecker` 331 to 373.
 
 ### 3.3 · Three renderings of a token kind in a diagnostic
 
@@ -539,6 +552,9 @@ byte-identical seed.
 `initChecker`'s header (`typecheck.vl:2983`): "Reset all checker module state, then intern the
 well-known primitives and the global scope. Call once before checking." It resets 244 bindings;
 37 more are reset in `checkProgramNode`, and the two sets do not intersect. See §3.2.
+
+**Done 2026-09-05** — the sentence is true as written: the 37 moved into `initChecker`, which
+is now the only reset surface, so a new checker module table has one place to go. See §3.2.
 
 ### 7.2 · `mkTok` and `LexResult` are exported and used only inside `lexer.vl`
 

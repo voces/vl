@@ -405,6 +405,12 @@ export type Checker = {
 // point `checkProgram(root)` and reads `T.diags`.
 export let T: Checker = { tys: [], scopes: [], diags: [], curRet: -1 }
 
+// The `initChecker` then `checkProgram` protocol, enforced rather than stated: every table
+// `checkProgram` fills is emptied in `initChecker`, so a second walk on an unarmed instance
+// reads the previous program's rows. `initChecker` arms this, `checkProgram` consumes it,
+// and consuming it when it is already clear is an `internal:` diagnostic, never a trap.
+let checkerArmed = false
+
 let symDeclScope: {[string]: i32}[] = []
 
 // The open-scope span stack, pushed and popped in lockstep with `symDeclScope`: the top is
@@ -3011,8 +3017,9 @@ function jwReset() {
   0
 }
 
-// Reset all checker module state, then intern the well-known primitives and the
-// global scope. Call once before checking.
+// Reset all checker module state, then intern the well-known primitives and the global
+// scope. Call once before checking: `checkProgram` assumes it, and this is the only reset
+// surface, so a new checker module table belongs here and nowhere else.
 export function initChecker() {
   jwReset()
   redunReset()
@@ -3199,6 +3206,48 @@ export function initChecker() {
   inferStack = []
   inferObserved = -1
   inferSawErr = false
+  // Pass 0 and pass 1's collect tables, reset here with everything else: every
+  // `checkProgram` reaches its walk through a caller that ran `initChecker` first
+  // (`compileSrc`, `checkSrc`, `checkSrcSym`, `jwSecondPass`), so this is the one
+  // reset surface, and a new checker module table has one place to go.
+  cStructTyIxs = []
+  cStructTyIxSet = []
+  cStructNames = []
+  cVariantMemberTyIxs = []
+  cVariantMemberTyIxSet = []
+  annPendingVariantTyIxs = []
+  annPendingVariantTyIxSet = []
+  cUnionTyIxs = []
+  cUnionTyIxSet = []
+  cUnionNames = []
+  gaAppTyIxs = []
+  gaAppTyIxSet = []
+  gaAppHeads = []
+  gaAppArgStart = []
+  gaAppArgCount = []
+  gaAppArgFlat = []
+  gaAppFinite = []
+  cPlainAliasNames = []
+  cFillStmtIx = Map()
+  cFillDoneAt = []
+  cFillActive = false
+  nwDeclNames = []
+  nwTyIxs = []
+  nwNames = []
+  nwBaseTyIxs = []
+  nwBodyScopedNames = Map()
+  flNames = []
+  flSizes = []
+  flFStart = []
+  flFCount = []
+  flDeclNodes = []
+  flFNames = []
+  flFWidth = []
+  flFNest = []
+  flFOff = []
+  cLitUnionCopyTyIxs = []
+  cLitUnionCopyAliasIxs = []
+  checkerArmed = true
   TY_I32 = mkPrim("i32")
   TY_I64 = mkPrim("i64")
   TY_F64 = mkPrim("f64")
@@ -22722,43 +22771,6 @@ function forceDeclFill(name: string) {
 // pass 2 checks every top-level statement.
 function checkProgramNode(n: Program) {
   const stmts = n.progStmts
-  cStructTyIxs = []
-  cStructTyIxSet = []
-  cStructNames = []
-  cVariantMemberTyIxs = []
-  cVariantMemberTyIxSet = []
-  annPendingVariantTyIxs = []
-  annPendingVariantTyIxSet = []
-  cUnionTyIxs = []
-  cUnionTyIxSet = []
-  cUnionNames = []
-  gaAppTyIxs = []
-  gaAppTyIxSet = []
-  gaAppHeads = []
-  gaAppArgStart = []
-  gaAppArgCount = []
-  gaAppArgFlat = []
-  gaAppFinite = []
-  cPlainAliasNames = []
-  cFillStmtIx = Map()
-  cFillDoneAt = []
-  cFillActive = false
-  nwDeclNames = []
-  nwTyIxs = []
-  nwNames = []
-  nwBaseTyIxs = []
-  nwBodyScopedNames = Map()
-  flNames = []
-  flSizes = []
-  flFStart = []
-  flFCount = []
-  flDeclNodes = []
-  flFNames = []
-  flFWidth = []
-  flFNest = []
-  flFOff = []
-  cLitUnionCopyTyIxs = []
-  cLitUnionCopyAliasIxs = []
   // Pass 0: registers top-level struct `type` declarations before anything else, so a struct
   // name in a param/return/let annotation or a later struct's field resolves via `nameToTy`.
   // Pass 0a pre-registers every top-level `type` name with an empty placeholder (struct or
@@ -25131,7 +25143,16 @@ function checkExternDecls() {
   0
 }
 
+// The checker's entry point; `initChecker()` must have run first. Every module table this
+// walk fills is emptied there, so a walk over a stale one reads another program's rows.
 export function checkProgram(rootIx: i32) {
+  if !checkerArmed {
+    tErr(
+      "internal: checkProgram without initChecker since the previous program",
+      -1,
+    )
+  }
+  checkerArmed = false
   const rootN0 = P.nodes[rootIx]
   if rootN0 is Program { gRootStmts = rootN0.progStmts }
   // Size the typed-IR table to the (now fully parsed) node arena, all holes (-1).
