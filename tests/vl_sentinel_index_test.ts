@@ -16,7 +16,10 @@
 //
 // FIVE OF THE FIXTURES ARE THE FILED DEFECTS, reduced: D1440's hole field, D1462's and
 // #2498's laundered `checkNode` answer, D1500's fall-through parameter, and D1500's own
-// STRICT sibling — which must land under the weaker code, not the gated one.
+// STRICT sibling — which must land under the weaker code, not the gated one. A sixth
+// pins the WRAPPED HEADER both ways: a scan reading only a header's first line reported
+// a continuation-line parameter as a table its function never declared, and missed the
+// same header's own `i32` parameter on a fall-through.
 //
 // GATING: env-gated (`SELFHOST_NATIVE_ALIGN=1`) AND requires the built binary + seed
 // wasm, like the other native `vl_*` suites.
@@ -185,6 +188,48 @@ function innerSlot(slot: i32): i32 {
     unguarded: ["16:12"],
     strict: [],
     says: { code: UNGUARDED, text: "the parameter `slot` on a fall-through path" },
+  },
+  {
+    // A WRAPPED HEADER. `vl fmt` breaks a long parameter list over several lines, and a
+    // scan that read only the first line saw a continuation-line parameter as neither
+    // declared nor an `i32` — so it reported `mine[s]` off a list the function was
+    // handed (a false positive), and missed `tys[slot]` off the function's own `i32`
+    // parameter on a fall-through (a false negative). Both directions are pinned here,
+    // with `undeclaredBase` as the control that must still fire.
+    name: "wrapped.vl",
+    src: `let tys: i32[] = []
+
+function slotOf(n: i32): i32 {
+  if n > 3 { return n }
+  -1
+}
+
+function wrappedBase(
+  n: i32,
+  mine: i32[],
+): i32 {
+  const s = slotOf(n)
+  mine[s]
+}
+
+function undeclaredBase(
+  n: i32,
+  _spare: i32[],
+): i32 {
+  const s = slotOf(n)
+  tys[s]
+}
+
+function wrappedParam(
+  first: i32,
+  slot: i32,
+): i32 {
+  if first > 0 { return first }
+  slotOf(tys[slot])
+}
+`,
+    unguarded: ["21:3", "29:10"],
+    strict: [],
   },
   {
     // The STRICT carve-out: `slotOfStrict`'s -1 is its documented answer, not a clamp,
