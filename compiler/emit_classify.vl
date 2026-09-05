@@ -9855,39 +9855,54 @@ export function listIdxKindOf(ek: VKind): MfKind {
   "i32"
 }
 
-// The bounds-check wrapper-ref slot for list kind `kind` (`slot` = the ref-list table slot
-// for kind "ref", else 0) — found in this function's lazily grown `liKinds` table, or
-// reserved now. Slot 0 of the frame is the shared i32 index stash; wrapper slot k lives at
-// `base + 1 + k`, handed out during lowering since first-use order keeps the layout deterministic.
-export function listIdxWrapSlot(kind: MfKind, slot: i32) {
+// Which columns join the `liBack` code in a stash's match: the code alone, the code and
+// `liSlots`, the code and `liKinds`, or all three. `scratchSlot` takes the code as an
+// ARGUMENT rather than each allocator copying a constant, so a new stash cannot silently
+// hand back a slot a live one already owns.
+const SCRATCH_BY_CODE = 0
+const SCRATCH_BY_KEY = 1
+const SCRATCH_BY_KIND = 2
+const SCRATCH_BY_BOTH = 3
+
+// The frame slot carrying `liBack` code `code`, found in the lazily grown table or reserved
+// now as the row `(kind, key, code)`. A column `by` does not key on is still WRITTEN, so a
+// row always reads back the valtype it reserved. Slot 0 of the frame is the shared i32
+// index stash, so row k is slot `listIdxScratchBase + 1 + k`.
+function scratchSlot(code: i32, kind: MfKind, key: i32, by: i32) {
   let k = 0
   while k < liKinds.length {
-    if liKinds[k] == kind && liSlots[k] == slot && liBack[k] == 0 {
-      return listIdxScratchBase + 1 + k
+    if liBack[k] == code {
+      let hit = true
+      if by == SCRATCH_BY_KEY || by == SCRATCH_BY_BOTH {
+        if liSlots[k] != key { hit = false }
+      }
+      if by == SCRATCH_BY_KIND || by == SCRATCH_BY_BOTH {
+        if liKinds[k] != kind { hit = false }
+      }
+      if hit { return listIdxScratchBase + 1 + k }
     }
     k = k + 1
   }
   liKinds.push(kind)
-  liSlots.push(slot)
-  liBack.push(0)
+  liSlots.push(key)
+  liBack.push(code)
   listIdxScratchBase + liKinds.length
 }
 
-// The shared-union-field receiver stash (`liBack` code 7) — one `(ref null $uBoxIdx)` slot
-// holding the box across a per-tag dispatch whose receiver cannot be re-emitted per arm.
-// Lazy, not eagerly reserved: whether a read is "shared" depends on `is`-narrowing, which a
-// pre-pass runs before and so cannot see — a slot handed out during lowering asks once, when the answer is known.
+// The bounds-check wrapper-ref slot for list kind `kind` (`slot` = the ref-list table slot
+// for kind "ref", else 0), code 0 — the one stash keyed on both columns, since a wrapper's
+// heap type comes from the kind and its ref-list row together. Handed out during lowering:
+// first-use order is what keeps the layout deterministic.
+export function listIdxWrapSlot(kind: MfKind, slot: i32) {
+  scratchSlot(0, kind, slot, SCRATCH_BY_BOTH)
+}
+
+// The shared-union-field receiver stash, code 7 — one `(ref null $uBoxIdx)` slot holding
+// the box across a per-tag dispatch whose receiver cannot be re-emitted per arm. Lazy, not
+// eagerly reserved: whether a read is "shared" depends on `is`-narrowing, which a pre-pass
+// runs before and so cannot see.
 export function sharedFieldRecvSlot() {
-  let k = 0
-  while k < liKinds.length {
-    if liBack[k] == 7 { return listIdxScratchBase + 1 + k }
-    k = k + 1
-  }
-  // `liKinds`/`liSlots` are unread for this code — `liBack` 7 alone selects the valtype.
-  liKinds.push("i32")
-  liSlots.push(0)
-  liBack.push(7)
-  listIdxScratchBase + liKinds.length
+  scratchSlot(7, "i32", 0, SCRATCH_BY_CODE)
 }
 
 // ── the element-converting copy's frame slots (D791) ─────────────────────────
@@ -9895,31 +9910,11 @@ export function sharedFieldRecvSlot() {
 // temps — lazy, since a pre-pass can't know a delivery widens before the tables intern.
 // Sharing is safe: the source is fully emitted before the stash, no user code runs between.
 export function widenSrcWrapSlot(slot: i32) {
-  let k = 0
-  while k < liKinds.length {
-    if liBack[k] == 8 && liSlots[k] == slot {
-      return listIdxScratchBase + 1 + k
-    }
-    k = k + 1
-  }
-  liKinds.push("ref")
-  liSlots.push(slot)
-  liBack.push(8)
-  listIdxScratchBase + liKinds.length
+  scratchSlot(8, "ref", slot, SCRATCH_BY_KEY)
 }
 
 export function widenDstBackSlot(slot: i32) {
-  let k = 0
-  while k < liKinds.length {
-    if liBack[k] == 9 && liSlots[k] == slot {
-      return listIdxScratchBase + 1 + k
-    }
-    k = k + 1
-  }
-  liKinds.push("ref")
-  liSlots.push(slot)
-  liBack.push(9)
-  listIdxScratchBase + liKinds.length
+  scratchSlot(9, "ref", slot, SCRATCH_BY_KEY)
 }
 
 // D972 — the union-`==` operand stash, code 13. Its own code rather than
@@ -9927,15 +9922,7 @@ export function widenDstBackSlot(slot: i32) {
 // operand of a `==` may itself be a shared-union-field read), and two writers of one slot
 // is how a stash gets clobbered — an operand assigning itself.
 export function unionEqStashSlot() {
-  let k = 0
-  while k < liKinds.length {
-    if liBack[k] == 13 { return listIdxScratchBase + 1 + k }
-    k = k + 1
-  }
-  liKinds.push("i32")
-  liSlots.push(0)
-  liBack.push(13)
-  listIdxScratchBase + liKinds.length
+  scratchSlot(13, "i32", 0, SCRATCH_BY_CODE)
 }
 
 // D1510 — the object-literal order stash, codes `100 + <field code>`. A struct/variant
@@ -9954,30 +9941,14 @@ export function objOrderStashSlot(code: i32, storageSlot: i32) {
 // parked here at first read. Its own code, not `unionEqStashSlot`'s 13, because an `is`
 // can sit inside a union `==`'s operand and a second writer of one slot is how a stash clobbers.
 export function unionLitIsStashSlot() {
-  let k = 0
-  while k < liKinds.length {
-    if liBack[k] == 17 { return listIdxScratchBase + 1 + k }
-    k = k + 1
-  }
-  liKinds.push("i32")
-  liSlots.push(0)
-  liBack.push(17)
-  listIdxScratchBase + liKinds.length
+  scratchSlot(17, "i32", 0, SCRATCH_BY_CODE)
 }
 
 // D973 — the three scratch slots a struct-union `==` needs: the two operand boxes (codes 13
 // and 15, `(ref null $uBoxIdx)`) and, per arm, the pair of casted variant payloads (code 14,
 // keyed by variant index; the right operand is keyed `vi + 1024`, outside any variant table).
 export function unionEqStashSlot2() {
-  let k = 0
-  while k < liKinds.length {
-    if liBack[k] == 15 { return listIdxScratchBase + 1 + k }
-    k = k + 1
-  }
-  liKinds.push("i32")
-  liSlots.push(0)
-  liBack.push(15)
-  listIdxScratchBase + liKinds.length
+  scratchSlot(15, "i32", 0, SCRATCH_BY_CODE)
 }
 
 // D974 — a struct-heap-typed stash pair, code 16, keyed by struct-table row (the right
@@ -9985,29 +9956,11 @@ export function unionEqStashSlot2() {
 // shape is interned into the struct table even though the arms themselves are not, so the
 // nested compare can use `emitStructEqRec` given operands parked at the nested row's heap.
 export function structEqStashSlot(row: i32) {
-  let k = 0
-  while k < liKinds.length {
-    if liBack[k] == 16 && liSlots[k] == row {
-      return listIdxScratchBase + 1 + k
-    }
-    k = k + 1
-  }
-  liKinds.push("ref")
-  liSlots.push(row)
-  liBack.push(16)
-  listIdxScratchBase + liKinds.length
+  scratchSlot(16, "ref", row, SCRATCH_BY_KEY)
 }
 
 export function unionEqArmSlot(vi: i32) {
-  let k = 0
-  while k < liKinds.length {
-    if liBack[k] == 14 && liSlots[k] == vi { return listIdxScratchBase + 1 + k }
-    k = k + 1
-  }
-  liKinds.push("ref")
-  liSlots.push(vi)
-  liBack.push(14)
-  listIdxScratchBase + liKinds.length
+  scratchSlot(14, "ref", vi, SCRATCH_BY_KEY)
 }
 
 // The scalar analogue of `widenSrcWrapSlot`/`widenDstBackSlot`: codes 11 and 12, keyed by
@@ -10015,45 +9968,15 @@ export function unionEqArmSlot(vi: i32) {
 // backing heap types come from the kind alone. Two copies over the same kind share one
 // slot for the same reason: the source is fully emitted before the stash (D965).
 export function widenScalarWrapSlot(kind: MfKind) {
-  let k = 0
-  while k < liKinds.length {
-    if liBack[k] == 11 && liKinds[k] == kind {
-      return listIdxScratchBase + 1 + k
-    }
-    k = k + 1
-  }
-  liKinds.push(kind)
-  liSlots.push(0)
-  liBack.push(11)
-  listIdxScratchBase + liKinds.length
+  scratchSlot(11, kind, 0, SCRATCH_BY_KIND)
 }
 
 export function widenScalarBackSlot(kind: MfKind) {
-  let k = 0
-  while k < liKinds.length {
-    if liBack[k] == 12 && liKinds[k] == kind {
-      return listIdxScratchBase + 1 + k
-    }
-    k = k + 1
-  }
-  liKinds.push(kind)
-  liSlots.push(0)
-  liBack.push(12)
-  listIdxScratchBase + liKinds.length
+  scratchSlot(12, kind, 0, SCRATCH_BY_KIND)
 }
 
 export function widenTmpSlot(which: i32) {
-  let k = 0
-  while k < liKinds.length {
-    if liBack[k] == 10 && liSlots[k] == which {
-      return listIdxScratchBase + 1 + k
-    }
-    k = k + 1
-  }
-  liKinds.push("i32")
-  liSlots.push(which)
-  liBack.push(10)
-  listIdxScratchBase + liKinds.length
+  scratchSlot(10, "i32", which, SCRATCH_BY_KEY)
 }
 
 // The tail-value expression of an if-expression's then arm (`ifArmValueExpr`: the arm
