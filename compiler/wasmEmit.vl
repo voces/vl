@@ -8684,11 +8684,34 @@ function listIdxValSlot(kind: MfKind, slot: i32) {
   listIdxScratchBase + liKinds.length
 }
 
+// True when the call at `callIx` lowers to linear-memory instructions and nothing else:
+// a bare-identifier callee, unshadowed here, in the load/store/bulk/size families. No GC
+// object is reachable from such a call — every operand is a number and the lowering is one
+// instruction — so no list's `backing`/`len` can move across it. Every other call declines.
+function hoistSafeMemCall(callIx: i32, fnIx: i32): boolean {
+  const c = P.nodes[callIx]
+  if c is Call {
+    const callee = P.nodes[c.callFn]
+    if callee is Ident {
+      const nm = callee.identName
+      if identNameIsUserBound(nm, fnIx) { return false }
+      if nm == "__store_i32__" { return true }
+      if nm == "__load_i32__" { return true }
+      if nm == "__memory_size__" { return true }
+      if nm == "__memory_grow__" { return true }
+      if nameIsMemStoreIntrinsic(nm) { return true }
+      if nameIsMemLoadIntrinsic(nm) { return true }
+      return nameIsMemBulkIntrinsic(nm)
+    }
+  }
+  false
+}
+
 // The soundness condition for list-header hoisting: across a loop body that cannot
 // reallocate a list, its backing ref and `len` are loop-invariant, so hoisting reads them
-// once before the loop instead of per access. Declines on any call (may reallocate the
-// list through a param, capture or global), a rebinding, or a nullable receiver.
-function hoistSafeExpr(ix: i32): boolean {
+// once before the loop instead of per access. Declines on a rebinding, a nullable receiver,
+// and every call but `hoistSafeMemCall`'s — any other may reallocate through a param.
+function hoistSafeExpr(ix: i32, fnIx: i32): boolean {
   if ix < 0 { return true }
   const e = P.nodes[ix]
   if e is NumLit { return true }
@@ -8697,18 +8720,28 @@ function hoistSafeExpr(ix: i32): boolean {
   if e is BoolLit { return true }
   if e is NullLit { return true }
   if e is Ident { return true }
-  if e is Unary { return hoistSafeExpr(e.unArg) }
-  if e is Paren { return hoistSafeExpr(e.parInner) }
-  if e is IsExpr { return hoistSafeExpr(e.isObj) }
-  if e is AsExpr { return hoistSafeExpr(e.asObj) }
-  if e is Member { return hoistSafeExpr(e.memObj) }
+  if e is Unary { return hoistSafeExpr(e.unArg, fnIx) }
+  if e is Paren { return hoistSafeExpr(e.parInner, fnIx) }
+  if e is IsExpr { return hoistSafeExpr(e.isObj, fnIx) }
+  if e is AsExpr { return hoistSafeExpr(e.asObj, fnIx) }
+  if e is Member { return hoistSafeExpr(e.memObj, fnIx) }
   if e is Index {
-    if !hoistSafeExpr(e.idxArr) { return false }
-    return hoistSafeExpr(e.idxIndex)
+    if !hoistSafeExpr(e.idxArr, fnIx) { return false }
+    return hoistSafeExpr(e.idxIndex, fnIx)
   }
   if e is BinExpr {
-    if !hoistSafeExpr(e.binLeft) { return false }
-    return hoistSafeExpr(e.binRight)
+    if !hoistSafeExpr(e.binLeft, fnIx) { return false }
+    return hoistSafeExpr(e.binRight, fnIx)
+  }
+  if e is Call {
+    if !hoistSafeMemCall(ix, fnIx) { return false }
+    const args = e.callArgs
+    let a = 0
+    while a < args.length {
+      if !hoistSafeExpr(args[a], fnIx) { return false }
+      a = a + 1
+    }
+    return true
   }
   false
 }
@@ -8716,44 +8749,44 @@ function hoistSafeExpr(ix: i32): boolean {
 // The statement half of the whitelist. The fall-through hands an unrecognised
 // statement to the EXPRESSION walk (a bare expression statement is how an
 // assignment and a call both appear), which declines anything it does not know.
-function hoistSafeStmt(ix: i32): boolean {
+function hoistSafeStmt(ix: i32, fnIx: i32): boolean {
   if ix < 0 { return true }
   const s = P.nodes[ix]
-  if s is LetDecl { return hoistSafeExpr(s.letInit) }
-  if s is RetStmt { return hoistSafeExpr(s.retArg) }
+  if s is LetDecl { return hoistSafeExpr(s.letInit, fnIx) }
+  if s is RetStmt { return hoistSafeExpr(s.retArg, fnIx) }
   if s is BreakStmt { return true }
   if s is ContinueStmt { return true }
-  if s is Block { return hoistSafeBlock(ix) }
+  if s is Block { return hoistSafeBlock(ix, fnIx) }
   if s is IfStmt {
-    if !hoistSafeExpr(s.ifCond) { return false }
-    if !hoistSafeStmt(s.ifThen) { return false }
-    return hoistSafeStmt(s.ifElse)
+    if !hoistSafeExpr(s.ifCond, fnIx) { return false }
+    if !hoistSafeStmt(s.ifThen, fnIx) { return false }
+    return hoistSafeStmt(s.ifElse, fnIx)
   }
   if s is WhileStmt {
-    if !hoistSafeExpr(s.whileCond) { return false }
-    return hoistSafeStmt(s.whileBody)
+    if !hoistSafeExpr(s.whileCond, fnIx) { return false }
+    return hoistSafeStmt(s.whileBody, fnIx)
   }
   if s is ForRange {
-    if !hoistSafeExpr(s.frFrom) { return false }
-    if !hoistSafeExpr(s.frTo) { return false }
-    if !hoistSafeExpr(s.frStep) { return false }
-    return hoistSafeStmt(s.frBody)
+    if !hoistSafeExpr(s.frFrom, fnIx) { return false }
+    if !hoistSafeExpr(s.frTo, fnIx) { return false }
+    if !hoistSafeExpr(s.frStep, fnIx) { return false }
+    return hoistSafeStmt(s.frBody, fnIx)
   }
   if s is ForIn {
-    if !hoistSafeExpr(s.fiIter) { return false }
-    return hoistSafeStmt(s.fiBody)
+    if !hoistSafeExpr(s.fiIter, fnIx) { return false }
+    return hoistSafeStmt(s.fiBody, fnIx)
   }
-  hoistSafeExpr(ix)
+  hoistSafeExpr(ix, fnIx)
 }
 
-function hoistSafeBlock(ix: i32): boolean {
+function hoistSafeBlock(ix: i32, fnIx: i32): boolean {
   if ix < 0 { return false }
   const b = P.nodes[ix]
   if b is Block {
     const stmts = b.blkStmts
     let i = 0
     while i < stmts.length {
-      if !hoistSafeStmt(stmts[i]) { return false }
+      if !hoistSafeStmt(stmts[i], fnIx) { return false }
       i = i + 1
     }
     return true
@@ -8785,6 +8818,15 @@ function exprReboundsName(ix: i32, name: string): boolean {
   if e is Index {
     if exprReboundsName(e.idxArr, name) { return true }
     return exprReboundsName(e.idxIndex, name)
+  }
+  if e is Call {
+    if exprReboundsName(e.callFn, name) { return true }
+    const args = e.callArgs
+    let a = 0
+    while a < args.length {
+      if exprReboundsName(args[a], name) { return true }
+      a = a + 1
+    }
   }
   false
 }
@@ -8875,6 +8917,15 @@ function hoistScanExpr(ix: i32) {
   if e is BinExpr {
     hoistScanExpr(e.binLeft)
     return hoistScanExpr(e.binRight)
+  }
+  if e is Call {
+    hoistScanExpr(e.callFn)
+    const args = e.callArgs
+    let a = 0
+    while a < args.length {
+      hoistScanExpr(args[a])
+      a = a + 1
+    }
   }
   0
 }
@@ -8986,8 +9037,8 @@ function loopHoistOpen(
   fnIx: i32,
   ownVar: string,
 ) {
-  if !hoistSafeExpr(condIx) { return 0 }
-  if !hoistSafeBlock(bodyIx) { return 0 }
+  if !hoistSafeExpr(condIx, fnIx) { return 0 }
+  if !hoistSafeBlock(bodyIx, fnIx) { return 0 }
   lhScanName = []
   lhScanRep = []
   hoistScanExpr(condIx)
