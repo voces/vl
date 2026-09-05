@@ -270,7 +270,9 @@ fn version_line() -> String {
 
 /// `vl --version` in full: the version line, the commit this binary was built
 /// from, and — the reason the command grew past one line — WHICH SEED AND WHICH
-/// std it is about to use, named by origin.
+/// std it is about to use, named by origin. Both carry a content hash (`seed_hash`,
+/// `std_hash`) alongside their byte/module count, so two binaries that happen to
+/// share a byte count are still distinguishable without a round-trip.
 ///
 /// The two questions it answers are the two consumer defects: a binary that
 /// paired a current seed with a stale checkout's `std/` (D1573), and a binary
@@ -282,12 +284,17 @@ fn version_report() -> String {
     out += &format!("commit:  {}\n", env!("VL_BUILD_COMMIT"));
 
     let (seed, seed_origin) = resolve_compiler_with_origin(None);
-    let (seed_where, seed_bytes) = match &seed {
-        CompilerSource::Path(p) => (p.clone(), std::fs::metadata(p).map(|m| m.len()).ok()),
-        CompilerSource::Embedded(b) => ("embedded".to_string(), Some(b.len() as u64)),
+    let (seed_where, seed_info) = match &seed {
+        CompilerSource::Path(p) => (
+            p.clone(),
+            std::fs::read(p).ok().map(|b| (b.len() as u64, seed_hash(&b))),
+        ),
+        CompilerSource::Embedded(b) => ("embedded".to_string(), Some((b.len() as u64, seed_hash(b)))),
     };
-    out += &match seed_bytes {
-        Some(n) => format!("seed:    {seed_where} ({n} bytes) — {}\n", seed_origin.label()),
+    out += &match seed_info {
+        Some((n, hash)) => {
+            format!("seed:    {seed_where} ({n} bytes, {hash}) — {}\n", seed_origin.label())
+        }
         None => format!("seed:    {seed_where} (unreadable) — {}\n", seed_origin.label()),
     };
 
@@ -875,6 +882,13 @@ fn std_hash<'a>(modules: impl Iterator<Item = (&'a str, &'a [u8])>) -> String {
         feed(b"\0", &mut h);
     }
     format!("{h:016x}")
+}
+
+/// The identity of a compiler SEED, as 16 hex digits — `std_hash`'s own fold,
+/// applied to the one blob a seed is. A byte COUNT alone cannot tell two seeds
+/// apart when they happen to match; this can, without a second hasher.
+fn seed_hash(bytes: &[u8]) -> String {
+    std_hash(std::iter::once(("seed", bytes)))
 }
 
 /// Every `.vl` under `dir` (recursive), as `(std:`-less name, source bytes)` sorted
