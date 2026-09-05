@@ -470,6 +470,7 @@ print(fromCodePoint(72))        // "H"        — ONE code point
 print(fromCodePoint(0x1F600))   // "😀"
 const cps = [72, 105]
 print(fromCodePoints(cps))      // "Hi"       — a whole i32[], one bulk encode
+print(fromCodePoints([72, 105]))  // "Hi"     — any i32[] expression, not just a name
 ```
 
 - **`fromCodePoint(cp)` is the single-code-point form**, and it takes an expression: a
@@ -481,10 +482,9 @@ print(fromCodePoints(cps))      // "Hi"       — a whole i32[], one bulk encode
 - **Both substitute U+FFFD** for a value with no UTF-8 encoding — a lone surrogate,
   anything past U+10FFFF, a negative. That is the §Validity ruling below, and it is why
   `fromCodePoint(0xD800)` is three bytes rather than a trap.
-- **`fromCodePoints` today accepts only a bare NAME**, not a literal or any other
-  expression: `fromCodePoints([72, 105])` passes `vl check` and is then refused by the
-  emitter. That is a codegen limitation rather than a rule of the language, filed as
-  `D1640`; bind the list first.
+- **Both take an ARBITRARY expression** — a literal, a field, a call result, a `.slice`.
+  `fromCodePoints` accepted only a bare name until `D1640`, because its lowering emitted
+  the argument twice; it now evaluates it once, so an argument with side effects runs once.
 
 ### The char-literal trap — closed by the type system
 
