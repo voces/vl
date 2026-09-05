@@ -2715,6 +2715,44 @@ function letInitTyIsFunc(letIx: i32): boolean {
   false
 }
 
+// Whether an un-annotated binding's initializer carries a registered STRUCT in the arena —
+// the checker's own answer for the projection spellings (`xs[0]`, `box.it`) that commit no
+// rep the `letIs*` ladder can read. Shared by the kind and its slot so the two agree (D1476).
+function letInitTyIsStruct(letIx: i32): boolean {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 { return false }
+    if d.letInit < 0 { return false }
+    return isStructOfTy(nodeTyIxOf(d.letInit))
+  }
+  false
+}
+
+// Whether that initializer is a nested-struct FIELD read — the one projection shape whose
+// slot is nullable, so the kind above it must be `nulstruct` and not `struct` (D1476).
+function letInitIsNestedStructField(letIx: i32): boolean {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 { return false }
+    if d.letInit < 0 { return false }
+    const e = P.nodes[unwrapParen(d.letInit)]
+    if e is Member { return isStructOfTy(nodeTyIxOf(d.letInit)) }
+  }
+  false
+}
+
+// The struct row that rung names, or -1 — the companion index `fbValtype` reads for a
+// `"struct"` cell.
+function letInitTyStructRow(letIx: i32): i32 {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 { return -1 }
+    if d.letInit < 0 { return -1 }
+    return structRowOfTy(nodeTyIxOf(d.letInit))
+  }
+  -1
+}
+
 // The nullable twin: the initializer carries a `TyNullable` over a `TyFunc`, which a bare
 // `const t = m[k]` read of a function-valued map is and no syntactic arm claims (D1621).
 function letInitTyIsNulFunc(letIx: i32): boolean {
@@ -2815,6 +2853,15 @@ function letInitCellKind(letIx: i32, fnIx: i32): VKind {
     }
     return "struct"
   }
+  // A nested-struct FIELD read reads back `(ref null $S)` — the lowering folds `inner: S`
+  // and `inner: S | null` onto one code-15 hop — so its cell is the NULLABLE struct, ahead
+  // of the bare rung the `Index` projection takes (D1476).
+  if letInitIsNestedStructField(letIx) { return "nulstruct" }
+
+  // The arena rung: a PROJECTION commits no rep the syntactic ladder reads, and the checker
+  // recorded the type. Paired with `captureValStructIdx`'s own, since a kind whose slot
+  // stays -1 is a different refusal rather than half a fix.
+  if letInitTyIsStruct(letIx) { return "struct" }
   if letIsArray(letIx, fnIx) { return "list" }
   if letIsNulString(letIx, fnIx) { return "nulstr" }
   if letIsString(letIx, fnIx) { return "str" }
@@ -4149,6 +4196,10 @@ export function captureValStructIdx(fe: i32, name: string) {
         }
         return csi
       }
+      // The arena rung's companion, paired with `letInitCellKind`'s: a projection
+      // initialiser's struct row comes from the type the checker recorded, since
+      // `structIndexOfLet` reads a spelling the projection does not carry (D1476).
+      if letInitTyIsStruct(b) { return letInitTyStructRow(b) }
     }
   }
   -1
@@ -15799,10 +15850,26 @@ export function globalRefListSlot(letIx: i32) {
 // True if the type-name `name` refers to one of the declared struct types.
 export function isSName(name: string) { structIndexByName(name) >= 0 }
 
+// The struct-table ROW whose arena type is `ty`, or -1 — `isStructOfTy`'s index-returning
+// twin, with the same two passes and the same first-match-wins rule.
+export function structRowOfTy(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  let s = 0
+  while s < sTyIx.length {
+    if sTyIx[s] == ty { return s }
+    s = s + 1
+  }
+  let q = 0
+  while q < sTyIx.length {
+    if tySame(sTyIx[q], ty) { return q }
+    q = q + 1
+  }
+  -1
+}
+
 // "Is this type a registered struct", asked of the arena — the struct companion to
-// `isUnionOfTy`. Structural here, unlike unions, needing no declared/inline split: the
-// intern layer already dedupes an inline shape onto a declared struct at intern time, so
-// `tySame` is the right comparison for every row. The index rung runs first as the cheap one.
+// `isUnionOfTy`. Structural here, unlike unions: the intern layer dedupes an inline shape
+// onto a declared struct, so `tySame` is the right comparison for every row.
 export function isStructOfTy(ty: i32): boolean {
   if ty < 0 { return false }
   let s = 0
