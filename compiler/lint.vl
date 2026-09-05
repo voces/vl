@@ -1272,6 +1272,23 @@ let declWritten: i32[] = []
 let visNames: string[] = []
 let visIds: i32[] = []
 
+// The per-name chain through that stack: `visHead[name]` is the innermost entry's index
+// and `visPrev[i]` the next-outer entry sharing entry `i`'s name, -1 at each end. Pushes
+// and pops are LIFO, so the head is the innermost — a resolution is one probe, not a walk
+// as deep as the module has bindings (B6a, `docs/internals/perf-opportunities-2026-09.md`).
+let visHead: {[string]: i32} = Map()
+let visPrev: i32[] = []
+
+// Push one scope entry: `id` is its `declNodes` index, or -1 for a shadowing-only
+// entry. The single writer of the stack and its chain, so the two cannot disagree.
+function visPush(name: string, id: i32) {
+  visPrev.push(visHead[name] ?? -1)
+  visHead[name] = visNames.length
+  visNames.push(name)
+  visIds.push(id)
+  0
+}
+
 // Register the declaration at node `ix` (kind 0 = let/const, 1 = param, 2 = import
 // local) and push it onto the scope stack. `tok` is the binding's name token when the
 // node cannot provide it — an `ImportDecl` declares several names, so kind 2 passes
@@ -1283,16 +1300,19 @@ function bindPush(name: string, ix: i32, kind: i32, tok: i32) {
   declToks.push(tok)
   declUsed.push(0)
   declWritten.push(0)
-  visNames.push(name)
-  visIds.push(declNodes.length - 1)
+  visPush(name, declNodes.length - 1)
   0
 }
 
-// Pop scope entries down to `mark` (a `visNames.length` captured at scope entry).
+// Pop scope entries down to `mark` (a `visNames.length` captured at scope entry),
+// relinking each popped name's head to the entry it shadowed.
 function bindTrim(mark: i32) {
   while visNames.length > mark {
+    const top = visNames.length - 1
+    visHead[visNames[top]] = visPrev[top]
     visNames.pop()
     visIds.pop()
+    visPrev.pop()
   }
   0
 }
@@ -1301,16 +1321,11 @@ function bindTrim(mark: i32) {
 // 1 marks it WRITTEN. A shadowing-only entry (`visIds` -1, a loop variable)
 // stops resolution — the name is that entry's, not an outer binding's.
 function bindMark(name: string, flag: i32) {
-  let i = visNames.length - 1
-  while i >= 0 {
-    if visNames[i] == name {
-      const id = visIds[i]
-      if id >= 0 {
-        if flag == 0 { declUsed[id] = 1 } else { declWritten[id] = 1 }
-      }
-      return 0
-    }
-    i = i - 1
+  const i = visHead[name] ?? -1
+  if i < 0 { return 0 }
+  const id = visIds[i]
+  if id >= 0 {
+    if flag == 0 { declUsed[id] = 1 } else { declWritten[id] = 1 }
   }
   0
 }
@@ -1467,15 +1482,13 @@ function bindScan(ix: i32) {
     bindScan(n.frTo)
     bindScan(n.frStep)
     const mark = visNames.length
-    visNames.push(n.frVar)
-    visIds.push(-1)
+    visPush(n.frVar, -1)
     bindScan(n.frBody)
     bindTrim(mark)
   } else if n is ForIn {
     bindScan(n.fiIter)
     const mark = visNames.length
-    visNames.push(n.fiVar)
-    visIds.push(-1)
+    visPush(n.fiVar, -1)
     bindScan(n.fiBody)
     bindTrim(mark)
   } else {
@@ -1504,6 +1517,8 @@ function collectBindingsAndRefs(progRoot: i32) {
   declWritten = []
   visNames = []
   visIds = []
+  visHead = Map()
+  visPrev = []
   bindScan(progRoot)
   collectTypeNameRefs()
   0
@@ -3721,9 +3736,9 @@ function kindLadderLint() {
 // negative somewhere. Read from the module rather than written down, so `nInner`
 // earns its place from the guards the module already spells — D1440's whole shape is
 // `T.tys[t.nInner]` carrying the guard its sibling had and it did not.
-let siHoleF: string[] = []
+let siHoleF: {[string]: i32} = Map()
 // This module's MAP globals — a key subscript, never an index.
-let siMapG: string[] = []
+let siMapG: {[string]: i32} = Map()
 
 // Per top-level function, parallel to `klFnName` — this pass reuses the kind-ladder
 // module index. 1 when the function answers -1 in band, directly or by handing back a
@@ -3742,12 +3757,12 @@ let siFnIx: {[string]: i32} = Map()
 // Per-function state, reset by `siGradeFn`. Module globals rather than locals threaded
 // through: the read grader wants seven of them, and a parameter list that long is how a
 // walk stops being readable.
-let siDeclared: string[] = []
-let siParams: string[] = []
-let siPName: string[] = []
+let siDeclared: {[string]: i32} = Map()
+let siParams: {[string]: i32} = Map()
+let siPIx: {[string]: i32} = Map()
 let siPKind: i32[] = []
 let siPText: string[] = []
-let siGuarded: string[] = []
+let siGuarded: {[string]: i32} = Map()
 let siReturned = false
 
 // The identifier at `i` and, if a `.` follows it, the field after that — `name`, `a.b`.
@@ -3780,20 +3795,27 @@ function siFreshAt(s: string, i: i32) {
   !txIsWordChar(c) && c != '.'
 }
 
-// Record `name` once. "" is never recorded, which is what makes an emptied slot below
-// unmatchable rather than a wildcard.
-function siAdd(xs: string[], name: string) {
-  if name.length > 0 && !txListHas(xs, name) { xs.push(name) }
+// The name sets below are maps: each is asked once per name occurrence over a set as
+// large as the enclosing function has bindings, so a list would be quadratic in it
+// (B6a of `docs/internals/perf-opportunities-2026-09.md`). Membership is the value 1,
+// and a dropped name reads 0.
+
+// Record `name`. "" is never recorded, which is what keeps a dropped name unmatchable
+// rather than a wildcard.
+function siAdd(xs: {[string]: i32}, name: string) {
+  if name.length > 0 { xs[name] = 1 }
   0
 }
 
-// Blank `name` where it occurs, so a rebinding drops the guard and the parameter status
-// the OLD value earned.
-function siDrop(xs: string[], name: string) {
-  const k = txListIndexOf(xs, name)
-  if k >= 0 { xs[k] = "" }
+// Forget `name`, so a rebinding drops the guard and the parameter status the OLD
+// value earned.
+function siDrop(xs: {[string]: i32}, name: string) {
+  xs[name] = 0
   0
 }
+
+// `name` is a live member of `xs`.
+function siHas(xs: {[string]: i32}, name: string) { (xs[name] ?? 0) == 1 }
 
 // ── one walk over a line, seven kinds of work ────────────────────────────────
 // Every pass below reads a line index by index with string and char literals stepped
@@ -3951,8 +3973,8 @@ function siHoleAt(s: string, _a: i32, e: i32, i: i32) {
 }
 
 function siScanHoles(s: string) {
-  siHoleF = []
-  siMapG = []
+  siHoleF = Map()
+  siMapG = Map()
   let n = 0
   while n < klLnStart.length {
     const a = klLnStart[n]
@@ -4271,22 +4293,22 @@ function siGradeRead(table: string, idx: string, line: i32, col: i32) {
   let base = table
   const dot = siFieldOf(table)
   if dot.length > 0 { base = table.slice(0, table.length - dot.length - 1) }
-  if txListHas(siDeclared, base) { return 0 }
-  if txListHas(siMapG, table) { return 0 }
-  if txListHas(siGuarded, idx) { return 0 }
+  if siHas(siDeclared, base) { return 0 }
+  if siHas(siMapG, table) { return 0 }
+  if siHas(siGuarded, idx) { return 0 }
   const fld = siFieldOf(idx)
   if fld.length > 0 {
-    if txListHas(siHoleF, fld) { siReport(table, idx, 2, idx, line, col) }
+    if siHas(siHoleF, fld) { siReport(table, idx, 2, idx, line, col) }
     return 0
   }
-  const k = txListIndexOf(siPName, idx)
+  const k = siPIx[idx] ?? -1
   if k >= 0 {
     if siPKind[k] == 1 || siPKind[k] == 2 {
       siReport(table, idx, siPKind[k], siPText[k], line, col)
     }
     return 0
   }
-  if siReturned && txListHas(siParams, idx) {
+  if siReturned && siHas(siParams, idx) {
     siReport(table, idx, 3, idx, line, col)
   }
   0
@@ -4297,12 +4319,12 @@ function siGradeRead(table: string, idx: string, line: i32, col: i32) {
 // `arenaScanLint` does — a guard in an `else` arm marks the name and the read goes
 // unreported, a false negative, which is the safe direction for a ratcheted warning.
 function siGradeFn(s: string, f: i32) {
-  siDeclared = []
-  siParams = []
-  siPName = []
+  siDeclared = Map()
+  siParams = Map()
+  siPIx = Map()
   siPKind = []
   siPText = []
-  siGuarded = []
+  siGuarded = Map()
   siReturned = false
   siHeaderNames(s, f, siWorkHdrDecl)
   if siFnReader[f] == 1 { siHeaderNames(s, f, siWorkHdrParam) }
@@ -4347,10 +4369,10 @@ function siGradeFn(s: string, f: i32) {
     siBindAt(s, a, e)
     if siBindKind > 0 {
       let kind = siBindKind
-      if kind == 2 && !txListHas(siHoleF, siFieldOf(siBindText)) { kind = 3 }
-      const k = txListIndexOf(siPName, siBindName)
+      if kind == 2 && !siHas(siHoleF, siFieldOf(siBindText)) { kind = 3 }
+      const k = siPIx[siBindName] ?? -1
       if k < 0 {
-        siPName.push(siBindName)
+        siPIx[siBindName] = siPKind.length
         siPKind.push(kind)
         siPText.push(siBindText)
       } else {
