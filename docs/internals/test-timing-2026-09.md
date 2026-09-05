@@ -162,7 +162,7 @@ Read from each test's code. Causes as briefed: (a) spawns the native binary per 
 | file | ci ≥100 ms | cause | note |
 | --- | ---: | --- | --- |
 | `vl_scaling_shape_test.ts` | 40.3 s | **(d)** | grades a TIME RATIO; exempt, now tagged |
-| `selfhost_native_align_test.ts` | 36.1 s | **(a)+(c)** | one `vl check` per case, ~2,989 spawns; §5a |
+| `selfhost_native_align_test.ts` | 36.1 s | **(a)+(c)** | was one `vl check` per case; batched in §5a |
 | `selfhost_native_diag_pos_test.ts` | 16.7 s | (a) | multi-module fixtures, one spawn each |
 | `vl_test_runner_test.ts` | 14.8 s | (a)+(d) | its parallel-SCHEDULE test is an instrument |
 | `vl_capability_matrix_test.ts` | 12.3 s | (d) | runs `matrix.py` over 26 positions × 2 faces |
@@ -186,7 +186,7 @@ Two classifications were tested and came out **negative**, which is why they are
   across six tests and is not worth the churn.
 * **(f) does not occur.** No test in the suite sleeps or polls.
 
-### 5a · `align`'s spawn floor, and why it was not batched
+### 5a · `align`'s spawn floor — batched, and what it cost to keep the verdicts
 
 The measured floor of a `vl` invocation with a warm `.cwasm` sidecar:
 
@@ -205,15 +205,47 @@ leg is one spawn per case.
 Batching it is worth **13.3×**, measured on `tests/cases/maps`: 236 files cost 4,477 ms as
 236 spawns and **337 ms as one `vl check <dir> --json`** (18 ms/file against 1 ms/file).
 
-**It was not done, for two reasons that are assertion-preserving blockers, not effort.**
-`align` classifies each refusal by STAGE, parsed from stderr's `(parse|type|emit) error` —
-and `vl check --json` carries `file`, `severity`, `code`, `line`, `col`, `message` and **no
-stage**. And a directory walk checks every `.vl` under it as its own entry, including the
-module PARTS that `tiersOf` deliberately excludes. Batching today would weaken the suite.
-The prerequisite is a stage field in the JSON diagnostic; filed as such in the PR.
+**LANDED.** Two blockers stood, both assertion-preserving rather than effort: `align`
+classified each refusal by STAGE parsed from stderr's `(parse|type|emit) error`, which
+`vl check --json` did not carry, and a directory walk would check every `.vl` under it
+as its own entry — including the module PARTS `tiersOf` deliberately excludes. Both are
+now gone. `vl check --json` carries a `stage` on every diagnostic, and
+`vl check --batch --json` takes a file LIST and writes one `{file, exit, diagnostics}`
+record per input, so the parts are never checked at all rather than checked and
+discarded. The record shape is what makes a CLEAN file a row of its own: in a flat array
+it is indistinguishable from one nothing checked. `docs/internals/cli-design.md`
+carries the schema.
 
-(The comment in `selfhost_native_align_test.ts` saying "`vl check` takes one path" is now
-inaccurate — a directory is accepted. The per-case verdict is the real reason.)
+Measured on the merged tree at `47b3a6ac6`, min of 3, on a box at load 15–230 (other
+agents). Reported as measured rather than smoothed — the condition is exactly the one
+§4's table says lies by 150× on a single pass, which is what the min is for:
+
+| | per spawn | batched | ratio |
+| --- | ---: | ---: | ---: |
+| the `vl check` leg alone (CPU s) | 56.3 | **5.0** | 11.2× |
+| the whole suite (CPU s) | 122.3 | **80.4** | 1.52× |
+| the whole suite, 4-core pinned wall (s) | 21.0 | **13.9** | 1.51× |
+
+The leg's **11.2×** sits just under the 13.3× above, and the gap is the population: that
+reading was one directory, and over the whole corpus the per-file module-graph resolution
+is a larger share of what is left. The suite's 1.52× is the leg's −41.9 CPU-seconds
+against a total the already-batched `vl run` waves dominate — `align` is no longer 38% of
+the native step's CPU, but it is still its largest file, and the `vl run` waves are where
+the rest of it now is.
+
+**Every case's verdict is identical**: 2,887 of 2,887 tests, same names, same statuses,
+nothing added or removed. Under that, the two inputs the tier assertions read were
+compared per case, per-spawn against batched, over all 2,848 tiered cases: the exit code
+agrees on every one and the stage on 2,841. The seven that differ are the REGEX's false
+positive rather than the batch's — it matched `(parse|type|emit) error` anywhere in
+stderr, including inside a diagnostic's own message and inside the source line a caret
+block echoes (`// the hint's own suggestion was a parse error` is one). All seven exit 0,
+so the value fed a failure message that is never built.
+
+Four sabotages, each naming the population it breaks: every case reading one shared
+record fails 526 of 2,887, never deriving the stage 526, taking the batch PROCESS's exit
+code instead of the record's 527, and dropping the message text 51 — exactly the
+emit-reject tier, which is the only tier that reads it.
 
 ### 5b · The one mechanical fix applied: one compiled Module per file
 

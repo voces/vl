@@ -235,6 +235,7 @@ import {
   lintCount,
   lintLineAt,
   lintMsgAt,
+  lintReset,
   lintSetPath,
   lintSetSource,
   lintSevAt,
@@ -306,6 +307,11 @@ let vcDgCol: i32[] = []
 // covers. Equal to `vcDgCol` for an entry with no span (the point rendering).
 let vcDgEnd: i32[] = []
 let vcDgMod: i32[] = []
+// How many of `P.diags`' LEADING entries the module order/validate phase produced
+// (an unresolvable specifier, an import cycle). `modCompile` runs that phase before a
+// token is loaded and returns straight after, so its findings are always a prefix —
+// which is what lets `diagStage` call them `import` rather than `parse`.
+let modResolveDiagN = 0
 // The module whose source `vcLoadToks` is currently loading — a lex diag's
 // owner. The modCompile parse loop sets it per module; 0 elsewhere.
 let vcLoadMod = 0
@@ -329,6 +335,7 @@ function vcDgReset() {
   vcDgEnd = []
   vcDgMod = []
   vcLoadMod = 0
+  modResolveDiagN = 0
   dgLosslessReset()
   0
 }
@@ -904,7 +911,12 @@ export function lintSrc(): i32 {
   // are as real as any other file's; only a lossy parse still returns -1. The parse
   // diagnostics are not lost — every caller reads them from the error stream before
   // or beside this call.
-  if vcParseBlocked() { return -1 }
+  if vcParseBlocked() {
+    // `lint(root)` is what normally clears the sink, so without this a caller reading
+    // the count regardless is handed the PREVIOUS source's findings against this file.
+    lintReset()
+    return -1
+  }
   // Comments never reach the arena; the comment-budget rules read the text.
   lintSetSource(vcSource())
   lint(root)
@@ -1787,6 +1799,19 @@ export function diagCount(): i32 {
   let n = P.diags.length + T.diags.length
   if emitErr.length > 0 { n = n + 1 }
   n
+}
+// The stage that produced diagnostic `i`, over the same index math every other `diag*`
+// accessor uses: `P.diags` is the front end's stream, `T.diags` the checker's, and the
+// trailing `emitErr` the emitter's one refusal. `import`, `parse`, `type` or `emit` —
+// the four the return-code ladder and the module phase distinguish.
+export function diagStage(i: i32): string {
+  if i < P.diags.length {
+    if i < modResolveDiagN { return "import" }
+    return "parse"
+  }
+  const j = i - P.diags.length
+  if j < T.diags.length { return "type" }
+  "emit"
 }
 function vcDiagMsgMemo(i: i32): string {
   if vcDiagMsgBufI != i {
@@ -3211,6 +3236,7 @@ function modCompile(emit: i32): i32 {
       P.diags.push({ msg: modDiags[d], at: -1 })
       d = d + 1
     }
+    modResolveDiagN = modDiags.length
     return 1
   }
   // 2. Parse each module dependency-first into the SHARED arena. Tokens append

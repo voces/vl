@@ -522,6 +522,7 @@ program verbatim — the only way to pass one that starts with `-`.
 {c}vl check{r} — typecheck; print diagnostics
 
 {b}Usage:{r} vl check [path] [flags]      {d}default path: the current directory{r}
+       vl check --batch [path]... [flags]
 
 A single file checks its whole resolved module graph; a directory walks
 every .vl file under it.
@@ -531,6 +532,10 @@ every .vl file under it.
                       (default error; also spelled --severity=<s>)
   {c}--concise{r}           One line per diagnostic
   {c}--json{r}              JSON diagnostics (machine output: never colored)
+  {c}--batch{r}             Take MANY paths and check them in one process. With
+                      --json, stdout is one record per input file rather than
+                      one array {d}(file, exit, diagnostics){r}, in argv order, each
+                      file graded exactly as `vl check <file>` grades it
   {c}--codegen{r}           Also run the emitter and VALIDATE the emitted module
   {c}--no-validate{r}       (with --codegen) skip the engine's verdict
   {c}--fix{r}               Apply safe autofixes, writing files in place
@@ -553,6 +558,7 @@ every .vl file under it.
 {b}Examples:{r}
   vl check
   vl check src/main.vl --severity info --concise
+  vl check --batch --json a.vl b.vl c.vl   {d}one verdict record per file{r}
 "
         ),
         // Parser of record: cliParseArgs in compiler/cli.vl (inside the seed).

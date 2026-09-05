@@ -34,8 +34,8 @@ per result, a live set copied whole at every function — where the first pass's
 | # | finding | evidence | size | risk | proof a landing owes |
 | --- | --- | --- | --- | --- | --- |
 | 1 | `srcIsUnannotatedObjBinding` (`typecheck.vl:14593`) resolves a name by first arena match, so an unrelated earlier binding disables D938's soundness refusal (§2) | witness: `vl check` rc 1 → **rc 0 + invalid wasm** when a decoy moves above the const; decoy below it, refusal holds | S | low | the two-arm ablation flipping back to rc 1; `regress.py` 0 `runs → not-runs`; an inventory row and a `tests/cases` fixture — **landed #2622** (D1609) |
-| 2 | `symRefAt` re-runs `symOccAt` plus a second full `symOccTok` scan per `k`, and the LSP calls it once per result (§3) | same file, cursor moved only: 252 refs 0.5 ms, 2,002 refs **22.9 ms**; 1-ref control 0.0 ms at every size | S | low | the ladder flat in the reference count; `lsp_crossfile_refs_wasm_test.ts`, `lsp_rename_wasm_test.ts`, `lsp_document_highlight_wasm_test.ts` |
-| 3 | `daSnapshot`/`daClear`/`daRestore` copy the whole live set at every function body; the set holds every module binding until pass 2 reaches it (§4) | **2.75% of a self-compile**; `daSnapshot` 91.4% reached from `checkFuncDeclNode`; same file reordered **1.82 s → 0.19 s** at N=8,000 F=800 | M | low | the order control at ratio ≤ 1.5; `regress.py`; `deno task test` + `--prove-fixpoint` (the seed changes) |
+| 2 | `symRefAt` re-runs `symOccAt` plus a second full `symOccTok` scan per `k`, and the LSP calls it once per result (§3) | same file, cursor moved only: 252 refs 0.5 ms, 2,002 refs **22.9 ms**; 1-ref control 0.0 ms at every size | S | low | the ladder flat in the reference count; `lsp_crossfile_refs_wasm_test.ts`, `lsp_rename_wasm_test.ts`, `lsp_document_highlight_wasm_test.ts` — **landed #2639** |
+| 3 | `daSnapshot`/`daClear`/`daRestore` copy the whole live set at every function body; the set holds every module binding until pass 2 reaches it (§4) | **2.75% of a self-compile**; `daSnapshot` 91.4% reached from `checkFuncDeclNode`; same file reordered **1.82 s → 0.19 s** at N=8,000 F=800 | M | low | the order control at ratio ≤ 1.5; `regress.py`; `deno task test` + `--prove-fixpoint` (the seed changes) — **landed #2639** at a ratio of 5.2×, with §4's own family gone from the profile and the residue §9's |
 | 4 | `recordRedundantAnnot`'s `=`-token scan runs to the end of the token stream after it has the answer (`typecheck.vl:6140`–`:6156`) (§5) | **0.64% self**, 100% of its samples reached from `checkLetDeclNode`; the loop body is guarded by `if eqTok < 0` and the loop condition is not | XS | low | byte-identical seed; profile A/B |
 | 5 | the deferred-constraint layer is **8 families, 37 hand-written columns, 37 push sites, 18 functions, 663 lines**, with nothing enforcing lockstep (§6) | `typecheck.vl:613`–`:754` declarations, `:15770`–`:17521` writers and readers | M | medium | byte-identical seed; a test that a family's columns are equal length after a check |
 | 6 | 35 `nodeTyIs*` / `nodeArrayElemIs*` predicates; **7 of the 18 raw-ratio ≥ 0.70 duplicate pairs in the whole scope are inside this one family** (§7) | three of them at normalised ratio 1.000 with raw 0.846–0.941, and a fourth 1.000 pair at raw 0.467 | M | low | byte-identical seed |
@@ -197,6 +197,10 @@ existing suites (`lsp_crossfile_refs_wasm_test.ts`, `lsp_rename_wasm_test.ts`,
 `lsp_document_highlight_wasm_test.ts`) pin the answers. Proof: the ladder above flat in
 `n`.
 
+**Landed #2639** as `symRefFillAt` over the `symRefOcc` column, memoised on the cursor and
+dropped with the occurrence table. The ladder is 0.1 / 0.1 / 0.2 / 0.3 ms against master's
+0.6 / 1.8 / 6.6 / 25.5 on the same box.
+
 ## 4 · Definite assignment still copies the whole live set per function
 
 #2584 made membership and mark O(1) by sid-keying `daPos`. What it did not change is that
@@ -255,6 +259,16 @@ only saves and restores (the function-body case, which is 91% of the samples) ne
 materialises one. Size M. Risk low. Proof: the order control at ratio ≤ 1.5,
 `regress.py` 0 `runs → not-runs`, `deno task test` plus ci-native plus `--prove-fixpoint`
 (the seed changes, so byte-identity is not available).
+
+**Landed #2639** as `daEnterFrame`/`daLeaveFrame` over a generation column: the family falls
+from **2.74% to 0.08%** of the same profile, the order control's pathological arm from 2.23 s
+to 0.97 s at N=8,000 F=800, and the L2 self-compile from 4.13 to 3.99 CPU seconds. The order
+RATIO lands at 5.2×, not the ≤ 1.5 asked for here — the candidate's own first-arm profile
+carries none of this family and reads `__str_eq__` / `__map_probe__` under `checkLetDeclNode`,
+so the residue is §9's name-keyed registries. **And the control arm is not one effect**: a
+neighbourhood scan at N=12,000–24,000 puts every cell at 0.88–1.06× except (16,000, 1,600),
+which sits at 1.66× with both its neighbours in each axis clean — the same non-monotonicity
+this section's own control column shows, and it is not the definite-assignment family.
 
 ## 5 · A loop that keeps going after it has the answer
 
