@@ -14,6 +14,7 @@ The language and CLI as a user mental model.
 - [`guide/unions.md`](guide/unions.md) — union types and variant discrimination.
 - [`guide/collections-design.md`](guide/collections-design.md) — `T[]` / `Map` / `Set` syntax and semantics; §"What you write TODAY" is the shipped spelling table (a map TYPE is `{[K]: V}`, `Map()` is the constructor).
 - [`guide/strings-design.md`](guide/strings-design.md) — string representation and API.
+- [`guide/bytes.md`](guide/bytes.md) — reading integers out of a `u8[]` (`std:bytes`): the eight widths and byte orders, why there is no `u32le`, floats by bitcast, and what an out-of-range offset does.
 - [`guide/lambda-param-skip-design.md`](guide/lambda-param-skip-design.md) — lambda param-skip ergonomics.
 - [`guide/language-todo.md`](guide/language-todo.md) — language feature backlog.
 
