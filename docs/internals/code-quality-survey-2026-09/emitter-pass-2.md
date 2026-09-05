@@ -88,7 +88,7 @@ while the ambient `pending*` write count went **311 → 330** (§8).
 |---|---|---|---|---|---|
 | 1 | `buildVariantTwins` rebuilds `variantSig` for both operands of every pair in an O(n²) scan; `variantSig(i)` is loop-invariant and `variantSig(d)` is a pure function of tables the loop never writes (§2) | **30.34% self** of a 3,200-union compile, **99.7%** of it from that one loop; the axis reads **3.86 / bar 4.0** at 1,600 unions — **re-graded on the merged tree at 27.62% and 3.88** (§0) | XS | none | byte-identical seed; `regress.py`; the `unions` axis ratio |
 | 2 | The env-parameter ABI is module-wide: one function value gives **every** function a `structref` param and **every** direct call a `ref.null none` — #2609 named this as "where the next slice is" and it is unsized (§4) | **+82,534 B (+3.83%)** on the compiler, independently reproducing #2609's +82,151; only **24.2%** of functions in the 611 paying `tests/cases` modules are address-taken, so three in four could keep the plain ABI | L | high | `matrix.py`, `regress.py`, corpus byte identity, an owner ruling on the ABI split |
-| 3 | Seven `expr*Array` classifiers each ask `unionIdentReadKind` independently, and each re-interns the identifier's sid (§5.2) | `unionIdentReadKind` **21.12% inclusive** on the `functions` axis; `sidOfNode` 5.90% self, half of it under `unionNameOfIdentSid` | M | med | byte-identical seed; corpus `cmp` |
+| 3 | ~~Seven `expr*Array` classifiers each ask `unionIdentReadKind` independently, and each re-interns the identifier's sid~~ — the memo is REFUTED by measurement and `sidOfNode` already memoises; the work removals landed (§5.2) | `unionIdentReadKind` **21.12% inclusive** on the `functions` axis, **91.0%** of its calls repeats of a seen `(exprIx, fnIx)` — and **3 of them answer differently**, witness `wfHit` in `typecheck.findFnDeclIn`. `sidOf` 2.51% inclusive, 89.5% from one string-taking call site | M | med | byte-identical seed; corpus `cmp` |
 | 4 | The rep-key renderer is written five times: three `*KeyGo` bodies at 110/115/98 lines and 85–98% pairwise, three 33-line entry points at 100%, while `repElemIdGo(ty, mv)` already proves the merge (§5.1) | script-measured token similarity; `repCanonId`/`repElemId`/`repMvValId` are identical after normalisation | M | med | byte-identical seed; `rep-fuzz-check.sh` |
 | 5 | The table section is sized to the function count while the element section it feeds is sized to the address-taken set — the same ordering #2609 fixed one section over (§4.4) | arm B declares `(table $0 5039 funcref)` with an **empty** element section | XS | low | byte-identical seed on a no-function-value program; `wasm-dis` on one paying module |
 | 6 | Four phase flags mark one monotone arena timeline; only one of the six arena-stability mechanisms has a gate (§6) | `capCacheOn`, `postMonoShapes`, `anonLeafEmitPhase`, `emitArenaFinal`, plus `monoArenaTick` (gated) and ten `caSeen*` prefix marks | L | med | byte-identical seed; a new pass-table rule + its control |
@@ -482,6 +482,41 @@ not need the sixteen call sites merged.
 *Size* M. *Risk* med — the answer depends on narrowing state, so the memo's key has to carry
 the frame, not only the sid, and an epoch stamp has to retire it when narrowing moves.
 *Proof*: byte-identical seed; corpus `cmp`; the `functions` axis.
+
+**Graded: the memo is REFUTED and the intern is already done; the work removals landed.** An
+instrumented compiler (scratch build, never a seed) banking every `(exprIx, fnIx)` answer and
+re-deriving it on each repeat reports, on the compiler's own source, **532,158 calls · 47,851
+distinct keys · 484,307 repeats (91.0%) · 3 DISAGREEMENTS**, and on the `functions` many arm
+1,653,966 · 97,681 · 1,556,285 (94.1%) · 0. The witness is `wfHit` (`typecheck.vl`
+`findFnDeclIn`): `unionNameOfIdentSid` answers `""` at the first ask and `"i32|null"` later,
+with `dupScanActive` and `blockLetHidden` both clear and the lexical scope stack 0 entries deep
+then 2 — so it is not the D1595 / D1597 flags but a phase move, and the map-value registry the
+`LetDecl`'s initializer needs is not built at the first ask. Keying the GUARD alone does not
+rescue it: `unionNameOfIdentSid` on `(sid, fnIx)` disagrees **6** times over 912,090 repeats.
+A key that carried this would have to bump on every scope, narrowing, arena and registry move,
+and a stale hit is a silent miscompile.
+
+**And `sidOfNode` already memoises** — `symbols.vl`'s `sidNode` column, filled lazily and
+dropped per compile — so the sid-taking path re-interns nothing. What did re-intern is the
+STRING-taking twin: `unionNameOfExpr`'s ident arm called `unionNameOfIdent(e.identName, …)`,
+which hashes and probes `sidMap`, with the node index already in hand. `sidOf` is **2.51%
+inclusive** on the many arm and **89.5% of it is that one call site**.
+
+*Landed*: the ident arm takes `unionNameOfIdentSid(sidOfNode(…), fnIx)`; the param scan compares
+the side-table id before paying the arena read and the `Param` narrowing; and both union-registry
+membership tests render the spelling on the far side of the test that discards it (`tyNameOf` is
+1.33% self, 95% of it under those two). Byte-identical output on master's own source and on all
+2,983 fixtures. The `functions` axis RATIO is unchanged — the work removed is per-identifier in
+BOTH arms — so its bar stays at 2.5; the absolute arms fall, many 0.83 s → 0.79 s and one
+0.78 s → 0.73 s, with L2 self-compile 4.26 s → 4.04 s (min of five interleaved).
+
+*Not landed, and worth its own row*: hoisting `unionNameOfExpr`'s eleven `unwrapParen(exprIx)`
+calls to one local costs a further ~0.33% and is blocked by `sentinel-index-unguarded`, which
+flags `P.nodes[<named call result>]` but not the same read spelled inline. The hit is DEFENSIVE
+by argument — `unwrapParen` reads `P.nodes[cur]` on every rung, so it traps before it can return
+a negative — but a ratchet may only fall, and neither suppressing the hit nor adding a guard on
+an unreachable branch is the right close. The same spelling already stands elsewhere in the file
+and is inside the baseline.
 
 ### 5.3 Fifteen copies of two eight-line scans
 
