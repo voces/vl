@@ -190,7 +190,7 @@ Deno.test({
 });
 
 Deno.test({
-  name: "matrix: D1197's `.push` cell runs; D1370's four annotated captures are the price",
+  name: "matrix: D1197's `.push` cell runs, and D1370's four annotated captures run too",
   ignore: !ENABLED,
   fn: async () => {
     const { code, cells } = await runMatrix("narrowed-nullable-ref-push.matrix.vl");
@@ -209,28 +209,26 @@ Deno.test({
       // so rather than reporting a refusal it manufactured itself.
       wantVerdict(cells, "global_init", face, "skipped", "a global init cannot nest in a guard");
     }
-    // D1370 — THE PRICE D1244's FRAME BOUGHT, PINNED BY NAME AND BY FACE. Making a
-    // module-scope block a real frame let four captured cells reach the emitter, and the
-    // ANNOTATED rebind arrives with a rep nothing converts: `const c: Item = e` under
-    // `if e != null`. On master all four were D1244's own loud message. Eight cells left the
-    // loud column here — four to RUNS, these four to SILENT, with runs -> not-runs at zero.
-    // The un-annotated face of every one of them RUNS, which is why the face is part of the
-    // pin: a fix that moves the annotated four must not quietly move the other face instead.
+    // D1370 — CLOSED (D1632). Making a module-scope block a real frame let four captured
+    // cells reach the emitter, and the ANNOTATED rebind then arrived with a rep nothing
+    // converted: `const c: Item = e` under `if e != null`. `captureValKind` now types the env
+    // field from the LOCAL rather than re-deriving it from the annotation, so all four run.
+    // The face stays part of the pin: the un-annotated one ran throughout, and a fix that
+    // moved only one face would show here rather than in a count.
     for (const p of ["closure_capture", "block_if_capture", "block_while_capture", "block_bare_capture"]) {
-      wantVerdict(cells, p, "annotated", "SILENT", "D1370. When it closes, change to RUNS");
-      wantVerdict(cells, p, "un-annotated", "RUNS", "D1370's un-annotated face already runs");
+      wantVerdict(cells, p, "annotated", "RUNS", "D1370 closed: the env field matches the local");
+      wantVerdict(cells, p, "un-annotated", "RUNS", "D1370's un-annotated face always ran");
     }
-    // Non-zero BECAUSE of those four and nothing else. The count is asserted so a fifth
-    // silent cell cannot hide behind a pin that only names four.
+    // No silent cell survives, and the count is asserted so a new one cannot appear unnamed.
     const silent = cells.filter((c) => verdictOf(c.grade) === "SILENT");
-    if (silent.length !== 4) {
+    if (silent.length !== 0) {
       throw new Error(
-        `want exactly D1370's 4 SILENT cells, got ${silent.length}: ` +
+        `want 0 SILENT cells once D1370 closes, got ${silent.length}: ` +
           silent.map((c) => `${c.position}/${c.face}`).join(", "),
       );
     }
-    if (code === 0) {
-      throw new Error("want a non-zero exit while D1370's four cells are SILENT, got 0");
+    if (code !== 0) {
+      throw new Error(`want exit 0 once D1370's four cells run, got ${code}`);
     }
   },
 });
