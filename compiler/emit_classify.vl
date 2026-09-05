@@ -106,6 +106,7 @@ import {
   nodeTyIsMap,
   nodeTyIsNulBool,
   nodeTyIsNulBoolList,
+  nodeTyIsNulFunc,
   nodeTyIsNulLitUnion,
   nodeTyIsNulNumLitUnion,
   nodeTyIsNulScalarBox,
@@ -2694,6 +2695,28 @@ function fnParamNodeOf(fnIx: i32, name: string) {
   -1
 }
 
+// Whether an un-annotated binding's initializer carries a `TyFunc` in the arena — the
+// checker's own answer, for the spellings `letIsClosure`'s syntactic ladder cannot reach.
+function letInitTyIsFunc(letIx: i32): boolean {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letInit < 0 { return false }
+    return nodeTyIsFunc(d.letInit)
+  }
+  false
+}
+
+// The nullable twin: the initializer carries a `TyNullable` over a `TyFunc`, which a bare
+// `const t = m[k]` read of a function-valued map is and no syntactic arm claims (D1621).
+function letInitTyIsNulFunc(letIx: i32): boolean {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letInit < 0 { return false }
+    return nodeTyIsNulFunc(d.letInit)
+  }
+  false
+}
+
 // The `fbValtype` kind an un-annotated binding's initializer decides, through the same
 // per-`let` predicates `collectLocals` types the binding with and in the same order — the one
 // home of that ladder, shared by `captureValKind` and `letCellKind`. `"i32"` when no arm
@@ -2764,7 +2787,11 @@ function letInitCellKind(letIx: i32, fnIx: i32): VKind {
   if letIsRefArray(letIx, fnIx) && !letIsUnion(letIx, fnIx) { return "reflist" }
   // The nullable closure fat-pointer, before `letIsUnion` (the `fn | null` annotation reads
   // as a union name) and before the non-null closure.
-  if letIsNulClosure(letIx, fnIx) || letInfersNulClosure(letIx, fnIx) {
+  if (
+    letIsNulClosure(letIx, fnIx) ||
+    letInfersNulClosure(letIx, fnIx) ||
+    letInitTyIsNulFunc(letIx)
+  ) {
     return "nulclosure"
   }
   if letIsVariant(letIx, fnIx) { return "variant" }
@@ -2786,6 +2813,11 @@ function letInitCellKind(letIx: i32, fnIx: i32): VKind {
   if letIsF32(letIx) || letInfersF32(letIx, fnIx) { return "f32" }
   if letIsF64(letIx, fnIx) { return "f64" }
   if letIsClosure(letIx, fnIx) { return "closure" }
+  // The arena rung beside it: a field, element or map read yields a function value the
+  // syntactic predicates cannot resolve during a pass that runs before the locals registry
+  // is built, and the checker already recorded a `TyFunc` for it. Structural, so a func
+  // ARRAY and a NULLABLE closure are excluded and only the plain rep claims (D1621).
+  if letInitTyIsFunc(letIx) { return "closure" }
   // The `boolean | null` niche — a plain i32 to `fbValtype`, but a dedicated kind so the
   // sentinel-2 rep is reachable and a later `x = null` stays valid.
   if letNulBool(letIx, fnIx) { return "nulbool" }
@@ -30977,12 +31009,22 @@ function blockTailIsClosure(blockIx: i32, fnIx: i32) {
     const last = stmts[n - 1]
     const s = P.nodes[last]
     if s is RetStmt {
-      if s.retArg >= 0 { return exprIsClosureNoLocal(s.retArg, fnIx) }
+      if s.retArg >= 0 { return tailValueIsClosure(s.retArg, fnIx) }
       return false
     }
-    return exprIsClosureNoLocal(last, fnIx)
+    return tailValueIsClosure(last, fnIx)
   }
   false
+}
+
+// The tail value's own question, asked of the ARENA first and of the syntax second. The
+// checker recorded a `TyFunc` for every spelling that yields a function value — a call
+// hop, a returned local, a chain of them — and `nodeTyIsFunc` is structural, so a func
+// ARRAY and a NULLABLE closure are excluded and only the plain `closure` rep claims (D1620).
+function tailValueIsClosure(exprIx: i32, fnIx: i32) {
+  if exprIx < 0 { return false }
+  if nodeTyIsFunc(exprIx) { return true }
+  exprIsClosureNoLocal(exprIx, fnIx)
 }
 
 // The declaration half of `exprIsClosureNoLocal`'s binding arm: "does this `let`/`const`
