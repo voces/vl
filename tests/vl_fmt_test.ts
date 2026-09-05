@@ -6,18 +6,7 @@
 // GATING: same as tests/selfhost_native_align_test.ts — env-gated
 // (`SELFHOST_NATIVE_ALIGN=1`) AND requires the built binary + seed wasm.
 
-const exists = (p: string): boolean => {
-  try {
-    Deno.statSync(p);
-    return true;
-  } catch {
-    return false;
-  }
-};
-
-const ROOT = new URL("../", import.meta.url).pathname.replace(/\/$/, "");
-const VL = `${ROOT}/scripts/vl-host/target/release/vl`;
-const COMPILER = `${ROOT}/build/vl-compiler.wasm`;
+import { COMPILER, ROOT, VL, exists, nativeEnv } from "./support/tree.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER);
@@ -35,7 +24,7 @@ const run = async (
     stdin: stdin === undefined ? "null" : "piped",
     stdout: "piped",
     stderr: "piped",
-    env: { RUST_BACKTRACE: "0", NO_COLOR: "1" },
+    env: nativeEnv({ NO_COLOR: "1" }),
   });
   const child = cmd.spawn();
   if (stdin !== undefined) {
@@ -63,7 +52,7 @@ const runOn = async (
     args: [sub, file, "--compiler", COMPILER],
     stdout: "piped",
     stderr: "piped",
-    env: { RUST_BACKTRACE: "0", NO_COLOR: "1" },
+    env: nativeEnv({ NO_COLOR: "1" }),
   }).output();
   return {
     code,
@@ -244,7 +233,7 @@ Deno.test({
         args: ["run", f, "--compiler", COMPILER],
         stdout: "piped",
         stderr: "piped",
-        env: { RUST_BACKTRACE: "0", NO_COLOR: "1" },
+        env: nativeEnv({ NO_COLOR: "1" }),
       });
       const { code, stdout, stderr } = await cmd.output();
       const out = new TextDecoder().decode(stdout);
@@ -303,7 +292,7 @@ Deno.test({
         args: ["check", f, "--compiler", COMPILER],
         stdout: "piped",
         stderr: "piped",
-        env: { RUST_BACKTRACE: "0", NO_COLOR: "1" },
+        env: nativeEnv({ NO_COLOR: "1" }),
       });
       const { code, stdout } = await chk.output();
       if (code !== 0) {
@@ -1030,7 +1019,7 @@ const runCheck = async (path: string): Promise<{ code: number; err: string }> =>
     args: ["check", path, "--compiler", COMPILER],
     stdout: "piped",
     stderr: "piped",
-    env: { RUST_BACKTRACE: "0", NO_COLOR: "1" },
+    env: nativeEnv({ NO_COLOR: "1" }),
   });
   const { code, stderr } = await cmd.output();
   return { code, err: new TextDecoder().decode(stderr) };

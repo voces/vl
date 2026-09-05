@@ -11,7 +11,8 @@
 // depends on: shrinkage passes (it is not a size TARGET), and an absent seed exits
 // 0 with a line saying so, because the `ci` job never builds one.
 
-const ROOT = new URL("../", import.meta.url).pathname.replace(/\/$/, "");
+import { ROOT } from "./support/tree.ts";
+
 const SCRIPT = `${ROOT}/scripts/seed-size.py`;
 const CI_YML = `${ROOT}/.github/workflows/ci.yml`;
 const GATE_SH = `${ROOT}/scripts/gate.sh`;

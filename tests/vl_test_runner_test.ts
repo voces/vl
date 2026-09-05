@@ -24,6 +24,9 @@
 // graded against the RUNNER'S REAL OUTPUT rather than a retyped sample. Pure —
 // `testDiscovery.ts` imports no `vscode` (tests/lsp_test_discovery_test.ts is the
 // unit half of the same pair).
+
+import { COMPILER, ROOT, VL, exists } from "./support/tree.ts";
+
 import { failureAnchor, parseTestReport } from "../lsp/src/testDiscovery.ts";
 
 /**
@@ -34,18 +37,6 @@ import { failureAnchor, parseTestReport } from "../lsp/src/testDiscovery.ts";
 const resolve = (base: string, rel: string): string =>
   rel.startsWith("/") ? rel : `${base}/${rel}`;
 
-const exists = (p: string): boolean => {
-  try {
-    Deno.statSync(p);
-    return true;
-  } catch {
-    return false;
-  }
-};
-
-const ROOT = new URL("../", import.meta.url).pathname.replace(/\/$/, "");
-const VL = `${ROOT}/scripts/vl-host/target/release/vl`;
-const COMPILER = `${ROOT}/build/vl-compiler.wasm`;
 const FIXTURES = `${ROOT}/tests/fixtures/vl-test`;
 const SLOW = `${ROOT}/tests/fixtures/vl-test-parallel`;
 

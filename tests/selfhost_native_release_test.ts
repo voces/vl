@@ -12,6 +12,7 @@ import {
   WASM_OPT,
   buildAndCount,
   exists,
+  nativeEnv,
   rustList,
   vl,
 } from "./support/nativeRelease.ts";
@@ -112,7 +113,9 @@ Deno.test({
 // binaryen still builds everything that did not ask to be optimized.
 //
 // Runs with an emptied environment so neither PATH nor an ambient `$VL_WASM_OPT`
-// can find a binaryen.
+// can find a binaryen. `nativeEnv` puts back only the two tree pins, neither of
+// which is PATH or `$VL_WASM_OPT`, so the probe is unchanged and the fixture is
+// compiled against THIS tree's std rather than the EXE's checkout.
 Deno.test({
   name: "native-release: -O/-O3 FAIL LOUDLY with no wasm-opt (never a silent no-op)",
   ignore: !ENABLED,
@@ -127,7 +130,7 @@ Deno.test({
           stdout: "piped",
           stderr: "piped",
           clearEnv: true,
-          env: { PATH: "" },
+          env: nativeEnv({ PATH: "" }),
         }).output();
         const err = new TextDecoder().decode(stderr);
         if (code === 0) {
@@ -170,7 +173,7 @@ Deno.test({
         stdout: "piped",
         stderr: "piped",
         clearEnv: true,
-        env: { PATH: "" },
+        env: nativeEnv({ PATH: "" }),
       }).output();
       if (code !== 0) {
         throw new Error(

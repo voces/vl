@@ -18,7 +18,8 @@
 //
 // GATING: none. The script reads `compiler/*.vl` as text; no seed, no binary.
 
-const ROOT = new URL("../", import.meta.url).pathname.replace(/\/$/, "");
+import { ROOT } from "./support/tree.ts";
+
 const SCRIPT = `${ROOT}/scripts/emitter-state-audit.py`;
 const EMIT_SECTIONS = `${ROOT}/compiler/emit_sections.vl`;
 

@@ -21,18 +21,7 @@
 // (`SELFHOST_NATIVE_ALIGN=1`) AND requires the built binary + seed wasm, so a
 // plain `deno task test` stays fast and green while CI's native job opts in.
 
-const exists = (p: string): boolean => {
-  try {
-    Deno.statSync(p);
-    return true;
-  } catch {
-    return false;
-  }
-};
-
-const ROOT = new URL("../", import.meta.url).pathname.replace(/\/$/, "");
-const VL = `${ROOT}/scripts/vl-host/target/release/vl`;
-const COMPILER = `${ROOT}/build/vl-compiler.wasm`;
+import { COMPILER, ROOT, VL, exists, nativeEnv } from "./support/tree.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER);
@@ -49,7 +38,7 @@ const check = async (path: string): Promise<{ code: number; err: string }> => {
     args: ["check", path, "--concise", "--compiler", COMPILER],
     stdout: "piped",
     stderr: "piped",
-    env: { RUST_BACKTRACE: "0" },
+    env: nativeEnv(),
   }).output();
   return { code, err: new TextDecoder().decode(stderr) };
 };
@@ -187,7 +176,7 @@ const build = async (path: string): Promise<{ code: number; err: string }> => {
       ],
       stdout: "piped",
       stderr: "piped",
-      env: { RUST_BACKTRACE: "0" },
+      env: nativeEnv(),
     }).output();
     return { code, err: new TextDecoder().decode(stderr) };
   } finally {
@@ -318,7 +307,7 @@ const runIn = async (dir: string): Promise<{ code: number; err: string }> => {
     args: ["run", `${dir}/entry.vl`, "--compiler", COMPILER],
     stdout: "piped",
     stderr: "piped",
-    env: { RUST_BACKTRACE: "0" },
+    env: nativeEnv(),
   }).output();
   return { code, err: new TextDecoder().decode(stderr) };
 };
@@ -328,7 +317,7 @@ const buildIn = async (dir: string): Promise<{ code: number; err: string }> => {
     args: ["build", `${dir}/entry.vl`, "-o", `${dir}/out.wasm`, "--compiler", COMPILER],
     stdout: "piped",
     stderr: "piped",
-    env: { RUST_BACKTRACE: "0" },
+    env: nativeEnv(),
   }).output();
   return { code, err: new TextDecoder().decode(stderr) };
 };
@@ -466,7 +455,7 @@ const runProg = async (path: string): Promise<{ code: number; err: string }> => 
     args: ["run", path, "--compiler", COMPILER],
     stdout: "piped",
     stderr: "piped",
-    env: { RUST_BACKTRACE: "0" },
+    env: nativeEnv(),
   }).output();
   return { code, err: new TextDecoder().decode(stderr) };
 };
@@ -476,7 +465,7 @@ const checkJson = async (path: string): Promise<{ code: number; out: string }> =
     args: ["check", path, "--json", "--compiler", COMPILER],
     stdout: "piped",
     stderr: "piped",
-    env: { RUST_BACKTRACE: "0" },
+    env: nativeEnv(),
   }).output();
   return { code, out: new TextDecoder().decode(stdout) };
 };

@@ -35,6 +35,8 @@
 //
 // PURE — no seed, no binary, no network. It runs in the `ci` job.
 
+import { ROOT } from "./support/tree.ts";
+
 import {
   hasImports,
   hasTemplateHole,
@@ -47,7 +49,6 @@ const assert = (cond: boolean, msg: string): void => {
   if (!cond) throw new Error(msg);
 };
 
-const ROOT = new URL("../", import.meta.url).pathname.replace(/\/$/, "");
 const read = (rel: string): string => Deno.readTextFileSync(`${ROOT}/${rel}`);
 
 const CLI_UTIL = "compiler/cli_util.vl";

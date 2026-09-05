@@ -16,18 +16,8 @@
 // (tests/ci_seed_coverage_test.ts). GATING is the usual one — `SELFHOST_NATIVE_ALIGN=1`
 // plus a built binary and seed, so a fresh clone self-ignores.
 
-const exists = (p: string): boolean => {
-  try {
-    Deno.statSync(p);
-    return true;
-  } catch {
-    return false;
-  }
-};
+import { COMPILER, ROOT, VL, exists } from "./support/tree.ts";
 
-const ROOT = new URL("../", import.meta.url).pathname.replace(/\/$/, "");
-const VL = `${ROOT}/scripts/vl-host/target/release/vl`;
-const COMPILER = `${ROOT}/build/vl-compiler.wasm`;
 const STD = `${ROOT}/std`;
 const CASES = `${ROOT}/tests/cases/extern`;
 

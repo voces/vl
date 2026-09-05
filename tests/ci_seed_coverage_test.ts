@@ -15,7 +15,8 @@
 // moment such a test exists. Wire a new seed-backed test into `ci-native`
 // (preferably via the `vl_*`/`selfhost_native_*` naming) and this goes green.
 
-const ROOT = new URL("../", import.meta.url).pathname.replace(/\/$/, "");
+import { ROOT } from "./support/tree.ts";
+
 const TESTS_DIR = `${ROOT}/tests`;
 const CI_YML = `${ROOT}/.github/workflows/ci.yml`;
 
@@ -23,12 +24,24 @@ const CI_YML = `${ROOT}/.github/workflows/ci.yml`;
 // from its own scan.
 const SELF = "ci_seed_coverage_test.ts";
 
-// A file is seed-backed if it references the seed wasm AND gates on its presence
-// (the `statSync`/`exists(` self-ignore). Both must hold so a passing mention
-// (e.g. a comment) doesn't count.
+// The module that DEFINES the seed path for the whole suite. It is not itself
+// seed-backed — naming a path is not reading it — and it is excluded below for
+// the same reason this file excludes itself. The assertion in the test keeps the
+// exclusion honest: if the definition ever moves, this stops pointing at it.
+const TREE = "tree.ts";
+
+// A file NAMES the seed by the literal path or by `COMPILER`, the constant
+// tests/support/tree.ts derives it as. Before that constant existed every spawner
+// spelled the path itself; a rule reading only the literal now sees almost none
+// of them, which is a detector going quiet rather than a tree getting cleaner.
+const namesSeed = (src: string): boolean =>
+  src.includes("vl-compiler.wasm") || /\bCOMPILER\b/.test(src);
+
+// A file is seed-backed if it NAMES the seed AND gates on its presence (the
+// `statSync`/`exists(` self-ignore). Both must hold so a passing mention (e.g. a
+// comment) doesn't count.
 const isSeedBacked = (src: string): boolean =>
-  src.includes("vl-compiler.wasm") &&
-  (src.includes("statSync") || src.includes("exists("));
+  namesSeed(src) && (src.includes("statSync") || src.includes("exists("));
 
 // A test whose driver lives in `tests/support/` INHERITS its seed-backing. The
 // corpus-oracle shards are three lines each (`registerCorpusOracle(k, n)`) and
@@ -43,6 +56,7 @@ const seedBackedSupport = (): RegExp[] => {
   const out: RegExp[] = [];
   for (const entry of Deno.readDirSync(`${TESTS_DIR}/support`)) {
     if (!entry.isFile || !entry.name.endsWith(".ts")) continue;
+    if (entry.name === TREE) continue;
     const src = Deno.readTextFileSync(`${TESTS_DIR}/support/${entry.name}`);
     if (!isSeedBacked(src)) continue;
     const spec = entry.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -79,6 +93,13 @@ Deno.test("ci-seed-coverage: every seed-backed test runs in ci-native (glob or e
       "found no seed-backed module under tests/support/ — the inheritance rule " +
         "above matches nothing, so a shard whose driver lives there would read " +
         "as pure. Verify the detection still matches the self-ignore convention.",
+    );
+  }
+  if (!Deno.readTextFileSync(`${TESTS_DIR}/support/${TREE}`).includes("vl-compiler.wasm")) {
+    throw new Error(
+      `tests/support/${TREE} no longer defines the seed path, so excluding it ` +
+        `from the support scan excludes nothing. Point TREE at whichever module ` +
+        `defines it now, or drop the exclusion.`,
     );
   }
 

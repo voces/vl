@@ -40,18 +40,8 @@
 // wasm; absent either, every case registers as ignored with a one-line how-to-build
 // note (so a plain `deno task test` stays fast and green; CI's native job opts in).
 
-const exists = (p: string): boolean => {
-  try {
-    Deno.statSync(p);
-    return true;
-  } catch {
-    return false;
-  }
-};
+import { COMPILER, ROOT, VL, exists } from "./support/tree.ts";
 
-const ROOT = new URL("../", import.meta.url).pathname.replace(/\/$/, "");
-const VL = `${ROOT}/scripts/vl-host/target/release/vl`;
-const COMPILER = `${ROOT}/build/vl-compiler.wasm`;
 const CASES = new URL("./cases/", import.meta.url);
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";

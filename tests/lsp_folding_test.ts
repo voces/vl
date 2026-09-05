@@ -16,6 +16,8 @@
 //
 // Run: deno test -A --no-check tests/lsp_folding_test.ts
 
+import { ROOT } from "./support/tree.ts";
+
 import {
   type FoldableExtent,
   foldingRanges,
@@ -473,8 +475,6 @@ Deno.test("folding(extents): with no extents the lexical answer is unchanged", (
 // editor's own semantics: `indentationRules` are line predicates, and
 // `onEnterRules` are tried IN ORDER with the first match winning
 // (`OnEnterSupport.onEnter`).
-
-const ROOT = new URL("../", import.meta.url).pathname.replace(/\/$/, "");
 
 interface EnterAction {
   indent: string;
