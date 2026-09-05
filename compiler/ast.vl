@@ -636,30 +636,42 @@ export function isBodyTyDecl(nodeIx: i32): boolean {
   false
 }
 
-// ── extern declarations: the wasm import manifest ────────────────────────────
+// ── extern declarations: link rows and declaration rows ──────────────────────
 
-// One row per DISTINCT `extern function` name in the module graph, in first-declaration
-// order — the order the import section writes, which is what fixes each extern's wasm
-// function index. A re-declaration of a name already here lands in the duplicate table
-// below, so this stays one row per import.
+// The LINK rows: one per distinct wasm import name in the module graph, in
+// first-declaration order — the order the import section writes, which is what fixes each
+// extern's wasm function index. Two modules declaring one extern share a row, so the name
+// they both spell is one import.
 export let extNames: string[] = []
 export let extRets: string[] = []
 export let extSigs: string[] = []
 export let extPoss: i32[] = []
 export let extParBase: i32[] = []
 export let extParN: i32[] = []
-// The parameter type spellings of every row, contiguous per row — flat rather than a
+// The parameter type spellings of every link row, contiguous per row — flat rather than a
 // `string[][]`, so a row's parameters are `extParTys[base + i]` with no nested list.
 export let extParTys: string[] = []
-// Every re-declaration of a name already in the manifest, with its rendered signature and
-// its own name token. The checker compares each against the manifest row and reports only
-// the ones that disagree, so declaring one extern in two modules costs nothing.
-export let extDupNames: string[] = []
-export let extDupSigs: string[] = []
-export let extDupPoss: i32[] = []
 
-// Per-compile reset, called wherever `P.nodes = []` is: the manifest spans the whole module
-// graph, so it must outlive one module's parse and must not outlive one program's compile.
+// The DECLARATION rows: one per `extern function` written anywhere in the graph. `extDeclVl`
+// is the name VL resolves — mangled by the module merge, so a module-private extern is
+// private to name lookup while the link name it points at stays shared. `extDeclSig` is that
+// declaration's own rendered signature, which the checker compares against its link row's.
+export let extDeclVl: string[] = []
+export let extDeclLink: i32[] = []
+export let extDeclSig: string[] = []
+export let extDeclPos: i32[] = []
+export let extDeclMod: i32[] = []
+// The module index `externAdd` stamps on a declaration. The driver's per-module parse loop
+// sets it; a single-source program never does, and its one module is 0 by construction.
+export let externCurMod = 0
+
+export function externSetMod(m: i32) {
+  externCurMod = m
+  0
+}
+
+// Per-compile reset, called wherever `P.nodes = []` is: the tables span the whole module
+// graph, so they must outlive one module's parse and must not outlive one program's compile.
 export function externReset() {
   extNames = []
   extRets = []
@@ -668,14 +680,17 @@ export function externReset() {
   extParBase = []
   extParN = []
   extParTys = []
-  extDupNames = []
-  extDupSigs = []
-  extDupPoss = []
+  extDeclVl = []
+  extDeclLink = []
+  extDeclSig = []
+  extDeclPos = []
+  extDeclMod = []
+  externCurMod = 0
   0
 }
 
-// The manifest row for `name`, or -1. This index is the identity of an extern everywhere
-// downstream: the checker's declaration, the import entry and the call lowering all key on it.
+// The link row whose import name is `name`, or -1. Keyed on the name the AUTHOR wrote, which
+// is what makes two modules' declarations one import.
 export function externSlot(name: string): i32 {
   let i = 0
   while i < extNames.length {
@@ -685,31 +700,44 @@ export function externSlot(name: string): i32 {
   -1
 }
 
+// The link row a VL name resolves to, or -1 — the lookup every consumer past the merge takes,
+// since a call site carries the merged (possibly mangled) name and not the import name.
+export function externLinkOf(vlName: string): i32 {
+  let i = 0
+  while i < extDeclVl.length {
+    if extDeclVl[i] == vlName { return extDeclLink[i] }
+    i = i + 1
+  }
+  -1
+}
+
 // How many imports the manifest declares — the entry count the import section writes and the
 // standalone functype count the type section appends.
 export function externCount(): i32 { extNames.length }
+
+export function externDeclCount(): i32 { extDeclVl.length }
 
 export function externNameAt(k: i32): string {
   if k < 0 || k >= extNames.length { return "" }
   extNames[k]
 }
 
-// The return type spelling of row `k`; `""` when the declaration named none, which is a void
-// import and not a missing one.
+// The return type spelling of link row `k`; `""` when the declaration named none, which is a
+// void import and not a missing one.
 export function externRetAt(k: i32): string {
   if k < 0 || k >= extRets.length { return "" }
   extRets[k]
 }
 
-// The parameter count of row `k`, or -1 out of range — which every caller treats as "this row
-// is not emittable", never as an arity.
+// The parameter count of link row `k`, or -1 out of range — which every caller treats as
+// "this row is not emittable", never as an arity.
 export function externArityAt(k: i32): i32 {
   if k < 0 || k >= extParN.length { return -1 }
   extParN[k]
 }
 
-// The type spelling of parameter `i` of row `k`, or `""` out of range — read by the functype
-// writer and the call lowering, which treat `""` as an unemittable row rather than as a type.
+// The type spelling of parameter `i` of link row `k`, or `""` out of range — read by the
+// functype writer and the call lowering, which treat `""` as an unemittable row.
 export function externParamAt(k: i32, i: i32): string {
   if k < 0 || k >= extParN.length { return "" }
   if i < 0 || i >= extParN[k] { return "" }
@@ -718,9 +746,18 @@ export function externParamAt(k: i32, i: i32): string {
   extParTys[at]
 }
 
-// Record one `extern function` and answer its manifest row. A name already in the manifest
-// banks its signature in the duplicate table instead of appending a second import, so two
-// modules declaring one extern agree by construction and only a DISAGREEMENT reaches the checker.
+// Rebind declaration `d`'s VL name — the module merge's hook, which mangles a declared name
+// so a module-private extern cannot be reached by spelling it in another module. The LINK
+// name is untouched, so the import section still carries what the author wrote.
+export function externRenameDecl(d: i32, vlName: string) {
+  if d < 0 || d >= extDeclVl.length { return 0 }
+  extDeclVl[d] = vlName
+  0
+}
+
+// Record one `extern function`, answering its declaration row. A name already linked reuses
+// that link row rather than appending a second import, so two modules declaring one extern
+// agree by construction and only a DISAGREEMENT of signatures reaches the checker.
 export function externAdd(
   name: string,
   params: string[],
@@ -735,25 +772,27 @@ export function externAdd(
     i = i + 1
   }
   sig = sig + ")->" + ret
-  const prior = externSlot(name)
-  if prior >= 0 {
-    extDupNames.push(name)
-    extDupSigs.push(sig)
-    extDupPoss.push(pos)
-    return prior
+  let link = externSlot(name)
+  if link < 0 {
+    extNames.push(name)
+    extRets.push(ret)
+    extSigs.push(sig)
+    extPoss.push(pos)
+    extParBase.push(extParTys.length)
+    extParN.push(params.length)
+    let j = 0
+    while j < params.length {
+      extParTys.push(params[j])
+      j = j + 1
+    }
+    link = extNames.length - 1
   }
-  extNames.push(name)
-  extRets.push(ret)
-  extSigs.push(sig)
-  extPoss.push(pos)
-  extParBase.push(extParTys.length)
-  extParN.push(params.length)
-  let j = 0
-  while j < params.length {
-    extParTys.push(params[j])
-    j = j + 1
-  }
-  extNames.length - 1
+  extDeclVl.push(name)
+  extDeclLink.push(link)
+  extDeclSig.push(sig)
+  extDeclPos.push(pos)
+  extDeclMod.push(externCurMod)
+  extDeclVl.length - 1
 }
 
 // Constraints phase 1: bounds, kept where annotations are kept. Both tables store an

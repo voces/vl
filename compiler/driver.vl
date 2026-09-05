@@ -88,7 +88,14 @@ import {
   declNameTokOf,
   dgAllLossless,
   dgLosslessReset,
+  extDeclLink,
+  extDeclMod,
+  externDeclCount,
+  externLinkOf,
+  externNameAt,
+  externRenameDecl,
   externReset,
+  externSetMod,
   fnRequiredArity,
   fnTpBoundOf,
   i32ToStr,
@@ -2323,6 +2330,27 @@ function modResolveSpecifier(spec: string, fromKey: string): string {
 // Tokenizes the committed source and walks top-level tokens (brace-depth tracked):
 // each import records one entry per specifier, each exported declaration records a
 // name. A clean tokenization is banked and `vcLoadToksMod` replays it instead.
+
+// One `export`-marked declaration recorded for module `m`. The declared NAME token sits at
+// `i + dOff + 1`, and the `export` keyword's own span is the target of the redundant-export
+// hint (an export used locally but imported nowhere).
+function modExportRecord(
+  m: i32,
+  name: string,
+  nameLine: i32,
+  nameCol: i32,
+  kwLine: i32,
+  kwCol: i32,
+) {
+  expMod.push(m)
+  expName.push(name)
+  expDeclLine.push(nameLine)
+  expDeclCol.push(nameCol)
+  expKwLine.push(kwLine)
+  expKwCol.push(kwCol)
+  0
+}
+
 function modScan(m: i32, src: string): i32 {
   const r = tokenize(src)
   const toks = r.tokens
@@ -2587,16 +2615,22 @@ function modScan(m: i32, src: string): i32 {
         if toks[i + 1].kind == "IDENT" && toks[i + 1].text == "flat" {
           if i + 3 < toks.length && toks[i + 2].kind == "TYPE" { dOff = 2 }
         }
+        // `export extern function n(…)` puts the `extern` keyword in the same slot `flat`
+        // takes, so the declared name is one token further along here too.
+        if toks[i + 1].kind == "EXTERN" {
+          if i + 3 < toks.length && toks[i + 2].kind == "FUNCTION" { dOff = 2 }
+        }
         const dk = toks[i + dOff].kind
         if dk == "FUNCTION" || dk == "LET" || dk == "CONST" || dk == "TYPE" {
-          expMod.push(m)
-          expName.push(toks[i + dOff + 1].text)
-          expDeclLine.push(toks[i + dOff + 1].line)
-          expDeclCol.push(toks[i + dOff + 1].col)
-          // The `export` keyword's own span — the target for the "redundant export
-          // keyword" hint (an export used locally but imported nowhere).
-          expKwLine.push(toks[i].line)
-          expKwCol.push(toks[i].col)
+          const dnt = toks[i + dOff + 1]
+          modExportRecord(
+            m,
+            dnt.text,
+            dnt.line,
+            dnt.col,
+            toks[i].line,
+            toks[i].col,
+          )
         }
         i = i + 1
       } else {
@@ -2951,6 +2985,9 @@ function modCompile(emit: i32): i32 {
     modLoadStart.push(P.toks.length)
     modLoadMod.push(m)
     vcLoadMod = m
+    // The module every `extern function` this parse declares belongs to — its declaration is
+    // banked outside the arena, so it cannot carry a token the merge could read it off later.
+    externSetMod(m)
     vcLoadToksMod(m)
     roots.push(parseProgram())
     o = o + 1
@@ -3037,8 +3074,13 @@ function modCompile(emit: i32): i32 {
   let rex = 0
   while rex < expMod.length {
     if expMod[rex] == 0 && !capHas(reExpName, expName[rex]) {
-      reExpName.push(expName[rex])
-      reExpTarget.push(expName[rex] + "$m0")
+      // An exported EXTERN publishes to VL importers and not to the wasm ABI: there is no
+      // local function to forward to, so an alias row would name a target the merge never
+      // defines. Its own import entry is what a host sees.
+      if externLinkOf(expName[rex] + "$m0") < 0 {
+        reExpName.push(expName[rex])
+        reExpTarget.push(expName[rex] + "$m0")
+      }
     }
     rex = rex + 1
   }
@@ -3236,6 +3278,21 @@ function modBuildRename(m: i32, root: i32): i32 {
       }
       si = si + 1
     }
+  }
+  // The module's own `extern function` declarations. They are not `progStmts`, so the loop
+  // above cannot see them — but their VL name has to be mangled for the same reason a
+  // function's is: an extern the module did not export must not be reachable by spelling it.
+  // The LINK name is untouched, so the import section still carries what the author wrote.
+  let xd = 0
+  while xd < externDeclCount() {
+    if extDeclMod[xd] == m {
+      const xbase = externNameAt(extDeclLink[xd])
+      if xbase != "" && !capHas(impLocals, xbase) {
+        modRenamePush(xbase, xbase + suffix)
+        externRenameDecl(xd, xbase + suffix)
+      }
+    }
+    xd = xd + 1
   }
   let ij = 0
   while ij < impMod.length {

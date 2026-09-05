@@ -100,6 +100,104 @@ Deno.test({
 });
 
 Deno.test({
+  name: "extern: `export extern` in one module gives every importer ONE import, and no wasm export",
+  ignore: !ENABLED,
+  fn: async () => {
+    if (!exists(WASM_DIS)) {
+      throw new Error(
+        `missing ${WASM_DIS} — binaryen is pinned in package.json; run \`npm install\``,
+      );
+    }
+    const dir = await Deno.makeTempDir({ prefix: "vl_extern_exp_" });
+    const out = `${dir}/entry.wasm`;
+    try {
+      const built = await vl([
+        "build",
+        `${CASES}/exported-from-host-module/entry.vl`,
+        "-o",
+        out,
+      ]);
+      if (built.code !== 0) {
+        throw new Error(`\`vl build\` exited ${built.code}\n${built.err}`);
+      }
+      const dis = await new Deno.Command(WASM_DIS, {
+        args: [out],
+        stdout: "piped",
+        stderr: "piped",
+      }).output();
+      const wat = new TextDecoder().decode(dis.stdout);
+      const externs = wat.split("\n").filter((l) => l.includes('(import "extern" '));
+      // Three declarations across four modules — two exported and taken by an importer each,
+      // one module-private — so three imports, and not one more per importing module.
+      const want = ["nowMillis", "hostEcho", "hostPrivate"];
+      if (externs.length !== want.length) {
+        throw new Error(
+          `want ${want.length} \`extern\` imports, got ${externs.length}:\n${
+            externs.join("\n")
+          }`,
+        );
+      }
+      for (const name of want) {
+        if (!externs.some((l) => l.includes(`"${name}"`))) {
+          throw new Error(`no import entry for \`${name}\`:\n${externs.join("\n")}`);
+        }
+      }
+      // An `export extern` publishes a VL name, never a wasm one: an alias row would name a
+      // local function the merge never defines.
+      if (wat.includes("(export ")) {
+        throw new Error(`an exported extern leaked into the wasm export section:\n${wat}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
+  name: "extern: a module-private extern is unreachable from another module",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_extern_priv_" });
+    try {
+      await Deno.writeTextFile(
+        `${dir}/host.vl`,
+        "extern function hostPrivate(x: i32): i32\n" +
+          "export function twice(x: i32) { return hostPrivate(x) }\n",
+      );
+      // Spelling it directly: the merge mangled the declaration, so the name is not in scope.
+      await Deno.writeTextFile(
+        `${dir}/spell.vl`,
+        'import { twice } from "./host"\nprint(twice(1) + hostPrivate(2))\n',
+      );
+      const spelled = await vl(["check", `${dir}/spell.vl`]);
+      if (spelled.code === 0 || !spelled.err.includes("undeclared identifier 'hostPrivate'")) {
+        throw new Error(
+          `want \`undeclared identifier 'hostPrivate'\`, got rc ${spelled.code}\n` +
+            `${spelled.out}${spelled.err}`,
+        );
+      }
+      // Importing it: the module does not export the name, so the import resolution says so.
+      await Deno.writeTextFile(
+        `${dir}/imp.vl`,
+        'import { hostPrivate } from "./host"\nprint(hostPrivate(2))\n',
+      );
+      const imported = await vl(["check", `${dir}/imp.vl`]);
+      if (
+        imported.code === 0 ||
+        !imported.err.includes('"hostPrivate" is not exported by "./host"')
+      ) {
+        throw new Error(
+          `want \`"hostPrivate" is not exported by "./host"\`, got rc ${imported.code}\n` +
+            `${imported.out}${imported.err}`,
+        );
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
   name: "extern: an unprovided extern is a load error naming the function, exit 1",
   ignore: !ENABLED,
   fn: async () => {

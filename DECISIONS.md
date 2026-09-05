@@ -1275,12 +1275,19 @@ it worked.
   a declaration in ANY module is collected into the wasm import section, under the `extern`
   namespace (std's floor keeps `imports`), and the engine's own link step is the enforcement.
 
-  Three consequences that are decisions rather than mechanics. **An extern's name is a LINK
-  name in one flat namespace**, not a module-scoped binding — forced by the import section
-  carrying exactly one entry per name, and the same rule C, Zig and Rust `extern` blocks have;
-  so two modules may declare one extern (no diagnostic, one import), a disagreement is a check
-  error at the second declaration, and `export extern` is REFUSED rather than accepted as a
-  no-op, because a no-op keyword reads as a visibility rule that is not there. **Only scalars
+  Three consequences that are decisions rather than mechanics. **The LINK name and the VL name
+  are two different things.** The link name is what the import section carries, so it is one
+  flat program-wide namespace — forced by the section holding exactly one entry per name, and
+  the rule C, Zig and Rust `extern` blocks have; so two modules may declare one extern (no
+  diagnostic, one import) and a disagreement is a check error at the second declaration. The
+  VL name is an ordinary module binding, mangled by the merge, so `export` on an extern is
+  ordinary visibility (owner ruling, 2026-09-05: *"export extern makes sense to me if you want
+  to just define all the types in one place then everywhere else you just import by name"*) —
+  one module owns the host boundary, everyone else imports the names with no re-declaration,
+  and a non-exported extern is unspellable elsewhere. **The alternative — refusing `export
+  extern` — lost**: it read the link name as *the* name, and it bought nothing, since `export`
+  here publishes a VL name and never a wasm one (an exported extern adds no export-section
+  entry, so a host-callable shim stays a separate feature either way). **Only scalars
   cross** (`i32 i64 f32 f64 boolean`) — measured, a `u8[]` crosses to wasmtime, which reads GC
   objects, and is opaque to a browser, which cannot build or read one, so admitting it would
   make a declaration link natively and fail in the browser it was written for; bytes travel as

@@ -96,17 +96,20 @@ import { nodePos, tokIndexAt } from "./fmt_util"
 import { isBinOpFuncName } from "./ast"
 // The extern manifest: parsed in any module, declared here, imported by the emitter.
 import {
-  extDupNames,
-  extDupPoss,
-  extDupSigs,
+  extDeclLink,
+  extDeclPos,
+  extDeclSig,
+  extDeclVl,
+  extNames,
   extPoss,
   extSigs,
   externArityAt,
   externCount,
+  externDeclCount,
+  externLinkOf,
   externNameAt,
   externParamAt,
   externRetAt,
-  externSlot,
 } from "./ast"
 // The parser's spelling tree — what `parseTypeName` saw, before it concatenated it into a
 // name. `tsToTy` resolves from this instead of re-parsing the concatenation.
@@ -3525,7 +3528,7 @@ function checkNotEmitterIntrinsic(name: string, at: i32) {
   }
   // An extern name is a host import name: `emitCall` routes the call to the import, so a
   // definition of that name would never run — the same reason the fs floor is reserved.
-  if externSlot(name) >= 0 {
+  if externLinkOf(name) >= 0 {
     tErr(
       "'" +
         name +
@@ -25240,9 +25243,12 @@ function externBadTy(name: string, what: string, spelling: string, tok: i32) {
 }
 
 // Declare every `extern function` the module graph carries, and refuse the two shapes that
-// cannot become one import: a type that does not cross, and two declarations of one name whose
-// signatures disagree. Runs before `checkNode` so a call in any module resolves.
+// cannot become one import: a type that does not cross, and two declarations of one link name
+// whose signatures disagree. Runs before `checkNode` so a call in any module resolves.
 function checkExternDecls() {
+  // The link rows first: one type check per IMPORT, so an extern declared in two modules is
+  // graded once. `linkTys` is parallel to the link table and read by the declaration loop.
+  const linkTys: i32[] = []
   let k = 0
   while k < externCount() {
     const nm = externNameAt(k)
@@ -25265,28 +25271,30 @@ function checkExternDecls() {
     // no annotation does not get, because an extern has no body to infer one from.
     let rt = TY_VOID
     if rs != "" { rt = externScalarTy(nm, "returns", rs, tok) }
-    if nm != "" { declare(nm, mkFuncTy(ptys, rt)) }
+    linkTys.push(mkFuncTy(ptys, rt))
     k = k + 1
   }
-  // Every re-declaration, compared against the manifest row it did not create. Same signature is
-  // the supported shape — one import — so only a disagreement is reported, at the second site.
+  // Then one binding per DECLARATION, under the name the merge left it — so a module-private
+  // extern is private to name lookup while the link it points at stays shared. A declaration
+  // whose signature disagrees with its link row is reported at its own site: same signature is
+  // the supported shape, and only a disagreement has no import section that satisfies both.
   let d = 0
-  while d < extDupNames.length {
-    const dn = extDupNames[d]
-    const home = externSlot(dn)
-    if home >= 0 {
-      if extSigs[home] != extDupSigs[d] {
+  while d < externDeclCount() {
+    const link = extDeclLink[d]
+    if link >= 0 && link < linkTys.length {
+      if extSigs[link] != extDeclSig[d] {
         externErr(
           "extern `" +
-            dn +
+            extNames[link] +
             "` is declared `" +
-            extDupSigs[d] +
+            extDeclSig[d] +
             "` here and `" +
-            extSigs[home] +
+            extSigs[link] +
             "` elsewhere — one name is one host import, so every declaration of it must agree",
-          extDupPoss[d],
+          extDeclPos[d],
         )
       }
+      if extDeclVl[d] != "" { declare(extDeclVl[d], linkTys[link]) }
     }
     d = d + 1
   }

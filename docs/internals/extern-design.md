@@ -13,11 +13,13 @@ The short version:
 > manifest — there is no second file to keep in step. Whoever instantiates the module must
 > provide every import or instantiation fails naming what is missing. A `Buf`, a string or a
 > list does not cross; scalars and a `(base, length)` pair into the exported `memory` do.
+> `export` on one is ordinary visibility, so one module can own the whole host boundary and
+> everyone else imports the names.
 
 Consumer ask: `~/glean/docs/vl-requirements.md` R2, filed as VL-011 ("no host-function
 imports… no way to read the clock, `performance.now()`, or a file from vl in the browser").
 
-Precedent: Zig `extern fn`, Rust `extern "C" { fn … }`, AssemblyScript `declare function`,
+Precedent: Zig `pub extern fn`, Rust `extern "C" { fn … }`, AssemblyScript `declare function`,
 C# `[DllImport]`. All four declare a signature with no body and leave the binding to the
 loader; VL's loader is the wasm engine and its contract is the import section.
 
@@ -26,7 +28,7 @@ loader; VL's loader is the wasm engine and its contract is the import section.
 ## 1. Syntax and placement
 
 ```vl
-extern function nowMillis(): i64
+export extern function nowMillis(): i64
 extern function drawRect(x: i32, y: i32, w: i32, h: i32)
 ```
 
@@ -34,22 +36,34 @@ Module level, any module, no body, no generics. The declaration mints **no state
 AST node** — it is banked in a program-wide manifest (`ast.vl` `externAdd`) — because an
 extern has nothing to run and no local index to occupy.
 
-**An extern's name is a LINK name in one flat namespace, not a module-scoped binding.** That
-is forced: the name is what the import section carries, so two modules cannot mean different
-things by it. It is also the precedent's rule — a C `extern int foo;` in two translation
-units names one object, which is why the idiom is to declare it in a header everyone includes.
-Three consequences, each with a fixture:
+**The LINK name and the VL name are two different things, and that is what makes `export`
+ordinary.** The link name is what the import section carries, so it lives in one flat
+namespace shared by the whole program: two modules cannot mean different things by it, exactly
+as a C `extern int foo;` in two translation units names one object. The VL name is a module
+binding like any other — the merge mangles it (`nowMillis$m2`), so an extern the declaring
+module did not export is not spellable elsewhere, while the import entry still reads
+`nowMillis`. Owner ruling, 2026-09-05:
+
+> "export extern makes sense to me if you want to just define all the types in one place then
+> everywhere else you just import by name"
+
+Four consequences, each with a fixture:
 
 | | |
 | --- | --- |
-| two modules, same signature | **one import**, no diagnostic (`tests/cases/extern/two-modules/`) |
+| `export extern` + `import { n } from "./host"` | the importer calls it with **no re-declaration**, and the program has ONE import (`tests/cases/extern/exported-from-host-module/`) |
+| a non-exported extern | module-private to VL name lookup: spelling it elsewhere is `undeclared identifier`, importing it is `"n" is not exported by "./host"` |
+| two modules, same signature | **one import**, no diagnostic (`…/two-modules/`) |
 | two modules, different signature | check error at the second declaration (`…/two-modules-disagree/`) |
-| `export extern function …` | **refused**: the name is already visible everywhere, so `export` would read as a visibility rule that is not there (`…/error-export.vl`) |
 
-That last one is the brief's open question answered the other way, and it is the one thing in
-this document worth the owner's confirmation. Re-exporting an extern as a wasm *export* (a
-host calling back through a shim) is a real and separate feature; refusing the spelling now
-keeps it available later, which admitting a no-op keyword would not.
+**Refusing `export extern` was the alternative, and it lost.** The reasoning was that the link
+name is already program-global, so `export` would read as a visibility rule that is not there
+— which reads the link name as *the* name. It is not: making one module own the host boundary
+and having everyone else import it is the ordinary shape, and it is what `pub extern fn` (Zig),
+a `pub use` of an `extern` block (Rust) and a C header do. The refusal also bought nothing it
+was credited with: re-exporting an extern as a wasm *export* (a host calling back through a
+shim) is a separate feature either way, since `export` here publishes a VL name and never a
+wasm one — an exported extern adds no export-section entry (`…/exported-declaration.vl`).
 
 A `function` of a declared extern's name is refused for the reason the fs floor is
 (`…/error-redefine.vl`): `emitCall` routes the call to the import before it looks up any
