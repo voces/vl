@@ -56,6 +56,10 @@ import {
   ufcsImportModules,
   ufcsMissingImportAt,
 } from "./codeActions.ts";
+import {
+  applyRatchetHold,
+  invalidateRatchetBaselines,
+} from "./ratchetHold.ts";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -225,6 +229,23 @@ const tagMap: Record<VLDiagnosticTag, DiagnosticTag> = {
 // request — purely additive discoverability over the editor-supplied set.
 const diagnosticsByUri = new Map<string, VLDiagnostic[]>();
 
+// `vital.lint.showHeld` — publish the findings a per-file ratchet already HOLDS, as
+// greyed hints, instead of dropping them. Off by default: the point of the hold is
+// that a file at its baseline reads as clean, the way the gate reads it.
+let showHeldLint = false;
+
+// Every ratcheted code's findings for `uri`, re-graded against the committed
+// baselines. One helper, because the diagnostics for an open document are published
+// from two places — the edit handler and the workspace pass — and only one of them
+// runs on a given keystroke.
+const heldFiltered = (uri: string, diagnostics: VLDiagnostic[]): VLDiagnostic[] =>
+  applyRatchetHold(
+    diagnostics,
+    uriToPath(uri),
+    workspaceFolder ? uriToPath(workspaceFolder) : undefined,
+    showHeldLint,
+  );
+
 const toLspDiagnostic = (d: VLDiagnostic): Diagnostic => ({
   message: d.message,
   severity: severityMap[d.severity],
@@ -283,6 +304,9 @@ const runUnusedExportPass = async (): Promise<void> => {
   // another editor). Bump before it crawls: the memo must not outlive a graph
   // this pass is about to read differently.
   wasmChecker.bumpReaderGeneration();
+  // The pass reads the tree off disk, so it is also the moment a baseline JSON may
+  // have changed under an open buffer (a branch switch, another editor).
+  invalidateRatchetBaselines();
   // Determine the project root (same logic as onReferences).
   const openUris = documents.all().map((d) => d.uri);
   // Use the first open document's key to detect the root; fall back to an
@@ -314,7 +338,8 @@ const runUnusedExportPass = async (): Promise<void> => {
     connection.sendDiagnostics({
       uri: doc.uri,
       version: doc.version,
-      diagnostics: [...cached, ...hints].map(toLspDiagnostic),
+      diagnostics: [...heldFiltered(doc.uri, cached), ...hints]
+        .map(toLspDiagnostic),
     });
   }
 
@@ -397,7 +422,8 @@ documents.onDidChangeContent(async (event) => {
   connection.sendDiagnostics({
     uri: event.document.uri,
     version: event.document.version,
-    diagnostics: [...diagnostics, ...hints].map(toLspDiagnostic),
+    diagnostics: [...heldFiltered(event.document.uri, diagnostics), ...hints]
+      .map(toLspDiagnostic),
   });
 
   // Arm the idle debounce timer: after UNUSED_EXPORT_DEBOUNCE_MS of no edits,
@@ -1627,7 +1653,9 @@ connection.onInitialize((params) => {
   const opts = (params.initializationOptions ?? {}) as {
     compilerWasm?: string;
     compilerPath?: string;
+    lintShowHeld?: boolean;
   };
+  showHeldLint = opts.lintShowHeld === true;
   const root = params.rootUri ? uriToPath(params.rootUri) : "";
   // THE SEED LADDER — see `wasmCheckerNode.ts` for why this is a ladder and not a
   // path. In short: the old single default was `<workspace>/build/vl-compiler.wasm`,
