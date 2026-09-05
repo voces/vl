@@ -1802,15 +1802,20 @@ const cbHeaderBudget = 12
 // trivia the parse path never carries, so the text is the only reader here. The scan
 // consumes it, so a caller that forgets the setter reports nothing rather than the
 // previous module's blocks. A `//` opening a line inside a template literal reads as one.
-let cbSource = ""
+let txSource = ""
 export function lintSetSource(src: string) {
-  cbSource = src
+  txSource = src
   0
 }
 
+// ── the shared text primitives ───────────────────────────────────────────────
+// What more than one rule reads, over the one `txSource` the driver hands in. A `cb` /
+// `kl` / `si` / `sca` / `as` prefix below is rule-local: exactly one rule calls it. The
+// exception is `kl`'s line index, which every rule takes through `klEnsureIndex`.
+
 // The index of `name` in `xs`, or -1. Every caller tests it: a 0 here is the first row
 // and not "absent", which is the clamp D1500 names.
-function cbListIndexOf(xs: string[], name: string) {
+function txListIndexOf(xs: string[], name: string) {
   let i = 0
   while i < xs.length {
     if xs[i] == name { return i }
@@ -1820,28 +1825,28 @@ function cbListIndexOf(xs: string[], name: string) {
 }
 
 // `name` occurs in `xs`.
-function cbListHas(xs: string[], name: string) { cbListIndexOf(xs, name) >= 0 }
+function txListHas(xs: string[], name: string) { txListIndexOf(xs, name) >= 0 }
 
-function cbIsDigit(c: i32) { c >= '0' && c <= '9' }
+function txIsDigit(c: i32) { c >= '0' && c <= '9' }
 
-function cbIsWordChar(c: i32) {
-  (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || cbIsDigit(c) || c == '_'
+function txIsWordChar(c: i32) {
+  (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || txIsDigit(c) || c == '_'
 }
 
 // The `\b` both scanners spell: a word char at `i`, false off either end.
-function cbWordAt(s: string, i: i32, b: i32) {
-  i >= 0 && i < b && cbIsWordChar(s[i])
+function txWordAt(s: string, i: i32, b: i32) {
+  i >= 0 && i < b && txIsWordChar(s[i])
 }
 
 // `s[i]`, or -1 off the end — never a digit and never a word char, so a boundary
 // test reads an out-of-range index the same way the script's does.
-function cbCharOr(s: string, i: i32, b: i32) {
+function txCharOr(s: string, i: i32, b: i32) {
   if i < 0 || i >= b { return -1 }
   s[i]
 }
 
 // `s` at `i` begins with `w`, inside `[.., b)`.
-function cbAt(s: string, i: i32, b: i32, w: string) {
+function txAt(s: string, i: i32, b: i32, w: string) {
   if i < 0 || i + w.length > b { return false }
   let k = 0
   while k < w.length {
@@ -1851,9 +1856,9 @@ function cbAt(s: string, i: i32, b: i32, w: string) {
   true
 }
 
-// `cbAt` folding the SOURCE side's case (`w` is given lower). Only `measured`,
+// `txAt` folding the SOURCE side's case (`w` is given lower). Only `measured`,
 // which starts a sentence as often as not, needs it.
-function cbAtI(s: string, i: i32, b: i32, w: string) {
+function txAtI(s: string, i: i32, b: i32, w: string) {
   if i < 0 || i + w.length > b { return false }
   let k = 0
   while k < w.length {
@@ -1866,111 +1871,77 @@ function cbAtI(s: string, i: i32, b: i32, w: string) {
 }
 
 // `w` occurs anywhere in `s[a, b)`.
-function cbFind(s: string, a: i32, b: i32, w: string) {
+function txFind(s: string, a: i32, b: i32, w: string) {
   let i = a
   while i + w.length <= b {
-    if cbAt(s, i, b, w) { return true }
+    if txAt(s, i, b, w) { return true }
     i = i + 1
   }
   false
 }
 
 // `w` at `i` as a whole word (the trailing `\b`).
-function cbWordIs(s: string, i: i32, b: i32, w: string) {
-  cbAt(s, i, b, w) && !cbWordAt(s, i + w.length, b)
+function txWordIs(s: string, i: i32, b: i32, w: string) {
+  txAt(s, i, b, w) && !txWordAt(s, i + w.length, b)
 }
 
-// `cbWordIs` folding the SOURCE side's case, `w` given lower. The caller owns the
+// `txWordIs` folding the SOURCE side's case, `w` given lower. The caller owns the
 // leading boundary; this owns the trailing one.
-function cbWordIsI(s: string, i: i32, b: i32, w: string) {
-  cbAtI(s, i, b, w) && !cbWordAt(s, i + w.length, b)
+function txWordIsI(s: string, i: i32, b: i32, w: string) {
+  txAtI(s, i, b, w) && !txWordAt(s, i + w.length, b)
 }
 
 // End of the identifier at `i`, or -1 when none begins there (a digit does not). The
-// one scan behind both this and `cbIdentAt`'s text form.
-function cbIdentEnd(s: string, i: i32, b: i32) {
-  if !cbWordAt(s, i, b) { return -1 }
-  if cbIsDigit(s[i]) { return -1 }
+// one scan behind both this and `txIdentAt`'s text form.
+function txIdentEnd(s: string, i: i32, b: i32) {
+  if !txWordAt(s, i, b) { return -1 }
+  if txIsDigit(s[i]) { return -1 }
   let j = i
-  while cbWordAt(s, j, b) { j = j + 1 }
+  while txWordAt(s, j, b) { j = j + 1 }
   j
 }
 
 // The identifier starting at `i`, or "" when none does. The result is bound rather than
 // left in tail position: a bare member call there is an emit refusal on a `vl
 // check`-clean program.
-function cbIdentAt(s: string, i: i32, b: i32) {
-  const j = cbIdentEnd(s, i, b)
+function txIdentAt(s: string, i: i32, b: i32) {
+  const j = txIdentEnd(s, i, b)
   if j < 0 { return "" }
   const out = s.slice(i, j)
   out
 }
 
 // End of the digit run at `i`, thousands commas included but never trailing.
-function cbDigitsEnd(s: string, i: i32, b: i32) {
+function txDigitsEnd(s: string, i: i32, b: i32) {
   let j = i
-  while j < b && (cbIsDigit(s[j]) || s[j] == ',') { j = j + 1 }
+  while j < b && (txIsDigit(s[j]) || s[j] == ',') { j = j + 1 }
   while j > i && s[j - 1] == ',' { j = j - 1 }
   j
 }
 
 // End of the run of plain digits at `i` — a row id's digits, where a comma ends the
 // id rather than continuing it.
-function cbPlainDigitsEnd(s: string, i: i32, b: i32) {
+function txPlainDigitsEnd(s: string, i: i32, b: i32) {
   let j = i
-  while j < b && cbIsDigit(s[j]) { j = j + 1 }
+  while j < b && txIsDigit(s[j]) { j = j + 1 }
   j
 }
 
-function cbSpacesEnd(s: string, i: i32, b: i32) {
+function txSpacesEnd(s: string, i: i32, b: i32) {
   let j = i
   while j < b && s[j] == ' ' { j = j + 1 }
   j
 }
 
-// A unit a count can carry. `i32` never reads as the number 32: the caller only asks
-// on a digit run that starts at a word boundary (CLAUDE.md's `iN` lesson).
-function cbUnitAt(s: string, i: i32, b: i32) {
-  cbWordIs(s, i, b, "cells") ||
-    cbWordIs(s, i, b, "cell") ||
-    cbWordIs(s, i, b, "rows") ||
-    cbWordIs(s, i, b, "row") ||
-    cbWordIs(s, i, b, "bytes") ||
-    cbWordIs(s, i, b, "classes") ||
-    cbWordIs(s, i, b, "class") ||
-    cbWordIs(s, i, b, "programs") ||
-    cbWordIs(s, i, b, "program")
-}
-
-function cbVerdictAt(s: string, i: i32, b: i32) {
-  cbWordIs(s, i, b, "loud") || cbWordIs(s, i, b, "silent")
-}
-
-// A count at `i` carrying a unit (`12 cells`), a denominator (`4 of 315`), or a
-// graded verdict (`48 loud`) — the three shapes a claimed number takes, per
-// CLAUDE.md's comment-budget section.
-function cbCountAt(s: string, i: i32, b: i32) {
-  const d = cbDigitsEnd(s, i, b)
-  const k = cbSpacesEnd(s, d, b)
-  if k > d && cbUnitAt(s, k, b) { return true }
-  if (
-    cbAt(s, k, b, "of ") &&
-    cbIsDigit(cbCharOr(s, cbSpacesEnd(s, k + 2, b), b))
-  ) {
-    return true
-  }
-  cbVerdictAt(s, k, b)
-}
-
 // `yyyy-mm-dd` at `i` — a measurement's timestamp.
-function cbDateAt(s: string, i: i32, b: i32) {
+function txDateAt(s: string, i: i32, b: i32) {
   if i + 10 > b { return false }
   let k = 0
   while k < 10 {
     const c = s[i + k]
     if k == 4 || k == 7 {
       if c != '-' { return false }
-    } else if !cbIsDigit(c) {
+    } else if !txIsDigit(c) {
       return false
     }
     k = k + 1
@@ -1978,52 +1949,126 @@ function cbDateAt(s: string, i: i32, b: i32) {
   true
 }
 
+// `D` + 2-4 digits as a whole word — an inventory row id.
+function txRowIdAt(s: string, i: i32, b: i32) {
+  if txWordAt(s, i - 1, b) || s[i] != 'D' { return false }
+  const e = txPlainDigitsEnd(s, i + 1, b)
+  e - i - 1 >= 2 && e - i - 1 <= 4 && !txWordAt(s, e, b)
+}
+
+// `s[i, e)` is exactly `w` — `txAt`'s prefix match with the length pinned.
+function txSpanIs(s: string, i: i32, e: i32, w: string) {
+  e - i == w.length && txAt(s, i, e, w)
+}
+
+// The decimal spelling of `n`. The compiler graph reaches no i32→string builtin —
+// the CLI's number printers are host-side.
+function txNumStr(n: i32) {
+  if n <= 0 { return "0" }
+  let v = n
+  let out = ""
+  while v > 0 {
+    out = fromCodePoint('0' + (v % 10)) + out
+    v = v / 10
+  }
+  out
+}
+
+// The already-indent-skipped line `[k, e)` opens a `//` comment. Both comment scans
+// ask it of the same index, so neither can drift from the other's idea of a comment.
+function txCommentAt(s: string, k: i32, e: i32) {
+  k + 1 < e && s[k] == '/' && s[k + 1] == '/'
+}
+
+// Whether the block just closed is the module header: the first one, with no code yet
+// seen. `seenCode` stays 0 across blank lines and the leading import region, which is
+// why a multi-line `import { … } from "…"` is tracked here.
+function txIsHeader(seenCode: i32, headerTaken: i32) {
+  if seenCode == 0 && headerTaken == 0 { return 1 }
+  0
+}
+
+// The name declared by a top-level `function f(` / `export function f(` line, else "".
+function txFnNameOf(s: string, k: i32, b: i32) {
+  let p = k
+  if txAt(s, p, b, "export ") { p = txSpacesEnd(s, p + 7, b) }
+  if !txAt(s, p, b, "function ") { return "" }
+  txIdentAt(s, txSpacesEnd(s, p + 9, b), b)
+}
+
+// A unit a count can carry. `i32` never reads as the number 32: the caller only asks
+// on a digit run that starts at a word boundary (CLAUDE.md's `iN` lesson).
+function cbUnitAt(s: string, i: i32, b: i32) {
+  txWordIs(s, i, b, "cells") ||
+    txWordIs(s, i, b, "cell") ||
+    txWordIs(s, i, b, "rows") ||
+    txWordIs(s, i, b, "row") ||
+    txWordIs(s, i, b, "bytes") ||
+    txWordIs(s, i, b, "classes") ||
+    txWordIs(s, i, b, "class") ||
+    txWordIs(s, i, b, "programs") ||
+    txWordIs(s, i, b, "program")
+}
+
+function cbVerdictAt(s: string, i: i32, b: i32) {
+  txWordIs(s, i, b, "loud") || txWordIs(s, i, b, "silent")
+}
+
+// A count at `i` carrying a unit (`12 cells`), a denominator (`4 of 315`), or a
+// graded verdict (`48 loud`) — the three shapes a claimed number takes, per
+// CLAUDE.md's comment-budget section.
+function cbCountAt(s: string, i: i32, b: i32) {
+  const d = txDigitsEnd(s, i, b)
+  const k = txSpacesEnd(s, d, b)
+  if k > d && cbUnitAt(s, k, b) { return true }
+  if (
+    txAt(s, k, b, "of ") &&
+    txIsDigit(txCharOr(s, txSpacesEnd(s, k + 2, b), b))
+  ) {
+    return true
+  }
+  cbVerdictAt(s, k, b)
+}
+
 // A `%` whose number is to its left (`52.8%` and `52.8 %` alike) — CLAUDE.md's
 // comment-budget section names the shape.
 function cbPercentAt(s: string, i: i32, a: i32) {
   let j = i
   while j > a && s[j - 1] == ' ' { j = j - 1 }
-  j > a && cbIsDigit(s[j - 1])
+  j > a && txIsDigit(s[j - 1])
 }
 
 // `measured` with a digit before the sentence ends: the bare verb is ordinary prose
 // rather than a claim, and matching it on its own drowns the rule.
 function cbMeasuredAt(s: string, i: i32, b: i32) {
-  if cbWordAt(s, i - 1, b) || !cbAtI(s, i, b, "measured") { return false }
-  if cbWordAt(s, i + 8, b) { return false }
+  if txWordAt(s, i - 1, b) || !txAtI(s, i, b, "measured") { return false }
+  if txWordAt(s, i + 8, b) { return false }
   let k = i + 8
   let stop = i + 48
   if stop > b { stop = b }
   while k < stop {
     if s[k] == '.' { return false }
-    if cbIsDigit(s[k]) { return true }
+    if txIsDigit(s[k]) { return true }
     k = k + 1
   }
   false
 }
 
-// `D` + 2-4 digits as a whole word — an inventory row id.
-function cbRowIdAt(s: string, i: i32, b: i32) {
-  if cbWordAt(s, i - 1, b) || s[i] != 'D' { return false }
-  const e = cbPlainDigitsEnd(s, i + 1, b)
-  e - i - 1 >= 2 && e - i - 1 <= 4 && !cbWordAt(s, e, b)
-}
-
 // A `.md` doc reference: the extension has to end a name, not stand alone.
 function cbMdRefAt(s: string, i: i32, b: i32) {
-  cbAt(s, i, b, ".md") &&
-    (cbWordAt(s, i - 1, b) || cbCharOr(s, i - 1, b) == '-')
+  txAt(s, i, b, ".md") &&
+    (txWordAt(s, i - 1, b) || txCharOr(s, i - 1, b) == '-')
 }
 
 // A graded VERDICT beside a count, in either order (`48 loud`, `loud 48`) — see
 // CLAUDE.md's comment-budget section.
 function cbVerdictCountAt(s: string, i: i32, b: i32) {
-  if cbWordAt(s, i - 1, b) { return false }
-  if cbWordIs(s, i, b, "loud") {
-    return cbIsDigit(cbCharOr(s, cbSpacesEnd(s, i + 4, b), b))
+  if txWordAt(s, i - 1, b) { return false }
+  if txWordIs(s, i, b, "loud") {
+    return txIsDigit(txCharOr(s, txSpacesEnd(s, i + 4, b), b))
   }
-  if cbWordIs(s, i, b, "silent") {
-    return cbIsDigit(cbCharOr(s, cbSpacesEnd(s, i + 6, b), b))
+  if txWordIs(s, i, b, "silent") {
+    return txIsDigit(txCharOr(s, txSpacesEnd(s, i + 6, b), b))
   }
   false
 }
@@ -2038,24 +2083,24 @@ function cbLineFlags(s: string, a: i32, b: i32) {
   while i < b {
     const c = s[i]
     if m == 0 {
-      if cbIsDigit(c) {
-        if cbDateAt(s, i, b) { m = 1 }
-        else if !cbWordAt(s, i - 1, b) && cbCountAt(s, i, b) { m = 1 }
+      if txIsDigit(c) {
+        if txDateAt(s, i, b) { m = 1 }
+        else if !txWordAt(s, i - 1, b) && cbCountAt(s, i, b) { m = 1 }
       } else if c == '%' {
         if cbPercentAt(s, i, a) { m = 1 }
       } else if c == 'm' || c == 'M' {
         if cbMeasuredAt(s, i, b) { m = 1 }
       } else if c == 'b' {
-        if cbAt(s, i, b, "byte-identical") { m = 1 }
+        if txAt(s, i, b, "byte-identical") { m = 1 }
       } else if c == 'r' {
-        if cbAt(s, i, b, "runs → not-runs") { m = 1 }
+        if txAt(s, i, b, "runs → not-runs") { m = 1 }
       } else if c == 'l' || c == 's' {
         if cbVerdictCountAt(s, i, b) { m = 1 }
       }
     }
     if d == 0 {
       if c == 'D' {
-        if cbAt(s, i, b, "DECISIONS") || cbRowIdAt(s, i, b) { d = 1 }
+        if txAt(s, i, b, "DECISIONS") || txRowIdAt(s, i, b) { d = 1 }
       } else if c == '.' {
         if cbMdRefAt(s, i, b) { d = 1 }
       }
@@ -2066,28 +2111,23 @@ function cbLineFlags(s: string, a: i32, b: i32) {
   m + d * 2
 }
 
-// `s[i, e)` is exactly `w` — `cbAt`'s prefix match with the length pinned.
-function cbSpanIs(s: string, i: i32, e: i32, w: string) {
-  e - i == w.length && cbAt(s, i, e, w)
-}
-
 // The acronyms a comment may spell in capitals — the whole allow-list, in one
 // place. A word under three letters never reaches here, so `GC` needs no entry.
 function cbIsAcronym(s: string, i: i32, e: i32) {
-  cbSpanIs(s, i, e, "ABI") ||
-    cbSpanIs(s, i, e, "API") ||
-    cbSpanIs(s, i, e, "ASCII") ||
-    cbSpanIs(s, i, e, "AST") ||
-    cbSpanIs(s, i, e, "CLI") ||
-    cbSpanIs(s, i, e, "IEEE") ||
-    cbSpanIs(s, i, e, "JSON") ||
-    cbSpanIs(s, i, e, "LEB") ||
-    cbSpanIs(s, i, e, "LSP") ||
-    cbSpanIs(s, i, e, "OOB") ||
-    cbSpanIs(s, i, e, "RFC") ||
-    cbSpanIs(s, i, e, "UFCS") ||
-    cbSpanIs(s, i, e, "UTF") ||
-    cbSpanIs(s, i, e, "WASM")
+  txSpanIs(s, i, e, "ABI") ||
+    txSpanIs(s, i, e, "API") ||
+    txSpanIs(s, i, e, "ASCII") ||
+    txSpanIs(s, i, e, "AST") ||
+    txSpanIs(s, i, e, "CLI") ||
+    txSpanIs(s, i, e, "IEEE") ||
+    txSpanIs(s, i, e, "JSON") ||
+    txSpanIs(s, i, e, "LEB") ||
+    txSpanIs(s, i, e, "LSP") ||
+    txSpanIs(s, i, e, "OOB") ||
+    txSpanIs(s, i, e, "RFC") ||
+    txSpanIs(s, i, e, "UFCS") ||
+    txSpanIs(s, i, e, "UTF") ||
+    txSpanIs(s, i, e, "WASM")
 }
 
 // `s[i, e)` is three or more letters, every one a capital, and not an acronym —
@@ -2116,9 +2156,9 @@ function cbShoutLine(s: string, a: i32, b: i32) {
     if c == '`' {
       if tick == 0 { tick = 1 } else { tick = 0 }
       i = i + 1
-    } else if cbIsWordChar(c) {
+    } else if txIsWordChar(c) {
       let e = i
-      while e < b && cbIsWordChar(s[e]) { e = e + 1 }
+      while e < b && txIsWordChar(s[e]) { e = e + 1 }
       if tick == 0 {
         if cbIsShoutWord(s, i, e) {
           if prev == 1 { return true }
@@ -2156,13 +2196,13 @@ function cbHistStart(c: i32) {
 // are how a past state gets told, and the passive-voice contract sentence they also
 // match reads better rewritten active.
 function cbHistPhraseAt(s: string, i: i32, b: i32): string {
-  if cbWordIsI(s, i, b, "no longer") { return "no longer" }
-  if cbWordIsI(s, i, b, "used to") { return "used to" }
-  if cbWordIsI(s, i, b, "previously") { return "previously" }
-  if cbWordIsI(s, i, b, "measured") { return "measured" }
-  if cbWordIsI(s, i, b, "landed") { return "landed" }
-  if cbWordIsI(s, i, b, "was") { return "was" }
-  if cbWordIsI(s, i, b, "were") { return "were" }
+  if txWordIsI(s, i, b, "no longer") { return "no longer" }
+  if txWordIsI(s, i, b, "used to") { return "used to" }
+  if txWordIsI(s, i, b, "previously") { return "previously" }
+  if txWordIsI(s, i, b, "measured") { return "measured" }
+  if txWordIsI(s, i, b, "landed") { return "landed" }
+  if txWordIsI(s, i, b, "was") { return "was" }
+  if txWordIsI(s, i, b, "were") { return "were" }
   ""
 }
 
@@ -2177,9 +2217,9 @@ function cbHistLine(s: string, a: i32, b: i32): string {
     if c == '`' {
       if tick == 0 { tick = 1 } else { tick = 0 }
     } else if tick == 0 {
-      if cbIsDigit(c) {
-        if cbDateAt(s, i, b) { return "a date" }
-      } else if cbHistStart(c) && !cbWordAt(s, i - 1, b) {
+      if txIsDigit(c) {
+        if txDateAt(s, i, b) { return "a date" }
+      } else if cbHistStart(c) && !txWordAt(s, i - 1, b) {
         const w = cbHistPhraseAt(s, i, b)
         if w.length > 0 { return w }
       }
@@ -2187,19 +2227,6 @@ function cbHistLine(s: string, a: i32, b: i32): string {
     i = i + 1
   }
   ""
-}
-
-// The decimal spelling of `n`. The compiler graph reaches no i32→string builtin —
-// the CLI's number printers are host-side.
-function cbNumStr(n: i32) {
-  if n <= 0 { return "0" }
-  let v = n
-  let out = ""
-  while v > 0 {
-    out = fromCodePoint('0' + (v % 10)) + out
-    v = v / 10
-  }
-  out
 }
 
 // Report one finished block's length and its uncited measurement. All four codes are
@@ -2216,9 +2243,9 @@ function cbReport(n: i32, ln: i32, co: i32, meas: i32, cited: i32, hdr: i32) {
     lintEmitAtPos(
       "comment-block-too-long",
       what +
-        cbNumStr(n) +
+        txNumStr(n) +
         " lines exceeds the " +
-        cbNumStr(cap) +
+        txNumStr(cap) +
         "-line budget — state the contract and the non-obvious why here, and leave the rest to the inventory row (docs/internals/comment-style.md rule 2)",
       "warning",
       ln,
@@ -2237,27 +2264,13 @@ function cbReport(n: i32, ln: i32, co: i32, meas: i32, cited: i32, hdr: i32) {
   0
 }
 
-// The already-indent-skipped line `[k, e)` opens a `//` comment. Both comment scans
-// ask it of the same index, so neither can drift from the other's idea of a comment.
-function cbCommentAt(s: string, k: i32, e: i32) {
-  k + 1 < e && s[k] == '/' && s[k + 1] == '/'
-}
-
-// Whether the block just closed is the module header: the first one, with no code yet
-// seen. `seenCode` stays 0 across blank lines and the leading import region, which is
-// why a multi-line `import { … } from "…"` is tracked here.
-function cbIsHeader(seenCode: i32, headerTaken: i32) {
-  if seenCode == 0 && headerTaken == 0 { return 1 }
-  0
-}
-
 // Walk the source line by line over the shared index, accumulating own-line `//` runs.
 // O(bytes); the only per-line state is a handful of counters. Length and the uncited
 // measurement are block facts and report when the block closes; shouting and history
 // are line facts and report where they stand, once per block per code.
 function commentBudget() {
-  const s = cbSource
-  cbSource = ""
+  const s = txSource
+  txSource = ""
   // `comment-style.md` is the COMPILER's rubric; a std comment is consumer API
   // surface, graded by `std-comment-audience` against `std-api-review.md` §4
   // instead. Grading std under both buried a consumer's own diagnostics (D1601).
@@ -2282,7 +2295,7 @@ function commentBudget() {
     const le = klLnEnd[ln]
     const k = klIndentEnd(s, i, le)
     const line = ln + 1
-    if cbCommentAt(s, k, le) {
+    if txCommentAt(s, k, le) {
       if n == 0 {
         blockLine = line
         blockCol = k - i
@@ -2320,7 +2333,7 @@ function commentBudget() {
       }
     } else {
       if n > 0 {
-        const hdr = cbIsHeader(seenCode, headerTaken)
+        const hdr = txIsHeader(seenCode, headerTaken)
         if hdr == 1 { headerTaken = 1 }
         cbReport(n, blockLine, blockCol, meas, cited, hdr)
         n = 0
@@ -2332,9 +2345,9 @@ function commentBudget() {
       // A non-blank, non-comment line: still the import region, or the first code.
       if k < le {
         if inImport == 1 {
-          if cbFind(s, k, le, "} from ") { inImport = 0 }
-        } else if cbAt(s, k, le, "import ") {
-          if !cbFind(s, k, le, " from ") { inImport = 1 }
+          if txFind(s, k, le, "} from ") { inImport = 0 }
+        } else if txAt(s, k, le, "import ") {
+          if !txFind(s, k, le, " from ") { inImport = 1 }
         } else {
           seenCode = 1
         }
@@ -2349,7 +2362,7 @@ function commentBudget() {
       blockCol,
       meas,
       cited,
-      cbIsHeader(seenCode, headerTaken),
+      txIsHeader(seenCode, headerTaken),
     )
   }
   0
@@ -2383,13 +2396,13 @@ export function lintSetPath(p: string) {
 // One residue is accepted knowingly: a user's own top-level `std/` still matches.
 function scaIsStd(p: string): boolean {
   const b = p.length
-  cbAt(p, 0, b, "std/") || cbAt(p, 0, b, "std:")
+  txAt(p, 0, b, "std/") || txAt(p, 0, b, "std:")
 }
 
-// `cbWordIsI` with the leading boundary taken here rather than by the caller, so
+// `txWordIsI` with the leading boundary taken here rather than by the caller, so
 // `DECISIONS` and `decisions` are the same word and neither matches inside a longer one.
 function scaWordIsI(s: string, i: i32, b: i32, w: string) {
-  !cbWordAt(s, i - 1, b) && cbWordIsI(s, i, b, w)
+  !txWordAt(s, i - 1, b) && txWordIsI(s, i, b, w)
 }
 
 // The letters the jargon words start with, so the whole list is consulted only
@@ -2422,7 +2435,7 @@ function scaJargonAt(s: string, i: i32, b: i32) {
 // `#` + 3-4 digits as a whole token — a pull-request number.
 function scaPrAt(s: string, i: i32, b: i32) {
   if s[i] != '#' { return false }
-  const e = cbPlainDigitsEnd(s, i + 1, b)
+  const e = txPlainDigitsEnd(s, i + 1, b)
   e - i - 1 >= 3 && e - i - 1 <= 4
 }
 
@@ -2432,9 +2445,9 @@ function scaLineTell(s: string, a: i32, b: i32): string {
   let i = a
   while i < b {
     const c = s[i]
-    if c == 'D' && cbRowIdAt(s, i, b) { return "an inventory row id" }
+    if c == 'D' && txRowIdAt(s, i, b) { return "an inventory row id" }
     if c == '#' && scaPrAt(s, i, b) { return "a pull-request number" }
-    if cbIsDigit(c) && cbDateAt(s, i, b) { return "a date" }
+    if txIsDigit(c) && txDateAt(s, i, b) { return "a date" }
     if scaJargonStart(c) && scaJargonAt(s, i, b) {
       return "compiler-internal vocabulary"
     }
@@ -2458,9 +2471,9 @@ function scaReport(
     lintEmitAtPos(
       "std-comment-audience",
       "a std module header of " +
-        cbNumStr(n) +
+        txNumStr(n) +
         " lines exceeds the " +
-        cbNumStr(scaHeaderBudget) +
+        txNumStr(scaHeaderBudget) +
         "-line budget — say what the module is for, how to import it, and what it deliberately does not do; the rest belongs in docs/internals/",
       "warning",
       ln,
@@ -2471,9 +2484,9 @@ function scaReport(
     lintEmitAtPos(
       "std-comment-audience",
       "a std doc comment of " +
-        cbNumStr(n) +
+        txNumStr(n) +
         " lines exceeds the " +
-        cbNumStr(scaDocBudget) +
+        txNumStr(scaDocBudget) +
         "-line budget — say what the export does, what its arguments mean, what it returns, and the edge case a caller must know",
       "warning",
       ln,
@@ -2500,7 +2513,7 @@ function scaReport(
 // documents nothing, so a section banner is not held to it. O(bytes), like the scan above.
 function stdCommentAudience() {
   if !scaIsStd(scaPath) { return 0 }
-  const s = cbSource
+  const s = txSource
   klEnsureIndex(s)
   let n = 0
   let blockLine = 0
@@ -2518,7 +2531,7 @@ function stdCommentAudience() {
     const le = klLnEnd[ln]
     const k = klIndentEnd(s, i, le)
     const line = ln + 1
-    if cbCommentAt(s, k, le) {
+    if txCommentAt(s, k, le) {
       // A new block starting while one is pending settles the pending one: what
       // follows it is a comment, not a declaration.
       if pend == 1 {
@@ -2541,23 +2554,23 @@ function stdCommentAudience() {
       }
     } else {
       if n > 0 && pend == 0 {
-        pendHdr = cbIsHeader(seenCode, headerTaken)
+        pendHdr = txIsHeader(seenCode, headerTaken)
         if pendHdr == 1 { headerTaken = 1 }
         pend = 1
       }
       if k < le {
         if pend == 1 {
           let isExp = 0
-          if cbAt(s, k, le, "export ") { isExp = 1 }
+          if txAt(s, k, le, "export ") { isExp = 1 }
           scaReport(n, blockLine, blockCol, tell, tellLine, pendHdr, isExp)
           pend = 0
           n = 0
           tell = ""
         }
         if inImport == 1 {
-          if cbFind(s, k, le, "} from ") { inImport = 0 }
-        } else if cbAt(s, k, le, "import ") {
-          if !cbFind(s, k, le, " from ") { inImport = 1 }
+          if txFind(s, k, le, "} from ") { inImport = 0 }
+        } else if txAt(s, k, le, "import ") {
+          if !txFind(s, k, le, " from ") { inImport = 1 }
         } else {
           seenCode = 1
         }
@@ -2566,7 +2579,7 @@ function stdCommentAudience() {
     ln = ln + 1
   }
   // A file with no trailing newline can end inside a block the loop never closed.
-  if pend == 0 && n > 0 { pendHdr = cbIsHeader(seenCode, headerTaken) }
+  if pend == 0 && n > 0 { pendHdr = txIsHeader(seenCode, headerTaken) }
   if pend == 1 || n > 0 {
     scaReport(n, blockLine, blockCol, tell, tellLine, pendHdr, 0)
   }
@@ -2658,7 +2671,7 @@ function asTableAt(s: string, i: i32, b: i32) {
   let t = 0
   while t < asTables.length {
     const nm = asTables[t]
-    if cbAt(s, i, b, nm) && cbAt(s, i + nm.length, b, ".length") { return nm }
+    if txAt(s, i, b, nm) && txAt(s, i + nm.length, b, ".length") { return nm }
     t = t + 1
   }
   ""
@@ -2668,38 +2681,30 @@ function asTableAt(s: string, i: i32, b: i32) {
 // one. A grow loop (`while xs.length < P.nodes.length { push }`) has no bare
 // identifier here and so is never a hit: it appends, it does not rescan.
 function asWhileVarOf(s: string, k: i32, b: i32) {
-  if !cbAt(s, k, b, "while ") { return "" }
-  const v = cbIdentAt(s, k + 6, b)
+  if !txAt(s, k, b, "while ") { return "" }
+  const v = txIdentAt(s, k + 6, b)
   if v.length == 0 { return "" }
-  let p = cbSpacesEnd(s, k + 6 + v.length, b)
+  let p = txSpacesEnd(s, k + 6 + v.length, b)
   if p >= b { return "" }
   if s[p] != '<' { return "" }
-  p = cbSpacesEnd(s, p + 1, b)
+  p = txSpacesEnd(s, p + 1, b)
   if asTableAt(s, p, b).length == 0 { return "" }
   v
-}
-
-// The name declared by a top-level `function f(` / `export function f(` line, else "".
-function asFnNameOf(s: string, k: i32, b: i32) {
-  let p = k
-  if cbAt(s, p, b, "export ") { p = cbSpacesEnd(s, p + 7, b) }
-  if !cbAt(s, p, b, "function ") { return "" }
-  cbIdentAt(s, cbSpacesEnd(s, p + 9, b), b)
 }
 
 // The name a `let x = 0` / `const x = 0` line zeroes, else "". Anything but the bare
 // literal is a resume point, and a scan that resumes has already been banked.
 function asZeroedNameOf(s: string, k: i32, b: i32) {
   let p = k
-  if cbAt(s, p, b, "let ") { p = p + 4 }
-  else if cbAt(s, p, b, "const ") { p = p + 6 }
+  if txAt(s, p, b, "let ") { p = p + 4 }
+  else if txAt(s, p, b, "const ") { p = p + 6 }
   else { return "" }
-  p = cbSpacesEnd(s, p, b)
-  const v = cbIdentAt(s, p, b)
+  p = txSpacesEnd(s, p, b)
+  const v = txIdentAt(s, p, b)
   if v.length == 0 { return "" }
-  p = cbSpacesEnd(s, p + v.length, b)
+  p = txSpacesEnd(s, p + v.length, b)
   if p >= b || s[p] != '=' { return "" }
-  p = cbSpacesEnd(s, p + 1, b)
+  p = txSpacesEnd(s, p + 1, b)
   if p >= b || s[p] != '0' { return "" }
   if p + 1 != b { return "" }
   v
@@ -2710,7 +2715,7 @@ function asZeroedNameOf(s: string, k: i32, b: i32) {
 // reading `klFnName`, which holds column-0 headers only — an indented `function` opens a
 // body here. O(bytes), one array of names per body.
 function arenaScanLint() {
-  const s = cbSource
+  const s = txSource
   klEnsureIndex(s)
   let fnName = ""
   let zeroed: string[] = []
@@ -2720,7 +2725,7 @@ function arenaScanLint() {
     const le = klLnEnd[ln]
     const k = klIndentEnd(s, i, le)
     const line = ln + 1
-    const fn = asFnNameOf(s, k, le)
+    const fn = txFnNameOf(s, k, le)
     if fn.length > 0 {
       fnName = fn
       zeroed = []
@@ -2732,9 +2737,9 @@ function arenaScanLint() {
         const v = asWhileVarOf(s, k, le)
         if (
           v.length > 0 &&
-          cbListHas(zeroed, v) &&
-          !cbListHas(asPasses, fnName) &&
-          !cbListHas(asAllow, fnName)
+          txListHas(zeroed, v) &&
+          !txListHas(asPasses, fnName) &&
+          !txListHas(asAllow, fnName)
         ) {
           lintEmitAtPos(
             "arena-scan-outside-pass",
@@ -3172,12 +3177,12 @@ function klCloser(s: string, i: i32, b: i32, op: i32, cl: i32) {
 // and `(…)`. The four spellings the tree dispatches on — `n`, `ot.primName`,
 // `P.nodes[ix]`, `kindAt(k)` — and nothing that is not one.
 function klSubjEnd(s: string, i: i32, b: i32) {
-  let j = cbIdentEnd(s, i, b)
+  let j = txIdentEnd(s, i, b)
   if j < 0 { return -1 }
   let go = true
   while go && j < b {
-    if s[j] == '.' && cbIdentEnd(s, j + 1, b) > 0 {
-      j = cbIdentEnd(s, j + 1, b)
+    if s[j] == '.' && txIdentEnd(s, j + 1, b) > 0 {
+      j = txIdentEnd(s, j + 1, b)
     } else if s[j] == '[' {
       const k = klCloser(s, j, b, '[', ']')
       if k < 0 { go = false } else { j = k }
@@ -3197,9 +3202,9 @@ function klSubjEnd(s: string, i: i32, b: i32) {
 // dispatches on none of them.
 function klArmLead(s: string, a: i32, e: i32) {
   const k = klIndentEnd(s, a, e)
-  if cbAt(s, k, e, "if ") { return k + 3 }
-  if cbAt(s, k, e, "} else if ") { return k + 10 }
-  if cbAt(s, k, e, "else if ") { return k + 8 }
+  if txAt(s, k, e, "if ") { return k + 3 }
+  if txAt(s, k, e, "} else if ") { return k + 10 }
+  if txAt(s, k, e, "else if ") { return k + 8 }
   -1
 }
 
@@ -3217,16 +3222,16 @@ function klTestAt(s: string, k: i32, b: i32) {
   klTSubj = ""
   klTMem = ""
   klTIsType = 0
-  const p = cbSpacesEnd(s, k, b)
+  const p = txSpacesEnd(s, k, b)
   const e = klSubjEnd(s, p, b)
   if e < 0 { return false }
-  const q = cbSpacesEnd(s, e, b)
+  const q = txSpacesEnd(s, e, b)
   let off = 0
-  if q > e && cbAt(s, q, b, "is ") { off = 3 }
-  if q > e && cbAt(s, q, b, "!is ") { off = 4 }
+  if q > e && txAt(s, q, b, "is ") { off = 3 }
+  if q > e && txAt(s, q, b, "!is ") { off = 4 }
   if off > 0 {
-    const r = cbSpacesEnd(s, q + off, b)
-    const me = cbIdentEnd(s, r, b)
+    const r = txSpacesEnd(s, q + off, b)
+    const me = txIdentEnd(s, r, b)
     if me <= r { return false }
     if s[r] < 'A' || s[r] > 'Z' { return false }
     klTSubj = s.slice(p, e)
@@ -3234,8 +3239,8 @@ function klTestAt(s: string, k: i32, b: i32) {
     klTIsType = 1
     return true
   }
-  if !cbAt(s, q, b, "==") && !cbAt(s, q, b, "!=") { return false }
-  const r = cbSpacesEnd(s, q + 2, b)
+  if !txAt(s, q, b, "==") && !txAt(s, q, b, "!=") { return false }
+  const r = txSpacesEnd(s, q + 2, b)
   if r >= b { return false }
   if s[r] != '"' { return false }
   let j = r + 1
@@ -3260,7 +3265,7 @@ function klIndexFns(s: string) {
   klFnHi = []
   let n = 0
   while n < klLnStart.length {
-    const nm = asFnNameOf(s, klLnStart[n], klLnEnd[n])
+    const nm = txFnNameOf(s, klLnStart[n], klLnEnd[n])
     if nm.length > 0 {
       if klFnName.length > 0 { klFnHi[klFnName.length - 1] = n - 1 }
       klFnName.push(nm)
@@ -3303,7 +3308,7 @@ function klElseBeforeBrace(s: string, k: i32, e: i32) {
   let i = k
   while i < e {
     if s[i] == '{' { return false }
-    if cbAt(s, i, e, "else") { return true }
+    if txAt(s, i, e, "else") { return true }
     i = i + 1
   }
   false
@@ -3335,11 +3340,11 @@ function klLineCallsName(s: string, a: i32, e: i32, target: string) {
     if c == '"' || c == '\'' {
       i = klSkipLit(s, i, e)
     } else {
-      const j = cbIdentEnd(s, i, e)
+      const j = txIdentEnd(s, i, e)
       if j < 0 {
         i = i + 1
       } else {
-        const p = cbSpacesEnd(s, j, e)
+        const p = txSpacesEnd(s, j, e)
         if p < e && s[p] == '(' && s.slice(i, j) == target { return true }
         i = j
       }
@@ -3356,15 +3361,15 @@ function klLineCallsAny(s: string, a: i32, e: i32) {
     if c == '"' || c == '\'' {
       i = klSkipLit(s, i, e)
     } else {
-      const j = cbIdentEnd(s, i, e)
+      const j = txIdentEnd(s, i, e)
       if j < 0 {
         i = i + 1
       } else {
-        const p = cbSpacesEnd(s, j, e)
+        const p = txSpacesEnd(s, j, e)
         if p < e && s[p] == '(' {
           const nm = s.slice(i, j)
-          if cbListHas(klNamingCalls, nm) { return true }
-          if cbListHas(klFnName, nm) { return true }
+          if txListHas(klNamingCalls, nm) { return true }
+          if txListHas(klFnName, nm) { return true }
         }
         i = j
       }
@@ -3382,7 +3387,7 @@ function klTailNames(s: string, last: i32, hi: i32) {
   // body has nowhere else to be read: the arm's own line joins the tail.
   const la = klLnStart[last]
   const le = klCodeEnd(s, la, klLnEnd[last])
-  if ts == last + 1 && cbFind(s, la, le, "else") { i = last }
+  if ts == last + 1 && txFind(s, la, le, "else") { i = last }
   while i <= hi {
     const a = klLnStart[i]
     const e = klCodeEnd(s, a, klLnEnd[i])
@@ -3432,7 +3437,7 @@ function klSetOf(mems: string[], a: i32, n: i32, isType: i32) {
       let ok = true
       let k = 0
       while k < n {
-        if !cbListHas(ms, mems[a + k]) { ok = false }
+        if !txListHas(ms, mems[a + k]) { ok = false }
         k = k + 1
       }
       if ok { return si }
@@ -3554,9 +3559,9 @@ function klRecordLadder(s: string, f: i32, g: i32) {
       "`" +
         klFnName[f] +
         "` tests " +
-        cbNumStr(n) +
+        txNumStr(n) +
         " of " +
-        cbNumStr(total) +
+        txNumStr(total) +
         " " +
         klSetNames[si] +
         " kinds and ends without naming the rest — add the missing arms or an `emitFail`/message default that lists them",
@@ -3639,7 +3644,7 @@ function klGradePair(s: string, x: i32, y: i32) {
       " ladder: this default hands the rest to `" +
       klFnName[fy] +
       "`, which hands none back, so " +
-      cbNumStr(drops.length) +
+      txNumStr(drops.length) +
       " kinds only `" +
       klFnName[fx] +
       "` tests fall through it — " +
@@ -3663,8 +3668,8 @@ function klSplitWalks(s: string) {
     let y = 0
     while y < klLadFn.length {
       if x != y && klLadSet[x] == klLadSet[y] && klLadFn[x] != klLadFn[y] {
-        const key = cbNumStr(klLadFn[x]) + ":" + cbNumStr(klLadFn[y])
-        if !cbListHas(klSplitDone, key) {
+        const key = txNumStr(klLadFn[x]) + ":" + txNumStr(klLadFn[y])
+        if !txListHas(klSplitDone, key) {
           if klGradePair(s, x, y) == 1 { klSplitDone.push(key) }
         }
       }
@@ -3679,7 +3684,7 @@ function klSplitWalks(s: string) {
 // recorded ladders for the split rule. Linear in bytes for the first two; the third is
 // quadratic in LADDERS, of which the largest module has under two hundred.
 function kindLadderLint() {
-  const s = cbSource
+  const s = txSource
   klLadFn = []
   klLadSet = []
   klLadMem = []
@@ -3749,11 +3754,11 @@ let siReturned = false
 // The identifier at `i` and, if a `.` follows it, the field after that — `name`, `a.b`.
 // "" when nothing starts here.
 function siPathAt(s: string, i: i32, b: i32) {
-  const a = cbIdentAt(s, i, b)
+  const a = txIdentAt(s, i, b)
   if a.length == 0 { return "" }
   const p = i + a.length
   if p < b && s[p] == '.' {
-    const f = cbIdentAt(s, p + 1, b)
+    const f = txIdentAt(s, p + 1, b)
     if f.length > 0 { return a + "." + f }
   }
   a
@@ -3773,20 +3778,20 @@ function siFieldOf(path: string) {
 function siFreshAt(s: string, i: i32) {
   if i == 0 { return true }
   const c = s[i - 1]
-  !cbIsWordChar(c) && c != '.'
+  !txIsWordChar(c) && c != '.'
 }
 
 // Record `name` once. "" is never recorded, which is what makes an emptied slot below
 // unmatchable rather than a wildcard.
 function siAdd(xs: string[], name: string) {
-  if name.length > 0 && !cbListHas(xs, name) { xs.push(name) }
+  if name.length > 0 && !txListHas(xs, name) { xs.push(name) }
   0
 }
 
 // Blank `name` where it occurs, so a rebinding drops the guard and the parameter status
 // the OLD value earned.
 function siDrop(xs: string[], name: string) {
-  const k = cbListIndexOf(xs, name)
+  const k = txListIndexOf(xs, name)
   if k >= 0 { xs[k] = "" }
   0
 }
@@ -3795,12 +3800,12 @@ function siDrop(xs: string[], name: string) {
 // spellings an index is allowed to be tested against. Index just past it, or -1.
 function siBoundAt(s: string, i: i32, b: i32) {
   if i >= b { return -1 }
-  if s[i] == '0' && !cbWordAt(s, i + 1, b) && cbCharOr(s, i + 1, b) != '.' {
+  if s[i] == '0' && !txWordAt(s, i + 1, b) && txCharOr(s, i + 1, b) != '.' {
     return i + 1
   }
   if s[i] == '-' {
-    const p = cbSpacesEnd(s, i + 1, b)
-    if p < b && s[p] == '1' && !cbWordAt(s, p + 1, b) { return p + 1 }
+    const p = txSpacesEnd(s, i + 1, b)
+    if p < b && s[p] == '1' && !txWordAt(s, p + 1, b) { return p + 1 }
     return -1
   }
   const path = siPathAt(s, i, b)
@@ -3809,7 +3814,7 @@ function siBoundAt(s: string, i: i32, b: i32) {
     // still has one to find. Missing it reads `while xs.length <= k { push }` as no
     // guard at all, and reports a correct grow-then-write loop.
     if siFieldOf(path) == "length" { return i + path.length }
-    if cbAt(s, i + path.length, b, ".length") { return i + path.length + 7 }
+    if txAt(s, i + path.length, b, ".length") { return i + path.length + 7 }
   }
   -1
 }
@@ -3818,7 +3823,7 @@ function siBoundAt(s: string, i: i32, b: i32) {
 function siCmpAt(s: string, i: i32, b: i32) {
   if i >= b { return 0 }
   const c = s[i]
-  const n = cbCharOr(s, i + 1, b)
+  const n = txCharOr(s, i + 1, b)
   if (c == '<' || c == '>' || c == '=' || c == '!') && n == '=' { return 2 }
   if c == '<' || c == '>' { return 1 }
   0
@@ -3829,19 +3834,19 @@ function siCmpAt(s: string, i: i32, b: i32) {
 function siMarkGuards(s: string, i: i32, e: i32) {
   const path = siPathAt(s, i, e)
   if path.length > 0 {
-    const p = cbSpacesEnd(s, i + path.length, e)
+    const p = txSpacesEnd(s, i + path.length, e)
     const w = siCmpAt(s, p, e)
     if w > 0 {
-      if siBoundAt(s, cbSpacesEnd(s, p + w, e), e) >= 0 {
+      if siBoundAt(s, txSpacesEnd(s, p + w, e), e) >= 0 {
         siAdd(siGuarded, path)
       }
     }
   }
   const be = siBoundAt(s, i, e)
   if be >= 0 {
-    const q = cbSpacesEnd(s, be, e)
+    const q = txSpacesEnd(s, be, e)
     const w2 = siCmpAt(s, q, e)
-    if w2 > 0 { siAdd(siGuarded, siPathAt(s, cbSpacesEnd(s, q + w2, e), e)) }
+    if w2 > 0 { siAdd(siGuarded, siPathAt(s, txSpacesEnd(s, q + w2, e), e)) }
   }
   0
 }
@@ -3858,10 +3863,10 @@ function siMarkGuards(s: string, i: i32, e: i32) {
 function siHoleTestAt(s: string, p: i32, e: i32) {
   const w = siCmpAt(s, p, e)
   if w == 0 { return false }
-  const q = cbSpacesEnd(s, p + w, e)
+  const q = txSpacesEnd(s, p + w, e)
   if q >= e { return false }
   if s[q] == '-' { return true }
-  if s[q] != '0' || cbWordAt(s, q + 1, e) || cbCharOr(s, q + 1, e) == '.' {
+  if s[q] != '0' || txWordAt(s, q + 1, e) || txCharOr(s, q + 1, e) == '.' {
     return false
   }
   (w == 1 && s[p] == '<') || (w == 2 && s[p] == '>')
@@ -3873,16 +3878,16 @@ function siHoleTestAt(s: string, p: i32, e: i32) {
 function siMapGlobalOf(s: string, a: i32, e: i32) {
   if a >= e || s[a] == ' ' { return "" }
   let p = a
-  if cbAt(s, p, e, "export ") { p = cbSpacesEnd(s, p + 7, e) }
-  if cbAt(s, p, e, "let ") { p = cbSpacesEnd(s, p + 4, e) }
-  else if cbAt(s, p, e, "const ") { p = cbSpacesEnd(s, p + 6, e) }
+  if txAt(s, p, e, "export ") { p = txSpacesEnd(s, p + 7, e) }
+  if txAt(s, p, e, "let ") { p = txSpacesEnd(s, p + 4, e) }
+  else if txAt(s, p, e, "const ") { p = txSpacesEnd(s, p + 6, e) }
   else { return "" }
-  const nm = cbIdentAt(s, p, e)
+  const nm = txIdentAt(s, p, e)
   if nm.length == 0 { return "" }
-  const q = cbSpacesEnd(s, p + nm.length, e)
+  const q = txSpacesEnd(s, p + nm.length, e)
   if q >= e || s[q] != ':' { return "" }
-  const r = cbSpacesEnd(s, q + 1, e)
-  if !cbAt(s, r, e, "{[") { return "" }
+  const r = txSpacesEnd(s, q + 1, e)
+  if !txAt(s, r, e, "{[") { return "" }
   nm
 }
 
@@ -3900,10 +3905,10 @@ function siScanHoles(s: string) {
       if c == '"' || c == '\'' {
         i = klSkipLit(s, i, e)
       } else {
-        if c == '.' && cbWordAt(s, i - 1, e) {
-          const f = cbIdentAt(s, i + 1, e)
+        if c == '.' && txWordAt(s, i - 1, e) {
+          const f = txIdentAt(s, i + 1, e)
           if f.length > 0 {
-            if siHoleTestAt(s, cbSpacesEnd(s, i + 1 + f.length, e), e) {
+            if siHoleTestAt(s, txSpacesEnd(s, i + 1 + f.length, e), e) {
               siAdd(siHoleF, f)
             }
           }
@@ -3919,22 +3924,22 @@ function siScanHoles(s: string) {
 // ── pass 2: which functions answer -1 ────────────────────────────────────────
 // `return -1`, a bare `-1` tail, or `return 0 - 1`.
 function siNegAnswerLine(s: string, a: i32, e: i32) {
-  const k = cbSpacesEnd(s, a, e)
-  if cbAt(s, k, e, "-1") && cbSpacesEnd(s, k + 2, e) >= e { return true }
+  const k = txSpacesEnd(s, a, e)
+  if txAt(s, k, e, "-1") && txSpacesEnd(s, k + 2, e) >= e { return true }
   let i = a
   while i < e {
     const c = s[i]
     if c == '"' || c == '\'' {
       i = klSkipLit(s, i, e)
     } else {
-      if cbAt(s, i, e, "return ") && !cbWordAt(s, i - 1, e) {
-        const p = cbSpacesEnd(s, i + 7, e)
-        if cbAt(s, p, e, "-1") && !cbWordAt(s, p + 2, e) { return true }
+      if txAt(s, i, e, "return ") && !txWordAt(s, i - 1, e) {
+        const p = txSpacesEnd(s, i + 7, e)
+        if txAt(s, p, e, "-1") && !txWordAt(s, p + 2, e) { return true }
         if p < e && s[p] == '0' {
-          const q = cbSpacesEnd(s, p + 1, e)
+          const q = txSpacesEnd(s, p + 1, e)
           if q < e && s[q] == '-' {
-            const r = cbSpacesEnd(s, q + 1, e)
-            if cbAt(s, r, e, "1") && !cbWordAt(s, r + 1, e) { return true }
+            const r = txSpacesEnd(s, q + 1, e)
+            if txAt(s, r, e, "1") && !txWordAt(s, r + 1, e) { return true }
           }
         }
       }
@@ -3947,9 +3952,9 @@ function siNegAnswerLine(s: string, a: i32, e: i32) {
 // The name a line hands its answer to: a bare two-space tail `f(…)`, or `return f(…)`.
 function siRetCallOf(s: string, a: i32, e: i32) {
   if a + 2 < e && s[a] == ' ' && s[a + 1] == ' ' && s[a + 2] != ' ' {
-    const t = cbIdentAt(s, a + 2, e)
+    const t = txIdentAt(s, a + 2, e)
     if t.length > 0 {
-      if cbCharOr(s, cbSpacesEnd(s, a + 2 + t.length, e), e) == '(' { return t }
+      if txCharOr(s, txSpacesEnd(s, a + 2 + t.length, e), e) == '(' { return t }
     }
   }
   let i = a
@@ -3958,11 +3963,11 @@ function siRetCallOf(s: string, a: i32, e: i32) {
     if c == '"' || c == '\'' {
       i = klSkipLit(s, i, e)
     } else {
-      if cbAt(s, i, e, "return ") && !cbWordAt(s, i - 1, e) {
-        const p = cbSpacesEnd(s, i + 7, e)
-        const t = cbIdentAt(s, p, e)
+      if txAt(s, i, e, "return ") && !txWordAt(s, i - 1, e) {
+        const p = txSpacesEnd(s, i + 7, e)
+        const t = txIdentAt(s, p, e)
         if t.length > 0 {
-          if cbCharOr(s, cbSpacesEnd(s, p + t.length, e), e) == '(' { return t }
+          if txCharOr(s, txSpacesEnd(s, p + t.length, e), e) == '(' { return t }
         }
       }
       i = i + 1
@@ -3979,9 +3984,9 @@ function siLineReturns(s: string, a: i32, e: i32) {
     if c == '"' || c == '\'' {
       i = klSkipLit(s, i, e)
     } else {
-      const prev = cbCharOr(s, i - 1, e)
+      const prev = txCharOr(s, i - 1, e)
       const lead = i == a || prev == ' ' || prev == '\t' || prev == '{'
-      if lead && cbAt(s, i, e, "return") && !cbWordAt(s, i + 6, e) {
+      if lead && txAt(s, i, e, "return") && !txWordAt(s, i + 6, e) {
         return true
       }
       i = i + 1
@@ -4057,12 +4062,12 @@ function siHeaderNames(s: string, f: i32, i32Only: boolean, out: string[]) {
     if c == '"' || c == '\'' {
       i = klSkipLit(s, i, e)
     } else {
-      const nm = cbIdentAt(s, i, e)
+      const nm = txIdentAt(s, i, e)
       if nm.length > 0 {
-        const p = cbSpacesEnd(s, i + nm.length, e)
+        const p = txSpacesEnd(s, i + nm.length, e)
         if p < e && s[p] == ':' {
-          const q = cbSpacesEnd(s, p + 1, e)
-          if !i32Only || (cbAt(s, q, e, "i32") && !cbWordAt(s, q + 3, e)) {
+          const q = txSpacesEnd(s, p + 1, e)
+          if !i32Only || (txAt(s, q, e, "i32") && !txWordAt(s, q + 3, e)) {
             siAdd(out, nm)
           }
         }
@@ -4077,17 +4082,17 @@ function siHeaderNames(s: string, f: i32, i32Only: boolean, out: string[]) {
 
 // The name a `let` / `const` / `for … in` line declares, or "".
 function siDeclNameOf(s: string, a: i32, e: i32) {
-  const p = cbSpacesEnd(s, a, e)
-  if cbAt(s, p, e, "let ") { return cbIdentAt(s, cbSpacesEnd(s, p + 4, e), e) }
-  if cbAt(s, p, e, "const ") {
-    return cbIdentAt(s, cbSpacesEnd(s, p + 6, e), e)
+  const p = txSpacesEnd(s, a, e)
+  if txAt(s, p, e, "let ") { return txIdentAt(s, txSpacesEnd(s, p + 4, e), e) }
+  if txAt(s, p, e, "const ") {
+    return txIdentAt(s, txSpacesEnd(s, p + 6, e), e)
   }
-  if cbAt(s, p, e, "for ") {
-    const v0 = cbSpacesEnd(s, p + 4, e)
-    const v = cbIdentAt(s, v0, e)
+  if txAt(s, p, e, "for ") {
+    const v0 = txSpacesEnd(s, p + 4, e)
+    const v = txIdentAt(s, v0, e)
     if v.length > 0 {
-      const q = cbSpacesEnd(s, v0 + v.length, e)
-      if cbAt(s, q, e, "in") && !cbWordAt(s, q + 2, e) { return v }
+      const q = txSpacesEnd(s, v0 + v.length, e)
+      if txAt(s, q, e, "in") && !txWordAt(s, q + 2, e) { return v }
     }
   }
   ""
@@ -4105,19 +4110,19 @@ function siBindAt(s: string, a: i32, e: i32) {
   siBindKind = 0
   siBindName = ""
   siBindText = ""
-  let p = cbSpacesEnd(s, a, e)
-  if cbAt(s, p, e, "let ") { p = cbSpacesEnd(s, p + 4, e) }
-  else if cbAt(s, p, e, "const ") { p = cbSpacesEnd(s, p + 6, e) }
-  const nm = cbIdentAt(s, p, e)
+  let p = txSpacesEnd(s, a, e)
+  if txAt(s, p, e, "let ") { p = txSpacesEnd(s, p + 4, e) }
+  else if txAt(s, p, e, "const ") { p = txSpacesEnd(s, p + 6, e) }
+  const nm = txIdentAt(s, p, e)
   if nm.length == 0 { return 0 }
-  let q = cbSpacesEnd(s, p + nm.length, e)
+  let q = txSpacesEnd(s, p + nm.length, e)
   // An annotation runs to the `=`. Only a one-word one leaves the right-hand side
   // readable as an index: `const x: i32[] = f()` binds a list, never an index, and is
   // taken here as an unbind.
   let simple = true
   if q < e && s[q] == ':' {
-    q = cbSpacesEnd(s, q + 1, e)
-    const ty = cbIdentAt(s, q, e)
+    q = txSpacesEnd(s, q + 1, e)
+    const ty = txIdentAt(s, q, e)
     if ty.length == 0 { simple = false } else { q = q + ty.length }
     while q < e && s[q] != '=' {
       if s[q] != ' ' { simple = false }
@@ -4125,15 +4130,15 @@ function siBindAt(s: string, a: i32, e: i32) {
     }
   }
   if q >= e || s[q] != '=' { return 0 }
-  if cbCharOr(s, q + 1, e) == '=' { return 0 }
+  if txCharOr(s, q + 1, e) == '=' { return 0 }
   siBindName = nm
   siBindKind = 3
   if !simple { return 0 }
-  const r = cbSpacesEnd(s, q + 1, e)
-  const callee = cbIdentAt(s, r, e)
+  const r = txSpacesEnd(s, q + 1, e)
+  const callee = txIdentAt(s, r, e)
   if (
     callee.length > 0 &&
-    cbCharOr(s, cbSpacesEnd(s, r + callee.length, e), e) == '('
+    txCharOr(s, txSpacesEnd(s, r + callee.length, e), e) == '('
   ) {
     siBindKind = 1
     siBindText = callee
@@ -4141,7 +4146,7 @@ function siBindAt(s: string, a: i32, e: i32) {
   }
   const path = siPathAt(s, r, e)
   if path.length > 0 && siFieldOf(path).length > 0 {
-    if cbSpacesEnd(s, r + path.length, e) >= e {
+    if txSpacesEnd(s, r + path.length, e) >= e {
       siBindKind = 2
       siBindText = path
     }
@@ -4205,22 +4210,22 @@ function siGradeRead(table: string, idx: string, line: i32, col: i32) {
   let base = table
   const dot = siFieldOf(table)
   if dot.length > 0 { base = table.slice(0, table.length - dot.length - 1) }
-  if cbListHas(siDeclared, base) { return 0 }
-  if cbListHas(siMapG, table) { return 0 }
-  if cbListHas(siGuarded, idx) { return 0 }
+  if txListHas(siDeclared, base) { return 0 }
+  if txListHas(siMapG, table) { return 0 }
+  if txListHas(siGuarded, idx) { return 0 }
   const fld = siFieldOf(idx)
   if fld.length > 0 {
-    if cbListHas(siHoleF, fld) { siReport(table, idx, 2, idx, line, col) }
+    if txListHas(siHoleF, fld) { siReport(table, idx, 2, idx, line, col) }
     return 0
   }
-  const k = cbListIndexOf(siPName, idx)
+  const k = txListIndexOf(siPName, idx)
   if k >= 0 {
     if siPKind[k] == 1 || siPKind[k] == 2 {
       siReport(table, idx, siPKind[k], siPText[k], line, col)
     }
     return 0
   }
-  if siReturned && cbListHas(siParams, idx) {
+  if siReturned && txListHas(siParams, idx) {
     siReport(table, idx, 3, idx, line, col)
   }
   0
@@ -4260,14 +4265,14 @@ function siGradeFn(s: string, f: i32) {
       } else {
         if siFreshAt(s, i) {
           siMarkGuards(s, i, e)
-          const prev = cbCharOr(s, i - 1, e)
+          const prev = txCharOr(s, i - 1, e)
           if prev != ']' && prev != ')' {
             const table = siPathAt(s, i, e)
-            if table.length > 0 && cbCharOr(s, i + table.length, e) == '[' {
-              const j = cbSpacesEnd(s, i + table.length + 1, e)
+            if table.length > 0 && txCharOr(s, i + table.length, e) == '[' {
+              const j = txSpacesEnd(s, i + table.length + 1, e)
               const idx = siPathAt(s, j, e)
               if idx.length > 0 {
-                if cbCharOr(s, cbSpacesEnd(s, j + idx.length, e), e) == ']' {
+                if txCharOr(s, txSpacesEnd(s, j + idx.length, e), e) == ']' {
                   siGradeRead(table, idx, ln + 1, i - a)
                 }
               }
@@ -4281,8 +4286,8 @@ function siGradeFn(s: string, f: i32) {
     siBindAt(s, a, e)
     if siBindKind > 0 {
       let kind = siBindKind
-      if kind == 2 && !cbListHas(siHoleF, siFieldOf(siBindText)) { kind = 3 }
-      const k = cbListIndexOf(siPName, siBindName)
+      if kind == 2 && !txListHas(siHoleF, siFieldOf(siBindText)) { kind = 3 }
+      const k = txListIndexOf(siPName, siBindName)
       if k < 0 {
         siPName.push(siBindName)
         siPKind.push(kind)
@@ -4303,7 +4308,7 @@ function siGradeFn(s: string, f: i32) {
 // module index rather than inheriting one, so it does not depend on running after the
 // kind-ladder pass; `klEnsureIndex` is what keeps that free.
 function sentinelIndexLint() {
-  const s = cbSource
+  const s = txSource
   klEnsureIndex(s)
   siScanHoles(s)
   siScanReaders(s)
