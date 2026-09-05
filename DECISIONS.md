@@ -625,7 +625,7 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   local's valtype through `letRefListSlot` while `emitLetDeclStmt` seeds the literal's
   construction through `pendingListKind`/`pendingListSlot`: give the destination to one and
   not the other and the binding stores an arm list into a box cell, which is the same
-  check-clean invalid wasm at a new offset. `letListBuildKind`/`letListBuildSlot` is the pair,
+  check-clean invalid wasm at a new offset. `letListBuild` returns the pair,
   and it is one function precisely so the two halves cannot drift. The same rule chose the map
   arm's input: reading the destination map's INTERNED shape (`mvRlSlot[mapShapeOfExpr(…)]`,
   the obvious route and the one `letMapDestShape` uses) answers only after the map's value
