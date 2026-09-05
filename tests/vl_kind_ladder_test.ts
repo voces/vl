@@ -147,6 +147,73 @@ function ctrlB(k: string): i32 {
     incomplete: [],
     split: [],
   },
+  {
+    // D1642 — the LAST function's range ran to END OF FILE, so a module's trailing
+    // top-level statements were read as its tail and `klLineCallsAny` took the call
+    // for a naming default. The pair is the control: the same ladder without the
+    // trailing line already fired, so only the added line can move the answer.
+    name: "tail-control.vl",
+    src: `function holed(k: string): i32 {
+  if k == "nulbool" { return 1 }
+  if k == "f64list" { return 2 }
+  if k == "u8list" { return 3 }
+  -1
+}
+`,
+    incomplete: [2],
+    split: [],
+  },
+  {
+    name: "tail-toplevel.vl",
+    src: `function holed(k: string): i32 {
+  if k == "nulbool" { return 1 }
+  if k == "f64list" { return 2 }
+  if k == "u8list" { return 3 }
+  -1
+}
+print(holed("u8list"))
+`,
+    incomplete: [2],
+    split: [],
+  },
+  {
+    // The other half of the same range bug: top-level code BETWEEN two functions was
+    // inside the earlier one's body too, so `after`'s call named `before`'s default.
+    name: "tail-between.vl",
+    src: `function before(k: string): i32 {
+  if k == "nulbool" { return 1 }
+  if k == "f64list" { return 2 }
+  if k == "u8list" { return 3 }
+  -1
+}
+print(before("u8list"))
+
+function after(k: string): i32 {
+  k.length
+}
+print(after("x"))
+`,
+    incomplete: [2],
+    split: [],
+  },
+  {
+    // A one-line function is where a brace walk is easiest to get wrong: its `{` and
+    // `}` are both on the header line, so the body must end there and not swallow
+    // what follows.
+    name: "tail-oneliner.vl",
+    src: `function oneLiner(k: string): i32 { k.length }
+
+function holed(k: string): i32 {
+  if k == "nulbool" { return 1 }
+  if k == "f64list" { return 2 }
+  if k == "u8list" { return 3 }
+  -1
+}
+print(oneLiner("x") + holed("u8list"))
+`,
+    incomplete: [4],
+    split: [],
+  },
 ];
 
 type Hits = { lines: Record<string, number[]>; msgs: Record<string, string[]> };
