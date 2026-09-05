@@ -1184,8 +1184,8 @@ where
 /// Render the compiler's accumulated diagnostics, one per line. A compiler
 /// module with the structured per-diagnostic exports (`diagCount` /
 /// `diagMsgLen` / `diagMsgAt` / `diagLine` / `diagCol`) renders a positioned
-/// diagnostic as `path:line:col: message` — 1-based line, 0-based column (the
-/// lexer's and the corpus `@error-at` directive's convention) — while
+/// diagnostic as `path:line:col: message` — 1-based line and column, through
+/// `display_col` — while
 /// `diagLine(i) == 0` means "no position" and the message prints bare. An older
 /// module without those exports degrades to the legacy newline-joined
 /// `diagLen`/`diagAt` text (bare messages), byte-identical to before.
@@ -1194,6 +1194,18 @@ where
 /// compile asks `DiagPaths` which file each diagnostic actually belongs to. The
 /// entry's own diagnostics resolve to module 0, whose key IS `path`, so a
 /// single-file program's output is unchanged to the byte.
+/// The guest's 0-based column as the 1-based one every channel prints.
+///
+/// The compiler carries columns 0-based internally (the lexer's convention, and the
+/// corpus `@error-at` directive's), and `cli-design.md` makes the OUTPUT 1-based:
+/// "`line` (1-based), `col` (1-based, inclusive)". The CLI pump shifts in VL
+/// (`cliFmtConcise`/`cliFmtJson`/`cliFmtPretty` each render `dgCol + 1`); this is the
+/// same shift for the two channels the pump never enters, so one diagnostic cannot
+/// reach two columns depending on whether it was reached by `check` or by `run`.
+fn display_col(guest_col: i32) -> i32 {
+    guest_col + 1
+}
+
 fn render_diags(inst: &Instance, store: &mut Store<()>, path: &str) -> Result<String> {
     if let (Ok(count), Ok(mlen), Ok(mat), Ok(dline), Ok(dcol)) = (
         inst.get_typed_func::<(), i32>(&mut *store, "diagCount"),
@@ -1210,7 +1222,7 @@ fn render_diags(inst: &Instance, store: &mut Store<()>, path: &str) -> Result<St
             let msg = read_guest_str(len, |j| Ok(mat.call(&mut *store, (i, j))?))?;
             let line = dline.call(&mut *store, i)?;
             if line > 0 {
-                let col = dcol.call(&mut *store, i)?;
+                let col = display_col(dcol.call(&mut *store, i)?);
                 let file = owners
                     .as_ref()
                     .and_then(|o| o.path_for(&mut *store, i))
@@ -2318,7 +2330,8 @@ fn locate_invalid_module(
     let headline = match &located {
         Some(w) => match &w.at {
             Some((file, line, col)) => format!(
-                "{file}:{line}:{col}: the emitted module failed to validate{}: {sentence}",
+                "{file}:{line}:{}: the emitted module failed to validate{}: {sentence}",
+                display_col(*col),
                 w.what(entry)
             ),
             None => format!(

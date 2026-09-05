@@ -44,10 +44,11 @@ const BUG_LINE = "this is a bug in vl, not in your program";
 
 // D1471's witness, verbatim from docs/internals/inventory/D1471.md: `vl check` rc 0, and
 // the engine refuses the module. `take` is declared on line 1, so the position this suite
-// asserts names its NAME token — `1:10` from the CLI renderer (1-based columns, which is
-// what `vl check` has always printed) and `1:9` from the host's own error printer (raw
-// 0-based, what `render_diags` prints for an emit refusal). The two conventions predate
-// this row; the assertion carries each channel's own rather than papering over them.
+// asserts names its NAME token: `1:10`, ONE literal for all three channels. The host used to
+// print `1:9` here — the guest's raw 0-based column — while the CLI pump shifted to 1-based,
+// so one diagnostic reached two columns depending on which command found it. `cli-design.md`
+// makes the output 1-based ("`col` (1-based, inclusive)"); the host shifts too now.
+const WANT_AT = "take.vl:1:10";
 const INVALID = `function take(a) {
   const v = a
   v[0] = 1.25
@@ -132,7 +133,7 @@ Deno.test({
         );
       }
       const r = await run(["check", "--codegen", "take.vl"], dir);
-      assertLocated("check --codegen", "take.vl:1:10", r.code, r.out);
+      assertLocated("check --codegen", WANT_AT, r.code, r.out);
     });
   },
 });
@@ -143,7 +144,7 @@ Deno.test({
   fn: async () => {
     await withDir({ "take.vl": INVALID }, async (dir) => {
       const r = await run(["run", "take.vl"], dir);
-      assertLocated("run", "take.vl:1:9:", r.code, r.out);
+      assertLocated("run", `${WANT_AT}:`, r.code, r.out);
     });
   },
 });
@@ -154,7 +155,7 @@ Deno.test({
   fn: async () => {
     await withDir({ "take.vl": INVALID }, async (dir) => {
       const r = await run(["build", "take.vl", "-o", "take.wasm"], dir);
-      assertLocated("build", "take.vl:1:9:", r.code, r.out);
+      assertLocated("build", `${WANT_AT}:`, r.code, r.out);
     });
   },
 });
