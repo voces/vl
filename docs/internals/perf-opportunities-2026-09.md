@@ -25,7 +25,7 @@ QUICK = a day, no design question. STRUCT = a design track.
 | 10 | `declaredSlotOf` → per-function side index built in `buildLocals` | **1.1%** self time | M | reset per function, 5 sites | byte-identical seed; `regress.py` | STRUCT |
 | 11 | `fnStmtsPosOf` → reverse index `nodeIx → fe` after mono: 19,106 calls, **25.9 M scan steps** | closures axis 2.22 → ~1 | M | 1 in-place write, `emit_mono.vl:6353` | byte-identical seed; the closures axis under its 3.2 bar | STRUCT |
 | 12 | Destringify type names — `tyTopIndexOf` is a per-CHARACTER walk over a type-name string, **4.94% self** | 4.9% plus most of `__str_eq__`'s tail | L | canon / rep | `docs/internals/registry-by-type-id.md` steps 4–6; byte-identity | STRUCT |
-| 13 | ✅ **LANDED (§G1 + §G2)** — but NOT as prescribed: the early-out never fires (0 of 5.4 M walks found a top-level `|`) and the suffix test already ran first. What the measurement supported is a byte pre-scan in front of `tyTopIndexOf`'s ladder, which serves every caller | §G1 `vl build` **0.568× / 0.725×** on the two outliers (medians of six interleaved readings), 0.922× on the control; §G2 a further **0.516× / 0.830×** on top, from the ladder's own 33.7× re-derivation | S | none — a sound over-approximation in front of the walk | byte-identical seed and codegen; `regress.py` no cell moved; all 2,996 corpus modules identical; `rep-fuzz-check.sh` | QUICK |
+| 13 | ✅ **LANDED (§G1 + §G2)** — but NOT as prescribed: the early-out never fires (0 of 5.4 M walks found a top-level `|`) and the suffix test already ran first. What the measurement supported is a byte pre-scan in front of `tyTopIndexOf`'s ladder, which serves every caller | §G1 `vl build` **0.568× / 0.725×** on the two outliers (medians of six interleaved readings), 0.922× on the control; §G2 a further **0.515× / 0.800×** on top, from the ladder's own 33.7× re-derivation | S | none — a sound over-approximation in front of the walk | byte-identical seed and codegen; `regress.py` no cell moved; all 2,996 corpus modules identical; `rep-fuzz-check.sh` | QUICK |
 
 Two corrections are load-bearing: **`vl check std/json.vl` is 40 ms, not 6.5 s** (§B1), and
 **`tyTopIndexOf` is not a name-keyed registry; `collectA` never calls it** (§B4).
@@ -1382,7 +1382,7 @@ build says the count is real and the attribution is wrong. The counter and profi
 are taken on `b437a3ae8` (master with §G1 merged, before #2648 and #2649 landed) by the
 same method §G1 used — counters compiled into a scratch artifact, dumped from the tail of
 `emitProgram` through a distinctive `emitFail`, with the seed never written; the CPU and
-identity tables are re-taken on the merged tree at `13ae7ff3d`.
+identity tables are re-taken on the merged tree at `4ad4996df`.
 
 `VL_PROFILE_GUEST` first, because it is what points at the entry. Of the first outlier's
 205 samples, **196 (95.6%) carry `nameIsRefArray`, `refArrShapeKind`, `refArrElemName` or
@@ -1442,30 +1442,33 @@ Measured after, same counters:
 | `nameIsArray` calls | 1,068,680 | 717,102 | **1.49×** |
 | characters `tyHasSepByte` visited | 17,213,995 | 12,788,698 | 1.35× |
 
-`vl build` CPU, user+sys per build over 25-30-build batches, min over five interleaved
-batches per arm, and that whole procedure run three times at loads from 7 to 156, because
-one reading of a ratio on this box is not a reading. The table is the merged-tree run at
-load 7-42; the two earlier readings were taken against §G1's seed on the pre-merge pin:
+`vl build` CPU, user+sys per build over 25-30-build batches so the 10 ms clock is not the
+resolution, min over five interleaved batches per arm, and that whole procedure run FOUR
+times at loads from 7 to 156, because one reading of a ratio on this box is not a reading.
+The table is the final merged-tree run; the three earlier readings were taken against
+§G1's seed on two earlier pins:
 
-| program | A (master) | B (this) | ratio | the two earlier readings |
+| program | A (master) | B (this) | ratio | the three earlier readings |
 | --- | ---: | ---: | ---: | ---: |
-| `arm-list-elem-pin-at-depth` | 0.1707 s | 0.0880 s | **0.516** (1.94×) | 0.509, 0.531 |
-| `global-reference-chain-cost` | 0.1201 s | 0.0997 s | **0.830** (1.20×) | 0.866, 0.880 |
-| control `deep-is-json-shape-walk` | 0.1879 s | 0.1866 s | 0.993 | 1.015, 0.998 |
+| `arm-list-elem-pin-at-depth` | 0.1735 s | 0.0894 s | **0.515** (1.94×) | 0.509, 0.531, 0.516 |
+| `global-reference-chain-cost` | 0.1216 s | 0.0973 s | **0.800** (1.25×) | 0.866, 0.880, 0.830 |
+| control `deep-is-json-shape-walk` | 0.1843 s | 0.1925 s | 1.044 | 1.015, 0.998, 0.993 |
 
-Per-test wall through the corpus oracle, min of 6 interleaved rounds (the oracle's own
-per-case work dilutes the ratio, which is why the CPU table above is the one to read for
-the mechanism): 115 → 85 ms, 99 → 88 ms, control 157 → 165 ms — the control's 1.05 is the
-same load noise the whole of `test-timing-2026-09.md` §2 is about, and the CPU A/B reads
-0.993 on it. The self-compile is 3.88 → 3.78 CPU-s, min of 6 interleaved (an earlier
-reading 4.23 → 3.85): at or just past this box's resolution, and expected either way —
-the compiler's own type names are shallow, so the recursion this removes barely runs on
-it.
+The control's four readings straddle 1 (median 1.006), which is what a program the change
+does not reach looks like on this box.
 
-Identity, pinned to `13ae7ff3d`: master is its own fixpoint, the candidate is its own
+Per-test wall through the corpus oracle, min of 6 interleaved rounds at load 22 (the
+oracle's own per-case work dilutes the ratio, which is why the CPU table above is the one
+to read for the mechanism): 110 → 77 ms, 92 → 84 ms, control 150 → 151 ms. The
+self-compile is 3.83 → 3.83 CPU-s, min of 6 interleaved at load 13-21 (two earlier and
+noisier readings, 0.975 and 0.911, both favoured the candidate) — unchanged at this box's
+resolution, and expected: the compiler's own type names are shallow, so the recursion this
+removes barely runs on it.
+
+Identity, pinned to `4ad4996df`: master is its own fixpoint, the candidate is its own
 fixpoint, and the candidate seed compiling the pinned master source reproduces master's
-fixpoint byte for byte. All 2,998 `tests/cases/**` modules are identical under both seeds
-— 2,452 byte-for-byte, 546 refused with identical text, 0 differences. `regress.py` moved
+fixpoint byte for byte. All 3,000 `tests/cases/**` modules are identical under both seeds
+— 2,453 byte-for-byte, 547 refused with identical text, 0 differences. `regress.py` moved
 no cell and `--verify-fresh` is clean; `rep-fuzz-check.sh` is exact; the seed grows 899
 bytes (+0.04%).
 
