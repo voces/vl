@@ -35,7 +35,7 @@ diagnostic column base); the rest stand on the surveys' own measurements.
 
 | # | finding | where | value | proof |
 | --- | --- | --- | --- | --- |
-| 14 | the cell-seed ladder is written four times; `ExpCtx` is the intended shape and is private to one file | emitter #3 | 311 `pending*` write sites converge on one resolver | byte-identical seed, `regress.py` |
+| 14 | the cell-seed ladder is written four times; `ExpCtx` is the intended shape and is private to one file | emitter #3 | 311 `pending*` write sites converge on one resolver; DONE 2026-09-05 — all four ladders call `expCtxForCell`, the const cell's per-cell reset is an `ExpCtx` snapshot restore, and `ExpCtx` carries all seventeen seeds (emitter §6.1.1) | byte-identical seed, `regress.py` |
 | 15 | `checkFuncDeclNode` (1,288 lines) and `checkCallNode` (996) split at seams with ≤ 12 and 2 live locals | front end #6, #7 | the two largest functions halve; 31 untested diagnostics get a named home | byte-identical seed |
 | 16 | `tyToEmitNameGo` / `tyToNominalNameGo` are 83% identical and must agree character for character | front end #5 | one drift surface; DONE 2026-09-05 as `tyToNameGo(ix, ctx, nominal)`, one atom bank, and `nameKidCtx` for the one divergence the survey did not name (§2.1) | byte-identical seed |
 | 17 | five ratchet scripts share 41 verbatim lines; `const ROOT` in 59 test files, 35 of 54 spawners pin no `VL_STD` | tooling #6, #7 | one core; a bare `deno test` from a worktree grades the right std | the gate |
