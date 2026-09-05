@@ -18,6 +18,8 @@
 // AND requires the vl binary + seed wasm + a `wasm-opt`; absent any, every case
 // registers ignored with a one-line how-to-build note. (No emitter bytes change —
 // optimization is a post-pass on the host side — so goldens are untouched.)
+//
+// @test-timing opt
 
 import { COMPILER, ROOT, VL, exists, nativeEnv } from "./support/tree.ts";
 

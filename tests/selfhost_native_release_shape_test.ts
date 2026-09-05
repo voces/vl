@@ -1,6 +1,8 @@
 // The BENCHMARK SHAPE rows of the release suite (`SHAPE_TABLE`). Its own file so
 // `deno test --parallel` can run it beside the melt/loop/case rows rather than
 // after them; the machinery and the table are in the shared support module.
+//
+// @test-timing opt
 import {
   BENCH,
   BYTES_TOL_FRAC,

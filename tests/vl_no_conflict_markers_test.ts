@@ -7,6 +7,8 @@
 // count, plus `=======` when it sits between them.
 //
 // Repro (any file): `git merge` with a conflict, `git add` without editing, commit.
+//
+// @test-timing sweep n=12355
 
 const BINARY = /\.(wasm|png|jpg|jpeg|gif|ico|woff2?|ttf|pdf|zip|gz|cwasm)$/i;
 // The generated corpora are thousands of one-line files a conflict would break outright

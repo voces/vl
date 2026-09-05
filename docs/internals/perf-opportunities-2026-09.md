@@ -25,6 +25,7 @@ QUICK = a day, no design question. STRUCT = a design track.
 | 10 | `declaredSlotOf` → per-function side index built in `buildLocals` | **1.1%** self time | M | reset per function, 5 sites | byte-identical seed; `regress.py` | STRUCT |
 | 11 | `fnStmtsPosOf` → reverse index `nodeIx → fe` after mono: 19,106 calls, **25.9 M scan steps** | closures axis 2.22 → ~1 | M | 1 in-place write, `emit_mono.vl:6353` | byte-identical seed; the closures axis under its 3.2 bar | STRUCT |
 | 12 | Destringify type names — `tyTopIndexOf` is a per-CHARACTER walk over a type-name string, **4.94% self** | 4.9% plus most of `__str_eq__`'s tail | L | canon / rep | `docs/internals/registry-by-type-id.md` steps 4–6; byte-identity | STRUCT |
+| 13 | `nameIsArray` asks `unionMemberCount` for a COUNT when it needs the predicate `< 2`, so a cheap suffix test drags a whole-string walk behind it — and it is asked once per element and per nesting level (§G) | `tyTopIndexOf` **61.5% / 28.3% self** on the two type-heavy outliers against 11.1% on the control; 79 `nameIsArray` sites, 10 of 23 `unionMemberCount` sites compare only against 1 or 2 | S | none — a pure early-out | byte-identical seed; `regress.py`; the two profiles below re-taken; the unions + generic-pins scaling axes | QUICK |
 
 Two corrections are load-bearing: **`vl check std/json.vl` is 40 ms, not 6.5 s** (§B1), and
 **`tyTopIndexOf` is not a name-keyed registry; `collectA` never calls it** (§B4).
@@ -1145,3 +1146,53 @@ bar with a `gate.sh` fanned out beside it (load 103–115) the pair reads 2.17�
 the bar, which is what a ratchet is for. The one reading above 4.0 seen anywhere was a single
 5.25 at load 70 with `many` at 1.31 s — above the new bar, so the pair's own per-side
 re-measure absorbs it, which is exactly the case a bar set AT the measurement would not have.
+
+## G · `nameIsArray`'s count-instead-of-predicate (item 13), 2026-09-05
+
+Found from the other direction: `docs/internals/test-timing-2026-09.md` was surveying which
+TESTS take over 100 ms, and the corpus turned out to be the better instrument — 2,989
+programs with their sizes attached. Baseline rate from `scripts/self-compile-baseline.json`
+is 6.3 CPU-s over 5,902,133 bytes of `compiler/*.vl` = **1.067 µs/byte**. Over the whole
+corpus at `vl build`, min of 3, the work after subtracting the measured 11 ms spawn floor is
+10.5 s over 5.65 MB — **1.87 µs/byte, 1.7x baseline**, so the corpus as a whole compiles at
+about the rate the compiler compiles itself. Restricted to cases of 1 KB or more, three
+stand clear:
+
+| case | ms (min of 3) | bytes | µs/byte | x baseline |
+| --- | ---: | ---: | ---: | ---: |
+| `unions/arm-list-elem-pin-at-depth.vl` | 290 | 2,981 | 93.6 | **88x** |
+| `globals/global-reference-chain-cost.vl` | 166 | 2,130 | 72.8 | 68x |
+| `std/json-deep-is-parse-result.vl` | 135 | 1,816 | 68.3 | 64x |
+| `literal-unions/litunion-order-cross-module-alias.vl` | 69 | 1,575 | 36.8 | 35x |
+
+The second is a DELIBERATE cost fixture (D1513, and its own header says so) and the third
+pulls `std:json`, a fixed cost. `VL_PROFILE_GUEST` against a `--names` seed, ranked by SELF
+time with `scripts/profile-rank.py`, and with the 30x case as a control:
+
+| frame | `arm-list-elem-pin-at-depth` (330) | `global-reference-chain-cost` (166) | control `deep-is-json-shape-walk` (198) |
+| --- | ---: | ---: | ---: |
+| `tyTopIndexOf` self | **61.52%** | **28.31%** | 11.11% |
+| `unionMemberCount` incl | 55.45% | 27.11% | — |
+| `nameIsArray` incl | 56.36% | — | — |
+| `__str_eq__` self | 6.06% | 7.83% | 12.12% |
+
+One term tops both outliers and sits well below that in the control, so it is a family
+rather than one case's quirk. Taken on `ca9645cc1`, after #2630's emitter index: the
+outlier's share ROSE (59.2 -> 61.5%) as a competing scan left and the control's fell
+(18.0 -> 11.1%), so that landing sharpened this rather than touching it. The mechanism is in `compiler/tyname.vl`: `nameIsArray` opens
+with a two-character suffix test, then finishes `unionMemberCount(name) < 2` — and
+`unionMemberCount` loops `tyTopIndexOf`, a per-character bracket walk, to the END of the
+string counting every top-level `|` when the caller only needs to know whether one exists.
+For a name with k top-level members that is k+1 walks of the remainder. `nameIsArray` is
+then asked once per element and per nesting level by `arrElemIsArrayOf`, `arrElemNameRaw`
+and `nameIsClosureArray`, so `{r: i32}[][][][]` re-walks the same string at every level.
+
+**Surface: 79 `nameIsArray` call sites over 8 modules; 10 of the 23 `unionMemberCount` call
+sites compare the count only against 1 or 2** (`> 1`, `< 2`, `>= 2`), so every one of those
+wants a predicate. The fix is an early-out `unionHasTopLevelBar` that returns at the first
+top-level `|`, which is why this is QUICK and item 12's canon/rep design question is not a
+prerequisite: item 12 recorded the same frame at 4.94% self on a SELF-COMPILE, and what is
+new here is that on type-heavy programs it is 28-62%, reachable without destringifying
+anything.
+
+Not fixed in the PR that filed this — that one changed only tests.

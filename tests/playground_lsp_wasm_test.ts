@@ -28,26 +28,29 @@ const seedExists = (() => {
 })();
 const ignore = !seedExists;
 
+// One compiled Module for the file, a FRESH Instance per call below. Compiling is
+// the expensive half and a `WebAssembly.Module` is immutable, so every helper still
+// hands out its own store — which is what makes the tests independent.
+const module = seedExists
+  ? new WebAssembly.Module(Deno.readFileSync(SEED) as BufferSource)
+  : undefined;
+const seedInstance = (): WebAssembly.Instance => {
+  if (!module) throw new Error(`no seed at ${SEED}`);
+  return new WebAssembly.Instance(module, {});
+};
+
 // Build a checker over the on-disk seed and wire it into the adapter (what the
 // page does via `wasmCheckerBrowser.ts` + `initLsp`). Idempotent across tests —
 // `initLsp` just replaces the module-level checker each call.
 const initFromSeed = (): void => {
-  const bytes = Deno.readFileSync(SEED);
-  const instance = new WebAssembly.Instance(
-    new WebAssembly.Module(bytes as BufferSource),
-    {},
-  );
+  const instance = seedInstance();
   lsp.initLsp(createWasmChecker(() => instance.exports as unknown as Exports));
 };
 
 // A bare seed-backed checker (no LSP wiring) — for the Run-path tests, which call
 // `checker.compile` / `runProgram(…, checker)` directly.
 const seedChecker = (): WasmChecker => {
-  const bytes = Deno.readFileSync(SEED);
-  const instance = new WebAssembly.Instance(
-    new WebAssembly.Module(bytes as BufferSource),
-    {},
-  );
+  const instance = seedInstance();
   return createWasmChecker(() => instance.exports as unknown as Exports);
 };
 
@@ -253,11 +256,7 @@ Deno.test("playground-lsp: features degrade to empty before a seed is wired", as
 // a genuinely old artifact on disk. `undefined` removes the export entirely, which
 // is what any pre-stamp seed looks like.
 const checkerAtAbi = (abi: number | undefined): WasmChecker => {
-  const bytes = Deno.readFileSync(SEED);
-  const instance = new WebAssembly.Instance(
-    new WebAssembly.Module(bytes as BufferSource),
-    {},
-  );
+  const instance = seedInstance();
   // A PLAIN COPY, not a Proxy: a wasm export is a non-configurable own data
   // property, so a `get` trap that returns anything else throws a TypeError.
   const real = instance.exports as unknown as Exports;
