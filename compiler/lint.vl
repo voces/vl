@@ -163,13 +163,11 @@ export function lint(progRoot: i32) {
     duplicateImports(stmts)
     unusedFunctions(stmts)
     preferConst()
-    lintWalk(lintRuleUnreachable, progRoot)
-    lintWalk(lintRuleConstBranch, progRoot)
-    lintWalk(lintRuleStepZero, progRoot)
-    lintWalk(lintRuleUncondRecursion, progRoot)
-    lintWalk(lintRuleHasGuardReread, progRoot)
-    lintWalk(lintRuleUnionLetNoMelt, progRoot)
-    lintWalk(lintRuleUnusedPureExpr, progRoot)
+    // One walk offers every node to all seven structural rules; the regroup restores
+    // the rule-major emit sequence a same-position tie reads.
+    const walkMark = lintCodes.length
+    lintWalk(progRoot)
+    lintRegroupWalkPhase(walkMark)
     // Not walks: neither comments, nor a loop's shape, nor a ladder's default is in
     // the arena. All four read the source the driver set, and `commentBudget` consumes
     // it, so it runs last — after the std audience pass, which reads the same text.
@@ -703,37 +701,112 @@ function upeIsPure(ix: i32) {
   upeLitOperand(ix)
 }
 
-// ── generic AST walk (one child-enumerator, per-rule visit dispatch) ─────────
+// ── generic AST walk (one child-enumerator, every rule visited per node) ─────
 
 // Every structural rule needs the same recursive traversal of the node arena, so one
 // shared walker carries it: `nodeChildren` is the one place that knows each variant's
-// child slots, and `lintWalk` drives a pre-order visit selected by a rule id. The
-// binding scan is the one traversal not driven through it — it needs scope enter/exit.
-const lintRuleConstBranch = 0
-const lintRuleStepZero = 1
-const lintRuleUnreachable = 2
-const lintRuleUncondRecursion = 3
-const lintRuleHasGuardReread = 4
-const lintRuleUnionLetNoMelt = 5
-const lintRuleUnusedPureExpr = 6
+// child slots, and `lintWalk` drives ONE pre-order pass in which every rule looks at
+// every node. The binding scan needs scope enter/exit and keeps its own traversal.
 
-// Visit `ix` for `rule`, then recurse into its children (pre-order: a rule sees
-// a node before any of its descendants). `-1` child slots (absent) and any
-// out-of-range index are skipped by the bounds check, so the walk never traps.
-function lintWalk(rule: i32, ix: i32) {
+// One pass makes the emit sequence node-major where seven passes made it rule-major,
+// and same-position ties read that sequence (`cliStableSort` orders by position and
+// keeps arrival order). The ranks below are the tie-break, applied by
+// `lintRegroupWalkPhase` — the rule order is stated rather than inherited from a walk.
+const lintRankUnreachable = 0
+const lintRankConstBranch = 1
+const lintRankStepZero = 2
+const lintRankUncondRecursion = 3
+const lintRankHasGuardReread = 4
+const lintRankUnionLetNoMelt = 5
+const lintRankUnusedPureExpr = 6
+const lintRankCount = 7
+
+// Offer `ix` to all seven structural rules, in rank order. Each visitor opens with its
+// own `is` test, so this is a flat unconditional sequence: there is no rule id to
+// dispatch on and no chain a new rule could be inserted into in the wrong place.
+function lintVisitAll(ix: i32) {
+  unreachableVisit(ix)
+  constantBranchVisit(ix)
+  degenerateStepVisit(ix)
+  uncondRecursionVisit(ix)
+  hasGuardRereadVisit(ix)
+  unionLetNoMeltVisit(ix)
+  unusedPureExprVisit(ix)
+  0
+}
+
+// Visit `ix`, then recurse into its children (pre-order: a rule sees a node before any
+// of its descendants). `-1` child slots (absent) and any out-of-range index are skipped
+// by the bounds check, so the walk never traps.
+function lintWalk(ix: i32) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
-  if rule == lintRuleConstBranch { constantBranchVisit(ix) }
-  if rule == lintRuleHasGuardReread { hasGuardRereadVisit(ix) }
-  if rule == lintRuleUnusedPureExpr { unusedPureExprVisit(ix) }
-  if rule == lintRuleUnionLetNoMelt { unionLetNoMeltVisit(ix) }
-  else if rule == lintRuleStepZero { degenerateStepVisit(ix) }
-  else if rule == lintRuleUnreachable { unreachableVisit(ix) }
-  else if rule == lintRuleUncondRecursion { uncondRecursionVisit(ix) }
+  lintVisitAll(ix)
   const kids = nodeChildren(ix)
   let i = 0
   while i < kids.length {
-    lintWalk(rule, kids[i])
+    lintWalk(kids[i])
     i = i + 1
+  }
+  0
+}
+
+// The tie-break rank of a walk-rule diagnostic, read off its code — each of the seven
+// codes is emitted by exactly one visitor, so the code is the whole key. A code with no
+// rank sorts after all seven rather than being dropped; only the seven reach here,
+// since `lintRegroupWalkPhase` reads just the slice the walk appended.
+function lintRankOfCode(code: string) {
+  if code == "unreachable-code" { return lintRankUnreachable }
+  if code == "constant-condition" { return lintRankConstBranch }
+  if code == "for-step-zero" { return lintRankStepZero }
+  if code == "unconditional-recursion" { return lintRankUncondRecursion }
+  if code == "map-has-guard-reread" { return lintRankHasGuardReread }
+  if code == "union-let-no-melt" { return lintRankUnionLetNoMelt }
+  if code == "unused-pure-expression" { return lintRankUnusedPureExpr }
+  lintRankCount
+}
+
+// Regroup the diagnostics the single walk appended at or after `mark` into rank order,
+// stably — each rule's findings keep the pre-order the walk produced. This is the
+// sequence the seven separate walks emitted, and it is what breaks a same-position tie
+// downstream; `tests/vl_check_module_lint_test.ts` pins one such tie.
+function lintRegroupWalkPhase(mark: i32) {
+  const n = lintCodes.length
+  if mark < 0 || n - mark < 2 { return 0 }
+  const rank: i32[] = []
+  let i = mark
+  while i < n {
+    rank.push(lintRankOfCode(lintCodes[i]))
+    i = i + 1
+  }
+  const codes: string[] = []
+  const msgs: string[] = []
+  const sevs: string[] = []
+  const lines: i32[] = []
+  const cols: i32[] = []
+  let r = 0
+  while r <= lintRankCount {
+    let j = 0
+    while j < rank.length {
+      if rank[j] == r {
+        const at = mark + j
+        codes.push(lintCodes[at])
+        msgs.push(lintMsgs[at])
+        sevs.push(lintSevs[at])
+        lines.push(lintLines[at])
+        cols.push(lintCols[at])
+      }
+      j = j + 1
+    }
+    r = r + 1
+  }
+  let k = 0
+  while k < codes.length {
+    lintCodes[mark + k] = codes[k]
+    lintMsgs[mark + k] = msgs[k]
+    lintSevs[mark + k] = sevs[k]
+    lintLines[mark + k] = lines[k]
+    lintCols[mark + k] = cols[k]
+    k = k + 1
   }
   0
 }
@@ -2144,10 +2217,10 @@ function cbIsHeader(seenCode: i32, headerTaken: i32) {
   0
 }
 
-// Walk the source line by line, accumulating own-line `//` runs. O(bytes); the only
-// per-line state is a handful of counters. Length and the uncited measurement are
-// block facts and report when the block closes; shouting and history are line facts
-// and report where they stand, once per block per code.
+// Walk the source line by line over the shared index, accumulating own-line `//` runs.
+// O(bytes); the only per-line state is a handful of counters. Length and the uncited
+// measurement are block facts and report when the block closes; shouting and history
+// are line facts and report where they stand, once per block per code.
 function commentBudget() {
   const s = cbSource
   cbSource = ""
@@ -2158,8 +2231,7 @@ function commentBudget() {
   const p = scaPath
   scaPath = ""
   if scaIsStd(p) { return 0 }
-  let i = 0
-  let line = 1
+  klEnsureIndex(s)
   let n = 0
   let blockLine = 0
   let blockCol = 0
@@ -2170,13 +2242,12 @@ function commentBudget() {
   let seenCode = 0
   let headerTaken = 0
   let inImport = 0
-  while i <= s.length {
-    let e = i
-    while e < s.length && s[e] != '\n' { e = e + 1 }
-    let le = e
-    if le > i && s[le - 1] == '\r' { le = le - 1 }
-    let k = i
-    while k < le && (s[k] == ' ' || s[k] == '\t') { k = k + 1 }
+  let ln = 0
+  while ln < klLnStart.length {
+    const i = klLnStart[ln]
+    const le = klLnEnd[ln]
+    const k = klIndentEnd(s, i, le)
+    const line = ln + 1
     if k + 1 < le && s[k] == '/' && s[k + 1] == '/' {
       if n == 0 {
         blockLine = line
@@ -2235,8 +2306,7 @@ function commentBudget() {
         }
       }
     }
-    i = e + 1
-    line = line + 1
+    ln = ln + 1
   }
   if n > 0 {
     cbReport(
@@ -2391,15 +2461,14 @@ function scaReport(
   0
 }
 
-// Walk the source line by line, resolving each block against what follows it: a block
-// whose next non-blank line declares an `export` documents that export and takes the
-// tighter budget. A block followed by another comment block documents nothing, so a
-// section banner is not held to it. O(bytes), like the scan above.
+// Walk the source line by line over the shared index, resolving each block against what
+// follows it: a block whose next non-blank line declares an `export` documents that
+// export and takes the tighter budget. A block followed by another comment block
+// documents nothing, so a section banner is not held to it. O(bytes), like the scan above.
 function stdCommentAudience() {
   if !scaIsStd(scaPath) { return 0 }
   const s = cbSource
-  let i = 0
-  let line = 1
+  klEnsureIndex(s)
   let n = 0
   let blockLine = 0
   let blockCol = 0
@@ -2410,13 +2479,12 @@ function stdCommentAudience() {
   let seenCode = 0
   let headerTaken = 0
   let inImport = 0
-  while i <= s.length {
-    let e = i
-    while e < s.length && s[e] != '\n' { e = e + 1 }
-    let le = e
-    if le > i && s[le - 1] == '\r' { le = le - 1 }
-    let k = i
-    while k < le && (s[k] == ' ' || s[k] == '\t') { k = k + 1 }
+  let ln = 0
+  while ln < klLnStart.length {
+    const i = klLnStart[ln]
+    const le = klLnEnd[ln]
+    const k = klIndentEnd(s, i, le)
+    const line = ln + 1
     if k + 1 < le && s[k] == '/' && s[k + 1] == '/' {
       // A new block starting while one is pending settles the pending one: what
       // follows it is a comment, not a declaration.
@@ -2462,8 +2530,7 @@ function stdCommentAudience() {
         }
       }
     }
-    i = e + 1
-    line = line + 1
+    ln = ln + 1
   }
   // A file with no trailing newline can end inside a block the loop never closed.
   if pend == 0 && n > 0 { pendHdr = cbIsHeader(seenCode, headerTaken) }
@@ -2627,21 +2694,21 @@ function asZeroedNameOf(s: string, k: i32, b: i32) {
   v
 }
 
-// One pass over the source. Per line: open a function (resetting the zeroed set),
-// record a zeroed local, or grade a `while`. O(bytes), one array of names per body.
+// One pass over the shared line index. Per line: open a function (resetting the zeroed
+// set), record a zeroed local, or grade a `while`. It finds its own headers rather than
+// reading `klFnName`, which holds column-0 headers only — an indented `function` opens a
+// body here. O(bytes), one array of names per body.
 function arenaScanLint() {
   const s = cbSource
-  let i = 0
-  let line = 1
+  klEnsureIndex(s)
   let fnName = ""
   let zeroed: string[] = []
-  while i <= s.length {
-    let e = i
-    while e < s.length && s[e] != '\n' { e = e + 1 }
-    let le = e
-    if le > i && s[le - 1] == '\r' { le = le - 1 }
-    let k = i
-    while k < le && (s[k] == ' ' || s[k] == '\t') { k = k + 1 }
+  let ln = 0
+  while ln < klLnStart.length {
+    const i = klLnStart[ln]
+    const le = klLnEnd[ln]
+    const k = klIndentEnd(s, i, le)
+    const line = ln + 1
     const fn = asFnNameOf(s, k, le)
     if fn.length > 0 {
       fnName = fn
@@ -2670,8 +2737,7 @@ function arenaScanLint() {
         }
       }
     }
-    i = e + 1
-    line = line + 1
+    ln = ln + 1
   }
   0
 }
@@ -2979,8 +3045,9 @@ const klNamingCalls = [
 ]
 
 // ── the line index ───────────────────────────────────────────────────────────
-// Byte offsets of every line's start and its end (the `\r` and `\n` excluded). Built once
-// per module; three walks read it, and none of them re-splits the source.
+// Byte offsets of every line's start and its end (the `\r` and `\n` excluded). One entry
+// per line the source has, counting the empty one a trailing newline leaves. Every text
+// rule reads it through `klEnsureIndex` and none of them re-splits the source.
 let klLnStart: i32[] = []
 let klLnEnd: i32[] = []
 
@@ -3200,6 +3267,25 @@ function klIndexFns(s: string) {
     }
     n = n + 1
   }
+  0
+}
+
+// The source both indexes above describe, and whether they describe one at all. An empty
+// module is a real source equal to the initial `klIndexedSrc`, so the flag is what keeps
+// its own build from being skipped.
+let klIndexedSrc = ""
+let klIndexed = false
+
+// Build the line and function indexes for `s`, unless they already describe it. Both are
+// pure functions of the source, so every text rule may ask and none has to run after any
+// other: `kindLadderLint` and `sentinelIndexLint` each ask, and stay order-independent
+// without paying for the build twice.
+function klEnsureIndex(s: string) {
+  if klIndexed && s == klIndexedSrc { return 0 }
+  klIndexLines(s)
+  klIndexFns(s)
+  klIndexedSrc = s
+  klIndexed = true
   0
 }
 
@@ -3600,8 +3686,7 @@ function kindLadderLint() {
   klLadLine = []
   klLadCol = []
   klLadLast = []
-  klIndexLines(s)
-  klIndexFns(s)
+  klEnsureIndex(s)
   let f = 0
   while f < klFnName.length {
     klScanFn(s, f)
@@ -4226,13 +4311,12 @@ function siGradeFn(s: string, f: i32) {
   0
 }
 
-// Two module passes and one per function, all linear in bytes. The kind-ladder module
-// index is rebuilt here rather than inherited, so this pass does not depend on running
-// after that one.
+// Two module passes and one per function, all linear in bytes. This pass asks for the
+// module index rather than inheriting one, so it does not depend on running after the
+// kind-ladder pass; `klEnsureIndex` is what keeps that free.
 function sentinelIndexLint() {
   const s = cbSource
-  klIndexLines(s)
-  klIndexFns(s)
+  klEnsureIndex(s)
   siScanHoles(s)
   siScanReaders(s)
   let f = 0

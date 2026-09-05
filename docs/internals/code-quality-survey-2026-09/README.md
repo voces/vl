@@ -29,7 +29,7 @@ diagnostic column base); the rest stand on the surveys' own measurements.
 | 10 | `nestedFnDeclaredInFrame` is the un-indexed twin of `nestedFnDeclaredIn`, which already has the child index | emitter #5 | O(children) per rung; one arena-scan ratchet entry retires | byte-identical seed |
 | 11 | definite assignment keeps a name-keyed `string[]` rebuilt per write, with every module binding in it | front end #2 | the call-site `O(n^1.5)` the perf survey never attributed | the scaling-shape ladder |
 | 12 | sixteen functions re-run the same seven-classifier ladder in the same order | emitter #4 | ~23% inclusive summed | byte-identical seed, corpus `cmp` |
-| 13 | `lint()` walks the arena seven times and re-splits the source four ways, on every keystroke | tooling #5 | editor latency | byte-identical `lint-self.sh` |
+| 13 | `lint()` walks the arena seven times and re-splits the source four ways, on every keystroke | tooling #5 | editor latency; DONE 2026-09-05 — one walk is **−5.2% to −6.7%** of a whole `vl check`, the shared line index a further −0.9% to −2.7% at the noise floor, and the walk's own tie-break is now an explicit rank (tooling §5.1) | byte-identical `lint-self.sh`, plus 18,236 diagnostics identical in order over 3,219 files |
 
 ## Tranche 3 — structure (days; each a campaign with its own gate)
 
