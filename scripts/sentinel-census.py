@@ -186,15 +186,36 @@ def module_maps(lines):
     return out
 
 
+def header_end(lines, lo, hi):
+    """The last line of the function's header: the first one holding the `{` that opens
+    the body. `vl fmt` wraps a long parameter list, so a header is not one line and a
+    parameter can be declared on a continuation line."""
+    for i in range(lo, hi + 1):
+        if "{" in lines[i]:
+            return i
+    return lo
+
+
+def header_names(lines, lo, hi, pat):
+    """Every name `pat` matches in the header, from the `(` on the first line through the
+    line that opens the body."""
+    out = set()
+    for i in range(lo, header_end(lines, lo, hi) + 1):
+        s = lines[i]
+        if i == lo:
+            k = s.find("(")
+            if k < 0:
+                continue
+            s = s[k:]
+        for m in pat.finditer(s):
+            out.add(m.group(1))
+    return out
+
+
 def declared_in(lines, lo, hi):
     """Every name the function DECLARES: its parameters and its `let`/`const`/`for`
     bindings. A subscript base among these is not a table — see the rule."""
-    out = set()
-    head = lines[lo]
-    k = head.find("(")
-    if k >= 0:
-        for m in PARAMS.finditer(head[k:]):
-            out.add(m.group(1))
+    out = header_names(lines, lo, hi, PARAMS)
     for i in range(lo, hi + 1):
         m = DECL.match(lines[i]) or FOR_IN.match(lines[i])
         if m:
@@ -202,10 +223,8 @@ def declared_in(lines, lo, hi):
     return out
 
 
-def i32_params(lines, lo):
-    head = lines[lo]
-    k = head.find("(")
-    return set(m.group(1) for m in I32_PARAM.finditer(head[k:])) if k >= 0 else set()
+def i32_params(lines, lo, hi):
+    return header_names(lines, lo, hi, I32_PARAM)
 
 
 def module_readers(lines, fns):
@@ -254,7 +273,7 @@ def hits_in(rel, src):
     out = []
     for fn, lo, hi in fns:
         local = declared_in(lines, lo, hi)
-        params = i32_params(lines, lo) if fn in readers_here else set()
+        params = i32_params(lines, lo, hi) if fn in readers_here else set()
         producer = {}   # name -> (kind, producer text); kind is "call"/"field"/"param"
         guarded = set()
         returned = False

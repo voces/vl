@@ -204,6 +204,19 @@ Each was a real over-report during the build, and each is pinned as a fixture in
   field, which turned every `const id = xs.length` into a producer.
 * **A locally-built list**, a **re-bound index**, and a **parameter read at the TOP of a
   reader** rather than on a fall-through.
+* **A parameter on a WRAPPED header.** Both implementations read a function's declarations off
+  its header, and both read only the header's FIRST line — so when `vl fmt` broke a long
+  parameter list over several lines, a parameter declared on a continuation line was neither
+  "declared" nor "an `i32` parameter". The header now runs to the `{` that opens the body.
+
+  The one-line read cost the rule in BOTH directions, and only one of them was a false
+  positive. Measured on `compiler/` when the fix landed: **0 hits left** — the false positive
+  is real (a six-parameter helper written in #2601 hit it the day it was written) but no
+  function in the tree happened to have that shape — and **21 hits ENTERED**, every one the
+  fall-through-`i32`-parameter arm inside a function whose header wraps: `monoMakeInstance`
+  (13), `emitStructExprAsVariantBox` (6), `emitVariantFieldsEq` (2). The ratchet therefore
+  ROSE, 358 → 379, which is a detector seeing more rather than a tree getting worse, and
+  `tests/vl_sentinel_index_test.ts`'s `wrapped.vl` fixture pins both directions.
 
 ## Agreement, and why there are two implementations
 
