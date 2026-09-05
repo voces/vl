@@ -67,6 +67,12 @@ is the one refactor here where a byte-identical seed is both the proof and non-n
 Proof: `scripts/refresh-compiler.sh`, then `cmp` against a seed built from the pre-change
 source.
 
+**Done 2026-09-05**, as `tyToNameGo(ix, ctx, nominal)` with one `tyNameAtoms` bank and the two
+`At`s kept as the faces' entry points. The survey missed one divergence: the structural face
+passes its interior positions through `appKidCtx`, which re-roots a registered generic
+application's interior, and the nominal face does not — that is `nameKidCtx`, behind the same
+flag. `sentinel-index-unguarded` fell 361 → 358 as predicted.
+
 ### 2.2 · Two AST child walkers
 
 `nodeChildren` (`ast.vl:1683`, 25 arms) and `jwKids` (`json_walk.vl:575`, 22 arms) walk the

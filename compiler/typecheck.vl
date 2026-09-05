@@ -2262,10 +2262,10 @@ function irAtoms(nm: string, atoms: i32): string {
 }
 
 // `irAtoms` for a name that is a `tyToEmitName` render: adopt the renderer's own reported width
-// (`emitNameAtoms`). Written as a call so the render is evaluated before `emitNameAtoms` is read,
+// (`tyNameAtoms`). Written as a call so the render is evaluated before `tyNameAtoms` is read,
 // with no dependence on argument evaluation order.
 function irRendered(nm: string): string {
-  inferRetNameAtoms = emitNameAtoms
+  inferRetNameAtoms = tyNameAtoms
   return nm
 }
 // The arena-index sibling of `inferRetTy`: the `Ty`-arena index of each recorded inferred return
@@ -9475,7 +9475,7 @@ function tyToStrGo(ix: i32, nominal: boolean) {
   // this arm: a newtype must be erased in the emitter's vocabulary (`newtype-design.md` §3).
   const nwn = nomNameOfTy(ix)
   if nwn != "" { return nwn }
-  // Nominal-first, in the same order `tyToNominalNameGo`/`transparentMemberEmitName` use:
+  // Nominal-first, in the same order `tyToNameGo`/`transparentMemberEmitName` use:
   // declared struct, generic application, declared union alias — application before union,
   // since an application expands to the `TyObj`/`TyUnion` this exists to replace. Each leg
   // declines with "" for a type it cannot name, so an unnamed type still renders structurally.
@@ -9990,7 +9990,7 @@ function tyEmitNameIsString(ix: i32): boolean {
   if t is TyUnion {
     const members = t.uMembers
     if members.length == 0 { return false }
-    // Mirrors `tyToEmitNameGo`'s union arm: the flattened-alias regroup and the per-member
+    // Mirrors `tyToNameGo`'s union arm: the flattened-alias regroup and the per-member
     // litunion-alias lookup can substitute a declared alias name for a literal run, and a
     // name that isn't `string` makes this predicate's answer false — dual-written
     // deliberately, since `tyToEmitName(ix) == "string"` is a contract only if both move together.
@@ -10058,11 +10058,11 @@ const RC_UNION_KEY = 256 // a member of a union being spelled as the registry KE
 // splits `null` as a sibling — a rule asking "am I under a nullable" must agree either way.
 // Every other bit is replaced at each descent (a struct field that is itself an array element is a field, not both).
 
-// The top-level atom count of the name the last `tyToEmitName` call returned, produced by
-// the renderer rather than re-derived by scanning the finished string. A name gains a
+// The top-level atom count of the name the last render returned, at either face, produced
+// by the renderer rather than re-derived by scanning the finished string. A name gains a
 // top-level `|` at exactly two places (the union join, the nullable `|null` suffix); every
-// other arm is one atom. Meaningful only for a non-empty render; written and read per call, never carried between calls.
-let emitNameAtoms = 1
+// other arm is one atom. Meaningful only for a non-empty render, never carried between calls.
+let tyNameAtoms = 1
 
 // The ancestor stack of the render in progress, `isEquatable`'s `seen` guard applied to the
 // renderer: a recursive type is a cycle in the arena, and rendering one structurally without
@@ -10091,7 +10091,7 @@ function tyToEmitNameAt(ix: i32, ctx: i32) {
   let si = 0
   while si < emitNameSeen.length {
     if emitNameSeen[si] == ix {
-      emitNameAtoms = 1
+      tyNameAtoms = 1
       const selfNm = aliasNameOfTyIx(ix)
       if selfNm != "" { return selfNm }
       return ""
@@ -10099,7 +10099,7 @@ function tyToEmitNameAt(ix: i32, ctx: i32) {
     si = si + 1
   }
   emitNameSeen.push(ix)
-  const r = tyToEmitNameGo(ix, ctx)
+  const r = tyToNameGo(ix, ctx, false)
   emitNameSeen.pop()
   // An empty render is not an answer, and a declared name always beats it: `type J = null |
   // f64 | JO` folds to a one-member `TyUnion` whose member is a `TyNullable`, so the cycle
@@ -10165,9 +10165,54 @@ function appKidCtx(ix: i32, ctx: i32): i32 {
   ctx
 }
 
-function tyToEmitNameGo(ix: i32, ctx: i32) {
-  emitNameAtoms = 1
+// The kid position the two faces disagree about: the structural face re-roots a registered
+// generic application's interior, the nominal face leaves the position alone. Nominal only
+// reaches a registered application when `genAppNameOfTy` declined or `RC_UNION_KEY` held its
+// arm back, and re-rooting there would respell a member the union key already banked.
+function nameKidCtx(ix: i32, ctx: i32, nominal: boolean): i32 {
+  if nominal { return ctx }
+  appKidCtx(ix, ctx)
+}
+
+// The recursive entry of the face being rendered. The two `At`s keep their own bodies: the
+// structural one answers a revisited alias's own name and retries the null-fold, the nominal
+// one records the cut in `nomNameCycle`.
+function tyToNameAt(ix: i32, ctx: i32, nominal: boolean): string {
+  if nominal { return tyToNominalNameAt(ix, ctx) }
+  tyToEmitNameAt(ix, ctx)
+}
+
+// The structural render, at one of two faces: `nominal` turns on the nominal-first prelude
+// (a declared struct, generic application or union alias spells as its own name) and selects
+// the recursion's face. One body because the two faces and canon must spell one arena type
+// one way, or the name-keyed registries hold a row per spelling; `tyToStrGo` is the precedent.
+function tyToNameGo(ix: i32, ctx: i32, nominal: boolean): string {
+  tyNameAtoms = 1
   if ix < 0 { return "" }
+  if nominal {
+    // Nominal-first: a declared struct or union alias renders as its name — one identifier,
+    // so one atom.
+    const sdn = structNameOfTy(ix)
+    if sdn != "" { return sdn }
+    // …and a generic application renders as the application (`Box<i32>`), ahead of the union
+    // arm for the same reason `structNameOfTy` is. Declines ("") for an uninstantiated or
+    // cyclic argument. Not taken at `RC_UNION_KEY`, though: a generic application standing as
+    // a union member is spelled by its shape on the annotation side (`unionMemberGenAppShape`).
+    if (ctx & RC_UNION_KEY) == 0 {
+      const gan = genAppNameOfTy(ix)
+      if gan != "" { return gan }
+    }
+    const udn = unionAliasDeclNameOfTy(ix)
+    if udn != "" {
+      // …except a declared alias for a numeric literal union (`type Z = 0 | 1`), which
+      // denotes its base scalar, never the alias name — the emitter cannot classify that
+      // name, so `isUName` would otherwise claim a union box while every read lowers as a
+      // plain scalar. `canonEmitName` reaches this by name, this renderer by arena index.
+      const nlb = numLitUnionBaseName(ix)
+      if nlb != "" { return nlb }
+      return udn
+    }
+  }
   const t = T.tys[ix]
   // Exhaustive over `Ty`, deliberately without a `_` arm: a new variant breaks the
   // self-compile here instead of silently rendering "" — which every name-keyed registry
@@ -10179,7 +10224,7 @@ function tyToEmitNameGo(ix: i32, ctx: i32) {
     }
     TyLit => {
       // A literal renders as its base scalar, at the one home that answers that
-      // (`tyLitBaseName`) — shared with the twin arm in the other renderer.
+      // (`tyLitBaseName`).
       return tyLitBaseName(t)
     }
     TyUnion => {
@@ -10191,11 +10236,11 @@ function tyToEmitNameGo(ix: i32, ctx: i32) {
       const luiN = litUnionInlineNameOfTy(ix)
       if luiN != "" {
         if luiHasNull {
-          emitNameAtoms = luiAtoms + 1
+          tyNameAtoms = luiAtoms + 1
           return luiN + "|null"
         }
         if ctxKeepsLitUnion(ctx) {
-          emitNameAtoms = luiAtoms
+          tyNameAtoms = luiAtoms
           return luiN
         }
       }
@@ -10226,7 +10271,7 @@ function tyToEmitNameGo(ix: i32, ctx: i32) {
       const parts: string[] = []
       // The render's atom count, accumulated as parts are kept: a part is not always one
       // atom (a nullable member renders `X|null`), so this is summed rather than read off
-      // `parts.length`.
+      // `parts.length`, and a duplicate part contributes nothing.
       let psum = 0
       let rgDone = false
       let i = 0
@@ -10245,14 +10290,18 @@ function tyToEmitNameGo(ix: i32, ctx: i32) {
           continue
         }
         // An alias name is one identifier — one atom. Only the render leg can be wider,
-        // and it reports its own width in `emitNameAtoms`.
+        // and it reports its own width in `tyNameAtoms`.
         let sc = 1
         let s = litUnionAliasNameOfTy(members[i])
         if s == "" {
           // A union member, carrying the sticky nullable bit down so this arm agrees with
           // canon's flat `A|B|null` split about what "under a nullable" means.
-          s = tyToEmitNameAt(members[i], RC_UNION_MEM | (ctx & RC_NULLABLE))
-          sc = emitNameAtoms
+          s = tyToNameAt(
+            members[i],
+            RC_UNION_MEM | (ctx & RC_NULLABLE),
+            nominal,
+          )
+          sc = tyNameAtoms
         }
         if s == "" { return "" }
         // A function-type member renders parenthesized (`(()=>f32|null)|{w:i32}`) — bare,
@@ -10281,7 +10330,7 @@ function tyToEmitNameGo(ix: i32, ctx: i32) {
         out = out + "|" + parts[k]
         k = k + 1
       }
-      emitNameAtoms = psum
+      tyNameAtoms = psum
       return out
     }
     TyNullable => {
@@ -10291,7 +10340,7 @@ function tyToEmitNameGo(ix: i32, ctx: i32) {
       const nal = litUnionAliasNameOfTy(t.nInner)
       if nal != "" {
         // An alias identifier plus the `null` arm — two atoms.
-        emitNameAtoms = 2
+        tyNameAtoms = 2
         return nal + "|null"
       }
       // …and an un-aliased one keeps its members, at every position: canon's
@@ -10299,11 +10348,13 @@ function tyToEmitNameGo(ix: i32, ctx: i32) {
       // `litUnionInlineNameOfTy` applies internally, so the two cannot disagree.
       const nlui = litUnionInlineNameOfTy(t.nInner)
       if nlui != "" {
-        emitNameAtoms = luiAtoms + 1
+        tyNameAtoms = luiAtoms + 1
         return nlui + "|null"
       }
-      const inner = tyToEmitNameAt(t.nInner, RC_NULLABLE)
-      const innerAtoms = emitNameAtoms
+      // At the nominal face this is where a nullable declared struct or union keeps its
+      // name (`S|null`, `U|null`) — the prelude claims it one recursion down.
+      const inner = tyToNameAt(t.nInner, RC_NULLABLE, nominal)
+      const innerAtoms = tyNameAtoms
       if inner == "" { return "" }
       // A nullable function type keeps grouping parens (`((i32)=>string)|null`) — bare,
       // the render would spell a closure returning `string|null` instead, the same
@@ -10311,12 +10362,12 @@ function tyToEmitNameGo(ix: i32, ctx: i32) {
       const nfn = T.tys[t.nInner]
       if nfn is TyFunc {
         // The grouped closure is one atom; `null` is the second.
-        emitNameAtoms = 2
+        tyNameAtoms = 2
         return "(" + inner + ")|null"
       }
       // A union inner keeps its own top-level `|`s (`A|B|null`), so the `null` arm adds to
       // the inner render's width rather than making the whole name two atoms.
-      emitNameAtoms = innerAtoms + 1
+      tyNameAtoms = innerAtoms + 1
       return inner + "|null"
     }
     TyObj => {
@@ -10338,15 +10389,17 @@ function tyToEmitNameGo(ix: i32, ctx: i32) {
           const fbal = litUnionAliasNameOfTy(ftys[fi])
           if fbal != "" { fs = fbal }
         }
-        if fs == "" { fs = tyToEmitNameAt(ftys[fi], appKidCtx(ix, RC_FIELD)) }
+        if fs == "" {
+          fs = tyToNameAt(ftys[fi], nameKidCtx(ix, RC_FIELD, nominal), nominal)
+        }
         if fs == "" { return "" }
         if fi > 0 { out = out + "," }
         out = out + names[fi] + ":" + fs
         fi = fi + 1
       }
       // Every field separator sits inside the braces — one atom. Set explicitly, since a
-      // field's own render leaves `emitNameAtoms` holding its last width.
-      emitNameAtoms = 1
+      // field's own render leaves `tyNameAtoms` holding its last width.
+      tyNameAtoms = 1
       return out + "}"
     }
     TyArray => {
@@ -10358,26 +10411,28 @@ function tyToEmitNameGo(ix: i32, ctx: i32) {
       // one atom, the render leg reports its own.
       let elw = 1
       if el == "" {
-        el = tyToEmitNameAt(t.aElem, appKidCtx(ix, RC_ELEM))
-        elw = emitNameAtoms
+        el = tyToNameAt(t.aElem, nameKidCtx(ix, RC_ELEM, nominal), nominal)
+        elw = tyNameAtoms
       }
       if el == "" { return "" }
       // A list name is one atom in every form — a union element is parenthesized so its
       // `|`s stop being top-level. Set explicitly, since the element render leaves its own
       // width behind; the grouping itself is `arrElemRender`'s.
-      emitNameAtoms = 1
+      tyNameAtoms = 1
       return arrElemRender(el, t.aElem, elw)
     }
     TyMap => {
-      const mk = tyToEmitNameAt(t.mKey, RC_MAP_KEY)
+      const mk = tyToNameAt(t.mKey, RC_MAP_KEY, nominal)
       // A litunion-alias map value (`{[string]: K0}`) keeps its alias name rather than
       // softening to `string` — an atom-valued map is the mono i32 map, and every
       // `$fnsig`/mv-slot key derived here must agree with the annotation side's spelling.
       let mv = litUnionAliasNameOfTy(t.mVal)
-      if mv == "" { mv = tyToEmitNameAt(t.mVal, appKidCtx(ix, RC_MAP_VAL)) }
+      if mv == "" {
+        mv = tyToNameAt(t.mVal, nameKidCtx(ix, RC_MAP_VAL, nominal), nominal)
+      }
       if mk == "" || mv == "" { return "" }
       // The key/value separators sit inside the braces — one atom.
-      emitNameAtoms = 1
+      tyNameAtoms = 1
       return "{[" + mk + "]:" + mv + "}"
     }
     TyFunc => {
@@ -10389,7 +10444,7 @@ function tyToEmitNameGo(ix: i32, ctx: i32) {
       let out = "("
       let i = 0
       while i < ps.length {
-        const ps1 = tyToEmitNameAt(ps[i], RC_FN_PARAM)
+        const ps1 = tyToNameAt(ps[i], RC_FN_PARAM, nominal)
         if ps1 == "" { return "" }
         if i > 0 { out = out + "," }
         out = out + ps1
@@ -10408,7 +10463,9 @@ function tyToEmitNameGo(ix: i32, ctx: i32) {
         const bal = litUnionAliasNameOfTy(t.fnRet)
         if bal != "" { rs = bal }
       }
-      if rs == "" { rs = tyToEmitNameAt(t.fnRet, appKidCtx(ix, RC_FN_RES)) }
+      if rs == "" {
+        rs = tyToNameAt(t.fnRet, nameKidCtx(ix, RC_FN_RES, nominal), nominal)
+      }
       if rs == "" { return "" }
       // A function-type result keeps grouping parens so the outer `$fnsig` producers see a
       // single result token (`(i32)=>((i32)=>i32)`), matching the source-annotation form.
@@ -10417,18 +10474,18 @@ function tyToEmitNameGo(ix: i32, ctx: i32) {
       // A function type is one atom: params are parenthesized and everything after the
       // top-level `=>` belongs to the result — `unionMemberCount` implements this by
       // stopping at a top-level arrow, so `(i32)=>A|B` counts 1, not 2.
-      emitNameAtoms = 1
+      tyNameAtoms = 1
       return out + ")=>" + rs
     }
     TyVar => {
-      // An unsolved type parameter has no name in the emitter's vocabulary — the
-      // monomorphizer names the instance.
+      // An unsolved type parameter has no name at either face — the monomorphizer names
+      // the instance.
     }
     TyNeg => {
-      // A residual negation — `intersectTy` folds the rest — has no emitter name.
+      // A residual negation — `intersectTy` folds the rest — has no name at either face.
     }
     TyErr => {
-      // The error/unknown hole has no emitter name; a rejected program never
+      // The error/unknown hole has no name at either face; a rejected program never
       // reaches the emitter that would need one.
     }
   }
@@ -10591,19 +10648,13 @@ export function genAppNameOfTy(ty: i32): string {
         a = a + 1
       }
       // The application is one top-level atom, whatever the recursion left in the bank.
-      nomNameAtoms = 1
+      tyNameAtoms = 1
       return gaAppHeads[i] + "<" + s + ">"
     }
     i = i + 1
   }
   ""
 }
-
-// Name-faithful, nominal-first renderer: a declared struct renders as its name, a declared
-// union alias as its alias name, rather than `tyToEmitName`'s structural expansion — tames
-// recursion too, since a declared type short-circuits before its fields re-enter.
-// `nomNameAtoms`: the last call's top-level atom width, for `arrElemRender` to read.
-let nomNameAtoms = 1
 
 // The ancestor stack of the nominal render in progress, `emitNameSeen`'s twin: nominal-first
 // tames a declared recursive struct by short-circuiting to its name, but not a recursive
@@ -10616,9 +10667,10 @@ const nomNameSeen: i32[] = []
 // with no name, none of which is a cycle — testing the string would reject every generic alias.
 let nomNameCycle = false
 
-// The position-free entry, as on the structural sibling: every outside caller
-// (`emit_collect.vl`'s registration walk) asks about a type standing on its own. The
-// cycle bank is per top-level render, so it resets here rather than in the recursion.
+// The name-faithful face: a declared struct renders as its name, a declared union alias as
+// its alias name, rather than the structural expansion — which tames recursion too, since a
+// declared type short-circuits before its fields re-enter. Position-free, as on the
+// structural sibling; the cycle bank is per top-level render, so it resets here.
 export function tyToNominalName(ix: i32): string {
   nomNameCycle = false
   tyToNominalNameAt(ix, RC_ROOT)
@@ -10630,281 +10682,21 @@ export function tyToNominalName(ix: i32): string {
 export function tyNomNameCycled(): boolean { nomNameCycle }
 
 function tyToNominalNameAt(ix: i32, ctx: i32): string {
-  nomNameAtoms = 1
+  tyNameAtoms = 1
   if ix < 0 { return "" }
   let si = 0
   while si < nomNameSeen.length {
     if nomNameSeen[si] == ix {
-      nomNameAtoms = 1
+      tyNameAtoms = 1
       nomNameCycle = true
       return ""
     }
     si = si + 1
   }
   nomNameSeen.push(ix)
-  const r = tyToNominalNameGo(ix, ctx)
+  const r = tyToNameGo(ix, ctx, true)
   nomNameSeen.pop()
   r
-}
-
-function tyToNominalNameGo(ix: i32, ctx: i32): string {
-  nomNameAtoms = 1
-  if ix < 0 { return "" }
-  // Nominal-first: a declared struct or union alias renders as its name — one identifier,
-  // so one atom.
-  const sdn = structNameOfTy(ix)
-  if sdn != "" { return sdn }
-  // …and a generic application renders as the application (`Box<i32>`), ahead of the union
-  // arm for the same reason `structNameOfTy` is. Declines ("") for an uninstantiated or
-  // cyclic argument. Not taken at `RC_UNION_KEY`, though: a generic application standing as
-  // a union member is spelled by its shape on the annotation side (`unionMemberGenAppShape`).
-  if (ctx & RC_UNION_KEY) == 0 {
-    const gan = genAppNameOfTy(ix)
-    if gan != "" { return gan }
-  }
-  const udn = unionAliasDeclNameOfTy(ix)
-  if udn != "" {
-    // …except a declared alias for a numeric literal union (`type Z = 0 | 1`), which
-    // denotes its base scalar, never the alias name — the emitter cannot classify that
-    // name, so `isUName` would otherwise claim a union box while every read lowers as a
-    // plain scalar. `canonEmitName` reaches this by name, this renderer by arena index.
-    const nlb = numLitUnionBaseName(ix)
-    if nlb != "" { return nlb }
-    return udn
-  }
-  const t = T.tys[ix]
-  // Exhaustive over `Ty`, deliberately without a `_` arm: a new variant breaks the
-  // self-compile here instead of silently rendering "" ("no nominal name").
-  match t {
-    TyPrim => {
-      if t.primName == "never" { return "" }
-      return t.primName
-    }
-    TyLit => {
-      // A literal renders as its base scalar, at the one home that answers that
-      // (`tyLitBaseName`) — shared with the twin arm in the other renderer.
-      return tyLitBaseName(t)
-    }
-    TyUnion => {
-      const members = t.uMembers
-      // A pure inline literal union keeps its members, matching `tyToEmitNameGo`'s leg
-      // character for character — the two renderers and canon must spell one arena type
-      // one way, or the name-keyed registries hold a row per spelling.
-      const luiN = litUnionInlineNameOfTy(ix)
-      if luiN != "" {
-        if luiHasNull {
-          nomNameAtoms = luiAtoms + 1
-          return luiN + "|null"
-        }
-        if ctxKeepsLitUnion(ctx) {
-          nomNameAtoms = luiAtoms
-          return luiN
-        }
-      }
-      // Source-faithful render: a litunion-alias member keeps its alias name, reconstructing
-      // a flattened lit run into its registered alias. Position-dependent softening is not
-      // re-implemented here — a consumer applies `canonEmitName` once over the whole rendered
-      // name, where the func-type structure is visible; per-arm softening would lose that context.
-      let rgAlias = ""
-      const rgTexts: string[] = []
-      let rgNonLit = false
-      let rg = 0
-      while rg < members.length {
-        const rm = T.tys[members[rg]]
-        if rm is TyLit {
-          if rm.litKind == "str" { rgTexts.push(rm.litText) }
-        } else {
-          let rmNull = false
-          if rm is TyPrim {
-            if rm.primName == "null" { rmNull = true }
-          }
-          if !rmNull { rgNonLit = true }
-        }
-        rg = rg + 1
-      }
-      if rgNonLit && rgTexts.length >= 2 {
-        rgAlias = litUnionAliasOfLitTexts(rgTexts)
-      }
-      const parts: string[] = []
-      // The kept parts' widths, summed — not `parts.length`. A part is not always one atom
-      // (a nullable member renders `X|null`), and a duplicate part contributes nothing.
-      let psum = 0
-      let rgDone = false
-      let i = 0
-      while i < members.length {
-        const rgm = T.tys[members[i]]
-        if rgAlias != "" && rgm is TyLit {
-          if !rgDone {
-            rgDone = true
-            parts.push(rgAlias)
-            psum = psum + 1
-          }
-          i = i + 1
-          continue
-        }
-        // An alias name is one identifier — one atom. Only the render leg can be wider, and
-        // it reports its own width in `nomNameAtoms`.
-        let sc = 1
-        let s = litUnionAliasNameOfTy(members[i])
-        if s == "" {
-          // The union-member position, with the sticky nullable bit — the same rule the
-          // structural sibling applies, so the two agree about `A|B|null`.
-          s = tyToNominalNameAt(members[i], RC_UNION_MEM | (ctx & RC_NULLABLE))
-          sc = nomNameAtoms
-        }
-        if s == "" { return "" }
-        // The grouping parens put every separator inside a grouper — one atom again.
-        if rgm is TyFunc {
-          s = "(" + s + ")"
-          sc = 1
-        }
-        let dup = false
-        let j = 0
-        while j < parts.length {
-          if parts[j] == s { dup = true }
-          j = j + 1
-        }
-        if !dup {
-          parts.push(s)
-          psum = psum + sc
-        }
-        i = i + 1
-      }
-      if parts.length == 0 { return "" }
-      let out = parts[0]
-      let k = 1
-      while k < parts.length {
-        out = out + "|" + parts[k]
-        k = k + 1
-      }
-      nomNameAtoms = psum
-      return out
-    }
-    TyNullable => {
-      const nal = litUnionAliasNameOfTy(t.nInner)
-      if nal != "" {
-        // An alias identifier plus the `null` arm — two atoms.
-        nomNameAtoms = 2
-        return nal + "|null"
-      }
-      // …and an un-aliased one keeps its members at every position — `nulLitUnionPreserve`'s
-      // mirror, the structural sibling's leg.
-      const nlui = litUnionInlineNameOfTy(t.nInner)
-      if nlui != "" {
-        nomNameAtoms = luiAtoms + 1
-        return nlui + "|null"
-      }
-      // A nullable declared struct/union keeps its nominal name (`S|null`, `U|null`).
-      const nsn = tyToNominalNameAt(t.nInner, RC_NULLABLE)
-      const nsnAtoms = nomNameAtoms
-      if nsn == "" { return "" }
-      const nfn = T.tys[t.nInner]
-      if nfn is TyFunc {
-        // The grouped closure is one atom; `null` is the second.
-        nomNameAtoms = 2
-        return "(" + nsn + ")|null"
-      }
-      // A union inner keeps its own top-level `|`s (`A|B|null`), so the `null` arm adds to
-      // the inner render's width rather than making the whole name two atoms.
-      nomNameAtoms = nsnAtoms + 1
-      return nsn + "|null"
-    }
-    TyObj => {
-      const names = t.objFieldNames
-      const ftys = t.objFieldTypes
-      let out = "{"
-      let fi = 0
-      while fi < names.length {
-        let fs = ""
-        const ftn = T.tys[ftys[fi]]
-        if ftn is TyNullable {
-          const fal = litUnionAliasNameOfTy(ftn.nInner)
-          if fal != "" { fs = fal + "|null" }
-        }
-        if fs == "" {
-          const fbal = litUnionAliasNameOfTy(ftys[fi])
-          if fbal != "" { fs = fbal }
-        }
-        if fs == "" { fs = tyToNominalNameAt(ftys[fi], RC_FIELD) }
-        if fs == "" { return "" }
-        if fi > 0 { out = out + "," }
-        out = out + names[fi] + ":" + fs
-        fi = fi + 1
-      }
-      // Every field separator sits inside the braces — one atom. Set explicitly, since a
-      // field's own render leaves `nomNameAtoms` holding its last width.
-      nomNameAtoms = 1
-      return out + "}"
-    }
-    TyArray => {
-      let el = litUnionAliasNameOfTy(t.aElem)
-      // The element's own atom width, as its producer reported it — an alias identifier is
-      // one atom, the render leg reports its own.
-      let elw = 1
-      if el == "" {
-        el = tyToNominalNameAt(t.aElem, RC_ELEM)
-        elw = nomNameAtoms
-      }
-      if el == "" { return "" }
-      // A list name is one atom in every form — a union element is parenthesized so its
-      // `|`s stop being top-level. Set explicitly, since the element recursion leaves its
-      // width in `nomNameAtoms`.
-      nomNameAtoms = 1
-      return arrElemRender(el, t.aElem, elw)
-    }
-    TyMap => {
-      const mk = tyToNominalNameAt(t.mKey, RC_MAP_KEY)
-      let mv = litUnionAliasNameOfTy(t.mVal)
-      if mv == "" { mv = tyToNominalNameAt(t.mVal, RC_MAP_VAL) }
-      if mk == "" || mv == "" { return "" }
-      // The key/value separators sit inside the braces — one atom.
-      nomNameAtoms = 1
-      return "{[" + mk + "]:" + mv + "}"
-    }
-    TyFunc => {
-      const ps = t.fnParamTypes
-      let out = "("
-      let i = 0
-      while i < ps.length {
-        const ps1 = tyToNominalNameAt(ps[i], RC_FN_PARAM)
-        if ps1 == "" { return "" }
-        if i > 0 { out = out + "," }
-        out = out + ps1
-        i = i + 1
-      }
-      let rs = ""
-      const rtn = T.tys[t.fnRet]
-      if rtn is TyNullable {
-        const nal = litUnionAliasNameOfTy(rtn.nInner)
-        if nal != "" { rs = nal + "|null" }
-      }
-      if rs == "" {
-        const bal = litUnionAliasNameOfTy(t.fnRet)
-        if bal != "" { rs = bal }
-      }
-      if rs == "" { rs = tyToNominalNameAt(t.fnRet, RC_FN_RES) }
-      if rs == "" { return "" }
-      const rt = T.tys[t.fnRet]
-      if rt is TyFunc { rs = "(" + rs + ")" }
-      // A function type is one atom: params are parenthesized and everything after the
-      // top-level `=>` belongs to the result. Set explicitly, since the param/result
-      // renders leave their own widths behind.
-      nomNameAtoms = 1
-      return out + ")=>" + rs
-    }
-    TyVar => {
-      // An unsolved type parameter has no nominal spelling.
-    }
-    TyNeg => {
-      // A residual negation has no nominal spelling.
-    }
-    TyErr => {
-      // The error/unknown hole has no nominal spelling.
-    }
-  }
-  // The type-parameter, negation and error arms land here: "" is this renderer's "no
-  // nominal name", the same sentinel `tyToEmitNameGo` uses.
-  ""
 }
 
 // Canonicalizes one inline `{…}` shape name (an object or a map): each field/key/value type
@@ -10989,7 +10781,7 @@ export function unionAliasMembers(name: string) {
 
 // The `|`-joined declared member spellings of union alias `name` (`type Shape = Circle |
 // Rect` → "Circle|Rect"), when every member names a declared struct or is `null`; "" for
-// anything else. Needed since `tyToEmitNameGo`'s `TyObj` arm has no nominal rung — it
+// anything else. Needed since `tyToNameGo`'s `TyObj` arm has no nominal rung — it
 // renders a member as an anonymous shape, unrelated to the real declared structs.
 function declaredStructUnionMembers(name: string) {
   let si = 0
@@ -11013,9 +10805,9 @@ function declaredStructUnionMembers(name: string) {
           out = out + m
           i = i + 1
         }
-        // The join's own atom width, for the caller that reads `emitNameAtoms` after a
+        // The join's own atom width, for the caller that reads `tyNameAtoms` after a
         // flatten: one atom per member, since each is a bare name.
-        emitNameAtoms = vs.length
+        tyNameAtoms = vs.length
         return out
       }
     }
@@ -11984,7 +11776,7 @@ function transparentMemberEmitName(smt: i32, ctx: i32): string {
     if sdn != "" {
       // A declared name is one identifier, so one atom — the same bank `tyToEmitNameAt`
       // fills for its own renders, set here since this arm returns without calling it.
-      emitNameAtoms = 1
+      tyNameAtoms = 1
       return sdn
     }
     // The application spelling is likewise one top-level atom, on `genAppNameOfTy`'s own
@@ -11992,7 +11784,7 @@ function transparentMemberEmitName(smt: i32, ctx: i32): string {
     // application name still falls through to the structural render.
     const gan = genAppNameOfTy(smt)
     if gan != "" {
-      emitNameAtoms = 1
+      tyNameAtoms = 1
       return gan
     }
   }
@@ -12004,7 +11796,7 @@ function transparentMemberEmitName(smt: i32, ctx: i32): string {
   if uan != "" {
     if numLitUnionAliasName(uan) == "" {
       // An alias name is one identifier — one atom, as on the object and union arms.
-      emitNameAtoms = 1
+      tyNameAtoms = 1
       return uan
     }
   }
@@ -12019,10 +11811,9 @@ function transparentMemberEmitName(smt: i32, ctx: i32): string {
     if nomLeaf || arrSpineIsUnionAlias(smt) {
       const anr = tyToNominalNameAt(smt, ctx)
       if anr != "" {
-        // The nominal renderer's own width bank, handed over as the object and union arms
-        // hand over theirs. An array is one atom — its `|`s, if any, sit inside the
-        // element's grouping parens — reported from the producer's side, not a string scan.
-        emitNameAtoms = nomNameAtoms
+        // The nominal render's width stands where it left it — one bank serves both faces,
+        // so there is no hand-over. An array is one atom: its `|`s, if any, sit inside the
+        // element's grouping parens.
         return anr
       }
     }
@@ -12363,7 +12154,7 @@ function nulLitUnionPreserve(parts: string[], ctx: i32) {
 }
 
 // True at the render positions where a literal union keeps its members — the positive half
-// of the policy `tyToEmitNameGo`'s array/object/map arms already apply. False at `RC_ROOT`,
+// of the policy `tyToNameGo`'s array/object/map arms already apply. False at `RC_ROOT`,
 // `RC_FN_PARAM` and `RC_FN_RES`: a container's slot really does hold the interned atom, but
 // a function result is the same scalar position a declaration's return occupies.
 function ctxKeepsLitUnion(ctx: i32) {
@@ -12468,7 +12259,7 @@ function litUnionFlatten(parts: string[]) {
 }
 
 // —— the mixed-union literal-run regroup, canon's side ——
-// `tyToEmitNameGo`'s union arm regroups the flattened string-literal members of a mixed
+// `tyToNameGo`'s union arm regroups the flattened string-literal members of a mixed
 // union back into their registered alias (`K0 | f64` renders `K0|f64`); canon must spell the
 // same union the same way, so this classifies member spellings by the same three-way rule the renderer applies to arena members.
 
@@ -12804,7 +12595,7 @@ function canonEmitNameTs(name: string, ctx: i32, root: i32) {
     // drops the arm names, so an inline object literal falls to a global field-set scan (D1172).
     const dsu = declaredStructUnionMembers(name)
     if dsu != "" {
-      canonAtoms = emitNameAtoms
+      canonAtoms = tyNameAtoms
       return dsu
     }
     const smr = transparentMemberEmitName(smt, ctx)
@@ -12814,7 +12605,7 @@ function canonEmitNameTs(name: string, ctx: i32, root: i32) {
     if smr != "" {
       // The render's own atom width, as its producer reported it — the hand-off the
       // second renderer needs for exactly this purpose.
-      canonAtoms = emitNameAtoms
+      canonAtoms = tyNameAtoms
       return smr
     }
   }
@@ -12892,7 +12683,7 @@ function canonEmitNameTs(name: string, ctx: i32, root: i32) {
       }
     }
     const kept: string[] = []
-    // The mixed-union literal-run regroup, on the annotation side: `tyToEmitNameGo`'s union
+    // The mixed-union literal-run regroup, on the annotation side: `tyToNameGo`'s union
     // arm spells a mixed union's string-literal run by its registered alias (`K0 | f64` →
     // `K0|f64`); without this the same union canon'd to `string|f64` here, since a `K0`
     // member expands through `unionAliasMembers` and its pure-litunion arena type softens.
@@ -12934,7 +12725,7 @@ function canonEmitNameTs(name: string, ctx: i32, root: i32) {
         c = exp
         // `unionAliasMembers` renders through `tyToEmitName`, which reports the render's
         // own atom width — the flattened member set is as wide as the alias's union.
-        ca = emitNameAtoms
+        ca = tyNameAtoms
       }
       // A function-type member keeps grouping parens (`((i32) => i32) | null`), so the
       // rejoined name stays distinct from a function returning a nullable. `canonEmitName`
@@ -12991,7 +12782,7 @@ function canonEmitNameTs(name: string, ctx: i32, root: i32) {
       const r = tyToEmitNameAt(folded, ctx)
       // The fold's render carries its own width — `(0|1|2) & !2` folds to the one-atom
       // `i32`, but a fold that stays a union renders as one.
-      const ra = emitNameAtoms
+      const ra = tyNameAtoms
       if r != "" {
         canonAtoms = ra
         return r
@@ -13070,7 +12861,7 @@ function canonEmitNameTs(name: string, ctx: i32, root: i32) {
   if lmt >= 0 {
     const lbn = tyToEmitNameAt(softenLitTy(lmt), ctx)
     // A softened literal is a base scalar — one atom. Set explicitly, since the render
-    // leaves its own width behind in `emitNameAtoms`.
+    // leaves its own width behind in `tyNameAtoms`.
     canonAtoms = 1
     return lbn
   }
@@ -24139,7 +23930,7 @@ function litUnionArrayValueUnionRetName(er: i32) {
   let i = 0
   while i < members.length {
     const mn = tyToEmitName(members[i])
-    const mw = emitNameAtoms
+    const mw = tyNameAtoms
     if mn == "" { return "" }
     if litUnionArrayElemOf(mn) != "" { hasLitArr = true }
     if i > 0 { name = name + "|" }
@@ -24260,7 +24051,7 @@ function nullableRetName(er: i32, stmts: i32[]) {
       if inm != "" {
         // The `{…}` shape's separators all sit inside the braces (the renderer reports
         // its own width); `null` adds one atom (#1115).
-        return irAtoms(inm + "|null", emitNameAtoms + 1)
+        return irAtoms(inm + "|null", tyNameAtoms + 1)
       }
     } else if it is TyFunc {
       // A nullable-closure return (kind 19): the fat-pointer made nullable, rendered
@@ -24284,14 +24075,14 @@ function nullableRetName(er: i32, stmts: i32[]) {
       // The nullable i32-backed list (kind 15) reps as the shared list wrapper made nullable;
       // rendered non-spaced so `nullablePartOf` and `synthRetAnnots`'s pin both recognize it.
       const lnm = tyToEmitName(t.nInner)
-      return irAtoms(lnm + "|null", emitNameAtoms + 1)
+      return irAtoms(lnm + "|null", tyNameAtoms + 1)
     } else if it is TyMap {
       // The nullable map (kind 3 struct made nullable) admits any string-keyed non-`Set` map,
       // not just the mono i32-valued shape (D956) — resolved through `inferredRetMapSlot`.
       let mapOk = false
       if it.mSet == 0 { mapOk = tyIsPrimNamed(it.mKey, "string") }
       const mnm = tyToEmitName(t.nInner)
-      if mapOk && mnm != "" { return irAtoms(mnm + "|null", emitNameAtoms + 1) }
+      if mapOk && mnm != "" { return irAtoms(mnm + "|null", tyNameAtoms + 1) }
     } else if tyIsPrimNamed(t.nInner, "string") {
       return irAtoms("string|null", 2)
     } else if tyIsPrimNamed(t.nInner, "boolean") {
@@ -24316,7 +24107,7 @@ function nulListRetName(er: i32) {
     if it is TyArray {
       const lnm = tyToEmitName(t.nInner)
       // The array's separators sit inside its element render; `null` adds one atom (#1115).
-      if lnm != "" { return irAtoms(lnm + "|null", emitNameAtoms + 1) }
+      if lnm != "" { return irAtoms(lnm + "|null", tyNameAtoms + 1) }
     }
   }
   ""

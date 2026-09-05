@@ -37,7 +37,7 @@ diagnostic column base); the rest stand on the surveys' own measurements.
 | --- | --- | --- | --- | --- |
 | 14 | the cell-seed ladder is written four times; `ExpCtx` is the intended shape and is private to one file | emitter #3 | 311 `pending*` write sites converge on one resolver | byte-identical seed, `regress.py` |
 | 15 | `checkFuncDeclNode` (1,288 lines) and `checkCallNode` (996) split at seams with ≤ 12 and 2 live locals | front end #6, #7 | the two largest functions halve; 31 untested diagnostics get a named home | byte-identical seed |
-| 16 | `tyToEmitNameGo` / `tyToNominalNameGo` are 83% identical and must agree character for character | front end #5 | one drift surface | byte-identical seed |
+| 16 | `tyToEmitNameGo` / `tyToNominalNameGo` are 83% identical and must agree character for character | front end #5 | one drift surface; DONE 2026-09-05 as `tyToNameGo(ix, ctx, nominal)`, one atom bank, and `nameKidCtx` for the one divergence the survey did not name (§2.1) | byte-identical seed |
 | 17 | five ratchet scripts share 41 verbatim lines; `const ROOT` in 59 test files, 35 of 54 spawners pin no `VL_STD` | tooling #6, #7 | one core; a bare `deno test` from a worktree grades the right std | the gate |
 | 18 | `moduleSurface` omits re-exports; 86 of 86 consumer files pay a second import | tooling #3 | three LSP features at once | `lsp_auto_import_test.ts` |
 | 19 | the seed anchors on the CWD, std on the EXE's tree; one `vl --version` names two checkouts | tooling #2 | the trap documented twice and filed by the consumer three times | an owner ruling, then `vl_std_cmd_test.ts` |
