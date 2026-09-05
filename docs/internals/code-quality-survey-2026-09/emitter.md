@@ -35,7 +35,7 @@ anywhere in the tree, `scripts/emitter-state-audit.py` reports 19 frame-flag asy
 | 7 | `fbBeginFunc` / `fbLocalsCount` / `fbEmitLocalsVec` walk one frame layout three times by hand (§7.1) | a base/count disagreement is silent wrong wasm, not a validator error | M | med | byte-identical seed; `cases_wasm_test.ts`; disassemble one frame with `wasm-dis` |
 | 8 | 14 exported emitter functions have zero references tree-wide; `unused-function` exempts exports by design (§8.1) | dead code deleted, and a fourth ratchet keeps it deleted | S | none | byte-identical seed after deletion; a new `--check` script |
 | 9 | `scripts/emitter-state-audit.py` names `startFnDetectScratch`, but D1595 moved the resets to `startFnDetectFrames` — it reports 19 asymmetries where 2 are real (§8.4) | restores a live instrument whose signal is currently 90% noise | XS | none | the script's own output; the 2 survivors are D1006/D1007 |
-| 10 | **REFUTED, 2026-09-05** — `plCacheBlock` serves **96.28%** of 4,500,173 asks; an LRU ring of 128 avoids **1.12%** of the rebuilds and a ring was the whole proposal. The cost is 32 whole-program `dsScopeWalk` sweeps, not eviction (§5.3) | a ring buys ≈0.05pp of a self-compile, under the profile's own 0.22pp run-to-run spread; the reachable 97% needs an M/L change | S→M/L | low→med | `scripts/perf/parent-let-cache-probe.py`, not a profile A/B |
+| 10 | **REFUTED then LANDED, 2026-09-05** — `plCacheBlock` serves **96.28%** of 4,500,173 asks and an LRU ring of 128 avoids **1.12%** of the rebuilds, so the ring the row proposed was not the cost; the 32 whole-program `dsScopeWalk` sweeps were, and their own traversal (12,254,568 node visits) was three times the rebuilds it was measured by. The `Program` root is now an index (§5.3) | subtree node work 16.34M → 1.22M; L2 self-compile CPU 5.05 → 4.18 s on the min (−17.2%) | S→M | low→med | `scripts/perf/parent-let-cache-probe.py`, not a profile A/B; byte-identical seed on master's source |
 
 Everything below carries file, line, what, why, the change, size, risk and how to prove it
 safe. "Byte-identical seed" means `scripts/refresh-compiler.sh` then `cmp` against a seed built
@@ -289,7 +289,7 @@ it is skipped once its flag is true — `fnDetectScratch` 24.47% → 20.16%, L2 
 (`emit_classify.vl`), which re-derive `listOpKindOfBin` for the same `(binIx, fnIx)`; a memo
 there is worth ~2.5% and is the follow-up this row leaves open.**
 
-### 5.3 `dsRebindsName` and the `parentLetOf` cache — the ring is REFUTED
+### 5.3 `dsRebindsName` and the `parentLetOf` cache — the ring is REFUTED, the walk is an index
 
 **Re-measured at `7a733ea6b`, 2026-09-05.** The caller chain below is real; the *diagnosis* on
 top of it is not. The cache serves **96.28%** of its asks, and the ring this row proposed would
@@ -346,20 +346,55 @@ spread, and 0.41 across the three taken one commit earlier. A 128-entry ring's w
 1.12% of a ~4.1%-inclusive subtree, ≈0.05 points. The profile A/B is an order of magnitude
 coarser than the effect it would grade; the counter is the instrument for this question.
 
-*What is actually available*, and neither shape is S. 97% of 167,403 rebuilds is reachable —
-the `plScanStmt` subtree is ~4.1% of a self-compile — by one of:
+**And the walk's own traversal is the larger half, which no reading above could see.** A
+counter on `dsScopeWalk` itself puts **12,254,568** node visits across the 32 roots — 382,955
+per root, the whole reachable arena — against the 4,087,976 the rebuilds visit. `dsDestSlotAt`
+runs at every one of them and **32 of 32 roots return -1** on this source: three quarters of
+the subtree is a search, not a cache miss.
 
-* **Stop re-walking the whole program once per global binding.** `letRefListDestSlotK`
-  (`:27210`) roots the walk at `emitRootIx` whenever the binding is a global, so 29 globals
-  each sweep every function in the program. This is row 1's subtree: #2567 halved the walk
-  *count* and did not change a walk's cost.
-* **An unbounded per-block index**, on the `index, not memo` pattern D1514 landed. Sound only
-  if a block's `LetDecl` set cannot change after its first build; the arena grows during the
-  pass table, so the invalidation has to be derived — an arena-length stamp covers an added
-  node but not an in-place kind rewrite — and a wrong answer here is a silent miscompile, not
-  a validator error.
+**LANDED — the `Program` root is an index, not a walk.** `letRefListDestSlotK` no longer
+sweeps the arena per global binding. One pre-order pass records, per module-global symbol, the
+destination sites its name is read at — an arena node and its enclosing `FuncDecl`, in the
+walk's own order — chained per symbol, and each binding reads its own chain. Four things make
+the answer the walk's own:
 
-*Size* M/L. *Risk* med. *Proof*: byte-identical seed; the counter above, never a profile A/B.
+* Rows exist only for a name some global binds, which is the only thing `dsScopeRootOf` roots
+  at `Program` for.
+* A site under a frame that rebinds the name is dropped at its row — `dsScopeWalk`'s prune,
+  applied once per row instead of once per `FuncDecl` per binding.
+* `dsDestSlotAt` still decides every row, so the index is a candidate filter over a **superset**
+  of that reader's seven forms (a child identifier, a list literal's elements, an object
+  literal's field values) and cannot answer where the walk would not.
+* Registration is in pre-order, so first match is first match.
+
+It is consulted only while `emitArenaFinal` holds — a flag of its own, set after the pass
+table's last row, whose declaration carries the contract: no pass rewrites the arena from
+here on. It rebuilds when `P.nodes.length` moves. Before that boundary, and for the three
+function-scoped roots, the walk is unchanged.
+
+Index and walk are compared directly, not only through the bytes they produce: a scratch
+compiler that computes every module global's slot both ways over every `tests/cases`
+module and the compiler's own reports **0 disagreements in 20,414 (name, want) pairs**,
+and reports 1 with the build-time prune deleted.
+
+| | before | after |
+|---|---|---|
+| `parentLetOf` rebuilds | 168,004 | 26,079 |
+| arena nodes visited rebuilding | 4,087,976 | 801,719 |
+| one-slot cache hit rate | 96.27% | 99.40% |
+| `dsScopeWalk` node visits | 12,254,568 | 850 |
+| index passes / nodes visited | — | 1 / 423,121 |
+| rows scanned answering all 29 globals | — | 36 |
+
+Node work in the subtree: **16.34M → 1.22M (13.4x)**. L2 self-compile CPU **5.05 s → 4.18 s on the min**
+(twenty interleaved pairs over three master bases, master's own source under each seed;
+−16.4% to −17.2% per base) — four times the ~4% this section projected from the
+`plScanStmt` subtree alone, because that subtree was the smaller half.
+
+*Proof*: `compile(candidate, master source)` is `cmp` rc 0 against master's fixpoint seed; the
+candidate is its own fixpoint; 2,982 `tests/cases` modules agree under both seeds (2,439
+byte-identical, 543 refusing with the identical message, 0 differing); `regress.py` moves 0
+cells; the counters above are `scripts/perf/parent-let-cache-probe.py`, never a profile A/B.
 
 *And the control a multi-entry cache needs now exists, because the two fixtures that look
 like it are not it.* `tests/cases/closures/capture-one-name-five-frames.vl` binds `v` in five

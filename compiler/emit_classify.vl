@@ -369,6 +369,7 @@ import {
   dupScanActive,
   dupSlotBias,
   dupSlotMore,
+  emitArenaFinal,
   emitCurFnIx,
   emitCurFnPos,
   emitRootIx,
@@ -27246,7 +27247,14 @@ export function letRefListDestSlotK(letIx: i32, fnIx: i32, want: i32): i32 {
     // The binding's own scope (D661): a name-matched whole-arena scan reads two same-named
     // bindings in different scopes as one with two destinations, and wrongly refuses both.
     const scopeIx = dsScopeRootOf(letIx, nm, fnIx)
-    if scopeIx >= 0 { return dsScopeWalk(scopeIx, scopeIx, nm, fnIx, want) }
+    if scopeIx >= 0 {
+      // A global's scope is the whole program, and the walk re-reads every function body once
+      // per binding; `dsgDestSlot` answers all of them off one pass over the same nodes.
+      if scopeIx == emitRootIx && dsgReady() {
+        return dsgDestSlot(nm, fnIx, want)
+      }
+      return dsScopeWalk(scopeIx, scopeIx, nm, fnIx, want)
+    }
     let i = 0
     while i < P.nodes.length {
       const rs = dsDestSlotAt(i, nm, fnIx, want)
@@ -27258,8 +27266,9 @@ export function letRefListDestSlotK(letIx: i32, fnIx: i32, want: i32): i32 {
 }
 
 // The seven destination forms, asked of one arena node — `letRefListDestSlotK`'s loop body,
-// lifted so the scoped walk and the whole-arena fallback ask the identical question. Kept as
-// two copies so a form gets fixed in one traversal, not silently missed in the other.
+// lifted so the scoped walk, the whole-arena fallback and the global index ask one question.
+// A form added here that reads its name deeper than `dsgNoteChild` looks is invisible at a
+// `Program` root, where `dsgDestSlot` chooses which nodes this is asked of.
 function dsDestSlotAt(i: i32, nm: string, fnIx: i32, want: i32): i32 {
   const nd = P.nodes[i]
   if nd is LetDecl {
@@ -27449,6 +27458,174 @@ function dsScopeWalk(
     const rs = dsScopeWalk(kids[k], scopeIx, nm, frame, want)
     if rs >= 0 { return rs }
     k = k + 1
+  }
+  -1
+}
+
+// The destination sites a module global's name is read at, in `dsScopeWalk`'s own pre-order.
+// Rows are (arena node, enclosing `FuncDecl`), chained per symbol through `dsgHead`/`dsgTail`;
+// a row whose frame is -1 sits outside every function and takes the asking call's own. Only a
+// global's name gets rows, since `dsScopeRootOf` roots a walk at `Program` for nothing else.
+let dsgNode: i32[] = []
+let dsgFrame: i32[] = []
+let dsgNext: i32[] = []
+let dsgHead: i32[] = []
+let dsgTail: i32[] = []
+
+// The arena the rows describe: the `Program` node the index walk started at, and the node
+// count it saw. Every field a row holds is an arena index, so a different program or a grown
+// arena rebuilds. `dsgRoot` -1 is no index.
+let dsgRoot: i32 = -1
+let dsgLen: i32 = -1
+
+// The `FuncDecl` chain the index walk is inside, outermost first.
+let dsgStack: i32[] = []
+
+// Drops the global-destination index. Sid-keyed and arena-keyed both, so it rides
+// `sidKeyedTablesReset` with its siblings: a surviving row would name the previous program's
+// node under this program's symbol.
+export function sidResetGlobalDestIx() {
+  dsgNode = []
+  dsgFrame = []
+  dsgNext = []
+  dsgHead = []
+  dsgTail = []
+  dsgStack = []
+  dsgRoot = -1
+  dsgLen = -1
+  0
+}
+
+// True where a frame the index walk is inside binds `nm`: `dsScopeWalk` stops at such a frame,
+// so a site under one denotes that frame's binding and never the global's.
+function dsgStackRebinds(nm: string): boolean {
+  let i = 0
+  while i < dsgStack.length {
+    if dsRebindsName(dsgStack[i], nm) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Adds a row for symbol `sid` read at node `ix` inside `frame`. Declines a name no global
+// binds and a site the walk could not reach; the tail test drops the repeat a node that reads
+// one name twice would otherwise add.
+function dsgAdd(sid: i32, ix: i32, frame: i32) {
+  if sid < 0 { return 0 }
+  if globalLetOfSid(sid) < 0 { return 0 }
+  const t = sidArrGet(dsgTail, sid)
+  if t >= 0 {
+    if dsgNode[t] == ix { return 0 }
+  }
+  if dsgStackRebinds(sidText(sid)) { return 0 }
+  const row = dsgNode.length
+  dsgNode.push(ix)
+  dsgFrame.push(frame)
+  dsgNext.push(-1)
+  if t >= 0 { dsgNext[t] = row } else { sidArrPut(dsgHead, sid, row) }
+  sidArrPut(dsgTail, sid, row)
+  0
+}
+
+// Adds a row for `ix` where `c` unwraps to an identifier. `dsDestSlotAt` reads every
+// destination through one `unwrapParen`, so a site behind parentheses is the same site.
+function dsgNoteIdent(c: i32, ix: i32, frame: i32) {
+  if c < 0 || c >= P.nodes.length { return 0 }
+  const u = unwrapParen(c)
+  if u < 0 || u >= P.nodes.length { return 0 }
+  const n = P.nodes[u]
+  if n is Ident { return dsgAdd(sidOfNode(u), ix, frame) }
+  0
+}
+
+// Records `ix` against every name read at child `c` where `dsDestSlotAt` can see one: a list
+// literal's elements, an object literal's field values, or — every other child shape — the
+// child itself. A superset of that reader's seven forms, and it re-runs at the lookup, so a
+// form added there needs an arm here only where it reads its name deeper.
+function dsgNoteChild(c: i32, ix: i32, frame: i32) {
+  if c < 0 || c >= P.nodes.length { return 0 }
+  const u = unwrapParen(c)
+  if u < 0 || u >= P.nodes.length { return 0 }
+  const n = P.nodes[u]
+  if n is ArrayLit {
+    let i = 0
+    while i < n.arrElems.length {
+      dsgNoteIdent(n.arrElems[i], ix, frame)
+      i = i + 1
+    }
+    return 0
+  }
+  if n is ObjLit {
+    let i = 0
+    while i < n.objFields.length {
+      const f = P.nodes[n.objFields[i]]
+      if f is FieldInit { dsgNoteIdent(f.fiValue, ix, frame) }
+      i = i + 1
+    }
+    return 0
+  }
+  dsgNoteIdent(c, ix, frame)
+}
+
+// One pre-order pass over the program filling the index. It descends where `dsScopeWalk`
+// prunes and drops the site at its row instead, so the one pass answers for every name.
+function dsgWalk(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  let pushed = false
+  if ix != dsgRoot {
+    if n is FuncDecl {
+      dsgStack.push(ix)
+      pushed = true
+    }
+  }
+  let frame = -1
+  if dsgStack.length > 0 { frame = dsgStack[dsgStack.length - 1] }
+  const kids = nodeChildren(ix)
+  let k = 0
+  while k < kids.length {
+    dsgNoteChild(kids[k], ix, frame)
+    k = k + 1
+  }
+  k = 0
+  while k < kids.length {
+    dsgWalk(kids[k])
+    k = k + 1
+  }
+  if pushed { dsgStack.pop() }
+  0
+}
+
+// Builds the index where the arena has moved since the last one. Declines while
+// `emitArenaFinal` is clear, since a synth pass can re-point a body in place and no node
+// count would show it; the caller keeps the walk there.
+function dsgReady(): boolean {
+  if !emitArenaFinal { return false }
+  if emitRootIx < 0 { return false }
+  if dsgRoot == emitRootIx && dsgLen == P.nodes.length { return true }
+  sidResetGlobalDestIx()
+  dsgRoot = emitRootIx
+  dsgWalk(emitRootIx)
+  dsgLen = P.nodes.length
+  true
+}
+
+// The slot `dsScopeWalk` would reach first for the global `nm`, read off the index. The same
+// reader in the same order over a superset of the nodes that can answer it, so the two agree
+// by construction; a row's -1 frame takes the asking call's own.
+function dsgDestSlot(nm: string, fnIx: i32, want: i32): i32 {
+  let r = sidArrGet(dsgHead, sidOf(nm))
+  while r >= 0 {
+    let frame = dsgFrame[r]
+    if frame < 0 { frame = fnIx }
+    // The stamp pins the arena a row names, so this bound holds; read it anyway, because a
+    // stamp that stopped holding would be a compiler trap rather than a wrong slot.
+    const nd = dsgNode[r]
+    if nd >= 0 && nd < P.nodes.length {
+      const rs = dsDestSlotAt(nd, nm, frame, want)
+      if rs >= 0 { return rs }
+    }
+    r = dsgNext[r]
   }
   -1
 }
