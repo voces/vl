@@ -22748,6 +22748,10 @@ export function letIsVariant(letIx: i32, fnIx: i32) {
         if variantIndexOf(lt.tyName) >= 0 { return true }
       }
     }
+    // A value-union annotation pins the cell to the box, whatever the init produces (D1606):
+    // `emitLetDeclStmt` coerces the init against the ANNOTATION, so classifying from the init
+    // instead stores a box in a variant cell wherever `emitUnionCoerce` finds the arm a row.
+    if letAnnIsUnion(letIx) { return false }
     // The init's rep is `exprVariantIndex`'s answer, and nothing second-guesses it. A guard
     // that re-asks the struct table to catch a plain-struct twin of an arm misreads a variant
     // index as a struct row whenever the struct table is non-empty, since the two tables
@@ -22769,8 +22773,10 @@ export function variantIndexOfLet(letIx: i32, fnIx: i32) {
         if vi >= 0 { return vi }
       }
     }
-    // Mirrors `letIsVariant` — including the retired `letInitReboxesToVariant` guard, whose
-    // reasoning is recorded there.
+    // Mirrors `letIsVariant` — including the retired `letInitReboxesToVariant` guard and the
+    // union-annotation gate, whose reasoning is recorded there. The pair answers arm for arm,
+    // so a binding that predicate declines has no variant index for a caller to bank either.
+    if letAnnIsUnion(letIx) { return -1 }
     return exprVariantIndex(d.letInit, fnIx)
   }
   -1
@@ -29797,9 +29803,9 @@ export function letIsClosure(letIx: i32, fnIx: i32) {
 }
 
 // Does `name` denote a live binding holding a closure in frame `fnIx` — a narrowed arm, a
-// closure-typed param, a nullable one, or a `let`/`const` whose cell is a closure? The rungs
-// of `exprIsClosure`'s `Ident` arm that read a binding, asked without the module-function
-// rung above them, so a call site can let the binding win (D1602).
+// closure-typed param, a nullable one, a CAPTURE, or a `let`/`const` whose cell is a
+// closure? The rungs of `exprIsClosure`'s `Ident` arm that read a binding, asked without
+// the module-function rung above them, so a call site can let the binding win (D1602).
 export function identIsBoundClosure(name: string, fnIx: i32): boolean {
   if narrowedClosureOf(name) != "" { return true }
   if paramIsClosure(fnIx, name) { return true }
@@ -29808,6 +29814,12 @@ export function identIsBoundClosure(name: string, fnIx: i32): boolean {
   if slot >= 0 {
     return localIsRef[slot] == "closure" || localIsRef[slot] == "nulclosure"
   }
+  // The capture rung: a function value that reached this frame in the env struct is a
+  // closure binding like any other, and `captureValKind` — which typed that env field — is
+  // what says so, the channel `exprNulClosure` already asks for the nullable half. Below
+  // the local rungs, so a same-named local of the frame still shadows it (D1608).
+  const capK = capturedKindOf(fnIx, name)
+  if capK != null { return capK == "closure" || capK == "nulclosure" }
   // The arena rung, for a pass that runs before `buildLocals` fills the registry — a binding
   // declared directly in the frame body covers every call in it, a nested-block one does not.
   if fnIx < 0 || fnIndexOf(name) < 0 { return false }

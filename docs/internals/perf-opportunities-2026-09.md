@@ -21,7 +21,7 @@ QUICK = a day, no design question. STRUCT = a design track.
 | 6 | String `+` in a loop is **O(n²)** (§D): a loop-local builder, with n-ary chain fusion as the down payment. The fusion once shipped in the TS core and was never ported | ×4.80 per doubling; 5.4× at 320 KB; ≥129 in-loop sites | M / L | rep layer | corpus byte-identity where the pattern is absent; a scaling pair "append N" vs "join N", ratio bar 2.5 — **a value fixture cannot pin a cost class** | STRUCT |
 | 7 | ✅ **LANDED (§F8)** — `unRowOfName`/`isUName` → `unRowBySid`, extended at all three pushes; `unionMemberSetOf` and `unionRowOf`'s first leg route through it | self **0.70% → 0.01%**, incl **1.33% → 0.26%** | M | index must extend at all 3 pushes | byte-identical seed; `regress.py`; the unions axis | STRUCT |
 | 8 | ✅ **LANDED in part (§B6)** — the shape is module-level BINDINGS, not call sites, and the definite-assignment set was 91% of it. Sid-keyed, the 8,000-rung falls 2.54 s → 1.07 s and `checkProgram` goes 57.5% → 1.8% inclusive; the residual is not the checker | **−58% at 8k, −66% at 16k** | M | — | a 4-rung absolute ladder with an exponent bar (`scripts/perf/check-scaling.sh`) | STRUCT |
-| 9 | LSP re-checks the WHOLE module graph per keystroke — 30 modules. **Measured (§C2a): 72% is `checkProgram` over the MERGED program**, so the per-module cache §C2 named has a 28% ceiling; its staging half is **LANDED (§C2c)**, −14.5%, and the edit→hover pair is **LANDED (§C2d)**, 2 graph checks → 1. What is left is the merged half (§C2b), a track | editor latency, not CI | M / L | — | a keystroke ladder at 1 / 4 / 30 modules; the cross-file invalidation in both directions; graph checks per request | STRUCT |
+| 9 | LSP re-checks the WHOLE module graph per keystroke — 30 modules. **Measured (§C2a): 72% is `checkProgram` over the MERGED program**, so the per-module cache §C2 named has a 28% ceiling; its staging half is **LANDED (§C2c)**, −14.5%, and the whole keystroke burst is **LANDED (§C2d)**, 3 graph checks → 1. What is left is the merged half (§C2b), a track | editor latency, not CI | M / L | — | a keystroke ladder at 1 / 4 / 30 modules; the cross-file invalidation in both directions; graph checks per request | STRUCT |
 | 10 | `declaredSlotOf` → per-function side index built in `buildLocals` | **1.1%** self time | M | reset per function, 5 sites | byte-identical seed; `regress.py` | STRUCT |
 | 11 | `fnStmtsPosOf` → reverse index `nodeIx → fe` after mono: 19,106 calls, **25.9 M scan steps** | closures axis 2.22 → ~1 | M | 1 in-place write, `emit_mono.vl:6353` | byte-identical seed; the closures axis under its 3.2 bar | STRUCT |
 | 12 | Destringify type names — `tyTopIndexOf` is a per-CHARACTER walk over a type-name string, **4.94% self** | 4.9% plus most of `__str_eq__`'s tail | L | canon / rep | `docs/internals/registry-by-type-id.md` steps 4–6; byte-identity | STRUCT |
@@ -650,14 +650,15 @@ every round. Quote the counts wherever the box is not quiet.
 
 ### C2d · The edit and the hover after it, on one check
 
-A keystroke makes four requests and they were paying three whole-graph checks:
+A keystroke makes four requests and they were paying three whole-graph checks. They now pay
+one, at every graph size:
 
 | case | arm | change | +hover | +tokens | +inlay | burst |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| any of 1 / 4 / 30 modules | before | 1 | **1** | 0 | 1 | **3** |
-| any of 1 / 4 / 30 modules | after | 1 | **0** | 0 | 1 | **2** |
+| any of 1 / 4 / 30 modules | before | 1 | **1** | 0 | **1** | **3** |
+| any of 1 / 4 / 30 modules | after | 1 | **0** | 0 | **0** | **1** |
 
-Two things were in the way, and neither is the memo.
+THREE things were in the way, and none of them is the memo.
 
 **The entries disagreed about diagnostics.** `checkSrc` ran the deep-`is` second pass on the
 single-source path and `checkSrcSym` did not, so the diagnostics pass could not ride the
@@ -694,6 +695,27 @@ pipeline shipped.** It splices walkers onto the token stream and re-checks with 
 table on, so an 8-line file reported **29 semantic tokens and 10 inlay hints past its own end**
 and offered `__vlJsonIs_0` and friends as completions. An occurrence at a generated token is
 now never recorded — the rule the style tier already applied through `jwTokIsGenerated`.
+
+**The third was the LEXICAL slice, which is not one of the destructive passes.** The semantic
+tokens handler ends with `lexicalTokensAt`, and that shared the "a pass that pushes the entry
+source again owes a check" downgrade with `lint`, `formatSrc` and `declExtentsAt` — which
+really do re-lex into `P.toks` and re-parse the shared arena. `lexScan` does not: it writes
+only its own four span tables and calls `tokenize`, whose state is the lexer's own scanner
+globals. So over the text already staged it keeps the check, and the inlay request behind it
+is free. The DIFFERENT-source arm still drops the staging, because the instance then holds a
+program the memo does not describe.
+
+`scripts/perf/lsp-keystroke.ts`'s BURST section, both arms in one process, rounds interleaved,
+medians of 3 at load 17 → 13 and again at load 10:
+
+| case | before | after | speedup | burst checks |
+| --- | ---: | ---: | ---: | --- |
+| 1 module | 0.4 / 0.3 ms | 0.3 / 0.3 ms | — | 2 → **1** |
+| 4 modules (std) | 21.2 / 19.5 ms | 9.1 / 10.7 ms | 2.33x / 1.82x | 2 → **1** |
+| `compiler/entry.vl` (30) | **2,782 / 2,791 ms** | **1,698 / 1,611 ms** | **1.64x / 1.73x** | 2 → **1** |
+
+Raw reps at 30 modules, second reading: before `2807 / 2791 / 2790`, after `1611 / 1610 / 1616`.
+This one is host-only — the seed is the same file in both arms.
 
 ---
 

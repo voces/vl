@@ -210,6 +210,73 @@ Deno.test({
   want("which cost exactly one re-check", c2.graphCheckCount() - mid, 1);
 });
 
+// `onSemanticTokens`'s three calls, in `server.ts`'s order. The last of them is
+// the LEXICAL slice, and it re-pushes the entry source — `lexScan` writes only
+// its own four span tables and calls `tokenize`, whose state is the lexer's own
+// scanner globals, so over the text already staged the check survives it.
+const tokensRequest = async (
+  checker: ReturnType<typeof loadWasmChecker>,
+  source: string,
+  read: (key: string) => string | undefined,
+) => {
+  const c = checker!;
+  await c.tokensAt(source, ENTRY_KEY, read);
+  await c.memberTokensAt(source, ENTRY_KEY, read);
+  return c.lexicalTokensAt(source);
+};
+
+Deno.test({
+  name: "wasm-memo: the whole keystroke burst is ONE graph check",
+  ignore,
+}, async () => {
+  const c = loadWasmChecker(SEED, log)!;
+  const read = readerFor(() => utilI32);
+  const edited = `${entry}// typed\n`;
+
+  // Everything VS Code sends after one keystroke: the change handler, then the
+  // hover, the semantic tokens and the inlay hints it re-requests. Each of the
+  // four is a separate request over the same unchanged text.
+  await changeRequest(c, entry, read);
+  const before = c.graphCheckCount();
+  await changeRequest(c, edited, read);
+  const afterChange = c.graphCheckCount();
+  want("the change is the one check", afterChange - before, 1);
+  want("`r` on hover", await hoverRequest(c, edited, read, 1, 6), "i32");
+  const lex = await tokensRequest(c, edited, read);
+  if (lex.length === 0) throw new Error("want lexical tokens for the edited text, got none");
+  const hints = await c.inlayHintsAt(edited, ENTRY_KEY, read);
+  want("the inlay hint for `r`", hints.map((h) => h.type).join(","), "i32");
+  want("the burst is one graph check", c.graphCheckCount() - before, 1);
+});
+
+Deno.test({
+  name: "wasm-memo: a lexical scan keeps the check only over the text already staged",
+  ignore,
+}, async () => {
+  const c = loadWasmChecker(SEED, log)!;
+  const read = readerFor(() => utilI32);
+  want("`r`", await hoverRequest(c, entry, read, 1, 6), "i32");
+  want("one check", c.graphCheckCount(), 1);
+
+  // SAME text: free, and still right.
+  c.lexicalTokensAt(entry);
+  want("`r` after a lexical scan of the same text", await hoverRequest(c, entry, read, 1, 6), "i32");
+  want("which cost nothing", c.graphCheckCount(), 1);
+
+  // ANOTHER text: the instance now holds a program the memo does not describe,
+  // so the staging must be gone — the answer has to be re-earned, not reused.
+  c.lexicalTokensAt("const q = 2\nprint(q)\n");
+  want("`r` after a lexical scan of another text", await hoverRequest(c, entry, read, 1, 6), "i32");
+  want("which cost a re-check", c.graphCheckCount(), 2);
+
+  // And the DESTRUCTIVE parse-only passes still downgrade the same text: `lint`
+  // re-lexes into `P.toks` and re-parses the arena, so the tables are gone even
+  // though the module table is not.
+  c.lint(entry);
+  want("`r` after a lint of the same text", await hoverRequest(c, entry, read, 1, 6), "i32");
+  want("which cost its own check", c.graphCheckCount(), 3);
+});
+
 // The raw seed instance, driven the way `wasmChecker`'s `check` used to: stage
 // the source and run `checkSrc`, the entry with the symbol table OFF. This is
 // the BEFORE arm of the diagnostics control below — same seed, other entry — so

@@ -4061,55 +4061,68 @@ export function emitUnionBoxArg(
   const bxMap = emitUnionMapArmBox(body, unionName, exprIx, fnIx)
   if bxMap < 0 { return -1 }
   if bxMap == 1 { return 0 }
-  if !exprUnion(exprIx, fnIx) {
-    const svi = exprVariantIndex(exprIx, fnIx)
-    if svi >= 0 {
-      // A struct-typed value built as the plain struct (an anonymous union arm returned from a
-      // `: {…}` function, or bound to a struct local) is a layout twin of but a distinct heap
-      // type from the arm's variant struct: boxing the raw ref validates, and the narrow's
-      // `ref.cast` traps at run time. Rebuild it with `emitStructExprAsVariantBox` instead.
-      const bssi = structIndexOfExpr(exprIx, fnIx)
-      // The bounds half of the twin test. `structIndexOfExpr` answers a struct table row, and
-      // `sHeapIdx` is only as long as the rows that reached heap-type assignment, so a row that
-      // never interned a shape indexes past it. Every sibling reader carries this bound, and an
-      // out-of-bounds read in the compiler is a wasm trap with no diagnostic.
+  const bxArm = emitUnionArmValueBox(body, exprIx, fnIx)
+  if bxArm < 0 { return -1 }
+  if bxArm == 1 { return 0 }
+  emitUnionCoerce(body, unionName, exprIx, fnIx)
+}
 
-      // Neither same shapes nor the `is` test is required to reach it: `function f(x: A | i32)`
-      // called as `f(mkA())` is enough. What is required is a call result in a union argument
-      // position. A row with no heap index cannot be a layout twin of anything, so the compare
-      // declines instead of indexing and the program continues to the loud reject.
-      if (
-        bssi >= 0 &&
-        bssi < sHeapIdx.length &&
-        sHeapIdx[bssi] != uVarHeap[svi]
-      ) {
-        return emitStructExprAsVariantBox(body, exprIx, svi, bssi, fnIx)
+// Box a value that is already one arm of a value union — a concrete variant ref, or the
+// `nulvariant` niche narrowed non-null — into the `{tag, anyref}` box. Returns 1 handled, 0
+// not an arm value, -1 on error. Every box-typed destination delivers through it, since
+// `emitUnionCoerce` alone passes an arm value raw, which fits only a variant cell (D1606).
+function emitUnionArmValueBox(body: i32[], exprIx: i32, fnIx: i32): i32 {
+  if exprUnion(exprIx, fnIx) { return 0 }
+  const svi = exprVariantIndex(exprIx, fnIx)
+  if svi >= 0 {
+    // A struct-typed value built as the plain struct (an anonymous union arm returned from a
+    // `: {…}` function, or bound to a struct local) is a layout twin of but a distinct heap
+    // type from the arm's variant struct: boxing the raw ref validates, and the narrow's
+    // `ref.cast` traps at run time. Rebuild it with `emitStructExprAsVariantBox` instead.
+    const bssi = structIndexOfExpr(exprIx, fnIx)
+    // The bounds half of the twin test. `structIndexOfExpr` answers a struct table row, and
+    // `sHeapIdx` is only as long as the rows that reached heap-type assignment, so a row that
+    // never interned a shape indexes past it. Every sibling reader carries this bound, and an
+    // out-of-bounds read in the compiler is a wasm trap with no diagnostic.
+
+    // Neither same shapes nor the `is` test is required to reach it: `function f(x: A | i32)`
+    // called as `f(mkA())` is enough. What is required is a call result in a union argument
+    // position. A row with no heap index cannot be a layout twin of anything, so the compare
+    // declines instead of indexing and the program continues to the loud reject.
+    if (
+      bssi >= 0 &&
+      bssi < sHeapIdx.length &&
+      sHeapIdx[bssi] != uVarHeap[svi]
+    ) {
+      if emitStructExprAsVariantBox(body, exprIx, svi, bssi, fnIx) < 0 {
+        return -1
       }
-      fbI32Const(uTags[svi]) // 0x41 i32.const <variant tag> (program-global)
-      if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
-      fbStructNew(uBoxIdx) // { tag, variant-ref }
-      return 0
+      return 1
     }
-    // The niche twin of the rung above (D24). A narrowed `Circle | null` is the `nulvariant`
-    // niche — one non-null member, so a bare `(ref null $Circle)` and not a `{tag, value}` box —
-    // and `exprVariantIndex` answers -1 for it by construction, its arms being the kind-8 param,
-    // the declared local and the global, none of which is the nullable cell.
+    fbI32Const(uTags[svi]) // 0x41 i32.const <variant tag> (program-global)
+    if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
+    fbStructNew(uBoxIdx) // { tag, variant-ref }
+    return 1
+  }
+  // The niche twin of the rung above (D24). A narrowed `Circle | null` is the `nulvariant`
+  // niche — one non-null member, so a bare `(ref null $Circle)` and not a `{tag, value}` box —
+  // and `exprVariantIndex` answers -1 for it by construction, its arms being the kind-8 param,
+  // the declared local and the global, none of which is the nullable cell.
 
-    // The narrow is what makes it sound: this position is only reachable with the value proved
-    // non-null, and the box's payload field is `anyref`, so the niche rides it exactly as the
-    // non-null variant ref does. Gated on the boolean twin and not the index alone —
-    // `exprNullableVariant` and `nulVariantIdxOfExpr` are a kind/slot pair.
-    if exprNullableVariant(exprIx, fnIx) {
-      const nvi = nulVariantIdxOfExpr(exprIx, fnIx)
-      if nvi >= 0 && nvi < uTags.length {
-        fbI32Const(uTags[nvi]) // 0x41 i32.const <variant tag>
-        if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
-        fbStructNew(uBoxIdx) // { tag, niche-ref }
-        return 0
-      }
+  // The narrow is what makes it sound: this position is only reachable with the value proved
+  // non-null, and the box's payload field is `anyref`, so the niche rides it exactly as the
+  // non-null variant ref does. Gated on the boolean twin and not the index alone —
+  // `exprNullableVariant` and `nulVariantIdxOfExpr` are a kind/slot pair.
+  if exprNullableVariant(exprIx, fnIx) {
+    const nvi = nulVariantIdxOfExpr(exprIx, fnIx)
+    if nvi >= 0 && nvi < uTags.length {
+      fbI32Const(uTags[nvi]) // 0x41 i32.const <variant tag>
+      if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
+      fbStructNew(uBoxIdx) // { tag, niche-ref }
+      return 1
     }
   }
-  emitUnionCoerce(body, unionName, exprIx, fnIx)
+  0
 }
 
 // Lower an if-expression whose value is a union as a value-typed `if` with the union box result
@@ -17754,7 +17767,17 @@ function emitLetDeclStmt(body: i32[], s: LetDecl, stmtIx: i32, fnIx: i32) {
       )
     }
   } else if letUNm != "" {
-    if emitUnionCoerce(body, letUNm, s.letInit, fnIx) < 0 { return -1 }
+    // The binding boundary is a box-typed destination, so an init that is one ARM of the union
+    // boxes here exactly as an argument does (D1606) — `emitUnionCoerce` alone passes an arm
+    // value raw, which fits only a variant cell, and a union annotation never types one.
+    let letArmBoxed = 0
+    if localIsRef[slot] == "union" {
+      letArmBoxed = emitUnionArmValueBox(body, s.letInit, fnIx)
+      if letArmBoxed < 0 { return -1 }
+    }
+    if letArmBoxed == 0 {
+      if emitUnionCoerce(body, letUNm, s.letInit, fnIx) < 0 { return -1 }
+    }
   } else if letIsF32(stmtIx) || letInfersF32(stmtIx, fnIx) {
     // `letIsF32` is annotation-only; `collectLocals` types the slot with `letIsF32 ||
     // letInfersF32`, so an un-annotated `const g = fv * 1.0` needs the same pair here —
