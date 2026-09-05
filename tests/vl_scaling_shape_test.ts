@@ -280,17 +280,16 @@ axis(
 axis("types", 2.5, "A per-declaration cost is scaling with the type table.", (d) =>
   twoFiles(d, genTypes(2500, 1), genTypes(2500, 20)));
 
-// Median 1.25 (min 1.23, max 1.38) over twelve runs at load 65 to 77, against 1.40 for the
-// same pair interleaved beside it, and 1.52 to 2.26 over five at load 100 to 180; raw
-// many/one 1.86 at the shipped size and 2.51 at twice it, so the axis is still super-linear.
-// The 0.25 floor keeps that quotient from being an absolute budget on the many arm. The bar
-// stays at 3.5 on the term that just left: it was 8.2 to 10.2% inclusive at THIS size
-// against 27% at 3,200 unions, so the shipped many arm sheds 11% and the load-350 outlier a
-// bar of 3.0 would red is still ~3.4.
+// Median 1.14 (min 1.00, max 2.38) over twelve runs at load 33 to 40, against 1.46 (min
+// 1.33, max 1.86) for the same pair interleaved beside it; the many arm falls 0.370 s to
+// 0.285 s while the cheap arm holds at 0.19 s, which is the control saying only one side
+// moved. The 0.25 floor keeps the quotient from being an absolute budget on the many arm.
+// The bar stays at 3.5 because a spike, not a mechanism, sets the top of the sample: the
+// 2.38 above is one reading among eleven under 1.51, and 3.82 was drawn at load 350.
 axis(
   "unions",
   3.5,
-  "`collectVariantFields` (compiler/emit_collect.vl) scans the top-level statements once per struct variant arm.",
+  "`assignTags` (compiler/emit_collect.vl) ranks every variant signature against every other one.",
   (d) => twoFiles(d, genUnions(800, 1), genUnions(800, 20)),
   0.25,
 );

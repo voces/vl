@@ -532,6 +532,7 @@ import {
   unMemTys,
   unMemberSet,
   unNames,
+  unRowByMemberSid,
   unRowBySid,
   unTyIx,
   unVarCount,
@@ -20750,7 +20751,7 @@ function registerValueUnionNameTy(name: string, tyIx: i32) {
   unTyIx.push(tyIx)
   unKey.push(canonUnionKeyOfName(name))
   unDeclIx.push(-1) // value-union row: registered from a name, no declaration
-  unMemberSet.push(name)
+  unMemberSetPush(name)
   recordUnMemTys(name) // D-UNION foundation
   unVarStart.push(uVariants.length)
   unVarCount.push(0)
@@ -22237,6 +22238,18 @@ export function unNamesPush(name: string) {
   const s = sidOf(name)
   if sidArrGet(unRowBySid, s) < 0 { sidArrPut(unRowBySid, s, unNames.length) }
   unNames.push(name)
+  0
+}
+
+// The only writer of `unMemberSet`, so its sid index cannot drift from it — `unNamesPush`'s
+// twin for the SET column, first spelling keeping the slot. The two are pushed in lockstep,
+// so the row this records is the row `unNamesPush` recorded for the same registration.
+export function unMemberSetPush(set: string) {
+  const s = sidOf(set)
+  if sidArrGet(unRowByMemberSid, s) < 0 {
+    sidArrPut(unRowByMemberSid, s, unMemberSet.length)
+  }
+  unMemberSet.push(set)
   0
 }
 
@@ -24694,12 +24707,9 @@ export function unionRowOf(name: string): i32 {
   if name == "" { return -1 }
   const u = unRowOfName(name)
   if u >= 0 { return u }
-  let v = 0
-  while v < unMemberSet.length {
-    if unMemberSet[v] == name { return v }
-    v = v + 1
-  }
-  -1
+  // The alias name is asked first and still is: a spelling that is both one row's name and an
+  // earlier row's member set keeps naming the row it named.
+  sidArrGet(unRowByMemberSid, sidLookup(name))
 }
 
 // ── the union registry asked by arena type id — an A/B shadow harness (docs/internals/registry-by-type-id.md)
@@ -26047,13 +26057,114 @@ function objNestedFieldCompat(
 export function objVariantName(objIx: i32) {
   const o = P.nodes[objIx]
   if o is ObjLit {
-    let vi = 0
-    while vi < uVariants.length {
+    // Only a variant whose field-name signature equals the literal's can match — the matcher
+    // below needs equal counts and every variant name present — so the bucket for that
+    // signature holds every candidate, in the ascending order the scan visited them.
+    let vi = ovnFirst(objLitFieldSig(objIx))
+    while vi >= 0 {
       if objMatchesVariantIdx(objIx, vi) { return uVariants[vi] }
-      vi = vi + 1
+      vi = ovnNextOf(vi)
     }
   }
   ""
+}
+
+// The signature of the object literal at `objIx` — its field names in `fieldNameOrder`,
+// comma-joined, the construction `variantSig` applies to a variant's own already-canonical
+// name column. Duplicate names are kept, so two spellings differ exactly where the sets do.
+function objLitFieldSig(objIx: i32) {
+  const o = P.nodes[objIx]
+  const names: string[] = []
+  if o is ObjLit {
+    let i = 0
+    while i < o.objFields.length {
+      const f = P.nodes[o.objFields[i]]
+      // One name per ENTRY, so the signature counts what the matcher counts. A malformed
+      // entry contributes "", which no variant field can spell, so it matches nothing —
+      // the answer the matcher reaches by failing to find that entry's name.
+      let nm = ""
+      if f is FieldInit { nm = f.fiName }
+      names.push(nm)
+      i = i + 1
+    }
+  }
+  const ord = fieldNameOrder(names)
+  let out = ""
+  let j = 0
+  while j < ord.length {
+    if j > 0 { out = out + "," }
+    out = out + names[ord[j]]
+    j = j + 1
+  }
+  out
+}
+
+// The variant buckets by signature: `ovnHeadBySid` holds the first variant row at each
+// signature's interned id, `ovnTailBySid` the last, `ovnNext` the next row sharing it, all in
+// ascending row order. Rebuilt when the variant table or either span column moves.
+let ovnHeadBySid: i32[] = []
+let ovnTailBySid: i32[] = []
+let ovnNext: i32[] = []
+let ovnVarsLen = -1
+let ovnStartLen = -1
+let ovnCountLen = -1
+
+// Drops the buckets. `collectU` rebuilds the variant table from empty and a second module can
+// refill it to the same three lengths with different names, which the stamp cannot see; the
+// signature ids are sid-keyed too, and a sid means nothing in the next program.
+export function objVariantIndexDrop() {
+  ovnHeadBySid = []
+  ovnTailBySid = []
+  ovnNext = []
+  ovnVarsLen = -1
+  ovnStartLen = -1
+  ovnCountLen = -1
+  0
+}
+
+// Fills the buckets from the variant table. Every row is appended to its signature's chain,
+// so a chain lists its rows in the order the scan this replaces visited them.
+function ovnBuild() {
+  ovnHeadBySid = []
+  ovnTailBySid = []
+  ovnNext = []
+  ovnVarsLen = uVariants.length
+  ovnStartLen = uFieldStart.length
+  ovnCountLen = uFieldCount.length
+  let vi = 0
+  while vi < uVariants.length {
+    ovnNext.push(-1)
+    if vi < uFieldStart.length && vi < uFieldCount.length {
+      const s = sidOf(variantSig(vi))
+      // The tail is kept beside the head so an append is a write, not a walk: a program whose
+      // variants all share one signature would otherwise make this build quadratic in them.
+      const tail = sidArrGet(ovnTailBySid, s)
+      if tail < 0 { sidArrPut(ovnHeadBySid, s, vi) } else { ovnNext[tail] = vi }
+      sidArrPut(ovnTailBySid, s, vi)
+    }
+    vi = vi + 1
+  }
+  0
+}
+
+// The first variant row whose signature is `sig`, or -1. Rebuilds first when the stamp
+// disagrees, so a caller can never read a chain the current variant table did not produce.
+function ovnFirst(sig: string) {
+  if (
+    ovnVarsLen != uVariants.length ||
+    ovnStartLen != uFieldStart.length ||
+    ovnCountLen != uFieldCount.length
+  ) {
+    ovnBuild()
+  }
+  sidArrGet(ovnHeadBySid, sidLookup(sig))
+}
+
+// The next variant row sharing `vi`'s signature, or -1. Only reached through `ovnFirst`,
+// which is what makes the chain current.
+function ovnNextOf(vi: i32) {
+  if vi < 0 || vi >= ovnNext.length { return -1 }
+  ovnNext[vi]
 }
 
 // Whether the object literal at `objIx` matches variant `vi`: the field-name set equals
