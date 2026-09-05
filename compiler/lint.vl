@@ -1980,11 +1980,26 @@ function txCommentAt(s: string, k: i32, e: i32) {
   k + 1 < e && s[k] == '/' && s[k + 1] == '/'
 }
 
-// Whether the block just closed is the module header: the first one, with no code yet
-// seen. `seenCode` stays 0 across blank lines and the leading import region, which is
-// why a multi-line `import { … } from "…"` is tracked here.
-function txIsHeader(seenCode: i32, headerTaken: i32) {
-  if seenCode == 0 && headerTaken == 0 { return 1 }
+// How far the module header region has got, encoded: bit 0 is "inside a multi-line
+// `import { … } from`", bit 1 is "code has been seen". Stepped once per non-blank,
+// non-comment line, so the two comment scans cannot decide the header ends in different
+// places — the header is the first block with no code before it, imports excepted.
+function txHeaderStep(s: string, k: i32, le: i32, region: i32) {
+  if region % 2 == 1 {
+    if txFind(s, k, le, "} from ") { return region - 1 }
+    return region
+  }
+  if txAt(s, k, le, "import ") {
+    if !txFind(s, k, le, " from ") { return region + 1 }
+    return region
+  }
+  2
+}
+
+// Whether the block just closed is the module header: the first one, with `txHeaderStep`'s
+// code bit still clear.
+function txIsHeader(region: i32, headerTaken: i32) {
+  if region < 2 && headerTaken == 0 { return 1 }
   0
 }
 
@@ -2286,9 +2301,8 @@ function commentBudget() {
   let cited = 0
   let shouted = 0
   let told = 0
-  let seenCode = 0
+  let region = 0
   let headerTaken = 0
-  let inImport = 0
   let ln = 0
   while ln < klLnStart.length {
     const i = klLnStart[ln]
@@ -2333,7 +2347,7 @@ function commentBudget() {
       }
     } else {
       if n > 0 {
-        const hdr = txIsHeader(seenCode, headerTaken)
+        const hdr = txIsHeader(region, headerTaken)
         if hdr == 1 { headerTaken = 1 }
         cbReport(n, blockLine, blockCol, meas, cited, hdr)
         n = 0
@@ -2343,15 +2357,7 @@ function commentBudget() {
         told = 0
       }
       // A non-blank, non-comment line: still the import region, or the first code.
-      if k < le {
-        if inImport == 1 {
-          if txFind(s, k, le, "} from ") { inImport = 0 }
-        } else if txAt(s, k, le, "import ") {
-          if !txFind(s, k, le, " from ") { inImport = 1 }
-        } else {
-          seenCode = 1
-        }
-      }
+      if k < le { region = txHeaderStep(s, k, le, region) }
     }
     ln = ln + 1
   }
@@ -2362,7 +2368,7 @@ function commentBudget() {
       blockCol,
       meas,
       cited,
-      txIsHeader(seenCode, headerTaken),
+      txIsHeader(region, headerTaken),
     )
   }
   0
@@ -2522,9 +2528,8 @@ function stdCommentAudience() {
   let tellLine = 0
   let pend = 0
   let pendHdr = 0
-  let seenCode = 0
+  let region = 0
   let headerTaken = 0
-  let inImport = 0
   let ln = 0
   while ln < klLnStart.length {
     const i = klLnStart[ln]
@@ -2554,7 +2559,7 @@ function stdCommentAudience() {
       }
     } else {
       if n > 0 && pend == 0 {
-        pendHdr = txIsHeader(seenCode, headerTaken)
+        pendHdr = txIsHeader(region, headerTaken)
         if pendHdr == 1 { headerTaken = 1 }
         pend = 1
       }
@@ -2567,19 +2572,13 @@ function stdCommentAudience() {
           n = 0
           tell = ""
         }
-        if inImport == 1 {
-          if txFind(s, k, le, "} from ") { inImport = 0 }
-        } else if txAt(s, k, le, "import ") {
-          if !txFind(s, k, le, " from ") { inImport = 1 }
-        } else {
-          seenCode = 1
-        }
+        region = txHeaderStep(s, k, le, region)
       }
     }
     ln = ln + 1
   }
   // A file with no trailing newline can end inside a block the loop never closed.
-  if pend == 0 && n > 0 { pendHdr = txIsHeader(seenCode, headerTaken) }
+  if pend == 0 && n > 0 { pendHdr = txIsHeader(region, headerTaken) }
   if pend == 1 || n > 0 {
     scaReport(n, blockLine, blockCol, tell, tellLine, pendHdr, 0)
   }
@@ -3796,6 +3795,50 @@ function siDrop(xs: string[], name: string) {
   0
 }
 
+// ── one walk over a line, six kinds of work ──────────────────────────────────
+// Every pass below reads a line index by index with string and char literals stepped
+// over. The walk is `siWalkLine` and the work is chosen by kind, so a pass that
+// mis-skips a literal cannot exist in one place and not another.
+
+// The six works, named at the call site rather than spelled as an integer there.
+const siWorkHole = 0
+const siWorkNegAnswer = 1
+const siWorkRetCall = 2
+const siWorkReturn = 3
+const siWorkHdrDecl = 4
+const siWorkHdrParam = 5
+
+// The work at one index. A function VALUE would read better and costs the seed 4.3%: one
+// address-taken function makes the emitter list every function of the program in the
+// table (`docs/internals/code-quality-survey-2026-09/tooling-std-host.md` §5.2).
+function siWorkAt(kind: i32, s: string, a: i32, e: i32, i: i32) {
+  if kind == siWorkHole { return siHoleAt(s, a, e, i) }
+  if kind == siWorkNegAnswer { return siNegAnswerAt(s, a, e, i) }
+  if kind == siWorkRetCall { return siRetCallAt(s, a, e, i) }
+  if kind == siWorkReturn { return siReturnAt(s, a, e, i) }
+  if kind == siWorkHdrDecl { return siHdrDeclAt(s, a, e, i) }
+  siHdrParamAt(s, a, e, i)
+}
+
+// The work is offered every index the line's own text holds and answers with the next one
+// to visit — `i + 1` to step one character, further to consume a token. A negative answer
+// stops the walk and its complement is where, which is how a pass that answers on a hit
+// says which index hit. Returns that index, or -1 when the work reached `e`.
+function siWalkLine(s: string, a: i32, e: i32, kind: i32): i32 {
+  let i = a
+  while i < e {
+    const c = s[i]
+    if c == '"' || c == '\'' {
+      i = klSkipLit(s, i, e)
+    } else {
+      const n = siWorkAt(kind, s, a, e, i)
+      if n < 0 { return 0 - n - 1 }
+      i = n
+    }
+  }
+  -1
+}
+
 // A BOUND: `0` (not the head of a longer number), `-1`, or any `x.length` — the three
 // spellings an index is allowed to be tested against. Index just past it, or -1.
 function siBoundAt(s: string, i: i32, b: i32) {
@@ -3891,6 +3934,20 @@ function siMapGlobalOf(s: string, a: i32, e: i32) {
   nm
 }
 
+// The work pass 1 does at one index: a `.` whose left side is a name opens a field, and a
+// hole test after it makes that field one. Records into `siHoleF` and never stops.
+function siHoleAt(s: string, _a: i32, e: i32, i: i32) {
+  if s[i] == '.' && txWordAt(s, i - 1, e) {
+    const f = txIdentAt(s, i + 1, e)
+    if f.length > 0 {
+      if siHoleTestAt(s, txSpacesEnd(s, i + 1 + f.length, e), e) {
+        siAdd(siHoleF, f)
+      }
+    }
+  }
+  i + 1
+}
+
 function siScanHoles(s: string) {
   siHoleF = []
   siMapG = []
@@ -3899,54 +3956,51 @@ function siScanHoles(s: string) {
     const a = klLnStart[n]
     const e = klCodeEnd(s, a, klLnEnd[n])
     siAdd(siMapG, siMapGlobalOf(s, a, e))
-    let i = a
-    while i < e {
-      const c = s[i]
-      if c == '"' || c == '\'' {
-        i = klSkipLit(s, i, e)
-      } else {
-        if c == '.' && txWordAt(s, i - 1, e) {
-          const f = txIdentAt(s, i + 1, e)
-          if f.length > 0 {
-            if siHoleTestAt(s, txSpacesEnd(s, i + 1 + f.length, e), e) {
-              siAdd(siHoleF, f)
-            }
-          }
-        }
-        i = i + 1
-      }
-    }
+    siWalkLine(s, a, e, siWorkHole)
     n = n + 1
   }
   0
 }
 
 // ── pass 2: which functions answer -1 ────────────────────────────────────────
-// `return -1`, a bare `-1` tail, or `return 0 - 1`.
+// A function reads a sentinel when it answers -1: `return -1`, a bare `-1` tail, or
+// `return 0 - 1`.
+
+// The two `return` spellings, at one index. Stops at the `return`.
+function siNegAnswerAt(s: string, _a: i32, e: i32, i: i32) {
+  if txAt(s, i, e, "return ") && !txWordAt(s, i - 1, e) {
+    const p = txSpacesEnd(s, i + 7, e)
+    if txAt(s, p, e, "-1") && !txWordAt(s, p + 2, e) { return 0 - i - 1 }
+    if p < e && s[p] == '0' {
+      const q = txSpacesEnd(s, p + 1, e)
+      if q < e && s[q] == '-' {
+        const r = txSpacesEnd(s, q + 1, e)
+        if txAt(s, r, e, "1") && !txWordAt(s, r + 1, e) { return 0 - i - 1 }
+      }
+    }
+  }
+  i + 1
+}
+
 function siNegAnswerLine(s: string, a: i32, e: i32) {
   const k = txSpacesEnd(s, a, e)
   if txAt(s, k, e, "-1") && txSpacesEnd(s, k + 2, e) >= e { return true }
-  let i = a
-  while i < e {
-    const c = s[i]
-    if c == '"' || c == '\'' {
-      i = klSkipLit(s, i, e)
-    } else {
-      if txAt(s, i, e, "return ") && !txWordAt(s, i - 1, e) {
-        const p = txSpacesEnd(s, i + 7, e)
-        if txAt(s, p, e, "-1") && !txWordAt(s, p + 2, e) { return true }
-        if p < e && s[p] == '0' {
-          const q = txSpacesEnd(s, p + 1, e)
-          if q < e && s[q] == '-' {
-            const r = txSpacesEnd(s, q + 1, e)
-            if txAt(s, r, e, "1") && !txWordAt(s, r + 1, e) { return true }
-          }
-        }
+  siWalkLine(s, a, e, siWorkNegAnswer) >= 0
+}
+
+// A `return f(…)`. Stops at the `return`, and `siRetCallOf` reads the name back from
+// there rather than carrying it out — a walk answers with an index, not with a value.
+function siRetCallAt(s: string, _a: i32, e: i32, i: i32) {
+  if txAt(s, i, e, "return ") && !txWordAt(s, i - 1, e) {
+    const p = txSpacesEnd(s, i + 7, e)
+    const t = txIdentAt(s, p, e)
+    if t.length > 0 {
+      if txCharOr(s, txSpacesEnd(s, p + t.length, e), e) == '(' {
+        return 0 - i - 1
       }
-      i = i + 1
     }
   }
-  false
+  i + 1
 }
 
 // The name a line hands its answer to: a bare two-space tail `f(…)`, or `return f(…)`.
@@ -3957,42 +4011,25 @@ function siRetCallOf(s: string, a: i32, e: i32) {
       if txCharOr(s, txSpacesEnd(s, a + 2 + t.length, e), e) == '(' { return t }
     }
   }
-  let i = a
-  while i < e {
-    const c = s[i]
-    if c == '"' || c == '\'' {
-      i = klSkipLit(s, i, e)
-    } else {
-      if txAt(s, i, e, "return ") && !txWordAt(s, i - 1, e) {
-        const p = txSpacesEnd(s, i + 7, e)
-        const t = txIdentAt(s, p, e)
-        if t.length > 0 {
-          if txCharOr(s, txSpacesEnd(s, p + t.length, e), e) == '(' { return t }
-        }
-      }
-      i = i + 1
-    }
+  const h = siWalkLine(s, a, e, siWorkRetCall)
+  if h < 0 { return "" }
+  txIdentAt(s, txSpacesEnd(s, h + 7, e), e)
+}
+
+// A `return` opening a token. Stops there; the leading test is what makes it a token
+// rather than the tail of a longer name.
+function siReturnAt(s: string, a: i32, e: i32, i: i32) {
+  const prev = txCharOr(s, i - 1, e)
+  const lead = i == a || prev == ' ' || prev == '\t' || prev == '{'
+  if lead && txAt(s, i, e, "return") && !txWordAt(s, i + 6, e) {
+    return 0 - i - 1
   }
-  ""
+  i + 1
 }
 
 // A `return` opening a token on this line — the tell that what follows is a fall-through.
 function siLineReturns(s: string, a: i32, e: i32) {
-  let i = a
-  while i < e {
-    const c = s[i]
-    if c == '"' || c == '\'' {
-      i = klSkipLit(s, i, e)
-    } else {
-      const prev = txCharOr(s, i - 1, e)
-      const lead = i == a || prev == ' ' || prev == '\t' || prev == '{'
-      if lead && txAt(s, i, e, "return") && !txWordAt(s, i + 6, e) {
-        return true
-      }
-      i = i + 1
-    }
-  }
-  false
+  siWalkLine(s, a, e, siWorkReturn) >= 0
 }
 
 // Mark every function answering -1 directly, record the forwarding edges, then close
@@ -4049,34 +4086,43 @@ function siScanReaders(s: string) {
 }
 
 // ── pass 3: one function's declarations ──────────────────────────────────────
-// Every name the function's header line declares — a parameter is `name:`, and with
-// `i32Only` only an `i32` one, the only kind that can be an index. A header continued
-// onto a second line contributes nothing, in both implementations alike.
-function siHeaderNames(s: string, f: i32, i32Only: boolean, out: string[]) {
+// Every name the function's header line declares — a parameter is `name:`, and the
+// `i32` ones alone are what can be an index. A header continued onto a second line
+// contributes nothing, in both implementations alike.
+
+// Where `nm` at `i` declares its type, or -1 when a `:` does not follow it and the name is
+// therefore not a parameter. The half both walks below share.
+function siHdrTy(s: string, e: i32, i: i32, nm: string) {
+  const p = txSpacesEnd(s, i + nm.length, e)
+  if p >= e || s[p] != ':' { return -1 }
+  txSpacesEnd(s, p + 1, e)
+}
+
+// The two destinations, one walk each: every declared name, and only the `i32` ones. Each
+// names its own destination, so neither walk has to close over one.
+function siHdrDeclAt(s: string, _a: i32, e: i32, i: i32) {
+  const nm = txIdentAt(s, i, e)
+  if nm.length == 0 { return i + 1 }
+  if siHdrTy(s, e, i, nm) >= 0 { siAdd(siDeclared, nm) }
+  i + nm.length
+}
+
+function siHdrParamAt(s: string, _a: i32, e: i32, i: i32) {
+  const nm = txIdentAt(s, i, e)
+  if nm.length == 0 { return i + 1 }
+  const q = siHdrTy(s, e, i, nm)
+  if q >= 0 && txAt(s, q, e, "i32") && !txWordAt(s, q + 3, e) {
+    siAdd(siParams, nm)
+  }
+  i + nm.length
+}
+
+function siHeaderNames(s: string, f: i32, kind: i32) {
   const a = klLnStart[klFnLo[f]]
   const e = klCodeEnd(s, a, klLnEnd[klFnLo[f]])
   let i = a
   while i < e && s[i] != '(' { i = i + 1 }
-  while i < e {
-    const c = s[i]
-    if c == '"' || c == '\'' {
-      i = klSkipLit(s, i, e)
-    } else {
-      const nm = txIdentAt(s, i, e)
-      if nm.length > 0 {
-        const p = txSpacesEnd(s, i + nm.length, e)
-        if p < e && s[p] == ':' {
-          const q = txSpacesEnd(s, p + 1, e)
-          if !i32Only || (txAt(s, q, e, "i32") && !txWordAt(s, q + 3, e)) {
-            siAdd(out, nm)
-          }
-        }
-        i = i + nm.length
-      } else {
-        i = i + 1
-      }
-    }
-  }
+  siWalkLine(s, i, e, kind)
   0
 }
 
@@ -4243,8 +4289,8 @@ function siGradeFn(s: string, f: i32) {
   siPText = []
   siGuarded = []
   siReturned = false
-  siHeaderNames(s, f, false, siDeclared)
-  if siFnReader[f] == 1 { siHeaderNames(s, f, true, siParams) }
+  siHeaderNames(s, f, siWorkHdrDecl)
+  if siFnReader[f] == 1 { siHeaderNames(s, f, siWorkHdrParam) }
   let n = klFnLo[f]
   while n <= klFnHi[f] {
     siAdd(
