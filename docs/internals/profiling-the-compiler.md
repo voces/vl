@@ -1,28 +1,39 @@
 # Profiling the compiler
 
-`VL_PROFILE_GUEST=<out.json>` runs a compile under a sampling guest profiler (~1 ms epoch
-interrupts, `compile_vl_guest_profiled` in `scripts/vl-host/src/main.rs`) and writes a
+`VL_PROFILE_GUEST=<out.json>` samples the compiler guest (~1 ms epoch interrupts) and writes a
 Firefox-profiler JSON. Frames read `wasm-function[N]` unless the SEED carries a name section,
 so build the seed with `--names` first — and profile with that seed, never ship it.
 
 ```sh
 vl build compiler/entry.vl -o /tmp/names.wasm --names --compiler build/vl-compiler.wasm
-VL_PROFILE_GUEST=/tmp/p.json vl build compiler/entry.vl -o /tmp/o.wasm --compiler /tmp/names.wasm
+VL_PROFILE_GUEST=/tmp/p.json vl check compiler/typecheck.vl --compiler /tmp/names.wasm
 python3 scripts/profile-rank.py /tmp/p.json 20      # rank by SELF time
 ```
 
+**EVERY ENTRY THE HOST DRIVES TAKES IT** — `check`, `build`, `run`, `fmt`, `test`, and the
+`--batch` / `--json` forms. The sampler is a per-STORE epoch-deadline callback
+(`arm_guest_profile` in `scripts/vl-host/src/main.rs`), so it fires whenever guest code is on
+the stack, however many times the host crossed into it: one profile covers the CLI pump's whole
+command loop the same way it covers `build`'s single `compileSrc`. Profile the command you
+actually mean — `vl build` is a poor proxy for `vl check`, which runs the LINT that `build`
+never reaches (0.12 vs 0.84 CPU-s on one 17,600-line file).
+
 Notes, each of which cost something to learn:
 
-* **The profiled run bypasses the `.cwasm` sidecar** (epoch instrumentation is a different
-  engine config), so it pays ~10 s re-JITing the compiler no matter how small the input.
-  That fixed cost is why the merge-gate guard is
-  `tests/vl_scaling_shape_test.ts`'s ratio and not a profiler run.
+* **`vl run` profiles the COMPILE, not the program it emitted.** The user program runs on a
+  second engine under a real collector, and one `GuestProfiler` may only carry modules from
+  one engine. Same for the modules `vl test` runs.
+* **The first profiled run against a given seed re-JITs it.** Epoch instrumentation is a
+  compilation setting, so it is part of the engine's precompile compatibility hash and lands
+  the profiled seed at its OWN `.cwasm` sidecar — ~10 s once, milliseconds after that. A
+  normal run never reads it. The merge-gate guard is still `tests/vl_scaling_shape_test.ts`'s
+  ratio, because a ratio needs no seed built with `--names`.
 * **Rank by SELF time, not inclusive.** A whole-arena scan called from one place shows up as
   ~all self; a dispatcher shows up as ~all inclusive. `profile-rank.py` prints both.
 * **`__str_eq__` high in the list is a symptom, not a site** — it is the name-keyed
   registries (`isUName`, `variantIndexOf`, `declaredSlotOf`, `__map_probe__`) doing linear
-  lookups. `python3 scripts/profile-rank.py` has a sibling idiom: rank the immediate PARENT
-  frame of every sample whose leaf is a given function, to find whose loop it is.
+  lookups. `python3 scripts/perf/profile-parents.py` ranks the immediate PARENT frame of every
+  sample whose leaf is a given function, to find whose loop it is.
 * **`VL_STD=<worktree>/std`** on every worktree probe — the host resolves `std:` from the
   BINARY's checkout, which is the main repo's.
 
@@ -183,6 +194,18 @@ After, at 800 pins: 3,528 guest samples → **1,839**, `collectA` 63.78% inclusi
 `buildFnMap` at **18.71%** of the compile — the same per-instance whole-program pass one row
 over, whose `retAnnKindChain` / `retVoidAnnFlag` / `refArrElemNameIf` children are 38.3% /
 16.5% / 12.5% of it, and whose per-function return-kind table has no prefix shape to resume on.
+
+## Measured 2026-09-05 — the first `vl check` profile, and what `build` could not see
+
+`vl check compiler/typecheck.vl` (32,451 lines, 0.77 s CPU unprofiled), 619 samples on a
+`--names` seed. Ranked by INCLUSIVE, the run divides into `lintGraph` **59.94%** and
+`checkProgram` **20.68%**, with `kindLadderLint` alone at 32.31% and `klSplitWalks` under it at
+31.18%. `profile-phases.py` had no row for the lint, because the phase list was derived from
+`build` profiles and a `build` never runs one; it has one now, and the unclaimed remainder fell
+from 64.6% to 7.3%.
+
+**The lint is the majority of a `vl check` on a large file, and no `build` profile could say
+so.** That is the shape of the gap this instrument closed, not an incidental reading.
 
 ## Guards
 

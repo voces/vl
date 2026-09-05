@@ -5,8 +5,10 @@
         -o /tmp/out.wasm --compiler <a seed built with --names>
     python3 scripts/profile-rank.py /tmp/p.json
 
-The host samples the guest every ~1 ms (see `compile_vl_guest_profiled` in
-scripts/vl-host/src/main.rs) and writes one thread of stack samples. A frame's
+Any entry the host drives takes it — `check`, `build`, `run`, `fmt`, `test`, and the
+`--batch` / `--json` forms — since the sampler is armed per STORE (`arm_guest_profile`
+in scripts/vl-host/src/main.rs). The host samples the guest every ~1 ms and writes
+one thread of stack samples. A frame's
 SELF time is the samples whose LEAF is that frame; INCL is the samples with the
 frame anywhere on the stack, counted once per sample so recursion cannot
 double-count.  Without a `--names` seed every frame reads `wasm-function[N]`.

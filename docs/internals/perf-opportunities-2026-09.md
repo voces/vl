@@ -300,6 +300,51 @@ it takes its own 0.25 s denominator floor, because its cheap arm now costs less 
 0.4 s one and a clamped denominator turns a ratio into an absolute budget. What it grades now is
 the union registry's own per-entity cost — items #5 and #7 — which nothing had measured.
 
+### B6a · Item 8's residual, attributed — it is the LINT, and CALL SITES are linear
+
+B6 left "the 2.76 s `vl check` still costs is spent outside `checkProgram`" unattributed
+because the guest profiler was `build`-only. It is not any more, and the answer is two
+name-keyed linear scans in `compiler/lint.vl`.
+
+**The `call sites` axis is not the super-linear shape.** `genCallSites(N, 1)` from
+`tests/vl_scaling_shape_test.ts` — N callees, N call sites, six filler statements each —
+under `vl check`, best of two:
+
+| N | lines | bytes | `vl check` | samples | growth |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 6,000 | 48,002 | 1.15 MB | 0.86 s | 527 | — |
+| 12,000 | 96,002 | 2.31 MB | 1.84 s | 1,110 | ×2.14 |
+| 24,000 | 192,002 | 4.65 MB | 3.72 s | 1,993 | ×2.02 |
+
+Exponents 1.10 and 1.02. Nothing in its ranking grows faster than the input by enough to
+matter (`siWorkAt` ×8.1 for ×4, on 57 of 1,993 samples).
+
+**The module-scope BINDING shape still is**, and `check-scaling.sh`'s `calls` rows are that
+shape (`const v$i = g(i, i)`), which is what B6 renamed:
+
+| N bindings | `vl check` | samples | growth |
+| ---: | ---: | ---: | --- |
+| 4,000 | 0.35 s | 235 | — |
+| 8,000 | 1.07 s | 832 | ×3.06 (exp 1.61) |
+| 16,000 | 2.73 s | 2,712 | ×2.55 (exp 1.35) |
+
+At 16,000 bindings, `__str_eq__` is **63.5% self** and its immediate callers are
+`txListIndexOf` (42.7% of the run) and `bindMark` (20.5%). Following each up:
+
+| chain | incl at 16,000 | self samples 4k → 16k |
+| --- | ---: | --- |
+| `sentinelIndexLint` → `siGradeFn` → `txListIndexOf`, and `siAdd` → `txListHas` → same | 58.7% | 21 → 388 (**×18.5** for ×4) |
+| `nameVisit` → `bindMark`, scanning the `visNames` stack | 34.3% | 16 → 373 (**×23.3**) |
+
+Both are a linear scan of a `string[]` keyed by NAME, asked once per occurrence, over a list
+whose length is the module-level binding count — O(N²) by construction, and together 93% of the
+run. `bindMark` walks `visNames` from the innermost end, so the cost is the module scope's own
+depth; `txListIndexOf` is the shared `-1`-returning helper `siGradeFn` and `txListHas` both
+call. Neither is the checker, and `sentinel-index-unguarded` (#2499) post-dates B6's reading —
+so this term was added after item 8 was written. The fix shape is the one D1514 and `daLive`
+already took: an index keyed by name, built once. **Not fixed here — this PR is the
+instrument.**
+
 ### B7 · `collectA`'s three phases, and which one a suffix can extend
 
 `monoRebuild`'s stamp (#2594) removed the DUPLICATE rebuild after each minted instance;

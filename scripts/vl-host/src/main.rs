@@ -916,6 +916,28 @@ fn embedded_std_hash() -> String {
 }
 
 fn gc_engine(collector: Collector) -> Result<Engine> {
+    Engine::new(&gc_config(collector))
+}
+
+/// The engine for a store that drives the COMPILER SEED (`build`'s one-shot compile,
+/// the CLI pump's command loop, `run`'s and `--batch`'s compile phase). Identical to
+/// `gc_engine` except that a profiled run (`$VL_PROFILE_GUEST`) adds EPOCH
+/// INTERRUPTION, the sampler's clock.
+///
+/// Split from `gc_engine` rather than folded into it because every store on such an
+/// engine MUST arm a deadline callback before it runs anything (`arm_guest_profile`):
+/// the default deadline is 0 and the default action is a TRAP, so an unarmed store
+/// dies in the module's start function. The user-program engine therefore stays
+/// plain, and the profile covers the compiler rather than the program it emitted.
+fn seed_engine(collector: Collector) -> Result<Engine> {
+    let mut cfg = gc_config(collector);
+    if guest_profile_path().is_some() {
+        cfg.epoch_interruption(true);
+    }
+    Engine::new(&cfg)
+}
+
+fn gc_config(collector: Collector) -> Config {
     let mut cfg = Config::new();
     cfg.wasm_gc(true);
     cfg.wasm_function_references(true);
@@ -929,7 +951,7 @@ fn gc_engine(collector: Collector) -> Result<Engine> {
     if matches!(collector, Collector::Null) {
         cfg.gc_heap_reservation(8 << 30); // 8 GiB virtual reservation (lazily committed)
     }
-    Engine::new(&cfg)
+    cfg
 }
 
 /// The collector for the USER PROGRAM's store (`vl run`) — `Collector::Auto`
@@ -1694,12 +1716,18 @@ fn std_cmd(rest: &[String]) -> Result<()> {
 /// that caches the Cranelift compilation (the dominant fixed cost of every
 /// invocation), keyed by the seed's CONTENT and by engine configuration (a separate
 /// sidecar per one). Shared by every subcommand that
-/// drives the seed (`compile_vl`, `fmt`). `deserialize_file` is unsafe because a
+/// drives the seed (`compile_vl_located`, the pump). `deserialize_file` is unsafe because a
 /// corrupt/forged artifact is UB — we only ever load a sidecar this same binary wrote
 /// next to the module it was derived from.
+///
+/// Under `$VL_PROFILE_GUEST` this is also where the sampler starts and where the store
+/// is armed — before instantiation, since the module's start function is guest code an
+/// unarmed epoch-interrupting store would trap in.
 fn load_compiler(engine: &Engine, source: &CompilerSource) -> Result<(Store<()>, Instance)> {
     let module = load_compiler_module(engine, source)?;
+    start_guest_profile(engine, &module)?;
     let mut store = Store::new(engine, ());
+    arm_guest_profile(&mut store);
     let linker = Linker::new(engine);
     let inst = from_compiler(linker.instantiate(&mut store, &module))?;
     check_seed_abi(&mut store, &inst, source)?;
@@ -2055,7 +2083,7 @@ impl StrOut {
 /// Stage `source` (as `source_path`) into a freshly-loaded compiler instance: run
 /// the module fetch loop when it has imports, then `srcReset` + `srcPush`. Leaves
 /// the instance ready for a `checkSrc` / `compileSrc` / `lintSrc` call. Used by
-/// `compile_vl` (build/run); `check` drives its own module fetch from VL via the
+/// `compile_vl_located` (build/run); `check` drives its own module fetch from VL via the
 /// True when `source` holds a backtick template literal that has a `${…}` hole.
 ///
 /// Skips `//` comments and `"…"` / `'…'` literals so a backtick written in prose
@@ -2233,33 +2261,16 @@ macro_rules! phase {
     }};
 }
 
-fn compile_vl(
-    engine: &Engine,
-    compiler: &CompilerSource,
-    source: &str,
-    source_path: &str,
-    entry: &str,
-    emit_names: bool,
-) -> Result<Vec<u8>> {
-    // `$VL_PROFILE_GUEST=<out.json>`: run this compile under a SAMPLING guest
-    // profiler and write a Firefox-profiler JSON, for function-level attribution
-    // of time spent INSIDE the compiler wasm. Diagnostics-only path.
-    if let Ok(out) = std::env::var("VL_PROFILE_GUEST") {
-        if let CompilerSource::Path(p) = compiler {
-            return compile_vl_guest_profiled(p, &out, source, source_path, entry, emit_names);
-        }
-    }
-    let (mut store, inst) = phase!("load_compiler", load_compiler(engine, compiler))?;
-    compile_vl_instance(&mut store, &inst, source, source_path, entry, emit_names)
-}
-
-/// Like `compile_vl`, but hands the live compiler instance BACK so a failure that
-/// happens after the compile - the engine refusing the emitted module - can still ask it
-/// where the offending bytes came from (`locate_invalid_module`, D1578).
+/// Load the seed, stage `source`, call `entry`, and hand the emitted bytes back
+/// ALONGSIDE the live compiler instance, so a failure that happens after the compile
+/// - the engine refusing the emitted module - can still ask it where the offending
+/// bytes came from (`locate_invalid_module`, D1578).
 ///
 /// ZERO COST ON THE HAPPY PATH, which is why it exists rather than a pre-validate:
 /// nothing is read out of the guest unless the module is already known not to load.
-/// `None` for the `$VL_PROFILE_GUEST` rung, whose store belongs to the profiler.
+///
+/// `$VL_PROFILE_GUEST` rides in `load_compiler`, which arms the store this call runs
+/// on; `engine` has to have come from `seed_engine` or the sampler never fires.
 fn compile_vl_located(
     engine: &Engine,
     compiler: &CompilerSource,
@@ -2268,10 +2279,6 @@ fn compile_vl_located(
     entry: &str,
     emit_names: bool,
 ) -> Result<(Vec<u8>, Option<(Store<()>, Instance)>)> {
-    if std::env::var_os("VL_PROFILE_GUEST").is_some() {
-        let bytes = compile_vl(engine, compiler, source, source_path, entry, emit_names)?;
-        return Ok((bytes, None));
-    }
     let (mut store, inst) = phase!("load_compiler", load_compiler(engine, compiler))?;
     let bytes = compile_vl_instance(&mut store, &inst, source, source_path, entry, emit_names)?;
     Ok((bytes, Some((store, inst))))
@@ -2347,40 +2354,61 @@ fn locate_invalid_module(
     ))
 }
 
-/// The `$VL_PROFILE_GUEST` path: like `compile_vl`, but on its own engine with
-/// EPOCH INTERRUPTION enabled — a timer thread bumps the epoch every ~1ms and the
-/// deadline callback takes a `GuestProfiler` stack sample, so the profile names
-/// where the compiler spends its time (build the seed with `--names` for legible
-/// frames). Deliberately bypasses the `.cwasm` sidecar: epoch-instrumented code
-/// has a different Engine config, and caching it would poison the sidecar every
-/// normal run then re-heals.
-fn compile_vl_guest_profiled(
-    compiler_path: &str,
-    out_path: &str,
-    source: &str,
-    source_path: &str,
-    entry: &str,
-    emit_names: bool,
-) -> Result<Vec<u8>> {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Duration;
-    const INTERVAL: Duration = Duration::from_millis(1);
+// ── the sampling guest profiler (`$VL_PROFILE_GUEST`) ────────────────────────
+//
+// `$VL_PROFILE_GUEST=<out.json>` writes a Firefox-profiler JSON naming where the
+// COMPILER SEED spends its time. Three pieces: `seed_engine` turns on EPOCH
+// INTERRUPTION, a timer thread bumps the epoch every `GUEST_SAMPLE_INTERVAL`, and
+// each seed-driving store's deadline callback takes one `GuestProfiler` stack
+// sample per bump. Build the seed with `--names` for legible frames.
+//
+// SAMPLES ARE PER STORE, NOT PER CALL, which is why one profile covers the CLI
+// pump's whole command loop (`check`, `fmt`, `test`, `--json`) as well as `build`'s
+// single `compileSrc`: the callback fires whenever GUEST code is on the stack,
+// however many times the host crossed into it. Tying this to the one-shot compile
+// entry was a duplicated engine + module + store, not a property of the sampler.
+//
+// The USER PROGRAM's engine stays plain, so `vl run` profiles its compile phase and
+// not the module it emitted — that runs on a second engine, and a `GuestProfiler`
+// may only carry modules from one.
 
-    let mut cfg = Config::new();
-    cfg.wasm_gc(true);
-    cfg.wasm_function_references(true);
-    cfg.collector(Collector::Null);
-    cfg.gc_heap_reservation(8 << 30);
-    cfg.epoch_interruption(true);
-    let engine = Engine::new(&cfg)?;
-    let module = Module::from_file(&engine, compiler_path)
-        .map_err(|e| e.context(format!("loading compiler module `{compiler_path}`")))?;
-    let mut store = Store::new(&engine, ());
+/// One stack sample per millisecond of guest execution, and the `delta` each sample
+/// is credited with. The two must agree or the profile's times are a scaled lie.
+const GUEST_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
 
+/// The output path `$VL_PROFILE_GUEST` names, or `None` when this run is not
+/// profiled. An EMPTY value reads as "off" rather than as a file called "".
+fn guest_profile_path() -> Option<String> {
+    std::env::var("VL_PROFILE_GUEST")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// The live sampler: the profiler it appends to, the timer thread driving it, and
+/// where the JSON goes. One per process, in `GUEST_PROFILE`.
+struct GuestProfile {
+    profiler: Arc<Mutex<Option<GuestProfiler>>>,
+    stop: Arc<AtomicBool>,
+    timer: Option<std::thread::JoinHandle<()>>,
+    out_path: String,
+}
+
+/// The process's profiler, `None` on an unprofiled run. A static rather than a
+/// value threaded through the entries because every subcommand has to FINISH it on
+/// the way out, including the pump, which leaves by `process::exit`.
+static GUEST_PROFILE: Mutex<Option<GuestProfile>> = Mutex::new(None);
+
+/// Begin sampling `module` on `engine`, if this run is profiled. Call once, with the
+/// seed's module, before the first store is armed; `engine` must have come from
+/// `seed_engine` or the deadline never fires.
+fn start_guest_profile(engine: &Engine, module: &Module) -> Result<()> {
+    let Some(out_path) = guest_profile_path() else {
+        return Ok(());
+    };
     let profiler = Arc::new(Mutex::new(Some(GuestProfiler::new(
-        &engine,
+        engine,
         "vl-compiler",
-        INTERVAL,
+        GUEST_SAMPLE_INTERVAL,
         vec![("vl-compiler".to_string(), module.clone())],
     )?)));
     let stop = Arc::new(AtomicBool::new(false));
@@ -2389,7 +2417,7 @@ fn compile_vl_guest_profiled(
         let weak = engine.weak();
         std::thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
-                std::thread::sleep(INTERVAL);
+                std::thread::sleep(GUEST_SAMPLE_INTERVAL);
                 match weak.upgrade() {
                     Some(engine) => engine.increment_epoch(),
                     None => break,
@@ -2397,32 +2425,66 @@ fn compile_vl_guest_profiled(
             }
         })
     };
-    // Deadline + callback must be armed BEFORE instantiation: with epoch
-    // interruption enabled the store's default deadline is 0 and the default
-    // behavior is TRAP, so the module's start function would die immediately.
+    *GUEST_PROFILE.lock().unwrap() = Some(GuestProfile {
+        profiler,
+        stop,
+        timer: Some(timer),
+        out_path,
+    });
+    Ok(())
+}
+
+/// Arm `store` so each epoch bump takes a sample. A NO-OP on an unprofiled run.
+///
+/// Must run BEFORE the store executes anything: with epoch interruption enabled the
+/// default deadline is 0 and the default action is a trap, so an unarmed store dies
+/// inside the module's start function.
+fn arm_guest_profile(store: &mut Store<()>) {
+    let guard = GUEST_PROFILE.lock().unwrap();
+    let Some(g) = guard.as_ref() else {
+        return;
+    };
     store.set_epoch_deadline(1);
-    let prof = profiler.clone();
+    let prof = g.profiler.clone();
     store.epoch_deadline_callback(move |cx| {
         if let Some(p) = prof.lock().unwrap().as_mut() {
-            p.sample(&cx, INTERVAL);
+            p.sample(&cx, GUEST_SAMPLE_INTERVAL);
         }
         Ok(UpdateDeadline::Continue(1))
     });
-    let inst = from_compiler(Linker::new(&engine).instantiate(&mut store, &module))?;
-
-    let result = compile_vl_instance(&mut store, &inst, source, source_path, entry, emit_names);
-    stop.store(true, Ordering::Relaxed);
-    let _ = timer.join();
-    if let Some(p) = profiler.lock().unwrap().take() {
-        let f = std::fs::File::create(out_path)
-            .map_err(|e| Error::from(e).context(format!("creating guest profile `{out_path}`")))?;
-        p.finish(std::io::BufWriter::new(f))?;
-        eprintln!("[profile] guest profile written to {out_path} (load in https://profiler.firefox.com)");
-    }
-    result
 }
 
-/// The per-invocation body of `compile_vl`, over an already-instantiated compiler:
+/// Stop sampling and write the profile. Idempotent — the second call finds `None` —
+/// so it can sit on both ways out of the process: `main` after `real_main` returns
+/// (success or failure), and the pump's own `process::exit`.
+///
+/// A FAILED compile still writes its profile: the interesting runs are often the
+/// slow ones that end in a diagnostic. A write error is reported and swallowed
+/// rather than replacing the command's own exit status.
+fn finish_guest_profile() {
+    let Some(mut g) = GUEST_PROFILE.lock().unwrap().take() else {
+        return;
+    };
+    g.stop.store(true, Ordering::Relaxed);
+    if let Some(t) = g.timer.take() {
+        let _ = t.join();
+    }
+    let Some(p) = g.profiler.lock().unwrap().take() else {
+        return;
+    };
+    let out_path = &g.out_path;
+    let written = std::fs::File::create(out_path)
+        .map_err(|e| Error::from(e).context(format!("creating guest profile `{out_path}`")))
+        .and_then(|f| p.finish(std::io::BufWriter::new(f)));
+    match written {
+        Ok(()) => eprintln!(
+            "[profile] guest profile written to {out_path} (load in https://profiler.firefox.com)"
+        ),
+        Err(e) => eprintln!("[profile] guest profile not written: {e:?}"),
+    }
+}
+
+/// The per-invocation body of a compile, over an already-instantiated compiler:
 /// stage the source, call `entry`, read the emitted bytes back (or the compiler's
 /// diagnostics as the error). `vl run --batch` instantiates the compiler once per
 /// case (cheap) from a once-loaded Module (expensive) and calls this directly.
@@ -3655,17 +3717,20 @@ fn run_batch(args: &[String]) -> Result<()> {
         .map_err(|e| Error::from(e).context(format!("creating --out-dir `{out_dir}`")))?;
     let compiler = resolve_compiler(compiler);
 
-    let compile_engine = gc_engine(Collector::Null)?;
+    let compile_engine = seed_engine(Collector::Null)?;
     let run_engine = gc_engine(run_collector()?)?;
     let module = load_compiler_module(&compile_engine, &compiler)?;
     // Pre-link once; `instantiate_pre` re-checks nothing per case.
     let pre = from_compiler(Linker::new(&compile_engine).instantiate_pre(&module))?;
     // `run_batch` is the ONE loader that bypasses `load_compiler` (it holds the
     // Module engine-level and instantiates per case for isolation), so the ABI
-    // check has to be repeated here or a stale seed reaches every case unchecked.
-    // Once, against a throwaway store — not per case.
+    // check — and, under `$VL_PROFILE_GUEST`, the sampler's start and every store's
+    // arming — has to be repeated here or a stale seed reaches every case unchecked
+    // and the profile comes back empty. Once, against a throwaway store — not per case.
+    start_guest_profile(&compile_engine, &module)?;
     {
         let mut probe = Store::new(&compile_engine, ());
+        arm_guest_profile(&mut probe);
         let inst = from_compiler(pre.instantiate(&mut probe))?;
         check_seed_abi(&mut probe, &inst, &compiler)?;
     }
@@ -3697,6 +3762,7 @@ fn run_batch(args: &[String]) -> Result<()> {
                         .context(format!("`{f}` is neither UTF-8 VL source nor a wasm module"))
                 })?;
                 let mut store = Store::new(&compile_engine, ());
+                arm_guest_profile(&mut store);
                 let inst = from_compiler(pre.instantiate(&mut store))?;
                 compile_vl_instance(&mut store, &inst, &source, f, "compileSrc", true)?
             };
@@ -3939,7 +4005,7 @@ fn compile_and_run(
     run_engine: &Engine,
     palette: Palette,
 ) -> Result<()> {
-    let compile_engine = gc_engine(Collector::Null)?;
+    let compile_engine = seed_engine(Collector::Null)?;
     // `_located`, so a module the engine refuses can still be traced back to the
     // function that emitted it (D1578). The compile itself is unchanged.
     let (bytes, session) =
@@ -4982,7 +5048,7 @@ fn cli_pump(args: &[String]) -> Result<()> {
     // with the FILE COUNT; under the null collector the heap only ever grows and a walk
     // of a few dozen files dies with `wasm trap: allocation size too large`. Two copies
     // of this repo's own `compiler/` (54 files) were enough.
-    let engine = gc_engine(match std::env::var("VL_PUMP_GC").ok().as_deref() {
+    let engine = seed_engine(match std::env::var("VL_PUMP_GC").ok().as_deref() {
         Some("null") => Collector::Null,
         Some("tracing") => Collector::Copying,
         Some("refcount") => Collector::DeferredReferenceCounting,
@@ -5277,7 +5343,11 @@ fn cli_pump(args: &[String]) -> Result<()> {
     }
     out.flush().ok();
     err.flush().ok();
-    std::process::exit(exit_code.call(&mut store, ())?);
+    // AFTER the last guest call, and before the `exit` that keeps `main`'s own
+    // `finish_guest_profile` from ever running on this path.
+    let code = exit_code.call(&mut store, ())?;
+    finish_guest_profile();
+    std::process::exit(code);
 }
 
 
@@ -5389,9 +5459,12 @@ fn report(err: Error) -> ! {
 }
 
 fn main() {
-    match real_main() {
-        Ok(()) => {}
-        Err(e) => report(e),
+    let r = real_main();
+    // Before `report`, which exits: a failed compile is often the one worth
+    // profiling, and a profile that is never written says nothing at all.
+    finish_guest_profile();
+    if let Err(e) = r {
+        report(e);
     }
 }
 
@@ -5498,7 +5571,7 @@ fn build_cmd(args: &[String]) -> Result<()> {
     };
     // The compile step always runs under the null collector (one-shot batch work);
     // only the user program's own execution gets a real (DRC) collector.
-    let compile_engine = gc_engine(Collector::Null)?;
+    let compile_engine = seed_engine(Collector::Null)?;
 
     let out = flag("-o").unwrap_or_else(|| {
         input.strip_suffix(".vl").unwrap_or(input).to_string() + ".wasm"

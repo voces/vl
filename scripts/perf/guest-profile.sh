@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Guest-profile a compile and rank by SELF time. Builds a `--names` seed once
-# (frames read `wasm-function[N]` without one) and reuses it. The profiled run
-# bypasses the `.cwasm` sidecar and pays ~10 s re-JITing whatever the input, so
-# read the RANKING, never the wall time.
+# Guest-profile one command and rank by SELF time. Builds a `--names` seed once
+# (frames read `wasm-function[N]` without one) and reuses it. `<cmd>` is any entry
+# the host drives — check, build, run, fmt, test. The FIRST profiled run against a
+# given seed re-JITs it (the epoch-instrumented engine has its own `.cwasm`
+# sidecar); every later one deserializes, so read the ranking off a warm run.
 #   scripts/perf/guest-profile.sh <out-dir> <cmd> <file> [more files...]
 set -u
 cd "$(dirname "$0")/../.."
