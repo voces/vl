@@ -19,12 +19,16 @@ if (GATED && !ENABLED) {
 type Diag = {
   file: string;
   severity: string;
+  stage: string;
   code?: string;
   line?: number;
   col?: number;
   endCol?: number;
   message: string;
 };
+
+/** One `--batch` record: the file, the exit code it alone would carry, its diagnostics. */
+type Batch = { file: string; exit: number; diagnostics: Diag[] };
 
 const run = async (
   args: string[],
@@ -53,6 +57,20 @@ const parseDiags = (out: string): Diag[] => {
     throw new Error(`--json stdout is not a JSON array: ${trimmed}`);
   }
   return parsed as Diag[];
+};
+
+// stdout in `--batch` mode is one record per LINE — parse or throw.
+const parseBatch = (out: string): Batch[] => {
+  const lines = out.split("\n").filter((l) => l.trim() !== "");
+  return lines.map((l) => {
+    const rec = JSON.parse(l);
+    if (typeof rec.file !== "string" || typeof rec.exit !== "number" ||
+      !Array.isArray(rec.diagnostics)
+    ) {
+      throw new Error(`--batch record is not {file, exit, diagnostics}: ${l}`);
+    }
+    return rec as Batch;
+  });
 };
 
 const withDir = async (
@@ -264,6 +282,186 @@ Deno.test({
         throw new Error(
           `expected [1:30, 38), got [${d.line}:${d.col}, ${d.endCol}): ${out}`,
         );
+      }
+    });
+  },
+});
+
+// ── `stage`: which pipeline phase produced the diagnostic ────────────────────
+// The driver distinguishes four by the same index math its other `diag*` accessors
+// use (`diagStage`) — `import` for the module order/validate phase, `parse` for the
+// front end, `type` for the checker, `emit` for the emitter's one refusal — and this
+// file's own report adds `lint`, `validate`, `fix` and `read`. A consumer classifies a
+// refusal by this instead of grepping the summary's `(type error)` note, which is per
+// FILE rather than per diagnostic and is absent from `--json` altogether.
+Deno.test({
+  name: "check --json: every diagnostic carries the stage that produced it",
+  ignore: !ENABLED,
+  fn: async () => {
+    await withDir(async (dir) => {
+      // source, a message fragment that picks the diagnostic out, its stage
+      const cases: [string, string, string][] = [
+        ["let x = (\n", "expected an expression", "parse"],
+        ['const x: i32 = "s"\nprint(x)\n', "cannot assign string", "type"],
+        ['import { a } from "./nope"\nprint(1)\n', "Cannot resolve import", "import"],
+        ["let y = 1\nprint(y)\n", "never reassigned", "lint"],
+        ["const z: i32 = 1\nprint(z)\n", "redundant type annotation", "type"],
+      ];
+      for (const [src, frag, stage] of cases) {
+        const file = `${dir}/stage.vl`;
+        await Deno.writeTextFile(file, src);
+        const { out } = await run(["check", file, "--json"]);
+        const diags = parseDiags(out);
+        const d = diags.find((x) => x.message.includes(frag));
+        if (!d) throw new Error(`no diagnostic matching "${frag}": ${out}`);
+        if (d.stage !== stage) {
+          throw new Error(`want stage "${stage}" for "${frag}", got "${d.stage}": ${out}`);
+        }
+        for (const other of diags) {
+          if (!other.stage) throw new Error(`a diagnostic carries no stage: ${out}`);
+        }
+      }
+    });
+  },
+});
+
+Deno.test({
+  name: "check --json --codegen: an emitter refusal is stage `emit`",
+  ignore: !ENABLED,
+  fn: async () => {
+    await withDir(async (dir) => {
+      const file = `${dir}/emit.vl`;
+      // The same shape `tests/cases/unions/same-field-names-i32-vs-boolean-reject.vl`
+      // carries: `vl check` accepts it and the emitter has no discriminator for it.
+      await Deno.writeTextFile(
+        file,
+        "type P = { a: i32 }\ntype Q = { a: boolean }\n" +
+          "const u: P | Q = { a: true }\n" +
+          'if u is P { print("IS-P") } else { print("IS-Q") }\n',
+      );
+      const { code, out } = await run(["check", "--codegen", file, "--json"]);
+      if (code === 0) throw new Error(`expected a refusal, got exit 0: ${out}`);
+      const d = parseDiags(out).find((x) => x.severity === "error");
+      if (!d) throw new Error(`expected an error diagnostic: ${out}`);
+      if (d.stage !== "emit") {
+        throw new Error(`want stage "emit", got "${d.stage}": ${out}`);
+      }
+    });
+  },
+});
+
+// ── `--batch`: many paths, one verdict record per file ──────────────────────
+// The point of the record over the flat array is that a CLEAN file is a row of its
+// own. In an array a file with no findings is indistinguishable from one that was
+// never checked, so a caller batching a file list cannot tell the two apart —
+// which is what `tests/selfhost_native_align_test.ts` needs to grade a case.
+Deno.test({
+  name: "check --batch --json: one record per file, in argv order, exit per file",
+  ignore: !ENABLED,
+  fn: async () => {
+    await withDir(async (dir) => {
+      await Deno.writeTextFile(`${dir}/bad.vl`, 'const x: i32 = "s"\nprint(x)\n');
+      await Deno.writeTextFile(`${dir}/ok.vl`, "print(1)\n");
+      const { code, out, err } = await run([
+        "check",
+        "--batch",
+        "--json",
+        `${dir}/bad.vl`,
+        `${dir}/ok.vl`,
+      ]);
+      if (code !== 1) throw new Error(`expected exit 1, got ${code}: ${err}`);
+      const recs = parseBatch(out);
+      if (recs.length !== 2) {
+        throw new Error(`expected 2 records, got ${recs.length}: ${out}`);
+      }
+      if (recs[0].file !== `${dir}/bad.vl` || recs[1].file !== `${dir}/ok.vl`) {
+        throw new Error(`records are not in argv order: ${out}`);
+      }
+      if (recs[0].exit !== 1 || recs[1].exit !== 0) {
+        throw new Error(`want per-file exits 1 then 0, got ${recs[0].exit} and ${recs[1].exit}`);
+      }
+      if (recs[1].diagnostics.length !== 0) {
+        throw new Error(`the clean file must carry no diagnostics: ${out}`);
+      }
+      if (!recs[0].diagnostics.some((d) => d.stage === "type")) {
+        throw new Error(`the bad file must carry its type error: ${out}`);
+      }
+    });
+  },
+});
+
+Deno.test({
+  name: "check --batch --json: an unreadable entry is a record, not a silent skip",
+  ignore: !ENABLED,
+  fn: async () => {
+    await withDir(async (dir) => {
+      await Deno.writeTextFile(`${dir}/ok.vl`, "print(1)\n");
+      const { code, out } = await run([
+        "check",
+        "--batch",
+        "--json",
+        `${dir}/ok.vl`,
+        `${dir}/gone.vl`,
+      ]);
+      // Exit 2 — the code a single `vl check <missing>` carries.
+      if (code !== 2) throw new Error(`expected exit 2, got ${code}: ${out}`);
+      const recs = parseBatch(out);
+      if (recs.length !== 2) {
+        throw new Error(`expected a record for BOTH paths, got ${recs.length}: ${out}`);
+      }
+      const gone = recs[1];
+      if (gone.exit !== 2 || gone.diagnostics[0]?.stage !== "read") {
+        throw new Error(`want exit 2 at stage "read" for the missing path: ${out}`);
+      }
+    });
+  },
+});
+
+// A batch has to grade each NAMED file exactly as a lone `vl check <file>` grades it:
+// same diagnostics, same exit. The one thing many-files-per-process could change is
+// state carried between them, so the assertion is the equality itself rather than a
+// spot check on one field.
+Deno.test({
+  name: "check --batch --json: a record equals that file's own `vl check` run",
+  ignore: !ENABLED,
+  fn: async () => {
+    await withDir(async (dir) => {
+      const srcs: Record<string, string> = {
+        "a.vl": 'const x: i32 = "s"\nprint(x)\n',
+        "b.vl": "let y = 2\nprint(y)\n",
+        // A file that fails at PARSE, right after one carrying lint findings: a lossy
+        // parse leaves the lint sink alone, and its findings are the previous file's.
+        "c.vl": "// a header line\n// a second header line\nlet z = (\n",
+        "d.vl": "print(1)\n",
+      };
+      for (const [name, src] of Object.entries(srcs)) {
+        await Deno.writeTextFile(`${dir}/${name}`, src);
+      }
+      const names = Object.keys(srcs);
+      const alone = new Map<string, { exit: number; diagnostics: Diag[] }>();
+      for (const name of names) {
+        const r = await run(["check", `${dir}/${name}`, "--json"]);
+        alone.set(name, { exit: r.code, diagnostics: parseDiags(r.out) });
+      }
+      const batched = await run([
+        "check",
+        "--batch",
+        "--json",
+        ...names.map((n) => `${dir}/${n}`),
+      ]);
+      const recs = parseBatch(batched.out);
+      if (recs.length !== names.length) {
+        throw new Error(`expected ${names.length} records, got ${recs.length}`);
+      }
+      for (let i = 0; i < names.length; i++) {
+        const want = alone.get(names[i])!;
+        const got = recs[i];
+        if (JSON.stringify(want) !== JSON.stringify({ exit: got.exit, diagnostics: got.diagnostics })) {
+          throw new Error(
+            `${names[i]} differs batched vs alone\n  alone: ${JSON.stringify(want)}\n` +
+              `  batch: ${JSON.stringify({ exit: got.exit, diagnostics: got.diagnostics })}`,
+          );
+        }
       }
     });
   },

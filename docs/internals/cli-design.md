@@ -309,7 +309,7 @@ object per diagnostic, in the same order the pretty renderer would print them
 still emits a parseable `[]`.
 
 ```json
-[{"file":"src/a.vl","severity":"info","code":"prefer-const",
+[{"file":"src/a.vl","severity":"info","stage":"lint","code":"prefer-const",
   "line":3,"col":1,"endCol":4,
   "message":"`x` is never reassigned; use `const` instead of `let`"}]
 ```
@@ -320,6 +320,18 @@ Fields:
   graph-compile error, else the checked file (same resolution as the pretty
   label).
 - `severity` — `"error" | "warning" | "info" | "hint"`.
+- `stage` — the pipeline phase that produced it, always present. Eight values, in
+  pipeline order: `read` (a `--batch` entry the host could not read), `import`
+  (module order/validate — an unresolvable specifier, a cycle), `parse`, `type`,
+  `emit`, `validate` (the engine's verdict on the emitted module, under
+  `--codegen`), `lint`, `fix` (an edit `--fix` declined). The first four are the
+  driver's own (`diagStage`, over the same index math as every other `diag*`
+  accessor: `P.diags` is the front end's stream, `T.diags` the checker's, and the
+  trailing `emitErr` the emitter's one refusal, with the module phase's findings a
+  prefix of `P.diags`); the other four are `compiler/cli.vl`'s report. The
+  checker's advisory streams — `redundant-type`, `dead-coalesce-default`,
+  `collapsed-arm-value-test` — are `type`, since the phase is what `stage` names
+  and `severity` is what says whether it refused.
 - `code` — the stable machine id: the lint rule id (`prefer-const`,
   `unused-variable`, …) or `redundant-type` for the annotation hint. **Omitted**
   for compile (parse/type/emit/resolution) errors — those carry no code.
@@ -327,6 +339,12 @@ Fields:
   `endCol - col` is the caret-span length, ≥ 1). All three **omitted** for a
   positionless diagnostic.
 - `message` — the diagnostic text, unstyled.
+
+**`stage` is per DIAGNOSTIC; the summary's note is per FILE.** The human summary ends
+`Found 1 error. (type error)` from `cliLastStage`, which is the whole file's return
+code — one label for however many diagnostics the file produced, and absent from
+`--json` altogether. A lossless-recovered parse reports its parse mistake AND the
+checker's type errors in one run, so the two are not the same fact.
 
 **The column base is the SAME on every channel.** The compiler carries columns 0-based
 internally (the lexer's convention, and the corpus `@error-at` directive's) and every
@@ -344,6 +362,41 @@ cannot-read errors keep their stderr message and emit no JSON). ANSI is never
 emitted in `--json` mode regardless of the host-resolved `--color`; the human
 summary line is suppressed (stderr keeps only notes like the `--fix` count, so
 stdout stays pure JSON).
+
+## `check --batch` — many paths, one verdict record per file
+
+`vl check --batch <path>... --json` checks MANY paths in ONE process and writes **one
+JSON record per input file, one per line**, in argv order (each directory target's own
+files sorted inside it):
+
+```json
+{"file":"src/a.vl","exit":1,"diagnostics":[{"file":"src/a.vl","severity":"error","stage":"type","line":1,"col":14,"endCol":17,"message":"cannot assign string to 'x' of type i32"}]}
+{"file":"src/b.vl","exit":0,"diagnostics":[]}
+```
+
+`exit` is the code `vl check <file>` ALONE would carry (0 clean, 1 gating, 2 unreadable,
+70 an invalid emitted module), and the diagnostics are the same objects the flat array
+holds. The process exit code is still the run's aggregate.
+
+**Why records and not the flat array.** A file with no findings contributes nothing to
+an array, so a caller batching a file list cannot tell a clean file from one that was
+never checked — a typo'd path, or a walk that skipped it, reads exactly like a pass.
+A record per file removes the ambiguity by construction, and an entry the host cannot
+read gets its own record (`exit` 2, one diagnostic at stage `read`) rather than the
+directory walk's silent skip.
+
+**Each NAMED path is graded exactly as `vl check <path>` grades it** — same module-graph
+lint scope, same report, same exit — which is what makes a batch a schedule change and
+not a semantic one. `tests/vl_check_json_test.ts` asserts that equality directly rather
+than spot-checking a field, and `tests/selfhost_native_align_test.ts` is the consumer:
+its ~2,989 per-case `vl check` spawns are 77% process floor
+(`docs/internals/test-timing-2026-09.md` §5a).
+
+`--batch` without `--json` takes the same many paths and prints the ordinary aggregate
+report; the per-file exit code has no human rendering, so it is `--json`'s alone. Every
+other spelling is untouched: without `--batch` a second positional is still the usage
+error `one path per run`, and single-path `--json` is byte-identical to what it was
+apart from the new `stage` key.
 
 ## `std:` diagnostics are withheld unless asked for (`--include-std`)
 
