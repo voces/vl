@@ -337,6 +337,19 @@ documents.onDidChangeContent(async (event) => {
   // types of the module just edited.
   wasmChecker?.bumpReaderGeneration();
 
+  // The most-recently-computed unused-export hints (from the last workspace
+  // pass). Stale relative to this edit — the debounce timer below refreshes
+  // them after idle; publishing the stale set avoids losing them on every
+  // keystroke.
+  const hints = wasmChecker !== undefined
+    ? unusedExportHints(
+      event.document.getText(),
+      entryKeyOf(event.document.uri),
+      lastUseMap,
+      wasmChecker,
+    )
+    : [];
+
   // Diagnostics only — running a program is explicit (the `vital.runFile`
   // command / Ctrl+F5), never a side effect of editing. (Auto-running on every
   // change executed arbitrary program logic on each keystroke — e.g. an infinite
@@ -349,19 +362,28 @@ documents.onDidChangeContent(async (event) => {
   // statements. A file with no imports analyzes exactly as the single-file
   // `checkOnly` path did. Codegen-only diagnostics (the rare `Codegen error:`)
   // aren't produced here, same trade-off as `vl check`.
+  //
   // Diagnostics from the self-hosted compiler: the error tier (`check`) PLUS the
   // Stage-3 lint tier (`lint`, which `check` excludes). No checker (no seed / no
   // WasmGC in this host) → no diagnostics, rather than a TS fallback.
+  //
+  // `check` RUNS LAST of the three, and that ordering is the keystroke's cost:
+  // it is the only one that leaves a checked module graph behind, and both
+  // `lint` (a parse-only pass over the same instance) and the hints'
+  // `moduleSurface` (which resets the module table) would discard it. The hover
+  // / semantic-tokens / inlay requests that follow an edit then answer off the
+  // staging this leaves, for no second whole-graph check.
   let diagnostics: VLDiagnostic[] = [];
   if (wasmChecker !== undefined) {
     try {
       const text = event.document.getText();
+      const lintDiags = wasmChecker.lint(text);
       const errors = await wasmChecker.check(
         text,
         entryKeyOf(event.document.uri),
         workspaceReader,
       );
-      diagnostics = [...errors, ...wasmChecker.lint(text)];
+      diagnostics = [...errors, ...lintDiags];
     } catch (err) {
       connection.console.log(`[wasm-checker] check failed: ${err}`);
     }
@@ -371,20 +393,6 @@ documents.onDidChangeContent(async (event) => {
   // `onCodeAction` can offer fixes by line overlap, not just for the exact
   // diagnostics VS Code passes back.
   diagnosticsByUri.set(event.document.uri, diagnostics);
-
-  // Merge the most-recently-computed unused-export hints (from the last
-  // workspace pass) with the per-file lint/type diagnostics. The hints are
-  // stale relative to this edit — they will be refreshed by the debounce
-  // timer that fires after idle. Publishing the stale hints avoids losing
-  // them entirely on every keystroke.
-  const hints = wasmChecker !== undefined
-    ? unusedExportHints(
-      event.document.getText(),
-      entryKeyOf(event.document.uri),
-      lastUseMap,
-      wasmChecker,
-    )
-    : [];
 
   connection.sendDiagnostics({
     uri: event.document.uri,

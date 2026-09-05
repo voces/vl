@@ -1689,10 +1689,16 @@ export const createWasmChecker = (
     // (correctly — it produces a right answer by another route); diagnostics cannot,
     // because every message read from a mismatched seed would be mis-decoded.
     if (!speaksAbi(exp)) return abiMismatchDiag(exp);
-    // `checkSrc` always runs — it is not `checkSrcSym` with the symbol table
-    // off. It alone runs the deep-`is` second pass, so it can report a
-    // diagnostic the symbol check does not, and the store it fills is what this
-    // returns. The STAGING is what the memo saves here.
+    // ONE check for the whole keystroke: `checkSrcSym` fills the SAME diagnostic
+    // store and leaves the occurrence tables the hover / tokens / inlay that
+    // follow would otherwise pay a second graph check to rebuild.
+    if (hasSymbols(exp) && typeof exp.checkSymDiagsComplete === "function") {
+      await ensurePrepared(exp, source, entryKey, read);
+      return readDiags(exp);
+    }
+    // A seed whose `checkSrcSym` skips the deep-`is` second pass reports FEWER
+    // diagnostics than `checkSrc`, and this is the one surface that may not
+    // degrade silently — so it runs the plain check, as every seed used to.
     const s = await ensureStaged(exp, source, entryKey, read);
     graphChecks++;
     exp.checkSrc();

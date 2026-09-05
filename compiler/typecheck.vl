@@ -5782,12 +5782,23 @@ function symRetainType(declNode: i32, ty: i32, kind: i32) {
   0
 }
 
+// A declaration's anchor token: its own name token from the parser's side table, falling back to
+// the node anchor when unset. The one place the three recorders agree on which token a binding
+// answers at, so a test about that token (`jwTokIsGenerated`) reads the same value everywhere.
+function symDeclTok(declNode: i32) {
+  const named = declNameTokOf(declNode)
+  if named >= 0 { return named }
+  if declNode >= 0 && declNode < nodeToks.length { return nodeToks[declNode] }
+  -1
+}
+
 // Stamp a binding's visibility scope for the position query, from open-scope span `spanIx`, a
 // `scope*` stack index; skipped when the index is out of range. The first stamp per binding wins,
 // so a demand-inference re-entry — which runs the body from an artificially deep stack — cannot
 // clobber a top-level function's correct global span.
 function symStampVis(name: string, declNode: i32, kind: i32, spanIx: i32) {
   if spanIx < 0 || spanIx >= scopeSL.length { return 0 }
+  if jwTokIsGenerated(symDeclTok(declNode)) { return 0 }
   let k = 0
   while k < symVisNode.length {
     if symVisNode[k] == declNode { return 0 }
@@ -5817,13 +5828,10 @@ function symDecl(name: string, declNode: i32, ty: i32, kind: i32) {
   // Visibility for completion: a binding is visible across its own innermost scope. Stamped
   // before the occurrence dedup so a demand-inference re-check refreshes the span.
   symStampVis(name, declNode, kind, scopeSL.length - 1)
-  let tok = declNameTokOf(declNode)
-  if tok < 0 {
-    if declNode >= 0 && declNode < nodeToks.length { tok = nodeToks[declNode] }
-  }
+  const tok = symDeclTok(declNode)
   // Idempotent by token: a function body re-checked during demand-inference would
   // otherwise stamp the same source identifier twice.
-  if symOccHasTok(tok) { return 0 }
+  if symOccSkipTok(tok) { return 0 }
   symOccTok.push(tok)
   symOccRecordTok(tok)
   symOccDecl.push(declNode)
@@ -5846,6 +5854,15 @@ function symOccRecordTok(tok: i32) {
   if tok < 0 { return 0 }
   symOccTokSet[i32ToStr(tok)] = true
   0
+}
+
+// Whether an occurrence at token `tok` must NOT be recorded: it is already recorded (the dedup),
+// or the token is GENERATED. The deep-`is` second pass splices walkers onto the token stream and
+// re-checks, and the editor must not colour, hint or complete over code the author never wrote —
+// the same rule the style tier applies through `jwTokIsGenerated`.
+function symOccSkipTok(tok: i32) {
+  if jwTokIsGenerated(tok) { return true }
+  symOccHasTok(tok)
 }
 
 // Whether an occurrence at token `tok` is already recorded (the dedup guard).
@@ -5877,11 +5894,8 @@ function symDeclInOuter(name: string, declNode: i32, ty: i32, kind: i32) {
   let outerSpan = scopeSL.length - 2
   if outerSpan < 0 { outerSpan = scopeSL.length - 1 }
   symStampVis(name, declNode, kind, outerSpan)
-  let tok = declNameTokOf(declNode)
-  if tok < 0 {
-    if declNode >= 0 && declNode < nodeToks.length { tok = nodeToks[declNode] }
-  }
-  if symOccHasTok(tok) { return 0 }
+  const tok = symDeclTok(declNode)
+  if symOccSkipTok(tok) { return 0 }
   symOccTok.push(tok)
   symOccRecordTok(tok)
   symOccDecl.push(declNode)
@@ -5912,7 +5926,7 @@ function symUse(useNode: i32, name: string, curTy: i32) {
   if decl < 0 { return 0 }
   let tok = -1
   if useNode >= 0 && useNode < nodeToks.length { tok = nodeToks[useNode] }
-  if symOccHasTok(tok) { return 0 }
+  if symOccSkipTok(tok) { return 0 }
   symOccTok.push(tok)
   symOccRecordTok(tok)
   symOccDecl.push(decl)
@@ -6264,6 +6278,8 @@ function symMem(ix: i32, ty: i32) {
   if ix < 0 || ix >= nodeToks.length { return ty }
   const tk = nodeToks[ix]
   if tk < 0 || tk >= P.toks.length { return ty }
+  // Generated walker code, on the same rule as `symOccSkipTok`.
+  if jwTokIsGenerated(tk) { return ty }
   const t = P.toks[tk]
   // Property-name length, to bound the span the cursor must fall within.
   let pl = 0
@@ -6295,6 +6311,8 @@ function symMemMethod(ix: i32) {
   if ix < 0 || ix >= nodeToks.length { return ix }
   const tk = nodeToks[ix]
   if tk < 0 || tk >= P.toks.length { return ix }
+  // Generated walker code, on the same rule as `symOccSkipTok`.
+  if jwTokIsGenerated(tk) { return ix }
   const t = P.toks[tk]
   let pl = 0
   const nd = P.nodes[ix]

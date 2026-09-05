@@ -21,7 +21,7 @@ QUICK = a day, no design question. STRUCT = a design track.
 | 6 | String `+` in a loop is **O(n²)** (§D): a loop-local builder, with n-ary chain fusion as the down payment. The fusion once shipped in the TS core and was never ported | ×4.80 per doubling; 5.4× at 320 KB; ≥129 in-loop sites | M / L | rep layer | corpus byte-identity where the pattern is absent; a scaling pair "append N" vs "join N", ratio bar 2.5 — **a value fixture cannot pin a cost class** | STRUCT |
 | 7 | ✅ **LANDED (§F8)** — `unRowOfName`/`isUName` → `unRowBySid`, extended at all three pushes; `unionMemberSetOf` and `unionRowOf`'s first leg route through it | self **0.70% → 0.01%**, incl **1.33% → 0.26%** | M | index must extend at all 3 pushes | byte-identical seed; `regress.py`; the unions axis | STRUCT |
 | 8 | ✅ **LANDED in part (§B6)** — the shape is module-level BINDINGS, not call sites, and the definite-assignment set was 91% of it. Sid-keyed, the 8,000-rung falls 2.54 s → 1.07 s and `checkProgram` goes 57.5% → 1.8% inclusive; the residual is not the checker | **−58% at 8k, −66% at 16k** | M | — | a 4-rung absolute ladder with an exponent bar (`scripts/perf/check-scaling.sh`) | STRUCT |
-| 9 | LSP re-checks the WHOLE module graph per keystroke — 30 modules. **Measured (§C2a): 72% is `checkProgram` over the MERGED program**, so the per-module cache §C2 named has a 28% ceiling; its staging half is **LANDED (§C2c)**, −14.5% | editor latency, not CI | M / L | — | a keystroke ladder at 1 / 4 / 30 modules; the cross-file invalidation in both directions | STRUCT |
+| 9 | LSP re-checks the WHOLE module graph per keystroke — 30 modules. **Measured (§C2a): 72% is `checkProgram` over the MERGED program**, so the per-module cache §C2 named has a 28% ceiling; its staging half is **LANDED (§C2c)**, −14.5%, and the edit→hover pair is **LANDED (§C2d)**, 2 graph checks → 1. What is left is the merged half (§C2b), a track | editor latency, not CI | M / L | — | a keystroke ladder at 1 / 4 / 30 modules; the cross-file invalidation in both directions; graph checks per request | STRUCT |
 | 10 | `declaredSlotOf` → per-function side index built in `buildLocals` | **1.1%** self time | M | reset per function, 5 sites | byte-identical seed; `regress.py` | STRUCT |
 | 11 | `fnStmtsPosOf` → reverse index `nodeIx → fe` after mono: 19,106 calls, **25.9 M scan steps** | closures axis 2.22 → ~1 | M | 1 in-place write, `emit_mono.vl:6353` | byte-identical seed; the closures axis under its 3.2 bar | STRUCT |
 | 12 | Destringify type names — `tyTopIndexOf` is a per-CHARACTER walk over a type-name string, **4.94% self** | 4.9% plus most of `__str_eq__`'s tail | L | canon / rep | `docs/internals/registry-by-type-id.md` steps 4–6; byte-identity | STRUCT |
@@ -391,6 +391,107 @@ not have `collectA`'s prefix shape: it rebuilds a per-function return-kind table
 `monoModuleLetOf` is 14.14% self and `recordRedundantAnnot` 7.01%. `collectA`'s own residue is
 0.76%, and all of it is the field-table phase this design deliberately re-runs.
 
+### B8 · `buildFnMap`'s ten columns, and why six need a row cache
+
+Re-measured on 4b0af3a47, `--names` seed, `genPins(N, true)`, `VL_PROFILE_GUEST` +
+`profile-rank.py`: `buildFnMap` is **10.61% inclusive at 400 pins and 18.58 – 20.38% at 800**
+over three interleaved pairs, and **89.9 – 95.1%** of what is left of `monoRebuild`. B7's
+estimate of 18.71% was one merge behind and reads high or low depending on which of the six
+landings since is in the denominator; the SHAPE it named is the shape measured. Its children at
+800 pins:
+
+| immediate child of `buildFnMap` | % of it | % of compile |
+| --- | ---: | ---: |
+| `retAnnKindChain` | 48.71 | 9.57 |
+| `refArrElemNameIf` | 15.52 | 3.05 |
+| `sidOfNode` | 9.91 | 1.95 |
+| `retVoidAnnFlag` | 8.62 | 1.69 |
+| `sidArrPut` | 6.47 | 1.27 |
+| (self) | 5.17 | 1.02 |
+| `retStructIndex` | 2.59 | 0.51 |
+
+There is no walk here — the pass is one loop over `fnStmts`, and every row is a pure function
+of that function's own `FuncDecl` node plus the registries the return classifiers consult. So
+it is not a resume, it is an INDEX with an append, which is what B7 predicted.
+
+**What the pass writes, and what a suffix can extend.** Ten columns, and the split is not by
+shape but by who else writes them.
+
+| column | seeded from | written after `buildFnMap`? | prefix treatment |
+| --- | --- | --- | --- |
+| `fnNames`, `fnIndices` | `s.fnName`, `i` | no | **keep** — the live prefix already is the answer |
+| `fnIndexBySid` | `sidOfNode`, first-occurrence | no (only the per-program reset) | **keep** — first-wins over prefix then suffix is first-wins over the whole |
+| `nestedNameBySid` | `fnParent[i] >= 0` | no | **keep** — monotone set-to-1 |
+| `fRetVoid` | `retVoidAnnFlag` | `computeVoidFns`, `emit_rewrite` | **re-seed from the cache** |
+| `fRetStructIdx` | `retStructIndex` | `computeRetInference` | re-seed |
+| `fRetRArrElem` | `retRefArrElemName` | `computeRetInference` | re-seed |
+| `fRetBool` | `retBoolFlag` | `computeRetInference` | re-seed |
+| `fRetKind` | `retAnnKindChain` | `computeRetInference` | re-seed |
+| `fRetLitAtom` | the constant 0 | `computeVoidFns`'s literal-atom arm | re-seed (write 0) |
+| `fnChildHead` / `fnChildNext` | — | lazily rebuilt on demand | cleared every call, as before |
+
+**The refinement is why a cache is needed at all.** `computeVoidFns` and `computeRetInference`
+run straight after `buildFnMap` and write into those six columns in place, so what stands in
+them at the next call is a REFINED value where a full re-mint would put the annotation's own.
+Keeping them would hand round k+1 round k's fixpoint as its seed — and that fixpoint is a
+function of the whole arena, not of one function, so it is not stable under a callee rename.
+The cache banks the seed row by row as each function is classified, and the resume writes it
+back. That makes the resumed pass produce exactly what a full re-mint produces, for every
+program, whether or not anything was minted.
+
+**The invalidation rule** is `collectA`'s seven registry lengths — `retStructIndex` reads the
+struct table and the variant rows, `retAnnKindChain` the union names, `refArrElemNameIf` the
+struct table — plus one signal `collectA` does not need. The walk `collectA` resumes reads
+`P.nodes`; `buildFnMap` reads `P.nodes[fnStmts[i]]` and `fnParent[i]`, and the monomorphizer
+re-points BOTH in place: `fnStmts[tSlot] = clone`, `fnStmts[origFe] = nfn`, `fnStmts[gp] =
+mkFunc(…)`, `fnParent[s] = parentSlot`, `fnParent[msl] = instFe`. Five sites, all in
+`emit_mono.vl`, each of which would re-classify a function the prefix already covers — so each
+calls `buildFnMapNoteFnSlotWrite()` and `tests/vl_mono_arena_tick_test.ts` gained a third rule
+that requires it, validated against its own control and against a live one (deleting the note
+at `emit_mono.vl:3554` makes the suite name that line). The rule also covers `.fnRet =` and
+`.fnName =`, which have no site in `emit_mono.vl` today — the fifteen `fn.fnRet =` writes are
+`synthRetAnnots`' in `emit_rewrite.vl`, outside the armed window, and the two `.fnName =` are
+the module merge and `collectFns`' lambda naming, both earlier. That arm is forward-guarding,
+and it is there because a `monoArenaTouch()` is NOT a substitute for the note: the bump makes
+`monoRebuild` RUN, and a run whose prefix is still armed re-seeds the stale row.
+
+The `Param` writes and the four callee renames are the ones this pass does NOT care about: it
+reads no parameter and no call node. Nor does it need `T.tys` or `nodeTyIx` in the predicate:
+the tree has **zero** in-place `T.tys[…] =` writes, and the only in-place `nodeTyIx` write
+during emit is `nodeTyCarry`, called twice from `emit_rewrite.vl` and never from the armed
+window. The resume is armed by `monoRebuild` alone, for B7's reason, and unarmed everywhere
+else — so only a run inside that window banks a prefix.
+
+**Measured on 4b0af3a47**, `--names` seed both arms, min of five interleaved, box load 24–38:
+
+| | 200 pins | 400 pins | 800 pins |
+| --- | ---: | ---: | ---: |
+| master, CPU seconds | 0.170 s | 0.380 s | 1.150 s |
+| after, CPU seconds | 0.170 s | 0.330 s | **0.890 s** |
+| master, wall clock | — | — | 0.844 s |
+| after, wall clock | — | — | **0.661 s** |
+
+At 800 pins `buildFnMap` goes **18.58 – 20.38% inclusive → 0.25 – 1.58%** and `monoRebuild`
+**20.65 – 22.61% → 2.75 – 3.44%**, of which `buildFnMap` is 1.45, `collectA` 1.05,
+`computeVoidFns` 0.39 and `computeRetInference` 0.13 — the pass table's four rows now cost
+about the same as each other. Guest samples at 800 pins fall 1,011 – 1,181 to 760 – 801.
+The `generic pins` axis reads **0.80 – 1.06 against master's 0.88 – 1.20** over five
+interleaved rounds; both arms clamp on the harness's 0.4 s floor at 400 pins, so the bar STAYS
+at 2.5 — below the family default would be a bar on noise, not on a shape.
+
+**The self-compile is a wash, and the reason is worth recording**: `monoRebuild` is **0.00% of
+the compiler compiling itself** — the compiler's own generics mint few enough instances that
+the pass never repeats. So the L2 CPU reads 4.97 – 6.38 s against 4.93 – 6.26 s over five
+interleaved rounds, which is load, not signal, and the fixpoint proves nothing about the
+resume. What DOES exercise it is `tests/cases`: an `emitFail` probe on the resume branch
+(validated both ways — it fires on the many arm, is silent on the one arm and on the compiler)
+says **167 of the 2,983 modules take the resume**, across generics 59, functions 24, std 16,
+soundness 12, closures 11, inference 9 and six more directories. All 167 are byte-identical
+under both seeds.
+
+What is left at 800 pins: `__str_eq__` 15.36% self, `recordRedundantAnnot` 11.61% self (11.86%
+inclusive), `numLexIsFloat` 2.75%, `sidOfNode` 2.25%. `recordRedundantAnnot` is now the largest
+named frame and it is not in `monoRebuild` at all.
 
 ---
 
@@ -485,10 +586,7 @@ in it, and the type arena is still keyed on rendered names.
 
 Two smaller findings from the same measurement, named here rather than lost:
 
-* **An edit followed by a hover pays TWO whole-graph checks.** `check()` runs `checkSrc` —
-  it alone runs the deep-`is` second pass, so it reports a diagnostic the symbol check does
-  not — and clears the memo's `checked` flag; the hover then runs `checkSrcSym`. One call
-  serving both needs that second pass moved, not the memo changed.
+* **An edit followed by a hover was TWO whole-graph checks** — closed in §C2d.
 * **`checkSrcSym` records occurrences for all 30 modules** and the editor asks about one.
 
 ### C2c · The staging half, and the cache that was already there
@@ -549,6 +647,53 @@ than the 60 ms `push` column because a skipped commit also skips the guest's own
 105, five interleaved rounds read 892 / 656 / 1,303 / 834 / 1,947 ms against 820 / 1,569 /
 698 / 541 / 1,046 — the timing is buried, while `30 → 1 pushed, 29 cached` reproduces on
 every round. Quote the counts wherever the box is not quiet.
+
+### C2d · The edit and the hover after it, on one check
+
+A keystroke makes four requests and they were paying three whole-graph checks:
+
+| case | arm | change | +hover | +tokens | +inlay | burst |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| any of 1 / 4 / 30 modules | before | 1 | **1** | 0 | 1 | **3** |
+| any of 1 / 4 / 30 modules | after | 1 | **0** | 0 | 1 | **2** |
+
+Two things were in the way, and neither is the memo.
+
+**The entries disagreed about diagnostics.** `checkSrc` ran the deep-`is` second pass on the
+single-source path and `checkSrcSym` did not, so the diagnostics pass could not ride the
+symbol-aware check — a program whose only error is a walker the rewrite cannot route would
+have published clean. The module pipeline always ran the pass for both, so this was a
+single-source-only split; `checkSrcSym` now runs it there too. Over `tests/cases`, master's
+two entries disagree on **1 of 2,786** programs and this branch's on **0** — the corpus
+already carried the witness (`unions/error-deep-is-arm-rebinds-receiver.vl`). The host gates
+on a `checkSymDiagsComplete` probe, because diagnostics is the one surface that may not
+degrade against an older seed.
+
+**And the check ran FIRST of the three.** `onDidChangeContent` also runs `lint` (a parse-only
+pass over the same instance) and the unused-export hints' `moduleSurface` (which resets the
+module table); each discards a checked graph, so whatever the check left was gone before the
+hover asked. `server.ts` runs the check LAST.
+
+`scripts/perf/lsp-keystroke.ts`'s PAIR section times both orders. Both arms in one process,
+rounds interleaved, medians of 5 at load 96 → 68:
+
+| case | before | after | speedup | checks |
+| --- | ---: | ---: | ---: | --- |
+| 1 module | 0.7 ms | 0.8 ms | 0.97x | 2 → **1** |
+| 4 modules (std) | 39.6 ms | 21.6 ms | 1.83x | 2 → **1** |
+| `compiler/entry.vl` (30) | **3,372 ms** | **2,005 ms** | **1.68x** | 2 → **1** |
+
+The speedup is under 2x because a symbol-aware check is not free: staged identically,
+`checkSrcSym` is **1.8–2.0x** `checkSrc` on the 30-module graph, which is §C2b's other finding
+(occurrences recorded for all 30 modules) priced. Before was one of each, after is one
+symbol-aware check. Two earlier runs of the same ladder read 1.21x at load 15 → 81 and 1.43x
+at load 89 → 62; the count is the robust half.
+
+**The second pass leaked its generated code into every query family, and had since the module
+pipeline shipped.** It splices walkers onto the token stream and re-checks with the symbol
+table on, so an 8-line file reported **29 semantic tokens and 10 inlay hints past its own end**
+and offered `__vlJsonIs_0` and friends as completions. An occurrence at a generated token is
+now never recorded — the rule the style tier already applied through `jwTokIsGenerated`.
 
 ---
 
