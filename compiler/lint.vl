@@ -61,13 +61,14 @@ import { OP_INDEX_GET, OP_INDEX_SET, opDeclLabel, opDeclOpOf } from "./ast"
 
 // Parallel arrays, mirroring the native checker's `T.diags` shape but kept as module
 // globals. Each entry is one diagnostic: its code, human message, severity, and a
-// single-point source position — the anchor token's line and col, since the AST
-// carries no full span.
+// one-line source span `[col, end)` — the anchor token's column and the column after
+// it, unless the rule named a wider subject.
 let lintCodes: string[] = []
 let lintMsgs: string[] = []
 let lintSevs: string[] = []
 let lintLines: i32[] = []
 let lintCols: i32[] = []
+let lintEnds: i32[] = []
 
 export function lintReset() {
   lintCodes = []
@@ -75,6 +76,7 @@ export function lintReset() {
   lintSevs = []
   lintLines = []
   lintCols = []
+  lintEnds = []
   0
 }
 
@@ -84,58 +86,76 @@ export function lintMsgAt(i: i32) { lintMsgs[i] }
 export function lintSevAt(i: i32) { lintSevs[i] }
 export function lintLineAt(i: i32) { lintLines[i] }
 export function lintColAt(i: i32) { lintCols[i] }
+export function lintEndAt(i: i32) { lintEnds[i] }
 
 // The anchor token of arena node `ix` — its last consumed token, since the AST has no
-// full span. `lintLineOf` / `lintColOf` read its source position, falling back to 0
-// on an out-of-range index (the same bounds-check contract as `tErr`).
-function lintLineOf(ix: i32) {
+// full span — or -1 when the index names no token. The three readers below take that
+// -1 and answer with a position of 0 and a width of 1 (the `tErr` bounds contract).
+function lintAnchorTok(ix: i32) {
   if ix >= 0 && ix < nodeToks.length {
     const tk = nodeToks[ix]
-    if tk >= 0 && tk < P.toks.length { return P.toks[tk].line }
+    if tk >= 0 && tk < P.toks.length { return tk }
   }
-  0
+  -1
 }
-function lintColOf(ix: i32) {
-  if ix >= 0 && ix < nodeToks.length {
-    const tk = nodeToks[ix]
-    if tk >= 0 && tk < P.toks.length { return P.toks[tk].col }
-  }
-  0
+function lintTokLine(tk: i32) {
+  if tk < 0 { return 0 }
+  P.toks[tk].line
+}
+function lintTokCol(tk: i32) {
+  if tk < 0 { return 0 }
+  P.toks[tk].col
 }
 
-// Append one diagnostic, positioned at arena node `at`'s anchor token.
+// The width of token `tk`'s lexeme on its own line — the span a token-anchored
+// diagnostic covers. A span is one line by construction, so a lexeme carrying a
+// newline (a template literal) is cut at the first one.
+function lintTokWidth(tk: i32) {
+  if tk < 0 { return 1 }
+  const t = P.toks[tk].text
+  let i = 0
+  while i < t.length {
+    if t[i] == '\n' { return i }
+    i = i + 1
+  }
+  t.length
+}
+
+// Append one diagnostic spanning arena node `at`'s anchor token. The arena carries no
+// full span, so the anchor's lexeme is the widest honest subject available here.
 function lintEmit(code: string, msg: string, sev: string, at: i32) {
-  lintEmitAtPos(code, msg, sev, lintLineOf(at), lintColOf(at))
+  lintEmitAtTok(code, msg, sev, lintAnchorTok(at))
 }
 
-// Append one diagnostic at an explicit 1-based line / 0-based col. The base
-// emitter: the two above derive their position and land here.
-function lintEmitAtPos(
+// Append one diagnostic spanning `[co, endCo)` on the 1-based line `ln`. The base
+// emitter: every other one lands here. An `endCo` at or before `co` normalises to the
+// one-column anchor, so a caller with no span to give need not compute one.
+function lintEmitAtSpan(
   code: string,
   msg: string,
   sev: string,
   ln: i32,
   co: i32,
+  endCo: i32,
 ) {
   lintCodes.push(code)
   lintMsgs.push(msg)
   lintSevs.push(sev)
   lintLines.push(ln)
   lintCols.push(co)
+  let e = endCo
+  if e < co + 1 { e = co + 1 }
+  lintEnds.push(e)
   0
 }
 
-// Append one diagnostic positioned directly at token index `tk`, for a rule whose
-// point is not the node's anchor — a declaration's name token, or the `let` keyword
-// the prefer-const fix rewrites.
+// Append one diagnostic spanning token index `tk`, for a rule whose subject is one
+// token — a declaration's name, or the `let` keyword the prefer-const fix rewrites.
 function lintEmitAtTok(code: string, msg: string, sev: string, tk: i32) {
-  let ln = 0
-  let co = 0
-  if tk >= 0 && tk < P.toks.length {
-    ln = P.toks[tk].line
-    co = P.toks[tk].col
-  }
-  lintEmitAtPos(code, msg, sev, ln, co)
+  let t = tk
+  if t >= P.toks.length { t = -1 }
+  const co = lintTokCol(t)
+  lintEmitAtSpan(code, msg, sev, lintTokLine(t), co, co + lintTokWidth(t))
 }
 
 // True when `name` is the language's "intentionally unused" marker (leading `_`).
@@ -2262,15 +2282,26 @@ function cbHistLine(s: string, a: i32, b: i32): string {
 // Report one finished block's length and its uncited measurement. All four codes are
 // `warning`; `scripts/lint-self.sh` holds each out of its own `info` gate while the
 // ratchet baseline still owes it.
-function cbReport(n: i32, ln: i32, co: i32, meas: i32, cited: i32, hdr: i32) {
+function cbReport(
+  s: string,
+  n: i32,
+  ln: i32,
+  co: i32,
+  meas: i32,
+  cited: i32,
+  hdr: i32,
+) {
   let cap = cbBudget
   let what = "comment block of "
   if hdr == 1 {
     cap = cbHeaderBudget
     what = "module header of "
   }
+  // The span is the block's first line, not its whole run: a span is one line, and the
+  // first line is where the block is read from.
+  const endCo = klLineEndCol(s, ln)
   if n > cap {
-    lintEmitAtPos(
+    lintEmitAtSpan(
       "comment-block-too-long",
       what +
         txNumStr(n) +
@@ -2280,15 +2311,17 @@ function cbReport(n: i32, ln: i32, co: i32, meas: i32, cited: i32, hdr: i32) {
       "warning",
       ln,
       co,
+      endCo,
     )
   }
   if meas == 1 && cited == 0 {
-    lintEmitAtPos(
+    lintEmitAtSpan(
       "comment-measurement-uncited",
       "a comment states a measurement but cites no inventory row or DECISIONS section — a comment is never re-graded; put the number in a row and cite it (docs/internals/comment-style.md rule 1)",
       "warning",
       ln,
       co,
+      endCo,
     )
   }
   0
@@ -2337,19 +2370,20 @@ function commentBudget() {
       }
       if shouted == 0 && cbShoutLine(s, k, le) {
         shouted = 1
-        lintEmitAtPos(
+        lintEmitAtSpan(
           "comment-shouting",
           "a comment line shouts — two or more words in capitals in a row; put identifiers in backticks and ordinary words in lower case (docs/internals/comment-style.md rule 5)",
           "warning",
           line,
           k - i,
+          klLineEndCol(s, line),
         )
       }
       if told == 0 {
         const w = cbHistLine(s, k, le)
         if w.length > 0 {
           told = 1
-          lintEmitAtPos(
+          lintEmitAtSpan(
             "comment-history",
             "a comment line narrates history (\"" +
               w +
@@ -2357,6 +2391,7 @@ function commentBudget() {
             "warning",
             line,
             k - i,
+            klLineEndCol(s, line),
           )
         }
       }
@@ -2364,7 +2399,7 @@ function commentBudget() {
       if n > 0 {
         const hdr = txIsHeader(region, headerTaken)
         if hdr == 1 { headerTaken = 1 }
-        cbReport(n, blockLine, blockCol, meas, cited, hdr)
+        cbReport(s, n, blockLine, blockCol, meas, cited, hdr)
         n = 0
         meas = 0
         cited = 0
@@ -2378,6 +2413,7 @@ function commentBudget() {
   }
   if n > 0 {
     cbReport(
+      s,
       n,
       blockLine,
       blockCol,
@@ -2480,6 +2516,7 @@ function scaLineTell(s: string, a: i32, b: i32): string {
 // Report one finished block. `hdr` = it is the module header; `isExp` = the next
 // declaration is an `export`, so the block documents one.
 function scaReport(
+  s: string,
   n: i32,
   ln: i32,
   co: i32,
@@ -2488,8 +2525,11 @@ function scaReport(
   hdr: i32,
   isExp: i32,
 ) {
+  // Each clause spans one comment line: the block's first for the two budgets, and the
+  // line carrying the tell for the third, which is the line to rewrite.
+  const endCo = klLineEndCol(s, ln)
   if hdr == 1 && n > scaHeaderBudget {
-    lintEmitAtPos(
+    lintEmitAtSpan(
       "std-comment-audience",
       "a std module header of " +
         txNumStr(n) +
@@ -2499,10 +2539,11 @@ function scaReport(
       "warning",
       ln,
       co,
+      endCo,
     )
   }
   if hdr == 0 && isExp == 1 && n > scaDocBudget {
-    lintEmitAtPos(
+    lintEmitAtSpan(
       "std-comment-audience",
       "a std doc comment of " +
         txNumStr(n) +
@@ -2512,10 +2553,11 @@ function scaReport(
       "warning",
       ln,
       co,
+      endCo,
     )
   }
   if tell.length > 0 {
-    lintEmitAtPos(
+    lintEmitAtSpan(
       "std-comment-audience",
       "a std comment cites " +
         tell +
@@ -2523,6 +2565,7 @@ function scaReport(
       "warning",
       tellLine,
       co,
+      klLineEndCol(s, tellLine),
     )
   }
   0
@@ -2555,7 +2598,7 @@ function stdCommentAudience() {
       // A new block starting while one is pending settles the pending one: what
       // follows it is a comment, not a declaration.
       if pend == 1 {
-        scaReport(n, blockLine, blockCol, tell, tellLine, pendHdr, 0)
+        scaReport(s, n, blockLine, blockCol, tell, tellLine, pendHdr, 0)
         pend = 0
         n = 0
         tell = ""
@@ -2582,7 +2625,7 @@ function stdCommentAudience() {
         if pend == 1 {
           let isExp = 0
           if txAt(s, k, le, "export ") { isExp = 1 }
-          scaReport(n, blockLine, blockCol, tell, tellLine, pendHdr, isExp)
+          scaReport(s, n, blockLine, blockCol, tell, tellLine, pendHdr, isExp)
           pend = 0
           n = 0
           tell = ""
@@ -2595,7 +2638,7 @@ function stdCommentAudience() {
   // A file with no trailing newline can end inside a block the loop never closed.
   if pend == 0 && n > 0 { pendHdr = txIsHeader(region, headerTaken) }
   if pend == 1 || n > 0 {
-    scaReport(n, blockLine, blockCol, tell, tellLine, pendHdr, 0)
+    scaReport(s, n, blockLine, blockCol, tell, tellLine, pendHdr, 0)
   }
   0
 }
@@ -2615,6 +2658,10 @@ function stdCommentAudience() {
 // This reads the source text, not the arena, so it knows the compiler's own tables by
 // spelling: a user program naming a binding `sNames` and looping to its length reads
 // as a hit. The tree this polices is this one, and the names below are distinctive.
+
+// The width of the `.length` an `asTables` entry is matched with, so the span of a
+// reported `while` head can run past the bound rather than stopping at the table name.
+const LEN_DOT_LENGTH = 7
 
 // The whole-program tables: the AST arena and the module-wide registries. Each grows
 // with the program, so a loop bounded by one of them walks the program.
@@ -2691,6 +2738,11 @@ function asTableAt(s: string, i: i32, b: i32) {
   ""
 }
 
+// The byte offset just past the bound of the `while` head `asWhileVarOf` last
+// ACCEPTED — the end of the span the finding highlights. Meaningless after a decline,
+// so read it only where that call returned a name.
+let asWhileEnd = 0
+
 // `while <v> < <table>.length` — the induction variable, or "" when the line is not
 // one. A grow loop (`while xs.length < P.nodes.length { push }`) has no bare
 // identifier here and so is never a hit: it appends, it does not rescan.
@@ -2702,7 +2754,11 @@ function asWhileVarOf(s: string, k: i32, b: i32) {
   if p >= b { return "" }
   if s[p] != '<' { return "" }
   p = txSpacesEnd(s, p + 1, b)
-  if asTableAt(s, p, b).length == 0 { return "" }
+  const t = asTableAt(s, p, b)
+  if t.length == 0 { return "" }
+  // `asTableAt` matched the table name AND the `.length` after it; the span ends past
+  // both, so the highlight covers the whole bound and not just the table.
+  asWhileEnd = p + t.length + LEN_DOT_LENGTH
   v
 }
 
@@ -2755,7 +2811,7 @@ function arenaScanLint() {
           !txListHas(asPasses, fnName) &&
           !txListHas(asAllow, fnName)
         ) {
-          lintEmitAtPos(
+          lintEmitAtSpan(
             "arena-scan-outside-pass",
             "`" +
               fnName +
@@ -2763,6 +2819,7 @@ function arenaScanLint() {
             "warning",
             line,
             k - i,
+            asWhileEnd - i,
           )
         }
       }
@@ -3118,6 +3175,32 @@ function klSkipLit(s: string, i: i32, b: i32) {
 
 // Where the line's code ends: at its `//` comment, or at `b`. A `//` inside a literal
 // is text, not a comment, which is why this walks rather than searching.
+// `[a, b)` with its trailing blanks cut, so an underline stops at the last character
+// rather than running through the gap before a trailing comment.
+function klTrimEnd(s: string, a: i32, b: i32) {
+  let e = b
+  while e > a && (s[e - 1] == ' ' || s[e - 1] == '\t') { e = e - 1 }
+  e
+}
+
+// The end column of 1-based line `ln` — `klCodeEndCol` to the end of its code,
+// `klLineEndCol` to the end of the line itself, which is what a comment line has. Both
+// answer 0 for a line the shared index does not hold, and the span emitter widens that
+// back to the one-column anchor.
+function klCodeEndCol(s: string, ln: i32) {
+  const k = ln - 1
+  if k < 0 || k >= klLnStart.length { return 0 }
+  const a = klLnStart[k]
+  klTrimEnd(s, a, klCodeEnd(s, a, klLnEnd[k])) - a
+}
+
+function klLineEndCol(s: string, ln: i32) {
+  const k = ln - 1
+  if k < 0 || k >= klLnStart.length { return 0 }
+  const a = klLnStart[k]
+  klTrimEnd(s, a, klLnEnd[k]) - a
+}
+
 function klCodeEnd(s: string, a: i32, b: i32) {
   let i = a
   while i < b {
@@ -3470,6 +3553,7 @@ let klLadMemAt: i32[] = []
 let klLadMemN: i32[] = []
 let klLadLine: i32[] = []
 let klLadCol: i32[] = []
+let klLadEnd: i32[] = []
 let klLadLast: i32[] = []
 
 // Per-function scratch: one group per (subject, member kind), its arms appended to
@@ -3560,15 +3644,20 @@ function klRecordLadder(s: string, f: i32, g: i32) {
     return 0
   }
   const total = klSetMembers(si).length
+  const endCo = klCodeEndCol(s, klGFirst[g] + 1)
   klLadFn.push(f)
   klLadSet.push(si)
   klLadMemAt.push(at)
   klLadMemN.push(n)
   klLadLine.push(klGFirst[g] + 1)
   klLadCol.push(klGCol[g])
+  klLadEnd.push(endCo)
   klLadLast.push(klGLast[g])
   if !klTailNames(s, klGLast[g], klFnHi[f]) {
-    lintEmitAtPos(
+    // The span is the ladder's first arm line, not the function the message names: a
+    // function may carry several ladders, so its header cannot separate two findings,
+    // and the fix — a missing arm, or a default naming the rest — is written here.
+    lintEmitAtSpan(
       "kind-ladder-incomplete",
       "`" +
         klFnName[f] +
@@ -3582,6 +3671,7 @@ function klRecordLadder(s: string, f: i32, g: i32) {
       "warning",
       klGFirst[g] + 1,
       klGCol[g],
+      endCo,
     )
   }
   0
@@ -3647,7 +3737,7 @@ function klGradePair(s: string, x: i32, y: i32) {
   if !klBodyCalls(s, fy, klFnName[fx]) { return 0 }
   const drops = klArmsMissing(x, y)
   if drops.length == 0 { return 0 }
-  lintEmitAtPos(
+  lintEmitAtSpan(
     "kind-ladder-split",
     "`" +
       klFnName[fx] +
@@ -3666,6 +3756,7 @@ function klGradePair(s: string, x: i32, y: i32) {
     "warning",
     klLadLine[x],
     klLadCol[x],
+    klLadEnd[x],
   )
   1
 }
@@ -3706,6 +3797,7 @@ function kindLadderLint() {
   klLadMemN = []
   klLadLine = []
   klLadCol = []
+  klLadEnd = []
   klLadLast = []
   klEnsureIndex(s)
   let f = 0
@@ -4258,6 +4350,7 @@ function siReport(
   text: string,
   ln: i32,
   co: i32,
+  endCo: i32,
 ) {
   let code = "sentinel-index-unguarded"
   if kind == 1 && text.length >= 6 {
@@ -4265,7 +4358,7 @@ function siReport(
       code = "sentinel-index-strict-untested"
     }
   }
-  lintEmitAtPos(
+  lintEmitAtSpan(
     code,
     "`" +
       table +
@@ -4281,15 +4374,22 @@ function siReport(
     "warning",
     ln,
     co,
+    endCo,
   )
   0
 }
 
 // ── pass 3: the walk ─────────────────────────────────────────────────────────
-// One table read, graded. The index is sentinel-bearing when it is a hole field path,
-// a local last bound from a call or a hole field, or — inside a reader, past that
-// function's first `return` — one of its own `i32` parameters.
-function siGradeRead(table: string, idx: string, line: i32, col: i32) {
+// One read, graded, and spanned over the whole `<table>[<idx>]` it is about. The index
+// is sentinel-bearing when it is a hole field path, a local last bound from a call or a
+// hole field, or — inside a reader, past its first `return` — one of its parameters.
+function siGradeRead(
+  table: string,
+  idx: string,
+  line: i32,
+  col: i32,
+  endCol: i32,
+) {
   let base = table
   const dot = siFieldOf(table)
   if dot.length > 0 { base = table.slice(0, table.length - dot.length - 1) }
@@ -4298,18 +4398,18 @@ function siGradeRead(table: string, idx: string, line: i32, col: i32) {
   if siHas(siGuarded, idx) { return 0 }
   const fld = siFieldOf(idx)
   if fld.length > 0 {
-    if siHas(siHoleF, fld) { siReport(table, idx, 2, idx, line, col) }
+    if siHas(siHoleF, fld) { siReport(table, idx, 2, idx, line, col, endCol) }
     return 0
   }
   const k = siPIx[idx] ?? -1
   if k >= 0 {
     if siPKind[k] == 1 || siPKind[k] == 2 {
-      siReport(table, idx, siPKind[k], siPText[k], line, col)
+      siReport(table, idx, siPKind[k], siPText[k], line, col, endCol)
     }
     return 0
   }
   if siReturned && siHas(siParams, idx) {
-    siReport(table, idx, 3, idx, line, col)
+    siReport(table, idx, 3, idx, line, col, endCol)
   }
   0
 }
@@ -4355,8 +4455,9 @@ function siGradeFn(s: string, f: i32) {
               const j = txSpacesEnd(s, i + table.length + 1, e)
               const idx = siPathAt(s, j, e)
               if idx.length > 0 {
-                if txCharOr(s, txSpacesEnd(s, j + idx.length, e), e) == ']' {
-                  siGradeRead(table, idx, ln + 1, i - a)
+                const rb = txSpacesEnd(s, j + idx.length, e)
+                if txCharOr(s, rb, e) == ']' {
+                  siGradeRead(table, idx, ln + 1, i - a, rb + 1 - a)
                 }
               }
             }

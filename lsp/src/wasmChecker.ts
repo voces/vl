@@ -1780,9 +1780,11 @@ export const createWasmChecker = (
       ? s
       : "warning";
 
-  // The lint pass reports a start line/col but no end column. Widen to the
-  // identifier (or, failing that, one char) starting at `col` on `line` so the
-  // squiggle is visible and a quick-fix range overlaps the cursor.
+  // A seed that predates `lintEnd` reports a start line/col and no end, so the host
+  // guesses: widen to the identifier (or one char) starting at `col` on `line`, so the
+  // squiggle is visible and a quick-fix range overlaps the cursor. A current seed
+  // carries each rule's own span and this is not consulted — the guess and the CLI's
+  // `col + 1` were two different answers, neither of them the rule's.
   const wordEndCol = (source: string, line: number, col: number): number => {
     const lines = source.split("\n");
     const text = lines[line] ?? "";
@@ -1834,7 +1836,16 @@ export const createWasmChecker = (
       const col = exp.lintCol(i); // 0-based
       const lspLine = line > 0 ? line - 1 : 0;
       const startChar = line > 0 ? col : 0;
-      const endChar = line > 0 ? wordEndCol(source, lspLine, col) : 0;
+      // The rule's own span, exclusive, when the seed carries one (`lintEnd`); an
+      // older seed falls back to the identifier guess above.
+      const ruleEnd = typeof exp.lintEnd === "function"
+        ? exp.lintEnd(i)
+        : undefined;
+      const endChar = line <= 0
+        ? 0
+        : ruleEnd !== undefined && ruleEnd > col
+        ? ruleEnd
+        : wordEndCol(source, lspLine, col);
       out.push({
         message,
         severity: asSeverity(sev),
