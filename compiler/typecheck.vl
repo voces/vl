@@ -185,6 +185,9 @@ import {
   symOccIsDecl,
   symOccTok,
   symOccTy,
+  symRefCursorCol,
+  symRefCursorLine,
+  symRefOcc,
   symVisEC,
   symVisEL,
   symVisKind,
@@ -1725,21 +1728,51 @@ function flushUninferred(depth: i32) {
 // written on every preceding path is a "used before it is assigned" error. `daLive` is the live
 // set of binding ids still un-written on the current path, forked and joined explicitly at
 // `if`/`else` and loops; `daWriteTarget` exempts a plain-`=` left-hand ident.
-const daLive: i32[] = []
-// `daPos` is `daLive`'s sid-keyed inverse: the id's index in `daLive`, or -1 when it is assigned.
-// Membership, add and mark are one array read each, so a module whose pass-1 dead zone holds
-// every top-level binding is linear in them rather than quadratic.
+let daLive: i32[] = []
+// `daPos` is `daLive`'s sid-keyed inverse: the id's index in `daLive`, or -1 when it is assigned,
+// and `daGen` the frame generation that index belongs to. A row an enclosing frame (or an earlier
+// check) wrote reads as absent on its generation alone, so opening a frame costs nothing per
+// entry — which is what keeps a function body off the module's whole dead zone.
 const daPos: i32[] = []
+const daGen: i32[] = []
+// Every generation is minted from `daGenSeq`, which only ever rises, so two SIBLING frames
+// never share one — a row the first left behind cannot read as live inside the second.
+let daGenSeq = 1
+let daCurGen = 1
 let daWriteTarget = -1
+// The frame stack: each entry is the generation `daEnterFrame` displaced and the shadow log's
+// height at that moment. The enclosing live SET travels through the caller (`daEnterFrame`
+// returns it), so the stack itself stays flat.
+let daFrameGen: i32[] = []
+let daFrameShadow: i32[] = []
+// Rows an inner frame's add overwrote while they belonged to an enclosing frame, oldest first.
+// That is the only state a frame can damage, and it is what `daLeaveFrame` puts back.
+let daShadowSid: i32[] = []
+let daShadowPos: i32[] = []
+let daShadowGen: i32[] = []
 
-// True if the interned id `sid` is currently in the live unassigned set.
-function daIsUnassignedSid(sid: i32) { sidArrGet(daPos, sid) >= 0 }
+// True if the interned id `sid` is currently in the live unassigned set. A row from another
+// generation is not in it, whatever index it holds.
+function daIsUnassignedSid(sid: i32) {
+  if sidArrGet(daGen, sid) != daCurGen { return false }
+  sidArrGet(daPos, sid) >= 0
+}
 
 // Mark the interned id `sid` unassigned on the current path.
 function daAddSid(sid: i32) {
   if sid < 0 { return 0 }
-  if sidArrGet(daPos, sid) >= 0 { return 0 }
+  if daIsUnassignedSid(sid) { return 0 }
+  // Inside a frame the row may still be an enclosing one's; bank it before overwriting.
+  if daFrameGen.length > 0 {
+    const prev = sidArrGet(daPos, sid)
+    if prev >= 0 {
+      daShadowSid.push(sid)
+      daShadowPos.push(prev)
+      daShadowGen.push(sidArrGet(daGen, sid))
+    }
+  }
   sidArrPut(daPos, sid, daLive.length)
+  sidArrPut(daGen, sid, daCurGen)
   daLive.push(sid)
   0
 }
@@ -1751,8 +1784,11 @@ function daAdd(name: string) { daAddSid(sidOf(name)) }
 // into its slot. Order is unobservable: nothing reads the set except as a membership test and as
 // a snapshot fed back through `daAddSid`.
 function daMarkAssignedSid(sid: i32) {
+  if !daIsUnassignedSid(sid) { return 0 }
+  // Membership already said the slot is this frame's; the bound test is the standing rule for
+  // an index a reader can answer out of band (D1440).
   const at = sidArrGet(daPos, sid)
-  if at < 0 { return 0 }
+  if at < 0 || at >= daLive.length { return 0 }
   const moved = daLive[daLive.length - 1]
   daLive[at] = moved
   sidArrPut(daPos, moved, at)
@@ -1769,8 +1805,8 @@ function daMarkAssigned(name: string) {
   daMarkAssignedSid(sidOf(name))
 }
 
-// Empty the live set in place; it never reassigns the global reference. Clearing through
-// `daLive` restores `daPos` to all -1, which is what makes the column safe across a `sidReset`.
+// Empty the live set of the current frame, in place. Every row leaves through `daLive`, so
+// `daPos` ends at -1 for exactly the ids this frame holds and for no others.
 function daClear() {
   // The self-host emitter lowers `.pop()` (and `.length`) as statements but not
   // `.clear()`, so empty the array in place by popping until empty.
@@ -1778,6 +1814,54 @@ function daClear() {
     sidArrPut(daPos, daLive[daLive.length - 1], -1)
     daLive.pop()
   }
+  0
+}
+
+// Start a check with an empty dead zone and no open frame. The generation bump is what makes
+// the sid-keyed columns safe across a `sidReset`: a row an earlier check left behind carries an
+// older generation, so a recycled id reads as absent rather than as that row.
+function daResetForCheck() {
+  daLive = []
+  daFrameGen = []
+  daFrameShadow = []
+  daShadowSid = []
+  daShadowPos = []
+  daShadowGen = []
+  daGenSeq = daGenSeq + 1
+  daCurGen = daGenSeq
+  0
+}
+
+// Open a nested flow context: the enclosing dead zone is set aside whole and the body checks
+// against an empty one, so a body costs its own uninitialized bindings and not the module's.
+// Returns the enclosing live set, to hand back to `daLeaveFrame`.
+function daEnterFrame() {
+  const saved = daLive
+  daFrameGen.push(daCurGen)
+  daFrameShadow.push(daShadowSid.length)
+  daGenSeq = daGenSeq + 1
+  daCurGen = daGenSeq
+  daLive = []
+  saved
+}
+
+// Close the frame `daEnterFrame` opened, restoring `saved` as the live set. Only rows an inner
+// add overwrote need putting back, replayed newest first so the oldest banked value — the one
+// the enclosing frame wrote — is the one that stands.
+function daLeaveFrame(saved: i32[]) {
+  const base = daFrameShadow[daFrameShadow.length - 1]
+  daFrameShadow.pop()
+  while daShadowSid.length > base {
+    const j = daShadowSid.length - 1
+    sidArrPut(daPos, daShadowSid[j], daShadowPos[j])
+    sidArrPut(daGen, daShadowSid[j], daShadowGen[j])
+    daShadowSid.pop()
+    daShadowPos.pop()
+    daShadowGen.pop()
+  }
+  daCurGen = daFrameGen[daFrameGen.length - 1]
+  daFrameGen.pop()
+  daLive = saved
   0
 }
 
@@ -1793,7 +1877,8 @@ function daCheckRead(name: string, at: i32) {
   0
 }
 
-// Snapshot the live unassigned set (a copy of its ids), for forking and joining paths.
+// Snapshot the live unassigned set (a copy of its ids), for forking and joining paths WITHIN a
+// frame — an `if`'s two arms, a loop body. A whole nested context takes `daEnterFrame` instead.
 function daSnapshot() {
   const snap: i32[] = []
   let i = 0
@@ -3208,7 +3293,7 @@ export function initChecker() {
   fnSawValueRet = false
   retNatural = -1
   retNaturalErr = false
-  daClear()
+  daResetForCheck()
   daWriteTarget = -1
   inferStack = []
   inferObserved = -1
@@ -3324,6 +3409,10 @@ export function initChecker() {
   symOccTy = []
   // Token-membership set mirroring `symOccTok` — reset in lockstep (see `symOccHasTok`).
   symOccTokSet = Map()
+  // Find-references' filled result column indexes `symOccTok`, so it is dropped with it.
+  symRefOcc = []
+  symRefCursorLine = -1
+  symRefCursorCol = -1
   symDeclScope = []
   symBindNode = []
   symBindType = []
@@ -22184,9 +22273,9 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   }
   // Definite-assignment: a function body is its own flow context — it runs at call time,
   // not at the declaration site, so a nested function capturing an outer still-unassigned
-  // `let x` must not be flagged (the call may happen after `x` is written). Saves and clears the live unassigned set for the body, then restores the enclosing path.
-  const daSavedUnassigned = daSnapshot()
-  daClear()
+  // `let x` must not be flagged (the call may happen after `x` is written). The body checks in
+  // its own frame, against an empty live set; `daLeaveFrame` restores the enclosing path.
+  const daSavedUnassigned = daEnterFrame()
   const savedRet = T.curRet
   T.curRet = ret
   // D1045: the name the nominal-escape refusal puts in its sentence. An anonymous
@@ -22376,7 +22465,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   T.curRet = savedRet
   curFnEscName = savedEscName
   curFnBareRetVoid = savedBareRetVoid
-  daRestore(daSavedUnassigned)
+  daLeaveFrame(daSavedUnassigned)
   let tpPop = 0
   while tpPop < n.fnTyParams.length {
     tpEnvNames.pop()
