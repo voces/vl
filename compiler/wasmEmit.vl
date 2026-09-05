@@ -214,6 +214,7 @@ import {
   fa32Used,
   fa64TypeIdx,
   fa64Used,
+  fcpSpillSlot,
   fl32TypeIdx,
   fl64TypeIdx,
   fnListCatKinds,
@@ -480,6 +481,7 @@ import {
   binEqVariantRow,
   binMixHardF64,
   callIsArrSlice,
+  callSpillsFcpArg,
   calleeReturnsVoid,
   capComputeNamesOf,
   captureCountOf,
@@ -13447,23 +13449,32 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
             "emitProgram: fromCodePoints takes exactly one argument",
           )
         }
-        let fcpArg = c.callArgs[0]
-        const fcpN0 = P.nodes[fcpArg]
-        if fcpN0 is Paren { fcpArg = fcpN0.parInner }
-        const fcpNode = P.nodes[fcpArg]
-        if fcpNode is Ident {
-          // __utf8_enc__(xs.backing, 0, xs.len)
+        const fcpA0 = c.callArgs[0]
+        // An unbound argument slot takes `emitExpr`'s own hole refusal: `unwrapParen` would
+        // read `P.nodes[-1]` and trap the compiler before any diagnostic printed.
+        if fcpA0 < 0 { return emitExpr(body, fcpA0, fnIx) }
+        const fcpArg = unwrapParen(fcpA0)
+        // __utf8_enc__(xs.backing, 0, xs.len) — two reads of one list. A bare name is
+        // re-readable, so it is emitted twice and costs no local; every other spelling is
+        // evaluated ONCE into the spill slot, since a second emission would re-run its
+        // effects. `callSpillsFcpArg` is the same question the frame reserved on (D1640).
+        if callSpillsFcpArg(callIx) {
           if emitExpr(body, fcpArg, fnIx) < 0 { return -1 }
+          fbLocalTee(fcpSpillSlot)
           fbStructGet(lTypeIdx, 0)
           fbI32Const(0)
-          if emitExpr(body, fcpArg, fnIx) < 0 { return -1 }
+          fbLocalGet(fcpSpillSlot)
           fbStructGet(lTypeIdx, 1)
           fbCall(gHelpUtf8Enc)
           return 0
         }
-        return emitFail(
-          "emitProgram: fromCodePoints argument must be a named i32[] binding",
-        )
+        if emitExpr(body, fcpArg, fnIx) < 0 { return -1 }
+        fbStructGet(lTypeIdx, 0)
+        fbI32Const(0)
+        if emitExpr(body, fcpArg, fnIx) < 0 { return -1 }
+        fbStructGet(lTypeIdx, 1)
+        fbCall(gHelpUtf8Enc)
+        return 0
       }
       // `fromCodePoint(code)` is a compiler builtin (H2): construct a single-character VL
       // string from an i32 code point, riding the same `__utf8_enc__` helper `fromCodePoints`
