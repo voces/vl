@@ -198,6 +198,14 @@ inclusive **27.64 → 5.33%** and **29.13 → 5.62%**. The axis reads **1.46** a
 the bar drops **4.0 → 3.5**; its note now names `isDeclaredStructName` (**21.83%
 inclusive**), which is the next term. Numbers and their commands: the `CHANGELOG.md` entry.
 
+`isDeclaredStructName` followed, as a sid-keyed set of the declared struct names built once
+per program at the head of `collectU`: **27.16 → 0.08%** inclusive at 3,200 unions and
+**14.12 → 0.11%** at 1,600, three interleaved readings a side. The bar stays at **3.5**,
+because at the SHIPPED 800 the term is only **8.24–10.20%** inclusive and the many arm sheds
+11%. The axis note now names `collectVariantFields` (`compiler/emit_collect.vl`, **16.65%
+inclusive** at 3,200) — the same per-arm scan of the top-level statements, one function over
+and looking for the `TypeDecl` rather than for its name.
+
 ---
 
 ## 3 · The four axes, profiled
