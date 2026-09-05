@@ -45,9 +45,16 @@ NAMES=(); PIDS=(); STARTS=()
 run() { local i=${#PIDS[@]}; NAMES+=("$1"); STARTS+=("$(date +%s.%N)"); shift
         ( "$@" > "$LOGS/$i.log" 2>&1; rc=$?; date +%s.%N > "$LOGS/$i.t"; exit $rc ) & PIDS+=($!); }
 
-run "deno task test"           deno task test
+# vl_scaling_shape_test.ts is EXCLUDED from this row and from ci-native's glob below —
+# both are dropped in gate.sh ONLY, deno.json's task and ci.yml are untouched. It grades a
+# TIME RATIO, and the dedicated "scaling shape" row already runs it; a ratio test measured
+# concurrently with itself grades the box's contention, not the compiler (tooling-std-host.md §7.2).
+run "deno task test"           deno test -A --no-check --parallel --ignore=tests/vl_scaling_shape_test.ts tests/
+# `--ignore` next to an explicit multi-glob file LIST is order-sensitive (measured: the same
+# flag, same files, excluded the file with one argument order and not another) — so the glob
+# is filtered in bash instead, which cannot depend on deno's internal match order.
 run "ci-native"                env SELFHOST_NATIVE_ALIGN=1 bash -c \
-                                 'deno test -A --no-check --parallel tests/selfhost_native_*_test.ts tests/vl_*_test.ts'
+                                 'deno test -A --no-check --parallel $(ls tests/selfhost_native_*_test.ts tests/vl_*_test.ts | grep -vx "tests/vl_scaling_shape_test.ts")'
 # The ci-native JOB also runs an EXPLICIT list of seed-backed editor suites that
 # match neither glob above (ci.yml's "Editor features on the wasm compiler"
 # step). Measured gap, 2026-09-01: nine local gates were green while master's
