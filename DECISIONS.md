@@ -4969,6 +4969,58 @@ bracket is a parse error today too. Three edges are part of the rule:
   and that fmt's output for it re-parses and means the same thing (`tests/vl_paren_newline_test.ts`).
   Author-break preservation stays out, exactly as in the leading-dot ruling.
 
+## A line beginning with a token that cannot start an expression continues the previous expression (2026-09-04)
+
+**Ruling** (owner, on glean's VL-031, whose bracketed half had shipped the same day as D1581
+above; the owner's word on the general form was "B"). When a statement's expression has ended
+at a newline and the next line's first token is one that can NEVER begin an expression, the
+parser continues the expression instead of ending the statement — at statement level, not only
+inside brackets:
+
+```vl
+const ok = a == 1
+  || b == 2
+const big = n
+  > 3
+```
+
+**The continuing set is DERIVED from `binPrec`, so it cannot drift.** Every entry in the
+parser's binary-operator table joins a line except `-`: `|| && ?? == != < <= > >= + * / %`, the
+bitwise and shift operators `| & ^ << >> >>>`, and — by the same derivation, since none of them
+can begin an expression either — `=` and the compound forms `+= -= *= /=`. Member access (`.`,
+`?.`) already joined at every depth; `is` and the four `as` casts join here for the first time.
+A `|>` pipe, if one is ever added, would join for the same reason.
+
+**Why unary minus is EXCLUDED.** `{ f()` ⏎ `-x }` is a legal block today meaning "call `f`, and
+the block's value is `-x`". Joining would silently turn it into `f() - x` — a value change with
+no diagnostic — so a leading-minus line stays a statement, and a program that wants subtraction
+puts the operator at the end of the previous line or in parentheses, as today. Swift, Kotlin, Go
+and Ruby all keep a leading minus a new statement for the same reason. `!`, `(`, `[`, `{`, an
+identifier and a literal are excluded on the same test: each can begin a statement.
+
+**`as` needed a narrower rule than the ruling's sentence, because `as` IS an identifier.** It is
+a contextual keyword and lexes as a plain `IDENT`, so `let as = 6` ⏎ `as = 12` is a legal
+reassignment — and the first candidate broke exactly that, losing
+`tests/cases/lexer/soft-keywords-as-identifiers.vl` and `-as-function-names.vl`. A line-leading
+`as` therefore joins only ahead of a NAMED cast target (an `IDENT` after the optional `? ! %`
+suffix); on its own line it is unchanged. `is` needs no such guard — it is a reserved keyword
+with its own token kind. `!is` does not join: its first token is `!`, which can begin an
+expression.
+
+**Nothing else changes meaning, measured rather than asserted.** Every remaining member of the
+set is a parse error at line start on the previous compiler. The proof is a byte-identity sweep
+of the whole fixture corpus across the two seeds: **2,404 modules identical, 0 differing, 0
+lost**, with the only additions the new cases; the distilled corpus moved **0 of 7,564 cells**;
+glean's 115 files check identically on both.
+
+**Scope, blank lines and comments.** The scan is "the next token past the run of NEWLINEs",
+which is the leading-dot rule's own code path (`afterNewlines`), so a blank line or a comment
+line between the operand and its operator costs nothing — comments are trivia and never reach
+the token stream. Precedence is untouched: the operator is handed to the same climber, so
+`a` ⏎ `|| b` ⏎ `&& c` groups as `a || (b && c)`, exactly as the one-line spelling does. `vl fmt`
+normalises the layout away and that stays fine — the third ruling on this axis to say so, after
+the leading dot and D1581.
+
 ## One name may not bind two IMPORTS, and the test is on the resolved DECLARATION (D1120, 2026-09-02)
 
 `import { area } from "./a"` beside `import { area } from "./b"` is refused —
