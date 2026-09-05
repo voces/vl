@@ -17,6 +17,10 @@ is not how they behave now but what a specific candidate DID to them. Nothing de
 current behaviour can know that, so the named set is kept whole.
 
     python3 regress.py <seed.wasm> [--baseline F] [--write-baseline] [--json OUT]
+    python3 regress.py <seed.wasm> --write-baseline --set <named-set>
+
+`--set` is how a landing that adds `named/*.vl` files records them in `expected.jsonl` and
+`baseline.jsonl` in ONE move; `index.py` owns that file and says what a missing row cost.
 
 Exit code is 1 only when a cell went `runs` -> not-runs. Every other transition is
 REPORTED, not blocking: a program that did not work before and does not work now has not
@@ -30,6 +34,7 @@ import subprocess
 import sys
 
 from cellmap import dump_cells, load_cells
+from index import DERIVED_BLOCKS, audit, complaint, prune, write_set
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
@@ -38,10 +43,6 @@ CELLS = os.path.join(HERE, "cells")
 NAMED = os.path.join(HERE, "named")
 
 SILENT = ("runs but wrong value", "check-clean invalid wasm", "compiler trap", "trap_loads")
-
-# The five census blocks are the DERIVED half; every other block name is a curated named
-# set, and `named/sources.json` says which regression named it and what it cost.
-DERIVED_BLOCKS = frozenset("ABCDE")
 
 
 def arg(flag, default=None):
@@ -55,6 +56,28 @@ def main():
     seed = sys.argv[1]
     baseline = arg("--baseline", os.path.join(HERE, "baseline.jsonl"))
     out = arg("--json", os.path.join(HERE, ".last.json"))
+
+    # THE INDEX IS RECONCILED BEFORE THE GRADE, never after: a tree that is merely
+    # mid-edit must not pay a minute to be told its index is short. Every cell graded
+    # below carries an `expected.jsonl` row, so the reads of it further down have no
+    # default left to take — a missing row used to mean block `A`, `represents` 0, and a
+    # curated cell was then counted as a census representative standing for nothing.
+    setname = arg("--set")
+    gaps = audit()
+    if "--write-baseline" in sys.argv and (gaps["orphan"] or gaps["missing"]):
+        if gaps["orphan"]:
+            print(f"distilled: index — pruned {len(prune())} row(s) whose cell is gone")
+        if gaps["missing"] and not setname:
+            print(complaint(gaps))
+            return 2
+        if gaps["missing"]:
+            n = write_set(setname, gaps["missing"])
+            print(f"distilled: index — wrote {n} curated row(s) at block {setname}")
+        gaps = audit()
+    short = complaint(gaps)
+    if short:
+        print(short)
+        return 2
 
     env = dict(os.environ)
     env.setdefault("JOBS", "6")
@@ -83,7 +106,7 @@ def main():
         b = before.get(c)
         if b is None or (b["class"], b["msg"]) == (v["class"], v["msg"]):
             continue
-        row = (c, b["class"], v["class"], idx.get(c, {}).get("represents", 0))
+        row = (c, b["class"], v["class"], idx[c]["represents"])
         if b["class"] == "runs":
             lost.append(row)
         elif v["class"] in SILENT and b["class"] not in SILENT:
@@ -101,7 +124,7 @@ def main():
         if len(rows) > 12:
             print(f"      … and {len(rows) - 12} more")
 
-    ncur = sum(1 for c in now if idx.get(c, {}).get("block", "A") not in DERIVED_BLOCKS)
+    ncur = sum(1 for c in now if idx[c]["block"] not in DERIVED_BLOCKS)
     print(f"distilled corpus: {len(now) - ncur} representatives standing for {pop} census "
           f"cells, plus {ncur} curated cells from named regression sets")
     show("runs -> NOT-RUNS  (blocking)", lost)
