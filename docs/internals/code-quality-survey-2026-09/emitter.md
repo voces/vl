@@ -471,24 +471,32 @@ run at `fnIx == -1`, where it degrades to exactly the literal-only `letInfStrLis
 | 3 | `pendingStructIdx`, `nulstruct` cell | `localStructIdx[slot]` | `globalCellStructIdx` | `globalCellStructIdx` | `nulRefStructIdxOfLet` | **equivalent spelling** — `globalCellStructIdx` routes an annotated cell through `globalNulRefSupersede`, gated on `globalCellKind == "nulstruct"`, which is the module-scope twin of `nulRefStructIdxOfLet`'s redirect |
 | 4 | `pendingVariantIdx` bound | unbounded | unbounded | bounded by `uVarHeap.length` | unbounded | **no witness** — the window needs `globalCellKind` to answer `variant`/`nulvariant` while `globalCellStructIdx` falls to `structIndexOfExpr`; the two are paired arm for arm. A defensive bound, not a live one. Called out, not filed |
 | 5 | `pendingNulRefHeap`, `nulvariant` cell | no seed | `uVarHeap[i]`, ungated | `uVarHeap[i]`, ungated (bounded) | `armDestHeapOf(kind, i)`, gated on a `NullLit` RHS | **same value, three spellings** — `armDestHeapOf("nulvariant", i)` *is* `uVarHeap[i]` under the same bound, and `globalCellArmIdx(g, "nulvariant")` *is* `globalCellStructIdx(g)`. L needs no seed because `emitNullLitNode` reads `pendingVariantIdx` first, which L does seed. The gate scopes a leak; both global loops clear the seed at the foot (D1563) |
-| 6 | `pendingNulNone` | no seed (an early `letIsNulNone` return emits `ref.null none`) | `gck == "nulnone"` | **no seed** | no seed (a `gaKind == "nulnone"` arm emits it) | **dead in C by construction** — a `nulnone` cell's init is `null`, which is never a constexpr. L and A are equivalent spellings: a direct emit instead of a seed |
-| 7 | `pendingNulBool`/`NulString`/`NulClosure`/`NulList` | seeded | seeded | **none seeded** | seeded | **dead in C by construction** — each is consumed only by a bare `null` |
+| 6 | `pendingNulNone` | no seed (an early `letIsNulNone` return emits `ref.null none`) | `gck == "nulnone"` | **no seed** | no seed (a `gaKind == "nulnone"` arm emits it) | **dead in C by construction** — a `nulnone` cell's init is `null`, which is never a constexpr. L and A are equivalent spellings: a direct emit instead of a seed. C's per-cell snapshot restores it with the other sixteen, so deadness is no longer the only thing keeping it scoped |
+| 7 | `pendingNulBool`/`NulString`/`NulClosure`/`NulList` | seeded | seeded | `NulClosure`/`NulList` through `expCtxForCell`; `NulBool`/`NulString` not | seeded | **armed at C, never consumed there** — each is read only by a bare `null`, which no constexpr init can contain. What keeps the two the builder arms from reaching a later cell, a function body or the start function is C's snapshot restore, not their deadness |
 | 8 | `pendingNulBool` producer | `letNulBool` (annotation, inferred, or init probe) | `letIsNulBoolAnn` (annotation only) | — | `exprNulBool` | **equivalent spelling** — the inferred rungs answer for a binding whose init is not a bare `null`, and only a bare `null` consumes the seed |
 | 9 | `pendingI64` / `pendingF64` | not seeded | not seeded | `gck == "i64"` / `"f64"` | not seeded | **equivalent spelling, stated in `emit_state.vl`'s own header** — a wasm constexpr carries no convert op, so C re-encodes the literal where the other three widen through `emitExprAs*` |
 | 10 | `pendingF32` | set around `emitExprAsF32` | set around `emitExprAsF32` | `gck == "f32"` | not set | **equivalent spelling** — same three witnesses (float literal, integer literal, `f32[]`) at all four |
 | 11 | `pendingMapSlot` for a `map`/`nulmap` **const** cell | — | seeded | seeded | seeded under `exprMap` | **dead arm in C, and its comment is stale**: "the `pendingMapSlot` seed makes the `Map()` init constexpr build it" cannot fire — `Map()` is a `Call` and `isConstInit` has no `Call` arm |
-| 12 | `pendingNulRefHeap` for `nulreflist` / nul-scalar-list | seeded | seeded | **not seeded** (the `pendingListKind` half is) | seeded | **correct as written** — the ref-heap half is consumed only by a bare `null`; the list-build half *is* live at C and is present |
-| 13 | `ExpCtx` carries 16 fields for 17 `pending*` globals | — | — | — | — | `pendingNulNone` is absent from `expCtxHere`/`expCtxApply`, so `emitExprExpect` neither applies nor restores it. Nothing observes it today (S is its only writer and S does not route through `emitExprExpect`), but a later merge must not start scoping it silently |
-| 14 | what the per-cell RESET clears | restores through `emitExprExpect` | clears all eleven, `pendingNulRefHeap` among them | clears **nine**, and no null rep among them | restores through `emitExprExpect` | **the reason C stays unwired.** Rows 6, 7 and 12 say C never *consumes* a null rep. It also never *clears* one, and only the first fact was load-bearing until the builder arrived |
+| 12 | `pendingNulRefHeap` for `nulreflist` / nul-scalar-list | seeded | seeded | the nul-scalar-list wrapper through `expCtxForCell`; the `nulreflist` `rlWrapIdx` half not | seeded | **equivalent spelling** — the `nulreflist` half is gated on a `NullLit` init, which C cannot receive; the nul-scalar-list wrapper rides with the leaf build code the const init genuinely needs |
+| 13 | `ExpCtx` carries 17 fields for 17 `pending*` globals | — | — | — | — | **closed** — `nulNone` is a field, so `expCtxHere`/`expCtxApply` transport it and `emitExprExpect` scopes all seventeen. Every context in the tree is derived from `expCtxHere()`, so the added field round-trips the ambient value: byte-identical seed, byte-identical corpus |
+| 14 | what the per-cell RESET clears | restores through `emitExprExpect` | clears all eleven, `pendingNulRefHeap` among them | restores the whole `ExpCtx` snapshot | restores through `emitExprExpect` | **closed** — rows 6, 7 and 12 say C never *consumes* a null rep, which licenses arming one; what licenses arming one *safely* is that C now restores every seed it can write, the map shape and the null-rep heap included. The seed set is closed by the type, not by a list a later rung has to remember to extend |
 
 **Row 14 is the one the merge had to find the hard way.** Wiring C to the shared builder is
-sound by consumption — a bare `null` cannot reach it — and unsound by leakage: a const cell of
-kind `nulf64list` arms `pendingNulRefHeap` with its wrapper, C's reset does not clear it, and the
-next `= null` global in the start function lowers as that wrapper. That is D1563's mechanism
-exactly, and `tests/cases/globals/nullable-global-null-list-seeds.vl` plus
-`nullable-global-assign-null-seeds.vl` turned check-clean invalid wasm (`type mismatch: expected
-(ref null $type), found (ref null $type)`) under the wired build. **A dead arm and an inert one
-are not the same claim**, and only the second licenses adding a seed.
+sound by consumption — a bare `null` cannot reach it — and unsound by leakage while C's reset
+names its seeds by hand: a const cell of kind `nulf64list` arms `pendingNulRefHeap` with its
+wrapper, a nine-name clear list does not mention it, and the next `= null` global in the start
+function lowers as that wrapper. That is D1563's mechanism exactly. **A dead arm and an inert
+one are not the same claim**, and only the second licenses adding a seed.
+
+Four fixtures hold the distinction. `tests/cases/globals/nullable-global-null-list-seeds.vl`
+and `nullable-global-assign-null-seeds.vl` grade check-clean invalid wasm (`type mismatch:
+expected (ref null $type), found (ref null $type)`) against a build that calls the builder from
+C with the hand-rolled reset left standing; `nullable-global-const-cell-seed-leak.vl` and
+`nullable-global-const-cell-list-seed-leak.vl` pin the two channels directly — the heap index
+and the boolean `pendingNulList`, which `emitNullBySeed` reads first — at three victim
+positions each. The victims are a global declared after the armer, a global declared before it,
+and a `return null` in a function body: the const cell's constexpr is emitted ahead of every
+body and ahead of the start function, so section order, not declaration order, decides.
 
 **Outcome: no disagreement changes a program's outcome, so no row was filed.** Every entry is
 an equivalent spelling or a dead arm, and each is named as one above.
@@ -515,11 +523,11 @@ entry point. Only the controls said so.
 (which calls `emitExpr`), while `emit_sections.vl` already imports from `wasmEmit.vl`. Adding
 `export` alone is byte-identical. `expCtxForCell(kind: VKind): ExpCtx` then carries the four
 rungs a ladder derives from the kind alone — the two nul-scalar-list seeds, `nullist` and
-`nulclosure`. **Three of the four boundaries call it**: the local `let`, the start-fn global
-init, and the `global.set` arm. The const cell keeps its own single live rung, for row 14's
-reason. Row 5's `nulvariant` null is deliberately **not** in the builder: its gate genuinely
-differs per boundary and no witness separates the three spellings, so folding it in would be an
-unmeasured behaviour change.
+`nulclosure`. **All four boundaries call it**: the local `let`, the start-fn global init, the
+`global.set` arm, and the const cell, whose own per-cell reset is an `expCtxHere()` snapshot
+applied back after the init. Row 5's `nulvariant` null is deliberately **not** in the builder:
+its gate genuinely differs per boundary and no witness separates the three spellings, so
+folding it in would be an unmeasured behaviour change.
 
 ### 6.2 Sixteen functions re-run one list-rep classifier ladder
 
