@@ -451,6 +451,175 @@ jobs:
           exit "$(cat /tmp/lint-self.rc)"
 
   # ---------------------------------------------------------------------------
+  # ci-release-shape — the seven `vl build -O3` release-profile suites (the
+  # opt / allocation-melt / loop-shape / bench-shape rows, and the
+  # buffer-view-bounds table + P1.4 contract), which run in NO CI job today:
+  # `ci` installs node deps but builds no seed, and `ci-native` builds the seed
+  # but never runs `npm ci`, so both jobs' `exists(wasm-opt)` gate is false and
+  # every one of these files self-ignores everywhere (measured locally at ~153
+  # CPU-seconds; docs/internals/test-timing-2026-09.md §4a). A SEPARATE,
+  # PARALLEL job — not folded into `ci-native` — so this coverage adds no wall
+  # time to either existing job's critical path.
+  #
+  # No `needs:` on `ci-native`: this job obtains the vl-host binary and the seed
+  # the same way `ci-native` does (cache first, build/self-compile on a miss),
+  # by reusing its "Cache vl-host binary" / "Cache cargo + vl-host target" /
+  # "Build vl-host" / "Cache seed compiler wasm" / "Refresh seed + native
+  # fixpoint" steps verbatim, rather than waiting on that job to publish either
+  # cache entry.
+  #
+  # The view-bounds half of the suite gates on a SECOND tool, `wasm-tools`
+  # (spec-grade WAT printer) — not an npm package, so `npm ci` alone is not
+  # enough; a dev box gets it from `cargo install wasm-tools`, so it is
+  # installed here from a prebuilt release binary (seconds, cached by version,
+  # vs. minutes to compile from source).
+  #
+  # The explicit file list is what lets tests/ci_seed_coverage_test.ts see this
+  # job's coverage; keep it in sync with that test's expectations if the seven
+  # files are ever renamed.
+  # ---------------------------------------------------------------------------
+  ci-release-shape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Detect docs-only change
+        id: docs_check
+        uses: ./.github/actions/docs-only
+
+      - uses: denoland/setup-deno@v2
+        if: steps.docs_check.outputs.docs_only != 'true'
+        with:
+          deno-version: v2.x
+
+      # binaryen (wasm-opt/wasm-dis) is what this job exists to gate IN — `cache:
+      # npm` is actions/setup-node's own actions/cache wrapper keyed on
+      # package-lock.json, so the install is seconds after the first run
+      # (mirrors the `ci` job's own step).
+      - uses: actions/setup-node@v5
+        if: steps.docs_check.outputs.docs_only != 'true'
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Cache Deno modules
+        if: steps.docs_check.outputs.docs_only != 'true'
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/deno
+          key: deno-${{ runner.os }}-${{ hashFiles('deno.lock') }}
+          restore-keys: |
+            deno-${{ runner.os }}-
+
+      - name: Install node deps
+        if: steps.docs_check.outputs.docs_only != 'true'
+        run: npm ci
+
+      # The buffer-view-bounds suite's second gate. A prebuilt release tarball
+      # rather than `cargo install wasm-tools` (source build, minutes not
+      # seconds); cached on its pinned version so a repeat run costs nothing.
+      - name: Cache wasm-tools
+        if: steps.docs_check.outputs.docs_only != 'true'
+        id: wasmtools
+        uses: actions/cache@v5
+        with:
+          path: ~/.local/bin/wasm-tools
+          key: wasm-tools-${{ runner.os }}-1.258.0
+
+      - name: Install wasm-tools
+        if: steps.docs_check.outputs.docs_only != 'true' && steps.wasmtools.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.local/bin
+          asset="wasm-tools-1.258.0-x86_64-linux.tar.gz"
+          work="$(mktemp -d)"
+          # Prefer gh (honors auth / rate limits); fall back to curl against the
+          # public release CDN — same fallthrough scripts/fetch-seed.sh uses.
+          if ! gh release download v1.258.0 --repo bytecodealliance/wasm-tools \
+                 --pattern "$asset" --dir "$work" --clobber 2>/dev/null; then
+            curl -fsSL "https://github.com/bytecodealliance/wasm-tools/releases/download/v1.258.0/$asset" -o "$work/$asset"
+          fi
+          tar xzf "$work/$asset" -C "$work"
+          mv "$work/wasm-tools-1.258.0-x86_64-linux/wasm-tools" ~/.local/bin/wasm-tools
+          chmod +x ~/.local/bin/wasm-tools
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Add ~/.local/bin to PATH
+        if: steps.docs_check.outputs.docs_only != 'true'
+        run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # --- everything below to the suite step is copied verbatim from
+      # ci-native's own seed-acquisition steps, so a cache hit there is a cache
+      # hit here too and neither job ever waits on the other. ---
+
+      - name: Rustc version (cargo cache key)
+        if: steps.docs_check.outputs.docs_only != 'true'
+        id: rustc
+        run: echo "v=$(rustc -V | tr ' ' '_')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache vl-host binary
+        if: steps.docs_check.outputs.docs_only != 'true'
+        id: vlbin
+        uses: actions/cache@v5
+        with:
+          path: scripts/vl-host/target/release/vl
+          key: vl-bin-${{ runner.os }}-${{ steps.rustc.outputs.v }}-${{ hashFiles('scripts/vl-host/Cargo.lock', 'scripts/vl-host/Cargo.toml', 'scripts/vl-host/build.rs', 'scripts/vl-host/src/**') }}
+
+      - name: Cache cargo + vl-host target
+        if: steps.docs_check.outputs.docs_only != 'true' && steps.vlbin.outputs.cache-hit != 'true'
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            scripts/vl-host/target
+          key: cargo-${{ runner.os }}-${{ steps.rustc.outputs.v }}-${{ hashFiles('scripts/vl-host/Cargo.lock', 'scripts/vl-host/Cargo.toml') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ steps.rustc.outputs.v }}-
+            cargo-${{ runner.os }}-
+
+      - name: Build vl-host (native tool)
+        if: steps.docs_check.outputs.docs_only != 'true' && steps.vlbin.outputs.cache-hit != 'true'
+        run: cargo build --release
+        working-directory: scripts/vl-host
+
+      - name: Cache seed compiler wasm
+        if: steps.docs_check.outputs.docs_only != 'true'
+        uses: actions/cache@v5
+        with:
+          path: |
+            build/vl-compiler.wasm
+            build/vl-compiler.wasm.*.cwasm
+          key: vl-seedpair-${{ runner.os }}-${{ hashFiles('compiler/*.vl') }}
+          restore-keys: |
+            vl-seedpair-${{ runner.os }}-
+
+      - name: Refresh seed + native fixpoint (self-reproduction ladder)
+        if: steps.docs_check.outputs.docs_only != 'true'
+        run: ./scripts/refresh-compiler.sh --prove-fixpoint
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      # The seven files themselves — kept EXPLICIT (not a glob) so
+      # tests/ci_seed_coverage_test.ts can see every one of them named in
+      # ci.yml, the same discipline the "Editor features" step already follows.
+      - name: Release-profile suites (-O3 / wasm-opt / wasm-dis / wasm-tools shape)
+        if: steps.docs_check.outputs.docs_only != 'true'
+        run: >-
+          deno test -A --no-check --parallel
+          tests/selfhost_native_opt_test.ts
+          tests/selfhost_native_release_test.ts
+          tests/selfhost_native_release_loops_test.ts
+          tests/selfhost_native_release_melt_test.ts
+          tests/selfhost_native_release_shape_test.ts
+          tests/vl_buffer_view_bounds_contract_test.ts
+          tests/vl_buffer_view_bounds_shape_test.ts
+        env:
+          SELFHOST_NATIVE_ALIGN: "1"
+
+  # ---------------------------------------------------------------------------
   # ci-embed-seed — the release DISTRIBUTION build (roadmap H-M2), gated on every
   # push instead of only at release time.
   #
