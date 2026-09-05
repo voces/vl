@@ -387,10 +387,15 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
   // and the same 2 -> 0, on the idiomatic spelling rather than a synthetic one.
   // SHOULD MOVE IF: the callback stops being devirtualised at `-O3`, or the pipeline's
   // intermediate arrays stop melting (`allocs`).
+  // `-O` re-read 946 -> 976 when `std:array` gained `filled`, and only 5 of the 30 is that
+  // export: this file's std at the previous reading measures 971 here, so 25 had already
+  // drifted inside the ±28 band. The 5 is what an UNUSED std export costs — one functype
+  // entry and one funcref table slot, no body, the elem pointing at the trap stub — and
+  // `-O3` is unchanged at 708, so `--closed-world` strips every byte of it.
   {
     bench: "algorithms/map-filter-reduce",
     axis: "map/filter/reduce callback pipeline",
-    O: { bytes: 946, fns: 7, allocs: 10, indirect: 2 },
+    O: { bytes: 976, fns: 7, allocs: 10, indirect: 2 },
     O3: { bytes: 708, fns: 1, allocs: 8, indirect: 0 },
   },
   // THE CONTROL FOR THE TWO ABOVE. A four-way dispatch table is genuinely dynamic, so
