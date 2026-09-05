@@ -67,11 +67,17 @@ PASS = {
     "collectStartLocals", "gaeCollectDecls", "emitGlobalSection",
 }
 # The two FRAME builders. Per function, not per compile — `emitFuncCode` for a declared
-# function, `startFnDetectScratch` for the start function (top-level statements + the
-# global initializers that run there). They must clear the SAME flags: a flag one clears
-# and the other does not survives into the next program's start function. That asymmetry
-# is D1006/D1007.
-FRAME = {"emitFuncCode", "startFnDetectScratch"}
+# function, `emitStartFnCode` for the start function (top-level statements + the global
+# initializers that run there). They must clear the SAME flags: a flag one clears and the
+# other does not survives into the next program's start function. That asymmetry is
+# D1006/D1007.
+#
+# Each ROOT stands for itself plus the helpers it was split into, and those are WALKED
+# (`frame_side`) rather than listed: naming `startFnDetectScratch` here was correct until
+# D1595 moved the resets up into `startFnDetectFrames`, after which the script reported 15
+# resets as missing. A name pinned to one refactor is the failure mode; the callee walk
+# follows the code.
+FRAME_ROOTS = ("emitFuncCode", "emitStartFnCode")
 
 
 def decls():
@@ -107,10 +113,42 @@ def spans(path):
     return out
 
 
+def frame_side(root, fnspans):
+    """`root` plus the functions it calls that its OWN module declares.
+
+    One level deep, and same-module: a builder split into helpers keeps them beside
+    itself, while a call into another emitter module is a lowering or query helper whose
+    writes are emission, not a per-frame reset. Returns `None` when no module declares
+    `root` — a renamed anchor is then a loud failure rather than an empty side.
+    """
+    for f, fns in fnspans.items():
+        own = {n for n, _, _ in fns}
+        if root not in own:
+            continue
+        lines = open(os.path.join(CDIR, f)).read().split("\n")
+        side = {root}
+        for name, a, b in fns:
+            if name != root:
+                continue
+            for m in re.finditer(r"(?<![A-Za-z0-9_.])([A-Za-z_][A-Za-z0-9_]*)\s*\(",
+                                 "\n".join(lines[a:b])):
+                if m.group(1) in own:
+                    side.add(m.group(1))
+        return side
+    return None
+
+
 def main():
     d = decls()
     files = sorted(f for f in os.listdir(CDIR) if f.endswith(".vl"))
     fnspans = {f: spans(os.path.join(CDIR, f)) for f in files}
+    sides = {r: frame_side(r, fnspans) for r in FRAME_ROOTS}
+    missing = sorted(r for r, s in sides.items() if s is None)
+    if missing:
+        print("no compiler/*.vl function declares: " + ", ".join(missing), file=sys.stderr)
+        print("the frame-builder anchors moved; re-point FRAME_ROOTS.", file=sys.stderr)
+        return 2
+    FRAME = set().union(*sides.values())
 
     def fn_at(f, line):
         for name, a, b in fnspans[f]:
@@ -161,18 +199,24 @@ def main():
     for k in ("prologue", "pass", "frame", "inner", "NEVER"):
         print("  %-9s %4d" % (k, c[k]))
 
+    ra, rb = FRAME_ROOTS
     print("\nTHE TWO FRAME BUILDERS MUST AGREE — a flag one clears and the other does not")
-    print("survives into the next program's START function.")
+    print("survives into the next program's START function. Each side is the root plus the")
+    print("helpers its own module splits it into:")
+    for r in FRAME_ROOTS:
+        print("  %-16s %s" % (r, ", ".join(sorted(sides[r] - {r})) or "-"))
+    print()
     bad = []
     for n in sorted(d):
         if not n.startswith("fnUses"):
             continue
         h = assigned[n]
-        a, b = "emitFuncCode" in h, "startFnDetectScratch" in h
+        a, b = bool(h & sides[ra]), bool(h & sides[rb])
         if a != b:
             bad.append(n)
-        print("  %-20s emitFuncCode %-4s startFnDetectScratch %-4s%s" %
-              (n, "yes" if a else "NO", "yes" if b else "NO", "   <-- ASYMMETRIC" if a != b else ""))
+        print("  %-20s %s %-4s %s %-4s%s" %
+              (n, ra, "yes" if a else "NO", rb, "yes" if b else "NO",
+               "   <-- ASYMMETRIC" if a != b else ""))
     print("  %d of %d asymmetric: %s" %
           (len(bad), sum(1 for n in d if n.startswith("fnUses")), ", ".join(bad) or "none"))
 

@@ -1,7 +1,7 @@
 # The emitter's module-scope state — where each piece is reset, and what is not
 
 **Re-derive before quoting: `python3 scripts/emitter-state-audit.py`.** Every number below
-is that script's output on 2026-09-01. A hand-written audit table goes stale in ONE
+is that script's output on 2026-09-04. A hand-written audit table goes stale in ONE
 direction — a variable that gains a reset keeps reading as a hazard, and one that LOSES a
 reset keeps reading as safe, which is the direction that ships bugs.
 
@@ -23,18 +23,18 @@ The standing instrument is `tests/vl_instance_state_leak_test.ts`: compile P on 
 instance and require byte-identity with P on a fresh one. **Nothing here is settled by
 reading; it is settled by a witness**, and this document only says where to look.
 
-## Where the 445 mutables are cleared
+## Where the 532 mutables are cleared
 
 `let` / `export let` at column 0 in `emit_*.vl` + `wasmEmit.vl`, classified by the enclosing
 function of the assignments that write the declaration's own initial value back:
 
 | where | count | when it runs | what it protects |
 |---|---|---|---|
-| `emitProgram` prologue (+ the `*Reset` helpers it calls) | 141 | once per compile, ahead of every pass | clean before anything reads it — the safe home |
-| a `runEmitPass` row (`collectU`/`collectS`/`collectA`/`scanPrintUse`/…) | 142 | once per compile, but AFTER earlier rows | stale for anything an EARLIER pass reads |
-| a frame builder (`emitFuncCode` / `startFnDetectScratch`) | 44 | once per FUNCTION | stale across programs unless BOTH builders write it |
-| some inner helper | 38 | wherever that helper runs | case by case |
-| nowhere | 80 | — | safe only if rewritten unconditionally each compile |
+| `emitProgram` prologue (+ the `*Reset` helpers it calls) | 162 | once per compile, ahead of every pass | clean before anything reads it — the safe home |
+| a `runEmitPass` row (`collectU`/`collectS`/`collectA`/`scanPrintUse`/…) | 153 | once per compile, but AFTER earlier rows | stale for anything an EARLIER pass reads |
+| a frame builder (`emitFuncCode` / `emitStartFnCode`, each with the helpers its own module splits it into) | 54 | once per FUNCTION | stale across programs unless BOTH builders write it |
+| some inner helper | 68 | wherever that helper runs | case by case |
+| nowhere | 95 | — | safe only if rewritten unconditionally each compile |
 
 **The pass-table rows are not equivalent to the prologue and the difference is real.**
 `collectA` clears `aUsed`, `lUsed`, `raUsed`, `rlUsed`, `mUsed`, `mI32Used`, `slUsed` and
@@ -43,22 +43,22 @@ the PREVIOUS program's value. D986's four flags could not be fixed there at all 
 is set by `scanPrintUse`, which runs long after `collectA` — which is why #2218 put them in
 the prologue instead.
 
-## THE TWO FRAME BUILDERS MUST AGREE — four flags where they do not
+## THE TWO FRAME BUILDERS MUST AGREE — two flags where they do not
 
-`emitFuncCode` decides a declared function's scratch frame; `startFnDetectScratch` is its
+`emitFuncCode` decides a declared function's scratch frame; `emitStartFnCode` is its
 analogue for the START function (top-level statements plus the global initializers that run
-there). Both read the same 24 `fnUses*` flags and both must write all 24, because a flag one
+there). Each stands for itself plus the helpers its own module splits it into —
+`buildLocals`/`dupScanRun` on one side, `startFnDetectFrames` and three others on the other.
+Both sides read the same 25 `fnUses*` flags and both must write all 25, because a flag one
 writes and the other does not survives — into the rest of this compile, and into the next
 program on the same instance.
 
-Twenty of twenty-four agree. Four do not:
+Twenty-three of twenty-five agree. Two do not:
 
-| flag | `emitFuncCode` | `startFnDetectScratch` | witness |
+| flag | `emitFuncCode` | `emitStartFnCode` | witness |
 |---|---|---|---|
-| `fnUsesU8Push` | yes (lines 872 **and 873**) | **NO** | **D1006** — 4 phantom locals, +10 bytes |
-| `fnUsesMapVals` | yes (lines 904 **and 905**) | **NO** | **D1007** — 6 phantom locals, +15 bytes |
-| `fnUsesUnionSink` | yes (931) | **NO** | none found |
-| `fnUsesUnionLetSink` | yes (932) | **NO** | none found |
+| `fnUsesU8Push` | yes (lines 782 **and 783**) | **NO** | **D1006** — 4 phantom locals, +10 bytes |
+| `fnUsesMapVals` | yes (lines 804 **and 805**) | **NO** | **D1007** — 6 phantom locals, +15 bytes |
 
 **The duplicated line is the tell.** `fnUsesU8Push = false` and `fnUsesMapVals = false` each
 appear TWICE IN A ROW inside `emitFuncCode`. The second copy was written for the other
@@ -66,13 +66,17 @@ builder and landed in the same one; the flag then has two writers where it needs
 place. Nothing reads a duplicated assignment as wrong, and no gate could see the result
 because the CLI compiles once.
 
-The last two are filed as a hazard, not a defect: `fnUnionRetSinkOk`/`fnUnionLetSinkOk` are
-per-function predictions and no program has been found whose start function inherits one
-visibly. That is the same framing #2218 used for D986's untouched siblings — **a flag with no
-witness is a place to look, not a fix to ship**, and `vl_instance_state_leak_test.ts` carries
-a `union-return-sink` program so one would be caught.
+`fnUsesUnionSink`/`fnUsesUnionLetSink` were the other two rows here and are no longer
+asymmetric: `emitStartFnCode` clears both before `fbBeginFunc`, on the grounds that the start
+function is void and its bindings take neither sink.
 
-## The 80 that are cleared nowhere
+**The anchors are walked, not named.** A pinned name went stale once already — D1595 moved
+fifteen resets into `startFnDetectFrames` and the script, still naming the function it had
+left, reported 19 asymmetries where 2 were real. `FRAME_ROOTS` now names the two builders and
+the callee walk finds their helpers; `tests/vl_emitter_state_audit_test.ts` reds if a root
+stops resolving or the survivor set stops being exactly these two rows.
+
+## The 95 that are cleared nowhere
 
 Most are safe by UNCONDITIONAL REWRITE, and the script cannot tell that from a guarded one —
 so read this as a list of questions, not a defect list. Two shapes worth separating:
@@ -91,9 +95,9 @@ per-compile, the flag was not, and the pair disagreed.
 `mfScratchBase`, `arrNewScratchBase`, `cloEqScratchBase`, `leqIScratchBase`,
 `leqSScratchBase`, `unionSinkBase`, `unionAsSlot`, `variantReboxSlot`, `coalesceCallSlot`,
 `coalesceCallStrSlot`, `coalesceCallBoolSlot`, `callRefSlot`, `atomStageSlot`,
-`listIdxScratchBase`, `fnMvBase`, `mvValsOutBase`, `fbScratchCur` — all assigned
-unconditionally in `fbBeginFunc`, and each guarded reservation is `if <fnUses*> {
-fbReserve(n) }`. Same pairing, same conclusion: **the frame bases are only as per-compile as
+`listIdxScratchBase`, `fnMvBase`, `mvValsOutBase`, `fbScratchCur`, `numCastF64Slot`,
+`numCastF32Slot`, `numCastI64Slot` — all assigned unconditionally in `fbBeginFunc`, and
+each guarded reservation is `if <fnUses*> { fbReserve(n) }`. Same pairing, same conclusion: **the frame bases are only as per-compile as
 the `fnUses*` flags are**, which is what makes the asymmetry table above the thing to keep
 right.
 
@@ -102,8 +106,9 @@ The remainder: `capFrame`, `sblEpoch`, `cmSlot`, `eqStashL`/`eqStashR`, `gStrInf
 `msAtomTexts`/`msAtomIds`, `narrowStripNullOnly`, `narrowBareIdentOnly`, `pendingNulClosure`,
 `pendingNulList`, `pendingRawNullRead`, `gDivRemNonzero`, `repShadowOn`, `rtWalkN`,
 `rtUserVer`, `repSlotRepEpoch`, `repElemMemoEpoch`/`repElemMemoLen`/`repElemMemoUserVer`,
-`fnUsesUnionAs`. The `rep*`/`rt*` epoch counters are generation stamps and are MEANT to
-outlive a program (`msPoolReset` bumps `msGen` rather than clearing it); `emitRootIx` is
+`fnUsesUnionAs`, `fnUsesNumCast`, `gckDepth`, `gckGenTy`/`gckGenS`/`gckGenSF`/`gckGenU`/
+`gckGenV`/`gckGenN`, `mvShapeNest`, `monoInstIsFirst`, `saFnIx`, `unABMode`. The
+`rep*`/`rt*` epoch counters are generation stamps and are MEANT to outlive a program (`msPoolReset` bumps `msGen` rather than clearing it); `emitRootIx` is
 assigned in the prologue with a value, not cleared. Run
 `python3 scripts/emitter-state-audit.py --names` for the per-name clear sites.
 
