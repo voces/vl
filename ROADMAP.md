@@ -64,8 +64,8 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
 - ✅ **2. A position-matrix harness for capability briefs — DONE #2415.**
   `scripts/capability-probes/matrix.py`; see the fuller row below, and CLAUDE.md's
   "A CAPABILITY GAP HAS A POSITION MATRIX".
-- 🟡 **3. Split the inventory into one file per row — TOOLING SHIPPED (#2416), the split
-  lands on merge day.** See the fuller row below; `scripts/inventory/split.py --apply
+- ✅ **3. Split the inventory into one file per row — DONE (#2416 tooling, #2437 applied
+  2026-09-03).** See the fuller row below; `scripts/inventory/split.py --apply
   --relink` against fresh master under an append freeze.
 - 🟡 **4. Key the union/variant registries by arena type id, and collapse the kind ladders —
   DESIGN + shim #2417, steps 1-3, 4a and 4b landed since.** Registries keyed by SPELLED names
@@ -171,11 +171,11 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   offers a module's exported `f(self: T, …)` with an auto-import edit; a quick-fix on the
   D1230 diagnostic adds the name to the import; the diagnostic itself names the missing
   import (compile-goal, D1230). DECISIONS.md §"UFCS is never implicit". Tooling track.
-- **An else-less `if` as a VALUE is `T | null` everywhere — RULED (owner, 2026-09-02), TO BUILD
+- **An else-less `if` as a VALUE is `T | null` everywhere — RULED (owner, 2026-09-02), BUILT
   as D1086.** Checker first (return / `??` / argument / field / element / assignment RHS agree
   with the binding rule), then the emitter's synthesized `null` else arm over the row's 2×12
   scope × rep grid, both faces. DECISIONS.md §"An else-less `if` used as a VALUE". Compile-goal
-  track.
+  track. **STATUS 2026-09-05: DONE — D1086 closed, 48 of 48 grid cells running at both faces.**
 - **UFCS is never implicit; the LSP surfaces the import — RULED (owner, 2026-09-02);
   TOOLING HALF SHIPPED the same day.** `expect(x).toEqual(y)` keeps needing `toEqual`
   imported. DECISIONS.md §"UFCS is never implicit".
@@ -281,8 +281,8 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   trim moves a DOWNSTREAM module's bytes without moving its behaviour, because
   `emitNumCastTrapMsg` embeds an `as!` site's `line:col`: over all 67 `tests/cases/std/*.vl`,
   15 modules differ, 0 beyond that print-char stream, 0 at runtime.
-- **Modernization program, item 3 — the defect inventory is ONE FILE PER ROW. TOOLING SHIPPED;
-  the split itself lands on merge day.** `scripts/inventory/split.py --apply --relink` run
+- **Modernization program, item 3 — the defect inventory is ONE FILE PER ROW. DONE (#2437,
+  applied 2026-09-03).** `scripts/inventory/split.py --apply --relink` run
   against fresh master, under a freeze on inventory appends; every consumer already reads
   either form, so nothing else changes that day. Two gates came out of it:
   `tests/vl_inventory_refs_test.ts` (a cited row must EXIST — #2405 deleted a row and every
@@ -325,8 +325,9 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   this axis**, from the post-fix profile: `__str_eq__` at 19.2% self is the name-keyed
   registries doing linear lookups (`isUName`, `variantIndexOf`, `declaredSlotOf`,
   `__map_probe__`) — the registry-keying design track item 4 opened, not a hot-spot fix.
-- **Modernization program, item 4 — the registries keyed by an interned REP KEY. STEPS 1-3
-  AND 4a SHIPPED (additive, byte-identical); 4b-6 need the freeze.** `canonUnionKey` is minted
+- **Modernization program, item 4 — the registries keyed by an interned REP KEY. STEPS 1-3,
+  4a AND 4b SHIPPED (additive, byte-identical); step 5 (the switch) and step 6 need the
+  freeze.** `canonUnionKey` is minted
   in canon and pushed as `unKey` beside `unTyIx` at all three mint sites with **no reader**;
   every name-keyed union read has an arena-keyed twin beside it, and 22 sites offer an arena
   id through a per-site A/B seam that still ships the name answer. **The counters say the
@@ -343,6 +344,9 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   the right one, because a call site holds a different type from the one the row was minted
   under. **That residue is 4b's, and step 5 still blocks on it.**
   `docs/internals/registry-by-type-id.md` §5.
+  **STATUS 2026-09-05: 4b SHIPPED (#2473) — 1,499 of the 1,587 `differ` reaches were
+  key-EQUAL sibling rows; step 5 remains blocked on D1492/D1493, both filed as
+  refutation pins that still run today.**
 - ✅ **Modernization program — (6) the #2419 class cannot come back: three guards, DONE.**
   The owner's question after (5) was "how do we prevent this in the future"; the answer is
   one guard per moment. **Review time**: `arena-scan-outside-pass` (`compiler/lint.vl`) —
@@ -426,7 +430,7 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   predicate + emitter walk keyed on the RHS type); OQ-1 (b)'s intrinsic stays for the
   binary source and `serialize`. Position matrix before the checker narrows (D965).
   Compiler-side work; the compile-goal session's surface once the sub-rules are ruled.
-- **Numeric `as` honours the trio — RULED (owner, 2026-09-02), NOT BUILT.** A numeric `as`
+- **Numeric `as` honours the trio — RULED (owner, 2026-09-02), DONE.** A numeric `as`
   to an INTEGER target is exact-or-fail: `f64 → i32`/`i64` succeeds iff integral and in
   range, `i64 → i32` iff in range (no wrap), `i32 → i64`/`f64` cannot fail; failure is the
   trio's — bare `as` propagates `null` (the return must carry `| null`, else the checker
@@ -1232,7 +1236,7 @@ in-language GC knobs.
   Miss one and a script runs under the CLI and fails under `deno task test`. Keep the ABI tiny, land it
   as one batch. These are the same syscalls a `vl` CLI written in VL needs, so it is step 1 of Track H.
 
-- ⬜ **`match` over ALL unions, not just literal unions.** Verified at `cd69bd9`: a litunion scrutinee
+- ✅ **`match` over ALL unions, not just literal unions.** Verified at `cd69bd9`: a litunion scrutinee
   works, and both other union kinds are rejected by the checker —
   `match scrutinee must be a literal union, got {c: i32} | {d: i32}` and `…got i32 | string`. The
   workaround is an `is`-chain, which works but is not exhaustiveness-checked — so the one property that
@@ -1247,6 +1251,10 @@ in-language GC knobs.
   **Distinct from webcraft's P2 "match phase 2" (variant payload binding, `Move{x,y} => …`)** — that
   extends the *arm*, this extends the *scrutinee* — but they share the narrowing and lowering work, so
   do them adjacently and let phase 2 ride the tag-switch this lands.
+  **STATUS 2026-09-05: DONE — #1131 (B21 phase 2a) shipped `match` over every non-literal-member
+  union (struct/scalar/mixed, both `| null` spellings) with full exhaustiveness checking; verified
+  today by running a struct-union and a scalar-union `match` to completion and confirming a missing
+  arm is a compile error. A union with a LITERAL member still refuses (its own, narrower reason).**
 
 > **#2 priority — drive the rep-composition fuzz baseline to 0** (`scripts/rep-fuzz-baseline.txt`;
 > item 2 below). Every remaining entry is a fail-loud REJECT — a coverage gap the compiler refuses
@@ -1438,11 +1446,19 @@ in-language GC knobs.
      over the corpus and was retired; the residual 81 span/ergonomic deltas are recorded in
      `docs/internals/vl-tech-debt.md` (native is the spec now — "match the TS span" is no longer a goal).
   Follow-through that outlived the TS kill (separate, still open):
-  - ⬜ Delete the gated deno-side RUN half + its 305-file whitelist outright (see F-tiers).
-  - ⬜ `std:` Phase 2 (H0) written in VL — DESIGNED: `docs/internals/std-design.md` (the `std:` scheme,
+  - ✅ Delete the gated deno-side RUN half + its 305-file whitelist outright (see F-tiers).
+    **STATUS 2026-09-05: DONE — `docs/internals/deno-deprecation.md` §J1: "the deletions this
+    bullet named are already done", `SELFHOST_DENO_RUN` gone from the tree; the residue is the
+    narrower, separately-tracked F-tiers item (re-hosting four remaining V8-executing tests onto
+    the native runner).**
+  - ✅ `std:` Phase 2 (H0) written in VL — DONE: `docs/internals/std-design.md` (the `std:` scheme,
     hybrid delivery, the two-primitive intrinsic floor + `__trap__`, slices 0–6 with gates; six
     open decisions flagged for the maintainer). Doubles as the demand-driven discovery engine
     for the remaining emitter long tail (each gap fails loudly).
+    **STATUS 2026-09-05: DONE — all six slices landed** (`std:fmt`, `std:test` v1+v2 including
+    generic `expect<T>` #2104, `std:list` superseded by the `T[]` array ruling, `std:map`/
+    `std:set` superseded by language-level `Map()`/`Set()`) and OD1 (release packaging) resolved
+    by #2505 (std ships inside the binary).
   - The `.vl` compiler is the spec, so a parked soundness xfail is a fixable bug rather than a
     parity constraint. Two have since flipped to ordinary passing pins on exactly that reasoning:
     arith-hole-operand (A13), and array-element-recursion, whose premise that `{[i32]: T}` spells
@@ -1464,7 +1480,7 @@ in-language GC knobs.
   through default arguments rather than an attribute, and `expect`-only**; ~~generic
   `expect<T>`~~ **DONE (#2104)** + structural diffs, power-`assert` rewriting. New behavioral tests switch to `*.test.vl` at v1 (directive-corpus
   growth stops; conversion waits for the TS-tier teardown).
-- 🟡 **Error-handling design** — RULED and PARTLY BUILT: `docs/error-handling-design.md`
+- ✅ **Error-handling design** — RULED and BUILT: `docs/error-handling-design.md`
   (errors-as-values via unions — `T | null` for absence, `T | E` with a structural `IoError`
   alias for reasoned failure, traps (`__trap__(msg)`) for bugs; no catchable throw in v1, `exnref`
   reserved for a possible async era, Go-style multi-value returns ruled out; union-`as`
@@ -1477,6 +1493,10 @@ in-language GC knobs.
   its lowering emits correct bytes while the binding/consumer classifiers still need a
   nullable arm each. It is the member the design itself calls lossy, so nothing waits on it.
   Also open: the seven O1–O7 questions, of which O5/O6 are settled by the above.
+  **STATUS 2026-09-05: DONE — `as?` completed by #1889 ("the last arm shape; `as?` is
+  complete"), covering the value-atom, struct-arm and sub-union targets; O1–O7 in
+  `docs/error-handling-design.md` are each RULED, with O6(b) user-defined casts the one
+  sub-question left genuinely open.**
 - ✅ **Explicit numeric conversion syntax — SHIPPED; this entry was STALE.** The lossless-only
   implicit-widening rule (#298) makes the lossy edges expressible only via a cast, and that cast
   **exists**: `as` covers every edge this item named — `i32 as f32`, `i64 as f64`, and the

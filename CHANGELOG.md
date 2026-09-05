@@ -8,6 +8,16 @@ see **`DECISIONS.md`**.
 
 ## Type system (Track A)
 
+- **Nine `ROADMAP.md` headings re-graded against the tree; no bullet removed.** Each carried a
+  status word (`TO BUILD`, `NOT BUILT`, ⬜, 🟡) contradicted by a closed inventory row, a landed
+  PR, or a program run against today's compiler — the else-less-`if`-as-value ruling (D1086,
+  "TO BUILD" → built), numeric `as`'s trio (D1041, "NOT BUILT" → done), the inventory
+  one-file-per-row split (#2437, landed twice as stale in the doc), the registry-by-key item 4
+  duplicate (4b already shipped as #2473), `match` over every non-literal-member union (#1131,
+  verified by running a struct- and a scalar-union `match` to completion), the deno-side RUN
+  half + 305-file whitelist deletion, `std:` Phase 2 (all six slices landed), and the
+  error-handling design's `as?` remainder (#1889, all three targets verified by running them).
+  Docs only.
 - **THE UFCS `is not imported` DIAGNOSTIC NOW ENDS WITH THE EXACT LINE TO PASTE** — glean's VL-002 (R3) called the sentence excellent but costly to act on, so it now closes with `` — add `import { loadU8 } from "std:buffer"` `` (or, when the file already imports from that module, `` — add `loadU8` to the existing `import { … } from "std:buffer"` ``), unchanged when two candidate modules compete since the fix is then a choice between them. Diagnostics only — emitted wasm byte-identical, distilled corpus 0 classes moved; fixtures under `tests/cases/modules/ufcs-not-imported*`, exact-message assertions in `tests/vl_ufcs_import_suffix_test.ts`.
 - **The compiler writes its murmur constants as the hex they are.** `fbI32Const(0x85ebca6b)` and `fbI32Const(0xc2b2ae35)` replace `0 - 2048144789 // 0x85ebca6b` and its twin, now that the published `seed-latest` carries the hex-literal rule (#2543; the rewrite was held out of that PR because the released seed could not yet compile it). The two compilers emit identical bytes for every program; the seed itself is 12 bytes smaller because the subtraction is no longer emitted.
 - **A NAMED ARGUMENT NOW RESOLVES AGAINST THE DECLARATION THE CALLEE'S NAME DENOTES (D1604)** — found by the code-quality survey (§3.1 of `front-end-and-checker.md`): `g(alpha: 8)` through a closure-typed parameter read its parameter names off `fnDeclIx`, the flat top-level table, so an unrelated `function g(alpha: i32)` made the call `vl check` rc 0 and the emitter refuse it — renaming that declaration's parameter changed whether the program type-checked. The arm now reads the names off `calleeDeclParams`, the scope-aware resolver the same arm already used for defaults, and the caller audit fixed two more by-name sites: the UFCS arity range, where a shadowed callee inherited the module function's DEFAULTS and produced check-clean invalid wasm, and the unimplemented-intrinsic refusal, which fired on a parameter spelled `__store_string__`. A 30-cell grid moves 5 cells to one loud refusal with every positional control keeping its value, 0 emit refusals and 0 SILENT; capability probes 140 → 141 of 144, distilled corpus 0 classes moved. Row [D1604](docs/internals/inventory/D1604.md).
