@@ -466,12 +466,15 @@ Both defects this replaces were silent, and both are one command to see now:
   `./build/vl-compiler.wasm`) and 2,046,575 from anywhere else (the embedded seed).
 
 `vl --version` now names both resolutions and the rung each came from, plus the
-commit the binary was built from and a std digest; when a development override is in
-effect it says so, and prints the embedded digest beside it so the difference is the
-thing you see. A distribution binary also prints one stderr line the moment
-`$VL_STD` or `$VL_COMPILER_WASM` is honoured. A development build does not — it *is*
-the exception, `$VL_STD` is how its own gates pin the tree under test, and the
-announcement would be one line per invocation across every suite.
+commit the binary was built from and a digest for EACH of the seed and the std — a
+byte count alone cannot tell two same-sized seeds apart, which is what a consumer
+pinning a copy of `dist/vl` needs to diff between builds without a round-trip; when
+a development override is in effect it says so, and prints the embedded std digest
+beside it so the difference is the thing you see. A distribution binary also prints
+one stderr line the moment `$VL_STD` or `$VL_COMPILER_WASM` is honoured. A
+development build does not — it *is* the exception, `$VL_STD` is how its own gates
+pin the tree under test, and the announcement would be one line per invocation
+across every suite.
 
 ### `vl std` — the sibling of `vl seed`
 

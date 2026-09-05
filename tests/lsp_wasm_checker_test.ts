@@ -661,6 +661,80 @@ Deno.test({ name: "wasm-checker: lint surfaces unused-pure-expression, tagged un
   }
 });
 
+// ── the lint range comes from the RULE, not from a host guess ───────────────
+//
+// The host used to widen a lint finding to the identifier starting at `col`
+// (`wordEndCol`), while the CLI widened it to `col + 1`: two guesses, neither of them
+// the rule's own answer, and they disagreed — a kind-ladder finding read two columns
+// wide in VS Code and one in `vl check`. The seed now carries `[col, endCol)` per rule
+// and both faces read it. Every expectation below is DERIVED from the source text, so
+// this cannot pass by recording whatever the compiler emits.
+
+/** The source text an LSP range underlines. Ranges are 0-based, end exclusive. */
+const rangeText = (src: string, r: { start: { line: number; character: number }; end: { line: number; character: number } }): string => {
+  if (r.start.line !== r.end.line) return "";
+  return (src.split("\n")[r.start.line] ?? "").slice(r.start.character, r.end.character);
+};
+
+Deno.test({ name: "wasm-checker: a lint range covers what the message names", ignore }, () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const src = "function neverCalledHelper(unusedParameterName: i32) {\n" +
+    "  let neverReassignedLocal = 1\n" +
+    "  neverReassignedLocal + 2\n" +
+    "}\n" +
+    "print(1)\n";
+  const diags = checker.lint(src);
+  for (const code of ["unused-function", "unused-variable"]) {
+    const d = diags.find((x) => x.code === code);
+    if (d === undefined) throw new Error(`no ${code} in ${JSON.stringify(diags.map((x) => x.code))}`);
+    const named = /`([^`]*)`/.exec(d.message)?.[1] ?? "";
+    if (rangeText(src, d.range) !== named) {
+      throw new Error(
+        `${code}: want the range over ${JSON.stringify(named)}, got ` +
+          `${JSON.stringify(rangeText(src, d.range))} at ${JSON.stringify(d.range)}`,
+      );
+    }
+  }
+  // `prefer-const` is anchored at the `let` keyword its fix rewrites, so its range is
+  // that keyword — not the name the message names, and not one character of it.
+  const pc = diags.find((d) => d.code === "prefer-const");
+  if (pc === undefined) throw new Error("no prefer-const fired");
+  if (rangeText(src, pc.range) !== "let") {
+    throw new Error(`prefer-const: want the range over "let", got ${JSON.stringify(rangeText(src, pc.range))}`);
+  }
+});
+
+Deno.test({ name: "wasm-checker: a sentinel-index range covers the whole read", ignore }, () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // The owner's case: `const n = P.nodes[ix]` highlighted `P`, one column, because the
+  // host widened to the identifier at `col`. The rule's own span is the read.
+  const src = "type Node = { nKid: i32 }\n" +
+    "let nodes: Node[] = []\n" +
+    "function holeOf(n: Node) {\n" +
+    "  if n.nKid < 0 { return -1 }\n" +
+    "  n.nKid\n" +
+    "}\n" +
+    "function readIt(n: Node) {\n" +
+    "  const kid = nodes[n.nKid]\n" +
+    "  kid.nKid\n" +
+    "}\n" +
+    "print(holeOf({ nKid: 1 }) + readIt({ nKid: 0 }))\n";
+  const diags = checker.lint(src);
+  const d = diags.find((x) => x.code === "sentinel-index-unguarded");
+  if (d === undefined) throw new Error("no sentinel-index-unguarded fired");
+  const named = /`([^`]*)`/.exec(d.message)?.[1] ?? "";
+  if (rangeText(src, d.range) !== named || named !== "nodes[n.nKid]") {
+    throw new Error(
+      `want the range over "nodes[n.nKid]", got ${JSON.stringify(rangeText(src, d.range))}`,
+    );
+  }
+  // The CONTROL for "the host is no longer guessing": the identifier `wordEndCol` would
+  // have widened to is `nodes`, five characters, and the range is longer than that.
+  if (d.range.end.character - d.range.start.character <= "nodes".length) {
+    throw new Error("the range is no wider than the host's old identifier guess");
+  }
+});
+
 Deno.test({ name: "wasm-checker: lint returns [] on a parse error", ignore }, () => {
   const checker = loadWasmChecker(SEED, log)!;
   if (checker.lint("function f( {\n").length !== 0) {

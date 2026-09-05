@@ -140,6 +140,10 @@ const createClient = (
       // without it the ladder always ran `vl` from PATH and the setting only
       // steered the Run command — found by the editor-surface survey.
       compilerPath: config.get<string>("compilerPath", ""),
+      // `vital.lint.showHeld` — show the lint findings a committed per-file ratchet
+      // already holds, as greyed hints. Off by default: a file at its baseline reads
+      // as clean, which is how the gate reads it.
+      lintShowHeld: config.get<boolean>("lint.showHeld", false),
     },
   };
   const client = new LanguageClient("Vital", serverOptions, clientOptions);
