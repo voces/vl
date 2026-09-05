@@ -617,8 +617,14 @@ For any doc whose rows are `### <ID> — <title>` + a `**<status>**` line + a `R
 that is one command:
 
 ```sh
-python3 scripts/check-filed-witnesses.py --strict docs/internals/inventory
+python3 scripts/check-filed-witnesses.py --strict docs/internals/inventory docs/internals/inventory-2
 ```
+
+**THERE ARE TWO INVENTORIES AND THE COMMAND TAKES SEVERAL.** `inventory-2/` holds the
+coverage gaps of inventory #1 and numbers independently — D1–D14 exist in both as different
+defects — and until the `filed witnesses` gate row named it too, its 17 rows were re-run by
+nothing. They graded `17 as filed` on the day they joined the gate, which is what a LATENT
+gap looks like: a row does not announce that nobody has re-run it.
 
 **The inventory is ONE FILE PER ROW** (`docs/internals/inventory/D1042.md`), because every
 defect PR appended to one file's tail and two concurrent PRs conflicted there nearly every
