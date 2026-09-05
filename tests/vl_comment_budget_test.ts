@@ -13,7 +13,7 @@
 //
 // @test-timing sweep n=30
 
-import { COMPILER, ROOT, VL, exists, nativeEnv } from "./support/tree.ts";
+import { COMPILER, ROOT, VL, exists, nativeEnv, pythonBin } from "./support/tree.ts";
 
 const SCRIPT = `${ROOT}/scripts/comment-budget.py`;
 const TOO_LONG = "comment-block-too-long";
@@ -147,7 +147,7 @@ const DEP = `export function dep(): i32 { 7 }\n`;
 type Hits = { lines: Record<string, number[]>; msgs: string[] };
 
 const script = async (path: string): Promise<Hits> => {
-  const { code, stdout, stderr } = await new Deno.Command("python3", {
+  const { code, stdout, stderr } = await new Deno.Command(pythonBin(), {
     args: [SCRIPT, "--grade", path],
     stdout: "piped",
     stderr: "piped",
@@ -329,7 +329,7 @@ Deno.test({
   name: "comment rules: the ratchet walks compiler/ only",
   ignore: !ENABLED,
   fn: async () => {
-    const { code, stdout, stderr } = await new Deno.Command("python3", {
+    const { code, stdout, stderr } = await new Deno.Command(pythonBin(), {
       args: [SCRIPT],
       stdout: "piped",
       stderr: "piped",

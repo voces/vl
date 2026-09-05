@@ -26,7 +26,7 @@
 //
 // @test-timing sweep n=30
 
-import { COMPILER, ROOT, VL, exists, nativeEnv } from "./support/tree.ts";
+import { COMPILER, ROOT, VL, exists, nativeEnv, pythonBin } from "./support/tree.ts";
 
 const SCRIPT = `${ROOT}/scripts/sentinel-budget.py`;
 const UNGUARDED = "sentinel-index-unguarded";
@@ -265,7 +265,7 @@ function reader(n: i32): i32 {
 type Hits = { at: Record<string, string[]>; msgs: Record<string, string[]> };
 
 const script = async (path: string): Promise<Hits> => {
-  const { code, stdout, stderr } = await new Deno.Command("python3", {
+  const { code, stdout, stderr } = await new Deno.Command(pythonBin(), {
     args: [SCRIPT, "--grade", path],
     stdout: "piped",
     stderr: "piped",
@@ -367,7 +367,7 @@ Deno.test({
   name: "sentinel-index: the committed baseline is at or above the tree, and --check passes",
   ignore: !ENABLED,
   fn: async () => {
-    const { code, stdout, stderr } = await new Deno.Command("python3", {
+    const { code, stdout, stderr } = await new Deno.Command(pythonBin(), {
       args: [SCRIPT, "--check"],
       stdout: "piped",
       stderr: "piped",
