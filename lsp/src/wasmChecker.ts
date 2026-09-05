@@ -279,6 +279,11 @@ export type WasmImportedSource = {
  * `name` is the exported name; `declLine`/`declCol` locate the decl NAME (1-based
  * line, 0-based col — the native convention), `kwLine`/`kwCol` the `export`
  * KEYWORD. Used by the project-wide unused-export pass to place its hints.
+ *
+ * `origin` is `""` for a name this module DECLARES and the resolved key of the
+ * declaring module for a RE-EXPORT (`export { a } from "std:str"`) — the two are
+ * one surface to an importer and two different things to a reader that wants to
+ * edit the declaration, so every reader must decide which it means.
  */
 export type WasmModuleExport = {
   name: string;
@@ -286,6 +291,7 @@ export type WasmModuleExport = {
   declCol: number; // 0-based column
   kwLine: number; // 1-based native line of the `export` keyword
   kwCol: number; // 0-based column of the `export` keyword
+  origin: string; // "" when declared here; else the re-export's source module key
 };
 
 /**
@@ -1321,6 +1327,14 @@ export const createWasmChecker = (
     typeof exp.expKwLineAt === "function" &&
     typeof exp.expKwColAt === "function";
 
+  // The RE-export table (`export { a } from "spec"`) rides a later seed than the
+  // declaration table. An older seed reports declarations only — the surface a
+  // reader gets is then narrower, never wrong.
+  const hasReExports = (exp: Exports): boolean =>
+    typeof exp.reExpCount === "function" &&
+    typeof exp.reExpNameLen === "function" &&
+    typeof exp.reExpKeyLen === "function";
+
   const moduleSurface = (
     source: string,
     entryKey: string,
@@ -1352,7 +1366,38 @@ export const createWasmChecker = (
         declCol: exp.expDeclColAt(i),
         kwLine: exp.expKwLineAt(i),
         kwCol: exp.expKwColAt(i),
+        origin: "",
       });
+    }
+
+    // Re-exports, appended after the declarations so a name this module both
+    // declares and re-exports keeps its DECLARATION entry (the readers here all
+    // take the first entry for a name).
+    if (hasReExports(exp)) {
+      const declared = new Set(exports.map((e) => e.name));
+      const reCount = exp.reExpCount();
+      for (let i = 0; i < reCount; i++) {
+        if (exp.reExpModAt(i) !== 0) continue; // entry module only
+        const name = readString(
+          exp.reExpNameLen(i),
+          (j) => exp.reExpNameCharAt(i, j),
+        );
+        if (name.length === 0 || declared.has(name)) continue;
+        declared.add(name);
+        const origin = readString(
+          exp.reExpKeyLen(i),
+          (j) => exp.reExpKeyCharAt(i, j),
+        );
+        if (origin.length === 0) continue; // unresolved specifier — no origin to name
+        exports.push({
+          name,
+          declLine: exp.reExpDeclLineAt(i),
+          declCol: exp.reExpDeclColAt(i),
+          kwLine: exp.reExpKwLineAt(i),
+          kwCol: exp.reExpKwColAt(i),
+          origin,
+        });
+      }
     }
 
     const imports: WasmModuleImport[] = [];

@@ -1621,20 +1621,35 @@ export const ufcsCompletions = (
   return out;
 };
 
-/** One std-module export the auto-import pass may offer. */
+/**
+ * One std-module export the auto-import pass may offer. `origin` is set only
+ * when the module RE-exports the name rather than declaring it (the resolved key
+ * of the module it comes from), which is what `stdAutoImportCompletions` ranks on.
+ */
 export type StdExportCandidate = {
   name: string;
   kind: CompletionKind;
   detail?: string;
+  origin?: string;
 };
+
+/** Whether `source` already has an `import { … } from "<key>"` statement. */
+const importsModule = (source: string, key: string): boolean =>
+  new RegExp(`import\\s*\\{[^}]*\\}\\s*from\\s*"${escapeRegExp(key)}"`)
+    .test(source);
 
 /**
  * Auto-import completion items over `stdExports` (module key → exports, from
  * the server's cached per-module surface scan): every export whose name is not
- * already in scope (`inScope`) yields ONE item — first module wins on a name
- * two modules export — carrying the providing module key as `description` and
- * the import rewrite as `extraEdits`. Modules are visited in sorted-key order
- * so the winner is deterministic.
+ * already in scope (`inScope`) yields ONE item, carrying the providing module
+ * key as `description` and the import rewrite as `extraEdits`.
+ *
+ * A name several modules offer — `std:str` DECLARES `join`, `std:fmt`
+ * RE-EXPORTS it — picks the provider in this order: a module the file ALREADY
+ * imports from (the accepted item then extends that statement instead of adding
+ * a second one), else the module that declares the name, else the sorted-first
+ * re-exporter. Modules are visited in sorted-key order so every tie is
+ * deterministic.
  */
 export const stdAutoImportCompletions = (
   source: string,
@@ -1642,22 +1657,32 @@ export const stdAutoImportCompletions = (
   inScope: (name: string) => boolean,
   formatImport?: (stmt: string) => string | undefined,
 ): Completion[] => {
-  const out: Completion[] = [];
-  const offered = new Set<string>();
+  // Group by name first: the winner among the modules offering a name cannot be
+  // decided while walking one module at a time.
+  const byName = new Map<string, { key: string; exp: StdExportCandidate }[]>();
   for (const key of [...stdExports.keys()].sort()) {
     for (const exp of stdExports.get(key) ?? []) {
-      if (inScope(exp.name) || offered.has(exp.name)) continue;
-      const edit = importInsertionEdit(source, key, exp.name, formatImport);
-      if (edit === undefined) continue; // imported but not in scope; defensive
-      offered.add(exp.name);
-      out.push({
-        name: exp.name,
-        kind: exp.kind,
-        detail: exp.detail,
-        description: key,
-        extraEdits: [edit],
-      });
+      if (inScope(exp.name)) continue;
+      const bucket = byName.get(exp.name);
+      if (bucket === undefined) byName.set(exp.name, [{ key, exp }]);
+      else bucket.push({ key, exp });
     }
+  }
+
+  const out: Completion[] = [];
+  for (const [, offers] of byName) {
+    const pick = offers.find((o) => importsModule(source, o.key)) ??
+      offers.find((o) => o.exp.origin === undefined) ??
+      offers[0];
+    const edit = importInsertionEdit(source, pick.key, pick.exp.name, formatImport);
+    if (edit === undefined) continue; // imported but not in scope; defensive
+    out.push({
+      name: pick.exp.name,
+      kind: pick.exp.kind,
+      detail: pick.exp.detail,
+      description: pick.key,
+      extraEdits: [edit],
+    });
   }
   return out;
 };
