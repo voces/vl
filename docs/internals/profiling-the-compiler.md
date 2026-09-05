@@ -56,6 +56,44 @@ so the self-compile never paid it, and the shape family had no axis for the enti
 (`callback slots`) is the third guard's new row, and it is what a second instance of a class
 owes.
 
+## Measured 2026-09-05 — the third instance, and the one whose comment named the wrong table
+
+`tests/vl_scaling_shape_test.ts`'s `generic pins` axis carried a bar of 9.0 and a comment
+saying `collectA` "interns each pin through `tyTopIndexOf` … a linear scan of the type-name
+registry". It does not: `tyTopIndexOf` is a per-character bracket walk over a *string* with no
+table, and `grep -c tyTopIndexOf compiler/emit_collect.vl` is 0 — `perf-opportunities-2026-09.md`
+§B4 established that a day earlier and the comment went on asserting it. The axis is the
+#2419 shape one phase further out: `monoRebuild` re-runs FOUR whole-program passes once per
+minted instance, and again after that instance's body walk.
+
+The many arm at 200 / 400 / 800 pins, guest samples (`--names` seed, `profile-rank.py`):
+
+| frame | 200 | 400 | 800 | one arm (400) | samples 200 → 800 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **total samples** | 1,244 | 4,910 | 19,157 | 630 | ×15.4 for ×4 the pins |
+| `monoRebuild` incl | 63.2% | 72.4% | 79.5% | **0.0%** | 786 → 15,234 (×19.4) |
+| `collectA` incl | 58.7% | 66.5% | 71.8% | 1.8% | 730 → 13,763 (×18.9) |
+| `collectTyParamNames` self | 16.2% | 18.0% | 20.0% | 0.5% | 201 → 3,828 (×19.0) |
+| `collectA` self | 15.7% | 17.7% | 18.9% | — | 195 → 3,619 (×18.6) |
+| `__str_eq__` self | 11.7% | 10.7% | 11.2% | 17.1% | 145 → 2,151 (×14.8) |
+| `globalCellKind` self | 7.3% | 7.6% | 7.9% | — | 91 → 1,515 (×16.6) |
+| `tyTopIndexOf` self | 3.6% | 4.6% | 4.8% | — | 45 → 918 (×20.4) |
+
+Every share is roughly flat and every count is ×16–20 for ×4 the pins: the whole many-arm
+compile is quadratic, not one frame inside it, which is what a per-entity whole-program pass
+looks like. `collectA`'s own children at 800 are `collectTyParamNames` 27.8%, self 26.3%,
+`forceNestedCloSigReps` 10.8%, `__str_eq__` 8.3%, `nulScalarListKindOfNode` 7.5% — annotation
+text work, spread thin, with no registry under it.
+
+**The fix is a stamp, not an index.** All four passes read the arena and nothing else, so
+`monoRebuild` skips when `P.nodes.length + fnStmts.length + fnParent.length + monoArenaTick`
+has not moved, `monoArenaTick` counting the ten in-place writes `emit_mono.vl` makes to a node
+field or an `fnStmts`/`fnParent` slot. `collectTyParamNames` additionally resumes from
+`genTyParamSeen` rather than rescanning. After: 7,850 samples at 800 pins (0.41×),
+`monoRebuild` 58.9% inclusive, `collectTyParamNames` 0.03% self, axis bar 9.0 → 6.0. What is
+left is `globalCellKind` at 16.0% self, reached from `exprIsClosure`: it has a memo, and the
+same arena growth stamps it stale once per instance.
+
 ## Guards
 
 Three, and they fire at different moments. Profiling is what you do AFTER one of them does.

@@ -261,6 +261,24 @@ import { collectValuedReturnsIn } from "./emit_query"
 // layout. Recorded here and re-pointed the moment the instance is lifted.
 let monoLamMintedSlots: i32[] = []
 
+// The arena shape `monoRebuild`'s four whole-program passes are a pure function of:
+// `P.nodes`, `fnStmts` and `fnParent` grow, and `monoArenaTick` counts what lands IN PLACE,
+// which no length can see. Every in-place write in this module calls `monoArenaTouch` or
+// carries an `arena-tick exempt:` line; `tests/vl_mono_arena_tick_test.ts` enforces that.
+let monoArenaTick = 0
+let monoRebuiltStamp = 0 - 1
+
+function monoArenaStamp() {
+  P.nodes.length + fnStmts.length + fnParent.length + monoArenaTick
+}
+
+// Record an in-place write to a node field or to a `fnStmts`/`fnParent` slot: no length
+// moves, so the stamp needs the count to see it. Every such write in this module calls it.
+function monoArenaTouch() {
+  monoArenaTick = monoArenaTick + 1
+  0
+}
+
 // D1046 — is this the first instance of the generic being built? Read by the nested
 // named-function arm alone: at `count == 0` the instance reuses the template's own
 // slot, so template and clone would be two children of one frame under one name and
@@ -1420,10 +1438,14 @@ function monoReparentNestedLams(mark: i32, parentSlot: i32) {
       fnParent[s] = parentSlot
       wrote = true
     }
+    // arena-tick exempt: this module's own scratch list of slots already re-pointed, read by no pass.
     monoLamMintedSlots[k] = -1
     k = k + 1
   }
-  if wrote { invalidateFnChildIndex() }
+  if wrote {
+    monoArenaTouch()
+    invalidateFnChildIndex()
+  }
   0
 }
 
@@ -1579,6 +1601,7 @@ function monoCloneLambdaSubst(
       const tSlot = monoSlotOfLamNode(fnIx)
       if tSlot >= 0 {
         fnStmts[tSlot] = clone
+        monoArenaTouch()
         monoNamedTmplNode.push(fnIx)
         monoNamedTmplSlot.push(tSlot)
         monoReparentNestedLams(mark, tSlot)
@@ -1953,15 +1976,18 @@ function monoPinMapLambdas(
   ix
 }
 
-// Rebuild the name→index map and the voidness/return-kind inference after a new
-// instance lands in `fnStmts`, so later argument classification sees its
-// concrete signature. Also re-runs `collectA` (a pinned `string[]`/`f64`
-// annotation may force list/array types the original generic name never did).
+// Rebuild the name→index map, the voidness/return-kind inference and `collectA`'s rep rows
+// after a new instance lands in `fnStmts`: a pinned `string[]`/`f64` annotation forces types
+// the original generic name never did. All four read the arena and nothing else, so an
+// unmoved stamp means the state they would produce is the state already in hand.
 function monoRebuild() {
+  const stamp = monoArenaStamp()
+  if stamp == monoRebuiltStamp { return 0 }
   if collectA(monoProgStmts) < 0 { return -1 }
   if buildFnMap(monoProgStmts) < 0 { return -1 }
   computeVoidFns()
   computeRetInference()
+  monoRebuiltStamp = stamp
   0
 }
 
@@ -2951,6 +2977,7 @@ function monoMakeInstance(
           if !keepCallRef {
             if cal.identName != monoInstName[k] {
               cal.identName = monoInstName[k]
+              monoArenaTouch()
               // R4 writer 5 of 8 (`compiler/symbols.vl`; census in `perf-program.md`).
               sidNoteNodeName(calleeIx)
             }
@@ -2973,6 +3000,7 @@ function monoMakeInstance(
                     // the type under the same pin this column holds. Equivalent
                     // to the clone arm only while this caller's column is all -1.
                     hpp.parType = synthTypeRef(pinned[hp], -1)
+                    monoArenaTouch()
                   }
                 }
                 hp = hp + 1
@@ -3473,6 +3501,7 @@ function monoMakeInstance(
     if count == 0 {
       // First instance: keep the bare name and the original's wasm index.
       fnStmts[origFe] = nfn
+      monoArenaTouch()
     } else {
       // D971 — a lifted capturing instance takes its env as a leading `structref` param,
       // so a by-name call to it is sound. What is not is the rename folding a call into
@@ -3502,6 +3531,7 @@ function monoMakeInstance(
         const msl = monoLamMintedSlots[mls]
         if msl >= 0 && msl < fnParent.length {
           fnParent[msl] = instFe
+          monoArenaTouch()
           mlsWrote = true
         }
         mls = mls + 1
@@ -3512,6 +3542,7 @@ function monoMakeInstance(
       // R4 writer 6 of 8 (`compiler/symbols.vl`; census in `perf-program.md`).
       if cal2 is Ident {
         cal2.identName = instName
+        monoArenaTouch()
         sidNoteNodeName(calleeIx)
       }
     }
@@ -4205,6 +4236,7 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
           // R4 writer 7 of 8 (`compiler/symbols.vl`; census in `perf-program.md`).
           if cal is Ident {
             cal.identName = monoInstName[r]
+            monoArenaTouch()
             sidNoteNodeName(c.callFn)
           }
           return 0
@@ -4254,6 +4286,7 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
       // R4 writer 8 of 8 (`compiler/symbols.vl`; census in `perf-program.md`).
       if cal2 is Ident {
         cal2.identName = specName
+        monoArenaTouch()
         sidNoteNodeName(c.callFn)
       }
       monoKeys.push(key)
@@ -4585,6 +4618,7 @@ function monoNamesUsedAsValue(names: string[]): i32[] {
     const cn = P.nodes[j]
     if cn is Call {
       const cf = cn.callFn
+      // arena-tick exempt: `isCallee` is a local declared in this function.
       if cf >= 0 && cf < isCallee.length { isCallee[cf] = 1 }
     }
     j = j + 1
@@ -4596,6 +4630,7 @@ function monoNamesUsedAsValue(names: string[]): i32[] {
       if idn is Ident {
         let m = 0
         while m < names.length {
+          // arena-tick exempt: `hit` is this function's own out-parameter list.
           if names[m] == idn.identName { hit[m] = 1 }
           m = m + 1
         }
@@ -4699,6 +4734,8 @@ function monoSlotParamPins(fe: i32, out: string[]) {
 // bodies are walked as they are created. Usage-gated: a program with no generic
 // declaration and no concrete higher-order function returns immediately.
 export function monomorphize(stmts: i32[]) {
+  monoArenaTick = 0
+  monoRebuiltStamp = 0 - 1
   monoGen = []
   monoOrigNode = []
   monoKeys = []
@@ -4875,6 +4912,7 @@ export function monomorphize(stmts: i32[]) {
             mkBlock([], gfn.pos),
             gfn.pos,
           )
+          monoArenaTouch()
         }
       }
     }

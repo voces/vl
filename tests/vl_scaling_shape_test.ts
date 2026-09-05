@@ -13,9 +13,11 @@
 
 // FOUR AXES ARE SUPER-LINEAR TODAY and carry a bar above their measured ratio rather
 // than the default. That is recorded DEBT, not tolerance: each names the function that
-// makes it so, and every one is a name-keyed registry answering a lookup by linear scan
-// — the track `__str_eq__` has topped the self-compile profile since #2419 closed the
-// arena scans. Lower the bar when the registry it names stops being a list. The fourth,
+// makes it so. Three of the four are a name-keyed registry answering a lookup by linear
+// scan — the track `__str_eq__` has topped the self-compile profile since #2419 closed
+// the arena scans. `generic pins` is not one of them, and reading it as one cost a
+// campaign: it is a whole-program PASS re-run once per minted instance, the #2419 shape
+// one phase over. Lower a bar when the thing it names stops multiplying. The fourth,
 // `unions`, joined the list when a constant term left BOTH its arms, which is worth
 // keeping in mind before reading any ratio here as a property of its own axis.
 
@@ -304,10 +306,11 @@ axis("call sites", 2.5, "Callee resolution is scaling with the number of callees
 // them at 73% self. 800 modules against 400 is 4.45x, so a per-module arena scan would
 // roughly double this ratio and still be caught. Each function carries 30 statements so
 // the linear half is not startup-dominated; shrink that once those two stop scanning.
-// The three super-linear axes' bars carry ~2x headroom over the IDLE ratio (modules 2.58,
-// closures 2.22, generic pins 4.58): a ratio is load-tolerant but not load-proof — generic
-// pins read 6.16 against the old bar of 6 inside a fanned-out gate at load 92, a
-// comment-only PR. A doubling of the class (a new scan per pin) still clears every bar.
+// The super-linear axes' bars carry ~2x headroom over the IDLE ratio (modules 2.58,
+// closures 2.22): a ratio is load-tolerant but not load-proof — generic pins read 6.16
+// against a bar of 6 inside a fanned-out gate at load 92, a comment-only PR, and 10.5
+// against a bar of 9 in another, which is why that one's headroom is wider still.
+// A doubling of the class (a new scan per pin) still clears every bar.
 axis("modules", 5.0, "The module merge is scaling with the file count.", (d) => [
   writeModules(`${d}/many`, 400, 2, 30),
   writeModules(`${d}/one`, 200, 4, 30),
@@ -336,12 +339,12 @@ axis(
   (d) => twoFiles(d, genCallbacks(300, 1), genCallbacks(300, 20)),
 );
 
-// 1.68 / 0.38 / 4.37 — the widest gap in the family, and super-linear in the pin count
-// (0.23s at 200 pins, 0.84s at 400, 3.23s at 800). `collectA` is 68% inclusive on the
-// many arm against nothing on the one arm; its per-annotation intern goes through
-// `tyTopIndexOf` (compiler/tyname.vl) into `__str_eq__`, a linear scan of the type-name
-// registry, so N pins mint N rows and cost N^2 comparisons.
-axis("generic pins", 9.0, "`collectA` interns each pin through a linear registry scan.", (d) =>
+// Still super-linear in the pin count, and the one arm sits under `FLOOR`, so the quotient
+// is an absolute budget on the many arm and moves with box load. `monoRebuild`
+// (compiler/emit_mono.vl) re-runs four whole-program passes once per minted instance; what
+// is left of that is `globalCellKind`, whose memo the same arena growth throws away. The
+// bar, the profile and the interleaved A/B behind them: CHANGELOG.md, 2026-09-05.
+axis("generic pins", 6.0, "`monoRebuild` re-runs a whole-program pass per minted instance.", (d) =>
   twoFiles(d, genPins(400, true), genPins(400, false)));
 
 // ── the one RUNTIME axis ─────────────────────────────────────────────────────
