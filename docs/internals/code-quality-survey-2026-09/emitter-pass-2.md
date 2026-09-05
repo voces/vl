@@ -506,7 +506,7 @@ inclusive** on the many arm and **89.5% of it is that one call site**.
 the side-table id before paying the arena read and the `Param` narrowing; and both union-registry
 membership tests render the spelling on the far side of the test that discards it (`tyNameOf` is
 1.33% self, 95% of it under those two). Byte-identical output on master's own source and on all
-2,983 fixtures. The `functions` axis RATIO is unchanged — the work removed is per-identifier in
+2,989 fixtures. The `functions` axis RATIO is unchanged — the work removed is per-identifier in
 BOTH arms — so its bar stays at 2.5; the absolute arms fall, many 0.83 s → 0.79 s and one
 0.78 s → 0.73 s, with L2 self-compile 4.26 s → 4.04 s (min of five interleaved).
 
