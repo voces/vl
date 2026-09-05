@@ -2812,11 +2812,13 @@ seed from current `compiler/*.vl` in ~40s.*
     `SELFHOST_DENO_RUN` is gone from the tree entirely (→ `CHANGELOG.md`), along with the corpus
     RUN half, its 305-file whitelist, the V8-side golden fixpoint and the emit-program suite. **The
     actual residue is narrower and lives somewhere else: four deno tests still EXECUTE emitted wasm
-    under V8** via `tests/support/runWasm.ts` — `tests/cases_wasm_test.ts` (the whole behavioral
-    corpus, and the one that matters), plus `vl_exported_memory_test.ts`,
+    under V8** via `tests/support/runWasm.ts` — the four `tests/cases_wasm_{0,1,2,3}_test.ts`
+    shards (split from one `cases_wasm_test.ts` by #2451; the whole behavioral corpus, and the one
+    that matters), plus `vl_exported_memory_test.ts`,
     `vl_global_promotion_test.ts` and `vl_reexport_abi_test.ts`. REMAINING: move those onto the
-    native runner, which is what "removes Deno-as-an-engine" now means. **`cases_wasm_test.ts` is
-    the SOLE behavioral corpus oracle** and its `EXPECTED_DIVERGENCES` list is load-bearing, so it
+    native runner, which is what "removes Deno-as-an-engine" now means. **The `cases_wasm_*_test.ts`
+    shards are the SOLE behavioral corpus oracle** and their shared `EXPECTED_DIVERGENCES` list
+    (`tests/support/casesWasmOracle.ts`) is load-bearing, so it
     cannot simply be deleted — it has to be re-hosted. Also: the single-unit assembly compile was
     SUPERLINEAR in the TS host (~5s as a 2-module graph vs ~100s concatenated — wasmEmit.vl was the
     multiplier); that host is retired, so the note is history. (Landed → `CHANGELOG.md`: gating,

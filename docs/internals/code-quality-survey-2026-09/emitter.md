@@ -727,9 +727,11 @@ declarations by design — *"an exported one is public surface."* For `std/` tha
 list.
 
 *Change.* A fourth ratchet on the pattern of the existing three: a
-`scripts/dead-export-budget.py --check` over the compiler module graph, with a committed
-baseline that may only fall, and `--why` naming what left. `lint-self.sh` already resolves the
-whole module graph for a single-file `vl check`, so a `lint.vl` rule is also possible — but the
+`scripts/export-budget.py --check` over the compiler module graph, with a committed
+baseline that may only fall, and `--why` naming what left (landed under this name — the
+`dead-export-budget.py` name this paragraph proposed is not what shipped). `lint-self.sh`
+already resolves the whole module graph for a single-file `vl check`, so a `lint.vl` rule is
+also possible — but the
 script is the cheaper first cut and matches the shape the tree already runs three of.
 *Size* S. *Risk* none. *Proof*: the seed must be byte-identical after the 14 deletions (dead
 code emits nothing); the ratchet's own `--check`.
