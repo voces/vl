@@ -20,6 +20,8 @@
 //
 // GATING: env-gated (`SELFHOST_NATIVE_ALIGN=1`) AND requires the built vl binary +
 // seed wasm; absent either, every case registers ignored with a build note.
+//
+// @test-timing native
 
 import { COMPILER, VL, exists, nativeEnv } from "./support/tree.ts";
 

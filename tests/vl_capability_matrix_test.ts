@@ -12,6 +12,8 @@
 // can still SEE check-clean invalid wasm. It took that role from D1197's `.push`, which is
 // now the opposite control: the row it was filed against is closed, so an `array_push` cell
 // that stops grading RUNS is a regression rather than a blinded instrument.
+//
+// @test-timing instrument
 
 import { COMPILER, ROOT, VL, exists } from "./support/tree.ts";
 

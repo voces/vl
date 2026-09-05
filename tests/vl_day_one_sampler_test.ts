@@ -19,6 +19,8 @@
 // grammar's OWN list, so adding an axis nothing can generate fails here rather than
 // silently narrowing every future run. `modules_split` needs one assertion of its own:
 // its faces differ by the NUMBER OF FILES, which axis coverage cannot see.
+//
+// @test-timing instrument
 
 import { COMPILER, ROOT, VL, exists } from "./support/tree.ts";
 

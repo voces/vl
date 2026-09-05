@@ -35,10 +35,14 @@ const pushString = (push: (cp: number) => number, text: string) => {
   for (const ch of text) push(ch.codePointAt(0)!);
 };
 
+// The compiled Module is shared; the INSTANCE is what must be fresh, and it is. A
+// `WebAssembly.Module` is immutable, so it carries no state between the arms this
+// suite compares — the same split as `tests/support/sharedInstance.ts`.
+const module = seedExists ? new WebAssembly.Module(Deno.readFileSync(SEED)) : undefined;
+
 /** A FRESH instance per call — the baseline "compiled first" answer. */
 const freshInstance = (): Exports => {
-  const bytes = Deno.readFileSync(SEED);
-  const module = new WebAssembly.Module(bytes);
+  if (!module) throw new Error(`no seed at ${SEED}`);
   return new WebAssembly.Instance(module, {}).exports as unknown as Exports;
 };
 

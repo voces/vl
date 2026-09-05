@@ -17,6 +17,8 @@
 // GATING: same as the other `vl_*`/`selfhost_native_*` suites — env-gated
 // (`SELFHOST_NATIVE_ALIGN=1`) AND requires the built binary + seed wasm, so it
 // self-ignores on a fresh clone and runs in `ci-native` (which has a seed).
+//
+// @test-timing native
 
 import { COMPILER, VL, exists } from "./support/tree.ts";
 
