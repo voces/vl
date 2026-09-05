@@ -17,9 +17,9 @@ QUICK = a day, no design question. STRUCT = a design track.
 | 2 | ✅ **LANDED for 2 of 3 (§F2)** — split the heaviest ci-native files (§A3): `--parallel` is one worker per FILE, so the step's wall floor is the slowest file, 39.6 s | **−20…30 s** | S | none | per-file wall (`per-file-time.sh`) drops below the step's CPU/cores floor; case count unchanged | QUICK |
 | 3 | ✅ **LANDED (§F3)** — warm BOTH `.cwasm` engine tags in `refresh-compiler.sh`; it carried forward only the one its own `vl run` made | ~~−10 s CI~~ **a wash on the runner (§F7)**; **−330 s CPU** locally, 48% of the step | S | low | `ls build/*.cwasm` = 2 after a refresh; A/B the step's user CPU with `parallel-jit-storm.sh` | QUICK |
 | 4 | ✅ **LANDED (§F4)** — content-key the sidecar (`seed-<key>-<tag>.cwasm`, as the EMBEDDED path already does) instead of mtime | folds in #3; CI's seed cache survives a byte-identical rebuild | S | low | a rewritten byte-identical seed keeps `load_compiler` at 5 ms | QUICK |
-| 5 | `variantIndexOf` → sid-keyed index: 76 call sites, 13/13 in `wasmEmit.vl` per-expression, table FROZEN after `collectU` | **3.6%** of self-compile self time, 7.1% incl | M | union member-set ABI (never dedupe) | byte-identical seed; `regress.py`; `rep-fuzz-check.sh`; the unions scaling axis | STRUCT |
+| 5 | ✅ **LANDED (§F8)** — `variantIndexOf` → `uVariantRowBySid`, maintained at every write (the table is append-only, NOT frozen: mono reaches `registerInlineUnionAt`) | self **0.73% → 0.04%**, incl **1.72% → 0.32%**; the 3.6% quoted here was already stale, see §F8 | M | union member-set ABI (never dedupe) | byte-identical seed; `regress.py`; `rep-fuzz-check.sh`; the unions scaling axis | STRUCT |
 | 6 | String `+` in a loop is **O(n²)** (§D): a loop-local builder, with n-ary chain fusion as the down payment. The fusion once shipped in the TS core and was never ported | ×4.80 per doubling; 5.4× at 320 KB; ≥129 in-loop sites | M / L | rep layer | corpus byte-identity where the pattern is absent; a scaling pair "append N" vs "join N", ratio bar 2.5 — **a value fixture cannot pin a cost class** | STRUCT |
-| 7 | `unRowOfName`/`isUName` → incrementally maintained sid index (3 push sites, one POST-collect) | **2.9%** self time; 824,867 reaches/corpus | M | index must extend at all 3 pushes | byte-identical seed; `regress.py`; the unions axis | STRUCT |
+| 7 | ✅ **LANDED (§F8)** — `unRowOfName`/`isUName` → `unRowBySid`, extended at all three pushes; `unionMemberSetOf` and `unionRowOf`'s first leg route through it | self **0.70% → 0.01%**, incl **1.33% → 0.26%** | M | index must extend at all 3 pushes | byte-identical seed; `regress.py`; the unions axis | STRUCT |
 | 8 | ✅ **LANDED in part (§B6)** — the shape is module-level BINDINGS, not call sites, and the definite-assignment set was 91% of it. Sid-keyed, the 8,000-rung falls 2.54 s → 1.07 s and `checkProgram` goes 57.5% → 1.8% inclusive; the residual is not the checker | **−58% at 8k, −66% at 16k** | M | — | a 4-rung absolute ladder with an exponent bar (`scripts/perf/check-scaling.sh`) | STRUCT |
 | 9 | LSP re-checks the WHOLE module graph per keystroke — 26 modules = **4.43 s** | editor latency, not CI | M | — | a keystroke ladder at 1 / 4 / 26 modules | STRUCT |
 | 10 | `declaredSlotOf` → per-function side index built in `buildLocals` | **1.1%** self time | M | reset per function, 5 sites | byte-identical seed; `regress.py` | STRUCT |
@@ -208,7 +208,7 @@ is this survey's, verified line by line.
 
 | registry | table (decl) | key / eq | call sites | frozen? | O(1) fix |
 | --- | --- | --- | ---: | --- | --- |
-| `variantIndexOf` `emit_classify.vl:28618` | `uVariants: string[]` `emit_state.vl:1815` | string, `__str_eq__`; bound is the whole-program variant band | **76** (47 `emit_classify`, 13 `wasmEmit` — all per-expression, 13 `emit_collect`, 2 `emit_mono`) | **YES** — 2 pushes, both in `collectU`, 0 in-place writes | index built once at `emit_collect.vl:13449`. **Best payoff/risk in the tree.** |
+| `variantIndexOf` `emit_classify.vl:28618` | `uVariants: string[]` `emit_state.vl:1815` | string, `__str_eq__`; bound is the whole-program variant band | **76** (47 `emit_classify`, 13 `wasmEmit` — all per-expression, 13 `emit_collect`, 2 `emit_mono`) | **NO** — 2 push sites and 0 in-place writes, but `monoRegisterPinUnion` reaches the inline one during monomorphize, which is why it re-ranks tags when the length moves | index maintained at both pushes (§F8) |
 | `unRowOfName` `:28732` (`isUName` `:28741`) | `unNames: string[]` `emit_state.vl:1716`, 2,389–2,441 rows | string, `__str_eq__` | 16 + 4 | append-only but **NOT frozen** — a 3rd push at `emit_classify.vl:26992` fires during mono/emit | `sidArr*` extended at all 3 pushes |
 | `declaredSlotOf` `:9560` | `localNames: string[]` `emit_state.vl:522`, per FUNCTION | string, `__str_eq__` | 17 | rebuilt per function, 5 reset sites | index in `buildLocals`; cost is reach count, not table size |
 | `fnStmtsPosOf` `:16931` | `fnStmts: i32[]` `emit_state.vl:231` + `monoOrigNode` | **i32**, integer `==` | 24, of which 14 in per-node loops | append + 1 write `emit_mono.vl:6353`, all before `emitCodeSection` | reverse index after mono. Already short-circuits 80.3%; residue **19,106 calls / 25,953,420 scan steps** (`perf-program.md:1192`) |
@@ -548,7 +548,7 @@ the cost of a whole-arena pass and a `scan-budget` entry — for a seed saving n
 
 ---
 
-## F · Landed: items 1–4, each A/B'd
+## F · Landed: items 1–4, 5 and 7, each A/B'd
 
 Every A/B ALTERNATES its arms inside one load window on this shared box (24 cores; the
 load is quoted per row because it moved 20 → 160 while these ran), and every row states
@@ -692,3 +692,63 @@ and the cost is now deterministic, but **the follow-up is to background the `che
 warm** so CI stops paying it on the critical path. Two of the three PR runs also paid a
 one-off ~21 s of `Build vl-host` (the host source changed); the third, which hit the binary
 cache, is the 179 s total — below master's whole range.
+
+### F8 · Items 5 and 7 — both registries answer by sid
+
+`variantIndexOf` over `uVariants` and `unRowOfName`/`isUName` over `unNames` now read a
+dense sid-keyed side array (`uVariantRowBySid`, `unRowBySid`), maintained at every write
+rather than built at one point: `uVariantsPush` and `unNamesPush` are the only writers, the
+indexes are emptied with their tables in `collectU`, and they are dropped in
+`sidKeyedTablesReset` because the sid space is re-keyed there. Both tables can hold a
+duplicate name, so each index records the FIRST row and the lookups still answer first match
+by name. `unionMemberSetOf` and `unionRowOf`'s first leg route through `unRowOfName`.
+
+**The survey's own shares were stale by ~5x, and this section states the measurement rather
+than the estimate.** §B2 read `variantIndexOf` 3.45% self / 7.06% incl and `unRowOfName`
+3.35% / 6.23%; re-run on master b9ed79e3 (the profile and the CPU rows below are that base;
+identity was re-proved at c8a99305b after the last rebase) with the same instrument
+(`scripts/profile-rank.py`, a `--names` seed, six aggregated runs of
+`vl build compiler/entry.vl` over one source tree, 32–34k samples per arm) they are a fifth
+of that BEFORE the change:
+
+| function | master self / incl | after self / incl |
+| --- | ---: | ---: |
+| `variantIndexOf` | 0.73% / 1.72% | **0.04% / 0.32%** |
+| `unRowOfName` | 0.70% / 1.33% | **0.01% / 0.26%** |
+| `isUName` | 0.02% / 1.36% | 0.02% / 0.31% |
+| `unionMemberSetOf` | 0.01% / 0.10% | 0.01% / 0.09% |
+| `__str_eq__` | 21.36% / 21.36% | 19.95% / 19.95% |
+| `sidArrGet` + `sidLookup` + `__map_probe__` + `__str_hash__`, the work bought back | 3.12% self | 3.60% self |
+
+So the two scans were **1.43% of self time and shed 1.38 of it**, paying ~0.48 points of
+hashing and probing for it. The L2 self-compile, both seeds compiling the SAME master source,
+interleaved A-then-B, 11 reps at load 6–10: **min 5.23 s → 5.09 s of CPU (−2.8%)**, median
+5.31 → 5.17 (−2.6%) — min and median agreeing is the tell that it is the effect and not the
+box. Runs taken while the load swung past 100 cannot separate the arms at all, which is what a
+3% effect looks like here. Either way it is **smaller than the survey's 3.6% + 2.9% estimate,
+and the estimate is what was wrong** — the compiler's own source declares few unions.
+
+Where the change is large is the axis it was priced on. `unions` in
+`tests/vl_scaling_shape_test.ts` (800 unions against 40), five interleaved rounds on
+c8a99305b at load 27–32:
+
+| arm | many | one | graded ratio |
+| --- | --- | --- | --- |
+| master | 0.60 / 0.59 / 0.58 / 0.59 / 0.60 s | 0.17 s | 2.39 2.36 2.34 2.36 2.41 |
+| after | 0.46 / 0.46 / 0.45 / 0.45 / 0.45 s | 0.17 s | **1.84 1.84 1.80 1.78 1.78** |
+
+The many arm falls **24%** (0.59 → 0.45 s) and the one arm does not move at all, which is the
+per-union cost being what left. At load 83–97 the same pair reads master 2.39–2.87 against
+after 1.76–2.18, and at load 143–152 master 3.48–3.93 against after 2.47–2.83: the fall holds
+and the SPREAD is what load buys. The `one` arm sits under the pair's 0.25 s floor at these
+loads, so the graded quotient is `many / 0.25`; at #2584's load 79–227 the denominator clears
+the floor and the raw ratio grades. Both readings fall by about a quarter.
+
+**The bar goes 5.5 → 4.0, and the flake risk was measured rather than argued.** 4.0 is 2.22x
+the after-median of 1.80 — the ~2x over the idle ratio the other three super-linear axes
+carry, and the clearance `callback slots` keeps over its own 1.92. Run eight times at the new
+bar with a `gate.sh` fanned out beside it (load 103–115) the pair reads 2.17–2.83 and passes
+8 of 8; master reads 3.07–3.54 at load 86–92 and passes 6 of 6, so a revert would sit close to
+the bar, which is what a ratchet is for. The one reading above 4.0 seen anywhere was a single
+5.25 at load 70 with `many` at 1.31 s — above the new bar, so the pair's own per-side
+re-measure absorbs it, which is exactly the case a bar set AT the measurement would not have.

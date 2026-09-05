@@ -431,6 +431,28 @@ line reader exist, the five families collapse toward one. Listed separately so t
 honest — the scanners are what makes `lint.vl` 4,243 lines, and no single PR should try to
 merge them.
 
+**The PRIMITIVES landed 2026-09-05; the rule scanners did not.** Re-derived from the tree
+after #2588 the families were `cb*` 32, `kl*` 30, `si*` 24, `sca*` 7, `as*` 6 — the counts
+above are one release stale. Five operations were written twice: the identifier scan
+(`asIdentAt` + `klIdentEnd`), list membership (`asListHas` + `siHas` + `siIndexOf`), the
+case-folded whole word (`cbHistWordAt` and `scaWordIsI`'s own body), span equality
+(`cbSpanIs` re-spelling `cbAt`'s loop), and the `//` line test, inline in both comment scans.
+
+Everything more than one rule reads is now **one contiguous `tx*` block** under its own
+header — 23 primitives, `txIdentEnd`/`txIdentAt`, `txListIndexOf`/`txListHas`, `txAt`/`txAtI`,
+`txWordIs`/`txWordIsI`, `txSpanIs`, `txCommentAt`, `txFnNameOf` and the rest, over the one
+`txSource`. A `cb*` / `sca*` / `as*` / `si*` prefix now means the name has exactly one rule
+for a caller; `kl*`'s line index stays `kl*` and is shared through `klEnsureIndex`.
+
+Four pairs that read like duplicates are KEPT, because each difference is load-bearing for a
+named rule and has a witness in the landing PR: `txSpacesEnd` skips spaces where
+`klIndentEnd` skips tabs too, `txDigitsEnd` eats thousands commas where `txPlainDigitsEnd`
+does not, `txWordIs` is case-sensitive where `txWordIsI` folds, and `scaWordIsI` takes the
+leading boundary its caller does not. Left for a second slice: the five per-line
+literal-skipping walks (`siScanHoles`, `siNegAnswerLine`, `siRetCallOf`, `siLineReturns`,
+`siHeaderNames`), which differ only in the body they run at each index, and the
+import-region tracker the two comment scans each keep a copy of.
+
 ---
 
 ## 6 · What the survey did not find

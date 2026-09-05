@@ -279,17 +279,21 @@ axis(
 axis("types", 2.5, "A per-declaration cost is scaling with the type table.", (d) =>
   twoFiles(d, genTypes(2500, 1), genTypes(2500, 20)));
 
-// 3.49 / 3.02 / 3.69 raw, across box load 79 to 227 — a fourth super-linear axis, and the
-// only one whose number was ever HIDDEN rather than tolerated. Both arms declare 801
-// module-level bindings, so both used to pay the definite-assignment set's per-write rebuild;
-// at 2,400 bindings that constant read 41.7 s against 37.8 s, ratio 1.10, and the axis graded
-// nothing. With the set sid-keyed the arms read 1.2 s against 0.33 s and the union registry's
-// own per-entity cost is what is left (perf items 5 and 7). The cheap arm now costs less than
-// the shared 0.4 s floor, which would turn the quotient into an absolute budget on the many
-// arm, so this pair takes 0.25 — above a process start, below its own denominator.
+// 1.84 / 1.84 / 1.80 / 1.78 / 1.78, against 2.39 / 2.36 / 2.34 / 2.36 / 2.41 for the same
+// pair before the union registry was sid-keyed — the many arm 0.59 s -> 0.45 s while the one
+// arm holds at 0.17 s, which is the per-union cost being what left (perf items 5 and 7, §F8).
+// The axis was hidden before that: both arms declare 801 module-level bindings, so both used
+// to pay the definite-assignment set's per-write rebuild, 41.7 s against 37.8 s at 2,400.
+// The cheap arm costs less than the shared 0.4 s floor, which would turn the quotient into
+// an absolute budget on the many arm, so this pair takes 0.25 — above a process start, below
+// its own denominator at the loads #2584 measured. The bar is 2.22x the after-median, the
+// clearance `callback slots` keeps over an almost identical reading, and it was flake-tested
+// rather than argued: 8 of 8 green at load 103 to 115 with a fanned-out gate beside it. The
+// arms are short enough that a scheduler spike doubles one — this pair drew 5.25 once in four
+// rounds at load 70 — which is what the per-side re-measure above absorbs.
 axis(
   "unions",
-  5.5,
+  4.0,
   "A per-union cost is scaling with the union registry.",
   (d) => twoFiles(d, genUnions(800, 1), genUnions(800, 20)),
   0.25,
