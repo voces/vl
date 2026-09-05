@@ -118,9 +118,35 @@ What is left is `collectA` (`compiler/emit_collect.vl`) at **62.6% inclusive** u
 `monoRebuild`'s 71.4%. #2594's stamp removes only the DUPLICATE rebuild — minting an instance
 moves the arena for real, so the pass still runs once per instance, and it is a full reset and
 re-mint of the ref-list / map-value / annotation row tables rather than a prefix a suffix scan
-could extend. Making that incremental is the next shape, and it is a bigger piece of work than
-either stamp: the tables are keyed and deduped, so a suffix pass has to not re-mint a row the
-prefix already owns.
+could extend.
+
+## Measured 2026-09-05, third pass — the pass resumes on the arena prefix
+
+`collectA` re-profiled on 964b5050b is 52.4% inclusive at 400 pins and **63.8% at 800**, with
+no hotspot under it: self 35.8% of its own inclusive, `forceNestedCloSigReps` 13.1%,
+`nulScalarListKindOfNode` 10.3%, `__str_eq__` 9.5%. The cost is the WALK, so the fix is to walk
+less of it.
+
+**It has three phases and only the middle one is a function of an arena prefix**: the union
+member re-marks run first, the arena walk second, the field-table re-derivation last. The walk
+extends — rows only append, dedup is by key, the flags are monotone, `annRlSlot` is node-keyed.
+The field tail does NOT, because a row's index is its slot and box tags are positional, so a
+resumed walk's new rows have to land ahead of it: the resume pops back to the length recorded
+right after the walk and re-derives the tail. Table by table, and the registry-growth
+invalidation rule: `docs/internals/perf-opportunities-2026-09.md` B7.
+
+**The resume is armed by `monoRebuild` and by nothing else.** Only this module's arena writes
+are enumerated; the rewrite and annotation-synthesis passes between the pass table's two
+`collectA` rows edit nodes in place and write `arrLitCommitName`, which the walk reads. A
+version without the arming moved two of 2,975 `tests/cases` modules — one built-to-refused,
+one different bytes — which is what the fixture identity sweep is for.
+
+After, at 800 pins: 3,528 guest samples → **1,839**, `collectA` 63.78% inclusive → **1.96%**,
+`monoRebuild` 71.4% → **21.37%**, the many arm 3.57 s → **1.18 s (0.33×)**, and the axis bar
+6.0 → **2.5** on eleven rounds reading 0.95 – 1.34 across box load 4 to 101. What is left is
+`buildFnMap` at **18.71%** of the compile — the same per-instance whole-program pass one row
+over, whose `retAnnKindChain` / `retVoidAnnFlag` / `refArrElemNameIf` children are 38.3% /
+16.5% / 12.5% of it, and whose per-function return-kind table has no prefix shape to resume on.
 
 ## Guards
 
@@ -132,7 +158,8 @@ Three, and they fire at different moments. Profiling is what you do AFTER one of
   multiplying over an axis, and NAMES the axis. ~20–30 s; two of its axes red on the
   pre-#2419 compiler and `callback slots` on the pre-D1514 one. Three axes are super-linear
   today and carry a bar above their measurement, each naming the function responsible — read
-  those comments before widening a bar. **An axis is only a guard for an entity it HAS**:
+  those comments before widening a bar; `generic pins` left that list when `collectA` learned
+  to resume, and its bar fell 6.0 to 2.5 with it. **An axis is only a guard for an entity it HAS**:
   D1514 was cubic in the callback-parameter count for a year of this file's life and every
   pair here was green, because none of them varied that count.
 * **`arena-scan-outside-pass`** (compiler/lint.vl) with `scripts/scan-budget.py`'s ratchet —
