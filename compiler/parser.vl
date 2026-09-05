@@ -143,6 +143,14 @@ function kindAt(i: i32): TokKind {
   P.toks[j].kind
 }
 
+// The lexeme of the token at absolute index `i`, clamped to the trailing EOF exactly as
+// `kindAt` clamps, for the lookaheads that must read a contextual keyword's spelling.
+function textAt(i: i32): string {
+  let j = i
+  if j >= P.toks.length { j = P.toks.length - 1 }
+  P.toks[j].text
+}
+
 // If the current token has `kind`, consume it and return true; else leave the
 // cursor put and return false. (The "match" combinator.)
 export function accept(kind: TokKind) {
@@ -378,20 +386,62 @@ function binPrec(kind: TokKind): i32 {
   0
 }
 
-// D1581 — how many `(`, `[` or object-literal `{` are open around the expression being
-// parsed. Inside one there is no statement a NEWLINE could end, so a continuation line may
-// lead with a binary operator; at depth 0 the newline is the statement terminator. A block
-// resets it to 0, because a `{ … }` inside a call argument holds statements.
+// How many `(`, `[` or object-literal `{` are open around the expression being parsed.
+// Inside one there is no statement a NEWLINE could end, so even `-` continues the line; at
+// depth 0 only a token no expression can begin with does. A block resets it to 0, because a
+// `{ … }` inside a call argument holds statements. D1581.
 let brDepth = 0
+
+// The absolute index of the first token at the cursor that is not a NEWLINE. Reads through
+// `kindAt`, so the scan neither moves the cursor nor runs off the stream; comments are
+// trivia and never reach `P.toks`, so a comment line between two lines costs nothing.
+function afterNewlines(): i32 {
+  let j = P.pos
+  while kindAt(j) == "NEWLINE" { j = j + 1 }
+  j
+}
+
+// Whether a line-leading binary operator continues the previous expression rather than
+// starting a statement. Derived from `binPrec` so the set cannot drift: `-` is the only
+// entry that can also begin an expression, and outside brackets a leading `-x` line is a
+// block's value (DECISIONS "A line beginning with a token that cannot start an expression").
+function continuesLine(kind: TokKind): boolean {
+  if binPrec(kind) == 0 { return false }
+  brDepth > 0 || kind != "MINUS"
+}
 
 // The absolute index of the binary operator a NEWLINE run at the cursor leads to, or -1
 // when it leads to anything else. Sibling of `chainDotAfterNewlines`, with the same
 // look-before-consume discipline: the cursor moves only once the answer is known, so a run
 // leading to a closer is left in place for `takeSep` to read off `P.pos - 1`.
 function binOpAfterNewlines(): i32 {
-  let j = P.pos
-  while kindAt(j) == "NEWLINE" { j = j + 1 }
-  if binPrec(kindAt(j)) > 0 { return j }
+  const j = afterNewlines()
+  if continuesLine(kindAt(j)) { return j }
+  -1
+}
+
+// The absolute index of the `is` a NEWLINE run at the cursor leads to, or -1 otherwise.
+// `!is` is deliberately absent: `!` can begin an expression, so a leading `!` stays a
+// statement.
+function isAfterNewlines(): i32 {
+  const j = afterNewlines()
+  if kindAt(j) == "IS" { return j }
+  -1
+}
+
+// The absolute index of the contextual `as` at the cursor, past any NEWLINE run, or -1.
+// `as` stays an IDENT token and is a legal identifier, so a leading one joins only when a
+// named cast target follows: `as = 12` on its own line is an assignment to a variable
+// called `as`, not a cast. With no newline crossed the same-line rule is unchanged.
+function asAfterNewlines(): i32 {
+  const j = afterNewlines()
+  if kindAt(j) != "IDENT" { return -1 }
+  if textAt(j) != "as" { return -1 }
+  if j == P.pos { return j }
+  let t = j + 1
+  const suf = kindAt(t)
+  if suf == "QUESTION" || suf == "BANG" || suf == "PERCENT" { t = t + 1 }
+  if kindAt(t) == "IDENT" { return j }
   -1
 }
 
@@ -1253,12 +1303,10 @@ function parseArrayLit() {
 }
 
 // The absolute index of the `.` or `?.` a NEWLINE run at the cursor leads to, or -1 when it
-// leads to anything else. It reads with `kindAt`, which clamps to the trailing EOF, so the
-// scan neither moves the cursor nor runs off the stream. Comments never reach `P.toks`, so a
-// comment line between two links costs nothing.
+// leads to anything else. Member access joins a line at every bracket depth: neither token
+// can begin an expression, so there is no statement the newline could have been ending.
 function chainDotAfterNewlines(): i32 {
-  let j = P.pos
-  while kindAt(j) == "NEWLINE" { j = j + 1 }
+  const j = afterNewlines()
   const k = kindAt(j)
   if k == "DOT" || k == "QUESTION_DOT" { return j }
   -1
@@ -1388,10 +1436,12 @@ function parseUnary() {
   }
   let node = parsePostfix()
   // `x as T` — an explicit numeric cast. `as` is a contextual keyword: it stays a plain
-  // IDENT token and is special only here, directly after a postfix operand on the same
-  // line. It shares the `is` guard's precedence slot, looser than postfix and tighter than
-  // every binary operator, and is chainable. A newline before `as` ends the statement.
-  while peekKind() == "IDENT" && peekTok().text == "as" {
+  // IDENT token and is special only here, directly after a postfix operand. It shares the
+  // `is` guard's precedence slot, looser than postfix and tighter than every binary
+  // operator, and is chainable. A line may lead with it, so newlines before it are skipped.
+  let asAt = asAfterNewlines()
+  while asAt >= 0 {
+    P.pos = asAt
     advance() // `as`
     // The family's suffix (`error-handling-design.md` §Trio): `as` propagates, `as?` coalesces
     // to null, `as!` traps, `as%` wraps. Read immediately after the keyword, before the type,
@@ -1417,7 +1467,12 @@ function parseUnary() {
     const asIx = mkAsExpr(node, asNm, asMode, p0)
     setAnnTs(asIx, asRoot)
     node = asIx
+    asAt = asAfterNewlines()
   }
+  // A line may lead with `is`, which can never begin an expression. `!is` is not in the
+  // set: its `!` can, so a leading `!` stays a statement and the pair is left alone.
+  const isAt = isAfterNewlines()
+  if isAt >= 0 { P.pos = isAt }
   const pk = peekKind()
   // `x is T` / `x !is T` — the right side is a type, not an expression, so `x is {x: i32}`,
   // `x is A | B` and `x is null` all parse. `!is` inverts the boolean by desugaring to
@@ -1501,17 +1556,15 @@ function parseBinary(left: i32, minPrec: i32, leftPos: i32) {
   let going = true
   while going {
     let k = peekKind()
-    // D1581 — a NEWLINE inside an open bracket is whitespace before a binary operator, so
-    // the continuation line may lead with the operator. Gated on `brDepth`, because at
-    // statement level the newline is the terminator. Look-before-consume, like
-    // `chainDotAfterNewlines`: a run leading anywhere else is left in place for the caller.
-    if brDepth > 0 {
-      if k == "NEWLINE" {
-        const jb = binOpAfterNewlines()
-        if jb >= 0 {
-          P.pos = jb
-          k = peekKind()
-        }
+    // A NEWLINE run leading to an operator that cannot begin an expression is whitespace,
+    // not a terminator, so the continuation line may lead with that operator (`continuesLine`
+    // owns the set). Look-before-consume, like `chainDotAfterNewlines`: a run leading
+    // anywhere else is left in place for the caller.
+    if k == "NEWLINE" {
+      const jb = binOpAfterNewlines()
+      if jb >= 0 {
+        P.pos = jb
+        k = peekKind()
       }
     }
     const prec = binPrec(k)

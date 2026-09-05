@@ -138,3 +138,38 @@ A LITERAL operand is folded, so `0xb81a1aaa as% i32` is a constant and can be us
 `%` here can never be read as the remainder: the suffix is read only directly after `as`, and
 `as` only directly after a postfix operand, so `a % b`, `a as% u8 % b` and a binding named `as`
 all keep their meanings.
+
+## Breaking a long expression across lines
+
+A newline ends a statement, except that a line whose first token cannot begin an expression
+continues the previous one. Both spellings of a break are therefore available, and both mean
+what the one-line form means:
+
+```vl
+const ok = a == 1 ||
+  b == 2                   // the operator at the end of the line
+
+const ok2 = a == 1
+  || b == 2                // the operator at the start of the next line
+```
+
+Everything in the precedence ladder above continues a line — `|| && ?? == != < <= > >= + * / %`,
+the bitwise and shift operators, and assignment — along with `.`, `?.`, `is`, and the four `as`
+casts. Precedence is unaffected: the operator binds exactly as if the newline were a space, so
+`a` ⏎ `|| b` ⏎ `&& c` is `a || (b && c)`. Blank lines and comment lines between the two halves
+are free.
+
+**A leading `-` does not continue a line**, because `-x` is a legal statement and a block's last
+statement is its value:
+
+```vl
+function f(): i32 {
+  work()
+  -x                       // the block's value is `-x`; NOT `work() - x`
+}
+```
+
+Write the `-` at the end of the previous line, or parenthesize, to subtract across a break. The
+same holds for a line beginning with `!`, `(`, `[`, `{`, an identifier or a literal: each can
+start a statement, so each does. Inside an open `(`, `[` or object-literal `{` there is no
+statement a newline could end, so `-` continues there like everything else.

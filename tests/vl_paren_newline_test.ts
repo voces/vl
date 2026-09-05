@@ -155,11 +155,12 @@ Deno.test({
   },
 });
 
-// The other half of the same rule: at statement level the newline is still the
-// terminator. `a` NEWLINE `-b` at top level is two statements, and a leading `||` there
-// stays a parse error — neither may be quietly joined.
+// The other half of the same rule, as the 2026-09-04 ruling left it: a line beginning with
+// a token that cannot start an expression continues the previous expression at STATEMENT
+// level too, so the leading `||` now runs. `-` is excluded and keeps the newline a
+// terminator — `a` NEWLINE `-a` is two statements, and joining would silently subtract.
 Deno.test({
-  name: "vl-parse: statement level still terminates at the newline",
+  name: "vl-parse: statement level joins a leading operator but not a leading `-`",
   ignore: !ENABLED,
   fn: async () => {
     const dir = await Deno.makeTempDir({ prefix: "vl_leadop_" });
@@ -178,9 +179,25 @@ Deno.test({
         g,
         "const a = 1\nconst b = 2\nconst ok = a == 1\n  || b == 2\nprint(ok)\n",
       );
-      const bad = await runVL("check", g);
-      if (bad.code === 0) {
-        throw new Error("a leading `||` at statement level must stay a parse error");
+      const joined = await runVL("run", g);
+      if (joined.code !== 0) {
+        throw new Error(`a leading \`||\` at statement level must run: ${joined.err}`);
+      }
+      if (joined.out !== "true\n") {
+        throw new Error(`want "true\\n", got ${JSON.stringify(joined.out)}`);
+      }
+
+      // `as` is a legal identifier, so a leading one joins only ahead of a named cast
+      // target: `as = 12` after an expression statement stays an assignment.
+      const h = `${dir}/u.vl`;
+      await Deno.writeTextFile(
+        h,
+        "let as = 6\nprint(as)\nas = 12\nprint(as)\n",
+      );
+      const soft = await runVL("run", h);
+      if (soft.code !== 0) throw new Error(`soft-keyword probe failed: ${soft.err}`);
+      if (soft.out !== "6\n12\n") {
+        throw new Error(`want "6\\n12\\n", got ${JSON.stringify(soft.out)}`);
       }
     } finally {
       await Deno.remove(dir, { recursive: true });
