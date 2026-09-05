@@ -233,3 +233,55 @@ for (const [name, key, base] of CASES) {
   }
 }
 console.log(`# load: ${Deno.readTextFileSync("/proc/loadavg").trim()}`);
+
+// ── the whole BURST — every request VS Code sends after one keystroke ─────────────────
+// The change handler, then the hover, the semantic tokens and the inlay hints the client
+// re-queries on a document change. Broken out per request, because a burst total says
+// only that something paid and not which request did.
+const burst = async (
+  c: NonNullable<ReturnType<typeof loadWasmChecker>>,
+  text: string,
+  key: string,
+): Promise<{ ms: number; per: number[] }> => {
+  const at = () => c.graphCheckCount();
+  const t = performance.now();
+  const t0 = at();
+  c.bumpReaderGeneration();
+  c.moduleSurface(text, key); // the unused-export hints' surface scan
+  c.lint(text);
+  await c.check(text, key, readModule);
+  const t1 = at();
+  if (await c.hoverTypeAt(text, key, readModule, 0, 2) === undefined) {
+    if (await c.memberTypeAt(text, key, readModule, 0, 2) === undefined) {
+      await c.typeAliasAt(text, key, readModule, 0, 2);
+    }
+  }
+  const t2 = at();
+  await c.tokensAt(text, key, readModule);
+  await c.memberTokensAt(text, key, readModule);
+  c.lexicalTokensAt(text);
+  const t3 = at();
+  await c.inlayHintsAt(text, key, readModule);
+  const t4 = at();
+  return { ms: performance.now() - t, per: [t1 - t0, t2 - t1, t3 - t2, t4 - t3] };
+};
+
+console.log("");
+console.log("## BURST — change → hover → tokens → inlay, one keystroke's worth");
+console.log("| case | change | +hover | +tokens | +inlay | burst checks | burst ms |");
+console.log("| --- | ---: | ---: | ---: | ---: | ---: | ---: |");
+for (const [name, key, base] of CASES) {
+  const c = loadWasmChecker(SEED, () => {})!;
+  const rows: { ms: number; per: number[] }[] = [];
+  for (let r = 0; r <= REPS; r++) {
+    const row = await burst(c, `${base}\n// edit ${r}\n`, key);
+    if (r > 0) rows.push(row); // the first pays for a cold cache
+  }
+  const per = [0, 1, 2, 3].map((i) => med(rows.map((x) => x.per[i])));
+  console.log(
+    `| ${name} | ${per.join(" | ")} | ${per.reduce((a, b) => a + b, 0)} | ${
+      med(rows.map((x) => x.ms)).toFixed(1)
+    } |`,
+  );
+}
+console.log(`# load: ${Deno.readTextFileSync("/proc/loadavg").trim()}`);
