@@ -250,6 +250,59 @@ Deno.test("ratchet-hold: a re-read picks up a baseline edited on disk", async ()
   await Deno.remove(dir, { recursive: true });
 });
 
+Deno.test("ratchet-hold: a same-size rewrite at the same mtime is still seen", async () => {
+  // THE REGRESSION THIS FILE EXISTS FOR. Freshness was keyed on `mtimeMs:size`, and
+  // `--write-baseline` typically rewrites ONE DIGIT — same size, so the key moved only
+  // when the two writes landed in different milliseconds. Under a saturated `gate.sh`
+  // they did not, and the test above ("a re-read picks up a baseline edited on disk")
+  // failed there while passing alone.
+  //
+  // Both facts a stat key is made of are held fixed here BY CONSTRUCTION rather than by
+  // how fast the box is: one digit keeps the size, and `Deno.utime` puts the mtime back.
+  // So this reds on a stat-keyed cache every time, on any machine.
+  const dir = await workspace(LADDER, {
+    "compiler/x.vl": { "kind-ladder-incomplete": 3 },
+  });
+  const path = `${dir}/${LADDER}`;
+  const pinned = new Date(1_700_000_000_000);
+  await Deno.utime(path, pinned, pinned);
+
+  const diags = [diag(CODE, 1), diag(CODE, 2), diag(CODE, 3)];
+  if (applyRatchetHold(diags, `${dir}/compiler/x.vl`, dir, false).length !== 0) {
+    throw new Error("precondition: three findings against a baseline of 3 are held");
+  }
+
+  const before = await Deno.stat(path);
+  const text = await Deno.readTextFile(path);
+  const edited = text.replace('"kind-ladder-incomplete":3', '"kind-ladder-incomplete":1');
+  if (edited === text) {
+    throw new Error(`precondition: the baseline is not spelled as expected: ${text}`);
+  }
+  await Deno.writeTextFile(path, edited);
+  await Deno.utime(path, pinned, pinned);
+  const after = await Deno.stat(path);
+
+  // The two halves of the old key, asserted unchanged — without this the test could
+  // pass on a stat key just because the clock ticked.
+  if (after.size !== before.size) {
+    throw new Error(`the rewrite must not change the size: ${before.size} -> ${after.size}`);
+  }
+  if (after.mtime?.getTime() !== before.mtime?.getTime()) {
+    throw new Error(
+      `the rewrite must not change the mtime: ${before.mtime} -> ${after.mtime}`,
+    );
+  }
+
+  const out = applyRatchetHold(diags, `${dir}/compiler/x.vl`, dir, false);
+  if (out.length !== 3 || !out[0].message.startsWith("+2 over baseline: ")) {
+    throw new Error(
+      `a same-size rewrite at the same mtime must be seen; want 3 loud at +2, got ` +
+        JSON.stringify(out.map((d) => d.message)),
+    );
+  }
+  await Deno.remove(dir, { recursive: true });
+});
+
 Deno.test("ratchet-hold: a file outside the workspace is untouched", async () => {
   const dir = await workspace(LADDER, {
     "compiler/x.vl": { "kind-ladder-incomplete": 3 },
