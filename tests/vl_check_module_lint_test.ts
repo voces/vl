@@ -186,3 +186,51 @@ Deno.test({
     }
   },
 });
+
+// SAME-POSITION TIE ORDER. `lint()` drives one walk in which every structural rule
+// looks at every node, so the emit sequence is node-major; the display order is
+// position-sorted with arrival order breaking ties (`cliStableSort`), and
+// `lintRegroupWalkPhase` is what puts a tie back in rule order. Here the `let` is
+// BOTH the first unreachable statement of its block and a boxing union-`let` in a
+// loop, so both rules anchor on the same token — the walker reaches the `while`
+// (union-let-no-melt) before its block (unreachable-code), and without the regroup
+// these two swap.
+const TIE = `function f(n: i32) {
+  let k = 0
+  while n > 0 {
+    return 0
+    let u: string | i32[] = "a"
+    u = [1]
+    k = k + 1
+  }
+  k
+}
+print(f(1))
+`;
+
+Deno.test({
+  name:
+    "vl-check-module-lint: two rules on one token keep rule order (unreachable-code before union-let-no-melt)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_check_lint_tie_" });
+    try {
+      await Deno.writeTextFile(`${dir}/main.vl`, TIE);
+      const r = await check("main.vl", dir);
+      const unreach = r.out.indexOf("[5:29] Unreachable code");
+      const melt = r.out.indexOf("[5:29] `u` is a union-typed");
+      if (unreach < 0 || melt < 0) {
+        throw new Error(
+          `expected both rules to fire at 5:29 (unreachable=${unreach}, union-let=${melt}):\n${r.out}`,
+        );
+      }
+      if (unreach > melt) {
+        throw new Error(
+          `same-position tie order changed: union-let-no-melt now precedes unreachable-code:\n${r.out}`,
+        );
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});

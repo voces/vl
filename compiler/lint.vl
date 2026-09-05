@@ -163,13 +163,11 @@ export function lint(progRoot: i32) {
     duplicateImports(stmts)
     unusedFunctions(stmts)
     preferConst()
-    lintWalk(lintRuleUnreachable, progRoot)
-    lintWalk(lintRuleConstBranch, progRoot)
-    lintWalk(lintRuleStepZero, progRoot)
-    lintWalk(lintRuleUncondRecursion, progRoot)
-    lintWalk(lintRuleHasGuardReread, progRoot)
-    lintWalk(lintRuleUnionLetNoMelt, progRoot)
-    lintWalk(lintRuleUnusedPureExpr, progRoot)
+    // One walk offers every node to all seven structural rules; the regroup restores
+    // the rule-major emit sequence a same-position tie reads.
+    const walkMark = lintCodes.length
+    lintWalk(progRoot)
+    lintRegroupWalkPhase(walkMark)
     // Not walks: neither comments, nor a loop's shape, nor a ladder's default is in
     // the arena. All four read the source the driver set, and `commentBudget` consumes
     // it, so it runs last — after the std audience pass, which reads the same text.
@@ -703,37 +701,112 @@ function upeIsPure(ix: i32) {
   upeLitOperand(ix)
 }
 
-// ── generic AST walk (one child-enumerator, per-rule visit dispatch) ─────────
+// ── generic AST walk (one child-enumerator, every rule visited per node) ─────
 
 // Every structural rule needs the same recursive traversal of the node arena, so one
 // shared walker carries it: `nodeChildren` is the one place that knows each variant's
-// child slots, and `lintWalk` drives a pre-order visit selected by a rule id. The
-// binding scan is the one traversal not driven through it — it needs scope enter/exit.
-const lintRuleConstBranch = 0
-const lintRuleStepZero = 1
-const lintRuleUnreachable = 2
-const lintRuleUncondRecursion = 3
-const lintRuleHasGuardReread = 4
-const lintRuleUnionLetNoMelt = 5
-const lintRuleUnusedPureExpr = 6
+// child slots, and `lintWalk` drives ONE pre-order pass in which every rule looks at
+// every node. The binding scan needs scope enter/exit and keeps its own traversal.
 
-// Visit `ix` for `rule`, then recurse into its children (pre-order: a rule sees
-// a node before any of its descendants). `-1` child slots (absent) and any
-// out-of-range index are skipped by the bounds check, so the walk never traps.
-function lintWalk(rule: i32, ix: i32) {
+// One pass makes the emit sequence node-major where seven passes made it rule-major,
+// and same-position ties read that sequence (`cliStableSort` orders by position and
+// keeps arrival order). The ranks below are the tie-break, applied by
+// `lintRegroupWalkPhase` — the rule order is stated rather than inherited from a walk.
+const lintRankUnreachable = 0
+const lintRankConstBranch = 1
+const lintRankStepZero = 2
+const lintRankUncondRecursion = 3
+const lintRankHasGuardReread = 4
+const lintRankUnionLetNoMelt = 5
+const lintRankUnusedPureExpr = 6
+const lintRankCount = 7
+
+// Offer `ix` to all seven structural rules, in rank order. Each visitor opens with its
+// own `is` test, so this is a flat unconditional sequence: there is no rule id to
+// dispatch on and no chain a new rule could be inserted into in the wrong place.
+function lintVisitAll(ix: i32) {
+  unreachableVisit(ix)
+  constantBranchVisit(ix)
+  degenerateStepVisit(ix)
+  uncondRecursionVisit(ix)
+  hasGuardRereadVisit(ix)
+  unionLetNoMeltVisit(ix)
+  unusedPureExprVisit(ix)
+  0
+}
+
+// Visit `ix`, then recurse into its children (pre-order: a rule sees a node before any
+// of its descendants). `-1` child slots (absent) and any out-of-range index are skipped
+// by the bounds check, so the walk never traps.
+function lintWalk(ix: i32) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
-  if rule == lintRuleConstBranch { constantBranchVisit(ix) }
-  if rule == lintRuleHasGuardReread { hasGuardRereadVisit(ix) }
-  if rule == lintRuleUnusedPureExpr { unusedPureExprVisit(ix) }
-  if rule == lintRuleUnionLetNoMelt { unionLetNoMeltVisit(ix) }
-  else if rule == lintRuleStepZero { degenerateStepVisit(ix) }
-  else if rule == lintRuleUnreachable { unreachableVisit(ix) }
-  else if rule == lintRuleUncondRecursion { uncondRecursionVisit(ix) }
+  lintVisitAll(ix)
   const kids = nodeChildren(ix)
   let i = 0
   while i < kids.length {
-    lintWalk(rule, kids[i])
+    lintWalk(kids[i])
     i = i + 1
+  }
+  0
+}
+
+// The tie-break rank of a walk-rule diagnostic, read off its code — each of the seven
+// codes is emitted by exactly one visitor, so the code is the whole key. A code with no
+// rank sorts after all seven rather than being dropped; only the seven reach here,
+// since `lintRegroupWalkPhase` reads just the slice the walk appended.
+function lintRankOfCode(code: string) {
+  if code == "unreachable-code" { return lintRankUnreachable }
+  if code == "constant-condition" { return lintRankConstBranch }
+  if code == "for-step-zero" { return lintRankStepZero }
+  if code == "unconditional-recursion" { return lintRankUncondRecursion }
+  if code == "map-has-guard-reread" { return lintRankHasGuardReread }
+  if code == "union-let-no-melt" { return lintRankUnionLetNoMelt }
+  if code == "unused-pure-expression" { return lintRankUnusedPureExpr }
+  lintRankCount
+}
+
+// Regroup the diagnostics the single walk appended at or after `mark` into rank order,
+// stably — each rule's findings keep the pre-order the walk produced. This is the
+// sequence the seven separate walks emitted, and it is what breaks a same-position tie
+// downstream; `tests/vl_check_module_lint_test.ts` pins one such tie.
+function lintRegroupWalkPhase(mark: i32) {
+  const n = lintCodes.length
+  if mark < 0 || n - mark < 2 { return 0 }
+  const rank: i32[] = []
+  let i = mark
+  while i < n {
+    rank.push(lintRankOfCode(lintCodes[i]))
+    i = i + 1
+  }
+  const codes: string[] = []
+  const msgs: string[] = []
+  const sevs: string[] = []
+  const lines: i32[] = []
+  const cols: i32[] = []
+  let r = 0
+  while r <= lintRankCount {
+    let j = 0
+    while j < rank.length {
+      if rank[j] == r {
+        const at = mark + j
+        codes.push(lintCodes[at])
+        msgs.push(lintMsgs[at])
+        sevs.push(lintSevs[at])
+        lines.push(lintLines[at])
+        cols.push(lintCols[at])
+      }
+      j = j + 1
+    }
+    r = r + 1
+  }
+  let k = 0
+  while k < codes.length {
+    lintCodes[mark + k] = codes[k]
+    lintMsgs[mark + k] = msgs[k]
+    lintSevs[mark + k] = sevs[k]
+    lintLines[mark + k] = lines[k]
+    lintCols[mark + k] = cols[k]
+    k = k + 1
   }
   0
 }
