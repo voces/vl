@@ -18368,26 +18368,63 @@ function opSelfFnTy(op: string, lt: i32, rt: i32, rightIx: i32, ix: i32) {
   -1
 }
 
-// The declared parameter NAMES of the top-level function `name` (via its
-// `FuncDecl` in `fnDeclIx`), or an empty list when no declaration is known (an
-// undeclared name, or a closure-valued binding — `TyFunc` carries no parameter
-// names, so NAMED arguments resolve only against a declared function).
-function fnParamNamesOf(name: string) {
+// The parameter NAMES of the declaration nodes `ps`, in order, skipping any the parser did not
+// recover as a `Param`. The caller supplies the declaration it resolved, so a callee whose name
+// the scope chain answers with a binding contributes no names.
+function paramNamesOfNodes(ps: i32[]) {
   const out: string[] = []
+  let i = 0
+  while i < ps.length {
+    const p = P.nodes[ps[i]]
+    if p is Param { out.push(p.parName) }
+    i = i + 1
+  }
+  out
+}
+
+// The declaration nodes `ps` minus the receiver — the list a UFCS call's explicit arguments
+// align with, and therefore the list its defaults are read from.
+function paramsAfterFirst(ps: i32[]) {
+  const out: i32[] = []
+  let i = 1
+  while i < ps.length {
+    out.push(ps[i])
+    i = i + 1
+  }
+  out
+}
+
+// The parameter nodes of the top-level `FuncDecl` named `name`, or the empty list. Resolved by
+// name with no scope walk, so it answers a diagnostic about a free function; a call site asks the
+// scope chain instead (`calleeDeclParams`, `declParamsInScope`), or an unrelated declaration of
+// the name decides whether the call checks (D1604).
+function fnDeclParamsOf(name: string) {
+  const none: i32[] = []
   const dIx = fnDeclIx[name] ?? -1
   if dIx >= 0 {
     const d = P.nodes[dIx]
-    if d is FuncDecl {
-      const ps = d.fnParams
-      let i = 0
-      while i < ps.length {
-        const p = P.nodes[ps[i]]
-        if p is Param { out.push(p.parName) }
-        i = i + 1
-      }
-    }
+    if d is FuncDecl { return d.fnParams }
   }
-  out
+  none
+}
+
+// The parameter nodes of the `FuncDecl` that `name` denotes under the scope chain, or the empty
+// list when it denotes a binding instead. The UFCS callee is a member property with no callee
+// node, which is why this is keyed by name where `calleeDeclParams` takes a node.
+function declParamsInScope(name: string) {
+  const none: i32[] = []
+  const dIx = lookupFnDeclNode(name)
+  if dIx >= 0 {
+    const d = P.nodes[dIx]
+    if d is FuncDecl { return d.fnParams }
+  }
+  none
+}
+
+// The declared parameter NAMES of the top-level function `name`, or an empty list. By name: for
+// a diagnostic about the free function, never for a call site (`fnDeclParamsOf`).
+function fnParamNamesOf(name: string) {
+  paramNamesOfNodes(fnDeclParamsOf(name))
 }
 
 // The declared parameter nodes behind a call's callee, when the call is direct — an `Ident`
@@ -18412,14 +18449,10 @@ function calleeDeclParams(calleeIx: i32) {
 // rule, so a callee that fails this is a program the design forbids; returning -1 falls
 // through to the caller's own member-access error, naming the receiver and the property.
 function declFirstParamIsSelf(name: string) {
-  const dIx = fnDeclIx[name] ?? -1
-  if dIx < 0 { return false }
-  const d = P.nodes[dIx]
-  if d is FuncDecl {
-    if d.fnParams.length == 0 { return false }
-    const p0 = P.nodes[d.fnParams[0]]
-    if p0 is Param { return p0.parName == "self" }
-  }
+  const ps = fnDeclParamsOf(name)
+  if ps.length == 0 { return false }
+  const p0 = P.nodes[ps[0]]
+  if p0 is Param { return p0.parName == "self" }
   false
 }
 
@@ -18428,20 +18461,7 @@ function declFirstParamIsSelf(name: string) {
 // the list its defaults are read from. Empty when `name` is not a declared
 // function (a UFCS callee always is, by the time this is asked).
 function declParamsAfterSelf(name: string) {
-  const out: i32[] = []
-  const dIx = fnDeclIx[name] ?? -1
-  if dIx >= 0 {
-    const d = P.nodes[dIx]
-    if d is FuncDecl {
-      const ps = d.fnParams
-      let i = 1
-      while i < ps.length {
-        out.push(ps[i])
-        i = i + 1
-      }
-    }
-  }
-  out
+  paramsAfterFirst(fnDeclParamsOf(name))
 }
 
 // The "expected …" half of an arity diagnostic. A parameter list with no
@@ -19246,9 +19266,9 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
     // The `self`-NAME rule, asked here because the REWRITE asks it and the two
     // must not disagree about what dispatches (see `declFirstParamIsSelf`).
     if !declFirstParamIsSelf(name) { return -1 }
-    // UFCS dispatch takes the same arity range the direct spelling takes — the receiver fills
-    // `self` and the defaults fill the tail, so the low end is `fnRequiredArity` over the declaration's post-`self` parameter list.
-    const uDecl = declParamsAfterSelf(name)
+    // The arity range the direct spelling takes: the receiver fills `self` and the defaults fill
+    // the tail of the declaration the scope chain gives this callee, empty for a binding (D1604).
+    const uDecl = paramsAfterFirst(declParamsInScope(name))
     let uRequired = params.length - 1
     // `fnRequiredArity` over the TAIL alone: `self` is never defaulted (it is
     // the receiver), so the tail's own required count IS the answer.
@@ -19261,7 +19281,7 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
     // Named arguments bind against the parameter names after `self` (the receiver is an
     // unnamed slot-0 positional), in parameter order — the full list with the receiver unnamed.
     if hasNamedArgs(n.callArgNames) {
-      const uNames = fnParamNamesOf(name)
+      const uNames = paramNamesOfNodes(declParamsInScope(name))
       if uNames.length != params.length {
         tErr("named arguments require a declared function", ix)
         return TY_ERR
@@ -20183,13 +20203,14 @@ function checkCallNode(n: Call, ix: i32) {
     }
   }
   // A memory intrinsic declared in the default scope but with no emitter arm
-  // (`nameIsUnimplementedIntrinsic`) is reported here rather than left to the emitter's
-  // generic "call to unknown function", which would misread a missing implementation as a
-  // typo. Gated on the program not declaring its own function of that name, which keeps a user's own `function __store_string__(…)` as a genuine escape hatch.
+  // (`nameIsUnimplementedIntrinsic`) is reported here rather than as the emitter's generic "call
+  // to unknown function", which would misread a missing implementation as a typo. Gated on the
+  // callee still denoting that binding, so a shadowing declaration or parameter keeps it (D1604).
   if cfn is Ident {
     if (
       nameIsUnimplementedIntrinsic(cfn.identName) &&
-      (fnDeclIx[cfn.identName] ?? -1) < 0
+      (fnDeclIx[cfn.identName] ?? -1) < 0 &&
+      lookupDepth(cfn.identName) == 0
     ) {
       tErrUnsupported(
         "'" +
@@ -20446,12 +20467,11 @@ function checkCallNode(n: Call, ix: i32) {
       return retTy
     }
     // Named arguments bind to parameters by name, then positionally — source order is
-    // irrelevant for named args. `TyFunc` carries no parameter names, so the names
-    // resolve against the callee's `FuncDecl`; a closure-valued callee (no declaration)
-    // cannot take named arguments.
+    // irrelevant for named args. `TyFunc` carries no parameter names, so the names resolve
+    // against the declaration the scope chain gives this callee; a closure-valued binding has
+    // none and cannot take named arguments, whatever a same-named declaration says (D1604).
     if hasNamedArgs(n.callArgNames) {
-      let cNames: string[] = []
-      if cfn is Ident { cNames = fnParamNamesOf(cfn.identName) }
+      const cNames = paramNamesOfNodes(dParams)
       if cNames.length != params.length {
         tErr("named arguments require a declared function", ix)
         return retTy
