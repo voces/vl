@@ -385,6 +385,65 @@ The proof is lint OUTPUT identity, not inspection: `vl check --severity info --j
 diagnostics), `lint-self.sh` output is byte-identical, and `compile(candidate, master source)`
 is `cmp`-equal to master's own fixpoint, since lint feeds no codegen.
 
+### B6b · The lexer paid twice — on the SINGLE-SOURCE path only, and that is most of the tree
+
+B6a's "what is left is the lexer (`vcLoadToks` 16.7%)" reads on its own witness, the generated
+16,000-binding file, and the shape it names is real: `checkSrc` lexes the entry, `lintSrc`
+re-lexes the same bytes. **It does not describe a module-mode check, and the seed's numbers say
+so.** On `vl check compiler/typecheck.vl` (a 26-module graph) `vcLoadToks` is **0.00% inclusive**
+and `tokenize` is 4.50%, every sample under `modScan` — the per-instance `(key, source)` cache
+(#2606) banks each module's stream once and both `modCompile` and `lintGraph` replay it. The
+double lex is the path with no module table, which is `tests/cases`, `scripts/`, and every
+`vl check` of a file that imports nothing.
+
+`vcLoadToksEntry` closes it. The bank is `P.toks` itself — the entry stream is held by
+reference, and the second pass takes the array back rather than re-lexing or re-copying, popping
+`jwSecondPass`'s generated tail if one was appended. Only a diagnostic-free lex banks, so a
+replay owes no diagnostic; `modCompile` releases the bank, since module mode can never replay it.
+
+Guest shares, `--names` seeds, warm run, both arms on one box:
+
+| witness | frame | master | after |
+| --- | --- | ---: | ---: |
+| `vl check tests/cases --severity info` (3,002 files) | `vcLoadToks` incl | 12.05% | 6.03% |
+| | — under `checkSrc` | 5.95% | 5.48% |
+| | — under `lintSrc` | 6.10% | **0.56%** |
+| | `tokenize` incl | 10.50% | 5.54% |
+| | `parseProgram` under `lintSrc` | 3.55% | 4.13% |
+| `vl check` one 48,002-line importless file | `vcLoadToks` incl | 16.30% | 8.71% |
+| | — under `lintSrc` | 8.59% | **0.00%** |
+| | `parseProgram` under `lintSrc` | 10.04% | 10.81% |
+| `vl check compiler/typecheck.vl` (26 modules) | `vcLoadToks` incl | 0.00% | 0.00% |
+| | `tokenize` incl, all under `modScan` | 4.50% | 4.47% |
+
+CPU, `/usr/bin/time` user+sys, minimum of interleaved reps against two fixpoint seeds, on a box
+whose load moved between 5 and 111 during the runs:
+
+| workload | reps | master | after | ratio |
+| --- | ---: | ---: | ---: | ---: |
+| `vl check tests/cases --severity info` | 13 | 2.42 s | 2.27 s | 0.938 |
+| `vl check` the 48,002-line file | 11 | 0.79 s | 0.75 s | 0.949 |
+| `vl check compiler/entry.vl` | 7 | 3.88 s | 3.87 s | 0.997 |
+| `vl check compiler/typecheck.vl` | 9 | 0.83 s | 0.79 s | 0.952 |
+
+The two module-mode rows are the control and should read 1.00; `typecheck.vl` has read 0.987,
+1.000 and 0.952 across three sittings, which is the spread a 387-byte seed's code layout and the
+box's load produce on a 0.8 s run. The profile is the sharper statement for them: the lexer's
+share is unchanged to two decimal places, because module mode never enters this path.
+
+**A bank that COPIES the stream is not free, and on a large file it costs more than the lex it
+removes.** The first shape here pushed the rows into a second `Tok[]`: on `tests/cases` it still
+won (0.921), and on the 48,002-line file it was **1.099× — slower than master**, because a
+retained second stream is a live set the collector walks for the rest of the check. The
+by-reference form is 0.931 on that file. Price a cache by what it keeps ALIVE, not only by the
+work it skips.
+
+**The next term is the second PARSE.** `lintSrc` re-parses what `checkSrc` already built, and
+after this it is the larger of the two duplicates — 4.13% of a `tests/cases` run and 10.81% of
+the 48,002-line file, against 0.56% and 0.00% for the lex. It is a different problem:
+`checkProgram` and `jwSecondPass` may move the shared node arena, so reusing the checked arena
+needs a statement about what the check leaves behind, not a bank.
+
 ### B7 · `collectA`'s three phases, and which one a suffix can extend
 
 `monoRebuild`'s stamp (#2594) removed the DUPLICATE rebuild after each minted instance;
