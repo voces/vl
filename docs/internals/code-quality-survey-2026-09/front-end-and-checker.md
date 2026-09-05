@@ -35,7 +35,7 @@ live clause-2 violation with a three-arm witness (§3.1).
 | 5 | `tyToEmitNameGo` (271 lines) and `tyToNominalNameGo` (259) are 83.2% identical and must agree character for character (§2.1) | one drift surface; six duplicated sentinel-index hits collapse to three | M | medium | byte-identical seed (`refresh-compiler.sh` + `cmp`) |
 | 6 | `checkFuncDeclNode` (1,288 lines) — the `if inferring` arm is 752 of them with 12 live locals crossing (§6.1) | the largest function in the tree halves | M | low | byte-identical seed |
 | 7 | `checkCallNode` (996 lines) splits three ways at 2 live locals each; the 525-line member arm holds 31 of the 52 untested diagnostics (§6.2, §8) | readability plus a named test target | M | low | byte-identical seed |
-| 8 | `jwKids` (`json_walk.vl:575`) is `nodeChildren` minus the annotation slots, maintained by hand (§2.2) | a new `Node` variant must be added twice, once outside the ladder ratchet | S | low | byte-identical seed |
+| 8 | `jwKids` (`json_walk.vl:575`) is `nodeChildren` minus the annotation slots, maintained by hand (§2.2) — **landed** | a new `Node` variant must be added twice, once outside the ladder ratchet | S | low | byte-identical seed |
 | 9 | 66 of 750 exports have no cross-module use, 5 have none anywhere; no gate sees this (§4.2) | 21 exported mutable tables in `ast.vl` alone | S | none | `lint-self.sh` + `deno task test`; the LSP's own `unused-export` pass |
 | 10 | `initChecker`'s contract says it resets all checker state; it resets 244 bindings and `checkProgramNode`'s prologue resets a **disjoint** 37 (§7.1) | no rule says where a new table goes | S | low | byte-identical seed if only the comment changes |
 
@@ -88,6 +88,14 @@ walker whose default is documented.
 
 Proposal: `nodeChildren` gains a value-only mode (or `jwKids` becomes a filter over its
 result), so one arm table exists. Size S. Risk low. Proof: byte-identical seed.
+
+**Done 2026-09-05**, the other way round from the proposal: `nodeChildren` is untouched (row 1
+made its allocation the cost) and `nodeValueChildren` is a five-arm exception ladder over the
+kinds that carry a non-value slot, delegating its default to `nodeChildren`. The survey's
+"minus the annotation slots" is one word short — `FuncDecl.fnParams` and the `Param` arm are
+declarations, not annotations, and a filter reading the CHILD's kind cannot drop either,
+because an absent slot is `-1` and has no kind to read. `kind-ladder-incomplete` falls
+10 → 9 in `json_walk.vl` and does not rise in `ast.vl`: a delegating default is a named one.
 
 ### 2.3 · One scan written twice, run twice on the hit path
 
