@@ -3415,6 +3415,87 @@ fn register_fs_imports(
     Ok(())
 }
 
+/// Milliseconds since the Unix epoch, the value `nowMillis()` answers. A clock before the
+/// epoch is 0 rather than negative, and a clock past `i64::MAX` ms saturates: neither is
+/// reachable on a sane host, and both keep the import total.
+fn now_millis() -> i64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => i64::try_from(d.as_millis()).unwrap_or(i64::MAX),
+        Err(_) => 0,
+    }
+}
+
+/// Refuse an extern whose DECLARED signature is not the one this host implements. The name
+/// is the contract, so a program declaring `nowMillis(): i32` is not asking for this
+/// function — and saying so here is better than a wasmtime type error naming no source.
+fn expect_extern_sig(name: &str, ft: &FuncType, params: &[&str], result: &[&str]) -> Result<()> {
+    // `ValType` implements neither `PartialEq` nor `Debug`, so the comparison and the message
+    // both run over these tags — which are also the VL spellings the author wrote.
+    fn tag(v: &ValType) -> &'static str {
+        if v.is_i32() {
+            "i32"
+        } else if v.is_i64() {
+            "i64"
+        } else if v.is_f32() {
+            "f32"
+        } else if v.is_f64() {
+            "f64"
+        } else {
+            "<non-scalar>"
+        }
+    }
+    let ps: Vec<&str> = ft.params().map(|v| tag(&v)).collect();
+    let rs: Vec<&str> = ft.results().map(|v| tag(&v)).collect();
+    if ps != params || rs != result {
+        bail!(
+            "extern function `{name}` is declared `({}) -> ({})`, but this host provides \
+             `({}) -> ({})`",
+            ps.join(", "),
+            rs.join(", "),
+            params.join(", "),
+            result.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Register the user externs (`extern function`) this module declares.
+///
+/// The module's import section IS the manifest, so this walks it: a name in the registry is
+/// defined with the module's OWN `FuncType` (a signature drift is then a named refusal, not
+/// a wrong answer), and a name outside it is a LOAD error naming the function. That refusal
+/// is the enforcement half of the design — the invoker must implement every extern — and it
+/// is deliberately better worded than wasmtime's anonymous `unknown import`.
+///
+/// `vl build` does NOT apply it: a built module is for whatever host will run it, and this
+/// list describes only the one embedded here.
+fn register_extern_imports(linker: &mut Linker<()>, module: &Module) -> Result<()> {
+    for imp in module.imports() {
+        if imp.module() != "extern" {
+            continue;
+        }
+        let name = imp.name().to_string();
+        let ExternType::Func(ft) = imp.ty() else {
+            bail!("extern `{name}` is not imported as a function");
+        };
+        match name.as_str() {
+            // The first entry, and the one the external consumer asked for: a wall clock.
+            "nowMillis" => {
+                expect_extern_sig(&name, &ft, &[], &["i64"])?;
+                linker.func_new("extern", "nowMillis", ft, move |_c, _a, results| {
+                    results[0] = Val::I64(now_millis());
+                    Ok(())
+                })?;
+            }
+            _ => bail!(
+                "extern function `{name}` is declared but this host does not provide it \
+                 (`vl` implements: nowMillis)"
+            ),
+        }
+    }
+    Ok(())
+}
+
 /// Instantiate an already-loaded program module with the host print-import family,
 /// returning the live store + instance. Instantiation RUNS the start function (the
 /// VL program's top level), which for a `*.test.vl` module is the registration pass.
@@ -3499,6 +3580,11 @@ fn instantiate_program(
     // program that touches no file pays nothing and instantiates exactly as before.
     let fs_errno: Arc<Mutex<i32>> = Arc::new(Mutex::new(0));
     register_fs_imports(&mut linker, module, &fs_errno)?;
+
+    // The USER externs, from the module's own import section. An unprovided one fails HERE,
+    // before instantiation, so the message names the function instead of arriving as
+    // wasmtime's `unknown import`.
+    register_extern_imports(&mut linker, module)?;
 
     // Instantiation runs the start function — the VL program's top level.
     //

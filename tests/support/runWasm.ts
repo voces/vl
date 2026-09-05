@@ -154,6 +154,15 @@ export const runWasm = async (wasm: Uint8Array): Promise<RunResult> => {
     // NOT type-check this file. `ci-native`'s `deno test -A tests/cases_wasm_*_test.ts`
     // does, and it is what caught this.
     const { instance } = await WebAssembly.instantiate(wasm as BufferSource, {
+      // The USER externs (`extern function`), under their own module name. Externs carry
+      // scalars only, so — unlike the fs floor below — this harness can implement them, and
+      // it provides exactly the registry the native host does so a fixture behaves the same
+      // under both. An extern outside it is a LinkError naming the function, which is the
+      // enforcement docs/internals/extern-design.md §4 relies on.
+      extern: {
+        // `nowMillis(): i64` — a wasm i64 result must be handed back as a JS bigint.
+        nowMillis: () => BigInt(Date.now()),
+      },
       imports: {
         // Direct value sinks for the `print(x)` builtin. A wasm i64 arrives as a
         // JS bigint; the rest as numbers. Booleans render as `true`/`false`.

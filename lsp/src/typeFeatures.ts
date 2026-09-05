@@ -1194,6 +1194,7 @@ export const VL_HARD_KEYWORDS: readonly string[] = [
   "match",
   "import",
   "export",
+  "extern",
   "type",
   "true",
   "false",

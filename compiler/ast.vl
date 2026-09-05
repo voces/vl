@@ -636,6 +636,126 @@ export function isBodyTyDecl(nodeIx: i32): boolean {
   false
 }
 
+// ── extern declarations: the wasm import manifest ────────────────────────────
+
+// One row per DISTINCT `extern function` name in the module graph, in first-declaration
+// order — the order the import section writes, which is what fixes each extern's wasm
+// function index. A re-declaration of a name already here lands in the duplicate table
+// below, so this stays one row per import.
+export let extNames: string[] = []
+export let extRets: string[] = []
+export let extSigs: string[] = []
+export let extPoss: i32[] = []
+export let extParBase: i32[] = []
+export let extParN: i32[] = []
+// The parameter type spellings of every row, contiguous per row — flat rather than a
+// `string[][]`, so a row's parameters are `extParTys[base + i]` with no nested list.
+export let extParTys: string[] = []
+// Every re-declaration of a name already in the manifest, with its rendered signature and
+// its own name token. The checker compares each against the manifest row and reports only
+// the ones that disagree, so declaring one extern in two modules costs nothing.
+export let extDupNames: string[] = []
+export let extDupSigs: string[] = []
+export let extDupPoss: i32[] = []
+
+// Per-compile reset, called wherever `P.nodes = []` is: the manifest spans the whole module
+// graph, so it must outlive one module's parse and must not outlive one program's compile.
+export function externReset() {
+  extNames = []
+  extRets = []
+  extSigs = []
+  extPoss = []
+  extParBase = []
+  extParN = []
+  extParTys = []
+  extDupNames = []
+  extDupSigs = []
+  extDupPoss = []
+  0
+}
+
+// The manifest row for `name`, or -1. This index is the identity of an extern everywhere
+// downstream: the checker's declaration, the import entry and the call lowering all key on it.
+export function externSlot(name: string): i32 {
+  let i = 0
+  while i < extNames.length {
+    if extNames[i] == name { return i }
+    i = i + 1
+  }
+  -1
+}
+
+// How many imports the manifest declares — the entry count the import section writes and the
+// standalone functype count the type section appends.
+export function externCount(): i32 { extNames.length }
+
+export function externNameAt(k: i32): string {
+  if k < 0 || k >= extNames.length { return "" }
+  extNames[k]
+}
+
+// The return type spelling of row `k`; `""` when the declaration named none, which is a void
+// import and not a missing one.
+export function externRetAt(k: i32): string {
+  if k < 0 || k >= extRets.length { return "" }
+  extRets[k]
+}
+
+// The parameter count of row `k`, or -1 out of range — which every caller treats as "this row
+// is not emittable", never as an arity.
+export function externArityAt(k: i32): i32 {
+  if k < 0 || k >= extParN.length { return -1 }
+  extParN[k]
+}
+
+// The type spelling of parameter `i` of row `k`, or `""` out of range — read by the functype
+// writer and the call lowering, which treat `""` as an unemittable row rather than as a type.
+export function externParamAt(k: i32, i: i32): string {
+  if k < 0 || k >= extParN.length { return "" }
+  if i < 0 || i >= extParN[k] { return "" }
+  const at = extParBase[k] + i
+  if at < 0 || at >= extParTys.length { return "" }
+  extParTys[at]
+}
+
+// Record one `extern function` and answer its manifest row. A name already in the manifest
+// banks its signature in the duplicate table instead of appending a second import, so two
+// modules declaring one extern agree by construction and only a DISAGREEMENT reaches the checker.
+export function externAdd(
+  name: string,
+  params: string[],
+  ret: string,
+  pos: i32,
+) {
+  let sig = "("
+  let i = 0
+  while i < params.length {
+    if i > 0 { sig = sig + "," }
+    sig = sig + params[i]
+    i = i + 1
+  }
+  sig = sig + ")->" + ret
+  const prior = externSlot(name)
+  if prior >= 0 {
+    extDupNames.push(name)
+    extDupSigs.push(sig)
+    extDupPoss.push(pos)
+    return prior
+  }
+  extNames.push(name)
+  extRets.push(ret)
+  extSigs.push(sig)
+  extPoss.push(pos)
+  extParBase.push(extParTys.length)
+  extParN.push(params.length)
+  let j = 0
+  while j < params.length {
+    extParTys.push(params[j])
+    j = j + 1
+  }
+  extNames.length - 1
+}
+
 // Constraints phase 1: bounds, kept where annotations are kept. Both tables store an
 // annotation node index, never a rendered name, because a declared bound is an annotation
 // and rides the path that works end to end — D976 records that the column the checker

@@ -94,6 +94,20 @@ import { OP_INDEX_GET, OP_INDEX_SET, opDeclLabel, opDeclOpOf } from "./ast"
 // is its closing brace.
 import { nodePos, tokIndexAt } from "./fmt_util"
 import { isBinOpFuncName } from "./ast"
+// The extern manifest: parsed in any module, declared here, imported by the emitter.
+import {
+  extDupNames,
+  extDupPoss,
+  extDupSigs,
+  extPoss,
+  extSigs,
+  externArityAt,
+  externCount,
+  externNameAt,
+  externParamAt,
+  externRetAt,
+  externSlot,
+} from "./ast"
 // The parser's spelling tree — what `parseTypeName` saw, before it concatenated it into a
 // name. `tsToTy` resolves from this instead of re-parsing the concatenation.
 import { PIN_ANON, PIN_NONE, PIN_SIGKEY } from "./ast"
@@ -3505,6 +3519,17 @@ function checkNotEmitterIntrinsic(name: string, at: i32) {
       "'" +
         CALLSITE_NAME +
         "' is a compiler intrinsic and cannot be redefined — it is matched by name as a parameter default value, so this definition would never be read there",
+      at,
+    )
+    return 0
+  }
+  // An extern name is a host import name: `emitCall` routes the call to the import, so a
+  // definition of that name would never run — the same reason the fs floor is reserved.
+  if externSlot(name) >= 0 {
+    tErr(
+      "'" +
+        name +
+        "' is declared `extern` — every call to it lowers to a host import, so this definition would never run",
       at,
     )
     return 0
@@ -25166,6 +25191,108 @@ function mixedVariantBoxGate(members: i32[]): boolean {
 
 // The public entry point: checks the program rooted at node `rootIx`, returning the number
 // of diagnostics raised (diagnostics also accumulate on `T.diags`).
+// ── extern declarations ──────────────────────────────────────────────────────
+
+// A diagnostic anchored at an extern's own name TOKEN. Externs mint no AST node, so `tErr`'s
+// node-to-token resolution has nothing to read and the position is supplied directly.
+function externErr(msg: string, tok: i32) {
+  if tok >= 0 && tok < P.toks.length {
+    return tErrPush(msg, -1, P.toks[tok].line, P.toks[tok].col, "", "")
+  }
+  tErrPush(msg, -1, 0, 0, "", "")
+}
+
+// The type-arena index an `extern function` parameter or return spelling resolves to — the
+// closed set that crosses a host boundary in both hosts (`docs/internals/extern-design.md` §2).
+// Every other spelling is refused here and answers `TY_ERR`, so the declaration still gets a
+// type and no caller holds a sentinel it could forget.
+function externScalarTy(
+  name: string,
+  what: string,
+  spelling: string,
+  tok: i32,
+): i32 {
+  if spelling == "i32" { return TY_I32 }
+  if spelling == "i64" { return TY_I64 }
+  if spelling == "f32" { return TY_F32 }
+  if spelling == "f64" { return TY_F64 }
+  if spelling == "boolean" { return TY_BOOL }
+  externBadTy(name, what, spelling, tok)
+  TY_ERR
+}
+
+// The one refusal for a type that cannot cross, naming the workaround the design settles on:
+// bytes travel as a `Buf`'s two i32s through the module's exported `memory`.
+function externBadTy(name: string, what: string, spelling: string, tok: i32) {
+  externErr(
+    "extern `" +
+      name +
+      "` " +
+      what +
+      " `" +
+      spelling +
+      "`, which cannot cross a host boundary — an extern carries i32, i64, f32, f64 and boolean " +
+      "only; pass bytes as a `Buf`'s `base` and `length` (two i32s) and read them through the " +
+      "module's exported `memory`",
+    tok,
+  )
+  0
+}
+
+// Declare every `extern function` the module graph carries, and refuse the two shapes that
+// cannot become one import: a type that does not cross, and two declarations of one name whose
+// signatures disagree. Runs before `checkNode` so a call in any module resolves.
+function checkExternDecls() {
+  let k = 0
+  while k < externCount() {
+    const nm = externNameAt(k)
+    const tok = extPoss[k]
+    if nm == "" {
+      externErr(
+        "`extern function` needs a name — it is the host import's name",
+        tok,
+      )
+    }
+    const ptys: i32[] = []
+    let p = 0
+    const ar = externArityAt(k)
+    while p < ar {
+      ptys.push(externScalarTy(nm, "takes", externParamAt(k, p), tok))
+      p = p + 1
+    }
+    const rs = externRetAt(k)
+    // No return annotation is a VOID import, not a missing one — the reading a `function` with
+    // no annotation does not get, because an extern has no body to infer one from.
+    let rt = TY_VOID
+    if rs != "" { rt = externScalarTy(nm, "returns", rs, tok) }
+    if nm != "" { declare(nm, mkFuncTy(ptys, rt)) }
+    k = k + 1
+  }
+  // Every re-declaration, compared against the manifest row it did not create. Same signature is
+  // the supported shape — one import — so only a disagreement is reported, at the second site.
+  let d = 0
+  while d < extDupNames.length {
+    const dn = extDupNames[d]
+    const home = externSlot(dn)
+    if home >= 0 {
+      if extSigs[home] != extDupSigs[d] {
+        externErr(
+          "extern `" +
+            dn +
+            "` is declared `" +
+            extDupSigs[d] +
+            "` here and `" +
+            extSigs[home] +
+            "` elsewhere — one name is one host import, so every declaration of it must agree",
+          extDupPoss[d],
+        )
+      }
+    }
+    d = d + 1
+  }
+  0
+}
+
 export function checkProgram(rootIx: i32) {
   const rootN0 = P.nodes[rootIx]
   if rootN0 is Program { gRootStmts = rootN0.progStmts }
@@ -25186,6 +25313,7 @@ export function checkProgram(rootIx: i32) {
     isParentElseTyIx.push(-1)
     ntz = ntz + 1
   }
+  checkExternDecls()
   checkNode(rootIx)
   // The global scope (depth 0) is never popped, so flush its un-annotated
   // empty-collection bindings here: any still-open hole is genuinely uninferable.

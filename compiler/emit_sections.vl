@@ -75,6 +75,11 @@ import {
   Unary,
   WhileStmt,
   annTsOf,
+  externArityAt,
+  externCount,
+  externNameAt,
+  externParamAt,
+  externRetAt,
   isDefaultGlobalRef,
   tsMentionsAnyName,
 } from "./ast"
@@ -143,6 +148,7 @@ import {
   emitFnSpanTag,
   emitLetCursor,
   emitRootIx,
+  externIdxAt,
   fRetRArrElem,
   fRetStructIdx,
   fRetVoid,
@@ -190,6 +196,7 @@ import {
   fsUsedAt,
   gCellIdx,
   gEmitNames,
+  gExtIdx,
   gF32PrintIdx,
   gF64PrintIdx,
   gFsIdx,
@@ -3214,6 +3221,23 @@ function emitNameSection(n: i32) {
       }
       fsnm = fsnm + 1
     }
+    // The user externs, after the fs block, which is where manifest order puts them — so the
+    // namemap stays strictly increasing, the appendix's one hard requirement.
+    let exnm = 0
+    while exnm < externCount() {
+      let exIx = externIdxAt(exnm)
+      let exLbl = externNameAt(exnm)
+      if exIx < 0 || exLbl == "" {
+        emitFail(
+          "emitProgram: extern import has no index or name — the manifest and its readers have drifted",
+        )
+        exIx = 0
+        exLbl = "__extern_unknown__"
+      }
+      wULEB(exIx)
+      wName(exLbl)
+      exnm = exnm + 1
+    }
   }
   let fi = 0
   while fi < n {
@@ -3443,6 +3467,9 @@ function emitModule(_stmts: i32[]) {
   // export-wrapper block, the rectype count) is already expressed in terms of this number. One
   // per used import, not one per distinct shape: sharing would make slot k's functype depend on which other slots the program uses, the coupling the append-only slot order exists to avoid.
   nPrintTypes = nPrintTypes + fsImportCount()
+  // …and one per declared extern, on the same terms and trailing the fs block, so an extern
+  // added to a program moves no earlier functype index.
+  nPrintTypes = nPrintTypes + externCount()
 
   emitTypeSection(n, typeOffset, hasStart, memFn, nPrintTypes, nHelpers)
 
@@ -3616,6 +3643,15 @@ function scanPrintUse() {
     gFsUse.push(0)
     gFsIdx.push(-1)
     fsr = fsr + 1
+  }
+  // The extern manifest is the import list, so every row is reserved whether or not the program
+  // calls it: the declaration is the contract the host must satisfy, which is the whole point of
+  // routing it through the import section (extern-design.md §3).
+  gExtIdx = []
+  let exr = 0
+  while exr < externCount() {
+    gExtIdx.push(-1)
+    exr = exr + 1
   }
   let pscan = 0
   let sawI64Ann = false
@@ -3813,6 +3849,17 @@ function scanPrintUse() {
   // the module mentions a float somewhere, which is what keeps an integer-only program's
   // bytes unchanged; the flags this reads are final only now, hence after the loop.
   gNeedsF64Rem = sawFloatRem || (sawRemUnknown && (sawF64 || sawF32))
+  // An extern's own RESULT width is a scalar the annotation scan cannot see: `print(nowMillis())`
+  // spells `i64` nowhere, and without this the print router would call an undeclared import.
+  // Read off the manifest, which is total, exactly as `fsRetIsI64` is for the fs floor.
+  let exw = 0
+  while exw < externCount() {
+    const exwR = externRetAt(exw)
+    if exwR == "i64" { sawI64Ann = true }
+    if exwR == "f64" { sawF64 = true }
+    if exwR == "f32" { sawF32 = true }
+    exw = exw + 1
+  }
   // When the program both prints (`gImports == 4`, the print family) and names
   // an i64 type, add the 5th `__print_i64__` import.
   if gImports == 4 {
@@ -3846,6 +3893,18 @@ function scanPrintUse() {
       gImports = gImports + 1
     }
     fsa = fsa + 1
+  }
+  // The user externs trail everything: the print family (whose 0..3 the call lowering hardcodes)
+  // and the fs floor. An extern occupies an index, so a program that declares one but does not
+  // print still reserves the four print entries — every host provides them already.
+  if externCount() > 0 {
+    if gImports == 0 { gImports = 4 }
+    let exa = 0
+    while exa < externCount() {
+      gExtIdx[exa] = gImports
+      gImports = gImports + 1
+      exa = exa + 1
+    }
   }
   0
 }
@@ -4994,6 +5053,39 @@ function emitTypeSection(
     }
     fsty = fsty + 1
   }
+  // ── the extern functypes ──
+  // One `0x60` rectype per declared extern, in manifest order, standalone outside the rec group
+  // for the reason the fs block above is: wasmtime will not match a rec-group member against a
+  // host-provided function. Scalars only, so no heap type is ever named here.
+  let exty = 0
+  while exty < externCount() {
+    const exAr = externArityAt(exty)
+    wU8(96) // 0x60 func
+    if exAr < 0 {
+      // Cannot `return` — `curBuf` is bound to `typePayload` across this block. Record and write
+      // a well-formed 0-param shape so the section stays parseable while the failure unwinds.
+      emitFail(
+        "emitProgram: extern row has no arity — the manifest and its readers have drifted",
+      )
+      wULEB(0)
+      wULEB(0)
+    } else {
+      wULEB(exAr)
+      let exp = 0
+      while exp < exAr {
+        wU8(externValType(externParamAt(exty, exp)))
+        exp = exp + 1
+      }
+      const exR = externRetAt(exty)
+      if exR == "" {
+        wULEB(0)
+      } else {
+        wULEB(1)
+        wU8(externValType(exR))
+      }
+    }
+    exty = exty + 1
+  }
   if memLogUsed {
     wU8(96)  // 0x60 func — the `__log__` decoder
     wU8(2)   // 2 params
@@ -5041,6 +5133,24 @@ function emitTypeSection(
   0
 }
 
+// The wasm valtype byte an extern's type spelling writes. The set is the checker's
+// (`externScalarTy`); a spelling outside it cannot reach here, and the refusal says which of the
+// two lists moved rather than writing a malformed functype.
+function externValType(spelling: string): i32 {
+  if spelling == "i32" { return 127 }
+  // A boolean is an i32 at the boundary: the host receives 0 or 1, which is its whole ABI.
+  if spelling == "boolean" { return 127 }
+  if spelling == "i64" { return 126 }
+  if spelling == "f32" { return 125 }
+  if spelling == "f64" { return 124 }
+  emitFail(
+    "emitProgram: extern type `" +
+      spelling +
+      "` has no wasm valtype — the checker's extern type set and this writer have drifted",
+  )
+  127
+}
+
 function emitImportSection(n: i32, typeOffset: i32, hasStart: i32) {
   // Import section (id 2, between type and function): the 4-entry print family from
   // the host's `"imports"` module, occupying function indices 0..3 in this exact
@@ -5072,6 +5182,8 @@ function emitImportSection(n: i32, typeOffset: i32, hasStart: i32) {
     if gNeedsF32Print { nImports = nImports + 1 }
     // …and one per USED fs slot, counted from the same table the entries below iterate.
     nImports = nImports + fsImportCount()
+    // …and one per declared extern, trailing the fs block.
+    nImports = nImports + externCount()
     wULEB(nImports)
     wName("imports")
     wName("__print_i32__")
@@ -5135,6 +5247,25 @@ function emitImportSection(n: i32, typeOffset: i32, hasStart: i32) {
         ftFs = ftFs + 1
       }
       fsim = fsim + 1
+    }
+    // The user externs last, in manifest order, under their OWN module name so a host can tell a
+    // user extern from a std intrinsic without a name convention. The import name is the VL name,
+    // unmangled: it is the contract the author wrote (extern-design.md §3).
+    let exim = 0
+    while exim < externCount() {
+      let exNm = externNameAt(exim)
+      if exNm == "" {
+        emitFail(
+          "emitProgram: extern row has no name — the manifest and its count have drifted",
+        )
+        exNm = "__extern_unknown__"
+      }
+      wName("extern")
+      wName(exNm)
+      wU8(0) // import kind: func
+      wULEB(ftFs)
+      ftFs = ftFs + 1
+      exim = exim + 1
     }
     wTarget(imPrev)
     wSection(2, importPayload)
