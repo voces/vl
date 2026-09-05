@@ -431,6 +431,22 @@ line reader exist, the five families collapse toward one. Listed separately so t
 honest — the scanners are what makes `lint.vl` 4,243 lines, and no single PR should try to
 merge them.
 
+**The PRIMITIVES landed 2026-09-05; the rule scanners did not.** Re-derived from the tree
+after #2588 the families are `cb*` 32, `kl*` 30, `si*` 24, `sca*` 7, `as*` 6 — the counts
+above are one release stale. Five operations were written twice: the identifier scan
+(`asIdentAt` + `klIdentEnd` → `cbIdentAt` + `cbIdentEnd`), list membership (`asListHas` +
+`siHas` + `siIndexOf` → `cbListHas` + `cbListIndexOf`), the case-folded whole word
+(`cbHistWordAt` → `cbWordIsI`, which `scaWordIsI` now wraps), span equality (`cbSpanIs` is
+`cbAt` with the length pinned), and the `//` line test, inline in both comment scans and now
+`cbCommentAt`. Four pairs that read like duplicates are KEPT, because each difference is
+load-bearing for a named rule and has a witness in the landing PR: `cbSpacesEnd` skips spaces
+where `klIndentEnd` skips tabs too, `cbDigitsEnd` eats thousands commas where
+`cbPlainDigitsEnd` does not, `cbWordIs` is case-sensitive where `cbWordIsI` folds, and
+`scaWordIsI` takes the leading boundary its caller does not. Left for a second slice: the
+five per-line literal-skipping walks (`siScanHoles`, `siNegAnswerLine`, `siRetCallOf`,
+`siLineReturns`, `siHeaderNames`), which differ only in the body they run at each index, and
+the import-region tracker the two comment scans each keep a copy of.
+
 ---
 
 ## 6 · What the survey did not find
