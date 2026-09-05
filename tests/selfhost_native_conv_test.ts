@@ -21,18 +21,7 @@
 // GATING: env-gated (`SELFHOST_NATIVE_ALIGN=1`) AND requires the built vl binary +
 // seed wasm; absent either, every case registers ignored with a build note.
 
-const exists = (p: string): boolean => {
-  try {
-    Deno.statSync(p);
-    return true;
-  } catch {
-    return false;
-  }
-};
-
-const ROOT = new URL("../", import.meta.url).pathname.replace(/\/$/, "");
-const VL = `${ROOT}/scripts/vl-host/target/release/vl`;
-const COMPILER = `${ROOT}/build/vl-compiler.wasm`;
+import { COMPILER, VL, exists, nativeEnv } from "./support/tree.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER);
@@ -65,7 +54,7 @@ const nativeRejects = async (src: string): Promise<boolean> => {
       args: ["check", tmp, "--compiler", COMPILER],
       stdout: "null",
       stderr: "null",
-      env: { RUST_BACKTRACE: "0" },
+      env: nativeEnv(),
     }).output();
     return code !== 0;
   } finally {

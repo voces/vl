@@ -93,6 +93,7 @@ import { OP_INDEX_GET, OP_INDEX_SET, opDeclLabel, opDeclOpOf } from "./ast"
 // for a function-literal argument (`tErrAtNodeStart`), whose `nodeToks` last-token anchor
 // is its closing brace.
 import { nodePos, tokIndexAt } from "./fmt_util"
+import { sidArrGet, sidArrPut, sidOf } from "./symbols"
 import { isBinOpFuncName } from "./ast"
 // The extern manifest: parsed in any module, declared here, imported by the emitter.
 import {
@@ -1707,83 +1708,94 @@ function flushUninferred(depth: i32) {
 // ── definite-assignment flow ─────────────────────────────────────────────────
 
 // An uninitialized `let x: T` starts unassigned and is non-null, so a read before it is provably
-// written on every preceding path is a "used before it is assigned" error. `daUnassigned` is the
-// live set of binding names still un-written on the current path, keyed by name and forked and
-// joined explicitly at `if`/`else` and loops; `daWriteTarget` exempts a plain-`=` left-hand ident.
-const daUnassigned: string[] = []
+// written on every preceding path is a "used before it is assigned" error. `daLive` is the live
+// set of binding ids still un-written on the current path, forked and joined explicitly at
+// `if`/`else` and loops; `daWriteTarget` exempts a plain-`=` left-hand ident.
+const daLive: i32[] = []
+// `daPos` is `daLive`'s sid-keyed inverse: the id's index in `daLive`, or -1 when it is assigned.
+// Membership, add and mark are one array read each, so a module whose pass-1 dead zone holds
+// every top-level binding is linear in them rather than quadratic.
+const daPos: i32[] = []
 let daWriteTarget = -1
 
-// True if `name` is currently in the live unassigned set.
-function daIsUnassigned(name: string) {
-  let i = 0
-  while i < daUnassigned.length {
-    if daUnassigned[i] == name { return true }
-    i = i + 1
-  }
-  false
+// True if the interned id `sid` is currently in the live unassigned set.
+function daIsUnassignedSid(sid: i32) { sidArrGet(daPos, sid) >= 0 }
+
+// Mark the interned id `sid` unassigned on the current path.
+function daAddSid(sid: i32) {
+  if sid < 0 { return 0 }
+  if sidArrGet(daPos, sid) >= 0 { return 0 }
+  sidArrPut(daPos, sid, daLive.length)
+  daLive.push(sid)
+  0
 }
 
 // Mark `name` unassigned on the current path (a `let x: T` with no initializer).
-function daAdd(name: string) {
-  if !daIsUnassigned(name) { daUnassigned.push(name) }
+function daAdd(name: string) { daAddSid(sidOf(name)) }
+
+// Mark the interned id `sid` assigned, removing it from the live set by swapping the last entry
+// into its slot. Order is unobservable: nothing reads the set except as a membership test and as
+// a snapshot fed back through `daAddSid`.
+function daMarkAssignedSid(sid: i32) {
+  const at = sidArrGet(daPos, sid)
+  if at < 0 { return 0 }
+  const moved = daLive[daLive.length - 1]
+  daLive[at] = moved
+  sidArrPut(daPos, moved, at)
+  daLive.pop()
+  sidArrPut(daPos, sid, -1)
   0
 }
 
-// Mark `name` assigned on the current path (a write or a checked read), removing it from the
-// live set. Rebuilds the survivors into a temp, then refills the global in place (`.clear()` +
-// push) so the global array reference is never reassigned, which keeps the self-emitter on its
-// supported in-place-mutation path.
+// Mark `name` assigned on the current path (a write or a checked read). An empty live set
+// answers without interning, which is every read and write inside a body that declares no
+// uninitialized binding.
 function daMarkAssigned(name: string) {
-  const keep: string[] = []
-  let i = 0
-  while i < daUnassigned.length {
-    if daUnassigned[i] != name { keep.push(daUnassigned[i]) }
-    i = i + 1
-  }
-  daClear()
-  let j = 0
-  while j < keep.length {
-    daUnassigned.push(keep[j])
-    j = j + 1
-  }
-  0
+  if daLive.length == 0 { return 0 }
+  daMarkAssignedSid(sidOf(name))
 }
 
-// Empty the live set in place; it never reassigns the global reference.
+// Empty the live set in place; it never reassigns the global reference. Clearing through
+// `daLive` restores `daPos` to all -1, which is what makes the column safe across a `sidReset`.
 function daClear() {
   // The self-host emitter lowers `.pop()` (and `.length`) as statements but not
   // `.clear()`, so empty the array in place by popping until empty.
-  while daUnassigned.length > 0 { daUnassigned.pop() }
+  while daLive.length > 0 {
+    sidArrPut(daPos, daLive[daLive.length - 1], -1)
+    daLive.pop()
+  }
   0
 }
 
 // Check a read of `name`: if it is still unassigned on this path, report it and drop it so the
 // same hole does not re-fire on every later read.
 function daCheckRead(name: string, at: i32) {
-  if daIsUnassigned(name) {
-    daMarkAssigned(name)
+  if daLive.length == 0 { return 0 }
+  const sid = sidOf(name)
+  if daIsUnassignedSid(sid) {
+    daMarkAssignedSid(sid)
     tErr("`" + name + "` is used before it is assigned", at)
   }
   0
 }
 
-// Snapshot the live unassigned set (a copy), for forking and joining paths.
+// Snapshot the live unassigned set (a copy of its ids), for forking and joining paths.
 function daSnapshot() {
-  const snap: string[] = []
+  const snap: i32[] = []
   let i = 0
-  while i < daUnassigned.length {
-    snap.push(daUnassigned[i])
+  while i < daLive.length {
+    snap.push(daLive[i])
     i = i + 1
   }
   snap
 }
 
 // Restore the live set from a snapshot (in place — never reassigns the global).
-function daRestore(snap: string[]) {
+function daRestore(snap: i32[]) {
   daClear()
   let i = 0
   while i < snap.length {
-    daUnassigned.push(snap[i])
+    daAddSid(snap[i])
     i = i + 1
   }
   0
@@ -1793,10 +1805,10 @@ function daRestore(snap: string[]) {
 // assigned on both, equivalently still unassigned if it is unassigned on either. So the joined
 // live set is the union of the two paths' unassigned sets, the current live set standing for
 // `a` and `b` folded in.
-function daJoinInto(b: string[]) {
+function daJoinInto(b: i32[]) {
   let i = 0
   while i < b.length {
-    daAdd(b[i])
+    daAddSid(b[i])
     i = i + 1
   }
   0

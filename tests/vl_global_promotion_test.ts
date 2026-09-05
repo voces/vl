@@ -33,18 +33,7 @@
 // and a seed-backed test matching neither glob nor an explicit ci.yml step runs NOWHERE
 // (`tests/ci_seed_coverage_test.ts` is the guard).
 
-const exists = (p: string): boolean => {
-  try {
-    Deno.statSync(p);
-    return true;
-  } catch {
-    return false;
-  }
-};
-
-const ROOT = new URL("../", import.meta.url).pathname.replace(/\/$/, "");
-const VL = `${ROOT}/scripts/vl-host/target/release/vl`;
-const COMPILER = `${ROOT}/build/vl-compiler.wasm`;
+import { COMPILER, ROOT, VL, exists, nativeEnv } from "./support/tree.ts";
 
 const haveBin = exists(VL);
 const haveSeed = exists(COMPILER);
@@ -70,6 +59,7 @@ const build = async (relPath: string): Promise<Uint8Array> => {
       args: ["build", relPath, "-o", o, "--compiler", COMPILER],
       stdout: "piped",
       stderr: "piped",
+      env: nativeEnv(),
     }).output();
     if (code !== 0) {
       throw new Error(
