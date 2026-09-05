@@ -890,18 +890,28 @@ export const createWasmChecker = (
     staged = undefined;
   };
 
-  // A parse-only pass (`lint` / `formatSrc` / `lexicalTokensAt` /
-  // `declExtentsAt`) re-stages the SOURCE and destroys the checked tables while
-  // leaving the module table alone — so the staging survives exactly when the
-  // text it re-stages is the text the instance already held.
-  const restagedSource = (exp: Exports, source: string): void => {
+  // What survives a pass that pushes the ENTRY SOURCE again: the same entry when
+  // the text being pushed is the text the instance already held, and nothing
+  // otherwise — a different source makes the instance hold a program the memo does
+  // not describe. The module table is untouched either way, so this never
+  // re-commits the graph. Returns the surviving entry, for a caller to downgrade.
+  const restagedFor = (exp: Exports, source: string): Staged | undefined => {
     const held = staged;
-    if (held === undefined) return;
+    if (held === undefined) return undefined;
     if (held.exp !== exp || held.source !== source) {
       staged = undefined;
-      return;
+      return undefined;
     }
-    held.checked = false;
+    return held;
+  };
+
+  // A parse-only pass (`lint` / `formatSrc` / `declExtentsAt`) additionally
+  // DESTROYS the checked tables — it re-lexes into `P.toks` and re-parses the
+  // shared node arena — so the staging it leaves behind owes a check again.
+  // `lexicalTokensAt` is NOT one of these and calls `restagedFor` itself.
+  const restagedSource = (exp: Exports, source: string): void => {
+    const held = restagedFor(exp, source);
+    if (held !== undefined) held.checked = false;
   };
 
   // THE HOST<->SEED ABI GENERATION this checker speaks. Kept in step with the Rust
@@ -1857,7 +1867,11 @@ export const createWasmChecker = (
     ) {
       return [];
     }
-    restagedSource(exp, source);
+    // `restagedFor`, not `restagedSource`: `lexScan` writes only its own four span
+    // tables and calls `tokenize`, whose state is the lexer's own scanner globals —
+    // it never touches `P.toks`, the node arena or the occurrence tables. So over
+    // the text already staged the CHECK survives, and the query after it is free.
+    restagedFor(exp, source);
     exp.srcReset();
     pushString(exp.srcPush, source);
     const n = exp.lexScan();
