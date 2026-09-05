@@ -628,6 +628,16 @@ export type WasmChecker = {
    * document zero.
    */
   graphCheckCount: () => number;
+  /**
+   * How many module commits this checker has made, split by whether the module's
+   * SOURCE had to cross the boundary (`pushed`) or the seed already held it under
+   * that key (`cached`).
+   *
+   * The same kind of instrument as {@link graphCheckCount}: it distinguishes a
+   * staging cache that is present from one that is live. Re-staging a 30-module
+   * graph after an edit to the entry must push exactly one module.
+   */
+  stagingCounts: () => { pushed: number; cached: number };
 };
 
 /** A native 1-based line as an LSP 0-based one; 0 means "no position". */
@@ -650,6 +660,23 @@ const pushString = (push: (cp: number) => number, text: string) => {
  */
 const readString = (len: number, at: (j: number) => number): string =>
   new TextDecoder().decode(readBytes(len, at));
+
+/** A string's UTF-8 byte length — the unit a VL string's own `.length` counts, and
+ *  what the seed compares a cached module's source against. Counted rather than
+ *  encoded: the caller holds megabytes of module text per keystroke. */
+const utf8Length = (text: string): number => {
+  let n = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (c < 0x80) n += 1;
+    else if (c < 0x800) n += 2;
+    else if (c >= 0xd800 && c < 0xdc00) {
+      n += 4;
+      i++; // the low surrogate belongs to the code point just counted
+    } else n += 3;
+  }
+  return n;
+};
 
 /** The same per-byte pull, left as BYTES — what a length-prefixed payload needs
  *  (`decodeDiagData`), since its lengths are UTF-8 byte counts. */
@@ -677,6 +704,36 @@ export const createWasmChecker = (
   instantiate: () => Exports | undefined,
   wrapReader?: (read: ModuleReader) => ModuleReader,
 ): WasmChecker => {
+  /**
+   * What the instance's per-module scan cache holds, AS THE HOST LAST WROTE IT:
+   * module key → the exact source pushed for it, and that source's UTF-8 length.
+   *
+   * This is the staging half of the per-module cache. A whole-graph check re-commits
+   * every module on every keystroke, and all but the edited one are byte-identical
+   * to what the seed already holds — so the entry alone need cross the boundary, and
+   * `modCommitCached` commits the rest by key.
+   *
+   * The SEED is the authority, not this map: `modCommitCached` answers 0 whenever its
+   * own slot is gone (evicted) or disagrees about the length, and the host then pushes.
+   * So a stale entry here costs a push, never a wrong answer. It is dropped whole when
+   * the instance is replaced (a mid-session `refresh-compiler.sh`), since a fresh
+   * instance holds no cache at all.
+   */
+  type PushedSource = { text: string; bytes: number };
+  let pushedExp: Exports | undefined;
+  let pushedByKey = new Map<string, PushedSource>();
+  // Module commits since this checker was built, by route. An instrument, not a
+  // feature — `stagingCounts` is what proves the cache is live.
+  let pushedCommits = 0;
+  let cachedCommits = 0;
+  const pushedFor = (exp: Exports): Map<string, PushedSource> => {
+    if (pushedExp !== exp) {
+      pushedExp = exp;
+      pushedByKey = new Map();
+    }
+    return pushedByKey;
+  };
+
   // Shared setup for every query: reset the module table (it persists across
   // checks by design — an LSP check is a fresh program every time), run the
   // import fetch loop against the workspace reader, then stage the entry source.
@@ -694,10 +751,30 @@ export const createWasmChecker = (
       // precedence as the TS checker's workspace reader, so the two agree about
       // std). With no wrapper, the reader is used as-is.
       const readModule = wrapReader ? wrapReader(read) : read;
+      const pushed = pushedFor(exp);
       const commit = (key: string, src: string | undefined) => {
         pushString(exp.modKeyPush, key);
-        if (src !== undefined) pushString(exp.modSrcPush, src);
-        exp.modCommit(src !== undefined ? 1 : 0);
+        if (src === undefined) {
+          exp.modCommit(0);
+          return;
+        }
+        // An UNCHANGED dependency: the seed still holds this key's source, so commit
+        // it by key and its text never crosses the boundary. A 0 leaves the key
+        // staged (the seed has no such slot, or disagrees about its length), and the
+        // push below finishes the same commit.
+        const held = pushed.get(key);
+        if (
+          held !== undefined && held.text === src &&
+          typeof exp.modCommitCached === "function" &&
+          exp.modCommitCached(held.bytes) === 1
+        ) {
+          cachedCommits++;
+          return;
+        }
+        pushString(exp.modSrcPush, src);
+        exp.modCommit(1);
+        pushedCommits++;
+        pushed.set(key, { text: src, bytes: utf8Length(src) });
       };
       commit(entryKey, source);
       for (;;) {
@@ -1482,6 +1559,9 @@ export const createWasmChecker = (
     pushString(exp.modKeyPush, entryKey);
     pushString(exp.modSrcPush, source);
     exp.modCommit(1);
+    // This push is what the seed's cache now holds for `entryKey`; recording it keeps
+    // the staging memo describing the instance rather than only `prepare`'s own writes.
+    pushedFor(exp).set(entryKey, { text: source, bytes: utf8Length(source) });
 
     const exports: WasmModuleExport[] = [];
     const expCount = exp.expCount();
@@ -1860,6 +1940,13 @@ export const createWasmChecker = (
   // `WasmChecker.graphCheckCount`).
   const graphCheckCount = (): number => graphChecks;
 
+  // The staging counters, for the test that grades the per-module cache (see
+  // `WasmChecker.stagingCounts`).
+  const stagingCounts = (): { pushed: number; cached: number } => ({
+    pushed: pushedCommits,
+    cached: cachedCommits,
+  });
+
   // The builtin-completion export rides the same seed as the Stage-2+ exports; an
   // older seed lacks it, so this yields [] and the host keeps its TS builtins.
   // Static (no source / `prepare`) — the builtin surface is fixed.
@@ -1908,6 +1995,7 @@ export const createWasmChecker = (
     lint,
     bumpReaderGeneration,
     graphCheckCount,
+    stagingCounts,
   };
 };
 

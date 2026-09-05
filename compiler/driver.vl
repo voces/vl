@@ -453,21 +453,27 @@ let modTyShadow: string[] = []
 // without this its value row alone wrongly renamed `u8[]` too. Almost always empty.
 let modBuiltinTyTargets: string[] = []
 // ── per-instance module scan/token cache ──────────────────────────────────────
-// A directory check rebuilds the module table once per file, so a shared dependency
-// is cached per (module key, source text): entries replay under the new table
-// index, so one tokenization serves both scan and parse for every module of every build.
-const modCacheKeys: string[] = []
-const modCacheSrcs: string[] = []
-const modCacheImpOff: i32[] = []
-const modCacheImpEnd: i32[] = []
-const modCacheReOff: i32[] = []
-const modCacheReEnd: i32[] = []
-const modCacheExpOff: i32[] = []
-const modCacheExpEnd: i32[] = []
+// One slot per module key, holding that module's import/export scan and its token
+// stream, replayable under any later table index. A source change DROPS the key's
+// slot, so an editor re-committing one file cannot bank a slot per keystroke.
+let modCacheKeys: string[] = []
+let modCacheSrcs: string[] = []
+let modCacheImpOff: i32[] = []
+let modCacheImpEnd: i32[] = []
+let modCacheReOff: i32[] = []
+let modCacheReEnd: i32[] = []
+let modCacheExpOff: i32[] = []
+let modCacheExpEnd: i32[] = []
 // Token slice (-1 = not captured); only a CLEAN tokenization (no lex diags) is
 // cached, so a hit never has diags to re-fold.
-const modCacheTokOff: i32[] = []
-const modCacheTokEnd: i32[] = []
+let modCacheTokOff: i32[] = []
+let modCacheTokEnd: i32[] = []
+// What a non-trailing drop leaves behind: its token rows, and the slot itself. The
+// whole cache clears once either outgrows its live half, bounding the storage without
+// a compaction pass. A module banking no tokens (a lex diag) moves only the slot count.
+let modCacheDeadTok = 0
+let modCacheDeadSlots = 0
+let modCacheClears = 0
 // The token range `modScan` just banked into the flat storage, handed to
 // `modScanCached` for the slot it appends. `modScan` is called from exactly one
 // place and its result is recorded immediately, so a scalar pair carries it
@@ -475,42 +481,180 @@ const modCacheTokEnd: i32[] = []
 let modScanTokOff = -1
 let modScanTokEnd = -1
 // Flat storage backing the slices above.
-const modCacheImpSpec: string[] = []
-const modCacheImpKey: string[] = []
-const modCacheImpName: string[] = []
-const modCacheImpLocal: string[] = []
-const modCacheImpNameLine: i32[] = []
-const modCacheImpNameCol: i32[] = []
-const modCacheImpSpecLine: i32[] = []
-const modCacheImpSpecCol: i32[] = []
-const modCacheImpSpecEnd: i32[] = []
-const modCacheImpSpecChar: i32[] = []
-const modCacheRePublic: string[] = []
-const modCacheReLocal: string[] = []
-const modCacheReNameLine: i32[] = []
-const modCacheReNameCol: i32[] = []
-const modCacheReKwLine: i32[] = []
-const modCacheReKwCol: i32[] = []
-const modCacheReKey: string[] = []
-const modCacheExpName: string[] = []
-const modCacheExpDeclLine: i32[] = []
-const modCacheExpDeclCol: i32[] = []
-const modCacheExpKwLine: i32[] = []
-const modCacheExpKwCol: i32[] = []
-const modCacheTokKind: TokKind[] = []
-const modCacheTokText: string[] = []
-const modCacheTokStart: i32[] = []
-const modCacheTokLine: i32[] = []
-const modCacheTokCol: i32[] = []
-// The cache slot for (key, src), or -1. Duplicate keys may exist (a source
-// rewritten mid-run appends a new slot); the src must match exactly.
-function modCacheLookup(key: string, src: string): i32 {
+let modCacheImpSpec: string[] = []
+let modCacheImpKey: string[] = []
+let modCacheImpName: string[] = []
+let modCacheImpLocal: string[] = []
+let modCacheImpNameLine: i32[] = []
+let modCacheImpNameCol: i32[] = []
+let modCacheImpSpecLine: i32[] = []
+let modCacheImpSpecCol: i32[] = []
+let modCacheImpSpecEnd: i32[] = []
+let modCacheImpSpecChar: i32[] = []
+let modCacheRePublic: string[] = []
+let modCacheReLocal: string[] = []
+let modCacheReNameLine: i32[] = []
+let modCacheReNameCol: i32[] = []
+let modCacheReKwLine: i32[] = []
+let modCacheReKwCol: i32[] = []
+let modCacheReKey: string[] = []
+let modCacheExpName: string[] = []
+let modCacheExpDeclLine: i32[] = []
+let modCacheExpDeclCol: i32[] = []
+let modCacheExpKwLine: i32[] = []
+let modCacheExpKwCol: i32[] = []
+let modCacheTokKind: TokKind[] = []
+let modCacheTokText: string[] = []
+let modCacheTokStart: i32[] = []
+let modCacheTokLine: i32[] = []
+let modCacheTokCol: i32[] = []
+// The slot holding `key`, or -1. A dropped slot keeps its row but takes the empty
+// key, which no module can carry, so it is skipped here and reused by nothing.
+function modCacheSlotOfKey(key: string): i32 {
+  if key == "" { return -1 }
   let i = 0
   while i < modCacheKeys.length {
-    if modCacheKeys[i] == key && modCacheSrcs[i] == src { return i }
+    if modCacheKeys[i] == key { return i }
     i = i + 1
   }
   -1
+}
+// The cache slot for (key, src), or -1. The key has at most one slot, so a source
+// that does not match it is a miss and the slot is the one about to be dropped.
+function modCacheLookup(key: string, src: string): i32 {
+  const i = modCacheSlotOfKey(key)
+  if i >= 0 && modCacheSrcs[i] == src { return i }
+  -1
+}
+// Empties every cache array. Called only when the dead rows outgrow the live ones;
+// the cache is transparent, so the cost of a clear is one re-scan per module.
+function modCacheClear(): i32 {
+  modCacheKeys = []
+  modCacheSrcs = []
+  modCacheImpOff = []
+  modCacheImpEnd = []
+  modCacheReOff = []
+  modCacheReEnd = []
+  modCacheExpOff = []
+  modCacheExpEnd = []
+  modCacheTokOff = []
+  modCacheTokEnd = []
+  modCacheImpSpec = []
+  modCacheImpKey = []
+  modCacheImpName = []
+  modCacheImpLocal = []
+  modCacheImpNameLine = []
+  modCacheImpNameCol = []
+  modCacheImpSpecLine = []
+  modCacheImpSpecCol = []
+  modCacheImpSpecEnd = []
+  modCacheImpSpecChar = []
+  modCacheRePublic = []
+  modCacheReLocal = []
+  modCacheReNameLine = []
+  modCacheReNameCol = []
+  modCacheReKwLine = []
+  modCacheReKwCol = []
+  modCacheReKey = []
+  modCacheExpName = []
+  modCacheExpDeclLine = []
+  modCacheExpDeclCol = []
+  modCacheExpKwLine = []
+  modCacheExpKwCol = []
+  modCacheTokKind = []
+  modCacheTokText = []
+  modCacheTokStart = []
+  modCacheTokLine = []
+  modCacheTokCol = []
+  modCacheDeadTok = 0
+  modCacheDeadSlots = 0
+  modCacheClears = modCacheClears + 1
+  0
+}
+// Truncates `arr` back to `n`, for the trailing-row release below.
+function modCachePopTo(arr: string[], n: i32): i32 {
+  while arr.length > n { arr.pop() }
+  0
+}
+function modCachePopToI(arr: i32[], n: i32): i32 {
+  while arr.length > n { arr.pop() }
+  0
+}
+// Releases slot `ci`. Its key, source and any TRAILING flat rows go immediately —
+// the editor's own shape, since the file being edited commits first and so banked
+// last. Rows that are not trailing are counted, and pass the storage bound to the clear.
+function modCacheDrop(ci: i32): i32 {
+  const toff = modCacheTokOff[ci]
+  const tend = modCacheTokEnd[ci]
+  if toff >= 0 && tend == modCacheTokKind.length {
+    modCachePopTo(modCacheTokText, toff)
+    modCachePopToI(modCacheTokStart, toff)
+    modCachePopToI(modCacheTokLine, toff)
+    modCachePopToI(modCacheTokCol, toff)
+    while modCacheTokKind.length > toff { modCacheTokKind.pop() }
+  } else if toff >= 0 {
+    modCacheDeadTok = modCacheDeadTok + (tend - toff)
+  }
+  if modCacheImpEnd[ci] == modCacheImpSpec.length {
+    const ioff = modCacheImpOff[ci]
+    modCachePopTo(modCacheImpSpec, ioff)
+    modCachePopTo(modCacheImpKey, ioff)
+    modCachePopTo(modCacheImpName, ioff)
+    modCachePopTo(modCacheImpLocal, ioff)
+    modCachePopToI(modCacheImpNameLine, ioff)
+    modCachePopToI(modCacheImpNameCol, ioff)
+    modCachePopToI(modCacheImpSpecLine, ioff)
+    modCachePopToI(modCacheImpSpecCol, ioff)
+    modCachePopToI(modCacheImpSpecEnd, ioff)
+    modCachePopToI(modCacheImpSpecChar, ioff)
+  }
+  if modCacheReEnd[ci] == modCacheRePublic.length {
+    const roff = modCacheReOff[ci]
+    modCachePopTo(modCacheRePublic, roff)
+    modCachePopTo(modCacheReLocal, roff)
+    modCachePopToI(modCacheReNameLine, roff)
+    modCachePopToI(modCacheReNameCol, roff)
+    modCachePopToI(modCacheReKwLine, roff)
+    modCachePopToI(modCacheReKwCol, roff)
+    modCachePopTo(modCacheReKey, roff)
+  }
+  if modCacheExpEnd[ci] == modCacheExpName.length {
+    const eoff = modCacheExpOff[ci]
+    modCachePopTo(modCacheExpName, eoff)
+    modCachePopToI(modCacheExpDeclLine, eoff)
+    modCachePopToI(modCacheExpDeclCol, eoff)
+    modCachePopToI(modCacheExpKwLine, eoff)
+    modCachePopToI(modCacheExpKwCol, eoff)
+  }
+  modCacheKeys[ci] = ""
+  modCacheSrcs[ci] = ""
+  if ci == modCacheKeys.length - 1 {
+    modCachePopTo(modCacheKeys, ci)
+    modCachePopTo(modCacheSrcs, ci)
+    modCachePopToI(modCacheImpOff, ci)
+    modCachePopToI(modCacheImpEnd, ci)
+    modCachePopToI(modCacheReOff, ci)
+    modCachePopToI(modCacheReEnd, ci)
+    modCachePopToI(modCacheExpOff, ci)
+    modCachePopToI(modCacheExpEnd, ci)
+    modCachePopToI(modCacheTokOff, ci)
+    modCachePopToI(modCacheTokEnd, ci)
+  } else {
+    modCacheDeadSlots = modCacheDeadSlots + 1
+  }
+  0
+}
+// The storage bound, applied after a bank rather than inside the drop: the editor drops a
+// slot and re-banks the same key at once, so a check between the two reads one module's
+// rows as half the cache and clears on every keystroke.
+function modCacheBound(): i32 {
+  if modCacheDeadTok > modCacheTokKind.length - modCacheDeadTok {
+    return modCacheClear()
+  }
+  if modCacheDeadSlots > modCacheKeys.length - modCacheDeadSlots {
+    return modCacheClear()
+  }
+  0
 }
 
 function vcLoadToks(src: string): i32 {
@@ -2036,12 +2180,41 @@ export function modCommitStr(key: string, src: string, found: i32): i32 {
   modRecomputePending()
   0
 }
+// Commits the accumulated key from the cache's own copy of its source, so an unchanged
+// dependency costs the host no source push. `srcBytes` is the caller's own UTF-8 length,
+// and a disagreement is a miss. Returns 1 when the cache served it; 0 leaves the key
+// staged, so a miss is finished by `modSrcPush` + `modCommit`.
+export function modCommitCached(srcBytes: i32): i32 {
+  const key = fromCodePoints(modKeyAcc)
+  const ci = modCacheSlotOfKey(key)
+  if ci < 0 { return 0 }
+  if modCacheSrcs[ci].length != srcBytes { return 0 }
+  modKeyAcc = []
+  modSrcAcc = []
+  modCommitStr(key, modCacheSrcs[ci], 1)
+  1
+}
+// The cache's own counters, for the test that grades the storage bound: 0 = slots,
+// 1 = live token rows, 2 = rows a non-trailing drop stranded, 3 = whole-cache clears.
+export function modCacheStat(which: i32): i32 {
+  if which == 0 { return modCacheKeys.length }
+  if which == 1 { return modCacheTokKind.length }
+  if which == 2 { return modCacheDeadTok }
+  if which == 3 { return modCacheClears }
+  -1
+}
 // `modScan` through the per-instance cache: replay a recorded scan under table
 // index `m` on a hit; on a miss, scan and record the entries the scan appended
 // (modScan only ever appends, and only for `m`, so the [before, after) slice IS
 // this module's scan result) together with the token range it banked.
 function modScanCached(m: i32, key: string, src: string): i32 {
   const ci = modCacheLookup(key, src)
+  if ci < 0 {
+    // The key's own slot, if it has one, is now stale: its source is not this one and
+    // no later lookup can ask for it again. Released before the fresh scan banks.
+    const stale = modCacheSlotOfKey(key)
+    if stale >= 0 { modCacheDrop(stale) }
+  }
   if ci >= 0 {
     let ii = modCacheImpOff[ci]
     while ii < modCacheImpEnd[ci] {
@@ -2130,6 +2303,7 @@ function modScanCached(m: i32, key: string, src: string): i32 {
   modCacheExpEnd.push(modCacheExpName.length)
   modCacheTokOff.push(modScanTokOff)
   modCacheTokEnd.push(modScanTokEnd)
+  modCacheBound()
   0
 }
 // `vcLoadToks` for module `m` through the per-instance cache: on a hit, re-pushes

@@ -21,7 +21,7 @@ QUICK = a day, no design question. STRUCT = a design track.
 | 6 | String `+` in a loop is **O(n²)** (§D): a loop-local builder, with n-ary chain fusion as the down payment. The fusion once shipped in the TS core and was never ported | ×4.80 per doubling; 5.4× at 320 KB; ≥129 in-loop sites | M / L | rep layer | corpus byte-identity where the pattern is absent; a scaling pair "append N" vs "join N", ratio bar 2.5 — **a value fixture cannot pin a cost class** | STRUCT |
 | 7 | ✅ **LANDED (§F8)** — `unRowOfName`/`isUName` → `unRowBySid`, extended at all three pushes; `unionMemberSetOf` and `unionRowOf`'s first leg route through it | self **0.70% → 0.01%**, incl **1.33% → 0.26%** | M | index must extend at all 3 pushes | byte-identical seed; `regress.py`; the unions axis | STRUCT |
 | 8 | ✅ **LANDED in part (§B6)** — the shape is module-level BINDINGS, not call sites, and the definite-assignment set was 91% of it. Sid-keyed, the 8,000-rung falls 2.54 s → 1.07 s and `checkProgram` goes 57.5% → 1.8% inclusive; the residual is not the checker | **−58% at 8k, −66% at 16k** | M | — | a 4-rung absolute ladder with an exponent bar (`scripts/perf/check-scaling.sh`) | STRUCT |
-| 9 | LSP re-checks the WHOLE module graph per keystroke — 26 modules = **4.43 s** | editor latency, not CI | M | — | a keystroke ladder at 1 / 4 / 26 modules | STRUCT |
+| 9 | LSP re-checks the WHOLE module graph per keystroke — 30 modules. **Measured (§C2a): 72% is `checkProgram` over the MERGED program**, so the per-module cache §C2 named has a 28% ceiling; its staging half is **LANDED (§C2c)**, −14.5% | editor latency, not CI | M / L | — | a keystroke ladder at 1 / 4 / 30 modules; the cross-file invalidation in both directions | STRUCT |
 | 10 | `declaredSlotOf` → per-function side index built in `buildLocals` | **1.1%** self time | M | reset per function, 5 sites | byte-identical seed; `regress.py` | STRUCT |
 | 11 | `fnStmtsPosOf` → reverse index `nodeIx → fe` after mono: 19,106 calls, **25.9 M scan steps** | closures axis 2.22 → ~1 | M | 1 in-place write, `emit_mono.vl:6353` | byte-identical seed; the closures axis under its 3.2 bar | STRUCT |
 | 12 | Destringify type names — `tyTopIndexOf` is a per-CHARACTER walk over a type-name string, **4.94% self** | 4.9% plus most of `__str_eq__`'s tail | L | canon / rep | `docs/internals/registry-by-type-id.md` steps 4–6; byte-identity | STRUCT |
@@ -416,6 +416,139 @@ no imports **9 ms**, `std:json`+`std:fmt` **31 ms**, `compiler/entry.vl` (26 mod
 the modules axis is itself the super-linear one (`modIndexOfKey`, ~N^2.5 in file count,
 #2429). The two fixes that matter are the cross-program std cache (§B1) and a per-module
 checked-form cache keyed on unchanged source.
+
+### C2a · Where a keystroke goes — the MERGED check, not the per-module half
+
+Two instruments. `scripts/perf/lsp-keystroke.ts` drives the driver exports the way
+`prepare` + `ensurePrepared` do and times the halves the host can see;
+`scripts/perf/guest-profile.sh` with `scripts/perf/profile-phases.py` splits the guest half
+by PIPELINE STAGE rather than by function. Read the second-edit row — the first pays for a
+cold scan cache, the second is the steady state.
+
+`lsp-keystroke.ts` RAW, seed `7a733ea6b`, median of 3, load 8.9 → 4.4:
+
+| case | mods | src KB | edit | reader | push | commit | STAGE | `checkSrcSym` |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 1 module | 1 | 0 | 2nd | 0.0 | 0.0 | 0.0 | 0.0 | 0.1 |
+| 4 modules (std) | 4 | 52 | 2nd | 0.2 | 0.7 | 0.2 | 1.4 | 12.3 |
+| `compiler/entry.vl` | **30** | 5,686 | 2nd | 9.5 | 60.7 | 23.3 | **93.2** | **1,260.3** |
+
+The graph is 30 modules, not the 26 the paragraph above says: `std:fmt` and its own
+dependencies arrive through the template-hole injection (`TPL_RENDER_MODULE`).
+
+Phase split of the guest half — `vl build compiler/entry.vl` under `VL_PROFILE_GUEST`, 7,270
+samples at load ~110, with a second run of 5,613 samples moving `checkProgram`'s share only
+76.9% → 75.3%. `vl check` cannot be profiled at all (the guest profiler hooks `compile_vl`,
+which `check` does not take), so this is a BUILD with the emit column held out; every other
+phase is shared with a check.
+
+| phase | samples | % of the check side |
+| --- | ---: | ---: |
+| staging: `modCommit` / `modScan` / `modSrcLoad` | 266 | 18.9% |
+| 1 order + validate (`modVisit`) | 49 | 3.5% |
+| 2 lex per module (`vcLoadToksMod`, a cache replay) | 28 | 2.0% |
+| 2 parse per module (`parseProgram`) | 84 | 6.0% |
+| 2b duplicate-binding / builtin-decl screens | 14 | 1.0% |
+| 3+4 rename + rewrite per module | 85 | 6.0% |
+| 5 `csPreMintLocs` (merged) | 3 | 0.2% |
+| **5 `checkProgram` (MERGED)** | **876** | **62.2%** |
+| 6 `emitProgram` (merged, build only) | 5,862 | — |
+
+Folding the two — the phases inside `checkSrcSym` are everything but staging, 1,139 of the
+1,408 check-side samples — one keystroke on `compiler/entry.vl` is:
+
+| | ms | share |
+| --- | ---: | ---: |
+| `checkProgram` + `csPreMintLocs` over the MERGED program | ~972 | **72%** |
+| the per-module pipeline (visit, lex replay, parse, screens, rename + rewrite) | ~287 | 21% |
+| staging (the host→guest source push and the scan cache) | 93 | 7% |
+
+**So §C2's own prescription — "a per-module checked-form cache keyed on unchanged source" —
+saves the small half.** Its ceiling is 28%, and most of the 21% is not cacheable as written:
+`parseProgram` and `modRwStmt` write into the SHARED node arena at absolute indices, so
+replaying an unchanged module's parse means relocating every child index in its slice, which
+is an arena pass and not a cache. The 62% is ONE `checkNode` walk (96.8% of `checkProgram`)
+over `mkProgram(allStmts)` — every module's statements concatenated into one program.
+
+### C2b · What the merged half would take, and why it is not one PR
+
+The merge is dependency-first (`modVisit` is a DFS whose post-order puts the ENTRY LAST), so
+the unchanged dependencies are a stable PREFIX of `allStmts` and the edited file is the
+suffix. What a keystroke wants is therefore a CHECKPOINT, not a cache: walk the prefix once,
+snapshot the checker after it, and resume from the snapshot on every later keystroke that
+changed only the entry. The snapshot has to hold the whole of the checker's program-scoped
+state — the `T.tys` type arena, the scope stack, `nodeTyIx` and its siblings, the sid-keyed
+tables, `daLive`/`daPos`, `topUnannotFns`, the inferred-return records — and a column left
+out of it is a silently wrong hover rather than a failure. That is a track, and it sits
+behind `docs/internals/registry-by-type-id.md`: a snapshot is only as cheap as the identities
+in it, and the type arena is still keyed on rendered names.
+
+Two smaller findings from the same measurement, named here rather than lost:
+
+* **An edit followed by a hover pays TWO whole-graph checks.** `check()` runs `checkSrc` —
+  it alone runs the deep-`is` second pass, so it reports a diagnostic the symbol check does
+  not — and clears the memo's `checked` flag; the hover then runs `checkSrcSym`. One call
+  serving both needs that second pass moved, not the memo changed.
+* **`checkSrcSym` records occurrences for all 30 modules** and the editor asks about one.
+
+### C2c · The staging half, and the cache that was already there
+
+`modScanCached` / `vcLoadToksMod` (`compiler/driver.vl`) already cache a module's
+import/export scan and its whole token stream, per **(key, source text)** — that is why the
+4-module std graph re-stages in 1.4 ms. Two defects the keystroke workload finds and a
+directory check does not:
+
+**It grew without bound.** Every keystroke commits the edited file under the same key with
+new text, which is a MISS, which appends a slot — and nothing can ever hit that slot again,
+since the only source that would is the one the user just replaced. Staging
+`compiler/typecheck.vl` (26k lines, a 9-module graph) 100 times, RSS:
+
+| | edit 0 | 20 | 40 | 60 | 80 | 99 | peak |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| master `8afdffb2f` | 141 MB | 679 | 1,084 | 1,986 | 1,478 | 2,724 | **2,724 MB** |
+| one slot per key | 147 MB | 341 | 323 | 439 | 342 | 273 | **450 MB** |
+
+~26 MB a keystroke, held for the life of the server. The CONTROL is the same run with the
+text held FIXED, which stays at 142–325 MB on master — the growth is the cache, not the
+harness. The fix: at most one slot per key, a source change DROPS the key's slot before
+banking the new one, and the dropped rows come straight back when they are the trailing ones
+(they are, from the second edit on, and the seed's own counters read 10 slots / 377,600 rows
+flat from edit 1 to edit 99). What a non-trailing drop strands — its rows AND its slot — is
+counted, and the whole cache clears once either outgrows its live half. **The bound is
+applied after the re-bank, not inside the drop** — checked between the two, one module's rows
+read as half the cache and the clear fired on every keystroke, re-scanning the whole graph.
+
+The clear is the fallback for the pattern that strands a slot every time, and it is measured
+rather than assumed: ALTERNATING between two compiler files as the entry, 30 stagings, fires
+**7 clears** and holds the store at 782k rows / 606 MB peak, against master's same run
+reaching **927 MB** and still climbing.
+
+**And the host re-pushed 5.68 MB of unchanged source per keystroke**, code point by code
+point, for 29 modules the seed already held. `modCommitCached(srcBytes)` commits a module
+from the cache's own copy of its source, so only the edited file crosses;
+`lsp/src/wasmChecker.ts` keeps a per-instance memo of what it last pushed under each key and
+uses it when the reader hands back the identical text. The seed is the authority — it answers
+0 when its slot is gone or disagrees about the length, and the host pushes — so a stale memo
+costs a push and never an answer.
+
+`lsp-keystroke.ts` CHECKER, three interleaved rounds per arm, load 6.5 → 4.4, second and
+later edits (the ones the cache serves):
+
+| graph | before | after | modules pushed |
+| --- | ---: | ---: | --- |
+| 1 module | 0.1 ms | 0.1 ms | 0 → 0 (no module table) |
+| 4 modules (std) | 4.7 ms | 3.9 ms | 4 → **1**, 3 from the cache |
+| `compiler/entry.vl` (30) | 614.4 ms | **525.1 ms** | 30 → **1**, 29 from the cache |
+
+−14.5% of a keystroke, which is the staging half of the 28% ceiling above. The 89 ms is more
+than the 60 ms `push` column because a skipped commit also skips the guest's own
+`fromCodePoints` over that module's accumulator. The merged 72% is untouched and stays item
+#9's real content.
+
+**THE PUSH COUNT IS THE ROBUST HALF OF THAT TABLE.** Re-run over the same pair at load 43 →
+105, five interleaved rounds read 892 / 656 / 1,303 / 834 / 1,947 ms against 820 / 1,569 /
+698 / 541 / 1,046 — the timing is buried, while `30 → 1 pushed, 29 cached` reproduces on
+every round. Quote the counts wherever the box is not quiet.
 
 ---
 
