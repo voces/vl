@@ -37,6 +37,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 VL="${VL:-scripts/vl-host/target/release/vl}"
+# $PYTHON pins the interpreter gate.sh preflighted; bare `python3` otherwise.
+PY="${PYTHON:-python3}"
 [ -x "$VL" ] || { echo "missing vl binary: $VL (cd scripts/vl-host && cargo build --release)"; exit 1; }
 [ -f build/vl-compiler.wasm ] || { echo "missing seed: build/vl-compiler.wasm (scripts/refresh-compiler.sh)"; exit 1; }
 
@@ -66,10 +68,10 @@ lint_graded() { # <target> <json path>
   cat "$2.err"
   if [ "$rc" -gt 1 ]; then cat "$2"; return "$rc"; fi
   # shellcheck disable=SC2046  # the word split is the point: zero or more codes
-  python3 scripts/comment-budget.py --filter-lint "$2" \
-    $(python3 scripts/scan-budget.py --exempt-codes) \
-    $(python3 scripts/ladder-budget.py --exempt-codes) \
-    $(python3 scripts/sentinel-budget.py --exempt-codes)
+  "$PY" scripts/comment-budget.py --filter-lint "$2" \
+    $("$PY" scripts/scan-budget.py --exempt-codes) \
+    $("$PY" scripts/ladder-budget.py --exempt-codes) \
+    $("$PY" scripts/sentinel-budget.py --exempt-codes)
 }
 
 # std/ goes first: it is near-instant AND its module load warms the seed's
