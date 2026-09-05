@@ -1134,11 +1134,15 @@ const stdExportsForCompletion = async (): Promise<Map<string, StdExportCandidate
       .catch(() => []);
     const byName = new Map(scope.map((b) => [b.name, b]));
     const exports: StdExportCandidate[] = surface.exports.map((e) => {
-      const b = byName.get(e.name);
+      // A RE-EXPORT has no binding in this module's own scope, so it carries the
+      // origin instead of a type detail — the ranking in
+      // `stdAutoImportCompletions` is what that origin is for.
+      const b = e.origin === "" ? byName.get(e.name) : undefined;
       return {
         name: e.name,
         kind: b !== undefined ? SCOPE_KINDS[b.kind] ?? "function" : "function",
         detail: b !== undefined && b.type !== "" ? b.type : undefined,
+        ...(e.origin === "" ? {} : { origin: e.origin }),
       };
     });
     stdExportCache.set(key, { src, exports });

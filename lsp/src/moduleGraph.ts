@@ -699,6 +699,10 @@ export const buildUnusedExportUseMap = async (
   for (const [filePath, surface] of surfaces) {
     const source = sources.get(filePath)!;
     for (const exp of surface.exports) {
+      // A RE-EXPORT declares nothing here, so "same-file uses of the declaration"
+      // is not a question this file can answer — the origin module's own row
+      // carries it. Its cross count (pass 2a) is the one that means something.
+      if (exp.origin !== "") continue;
       const refs = await wasmChecker.referencesAt(
         source,
         filePath,
@@ -762,8 +766,17 @@ export const unusedExportHints = (
   // name; the keyword range spans the literal `export` (6 chars).
   const declRanges = new Map<string, VLRange>();
   const exportKwRanges = new Map<string, VLRange>();
+  // A RE-EXPORT (`export { a } from "dep"`) is never hinted: neither fix applies
+  // to it — there is no declaration here to delete, and dropping the `export`
+  // keyword alone would leave `{ a } from "dep"`, which is not a statement. The
+  // question "is `a` used anywhere" belongs to the module that declares it.
+  const reExported = new Set<string>();
   const surface = wasmChecker.moduleSurface(entrySource, entryKey);
   for (const exp of surface.exports) {
+    if (exp.origin !== "") {
+      reExported.add(exp.name);
+      continue;
+    }
     if (declRanges.has(exp.name)) continue; // first decl wins
     const nameLine = exp.declLine > 0 ? exp.declLine - 1 : 0;
     declRanges.set(exp.name, {
@@ -780,6 +793,7 @@ export const unusedExportHints = (
   for (const [exportName, counts] of fileExports) {
     const { cross, local } = counts;
 
+    if (reExported.has(exportName)) continue; // not this module's declaration
     if (cross > 0) continue; // real export — used by another module, no hint
 
     if (local === 0) {
