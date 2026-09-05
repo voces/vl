@@ -2847,6 +2847,8 @@ function arenaScanLint() {
 // is the per-file ratchet, and it re-derives every set below from the `export type`
 // that declares it, refusing to run when one has drifted.
 
+// The rule, its `match` half and the controls: docs/internals/kind-ladder-lint.md.
+
 // This reads the source text, not the arena, so a user program declaring its own
 // `type Node = …` is graded against the compiler's. The tree this polices is this one.
 
@@ -3720,8 +3722,198 @@ function klRecordLadder(s: string, f: i32, g: i32) {
   0
 }
 
+// ── the `match` form ─────────────────────────────────────────────────────────
+
+// A `match` is exhaustive or it does not compile — except through `_`, which covers
+// every member the arms do not name and says nothing about them. That is the `if`
+// chain's bare `-1` wearing a keyword, so the `_` arm's body is graded by the same
+// default test. A `_`-less match is the language's own gate and is never reported.
+
+// The split rule reads only the `if` form: a delegating `_` is graded as naming its
+// default, so it never reaches that rule, and these ladders stay out of `klLad*`.
+
+// `klMatchAt`'s answer: the `match` keyword's column. Read only after it returns true.
+let klMCol = 0
+
+// True when `[a, e)` is exactly `match <subj> {`, the head of a match block.
+function klMatchAt(s: string, a: i32, e: i32) {
+  klMCol = 0
+  const k = klIndentEnd(s, a, e)
+  if !txAt(s, k, e, "match ") { return false }
+  const p = txSpacesEnd(s, k + 6, e)
+  const j = klSubjEnd(s, p, e)
+  if j <= p { return false }
+  const q = txSpacesEnd(s, j, e)
+  const t = klTrimEnd(s, a, e)
+  if q + 1 != t { return false }
+  if s[q] != '{' { return false }
+  klMCol = k - a
+  true
+}
+
+// The line the brace opening on line `lo` closes on, or `hi` when it never balances.
+function klBlockEnd(s: string, lo: i32, hi: i32) {
+  let depth = 0
+  let opened = false
+  let n = lo
+  while n <= hi {
+    const a = klLnStart[n]
+    const e = klCodeEnd(s, a, klLnEnd[n])
+    depth = depth + klBraceDelta(s, a, e)
+    if depth > 0 { opened = true }
+    if opened && depth <= 0 { return n }
+    n = n + 1
+  }
+  hi
+}
+
+// `klArmAt`'s answer: the arm's patterns (a literal's inner text, or a type name), 1
+// when they are type names, and whether one of them is the `_` wildcard.
+let klAMem: string[] = []
+let klAIsType = 0
+let klAWild = false
+
+// True when `[a, e)` is a match arm at column `col`. An or-pattern contributes each
+// alternative; a line mixing literal and type patterns is not an arm. The `=>` looked
+// for is the line's first outside a literal — one inside an arm BODY sits at a deeper
+// column, and a lambda's is never at the head of a line.
+function klArmAt(s: string, a: i32, e: i32, col: i32) {
+  klAMem = []
+  klAIsType = 0
+  klAWild = false
+  const k = klIndentEnd(s, a, e)
+  if k - a != col { return false }
+  if k >= e { return false }
+  let cut = 0 - 1
+  let i = k
+  while i < e && cut < 0 {
+    if s[i] == '"' || s[i] == '\'' {
+      i = klSkipLit(s, i, e)
+    } else {
+      if s[i] == '=' && i + 1 < e && s[i + 1] == '>' { cut = i }
+      i = i + 1
+    }
+  }
+  if cut < 0 { return false }
+  let p = k
+  while p < cut {
+    let q = p
+    let go = true
+    while q < cut && go {
+      if s[q] == '"' || s[q] == '\'' { q = klSkipLit(s, q, cut) }
+      else if s[q] == '|' { go = false }
+      else { q = q + 1 }
+    }
+    const ts = txSpacesEnd(s, p, q)
+    const te = klTrimEnd(s, ts, q)
+    if te <= ts { return false }
+    if te - ts == 1 && s[ts] == '_' {
+      klAWild = true
+    } else if te - ts >= 2 && s[ts] == '"' && s[te - 1] == '"' {
+      if klAIsType == 1 { return false }
+      klAMem.push(s.slice(ts + 1, te - 1))
+    } else {
+      if txIdentEnd(s, ts, te) != te { return false }
+      if s[ts] < 'A' || s[ts] > 'Z' { return false }
+      if klAMem.length > 0 && klAIsType == 0 { return false }
+      klAIsType = 1
+      klAMem.push(s.slice(ts, te))
+    }
+    p = q + 1
+  }
+  true
+}
+
+// True when the `_` arm at line `wild` names what the match excludes. Its region is
+// that line, plus the block it opens when the body is braced over several lines.
+function klMatchWildNames(s: string, wild: i32, end: i32) {
+  const a = klLnStart[wild]
+  const e = klCodeEnd(s, a, klLnEnd[wild])
+  const t = klTrimEnd(s, a, e)
+  let last = wild
+  if t > a && s[t - 1] == '{' { last = klBlockEnd(s, wild, end) }
+  let i = wild
+  while i <= last {
+    const la = klLnStart[i]
+    const le = klCodeEnd(s, la, klLnEnd[i])
+    if klHasSentence(s, la, le) { return true }
+    if klLineCallsAny(s, la, le) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Grade the match opening on line `ln`, reporting at its `match` keyword.
+function klMatchGrade(s: string, f: i32, ln: i32, col: i32, hi: i32) {
+  const end = klBlockEnd(s, ln, hi)
+  const mems: string[] = []
+  let isType = 0
+  let kindSet = false
+  let wild = 0 - 1
+  let j = ln + 1
+  while j <= end {
+    const a = klLnStart[j]
+    const e = klCodeEnd(s, a, klLnEnd[j])
+    if klArmAt(s, a, e, col + 2) {
+      if klAWild { wild = j }
+      if klAMem.length > 0 {
+        if !kindSet {
+          isType = klAIsType
+          kindSet = true
+        }
+        if klAIsType == isType {
+          let m = 0
+          while m < klAMem.length {
+            if !txListHas(mems, klAMem[m]) { mems.push(klAMem[m]) }
+            m = m + 1
+          }
+        }
+      }
+    }
+    j = j + 1
+  }
+  // A `_`-less match is exhaustive by the checker, and arms already covering the whole
+  // set leave the `_` unreachable — neither is a hole anything could name.
+  if wild < 0 || mems.length < klMinArms { return 0 }
+  const si = klSetOf(mems, 0, mems.length, isType)
+  if si < 0 { return 0 }
+  const total = klSetMembers(si).length
+  if mems.length >= total { return 0 }
+  if klMatchWildNames(s, wild, end) { return 0 }
+  lintEmitAtSpan(
+    "kind-ladder-incomplete",
+    "`" +
+      klFnName[f] +
+      "` matches " +
+      txNumStr(mems.length) +
+      " of " +
+      txNumStr(total) +
+      " " +
+      klSetNames[si] +
+      " kinds and its `_` arm names none of the rest — add the missing arms and drop the `_`, or an `emitFail`/message default that lists them",
+    "warning",
+    ln + 1,
+    col,
+    klCodeEndCol(s, ln + 1),
+  )
+  0
+}
+
+// Every `match` in function `f`.
+function klMatchScanFn(s: string, f: i32) {
+  let i = klFnLo[f]
+  while i <= klFnHi[f] {
+    const a = klLnStart[i]
+    const e = klCodeEnd(s, a, klLnEnd[i])
+    if klMatchAt(s, a, e) { klMatchGrade(s, f, i, klMCol, klFnHi[f]) }
+    i = i + 1
+  }
+  0
+}
+
 // Collect one function's groups, then record every one that is a ladder.
 function klScanFn(s: string, f: i32) {
+  klMatchScanFn(s, f)
   klGSubj = []
   klGType = []
   klGFirst = []

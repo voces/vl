@@ -221,6 +221,15 @@ of the population.**
 * For **i32 kind codes and raw-`string` vocabularies (215 ladders, 32%)** there is no
   mechanism at all. Mint the litunion (§1.5), or lint — and §4 measures the lint.
 
+**Follow-up, measured after this survey (#2663): §1.5's "0 of 26 have a `_` arm" is the
+invariant the whole verdict rests on, and nothing was enforcing it.** A pilot converted 31 of
+`emit_collect.vl`'s 39 held ladders to `match … _ => {}` and the ratchet fell by 31 while the
+compiler caught nothing more — `desugarMatchAt` lowers the `match` to the same `IfStmt` chain,
+so the output was byte-identical and the seed grew 129 bytes. The pilot was reverted and
+`kind-ladder-incomplete` now grades a `_` arm by the same named-default test as an `if`
+chain's tail: `docs/internals/kind-ladder-lint.md`. **A `match` is only the guard this section
+claims when it is `_`-less.**
+
 ---
 
 ## 2. The fall-through census
