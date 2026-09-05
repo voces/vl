@@ -145,22 +145,126 @@ Deno.test({
 });
 
 Deno.test({
-  name: "wasm-memo: `check` leaves a staging a symbol query can finish",
+  name: "wasm-memo: `check` leaves a CHECKED staging, so the hover after it is free",
   ignore,
 }, async () => {
   const c = loadWasmChecker(SEED, log)!;
   const read = readerFor(() => utilI32);
 
-  // `checkSrc` is not `checkSrcSym` with the symbol table off — it runs the
-  // deep-`is` second pass and leaves no occurrence table — so the hover after it
-  // still owes a check. What the memo saves is the STAGING: the graph is
-  // committed once, and the answer must be the same one a cold hover gives.
+  // `check` runs the SAME symbol-aware entry the queries do, so what it leaves
+  // is not just the staging but the occurrence tables. Before, `checkSrc` ran
+  // with the symbol table off and the hover after it owed a second whole-graph
+  // check over the very same text.
   want("no diagnostics", (await c.check(entry, ENTRY_KEY, read)).length, 0);
   want("check is one graph check", c.graphCheckCount(), 1);
   want("`r` after a check", await hoverRequest(c, entry, read, 1, 6), "i32");
-  want("the hover owes its own symbol check", c.graphCheckCount(), 2);
-  want("and nothing more", (await c.hoverTypeAt(entry, ENTRY_KEY, read, 1, 6)), "i32");
-  want("still two", c.graphCheckCount(), 2);
+  want("and the hover owes nothing", c.graphCheckCount(), 1);
+  want("nor does the next one", (await c.hoverTypeAt(entry, ENTRY_KEY, read, 1, 6)), "i32");
+  want("still one", c.graphCheckCount(), 1);
+});
+
+// `server.ts`'s `onDidChangeContent`, in the order it runs its three checker
+// calls: the unused-export hints (`moduleSurface`, which resets the module
+// table), the parse-only `lint`, and the graph `check` LAST — the only one that
+// leaves a checked graph, and the reason the queries after an edit are free.
+const changeRequest = async (
+  checker: ReturnType<typeof loadWasmChecker>,
+  source: string,
+  read: (key: string) => string | undefined,
+) => {
+  const c = checker!;
+  c.bumpReaderGeneration();
+  c.moduleSurface(source, ENTRY_KEY);
+  c.lint(source);
+  return await c.check(source, ENTRY_KEY, read);
+};
+
+Deno.test({
+  name: "wasm-memo: an edit then a hover is ONE graph check, not two",
+  ignore,
+}, async () => {
+  const c = loadWasmChecker(SEED, log)!;
+  const read = readerFor(() => utilI32);
+  const edited = `${entry}// typed\n`;
+
+  // A steady-state keystroke: the entry's own text moved, the DEPENDENCY did
+  // not. The bump invalidates the memo, the check re-fills it, and the hover
+  // that follows rides it.
+  await changeRequest(c, entry, read);
+  const before = c.graphCheckCount();
+  want("no diagnostics for the edited text", (await changeRequest(c, edited, read)).length, 0);
+  want("`r` after the edit", await hoverRequest(c, edited, read, 1, 6), "i32");
+  want("the edit + the hover cost one check", c.graphCheckCount() - before, 1);
+
+  // The invalidation rules #2593 built are untouched: the sibling moving on disk
+  // behind an unchanged entry still costs its own re-check, and still answers.
+  let util = utilI32;
+  const swappable = readerFor(() => util);
+  const c2 = loadWasmChecker(SEED, log)!;
+  await changeRequest(c2, entry, swappable);
+  want("`r` under the i32 sibling", await hoverRequest(c2, entry, swappable, 1, 6), "i32");
+  const mid = c2.graphCheckCount();
+  util = utilF64;
+  c2.bumpReaderGeneration();
+  want("`r` after the dependency edit", await hoverRequest(c2, entry, swappable, 1, 6), "f64");
+  want("which cost exactly one re-check", c2.graphCheckCount() - mid, 1);
+});
+
+// The raw seed instance, driven the way `wasmChecker`'s `check` used to: stage
+// the source and run `checkSrc`, the entry with the symbol table OFF. This is
+// the BEFORE arm of the diagnostics control below — same seed, other entry — so
+// the test compares two real answers rather than one answer against a literal.
+const plainCheckDiags = (source: string): string[] => {
+  const exp = new WebAssembly.Instance(
+    new WebAssembly.Module(Deno.readFileSync(SEED)),
+    {},
+  ).exports as unknown as Record<string, (...a: number[]) => number>;
+  exp.modReset();
+  exp.srcReset();
+  for (const ch of source) exp.srcPush(ch.codePointAt(0)!);
+  exp.checkSrc();
+  const out: string[] = [];
+  for (let i = 0; i < exp.diagCount(); i++) {
+    const b = new Uint8Array(exp.diagMsgLen(i));
+    for (let j = 0; j < b.length; j++) b[j] = exp.diagMsgAt(i, j);
+    out.push(`${exp.diagLine(i)}:${exp.diagCol(i)}:${new TextDecoder().decode(b)}`);
+  }
+  return out;
+};
+
+Deno.test({
+  name: "wasm-memo: the diagnostics are the plain check's, message for message",
+  ignore,
+}, async () => {
+  const c = loadWasmChecker(SEED, log)!;
+  const read = () => undefined;
+
+  // Two errors, so an ordering or a truncation shows. The `check` arm now runs
+  // `checkSrcSym`; the control runs `checkSrc` on a separate instance.
+  const twoErrors = 'const x: i32 = "no"\nconst y: string = 1\nprint(x)\nprint(y)\n';
+  const got = (await c.check(twoErrors, ENTRY_KEY, read))
+    .map((d) => `${d.range.start.line + 1}:${d.range.start.character}:${d.message}`);
+  want("two errors", got.length, 2);
+  want("same diagnostics as `checkSrc`", got.join("\n"), plainCheckDiags(twoErrors).join("\n"));
+
+  // The one diagnostic the symbol check did NOT used to report: a deep-`is` arm
+  // that writes its own receiver refuses in the SECOND pass, which only
+  // `checkSrc` ran. A `checkSrcSym` without it publishes a clean file for a
+  // program `vl build` refuses — the reason the parity is a compiler change and
+  // not a host one.
+  const deepIs = `type Json = null | boolean | f64 | string | Json[] | { [string]: Json }
+type Cfg = { port: i32, host: string | null }
+let g: Json = null
+function a(): i32 { if g is Cfg { g = null  return 1 }  0 }
+print(a())
+`;
+  const deep = await c.check(deepIs, ENTRY_KEY, read);
+  want("the deep-\`is\` refusal reaches the editor", deep.length, 1);
+  want(
+    "and it is the plain check's",
+    `${deep[0].range.start.line + 1}:${deep[0].range.start.character}:${deep[0].message}`,
+    plainCheckDiags(deepIs).join("\n"),
+  );
 });
 
 Deno.test({
