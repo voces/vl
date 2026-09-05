@@ -45,25 +45,46 @@ NAMES=(); PIDS=(); STARTS=()
 run() { local i=${#PIDS[@]}; NAMES+=("$1"); STARTS+=("$(date +%s.%N)"); shift
         ( "$@" > "$LOGS/$i.log" 2>&1; rc=$?; date +%s.%N > "$LOGS/$i.t"; exit $rc ) & PIDS+=($!); }
 
-# vl_scaling_shape_test.ts is EXCLUDED from this row and from ci-native's glob below —
-# both are dropped in gate.sh ONLY, deno.json's task and ci.yml are untouched. It grades a
-# TIME RATIO, and the dedicated "scaling shape" row already runs it; a ratio test measured
-# concurrently with itself grades the box's contention, not the compiler (tooling-std-host.md §7.2).
-run "deno task test"           deno test -A --no-check --parallel --ignore=tests/vl_scaling_shape_test.ts tests/
-# `--ignore` next to an explicit multi-glob file LIST is order-sensitive (measured: the same
-# flag, same files, excluded the file with one argument order and not another) — so the glob
-# is filtered in bash instead, which cannot depend on deno's internal match order.
-run "ci-native"                env SELFHOST_NATIVE_ALIGN=1 bash -c \
-                                 'deno test -A --no-check --parallel $(ls tests/selfhost_native_*_test.ts tests/vl_*_test.ts | grep -vx "tests/vl_scaling_shape_test.ts")'
-# The ci-native JOB also runs an EXPLICIT list of seed-backed editor suites that
-# match neither glob above (ci.yml's "Editor features on the wasm compiler"
-# step). Measured gap, 2026-09-01: nine local gates were green while master's
-# ci-native was red on exactly those files (#2104×#2105). The list is extracted
-# FROM ci.yml at run time so the two can never drift — ci_seed_coverage_test.ts
-# guards ci.yml's side of the contract — and an empty extraction fails loudly
-# rather than silently passing.
-run "lsp suites (ci list)"     env SELFHOST_NATIVE_ALIGN=1 bash -c \
-                                 'L=$(awk "/Editor features on the wasm compiler/{f=1; next} f && /- name:/{exit} f{print}" .github/workflows/ci.yml | grep -oE "tests/[a-zA-Z0-9_]+\.ts" | sort -u); [ -n "$L" ] || { echo "no lsp suite list extracted from ci.yml" >&2; exit 1; }; deno test -A --no-check --parallel $L'
+# THE SUITE ROWS' FILE SETS, derived here so each file runs in exactly ONE row: 46 ran
+# twice and 2 ran three times, which is that much extra contention on the two rows whose
+# verdict IS a measurement (`scaling shape`, `self-compile time`). gate.sh only — deno.json
+# and ci.yml keep the full set, CI running them as separate jobs (pass-2 survey §7).
+#
+# A file the three single-file rows below own leaves both lists, so the dedicated row is
+# the only place it runs. vl_scaling_shape_test.ts is the one that must: it grades a TIME
+# RATIO, and measured concurrently with itself it grades the box. The other two are pure
+# file scans — no seed, no SELFHOST_NATIVE_ALIGN — so they run identically wherever they land.
+OWN_ROW=$'tests/vl_scaling_shape_test.ts\ntests/vl_inventory_refs_test.ts\ntests/vl_no_conflict_markers_test.ts'
+# Filtered in bash, not with `--ignore`: `--ignore` next to an explicit multi-glob file
+# LIST is order-sensitive (measured: the same flag, same files, excluded the file with one
+# argument order and not another).
+CI_NATIVE=$(ls tests/selfhost_native_*_test.ts tests/vl_*_test.ts | grep -vxF "$OWN_ROW")
+# The ci-native JOB also runs an EXPLICIT list of seed-backed editor suites that match
+# neither glob (ci.yml's "Editor features on the wasm compiler" step). Measured gap,
+# 2026-09-01: nine local gates were green while master's ci-native was red on exactly
+# those files (#2104×#2105). The list is extracted FROM ci.yml so the two cannot drift —
+# ci_seed_coverage_test.ts guards ci.yml's side — and an empty extraction now aborts the
+# whole run rather than reddening one row, because it also silently un-excludes those
+# files from the row below.
+LSP_CI=$(awk '/Editor features on the wasm compiler/{f=1; next} f && /- name:/{exit} f{print}' \
+           .github/workflows/ci.yml | grep -oE "tests/[a-zA-Z0-9_]+\.ts" | sort -u)
+[ -n "$LSP_CI" ] || { echo "no lsp suite list extracted from ci.yml — the step name that anchors the extraction was renamed or removed; fix .github/workflows/ci.yml and scripts/gate.sh together" >&2; exit 1; }
+DEDUPE=$(printf '%s\n%s\n%s\n' "$CI_NATIVE" "$LSP_CI" "$OWN_ROW" | sort -u | paste -sd,)
+
+# ROW 1 TAKES THE COMPLEMENT. `deno task test` is the row that gives way, not ci-native:
+# every `ignore:` in the 57 files reading SELFHOST_NATIVE_ALIGN is a NEGATIVE gate, so
+# ci-native's face is a strict SUPERSET, and the other 46 run identically either way.
+#
+# $CI_NATIVE / $LSP_CI are deliberately UNQUOTED — the word split on their newlines is what
+# turns each list into argv, and they hold `tests/<name>.ts` and nothing else. Through a
+# `bash -c` instead, every newline would be a COMMAND separator (measured: 78 of
+# ci-native's 79 files ran as commands, rc=126).
+# shellcheck disable=SC2086
+run "deno task test"           deno test -A --no-check --parallel --ignore="$DEDUPE" tests/
+# shellcheck disable=SC2086
+run "ci-native"                env SELFHOST_NATIVE_ALIGN=1 deno test -A --no-check --parallel $CI_NATIVE
+# shellcheck disable=SC2086
+run "lsp suites (ci list)"     env SELFHOST_NATIVE_ALIGN=1 deno test -A --no-check --parallel $LSP_CI
 # Root deno.json excludes lsp/ and every suite runs --no-check, so a type error
 # in lsp/src/*.ts is invisible to all the other gates (esbuild strips types
 # without checking). Mirrors ci.yml's "Type-check (lsp)" step.
