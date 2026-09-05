@@ -30,12 +30,13 @@ if (GATED && !ENABLED) {
 
 const run = async (
   args: string[],
+  env: Record<string, string> = {},
 ): Promise<{ code: number; out: string; err: string; outBytes: Uint8Array }> => {
   const { code, stdout, stderr } = await new Deno.Command(VL, {
     args,
     stdout: "piped",
     stderr: "piped",
-    env: nativeEnv({ NO_COLOR: "1" }),
+    env: nativeEnv({ NO_COLOR: "1", ...env }),
   }).output();
   return {
     code,
@@ -43,6 +44,27 @@ const run = async (
     err: new TextDecoder().decode(stderr),
     outBytes: stdout,
   };
+};
+
+/** Mirrors `seed_hash` in scripts/vl-host/src/main.rs — `std_hash`'s own FNV-1a
+ * fold applied to one `("seed", bytes)` pair. Lets a test derive the digest
+ * `vl --version` SHOULD print straight from the seed file, rather than trusting
+ * (or copying) whatever the binary happens to say. */
+const seedHashBytes = (bytes: Uint8Array): string => {
+  const MASK = (1n << 64n) - 1n;
+  const PRIME = 0x100000001b3n;
+  const enc = new TextEncoder();
+  let h = 0xcbf29ce484222325n;
+  const feed = (b: Uint8Array): void => {
+    for (const byte of b) h = ((h ^ BigInt(byte)) * PRIME) & MASK;
+  };
+  feed(enc.encode("seed"));
+  feed(new Uint8Array([0]));
+  feed(enc.encode(String(bytes.length)));
+  feed(new Uint8Array([0]));
+  feed(bytes);
+  feed(new Uint8Array([0]));
+  return h.toString(16).padStart(16, "0");
 };
 
 Deno.test({
@@ -136,6 +158,10 @@ Deno.test({
   name: "vl-help: --version leads with one `vl <version>` line, then names seed and std",
   ignore: !ENABLED,
   fn: async () => {
+    // Derived from the seed file, not copied from a printed value — see
+    // "reproduce the ORIGINAL, not a reconstruction" in CLAUDE.md.
+    const seedBytes = await Deno.readFile(COMPILER);
+    const wantHash = seedHashBytes(seedBytes);
     for (const flag of ["--version", "-V"]) {
       const r = await run([flag]);
       const lines = r.out.trimEnd().split("\n");
@@ -149,6 +175,70 @@ Deno.test({
           throw new Error(`${flag} should carry a \`${want}\` line, got:\n${r.out}`);
         }
       }
+      // The seed line carries a content hash in the same shape as the std
+      // line's (`N bytes, <16 hex digits>`) — a byte COUNT alone cannot tell
+      // two seeds apart when they happen to match.
+      const seedLine = lines.find((l) => l.startsWith("seed:")) ?? "";
+      const m = seedLine.match(/\((\d+) bytes, ([0-9a-f]{16})\)/);
+      if (!m) {
+        throw new Error(
+          `\`seed:\` line should carry \`(N bytes, <16 hex digits>)\`, got:\n${seedLine}`,
+        );
+      }
+      if (Number(m[1]) !== seedBytes.length) {
+        throw new Error(
+          `\`seed:\` line's byte count disagrees with the seed file (want ${seedBytes.length}):\n${seedLine}`,
+        );
+      }
+      if (m[2] !== wantHash) {
+        throw new Error(
+          `\`seed:\` line's hash does not match the seed file's own FNV-1a fold ` +
+            `(want ${wantHash}, computed from ${COMPILER}):\n${seedLine}`,
+        );
+      }
+    }
+  },
+});
+
+// Two seeds sharing a byte count are exactly the case a byte count alone
+// cannot distinguish — the consumer ask this closes. A one-byte flip keeps
+// the length identical and must still change the printed hash.
+Deno.test({
+  name: "vl-help: --version's seed hash tells apart two same-length seeds",
+  ignore: !ENABLED,
+  fn: async () => {
+    const original = await Deno.readFile(COMPILER);
+    const mutated = new Uint8Array(original);
+    mutated[0] = mutated[0] ^ 0xff;
+    const dir = await Deno.makeTempDir({ prefix: "vl_seed_hash_" });
+    try {
+      const altPath = `${dir}/vl-compiler.wasm`;
+      await Deno.writeFile(altPath, mutated);
+      const r = await run(["--version"], { VL_COMPILER_WASM: altPath });
+      if (r.code !== 0) throw new Error(`want exit 0, got ${r.code}:\n${r.err}`);
+      const seedLine = r.out.split("\n").find((l) => l.startsWith("seed:")) ?? "";
+      const m = seedLine.match(/\((\d+) bytes, ([0-9a-f]{16})\)/);
+      if (!m) throw new Error(`\`seed:\` line missing its hash:\n${seedLine}`);
+      if (Number(m[1]) !== original.length) {
+        throw new Error(`the mutated seed changed length, which defeats this test's premise`);
+      }
+      const wantOriginal = seedHashBytes(original);
+      const wantMutated = seedHashBytes(mutated);
+      if (wantOriginal === wantMutated) {
+        throw new Error("test bug: the one-byte flip did not change the reference hash");
+      }
+      if (m[2] !== wantMutated) {
+        throw new Error(
+          `want the MUTATED seed's hash ${wantMutated}, got ${m[2]} in:\n${seedLine}`,
+        );
+      }
+      if (m[2] === wantOriginal) {
+        throw new Error(
+          `\`vl --version\` printed the ORIGINAL seed's hash for a mutated, same-length seed:\n${seedLine}`,
+        );
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
     }
   },
 });
