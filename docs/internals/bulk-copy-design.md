@@ -4,11 +4,12 @@ glean's R1 (`~/glean/docs/vl-requirements.md`, from VL-010) asks for a one-instr
 `u8[]` → linear memory and back, because `readFile` lands a file in a GC array while its parsers
 run over a `Buf`. This is the measurement and the design it settled.
 
-**§E1 IS LANDED** — `std:fs` gained `readFileInto` and `readFileRangeInto` over one host import,
-with the destination offset §E1 recommends and no destination length; the owner's decision 1 below
-was answered "take the `Buf`". §E2 is a sibling change and §E3's emitter hoist is still unscheduled.
-The rows in §B and §D stand as measured; the landed exports are re-measured in the PR that shipped
-them and in `std-notes.md` §`std:fs`.
+**§E1 AND §E2 ARE BOTH LANDED, as two independent changes.** `std:fs` gained `readFileInto` and
+`readFileRangeInto` over one host import, with the destination offset §E1 recommends and no
+destination length; the owner's decision 1 below was answered "take the `Buf`". `std:buffer`
+gained §E2's pair in pure VL, with one owner ruling on top of it recorded in §E3. §E3's emitter
+hoist is still unscheduled. The rows in §B and §D stand as measured; each landed export is
+re-measured in the PR that shipped it, §E1's in `std-notes.md` §`std:fs` and §E2's in §E2 below.
 
 **The short answer.** There is no such instruction and there will not be one; the copy is 75% of
 the cost of reading a 64 MiB file today, and the fastest thing available is not to make the copy
@@ -177,6 +178,19 @@ function written in VL — hoist `self.base` and `src.length` out of the loop, s
 identically in the browser. It sits beside `fill` and `copyFrom` in the existing `── bulk ──`
 section, and it removes the `0 to n - 1` off-by-one (VL-012) from 46 call sites.
 
+**As landed, re-measured by the same method** (64 MiB, prebuilt module, min of 7, control differs
+by exactly the loop): `storeBytes` **847 MB/s against today's idiom at 389 MB/s (2.2×)**, and
+`toBytes` **814 MB/s against the push loop at 340 MB/s (2.4×)**. The disassembly shows the base
+hoisted into a local outside the loop and the body one `i32.store8` over one `array.get_u`; what
+remains per element is the wrapper reload and the `select` guard the next paragraph is about.
+
+**One consequence to know about, priced.** `__trap__("…")` streams its message a character at a
+time, so each of the two range checks carries a print loop — which drags the string machinery into
+a module that has no strings. An unoptimized numeric kernel importing `std:buffer` grew 1,928 →
+4,509 bytes. At `-O3` the module is **byte-identical** to one built before the pair existed, since
+nothing calls them. The same reading moves the `none` column of `tests/support/viewBoundsShape.ts`
+by +3 call and +4 sget on all eighteen rows and neither optimized column at all.
+
 The 2.1× → 2.4× gap to a hand-written loop is the per-element wrapper reload and the redundant
 `select` guard in §B. That is an **emitter** opportunity, not a reason to emit a runtime helper:
 hoisting a `u8[]`'s backing and length out of a loop whose index is the induction variable speeds
@@ -192,9 +206,19 @@ function.
   destination-is-the-receiver rule.
 - **`self` first?** `std:buffer`'s pair yes; `std:fs`'s no, and for the reason its header already
   gives — the thing operated on is the file, so `path` leads.
-- **Second error channel?** No. `T | IoError` in `std:fs`, the module's existing model. The
-  `std:buffer` pair does not fail: like every other export there it does not bounds-check, which
-  its header already states, and a short `src` is not an error but fewer bytes.
+- **Second error channel?** No. `T | IoError` in `std:fs`, the module's existing model. This
+  paragraph used to say the `std:buffer` pair does not fail — that a short `src` is fewer bytes
+  rather than an error, like every other export in the module. **The owner ruled otherwise
+  (2026-09-05): both trap, naming the range.** It is `buffer-design.md` §J3's carve-out applied a
+  third time, not a new policy: §A4 declines a VL-level check because the ENGINE's trap is the
+  memory-safety proof, and past the end of a `Buf` but still inside the memory is exactly where
+  that proof does not reach — which is why the typed views already check. An over-long range here
+  hands `writeFile` or a decoder a `u8[]` whose tail is a neighbouring buffer's bytes, with
+  nothing to tell it apart. `__trap__` and not `T | E`, because that is the ruled channel for a
+  caller bug (`error-handling-design.md`), this module has no error type and traps in `Buffer`,
+  `bufferRelease` and all eight view accessors, and `std:array`'s `filled` sets the message shape.
+  A clamped short answer would be worse than either: `out.length` would lie about the request.
+  The module header and the `── bulk ──` section blurb both say which exports check.
 - **Boolean parameters?** None.
 - **Silently lossy?** `readFileInto` truncates at `dst.length - dstOff`, and the returned count is
   what says so — a caller comparing it against `fileSize` sees the truncation. This is the one
@@ -223,16 +247,16 @@ mean `readFileInto` is native-only, which is correct — so is `readFile`.
 caller allocated, and `std:buffer`'s LIFO contract already says a `Buf` allocated after a released
 mark dangles. Nothing new, but the header should not pretend the destination is checked.
 
-Three decisions are the owner's; the first is ANSWERED:
+Three decisions are the owner's; the first two are ANSWERED:
 
 1. **Does `readFileInto` take a `Buf` or a raw address?** ANSWERED 2026-09-05: the `Buf`. A `Buf`
    makes `std:fs` depend on `std:buffer` and re-export its type; an `i32` address avoids that and
    is worse at every call site, because it drops the length the truncation is measured against.
    The dependency's price turned out to be measurable and is recorded in `std-notes.md`: every
    `std:fs` program now carries a linear memory and its `memory` export.
-2. **E2 alone, or both?** E2 is a pure std addition with no compiler and no host change and closes
-   the shape complaint — the half glean says it is actually paying at its file sizes. E1 is where
-   the 4×–20× is. They are independent.
+2. **E2 alone, or both?** ANSWERED: both, independently. E2 is a pure std addition with no
+   compiler and no host change and closes the shape complaint — the half glean says it is actually
+   paying at its file sizes. E1 is where the 4×–20× is.
 3. **Is the emitter's `u8[]` loop hoist scheduled here or on its own?** It is worth 1.1×–1.4× on
    E2 and on every byte loop in the language, and it is the only item here that touches the
    compiler.

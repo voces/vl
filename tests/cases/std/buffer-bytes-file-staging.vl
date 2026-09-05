@@ -1,0 +1,63 @@
+// @run
+// @skip the fs floor needs a host that can build a WasmGC value — V8 cannot; asserted natively by tests/selfhost_native_align_test.ts
+// @log wrote
+// @log 11
+// @log 71
+// @log 69
+// @log true
+// @log 11
+// @log true
+// THE TWO SHAPES A CONSUMER ACTUALLY WRITES, both taken from a replay tool that
+// stages files through a `Buf` (`bulk-copy-design.md` §A).
+//
+// Forward, at 45 of its 46 copy sites: `readFile` lands a `u8[]`, a `Buf` of the
+// same size is allocated, and the bytes are moved across so a byte-oriented
+// parser can walk them. Reverse, at its one: a `Buf` a decoder filled has to
+// become a `u8[]` again because `writeFile` takes one.
+import {
+  IoError,
+  readFile,
+  writeFile,
+  writeTextFile,
+} from "std:fs"
+import { Buf, Buffer, loadU8, storeBytes, toBytes } from "std:buffer"
+
+const p = "/tmp/vl-std-buffer-bytes-staging.bin"
+const q = "/tmp/vl-std-buffer-bytes-staging.out"
+
+const w = writeTextFile(p, "GLEAN bytes")
+if w != null { print("write failed: " + w.msg) } else { print("wrote") }
+
+// FORWARD — the whole file into linear memory, then read back through the `Buf`
+// the way a parser does. `Buffer(0)` is the "could not read" answer, so every
+// caller downstream sees a length rather than a union.
+function load(path: string): Buf {
+  const bytes = readFile(path)
+  if bytes is IoError { return Buffer(0) }
+  const buf = Buffer(bytes.length)
+  buf.storeBytes(0, bytes)
+  buf
+}
+
+const buf = load(p)
+print(buf.length)
+print(buf.loadU8(0)) // 'G'
+print(buf.loadU8(2)) // 'E'
+
+// The staged copy agrees with the array it came from, byte for byte.
+const src = readFile(p)
+if src is IoError {
+  print("read failed")
+} else {
+  let same = src.length == buf.length
+  for i in 0 to buf.length - 1 { if buf.loadU8(i) != src[i] { same = false } }
+  print(same)
+}
+
+// REVERSE — the `Buf` back out to a `u8[]`, which is the only thing `writeFile`
+// accepts. The window is the whole buffer here; a decoder writing one member of
+// an archive would pass its own offset and length.
+const out = buf.toBytes(0, buf.length)
+print(out.length)
+const e = writeFile(q, out)
+if e != null { print("write failed: " + e.msg) } else { print(true) }

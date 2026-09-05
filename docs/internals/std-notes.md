@@ -162,10 +162,15 @@ Each now says so, in the shape the `concat`-vs-`+` bullet uses.
 
 - The design record is `docs/internals/buffer-design.md`; the module implements §C's
   sequencing item S5, with O1 = (c) — `Buffer` is std VL, not a compiler-known type.
-- **Bounds: none, by design (§A4).** An access past the end of the memory traps in the
-  ENGINE, and that trap is the memory-safety proof; a VL-level check would only make it
-  quieter. The typed views are the one exception, and §J3 is why the check is at
-  construction rather than per access.
+- **Bounds: none, by design (§A4) — with two exceptions, both for one reason.** An access
+  past the end of the MEMORY traps in the engine, and that trap is the memory-safety proof;
+  a VL-level check would only make it quieter. Past the end of a `Buf` but still inside the
+  memory is where that proof does not reach, and that is what both exceptions check. The
+  typed views check at construction (§J3 is why, rather than per access); the `u8[]` bulk
+  pair checks per call. `bulk-copy-design.md` §E3 proposed that the pair NOT check and treat
+  a short `src` as fewer bytes; the owner overrode it, because an over-long range hands
+  `writeFile` or a decoder a `u8[]` whose tail is a neighbouring buffer's bytes with nothing
+  to tell it apart.
 - **`memory.grow` detaches every host view of `exports.memory.buffer`** (O5 = lazy
   growth, no epoch export). A stale view is detectable by `view.byteLength === 0`. This
   is what Emscripten's `updateMemoryViews()`, wasm-bindgen's `byteLength === 0` probe
