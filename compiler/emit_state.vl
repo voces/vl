@@ -1,93 +1,55 @@
-// `emit_state.vl` — the emitter's shared MUTABLE STATE: the output buffer (`W`), the
-// WasmGC type-index globals (`cloStructIdx`/`aTypeIdx`/`sHeapIdx`/…), the collection
-// tables (`localIsRef`/`fnNames`/…), scratch-slot bases, and the per-function
-// `fnUses*` flags. A LEAF of declarations only — the emitter (and its split sub-
-// modules) import these and mutate them in place. Carved out of `wasmEmit.vl`.
+// `emit_state.vl` — the emitter's shared mutable state: the output buffer (`W`),
+// WasmGC type-index globals, the collection tables, scratch-slot bases, and
+// per-function `fnUses*` flags — a leaf of declarations the emitter and its
+// split sub-modules import and mutate in place.
 //
-// THREE CONVENTIONS run through the whole table below; each entry states only what
-// is case-SPECIFIC about it.
-//  · ADDITIVE GATING. A type / import / table slot is minted only when the program
-//    uses the feature. A program that does not use it interns nothing, no existing
-//    index shifts, and its bytes are identical to before the feature existed — the
-//    property the goldens and the self-compile fixpoint check.
-//  · ARENA-INDEX SIDECARS (the destringify program, docs/internals/destringify-
-//    types-program.md). A `*TyIx` column parallels a NAME column and holds the
-//    `T.tys` index that name denotes, resolved ONCE at intern time instead of
-//    re-derived by string surgery at every query. Each is padded with -1 on push, so
-//    a mint site that skips the recorder self-heals to "uncovered" and its consumers
-//    fall through to the legacy name path instead of reading a mis-aligned entry.
-//    LIFETIME (method note 7): a `T.tys` index is per-PROGRAM — a fresh program
-//    re-mints the arena, and a stale index TRAPS where a stale NAME is merely wrong
-//    text — so every sidecar is emptied at the top of `emitProgram`, ahead of the
-//    collect pass that clears the name column it parallels.
-//  · PENDING HINTS (`pending*`). A one-shot context flag the binding / argument /
-//    element site sets immediately before its `emitExpr` call, read by the lowering
-//    it steers, then cleared. Each is overwritten at every use and consumed by that
-//    lowering, so a NESTED literal never inherits an outer hint.
+// Three conventions recur below: additive gating (a type/import/table slot is
+// minted only when the program uses the feature, so an unused feature shifts no
+// index); arena-index sidecars (a `*TyIx` column parallels a name column with a
+// resolved `T.tys` index, padded -1 so a skipped mint falls back to the name
+// path, emptied at the top of `emitProgram`); and pending hints (`pending*`, a
+// one-shot flag a binding/argument/element site sets before its `emitExpr` call
+// and clears right after, so a nested literal never inherits an outer hint).
 
-// ── BinaryWriter (Layer 1) ───────────────────────────────────────────────────
-// The one place bytes are appended. State lives in module-global `let`s (no
-// closures, so the emitter stays self-compilable). `W.bytes` is the module
-// output buffer; `curBuf` is the "current target" the streaming primitives
-// (`wU8`/`wBytes`/`wULEB`/`wSLEB`/`wName`) append to. By default `curBuf` IS
-// `W.bytes`; lowering that builds a section payload into a fresh `i32[]`
-// redirects the writer with `wTarget(buf)` (save the returned previous buffer,
-// restore it with a second `wTarget(prev)` when done). This threads "which
-// buffer" without passing it to every helper and without a closure.
-//
-// Output representation: a VL `i32[]` of byte values 0..255 (WasmGC has no `u8`);
-// bytes are masked to the low 8 bits on emit.
+// ── binary writer (layer 1) ── the only place bytes are appended, as a VL `i32[]`
+// of 0..255 values masked to the low 8 bits on emit (WasmGC has no `u8`). State is
+// module-global `let`s (no closures), and `wTarget(buf)` redirects the streaming
+// primitives to `buf`, returning the previous target to restore afterward.
 export type Emitter = { bytes: i32[] }
 export const W: Emitter = { bytes: [] }
-// RE-EXPORT alias tables (`export { name } from "dep"`): the public bare name and its
-// merged (mangled) target function. POPULATED by the driver's `modCompile`, CONSUMED by
-// this module's export section — defined HERE (the consumer) so the driver imports them,
-// avoiding a driver↔emitter import cycle.
+// Re-export alias tables (`export { name } from "dep"`): the public bare name and its
+// merged (mangled) target function. Populated by the driver's `modCompile`, consumed by
+// this module's export section — defined here, the consumer, so the driver imports them
+// without a driver-emitter import cycle.
 export let reExpName: string[] = []
 export let reExpTarget: string[] = []
 // The buffer the streaming writer currently appends to. Initialized to the
 // module output buffer; rebound by `wTarget`, reset by `emitReset`.
 export let curBuf = W.bytes
-// ── print imports ─────────────────────────────────────────────────────────────
-// Number of imported FUNCTIONS: 0, or 4 (the `print` family) when any `print` call
-// exists, plus one per WIDE scalar the program also uses. Imports occupy wasm
-// function indices 0..gImports-1, so every LOCAL function's WASM index is
-// `gImports + position` (fnIndices stays the fnStmts POSITION for arena lookups; the
-// offset applies at the index WRITE points: the call instruction, the export entries,
-// the start index). Decided up front in `emitProgram`, because an extra import shifts
-// every local function's index — the count cannot be discovered mid-emit.
+// print imports: the count is 0, or 4 (the `print` family) plus one per wide
+// scalar the program also uses. Imports occupy wasm indices `0..gImports-1`, so a
+// local function's wasm index is `gImports + position` — decided up front in
+// `emitProgram`, since an extra import would shift every local function's index.
 export let gImports = 0
-// `true` when the program uses `print` AND the named scalar (`scanPrintUse` owns the
-// trigger set — annotations, literals, `as`-casts, intrinsic results). Each pulls in
-// one more import carrying the matching `(T)->()` functype, appended in the fixed
-// order i64 → f64 → f32 so an earlier one's index never shifts: i64 is always
-// function index 4, while the f64/f32 indices vary with which of the others precede
-// them and are recorded in `gF64PrintIdx`/`gF32PrintIdx` (the `fbCall` targets in the
-// print router), meaningful only when the matching flag is set. Slices 1 / 3 / 5.
+// `true` when the program uses `print` and the named scalar (`scanPrintUse` owns
+// the trigger set). Each adds one import in the fixed order i64 -> f64 -> f32, so i64
+// is always function index 4; the f64/f32 indices vary and are recorded in
+// `gF64PrintIdx`/`gF32PrintIdx`, meaningful only when the matching flag is set.
 export let gNeedsI64Print = false
 export let gNeedsF64Print = false
 export let gF64PrintIdx = 0
 export let gNeedsF32Print = false
 export let gF32PrintIdx = 0
-// ── the filesystem imports (`std:fs`) ─────────────────────────────────────────
-// Two parallel tables, one row per slot of `typecheck.fsIntrinsicSlot`, both exactly
-// `fsIntrinsicCount()` long and both rewritten from scratch by `scanPrintUse`:
-//   gFsUse[k]  1 when the program CALLS slot k, else 0
-//   gFsIdx[k]  the wasm function index of that import — meaningful only when used
-// Indices are assigned AFTER the whole print family, and within the fs block in slot order
-// over the USED slots only — the append-only discipline the header's ADDITIVE GATING
-// convention states, so gaining one fs call moves no existing import's index.
-//
-// BOUND-CHECKED AT EVERY READ, without exception. `emitFail` records a failure and lets
-// emission continue, so a read past the end is not a caught error — it is a trap inside a
-// compiler that has already given up. `fsUsedAt`/`fsIdxAt` are the only readers.
+// The filesystem imports (`std:fs`): two parallel tables, one row per
+// `typecheck.fsIntrinsicSlot`, rewritten by `scanPrintUse`. `gFsUse[k]` is 1 when
+// the program calls slot k; `gFsIdx[k]` is that import's wasm index, meaningful
+// only when used — bound-checked at every read since `emitFail` does not halt.
 export let gFsUse: i32[] = []
 export let gFsIdx: i32[] = []
-// Is fs slot `k` used by this program? The ONE reader of `gFsUse`, so the bound check
-// lives in exactly one place and cannot be forgotten at a call site. An out-of-range
-// slot answers "unused", which makes every consumer emit nothing for it — the safe
-// direction, because emitting an import nothing calls is dead weight while emitting a
-// CALL to an import that was never declared is invalid wasm.
+// Is fs slot `k` used by this program? The one reader of `gFsUse`, so the bound
+// check lives in exactly one place. An out-of-range slot answers `false`, which is
+// the safe direction: emitting an unused import is dead weight, while a call to an
+// import never declared is invalid wasm.
 export function fsUsedAt(k: i32) {
   if k < 0 { return false }
   if k >= gFsUse.length { return false }
@@ -112,78 +74,46 @@ export function fsImportCount(): i32 {
   }
   c
 }
-// ── name-section opt-in (OFF by default — goldens keep their bytes) ───────────
-// When `1`, `emitModule` appends the wasm "name" custom section (module-name +
-// function-name subsections) so a wasmtime trap backtrace shows real function names
-// instead of `<wasm function N>`. Semantically inert (custom section id 0, ignored by
-// every conforming runtime) but it CHANGES the emitted bytes — so unlike the rest of
-// this table it is opted into by the HOST, not by program content: only the native
-// `vl` binary flips it (`setEmitNames`, for `vl run` / `vl build --names`), while the
-// driver's `compileSrc` leaves it at 0 for every golden, fixpoint and self-typecheck.
+// Name-section opt-in, off by default so goldens keep their bytes. When `1`,
+// `emitModule` appends the wasm name custom section so a trap backtrace shows real
+// function names instead of `<wasm function N>` — semantically inert but it changes
+// emitted bytes, so only the host opts in (`setEmitNames`, `vl run`/`vl build --names`).
 export let gEmitNames = 0
-// Top-level STATEMENTS (a bare `print(...)`, an assignment, a `while` over globals —
-// anything that is not a function/type/global declaration). They run inside the
-// synthetic START function, in source order, after the non-const global inits —
-// the host's `__program__` model. Empty for every golden (pure-decl modules).
+// Top-level statements (a bare `print(...)`, an assignment, a `while` over globals)
+// run inside the synthetic start function, in source order, after the non-const
+// global inits — the host's `__program__` model.
 export let startStmts: i32[] = []
-// The unsupported-shape state. `emitFailed` is the set flag (a `boolean`, which
-// widens on reassignment the way `true`/`false`-toggled flags do throughout the
-// parser; a bare-`0`/`1` i32 global pins to the literal type and won't reassign);
-// `emitErr` carries the first message. Both are top-level mutable `let`s — they
+// The unsupported-shape state: `emitFailed` is the set flag, declared `boolean` (not
+// a bare `0`/`1` i32, which would pin to the literal type and refuse reassignment) and
+// `emitErr` carries the first message. Both are top-level mutable `let`s, so they
 // lower to wasm globals readable from any helper.
 export let emitFailed = false
 export let emitErr = ""
-// The AST node the emit failure is ANCHORED to (a source span the diagnostic
-// stream reports), or -1 for a positionless (module-level) failure. `emitFuncCode`
-// sets `emitCurFnIx` to the FuncDecl it is lowering; `emitFail` snapshots it into
-// `emitErrAt` on the FIRST failure, so the diagnostic points at the failing
-// function's declaration (resolved through `nodeToks`, exactly as a type diag's node
-// anchor is). A failure during the collect passes / module framing leaves
-// `emitCurFnIx == -1` and the diagnostic degrades to positionless.
+// The AST node the emit failure is anchored to, or -1 for a positionless
+// (module-level) failure. `emitFuncCode` sets `emitCurFnIx` to the `FuncDecl` it is
+// lowering; `emitFail` snapshots it into `emitErrAt` on the first failure, so the
+// diagnostic points at the failing function's declaration.
 export let emitCurFnIx = -1
-// The `fnStmts` POSITION of `emitCurFnIx`, written as one pair with it from
-// `emitCodeSection`'s own loop index — the position it is already emitting body
-// `gImports + pos` for. `fnStmtsPosOf` answers from this pair instead of scanning
-// whenever it is asked about the function being lowered, which is most of its calls.
-//
-// THE PAIR IS EXACT, in two clauses. (1) Nothing writes `fnStmts` between the pair being
-// set and the body finishing: every writer is a collect pass or a monomorphization writer,
-// all of which complete before `emitCodeSection` starts. (2) `fnStmts` holds each arena
-// node at most once, so the position the loop is at IS the first-match position a scan
-// would return. Were a duplicate ever to appear, `emitCodeSection` would already be
-// lowering the second body against the first's position-keyed metadata (`fRetVoid`,
-// `fnEnvIdx`, `capStartTbl`), so the pair is the self-consistent reading either way.
+// The `fnStmts` position of `emitCurFnIx`, set as one pair with it from
+// `emitCodeSection`'s loop index, so `fnStmtsPosOf` answers without scanning. Exact
+// because `fnStmts` is not written between the pair being set and the body
+// finishing, and holds each node at most once — the loop position IS the scan's answer.
 export let emitCurFnPos = -1
-// The top-level STATEMENT (or global initializer) the synthetic start function is lowering,
-// or -1 outside it. `emitFail` prefers it over `emitCurFnIx`, because the start function has
-// no `FuncDecl` to name and the function cursor still points at the LAST user body
-// `emitCodeSection` lowered — which is a diagnostic pointing at an unrelated function
-// several lines from the offending code, not a missing one. Set (and cleared) as a pair with
-// the merge loop's own cursor in `emitStartFnCode`; every function body leaves it -1.
+// The top-level statement (or global initializer) the synthetic start function is
+// lowering, or -1 outside it. `emitFail` prefers it over `emitCurFnIx`: the start
+// function has no `FuncDecl` to name, and the function cursor still points at the
+// last user body lowered — a diagnostic on the wrong function, not a missing one.
 export let emitCurStmtIx = -1
-// The `Program` node `emitProgram` was handed — the MODULE SCOPE, as an arena index, or -1
-// before/outside a compile. Written once at `emitProgram` entry, beside the other per-program
-// resets, and read by the destination scans that need to walk a scope rather than the whole
-// arena (D661: `dsScopeRootOf`). Every other pass already receives `rootIx` as an argument
-// (`runEmitPass` threads it), so this exists for the one consumer a pass table cannot reach —
-// a classifier called from deep inside code emission, which has no `rootIx` in hand and must
-// not guess one. Guessing is the failure it prevents: after a module merge the arena holds
-// several `Program` nodes (one per parsed module plus the merged root) and "the last one" is
-// an invariant of the driver's construction order, not of the AST.
+// The `Program` node `emitProgram` receives — the module scope, as an arena
+// index, or -1 outside a compile. Exists for the one consumer a pass table cannot
+// reach: a classifier deep inside code emission with no `rootIx` argument, which must
+// not guess one — after a module merge the arena holds several `Program` nodes (D661).
 export let emitRootIx = -1
 export let emitErrAt = -1
-// ── the emit-time BODY SPAN table (D1578, D1594) ─────────────────────────────
-// One row per stretch of code section the emitter can name: its arena node, its
-// `fnStmts` position, and the `[start, end)` BYTE RANGE it occupies in the FINISHED
-// module (rebased off the payload once `wSection` places it). Diagnostics only.
-//
-// WHY IT EXISTS: a module the engine refuses reports a byte offset into bytes the
-// author never sees, and that offset is the only handle on WHERE. The emitter is the
-// one pass that knows both ends, so it banks the pair here.
-//
-// EVERY body gets a row, not just the user functions (D1594) — `emitFnSpanKind` says
-// which sort it is (the ladder is `emitFnSpanKindOf`, driver.vl), and `emitFnSpanTag`
-// names a body with no `FuncDecl` to take a name from.
+// The emit-time body-span table: one row per stretch of code section the emitter
+// can name — its arena node, `fnStmts` position, and `[start, end)` byte range in
+// the finished module. Diagnostics only, since a refused module reports a byte
+// offset the author never sees. Every body gets a row, not just user functions (D1594).
 export let emitFnSpanNode: i32[] = []
 export let emitFnSpanPos: i32[] = []
 export let emitFnSpanStart: i32[] = []
@@ -191,18 +121,10 @@ export let emitFnSpanEnd: i32[] = []
 export let emitFnSpanKind: i32[] = []
 export let emitFnSpanTag: string[] = []
 export let fnNames: string[] = []
-// ── the three whole-program name → INDEX tables, SYMBOL-ID keyed (R6) ────────
-// Each was a `{[string]: i32}` — a `__str_hash__` plus a probe per lookup, and a
-// measurable slice of a self-compile (`docs/internals/perf-program.md` §9.1). Now
-// DENSE ARRAYS indexed by the interned symbol id (`compiler/symbols.vl`): a bounds
-// check plus a load, provided the caller already HAS the id. An array rather than an
-// i32-keyed map because the id space is dense from 0, so hash+probe buys nothing, and
-// absence is EXACT — the array is sized where the table is BUILT, interning every key
-// as it goes, so `sid >= length ⇒ absent` cannot be wrong. THE CAVEAT: it must be
-// rebuilt or EXTENDED wherever the table is WRITTEN. `globalIndexBySid` is built once
-// (`collectFns`); `fnIndexBySid`/`nestedNameBySid` by `buildFnMap`, which
-// monomorphization RE-RUNS rather than extending in place. Below: `fnName's sid →
-// fnStmts index` (FIRST wins), so a callee index is O(1), not an O(functions) scan.
+// The three whole-program name -> index tables (symbol-id keyed, R6): dense arrays
+// indexed by the interned sid (`compiler/symbols.vl`), sized where each is built so
+// `sid >= length` means absent, and rebuilt or extended wherever the table changes.
+// `fnIndexBySid` maps a callee's sid to its `fnStmts` index (first wins), O(1).
 export let fnIndexBySid: i32[] = []
 // Sids that name a NESTED (lifted) function (`fnParent[i] >= 0`), 1 = yes.
 // `fnIndexOfInScope` only needs its O(functions) parent-matching scan when the name
@@ -222,53 +144,32 @@ export let fnIndices: i32[] = []
 // Built by `collectFns` (a single `is FuncDecl` scan); `TypeDecl`s are skipped, any
 // other top-level statement fails loudly there.
 export let fnStmts: i32[] = []
-// ── function-value / closure ABI (lambdas) ────────────────────────────────────
-// A function value is a WasmGC fat-pointer struct `{ env: structref, id: i32 }`
-// (`cloStructIdx`), called via `call_indirect $fnsig` on the id. Both interned AFTER
-// every existing heap type; minted ONLY when `fnValUsed` — a whole-module flag,
-// because a function callable both by-name and as a value uses the env-leading
-// signature. At `fnValUsed == 0` (the compiler's own source) no closure type is
-// minted, the env-leading param is absent, and sections 4 + 9 are omitted.
-//
-// The id is the callee's wasm function index (`gImports + fe`), serving BOTH as the
-// `==` identity token and as the dispatch operand. Deliberately an i32 and not a
-// `funcref`: in wasmtime a `funcref` cannot live in the GC heap as a pointer, so
-// reading one out of a GC struct costs a host libcall, and writing one costs another.
+// Function-value / closure ABI: a value is a WasmGC fat-pointer struct `{ env:
+// structref, id: i32 }` (`cloStructIdx`), called via `call_indirect $fnsig` on the
+// id, minted only when `fnValUsed`. The id is deliberately an i32 rather than a
+// `funcref`, which cannot live in the GC heap as a pointer in wasmtime.
 export let fnValUsed = false
 export let cloStructIdx = 0 // the closure fat-pointer struct heap-type index
 // The module's one and only table: a `funcref` table whose entry `i` holds wasm
 // function `i`, so a closure's id indexes it with no translation. `call_indirect`
 // names it, and it exists exactly when `fnValUsed`.
 export const gFnTableIdx = 0
-// The distinct value-call SIGNATURES any function value can be called with — one
-// `$fnsig` env-leading functype `(structref, params...) -> ret` is interned per
-// distinct signature KEY (`fnSigKeyOf`), in first-seen `fnStmts` order. `cloSigRepFn`
-// holds a representative function per key (its param/return kinds drive the functype
-// bytes); `cloSigBase` is the type index of the first. Keys carry the full param +
-// return kinds (not just the arity): `.map`/`.filter` callbacks introduce f64 and
-// struct-ref params and f64 results beside the original all-i32 lambdas.
+// The distinct value-call signatures any function value can be called with: one
+// `$fnsig` env-leading functype per distinct key (`fnSigKeyOf`), first-seen order.
+// `cloSigRepFn` holds a representative function per key, whose kinds drive the
+// functype bytes; `cloSigBase` is the first key's type index.
 export let cloSigKeys: string[] = []
 export let cloSigRepFn: i32[] = []
 export let cloSigBase = 0
-// THE POOL'S OWN TWIN COLUMN (D351), parallel to `cloSigKeys`: `cloSigTwin[i]` is the
-// SMALLEST pool position whose functype renders the same bytes as `i`'s, or `i` itself
-// when `i` is first of its shape. Every type-index consumer resolves through it
-// (`cloSigTypeIdxAt`), so two keys naming one wasm functype name ONE type index.
-// WHY A KEY IS NOT ENOUGH: the key is a REP-LAYER spelling and the slot layers dedup
-// BELOW it in a different alphabet (D199, D280), so two structurally identical
-// functypes land at two indices of one rec group — DISTINCT types in WasmGC, and a
-// closure declared with one and `call_indirect`ed at the other traps. Deduping the
-// KEYS instead was BUILT and REFUSED (D351): the token CHAR is what `sigParamKindAt`
-// reports, and folding it costs working cells. FILLED AT THE POOL'S EMIT
-// (`emitTypeSection`), not at intern, because `mAssignTypeIndices` mints the typed-map
-// value structs AFTER the pool; `cloSigTypeIdxAt` falls back to the identity otherwise.
+// `cloSigTwin[i]` is the smallest pool position whose functype renders the same
+// bytes as `i`'s, or `i` itself when first of its shape (D351): two structurally
+// identical functypes can otherwise land at two indices of one rec group, tripping
+// `call_indirect`. Filled at the pool's emit, not at intern — read only after it.
 export let cloSigTwin: i32[] = []
-// Arena tyIx roots of every annotation the union registration walk descended
-// (`collectInlineUnionsIn`'s FuncDecl ret/param, LetDecl, TypeDecl-field sites) —
-// recorded there and consumed by `collectCloSigs`' arena closure-sig walk, so the sig
-// walk reuses the registration walk's SAFE root set (top-level + body annotations only,
-// never the monomorphized/generic TEMPLATE `TypeRef` nodes a blind `P.nodes` scan would
-// hit — those carry substituted/cyclic types that crash `tyToNominalName`).
+// Arena tyIx roots of every annotation the union registration walk descended,
+// recorded by `collectInlineUnionsIn` and reused by `collectCloSigs`'s closure-sig
+// walk in place of a blind `P.nodes` scan, which would hit monomorphized template
+// nodes whose substituted/cyclic types crash `tyToNominalName`.
 export let cloSigWalkRoots: i32[] = []
 // Per-lifted-function env struct heap-type index, parallel to `fnStmts` (-1 = the
 // function captures nothing, so its closure env is `ref.null structref`). Filled by
@@ -276,11 +177,9 @@ export let cloSigWalkRoots: i32[] = []
 // `captureNamesOf` (a flat `string[]` per call — `string[][]` is not self-host-emittable).
 export let fnEnvIdx: i32[] = []
 // Capture-list cache: every lifted function's captured names back-to-back in
-// `capNamesFlat`, with `capStartTbl[fe]`/`capCountTbl[fe]` its slice (flat parallel
-// arrays — the self-hostable stand-in for a `string[][]`). Valid only while
-// `capCacheOn`: `capCacheBuild` sets it once the AST is FINAL (after the last
-// rewrite/monomorphize pass), and `emitProgram` clears it up front, so queries
-// during the mutating passes fall back to the direct `capScan` walk.
+// `capNamesFlat`, with `capStartTbl[fe]`/`capCountTbl[fe]` its slice — the
+// self-hostable stand-in for a `string[][]`. Valid only while `capCacheOn`, set once
+// the AST is final; queries during the mutating passes fall back to `capScan`.
 export let capCacheOn = false
 export let capStartTbl: i32[] = []
 export let capCountTbl: i32[] = []
@@ -291,158 +190,89 @@ export let capNamesFlat: string[] = []
 export let fnParent: i32[] = []
 // Anonymous-lambda name counter (synthesized names `__lambda_N`), reset per program.
 export let lambdaCtr = 0
-// D426 — THE TWO LAMBDA-TEMPLATE LEDGERS, read by `monomorphize`'s prune. A lambda declared
-// inside a generic body is a TEMPLATE (`monoLamSlotIsTyParamTemplate`), and each instance mints
-// its own copy with the pin substituted. `monoLamPinned` holds the arena node of every template
-// a clone actually replaced; `monoLamShared` the node of every template a clone DECLINED to
-// replace, which is a template some instance body still refers to by name.
-//
-// THE PRUNE NEEDS BOTH, and getting it wrong is a silently-wrong answer rather than a loud one:
-// stubbing a template a live binding still points at leaves `const g = <stub>` calling a
-// `() -> void`. So the prune stubs a template only when a clone replaced it, or when no
-// enclosing frame was instantiated at all. A template the walk never REACHED is in neither
-// list and falls to the `checkParams` floor — the honest answer for a shape the substitution
-// could not reach.
+// D426 — the two lambda-template ledgers `monomorphize`'s prune reads: `monoLamPinned`
+// holds every template a clone replaced, `monoLamShared` every template a clone
+// declined to replace because a live instance still names it. Stubbing a template a
+// binding still points at would silently miscompile to a `() -> void` call.
 export let monoLamPinned: i32[] = []
 export let monoLamShared: i32[] = []
 // Re-entrancy guard for the usage-driven empty-`[]` element inference
-// (`letInfStrListByUseV`): the `LetDecl` node index currently being resolved, or -1.
-// A push whose argument refers back to the SAME binding (`out.push(out[0])`) would
-// otherwise recurse `letIsStringArray → exprString → letIsStringArray`; the guard
-// makes that re-entry return false instead of looping.
+// (`letInfStrListByUseV`): the `LetDecl` node currently being resolved, or -1. A
+// self-referential push (`out.push(out[0])`) would otherwise recurse
+// `letIsStringArray -> exprString -> letIsStringArray`; the guard returns false instead.
 export let gStrInfLet = -1
-// Parallel to `fnStmts`: a DEBUG display name for a lifted function — the binding a
-// directly-bound lambda was assigned to (`const foo = (n) => …` → "foo"), else "".
-// Read ONLY by the wasm name section (so a trap backtrace reads `foo` rather than the
-// synthesized `__lambda_N`); it never enters `fnNameMap`, so call resolution is
-// untouched. An array (not a `{[string]: string}` map, which mis-lowers with `?? ""`
-// — see typecheck.vl). Populated during lifting from the enclosing `let`/`const`.
+// Parallel to `fnStmts`: a debug display name for a lifted function — the binding a
+// directly-bound lambda binds to (`const foo = (n) => ...` -> `"foo"`), else `""`.
+// Read only by the wasm name section, so a trap backtrace shows `foo` rather than
+// `__lambda_N`; it never enters `fnNameMap`, so call resolution is untouched.
 export let fnDispNames: string[] = []
-// Parallel to `fnNames`: the STRUCT TABLE INDEX the i-th function returns (when
-// `fRetKind[i]` is `"struct"`/`"nulstruct"`; also a union-VARIANT return's variant
-// index — see `retStructIndex`), else `-1`. Populated by `buildFnMap` so
-// `fnRetStructIndex` is a flat lookup.
+// Parallel to `fnNames`: the struct table index the i-th function returns (when
+// `fRetKind[i]` is `"struct"`/`"nulstruct"`, or a union-variant return's variant
+// index), else `-1`. Populated by `buildFnMap` so `fnRetStructIndex` is a flat lookup.
 export let fRetStructIdx: i32[] = []
 // Parallel to `fnNames`: the ref-list element type-NAME the i-th function returns (its
 // `S[]`/`N[]` return annotation's element), or "". Lets a ref-list-returning call resolve
 // its distinct element-type table slot.
 export let fRetRArrElem: string[] = []
-// Parallel to `fnNames`: `1` if the i-th function RETURNS a boolean — its declared
-// return type is `boolean`/`bool`, or (un-annotated) its first valued `return` is
-// boolean-classified (`computeRetInference`). Drives the `print` import choice for a
-// call argument (`__print_bool__` vs `__print_i32__`); a bool rides in an i32 at the
-// wasm level, so the functype result is unchanged. NOT folded into `fRetKind`: a
-// boolean is not a rep kind (`VKind` has no `bool` member — its valtype IS i32), so
-// this stays a print-routing side channel beside the kind, like `fRetVoid`.
+// Parallel to `fnNames`: `1` if the i-th function returns a boolean (declared, or
+// inferred by `computeRetInference`). Drives the `print` import choice for a call
+// argument, since a bool rides an i32 at the wasm level. Not folded into `fRetKind`:
+// `VKind` has no `bool` member, so this stays a side channel beside the kind.
 export let fRetBool: i32[] = []
-// Parallel to `fnNames`: THE stored return kind — the single `VKind`-valued slot the
-// ~8 per-family flag tables (`fRetStr`/`fRetListKind`/`fRetUni`/`fRetRef`/`fRetNul`/
-// `fRetMap`/`fRetNulStr`/`fRetScalar`) folded into (the repOf fold, extending #824/#826).
-// Seeded by `buildFnMap` from the annotation (`retAnnKindChain`) or the checker's
-// inferred-return name (the A20 pass), then refined in place by `computeRetInference`'s
-// fixed point (`criSetRetKind` — writes land in the historical override-chain priority,
-// so a later, stronger classification wins exactly as the old chain resolved). `"i32"`
-// means "no non-i32 fact": an i32 return, a boolean (see `fRetBool`), a void function
-// (see `fRetVoid`), and an annotated union-VARIANT return (its payload rides
-// `fRetStructIdx`) all read `"i32"` here, exactly as the old chain left them.
-// `inferredRetKindCore` is a plain read of this table.
+// Parallel to `fnNames`: the stored return kind, a single `VKind` slot folding
+// several per-family flag tables. Seeded by `buildFnMap`, then refined by
+// `computeRetInference`'s fixed point (`criSetRetKind`). `"i32"` means no non-i32
+// fact: plain i32, boolean (`fRetBool`), void (`fRetVoid`) and variant returns all read it.
 export let fRetKind: VKind[] = []
-// Parallel to `fRetKind`: 1 when this function's UN-ANNOTATED return yields a literal-union
-// ATOM (an interned i32 id) rather than a plain i32.
-//
-// `fRetKind` cannot carry it. Both reps ARE i32 — the atom's whole point — so the kind is
-// `"i32"` either way, and a caller reading only the kind cannot tell `print(f())` needs the
-// atom→member widen from a plain integer that must not be widened. The symptom was a wrong
-// value printed from a valid module at rc 0: a miscompile, not a reject.
-//
-// Set by `criClassify`, the ONE place with the context to answer — it walks the returns under
-// the same narrowing replay the emitter uses, so `exprIsLitAtom` resolves the receiver of a
-// shared tag read there. Asking from the CALL SITE does not work: the callee's params and
-// narrowing are not in scope during the caller's classification.
+// Parallel to `fRetKind`: 1 when this function's un-annotated return yields a
+// literal-union atom (an interned i32 id) rather than a plain i32 — both reps are
+// i32, so a reader of only `fRetKind` cannot tell `print(f())` needs the atom-member
+// widen. Set by `criClassify` alone, which walks returns under the emitter's narrowing.
 export let fRetLitAtom: i32[] = []
-// ── module-level GLOBALS (G2b) ────────────────────────────────────────────────
-// A top-level `let`/`const` (`LetDecl`) lowers to a wasm module GLOBAL (mutable),
-// emitted in the global section (id 6). Its wasm GLOBAL INDEX is its position among
-// the top-level `LetDecl`s in declaration order — that order IS the index a
-// `global.get`/`global.set` references. `globalStmts` holds the arena indices of those
-// `LetDecl`s (declaration order); `globalNames` the parallel names (name→index lookup).
-// A bare `Ident` that is not a param/local but matches a `globalName` reads/writes the
-// global (`0x23`/`0x24`) instead of a local (`0x20`/`0x21`).
+// Module-level globals (G2b): a top-level `let`/`const` lowers to a mutable wasm
+// global, whose index is its position among top-level `LetDecl`s in declaration
+// order. `globalStmts` holds their arena indices in that order, `globalNames` the
+// parallel names; a bare `Ident` matching one reads/writes the global, not a local.
 export let globalStmts: i32[] = []
 export let globalNames: string[] = []
-// ── PROMOTION of a top-level binding to a START-FUNCTION LOCAL (G2c) ──────────
-// A mutable wasm GLOBAL is observable module state and must stay in memory; a LOCAL
-// lives in a register, and `wasm-opt --closed-world -O3 --gufa` does NOT promote these,
-// so the storage class is the emitter's choice. `gPromoOk[gi] == 1` marks the top-level
-// `LetDecl` at `globalStmts[gi]` as living in a LOCAL of the synthetic start function;
-// `gPromoSlot[gi]` is that slot; `gCellIdx[gi]` is its index among the cells that ARE
-// emitted (`-1` when promoted), which `userGlobalIdx` translates through so the
-// surviving cells stay dense. THE SAFETY PREDICATE is `globalPromotable`
-// (emit_sections.vl) and its four clauses; `gPromoInStart` is true only while
-// `emitStartFnCode` streams the start body — the one frame where the local exists — and
-// the two `emitUserGlobal*` producers consult it and `emitFail` when a promoted binding
-// is addressed elsewhere. A hole in the predicate is a LOUD reject, never a wrong class.
+// Promotion of a top-level binding to a start-function local (G2c), since `wasm-opt`
+// does not do this itself: `gPromoOk[gi]` marks the `LetDecl` at `globalStmts[gi]` as
+// living in local `gPromoSlot[gi]`. The safety predicate is `globalPromotable`
+// (emit_sections.vl); a hole in it is a loud reject, never a wrong class.
 export let gPromoOk: i32[] = []
 export let gPromoSlot: i32[] = []
 export let gCellIdx: i32[] = []
 export let gPromoInStart = false
-// The active `is`-narrowing stack — the union-narrowing section below carries the
-// full architecture comment.
+// The active `is`-narrowing stack; the discriminated-union table section (G1)
+// carries the full architecture note.
 export let narrowNames: string[] = []
 export let narrowVariants: string[] = []
-// The narrowed type's STRUCTURE, parallel to `narrowVariants` (whose entry is the
-// narrowed type RENDERED — kept for nominal lookups and for the ladder fall-throughs):
-// `narrowTys` is the arena type of a narrowing that binds ONE type (the checker-banked
-// `is`-test type, `isVarTyIxOf`), `narrowSets` the interned member-SET id (the (row,
-// mask) ADT — see `msSetRow`) of a COMPLEMENT narrowing, which is a subset of the
-// receiver's union row. Each is -1 where it does not apply, and every consumer keeps
-// its rendered-name path for that entry.
+// Parallel to `narrowVariants` (the narrowed type rendered): `narrowTys` is the
+// arena type of a narrowing binding one type (`isVarTyIxOf`); `narrowSets` the
+// interned member-set id (`msSetRow`) of a complement narrowing, a subset of the
+// receiver's union row. Each is -1 where it does not apply.
 export let narrowTys: i32[] = []
 export let narrowSets: i32[] = []
-// RETIREMENT, one slot per entry: 1 once a write the narrowing does not admit has
-// falsified it, 0 while it is in force. A narrowing is a FLOW fact and a null-bearing
-// write ends the flow — `let x: i32 | null = null` / `x = 5` / `x = null` / read left the
-// stack claiming `i32` for a slot holding the null box, so the read unboxed a null payload:
-// `ref.cast` TRAP over the scalar reps, and the box arms met an unboxed operand.
-//
-// WRITTEN IN PLACE, NEVER PUSHED, for the reason `typecheck`'s `retireNarrowingsForWrite`
-// gives: a shadowing push unwinds with whatever inner block held the write and resurrects
-// the narrowing for the statements after it, while the write MAY have happened. Overwriting
-// the entry keeps the retirement alive exactly as long as the narrowing it kills, and the
-// depth rewind at block exit retires both together. `pushNarrowRep` clears the column
-// whenever it reuses a slot, so a rewound-and-reused slot never inherits a stale mark.
+// Retirement, one slot per narrowing entry: 1 once a write it does not admit has
+// falsified it, 0 while in force — a narrowing is a flow fact and a null-bearing write
+// ends the flow. Written in place, never pushed, since a shadowing push would unwind
+// and resurrect the narrowing after a write that may already have happened.
 export let narrowRetired: i32[] = []
 export let narrowTop = 0
-// Restricts `setNarrowFromCond`/`setNarrowFromCondElse` to the pushes that STRIP `null`
-// from a union, skipping the ones that pin a variant (`is T`, and the `null` side of a
-// null compare). Held true only across the LOOP-BODY push, and the reason is the write
-// contract a narrowing carries: the narrowed type is what the binding ACCEPTS inside the
-// scope, so an `is T` narrowing of a loop body would reject the assignment that flips the
-// variant — which is how a loop over a union TERMINATES (`while x is i64 { … x = true }`,
-// `unions/paren-is-narrow.vl`). A null strip has no such cost: writing null back is the
-// one thing a null guard's body must not do anyway. The checker's loop-body filter keeps
-// exactly the same facts, and the two must agree or a boxed read diverges.
+// Restricts `setNarrowFromCond`/`setNarrowFromCondElse` to pushes that strip `null`
+// from a union, skipping ones that pin a variant. Held true only across the loop-body
+// push: an `is T` narrowing there would reject the assignment that flips the variant,
+// which is how a union loop terminates — a null strip has no such cost.
 export let narrowStripNullOnly = false
-// BARE-NAME narrowings only — property PATHS decline. Held across the post-guard
-// complement push of an `if` that HAS an `else` (`pushPostGuardNarrow`), which is the one
-// position where the checker narrows a bare name and refuses to narrow a path: a path's
-// checker-side narrowing is an overlay entry the else arm can RETIRE, and the retirement
-// is popped with the else's scope, so re-deriving one after the `if` would resurrect it.
-// See the guard-clause comment in `typecheck.checkIfStmtNode` — the two sides must agree
-// on which guards post-narrow or the block below reads a boxed union as an unboxed one.
+// Bare-name narrowings only; property paths decline. Held across the post-guard
+// complement push of an `if` with an `else`: a path's checker-side narrowing is an
+// overlay entry the else arm can retire and pop with its scope, so re-deriving one
+// after the `if` would resurrect it (`typecheck.checkIfStmtNode`).
 export let narrowBareIdentOnly = false
-// ── the declaration-site narrowing of a CAPTURE ───────────────────────────────
-// A nested function / lambda is written LEXICALLY INSIDE the guard that narrowed the
-// binding it captures, so every rep question about the captured READ has to be answered
-// under the same narrowing. The narrowing SLOT active where the closure was WRITTEN is
-// recorded here — one record per (lifted-frame position, capture name), in the same four
-// columns the narrowing stack carries — and REPLAYED onto that stack by `capNarrowSeed`
-// at the two walks that enter a function body: the classifier's (`computeRetInference`)
-// and the emitter's (`emitFuncCode`). ONE record, so the two cannot disagree.
-//
-// WHY ONE RECORD PER FRAME IS WELL-DEFINED rather than a join over sites: a lifted frame
-// has exactly one declaration site, and a nested function declared inside an `if` block
-// is not in scope outside it, so every env-BUILD site sits under the same guard.
+// The declaration-site narrowing of a capture: a nested function/lambda sits
+// lexically inside the guard that narrowed the binding it captures, so a captured
+// read must use that same narrowing. One record per (lifted-frame, capture name) is
+// replayed by `capNarrowSeed` onto both walks that enter a body, so they cannot disagree.
 export let cnFe: i32[] = []
 export let cnName: string[] = []
 export let cnVariant: string[] = []
@@ -467,31 +297,15 @@ export let nliNames: string[] = []
 // point like voidness does: `function outer() { return inner() }` cannot be resolved
 // until inner's own kind is inferred.
 export let criChanged = false
-// ── declared-local map ────────────────────────────────────────────────────────
-// A `let`/`const` inside a function body allocates a wasm local whose index comes
-// AFTER the params: params occupy locals `0..p-1`, the i-th declared local gets
-// `p + i` (declaration order). Wasm locals are function-scoped (not block-scoped),
-// and the code body's locals vector is fixed up-front, so EVERY `LetDecl` in the
-// body — including those nested in `if` branches — must be collected before any
-// instruction is emitted.
-//
-// `localNames` holds the declared-local names of the function currently being
-// emitted, in declaration order; the i-th name's wasm local index is `p + i`. It is
-// rebuilt per function by `buildLocals` before that function's body is lowered, so
-// only one function's locals are live at a time.
+// A `let`/`const` inside a function body allocates a wasm local after the params
+// (`0..p-1`); the i-th declared local gets `p + i`. Locals are function-scoped, so
+// every `LetDecl`, including ones nested in `if` branches, is collected before any
+// instruction emits. `localNames` holds them in order, rebuilt per function.
 export let localNames: string[] = []
-// Parallel to `localNames`: the i-th declared local's value-type `VKind`. The locals
-// vector and identifier resolution consult this so a ref-typed local gets the correct
-// ref valtype, not i32.
-//
-// `VKind` is the wasm-rep KIND of a local/param/global cell and of a function's
-// params/result — the vocabulary `fbValtype` matches on to emit a wasm valtype byte.
-// The numeric code each member carried before the union existed (C2), still the
-// alphabet of the emitter's integer-coded columns (`sFieldTypes`, `uFieldTypes`):
-//   i32 0 · struct 1 · list 2 (i32-list) · str 3 · union 4 (value-union box) · reflist 5 ·
-//   map 6 · strlist 7 · variant 8 · nulstruct 9 · i64 10 · f64 11 · f64list 12 · f32 13 ·
-//   closure 14 · nullist 15 (i32[]|null) · nulstr 16 · nulbool 17 (boolean|null niche) ·
-//   nulreflist 18 · nulclosure 19 · i64list 20 · f32list 21.
+// Parallel to `localNames`: the i-th declared local's value-type `VKind`, so a
+// ref-typed local gets the correct ref valtype rather than i32. `VKind` is also the
+// wasm-rep kind of a param/global cell and of a function's params/result — the
+// vocabulary `fbValtype` matches to emit a valtype byte.
 export type VKind = "i32"
   | "struct"
   | "list"
@@ -501,18 +315,10 @@ export type VKind = "i32"
   | "map"
   | "strlist"
   | "variant"
-  // A NULLABLE union variant (`Circle | null`, where `Circle` is a union ARM) — the
-  // `(ref null $uVarHeap[vi])` niche, and the exact variant-table twin of `nulstruct`.
-  // IT IS A SEPARATE KIND BECAUSE THE HEAP TABLE DIFFERS, not the lowering: `nulstruct`
-  // resolves through `sHeapIdx`, and `collectS` deliberately refuses a variant its own
-  // struct row, so the two cannot share an index space. Pairing kind `nulstruct` with a
-  // `uVariants` row is a `ref valtype with no interned shape` reject where the struct
-  // table is empty, and a SILENT read of an unrelated heap type where an anonymous
-  // shape happened to intern at the same slot (#1803).
-  // A NICHE, NOT A BOX — the ruling `A | null` gets everywhere else. Boxing would cost
-  // an allocation per non-null value and make `Circle | null` allocate where the
-  // identical `S | null` does not: a cliff switched on by whether `Circle` is a union
-  // member ELSEWHERE in the file, which is invisible at the use site.
+  // A nullable union variant (`Circle | null`, the `(ref null $uVarHeap[vi])` niche) is
+  // a separate kind from `nulstruct` because the heap table differs — pairing them risks
+  // reading an unrelated heap type at the same slot (#1803). A niche, not a box: boxing
+  // would allocate on a cliff switched on whether `Circle` is a union member elsewhere.
   | "nulvariant"
   | "nulstruct"
   | "i64"
@@ -533,22 +339,15 @@ export type VKind = "i32"
   | "nulf32list"
   | "nulu8list"
   | "nulmap"
-  // THE `null` TYPE ITSELF — a function whose every returned value is a bare `null`, which
-  // the checker types `TyPrim:null` and not `T | null` (D1567). Its wasm rep is `nullref`
-  // (`(ref null none)`), the BOTTOM of the GC hierarchy: one value, no fields, and a
-  // subtype of every nullable ref valtype, so the result flows into a `C | null` /
-  // `string | null` / `T[] | null` / map / closure destination with no coercion at all.
-  // The three i32-repped nullable destinations are NOT its subtypes (`boolean | null` is
-  // the sentinel 2, `K | null` the sentinel -1, `i32 | null` a box) — `emitDirectCall`
-  // converts for those by dropping the nullref and re-lowering through the null-rep table.
+  // The `null` type itself — a function whose every return is a bare `null`, typed
+  // `TyPrim:null` rather than `T | null` (D1567). Its wasm rep is `nullref`, the bottom
+  // of the GC hierarchy, flowing into any nullable ref destination with no coercion —
+  // except the three i32-repped destinations, which `emitDirectCall` converts instead.
   | "nulnone"
-  // A `u8[]` — the PACKED byte list. Its wrapper is `{ backing: (ref $ba8TypeIdx),
-  // len, cap }` exactly like the other scalar lists, but the backing's element
-  // STORAGE type is the packed `i8` (0x78), not a valtype: one byte per element
-  // instead of four. Its VALUES are i32 at every seam (`array.get_u` widens on read,
-  // `array.set` truncates on write, `push` takes an i32), so unlike `i64list` /
-  // `f64list` / `f32list` it needs no new scalar anywhere — the element kind is
-  // `"i32"`, and the only thing that is not an i32 is the storage.
+  // A `u8[]`, the packed byte list: its wrapper is `{ backing: (ref $ba8TypeIdx), len,
+  // cap }` like the other scalar lists, but the backing's element storage is the packed
+  // `i8` (0x78), not a valtype — one byte per element. Its values are i32 at every seam
+  // (`array.get_u` widens, `array.set` truncates), so it needs no new scalar kind.
   | "u8list"
 
 export let localIsRef: VKind[] = []
@@ -557,45 +356,32 @@ export let localIsRef: VKind[] = []
 // resolves to the right heap type + field layout). For non-struct locals the slot is
 // unused (`-1`). Rebuilt alongside `localNames` by `buildLocals`.
 export let localStructIdx: i32[] = []
-// Parallel to `localNames`: `1` when the i-th declared local is a LOOP VARIABLE
-// (a `for` counter / for-in element), whose scope is the loop — the resolution
-// fallback skips these once their loop has closed (see `markLoopVarSlot`).
+// Parallel to `localNames`: `1` when the i-th declared local is a loop variable
+// (a `for` counter or for-in element), whose scope is the loop — the resolution
+// fallback skips these once their loop has closed (`markLoopVarSlot`).
 export let localLoopVar: i32[] = []
 // Parallel to `localNames`: `1` when the i-th declared local is bound inside a nested
 // lexical block, so its scope is that block and not the whole frame. Wasm locals are
 // function-scoped and a module's top-level statements share one start function, so a name
 // scan that ignores this hands a read outside the block a slot out of scope. D1597.
 export let localBlockLet: i32[] = []
-// Parallel to `localNames`: for a FOR-IN element loop variable, the ITERABLE expression
-// node its loop iterates; `-1` for every other slot. A loop var is the one storage class
-// with no declaration node (no `Param`, no `LetDecl`), so a question that can only be
-// answered from the iterable — which value union does a kind-4 box loop var flow as
-// (`unionNameOfIdentSid`) — has to reach the iterable from the SLOT. Keying that on the
-// loop-var NAME instead is a miscompile: two loops in one frame may share a name while
-// binding different reps or different unions, and the name cannot tell them apart.
+// Parallel to `localNames`: for a for-in element loop variable, the iterable
+// expression node it iterates; `-1` otherwise. A loop var has no declaration node, so
+// a question answerable only from the iterable must reach it via the slot — keying on
+// the loop-var name instead is a miscompile, since two loops may share a name.
 export let localLoopIter: i32[] = []
-// Parallel to `localNames`: the `LetDecl` node that DECLARED the slot; `-1` for a param-shadow
-// slot, a loop var (which has no declaration node — that is `localLoopIter`'s job) or any
-// emitter-synthesized temp. The declaration is where a MONOMORPHIZED instance keeps the only
-// concrete type it has: `monoSubstLetType` rebuilds the statement spine with the type param
-// substituted (`const out: T[]` → `const out: ("a" | "b")[]`) while every leaf EXPRESSION node
-// is SHARED with the generic body and still records the type VARIABLE. So a rep question about
-// `out[k]` inside an instance is answerable only from `out`'s annotation, and the slot is the
-// only route to it (the NAME is not a key — two blocks in one frame may bind the same name to
-// different declarations, exactly the reason `localLoopIter` is keyed by slot).
+// Parallel to `localNames`: the `LetDecl` node that declared the slot; `-1` for a
+// param-shadow slot, a loop var, or an emitter-synthesized temp. A monomorphized
+// instance keeps its only concrete type at the declaration, since every leaf
+// expression node stays shared with the generic body — the slot is the only route to it.
 export let localDeclIx: i32[] = []
 // Per declared-local flag: 1 if the slot is a literal-union ATOM (`: K` where `type K = "a"|"b"`), an
 // i32-backed interned id. Parallel to `localNames`; pushed in `addLocalName`, reset in `buildLocals`.
 export let localLitUnion: i32[] = []
-// ── SAME-NAMED SLOT DISAMBIGUATION for the scratch DETECTION passes (D1595) ──
-// The detectors run with the scope stack EMPTY, so `declaredSlotOf` answers from a flat
-// first-match scan over `localNames` — a GUESS whenever one frame binds a name twice (a
-// `for n` loop var beside a block's `const n`). Guessing wrong under-reserves the frame the
-// emit pass then writes into, which is `unknown local N` at `vl check` rc 0. The detection
-// drivers therefore ask the question once per CANDIDATE slot: `dupSlotBias` selects the k-th
-// same-named match and `dupSlotMore` reports that a later one of a DIFFERENT rep was passed
-// over, so the flags OR over every binding the name could denote. `dupScanActive` is false
-// everywhere else, where the flat scan keeps its early return.
+// Same-named slot disambiguation for the scratch detection passes (D1595): they run
+// with the scope stack empty, so `declaredSlotOf`'s flat scan over `localNames` guesses
+// whenever one frame binds a name twice. `dupSlotBias` selects the k-th match and
+// `dupSlotMore` flags a later one of a different rep, so the flags OR over every binding.
 export let dupScanActive = false
 // Armed for one extra detection sweep per frame, in which the flat registry scan hides
 // every block-scoped slot so a shadowed name classifies as the module global it denotes
@@ -604,31 +390,18 @@ export let dupScanActive = false
 export let blockLetHidden = false
 export let dupSlotBias = 0
 export let dupSlotMore = false
-// ── lexical scope stack (per-block local binding resolution) ──────────────────
-// Wasm locals are function-scoped, but VL `let`s are LEXICALLY block-scoped: two
-// `let s` in DISJOINT branches (then vs else) are SEPARATE bindings that may carry
-// DIFFERENT types, so each must get its OWN wasm slot. `addLocalName` therefore does
-// not dedupe by name — every `let` pushes a fresh slot — and resolving an identifier
-// to the RIGHT slot (innermost binding in scope at the reference site) needs a scope
-// stack of the `(name → declared-local position)` bindings live as the walk descends.
-//
-// `scopeNames`/`scopeSlots` are parallel: the k-th live binding's name and its
-// declared-local POSITION. `scopeFrames` is the frame-boundary stack — each pushed
-// value is `scopeNames.length` AT FRAME ENTRY, so a pop truncates back to that mark.
-// The same discipline runs in BOTH passes; all reset per function in `buildLocals`.
+// Lexical scope stack: wasm locals are function-scoped, but VL `let`s are
+// block-scoped, so two `let s` in disjoint branches need separate slots —
+// `addLocalName` never dedupes by name. `scopeNames`/`scopeSlots` pair (name, slot)
+// per live binding; `scopeFrames` marks the length at frame entry so a pop truncates back.
 export let scopeNames: string[] = []
 export let scopeSlots: i32[] = []
 export let scopeFrames: i32[] = []
 
-// The declared-local POSITION bound to `name` by the innermost live scope frame, or
-// -1 if `name` is not a live lexical binding. Searches the scope stack top-down
-// (innermost first), so a shadowing inner `let` wins over an outer same-named one.
-//
-// LIVES HERE, beside the stack it reads, because BOTH halves of name resolution ask
-// it and they sit in different modules: `emit_classify`'s `localIndexOf` picks the
-// wasm local INDEX, `emit_query`'s `paramTypeNode` gates the param TYPE. Those two
-// answering from different tables is what let a block-scoped local that shadows a
-// parameter be ignored, so they must read one stack through one function.
+// The declared-local position bound to `name` by the innermost live scope frame, or
+// -1 if not a live lexical binding — searched top-down so a shadowing inner `let`
+// wins. Lives beside the stack because both halves of name resolution ask it from
+// different modules; two tables answering separately let a shadowing local be ignored.
 export function scopeSlotOf(name: string) {
   let k = scopeNames.length
   while k > 0 {
@@ -638,51 +411,32 @@ export function scopeSlotOf(name: string) {
   -1
 }
 
-// Emit-time running declared-local slot cursor. The emit pass visits `LetDecl`s in the
-// SAME pre-order `collectLocals` allocated them (block stmts → if-then → if-else →
-// while-body), so the n-th `LetDecl` emitted owns declared-local slot `n` — exactly the
-// slot `addLocalName` gave it. The cursor yields that slot WITHOUT a name lookup (a name
-// lookup would wrongly resolve to an outer same-named binding still in scope at the
-// store site). Reset to 0 per function before the body is lowered.
+// Emit-time running declared-local slot cursor: the emit pass visits `LetDecl`s in
+// the same pre-order `collectLocals` allocated them, so the n-th one emitted owns
+// slot `n` without a name lookup — a lookup would wrongly resolve to an outer
+// same-named binding still in scope at the store site. Reset to 0 per function.
 export let emitLetCursor = 0
-// ── loop control-frame tracking (for `break` / `continue`) ───────────────────
-// wasm branch targets are RELATIVE depths, so lowering `break`/`continue` to a
-// `br <depth>` needs to know how many control frames sit between the branch site and
-// the loop it targets. `ctrlDepth` counts the control frames (block / loop / if) open
-// at the emit cursor — bumped when a frame opens, dropped at its matching `end`. A
-// `while` opens a `block` then a `loop`: on entry it pushes the ABSOLUTE `ctrlDepth`
-// of the loop frame onto `loopContDepth` (the `continue` target) and of the block
-// frame onto `loopBrkDepth` (the `break` target). At a branch site the relative `br`
-// operand is `ctrlDepth - <stack top>`. Popped when the `while` closes; all reset per
-// function in the body emit. LOOP LABELS: each loop also pushes its label ("" =
-// unlabelled) onto `loopBrkLabel`/`loopContLabel`, parallel to the depth stacks; an
-// unlabelled branch takes the stack TOP, a labelled one scans down for its label.
+// Loop control-frame tracking for `break`/`continue`: wasm branch targets are relative
+// depths, so `ctrlDepth` counts open control frames at the emit cursor. A `while` pushes
+// its absolute depth onto `loopContDepth`/`loopBrkDepth`; a branch's `br` operand is
+// `ctrlDepth - <stack top>`, and each loop carries a label in the parallel `loopBrkLabel`/`loopContLabel`.
 export let ctrlDepth = 0
 export let loopContDepth: i32[] = []
 export let loopBrkDepth: i32[] = []
 export let loopContLabel: string[] = []
 export let loopBrkLabel: string[] = []
-// ── per-function scratch frames ───────────────────────────────────────────────
-// LAYOUT RULE for every frame declared from here down: `fbBeginFunc` (emit_bytes) is
-// the sole owner of the layout — it walks the frames in a fixed order after the params
-// + declared locals, reserving each only when its `fnUses*` flag is set, and a NEW
-// frame is appended at the END of that order so every function that does not use it
-// keeps the exact local layout it had. `fbBeginFunc` is also the authority on each
-// frame's slot count; the declarations below name only what each frame HOLDS.
-//
-// `.push(x)` lowers INLINE to grow-if-full + write + len-bump, so each pushed list KIND
-// needs its own typed quad: val, cap, backing and recvRef (the wrapper, for a
-// struct-FIELD receiver). One `fnUses*Push` flag + one `*PushScratchBase` (the quad's
-// val slot) per kind; the `blockPushPopBits` pre-scan sets every flag in ONE body walk.
+// Per-function scratch frames: `fbBeginFunc` (emit_bytes) owns the layout, walking
+// frames in a fixed order after params+locals and reserving each only when its
+// `fnUses*` flag is set — a new frame is appended last so an unused function keeps
+// its layout. `.push(x)` lowers inline, so each list kind needs its own typed quad.
 export let fnUsesPush = false    // i32 list: backing `(ref $aTypeIdx)`
 export let pushScratchBase = 0
 export let fnUsesRefPush = false // ref list (G7-ref): backing `(ref $raTypeIdx)`
 export let refPushScratchBase = 0
-// A function pushing onto DISTINCT ref-list element types needs a separately-TYPED
-// quad per element type (backing/wrapper/value are typed per element). `fnRefPushSlots`
-// lists the table slots it pushes onto (first-seen order), `refPushBaseBySlot[k]` is the
-// k-th quad's base, and `refPushScratchBaseFor` maps a table slot to its base;
-// `refPushScratchBase` aliases the first quad. (Slice 4.)
+// A function pushing onto distinct ref-list element types needs a separately-typed
+// quad per element type. `fnRefPushSlots` lists the table slots it pushes onto
+// (first-seen order); `refPushBaseBySlot[k]` is the k-th quad's base, and
+// `refPushScratchBaseFor` maps a table slot to its base (`refPushScratchBase` aliases the first).
 export let fnRefPushSlots: i32[] = []
 export let refPushBaseBySlot: i32[] = []
 // `string[]`: val + backing are `(ref $sTypeIdx)` / `(ref $mkArrIdx)`, recvRef `(ref
@@ -705,106 +459,66 @@ export let f32PushScratchBase = 0
 export let fnUsesU8Push = false
 export let u8PushScratchBase = 0
 export let strPushScratchBase = 0
-// ── per-function string-op scratch locals (G6: `+` / `==`/`!=` / `.slice`) ────
-// Concat and value-equality lower as a `call` into the shared module-tail helpers
-// (`gHelpStrConcat`/`gHelpStrEq`); the REMAINING string ops (slice, ordering, indexOf,
-// charCodeAt) lower inline and need temporaries to stash the operand strings — so an
-// operand expression is evaluated ONCE, no re-eval of a side-effecting call — and to
-// drive an element loop. ONE shared frame covers them all, reserved in any function
-// using ANY string op (`fnHasStrOp`). `strScratchBase` is slot 0 and the rest follow at
-// +1..+10: strScrA/B the two operand HEADERS `(ref $sTypeIdx)`; strScrOut the freshly
-// allocated BACKING a builder fills; strScrI0..I3 four i32 temporaries; strScrABk/BBk
-// the operands' HOISTED backings, `(ref null $sBackIdx)` so the slots are defaultable;
-// strScrAOff/BOff their `start` offsets. The last four exist because every element loop
-// reads its operands repeatedly — the hoist is done in CODEGEN, not left to binaryen.
+// Per-function string-op scratch locals (G6: `+`/`==`/`!=`/`.slice`): the remaining
+// string ops (slice, ordering, indexOf, charCodeAt) lower inline and need temporaries
+// to stash operand strings, so each is evaluated once and an element loop can run.
+// One shared frame (`strScratchBase` + 10 slots) covers them all, reserved by `fnHasStrOp`.
 export let fnUsesStrOp = false
 export let strScratchBase = 0
-// ── per-function list `==`/`!=`/`+` scratch frames (collections-design §VL.4/6) ──
-// List value-equality and list concat lower INLINE (like the string ops above),
-// each staging its two operand WRAPPER refs + a length and an index. One typed
-// frame per receiver list KIND so a nested compare (an `i32[][]` element loop
-// recursing into an i32-list compare) never clobbers its outer loop:
-//   LEQI (5 slots): A/B `(ref $lTypeIdx)`, out `(ref $aTypeIdx)` (concat), n, i
-//   LEQS (4 slots): A/B `(ref $mkListIdx)`, n, i  (string elements ride strScr)
-//   LEQR (4 slots, one frame per ref-list slot): A/B `(ref $rlWrapIdx[slot])`, n, i
+// Per-function list `==`/`!=`/`+` scratch frames (collections-design section VL.4/6), one
+// typed frame per receiver list kind so a nested compare never clobbers its outer loop:
+//   LEQI (5): A/B `(ref $lTypeIdx)`, out `(ref $aTypeIdx)` (concat), n, i . LEQS (4):
+//   A/B `(ref $mkListIdx)`, n, i (strScr) . LEQR (4, per ref-list slot): A/B `(ref $rlWrapIdx[slot])`, n, i
 export let fnUsesListEqI = false
 export let leqIScratchBase = 0
 export let fnUsesListEqS = false
 export let leqSScratchBase = 0
 export let fnListEqRSlots: i32[] = []
 export let leqRBases: i32[] = []
-// ── per-function list `+` CONCAT frames for every list rep but the i32 one ────────────
-// LCAT (4 slots, one frame per (rep, slot) pair concatenated): A/B `(ref <wrapper>)`, out
-// `(ref <backing>)`, n. No `i` — a concat is two bulk `array.copy`s, never an element loop,
-// which is why the frame is four slots where LEQI is five; the i32 list still rides LEQI's
-// `out` slot exactly as it did. A SEPARATE FAMILY RATHER THAN A FIFTH SLOT ON LEQR because
-// appending one to LEQR would shift the local index of every later frame in every function
-// that compares a ref list — changed bytes for a concat those programs never perform, which
-// is what `fbBeginFunc`'s "appended LAST" rule guards.
-// `fnListCatKinds[k]` is the k-th frame's rep code and `fnListCatSlots[k]` its ref-list slot
-// (0 when the rep is not slot-keyed); `lcatBases[k]` the frame's base local. The scan
-// (`leqNoteBin`) and the emitter (`emitListConcatG`) resolve the pair through ONE home
-// (`catListKindOfBin`) — else a frame is reserved under one answer and written under another.
+// Per-function list `+` concat frames for every list rep but i32 (which rides LEQI's
+// `out` slot): LCAT (4 slots per (rep, slot) pair) is A/B `(ref <wrapper>)`, out
+// `(ref <backing>)`, n — no `i`, since a concat is bulk `array.copy`, never a loop. A
+// separate family, not a fifth LEQR slot, since that would shift every later frame's index.
 export let fnListCatKinds: i32[] = []
 export let fnListCatSlots: i32[] = []
 export let lcatBases: i32[] = []
-// ── per-function list `==` frames for every list rep with NO core of its own ──────────
-// LEQG (4 slots, one frame per (rep, slot) pair COMPARED): A/B `(ref <wrapper>)`, n, i.
-// The rep alphabet and the two heap indices are `catWrapIdxOf`/`catBackIdxOf`'s, shared
-// with LCAT — a wrapper is a wrapper whichever operator reads it.
-// ONE FRAME PER LEVEL, AND THAT IS WHY THE KEY IS THE PAIR RATHER THAN A FLAG. A compare
-// INSPECTS its elements, so `f64[][] == f64[][]` runs an outer loop over the ref list and
-// an inner loop over each `f64[]` element — two live loop counters at once. Keying on
-// (kind, slot) gives each level its own frame for free, because a level's rep differs from
-// its parent's by construction. `emitListEqGCore` recurses along exactly the chain
-// `leqgNoteRep` reserved along, so a frame reserved for one level and written by another
-// cannot happen. NOT LCAT's frames: their fourth slot is a `(ref <backing>)` for the
-// concat's fresh allocation where a compare needs an i32 loop counter instead.
+// Per-function list `==` frames for every list rep with no core of its own: LEQG (4
+// slots per (rep, slot) pair) is A/B `(ref <wrapper>)`, n, i — keyed by the pair, since a
+// nested compare (`f64[][] == f64[][]`) runs one loop per level, each with its own rep.
+// Not LCAT's frames: their fourth slot is a backing for concat, where compare needs a counter.
 export let fnListEqGKinds: i32[] = []
 export let fnListEqGSlots: i32[] = []
 export let leqgBases: i32[] = []
-// ── per-function closure-equality scratch frame (function-identity `==`) ──────
-// `f == g` (or a struct equality whose shape carries a function-typed field)
-// stages both closure fat-pointers in a 2-slot `(ref $cloStruct)` frame (A the
-// left operand, B the right) so each operand's id + env fields read off ONE
-// evaluation. Flagged by `cloEqNoteBin` riding the leq scan.
+// Per-function closure-equality scratch frame (function-identity `==`): `f == g` (or a
+// struct equality whose shape carries a function-typed field) stages both closure
+// fat-pointers in a 2-slot `(ref $cloStruct)` frame so each operand's id+env fields
+// read off one evaluation. Flagged by `cloEqNoteBin` riding the leq scan.
 export let fnUsesCloEq = false
 export let cloEqScratchBase = 0
-// ── per-function array-intrinsic scratch (std-design D1: the intrinsic floor) ──
-// `__array_new__(n, fill)` / `__array_new_default__(n)` stage the runtime
-// length `n` in ONE i32 scratch slot — it feeds the allocation size and the
-// list wrapper's len/cap fields. Flagged by `fnHasArrNew` (a pure name-walk for
-// the two allocator calls). (`__array_copy__`/`__trap__` need no scratch.)
+// Per-function array-intrinsic scratch (std-design D1): `__array_new__(n, fill)` and
+// `__array_new_default__(n)` stage the runtime length `n` in one i32 slot, feeding the
+// allocation size and the list wrapper's len/cap fields. Flagged by `fnHasArrNew`;
+// `__array_copy__`/`__trap__` need no scratch.
 export let fnUsesArrNew = false
 export let arrNewScratchBase = 0
 // `f(x) ?? d` (call-LHS null-coalesce) frame: stashes the call's result once so the
-// null test + recovery read the SAME evaluation (a call cannot be re-evaluated). THREE
-// slots, one per rep the call may return: a `(ref $uBoxIdx)` for a value-union box, a
-// `(ref null $sTypeIdx)` for a `string | null` niche, and an i32 for a `boolean | null`
-// niche. Flagged by `fnHasCoalesceCall` (over-approximating ANY call-LHS `??`).
+// null test and recovery read the same evaluation. Three slots, one per rep the call
+// may return (a value-union box, a `string | null` niche, a `boolean | null` niche).
+// Flagged by `fnHasCoalesceCall`, which over-approximates any call-LHS `??`.
 export let fnUsesCoalesceCall = false
 export let coalesceCallSlot = 0
 export let coalesceCallStrSlot = 0
 export let coalesceCallBoolSlot = 0
-// Variant-rebox scratch: a struct-typed value BUILT as the plain struct twin (a CALL
-// result — a non-re-readable, multi-field source) that must be re-boxed field-by-field
-// into a variant-box union arm. The source is stashed ONCE in a `(ref null struct)` slot
-// so each field re-reads it (a call cannot be re-evaluated). A re-readable / single-field
-// source needs no stash. Flagged by `fnHasVariantRebox`.
+// Variant-rebox scratch: a struct-typed value built as the plain struct twin (a call
+// result — non-re-readable, multi-field) that must be re-boxed field-by-field into a
+// variant-box union arm is stashed once in a `(ref null struct)` slot so each field
+// re-reads it. A re-readable or single-field source needs no stash. Flagged by `fnHasVariantRebox`.
 export let fnUsesVariantRebox = false
 export let variantReboxSlot = 0
-// ── union-box SINK ────────────────────────────────────────────────────────────
-// A value whose rep is the shared union box `{tag: i32, payload: anyref}` and produced on
-// TWO branches gets one construction site per branch. Binaryen's Heap2Local scalarizes per
-// allocation SITE, so two sites merging into one value melt neither and the box survives
-// the moment its payload is read. The sink gives the merge ONE site: each branch writes
-// the box's two operands into these slots and the single `struct.new` runs past the merge.
-// Two positions share ONE frame (an i32 tag slot then an `anyref` payload slot, both
-// defaultable) — a RETURN (`fnUsesUnionSink`, predicted by `fnUnionRetSinkOk`) branching
-// to one exit block, emitted only when `uSinkFired` says a `return` took the sink, and a
-// BINDING (`fnUsesUnionLetSink`/`fnUnionLetSinkOk`) writing the pair in each arm of a void
-// `if`. One frame is enough because the pair is live only from a branch's write to that
-// construction, with no instruction of the other position in between.
+// Union-box sink: a value whose rep is the shared union box, produced on two branches,
+// gets one construction site per branch — binaryen's Heap2Local scalarizes per site, so
+// two sites merging into one value melt neither and the box survives. The sink gives the
+// merge one frame (tag, payload), written once for a `return` (`fnUsesUnionSink`) or a binding (`fnUsesUnionLetSink`).
 export let fnUsesUnionSink = false
 export let fnUsesUnionLetSink = false
 export let unionSinkBase = 0
@@ -812,152 +526,74 @@ export let unionSinkBase = 0
 // read AFTER the body is lowered to decide whether the exit block is emitted at all.
 export let uSinkFired = 0
 // The buffer offset just past the most recent `struct.new $uBoxIdx` — the cursor that
-// tells the return sink the box construction is still the LAST thing written. A byte
-// pattern alone cannot: an operand can spell any opcode, so matching the tail bytes
-// proves only that they LOOK like the instruction. Equality with the current buffer
-// length proves nothing has been written since, which is the property the rewrite needs.
+// tells the return sink the box construction is still the last thing written. A byte
+// pattern alone cannot prove this (an operand can spell any opcode); equality with the
+// current buffer length proves nothing has been written since, which is what the rewrite needs.
 export let uBoxNewEnd = -1
-// The TAIL-CALL cursor pair: the buffer offset just past the most recent DIRECT call to
+// The tail-call cursor pair: the buffer offset just past the most recent direct call to
 // a user function, and that call's wasm function index. `emitUnionRetSink` turns the
 // `call`/`return` pair into a single `return_call` when the call is still the last thing
-// written, which is exactly what puts it in tail position.
-//
-// Two conditions, for the reason `uBoxNewEnd` states: the tail bytes alone prove only
-// that they LOOK like a call (an operand can spell any opcode), and the cursor alone
-// proves only that nothing was written since. Reset per function, so a cursor left by
-// one function's body can never be read as another's — without that reset the offsets
-// are comparable across bodies and a coincidental match is reachable.
+// written — two conditions, for the reason `uBoxNewEnd` states, reset per function.
 export let tailCallEnd = -1
 export let tailCallIdx = -1
-// ── struct-type table (MULTIPLE structs per program) ──────────────────────────
-// A program may declare MANY struct `type`s. Mirroring the union variant table, the
-// struct table is a FLAT store keyed by struct index (declaration order): struct `i` is
-// named `sNames[i]`, owns `sFieldNames[sFieldStart[i] .. + sFieldCount[i]]` (declaration
-// order = wasm struct field index) with parallel wasm-type codes `sFieldTypes[...]`, and
-// its WasmGC heap-type index is `sHeapIdx[i]`. Rebuilt per program by `collectS`; when a
-// UNION is declared the union path owns the struct `type`s instead and this stays empty.
-// `postMonoShapes` below is TRUE once `monomorphize` has run, so a shape interned from
-// here on is an instance's RE-SPELLING rather than a type the author wrote.
-// `annShapeWiderRowOf` reads it: a user-written annotation naming a shape distinct from
-// an existing row must keep its own row (two annotations in one program are two types),
-// while an instance's re-spelling must not mint a narrower twin. Reset in `emitProgram`.
+// Struct-type table: a flat store keyed by struct index (`sNames`, `sFieldNames`,
+// `sFieldTypes`, `sHeapIdx`), rebuilt by `collectS`, empty when the program declares
+// unions instead. `postMonoShapes` turns true once `monomorphize` runs, so
+// `annShapeWiderRowOf` can tell a user annotation's row from an instance's re-spelling.
 export let postMonoShapes = false
 
-// D833 — IS OBJECT LITERAL `n` ONE OF THE VALUES A `??` JOINS? 1 yes, 0 no, indexed by node.
-// Computed once per program by `anonLeafJoinedMark`; the question is a two-level node scan and
-// the rungs that ask it already sit inside two more, so asking it live is quartic.
-//
-// IT IS THE POPULATION D804'S SIBLING SCAN CANNOT USE ITS OWN RULE FOR. That scan reads "every
-// literal in the program with this field-name set", skipping any a row already claims — right
-// for the merged row's MEMBER SET, wrong for deciding which literals must ABANDON a row they
-// matched. A `??` is what makes two literals ONE value, so a row holding one must hold both; a
-// same-fieldset literal with a destination of its own is not part of that value and keeps its
-// row. Reset per program in `collectS`.
+// Is object literal `n` one of the values a `??` joins? 1 yes, 0 no, indexed by node
+// (D833). Computed once per program by `anonLeafJoinedMark`, since the question is a
+// two-level scan whose callers already sit inside two more — asking it live is
+// quartic. A `??` makes two literals one value, so a row holding one must hold both.
 export let anonLeafJoined: i32[] = []
 
-// D833 — THE ROW THAT CLAIMED `n`'s `??` FAMILY before any anonymous row was minted, or -1.
-// Recorded per member by `anonLeafJoinedMark`, off a table snapshot taken before the mint loop
-// so it cannot drift as that loop appends rows.
-//
-// IT IS WHAT GROUPS FAMILIES THAT MUST SHARE A ROW AND SEPARATES THOSE THAT MUST NOT, and both
-// halves are measured. Two `??`s over one field set whose maps have the same value NAME key the
-// SAME mv slot, so they must land on ONE row — five such families minted eight rows before this
-// grouped them, and reading a member back through the wrong row's tag layout printed `null` for
-// a string. Two `??`s over one field set claimed by DIFFERENT rows are two values that must stay
-// apart — `tests/cases/types/atom-vs-plain-field-twin-rows.vl` holds a `{f: boolean}` map beside
-// a `{f: K0}` one, and merging their literals is a byte change to a program that already ran.
+// D833 — the row that claimed `n`'s `??` family before any anonymous row is minted, or
+// -1, recorded per member off a snapshot taken before the mint loop so it cannot drift
+// as that loop appends rows. Groups families that must share a row (two `??`s over one
+// field set with the same map value name) and keeps apart ones two different rows claim.
 export let anonLeafFamRow: i32[] = []
 
-// D872 — THE `??` LEFT OPERAND'S OWN DECLARED TYPE NODE, per family member, or -1: the
-// annotation on the binding it reads, or the RETURN annotation of the function it calls,
-// stamped by `anonLeafJoinedMark` beside `anonLeafFamRow`.
-//
-// IT IS THE HALF OF THE FAMILY THAT IS NOT A LITERAL, and two rows need it. `let a: {r:
-// i32} | null = null` … `a ?? {r: null}` has NO second literal at all — its other atom
-// exists only here (D872); and where a SECOND same-fieldset row exists the cell resolves
-// to it rather than to the one `structIndexOfObj` named, so the supersede must be recorded
-// against this row too (D873). NOT A WIDENING INTO A TYPE QUESTION: it is the declared
-// type of the `??`'s OWN LEFT OPERAND, not of any same-fieldset destination (the direction
-// the `d841`/`d842` hazard cells punish). That operand's static type IS one of the two
-// things the coalesce joins — D804's argument for the two literals. Reset in `collectS`.
+// D872 — the `??` left operand's own declared type node, per family member, or -1: the
+// annotation on the binding it reads, or the return annotation of the function it
+// calls. The half of the family that is not a literal: `a ?? {r: null}` over `let a:
+// {r: i32} | null = null` has no second literal at all, so its other atom exists only here.
 export let anonLeafAnnTy: i32[] = []
 
-// D871 — 1 FOR EVERY `FuncDecl` NODE WHOSE RETURNED LITERALS A `??` FAMILY TOOK AS MEMBERS.
-// Written by `anonLeafJoinCallee`, read by the four return-row resolvers as the gate on their
-// `anonLeafSupersedeOf` redirect.
-//
-// IT IS THE GATE, NOT AN OPTIMISATION, and a `runs`-losing witness is why. The row a merge
-// supersedes is a FIELD-SET row, so EVERY function returning that shape resolves to it —
-// including one whose returns the reader could not name and therefore did not move.
-// `function srcv(): {r: i32} | null { const v = { r: 7 }; v }` beside an unrelated `??` over
-// `{r: i32}` runs today and became CHECK-CLEAN INVALID WASM: its result valtype followed the
-// merge while the literal `v` holds stayed at the narrow row. Marking the callees the reader
-// actually read makes the redirect exactly as wide as the mint. Reset per program in `collectS`.
+// D871 — 1 for every `FuncDecl` node whose returned literals a `??` family took as
+// members. Written by `anonLeafJoinCallee`, read by the return-row resolvers as the
+// gate on their `anonLeafSupersedeOf` redirect — a gate, not an optimisation, since a
+// merge's row is a field-set row every function returning that shape resolves to.
 export let anonLeafRetMoved: i32[] = []
 
-// D891 — 1 FOR EVERY `Param` NODE WHOSE SLOT A `??` FAMILY MOVED ONTO THE MERGED ROW.
-//
-// THE SEVENTH OWNER OF THE MERGED ROW, and the first that is not a literal, a cell or a
-// return. `function src(p: {r: i32}): {r: i32} | null { p }` hands back its PARAMETER: the
-// literals reaching the family are the ARGUMENTS at every call site, and moving them
-// without moving the parameter's own slot is the same disagreement one position over — the
-// callee's `local.get 0` is `(ref $narrow)` under a `(result (ref null $merged))`. The slot
-// comes from the ANNOTATION (`paramStructIdxOf` → `annValtypeSlotOf`).
-//
-// A PER-PARAM MARK AND NOT A ROW REDIRECT, for `anonLeafRetMoved`'s reason exactly: the
-// superseded row is a FIELD-SET row, so redirecting at `paramStructIdxOf` ungated would
-// move EVERY `{r: i32}` parameter in the program. Written at COMMIT; reset in `collectS`.
+// D891 — 1 for every `Param` node whose slot a `??` family moved onto the merged row:
+// a returned parameter's literals reach the family through call-site arguments, so its
+// own slot must move too, or the callee's `local.get` disagrees with the merged result
+// type. A per-param mark, not a row redirect, which would move every same-shape param.
 export let anonLeafParamMoved: i32[] = []
 
-// D940 — FOR A CLOSURE-TYPED `Param` NODE WHOSE SLOT ONLY EVER RECEIVES ONE FUNCTION, AND
-// THAT FUNCTION'S ROWS MOVED: that function's NAME. "" (or absent) for every other param.
-//
-// THE NINTH OWNER OF THE MERGED ROW, and the first that is not a value but a SIGNATURE.
-// `apply(cb: ({r: i32}) => {r: i32} | null)` keys its `$fnsig` off the ANNOTATION, which
-// still names the pre-merge row; `src`, whose param and return rows the merge moved, keys a
-// DIFFERENT `$fnsig`. The closure struct carries only a function index, so `call_indirect`
-// checks the moved callee against the un-moved functype and TRAPS with `indirect call type
-// mismatch` — `vl check` clean, module valid. A PER-PARAM MARK, not a rewrite of the key,
-// for `anonLeafParamMoved`'s reason: the annotation names a FIELD-SET row, so superseding
-// it wherever it appears would move every `({r: i32}) => …` parameter, including one whose
-// slot receives a function nothing moved. Written by `anonLeafCloSlotMark`; reset in `collectS`.
+// D940 — for a closure-typed `Param` node whose slot only ever receives one function
+// whose rows moved: that function's name, else `""`. A `$fnsig` keys off the
+// annotation, which still names the pre-merge row, so a moved callee's `call_indirect`
+// traps against the un-moved functype — a per-param mark, not a rewrite of the shared key.
 export let anonLeafCloSlotFn: string[] = []
-// D1090 — THE TENTH OWNER: the same signature, at a BINDING instead of a parameter.
-// `const lb: ({r: i32}) => {r: i32} | null = src` keys its call off the ANNOTATION exactly as
-// a parameter does, so a `??` merge that moved `src`'s rows leaves `lb(…)` signature-checking
-// the moved callee against the un-moved functype — `wasm trap: indirect call type mismatch`,
-// module valid, `vl check` clean. The UN-annotated spelling of the same binding runs, which is
-// how the two were told apart.
-//
-// TWO PARALLEL COLUMNS keyed by BINDING NAME rather than by node: the resolver that fills
-// them (`anonLeafFnValueTarget`) is itself name-keyed module-wide, so a node key would claim a
-// precision the answer does not have — and where two bindings of one name disagree that
-// resolver already answers "" and nothing is recorded. Written by `anonLeafCloBindMark`
-// alongside `anonLeafCloSlotMark`; read by `calleeCloSigKey`. Reset per program in `collectS`.
+// D1090 — the same signature-trap as the closure-slot case, at a binding instead of a
+// parameter: `const lb: (...) => ... = src` keys its call off the annotation too, so a
+// merge that moves `src`'s rows leaves `lb(...)` trapping against the un-moved
+// functype. Keyed by binding name, since the resolver that fills it is itself name-keyed module-wide.
 export let anonLeafCloBindName: string[] = []
 export let anonLeafCloBindFn: string[] = []
 
-// D833 — THE MERGED ROW THAT SUPERSEDES A NARROW ONE AS A MAP'S VALUE, by struct-table index,
-// or -1 for every row. Read at exactly one site: the mv slot's struct column
-// (`mvShapeOfValNameArmTy`'s `vsi`).
-//
-// MINTING THE MERGED ROW IS NOT THE WHOLE FIX AND THIS IS THE HALF THAT WAS MISSING. The
-// literals are delivered through the map's value SLOT, and that slot resolves its struct row by
-// rendering the checker's inferred value type (`{r: i32}`) and looking the render up — which,
-// with `type R = { r: i32 }` in scope, names `R` exactly. The vals array is then emitted over
-// `R` and the merged literal cannot be stored into it. The grid splits on this: D833's `_str`
-// half (a competing `{r: string}`) closes without it, because that render does not name the i32
-// value type; the `_i32` half is nothing but it. Reset per program in `collectS`.
+// D833 — the merged row that supersedes a narrow one as a map's value, by struct-table
+// index, or -1. Read at the mv slot's struct column. Minting the merged row alone is
+// not enough: the map's value slot resolves its struct row by rendering the checker's
+// inferred type and looking the render up, which still names the narrow row's own type.
 export let anonLeafSupersede: i32[] = []
 
-// D882 — IS THE MINT OVER? False through the whole pass table, true from `emitModule` on.
-//
-// IT IS A PHASE BOUNDARY AND NOT AN OPTIMISATION. `anonLeafJoinRowOf` redirects a `??`-joined
-// literal onto the merged row at `structIndexOfObjCtx`, the one resolver every reader of a
-// literal's row goes through — including `collectAnonShapes`' OWN mint loop, which needs the
-// pre-merge answer to decide what to mint and against which row to record the supersede. So the
-// redirect is armed exactly where no pass can still be minting: after the last pass row, before
-// the first section. Reset per program in `emitProgram`, beside `postMonoShapes`.
+// D882 — is the mint over? False through the whole pass table, true from `emitModule`
+// on — a phase boundary, not an optimisation. `anonLeafJoinRowOf` redirects every
+// `??`-joined literal onto the merged row, including inside `collectAnonShapes`'s own
+// mint loop, which still needs the pre-merge answer to decide what to mint.
 export let anonLeafEmitPhase = false
 
 export let sDeclared = false
@@ -973,72 +609,40 @@ export let sFieldTypes: i32[] = []
 // table key into `rlElemName`); "" for any non-ref-list field. Lets a field store/load /
 // empty-`[]` field-assign resolve the field's distinct ref-list slot.
 export let sFieldElemName: string[] = []
-// Parallel to `sFieldTypes`: the `$fnsig` KEY of a CLOSURE field (code 14), "" for every
-// other code and for a spelling whose signature does not resolve (an alias name reaching a
-// recorder that has only the raw text).
-//
-// IT IS THE HALF OF A CLOSURE FIELD'S TYPE THE ROW OTHERWISE DROPS. `sFieldTypes` records
-// only that the field IS a closure and `sFieldElemName` is "" for it, so `{f: () => string}`
-// and `{f: () => i32}` were indistinguishable to `annShapeIndexOf`: the second annotation
-// deduped onto the first's row, its own spelling resolved no row at all, and the parameter's
-// valtype became `emitProgram: ref valtype with no interned shape` — a loud reject on a
-// program `vl check` accepts. A KEY, NOT THE TEXT, deliberately: two closure fields whose
-// signatures share a rep spine ARE interchangeable in a row (one uniform `(ref $cloStruct)`
-// valtype), so keying on `cloNameSigKey` splits exactly the rows that must not share.
+// Parallel to `sFieldTypes`: the `$fnsig` key of a closure field (code 14), `""` for
+// every other code or an unresolvable spelling. `sFieldTypes` only says the field is a
+// closure, so `{f: () => string}` and `{f: () => i32}` dedupe onto one indistinguishable
+// row. A key, not the text: two signatures sharing a rep spine may share a row.
 export let sFieldCloSig: string[] = []
-// ARENA-INDEX SIDECAR (see the header) parallel to `sFieldElemName`, recorded by
-// `recordSFieldElemRow` — destringify phase D5. `sFieldElemName` is the INPUT to
-// every slot resolver the field layer consults (`rlSlotByName`, `structIndexByName`,
-// `mvSlotOfValNameFind`), so the name column cannot retire while it is the only way
-// to ask "which slot does this field's element type use?"; this is the arena answer.
+// Arena-index sidecar parallel to `sFieldElemName`, recorded by `recordSFieldElemRow`
+// (destringify phase D5). `sFieldElemName` is the input to every slot resolver the
+// field layer consults, so the name column cannot retire while it is the only way to
+// ask which slot a field's element type uses — this is the arena answer.
 export let sFieldElemTyIx: i32[] = []
-// THE FIELD ROW'S KEY COLUMN (B6b), parallel to `sFieldElemName`: 1 when this field's
-// type is an i32-KEYED map (`{[i32]: V}`, or its `| null` twin), 0 otherwise.
-//
-// A map field records only its VALUE — `sFieldElemName` holds `V`, the sidecar above
-// holds V's arena type — and an mv slot's identity is the (KEY, VALUE) PAIR (see
-// `mvKeyI32`), so without this column an i32-keyed map field resolves its STRING-keyed
-// twin's map struct: a string-ref keys list read as an i32 list, invalid wasm that
-// `vl check` cannot see. That is why the position was a loud reject until this column
-// existed. Written by `recordSFieldElemRow` — the SAME recorder that writes the arena
-// sidecar, so the two columns cannot skew (a parallel-array skew is the failure class
-// this rep's tables are most fragile to); read through `sFieldElemKeyI32At`.
+// The field row's key column (B6b), parallel to `sFieldElemName`: 1 when this field's
+// type is an i32-keyed map (`{[i32]: V}`, or its `| null` twin), 0 otherwise. A map
+// field records only its value, and an mv slot's identity is the (key, value) pair, so
+// without this column an i32-keyed map field resolves its string-keyed twin's struct.
 export let sFieldElemKeyI32: i32[] = []
 export let sHeapIdx: i32[] = []
-// STRUCTURAL SLOT DEDUP — and the TWIN PATTERN the `rlTwin`/`mvTwin`/`uVarTwin` tables
-// below repeat over their own layers. VL is structurally typed: `type A = {v:i32}` and
-// `type B = {v:i32}` are THE SAME type, so they must share ONE WasmGC heap type — else a
-// `B`-value flowing to an `A`-typed slot emits an invalid `(ref $A)` vs `(ref $B)` mismatch.
-//
-// A twin column reads `twin[i] =` the REPRESENTATIVE slot for `i`'s heap type: the smallest
-// EARLIER slot with the same canonical key, or `i` itself when `i` is the first of its
-// shape. Only the heap index collapses — every slot keeps its own name entry + field table,
-// so diagnostics still read the declared name — and the type section skips a twin in
-// lock-step with the `mAssignTypeIndices` allocation that reused the earlier index. Rebuilt
-// per program alongside the heap-index column. `sTwin`'s key is `repCanonKey`, computed by
-// `buildStructTwins` (emit_rep).
+// Structural slot dedup, the twin pattern `rlTwin`/`mvTwin`/`uVarTwin` repeat: VL is
+// structurally typed, so `type A = {v:i32}` and `type B = {v:i32}` must share one
+// WasmGC heap type or a `B` value flowing to an `A` slot mismatches. `sTwin[i]` is the
+// smallest earlier slot with the same canonical key, or `i` itself when first of its shape.
 export let sTwin: i32[] = []
-// THE DECLARED SUPERTYPE column (D622), parallel to `sNames`: the struct slot whose emitted
-// field list is the LONGEST PROPER PREFIX of this slot's, or -1. Built by
-// `buildStructSupers` after `sHeapIdx`, read only by `emitTypeSection`, which turns a row
-// with a parent into WasmGC's `0x50 sub` form.
-// WHAT IT BUYS: `(type $Wide (sub $Narrow …))` makes a `(ref $Wide)` acceptable wherever a
-// `(ref $Narrow)` is — structural WIDTH subtyping, at zero runtime cost and with REFERENCE
-// IDENTITY intact, which is what rules a field-dropping copy out (VL struct values alias
-// uniformly; a copy would make this the one place `const y: T = x` stops aliasing).
-// WHY A SINGLE PARENT IS ENOUGH: wasm allows one declared supertype, a row's required
-// parents are all PREFIXES of its own canonical field list, and prefixes of one list are
-// totally ordered by length — so taking the longest and letting IT take its own chains the
-// rest. True only because the field order is canonical (`fieldNameOrder`).
+// D622 — the declared supertype column, parallel to `sNames`: the struct slot whose
+// emitted field list is the longest proper prefix of this slot's, or -1, letting
+// `emitTypeSection` write a `(sub $Narrow ...)` row so `(ref $Wide)` accepts a
+// `(ref $Narrow)` with zero-cost, identity-preserving structural width subtyping.
 export let sSuper: i32[] = []
 // True for a slot some OTHER slot declares as its supertype. A wasm type is FINAL unless it
 // is written with the `sub` form, so a parent has to be emitted non-final even when it has
 // no parent of its own — this is the column that says which.
 export let sSubbed: boolean[] = []
-// The bounds-guarded reads of the two columns above — the discipline every parallel-table
-// accessor in this codebase carries: an uncovered slot reads "no parent" / "not a parent",
-// which is what every site meant before the columns existed. The pre-collect window and any
-// row minted after `buildStructSupers` ran both land there.
+// The bounds-guarded reads of `sSuper`/`sSubbed` — the discipline every parallel-table
+// accessor in this codebase carries: an uncovered slot reads "no parent"/"not a
+// parent", which is what every site meant before the columns existed. The pre-collect
+// window and any row minted after `buildStructSupers` ran both land there.
 export function sSuperAt(si: i32): i32 {
   if si < 0 { return -1 }
   if si >= sSuper.length { return -1 }
@@ -1049,241 +653,130 @@ export function sSubbedAt(si: i32): boolean {
   if si >= sSubbed.length { return false }
   sSubbed[si]
 }
-// ARENA-INDEX SIDECAR (see the header) parallel to `sNames`, recorded by `recordSTyIx`
-// at the mint site where the minting node/annotation is still in scope — destringify
-// phase D0. `slotCanonId` reads `sNames[si]` and parses that string back into a type
-// (`cUserTypes` / `resolveAnnot`) before computing the structural key — the arena as a
-// resolver layered over a table of NAMES. Recording the index at the mint removes that
-// round-trip and covers the rows a name cannot resolve at ALL: the synthetic `#anon`
-// literal shapes.
+// Arena-index sidecar parallel to `sNames`, recorded by `recordSTyIx` at the mint site
+// (destringify phase D0). `slotCanonId` would otherwise parse `sNames[si]` back into a
+// type before computing the structural key; recording the index at the mint removes
+// that round-trip and covers rows a name cannot resolve at all (synthetic `#anon` shapes).
 export let sTyIx: i32[] = []
-// ── array-type table (the raw `(array (mut i32))` heap type) ──────────────────
-// A single element type — `i32` — so ALL raw i32 arrays share one WasmGC array heap type
-// `(array (mut i32))`: the BACKING store of a growable `i32[]` list (see the list-struct
-// table below) and the map's raw `live`/`index`/`hashes`/mono-`vals` arrays. It is emitted
-// whenever the program uses a string OR a list, placed in the type section right AFTER the
-// struct type (if any), so its index is `structOffset`. `aUsed` is a presence flag set by
-// `collectA`'s up-front arena scan; `aTypeIdx` is the resolved heap-type index, computed in
-// `emitModule`.
+// Array-type table: a single element type (`i32`), so all raw i32 arrays share one
+// WasmGC array heap type — the backing store of a growable `i32[]` list and the map's
+// raw `live`/`index`/`hashes`/mono-`vals` arrays. Emitted whenever the program uses a
+// string or a list, right after the struct type. `aUsed` flags it; `aTypeIdx` is the resolved index.
 export let aUsed = false
 export let aTypeIdx = 0
-// ── string-type table (`string`'s OWN heap types) ─────────────────────────────
-// A `string` VALUE is `(ref $sTypeIdx)` — a SLICE HEADER `(struct (ref $sBackIdx) i32 i32
-// (mut i32))`: 0 backing, 1 start, 2 len (BYTES of THIS view), 3 hash. `$sBackIdx` is
-// `(array (mut i8))`, the UTF-8 bytes — `s[i]` is a byte, `'é'.length == 2`, and code points
-// come from iteration. Design: `docs/guide/strings-design.md`; the migration's stages and
-// their measurements: `docs/internals/string-rep-measurements.md`.
-// `.length` is `struct.get $s 2`, NOT `array.len` — that is the backing's PHYSICAL length
-// and would read a sibling view's bytes; `s[i]` is `backing[start + i]` behind the list
-// index's `i u< len` guard; `.slice` allocates a HEADER ONLY, so a small view retains its
-// whole backing (Go's `strings.Clone` gotcha). Field 3 is a MEMO, not state — a pure
-// function of the three immutable fields. ONE PRESENCE FLAG, DELIBERATELY: both indices
-// mint from `aUsed`, which string and `i32[]` both force; forking it risks silent bad wasm.
+// String-type table: a `string` value is `(ref $sTypeIdx)`, a slice header `(struct (ref
+// $sBackIdx) i32 i32 (mut i32))` — backing, start, len (bytes of this view), a memoised
+// hash. `.length` is `struct.get $s 2`, not `array.len` (the backing's physical length,
+// which reads a sibling view's bytes); `.slice` allocates a header only, retaining its whole backing.
 export let sTypeIdx = 0
-// The string's BACKING array heap type — `(array (mut i32))` of code points, minted from the
-// same `aUsed` flag and emitted between `aTypeIdx` and the header struct. Structurally
-// identical to `aTypeIdx`, and DELIBERATELY a separate index: iso-recursive identity is
-// (rec group, POSITION), so naming the wrong one is invalid wasm rather than a silent share.
-// Every element read/write/copy under a string names THIS index; nothing that types a string
-// VALUE does.
+// The string's backing array heap type, `(array (mut i8))` holding UTF-8 byte data — minted from
+// the same `aUsed` flag, emitted between `aTypeIdx` and the header struct, and
+// deliberately a separate index from `aTypeIdx` even though structurally identical:
+// iso-recursive identity is (rec group, position), so naming the wrong one is invalid wasm.
 export let sBackIdx = 0
-// ── list-type table (the growable `i32[]` wrapper struct) ─────────────────────
-// A growable `i32[]` value lowers to a WasmGC struct `{ backing: (ref $aTypeIdx),
-// len: i32, cap: i32 }` — the `{ptr,len,cap}` triple (`docs/guide/collections-design.md`
-// §VL.1). `backing` is the raw `(array (mut i32))` above (so a grow can swap in a larger
-// one); `len` is the user-visible size (`.length`, bounds, iteration); `cap` the allocated
-// slot count. WasmGC arrays are FIXED-LENGTH, so the wrapper is what makes `.push` grow:
-// at `len == cap`, allocate a backing of `cap == 0 ? 4 : cap * 2`, `array.copy` the live
-// `len` elements in, swap in the new backing + cap, then write at `[len]` and bump `len`
-// (§VL.2). All three fields are mutable and their indices are fixed by the type-section
-// order below: backing=0, len=1, cap=2. `lUsed` is set by `collectA` whenever a list is
-// used; a list use also sets `aUsed` (the backing). `lTypeIdx` is the resolved heap-type
-// index, computed in `emitModule`.
+// List-type table: a growable `i32[]` value lowers to a WasmGC struct `{ backing: (ref
+// $aTypeIdx), len: i32, cap: i32 }`. WasmGC arrays are fixed-length, so the wrapper is
+// what makes `.push` grow: at `len == cap`, allocate a doubled backing, `array.copy` the
+// live elements in, swap it in, then write and bump `len`. Field order (0/1/2) is fixed.
 export let lUsed = false
 export let lTypeIdx = 0
-// ── ref-element list-type table (G7-ref: arrays of structs / unions) ──────────
-// A growable list whose ELEMENT is a REFERENCE — `Tok[]` (a struct ref) or `Node[]` (the
-// union box ref) — uses the SAME `{ backing, len, cap }` wrapper shape as the i32 list,
-// over a backing whose element slot is a ref: `(array (mut (ref null $elem)))`, the element
-// ref NULLABLE-WIDENED so `array.new_default` (used by grow) can default the spare slots to
-// `ref.null`. `$elem` is the struct type for a struct list, or `uBoxIdx` for a union list;
-// its heap-type index is `raTypeIdx`, the wrapper's `rlTypeIdx`.
-// A READ `xs[i]` is `array.get $raTypeIdx` then `ref.as_non_null` — slots in `[0,len)` are
-// always populated, so the cast never traps. `.push`/index-set reuse the i32-list machinery
-// over the ref backing. `rElemKind` records the element kind (`1` struct ref, `2` union
-// box); `raUsed`/`rlUsed` are `collectA`'s presence flags. Slot 0 of the per-element-type
-// table below supersedes this program-global singleton, which the two indices now alias.
+// Ref-element list-type table (G7-ref): a growable list of references (`Tok[]`,
+// `Node[]`) shares the `{ backing, len, cap }` wrapper, over a backing whose element
+// slot is `(array (mut (ref null $elem)))`, nullable-widened so grow's default can fill
+// spare slots. A read is `array.get` then `ref.as_non_null`, safe since `[0,len)` is always populated.
 export let raUsed = false
 export let rlUsed = false
 export let raTypeIdx = 0
 export let rlTypeIdx = 0
 export let rElemKind = 0
-// ── per-element-type ref-list table (MULTIPLE distinct ref lists program-wide) ─
-// `parser.vl`'s `Parser` holds THREE distinct ref-list element types at once —
-// `toks: Tok[]`, `nodes: Node[]`, `diags: Diag[]` — so a single program-global
-// `raTypeIdx`/`rlTypeIdx`/`rElemKind` is not enough. This flat table interns a
-// backing array + list wrapper heap type PER DISTINCT element type, keyed by the
-// element type-NAME (a declared struct name, or the union alias name). `collectA`
-// fills `rlElemName` with the distinct names; `emitModule` resolves the parallel
-// heap indices (`rlElemHeap` = the struct's heap idx / `uBoxIdx`; `rlBackIdx` =
-// its `(array (mut (ref null $elem)))` backing; `rlWrapIdx` = its `{backing,len,
-// cap}` wrapper). `rlElemKind[s]` is `1` (struct element) or `2` (union box).
-// Every site that assumed the singletons resolves a SLOT from the receiver's
-// element type-name (`refListSlotOfExpr`) and consults the table at that slot.
+// Per-element-type ref-list table: a program using several distinct ref-list element
+// types (`Tok[]`, `Node[]`, `Diag[]`) needs more than the one program-global singleton
+// (`raTypeIdx`/`rlTypeIdx`), so this flat table interns a backing+wrapper pair per
+// distinct element type-name, filled by `collectA`. Every site resolves a slot from the receiver's element name, not the singleton.
 export let rlElemName: string[] = []
-// Per ref-list slot: the element's REP identity — the destringify-D2 slot discriminant.
-// Two slots share a wrapper heap type iff their `rlElemKey` matches; `rlInternName` dedups
-// on it and `rlSlotByName` scans it, replacing the string-surgery canonical-name key.
-// Parallel to `rlElemName` (which survives only for the downstream heap/struct/map name
-// resolvers — diagnostic + nominal, not a slot key).
-//
-// STEP 3 OF THE REP-COLUMN REWRITE MADE IT AN `i32[]`. The column held `repElemKey`, a
-// RENDERED string; it now holds the hash-consed structural id `repElemIdOfNameTy` answers.
-// Its only use was ever equality, and the identity is proven to partition exactly as the
-// spelling did — so the type changed and no consumer did.
+// Per ref-list slot: the element's rep identity (destringify D2), the hash-consed
+// structural id `repElemIdOfNameTy` answers. Two slots share a wrapper heap type iff
+// their `rlElemKey` matches; `rlInternName` dedups on it and `rlSlotByName` scans it.
+// Parallel to `rlElemName`, which survives only for downstream diagnostic/nominal name resolvers.
 export let rlElemKey: i32[] = []
-// ARENA-INDEX SIDECAR (see the header) per ref-list slot, recorded by `rlInternName`
-// from the STORED spelling — the one every reader sees. Destringify D5-final: the
-// structural input the `rlElemName` READERS use instead of re-deriving structure by
-// string surgery on the rendering (`nullablePartOf` = is it nullable, `refArrElemName`
-// = its array element, `structIdxOfElemName` = its struct row). -1 also covers a
-// spelling that resolves through neither the nominal (`cUserTypes`) nor the annotation
-// (`resolveAnnot`) path. Its name column resets in `collectA`, which runs THIRD.
+// Arena-index sidecar per ref-list slot, recorded by `rlInternName` from the stored
+// spelling (destringify D5-final): the structural input `rlElemName` readers
+// (`nullablePartOf`, `refArrElemName`, `structIdxOfElemName`) use instead of re-deriving
+// structure by string surgery. -1 also covers a spelling neither the nominal nor the annotation path resolves.
 export let rlElemTyIx: i32[] = []
-// Per TYPE-ANNOTATION NODE (a `TypeRef` arena index): the ref-list ROW the node's
-// ref-array spelling interned, or -1 when the node is not a ref-array annotation /
-// was never interned. Recorded by the ONE pass that already resolves an annotation's
-// element name into the table (`collectA`'s ref-array arm, plus the two annotation
-// SYNTHESIS sites that postdate it), so the annotation-node consumers read the row
-// instead of re-deriving it from the rendered name. Parallel `annRlNul` carries the
-// spelling's `| null` tri-state (`1` nullable ref array, `0` bare, -1 uncovered),
-// the same distinction `annTyNulFlag` reads off the arena. Node indices are stable
-// for a program but the ROWS are not, so both columns share the sidecar lifetime.
+// Per type-annotation node: the ref-list row the node's ref-array spelling interned,
+// or -1 when not a ref-array annotation. Recorded by `collectA`'s ref-array arm so
+// annotation-node consumers read the row instead of re-deriving it from the rendered
+// name. `annRlNul` parallels it with the `| null` tri-state (1 nullable, 0 bare, -1 uncovered).
 export let annRlSlot: i32[] = []
 export let annRlNul: i32[] = []
-// Per ARRAY-LITERAL NODE: the element type-NAME the literal's FIRST ELEMENT has already
-// COMMITTED to, or "" where nothing did (D163). The checker's recorded element type is a
-// STRUCTURAL shape and `shapeNominalOfTy` resolves it by asking the struct table before the
-// variant table — so with an exact layout twin declared, a `[c]` over a `c` pinned `Circle`
-// keys its row under `Dot` and `array.new_fixed` pushes the arm's heap into an array of the
-// twin's.
-//
-// A BANK AND NOT A RUNG, forced rather than stylistic: `arrLitElemName` is the ref-list
-// interning KEY, called once from `collectA`'s ARENA WALK (no scope) and again from
-// `wasmEmit`'s literal lowering (scope), so an answer needing `parentLetOf` would be
-// available at one site and not the other and the two would key two rows for one literal.
-// `scanArrLitCommit` resolves it ONCE, with scope; the bank shares the sidecar lifetime.
+// D163 — per array-literal node: the element type-name the literal's first element has
+// already committed to, or `""`. `shapeNominalOfTy` resolves a structural shape by
+// asking the struct table before the variant table, so an exact layout twin can key the
+// wrong row. A bank, not a rung, since `arrLitElemName` is called both with and without scope.
 export let arrLitCommitName: string[] = []
 export let rlElemHeap: i32[] = []
 export let rlBackIdx: i32[] = []
 export let rlWrapIdx: i32[] = []
-// The TWIN column (see `sTwin`) for the ref-list layer; its key is the RESOLVED ELEMENT
-// HEAP. A slot's (backing, wrapper) pair is `(array (mut (ref null $rlElemHeap)))` +
-// `{backing, len, cap}` — structurally UNIFORM across every element kind, so two slots
-// with the same `rlElemHeap` emit the identical pair. After struct dedup a `B[]` and an
-// `A[]` already resolve to the same element heap (`sHeapIdx[A] == sHeapIdx[B]`), yet each
-// interned its own wrapper type — so a `B[]` passed where an `A[]` was expected mismatched
-// the wrapper `(ref $S)`. Twins reuse the representative's `rlBackIdx`/`rlWrapIdx`; built
-// in `mAssignTypeIndices` before the ref-pair allocation.
+// The twin column (see `sTwin`) for the ref-list layer, keyed by the resolved element
+// heap: a slot's (backing, wrapper) pair is structurally uniform across every element
+// kind, so two slots with the same `rlElemHeap` must share one pair — otherwise `B[]`
+// and `A[]` sharing a struct heap still mismatch `(ref $S)` at the call boundary.
 export let rlTwin: i32[] = []
 export let rlElemKindTbl: i32[] = []
-// Per ref-list slot: `1` if the element is a NULLABLE NICHE — a `(ref null $elem)` the index read leaves
-// nullable (a `(P | null)[]` struct / `(i32[] | null)[]` list), so the caller narrows it with `e != null`.
-// `0` otherwise — INCLUDING a value-union BOX element (`(i32 | null)[]`, kind 2) whose null is a TAG inside
-// a NON-null box. The KIND decides this, not the element name (both carry `| null`), so it is recorded
-// explicitly at intern time rather than re-derived from the name string at each read/build site.
+// Per ref-list slot: `1` if the element is a nullable niche (`(ref null $elem)`, e.g. a
+// `(P | null)[]`), so the caller narrows with `e != null`; `0` otherwise, including a
+// value-union box element whose null is a tag inside a non-null box. The kind decides
+// this, not the element name (both carry `| null`), so it is recorded explicitly at intern time.
 export let rlElemNullable: i32[] = []
-// ── READ-ONLY COVARIANCE: the per-slot WRITE memo (D791) ─────────────────────
-// `rlSlotEverWritten(slot)` answers "does any list-element STORE or mutating list
-// method ANYWHERE in this program reach a list whose element rep is this slot".
-// It is the licence for the element-converting copy (`emitRefListWiden`): a copy is
-// indistinguishable from the alias exactly where nothing writes through either
-// handle, so the widening declines wherever this answers yes.
-//
-// MEMOISED PER SLOT because the scan is a full arena walk and the widening sites ask
-// the same two questions repeatedly. `rlWrSlots[i]` is the slot, `rlWrAns[i]` the
-// 0/1 answer; both cleared with the ref-list tables in `collectA`, since a slot
-// number means nothing across programs.
+// D791 — read-only covariance's per-slot write memo: `rlSlotEverWritten(slot)` answers
+// whether any list-element store or mutating method anywhere reaches this element rep.
+// It licenses the element-converting copy (`emitRefListWiden`), which declines wherever
+// this answers yes. Memoised per slot since the underlying scan is a full arena walk.
 export let rlWrSlots: i32[] = []
 export let rlWrAns: i32[] = []
-// ── string-keyed map table (G8: `{[string]: i32}` open-addressing hash map) ────
-// A `{[string]: i32}` lowers to an ordered open-addressing hash map: a 7-field WasmGC
-// struct `MAP = { keys, vals, live, index, count, size, hashes }` at `mStructIdx`. FIELD
-// ORDER AND COUNT ARE THE ABI — every accessor writes a fixed `struct.get`/`struct.set`
-// immediate, so no field may be inserted or reordered. `keys` is a growable list of STRING
-// refs (wrapper `mkListIdx` over backing `mkArrIdx`) and `vals` the existing growable i32
-// list, both INSERTION-ORDERED; `live` is a parallel raw i32 array (1 live, 0 tombstone);
-// `index` maps a hash slot to entry position + 1 (0 = empty), initial capacity 16, doubled
-// on load factor 1/2; `count` counts entries appended incl. tombstones and `size` the live
-// ones, both driving resize/compaction; `hashes` caches `keys[i]`'s FNV hash so resize and
-// compact re-place without re-hashing and the probe can gate the key compare on a mismatch.
-// Ops LINEAR-PROBE (`emitMapProbe`); a map forces `aUsed` + `lUsed` plus these three types.
+// String-keyed map table (G8): `{[string]: i32}` lowers to an ordered open-addressing
+// hash map, a 7-field struct `{ keys, vals, live, index, count, size, hashes }` at
+// `mStructIdx` — field order and count are the ABI, since every accessor writes a fixed
+// `struct.get`/`struct.set` immediate. Ops linear-probe (`emitMapProbe`); forces `aUsed`+`lUsed`.
 export let mUsed = false
 export let mkArrIdx = 0
 export let mkListIdx = 0
 export let mStructIdx = 0
-// ── i32-KEYED map table (`{[i32]: V}` — the same 7-field rep, an i32 keys list) ─
-// An i32-keyed map is the string-keyed map with ONE field re-typed: `keys` is the EXISTING
-// growable i32 list (`lTypeIdx` over `aTypeIdx`) instead of the string-ref list. Everything
-// else — `vals`/`live`/`index`/`count`/`size`/`hashes`, the ordered insertion semantics, the
-// tombstone-aware probe, resize/compact — is identical, so only the key HASH (an integer mix
-// instead of `__str_hash__`), the key COMPARE (`i32.eq`) and the keys-list type immediates
-// differ.
-// The shape vocabulary (`mapShapeOfExpr` / `mapTypeIdxOf`) grows two sentinels, DISJOINT
-// from the string-keyed ones: `-4` an i32-keyed map, `-5` an i32-keyed Set. Both are `< 0`,
-// so every VALUE-side classifier reading "slot < 0 ⇒ the mono i32/boolean value rep" stays
-// correct untaught. `mI32Used` gates the extra heap type and scratch locals; `mStructI32Idx`
-// is that struct.
+// i32-keyed map table (`{[i32]: V}`, the same 7-field rep, an i32 keys list): re-types
+// one field from the string-keyed map (`keys` becomes the i32 list over `aTypeIdx`);
+// everything else is identical, so only the key hash, key compare (`i32.eq`) and the
+// keys-list type immediates differ. `mI32Used` gates the extra heap type; `mStructI32Idx` is that struct.
 export let mI32Used = false
 export let mStructI32Idx = 0
-// `slUsed` is set by `collectA` when a `string[]` struct/union-variant field appears.
-// A `string[]` reuses the SAME string-ref list types as the map's keys list (the
-// `{ backing: (ref $mkArrIdx), len, cap }` wrapper over a `(ref null $aTypeIdx)`
-// backing) — so the keys backing + wrapper types are emitted whenever `slUsed || mUsed`,
-// while the map STRUCT (`mStructIdx`) stays gated on `mUsed` alone. `string[]` fields
-// thus need no new heap type; they share `mkArrIdx`/`mkListIdx`.
+// `slUsed` is set by `collectA` when a `string[]` field appears. It reuses the same
+// string-ref list types as the map's keys list, so the keys backing+wrapper types are
+// emitted whenever `slUsed || mUsed`, while the map struct stays gated on `mUsed` alone
+// — a `string[]` field needs no new heap type of its own.
 export let slUsed = false
-// ── ref-valued map table (per-(KEY,VALUE) map parameterization) ───────────────
-// A `{[string]: V}` whose V is a REFERENCE type cannot ride the monomorphic i32 `vals`
-// list. Each distinct ref value type interns a SLOT here carrying its OWN 7-field map
-// struct whose `vals` references the matching ref-list wrapper: V = string → the string-ref
-// list (`mkListIdx` over `mkArrIdx`, the pair the KEYS list already uses); V = a struct →
-// that element's ref list (`rlWrapIdx`/`rlBackIdx`, interned via `rlInternName`). The
-// keys/live/index/count/size/hashes fields are IDENTICAL across every map struct, so
-// probe/rehash/compact are shared. Slot `-1` is the mono i32-valued map, `-2` the Set
-// flavor, `-3` an UNSUPPORTED value type (loud at the op site), `-4`/`-5` the i32-KEYED
-// pair. THE SLOT'S IDENTITY IS THE (KEY, VALUE) PAIR, NOT THE VALUE ALONE — `keys` is the
-// string-ref list for `{[string]: V}` and the i32 list for `{[i32]: V}`, two LAYOUTS and so
-// two rows; `mvKeyI32` is that second column and every value→slot resolver takes it along.
+// Ref-valued map table (per-(key,value) parameterization): a `{[string]: V}` whose V is
+// a reference cannot ride the monomorphic i32 `vals` list, so each distinct ref value
+// type interns its own 7-field map struct. Slot `-1` is mono i32-valued, `-2` a Set, `-3`
+// unsupported, `-4`/`-5` i32-keyed; `mvKeyI32` is the second half of a slot's (key,value) identity.
 export let mvValName: string[] = [] // canonical value type-name per slot
 // The KEY half of the slot's identity: 1 when this slot's map struct has the i32 keys
 // list (`lTypeIdx` over `aTypeIdx`), 0 for the string-ref keys list. Parallel to
 // `mvValName`; read through `mvSlotKeyI32`.
 export let mvKeyI32: i32[] = []
-// ARENA-INDEX SIDECAR (see the header) parallel to `mvValName`, recorded by
-// `recordMvValTyIx` — the structural input the slot resolvers key on instead of
-// re-comparing the recorded name string.
+// Arena-index sidecar parallel to `mvValName`, recorded by `recordMvValTyIx` — the
+// structural input the slot resolvers key on instead of re-comparing the recorded name string.
 export let mvValTyIx: i32[] = []
 export let mvValKind: i32[] = []      // 3 = string value, 1 = struct value
 export let mvValStructIdx: i32[] = [] // struct TABLE index of a kind-1 value, else -1
-// The VARIANT-table row of a kind-1 value that is a declared union ARM, else -1 — the
-// half `tests/cases/maps/error-map-value-struct-in-union.vl`'s header named as missing
-// ("the mv slot's `mvValStructIdx` column has no variant half"), pushed in LOCKSTEP with
-// it so the pair is one row. The two are mutually exclusive by construction: a name in
-// `uVariants` has no `sNames` row, which is #1942's gate stated once more.
+// The variant-table row of a kind-1 value that is a declared union arm, else -1,
+// pushed in lockstep with `mvValStructIdx` so the pair is one row. The two are
+// mutually exclusive by construction: a name in `uVariants` has no `sNames` row
+// (#1942's gate stated once more).
 export let mvValVariantIdx: i32[] = []
-// The slot's ARM SIGNATURE, pushed in the same breath as the two columns above and
-// deliberately NOT the same question (D93). `mvValVariantIdx` asks "is this slot's VALUE a
-// declared arm", which every one of its readers depends on; this asks "does this slot's
-// value REACH a declared arm", strictly wider and the one the slot's IDENTITY needs. They
-// differ exactly on a kind-6 map-valued map: `{[string]: Circle}`'s value is a `TyMap` and
-// not an arm, so the variant column is -1 for it and for its layout twin `{[string]: Dot}`
-// alike — one slot, one vals element heap, and whichever inner map struct loses is stored
-// into a field typed for the other.
-//
-// A SECOND COLUMN RATHER THAN A WIDER FIRST ONE, because the first one's readers (the
-// map-store seed, the `??` default seed, the optional-chain field resolver, the kind-1 dedup
-// guard, six classifiers) all read `>= 0` as "the VALUE is an arm".
+// D93 — the slot's arm signature, deliberately not the same question as
+// `mvValVariantIdx`: that asks whether the value IS a declared arm; this asks whether
+// it REACHES one, strictly wider. A second column rather than widening the first,
+// since the first's many readers all read `>= 0` as "is an arm".
 export let mvValArmSig: i32[] = []
 export let mvRlSlot: i32[] = []     // ref-list table slot of a kind-1 vals list, else -1
 export let mvMapTypeIdx: i32[] = [] // this slot's map struct heap-type index (emitModule)
@@ -1291,17 +784,10 @@ export let mvMapTypeIdx: i32[] = [] // this slot's map struct heap-type index (e
 // `repMapValSlotsTwin` (canonical VALUE key + per-kind layout guard) and twins share
 // ONE `mvMapTypeIdx`. Built by `mAssignTypeIndices`.
 export let mvTwin: i32[] = []
-// ── WIDE-SCALAR list tables (`f64[]` Slice 4, then `i64[]` / `f32[]`) ─────────
-// Three sibling reps modeled on the i32-list pair (`aTypeIdx`/`lTypeIdx`), each a raw
-// `(array (mut T))` backing plus its `{ backing, len, cap }` growable wrapper. Element
-// reads/writes yield/consume the scalar DIRECTLY, and the push grow-quad's value +
-// backing scratch locals are typed to match. Each `*Used` flag is set by `collectA`
-// (a `T[]` annotation, a T-element literal, a T-valued map); the two indices per rep
-// are resolved in `emitModule`. Interned in the order f64 → i64 → f32, each after
-// every existing type. The `kind` column is what a local/global cell of that list
-// carries, and the scalar-list descriptor selects the rep by ELEMENT kind:
-//   f64 → cells kind 12 · i64 → cells kind 20, element kind 10 · f32 → cells kind 21,
-//   element kind 13.
+// Wide-scalar list tables (`f64[]`, `i64[]`, `f32[]`): three sibling reps modeled on
+// the i32-list pair, each a raw `(array (mut T))` backing plus its `{backing,len,cap}`
+// wrapper, element reads/writes yielding the scalar directly. Each `*Used` flag is set
+// by `collectA`; interned in order f64 -> i64 -> f32, each after every existing type.
 export let fa64Used = false
 export let fa64TypeIdx = 0
 export let fl64TypeIdx = 0
@@ -1311,47 +797,31 @@ export let il64TypeIdx = 0
 export let fa32Used = false
 export let fa32TypeIdx = 0
 export let fl32TypeIdx = 0
-// ── the PACKED byte list (`u8[]`) ─────────────────────────────────────────────
-// A FOURTH sibling of the three wide-scalar list reps above, and the first with a PACKED
-// backing: `(array (mut i8))` — storage type `0x78`, one byte per element — under the same
-// `{ backing, len, cap }` wrapper. Interned AFTER the f32 pair, so no existing type index
-// shifts and a program with no `u8[]` mints nothing.
-//
-// TWO THINGS DIFFER from the three above: the backing's element type is a packed STORAGE
-// type, so the type section writes `5e 78 01` where the f32 array writes `5e 7d 01`; and a
-// READ must be `array.get_u` (0xfb 0x0d), which zero-extends the byte into an i32.
-// `array.get` is not even VALID on a packed array — the engine rejects the module — so that
-// is a validity requirement, not a choice of signedness, and it is dispatched inside
-// `fbArrayGet` off the heap index so every element-read site gets it without an arm.
+// The packed byte list (`u8[]`): a fourth sibling of the wide-scalar reps, the first
+// with a packed backing (`(array (mut i8))`, storage type `0x78`, one byte per
+// element) under the same wrapper. A read must be `array.get_u`, which zero-extends —
+// `array.get` is not even valid on a packed array, so `fbArrayGet` dispatches it off the heap index without an arm.
 export let ba8Used = false
 export let ba8TypeIdx = 0
 export let bl8TypeIdx = 0
-// Linear-memory intrinsics (`__store_i32__` / `__load_i32__` / `__log__`): `memUsed`
-// gates the module-DEFINED memory (section 5); `memLogUsed` additionally gates the
-// synthetic in-module `__log__` decoder function. DIVERGENCE from the host (justified):
-// the host IMPORTS `imports.memory` + `imports.__log__`, but the native runner
-// (scripts/vl-host) provides neither import, so the native module defines its own
-// memory and decodes the tag/value pairs itself via the print imports — identical
-// observable stdout for every corpus `__log__` program. Both usage-gated, per the
-// header's ADDITIVE GATING convention: no memory intrinsic, no extra output.
+// Linear-memory intrinsics (`__store_i32__`/`__load_i32__`/`__log__`): `memUsed` gates
+// the module-defined memory; `memLogUsed` additionally gates the synthetic `__log__`
+// decoder. The native runner provides neither host import, so the native module
+// defines its own memory and decodes tag/value pairs via the print imports instead, for identical stdout.
 export let memUsed = false
 export let memLogUsed = false
 // The synthetic `__log__` decoder's wasm function index (the LAST index — after the
 // imports, the user functions, and the start fn), set by `emitModule`.
 export let gMemLogIdx = 0
-// ── shared runtime helpers ────────────────────────────────────────────────────
-// Module-tail helper FUNCTIONS synthesized once per module (after the start fn and
-// the `__log__` decoder, so no user function index shifts) and `call`ed from every
-// lowering site that would otherwise inline the machinery — the string FNV hash /
-// element-wise equality / concat, and the map probe / index resize. Each index is
-// assigned by `emitModule`; `-1` = not emitted. Usage-gated on the same type flags
-// as their operand types (`aUsed` strings, `mUsed` maps), per the header's ADDITIVE
-// GATING convention: a string-free program emits no helpers at all.
+// Shared runtime helpers: module-tail functions synthesized once per module (after
+// the start fn and `__log__` decoder, so no user function index shifts) and `call`ed
+// from every lowering site that would otherwise inline them — string hash, equality,
+// concat, map probe/resize. `-1` = not emitted; usage-gated on the same flags as their operand types.
 export let gHelpStrHash = -1   // (str) -> i32: masked non-negative FNV-1a hash
 export let gHelpStrEq = -1     // (a, b) -> i32: element-wise string equality (0/1)
 export let gHelpStrConcat = -1 // (a, b) -> (ref str): fresh a+b string
-// The UTF-8 codec trio (Stage 2c) — minted from the same `aUsed` flag as the string trio
-// above, and emitted immediately after it so no existing helper index moves.
+// The UTF-8 codec trio (Stage 2c) — minted from the same `aUsed` flag as
+// `gHelpStrHash`/`gHelpStrEq`/`gHelpStrConcat`, emitted immediately after them so no existing helper index moves.
 export let gHelpUtf8Dec = -1   // (back, i, end) -> i32: (width << 24) | code point
 export let gHelpUtf8Enc = -1   // (back, start, len) -> (ref str): UTF-8-encode code points
 export let gHelpUtf8CpLen = -1 // (str) -> i32: the code-point count of a view, O(n)
@@ -1362,51 +832,35 @@ export let gHelpMapProbe = -1  // (index, hashes, live, keysBack, key) -> probe 
 // into `__str_eq__`. Emitted only when `mI32Used`.
 export let gHelpMapProbeI32 = -1 // (index, hashes, live, keysBack, key) -> probe slot
 export let gHelpMapResize = -1 // (index, hashes, live, count, size) -> index'
-// The FLOAT REMAINDER intrinsic (D1586): wasm has no `f64.rem` instruction, so `a % b` over
-// floats calls this once-per-module `fmod`. Gated on `gNeedsF64Rem`, which `scanPrintUse`
-// sets — the f32 slice promotes into it and demotes out, so one helper serves both widths.
+// D1586 — the float remainder intrinsic: wasm has no `f64.rem` instruction, so `a % b`
+// over floats calls this once-per-module `fmod`, gated on `gNeedsF64Rem` (`scanPrintUse`
+// sets it; the f32 slice promotes in and demotes out, so one helper serves both widths).
 export let gHelpF64Rem = -1 // (f64, f64) -> f64: the truncated remainder, exactly
 export let gNeedsF64Rem = false
-// ── string-literal pool ───────────────────────────────────────────────────────
-// Distinct string LITERALS interned once as IMMUTABLE module globals — an
-// occurrence lowers as a `global.get`, so a literal in a loop no longer
-// re-allocates per evaluation. The pool occupies global indices
-// 0..gStrPoolTexts.length-1, BEFORE the user globals, so a const user global's
-// init constexpr may `global.get` a pool entry (a constexpr may only reference
-// a PRECEDING immutable global). `gStrPoolTexts` holds the raw lexemes in
-// first-seen arena order (deterministic per program — the fixpoint converges);
-// `gStrPoolIx` maps lexeme → pool index. Collected by `collectStrPool`; a
-// literal past the `array.new_fixed` operand cap stays inline-chunked (a
-// constexpr admits no locals).
+// String-literal pool: distinct string literals interned once as immutable module
+// globals, so an occurrence lowers as a `global.get` rather than a fresh allocation
+// per evaluation. The pool occupies global indices before the user globals, so a
+// const user global's init constexpr may reference a pool entry. Collected by `collectStrPool`.
 export let gStrPoolTexts: string[] = []
 export let gStrPoolIx: {[string]: i32} = Map()
-// The arm BLOCK nodes whose PRELUDE (every statement before the arm's tail value —
-// what a `const` inside an if-expression arm, and so a `match` payload binding in value
-// position, produces) had its locals allocated by `collectLocalsIf`. Wasm locals are
-// function-scoped and `emitLetDeclStmt` claims them off a LINEAR cursor, so the emitter
-// may only lower a prelude the collect pass walked in the SAME pre-order — an arm collect
-// never saw would take a slot belonging to some other binding. Membership is the emitter's
-// proof of that, so an unwalked prelude (an if-expression buried in another expression, or
-// a top-level global initializer, neither of which collect descends into) fails LOUDLY at
-// `emitIfArmOpen` instead of silently claiming the wrong slot. Only multi-statement arms
-// are recorded; a one-statement arm has no prelude and needs no permission.
+// The arm block nodes whose prelude (every statement before the arm's tail value) had
+// its locals allocated by `collectLocalsIf`. Wasm locals are claimed off a linear
+// cursor, so the emitter may only lower a prelude the collect pass walked in the same
+// order; membership is that proof, and an unwalked prelude fails loudly at `emitIfArmOpen` rather than claiming the wrong slot.
 export let armPreludeBlocks: i32[] = []
 // ── pending-* lowering hints (the protocol is stated in the header) ───────────
 // The kind an EMPTY `[]` literal constructs: `0` = i32 list (the default), `1` =
 // struct-ref list, `2` = union-ref list. `emitArr` consults it ONLY for an empty
 // literal — a non-empty one takes its kind from its elements.
 export let pendingListKind = 0
-// The ref-list TABLE SLOT that empty `[]` builds as: WHICH distinct element type
+// The ref-list table slot that empty `[]` builds as: which distinct element type
 // (`Tok[]` vs `Diag[]` vs `Node[]`), where `pendingListKind` says only struct-vs-union.
 // Set alongside it for kinds 1/2; defaults to slot 0.
 export let pendingListSlot = 0
-// The struct-table index an object literal MUST construct as, or `-1` for "infer from
-// fields". `emitObj` consults this to OVERRIDE the field-name match
-// (`structIndexOfObj`): a literal passed as a struct-typed call argument must be the
-// CALLEE PARAMETER's struct type, not whichever declared struct happens to match its
-// field names first — those differ when two structs share a field-name set (e.g. the
-// natural `parseExpr(p)` / `parseStmt(p)` recursive-descent shape where every
-// parser-state struct looks alike).
+// The struct-table index an object literal must construct as, or `-1` for "infer from
+// fields". `emitObj` consults this to override the field-name match: a literal passed
+// as a struct-typed argument must be the callee parameter's struct type, not
+// whichever declared struct happens to match its fields first (two structs may share a field-name set).
 export let pendingStructIdx = -1
 // The union-VARIANT table index a bare object literal must construct as a CONCRETE
 // variant struct (`(ref $(uVarHeap[vi]))`) rather than a union box, when the binding /
@@ -1417,32 +871,17 @@ export let pendingVariantIdx = -1
 // for a ref-valued map, `-2` a Set (mono rep). Consumed by `emitMapNew`, so a
 // non-constructor init cannot leak a stale slot.
 export let pendingMapSlot = -1
-// SCALAR-CONTEXT hints read by the `NumLit` lowering, each set when the context is an
-// annotated binding / global init / argument / return of that type:
-//   pendingI64  `i64.const` over `i32.const`. Slice 1 covers the literal case; nested
-//               arithmetic is Slice 2.
-//   pendingF32  `f32.const` — a float literal re-encoded at single precision, an
-//               integer literal via `i32.const` + `f32.convert_i32_s`. (Slice 5.)
-//   pendingF64  an INTEGER literal as `f64.const`, re-encoded directly. CONST-GLOBAL
-//               path only, where `const b: f64 = 5` must stay a constexpr and a
-//               convert op is NOT a valid global init; locals/returns widen through
-//               `emitExprAsF64` instead, and a float literal already lowers as
-//               `f64.const` unaided. (Slice 5.)
+// Scalar-context hints read by the `NumLit` lowering, set when the context is an
+// annotated binding/global-init/argument/return of that type:
+//   pendingI64 -> `i64.const` over `i32.const`. pendingF32 -> `f32.const` (a float
+//   re-encoded at single precision, an integer via `i32.const`+`f32.convert_i32_s`). pendingF64 -> an integer literal as `f64.const` directly, const-global path only (locals/returns widen through `emitExprAsF64` instead).
 export let pendingI64 = false
 export let pendingF32 = false
 export let pendingF64 = false
-// NULL-CONTEXT hints — what a bare `null` lowers AS, since the rep differs per target
-// type. Seeded at the binding / param-argument / `return null` / `x = null` boundary
-// (or per element, for a list-element target) and consumed by the `NullLit` emit:
-//   pendingNulBool     `boolean|null` NICHE — the sentinel `i32.const 2`, NOT a `ref.null`.
-//   pendingNulLitUnion `K | null` NICHE — `i32.const -1`, the spare sentinel below the
-//                      >= 0 atom ids, NOT a `ref.null` or the boolean sentinel 2.
-//   pendingNulString   `string | null` (kind 16) — `ref.null $sTypeIdx`, the raw string
-//                      array made nullable, NOT the struct seed.
-//   pendingNulClosure  `fn | null` (kind 19) — `ref.null $cloStruct`.
-//   pendingNulList     an `(i32[] | null)[]` element — `ref.null $lTypeIdx`.
-//   pendingNulNone     the `null` TYPE's cell (`nulnone`) — `ref.null none`, the GC bottom
-//                      and its only value. LAST: not one of the choices (D1567/D1576).
+// Null-context hints — what a bare `null` lowers as, since the rep differs per target
+// type, seeded at the binding/argument/return/assignment boundary and consumed by `NullLit`:
+//   pendingNulBool `i32.const 2` sentinel; pendingNulLitUnion `i32.const -1` sentinel;
+//   pendingNulString/pendingNulClosure/pendingNulList `ref.null` of their heap type; pendingNulNone `ref.null none`, the GC bottom (D1567).
 export let pendingNulBool = false
 export let pendingNulLitUnion = false
 export let pendingNulString = false
@@ -1454,57 +893,31 @@ export let pendingNulNone = false
 // none. The generic analogue of `pendingNulList`.
 export let pendingNulRefHeap = -1
 // Set by the `== null`/`!= null` null-check around its receiver emit so a `string |
-// null` (kind 16) ident reads as the RAW nullable ref (for `ref.is_null`) instead of
-// being recovered to a non-null string. Every OTHER read of a kind-16 binding is a
-// narrowed value use and DOES recover non-null (`ref.as_non_null`) — see the `Ident`
-// read in `emitExpr`.
+// null` (kind 16) ident reads as the raw nullable ref (for `ref.is_null`) rather than
+// being recovered to a non-null string. Every other read of a kind-16 binding recovers
+// non-null (`ref.as_non_null`) instead — see the `Ident` read in `emitExpr`.
 export let pendingRawNullRead = false
 
-// Whether the CONSUMER currently being emitted for accepts a `(ref null $aTypeIdx)` — i.e.
-// whether a `string | null` (kind 16) read must stay the RAW nullable ref rather than
-// recover itself with `ref.as_non_null`. Two contexts say yes: `pendingRawNullRead` (a null
-// TEST — `!= null`, `is "m"` — which needs the ref to reach `ref.is_null`) and
-// `pendingNulString` (a nullable-string TARGET, where recovering would `ref.as_non_null` a
-// legitimately-null value and TRAP).
-// ONE HOME, BECAUSE THE READS AND THE BLOCK TYPES MUST AGREE. Four read sites owe this
-// recovery and the `??` lowering must declare its result block type by the SAME question.
-// Spelling the conjunction at each site is how `emitCoalesce` came to ask only half of it —
-// its `string | null` arm declared `(ref $aTypeIdx)` for every BINDING consumer while the
-// default arm's read, still raw under `pendingNulString`, left a `(ref null $sTypeIdx)` in
-// it: invalid wasm with `vl check` rc 0.
+// Whether a `string | null` (kind 16) read must stay the raw nullable ref rather than
+// recover with `ref.as_non_null`. Two contexts say yes: `pendingRawNullRead` (a null
+// test needing `ref.is_null`) and `pendingNulString` (a nullable-string target, where
+// recovering would trap). One home because the reads and the `??` block type must ask the same question, or one arm leaves a raw ref where the other expects non-null.
 export function nulStrReadStaysRaw() { pendingRawNullRead || pendingNulString }
-// ── discriminated-union table (G1: struct unions + `is`-narrowing) ────────────
-// A union alias `type N = A | B | …` whose members are struct `type`s lowers to the boxed
-// tagged encoding (`docs/guide/unions.md` §boxed tagged struct): a UNION BOX `{tag: i32,
-// value: anyref}` at heap type `uBoxIdx`, plus one VARIANT STRUCT per member of that
-// member's fields in DECLARATION order. `n is A` compares `struct.get $box 0` with
-// `tagOf(A)`; a narrowed `n.f` casts `struct.get $box 1` to `(ref $A)` and reads the field.
-// `uVariants` holds the variant struct NAMES across ALL declared unions, flattened in
-// declaration order, which is ALSO the heap-type order (`uVarHeap[i]`); `uTags[i]` is the
-// i-th variant's GLOBALLY-UNIQUE tag, ranked across every variant of every union so one tag
-// compare discriminates whichever union it came from. `unNames[u]` is the u-th union's alias
-// name and its variants are the slice `uVariants[unVarStart[u] .. + unVarCount[u]]` — only
-// the union-NAME identity needs that table, since ALL unions share the one `uBoxIdx` box.
+// Discriminated-union table (G1): a union alias `type N = A | B | ...` lowers to a
+// boxed tagged encoding, a union box `{tag: i32, value: anyref}` at `uBoxIdx` plus one
+// variant struct per member. `n is A` compares `struct.get $box 0` with `tagOf(A)`; a
+// narrowed `n.f` casts `struct.get $box 1` to `(ref $A)` and reads the field.
 export let uDeclared = false
 export let unNames: string[] = []
-// The ARENA index the union row at the same position was registered FOR, or -1 where the
-// registration entry point received only a name. The union-registry twin of `sTyIx`
-// (destringify B-1 step 1): the struct registry has had this since D0, and every
-// `structIndexByName` reader that could be moved onto it was.
-//
-// -1 IS EXPECTED, NOT A BUG. `registerValueUnionName` takes a bare string and has twelve
-// callers, each passing a name computed by other name work — so a row minted through it has no
-// type to record until that path is threaded (B91 step 2). The coverage rate over the corpus is
-// the number that says whether threading it is worth doing.
+// The arena index the union row at the same position registers for, or -1 where the
+// registration entry point receives only a name (the union-registry twin of `sTyIx`,
+// destringify B-1 step 1). -1 is expected, not a bug: `registerValueUnionName` takes a
+// bare string from twelve callers, so a row minted through it has no type to record until that path threads one (B91 step 2).
 export let unTyIx: i32[] = []
-// D-UNIONKEY — the canon-minted REP KEY of the union row at the same position, or -1
-// (`docs/internals/registry-by-type-id.md` §3). `unTyIx` is an arena INDEX and not an
-// identity; `repCanonId` is an identity and the wrong one. This column is the third slice
-// beside them, on the equivalence the registry actually needs — canon's own softening,
-// with union members flattened and their ORDER preserved. Pushed at all three mint sites
-// from `canonUnionKeyOfName`, so no producer renders its own. **NOTHING READS IT YET**:
-// step 3 lands the column and proves it stable across the producers, and the readers move
-// onto it under a freeze in step 5. A row minted before the key can be obtained carries -1.
+// D-UNIONKEY — the canon-minted rep key of the union row at the same position, or -1.
+// `unTyIx` is an arena index, not an identity; `repCanonId` is an identity but the
+// wrong one. This is the third slice on the equivalence the registry needs — canon's
+// own softening, with union members flattened and order preserved — pushed at all three mint sites from `canonUnionKeyOfName`.
 export let unKey: i32[] = []
 // The DECLARATION node a union row came from, or -1 for an inline / value-union row that has no
 // declaration. A NOMINAL identity that is not a string: two `type X = …` declarations with the
@@ -1521,31 +934,17 @@ export let unVarCount: i32[] = []
 // narrowing can subtract from the complete set). For an inline union the set IS
 // the name; for a declared alias it is the joined `udVariants`.
 export let unMemberSet: string[] = []
-// D-UNION FOUNDATION (the destringify-types `unMemberSet` slice) — the ARENA member
-// TYPES of each union row, parallel to `unNames`/`unMemberSet`. Row `u`'s member type
-// indices are the contiguous slice `unMemTys[unMemTyStart[u] .. + unMemTyCount[u]]`,
-// in EXACTLY the order `splitUnionAtoms(unMemberSet[u])` yields its atoms — the union
-// box-tag scheme (`unVarStart`/`unVarCount` slicing `uVariants`, `markValueUnionAtoms`
-// minting value boxes in order) depends on member ORDER, so the recorded order is
-// authoritative and a structural iteration must never reorder it. A member whose atom
-// spelling does not resolve to an arena type records -1; `unMemTyStart[u] == -1` marks
-// a row the recorder missed entirely (pad-on-push, like `recordSTyIx`), and both make
-// the consumer fall through to its legacy member-NAME path.
+// The arena member types of each union row, parallel to `unNames`: row `u`'s member
+// type indices are the contiguous slice `unMemTys[unMemTyStart[u] .. + unMemTyCount[u]]`,
+// in exactly the order `splitUnionAtoms` yields its atoms — order is authoritative since
+// the box-tag scheme depends on it. -1 for an unresolved member or a row the recorder missed, both falling through to the legacy member-name path.
 export let unMemTyStart: i32[] = []
 export let unMemTyCount: i32[] = []
 export let unMemTys: i32[] = []
-// D-UNION SET-ADT — the union member set as a STRUCTURE, not a pipe-joined string. Three
-// more columns parallel to `unMemTys` (same `unMemTyStart`/`unMemTyCount` slicing, same
-// atom ORDER — recorded in ONE pass by `recordUnMemTys`, so no consumer ever re-splits a
-// member set to learn what its members are):
-//   · `unMemAtoms[m]` — the member's VERBATIM atom spelling. Kept because it is the
-//     member's NAME (nominal identity for a declared variant) and because rendering a set
-//     back for a name-keyed consumer must reproduce the SOURCE spelling, which the arena's
-//     structural render (`{v: i32}` where the source said `S`) would not.
-//   · `unMemAtomIds[m]` — that spelling's interned id after `peelGroupParens`, so
-//     membership and subtraction are integer work, not a string scan.
-//   · `unMemKinds[m]` — WHAT the member is: 0 `null` · 1 nominal · 2 a scalar primitive ·
-//     3 a composite · -1 unresolved. Null-membership and cardinality are KIND tests.
+// The union member set as a structure, not a pipe-joined string: three columns
+// parallel to `unMemTys`, recorded in one pass by `recordUnMemTys`. `unMemAtoms[m]` the
+// verbatim spelling; `unMemAtomIds[m]` its interned id, so membership is integer work;
+// `unMemKinds[m]` what it is (0 null, 1 nominal, 2 scalar, 3 composite, -1 unresolved).
 export let unMemAtoms: string[] = []
 export let unMemAtomIds: i32[] = []
 export let unMemKinds: i32[] = []
@@ -1553,16 +952,10 @@ export let unMemKinds: i32[] = []
 // with no arena/table content, so this table is program-INDEPENDENT and never reset.
 export let msAtomTexts: string[] = []
 export let msAtomIds: {[string]: i32} = Map()
-// The SET POOL. A member set is a SUBSET of one union row's members: `msSetRow[s]`
-// is the row, `msSetMask[s]` a bitmask over the row's members in the row's recorded
-// ORDER (bit i = member i is present) — so subtraction is `mask & ~bits`, membership
-// a bit test, cardinality a popcount, and iteration a walk in ABI order. No operation
-// can reorder anything, because the order is the row's and is never re-derived.
-// `msSetText[s]` is the set RENDERED (the kept members' verbatim spellings joined on
-// `|`) — built once per distinct set, for the name-keyed consumers a set is handed to.
-// Sets are interned per row through the chain `msRowChain[u] -> msSetNext[...]`, and
-// `msSetByText` resolves a legacy set STRING back to its set id (the bridge that lets
-// a consumer holding a string join the structural side without re-parsing it).
+// The set pool: a member set is a subset of one union row's members. `msSetRow[s]` is
+// the row, `msSetMask[s]` a bitmask over the row's members in recorded order, so
+// subtraction is `mask & ~bits`, membership a bit test, cardinality a popcount.
+// `msSetText[s]` renders the kept spellings joined on `|`; `msSetByText` resolves a legacy set string back to its id.
 export let msSetRow: i32[] = []
 export let msSetMask: i32[] = []
 export let msSetNext: i32[] = []
@@ -1570,57 +963,38 @@ export let msSetText: string[] = []
 export let msSetGen: i32[] = []
 export let msRowChain: i32[] = []
 export let msSetByText: {[string]: i32} = Map()
-// The negative half of that bridge: a set STRING the pool does not cover, stamped
-// with the generation the miss was observed in, so a consumer on the fall-through
-// path pays one map probe instead of re-scanning the row table on every call.
+// The negative half of that bridge: a set string the pool does not cover, stamped
+// with the generation the miss occurred in, so a consumer on the fall-through path
+// pays one map probe instead of re-scanning the row table on every call.
 export let msSetMiss: {[string]: i32} = Map()
-// The pool's GENERATION (method note 7 — a sidecar has a lifetime the name column it
-// parallels does not). Set ids carry `T.tys`-derived row content, so every entry is
-// stamped and a stamp mismatch reads as "uncovered": the consumer keeps its member-NAME
-// path instead of answering from a previous program's rows. Bumped at the top of
-// `emitProgram` and whenever `recordUnMemTys` observes the member columns reset.
+// The pool's generation: set ids carry `T.tys`-derived row content, so every entry is
+// stamped and a stamp mismatch reads as uncovered, keeping the consumer on its
+// member-name path instead of answering from a previous program's rows. Bumped at the
+// top of `emitProgram` and whenever `recordUnMemTys` sees the member columns reset.
 export let msGen = 1
 export let uVariants: string[] = []
-// The CLOSURE-SIGNATURE tag table: the canonical structural renders (`tyToEmitName`) of
-// the function types that have claimed a union box tag, in intern order. A bare
-// function-typed union arm tags by the SLOT its signature interns at
-// (`cloSigSlotTag`) rather than by the value-atom kind alone, because ONE union may
-// carry SEVERAL function-typed arms and a single kind-11 tag cannot separate them —
-// the same reason a ref-element array arm tags on its interned reflist slot. Reset per
-// program in `collectU`, beside `uVariants`, which is the band's base.
+// The closure-signature tag table: the canonical structural renders of function types
+// that have claimed a union box tag, in intern order. A bare function-typed union arm
+// tags by the slot its signature interns at, rather than by the value-atom kind alone,
+// since one union may carry several function-typed arms that a single kind-11 tag cannot separate.
 export let cloSigTagNames: string[] = []
 export let uTags: i32[] = []
 export let uBoxIdx = 0
-// `uVarHeap[i]` is variant `i`'s heap-type index, and `uVarTwin` is the TWIN column
-// (see `sTwin`) for the variant layer; its key is `repVariantSlotsTwin` (canonical
-// variant key + per-field storage guard). Two things collapse here: the SAME variant
-// name pushed by TWO unions (`Cat` in `Cat | Dog` and in `Cat | Bird`) and structural
-// twins (`Cat`/`Kot`). Without it each occurrence minted its own structurally identical
-// yet DISTINCT struct type inside the one rec group, so a twin flowing where the other
-// spelling was expected failed validation. Built by `mAssignTypeIndices`.
+// `uVarHeap[i]` is variant `i`'s heap-type index; `uVarTwin` is the twin column (see
+// `sTwin`) for the variant layer, collapsing the same variant name pushed by two
+// unions and structural twins (`Cat`/`Kot`) onto one heap type — without it, two
+// occurrences mint distinct rec-group types and a twin flowing where the other is expected fails validation.
 export let uVarHeap: i32[] = []
 export let uVarTwin: i32[] = []
-// The CROSS-TABLE twin column (silent-class-inventory D280): `uVarSTwin[i]` is the
-// declared STRUCT slot whose heap type variant `i` shares, or -1. `uVarTwin` closes the
-// variant table against itself and `sTwin` closes the struct table against itself; this
-// is the one seam neither covers — a union ARM and a declared struct of its exact layout
-// are the SAME type to the checker (`type Dot = {r:i32}` is accepted wherever the arm
-// `Circle = {r:i32}` is) and so must be one heap type, by the identical argument `sTwin`
-// exists for. Built by `buildVariantTwins` beside `uVarTwin`, keyed by
-// `variantStructHeapTwinAt`.
+// D280 — the cross-table twin column: `uVarSTwin[i]` is the declared struct slot
+// whose heap type variant `i` shares, or -1. `uVarTwin` closes the variant table
+// against itself and `sTwin` the struct table against itself; this is the seam
+// neither covers, since a union arm and a same-layout declared struct are one type to the checker and must share a heap type.
 export let uVarSTwin: i32[] = []
-// ── VALUE unions (`i32 | null`, `string | i32`, `boolean | i32`, `i32 | f64`) ──
-// A union whose members are scalar/string atoms boxes into the SAME `{tag, anyref}` box
-// (`uBoxIdx`) as a struct union; a SCALAR payload (i32/boolean/i64/f64/f32) is wrapped in a
-// one-field `{ rep }` VALUE BOX behind the `anyref` slot, keyed by wasm rep — boolean shares
-// the i32 box. A STRING payload is the `(ref $sTypeIdx)` header itself (already an `anyref`
-// subtype), no inner box. Atom tags are globally stable: `scalarTagOf` gives each atom KIND
-// a fixed tag ABOVE every struct-variant tag (`uVariants.length + kind`), so a value keeps
-// its identity across sub-union flow and alongside struct unions.
-// ALWAYS THE SHARED `anyref` BOX PLUS A PER-REP VALUE BOX, even where every member shares
-// one scalar rep and a payload-typed `{tag, i32}` box would do: observably identical, and it
-// reuses the single interned `uBoxIdx` machinery. The `vb*Used` flags are set when a value
-// union is registered; each used rep interns one box heap type (`vb*Idx`).
+// Value unions (`i32 | null`, `string | i32`, ...): a scalar/string-atom union boxes
+// into the same `{tag, anyref}` box as a struct union. A scalar payload is a one-field
+// value box behind the `anyref` slot, keyed by wasm rep (boolean shares the i32 box); a
+// string payload is the `(ref $sTypeIdx)` header itself, already an anyref subtype.
 export let vbI32Used = false
 export let vbI64Used = false
 export let vbF32Used = false
@@ -1629,11 +1003,10 @@ export let vbI32Idx = 0
 export let vbI64Idx = 0
 export let vbF32Idx = 0
 export let vbF64Idx = 0
-// ── flat multi-struct field table (union variant structs) ─────────────────────
-// Parallel to `uVariants`: variant struct `i` owns the field names
-// `uFieldNames[uFieldStart[i] .. uFieldStart[i] + uFieldCount[i]]`, all i32, in
-// declaration order (= wasm struct field index). A flat backing store sidesteps a
-// `string[][]` (which the codebase avoids). Built by `collectU`.
+// Flat multi-struct field table (union variant structs), parallel to `uVariants`:
+// variant struct `i` owns the field names `uFieldNames[uFieldStart[i] ..
+// + uFieldCount[i]]`, in declaration order. A flat backing store sidesteps a
+// `string[][]`, which the codebase avoids. Built by `collectU`.
 export let uFieldNames: string[] = []
 export let uFieldStart: i32[] = []
 export let uFieldCount: i32[] = []
@@ -1642,44 +1015,28 @@ export let uFieldCount: i32[] = []
 export let uFieldTypes: i32[] = []
 // Parallel to `uFieldTypes`: a ref-list variant field's element type-NAME, "" otherwise.
 export let uFieldElemName: string[] = []
-// Parallel to `uFieldTypes`: the variant field's own canonical type TEXT (`"i32"`,
-// `"boolean"`, `"{[string]:i32}"`) — the field's IDENTITY where the code column is its
-// STORAGE. The two are not the same question and one code covers several types (`i32` and
-// `boolean` are both code 0), so `variantFieldTysEq`'s same-field-names exemption reads this
-// column: two arms that merely store alike are two DIFFERENT variants and have no sound
-// tag, while two arms that name the same type are one variant the twin machinery folds.
-// VARIANT-ONLY: the struct table has no discrimination rule to key, so it records none.
+// Parallel to `uFieldTypes`: the variant field's own canonical type text (`"i32"`,
+// `"boolean"`, `"{[string]:i32}"`) — its identity, where the code column is only its
+// storage (`i32`/`boolean` share code 0). `variantFieldTysEq` reads this column: two
+// arms that merely store alike are different variants; two that name the same type are one, folded by the twin machinery.
 export let uFieldTyText: string[] = []
-// Parallel to `uFieldTypes`: the ARENA type of a variant field whose declared type is a
-// LITERAL SET (a bare `TyLit`, or a `TyUnion` whose members are all `TyLit`), and `-1` for
-// every other field — the DISCRIMINANT column (D1023).
-// WHY THE ARENA INDEX AND NOT THE RENDERED MEMBERS: `uFieldTyText` above is canon's
-// rendering and canon SOFTENS a literal set to its base — a bare `"circle"` is restored by
-// `variantFieldIdText`, but `"x" | "y"` reaches that column as the plain `string` its members
-// share, which is why two arms differing only in a multi-member set compared EQUAL and were
-// folded as layout twins. The member texts cannot be recovered from a text column either (a
-// string literal may contain any separator), so the row banks the arena index and both
-// readers ask `tyLitSetMemberLexes` on demand. TWO READERS: `variantLitDiscriminable` rules
-// a same-signature pair differing only in same-STORAGE literal fields legal, not rejected;
-// `emitIs` lowers `x is A` as the tag test AND a membership compare on each such field.
+// D1023 — the discriminant column, parallel to `uFieldTypes`: the arena type of a
+// variant field whose declared type is a literal set, else -1. `uFieldTyText` softens
+// a literal set to its base type, so two arms differing only in a multi-member set
+// compared equal and folded as layout twins without it; both readers ask `tyLitSetMemberLexes` on demand.
 export let uFieldLitTyIx: i32[] = []
 // The `sFieldElemTyIx` sidecar for VARIANT fields (destringify D5), recorded by
 // `recordUFieldElemRow`.
 export let uFieldElemTyIx: i32[] = []
-// The `sFieldElemKeyI32` KEY COLUMN for VARIANT fields (B6b) — see that column's
+// The `sFieldElemKeyI32` key column for variant fields (B6b) — see that column's
 // header for why a map field row that carries only `V` cannot resolve its map struct.
 export let uFieldElemKeyI32: i32[] = []
 export let fnUsesMap = false
 export let mapScratchBase = 0
-// The i32-KEYED map's own scratch slots, appended AFTER the string-keyed frame so no
-// existing offset moves (a program with no i32-keyed map reserves none of them). Reserved
-// when `fnUsesMap && mI32Used`:
-//   +0 keyI32  i32              — the target key (the string frame's slot 1 twin)
-//   +1 keysBk  (ref $aTypeIdx)  — grown / compacted keys backing (slot 6's twin)
-//   +2 kOut    (ref $aTypeIdx)  — `.keys()` / `for k in m` output backing
-//   +3 kSrc    (ref $aTypeIdx)  — `.keys()` / `for k in m` source keys backing
-//   +4 mapRef  (ref $mStructI32Idx) — the map value (slot 0's twin; the string frame's
-//              mono slot is typed `(ref $mStructIdx)` and cannot hold this struct)
+// The i32-keyed map's own scratch slots, appended after the string-keyed frame so no
+// existing offset moves. Reserved when `fnUsesMap && mI32Used`:
+//   +0 keyI32 i32 (target key) . +1 keysBk (ref $aTypeIdx) (keys backing) . +2/+3 kOut/kSrc
+//   (ref $aTypeIdx) (`.keys()` output/source) . +4 mapRef (ref $mStructI32Idx), typed apart from the string frame's mono slot.
 export let mapI32Base = 0
 // `m.keys()` / `for k in m` build a fresh string list of LIVE keys: a 6-slot frame —
 // outBack (ref $mkArrIdx), keysBack (ref $mkArrIdx), live (ref $aTypeIdx), then i/j/count
@@ -1691,10 +1048,9 @@ export let mapKeysBase = 0
 // (3 i32). The i32 sibling of the key-list frame.
 export let fnUsesMapVals = false
 export let mapValsBase = 0
-// `m.values()` over a REF/SCALAR-VALUED (mv-slot) map needs an OUTPUT backing of the value's
-// type — one slot per module mv slot (typed `mvValsBackOf`), the value-list dual of the
-// per-mv-slot frame. The source backing reuses the mv frame's `valsBk`, and live/i/j/count
-// the key-list frame (`fnUsesMapKeys` is set alongside). Reserved when `fnUsesMapVals`.
+// `m.values()` over a ref/scalar-valued (mv-slot) map needs an output backing of the
+// value's type, one slot per module mv slot (typed `mvValsBackOf`) — the value-list
+// dual of the per-mv-slot frame. Reserved when `fnUsesMapVals`, which also sets `fnUsesMapKeys` for the source backing and live/i/j/count it reuses.
 export let mvValsOutBase = 0
 // The base wasm-local index of the ref-valued map frames (3 typed slots per module
 // mv slot — mapRef / valsBk / valStash), reserved after every other scratch frame
@@ -1705,35 +1061,21 @@ export let fnMvBase = 0
 // the closure once so its env + code fields are read off ONE evaluation.
 export let fnUsesCallRef = false
 export let callRefSlot = 0
-// ── union-`as` propagation scratch (the ruled `as` trio, propagating form) ────────────
-// `x as T` over a UNION operand evaluates the operand ONCE, tests the box tag, early-returns
-// the whole box when it is not a `T`, and unboxes to `T` otherwise. The operand is typically a
-// CALL (`readTextFile(p) as string`), so it cannot be re-read — hence one slot holding the box
-// across the test. NON-NULL `(ref $uBoxIdx)`: it is always `local.set` before any read, which
-// wasm accepts for a non-defaultable local (the push quads rely on the same rule), and it keeps
-// the early `return` a plain `local.get` with no `ref.as_non_null` in front of it.
+// Union-`as` propagation scratch (the `as` trio's propagating form): `x as T` over a
+// union operand evaluates the operand once, tests the box tag, early-returns the whole
+// box when it is not a `T`, and unboxes otherwise — the operand is typically a call, so
+// it cannot be re-read. Non-null `(ref $uBoxIdx)`, always `local.set` before any read, which wasm accepts for a non-defaultable local.
 export let fnUsesUnionAs = false
 export let unionAsSlot = 0
-// ── numeric exact-or-fail `as` scratch (D1041 / json-design §6 q2) ────────────────────
-// A numeric cast to an INTEGER target is exact-or-fail, so the operand is TESTED before it is
-// converted — and the test reads it twice (the truncation and the compare against it). The
-// operand is typically not a re-readable place (`parse(s) as? i32`), so it is staged once, in
-// the slot for its own SOURCE rep: an f64/f32 source needs a float slot, an `i64 → i32` cast
-// an i64 one. Three slots rather than one because they are three valtypes; a module that casts
-// only `f64 → i32` still declares all three, which is the same trade `moduleHasUnionAs`'s
-// header records (an unused local, never a wrong index).
+// D1041 — numeric exact-or-fail `as` scratch: a numeric cast to an integer target
+// tests the operand before converting (truncation, then compare), reading it twice, so
+// a non-re-readable operand is staged once in the slot for its own source rep. Three
+// slots for three valtypes; a module using only one still declares all three (an unused local, never a wrong index).
 export let fnUsesNumCast = false
-// ── the MODULE-predicate memo (`moduleHasUnionAs` / `moduleHasNumCast`) ───────────────
-// Both predicates are whole-arena scans and both were asked once per EMITTED FUNCTION, so
-// the compiler compiling itself spent ~59% of its wall clock re-deriving two module-wide
-// booleans (28,755 guest samples, 2026-09-02; docs/internals/profiling-the-compiler.md).
-// The answer is module-wide by construction,
-// so it is banked: `…Seen` is the arena PREFIX already scanned, `…Hit` the answer over it.
-// Banking a PREFIX rather than a plain boolean keeps the answer exact when a pass appends
-// nodes after a call (the monomorphizer clones `AsExpr`s) — the next call scans only the
-// new tail, so every caller sees what an unmemoised scan would have seen at that moment.
-// `emitProgram` clears all four, so one instance lowering many programs (the LSP, the wasm
-// test harness) never reads the previous program's arena through a stale prefix.
+// The module-predicate memo (`moduleHasUnionAs`/`moduleHasNumCast`): both predicates
+// are whole-arena scans, so the answer is banked rather than re-derived per function.
+// `...Seen` is the arena prefix scanned, `...Hit` the answer over it — a prefix, not a
+// boolean, so a pass appending nodes stays exact; `emitProgram` clears all four so a long-lived instance never reads a stale prefix.
 export let modUnionAsSeen = 0
 export let modUnionAsHit = false
 export let modNumCastSeen = 0
@@ -1741,32 +1083,16 @@ export let modNumCastHit = false
 export let numCastF64Slot = 0
 export let numCastF32Slot = 0
 export let numCastI64Slot = 0
-// ── the literal-union atom-NARROW staging slot ───────────────────────────────────
-// A string-repped literal union reaching an ATOM-typed destination whose VALUE is not a
-// re-readable place. The narrow (`emitStrToAtom` / `emitDestStrToAtom`) is a `select` tower
-// that re-reads the value once per member, correct only for a place — a CALL re-read once
-// per member is the wrong NUMBER OF EVALUATIONS, not merely a wrong value, so the tower
-// refuses one. This slot holds the value's STRING once and the tower re-reads the slot: the
-// direct mirror of `emitAtomToStr`'s id stash, NON-NULL `(ref $sTypeIdx)` because it is
-// `local.set` before any read. ONE SLOT, TWO CLAIMANTS, reserved by two walks that ask
-// different questions: a `.push` inside a monomorphized instance takes its member set from
-// the DESTINATION and is reserved by `callPushBits`, while every OTHER destination reaches
-// the narrow through `emitExpr`'s single `pendingLitUnion` hook and is reserved by
-// `exprPopBits`, the value-position walk. Both set the same flag; one slot serves either.
+// The literal-union atom-narrow staging slot: a string-repped literal union reaching
+// an atom-typed destination whose value is not re-readable (a call) stashes the
+// value's string once, non-null `(ref $sTypeIdx)`, so the narrow's select-tower
+// re-reads the slot. One slot, two claimants — `callPushBits` and `exprPopBits` — both setting the same flag.
 export let fnUsesAtomStage = false
 export let atomStageSlot = 0
-// ── `.map` / `.filter` scratch frame (the HOF loop — Slices 3–4) ───────────────
-// A `.map`/`.filter` call lowers to an inline closure-calling loop needing: 3 shared i32
-// temporaries (`i` the loop index, `n` the source length, `j` the filter write cursor), one
-// `(ref $cloStruct)` slot holding the callback's closure (built ONCE before the loop), one
-// typed SOURCE slot per distinct receiver list type, and one typed DEST slot per distinct
-// result element kind. `mfScratchBase` is the wasm index of `i` (+1 n, +2 j, +3 clo); the
-// src/dst slots follow. `mfSrcKinds[k]` is `0` (i32 list) / `1` (f64 list) / `2` (ref list,
-// whose table slot is `mfSrcSlots[k]`); `mfDstKinds[k]` is `0` (i32 backing) / `1` (f64
-// backing). Reserved only in a function whose body holds a `.map`/`.filter` over a list
-// (`mfScan`), so no other function's frame layout moves. `MfKind`'s `"u8"` is the PACKED
-// byte list's frame kind, not a scalar VALUE kind — a `u8[]` element is an i32 above the
-// load; it exists because a slot holding a `u8[]` wrapper or backing needs the packed type.
+// `.map`/`.filter` scratch frame (the HOF loop): 3 shared i32 temporaries (`i`, `n`,
+// `j`), one closure slot built once before the loop, one typed source slot per
+// distinct receiver list type, one typed dest slot per distinct result element kind.
+// Reserved only in a function whose body holds a `.map`/`.filter` (`mfScan`).
 export type MfKind = "i32" | "f64" | "ref" | "str" | "i64" | "f32" | "u8"
 export let fnUsesMapFilter = false
 export let mfScratchBase = 0
@@ -1774,83 +1100,54 @@ export let mfSrcKinds: MfKind[] = []
 export let mfSrcSlots: i32[] = []
 export let mfSrcBases: i32[] = []
 export let mfDstKinds: MfKind[] = []
-// Parallel to `mfDstKinds`: the ref-list TABLE SLOT of a kind-2 (ref-list) dest, so its fresh
-// backing valtype is `rlBackIdx[mfDstSlots[k]]` (a `.filter` over a struct array yields the SAME
-// ref list; a struct-returning `.map` a possibly-different one). -1 for a non-ref dest kind.
+// Parallel to `mfDstKinds`: the ref-list table slot of a kind-2 (ref-list) dest, so
+// its fresh backing valtype is `rlBackIdx[mfDstSlots[k]]` (`.filter` over a struct
+// array yields the same ref list; a struct-returning `.map` a possibly different one). -1 for a non-ref dest kind.
 export let mfDstSlots: i32[] = []
 export let mfDstBases: i32[] = []
-// ── lazy list scratch frame (index bounds checks + chunked literals) ─────────
-// `xs[i]` reads/writes guard `i u< len` (the wrapper's LOGICAL length — the backing's
-// physical length is `cap`, so a raw `array.get` alone would silently read the
-// `len <= i < cap` slack). The guard stages the index and the wrapper ref here: slot 0
-// (`listIdxScratchBase`) is the shared i32 index stash; typed slot k is `base + 1 + k`, one
-// nullable ref slot per DISTINCT indexed list kind (`liKinds[k]`, with `liSlots[k]` the
-// ref-list table slot for kind "ref"). Two other users ride the same frame: a CHUNKED long
-// literal past the engines' `array.new_fixed` operand cap (`liBack[k] == 1`, a BACKING-typed
-// slot allocated FRESH per literal, never shared, so a nested chunked literal cannot clobber
-// an outer one), and an indexed STORE's element-VALUE stash (`liBack[k] == 2`, shared per
-// kind — no user code runs between its write and the `array.set`). The frame lays out AFTER
-// every eager frame, so `fbBeginFunc` fixes its base while slots are handed out lazily.
+// Lazy list scratch frame (index bounds checks + chunked literals): `xs[i]` guards
+// `i u< len` (the backing's physical length is `cap`, so a raw `array.get` alone could
+// read the slack). Slot 0 is the shared i32 index stash, one ref slot per distinct
+// indexed list kind following. Two other users ride the frame: a chunked literal past `array.new_fixed`'s cap, and an indexed store's element-value stash.
 export let listIdxScratchBase = 0
 export let liKinds: MfKind[] = []
 export let liSlots: i32[] = []
 export let liBack: i32[] = []
-// The n-ary string-concat part pool (`liBack` code 10): slot `i` holds part `i` of the
-// chain being fused, minted on demand by `strCatSlot` and reused for the rest of the
-// function. ONE pool serves every nesting depth because a nested chain finishes — its
-// parts stashed, its backing copied, its header on the stack — before the outer chain
-// writes its first slot (D-string-fusion; `emitStrCatN`).
+// The n-ary string-concat part pool (`liBack` code 10): slot `i` holds part `i` of
+// the chain being fused, minted on demand by `strCatSlot` and reused for the rest of
+// the function. One pool serves every nesting depth, since a nested chain finishes
+// before the outer chain writes its first slot (`emitStrCatN`).
 export let strCatSlotIx: i32[] = []
-// ── the CURRENT map-op context (the receiver's mv slot) ───────────────────────
-// `cmSlot` is the map SHAPE the op being lowered runs against: `-1` the mono i32
-// map (also the Set flavor, normalized by `emitMapPrep`), or an mv slot >= 0 (a
-// ref-valued map). Set by each op entry (`emitMapPrep`/`emitMapNew`/the for-in
-// walk) and RE-SET after any inner `emitExpr` (a value/default expression may
-// itself contain a map op against a different map — the inner op clobbers the
-// context). The leaf accessors below read it to pick the struct.get/set TYPE
-// immediates, the vals list/backing types, and the mapRef/valsBk/valStash locals.
+// The current map-op context (the receiver's mv slot): `cmSlot` is the map shape the
+// op being lowered runs against, `-1` the mono i32 map (also the Set flavor) or an mv
+// slot >= 0 (a ref-valued map). Set by each op entry and re-set after any inner
+// `emitExpr`, since a nested map op against a different map would clobber the context.
 export let cmSlot = -1
-// ── FuncBuilder: per-function local + scratch-frame allocation (Phase H) ──────
-// The running wasm-local cursor: set to (params + declared locals) by `fbBeginFunc`,
-// then advanced by each frame `fbReserve` hands a base out for. Every `*ScratchBase`
-// in this file comes from THIS one cursor walked in frame order, so the bases cannot
-// desync from each other; the locals vector (`fbEmitLocalsVec`) is likewise DERIVED
-// from the same `fnUses*` flags rather than separately counted. `fbBeginFunc`
-// (emit_bytes) owns the frame order — see the layout rule above `fnUsesPush`.
+// FuncBuilder: per-function local + scratch-frame allocation (Phase H). The running
+// wasm-local cursor, set to (params + declared locals) by `fbBeginFunc`, then advanced
+// by each frame `fbReserve` hands a base out for — every `*ScratchBase` in this file
+// comes from this one cursor, so the bases cannot desync (`fbBeginFunc` owns the frame order).
 export let fbScratchCur = 0
-// ── type interning (Phase G — replaces emitModule's offset arithmetic) ────────
-// The heap-type index allocator. Every type the module emits (standalone structs,
-// union variants + box, the raw i32 array, the i32-list wrapper, each ref-list
-// (backing, wrapper) pair, the string-list (backing, wrapper) pair, the map struct,
-// and the functypes) occupies one slot in the single rec group, in EMIT ORDER.
-// `mNextType` is the running counter; `mAllocType` hands out the next index. This
-// centralizes the running-sum invariant the old parallel `*Offset` formulas
-// open-coded ("a type that references a later type still goes in the one rec
-// group, so all indices are mutually visible"). Reset per program by
-// `mResetTypeIntern`, driven in declaration order by `mAssignTypeIndices`.
+// Type interning (Phase G, replacing `emitModule`'s offset arithmetic): the heap-type
+// index allocator. Every type the module emits occupies one slot in the single rec
+// group, in emit order; `mNextType` is the running counter, `mAllocType` hands out the
+// next index. Reset per program by `mResetTypeIntern`, driven by `mAssignTypeIndices`.
 export let mNextType = 0
 // Every FuncDecl type-parameter name in the program (`<T, U>` declarations),
 // gathered by `collectA`'s pre-pass. A generic original's `T`/`T[]` annotations
 // ride these names; `genTyParamArr` consults the set so `collectA` skips them.
 export let genTyParamNames: string[] = []
-// ── generic type-alias APPLICATIONS (A10 stage 3) ────────────────────────────
-// A parameterized `type Box<T> = { value: T }` declares NO concrete struct —
-// the parser folds the params into the declared name ("Box<T>"), and `collectS`
-// skips it. Each APPLICATION name used by an annotation ("Box<i32>",
-// "Pair<i32,string>", possibly behind `[]` / `|null` wrappers) interns ONE
-// struct shape with the parameter names substituted by the argument names —
-// the emitter's name-keyed mirror of the checker's `applyGenAlias`. The
-// registry is a flat table (decl base name, comma-joined params, field
-// names/type-names); applications intern depth-first so a nested
-// `Box<Pair<i32,string>>` resolves its inner application to a struct-ref field
-// (code 15).
+// Generic type-alias applications (A10 stage 3): a parameterized `type Box<T> = {
+// value: T }` declares no concrete struct, so each application name an annotation
+// uses (`Box<i32>`, possibly behind `[]`/`|null`) interns one struct shape with the
+// parameter names substituted — the emitter's mirror of the checker's `applyGenAlias`, interning depth-first so a nested application resolves to a struct-ref field.
 export let gaeBases: string[] = []
 export let gaeParams: string[] = []
 export let gaeFieldStart: i32[] = []
 export let gaeFieldCount: i32[] = []
 export let gaeFieldNames: string[] = []
 export let gaeFieldTyNames: string[] = []
-// Was `fnStmts[fe]` generic before instantiation? (frozen at pass start)
+// 1 if `fnStmts[fe]` is generic before instantiation, else 0 (frozen at pass start).
 export let monoGen: i32[] = []
 // The ORIGINAL FuncDecl arena index per pre-pass `fnStmts` slot (the slot itself
 // is overwritten by the first instance, but later shapes clone from the
