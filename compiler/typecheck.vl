@@ -102,7 +102,7 @@ import {
   tokIndexAt,
 } from "./fmt_util"
 import { sidArrGet, sidArrPut, sidOf } from "./symbols"
-import { isBinOpFuncName } from "./ast"
+import { arenaReplaceNode, isBinOpFuncName } from "./ast"
 // The extern manifest: parsed in any module, declared here, imported by the emitter.
 import {
   extDeclLink,
@@ -11758,7 +11758,7 @@ function flatMemberFold(n: Member, ix: i32) {
       )
       return 2
     }
-    P.nodes[ix] = P.nodes[mkNum(i32ToStr(v), n.pos)]
+    arenaReplaceNode(ix, mkNum(i32ToStr(v), n.pos))
     return 1
   }
   0
@@ -13389,9 +13389,82 @@ export function canonRewroteNode(ix: i32): boolean {
   false
 }
 
+// The spelling each rewrite below replaced, as a node column, a member slot and the text
+// that stood there. `driver.vl`'s parse bank writes them back, so the lint reads the names
+// the author wrote; nothing else consumes it and the next sweep clears it.
+let canonRawNode: i32[] = []
+let canonRawSlot: i32[] = []
+let canonRawText: string[] = []
+
+// The three whole-node spelling fields, as `canonRawSlot` codes; a slot >= 0 is a
+// `UnionDecl` member index.
+const CANON_SLOT_TY = -1
+const CANON_SLOT_IS = -2
+const CANON_SLOT_AS = -3
+
+function canonBankRaw(nodeIx: i32, slot: i32, raw: string) {
+  canonRawNode.push(nodeIx)
+  canonRawSlot.push(slot)
+  canonRawText.push(raw)
+  0
+}
+
+// One setter per banked field. Each takes the node the row names and answers 0 when that node
+// does not carry the kind its slot claims — impossible by construction, since a slot is minted
+// beside the write it records.
+function canonPutTyName(n: Node, raw: string) {
+  if n is TypeRef { n.tyName = raw }
+  0
+}
+
+function canonPutIsVariant(n: Node, raw: string) {
+  if n is IsExpr { n.isVariant = raw }
+  0
+}
+
+function canonPutAsTy(n: Node, raw: string) {
+  if n is AsExpr { n.asTy = raw }
+  0
+}
+
+function canonPutUdVariant(n: Node, slot: i32, raw: string) {
+  if n is UnionDecl {
+    if slot >= 0 && slot < n.udVariants.length { n.udVariants[slot] = raw }
+  }
+  0
+}
+
+// Write `raw` back into the one spelling field `slot` names on node `ix`. `ix` is
+// bounds-tested because the sweep walks nodes a later pop may have removed.
+function canonRestoreOne(ix: i32, slot: i32, raw: string) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if slot == CANON_SLOT_TY { return canonPutTyName(n, raw) }
+  if slot == CANON_SLOT_IS { return canonPutIsVariant(n, raw) }
+  if slot == CANON_SLOT_AS { return canonPutAsTy(n, raw) }
+  canonPutUdVariant(n, slot, raw)
+}
+
+// Put every rewritten spelling back, newest first so a field written more than once ends at
+// the one the parser gave it. One-shot: the bank empties, so a second call is a no-op.
+export function canonRestoreSpellings(): i32 {
+  let i = canonRawNode.length - 1
+  while i >= 0 {
+    canonRestoreOne(canonRawNode[i], canonRawSlot[i], canonRawText[i])
+    i = i - 1
+  }
+  canonRawNode = []
+  canonRawSlot = []
+  canonRawText = []
+  0
+}
+
 export function canonEmitTypeNames() {
   // Reset with `annUnionAtoms`, for the same reason: a second program on this instance
   // must not inherit the first one's node indices.
+  canonRawNode = []
+  canonRawSlot = []
+  canonRawText = []
   canonCleared = []
   canonTyIxCol = []
   annUnionAtoms = []
@@ -13418,6 +13491,7 @@ export function canonEmitTypeNames() {
         clearAnnTs(i)
         canonCleared.push(i)
         canonTyIxCol.push(nameToTy(c))
+        canonBankRaw(i, CANON_SLOT_TY, n.tyName)
         n.tyName = c
       }
       atoms = canonAtoms
@@ -13441,6 +13515,7 @@ export function canonEmitTypeNames() {
         // the member table).
         if c2 != vs[vi] {
           clearUdTs(i, vi)
+          canonBankRaw(i, vi, vs[vi])
           vs[vi] = c2
         }
         vi = vi + 1
@@ -13455,18 +13530,33 @@ export function canonEmitTypeNames() {
         const ot = T.tys[opTy]
         if ot is TyUnion {
           const gis = unionMemberGenAppShape(n.isVariant)
-          if gis != "" { n.isVariant = gis }
+          if gis != "" {
+            if gis != n.isVariant {
+              canonBankRaw(i, CANON_SLOT_IS, n.isVariant)
+            }
+            n.isVariant = gis
+          }
           const sit = singleMemberAliasTyIx(n.isVariant)
           if sit >= 0 {
             const sir = transparentMemberEmitName(sit, RC_ROOT)
-            if sir != "" { n.isVariant = sir }
+            if sir != "" {
+              if sir != n.isVariant {
+                canonBankRaw(i, CANON_SLOT_IS, n.isVariant)
+              }
+              n.isVariant = sir
+            }
           }
           // …and the application rewrite runs after the transparency render too, since the
           // member arm applies the two in that order: a member spelled `Y` for `type Y =
           // Box<i32>` lands in `uVariants` as `{v:i32}`, so the `is` test must travel the
           // same two rungs or it names `Box<i32>` against a variant table holding `{v:i32}`.
           const gis2 = unionMemberGenAppShape(n.isVariant)
-          if gis2 != "" { n.isVariant = gis2 }
+          if gis2 != "" {
+            if gis2 != n.isVariant {
+              canonBankRaw(i, CANON_SLOT_IS, n.isVariant)
+            }
+            n.isVariant = gis2
+          }
         }
       }
     } else if n is AsExpr {
@@ -13484,7 +13574,10 @@ export function canonEmitTypeNames() {
         // `n.asTy` is the author's spelling, a plain string on the node, so the atom is
         // materialized here rather than the node's field changing type.
         const ats = primNameStr(at)
-        if ats != n.asTy { n.asTy = ats }
+        if ats != n.asTy {
+          canonBankRaw(i, CANON_SLOT_AS, n.asTy)
+          n.asTy = ats
+        }
       }
     }
     annUnionAtoms.push(atoms)
@@ -16193,7 +16286,7 @@ function tplHoleHandled(
   expected: i32,
 ) {
   if isStringTy(at) {
-    P.nodes[callIx] = P.nodes[mkParen(holeIx, callPos)]
+    arenaReplaceNode(callIx, mkParen(holeIx, callPos))
     return true
   }
   if at < 0 { return false }
@@ -23797,7 +23890,7 @@ function matchArmBlockOf(bodyIx: i32, bindIx: i32) {
       j = j + 1
     }
     const spliced = mkBlock(stmts, b.pos)
-    P.nodes[bodyIx] = P.nodes[spliced]
+    arenaReplaceNode(bodyIx, spliced)
     return bodyIx
   }
   stmts.push(bodyIx)
@@ -23900,7 +23993,7 @@ function desugarMatchAt(ix: i32) {
         }
         k = k - 1
       }
-      P.nodes[ix] = P.nodes[chain]
+      arenaReplaceNode(ix, chain)
     }
   }
   0
