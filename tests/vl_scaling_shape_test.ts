@@ -13,9 +13,9 @@
 
 // THREE AXES ARE SUPER-LINEAR TODAY and carry a bar above their measured ratio rather
 // than the default. That is recorded DEBT, not tolerance: each names the function that
-// makes it so. All three are a name-keyed registry answering a lookup by linear scan —
-// the track `__str_eq__` has topped the self-compile profile since #2419 closed the arena
-// scans. `generic pins` used to be a fourth, and reading it as one of these cost a
+// makes it so. All three answer a name by linear scan — over a registry table, or over the
+// top-level statements for `unions` — which is why `__str_eq__` tops each of their
+// profiles. `generic pins` used to be a fourth, and reading it as one of these cost a
 // campaign: it was a whole-program PASS re-run once per minted instance, the #2419 shape
 // one phase over, and it left the list when that pass learned to resume. Lower a bar when
 // the thing it names stops multiplying. `unions` joined the list when a constant term left
@@ -280,22 +280,14 @@ axis(
 axis("types", 2.5, "A per-declaration cost is scaling with the type table.", (d) =>
   twoFiles(d, genTypes(2500, 1), genTypes(2500, 20)));
 
-// 1.84 / 1.84 / 1.80 / 1.78 / 1.78, against 2.39 / 2.36 / 2.34 / 2.36 / 2.41 for the same
-// pair before the union registry was sid-keyed — the many arm 0.59 s -> 0.45 s while the one
-// arm holds at 0.17 s, which is the per-union cost being what left (perf items 5 and 7, §F8).
-// The axis was hidden before that: both arms declare 801 module-level bindings, so both used
-// to pay the definite-assignment set's per-write rebuild, 41.7 s against 37.8 s at 2,400.
-// The cheap arm costs less than the shared 0.4 s floor, which would turn the quotient into
-// an absolute budget on the many arm, so this pair takes 0.25 — above a process start, below
-// its own denominator at the loads #2584 measured. The bar is 2.22x the after-median, the
-// clearance `callback slots` keeps over an almost identical reading, and it was flake-tested
-// rather than argued: 8 of 8 green at load 103 to 115 with a fanned-out gate beside it. The
-// arms are short enough that a scheduler spike doubles one — this pair drew 5.25 once in four
-// rounds at load 70 — which is what the per-side re-measure above absorbs.
+// 1.43 / 1.48 / 1.48 / 1.46 / 1.34 at load 90, median 2.28 at load 250 to 320 where the one
+// arm clears the floor and the reading becomes the raw quotient — 2.10 at the shipped size,
+// 3.11 at twice it, so the axis is still super-linear. The 0.25 floor keeps that quotient
+// from being an absolute budget on the many arm; bar 2.4x the median, 12 of 12 at load 170.
 axis(
   "unions",
-  4.0,
-  "A per-union cost is scaling with the union registry.",
+  3.5,
+  "`isDeclaredStructName` (compiler/emit_base.vl) scans the top-level statements once per union arm.",
   (d) => twoFiles(d, genUnions(800, 1), genUnions(800, 20)),
   0.25,
 );

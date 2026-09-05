@@ -86,7 +86,7 @@ while the ambient `pending*` write count went **311 → 330** (§8).
 
 | # | finding | evidence | size | risk | proof |
 |---|---|---|---|---|---|
-| 1 | `buildVariantTwins` rebuilds `variantSig` for both operands of every pair in an O(n²) scan; `variantSig(i)` is loop-invariant and `variantSig(d)` is a pure function of tables the loop never writes (§2) | **30.34% self** of a 3,200-union compile, **99.7%** of it from that one loop; the axis reads **3.86 / bar 4.0** at 1,600 unions — **re-graded on the merged tree at 27.62% and 3.88** (§0) | XS | none | byte-identical seed; `regress.py`; the `unions` axis ratio |
+| 1 | `buildVariantTwins` rebuilds `variantSig` for both operands of every pair in an O(n²) scan; `variantSig(i)` is loop-invariant and `variantSig(d)` is a pure function of tables the loop never writes (§2) | **30.34% self** of a 3,200-union compile, **99.7%** of it from that one loop; the axis reads **3.86 / bar 4.0** at 1,600 unions — **re-graded on the merged tree at 27.62% and 3.88** (§0) | XS | none | byte-identical seed; `regress.py`; the `unions` axis ratio — **landed** (§2.4) |
 | 2 | The env-parameter ABI is module-wide: one function value gives **every** function a `structref` param and **every** direct call a `ref.null none` — #2609 named this as "where the next slice is" and it is unsized (§4) | **+82,534 B (+3.83%)** on the compiler, independently reproducing #2609's +82,151; only **24.2%** of functions in the 611 paying `tests/cases` modules are address-taken, so three in four could keep the plain ABI | L | high | `matrix.py`, `regress.py`, corpus byte identity, an owner ruling on the ABI split |
 | 3 | Seven `expr*Array` classifiers each ask `unionIdentReadKind` independently, and each re-interns the identifier's sid (§5.2) | `unionIdentReadKind` **21.12% inclusive** on the `functions` axis; `sidOfNode` 5.90% self, half of it under `unionNameOfIdentSid` | M | med | byte-identical seed; corpus `cmp` |
 | 4 | The rep-key renderer is written five times: three `*KeyGo` bodies at 110/115/98 lines and 85–98% pairwise, three 33-line entry points at 100%, while `repElemIdGo(ty, mv)` already proves the merge (§5.1) | script-measured token similarity; `repCanonId`/`repElemId`/`repMvValId` are identical after normalisation | M | med | byte-identical seed; `rep-fuzz-check.sh` |
@@ -188,6 +188,15 @@ Step 2 is the one to land first: it is a memo of a pure function whose inputs �
 (`refresh-compiler.sh` + `cmp`); `regress.py` 0 `runs → not-runs`; the `unions` axis ratio, and
 if it falls clear the bar should fall with it — the comment above it needs rewriting either
 way, per §2.2.
+
+### 2.4 Landed
+
+Steps 1 and 2, as a column stamped on the lengths of `uFieldNames` / `uFieldStart` /
+`uFieldCount` and dropped in `collectU`. Re-graded on `a16b9cb2b` + the change: `variantSig`
+self **24.38 → 1.62%** at 1,600 and **26.39 → 1.28%** at 3,200, `buildVariantTwins`
+inclusive **27.64 → 5.33%** and **29.13 → 5.62%**. The axis reads **1.46** against 1.78 and
+the bar drops **4.0 → 3.5**; its note now names `isDeclaredStructName` (**21.83%
+inclusive**), which is the next term. Numbers and their commands: the `CHANGELOG.md` entry.
 
 ---
 
