@@ -357,13 +357,40 @@ Attribution of the reach: **94.6% of `nodeChildren`'s samples come from one call
 `dsScopeWalk` (`emit_classify.vl:27502`), with `alcWalk` 2.4%, `dstPinSynthWalk` 2.0% and
 `strAccWalk` 1.0%. So the fix has two independent halves and two owners.
 
-* **`ast.vl` owns the per-node cost**: hoist the tag once and dispatch on it (a `match n { … }`
-  gives the emitter one shape and the ladder lint one entry), and return without allocating for
-  a childless kind. An early exit for the 45.5% takes the mean from 17 steps toward ~7 and
-  removes the same fraction of allocations.
-* **`emit_classify.vl` owns the reach**: `dsScopeWalk` is an unmemoised whole-subtree search
-  for a destination slot by name, re-run per query — the shape `profiling-the-compiler.md`
-  records twice (#2419, D1514). That half is the emitter survey's.
+* **`ast.vl` owns the per-node cost.** DONE, 2026-09-04: arms in descending kind frequency,
+  each returning; a childless kind falls out of the end onto one shared empty list, a
+  fixed-arity kind is an exact-size array literal, and `Block`/`Program`/`ArrayLit`/`ObjLit`/
+  `TypeDecl` return the node's own list. `nodeChildren` self **8.16% → 3.51%** with the
+  byte-identity proofs below.
+* **The tag CANNOT be hoisted in VL source, and the ladder was not the cost.** `match`
+  desugars to the same `if`/`else if` chain (`typecheck.vl desugarMatchAt`), so a `match n { … }`
+  emits the same 25 `struct.get $60 0` loads; and reordering plus the shared empty list ALONE
+  measured a 6,215 → 5,819-sample profile with `nodeChildren` self UNMOVED at 507 → 515
+  absolute samples. What moved it was the allocation traffic: a VL list starts at capacity 0,
+  so a two-child `BinExpr` cost `struct.new` + `array.new_fixed 0` + `array.new_default 4` +
+  `array.copy` before its first `array.set`.
+* **`emit_classify.vl` owns the reach, and a MEMO is not what removes it** (measured
+  2026-09-04, an instrumented compiler never used as a seed, validated against a control that
+  must make it count — `calls=0` on `print(6 * 7)`, `calls=6 walks=6` on a program with a
+  destination-typed list binding). On the compiler's own source: **16,195 `letRefListDestSlotK`
+  calls, 32 of which reach the scoped walk, 12,218,274 arena node visits between them, and
+  16,194 distinct `(letIx, want)` keys with ONE repeat.** 29 of the 32 walks start at the
+  `Program` node with the identical `(root, fnIx = -1, want = 2)`, differ only in the NAME,
+  visit all **421,292** nodes and answer **-1** — they are the module-scope lookup tables
+  (`klNode`, `klTokKind`, `asPasses`, …), each searching the whole arena for a union-box
+  destination that is not there. So `dsScopeWalk` is not "re-run per query": a
+  `(letIx, fnIx, want)` memo skips **0 of the 32 walks and 0 of the 12.2M visits**. Over the
+  2,403 gradeable `tests/cases` fixtures the same memo skips 244 of 529 walks and 45,530 of
+  183,331 visits — a quarter of a population two orders of magnitude smaller than ONE
+  self-compile, so it buys nothing measurable and costs a per-program table.
+* **What removes the 12.2M is an INDEX over `(root, fnIx, want)`**, answering every name from
+  one pass — D1514's shape, and the reason this row's prescription was wrong is D1514's own
+  lesson one level out. Its blocker is named rather than guessed: every one of
+  `dsDestSlotAt`'s seven forms is invertible (each reads its name off an `Ident` in a fixed
+  slot), but inverting the `Call` form calls `fnParamKindListSlot` — itself a whole-arena scan
+  — once per `Ident` argument at every `Call` node, which is a larger cost than the walk it
+  replaces. Closing it needs `fnParamKindListSlot`, `destLetOf`/`globalLetOf` and
+  `rlSlotByName` to be O(1) first, which is a campaign, not a commit.
 
 Size M. Risk low (the function is pure over the arena). Proof: the emitted module for every
 `tests/cases` program byte-identical, `regress.py` 0 `runs → not-runs`, `--prove-fixpoint`, and
