@@ -9,9 +9,9 @@ walked from the ROOT down and charged to the first frame naming a phase entry po
 so a phase's number is inclusive of everything it calls and the phases partition the
 run. That is what separates the per-module half of a check (scan, lex, parse, rename)
 from the merged half (`checkProgram` over every module's statements at once) — the
-split item #9 turns on. `vl check` cannot be profiled (the guest profiler hooks
-`compile_vl`, which `check` does not take), so profile a `build` and read the
-check-side column: every phase but `emitProgram` is shared with a check.
+split item #9 turns on. Profile the command you mean: every entry the host drives
+takes `$VL_PROFILE_GUEST`, so a `vl check` profile reports the check's own phases
+(`lintGraph` included) rather than a `build`'s check-side column.
 """
 import collections
 import json
@@ -35,6 +35,7 @@ PHASES = [
     ("5 checkProgram (MERGED)", {"checkProgram"}),
     ("5 jwSecondPass (MERGED)", {"jwSecondPass"}),
     ("6 emitProgram (MERGED, build only)", {"emitProgram"}),
+    ("7 lintGraph (check only)", {"lintGraph", "lintSrc"}),
 ]
 NAME_TO_PHASE = {n: label for label, names in PHASES for n in names}
 UNCLAIMED = "(outside every named phase)"
