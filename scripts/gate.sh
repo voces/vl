@@ -43,12 +43,17 @@ if [ "${1:-}" != "--no-build" ]; then
 fi
 
 NAMES=(); PIDS=(); STARTS=()
-# The TIME column is each gate's OWN wall time, which is why the subshell stamps its
-# finish into `$LOGS/<i>.t`. The report loop `wait`s in index order and a job that already
-# exited returns from `wait` instantly, so an elapsed computed there is the loop's clock,
-# not the gate's — 19 of 21 rows read the same number. No stamp falls back to that reading.
+# WALL is each gate's OWN elapsed, which is why the subshell stamps its finish into
+# `$LOGS/<i>.t`: the report loop `wait`s in index order and a job that already exited
+# returns instantly, so an elapsed computed there is the loop's clock. No stamp falls back
+# to that reading. CPU is the same subshell's `times`, whose second line is its reaped
+# children's user+sys — the whole row's process tree, which the box cannot inflate.
 run() { local i=${#PIDS[@]}; NAMES+=("$1"); STARTS+=("$(date +%s.%N)"); shift
-        ( "$@" > "$LOGS/$i.log" 2>&1; rc=$?; date +%s.%N > "$LOGS/$i.t"; exit $rc ) & PIDS+=($!); }
+        ( "$@" > "$LOGS/$i.log" 2>&1; rc=$?; date +%s.%N > "$LOGS/$i.t"; times > "$LOGS/$i.cpu"; exit $rc ) & PIDS+=($!); }
+# `times` prints `<m>m<s>s <m>m<s>s`; sum both into seconds.
+cpusec() { local tot=0 p m x
+           for p in "$@"; do m=${p%%m*}; x=${p#*m}; x=${x%s}; tot=$(echo "$tot + $m * 60 + $x" | bc); done
+           printf '%s' "$tot"; }
 
 # FIRST ROW, so the table's first line names the cause once instead of ten times.
 run "python preflight"         bash scripts/python-preflight.sh "$LOGS/python.diag"
@@ -175,14 +180,22 @@ if [ "$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" = "master" ]; then
 fi
 
 FAIL=0
-printf '\n%-22s %8s  %s\n' "GATE" "TIME" "RESULT"
+# WALL is contended — every row is measured with all its siblings on the box, so it reads
+# up to 3.8x the row's cost and a scheduling decision taken off it is wrong by that much.
+# CPU is the row's own user+sys, which contention cannot inflate: WALL/CPU is the waiting,
+# so a row that is SLOW (high CPU) and one that is STARVED (high WALL, low CPU) separate.
+echo
+echo "WALL = elapsed with all rows running   CPU = the row's own user+sys (WALL>>CPU means starved, not slow)"
+printf '%-22s %8s %8s  %s\n' "GATE" "WALL" "CPU" "RESULT"
 for i in "${!PIDS[@]}"; do
   wait "${PIDS[$i]}"; rc=$?
   fin=$(cat "$LOGS/$i.t" 2>/dev/null)
   [ -n "$fin" ] || fin=$(date +%s.%N)
   el=$(echo "$fin - ${STARTS[$i]}" | bc)
-  if [ $rc -eq 0 ]; then printf '%-22s %7.1fs  ok\n' "${NAMES[$i]}" "$el"
-  else FAIL=1; printf '%-22s %7.1fs  FAILED rc=%d   %s\n' "${NAMES[$i]}" "$el" "$rc" "$LOGS/$i.log"; fi
+  cpu=$(cpusec $(tail -1 "$LOGS/$i.cpu" 2>/dev/null))
+  [ -n "$cpu" ] || cpu=0
+  if [ $rc -eq 0 ]; then printf '%-22s %7.1fs %7.1fs  ok\n' "${NAMES[$i]}" "$el" "$cpu"
+  else FAIL=1; printf '%-22s %7.1fs %7.1fs  FAILED rc=%d   %s\n' "${NAMES[$i]}" "$el" "$cpu" "$rc" "$LOGS/$i.log"; fi
 done
 
 if [ $FAIL -ne 0 ]; then
