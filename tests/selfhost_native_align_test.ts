@@ -36,9 +36,19 @@
 // `@error-at` spans, and `@warning`/`@hint`/`@info` — this suite never pins those,
 // so a warning-only case is adjudicated for its ACCEPT verdict alone.
 //
+// NOTHING HERE SPAWNS ONE PROCESS PER CASE. `vl run --batch` runs the RUN/TRAP tiers
+// in waves and `vl check --batch --json` checks every tier's `vl check` leg in waves —
+// both because the per-invocation floor (process + two wasmtime engine builds + the
+// multi-MB seed) dominates the compiling, 77% of it for the check leg
+// (`docs/internals/test-timing-2026-09.md` §5a). The per-case TESTS are untouched: each
+// still awaits its own memoized result and asserts on it alone.
+//
 // GATING: env-gated (`SELFHOST_NATIVE_ALIGN=1`) AND requires the built binary + seed
 // wasm; absent either, every case registers as ignored with a one-line how-to-build
 // note (so a plain `deno task test` stays fast and green; CI's native job opts in).
+//
+// @test-timing native
+// @test-timing sweep n=2328 name~"native-align setup"
 
 import { COMPILER, ROOT, VL, exists } from "./support/tree.ts";
 
@@ -127,7 +137,43 @@ const vl = (args: string[]): Promise<Run> =>
       err: new TextDecoder().decode(stderr),
     };
   });
-const stageOf = (err: string) => err.match(/(parse|type|emit) error/)?.[1] ?? "other";
+/** One `vl check --json` diagnostic. `stage` names the phase that produced it. */
+type Diag = {
+  file: string;
+  severity: string;
+  stage: string;
+  code?: string;
+  line?: number;
+  col?: number;
+  endCol?: number;
+  message: string;
+};
+
+/** What one case's `vl check` leg hands its tier assertion. */
+type Verdict = { code: number; stage: string; text: string };
+
+/**
+ * The stage a refusal is classified at, from the diagnostics rather than from a
+ * regex over the summary line. It is the driver's return-code ladder read backwards:
+ * `import` and `parse` are rc 1, `type` rc 2, `emit` rc 3, and rc is the FIRST
+ * non-empty stream — so the earliest stage present is the one the summary's
+ * `(… error)` note would have named. No error diagnostics is "other", exactly as an
+ * absent note was, and that is what an `invalid-module` (stage `validate`, rc 0 at the
+ * emitter) still grades as.
+ *
+ * Reading the key rather than the sentence also drops a false positive the regex had:
+ * it matched "parse error" wherever it appeared, INCLUDING inside a diagnostic's own
+ * message and inside the source line a caret block echoes. Seven corpus cases hit that
+ * — all of them `vl check` clean, so the value fed a failure message that was never
+ * built (see the PR's verdict table).
+ */
+const stageOf = (diags: Diag[]): string => {
+  const errs = diags.filter((d) => d.severity === "error");
+  if (errs.some((d) => d.stage === "import" || d.stage === "parse")) return "parse";
+  if (errs.some((d) => d.stage === "type")) return "type";
+  if (errs.some((d) => d.stage === "emit")) return "emit";
+  return "other";
+};
 
 // ── Directive scan + tier classification ──────────────────────────────────────
 // A directive is a line whose comment body starts with `@name`. This is
@@ -238,7 +284,7 @@ for (const rel of [...walkVl(CASES)].sort()) {
 // SAME rendered error a failing `vl run` prints — compiler diagnostics / trap
 // text — only on failure), so the per-case assertions below are unchanged in
 // strength: stdout still must equal `@log` exactly, and a trap still must render
-// "wasm trap". The `vl check` legs stay per-spawn (`vl check` takes one path).
+// "wasm trap". The `vl check` legs batch too, further down.
 //
 // Outputs are keyed by BASENAME, and the corpus reuses basenames across dirs
 // (dozens of `entry.vl`, several `basics.vl`, …) — and module imports resolve
@@ -324,51 +370,142 @@ const runOne = async (rel: string): Promise<BatchResult> => {
   return { out: r.out, err: r.code === 0 ? null : r.err || r.out };
 };
 
-// ── The `vl check` legs, memoized and PREFETCHED ──────────────────────────────
-// Every tier ends in a `vl check` (or `vl check --codegen`) of one case, and each
-// is independent of every other. `checkRun` memoizes the spawn per (case, flag) so
-// a case is checked exactly once, and `warmChecks()` queues ALL of them through
-// `spawnGate` — after which the sequential per-case tests below mostly COLLECT a
-// finished result instead of starting one.
+// ── The `vl check` legs, BATCHED ──────────────────────────────────────────────
+// Every tier ends in a `vl check` (or `vl check --codegen`) of one case, and each is
+// independent of every other. They used to be one spawn each — ~2,989 processes, of
+// which 77% was the process + engine + seed floor and only 23% the compiling
+// (`docs/internals/test-timing-2026-09.md` §5a). `vl check --batch --json` takes a file
+// LIST and writes one `{file, exit, diagnostics}` record per input, so the floor is
+// paid once per WAVE instead of once per case.
 //
-// The memo key is exactly the two things that vary (the case path and the
-// `--codegen` flag), so no case can read another's result, and the assertion
-// functions are otherwise untouched. Like the `vl run --batch` fixture above the
-// prefetch is LAZY — it is kicked off from the setup fixture, so a filtered run
-// that never reaches it still spawns only the cases it actually adjudicates.
+// WHAT KEEPS THE VERDICT THE SAME. `--batch` grades each NAMED file exactly as
+// `vl check <file>` alone grades it — same whole-graph lint scope, same report, same
+// exit — and `tests/vl_check_json_test.ts` pins that by comparing a record against that
+// file's own lone run rather than spot-checking a field. On top of that, both inputs
+// the tier assertions read come from the record rather than from stderr: the exit code
+// is the record's own `exit` (never the batch process's), and the stage is `stageOf`
+// above.
 //
-// SABOTAGE-VERIFIED (2026-07-29), and the two halves of the key do NOT verify the
-// same way. Collapsing the key to drop `rel` — every case reading one shared
-// result — reddens the suite loudly: 260 of 1,646 fail. Collapsing it to drop the
-// `codegen` flag stays GREEN, and that is not a hole in the key, it is a property
-// of the tier partition: a case lands in exactly ONE tier, so no case is ever
-// checked both ways and the two flavours cannot collide today. The flag stays in
-// the key because it is what makes the memo correct rather than accidentally
-// correct — do not "simplify" it out on the strength of a green run.
-const checkMemo = new Map<string, Promise<Run>>();
-const checkRun = (rel: string, codegen: boolean): Promise<Run> => {
-  const key = `${codegen ? "codegen" : "check"} ${rel}`;
-  const memo = checkMemo.get(key);
-  if (memo) return memo;
-  const args = codegen ? ["check", "--codegen", path(rel)] : ["check", path(rel)];
-  const p = vl(args);
-  // A prefetched spawn can settle long before its test awaits it. `vl()` rejects
-  // only when the PROCESS cannot start (a nonzero exit is a resolved value, not a
-  // rejection), but marking the promise handled here keeps that failure from
-  // surfacing as an unhandled rejection that kills the worker before the owning
-  // test can report it against the case.
-  p.catch(() => {});
-  checkMemo.set(key, p);
-  return p;
+// THE FILE LIST IS THE TIERED CASES, which is why this is a list and not
+// `vl check <dir> --json`. A directory walk checks every `.vl` under it, including the
+// module PARTS and shared helpers `tiersOf` deliberately excludes — the second blocker
+// §5a names. Naming the files removes it rather than working around it, and it is also
+// what lets the `--codegen` leg cover the EMIT-REJECT tier alone instead of emitting
+// the whole corpus.
+//
+// A case a wave does not name is one the batch cannot answer for, so `checkRun` THROWS
+// rather than falling back to a spawn: a silent fallback would be a second code path
+// with its own verdict, which is the thing this rewrite has to not have.
+const CHECK_LEG = (tier: Tier): "check" | "codegen" =>
+  tier === "emit-reject" ? "codegen" : "check";
+const CHECK_LEGS: Record<"check" | "codegen", string[]> = { check: [], codegen: [] };
+for (const tier of ["run", "accept", "reject", "emit-reject"] as Tier[]) {
+  CHECK_LEGS[CHECK_LEG(tier)].push(...TIERS[tier]);
+}
+// The exclusion tripwires re-run the same assertion over their case, so the batch has
+// to carry them too. A TRAP-tier exclusion has no `vl check` leg at all.
+for (const { rel, tier } of EXCLUDED) {
+  if (tier !== "trap") CHECK_LEGS[CHECK_LEG(tier)].push(rel);
+}
+
+/** Round-robin into at most `SPAWN_JOBS` waves, so long and short cases mix evenly. */
+const checkWaves = (rels: string[]): string[][] => {
+  if (rels.length === 0) return [];
+  const n = Math.min(SPAWN_JOBS, rels.length);
+  const out: string[][] = Array.from({ length: n }, () => []);
+  rels.forEach((rel, i) => out[i % n].push(rel));
+  return out;
+};
+
+/** One `vl check --batch --json` process over `rels`, in argv order. */
+const checkWave = (
+  rels: string[],
+  codegen: boolean,
+): Promise<[string, Verdict][]> =>
+  spawnGate(async () => {
+    const { code, stdout, stderr } = await new Deno.Command(VL, {
+      args: [
+        "check",
+        "--batch",
+        "--json",
+        ...(codegen ? ["--codegen"] : []),
+        ...rels.map(path),
+        "--compiler",
+        COMPILER,
+      ],
+      stdout: "piped",
+      stderr: "piped",
+      env: { RUST_BACKTRACE: "0", VL_STD: `${ROOT}/std` },
+    }).output();
+    const lines = new TextDecoder().decode(stdout).split("\n").filter((l) =>
+      l.trim() !== ""
+    );
+    // One record per input, or the process died part-way through the wave — a compiler
+    // TRAP is the way that happens, and the host's stderr banner names the file it was
+    // compiling. Loud here rather than a missing key later.
+    if (lines.length !== rels.length) {
+      throw new Error(
+        `vl check --batch wrote ${lines.length} records for ${rels.length} files ` +
+          `(exit ${code}): ${new TextDecoder().decode(stderr).trim().slice(0, 600)}`,
+      );
+    }
+    return lines.map((line, i) => {
+      const rec = JSON.parse(line) as {
+        file: string;
+        exit: number;
+        diagnostics: Diag[];
+      };
+      // Records are in argv order, so a mismatch here means the batch and this suite
+      // disagree about WHICH file a verdict belongs to — the one way batching could
+      // grade a case against another case's result.
+      if (rec.file !== path(rels[i])) {
+        throw new Error(
+          `vl check --batch record ${i} names ${rec.file}, expected ${path(rels[i])}`,
+        );
+      }
+      return [rels[i], {
+        code: rec.exit,
+        stage: stageOf(rec.diagnostics),
+        text: rec.diagnostics.map((d) => d.message).join("\n"),
+      }] as [string, Verdict];
+    });
+  });
+
+// LAZY, like the `vl run --batch` fixture above: a filtered run that never reaches a
+// check leg never pays for it.
+const checkP: Record<"check" | "codegen", Promise<Map<string, Verdict>> | null> = {
+  check: null,
+  codegen: null,
+};
+const checkResults = (
+  leg: "check" | "codegen",
+): Promise<Map<string, Verdict>> =>
+  checkP[leg] ??= (async () => {
+    const parts = await Promise.all(
+      checkWaves(CHECK_LEGS[leg]).map((w) => checkWave(w, leg === "codegen")),
+    );
+    return new Map(parts.flat());
+  })();
+
+const checkRun = async (rel: string, codegen: boolean): Promise<Verdict> => {
+  const leg = codegen ? "codegen" : "check";
+  const v = (await checkResults(leg)).get(rel);
+  if (!v) {
+    throw new Error(
+      `${rel}: no --batch record on the ${leg} leg — its tier did not queue it`,
+    );
+  }
+  return v;
 };
 let warmed = false;
 const warmChecks = (): void => {
   if (warmed) return;
   warmed = true;
-  for (const rel of TIERS.run) checkRun(rel, false);
-  for (const rel of TIERS.accept) checkRun(rel, false);
-  for (const rel of TIERS.reject) checkRun(rel, false);
-  for (const rel of TIERS["emit-reject"]) checkRun(rel, true);
+  // Not awaited: `spawnGate` bounds the in-flight count and each test awaits — and
+  // reports — its own case. Marked handled so a wave that cannot start surfaces
+  // against the owning test rather than as an unhandled rejection.
+  checkResults("check").catch(() => {});
+  checkResults("codegen").catch(() => {});
 };
 
 // ── Per-tier assertions, as functions: `null` = the native tool agrees ─────────
@@ -399,17 +536,16 @@ const checkCleanDivergence = async (rel: string): Promise<string | null> => {
   const c = await checkRun(rel, false);
   return c.code === 0
     ? null
-    : `vl check should compile clean, exited ${c.code} (${stageOf(c.err)}): ${head(c.err)}`;
+    : `vl check should compile clean, exited ${c.code} (${c.stage}): ${head(c.text)}`;
 };
 
 const rejectDivergence = async (rel: string): Promise<string | null> => {
   const r = await checkRun(rel, false);
   if (r.code === 0) return "expected rejection, vl check exited 0";
-  const stage = stageOf(r.err);
   // The front end must catch it — an invalid program must never slip past the
   // type-check gate into the emitter (which would mask an unsound accept).
-  if (stage !== "parse" && stage !== "type") {
-    return `rejected at "${stage}" stage, expected parse/type — the checker should catch this BEFORE emit\n  ${head(r.err, 2)}`;
+  if (r.stage !== "parse" && r.stage !== "type") {
+    return `rejected at "${r.stage}" stage, expected parse/type — the checker should catch this BEFORE emit\n  ${head(r.text, 2)}`;
   }
   return null;
 };
@@ -419,14 +555,14 @@ const emitRejectDivergence = async (rel: string): Promise<string | null> => {
   if (r.code === 0) {
     return "expected an emit-stage rejection, vl check --codegen exited 0";
   }
-  const all = r.out + r.err;
-  const stage = stageOf(all);
-  if (stage !== "emit") {
-    return `rejected at "${stage}" stage, expected emit — an earlier-stage reject belongs in the REJECT tier\n  ${head(all, 2)}`;
+  if (r.stage !== "emit") {
+    return `rejected at "${r.stage}" stage, expected emit — an earlier-stage reject belongs in the REJECT tier\n  ${head(r.text, 2)}`;
   }
+  // The message text is every diagnostic's own `message`, which is the same string the
+  // pretty renderer prints — the `@emit-error` fragments match it unchanged.
   for (const want of emitErrorsOf(src(rel))) {
-    if (!foldMsg(all).includes(foldMsg(want))) {
-      return `expected the emit error to contain ${JSON.stringify(want)}\n  got: ${head(all, 3)}`;
+    if (!foldMsg(r.text).includes(foldMsg(want))) {
+      return `expected the emit error to contain ${JSON.stringify(want)}\n  got: ${head(r.text, 3)}`;
     }
   }
   return null;

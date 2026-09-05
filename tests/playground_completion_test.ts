@@ -29,15 +29,19 @@ const seedExists = (() => {
 })();
 const ignore = !seedExists;
 
+// One compiled Module for the file, a FRESH Instance per call. Compiling is the
+// expensive half and a `WebAssembly.Module` is immutable, so each test still gets
+// its own store.
+const module = seedExists
+  ? new WebAssembly.Module(Deno.readFileSync(SEED) as BufferSource)
+  : undefined;
+
 // Wire a seed-backed checker into the adapter (the page does this via
 // `wasmCheckerBrowser.ts` + `initLsp`). Called at the top of each test; `initLsp`
 // just replaces the module-level checker.
 const init = (): void => {
-  const bytes = Deno.readFileSync(SEED);
-  const instance = new WebAssembly.Instance(
-    new WebAssembly.Module(bytes as BufferSource),
-    {},
-  );
+  if (!module) throw new Error(`no seed at ${SEED}`);
+  const instance = new WebAssembly.Instance(module, {});
   initLsp(createWasmChecker(() => instance.exports as unknown as Exports));
 };
 

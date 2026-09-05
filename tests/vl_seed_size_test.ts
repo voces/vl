@@ -10,8 +10,10 @@
 // one byte past it fails. It also pins the two non-obvious behaviours the gate
 // depends on: shrinkage passes (it is not a size TARGET), and an absent seed exits
 // 0 with a line saying so, because the `ci` job never builds one.
+//
+// @test-timing native
 
-import { ROOT } from "./support/tree.ts";
+import { ROOT, pythonBin } from "./support/tree.ts";
 
 const SCRIPT = `${ROOT}/scripts/seed-size.py`;
 const CI_YML = `${ROOT}/.github/workflows/ci.yml`;
@@ -27,7 +29,7 @@ const LIMIT = BASE + Math.trunc((BASE * MAX_GROWTH_PCT) / 100); // 1_030_000
 const dec = new TextDecoder();
 
 const run = async (args: string[]): Promise<{ code: number; out: string }> => {
-  const { code, stdout, stderr } = await new Deno.Command("python3", {
+  const { code, stdout, stderr } = await new Deno.Command(pythonBin(), {
     args: [SCRIPT, ...args],
     stdout: "piped",
     stderr: "piped",

@@ -16,6 +16,8 @@
 //
 // GATING: env-gated (`SELFHOST_NATIVE_ALIGN=1`) and needs the built binary plus
 // the seed; absent either, the case registers as ignored.
+//
+// @test-timing native
 
 import { COMPILER, ROOT, VL, exists, nativeEnv } from "./support/tree.ts";
 

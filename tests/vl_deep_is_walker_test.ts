@@ -26,6 +26,8 @@
 // GATING mirrors the other seed-backed suites: `SELFHOST_NATIVE_ALIGN=1` plus the vl
 // binary, the seed and `wasm-dis`. Absent any, the case registers ignored with a note.
 // No assertion library, per CLAUDE.md — every failure is a `throw new Error` with want/got.
+//
+// @test-timing native
 
 import { COMPILER, ROOT, VL, exists } from "./support/tree.ts";
 

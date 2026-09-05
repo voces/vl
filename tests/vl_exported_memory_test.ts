@@ -24,6 +24,8 @@
 // explicit ci.yml step runs NOWHERE in CI (it self-ignores in the seedless `ci`
 // job). `tests/ci_seed_coverage_test.ts` is the guard that enforces this, and it
 // caught this file under its original name.
+//
+// @test-timing native
 
 import { COMPILER, VL, exists, nativeEnv } from "./support/tree.ts";
 

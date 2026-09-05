@@ -36,6 +36,8 @@
 // GATING: needs the built binary, the seed, `wasm-opt` and `wasm-tools`. A
 // missing prerequisite self-ignores rather than fails, so read the suite's
 // IGNORED COUNT, not just its pass count.
+//
+// @test-timing opt
 
 import { COMPILER, ROOT, VL, exists, nativeEnv } from "./support/tree.ts";
 

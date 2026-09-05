@@ -31,6 +31,7 @@ import shutil
 import sys
 
 from cellmap import dump_cells
+from index import DERIVED_BLOCKS, load_index
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
@@ -132,8 +133,15 @@ def main():
                "meta": {"note": "one representative per behavioural equivalence class "
                                 "of the census; rebuilt by redistil.py"}},
               open(os.path.join(out, "manifest.json"), "w"), indent=1, sort_keys=True)
-    dump_cells(os.path.join(HERE, "expected.jsonl"), index)
-    print(f"wrote {out}/*.vl ({len(staged)} cells), cells/manifest.json and expected.jsonl")
+    # THE CURATED ROWS SURVIVE A RE-DISTILLATION. This wrote `index` alone, and `index`
+    # holds only blocks A-E — so one run would have deleted the `expected.jsonl` row of
+    # every `named/` cell while leaving the cells themselves in place, which is exactly
+    # the missing-row state `index.py` exists to refuse. Only the derived rows are
+    # re-derived here; the curated half is carried over untouched.
+    keep = {c: v for c, v in load_index().items() if v["block"] not in DERIVED_BLOCKS}
+    dump_cells(os.path.join(HERE, "expected.jsonl"), {**keep, **index})
+    print(f"wrote {out}/*.vl ({len(staged)} cells), cells/manifest.json and expected.jsonl "
+          f"({len(index)} derived rows re-derived, {len(keep)} curated rows carried over)")
     ncur = len(glob.glob(os.path.join(HERE, "named", "*.vl")))
     if ncur:
         print(f"named/ left untouched: {ncur} curated cells")

@@ -26,7 +26,7 @@ import {
   nodeTyWidenedRepName,
   valueAtomKind,
 } from "./typecheck"
-import { sidArrGet, sidArrPut, sidOf, sidOfNode } from "./symbols"
+import { sidArrGet, sidArrPut, sidLookup, sidOf, sidOfNode } from "./symbols"
 // ── the type-name grammars this file calls, homed in `tyname.vl` ──
 // A leaf with zero imports; this file binds them for its own calls and republishes
 // none — every emitter module asks the home directly. The layering is one-directional:
@@ -2052,19 +2052,45 @@ export function removeAtomFrom(set: string, removed: string) {
   raftVals.push(out)
   out
 }
-// True if `name` is declared by a top-level struct `type X = {…}` (`TypeDecl`). Used
-// during `collectU` — BEFORE `collectS` runs — so it scans the arena directly rather
-// than reading the not-yet-populated `sNames` table.
-function isDeclaredStructName(stmts: i32[], name: string) {
+// The declared-struct index — the arena NODE of the first top-level `TypeDecl` at each
+// declared name's interned id, or -1. `declStructStmtsLen` stamps the statement list it
+// answers for, so a reader holding a list of another length rebuilds rather than read rows
+// that belong to a different program.
+let declStructNodeBySid: i32[] = []
+let declStructStmtsLen = -1
+
+// Rebuilds the index from `stmts`. `collectU` calls it before its walk, the first pass that
+// asks: only the parser mints a `TypeDecl` and only the driver's module merge appends a
+// top-level statement, so both are settled before any emit pass runs. First declaration
+// wins, matching the forward scans this replaces.
+export function declStructIndexBuild(stmts: i32[]) {
+  declStructNodeBySid = []
+  declStructStmtsLen = stmts.length
   let i = 0
   while i < stmts.length {
     const s = P.nodes[stmts[i]]
     if s is TypeDecl {
-      if s.tdName == name { return true }
+      const dsid = sidOf(s.tdName)
+      if sidArrGet(declStructNodeBySid, dsid) < 0 {
+        sidArrPut(declStructNodeBySid, dsid, stmts[i])
+      }
     }
     i = i + 1
   }
-  false
+  0
+}
+
+// The arena node of the top-level `type <name> = …` declaring `name`, or -1. Asked during
+// `collectU` — BEFORE `collectS` runs — so it reads the index above rather than the
+// not-yet-populated `sNames` table. A name never interned is a name no declaration carries.
+export function declStructNodeOf(stmts: i32[], name: string) {
+  if declStructStmtsLen != stmts.length { declStructIndexBuild(stmts) }
+  sidArrGet(declStructNodeBySid, sidLookup(name))
+}
+
+// True if `name` is declared by a top-level struct `type X = {…}` (`TypeDecl`).
+function isDeclaredStructName(stmts: i32[], name: string) {
+  declStructNodeOf(stmts, name) >= 0
 }
 // True if the atom `a` is a STRUCT variant — a declared `type X = {…}`, or an INLINE
 // object shape `{x:i32}` (its fields parse from its own text; a map shape `{[…]}` is

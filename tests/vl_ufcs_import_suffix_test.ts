@@ -10,6 +10,8 @@
 //
 // GATING: same as tests/vl_check_json_test.ts — env-gated (`SELFHOST_NATIVE_ALIGN=1`)
 // AND requires the built binary + seed wasm.
+//
+// @test-timing native
 
 import { COMPILER, ROOT, VL, exists } from "./support/tree.ts";
 

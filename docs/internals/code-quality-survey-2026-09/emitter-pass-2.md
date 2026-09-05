@@ -86,7 +86,7 @@ while the ambient `pending*` write count went **311 → 330** (§8).
 
 | # | finding | evidence | size | risk | proof |
 |---|---|---|---|---|---|
-| 1 | `buildVariantTwins` rebuilds `variantSig` for both operands of every pair in an O(n²) scan; `variantSig(i)` is loop-invariant and `variantSig(d)` is a pure function of tables the loop never writes (§2) | **30.34% self** of a 3,200-union compile, **99.7%** of it from that one loop; the axis reads **3.86 / bar 4.0** at 1,600 unions — **re-graded on the merged tree at 27.62% and 3.88** (§0) | XS | none | byte-identical seed; `regress.py`; the `unions` axis ratio |
+| 1 | `buildVariantTwins` rebuilds `variantSig` for both operands of every pair in an O(n²) scan; `variantSig(i)` is loop-invariant and `variantSig(d)` is a pure function of tables the loop never writes (§2) | **30.34% self** of a 3,200-union compile, **99.7%** of it from that one loop; the axis reads **3.86 / bar 4.0** at 1,600 unions — **re-graded on the merged tree at 27.62% and 3.88** (§0) | XS | none | byte-identical seed; `regress.py`; the `unions` axis ratio — **landed** (§2.4) |
 | 2 | The env-parameter ABI is module-wide: one function value gives **every** function a `structref` param and **every** direct call a `ref.null none` — #2609 named this as "where the next slice is" and it is unsized (§4) | **+82,534 B (+3.83%)** on the compiler, independently reproducing #2609's +82,151; only **24.2%** of functions in the 611 paying `tests/cases` modules are address-taken, so three in four could keep the plain ABI | L | high | `matrix.py`, `regress.py`, corpus byte identity, an owner ruling on the ABI split |
 | 3 | ~~Seven `expr*Array` classifiers each ask `unionIdentReadKind` independently, and each re-interns the identifier's sid~~ — the memo is REFUTED by measurement and `sidOfNode` already memoises; the work removals landed (§5.2) | `unionIdentReadKind` **21.12% inclusive** on the `functions` axis, **91.0%** of its calls repeats of a seen `(exprIx, fnIx)` — and **3 of them answer differently**, witness `wfHit` in `typecheck.findFnDeclIn`. `sidOf` 2.51% inclusive, 89.5% from one string-taking call site | M | med | byte-identical seed; corpus `cmp` |
 | 4 | The rep-key renderer is written five times: three `*KeyGo` bodies at 110/115/98 lines and 85–98% pairwise, three 33-line entry points at 100%, while `repElemIdGo(ty, mv)` already proves the merge (§5.1) | script-measured token similarity; `repCanonId`/`repElemId`/`repMvValId` are identical after normalisation | M | med | byte-identical seed; `rep-fuzz-check.sh` |
@@ -188,6 +188,66 @@ Step 2 is the one to land first: it is a memo of a pure function whose inputs �
 (`refresh-compiler.sh` + `cmp`); `regress.py` 0 `runs → not-runs`; the `unions` axis ratio, and
 if it falls clear the bar should fall with it — the comment above it needs rewriting either
 way, per §2.2.
+
+### 2.4 Landed
+
+Steps 1 and 2, as a column stamped on the lengths of `uFieldNames` / `uFieldStart` /
+`uFieldCount` and dropped in `collectU`. Re-graded on `a16b9cb2b` + the change: `variantSig`
+self **24.38 → 1.62%** at 1,600 and **26.39 → 1.28%** at 3,200, `buildVariantTwins`
+inclusive **27.64 → 5.33%** and **29.13 → 5.62%**. The axis reads **1.46** against 1.78 and
+the bar drops **4.0 → 3.5**; its note now names `isDeclaredStructName` (**21.83%
+inclusive**), which is the next term. Numbers and their commands: the `CHANGELOG.md` entry.
+
+`isDeclaredStructName` followed, as a sid-keyed set of the declared struct names built once
+per program at the head of `collectU`: **27.16 → 0.08%** inclusive at 3,200 unions and
+**14.12 → 0.11%** at 1,600, three interleaved readings a side. The bar stays at **3.5**,
+because at the SHIPPED 800 the term is only **8.24–10.20%** inclusive and the many arm sheds
+11%. The axis note now names `collectVariantFields` (`compiler/emit_collect.vl`, **16.65%
+inclusive** at 3,200) — the same per-arm scan of the top-level statements, one function over
+and looking for the `TypeDecl` rather than for its name.
+
+Three more followed, one commit each, each profiled first and each proved by byte identity
+against the commit before it. At 3,200 unions: `collectVariantFields` **23.63 → 0.19%**
+(the set becomes a NODE index, so one index answers both questions and the set is retired),
+`unionRowOf` **12.87 → 0.07%** (`unRowByMemberSid`, the `unRowBySid` twin for the member-set
+column, with `unMemberSetPush` made its only writer), `objVariantName` **22.46 → 0.21%**
+(buckets keyed on `variantSig`, which both variant-field paths already order canonically).
+The axis reads a median **1.14** against **1.46**, the bar stays at **3.5**, and its note now
+names `assignTags` — **16.10% inclusive**, an all-pairs signature RANK rather than a scan, so
+the next term on this axis is not another index.
+
+Two more close the chain. `unionArmVariantForObj` **4.89 → 0.00%** — the last walk of the two
+columns the member-set index already covers, its row being the earlier of the two first-wins
+answers — and `assignTags` **23.14 → 0.14%**, the all-pairs rank replaced by a merge sort plus
+a run walk, since a tag is how many signatures sort below it and that is the start index of
+its own equal run.
+
+**And the axis has run out of signal at its shipped size, which is the finding.** It reads a
+median **0.86** against **0.94** over twelve runs at load 30, and **1.34** against **1.48**
+over twelve at load 125 to 235. At load 30 the many arm is 0.215 s and the cheap one 0.160 s,
+so the 0.25 floor is the denominator and the reading is an absolute budget: the bar of 3.5 is
+four times it, and doubling what the pair still costs would read about 1.7. The bar therefore
+stays — lowering it is not what would restore detection. `genUnions(800, …)` needs to become
+`genUnions(1600, …)`, which is a change to the gate's cost and wants its own decision. Next
+on the axis is `buildVariantTwins` (**16.21% inclusive**), which is §2.3's own step 3: intern
+the signature and the pair search's residue becomes an integer compare.
+
+**Step 3 landed, and row 1 is closed.** `sigIds` interns each signature once per row, so the
+D1023 arm compares integers: `buildVariantTwins` **14.44 → 4.40%** inclusive at 3,200 unions,
+with `__str_eq__` under it (5.50% of the compile) and `variantSig` self (3.96%, 98.8% of it
+under this loop) both off the frame list. **No emitter frame on this axis is above 5% now**;
+what is left at the top of a 3,200-union profile is the CHECKER's definite-assignment join
+(`daAddSid` 10.46% inclusive under `daJoinInto`/`daRestore`), which is `typecheck.vl` and a
+different axis's question.
+
+**And the axis itself was resized, which is the finding this section ends on.** At 800 unions
+the cheap arm ran 0.16 s under a 0.25 s floor, so the gate reported an absolute budget on the
+many arm rather than a ratio. The pair is `genUnions(2400, …)`, where the cheap arm is 2.4 to
+3.2x the floor; the reading is 1.28 to 1.40 median over 44 interleaved rounds spanning load 22
+to 235 against master's 1.42 to 1.48, and the bar comes off the super-linear ladder — the
+family default would be **2.5**, set to **3.0** because one round of the 44 drew 2.30, which
+leaves 2.5 a headroom of 1.09x. 3.0 is 1.3x that worst round, and the control that fixes it is
+the pre-#2630 compiler reading **4.42** on the same pair. The row's wall grows **+0.52 s**.
 
 ---
 

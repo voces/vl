@@ -3,7 +3,8 @@
 A prioritized feature/API spec for vl (`~/vl`), written against vl's actual
 state as of 2026-07-25 (self-hosted fixpoint, WasmGC-only heap, scalar-only
 export ABI, no Buffer tier yet, no math/RNG std, wasmtime 47). Companion to
-`docs/design/performance-topology.md`, which motivates the "authoritative
+`docs/design/performance-topology.md` (in webcraft's own repo, not this one —
+see `docs/internals/buffer-design.md` §G), which motivates the "authoritative
 state ⊆ Buffer" discipline this spec serves.
 
 Framing: the sim (kernel/ + wc3/) is the only vl consumer. It is a pure

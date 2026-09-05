@@ -35,6 +35,8 @@
 //
 // GATING: same as tests/vl_check_args_test.ts — env-gated (`SELFHOST_NATIVE_ALIGN=1`)
 // AND requires the built binary + seed wasm.
+//
+// @test-timing native
 
 import { COMPILER, VL, exists, nativeEnv } from "./support/tree.ts";
 

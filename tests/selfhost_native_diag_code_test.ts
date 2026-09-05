@@ -40,9 +40,14 @@ type Exports = Record<string, (...args: number[]) => number>;
 
 type Diag = { message: string; code: string; data: VLDiagnosticData; raw: string };
 
+// One compiled Module for the file, a FRESH Instance per test. Compiling is the
+// expensive half and a `WebAssembly.Module` is immutable, so hoisting it changes
+// nothing a test can observe — every test still gets its own store, which is what
+// keeps `modReset`/`srcReset` honest. The same split is `tests/support/sharedInstance.ts`.
+const module = seedExists ? new WebAssembly.Module(Deno.readFileSync(SEED)) : undefined;
+
 const instantiate = (): Exports => {
-  const bytes = Deno.readFileSync(SEED);
-  const module = new WebAssembly.Module(bytes);
+  if (!module) throw new Error(`no seed at ${SEED}`);
   return new WebAssembly.Instance(module, {}).exports as unknown as Exports;
 };
 

@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """Run every capability probe and report which still refuse.
 
-Each probe is a program the TYPE SYSTEM ACCEPTS and codegen refuses — the gaps that are
-invisible to the distilled corpus because the census axes generate no program for them.
-See README.md.
-
-NOT A MERGE GATE. Today every probe fails, by construction; that is what makes them probes.
-Run it to find out whether a change moved something the corpus could not see.
+Each probe is a program `vl check` ACCEPTS, one per known capability gap — the gaps the
+distilled corpus cannot see, since the census axes generate no program for them. Most run
+today, so the measurement is the summary line: how many gaps run against how many refuse.
+A refusal is a clause-2 violation by construction (`check` returned 0 to reach the emitter);
+a `SILENT` cell is a clause-1 one, check-clean invalid wasm, and worse. README.md.
 
 `matches`, `classify` and `grade` are the shared grading vocabulary; `matrix.py` imports
 them so a generated position cell and a hand-written probe are read on the same scale.
@@ -17,6 +16,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 VL = os.path.join(ROOT, "scripts", "vl-host", "target", "release", "vl")
 SEED = os.path.join(ROOT, "build", "vl-compiler.wasm")
+# `vl` resolves `std:` from the EXE's checkout, and an agent worktree symlinks the host
+# binary at the main repo — so an unpinned probe grades THIS tree's seed against the main
+# checkout's `std/`. `matrix.py` pins it; the default here is what every caller gets.
+ENV = dict(os.environ, VL_STD=os.path.join(ROOT, "std"))
 
 
 def matches(want, out):
@@ -96,8 +99,9 @@ def grade(path, compiler, want, vl=VL, env=None, timeout=120):
     ONE `vl` invocation per healthy cell — `run` first, and `check` only when the run
     failed, since the rc is all a passing cell needs and only a failing one has a channel
     to name. Verdicts: RUNS · WRONG · check refuses · emit refuses · SILENT (check rc 0) ·
-    COMPILER TRAP (check rc 0) · TIMEOUT.
+    COMPILER TRAP (check rc 0) · TIMEOUT. `env` defaults to this checkout's `std:`.
     """
+    env = env or ENV
     try:
         run = subprocess.run([vl, "run", path, "--compiler", compiler],
                              capture_output=True, text=True, timeout=timeout, env=env)

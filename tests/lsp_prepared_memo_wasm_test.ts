@@ -281,11 +281,13 @@ Deno.test({
 // the source and run `checkSrc`, the entry with the symbol table OFF. This is
 // the BEFORE arm of the diagnostics control below — same seed, other entry — so
 // the test compares two real answers rather than one answer against a literal.
+// Compiled once, instantiated per call: the fresh STORE is what makes this the
+// before-arm, and a `WebAssembly.Module` is immutable.
+const plainModule = seedExists ? new WebAssembly.Module(Deno.readFileSync(SEED)) : undefined;
 const plainCheckDiags = (source: string): string[] => {
-  const exp = new WebAssembly.Instance(
-    new WebAssembly.Module(Deno.readFileSync(SEED)),
-    {},
-  ).exports as unknown as Record<string, (...a: number[]) => number>;
+  if (!plainModule) throw new Error(`no seed at ${SEED}`);
+  const exp = new WebAssembly.Instance(plainModule, {})
+    .exports as unknown as Record<string, (...a: number[]) => number>;
   exp.modReset();
   exp.srcReset();
   for (const ch of source) exp.srcPush(ch.codePointAt(0)!);

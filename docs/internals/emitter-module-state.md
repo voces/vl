@@ -11,7 +11,8 @@ The compiler is a wasm module, and its module-scope `let`s live as long as the
 `WebAssembly.Instance` does — not as long as one compile. **`vl` compiles once per process,
 so the CLI can never see a leak.** Two drivers compile MANY programs through ONE instance:
 
-* `tests/cases_wasm_test.ts` — one instance over ~2,500 corpus cases.
+* the `tests/cases_wasm_*_test.ts` shards (one `tests/cases_wasm_test.ts` before #2451 split it
+  into four) — one instance per shard over its share of the ~2,500 corpus cases.
 * the LSP server — `lsp/src/wasmCheckerNode.ts`, "one instance is reused across keystrokes",
   and `checker.compile()` (the playground's Run path) hands back the emitted bytes.
 

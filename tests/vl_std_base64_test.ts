@@ -12,6 +12,8 @@
 //
 // GATING: env-gated (`SELFHOST_NATIVE_ALIGN=1`) AND requires the built binary +
 // seed wasm, so it self-ignores on a fresh clone and runs in `ci-native`.
+//
+// @test-timing native
 
 import { COMPILER, ROOT, VL, exists } from "./support/tree.ts";
 

@@ -27,10 +27,19 @@ export const exists = (p: string): boolean => {
   }
 };
 
+/** The interpreter every python-shelling test honours: `PYTHON` first (the
+ * gate's preflight row proves THAT interpreter works; a bare `python3` on
+ * PATH may not), else `python3` so a plain `deno test` outside the gate
+ * still runs. */
+export const pythonBin = (): string => Deno.env.get("PYTHON") ?? "python3";
+
 /**
  * The environment a native `vl` spawn takes: `RUST_BACKTRACE` holds a host panic
  * to one line, and `VL_STD` / `VL_COMPILER_WASM` pin both resolutions to THIS
- * tree. `Deno.Command` merges these over the inherited environment.
+ * tree. `PYTHON` rides along too, because a ratchet script the spawned `vl` (or
+ * a wrapping script) shells out to python needs the same pinned interpreter, not
+ * whatever `python3` resolves to on PATH. `Deno.Command` merges these over the
+ * inherited environment.
  *
  * `VL_COMPILER_WASM` changes which seed NO caller reads: `--compiler` wins over
  * the variable in the host's seed ladder, so a spawn that passes the flag is
@@ -45,5 +54,6 @@ export const nativeEnv = (
   RUST_BACKTRACE: "0",
   VL_STD: STD,
   VL_COMPILER_WASM: COMPILER,
+  PYTHON: pythonBin(),
   ...extra,
 });

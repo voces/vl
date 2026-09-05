@@ -8,6 +8,8 @@
 // The lint still reports them.
 //
 // GATING: env-gated (`SELFHOST_NATIVE_ALIGN=1`) + needs the built binary + seed.
+//
+// @test-timing native
 
 import { COMPILER, VL, exists, nativeEnv } from "./support/tree.ts";
 

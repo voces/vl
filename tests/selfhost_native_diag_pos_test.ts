@@ -20,6 +20,8 @@
 // GATING: same as tests/selfhost_native_align_test.ts — env-gated
 // (`SELFHOST_NATIVE_ALIGN=1`) AND requires the built binary + seed wasm, so a
 // plain `deno task test` stays fast and green while CI's native job opts in.
+//
+// @test-timing native
 
 import { COMPILER, ROOT, VL, exists, nativeEnv } from "./support/tree.ts";
 

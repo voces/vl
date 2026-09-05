@@ -13,6 +13,8 @@
 //
 // GATING: requires the vl binary + seed wasm; absent either, every case
 // registers ignored with a one-line how-to-build note.
+//
+// @test-timing native
 
 import { COMPILER, VL, exists, nativeEnv } from "./support/tree.ts";
 

@@ -147,6 +147,8 @@ import {
   annRetNameOf,
   arrLeafNameOf,
   cloArrElemNameOf,
+  declStructIndexBuild,
+  declStructNodeOf,
   gaeAnnHasParam,
   gaeApplyFieldTy,
   gaeSplitArgs,
@@ -396,6 +398,7 @@ import {
   unMemTys,
   unMemberSet,
   unNames,
+  unRowByMemberSid,
   unRowBySid,
   unTyIx,
   unVarCount,
@@ -599,6 +602,7 @@ import {
   nulScalarListKind,
   nulScalarListKindOfNode,
   nulVariantIdxOfLet,
+  objVariantIndexDrop,
   objVariantName,
   parentBindingOf,
   pushPostGuardNarrow,
@@ -658,6 +662,7 @@ import {
   uFieldRowKeyI32,
   uVarSTwinAt,
   uVariantsPush,
+  unMemberSetPush,
   unNamesPush,
   unRowOfCanon,
   unionArmSigKey,
@@ -674,6 +679,7 @@ import {
   variantLitRepUnifiable,
   variantNestedShapeOk,
   variantSig,
+  variantSigMemoDrop,
 } from "./emit_classify"
 
 // The value-union half, read from the rung `recordInferRet` banked rather than re-derived
@@ -9571,9 +9577,12 @@ function collectVariantFields(stmts: i32[], name: string) {
   if nameIsShapeSpanEnds(name) {
     return collectShapeVariantFields(name, declTyIxOfName(name))
   }
-  let i = 0
-  while i < stmts.length {
-    const s = P.nodes[stmts[i]]
+  // The declaration this variant names, from the index `collectU` built — the forward scan
+  // this replaces took the FIRST `TypeDecl` spelling `name` and the index records the same
+  // one. A miss is the refusal at the tail, reached the same way an exhausted scan reached it.
+  const dsIx = declStructNodeOf(stmts, name)
+  if dsIx >= 0 {
+    const s = P.nodes[dsIx]
     if s is TypeDecl {
       if s.tdName == name {
         uFieldStart.push(uFieldNames.length)
@@ -9648,7 +9657,6 @@ function collectVariantFields(stmts: i32[], name: string) {
         return 0
       }
     }
-    i = i + 1
   }
   emitFail("emitProgram: union variant names an unknown struct type")
 }
@@ -9859,20 +9867,78 @@ export function assignTags() {
     }
     ui = ui + 1
   }
+  // The tag of a variant is how many signatures sort strictly below its own, so equal
+  // signatures share a tag. Sorted, that count is the position at which the run of equal
+  // signatures begins: everything before it is strictly smaller and nothing after it is.
   uTags = []
+  const ord: i32[] = []
   let i = 0
   while i < uVariants.length {
-    const sigI = sigs[i]
-    let rank = 0
-    let j = 0
-    while j < uVariants.length {
-      if j != i {
-        if strLess(sigs[j], sigI) { rank = rank + 1 }
-      }
-      j = j + 1
-    }
-    uTags.push(rank)
+    uTags.push(0)
+    ord.push(i)
     i = i + 1
+  }
+  sigRankOrder(sigs, ord)
+  let p = 0
+  while p < ord.length {
+    let q = p
+    while q < ord.length && sigs[ord[q]] == sigs[ord[p]] { q = q + 1 }
+    let t = p
+    while t < q {
+      uTags[ord[t]] = p
+      t = t + 1
+    }
+    p = q
+  }
+  0
+}
+
+// Orders `ord` — indices into `keys` — by `strLess` on the key it names, bottom-up so the
+// merge depth is a loop and not a recursion. Ties keep no promised order, which the ranking
+// above does not depend on: two variants with the same signature take the same tag.
+function sigRankOrder(keys: string[], ord: i32[]) {
+  const n = ord.length
+  const buf: i32[] = []
+  let z = 0
+  while z < n {
+    buf.push(0)
+    z = z + 1
+  }
+  let width = 1
+  while width < n {
+    let lo = 0
+    while lo < n {
+      let mid = lo + width
+      if mid > n { mid = n }
+      let hi = lo + width + width
+      if hi > n { hi = n }
+      let a = lo
+      let b = mid
+      let k = lo
+      while k < hi {
+        // The left run wins a tie, so an equal pair keeps its earlier index first; the merge
+        // takes from the right only when the left is spent or the right key is strictly less.
+        let fromLeft = a < mid
+        if fromLeft && b < hi {
+          fromLeft = !strLess(keys[ord[b]], keys[ord[a]])
+        }
+        if fromLeft {
+          buf[k] = ord[a]
+          a = a + 1
+        } else {
+          buf[k] = ord[b]
+          b = b + 1
+        }
+        k = k + 1
+      }
+      lo = hi
+    }
+    let c = 0
+    while c < n {
+      ord[c] = buf[c]
+      c = c + 1
+    }
+    width = width + width
   }
   0
 }
@@ -10047,7 +10113,7 @@ function registerInlineUnionAt(stmts: i32[], name: string, site: i32, ty: i32) {
   unTyIx.push(declTyIxOfName(name)) // B-1 step 1: resolve ONCE at mint, like `sTyIx`
   unKey.push(canonUnionKeyOfName(name)) // D-UNIONKEY: obtained from canon, never rendered
   unDeclIx.push(-1) // inline union: no declaration node
-  unMemberSet.push(name)
+  unMemberSetPush(name)
   recordUnMemTys(name) // D-UNION foundation
   // The member list below is the row just recorded, not a second split of `name`:
   // `recordUnMemTys` already split it once, so this just reads the tail it appended.
@@ -10693,6 +10759,10 @@ export function reconcileVariantFieldSpans() {
 // `uVariants` list, and collects each variant's fields into the flat table. Multiple unions
 // coexist. Returns 0, or -1 (via `emitFail`).
 export function collectU(stmts: i32[]) {
+  // The declared-struct-name index, rebuilt here rather than memoised: a second module in the
+  // same instance can present a statement list of the same length, which the index's own
+  // stamp cannot see. Every `isStructAtom` ask in this pass and in mono's reads it.
+  declStructIndexBuild(stmts)
   // The first emit pass, so this is the first thing in the emitter that would walk a
   // declared type — reject the ones no renderer can finish before any of them tries.
   if guardFiniteUserTypes() < 0 { return -1 }
@@ -10707,6 +10777,7 @@ export function collectU(stmts: i32[]) {
   unKey = []
   unDeclIx = []
   unMemberSet = []
+  unRowByMemberSid = []
   unMemTyStart = []
   unMemTyCount = []
   unMemTys = []
@@ -10725,6 +10796,8 @@ export function collectU(stmts: i32[]) {
   uFieldElemName = []
   uFieldElemTyIx = []
   uFieldElemKeyI32 = []
+  variantSigMemoDrop()
+  objVariantIndexDrop()
   let i = 0
   while i < stmts.length {
     // D1519 — the declaration cursor `emitFail` anchors refusals at, since this pass runs before
@@ -10773,7 +10846,7 @@ export function collectU(stmts: i32[]) {
         udSet = udSet + udMem
         usj = usj + 1
       }
-      unMemberSet.push(udSet)
+      unMemberSetPush(udSet)
       // Keyed on the set this row actually records, not the alias name — the row's tag slice
       // is positional over `udSet`, which a query must reproduce to name this row.
       unKey.push(canonUnionKeyOfName(udSet))

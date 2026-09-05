@@ -10,17 +10,17 @@
 // One pair per axis a pass could accidentally multiply over. The "many" arm spreads the
 // same work over N entities, the "one" arm over N/K. Method and profiles:
 // docs/internals/profiling-the-compiler.md.
+//
+// @test-timing instrument
 
-// THREE AXES ARE SUPER-LINEAR TODAY and carry a bar above their measured ratio rather
-// than the default. That is recorded DEBT, not tolerance: each names the function that
-// makes it so. All three are a name-keyed registry answering a lookup by linear scan —
-// the track `__str_eq__` has topped the self-compile profile since #2419 closed the arena
-// scans. `generic pins` used to be a fourth, and reading it as one of these cost a
-// campaign: it was a whole-program PASS re-run once per minted instance, the #2419 shape
-// one phase over, and it left the list when that pass learned to resume. Lower a bar when
-// the thing it names stops multiplying. `unions` joined the list when a constant term left
-// BOTH its arms, which is worth keeping in mind before reading any ratio here as a
-// property of its own axis.
+// TWO AXES ARE SUPER-LINEAR TODAY and carry a bar above their measured ratio rather than
+// the default. That is recorded DEBT, not tolerance: each names the function that makes it
+// so, and both answer a name by linear scan over a registry table, which is why `__str_eq__`
+// tops their profiles. Two have left the list: `generic pins` when its per-instance pass
+// learned to resume, and `unions` when the five scans under it came off — and reading either
+// as still super-linear costs a campaign. Lower a bar when the thing it names stops
+// multiplying, and RESIZE the pair when its cheap arm falls under the floor, because from
+// there the reading is a budget on the dear arm and not a ratio at all.
 
 import { ROOT, VL, exists } from "./support/tree.ts";
 
@@ -280,23 +280,19 @@ axis(
 axis("types", 2.5, "A per-declaration cost is scaling with the type table.", (d) =>
   twoFiles(d, genTypes(2500, 1), genTypes(2500, 20)));
 
-// 1.84 / 1.84 / 1.80 / 1.78 / 1.78, against 2.39 / 2.36 / 2.34 / 2.36 / 2.41 for the same
-// pair before the union registry was sid-keyed — the many arm 0.59 s -> 0.45 s while the one
-// arm holds at 0.17 s, which is the per-union cost being what left (perf items 5 and 7, §F8).
-// The axis was hidden before that: both arms declare 801 module-level bindings, so both used
-// to pay the definite-assignment set's per-write rebuild, 41.7 s against 37.8 s at 2,400.
-// The cheap arm costs less than the shared 0.4 s floor, which would turn the quotient into
-// an absolute budget on the many arm, so this pair takes 0.25 — above a process start, below
-// its own denominator at the loads #2584 measured. The bar is 2.22x the after-median, the
-// clearance `callback slots` keeps over an almost identical reading, and it was flake-tested
-// rather than argued: 8 of 8 green at load 103 to 115 with a fanned-out gate beside it. The
-// arms are short enough that a scheduler spike doubles one — this pair drew 5.25 once in four
-// rounds at load 70 — which is what the per-side re-measure above absorbs.
+// The pair moved 800 -> 2,400 because at 800 the cheap arm ran 0.16 s under a 0.25 s floor:
+// the floor was the denominator, so the reading was an absolute budget and a constant-factor
+// regression was invisible. At 2,400 the cheap arm is 0.6 to 1.2 s, 2.4 to 3.2x the floor, so
+// the reading is a ratio again — median 1.28 to 1.40 over 44 interleaved rounds spanning load
+// 22 to 235, against master's 1.42 to 1.48 beside it. The arms have converged, so the bar
+// would be the family default; it sits at 3.0 because one round of the 44 drew 2.30 and 2.5
+// would have 1.09x on that. 3.0 is 1.3x the worst round and 1.8x the second worst, and the
+// pre-#2630 compiler — still carrying the scans since taken off this axis — reads 4.42 here.
 axis(
   "unions",
-  4.0,
-  "A per-union cost is scaling with the union registry.",
-  (d) => twoFiles(d, genUnions(800, 1), genUnions(800, 20)),
+  3.0,
+  "No frame is above 5% on this axis any more — profile the many arm before naming a cause.",
+  (d) => twoFiles(d, genUnions(2400, 1), genUnions(2400, 20)),
   0.25,
 );
 

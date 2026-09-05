@@ -19,6 +19,9 @@
 //
 // GATING: same as tests/selfhost_native_align_test.ts — env-gated
 // (`SELFHOST_NATIVE_ALIGN=1`) AND requires the built binary + seed wasm.
+//
+// @test-timing native
+// @test-timing instrument name~"files run in PARALLEL"
 
 // The extension's own report parser and anchor resolver, so the editor payoff is
 // graded against the RUNNER'S REAL OUTPUT rather than a retyped sample. Pure —

@@ -18,6 +18,8 @@
 // check-clean invalid-wasm program (`scripts/goal-scoreboard.py` names the population).
 //
 // GATING: `SELFHOST_NATIVE_ALIGN=1` plus the built binary and seed, as vl_check_dir_test.ts.
+//
+// @test-timing native
 
 import { COMPILER, ROOT, VL, exists } from "./support/tree.ts";
 

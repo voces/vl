@@ -19,8 +19,10 @@
 // grammar's OWN list, so adding an axis nothing can generate fails here rather than
 // silently narrowing every future run. `modules_split` needs one assertion of its own:
 // its faces differ by the NUMBER OF FILES, which axis coverage cannot see.
+//
+// @test-timing instrument
 
-import { COMPILER, ROOT, VL, exists } from "./support/tree.ts";
+import { COMPILER, ROOT, VL, exists, pythonBin } from "./support/tree.ts";
 
 const SAMPLE = `${ROOT}/scripts/day-one/sample.py`;
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
@@ -30,7 +32,7 @@ if (GATED && !ENABLED) {
 }
 
 const run = async (args: string[]): Promise<{ code: number; out: string }> => {
-  const { code, stdout, stderr } = await new Deno.Command("python3", {
+  const { code, stdout, stderr } = await new Deno.Command(pythonBin(), {
     args: [SAMPLE, ...args, "--compiler", COMPILER],
     stdout: "piped",
     stderr: "piped",

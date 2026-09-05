@@ -18,8 +18,10 @@
 //
 // GATING: env-gated (`SELFHOST_NATIVE_ALIGN=1`) AND requires the built binary +
 // seed wasm, like the other native `vl_*` suites.
+//
+// @test-timing sweep n=30
 
-import { COMPILER, ROOT, VL, exists, nativeEnv } from "./support/tree.ts";
+import { COMPILER, ROOT, VL, exists, nativeEnv, pythonBin } from "./support/tree.ts";
 
 const SCRIPT = `${ROOT}/scripts/ladder-budget.py`;
 const INCOMPLETE = "kind-ladder-incomplete";
@@ -150,7 +152,7 @@ function ctrlB(k: string): i32 {
 type Hits = { lines: Record<string, number[]>; msgs: Record<string, string[]> };
 
 const script = async (path: string): Promise<Hits> => {
-  const { code, stdout, stderr } = await new Deno.Command("python3", {
+  const { code, stdout, stderr } = await new Deno.Command(pythonBin(), {
     args: [SCRIPT, "--grade", path],
     stdout: "piped",
     stderr: "piped",
@@ -257,7 +259,7 @@ Deno.test({
   name: "kind-ladder: the lint's closed-set copy still matches the tree",
   ignore: !GATED,
   fn: async () => {
-    const { code, stdout, stderr } = await new Deno.Command("python3", {
+    const { code, stdout, stderr } = await new Deno.Command(pythonBin(), {
       args: [SCRIPT, "--check"],
       stdout: "piped",
       stderr: "piped",

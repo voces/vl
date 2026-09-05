@@ -11,13 +11,17 @@
 // gate row rests on: any export the tree stops referencing fails CI.
 //
 // Pure Python + a file walk — no seed, no binary, so it runs everywhere.
+//
+// @test-timing sweep n=30
+
+import { pythonBin } from "./support/tree.ts";
 
 const ROOT = new URL("../", import.meta.url).pathname.replace(/\/$/, "");
 const SCRIPT = `${ROOT}/scripts/export-budget.py`;
 const BASELINE = `${ROOT}/scripts/export-budget-baseline.json`;
 
 const run = async (args: string[]): Promise<string> => {
-  const { code, stdout, stderr } = await new Deno.Command("python3", {
+  const { code, stdout, stderr } = await new Deno.Command(pythonBin(), {
     args: [SCRIPT, ...args],
     stdout: "piped",
     stderr: "piped",

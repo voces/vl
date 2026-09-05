@@ -192,7 +192,24 @@ not one of the five census blocks `A`–`E`.
 
 ## `expected.jsonl` carries only what is READ, because a stale field reads as live
 
-It holds `block` and `represents`. It used to hold `class` and `msg` too, written from the
+It holds `block` and `represents`, and **every graded cell has a row** — `regress.py`
+refuses to grade a corpus it cannot describe, in either direction, before it pays for the
+grade. It used to DEFAULT a missing row to block `A`, `represents` 0, and 584 curated cells
+from eleven `named/` landings had no row at all: the split line read 2,061/5,504 for
+directories holding 1,477/6,088, and a movement in any of those 584 would have reported
+`0 of 255505 census cells`. `redistil.py` owns the derived rows and carries the curated ones
+over untouched; `index.py` owns the curated half, and a landing that adds a named set writes
+both files in one move:
+
+```sh
+python3 regress.py <seed.wasm> --write-baseline --set <named-set>
+python3 index.py --check          # every cell has a row, every row a cell, every set a source
+```
+
+A set name must already be a key in `named/sources.json`. That is the same rule one level
+out: a set nobody described is another confident answer nobody computed.
+
+It used to hold `class` and `msg` too, written from the
 last graded snapshot — and nothing refreshed them when a landing moved the baseline. Measured
 2026-08-29: **1,593 of 3,671 cells (43%) disagreed with `baseline.jsonl`**, and an agent
 grading D501 nearly took a verdict off the stale copy.

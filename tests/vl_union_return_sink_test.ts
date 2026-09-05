@@ -48,6 +48,8 @@
 // the playbook requires on PATH). A missing prerequisite self-ignores rather than fails,
 // so read the suite's IGNORED COUNT, not just its pass count — extra ignores here mean the
 // prerequisites broke, not that anything was proven.
+//
+// @test-timing native
 
 import { COMPILER, ROOT, VL, exists, nativeEnv } from "./support/tree.ts";
 

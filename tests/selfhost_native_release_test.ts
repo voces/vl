@@ -2,6 +2,8 @@
 // outranking `-O`, and the two no-wasm-opt arms. The table-driven rows moved to
 // `selfhost_native_release_{shape,melt,loops}_test.ts` so `deno test --parallel`
 // can spread them; the machinery is in the shared support module.
+//
+// @test-timing opt
 import {
   COMPILER,
   ENABLED,
