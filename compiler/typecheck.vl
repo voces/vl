@@ -13818,6 +13818,180 @@ function containerElemClassDiffers(se: i32, de: i32): boolean {
   sc != dc
 }
 
+// —— which binding does a name mean: the frame table the write scan keys on (D1610/D1611) ——
+// A name is not a value: two functions may each bind `b` and mean two lists. Every predicate
+// below keys on the pair (name, frame), so a same-named handle another frame cannot reach
+// neither spends D852's aliasing guard nor counts as a write through this one.
+
+// The enclosing function frame of every arena node: a `FuncDecl` index, `CW_FR_MOD` at module
+// scope, `CW_FR_UNKNOWN` for a node no `Program` reaches. Frames are FUNCTION-wide, not block-
+// wide, deliberately: `parentLetOf` gives the emitter one local per name per body, so a finer
+// answer here would license a copy the emitter then applies to a conflated slot.
+const CW_FR_MOD = -1
+// Matches every frame — the conservative answer. A binder this walk does not model (a
+// `MatchExpr` arm's payload `const`, before `desugarMatchAt` rewrites it) lands here, so an
+// unmodelled shape stays exactly as coarse as a bare name is, never coarser.
+const CW_FR_UNKNOWN = -2
+let cwFrameOf: i32[] = []
+// Per frame, the names it declares, as a linked list: `cwDeclHead` is indexed by the frame's
+// own arena node, `cwModHead` is module scope's, and a row carries the interned name.
+let cwDeclHead: i32[] = []
+let cwDeclNext: i32[] = []
+let cwDeclSid: i32[] = []
+let cwModHead = -1
+// The enclosing frame of a frame, indexed by its `FuncDecl` node — the chain a name walks out
+// along. A lambda is a `FuncDecl` with an empty name, so capture needs no arm of its own.
+let cwFrameUp: i32[] = []
+let cwFramesBuilt = false
+
+function cwFrameReset() {
+  cwFrameOf = []
+  cwDeclHead = []
+  cwDeclNext = []
+  cwDeclSid = []
+  cwFrameUp = []
+  cwModHead = -1
+  cwFramesBuilt = false
+  0
+}
+
+// Record that frame `fr` declares `nm`. Module scope keeps its head in a scalar rather than
+// at a table index, since its frame id is -1 and there is no row -1 to read.
+function cwDeclare(fr: i32, nm: string) {
+  const row = cwDeclSid.length
+  if fr == CW_FR_MOD {
+    cwDeclNext.push(cwModHead)
+    cwModHead = row
+  } else if fr >= 0 && fr < cwDeclHead.length {
+    cwDeclNext.push(cwDeclHead[fr])
+    cwDeclHead[fr] = row
+  } else {
+    return 0
+  }
+  cwDeclSid.push(sidOf(nm))
+  0
+}
+
+// The head of frame `fr`'s declaration list, or -1 where the frame has none.
+function cwDeclHeadOf(fr: i32): i32 {
+  if fr == CW_FR_MOD { return cwModHead }
+  if fr < 0 || fr >= cwDeclHead.length { return -1 }
+  cwDeclHead[fr]
+}
+
+// Does frame `fr` declare `sid`?
+function cwFrameDeclares(fr: i32, sid: i32): boolean {
+  let r = cwDeclHeadOf(fr)
+  while r >= 0 {
+    if cwDeclSid[r] == sid { return true }
+    r = cwDeclNext[r]
+  }
+  false
+}
+
+// The walk. Mirrors `lint.vl`'s `bindScan` arm for arm — a binder it grows and this does not
+// is a name that resolves to `CW_FR_UNKNOWN`, which matches everything, so the two may differ
+// in precision but never in soundness.
+function cwFrameWalk(ix: i32, fr: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  cwFrameOf[ix] = fr
+  const n = P.nodes[ix]
+  if n is LetDecl { cwDeclare(fr, n.letName) }
+  if n is ForRange { cwDeclare(fr, n.frVar) }
+  if n is ForIn { cwDeclare(fr, n.fiVar) }
+  if n is FuncDecl {
+    // The declaration's own name binds OUTSIDE the frame it opens; its params and body are in.
+    cwDeclare(fr, n.fnName)
+    cwFrameUp[ix] = fr
+    let p = 0
+    while p < n.fnParams.length {
+      const pix = n.fnParams[p]
+      if pix >= 0 && pix < P.nodes.length {
+        const pn = P.nodes[pix]
+        if pn is Param { cwDeclare(ix, pn.parName) }
+        cwFrameWalk(pix, ix)
+      }
+      p = p + 1
+    }
+    cwFrameWalk(n.fnBody, ix)
+    return 0
+  }
+  const kids = nodeChildren(ix)
+  let i = 0
+  while i < kids.length {
+    cwFrameWalk(kids[i], fr)
+    i = i + 1
+  }
+  0
+}
+
+// One grow pass sizes the three columns and collects the roots as it goes, then the walk runs
+// over the roots — several `Program` nodes stand in one arena after a module merge (D661).
+// Memoised on `cwFramesBuilt`, which `covarValueWriteState` drops with the rest of the memo
+// when the monomorphizer has grown the arena under it.
+function cwBuildFrames() {
+  if cwFramesBuilt { return 0 }
+  cwFrameReset()
+  const roots: i32[] = []
+  while cwFrameOf.length < P.nodes.length {
+    const at = cwFrameOf.length
+    cwFrameOf.push(CW_FR_UNKNOWN)
+    cwDeclHead.push(-1)
+    cwFrameUp.push(CW_FR_MOD)
+    const n = P.nodes[at]
+    if n is Program { roots.push(at) }
+  }
+  let r = 0
+  while r < roots.length {
+    const pn = P.nodes[roots[r]]
+    if pn is Program {
+      let s = 0
+      while s < pn.progStmts.length {
+        cwFrameWalk(pn.progStmts[s], CW_FR_MOD)
+        s = s + 1
+      }
+    }
+    r = r + 1
+  }
+  cwFramesBuilt = true
+  0
+}
+
+// The frame the name at `ix` resolves in: walk out from `ix`'s own frame to the first that
+// declares it, module scope last. `CW_FR_UNKNOWN` where nothing does — an undeclared name or a
+// binder this walk does not model — and that matches every frame rather than none.
+function cwFrameOfUse(ix: i32, nm: string): i32 {
+  if ix < 0 || ix >= P.nodes.length { return CW_FR_UNKNOWN }
+  cwBuildFrames()
+  let fr = cwFrameOf[ix]
+  if fr == CW_FR_UNKNOWN { return CW_FR_UNKNOWN }
+  const sid = sidOf(nm)
+  while fr >= 0 && fr < cwFrameUp.length {
+    if cwFrameDeclares(fr, sid) { return fr }
+    fr = cwFrameUp[fr]
+  }
+  if cwFrameDeclares(CW_FR_MOD, sid) { return CW_FR_MOD }
+  CW_FR_UNKNOWN
+}
+
+// Are two resolved frames the same binding? `CW_FR_UNKNOWN` on either side matches, which is
+// what holds an unmodelled binder at the coarsest answer rather than a wrong one.
+function cwSameFrame(a: i32, b: i32): boolean {
+  if a == CW_FR_UNKNOWN { return true }
+  if b == CW_FR_UNKNOWN { return true }
+  a == b
+}
+
+// The frame a root identifier at `ix` resolves in — the key the alias set carries beside the
+// name, so two same-named handles in different functions are two values.
+export function covarRootFrame(ix: i32): i32 {
+  const p = cwPeel(ix)
+  if p < 0 || p >= P.nodes.length { return CW_FR_UNKNOWN }
+  const n = P.nodes[p]
+  if n is Ident { return cwFrameOfUse(p, n.identName) }
+  CW_FR_UNKNOWN
+}
+
 // —— written-through covariance: the per-value half of D791's write scan (D821) ——
 // D791 lowered a read-only covariant list assignment as an element-converting copy, licensed
 // by a rep-scoped predicate that declines on an unrelated list sharing an element rep — a
@@ -13827,6 +14001,9 @@ function containerElemClassDiffers(se: i32, de: i32): boolean {
 // not change between `check` and `emit`, so the two answers are literally the same row;
 // `cwArenaLen` drops the memo once the monomorphizer clones nodes into it.
 let cwRootNames: string[] = []
+// Parallel to `cwRootNames`: the frame each memoised root resolved in, so two functions'
+// same-named handles get two rows rather than sharing one answer (D1610/D1611).
+let cwRootFrames: i32[] = []
 let cwAnswers: i32[] = []
 // Parallel to `cwAnswers`: 1 where the alias set demands two element storages
 // (`cwSplitStorage`), 0 otherwise. Meaningful only where the closure actually ran.
@@ -13842,6 +14019,7 @@ let cwFnBuilt = false
 
 export function covarWriteReset() {
   cwRootNames = []
+  cwRootFrames = []
   cwAnswers = []
   cwSplits = []
   cwArenaLen = -1
@@ -13849,6 +14027,7 @@ export function covarWriteReset() {
   cwFnNames = []
   cwFnDecls = []
   cwFnBuilt = false
+  cwFrameReset()
 }
 
 // `unwrapParen`'s twin — that one lives in `emit_base`, which is downstream of this file.
@@ -13874,13 +14053,34 @@ export function covarRootName(ix: i32): string {
   ""
 }
 
-function cwHas(set: string[], nm: string): boolean {
+// Is (`nm`, `fr`) in the alias set? The set carries a frame beside every name, so two
+// same-named handles in different functions are two values (D1610/D1611).
+function cwHas(set: string[], setFr: i32[], nm: string, fr: i32): boolean {
   let i = 0
   while i < set.length {
-    if set[i] == nm { return true }
+    if set[i] == nm {
+      if cwSameFrame(setFr[i], fr) { return true }
+    }
     i = i + 1
   }
   false
+}
+
+// Add (`nm`, `fr`) to the set unless it is already there.
+function cwAdd(set: string[], setFr: i32[], nm: string, fr: i32): boolean {
+  if cwHas(set, setFr, nm, fr) { return false }
+  set.push(nm)
+  setFr.push(fr)
+  true
+}
+
+// The frame a BINDING node declares into — its own enclosing frame, which is the function
+// frame for a `Param` because the walk enters params under the `FuncDecl` they belong to.
+function cwFrameOfDecl(ix: i32): i32 {
+  if ix < 0 { return CW_FR_UNKNOWN }
+  cwBuildFrames()
+  if ix >= cwFrameOf.length { return CW_FR_UNKNOWN }
+  cwFrameOf[ix]
 }
 
 // The mutating list methods, `rlSlotWrittenScan`'s own set. `set`/`add`/`delete` are map
@@ -13935,6 +14135,19 @@ function cwParamName(fnName: string, argIx: i32): string {
   ""
 }
 
+// The `FuncDecl` node of the top-level function `fnName`, or `CW_FR_UNKNOWN`. A parameter
+// declares into the frame its own function opens, so this is the frame the argument edge
+// binds the parameter in.
+function cwParamFrame(fnName: string): i32 {
+  cwBuildFnTable()
+  let i = 0
+  while i < cwFnNames.length {
+    if cwFnNames[i] == fnName { return cwFnDecls[i] }
+    i = i + 1
+  }
+  CW_FR_UNKNOWN
+}
+
 // A call with named arguments binds by name, not by position, so the positional
 // argument->parameter edge below would read the wrong parameter. Decline instead.
 function cwCallNamed(names: string[]): boolean {
@@ -13950,7 +14163,13 @@ function cwCallNamed(names: string[]): boolean {
 // The field name a member of `set` is stored into by an object literal — the shape the
 // three name-to-name edges have neither end of: `{ xs: b }` puts the list inside a struct
 // and `bx.xs` takes it back out under a name the closure never saw, keyed by the container's name plus the field name.
-function cwEscapedFields(set: string[], owners: string[], flds: string[]) {
+function cwEscapedFields(
+  set: string[],
+  setFr: i32[],
+  owners: string[],
+  ownerFrs: i32[],
+  flds: string[],
+) {
   let i = 0
   while i < P.nodes.length {
     const n = P.nodes[i]
@@ -13958,15 +14177,17 @@ function cwEscapedFields(set: string[], owners: string[], flds: string[]) {
       if n.letInit >= 0 {
         const lit = P.nodes[cwPeel(n.letInit)]
         if lit is ObjLit {
-          if cwBoundOnce(n.letName) {
+          const ofr = cwFrameOfDecl(i)
+          if cwBoundOnce(n.letName, ofr) {
             let k = 0
             while k < lit.objFields.length {
               const fn = P.nodes[lit.objFields[k]]
               if fn is FieldInit {
                 const rn = covarRootName(fn.fiValue)
                 if rn != "" {
-                  if cwHas(set, rn) {
+                  if cwHas(set, setFr, rn, covarRootFrame(fn.fiValue)) {
                     owners.push(n.letName)
+                    ownerFrs.push(ofr)
                     flds.push(fn.fiName)
                   }
                 }
@@ -13982,23 +14203,30 @@ function cwEscapedFields(set: string[], owners: string[], flds: string[]) {
   0
 }
 
-// Is `nm` bound exactly once in the whole program and never assigned? The guard that makes
-// a binding name usable as a container identity — a name that can be re-pointed by `bx =
-// other` is not an identity at all.
-function cwBoundOnce(nm: string): boolean {
+// Is `nm` bound exactly once in frame `fr`, and never assigned there? The guard that makes a
+// binding name usable as a container identity — a name re-pointed by `bx = other` is not an
+// identity at all. Per frame, not program-wide: a binding of the name in a function that
+// cannot see this one is a different container and must not spend the guard (D1610).
+function cwBoundOnce(nm: string, fr: i32): boolean {
   let binds = 0
   let i = 0
   while i < P.nodes.length {
     const n = P.nodes[i]
     if n is LetDecl {
-      if n.letName == nm { binds = binds + 1 }
+      if n.letName == nm {
+        if cwSameFrame(cwFrameOfDecl(i), fr) { binds = binds + 1 }
+      }
     }
     if n is Param {
-      if n.parName == nm { binds = binds + 1 }
+      if n.parName == nm {
+        if cwSameFrame(cwFrameOfDecl(i), fr) { binds = binds + 1 }
+      }
     }
     if n is BinExpr {
       if n.binOp == "=" {
-        if covarRootName(n.binLeft) == nm { return false }
+        if covarRootName(n.binLeft) == nm {
+          if cwSameFrame(covarRootFrame(n.binLeft), fr) { return false }
+        }
       }
     }
     i = i + 1
@@ -14009,31 +14237,54 @@ function cwBoundOnce(nm: string): boolean {
 // Is `ix` a read of an escaped field (`<owner>.<f>` for a recorded pair)? Such a read is a
 // handle on the value with no name of its own; the three edges bind it exactly as they bind
 // a member name, so `const c = bx.xs` joins `c` and `bx.xs.push(…)` is a write.
-function cwIsEscapedHandle(ix: i32, owners: string[], flds: string[]): boolean {
+function cwIsEscapedHandle(
+  ix: i32,
+  owners: string[],
+  ownerFrs: i32[],
+  flds: string[],
+): boolean {
   if flds.length == 0 { return false }
   const p = cwPeel(ix)
   if p < 0 || p >= P.nodes.length { return false }
   const n = P.nodes[p]
   if n is Member {
-    return cwEscapedPairHas(covarRootName(n.memObj), n.memProp, owners, flds)
+    return cwEscapedPairHas(
+      covarRootName(n.memObj),
+      covarRootFrame(n.memObj),
+      n.memProp,
+      owners,
+      ownerFrs,
+      flds,
+    )
   }
   if n is OptMember {
-    return cwEscapedPairHas(covarRootName(n.omObj), n.omProp, owners, flds)
+    return cwEscapedPairHas(
+      covarRootName(n.omObj),
+      covarRootFrame(n.omObj),
+      n.omProp,
+      owners,
+      ownerFrs,
+      flds,
+    )
   }
   false
 }
 
 function cwEscapedPairHas(
   onm: string,
+  ofr: i32,
   prop: string,
   owners: string[],
+  ownerFrs: i32[],
   flds: string[],
 ): boolean {
   if onm == "" { return false }
   let i = 0
   while i < owners.length {
     if owners[i] == onm {
-      if flds[i] == prop { return true }
+      if flds[i] == prop {
+        if cwSameFrame(ownerFrs[i], ofr) { return true }
+      }
     }
     i = i + 1
   }
@@ -14044,15 +14295,16 @@ function cwEscapedPairHas(
 // list value from one name to another without putting it inside anything (a passthrough
 // binding, an assignment to a plain identifier, a call argument reaching a declared
 // function's parameter). Returns 0 when the closure completed, 2 when it hit a form it does not model.
-function cwGrow(set: string[]): i32 {
+function cwGrow(set: string[], setFr: i32[]): i32 {
   let changed = true
   let rounds = 0
   while changed {
     changed = false
     rounds = rounds + 1
     const fowners: string[] = []
+    const fownerFrs: i32[] = []
     const flds: string[] = []
-    cwEscapedFields(set, fowners, flds)
+    cwEscapedFields(set, setFr, fowners, fownerFrs, flds)
     // The set grows by at least one name per round or the loop ends, so the bound is the
     // number of names in the program — cheaper than proving it, and turns any surprise into
     // a decline rather than a hang.
@@ -14065,14 +14317,15 @@ function cwGrow(set: string[]): i32 {
           const rn = covarRootName(n.letInit)
           let carries = false
           if rn != "" {
-            if cwHas(set, rn) { carries = true }
-          }
-          if cwIsEscapedHandle(n.letInit, fowners, flds) { carries = true }
-          if carries {
-            if !cwHas(set, n.letName) {
-              set.push(n.letName)
-              changed = true
+            if cwHas(set, setFr, rn, covarRootFrame(n.letInit)) {
+              carries = true
             }
+          }
+          if cwIsEscapedHandle(n.letInit, fowners, fownerFrs, flds) {
+            carries = true
+          }
+          if carries {
+            if cwAdd(set, setFr, n.letName, cwFrameOfDecl(i)) { changed = true }
           }
         }
       }
@@ -14081,16 +14334,19 @@ function cwGrow(set: string[]): i32 {
           const rn = covarRootName(n.binRight)
           let carries = false
           if rn != "" {
-            if cwHas(set, rn) { carries = true }
+            if cwHas(set, setFr, rn, covarRootFrame(n.binRight)) {
+              carries = true
+            }
           }
-          if cwIsEscapedHandle(n.binRight, fowners, flds) { carries = true }
+          if cwIsEscapedHandle(n.binRight, fowners, fownerFrs, flds) {
+            carries = true
+          }
           if carries {
             const ln = covarRootName(n.binLeft)
             // `m[k] = b` / `o.f = b` — the value goes inside something, and a later read
             // out of that container is a handle this analysis cannot name.
             if ln == "" { return 2 }
-            if !cwHas(set, ln) {
-              set.push(ln)
+            if cwAdd(set, setFr, ln, covarRootFrame(n.binLeft)) {
               changed = true
             }
           }
@@ -14102,9 +14358,11 @@ function cwGrow(set: string[]): i32 {
         while k < n.callArgs.length {
           const an = covarRootName(n.callArgs[k])
           if an != "" {
-            if cwHas(set, an) { anyMember = true }
+            if cwHas(set, setFr, an, covarRootFrame(n.callArgs[k])) {
+              anyMember = true
+            }
           }
-          if cwIsEscapedHandle(n.callArgs[k], fowners, flds) {
+          if cwIsEscapedHandle(n.callArgs[k], fowners, fownerFrs, flds) {
             anyMember = true
           }
           k = k + 1
@@ -14115,23 +14373,23 @@ function cwGrow(set: string[]): i32 {
           // A method or a lambda-valued callee (`xs.push(b)`, `fp(b)`): the body that
           // receives the value is not a declared parameter list this can read.
           if cn == "" { return 2 }
+          const cfr = cwParamFrame(cn)
           let k2 = 0
           while k2 < n.callArgs.length {
             const a2 = covarRootName(n.callArgs[k2])
             let carries2 = false
             if a2 != "" {
-              if cwHas(set, a2) { carries2 = true }
+              if cwHas(set, setFr, a2, covarRootFrame(n.callArgs[k2])) {
+                carries2 = true
+              }
             }
-            if cwIsEscapedHandle(n.callArgs[k2], fowners, flds) {
+            if cwIsEscapedHandle(n.callArgs[k2], fowners, fownerFrs, flds) {
               carries2 = true
             }
             if carries2 {
               const pn = cwParamName(cn, k2)
               if pn == "" { return 2 }
-              if !cwHas(set, pn) {
-                set.push(pn)
-                changed = true
-              }
+              if cwAdd(set, setFr, pn, cfr) { changed = true }
             }
             k2 = k2 + 1
           }
@@ -14158,14 +14416,14 @@ function cwMark(idents: i32[], flags: i32[], ix: i32) {
 // this test, since a form nobody thought of is silently treated as safe under the other
 // shape. Every occurrence of a member name must be a binding initializer, either side of an
 // assignment, a call argument, a member-access object, or an index array; anything else is left unclaimed, the `2` answer.
-function cwClaimed(set: string[]): boolean {
+function cwClaimed(set: string[], setFr: i32[]): boolean {
   const idents: i32[] = []
   const flags: i32[] = []
   let i = 0
   while i < P.nodes.length {
     const n = P.nodes[i]
     if n is Ident {
-      if cwHas(set, n.identName) {
+      if cwHas(set, setFr, n.identName, cwFrameOfUse(i, n.identName)) {
         idents.push(i)
         flags.push(0)
       }
@@ -14242,7 +14500,13 @@ function cwProgramHasWrite(): boolean {
 // The write pass over a completed alias set. A write whose receiver roots at a member is a
 // definite hit (1); one rooting at nothing (`m["k"][0] = v`, `f()[0] = v`) could be any list
 // and is a decline (2). An escaped-field receiver (`p.xs.push(…)`, D852) is tested before the decline, since that shape has no name.
-function cwWrites(set: string[], owners: string[], flds: string[]): i32 {
+function cwWrites(
+  set: string[],
+  setFr: i32[],
+  owners: string[],
+  ownerFrs: i32[],
+  flds: string[],
+): i32 {
   let i = 0
   while i < P.nodes.length {
     const n = P.nodes[i]
@@ -14254,10 +14518,12 @@ function cwWrites(set: string[], owners: string[], flds: string[]): i32 {
           if ln is Index {
             const rn = covarRootName(ln.idxArr)
             if rn == "" {
-              if cwIsEscapedHandle(ln.idxArr, owners, flds) { return 1 }
+              if cwIsEscapedHandle(ln.idxArr, owners, ownerFrs, flds) {
+                return 1
+              }
               return 2
             }
-            if cwHas(set, rn) { return 1 }
+            if cwHas(set, setFr, rn, covarRootFrame(ln.idxArr)) { return 1 }
           }
         }
       }
@@ -14270,10 +14536,12 @@ function cwWrites(set: string[], owners: string[], flds: string[]): i32 {
           if cwMutatesList(cn.memProp) {
             const rn = covarRootName(cn.memObj)
             if rn == "" {
-              if cwIsEscapedHandle(cn.memObj, owners, flds) { return 1 }
+              if cwIsEscapedHandle(cn.memObj, owners, ownerFrs, flds) {
+                return 1
+              }
               return 2
             }
-            if cwHas(set, rn) { return 1 }
+            if cwHas(set, setFr, rn, covarRootFrame(cn.memObj)) { return 1 }
           }
         }
         // `__array_copy__` writes into a destination array through an intrinsic whose
@@ -14313,7 +14581,7 @@ function cwElemKindOfAnn(annIx: i32): i32 {
 // write would expose — exists only where one list value is demanded at both a union-box
 // element row and a plain struct row; where every handle is a union it is built at the box
 // and every handle aliases it (D381). Also asks whether any element is read: reading only `a.length` is correct and refusing it is a clause-2 false reject.
-function cwElemRead(set: string[]): boolean {
+function cwElemRead(set: string[], setFr: i32[]): boolean {
   const stores: i32[] = []
   let i = 0
   while i < P.nodes.length {
@@ -14335,15 +14603,17 @@ function cwElemRead(set: string[]): boolean {
       }
       if !isStore {
         const rn = covarRootName(n.idxArr)
+        const rnf = covarRootFrame(n.idxArr)
         if rn != "" {
-          if cwHas(set, rn) { return true }
+          if cwHas(set, setFr, rn, rnf) { return true }
         }
       }
     }
     if n is ForIn {
       const fn2 = covarRootName(n.fiIter)
+      const fn2f = covarRootFrame(n.fiIter)
       if fn2 != "" {
-        if cwHas(set, fn2) { return true }
+        if cwHas(set, setFr, fn2, fn2f) { return true }
       }
     }
     if n is Call {
@@ -14354,7 +14624,9 @@ function cwElemRead(set: string[]): boolean {
           if cn.memProp == "pop" || cn.memProp == "get" {
             const rn2 = covarRootName(cn.memObj)
             if rn2 != "" {
-              if cwHas(set, rn2) { return true }
+              if cwHas(set, setFr, rn2, covarRootFrame(cn.memObj)) {
+                return true
+              }
             }
           }
         }
@@ -14387,7 +14659,7 @@ function cwUnionElemTyOfAnn(annIx: i32): i32 {
 // Do the declared handles on this value demand two different value unions, and is an
 // element read? Both want the program's one box, but a store through one puts an arm the
 // other's type does not name. Compared with `tySame`, so two aliases of one member set count as one union.
-function cwTwoUnions(set: string[]): boolean {
+function cwTwoUnions(set: string[], setFr: i32[]): boolean {
   const seen: i32[] = []
   let i = 0
   while i < P.nodes.length {
@@ -14395,12 +14667,12 @@ function cwTwoUnions(set: string[]): boolean {
     let ann = -1
     if n is LetDecl {
       if n.letType >= 0 {
-        if cwHas(set, n.letName) { ann = n.letType }
+        if cwHas(set, setFr, n.letName, cwFrameOfDecl(i)) { ann = n.letType }
       }
     }
     if n is Param {
       if n.parType >= 0 {
-        if cwHas(set, n.parName) { ann = n.parType }
+        if cwHas(set, setFr, n.parName, cwFrameOfDecl(i)) { ann = n.parType }
       }
     }
     if ann >= 0 {
@@ -14418,10 +14690,10 @@ function cwTwoUnions(set: string[]): boolean {
     i = i + 1
   }
   if seen.length < 2 { return false }
-  cwElemRead(set)
+  cwElemRead(set, setFr)
 }
 
-function cwSplitStorage(set: string[]): boolean {
+function cwSplitStorage(set: string[], setFr: i32[]): boolean {
   let sawBox = false
   let sawRow = false
   let i = 0
@@ -14429,7 +14701,7 @@ function cwSplitStorage(set: string[]): boolean {
     const n = P.nodes[i]
     if n is LetDecl {
       if n.letType >= 0 {
-        if cwHas(set, n.letName) {
+        if cwHas(set, setFr, n.letName, cwFrameOfDecl(i)) {
           const k = cwElemKindOfAnn(n.letType)
           if k == 1 { sawBox = true }
           if k == 2 { sawRow = true }
@@ -14438,7 +14710,7 @@ function cwSplitStorage(set: string[]): boolean {
     }
     if n is Param {
       if n.parType >= 0 {
-        if cwHas(set, n.parName) {
+        if cwHas(set, setFr, n.parName, cwFrameOfDecl(i)) {
           const k = cwElemKindOfAnn(n.parType)
           if k == 1 { sawBox = true }
           if k == 2 { sawRow = true }
@@ -14455,66 +14727,84 @@ function cwSplitStorage(set: string[]): boolean {
 // (and read an element)? Only meaningful once `covarValueWriteState` has run the closure.
 // Recomputed rather than memoised beside `cwSplits`: this runs mid-check, so the answer at
 // the first assignment cannot see a later handle's annotation — a memo would decide by check order.
-function covarValueTwoUnions(root: string): boolean {
+function covarValueTwoUnions(root: string, rootFr: i32): boolean {
   if root == "" { return false }
   const set: string[] = []
+  const setFr: i32[] = []
   set.push(root)
-  cwGrow(set)
-  cwTwoUnions(set)
+  setFr.push(rootFr)
+  cwGrow(set, setFr)
+  cwTwoUnions(set, setFr)
 }
 
-function covarValueSplitStorage(root: string): boolean {
+function covarValueSplitStorage(root: string, rootFr: i32): boolean {
   let m = 0
   while m < cwRootNames.length {
-    if cwRootNames[m] == root { return cwSplits[m] == 1 }
+    if cwRootNames[m] == root {
+      if cwRootFrames[m] == rootFr { return cwSplits[m] == 1 }
+    }
     m = m + 1
   }
   false
 }
 
-// The predicate. 0 = nothing writes this value, 1 = something does, 2 = unknown.
-export function covarValueWriteState(root: string): i32 {
+// The frame a BINDING node declares into, for a caller holding the declaration rather than a
+// use of it — the emitter's ref-list licence asks about a `LetDecl`.
+export function covarDeclFrame(ix: i32): i32 { cwFrameOfDecl(ix) }
+
+// The predicate. 0 = nothing writes this value, 1 = something does, 2 = unknown. `rootFr` is
+// the frame `root` resolves in (`covarRootFrame` for a use, `covarDeclFrame` for a binding);
+// the pair is the value, since one name may stand for a binding in each frame that spells it.
+export function covarValueWriteState(root: string, rootFr: i32): i32 {
   if root == "" { return 2 }
   if P.nodes.length != cwArenaLen {
     // The monomorphizer clones nodes into the arena after `check`, so an answer computed
     // over the smaller arena describes a program that has since changed. Drop and
     // recompute: this analysis reads every `Ident` in the arena and a clone adds Idents.
     cwRootNames = []
+    cwRootFrames = []
     cwAnswers = []
     cwSplits = []
     cwAnyWrite = -1
     cwFnNames = []
     cwFnDecls = []
     cwFnBuilt = false
+    cwFrameReset()
     cwArenaLen = P.nodes.length
   }
   let m = 0
   while m < cwRootNames.length {
-    if cwRootNames[m] == root { return cwAnswers[m] }
+    if cwRootNames[m] == root {
+      if cwRootFrames[m] == rootFr { return cwAnswers[m] }
+    }
     m = m + 1
   }
   let ans = 0
   let split = 0
   if cwProgramHasWrite() {
     const set: string[] = []
+    const setFr: i32[] = []
     set.push(root)
-    ans = cwGrow(set)
+    setFr.push(rootFr)
+    ans = cwGrow(set, setFr)
     // The write pass runs before the claim pass (D852): a write to a member of the closed
     // set is a positive fact about this value, which the claim pass's `2` had been
     // discarding wherever both fired. The reorder can only move a `2` to a `1`, and only
     // where a definite write exists — such a program is already an invalid module today.
     const wowners: string[] = []
+    const wownerFrs: i32[] = []
     const wflds: string[] = []
-    cwEscapedFields(set, wowners, wflds)
-    if ans == 0 { ans = cwWrites(set, wowners, wflds) }
+    cwEscapedFields(set, setFr, wowners, wownerFrs, wflds)
+    if ans == 0 { ans = cwWrites(set, setFr, wowners, wownerFrs, wflds) }
     if ans == 0 {
-      if !cwClaimed(set) { ans = 2 }
+      if !cwClaimed(set, setFr) { ans = 2 }
     }
     if ans != 2 {
-      if cwSplitStorage(set) { split = 1 }
+      if cwSplitStorage(set, setFr) { split = 1 }
     }
   }
   cwRootNames.push(root)
+  cwRootFrames.push(rootFr)
   cwAnswers.push(ans)
   cwSplits.push(split)
   ans
@@ -14548,9 +14838,10 @@ function covarWriteThrough(srcExpr: i32, srcTy: i32, dstTy: i32): i32 {
           if covarNonNullArms(dt.uMembers) < 2 { return 0 }
           const root = covarRootName(srcExpr)
           if root == "" { return 0 }
-          if covarValueWriteState(root) != 1 { return 0 }
-          if covarValueSplitStorage(root) { return 1 }
-          if covarValueTwoUnions(root) { return 2 }
+          const rootFr = covarRootFrame(srcExpr)
+          if covarValueWriteState(root, rootFr) != 1 { return 0 }
+          if covarValueSplitStorage(root, rootFr) { return 1 }
+          if covarValueTwoUnions(root, rootFr) { return 2 }
         }
       }
     }
@@ -14870,7 +15161,9 @@ function objShapeAdapterless(
         // copy already runs on: the copy is a snapshot, sound only where nothing writes the
         // value. An unknown write state (2) keeps the refusal.
         if scalarElemWidenServed(s.aElem, d.aElem) {
-          if covarValueWriteState(covarRootName(cx)) == 0 { return false }
+          if covarValueWriteState(covarRootName(cx), covarRootFrame(cx)) == 0 {
+            return false
+          }
         }
         shapeAdaptSrcTy = src
         shapeAdaptDstTy = dst
