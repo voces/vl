@@ -683,3 +683,117 @@ Deno.test({
     }
   },
 });
+
+// ── the per-module scan cache, in both directions ──────────────────────────────────────
+//
+// The seed caches a module's scan and token stream per (key, source) and reuses it for
+// every later staging, and the LSP now commits an UNCHANGED dependency by key alone
+// (`modCommitCached`) rather than pushing its text again. A cache is the canonical way to
+// leak one program's state into the next, and the failure here is silent: the importer's
+// own text never changes when its dependency does, so a stale entry answers with the
+// pre-edit types and nothing says so.
+//
+// BOTH DIRECTIONS, because they fail differently. Edit-then-check catches a cache that
+// never invalidates; revert-then-check catches one that invalidated by dropping the
+// dependency's entry and cannot get the original answer back.
+const IMPORTER_KEY = "/proj/main.vl";
+const IMPORTER = 'import { pick } from "./util"\nconst r: i32 = pick()\nprint(r)\n';
+const DEP_I32 = "export function pick(): i32 {\n  1\n}\n";
+const DEP_F64 = "export function pick(): f64 {\n  1.5\n}\n";
+
+Deno.test({
+  name: "instance-leak: a dependency edit reaches the LSP checker, and reverting it comes back",
+  ignore,
+  fn: async () => {
+    const c = loadWasmChecker(SEED, () => {})!;
+    let dep = DEP_I32;
+    const read = (key: string) => key.endsWith("util.vl") ? dep : undefined;
+    const msgs = async () =>
+      (await c.check(IMPORTER, IMPORTER_KEY, read)).map((d) => d.message).join(" | ");
+
+    const clean = await msgs();
+    if (clean !== "") throw new Error(`the importer starts clean, got: ${clean}`);
+
+    // The importer's own text is untouched; only the sibling on "disk" moved.
+    dep = DEP_F64;
+    c.bumpReaderGeneration();
+    const broken = await msgs();
+    if (!broken.includes("f64")) {
+      throw new Error(
+        `STALE DEPENDENCY — after the sibling's return type changed to f64 the importer ` +
+          `must not still type-check. want a diagnostic naming f64, got: ${broken || "(none)"}`,
+      );
+    }
+
+    dep = DEP_I32;
+    c.bumpReaderGeneration();
+    const again = await msgs();
+    if (again !== "") {
+      throw new Error(
+        `REVERT NOT SEEN — the sibling is byte-identical to its first version, so the ` +
+          `importer must be clean again. got: ${again}`,
+      );
+    }
+  },
+});
+
+Deno.test({
+  name: "instance-leak: the same two directions on the raw module protocol the LSP drives",
+  ignore,
+  fn: () => {
+    const exp = new WebAssembly.Instance(
+      new WebAssembly.Module(Deno.readFileSync(SEED)),
+      {},
+    ).exports as unknown as Exports;
+    const push = (fn: (cp: number) => number, text: string) => {
+      for (const ch of text) fn(ch.codePointAt(0)!);
+    };
+    const readStr = (len: number, at: (j: number) => number) => {
+      const b = new Uint8Array(len);
+      for (let j = 0; j < len; j++) b[j] = at(j);
+      return new TextDecoder().decode(b);
+    };
+    // `prepare`'s shape, minus the host memo: every module is pushed in full, so this
+    // grades the SEED's own cache rather than the checker's bookkeeping.
+    const check = (dep: string): string => {
+      exp.modReset();
+      const commit = (key: string, src: string) => {
+        push(exp.modKeyPush, key);
+        push(exp.modSrcPush, src);
+        exp.modCommit(1);
+      };
+      commit(IMPORTER_KEY, IMPORTER);
+      for (;;) {
+        const n = exp.modPendingCount();
+        if (n === 0) break;
+        const keys: string[] = [];
+        for (let i = 0; i < n; i++) {
+          keys.push(readStr(exp.modPendingLen(i), (j) => exp.modPendingAt(i, j)));
+        }
+        for (const k of keys) commit(k, dep);
+      }
+      exp.srcReset();
+      push(exp.srcPush, IMPORTER);
+      exp.checkSrc();
+      const out: string[] = [];
+      for (let i = 0; i < exp.diagCount(); i++) {
+        out.push(readStr(exp.diagMsgLen(i), (j) => exp.diagMsgAt(i, j)));
+      }
+      return out.join(" | ");
+    };
+    const clean = check(DEP_I32);
+    if (clean !== "") throw new Error(`the importer starts clean, got: ${clean}`);
+    const broken = check(DEP_F64);
+    if (!broken.includes("f64")) {
+      throw new Error(
+        `STALE SCAN CACHE — the dependency's source changed under the same key and the ` +
+          `seed answered as though it had not. want a diagnostic naming f64, got: ` +
+          `${broken || "(none)"}`,
+      );
+    }
+    const again = check(DEP_I32);
+    if (again !== "") {
+      throw new Error(`REVERT NOT SEEN on the raw protocol. got: ${again}`);
+    }
+  },
+});
