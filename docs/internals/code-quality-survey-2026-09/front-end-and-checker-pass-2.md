@@ -35,7 +35,7 @@ per result, a live set copied whole at every function — where the first pass's
 | --- | --- | --- | --- | --- | --- |
 | 1 | `srcIsUnannotatedObjBinding` (`typecheck.vl:14593`) resolves a name by first arena match, so an unrelated earlier binding disables D938's soundness refusal (§2) | witness: `vl check` rc 1 → **rc 0 + invalid wasm** when a decoy moves above the const; decoy below it, refusal holds | S | low | the two-arm ablation flipping back to rc 1; `regress.py` 0 `runs → not-runs`; an inventory row and a `tests/cases` fixture — **landed #2622** (D1609) |
 | 2 | `symRefAt` re-runs `symOccAt` plus a second full `symOccTok` scan per `k`, and the LSP calls it once per result (§3) | same file, cursor moved only: 252 refs 0.5 ms, 2,002 refs **22.9 ms**; 1-ref control 0.0 ms at every size | S | low | the ladder flat in the reference count; `lsp_crossfile_refs_wasm_test.ts`, `lsp_rename_wasm_test.ts`, `lsp_document_highlight_wasm_test.ts` — **landed #2639** |
-| 3 | `daSnapshot`/`daClear`/`daRestore` copy the whole live set at every function body; the set holds every module binding until pass 2 reaches it (§4) | **2.75% of a self-compile**; `daSnapshot` 91.4% reached from `checkFuncDeclNode`; same file reordered **1.82 s → 0.19 s** at N=8,000 F=800 | M | low | the order control at ratio ≤ 1.5; `regress.py`; `deno task test` + `--prove-fixpoint` (the seed changes) — **landed #2639** at a ratio of 5.2×, with §4's own family gone from the profile and the residue §9's |
+| 3 | `daSnapshot`/`daClear`/`daRestore` copy the whole live set at every function body; the set holds every module binding until pass 2 reaches it (§4) | **2.75% of a self-compile**; `daSnapshot` 91.4% reached from `checkFuncDeclNode`; same file reordered **1.82 s → 0.19 s** at N=8,000 F=800 | M | low | the order control at ratio ≤ 1.5; `regress.py`; `deno task test` + `--prove-fixpoint` (the seed changes) — **landed #2639** (the body) and **#2652** (the `if` fork/join), the family 2.74% → 0.08% of a self-compile and 51.4% → 0.33% of `genUnions(3200, 1)`; the order ratio is 5.2× and the residue §9's |
 | 4 | `recordRedundantAnnot`'s `=`-token scan runs to the end of the token stream after it has the answer (`typecheck.vl:6140`–`:6156`) (§5) | **0.64% self**, 100% of its samples reached from `checkLetDeclNode`; the loop body is guarded by `if eqTok < 0` and the loop condition is not | XS | low | byte-identical seed; profile A/B |
 | 5 | the deferred-constraint layer is **8 families, 37 hand-written columns, 37 push sites, 18 functions, 663 lines**, with nothing enforcing lockstep (§6) | `typecheck.vl:613`–`:754` declarations, `:15770`–`:17521` writers and readers | M | medium | byte-identical seed; a test that a family's columns are equal length after a check |
 | 6 | 35 `nodeTyIs*` / `nodeArrayElemIs*` predicates; **7 of the 18 raw-ratio ≥ 0.70 duplicate pairs in the whole scope are inside this one family** (§7) | three of them at normalised ratio 1.000 with raw 0.846–0.941, and a fourth 1.000 pair at raw 0.467 | M | low | byte-identical seed |
@@ -275,6 +275,22 @@ so the residue is §9's name-keyed registries. **And the control arm is not one 
 neighbourhood scan at N=12,000–24,000 puts every cell at 0.88–1.06× except (16,000, 1,600),
 which sits at 1.66× with both its neighbours in each axis clean — the same non-monotonicity
 this section's own control column shows, and it is not the definite-assignment family.
+
+**And the FORK/JOIN is the other half, landed #2652.** #2639 took the function BODY off the
+module's dead zone; an `if` still copied it — `daSnapshot` twice, `daClear` once and
+`daJoinInto` twice per `if`, over whatever the set held. That is invisible to this section's
+own order witness, which has no `if` in it, and it is the whole cost on a program whose `if`s
+sit at MODULE level. On `genUnions(3200, 1)`, once #2648 had taken the lint's own two linear
+scans off the same witness, the family is **51.4% of a `vl check`** — `daAddSid` 25.6%
+inclusive (52% under `daJoinInto`, 48% under `daRestore`), `daJoinInto` 20.6%, `daRestore`
+16.3%, `daSnapshot` 10.0% self and 100% of it from `checkIfStmtNode`, `daIsUnassignedSid`
+10.1%, `daClear` 8.1%, with `sidArrPut` 15.5% self reached only from `daAddSid`/`daClear` and
+`sidArrGet` 7.7% self reached only from `daIsUnassignedSid`. An undo log makes the fork a
+mark, the restore a rollback and the join a delta union, all proportional to the ids the arms
+CHANGED: **no `da*` frame survives in the profile at all** (`sidArrPut` 15.5% → 0.33%,
+`sidArrGet` 7.7% → none), the check falls from 621 samples to 307, and the witness costs
+**2.38 s → 1.33 s** of CPU. Both arms of the `unions` scaling axis move together (many 0.66 →
+0.40, one 1.06 → 0.70), so its ratio is unchanged.
 
 ## 5 · A loop that keeps going after it has the answer
 
