@@ -2217,10 +2217,10 @@ function cbIsHeader(seenCode: i32, headerTaken: i32) {
   0
 }
 
-// Walk the source line by line, accumulating own-line `//` runs. O(bytes); the only
-// per-line state is a handful of counters. Length and the uncited measurement are
-// block facts and report when the block closes; shouting and history are line facts
-// and report where they stand, once per block per code.
+// Walk the source line by line over the shared index, accumulating own-line `//` runs.
+// O(bytes); the only per-line state is a handful of counters. Length and the uncited
+// measurement are block facts and report when the block closes; shouting and history
+// are line facts and report where they stand, once per block per code.
 function commentBudget() {
   const s = cbSource
   cbSource = ""
@@ -2231,8 +2231,7 @@ function commentBudget() {
   const p = scaPath
   scaPath = ""
   if scaIsStd(p) { return 0 }
-  let i = 0
-  let line = 1
+  klEnsureIndex(s)
   let n = 0
   let blockLine = 0
   let blockCol = 0
@@ -2243,13 +2242,12 @@ function commentBudget() {
   let seenCode = 0
   let headerTaken = 0
   let inImport = 0
-  while i <= s.length {
-    let e = i
-    while e < s.length && s[e] != '\n' { e = e + 1 }
-    let le = e
-    if le > i && s[le - 1] == '\r' { le = le - 1 }
-    let k = i
-    while k < le && (s[k] == ' ' || s[k] == '\t') { k = k + 1 }
+  let ln = 0
+  while ln < klLnStart.length {
+    const i = klLnStart[ln]
+    const le = klLnEnd[ln]
+    const k = klIndentEnd(s, i, le)
+    const line = ln + 1
     if k + 1 < le && s[k] == '/' && s[k + 1] == '/' {
       if n == 0 {
         blockLine = line
@@ -2308,8 +2306,7 @@ function commentBudget() {
         }
       }
     }
-    i = e + 1
-    line = line + 1
+    ln = ln + 1
   }
   if n > 0 {
     cbReport(
@@ -2464,15 +2461,14 @@ function scaReport(
   0
 }
 
-// Walk the source line by line, resolving each block against what follows it: a block
-// whose next non-blank line declares an `export` documents that export and takes the
-// tighter budget. A block followed by another comment block documents nothing, so a
-// section banner is not held to it. O(bytes), like the scan above.
+// Walk the source line by line over the shared index, resolving each block against what
+// follows it: a block whose next non-blank line declares an `export` documents that
+// export and takes the tighter budget. A block followed by another comment block
+// documents nothing, so a section banner is not held to it. O(bytes), like the scan above.
 function stdCommentAudience() {
   if !scaIsStd(scaPath) { return 0 }
   const s = cbSource
-  let i = 0
-  let line = 1
+  klEnsureIndex(s)
   let n = 0
   let blockLine = 0
   let blockCol = 0
@@ -2483,13 +2479,12 @@ function stdCommentAudience() {
   let seenCode = 0
   let headerTaken = 0
   let inImport = 0
-  while i <= s.length {
-    let e = i
-    while e < s.length && s[e] != '\n' { e = e + 1 }
-    let le = e
-    if le > i && s[le - 1] == '\r' { le = le - 1 }
-    let k = i
-    while k < le && (s[k] == ' ' || s[k] == '\t') { k = k + 1 }
+  let ln = 0
+  while ln < klLnStart.length {
+    const i = klLnStart[ln]
+    const le = klLnEnd[ln]
+    const k = klIndentEnd(s, i, le)
+    const line = ln + 1
     if k + 1 < le && s[k] == '/' && s[k + 1] == '/' {
       // A new block starting while one is pending settles the pending one: what
       // follows it is a comment, not a declaration.
@@ -2535,8 +2530,7 @@ function stdCommentAudience() {
         }
       }
     }
-    i = e + 1
-    line = line + 1
+    ln = ln + 1
   }
   // A file with no trailing newline can end inside a block the loop never closed.
   if pend == 0 && n > 0 { pendHdr = cbIsHeader(seenCode, headerTaken) }
@@ -2700,21 +2694,21 @@ function asZeroedNameOf(s: string, k: i32, b: i32) {
   v
 }
 
-// One pass over the source. Per line: open a function (resetting the zeroed set),
-// record a zeroed local, or grade a `while`. O(bytes), one array of names per body.
+// One pass over the shared line index. Per line: open a function (resetting the zeroed
+// set), record a zeroed local, or grade a `while`. It finds its own headers rather than
+// reading `klFnName`, which holds column-0 headers only — an indented `function` opens a
+// body here. O(bytes), one array of names per body.
 function arenaScanLint() {
   const s = cbSource
-  let i = 0
-  let line = 1
+  klEnsureIndex(s)
   let fnName = ""
   let zeroed: string[] = []
-  while i <= s.length {
-    let e = i
-    while e < s.length && s[e] != '\n' { e = e + 1 }
-    let le = e
-    if le > i && s[le - 1] == '\r' { le = le - 1 }
-    let k = i
-    while k < le && (s[k] == ' ' || s[k] == '\t') { k = k + 1 }
+  let ln = 0
+  while ln < klLnStart.length {
+    const i = klLnStart[ln]
+    const le = klLnEnd[ln]
+    const k = klIndentEnd(s, i, le)
+    const line = ln + 1
     const fn = asFnNameOf(s, k, le)
     if fn.length > 0 {
       fnName = fn
@@ -2743,8 +2737,7 @@ function arenaScanLint() {
         }
       }
     }
-    i = e + 1
-    line = line + 1
+    ln = ln + 1
   }
   0
 }
@@ -3052,8 +3045,9 @@ const klNamingCalls = [
 ]
 
 // ── the line index ───────────────────────────────────────────────────────────
-// Byte offsets of every line's start and its end (the `\r` and `\n` excluded). Built once
-// per module; three walks read it, and none of them re-splits the source.
+// Byte offsets of every line's start and its end (the `\r` and `\n` excluded). One entry
+// per line the source has, counting the empty one a trailing newline leaves. Every text
+// rule reads it through `klEnsureIndex` and none of them re-splits the source.
 let klLnStart: i32[] = []
 let klLnEnd: i32[] = []
 
@@ -3273,6 +3267,25 @@ function klIndexFns(s: string) {
     }
     n = n + 1
   }
+  0
+}
+
+// The source both indexes above describe, and whether they describe one at all. An empty
+// module is a real source equal to the initial `klIndexedSrc`, so the flag is what keeps
+// its own build from being skipped.
+let klIndexedSrc = ""
+let klIndexed = false
+
+// Build the line and function indexes for `s`, unless they already describe it. Both are
+// pure functions of the source, so every text rule may ask and none has to run after any
+// other: `kindLadderLint` and `sentinelIndexLint` each ask, and stay order-independent
+// without paying for the build twice.
+function klEnsureIndex(s: string) {
+  if klIndexed && s == klIndexedSrc { return 0 }
+  klIndexLines(s)
+  klIndexFns(s)
+  klIndexedSrc = s
+  klIndexed = true
   0
 }
 
@@ -3673,8 +3686,7 @@ function kindLadderLint() {
   klLadLine = []
   klLadCol = []
   klLadLast = []
-  klIndexLines(s)
-  klIndexFns(s)
+  klEnsureIndex(s)
   let f = 0
   while f < klFnName.length {
     klScanFn(s, f)
@@ -4299,13 +4311,12 @@ function siGradeFn(s: string, f: i32) {
   0
 }
 
-// Two module passes and one per function, all linear in bytes. The kind-ladder module
-// index is rebuilt here rather than inherited, so this pass does not depend on running
-// after that one.
+// Two module passes and one per function, all linear in bytes. This pass asks for the
+// module index rather than inheriting one, so it does not depend on running after the
+// kind-ladder pass; `klEnsureIndex` is what keeps that free.
 function sentinelIndexLint() {
   const s = cbSource
-  klIndexLines(s)
-  klIndexFns(s)
+  klEnsureIndex(s)
   siScanHoles(s)
   siScanReaders(s)
   let f = 0
