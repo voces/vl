@@ -151,7 +151,7 @@ two live ones are one mechanism, and one scope-keyed alias analysis closes them 
 `scripts/capability-probes/covar-scope-grid.py` move silent to loud and 9 refuse to runs, with
 0 runs lost. The cheap direction flip stayed refused, on D852's own fixture header, which
 records that a field-name-only key reddened a running program. What the close UNMASKS is
-D1622: three deliveries -- a struct field, a nested element, a return -- have no arm in the
+D1628: three deliveries -- a struct field, a nested element, a return -- have no arm in the
 claim pass, so any unrelated write leaves the state unknown and the emitter builds an invalid
 module. That reproduces on master with no name collision at all, which is what makes it a
 separate row rather than a price this one paid. The census is cheap and worth keeping as a lint

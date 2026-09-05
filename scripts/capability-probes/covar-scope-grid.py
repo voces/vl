@@ -23,6 +23,19 @@ GRADING is run.py's, imported rather than copied. Each cell declares the outcome
 OWES it (`refuse` or `run`); a cell that owes `run` and refuses is a clause-2 violation, one
 that owes `refuse` and runs is clause 1. Exit is non-zero on any cell not meeting what it
 owes, on any SILENT, and on any `runs -> not-runs` between two seeds.
+
+NINE CELLS ARE STILL SILENT, AND THEY ARE D1628 -- the claim pass has no arm for a struct
+field, a nested element or a return, so an unrelated write anywhere leaves the write state
+unknown and the emitter builds a module the engine refuses. They reproduce with no name
+collision at all, so they are not this grid's own subject; a fix for D1628 is what should
+turn them green, and these are the exact nine to grade it on:
+
+    direct/struct_field/sibling_fn        direct/struct_field/noncapturing_lambda
+    direct/struct_field/module_stmt       direct/nested_element/sibling_fn
+    direct/nested_element/noncapturing_lambda
+    direct/nested_element/module_stmt     direct/return_value/sibling_fn
+    direct/return_value/noncapturing_lambda
+    direct/return_value/module_stmt
 """
 import argparse, os, shutil, sys, tempfile
 
