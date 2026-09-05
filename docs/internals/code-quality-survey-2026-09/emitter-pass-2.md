@@ -216,6 +216,22 @@ The axis reads a median **1.14** against **1.46**, the bar stays at **3.5**, and
 names `assignTags` — **16.10% inclusive**, an all-pairs signature RANK rather than a scan, so
 the next term on this axis is not another index.
 
+Two more close the chain. `unionArmVariantForObj` **4.89 → 0.00%** — the last walk of the two
+columns the member-set index already covers, its row being the earlier of the two first-wins
+answers — and `assignTags` **23.14 → 0.14%**, the all-pairs rank replaced by a merge sort plus
+a run walk, since a tag is how many signatures sort below it and that is the start index of
+its own equal run.
+
+**And the axis has run out of signal at its shipped size, which is the finding.** It reads a
+median **0.86** against **0.94** over twelve runs at load 30, and **1.34** against **1.48**
+over twelve at load 125 to 235. At load 30 the many arm is 0.215 s and the cheap one 0.160 s,
+so the 0.25 floor is the denominator and the reading is an absolute budget: the bar of 3.5 is
+four times it, and doubling what the pair still costs would read about 1.7. The bar therefore
+stays — lowering it is not what would restore detection. `genUnions(800, …)` needs to become
+`genUnions(1600, …)`, which is a change to the gate's cost and wants its own decision. Next
+on the axis is `buildVariantTwins` (**16.21% inclusive**), which is §2.3's own step 3: intern
+the signature and the pair search's residue becomes an integer compare.
+
 ---
 
 ## 3 · The four axes, profiled
