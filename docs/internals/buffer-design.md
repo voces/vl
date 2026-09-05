@@ -2026,6 +2026,11 @@ are not an absence of checking — they are the checks being one frame down, ins
 which the same table's `call` column shows being called once per access. There is no rung, and no
 shape, at which the count falls.
 
+The counts are module-wide within loops, so the `call` and `sget` columns at `none` also carry every
+loop-bearing function `std:buffer` defines, whether the kernel reaches it or not — `storeBytes` and
+`loadBytes` add 3 and 4 to every row there. The `trap` column above is unaffected, and so is every
+`-O`/`-O3` cell, because those rungs delete what nothing calls.
+
 The transition is worth knowing for reading a `-O` disassembly: at `-O` binaryen inlines the VOID
 setter but not the f32-returning getter, so half the check appears in the loop and half stays in a
 callee. Nothing about the check itself changes.
