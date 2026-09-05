@@ -20,7 +20,7 @@
 //
 // @test-timing native
 
-import { ROOT } from "./support/tree.ts";
+import { ROOT, pythonBin } from "./support/tree.ts";
 
 const SCRIPT = `${ROOT}/scripts/emitter-state-audit.py`;
 const EMIT_SECTIONS = `${ROOT}/compiler/emit_sections.vl`;
@@ -32,7 +32,7 @@ const OPEN = new Map([
 ]);
 
 const audit = async (): Promise<string> => {
-  const { code, stdout, stderr } = await new Deno.Command("python3", {
+  const { code, stdout, stderr } = await new Deno.Command(pythonBin(), {
     args: [SCRIPT],
     cwd: ROOT,
     stdout: "piped",

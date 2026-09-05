@@ -15,7 +15,7 @@
 //
 // @test-timing instrument
 
-import { COMPILER, ROOT, VL, exists } from "./support/tree.ts";
+import { COMPILER, ROOT, VL, exists, pythonBin } from "./support/tree.ts";
 
 const MATRIX = `${ROOT}/scripts/capability-probes/matrix.py`;
 const TEMPLATES = `${ROOT}/scripts/capability-probes/matrix`;
@@ -67,7 +67,7 @@ const runMatrixOnce = async (
 ): Promise<{ code: number; cells: Cell[]; out: string }> => {
   const args = [MATRIX, `${TEMPLATES}/${template}`, "--compiler", COMPILER, "--vl", VL];
   if (only) args.push("--only", only);
-  const { code, stdout, stderr } = await new Deno.Command("python3", {
+  const { code, stdout, stderr } = await new Deno.Command(pythonBin(), {
     args,
     stdout: "piped",
     stderr: "piped",
