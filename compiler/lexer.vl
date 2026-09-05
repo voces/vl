@@ -11,7 +11,7 @@ import { cpCount } from "./strutil"
 // expressions lexed as ordinary tokens between, one holding none stays a single token.
 // A raw newline is content in a backtick literal and a terminator inside `"` — the only
 // rule the two grammars still disagree about. Positions follow the diagnostics
-// convention: `line` 1-based, `col` 0-based, `start`/`stop` offsets [first, past-last).
+// convention: `line` 1-based, `col` 0-based, `start` the offset of the first char.
 
 // The closed token vocabulary as a literal union: `kind` is one i32 field, `kind ==
 // "IDENT"` lowers to `i32.eq`, and a spelling is minted from the atom rather than carried
@@ -102,15 +102,13 @@ type Diag = {
 }
 
 // A lexed token: `kind` the closed `TokKind` atom, `text` the raw source lexeme (quotes
-// and backslashes kept for a `STRING` or `CHAR`), `value` the decoded literal with escapes
-// resolved for those two and "" otherwise, `start`/`stop` char offsets
-// [first, one-past-last), and `line`/`col` the 1-based line and 0-based column.
+// and backslashes kept for a `STRING` or `CHAR`), `start` the char offset of its first
+// char, and `line`/`col` the 1-based line and 0-based column. A literal's escapes are
+// not resolved here: `decodeStr` (`emit_base.vl`) is the one decoder, working from `text`.
 type Tok = {
   kind: TokKind,
   text: string,
-  value: string,
   start: i32,
-  stop: i32,
   line: i32,
   col: i32
 }
@@ -440,7 +438,6 @@ function decodeSimpleEscape(e: i32) {
 
 export function mkTok(
   kind: TokKind,
-  value: string,
   start: i32,
   startLine: i32,
   startCol: i32,
@@ -448,9 +445,7 @@ export function mkTok(
   {
     kind: kind,
     text: gSrc.slice(start, gPos),
-    value: value,
     start: start,
-    stop: gPos,
     line: startLine,
     col: startCol,
   }
@@ -511,9 +506,9 @@ function scanRadix(base: i32, baseName: string, prefixChar: i32) {
 }
 
 // Scan a quoted literal, the cursor on the opening quote; `quote` is the quote char code.
-// Returns the decoded `value` with escapes resolved. The value is built from
-// `[runStart, gPos)` runs of escape-free text — one slice per run, concatenating only at
-// escape boundaries — because one slice per character is O(k²) on immutable strings.
+// Returns the decoded code-point count — one per escape plus each escape-free run
+// `[runStart, gPos)` — which is all a caller needs (the char literal's "exactly one
+// character" rule). The decoded text is `decodeStr`'s at emit time, so there is one decoder.
 export function scanQuoted(quote: i32) {
   // The opening quote anchors the unterminated-literal diagnostic: reporting
   // there (not wherever scanning stopped) keeps a missing quote a local error.
@@ -527,7 +522,7 @@ export function scanQuoted(quote: i32) {
   const holes = tpl || quote == '"'
   if holes { gTplStop = 2 }
   advance() // opening quote
-  let value = ""
+  let nCp = 0
   let closed = false
   let runStart = gPos
   while gPos < gSrc.length {
@@ -542,7 +537,7 @@ export function scanQuoted(quote: i32) {
     // break. Tested before the escape arm, so `\{` never reaches `decodeSimpleEscape`;
     // `\\{` is a literal backslash then a literal brace.
     if holes && ch == '\\' && peek2() == '{' {
-      value = value + gSrc.slice(runStart, gPos)
+      nCp = nCp + cpCount(gSrc.slice(runStart, gPos))
       advance() // backslash
       advance() // {
       runStart = gPos
@@ -551,7 +546,7 @@ export function scanQuoted(quote: i32) {
       break
     }
     if ch == '\\' {
-      value = value + gSrc.slice(runStart, gPos)
+      nCp = nCp + cpCount(gSrc.slice(runStart, gPos))
       // Escape diagnostics anchor at the backslash, not the scan position
       // after the sequence has been consumed.
       const escLine = gLine
@@ -568,7 +563,7 @@ export function scanQuoted(quote: i32) {
       // unknown-escape arm below, which names it.
       if tpl && e == '`' {
         advance() // the escaped delimiter
-        value = value + fromCodePoint(e)
+        nCp = nCp + 1
         runStart = gPos
         continue
       }
@@ -576,14 +571,15 @@ export function scanQuoted(quote: i32) {
       if e == 'x' {
         if isHex(peek2()) && isHex(peekN(2)) {
           advance() // x
-          const h1 = advance()
-          const h2 = advance()
-          value = value + fromCodePoint(hexVal(h1) * 16 + hexVal(h2))
+          advance() // first hex digit
+          advance() // second hex digit
         } else {
           advance() // x
           diagAt("Invalid \\x escape (needs two hex digits)", escLine, escCol)
-          value = value + "x"
         }
+        // One code point either way: the valid escape decodes to one, and the
+        // invalid one keeps the `x` verbatim.
+        nCp = nCp + 1
         runStart = gPos
         continue
       }
@@ -601,17 +597,16 @@ export function scanQuoted(quote: i32) {
           }
           if peek() == '}' && n >= 1 && n <= 6 && cp <= 1114111 {
             advance() // }
-            value = value + fromCodePoint(cp)
           } else {
             diagAt(
               "Invalid \\u{…} escape (needs 1-6 hex digits for a valid code point)",
               escLine,
               escCol,
             )
-            value = value + "u"
             // Consume a closing `}` if present so the span stays sane.
             if peek() == '}' { advance() }
           }
+          nCp = nCp + 1
           runStart = gPos
           continue
         }
@@ -622,15 +617,10 @@ export function scanQuoted(quote: i32) {
           isHex(peekN(4))
         ) {
           advance() // u
-          const u1 = advance()
-          const u2 = advance()
-          const u3 = advance()
-          const u4 = advance()
-          const cp = hexVal(u1) * 4096 +
-            hexVal(u2) * 256 +
-            hexVal(u3) * 16 +
-            hexVal(u4)
-          value = value + fromCodePoint(cp)
+          advance() // the four hex digits
+          advance()
+          advance()
+          advance()
         } else {
           advance() // u
           diagAt(
@@ -638,8 +628,8 @@ export function scanQuoted(quote: i32) {
             escLine,
             escCol,
           )
-          value = value + "u"
         }
+        nCp = nCp + 1
         runStart = gPos
         continue
       }
@@ -668,13 +658,13 @@ export function scanQuoted(quote: i32) {
         }
         runStart = gPos - 1
       } else {
-        value = value + dec
+        nCp = nCp + 1
         runStart = gPos
       }
       continue
     }
     if ch == quote {
-      value = value + gSrc.slice(runStart, gPos)
+      nCp = nCp + cpCount(gSrc.slice(runStart, gPos))
       advance() // closing quote
       runStart = gPos
       closed = true
@@ -683,7 +673,7 @@ export function scanQuoted(quote: i32) {
     }
     advance()
   }
-  value = value + gSrc.slice(runStart, gPos)
+  nCp = nCp + cpCount(gSrc.slice(runStart, gPos))
   if !closed {
     // An interpolable literal's unterminated report is the caller's: only the caller knows
     // where the opening delimiter is (a `MID` or `TAIL` part opens at a `}`) and can
@@ -695,7 +685,7 @@ export function scanQuoted(quote: i32) {
       diagSpan("Unterminated char literal", openLine, openCol, gCol)
     }
   }
-  value
+  nCp
 }
 
 // The `"`-quoted string lexeme meaning what template part `raw` means — the one bridge
@@ -801,7 +791,7 @@ export function tokenize(source: string): LexResult {
       // elsewhere, and emitting one would end the hole's expression mid-way. A newline
       // inside a `{ … }` nested in the hole is deeper and keeps its NEWLINE.
       if atTplHoleDepth() { continue }
-      toks.push(mkTok("NEWLINE", "", startPos, startLine, startCol))
+      toks.push(mkTok("NEWLINE", startPos, startLine, startCol))
       continue
     }
 
@@ -840,7 +830,7 @@ export function tokenize(source: string): LexResult {
     if isIdStart(c) {
       while gPos < gSrc.length && isIdPart(peek()) { advance() }
       const text = gSrc.slice(startPos, gPos)
-      toks.push(mkTok(keywordKind(text), "", startPos, startLine, startCol))
+      toks.push(mkTok(keywordKind(text), startPos, startLine, startCol))
       continue
     }
 
@@ -857,21 +847,21 @@ export function tokenize(source: string): LexResult {
         advance() // '0'
         advance() // 'x' / 'X'
         scanRadix(16, "hex", 'x')
-        toks.push(mkTok("NUMBER", "", startPos, startLine, startCol))
+        toks.push(mkTok("NUMBER", startPos, startLine, startCol))
         continue
       }
       if c == '0' && (peek2() == 'b' || peek2() == 'B') {
         advance() // '0'
         advance() // 'b' / 'B'
         scanRadix(2, "binary", 'b')
-        toks.push(mkTok("NUMBER", "", startPos, startLine, startCol))
+        toks.push(mkTok("NUMBER", startPos, startLine, startCol))
         continue
       }
       if c == '0' && (peek2() == 'o' || peek2() == 'O') {
         advance() // '0'
         advance() // 'o' / 'O'
         scanRadix(8, "octal", 'o')
-        toks.push(mkTok("NUMBER", "", startPos, startLine, startCol))
+        toks.push(mkTok("NUMBER", startPos, startLine, startCol))
         continue
       }
       // Plain decimal, optional fractional part. A `_` separator is legal only
@@ -923,18 +913,17 @@ export function tokenize(source: string): LexResult {
         diag("`_` may only separate digits in a numeric literal")
         while gPos < gSrc.length && isIdPart(peek()) { advance() }
       }
-      toks.push(mkTok("NUMBER", "", startPos, startLine, startCol))
+      toks.push(mkTok("NUMBER", startPos, startLine, startCol))
       continue
     }
 
     // Char literal `'...'`.
     if c == '\'' {
-      const value = scanQuoted('\'')
       // A char literal must decode to exactly one code point; empty `''` or multi-char
-      // `'ab'` is an error, and a CHAR token is still emitted to recover. Counted in code
-      // points, not `.length`, which is a byte count that would reject `'é'` as
-      // multi-character. `cpCount` is rep-stable, which the bootstrap ladder needs.
-      const cpn = cpCount(value)
+      // `'ab'` is an error, and a CHAR token is still emitted to recover. `scanQuoted`
+      // counts code points, not bytes — a byte count would reject `'é'` as
+      // multi-character — and is rep-stable, which the bootstrap ladder needs.
+      const cpn = scanQuoted('\'')
       if cpn != 1 {
         // Span the whole literal, opening quote through closing quote: the scanner sits
         // one past it, so `startCol` is the open quote and `gCol` the exclusive end. The
@@ -951,7 +940,7 @@ export function tokenize(source: string): LexResult {
           )
         }
       }
-      toks.push(mkTok("CHAR", value, startPos, startLine, startCol))
+      toks.push(mkTok("CHAR", startPos, startLine, startCol))
       continue
     }
 
@@ -960,10 +949,10 @@ export function tokenize(source: string): LexResult {
     // no hole is one `STRING` token and nothing downstream changes for it; one
     // with a hole opens a `TEMPLATE_HEAD` and rides the identical machinery.
     if c == '"' {
-      const value = scanQuoted('"')
+      scanQuoted('"')
       if gTplStop == 1 {
         tplOpenPush(startLine, startCol, startPos, '"')
-        toks.push(mkTok("TEMPLATE_HEAD", value, startPos, startLine, startCol))
+        toks.push(mkTok("TEMPLATE_HEAD", startPos, startLine, startCol))
       } else {
         // The span `scanQuoted` reports for a non-interpolable literal: the scan stopped
         // at a raw newline (still on `startLine`) or at EOF, so `gCol` is the honest
@@ -971,7 +960,7 @@ export function tokenize(source: string): LexResult {
         if gTplStop == 2 {
           diagSpan("Unterminated string literal", startLine, startCol, gCol)
         }
-        toks.push(mkTok("STRING", value, startPos, startLine, startCol))
+        toks.push(mkTok("STRING", startPos, startLine, startCol))
       }
       continue
     }
@@ -980,10 +969,10 @@ export function tokenize(source: string): LexResult {
     // `TEMPLATE` token; one with holes opens a `TEMPLATE_HEAD` and pushes a row
     // onto the hole stack, which the `}` arm below closes.
     if c == '`' {
-      const tv = scanQuoted('`')
+      scanQuoted('`')
       if gTplStop == 1 {
         tplOpenPush(startLine, startCol, startPos, '`')
-        toks.push(mkTok("TEMPLATE_HEAD", tv, startPos, startLine, startCol))
+        toks.push(mkTok("TEMPLATE_HEAD", startPos, startLine, startCol))
       } else {
         if gTplStop == 2 {
           diagSpan(
@@ -993,7 +982,7 @@ export function tokenize(source: string): LexResult {
             tplLineEndCol(startPos, startCol),
           )
         }
-        toks.push(mkTok("TEMPLATE", tv, startPos, startLine, startCol))
+        toks.push(mkTok("TEMPLATE", startPos, startLine, startCol))
       }
       continue
     }
@@ -1004,7 +993,7 @@ export function tokenize(source: string): LexResult {
     if c == '{' {
       gBrace = gBrace + 1
       advance()
-      toks.push(mkTok("LBRACE", "", startPos, startLine, startCol))
+      toks.push(mkTok("LBRACE", startPos, startLine, startCol))
       continue
     }
     if c == '}' {
@@ -1012,19 +1001,19 @@ export function tokenize(source: string): LexResult {
         // Resumed in the mode the run opened in — a `"` run still refuses a raw
         // newline, a backtick run still takes one as content. This is the one
         // read of `gTplQuote` that makes one machinery serve two literal forms.
-        const tv2 = scanQuoted(gTplQuote[gTplQuote.length - 1]) // the `}` is this part's opener
+        scanQuoted(gTplQuote[gTplQuote.length - 1]) // the `}` is this part's opener
         if gTplStop == 1 {
-          toks.push(mkTok("TEMPLATE_MID", tv2, startPos, startLine, startCol))
+          toks.push(mkTok("TEMPLATE_MID", startPos, startLine, startCol))
         } else {
           if gTplStop == 2 { tplOpenDiag() }
           tplOpenPop()
-          toks.push(mkTok("TEMPLATE_TAIL", tv2, startPos, startLine, startCol))
+          toks.push(mkTok("TEMPLATE_TAIL", startPos, startLine, startCol))
         }
         continue
       }
       gBrace = gBrace - 1
       advance()
-      toks.push(mkTok("RBRACE", "", startPos, startLine, startCol))
+      toks.push(mkTok("RBRACE", startPos, startLine, startCol))
       continue
     }
 
@@ -1037,7 +1026,7 @@ export function tokenize(source: string): LexResult {
       advance()
       advance()
       advance()
-      toks.push(mkTok(three, "", startPos, startLine, startCol))
+      toks.push(mkTok(three, startPos, startLine, startCol))
       continue
     }
 
@@ -1046,7 +1035,7 @@ export function tokenize(source: string): LexResult {
     if two != "" {
       advance()
       advance()
-      toks.push(mkTok(two, "", startPos, startLine, startCol))
+      toks.push(mkTok(two, startPos, startLine, startCol))
       continue
     }
 
@@ -1054,7 +1043,7 @@ export function tokenize(source: string): LexResult {
     const one = oneCharKind(c)
     if one != "" {
       advance()
-      toks.push(mkTok(one, "", startPos, startLine, startCol))
+      toks.push(mkTok(one, startPos, startLine, startCol))
       continue
     }
 
@@ -1062,7 +1051,7 @@ export function tokenize(source: string): LexResult {
     // AT the char, not one past it), emit an ERROR token, make progress.
     diag("Unexpected character " + charDesc(c))
     advance()
-    toks.push(mkTok("ERROR", "", startPos, startLine, startCol))
+    toks.push(mkTok("ERROR", startPos, startLine, startCol))
   }
 
   // Input ran out inside a hole (`` `a${x ``): no part ever scanned to EOF, so
@@ -1072,7 +1061,7 @@ export function tokenize(source: string): LexResult {
     tplOpenPop()
   }
 
-  toks.push(mkTok("EOF", "", gPos, gLine, gCol))
+  toks.push(mkTok("EOF", gPos, gLine, gCol))
   { tokens: toks, diags: gDiags, comments: gComments }
 }
 
