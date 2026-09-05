@@ -218,7 +218,10 @@ is this survey's, verified line by line.
 **`tyTopIndexOf` is not in this family.** `compiler/tyname.vl:439` is a per-CHARACTER
 bracket-depth walk over a type-name *string*: the key is an i32 char code compared with
 `==`, there is no table, and `grep -c tyTopIndexOf compiler/emit_collect.vl` is **0**, so
-`collectA` never calls it. Its 4.94% is **type names being re-parsed as text**, and the fix
+`collectA` never calls it. The `generic pins` axis was reading `collectA`'s 68% inclusive as
+this family's; profiled at 200/400/800 pins it is `monoRebuild` re-running four whole-program
+passes per minted instance, with no registry under it at all
+(`profiling-the-compiler.md` §"Measured 2026-09-05"). Its 4.94% is **type names being re-parsed as text**, and the fix
 is the destringify / `canonUnionKey` track, not a hash map. Parent-frame rank:
 `nullablePartOf` 59.4%, `splitUnionAtoms` 12.0%, `nameIsFuncTypeAtom` 11.1%.
 
