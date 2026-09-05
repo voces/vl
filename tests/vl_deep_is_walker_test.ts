@@ -27,18 +27,8 @@
 // binary, the seed and `wasm-dis`. Absent any, the case registers ignored with a note.
 // No assertion library, per CLAUDE.md — every failure is a `throw new Error` with want/got.
 
-const exists = (p: string): boolean => {
-  try {
-    Deno.statSync(p);
-    return true;
-  } catch {
-    return false;
-  }
-};
+import { COMPILER, ROOT, VL, exists } from "./support/tree.ts";
 
-const ROOT = new URL("../", import.meta.url).pathname.replace(/\/$/, "");
-const VL = `${ROOT}/scripts/vl-host/target/release/vl`;
-const COMPILER = `${ROOT}/build/vl-compiler.wasm`;
 const WASM_DIS = `${ROOT}/node_modules/.bin/wasm-dis`;
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";

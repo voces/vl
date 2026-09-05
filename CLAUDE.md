@@ -395,8 +395,10 @@ the fall was a genuine merge (#2465): a check that is a strict subset of the rig
 result indistinguishable from the right one's, so say what was compared. And a ratchet's FALL
 is not self-explaining: "it went down" and "it went down because #2465 added the arm" are
 different confidence levels, and only the second rules out a detector that stopped seeing
-something — `scripts/ladder-budget.py --why` names the entries that left since the baseline's
-commit, and every ratchet with a baseline should be able to.
+something — `--why` names the entries that left since the baseline's commit, and all four
+per-file ratchets now carry it (`comment-budget`, `ladder-budget`, `sentinel-budget`,
+`scan-budget`, sharing one `scripts/ratchet.py`; `seed-size` is a scalar and has no entries
+to name). A baseline recording no `commit` falls back to the commit that last CHANGED it.
 
 `vl fmt -w` takes **one path per run**; a multi-path call fails and formats nothing.
 
@@ -546,7 +548,8 @@ corrected none of them.
 The tree cannot reach zero in one PR, so all four codes ride ONE RATCHET.
 `python3 scripts/comment-budget.py --check` (a gate in `gate.sh` and in CI) fails when any
 FILE's count for any code goes up; `--write-baseline` lowers it, in the same PR as the trim
-that earned it, and `--list <code>` names the blocks. `scripts/lint-self.sh` holds a code out
+that earned it, `--list <code>` names the blocks and `--why` names the ones that LEFT.
+`scripts/lint-self.sh` holds a code out
 of its own `info` gate only while the baseline still owes it — read FROM the baseline, so the
 exemption deletes itself at zero, one code at a time (`comment-measurement-uncited` is
 already there and already gates).

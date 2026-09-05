@@ -20,19 +20,9 @@
 // silently narrowing every future run. `modules_split` needs one assertion of its own:
 // its faces differ by the NUMBER OF FILES, which axis coverage cannot see.
 
-const exists = (p: string): boolean => {
-  try {
-    Deno.statSync(p);
-    return true;
-  } catch {
-    return false;
-  }
-};
+import { COMPILER, ROOT, VL, exists } from "./support/tree.ts";
 
-const ROOT = new URL("../", import.meta.url).pathname.replace(/\/$/, "");
 const SAMPLE = `${ROOT}/scripts/day-one/sample.py`;
-const VL = `${ROOT}/scripts/vl-host/target/release/vl`;
-const COMPILER = `${ROOT}/build/vl-compiler.wasm`;
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER) && exists(SAMPLE);
 if (GATED && !ENABLED) {

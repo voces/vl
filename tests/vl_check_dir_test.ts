@@ -7,18 +7,7 @@
 // GATING: same as tests/selfhost_native_align_test.ts — env-gated
 // (`SELFHOST_NATIVE_ALIGN=1`) AND requires the built binary + seed wasm.
 
-const exists = (p: string): boolean => {
-  try {
-    Deno.statSync(p);
-    return true;
-  } catch {
-    return false;
-  }
-};
-
-const ROOT = new URL("../", import.meta.url).pathname.replace(/\/$/, "");
-const VL = `${ROOT}/scripts/vl-host/target/release/vl`;
-const COMPILER = `${ROOT}/build/vl-compiler.wasm`;
+import { COMPILER, VL, exists, nativeEnv } from "./support/tree.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER);
@@ -34,7 +23,7 @@ const check = async (
     args: ["check", target, "--concise", "--compiler", COMPILER, ...extraArgs],
     stdout: "piped",
     stderr: "piped",
-    env: { RUST_BACKTRACE: "0", NO_COLOR: "1" },
+    env: nativeEnv({ NO_COLOR: "1" }),
   }).output();
   return { code, err: new TextDecoder().decode(stderr) };
 };
@@ -138,7 +127,7 @@ Deno.test({
         cwd: dir,
         stdout: "piped",
         stderr: "piped",
-        env: { RUST_BACKTRACE: "0", NO_COLOR: "1" },
+        env: nativeEnv({ NO_COLOR: "1" }),
       }).output();
       const err = new TextDecoder().decode(stderr);
       if (code !== 0 || !err.includes("Checked 1 file, no errors.")) {

@@ -18,17 +18,9 @@
 // arena scans. Lower the bar when the registry it names stops being a list. The fourth,
 // `unions`, joined the list when a constant term left BOTH its arms, which is worth
 // keeping in mind before reading any ratio here as a property of its own axis.
-const exists = (p: string): boolean => {
-  try {
-    Deno.statSync(p);
-    return true;
-  } catch {
-    return false;
-  }
-};
 
-const ROOT = new URL("../", import.meta.url).pathname.replace(/\/$/, "");
-const VL = `${ROOT}/scripts/vl-host/target/release/vl`;
+import { ROOT, VL, exists } from "./support/tree.ts";
+
 const COMPILER = Deno.env.get("VL_SCALING_COMPILER") ?? `${ROOT}/build/vl-compiler.wasm`;
 const ENABLED = exists(VL) && exists(COMPILER);
 if (!ENABLED) console.warn("[scaling-shape] skipped — missing vl binary or seed wasm.");

@@ -14,18 +14,8 @@
 // GATING: requires the vl binary + seed wasm; absent either, every case
 // registers ignored with a one-line how-to-build note.
 
-const exists = (p: string): boolean => {
-  try {
-    Deno.statSync(p);
-    return true;
-  } catch {
-    return false;
-  }
-};
+import { COMPILER, VL, exists, nativeEnv } from "./support/tree.ts";
 
-const ROOT = new URL("../", import.meta.url).pathname.replace(/\/$/, "");
-const VL = `${ROOT}/scripts/vl-host/target/release/vl`;
-const COMPILER = `${ROOT}/build/vl-compiler.wasm`;
 const CASES = new URL("./cases/", import.meta.url);
 
 const haveBin = exists(VL);
@@ -59,7 +49,7 @@ const vl = async (args: string[], env: Record<string, string> = {}) => {
     args: [...args, "--compiler", COMPILER],
     stdout: "piped",
     stderr: "piped",
-    env: { RUST_BACKTRACE: "0", ...env },
+    env: nativeEnv(env),
   }).output();
   return {
     code,

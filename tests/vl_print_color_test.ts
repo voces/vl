@@ -29,18 +29,8 @@
 // GATING: as tests/vl_run_args_test.ts — env-gated (`SELFHOST_NATIVE_ALIGN=1`) AND
 // requires the built native binary + the seed wasm.
 
-const exists = (p: string): boolean => {
-  try {
-    Deno.statSync(p);
-    return true;
-  } catch {
-    return false;
-  }
-};
+import { COMPILER, ROOT, VL, exists } from "./support/tree.ts";
 
-const ROOT = new URL("../", import.meta.url).pathname.replace(/\/$/, "");
-const VL = `${ROOT}/scripts/vl-host/target/release/vl`;
-const COMPILER = `${ROOT}/build/vl-compiler.wasm`;
 const STD = `${ROOT}/std`;
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER);

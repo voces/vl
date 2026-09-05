@@ -21,18 +21,7 @@
 // (see tests/ci_seed_coverage_test.ts); a seed-backed test matching neither glob nor an
 // explicit ci.yml step runs nowhere in CI.
 
-const exists = (p: string): boolean => {
-  try {
-    Deno.statSync(p);
-    return true;
-  } catch {
-    return false;
-  }
-};
-
-const ROOT = new URL("../", import.meta.url).pathname.replace(/\/$/, "");
-const VL = `${ROOT}/scripts/vl-host/target/release/vl`;
-const COMPILER = `${ROOT}/build/vl-compiler.wasm`;
+import { COMPILER, VL, exists, nativeEnv } from "./support/tree.ts";
 
 const haveBin = exists(VL);
 const haveSeed = exists(COMPILER);
@@ -63,6 +52,7 @@ const buildGraph = async (
       args: ["build", `${dir}/entry.vl`, "-o", out, "--compiler", COMPILER],
       stdout: "piped",
       stderr: "piped",
+      env: nativeEnv(),
     }).output();
     if (code !== 0) {
       throw new Error(
