@@ -201,6 +201,23 @@ no-longer-needed first-character bucketing (which existed only to avoid
 because `(first char, length)` collides over this vocabulary) is gone with it.
 ```
 
+## continuesLine — the continuing set is `binPrec` minus `-`
+
+A line whose first token cannot begin an expression continues the previous expression
+(DECISIONS.md, 2026-09-04). The set is not written out anywhere: `continuesLine` asks `binPrec`
+and subtracts `MINUS`, which is the table's only entry that is also a prefix operator. Adding a
+binary operator therefore adds it to the continuing set automatically, and that is deliberate —
+the two lists cannot drift apart. `PLUSPLUS`, `MINUSMINUS` and `TILDE` are prefix-only and were
+never in the table, so they need no subtraction.
+
+Inside a bracket (`brDepth > 0`) even `-` continues, because there is no statement the newline
+could be ending; the predicate takes the depth into account rather than the callers.
+
+Three sites read the same `afterNewlines` scan: `binOpAfterNewlines` (the climber),
+`chainDotAfterNewlines` (`.` / `?.`), and `isAfterNewlines` / `asAfterNewlines` in `parseUnary`.
+All four look before consuming — a run leading anywhere else stays in place, because `takeSep`
+reads that newline off `P.pos - 1` to refuse a cross-line missing-comma insert.
+
 ## atTypeCont — a banked `>` credit is an unclosed enclosing generic
 
 Moved from `compiler/parser.vl` (the 15-line block at line 565, as it stood at 2026-09-02).
@@ -376,10 +393,18 @@ BINARY operator, so `a + b as f64` is `a + (b as f64)`. A PREFIX unary (`-`,
 `~`) recurses through `parseUnary`, so it binds looser than `as` (`-b as i64`
 is `-(b as i64)`) — the reverse of Rust, but unobservable for numeric casts
 (negation / bitwise-not commute with wrap / trunc / demote). CHAINABLE
-(`x as i64 as f64`). A newline before `as` ends the statement (no
-`skipNewlines` here), so a following `as = 1` reassignment of the soft-keyword
-identifier is unaffected.
+(`x as i64 as f64`).
 ```
+
+**Amended 2026-09-04 — a line may now LEAD with `as`.** The archived block's last sentence read
+"a newline before `as` ends the statement (no `skipNewlines` here), so a following `as = 1`
+reassignment of the soft-keyword identifier is unaffected". Under the line-continuation ruling
+(DECISIONS.md, "A line beginning with a token that cannot start an expression continues the
+previous expression") the loop now scans past a NEWLINE run for `as` — but only ahead of a
+NAMED cast target, an `IDENT` after the optional `? ! %` suffix. That is what keeps the second
+half of the old sentence true: `as = 12` on its own line is still a reassignment, because `=` is
+not a type. `asAfterNewlines` is the lookahead, and `tests/cases/lexer/soft-keywords-as-*.vl`
+are the fixtures that caught the version without the guard.
 
 ## parseAsType — the cast target is one type ATOM
 
