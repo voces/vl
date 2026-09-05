@@ -1,8 +1,9 @@
 # Code-quality survey — the emitter, 2026-09-04
 
-Surveyed at `facb9f610`. Every line number below is that commit's; every number names the
-command that produced it in §9, and nothing here is asserted without one. Read-only: no
-compiler source was changed to produce this.
+Surveyed at `facb9f610`. Every line number below is that commit's — except §5.3, re-measured
+at `7a733ea6b` and carrying that commit's — and every number names the command that produced
+it in §9, with nothing asserted without one. Read-only apart from §5.3's counter probe, which
+reverts itself.
 
 **Summary.** The emitter's twelve files hold 88,693 lines and 2,751 functions, and its
 structural problems are not spread evenly — they cluster in three shapes. (a) One question is
@@ -34,7 +35,7 @@ anywhere in the tree, `scripts/emitter-state-audit.py` reports 19 frame-flag asy
 | 7 | `fbBeginFunc` / `fbLocalsCount` / `fbEmitLocalsVec` walk one frame layout three times by hand (§7.1) | a base/count disagreement is silent wrong wasm, not a validator error | M | med | byte-identical seed; `cases_wasm_test.ts`; disassemble one frame with `wasm-dis` |
 | 8 | 14 exported emitter functions have zero references tree-wide; `unused-function` exempts exports by design (§8.1) | dead code deleted, and a fourth ratchet keeps it deleted | S | none | byte-identical seed after deletion; a new `--check` script |
 | 9 | `scripts/emitter-state-audit.py` names `startFnDetectScratch`, but D1595 moved the resets to `startFnDetectFrames` — it reports 19 asymmetries where 2 are real (§8.4) | restores a live instrument whose signal is currently 90% noise | XS | none | the script's own output; the 2 survivors are D1006/D1007 |
-| 10 | `plCacheBlock` is a single-entry cache that `dsRebindsName`'s alternation thrashes (§5.3) | `plScanStmt` is 4.56% self, almost all rebuild | S | low | byte-identical seed; profile A/B |
+| 10 | **REFUTED, 2026-09-05** — `plCacheBlock` serves **96.28%** of 4,500,173 asks; an LRU ring of 128 avoids **1.12%** of the rebuilds and a ring was the whole proposal. The cost is 32 whole-program `dsScopeWalk` sweeps, not eviction (§5.3) | a ring buys ≈0.05pp of a self-compile, under the profile's own 0.22pp run-to-run spread; the reachable 97% needs an M/L change | S→M/L | low→med | `scripts/perf/parent-let-cache-probe.py`, not a profile A/B |
 
 Everything below carries file, line, what, why, the change, size, risk and how to prove it
 safe. "Byte-identical seed" means `scripts/refresh-compiler.sh` then `cmp` against a seed built
@@ -288,23 +289,87 @@ it is skipped once its flag is true — `fnDetectScratch` 24.47% → 20.16%, L2 
 (`emit_classify.vl`), which re-derive `listOpKindOfBin` for the same `(binIx, fnIx)`; a memo
 there is worth ~2.5% and is the follow-up this row leaves open.**
 
-### 5.3 `dsRebindsName` thrashes the single-entry `parentLetOf` cache
+### 5.3 `dsRebindsName` and the `parentLetOf` cache — the ring is REFUTED
 
-`compiler/emit_base.vl:198 plCacheBlock` is a **single-entry** cache: `parentLetOfSid`
-(`:470`) rebuilds `plScanStmt` whenever `blockIx != plCacheBlock`. `dsScopeWalk` calls
-`dsRebindsName(ix, nm)` at every nested `FuncDecl`, and that calls
-`parentLetOf(fn.fnBody, nm)` — a different block each time, alternating with whatever the
-outer walk asked.
+**Re-measured at `7a733ea6b`, 2026-09-05.** The caller chain below is real; the *diagnosis* on
+top of it is not. The cache serves **96.28%** of its asks, and the ring this row proposed would
+avoid **1.12%** of the rebuilds it was proposed to remove. `#2567` (row 1's `letListBuild`)
+landed between the two readings and halved this subtree, so the profile figures are re-taken.
 
-Measured: `plScanStmt` **4.56% self / 5.51% inclusive**; `parentLetOfSid` 0.38% self /
-**5.98% inclusive**; `dsRebindsName` 1.08% self / 6.91% inclusive. The gap between
-`dsRebindsName`'s self and inclusive is the rebuild.
+`compiler/emit_base.vl:148 plCacheBlock` is a **single-entry** cache: `parentLetOfSid`
+(`:420`) rebuilds `plScanStmt` (`:239`) whenever `blockIx != plCacheBlock`. `dsScopeWalk`
+(`emit_classify.vl:27411`) calls `dsRebindsName` (`:27391`) at every nested `FuncDecl`, and
+that calls `parentLetOf(fn.fnBody, nm)`.
 
-*Change.* Make the cache hold a small ring of blocks (the generation stamp `plGen` and the
-sid arrays are already there; only the single `plCacheBlock` slot has to become a short list),
-or have `dsScopeWalk` ask the question once per frame rather than per visit. *Size* S. *Risk*
-low — `sidResetParentLet` (`:261`) already documents why the reset must be paired with
-`sidReset`, and a ring keeps that unchanged. *Proof*: byte-identical seed; profile A/B.
+That chain is confirmed. Over three self-compiles of identical source (7,458 / 10,044 / 9,348
+samples): `plScanStmt` **3.29–3.51% self, 4.07–4.14% inclusive**, and 100% of its samples are
+under `parentLetOfSid`; `parentLetOfSid` 4.57–4.81% inclusive, 89% of it `plScanStmt`;
+`dsRebindsName` 0.66–0.76% self, 4.40–4.43% inclusive, and the immediate caller of **75.2%**
+of `parentLetOfSid`'s samples. **83.1%** of `plScanStmt`'s samples sit under
+`emitGlobalSection` → `letListBuild` → `letRefListDestSlot` → `dsScopeWalk` → `dsRebindsName`.
+
+**What a profile cannot say is whether a bigger cache would avoid the rebuild.**
+`scripts/perf/parent-let-cache-probe.py` counts it, over one self-compile:
+
+| | |
+|---|---|
+| asks (`parentLetOfSid` + `parentLoopVarOfSid`) | 4,500,173 |
+| served by the one-slot cache | 4,332,770 (**96.28%**) |
+| rebuilds | 167,403 |
+| arena nodes visited rebuilding | 4,086,747 |
+| distinct blocks ever asked | 4,994 |
+
+| cache | rebuilds avoided | of all rebuilds |
+|---|---|---|
+| LRU 2 | 1,424 | 0.85% |
+| LRU 4 | 1,598 | 0.95% |
+| LRU 8 | 1,692 | 1.01% |
+| LRU 16 | 1,755 | 1.05% |
+| LRU 32 | 1,815 | 1.08% |
+| LRU 128 | 1,877 | 1.12% |
+| unbounded | 162,409 | **97.02%** |
+
+**There is no alternation to catch.** A second counter finds **32** whole-scope `dsScopeWalk`
+roots — 29 of them rooted at the `Program` node, which is what `dsScopeRootOf` (`:27371`)
+returns for a global binding — making **144,826** `dsRebindsName` calls between them: 4,526
+per walk, one per `FuncDecl` the walk enters, and 86.5% of every rebuild in the compile. Each
+walk marches through ~4,500 *distinct* bodies in sequence and then starts over, so the reuse
+distance for any one body is ~4,500. That is why every ring from 2 to 128 lands within 0.3
+points of the others while the unbounded column is 87× all of them: these are the sweep's
+compulsory misses, not eviction pressure. The same fact refutes the row's second option —
+`dsScopeWalk` already asks `dsRebindsName` exactly once per frame per walk, so "once per frame
+rather than per visit" is already true and buys nothing.
+
+**And the proof this row named cannot resolve the change it proposed.** `plScanStmt`'s self
+time reads 3.29 / 3.34 / 3.51% across three profiles of the *same* source — a 0.22-point
+spread, and 0.41 across the three taken one commit earlier. A 128-entry ring's whole effect is
+1.12% of a ~4.1%-inclusive subtree, ≈0.05 points. The profile A/B is an order of magnitude
+coarser than the effect it would grade; the counter is the instrument for this question.
+
+*What is actually available*, and neither shape is S. 97% of 167,403 rebuilds is reachable —
+the `plScanStmt` subtree is ~4.1% of a self-compile — by one of:
+
+* **Stop re-walking the whole program once per global binding.** `letRefListDestSlotK`
+  (`:27210`) roots the walk at `emitRootIx` whenever the binding is a global, so 29 globals
+  each sweep every function in the program. This is row 1's subtree: #2567 halved the walk
+  *count* and did not change a walk's cost.
+* **An unbounded per-block index**, on the `index, not memo` pattern D1514 landed. Sound only
+  if a block's `LetDecl` set cannot change after its first build; the arena grows during the
+  pass table, so the invalidation has to be derived — an arena-length stamp covers an added
+  node but not an in-place kind rewrite — and a wrong answer here is a silent miscompile, not
+  a validator error.
+
+*Size* M/L. *Risk* med. *Proof*: byte-identical seed; the counter above, never a profile A/B.
+
+*And the control a multi-entry cache needs now exists, because the two fixtures that look
+like it are not it.* `tests/cases/closures/capture-one-name-five-frames.vl` binds `v` in five
+frames at five storage classes and types — a `for` variable (f64 element), a body `let`
+(string), a parameter (boolean), the module-scope `const` (i32) seen from a frame binding no
+`v`, and a nested frame shadowing its parent — and captures each, so a plan served for the
+wrong block cannot type-check by accident. Sabotaged so `parentLetOfSid` serves the first
+block it ever built, it is `expected (ref $type), found f64` inside `loopV`; under the same
+saboteur `unions/list-literal-destination-scope.vl` and its shadow twin both still **pass**,
+which is the reason to have run them rather than reasoned about them.
 
 ### 5.4 Type-string parsing is ~3.7% of a self-compile
 
@@ -406,24 +471,32 @@ run at `fnIx == -1`, where it degrades to exactly the literal-only `letInfStrLis
 | 3 | `pendingStructIdx`, `nulstruct` cell | `localStructIdx[slot]` | `globalCellStructIdx` | `globalCellStructIdx` | `nulRefStructIdxOfLet` | **equivalent spelling** — `globalCellStructIdx` routes an annotated cell through `globalNulRefSupersede`, gated on `globalCellKind == "nulstruct"`, which is the module-scope twin of `nulRefStructIdxOfLet`'s redirect |
 | 4 | `pendingVariantIdx` bound | unbounded | unbounded | bounded by `uVarHeap.length` | unbounded | **no witness** — the window needs `globalCellKind` to answer `variant`/`nulvariant` while `globalCellStructIdx` falls to `structIndexOfExpr`; the two are paired arm for arm. A defensive bound, not a live one. Called out, not filed |
 | 5 | `pendingNulRefHeap`, `nulvariant` cell | no seed | `uVarHeap[i]`, ungated | `uVarHeap[i]`, ungated (bounded) | `armDestHeapOf(kind, i)`, gated on a `NullLit` RHS | **same value, three spellings** — `armDestHeapOf("nulvariant", i)` *is* `uVarHeap[i]` under the same bound, and `globalCellArmIdx(g, "nulvariant")` *is* `globalCellStructIdx(g)`. L needs no seed because `emitNullLitNode` reads `pendingVariantIdx` first, which L does seed. The gate scopes a leak; both global loops clear the seed at the foot (D1563) |
-| 6 | `pendingNulNone` | no seed (an early `letIsNulNone` return emits `ref.null none`) | `gck == "nulnone"` | **no seed** | no seed (a `gaKind == "nulnone"` arm emits it) | **dead in C by construction** — a `nulnone` cell's init is `null`, which is never a constexpr. L and A are equivalent spellings: a direct emit instead of a seed |
-| 7 | `pendingNulBool`/`NulString`/`NulClosure`/`NulList` | seeded | seeded | **none seeded** | seeded | **dead in C by construction** — each is consumed only by a bare `null` |
+| 6 | `pendingNulNone` | no seed (an early `letIsNulNone` return emits `ref.null none`) | `gck == "nulnone"` | **no seed** | no seed (a `gaKind == "nulnone"` arm emits it) | **dead in C by construction** — a `nulnone` cell's init is `null`, which is never a constexpr. L and A are equivalent spellings: a direct emit instead of a seed. C's per-cell snapshot restores it with the other sixteen, so deadness is no longer the only thing keeping it scoped |
+| 7 | `pendingNulBool`/`NulString`/`NulClosure`/`NulList` | seeded | seeded | `NulClosure`/`NulList` through `expCtxForCell`; `NulBool`/`NulString` not | seeded | **armed at C, never consumed there** — each is read only by a bare `null`, which no constexpr init can contain. What keeps the two the builder arms from reaching a later cell, a function body or the start function is C's snapshot restore, not their deadness |
 | 8 | `pendingNulBool` producer | `letNulBool` (annotation, inferred, or init probe) | `letIsNulBoolAnn` (annotation only) | — | `exprNulBool` | **equivalent spelling** — the inferred rungs answer for a binding whose init is not a bare `null`, and only a bare `null` consumes the seed |
 | 9 | `pendingI64` / `pendingF64` | not seeded | not seeded | `gck == "i64"` / `"f64"` | not seeded | **equivalent spelling, stated in `emit_state.vl`'s own header** — a wasm constexpr carries no convert op, so C re-encodes the literal where the other three widen through `emitExprAs*` |
 | 10 | `pendingF32` | set around `emitExprAsF32` | set around `emitExprAsF32` | `gck == "f32"` | not set | **equivalent spelling** — same three witnesses (float literal, integer literal, `f32[]`) at all four |
 | 11 | `pendingMapSlot` for a `map`/`nulmap` **const** cell | — | seeded | seeded | seeded under `exprMap` | **dead arm in C, and its comment is stale**: "the `pendingMapSlot` seed makes the `Map()` init constexpr build it" cannot fire — `Map()` is a `Call` and `isConstInit` has no `Call` arm |
-| 12 | `pendingNulRefHeap` for `nulreflist` / nul-scalar-list | seeded | seeded | **not seeded** (the `pendingListKind` half is) | seeded | **correct as written** — the ref-heap half is consumed only by a bare `null`; the list-build half *is* live at C and is present |
-| 13 | `ExpCtx` carries 16 fields for 17 `pending*` globals | — | — | — | — | `pendingNulNone` is absent from `expCtxHere`/`expCtxApply`, so `emitExprExpect` neither applies nor restores it. Nothing observes it today (S is its only writer and S does not route through `emitExprExpect`), but a later merge must not start scoping it silently |
-| 14 | what the per-cell RESET clears | restores through `emitExprExpect` | clears all eleven, `pendingNulRefHeap` among them | clears **nine**, and no null rep among them | restores through `emitExprExpect` | **the reason C stays unwired.** Rows 6, 7 and 12 say C never *consumes* a null rep. It also never *clears* one, and only the first fact was load-bearing until the builder arrived |
+| 12 | `pendingNulRefHeap` for `nulreflist` / nul-scalar-list | seeded | seeded | the nul-scalar-list wrapper through `expCtxForCell`; the `nulreflist` `rlWrapIdx` half not | seeded | **equivalent spelling** — the `nulreflist` half is gated on a `NullLit` init, which C cannot receive; the nul-scalar-list wrapper rides with the leaf build code the const init genuinely needs |
+| 13 | `ExpCtx` carries 17 fields for 17 `pending*` globals | — | — | — | — | **closed** — `nulNone` is a field, so `expCtxHere`/`expCtxApply` transport it and `emitExprExpect` scopes all seventeen. Every context in the tree is derived from `expCtxHere()`, so the added field round-trips the ambient value: byte-identical seed, byte-identical corpus |
+| 14 | what the per-cell RESET clears | restores through `emitExprExpect` | clears all eleven, `pendingNulRefHeap` among them | restores the whole `ExpCtx` snapshot | restores through `emitExprExpect` | **closed** — rows 6, 7 and 12 say C never *consumes* a null rep, which licenses arming one; what licenses arming one *safely* is that C now restores every seed it can write, the map shape and the null-rep heap included. The seed set is closed by the type, not by a list a later rung has to remember to extend |
 
 **Row 14 is the one the merge had to find the hard way.** Wiring C to the shared builder is
-sound by consumption — a bare `null` cannot reach it — and unsound by leakage: a const cell of
-kind `nulf64list` arms `pendingNulRefHeap` with its wrapper, C's reset does not clear it, and the
-next `= null` global in the start function lowers as that wrapper. That is D1563's mechanism
-exactly, and `tests/cases/globals/nullable-global-null-list-seeds.vl` plus
-`nullable-global-assign-null-seeds.vl` turned check-clean invalid wasm (`type mismatch: expected
-(ref null $type), found (ref null $type)`) under the wired build. **A dead arm and an inert one
-are not the same claim**, and only the second licenses adding a seed.
+sound by consumption — a bare `null` cannot reach it — and unsound by leakage while C's reset
+names its seeds by hand: a const cell of kind `nulf64list` arms `pendingNulRefHeap` with its
+wrapper, a nine-name clear list does not mention it, and the next `= null` global in the start
+function lowers as that wrapper. That is D1563's mechanism exactly. **A dead arm and an inert
+one are not the same claim**, and only the second licenses adding a seed.
+
+Four fixtures hold the distinction. `tests/cases/globals/nullable-global-null-list-seeds.vl`
+and `nullable-global-assign-null-seeds.vl` grade check-clean invalid wasm (`type mismatch:
+expected (ref null $type), found (ref null $type)`) against a build that calls the builder from
+C with the hand-rolled reset left standing; `nullable-global-const-cell-seed-leak.vl` and
+`nullable-global-const-cell-list-seed-leak.vl` pin the two channels directly — the heap index
+and the boolean `pendingNulList`, which `emitNullBySeed` reads first — at three victim
+positions each. The victims are a global declared after the armer, a global declared before it,
+and a `return null` in a function body: the const cell's constexpr is emitted ahead of every
+body and ahead of the start function, so section order, not declaration order, decides.
 
 **Outcome: no disagreement changes a program's outcome, so no row was filed.** Every entry is
 an equivalent spelling or a dead arm, and each is named as one above.
@@ -450,11 +523,11 @@ entry point. Only the controls said so.
 (which calls `emitExpr`), while `emit_sections.vl` already imports from `wasmEmit.vl`. Adding
 `export` alone is byte-identical. `expCtxForCell(kind: VKind): ExpCtx` then carries the four
 rungs a ladder derives from the kind alone — the two nul-scalar-list seeds, `nullist` and
-`nulclosure`. **Three of the four boundaries call it**: the local `let`, the start-fn global
-init, and the `global.set` arm. The const cell keeps its own single live rung, for row 14's
-reason. Row 5's `nulvariant` null is deliberately **not** in the builder: its gate genuinely
-differs per boundary and no witness separates the three spellings, so folding it in would be an
-unmeasured behaviour change.
+`nulclosure`. **All four boundaries call it**: the local `let`, the start-fn global init, the
+`global.set` arm, and the const cell, whose own per-cell reset is an `expCtxHere()` snapshot
+applied back after the init. Row 5's `nulvariant` null is deliberately **not** in the builder:
+its gate genuinely differs per boundary and no witness separates the three spellings, so
+folding it in would be an unmeasured behaviour change.
 
 ### 6.2 Sixteen functions re-run one list-rep classifier ladder
 
@@ -775,11 +848,28 @@ say which. The type-string parse count (§6.4) excludes comment lines and the pa
 declarations; the raw textual count is 20–25% higher, which is the same "a line is not a
 message" trap one level over.
 
+**§5.3 re-measured at `7a733ea6b`** (2026-09-05, after #2567), because a profile ranks cost
+and cannot say whether a bigger cache would avoid it:
+
+```sh
+python3 scripts/perf/parent-let-cache-probe.py     # asks, rebuilds, LRU 2..128, unbounded
+```
+
+It patches counters into `emit_base.vl`, reports them through `emitFail` at the foot of
+`emitProgram` (the compiler module is instantiated with an EMPTY linker, so `print` has no
+import to reach), builds that compiler to a scratch path and reverts the patch *before* the
+measuring build runs — so the instrumented bytes can never become anyone's seed. A moved
+anchor is a loud refusal that writes nothing; the control for that is in §5.3's own numbers
+being reproducible on demand. The walk count (32 roots, 144,826 `dsRebindsName` calls) came
+from the same instrument with one extra counter at `dsScopeWalk`'s entry, not committed.
+
 **Witnesses run** (verbatim, on this checkout's seed): the map-value scalar widen program in
 §8.5. One further probe was written for a global-assignment ref widen and is **not** reported:
 it used structural width subtyping rather than an interned ref-list pair, so it exercised a
 different refusal and says nothing about the position it was meant to test.
 
-**Not run:** the full census (a discovery instrument, forbidden by the brief), `gate.sh`, and
-any change to compiler source. Nothing in this document is graded by a compile of a modified
-compiler; every "proof" column states what such a compile would have to show.
+**Not run:** the full census (a discovery instrument, forbidden by the brief) and `gate.sh`.
+No proposed change was built: every "proof" column states what such a compile would have to
+show. The one compile of modified compiler source in this document is §5.3's counter probe,
+which changes no behaviour, is reverted by the script that applies it and never reaches
+`build/`.
