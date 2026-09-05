@@ -32,6 +32,9 @@ import {
   f64PushScratchBase,
   fa32TypeIdx,
   fa64TypeIdx,
+  fbEagerScratch,
+  fbFrameParams,
+  fbRunsWritten,
   fbScratchCur,
   fl32TypeIdx,
   fl64TypeIdx,
@@ -181,7 +184,6 @@ const OP_F64_PROMOTE_F32 = 0xbb
 // it integral" and "is it in range" before converting. Grouped here as a block since
 // nothing else in the emitter compares two floats or truncates one toward an integral float.
 const OP_I32_AND = 0x71
-const OP_I64_EQ = 0x51
 const OP_I64_LE_S = 0x57
 const OP_I64_GE_S = 0x59
 const OP_F32_EQ = 0x5b
@@ -397,7 +399,7 @@ export function fbI32Const(v: i32) {
 // unsigned 32-bit lanes, shifted right 7 bits at a time across the lane boundary by
 // hand — `wSLEB`'s i32 form cannot be reused, since its `v >> 7` is a 32-bit arithmetic
 // shift. Stops once the remaining value is all-0 (sign bit clear) or all-1 (sign bit set).
-export function wSLEB64(hi: i32, lo: i32) {
+function wSLEB64(hi: i32, lo: i32) {
   let h = hi
   let l = lo
   let more = true
@@ -540,11 +542,6 @@ export function fbI64TruncF64S() {
 // answering "is this value integral"; a NaN answers false for free (`NaN == trunc(NaN)`).
 export function fbI32And() {
   wU8(OP_I32_AND)
-  0
-}
-// i64.eq: 0x51 — the `i64 → i32` round trip's compare.
-export function fbI64Eq() {
-  wU8(OP_I64_EQ)
   0
 }
 // i64.le_s / i64.ge_s: 0x57 / 0x59.
@@ -1074,6 +1071,7 @@ export function fbReserve(n: i32) {
 // the cursor's end index, the first local past all scratch frames.
 export function fbBeginFunc(nParams: i32, nLocals: i32) {
   fbScratchCur = nParams + nLocals
+  fbFrameParams = nParams
   // i32-list push grow quad (val / cap / backing / recvRef).
   pushScratchBase = fbScratchCur
   if fnUsesPush { fbReserve(4) }
@@ -1258,6 +1256,7 @@ export function fbBeginFunc(nParams: i32, nLocals: i32) {
   lhOpen = []
   lhScanName = []
   lhScanRep = []
+  fbEagerScratch = fbScratchCur - nParams - nLocals
   fbScratchCur
 }
 // List-header hoist rows: a row caches one binding's list header (backing ref, `len`)
@@ -1281,39 +1280,39 @@ export let lhOpen: i32[] = []
 export let lhScanName: string[] = []
 export let lhScanRep: i32[] = []
 // One (1, i32) run — `0x7f`.
-export function fbI32Run() {
-  wU8(1)
+function fbI32Run() {
+  fbRun()
   wU8(VT_I32) // 0x7f i32
   0
 }
 // One (1, f64) run — `0x7c`.
-export function fbF64Run() {
-  wU8(1)
+function fbF64Run() {
+  fbRun()
   wU8(VT_F64) // 0x7c f64
   0
 }
 // One (1, i64) run — `0x7e`.
-export function fbI64Run() {
-  wU8(1)
+function fbI64Run() {
+  fbRun()
   wU8(VT_I64) // 0x7e i64
   0
 }
 // One (1, f32) run — `0x7d`.
-export function fbF32Run() {
-  wU8(1)
+function fbF32Run() {
+  fbRun()
   wU8(VT_F32) // 0x7d f32
   0
 }
 // One (1, anyref) run — `0x6e`. Defaultable (it is a nullable ref), so a local
 // declared with it needs no pre-seed before its first `local.set`.
-export function fbAnyRun() {
-  wU8(1)
+function fbAnyRun() {
+  fbRun()
   wU8(VT_ANYREF) // 0x6e anyref
   0
 }
 // One (1, (ref ht)) run — non-null `0x64 <uleb heapIdx>`.
 export function fbRefRun(heapIdx: i32) {
-  wU8(1)
+  fbRun()
   wU8(RT_REF) // 0x64 (ref ht) — non-null ref
   wSLEB(heapIdx)
   0
@@ -1321,53 +1320,56 @@ export function fbRefRun(heapIdx: i32) {
 // One (1, valtype) run for a DECLARED local, via the shared `fbValtype` switch
 // (`kind`/`structIdx` are the `localIsRef`/`localStructIdx` codes).
 export function fbLocalRun(kind: VKind, structIdx: i32) {
-  wU8(1)
+  fbRun()
   fbValtype(kind, structIdx)
   0
 }
+// One (1, (ref null struct)) run — nullable `0x63` over the abstract `structref`
+// heaptype, the variant-rebox stash's slot.
+function fbStructNullRun() {
+  fbRun()
+  wU8(RT_REF_NULL) // 0x63 (ref null ht)
+  wU8(HT_STRUCT) // structref abstract heaptype (0x6b)
+  0
+}
+// One (count=1) run header, and the only place the vector's run tally moves — every
+// `fb*Run` opens with it, so `fbRunsWritten` counts declared locals and scratch slots
+// alike and `fbFrameAt` can read it as a local index.
+function fbRun() {
+  wU8(1)
+  fbRunsWritten = fbRunsWritten + 1
+  0
+}
+// A frame boundary: `base` is the local index `fbBeginFunc` reserved this frame at, and
+// `fbRunsWritten` is how many locals the vector has declared — the same position in two
+// units. A disagreement is a frame emitted at a size its base did not reserve, which
+// leaves the vector VALID and every later slot read off by the difference.
+function fbFrameAt(base: i32, frame: string) {
+  if base - fbFrameParams != fbRunsWritten {
+    return emitFail(
+      "emitProgram: the locals vector desyncs from the frame layout at the " +
+        frame +
+        " frame — `fbBeginFunc` reserved a different slot count than `fbEmitLocalsVec` declared",
+    )
+  }
+  0
+}
 // The number of (count=1) runs this function's locals vector holds: one per declared
-// local plus the slot count of every reserved scratch frame. DERIVED from the same
-// `fnUses*` flags + `fnRefPushSlots` that drove `fbBeginFunc`, so it cannot desync
-// from the actual layout.
+// local, plus the eager scratch slots `fbBeginFunc` reserved, plus the lazy list frame
+// when any row interned. The eager total is the CURSOR that walk advanced, so this is
+// the layout read back rather than a second sum over the same flags.
 export function fbLocalsCount(nLocals: i32) {
-  let n = nLocals
-  if fnUsesPush { n = n + 4 }
-  n = n + fnRefPushSlots.length * 4
-  if fnUsesStrPush { n = n + 4 }
-  if fnUsesF64Push { n = n + 4 }
-  if fnUsesI64Push { n = n + 4 }
-  if fnUsesF32Push { n = n + 4 }
-  if fnUsesU8Push { n = n + 4 }
-  if fnUsesStrOp { n = n + 11 }
-  if fnUsesMap { n = n + 15 + mvValName.length * 3 }
-  if fnUsesMap && mI32Used { n = n + 5 }
-  if fnUsesMapKeys { n = n + 6 }
-  if fnUsesMapVals { n = n + 6 + mvValName.length }
-  if fnUsesCallRef { n = n + 1 }
-  if fnUsesMapFilter { n = n + 4 }
-  n = n + mfSrcKinds.length + mfDstKinds.length
-  if fnUsesListEqI { n = n + 5 }
-  if fnUsesListEqS { n = n + 4 }
-  n = n + fnListEqRSlots.length * 4
-  n = n + fnListCatKinds.length * 4
-  n = n + fnListEqGKinds.length * 4
-  if fnUsesCloEq { n = n + 2 }
-  if fnUsesArrNew { n = n + 1 }
-  if fnUsesCoalesceCall { n = n + 3 }
-  if fnUsesVariantRebox { n = n + 1 }
-  if fbUsesSinkPair() { n = n + 2 }
-  if fnUsesUnionAs { n = n + 1 }
-  if fnUsesAtomStage { n = n + 1 }
-  if fnUsesNumCast { n = n + 3 }
+  let n = nLocals + fbEagerScratch
   if liKinds.length > 0 { n = n + 1 + liKinds.length }
   n
 }
 // Emits the full locals vector onto `body`: the run count, then one `(1, valtype)` run
-// per declared local, then the scratch frames in `fbBeginFunc`'s layout order (i32-push,
-// per-slot ref-push, string-push, string-op, map). Derived from the local set and
-// scratch flags rather than separately counted.
+// per declared local, then the scratch frames in `fbBeginFunc`'s layout order. Every
+// frame that walk hands a named base out for is checked here against the runs written so
+// far (`fbFrameAt`), so the third walk cannot drift from the two it must agree with.
 export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
   const prev = wTarget(body)
+  fbRunsWritten = 0
   wULEB(fbLocalsCount(nLocals))
   // Declared locals (struct / list / string / ref-list ref or i32 — see `fbValtype`).
   let li = 0
@@ -1375,6 +1377,7 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
     fbLocalRun(localIsRef[li], localStructIdx[li])
     li = li + 1
   }
+  fbFrameAt(pushScratchBase, "i32-push")
   // i32-list push grow quad: pushVal i32, pushNewCap i32, pushNewBacking (ref $aTypeIdx),
   // pushRecvRef (ref $lTypeIdx) — the wrapper ref for a struct-FIELD receiver (gap #3).
   if fnUsesPush {
@@ -1383,6 +1386,7 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
     fbRefRun(aTypeIdx)
     fbRefRun(lTypeIdx)
   }
+  fbFrameAt(refPushScratchBase, "ref-push")
   // One typed 4-slot ref-push frame per distinct pushed element-type slot, in
   // `fnRefPushSlots` order: pushRefVal (ref $elem), pushRefCap i32,
   // pushRefBacking (ref $back), pushRefRecvRef (ref $wrap).
@@ -1403,6 +1407,7 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
     fbRefRun(rlWrapIdx[rfs])
     rfk = rfk + 1
   }
+  fbFrameAt(strPushScratchBase, "string-push")
   // String-list push quad: pushStrVal (ref $sTypeIdx), pushStrCap i32,
   // pushStrBacking (ref $mkArrIdx), pushStrRecvRef (ref $mkListIdx).
   if fnUsesStrPush {
@@ -1415,33 +1420,34 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
     fbRefRun(mkArrIdx)
     fbRefRun(mkListIdx)
   }
+  fbFrameAt(f64PushScratchBase, "f64-push")
   // f64-list push quad: pushF64Val f64, pushF64Cap i32, pushF64Backing
   // (ref $fa64TypeIdx), pushF64RecvRef (ref $fl64TypeIdx).
   if fnUsesF64Push {
-    wU8(1)
-    wU8(VT_F64) // 0x7c f64
+    fbF64Run()
     fbI32Run()
     fbRefRun(fa64TypeIdx)
     fbRefRun(fl64TypeIdx)
   }
+  fbFrameAt(i64PushScratchBase, "i64-push")
   // i64-list push quad: pushI64Val i64, pushI64Cap i32, pushI64Backing
   // (ref $ia64TypeIdx), pushI64RecvRef (ref $il64TypeIdx).
   if fnUsesI64Push {
-    wU8(1)
-    wU8(VT_I64) // 0x7e i64
+    fbI64Run()
     fbI32Run()
     fbRefRun(ia64TypeIdx)
     fbRefRun(il64TypeIdx)
   }
+  fbFrameAt(f32PushScratchBase, "f32-push")
   // f32-list push quad: pushF32Val f32, pushF32Cap i32, pushF32Backing
   // (ref $fa32TypeIdx), pushF32RecvRef (ref $fl32TypeIdx).
   if fnUsesF32Push {
-    wU8(1)
-    wU8(VT_F32) // 0x7d f32
+    fbF32Run()
     fbI32Run()
     fbRefRun(fa32TypeIdx)
     fbRefRun(fl32TypeIdx)
   }
+  fbFrameAt(u8PushScratchBase, "u8-push")
   // `u8[]` push quad: pushU8Val i32, pushU8Cap i32, pushU8Backing (ref $ba8TypeIdx),
   // pushU8RecvRef (ref $bl8TypeIdx). The VALUE slot is a plain i32 — a byte value is an
   // i32 in wasm, and the truncation to one byte happens in `array.set` on the packed
@@ -1452,6 +1458,7 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
     fbRefRun(ba8TypeIdx)
     fbRefRun(bl8TypeIdx)
   }
+  fbFrameAt(strScratchBase, "string-op")
   // String-op frame: strScrA/strScrB (string header refs), strScrOut (the backing under
   // construction), strScrI0..strScrI3 (i32 temporaries), and the hoisted operand
   // backings/offsets (strScrABk/strScrBBk, strScrAOff/strScrBOff) that keep an element
@@ -1469,6 +1476,7 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
     fbI32Run()
     fbI32Run()
   }
+  fbFrameAt(mapScratchBase, "map")
   // G8 map scratch frame, in slot order: mapRef, keyRef, curRef, slot, cap, entry,
   // keysBk, valsBk, chr, hcur, idxBk, rslot, liveBk, hashBk, valSet (the mono SET
   // value stash, reserved across the probe). Types match each `fbRefRun`/`fbI32Run`
@@ -1490,6 +1498,7 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
     fbRefRun(aTypeIdx)
     fbI32Run()
   }
+  fbFrameAt(mapI32Base, "i32-keyed map")
   // The i32-KEYED map's extra slots, in `fbBeginFunc`'s reservation order:
   //   0 keyI32 i32, 1 keysBk (ref $aTypeIdx), 2 kOut (ref $aTypeIdx),
   //   3 kSrc (ref $aTypeIdx), 4 mapRef (ref $mStructI32Idx).
@@ -1500,6 +1509,7 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
     fbRefRun(aTypeIdx)
     fbRefRun(mStructI32Idx)
   }
+  fbFrameAt(mapKeysBase, "map-keys")
   // `m.keys()` / `for k in m` key-list builder frame (6 slots): outBack (ref $mkArrIdx),
   // keysBack (ref $mkArrIdx), live (ref $aTypeIdx), i, j, count (3 i32).
   if fnUsesMapKeys {
@@ -1510,6 +1520,7 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
     fbI32Run()
     fbI32Run()
   }
+  fbFrameAt(mapValsBase, "map-values")
   // `m.values()` value-list builder frame (6 slots): outBack (ref $aTypeIdx), valsBack
   // (ref $aTypeIdx), live (ref $aTypeIdx), i, j, count (3 i32).
   if fnUsesMapVals {
@@ -1520,8 +1531,10 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
     fbI32Run()
     fbI32Run()
   }
+  fbFrameAt(callRefSlot, "call_ref")
   // Closure scratch slot (1, (ref $cloStruct)) for `call_ref` (lambdas).
   if fnUsesCallRef { fbRefRun(cloStructIdx) }
+  fbFrameAt(mfScratchBase, "map/filter")
   // `.map`/`.filter` HOF frame: i, n, j (3 i32) + the callback closure
   // (ref $cloStruct), then the typed src-wrapper slots, then the typed dst-backing
   // slots — in `fbBeginFunc`'s reservation order.
@@ -1562,6 +1575,7 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
     }
     mfw = mfw + 1
   }
+  fbFrameAt(fnMvBase, "ref-valued map")
   // Ref-valued map frames (3 typed slots per module mv slot, map-using functions
   // only — `fbBeginFunc`'s reservation order): mapRef, valsBk, valStash (nullable —
   // it holds a vals-slot read, which is a `(ref null <elem>)`).
@@ -1579,6 +1593,7 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
       mvr = mvr + 1
     }
   }
+  fbFrameAt(mvValsOutBase, "map-values output")
   // `m.values()` per-mv-slot output backing (1 per mv slot, typed as the value backing).
   if fnUsesMapVals {
     let mvo = 0
@@ -1587,6 +1602,7 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
       mvo = mvo + 1
     }
   }
+  fbFrameAt(leqIScratchBase, "i32-list compare")
   // List `==`/`!=`/`+` frames, in `fbBeginFunc`'s reservation order: the
   // i32-list frame (A/B wrapper refs, the concat out backing, n, i), the
   // string-list frame (A/B wrapper refs, n, i), then one typed frame per
@@ -1598,6 +1614,7 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
     fbI32Run()
     fbI32Run()
   }
+  fbFrameAt(leqSScratchBase, "string-list compare")
   if fnUsesListEqS {
     fbRefRun(mkListIdx)
     fbRefRun(mkListIdx)
@@ -1639,13 +1656,16 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
     fbI32Run()
     lgv = lgv + 1
   }
+  fbFrameAt(cloEqScratchBase, "closure equality")
   // Closure equality frame (2 `(ref $cloStruct)` slots, appended LAST).
   if fnUsesCloEq {
     fbRefRun(cloStructIdx)
     fbRefRun(cloStructIdx)
   }
+  fbFrameAt(arrNewScratchBase, "array-intrinsic")
   // Array-intrinsic frame (1 i32 slot — the staged allocation length).
   if fnUsesArrNew { fbI32Run() }
+  fbFrameAt(coalesceCallSlot, "call-LHS `??`")
   // Call-LHS `??` stash (3 slots, appended LAST): the `(ref $uBoxIdx)` box, the
   // `(ref null $sTypeIdx)` string|null niche, then the i32 boolean|null niche.
   if fnUsesCoalesceCall {
@@ -1653,29 +1673,31 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
     fbRefNullRun(sTypeIdx)
     fbI32Run()
   }
+  fbFrameAt(variantReboxSlot, "variant-rebox")
   // Variant-rebox stash: one `(ref null struct)` slot (holds any plain-struct source ref;
   // recovered by `ref.cast (ref $plainStruct)` at each field re-read).
-  if fnUsesVariantRebox {
-    wU8(1)
-    wU8(RT_REF_NULL) // 0x63 (ref null ht)
-    wU8(HT_STRUCT) // structref abstract heaptype (0x6b)
-  }
+  if fnUsesVariantRebox { fbStructNullRun() }
+  fbFrameAt(unionSinkBase, "union-box sink")
   // Union-box sink frame: the i32 tag, then the `anyref` payload — the two operands of
   // the box's single `struct.new`, in the field order it pops them.
   if fbUsesSinkPair() {
     fbI32Run()
     fbAnyRun()
   }
+  fbFrameAt(unionAsSlot, "union-`as` box")
   // The union-`as` box slot — non-null, `local.set` before every read.
   if fnUsesUnionAs { fbRefRun(uBoxIdx) }
+  fbFrameAt(atomStageSlot, "atom-narrow staging")
   // The atom-narrow staging slot — likewise non-null, `local.set` before every read.
   if fnUsesAtomStage { fbRefRun(sTypeIdx) }
+  fbFrameAt(numCastF64Slot, "numeric-cast staging")
   // The numeric exact-or-fail staging slots, in `fbBeginFunc`'s order: f64, f32, i64.
   if fnUsesNumCast {
     fbF64Run()
     fbF32Run()
     fbI64Run()
   }
+  fbFrameAt(listIdxScratchBase, "lazy list")
   // Lazy list scratch frame (appended last, after every eager frame above): the shared
   // i32 index stash, then one nullable typed slot per `liBack` code — 0 a bounds-check
   // wrapper, 1/3 a list-literal destination backing, 2 an indexed-store element value,
@@ -1822,7 +1844,7 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
 }
 // One (1, (ref null ht)) run — nullable `0x63 <uleb heapIdx>`.
 export function fbRefNullRun(heapIdx: i32) {
-  wU8(1)
+  fbRun()
   wU8(RT_REF_NULL) // 0x63 (ref null ht) — nullable ref
   wSLEB(heapIdx)
   0
@@ -2035,8 +2057,8 @@ export function pushFieldStorage(code: i32, refSlot: i32) {
 // slot (D1510), typed off the same `pushFieldStorage` table the type section uses. A
 // non-null field gets a non-null local: it is `local.set` before `local.get`, straight-
 // line at one block depth, satisfying wasm's definite-assignment rule.
-export function fbFieldStorageRun(code: i32, storageSlot: i32) {
-  wU8(1)
+function fbFieldStorageRun(code: i32, storageSlot: i32) {
+  fbRun()
   pushFieldStorage(code, storageSlot)
 }
 // Emit a global cell valtype, NULLABLE for refs (`0x63` instead of `0x64`) so a
