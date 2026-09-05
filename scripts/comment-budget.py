@@ -5,25 +5,31 @@ Same four clauses as compiler/lint.vl's rules, over the same block definition an
 the same two budgets — 4 lines a block, 12 a module header — so the numbers agree
 file by file (tests/vl_comment_budget_test.ts pins that).
 Per-file counts may only FALL: `--check` fails when any file exceeds its
-baseline, `--write-baseline` lowers it after a trim lands. The rules themselves
-are docs/internals/comment-style.md.
+baseline, `--write-baseline` lowers it after a trim lands. The baseline schema,
+the `--check`/`--why` commands and the exit codes are scripts/ratchet.py, shared
+with the other four ratchets. The rules themselves are
+docs/internals/comment-style.md.
 """
 
 import json
 import os
 import sys
 
+import ratchet
+from ratchet import DIGIT, WORD, read_source
+
 BUDGET = 4
 # A module header earns more room: it is the file's contract, not a note beside one
 # line. Both implementations read both budgets from here.
 HEADER_BUDGET = 12
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BASELINE = os.path.join(ROOT, "scripts", "comment-budget-baseline.json")
+BASELINE = os.path.join(ratchet.ROOT, "scripts", "comment-budget-baseline.json")
 TOO_LONG = "comment-block-too-long"
 UNCITED = "comment-measurement-uncited"
 SHOUTING = "comment-shouting"
 HISTORY = "comment-history"
 CODES = (TOO_LONG, UNCITED, SHOUTING, HISTORY)
+# `std/` is deliberately absent — see `sources()`.
+TREES = ("compiler",)
 
 # The acronyms a comment may spell in capitals (rule 5) — the whole allow-list, in
 # one place. A word under three letters never reaches it, so `GC` needs no entry.
@@ -34,8 +40,6 @@ ACRONYMS = frozenset(
 HISTORY_PHRASES = ("no longer", "used to", "previously", "measured", "landed", "was", "were")
 HISTORY_STARTS = frozenset("nNuUpPmMlLwW")
 
-WORD = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
-DIGIT = set("0123456789")
 UNITS = ("cells", "cell", "rows", "row", "bytes", "classes", "class", "programs", "program")
 VERDICTS = ("loud", "silent")
 # Sources are read as BYTES decoded latin-1, so an index here is a BYTE index —
@@ -321,34 +325,36 @@ def _first(b, pred):
     return -1
 
 
-def grade(src):
-    """One hit list per code, each of (line, block length).
+def block_hits(start, b, is_header):
+    """ONE block's hits per code, each of (line, block length).
 
     Length and the uncited measurement are BLOCK facts and report at the block's
     first line; shouting and history are LINE facts and report where they stand,
     once per block per code — the same positions compiler/lint.vl emits."""
     hits = {c: [] for c in CODES}
-    for start, b, is_header in blocks(src):
-        if len(b) > (HEADER_BUDGET if is_header else BUDGET):
-            hits[TOO_LONG].append((start, len(b)))
-        if any(states_measurement(x) for x in b) and not any(has_citation(x) for x in b):
-            hits[UNCITED].append((start, len(b)))
-        k = _first(b, shouts)
-        if k >= 0:
-            hits[SHOUTING].append((start + k, len(b)))
-        k = _first(b, hist_phrase)
-        if k >= 0:
-            hits[HISTORY].append((start + k, len(b)))
+    if len(b) > (HEADER_BUDGET if is_header else BUDGET):
+        hits[TOO_LONG].append((start, len(b)))
+    if any(states_measurement(x) for x in b) and not any(has_citation(x) for x in b):
+        hits[UNCITED].append((start, len(b)))
+    k = _first(b, shouts)
+    if k >= 0:
+        hits[SHOUTING].append((start + k, len(b)))
+    k = _first(b, hist_phrase)
+    if k >= 0:
+        hits[HISTORY].append((start + k, len(b)))
     return hits
 
 
-def read_source(path):
-    """Latin-1 so one index is one BYTE, matching the lint's `s[i]`."""
-    with open(path, "rb") as fh:
-        return fh.read().decode("latin-1")
+def grade(src):
+    """One hit list per code for a whole source, in block order."""
+    hits = {c: [] for c in CODES}
+    for start, b, is_header in blocks(src):
+        for c, hs in block_hits(start, b, is_header).items():
+            hits[c] += hs
+    return hits
 
 
-def sources():
+def sources(root=None):
     """The tree this ratchet owns: `compiler/` only.
 
     `std/` is deliberately absent. comment-style.md is the COMPILER's rubric; a
@@ -357,11 +363,7 @@ def sources():
     the four codes for a std module for the same reason (D1601), so walking std
     here would ratchet a count the lint no longer produces.
     """
-    for d in ("compiler",):
-        p = os.path.join(ROOT, d)
-        for name in sorted(os.listdir(p)):
-            if name.endswith(".vl"):
-                yield f"{d}/{name}", os.path.join(p, name)
+    return ratchet.sources(TREES, root)
 
 
 def current():
@@ -373,59 +375,39 @@ def current():
     return out
 
 
-def load_baseline():
-    with open(BASELINE, encoding="utf-8") as fh:
-        return json.load(fh)
+def named(root):
+    """{code: {name: hits}} for one tree — the NAMED entries,
+    `file:<the block's opening line>`.
+
+    A comment block has no function to be named after, and its LINE NUMBER moves
+    whenever anything above it does, so the name is its opening text trimmed to 60
+    characters. Two blocks in one file that open identically collapse into one name
+    with a count, which is what hits-per-name is for."""
+    out = {c: {} for c in CODES}
+    for rel, path in sources(root):
+        for start, b, is_header in blocks(read_source(path)):
+            key = f"{rel}:{b[0].strip()[:60]}"
+            for c, hs in block_hits(start, b, is_header).items():
+                if hs:
+                    out[c][key] = out[c].get(key, 0) + len(hs)
+    return out
 
 
-def write_baseline(cur):
-    total = {c: sum(v[c] for v in cur.values()) for c in CODES}
-    lines = [
-        "{",
-        f'"budget": {BUDGET},',
-        f'"header_budget": {HEADER_BUDGET},',
-        f'"total": {json.dumps(total)},',
-        '"files": {',
-    ]
-    rows = [f'{json.dumps(k)}: {json.dumps(v)}' for k, v in sorted(cur.items())]
-    lines.append(",\n".join(rows))
-    lines += ["}", "}"]
-    with open(BASELINE, "w", encoding="utf-8") as fh:
-        fh.write("\n".join(lines) + "\n")
-    print(f"wrote {BASELINE}: " + ", ".join(f"{total[c]} {c}" for c in CODES))
-
-
-def cmd_check(cur):
-    base = load_baseline()["files"]
-    bad = []
-    for rel, v in sorted(cur.items()):
-        b = base.get(rel, {})
-        for c in CODES:
-            if v[c] > b.get(c, 0):
-                bad.append(f"  {rel}  {c}: {v[c]} (baseline {b.get(c, 0)})")
-    if bad:
-        print("comment budget REGRESSED — a file may only go down or stay:")
-        print("\n".join(bad))
-        print(
-            "\nShorten the block (state the invariant + the why + the row id) or cite\n"
-            "the row the number lives in. After a real trim, lower the baseline with\n"
-            "  python3 scripts/comment-budget.py --write-baseline"
-        )
-        return 1
-    tot = {c: sum(v[c] for v in cur.values()) for c in CODES}
-    print(
-        "comment budget ok (baseline or below) — "
-        + ", ".join(f"{tot[c]} {c}" for c in CODES)
-    )
-    return 0
-
-
-def cmd_exempt_codes():
-    """Codes scripts/lint-self.sh still tolerates: exactly those the committed
-    baseline still owes. At zero the code prints nothing and the gate bites."""
-    total = load_baseline()["total"]
-    print(" ".join(c for c in CODES if total.get(c, 0) > 0))
-    return 0
+R = ratchet.Ratchet(
+    script="comment-budget.py",
+    label="comment",
+    baseline=BASELINE,
+    codes=CODES,
+    ok_line=lambda t: "comment budget ok (baseline or below) — "
+                      + ", ".join(f"{t[c]} {c}" for c in CODES),
+    remedy="Shorten the block (state the invariant + the why + the row id) or cite\n"
+           "the row the number lives in. After a real trim, lower the baseline with",
+    wrote_line=lambda t: ", ".join(f"{t[c]} {c}" for c in CODES),
+    extras=lambda: (("budget", BUDGET), ("header_budget", HEADER_BUDGET),
+                    ("commit", ratchet.head_commit())),
+    named=named,
+    tree_paths=TREES,
+)
 
 
 def cmd_filter_lint(path, extra=()):
@@ -434,7 +416,7 @@ def cmd_filter_lint(path, extra=()):
     `extra` names codes a SIBLING ratchet still owes — scripts/scan-budget.py
     prints its own through `--exempt-codes`, and lint-self.sh passes them here so
     one filter grades the whole dump rather than two chained ones."""
-    total = load_baseline()["total"]
+    total = R.load_baseline()["total"]
     exempt = {c for c in CODES if total.get(c, 0) > 0} | set(extra)
     with open(path, encoding="utf-8") as fh:
         text = fh.read().strip()
@@ -461,7 +443,7 @@ def cmd_grade(path):
 
 def cmd_list(cur, code):
     if code not in CODES:
-        raise SystemExit(f"comment-budget: --list wants one of {' '.join(CODES)}")
+        raise SystemExit(f"{R.stem}: --list wants one of {' '.join(CODES)}")
     for rel, path in sources():
         if rel not in cur:
             continue
@@ -473,7 +455,9 @@ def cmd_list(cur, code):
 def main():
     args = sys.argv[1:]
     if "--exempt-codes" in args:
-        return cmd_exempt_codes()
+        return R.exempt_codes()
+    if "--why" in args:
+        return R.why(ratchet.flag_value(args, "--why"))
     if "--filter-lint" in args:
         i = args.index("--filter-lint")
         return cmd_filter_lint(args[i + 1], args[i + 2:])
@@ -481,13 +465,12 @@ def main():
         return cmd_grade(args[args.index("--grade") + 1])
     cur = current()
     if "--write-baseline" in args:
-        write_baseline(cur)
-        return 0
+        return R.write_baseline(cur)
     if "--check" in args:
-        return cmd_check(cur)
+        return R.check(cur)
     if "--list" in args:
         return cmd_list(cur, args[args.index("--list") + 1])
-    tot = {c: sum(v[c] for v in cur.values()) for c in CODES}
+    tot = R.totals(cur)
     head = "".join(f"{c.removeprefix('comment-'):>14}" for c in CODES)
     print(f"{'file':<28}{head}")
     for rel, v in sorted(cur.items(), key=lambda kv: -sum(kv[1].values())):

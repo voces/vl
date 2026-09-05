@@ -23,14 +23,21 @@ size is a per-landing number" / "The reading is the FIXPOINT's".
 
 Absent seed is not a failure: the `ci` job never builds one, and every seed-backed
 test there self-ignores on the same reasoning.
+
+THE ONE RATCHET WITH NO `--why`, and no `Ratchet` from scripts/ratchet.py. Its
+baseline is a SCALAR, not `{file: {code: count}}`, so there are no entries a fall
+could be attributed to and nothing for the shared `--check` to compare per file. It
+takes the checkout root and the baseline's provenance commit from there and keeps
+its own schema.
 """
 
 import json
 import os
-import subprocess
 import sys
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+import ratchet
+
+ROOT = ratchet.ROOT
 SEED = os.path.join(ROOT, "build", "vl-compiler.wasm")
 BASELINE = os.path.join(ROOT, "scripts", "seed-size-baseline.json")
 
@@ -63,19 +70,6 @@ def load_baseline(path):
     return row
 
 
-def head_commit():
-    """The commit the baseline describes. `unknown` outside a checkout — the
-    field is provenance for a human reading a jump, never an input to `--check`."""
-    try:
-        out = subprocess.run(
-            ["git", "-C", ROOT, "rev-parse", "--short", "HEAD"],
-            capture_output=True, text=True, timeout=10,
-        )
-        return out.stdout.strip() if out.returncode == 0 else "unknown"
-    except (OSError, subprocess.SubprocessError):
-        return "unknown"
-
-
 def pct_growth(size, base):
     return (size - base) * 100.0 / base
 
@@ -93,7 +87,9 @@ def report(size, base):
 
 def write_baseline(seed, baseline):
     size = read_size(seed)
-    row = {"bytes": size, "commit": head_commit()}
+    # `unknown` outside a checkout — the commit is provenance for a human reading
+    # a jump, never an input to `--check`.
+    row = {"bytes": size, "commit": ratchet.head_commit("unknown")}
     with open(baseline, "w", encoding="utf-8") as fh:
         fh.write(json.dumps(row) + "\n")
     print(f"wrote {baseline}: {size} bytes at {row['commit']}")
