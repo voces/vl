@@ -43,9 +43,11 @@ import {
   PrimName,
   T,
   TyArray,
+  TyErr,
   TyFunc,
   TyLit,
   TyMap,
+  TyNeg,
   TyNullable,
   TyObj,
   TyPrim,
@@ -7468,25 +7470,10 @@ export function arrNewIntrKind(callIx: i32, fnIx: i32) {
     const callee = P.nodes[c.callFn]
     if callee is Ident {
       if callee.identName == "__array_new__" {
-        if c.callArgs.length == 2 {
-          if exprIsF64(c.callArgs[1], fnIx) { return 1 }
-          // D963 — the i64 fill: `ia64TypeIdx` and `il64TypeIdx` are interned like the f64
-          // pair above and `i64[]` lists lower and run. Ahead of the string and struct arms
-          // for the same reason f64 is: a scalar fill cannot be either. f32 is not here —
-          // the identical wiring for the f32 pair produces invalid wasm, so its guard stays.
-          if exprIsI64(c.callArgs[1], fnIx) { return 4 }
-          // A string fill builds the string list; a struct or object-literal fill builds the
-          // ref list for that element struct.
-          if exprString(c.callArgs[1], fnIx) { return 2 }
-          const anf = P.nodes[c.callArgs[1]]
-          if anf is ObjLit { return 3 }
-          if exprStruct(c.callArgs[1], fnIx) { return 3 }
-          if exprIsClosure(c.callArgs[1], fnIx) { return 3 }
-          if exprArray(c.callArgs[1], fnIx) { return 3 }
-          if exprRefArray(c.callArgs[1], fnIx) { return 3 }
-          if exprStringArray(c.callArgs[1], fnIx) { return 3 }
-          if exprMap(c.callArgs[1], fnIx) { return 3 }
-        }
+        const ank = arrNewNamedKind(callIx, fnIx)
+        if ank >= 0 { return ank }
+        // Nothing named it, so `0` here is a guess. Every consumer of this classifier keeps
+        // reading it; the emitter asks `arrNewKindNamed` and refuses instead (D1630).
         return 0
       }
       if callee.identName == "__array_new_default__" {
@@ -7494,6 +7481,161 @@ export function arrNewIntrKind(callIx: i32, fnIx: i32) {
       }
     }
   }
+  -1
+}
+
+// True when something NAMED the `__array_new__` at `callIx` its element kind, rather than the
+// classifier above falling through to its i32 default. The emitter's own i32-list arm refuses
+// on `false` — the list it would build is then a guess about the fill's rep.
+export function arrNewKindNamed(callIx: i32, fnIx: i32) {
+  arrNewNamedKind(callIx, fnIx) >= 0
+}
+
+// The `__array_new__` element kind some source NAMES, or `-1` where none does. Three sources,
+// asked in that order: the fill's own rep, the destination's recorded type, and — inside a
+// monomorphized body, where that type is still the unpinned `T[]` — the instance's substituted
+// parameter annotation.
+function arrNewNamedKind(callIx: i32, fnIx: i32) {
+  const c = P.nodes[callIx]
+  if c is Call {
+    if c.callArgs.length == 2 {
+      if exprIsF64(c.callArgs[1], fnIx) { return 1 }
+      // D963 — the i64 fill: `ia64TypeIdx` and `il64TypeIdx` are interned like the f64
+      // pair above and `i64[]` lists lower and run. Ahead of the string and struct arms
+      // for the same reason f64 is: a scalar fill cannot be either. f32 is not here —
+      // the identical wiring for the f32 pair produces invalid wasm, so its guard stays.
+      if exprIsI64(c.callArgs[1], fnIx) { return 4 }
+      // A string fill builds the string list; a struct or object-literal fill builds the
+      // ref list for that element struct.
+      if exprString(c.callArgs[1], fnIx) { return 2 }
+      const anf = P.nodes[c.callArgs[1]]
+      if anf is ObjLit { return 3 }
+      if exprStruct(c.callArgs[1], fnIx) { return 3 }
+      if exprIsClosure(c.callArgs[1], fnIx) { return 3 }
+      if exprArray(c.callArgs[1], fnIx) { return 3 }
+      if exprRefArray(c.callArgs[1], fnIx) { return 3 }
+      if exprStringArray(c.callArgs[1], fnIx) { return 3 }
+      if exprMap(c.callArgs[1], fnIx) { return 3 }
+      // A wide-scalar list fill is a ref-list element like every other list. The three arms
+      // above claim one only where it is a module global; an `f64[]`/`i64[]`/`u8[]`/`f32[]`
+      // parameter or local reaches here (D1631).
+      if exprF64Array(c.callArgs[1], fnIx) { return 3 }
+      if exprI64Array(c.callArgs[1], fnIx) { return 3 }
+      if exprU8Array(c.callArgs[1], fnIx) { return 3 }
+      if exprF32Array(c.callArgs[1], fnIx) { return 3 }
+      // The fill named no kind, so the DESTINATION's rep decides. A union-typed fill answers
+      // none of the questions above (D1630).
+      const anDest = arrNewDestKind(callIx)
+      if anDest >= 0 { return anDest }
+      return arrNewFillAnnKind(callIx, fnIx)
+    }
+  }
+  -1
+}
+
+// The `__array_new__(n, fill)` element kind read off the DESTINATION — the checker's recorded
+// type for the call, the same source `arrNewDefaultKind` reads below. `-1` where that type
+// names no list rep, an unpinned `T[]` inside a generic body being the live case, and the
+// fill ladder stays authoritative there.
+function arrNewDestKind(callIx: i32) {
+  const ty = nodeTyIxOf(callIx)
+  const el = tyRefArrElemOf(ty)
+  const k = tyListRepKind(ty, rlSlotOfTy(el))
+  if k != null { return arrNewKindOfListVKind(k) }
+  // No interned row carries the element. An UN-annotated destination has no annotation to have
+  // banked one and the collect pass interns off this very answer, so the row cannot be the
+  // test; a RESOLVED non-primitive element is the ref list by construction, and the intern
+  // follows. An unpinned `T` is not resolved and still declines.
+  if tyIsRefListElemTy(el) { return 3 }
+  -1
+}
+
+// True when arena type `el` is an element the REF list carries — every composite, since each
+// reps as one heap ref. A `TyPrim` has its own scalar backing, and the other four are not a
+// resolved element type at all: an unbound `TyVar`, a bare literal, a negation, the err hole.
+function tyIsRefListElemTy(el: i32) {
+  if el < 0 { return false }
+  const e = T.tys[el]
+  if e is TyObj { return true }
+  if e is TyArray { return true }
+  if e is TyUnion { return true }
+  if e is TyNullable { return true }
+  if e is TyMap { return true }
+  if e is TyFunc { return true }
+  if e is TyPrim { return false }
+  if e is TyVar { return false }
+  if e is TyLit { return false }
+  if e is TyNeg { return false }
+  if e is TyErr { return false }
+  false
+}
+
+// The `__array_new__` element kind named by an annotated-PARAMETER fill: the list a value of
+// the parameter's declared `VKind` is an element of. The one channel a monomorphized instance
+// still has, its annotation carrying the pin while the recorded type is the original's
+// unpinned `T`. `-1` for a fill that is not an annotated parameter.
+function arrNewFillAnnKind(callIx: i32, fnIx: i32) {
+  const c = P.nodes[callIx]
+  if c is Call {
+    if c.callArgs.length == 2 {
+      const a = P.nodes[c.callArgs[1]]
+      if a is Ident {
+        const pt = paramTypeNode(fnIx, a.identName)
+        if pt >= 0 { return arrNewKindOfElemVKind(vtKindOfType(pt)) }
+      }
+    }
+  }
+  -1
+}
+
+// `arrNewIntrKind`'s 0-6 vocabulary for a list over an ELEMENT of `VKind` k. The arms are the
+// four scalar backings and the two i32-sentinel niches; `-1` for `f32`, whose FILL the emitter
+// still refuses, and for `nulnone`, a bare `null` with no rep of its own. Every remaining kind
+// is ref-repped, and the ladder below owns that answer.
+function arrNewKindOfElemVKind(k: VKind): i32 {
+  if k == "i32" || k == "nulbool" { return 0 }
+  if k == "f64" { return 1 }
+  if k == "str" || k == "nulstr" { return 2 }
+  if k == "i64" { return 4 }
+  if k == "f32" || k == "nulnone" { return -1 }
+  arrNewKindOfListVKind("reflist")
+}
+
+// `arrNewIntrKind`'s 0-6 vocabulary for a list `VKind`: the seven backings this intrinsic
+// allocates, and `-1` for every other kind — each names a VALUE rather than a list of them,
+// and the `T[] | null` ones name a cell the allocation does not fill.
+function arrNewKindOfListVKind(k: VKind | null): i32 {
+  if k == "list" { return 0 }
+  if k == "f64list" { return 1 }
+  if k == "strlist" { return 2 }
+  if k == "reflist" { return 3 }
+  if k == "i64list" { return 4 }
+  if k == "u8list" { return 5 }
+  if k == "f32list" { return 6 }
+  if k == "i32" { return -1 }
+  if k == "i64" { return -1 }
+  if k == "f64" { return -1 }
+  if k == "f32" { return -1 }
+  if k == "str" { return -1 }
+  if k == "struct" { return -1 }
+  if k == "variant" { return -1 }
+  if k == "union" { return -1 }
+  if k == "map" { return -1 }
+  if k == "closure" { return -1 }
+  if k == "nulstruct" { return -1 }
+  if k == "nulvariant" { return -1 }
+  if k == "nulstr" { return -1 }
+  if k == "nulbool" { return -1 }
+  if k == "nulclosure" { return -1 }
+  if k == "nulmap" { return -1 }
+  if k == "nulnone" { return -1 }
+  if k == "nullist" { return -1 }
+  if k == "nulstrlist" { return -1 }
+  if k == "nulreflist" { return -1 }
+  if k == "nulf64list" { return -1 }
+  if k == "nuli64list" { return -1 }
+  if k == "nulf32list" { return -1 }
+  if k == "nulu8list" { return -1 }
   -1
 }
 
@@ -8112,6 +8254,23 @@ export function rlElemCloSigKeyAt(slot: i32): string {
   const bt = T.tys[b]
   if bt is TyFunc { return sigKeyOfTy(b) }
   ""
+}
+
+// The `pendingListKind` an ELEMENT of ref-list row `slot` builds at, or `-1` where the element
+// is not a list at all and the caller's own seed stands. A kind-9 (ref inner list) element
+// pairs it with `rlElemInnerSlot`. An element left on the OUTER list's threading is built at
+// the outer pair's heap types instead of its own (D1629).
+export function refElemListBuildKind(slot: i32): i32 {
+  if slot < 0 || slot >= rlElemKindTbl.length { return -1 }
+  const k = rlElemKindTbl[slot]
+  if k == 4 { return 0 }
+  if k == 6 { return 3 }
+  if k == 7 { return 4 }
+  if k == 8 { return 6 }
+  if k == 9 { return 5 }
+  if k == 10 { return 7 }
+  if k == 11 { return 10 }
+  -1
 }
 
 // The inner ref-list slot of a nested or nullable ref-array element — the chokepoint the
@@ -26798,15 +26957,26 @@ export function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
   if e is Call {
     // `__array_new__(n, {…})` — the ref-list element name is the fill's struct.
     if arrNewIntrKind(exprIx, fnIx) == 3 {
+      // The DESTINATION's element names the row first: the list is allocated at the heap
+      // types it is stored into, and the fill's own spelling can be narrower — a `Node | null`
+      // fill answers the bare `Node`, whose row the destination never interned (D1630). Taken
+      // only when a row already carries the name, so a miss cannot be a row of its own.
+      const anDstNm = tyToEmitName(tyRefArrElemOf(nodeTyIxOf(exprIx)))
+      if anDstNm != "" {
+        if rlSlotByName(anDstNm) >= 0 { return anDstNm }
+      }
+      // An ANNOTATED fill names its own element, ahead of the struct index below: inside a
+      // monomorphized instance the annotation carries the pin, and it is the only one of the
+      // two that keeps a `| null` — the struct index answers the bare struct for both.
+      const anInst = instAnnTyNameOfExpr(e.callArgs[1], fnIx)
+      if anInst != "" { return anInst }
       const asi = structIndexOfExpr(e.callArgs[1], fnIx)
       if asi >= 0 { return sNames[asi] }
-      // The fill's own recorded type, then the instance's annotation for it. A
-      // monomorphized clone shares this call node, so the recorded type is still the
-      // template's `T` and only the instance can name the element; `""` reaches the
-      // caller's strict slot and refuses, rather than taking another element's row (D1605).
-      const anTy = tyToEmitName(nodeTyIxOf(e.callArgs[1]))
-      if anTy != "" { return anTy }
-      return instAnnTyNameOfExpr(e.callArgs[1], fnIx)
+      // The fill's own recorded type. A monomorphized clone shares this call node, so that
+      // type is still the template's `T` and only the annotation above can name the element;
+      // `""` reaches the caller's strict slot and refuses, rather than taking another
+      // element's row (D1605).
+      return tyToEmitName(nodeTyIxOf(e.callArgs[1]))
     }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
@@ -27107,22 +27277,28 @@ function emptyArrHoleElemSlot(exprIx: i32) {
   rlSlotByName(en)
 }
 
-// The `VKind` an empty `[]`'s recorded array type reps as, or `null` when this is not an
-// element-pinned hole. Ordered as `tyAnnRefListKind`'s ladder is: non-`TyPrim`-backed
+// The list `VKind` a recorded ARRAY type reps as, given the caller's own ref-list ROW for the
+// element (`-1` for none). Ordered as `tyAnnRefListKind`'s ladder is: non-`TyPrim`-backed
 // spellings (litunion, nullable niches) first, then `TyPrim` leaves, then the ref-list row —
 // a `TyPrim` leaf returns on an unmapped element rather than falling into the row lookup.
-function emptyArrHoleKind(exprIx: i32): VKind | null {
-  const ax = emptyArrLitIxOf(exprIx)
-  if ax < 0 { return null }
-  const ty = nodeTyIxOf(ax)
+function tyListRepKind(ty: i32, rowSlot: i32): VKind | null {
   if ty < 0 { return null }
   const sbk = tyScalarBackedListKind(ty)
   if sbk != null { return sbk }
   const lk = tyPrimLeafListKind(ty)
   if lk != null { return lk }
   if tyPrimLeafElem(ty) { return null }
-  if emptyArrHoleElemSlot(exprIx) >= 0 { return "reflist" }
+  if rowSlot >= 0 { return "reflist" }
   null
+}
+
+// The `VKind` an empty `[]`'s recorded array type reps as, or `null` when this is not an
+// element-pinned hole. Its ref-list row is resolved by NAME where the arena declines, which
+// is the one thing this reading has that the plain recorded-type one does not.
+function emptyArrHoleKind(exprIx: i32): VKind | null {
+  const ax = emptyArrLitIxOf(exprIx)
+  if ax < 0 { return null }
+  tyListRepKind(nodeTyIxOf(ax), emptyArrHoleElemSlot(exprIx))
 }
 
 // The bare `TyPrim` element name of an array type, or `null` for a non-array, an unpinned
