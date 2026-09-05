@@ -186,3 +186,130 @@ Deno.test({
     throw new Error(`expected no hints, got ${JSON.stringify(hints)}`);
   }
 });
+
+// ---- re-exports on the surface (survey §3.5) ---------------------------------
+//
+// `moduleSurface` used to report only DECLARED exports, so `std:fmt` named 5 of
+// its 8 and `std:args` 1 of its 2. A re-export now rides the same list, marked
+// by a non-empty `origin` — the resolved key of the module it comes from.
+
+// `mid` declares one name and re-exports two, one under an `as` alias.
+const reBase = "export function alpha(): i32 {\n" +
+  "  1\n" +
+  "}\n" +
+  "export function beta(): i32 {\n" +
+  "  2\n" +
+  "}\n";
+const reMid = 'export { alpha, beta as gamma } from "./base"\n' +
+  "\n" +
+  "export function own(): i32 {\n" +
+  "  3\n" +
+  "}\n";
+const reApp = 'import { alpha } from "./mid"\nprint(alpha())\n';
+const baseKey = "/proj/base.vl";
+const midKey = "/proj/mid.vl";
+const appKey = "/proj/app.vl";
+const readRe = (key: string): string | undefined => {
+  if (key.endsWith("base.vl")) return reBase;
+  if (key.endsWith("mid.vl")) return reMid;
+  if (key.endsWith("app.vl")) return reApp;
+  return undefined;
+};
+
+Deno.test({
+  name: "wasm-unused-export: moduleSurface reports re-exports with their origin",
+  ignore,
+}, () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const surface = checker.moduleSurface(reMid, midKey);
+  const names = surface.exports.map((e) => e.name).sort();
+  if (names.join(",") !== "alpha,gamma,own") {
+    throw new Error(`expected [alpha, gamma, own], got ${JSON.stringify(names)}`);
+  }
+  const own = surface.exports.find((e) => e.name === "own")!;
+  if (own.origin !== "") {
+    throw new Error(`a declared export has no origin, got ${own.origin}`);
+  }
+  const alpha = surface.exports.find((e) => e.name === "alpha")!;
+  if (alpha.origin !== baseKey) {
+    throw new Error(`expected alpha.origin ${baseKey}, got ${alpha.origin}`);
+  }
+  // Line 1 is `export { alpha, beta as gamma } from "./base"`: the keyword at
+  // col 0, `alpha` at col 9.
+  if (alpha.declLine !== 1 || alpha.declCol !== 9) {
+    throw new Error(`expected alpha decl at 1:9, got ${alpha.declLine}:${alpha.declCol}`);
+  }
+  if (alpha.kwLine !== 1 || alpha.kwCol !== 0) {
+    throw new Error(`expected alpha keyword at 1:0, got ${alpha.kwLine}:${alpha.kwCol}`);
+  }
+  // An `as` alias publishes the ALIAS, and the span is the alias token's (col
+  // 24) — the source name's would underline the wrong word.
+  const gamma = surface.exports.find((e) => e.name === "gamma")!;
+  if (gamma.declLine !== 1 || gamma.declCol !== 24) {
+    throw new Error(`expected gamma decl at 1:24, got ${gamma.declLine}:${gamma.declCol}`);
+  }
+  if (gamma.origin !== baseKey) {
+    throw new Error(`expected gamma.origin ${baseKey}, got ${gamma.origin}`);
+  }
+  // A re-export is ALSO an import edge — that is what makes `base`'s own
+  // exports count as used.
+  const impNames = surface.imports.map((i) => `${i.key} ${i.name}`).sort();
+  if (impNames.join(", ") !== `${baseKey} alpha, ${baseKey} beta`) {
+    throw new Error(`expected both import edges, got ${JSON.stringify(impNames)}`);
+  }
+});
+
+Deno.test({
+  name: "wasm-unused-export: a re-export is counted for its origin and never hinted",
+  ignore,
+}, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const useMap = await buildUnusedExportUseMap(
+    [baseKey, midKey, appKey],
+    readRe,
+    checker,
+  );
+
+  // `app` imports `alpha` THROUGH `mid`. The survey's named risk is that the
+  // hint would then call `mid`'s re-export dead; it is counted instead.
+  const midCounts = useMap.get(midKey);
+  if (midCounts === undefined) throw new Error("expected mid.vl seeded");
+  const alpha = midCounts.get("alpha");
+  if (alpha === undefined || alpha.cross < 1) {
+    throw new Error(`expected mid's alpha cross >= 1, got ${JSON.stringify(alpha)}`);
+  }
+  // `gamma` is re-exported and imported by nobody, and is still not hinted: the
+  // fix a hint implies — delete the decl, or drop the `export` keyword — does
+  // not exist for a re-export.
+  const gamma = midCounts.get("gamma");
+  if (gamma === undefined || gamma.cross !== 0 || gamma.local !== 0) {
+    throw new Error(`expected gamma {0,0}, got ${JSON.stringify(gamma)}`);
+  }
+  const midHints = unusedExportHints(reMid, midKey, useMap, checker);
+  if (
+    midHints.some((h) => h.message.includes("alpha") || h.message.includes("gamma"))
+  ) {
+    throw new Error(
+      `no re-export may be hinted, got ${JSON.stringify(midHints.map((h) => h.message))}`,
+    );
+  }
+  // `own` is declared here, imported by nobody and used by nobody → still dead.
+  if (midHints.length !== 1 || midHints[0].code !== "unused-export") {
+    throw new Error(
+      `expected only own's dead hint, got ${JSON.stringify(midHints.map((h) => h.message))}`,
+    );
+  }
+
+  // And the ORIGIN's declarations count as used — the re-export's import edge
+  // is what says so.
+  const baseCounts = useMap.get(baseKey)!;
+  if ((baseCounts.get("alpha")?.cross ?? 0) < 1) {
+    throw new Error(
+      `expected base's alpha cross >= 1, got ${JSON.stringify(baseCounts.get("alpha"))}`,
+    );
+  }
+  const baseHints = unusedExportHints(reBase, baseKey, useMap, checker);
+  if (baseHints.length !== 0) {
+    throw new Error(`expected no hints on base, got ${JSON.stringify(baseHints)}`);
+  }
+});

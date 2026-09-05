@@ -16,6 +16,7 @@ import {
 } from "../lsp/src/typeFeatures.ts";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
 import { makeWorkspaceReader } from "../lsp/src/moduleGraph.ts";
+import { STD_SOURCES } from "../std/embedded.ts";
 
 const assert = (cond: boolean, msg: string): void => {
   if (!cond) throw new Error(msg);
@@ -136,7 +137,7 @@ const CANDIDATES = new Map<string, StdExportCandidate[]>([
   ]],
   ["std:str", [
     { name: "trim", kind: "function", detail: "(string) => string" },
-    // A name a second module also exports — sorted-key order makes std:str win.
+    // A name a second module also exports.
     { name: "expect", kind: "function" },
   ]],
 ]);
@@ -151,12 +152,69 @@ Deno.test("auto-import completions: skips in-scope names, carries module + edit"
   );
   const expect = items.find((c) => c.name === "expect")!;
   assert(
-    expect.description === "std:str",
-    `sorted-key order dedupe: std:str wins; got ${expect.description}`,
+    expect.description === "std:test",
+    `the file already imports std:test, so that offer wins; got ${expect.description}`,
   );
   assert(
     expect.extraEdits !== undefined && expect.extraEdits.length === 1,
     "an auto-import item must carry its import rewrite",
+  );
+  assert(
+    expect.extraEdits![0].newText === 'import { expect, it } from "std:test"',
+    `the accepted item extends the statement already there; got ${
+      JSON.stringify(expect.extraEdits![0].newText)
+    }`,
+  );
+});
+
+// ---- the provider rule when a name is re-exported (survey §3.5) --------------
+//
+// `std:fmt` re-exports `join` from `std:str`, so the surface offers it from two
+// modules. The pick is: a module the file already imports from, else the module
+// that DECLARES the name, else the sorted-first re-exporter.
+
+const REEXPORT_CANDIDATES = new Map<string, StdExportCandidate[]>([
+  // sorts FIRST, and only re-exports the name
+  ["std:fmt", [{ name: "join", kind: "function", origin: "std:str" }]],
+  ["std:str", [{ name: "join", kind: "function", detail: "(string[], string) => string" }]],
+]);
+
+Deno.test("auto-import: with neither module imported, the DECLARING module wins", () => {
+  const src = 'const s = join(["a"], ",")\n';
+  const items = stdAutoImportCompletions(src, REEXPORT_CANDIDATES, () => false);
+  assert(items.length === 1, `one offer for one name; got ${items.length}`);
+  assert(
+    items[0].description === "std:str",
+    `std:fmt sorts first but only re-exports; got ${items[0].description}`,
+  );
+});
+
+Deno.test("auto-import: the module the file already imports wins over the declarer", () => {
+  const src = 'import { toString } from "std:fmt"\n\nconst s = join(["a"], ",")\n';
+  const items = stdAutoImportCompletions(src, REEXPORT_CANDIDATES, () => false);
+  assert(
+    items[0].description === "std:fmt",
+    `the already-imported re-exporter wins; got ${items[0].description}`,
+  );
+  assert(
+    items[0].extraEdits![0].newText ===
+      'import { join, toString } from "std:fmt"',
+    `it extends the statement instead of adding a second; got ${
+      JSON.stringify(items[0].extraEdits![0].newText)
+    }`,
+  );
+});
+
+Deno.test("auto-import: a re-exporter is offered when it is the only provider", () => {
+  const only = new Map<string, StdExportCandidate[]>([
+    ["std:args", [{ name: "Utf8Error", kind: "function", origin: "std:utf8" }]],
+  ]);
+  const items = stdAutoImportCompletions("const x = 1\n", only, () => false);
+  assert(
+    items.length === 1 && items[0].description === "std:args",
+    `a re-export with no declarer in the map is still offered; got ${
+      JSON.stringify(items.map((i) => i.description))
+    }`,
   );
 });
 
@@ -212,4 +270,57 @@ Deno.test({
       `a mangled type leaked: ${mangled.name}: ${mangled.type}`,
     );
   }
+});
+
+// The whole point, against the REAL std: `std/args.vl` re-exports `Utf8Error`
+// precisely so a caller of `programArgs` needs no second import, and the editor
+// never offered it — 86 of 86 files in the first external consumer import it
+// from `std:utf8` instead (glean VL-002, survey §3.5).
+Deno.test({
+  name: "auto-import: a file importing std:args is offered Utf8Error from std:args",
+  ignore,
+}, () => {
+  const checker = loadWasmChecker(SEED, () => {})!;
+  const stdExports = new Map<string, StdExportCandidate[]>();
+  for (const key of Object.keys(STD_SOURCES)) {
+    stdExports.set(
+      key,
+      checker.moduleSurface(STD_SOURCES[key], key).exports.map((e) => ({
+        name: e.name,
+        kind: "function" as const,
+        ...(e.origin === "" ? {} : { origin: e.origin }),
+      })),
+    );
+  }
+  const src = 'import { programArgs } from "std:args"\n' +
+    "\n" +
+    "const a = programArgs()\n" +
+    "if a is Utf8Error { print(a.at) }\n";
+  const items = stdAutoImportCompletions(
+    src,
+    stdExports,
+    () => false,
+    (stmt) => checker.formatSrc?.(stmt),
+  );
+  const item = items.find((c) => c.name === "Utf8Error");
+  if (item === undefined) {
+    throw new Error("Utf8Error must be offered");
+  }
+  assert(
+    item.description === "std:args",
+    `the module the file already imports; got ${item.description}`,
+  );
+  assert(
+    item.extraEdits![0].newText === 'import { Utf8Error, programArgs } from "std:args"',
+    `one statement, not two; got ${JSON.stringify(item.extraEdits![0].newText)}`,
+  );
+
+  // A name the file imports NEITHER provider of still comes from the declarer:
+  // `std:fmt` re-exports `join` and sorts first, `std:str` declares it.
+  const join = items.find((c) => c.name === "join");
+  if (join === undefined) throw new Error("join must be offered");
+  assert(
+    join.description === "std:str",
+    `the declaring module; got ${join.description}`,
+  );
 });
