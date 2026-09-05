@@ -34,6 +34,7 @@ import {
   Paren,
   Program,
   RetStmt,
+  Tok,
   TypeDecl,
   TypeRef,
   Unary,
@@ -702,6 +703,44 @@ function vcLoadToks(src: string): i32 {
   }
   P.toks.length
 }
+// The entry source and the stream the lexer produced from it, held by reference: the bank
+// is `P.toks` itself, never a second copy, so banking allocates nothing and keeps no extra
+// stream alive for the collector to walk. `vcEtLen` is the length the lexer left, and only
+// a diagnostic-free lex banks, so a replay owes no diagnostic either.
+let vcEtSrc = ""
+let vcEtToks: Tok[] = []
+let vcEtLen = 0
+// Releases the bank. Module mode never replays it — each module's stream comes from
+// `vcLoadToksMod` — so a graph check that kept the previous file's array would hold a
+// stream alive that nothing can read.
+function vcEtDrop(): i32 {
+  const fresh: Tok[] = []
+  vcEtToks = fresh
+  vcEtLen = 0
+  vcEtSrc = ""
+  0
+}
+// `vcLoadToks` for the entry source, through the bank above: `tokenize` is a pure function
+// of its source, so a later pass over the same bytes takes the array back instead of
+// re-lexing. Both sides need an empty `P.toks`, which is what makes a row's `pos` its own
+// index. The pop drops `jwSecondPass`'s generated tail, the one thing appended after a bank.
+function vcLoadToksEntry(src: string): i32 {
+  if P.toks.length == 0 && vcEtLen > 0 && vcEtSrc == src {
+    P.toks = vcEtToks
+    while P.toks.length > vcEtLen { P.toks.pop() }
+    return P.toks.length
+  }
+  const tokBefore = P.toks.length
+  const diagBefore = P.diags.length
+  vcEtDrop()
+  vcLoadToks(src)
+  if tokBefore == 0 && P.diags.length == diagBefore {
+    vcEtSrc = src
+    vcEtToks = P.toks
+    vcEtLen = P.toks.length
+  }
+  P.toks.length
+}
 // ── deep `is` over a `Json` value — the second check pass (D1035) ────────────
 // `r is T` for a json-shape `T` not one of the union's arms is a runtime shape walk
 // the checker cannot lower: pass 1 records the sites, this pass generates one
@@ -766,7 +805,7 @@ export function compileSrc(): i32 {
   // (order/validate → parse-merge → rename/rewrite → check/emit). With an EMPTY
   // table (every existing consumer) the single-source path below is untouched.
   if modKeys.length > 0 { return modCompile(1) }
-  vcLoadToks(vcSource())
+  vcLoadToksEntry(vcSource())
   const root = parseProgram()
   if vcParseBlocked() { return 1 }
   csPreMintLocs()
@@ -868,7 +907,7 @@ export function checkSrc(): i32 {
   initChecker()
   // Module mode (H3) — see compileSrc; `check` runs the same pipeline minus emit.
   if modKeys.length > 0 { return modCompile(0) }
-  vcLoadToks(vcSource())
+  vcLoadToksEntry(vcSource())
   const root = parseProgram()
   if vcParseBlocked() { return 1 }
   csPreMintLocs()
@@ -906,7 +945,7 @@ export function lintSrc(): i32 {
   declNameTok = []
   tplHole = []
   vcDgReset()
-  vcLoadToks(vcSource())
+  vcLoadToksEntry(vcSource())
   const root = parseProgram()
   // A lossless-recovered AST is the one the user wrote, so lint's findings over it
   // are as real as any other file's; only a lossy parse still returns -1. The parse
@@ -1168,7 +1207,7 @@ export function checkSrcSym(): i32 {
     const mrc = modCompile(0)
     return mrc
   }
-  vcLoadToks(vcSource())
+  vcLoadToksEntry(vcSource())
   const root = parseProgram()
   if vcParseBlocked() { return 1 }
   csPreMintLocs()
@@ -1739,7 +1778,7 @@ export function extentScan(): i32 {
   declNameTok = []
   tplHole = []
   vcDgReset()
-  vcLoadToks(vcSource())
+  vcLoadToksEntry(vcSource())
   extCollect(parseProgram())
 }
 
@@ -3216,6 +3255,7 @@ function modVisit(m: i32, depth: i32): i32 {
 }
 // The whole module pipeline behind `compileSrc` (emit = 1) / `checkSrc` (0).
 function modCompile(emit: i32): i32 {
+  vcEtDrop()
   // 1. Order + validate (DFS from the entry, table index 0).
   modState = []
   modOrder = []
