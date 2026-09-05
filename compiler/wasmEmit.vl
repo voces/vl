@@ -7905,8 +7905,8 @@ function emitMapValDefault(
     // concrete VARIANT default boxes (`emitUnionBoxArg`), as in a call arg / return.
     return emitUnionBoxArg(body, mvValName[mslot], defIx, fnIx)
   } else if mslot >= 0 && mvListValKind(mslot) == "reflist" {
-    // A STRUCT-LIST value: hint an empty `[]` default to an empty ref list of the inner
-    // struct (`listKind` 1 = struct-element, `listSlot` the inner slot).
+    // A struct-list value hints an empty `[]` default to an empty ref list of the inner
+    // struct (`listKind` 1 struct-element, `listSlot` the inner slot).
     const slCtx = expCtxHere()
     slCtx.listKind = 1
     slCtx.listSlot = mvValInnerRlSlot(mslot)
@@ -7926,13 +7926,10 @@ function emitMapValDefault(
   } else if lvk == "f32list" {
     dfCtx.listKind = 7
   } else if mslot >= 0 && mvValKind[mslot] == 1 {
-    // A STRUCT-valued map's `?? {f:…}` default builds the map's declared value struct — force
-    // its index so a field-name-set twin (`{f:f32}` vs `{f:{[string]:i64}}`) does not resolve
-    // the literal to the wrong layout (the store path's twin, see `emitMapSetV`).
-    // The ARM half is the same either/or the store seed takes (D34).
-    // …READ THROUGH THE SLOT'S LAYOUT IDENTITY (D123). Two spellings of one map value
-    // can intern two mv rows over ONE vals element heap; the row that names that heap is
-    // the canonical twin's, not necessarily this slot's own.
+    // A struct-valued map's `?? {f: …}` default forces the map's declared value-struct
+    // index, from the slot's canonical layout rather than this slot's own — two
+    // spellings of one map value can intern two mv rows over one vals element heap
+    // (D123). `emitMapSetV`'s store path takes the same either/or.
     const dfVi = mvValVariantOf(mslot)
     if dfVi >= 0 {
       dfCtx.variantIdx = dfVi
@@ -7940,18 +7937,10 @@ function emitMapValDefault(
       dfCtx.structIdx = mvValStructIdxOf(mslot)
     }
   }
-  // A NESTED-MAP value (`{[K]: {[K2]: V}}`): a `Map()` default builds the shape THIS slot's
-  // vals element is typed to, not the ambient mono one. SEVEN `Map()` boundaries were each
-  // taught this separately — let, global-init, return, struct field, variant field,
-  // assignment and the map STORE — and the `??` DEFAULT is the EIGHTH, the one nobody came
-  // back for. Unseeded, `emitMapNew` read `pendingMapSlot` = -1 and `struct.new`'d the MONO
-  // map struct into a vals element typed for the inner map's own struct: check-clean invalid
-  // wasm. Silently right only while the inner map is itself string-keyed AND mono, because
-  // the mono struct IS what -1 builds — which is why the i32-inner control ran.
-  //
-  // `mvValIsMap` / `mvInnerMapShape` are the store boundary's own pair (`emitMapSetV`),
-  // called here unchanged: the store and the default put a value into the SAME vals cell, so
-  // they must name one shape or the two disagree on the element they build.
+  // A nested-map value (`{[K]: {[K2]: V}}`) seeds `dfCtx.mapSlot` via `mvInnerMapShape`,
+  // matching `emitMapSetV`'s store boundary — store and default write into the same vals
+  // cell, so an unseeded `Map()` default would build the ambient mono map struct into a
+  // slot typed for the inner map: invalid wasm.
   if mvValIsMap(mslot) { dfCtx.mapSlot = mvInnerMapShape(mslot) }
   // A NULLABLE-value slot admits a bare `null` default (`m[k] ?? null` typing `S | null`) —
   // seed the element heap so the NullLit lowers as `ref.null <elem>`.
@@ -7968,9 +7957,9 @@ function defExprNullable(ix: i32) {
   nodeTyIsNullable(ix)
 }
 
-// Lower a map GET `m[k]` with a DEFAULT (`m[k] ?? d`) onto `body`: probe, then if the
-// key was found push `vals[entry-1]`, else push the default `d`. The self-host checker
-// ALWAYS reads a map through `?? -1` (a total fallback), so this is the primary get.
+// Lower a map get `m[k]` with a default (`m[k] ?? d`) onto `body`: probe, then if the
+// key is found push `vals[entry-1]`, else push the default `d`. The self-host checker
+// always reads a map through `?? -1` (a total fallback), so this is the primary get.
 function emitMapGetOr(
   body: i32[],
   recvIx: i32,
@@ -7980,17 +7969,15 @@ function emitMapGetOr(
 ) {
   if emitMapPrep(body, recvIx, keyIx, fnIx) < 0 { return -1 }
   if cmSlot >= 0 {
-    // REF values: a value-typed `if` would need an interned blocktype functype, so
-    // route through the slot's NULLABLE valStash local instead — both arms set it
-    // (the hit arm with the (ref null) slot read, the miss arm with the default's
-    // non-null value), then `ref.as_non_null` recovers the non-null result the
-    // `??` expression's type promises. A live entry's val slot is never null.
+    // Ref values route through the slot's nullable valStash local rather than a
+    // value-typed `if` (needs no interned blocktype): the hit arm sets it from the
+    // `(ref null)` slot read, the miss arm from the default, and `ref.as_non_null`
+    // recovers non-null — sound because a live entry's val slot is never null.
     const mslot = cmSlot
-    // A BOXED value-union map value that INCLUDES null (`{[string]: i32 | null}`,
-    // `{[string]: A | B | null}`) stores null as a null-TAGGED box. `??` peels the value NON-null
-    // (the checker types the result the raw scalar / non-null union), so the coalesce defaults on
-    // the box's null TAG — the value-union sibling of the ref-niche `ref.is_null` path below.
-    // A null-FREE union value (`{[string]: A | B}`) has no null tag and takes the plain path.
+    // A boxed value-union map value that includes null (`{[string]: i32 | null}`,
+    // `{[string]: A | B | null}`) stores null as a null-tagged box; `??` coalesces on
+    // that tag and peels the value non-null, the value-union sibling of the ref-niche
+    // `ref.is_null` path below. A null-free union value has no tag and takes the plain path.
     if mvValKind[mslot] == 2 {
       if mvValUnionHasNull(mslot) {
         return emitMapGetOrUnionBox(body, mslot, defIx, fnIx)
@@ -7999,11 +7986,10 @@ function emitMapGetOr(
     // A SCALAR-valued map (f64/i64) stores the value directly; its default is emitted in
     // the value's rep and it needs no `ref.as_non_null`. A ref value (string/struct) does.
     const scalarVK = mvScalarValKind(mslot)
-    // A NULLABLE-value REF niche (`{[string]: S | null}` / `{[string]: V | null}` where the
-    // value reps as `(ref null <elem>)`) stores null DIRECTLY in its vals slot, so the fused
-    // read is null on a MISSING key AND on a STORED null. `??` coalesces on the read VALUE
-    // being null — the owner ruling that a stored null defaults exactly as a miss does — so
-    // read the raw nullable value first and let one `ref.is_null` supply the default.
+    // A nullable-value ref niche (value reps as `(ref null <elem>)`) stores null
+    // directly in its vals slot: a missing key and a stored null both read as null, and
+    // `??` coalesces on that read being null — so read the raw nullable value first and
+    // let one `ref.is_null` supply the default for both.
     const nullableRef = scalarVK == null && mvSlotNullable(mslot)
     const stashL = fnMvValStashLocal(mslot)
     pushMapScr(body, 5)          // entry
@@ -8027,7 +8013,7 @@ function emitMapGetOr(
     }
     fbEnd() // end (if)
     if nullableRef {
-      // Coalesce on the READ VALUE being null — a MISSING key OR a STORED null both take `d`.
+      // Coalesce on the read value being null — a missing key or a stored null both take `d`.
       fbLocalGet(stashL)
       wU8(209) // 0xd1 ref.is_null
       fbIf(64)
@@ -8049,12 +8035,10 @@ function emitMapGetOr(
     }
     return 0
   }
-  // A nullable-ATOM value map (`{[string]: K | null}` / `{[string]: boolean | null}`) stores
-  // null as an i32 SENTINEL directly in the mono vals slot (`-1` for a litunion atom, `2` for
-  // a boolean), so the fused read is null on a MISSING key AND when the stored value IS the
-  // sentinel. `??` coalesces on the read VALUE being null — the owner ruling that a stored
-  // null defaults exactly as a miss does — so read the raw i32, then default when it equals
-  // the sentinel. A non-nullable atom / plain-i32 map has no sentinel and keeps the direct `if`.
+  // A nullable-atom value map (`{[string]: K | null}` / `{[string]: boolean | null}`)
+  // stores null as an i32 sentinel in the mono vals slot (`-1` litunion atom, `2`
+  // boolean): a missing key and the stored sentinel both read as null, and `??`
+  // coalesces on that — read the raw i32 and default when it equals the sentinel.
   let nulSentinel = 0
   let hasSentinel = false
   if nodeTyMapValIsNulLitUnion(recvIx) {
@@ -8104,18 +8088,16 @@ function emitMapGetOr(
   0
 }
 
-// Lower `m[k] ?? d` over a BOXED value-union map value that includes null (`{[string]: i32 | null}`,
-// `{[string]: A | B | null}`, mv kind 2 with a `null` atom). Reads the box (hit → the stored box;
-// miss → the null-tagged box), then COALESCES on the box's null TAG (`??` fires on the value being
-// null — a MISSING key AND a STORED null): a `scalar | null` value peels to the RAW unboxed scalar
-// (the checker's non-null result type), a multi-member `… | null` to the NON-null union box.
+// Lower `m[k] ?? d` over a boxed value-union map value that includes null (mv kind 2
+// with a `null` atom): read the box (hit → stored, miss → the null-tagged box), then
+// coalesce on the box's null tag — a `scalar | null` value peels to the raw unboxed
+// scalar, a multi-member `… | null` value peels to the non-null union box.
 function emitMapGetOrUnionBox(body: i32[], mslot: i32, defIx: i32, fnIx: i32) {
   const uvn = mvValName[mslot]
-  // D-UNION set ADT — the map value union's members from the recorded member
-  // columns; an un-interned value spelling re-splits (the ladder fall-through).
-  // D-SETONCE: one resolution of the map value's member set feeds BOTH the member
-  // walk and the residual code below (master resolved it twice — once inside
-  // `msMemberAtomsOf`, once inside the residual-kind resolution).
+  // The map value union's members come from the recorded member columns; an
+  // un-interned value spelling re-splits (the ladder fall-through). One resolution
+  // of the member set feeds both this walk and the residual-kind code below, so the
+  // two do not each re-derive it and risk disagreeing.
   const uvsid = msSetOfText(uvn)
   const atoms: string[] = []
   if !msMemberAtomsOfSet(uvsid, atoms) { splitUnionAtoms(uvn, atoms) }
@@ -8139,16 +8121,10 @@ function emitMapGetOrUnionBox(body: i32[], mslot: i32, defIx: i32, fnIx: i32) {
   // A `scalar | null` value (exactly one non-null scalar member) peels to the RAW scalar — take
   // the default on the null tag, else unbox the scalar payload.
   if atoms.length == 2 {
-    // D-UNION-ATOM-KIND: the residual member's banked ABI code; the rendered atom is
-    // re-parsed only where the set pool declines. The value box follows from the code.
-    // D-RESIDUE: the SUBTRACTION that produces that rendering now lives inside the decline
-    // branch too. Master resolved the set, cleared the null bits and rendered the survivor
-    // on EVERY call, then used the rendering only where the bank had already declined —
-    // and across the four sites that decline is reached 0 times on the whole corpus and 0
-    // times over 50,400 fuzz programs, with 19 corpus files reaching the sites themselves
-    // (the P-RCH / P-SITE measurement in the destringify doc). Kept because the population
-    // it serves — an ALIAS-spelled nullable value union — is rejected by the CHECKER before
-    // emit, not because it cannot exist.
+    // `ak` is the residual member's banked ABI code; when unresolved (-2) it re-parses
+    // the rendered atom instead. That fallback is unreached on the corpus and fuzz
+    // corpora (`docs/internals/destringify-types-program.md` P-RCH/P-SITE) because an
+    // alias-spelled nullable value union is rejected by the checker before emit.
     let ak = unionResidualSoloKindOfSet(uvsid)
     if ak == -2 { ak = valueAtomKind(removeAtomFromSet(uvn, "null")) }
     const vb = vbHeapIdxOfKind(ak)
@@ -8226,16 +8202,10 @@ function emitMonoMapDefault(body: i32[], recvIx: i32, defIx: i32, fnIx: i32) {
   0
 }
 
-// The NARROWED-READ tail of a bare map GET `m[1]` whose index PLACE carries a live
-// narrowing — the map twin of `emitIndex`'s two ref-list rungs (the niche recover and the
-// union-box unbox), and the emitter half the checker's `placeKeyOf` has always had.
-//
-// TWO RUNGS, IN THIS ORDER. `emitMapGet` leaves the vals element, which is `(ref null
-// <elem>)` for every ref-valued map because a MISS reads as `ref.null` — so the recover comes
-// first and is what the guard buys. A UNION value (kind 2) then unboxes to the tested atom
-// through `emitUnionUnboxTail`, the one home the narrowed ident / member / element reads
-// already share; a narrow that leaves two or more atoms keeps the box and takes the recover
-// alone, which is the rep a `(ref $uBox)` consumer wants.
+// The narrowed-read tail of a bare map get `m[1]` whose index carries a live narrowing
+// — the map twin of `emitIndex`'s ref-list rungs. Ref-recover runs first, since
+// `emitMapGet` leaves a nullable element for every ref-valued map; a union value (kind
+// 2) then unboxes to the tested atom, unless the narrow leaves two or more atoms.
 function emitNarrowedMapReadTail(idxIx: i32, fnIx: i32) {
   const mrs = mapReadNarrowableSlot(idxIx, fnIx)
   if mrs < 0 { return 0 }
@@ -8292,18 +8262,10 @@ function emitMapGet(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32) {
   fbI32Bin(107)       // i32.sub (entry - 1)
   fbArrayGet(aTypeIdx)
   fbElse()            // else — a miss reads as the rep's empty value. For a NICHE-BEARING
-  // value map (`K` / `K | null` atoms, `boolean` / `boolean | null`) that empty value IS null
-  // (the `-1` / `2` sentinel), so a bare-read `!= null` narrow sees a missing key as null —
-  // matching the ref-niche path's `ref.null` miss and `emitMapGetOr`'s sentinel coalesce.
-  //
-  // THE NON-NULLABLE VALUE SPELLING GETS THE SENTINEL TOO. `{[K]: V}` and `{[K]: V | null}`
-  // differ only in whether a null can be STORED; a BARE read is `V | null` in BOTH (a missing
-  // key is null), so the read's rep is the niche either way. Yielding `0` for the non-nullable
-  // half was a SILENT WRONG ANSWER, not a missing feature: `0` is a real value — atom id 0 is
-  // the FIRST-interned member, and boolean 0 is `false` — so `m[missing] == <that member>` and
-  // `m[missing] == false` both read TRUE, and `const g = m[k]; if g != null` narrowed a miss
-  // NON-null. A plain-i32 map is the one that genuinely has no spare value; it keeps `0` and
-  // its `!= null` narrow stays the loud `bare null needs a struct-typed context` reject.
+  // A niche-bearing value map (`K`/`K | null` atoms, `boolean`/`boolean | null`) reads
+  // a miss as its sentinel (`-1` litunion, `2` boolean) at both the nullable and the
+  // non-nullable spelling — yielding plain `0` there would collide with a real member
+  // (atom id 0, or `false`) and make `m[missing] == <that value>` silently true.
   if nodeTyMapValIsNulLitUnion(recvIx) || nodeTyMapValIsLitUnion(recvIx) {
     fbI32Const(0 - 1)
   } else if nodeTyMapValIsNulBool(recvIx) || nodeTyMapValIsBool(recvIx) {
@@ -8315,16 +8277,10 @@ function emitMapGet(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32) {
   0
 }
 
-// Lower a bare map GET `m[k]` of a UNION-valued map (mv kind 2) onto `body`, leaving the
-// NON-null `(ref $uBoxIdx)` box a kind-4 `"union"` binding stores: the hit arm loads the
-// stored box from the vals slot, the miss arm synthesizes the NULL-TAGGED box (the same
-// `nullBoxTag()` rep `emitUnionCoerce`'s NullLit arm stores for an `A | B | null`
-// binding), and `ref.as_non_null` recovers the box the nullable valStash routing loses
-// (a live entry's val slot is never null; the miss arm's box is non-null by construction).
-// The `t != null` / `is` narrows then read the tag exactly as an annotated `V | null`
-// binding's do.
-// Exported for the MODULE-SCOPE twin of `emitLetDeclStmt`'s union-box map-read arm:
-// `emitStartFnCode` lowers a top-level `const t = m[k]` and needs the identical miss arm.
+// Lower a bare map GET `m[k]` of a union-valued map (mv kind 2) onto `body`: the hit arm
+// loads the stored `(ref $uBoxIdx)` box, the miss arm synthesizes the null-tagged box
+// (`nullBoxTag()`, matching `emitUnionCoerce`'s `NullLit` arm) and recovers it non-null.
+// Exported for `emitStartFnCode`'s identical module-scope miss arm.
 export function emitMapGetUnionBox(
   body: i32[],
   recvIx: i32,
@@ -8370,18 +8326,10 @@ function scalarAtomNameOfKind(k: i32): string {
   ""
 }
 
-// Lower a bare SCALAR-valued map read `m[k]` DIRECTLY into the union box, with the tag chosen
-// by the probe — the fix for the miss-narrows-as-present miscompile. The coerce ladder
-// already boxes this read; it tagged it wrong, emitting the value-atom tag UNCONDITIONALLY
-// so a miss was boxed PRESENT with a zero payload and `is i32` answered true (read off the
-// disassembly). This emits the same two allocations with BOTH halves conditional: `entry`
-// selects the TAG, then `entry` selects the PAYLOAD (`vals[..]` boxed, or `ref.null`).
-//
-// ALLOCATION-NEUTRAL ON A HIT AND CHEAPER ON A MISS. ONE CONSTRUCTION SITE EACH, which is why
-// there are two value-typed `if`s and not one `if` with a `struct.new $uBox` in both arms:
-// Heap2Local scalarizes per allocation SITE (`opt-profile-design.md` §3 item 0). No valStash
-// local, unlike `emitMapGetUnionBox` — that slot is typed per VALUE kind, so stashing a
-// `(ref $uBox)` through it is invalid wasm; the blocktype carries the value instead.
+// Lower a bare scalar-valued map read `m[k]` directly into the union box: the tag and
+// the payload are each chosen by their own conditional (two allocation sites, so
+// Heap2Local scalarizes each — `opt-profile-design.md` §3 item 0), allocation-neutral on
+// a hit and cheaper on a miss. No valStash local — the blocktype carries the value.
 function emitMapGetScalarBox(
   body: i32[],
   recvIx: i32,
@@ -8437,13 +8385,10 @@ function emitMapHas(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32) {
   0
 }
 
-// Lower `m.keys()` onto `body`, leaving a fresh STRING list (`$mkListIdx`) of the map's
-// LIVE keys in insertion order. The ordered keys/live arrays carry tombstoned entries
-// after a delete (`live[i] == 0`), so it copies only live keys: `out[j++] = keys[i]` for
-// every `i` in `[0, count)` with `live[i] != 0`, then wraps `out` with `len = j`. Uses
-// the 6-slot key-list builder frame (`mapKeysBase`). The receiver is re-emitted to read
-// each of its three fields (a map op receiver is a simple binding — re-reading is
-// effect-free), avoiding a per-shape map-ref local.
+// Lower `m.keys()` onto `body`, leaving a fresh string list (`$mkListIdx`) of the map's
+// live keys in insertion order — the ordered keys/live arrays carry tombstoned entries
+// after a delete, so only `live[i] != 0` keys are copied. Uses the 6-slot `mapKeysBase`
+// frame; the receiver, a simple binding, is re-emitted per field rather than cached.
 function emitMapKeys(body: i32[], recvIx: i32, fnIx: i32) {
   if !exprMap(recvIx, fnIx) {
     return emitFail("emitProgram: .keys() receiver is not a map")
@@ -8547,12 +8492,10 @@ function emitMapKeys(body: i32[], recvIx: i32, fnIx: i32) {
   0
 }
 
-// Lower `m.values()` over a MONO i32 map onto `body`, leaving a fresh i32 list (`$lTypeIdx`)
-// of the map's LIVE values in insertion order — the value analogue of `emitMapKeys`, reading
-// the ordered VALS list (field 1) instead of keys and skipping tombstoned entries
-// (`live[i] == 0`). Other value types (string / struct / f64 / i64 / ref) iterate fine via
-// `for v in m.values()` but the BOUND list form here is i32-only for now (the output backing
-// type would otherwise vary per value kind). Uses the 6-slot `mapValsBase` frame.
+// Lower `m.values()` over a mono i32 map onto `body`, leaving a fresh i32 list
+// (`$lTypeIdx`) of the map's live values in insertion order — the value analogue of
+// `emitMapKeys`, reading the vals list instead of keys and skipping tombstoned entries.
+// Other value types iterate via `for v in m.values()`; the bound-list form is i32-only.
 function emitMapValues(body: i32[], recvIx: i32, fnIx: i32) {
   if !exprMap(recvIx, fnIx) {
     return emitFail("emitProgram: .values() receiver is not a map")
@@ -8645,15 +8588,10 @@ function emitMapValues(body: i32[], recvIx: i32, fnIx: i32) {
   0
 }
 
-// REHASH primitive: with `mapRef` in slot 0 and the target capacity in slot 4
-// (`newCap`), allocate a fresh `index` of `newCap` slots and REBUILD it from the LIVE
-// entries — for each entry `i` in `[0, count)` with `live[i] != 0`, RE-PLACE from the
-// STORED `hashes[i]` (no key re-hashing — mirrors the host's `mapRehashFn`) and
-// linear-probe to a free slot, writing `i+1`. The ordered keys/vals/live/hashes are
-// UNTOUCHED (insertion order preserved); only `index` is rebuilt. Scratch use (all
-// free after the probe/append): 4 newCap, 3 entry cursor `i`, 10 new index backing, 11
-// inner probe slot. Used by `emitMapResize` (load-factor grow, newCap = 2×cap) and
-// `emitMapCompact` (shrink to a live-count-based cap).
+// Rehash primitive: with `mapRef` in slot 0 and the target capacity in slot 4 (`newCap`),
+// rebuild a fresh `index` from the live entries by re-placing each from its stored
+// `hashes[i]` (no key re-hashing, mirroring the host's `mapRehashFn`). The ordered
+// keys/vals/live/hashes stay untouched; used by `emitMapResize` and `emitMapCompact`.
 function emitMapRehashTo(body: i32[]) {
   // idxBk = array.new_default $aTypeIdx newCap  (zero-filled)
   pushMapScr(body, 4) // newCap (slot 4, set by the caller)
@@ -8679,7 +8617,7 @@ function emitMapRehashTo(body: i32[]) {
   fbI32Const(0)
   fbI32Bin(71)         // 0x47 i32.ne (live[i] != 0)
   fbIf(64)             // if, void
-  // rslot = hashes[i] % newCap  — RE-PLACE FROM THE STORED HASH (no key re-hashing).
+  // rslot = hashes[i] % newCap — re-place from the stored hash (no key re-hashing).
   pushMapHashes(body)
   pushMapScr(body, 3)  // i
   fbArrayGet(aTypeIdx) // array.get hashes[i]
@@ -8728,12 +8666,10 @@ function emitMapRehashTo(body: i32[]) {
   0
 }
 
-// Resize the `index` when the load factor (size / cap) crosses 1/2 — a `call`
-// into the shared `__map_resize__` helper (`emitMapResizeFnCode`), which returns
-// the doubled+rehashed backing (or the old one when the load factor is fine);
-// the result is stored back unconditionally. Only the receiver `struct.get`s and
-// the final `struct.set` are shape-typed, so they stay at the call site. The
-// ordered entry lists are untouched.
+// Resize the `index` when the load factor (size / cap) crosses 1/2: a `call` into the
+// shared `__map_resize__` helper returns the doubled+rehashed backing (or the old one
+// when the load factor is fine), stored back unconditionally — only the receiver
+// `struct.get`s and the final `struct.set` are shape-typed; the entry lists are untouched.
 function emitMapResize(body: i32[]) {
   pushMapRef(body) // the struct.set receiver
   pushMapIndex(body)
@@ -8746,14 +8682,10 @@ function emitMapResize(body: i32[]) {
   0
 }
 
-// `emitMapCompact` (mirror of the host's `mapCompactFn`): reclaim tombstones. Rebuild
-// keys/vals/live/hashes from the LIVE entries only (dropping deleted ones, preserving
-// insertion order), set `count = size`, then rebuild the index at a live-count-based
-// capacity (next pow2 ≥ 2×size, floored at INITIAL_CAP*2 = 16). This bounds `count`
-// and the entry+index arrays under add/delete churn. `mapRef` in slot 0. Scratch:
-//   6 nk (ref $mkArrIdx), 7 nv (ref $aTypeIdx), 10 nl (ref $aTypeIdx),
-//   13 nh (ref $aTypeIdx) — the rebuilt entry arrays; 8 = i (read cursor),
-//   9 = j (write cursor), 11 = target cap; 4 = newCap for `emitMapRehashTo`.
+// `emitMapCompact` (mirror of the host's `mapCompactFn`): reclaim tombstones by
+// rebuilding keys/vals/live/hashes from the live entries only, preserving insertion
+// order, then rebuilding the index at a live-count-based capacity (next pow2 ≥ 2×size,
+// floored at `INITIAL_CAP`×2 = 16) — bounds both under add/delete churn.
 function emitMapCompact(body: i32[]) {
   // Fresh entry arrays sized to the OLD entry capacity (keeps spare room; lengths are
   // irrelevant to iteration — count/size bound it). Mirrors the host's `array.new_default
@@ -8872,7 +8804,7 @@ function emitMapCompact(body: i32[]) {
   pushMapRef(body)
   pushMapSize(body)
   fbStructSet(cmMapTy(), 4) // count = size
-  // Target index cap: next pow2 ≥ 2×size, floored at INITIAL_CAP*2 = 16. cap in slot 11.
+  // Target index cap: next pow2 ≥ 2×size, floored at `INITIAL_CAP`×2 = 16; cap in slot 11.
   fbI32Const(16)
   setMapScr(body, 11) // cap
   // while cap < 2*size { cap = cap * 2 }
@@ -8899,11 +8831,10 @@ function emitMapCompact(body: i32[]) {
   0
 }
 
-// Lower a map DELETE `m.delete(k): boolean` onto `body` (mirror of the host's
-// `mapDeleteFn`): probe to the entry; if `index[slot] == 0` push 0 (absent), else
-// tombstone `live[entry-1] = 0`, `size -= 1`, amortized-`compact` when dead entries
-// (`count - size`) exceed `size + INITIAL_CAP`, and push 1. Leaves a 0/1 i32 on the
-// stack (consumed as a boolean expression, or dropped as a bare statement).
+// Lower a map delete `m.delete(k): boolean` onto `body` (mirror of the host's
+// `mapDeleteFn`): probe to the entry; a miss pushes 0, a hit tombstones
+// `live[entry-1] = 0`, decrements `size`, amortized-compacts when dead entries
+// (`count - size`) exceed `size + INITIAL_CAP`, and pushes 1.
 function emitMapDelete(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32) {
   if emitMapPrep(body, recvIx, keyIx, fnIx) < 0 { return -1 }
   // if entry == 0 { 0 } else { tombstone ; size-- ; maybe-compact ; 1 }
@@ -8922,7 +8853,7 @@ function emitMapDelete(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32) {
   fbI32Const(1)
   fbI32Bin(107)             // i32.sub
   fbStructSet(cmMapTy(), 5) // struct.set field 5: size
-  // Amortized compaction: if (count - size) > (size + INITIAL_CAP) { compact }.
+  // Amortized compaction: if `(count - size) > (size + INITIAL_CAP)` compact.
   pushMapCount(body)
   pushMapSize(body)
   fbI32Bin(107) // i32.sub (count - size)
@@ -8933,7 +8864,7 @@ function emitMapDelete(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32) {
   fbIf(64)      // if, void
   if emitMapCompact(body) < 0 { return -1 }
   fbEnd()       // end (compact if)
-  // result = 1 (a key was removed)
+  // result = 1: a key is removed.
   fbI32Const(1)
   fbElse() // else
   // result = 0 (absent)
@@ -8942,11 +8873,10 @@ function emitMapDelete(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32) {
   0
 }
 
-// Emit a map SET's VALUE expr in the map's value REP — the scalar (f64/i64/f32)
-// coercion, union boxing, list-kind / ref-list-slot / struct-index hints, and the
-// atom-id context an overwrite or append needs. ONE evaluation, shared by both
-// arms of `emitMapSetV` (which stashes the result before the probe). Leaves the
-// value on the stack; `cmSlot` may be clobbered by inner map ops — callers re-pin.
+// Emit a map set's value expr in the map's value rep — scalar coercion, union boxing,
+// list-kind / ref-list-slot / struct-index hints, and the atom-id context an overwrite
+// or append needs. One evaluation, shared by both arms of `emitMapSetV`. Leaves the
+// value on the stack; `cmSlot` may be clobbered by inner map ops, so callers re-pin.
 function emitMapSetValExpr(
   body: i32[],
   valIx: i32,
@@ -8979,15 +8909,10 @@ function emitMapSetValExpr(
   } else if lvk == "f32list" {
     svCtx.listKind = 7
   } else if mslot >= 0 {
-    // A REF-list value (`S[]` / `(C|D)[]` / a nested `S[][]` / a closure list): seed the value's
-    // ref-list slot so the value literal builds as that list — its inner elements recurse
-    // through the literal build. Mirrors the array-binding ref-list seed.
-    // Destringify D-ISTY: the GUARD is the slot the body already resolves, not a second
-    // `nameIsRefArray` reading of the stored value name — the reflist NAMEABILITY that
-    // predicate adds over a shape test IS this slot's existence (#1116), so the pair was
-    // always one question, and resolving it ONCE is strictly less work than the name
-    // guard plus the body's own lookup. A value type that is not an array at all
-    // declines inside `mvValInnerRlSlot` without parsing anything.
+    // A ref-list value (`S[]`, `(C|D)[]`, a nested `S[][]`, or a closure list) seeds the
+    // value's ref-list slot so the literal builds as that list, recursing through its inner
+    // elements. The slot's existence already answers "is this a ref array", so no second
+    // `nameIsRefArray` guard is needed; a non-array value declines without parsing.
     const rlv = mvValInnerRlSlot(mslot)
     if rlv >= 0 {
       svCtx.listKind = 5
@@ -9018,21 +8943,15 @@ function emitMapSetValExpr(
   // `null` as `ref.null <elem>` — the vals element carries it directly and the fused read
   // preserves it. A non-null value ignores the seed.
   if mvSlotNullable(mslot) { svCtx.nulRefHeap = mvValElemHeapOf(mslot) }
-  // A STRUCT-valued map (`{[string]: {f:…}}`): force the value struct's OWN index so the
-  // literal `{f:…}` builds the map's declared value struct, not a field-name-set twin.
-  // Without this a program with two same-field-name-set inline struct map values (`{f:f32}`
-  // and `{f:{[string]:i64}}`) resolves the store literal via `structIndexOfObj` to whichever
-  // struct interned FIRST — a wrong-layout `struct.new` (invalid wasm). `emitObj` consumes it.
+  // A struct-valued map forces the value struct's own index so `{f: …}` builds the map's
+  // declared value struct, not a field-name-set twin — without it, two same-field-name-set
+  // struct map values resolve via `structIndexOfObj` to whichever interned first, a
+  // wrong-layout `struct.new` (invalid wasm). `emitObj` consumes the seed.
   if mslot >= 0 && mvValKind[mslot] == 1 {
-    // …AND THE **VARIANT** SEED WHERE THE VALUE IS A DECLARED ARM (D34). `ExpCtx` has
-    // carried `variantIdx` — "the bare variant an ObjLit must build" — since the variant
-    // literal path was written; this site only ever set its struct twin, so an inline
-    // `m[k] = { r: 1 }` into a `{[string]: Circle}` built the INLINE-SHAPE row while the
-    // vals element is `uVarHeap[Circle]`. The two columns are mutually exclusive (a name in
-    // `uVariants` has no `sNames` row), so this is an either/or, not a widening.
-    // …READ THROUGH THE SLOT'S LAYOUT IDENTITY (D123), for the reason
-    // `mvValVariantRawOf`'s header states: the seed must name the row whose heap the
-    // vals element holds, which is the canonical twin's row.
+    // The value may also be a declared variant arm: seed `variantIdx` too, since
+    // `uVariants` and `sNames` are mutually exclusive columns (a name in one has no row
+    // in the other) — this is an either/or, not a widening. The seed names the row whose
+    // heap the vals element actually holds, the canonical twin's row (D123).
     const svVi = mvValVariantOf(mslot)
     if svVi >= 0 {
       svCtx.variantIdx = svVi
@@ -9040,33 +8959,27 @@ function emitMapSetValExpr(
       svCtx.structIdx = mvValStructIdxOf(mslot)
     }
   }
-  // A NESTED-MAP value (`{[K]: {[K2]: V}}`): seed the shape the inner `Map()` builds, so
-  // it `struct.new`s the map struct THIS slot's vals element is typed to. Unseeded it
-  // built the ambient mono string-keyed struct, which was silently right only while the
-  // inner map was itself string-keyed AND mono — the store half of the same defect the
-  // let / return / global boundaries were each taught separately. The seed goes into the
-  // CONTEXT, not the global: `emitExprExpect` writes the whole context over the pending
-  // seeds, so a global written after `expCtxHere()` is overwritten by the snapshot.
+  // A nested-map value seeds `svCtx.mapSlot` (mirroring `emitMapValDefault`'s read-side
+  // seed) so a `Map()` value `struct.new`s the map struct this slot's vals element is
+  // typed to, not the ambient mono one. The seed must land in the context, not a global:
+  // `emitExprExpect` overwrites the whole context from its own snapshot.
   if mvValIsMap(mslot) { svCtx.mapSlot = mvInnerMapShape(mslot) }
-  // A literal-union ATOM stored into a STRING-valued map widens to its member string. The vals
-  // element is `(ref null $aTypeIdx)` and the atom's rep is an i32 id, so without this the store
-  // was `expected (ref null $type), found i32` — check-clean invalid wasm.
-  //
-  // Placed after every seed and gated on `!atomVal`, because an ATOM-VALUED map (`{[string]: K}`)
-  // wants the id stored raw and set `svCtx.litUnion` above to say so. The two are the same value
-  // going to slots with different reps, and only the string-valued one converts.
+  // A literal-union atom stored into a string-valued map widens to its member string: the
+  // vals element is `(ref null $aTypeIdx)` while the atom's rep is an i32 id, so without
+  // this the store is a type mismatch — invalid wasm. Gated on `!atomVal`, since an
+  // atom-valued map wants the raw id instead (`svCtx.litUnion`, set above).
   if !atomVal {
     if exprIsLitAtom(valIx, fnIx) { return emitStrValue(body, valIx, fnIx) }
   }
   const mvArmOwed = narrowedArmNeedsUnbox(valIx, fnIx)
   if emitExprExpect(body, valIx, fnIx, svCtx) < 0 { return -1 }
-  // THE NARROWED-ARM UNBOX at the MAP-VALUE boundary (D1031) — `m[k] = s` over a
-  // `{[string]: Circle}` under `if s is Circle`. The vals ELEMENT's own heap is the
-  // destination, the same one `mvSlotNullable`'s `ref.null` seed above reads.
+  // The narrowed-arm unbox at the map-value boundary (D1031) — `m[k] = s` under `if s is
+  // Circle` over a `{[string]: Circle}` — targets the vals element's own heap, the same
+  // one `mvSlotNullable`'s `ref.null` seed above reads.
   if mvArmOwed && mslot >= 0 { emitNarrowedArmUnboxTo(mvValElemHeapOf(mslot)) }
-  // READ-ONLY COVARIANCE at the MAP-VALUE boundary (D791) — `mU["k"] = lv1` over a
-  // `{[string]: Shape[]}`. The destination row is the same `mvValInnerRlSlot` the build
-  // seed above reads; it declines for every non-ref-list value type without parsing.
+  // Read-only covariance at the map-value boundary (D791) — `mU["k"] = lv1` over a
+  // `{[string]: Shape[]}` — targets the same `mvValInnerRlSlot` row the build seed above
+  // reads; it declines for every non-ref-list value type without parsing.
   if mslot >= 0 {
     const mvWiden = mvValInnerRlSlot(mslot)
     if mvWiden >= 0 {
@@ -9081,12 +8994,10 @@ function emitMapSetValExpr(
   0
 }
 
-// `local.set` / `local.get` of the SET value stash: the mv slot's typed valStash,
-// or the mono frame's dedicated `valSet` slot 14. Slot 14 is RESERVED for this —
-// no probe / push / grow / resize machinery touches it, so the stashed value
-// survives everything between its write (right after the value expr) and the
-// overwrite/append store. (Slot 3 — the pushVal stash — is also the probe slot,
-// so it cannot hold a value ACROSS the probe.)
+// `local.set` / `local.get` of the set-value stash: the mv slot's typed valStash, or the
+// mono frame's dedicated slot 14. Slot 14 is reserved — no probe / push / grow / resize
+// machinery touches it, so the value survives from its write through the overwrite or
+// append store; slot 3 (the pushVal stash) is also the probe slot and cannot hold one.
 function setMapSetValStash(body: i32[], mslot: i32) {
   if mslot >= 0 {
     fbLocalSet(fnMvValStashLocal(mslot))
@@ -9104,18 +9015,10 @@ function pushMapSetValStash(body: i32[], mslot: i32) {
   0
 }
 
-// Lower a map SET `m[k] = v`: probe; on a HIT overwrite `vals.backing[entry-1] = v`, else
-// APPEND — link the index slot, push key + value onto the ordered entry lists, bump
-// `count`/`size`, resize the index if the load factor crossed 1/2. `m.set(k, v)` shares it,
-// and the Set form `s.add(k)` reuses it with `valConst1 = true` (the stored value is the
-// constant `1`, `valIx` ignored). Run from `emitAssign` (a statement).
-//
-// EVALUATION ORDER (B-bug-maprmw): receiver, key, VALUE — all BEFORE the probe and before any
-// of them lands in a scratch local. That is what makes `m[k] = (m[k] ?? 0) + 1` sound on a
-// MISSING key: the RHS probes the UNTOUCHED map. It also fixes the CLOBBER family, where a
-// nested map op probes through the SAME shared scratch frame. Ordering inside the append
-// matters too: `index[slot] = count+1` is written BEFORE the two pushes, because
-// `emitMapPushKey`/`emitMapPushVal` clobber the probe slot (3) and cap (4).
+// Lower a map set `m[k] = v` (also `m.set(k, v)`, and `s.add(k)` via `valConst1 = true`):
+// probe; a hit overwrites, a miss appends and maybe resizes. Receiver, key and value are
+// all evaluated before the probe and before landing in scratch locals, so `m[k] = (m[k]
+// ?? 0) + 1` probes the untouched map and a nested map op cannot clobber the shared frame.
 function emitMapSetV(
   body: i32[],
   recvIx: i32,
@@ -9133,11 +9036,10 @@ function emitMapSetV(
   // A `boolean | null`-valued map is the MONO i32 niche too — a bare `null` store lowers as the
   // `2` sentinel (the store-side dual of the read's `nodeTyMapValIsNulBool` coalesce).
   const nulBoolVal = nodeTyMapValIsNulBool(recvIx)
-  // A MONO (i32/boolean-valued) map cannot store a REF value (a string / struct /
-  // list ref into an i32 array is invalid wasm) — fail loudly. A ref-valued map
-  // (mv slot) stores string/struct values through its own typed vals list. (A
-  // constant-true Set value is always a valid i32 boolean.) The shape is resolved
-  // here only for the GATE; `emitMapRecvKey` re-resolves it into the op context.
+  // A mono (i32/boolean-valued) map cannot store a ref value — a string / struct / list
+  // ref into an i32 array is invalid wasm — so fail loudly; an mv-slot map stores such
+  // values through its own typed vals list, and a constant-true Set value is always a
+  // valid i32 boolean. Resolved here only for the gate; `emitMapRecvKey` re-resolves it.
   if valConst1 == false && !atomVal {
     if mapShapeOfExpr(recvIx, fnIx) < 0 {
       if (
@@ -9218,13 +9120,10 @@ function emitMapSet(
   emitMapSetV(body, recvIx, keyIx, valIx, fnIx, false)
 }
 
-// Inline list-grow append of the scratch `keyRef` (slot 1) onto `M.keys` (the
-// string-ref list). The keys list backing is `(array (mut (ref null $sTypeIdx)))`,
-// so grow uses `array.new_default`/`array.copy` over `$mkArrIdx`, and the value
-// written is the (non-null) key string ref — reusing the map scratch frame's spare
-// i32 slots (4 = newCap, 3 = char cursor is free here) and a fresh backing local.
-// To keep it self-contained, the new backing is built/stored via `M.keys.backing`
-// directly (no extra ref local): grow path mirrors `emitPush`.
+// Inline list-grow append of the scratch `keyRef` (slot 1) onto `M.keys`. The keys
+// backing is `(array (mut (ref null $sTypeIdx)))`, so grow uses `array.new_default` /
+// `array.copy` over `$mkArrIdx`, reusing the map scratch frame's spare i32 slots (4
+// newCap, 3 free here) rather than a dedicated frame — the grow path mirrors `emitPush`.
 function emitMapPushKey(body: i32[]) {
   // if keys.len == keys.cap { grow }
   pushMapKeysLen(body)
@@ -9325,9 +9224,9 @@ function emitMapPushKey(body: i32[]) {
   0
 }
 
-// Append the STASHED set value onto `M.vals` (inline list-grow push). The value was
-// evaluated + stashed by `emitMapSetV` BEFORE the probe (see there) — this only
-// grows the vals list and stores the stash, so no user code runs inside the append.
+// Append the stashed set value onto `M.vals` (inline list-grow push). `emitMapSetV`
+// evaluates and stashes the value before the probe, so this only grows the vals list
+// and stores the stash — no user code runs inside the append.
 function emitMapPushVal(body: i32[]) {
   const mslot = cmSlot
   // if vals.len == vals.cap { grow }
@@ -9454,18 +9353,10 @@ function pushMapScrHB(_body: i32[]) {
   0
 }
 
-// Begin a CHUNKED long-literal build: allocate the full `n`-element backing
-// (`array.new_default $backTy`) into a FRESH backing-typed slot of the lazy
-// list frame (fresh per literal, so a nested chunked literal inside an element
-// expression cannot clobber this one), then open the first chunk by staging
-// the copy destination + offset under the coming element values. Returns the
-// destination slot.
-//
-// `strBack` says the destination is a raw STRING (`$sTypeIdx`), not a list backing. Both
-// callers pass `kind` "i32" — a long string literal's elements ARE i32 code points, exactly
-// like a long `i32[]` literal's — so the KIND cannot tell the two destinations apart, and
-// the slot type is the one thing that differs. That is `liBack` code 5 (see
-// `fbEmitLocalsVec`); the list destination stays code 1.
+// Begin a chunked long-literal build: allocate the full `n`-element backing into a fresh
+// backing-typed slot of the lazy list frame (so a nested chunked literal cannot clobber
+// this one), then open the first chunk and return the destination slot. `strBack` (not
+// `kind`, which is "i32" for both) distinguishes a string destination from a list one.
 function arrLitChunkStart(
   kind: MfKind,
   rslot: i32,
@@ -9485,11 +9376,10 @@ function arrLitChunkStart(
   dst
 }
 
-// Chunk boundary check after element `i` of `n` was pushed (`coff` = the open
-// chunk's first element). At `NEW_FIXED_MAX` elements or the literal's end,
-// close the chunk — `array.new_fixed` the pushed elements, `array.copy` them
-// into the destination — and open the next one (destination + offset) when
-// elements remain. Returns the new open-chunk start.
+// Chunk boundary check after element `i` of `n` is pushed (`coff` marks the open
+// chunk's first element). At `NEW_FIXED_MAX` elements or the literal's end, close
+// the chunk — `array.new_fixed` the pushed elements, `array.copy` them into the
+// destination — and open the next one when elements remain. Returns the new start.
 function arrLitChunkFlush(dst: i32, backTy: i32, coff: i32, i: i32, n: i32) {
   if i - coff < NEW_FIXED_MAX && i < n { return coff }
   fbArrayNewFixed(backTy, i - coff) // the chunk source array
@@ -9503,15 +9393,10 @@ function arrLitChunkFlush(dst: i32, backTy: i32, coff: i32, i: i32, n: i32) {
   i
 }
 
-// Lower the `len`-bounds guard of a list `xs[i]` read/write. On entry the stack
-// holds [wrapper, index] — both FULLY evaluated (a nested index op inside either
-// expression has already come and gone through this same frame). Stages both,
-// then leaves [backing, safeIndex] where safeIndex is `i` when `i u< len` (one
-// unsigned compare covers negative + past-len) and `-1` otherwise — an index the
-// backing can never satisfy, so the following `array.get`/`array.set` traps AT
-// ITS OWN instruction, exactly like a beyond-`cap` access always has. Without
-// the guard, reads in the `len <= i < cap` slack (`.push` grows `cap` past
-// `len`) return the backing's zero-init silently.
+// Lower the `len`-bounds guard of a list `xs[i]` read/write: stack holds [wrapper,
+// index] on entry, leaves [backing, safeIndex] where safeIndex is `i` when `i u< len`
+// (one unsigned compare covers negative and past-len) and `-1` otherwise, so the access
+// traps instead of silently reading the zero-init slack `.push` leaves past `len`.
 function emitListIdxGuard(wrapSlot: i32, lTy: i32) {
   fbLocalSet(listIdxScratchBase) // 0x21 local.set — stash the index
   fbLocalSet(wrapSlot)           // 0x21 local.set — stash the wrapper ref
@@ -9527,13 +9412,10 @@ function emitListIdxGuard(wrapSlot: i32, lTy: i32) {
   0
 }
 
-// The HOISTED twin of `emitListIdxGuard`, for an access whose receiver is a
-// binding with a live cached header. On entry the stack holds ONLY the index —
-// the receiver was never emitted, because the backing ref and `len` are already
-// in locals — and it leaves the same [backing, safeIndex] pair, with the same
-// `-1`-on-out-of-range meaning, that the general form leaves. The bounds check
-// is NOT weakened: it compares against the same `len` field, read once before
-// the loop instead of once per access.
+// The hoisted twin of `emitListIdxGuard`, for an access whose receiver is a binding
+// with a live cached header: the backing ref and `len` are already in locals, so the
+// receiver is never (re-)emitted and the stack holds only the index. Leaves the same
+// [backing, safeIndex] pair; the bounds check is not weakened — same `len`, read once.
 function emitListIdxGuardHoisted(row: i32) {
   fbLocalSet(listIdxScratchBase) // 0x21 local.set — stash the index
   fbLocalGet(lhBack[row])        // the cached backing (was `struct.get` field 0)
@@ -9546,18 +9428,10 @@ function emitListIdxGuardHoisted(row: i32) {
   0
 }
 
-// The live hoist row for an index receiver, or -1. THREE conditions, all
-// required: the receiver is a bare identifier (the prologue re-read exactly
-// that binding — a `Member`/`Call` receiver names no binding to cache), the row
-// is live (an enclosing loop opened it and has not closed it), and the row's
-// rep matches the arm asking. The rep check is the backstop that makes a
-// classifier disagreement between the prologue and the access DECLINE rather
-// than read a wrongly-typed local: the prologue cached whatever rep it resolved,
-// and an arm that resolved a different one falls through to the general guard.
-// A raw-STRING row is keyed (kind "i32", slot -1) and an i32-LIST row (kind "i32", slot 0),
-// so the triple compare below already separates them: an i32-list arm asking with slot 0
-// cannot match a string row and vice versa. Worth stating because raw strings and i32 lists
-// are the only two reps in this table that share a KIND.
+// The live hoist row for an index receiver, or -1: the receiver must be a bare
+// identifier matching the row's binding, the row must be live, and its rep must match
+// the arm asking. The rep check is the backstop that makes a classifier disagreement
+// between the prologue and the access decline, rather than read a wrongly-typed local.
 function liveHoistRow(exprIx: i32, kind: MfKind, slot: i32) {
   if exprIx < 0 { return 0 - 1 }
   const e = P.nodes[exprIx]
@@ -9610,17 +9484,10 @@ function listHoistRow(name: string, kind: MfKind, slot: i32) {
 // `hoistRowIsStr` reads the same pair.
 function hoistRowIsStr(row: i32) { lhKind[row] == "i32" && lhSlot[row] < 0 }
 
-// Find (or mint) the hoist row for raw STRING binding `name`. Minting takes THREE slots of
-// the lazy list frame — the backing ref (`liBack` 5, `(ref null $sBackIdx)`; code 3 with kind
-// "i32" would type it `$aTypeIdx`), then the i32 `start` and the i32 `len` (both `liBack` 4).
-//
-// EXISTS BECAUSE STAGE 2b MADE `s[i]` A THREE-FIELD READ. Unhoisted, a scan loop pays
-// `struct.get` ×3 plus a select per code point where it used to pay one `array.get`. The
-// header is loop-invariant by CONSTRUCTION — strings are immutable, the three fields are
-// declared immutable in the type section, and there is no string element store anywhere in
-// the emitter — so nothing but a rebinding of the NAME can invalidate the cache, which
-// `blockReboundsName` already refuses. §Header rules that the lift happens here rather than
-// in binaryen, whose LICM is not guaranteed to move a GC `struct.get` out of a loop body.
+// Find (or mint) the hoist row for raw string binding `name`, minting three slots of the
+// lazy list frame (backing ref, `start`, `len`). Safe because the header is loop-invariant
+// by construction — strings are immutable and there is no string element store — so only a
+// rebinding of the name can invalidate the cache, which `blockReboundsName` already refuses.
 function strHoistRow(name: string) {
   let k = 0
   while k < lhName.length {
@@ -9649,15 +9516,10 @@ function strHoistRow(name: string) {
   lhName.length - 1
 }
 
-// Mint a FRESH lazy-list-frame slot typed as list kind `kind`'s BACKING array — the same
-// `liBack` 1 typing a chunked literal's destination gets, without emitting anything. Fresh
-// and never deduped: a caller holds its backing live across a whole loop, so two callers
-// sharing one slot would clobber.
-//
-// EXISTS BECAUSE `string` HAS ITS OWN HEAP TYPE (Stage 2a). The struct-equality `i32[]`
-// field compare used to stash its two list backings in the string-op frame's `strScrA`/
-// `strScrB` — legal only while `string` and an `i32[]` backing were one heap index. Those
-// two slots are `(ref $sTypeIdx)` now and cannot hold an `(array mut i32)`.
+// Mint a fresh lazy-list-frame slot typed as list kind `kind`'s backing array — the same
+// `liBack` 1 typing a chunked literal's destination, without emitting anything. Fresh and
+// never deduped: a caller holds its backing live across a whole loop, so two callers
+// sharing one slot would clobber each other's backing.
 function listBackStashSlot(kind: MfKind, slot: i32) {
   liKinds.push(kind)
   liSlots.push(slot)
@@ -9665,18 +9527,10 @@ function listBackStashSlot(kind: MfKind, slot: i32) {
   listIdxScratchBase + liKinds.length
 }
 
-// The STRING-HEADER stash slot — a `liBack == 6` entry of the same lazy list frame,
-// `(ref null $sTypeIdx)`. Deduped per function: every `s[i]` / `s.charCodeAt(i)` in one
-// function shares it, which is safe under the SAME nested-op discipline the string-op frame
-// runs on — the receiver is stashed only after BOTH the receiver and the index expression
-// have fully evaluated onto the wasm stack, so a nested string index inside either one has
-// already come and gone through this slot.
-//
-// EXISTS BECAUSE Stage 2b made a `string` a HEADER. `s[i]` needs `backing`, `start` and `len`
-// off ONE evaluation of the receiver, and `struct.get` consumes the ref — so the receiver has
-// to land in a local. It rides the LAZY frame (minted during lowering) rather than the
-// string-op frame precisely so no reservation-scan arm has to learn about it: `emitStrCharCode`
-// deliberately has no `exprHasStrOp` arm (`emit_classify.vl`), and a plain `s[i]` never had one.
+// The string-header stash slot (`liBack == 6`, `(ref null $sTypeIdx)`), deduped per
+// function since every `s[i]` / `s.charCodeAt(i)` shares it safely — the receiver
+// stashes only after both it and the index are fully evaluated, so a nested string
+// index has already passed through; it rides the lazy frame, so `emitStrCharCode` needs no `exprHasStrOp` arm.
 function strHdrSlot() {
   let k = 0
   while k < liKinds.length {
@@ -9689,17 +9543,10 @@ function strHdrSlot() {
   listIdxScratchBase + liKinds.length
 }
 
-// Lower the bounds guard of a raw-string `s[i]` read. On entry the stack holds
-// [string, index] — both FULLY evaluated. Leaves [backing, offset] where `offset` is
-// `start + i` when `i u< len` and `-1` otherwise, so the following `array.get $sBackIdx`
-// TRAPS at its own instruction exactly as the pre-header `array.get` over the bare array did.
-//
-// THE GUARD IS NOT DECORATION AND NOT COPIED FROM THE LIST ARM FOR SYMMETRY. Before Stage 2b
-// a string WAS its element array, so `array.get`'s own bounds check against the physical
-// length was the semantics. A view's backing is longer than the view, so an unguarded
-// `array.get (start + i)` would silently return a SIBLING VIEW'S character for an
-// out-of-range `i` instead of trapping. Note the select is over the FINAL OFFSET, not over
-// the index: `start + (-1)` is a perfectly valid backing index whenever `start > 0`.
+// Lower the bounds guard of a raw-string `s[i]` read: stack holds [string, index] on
+// entry, leaves [backing, offset] where `offset` is `start + i` when `i u< len` and `-1`
+// otherwise, so the read traps rather than silently returning a sibling view's character
+// (the backing is longer than the view). The select is over the offset, not the raw index.
 function emitStrIdxGuard() {
   const hs = strHdrSlot()
   fbLocalSet(listIdxScratchBase) // 0x21 local.set — stash the index
@@ -9739,12 +9586,10 @@ function strI32Slot() {
   listIdxScratchBase + liKinds.length
 }
 
-// The HOISTED twin of `emitStrIdxGuard`, for a `s[i]` whose receiver is a binding with a live
-// cached header. On entry the stack holds ONLY the index — the receiver was never emitted,
-// because backing / start / len are already in locals — and it leaves the same
-// [backing, offset] pair, with the same `-1`-on-out-of-range meaning, that the general form
-// leaves. THE BOUNDS CHECK IS NOT WEAKENED: it compares against the same `len`, read once
-// before the loop instead of once per access.
+// The hoisted twin of `emitStrIdxGuard`, for a `s[i]` whose receiver is a binding with a
+// live cached header: backing / start / len are already in locals, so the receiver is
+// never emitted and the stack holds only the index. Leaves the same [backing, offset]
+// pair; the bounds check is not weakened — same `len`, read once before the loop.
 function emitStrIdxGuardHoisted(row: i32) {
   fbLocalSet(listIdxScratchBase) // 0x21 local.set — stash the index
   fbLocalGet(lhBack[row])        // the cached backing (was `struct.get` field 0)
@@ -9759,11 +9604,10 @@ function emitStrIdxGuardHoisted(row: i32) {
   0
 }
 
-// A FRESH element-VALUE slot of the lazy list frame — `(ref null $rlElemHeap[slot])` for
-// the "ref" kind. The non-deduping twin of `listIdxValSlot` below, for the same reason
-// `listBackStashSlot` does not dedupe: the struct-element compare needs TWO live slots of
-// one type at once (the left element and the right one), and a shared slot would compare a
-// value against itself.
+// A fresh element-value slot of the lazy list frame — `(ref null $rlElemHeap[slot])` for
+// the "ref" kind. The non-deduping twin of `listIdxValSlot` below: the struct-element
+// compare needs two live slots of one type at once (the left element and the right one),
+// so a shared slot would compare a value against itself.
 function listElemStashSlot(kind: MfKind, slot: i32) {
   liKinds.push(kind)
   liSlots.push(slot)
@@ -9771,12 +9615,10 @@ function listElemStashSlot(kind: MfKind, slot: i32) {
   listIdxScratchBase + liKinds.length
 }
 
-// The indexed-STORE value stash slot for list kind `kind` (`slot` = the ref-list table slot
-// for kind "ref", else 0) — a `liBack == 2` entry of the same lazy list frame, typed as the
-// element VALUE (i32 / i64 / f64 / f32, the nullable string ref, or the slot's nullable
-// element ref). The stored value parks here across `emitListIdxGuard` so the backing + len
-// resolve AFTER the value's user code ran; no user code runs between the stash write and the
-// `array.set`, so sharing the slot per (kind, slot) is clobber-safe.
+// The indexed-store value stash slot for list kind `kind` (`slot` the ref-list table slot
+// for kind "ref", else 0) — a `liBack == 2` entry typed as the element value. The value
+// parks here across `emitListIdxGuard` so the backing and len resolve after its user code
+// runs; no user code runs between the stash and the `array.set`, so sharing is clobber-safe.
 function listIdxValSlot(kind: MfKind, slot: i32) {
   let k = 0
   while k < liKinds.length {
@@ -9791,18 +9633,10 @@ function listIdxValSlot(kind: MfKind, slot: i32) {
   listIdxScratchBase + liKinds.length
 }
 
-// LIST-HEADER HOISTING — the soundness condition, and the whole of it. Across a loop body
-// that cannot REALLOCATE a list, that list's backing ref and `len` are loop-invariant, so
-// they are read once into locals before the loop. wasmtime cannot hoist them itself: the ref
-// SSA value differs each iteration, and no optimiser moves a `struct.get` past an
-// `array.set` it cannot prove non-aliasing.
-//
-// ACCEPTED in a body of literals, identifiers, parens, unary/binary operators (assignment
-// included), `o.f`, `x[i]` reads and stores, `is`/`as`, and the statement forms over the
-// same, on a binding declared OUTSIDE the loop. DECLINED: ANY call (`xs.push(v)` reallocates
-// and any call can reach the list through a parameter, capture or global — this is what makes
-// the question syntactic rather than interprocedural); a rebinding or `xs = …`; a nullable
-// receiver (recovering non-null in the prologue moves a trap). Fall-through is DECLINE.
+// The soundness condition for list-header hoisting: across a loop body that cannot
+// reallocate a list, its backing ref and `len` are loop-invariant, so hoisting reads them
+// once before the loop instead of per access. Declines on any call (may reallocate the
+// list through a param, capture or global), a rebinding, or a nullable receiver.
 function hoistSafeExpr(ix: i32): boolean {
   if ix < 0 { return true }
   const e = P.nodes[ix]
@@ -9957,11 +9791,10 @@ function blockReboundsName(ix: i32, name: string): boolean {
   false
 }
 
-// Record one index RECEIVER identifier and the `Index` node it was seen on. The
-// representative node is what the rep classifiers are asked about later, so the
-// first sighting is kept — every later sighting of the same spelling in this
-// body names the same binding (the caller has already established the body does
-// not rebind it).
+// Record one index receiver identifier and the `Index` node it is first seen on. The
+// representative node is what the rep classifiers are asked about later, so the first
+// sighting is kept — every later sighting of the same spelling in this body names the
+// same binding (the caller has already established the body does not rebind it).
 function hoistScanAdd(name: string, idxIx: i32) {
   let i = 0
   while i < lhScanName.length {
@@ -10037,20 +9870,16 @@ function hoistScanBlock(ix: i32) {
   0
 }
 
-// Resolve the list rep of an index receiver into a hoist row, or -1 when this
-// receiver is not one of the reps the guard hoists. The cascade is `emitIndex`'s
-// own, in `emitIndex`'s order, so a row is only ever minted for a rep whose
-// access path the hoisted guard can actually serve — and the nullable arms,
-// checked FIRST exactly as they are there, decline.
+// Resolve the list rep of an index receiver into a hoist row, or -1 when this receiver
+// is not one of the reps the guard hoists. The cascade mirrors `emitIndex`'s own order,
+// so a row is only minted for a rep whose access path the hoisted guard can actually
+// serve; the nullable arms, checked first exactly as there, decline.
 function hoistRowOfRecv(recvIx: i32, name: string, fnIx: i32) {
   if exprNulScalarListKind(recvIx, fnIx) != null { return 0 - 1 }
-  // The SHARED-backing nullable lists (`i32[] | null`, `boolean[] | null`) decline
-  // here too. `exprNulScalarListKind` above only names the four leaves that own a
-  // wrapper heap type, so these reached `scalarListElemKind` below as if they were
-  // plain `i32[]` — and the prologue then read the header ABOVE the guard that
-  // proves the wrapper present. In a loop CONDITION that is also a short-circuit
-  // violation: `while e != null && e[0] >= 0` hoisted `struct.get $lTypeIdx 0/1`
-  // out of the loop and in front of the `ref.is_null`, trapping on a null `e`.
+  // The shared-backing nullable lists (`i32[] | null`, `boolean[] | null`) must also
+  // decline here — `exprNulScalarListKind` above only names the four leaves with a
+  // wrapper heap type, so these would otherwise read the header above the null guard,
+  // and in a loop condition hoist `struct.get` in front of `ref.is_null`: trapping on a null.
   if exprNullableList(recvIx, fnIx) { return 0 - 1 }
   if exprRefArray(recvIx, fnIx) {
     if exprNullableRefArray(recvIx, fnIx) { return 0 - 1 }
@@ -10066,14 +9895,10 @@ function hoistRowOfRecv(recvIx: i32, name: string, fnIx: i32) {
     if !scalarListUsed(ek) { return 0 - 1 }
     return listHoistRow(name, listIdxKindOf(ek), 0)
   }
-  // A RAW STRING receiver (Stage 2b). LAST, after every list rep: a string is not a list and
-  // `exprString` must not get a chance to answer for one.
-  //
-  // The `| null` niche DECLINES, for the same reason `exprNullableList` declines two arms up
-  // and for the same measured reason: the prologue reads the header ABOVE the guard that
-  // proves the value present, so `while t != null && t[0] == 'x'` would hoist a `struct.get`
-  // in front of the null test and trap on a null `t`. `exprNullableString` is documented as
-  // STRICTLY WIDER than `exprString`, so declining on it is the conservative side.
+  // A raw string receiver is checked last, after every list rep, so `exprString` never
+  // gets a chance to answer for one. The `| null` niche declines too, for the same reason
+  // `exprNullableList` does: the prologue would read the header above the null guard and
+  // trap on a null receiver. `exprNullableString` is strictly wider than `exprString`.
   if exprString(recvIx, fnIx) {
     if !aUsed { return 0 - 1 }
     if exprNullableString(recvIx, fnIx) { return 0 - 1 }
@@ -10099,18 +9924,10 @@ function hoistWrapTyOfRow(row: i32) {
   scalarListWrap("i32")
 }
 
-// Open the hoists for one loop: scan its body, and for every index receiver that survives the
-// soundness conditions read its header into the row's two locals. Returns the number of rows
-// this loop activated (its own `loopHoistClose` argument), or -1 if the prologue failed.
-//
-// A row already live from an ENCLOSING loop is skipped rather than re-read: the outer body
-// being hoist-safe makes every nested statement hoist-safe too, so the outer cache is still
-// valid and re-reading it inside would cost exactly what the inner hoist saves.
-//
-// `condIx` is the loop's per-iteration CONDITION (-1 when the form has none), held to the
-// same standard as the body: a `while f() { … }` re-runs `f` every iteration, so a condition
-// that can reallocate defeats the hoist exactly as a body that can would. `ownVar` is the
-// loop's own variable, which the body sees as a fresh binding — never a candidate.
+// Open the hoists for one loop: scan its body, and for every index receiver that survives
+// the soundness conditions, read its header into the row's two locals. Returns the count
+// of rows opened (the `loopHoistClose` argument), or -1 on prologue failure. `condIx`, the
+// loop's per-iteration condition, is held to the body's own hoist-safety standard — a `while f()` re-runs `f` every iteration.
 function loopHoistOpen(
   body: i32[],
   condIx: i32,
@@ -10139,11 +9956,10 @@ function loopHoistOpen(
           const savedHF32 = pendingF32
           pendingF32 = false
           if hoistRowIsStr(row) {
-            // A RAW STRING's header is `{backing, start, len}` — THREE reads, because a
-            // view's element offset is `start + i` and its bound is `len`, and neither is
-            // recoverable from the other two. The list arm below reads two; keeping the two
-            // spellings in one `if` (rather than a second copy of `loopHoistOpen`) is what
-            // stops them drifting.
+            // A raw string's header is `{backing, start, len}` — three reads, because a
+            // view's element offset is `start + i` and its bound is `len`, neither
+            // recoverable from the other. The list arm below reads two; keeping both
+            // spellings in one `if` (rather than a second `loopHoistOpen`) stops them drifting.
             if emitExpr(body, rep.idxArr, fnIx) < 0 { return 0 - 1 }
             fbStrBack()
             fbLocalSet(lhBack[row])
@@ -10203,24 +10019,18 @@ function emitIndex(body: i32[], idxIx: i32, fnIx: i32) {
       if nsk == "nulstrlist" {
         emitListIdxGuard(listIdxWrapSlot("str", 0), mkListIdx)
         fbArrayGet(mkArrIdx) // 0xfb 0x0b string backing
-        // A NULLABLE-element inner list (`(string | null)[] | null`, narrowed): the
-        // element legitimately holds null — the read STAYS `(ref null $aTypeIdx)` (a
-        // `nulstr` the caller narrows with `!= null`). The unconditional recover was
-        // written for `string[] | null` (elements never null) and TRAPPED on a null
-        // element (fuzz-nightly plain leg, seed 154928295 d6). `exprNulStrArray`
-        // resolves the element discipline from the annotation (param / binding /
-        // rebind chain, outer `| null` peeled).
+        // A nullable-element inner list (`(string | null)[] | null`, narrowed): the
+        // element legitimately holds null, so the read stays `(ref null $aTypeIdx)` — an
+        // unconditional non-null recover here is correct only for `string[] | null` (whose
+        // elements are never null), and traps otherwise. `exprNulStrArray` resolves this.
         if exprNulStrArray(nd.idxArr, fnIx) { return 0 }
         wU8(212) // 0xd4 ref.as_non_null (non-null string element)
         return 0
       }
-      // The leaf ELEMENT kind whose wrapper / backing / index-scratch pool this read uses.
-      // `u8list` is the packed-byte leaf's spelling in `scalarListWrap` / `scalarListBack` /
-      // `listIdxKindOf` (the element is an ordinary i32, so the kind names the LIST, not a
-      // scalar). Without its arm a `u8[] | null` read fell to the `f64` default and read the
-      // f64 wrapper's heap index — which, in a module with no f64 at all, is whatever the
-      // usage-gated offset formula left there (the i64 list wrapper, beside an `i64[] | null`
-      // cell): check-clean invalid wasm.
+      // `nek` names the leaf element kind whose wrapper / backing / index-scratch pool this
+      // read uses; `u8list` is the packed-byte leaf's spelling (the element is a plain i32,
+      // so the kind names the list, not a scalar). Without this arm a `u8[] | null` read fell
+      // to the `f64` default and read whatever heap index the offset formula left there — check-clean invalid wasm.
       let nek: VKind = "f64"
       if nsk == "nuli64list" { nek = "i64" }
       if nsk == "nulf32list" { nek = "f32" }
@@ -10255,10 +10065,10 @@ function emitIndex(body: i32[], idxIx: i32, fnIx: i32) {
           wU8(212) // 0xd4 ref.as_non_null
         }
       }
-      // THE INDEX IS ALWAYS i32 — every index arm here clears `pendingF32` around it, else
-      // a bare index literal emits as `f32.const`. It bites on an INNER read `g[i][j]` over
-      // an `f32[][]`: the outer f32 read leaves `pendingF32` set while it emits this
-      // receiver, so the inner `[j]` inherits a context that was never its own.
+      // The index is always i32 — every index arm here clears `pendingF32` around it, else
+      // a bare index literal emits as `f32.const`. This matters for an inner read `g[i][j]`
+      // over an `f32[][]`: the outer f32 read leaves `pendingF32` set while emitting this
+      // receiver, so the inner `[j]` would otherwise inherit a context that is not its own.
       const savedRlIxF32 = pendingF32
       pendingF32 = false
       if emitExpr(body, nd.idxIndex, fnIx) < 0 { return -1 }
@@ -10270,10 +10080,10 @@ function emitIndex(body: i32[], idxIx: i32, fnIx: i32) {
         emitListIdxGuard(listIdxWrapSlot("ref", rslot), rlWrapIdx[rslot])
       }
       fbArrayGet(rlBackIdx[rslot]) // 0xfb 0x0b <this slot's ref backing array>
-      // A NULLABLE-NICHE element legitimately holds null, so the read STAYS `(ref null $elem)` — no
-      // `ref.as_non_null` recover (the bound `e` is the niche the caller narrows with `e != null`).
-      // `listElemStaysNullable` is the shared answer: the `.map`/`.filter` element step asks it too,
-      // and a rep answered in only one of the two is a recover that traps in the other.
+      // A nullable-niche element legitimately holds null, so the read stays `(ref null
+      // $elem)` with no `ref.as_non_null` recover (the caller narrows with `e != null`).
+      // `listElemStaysNullable` is the shared answer — `.map`/`.filter`'s element step asks
+      // it too, and answering it differently in the two places is a recover that traps in one.
       if listElemStaysNullable(nd.idxArr, fnIx) {
         // …UNLESS the index PLACE itself is narrowed non-null (D451). The niche half of the
         // channel: nothing to unbox, but the value must stop being `(ref null …)` or it
@@ -10285,17 +10095,10 @@ function emitIndex(body: i32[], idxIx: i32, fnIx: i32) {
         return 0
       }
       wU8(212) // 0xd4 ref.as_non_null (recover the non-null element)
-      // A union-BOX cell whose index PLACE is currently narrowed to one scalar atom unboxes
-      // HERE (D451) — the index twin of `emitNarrowedMem`'s code-16 tail, and the last rung
-      // of the channel: without it the checker proves `xs[0]` non-null, every classifier
-      // above calls the read an `i32`, and this arm still leaves the raw `(ref $uBox)` on the
-      // stack for an `(i32) -> ()` consumer. `vl check` rc 0, invalid wasm.
-      //
-      // Routed through `emitUnionUnboxTail`, the ONE home the narrowed IDENT read
-      // (`emitValueUnionUnboxRead`) and the union `as` cast already share, rather than a
-      // fifth open-coded `struct.get 1` + `ref.cast` + `struct.get 0`.
-      // The CONTAINER arms of the same channel (`if xs[0] is K[]`, `if xs[0] is {[string]:
-      // K}`) — the index twin of `emitUnionFieldNarrowUnbox`'s (D1014).
+      // A union-box cell whose index place is narrowed to one scalar atom unboxes here
+      // (D451): without it `vl check` proves `xs[0]` non-null and every classifier calls it
+      // an `i32`, but this arm still leaves the raw `(ref $uBox)` for an unboxed consumer —
+      // invalid wasm. Routed through the shared `emitUnionUnboxTail`, not an open-coded unbox.
       const iCon = emitPlaceNarrowContainerUnbox(idxIx, fnIx)
       if iCon != 0 { return iCon - 1 }
       const iuAtom = narrowedValueAtomOf(indexPathKeyOf(idxIx))
@@ -10395,10 +10198,10 @@ function emitIndex(body: i32[], idxIx: i32, fnIx: i32) {
     if !exprString(nd.idxArr, fnIx) {
       return emitFail("emitProgram: index receiver is not an array or string")
     }
-    // A raw string `s[i]` — Stage 2b: the receiver is a HEADER, so the read is
-    // `backing[start + i]` behind the `i u< len` guard that keeps an out-of-range index
-    // trapping instead of reading past the view into the rest of the backing. A binding with
-    // a live LOOP-HOISTED header skips the receiver entirely and reads three locals.
+    // A raw string `s[i]` — the receiver is a header, so the read is `backing[start + i]`
+    // behind the `i u< len` guard that keeps an out-of-range index trapping instead of
+    // reading past the view into the rest of the backing. A binding with a live
+    // loop-hoisted header skips the receiver entirely and reads three locals.
     const shz = liveHoistRow(nd.idxArr, "i32", 0 - 1)
     if shz < 0 {
       if emitExpr(body, nd.idxArr, fnIx) < 0 { return -1 }
@@ -10411,12 +10214,10 @@ function emitIndex(body: i32[], idxIx: i32, fnIx: i32) {
   emitFail("emitProgram: expected an index access")
 }
 
-// Lower a `.length` onto `body`. A list's length is its wrapper's `len` field (NOT the
-// backing's physical length, which is `cap`); a string's length is the raw array's
-// physical length:
-//   list `a.length`   → eval `a`, `struct.get $lTypeIdx 1` (the `len` field) — i32.
-//   string `s.length` → eval `s`, `array.len` (`0xfb 0x0f`, NO type-index operand,
-//                        unlike `array.get`/`array.set`) — the code-point count.
+// Lower a `.length` onto `body`: a list's length is its wrapper's `len` field (not the
+// backing's physical length, which is `cap`) via `struct.get <wrap> 1`; a raw string's
+// `.length` is its header's `len` field (`fbStrLen()`), not `array.len` — which would
+// report the parent's length for a view. Each element kind is resolved below in its own arm.
 function emitArrLen(body: i32[], memIx: i32, fnIx: i32) {
   const m = P.nodes[memIx]
   if m is Member {
@@ -10450,14 +10251,10 @@ function emitArrLen(body: i32[], memIx: i32, fnIx: i32) {
       fbStructGet(lTypeIdx, 1) // 0xfb 0x02 <list wrapper struct type index> field 1: len
       return 0
     }
-    // A raw STRING's `.length` is the HEADER's `len` field (Stage 2b) — NOT `array.len`,
-    // which is the BACKING's physical length and would report a parent string's length for
-    // every view of it. THE ARM IS SPELLED OUT AND THE FALLTHROUGH REJECTS. Before Stage 2b
-    // the string case WAS the fallthrough and `array.len` happened to be right for it; that
-    // made this a 5-arm ladder under an 8-predicate gate (`emitMemberNode`) whose leftover
-    // admitted anything the gate let through. Now the fallthrough would be a `struct.get $str
-    // 2` applied to whatever else arrives, which is invalid wasm at best and a wrong integer
-    // at worst — so it fails loudly instead.
+    // A raw string's `.length` is the header's `len` field (`fbStrLen()`), not `array.len`
+    // (the backing's physical length, which would report a parent string's length for a
+    // view of it). The arm is spelled out and the fallthrough fails loudly instead of
+    // defaulting, since a wrong fallthrough would be invalid wasm or a wrong integer.
     if !exprString(m.memObj, fnIx) {
       return emitFail("emitProgram: .length receiver is not an array or string")
     }
@@ -10469,17 +10266,9 @@ function emitArrLen(body: i32[], memIx: i32, fnIx: i32) {
 }
 
 // ── G6: string concatenation / value-equality / slice ────────────────────────
-// A string is a `{backing, start, len}` VIEW over a WasmGC `(array (mut i32))` of code
-// points (Stage 2b), so these lower to the same array machinery the list `.push` uses
-// (`array.new_default`/`array.copy`/`array.get`) over the BACKING, with the header read once
-// per op into the frame's hoist slots. `.slice` no longer allocates elements at all — it is
-// one `struct.new` over the receiver's backing.
-//
-// Each routine evaluates BOTH operands onto the stack FIRST, then stashes them into the
-// shared string scratch frame (`strScratchBase` +0/+1 = the two string HEADERS A/B, +2 = the
-// BACKING a builder fills, +3..+6 = i32 temps, +7/+8 = A/B's hoisted backings, +9/+10 = their
-// starts) — so a NESTED string op fully completes and leaves its result on the stack BEFORE
-// any scratch `local.set`, which is what makes the single frame safe to share.
+// A string is a `{backing, start, len}` view over a `(array (mut i32))` of code points;
+// these lower via the same array machinery `.push` uses, with the header hoisted once
+// into the shared string scratch frame — each routine evaluates both operands fully before any scratch `local.set`, which is what makes sharing one frame across nested ops safe.
 
 // `local.get` of string scratch local `n` (0 = header A, 1 = header B, 2 = the Out BACKING —
 // Stage 2b re-typed slot 2 from a finished string to the element array under construction).
@@ -10500,18 +10289,10 @@ function setStrScrI(_body: i32[], n: i32) {
   0
 }
 
-// ── the Stage-2b hoist half of the string-op frame ───────────────────────────
-// A `string` is a HEADER now, so an element loop that reads `A[i]` per step would pay two
-// `struct.get`s (backing, start) on every trip. `hoistStrScr` reads them ONCE into the
-// frame's last four slots — `strScrABk`/`strScrBBk` at +7/+8 and `strScrAOff`/`strScrBOff`
-// at +9/+10 — and `pushStrScrBase` re-pushes the pair. The lift is done HERE, in codegen,
-// rather than left to binaryen: LICM over a GC `struct.get` is not guaranteed (the loads are
-// from a GC object, not linear memory), and §Header rules that this compiler hoists rather
-// than relies on the optimizer.
-//
-// The operands are IMMUTABLE (the header's three fields are declared immutable in the type
-// section and no string element store exists — `emitAssign`'s `Index` target has no
-// raw-string arm), so the hoist can never go stale within the op that took it.
+// ── the string-op frame's hoist half ─────────────────────────────────────────
+// A string is a header, so a loop reading `A[i]` per step would pay two `struct.get`s
+// (backing, start) per trip; `hoistStrScr` reads them once into the frame's last four
+// slots, safe because the header's fields are immutable and no string element store exists.
 
 // Hoist operand `n` (0 = A, 1 = B) — its header must already be in `strScratchBase + n`.
 function hoistStrScr(_body: i32[], n: i32) {
@@ -10543,22 +10324,20 @@ function pushStrScrElem(body: i32[], n: i32, t: i32) {
   0
 }
 
-// Lower a string concatenation `a + b` onto `body`, leaving the new string ref on
-// the stack. Allocate a fresh `(array i32)` of `len(a)+len(b)` (`array.new_default`,
-// which zero-inits — every slot is then overwritten), `array.copy` a's code points
-// into `[0,lenA)` and b's into `[lenA, lenA+lenB)`. Both operands are evaluated
-// first, then stashed (nested-op-safe). `array.copy` is `0xfb 0x11 <dest> <src>`.
+// Lower a string concatenation `a + b` onto `body`, leaving the new string ref on the
+// stack: allocate a fresh `(array i32)` of `len(a) + len(b)`, `array.copy` a's code
+// points into `[0, lenA)` and b's into `[lenA, lenA+lenB)`. Both operands are evaluated
+// first, then stashed, so a nested string op fully completes before either write.
 function emitStrConcat(body: i32[], binIx: i32, fnIx: i32) {
   if !aUsed {
     return emitFail("emitProgram: string concat but array type not collected")
   }
   const e = P.nodes[binIx]
   if e is BinExpr {
-    // THREE OR MORE PARTS FUSE. `a + b + c + d` is one `+` node per operand pair, so the
-    // pairwise lowering allocates and copies the whole accumulated prefix once per pair —
-    // quadratic in the chain, and every interpolation is such a chain (the parser desugars
-    // `"…\{x}…"` into one). `strCatParts` flattens the maximal chain and `emitStrCatN`
-    // buys it with ONE sized allocation and one `array.copy` per part.
+    // Three or more parts fuse: `a + b + c + d` is one `+` node per operand pair, so the
+    // pairwise lowering would allocate and copy the accumulated prefix once per pair —
+    // quadratic, and every string interpolation is such a chain. `strCatParts` flattens
+    // the maximal chain and `emitStrCatN` buys it back with one sized allocation and copy.
     const parts: i32[] = []
     strCatParts(binIx, fnIx, parts)
     if parts.length > 2 { return emitStrCatN(body, parts, fnIx) }
@@ -10575,10 +10354,9 @@ function emitStrConcat(body: i32[], binIx: i32, fnIx: i32) {
 }
 
 // Flatten the maximal string `+` chain rooted at `binIx` into its operand expressions,
-// left to right, appending each to `parts`. A node is chain INTERIOR exactly when
-// `exprIsStrConcat` claims it — the same predicate that routes `+` here — so the walk and
-// the dispatch cannot disagree about where the chain ends. A parenthesised sub-chain is a
-// `Paren` node and is NOT interior, so it keeps its own lowering.
+// left to right, into `parts`. A node is chain-interior exactly when `exprIsStrConcat`
+// claims it — the same predicate that routes `+` here — so the walk and the dispatch
+// cannot disagree about where the chain ends. A `Paren` sub-chain keeps its own lowering.
 function strCatParts(binIx: i32, fnIx: i32, parts: i32[]) {
   const e = P.nodes[binIx]
   if e is BinExpr {
@@ -10597,10 +10375,9 @@ function strCatParts(binIx: i32, fnIx: i32, parts: i32[]) {
 }
 
 // Part slot `i` of the n-ary concat pool, minted on demand into the lazy list frame
-// (`liBack` code 18) and cached for the rest of the function. ONE pool serves every
-// nesting depth: `emitStrCatN` evaluates every part onto the STACK before it writes a
-// single slot, so a nested chain has finished with the pool before the outer chain
-// touches it.
+// (`liBack` code 18) and cached for the rest of the function. One pool serves every
+// nesting depth: `emitStrCatN` evaluates every part onto the stack before writing a
+// single slot, so a nested chain has finished with the pool before the outer chain touches it.
 function strCatSlot(i: i32) {
   while strCatSlotIx.length <= i {
     liKinds.push("i32")
@@ -10611,16 +10388,10 @@ function strCatSlot(i: i32) {
   strCatSlotIx[i]
 }
 
-// Lower an n-part (n >= 3) string chain: evaluate the parts left to right, sum their
-// lengths, allocate ONE exact-fit backing, `array.copy` each part in at a running offset,
-// and wrap one header. Side effects run exactly once, in source order — the parts are
-// emitted in the order the pairwise lowering emitted them.
-//
-// The stash order is the nested-op discipline (§G6): all n values reach the stack first,
-// then they are popped into slots deepest-last, so no scratch write ever straddles an
-// operand evaluation. `strScrOut` (+2), `strScrI0` (+3) and `strScrI1` (+4) are borrowed
-// for the backing, the total and the offset — nothing runs between their writes and their
-// reads, which is the same condition every other builder in this file relies on.
+// Lower an n-part (n >= 3) string chain: evaluate the parts left to right (each exactly
+// once, in source order), sum their lengths, allocate one exact-fit backing, `array.copy`
+// each part in at a running offset, and wrap one header. All n values reach the stack
+// first and are popped into slots deepest-last (§G6), so no scratch write straddles an operand evaluation.
 function emitStrCatN(body: i32[], parts: i32[], fnIx: i32) {
   const n = parts.length
   let i = 0
@@ -10675,17 +10446,9 @@ function emitStrCatN(body: i32[], parts: i32[], fnIx: i32) {
 }
 
 // ── the loop-local string accumulator ────────────────────────────────────────
-// `let s = ""` then `s = s + piece` inside a loop is O(n^2): every `+` allocates an
-// exact-fit backing and copies the accumulated prefix. `strAccScan` PROVES a binding is
-// an accumulator; `emitStrAccAppend` then appends IN PLACE into slack the binding's own
-// grow path allocated (capacity doubling), so the loop is linear with no builder in the
-// source.
-//
-// SOUNDNESS rests on one invariant: `s` only ever holds a string LITERAL, a fresh concat
-// result, or a buffer this binding allocated. The first two are exact-fit by construction
-// (`collectStrPool` gives every literal its own `array.new_fixed`), so a backing with
-// slack is always ours; every view of `s` has `start + len <= s.len` and the append writes
-// only past it. Full argument: DECISIONS.md "String building is a LOWERING".
+// `let s = ""; s = s + piece` in a loop is O(n²); `strAccScan` proves a binding is an
+// accumulator, and `emitStrAccAppend` then appends in place into slack its own grow
+// path allocated — linear, with no builder in the source. Soundness: `s` only ever holds a literal, a fresh concat result, or a buffer it allocated (DECISIONS.md "String building is a lowering").
 let saNames: string[] = []
 let saDecls: i32[] = []
 let saApps: i32[] = []
@@ -10711,11 +10474,10 @@ function saMarkBad(name: string) {
   0
 }
 
-// A DECLARATION qualifies only at the one spelling whose value is exact-fit by
-// construction: a mutable `let` whose initialiser is a string LITERAL, annotated
-// `string` or not at all. Anything else — a `const`, a missing or non-literal init, a
-// wider annotation — disqualifies the NAME, because the binding could then be handed a
-// buffer some other accumulator still owns.
+// A declaration qualifies only at the one spelling whose value is exact-fit by
+// construction: a mutable `let` whose initialiser is a string literal, annotated
+// `string` or not at all. Anything else disqualifies the name, because the binding
+// could then be handed a buffer some other accumulator still owns.
 function saNoteDecl(letIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
@@ -10865,9 +10627,9 @@ function saNameQualifies(name: string) {
   false
 }
 
-// Does the assignment at `binIx` append to a proven accumulator? Re-asked per SITE, with
+// Does the assignment at `binIx` append to a proven accumulator? Re-asked per site, with
 // the emit-time scope populated, so the scan's answer is a filter and never the whole
-// test. `saFnIx` pins the set to the body it was computed for.
+// test. `saFnIx` pins the set to the body it is computed for.
 function strAccAppendOk(binIx: i32, fnIx: i32) {
   if saFnIx != fnIx { return false }
   if saNames.length == 0 { return false }
@@ -10883,12 +10645,10 @@ function strAccAppendOk(binIx: i32, fnIx: i32) {
   false
 }
 
-// `s = s + p1 + … + pk` in place. The parts are evaluated and stashed first (they cannot
-// mention `s`, so reading the accumulator after them is unobservable), then the backing
-// grows only when the parts do not fit, then one `array.copy` per part at a running
-// offset, then ONE new header. Borrows the string frame: OUT (+2) the buffer, I0 (+3) the
-// added length, I1 (+4) the current length, I2 (+5) the offset, I3 (+6) the start, and
-// ABK (+7) the old buffer across the grow.
+// `s = s + p1 + … + pk` appended in place: the parts are evaluated and stashed first
+// (they cannot mention `s`, so reading the accumulator after them is unobservable), the
+// backing grows only when the parts do not fit, then one `array.copy` per part at a
+// running offset, then one new header. Borrows the string scratch frame's slots.
 function emitStrAccAppend(body: i32[], binIx: i32, fnIx: i32) {
   const a = P.nodes[binIx]
   if a is BinExpr {
@@ -10993,17 +10753,10 @@ function emitStrAccAppend(body: i32[], binIx: i32, fnIx: i32) {
   emitFail("emitProgram: expected a string accumulator append")
 }
 
-// Lower a string VALUE-equality `a == b` (or `a != b`) onto `body`, leaving a 0/1 i32.
-// ELEMENT-WISE, NOT ref identity: `false` if the lengths differ, else loop `i in [0,len)`
-// comparing `a[i] == b[i]`; all-equal → 1. `!=` negates with `i32.eqz`. Lowered as a
-// value-typed `block`/`loop`:
-//   block i32 { A=..; B=..            ; stash operands (nested-op-safe)
-//     I0 = len(A); if I0 != len(B) { (i32.const 0) br 0 }
-//     I1 = 0
-//     loop { if I1 >= I0 { } else {   ; fall through past the loop when done
-//       if A[I1] != B[I1] { (i32.const 0) br 1 }
-//       I1 = I1 + 1; br <loop> } }
-//     (i32.const 1) }                 ; every element matched
+// Lower a string value-equality `a == b` (or `a != b`) onto `body`, leaving a 0/1 i32:
+// element-wise, not ref identity — false if the lengths differ, else loop comparing
+// `a[i] == b[i]`, all-equal giving 1. `!=` negates with `i32.eqz`. Lowered as a
+// value-typed `block`/`loop` so the compare can `br` out early on a mismatch.
 function emitStrEq(body: i32[], binIx: i32, fnIx: i32) {
   if !aUsed {
     return emitFail("emitProgram: string equality but array type not collected")
@@ -11011,12 +10764,10 @@ function emitStrEq(body: i32[], binIx: i32, fnIx: i32) {
   const e = P.nodes[binIx]
   if e is BinExpr {
     const isNe = e.binOp == "!="
-    // Eval both operands, then stash (B on top → set B first). A literal-union ATOM operand
-    // widens to its member string first (`emitStrValue`) — the same boundary handling
-    // `emitStrConcat` one function up already applies, and the reason `s == k` with `s:
-    // string` and `k: K` is a string compare rather than the atom `i32.eq` (see
-    // `eqAtomOperandOk`). The widen stages the id in the string-op scratch frame, which this
-    // compare's own `exprIsStrEq` already reserves through `exprHasStrOp`.
+    // Eval both operands, then stash (B on top, so set B first). A literal-union atom
+    // operand widens to its member string first (`emitStrValue`), the same boundary
+    // `emitStrConcat` applies — the reason `s == k` (`s: string`, `k: K`) is a string
+    // compare rather than the atom `i32.eq` (`eqAtomOperandOk`).
     if emitStrValue(body, e.binLeft, fnIx) < 0 { return -1 }
     if emitEqRecoverNarrowed(e.binLeft, fnIx) < 0 { return -1 }
     if emitStrValue(body, e.binRight, fnIx) < 0 { return -1 }
@@ -11030,18 +10781,10 @@ function emitStrEq(body: i32[], binIx: i32, fnIx: i32) {
   emitFail("emitProgram: expected a string equality")
 }
 
-// Lower a string ORDERING comparison (`<`/`>`/`<=`/`>=`), leaving a 0/1. Built on ONE
-// primitive — `emitStrLessCore`, "first operand lexicographically < second":
-//   A < B ≡ less(A,B);  A > B ≡ less(B,A);  A <= B ≡ !less(B,A);  A >= B ≡ !less(A,B)
-// The core sets B (stack top) then A (below), so the lower operand is its first arg.
-//
-// EACH OPERAND IS PUSHED AS A STRING VALUE, not lowered raw: a literal-union ATOM operand
-// widens to its member string first (`emitStrValue` → `emitAtomToStr`), as `emitStrEq`
-// already does. That widen IS the soundness fix — a named litunion alias reps as the interned
-// i32 atom, so before it the ordering compared INTERNED IDS and answered `"b" < "a"` true.
-// `exprIsStrOrder` claims exactly the operand set this can push. THE TWO WIDENS DO NOT
-// COLLIDE in the scratch frame: the tower CONSUMES its stash before it returns, leaving only
-// a string ref, so the second widen's `local.set` of the same slot lands after the first.
+// Lower a string ordering comparison (`<`/`>`/`<=`/`>=`) onto a 0/1, built on one
+// primitive, `emitStrLessCore` ("first operand lexicographically < second"): `A < B`
+// is `less(A,B)`, `A > B` is `less(B,A)`, and the `<=`/`>=` forms negate. Each operand is
+// pushed as a string value (a literal-union atom widens first) — unwidened, ordering compared interned atom ids instead of the strings, e.g. answering `"b" < "a"` true.
 function emitStrOrder(body: i32[], binIx: i32, fnIx: i32) {
   if !aUsed {
     return emitFail("emitProgram: string ordering but array type not collected")
@@ -11078,12 +10821,10 @@ function emitStrOrder(body: i32[], binIx: i32, fnIx: i32) {
   emitFail("emitProgram: expected a string ordering")
 }
 
-// The string strict-LESS core: expects the two string refs already ON THE STACK (first
+// The string strict-less core: expects the two string refs already on the stack (first
 // below second), leaves 1 iff the first is lexicographically less than the second, else
-// 0. Compares code points (unsigned) up to the shorter length; on the first mismatch the
-// result is `a[i] < b[i]`; if one is a prefix of the other the shorter is less. Mirrors
-// `emitStrEqCore`'s frame/block/loop/br structure. Frame: refs A(0)/B(1); i32 temps
-// lenA(0)/lenB(1)/n(2)/i(3).
+// 0 — unsigned code-point compare up to the shorter length, first mismatch decides, and a
+// prefix relationship makes the shorter string less. Mirrors `emitStrEqCore`'s frame shape.
 function emitStrLessCore(body: i32[]) {
   fbLocalSet(strScratchBase + 1) // B (stack top)
   fbLocalSet(strScratchBase + 0) // A
@@ -11145,22 +10886,19 @@ function emitStrLessCore(body: i32[]) {
   0
 }
 
-// The string value-equality CORE: expects the two string refs already ON THE
-// STACK (left below right), leaves the 0/1 result. Shared by `emitStrEq` and the
-// struct-equality field compare (which pushes field chains as operands). A single
-// `call` — the element loop lives in the shared `__str_eq__` helper, emitted once
-// per module (`emitStrEqFnCode`).
+// The string value-equality core: expects the two string refs already on the stack
+// (left below right), leaves the 0/1 result. Shared by `emitStrEq` and the
+// struct-equality field compare (which pushes field chains as operands) — one `call`
+// into the shared `__str_eq__` helper, emitted once per module.
 function emitStrEqCore(_body: i32[]) {
   fbCall(gHelpStrEq)
   0
 }
 
 // ── list value-equality + concat cores (collections-design §VL.4/§VL.6) ───────
-// Each core expects its two list WRAPPER refs already ON THE STACK (left below
-// right) and leaves a 0/1 (equality) or the new wrapper (concat). The loop
-// structure mirrors `emitStrEqCore` exactly (same block/loop/br depths); only
-// the length source (the wrapper's `len` field, NOT `array.len` — the backing
-// has spare capacity) and the element compare differ per kind.
+// Each core expects its two list wrapper refs already on the stack (left below right)
+// and leaves a 0/1 (equality) or the new wrapper (concat), mirroring `emitStrEqCore`'s
+// block/loop/br structure — only the length source (`len`, not `array.len`) and the element compare differ per kind.
 
 // i32-list `==`: length + element compare over the LEQI frame.
 function emitListEqICore(_body: i32[]) {
@@ -11342,11 +11080,10 @@ let eqStashR = -1
 // through all of them would put the flag at every call site instead of the one that sets it.
 let eqChainRecover = false
 
-// The `i32.ne`-class element opcode for a SCALAR-LEAF list rep — one byte, and the only
-// thing that differs between the four wide backings' element compares.
-//   0 i32 (and every rep that IS one: boolean, an interned atom, an i32-based literal
-//     union) · 4 f64 · 6 i64 · 7 f32 · 10 u8 (packed; `fbArrayGet` zero-extends the byte
-//     into an i32, so its comparison is the i32 one)
+// The `i32.ne`-class element opcode for a scalar-leaf list rep — the only byte that
+// differs between the four wide backings' element compares. Kind 0 covers every rep
+// that already is an i32 (boolean, an interned atom, an i32-based literal union) and
+// kind 10 (packed u8), since `fbArrayGet` zero-extends the byte before comparing.
 function eqgNeOpcode(kind: i32) {
   if kind == 4 {
     return 98 // 0x62 f64.ne
@@ -11360,23 +11097,15 @@ function eqgNeOpcode(kind: i32) {
   71 // 0x47 i32.ne
 }
 
-// THE ONE ENTRY for a list `==` at rep (kind, slot), with both wrapper refs already ON THE
-// STACK (left below right); leaves the 0/1 answer. Routes to whichever core owns the rep —
-// the three that existed before this row keep every shape they claim, byte for byte, and
-// everything else is `emitListEqGCore`.
-//
-// IT IS A FUNCTION RATHER THAN AN ARM SO THE RECURSION HAS ONE PLACE TO GO. A nested
-// compare (`i32[][][]`, `f64[][]`) reaches its element's core from inside a loop, and the
-// element's rep may be one of the old three — `i32[][][]`'s element IS an `i32[][]`, whose
-// core is `emitListEqRCore`. Without a shared entry the new core would carry a second copy
-// of this dispatch and the two would drift.
+// The one entry for a list `==` at rep (kind, slot), with both wrapper refs already on
+// the stack (left below right); leaves the 0/1 answer, routing to whichever core owns
+// the rep (the three pre-existing cores keep every shape they claim; everything else is
+// `emitListEqGCore`). A function, not an inline arm, so a nested compare's recursion has one place to go.
 function emitListEqAnyRep(body: i32[], kind: i32, slot: i32, fnIx: i32) {
-  // A LIST CORE STARTS A FRESH CHAIN, so the niche guard's recover must not survive into it
-  // (D1291). Both wrappers are already on the stack and were recovered by the arm that read
-  // them; every read the core makes below is its OWN — `backing[i]`, then a struct element's
-  // fields off the stash pair — and an `i32` leaf field with a `ref.as_non_null` appended is
-  // check-clean invalid wasm. The flag names the CURRENT chain, so it is cleared for the
-  // duration of any core that opens another one.
+  // A list core starts a fresh chain, so the niche guard's recover must not survive into
+  // it (D1291): every read the core makes below is its own, and an `i32` leaf field with
+  // a stray `ref.as_non_null` appended is check-clean invalid wasm. The flag names the
+  // current chain, so it is cleared for the duration of any core that opens another one.
   const savedRec = eqChainRecover
   eqChainRecover = false
   const r = emitListEqAnyRepAt(body, kind, slot, fnIx)
@@ -11401,11 +11130,10 @@ function emitListEqAnyRepAt(body: i32[], kind: i32, slot: i32, fnIx: i32) {
   emitListEqGCore(body, kind, slot, fnIx)
 }
 
-// ONE ELEMENT READ at index `i` of the staged wrapper in frame slot `bA + which`, left on
-// the stack ready for its compare: `backing[i]`, plus the non-null recovery a REF element
-// needs. Split out because the two operands' reads must be INTERLEAVED with their
-// recoveries — a single trailing `ref.as_non_null` would recover the right operand twice
-// and leave the left one nullable, which the core's own slot type then rejects.
+// One element read at index `i` of the staged wrapper in frame slot `bA + which`, left
+// on the stack ready for compare: `backing[i]`, plus the non-null recovery a ref element
+// needs. Split out because the two operands' reads must interleave with their recoveries
+// — a single trailing recover would recover the right operand twice, leaving the left nullable.
 function emitEqGElemRead(
   bA: i32,
   which: i32,
@@ -11423,18 +11151,10 @@ function emitEqGElemRead(
   0
 }
 
-// ONE ELEMENT PAIR of a STRUCT-element list, compared field-wise, leaving the 0/1 EQUALITY.
-// Reads `backing[i]` for each side into a fresh lazy-frame slot, then runs the ordinary
-// struct compare with those slots as its two roots.
-//
-// THE ROW COMES OFF THE REF-LIST SLOT, the one place that knows what a slot's elements ARE.
-// `eqgElemClass` has already required that row to be field-flat, so every arm
-// `emitStructEqRec` can reach from here is two chain reads and one opcode.
-//
-// THE STASH GLOBALS ARE SAVED AND RESTORED rather than cleared, because a nested list of
-// structs (`Circle[][]`) reaches this from inside an OUTER `emitListEqGCore` whose own
-// element rung may be running. Today only one level can be a struct, but a rule that holds
-// by accident of the current accept set is the shape this file keeps paying for.
+// One element pair of a struct-element list, compared field-wise, leaving the 0/1
+// equality: read `backing[i]` for each side into a fresh lazy-frame slot, then run the
+// ordinary struct compare with those slots as its two roots. The stash globals are saved
+// and restored rather than cleared, since a nested list of structs re-enters this from inside an outer `emitListEqGCore` whose own element rung may still be running.
 function emitEqGStructElem(body: i32[], slot: i32, fnIx: i32) {
   if !eqgElemHasEqRow(slot) {
     return emitFail(
@@ -11471,18 +11191,10 @@ function emitEqGStructElem(body: i32[], slot: i32, fnIx: i32) {
   r
 }
 
-// LIST `==` OVER EVERY OTHER LIST REP — the compare twin of `emitListConcatG`, and the place
-// the two operators stop being the same shape.
-//
-// A CONCAT INSPECTS NO ELEMENT AND A COMPARE DOES, so where `emitListConcatG` needs only the
-// (wrapper, backing) pair and moves storage with two `array.copy`s, this needs an element
-// loop and an answer to "compare two of THESE". `eqgElemClass` is that answer in three cases
-// — a scalar leaf, a string leaf (`__str_eq__`), a nested list (recurse) — and every rep it
-// declines keeps its refusal rather than getting a guessed compare.
-//
-// THE LOOP IS `emitListEqICore`'s, INSTRUCTION FOR INSTRUCTION; what is parameterised is the
-// frame base, the two heap indices and the element rung. EACH LEVEL HAS ITS OWN FRAME, keyed
-// on (kind, slot), and a list is never its own element — that is what makes recursion safe.
+// List `==` over every other list rep: needs an element loop and `eqgElemClass`'s answer
+// to "compare two of these" — a scalar leaf, a string leaf, or a nested list (recurse) —
+// declining any rep it cannot classify rather than guessing a compare. Each recursion
+// level has its own frame keyed on (kind, slot), and a list is never its own element, which is what makes the recursion safe.
 function emitListEqGCore(body: i32[], kind: i32, slot: i32, fnIx: i32) {
   const bA = leqgBaseOfRep(kind, slot)
   if bA < 0 {
@@ -11529,10 +11241,10 @@ function emitListEqGCore(body: i32[], kind: i32, slot: i32, fnIx: i32) {
     if emitEqGElemRead(bA, 1, wrap, back, isRef) < 0 { return -1 }
   }
   if cls == 4 {
-    // A STRUCT element, compared FIELD-WISE off two stashed locals. The pair is parked
+    // A struct element, compared field-wise off two stashed locals. The pair is parked
     // rather than left on the stack because `emitStructEqRec` re-reads each root once per
-    // field; the slots are `(ref null <elem heap>)` and `struct.get` traps on null, which
-    // it can never see — `eqgElemClass` claims only the non-nullable struct element kind.
+    // field, and a `(ref null <elem heap>)` slot would trap `struct.get` on null —
+    // `eqgElemClass` claims only the non-nullable struct element kind, so it never does.
     if emitEqGStructElem(body, slot, fnIx) < 0 { return -1 }
     fbI32Eqz() // the compare leaves EQUALITY; the branch below tests MISMATCH
   } else if cls == 1 {
@@ -11636,18 +11348,10 @@ function emitListConcatI(body: i32[], leftIx: i32, rightIx: i32, fnIx: i32) {
   0
 }
 
-// LIST CONCAT over EVERY OTHER LIST REP — the rep-parameterised twin of `emitListConcatI`
-// one function up, instruction for instruction: one backing allocation sized `lenA + lenB`,
-// two `array.copy`s, one wrapper. Its arguments are the heap indices i32 hard-wires.
-//
-// WHY IT IS A SECOND FUNCTION RATHER THAN A PARAMETER ON THE FIRST: the i32 list stages its
-// operands in the LEQI frame and every other rep in its own LCAT frame — the same offsets, a
-// different base and different slot TYPES. Threading a base through `emitListConcatI` would
-// have changed the bytes of every `i32[]` concat for no behaviour, and corpus byte equality
-// is the instrument that proves this change touched only the new reps.
-//
-// A CONCAT INSPECTS NO ELEMENT — why one lowering covers every rep the compare side needs a
-// separate core for, and why the frame has no `i`: there is no element loop.
+// List concat over every other list rep — the rep-parameterised twin of `emitListConcatI`,
+// instruction for instruction: one backing allocation sized `lenA + lenB`, two
+// `array.copy`s, one wrapper. A second function rather than a parameter on the first
+// because the i32 list stages operands in the LEQI frame and every other rep in its own LCAT frame — different slot types, not just a different base.
 function emitListConcatG(
   body: i32[],
   leftIx: i32,
@@ -11724,18 +11428,10 @@ function lcatBaseOfRep(kind: i32, slot: i32) {
   -1
 }
 
-// Re-evaluate the field ACCESS CHAIN `root.f1.f2…` onto `body`: the root
-// expression, then one `struct.get` per (row, field) pair in the path arrays.
-// Every step is a pure re-read (the equality compare re-walks chains per field).
-//
-// TWO ROOT INDICES ARE NOT EXPRESSIONS, AND THAT IS WHAT LETS A STRUCT COMPARE RUN INSIDE
-// A LIST LOOP. `emitStructEqRec`'s whole contract is that both operands are pure RE-READS,
-// because every field compare re-walks the chain from its root — and an element of a list
-// has no expression to re-walk; it is `backing[i]`, whose `i` moves. `EQ_ROOT_STASH_L`
-// (-2) and `EQ_ROOT_STASH_R` (-3) name the two locals `emitListEqGCore` parked the element
-// pair in, so a re-read is a `local.get` and the recursion above is UNCHANGED — the
-// alternative was threading two extra parameters through four functions and about a dozen
-// call sites for a value that is constant across the whole subtree.
+// Re-evaluate the field access chain `root.f1.f2…` onto `body`: the root expression, then
+// one `struct.get` per (row, field) pair — a pure re-read, since the equality compare
+// re-walks chains per field. Root indices -2/-3 are sentinels naming the two locals
+// `emitListEqGCore` stashed a list element pair in, letting a struct compare run inside a list loop without threading that pair through every call site as a parameter.
 function emitChainRead(
   body: i32[],
   rootIx: i32,
@@ -11770,12 +11466,10 @@ function emitChainRead(
   0
 }
 
-// Compare two closure fat-pointers already on the stack (left below right), leaving
-// a 0/1 i32 — function IDENTITY: the same lifted function (id, field 1) AND the same
-// captured env (`ref.eq` over field 0; two null envs are equal, two separately
-// CREATED envs of the same function are not). Stages both operands in the 2-slot
-// closure-eq frame (`cloEqScratchBase`, reserved by `cloEqNoteBin`'s scan). Mirrors
-// the host's function-identity `==` (same table index AND same env).
+// Compare two closure fat-pointers already on the stack (left below right), leaving a
+// 0/1 i32 for function identity: the same lifted function (field 1) and the same
+// captured env (`ref.eq` over field 0 — two null envs are equal, two separately created
+// envs of the same function are not). Mirrors the host's function-identity `==`.
 function emitCloEqCore(_body: i32[]) {
   fbLocalSet(cloEqScratchBase + 1) // B = right operand
   fbLocalSet(cloEqScratchBase + 0) // A = left operand
@@ -11793,14 +11487,10 @@ function emitCloEqCore(_body: i32[]) {
   0
 }
 
-// THE ONE CORE-SELECTION LADDER for a `==`/`!=` whose two operands are ALREADY ON THE STACK as
-// NON-NULL refs. Leaves the 0/1 EQUALITY answer — never the negation; `!=` belongs to the
-// caller, which is what lets the null-guarded wrapper negate exactly once.
-//
-// Read by the plain compare paths AND by `emitNulNicheEq`, so a rep the plain compare can
-// handle is a rep the nullable form can handle BY CONSTRUCTION. Two ladders is how the nullable
-// half of a rep drifts out of the non-null half's capability, which is the shape of the defect
-// this closes.
+// The one core-selection ladder for a `==`/`!=` whose two operands are already on the
+// stack as non-null refs. Leaves the 0/1 equality answer, never the negation — `!=`
+// belongs to the caller. Shared by the plain compare paths and `emitNulNicheEq`, so a rep
+// the plain compare handles is a rep the nullable form handles by construction — two ladders is how the two drift apart.
 function emitEqNonNullCore(body: i32[], binIx: i32, fnIx: i32) {
   const e = P.nodes[binIx]
   if e is BinExpr {
@@ -11835,11 +11525,10 @@ function emitEqNonNullCore(body: i32[], binIx: i32, fnIx: i32) {
   emitFail("emitProgram: expected a `==`/`!=` for the compare core")
 }
 
-// One RAW read of a nullable-niche `==` operand — never `ref.as_non_null`, because the guard
-// around it exists precisely to SEE the null this rep can hold (a kind-16 `string | null` ident
-// otherwise recovers itself and traps on the very value the guard answers for). A literal-union
-// ATOM operand still widens to its member string first (`emitStrValue`), the same boundary
-// `emitStrEq` applies for `s == k`.
+// One raw read of a nullable-niche `==` operand — never `ref.as_non_null`, because the
+// guard around it exists precisely to see the null this rep can hold (a `string | null`
+// ident otherwise recovers itself and traps on the value the guard answers for). A
+// literal-union atom operand still widens to its member string first, as `emitStrEq` does.
 function emitEqOperandRaw(body: i32[], ix: i32, fnIx: i32) {
   if exprIsLitAtom(ix, fnIx) { return emitStrValue(body, ix, fnIx) }
   const rawCtx = expCtxHere()
@@ -11847,18 +11536,10 @@ function emitEqOperandRaw(body: i32[], ix: i32, fnIx: i32) {
   emitExprExpect(body, ix, fnIx, rawCtx)
 }
 
-// A NARROWED nullable-niche operand's CELL still holds a `(ref null …)`, and every compare
-// core's frame slot demands the non-null ref — so a PLAIN (unguarded) compare recovers its
-// operands exactly as `for`-in, `.slice` and the member ops do. The checker proved the read
-// guarded (that is what narrowed it), so the cast can never trap.
-//
-// The collection family answers through its own one home (`nulRecvNeedsRecover`, the READ dual
-// of `emitNulIsNullTest`'s niche disjunction); a nullable CLOSURE keeps its cell the same way.
-// A `string | null` read RECOVERS ITSELF — suppressing that is exactly what `rawNullRead` is
-// for — and a nullable STRUCT reaches its fields through `emitChainRead`, which recovers too.
-//
-// GENUINELY-nullable operands never arrive here: `binEqNulNiche` claims them off the checker's
-// banked type and the guard reads them raw. Only the narrowed spelling reaches this.
+// A narrowed nullable-niche operand's cell still holds a `(ref null …)`, and every compare
+// core's frame slot demands the non-null ref, so a plain (unguarded) compare recovers its
+// operands exactly as `for`-in, `.slice` and the member ops do — safe because the checker
+// proved the read guarded. A genuinely-nullable operand never arrives here: `binEqNulNiche` claims it off the checker's banked type and the guard reads it raw.
 function emitEqRecoverNarrowed(exprIx: i32, fnIx: i32) {
   if nulRecvNeedsRecover(exprIx, fnIx) || exprNulClosure(exprIx, fnIx) {
     fbRefAsNonNull() // 0xd4 ref.as_non_null
@@ -11878,18 +11559,10 @@ function emitEqIsNull(body: i32[], ix: i32, fnIx: i32) {
   0
 }
 
-// A `==`/`!=` where at least one operand is a nullable REF NICHE, lowered as the rep's OWN
-// compare under a NULL GUARD. Leaves the 0/1 EQUALITY (the caller negates for `!=`).
-//
-// SEMANTICS — `null == null` is TRUE, `null == v` is FALSE, which is what every nullable rep
-// that already compares correctly answers (the value-union box, the `boolean | null` and
-// `K | null` sentinels, `emitCloEqCore`'s `ref.eq` over two null envs). The non-null half is
-// the rep's existing core, UNCHANGED, so list `==` stays deep and closures stay identity.
-//
-// ONE EVALUATION PER OPERAND DECIDES THE BLOCK SHAPE. `br_on_null` consumes the ref it
-// tested, so a test-then-re-read guard would double-CALL a call-result operand; the right
-// operand's read is EMITTED twice, once per left-nullness path, and exactly one runs. BOTH
-// REFS LIVE IN THE SAME CONTROL FRAME, so the branch unwinds them and no `drop` is needed.
+// A `==`/`!=` where at least one operand is a nullable ref niche, lowered as the rep's own
+// compare under a null guard: `null == null` is true, `null == v` false, and the
+// non-null half runs the rep's existing core unchanged. `br_on_null` consumes the ref it
+// tests, so the right operand's code is emitted twice but exactly one path runs at runtime, evaluating each operand exactly once.
 function emitNulNicheEq(body: i32[], binIx: i32, fnIx: i32, niche: EqCmpKind) {
   const e = P.nodes[binIx]
   if e is BinExpr {
@@ -11930,18 +11603,10 @@ function emitNulNicheEq(body: i32[], binIx: i32, fnIx: i32, niche: EqCmpKind) {
 function emitNulStructEq(body: i32[], binIx: i32, fnIx: i32) {
   const e = P.nodes[binIx]
   if e is BinExpr {
-    // THE SAME TWO NAMESPACES the non-null dispatch asks, off the SAME shared resolvers and
-    // in the same ORDER (the niche rung first, on agreement). Asking only the struct one here
-    // is how the NULLABLE half of a rep drifts out of the non-null half's capability: with
-    // `Circle` a union arm, `Circle | null == Circle | null` was `emitProgram: struct equality
-    // over a non-struct operand` while the identical non-null compare had just learned to run.
-    //
-    // NICHE-FIRST IS MEASURED HERE TOO, not copied for symmetry. A `Circle | null` MODULE
-    // GLOBAL beside an exact layout twin resolves through `structIndexOfLet`, which is not
-    // kind-gated, so the struct rung answers the TWIN's row and the compare reads through
-    // `sHeapIdx` — check-clean invalid wasm. Storage class beats a structural twin in both
-    // halves. THE FOUND FLAG IS NOT DECORATION: an eq row is `>= 0` struct / `< 0` variant, so
-    // `-1` is variant row 0 and cannot double as "no answer".
+    // Asks the same two namespaces as the non-null dispatch, in the same order (niche rung
+    // first) — asking only the struct one is how the nullable half drifts out of the
+    // non-null half's capability. `siFound` is load-bearing, not decoration: an eq row is
+    // `>= 0` for a struct and `< 0` for a variant, so `-1` is variant row 0 and cannot double as "no answer".
     let si = -1
     let siFound = false
     const nvi = binEqNulVariantRow(binIx, fnIx)
@@ -11992,9 +11657,9 @@ function emitNulStructEq(body: i32[], binIx: i32, fnIx: i32) {
   emitFail("emitProgram: expected a nullable-struct equality")
 }
 
-// True for the six `eqCmpKindOfTy` tokens that name a nullable REF NICHE — the ones whose
-// compare needs `emitNulNicheEq`'s guard. The BOX- and SENTINEL-repped nullables answer "" from
-// that function and are deliberately not here: they already compare tag-first and correctly.
+// True for the `eqCmpKindOfTy` tokens that name a nullable ref niche — the ones whose
+// compare needs `emitNulNicheEq`'s guard. The box- and sentinel-repped nullables answer ""
+// from that function and are deliberately not here: they already compare tag-first correctly.
 function eqKindIsNulNiche(k: EqCmpKind) {
   k == "nulstr" ||
     k == "nullist" ||
@@ -12005,18 +11670,10 @@ function eqKindIsNulNiche(k: EqCmpKind) {
     k == "nulclosure"
 }
 
-// The nullable-niche token for this `==`/`!=`, or "" when neither operand is one. Reads the
-// ONE comparability home through the CHECKER'S BANKED TYPE, which is what makes a NARROWED
-// operand fall out for free: inside `if a != null { a == b }` the banked type is the non-null
-// one. A bare `null` operand is excluded — `x == null` is the null TEST, owned by
-// `emitNulIsNullTest` further down this same dispatch.
-//
-// TWO CHANNELS, AND THE SECOND IS THE INSTANCE'S. A node whose banked type is a TYPE VARIABLE
-// cannot be answered on the first: `monoCloneBody` shares every leaf across an instance's
-// siblings, so one `self[i] == needle` node serves every instantiation and carries `T`. That
-// left `T = string | null` feeding a `(ref null $array)` into a `(ref $array)` slot (D42).
-// `exprNulNicheKind` is the emitter's `fnIx`-scoped name for the same six niches. GATED ON
-// `nodeTyHasTyVar`, which reads CONTAINS rather than IS — D42 wrote it, D421 widened it.
+// The nullable-niche token for this `==`/`!=`, or "" when neither operand is one. Reads
+// the checker's banked type, which makes a narrowed operand fall out for free (inside
+// `if a != null { a == b }` the banked type is already non-null); a bare `null` operand is
+// excluded (owned by `emitNulIsNullTest`). Inside a monomorphized instance the banked type is a shared type variable instead, so `exprNulNicheKind`'s `fnIx`-scoped resolution answers there (D42).
 function binEqNulNiche(binIx: i32, fnIx: i32): EqCmpKind {
   const e = P.nodes[binIx]
   if e is BinExpr {
@@ -12047,51 +11704,29 @@ function binEqHasNoLowering(binIx: i32) {
   false
 }
 
-// THE GENERIC LIST COMPARE'S FLOOR. TRUE when the CHECKER accepted the program on the generic
-// core (`eqCmpKindOfTy` answered `glist`/`nulglist`, core 7) and the EMITTER cannot name the
-// rep — a ref-list slot that does not resolve, two operands at different slots, or an element
-// the rep tables classify differently from the way the arena does.
-//
-// WITHOUT IT THE FALL-THROUGH IS THE i32 TAIL, and that is a measured cell rather than a
-// worry: `d421c002` — `Circle[] == Circle[]` with `type Shape = Circle | Sq` declared — was
-// `i32.eq` over two `(ref $type)`, check-clean and refused at load. The two ladders disagreed
-// (the arena says `TyObj`, the rep tables say the element is a union VARIANT), which is the
-// standing hazard of having two; the answer is to make the disagreement LOUD. Same shape and
-// reason as `binConcatRepUnresolved` one function down, which D721 added for `+`.
+// The generic list compare's floor: true when the checker accepted the program on the
+// generic core (`eqCmpKindOfTy` answered `glist`/`nulglist`) but the emitter cannot name
+// the rep — an unresolved ref-list slot, operands at different slots, or the rep tables
+// disagreeing with the arena about the element. Same shape and reason as `binConcatRepUnresolved` (D721): without it the fall-through is a silent `i32.eq` over two refs.
 function binEqGRepUnresolved(binIx: i32, fnIx: i32) {
   const e = P.nodes[binIx]
   if e is BinExpr {
     if e.binOp != "==" && e.binOp != "!=" { return false }
     if P.nodes[unwrapParen(e.binLeft)] is NullLit { return false }
     if P.nodes[unwrapParen(e.binRight)] is NullLit { return false }
-    // THE TYPES SAY "TWO LISTS" AND THE REP SIDE CANNOT NAME THEIR PAIR — the conjunction,
-    // exactly as `binConcatRepUnresolved` takes it, and for the reason that function's header
-    // gives: `eqgListKindOfBin` answering -1 is not by itself evidence of a list (`1 == 2`
-    // answers -1 too), so dropping either half makes this floor silent or a false reject.
-    //
-    // IT READS THE BANKED TYPES, NOT `nodeEqCmpKind`, AND THAT IS D42's LESSON AGAIN. The
-    // first cut fired on "the checker's token names core 7", which is exact for the direct
-    // spelling and BLIND inside a monomorphized instance: the operand nodes are shared with
-    // the generic template, so the banked type is `T[]` and `eqCmpKindOfTy` answers "". A
-    // `T[]` is still a `TyArray`, so the shape question answers for the instance where the
-    // token question cannot.
+    // True only on the conjunction: the types say "two lists" and the rep side cannot name
+    // their pair. Reads the banked types, not `nodeEqCmpKind` (D42), because inside a
+    // monomorphized instance the operand nodes share the generic template — the banked
+    // type is `T[]` (still a `TyArray`) where the token question goes blind ("").
     if !binPlusIsListByTy(nodeTyIxOf(e.binLeft), nodeTyIxOf(e.binRight)) {
       const tl = eqCoreKindOfTyToken(nodeEqCmpKind(e.binLeft))
       const tr = eqCoreKindOfTyToken(nodeEqCmpKind(e.binRight))
       if tl != 7 && tr != 7 { return false }
     }
-    // Any core that DOES claim the pair, in either home — but an old core's claim is believed
-    // only when the REP home AGREES about which rep this is.
-    //
-    // THE FLOOR TRUSTED `listOpKindOfBin` AND THAT IS HOW A CLAUSE-1 DEFECT GOT PAST IT.
-    // `listOpKindOf` picks among the three OLD cores and answered `0` — the i32 core — for a
-    // module-scope `i64[]`, because it had no `i64` arm and fell through to `exprArray`. The
-    // floor saw "a core claims it", bailed, and `emitListEqICore` read an i64 list wrapper
-    // through `$lTypeIdx`. Loud is this function's whole job, so a claim it cannot corroborate
-    // is not a claim; `catListKindOfExpr` knows EVERY rep rather than only the three with
-    // cores, and the three pairings below are the entire correspondence between the alphabets.
-    // THE `listOpKindOf` ARMS ARE FIXED TOO (D755), so this guard reads zero on the tree as it
-    // stands — it exists for the NEXT rep added to one ladder and not the other.
+    // A core's claim on the pair is trusted only when the rep-home classifier
+    // (`catListKindOfExpr`) agrees which rep this is: `listOpKindOf` picks among only the
+    // three old cores, so it can silently misclassify an unhandled rep (an `i64[]` falling
+    // through to the i32 core) — a claim it cannot corroborate is not a claim. Reads zero on today's tree (D755) but guards the next rep added to one ladder and not the other.
     const lop = listOpKindOfBin(binIx, fnIx)
     if lop >= 0 {
       const ck = catListKindOfExpr(e.binLeft, fnIx)
@@ -12112,18 +11747,10 @@ function binEqGRepUnresolved(binIx: i32, fnIx: i32) {
   false
 }
 
-// The `+` twin of `binEqHasNoLowering`, and after D721 the ONLY refusal a list concat has
-// left: TRUE when the checker's banked types say this `+` is a list concat and the emitter
-// cannot resolve the pair to ONE (wrapper, backing) rep.
-//
-// TWO WAYS THAT HAPPENS, both emitter facts the checker provably cannot see: the operands
-// resolve to DIFFERENT ref-list slots (`array.copy` between two backing heap types is a
-// validation error, not a coercion), or one classifies as no list rep at all. Everything else
-// lowers — every list rep has a `{backing, len, cap}` wrapper.
-//
-// WHY IT READS THE BANKED TYPES AND NOT ONLY THE CLASSIFIERS: `catListKindOfBin` answering -1
-// is not evidence of a list (`1 + 2` answers -1 too). Only the CONJUNCTION is the failure.
-// Without the floor the numeric tail emits `i32.add` over two refs — check-clean INVALID WASM.
+// The `+` twin of `binEqHasNoLowering` (D721): true when the checker's banked types say
+// this `+` is a list concat and the emitter cannot resolve the pair to one (wrapper,
+// backing) rep — different ref-list slots, or no list rep at all. Reads the banked types
+// too, since `catListKindOfBin` answering -1 alone is not evidence of a list; only the conjunction is a failure, since an unguarded numeric tail would otherwise emit `i32.add` over two refs.
 function binConcatRepUnresolved(binIx: i32, fnIx: i32) {
   const e = P.nodes[binIx]
   if e is BinExpr {
@@ -12136,17 +11763,10 @@ function binConcatRepUnresolved(binIx: i32, fnIx: i32) {
   false
 }
 
-// Lower a STRUCTURAL struct equality `a == b` (or `!=`) onto `body`, leaving a 0/1
-// i32 — field-wise compare mirroring the host's `valueEq`: native compares for
-// scalars, the string-eq loop for string fields, a length+element loop for `i32[]`
-// fields, and recursion through NESTED struct fields (code 15). Both operands must
-// be PURE re-reads (names / field chains): every field compare re-evaluates the
-// full chain from its root. The two shapes match (`row` is the ONE eq row both
-// operands resolved to) — the checker proved the operands comparable.
-//
-// TAKES THE ROW rather than re-deriving it, and that is the fix's shape: the caller has
-// already asked BOTH namespaces and knows which one answered, so re-asking here could
-// only lose that (and did — `structIndexOfExpr` alone answers -1 for a variant operand).
+// Lower a structural struct equality `a == b` (or `!=`) onto `body`, leaving a 0/1 i32:
+// field-wise compare mirroring the host's `valueEq`. Both operands must be pure re-reads
+// (names / field chains), since every field compare re-evaluates the full chain from its
+// root. Takes `row` rather than re-deriving it — the caller already asked both namespaces (struct and variant) and knows which answered; re-asking loses that (`structIndexOfExpr` alone answers -1 for a variant operand).
 function emitStructEq(body: i32[], binIx: i32, fnIx: i32, row: i32) {
   const e = P.nodes[binIx]
   if e is BinExpr {
@@ -12166,11 +11786,10 @@ function emitStructEq(body: i32[], binIx: i32, fnIx: i32, row: i32) {
   emitFail("emitProgram: expected a struct equality")
 }
 
-// One SHAPE's field-wise compare at path (`pathSi`/`pathFi` from the roots),
-// leaving 0/1: an and-chain of per-field compares lowered as nested value-typed
-// `if`s (compare; if → next field … ; else → 0), so a first mismatch short-circuits.
-// `si` is an EQ ROW (see `eqRowOfVariant`), so one core serves a standalone struct and a
-// union arm — the two differ only in which table holds the layout.
+// One shape's field-wise compare at path (`pathSi`/`pathFi` from the roots), leaving 0/1:
+// an and-chain of per-field compares lowered as nested value-typed `if`s, so a first
+// mismatch short-circuits. `si` is an eq row (`eqRowOfVariant`), so one core serves a
+// standalone struct and a union arm alike — the two differ only in which table holds the layout.
 function emitStructEqRec(
   body: i32[],
   lRoot: i32,
@@ -12237,14 +11856,10 @@ function emitStructEqField(
   r
 }
 
-// `L.f == R.f` for a ref-niche field: `null == null` true, one side null false, otherwise the
-// non-null code's own core. Spelled as two null TESTS rather than `br_on_null`, for the reason
-// `emitNulStructEq` gives — every inner arm RE-READS its chain from the root, so there is no
-// single evaluation to preserve.
-// OPEN the guard: leaves the two `both null` / `exactly one null` answers in place and stops
-// with the both-non-null branch open, for the caller to fill with the core. Paired with
-// `emitNulFieldGuardClose`; split in two so the LEAF cores and the code-15 recursion share
-// one guard while differing on whether the chain read recovers.
+// `L.f == R.f` for a ref-niche field: `null == null` true, one side null false, else the
+// non-null code's own core. Two null tests rather than `br_on_null`, since every inner arm
+// re-reads its chain from the root. Opens the guard and leaves the both-non-null branch
+// open for the caller to fill; paired with `emitNulFieldGuardClose`, split so leaf cores and the code-15 recursion can share one guard while differing on chain-read recovery.
 function emitNulFieldGuardOpen(
   body: i32[],
   lRoot: i32,
@@ -12351,17 +11966,10 @@ function emitStructEqFieldAt(
   fnIx: i32,
   code: i32,
 ) {
-  // THE TWO I32-SENTINEL NICHES SHARE THE SCALAR ARM, and that is D101's third rung. Codes
-  // 21 (`boolean | null`, the spare 2) and 30 (`K | null`, the spare -1) are declared with
-  // the SAME `0x7f i32` storagetype code 0 is — `emitFieldStorageType`'s own default branch
-  // says so in one comment — and their null rides IN the value space rather than beside it,
-  // so `i32.eq` answers `null == null` true and `null == "a"` false with no guard.
-  //
-  // REACHABLE ONLY BECAUSE `isEquatable` GREW ITS NULLABLE ARM in the same change: before it,
-  // `{ f: K | null } == …` was refused at `vl check` and never got here. Fixing the checker
-  // alone would have moved that cell from a loud CHECK reject to this function's `emitFail` —
-  // loud to loud, which no outcome-class count sees, and a severity downgrade for a shape
-  // that is soundly comparable. The two rungs are one fix and are measured as one.
+  // Codes 21 (`boolean | null`) and 30 (`K | null`) share the scalar arm (D101): their null
+  // rides in the value space rather than beside it, using the same `0x7f i32` storagetype
+  // code 0 does, so plain `i32.eq` already answers `null == null` true and `null == "a"`
+  // false with no guard needed.
   if code == 0 || code == 21 || code == 30 {
     // Scalar (i32 / boolean), or an i32-sentinel niche field: a native compare.
     if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
@@ -12370,11 +11978,10 @@ function emitStructEqFieldAt(
     return 0
   }
   if code == 17 || code == 23 || code == 24 {
-    // A WIDE NUMERIC scalar field: one native compare opcode, i32 0/1 result.
-    //
-    // D1181 — i64 and f32 were absent here while `emitVariantFieldEqCore` has carried both
-    // since D1096, so `{d: i64}` compared INSIDE an `A | i32` and refused outside it. The
-    // two ladders must not disagree about a field rep; one arm serves all three widths.
+    // A wide numeric scalar field: one native compare opcode, i32 0/1 result. The two
+    // ladders (this one and `emitVariantFieldEqCore`) must not disagree about a field rep
+    // — `{d: i64}` compared inside an `A | i32` union but refused outside it before this
+    // arm covered i64/f32 too (D1181); one arm now serves all three widths.
     if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
     if emitChainRead(body, rRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
     if code == 17 {
@@ -12398,14 +12005,10 @@ function emitStructEqFieldAt(
     return emitStrEqCore(body)
   }
   if code == 15 {
-    // Nested struct: recurse one level deeper along the chain, UNDER A NULL GUARD.
-    //
-    // D1180 — `next: Node` and `next: Node | null` are BOTH code 15 over a `(ref null $S)`
-    // slot, so the code cannot tell them apart and the recursion's `struct.get` trapped on a
-    // genuinely null field: `vl check` rc 0, `a null value was used where a non-null one was
-    // required`. The guard is therefore unconditional; on a never-null field `ref.is_null` is
-    // a constant-false test and the answer is unchanged. Chain reads stay RAW inside it — a
-    // deeper field may be legitimately null and has its own guard.
+    // Nested struct: recurse one level deeper along the chain, under an unconditional null
+    // guard (D1180) — `next: Node` and `next: Node | null` are both code 15 over the same
+    // `(ref null $S)` slot, indistinguishable, so the guard must always run (a constant-false
+    // `ref.is_null` on a never-null field). Chain reads stay raw inside it; a deeper field has its own guard.
     const nsi = eqRowTgtStructIdx(si, fi)
     if nsi < 0 {
       return emitFail(
@@ -12421,13 +12024,10 @@ function emitStructEqFieldAt(
     return emitNulFieldGuardClose()
   }
   if code == 4 {
-    // `i32[]` list: lengths equal AND element-wise equal — `len` from the WRAPPER
-    // (field 1, the logical size; the backing may be longer), elements off the
-    // backings, stashed in two FRESH `(ref null $aTypeIdx)` slots of the lazy list frame
-    // (`listBackStashSlot`). They used to ride the string-op frame's `strScrA`/`strScrB`,
-    // which worked only while `string` and an `i32[]` backing shared one heap index; those
-    // two slots are `(ref $sTypeIdx)` string refs now. The i32 counters below still ride the
-    // string-op frame — they are plain i32 slots and carry no rep.
+    // `i32[]` list: lengths equal and element-wise equal — `len` from the wrapper (field
+    // 1, the logical size; the backing may be longer), elements read off backings stashed
+    // in two fresh `(ref null $aTypeIdx)` lazy-frame slots (`listBackStashSlot`, typed for
+    // this rep). The i32 counters below still ride the string-op frame: plain i32 slots carrying no rep, safe to share.
     if !lUsed {
       return emitFail(
         "emitProgram: i32[] field equality but list type not collected",
@@ -12495,11 +12095,10 @@ function emitStructEqFieldAt(
     return emitCloEqCore(body)
   }
   if code == 16 {
-    // A VALUE-UNION / STRUCT-UNION BOX field compares exactly as the box does at top level:
-    // tag first, then the arm the tag selects. The only thing this arm adds is READING the
-    // two boxes off a field path instead of off two operands — the shape D1017 gave the
-    // ref-list field. Columns FIRST, so an arm set the core cannot serve declines before a
-    // byte is written and keeps the loud refusal below (D1290).
+    // A value-union / struct-union box field compares exactly as the box does at top
+    // level: tag first, then the arm the tag selects, reading the two boxes off a field
+    // path instead of off two operands. Columns are resolved first, so an arm set the
+    // core cannot serve declines before any byte is written and reaches the loud refusal below (D1290).
     const bxN = sFieldElemNameAt(si, fi)
     if bxN != "" {
       const bxArms: string[] = []
@@ -12521,10 +12120,10 @@ function emitStructEqFieldAt(
     }
   }
   if code == 5 {
-    // A REF-LIST FIELD compares exactly as a ref list does at top level — push the two
-    // lists, then hand them to the shared core, whose struct-element class already routes
-    // to the stash-based `emitStructEqRec(body, -2, -3, …)`. The only thing this arm adds
-    // is READING the two lists off a field path instead of off two operands (D1017).
+    // A ref-list field compares exactly as a ref list does at top level: push the two
+    // lists and hand them to the shared core, whose struct-element class already routes
+    // to the stash-based `emitStructEqRec(body, -2, -3, …)`. The only addition here is
+    // reading the two lists off a field path instead of off two operands (D1017).
     if si >= 0 {
       const d17n = sFieldElemNameAt(si, fi)
       if d17n != "" {
@@ -12537,11 +12136,10 @@ function emitStructEqFieldAt(
       }
     }
   }
-  // A SCALAR-BACKED LIST FIELD compares exactly as that list does at top level — read the
-  // two lists off the field path, then hand them to the generic core, whose frame
-  // `leqNoteBin` reserved from the same map. `i32[]` (code 4) keeps its own arm above.
-  // D1020: only that one code had an arm, so `f64[]`, `i64[]`, `string[]`, `f32[]` and
-  // `u8[]` fields refused a compare their VALUES have always supported.
+  // A scalar-backed list field compares exactly as that list does at top level: read the
+  // two lists off the field path and hand them to the generic core, whose frame
+  // `leqNoteBin` reserved from the same map (`i32[]`, code 4, keeps its own arm above);
+  // `f64[]`/`i64[]`/`string[]`/`f32[]`/`u8[]` fields get the same coverage here (D1020).
   const eqSk = eqScalarListFieldKind(code)
   if eqSk >= 0 {
     if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
@@ -12552,10 +12150,9 @@ function emitStructEqFieldAt(
 }
 
 // Emit `clamp(idx, len)` where `idx` is in i32 temp `idxSlot` and `len` in temp
-// `lenSlot`, leaving the clamped value on the stack. JS slice semantics: a negative
-// index counts from the end (`len + idx`, floored at 0), a non-negative index is
-// capped at `len` — `idx < 0 ? max(len+idx, 0) : min(idx, len)`. Built from `select`
-// (`0x1b`: `[a, b, cond] -> a if cond else b`).
+// `lenSlot`, leaving the clamped value on the stack — JS slice semantics: a negative
+// index counts from the end (`len + idx`, floored at 0), a non-negative index is capped
+// at `len` (`idx < 0 ? max(len+idx, 0) : min(idx, len)`), built from `select`.
 function emitClampIdx(body: i32[], idxSlot: i32, lenSlot: i32) {
   // negCase = max(len+idx, 0) = select( len+idx, 0, (len+idx) > 0 )
   pushStrScrI(body, lenSlot)
@@ -12584,18 +12181,10 @@ function emitClampIdx(body: i32[], idxSlot: i32, lenSlot: i32) {
   0
 }
 
-// Lower a string `s.slice(start, end)`, leaving the new string ref — Stage 2b: a HEADER ONLY,
-// sharing the receiver's backing. JS semantics are unchanged (each bound clamps via
-// `emitClampIdx`, the out length is `max(end - start, 0)`); what changed is that the result is
-// `struct.new $str (s.backing, s.start + start, len)` instead of an `array.new_default` plus
-// an `array.copy`. O(1), one 3-field struct, ZERO element copies.
-//
-// THE ALIASING IS SAFE BY CONSTRUCTION, not by convention (§2.5): there is no string element
-// store anywhere in the emitter (`emitAssign`'s `Index` target has no raw-string arm, and the
-// checker gives a string only `.length` as a member) and no `ref.eq` on a string — every `==`
-// is element-wise — so a view and a copy are indistinguishable. THE RETENTION HAZARD IS REAL
-// AND TAKEN KNOWINGLY: a 3-element view keeps its whole backing alive. `compact()` is the
-// documented escape (§Header / OQ-4). i32 temps: I0/I1 clamped bounds, I2 len(s), I3 out len.
+// Lower a string `s.slice(start, end)`, leaving the new string ref: a header only, sharing
+// the receiver's backing (`struct.new $str (s.backing, s.start + start, len)`), O(1) with
+// zero element copies. Safe by construction — no string element store and no `ref.eq` on a
+// string exist anywhere in the emitter, so a view and a copy are indistinguishable — but a view keeps its whole backing alive; `compact()` is the documented escape (§Header).
 function emitStrSlice(body: i32[], callIx: i32, fnIx: i32) {
   if !aUsed {
     return emitFail("emitProgram: string slice but array type not collected")
@@ -12657,18 +12246,10 @@ function emitStrSlice(body: i32[], callIx: i32, fnIx: i32) {
   emitFail("emitProgram: expected a string slice call")
 }
 
-// Lower `s.indexOf(sub)` (or `s.includes(sub)`), leaving an i32: the first index of `sub` in
-// `s`, or -1 (an empty `sub` yields 0, the JS convention); `includes` is `indexOf != -1`.
-// Scratch: refs A = s, B = sub; i32 temps I0 = candidate start, I1 = the hoisted first needle
-// character during the skip and the match index during the verify, I2 = len(s) - len(sub),
-// I3 = len(sub). Shape: an outer loop per verify attempt, wrapping a SKIP loop that advances
-// to the next start whose first character matches, then a VERIFY loop over the rest.
-//
-// THE SKIP LOOP IS THE POINT. The common answer at a candidate start is "the first character
-// already differs", and a naive scan pays TWO bounds-checked `array.get`s to reach it.
-// Hoisting `B[0]` into a local makes that answer one load and a register compare. The hoist is
-// reloaded once per OUTER trip so it can share `I1` with the verify counter. Both guards are
-// load-bearing: hoisting `B[0]` TRAPS on an empty needle, and a too-long needle makes I2 < 0.
+// Lower `s.indexOf(sub)` (or `s.includes(sub)`), leaving an i32: the first index of `sub`
+// in `s`, or -1 (empty `sub` yields 0, the JS convention); `includes` is `indexOf != -1`.
+// An outer loop per verify attempt wraps a skip loop that hoists `B[0]` to advance to the
+// next matching-first-character start in one load, then a verify loop over the rest — both the empty-needle short-circuit and the too-long-needle guard are load-bearing for that hoist.
 function emitStrIndexOf(body: i32[], callIx: i32, fnIx: i32) {
   if !aUsed {
     return emitFail("emitProgram: string indexOf but array type not collected")
@@ -12798,11 +12379,10 @@ function emitStrIndexOf(body: i32[], callIx: i32, fnIx: i32) {
   emitFail("emitProgram: expected a string indexOf call")
 }
 
-// Lower `s.charCodeAt(i)` onto `body`, leaving the char code i32. A guarded
-// `backing[start + i]` over the code-point backing — an out-of-range index TRAPS, matching
-// the host (`s[i]` semantics, no JS NaN; compiler/builtins/strings.ts). The guard is what
-// keeps the trap: past Stage 2b the backing outlives the view, so `array.get`'s own bounds
-// check is no longer the view's.
+// Lower `s.charCodeAt(i)` onto `body`, leaving the char code i32: a guarded
+// `backing[start + i]` over the code-point backing, so an out-of-range index traps —
+// matching the host's `s[i]` semantics (no JS NaN). The guard is what keeps the trap: the
+// backing outlives the view, so `array.get`'s own bounds check is not the view's bound.
 function emitStrCharCode(body: i32[], callIx: i32, fnIx: i32) {
   if !aUsed {
     return emitFail(
@@ -12838,12 +12418,10 @@ function emitStrCharCode(body: i32[], callIx: i32, fnIx: i32) {
   emitFail("emitProgram: expected a string charCodeAt call")
 }
 
-// ── the Stage 2c code-point trio: `cpAt` / `cpLen` / `isCharBoundary` ─────────
-// All three read the UTF-8 STORAGE, which is the reason they are core intrinsics and the 15
-// `std:str` names are not (OQ-3): nothing writable in VL can see a byte as anything but a
-// byte. They ride the SAME lazy stash `s[i]` uses (`strHdrSlot` + `listIdxScratchBase`) and
-// therefore need no `exprHasStrOp` reservation arm — exactly the property `emitStrCharCode`
-// documents for itself.
+// ── the code-point trio: `cpAt` / `cpLen` / `isCharBoundary` ──────────────────
+// All three read the UTF-8 storage directly, which is why they are core intrinsics rather
+// than `std:str` functions — nothing writable in VL can see a byte as anything but a byte.
+// They ride the same lazy stash `s[i]` uses, so they need no `exprHasStrOp` reservation arm.
 
 // Stash [receiver, index] off the wasm stack into the shared header/index slots. On entry
 // BOTH are fully evaluated (a nested string index inside either has already come and gone
@@ -12941,18 +12519,10 @@ function emitStrCpLen(body: i32[], callIx: i32, fnIx: i32) {
   emitFail("emitProgram: expected a string cpLen call")
 }
 
-// Lower `s.isCharBoundary(i)` — Rust's primitive, O(1): does byte `i` BEGIN a UTF-8
-// sequence? True at `len` (the end of a view is a boundary), false past `len` or below 0,
-// and otherwise the lead/continuation bit test — a continuation byte is `10xxxxxx`,
-// everything else begins a sequence.
-//
-// RUST SPECIAL-CASES INDEX 0 AND THIS DELIBERATELY DOES NOT. Rust can: a `&str` is
-// guaranteed valid, so its byte 0 is never a continuation byte and the special case is a
-// free shortcut. A VL string carries no such guarantee (§Validity) — `"é→".slice(1, 4)`
-// starts on a continuation byte and is an ordinary legal value — so answering `true` at 0
-// unconditionally would report a boundary that is not one, on exactly the input this
-// function exists to detect. On every VALID string the two rules agree, because byte 0 of
-// valid UTF-8 is never a continuation byte.
+// Lower `s.isCharBoundary(i)` (Rust's primitive, O(1)): does byte `i` begin a UTF-8
+// sequence? True at `len`, false past `len` or below 0, else the lead/continuation bit
+// test. Deliberately does not special-case index 0 the way Rust does — a VL string is not
+// guaranteed valid (§Validity), so a view like `"é→".slice(1, 4)` can start on a continuation byte, and answering `true` at 0 unconditionally would report a boundary that is not one.
 function emitStrIsCharBoundary(body: i32[], callIx: i32, fnIx: i32) {
   if !aUsed {
     return emitFail(
@@ -13010,8 +12580,8 @@ function emitStrIsCharBoundary(body: i32[], callIx: i32, fnIx: i32) {
 }
 
 // Lower `s.bytes()` — one call into `__str_bytes__`, which `array.copy`s the view's byte
-// range into a fresh `u8[]`. `ba8Used` was forced by `scanPrintUse`'s `.bytes()` arm, which
-// is the ONLY thing that makes the packed pair exist for a program that spells no `u8[]`.
+// range into a fresh `u8[]`. `ba8Used` is forced by `scanPrintUse`'s `.bytes()` arm, the
+// only thing that makes the packed pair exist for a program that spells no `u8[]`.
 function emitStrBytes(body: i32[], callIx: i32, fnIx: i32) {
   if !aUsed || !ba8Used || gHelpStrBytes < 0 {
     return emitFail(
@@ -13037,25 +12607,16 @@ function emitStrBytes(body: i32[], callIx: i32, fnIx: i32) {
 }
 
 export function emitExpr(body: i32[], exprIx: i32, fnIx: i32) {
-  // STOP AFTER A RECORDED FAILURE. `emitFail` banks the first message and returns -1 for the
-  // caller to propagate; it does NOT halt the pass. A caller that drops the -1 leaves emission
-  // running over state the failure already invalidated, and the next unguarded parallel-table
-  // read goes out of bounds — a TRAP, which kills the compiler before the banked diagnostic can
-  // print. That was the whole crash family behind #1611: ten repros, two trap sites, one cause.
-  //
-  // Checking the flag at the two recursion roots makes a failure terminal wherever it happened,
-  // instead of relying on every caller in between to thread -1 outward. It is the general fix
-  // rather than another patch: with BOTH shipped bounds guards removed, this alone turns every
-  // one of those repros back into a diagnostic. No diagnostic is lost — `emitFail` keeps only
-  // the FIRST message, so everything after it was work whose output is discarded anyway.
+  // Stop after a recorded failure: `emitFail` banks the first message and returns -1 but
+  // does not halt the pass, so a caller that drops the -1 keeps emitting over invalidated
+  // state until an unguarded parallel-table read traps and kills the compiler before the
+  // diagnostic prints. Checking the flag at the two recursion roots makes a failure terminal wherever it happened, instead of relying on every caller in between to thread -1 outward.
   if emitFailed { return -1 }
   if exprIx < 0 { return emitFail("emitProgram: missing expression") }
-  // A STRING-repped literal union reaching an ATOM-typed destination narrows to its interned
-  // id here — ONE hook rather than one per destination, because `pendingLitUnion` is already
-  // the context every atom-typed slot seeds (an annotated local, a `K` parameter, a `K`
-  // field, a `K[]` element, a `K` return, a `K`-valued map store). Without it the store was
-  // a `local.set` of a `(ref $array)` into an `i32` slot: invalid wasm with `vl check
-  // --codegen` rc 0, at every one of those destinations.
+  // A string-repped literal union reaching an atom-typed destination narrows to its
+  // interned id here — one hook rather than one per destination, since `pendingLitUnion`
+  // is already the context every atom-typed slot seeds. Without it the store is a
+  // `local.set` of a `(ref $array)` into an `i32` slot: invalid wasm at every such destination.
   if pendingLitUnion == 1 {
     if strReppedLitUnionAt(exprIx, fnIx) {
       return emitStrToAtom(body, unwrapParen(exprIx), fnIx)
@@ -13090,12 +12651,10 @@ export function emitExpr(body: i32[], exprIx: i32, fnIx: i32) {
     // G8: a map GET `m[k]` (no `??`) — scan, value or 0. A `??` get is fused in the
     // BinExpr branch below (it carries the default).
     if exprMap(e.idxArr, fnIx) {
-      // A UNION-VALUED map (mv kind 2) reads through the NULL-TAGGED BOX, the same lowering
-      // the `const t = m[k]` binding arm and its module-scope twin already take. `emitMapGet`
-      // yields the vals slot with a BARE `ref.null` miss, and every consumer of a boxed read
-      // starts with `struct.get $uBox 0` (the tag) — so a MISSING key trapped `null
-      // reference` on `m[k] is T`, `m[k] != null`, `m[k] == null` and `print(m[k])` alike,
-      // while the identical program through a binding ran. The box IS the read's `null`.
+      // A union-valued map (mv kind 2) reads through the null-tagged box, the same lowering
+      // the `const t = m[k]` binding arm takes: a bare `ref.null` miss would leave a
+      // consumer's `struct.get $uBox 0` (the tag read) reading a null reference on `m[k] is
+      // T`, `!= null`, `== null` and `print(m[k])` alike. The box is the read's own null.
       const ubs = mapReadNarrowableSlot(exprIx, fnIx)
       if ubs >= 0 && mvValKind[ubs] == 2 {
         if emitMapGetUnionBox(body, e.idxArr, e.idxIndex, fnIx) < 0 {
@@ -13114,8 +12673,8 @@ export function emitExpr(body: i32[], exprIx: i32, fnIx: i32) {
   if e is OptMember { return emitOptMemberValue(body, exprIx, fnIx) }
   if e is BinExpr { return emitBinExprNode(body, e, exprIx, fnIx) }
   if e is FuncDecl {
-    // An anonymous `function(...)` literal in value position (it was lifted to a
-    // top-level function by `collectFns`, keeping its name). Construct its closure value.
+    // An anonymous `function(...)` literal in value position, lifted to a top-level
+    // function by `collectFns` (keeping its name). Construct its closure value.
     const fe = fnStmtsPosOf(exprIx)
     if fe >= 0 { return emitClosureValue(body, fe, fnIx) }
     return emitFail("emitProgram: function literal not lifted")
@@ -13126,26 +12685,17 @@ export function emitExpr(body: i32[], exprIx: i32, fnIx: i32) {
     // else slot). Lowered as `if (result i32)` over the arm VALUES.
     return emitIfExpr(body, exprIx, fnIx)
   }
-  // THE CATCH-ALL, and it must name the EXPRESSION, not a position. This said
-  // `unsupported expression in return` — a message written for the return arm but
-  // reached by every unhandled expression anywhere, and anchored by `emitFail`'s
-  // function-level fallback, so a `const t = a?.w` was reported as a `return` on the
-  // enclosing function's OWN header line. `emitFailAt` puts the caret on the offending
-  // node, the way every caller that HAS the node already does.
+  // The catch-all must name the expression, not a position: a message written for one
+  // caller (the return arm) but reached from anywhere reads as though every unhandled
+  // expression happened there. `emitFailAt` puts the caret on the offending node instead,
+  // the way every caller that has the node already does.
   emitFailAt("emitProgram: unsupported expression", exprIx)
 }
 
-// Lower an if-EXPRESSION (`if c then a else b` in value position) onto `body`:
-// cond, `if (result <kind>)`, the then-arm VALUE, `else`, the else-arm VALUE (an
-// `else if` chain recurses), `end`. Each arm applies the same condition narrowing
-// the statement form does. The blocktype is the SCALAR rep the branch-join produced —
-// i32 (127, the default), i64 (126), f32 (125), or f64 (124) — all single-byte
-// valtypes; both arms are emitted COERCED to that rep so a mixed `then 1 else 2.5`
-// widens its i32 arm to f64. A REF-typed join (string / struct / array — NOT a value
-// union or concrete variant, which `emitUnionIfValue`/`emitVariantIfValue` already
-// handle at their coerce sites) routes to `emitIfExprRef`, which writes the multi-byte
-// `(ref $ht)` blocktype via `fbValtype`. A missing else / non-value arm fails loudly —
-// the checker already proved both arms exist and agree.
+// Lower an if-expression (`if c then a else b` in value position) onto `body`: cond,
+// `if (result <kind>)`, the then-arm value, else the else-arm value (an `else if` chain
+// recurses). Both arms are coerced to the branch-join's scalar rep (a mixed `then 1 else
+// 2.5` widens to f64); a ref-typed join (string/struct/array) routes to `emitIfExprRef` instead, for the multi-byte `(ref $ht)` blocktype a single numeric byte cannot spell.
 function emitIfExpr(body: i32[], ifIx: i32, fnIx: i32) {
   const rk = ifExprRefKind(ifIx, fnIx)
   if rk != null {
@@ -13154,11 +12704,10 @@ function emitIfExpr(body: i32[], ifIx: i32, fnIx: i32) {
   emitIfExprAs(body, ifIx, fnIx, ifExprValtype(ifIx, fnIx))
 }
 
-// Lower a REF-typed if-expression join (string / struct / array) as a value-typed `if`
+// Lower a ref-typed if-expression join (string / struct / array) as a value-typed `if`
 // with the multi-byte `(ref $ht)` blocktype (`fbValtype`), each arm emitted in that rep.
-// Mirrors `emitIfExprAs` (narrowing save/restore, `else if` recursion) but the blocktype
-// is an interned reftype rather than a single numeric byte. The arm emitter re-seeds the
-// per-arm construction context so an `ObjLit` / list-literal arm builds the right shape.
+// Mirrors `emitIfExprAs` (narrowing save/restore, `else if` recursion), except the arm
+// emitter re-seeds the per-arm construction context so an `ObjLit`/list-literal arm builds the right shape.
 function emitIfExprRef(
   body: i32[],
   ifIx: i32,
@@ -13168,20 +12717,16 @@ function emitIfExprRef(
 ) {
   const s = P.nodes[ifIx]
   if s is IfStmt {
-    // AN ELSE-LESS `if` USED AS A VALUE IS `T | null` (DECISIONS, 2026-09-02): the false
-    // path yields `null`, so the join is nullable and the missing arm is the rep's own
-    // null. The blocktype below and the else arm at the bottom are that one fact, twice.
+    // An else-less `if` used as a value is `T | null` (DECISIONS.md "An else-less `if`
+    // used as a value"): the false path yields `null`, so the join is nullable and the
+    // missing arm is the rep's own null. The blocktype below and the else arm at the bottom are that one fact, twice.
     const noElse = s.ifElse < 0
     if emitExpr(body, s.ifCond, fnIx) < 0 { return -1 }
     wU8(4) // 0x04 if
-    // A join the checker typed `T | null` — one arm `null`, or absent — needs a NULLABLE
+    // A join the checker typed `T | null` (one arm `null`, or absent) needs a nullable
     // blocktype, else that arm's `(ref null $ht)` mismatches the non-null result.
-    // `nodeTyIsNullable` reads the checker's recorded join type: the GENERIC signal, asked
-    // for every ref kind at once. Asking it per-kind is what a struct-only spelling of this
-    // line did, and every other ref kind with a `null` arm was then check-clean INVALID
-    // WASM (`expected (ref $type), found (ref null $type)`) — measured at `str`, `strlist`,
-    // `list` and `map`. A non-nullable join, or a binding annotated `T | null` whose arms
-    // are both non-null, stays non-null: the value widens on store.
+    // `nodeTyIsNullable` reads the checker's recorded join type as one generic signal for
+    // every ref kind, rather than per-kind — a non-nullable join, or a binding whose arms are both non-null, stays non-null and widens on store.
     const nulJoin = noElse || nodeTyIsNullable(ifIx)
     if nulJoin {
       fbValtypeNullable(kind, slot) // `(ref null $ht)` result blocktype
@@ -13218,27 +12763,15 @@ function emitIfExprRef(
   emitFail("emitProgram: expected an if expression")
 }
 
-// ── if-EXPRESSION arm prelude ─────────────────────────────────────────────────
-// An if-expression arm is a Block whose VALUE is its LAST statement (`ifArmValueExpr`); every
-// statement before it is the arm's PRELUDE. The parser writes a one-statement arm for
-// `if c { v }`, but a `const` declared in the arm makes it two — and that is exactly what a
-// `match` payload-binding arm desugars to (`match u { A{a} => a }` becomes
-// `if u is A { const a = u.a; a }`), so the prelude is what lets a BINDING arm sit in value
-// position. Wasm-wise it is stack-neutral: it runs inside the arm's `if`/`else` frame.
-//
-// `emitIfArmOpen` pushes the arm's lexical frame and lowers the prelude; the caller emits the
-// value in ITS join rep and closes with `emitIfArmClose`, which pops the frame. The two are
-// separate calls because each arm emitter lowers the VALUE differently (coerced numeric, ref,
-// union box, variant struct, return exit) while the prelude and the frame are shared.
+// ── if-expression arm prelude ─────────────────────────────────────────────────
+// An if-expression arm is a block whose value is its last statement; every statement
+// before it is the prelude, which is what lets a binding arm sit in value position (the
+// desugared `match u { A{a} => a }` shape). `emitIfArmOpen` pushes the frame and lowers the prelude; the caller emits the value and closes with `emitIfArmClose`, split in two because each arm emitter lowers the value differently while the prelude and frame are shared.
 
-// Push the arm's lexical frame and lower every statement before the arm's value.
-// Returns 0, or -1 (the caller still owes `emitIfArmClose`).
-//
-// A non-empty prelude is lowered ONLY when `collectLocalsIf` walked this arm
-// (`armPreludeBlocks`) — that walk is what allocated the arm's locals, in the pre-order
-// `emitLetDeclStmt`'s cursor replays. An if-expression collect does not descend into
-// (one buried inside another expression, or a top-level global's initializer) is rejected
-// here rather than lowered against slots that belong to something else.
+// Push the arm's lexical frame and lower every statement before the arm's value. Returns
+// 0, or -1 (the caller still owes `emitIfArmClose`). A non-empty prelude is lowered only
+// when `collectLocalsIf` walked this arm (`armPreludeBlocks`) — the walk that allocated the
+// arm's locals; an if-expression the collect pass never descended into is rejected here rather than lowered against slots that belong to something else.
 function emitIfArmOpen(body: i32[], blockIx: i32, fnIx: i32) {
   scopePush()
   const b = P.nodes[blockIx]
@@ -13277,18 +12810,10 @@ function emitIfArmClose(rc: i32) {
   rc
 }
 
-// The `emitFail` reason for an if-expression arm that leaves no value on the stack. Every arm
-// emitter reaches this through the same two-part gate — `ifArmValueExpr` finding the arm's
-// last statement, then that statement classifying as a value — and the two halves fail for
-// DIFFERENT reasons, so the message names which one fired:
-//   • an EMPTY arm block has no value expression at all (`ifArmValueExpr` → -1);
-//   • an arm ending in a VOID call is a single, well-formed expression yielding nothing;
-//   • an arm ending in a real STATEMENT (`let` / `while` / an index assignment) likewise.
-//
-// The middle case is why "not a single value" is the wrong thing to say: such an arm IS a
-// single expression, and the author's fix is to give the call a result or restructure the `if`
-// as a statement. `what` names the arm flavour ("if-expression arm" / "union …" / "variant …")
-// so the union and variant joins keep their own rep in the text.
+// The `emitFail` reason for an if-expression arm with no value on the stack: an empty arm
+// (no value expression at all), a void call (a well-formed expression yielding nothing), or
+// a real statement, each get their own message — "not a single value" would be wrong for
+// the void-call case, since such an arm IS a single expression. `what` names the arm flavour so union and variant joins keep their own rep in the text.
 function ifArmNoValueFail(what: string, blockIx: i32) {
   const tv = ifArmValueExpr(blockIx)
   if tv < 0 {
@@ -13307,13 +12832,10 @@ function ifArmNoValueFail(what: string, blockIx: i32) {
   )
 }
 
-// One arm of a REF-typed if-expression: its prelude, then its tail-value statement
-// emitted in the join rep. Re-seeds `pendingStructIdx` (struct arms) /
-// `pendingListKind`+`pendingListSlot` (ref-list arms) after the prelude — the previous
-// arm's emit consumed the pending seed, and so can a prelude statement.
-//
-// `nulJoin` is the blocktype the caller wrote, threaded rather than re-derived so the
-// declaration and the arm's recover cannot disagree about the result's nullness (D1577).
+// One arm of a ref-typed if-expression: its prelude, then its tail-value statement emitted
+// in the join rep. Re-seeds `pendingStructIdx` (struct arms) / `pendingListKind` +
+// `pendingListSlot` (ref-list arms) after the prelude, since the previous arm's emit or a
+// prelude statement can consume the pending seed. `nulJoin` is threaded from the caller rather than re-derived, so the declaration and the arm's recover cannot disagree about nullness (D1577).
 function emitRefIfArm(
   body: i32[],
   blockIx: i32,
@@ -13328,12 +12850,10 @@ function emitRefIfArm(
     if tv >= 0 {
       if ifArmIsValue(tv, fnIx) {
         if emitIfArmOpen(body, blockIx, fnIx) < 0 { return emitIfArmClose(-1) }
-        // A bare `null` ARM lowers as the JOIN's OWN null, not through `emitNullLitNode`'s
+        // A bare `null` arm lowers as the join's own null, not through `emitNullLitNode`'s
         // seed ladder: `fbRefNullOfKind` is `fbValtypeNullable`'s value twin, so the arm and
-        // the blocktype cannot name different heap types — the identity the else-LESS
-        // spelling of the same value already lowers by. Without it the explicit
-        // `else { null }` twin floored on `bare null needs a struct-typed context` at every
-        // ref kind whose null no boundary seed carries (D1560), while its else-less twin ran.
+        // the blocktype cannot name different heap types. Without it an explicit
+        // `else { null }` refuses at every ref kind whose null no boundary seed carries (D1560), while the else-less spelling of the same value keeps working.
         if P.nodes[unwrapParen(tv)] is NullLit {
           return emitIfArmClose(fbRefNullOfKind(kind, slot))
         }
@@ -13348,12 +12868,10 @@ function emitRefIfArm(
         if kind == "str" && exprIsLitAtom(tv, fnIx) {
           return emitIfArmClose(emitAtomToStr(body, tv, fnIx))
         }
-        // D1577 — A NON-NULL BLOCKTYPE IS A DELIVERY, so an arm whose REP is the join
+        // A non-null blocktype is a delivery (D1577), so an arm whose rep is the join
         // kind's nullable niche owes the same `ref.as_non_null` the return / argument /
-        // binding boundaries make (`nulNicheRecoverOwed`, D1115). A nested-struct field is
-        // STORED `(ref null $S)` while its TYPE is not nullable, so two `s.ret` arms pushed
-        // `(ref null $S)` under a `(ref $S)` result: `vl check` rc 0, invalid wasm. Under a
-        // NULLABLE blocktype nothing is owed — there the niche IS the join's own rep.
+        // binding boundaries make (`nulNicheRecoverOwed`) — a nested-struct field stores
+        // `(ref null $S)` though its type is not nullable, so an unrecovered arm pushes that under a `(ref $S)` result: invalid wasm. Under a nullable blocktype nothing is owed.
         const rcV = emitExpr(body, tv, fnIx)
         if rcV >= 0 && !nulJoin {
           if nulNicheRecoverOwed(kind, tv, fnIx) { fbRefAsNonNull() }
@@ -13371,12 +12889,10 @@ function emitRefIfArm(
 function emitIfExprAs(body: i32[], ifIx: i32, fnIx: i32, kind: i32) {
   const s = P.nodes[ifIx]
   if s is IfStmt {
-    // AN ELSE-LESS `if` USED AS A VALUE IS `T | null` (DECISIONS, 2026-09-02). This is the
-    // i32-blocktype family, so the false path is a NICHE SENTINEL — 2 for `boolean | null`,
-    // -1 for a nullable literal union — the same two values `emitNullLitNode` writes for a
-    // bare `null` in those reps. A bare `i32`/`i64`/`f64`/`f32` join has no such spare
-    // value: its `T | null` rep is the union BOX, which `emitUnionIfValue` lowers, so this
-    // path keeps the loud refusal for it rather than inventing a sentinel in an i32.
+    // An else-less `if` used as a value is `T | null` (DECISIONS.md "An else-less `if`
+    // used as a value"). In the i32-blocktype family the false path is a niche sentinel —
+    // 2 for `boolean | null`, -1 for a nullable literal union — the same values
+    // `emitNullLitNode` writes for a bare `null` there; a bare numeric join has no such spare value, so it keeps the loud refusal rather than inventing a sentinel in an i32.
     const noElseNiche = s.ifElse < 0
     if noElseNiche {
       if !nodeTyIsNulBool(ifIx) && !nodeTyIsNulLitUnion(ifIx) {
@@ -13401,12 +12917,9 @@ function emitIfExprAs(body: i32[], ifIx: i32, fnIx: i32, kind: i32) {
       if els is IfStmt {
         rc = emitIfExprAs(body, s.ifElse, fnIx, kind)
       } else {
-        // THE EXPLICIT `else { null }` SPELLING OF THE SAME VALUE. It reaches
-        // `emitNullLitNode`, whose niche arms read a BOUNDARY seed that an un-annotated
-        // binding's initializer position never sets — so this spelling floored on
-        // `bare null needs a struct-typed context` while its else-LESS twin, which writes
-        // the sentinel three lines up, ran (D1560). Seeded from the join's own type, and
-        // only for a bare-`null` tail, so no other value in the arm can read it.
+        // The explicit `else { null }` spelling reaches `emitNullLitNode`, whose niche arms
+        // need a boundary seed an un-annotated binding initializer never sets (D1560) — seed
+        // `pendingNulBool`/`pendingNulLitUnion` from the join's own type here, scoped to a bare-`null` tail so no other value in the arm can read it.
         const savedNB = pendingNulBool
         const savedNL = pendingNulLitUnion
         const enull = ifArmValueExpr(s.ifElse)
@@ -13450,16 +12963,10 @@ function emitBlockValueAs(body: i32[], blockIx: i32, fnIx: i32, kind: i32) {
   emitFail("emitProgram: if-expression arm is not a block")
 }
 
-// ── nullable / value-union if-EXPRESSION in BINDING-INIT position ──────────────
-// `const x: i32 | null = if c then 5 else null` (and `else if` chains) lowers as a
-// VOID `if` whose every arm writes the binding's OWN local — so no value-typed-if
-// blocktype (an interned functype) and no scratch slot are needed: the destination
-// local IS the stash. Each arm emits its value in the binding's nullable rep (`rep`:
-// 0 the value-union box, 1 a `string | null` ref) then `local.set`s it; a bare `null`
-// arm / an else-less false path writes the rep's null. This is the binding-position
-// counterpart of the return-tail `emitIfTail`/`emitNullForRet` lowering (#484/#489).
-// A `boolean | null` local is not yet a supported rep at all (a separate pre-existing
-// gap), so it is not handled here.
+// ── nullable / value-union if-expression in binding-init position ─────────────
+// `const x: i32 | null = if c then 5 else null` lowers as a void `if` whose every arm
+// writes the binding's own local directly — no value-typed-if blocktype and no scratch
+// slot needed, since the destination local is the stash. `rep` 0 is the value-union box, 1 a `string | null` ref; `boolean | null` is not a supported local rep here yet.
 
 // Emit ONE arm value (`valIx`) in the binding's nullable rep, then `local.set idx`.
 function emitNulArmToLocal(
@@ -13474,21 +12981,16 @@ function emitNulArmToLocal(
     return emitFail("emitProgram: if-expression arm is not a value")
   }
   if rep == 0 {
-    // The binding's local is the union BOX `(ref $uBox)`, so a CONCRETE-VARIANT arm (`x`, a
-    // kind-8 `(ref $variant)` — `let a: Animal = if c then x else y`) must be BOXED to match,
-    // exactly as in `emitUnionIfArm` / a variant return. `emitUnionBoxArg` boxes a variant ref
-    // and defers every other shape (object literal, passthrough union, scalar) to
-    // `emitUnionCoerce` — plain `emitUnionCoerce` stored the raw variant ref (invalid wasm).
+    // The binding's local is the union box `(ref $uBox)`, so a concrete-variant arm (a
+    // kind-8 `(ref $variant)`) must be boxed to match, exactly as `emitUnionIfArm` and a
+    // variant return do. `emitUnionBoxArg` boxes a variant ref and defers every other shape
+    // to `emitUnionCoerce` — plain `emitUnionCoerce` alone would store the raw variant ref, invalid wasm.
     if emitUnionBoxArg(body, unionName, valIx, fnIx) < 0 { return -1 }
   } else if rep == 1 {
     // rep 1: a `string | null` arm — a non-null string passes through, a bare `null`
-    // lowers as `ref.null $sTypeIdx` (`nulString`).
-    //
-    // A literal-union ATOM arm is the one non-null value that does NOT pass through: its rep is
-    // an i32 id and the local is a nullable string reference, so it widens first. This is the
-    // BINDING-INIT path (`const s: string | null = if b { r.f } else { "z" }`), which
-    // `emitLetDeclStmt` routes here early — it never reaches the if-ARM widen at the join, which
-    // is why adding a `nulstr` kind there measured inert.
+    // lowers as `ref.null $sTypeIdx`. A literal-union atom arm is the one non-null value
+    // that does not pass through: its rep is an i32 id, so it widens to a string first —
+    // this binding-init path is routed here by `emitLetDeclStmt` and never reaches the if-arm widen at the join.
     if exprIsLitAtom(valIx, fnIx) {
       if emitStrValue(body, valIx, fnIx) < 0 { return -1 }
     } else {
@@ -13588,18 +13090,10 @@ function emitNullableIfBinding(
   emitFail("emitProgram: expected an if expression")
 }
 
-// ── the union-box BINDING SINK ────────────────────────────────────────────────
-// `const u: A | B = if c { a } else { b }` in the value-union box rep, with the box built ONCE
-// past the merge instead of once per arm.
-//
-// `emitNullableIfBinding`'s rep-0 lowering builds a box in every arm and pays a THIRD
-// construction before the `if` — the slot is a non-null `(ref $uBox)`, which is not
-// defaultable, and a void-`if` merge does not satisfy definite assignment, so the null box is
-// pre-seeded and immediately overwritten. Heap2Local scalarizes per allocation SITE, so none
-// of the three can own the slot and the box survives the whole release profile. The sink
-// writes each arm's tag and payload into a shared pair and does the single `struct.new` after
-// the `if`. Gated on `unionIfBindingAllBox`: an arm that PASSES a box through builds nothing,
-// and routing it through the pair would unbox and rebuild it (`emitUnionArmToPair` backstops).
+// ── the union-box binding sink ────────────────────────────────────────────────
+// `const u: A | B = if c { a } else { b }` needs the box built once after the merge, not
+// once per arm plus a pre-seed (three allocation sites means Heap2Local can scalarize none
+// of them, so the box survives as a real heap object). The sink writes each arm's tag and payload into a shared pair and does the single `struct.new` after the `if`; gated on `unionIfBindingAllBox` since an arm that already passes a box through would otherwise be unboxed and rebuilt for nothing.
 
 // Does every terminal arm of the union-box if-binding at `ifIx` CONSTRUCT its box? An
 // `else if` chain link recurses; an else-LESS chain contributes the rep's null box, which
@@ -13616,11 +13110,10 @@ function unionIfBindingAllBox(ifIx: i32, fnIx: i32) {
   false
 }
 
-// The two arm shapes whose lowering does NOT end in `struct.new $uBox`: a value that is
-// ALREADY a box (`emitUnionCoerce` passes it through untouched) and a NESTED if-expression
+// The two arm shapes whose lowering does not end in `struct.new $uBox`: a value that is
+// already a box (`emitUnionCoerce` passes it through untouched), and a nested if-expression
 // (`emitUnionIfValue`'s value-typed `if`, whose last instruction is the frame's `end`).
-// Every other shape — a scalar atom, a `null`, an object literal, a bare variant ref, a
-// map carrier — bottoms out in the box's own construction.
+// Every other shape bottoms out in the box's own construction.
 function unionIfArmBoxes(valIx: i32, fnIx: i32) {
   if valIx < 0 { return false }
   if exprUnion(valIx, fnIx) { return false }
@@ -13726,17 +13219,10 @@ function emitUnionIfBindingSink(
   emitFail("emitProgram: expected an if expression")
 }
 
-// The expression whose REP the `emitExprAs*` widenings must classify. ASSIGNMENT is a value
-// expression yielding a RE-READ of its TARGET — `emitBinExprNode`'s `=` arm stores through
-// `emitAssign` and then emits the target through the normal Ident path — so `g = 7` leaves the
-// CELL's rep on the stack, never the right-hand side's. Every other expression is itself.
-//
-// Only the CLASSIFICATION moves: the assignment is still emitted by the caller exactly as
-// before, so its right-hand side is evaluated exactly ONCE. Without this peel a widening cell
-// in ANY value position — a tail `function f(): i64 { g = 7 }`, `take(g = 7)`,
-// `let x: i64 = (g = 7)` — pushed the i64 cell and widened it AGAIN (`i64.extend_i32_s` over
-// an i64), invalid wasm from two ordinary lines with `vl check` clean. An already-wide
-// right-hand side (`g = h`) escaped because the checker types THAT node i64.
+// The expression whose rep the `emitExprAs*` widenings must classify: an assignment in
+// value position classifies by its target cell, not its right-hand side, since `g = 7`
+// leaves the cell's rep on the stack (`emitBinExprNode`'s `=` arm stores, then re-reads the
+// target). Only the classification moves — the right-hand side still evaluates once — so a widening cell in any value position is not double-widened (`i64.extend_i32_s` over an already-i64 value: invalid wasm).
 function widenClassifyExpr(exprIx: i32) {
   const wce = P.nodes[unwrapParen(exprIx)]
   if wce is BinExpr {
@@ -13750,17 +13236,10 @@ function widenClassifyExpr(exprIx: i32) {
   exprIx
 }
 
-// Emit `ix` with the three WIDE-SCALAR literal hints cleared, restoring them after — the one
-// home for "this emit's width is decided HERE, not by the position above it".
-//
-// `pendingI64` / `pendingF32` / `pendingF64` say what a bare integer LITERAL standing in an
-// i64 / f32 / f64 slot lowers as. They are a property of that ONE literal position, not of the
-// expression tree around it, so any emit that produces its own width must run with them off.
-// Left on, EVERY integer literal in the subtree takes the wide form while its own slot is
-// still i32 — an ARRAY INDEX, an i32-keyed map KEY, a `.slice` bound, the i32 operand of the
-// arithmetic that produces the wide value. `vl check` stays rc 0 and the module does not
-// validate. `emitNumIntrArg` and `emitMemIntrinArg` state the same rule for their own
-// operands; this is that rule at the WIDENING boundary, where the seeds are set.
+// Emit `ix` with the three wide-scalar literal hints cleared, restoring them after: the
+// one home for "this emit's width is decided here, not by the position above it".
+// `pendingI64`/`pendingF32`/`pendingF64` are a property of one literal position, not the
+// subtree around it — left on, every integer literal inside (an array index, a map key, a `.slice` bound) takes the wide form while its own slot is still i32: `vl check` rc 0, invalid module.
 function emitExprWideCleared(body: i32[], ix: i32, fnIx: i32) {
   const savedI64 = pendingI64
   const savedF32 = pendingF32
@@ -13775,16 +13254,10 @@ function emitExprWideCleared(body: i32[], ix: i32, fnIx: i32) {
   r
 }
 
-// Emit the expression at `exprIx` as an i64 value (Slice 2). A bare integer LITERAL is
-// lowered directly as `i64.const` (set `pendingI64` so the NumLit path takes the 64-bit
-// form). An expression that already yields i64 (`exprIsI64`) is emitted as-is; any other
-// i32 source is emitted then sign-extended with `i64.extend_i32_s` (0xac). This is the
-// i32→i64 widening for mixed-width operands.
-//
-// The LITERAL peel is checked FIRST so the other two arms can own their own width
-// (`emitExprWideCleared`): a bare literal is the only shape an ambient `pendingI64` is
-// about, and the check is width-identical either way — `emitNumLitNode` reaches the same
-// `parseI64Pair` + `fbI64Const` pair through its own `exprIsI64` / out-of-i32-range arms.
+// Emit the expression at `exprIx` as an i64 value: a bare integer literal lowers directly
+// as `i64.const` (`pendingI64` set), an expression that already yields i64 emits as-is, and
+// any other i32 source is emitted then sign-extended (`i64.extend_i32_s`). The literal peel
+// runs first so the other two arms can own their own width via `emitExprWideCleared`.
 export function emitExprAsI64(body: i32[], exprIx: i32, fnIx: i32) {
   // Peel parens to find a bare literal we can emit directly as i64.const.
   const inner = unwrapParen(exprIx)
@@ -13805,23 +13278,15 @@ export function emitExprAsI64(body: i32[], exprIx: i32, fnIx: i32) {
   0
 }
 
-// Emit the expression at `exprIx` as an f64 value. If it already yields f64
-// (`exprIsF64`) it is emitted as-is. Otherwise a narrower numeric source widens to f64
-// at the boundary (binding / argument / return / mixed-operand):
-//   f32 → f64.promote_f32 (0xbb)   i64 → f64.convert_i64_s (0xb9)
-//   i32 → f64.convert_i32_s (0xb7) [also covers an integer literal]
-// i32→f64 and f32→f64 are the LOSSLESS variable widenings the checker permits.
-// i64→f64 (lossy above 2^53) is no longer a permitted variable widening — the
-// checker rejects it — so the i64 path here only handles an i64 LITERAL coercing
-// into an f64 slot (re-encoded by value). (Slice 3 + Slice 5 widening.)
+// Emit the expression at `exprIx` as an f64 value: already-f64 emits as-is, otherwise a
+// narrower source widens at the boundary — f32 via `f64.promote_f32`, i32 via
+// `f64.convert_i32_s` (both lossless, permitted variable widenings), i64 via
+// `f64.convert_i64_s` for an i64 literal only (a variable i64→f64 is lossy above 2^53 and the checker rejects it).
 export function emitExprAsF64(body: i32[], exprIx: i32, fnIx: i32) {
-  // An f32 source promotes losslessly to f64. Checked BEFORE the f64 fast-path: an arithmetic
-  // expression with an f32 operand (`x + 1.0`, `x: f32`) EMITS as f32 — `emitExpr`'s f32 slice
-  // fires because a float literal re-encodes to the f32 operand — yet `exprIsF64` ALSO claims
-  // it via that literal. Without this the f64 fast-path emits f32 into an f64 slot and traps.
-  // (A pure-f64 expression is not `exprIsF32`, so it still takes the fast path below unchanged.)
-  // An ASSIGNMENT in value position classifies by its TARGET cell, not its right-hand side
-  // (`widenClassifyExpr`) — the same peel all three widenings share.
+  // An f32 source promotes losslessly to f64, checked before the f64 fast-path: an
+  // arithmetic expression with an f32 operand emits as f32, yet `exprIsF64` also claims it
+  // via its float literal — without this check the f64 fast-path would emit f32 into an f64
+  // slot and trap. A pure-f64 expression is not `exprIsF32`, so it still takes the fast path.
   const f64Cls = widenClassifyExpr(exprIx)
   if exprIsF32(f64Cls, fnIx) {
     if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
@@ -13829,11 +13294,10 @@ export function emitExprAsF64(body: i32[], exprIx: i32, fnIx: i32) {
     return 0
   }
   if exprIsF64(f64Cls, fnIx) { return emitExpr(body, exprIx, fnIx) }
-  // A bare INT literal (optionally negated) re-encodes directly as `f64.const` — exact
-  // (f64.convert would produce the identical value), and it keeps a CONST-GLOBAL init a
-  // valid constexpr (`const xs: f64[] = [2]` — a convert op is not constant). Checked
-  // BEFORE the i64 branch so a big literal stays one `f64.const` too. Mirrors the
-  // `pendingF64` NumLit lowering and `emitExprAsF32`'s literal path.
+  // A bare int literal (optionally negated) re-encodes directly as `f64.const` — exact,
+  // and it keeps a const-global init a valid constexpr (a convert op is not constant).
+  // Checked before the i64 branch so a big literal stays one `f64.const` too, mirroring
+  // the `pendingF64` NumLit lowering and `emitExprAsF32`'s literal path.
   const f64Inner = unwrapParen(exprIx)
   const f64Node = P.nodes[f64Inner]
   if f64Node is NumLit {
@@ -13865,18 +13329,10 @@ export function emitExprAsF64(body: i32[], exprIx: i32, fnIx: i32) {
   0
 }
 
-// The DECIMAL TEXT of a (possibly signed) numeric literal at `exprIx`, with the sign FOLDED
-// into the text — `""` when the expression is not a literal. Peels grouping parens and ANY
-// NUMBER of unary minuses, which is exactly what the checker's `isFloatLitExpr` /
-// `isExactF32IntLitExpr` peel when they grant a literal the f32 flow.
-//
-// The recursion matters. Those predicates recurse; the emitter used to handle exactly ONE
-// minus, so the checker admitted a literal the emitter then failed to recognize as one and
-// lowered through the f64 path instead: `const x: f32 = -(-1.5)` was `vl check`-clean INVALID
-// WASM. A checker that grants more shapes than the emitter can lower is that whole defect
-// family's shape, so the two peels are now the same peel. `f32Bytes` parses a leading `-`, so
-// the folded sign costs no `f32.neg` and no lossy f64 round-trip. The iteration bound is a
-// guard, not a semantic limit — it keeps a malformed arena from spinning.
+// The decimal text of a (possibly signed) numeric literal at `exprIx`, sign folded into
+// the text, or "" when the expression is not a literal. Peels grouping parens and any
+// number of unary minuses, matching the checker's peel exactly — granting more shapes
+// than the emitter recognizes is invalid wasm. The iteration bound guards a malformed arena, not a semantic limit.
 function signedNumLitText(exprIx: i32) {
   let ix = unwrapParen(exprIx)
   let neg = false
@@ -13898,37 +13354,24 @@ function signedNumLitText(exprIx: i32) {
   ""
 }
 
-// Emit the expression at `exprIx` as an f32 value (Slice 5). If it already yields f32
-// (`exprIsF32`) it is emitted as-is. A bare (possibly signed) numeric LITERAL — float or
-// integer — is lowered directly as `f32.const`, re-encoded at single precision and never
-// demoted from f64. Otherwise it is an i32 expression flowing into an f32 op: evaluate as
-// i32, then convert with `f32.convert_i32_s` (0xb2). An i32 *variable* never reaches here —
-// the checker rejects i32→f32 as lossy (above 2^24 the i32 would round to the nearest f32),
-// so only a literal (exactness-gated by the checker) takes the direct path.
+// Emit the expression at `exprIx` as an f32 value: already-f32 emits as-is; a bare
+// (possibly signed) numeric literal lowers directly as `f32.const`, re-encoded at single
+// precision and never demoted from f64; otherwise an i32 expression converts with
+// `f32.convert_i32_s`. An i32 variable never reaches the convert path unliterally — the checker rejects i32→f32 as lossy above 2^24, so only an exactness-gated literal takes it.
 export function emitExprAsF32(body: i32[], exprIx: i32, fnIx: i32) {
-  // Peel parens to find a bare (possibly negated) numeric literal — a literal lowers DIRECTLY
-  // as `f32.const`, checked BEFORE the `exprIsF32` delegation. `emitExpr` lowers a bare `.`
-  // literal at f64 (its default) even when the checker typed it f32, so a context-ADOPTED f32
-  // field literal (`objRetWidenAdopt`) would else emit an `f64.const` into an f32 field —
-  // invalid wasm at `struct.new`. Float OR integer literals take the same re-encode, with the
-  // sign folded in by `signedNumLitText`.
-  //
-  // Direct `f32.const` beats the `i32.const` + `f32.convert_i32_s` pair the integer case used
-  // to emit on three counts: it is a CONSTEXPR, so an integer literal reaches an f32 field or
-  // element of a `const` global (the convert pair made those "constant expression required");
-  // it survives past the i32 range, where `parseI32` silently WRAPPED; and it is two bytes
-  // shorter. The VALUE is unchanged — `f32Bytes` rounds to nearest-even, as the convert did.
+  // Peel parens for a bare (possibly negated) numeric literal, checked before the
+  // `exprIsF32` delegation: `emitExpr`'s bare-literal default is f64, so a context-adopted
+  // f32 field literal would otherwise emit an `f64.const` into an f32 field — invalid wasm.
+  // Direct `f32.const` is also a constexpr, unlike the `i32.const` + convert pair, so an integer literal can still reach a `const` global's f32 field or element.
   const litText = signedNumLitText(exprIx)
   if litText != "" {
     fbF32Const(litText)
     return 0
   }
   // An already-f32-valued expression (a variable, an f32 arithmetic / call result) emits
-  // directly; only a bare numeric literal needed the direct-`f32.const` handling above.
-  // An ASSIGNMENT classifies by its TARGET cell (`widenClassifyExpr`), as the i64/f64
-  // widenings do. Both arms own their own width (`emitExprWideCleared`) — the literal is
-  // already handled above, so an f32 seed reaching here belongs to the position that set
-  // it and not to the i32 sub-positions inside this subtree.
+  // directly. An assignment classifies by its target cell (`widenClassifyExpr`), as the
+  // i64/f64 widenings do, and owns its own width (`emitExprWideCleared`) so an f32 seed
+  // reaching here belongs to the position that set it, not the i32 sub-positions inside it.
   if exprIsF32(widenClassifyExpr(exprIx), fnIx) {
     return emitExprWideCleared(body, exprIx, fnIx)
   }
@@ -13938,13 +13381,10 @@ export function emitExprAsF32(body: i32[], exprIx: i32, fnIx: i32) {
   0
 }
 
-// Lower `exprIx` in the REP of a value atom of kind `k` — the emit half of
-// `valBlockTypeOfKind`'s blocktype: i64 / f64 / f32 route through their widening
-// helper, every other kind (i32, boolean, and the ref atoms) through `emitExpr`.
-//
-// D-BLOCKTY: the four `??` / map-get residual sites each spelled this dispatch out
-// beside their own copy of the blocktype ladder, on the same code, so the two halves
-// of "what rep does this arm produce" now move together.
+// Lower `exprIx` in the rep of a value atom of kind `k` — the emit half of
+// `valBlockTypeOfKind`'s blocktype: i64/f64/f32 route through their widening helper,
+// every other kind (i32, boolean, the ref atoms) through `emitExpr`. Kept beside that
+// ladder so the two halves of "what rep does this arm produce" move together.
 function emitExprAsKind(body: i32[], exprIx: i32, k: i32, fnIx: i32) {
   if k == 3 { return emitExprAsI64(body, exprIx, fnIx) }
   if k == 4 { return emitExprAsF64(body, exprIx, fnIx) }
@@ -13952,22 +13392,14 @@ function emitExprAsKind(body: i32[], exprIx: i32, k: i32, fnIx: i32) {
   emitExpr(body, exprIx, fnIx)
 }
 
-// ── the numeric EXACT-OR-FAIL cast (D1041 / json-design §6 q2) ────────────────────────────
-// A numeric `as` to an INTEGER target succeeds iff the value is exactly representable there,
-// and otherwise fails as the trio fails everywhere: `as?` yields `null`, `as!` traps, a bare
-// `as` propagates the `null` to the enclosing `| null` return.
-//
-// THE TEST IS "INTEGRAL AND IN RANGE", not a round-trip compare, and the difference is
-// soundness rather than taste: `trunc_sat` + convert-back + `eq` is exact for `f64 → i32` but
-// NOT for the other three float pairs, because the convert-back ROUNDS and admits a value the
-// target cannot hold. THE BOUNDS ARE CONVERTED, NOT SPELLED — `i64.const` +
-// `f64.convert_i64_s` puts the ENGINE's rounding on the path, and that rounding decides each
-// upper test (`<=` where `convert(MAX)` is exact, `<` where it rounds up); every MINIMUM is a
-// power of two, so the lower test is `>=` at all four. NaN fails integrality for free.
+// ── the numeric exact-or-fail cast (D1041) ────────────────────────────────────
+// A numeric `as` to an integer target succeeds iff the value is exactly representable
+// there, else fails as the trio fails everywhere (`as?` null, `as!` traps, bare `as`
+// propagates). The test is "integral and in range", not a round-trip compare — a round-trip is exact only for `f64 → i32`, not the other three float pairs, since the convert-back rounds and admits a value the target cannot hold; NaN fails integrality for free.
 
-// `dom` is the EXACTNESS DOMAIN, not the rep target: `u8` names 0..255 inside the `i32` the
-// cast produces (D1587), so it is a third set of bounds over the same two comparisons. Both
-// `u8` bounds convert EXACTLY at f32 and f64, which is why its upper test is `<=` at both.
+// `dom` is the exactness domain, not the rep target: `u8` names 0..255 inside the `i32`
+// the cast produces (D1587), a third set of bounds over the same two comparisons. Both
+// `u8` bounds convert exactly at f32 and f64, which is why its upper test is `<=` at both.
 function emitNumExactTest(src: string, dom: string) {
   const u8Dom = dom == "u8"
   if src == "i64" {
@@ -14038,9 +13470,9 @@ function emitNumExactTest(src: string, dom: string) {
   0
 }
 
-// The conversion itself, reached only where `emitNumExactTest` has already proved it cannot
-// fail — so the TRAPPING instructions are used rather than the saturating ones: an operand
-// that reaches them is in range by construction, and if that were ever false a trap is the
+// The conversion itself, reached only where `emitNumExactTest` has already proved it
+// cannot fail, so the trapping instructions are used rather than the saturating ones: an
+// operand here is in range by construction, and if that is ever false a trap is the
 // honest outcome, not a silent clamp.
 function emitNumExactConvert(src: string, tgt: string) {
   if src == "i64" {
@@ -14058,18 +13490,10 @@ function emitNumExactConvert(src: string, tgt: string) {
   0
 }
 
-// THE `as!` TRAP'S REASON, streamed to the host boundary before the abort — the same two
-// imports `__trap__("reason")` uses (`__print_char__` then `__print_str_flush__`). Built as
-// CHARACTERS rather than a synthesized `StrLit` because a string literal minted at emit time is
-// invisible to the collect passes that intern `$sTypeIdx`: a program whose only string is this
-// message would emit a `ref.cast` at a heap index that was never allocated. `scanPrintUse`
-// reserves the four print imports for a fallible `as!` as it does for `__trap__`.
-//
-// AND THE WORDING IS SIZED, not chosen for prose. Every character is `i32.const` + `call`, so
-// the message is per-SITE code in a cold branch. `: not exact` says what D1041 says in D1041's
-// own word, and the LOCATION is the part a user cannot recover from the backtrace. If a program
-// ever carries enough of these to care, the fix is a module-tail helper taking `(line, col)` —
-// `gHelpStrHash`'s block is the pattern; it needs its own digit rendering, so it is not here.
+// The `as!` trap's reason, streamed to the host boundary before the abort (the same two
+// imports `__trap__("reason")` uses). Built as characters rather than a synthesized
+// `StrLit`, since a string minted at emit time is invisible to the collect passes that
+// intern `$sTypeIdx` — a program whose only string is this message would `ref.cast` at an unallocated heap index. The wording is kept short since every character costs `i32.const` + `call` per site (D1041).
 function emitNumCastTrapMsg(exprIx: i32, tgt: string) {
   let where = ""
   if exprIx >= 0 && exprIx < nodeToks.length {
@@ -14089,33 +13513,23 @@ function emitNumCastTrapMsg(exprIx: i32, tgt: string) {
   0
 }
 
-// THE `null` NODE a bare `as`'s early return hands to `emitReturnValue` — the propagated
-// value, spelled as the thing it is so the RETURN path's seeds (`emitNullLitNode`'s rep table)
-// serve it rather than a second ladder here guessing a null encoding per rep.
-//
-// MINTED FRESH PER SITE, not cached in a module `let`. A cached arena index outliving the
-// program that minted it is the exact hazard `emitProgram`'s sidecar-reset block describes,
-// and the LSP compiles many programs through one instance; a bare numeric `as` is rare enough
-// that one spare node per site costs nothing worth trading that for.
+// The `null` node a bare `as`'s early return hands to `emitReturnValue`, so the return
+// path's own seeds (`emitNullLitNode`'s rep table) serve it rather than a second ladder
+// guessing a null encoding per rep. Minted fresh per site, not cached in a module `let` —
+// a cached arena index outliving its program is the hazard `emitProgram`'s sidecar-reset guards against, and the LSP compiles many programs through one instance.
 function numCastNullNode(): i32 { mkNull("null", -1) }
 
-// The three modes, over one test and one conversion.
-//
-//   `as?`   a value-producing `if` whose result IS the `{tag, payload}` union box — the same
-//           rep the union `as?` arm builds and the same one `emitUnionCoerce`'s `NullLit`
-//           builds, so `!= null` on the result sees the null and every delivery position
-//           (binding, return, argument, field, element, global, `??`) already knows it.
-//   `as!`   the reason, then `unreachable`, then the conversion.
-//   `as`    the enclosing function's own `null`, then `return` — the early-exit shape the
-//           union arm's propagating mode uses, with the null built by the RETURN path so
-//           every nullable rep (box / niche / variant) is served by one ladder.
+// The three modes, over one shared test and conversion: `as?` is a value-producing `if`
+// whose result is the `{tag, payload}` union box (the same rep `emitUnionCoerce`'s
+// `NullLit` builds, so every delivery position already knows the null); `as!` is the
+// reason, `unreachable`, then the conversion; a bare `as` returns the enclosing function's own null (built by the return path) then the conversion.
 function emitNumExactCast(body: i32[], e: AsExpr, exprIx: i32, fnIx: i32) {
   const tgt = asExprNumTgtName(exprIx)
-  // THE DOMAIN AND THE TARGET ARE TWO NAMES (D1587): the domain decides the range test and the
-  // `as!` message, the target decides the conversion opcode and the box row. At `u8` they
-  // differ, everywhere else they are the same string.
+  // The domain and the target are two names (D1587): the domain decides the range test and
+  // the `as!` message, the target decides the conversion opcode and the box row. At `u8`
+  // they differ; everywhere else they are the same string.
   const dom = asExprNumCastDomain(exprIx)
-  // AN i32 SOURCE EXISTS ONLY AT THE `u8` DOMAIN, and it rides the i64 path rather than a
+  // An i32 source exists only at the `u8` domain, and rides the i64 path rather than a
   // fourth scratch slot: `i64.extend_i32_s` is exact for every i32, the range test is the
   // same two compares, and `i32.wrap_i64` brings the proven 0..255 value back unchanged.
   let src = asExprNumSrcName(exprIx)
@@ -14151,7 +13565,7 @@ function emitNumExactCast(body: i32[], e: AsExpr, exprIx: i32, fnIx: i32) {
     fbStructNew(nvb) // wrap the scalar payload
     fbStructNew(uBoxIdx)
     fbElse()
-    // THE NULL-TAGGED BOX, not a null box ref — what `T | null` means for a boxed union.
+    // The null-tagged box, not a null box ref — what `T | null` means for a boxed union.
     fbI32Const(nullBoxTag())
     fbRefNullNone() // the payload slot is unread under the null tag
     fbStructNew(uBoxIdx)
@@ -14238,18 +13652,10 @@ function emitAsCast(body: i32[], e: AsExpr, _exprIx: i32, fnIx: i32) {
   const obj = e.asObj
   const tgt = e.asTy
   if e.asMode == "wrap" { return emitNumWrapCast(body, e, _exprIx, fnIx) }
-  // UNION-OPERAND `as` — THE PROPAGATING CAST (`error-handling-design.md` §Trio). Checked
-  // ahead of the numeric ladder and disjoint from it by operand, exactly as the checker's arm
-  // is: the checker already proved the target is one of the operand's arms and that the
-  // REMAINDER fits the enclosing return, so all that is left is the lowering — evaluate the
-  // box ONCE into `$unionAs`, compare `struct.get $uBox 0` against T's tag, and on a miss
-  // `return` the WHOLE box. THE EARLY RETURN NEEDS NO COERCION: there is ONE box struct and
-  // the tag registry is global, so the operand's box already IS a value of the enclosing
-  // function's union return type.
-  //
-  // `m[k] as! V` — THE ASSERTED MAP READ, fused rather than routed through the box path: `as!`
-  // asserts the arm, so the probe's `entry` is the only question left and a miss is
-  // `unreachable`. Only `as!` — `as` and `as?` hand a `V | null` onward and both NEED the box.
+  // Union-operand `as` is the propagating cast (`error-handling-design.md` §Trio): evaluate
+  // the box once into `$unionAs`, compare its tag against T's, and on a miss `return` the
+  // whole box unchanged — no coercion needed, since one box struct and a global tag registry
+  // make it already a value of the enclosing function's union return type. `m[k] as! V` fuses the map probe directly instead: `as!` asserts the arm, so a miss is `unreachable`.
   if e.asMode == "trap" {
     const amk = mapReadScalarBoxKindTy(obj)
     if amk >= 0 {
@@ -14282,43 +13688,30 @@ function emitAsCast(body: i32[], e: AsExpr, _exprIx: i32, fnIx: i32) {
       }
     }
   }
-  // NUMERIC EXACT-OR-FAIL (D1041 / json-design §6 q2, owner 2026-09-02) — checked ahead of
-  // the union arm and disjoint from it by OPERAND, exactly as the checker's two arms are.
-  // Only a cast that CAN fail comes here; the lossless and float-target edges fall through to
-  // the plain conversion ladder at the bottom of this function, byte-identical.
+  // Numeric exact-or-fail (D1041) is checked ahead of the union arm and disjoint from it
+  // by operand, exactly as the checker's two arms are. Only a cast that can fail comes
+  // here; the lossless and float-target edges fall through to the plain conversion ladder at the bottom of this function, byte-identical.
   if asExprNumFallible(_exprIx) {
-    // THE PEEPHOLE the ruling names: `trunc(d) as! i32` / `floor` / `ceil` / `nearest`. The
-    // operand is integral by construction, so the only way the cast can fail is RANGE — and
-    // the trapping `i32.trunc_f64_s` at the bottom of this function already traps on exactly
-    // that. So the spelled lossy truncation costs the one instruction it always cost, with no
-    // test in front of it. `as?` and a bare `as` do NOT take this door: they owe a `null` on
-    // an out-of-range value, which a trap cannot produce.
-    // NOR DOES `u8` (D1587). The peephole rests on the conversion instruction enforcing the
-    // range on its own, and `i32.trunc_f64_s` enforces i32's range, not 0..255 — so
-    // `trunc(d) as! u8` over 300.0 would answer 300 with no trap in sight.
+    // The peephole: `trunc(d) as! i32`/`floor`/`ceil`/`nearest`. The operand is integral by
+    // construction, so the only way the cast can fail is range, and the trapping
+    // `i32.trunc_f64_s` below already traps on exactly that — no test needed. `as?` and a
+    // bare `as` never take this door (they owe a `null`, which a trap cannot produce), nor does `u8` (D1587): `i32.trunc_f64_s` enforces i32's range, not 0..255.
     const peep = e.asMode == "trap" &&
       asExprNumCastDomain(_exprIx) != "u8" &&
       exprIsIntegralFloat(obj, fnIx)
     if !peep { return emitNumExactCast(body, e, _exprIx, fnIx) }
   }
   if asExprIsUnionCastIn(_exprIx, fnIx) {
-    // The target arm's TYPE is the cast node's own recorded type — the checker set it to
-    // exactly the arm it proved. No spelling is resolved here.
-    // The TARGET arm's type. For `as` / `as!` the cast node's own recorded type IS the
-    // target; for `as?` the node is `T | null` (its result), so the nullable is peeled to
-    // recover `T`. Without the peel the tag and heap were derived from `T | null` — the
-    // wrong type — and the block's result type could not match the slot's.
+    // The target arm's type is the cast node's own recorded type — the checker set it to
+    // exactly the arm it proved. For `as`/`as!` that recorded type is the target directly;
+    // for `as?` the node's type is `T | null`, so the nullable is peeled to recover `T` —
+    // without the peel the tag and heap derive from the wrong type and the block's result type cannot match the slot's.
     let tty = nodeTyIxOf(_exprIx)
     if e.asMode == "null" { tty = tyPeelNul(tty) }
-    // THE TARGET'S ARMS, flattened. A SUB-UNION target (`as Shape` over
-    // `Circle | Rect | ParseError`, where `type Shape = Circle | Rect`) is the shape the error
-    // model produces the moment a program keeps a DOMAIN union and an error type apart and
-    // joins them at one boundary. It is the CHEAPER lowering, not a harder one: the result IS
-    // the box at a narrower type, so there is no unbox at all — only the membership test
-    // widens, from one tag compare to a chain over the arms.
-    //
-    // The flatten decides which shape this is rather than a `TyUnion` test: it pushes a
-    // non-union type as itself, so one arm means one tag.
+    // The target's arms, flattened rather than tested as `TyUnion`, so a non-union type
+    // pushes as itself and one arm means one tag. A sub-union target (`as Shape` over
+    // `Circle | Rect | ParseError` with `type Shape = Circle | Rect`) is cheaper, not
+    // harder: the result is the box at a narrower type, so only the membership test widens — one tag compare becomes a chain over the arms, with no unbox at all.
     const armTys: i32[] = []
     flattenVariantsInto(tty, armTys)
     const subUnion = armTys.length > 1
