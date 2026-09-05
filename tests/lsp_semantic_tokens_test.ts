@@ -145,6 +145,70 @@ Deno.test({
   }
 });
 
+Deno.test({
+  name: "wasm-tokens: a deep-`is` program's generated walkers reach no query family",
+  ignore,
+}, async () => {
+  // A `r is Cfg` over a json-shape type is a runtime shape walk, so a SECOND
+  // check pass generates predicate/builder functions as VL source, splices them
+  // onto the token stream and re-checks — with the symbol table on. Every table
+  // that re-check fills is one the editor reads, so the walkers arrived as
+  // semantic tokens, inlay hints and completions at lines past the end of the
+  // file. The three families are graded together because one guard serves them
+  // all: an occurrence at a generated token is never recorded.
+  // BOTH SPELLINGS: with an import the graph goes through the module pipeline,
+  // which has always run the second pass, and without one it takes the
+  // single-source path, which now does too. A guard wired for one is silent
+  // about the other.
+  const checker = loadWasmChecker(SEED, () => {})!;
+  const body = [
+    "type Json = null | boolean | f64 | string | Json[] | { [string]: Json }",
+    "type Cfg = { port: i32, host: string | null }",
+    "function a(r: Json): i32 { if r is Cfg { return bump(r.port) }  0 }",
+    "const m: { [string]: Json } = Map()",
+    "const n = a(m)",
+    "print(n)",
+    "",
+  ];
+  const util = "export function bump(x: i32): i32 {\n  x + 1\n}\n";
+  const reader = (k: string) => k.endsWith("util.vl") ? util : undefined;
+  const faces: [string, string, (k: string) => string | undefined, number][] = [
+    ["imported", `import { bump } from "./util"\n${body.join("\n")}`, reader, 1],
+    ["single-file", body.join("\n").replace("bump(r.port)", "r.port"), noSiblings, 0],
+  ];
+
+  for (const [face, src, read, off] of faces) {
+    const lines = src.split("\n").length;
+    const past = <T extends { line: number }>(xs: T[]) => xs.filter((x) => x.line >= lines);
+    const toks = await checker.tokensAt(src, "/proj/main.vl", read);
+    if (past(toks).length !== 0) {
+      throw new Error(
+        `${face}: tokens past the end of a ${lines}-line file: ${JSON.stringify(past(toks))}`,
+      );
+    }
+    const hints = await checker.inlayHintsAt(src, "/proj/main.vl", read);
+    if (past(hints).length !== 0) {
+      throw new Error(`${face}: inlay hints past the end: ${JSON.stringify(past(hints))}`);
+    }
+    const names = (await checker.scopeAt(src, "/proj/main.vl", read, 4 + off, 0))
+      .map((s) => s.name);
+    const generated = names.filter((n) => n.startsWith("__vl") || n.startsWith("__vj"));
+    if (generated.length !== 0) {
+      throw new Error(`${face}: walker names offered as completions: ${generated.join(" ")}`);
+    }
+    // And the user's own program is still fully classified — the guard must not
+    // have swallowed the source it was written to protect.
+    const want = face === "imported" ? "bump a m n" : "a m n";
+    if (names.join(" ") !== want) {
+      throw new Error(`${face}: want the bindings ${want}, got ${JSON.stringify(names)}`);
+    }
+    const nUse = toks.find((t) => t.line === 5 + off && t.char === 6);
+    if (nUse?.bindKind !== 0) {
+      throw new Error(`${face}: expected the \`n\` use as a variable, got ${JSON.stringify(nUse)}`);
+    }
+  }
+});
+
 // ---- kill-TS: the wasm LEXICAL slice + whole-document wasm-only assembly ------
 // `lexicalTokensAt` is the native counterpart of the TS `tokenize` + comment
 // scan; `semanticTokensDataFromWasm` assembles a whole document from the wasm

@@ -21,7 +21,7 @@ QUICK = a day, no design question. STRUCT = a design track.
 | 6 | String `+` in a loop is **O(n²)** (§D): a loop-local builder, with n-ary chain fusion as the down payment. The fusion once shipped in the TS core and was never ported | ×4.80 per doubling; 5.4× at 320 KB; ≥129 in-loop sites | M / L | rep layer | corpus byte-identity where the pattern is absent; a scaling pair "append N" vs "join N", ratio bar 2.5 — **a value fixture cannot pin a cost class** | STRUCT |
 | 7 | ✅ **LANDED (§F8)** — `unRowOfName`/`isUName` → `unRowBySid`, extended at all three pushes; `unionMemberSetOf` and `unionRowOf`'s first leg route through it | self **0.70% → 0.01%**, incl **1.33% → 0.26%** | M | index must extend at all 3 pushes | byte-identical seed; `regress.py`; the unions axis | STRUCT |
 | 8 | ✅ **LANDED in part (§B6)** — the shape is module-level BINDINGS, not call sites, and the definite-assignment set was 91% of it. Sid-keyed, the 8,000-rung falls 2.54 s → 1.07 s and `checkProgram` goes 57.5% → 1.8% inclusive; the residual is not the checker | **−58% at 8k, −66% at 16k** | M | — | a 4-rung absolute ladder with an exponent bar (`scripts/perf/check-scaling.sh`) | STRUCT |
-| 9 | LSP re-checks the WHOLE module graph per keystroke — 30 modules. **Measured (§C2a): 72% is `checkProgram` over the MERGED program**, so the per-module cache §C2 named has a 28% ceiling; its staging half is **LANDED (§C2c)**, −14.5% | editor latency, not CI | M / L | — | a keystroke ladder at 1 / 4 / 30 modules; the cross-file invalidation in both directions | STRUCT |
+| 9 | LSP re-checks the WHOLE module graph per keystroke — 30 modules. **Measured (§C2a): 72% is `checkProgram` over the MERGED program**, so the per-module cache §C2 named has a 28% ceiling; its staging half is **LANDED (§C2c)**, −14.5%, and the edit→hover pair is **LANDED (§C2d)**, 2 graph checks → 1. What is left is the merged half (§C2b), a track | editor latency, not CI | M / L | — | a keystroke ladder at 1 / 4 / 30 modules; the cross-file invalidation in both directions; graph checks per request | STRUCT |
 | 10 | `declaredSlotOf` → per-function side index built in `buildLocals` | **1.1%** self time | M | reset per function, 5 sites | byte-identical seed; `regress.py` | STRUCT |
 | 11 | `fnStmtsPosOf` → reverse index `nodeIx → fe` after mono: 19,106 calls, **25.9 M scan steps** | closures axis 2.22 → ~1 | M | 1 in-place write, `emit_mono.vl:6353` | byte-identical seed; the closures axis under its 3.2 bar | STRUCT |
 | 12 | Destringify type names — `tyTopIndexOf` is a per-CHARACTER walk over a type-name string, **4.94% self** | 4.9% plus most of `__str_eq__`'s tail | L | canon / rep | `docs/internals/registry-by-type-id.md` steps 4–6; byte-identity | STRUCT |
@@ -485,10 +485,7 @@ in it, and the type arena is still keyed on rendered names.
 
 Two smaller findings from the same measurement, named here rather than lost:
 
-* **An edit followed by a hover pays TWO whole-graph checks.** `check()` runs `checkSrc` —
-  it alone runs the deep-`is` second pass, so it reports a diagnostic the symbol check does
-  not — and clears the memo's `checked` flag; the hover then runs `checkSrcSym`. One call
-  serving both needs that second pass moved, not the memo changed.
+* **An edit followed by a hover was TWO whole-graph checks** — closed in §C2d.
 * **`checkSrcSym` records occurrences for all 30 modules** and the editor asks about one.
 
 ### C2c · The staging half, and the cache that was already there
@@ -549,6 +546,53 @@ than the 60 ms `push` column because a skipped commit also skips the guest's own
 105, five interleaved rounds read 892 / 656 / 1,303 / 834 / 1,947 ms against 820 / 1,569 /
 698 / 541 / 1,046 — the timing is buried, while `30 → 1 pushed, 29 cached` reproduces on
 every round. Quote the counts wherever the box is not quiet.
+
+### C2d · The edit and the hover after it, on one check
+
+A keystroke makes four requests and they were paying three whole-graph checks:
+
+| case | arm | change | +hover | +tokens | +inlay | burst |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| any of 1 / 4 / 30 modules | before | 1 | **1** | 0 | 1 | **3** |
+| any of 1 / 4 / 30 modules | after | 1 | **0** | 0 | 1 | **2** |
+
+Two things were in the way, and neither is the memo.
+
+**The entries disagreed about diagnostics.** `checkSrc` ran the deep-`is` second pass on the
+single-source path and `checkSrcSym` did not, so the diagnostics pass could not ride the
+symbol-aware check — a program whose only error is a walker the rewrite cannot route would
+have published clean. The module pipeline always ran the pass for both, so this was a
+single-source-only split; `checkSrcSym` now runs it there too. Over `tests/cases`, master's
+two entries disagree on **1 of 2,786** programs and this branch's on **0** — the corpus
+already carried the witness (`unions/error-deep-is-arm-rebinds-receiver.vl`). The host gates
+on a `checkSymDiagsComplete` probe, because diagnostics is the one surface that may not
+degrade against an older seed.
+
+**And the check ran FIRST of the three.** `onDidChangeContent` also runs `lint` (a parse-only
+pass over the same instance) and the unused-export hints' `moduleSurface` (which resets the
+module table); each discards a checked graph, so whatever the check left was gone before the
+hover asked. `server.ts` runs the check LAST.
+
+`scripts/perf/lsp-keystroke.ts`'s PAIR section times both orders. Both arms in one process,
+rounds interleaved, medians of 5 at load 96 → 68:
+
+| case | before | after | speedup | checks |
+| --- | ---: | ---: | ---: | --- |
+| 1 module | 0.7 ms | 0.8 ms | 0.97x | 2 → **1** |
+| 4 modules (std) | 39.6 ms | 21.6 ms | 1.83x | 2 → **1** |
+| `compiler/entry.vl` (30) | **3,372 ms** | **2,005 ms** | **1.68x** | 2 → **1** |
+
+The speedup is under 2x because a symbol-aware check is not free: staged identically,
+`checkSrcSym` is **1.8–2.0x** `checkSrc` on the 30-module graph, which is §C2b's other finding
+(occurrences recorded for all 30 modules) priced. Before was one of each, after is one
+symbol-aware check. Two earlier runs of the same ladder read 1.21x at load 15 → 81 and 1.43x
+at load 89 → 62; the count is the robust half.
+
+**The second pass leaked its generated code into every query family, and had since the module
+pipeline shipped.** It splices walkers onto the token stream and re-checks with the symbol
+table on, so an 8-line file reported **29 semantic tokens and 10 inlay hints past its own end**
+and offered `__vlJsonIs_0` and friends as completions. An occurrence at a generated token is
+now never recorded — the rule the style tier already applied through `jwTokIsGenerated`.
 
 ---
 
