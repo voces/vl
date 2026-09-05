@@ -391,6 +391,107 @@ not have `collectA`'s prefix shape: it rebuilds a per-function return-kind table
 `monoModuleLetOf` is 14.14% self and `recordRedundantAnnot` 7.01%. `collectA`'s own residue is
 0.76%, and all of it is the field-table phase this design deliberately re-runs.
 
+### B8 · `buildFnMap`'s ten columns, and why six need a row cache
+
+Re-measured on 4b0af3a47, `--names` seed, `genPins(N, true)`, `VL_PROFILE_GUEST` +
+`profile-rank.py`: `buildFnMap` is **10.61% inclusive at 400 pins and 18.58 – 20.38% at 800**
+over three interleaved pairs, and **89.9 – 95.1%** of what is left of `monoRebuild`. B7's
+estimate of 18.71% was one merge behind and reads high or low depending on which of the six
+landings since is in the denominator; the SHAPE it named is the shape measured. Its children at
+800 pins:
+
+| immediate child of `buildFnMap` | % of it | % of compile |
+| --- | ---: | ---: |
+| `retAnnKindChain` | 48.71 | 9.57 |
+| `refArrElemNameIf` | 15.52 | 3.05 |
+| `sidOfNode` | 9.91 | 1.95 |
+| `retVoidAnnFlag` | 8.62 | 1.69 |
+| `sidArrPut` | 6.47 | 1.27 |
+| (self) | 5.17 | 1.02 |
+| `retStructIndex` | 2.59 | 0.51 |
+
+There is no walk here — the pass is one loop over `fnStmts`, and every row is a pure function
+of that function's own `FuncDecl` node plus the registries the return classifiers consult. So
+it is not a resume, it is an INDEX with an append, which is what B7 predicted.
+
+**What the pass writes, and what a suffix can extend.** Ten columns, and the split is not by
+shape but by who else writes them.
+
+| column | seeded from | written after `buildFnMap`? | prefix treatment |
+| --- | --- | --- | --- |
+| `fnNames`, `fnIndices` | `s.fnName`, `i` | no | **keep** — the live prefix already is the answer |
+| `fnIndexBySid` | `sidOfNode`, first-occurrence | no (only the per-program reset) | **keep** — first-wins over prefix then suffix is first-wins over the whole |
+| `nestedNameBySid` | `fnParent[i] >= 0` | no | **keep** — monotone set-to-1 |
+| `fRetVoid` | `retVoidAnnFlag` | `computeVoidFns`, `emit_rewrite` | **re-seed from the cache** |
+| `fRetStructIdx` | `retStructIndex` | `computeRetInference` | re-seed |
+| `fRetRArrElem` | `retRefArrElemName` | `computeRetInference` | re-seed |
+| `fRetBool` | `retBoolFlag` | `computeRetInference` | re-seed |
+| `fRetKind` | `retAnnKindChain` | `computeRetInference` | re-seed |
+| `fRetLitAtom` | the constant 0 | `computeVoidFns`'s literal-atom arm | re-seed (write 0) |
+| `fnChildHead` / `fnChildNext` | — | lazily rebuilt on demand | cleared every call, as before |
+
+**The refinement is why a cache is needed at all.** `computeVoidFns` and `computeRetInference`
+run straight after `buildFnMap` and write into those six columns in place, so what stands in
+them at the next call is a REFINED value where a full re-mint would put the annotation's own.
+Keeping them would hand round k+1 round k's fixpoint as its seed — and that fixpoint is a
+function of the whole arena, not of one function, so it is not stable under a callee rename.
+The cache banks the seed row by row as each function is classified, and the resume writes it
+back. That makes the resumed pass produce exactly what a full re-mint produces, for every
+program, whether or not anything was minted.
+
+**The invalidation rule** is `collectA`'s seven registry lengths — `retStructIndex` reads the
+struct table and the variant rows, `retAnnKindChain` the union names, `refArrElemNameIf` the
+struct table — plus one signal `collectA` does not need. The walk `collectA` resumes reads
+`P.nodes`; `buildFnMap` reads `P.nodes[fnStmts[i]]` and `fnParent[i]`, and the monomorphizer
+re-points BOTH in place: `fnStmts[tSlot] = clone`, `fnStmts[origFe] = nfn`, `fnStmts[gp] =
+mkFunc(…)`, `fnParent[s] = parentSlot`, `fnParent[msl] = instFe`. Five sites, all in
+`emit_mono.vl`, each of which would re-classify a function the prefix already covers — so each
+calls `buildFnMapNoteFnSlotWrite()` and `tests/vl_mono_arena_tick_test.ts` gained a third rule
+that requires it, validated against its own control and against a live one (deleting the note
+at `emit_mono.vl:3554` makes the suite name that line). The rule also covers `.fnRet =` and
+`.fnName =`, which have no site in `emit_mono.vl` today — the fifteen `fn.fnRet =` writes are
+`synthRetAnnots`' in `emit_rewrite.vl`, outside the armed window, and the two `.fnName =` are
+the module merge and `collectFns`' lambda naming, both earlier. That arm is forward-guarding,
+and it is there because a `monoArenaTouch()` is NOT a substitute for the note: the bump makes
+`monoRebuild` RUN, and a run whose prefix is still armed re-seeds the stale row.
+
+The `Param` writes and the four callee renames are the ones this pass does NOT care about: it
+reads no parameter and no call node. Nor does it need `T.tys` or `nodeTyIx` in the predicate:
+the tree has **zero** in-place `T.tys[…] =` writes, and the only in-place `nodeTyIx` write
+during emit is `nodeTyCarry`, called twice from `emit_rewrite.vl` and never from the armed
+window. The resume is armed by `monoRebuild` alone, for B7's reason, and unarmed everywhere
+else — so only a run inside that window banks a prefix.
+
+**Measured on 4b0af3a47**, `--names` seed both arms, min of five interleaved, box load 24–38:
+
+| | 200 pins | 400 pins | 800 pins |
+| --- | ---: | ---: | ---: |
+| master, CPU seconds | 0.170 s | 0.380 s | 1.150 s |
+| after, CPU seconds | 0.170 s | 0.330 s | **0.890 s** |
+| master, wall clock | — | — | 0.844 s |
+| after, wall clock | — | — | **0.661 s** |
+
+At 800 pins `buildFnMap` goes **18.58 – 20.38% inclusive → 0.25 – 1.58%** and `monoRebuild`
+**20.65 – 22.61% → 2.75 – 3.44%**, of which `buildFnMap` is 1.45, `collectA` 1.05,
+`computeVoidFns` 0.39 and `computeRetInference` 0.13 — the pass table's four rows now cost
+about the same as each other. Guest samples at 800 pins fall 1,011 – 1,181 to 760 – 801.
+The `generic pins` axis reads **0.80 – 1.06 against master's 0.88 – 1.20** over five
+interleaved rounds; both arms clamp on the harness's 0.4 s floor at 400 pins, so the bar STAYS
+at 2.5 — below the family default would be a bar on noise, not on a shape.
+
+**The self-compile is a wash, and the reason is worth recording**: `monoRebuild` is **0.00% of
+the compiler compiling itself** — the compiler's own generics mint few enough instances that
+the pass never repeats. So the L2 CPU reads 4.97 – 6.38 s against 4.93 – 6.26 s over five
+interleaved rounds, which is load, not signal, and the fixpoint proves nothing about the
+resume. What DOES exercise it is `tests/cases`: an `emitFail` probe on the resume branch
+(validated both ways — it fires on the many arm, is silent on the one arm and on the compiler)
+says **167 of the 2,983 modules take the resume**, across generics 59, functions 24, std 16,
+soundness 12, closures 11, inference 9 and six more directories. All 167 are byte-identical
+under both seeds.
+
+What is left at 800 pins: `__str_eq__` 15.36% self, `recordRedundantAnnot` 11.61% self (11.86%
+inclusive), `numLexIsFloat` 2.75%, `sidOfNode` 2.25%. `recordRedundantAnnot` is now the largest
+named frame and it is not in `monoRebuild` at all.
 
 ---
 
