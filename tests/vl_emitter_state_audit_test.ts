@@ -17,6 +17,8 @@
 // one program after another on ONE instance — loses its entry in the same PR.
 //
 // GATING: none. The script reads `compiler/*.vl` as text; no seed, no binary.
+//
+// @test-timing native
 
 import { ROOT } from "./support/tree.ts";
 

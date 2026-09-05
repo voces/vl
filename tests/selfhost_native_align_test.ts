@@ -39,6 +39,9 @@
 // GATING: env-gated (`SELFHOST_NATIVE_ALIGN=1`) AND requires the built binary + seed
 // wasm; absent either, every case registers as ignored with a one-line how-to-build
 // note (so a plain `deno task test` stays fast and green; CI's native job opts in).
+//
+// @test-timing native
+// @test-timing sweep n=2328 name~"native-align setup"
 
 import { COMPILER, ROOT, VL, exists } from "./support/tree.ts";
 

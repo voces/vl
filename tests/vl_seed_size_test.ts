@@ -10,6 +10,8 @@
 // one byte past it fails. It also pins the two non-obvious behaviours the gate
 // depends on: shrinkage passes (it is not a size TARGET), and an absent seed exits
 // 0 with a line saying so, because the `ci` job never builds one.
+//
+// @test-timing native
 
 import { ROOT } from "./support/tree.ts";
 

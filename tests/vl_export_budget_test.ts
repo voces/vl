@@ -11,6 +11,8 @@
 // gate row rests on: any export the tree stops referencing fails CI.
 //
 // Pure Python + a file walk — no seed, no binary, so it runs everywhere.
+//
+// @test-timing sweep n=30
 
 const ROOT = new URL("../", import.meta.url).pathname.replace(/\/$/, "");
 const SCRIPT = `${ROOT}/scripts/export-budget.py`;

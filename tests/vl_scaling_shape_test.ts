@@ -10,6 +10,8 @@
 // One pair per axis a pass could accidentally multiply over. The "many" arm spreads the
 // same work over N entities, the "one" arm over N/K. Method and profiles:
 // docs/internals/profiling-the-compiler.md.
+//
+// @test-timing instrument
 
 // THREE AXES ARE SUPER-LINEAR TODAY and carry a bar above their measured ratio rather
 // than the default. That is recorded DEBT, not tolerance: each names the function that
@@ -280,16 +282,18 @@ axis(
 axis("types", 2.5, "A per-declaration cost is scaling with the type table.", (d) =>
   twoFiles(d, genTypes(2500, 1), genTypes(2500, 20)));
 
-// Median 1.14 (min 1.00, max 2.38) over twelve runs at load 33 to 40, against 1.46 (min
-// 1.33, max 1.86) for the same pair interleaved beside it; the many arm falls 0.370 s to
-// 0.285 s while the cheap arm holds at 0.19 s, which is the control saying only one side
-// moved. The 0.25 floor keeps the quotient from being an absolute budget on the many arm.
-// The bar stays at 3.5 because a spike, not a mechanism, sets the top of the sample: the
-// 2.38 above is one reading among eleven under 1.51, and 3.82 was drawn at load 350.
+// Median 0.86 (0.85 to 0.92) over twelve runs at load 30, against 0.94 (0.93 to 1.00) for the
+// same pair interleaved beside it, and 1.34 against 1.48 over twelve at load 125 to 235. The
+// many arm is 0.215 s and the cheap one 0.160 s, so the 0.25 floor — not the cheap arm — is
+// the denominator, and the reading is an absolute budget of 0.86 on a 0.25 s allowance.
+// The bar is four times that reading, which is the finding: doubling what this pair still
+// costs would read about 1.7, so no bar catches that. What it does catch is a new per-entity
+// scan, which is what all five terms taken off this axis were, because that multiplies by the
+// statement count. The margin comes back from a bigger N, not from a lower bar.
 axis(
   "unions",
   3.5,
-  "`assignTags` (compiler/emit_collect.vl) ranks every variant signature against every other one.",
+  "`buildVariantTwins` (compiler/emit_classify.vl) compares every ordered pair of variant signatures.",
   (d) => twoFiles(d, genUnions(800, 1), genUnions(800, 20)),
   0.25,
 );

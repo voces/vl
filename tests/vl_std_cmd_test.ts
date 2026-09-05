@@ -21,6 +21,8 @@
 // out loud instead of failing.
 //
 // GATING: env-gated (`SELFHOST_NATIVE_ALIGN=1`) + needs the built binary.
+//
+// @test-timing native
 
 import { ROOT, VL, exists } from "./support/tree.ts";
 

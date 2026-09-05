@@ -20,6 +20,8 @@
 // The `vl_` prefix is load-bearing — it is one of the globs `ci-native` auto-discovers
 // (see tests/ci_seed_coverage_test.ts); a seed-backed test matching neither glob nor an
 // explicit ci.yml step runs nowhere in CI.
+//
+// @test-timing native
 
 import { COMPILER, VL, exists, nativeEnv } from "./support/tree.ts";
 

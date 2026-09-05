@@ -1,6 +1,8 @@
 // The LOOP-SHAPE rows of the release suite (`LOOP_TABLE`) and the `-O3` @log
 // replay over `CASES_LIST`. Their own file so `deno test --parallel` can run
 // them beside the shape/melt rows; the machinery is in the shared support module.
+//
+// @test-timing opt
 import {
   CASES,
   CASES_LIST,
