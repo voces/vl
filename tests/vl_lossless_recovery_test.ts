@@ -537,16 +537,27 @@ Deno.test({
         "arity",
         "function f(a: i32, b: i32) { a + b }\nprint(f(1 2 3))\n",
       );
+      // Report order is by POSITION, and the arity error spans the whole call
+      // `f(1 2 3)` — so it starts before the two separator notes inside it.
       const want = [
+        "wrong number of arguments: expected 2, got 3",
         "expected `,` but found `2`",
         "expected `,` but found `3`",
-        "wrong number of arguments: expected 2, got 3",
       ];
       if (
         errs.length !== want.length ||
         errs.some((d, i) => d.message !== want[i])
       ) {
         throw new Error(`want ${JSON.stringify(want)}, got: ${fmtDiags(errs)}`);
+      }
+      // THE SPAN, NOT JUST THE MESSAGE. `print(f(1 2 3))` puts `f` at 1-based
+      // column 7 and the call's `)` at 14, so the call is `[7, 15)`. The old
+      // closing-paren anchor was `[14, 15)` and fails this line.
+      const arity = errs[0];
+      if (arity.col !== 7 || arity.endCol !== 15) {
+        throw new Error(
+          `arity error spans the call: want 7..15, got ${arity.col}..${arity.endCol}`,
+        );
       }
     });
   },
