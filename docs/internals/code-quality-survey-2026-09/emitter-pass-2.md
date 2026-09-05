@@ -232,6 +232,23 @@ stays — lowering it is not what would restore detection. `genUnions(800, …)`
 on the axis is `buildVariantTwins` (**16.21% inclusive**), which is §2.3's own step 3: intern
 the signature and the pair search's residue becomes an integer compare.
 
+**Step 3 landed, and row 1 is closed.** `sigIds` interns each signature once per row, so the
+D1023 arm compares integers: `buildVariantTwins` **14.44 → 4.40%** inclusive at 3,200 unions,
+with `__str_eq__` under it (5.50% of the compile) and `variantSig` self (3.96%, 98.8% of it
+under this loop) both off the frame list. **No emitter frame on this axis is above 5% now**;
+what is left at the top of a 3,200-union profile is the CHECKER's definite-assignment join
+(`daAddSid` 10.46% inclusive under `daJoinInto`/`daRestore`), which is `typecheck.vl` and a
+different axis's question.
+
+**And the axis itself was resized, which is the finding this section ends on.** At 800 unions
+the cheap arm ran 0.16 s under a 0.25 s floor, so the gate reported an absolute budget on the
+many arm rather than a ratio. The pair is `genUnions(2400, …)`, where the cheap arm is 2.4 to
+3.2x the floor; the reading is 1.28 to 1.40 median over 44 interleaved rounds spanning load 22
+to 235 against master's 1.42 to 1.48, and the bar comes off the super-linear ladder — the
+family default would be **2.5**, set to **3.0** because one round of the 44 drew 2.30, which
+leaves 2.5 a headroom of 1.09x. 3.0 is 1.3x that worst round, and the control that fixes it is
+the pre-#2630 compiler reading **4.42** on the same pair. The row's wall grows **+0.52 s**.
+
 ---
 
 ## 3 · The four axes, profiled
