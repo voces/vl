@@ -73,6 +73,11 @@ run "lsp suites (ci list)"     env SELFHOST_NATIVE_ALIGN=1 bash -c \
 # absent). Measured 2026-09-01: byonm graded three different answers across
 # those three layouts under deno 2.9.6's nearest-manifest rule.
 run "lsp typecheck"            deno check --node-modules-dir=none --config lsp/deno.json lsp/src/*.ts
+# Same hole, for lint: root deno.json's top-level `exclude` drops lsp/ from the
+# "deno lint" row below too, silently — even a path passed explicitly on the
+# CLI is skipped. lsp/deno.json carries no exclude, so linting through it sees
+# lsp/src/. Mirrors ci.yml's "Lint (lsp)" step.
+run "lsp lint"                 deno lint --config lsp/deno.json lsp/src/
 run "native-fixpoint"          bash scripts/native-fixpoint.sh
 # THE L2 TRIPWIRE. Its own build rather than native-fixpoint's stage-4 number, because
 # the rows here are independent by construction and the two run concurrently — one extra

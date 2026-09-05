@@ -45,7 +45,7 @@
 // including the formatter's one-liner.
 
 import type { LspRange } from "./typeFeatures.ts";
-import { type LexToken, tokenize } from "./vlLex.ts";
+import { tokenize } from "./vlLex.ts";
 
 // ---- the discovered tree -----------------------------------------------------
 
