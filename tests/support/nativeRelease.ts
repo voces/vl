@@ -363,33 +363,36 @@ export const BYTES_TOL_MIN = 16;
 export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3: ShapePins }> = [
   // CLOSURE DISPATCH, the devirtualisable case. `meta.json` records 0.048s for a direct call
   // against 0.666s for the same body reached through a lambda value (14x), and that `-O`
-  // "collapses the lambda phases back to 0.033s". `indirect` is where that lives: 2 at `-O`,
-  // 0 at `-O3` — the release profile's `--closed-world` refinement is what turns the two
-  // call sites direct, and `allocs` 1 -> 0 is the closure record melting behind it.
-  // SHOULD MOVE IF: closure calls stop lowering to `call_indirect` (a rep change), or `-O3`
+  // "collapses the lambda phases back to 0.033s". `indirect` is where that lives, and it is
+  // now 0 at BOTH rungs: the element segment lists only the functions whose address is taken,
+  // so binaryen sees a two-entry table and `Directize` resolves both call sites without the
+  // release profile's `--closed-world`. `fns` 5 -> 3 is the DCE behind it — a listed function
+  // is a use, so the every-function segment was rooting every function in the module.
+  // SHOULD MOVE IF: closure calls stop lowering to `call_indirect` (a rep change), or `-O`
   // stops devirtualising them. Either is the 14x coming back.
   {
     bench: "algorithms/lambda-hot",
     axis: "closure call in a hot loop, four spellings",
-    O: { bytes: 389, fns: 5, allocs: 1, indirect: 2 },
-    O3: { bytes: 272, fns: 1, allocs: 0, indirect: 0 },
+    O: { bytes: 351, fns: 3, allocs: 1, indirect: 0 },
+    O3: { bytes: 269, fns: 1, allocs: 0, indirect: 0 },
   },
   // HIGHER-ORDER BUILTINS. `xs.map(f).filter(g)` plus a `reduce`: the one shape where
   // `meta.json` records reaching for the builtin costing VL 2.01x against its own hand-written
   // loop, while Rust and V8 charge 0.86x and 0.79x. Same devirtualisation story as lambda-hot
-  // and the same 2 -> 0, on the idiomatic spelling rather than a synthetic one.
-  // SHOULD MOVE IF: the callback stops being devirtualised at `-O3`, or the pipeline's
+  // and the same 0 indirect at both rungs, on the idiomatic spelling rather than a synthetic
+  // one.
+  // SHOULD MOVE IF: the callback stops being devirtualised at `-O`, or the pipeline's
   // intermediate arrays stop melting (`allocs`).
-  // `-O` re-read 946 -> 976 when `std:array` gained `filled`, and only 5 of the 30 is that
-  // export: this file's std at the previous reading measures 971 here, so 25 had already
-  // drifted inside the ±28 band. The 5 is what an UNUSED std export costs — one functype
-  // entry and one funcref table slot, no body, the elem pointing at the trap stub — and
-  // `-O3` is unchanged at 708, so `--closed-world` strips every byte of it.
+  // `-O` read 946 -> 976 when `std:array` gained `filled`, and only 5 of the 30 was that
+  // export: an UNUSED std export cost one functype entry and one funcref table slot, no body,
+  // the elem pointing at the trap stub. The narrowed element segment takes that slot back, and
+  // with the table down to the callbacks `-O` reaches the shape `-O3` used to need
+  // `--closed-world` for — 976 -> 869 bytes, 7 -> 4 fns, 10 -> 8 allocs, 2 -> 0 indirect.
   {
     bench: "algorithms/map-filter-reduce",
     axis: "map/filter/reduce callback pipeline",
-    O: { bytes: 976, fns: 7, allocs: 10, indirect: 2 },
-    O3: { bytes: 708, fns: 1, allocs: 8, indirect: 0 },
+    O: { bytes: 869, fns: 4, allocs: 8, indirect: 0 },
+    O3: { bytes: 688, fns: 1, allocs: 8, indirect: 0 },
   },
   // THE CONTROL FOR THE TWO ABOVE. A four-way dispatch table is genuinely dynamic, so
   // `meta.json` records that `-O3` does NOT help here (1.469s vs 1.331s) — binaryen cannot
@@ -405,8 +408,12 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // strings, and a string is now a HEADER over a backing — two `*.new` sites where it used
     // to be one. `-O3` is unmoved at 14, so `--closed-world` melts every header the extra
     // sites introduced. `indirect` is the row's real axis and did not move.
-    O: { bytes: 696, fns: 6, allocs: 22, indirect: 2 },
-    O3: { bytes: 466, fns: 6, allocs: 14, indirect: 2 },
+    // `fns` 6 -> 5 and the bytes with it when the element segment narrowed to the
+    // address-taken functions: one function was reachable only as a table entry. `indirect`
+    // stayed 2 at both rungs while lambda-hot and map-filter-reduce went to 0, which is this
+    // row discriminating a dynamic target from a devirtualisable one, exactly as intended.
+    O: { bytes: 672, fns: 5, allocs: 22, indirect: 2 },
+    O3: { bytes: 453, fns: 5, allocs: 14, indirect: 2 },
   },
   // TAIL CALLS. `meta.json` still carries the `vlDefect` entry from when VL emitted a plain
   // `call` in tail position; the emitter now emits `return_call`, and the same entry measures
