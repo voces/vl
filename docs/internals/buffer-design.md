@@ -855,7 +855,8 @@ callee-position skip) still needs no such pairing.
   `vl_exported_memory_test.ts`.
 - **THE LOCAL GATE RUNS A DIFFERENT COMMAND THAN CI, and that gap cost a round-trip.**
   `deno task test` is `deno test -A --no-check --parallel tests/`. `ci-native` additionally runs
-  **`deno test -A tests/cases_wasm_test.ts` without `--no-check`** — that single step is the repo's
+  **`deno test -A tests/cases_wasm_*_test.ts` without `--no-check`** (the four shards `cases_wasm_test.ts`
+  split into, #2451) — that step is the repo's
   TypeScript gate, and it type-checks `tests/support/runWasm.ts` transitively. A `TS2339` in the
   host adapter passed every local leg (fixpoint, lint-self, 2,122 tests, corpus A/B, 25,200 fuzz
   programs) and failed CI immediately. **A green local gate is evidence about the local gate.** The
@@ -1214,7 +1215,8 @@ expectation is the python `struct` encoding of the value, never hand-derived (§
   code beside it, so the next reader does not mistake it for covered. The guard that IS reachable and
   cheap — `Buffer(2147483647)`, which traps BEFORE attempting any growth — is pinned instead.
 - **The `std:buffer` fixtures reach the corpus oracle but not the NATIVE alignment suite.**
-  `tests/cases_wasm_test.ts` walks `tests/cases/**` and picked all 11 up automatically;
+  The `tests/cases_wasm_*_test.ts` shards (`tests/cases_wasm_test.ts` at the time this was
+  written) walk `tests/cases/**` and picked all 11 up automatically;
   `tests/selfhost_native_align_test.ts` carries EXPLICIT whitelists (deliberately, so it does not
   regress when a parallel PR grows another list), so new cases are invisible to it until someone adds
   them. All 11 were adjudicated natively by hand for this change — `vl run` stdout equal to the
@@ -1783,7 +1785,9 @@ Ten fixtures, all under `tests/cases/std/`:
   aliasing the same bytes, a partially-overlapping offset view, and `byteAddrF32` deltas.
 - `buffer-view-index-past-end-traps.vl`, `-negative-index-traps.vl`, `-write-past-end-traps.vl` —
   the three bounds traps. **They carry no `@log`**, deliberately: the harness ignores `@log` when
-  `@trap` is set (`cases_wasm_test.ts:453`), so log lines on a trap case are decoration that
+  `@trap` is set (`tests/support/casesWasmOracle.ts:520`, the shared oracle the
+  `cases_wasm_*_test.ts` shards now import — `cases_wasm_test.ts:453` before the #2451 split),
+  so log lines on a trap case are decoration that
   asserts nothing. Their inverted controls are separate `@run` files.
 - `buffer-view-bounds-control.vl` — the inverted control for all three, and the §L3 measurement:
   every address those cases reach for is read here through `Buf`'s unfenced accessors and every read
