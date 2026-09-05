@@ -184,13 +184,35 @@ def member_index(sets):
 FN_HEAD = re.compile(r"^(?:export )?function ([A-Za-z_]\w*)\s*[(<]")
 
 
+def fn_end(lines, lo, hi):
+    """The line the function opening at `lo` closes on — `lo` itself for a one-liner,
+    and `hi` when the braces never balance, so a source this cannot read keeps the
+    whole-range answer. Mirrors `klFnEnd` in compiler/lint.vl (D1642); `strip_line`
+    blanks literal CONTENT, so a brace inside a string never counts."""
+    depth, opened = 0, False
+    for n in range(lo, hi + 1):
+        for ch in strip_line(lines[n]):
+            if ch == "{":
+                depth += 1
+                opened = True
+            elif ch == "}":
+                depth -= 1
+        if opened and depth <= 0:
+            return n
+    return hi
+
+
 def functions(lines):
     """(name, first line index, last line index) for every TOP-LEVEL function, by
-    column-0 `function` headers. The body runs to the line before the next one."""
+    column-0 `function` headers. The body runs to the line its braces close on, and
+    never past the next header — a module's trailing top-level statements are not the
+    last function's body (D1642)."""
     heads = [(i, m.group(1)) for i, ln in enumerate(lines) for m in [FN_HEAD.match(ln)] if m]
     out = []
     for k, (i, name) in enumerate(heads):
-        end = heads[k + 1][0] - 1 if k + 1 < len(heads) else len(lines) - 1
+        end = fn_end(lines, i, len(lines) - 1)
+        if k + 1 < len(heads):
+            end = min(end, heads[k + 1][0] - 1)
         while end > i and lines[end].strip() == "":
             end -= 1
         out.append((name, i, end))
