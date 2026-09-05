@@ -44,6 +44,7 @@ import {
   LetDecl,
   MatchExpr,
   Member,
+  Node,
   NullLit,
   NumLit,
   ObjLit,
@@ -19541,989 +19542,1001 @@ function numIntrCallTy(name: string, n: Call, ix: i32) {
   width
 }
 
+// Method call on a member callee (`xs.push(e)`, `m.get(k)`, `s.slice(a)`): types the
+// builtin receiver kinds directly, never as a struct field read. Returns the call type,
+// or `-1` when no builtin arm claims it and the caller falls through to the field/UFCS
+// path — the same "no answer" spelling `ufcsCallTy` and `arrayUnionCallTy` already use.
+function checkMemberCallNode(n: Call, ix: i32, cfn: Member): i32 {
+  // A member-access callee is always function-typed for semantic tokens; the builtin arms
+  // below type it directly and never revisit the member-read arm, so its name is recorded here (a struct field holding a function falls through to `checkNode` and overwrites it for hover).
+  symMemMethod(n.callFn)
+  let recvTy = checkNode(cfn.memObj)
+  let rt = T.tys[recvTy]
+  // An un-annotated hole receiving an array method (`self.map`/`.push`/…) is constrained to
+  // an array — synthesizing one over a derived element hole and falling into the array-method
+  // arm below, which pins the concrete element per call shape. Without this the hole would
+  // grow a `{map: any}` struct shape no array argument could satisfy.
+  if rt is TyVar {
+    if holeArrMethod(cfn.memProp) {
+      noteArrayDemand(rt.tvName)
+      const elemHole = mkDerivedHole(HD_ELEM, "", -1, -1, recvTy)
+      recvTy = mkArrayTy(elemHole)
+    } else if holeMapMethod(cfn.memProp) {
+      // The dual for a hole receiving a map/set method: becomes the hole's demanded map
+      // (`{[?]: ?}`) and falls into the map-method arm below, which pins the open key/value
+      // from the method's own arguments — `.add` mints the Set flavor. Without this the hole
+      // would grow a `{set: any}` struct shape no map argument could satisfy.
+      recvTy = holeMapDemandTy(rt.tvName, cfn.memProp == "add")
+    }
+  }
+  rt = T.tys[recvTy]
+  if rt is TyArray {
+    const margs = n.callArgs
+    if cfn.memProp == "push" {
+      if margs.length != 1 {
+        tErr("push expects 1 argument, got " + i32ToStr(margs.length), ix)
+      } else {
+        // Contextual param inference for a pushed callback: `fs.push((n) => n + 1)` over a
+        // `((i32) => i32)[]` seeds the lambda's param from the element function type, so an
+        // un-annotated lambda infers `n` instead of erroring (mirrors the `.map`/`.filter`
+        // seeding). A non-function element / non-lambda arg is left untouched by `seedExpected`.
+        if rt.aElem >= 0 { seedExpected(margs[0], rt.aElem) }
+        const pat = checkNode(margs[0])
+        // The first `.push(v)` on a bare empty `[]` pins its element type to `typeof v` in
+        // place — the usage-driven inference that resolves an un-annotated `const xs = []`; a later conflicting push is then a clean type error.
+        if rt.aElem < 0 {
+          rt.aElem = pat
+          tyMutEpoch = tyMutEpoch + 1 // `.push` pinned the element in place
+        } else {
+          // The pushed value's own open holes pin from the element slot — the same rule
+          // `.set` / `m[k] = v` / `xs = e` apply at their own store positions.
+          constrainEmptyExpr(margs[0], pat, rt.aElem)
+          // Uses `assignableExpr`, not bare `assignable`, so a float-literal argument
+          // re-encodes into an `f32` element exactly as it does at a binding, and defers to
+          // the pin when a side is a hole (D582).
+          if !bmArgOk(BM_PUSH, "push", pat, rt.aElem, recvTy, margs[0]) {
+            tErr(bmArgMsg(BM_PUSH, "push", pat, rt.aElem, recvTy), ix)
+          }
+        }
+      }
+      return TY_I32
+    }
+    // `.map(fn)` / `.filter(pred)`: the callback is a 1-arg function over the
+    // element type; map yields an array of the callback's return, filter the
+    // same array type (its predicate must yield bool).
+    if cfn.memProp == "map" || cfn.memProp == "filter" {
+      const cargs = n.callArgs
+      if cargs.length != 1 {
+        tErr(
+          cfn.memProp + " expects 1 argument, got " + i32ToStr(cargs.length),
+          ix,
+        )
+        return TY_ERR
+      }
+      // Seeds the callback's expected param type from the receiver's element type, so an
+      // un-annotated function-literal argument infers its param instead of erroring — only
+      // when the arg is an anonymous literal and the element type is known, else cleared below.
+      const cbArg = P.nodes[cargs[0]]
+      if cbArg is FuncDecl {
+        if cbArg.fnName == "" && rt.aElem >= 0 {
+          recordCbExpected(cargs[0], [rt.aElem])
+        }
+      }
+      const cbTy = checkNode(cargs[0])
+      const cb = T.tys[cbTy]
+      if cb is TyFunc {
+        const cbParams = cb.fnParamTypes
+        if cbParams.length != 1 {
+          tErr(
+            cfn.memProp +
+              " callback expects 1 parameter, got " +
+              i32ToStr(cbParams.length),
+            ix,
+          )
+        } else if !assignable(rt.aElem, cbParams[0]) {
+          tErr(
+            cfn.memProp +
+              " callback: parameter expects " +
+              tyToStr(cbParams[0]) +
+              ", got " +
+              tyToStr(rt.aElem),
+            ix,
+          )
+        }
+        if cfn.memProp == "filter" {
+          if !assignable(cb.fnRet, TY_BOOL) {
+            tErr(
+              "filter predicate must yield boolean, got " + tyToStr(cb.fnRet),
+              ix,
+            )
+          }
+          return recvTy
+        }
+        return mkArrayTy(cb.fnRet)
+      }
+      tErr(cfn.memProp + " expects a function, got " + tyToStr(cbTy), ix)
+      return TY_ERR
+    }
+    // `.pop()` / `.get(i)` yield `T | null` (an empty pop / out-of-range get is
+    // normal absence); `.clear()` empties in place and yields nothing. The element is
+    // its VALUE type (`arrElemValueTy`), so a `u8[]` answers `i32 | null` — the same
+    // widening `xs[i]` takes, and the rep `emitPopNulBox` already builds (D1211).
+    if cfn.memProp == "pop" {
+      if margs.length != 0 {
+        tErr("pop expects 0 arguments, got " + i32ToStr(margs.length), ix)
+      }
+      return mkNullableTy(arrElemValueTy(rt.aElem))
+    }
+    if cfn.memProp == "get" {
+      if margs.length != 1 {
+        tErr("get expects 1 argument, got " + i32ToStr(margs.length), ix)
+      } else {
+        const gat = checkNode(margs[0])
+        if !bmArgOk(BM_INDEXMUST, "get", gat, TY_I32, -1, margs[0]) {
+          tErr(bmArgMsg(BM_INDEXMUST, "get", gat, TY_I32, -1), ix)
+        }
+      }
+      return mkNullableTy(arrElemValueTy(rt.aElem))
+    }
+    if cfn.memProp == "clear" {
+      if margs.length != 0 {
+        tErr("clear expects 0 arguments, got " + i32ToStr(margs.length), ix)
+      }
+      return TY_VOID
+    }
+    // `.slice(start, end?)` yields a NEW array of the SAME element type — the bounds
+    // are i32 (a missing `end` defaults to the length; negatives count from the end).
+    if cfn.memProp == "slice" {
+      if margs.length != 1 && margs.length != 2 {
+        tErr(
+          "slice expects 1 or 2 arguments, got " + i32ToStr(margs.length),
+          ix,
+        )
+      } else {
+        let si = 0
+        while si < margs.length {
+          const sat = checkNode(margs[si])
+          if !bmArgOk(BM_BOUNDMUST, "slice", sat, TY_I32, -1, margs[si]) {
+            tErr(bmArgMsg(BM_BOUNDMUST, "slice", sat, TY_I32, -1), ix)
+          }
+          si = si + 1
+        }
+      }
+      return recvTy
+    }
+    // UFCS `self`-method on an array receiver (`parts.join(sep)`): an array
+    // carries no user FIELD, so a matching free `self`-function resolves
+    // directly — the array dual of the string/struct/union UFCS paths.
+    const au = ufcsCallTy(cfn.memProp, recvTy, n, ix)
+    if au >= 0 { return au }
+    tErr(
+      "no method '." +
+        cfn.memProp +
+        "' on array " +
+        tyToStr(recvTy) +
+        methodDidYouMean(recvTy, cfn.memProp),
+      ix,
+    )
+    return TY_ERR
+  }
+  // Map/Set methods over the `{[K]: V}` rep, gated by flavor: a map exposes `.set`/`.get`/
+  // `.has`/`.delete`/`.keys`/`.values`; a set exposes only `.add`/`.has`/`.delete`/`.values`.
+  // `.add` alone gates on the value's TYPE rather than the flavor bit (see its own arm). The
+  // first `.set`/`.add` on a bare `Map()`/`Set()` pins its key/value holes in place.
+  if rt is TyMap {
+    const mp = cfn.memProp
+    const margs2 = n.callArgs
+    if mp == "set" && rt.mSet == 0 {
+      if margs2.length != 2 {
+        tErr("set expects 2 arguments, got " + i32ToStr(margs2.length), ix)
+      } else {
+        const k0 = checkNode(margs2[0])
+        // The value argument is a store into the map's value slot, taking the same
+        // contextual steps `xs.push(v)` and `m[k] = v` take: `seedExpected` first, then the
+        // expression-aware `assignableExpr` — the one home the assignment path also calls, so `.set` and `m[k] = v` cannot drift apart.
+        if rt.mVal >= 0 { seedExpected(margs2[1], rt.mVal) }
+        const v0 = checkNode(margs2[1])
+        if rt.mKey < 0 {
+          rt.mKey = k0
+          tyMutEpoch = tyMutEpoch + 1 // `.set` pinned the key in place
+          checkInferredMapKey(k0, rt.mSet, ix)
+        } else if !bmArgOk(BM_SETKEY, "set", k0, rt.mKey, -1, margs2[0]) {
+          tErr(bmArgMsg(BM_SETKEY, "set", k0, rt.mKey, -1), ix)
+        }
+        if rt.mVal < 0 {
+          rt.mVal = v0
+          tyMutEpoch = tyMutEpoch + 1 // `.set` pinned the value in place
+        } else {
+          // The value argument's own open holes pin from the slot, the third step
+          // this store shares with `m[k] = v` (which pins in `checkBinExprNode`'s
+          // `=` arm) — without it, `m.set("a", fq())` over a `{[string]: f64[]}` reaches the emitter with an unpinned `[]`.
+          constrainEmptyExpr(margs2[1], v0, rt.mVal)
+          // `assignableExpr` already covers the newtype literal-adoption case (`m.set("k",
+          // 1)` over `{[string]: EntityId}` fires), deferring to the pin under a hole (D582).
+          if !bmArgOk(BM_SETVAL, "set", v0, rt.mVal, -1, margs2[1]) {
+            tErr(bmArgMsg(BM_SETVAL, "set", v0, rt.mVal, -1), ix)
+          }
+        }
+      }
+      return TY_VOID
+    }
+    if mp == "get" && rt.mSet == 0 {
+      if margs2.length != 1 {
+        tErr("get expects 1 argument, got " + i32ToStr(margs2.length), ix)
+      } else {
+        const k1 = checkNode(margs2[0])
+        if !bmArgOk(BM_KEYMUST, "get", k1, rt.mKey, -1, margs2[0]) {
+          tErr(bmArgMsg(BM_KEYMUST, "get", k1, rt.mKey, -1), ix)
+        }
+      }
+      return mkNullableTy(rt.mVal)
+    }
+    // `.add(x)`, the membership insert (`m[x] = true` as the Set surface): admitted on any
+    // map whose VALUE is `boolean`, not only one whose provenance is a `Set()` call — `mSet`
+    // is a one-way refinement written only by `Set()`, so gating on it would make `.add`
+    // depend on how the value is spelled at its binding rather than on its type.
+    if mp == "add" && (rt.mSet == 1 || tyIsPrimNamed(rt.mVal, "boolean")) {
+      if margs2.length != 1 {
+        tErr("add expects 1 argument, got " + i32ToStr(margs2.length), ix)
+      } else {
+        const ka = checkNode(margs2[0])
+        if rt.mKey < 0 {
+          rt.mKey = ka
+          tyMutEpoch = tyMutEpoch + 1 // `.add` pinned the Set key in place
+          checkInferredMapKey(ka, rt.mSet, ix)
+        } else if !bmArgOk(BM_ADDKEY, "add", ka, rt.mKey, -1, margs2[0]) {
+          tErr(bmArgMsg(BM_ADDKEY, "add", ka, rt.mKey, -1), ix)
+        }
+      }
+      return TY_VOID
+    }
+    if mp == "has" || mp == "delete" {
+      if margs2.length != 1 {
+        tErr(mp + " expects 1 argument, got " + i32ToStr(margs2.length), ix)
+      } else {
+        const k2 = checkNode(margs2[0])
+        if !bmArgOk(BM_KEYMUST, mp, k2, rt.mKey, -1, margs2[0]) {
+          tErr(bmArgMsg(BM_KEYMUST, mp, k2, rt.mKey, -1), ix)
+        }
+      }
+      return TY_BOOL
+    }
+    if mp == "keys" && rt.mSet == 0 {
+      if margs2.length != 0 { tErr("keys expects no arguments", ix) }
+      return mkArrayTy(rt.mKey)
+    }
+    if mp == "values" {
+      if margs2.length != 0 { tErr("values expects no arguments", ix) }
+      // A set's `.values()` yields its ELEMENTS (the keys); a map's its values.
+      if rt.mSet == 1 { return mkArrayTy(rt.mKey) }
+      return mkArrayTy(rt.mVal)
+    }
+    tErr(
+      "unknown property `" +
+        mp +
+        "` on " +
+        tyToStr(recvTy) +
+        methodDidYouMean(recvTy, mp),
+      ix,
+    )
+    return TY_ERR
+  }
+  // String methods: `.slice`/`.indexOf`/`.includes`/`.charCodeAt`, and the stage 2c trio
+  // `.cpAt`/`.cpLen`/`.isCharBoundary` (`.length` is a `Member`, `s[i]` an `Index`). The trio
+  // lives in the core rather than `std:str` (OQ-3) because each needs the UTF-8 storage directly
+  // — a byte-offset decode, a continuation-byte scan, a lead-bit test — which the surface exposes no other way to reach.
+  if rt is TyPrim {
+    if rt.primName == "string" {
+      const sp = cfn.memProp
+      const sargs = n.callArgs
+      if sp == "slice" {
+        if sargs.length != 2 {
+          tErr("slice expects 2 arguments, got " + i32ToStr(sargs.length), ix)
+        } else {
+          const s0 = checkNode(sargs[0])
+          const s1 = checkNode(sargs[1])
+          // Two constraints, one sentence: each bound defers on its own (either can be the
+          // hole), but the message names both types, so each form carries the other bound as its `ctx` and renders the identical sentence whichever side failed.
+          const sb0 = bmArgOk(BM_BOUNDS0, "slice", s0, TY_I32, s1, sargs[0])
+          const sb1 = bmArgOk(BM_BOUNDS1, "slice", s1, TY_I32, s0, sargs[1])
+          if !sb0 {
+            tErr(bmArgMsg(BM_BOUNDS0, "slice", s0, TY_I32, s1), ix)
+          } else if !sb1 {
+            tErr(bmArgMsg(BM_BOUNDS1, "slice", s1, TY_I32, s0), ix)
+          }
+        }
+        return TY_STR
+      }
+      if sp == "indexOf" {
+        if sargs.length != 1 {
+          tErr("indexOf expects 1 argument, got " + i32ToStr(sargs.length), ix)
+        } else {
+          const a0 = checkNode(sargs[0])
+          if !bmArgOk(BM_EXPECTSA, "indexOf", a0, TY_STR, -1, sargs[0]) {
+            tErr(bmArgMsg(BM_EXPECTSA, "indexOf", a0, TY_STR, -1), ix)
+          }
+        }
+        return TY_I32
+      }
+      if sp == "includes" {
+        if sargs.length != 1 {
+          tErr("includes expects 1 argument, got " + i32ToStr(sargs.length), ix)
+        } else {
+          const a0 = checkNode(sargs[0])
+          if !bmArgOk(BM_EXPECTSA, "includes", a0, TY_STR, -1, sargs[0]) {
+            tErr(bmArgMsg(BM_EXPECTSA, "includes", a0, TY_STR, -1), ix)
+          }
+        }
+        return TY_BOOL
+      }
+      if sp == "charCodeAt" {
+        if sargs.length != 1 {
+          tErr(
+            "charCodeAt expects 1 argument, got " + i32ToStr(sargs.length),
+            ix,
+          )
+        } else {
+          const a0 = checkNode(sargs[0])
+          if !bmArgOk(BM_IDXPHRASE, "charCodeAt", a0, TY_I32, -1, sargs[0]) {
+            tErr(bmArgMsg(BM_IDXPHRASE, "charCodeAt", a0, TY_I32, -1), ix)
+          }
+        }
+        return TY_I32
+      }
+      // `s.cpAt(i)` — the code point whose UTF-8 sequence begins at byte offset `i`,
+      // O(1) (§Codepoints). Not "the i-th code point": the argument is in the one
+      // coordinate system `slice`, `indexOf` and `.length` share.
+      if sp == "cpAt" {
+        if sargs.length != 1 {
+          tErr("cpAt expects 1 argument, got " + i32ToStr(sargs.length), ix)
+        } else {
+          const a0 = checkNode(sargs[0])
+          if !bmArgOk(BM_BYTEOFF, "cpAt", a0, TY_I32, -1, sargs[0]) {
+            tErr(bmArgMsg(BM_BYTEOFF, "cpAt", a0, TY_I32, -1), ix)
+          }
+        }
+        return TY_I32
+      }
+      // `s.cpLen()` — the code-point count, O(n) and NAMED so the cost is visible at the
+      // call site rather than hidden in a `.length` that is O(1) on some data and O(n)
+      // on other data (§Codepoints: "a subscript should mean O(1), always").
+      if sp == "cpLen" {
+        if sargs.length != 0 {
+          tErr("cpLen expects no arguments, got " + i32ToStr(sargs.length), ix)
+        }
+        return TY_I32
+      }
+      // `s.isCharBoundary(i)` — Rust's primitive, O(1): a single lead/continuation bit
+      // test. Slicing off a boundary is LEGAL under Go-lean validity (§Validity), so this
+      // is the tool for code that wants to check rather than a guard the language imposes.
+      if sp == "isCharBoundary" {
+        if sargs.length != 1 {
+          tErr(
+            "isCharBoundary expects 1 argument, got " + i32ToStr(sargs.length),
+            ix,
+          )
+        } else {
+          const a0 = checkNode(sargs[0])
+          if (
+            !bmArgOk(BM_BYTEOFF, "isCharBoundary", a0, TY_I32, -1, sargs[0])
+          ) {
+            tErr(bmArgMsg(BM_BYTEOFF, "isCharBoundary", a0, TY_I32, -1), ix)
+          }
+        }
+        return TY_BOOL
+      }
+      // `s.bytes()` — the string's UTF-8 storage as a `u8[]`. A COPY, not a view:
+      // see `emitStrBytesFnCode` for why a `u8[]` cannot express a non-zero `start`,
+      // and `strings-design.md` §Byte view for the withdrawn zero-copy claim.
+      if sp == "bytes" {
+        if sargs.length != 0 {
+          tErr("bytes expects no arguments, got " + i32ToStr(sargs.length), ix)
+        }
+        return mkArrayTy(TY_U8)
+      }
+      // UFCS `self`-method on a string receiver (`"hello".first()`).
+      const su = ufcsCallTy(sp, recvTy, n, ix)
+      if su >= 0 { return su }
+      // D1230 on a STRING receiver. This arm answers before the general one and
+      // raises its own sentence at the CALL node, so it asks and raises here
+      // rather than banking — `memberFloorErr` never sees a string method call.
+      const suSpecs = ufcsMissingImportSpecs(sp, recvTy, n.callArgs.length)
+      if suSpecs != "" {
+        tErrCodedData(
+          ufcsNotImportedMsg(sp, suSpecs, recvTy),
+          ix,
+          CODE_UFCS_NOT_IMPORTED,
+          ufcsNotImportedData(sp, suSpecs, recvTy),
+        )
+        return TY_ERR
+      }
+      // D1570 on a STRING receiver, raised here for the reason D1230's arm is: this arm
+      // answers before the general one, so `memberFloorErr` never sees a string method call
+      // and there is nothing to bank for.
+      const suName = ufcsAliasAtSite(ix, sp)
+      const suKind = ufcsNotMethodKind(suName, recvTy, n.callArgs.length)
+      if suKind != 0 {
+        tErrCodedData(
+          ufcsNotMethodMsg(sp, suName, recvTy, n.callArgs.length, suKind),
+          ix,
+          CODE_UFCS_NOT_METHOD,
+          ufcsNotMethodData(sp, suName, recvTy, suKind),
+        )
+        return TY_ERR
+      }
+      tErr(
+        "no method '." + sp + "' on string" + methodDidYouMean(recvTy, sp),
+        ix,
+      )
+      return TY_ERR
+    }
+  }
+  // UFCS `self`-method on any other receiver: `o.f(args)` lowers to `f(o, args)` when the
+  // receiver has no such field (a callable field keeps precedence) and a matching free
+  // function exists. The field-first test is `tyFieldTyOf`, the same predicate the emitter's
+  // `drwWalk` calls on the receiver's recorded type, so the two cannot disagree (D1070).
+  const ufcsHasField = tyFieldTyOf(recvTy, cfn.memProp) >= 0
+  const urt = T.tys[recvTy]
+  // A bounded type parameter as the receiver (OQ-5, strict bodies): the bound answers, and
+  // only the bound — arguments check against its declared members and the result is what it
+  // promised. No dispatch happens here; the witness is chosen per instantiation site
+  // (`checkBoundsAtCall`) and baked by the monomorphizer.
+  if urt is TyVar {
+    const bcTy = boundMemberTy(urt.tvName, cfn.memProp, true)
+    if bcTy == BOUND_UNRESOLVED {
+      tErr(boundMemberUnknownMsg(urt.tvName, cfn.memProp), ix)
+      return TY_ERR
+    }
+    if bcTy >= 0 {
+      const bcT = T.tys[bcTy]
+      if bcT is TyFunc {
+        const bcArgs = n.callArgs
+        if bcArgs.length != bcT.fnParamTypes.length {
+          tErr(
+            "`" +
+              cfn.memProp +
+              "` on `" +
+              urt.tvName +
+              "` expects " +
+              i32ToStr(bcT.fnParamTypes.length) +
+              " arguments, got " +
+              i32ToStr(bcArgs.length),
+            ix,
+          )
+          return TY_ERR
+        }
+        let bca = 0
+        while bca < bcArgs.length {
+          const bcat = checkNode(bcArgs[bca])
+          const bcWant = bcT.fnParamTypes[bca]
+          // An UNRESOLVED member type (`-1`) is a bound whose own annotation
+          // named something this scope has no answer for. Reported once, at the
+          // call, rather than fed to `assignable` — which reads a negative side
+          // as "accept anything" and would silently pass every argument.
+          if bcWant < 0 {
+            tErr(boundMemberUnknownMsg(urt.tvName, cfn.memProp), ix)
+            return TY_ERR
+          }
+          if !assignableExpr(bcArgs[bca], bcat, bcWant) {
+            argMismatchErr(bca + 1, bcWant, bcat, bcArgs[bca])
+          }
+          bca = bca + 1
+        }
+        if bcT.fnRet < 0 {
+          tErr(boundMemberUnknownMsg(urt.tvName, cfn.memProp), ix)
+          return TY_ERR
+        }
+        return bcT.fnRet
+      }
+    }
+    const bcMsg = boundMemberFloorMsg(urt.tvName, cfn.memProp)
+    if bcMsg != "" {
+      tErr(bcMsg, ix)
+      return TY_ERR
+    }
+  }
+  if !ufcsHasField {
+    const uu = ufcsCallTy(cfn.memProp, recvTy, n, ix)
+    if uu >= 0 { return uu }
+    // The name is a self-function, just not one in scope (D1230) — asked here since only
+    // the call knows the argument count, banked on the callee member node where the sentence is raised (`memberFloorErr`).
+    noteUfcsMiss(
+      n.callFn,
+      ufcsMissingImportSpecs(cfn.memProp, recvTy, n.callArgs.length),
+    )
+    // When the name is already in scope, which gate declined (D1570) — banked beside
+    // D1230's answer and read after it, since `argc` is known here and raised there.
+    noteUfcsNotMethod(
+      n.callFn,
+      cfn.memProp,
+      ufcsAliasAtSite(ix, cfn.memProp),
+      recvTy,
+      n.callArgs.length,
+    )
+  }
+  -1
+}
+
+// A memory intrinsic declared in the default scope but with no emitter arm
+// (`nameIsUnimplementedIntrinsic`) is reported here rather than as the emitter's generic "call
+// to unknown function", which would misread a missing implementation as a typo. Gated on the
+// callee still denoting that binding, so a shadowing declaration or parameter keeps it (D1604).
+function checkUnimplementedIntrinsicCall(cfn: Ident, ix: i32) {
+  if (
+    nameIsUnimplementedIntrinsic(cfn.identName) &&
+    (fnDeclIx[cfn.identName] ?? -1) < 0 &&
+    lookupDepth(cfn.identName) == 0
+  ) {
+    tErrUnsupported(
+      "'" +
+        cfn.identName +
+        "' is declared but has no implementation yet — it type-checks and then has nothing to lower (see `docs/internals/memory-gc-design.md` §1.2)",
+      ix,
+    )
+  }
+}
+
+// Calls to a compiler builtin named by the callee identifier — `print`, `Map`/`Set`, the
+// codepoint constructors and the `__array_*` / bitcast / numeric intrinsics. None has a
+// declaration to check against, so arity and argument types are checked here. Returns the
+// call type, or `-1` when the name is none of them and the caller checks it as a value.
+function checkBuiltinIdentCall(n: Call, ix: i32, cfn: Ident): i32 {
+  // `print(x)` is a compiler builtin (no module/import system yet): it accepts a
+  // single value of any printable type and yields void. Special-cased so a program
+  // that prints does not trip "undeclared identifier 'print'". Each argument is
+  // still checked so a type error inside it surfaces.
+  if cfn.identName == "print" {
+    const pargs = n.callArgs
+    let pj = 0
+    while pj < pargs.length {
+      const pt = checkNode(pargs[pj])
+      // `print` demands a value to render, and a `void` call has none — the emitter's
+      // print ladder ends in `call __print_i32__` with nothing on the stack.
+      voidValueSlotErr(pt, pargs[pj], "print", pargs[pj])
+      // A domain rejection, asked first (the ruling): `print` takes one value of
+      // `printDomainStr()`'s reps, and an array/struct/map/function value (bare, behind
+      // `| null`, or inside a union) is not one — an ordinary domain error (`tErr`, no
+      // code), not a capability admission, since the language never defined what such a print outputs (D711).
+      if tyPrintsAsRef(pt, 24) {
+        tErr(printRefRefusal(pt), pargs[pj])
+      } else {
+        // The BOXED value-union residue. `print(<i32 | string>)` now LOWERS — every arm
+        // is inside the domain and the emitter dispatches on the box tag, the same
+        // dispatch it performs for `is` (D712) — so what is left here is a box whose
+        // arms that dispatch cannot classify, and only that keeps the concession.
+        const puMsg = printUnionRefusal(pt)
+        if puMsg != "" { tErrUnsupported(puMsg, pargs[pj]) }
+      }
+      // A printed type that still carries a HOLE answers FALSE to both floors above — it
+      // is neither a ref nor a box YET — so the two of them together admit every generic
+      // `print`. Defer it to the pin, the only position that knows the instance.
+      // (`silent-class-inventory` D401; the recorder's header has the measurement.)
+      notePrintCstr(pt, pargs[pj])
+      pj = pj + 1
+    }
+    return TY_VOID
+  }
+  // `Map()` / `Set()` construct an empty string-keyed map: key/value HOLES (-1)
+  // assignable to any map annotation (`const m: {[string]: i32} = Map()`).
+  if cfn.identName == "Map" || cfn.identName == "Set" {
+    if n.callArgs.length != 0 {
+      tErr(cfn.identName + " expects no arguments", ix)
+    }
+    if cfn.identName == "Set" {
+      // A set's VALUE type is the membership boolean; the element (key) is a
+      // hole pinned by the annotation or the first `.add`.
+      return mkMapTy(-1, TY_BOOL, 1)
+    }
+    return mkMapTy(-1, -1, 0)
+  }
+  // `toString(x)` resolves through the ordinary scope as `std:fmt`'s export now, and an
+  // un-imported use gets the migration hint `undeclaredIdentMsg` appends.
+  // `fromCodePoints(xs)` is a builtin: an `i32[]` of code points to a string, in one bulk
+  // copy (the amortized alternative to per-char concat).
+  if cfn.identName == "fromCodePoints" {
+    const pargs = n.callArgs
+    if pargs.length != 1 {
+      tErr(
+        "fromCodePoints expects 1 argument, got " + i32ToStr(pargs.length),
+        ix,
+      )
+    } else {
+      const p0 = checkNode(pargs[0])
+      const p0t = T.tys[p0]
+      let pOk = false
+      if p0t is TyArray {
+        // An empty `[]` literal's element hole (-1) pins to i32 here.
+        if p0t.aElem < 0 || assignable(p0t.aElem, TY_I32) { pOk = true }
+      }
+      if p0t is TyErr { pOk = true }
+      if !pOk {
+        tErr("fromCodePoints expects an i32[], got " + tyToStr(p0), ix)
+      }
+    }
+    return TY_STR
+  }
+  // `fromCodePoint(code)` is a builtin: an i32 code point -> a length-1 string.
+  if cfn.identName == "fromCodePoint" {
+    const fargs = n.callArgs
+    if fargs.length != 1 {
+      tErr(
+        "fromCodePoint expects 1 argument, got " + i32ToStr(fargs.length),
+        ix,
+      )
+    } else {
+      const f0 = checkNode(fargs[0])
+      if !assignable(f0, TY_I32) {
+        tErr("fromCodePoint expects an i32, got " + tyToStr(f0), ix)
+      }
+    }
+    return TY_STR
+  }
+  // The array-intrinsic floor (std-design D1 / collections-design §LS.2),
+  // host parity: `defaultScope.ts`. `__array_new__(n, fill)` allocates `n`
+  // slots each set to `fill`, typing as `T[]` with `T` = the fill's type.
+  if cfn.identName == "__array_new__" {
+    const anArgs = n.callArgs
+    if anArgs.length != 2 {
+      tErr(
+        "__array_new__ expects 2 arguments, got " + i32ToStr(anArgs.length),
+        ix,
+      )
+      return mkArrayTy(-1)
+    }
+    const anLen = checkNode(anArgs[0])
+    if !assignable(anLen, TY_I32) {
+      tErr("__array_new__ expects an i32 length, got " + tyToStr(anLen), ix)
+    }
+    return mkArrayTy(checkNode(anArgs[1]))
+  }
+  // `__array_new_default__(n)`: `n` zeroed/default slots. The element type is a hole (-1)
+  // pinned by the destination — the empty-`[]` mechanism — and the emitter reads the same
+  // pinned row back off this node (`arrNewDefaultKind`), so the two cannot disagree about
+  // the rep. Two questions this arm cannot answer yet are recorded here and asked late (`arrDefCallIx`).
+  if cfn.identName == "__array_new_default__" {
+    const adArgs = n.callArgs
+    if adArgs.length != 1 {
+      tErr(
+        "__array_new_default__ expects 1 argument, got " + i32ToStr(adArgs.length),
+        ix,
+      )
+    } else {
+      const adLen = checkNode(adArgs[0])
+      if !assignable(adLen, TY_I32) {
+        tErr(
+          "__array_new_default__ expects an i32 length, got " + tyToStr(adLen),
+          ix,
+        )
+      }
+    }
+    const adTy = mkArrayTy(-1)
+    arrDefCallIx.push(ix)
+    arrDefCallTy.push(adTy)
+    return adTy
+  }
+  // `__array_copy__(dst, dstAt, src, srcAt, count)`: bulk-moves `count` elements from
+  // `src[srcAt..]` into `dst[dstAt..]`; void. Both must be arrays; the element correlation
+  // between them is deliberately not enforced here, matching the host's own leniency (a
+  // mismatched pair fails loudly at the emit stage in both compilers).
+  if cfn.identName == "__array_copy__" {
+    const acArgs = n.callArgs
+    if acArgs.length != 5 {
+      tErr(
+        "__array_copy__ expects 5 arguments, got " + i32ToStr(acArgs.length),
+        ix,
+      )
+      return TY_VOID
+    }
+    let acI = 0
+    while acI < 5 {
+      const acT = checkNode(acArgs[acI])
+      if acI == 0 || acI == 2 {
+        const acTy = T.tys[acT]
+        let acOk = false
+        if acTy is TyArray { acOk = true }
+        if acTy is TyErr { acOk = true }
+        if !acOk {
+          tErr("__array_copy__ expects a T[], got " + tyToStr(acT), ix)
+        }
+      } else {
+        if !assignable(acT, TY_I32) {
+          tErr("__array_copy__ expects an i32, got " + tyToStr(acT), ix)
+        }
+      }
+      acI = acI + 1
+    }
+    return TY_VOID
+  }
+  // `__trap__()`: the deliberate abort primitive — lowered to `unreachable`.
+  // `__trap__("reason")`: an OPTIONAL single string message, printed to the
+  // host boundary (the print-of-string path) before the abort — so the trap
+  // carries a human-readable reason. Either form still "never returns".
+  if cfn.identName == "__trap__" {
+    if n.callArgs.length > 1 {
+      tErr("__trap__ takes an optional string message", ix)
+    } else if n.callArgs.length == 1 {
+      const trapMsgTy = checkNode(n.callArgs[0])
+      if !assignable(trapMsgTy, TY_STR) {
+        tErr(
+          "__trap__ takes an optional string message, got " + tyToStr(trapMsgTy),
+          ix,
+        )
+      }
+    }
+    return TY_VOID
+  }
+  // The numeric-opcode intrinsics: each lowers to exactly one wasm instruction, so
+  // the checker only has to type them. A user binding of the same name shadows the
+  // intrinsic (`numIntrShadowed`), and the emitter gates on the same rule — the
+  // intrinsic arm is a fallback for a name the program did not define itself.
+  if !numIntrShadowed(cfn.identName) {
+    const bcTy = bitcastCallTy(cfn.identName, n, ix)
+    if bcTy >= 0 { return bcTy }
+    const niTy = numIntrCallTy(cfn.identName, n, ix)
+    if niTy >= 0 { return niTy }
+  }
+  -1
+}
+
+// The ordinary call: the callee evaluates to a function type, so the arguments are checked
+// against its parameter list — named arguments reordered, an omitted trailing one filled
+// from the declaration default, and type-parameter bindings solved from the argument types.
+// Always answers; the caller's remaining arms cover an error or still-unsolved callee.
+function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
+  let args = n.callArgs
+  // PENDING return (-2): the un-annotated callee hasn't been inferred yet (a
+  // forward call). Demand-infer it now — check its FuncDecl, which patches this
+  // very TyFunc in place — unless it is already on the in-progress stack (an
+  // in-cycle call: contribute TY_ERR so the cycle can be detected at the root).
+  if ft.fnRet == -2 {
+    if cfn is Ident {
+      if !onInferStack(cfn.identName) {
+        const dIx = fnDeclIx[cfn.identName] ?? -1
+        if dIx >= 0 { checkNode(dIx) }
+      }
+    }
+  }
+  let retTy = ft.fnRet
+  if retTy == -2 {
+    retTy = TY_ERR
+    // A direct self-recursive call resolves to the function's own provisional inferred
+    // type (`inferObserved`, already holding the base case since it is checked first) —
+    // without this, `TY_ERR` makes `assignable(TY_ERR, string)` vacuously true and a `+`
+    // over the recursive call pollutes the inferred return. Mutual recursion keeps `TY_ERR` for the fixpoint to settle.
+    if cfn is Ident {
+      if inferStack.length > 0 {
+        if inferStack[inferStack.length - 1] == cfn.identName {
+          if inferObserved >= 0 { retTy = inferObserved }
+        }
+      }
+    }
+  }
+  const params = ft.fnParamTypes
+  // Defaults are direct-call-site sugar: a call naming a declared function may omit
+  // trailing arguments whose parameters carry a default, so the accepted arity is the
+  // range [`fnRequiredArity`, `params.length`]. A call through a function value has no
+  // declaration to read defaults from and keeps its exact-arity gate.
+  const dParams = calleeDeclParams(n.callFn)
+  let required = params.length
+  if dParams.length == params.length { required = fnRequiredArity(dParams) }
+  if args.length < required || args.length > params.length {
+    tErr(
+      "wrong number of arguments: expected " +
+        arityWantText(required, params.length) +
+        ", got " +
+        i32ToStr(args.length),
+      ix,
+    )
+    return retTy
+  }
+  // Named arguments bind to parameters by name, then positionally — source order is
+  // irrelevant for named args. `TyFunc` carries no parameter names, so the names resolve
+  // against the declaration the scope chain gives this callee; a closure-valued binding has
+  // none and cannot take named arguments, whatever a same-named declaration says (D1604).
+  if hasNamedArgs(n.callArgNames) {
+    const cNames = paramNamesOfNodes(dParams)
+    if cNames.length != params.length {
+      tErr("named arguments require a declared function", ix)
+      return retTy
+    }
+    args = orderNamedCallArgs(cNames, args, n.callArgNames, ix, dParams)
+    if args.length != params.length { return retTy }
+  } else if args.length < params.length {
+    // Trailing positional omission: check the defaults against their
+    // parameters alongside the supplied arguments, so one loop below covers
+    // the whole parameter list. (`args` is rebound to a COPY — `n.callArgs`
+    // stays the source list; the emit-side normalization is `emit_rewrite`'s.)
+    const padded: i32[] = []
+    let pj = 0
+    while pj < params.length {
+      if pj < args.length { padded.push(args[pj]) } else { padded.push(-1) }
+      pj = pj + 1
+    }
+    if fillArgDefaults(padded, dParams, ix) >= 0 { return retTy }
+    args = padded
+  }
+  // Generic call-site inference: a `TyVar` param (or `T[]`) binds its type-param to
+  // the argument's type (first use wins; later uses must agree), and the return
+  // type substitutes through the binding — so `id("s")` is `string`, and
+  // `let n: i32 = id("s")` is a genuine type error downstream.
+  const bNames: string[] = []
+  const bTys: i32[] = []
+  let i = 0
+  while i < args.length {
+    // Contextual param inference for a function-value argument: propagates the expected
+    // param type into it so an un-annotated literal param infers from the signature
+    // (matching `.map`/`.filter`), substituting type-param bindings from earlier arguments
+    // first — `mapArr(xs: T[], f: (T) => R)` called with `[1,2,3]` binds `T = i32` before seeding `f`'s param as `i32`.
+    seedExpected(args[i], substTyDeep(params[i], bNames, bTys))
+    const at = checkNode(args[i])
+    // A template hole meeting its injected renderer. This line is the first
+    // moment the hole's type exists, which is why the type-directed half of
+    // the template lowering lives here and not in the parser's desugar.
+    if nodeIsTplHole(args[i]) {
+      if tplHoleHandled(ix, n.pos, args[i], at, params[i]) { return TY_STR }
+    }
+    // Bind every TyVar reachable in the expected param position from the
+    // argument's shape (first use wins), then check the argument against the
+    // SUBSTITUTED expected type — a later disagreeing use errors here.
+    bindGenWalk(params[i], at, bNames, bTys)
+    const expected = substTyDeep(params[i], bNames, bTys)
+    // A `u8[]` argument meeting a generic parameter: `bindGenWalk` above declined to bind
+    // `T` to storage type `u8`, so `expected` still carries the unsolved hole and
+    // `assignable` answers true vacuously — needing its own message here, or the
+    // monomorphizer builds i32-list machinery over a one-byte backing. `u8[]` is not an instantiation of `T[]`, since `T` ranges over value types and `u8` is storage.
+    if !inferQuiet {
+      if tyIsU8ArrayTy(at) && tyReachesHole(expected, 8) {
+        tErr(
+          "`u8[]` cannot be passed to a generic parameter — `u8` is a storage type, so a type parameter never binds it and a `u8[]` is not a `T[]`",
+          args[i],
+        )
+      }
+    }
+    // A hole or deferred-join argument passes `assignable` vacuously, so the demand is
+    // recorded here and re-validated at the generic call site that pins it under the
+    // substituted argument types — without this, `function f(x) { g(x) }` with `g(n: i32)`
+    // type-checks `f("s")` clean and dies at wasm validation. Recorded on the argument's uncollapsed type, since a join's collapsed arm can later prove unreachable.
+    const atCstr = inferRetTyOf(args[i], at)
+    if tyIsHole(atCstr) || tyIsDeferredJoin(atCstr) {
+      if !tyIsHole(expected) {
+        let ccWho = ""
+        if cfn is Ident { ccWho = cfn.identName }
+        noteArgCstr(atCstr, expected, ccWho)
+      }
+    }
+    // A hole param whose body DEMANDED fields (member access on the hole)
+    // checks the argument against the demanded shape, so `getx(5)` rejects
+    // when the body read `o.x` (host: the grown `Infer<{x,…}>` pin).
+    const pHole = T.tys[params[i]]
+    if pHole is TyVar {
+      if !holeDemandOk(pHole.tvName, args[i], at) {
+        holeArgDemandErr(pHole.tvName, i + 1, at, args[i])
+      }
+      // A hole the body INDEXED (`self[i]`) demands an array — a scalar argument can't be
+      // indexed, so reject it here (`head(5)`) instead of deferring to an emit failure.
+      if holeIsArrayDemanded(pHole.tvName) {
+        if tyRefusesArrayDemand(at) { holeArgArrayErr(i + 1, at, args[i]) }
+      }
+      // The `as` cast the body parked on this hole, re-asked under the argument. D1342.
+      holeCastPinCheck(pHole.tvName, at, declParamNameAt(dParams, i))
+    }
+    // The cast this argument itself is (`id(a as? i32)`), whose destination the pin has to
+    // re-ask (D1371) — but only when the parameter is not a hole: for a hole parameter,
+    // `expected` is the pre-pin answer rather than a declared demand, and holding the cast to it would refuse a program whose annotated twin runs.
+    if !tyIsHole(params[i]) { noteCastArgDest(args[i], i + 1, expected) }
+    // Passing an empty-collection argument into a concrete `T[]` / map param pins
+    // its element type from the param (`len(empty)` resolves `empty` to `i32[]`),
+    // clearing its uninferred floor — pure downstream-usage inference, no push.
+    constrainEmptyExpr(args[i], at, expected)
+    if !assignableExpr(args[i], at, expected) {
+      // Anchored at the offending argument (or its offending return site),
+      // never at the call node — see `argMismatchErr`.
+      argMismatchErr(i + 1, expected, at, args[i])
+    }
+    i = i + 1
+  }
+  // Substitutes the binding into a generic return type — deep, so a structural return
+  // (`{first: B, second: A}`, a generic alias body, a function-typed field) concretizes
+  // per call site; a derived `?ret.` hole collapses to the pinned callee's return
+  // (`substTyDeep`).
+  if bNames.length > 0 {
+    const dBeforeC = T.diags.length
+    let cstrCallee = CSTR_NODECL
+    let cstrWho = ""
+    if cfn is Ident {
+      cstrCallee = fnDeclIx[cfn.identName] ?? CSTR_NODECL
+      // A local bound to a declared generic names that declaration — without this rung the
+      // call falls to `CSTR_NODECL` and adjudicates every generic in the program, since
+      // `substTyDeep` matches `TyVar`s by name and `const g = idT  g(structList)` would
+      // otherwise report a sibling's refusal.
+      if cstrCallee == CSTR_NODECL {
+        const aliasIx = lookupFnAliasNode(cfn.identName)
+        if aliasIx >= 0 { cstrCallee = aliasIx }
+      }
+      cstrWho = cfn.identName
+    }
+    // The direct spelling has no receiver, so every parameter is an argument (`selfOff` 0)
+    // and `params`/`args` are already 1:1 (named arguments reordered, defaults padded).
+    const dhNames: string[] = []
+    const dhArgNo: i32[] = []
+    const dhArgNode: i32[] = []
+    holeArgOrigins(params, args, 0, dhNames, dhArgNo, dhArgNode)
+    validateBinCstrs(
+      bNames,
+      bTys,
+      ix,
+      cstrCallee,
+      cstrWho,
+      dhNames,
+      dhArgNo,
+      dhArgNode,
+    )
+    validatePrintCstrs(bNames, bTys, ix, cstrCallee, cstrWho)
+    validateArgCstrs(bNames, bTys, ix)
+    // The declared return rides the same pin: the body's mismatch check is vacuous under
+    // a hole, and this is the first position that knows the instance (D551).
+    validateRetCstrs(bNames, bTys, ix, cstrCallee, cstrWho)
+    // The destination seam, for the same reason: a value landing in a hole-typed local /
+    // field / element inside the body is a mismatch the body's own gate cannot decide (D572).
+    validateLetCstrs(bNames, bTys, ix, cstrCallee, cstrWho)
+    // A builtin collection method's argument inside the body, for the same reason at a
+    // callee kind the deferred-argument table cannot name: a builtin has no `FuncDecl`, so its own arm is the whole check and is vacuous under a hole (D582).
+    validateBmCstrs(bNames, bTys, ix, cstrCallee, cstrWho)
+    // The receiver classification of a `.length` / `x[i]` inside the body: both arms admit
+    // the operation on a type variable correctly (a `T` pinned to a collection has it), and
+    // this is the first position that knows which rep `T` became (D651 / D691).
+    validateMemCstrs(
+      bNames,
+      bTys,
+      ix,
+      cstrCallee,
+      cstrWho,
+      dhNames,
+      dhArgNo,
+      dhArgNode,
+    )
+    validateUfcsCstrs(bNames, bTys, ix, cstrCallee, cstrWho)
+    // The bounds the callee declared, judged here in this site's own scope against the
+    // types this site bound — not deferred, since a bound is written at the declaration:
+    // there is nothing to record on the way in, only something to check on the way out.
+    checkBoundsAtCall(cstrWho, cstrCallee, bNames, bTys, ix)
+    // The escaped-join reject is a fallback, not an additional voice: when this site
+    // already reported a precise operand/argument-flow diagnostic, a join report would only repeat it in vaguer words.
+    if T.diags.length == dBeforeC { validateEscJoins(bNames, bTys) }
+    retTy = substTyDeep(retTy, bNames, bTys)
+  }
+  // A deferred join the re-fold could not decide here (the callee's arms name a hole this
+  // site does not bind) must not escape as this call's type — the emitter has no rep for a
+  // placeholder union. Collapses to one arm, but parks the uncollapsed join first so a
+  // `return h(w)` relay body can carry the whole join to its own call sites (`inferRetTyOf`).
+  const cRetTy = collapseDeferredJoin(retTy)
+  if cRetTy != retTy {
+    noteDeferredJoinNode(ix, retTy)
+    let ejWho = ""
+    if cfn is Ident { ejWho = cfn.identName }
+    noteEscJoin(retTy, ix, ejWho)
+  }
+  return cRetTy
+}
+
 // A call expression: array/string-method builtins, `print`/`fromCodePoint`, the generic
 // function-call path (arity + per-arg assignability), then UFCS `self`-method dispatch
 // (`o.f(args)` → `f(o, args)` for a free function whose first parameter accepts the
 // receiver). Returns the call's type, or -1 when nothing matches (the caller's own error).
 function checkCallNode(n: Call, ix: i32) {
-  // Array method call `xs.push(e)`: when the callee is a member access whose
-  // receiver is an array, type it as a builtin (NOT a struct field). Only fires for
-  // an array receiver, so a plain `f(…)` / non-array method falls through.
   const cfn = P.nodes[n.callFn]
   if cfn is Member {
-    // A member-access callee is always function-typed for semantic tokens; the builtin arms
-    // below type it directly and never revisit the member-read arm, so its name is recorded here (a struct field holding a function falls through to `checkNode` and overwrites it for hover).
-    symMemMethod(n.callFn)
-    let recvTy = checkNode(cfn.memObj)
-    let rt = T.tys[recvTy]
-    // An un-annotated hole receiving an array method (`self.map`/`.push`/…) is constrained to
-    // an array — synthesizing one over a derived element hole and falling into the array-method
-    // arm below, which pins the concrete element per call shape. Without this the hole would
-    // grow a `{map: any}` struct shape no array argument could satisfy.
-    if rt is TyVar {
-      if holeArrMethod(cfn.memProp) {
-        noteArrayDemand(rt.tvName)
-        const elemHole = mkDerivedHole(HD_ELEM, "", -1, -1, recvTy)
-        recvTy = mkArrayTy(elemHole)
-      } else if holeMapMethod(cfn.memProp) {
-        // The dual for a hole receiving a map/set method: becomes the hole's demanded map
-        // (`{[?]: ?}`) and falls into the map-method arm below, which pins the open key/value
-        // from the method's own arguments — `.add` mints the Set flavor. Without this the hole
-        // would grow a `{set: any}` struct shape no map argument could satisfy.
-        recvTy = holeMapDemandTy(rt.tvName, cfn.memProp == "add")
-      }
-    }
-    rt = T.tys[recvTy]
-    if rt is TyArray {
-      const margs = n.callArgs
-      if cfn.memProp == "push" {
-        if margs.length != 1 {
-          tErr("push expects 1 argument, got " + i32ToStr(margs.length), ix)
-        } else {
-          // Contextual param inference for a pushed callback: `fs.push((n) => n + 1)` over a
-          // `((i32) => i32)[]` seeds the lambda's param from the element function type, so an
-          // un-annotated lambda infers `n` instead of erroring (mirrors the `.map`/`.filter`
-          // seeding). A non-function element / non-lambda arg is left untouched by `seedExpected`.
-          if rt.aElem >= 0 { seedExpected(margs[0], rt.aElem) }
-          const pat = checkNode(margs[0])
-          // The first `.push(v)` on a bare empty `[]` pins its element type to `typeof v` in
-          // place — the usage-driven inference that resolves an un-annotated `const xs = []`; a later conflicting push is then a clean type error.
-          if rt.aElem < 0 {
-            rt.aElem = pat
-            tyMutEpoch = tyMutEpoch + 1 // `.push` pinned the element in place
-          } else {
-            // The pushed value's own open holes pin from the element slot — the same rule
-            // `.set` / `m[k] = v` / `xs = e` apply at their own store positions.
-            constrainEmptyExpr(margs[0], pat, rt.aElem)
-            // Uses `assignableExpr`, not bare `assignable`, so a float-literal argument
-            // re-encodes into an `f32` element exactly as it does at a binding, and defers to
-            // the pin when a side is a hole (D582).
-            if !bmArgOk(BM_PUSH, "push", pat, rt.aElem, recvTy, margs[0]) {
-              tErr(bmArgMsg(BM_PUSH, "push", pat, rt.aElem, recvTy), ix)
-            }
-          }
-        }
-        return TY_I32
-      }
-      // `.map(fn)` / `.filter(pred)`: the callback is a 1-arg function over the
-      // element type; map yields an array of the callback's return, filter the
-      // same array type (its predicate must yield bool).
-      if cfn.memProp == "map" || cfn.memProp == "filter" {
-        const cargs = n.callArgs
-        if cargs.length != 1 {
-          tErr(
-            cfn.memProp + " expects 1 argument, got " + i32ToStr(cargs.length),
-            ix,
-          )
-          return TY_ERR
-        }
-        // Seeds the callback's expected param type from the receiver's element type, so an
-        // un-annotated function-literal argument infers its param instead of erroring — only
-        // when the arg is an anonymous literal and the element type is known, else cleared below.
-        const cbArg = P.nodes[cargs[0]]
-        if cbArg is FuncDecl {
-          if cbArg.fnName == "" && rt.aElem >= 0 {
-            recordCbExpected(cargs[0], [rt.aElem])
-          }
-        }
-        const cbTy = checkNode(cargs[0])
-        const cb = T.tys[cbTy]
-        if cb is TyFunc {
-          const cbParams = cb.fnParamTypes
-          if cbParams.length != 1 {
-            tErr(
-              cfn.memProp +
-                " callback expects 1 parameter, got " +
-                i32ToStr(cbParams.length),
-              ix,
-            )
-          } else if !assignable(rt.aElem, cbParams[0]) {
-            tErr(
-              cfn.memProp +
-                " callback: parameter expects " +
-                tyToStr(cbParams[0]) +
-                ", got " +
-                tyToStr(rt.aElem),
-              ix,
-            )
-          }
-          if cfn.memProp == "filter" {
-            if !assignable(cb.fnRet, TY_BOOL) {
-              tErr(
-                "filter predicate must yield boolean, got " + tyToStr(cb.fnRet),
-                ix,
-              )
-            }
-            return recvTy
-          }
-          return mkArrayTy(cb.fnRet)
-        }
-        tErr(cfn.memProp + " expects a function, got " + tyToStr(cbTy), ix)
-        return TY_ERR
-      }
-      // `.pop()` / `.get(i)` yield `T | null` (an empty pop / out-of-range get is
-      // normal absence); `.clear()` empties in place and yields nothing. The element is
-      // its VALUE type (`arrElemValueTy`), so a `u8[]` answers `i32 | null` — the same
-      // widening `xs[i]` takes, and the rep `emitPopNulBox` already builds (D1211).
-      if cfn.memProp == "pop" {
-        if margs.length != 0 {
-          tErr("pop expects 0 arguments, got " + i32ToStr(margs.length), ix)
-        }
-        return mkNullableTy(arrElemValueTy(rt.aElem))
-      }
-      if cfn.memProp == "get" {
-        if margs.length != 1 {
-          tErr("get expects 1 argument, got " + i32ToStr(margs.length), ix)
-        } else {
-          const gat = checkNode(margs[0])
-          if !bmArgOk(BM_INDEXMUST, "get", gat, TY_I32, -1, margs[0]) {
-            tErr(bmArgMsg(BM_INDEXMUST, "get", gat, TY_I32, -1), ix)
-          }
-        }
-        return mkNullableTy(arrElemValueTy(rt.aElem))
-      }
-      if cfn.memProp == "clear" {
-        if margs.length != 0 {
-          tErr("clear expects 0 arguments, got " + i32ToStr(margs.length), ix)
-        }
-        return TY_VOID
-      }
-      // `.slice(start, end?)` yields a NEW array of the SAME element type — the bounds
-      // are i32 (a missing `end` defaults to the length; negatives count from the end).
-      if cfn.memProp == "slice" {
-        if margs.length != 1 && margs.length != 2 {
-          tErr(
-            "slice expects 1 or 2 arguments, got " + i32ToStr(margs.length),
-            ix,
-          )
-        } else {
-          let si = 0
-          while si < margs.length {
-            const sat = checkNode(margs[si])
-            if !bmArgOk(BM_BOUNDMUST, "slice", sat, TY_I32, -1, margs[si]) {
-              tErr(bmArgMsg(BM_BOUNDMUST, "slice", sat, TY_I32, -1), ix)
-            }
-            si = si + 1
-          }
-        }
-        return recvTy
-      }
-      // UFCS `self`-method on an array receiver (`parts.join(sep)`): an array
-      // carries no user FIELD, so a matching free `self`-function resolves
-      // directly — the array dual of the string/struct/union UFCS paths.
-      const au = ufcsCallTy(cfn.memProp, recvTy, n, ix)
-      if au >= 0 { return au }
-      tErr(
-        "no method '." +
-          cfn.memProp +
-          "' on array " +
-          tyToStr(recvTy) +
-          methodDidYouMean(recvTy, cfn.memProp),
-        ix,
-      )
-      return TY_ERR
-    }
-    // Map/Set methods over the `{[K]: V}` rep, gated by flavor: a map exposes `.set`/`.get`/
-    // `.has`/`.delete`/`.keys`/`.values`; a set exposes only `.add`/`.has`/`.delete`/`.values`.
-    // `.add` alone gates on the value's TYPE rather than the flavor bit (see its own arm). The
-    // first `.set`/`.add` on a bare `Map()`/`Set()` pins its key/value holes in place.
-    if rt is TyMap {
-      const mp = cfn.memProp
-      const margs2 = n.callArgs
-      if mp == "set" && rt.mSet == 0 {
-        if margs2.length != 2 {
-          tErr("set expects 2 arguments, got " + i32ToStr(margs2.length), ix)
-        } else {
-          const k0 = checkNode(margs2[0])
-          // The value argument is a store into the map's value slot, taking the same
-          // contextual steps `xs.push(v)` and `m[k] = v` take: `seedExpected` first, then the
-          // expression-aware `assignableExpr` — the one home the assignment path also calls, so `.set` and `m[k] = v` cannot drift apart.
-          if rt.mVal >= 0 { seedExpected(margs2[1], rt.mVal) }
-          const v0 = checkNode(margs2[1])
-          if rt.mKey < 0 {
-            rt.mKey = k0
-            tyMutEpoch = tyMutEpoch + 1 // `.set` pinned the key in place
-            checkInferredMapKey(k0, rt.mSet, ix)
-          } else if !bmArgOk(BM_SETKEY, "set", k0, rt.mKey, -1, margs2[0]) {
-            tErr(bmArgMsg(BM_SETKEY, "set", k0, rt.mKey, -1), ix)
-          }
-          if rt.mVal < 0 {
-            rt.mVal = v0
-            tyMutEpoch = tyMutEpoch + 1 // `.set` pinned the value in place
-          } else {
-            // The value argument's own open holes pin from the slot, the third step
-            // this store shares with `m[k] = v` (which pins in `checkBinExprNode`'s
-            // `=` arm) — without it, `m.set("a", fq())` over a `{[string]: f64[]}` reaches the emitter with an unpinned `[]`.
-            constrainEmptyExpr(margs2[1], v0, rt.mVal)
-            // `assignableExpr` already covers the newtype literal-adoption case (`m.set("k",
-            // 1)` over `{[string]: EntityId}` fires), deferring to the pin under a hole (D582).
-            if !bmArgOk(BM_SETVAL, "set", v0, rt.mVal, -1, margs2[1]) {
-              tErr(bmArgMsg(BM_SETVAL, "set", v0, rt.mVal, -1), ix)
-            }
-          }
-        }
-        return TY_VOID
-      }
-      if mp == "get" && rt.mSet == 0 {
-        if margs2.length != 1 {
-          tErr("get expects 1 argument, got " + i32ToStr(margs2.length), ix)
-        } else {
-          const k1 = checkNode(margs2[0])
-          if !bmArgOk(BM_KEYMUST, "get", k1, rt.mKey, -1, margs2[0]) {
-            tErr(bmArgMsg(BM_KEYMUST, "get", k1, rt.mKey, -1), ix)
-          }
-        }
-        return mkNullableTy(rt.mVal)
-      }
-      // `.add(x)`, the membership insert (`m[x] = true` as the Set surface): admitted on any
-      // map whose VALUE is `boolean`, not only one whose provenance is a `Set()` call — `mSet`
-      // is a one-way refinement written only by `Set()`, so gating on it would make `.add`
-      // depend on how the value is spelled at its binding rather than on its type.
-      if mp == "add" && (rt.mSet == 1 || tyIsPrimNamed(rt.mVal, "boolean")) {
-        if margs2.length != 1 {
-          tErr("add expects 1 argument, got " + i32ToStr(margs2.length), ix)
-        } else {
-          const ka = checkNode(margs2[0])
-          if rt.mKey < 0 {
-            rt.mKey = ka
-            tyMutEpoch = tyMutEpoch + 1 // `.add` pinned the Set key in place
-            checkInferredMapKey(ka, rt.mSet, ix)
-          } else if !bmArgOk(BM_ADDKEY, "add", ka, rt.mKey, -1, margs2[0]) {
-            tErr(bmArgMsg(BM_ADDKEY, "add", ka, rt.mKey, -1), ix)
-          }
-        }
-        return TY_VOID
-      }
-      if mp == "has" || mp == "delete" {
-        if margs2.length != 1 {
-          tErr(mp + " expects 1 argument, got " + i32ToStr(margs2.length), ix)
-        } else {
-          const k2 = checkNode(margs2[0])
-          if !bmArgOk(BM_KEYMUST, mp, k2, rt.mKey, -1, margs2[0]) {
-            tErr(bmArgMsg(BM_KEYMUST, mp, k2, rt.mKey, -1), ix)
-          }
-        }
-        return TY_BOOL
-      }
-      if mp == "keys" && rt.mSet == 0 {
-        if margs2.length != 0 { tErr("keys expects no arguments", ix) }
-        return mkArrayTy(rt.mKey)
-      }
-      if mp == "values" {
-        if margs2.length != 0 { tErr("values expects no arguments", ix) }
-        // A set's `.values()` yields its ELEMENTS (the keys); a map's its values.
-        if rt.mSet == 1 { return mkArrayTy(rt.mKey) }
-        return mkArrayTy(rt.mVal)
-      }
-      tErr(
-        "unknown property `" +
-          mp +
-          "` on " +
-          tyToStr(recvTy) +
-          methodDidYouMean(recvTy, mp),
-        ix,
-      )
-      return TY_ERR
-    }
-    // String methods: `.slice`/`.indexOf`/`.includes`/`.charCodeAt`, and the stage 2c trio
-    // `.cpAt`/`.cpLen`/`.isCharBoundary` (`.length` is a `Member`, `s[i]` an `Index`). The trio
-    // lives in the core rather than `std:str` (OQ-3) because each needs the UTF-8 storage directly
-    // — a byte-offset decode, a continuation-byte scan, a lead-bit test — which the surface exposes no other way to reach.
-    if rt is TyPrim {
-      if rt.primName == "string" {
-        const sp = cfn.memProp
-        const sargs = n.callArgs
-        if sp == "slice" {
-          if sargs.length != 2 {
-            tErr("slice expects 2 arguments, got " + i32ToStr(sargs.length), ix)
-          } else {
-            const s0 = checkNode(sargs[0])
-            const s1 = checkNode(sargs[1])
-            // Two constraints, one sentence: each bound defers on its own (either can be the
-            // hole), but the message names both types, so each form carries the other bound as its `ctx` and renders the identical sentence whichever side failed.
-            const sb0 = bmArgOk(BM_BOUNDS0, "slice", s0, TY_I32, s1, sargs[0])
-            const sb1 = bmArgOk(BM_BOUNDS1, "slice", s1, TY_I32, s0, sargs[1])
-            if !sb0 {
-              tErr(bmArgMsg(BM_BOUNDS0, "slice", s0, TY_I32, s1), ix)
-            } else if !sb1 {
-              tErr(bmArgMsg(BM_BOUNDS1, "slice", s1, TY_I32, s0), ix)
-            }
-          }
-          return TY_STR
-        }
-        if sp == "indexOf" {
-          if sargs.length != 1 {
-            tErr(
-              "indexOf expects 1 argument, got " + i32ToStr(sargs.length),
-              ix,
-            )
-          } else {
-            const a0 = checkNode(sargs[0])
-            if !bmArgOk(BM_EXPECTSA, "indexOf", a0, TY_STR, -1, sargs[0]) {
-              tErr(bmArgMsg(BM_EXPECTSA, "indexOf", a0, TY_STR, -1), ix)
-            }
-          }
-          return TY_I32
-        }
-        if sp == "includes" {
-          if sargs.length != 1 {
-            tErr(
-              "includes expects 1 argument, got " + i32ToStr(sargs.length),
-              ix,
-            )
-          } else {
-            const a0 = checkNode(sargs[0])
-            if !bmArgOk(BM_EXPECTSA, "includes", a0, TY_STR, -1, sargs[0]) {
-              tErr(bmArgMsg(BM_EXPECTSA, "includes", a0, TY_STR, -1), ix)
-            }
-          }
-          return TY_BOOL
-        }
-        if sp == "charCodeAt" {
-          if sargs.length != 1 {
-            tErr(
-              "charCodeAt expects 1 argument, got " + i32ToStr(sargs.length),
-              ix,
-            )
-          } else {
-            const a0 = checkNode(sargs[0])
-            if !bmArgOk(BM_IDXPHRASE, "charCodeAt", a0, TY_I32, -1, sargs[0]) {
-              tErr(bmArgMsg(BM_IDXPHRASE, "charCodeAt", a0, TY_I32, -1), ix)
-            }
-          }
-          return TY_I32
-        }
-        // `s.cpAt(i)` — the code point whose UTF-8 sequence begins at byte offset `i`,
-        // O(1) (§Codepoints). Not "the i-th code point": the argument is in the one
-        // coordinate system `slice`, `indexOf` and `.length` share.
-        if sp == "cpAt" {
-          if sargs.length != 1 {
-            tErr("cpAt expects 1 argument, got " + i32ToStr(sargs.length), ix)
-          } else {
-            const a0 = checkNode(sargs[0])
-            if !bmArgOk(BM_BYTEOFF, "cpAt", a0, TY_I32, -1, sargs[0]) {
-              tErr(bmArgMsg(BM_BYTEOFF, "cpAt", a0, TY_I32, -1), ix)
-            }
-          }
-          return TY_I32
-        }
-        // `s.cpLen()` — the code-point count, O(n) and NAMED so the cost is visible at the
-        // call site rather than hidden in a `.length` that is O(1) on some data and O(n)
-        // on other data (§Codepoints: "a subscript should mean O(1), always").
-        if sp == "cpLen" {
-          if sargs.length != 0 {
-            tErr(
-              "cpLen expects no arguments, got " + i32ToStr(sargs.length),
-              ix,
-            )
-          }
-          return TY_I32
-        }
-        // `s.isCharBoundary(i)` — Rust's primitive, O(1): a single lead/continuation bit
-        // test. Slicing off a boundary is LEGAL under Go-lean validity (§Validity), so this
-        // is the tool for code that wants to check rather than a guard the language imposes.
-        if sp == "isCharBoundary" {
-          if sargs.length != 1 {
-            tErr(
-              "isCharBoundary expects 1 argument, got " + i32ToStr(sargs.length),
-              ix,
-            )
-          } else {
-            const a0 = checkNode(sargs[0])
-            if (
-              !bmArgOk(BM_BYTEOFF, "isCharBoundary", a0, TY_I32, -1, sargs[0])
-            ) {
-              tErr(bmArgMsg(BM_BYTEOFF, "isCharBoundary", a0, TY_I32, -1), ix)
-            }
-          }
-          return TY_BOOL
-        }
-        // `s.bytes()` — the string's UTF-8 storage as a `u8[]`. A COPY, not a view:
-        // see `emitStrBytesFnCode` for why a `u8[]` cannot express a non-zero `start`,
-        // and `strings-design.md` §Byte view for the withdrawn zero-copy claim.
-        if sp == "bytes" {
-          if sargs.length != 0 {
-            tErr(
-              "bytes expects no arguments, got " + i32ToStr(sargs.length),
-              ix,
-            )
-          }
-          return mkArrayTy(TY_U8)
-        }
-        // UFCS `self`-method on a string receiver (`"hello".first()`).
-        const su = ufcsCallTy(sp, recvTy, n, ix)
-        if su >= 0 { return su }
-        // D1230 on a STRING receiver. This arm answers before the general one and
-        // raises its own sentence at the CALL node, so it asks and raises here
-        // rather than banking — `memberFloorErr` never sees a string method call.
-        const suSpecs = ufcsMissingImportSpecs(sp, recvTy, n.callArgs.length)
-        if suSpecs != "" {
-          tErrCodedData(
-            ufcsNotImportedMsg(sp, suSpecs, recvTy),
-            ix,
-            CODE_UFCS_NOT_IMPORTED,
-            ufcsNotImportedData(sp, suSpecs, recvTy),
-          )
-          return TY_ERR
-        }
-        // D1570 on a STRING receiver, raised here for the reason D1230's arm is: this arm
-        // answers before the general one, so `memberFloorErr` never sees a string method call
-        // and there is nothing to bank for.
-        const suName = ufcsAliasAtSite(ix, sp)
-        const suKind = ufcsNotMethodKind(suName, recvTy, n.callArgs.length)
-        if suKind != 0 {
-          tErrCodedData(
-            ufcsNotMethodMsg(sp, suName, recvTy, n.callArgs.length, suKind),
-            ix,
-            CODE_UFCS_NOT_METHOD,
-            ufcsNotMethodData(sp, suName, recvTy, suKind),
-          )
-          return TY_ERR
-        }
-        tErr(
-          "no method '." + sp + "' on string" + methodDidYouMean(recvTy, sp),
-          ix,
-        )
-        return TY_ERR
-      }
-    }
-    // UFCS `self`-method on any other receiver: `o.f(args)` lowers to `f(o, args)` when the
-    // receiver has no such field (a callable field keeps precedence) and a matching free
-    // function exists. The field-first test is `tyFieldTyOf`, the same predicate the emitter's
-    // `drwWalk` calls on the receiver's recorded type, so the two cannot disagree (D1070).
-    const ufcsHasField = tyFieldTyOf(recvTy, cfn.memProp) >= 0
-    const urt = T.tys[recvTy]
-    // A bounded type parameter as the receiver (OQ-5, strict bodies): the bound answers, and
-    // only the bound — arguments check against its declared members and the result is what it
-    // promised. No dispatch happens here; the witness is chosen per instantiation site
-    // (`checkBoundsAtCall`) and baked by the monomorphizer.
-    if urt is TyVar {
-      const bcTy = boundMemberTy(urt.tvName, cfn.memProp, true)
-      if bcTy == BOUND_UNRESOLVED {
-        tErr(boundMemberUnknownMsg(urt.tvName, cfn.memProp), ix)
-        return TY_ERR
-      }
-      if bcTy >= 0 {
-        const bcT = T.tys[bcTy]
-        if bcT is TyFunc {
-          const bcArgs = n.callArgs
-          if bcArgs.length != bcT.fnParamTypes.length {
-            tErr(
-              "`" +
-                cfn.memProp +
-                "` on `" +
-                urt.tvName +
-                "` expects " +
-                i32ToStr(bcT.fnParamTypes.length) +
-                " arguments, got " +
-                i32ToStr(bcArgs.length),
-              ix,
-            )
-            return TY_ERR
-          }
-          let bca = 0
-          while bca < bcArgs.length {
-            const bcat = checkNode(bcArgs[bca])
-            const bcWant = bcT.fnParamTypes[bca]
-            // An UNRESOLVED member type (`-1`) is a bound whose own annotation
-            // named something this scope has no answer for. Reported once, at the
-            // call, rather than fed to `assignable` — which reads a negative side
-            // as "accept anything" and would silently pass every argument.
-            if bcWant < 0 {
-              tErr(boundMemberUnknownMsg(urt.tvName, cfn.memProp), ix)
-              return TY_ERR
-            }
-            if !assignableExpr(bcArgs[bca], bcat, bcWant) {
-              argMismatchErr(bca + 1, bcWant, bcat, bcArgs[bca])
-            }
-            bca = bca + 1
-          }
-          if bcT.fnRet < 0 {
-            tErr(boundMemberUnknownMsg(urt.tvName, cfn.memProp), ix)
-            return TY_ERR
-          }
-          return bcT.fnRet
-        }
-      }
-      const bcMsg = boundMemberFloorMsg(urt.tvName, cfn.memProp)
-      if bcMsg != "" {
-        tErr(bcMsg, ix)
-        return TY_ERR
-      }
-    }
-    if !ufcsHasField {
-      const uu = ufcsCallTy(cfn.memProp, recvTy, n, ix)
-      if uu >= 0 { return uu }
-      // The name is a self-function, just not one in scope (D1230) — asked here since only
-      // the call knows the argument count, banked on the callee member node where the sentence is raised (`memberFloorErr`).
-      noteUfcsMiss(
-        n.callFn,
-        ufcsMissingImportSpecs(cfn.memProp, recvTy, n.callArgs.length),
-      )
-      // When the name is already in scope, which gate declined (D1570) — banked beside
-      // D1230's answer and read after it, since `argc` is known here and raised there.
-      noteUfcsNotMethod(
-        n.callFn,
-        cfn.memProp,
-        ufcsAliasAtSite(ix, cfn.memProp),
-        recvTy,
-        n.callArgs.length,
-      )
-    }
+    const mt = checkMemberCallNode(n, ix, cfn)
+    if mt >= 0 { return mt }
   }
-  // A memory intrinsic declared in the default scope but with no emitter arm
-  // (`nameIsUnimplementedIntrinsic`) is reported here rather than as the emitter's generic "call
-  // to unknown function", which would misread a missing implementation as a typo. Gated on the
-  // callee still denoting that binding, so a shadowing declaration or parameter keeps it (D1604).
+  if cfn is Ident { checkUnimplementedIntrinsicCall(cfn, ix) }
   if cfn is Ident {
-    if (
-      nameIsUnimplementedIntrinsic(cfn.identName) &&
-      (fnDeclIx[cfn.identName] ?? -1) < 0 &&
-      lookupDepth(cfn.identName) == 0
-    ) {
-      tErrUnsupported(
-        "'" +
-          cfn.identName +
-          "' is declared but has no implementation yet — it type-checks and then has nothing to lower (see `docs/internals/memory-gc-design.md` §1.2)",
-        ix,
-      )
-    }
-  }
-  // `print(x)` is a compiler builtin (no module/import system yet): it accepts a
-  // single value of any printable type and yields void. Special-cased so a program
-  // that prints does not trip "undeclared identifier 'print'". Each argument is
-  // still checked so a type error inside it surfaces.
-  if cfn is Ident {
-    if cfn.identName == "print" {
-      const pargs = n.callArgs
-      let pj = 0
-      while pj < pargs.length {
-        const pt = checkNode(pargs[pj])
-        // `print` demands a value to render, and a `void` call has none — the emitter's
-        // print ladder ends in `call __print_i32__` with nothing on the stack.
-        voidValueSlotErr(pt, pargs[pj], "print", pargs[pj])
-        // A domain rejection, asked first (the ruling): `print` takes one value of
-        // `printDomainStr()`'s reps, and an array/struct/map/function value (bare, behind
-        // `| null`, or inside a union) is not one — an ordinary domain error (`tErr`, no
-        // code), not a capability admission, since the language never defined what such a print outputs (D711).
-        if tyPrintsAsRef(pt, 24) {
-          tErr(printRefRefusal(pt), pargs[pj])
-        } else {
-          // The BOXED value-union residue. `print(<i32 | string>)` now LOWERS — every arm
-          // is inside the domain and the emitter dispatches on the box tag, the same
-          // dispatch it performs for `is` (D712) — so what is left here is a box whose
-          // arms that dispatch cannot classify, and only that keeps the concession.
-          const puMsg = printUnionRefusal(pt)
-          if puMsg != "" { tErrUnsupported(puMsg, pargs[pj]) }
-        }
-        // A printed type that still carries a HOLE answers FALSE to both floors above — it
-        // is neither a ref nor a box YET — so the two of them together admit every generic
-        // `print`. Defer it to the pin, the only position that knows the instance.
-        // (`silent-class-inventory` D401; the recorder's header has the measurement.)
-        notePrintCstr(pt, pargs[pj])
-        pj = pj + 1
-      }
-      return TY_VOID
-    }
-    // `Map()` / `Set()` construct an empty string-keyed map: key/value HOLES (-1)
-    // assignable to any map annotation (`const m: {[string]: i32} = Map()`).
-    if cfn.identName == "Map" || cfn.identName == "Set" {
-      if n.callArgs.length != 0 {
-        tErr(cfn.identName + " expects no arguments", ix)
-      }
-      if cfn.identName == "Set" {
-        // A set's VALUE type is the membership boolean; the element (key) is a
-        // hole pinned by the annotation or the first `.add`.
-        return mkMapTy(-1, TY_BOOL, 1)
-      }
-      return mkMapTy(-1, -1, 0)
-    }
-    // `toString(x)` resolves through the ordinary scope as `std:fmt`'s export now, and an
-    // un-imported use gets the migration hint `undeclaredIdentMsg` appends.
-    // `fromCodePoints(xs)` is a builtin: an `i32[]` of code points to a string, in one bulk
-    // copy (the amortized alternative to per-char concat).
-    if cfn.identName == "fromCodePoints" {
-      const pargs = n.callArgs
-      if pargs.length != 1 {
-        tErr(
-          "fromCodePoints expects 1 argument, got " + i32ToStr(pargs.length),
-          ix,
-        )
-      } else {
-        const p0 = checkNode(pargs[0])
-        const p0t = T.tys[p0]
-        let pOk = false
-        if p0t is TyArray {
-          // An empty `[]` literal's element hole (-1) pins to i32 here.
-          if p0t.aElem < 0 || assignable(p0t.aElem, TY_I32) { pOk = true }
-        }
-        if p0t is TyErr { pOk = true }
-        if !pOk {
-          tErr("fromCodePoints expects an i32[], got " + tyToStr(p0), ix)
-        }
-      }
-      return TY_STR
-    }
-    // `fromCodePoint(code)` is a builtin: an i32 code point -> a length-1 string.
-    if cfn.identName == "fromCodePoint" {
-      const fargs = n.callArgs
-      if fargs.length != 1 {
-        tErr(
-          "fromCodePoint expects 1 argument, got " + i32ToStr(fargs.length),
-          ix,
-        )
-      } else {
-        const f0 = checkNode(fargs[0])
-        if !assignable(f0, TY_I32) {
-          tErr("fromCodePoint expects an i32, got " + tyToStr(f0), ix)
-        }
-      }
-      return TY_STR
-    }
-    // The array-intrinsic floor (std-design D1 / collections-design §LS.2),
-    // host parity: `defaultScope.ts`. `__array_new__(n, fill)` allocates `n`
-    // slots each set to `fill`, typing as `T[]` with `T` = the fill's type.
-    if cfn.identName == "__array_new__" {
-      const anArgs = n.callArgs
-      if anArgs.length != 2 {
-        tErr(
-          "__array_new__ expects 2 arguments, got " + i32ToStr(anArgs.length),
-          ix,
-        )
-        return mkArrayTy(-1)
-      }
-      const anLen = checkNode(anArgs[0])
-      if !assignable(anLen, TY_I32) {
-        tErr("__array_new__ expects an i32 length, got " + tyToStr(anLen), ix)
-      }
-      return mkArrayTy(checkNode(anArgs[1]))
-    }
-    // `__array_new_default__(n)`: `n` zeroed/default slots. The element type is a hole (-1)
-    // pinned by the destination — the empty-`[]` mechanism — and the emitter reads the same
-    // pinned row back off this node (`arrNewDefaultKind`), so the two cannot disagree about
-    // the rep. Two questions this arm cannot answer yet are recorded here and asked late (`arrDefCallIx`).
-    if cfn.identName == "__array_new_default__" {
-      const adArgs = n.callArgs
-      if adArgs.length != 1 {
-        tErr(
-          "__array_new_default__ expects 1 argument, got " +
-            i32ToStr(adArgs.length),
-          ix,
-        )
-      } else {
-        const adLen = checkNode(adArgs[0])
-        if !assignable(adLen, TY_I32) {
-          tErr(
-            "__array_new_default__ expects an i32 length, got " + tyToStr(adLen),
-            ix,
-          )
-        }
-      }
-      const adTy = mkArrayTy(-1)
-      arrDefCallIx.push(ix)
-      arrDefCallTy.push(adTy)
-      return adTy
-    }
-    // `__array_copy__(dst, dstAt, src, srcAt, count)`: bulk-moves `count` elements from
-    // `src[srcAt..]` into `dst[dstAt..]`; void. Both must be arrays; the element correlation
-    // between them is deliberately not enforced here, matching the host's own leniency (a
-    // mismatched pair fails loudly at the emit stage in both compilers).
-    if cfn.identName == "__array_copy__" {
-      const acArgs = n.callArgs
-      if acArgs.length != 5 {
-        tErr(
-          "__array_copy__ expects 5 arguments, got " + i32ToStr(acArgs.length),
-          ix,
-        )
-        return TY_VOID
-      }
-      let acI = 0
-      while acI < 5 {
-        const acT = checkNode(acArgs[acI])
-        if acI == 0 || acI == 2 {
-          const acTy = T.tys[acT]
-          let acOk = false
-          if acTy is TyArray { acOk = true }
-          if acTy is TyErr { acOk = true }
-          if !acOk {
-            tErr("__array_copy__ expects a T[], got " + tyToStr(acT), ix)
-          }
-        } else {
-          if !assignable(acT, TY_I32) {
-            tErr("__array_copy__ expects an i32, got " + tyToStr(acT), ix)
-          }
-        }
-        acI = acI + 1
-      }
-      return TY_VOID
-    }
-    // `__trap__()`: the deliberate abort primitive — lowered to `unreachable`.
-    // `__trap__("reason")`: an OPTIONAL single string message, printed to the
-    // host boundary (the print-of-string path) before the abort — so the trap
-    // carries a human-readable reason. Either form still "never returns".
-    if cfn.identName == "__trap__" {
-      if n.callArgs.length > 1 {
-        tErr("__trap__ takes an optional string message", ix)
-      } else if n.callArgs.length == 1 {
-        const trapMsgTy = checkNode(n.callArgs[0])
-        if !assignable(trapMsgTy, TY_STR) {
-          tErr(
-            "__trap__ takes an optional string message, got " + tyToStr(trapMsgTy),
-            ix,
-          )
-        }
-      }
-      return TY_VOID
-    }
-    // The numeric-opcode intrinsics: each lowers to exactly one wasm instruction, so
-    // the checker only has to type them. A user binding of the same name shadows the
-    // intrinsic (`numIntrShadowed`), and the emitter gates on the same rule — the
-    // intrinsic arm is a fallback for a name the program did not define itself.
-    if !numIntrShadowed(cfn.identName) {
-      const bcTy = bitcastCallTy(cfn.identName, n, ix)
-      if bcTy >= 0 { return bcTy }
-      const niTy = numIntrCallTy(cfn.identName, n, ix)
-      if niTy >= 0 { return niTy }
-    }
+    const bt = checkBuiltinIdentCall(n, ix, cfn)
+    if bt >= 0 { return bt }
   }
   const fnTy = checkNode(n.callFn)
-  let args = n.callArgs
   const ft = T.tys[fnTy]
-  if ft is TyFunc {
-    // PENDING return (-2): the un-annotated callee hasn't been inferred yet (a
-    // forward call). Demand-infer it now — check its FuncDecl, which patches this
-    // very TyFunc in place — unless it is already on the in-progress stack (an
-    // in-cycle call: contribute TY_ERR so the cycle can be detected at the root).
-    if ft.fnRet == -2 {
-      if cfn is Ident {
-        if !onInferStack(cfn.identName) {
-          const dIx = fnDeclIx[cfn.identName] ?? -1
-          if dIx >= 0 { checkNode(dIx) }
-        }
-      }
-    }
-    let retTy = ft.fnRet
-    if retTy == -2 {
-      retTy = TY_ERR
-      // A direct self-recursive call resolves to the function's own provisional inferred
-      // type (`inferObserved`, already holding the base case since it is checked first) —
-      // without this, `TY_ERR` makes `assignable(TY_ERR, string)` vacuously true and a `+`
-      // over the recursive call pollutes the inferred return. Mutual recursion keeps `TY_ERR` for the fixpoint to settle.
-      if cfn is Ident {
-        if inferStack.length > 0 {
-          if inferStack[inferStack.length - 1] == cfn.identName {
-            if inferObserved >= 0 { retTy = inferObserved }
-          }
-        }
-      }
-    }
-    const params = ft.fnParamTypes
-    // Defaults are direct-call-site sugar: a call naming a declared function may omit
-    // trailing arguments whose parameters carry a default, so the accepted arity is the
-    // range [`fnRequiredArity`, `params.length`]. A call through a function value has no
-    // declaration to read defaults from and keeps its exact-arity gate.
-    const dParams = calleeDeclParams(n.callFn)
-    let required = params.length
-    if dParams.length == params.length { required = fnRequiredArity(dParams) }
-    if args.length < required || args.length > params.length {
-      tErr(
-        "wrong number of arguments: expected " +
-          arityWantText(required, params.length) +
-          ", got " +
-          i32ToStr(args.length),
-        ix,
-      )
-      return retTy
-    }
-    // Named arguments bind to parameters by name, then positionally — source order is
-    // irrelevant for named args. `TyFunc` carries no parameter names, so the names resolve
-    // against the declaration the scope chain gives this callee; a closure-valued binding has
-    // none and cannot take named arguments, whatever a same-named declaration says (D1604).
-    if hasNamedArgs(n.callArgNames) {
-      const cNames = paramNamesOfNodes(dParams)
-      if cNames.length != params.length {
-        tErr("named arguments require a declared function", ix)
-        return retTy
-      }
-      args = orderNamedCallArgs(cNames, args, n.callArgNames, ix, dParams)
-      if args.length != params.length { return retTy }
-    } else if args.length < params.length {
-      // Trailing positional omission: check the defaults against their
-      // parameters alongside the supplied arguments, so one loop below covers
-      // the whole parameter list. (`args` is rebound to a COPY — `n.callArgs`
-      // stays the source list; the emit-side normalization is `emit_rewrite`'s.)
-      const padded: i32[] = []
-      let pj = 0
-      while pj < params.length {
-        if pj < args.length { padded.push(args[pj]) } else { padded.push(-1) }
-        pj = pj + 1
-      }
-      if fillArgDefaults(padded, dParams, ix) >= 0 { return retTy }
-      args = padded
-    }
-    // Generic call-site inference: a `TyVar` param (or `T[]`) binds its type-param to
-    // the argument's type (first use wins; later uses must agree), and the return
-    // type substitutes through the binding — so `id("s")` is `string`, and
-    // `let n: i32 = id("s")` is a genuine type error downstream.
-    const bNames: string[] = []
-    const bTys: i32[] = []
-    let i = 0
-    while i < args.length {
-      // Contextual param inference for a function-value argument: propagates the expected
-      // param type into it so an un-annotated literal param infers from the signature
-      // (matching `.map`/`.filter`), substituting type-param bindings from earlier arguments
-      // first — `mapArr(xs: T[], f: (T) => R)` called with `[1,2,3]` binds `T = i32` before seeding `f`'s param as `i32`.
-      seedExpected(args[i], substTyDeep(params[i], bNames, bTys))
-      const at = checkNode(args[i])
-      // A template hole meeting its injected renderer. This line is the first
-      // moment the hole's type exists, which is why the type-directed half of
-      // the template lowering lives here and not in the parser's desugar.
-      if nodeIsTplHole(args[i]) {
-        if tplHoleHandled(ix, n.pos, args[i], at, params[i]) { return TY_STR }
-      }
-      // Bind every TyVar reachable in the expected param position from the
-      // argument's shape (first use wins), then check the argument against the
-      // SUBSTITUTED expected type — a later disagreeing use errors here.
-      bindGenWalk(params[i], at, bNames, bTys)
-      const expected = substTyDeep(params[i], bNames, bTys)
-      // A `u8[]` argument meeting a generic parameter: `bindGenWalk` above declined to bind
-      // `T` to storage type `u8`, so `expected` still carries the unsolved hole and
-      // `assignable` answers true vacuously — needing its own message here, or the
-      // monomorphizer builds i32-list machinery over a one-byte backing. `u8[]` is not an instantiation of `T[]`, since `T` ranges over value types and `u8` is storage.
-      if !inferQuiet {
-        if tyIsU8ArrayTy(at) && tyReachesHole(expected, 8) {
-          tErr(
-            "`u8[]` cannot be passed to a generic parameter — `u8` is a storage type, so a type parameter never binds it and a `u8[]` is not a `T[]`",
-            args[i],
-          )
-        }
-      }
-      // A hole or deferred-join argument passes `assignable` vacuously, so the demand is
-      // recorded here and re-validated at the generic call site that pins it under the
-      // substituted argument types — without this, `function f(x) { g(x) }` with `g(n: i32)`
-      // type-checks `f("s")` clean and dies at wasm validation. Recorded on the argument's uncollapsed type, since a join's collapsed arm can later prove unreachable.
-      const atCstr = inferRetTyOf(args[i], at)
-      if tyIsHole(atCstr) || tyIsDeferredJoin(atCstr) {
-        if !tyIsHole(expected) {
-          let ccWho = ""
-          if cfn is Ident { ccWho = cfn.identName }
-          noteArgCstr(atCstr, expected, ccWho)
-        }
-      }
-      // A hole param whose body DEMANDED fields (member access on the hole)
-      // checks the argument against the demanded shape, so `getx(5)` rejects
-      // when the body read `o.x` (host: the grown `Infer<{x,…}>` pin).
-      const pHole = T.tys[params[i]]
-      if pHole is TyVar {
-        if !holeDemandOk(pHole.tvName, args[i], at) {
-          holeArgDemandErr(pHole.tvName, i + 1, at, args[i])
-        }
-        // A hole the body INDEXED (`self[i]`) demands an array — a scalar argument can't be
-        // indexed, so reject it here (`head(5)`) instead of deferring to an emit failure.
-        if holeIsArrayDemanded(pHole.tvName) {
-          if tyRefusesArrayDemand(at) { holeArgArrayErr(i + 1, at, args[i]) }
-        }
-        // The `as` cast the body parked on this hole, re-asked under the argument. D1342.
-        holeCastPinCheck(pHole.tvName, at, declParamNameAt(dParams, i))
-      }
-      // The cast this argument itself is (`id(a as? i32)`), whose destination the pin has to
-      // re-ask (D1371) — but only when the parameter is not a hole: for a hole parameter,
-      // `expected` is the pre-pin answer rather than a declared demand, and holding the cast to it would refuse a program whose annotated twin runs.
-      if !tyIsHole(params[i]) { noteCastArgDest(args[i], i + 1, expected) }
-      // Passing an empty-collection argument into a concrete `T[]` / map param pins
-      // its element type from the param (`len(empty)` resolves `empty` to `i32[]`),
-      // clearing its uninferred floor — pure downstream-usage inference, no push.
-      constrainEmptyExpr(args[i], at, expected)
-      if !assignableExpr(args[i], at, expected) {
-        // Anchored at the offending argument (or its offending return site),
-        // never at the call node — see `argMismatchErr`.
-        argMismatchErr(i + 1, expected, at, args[i])
-      }
-      i = i + 1
-    }
-    // Substitutes the binding into a generic return type — deep, so a structural return
-    // (`{first: B, second: A}`, a generic alias body, a function-typed field) concretizes
-    // per call site; a derived `?ret.` hole collapses to the pinned callee's return
-    // (`substTyDeep`).
-    if bNames.length > 0 {
-      const dBeforeC = T.diags.length
-      let cstrCallee = CSTR_NODECL
-      let cstrWho = ""
-      if cfn is Ident {
-        cstrCallee = fnDeclIx[cfn.identName] ?? CSTR_NODECL
-        // A local bound to a declared generic names that declaration — without this rung the
-        // call falls to `CSTR_NODECL` and adjudicates every generic in the program, since
-        // `substTyDeep` matches `TyVar`s by name and `const g = idT  g(structList)` would
-        // otherwise report a sibling's refusal.
-        if cstrCallee == CSTR_NODECL {
-          const aliasIx = lookupFnAliasNode(cfn.identName)
-          if aliasIx >= 0 { cstrCallee = aliasIx }
-        }
-        cstrWho = cfn.identName
-      }
-      // The direct spelling has no receiver, so every parameter is an argument (`selfOff` 0)
-      // and `params`/`args` are already 1:1 (named arguments reordered, defaults padded).
-      const dhNames: string[] = []
-      const dhArgNo: i32[] = []
-      const dhArgNode: i32[] = []
-      holeArgOrigins(params, args, 0, dhNames, dhArgNo, dhArgNode)
-      validateBinCstrs(
-        bNames,
-        bTys,
-        ix,
-        cstrCallee,
-        cstrWho,
-        dhNames,
-        dhArgNo,
-        dhArgNode,
-      )
-      validatePrintCstrs(bNames, bTys, ix, cstrCallee, cstrWho)
-      validateArgCstrs(bNames, bTys, ix)
-      // The declared return rides the same pin: the body's mismatch check is vacuous under
-      // a hole, and this is the first position that knows the instance (D551).
-      validateRetCstrs(bNames, bTys, ix, cstrCallee, cstrWho)
-      // The destination seam, for the same reason: a value landing in a hole-typed local /
-      // field / element inside the body is a mismatch the body's own gate cannot decide (D572).
-      validateLetCstrs(bNames, bTys, ix, cstrCallee, cstrWho)
-      // A builtin collection method's argument inside the body, for the same reason at a
-      // callee kind the deferred-argument table cannot name: a builtin has no `FuncDecl`, so its own arm is the whole check and is vacuous under a hole (D582).
-      validateBmCstrs(bNames, bTys, ix, cstrCallee, cstrWho)
-      // The receiver classification of a `.length` / `x[i]` inside the body: both arms admit
-      // the operation on a type variable correctly (a `T` pinned to a collection has it), and
-      // this is the first position that knows which rep `T` became (D651 / D691).
-      validateMemCstrs(
-        bNames,
-        bTys,
-        ix,
-        cstrCallee,
-        cstrWho,
-        dhNames,
-        dhArgNo,
-        dhArgNode,
-      )
-      validateUfcsCstrs(bNames, bTys, ix, cstrCallee, cstrWho)
-      // The bounds the callee declared, judged here in this site's own scope against the
-      // types this site bound — not deferred, since a bound is written at the declaration:
-      // there is nothing to record on the way in, only something to check on the way out.
-      checkBoundsAtCall(cstrWho, cstrCallee, bNames, bTys, ix)
-      // The escaped-join reject is a fallback, not an additional voice: when this site
-      // already reported a precise operand/argument-flow diagnostic, a join report would only repeat it in vaguer words.
-      if T.diags.length == dBeforeC { validateEscJoins(bNames, bTys) }
-      retTy = substTyDeep(retTy, bNames, bTys)
-    }
-    // A deferred join the re-fold could not decide here (the callee's arms name a hole this
-    // site does not bind) must not escape as this call's type — the emitter has no rep for a
-    // placeholder union. Collapses to one arm, but parks the uncollapsed join first so a
-    // `return h(w)` relay body can carry the whole join to its own call sites (`inferRetTyOf`).
-    const cRetTy = collapseDeferredJoin(retTy)
-    if cRetTy != retTy {
-      noteDeferredJoinNode(ix, retTy)
-      let ejWho = ""
-      if cfn is Ident { ejWho = cfn.identName }
-      noteEscJoin(retTy, ix, ejWho)
-    }
-    return cRetTy
-  }
+  if ft is TyFunc { return checkCallOnFuncTy(n, ix, cfn, ft) }
   if ft is TyErr { return TY_ERR }
   if ft is TyVar {
     // Calling an inference-hole value — an un-annotated parameter used as a function inside
@@ -21064,6 +21077,759 @@ function ifChainHasBareReturn(ifIx: i32): boolean {
   false
 }
 
+// The un-annotated return, decided after the body is checked and its scope popped: the
+// observed returns join into one type, a contextual expected return may adopt it, and the
+// hoisted `TyFunc` is patched so existing references see the result. Restores the
+// inference accumulators its caller saved, and hands back the return type to finalize.
+function finishInferredReturn(
+  n: FuncDecl,
+  fnIx: i32,
+  paramTys: i32[],
+  paramUninferable: boolean,
+  cbBefore: i32,
+  savedObserved: i32,
+  savedSawErr: boolean,
+  savedValueRet: boolean,
+  bodyTotalForRet: boolean,
+): i32 {
+  let ret = -2
+  inferStack.pop()
+  let inferred = TY_VOID
+  // Set when the object-shaped contextual adoption fires (`objRetWidenAdopt` below):
+  // gates the plain-struct canonical record — a lambda whose self-inference already
+  // matches its context keeps the established un-pinned route (pinning every
+  // plain-struct lambda regresses `.map`-collapse / factory / generic-HOF cases).
+  let objRetAdopted = false
+  const sawCycle = cycleBreakCount > cbBefore
+  if inferObserved >= 0 {
+    inferred = inferObserved
+  } else if sawCycle && fnSawValueRet {
+    // A value return position resolved to `void` only because a recursive-cycle member
+    // is still pending: defer, so the binding-group fixpoint re-infers this once the
+    // cycle's resolvable members settle. Genuine void recursion has no value return
+    // position (`fnSawValueRet` is false), so it is never deferred this way.
+    if !listHasStr(inferTentative, n.fnName) { inferTentative.push(n.fnName) }
+    inferred = TY_VOID
+  } else if inferSawErr {
+    // Only err-ish types flowed back: no basis. A param that is itself uninferable
+    // already reported the root cause, so suppress the redundant message.
+    if !paramUninferable {
+      tErr(
+        "cannot infer a return type for '" +
+          n.fnName +
+          "' — annotate a return type",
+        n.fnBody,
+      )
+    }
+    inferred = TY_ERR
+  }
+  // Contextual return adoption: an anonymous lambda whose body infers a narrower numeric
+  // than the contextual expected return takes the expected return as its own, so the
+  // widening lands at the lambda's return seam (`emitReturnValue`). Numeric widening through
+  // function-type variance is rejected instead (`fnSlotAssignable`), since a function value's rep is fixed.
+  if n.fnName == "" && inferred >= 0 {
+    // A contextual adoption below means the seed changed what this lambda infers, so an
+    // annotation that supplied it is load-bearing and cannot be judged redundant by
+    // comparing the two (D1442). Snapshot/compare rather than marking each arm, since there are twenty of them and a new one must not have to remember.
+    const preAdopt = inferred
+    const expRet = cbExpectedRetFor(fnIx)
+    if expRet >= 0 {
+      if numWidens(inferred, expRet) { inferred = expRet }
+      // The f32 dual of the numeric widen: a literal-bodied lambda whose contextual return
+      // is f32 infers f64/i32 by default, but the literal re-encodes exactly at f32 — the
+      // same grant a direct `const v: f32 = 5.5` binding makes. Adopts f32 so the functype
+      // result is f32 and `emitReturnValue` encodes the literal at f32 in the body.
+      if inferred != expRet && primNameOf(expRet) == "f32" {
+        if isF32AdoptingLitExpr(lambdaBodyTail(n.fnBody)) { inferred = expRet }
+      }
+      // Object-shaped dual: `() => ({f: 5})` against `() => {f: i64}` — adopt the
+      // expected shape when every widening field is a re-encodable literal
+      // (`objRetWidenAdopt` also records the field types for the emitter's interner).
+      if objRetWidenAdopt(n.fnBody, inferred, expRet) {
+        inferred = expRet
+        objRetAdopted = true
+      }
+      // The litunion dual: a bare string-literal body that is a member of the expected
+      // literal-union adopts it. Its inferred type is the softened `string`; the direct
+      // `const k: K = "b"` binding grants the member flow via `assignableExpr`, but the
+      // lambda-return path only had the numeric/object arms until this one.
+      if inferred != expRet && tyIsLitUnion(expRet) {
+        const luTail = lambdaBodyTail(n.fnBody)
+        if luTail >= 0 && assignableExpr(luTail, inferred, expRet) {
+          inferred = expRet
+        }
+      }
+      // A nullable-string result: a lambda body inferring a bare `string` member of an
+      // expected `string | null` closure result adopts the nullable — its functype result is
+      // the string-ref `ref.null` niche, and `emitReturnValue` niches the value exactly as
+      // the named-function value spelling lowers. Covers the string/boolean niches only; a nullable numeric scalar boxes through `valueUnionRetName` instead.
+      if inferred != expRet {
+        const etU = T.tys[expRet]
+        if etU is TyNullable {
+          // The boolean-niche dual of the string niche: a lambda body inferring a bare
+          // `boolean`/`null` member of an expected `boolean | null` adopts the niche — its
+          // functype result is the i32 sentinel (2 = null), exactly as the annotated
+          // `: boolean | null` return and the named-function value lower.
+          if (
+            tyIsPrimNamed(etU.nInner, "string") ||
+            tyIsPrimNamed(etU.nInner, "boolean")
+          ) {
+            const nsTail = lambdaBodyTail(n.fnBody)
+            if nsTail >= 0 && assignableExpr(nsTail, inferred, expRet) {
+              inferred = expRet
+            }
+          }
+          // The nullable-list dual: a lambda body inferring the bare i32-backed list member
+          // of an expected `T[] | null` adopts the niche — its functype result is the
+          // nullable i32-list wrapper, exactly as the annotated form lowers. Distinct-backing
+          // leaves (`i64[] | null`, …) are not adopted and stay loud checker rejects.
+          if inferred != expRet && tyIsNulI32BackedListInner(etU.nInner) {
+            const nlTail = lambdaBodyTail(n.fnBody)
+            if nlTail >= 0 && assignableExpr(nlTail, inferred, expRet) {
+              inferred = expRet
+            }
+          }
+          // The nullable-closure dual: a lambda body inferring `null` (or a closure) against
+          // an expected nullable-closure result adopts the niche — its functype result is
+          // `(ref null $cloStruct)`, and `emitReturnValue`'s `retNulClosure` arm niches a
+          // `return null` exactly as the annotated form already lowers.
+          const etInnerTy = T.tys[etU.nInner]
+          if etInnerTy is TyFunc {
+            const ncTail = lambdaBodyTail(n.fnBody)
+            if ncTail >= 0 && assignableExpr(ncTail, inferred, expRet) {
+              inferred = expRet
+            }
+          }
+          // The nullable-struct dual: a lambda body inferring the bare struct member (or
+          // `null`) of an expected `S | null` closure result adopts the nullable — its
+          // functype result is the `(ref null $S)` niche, exactly as the annotated
+          // named-function value spelling already lowers.
+          if etInnerTy is TyObj {
+            const nsoTail = lambdaBodyTail(n.fnBody)
+            if nsoTail >= 0 && assignableExpr(nsoTail, inferred, expRet) {
+              inferred = expRet
+            }
+          }
+          // The nullable-litunion dual: a lambda body inferring a bare `string` member of
+          // the expected `K | null` litunion adopts the niche — its functype result is the
+          // i32 atom (`-1` = null), and `emitReturnValue`'s `retNulLitUnion` arm encodes it
+          // exactly as the annotated `: () => K | null` form already does.
+          if tyIsLitUnion(etU.nInner) {
+            const nluTail = lambdaBodyTail(n.fnBody)
+            if nluTail >= 0 && assignableExpr(nluTail, inferred, expRet) {
+              inferred = expRet
+            }
+          }
+        }
+      }
+      // A value-union result: a lambda body inferring a bare scalar arm of the expected
+      // value-union box result adopts the union, so the widening lands at the return seam —
+      // `emitReturnValue` boxes the scalar and the functype result is the box itself
+      // (`synthRetAnnots` pins `fnRet`). Checked after the niche arms, so a `T | null` niche is never swallowed as a value union.
+      if inferred != expRet && valueUnionRetName(expRet) != "" {
+        const vuTail = lambdaBodyTail(n.fnBody)
+        if vuTail >= 0 && assignableExpr(vuTail, inferred, expRet) {
+          inferred = expRet
+        }
+      }
+      // The litunion-array dual of the value-union result: a lambda body inferring the bare
+      // scalar arm of the expected `litunion-array | scalar` box adopts the union, boxing at
+      // the return seam. `valueUnionRetName` declines this union (its render flattens the
+      // litunion-array atom), so it needs its own alias-preserving arm.
+      if inferred != expRet && litUnionArrayValueUnionRetName(expRet) != "" {
+        const laTail = lambdaBodyTail(n.fnBody)
+        // Gates on strict `assignable` of the body's inferred type, not the expression-level
+        // `assignableExpr` the other arms use: the litunion-array arm reps as the kind-7
+        // i32-atom list, but a bare array literal self-infers the softened `string[]`, whose
+        // element re-typing would box the wrong tag. Only a body already at the union's own rep is adopted.
+        if laTail >= 0 && assignable(inferred, expRet) { inferred = expRet }
+      }
+      // The closure-arm dual of the value-union result: a lambda body inferring one arm (a
+      // closure or a scalar) of the expected closure-arm value union adopts it, boxing at
+      // the return seam — a closure member is the kind-11 ref atom riding the box's anyref
+      // value, and the functype result is the box (`synthRetAnnots` pins `fnRet`).
+      if inferred != expRet && cloArmValueUnionRetName(expRet) != "" {
+        const cvTail = lambdaBodyTail(n.fnBody)
+        if cvTail >= 0 && assignableExpr(cvTail, inferred, expRet) {
+          inferred = expRet
+        }
+      }
+      // The map-member-union dual: a lambda body inferring one struct arm of the expected
+      // map-member-union box result adopts the union, boxing the struct/map arm into the
+      // #865/#868 map-union box at the return seam, exactly as the annotated form exposes
+      // this rep already.
+      if inferred != expRet && mapUnionRetName(expRet) != "" {
+        const muTail = lambdaBodyTail(n.fnBody)
+        if muTail >= 0 && assignableExpr(muTail, inferred, expRet) {
+          inferred = expRet
+        }
+      }
+      // The ref-arm dual: a lambda body inferring one arm (a ref list or a struct) of the
+      // expected ref-arm union adopts it, boxing at the return seam so the functype result is
+      // the box rather than the raw reflist a narrowed call site would then cast — a
+      // guaranteed runtime trap or invalid wasm otherwise. Nominal-gated (`refArmUnionRetName` declines an anonymous-element array arm), so those shapes stay loud.
+      if inferred != expRet && refArmUnionRetName(expRet, gRootStmts) != "" {
+        const raTail = lambdaBodyTail(n.fnBody)
+        if raTail >= 0 && assignableExpr(raTail, inferred, expRet) {
+          inferred = expRet
+        }
+      }
+      // The variant-box dual with an inline-struct arm: a lambda body inferring one arm of
+      // the expected union adopts the whole union, boxing at the return seam so the
+      // functype result is the box, matching the value call's `annSigKey`. Checked after
+      // `refArmUnionRetName`, whose ref-array arms carry a slot render this arm declines.
+      if inferred != expRet && variantBoxUnionRetName(expRet) != "" {
+        const vbTail = lambdaBodyTail(n.fnBody)
+        if vbTail >= 0 && assignableExpr(vbTail, inferred, expRet) {
+          inferred = expRet
+        }
+      }
+      // The element-nullable-list result: a lambda body array literal assignable to the
+      // expected value-union-box list adopts it, so `emitReturnValue` seeds each nullable
+      // element through the same rep the annotated `(f64|null)[]` form already lowers
+      // (`synthRetAnnots` pins `fnRet`).
+      if inferred != expRet && nulElemListRetName(expRet) != "" {
+        const elTail = lambdaBodyTail(n.fnBody)
+        if elTail >= 0 && assignableExpr(elTail, inferred, expRet) {
+          inferred = expRet
+        }
+      }
+      // The element-nullable-struct-list dual: a lambda body array literal (non-null
+      // structs, or `null`) assignable to the expected nullable-struct-element list adopts
+      // it, building each element through the kind-1 struct niche the annotated form already
+      // lowers. Un-pinned, the body's structs would self-classify onto a different reflist slot than the annotation side.
+      if inferred != expRet && nulStructElemListRetName(expRet) != "" {
+        const nseTail = lambdaBodyTail(n.fnBody)
+        if nseTail >= 0 && assignableExpr(nseTail, inferred, expRet) {
+          inferred = expRet
+        }
+      }
+      // The element-nullable-map-list dual: a lambda body array literal (non-null maps, or
+      // `null`) assignable to the expected nullable-map-element list adopts it, building each
+      // element through the kind-3 map niche the annotated form already lowers. Un-pinned,
+      // the body's maps would self-classify onto a different reflist slot than the annotation side.
+      if inferred != expRet && nulMapElemListRetName(expRet) != "" {
+        const nmeTail = lambdaBodyTail(n.fnBody)
+        if nmeTail >= 0 && assignableExpr(nmeTail, inferred, expRet) {
+          inferred = expRet
+        }
+      }
+      // The element-nullable-scalar-list dual: a lambda body array literal (non-null inner
+      // lists, or `null`) assignable to the expected nullable-list-element list adopts it,
+      // building each element through the nullable inner-wrapper niche the annotated form
+      // already lowers. Un-pinned, the body's lists would self-classify onto a different reflist slot than the annotation side.
+      if inferred != expRet && nulListElemListRetName(expRet) != "" {
+        const nleTail = lambdaBodyTail(n.fnBody)
+        if nleTail >= 0 && assignableExpr(nleTail, inferred, expRet) {
+          inferred = expRet
+        }
+      }
+      // The element-value-union-list dual: a lambda body array literal assignable to the
+      // expected value-union-box list adopts it, boxing each element through the same
+      // element-kind-2 rep the annotated form already lowers.
+      if inferred != expRet && elemValueUnionListRetName(expRet) != "" {
+        const evTail = lambdaBodyTail(n.fnBody)
+        if evTail >= 0 && assignableExpr(evTail, inferred, expRet) {
+          inferred = expRet
+        }
+      }
+      // The element-variant-box-union-list dual: a lambda body array literal assignable to
+      // the expected variant-box-element list adopts it, boxing each element through the
+      // same element-kind-2 rep the annotated named-function value form already lowers.
+      if inferred != expRet && elemVariantBoxListRetName(expRet) != "" {
+        const vbeTail = lambdaBodyTail(n.fnBody)
+        if vbeTail >= 0 && assignableExpr(vbeTail, inferred, expRet) {
+          inferred = expRet
+        }
+      }
+      // The element-map-union-list dual: a lambda body array literal assignable to the
+      // expected map-union-element list adopts it, boxing each element through the same
+      // element-kind-2 map-union box rep the annotated form already lowers. Un-pinned, the
+      // body's array would self-classify onto a different reflist slot than the annotation side.
+      if inferred != expRet && elemMapUnionListRetName(expRet) != "" {
+        const meTail = lambdaBodyTail(n.fnBody)
+        if meTail >= 0 && assignableExpr(meTail, inferred, expRet) {
+          inferred = expRet
+        }
+      }
+      // The element-refarm-value-union-list dual: a lambda body array literal assignable to
+      // the expected list of (union-element-array | scalar) boxes adopts it, boxing each
+      // element through the same element-kind-2 box the annotated form already lowers.
+      // Un-pinned, the body's array would key onto a different `$fnsig` slot than the annotation side.
+      if inferred != expRet && elemRefArmValueUnionListRetName(expRet) != "" {
+        const raeTail = lambdaBodyTail(n.fnBody)
+        if raeTail >= 0 && assignableExpr(raeTail, inferred, expRet) {
+          inferred = expRet
+        }
+      }
+      // The nested (2-D+) union-element array dual: a lambda body nested array literal
+      // assignable to the expected 2-D+ box-element list adopts it, building the nested
+      // lists through the same element-kind-2 box the annotated form already lowers
+      // (`synthRetAnnots` pins `fnRet` off this producer's rung, `IR_RUNG_NESTED_ELEM_UNION_LIST`).
+      if inferred != expRet && nestedElemUnionListRetName(expRet) != "" {
+        const nueTail = lambdaBodyTail(n.fnBody)
+        if nueTail >= 0 && assignableExpr(nueTail, inferred, expRet) {
+          inferred = expRet
+        }
+      }
+      // The union-field-struct-element-list dual: a lambda body array literal assignable to
+      // the expected list of boxed-field structs adopts it, building each element's boxed
+      // field slot exactly as the annotated form lowers (`synthRetAnnots` pins `fnRet` via
+      // `nameIsStructWithUnionField`).
+      if inferred != expRet && structFieldBoxElemListRetName(expRet) != "" {
+        const sfeTail = lambdaBodyTail(n.fnBody)
+        if sfeTail >= 0 && assignableExpr(sfeTail, inferred, expRet) {
+          inferred = expRet
+        }
+      }
+      // The nullable-closure-element-list dual: a lambda body array literal assignable to
+      // the expected kind-5 niche list adopts it, seeding each element (a `null` to
+      // `ref.null $cloStruct`) through the same rep the annotated form already lowers.
+      if inferred != expRet && nulClosureElemListRetName(expRet) != "" {
+        const nceTail = lambdaBodyTail(n.fnBody)
+        if nceTail >= 0 && assignableExpr(nceTail, inferred, expRet) {
+          inferred = expRet
+        }
+      }
+      // The nested-list result: a lambda body array literal assignable to the expected
+      // nested scalar-leaf array adopts it, building under the pinned return's threading
+      // (`synthRetAnnots` pins `fnRet`); the `$fnsig` result keys the reflist slot on both
+      // producers, unlike the 1-D scalar-list arm below (R4).
+      if inferred != expRet && nestedLeafListRetName(expRet) != "" {
+        const nlTail = lambdaBodyTail(n.fnBody)
+        if nlTail >= 0 && assignableExpr(nlTail, inferred, expRet) {
+          inferred = expRet
+        }
+      }
+      // The scalar-leaf-list result: a lambda body array literal assignable to the expected
+      // distinct-backing scalar-leaf list adopts it — elements re-encode at the leaf
+      // (`assignableExpr`'s `ArrayLit` arm, the grant a direct `const xs: f32[] = [1.5]`
+      // binding makes), and `synthRetAnnots` pins `fnRet` to the adopted name (`isScalarListRetName`).
+      if inferred != expRet && scalarLeafListRetName(expRet) != "" {
+        const slTail = lambdaBodyTail(n.fnBody)
+        if slTail >= 0 && assignableExpr(slTail, inferred, expRet) {
+          inferred = expRet
+        }
+      }
+      // The litunion-element-list result: a lambda body array literal whose elements are
+      // members of the expected litunion-element list adopts it — `assignableExpr`'s
+      // `ArrayLit` arm records the destination array type, so the body builds the i32 atom
+      // list; the `>a` result token already byte-matches the annotation side, so no pin is needed.
+      if inferred != expRet && litUnionElemListRetName(expRet) != "" {
+        const lulTail = lambdaBodyTail(n.fnBody)
+        if lulTail >= 0 && assignableExpr(lulTail, inferred, expRet) {
+          inferred = expRet
+        }
+      }
+      // The struct-element-list result: a lambda body array literal's element structs
+      // coerce field-wise into the expected shape and adopt it — `assignableExpr`'s
+      // per-element `ObjLit` coercion records the coerced field types for the emitter's
+      // interner. Gated on plainly-lowerable element fields, so a map/union/nullable field stays a loud reject.
+      if inferred != expRet && structElemListRetName(expRet) != "" {
+        const seTail = lambdaBodyTail(n.fnBody)
+        if seTail >= 0 && assignableExpr(seTail, inferred, expRet) {
+          inferred = expRet
+          objRetAdopted = true
+        }
+      }
+      // The loud floor, last rung of this ladder: an empty-`[]` result no arm above adopted
+      // is the absence of a rep, not a narrower version of one — leaving `fnRet` a hole would
+      // cast-trap the value call or disagree with the body's list at emit. Exempt only the
+      // i32-backed elements (`i32`/`boolean`), which share the one i32-list backing with the annotation and so are already correct un-adopted.
+      if inferred != expRet && unresolvedHole(inferred) {
+        const ehT = T.tys[expRet]
+        if ehT is TyArray {
+          if (
+            !tyIsPrimNamed(ehT.aElem, "i32") &&
+            !tyIsPrimNamed(ehT.aElem, "boolean")
+          ) {
+            tErrUnsupported(
+              "a lambda returning an empty `[]` cannot build the " +
+                tyToStr(expRet) +
+                " result its annotation asks for — type-valid, but the element type has no" +
+                " rep to build from; return the literal from a named function" +
+                " (`function f(): " +
+                tyToStr(expRet) +
+                " { return [] }`), which lowers this",
+              n.fnBody,
+            )
+          }
+        }
+      }
+    }
+    if inferred != preAdopt { cbSeedUsed = cbSeedUsed + 1 }
+  }
+  // Permissive fall-through (totality): an un-annotated function that can fall off the end
+  // implicitly yields `null` there, so its inferred return widens to `T | null`. A box-able
+  // value type lowers un-annotated via the `uBoxIdx` box; a niche (`boolean`/`string`) widens
+  // too but stays floored below until A20 carries the niche seed. A void/error return is exempt.
+  if (
+    !bodyTotalForRet &&
+    inferred >= 0 &&
+    !isVoidTy(inferred) &&
+    inferred != TY_ERR
+  ) {
+    const inT = T.tys[inferred]
+    if !(inT is TyNullable) { inferred = mkNullableTy(inferred) }
+  }
+  // Robustness floor: an un-annotated function whose returns join to a union/nullable now
+  // infers the correct type, but must still be annotated when the emitter cannot yet lower
+  // it un-annotated — a value union/nullable already lowers via the `uBoxIdx` box and does
+  // not floor; a deferred join (a per-call-site placeholder) is not a shape to floor either, since it collapses to one arm at each call site.
+  if (
+    !inferQuiet &&
+    n.fnName != "" &&
+    inferred >= 0 &&
+    !tyIsDeferredJoin(inferred) &&
+    valueUnionRetName(inferred) == ""
+  ) {
+    const itt = T.tys[inferred]
+    // A variant-box union (`{w: i32} | i32`, and its nullable form) lowers un-annotated: the
+    // A20 loop records `variantBoxUnionRetName` and the emitter boxes it exactly like the
+    // annotated spelling. Checked before the `TyUnion`/`TyNullable` arms below (it spans
+    // both), so the floor accepts exactly the box the emitter registers.
+    if litUnionAliasNameOfTy(inferred) != "" {
+      // A pure literal union with a declared alias (`type K = "a" | "b"`) lowers
+      // un-annotated as the interned i32 atom: the A20 loop records the alias name and the
+      // emitter's return classification reads the same rep the annotated `: K` spelling
+      // reaches. An inline litunion (no alias to record) still floors below.
+    } else if variantBoxUnionRetName(inferred) != "" {
+      // lowers un-annotated — no floor
+    } else if tyIsLitUnion(inferred) {
+      // A pure un-named literal union lowers un-annotated as a string ref, the same rep its
+      // annotated twin carries — `collectF` records `retPrim = "string"` for this shape and
+      // the return site widens an atom-repped value into it. The alias form above reps as
+      // the atom instead, so the two never collide.
+    } else if numLitUnionHasBase(inferred) {
+      // A numeric literal union has no union rep at all: every member softens to one base
+      // scalar, so the recorder banks the base (`numLitUnionBaseTy`, the same rule
+      // `softenLitTy` states everywhere) and this arm accepts exactly what it banks. The
+      // string litunion two arms up is the shape that keeps an identity (the interned atom), which is why it is a separate question.
+    } else if itt is TyUnion {
+      // A pure struct-union whose every member maps to a named type lowers un-annotated via
+      // the variant-boxed rep, exactly like the annotated form — so it does not floor. The
+      // export uses the same `structUnionRetName` predicate, so the floor accepts exactly
+      // what the emitter can register.
+      if structUnionRetName(inferred, gRootStmts) == "" {
+        tErrUnsupported(
+          "'" +
+            n.fnName +
+            "' infers the union return type " +
+            tyToStr(inferred) +
+            " — type-valid, but an inferred return of this shape is not yet supported by codegen; annotate the return type",
+          n.fnBody,
+        )
+      }
+    } else if itt is TyNullable {
+      // The niche nullables (`boolean | null` / `string | null` / `K | null`), a nullable
+      // struct, a nullable list at every element type, and a never-filled infer-null hole
+      // (`nInner < 0`, whose only value is `null`) all lower un-annotated — each named by its
+      // own recorder for the emitter to seed from — so none of them floor (D1576).
+      if (
+        itt.nInner >= 0 &&
+        !tyIsPrimNamed(itt.nInner, "boolean") &&
+        !tyIsPrimNamed(itt.nInner, "string") &&
+        litUnionAliasNameOfTy(itt.nInner) == "" &&
+        nullableRetName(inferred, gRootStmts) == "" &&
+        nulListRetName(inferred) == ""
+      ) {
+        tErrUnsupported(
+          "'" +
+            n.fnName +
+            "' infers the nullable return type " +
+            tyToStr(inferred) +
+            " — type-valid, but an inferred return of this shape is not yet supported by codegen; annotate the return type",
+          n.fnBody,
+        )
+      }
+    }
+  }
+  ret = inferred
+  // Patches the hoisted `TyFunc` in place so existing references see the result; a nested
+  // (un-hoisted) named function declares fresh, and an anonymous lambda just carries its
+  // type as the expression value. The parameter-solve probe observes this body and must not
+  // decide the return, so patching here would deny pass 1.7 a fresh re-derivation.
+  if n.fnName != "" && !paramSolveProbe {
+    const bound = lookup(n.fnName)
+    let patched = false
+    if bound >= 0 {
+      const bt = T.tys[bound]
+      if bt is TyFunc {
+        bt.fnRet = inferred
+        tyMutEpoch = tyMutEpoch + 1 // inferred return patched in place
+        patched = true
+      }
+    }
+    if !patched { declare(n.fnName, mkFuncTy(paramTys, inferred)) }
+    // Re-retains the symbol-table type with the inferred return: the entry stamped while
+    // checking the signature carried the `-2` infer-later sentinel, and the in-place patch
+    // above only touches the scope-bound copy. Without this, hover / inlay on an
+    // unannotated function renders `-> _`.
+    if symEnabled != 0 { symRetainType(fnIx, mkFuncTy(paramTys, inferred), 2) }
+  } else if !inferQuiet {
+    // An anonymous lambda is lifted to a top-level function under a synthesized
+    // `__lambda_N` name the checker never saw, so the name-keyed inferred-return table
+    // can't reach it. Records the inferred scalar/string/list return under a node-index
+    // sentinel key (`#<nodeIx>`) instead, read back by `inferRetNameByNode`.
+    const anm = tyToStructStr(inferred)
+    // A struct-with-boxed-field contextual return the checker adopted at the lambda
+    // boundary (`objRetWidenAdopt`'s boxing-widen arm), recorded under the canonical emit
+    // name (not the spaced `tyToStr` render) so `synthRetAnnots`'s pin and
+    // `internShapeDeep`'s intern resolve. Takes precedence over `recordable`.
+    const sfbNm = structFieldBoxRetName(inferred)
+    // A map-carrying struct return, recorded under the canonical emit name too — the spaced
+    // `recordable` render never pins, and an un-pinned body literal's nested map field would
+    // otherwise resolve by field-name set and mint a wrong-layout twin. Checked after `sfbNm` (a boxed-field struct keeps its established pin).
+    let smfNm = ""
+    if sfbNm == "" { smfNm = structMapFieldRetName(inferred) }
+    // A plain struct return, recorded canonically too: the spaced `recordable` render never
+    // pins, and an un-pinned lambda's body literal fieldset-matches — a same-fieldset twin
+    // row in scope can resolve the wrong row otherwise. Composite fields (map/union/closure/list) keep their own recorder arms below.
+    let spfNm = ""
+    if sfbNm == "" && smfNm == "" && objRetAdopted {
+      spfNm = structPlainRetName(inferred)
+    }
+    // A single struct-shape inferred return is recorded too — a lambda that collapses to
+    // one union variant types as that variant's shape, so the emitter resolves it to the
+    // concrete variant rather than the box. The gates run only when all three canonical
+    // recorders declined, each at most once, in source order — `recordable` is bit-identical to the disjunction it replaces.
+    let recCode = IR_RUNG_NONE
+    if sfbNm == "" && smfNm == "" && spfNm == "" {
+      if isClassifiableRetName(anm) { recCode = IR_REC_CLASSIFIABLE }
+      else if isObjShapeName(anm) { recCode = IR_REC_OBJ_SHAPE }
+      else if isScalarListRetName(anm) { recCode = IR_REC_SCALAR_LIST }
+    }
+    const recordable = recCode != IR_RUNG_NONE
+    // A union inferred/contextual return exports its emitter-format name (value-union or
+    // struct-union) under the same node sentinel, mirroring the named-function A20 loop —
+    // the contextual return the checker proved for the lambda at its own boundary, pinned
+    // position-independently (`synthRetAnnots`) rather than re-derived per boundary.
+    let unm = ""
+    // Not the only writer since the r8 split: `nulElemListRetName` sets the rung itself, and
+    // the contextual-adoption gate above calls that producer too, so a write can land before
+    // this reset — safe since the reset is unconditional and precedes the cascade. The
+    // global's lifetime is exactly one cascade run: cleared here, written once, read once.
+    inferRetNameRung = IR_RUNG_NONE
+    if !recordable {
+      unm = irRung(IR_RUNG_SFB, sfbNm)
+      if unm == "" { unm = irRung(IR_RUNG_STRUCT_MAP_FIELD, smfNm) }
+      if unm == "" { unm = irRung(IR_RUNG_STRUCT_PLAIN, spfNm) }
+      if unm == "" {
+        unm = irRung(IR_RUNG_VALUE_UNION, valueUnionRetName(inferred))
+      }
+      // The litunion-array value-union dual (adopted above): records its alias-preserving
+      // emit name so `collectU` registers the union and `synthRetAnnots`'s `isValueUnionName`
+      // arm pins `fnRet` to it, keying the `$fnsig` result `>u` to match the value call.
+      if unm == "" {
+        unm = irRung(
+          IR_RUNG_LITUNION_ARR_VU,
+          litUnionArrayValueUnionRetName(inferred),
+        )
+      }
+      if unm == "" {
+        unm = irRung(
+          IR_RUNG_STRUCT_UNION,
+          structUnionRetName(inferred, gRootStmts),
+        )
+      }
+      // A NULLABLE-ref contextual return (`P | null`, `string | null`) — recorded under the same
+      // node sentinel so `synthRetAnnots` pins a nullable-returning closure value position-
+      // independently (the nullable dual of the union pin).
+      if unm == "" {
+        unm = irRung(IR_RUNG_NULLABLE, nullableRetName(inferred, gRootStmts))
+      }
+      // The nullable-litunion contextual return (adopted above): records the alias name so
+      // `synthRetAnnots` pins the lambda's `fnRet` as the nullable litunion (an i32 atom with
+      // `-1` = null), whose member-encoding `emitReturnValue` already performs.
+      if unm == "" {
+        unm = irRung(IR_RUNG_NUL_LITUNION, nulLitUnionRetName(inferred))
+      }
+      // The element-nullable-list contextual return (adopted above): records its emitter
+      // name so `synthRetAnnots` pins the lambda's `fnRet` as the value-union-box list, whose
+      // `[null]` element seeding `emitReturnValue` already performs for the annotated form.
+      if unm == "" { unm = nulElemListRetName(inferred) }
+      // The element-nullable-struct-list contextual return (adopted above): records its
+      // canonical emit name so `synthRetAnnots` pins `fnRet` as the nullable-struct-element
+      // list, whose kind-1 struct-niche element seeding `emitReturnValue` already performs.
+      if unm == "" {
+        unm = irRung(
+          IR_RUNG_NUL_STRUCT_ELEM_LIST,
+          nulStructElemListRetName(inferred),
+        )
+      }
+      // The element-nullable-map-list contextual return (adopted above): records its
+      // canonical emit name so `synthRetAnnots` pins `fnRet` as the nullable-map-element
+      // list, whose kind-3 map-niche element seeding `emitReturnValue` already performs.
+      if unm == "" {
+        unm = irRung(IR_RUNG_NUL_MAP_ELEM_LIST, nulMapElemListRetName(inferred))
+      }
+      // The element-nullable-scalar-list contextual return (adopted above): records its
+      // canonical emit name so `synthRetAnnots` pins `fnRet` as the nullable-list-element
+      // list, whose inner-wrapper element seeding `emitReturnValue` already performs.
+      if unm == "" {
+        unm = irRung(
+          IR_RUNG_NUL_LIST_ELEM_LIST,
+          nulListElemListRetName(inferred),
+        )
+      }
+      // The element-value-union-list contextual return (adopted above): records its emitter
+      // name so `synthRetAnnots` pins `fnRet` as the value-union-box list, whose element
+      // boxing `emitReturnValue` already performs.
+      if unm == "" {
+        unm = irRung(IR_RUNG_ELEM_VU_LIST, elemValueUnionListRetName(inferred))
+      }
+      // The element-variant-box-union-list contextual return (adopted above): records its
+      // emitter name so `synthRetAnnots` pins `fnRet` as the variant-box-element list, whose
+      // element boxing `emitReturnValue` already performs.
+      if unm == "" {
+        unm = irRung(
+          IR_RUNG_ELEM_VARIANT_BOX_LIST,
+          elemVariantBoxListRetName(inferred),
+        )
+      }
+      // The element-map-union-list contextual return (adopted above): records its emitter
+      // name so `synthRetAnnots` pins `fnRet` as the map-union-box element list, whose
+      // element boxing `emitReturnValue` already performs.
+      if unm == "" {
+        unm = irRung(
+          IR_RUNG_ELEM_MAP_UNION_LIST,
+          elemMapUnionListRetName(inferred),
+        )
+      }
+      // The element-refarm-value-union-list contextual return (adopted above): records its
+      // emitter name so `synthRetAnnots` pins `fnRet` as the box-list, whose element boxing
+      // `emitReturnValue` already performs for the annotated form.
+      if unm == "" {
+        unm = irRung(
+          IR_RUNG_ELEM_REFARM_VU_LIST,
+          elemRefArmValueUnionListRetName(inferred),
+        )
+      }
+      // The nested (2-D+) union-element array contextual return (adopted above): records its
+      // emitter name so `synthRetAnnots` pins `fnRet` as the nested box-element array, whose
+      // return-position threading + `$fnsig` reflist-slot keying already performs.
+      if unm == "" {
+        unm = irRung(
+          IR_RUNG_NESTED_ELEM_UNION_LIST,
+          nestedElemUnionListRetName(inferred),
+        )
+      }
+      // The union-field-struct-element-list contextual return (adopted above): records its
+      // emitter name so `synthRetAnnots` pins `fnRet` as the boxed-field-element list, whose
+      // element boxing the annotated spelling already performs.
+      if unm == "" {
+        unm = irRung(
+          IR_RUNG_STRUCT_FIELD_BOX_ELEM_LIST,
+          structFieldBoxElemListRetName(inferred),
+        )
+      }
+      // The plain-struct-element-list return: records its canonical name so
+      // `synthRetAnnots` pins the lambda and the element literals build under the annotated
+      // threading instead of fieldset-matching a wrong same-fieldset twin. Adoption-gated
+      // like the plain-struct record above, since un-gating regressed the closure-value ref-list ABI suite.
+      if unm == "" && objRetAdopted {
+        unm = irRung(IR_RUNG_STRUCT_ELEM_LIST, structElemListRetName(inferred))
+      }
+
+      // The nullable-closure-element-list contextual return (adopted above): records its
+      // emitter name so `synthRetAnnots` pins `fnRet` (`parenUnionArrElemName`), whose kind-5
+      // ref-list slot and `[null]` seeding `emitReturnValue` already threads.
+      if unm == "" {
+        unm = irRung(
+          IR_RUNG_NUL_CLOSURE_ELEM_LIST,
+          nulClosureElemListRetName(inferred),
+        )
+      }
+      // The closure-arm value-union contextual return (adopted above): records its emitter
+      // name so `collectU` registers the union and `synthRetAnnots` pins `fnRet` to it; the
+      // `$fnsig` result then keys `>u`, matching the value call.
+      if unm == "" {
+        unm = irRung(IR_RUNG_CLO_ARM_VU, cloArmValueUnionRetName(inferred))
+      }
+      // The map-member-union contextual return (adopted above): records its emitter name so
+      // `synthRetAnnots` pins `fnRet` as the map-union box (#865/#868), whose arm boxing
+      // `emitReturnValue` already performs for the annotated form.
+      if unm == "" {
+        unm = irRung(IR_RUNG_MAP_UNION, mapUnionRetName(inferred))
+      }
+      // The ref-arm value-union contextual return (adopted above; repOf item (d)): records
+      // its nominal render so `collectU` registers the union and `synthRetAnnots`'s `isUName`
+      // arm pins `fnRet` to the same spelling the emitter's binding resolution uses.
+      if unm == "" {
+        unm = irRung(
+          IR_RUNG_REFARM_UNION,
+          refArmUnionRetName(inferred, gRootStmts),
+        )
+      }
+      // The variant-box union contextual return with an inline-struct arm (adopted above):
+      // records its emitter name so `collectU` registers the union and `synthRetAnnots`'s
+      // `isUName` arm pins `fnRet` to it; the `$fnsig` result keys `>u`.
+      if unm == "" {
+        unm = irRung(IR_RUNG_VARIANT_BOX, variantBoxUnionRetName(inferred))
+      }
+      // The nested-list contextual return (adopted above): records its emitter name so
+      // `synthRetAnnots` pins `fnRet` as the nested array, whose return-position threading
+      // and `$fnsig` reflist-slot keying already performs (R4).
+      if unm == "" {
+        unm = irRung(IR_RUNG_NESTED_LEAF_LIST, nestedLeafListRetName(inferred))
+      }
+      // The map-element-list contextual return: records its emitter name so
+      // `synthRetAnnots` pins `fnRet` as the map-element array, whose kind-3 slot keying the
+      // annotated named-function form already performs.
+      if unm == "" {
+        unm = irRung(IR_RUNG_MAP_ELEM_LIST, mapElemListRetName(inferred))
+      }
+      // The litunion-alias-element-list contextual return (adopted above): records the
+      // name so `synthRetAnnots` pins `fnRet` and the body member literals build the i32
+      // atom list the annotated return does.
+      if unm == "" {
+        unm = irRung(
+          IR_RUNG_LITUNION_ELEM_LIST,
+          litUnionElemListRetName(inferred),
+        )
+      }
+      // The literal-union contextual return (adopted above): records the alias name so
+      // `synthRetAnnots` pins `fnRet` as the litunion, whose functype result reps as an i32
+      // atom — the `$fnsig` result keys `>i` and `emitReturnValue` encodes the member literal
+      // as its atom id (`retLitUnion`, #1115).
+      if unm == "" {
+        unm = irRung(
+          IR_RUNG_LITUNION_ALIAS,
+          irAtoms(litUnionAliasNameOfTy(inferred), 1),
+        )
+      }
+    }
+    // The width of the name this ladder settled on, handed over by the producer that
+    // joined it rather than re-derived by splitting it (#1115). The rungs short-circuit, so
+    // the last producer to answer non-empty is the one that wrote `inferRetNameAtoms`. The
+    // `recordable` name is not a producer's join: its three gates admit only one-atom spellings.
+    let rAtoms = 1
+    if !recordable { rAtoms = inferRetNameAtoms }
+    // The rung, on the identical footing as the width above: read from the cascade only on
+    // the path that ran it. A `recordable` row cannot carry a producer rung — it never runs
+    // the cascade — but it carries the gate code that admitted it instead, which the arm-9
+    // conversion reads; gate codes never write to `inferRetNameRung`, so they cannot leak.
+    let rRung = recCode
+    if !recordable { rRung = inferRetNameRung }
+    // A deferred join is a per-call-site placeholder, not a shape the emitter can
+    // classify a return by — see the named-function twin in `elaborateInferRets`.
+    if recordable || unm != "" {
+      if !tyIsDeferredJoin(inferred) {
+        const nodeKey = "#" + i32ToStr(fnIx)
+        if inferRetNameOf(nodeKey) == "" {
+          let rty = unm
+          if recordable { rty = anm }
+          recordInferRet(nodeKey, rty, inferred, rAtoms, rRung)
+        }
+      }
+    }
+  }
+  inferObserved = savedObserved
+  inferSawErr = savedSawErr
+  fnSawValueRet = savedValueRet
+  ret
+}
+
 // A function declaration: resolves param/return annotations, binds the signature, and checks
 // the body in a fresh scope. An un-annotated return is inferred from the body's returns and
 // trailing expression (`noteInferredRet`, under a `-2` pending `curRet`), then patched into
@@ -21524,756 +22290,17 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
     }
   }
   if inferring {
-    inferStack.pop()
-    let inferred = TY_VOID
-    // Set when the object-shaped contextual adoption fires (`objRetWidenAdopt` below):
-    // gates the plain-struct canonical record — a lambda whose self-inference already
-    // matches its context keeps the established un-pinned route (pinning every
-    // plain-struct lambda regresses `.map`-collapse / factory / generic-HOF cases).
-    let objRetAdopted = false
-    const sawCycle = cycleBreakCount > cbBefore
-    if inferObserved >= 0 {
-      inferred = inferObserved
-    } else if sawCycle && fnSawValueRet {
-      // A value return position resolved to `void` only because a recursive-cycle member
-      // is still pending: defer, so the binding-group fixpoint re-infers this once the
-      // cycle's resolvable members settle. Genuine void recursion has no value return
-      // position (`fnSawValueRet` is false), so it is never deferred this way.
-      if !listHasStr(inferTentative, n.fnName) { inferTentative.push(n.fnName) }
-      inferred = TY_VOID
-    } else if inferSawErr {
-      // Only err-ish types flowed back: no basis. A param that is itself uninferable
-      // already reported the root cause, so suppress the redundant message.
-      if !paramUninferable {
-        tErr(
-          "cannot infer a return type for '" +
-            n.fnName +
-            "' — annotate a return type",
-          n.fnBody,
-        )
-      }
-      inferred = TY_ERR
-    }
-    // Contextual return adoption: an anonymous lambda whose body infers a narrower numeric
-    // than the contextual expected return takes the expected return as its own, so the
-    // widening lands at the lambda's return seam (`emitReturnValue`). Numeric widening through
-    // function-type variance is rejected instead (`fnSlotAssignable`), since a function value's rep is fixed.
-    if n.fnName == "" && inferred >= 0 {
-      // A contextual adoption below means the seed changed what this lambda infers, so an
-      // annotation that supplied it is load-bearing and cannot be judged redundant by
-      // comparing the two (D1442). Snapshot/compare rather than marking each arm, since there are twenty of them and a new one must not have to remember.
-      const preAdopt = inferred
-      const expRet = cbExpectedRetFor(fnIx)
-      if expRet >= 0 {
-        if numWidens(inferred, expRet) { inferred = expRet }
-        // The f32 dual of the numeric widen: a literal-bodied lambda whose contextual return
-        // is f32 infers f64/i32 by default, but the literal re-encodes exactly at f32 — the
-        // same grant a direct `const v: f32 = 5.5` binding makes. Adopts f32 so the functype
-        // result is f32 and `emitReturnValue` encodes the literal at f32 in the body.
-        if inferred != expRet && primNameOf(expRet) == "f32" {
-          if isF32AdoptingLitExpr(lambdaBodyTail(n.fnBody)) {
-            inferred = expRet
-          }
-        }
-        // Object-shaped dual: `() => ({f: 5})` against `() => {f: i64}` — adopt the
-        // expected shape when every widening field is a re-encodable literal
-        // (`objRetWidenAdopt` also records the field types for the emitter's interner).
-        if objRetWidenAdopt(n.fnBody, inferred, expRet) {
-          inferred = expRet
-          objRetAdopted = true
-        }
-        // The litunion dual: a bare string-literal body that is a member of the expected
-        // literal-union adopts it. Its inferred type is the softened `string`; the direct
-        // `const k: K = "b"` binding grants the member flow via `assignableExpr`, but the
-        // lambda-return path only had the numeric/object arms until this one.
-        if inferred != expRet && tyIsLitUnion(expRet) {
-          const luTail = lambdaBodyTail(n.fnBody)
-          if luTail >= 0 && assignableExpr(luTail, inferred, expRet) {
-            inferred = expRet
-          }
-        }
-        // A nullable-string result: a lambda body inferring a bare `string` member of an
-        // expected `string | null` closure result adopts the nullable — its functype result is
-        // the string-ref `ref.null` niche, and `emitReturnValue` niches the value exactly as
-        // the named-function value spelling lowers. Covers the string/boolean niches only; a nullable numeric scalar boxes through `valueUnionRetName` instead.
-        if inferred != expRet {
-          const etU = T.tys[expRet]
-          if etU is TyNullable {
-            // The boolean-niche dual of the string niche: a lambda body inferring a bare
-            // `boolean`/`null` member of an expected `boolean | null` adopts the niche — its
-            // functype result is the i32 sentinel (2 = null), exactly as the annotated
-            // `: boolean | null` return and the named-function value lower.
-            if (
-              tyIsPrimNamed(etU.nInner, "string") ||
-              tyIsPrimNamed(etU.nInner, "boolean")
-            ) {
-              const nsTail = lambdaBodyTail(n.fnBody)
-              if nsTail >= 0 && assignableExpr(nsTail, inferred, expRet) {
-                inferred = expRet
-              }
-            }
-            // The nullable-list dual: a lambda body inferring the bare i32-backed list member
-            // of an expected `T[] | null` adopts the niche — its functype result is the
-            // nullable i32-list wrapper, exactly as the annotated form lowers. Distinct-backing
-            // leaves (`i64[] | null`, …) are not adopted and stay loud checker rejects.
-            if inferred != expRet && tyIsNulI32BackedListInner(etU.nInner) {
-              const nlTail = lambdaBodyTail(n.fnBody)
-              if nlTail >= 0 && assignableExpr(nlTail, inferred, expRet) {
-                inferred = expRet
-              }
-            }
-            // The nullable-closure dual: a lambda body inferring `null` (or a closure) against
-            // an expected nullable-closure result adopts the niche — its functype result is
-            // `(ref null $cloStruct)`, and `emitReturnValue`'s `retNulClosure` arm niches a
-            // `return null` exactly as the annotated form already lowers.
-            const etInnerTy = T.tys[etU.nInner]
-            if etInnerTy is TyFunc {
-              const ncTail = lambdaBodyTail(n.fnBody)
-              if ncTail >= 0 && assignableExpr(ncTail, inferred, expRet) {
-                inferred = expRet
-              }
-            }
-            // The nullable-struct dual: a lambda body inferring the bare struct member (or
-            // `null`) of an expected `S | null` closure result adopts the nullable — its
-            // functype result is the `(ref null $S)` niche, exactly as the annotated
-            // named-function value spelling already lowers.
-            if etInnerTy is TyObj {
-              const nsoTail = lambdaBodyTail(n.fnBody)
-              if nsoTail >= 0 && assignableExpr(nsoTail, inferred, expRet) {
-                inferred = expRet
-              }
-            }
-            // The nullable-litunion dual: a lambda body inferring a bare `string` member of
-            // the expected `K | null` litunion adopts the niche — its functype result is the
-            // i32 atom (`-1` = null), and `emitReturnValue`'s `retNulLitUnion` arm encodes it
-            // exactly as the annotated `: () => K | null` form already does.
-            if tyIsLitUnion(etU.nInner) {
-              const nluTail = lambdaBodyTail(n.fnBody)
-              if nluTail >= 0 && assignableExpr(nluTail, inferred, expRet) {
-                inferred = expRet
-              }
-            }
-          }
-        }
-        // A value-union result: a lambda body inferring a bare scalar arm of the expected
-        // value-union box result adopts the union, so the widening lands at the return seam —
-        // `emitReturnValue` boxes the scalar and the functype result is the box itself
-        // (`synthRetAnnots` pins `fnRet`). Checked after the niche arms, so a `T | null` niche is never swallowed as a value union.
-        if inferred != expRet && valueUnionRetName(expRet) != "" {
-          const vuTail = lambdaBodyTail(n.fnBody)
-          if vuTail >= 0 && assignableExpr(vuTail, inferred, expRet) {
-            inferred = expRet
-          }
-        }
-        // The litunion-array dual of the value-union result: a lambda body inferring the bare
-        // scalar arm of the expected `litunion-array | scalar` box adopts the union, boxing at
-        // the return seam. `valueUnionRetName` declines this union (its render flattens the
-        // litunion-array atom), so it needs its own alias-preserving arm.
-        if inferred != expRet && litUnionArrayValueUnionRetName(expRet) != "" {
-          const laTail = lambdaBodyTail(n.fnBody)
-          // Gates on strict `assignable` of the body's inferred type, not the expression-level
-          // `assignableExpr` the other arms use: the litunion-array arm reps as the kind-7
-          // i32-atom list, but a bare array literal self-infers the softened `string[]`, whose
-          // element re-typing would box the wrong tag. Only a body already at the union's own rep is adopted.
-          if laTail >= 0 && assignable(inferred, expRet) { inferred = expRet }
-        }
-        // The closure-arm dual of the value-union result: a lambda body inferring one arm (a
-        // closure or a scalar) of the expected closure-arm value union adopts it, boxing at
-        // the return seam — a closure member is the kind-11 ref atom riding the box's anyref
-        // value, and the functype result is the box (`synthRetAnnots` pins `fnRet`).
-        if inferred != expRet && cloArmValueUnionRetName(expRet) != "" {
-          const cvTail = lambdaBodyTail(n.fnBody)
-          if cvTail >= 0 && assignableExpr(cvTail, inferred, expRet) {
-            inferred = expRet
-          }
-        }
-        // The map-member-union dual: a lambda body inferring one struct arm of the expected
-        // map-member-union box result adopts the union, boxing the struct/map arm into the
-        // #865/#868 map-union box at the return seam, exactly as the annotated form exposes
-        // this rep already.
-        if inferred != expRet && mapUnionRetName(expRet) != "" {
-          const muTail = lambdaBodyTail(n.fnBody)
-          if muTail >= 0 && assignableExpr(muTail, inferred, expRet) {
-            inferred = expRet
-          }
-        }
-        // The ref-arm dual: a lambda body inferring one arm (a ref list or a struct) of the
-        // expected ref-arm union adopts it, boxing at the return seam so the functype result is
-        // the box rather than the raw reflist a narrowed call site would then cast — a
-        // guaranteed runtime trap or invalid wasm otherwise. Nominal-gated (`refArmUnionRetName` declines an anonymous-element array arm), so those shapes stay loud.
-        if inferred != expRet && refArmUnionRetName(expRet, gRootStmts) != "" {
-          const raTail = lambdaBodyTail(n.fnBody)
-          if raTail >= 0 && assignableExpr(raTail, inferred, expRet) {
-            inferred = expRet
-          }
-        }
-        // The variant-box dual with an inline-struct arm: a lambda body inferring one arm of
-        // the expected union adopts the whole union, boxing at the return seam so the
-        // functype result is the box, matching the value call's `annSigKey`. Checked after
-        // `refArmUnionRetName`, whose ref-array arms carry a slot render this arm declines.
-        if inferred != expRet && variantBoxUnionRetName(expRet) != "" {
-          const vbTail = lambdaBodyTail(n.fnBody)
-          if vbTail >= 0 && assignableExpr(vbTail, inferred, expRet) {
-            inferred = expRet
-          }
-        }
-        // The element-nullable-list result: a lambda body array literal assignable to the
-        // expected value-union-box list adopts it, so `emitReturnValue` seeds each nullable
-        // element through the same rep the annotated `(f64|null)[]` form already lowers
-        // (`synthRetAnnots` pins `fnRet`).
-        if inferred != expRet && nulElemListRetName(expRet) != "" {
-          const elTail = lambdaBodyTail(n.fnBody)
-          if elTail >= 0 && assignableExpr(elTail, inferred, expRet) {
-            inferred = expRet
-          }
-        }
-        // The element-nullable-struct-list dual: a lambda body array literal (non-null
-        // structs, or `null`) assignable to the expected nullable-struct-element list adopts
-        // it, building each element through the kind-1 struct niche the annotated form already
-        // lowers. Un-pinned, the body's structs would self-classify onto a different reflist slot than the annotation side.
-        if inferred != expRet && nulStructElemListRetName(expRet) != "" {
-          const nseTail = lambdaBodyTail(n.fnBody)
-          if nseTail >= 0 && assignableExpr(nseTail, inferred, expRet) {
-            inferred = expRet
-          }
-        }
-        // The element-nullable-map-list dual: a lambda body array literal (non-null maps, or
-        // `null`) assignable to the expected nullable-map-element list adopts it, building each
-        // element through the kind-3 map niche the annotated form already lowers. Un-pinned,
-        // the body's maps would self-classify onto a different reflist slot than the annotation side.
-        if inferred != expRet && nulMapElemListRetName(expRet) != "" {
-          const nmeTail = lambdaBodyTail(n.fnBody)
-          if nmeTail >= 0 && assignableExpr(nmeTail, inferred, expRet) {
-            inferred = expRet
-          }
-        }
-        // The element-nullable-scalar-list dual: a lambda body array literal (non-null inner
-        // lists, or `null`) assignable to the expected nullable-list-element list adopts it,
-        // building each element through the nullable inner-wrapper niche the annotated form
-        // already lowers. Un-pinned, the body's lists would self-classify onto a different reflist slot than the annotation side.
-        if inferred != expRet && nulListElemListRetName(expRet) != "" {
-          const nleTail = lambdaBodyTail(n.fnBody)
-          if nleTail >= 0 && assignableExpr(nleTail, inferred, expRet) {
-            inferred = expRet
-          }
-        }
-        // The element-value-union-list dual: a lambda body array literal assignable to the
-        // expected value-union-box list adopts it, boxing each element through the same
-        // element-kind-2 rep the annotated form already lowers.
-        if inferred != expRet && elemValueUnionListRetName(expRet) != "" {
-          const evTail = lambdaBodyTail(n.fnBody)
-          if evTail >= 0 && assignableExpr(evTail, inferred, expRet) {
-            inferred = expRet
-          }
-        }
-        // The element-variant-box-union-list dual: a lambda body array literal assignable to
-        // the expected variant-box-element list adopts it, boxing each element through the
-        // same element-kind-2 rep the annotated named-function value form already lowers.
-        if inferred != expRet && elemVariantBoxListRetName(expRet) != "" {
-          const vbeTail = lambdaBodyTail(n.fnBody)
-          if vbeTail >= 0 && assignableExpr(vbeTail, inferred, expRet) {
-            inferred = expRet
-          }
-        }
-        // The element-map-union-list dual: a lambda body array literal assignable to the
-        // expected map-union-element list adopts it, boxing each element through the same
-        // element-kind-2 map-union box rep the annotated form already lowers. Un-pinned, the
-        // body's array would self-classify onto a different reflist slot than the annotation side.
-        if inferred != expRet && elemMapUnionListRetName(expRet) != "" {
-          const meTail = lambdaBodyTail(n.fnBody)
-          if meTail >= 0 && assignableExpr(meTail, inferred, expRet) {
-            inferred = expRet
-          }
-        }
-        // The element-refarm-value-union-list dual: a lambda body array literal assignable to
-        // the expected list of (union-element-array | scalar) boxes adopts it, boxing each
-        // element through the same element-kind-2 box the annotated form already lowers.
-        // Un-pinned, the body's array would key onto a different `$fnsig` slot than the annotation side.
-        if inferred != expRet && elemRefArmValueUnionListRetName(expRet) != "" {
-          const raeTail = lambdaBodyTail(n.fnBody)
-          if raeTail >= 0 && assignableExpr(raeTail, inferred, expRet) {
-            inferred = expRet
-          }
-        }
-        // The nested (2-D+) union-element array dual: a lambda body nested array literal
-        // assignable to the expected 2-D+ box-element list adopts it, building the nested
-        // lists through the same element-kind-2 box the annotated form already lowers
-        // (`synthRetAnnots` pins `fnRet` off this producer's rung, `IR_RUNG_NESTED_ELEM_UNION_LIST`).
-        if inferred != expRet && nestedElemUnionListRetName(expRet) != "" {
-          const nueTail = lambdaBodyTail(n.fnBody)
-          if nueTail >= 0 && assignableExpr(nueTail, inferred, expRet) {
-            inferred = expRet
-          }
-        }
-        // The union-field-struct-element-list dual: a lambda body array literal assignable to
-        // the expected list of boxed-field structs adopts it, building each element's boxed
-        // field slot exactly as the annotated form lowers (`synthRetAnnots` pins `fnRet` via
-        // `nameIsStructWithUnionField`).
-        if inferred != expRet && structFieldBoxElemListRetName(expRet) != "" {
-          const sfeTail = lambdaBodyTail(n.fnBody)
-          if sfeTail >= 0 && assignableExpr(sfeTail, inferred, expRet) {
-            inferred = expRet
-          }
-        }
-        // The nullable-closure-element-list dual: a lambda body array literal assignable to
-        // the expected kind-5 niche list adopts it, seeding each element (a `null` to
-        // `ref.null $cloStruct`) through the same rep the annotated form already lowers.
-        if inferred != expRet && nulClosureElemListRetName(expRet) != "" {
-          const nceTail = lambdaBodyTail(n.fnBody)
-          if nceTail >= 0 && assignableExpr(nceTail, inferred, expRet) {
-            inferred = expRet
-          }
-        }
-        // The nested-list result: a lambda body array literal assignable to the expected
-        // nested scalar-leaf array adopts it, building under the pinned return's threading
-        // (`synthRetAnnots` pins `fnRet`); the `$fnsig` result keys the reflist slot on both
-        // producers, unlike the 1-D scalar-list arm below (R4).
-        if inferred != expRet && nestedLeafListRetName(expRet) != "" {
-          const nlTail = lambdaBodyTail(n.fnBody)
-          if nlTail >= 0 && assignableExpr(nlTail, inferred, expRet) {
-            inferred = expRet
-          }
-        }
-        // The scalar-leaf-list result: a lambda body array literal assignable to the expected
-        // distinct-backing scalar-leaf list adopts it — elements re-encode at the leaf
-        // (`assignableExpr`'s `ArrayLit` arm, the grant a direct `const xs: f32[] = [1.5]`
-        // binding makes), and `synthRetAnnots` pins `fnRet` to the adopted name (`isScalarListRetName`).
-        if inferred != expRet && scalarLeafListRetName(expRet) != "" {
-          const slTail = lambdaBodyTail(n.fnBody)
-          if slTail >= 0 && assignableExpr(slTail, inferred, expRet) {
-            inferred = expRet
-          }
-        }
-        // The litunion-element-list result: a lambda body array literal whose elements are
-        // members of the expected litunion-element list adopts it — `assignableExpr`'s
-        // `ArrayLit` arm records the destination array type, so the body builds the i32 atom
-        // list; the `>a` result token already byte-matches the annotation side, so no pin is needed.
-        if inferred != expRet && litUnionElemListRetName(expRet) != "" {
-          const lulTail = lambdaBodyTail(n.fnBody)
-          if lulTail >= 0 && assignableExpr(lulTail, inferred, expRet) {
-            inferred = expRet
-          }
-        }
-        // The struct-element-list result: a lambda body array literal's element structs
-        // coerce field-wise into the expected shape and adopt it — `assignableExpr`'s
-        // per-element `ObjLit` coercion records the coerced field types for the emitter's
-        // interner. Gated on plainly-lowerable element fields, so a map/union/nullable field stays a loud reject.
-        if inferred != expRet && structElemListRetName(expRet) != "" {
-          const seTail = lambdaBodyTail(n.fnBody)
-          if seTail >= 0 && assignableExpr(seTail, inferred, expRet) {
-            inferred = expRet
-            objRetAdopted = true
-          }
-        }
-        // The loud floor, last rung of this ladder: an empty-`[]` result no arm above adopted
-        // is the absence of a rep, not a narrower version of one — leaving `fnRet` a hole would
-        // cast-trap the value call or disagree with the body's list at emit. Exempt only the
-        // i32-backed elements (`i32`/`boolean`), which share the one i32-list backing with the annotation and so are already correct un-adopted.
-        if inferred != expRet && unresolvedHole(inferred) {
-          const ehT = T.tys[expRet]
-          if ehT is TyArray {
-            if (
-              !tyIsPrimNamed(ehT.aElem, "i32") &&
-              !tyIsPrimNamed(ehT.aElem, "boolean")
-            ) {
-              tErrUnsupported(
-                "a lambda returning an empty `[]` cannot build the " +
-                  tyToStr(expRet) +
-                  " result its annotation asks for — type-valid, but the element type has no" +
-                  " rep to build from; return the literal from a named function" +
-                  " (`function f(): " +
-                  tyToStr(expRet) +
-                  " { return [] }`), which lowers this",
-                n.fnBody,
-              )
-            }
-          }
-        }
-      }
-      if inferred != preAdopt { cbSeedUsed = cbSeedUsed + 1 }
-    }
-    // Permissive fall-through (totality): an un-annotated function that can fall off the end
-    // implicitly yields `null` there, so its inferred return widens to `T | null`. A box-able
-    // value type lowers un-annotated via the `uBoxIdx` box; a niche (`boolean`/`string`) widens
-    // too but stays floored below until A20 carries the niche seed. A void/error return is exempt.
-    if (
-      !bodyTotalForRet &&
-      inferred >= 0 &&
-      !isVoidTy(inferred) &&
-      inferred != TY_ERR
-    ) {
-      const inT = T.tys[inferred]
-      if !(inT is TyNullable) { inferred = mkNullableTy(inferred) }
-    }
-    // Robustness floor: an un-annotated function whose returns join to a union/nullable now
-    // infers the correct type, but must still be annotated when the emitter cannot yet lower
-    // it un-annotated — a value union/nullable already lowers via the `uBoxIdx` box and does
-    // not floor; a deferred join (a per-call-site placeholder) is not a shape to floor either, since it collapses to one arm at each call site.
-    if (
-      !inferQuiet &&
-      n.fnName != "" &&
-      inferred >= 0 &&
-      !tyIsDeferredJoin(inferred) &&
-      valueUnionRetName(inferred) == ""
-    ) {
-      const itt = T.tys[inferred]
-      // A variant-box union (`{w: i32} | i32`, and its nullable form) lowers un-annotated: the
-      // A20 loop records `variantBoxUnionRetName` and the emitter boxes it exactly like the
-      // annotated spelling. Checked before the `TyUnion`/`TyNullable` arms below (it spans
-      // both), so the floor accepts exactly the box the emitter registers.
-      if litUnionAliasNameOfTy(inferred) != "" {
-        // A pure literal union with a declared alias (`type K = "a" | "b"`) lowers
-        // un-annotated as the interned i32 atom: the A20 loop records the alias name and the
-        // emitter's return classification reads the same rep the annotated `: K` spelling
-        // reaches. An inline litunion (no alias to record) still floors below.
-      } else if variantBoxUnionRetName(inferred) != "" {
-        // lowers un-annotated — no floor
-      } else if tyIsLitUnion(inferred) {
-        // A pure un-named literal union lowers un-annotated as a string ref, the same rep its
-        // annotated twin carries — `collectF` records `retPrim = "string"` for this shape and
-        // the return site widens an atom-repped value into it. The alias form above reps as
-        // the atom instead, so the two never collide.
-      } else if numLitUnionHasBase(inferred) {
-        // A numeric literal union has no union rep at all: every member softens to one base
-        // scalar, so the recorder banks the base (`numLitUnionBaseTy`, the same rule
-        // `softenLitTy` states everywhere) and this arm accepts exactly what it banks. The
-        // string litunion two arms up is the shape that keeps an identity (the interned atom), which is why it is a separate question.
-      } else if itt is TyUnion {
-        // A pure struct-union whose every member maps to a named type lowers un-annotated via
-        // the variant-boxed rep, exactly like the annotated form — so it does not floor. The
-        // export uses the same `structUnionRetName` predicate, so the floor accepts exactly
-        // what the emitter can register.
-        if structUnionRetName(inferred, gRootStmts) == "" {
-          tErrUnsupported(
-            "'" +
-              n.fnName +
-              "' infers the union return type " +
-              tyToStr(inferred) +
-              " — type-valid, but an inferred return of this shape is not yet supported by codegen; annotate the return type",
-            n.fnBody,
-          )
-        }
-      } else if itt is TyNullable {
-        // The niche nullables (`boolean | null` / `string | null` / `K | null`), a nullable
-        // struct, a nullable list at every element type, and a never-filled infer-null hole
-        // (`nInner < 0`, whose only value is `null`) all lower un-annotated — each named by its
-        // own recorder for the emitter to seed from — so none of them floor (D1576).
-        if (
-          itt.nInner >= 0 &&
-          !tyIsPrimNamed(itt.nInner, "boolean") &&
-          !tyIsPrimNamed(itt.nInner, "string") &&
-          litUnionAliasNameOfTy(itt.nInner) == "" &&
-          nullableRetName(inferred, gRootStmts) == "" &&
-          nulListRetName(inferred) == ""
-        ) {
-          tErrUnsupported(
-            "'" +
-              n.fnName +
-              "' infers the nullable return type " +
-              tyToStr(inferred) +
-              " — type-valid, but an inferred return of this shape is not yet supported by codegen; annotate the return type",
-            n.fnBody,
-          )
-        }
-      }
-    }
-    ret = inferred
-    // Patches the hoisted `TyFunc` in place so existing references see the result; a nested
-    // (un-hoisted) named function declares fresh, and an anonymous lambda just carries its
-    // type as the expression value. The parameter-solve probe observes this body and must not
-    // decide the return, so patching here would deny pass 1.7 a fresh re-derivation.
-    if n.fnName != "" && !paramSolveProbe {
-      const bound = lookup(n.fnName)
-      let patched = false
-      if bound >= 0 {
-        const bt = T.tys[bound]
-        if bt is TyFunc {
-          bt.fnRet = inferred
-          tyMutEpoch = tyMutEpoch + 1 // inferred return patched in place
-          patched = true
-        }
-      }
-      if !patched { declare(n.fnName, mkFuncTy(paramTys, inferred)) }
-      // Re-retains the symbol-table type with the inferred return: the entry stamped while
-      // checking the signature carried the `-2` infer-later sentinel, and the in-place patch
-      // above only touches the scope-bound copy. Without this, hover / inlay on an
-      // unannotated function renders `-> _`.
-      if symEnabled != 0 {
-        symRetainType(fnIx, mkFuncTy(paramTys, inferred), 2)
-      }
-    } else if !inferQuiet {
-      // An anonymous lambda is lifted to a top-level function under a synthesized
-      // `__lambda_N` name the checker never saw, so the name-keyed inferred-return table
-      // can't reach it. Records the inferred scalar/string/list return under a node-index
-      // sentinel key (`#<nodeIx>`) instead, read back by `inferRetNameByNode`.
-      const anm = tyToStructStr(inferred)
-      // A struct-with-boxed-field contextual return the checker adopted at the lambda
-      // boundary (`objRetWidenAdopt`'s boxing-widen arm), recorded under the canonical emit
-      // name (not the spaced `tyToStr` render) so `synthRetAnnots`'s pin and
-      // `internShapeDeep`'s intern resolve. Takes precedence over `recordable`.
-      const sfbNm = structFieldBoxRetName(inferred)
-      // A map-carrying struct return, recorded under the canonical emit name too — the spaced
-      // `recordable` render never pins, and an un-pinned body literal's nested map field would
-      // otherwise resolve by field-name set and mint a wrong-layout twin. Checked after `sfbNm` (a boxed-field struct keeps its established pin).
-      let smfNm = ""
-      if sfbNm == "" { smfNm = structMapFieldRetName(inferred) }
-      // A plain struct return, recorded canonically too: the spaced `recordable` render never
-      // pins, and an un-pinned lambda's body literal fieldset-matches — a same-fieldset twin
-      // row in scope can resolve the wrong row otherwise. Composite fields (map/union/closure/list) keep their own recorder arms below.
-      let spfNm = ""
-      if sfbNm == "" && smfNm == "" && objRetAdopted {
-        spfNm = structPlainRetName(inferred)
-      }
-      // A single struct-shape inferred return is recorded too — a lambda that collapses to
-      // one union variant types as that variant's shape, so the emitter resolves it to the
-      // concrete variant rather than the box. The gates run only when all three canonical
-      // recorders declined, each at most once, in source order — `recordable` is bit-identical to the disjunction it replaces.
-      let recCode = IR_RUNG_NONE
-      if sfbNm == "" && smfNm == "" && spfNm == "" {
-        if isClassifiableRetName(anm) { recCode = IR_REC_CLASSIFIABLE }
-        else if isObjShapeName(anm) { recCode = IR_REC_OBJ_SHAPE }
-        else if isScalarListRetName(anm) { recCode = IR_REC_SCALAR_LIST }
-      }
-      const recordable = recCode != IR_RUNG_NONE
-      // A union inferred/contextual return exports its emitter-format name (value-union or
-      // struct-union) under the same node sentinel, mirroring the named-function A20 loop —
-      // the contextual return the checker proved for the lambda at its own boundary, pinned
-      // position-independently (`synthRetAnnots`) rather than re-derived per boundary.
-      let unm = ""
-      // Not the only writer since the r8 split: `nulElemListRetName` sets the rung itself, and
-      // the contextual-adoption gate above calls that producer too, so a write can land before
-      // this reset — safe since the reset is unconditional and precedes the cascade. The
-      // global's lifetime is exactly one cascade run: cleared here, written once, read once.
-      inferRetNameRung = IR_RUNG_NONE
-      if !recordable {
-        unm = irRung(IR_RUNG_SFB, sfbNm)
-        if unm == "" { unm = irRung(IR_RUNG_STRUCT_MAP_FIELD, smfNm) }
-        if unm == "" { unm = irRung(IR_RUNG_STRUCT_PLAIN, spfNm) }
-        if unm == "" {
-          unm = irRung(IR_RUNG_VALUE_UNION, valueUnionRetName(inferred))
-        }
-        // The litunion-array value-union dual (adopted above): records its alias-preserving
-        // emit name so `collectU` registers the union and `synthRetAnnots`'s `isValueUnionName`
-        // arm pins `fnRet` to it, keying the `$fnsig` result `>u` to match the value call.
-        if unm == "" {
-          unm = irRung(
-            IR_RUNG_LITUNION_ARR_VU,
-            litUnionArrayValueUnionRetName(inferred),
-          )
-        }
-        if unm == "" {
-          unm = irRung(
-            IR_RUNG_STRUCT_UNION,
-            structUnionRetName(inferred, gRootStmts),
-          )
-        }
-        // A NULLABLE-ref contextual return (`P | null`, `string | null`) — recorded under the same
-        // node sentinel so `synthRetAnnots` pins a nullable-returning closure value position-
-        // independently (the nullable dual of the union pin).
-        if unm == "" {
-          unm = irRung(IR_RUNG_NULLABLE, nullableRetName(inferred, gRootStmts))
-        }
-        // The nullable-litunion contextual return (adopted above): records the alias name so
-        // `synthRetAnnots` pins the lambda's `fnRet` as the nullable litunion (an i32 atom with
-        // `-1` = null), whose member-encoding `emitReturnValue` already performs.
-        if unm == "" {
-          unm = irRung(IR_RUNG_NUL_LITUNION, nulLitUnionRetName(inferred))
-        }
-        // The element-nullable-list contextual return (adopted above): records its emitter
-        // name so `synthRetAnnots` pins the lambda's `fnRet` as the value-union-box list, whose
-        // `[null]` element seeding `emitReturnValue` already performs for the annotated form.
-        if unm == "" { unm = nulElemListRetName(inferred) }
-        // The element-nullable-struct-list contextual return (adopted above): records its
-        // canonical emit name so `synthRetAnnots` pins `fnRet` as the nullable-struct-element
-        // list, whose kind-1 struct-niche element seeding `emitReturnValue` already performs.
-        if unm == "" {
-          unm = irRung(
-            IR_RUNG_NUL_STRUCT_ELEM_LIST,
-            nulStructElemListRetName(inferred),
-          )
-        }
-        // The element-nullable-map-list contextual return (adopted above): records its
-        // canonical emit name so `synthRetAnnots` pins `fnRet` as the nullable-map-element
-        // list, whose kind-3 map-niche element seeding `emitReturnValue` already performs.
-        if unm == "" {
-          unm = irRung(
-            IR_RUNG_NUL_MAP_ELEM_LIST,
-            nulMapElemListRetName(inferred),
-          )
-        }
-        // The element-nullable-scalar-list contextual return (adopted above): records its
-        // canonical emit name so `synthRetAnnots` pins `fnRet` as the nullable-list-element
-        // list, whose inner-wrapper element seeding `emitReturnValue` already performs.
-        if unm == "" {
-          unm = irRung(
-            IR_RUNG_NUL_LIST_ELEM_LIST,
-            nulListElemListRetName(inferred),
-          )
-        }
-        // The element-value-union-list contextual return (adopted above): records its emitter
-        // name so `synthRetAnnots` pins `fnRet` as the value-union-box list, whose element
-        // boxing `emitReturnValue` already performs.
-        if unm == "" {
-          unm = irRung(
-            IR_RUNG_ELEM_VU_LIST,
-            elemValueUnionListRetName(inferred),
-          )
-        }
-        // The element-variant-box-union-list contextual return (adopted above): records its
-        // emitter name so `synthRetAnnots` pins `fnRet` as the variant-box-element list, whose
-        // element boxing `emitReturnValue` already performs.
-        if unm == "" {
-          unm = irRung(
-            IR_RUNG_ELEM_VARIANT_BOX_LIST,
-            elemVariantBoxListRetName(inferred),
-          )
-        }
-        // The element-map-union-list contextual return (adopted above): records its emitter
-        // name so `synthRetAnnots` pins `fnRet` as the map-union-box element list, whose
-        // element boxing `emitReturnValue` already performs.
-        if unm == "" {
-          unm = irRung(
-            IR_RUNG_ELEM_MAP_UNION_LIST,
-            elemMapUnionListRetName(inferred),
-          )
-        }
-        // The element-refarm-value-union-list contextual return (adopted above): records its
-        // emitter name so `synthRetAnnots` pins `fnRet` as the box-list, whose element boxing
-        // `emitReturnValue` already performs for the annotated form.
-        if unm == "" {
-          unm = irRung(
-            IR_RUNG_ELEM_REFARM_VU_LIST,
-            elemRefArmValueUnionListRetName(inferred),
-          )
-        }
-        // The nested (2-D+) union-element array contextual return (adopted above): records its
-        // emitter name so `synthRetAnnots` pins `fnRet` as the nested box-element array, whose
-        // return-position threading + `$fnsig` reflist-slot keying already performs.
-        if unm == "" {
-          unm = irRung(
-            IR_RUNG_NESTED_ELEM_UNION_LIST,
-            nestedElemUnionListRetName(inferred),
-          )
-        }
-        // The union-field-struct-element-list contextual return (adopted above): records its
-        // emitter name so `synthRetAnnots` pins `fnRet` as the boxed-field-element list, whose
-        // element boxing the annotated spelling already performs.
-        if unm == "" {
-          unm = irRung(
-            IR_RUNG_STRUCT_FIELD_BOX_ELEM_LIST,
-            structFieldBoxElemListRetName(inferred),
-          )
-        }
-        // The plain-struct-element-list return: records its canonical name so
-        // `synthRetAnnots` pins the lambda and the element literals build under the annotated
-        // threading instead of fieldset-matching a wrong same-fieldset twin. Adoption-gated
-        // like the plain-struct record above, since un-gating regressed the closure-value ref-list ABI suite.
-        if unm == "" && objRetAdopted {
-          unm = irRung(
-            IR_RUNG_STRUCT_ELEM_LIST,
-            structElemListRetName(inferred),
-          )
-        }
-
-        // The nullable-closure-element-list contextual return (adopted above): records its
-        // emitter name so `synthRetAnnots` pins `fnRet` (`parenUnionArrElemName`), whose kind-5
-        // ref-list slot and `[null]` seeding `emitReturnValue` already threads.
-        if unm == "" {
-          unm = irRung(
-            IR_RUNG_NUL_CLOSURE_ELEM_LIST,
-            nulClosureElemListRetName(inferred),
-          )
-        }
-        // The closure-arm value-union contextual return (adopted above): records its emitter
-        // name so `collectU` registers the union and `synthRetAnnots` pins `fnRet` to it; the
-        // `$fnsig` result then keys `>u`, matching the value call.
-        if unm == "" {
-          unm = irRung(IR_RUNG_CLO_ARM_VU, cloArmValueUnionRetName(inferred))
-        }
-        // The map-member-union contextual return (adopted above): records its emitter name so
-        // `synthRetAnnots` pins `fnRet` as the map-union box (#865/#868), whose arm boxing
-        // `emitReturnValue` already performs for the annotated form.
-        if unm == "" {
-          unm = irRung(IR_RUNG_MAP_UNION, mapUnionRetName(inferred))
-        }
-        // The ref-arm value-union contextual return (adopted above; repOf item (d)): records
-        // its nominal render so `collectU` registers the union and `synthRetAnnots`'s `isUName`
-        // arm pins `fnRet` to the same spelling the emitter's binding resolution uses.
-        if unm == "" {
-          unm = irRung(
-            IR_RUNG_REFARM_UNION,
-            refArmUnionRetName(inferred, gRootStmts),
-          )
-        }
-        // The variant-box union contextual return with an inline-struct arm (adopted above):
-        // records its emitter name so `collectU` registers the union and `synthRetAnnots`'s
-        // `isUName` arm pins `fnRet` to it; the `$fnsig` result keys `>u`.
-        if unm == "" {
-          unm = irRung(IR_RUNG_VARIANT_BOX, variantBoxUnionRetName(inferred))
-        }
-        // The nested-list contextual return (adopted above): records its emitter name so
-        // `synthRetAnnots` pins `fnRet` as the nested array, whose return-position threading
-        // and `$fnsig` reflist-slot keying already performs (R4).
-        if unm == "" {
-          unm = irRung(
-            IR_RUNG_NESTED_LEAF_LIST,
-            nestedLeafListRetName(inferred),
-          )
-        }
-        // The map-element-list contextual return: records its emitter name so
-        // `synthRetAnnots` pins `fnRet` as the map-element array, whose kind-3 slot keying the
-        // annotated named-function form already performs.
-        if unm == "" {
-          unm = irRung(IR_RUNG_MAP_ELEM_LIST, mapElemListRetName(inferred))
-        }
-        // The litunion-alias-element-list contextual return (adopted above): records the
-        // name so `synthRetAnnots` pins `fnRet` and the body member literals build the i32
-        // atom list the annotated return does.
-        if unm == "" {
-          unm = irRung(
-            IR_RUNG_LITUNION_ELEM_LIST,
-            litUnionElemListRetName(inferred),
-          )
-        }
-        // The literal-union contextual return (adopted above): records the alias name so
-        // `synthRetAnnots` pins `fnRet` as the litunion, whose functype result reps as an i32
-        // atom — the `$fnsig` result keys `>i` and `emitReturnValue` encodes the member literal
-        // as its atom id (`retLitUnion`, #1115).
-        if unm == "" {
-          unm = irRung(
-            IR_RUNG_LITUNION_ALIAS,
-            irAtoms(litUnionAliasNameOfTy(inferred), 1),
-          )
-        }
-      }
-      // The width of the name this ladder settled on, handed over by the producer that
-      // joined it rather than re-derived by splitting it (#1115). The rungs short-circuit, so
-      // the last producer to answer non-empty is the one that wrote `inferRetNameAtoms`. The
-      // `recordable` name is not a producer's join: its three gates admit only one-atom spellings.
-      let rAtoms = 1
-      if !recordable { rAtoms = inferRetNameAtoms }
-      // The rung, on the identical footing as the width above: read from the cascade only on
-      // the path that ran it. A `recordable` row cannot carry a producer rung — it never runs
-      // the cascade — but it carries the gate code that admitted it instead, which the arm-9
-      // conversion reads; gate codes never write to `inferRetNameRung`, so they cannot leak.
-      let rRung = recCode
-      if !recordable { rRung = inferRetNameRung }
-      // A deferred join is a per-call-site placeholder, not a shape the emitter can
-      // classify a return by — see the named-function twin in `elaborateInferRets`.
-      if recordable || unm != "" {
-        if !tyIsDeferredJoin(inferred) {
-          const nodeKey = "#" + i32ToStr(fnIx)
-          if inferRetNameOf(nodeKey) == "" {
-            let rty = unm
-            if recordable { rty = anm }
-            recordInferRet(nodeKey, rty, inferred, rAtoms, rRung)
-          }
-        }
-      }
-    }
-    inferObserved = savedObserved
-    inferSawErr = savedSawErr
-    fnSawValueRet = savedValueRet
+    ret = finishInferredReturn(
+      n,
+      fnIx,
+      paramTys,
+      paramUninferable,
+      cbBefore,
+      savedObserved,
+      savedSawErr,
+      savedValueRet,
+      bodyTotalForRet,
+    )
   }
   // Soundness — missing return: a function whose body can fall off the end without yielding a
   // value on some path implicitly produces `null`, sound only when `null` is part of the
