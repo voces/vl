@@ -42,7 +42,7 @@ per result, a live set copied whole at every function — where the first pass's
 | 7 | 33 comment sites name an identifier the tree no longer has — 22 of them a compiler name, 9 the frozen TypeScript host (§12) | derived from the tree, not read: candidate `\`ident\`` in a `//` comment, no declaration, no family prefix, no code mention anywhere | S | none | the detector at zero, as a fifth ratchet |
 | 8 | one operator set is written three times in two spellings, and one of the three headers is wrong about the other two (§8) | `isBinOpFuncName` 10 names, `isStrFuncName` 14, `isOpFuncName` 12 token kinds; `isStrFuncName`'s header omits `==`/`!=` | S | low | byte-identical seed; the three derived from one list |
 | 9 | every `check_query.vl` position query is a full table scan — **15 of its functions**, all on the per-request LSP path, and two are the same scan written twice (§9) | `symTypeAliasAt` / `sigIdentAt` at raw ratio 0.824; `symOccTok` scanned by four separate exports | M | low | the LSP wasm suites; a latency ladder on a large file |
-| 10 | `tyTopIndexOf` (`tyname.vl:158`) is now the **largest single frame in the surveyed area at 3.28% self**, up from 2.42% in the first pass (§10.1) | six named parents, none over 34%; `nameIsFuncTypeAtom` 33.7%, `splitUnionAtoms` 18.7% | — | — | belongs to the destringify track; re-derived here, not re-prescribed |
+| 10 | ✅ **PART LANDED** — a byte pre-scan now decides the 74.6% of the frame's self-compile character volume that holds no separator byte (`perf-opportunities-2026-09.md` §G1). The residue is the destringify track (§10.1) | six named parents, none over 34%; `nameIsFuncTypeAtom` 33.7%, `splitUnionAtoms` 18.7% | S | — | byte-identical seed and codegen; `regress.py` no cell moved |
 | 11 | `blockHasBareReturn` is a whole-body walk asked from five sites with no memo (§10.2) | 0.53% self, 62.5% of its samples its own recursion, 16.7% `computeVoidFns`, 12.5% `checkFuncDeclNode` | S | low | byte-identical seed |
 | 12 | `finishInferredReturn` (748 lines) is the new longest function, and its cheapest interior seam crosses **3** live locals (§10.3) | 18 functions of ≥ 200 lines hold 6,432 of 38,380 lines (16.8%) | M | low | byte-identical seed |
 | 13 | **42 of 168** checker diagnostic sites carrying a prose run have none of it anywhere under `tests/` (§10.4) | 25.0%, against 34.9% in the first pass; the builtin-method family it named is now covered | S | none | one fixture per remaining family |
@@ -447,6 +447,13 @@ survey's own profile — the same function, a different mix. Its parents:
 and no dominant one, which is what a shared primitive looks like rather than a hot loop.
 It belongs to the destringify track (`perf-opportunities-2026-09.md` item #12); this
 survey re-derives the number and prescribes nothing.
+
+Part of it has since been taken without touching that design question: `tyTopIndexOf` now
+declines through a byte pre-scan, which is the whole answer for the 74.6% of its
+self-compile character volume that holds no separator byte at all
+(`perf-opportunities-2026-09.md` §G1). Every parent above is served by it. What the six
+parents still pay for is asking the same short name over and over — 20 distinct names
+behind 5.25 M calls on the heaviest corpus case — and that is the destringify track.
 
 ### 10.2 · `blockHasBareReturn` — one walk, five askers
 

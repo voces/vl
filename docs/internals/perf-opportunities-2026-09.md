@@ -25,7 +25,7 @@ QUICK = a day, no design question. STRUCT = a design track.
 | 10 | `declaredSlotOf` → per-function side index built in `buildLocals` | **1.1%** self time | M | reset per function, 5 sites | byte-identical seed; `regress.py` | STRUCT |
 | 11 | `fnStmtsPosOf` → reverse index `nodeIx → fe` after mono: 19,106 calls, **25.9 M scan steps** | closures axis 2.22 → ~1 | M | 1 in-place write, `emit_mono.vl:6353` | byte-identical seed; the closures axis under its 3.2 bar | STRUCT |
 | 12 | Destringify type names — `tyTopIndexOf` is a per-CHARACTER walk over a type-name string, **4.94% self** | 4.9% plus most of `__str_eq__`'s tail | L | canon / rep | `docs/internals/registry-by-type-id.md` steps 4–6; byte-identity | STRUCT |
-| 13 | `nameIsArray` asks `unionMemberCount` for a COUNT when it needs the predicate `< 2`, so a cheap suffix test drags a whole-string walk behind it — and it is asked once per element and per nesting level (§G) | `tyTopIndexOf` **61.5% / 28.3% self** on the two type-heavy outliers against 11.1% on the control; 79 `nameIsArray` sites, 10 of 23 `unionMemberCount` sites compare only against 1 or 2 | S | none — a pure early-out | byte-identical seed; `regress.py`; the two profiles below re-taken; the unions + generic-pins scaling axes | QUICK |
+| 13 | ✅ **LANDED (§G1)** — but NOT as prescribed: the early-out never fires (0 of 5.4 M walks found a top-level `|`) and the suffix test already ran first. What the measurement supported is a byte pre-scan in front of `tyTopIndexOf`'s ladder, which serves every caller | `vl build` **0.568× / 0.725×** on the two outliers (medians of six interleaved readings), 0.922× on the control; the frame **63.6% → 40.9%** and **47.8% → 17.8%** self | S | none — a sound over-approximation in front of the walk | byte-identical seed and codegen; `regress.py` no cell moved; all 2,996 corpus modules identical; `rep-fuzz-check.sh` | QUICK |
 
 Two corrections are load-bearing: **`vl check std/json.vl` is 40 ms, not 6.5 s** (§B1), and
 **`tyTopIndexOf` is not a name-keyed registry; `collectA` never calls it** (§B4).
@@ -1241,3 +1241,93 @@ new here is that on type-heavy programs it is 28-62%, reachable without destring
 anything.
 
 Not fixed in the PR that filed this — that one changed only tests.
+
+### G1 · Landed — and the prescribed fix was the wrong one
+
+Every number below is taken on `47b3a6ac6`. The finding above — the frame, its callers, its
+shares — reproduces. The FIX it prescribed does not, and an instrumented compiler says why:
+counters in `tyname.vl`, dumped from the tail of `emitProgram` through a distinctive
+`emitFail`, built to a scratch artifact so the seed was never written. Four programs: the two
+outliers, the control, and the compiler's own source.
+
+| counter | `arm-list-elem-pin-at-depth` | `global-reference-chain-cost` | control `deep-is-json-shape-walk` | self-compile |
+| --- | ---: | ---: | ---: | ---: |
+| `nameIsArray` calls | 5,251,443 | 1,068,680 | 376,993 | 1,879,686 |
+| declined by the suffix test, O(1) | 1,019,090 (19.4%) | 250,270 (23.4%) | 257,844 (68.4%) | 1,652,883 (87.9%) |
+| reached `unionMemberCount` | 4,232,353 | 818,410 | 119,149 | 226,803 |
+| that walk answered "one member" | 4,232,353 (**100%**) | 818,410 (**100%**) | 119,149 (**100%**) | 226,803 (**100%**) |
+| that walk answered "a union" | **0** | **0** | **0** | **0** |
+| `unionMemberCount` inputs holding no `\|` byte | 100% | 100% | 96.3% | 98.6% |
+| distinct names asked of `unionMemberCount` | 20 | 9 | 30 | 103 |
+| `tyTopIndexOf` calls | 5,456,542 | 1,120,404 | 966,462 | 2,950,889 |
+| characters its ladder visited | 49,242,147 | 17,213,951 | 7,819,151 | 48,923,397 |
+| calls holding no separator byte from `from` | 5,456,536 (100.0%) | 1,120,394 (100.0%) | 831,304 (86.0%) | 1,778,668 (60.3%) |
+| characters the byte scan decides | 49,242,125 (100.0%) | 17,213,907 (100.0%) | 6,805,549 (87.0%) | 36,485,450 (74.6%) |
+| characters it spends on calls it cannot decide | 22 | 44 | 1,012,510 | 12,440,901 |
+
+Three things the table settles.
+
+**An early-out at the first top-level `|` never fires.** Not once in 5.4 M walks over four
+programs did `nameIsArray`'s count exceed 1, so a count bounded at two reaches the end of the
+string exactly as the unbounded one does. The row's premise that "for a name with k top-level
+members that is k+1 walks of the remainder" is also wrong: `tyTopIndexOf` resumes at `from`,
+so the k+1 calls visit n characters *between* them and `unionMemberCount` was already one pass.
+
+**The suffix test already runs first**, and already declines 87.9% of the self-compile's calls
+and 19-23% of the outliers' at two character reads. Reordering had nothing left to take.
+
+**The cost is the ladder's per-character price, not the number of characters.** `tyTopIndexOf`
+spends about eleven comparisons a character on quote-skipping, three grouper classes and the
+`>`-closes-a-`<` rule; a top-level hit is still a hit, so a scan asking only whether the byte
+occurs at all decides the majority of calls at one comparison. That is `tyHasSepByte`, in
+front of the ladder — the last three rows are what it takes and what it costs.
+
+Callers behind the frame, before, by the immediate caller of each leaf sample
+(`VL_PROFILE_GUEST` against a `--names` seed per arm):
+
+| program | frame self | `unionMemberCount` as immediate caller | the next four |
+| --- | ---: | ---: | --- |
+| `arm-list-elem-pin-at-depth` | 63.58% (199 of 313) | **51.44%** of the profile, 81% of the frame | `nullablePartOf` 4.15, `parenUnionArrElemName` 3.51, `nameIsClosureArray` 2.56, `nameIsRefArray` 1.60 |
+| `global-reference-chain-cost` | 47.77% (75 of 157) | **35.67%**, 75% of the frame | `nameIsRefArray` 5.10, `parenUnionArrElemName` 3.82, `nullablePartOf` 2.55, `nameIsClosureArray` 0.64 |
+| control `deep-is-json-shape-walk` | 16.49% (32 of 194) | 3.09% | `isTopLevelFuncTypeName` 4.64, `nameHasSep` 3.61, `tyTopLevelSplit` 3.61, `splitUnionAtoms` 1.03 |
+
+The control has no dominant caller, which is what makes it a control rather than a smaller
+instance. Measured after, same instruments. CPU is user+sys per build over 25-30-build
+batches so the 10 ms clock is not the resolution, min over 5-7 interleaved batches per arm —
+and that whole procedure was run SIX times, at loads from 15 to 156, because one reading of a
+ratio on this box is not a reading:
+
+| | frame self, before | the two frames after | ratio, median of 6 | its range |
+| --- | ---: | ---: | ---: | ---: |
+| `arm-list-elem-pin-at-depth` | 63.58% (199 of 313) | 40.86% (76 of 186) | **0.568** | 0.510 - 0.580 |
+| `global-reference-chain-cost` | 47.77% (75 of 157) | 17.80% (21 of 118) | **0.725** | 0.661 - 0.852 |
+| control `deep-is-json-shape-walk` | 16.49% (32 of 194) | 9.55% (17 of 178) | 0.922 | 0.903 - 1.000 |
+
+The best-conditioned single run, at load 23, read 0.3100 -> 0.1784 s, 0.2676 -> 0.1864 s and
+0.2044 -> 0.1856 s per build. "The two frames after" is `tyHasSepByte` self plus
+`tyTopIndexOf` self, which is what the one frame was. Sample counts are given because the
+share moves with load too — the same unchanged code read 59.8%, 63.6% and 63.9% on three runs
+of the first outlier — so a share quoted to two decimals is a mechanism, not a precision. The
+self-compile moves 3.99 -> 3.93 CPU-s (min of 6 interleaved), which is what 74.6% of a 3-5%
+frame predicts and is at the box's resolution limit.
+
+`vl check` on all three programs is at or under 0.03 CPU-s on both arms, and
+`scripts/perf/profile-phases.py` says why: `emitProgram` is 99.68%, 100.00% and 97.94% of
+these three compiles, against 1, 0 and 4 samples on the whole check side. This term lives in
+the emitter, so the `check` half of the pipeline never sees enough of it to move — which is
+also why the row's own instrument, the corpus at `vl build`, was the one that found it.
+
+**What is left, named.** `tyHasSepByte` is now the largest frame on the first outlier at
+36.56% self, and the reason is the CALL COUNT, not the per-call price: 5.25 M `nameIsArray`
+calls over **20 distinct names**. The re-derivation is in the caller ladders —
+`nameIsI32Array` asks five arms that each re-test the same name, `refArrShapeKind` and
+`refArrElemName` do the same over a longer ladder — so the next term is hoisting one
+`nameIsArray` per ladder rather than one per arm, and after that item 12's destringify. A memo
+is the third option and the repeat rate would carry it, but `tyname.vl`'s contract is that it
+holds no state, and the LSP drives many compiles through one instance with no reset hook to
+hang one on.
+
+**Two surface numbers in the row above are mention counts, not call sites.** `nameIsArray` has
+**53** call sites, not 79 (that figure counts imports and comments). `unionMemberCount` has
+**22**, and **all 22** compare only against 1 or 2 — not 10 of 23. Every caller wants the
+predicate; none of them wanted it enough to matter, which is the finding.

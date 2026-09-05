@@ -363,6 +363,17 @@ self on a self-compile as part of the destringify track (kind STRUCT, risk L); t
 here is that on type-heavy programs the same frame is 28–62%, and that an early-out
 predicate reaches most of it without the destringify design question.
 
+**LANDED, and the prescription above is refuted** — `perf-opportunities-2026-09.md` §G1.
+The frame and its callers reproduce; the early-out does not, because a counter build says
+**0 of 5.4 M `nameIsArray` walks ever found a top-level `|`**, so a count bounded at 2
+reaches the end of the string exactly as the unbounded one does. The suffix test also
+already ran first. What the measurement supported instead is a byte pre-scan in front of
+`tyTopIndexOf`'s ladder: `vl build` **0.568× and 0.725×** on the two outliers (medians of
+six interleaved readings), 0.922× on the control, the seed byte-identical for every corpus
+module. The surface figures here are
+mention counts — `nameIsArray` has 53 call sites and `unionMemberCount` 22, all 22 of them
+predicates.
+
 ---
 
 ## 7 · Thresholds, and the script that grades them
