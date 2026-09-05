@@ -160,12 +160,14 @@ import {
 import {
   SYM_MEM_METHOD,
   isvalCol,
+  isvalEnd,
   isvalLine,
   isvalLit,
   isvalName,
   isvalTok,
   isvalType,
   rcoalCol,
+  rcoalEnd,
   rcoalLine,
   rcoalTok,
   rcoalType,
@@ -6193,24 +6195,42 @@ function inlayHoleDeep(ty: i32, depth: i32): boolean {
   false
 }
 
-// ── the dead-`??` finding ────────────────────────────────────────────────────
+// ── the node-anchored findings' span ─────────────────────────────────────────
 // A multi-module compile merges every module's AST, so `modOfTok` resolves which file a finding
 // is in; the CLI keeps only the entry module's (`redunModuleAt`).
+
+// The token a node-anchored FINDING starts at: the node's first token, else its last, since a
+// node minted after parsing owns no start. `-1` when it has neither, which drops the finding
+// rather than placing it where the author wrote nothing. The raise family's
+// `tErrPushNodeSpan` takes the same two rungs, for the same reason.
+function findingStartTok(ix: i32) {
+  const first = nodeStartTok(ix)
+  if first >= 0 { return first }
+  nodeLastTok(ix)
+}
+
+// That finding's 0-based exclusive end column: the node's last token on the start line, so the
+// span covers the construct the message names. Degrades to `tk`'s own end.
+function findingEndCol(ix: i32, tk: i32) {
+  const end = nodeSpanEndTok(ix)
+  if end >= 0 { return tokEndCol(end) }
+  tokEndCol(tk)
+}
 
 function rcoalReset() {
   rcoalLine = []
   rcoalCol = []
+  rcoalEnd = []
   rcoalTok = []
   rcoalType = []
   0
 }
 
 // Record `x ?? d` whose left operand's type admits no `null`: the default is dead.
-// Anchored at the `??` node, exactly where every other diagnostic on that node lands.
+// Spans the `??` NODE, exactly where every other diagnostic on that node lands.
 function recordDeadCoalesce(ix: i32, lt: i32) {
-  if ix < 0 || ix >= nodeToks.length { return 0 }
-  const tk = nodeToks[ix]
-  if tk < 0 || tk >= P.toks.length { return 0 }
+  const tk = findingStartTok(ix)
+  if tk < 0 { return 0 }
   if jwTokIsGenerated(tk) { return 0 }
   const t = P.toks[tk]
   // An exact repeat (same anchor) is the re-check of one node, not a second finding — the same
@@ -6222,6 +6242,7 @@ function recordDeadCoalesce(ix: i32, lt: i32) {
   }
   rcoalLine.push(t.line)
   rcoalCol.push(t.col)
+  rcoalEnd.push(findingEndCol(ix, tk))
   rcoalTok.push(tk)
   // User-facing (the finding's message quotes it) — the user render, not the raw one.
   rcoalType.push(tyToStrUser(lt))
@@ -6231,6 +6252,7 @@ function recordDeadCoalesce(ix: i32, lt: i32) {
 function rcoalTruncate(n: i32) {
   while rcoalLine.length > n { rcoalLine.pop() }
   while rcoalCol.length > n { rcoalCol.pop() }
+  while rcoalEnd.length > n { rcoalEnd.pop() }
   while rcoalTok.length > n { rcoalTok.pop() }
   while rcoalType.length > n { rcoalType.pop() }
   0
@@ -6241,6 +6263,7 @@ function rcoalTruncate(n: i32) {
 function isvalReset() {
   isvalLine = []
   isvalCol = []
+  isvalEnd = []
   isvalTok = []
   isvalName = []
   isvalType = []
@@ -6259,6 +6282,7 @@ function isvalReset() {
 function isvalTruncate(n: i32) {
   while isvalLine.length > n { isvalLine.pop() }
   while isvalCol.length > n { isvalCol.pop() }
+  while isvalEnd.length > n { isvalEnd.pop() }
   while isvalTok.length > n { isvalTok.pop() }
   while isvalName.length > n { isvalName.pop() }
   while isvalType.length > n { isvalType.pop() }
@@ -6372,9 +6396,8 @@ function fnRetCollapsed(fnIx: i32) {
 // `ix` is the `IsExpr` node; `name` the operand binding; `objTy` its (collapsed) type;
 // `lit` the tested spelling exactly as the author wrote it.
 function recordCollapsedIs(ix: i32, name: string, objTy: i32, lit: string) {
-  if ix < 0 || ix >= nodeToks.length { return 0 }
-  const tk = nodeToks[ix]
-  if tk < 0 || tk >= P.toks.length { return 0 }
+  const tk = findingStartTok(ix)
+  if tk < 0 { return 0 }
   const t = P.toks[tk]
   // An exact repeat (same anchor) is the re-check of one node, not a second finding — the
   // de-duplication `recordDeadCoalesce` and `tErrCoded` both apply.
@@ -6385,6 +6408,7 @@ function recordCollapsedIs(ix: i32, name: string, objTy: i32, lit: string) {
   }
   isvalLine.push(t.line)
   isvalCol.push(t.col)
+  isvalEnd.push(findingEndCol(ix, tk))
   isvalTok.push(tk)
   isvalName.push(demangleName(name))
   // User-facing (the finding's message quotes it) — the user render, not the raw one.

@@ -40,6 +40,7 @@ type Row = {
   name: string;
   src: string;
   frag: string; // a fragment of the message this row is about
+  sev?: string; // the tier it is raised at; "error" when omitted
   line: number; // 1-based
   col: number; // 1-based, inclusive
   endCol: number; // 1-based, EXCLUSIVE
@@ -255,6 +256,45 @@ const GRID: Row[] = [
     endCol: 16,
     underlines: '"text"',
   },
+  // ── the three findings raised on the CHECKER side with `stage: "type"` ────
+  // Not on `T.diags` at all — each is its own side table that `cli.vl` turns into a
+  // diagnostic, and all three hard-coded `endCol = col + 1` there.
+  {
+    // `const n: i32 = 1` — the `:` at 8, the `=` at 14. The span is the range `--fix`
+    // deletes, so it carries the space before the `=`.
+    name: "redundant-type: the hint spans the annotation the fix removes",
+    src: "const n: i32 = 1\nprint(n)\n",
+    frag: "redundant type annotation: `n`",
+    sev: "hint",
+    line: 1,
+    col: 8,
+    endCol: 14,
+    underlines: ": i32 ",
+  },
+  {
+    // `const d = n ?? 99` — the `??` node runs from `n` at 11 to the second `9` at 17.
+    name: "dead-coalesce-default: the warning spans the whole `??`",
+    src: "const n: i32 = 1\nconst d = n ?? 99\nprint(n + d)\n",
+    frag: "this `??` default is never used",
+    sev: "warning",
+    line: 2,
+    col: 11,
+    endCol: 18,
+    underlines: "n ?? 99",
+  },
+  {
+    // `const isErr = v is "err"` — the `is` node runs from `v` at 15 to the closing
+    // quote at 24.
+    name: "collapsed-arm-value-test: the hint spans the whole `is`",
+    src: 'function pick(): string | "err" {\n  return "err"\n}\n' +
+      'const v = pick()\nconst isErr = v is "err"\nprint(isErr)\n',
+    frag: "is a value test",
+    sev: "hint",
+    line: 5,
+    col: 15,
+    endCol: 25,
+    underlines: 'v is "err"',
+  },
 ];
 
 const jsonDiags = async (file: string): Promise<Diag[]> => {
@@ -289,12 +329,13 @@ Deno.test({
         const file = `${dir}/span.vl`;
         await Deno.writeTextFile(file, row.src);
         const diags = await jsonDiags(file);
+        const want = row.sev ?? "error";
         const d = diags.find((x) =>
-          x.severity === "error" && x.message.includes(row.frag)
+          x.severity === want && x.message.includes(row.frag)
         );
         if (!d) {
           bad.push(
-            `${row.name}: no error containing "${row.frag}" — got ${
+            `${row.name}: no ${want} containing "${row.frag}" — got ${
               diags.map((x) => `${x.severity} ${x.message}`).join("; ") || "none"
             }`,
           );
