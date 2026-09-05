@@ -124,7 +124,13 @@ import {
 import { PIN_SIGKEY } from "./ast"
 // Monomorphization rewrites a call's callee name on a node the arena already holds;
 // `compiler/symbols.vl` is the discipline that in-place write follows.
-import { sidNoteNodeName, sidOfNode } from "./symbols"
+import {
+  sidArrGet,
+  sidArrPut,
+  sidLookup,
+  sidNoteNodeName,
+  sidOfNode,
+} from "./symbols"
 import {
   annArrowAt,
   annFnDecompose,
@@ -268,6 +274,12 @@ let monoLamMintedSlots: i32[] = []
 let monoArenaTick = 0
 let monoRebuiltStamp = 0 - 1
 
+// `monoProgStmts` indexed by the interned name of each module-scope `LetDecl`, first
+// occurrence winning — `monoModuleLetOf`'s answer whenever the name is one of them. A miss
+// stays -1, the fall-through to `moduleLocalLetOfUnique`. Rebuilt at the one write to
+// `monoProgStmts`, so it carries no row from an earlier compile.
+let monoProgLetBySid: i32[] = []
+
 function monoArenaStamp() {
   P.nodes.length + fnStmts.length + fnParent.length + monoArenaTick
 }
@@ -409,19 +421,14 @@ function monoModuleNameVisible(name: string, fnIx: i32) {
   false
 }
 
-// The module-scope `LetDecl` for `name` as seen from `fnIx`, or -1. Module scope has two
-// storage classes: a top-level block's binding is a start-function local, absent from
-// `monoProgStmts`, so `moduleLocalLetOfUnique` is the other table (D1596).
+// The module-scope `LetDecl` for `name` as seen from `fnIx`, or -1, through
+// `monoProgLetBySid`. Module scope has two storage classes: a top-level block's binding is
+// a start-function local, absent from `monoProgStmts`, so `moduleLocalLetOfUnique` is the
+// other table (D1596).
 function monoModuleLetOf(name: string, fnIx: i32) {
   if !monoModuleNameVisible(name, fnIx) { return -1 }
-  let i = 0
-  while i < monoProgStmts.length {
-    const s = P.nodes[monoProgStmts[i]]
-    if s is LetDecl {
-      if s.letName == name { return monoProgStmts[i] }
-    }
-    i = i + 1
-  }
+  const hit = sidArrGet(monoProgLetBySid, sidLookup(name))
+  if hit >= 0 { return hit }
   moduleLocalLetOfUnique(emitRootIx, name)
 }
 
@@ -4743,6 +4750,21 @@ export function monomorphize(stmts: i32[]) {
   monoInstName = []
   monoInstFe = []
   monoProgStmts = stmts
+  // The index follows the table it answers for, at the write and not at a build point:
+  // between the two there is no reader, so `monoModuleLetOf` cannot see an empty column.
+  monoProgLetBySid = []
+  let mi = 0
+  while mi < stmts.length {
+    const ms = P.nodes[stmts[mi]]
+    if ms is LetDecl {
+      // First occurrence wins: a later module binding sharing the name keeps the slot.
+      const msid = sidOfNode(stmts[mi])
+      if sidArrGet(monoProgLetBySid, msid) < 0 {
+        sidArrPut(monoProgLetBySid, msid, stmts[mi])
+      }
+    }
+    mi = mi + 1
+  }
   monoLamPinned = []
   monoLamShared = []
   let any = false
