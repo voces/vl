@@ -19,6 +19,14 @@ export const runWasmBytes = async (wasm: Uint8Array): Promise<string[]> => {
   const printChars: number[] = [];
   const memory = new WebAssembly.Memory({ initial: 1, maximum: 65536 });
   await WebAssembly.instantiate(wasm, {
+    // The USER externs (`extern function`). A browser loader supplies this object; the
+    // playground provides the same registry the native host does, so a program that runs
+    // under `vl run` runs here. An extern outside it is a LinkError naming the function,
+    // which is the enforcement the design leans on (docs/internals/extern-design.md §4).
+    extern: {
+      // `nowMillis(): i64` — a wasm i64 result must be returned as a JS bigint.
+      nowMillis: () => BigInt(Date.now()),
+    },
     imports: {
       memory,
       // Read `length` raw bytes at `offset` as a UTF-8 string (the byte form a

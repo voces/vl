@@ -15,7 +15,7 @@
 // `P`, and the arena `mk*` constructors. The parser's own `advance`/`peekTok`
 // cursor primitives stay private to this module.
 import { TokKind, tplPartStrLex } from "./lexer"
-import { isBinOpFuncName, mkMatch } from "./ast"
+import { externAdd, isBinOpFuncName, mkMatch } from "./ast"
 import { BinExpr, Ident, P, Tok, dgMarkLossless, mkDeclNameTok } from "./ast"
 // The free index-operator declaration-name encoding — the parser is where
 // `function "[]"(self: T, …)` gets the receiver-carrying name it declares under.
@@ -2521,6 +2521,93 @@ function parseFuncTailBounded(
 
 function parseFunc() { parseFuncHead(true) }
 
+// The type spelling of the annotation node at `ix`, or `""` for none. Every annotation is a
+// `TypeRef` carrying a synthetic name, so one read covers `i32`, `u8[]` and `A | B` alike.
+function annNameOf(ix: i32): string {
+  if ix < 0 || ix >= P.nodes.length { return "" }
+  const n = P.nodes[ix]
+  if n is TypeRef { return n.tyName }
+  ""
+}
+
+// `extern function name(p: T, …): R` — a host function declared in ordinary VL syntax, with
+// no body. The name is the wasm import name, so the declaration is banked in the program-wide
+// manifest (`ast.externAdd`) and contributes NO statement: an extern has no body to run and
+// no local index to occupy.
+function parseExtern() {
+  // `export extern function …` — ordinary visibility, exactly as on a `function`: the
+  // declaring module keeps a non-exported extern to itself, and an exported one is importable
+  // by name. The link name it points at is shared either way.
+  if peekKind() == "EXPORT" { advance() }
+  advance() // "extern"
+  if peekKind() != "FUNCTION" {
+    P.diags.push(
+      {
+        msg: "`extern` declares a host function — write `extern function name(…): T`",
+        at: P.pos,
+      },
+    )
+    return 0
+  }
+  advance() // "function"
+  let name = ""
+  const nameTok = P.pos
+  if peekKind() == "IDENT" { name = advance().text } else { expect("IDENT") }
+  const ptys: string[] = []
+  parseExternParams(ptys)
+  let ret = ""
+  if accept("COLON") { ret = annNameOf(parseType()) }
+  externAdd(name, ptys, ret, nameTok)
+  externRejectBody()
+}
+
+// `"(" (IDENT ":" type ("," …)*)? ")"` — an extern's parameter list, appending each
+// parameter's type spelling to `out`. Its own reader rather than `parseParamList`, which
+// mints `Param` nodes an extern has nothing to attach them to.
+function parseExternParams(out: string[]) {
+  expect("LPAREN")
+  skipNewlines()
+  let going = peekKind() != "RPAREN"
+  while going {
+    skipNewlines()
+    if peekKind() == "IDENT" { advance() } else { expect("IDENT") }
+    if accept("COLON") {
+      out.push(annNameOf(parseType()))
+    } else {
+      P.diags.push(
+        {
+          msg: "an `extern` parameter needs a type — a host import's signature is the whole contract",
+          at: P.pos,
+        },
+      )
+      out.push("")
+    }
+    skipNewlines()
+    if peekKind() == "COMMA" {
+      advance()
+      skipNewlines()
+      going = peekKind() != "RPAREN"
+    } else {
+      going = false
+    }
+  }
+  expectClose("RPAREN")
+}
+
+// A body on an `extern function` is the one shape that would silently never run: the call
+// site lowers to the host import, so the statements would be emitted and unreachable.
+function externRejectBody() {
+  if peekKind() == "LBRACE" {
+    P.diags.push(
+      {
+        msg: "an `extern function` has no body — the host provides it, so a body here would never run",
+        at: P.pos,
+      },
+    )
+  }
+  0
+}
+
 // The recovered arm: exactly one statement, wrapped in a synthesized `Block` (`-1` for no
 // `{` source token). Every consumer downstream then sees the shape the braced form produces,
 // so nothing past the parser can tell a recovered body from a written one. Every unbraced
@@ -3207,6 +3294,8 @@ export function parseProgram() {
     else if k == "NEWLINE" || k == "SEMI" { advance() }
     else if k == "IMPORT" { stmts.push(parseImport()) }
     else if k == "EXPORT" && kindAt(P.pos + 1) == "LBRACE" { skipReexport() }
+    else if k == "EXTERN" { parseExtern() }
+    else if k == "EXPORT" && kindAt(P.pos + 1) == "EXTERN" { parseExtern() }
     else { stmts.push(parseStmt()) }
   }
   // D1045 — the hoist. A body-scoped declaration is also a top-level statement of the

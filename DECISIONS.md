@@ -1267,6 +1267,37 @@ it worked.
 
 ## Memory, runtime & object model
 
+- **AN `extern function` IS PICKED UP BY THE COMPILE, AND THE IMPORT SECTION IS THE MANIFEST**
+  (2026-09-05, owner ruling: *"Externs should be enforced in terms of the invoker HAVING to
+  implement them somehow. But I don't think they should have to be restricted to just one file
+  or stated in a config or the build tool; they should automatically be picked up via
+  compile/run etc."*). So there is no `extern` block, no manifest file and no build-tool flag:
+  a declaration in ANY module is collected into the wasm import section, under the `extern`
+  namespace (std's floor keeps `imports`), and the engine's own link step is the enforcement.
+
+  Three consequences that are decisions rather than mechanics. **The LINK name and the VL name
+  are two different things.** The link name is what the import section carries, so it is one
+  flat program-wide namespace — forced by the section holding exactly one entry per name, and
+  the rule C, Zig and Rust `extern` blocks have; so two modules may declare one extern (no
+  diagnostic, one import) and a disagreement is a check error at the second declaration. The
+  VL name is an ordinary module binding, mangled by the merge, so `export` on an extern is
+  ordinary visibility (owner ruling, 2026-09-05: *"export extern makes sense to me if you want
+  to just define all the types in one place then everywhere else you just import by name"*) —
+  one module owns the host boundary, everyone else imports the names with no re-declaration,
+  and a non-exported extern is unspellable elsewhere. **The alternative — refusing `export
+  extern` — lost**: it read the link name as *the* name, and it bought nothing, since `export`
+  here publishes a VL name and never a wasm one (an exported extern adds no export-section
+  entry, so a host-callable shim stays a separate feature either way). **Only scalars
+  cross** (`i32 i64 f32 f64 boolean`) — measured, a `u8[]` crosses to wasmtime, which reads GC
+  objects, and is opaque to a browser, which cannot build or read one, so admitting it would
+  make a declaration link natively and fail in the browser it was written for; bytes travel as
+  a `Buf`'s `base` and `length` into the `memory` the module already exports. **Every DECLARED
+  extern is imported**, called or not — the manifest reading of the ruling, and what this tree
+  already does for `std:fs`, where importing `readFile` alone emits seven fs imports.
+
+  Full argument, the JS loader shape, and why std's own floor is NOT migrated:
+  `docs/internals/extern-design.md`.
+
 - **A `string` is UTF-8 BYTES behind a slice header, and the surface is
   BYTE-INDEXED.** `s[i]` is a byte (0–255, O(1)), `.length` is the byte count
   (O(1)), `slice(a, b)` takes byte offsets and returns an O(1) view; code points
