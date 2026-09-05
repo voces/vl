@@ -35,12 +35,14 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 VL="${VL:-scripts/vl-host/target/release/vl}"
+# $PYTHON pins the interpreter gate.sh preflighted; bare `python3` otherwise.
+PYBIN="${PYTHON:-python3}"
 OUT="${1:-$(mktemp -d)}"
 COMP="${2:-build/vl-compiler.wasm}"
 [ -x "$VL" ] || { echo "missing vl binary: $VL" >&2; exit 1; }
 mkdir -p "$OUT/cells"
 
-python3 - "$OUT/cells" <<'PY'
+"$PYBIN" - "$OUT/cells" <<'PY'
 import sys
 d = sys.argv[1]
 reps = {"i32": "1", "string": '"a"', "f64": "1.5"}

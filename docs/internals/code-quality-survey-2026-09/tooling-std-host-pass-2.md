@@ -36,10 +36,10 @@ table could not say which had happened.
 | --- | --- | --- | --- | --- | --- |
 | 1 | `capability-probes/run.py` costs **3.35 s** and is in no gate — and its own header ("today every probe fails, by construction") is false of **142 of 148** (§2) | 6 refusals, **4 SILENT**; `goal-scoreboard.py` prints `total against the goal 0` on the same tree | S | low | a sixth ratchet at 142; `vl_capability_matrix_test.ts`'s sibling |
 | 2 | **584 of 7,564 corpus cells have no `expected.jsonl` row**, and `regress.py` silently defaults them to block `A`, `represents = 0` (§3) | the split reads 2,061/5,503 where the tree is 1,477/6,087; a movement in any of the 584 reports `0 of 255504` | S | low | `set(baseline) == set(expected)`; the `--verify-fresh` row |
-| 3 | the gate's wall clock is **127.0 s** against CLAUDE.md's ~90 s budget, and `distilled corpus` — not `ci-native` — is now the critical path (§4) | five numbers in CLAUDE.md §Gates are stale: 21 gates→**23**, ~7 s→**66.3 s**, 1,477→**2,061**, 250,238→**255,504**, 7,021→**7,564** | S (doc) + a decision | none | the table in §4; `regress.py`'s own summary line |
-| 4 | the TIME column is each row's **contended** time, not its cost — `filed witnesses` 71.2 s in the fan-out, **18.8 s alone** (3.8×) (§5) | `distilled corpus` 127.0 vs 66.3 (1.9×); consolidated row 1 fixed elapsed-to-report, not this | S | none | the two columns printed side by side |
-| 5 | **10 of the 23 gate rows run whichever `python3` is first on `PATH`**, with no version pin and no verdict of its own (§6) | a broken interpreter exits **rc=1 in 1.7 ms** — the same exit code a genuinely over-budget ratchet returns, and the table's only tell is a TIME column that legitimately reads 0.0 s elsewhere | S | low | one preflight row; `lint-self.sh`'s four `--exempt-codes` substitutions stop being silently empty |
-| 6 | **46 test files run twice in one `gate.sh`, 2 run three times** (§7) | 22 of ci-native's glob read no env var; all 24 of the lsp (ci list) row do not; #2592 removed the 47th for this reason | S | low — ci.yml must stay untouched | the gate table; each suite's own case count |
+| 3 | the gate's wall clock is **127.0 s** against CLAUDE.md's ~90 s budget, and `distilled corpus` — not `ci-native` — is now the critical path (§4) | five numbers in CLAUDE.md §Gates are stale: 21 gates→**23**, ~7 s→**66.3 s**, 1,477→**2,061**, 250,238→**255,504**, 7,021→**7,564** | S (doc) + a decision | none | the table in §4; `regress.py`'s own summary line — **landed #2621** |
+| 4 | the TIME column is each row's **contended** time, not its cost — `filed witnesses` 71.2 s in the fan-out, **18.8 s alone** (3.8×) (§5) | `distilled corpus` 127.0 vs 66.3 (1.9×); consolidated row 1 fixed elapsed-to-report, not this | S | none | the two columns printed side by side — **landed #2621** |
+| 5 | **10 of the 23 gate rows run whichever `python3` is first on `PATH`**, with no version pin and no verdict of its own (§6) | a broken interpreter exits **rc=1 in 1.7 ms** — the same exit code a genuinely over-budget ratchet returns, and the table's only tell is a TIME column that legitimately reads 0.0 s elsewhere | S | low | one preflight row; `lint-self.sh`'s four `--exempt-codes` substitutions stop being silently empty — **landed #2621** (`$PYTHON` reaches them; the empty-substitution shape is not fixed) |
+| 6 | **46 test files run twice in one `gate.sh`, 2 run three times** (§7) | 22 of ci-native's glob read no env var; all 24 of the lsp (ci list) row do not; #2592 removed the 47th for this reason | S | low — ci.yml must stay untouched | the gate table; each suite's own case count — **landed #2621** |
 | 7 | `check-filed-witnesses.py` grades **624 rows in a serial loop**, 145% CPU on 24 cores (§8) | 4th-longest gate row; every other heavy row fans out (`regress.py` reaches 498%) | S | low — the report already collects then prints | `624 graded · 0 MOVED` unchanged, and the order identical |
 | 8 | the gate grades **one** inventory; there are **two** (§9) | `inventory-2/` holds 17 gradeable rows no gate re-runs; graded by hand today **17 as filed, 0 MOVED** | one word | none | the `filed witnesses` row, ~5 s longer |
 | 9 | `run.py` takes the **ambient** std where its sibling `matrix.py` pins it (§10) | `matrix.py:506` builds `VL_STD`; `run.py:135` calls the shared `grade()` with `env=None`; measured from this worktree, `vl` pairs the worktree seed with `/home/verit/vl/std` | 2 lines | none | `run.py --sites` unchanged; the 10 probes naming `std:` |
@@ -157,7 +157,7 @@ still prints `no cell changed class`, the split line reads 1,477/6,087, and the 
 
 ---
 
-## 4 · The gate is 127 s, the budget is ~90 s, and the corpus is the new critical path
+## 4 · The gate is 127 s, the budget is ~90 s, and the corpus is the new critical path — **landed #2621**
 
 One full `gate.sh --no-build` on this tree, seed refreshed first, `JOBS=4 DENO_JOBS=4`, load
 31.7 rising to 73.6 as a second agent's gate started:
@@ -205,7 +205,7 @@ splits, which is the standing known risk and the reason to re-distil often rathe
 
 ---
 
-## 5 · The TIME column is a contended time, and consolidated row 1 did not fix that
+## 5 · The TIME column is a contended time, and consolidated row 1 did not fix that — **landed #2621**
 
 `gate.sh:44-46` now stamps the finish inside the subshell, so each row reports its own wall
 time rather than the report loop's clock — consolidated row 1, landed #2564, and the rows are
@@ -238,7 +238,7 @@ column, and the two rows above read 18.8/71.2 and 66.3/127.0 with the difference
 
 ---
 
-## 6 · Ten gate rows take whichever `python3` is first on `PATH`
+## 6 · Ten gate rows take whichever `python3` is first on `PATH` — **landed #2621**
 
 Measured during this survey, because the box changed under it: Homebrew relinked its
 `python3` (3.14) at 08:40 and it stopped loading —
@@ -290,7 +290,7 @@ interpreter, exactly one row fails and its name says why.
 
 ---
 
-## 7 · Forty-six suite files run twice in one gate, and two run three times
+## 7 · Forty-six suite files run twice in one gate, and two run three times — **landed #2621**
 
 Six gate rows select test files. Resolving each row's selector against `tests/`:
 
