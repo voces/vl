@@ -352,8 +352,10 @@ axis(
 // both sides clamp on the same floor. The bar comes off the super-linear ladder to the family
 // default, 2.5: 1.6x the worst of nineteen rounds, 8 of 8 green with a fanned-out gate beside
 // it, and master red at any load. Still super-linear in N (200/400/800 reads 0.17/0.41/1.18 s
-// where master reads 0.28/0.86/3.57), so a bigger pair needs its own bar. What is left at 800
-// pins is `buildFnMap`, 18.7% inclusive — the same per-instance pass one row over.
+// where master reads 0.28/0.86/3.57), so a bigger pair needs its own bar. `buildFnMap` then
+// went 18.6 - 20.4% inclusive -> 0.25 - 1.58% by re-seeding its prefix from a row cache, taking
+// the pair to 0.80 - 1.06 against 0.88 - 1.20; both arms clamp on `FLOOR` at 400 pins, so the
+// bar STAYS at the family default rather than tracking a number the harness cannot measure.
 axis("generic pins", 2.5, "`monoRebuild` re-runs a whole-program pass per minted instance.", (d) =>
   twoFiles(d, genPins(400, true), genPins(400, false)));
 
