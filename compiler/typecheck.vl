@@ -90,10 +90,17 @@ import {
 } from "./ast"
 // The free index-operator declaration-name encoding (B14).
 import { OP_INDEX_GET, OP_INDEX_SET, opDeclLabel, opDeclOpOf } from "./ast"
-// A node's start offset and the token sitting at it — the `argument N` mismatch anchor
-// for a function-literal argument (`tErrAtNodeStart`), whose `nodeToks` last-token anchor
-// is its closing brace.
-import { nodePos, tokIndexAt } from "./fmt_util"
+// A node's source span: its first token, its last token on that first line, and a token's
+// end column — what a diagnostic underlines, since a message names the whole construct and
+// `nodeToks` alone anchors at its closing brace.
+import {
+  nodeLastTok,
+  nodePos,
+  nodeSpanEndTok,
+  nodeStartTok,
+  tokEndCol,
+  tokIndexAt,
+} from "./fmt_util"
 import { sidArrGet, sidArrPut, sidOf } from "./symbols"
 import { isBinOpFuncName } from "./ast"
 // The extern manifest: parsed in any module, declared here, imported by the emitter.
@@ -153,12 +160,14 @@ import {
 import {
   SYM_MEM_METHOD,
   isvalCol,
+  isvalEnd,
   isvalLine,
   isvalLit,
   isvalName,
   isvalTok,
   isvalType,
   rcoalCol,
+  rcoalEnd,
   rcoalLine,
   rcoalTok,
   rcoalType,
@@ -339,15 +348,16 @@ export type Ty = TyPrim |
   TyLit |
   TyNeg
 
-// A type diagnostic: a message plus the AST node it is raised at (VL has no exceptions,
-// so errors accumulate on `T.diags`). `tline`/`tcol` are the anchor token's source
-// position — 1-based line, 0-based column, `0` meaning "no position"; `tcode` is the
-// stable category code, `""` for a type-soundness rejection; `tdata` the structured payload.
+// A type diagnostic: a message, the AST node it is raised at, and its SPAN — 1-based
+// `tline` (0 = no position) with 0-based `[tcol, tend)` columns. The raise records the end,
+// so an anchor it chose cannot drift from an end derived elsewhere. `tcode` is the stable
+// category code, `""` for a type-soundness rejection; `tdata` the structured payload.
 type TDiag = {
   tmsg: string,
   tat: i32,
   tline: i32,
   tcol: i32,
+  tend: i32,
   tcode: string,
   tdata: string,
 }
@@ -6185,24 +6195,42 @@ function inlayHoleDeep(ty: i32, depth: i32): boolean {
   false
 }
 
-// ── the dead-`??` finding ────────────────────────────────────────────────────
+// ── the node-anchored findings' span ─────────────────────────────────────────
 // A multi-module compile merges every module's AST, so `modOfTok` resolves which file a finding
 // is in; the CLI keeps only the entry module's (`redunModuleAt`).
+
+// The token a node-anchored FINDING starts at: the node's first token, else its last, since a
+// node minted after parsing owns no start. `-1` when it has neither, which drops the finding
+// rather than placing it where the author wrote nothing. The raise family's
+// `tErrPushNodeSpan` takes the same two rungs, for the same reason.
+function findingStartTok(ix: i32) {
+  const first = nodeStartTok(ix)
+  if first >= 0 { return first }
+  nodeLastTok(ix)
+}
+
+// That finding's 0-based exclusive end column: the node's last token on the start line, so the
+// span covers the construct the message names. Degrades to `tk`'s own end.
+function findingEndCol(ix: i32, tk: i32) {
+  const end = nodeSpanEndTok(ix)
+  if end >= 0 { return tokEndCol(end) }
+  tokEndCol(tk)
+}
 
 function rcoalReset() {
   rcoalLine = []
   rcoalCol = []
+  rcoalEnd = []
   rcoalTok = []
   rcoalType = []
   0
 }
 
 // Record `x ?? d` whose left operand's type admits no `null`: the default is dead.
-// Anchored at the `??` node, exactly where every other diagnostic on that node lands.
+// Spans the `??` NODE, exactly where every other diagnostic on that node lands.
 function recordDeadCoalesce(ix: i32, lt: i32) {
-  if ix < 0 || ix >= nodeToks.length { return 0 }
-  const tk = nodeToks[ix]
-  if tk < 0 || tk >= P.toks.length { return 0 }
+  const tk = findingStartTok(ix)
+  if tk < 0 { return 0 }
   if jwTokIsGenerated(tk) { return 0 }
   const t = P.toks[tk]
   // An exact repeat (same anchor) is the re-check of one node, not a second finding — the same
@@ -6214,6 +6242,7 @@ function recordDeadCoalesce(ix: i32, lt: i32) {
   }
   rcoalLine.push(t.line)
   rcoalCol.push(t.col)
+  rcoalEnd.push(findingEndCol(ix, tk))
   rcoalTok.push(tk)
   // User-facing (the finding's message quotes it) — the user render, not the raw one.
   rcoalType.push(tyToStrUser(lt))
@@ -6223,6 +6252,7 @@ function recordDeadCoalesce(ix: i32, lt: i32) {
 function rcoalTruncate(n: i32) {
   while rcoalLine.length > n { rcoalLine.pop() }
   while rcoalCol.length > n { rcoalCol.pop() }
+  while rcoalEnd.length > n { rcoalEnd.pop() }
   while rcoalTok.length > n { rcoalTok.pop() }
   while rcoalType.length > n { rcoalType.pop() }
   0
@@ -6233,6 +6263,7 @@ function rcoalTruncate(n: i32) {
 function isvalReset() {
   isvalLine = []
   isvalCol = []
+  isvalEnd = []
   isvalTok = []
   isvalName = []
   isvalType = []
@@ -6251,6 +6282,7 @@ function isvalReset() {
 function isvalTruncate(n: i32) {
   while isvalLine.length > n { isvalLine.pop() }
   while isvalCol.length > n { isvalCol.pop() }
+  while isvalEnd.length > n { isvalEnd.pop() }
   while isvalTok.length > n { isvalTok.pop() }
   while isvalName.length > n { isvalName.pop() }
   while isvalType.length > n { isvalType.pop() }
@@ -6364,9 +6396,8 @@ function fnRetCollapsed(fnIx: i32) {
 // `ix` is the `IsExpr` node; `name` the operand binding; `objTy` its (collapsed) type;
 // `lit` the tested spelling exactly as the author wrote it.
 function recordCollapsedIs(ix: i32, name: string, objTy: i32, lit: string) {
-  if ix < 0 || ix >= nodeToks.length { return 0 }
-  const tk = nodeToks[ix]
-  if tk < 0 || tk >= P.toks.length { return 0 }
+  const tk = findingStartTok(ix)
+  if tk < 0 { return 0 }
   const t = P.toks[tk]
   // An exact repeat (same anchor) is the re-check of one node, not a second finding — the
   // de-duplication `recordDeadCoalesce` and `tErrCoded` both apply.
@@ -6377,6 +6408,7 @@ function recordCollapsedIs(ix: i32, name: string, objTy: i32, lit: string) {
   }
   isvalLine.push(t.line)
   isvalCol.push(t.col)
+  isvalEnd.push(findingEndCol(ix, tk))
   isvalTok.push(tk)
   isvalName.push(demangleName(name))
   // User-facing (the finding's message quotes it) — the user render, not the raw one.
@@ -6692,44 +6724,60 @@ function tErrCoded(msg: string, at: i32, code: string) {
   tErrCodedData(msg, at, code, "")
 }
 
-// `tErrCoded` plus the structured payload — the only raise that fills `tdata`. The code stays a
-// bare category and the answer rides `data` (`diagDataField`), so no consumer has to split a code
-// string and no value's characters can bite.
+// `tErrCoded` plus the structured payload — the only raise that fills `tdata`. Anchoring: a node
+// whose own NAME is the subject spans that one token — a declaration's declared name, a member
+// access's property, the names `driver.vl`'s emit and module anchors already prefer. Every other
+// kind spans WHOLE, which is `tErrPushNodeSpan`'s arm.
 function tErrCodedData(msg: string, at: i32, code: string, data: string) {
-  let ln = 0
-  let co = 0
-  if at >= 0 && at < nodeToks.length {
-    const tk = nodeToks[at]
-    if tk >= 0 && tk < P.toks.length {
-      const t = P.toks[tk]
-      ln = t.line
-      co = t.col
+  if at >= 0 && at < P.nodes.length {
+    const n = P.nodes[at]
+    // A loop's binder and a parameter's name carry `declNameTok` too, and neither is its
+    // construct's subject — the diagnostics there are about the loop and the parameter.
+    if n is FuncDecl || n is TypeDecl || n is UnionDecl || n is LetDecl {
+      const nm = declNameTokOf(at)
+      if nm >= 0 && nm < P.toks.length {
+        return tErrPushTok(msg, at, nm, code, data)
+      }
+    } else if n is Member || n is OptMember {
+      const tk = nodeLastTok(at)
+      if tk >= 0 { return tErrPushTok(msg, at, tk, code, data) }
     }
   }
-  tErrPush(msg, at, ln, co, code, data)
+  tErrPushNodeSpan(msg, at, code, data)
 }
 
-// `tErr`, positioned at node `at`'s start token instead of its `nodeToks` last-token anchor — for a
-// multiline construct whose last token is a closing brace a whole body away from what the message
-// names. `tat` still records the node, so the repeat-dedupe key is unchanged, and both consumers
-// clamp an end that lands before this start. Falls back to the plain anchor when there is no start.
-function tErrAtNodeStart(msg: string, at: i32) {
-  tErrAtNodeStartCoded(msg, at, "")
-}
-
-// `tErrAtNodeStart` on the category-coded channel — the start-anchor twin of `tErrCoded`, so a
-// capability refusal can also point at the construct's first token. D1045's body-scope `type` needs
-// both halves at once: it is a "type-valid but cannot build" refusal whose last token is the
-// closing brace of its field list, a line or more below the `type` keyword the message names.
-function tErrAtNodeStartCoded(msg: string, at: i32, code: string) {
-  const sp = nodePos(at)
-  if sp >= 0 {
-    const tk = tokIndexAt(sp)
-    if tk >= 0 && tk < P.toks.length {
-      return tErrPush(msg, at, P.toks[tk].line, P.toks[tk].col, code, "")
-    }
+// Raise `msg` over node `at`'s whole span: its first token through the last of its tokens on
+// that first line, a report carrying one line. A node synthesized after parsing has no start
+// token and falls back to the `nodeToks` last-token anchor; a node with neither is positionless.
+function tErrPushNodeSpan(msg: string, at: i32, code: string, data: string) {
+  const first = nodeStartTok(at)
+  if first >= 0 {
+    const end = tokEndCol(nodeSpanEndTok(at))
+    return tErrPush(
+      msg,
+      at,
+      P.toks[first].line,
+      P.toks[first].col,
+      end,
+      code,
+      data,
+    )
   }
-  tErrCoded(msg, at, code)
+  const last = nodeLastTok(at)
+  if last >= 0 { return tErrPushTok(msg, at, last, code, data) }
+  tErrPush(msg, at, 0, 0, 0, code, data)
+}
+
+// Raise `msg` spanning exactly token `tk` — the caller has already decided the token is the
+// whole subject, so nothing widens it. Out-of-range is the caller's to rule out.
+function tErrPushTok(
+  msg: string,
+  at: i32,
+  tk: i32,
+  code: string,
+  data: string,
+) {
+  tErrPush(msg, at, P.toks[tk].line, P.toks[tk].col, tokEndCol(tk), code, data)
 }
 
 // D1585 — the reserved-name refusal, raised from one place by both faces: a single file's
@@ -6742,9 +6790,7 @@ export function tErrBuiltinTyDecl(name: string, at: i32): i32 {
     "` — every annotation resolves that name to the primitive, so the declaration " +
     "can never be referred to; rename it"
   const tk = declNameTokOf(at)
-  if tk >= 0 && tk < P.toks.length {
-    return tErrPush(msg, at, P.toks[tk].line, P.toks[tk].col, "", "")
-  }
+  if tk >= 0 && tk < P.toks.length { return tErrPushTok(msg, at, tk, "", "") }
   tErr(msg, at)
   0
 }
@@ -6754,6 +6800,7 @@ function tErrPush(
   at: i32,
   ln: i32,
   co: i32,
+  end: i32,
   code: string,
   data: string,
 ) {
@@ -6768,7 +6815,15 @@ function tErrPush(
     di = di + 1
   }
   T.diags.push(
-    { tmsg: msg, tat: at, tline: ln, tcol: co, tcode: code, tdata: data },
+    {
+      tmsg: msg,
+      tat: at,
+      tline: ln,
+      tcol: co,
+      tend: end,
+      tcode: code,
+      tdata: data,
+    },
   )
   0
 }
@@ -16173,7 +16228,7 @@ function argMismatchErr(argN: i32, expected: i32, at: i32, argIx: i32) {
     if n is FuncDecl {
       const site = fnLitRetMismatchSite(n, expected, at)
       if site >= 0 { return tErr(msg, site) }
-      return tErrAtNodeStart(msg, argIx)
+      return tErr(msg, argIx)
     }
   }
   tErr(msg, argIx)
@@ -18068,13 +18123,7 @@ function validateBinCstrs(
               msg = head + refusal + tail
             }
             const aNode = cstrArgNodeOf(anchorNo, hArgNo, hArgNode)
-            if aNode >= 0 {
-              // The argument's START, not its `nodeToks` last-token anchor: an argument that
-              // is a composite (`{ foo: "bar" }`) would otherwise caret its closing brace.
-              tErrAtNodeStart(msg, aNode)
-            } else {
-              tErr(msg, ix)
-            }
+            if aNode >= 0 { tErr(msg, aNode) } else { tErr(msg, ix) }
           }
         }
       }
@@ -20328,7 +20377,7 @@ function checkMemberCallNode(n: Call, ix: i32, cfn: Member): i32 {
         "' on array " +
         tyToStr(recvTy) +
         methodDidYouMean(recvTy, cfn.memProp),
-      ix,
+      n.callFn,
     )
     return TY_ERR
   }
@@ -20579,7 +20628,7 @@ function checkMemberCallNode(n: Call, ix: i32, cfn: Member): i32 {
       }
       tErr(
         "no method '." + sp + "' on string" + methodDidYouMean(recvTy, sp),
-        ix,
+        n.callFn,
       )
       return TY_ERR
     }
@@ -21690,6 +21739,20 @@ function ifChainHasBareReturn(ifIx: i32): boolean {
   false
 }
 
+// The inferred-return refusal, anchored at the END of the body it could not infer from — the
+// one raise exempt from the node-span rule. It is a whole-body verdict and usually a
+// consequence of an error inside that body, and the report is position-ordered: at the
+// function's name it would print above its own cause.
+function inferNoBasisErr(name: string, fnIx: i32, body: i32) {
+  const msg = "cannot infer a return type for '" +
+    name +
+    "' — annotate a return type"
+  const tk = nodeLastTok(body)
+  if tk >= 0 { return tErrPushTok(msg, fnIx, tk, "", "") }
+  tErr(msg, fnIx)
+  0
+}
+
 // The un-annotated return, decided after the body is checked and its scope popped: the
 // observed returns join into one type, a contextual expected return may adopt it, and the
 // hoisted `TyFunc` is patched so existing references see the result. Restores the
@@ -21726,14 +21789,7 @@ function finishInferredReturn(
   } else if inferSawErr {
     // Only err-ish types flowed back: no basis. A param that is itself uninferable
     // already reported the root cause, so suppress the redundant message.
-    if !paramUninferable {
-      tErr(
-        "cannot infer a return type for '" +
-          n.fnName +
-          "' — annotate a return type",
-        n.fnBody,
-      )
-    }
+    if !paramUninferable { inferNoBasisErr(n.fnName, fnIx, n.fnBody) }
     inferred = TY_ERR
   }
   // Contextual return adoption: an anonymous lambda whose body infers a narrower numeric
@@ -23695,12 +23751,7 @@ function checkProgramNode(n: Program) {
     if ufIx >= 0 {
       const ufn = P.nodes[ufIx]
       if ufn is FuncDecl {
-        tErr(
-          "cannot infer a return type for '" +
-            unresolvedFns[uf] +
-            "' — annotate a return type",
-          ufn.fnBody,
-        )
+        inferNoBasisErr(unresolvedFns[uf], ufIx, ufn.fnBody)
       }
     }
     uf = uf + 1
@@ -24014,7 +24065,7 @@ function checkNodeReal(ix: i32) {
     return checkFuncDeclNode(n, ix)
     // ── while ─────────────────────────────────────────────────────────────────
   } else if n is WhileStmt {
-    return checkWhileStmtNode(n, ix)
+    return checkWhileStmtNode(n)
     // Accepted unconditionally: valid only inside a loop, but loop-nesting is
     // not tracked yet (a misplaced `break`/`continue` is a parser concern).
   } else if n is BreakStmt {
@@ -25609,9 +25660,9 @@ function mixedVariantBoxGate(members: i32[]): boolean {
 // node-to-token resolution has nothing to read and the position is supplied directly.
 function externErr(msg: string, tok: i32) {
   if tok >= 0 && tok < P.toks.length {
-    return tErrPush(msg, -1, P.toks[tok].line, P.toks[tok].col, "", "")
+    return tErrPushTok(msg, -1, tok, "", "")
   }
-  tErrPush(msg, -1, 0, 0, "", "")
+  tErrPush(msg, -1, 0, 0, 0, "", "")
 }
 
 // The type-arena index an `extern function` parameter or return spelling resolves to — the
@@ -26845,9 +26896,7 @@ function refuseLocalNomEscape(t: i32, at: i32) {
   if t < 0 { return 0 }
   const nm = localNomEscapeAt(t, 0)
   if nm == "" { return 0 }
-  // Anchored at the node's start: `nodeToks`'s default is its last token, which would report
-  // at the closing identifier of a lambda expression, away from the `return` to annotate.
-  tErrAtNodeStart(
+  tErr(
     "return type `" +
       nm +
       "` is declared inside `" +
@@ -29696,7 +29745,7 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
       if asgBarred {
         writeBarredErr(placeKeyOf(n.binLeft), ix)
       } else {
-        tErr(letAssignMsg(n.binRight, rt, asgLt, ""), ix)
+        tErr(letAssignMsg(n.binRight, rt, asgLt, ""), n.binRight)
       }
     } else {
       // The same vacuous-gate check covers three write spellings (`r = e`, `b.v = e`,
@@ -30108,7 +30157,7 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
       if !neverAnnot && !assignableExpr(n.letInit, initTy, annot) {
         // Three sentences, one home: `letAssignMsg` picks between the object-literal-into-a-map,
         // lossy-numeric and opaque forms; the pin calls the same function on the substituted pair.
-        tErr(letAssignMsg(n.letInit, initTy, annot, n.letName), ix)
+        tErr(letAssignMsg(n.letInit, initTy, annot, n.letName), n.letInit)
       } else if !neverAnnot {
         // The check above is vacuous whenever a side is a hole — record the pair for the pin to
         // re-ask under substitution, only on the PASSING side (a failing one already reported, D572).
@@ -30966,7 +31015,7 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
   retTailPos = false
   const condTy = checkNode(n.ifCond)
   if !assignable(condTy, TY_BOOL) {
-    tErr("if-condition must be boolean, got " + tyToStr(condTy), ix)
+    tErr("if-condition must be boolean, got " + tyToStr(condTy), n.ifCond)
   }
   // Narrowing over a simple identifier: `is T` refines to the variant, `!= null`/`== null`
   // refine a nullable. Union-complement narrowing after `is T` is deliberately excluded — it missed real errors.
@@ -31844,7 +31893,7 @@ function checkIndexNode(n: Index, ix: i32) {
     if !assignable(idxTy, at.mKey) {
       tErr(
         "map key must be " + tyToStr(at.mKey) + ", got " + tyToStr(idxTy),
-        ix,
+        n.idxIndex,
       )
     }
     return mkNullableTy(at.mVal)
@@ -31866,7 +31915,7 @@ function checkIndexNode(n: Index, ix: i32) {
           return mkNullableTy(hmt.mVal)
         }
       }
-      tErr("array index must be i32, got " + tyToStr(idxTy), ix)
+      tErr("array index must be i32, got " + tyToStr(idxTy), n.idxIndex)
     }
     noteArrayDemand(at.tvName)
     // Admitted here and re-asked at the pin (D691): `noteArrayDemand` only reaches a bound
@@ -31939,7 +31988,7 @@ function checkIndexNode(n: Index, ix: i32) {
     return TY_ERR
   }
   if !assignable(idxTy, TY_I32) {
-    tErr("array index must be i32, got " + tyToStr(idxTy), ix)
+    tErr("array index must be i32, got " + tyToStr(idxTy), n.idxIndex)
   }
   if at is TyArray {
     // The element's value type — a `u8[]` read is an `i32`, never a `u8`. Same shape as the
@@ -32575,10 +32624,10 @@ function checkOptMemberNode(n: OptMember, ix: i32) {
 }
 
 // Extracted from `checkNodeReal`'s `WhileStmt` arm (C3: thin the dispatcher).
-function checkWhileStmtNode(n: WhileStmt, ix: i32) {
+function checkWhileStmtNode(n: WhileStmt) {
   const wc = checkNode(n.whileCond)
   if !assignable(wc, TY_BOOL) {
-    tErr("while-condition must be boolean, got " + tyToStr(wc), ix)
+    tErr("while-condition must be boolean, got " + tyToStr(wc), n.whileCond)
   }
   // Definite-assignment: a loop body may run zero times, so an in-body assignment is not
   // guaranteed to reach the fall-through — check the body live, then restore the pre-loop state.
@@ -32749,16 +32798,7 @@ function checkRangeNeverRuns(fromIx: i32, toIx: i32, stepIx: i32) {
     diagDataField("to", i32ToStr(to)) +
     diagDataField("step", i32ToStr(stepK))
   const tk = forToKwTok(toIx)
-  if tk >= 0 {
-    return tErrPush(
-      msg,
-      toIx,
-      P.toks[tk].line,
-      P.toks[tk].col,
-      CODE_RANGE_NEVER_RUNS,
-      data,
-    )
-  }
+  if tk >= 0 { return tErrPushTok(msg, toIx, tk, CODE_RANGE_NEVER_RUNS, data) }
   tErrCodedData(msg, toIx, CODE_RANGE_NEVER_RUNS, data)
 }
 
@@ -32824,7 +32864,7 @@ function checkForInNode(n: ForIn, ix: i32) {
   } else if it is TyErr {
     elemTy = TY_ERR
   } else {
-    tErr("for-in expects an array or map, got " + tyToStr(iterTy), ix)
+    tErr("for-in expects an array or map, got " + tyToStr(iterTy), n.fiIter)
   }
   // See ForRange: a `for` body re-executes with nothing to re-establish a narrowing.
   pushReBarrier()
@@ -32914,7 +32954,7 @@ function checkRetStmtNode(n: RetStmt, ix: i32) {
         tyToStr(got) +
         bareRetVoidNote(want) +
         charLitForStringNote(n.retArg, want),
-      ix,
+      n.retArg,
     )
   } else if want >= 0 {
     // The check above is vacuous whenever a side is a hole — record the pair for the pin to
