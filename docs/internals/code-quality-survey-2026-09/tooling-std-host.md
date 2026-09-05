@@ -35,7 +35,7 @@ the module surface do not. Six of the top ten are that shape.
 | 7 | the test harness re-declares its footing: `const ROOT` in **59** files, `exists` verbatim in **56**, and **35 of 54** binary-spawning files pin neither `VL_STD` nor the shared helper (§7.4) | a bare `deno test` from a worktree grades the main repo's std | M | low | `deno task test` + ci-native unchanged; `nativeRelease.vl()` gains one env entry |
 | 8 | `vl_scaling_shape_test.ts` runs **three times per `gate.sh`**, concurrently with itself, and it is the ratio test (§7.2) | it failed at 2.73/2.50 inside the fan-out and passed alone | S | low | the gate table; the suite's own 9 cases |
 | 9 | `lsp/src/*.ts` (9,958 lines) is linted by **nothing** (§8.3) | one standing hit today | S | none | a gate row beside the existing `lsp typecheck` |
-| 10 | `onHover` is a **three-rung ladder of full module-graph checks** (§8.1); no per-version memo in `wasmChecker` | hovering a type name in a 26-module graph is 3 × 4.4 s | M | med — a memo must key on the reader too | `lsp_*_wasm_test.ts` suites, the `lsp suites (ci list)` gate row |
+| 10 | ✅ **LANDED (§8.1)** — one-entry prepared-state memo in `wasmChecker`, keyed on (source, entryKey, reader, reader generation) | a hover is 1 graph check, not 3; a keystroke burst 2, not 7; 26 modules 4,293 → 1,449 ms | M | med — the key needs the reader's identity AND a host bump | `tests/lsp_prepared_memo_wasm_test.ts`, the whole `lsp_*` family, the `lsp suites (ci list)` gate row |
 
 ---
 
@@ -594,6 +594,22 @@ was. The one exception is §7.2: 32 s of it is a suite running for the third tim
 ## 8 · The LSP
 
 ### 8.1 A hover is up to three full module-graph checks
+
+**Landed.** `wasmChecker` holds ONE memo entry — the (source, entryKey, reader,
+reader generation) the seed instance is staged for, and whether `checkSrcSym` has
+run over it — and every query goes through `ensurePrepared`. Measured with the
+`graphCheckCount()` instrument the change adds (graph checks / module fetches per
+request): `onHover` **3 → 1** / 3 → 1, `onDocumentHighlight` **2 → 1** / 2 → 1,
+`semanticTokens` **2 → 1** / 2 → 1, `onDefinition` 1 → 1 / **2 → 1**, and one
+keystroke burst (change + hover + tokens + inlay) **7 → 2** / **7 → 1**. The
+keystroke ladder, medians of three interleaved runs per arm at load 12: 1 module
+0.3 → 0.1 ms, 4 modules 3.0 → 1.0 ms, **26 modules 4,293 → 1,449 ms (2.96×)**,
+with the second hover in the same unchanged file at **8.7 ms**. (The same ladder
+at load ~100 reads 4,995 → 1,961 ms, 2.55× — the ratio is the column that
+survives the box.) What remains is one staging (~100 ms) plus one `checkSrcSym`
+(~1.3 s), which is §C2's per-module checked-form cache, not this.
+
+The rest of this section is the survey's own finding, at the commit it names.
 
 `prepare()` (`wasmChecker.ts:652-686`) resets the module table, re-commits **every** module in
 the graph, and re-pushes the source; the sixteen methods that call it then run
