@@ -637,3 +637,43 @@ Deno.test({
     `a new import line; got ${JSON.stringify(edit.newText)}`,
   );
 });
+
+// `std:fmt` RE-EXPORTS `split` from `std:str`. Probing only `std:fmt` still
+// reaches the method — the re-export is an import edge, so `std:str` joins the
+// graph — and the offer names `std:str`, the module that DECLARES it. That is
+// the same provider rule the std auto-import pass applies, and this pins the
+// UFCS half of it against the surface now carrying re-exports (survey §3.5).
+Deno.test({
+  name: "seed: a re-exported self-function is reachable through the re-exporter, offered from its declarer",
+  ignore,
+}, async () => {
+  const { checker, read } = checkerAndReader();
+  const src = 'const parts = "a,b".\n';
+  const cursor = { line: 0, character: 20 };
+  const onlyFmt = stdProbeModules(checker).filter((m) => m.key === "std:fmt");
+  assert(onlyFmt.length === 1, "std:fmt must have a nameable export to probe with");
+  const probe = ufcsProbeSource(src, onlyFmt, cursor);
+  const candidates = await checker.ufcsCandidatesAt(
+    probe.source,
+    "/proj/main.vl",
+    read,
+    cursor.line + probe.lineOffset,
+    cursor.character,
+  );
+  const split = candidates.find((c) => c.name === "split");
+  if (split === undefined) {
+    throw new Error(
+      `split must be reachable through std:fmt's re-export; got ${
+        JSON.stringify(candidates.map((c) => c.name))
+      }`,
+    );
+  }
+  assert(split.moduleKey === "std:str", `the declarer; got ${split.moduleKey}`);
+  const items = ufcsCompletions(src, "/proj/main.vl", candidates, () => false);
+  const edit = items.find((i) => i.name === "split")?.extraEdits?.[0];
+  if (edit === undefined) throw new Error("expected an import edit");
+  assert(
+    edit.newText.startsWith('import { split } from "std:str"'),
+    `imported from the declarer; got ${JSON.stringify(edit.newText)}`,
+  );
+});
