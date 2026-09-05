@@ -1,6 +1,6 @@
 // The SENTENCE `std:buffer`'s bulk `u8[]` pair prints before it aborts.
 //
-// `storeBytes`/`toBytes` compare their range once and `__trap__("…")` when it
+// `storeBytes`/`loadBytes` compare their range once and `__trap__("…")` when it
 // does not fit, which streams the message to the host boundary and then executes
 // `unreachable`. The corpus `@trap` directive cannot see that half — it inspects
 // the abort, and every VL trap lowers to the same instruction — so the two
@@ -58,8 +58,8 @@ const CASES: [string, string][] = [
     "std:buffer.storeBytes: [off, off + src.length) is not inside the buffer",
   ],
   [
-    "buffer-to-bytes-overflow-traps.vl",
-    "std:buffer.toBytes: [off, off + len) is not inside the buffer",
+    "buffer-load-bytes-overflow-traps.vl",
+    "std:buffer.loadBytes: [off, off + len) is not inside the buffer",
   ],
 ];
 

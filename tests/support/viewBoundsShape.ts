@@ -43,7 +43,7 @@
 // module is present until an optimizer rung deletes what nothing calls. So a new
 // std export with a loop in it moves all eighteen `none` cells by the same
 // amount and neither `O` nor `O3` at all, which is the signature to check for
-// before reading a move as a codegen finding. `storeBytes`/`toBytes` did exactly
+// before reading a move as a codegen finding. `storeBytes`/`loadBytes` did exactly
 // that (+3 call, +4 sget): two `struct.get`s each in their copy loop, plus their
 // `__trap__("…")` message, whose per-character print loop is what drags the
 // string machinery into a kernel that has no strings. At `-O3` the module is

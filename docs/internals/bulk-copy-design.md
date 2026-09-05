@@ -169,7 +169,7 @@ so `std:fs` re-exports `Buf` and its header names the dependency.
 
 ```vl
 export function storeBytes(self: Buf, off: i32, src: u8[])
-export function toBytes(self: Buf, off: i32, len: i32): u8[]
+export function loadBytes(self: Buf, off: i32, len: i32): u8[]
 ```
 
 Mechanism: **no compiler change and no host import.** The measured (a1) row is exactly this
@@ -180,7 +180,7 @@ section, and it removes the `0 to n - 1` off-by-one (VL-012) from 46 call sites.
 
 **As landed, re-measured by the same method** (64 MiB, prebuilt module, min of 7, control differs
 by exactly the loop): `storeBytes` **847 MB/s against today's idiom at 389 MB/s (2.2×)**, and
-`toBytes` **814 MB/s against the push loop at 340 MB/s (2.4×)**. The disassembly shows the base
+`loadBytes` **814 MB/s against the push loop at 340 MB/s (2.4×)**. The disassembly shows the base
 hoisted into a local outside the loop and the body one `i32.store8` over one `array.get_u`; what
 remains per element is the wrapper reload and the `select` guard the next paragraph is about.
 
@@ -202,8 +202,16 @@ function.
 
 - **Name.** `readFileInto` / `readFileRangeInto` extend `readFile` / `readFileRange` with the
   destination that distinguishes them, and stay self-sufficient in a flat namespace.
-  `storeBytes` / `toBytes` match `store8` / `store16`'s width-family shape and `fill`'s
-  destination-is-the-receiver rule.
+  `storeBytes` / `loadBytes` match `store8` / `store16`'s width-family shape and `fill`'s
+  destination-is-the-receiver rule. **The read half was `toBytes` here until the review caught
+  what this bullet had not compared** (owner, ruling on the finding): `std:buffer` teaches one
+  verb pair — eight `load*`, six `store*` — so a caller who knows `loadU8`/`store8` types
+  `loadBytes`; every other `to*` in std (`toJson`, `toString`, `toLowerAscii`, `toUpperAscii`)
+  converts the WHOLE receiver and takes no window, which a positional `(off, len)` would be the
+  first to break; and `toBytes` is the name a whole-buffer `toBytes(self: Buf): u8[]` will want,
+  which is the form the tree actually writes (`buf.loadBytes(0, buf.length)`). `readBytes` was
+  considered and refused: `read` is `std:fs`'s verb, and a third verb for one export makes
+  `b.readBytes` and `b.loadU8` two words for one act.
 - **`self` first?** `std:buffer`'s pair yes; `std:fs`'s no, and for the reason its header already
   gives — the thing operated on is the file, so `path` leads.
 - **Second error channel?** No. `T | IoError` in `std:fs`, the module's existing model. This
