@@ -275,6 +275,51 @@ Each now says so, in the shape the `concat`-vs-`+` bullet uses.
   a path. `fileSize` continues `pathKind`/`pathExists`'s noun-first split of what `stat`
   would have promised, and changes the noun on purpose — a PATH has no size, and the
   function refuses (`EISDIR`) when the path names something that is not a file.
+- **`readFileInto`/`readFileRangeInto` take a `Buf` rather than a raw address, by owner
+  ruling** — `bulk-copy-design.md` §F put the choice to the owner and the answer was the
+  `Buf`. The price is that `std:fs` now imports `std:buffer`, and `std:buffer`'s body
+  carries the memory intrinsics, so EVERY `std:fs` program gets a linear memory and a
+  `memory` export whether or not it ever builds a `Buf`. Measured on a program whose only
+  call is `readFile`: 26,124 → 29,171 bytes unoptimized and 927 → 1,260 at `-O3`. An `i32`
+  address would have avoided it and would have dropped the length the truncation is
+  measured against, which is the whole reason the count is meaningful.
+- **A destination OFFSET, and no destination length**, as §E1 of that doc recommends. The
+  window's length is `dst.length - dstOff`, so there is no second number that can disagree
+  with the buffer about how much room there is, and an offset is what a caller assembling
+  one buffer out of several reads needs. The two exports are the `readFile`/`readFileRange`
+  split repeated, not a new axis.
+- **One floor slot serves both.** `__fs_read_into__(path, offset, addr, cap)` is fs slot 9;
+  `readFileInto` passes offset 0. Splitting it would have been a second host import with
+  the same body, and the emitter's per-slot tables would carry two rows saying one thing.
+- **It is the first fs slot that WRITES, so the use scan forces the memory.**
+  `fsSlotWritesMemory` sets `memUsed` exactly as `__memory_size__` does: the host looks the
+  destination up by the module's `memory` EXPORT, so a program whose only contact with
+  linear memory is this call still needs section 5 emitted and section 7 to name it.
+  `tests/cases/intrinsics/fs-read-into.vl` is the pin — it carries zero load, store or
+  bulk-memory instructions and its module still exports a memory.
+- **`EFAULT` (21) is by number, deliberately**, on the same terms as `EFBIG`. The host
+  answers it when the destination window does not lie inside the memory, which a `Buf` from
+  `Buffer(n)` cannot produce — that call grows the memory to cover the extent — so naming
+  the constant would add a permanent std name for a branch an allocating caller cannot take.
+  **The re-export widens who CAN take it**, which the API review found by writing the
+  program: `Buf` is a structural type, so `const forged: Buf = { base: 0, length: 100000000 }`
+  now type-checks with `std:fs` as the only import, and `readFileInto` through it answers
+  `errno 21` — a value, not a trap, and the header's no-trap promise holds for a base past
+  the end (21) and a negative base (28) alike. That is the price of `Buf` being trusted
+  rather than checked, and the declarations say so.
+- **The host LOOPS the read**, rather than taking one `read(2)`. That is what makes a short
+  count mean end of file instead of a short syscall, and a stop condition that can also
+  mean "the kernel felt like it" is not one a scan can use. A failure part-way through a
+  window answers `-errno` and leaves whatever arrived in the buffer; the count is lost, not
+  the bytes.
+- **A window of ZERO bytes still opens the file.** A buffer with no room left is not a
+  reason to stop answering the question the caller asked about the FILE, and the deciding
+  argument is agreement: `readFileRange(p, 0, 0)` on a missing file is `ENOENT`, so
+  `readFileInto` with a full buffer has to be too. The first draft short-circuited on a
+  zero capacity and answered 0, which is a success the call never looked for.
+- **The measurement that justified the out-parameter** is `bulk-copy-design.md` §B and §D —
+  the copy loop is 0.1791 s of the 0.2374 s a 64 MiB read costs, and §2 of the API rubric
+  requires it before a caller-owned buffer is admitted.
 - **Not here, and why:** no path manipulation (a future `std:fs/path`); no open handles,
   seeking or streaming (`readFileRange` is positional, so a scan needs none); no ranged
   TEXT read, since a byte range can split a UTF-8 sequence; no metadata beyond

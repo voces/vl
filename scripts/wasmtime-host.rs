@@ -92,7 +92,7 @@ fn main() -> Result<()> {
     })?;
 
     // ── the filesystem floor (`std:fs`) ──────────────────────────────────────
-    // The nine fs imports, registered only when the module declares them. This spike
+    // The ten fs imports, registered only when the module declares them. This spike
     // is not in CI and is built by nothing (see the header) — it carries them because
     // ROADMAP's host-ABI item requires every new import to land in all three hosts, and
     // because a parity harness that cannot instantiate a file-touching module cannot
@@ -338,6 +338,75 @@ fn main() -> Result<()> {
                 }
                 *e.lock().unwrap() = code;
                 r[0] = mk_list(&mut c, &st, &at, &out)?;
+                Ok(())
+            })?;
+        }
+        // `__fs_read_into__(path, offset, addr, cap)` — at most `cap` bytes from byte
+        // `offset` of the file, written straight into the module's exported linear memory
+        // at `addr`; the answer is the count written, or negative -errno. The read loops
+        // until the window is full or the file ends, so a short answer means end of file.
+        // A destination outside the memory is -EFAULT.
+        if let Some(ft) = fs_ty("__fs_read_into__") {
+            let e = fs_errno.clone();
+            linker.func_new("imports", "__fs_read_into__", ft, move |mut c, a, r| {
+                use std::io::{Read, Seek, SeekFrom};
+                let p = to_path(&bytes_of(&mut c, &a[0])?);
+                let Val::I64(off) = a[1] else {
+                    bail!("__fs_read_into__: expected an i64 offset")
+                };
+                let Val::I32(addr) = a[2] else {
+                    bail!("__fs_read_into__: expected an i32 address")
+                };
+                let Val::I32(cap) = a[3] else {
+                    bail!("__fs_read_into__: expected an i32 capacity")
+                };
+                let mut code = 0i32;
+                let mut wrote = 0i32;
+                if off < 0 || addr < 0 || cap < 0 {
+                    code = 28;
+                } else {
+                    // Opened even for a zero-byte window, so a missing file is ENOENT here
+                    // exactly as it is for `__fs_read_range__` with length 0.
+                    match std::fs::File::open(&p) {
+                        Err(err) => code = errno_of(&err),
+                        Ok(mut f) => match f.seek(SeekFrom::Start(off as u64)) {
+                            Err(err) => code = errno_of(&err),
+                            Ok(_) if cap == 0 => {}
+                            Ok(_) => {
+                                let Some(Extern::Memory(mem)) = c.get_export("memory") else {
+                                    bail!("__fs_read_into__: the module exports no `memory`")
+                                };
+                                let (lo, n) = (addr as usize, cap as usize);
+                                let data = mem.data_mut(&mut c);
+                                match data.get_mut(lo..).and_then(|t| t.get_mut(..n)) {
+                                    None => code = 21,
+                                    Some(dst) => {
+                                        let mut filled = 0usize;
+                                        while filled < n {
+                                            match f.read(&mut dst[filled..]) {
+                                                Ok(0) => break,
+                                                Ok(k) => filled += k,
+                                                Err(err)
+                                                    if err.kind()
+                                                        == std::io::ErrorKind::Interrupted => {}
+                                                Err(err) => {
+                                                    code = errno_of(&err);
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        wrote = filled as i32;
+                                    }
+                                }
+                            }
+                        },
+                    }
+                }
+                if code != 0 {
+                    wrote = -code;
+                }
+                *e.lock().unwrap() = code;
+                r[0] = Val::I32(wrote);
                 Ok(())
             })?;
         }

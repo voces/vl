@@ -1,0 +1,86 @@
+// @run
+// @skip the fs floor needs a host that can build a WasmGC value — V8 cannot; asserted natively by tests/selfhost_native_align_test.ts
+// @log 0
+// @log 16
+// @log 0
+// @log 4
+// @log 0
+// @log 4
+// @log 0
+// @log 0
+// @log 0
+// @log 0
+// @log 0
+// @log -28
+// @log 28
+// @log -44
+// @log 44
+// @log -44
+// @log 44
+// THE READ-INTO FLOOR — `__fs_read_into__`, under `std:fs`.
+//
+// It is the first fs import that WRITES: the host puts the bytes straight into the
+// module's linear memory at the address it is handed, and answers how many arrived (or
+// a negative `-errno`). Nothing in this program touches linear memory any other way —
+// no load, no store, no `std:buffer` — so the memory and the `memory` export it writes
+// through exist only because the use scan reserves them for this call. Remove that and
+// the host has no memory to find, which is why the byte checks live next door in
+// `tests/cases/std/fs-into.vl` rather than here: a load would force the memory itself
+// and this fixture could no longer show the reservation is load-bearing.
+//
+// `@skip`ped under the V8 harness and asserted natively for the reason
+// `tests/cases/intrinsics/fs-range.vl` sets out: a WasmGC array is opaque to JS and
+// cannot be constructed from it. Hermetic on the same terms — one file at a FIXED path
+// under `/tmp` with FIXED contents, so a concurrent second run writes the same bytes.
+function pathBytes(s: string): u8[] {
+  const out: u8[] = []
+  let i = 0
+  while i < s.length {
+    out.push(s[i])
+    i = i + 1
+  }
+  out
+}
+
+const path = pathBytes("/tmp/vl-fs-read-into-case.bin")
+const data: u8[] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+print(__fs_write__(path, data))
+
+// The address is a bare number on purpose: the memory is one page and byte 1024 is
+// where `std:buffer` starts its own heap, so nothing else in the module can be there.
+const DST = 1024
+
+// The whole file into a window with room to spare: sixteen bytes and errno 0.
+print(__fs_read_into__(path, 0, DST, 64))
+print(__fs_errno__())
+
+// A window SMALLER than the file fills exactly — the count is the window, not the file.
+print(__fs_read_into__(path, 0, DST, 4))
+print(__fs_errno__())
+
+// Straddling the end is SHORT: four bytes exist from offset 12, not the sixty asked
+// for, and a short answer is a success.
+print(__fs_read_into__(path, 12, DST, 60))
+print(__fs_errno__())
+
+// At the end, past it, and a zero-length window are all 0 with errno 0. Zero-plus-errno
+// is unambiguous only because errno is zeroed on success, so all three are asserted.
+print(__fs_read_into__(path, 16, DST, 8))
+print(__fs_read_into__(path, 9999, DST, 8))
+print(__fs_read_into__(path, 0, DST, 0))
+print(__fs_errno__())
+
+// A negative offset is `-EINVAL` (-28), refused by the host before it opens anything.
+print(__fs_read_into__(path, 0 - 1, DST, 4))
+print(__fs_errno__())
+
+// A missing file is `-ENOENT` (-44), the same code the other reads answer for it.
+const absent = pathBytes("/tmp/vl-fs-read-into-absent.bin")
+print(__fs_read_into__(absent, 0, DST, 4))
+print(__fs_errno__())
+
+// And a ZERO-LENGTH window still opens the file, so a missing one is `-ENOENT` here too
+// rather than a success that never looked — the same answer `__fs_read_range__` gives for
+// a zero length.
+print(__fs_read_into__(absent, 0, DST, 0))
+print(__fs_errno__())

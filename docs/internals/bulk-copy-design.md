@@ -2,8 +2,13 @@
 
 glean's R1 (`~/glean/docs/vl-requirements.md`, from VL-010) asks for a one-instruction bulk copy
 `u8[]` → linear memory and back, because `readFile` lands a file in a GC array while its parsers
-run over a `Buf`. This is the measurement and a proposed design. Nothing here is landed: the
-prototype was measured in scratch and is not in this branch.
+run over a `Buf`. This is the measurement and the design it settled.
+
+**§E1 IS LANDED** — `std:fs` gained `readFileInto` and `readFileRangeInto` over one host import,
+with the destination offset §E1 recommends and no destination length; the owner's decision 1 below
+was answered "take the `Buf`". §E2 is a sibling change and §E3's emitter hoist is still unscheduled.
+The rows in §B and §D stand as measured; the landed exports are re-measured in the PR that shipped
+them and in `std-notes.md` §`std:fs`.
 
 **The short answer.** There is no such instruction and there will not be one; the copy is 75% of
 the cost of reading a 64 MiB file today, and the fastest thing available is not to make the copy
@@ -138,7 +143,7 @@ runtime file.
 **Two exports, in two modules, for two different reasons. The first closes 45 of glean's 46 sites;
 the second is the general case and is the one that has to work in a browser.**
 
-### E1. `std:fs` gains a read that lands in linear memory
+### E1. `std:fs` gains a read that lands in linear memory — LANDED
 
 ```vl
 export function readFileInto(path: string, dst: Buf, dstOff: i32): i32 | IoError
@@ -218,11 +223,13 @@ mean `readFileInto` is native-only, which is correct — so is `readFile`.
 caller allocated, and `std:buffer`'s LIFO contract already says a `Buf` allocated after a released
 mark dangles. Nothing new, but the header should not pretend the destination is checked.
 
-Three decisions are the owner's:
+Three decisions are the owner's; the first is ANSWERED:
 
-1. **Does `readFileInto` take a `Buf` or a raw address?** A `Buf` makes `std:fs` depend on
-   `std:buffer` and re-export its type; an `i32` address avoids that and is worse at every call
-   site, because it drops the length the truncation is measured against.
+1. **Does `readFileInto` take a `Buf` or a raw address?** ANSWERED 2026-09-05: the `Buf`. A `Buf`
+   makes `std:fs` depend on `std:buffer` and re-export its type; an `i32` address avoids that and
+   is worse at every call site, because it drops the length the truncation is measured against.
+   The dependency's price turned out to be measurable and is recorded in `std-notes.md`: every
+   `std:fs` program now carries a linear memory and its `memory` export.
 2. **E2 alone, or both?** E2 is a pure std addition with no compiler and no host change and closes
    the shape complaint — the half glean says it is actually paying at its file sizes. E1 is where
    the 4×–20× is. They are independent.

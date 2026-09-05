@@ -3218,6 +3218,109 @@ fn register_fs_imports(
         )?;
     }
 
+    // `__fs_read_into__(path, offset, addr, cap)` — at most `cap` bytes from byte `offset`
+    // of the file, written STRAIGHT INTO the module's exported linear memory at byte
+    // `addr`. Answers the number of bytes written, or negative `-errno`; `errno` is set on
+    // every path so a caller may read the reason the same way every other slot reports it.
+    //
+    // The whole point is that no GC array is allocated and no byte is copied twice: the
+    // `read(2)` lands in the guest's own pages. The read LOOPS until the window is full or
+    // the file ends, so a short answer means end of file rather than a short syscall — that
+    // is what makes the count a stop condition a scan can use. Offset at or past the end is
+    // 0 bytes and not an error, exactly as `__fs_read_range__` answers empty, and a window
+    // of 0 bytes still opens the file so the two agree about a missing one.
+    //
+    // A destination outside the memory is `-EFAULT`: it cannot arise from a `Buf` that
+    // `std:buffer`'s allocator handed out, since that grows the memory to cover it, so this
+    // is the floor refusing a hand-built address rather than a case a caller reaches.
+    if let Some((_, ft)) = has("__fs_read_into__") {
+        let e = errno.clone();
+        linker.func_new(
+            "imports",
+            "__fs_read_into__",
+            ft,
+            move |mut c, args, results| {
+                use std::io::{Read, Seek, SeekFrom};
+                let path = read_u8_list(&mut c, &args[0])?;
+                let Val::I64(off) = args[1] else {
+                    bail!("fs intrinsic: __fs_read_into__ expected an i64 offset");
+                };
+                let Val::I32(addr) = args[2] else {
+                    bail!("fs intrinsic: __fs_read_into__ expected an i32 address");
+                };
+                let Val::I32(cap) = args[3] else {
+                    bail!("fs intrinsic: __fs_read_into__ expected an i32 capacity");
+                };
+                let mut code = 0i32;
+                let mut wrote = 0i32;
+                if off < 0 || addr < 0 || cap < 0 {
+                    code = 28; // EINVAL
+                } else {
+                    // OPENED EVEN FOR A ZERO-BYTE WINDOW, so a missing file is `ENOENT`
+                    // here exactly as it is for `__fs_read_range__` with length 0. A
+                    // buffer with no room left is not a reason to stop answering the
+                    // question the caller asked about the FILE.
+                    match os_path(&path) {
+                        Err(bad) => code = bad,
+                        Ok(p) => match std::fs::File::open(&p) {
+                            Err(err) => code = wasi_errno(&err),
+                            Ok(mut f) => match f.seek(SeekFrom::Start(off as u64)) {
+                                Err(err) => code = wasi_errno(&err),
+                                Ok(_) if cap == 0 => {}
+                                Ok(_) => {
+                                    // The emitter forces the memory to exist and to be
+                                    // exported whenever this slot is used, so a miss is a
+                                    // drift between the two halves, not something a
+                                    // program can spell.
+                                    let Some(Extern::Memory(mem)) = c.get_export("memory")
+                                    else {
+                                        bail!(
+                                            "fs intrinsic: __fs_read_into__ needs the \
+                                             module's exported `memory`, which this \
+                                             module does not have"
+                                        );
+                                    };
+                                    let a = addr as usize;
+                                    let n = cap as usize;
+                                    let data = mem.data_mut(&mut c);
+                                    match data
+                                        .get_mut(a..)
+                                        .and_then(|tail| tail.get_mut(..n))
+                                    {
+                                        None => code = 21, // EFAULT
+                                        Some(dst) => {
+                                            let mut filled = 0usize;
+                                            while filled < n {
+                                                match f.read(&mut dst[filled..]) {
+                                                    Ok(0) => break,
+                                                    Ok(k) => filled += k,
+                                                    Err(err)
+                                                        if err.kind()
+                                                            == std::io::ErrorKind::Interrupted => {}
+                                                    Err(err) => {
+                                                        code = wasi_errno(&err);
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            wrote = filled as i32;
+                                        }
+                                    }
+                                }
+                            },
+                        },
+                    }
+                }
+                if code != 0 {
+                    wrote = -code;
+                }
+                *e.lock().unwrap() = code;
+                results[0] = Val::I32(wrote);
+                Ok(())
+            },
+        )?;
+    }
+
     // `__fs_list__(path)` — the directory's entry NAMES, separated by 0x00 (NUL), or EMPTY
     // with `errno` set.
     //
