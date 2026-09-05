@@ -107,10 +107,55 @@ Each now says so, in the shape the `concat`-vs-`+` bullet uses.
   as a statement gets a silent no-op, clean at every severity. The rule going forward is
   that a building export whose verb also names a common in-place operation takes the
   participle instead (`sorted`); `reverse` predates it and std has no rename story.
+- **`filled` is the one export with no receiver, and its hot path is two allocations
+  behind one compare.** Its body is `__array_new__(n, v)`, and `wasm-dis` of an emitted
+  instance reads: `i32.lt_s` against zero guarding a cold arm (a per-character print loop
+  over the message, held in a module-level global, then `unreachable`), then `array.new`
+  for the backing and `struct.new` for the list wrapper. That is O(1) code against a
+  `push` loop's O(n), which is the whole reason to prefer this body — *"it lowers to one
+  instruction"* was the first wording here and the disassembly refutes it. The export
+  exists to put a std name on an intrinsic a program should not be spelling, which is
+  what its consumer asked for (glean VL-019 / R8: *"either bless the intrinsic under a
+  std name or make `[]` take a size"*). `n` is the first parameter because a length reads
+  first in `filled(256, 0)`, and there is no receiver to be `self`: the module header
+  carries that deviation, per `std-api-review.md` §4.5.
+- **A REFERENCE fill is SHARED across every slot, and that is `array.new`, not a
+  shortcut.** `filled(4, { count: 0, symbol: -1 })` writes one struct reference into four
+  slots, so `nodes[0].symbol = 7` is visible at `nodes[3]`. It is the Python
+  `[[0] * n] * m` trap and it is in the doc comment for that reason. **The remedy is one
+  call in this same module** — `filled(n, 0).mapIndexed(f)` builds a fresh object per
+  slot, measured distinct at both a struct and a list element — and the doc comment names
+  it, because a hazard whose answer is one call should carry the answer.
+  `tests/cases/std/array-filled-struct-element.vl` and `-nested-element.vl` pin both
+  halves and the remedy.
+- **The struct element and the list element cannot be instantiated in ONE module, and
+  that is why they are two fixtures.** A generic `T[]` constructor over `__array_new__`
+  pinned at a named struct AND at a nested list emits check-clean invalid wasm — but only
+  in that ORDER; nested-first runs, and so does either alone. Ablated over eight programs:
+  the ingredient is which ref-list row interned first, and not the annotation (both faces
+  fail). **The control that isolates it is a LOCAL generic wrapper, not the direct
+  spelling** — `function mk<T>(n: i32, v: T): T[] { return __array_new__(n, v) }` fails
+  the same pair the same way, which is what puts the mechanism at the generic monomorph
+  rather than at std; the direct `__array_new__(2, [1,2])` is a *different* cell (it is
+  silent ALONE, with a different message, and the wrapper FIXES it — so `filled` is a
+  small capability gain here as well as a rename). A `push`-loop constructor runs at all
+  28 element-type pairs where this one runs at 26.
+  `scripts/capability-probes/generic-array-new-struct-then-nested.vl` is the standing
+  witness.
+- **Three element types are outside the surface and every one of them is the raw
+  intrinsic's, not this export's.** A value-union element (`(i32 | string)[]`) and a
+  nullable-ref element (`(Node | null)[]`) are check-clean invalid wasm; a bare `null`
+  fill is the loud `bare null needs a struct-typed context`; a closure fill is the loud
+  `only i32[] arrays and struct/union element arrays are supported`. Each behaves
+  identically at the direct `__array_new__` spelling, so `filled` inherits them. The
+  nullable-ref one is the sharpest, because "fill with a placeholder and write the slots
+  later" is the shape a length-first constructor is FOR:
+  `scripts/capability-probes/array-new-nullable-ref-fill.vl`.
 - **Not done, deliberately:** no `sortUnstable`, no `sortBy`/`sortedBy`, no default
   ordering `xs.sort()` (`<` is defined for the scalars and `string` but not for a struct
   or a union, and VL has no overloading to express that), no `binarySearch`/`lowerBound`
-  (excluded by name in `perf-workstream.md` §6.2), and no adaptivity.
+  (excluded by name in `perf-workstream.md` §6.2), and no adaptivity. No `filledWith(n, f)`
+  taking a producer per index: `mapIndexed` over a `filled` list already composes into it.
 
 ## `std:buffer`
 
