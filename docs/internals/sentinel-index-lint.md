@@ -189,6 +189,35 @@ The grading also biases toward UNDECIDED on purpose: a time-boxed "I could not b
 is not proof of unreachability, and calling it DEFENSIVE is the error CLAUDE.md's reachability
 section names.
 
+### The 21 wrapped-header hits, graded — 21 DEFENSIVE, 0 LIVE
+
+Reading a function's whole header (#2605) uncovered 21 hits in three functions, every one the
+`fall-through i32 parameter` arm — D1500's own. Each was graded by tracing the parameter to
+every caller, then by an instrumented seed that turned each read's missing bound into a
+distinctive `emitFail` and swept **10,901 programs** (2,975 `tests/cases`, 7,564 distilled-corpus
+cells, 362 other tree `.vl` files) plus **84** generated union-delivery-position programs.
+**No bound fired.** The instrument was validated against an inverted control — flipping one
+condition to `==` made it refuse every program — so the zero is a measurement, not a silent probe.
+
+| hits | function · read | producer | grade · the comparison that guarantees it |
+| ---: | --- | --- | --- |
+| 10 | `emit_mono.vl:monoMakeInstance` — `monoOrigNode[origFe]` ×9, `fnStmts[origFe]` | `monoWalk`'s `fe`, `monoCoerceFnValueName`'s `gfe`, `monomorphize`'s `fe3` | **DEFENSIVE** — all three callers pass `fe >= 0 && fe < monoGen.length` (`emit_mono.vl:3794`, `4376`, and `4819`'s `nDecl`); `monoGen` and `monoOrigNode` are pushed in one loop (`4782`–`4787`) and neither is appended to again, so that test is `monoOrigNode.length`. `fnStmts` only grows past it. |
+| 3 | `emit_mono.vl:monoMakeInstance` — `P.nodes[calleeIx]` | `c.callFn` (call-driven), `exprIx` / `fnStmts[fe3]` (annotation-driven) | **DEFENSIVE** — each caller has already dereferenced the same index as `P.nodes[…]` before the call (`monoInstantiate`'s `P.nodes[callIx]` narrowed to `Call`, `monoCoerceFnValueName`'s own `P.nodes[exprIx]`), so this read is never the first. |
+| 2 | `wasmEmit.vl:emitStructExprAsVariantBox` — `uFieldCount[vi]`, `uFieldStart[vi]` | `unionArmVariantForStructExpr`, `exprVariantIndex` | **DEFENSIVE** — the function's first line is `guardVariantFieldSpan(vi, …)`, which tests `vi >= 0 && vi < uFieldStart.length && vi < uFieldCount.length` and both span ends. The rule's guard model reads comparisons, not helper calls (§What the guard model approximates). |
+| 2 | `wasmEmit.vl:emitStructExprAsVariantBox` — `uTags[vi]`, `uVarHeap[vi]` | same | **DEFENSIVE** — not covered by that guard, covered by construction: `assignTags` rebuilds `uTags` and `mAssignTypeIndices` rebuilds `uVarHeap` at one row per `uVariants` row, and the last writer of `uVariants` is a PASS (`collectU`, or `monoRegisterPinUnion` inside `monomorphize`), all of which run before the type section. A parity probe over 3,059 programs found `uVariants.length != uVarHeap.length` **0** times. |
+| 2 | `wasmEmit.vl:emitStructExprAsVariantBox` — `sHeapIdx[ssi]` ×2 | `structIndexOfExpr` | **DEFENSIVE** — each caller bounds it, differently: the union-coerce site only reaches the call past `unionArmVariantForStructExpr`, whose `structIdxMatchesVariantIdx` declines on `ssi >= sFieldCount.length` (`emit_classify.vl:26019`); the argument boundary carries `bssi < sHeapIdx.length` (`wasmEmit.vl:4074`, #1673). `sFieldCount` gains a row at every `sNames.push`, and a probe over 3,059 programs found `sNames.length != sHeapIdx.length` **0** times — checked at the top of the code section and again after every function body, so no row is interned late. |
+| 2 | `wasmEmit.vl:emitVariantFieldsEq` — `uVarHeap[vi]` ×2 | `eqConcreteVariantRow`, the `vis` column | **DEFENSIVE** — both callers take the same four bounds first: `emitStructUnionEqConcrete` spells them at `wasmEmit.vl:4660`–`4663`, and every `vis` entry `emitUnionBoxEqStaged` dispatches on was filled by `unionBoxEqColumns`, which declines at `4762`–`4765`. |
+
+Two things the sweep found that are **not** this family, recorded so they are not re-found as
+one: a same-shape union arm minted through an earlier `==` is check-clean invalid wasm
+(`type mismatch: expected (ref $type), found (ref $type)`, identical on master), and 13 of the
+84 generated position programs are loud check rejects. Neither is a trap, and grouping silent
+cells by that validator sentence is the mistake CLAUDE.md names.
+
+`guardVariantFieldSpan` checks two of the four tables its own callers go on to read; the two
+places that spell the bound by hand check all four. Closing that gap is free today (it fires on
+nothing measured) but it is a hardening, not a fix, and no hit here needs it.
+
 ## The false positives the rule had to design out
 
 Each was a real over-report during the build, and each is pinned as a fixture in
