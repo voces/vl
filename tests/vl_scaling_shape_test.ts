@@ -11,11 +11,13 @@
 // same work over N entities, the "one" arm over N/K. Method and profiles:
 // docs/internals/profiling-the-compiler.md.
 
-// THREE AXES ARE SUPER-LINEAR TODAY and carry a bar above their measured ratio rather
+// FOUR AXES ARE SUPER-LINEAR TODAY and carry a bar above their measured ratio rather
 // than the default. That is recorded DEBT, not tolerance: each names the function that
 // makes it so, and every one is a name-keyed registry answering a lookup by linear scan
 // — the track `__str_eq__` has topped the self-compile profile since #2419 closed the
-// arena scans. Lower the bar when the registry it names stops being a list.
+// arena scans. Lower the bar when the registry it names stops being a list. The fourth,
+// `unions`, joined the list when a constant term left BOTH its arms, which is worth
+// keeping in mind before reading any ratio here as a property of its own axis.
 const exists = (p: string): boolean => {
   try {
     Deno.statSync(p);
@@ -211,13 +213,14 @@ const gradePair = async (
   bar: number,
   note: string,
   mk: (dir: string) => Promise<[string, string]> | [string, string],
+  floor: number = FLOOR,
 ): Promise<void> => {
   const dir = await Deno.makeTempDir({ prefix: `vl_scale_${axis}_` });
   try {
     const [manySrc, oneSrc] = await mk(dir);
     let tMany = await build(manySrc, `${dir}/many.wasm`);
     let tOne = await build(oneSrc, `${dir}/one.wasm`);
-    const bad = () => tMany > bar * Math.max(tOne, FLOOR);
+    const bad = () => tMany > bar * Math.max(tOne, floor);
     if (bad()) {
       tMany = Math.min(tMany, await build(manySrc, `${dir}/many.wasm`));
       tOne = Math.min(tOne, await build(oneSrc, `${dir}/one.wasm`));
@@ -225,13 +228,13 @@ const gradePair = async (
     if (VERBOSE) {
       console.log(
         `[scaling] ${axis}: many ${tMany.toFixed(2)}s one ${tOne.toFixed(2)}s ` +
-          `ratio ${(tMany / Math.max(tOne, FLOOR)).toFixed(2)} bar ${bar}`,
+          `ratio ${(tMany / Math.max(tOne, floor)).toFixed(2)} bar ${bar}`,
       );
     }
     if (bad()) {
       throw new Error(
         `${axis}: the many-entity arm cost ${tMany}s against ${tOne}s for the same work ` +
-          `reshaped (ratio ${(tMany / Math.max(tOne, FLOOR)).toFixed(2)}, bar ${bar}) — ` +
+          `reshaped (ratio ${(tMany / Math.max(tOne, floor)).toFixed(2)}, bar ${bar}) — ` +
           `something is being re-derived per ${axis} entity. ${note} Profile it with ` +
           `docs/internals/profiling-the-compiler.md and bank the answer.`,
       );
@@ -247,18 +250,24 @@ const twoFiles = (dir: string, many: string, one: string): [string, string] => {
   return [`${dir}/many.vl`, `${dir}/one.vl`];
 };
 
-const axis = (name: string, bar: number, note: string, mk: (d: string) => [string, string]) =>
+const axis = (
+  name: string,
+  bar: number,
+  note: string,
+  mk: (d: string) => [string, string],
+  floor?: number,
+) =>
   Deno.test({
     name: `scaling shape: ${name}`,
     ignore: !ENABLED,
-    fn: () => gradePair(name, bar, note, mk),
+    fn: () => gradePair(name, bar, note, mk, floor),
   });
 
 // Measured 2026-09-03, box load 3 to 101 — absolute times moved 3x over that range while
-// the four LINEAR axes' ratios moved under 0.12 (1.02/1.02/1.03, 1.19/1.17/1.18,
-// 1.32/1.32/1.29, 1.13/1.02/1.01). The three super-linear ones move up to 0.76
-// (2.22/1.77/2.21, 2.47/1.99/2.58, 3.61/4.13/4.37), which is the other reason their bars
-// sit well clear of the measurement. Each line below is many/one/ratio.
+// the LINEAR axes' ratios moved under 0.12 (1.02/1.02/1.03, 1.19/1.17/1.18,
+// 1.13/1.02/1.01). The super-linear ones move up to 0.76 (2.22/1.77/2.21, 2.47/1.99/2.58,
+// 3.61/4.13/4.37), which is the other reason their bars sit well clear of the measurement.
+// Each line below is many/one/ratio; `unions` carries its own, re-measured reading.
 
 // 0.75 / 0.74 / 1.02, and 5.39 / 0.93 / 5.81 on the pre-#2419 compiler. The #2419 pair,
 // folded in from tests/vl_module_predicate_scan_test.ts: 32,000 statements either way,
@@ -276,9 +285,21 @@ axis(
 axis("types", 2.5, "A per-declaration cost is scaling with the type table.", (d) =>
   twoFiles(d, genTypes(2500, 1), genTypes(2500, 20)));
 
-// 1.86 / 1.41 / 1.32.
-axis("unions", 2.5, "A per-union cost is scaling with the union registry.", (d) =>
-  twoFiles(d, genUnions(800, 1), genUnions(800, 20)));
+// 3.49 / 3.02 / 3.69 raw, across box load 79 to 227 — a fourth super-linear axis, and the
+// only one whose number was ever HIDDEN rather than tolerated. Both arms declare 801
+// module-level bindings, so both used to pay the definite-assignment set's per-write rebuild;
+// at 2,400 bindings that constant read 41.7 s against 37.8 s, ratio 1.10, and the axis graded
+// nothing. With the set sid-keyed the arms read 1.2 s against 0.33 s and the union registry's
+// own per-entity cost is what is left (perf items 5 and 7). The cheap arm now costs less than
+// the shared 0.4 s floor, which would turn the quotient into an absolute budget on the many
+// arm, so this pair takes 0.25 — above a process start, below its own denominator.
+axis(
+  "unions",
+  5.5,
+  "A per-union cost is scaling with the union registry.",
+  (d) => twoFiles(d, genUnions(800, 1), genUnions(800, 20)),
+  0.25,
+);
 
 // 1.09 / 0.97 / 1.13.
 axis("call sites", 2.5, "Callee resolution is scaling with the number of callees.", (d) =>
