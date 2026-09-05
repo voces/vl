@@ -1,12 +1,15 @@
-// `extern function` AGAINST THE NATIVE HOST — the three facts the corpus fixtures cannot
-// assert, because a `tests/cases/` fixture is graded on its `@log` lines alone.
+// `extern function` AGAINST THE NATIVE HOST — the facts the corpus fixtures cannot assert,
+// because a `tests/cases/` fixture is graded on its `@log` lines alone.
 //
-//   1. THE IMPORT SECTION IS THE MANIFEST. Two modules declaring one extern emit exactly
-//      one `(import "extern" "nowMillis" …)`, and the entry is in the `extern` namespace,
-//      not `imports` — the split a host uses to tell a user extern from a std intrinsic.
-//   2. AN UNPROVIDED EXTERN IS A LOAD ERROR, exit 1, naming the function. That is the
+//   1. THE IMPORT SECTION IS THE MANIFEST. Declarations fold to one import per NAME, in the
+//      `extern` namespace and not `imports` — the split a host uses to tell a user extern
+//      from a std intrinsic. Read through `WebAssembly.Module.imports` (see `sections`).
+//   2. AN `export extern` PUBLISHES A VL NAME, NEVER A WASM ONE — the export section of a
+//      module whose only export is an extern is empty.
+//   3. A MODULE-PRIVATE EXTERN is unreachable from another module, by either route.
+//   4. AN UNPROVIDED EXTERN IS A LOAD ERROR, exit 1, naming the function. That is the
 //      enforcement half of the design; a fixture that ran it would just fail.
-//   3. `vl check` NEEDS NO PROVIDER. The same program checks clean, because checking a
+//   5. `vl check` NEEDS NO PROVIDER. The same program checks clean, because checking a
 //      program never instantiates it.
 //
 // The `vl_` prefix is load-bearing: it is one of the globs `ci-native` auto-discovers
@@ -27,7 +30,6 @@ const VL = `${ROOT}/scripts/vl-host/target/release/vl`;
 const COMPILER = `${ROOT}/build/vl-compiler.wasm`;
 const STD = `${ROOT}/std`;
 const CASES = `${ROOT}/tests/cases/extern`;
-const WASM_DIS = `${ROOT}/node_modules/.bin/wasm-dis`;
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER);
@@ -56,45 +58,71 @@ const tmp = async (name: string, src: string): Promise<string> => {
   return p;
 };
 
+type Sections = {
+  externs: WebAssembly.ModuleImportDescriptor[];
+  imports: WebAssembly.ModuleImportDescriptor[];
+  exports: WebAssembly.ModuleExportDescriptor[];
+};
+
+/**
+ * Build `entry` and read its import/export sections through `WebAssembly.Module`.
+ *
+ * The engine is the reader, deliberately: `ci-native` installs no npm packages, so
+ * `node_modules/.bin/wasm-dis` exists on a developer box and nowhere else — a suite that
+ * shells out to it is green here and red in CI. `WebAssembly.Module.imports` /
+ * `.exports` need no toolchain, and V8 parses this module's WasmGC types already (the
+ * corpus oracle instantiates them), so compiling it is also a validity check.
+ */
+const sections = async (entry: string): Promise<Sections> => {
+  const dir = await Deno.makeTempDir({ prefix: "vl_extern_sect_" });
+  const out = `${dir}/entry.wasm`;
+  try {
+    const built = await vl(["build", entry, "-o", out]);
+    if (built.code !== 0) {
+      throw new Error(`\`vl build ${entry}\` exited ${built.code}\n${built.err}`);
+    }
+    const mod = new WebAssembly.Module(await Deno.readFile(out));
+    const imports = WebAssembly.Module.imports(mod);
+    return {
+      imports,
+      externs: imports.filter((i) => i.module === "extern"),
+      exports: WebAssembly.Module.exports(mod),
+    };
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+};
+
+/** `module.name (kind)` per entry, for a failure message that names what it found. */
+const show = (xs: WebAssembly.ModuleImportDescriptor[]): string =>
+  xs.map((i) => `${i.module}.${i.name} (${i.kind})`).join(", ");
+
 Deno.test({
   name: "extern: two modules declaring one extern emit ONE import, in the `extern` namespace",
   ignore: !ENABLED,
   fn: async () => {
-    if (!exists(WASM_DIS)) {
+    const s = await sections(`${CASES}/two-modules/entry.vl`);
+    if (s.externs.length !== 1) {
       throw new Error(
-        `missing ${WASM_DIS} — binaryen is pinned in package.json; run \`npm install\``,
+        `want exactly 1 \`extern\` import, got ${s.externs.length}: ${show(s.externs)}`,
       );
     }
-    const dir = await Deno.makeTempDir({ prefix: "vl_extern_dis_" });
-    const out = `${dir}/entry.wasm`;
-    try {
-      const built = await vl(["build", `${CASES}/two-modules/entry.vl`, "-o", out]);
-      if (built.code !== 0) {
-        throw new Error(`\`vl build\` exited ${built.code}\n${built.err}`);
-      }
-      const dis = await new Deno.Command(WASM_DIS, {
-        args: [out],
-        stdout: "piped",
-        stderr: "piped",
-      }).output();
-      const wat = new TextDecoder().decode(dis.stdout);
-      const externs = wat.split("\n").filter((l) => l.includes('(import "extern" '));
-      if (externs.length !== 1) {
-        throw new Error(
-          `want exactly 1 \`extern\` import, got ${externs.length}:\n${externs.join("\n")}`,
-        );
-      }
-      if (!externs[0].includes('"nowMillis"') || !externs[0].includes("(result i64)")) {
-        throw new Error(
-          `the import entry does not carry the declared name and result: ${externs[0]}`,
-        );
-      }
-      // The std intrinsics keep their own namespace, which is the point of the split.
-      if (wat.includes('(import "extern" "__')) {
-        throw new Error(`a std intrinsic leaked into the \`extern\` namespace:\n${wat}`);
-      }
-    } finally {
-      await Deno.remove(dir, { recursive: true });
+    if (s.externs[0].name !== "nowMillis" || s.externs[0].kind !== "function") {
+      throw new Error(
+        `want \`extern.nowMillis (function)\`, got ${show(s.externs)}`,
+      );
+    }
+    // The std intrinsics keep their own namespace, which is the point of the split. The
+    // fs floor and the print family are `imports`, and nothing dunder is an `extern`.
+    const leaked = s.externs.filter((i) => i.name.startsWith("__"));
+    if (leaked.length > 0) {
+      throw new Error(`a std intrinsic leaked into \`extern\`: ${show(leaked)}`);
+    }
+    if (!s.imports.some((i) => i.module === "imports" && i.name === "__print_i64__")) {
+      throw new Error(
+        `\`__print_i64__\` is missing, so the extern's i64 result was not seen by the ` +
+          `print-import scan: ${show(s.imports)}`,
+      );
     }
   },
 });
@@ -103,52 +131,28 @@ Deno.test({
   name: "extern: `export extern` in one module gives every importer ONE import, and no wasm export",
   ignore: !ENABLED,
   fn: async () => {
-    if (!exists(WASM_DIS)) {
+    const s = await sections(`${CASES}/exported-from-host-module/entry.vl`);
+    // Three declarations across four modules — two exported and taken by an importer each,
+    // one module-private — so three imports, and not one more per importing module.
+    const want = ["nowMillis", "hostEcho", "hostPrivate"];
+    if (s.externs.length !== want.length) {
       throw new Error(
-        `missing ${WASM_DIS} — binaryen is pinned in package.json; run \`npm install\``,
+        `want ${want.length} \`extern\` imports, got ${s.externs.length}: ${show(s.externs)}`,
       );
     }
-    const dir = await Deno.makeTempDir({ prefix: "vl_extern_exp_" });
-    const out = `${dir}/entry.wasm`;
-    try {
-      const built = await vl([
-        "build",
-        `${CASES}/exported-from-host-module/entry.vl`,
-        "-o",
-        out,
-      ]);
-      if (built.code !== 0) {
-        throw new Error(`\`vl build\` exited ${built.code}\n${built.err}`);
+    for (const name of want) {
+      if (!s.externs.some((i) => i.name === name && i.kind === "function")) {
+        throw new Error(`no \`extern.${name} (function)\` entry: ${show(s.externs)}`);
       }
-      const dis = await new Deno.Command(WASM_DIS, {
-        args: [out],
-        stdout: "piped",
-        stderr: "piped",
-      }).output();
-      const wat = new TextDecoder().decode(dis.stdout);
-      const externs = wat.split("\n").filter((l) => l.includes('(import "extern" '));
-      // Three declarations across four modules — two exported and taken by an importer each,
-      // one module-private — so three imports, and not one more per importing module.
-      const want = ["nowMillis", "hostEcho", "hostPrivate"];
-      if (externs.length !== want.length) {
-        throw new Error(
-          `want ${want.length} \`extern\` imports, got ${externs.length}:\n${
-            externs.join("\n")
-          }`,
-        );
-      }
-      for (const name of want) {
-        if (!externs.some((l) => l.includes(`"${name}"`))) {
-          throw new Error(`no import entry for \`${name}\`:\n${externs.join("\n")}`);
-        }
-      }
-      // An `export extern` publishes a VL name, never a wasm one: an alias row would name a
-      // local function the merge never defines.
-      if (wat.includes("(export ")) {
-        throw new Error(`an exported extern leaked into the wasm export section:\n${wat}`);
-      }
-    } finally {
-      await Deno.remove(dir, { recursive: true });
+    }
+    // An `export extern` publishes a VL name, never a wasm one: an alias row would name a
+    // local function the merge never defines, so the export section stays empty.
+    if (s.exports.length !== 0) {
+      throw new Error(
+        `an exported extern leaked into the wasm export section: ${
+          s.exports.map((e) => `${e.name} (${e.kind})`).join(", ")
+        }`,
+      );
     }
   },
 });
