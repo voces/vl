@@ -167,6 +167,7 @@ import {
   fa32Used,
   fa64TypeIdx,
   fa64Used,
+  fnAddrTakenAt,
   fnDispNames,
   fnIndexBySid,
   fnListCatKinds,
@@ -3503,8 +3504,8 @@ function emitModule(_stmts: i32[]) {
 
   // Table section (id 4, between function (3) and memory (5)): the one `funcref` table function
   // values dispatch through, sized to cover every user function at its own wasm index (`gImports
-  // + i`), so the id a closure already stores is the table slot. The leading `gImports` slots
-  // stay null (never function-value targets); emitted only when `fnValUsed`, mirroring the element section below.
+  // + i`), so the id a closure already stores is the table slot. Sized for all of them, not for
+  // the filled ones: the size is written four sections before the bodies decide which those are.
   if fnValUsed {
     const tabPayload: i32[] = []
     const tabPrev = wTarget(tabPayload)
@@ -3547,29 +3548,45 @@ function emitModule(_stmts: i32[]) {
     wSection(8, startPayload)
   }
 
-  // Element section (id 9): a single active elem segment that fills the section-4 table with
-  // every user function at its own wasm index — the initializer `call_indirect` reads. Flags
-  // 0x00 is the plain active form; the offset is `gImports` because entry `gImports + i` must
-  // hold user function `i`. Emitted only when a function value exists (`fnValUsed`); sits after start (8), before code (10).
-  if fnValUsed {
-    const elemPayload: i32[] = []
-    const elPrev = wTarget(elemPayload)
-    wULEB(1) // 1 element segment
-    wU8(0)   // flags 0x00: active, table 0, offset expr + func-index vec
-    wU8(65)  // 0x41 i32.const — the offset expr
-    wSLEB(gImports)
-    wU8(11)  // 0x0b end
-    wULEB(n) // count of table entries written
-    let di = 0
-    while di < n {
-      wULEB(gImports + di) // func index (imports occupy 0..gImports-1)
-      di = di + 1
-    }
-    wTarget(elPrev)
-    wSection(9, elemPayload)
+  // The code payload is BUILT here and framed below, after the element section it feeds:
+  // lowering a function value is what marks `fnAddrTaken`, so building first is what lets the
+  // segment list the addresses the bodies actually took. Sound because no body reads the
+  // module buffer — every write goes to a payload of its own — so only the framing is ordered.
+  const codePayload: i32[] = []
+  if buildCodePayload(codePayload, n, hasStart, memFn, nHelpers) < 0 {
+    return -1
   }
 
-  if emitCodeSection(n, hasStart, memFn, nHelpers) < 0 { return -1 }
+  // Element section (id 9): one active segment per run of address-taken functions, filling
+  // entry `gImports + i` with user function `i` — the index a closure id already holds, so
+  // `call_indirect` needs no translation. Every other entry stays null and traps a call no
+  // expression can produce, since `markFnAddrTaken` records the one site that mints an id.
+  if fnValUsed {
+    const elemRuns = fnAddrTakenRuns(n)
+    if elemRuns > 0 {
+      const elemPayload: i32[] = []
+      const elPrev = wTarget(elemPayload)
+      wULEB(elemRuns)
+      let di = elemNextTaken(0, n)
+      while di < n {
+        const de = elemRunEnd(di, n)
+        wU8(0)         // flags 0x00: active, table 0, offset expr + func-index vec
+        wU8(65)        // 0x41 i32.const — the offset expr
+        wSLEB(gImports + di)
+        wU8(11)        // 0x0b end
+        wULEB(de - di) // count of table entries this run writes
+        while di < de {
+          wULEB(gImports + di) // func index (imports occupy 0..gImports-1)
+          di = di + 1
+        }
+        di = elemNextTaken(di, n)
+      }
+      wTarget(elPrev)
+      wSection(9, elemPayload)
+    }
+  }
+
+  if writeCodeSection(codePayload) < 0 { return -1 }
 
   // Custom "name" section LAST (after the code section, where it conventionally
   // lives). A no-op unless `gEmitNames` is set, so the default emit path is
@@ -5742,12 +5759,62 @@ function bankFnSpan(
   0
 }
 
-// Returns -1 if any function body fails to emit (propagated by the caller), else 0.
-function emitCodeSection(n: i32, hasStart: i32, memFn: i32, nHelpers: i32) {
-  // Code section (id 10): one size-prefixed body per function, in index order, then
-  // (if any) the synthetic start function's body, the `__log__` decoder's, and the
-  // shared-runtime-helper bodies LAST (in helper-index order).
-  const codePayload: i32[] = []
+// The byte width of `v` written as a ULEB128 — one element-segment entry's cost.
+function ulebWidth(v: i32): i32 {
+  let w = 1
+  let x = v
+  while x >= 128 {
+    x = x >> 7
+    w = w + 1
+  }
+  w
+}
+
+// The first address-taken function at or after `i`, or `n` when there is none.
+function elemNextTaken(i: i32, n: i32): i32 {
+  let k = i
+  while k < n && !fnAddrTakenAt(k) { k = k + 1 }
+  k
+}
+
+// One past the last entry of the element segment starting at address-taken function `s`. A run
+// crosses a gap when filling it beats a second segment: the constant below is a header's least
+// cost — the flags, the `i32.const` offset, its `end`, the count — against the ULEB a filled
+// entry costs, and that break-even keeps the narrowed section from exceeding the one it replaced.
+function elemRunEnd(s: i32, n: i32): i32 {
+  let e = s + 1
+  while e < n {
+    const nxt = elemNextTaken(e, n)
+    if nxt >= n { return e }
+    if (nxt - e) * ulebWidth(gImports + nxt) > 5 { return e }
+    e = nxt + 1
+  }
+  e
+}
+
+// The element section's segment count, which its own ULEB header needs before the segments
+// themselves are written. Walks the same runs the writer below does, so the two cannot disagree.
+function fnAddrTakenRuns(n: i32): i32 {
+  let runs = 0
+  let i = elemNextTaken(0, n)
+  while i < n {
+    runs = runs + 1
+    i = elemNextTaken(elemRunEnd(i, n), n)
+  }
+  runs
+}
+
+// The code section's payload: one size-prefixed body per function, in index order, then (if
+// any) the synthetic start function's body, the `__log__` decoder's, and the helper bodies last
+// (in helper-index order). Separate from the framing below because the element section is
+// written between the two. Returns -1 if any body fails to emit, else 0.
+function buildCodePayload(
+  codePayload: i32[],
+  n: i32,
+  hasStart: i32,
+  memFn: i32,
+  nHelpers: i32,
+) {
   const codePrev = wTarget(codePayload)
   const wrapC = exportWrapSlots()
   wULEB(n + hasStart + memFn + nHelpers + wrapC.length)
@@ -5830,6 +5897,12 @@ function emitCodeSection(n: i32, hasStart: i32, memFn: i32, nHelpers: i32) {
     bankFnSpan(fnStmts[wrapC[wci]], wrapC[wci], wAt, codePayload.length, 2, "")
     wci = wci + 1
   }
+  0
+}
+
+// Code section (id 10): frame the payload `buildCodePayload` produced onto the module, then
+// rebase the body spans onto it.
+function writeCodeSection(codePayload: i32[]) {
   wSection(10, codePayload)
   // Rebases the payload-relative spans onto the module (D1578). `wSection` has just appended
   // the payload to the module buffer, so `wLen() - codePayload.length` is where it starts — a
