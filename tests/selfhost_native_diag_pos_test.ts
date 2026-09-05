@@ -202,7 +202,7 @@ Deno.test({
     // A closure whose result struct carries a nullable REF-list field
     // (`{f: (i32 | null)[] | null}`) has no lowerable rep — the call `v(1)` inside
     // `useIt` (line 4) fails at the EMIT stage. The diagnostic anchors at the
-    // enclosing function's NAME token (`useIt`, col 8 0-based → [4:9]), not
+    // enclosing function's NAME token (`useIt`, col 8 0-based, printed 1-based as 4:10), not
     // positionless (line 0) as before — so a build/playground/LSP consumer can
     // point the reader at the offending function instead of rendering the message
     // bare. (`declNameTokOf` anchoring, matching the lint/type-diag convention.)
@@ -226,7 +226,7 @@ Deno.test({
       if (!r.err.includes("emit error")) {
         throw new Error(`expected "emit error" in stderr, got:\n${r.err}`);
       }
-      const needle = `${path}:4:9:`;
+      const needle = `${path}:4:10:`;
       if (!r.err.includes(needle)) {
         throw new Error(`expected stderr to contain "${needle}", got:\n${r.err}`);
       }
@@ -248,9 +248,9 @@ Deno.test({
     // that had nothing to do with the failure.
     //
     // Two things fix it and this pins both: the field-access floors are NODE-anchored
-    // (`emitFailAt`, the `Member` node → its property token, 0-based col 14 of line 11),
-    // and the start function arms a top-level STATEMENT cursor so any other failure it
-    // raises lands on the statement instead of on a stale function.
+    // (`emitFailAt`, the `Member` node → its property token, 0-based col 14 of line 11,
+    // printed 1-based as 11:15), and the start function arms a top-level STATEMENT cursor so
+    // any other failure it raises lands on the statement instead of on a stale function.
     //
     // The shared field here is a LIST (`xs`), which has no single-block result rep to
     // dispatch on — so this is still a loud reject after call receivers were taught to
@@ -274,7 +274,7 @@ Deno.test({
       );
       const r = await build(path);
       if (r.code === 0) throw new Error("expected emit-stage rejection, got exit 0");
-      const needle = `${path}:11:14:`;
+      const needle = `${path}:11:15:`;
       if (!r.err.includes(needle)) {
         throw new Error(`expected stderr to contain "${needle}", got:\n${r.err}`);
       }
@@ -449,5 +449,73 @@ Deno.test({
       "entry.vl": 'import { ok } from "./dep"\nconst s: string = 42\nprint(ok())\n',
       "dep.vl": "export function ok(): i32 { return 1 }\n",
     }, (d) => [`${d}/entry.vl:2`]);
+  },
+});
+
+// ── ONE DIAGNOSTIC, ONE COLUMN, WHICHEVER COMMAND FINDS IT ───────────────────
+//
+// The renderers are two: `vl check` formats inside the CLI pump (VL, `cliFmtConcise`
+// and `cliFmtJson`), `vl run` and `vl build` format in the host (`render_diags`). Both
+// read the same 0-based `diagCol` export and only the pump used to shift it, so the
+// same type error was `[1:16]` under `check` and `1:15` under `run` — a one-column
+// disagreement that anything scraping either channel inherits. `cli-design.md` settles
+// it: "`line` (1-based), `col` (1-based, inclusive)".
+
+const runProg = async (path: string): Promise<{ code: number; err: string }> => {
+  const { code, stderr } = await new Deno.Command(VL, {
+    args: ["run", path, "--compiler", COMPILER],
+    stdout: "piped",
+    stderr: "piped",
+    env: { RUST_BACKTRACE: "0" },
+  }).output();
+  return { code, err: new TextDecoder().decode(stderr) };
+};
+
+const checkJson = async (path: string): Promise<{ code: number; out: string }> => {
+  const { code, stdout } = await new Deno.Command(VL, {
+    args: ["check", path, "--json", "--compiler", COMPILER],
+    stdout: "piped",
+    stderr: "piped",
+    env: { RUST_BACKTRACE: "0" },
+  }).output();
+  return { code, out: new TextDecoder().decode(stdout) };
+};
+
+Deno.test({
+  name: "native-diag-pos: the same diagnostic reaches the same column through check and run",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_diag_pos_base_" });
+    try {
+      const path = `${dir}/case.vl`;
+      // `"s"` opens at 1-based column 16 of line 1 — counted by hand, because a test that
+      // only compared the channels would pass on all three agreeing about 15.
+      await Deno.writeTextFile(path, 'const x: i32 = "s"\nprint(x)\n');
+      const WANT = 16;
+
+      const concise = await check(path);
+      const cm = concise.err.match(/: error \[(\d+):(\d+)\]/);
+      if (!cm) throw new Error(`no concise [line:col] in:\n${concise.err}`);
+
+      const json = await checkJson(path);
+      const jm = json.out.match(/"line":(\d+),"col":(\d+)/);
+      if (!jm) throw new Error(`no --json line/col in:\n${json.out}`);
+
+      const ran = await runProg(path);
+      const rm = ran.err.match(/case\.vl:(\d+):(\d+): /);
+      if (!rm) throw new Error(`no run path:line:col in:\n${ran.err}`);
+
+      for (const [chan, m] of Object.entries({ concise: cm, json: jm, run: rm })) {
+        if (Number(m[1]) !== 1 || Number(m[2]) !== WANT) {
+          throw new Error(
+            `${chan}: want 1:${WANT} (1-based, the opening quote of \`"s"\`), got ` +
+              `${m[1]}:${m[2]}. Every channel renders the guest's 0-based \`diagCol\`, ` +
+              `and each must shift it exactly once.`,
+          );
+        }
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
   },
 });

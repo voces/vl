@@ -328,6 +328,15 @@ Fields:
   positionless diagnostic.
 - `message` — the diagnostic text, unstyled.
 
+**The column base is the SAME on every channel.** The compiler carries columns 0-based
+internally (the lexer's convention, and the corpus `@error-at` directive's) and every
+renderer shifts once: `--concise`'s `[line:col]`, `--json`'s `col`/`endCol`, the pretty
+block's `at file:line:col`, and the `path:line:col: message` that `vl run` / `vl build`
+print from the host. The host was the exception until the code-quality survey found it: it
+printed the raw 0-based column, so one diagnostic reached column 15 under `run` and 16
+under `check`, and a suite pinned both. `tests/selfhost_native_diag_pos_test.ts` now runs
+one diagnostic through three channels and requires one column.
+
 Semantics shared with the human renderers, unchanged: `--severity` sets both the
 display floor and the exit gate exactly as in pretty mode, and the exit codes are
 identical (0 clean, 1 gating diagnostics, 2 usage/read error — usage and
