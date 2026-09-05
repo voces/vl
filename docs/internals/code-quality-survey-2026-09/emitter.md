@@ -26,7 +26,7 @@ anywhere in the tree, `scripts/emitter-state-audit.py` reports 19 frame-flag asy
 | # | finding | value | size | risk | proof |
 |---|---|---|---|---|---|
 | 1 | `letListBuildKind` + `letListBuildSlot` each run the whole scoped destination walk with identical arguments, back to back, at all three call sites (§5.1) | ~16% of a self-compile; the subtree is 32.87% inclusive | S | low | byte-identical seed (`refresh-compiler.sh` + `cmp`), corpus `cmp`, `self-compile-time.sh` |
-| 2 | `fnDetectScratch` performs 12 independent whole-body walks per function; `dupScanRun` repeats the set per shadowed-name bias (§5.2) | 21.25% inclusive; the fix's precedent is in the same function | L | med | byte-identical seed; `regress.py` 0 `runs → not-runs`; `vl_instance_state_leak_test.ts` |
+| 2 | `fnDetectScratch` performs 12 independent whole-body walks per function; `dupScanRun` repeats the set per shadowed-name bias (§5.2) | 21.25% inclusive — but **measured, the traversals are free**: one walk is 78% of it and the fusion was refused (§5.2's measured note) | L | med | byte-identical seed; `regress.py` 0 `runs → not-runs`; `vl_instance_state_leak_test.ts` |
 | 3 | The cell-seed ladder is written four times; `ExpCtx` is the intended shape and is `wasmEmit.vl`-private (§6.1) | 311 `pending*` write sites collapse toward one resolver; four historical defect sites become one | L | med | byte-identical seed; gate ladder; `regress.py` |
 | 4 | Sixteen functions re-run the same `expr*Array` classifier ladder in the same order (§6.2) | ≈23% inclusive summed over the seven classifiers; removes an ordering hazard the comments already name | M | med | byte-identical seed; corpus `cmp` |
 | 5 | `nestedFnDeclaredInFrame` is the un-indexed twin of `nestedFnDeclaredIn`, which already uses `fnChildHead`/`fnChildNext` (§4.4) | one `arena-scan-outside-pass` entry retires; O(fnStmts) per chain rung → O(children) | S | low | byte-identical seed; `scan-budget.py --check` falls by 1 |
@@ -272,6 +272,21 @@ walker descends somewhere another does not; enumerate that by comparing the per-
 arms before merging, not by reading. *Proof*: byte-identical seed is the whole safety
 argument here (the frames are byte-visible); plus `vl_instance_state_leak_test.ts`, and
 `regress.py` 0 `runs → not-runs`.
+
+*Measured, and the fusion was NOT the change (2026-09-05).* A whole-body walk is nearly free:
+`blockHasArrNew` traverses every body of the compiler for **0.08%** of a self-compile, and
+eleven of the twelve legs together are ~4%. `leqScanBlock` alone is **19.01%** of the 24.47%,
+and its cost is not traversal — `leqNoteBin` re-asks `listOpKindOfBin` up to four times and
+`eqgListKindOfBin` twice per `==`/`!=`, with identical arguments. An instrumented compiler
+counts **103,521** `leqNoteBin` calls, **61,691** of them on an operator none of its six
+classifiers claims, and **190 of 5,173** detection passes are `dupScanRun`'s per-bias repeat
+(3.7%, `dupScanActive` true in 118 of 4,983 runs, `frameHasBlockLetOverGlobal` 0). What landed
+instead: the `k == 7` gate on the direct `eqgListKindOfBin`, one operator gate at
+`leqScanExpr`, and the list-op scan leading `fnDetectScratch` so every monotone-flag leg behind
+it is skipped once its flag is true — `fnDetectScratch` 24.47% → 20.16%, L2 user CPU −4.0%.
+**The remaining redundancy is inside `eqCoreKindOfBin` and `eqgListKindOfBin`
+(`emit_classify.vl`), which re-derive `listOpKindOfBin` for the same `(binIx, fnIx)`; a memo
+there is worth ~2.5% and is the follow-up this row leaves open.**
 
 ### 5.3 `dsRebindsName` thrashes the single-entry `parentLetOf` cache
 

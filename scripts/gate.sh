@@ -96,6 +96,11 @@ run "kind-ladder budget"       python3 scripts/ladder-budget.py --check
 # check` rc 0, then an anonymous out-of-bounds read inside the seed (D1440, D1462, D1500
 # and #2498 — and docs/internals/sentinel-index-lint.md for the controls).
 run "sentinel-index budget"    python3 scripts/sentinel-budget.py --check
+# The dead-export RATCHET, fifth of the same shape: `unused-function` exempts an exported
+# declaration ("public surface"), so for a tree whose only consumer is itself the export
+# list is a blind spot — 19 exports were in it when this landed. Its baseline is at ZERO,
+# unlike the four above, because the tree reached zero in the PR that added it.
+run "dead-export budget"       python3 scripts/export-budget.py --check
 # THE SHAPE FAMILY: seven pairs, same work, one axis reshaped, graded on the TIME
 # RATIO so machine speed and box load cancel. ~16-25 s; it is the only gate here
 # whose verdict is a measurement, and it reds on the pre-#2419 compiler.
