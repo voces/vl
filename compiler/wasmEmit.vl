@@ -468,6 +468,7 @@ import {
   arrLitIsRef,
   arrLitIsStr,
   arrNewIntrKind,
+  arrNewKindNamed,
   asExprIsUnionCastIn,
   asExprNumCastDomain,
   asExprNumFallible,
@@ -716,6 +717,7 @@ import {
   printUnionPlan,
   pushPostGuardNarrow,
   refArrSlotTag,
+  refElemListBuildKind,
   refListSlotOfExpr,
   refListSlotOfExprStrict,
   refPushScratchBaseFor,
@@ -6442,22 +6444,9 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
           // lists seed kind 0/3/4/6; a ref inner list (kind 9) seeds kind 5 + the inner slot, so
           // the element builds as that ref list — which may itself be kind 9 (nesting falls out).
           const elCtx = expCtxHere()
-          if elemNest == 4 {
-            elCtx.listKind = 0
-          } else if elemNest == 6 {
-            elCtx.listKind = 3
-          } else if elemNest == 7 {
-            elCtx.listKind = 4
-          } else if elemNest == 8 {
-            elCtx.listKind = 6
-          } else if elemNest == 10 {
-            elCtx.listKind = 7 // f32-inner list -> build each element as an f32[] (kind 7)
-          } else if elemNest == 11 {
-            elCtx.listKind = 10 // u8-inner list -> build each element as a packed u8[]
-          } else if elemNest == 9 {
-            elCtx.listKind = 5
-            elCtx.listSlot = nestInnerSlot
-          }
+          const elLK = refElemListBuildKind(rslot)
+          if elLK >= 0 { elCtx.listKind = elLK }
+          if elemNest == 9 { elCtx.listSlot = nestInnerSlot }
           // A map element (kind 3): a `Map()` element builds this element's map struct — the
           // literal twin of the `.push` and indexed-assign seed in `refElemValueCtx`, and the
           // site the whole list-of-maps family runs through. Unseeded, the element `Map()` builds
@@ -21102,6 +21091,9 @@ function emitArrayNewIntr(body: i32[], callIx: i32, fnIx: i32) {
       let anElemStructIdx = -1
       // The `__array_new__` fill twin of the store/push variant hint (D796).
       let anElemVariantIdx = -1
+      // The ref-list row the fill is an element of, for the element's own list threading
+      // below; -1 for every kind whose element is a scalar or a string.
+      let anElemSlot = -1
       const ank = arrNewIntrKind(callIx, fnIx)
       if ank == 1 {
         if !fa64Used {
@@ -21172,6 +21164,7 @@ function emitArrayNewIntr(body: i32[], callIx: i32, fnIx: i32) {
         }
         anBack = rlBackIdx[anSlot]
         anWrap = rlWrapIdx[anSlot]
+        anElemSlot = anSlot
         anElemStructIdx = rlElemStructRow(anSlot)
         if anElemStructIdx < 0 {
           anElemVariantIdx = variantIndexOf(nonNulBaseOf(rlElemName[anSlot]))
@@ -21185,6 +21178,15 @@ function emitArrayNewIntr(body: i32[], callIx: i32, fnIx: i32) {
         if anIsNew {
           const anFill = c.callArgs[1]
           const anFillNode = P.nodes[anFill]
+          // The i32 list is this arm's answer for an i32 or boolean fill and also
+          // `arrNewIntrKind`'s fall-through. Where nothing named the kind — not the fill, not
+          // the destination, not an instance's parameter annotation — the list is a guess,
+          // and a guess about the fill's rep is silent invalid wasm (D1630).
+          if !arrNewKindNamed(callIx, fnIx) {
+            return emitFail(
+              "emitProgram: __array_new__ fill names no element rep, and its destination names none either",
+            )
+          }
           // D963 — the i64 guard once here is gone: the i64 pair is interned today, so that
           // fill is kind 4 above and never reaches this fall-through. A stale reason in a
           // refusal is still a refusal.
@@ -21218,7 +21220,24 @@ function emitArrayNewIntr(body: i32[], callIx: i32, fnIx: i32) {
         pendingStructIdx = anElemStructIdx
         const savedAVI = pendingVariantIdx
         if anElemVariantIdx >= 0 { pendingVariantIdx = anElemVariantIdx }
-        if emitExpr(body, c.callArgs[1], fnIx) < 0 { return -1 }
+        // The fill is an ELEMENT of the list being allocated, so a LIST fill builds at the
+        // element's own threading. Left on the destination's, an inline `[0, 0]` fill built at
+        // the OUTER pair's heap types and the backing took the literal's i32s (D1629).
+        const savedANK = pendingListKind
+        const savedANS = pendingListSlot
+        const anElemLK = refElemListBuildKind(anElemSlot)
+        if anElemLK >= 0 {
+          pendingListKind = anElemLK
+          pendingListSlot = 0
+          if anElemLK == 5 {
+            const anInner = rlElemInnerSlot(anElemSlot)
+            if anInner >= 0 { pendingListSlot = anInner }
+          }
+        }
+        const anFillRc = emitExpr(body, c.callArgs[1], fnIx)
+        pendingListKind = savedANK
+        pendingListSlot = savedANS
+        if anFillRc < 0 { return -1 }
         pendingStructIdx = -1
         pendingVariantIdx = savedAVI
         fbLocalGet(arrNewScratchBase)
