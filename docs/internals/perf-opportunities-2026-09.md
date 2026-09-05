@@ -341,9 +341,49 @@ whose length is the module-level binding count — O(N²) by construction, and t
 run. `bindMark` walks `visNames` from the innermost end, so the cost is the module scope's own
 depth; `txListIndexOf` is the shared `-1`-returning helper `siGradeFn` and `txListHas` both
 call. Neither is the checker, and `sentinel-index-unguarded` (#2499) post-dates B6's reading —
-so this term was added after item 8 was written. The fix shape is the one D1514 and `daLive`
-already took: an index keyed by name, built once. **Not fixed here — this PR is the
-instrument.**
+so this term was added after item 8 was written.
+
+**FIXED.** Both took the shape D1514 and `daLive` already used — an index keyed by name, built
+once and extended at every write. The scope stack keeps a per-name chain (`visHead` is the
+innermost entry's index, `visPrev` the next-outer entry sharing that name), maintained by the one
+pusher `visPush` and unlinked by `bindTrim`, so `bindMark` reads the innermost visible binding
+directly. The sentinel pass's six name sets (`siHoleF`, `siMapG`, `siDeclared`, `siParams`,
+`siGuarded`, and `siPName`'s slot index, now `siPIx`) are maps, so `siAdd` / `siDrop` / the
+membership test `siHas` are one probe each.
+
+Guest samples on the 16,000-binding witness go **3,484 → 270**, and the whole ranking moves:
+
+| frame | before | after |
+| --- | ---: | ---: |
+| `__str_eq__` self | 60.3% | 4.1% |
+| `lint` incl | 95.9% | 44.8% |
+| `sentinelIndexLint` incl | 58.6% | 25.9% |
+| `siGradeFn` incl | 58.0% | 18.9% |
+| `collectBindingsAndRefs` incl | 35.9% | 1.9% |
+| `nameVisit → bindMark` incl | 35.1% | 0.0% (0 samples) |
+| `checkProgram` incl | 1.4% | 16.3% |
+
+The axis itself, guest samples, minimum of two:
+
+| N bindings | before | after | speed-up |
+| ---: | ---: | ---: | ---: |
+| 4,000 | 285 | 74 | 3.9× |
+| 8,000 | 838 | 122 | 6.9× |
+| 16,000 | 2,396 | 192 | 12.5× |
+| 32,000 | 10,870 | 401 | 27.1× |
+
+Exponent over that range **1.75 → 0.81**: quadratic to linear. What is left on this witness is
+the lexer (`vcLoadToks` 16.7%), the checker (16.3%), the diagnostic printer (`cliFmtPretty`
+14.4% — every one of the N bindings is an unused-variable finding) and the byte walk `siGradeFn`
+still owes (18.9%), none of which grows faster than the input. `vl check compiler/typecheck.vl`
+and `compiler/entry.vl` are unmoved (1.01× each): a compiler module has no scope with thousands
+of bindings in it, which is why item 8's generated shape and not a real file is what this term
+was ever about.
+
+The proof is lint OUTPUT identity, not inspection: `vl check --severity info --json` over all
+10,856 source `.vl` files is byte-identical between the two seeds (7,791,829 bytes, 21,465
+diagnostics), `lint-self.sh` output is byte-identical, and `compile(candidate, master source)`
+is `cmp`-equal to master's own fixpoint, since lint feeds no codegen.
 
 ### B7 · `collectA`'s three phases, and which one a suffix can extend
 
