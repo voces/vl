@@ -25,7 +25,7 @@ QUICK = a day, no design question. STRUCT = a design track.
 | 10 | `declaredSlotOf` → per-function side index built in `buildLocals` | **1.1%** self time | M | reset per function, 5 sites | byte-identical seed; `regress.py` | STRUCT |
 | 11 | `fnStmtsPosOf` → reverse index `nodeIx → fe` after mono: 19,106 calls, **25.9 M scan steps** | closures axis 2.22 → ~1 | M | 1 in-place write, `emit_mono.vl:6353` | byte-identical seed; the closures axis under its 3.2 bar | STRUCT |
 | 12 | Destringify type names — `tyTopIndexOf` is a per-CHARACTER walk over a type-name string, **4.94% self** | 4.9% plus most of `__str_eq__`'s tail | L | canon / rep | `docs/internals/registry-by-type-id.md` steps 4–6; byte-identity | STRUCT |
-| 13 | ✅ **LANDED (§G1)** — but NOT as prescribed: the early-out never fires (0 of 5.4 M walks found a top-level `|`) and the suffix test already ran first. What the measurement supported is a byte pre-scan in front of `tyTopIndexOf`'s ladder, which serves every caller | `vl build` **0.568× / 0.725×** on the two outliers (medians of six interleaved readings), 0.922× on the control; the frame **63.6% → 40.9%** and **47.8% → 17.8%** self | S | none — a sound over-approximation in front of the walk | byte-identical seed and codegen; `regress.py` no cell moved; all 2,996 corpus modules identical; `rep-fuzz-check.sh` | QUICK |
+| 13 | ✅ **LANDED (§G1 + §G2)** — but NOT as prescribed: the early-out never fires (0 of 5.4 M walks found a top-level `|`) and the suffix test already ran first. What the measurement supported is a byte pre-scan in front of `tyTopIndexOf`'s ladder, which serves every caller | §G1 `vl build` **0.568× / 0.725×** on the two outliers (medians of six interleaved readings), 0.922× on the control; §G2 a further **0.515× / 0.800×** on top, from the ladder's own 33.7× re-derivation | S | none — a sound over-approximation in front of the walk | byte-identical seed and codegen; `regress.py` no cell moved; all 2,996 corpus modules identical; `rep-fuzz-check.sh` | QUICK |
 
 Two corrections are load-bearing: **`vl check std/json.vl` is 40 ms, not 6.5 s** (§B1), and
 **`tyTopIndexOf` is not a name-keyed registry; `collectA` never calls it** (§B4).
@@ -1357,17 +1357,133 @@ these three compiles, against 1, 0 and 4 samples on the whole check side. This t
 the emitter, so the `check` half of the pipeline never sees enough of it to move — which is
 also why the row's own instrument, the corpus at `vl build`, was the one that found it.
 
-**What is left, named.** `tyHasSepByte` is now the largest frame on the first outlier at
-36.56% self, and the reason is the CALL COUNT, not the per-call price: 5.25 M `nameIsArray`
-calls over **20 distinct names**. The re-derivation is in the caller ladders —
-`nameIsI32Array` asks five arms that each re-test the same name, `refArrShapeKind` and
-`refArrElemName` do the same over a longer ladder — so the next term is hoisting one
-`nameIsArray` per ladder rather than one per arm, and after that item 12's destringify. A memo
-is the third option and the repeat rate would carry it, but `tyname.vl`'s contract is that it
-holds no state, and the LSP drives many compiles through one instance with no reset hook to
-hang one on.
+**What is left, named** (measured in §G2, and the attribution in this paragraph is half
+wrong). `tyHasSepByte` is now the largest frame on the first outlier at 36.56% self, and the
+reason is the CALL COUNT, not the per-call price: 5.25 M `nameIsArray` calls over **20
+distinct names**. The guess that follows — that the re-derivation is `nameIsI32Array`'s five
+arms and `refArrShapeKind`'s longer ladder each re-testing the same name — is one of two
+terms and the smaller one: §G2 counts 33.7 ladder calls per OUTERMOST call, all of it the
+ladder recursing into itself, against 11 `nameIsArray` walks per ladder call for the
+per-arm re-testing. A memo is the third option and the repeat rate carries it, but
+`tyname.vl`'s contract is that it holds no state, and the LSP drives many compiles through
+one instance with no reset hook to hang one on — so §G2 puts the memo in the ladder's own
+module and scopes it to one call.
 
 **Two surface numbers in the row above are mention counts, not call sites.** `nameIsArray` has
 **53** call sites, not 79 (that figure counts imports and comments). `unionMemberCount` has
 **22**, and **all 22** compare only against 1 or 2 — not 10 of 23. Every caller wants the
 predicate; none of them wanted it enough to matter, which is the finding.
+
+### G2 · The second term — the ladder re-derives its own recursion, 2026-09-05
+
+§G1's closing paragraph named the next term as the CALL COUNT and guessed at where it
+came from: "`nameIsI32Array` asks five arms that each re-test the same name". A counter
+build says the count is real and the attribution is wrong. The counter and profile numbers
+are taken on `b437a3ae8` (master with §G1 merged, before #2648 and #2649 landed) by the
+same method §G1 used — counters compiled into a scratch artifact, dumped from the tail of
+`emitProgram` through a distinctive `emitFail`, with the seed never written; the CPU and
+identity tables are re-taken on the merged tree at `4ad4996df`.
+
+`VL_PROFILE_GUEST` first, because it is what points at the entry. Of the first outlier's
+205 samples, **196 (95.6%) carry `nameIsRefArray`, `refArrShapeKind`, `refArrElemName` or
+`refArrElemNameIf` somewhere on the stack**, and the frame just above the OUTERMOST of
+those is one function in 91% of them:
+
+| entry caller (the frame above the outermost ladder frame) | of the whole profile | of the ladder's samples |
+| --- | ---: | ---: |
+| `letRefListElemName` | **91.22%** | 95.4% |
+| `refListSlotOfExpr` | 2.93% | 3.1% |
+| `refListElemNameOfExpr` | 0.98% | 1.0% |
+| `arrLitNestedElemName` | 0.49% | 0.5% |
+
+So the asks are not spread over the 53 `nameIsArray` sites. They come through one
+node-keyed classifier, and what happens under it is a recursion:
+
+| counter | `arm-list-elem-pin-at-depth` | `global-reference-chain-cost` |
+| --- | ---: | ---: |
+| OUTERMOST ladder calls (re-entrancy depth 0) | 14,076 | 8,653 |
+| distinct names the ladder is asked about at all | **11** | **5** |
+| ...of them, distinct at an outermost call | **10** | not taken |
+| `nameIsRefArray` + `refArrShapeKind` + `refArrElemName` calls | 474,202 | 100,471 |
+| ...per outermost call | **33.7×** | **11.6×** |
+| `nameIsArray` calls | 5,251,443 | 1,068,680 |
+| ...per ladder call | 11.1 | 10.6 |
+| characters `tyHasSepByte` visited | 49,242,163 | 17,213,995 |
+
+The 33.7× is inside ONE call. `refArrShapeKind`'s nested-ref arm reads
+`nameIsArray(name) && nameIsRefArray(refArrElemName(name))`, and `refArrElemName`'s own
+tail asked `nameIsRefArray` of that same element already, on the way to producing the
+string the arm then hands back — so each array level enters the ladder twice and the cost
+is 2^depth where depth+1 would do. The per-name counts are the signature: `Circle` 62,964,
+`Circle[]` 62,953, `Circle[][]` 30,972, `Circle[][][]` 14,104, `Circle[][][][]` 4,295 —
+each level about double the one outside it.
+
+**A per-call memo on `nameIsRefArray` collapses it, and one column is enough.** Both
+recursive edges land on `nameIsRefArray`, so memoizing that one function makes the second
+edge a hit and turns 2^depth into depth+1; a memo on all three saves nothing further that
+was measured. It lives for exactly one outermost call — a re-entrant depth of 0 empties it
+— which is what makes it sound with no generation stamp, and that is not an assumption:
+none of the five writers of `sNames`, `unNames` and `uVariants` (`internInlineShapeTy`,
+`internShapeAs`, `gaeEnsure`, `uVariantsPush`, `unNamesPush`) is reachable from any of the
+three, over a call-syntax closure of 638 functions. Nothing the ladder reads can move while
+one of its calls is on the stack.
+
+Measured after, same counters:
+
+| counter, first outlier | before | after | ratio |
+| --- | ---: | ---: | ---: |
+| ladder calls | 474,202 | 184,586 | 2.57× |
+| `nameIsArray` calls | 5,251,443 | 1,989,166 | **2.64×** |
+| characters `tyHasSepByte` visited | 49,242,163 | 22,409,182 | 2.20× |
+
+| counter, second outlier | before | after | ratio |
+| --- | ---: | ---: | ---: |
+| ladder calls | 100,471 | 69,899 | 1.44× |
+| `nameIsArray` calls | 1,068,680 | 717,102 | **1.49×** |
+| characters `tyHasSepByte` visited | 17,213,995 | 12,788,698 | 1.35× |
+
+`vl build` CPU, user+sys per build over 25-30-build batches so the 10 ms clock is not the
+resolution, min over five interleaved batches per arm, and that whole procedure run FOUR
+times at loads from 7 to 156, because one reading of a ratio on this box is not a reading.
+The table is the final merged-tree run; the three earlier readings were taken against
+§G1's seed on two earlier pins:
+
+| program | A (master) | B (this) | ratio | the three earlier readings |
+| --- | ---: | ---: | ---: | ---: |
+| `arm-list-elem-pin-at-depth` | 0.1735 s | 0.0894 s | **0.515** (1.94×) | 0.509, 0.531, 0.516 |
+| `global-reference-chain-cost` | 0.1216 s | 0.0973 s | **0.800** (1.25×) | 0.866, 0.880, 0.830 |
+| control `deep-is-json-shape-walk` | 0.1843 s | 0.1925 s | 1.044 | 1.015, 0.998, 0.993 |
+
+The control's four readings straddle 1 (median 1.006), which is what a program the change
+does not reach looks like on this box.
+
+Per-test wall through the corpus oracle, min of 6 interleaved rounds at load 22 (the
+oracle's own per-case work dilutes the ratio, which is why the CPU table above is the one
+to read for the mechanism): 110 → 77 ms, 92 → 84 ms, control 150 → 151 ms. The
+self-compile is 3.83 → 3.83 CPU-s, min of 6 interleaved at load 13-21 (two earlier and
+noisier readings, 0.975 and 0.911, both favoured the candidate) — unchanged at this box's
+resolution, and expected: the compiler's own type names are shallow, so the recursion this
+removes barely runs on it.
+
+Identity, pinned to `4ad4996df`: master is its own fixpoint, the candidate is its own
+fixpoint, and the candidate seed compiling the pinned master source reproduces master's
+fixpoint byte for byte. All 3,000 `tests/cases/**` modules are identical under both seeds
+— 2,453 byte-for-byte, 547 refused with identical text, 0 differences. `regress.py` moved
+no cell and `--verify-fresh` is clean; `rep-fuzz-check.sh` is exact; the seed grows 899
+bytes (+0.04%).
+
+**What is left, named, with the design question each carries.**
+
+* **~11 `nameIsArray` walks per ladder call**, unchanged by this. `refArrShapeKind` asks
+  the array-name grammar about the same string once per arm — `nameIsI32ListArray`, four
+  `arrElemIsArrayOf` leaves, the `string[][]` arm, `nameIsMapArray`, `nameIsClosureArray`
+  and `parenUnionArrElemName` each re-test it. Taking it needs span-taking or
+  already-cut variants in `tyname.vl` (new exports, and the dead-export ratchet), or item
+  12's destringify.
+* **The outermost calls themselves: 14,076 and 8,653, over 10 and 5 distinct names.** That
+  is a 1,400× repeat rate across NODES, and only a program-scoped cache reaches it. The
+  per-call memo's soundness proof does not extend to one: between two outermost calls the
+  tables above can and do grow, so such a cache needs a generation, and the generation
+  needs the ladder's whole read-set — not just the three name tables but whatever
+  `repRowOfName`, `structIndexOfTypeName`, `variantIndexOfOwnRender` and
+  `nameIsLitUnionType` consult. That audit is the design question, and it is not done here.
