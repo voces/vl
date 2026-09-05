@@ -817,6 +817,13 @@ let collBindName: string[] = []
 // signature before any body runs, so a forward call is already covered.
 let collRetFnNodes: i32[] = []
 
+// D1609 — the un-annotated object-literal bindings: names a `let`/`const` binds, with no type
+// annotation, to an object literal. The nested-width-pair exemption asks which binding a source
+// name resolves to, and only a scope answers that; a whole-arena name scan takes an unrelated
+// function's binding. Depth-tagged sparse rows, read through `lookupDepth` exactly like `collBind`.
+let objLitBindDepth: i32[] = []
+let objLitBindName: string[] = []
+
 // The un-inferred empty-collection floor: an un-annotated empty `[]` / `Map()` / `Set()` whose
 // element/key/value hole is never pinned — by an annotation or a downstream `.push`/`.set`/
 // `.add` — has a genuinely unknown type, and a later use may still pin it, so the question
@@ -6020,6 +6027,8 @@ function isvalReset() {
   isvalLit = []
   collBindDepth = []
   collBindName = []
+  objLitBindDepth = []
+  objLitBindName = []
   collRetFnNodes = []
   collapsedAliases = Map()
   annotCollapsed = Map()
@@ -6037,39 +6046,86 @@ function isvalTruncate(n: i32) {
   0
 }
 
-// Mark the binding just declared at the innermost scope as one whose declared type collapsed a
-// subsumed literal arm. Called right after `declare`, so the depth it records is the frame
-// `lookupDepth` answers with at every use.
-function markCollapsedBinding(name: string) {
-  collBindDepth.push(T.scopes.length - 1)
-  collBindName.push(name)
+// Record `name` in a depth-tagged mark table at `depth`. The shared half of every such table:
+// a sparse row per marked binding, so an unmarked program pays one length test.
+function bindMarkPush(
+  depths: i32[],
+  names: string[],
+  name: string,
+  depth: i32,
+) {
+  depths.push(depth)
+  names.push(name)
   0
 }
 
-// Did `name` resolve to a binding whose declared type collapsed? The depth pairing is what makes
-// this exact under shadowing: an inner plain `const r: string` records nothing, and `lookupDepth`
-// answers its own frame, which no row names.
-function bindingCollapsed(name: string) {
-  if collBindName.length == 0 { return false }
+// Does a row of this table name the binding `name` currently resolves to? The depth pairing is
+// what makes it exact under shadowing: an inner binding that records nothing still answers
+// false, because `lookupDepth` names its own frame and no row carries that depth.
+function bindMarkHas(depths: i32[], names: string[], name: string): boolean {
+  if names.length == 0 { return false }
   const d = lookupDepth(name)
   if d < 0 { return false }
-  let i = collBindName.length - 1
+  let i = names.length - 1
   while i >= 0 {
-    if collBindName[i] == name && collBindDepth[i] == d { return true }
+    if names[i] == name && depths[i] == d { return true }
     i = i - 1
   }
   false
 }
 
-// Drop the marks the scope just popped retired. `T.scopes` has already shrunk, so a row recorded
+// Drop the rows the scope just popped retired. `T.scopes` has already shrunk, so a row recorded
 // at a depth the chain has dropped is gone with its binding.
-function collBindPopTo(depth: i32) {
-  while collBindDepth.length > 0 {
-    if collBindDepth[collBindDepth.length - 1] < depth { return 0 }
-    collBindDepth.pop()
-    collBindName.pop()
+function bindMarkPopTo(depths: i32[], names: string[], depth: i32) {
+  while depths.length > 0 {
+    if depths[depths.length - 1] < depth { return 0 }
+    depths.pop()
+    names.pop()
   }
   0
+}
+
+// Mark the binding just declared at the innermost scope as one whose declared type collapsed a
+// subsumed literal arm. Called right after `declare`, so the depth it records is the frame
+// `lookupDepth` answers with at every use.
+function markCollapsedBinding(name: string) {
+  bindMarkPush(collBindDepth, collBindName, name, T.scopes.length - 1)
+}
+
+// Did `name` resolve to a binding whose declared type collapsed (D1048)?
+function bindingCollapsed(name: string) {
+  bindMarkHas(collBindDepth, collBindName, name)
+}
+
+// Mark the binding just declared at `depth` as un-annotated with an object-literal initializer.
+// The module hoist records its globals at depth 0 before any body is checked, so a body that
+// reads a global declared later resolves it the same way straight-line code does (D1609).
+function markObjLitBinding(name: string, depth: i32) {
+  bindMarkPush(objLitBindDepth, objLitBindName, name, depth)
+}
+
+// Did `name` resolve to an un-annotated object-literal binding (D1609)?
+function bindingIsObjLit(name: string) {
+  bindMarkHas(objLitBindDepth, objLitBindName, name)
+}
+
+// Is `ix` a `let`/`const` with no annotation and an object-literal initializer? The one shape
+// `markObjLitBinding` records, asked at both the hoist and the pass-2 declaration.
+function letDeclIsUnannotObjLit(ix: i32): boolean {
+  const n = P.nodes[ix]
+  if n is LetDecl {
+    if n.letType >= 0 { return false }
+    if n.letInit < 0 { return false }
+    const iv = P.nodes[n.letInit]
+    if iv is ObjLit { return true }
+  }
+  false
+}
+
+// Drop the marks the scope just popped retired, for every depth-tagged table at once.
+function collBindPopTo(depth: i32) {
+  bindMarkPopTo(collBindDepth, collBindName, depth)
+  bindMarkPopTo(objLitBindDepth, objLitBindName, depth)
 }
 
 // Mark or test a function declaration whose return annotation collapsed. Deduped: pass 1 hoists
@@ -14605,29 +14661,14 @@ function objFieldNameOrder(names: string[]): i32[] {
 }
 
 // Is `srcExpr` a name bound, without an annotation, to an object literal? An un-annotated
-// binding has no pinned wasm type of its own, so the emitter can lay it out at the shape it
-// flows into, which is what makes a nested width pair sound. An annotated source has a type
-// it must keep, so the destination is a second view of one object and the pair is unsound (D938).
+// binding has no pinned wasm type of its own, so the emitter lays it out at the shape it flows
+// into, which is what makes a nested width pair sound; an annotated source keeps its type and
+// the pair is unsound (D938). Resolved through the scope chain, never by arena order (D1609).
 function srcIsUnannotatedObjBinding(srcExpr: i32): boolean {
   if srcExpr < 0 { return false }
   const e = P.nodes[srcExpr]
   if e is Paren { return srcIsUnannotatedObjBinding(e.parInner) }
-  if e is Ident {
-    let i = 0
-    while i < P.nodes.length {
-      const n = P.nodes[i]
-      if n is LetDecl {
-        if n.letName == e.identName {
-          if n.letType >= 0 { return false }
-          if n.letInit < 0 { return false }
-          const ivn = P.nodes[n.letInit]
-          if ivn is ObjLit { return true }
-          return false
-        }
-      }
-      i = i + 1
-    }
-  }
+  if e is Ident { return bindingIsObjLit(e.identName) }
   false
 }
 
@@ -23110,6 +23151,9 @@ function checkProgramNode(n: Program) {
           }
         }
         declare(sm.letName, mty)
+        if letDeclIsUnannotObjLit(stmts[mi]) {
+          markObjLitBinding(sm.letName, 0)
+        }
         moduleGlobals[sm.letName] = true
         // TDZ: in the dead-zone until pass 2 reaches the initializer.
         daAdd(sm.letName)
@@ -29610,6 +29654,11 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
   // is called through the inline arm exactly like `function`, so the lambda never runs.
   checkNotEmitterIntrinsic(n.letName, ix)
   declare(n.letName, bound)
+  // The module hoist already recorded a global's row at depth 0; a second one would say the
+  // same thing at the same depth (D1609).
+  if !preHoisted && letDeclIsUnannotObjLit(ix) {
+    markObjLitBinding(n.letName, T.scopes.length - 1)
+  }
   // D1048's second hint: marks a binding whose type came from a spelling that collapsed a
   // subsumed literal arm. A bare call initializer is the whole rung, deliberately narrow.
   if annotCollapsedHere {
