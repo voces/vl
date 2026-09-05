@@ -7,6 +7,10 @@ of ONE closed set (`export type K = "a" | "b" | …`, or a union alias over stru
 types discriminated with `is`). The closed sets are read from `compiler/*.vl`, never
 hard-coded: `--sets` prints what was found and where.
 
+A `match` is a ladder too, but only through its `_` arm: a wildcard-less one is the
+language's own gate, while `_` covers every unnamed member and says nothing about
+them — the same bare fall-through wearing a keyword.
+
 Four sections, in the order a reader wants them:
 
   --sets      every closed set the tree declares, its members, its home
@@ -17,8 +21,9 @@ Four sections, in the order a reader wants them:
               `nulvariant` hole is here and in no other section
 
 The lint in compiler/lint.vl is the same walk over the first three, per module,
-and `scripts/ladder-budget.py` is its per-file ratchet. See CLAUDE.md,
-"A LADDER OVER A CLOSED KIND SET".
+and `scripts/ladder-budget.py` is its per-file ratchet. The rule and its controls
+are docs/internals/kind-ladder-lint.md; see also CLAUDE.md, "A LADDER OVER A CLOSED
+KIND SET".
 """
 
 import os
@@ -383,10 +388,11 @@ def tail_of(lines, last, hi):
     return out
 
 
-def ends_named(lines, last, hi, fn_names):
-    """True when the default NAMES what the ladder excludes: a refusal channel, a
-    sentence long enough to be one, or a delegation to another function."""
-    for i in tail_of(lines, last, hi):
+def region_names(lines, idxs, fn_names):
+    """True when the lines at `idxs` NAME what the ladder excludes: a refusal channel,
+    a sentence long enough to be one, or a delegation to another function. One test for
+    both default shapes — an `if` chain's tail and a `match`'s `_` arm."""
+    for i in idxs:
         # THE BLANKED LINE, NEVER THE RAW ONE: a `"C<fe>@<name>"` inside a COMMENT
         # measured as a sentence and graded `monoSpecializableCallbackName`'s default
         # as named. A comment is not a default.
@@ -398,6 +404,11 @@ def ends_named(lines, last, hi, fn_names):
             if m.group(1) in fn_names or m.group(1) in NAMING_CALLS:
                 return True
     return False
+
+
+def ends_named(lines, last, hi, fn_names):
+    """True when an `if` chain's default names what the ladder excludes."""
+    return region_names(lines, tail_of(lines, last, hi), fn_names)
 
 
 def tail_calls(lines, last, hi, fn_names):
@@ -412,15 +423,112 @@ def tail_calls(lines, last, hi, fn_names):
 
 # ── the census ───────────────────────────────────────────────────────────────
 class Ladder:
-    def __init__(self, rel, fn, subj, setname, arms, first, last, ending, delegates):
+    def __init__(self, rel, fn, subj, setname, arms, first, last, ending, delegates,
+                 form="if"):
         self.rel, self.fn, self.subj = rel, fn, subj
         self.set, self.arms = setname, arms
         self.first, self.last, self.ending = first, last, ending
         # The functions the DEFAULT region calls — what makes a pair a split walk.
         self.delegates = delegates
+        # "if" for a chain of arms, "match" for a `match` with a `_`. The split rule
+        # reads only the "if" form: a delegating `_` is graded `named` and never
+        # reaches it, so admitting the form would only add pairs the rule never meant.
+        self.form = form
 
     def missing(self, sets):
         return [m for m in sets[self.set][0] if m not in self.arms]
+
+
+# ── the `match` form ─────────────────────────────────────────────────────────
+# A `match` is exhaustive or it does not compile — EXCEPT through `_`, which covers
+# every member the arms do not name and says nothing about them. That is the `if`
+# chain's bare `-1` wearing a keyword, so it is graded by the same rule: the `_` arm's
+# body must name what it excludes, or the match is an incomplete ladder. A `_`-less
+# match is the language's own gate and is never reported.
+
+MATCH_HEAD = re.compile(r"^(\s*)match (\S.*?) \{$")
+
+
+def block_end(lines, lo, hi):
+    """The line the brace opening on `lo` closes on."""
+    depth, opened = 0, False
+    for n in range(lo, hi + 1):
+        s = strip_line(lines[n])
+        depth += s.count("{") - s.count("}")
+        if depth > 0:
+            opened = True
+        if opened and depth <= 0:
+            return n
+    return hi
+
+
+def arm_pats(s, raw, ind):
+    """The patterns of the arm at indent `ind`, or None: a list of
+    `("lit"|"type"|"wild", text)`, one per alternative of an or-pattern. A line whose
+    head is not wholly patterns is not an arm (a `=>` inside an arm BODY is at a deeper
+    indent, and a lambda's `=>` is not at the arm indent at all).
+
+    POSITIONS OFF THE STRIPPED LINE, TEXT OFF THE RAW ONE — `strip_line` blanks a
+    literal's content to `x` and preserves its length, so reading the member out of `s`
+    names every string member `xxxxxxx` and no set holds it."""
+    if not s.startswith(" " * ind) or s[ind:ind + 1] in ("", " "):
+        return None
+    cut = s.find("=>", ind)
+    if cut < 0:
+        return None
+    out = []
+    off = ind
+    for part in s[ind:cut].split("|"):
+        a = off + (len(part) - len(part.lstrip()))
+        p = part.strip()
+        off = off + len(part) + 1
+        if p == "_":
+            out.append(("wild", p))
+        elif len(p) >= 2 and p[0] == '"' and p[-1] == '"':
+            out.append(("lit", raw[a + 1:a + len(p) - 1]))
+        elif re.fullmatch(r"[A-Z]\w*", p):
+            out.append(("type", p))
+        else:
+            return None
+    return out or None
+
+
+def match_ladders_in(rel, lines, fn, lo, hi, sets, idx, fn_names):
+    """Every `match` in `[lo, hi]` whose `_` arm names nothing — one Ladder each,
+    positioned at the `match` keyword."""
+    out = []
+    for i in range(lo, hi + 1):
+        m = MATCH_HEAD.match(strip_line(lines[i]).rstrip())
+        if not m:
+            continue
+        ind = len(m.group(1)) + 2
+        end = block_end(lines, i, hi)
+        mems, kind, wild = [], None, -1
+        for j in range(i + 1, end + 1):
+            pats = arm_pats(strip_line(lines[j]), lines[j], ind)
+            if not pats:
+                continue
+            for k, text in pats:
+                if k == "wild":
+                    wild = j
+                elif kind is None or kind == k:
+                    kind = k
+                    if text not in mems:
+                        mems.append(text)
+        # A `_`-less match is exhaustive by the checker; arms that already cover the
+        # whole set leave the `_` unreachable, so neither is a hole to name.
+        if wild < 0 or kind is None or len(mems) < MIN_ARMS:
+            continue
+        setname = pick_set(mems, kind, sets, idx)
+        if setname is None or len(mems) >= len(sets[setname][0]):
+            continue
+        wend = block_end(lines, wild, end) if strip_line(lines[wild]).rstrip().endswith("{") \
+            else wild
+        ending = "named" if region_names(lines, range(wild, wend + 1), fn_names) \
+            else "silent"
+        out.append(Ladder(rel, fn, m.group(2), setname, mems, i, wild, ending, set(),
+                          form="match"))
+    return out
 
 
 def ladders_of(rel, src, sets, idx):
@@ -429,6 +537,7 @@ def ladders_of(rel, src, sets, idx):
     fn_names = {n for n, _, _ in fns}
     out = []
     for fn, lo, hi in fns:
+        out += match_ladders_in(rel, lines, fn, lo, hi, sets, idx, fn_names)
         groups = {}
         for i, subj, mem, kind in tests_in(lines, lo, hi):
             groups.setdefault((subj, kind), []).append((i, mem))
@@ -487,7 +596,8 @@ def split_in(rel, src, sets, idx):
               is here and NOT in `gap`, because `modRwStmt` did test it."""
     lines = src.split("\n")
     body = {n: calls_in(lines, lo, hi) for n, lo, hi in functions(lines)}
-    lads = [l for l in ladders_of(rel, src, sets, idx) if l.ending != "exhaustive"]
+    lads = [l for l in ladders_of(rel, src, sets, idx)
+            if l.ending != "exhaustive" and l.form == "if"]
     # ONE report per FUNCTION PAIR, not per ladder pair: `parseBlock` and `parseStmt`
     # each carry two TokKind ladders and would say it twice at one position. The lint
     # dedupes the same way, which is what makes the two agree.

@@ -13,8 +13,10 @@
 // expression, a refusal default, a single-arm guard, and a pair of walkers that
 // partition a set and hand back BOTH ways. Each is a shape the tree really has.
 //
-// `match` is deliberately out of scope for both: the checker already refuses a
-// wildcard-less `match` that misses a member, so the language is the gate there.
+// A `match` is in scope ONLY through its `_` arm. A wildcard-less one is refused by
+// the checker when it misses a member, so the language is the gate there; `_` covers
+// every unnamed member and says nothing about them, which is the `if` chain's bare
+// `-1` wearing a keyword. The `match-*` fixtures below pin both halves.
 //
 // GATING: env-gated (`SELFHOST_NATIVE_ALIGN=1`) AND requires the built binary +
 // seed wasm, like the other native `vl_*` suites.
@@ -194,6 +196,101 @@ function after(k: string): i32 {
 print(after("x"))
 `,
     incomplete: [2],
+    split: [],
+  },
+  {
+    // THE `match` PAIR. `bare`'s `_` returns a sentinel and names nothing, which is
+    // the whole hole the keyword can hide; `refusing`'s `_` reaches a refusal channel
+    // and `exhaustive` has no `_` at all, so the language is already the gate. Both
+    // must stay silent, or the rule would fire on every `match` in the compiler.
+    name: "match-wild.vl",
+    src: `type K = "nulbool" | "f64list" | "u8list" | "nulmap"
+
+function emitFail(m: string): i32 { m.length }
+
+function bare(k: K): i32 {
+  match k {
+    "nulbool" => 1
+    "f64list" => 2
+    _ => 0
+  }
+}
+
+function refusing(k: K): i32 {
+  match k {
+    "nulbool" => 1
+    "f64list" => 2
+    _ => emitFail("no lowering for " + k)
+  }
+}
+
+function exhaustive(k: K): i32 {
+  match k {
+    "nulbool" => 1
+    "f64list" => 2
+    "u8list" => 3
+    "nulmap" => 4
+  }
+}
+`,
+    incomplete: [6],
+    split: [],
+    says: {
+      code: INCOMPLETE,
+      text: "matches 2 of 31 VKind kinds and its `_` arm names none of the rest",
+    },
+  },
+  {
+    // The TYPE-pattern face of the same rule, and the two body shapes a `_` can take:
+    // `braced` opens a multi-line block (the shape `vl fmt` writes for `_ => {}`) and
+    // `orpat` is a one-line value after an or-pattern. `namedBraced` is the control —
+    // the same braced shape, with a refusal inside it.
+    name: "match-type.vl",
+    src: `type TyPrim = { primName: string }
+type TyErr = { errAt: i32 }
+type TyObj = { objN: i32 }
+type Ty = TyPrim | TyErr | TyObj
+
+function emitFail(m: string): i32 { m.length }
+
+function braced(t: Ty): i32 {
+  match t {
+    TyPrim => {
+      return t.primName.length
+    }
+    TyErr => {
+      return t.errAt
+    }
+    _ => {
+
+    }
+  }
+  0 - 1
+}
+
+function orpat(t: Ty): i32 {
+  match t {
+    TyPrim | TyErr => 1
+    _ => 0
+  }
+}
+
+function namedBraced(t: Ty): i32 {
+  match t {
+    TyPrim => {
+      return 1
+    }
+    TyErr => {
+      return 2
+    }
+    _ => {
+      return emitFail("no rep for this arena variant")
+    }
+  }
+  0 - 1
+}
+`,
+    incomplete: [9, 24],
     split: [],
   },
   {

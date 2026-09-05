@@ -572,7 +572,18 @@ pre-trim source. One byte different means you edited code, not comments.
 Four in one week: no `nulvariant` rung (#2400), no `IfStmt` arm (D981), no unbounded-`TyVar`
 arm (D1004/D1221), no module-block arm (D1370). **A bare fall-through to `-1` / `""` / `false` /
 `0` satisfies nothing** — a NAMED default is an `emitFail`, a sentence, or a delegation to the
-ladder that owns the rest. `kind-ladder-incomplete` is the rule; `kind-ladder-split` is one walk
+ladder that owns the rest.
+
+**AND NEITHER DOES A `match`'s `_` ARM**, which covers every member the arms do not name and
+says nothing about them — the same bare fall-through wearing a keyword, and graded by the same
+default test since #2663. Only a `_`-LESS `match` is gated by the language. **A ladder is paid
+by naming its missing arms or by a `_`-less exhaustive `match`, never by `_`**: rewriting 31 of
+`emit_collect.vl`'s 39 ladders as `match … _ => {}` dropped the ratchet by 31 for +129 seed
+bytes, zero CPU and byte-identical output — the number fell and nothing got safer, which is
+what the `_` clause now prevents. The rule, the pilot's table and the two `vl fmt` defects it
+found (D1646/D1647) are `docs/internals/kind-ladder-lint.md`.
+
+`kind-ladder-incomplete` is the rule; `kind-ladder-split` is one walk
 across two functions where only one hands back. Ratchet: `python3 scripts/ladder-budget.py
 --check` (a gate row; it also re-derives every closed set from its `export type` and fails on
 drift). `scripts/ladder-census.py` is the discovery half — `--sets`, `--split`, and `--pred`
