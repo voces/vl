@@ -460,6 +460,32 @@ s.cpLen()                  ;; count of code points              — O(n), named
 The principle: **operations whose cost depends on the data get a name, not a
 subscript.** A subscript should mean O(1), always, on every input.
 
+**Going the other way — code points TO a string — there are two builtins, and both are
+shipped.** They were undocumented until an external consumer reached for an ASCII
+lookup-table slice as a workaround for the one it could not find, so they are named here
+beside the reading direction:
+
+```vl
+print(fromCodePoint(72))        // "H"        — ONE code point
+print(fromCodePoint(0x1F600))   // "😀"
+const cps = [72, 105]
+print(fromCodePoints(cps))      // "Hi"       — a whole i32[], one bulk encode
+```
+
+- **`fromCodePoint(cp)` is the single-code-point form**, and it takes an expression: a
+  literal, a field, a call result. It is what a `charCodeAt`-shaped loop wants on the way
+  back, and it rides the same encoder `fromCodePoints` does, so the two cannot disagree
+  about a value.
+- **`fromCodePoints(xs)` is the bulk form** and is what every `std:` builder drains an
+  accumulator through — one encode for the whole list rather than one per character.
+- **Both substitute U+FFFD** for a value with no UTF-8 encoding — a lone surrogate,
+  anything past U+10FFFF, a negative. That is the §Validity ruling below, and it is why
+  `fromCodePoint(0xD800)` is three bytes rather than a trap.
+- **`fromCodePoints` today accepts only a bare NAME**, not a literal or any other
+  expression: `fromCodePoints([72, 105])` passes `vl check` and is then refused by the
+  emitter. That is a codegen limitation rather than a rule of the language, filed as
+  `D1640`; bind the list first.
+
 ### The char-literal trap — closed by the type system
 
 This is the one genuine hazard of the byte-indexed camp, and the one place VL can

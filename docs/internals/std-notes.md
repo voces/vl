@@ -588,6 +588,64 @@ Each now says so, in the shape the `concat`-vs-`+` bullet uses.
   a float literal has one way to be wrong. `kind` keeps the type structurally DISTINCT from
   `ParseError` as well.
 
+## `std:bytes`
+
+- **Which clause admits it — and it is NOT a "consumer clause", because there is no such
+  clause.** `docs/internals/std-design.md` D2 admits on **(a) what the language story needs
+  to be complete without third parties**, and excludes "anything speculative *without* a
+  consumer in the tree" — so a consumer CLEARS the exclusion, it never admits. Clause (a)
+  admits this on its own: `std:fs`'s `readFile`/`readFileRange` HAND the caller a `u8[]`
+  and std then offered no way to read a number out of one. glean — VL's first external
+  consumer, a WC3 replay/dump toolset — clears the speculative exclusion by reimplementing
+  the shape in **21 of its 150 `.vl` files** (measured 2026-09-05), 13 of them through a
+  private `le32`/`u32` helper and 8 of those through a private `le64`. `compiler/driver.vl:823`
+  and `compiler/cli.vl:529` write the same loops, but **no compiler module imports any std
+  module** — they are evidence that the shape is idiomatic, not in-tree consumers.
+- **Why no `u32le`, and why the 32-bit read returns `i32`.** The reason is *one read per
+  width*: at 64 there is nowhere wider to put an unsigned value, and at 32 the widening is
+  a cast the caller can spell. (An earlier draft of this module gave the 64-bit reason at
+  32 as well — "there is nowhere wider" — which is simply false there, and the export's own
+  comment prescribes the wider place.) `std:buffer` made the same call with
+  `loadI32`/`loadI64` and no unsigned twin, and declining is the reversible direction: with
+  no deprecation story a name can be added later and never removed.
+- **The consumer measurement that was cited for this is REFUTED, and the refutation is the
+  better argument for the doc.** The claim was "every one of the 21 files binds the word to
+  an `i32`, so nobody wanted an unsigned read". True about the binding, false as evidence:
+  **five of them** — `reg-scan.vl:14`, `reg-bounds.vl:12`, `rtti-name.vl:13`,
+  `rtti-vtable.vl:27`, `rtti-vtable-ra.vl:27` — end their helper with `& 0xffffffff`,
+  which at `i32` is a NO-OP (run against `00 00 00 80` it still prints `-2147483648`).
+  They wanted the unsigned read and could not spell it, then re-cast at the use site.
+  That is why `i32le`'s doc comment says to widen FIRST and that masking the i32 alone
+  does nothing — the failure is one five files in the sample have already hit.
+- **Why BOTH signednesses at 16 bits, and why all four `be` twins.** Two bytes fit an `i32`
+  two ways and the caller must choose; four and eight fill their return type, so there is
+  one answer. Same split `std:buffer`'s `loadI16`/`loadU16` pair documents. **Neither rests
+  on a counted site**: glean has zero 16-bit reads over a `u8[]` and zero big-endian
+  assembly sites. They rest on clause (a) — a std that reads a `u16` but not an `i16` forces
+  `(b.u16le(o) << 16) >> 16` on every caller, and byte order is a two-valued axis of which
+  half is not a story. Recorded here as chosen rather than drifted.
+- **Why the names do not reuse `load*`.** Not taste: VL has no namespace import and a UFCS
+  call resolves only names in scope, so a file reading both a `Buf` and a `u8[]` must import
+  both sets into one scope, and a module that both imports and declares a name is a hard
+  parse error. Two `loadI32`s would not compile UNALIASED —
+  `tests/cases/modules/err-duplicate-import-two-modules/` is that shape. `as` renaming does
+  exist, so the choice is between distinct names, which cost nobody anything, and an alias
+  every caller has to write.
+- **`u8[]` is outside the generic surface** — not a `T[]`, so `std:array`'s helpers do not
+  reach it; the loops are written out here, as `std:base64` and `std:utf8` write theirs.
+- **Why nothing bounds-checks.** A read is one array index and the engine already checks it,
+  so the trap is the list's own `out of bounds array access`. `std:buffer`'s `storeBytes` and
+  `loadBytes` DO check because linear memory would not catch it; `fill`/`copyFrom` do not,
+  for the same reason as here. A short read answering `0` was rejected outright: that is a
+  wrong number rather than a failure.
+- **Why no `put*` and no `f32le`.** The consumer's tree writes bytes at two sites and they
+  disagree about the shape — `out[at] = …` into an existing array vs `bytes.push(…)` onto a
+  growing one — so a store family would be guessing which one std blesses. A float needs no
+  export at all: `f32fromBits(b.i32le(off))` composes the existing bitcast intrinsic with the
+  integer read, and `tests/vl_std_bytes_test.ts` pins that composition so it cannot rot.
+- **What the suite grades against.** `DataView`, the platform's own byte reader, not a second
+  shift ladder written in TypeScript to agree with the VL one.
+
 ## `std:seed`
 
 Kept only to prove the `std:` resolution plumbing end to end — both resolvers, the Rust
