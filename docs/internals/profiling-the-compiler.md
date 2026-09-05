@@ -94,6 +94,34 @@ field or an `fnStmts`/`fnParent` slot. `collectTyParamNames` additionally resume
 left is `globalCellKind` at 16.0% self, reached from `exprIsClosure`: it has a memo, and the
 same arena growth stamps it stale once per instance.
 
+## Measured 2026-09-05, second pass — a memo whose INVALIDATION was the quadratic
+
+Re-profiling the same many arm on the post-#2594 seed, `globalCellKind` is the top self frame
+(18.5% at 400 pins, 18.3% at 800, 0.3% on the one arm) and 99.6% of its leaf samples have
+`exprIsClosure` as their immediate parent. **The re-derivation is not what costs**:
+`globalCellKindGo`, the ladder underneath, is the leaf of **0 samples of 5,885**, and
+`globalCellKind`'s inclusive share (18.57%) is its self share (18.27%) plus a rounding error.
+The whole cost is in the memo's own body — `while gckHave.length <= letIx { push; push }`,
+re-growing a column indexed by ARENA INDEX from empty after every invalidation, and the
+monomorphizer invalidates once per minted instance.
+
+So the fix is neither a narrower key nor an index: the memo's inputs really are the arena, and
+the conservative stamp is right. What was wrong was **dropping the columns to forget them**. A
+generation counter forgets in O(1) — a slot is a hit only while `gckHave[letIx] == gckGen` —
+and the columns are allocated once for the whole compile. After: `globalCellKind` 1,075 → 8
+self samples at 800 pins (18.27% → 0.12%), the many arm 5.38 s → 3.74 s (0.70×, min of three
+interleaved), and the axis ratio 0.81× master over nine interleaved pairs. **The bar does not
+move**: 0.81× of a bar-6 axis is not a decisive fall, and the worst candidate reading in ten
+rounds was 4.81 at box load 226.
+
+What is left is `collectA` (`compiler/emit_collect.vl`) at **62.6% inclusive** under
+`monoRebuild`'s 71.4%. #2594's stamp removes only the DUPLICATE rebuild — minting an instance
+moves the arena for real, so the pass still runs once per instance, and it is a full reset and
+re-mint of the ref-list / map-value / annotation row tables rather than a prefix a suffix scan
+could extend. Making that incremental is the next shape, and it is a bigger piece of work than
+either stamp: the tables are keyed and deduped, so a suffix pass has to not re-mint a row the
+prefix already owns.
+
 ## Guards
 
 Three, and they fire at different moments. Profiling is what you do AFTER one of them does.

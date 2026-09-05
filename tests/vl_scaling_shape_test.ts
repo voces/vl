@@ -343,11 +343,10 @@ axis(
   (d) => twoFiles(d, genCallbacks(300, 1), genCallbacks(300, 20)),
 );
 
-// Still super-linear in the pin count, and the one arm sits under `FLOOR`, so the quotient
-// is an absolute budget on the many arm and moves with box load. `monoRebuild`
-// (compiler/emit_mono.vl) re-runs four whole-program passes once per minted instance; what
-// is left of that is `globalCellKind`, whose memo the same arena growth throws away. The
-// bar, the profile and the interleaved A/B behind them: CHANGELOG.md, 2026-09-05.
+// Still super-linear in the pin count, and the one arm sits near `FLOOR`, so the quotient is
+// close to an absolute budget on the many arm and moves with box load. What is left is
+// `collectA` (compiler/emit_collect.vl), which `monoRebuild` re-mints once per minted
+// instance and which is 62.6% of the many arm. Profiles and A/B: CHANGELOG.md, 2026-09-05.
 axis("generic pins", 6.0, "`monoRebuild` re-runs a whole-program pass per minted instance.", (d) =>
   twoFiles(d, genPins(400, true), genPins(400, false)));
 
