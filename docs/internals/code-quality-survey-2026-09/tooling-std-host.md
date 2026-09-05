@@ -408,6 +408,16 @@ output over `compiler/`, `python3 scripts/comment-budget.py --check`, `ladder-bu
 `tests/vl_comment_budget_test.ts`, `vl_kind_ladder_test.ts`, `vl_sentinel_index_test.ts`,
 `deno task test`.
 
+**Both halves landed 2026-09-05, and (a)'s named risk was real.** A `let` that is both the
+first unreachable statement of its block and a boxing union-`let` in a loop anchors
+`unreachable-code` and `union-let-no-melt` on one token, and the single walk reaches the
+`while` before its block — built with the regroup out, the pair swaps. `lintRegroupWalkPhase`
+therefore gives the tie an explicit rank per code rather than letting walk order decide it,
+and `tests/vl_check_module_lint_test.ts` pins the pair. Measured in paired CPU milliseconds
+over 25 triples: the single walk is −5.2% to −6.7% of a whole `vl check`, and the shared index
+a further −0.9% to −2.7%, which on the box that measured it is the noise floor. §5.2 was not
+attempted.
+
 ### 5.2 Four text-scanner families over one string
 
 `lint.vl` carries five helper families with disjoint prefixes and overlapping jobs: `cb*` (32

@@ -8,10 +8,11 @@ list, and 14 emitter exports plus 5 front-end ones sat in it
 (docs/internals/code-quality-survey-2026-09/emitter.md 8.1, front-end 4.2).
 
 Sibling of scripts/comment-budget.py, scripts/scan-budget.py,
-scripts/ladder-budget.py and scripts/sentinel-budget.py — a committed per-file
-baseline that may only fall, a `--check` in gate.sh and in CI, `--write-baseline`
-in the same PR as the deletion that earned it, and `--why` naming what moved.
-This baseline starts AT ZERO: the tree it landed on had none left.
+scripts/ladder-budget.py and scripts/sentinel-budget.py. The baseline schema,
+the `--check`/`--why` commands and the exit codes are scripts/ratchet.py, shared
+with the other four ratchets; this file is the census — the reference count and
+the dead-export walk. This baseline starts AT ZERO: the tree it landed on had
+none left.
 
 WHAT COUNTS AS A REFERENCE: any word-boundary occurrence of the name anywhere
 under compiler/, std/, tests/, lsp/, playground/ or scripts/, other than the
@@ -22,15 +23,13 @@ stays. A self-recursive export references itself and so is never reported; the
 lint's `unused-function` is what sees that shape for a non-exported one.
 """
 
-import json
 import os
-import shutil
-import subprocess
 import sys
-import tempfile
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BASELINE = os.path.join(ROOT, "scripts", "export-budget-baseline.json")
+import ratchet
+from ratchet import WORD, read_source
+
+BASELINE = os.path.join(ratchet.ROOT, "scripts", "export-budget-baseline.json")
 CODE = "dead-export"
 # The trees a compiler export may be referenced from. `docs/` is absent on
 # purpose: a doc citing a name is not a consumer, and one of the front-end
@@ -42,13 +41,6 @@ SKIP_DIRS = frozenset(
     ".git node_modules dist build target __pycache__ .cache .deno".split()
 )
 KINDS = ("function", "let", "const", "type")
-WORD = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
-
-
-def read_source(path):
-    """Latin-1 so one index is one BYTE, matching the lint's `s[i]`."""
-    with open(path, "rb") as fh:
-        return fh.read().decode("latin-1")
 
 
 def modules(root):
@@ -134,117 +126,38 @@ def dead(root):
     return out
 
 
-def current(root=ROOT):
+def current(root=ratchet.ROOT):
     return {rel: {CODE: len(v)} for rel, v in dead(root).items()}
 
 
-def head_commit():
-    r = subprocess.run(["git", "-C", ROOT, "rev-parse", "--short", "HEAD"],
-                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    return r.stdout.decode().strip() if r.returncode == 0 else ""
+def named(root):
+    """{code: {`file:name`: hits}} for one tree — the NAMED entries, the shape
+    `--why` reads. One hit per dead export; the code has exactly one member,
+    `dead-export`, kept keyed the same way as the other four ratchets' `named`."""
+    out = {CODE: {}}
+    for rel, hits in dead(root).items():
+        for name, _kind, _line in hits:
+            k = f"{rel}:{name}"
+            out[CODE][k] = out[CODE].get(k, 0) + 1
+    return out
 
 
-def load_baseline():
-    try:
-        with open(BASELINE, encoding="utf-8") as fh:
-            return json.load(fh)
-    except (OSError, ValueError) as e:
-        raise SystemExit(
-            f"export-budget: cannot read the baseline {BASELINE} ({e}). Write one\n"
-            f"with  python3 scripts/export-budget.py --write-baseline")
-
-
-def write_baseline(cur):
-    total = sum(v[CODE] for v in cur.values())
-    rows = [f'{json.dumps(k)}: {json.dumps(v)}' for k, v in sorted(cur.items())]
-    files = "{}" if not rows else "{\n" + ",\n".join(rows) + "\n}"
-    body = "\n".join([
-        "{",
-        f'"commit": {json.dumps(head_commit())},',
-        f'"total": {json.dumps({CODE: total})},',
-        f'"files": {files}',
-        "}",
-    ])
-    with open(BASELINE, "w", encoding="utf-8") as fh:
-        fh.write(body + "\n")
-    print(f"wrote {BASELINE}: {total} {CODE}")
-
-
-def cmd_check(cur):
-    base = load_baseline()["files"]
-    bad = []
-    for rel, v in sorted(cur.items()):
-        was = base.get(rel, {}).get(CODE, 0)
-        if v[CODE] > was:
-            bad.append(f"  {rel}  {CODE}: {v[CODE]} (baseline {was})")
-    if bad:
-        print("export budget REGRESSED — a file may only go down or stay:")
-        print("\n".join(bad))
-        print(
-            "\nAn export nothing references is dead code the `unused-function` lint\n"
-            "cannot see. Delete it, or — when only its own module uses it — drop the\n"
-            "`export` keyword so the lint owns it. `python3 scripts/export-budget.py\n"
-            "--list` names them. After a real deletion, lower the baseline with\n"
-            "  python3 scripts/export-budget.py --write-baseline"
-        )
-        return 1
-    tot = sum(v[CODE] for v in cur.values())
-    was = load_baseline()["total"].get(CODE, 0)
-    print(f"export budget ok — {tot} {CODE} (baseline {was} or below)")
-    if tot < was:
-        print("  below baseline — `python3 scripts/export-budget.py --why` names "
-              "which exports left")
-    return 0
-
-
-def tree_at(rev):
-    """A worktree of `rev` under a temp dir, so both sides of `--why` are read by
-    the SAME walk. Sibling of ladder-budget.py's."""
-    tmp = tempfile.mkdtemp(prefix="export-budget-")
-    r = subprocess.run(["git", "-C", ROOT, "archive", "--format=tar", rev],
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if r.returncode != 0:
-        shutil.rmtree(tmp, ignore_errors=True)
-        raise SystemExit(f"export-budget: cannot read the tree at {rev}: "
-                         f"{r.stderr.decode().strip()}")
-    x = subprocess.run(["tar", "-x", "-C", tmp], input=r.stdout,
-                       stderr=subprocess.PIPE)
-    if x.returncode != 0:
-        shutil.rmtree(tmp, ignore_errors=True)
-        raise SystemExit(f"export-budget: cannot unpack {rev}: "
-                         f"{x.stderr.decode().strip()}")
-    return tmp
-
-
-def cmd_why(since):
-    """What LEFT and what ENTERED the reported set since the baseline was written.
-
-    Both sides are re-derived by the same walk, so a name that left is a name that
-    stopped qualifying — not a parser that stopped matching."""
-    base = load_baseline()
-    at = since or base.get("commit", "")
-    if not at:
-        raise SystemExit(
-            "export-budget: the baseline records no `commit`, so a fall cannot be\n"
-            "attributed. Pass one — `--why <rev>` — or re-run `--write-baseline`.")
-    tmp = tree_at(at)
-    try:
-        was = {n: rel for rel, v in dead(tmp).items() for n, _k, _l in v}
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-    now = {n: rel for rel, v in dead(ROOT).items() for n, _k, _l in v}
-    print(f"dead exports: {at} -> working tree\n{len(was)} -> {len(now)}")
-    moved = 0
-    for n in sorted(set(was) - set(now)):
-        print(f"  LEFT     {n}  ({was[n]})")
-        moved += 1
-    for n in sorted(set(now) - set(was)):
-        print(f"  ENTERED  {n}  ({now[n]})")
-        moved += 1
-    if moved == 0:
-        print("Nothing moved by name. A count that differs without a name moving is "
-              "the instrument, not the tree.")
-    return 0
+R = ratchet.Ratchet(
+    script="export-budget.py",
+    label="export",
+    baseline=BASELINE,
+    codes=(CODE,),
+    ok_line=lambda t: f"export budget ok — {t[CODE]} {CODE} (baseline "
+                      f"{R.load_baseline()['total'].get(CODE, 0)} or below)",
+    remedy="An export nothing references is dead code the `unused-function` lint\n"
+           "cannot see. Delete it, or — when only its own module uses it — drop the\n"
+           "`export` keyword so the lint owns it. `python3 scripts/export-budget.py\n"
+           "--list` names them. After a real deletion, lower the baseline with",
+    wrote_line=lambda t: f"{t[CODE]} {CODE}",
+    extras=lambda: (("commit", ratchet.head_commit()),),
+    named=named,
+    tree_paths=CORPUS,
+)
 
 
 def cmd_list(root):
@@ -259,23 +172,21 @@ def main():
     # `--root <dir>` grades a DIFFERENT tree of the same shape, so the detector can be
     # run against a control it must fire on and one it must stay quiet on
     # (tests/vl_export_budget_test.ts). The baseline is always this checkout's.
-    root = ROOT
+    root = ratchet.ROOT
     if "--root" in args:
         root = os.path.abspath(args[args.index("--root") + 1])
     if "--why" in args:
-        i = args.index("--why")
-        return cmd_why(args[i + 1] if len(args) > i + 1 else "")
+        return R.why(ratchet.flag_value(args, "--why"))
     if "--list" in args:
         return cmd_list(root)
     cur = current(root)
     if "--write-baseline" in args:
-        if root != ROOT:
+        if root != ratchet.ROOT:
             raise SystemExit("export-budget: --write-baseline records THIS checkout; "
                              "it does not take --root.")
-        write_baseline(cur)
-        return 0
+        return R.write_baseline(cur)
     if "--check" in args:
-        return cmd_check(cur)
+        return R.check(cur)
     tot = sum(v[CODE] for v in cur.values())
     print(f"{'file':<28}{CODE:>14}")
     for rel, v in sorted(cur.items(), key=lambda kv: -kv[1][CODE]):

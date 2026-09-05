@@ -14214,7 +14214,7 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
             // a niche `X | null` global seeds its null rep for a bare `null` RHS (the table
             // at `emitNullLitNode`), mirroring the seed the global's own initializer gets;
             // a non-null RHS ignores the seed.
-            const gsCtx = expCtxHere()
+            const gsCtx = expCtxForCell(gaKind)
             if exprNulBool(lhsIx, fnIx) { gsCtx.nulBool = true }
             if exprNullableString(lhsIx, fnIx) { gsCtx.nulString = true }
             if exprNulClosure(lhsIx, fnIx) { gsCtx.nulClosure = true }
@@ -17663,17 +17663,14 @@ function emitLetDeclStmt(body: i32[], s: LetDecl, stmtIx: i32, fnIx: i32) {
     // `null` init lowers as `ref.null $cloStruct`; a function init stores its closure
     // ref directly. Takes priority over the union-coerce path, since this is a niche
     // nullable ref, not a box.
-    const ncCtx = expCtxHere()
-    ncCtx.nulClosure = true
+    const ncCtx = expCtxForCell(localIsRef[slot])
     if emitExprExpect(body, s.letInit, fnIx, ncCtx) < 0 { return -1 }
   } else if isNulScalarListKind(localIsRef[slot]) {
     // A DISTINCT-backing nullable scalar list binding (`string[]|null`, `f64[]|null`,
     // `i64[]|null`, `f32[]|null`): a bare `null` init lowers as `ref.null $wrapper`
     // (`nulRefHeap`), a list value builds the leaf list (`listKind`) which subtypes the
     // nullable slot. Priority over the union-coerce path (the niche is not a box).
-    const nslCtx = expCtxHere()
-    nslCtx.nulRefHeap = nulScalarListWrapHeap(localIsRef[slot])
-    nslCtx.listKind = nulScalarListBuildKind(localIsRef[slot])
+    const nslCtx = expCtxForCell(localIsRef[slot])
     if emitExprExpect(body, s.letInit, fnIx, nslCtx) < 0 { return -1 }
   } else if (
     localIsRef[slot] == "union" &&
@@ -18812,7 +18809,7 @@ export function emitUserGlobalSet(gi: i32) {
 // The `pending*` globals are implicit parameters: a hand-rolled save/restore at every
 // site risks a leaked seed. `ExpCtx` makes it explicit — a site snapshots the ambient
 // seeds (`expCtxHere`), overrides what it knows, and hands it to `emitExprExpect`.
-type ExpCtx = {
+export type ExpCtx = {
   listKind: i32,        // pendingListKind — what an empty `[]` builds
   listSlot: i32,        // pendingListSlot — WHICH ref-list element type
   structIdx: i32,       // pendingStructIdx — the struct an ObjLit must build
@@ -18833,7 +18830,7 @@ type ExpCtx = {
 
 // The current pending seeds as an explicit context — the BASE every site starts
 // from (exact ambient semantics), overriding only the fields it knows.
-function expCtxHere(): ExpCtx {
+export function expCtxHere(): ExpCtx {
   const c: ExpCtx = {
     listKind: pendingListKind,
     listSlot: pendingListSlot,
@@ -18856,7 +18853,7 @@ function expCtxHere(): ExpCtx {
 }
 
 // Write a context into the pending seeds (the transport the consumers read).
-function expCtxApply(c: ExpCtx) {
+export function expCtxApply(c: ExpCtx) {
   pendingListKind = c.listKind
   pendingListSlot = c.listSlot
   pendingStructIdx = c.structIdx
@@ -18879,12 +18876,43 @@ function expCtxApply(c: ExpCtx) {
 // Emit `exprIx` under the explicit expected-type context `ctx`: the ambient
 // seeds are saved, `ctx` applied, the expression emitted, and EVERY seed
 // restored — scoping the whole context to this one emit.
-function emitExprExpect(body: i32[], exprIx: i32, fnIx: i32, ctx: ExpCtx) {
+export function emitExprExpect(
+  body: i32[],
+  exprIx: i32,
+  fnIx: i32,
+  ctx: ExpCtx,
+) {
   const saved = expCtxHere()
   expCtxApply(ctx)
   const r = emitExpr(body, exprIx, fnIx)
   expCtxApply(saved)
   r
+}
+
+// The cell-seed rungs a boundary derives from a cell's KIND alone, over the ambient seeds:
+// the local `let`, the start-fn global init and the `global.set` arm. Not the CONST cell —
+// its reset clears no null rep, so a seed armed there leaks (D1563). What a boundary reads
+// from its own annotation stays at the caller. Difference table: emitter.md 6.1.1.
+export function expCtxForCell(kind: VKind): ExpCtx {
+  const c = expCtxHere()
+  // The i32-backed `i32[] | null` (kind 15) and the nullable function value (kind 19): each
+  // lowers a bare `null` as `ref.null` of its own heap type rather than the GC bottom.
+  if kind == "nullist" { c.nulList = true }
+  if kind == "nulclosure" { c.nulClosure = true }
+  expCtxNulScalarList(c, kind)
+  c
+}
+
+// The rest of the kind set, and `expCtxForCell`'s default: the distinct-backing nullable
+// scalar lists take a leaf build code so a list init builds THAT wrapper and a wrapper heap
+// so a bare `null` refs it, and both resolvers hand back inert (0 / -1) for every kind they
+// do not name — which is what leaves the ambient seed standing for all the others.
+function expCtxNulScalarList(c: ExpCtx, kind: VKind) {
+  const slk = nulScalarListBuildKind(kind)
+  if slk != 0 { c.listKind = slk }
+  const slh = nulScalarListWrapHeap(kind)
+  if slh >= 0 { c.nulRefHeap = slh }
+  0
 }
 
 // Emit `print(<string expr>)`: stream each code point through `__print_char__`, then one

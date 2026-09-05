@@ -383,7 +383,6 @@ import {
   fbValtype,
   fbValtypeNullable,
   mapTypeIdxOf,
-  nulScalarListWrapHeap,
   pushFieldStorage,
   wBytes,
   wLen,
@@ -554,6 +553,8 @@ import {
   emitUnionCoerce,
   emitUnionRetSink,
   emitUserGlobalSet,
+  expCtxApply,
+  expCtxForCell,
   mvValsWrapOf,
   sFieldStorageSlot,
 } from "./wasmEmit"
@@ -1731,15 +1732,12 @@ function emitStartFnCode(out: i32[]) {
             // place a global cell's null rep is decided. Each mirrors `emitLetDeclStmt`'s local kind ladder
             // exactly, so a `const g: i32[] | null = null` gets the same seeding a local would. Kind 15, the i32-backed `i32[] | null`: `ref.null $lTypeIdx`.
             const savedSNL = pendingNulList
-            if gck == "nullist" { pendingNulList = true }
-            // The distinct-backing nullable scalar lists (`string[]|null`, `f64[]|null`, `i64[]|null`,
-            // `f32[]|null`): `ref.null $wrapper` for a bare `null`, and the leaf build code so a
-            // list-valued init builds that same wrapper rather than the i32 list. `nulScalarListWrapHeap`
-            // is -1 / `nulScalarListBuildKind` 0 for every other kind, so both are inert elsewhere.
-            const gSLK = nulScalarListBuildKind(gck)
-            if gSLK != 0 { pendingListKind = gSLK }
-            const gSLH = nulScalarListWrapHeap(gck)
-            if gSLH >= 0 { pendingNulRefHeap = gSLH }
+            const savedSNC = pendingNulClosure
+            // The kind-driven half of the seeding, shared with the local-`let` and `global.set`
+            // boundaries: the nullable-list and nullable-closure null reps, and the
+            // distinct-backing scalar lists' leaf build code. Applied over the ambient seeds, so
+            // the list seeds above stand for every kind the resolver answers inert for.
+            expCtxApply(expCtxForCell(gck))
             // Kind 18, a nullable ref array (`i32[][] | null`, `S[] | null`): the null is this global's
             // element wrapper (`rlWrapIdx[slot]`), the same slot the cell's valtype selects. Armed only
             // when the initializer is a bare `null` (the seed-leak gate the local ladder and the
@@ -1752,10 +1750,6 @@ function emitStartFnCode(out: i32[]) {
                 }
               }
             }
-            // A nullable-CLOSURE global (kind 19) lowers a bare `null` init as
-            // `ref.null $cloStruct`; a function init builds the (non-null) closure value.
-            const savedSNC = pendingNulClosure
-            if gck == "nulclosure" { pendingNulClosure = true }
             // A union cell (kind 4) coerces a raw init value into the box (`let w: string | i32 = n`
             // boxes the i32 read); a union-valued init passes through unchanged. The box-typed
             // position: a union global's cell is always the box (unlike `buildLocals`), so a
@@ -5468,8 +5462,8 @@ function emitGlobalSection() {
           pendingListSlot = gcLb.lbSlot
           // A DISTINCT-backing nullable scalar list cell (`i64[]|null`, `f32[]|null`, …): seed the
           // leaf list-build code so the const init builds the RIGHT wrapper (a small `i64` literal
-          // would otherwise build the i32 list; an `f32` list an f64 one). The non-null list value
-          // subtypes the nullable cell.
+          // would otherwise build the i32 list). This is the ONE rung of `expCtxForCell` this path
+          // may take: the reset below clears no null rep, so arming one here leaks it (D1563).
           const gNulSLK = nulScalarListBuildKind(gck)
           if gNulSLK != 0 { pendingListKind = gNulSLK }
           // A ref-array cell (kind 5) passes the ref-list table slot as `fbValtype`'s second arg
