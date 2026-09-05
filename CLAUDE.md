@@ -79,10 +79,11 @@ The parts, and what each is for:
    (Measured 2026-09-05 at load 33: 35.5 s alone, 269 CPU-s at 759%, so it does fan out; it
    is the gate's critical path, and 66.3 s of the 2026-09-04 reading was contention.)
    Two halves. `cells/` is DERIVED: 1,477 programs, one per behavioural equivalence class of
-   the 255,505-cell census. `named/` is CURATED: the exact cells some real regression NAMED,
-   kept whole — 6,088 of them, so the corpus is 7,565 cells. (`regress.py`'s own summary
-   splits that 2,061/5,504, which is the pass-2 survey's row 2: 584 curated cells have no
-   `expected.jsonl` row and default to block A. The total and the census count are right.)
+   the 250,238-cell census. `named/` is CURATED: the exact cells some real regression NAMED,
+   kept whole — 6,088 of them, so the corpus is 7,565 cells, and `regress.py`'s own summary
+   splits it exactly that way since #2623 gave the 584 curated cells that had no
+   `expected.jsonl` row one. The population it divides by, 256,089, is the census plus one
+   per curated cell; `index.py` owns those rows and the grader refuses a cell without one.
    It exits non-zero **only** on `runs → not-runs`; `→ silent` and every other
    movement is printed and read, not blocked on. A program that did not work before and does
    not work now has not regressed in the sense a gate should stop the world for.
@@ -97,8 +98,8 @@ The parts, and what each is for:
 
    Measured, not asserted: over 19 graded compilers, block A's 150,224 programs produce only
    **212 distinct answers** and **4.09 bits** of entropy each — the entire block is ~75 KiB of
-   signal. It collapses to 343 classes, and the census as a whole to **1,477 (99.42%
-   redundant, 173×)**. Validation is in `scripts/silent-sweep/distilled/README.md`: **2,699 of
+   signal. It collapses to 343 classes, and the census as a whole to **1,477 (99.41%
+   redundant, 169×)**. Validation is in `scripts/silent-sweep/distilled/README.md`: **2,699 of
    2,699** transition events across every snapshot pair are covered, including 938 loud→silent
    and 856 runs→not-runs, and leave-one-out over 17 held-out compilers missed **0 of 1,468**
    transition kinds.
