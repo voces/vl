@@ -299,6 +299,99 @@ it takes its own 0.25 s denominator floor, because its cheap arm now costs less 
 0.4 s one and a clamped denominator turns a ratio into an absolute budget. What it grades now is
 the union registry's own per-entity cost — items #5 and #7 — which nothing had measured.
 
+### B7 · `collectA`'s three phases, and which one a suffix can extend
+
+`monoRebuild`'s stamp (#2594) removed the DUPLICATE rebuild after each minted instance;
+minting moves the arena for real, so `collectA` still runs once per instance over the whole
+arena. Re-profiled on 964b5050b (`--names` seed, `genPins(N, true)`), it is **52.4% inclusive
+at 400 pins and 63.8% at 800**, and its children are annotation TEXT spread thin — no
+registry, no single frame: at 800, self 35.8% of its own inclusive, `forceNestedCloSigReps`
+13.1%, `nulScalarListKindOfNode` 10.3%, `__str_eq__` 9.5%, `nameIsRefArray` 6.2%. The cost is
+the walk, not a lookup inside it.
+
+The pass has three phases, and only the middle one is a function of an arena PREFIX:
+
+| phase | input | what it writes |
+| --- | --- | --- |
+| **M** — the union member re-marks | `unMemberSet`, in row order | `markValueUnionAtoms` sets value-box flags only; `markRefArrayArms` interns ref-list rows; `markMapUnionArms` interns map-value rows |
+| **W** — the arena walk | `P.nodes`, in index order | the `ArrayLit` / `StrLit` / `Call` / `TypeRef` arms: the rep flags, ref-list and map-value rows, the `annRlSlot`/`annRlNul` node sidecar, `rElemKind` |
+| **F** — the field-table re-derivation | `uFieldTypes`, `sFieldTypes`, in row order | the same flags and rows, plus `internInlineShapeTy` into the struct table and the code-15 re-key of `uFieldElemName` |
+
+Table by table, is the state a pure function of the arena prefix?
+
+| state | key / dedup | extensible by a suffix walk? |
+| --- | --- | --- |
+| `rlElemName` + its 7 parallel columns | `repElemKey`, first-match scan | **yes for W** — rows only append, and the walk is a forward scan, so prefix-then-suffix mints exactly what one full walk mints, in the same order |
+| `mvValName` + its 8 columns | `(key, value)` pair | same |
+| `annRlSlot` / `annRlNul` | ARENA NODE index, `-1` padded | **yes** — each node is written by the walk that covers it, and no site outside the pass records for a node below the mark |
+| `rElemKind` | none; last writer wins | **yes** — the last setter over `[0, N1) ++ [N1, N2)` is the last setter over `[0, N2)` |
+| `aUsed` … `ba8Used`, `vb*Used`, `fnValUsed` | none; monotone `= true` | **yes** |
+| `rlWrSlots` / `rlWrAns` | slot number | **no, and it does not need to be** — a pure memo, cleared on every call by both paths |
+| `rlTwin` / `mvTwin` | slot | built by `mAssignTypeIndices` after every `collectA`; empty for the whole pass table |
+
+**What is NOT extensible is F, and the reason is row ORDER.** Rows are slots, slots become
+heap-type indices, and a union's box tags are positional — so a resumed walk whose new row
+landed after F's tail would emit a different module, not merely a differently-spelled one. F
+runs last, so its rows are exactly the tail: the resume pops back to the length recorded
+right after W, extends W, and re-derives F. That reproduces a full re-mint's order for every
+program, whether or not F minted and whether or not the suffix did.
+
+M needs no such treatment — it runs FIRST, so its rows are at the head, and with
+`unMemberSet` unchanged the re-mark is a no-op on flags that are already true and rows that
+are still there.
+
+**The invalidation rule is #2594's stamp, plus the registries W classifies against.** The
+walk reads more than `P.nodes`: `refArrElemKind` consults `unNames` and `uVariants`,
+`nameIsRefArray` the struct table, `genTyParamArr` the type-parameter set — and B4 records
+that `unNames` and `uVariants` both take a push DURING monomorphization. A row added to any
+of them can re-classify a node the prefix already walked, so the resume requires
+`unMemberSet`, `unNames`, `uVariants`, `sNames`, `sFieldTypes`, `uFieldTypes` and
+`genTyParamNames` all unmoved; any growth retires the prefix and the next call re-mints in
+full.
+
+That leaves the IN-PLACE writes `monoArenaTick` counts. Read against what W actually reads,
+nine of the ten write `fnStmts`, `fnParent` or a `Param`'s type slot — none of which the walk
+looks at, and the `TypeRef` the tenth mints is appended, so the suffix covers it. The four
+that matter are the callee renames (`cal.identName = …`), because the `Call` arm classifies
+that name. They retire the prefix only when the OLD name is one the arm tests, and
+`collectACallIntrinsic` is the one home of that vocabulary, read by the arm and by
+`collectANoteIdentRename` alike.
+
+**And the resume is ARMED, not inferred — the first candidate was wrong and the fixtures said
+so.** Only `emit_mono.vl`'s arena writes are enumerated; between the pass table's two
+`collectA` rows sit `dispatchRewrite`, `captureBoxRewrite`, the three annotation syntheses and
+`scanArrLitCommit`, which edit nodes in place and write `arrLitCommitName` — a table the walk
+READS. A version that resumed whenever the registry lengths held moved two of the 2,975
+`tests/cases` modules: `arrays/array-new-ref-fill-inferred.vl` went from building to
+`emitProgram: __array_new__ fill type not yet supported natively`, and
+`generics/type-param-shadows-alias-through-constructors.vl` emitted different bytes. So
+`monoRebuild` arms the resume around its own call and nothing else does, and only an armed run
+banks a prefix — which is why `collectA` and `collectA#2` still re-mint whole.
+
+**Measured on 964b5050b**, `--names` seed both arms, `genPins(N, true)`:
+
+| | 200 pins | 400 pins | 800 pins |
+| --- | ---: | ---: | ---: |
+| master, many arm (min of 3) | 0.28 s | 0.86 s | 3.57 s |
+| after | **0.17 s** | **0.41 s** | **1.18 s** |
+| ratio | 0.61× | 0.48× | **0.33×** |
+
+At 800 pins the guest sample count falls 3,528 → 1,839 and `collectA` goes **63.78% inclusive
+→ 1.96%**; `monoRebuild` as a whole goes 71.4% (the post-#2599 reading) → **21.37%**. The
+`generic pins` axis reads 0.95–0.99 idle against master's 2.06–2.27, and 0.95–1.34 at box load
+68–101 against master's 3.61–3.69, so its bar comes off the super-linear ladder: **6.0 → 2.5**.
+Re-measured on the merged base 8afdffb2 (which carries #2602's `monoModuleLetOf` index, the
+other big term of the same arm) the pair reads **0.94 – 0.99 against master's 2.16 – 2.39**,
+and 8 of 8 green at the new bar with a fanned-out `gate.sh` beside it.
+
+What is left inside `monoRebuild` is `buildFnMap` at **18.71% of the whole compile** (87.5% of
+`monoRebuild`), with `retAnnKindChain` 38.3% of it, `retVoidAnnFlag` 16.5% and
+`refArrElemNameIf` 12.5% — the same per-instance whole-program pass one row over, and it does
+not have `collectA`'s prefix shape: it rebuilds a per-function return-kind table. Outside it,
+`monoModuleLetOf` is 14.14% self and `recordRedundantAnnot` 7.01%. `collectA`'s own residue is
+0.76%, and all of it is the field-table phase this design deliberately re-runs.
+
+
 ---
 
 ## C · The host and the LSP

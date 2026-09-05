@@ -11,15 +11,16 @@
 // same work over N entities, the "one" arm over N/K. Method and profiles:
 // docs/internals/profiling-the-compiler.md.
 
-// FOUR AXES ARE SUPER-LINEAR TODAY and carry a bar above their measured ratio rather
+// THREE AXES ARE SUPER-LINEAR TODAY and carry a bar above their measured ratio rather
 // than the default. That is recorded DEBT, not tolerance: each names the function that
-// makes it so. Three of the four are a name-keyed registry answering a lookup by linear
-// scan — the track `__str_eq__` has topped the self-compile profile since #2419 closed
-// the arena scans. `generic pins` is not one of them, and reading it as one cost a
-// campaign: it is a whole-program PASS re-run once per minted instance, the #2419 shape
-// one phase over. Lower a bar when the thing it names stops multiplying. The fourth,
-// `unions`, joined the list when a constant term left BOTH its arms, which is worth
-// keeping in mind before reading any ratio here as a property of its own axis.
+// makes it so. All three are a name-keyed registry answering a lookup by linear scan —
+// the track `__str_eq__` has topped the self-compile profile since #2419 closed the arena
+// scans. `generic pins` used to be a fourth, and reading it as one of these cost a
+// campaign: it was a whole-program PASS re-run once per minted instance, the #2419 shape
+// one phase over, and it left the list when that pass learned to resume. Lower a bar when
+// the thing it names stops multiplying. `unions` joined the list when a constant term left
+// BOTH its arms, which is worth keeping in mind before reading any ratio here as a
+// property of its own axis.
 
 import { ROOT, VL, exists } from "./support/tree.ts";
 
@@ -311,10 +312,12 @@ axis("call sites", 2.5, "Callee resolution is scaling with the number of callees
 // roughly double this ratio and still be caught. Each function carries 30 statements so
 // the linear half is not startup-dominated; shrink that once those two stop scanning.
 // The super-linear axes' bars carry ~2x headroom over the IDLE ratio (modules 2.58,
-// closures 2.22): a ratio is load-tolerant but not load-proof — generic pins read 6.16
-// against a bar of 6 inside a fanned-out gate at load 92, a comment-only PR, and 10.5
-// against a bar of 9 in another, which is why that one's headroom is wider still.
-// A doubling of the class (a new scan per pin) still clears every bar.
+// closures 2.22): a ratio is load-tolerant but not load-proof, and the pairs that move
+// most with load are the ones whose cheap arm clamps on `FLOOR` while the dear arm does
+// not — the quotient is then an absolute budget on the dear arm. That is why a
+// super-linear bar sits above its measurement rather than at it, and why an axis whose
+// two arms cost the same can take the family default.
+// A doubling of the class (a new scan per entity) still clears every bar.
 axis("modules", 5.0, "The module merge is scaling with the file count.", (d) => [
   writeModules(`${d}/many`, 400, 2, 30),
   writeModules(`${d}/one`, 200, 4, 30),
@@ -343,11 +346,15 @@ axis(
   (d) => twoFiles(d, genCallbacks(300, 1), genCallbacks(300, 20)),
 );
 
-// Still super-linear in the pin count, and the one arm sits near `FLOOR`, so the quotient is
-// close to an absolute budget on the many arm and moves with box load. What is left is
-// `collectA` (compiler/emit_collect.vl), which `monoRebuild` re-mints once per minted
-// instance and which is 62.6% of the many arm. Profiles and A/B: CHANGELOG.md, 2026-09-05.
-axis("generic pins", 6.0, "`monoRebuild` re-runs a whole-program pass per minted instance.", (d) =>
+// 0.94 – 0.99 idle against master's 2.16 – 2.39, and 0.71 – 1.59 over fourteen more rounds at
+// box load 33 to 101 against master's 3.61 – 3.69. With `collectA` resuming on the arena
+// prefix the many arm costs what the one arm costs, so the pair stopped moving with load —
+// both sides clamp on the same floor. The bar comes off the super-linear ladder to the family
+// default, 2.5: 1.6x the worst of nineteen rounds, 8 of 8 green with a fanned-out gate beside
+// it, and master red at any load. Still super-linear in N (200/400/800 reads 0.17/0.41/1.18 s
+// where master reads 0.28/0.86/3.57), so a bigger pair needs its own bar. What is left at 800
+// pins is `buildFnMap`, 18.7% inclusive — the same per-instance pass one row over.
+axis("generic pins", 2.5, "`monoRebuild` re-runs a whole-program pass per minted instance.", (d) =>
   twoFiles(d, genPins(400, true), genPins(400, false)));
 
 // ── the one RUNTIME axis ─────────────────────────────────────────────────────
