@@ -41,6 +41,7 @@ type Row = {
   src: string;
   frag: string; // a fragment of the message this row is about
   sev?: string; // the tier it is raised at; "error" when omitted
+  first?: boolean; // this diagnostic must be the FIRST error the report prints
   line: number; // 1-based
   col: number; // 1-based, inclusive
   endCol: number; // 1-based, EXCLUSIVE
@@ -154,15 +155,17 @@ const GRID: Row[] = [
     underlines: "i32",
   },
   {
-    // `function g(x: i32) {` — `g` at 10. The message names the FUNCTION, so it
-    // anchors at the declaration, not at the body's brace.
-    name: "declaration: an uninferable return names the function",
+    // THE ONE RAISE EXEMPT FROM THE NODE-SPAN RULE, and `cascade` below is why: this is
+    // a whole-body VERDICT, usually a consequence of an error inside that body, and the
+    // report is position-ordered — at the function's name it would print above its own
+    // cause. Anchored at the body's closing `}` on line 3, column 1.
+    name: "inferred return: the whole-body verdict anchors at the body's end",
     src: "function g(x: i32) {\n  return g(x)\n}\nprint(1)\n",
     frag: "cannot infer a return type for 'g'",
-    line: 1,
-    col: 10,
-    endCol: 11,
-    underlines: "g",
+    line: 3,
+    col: 1,
+    endCol: 2,
+    underlines: "}",
   },
   // ── exception 2: a member access's PROPERTY ───────────────────────────────
   {
@@ -255,6 +258,21 @@ const GRID: Row[] = [
     col: 10,
     endCol: 16,
     underlines: '"text"',
+  },
+  // A CONSEQUENCE IS NOT REPORTED ABOVE ITS CAUSE. `a & b` fails, so the inferred
+  // return has no basis — and both are reported. The report is position-ordered, so the
+  // row above is what keeps the verdict below the operator error that caused it: a span
+  // change must not reorder a file's diagnostics, and `first` is that pin.
+  {
+    // `  return a & b` — the `&` expression at 10..14.
+    name: "cascade: the body's error leads its own inferred-return verdict",
+    src: "function g(a: i32[], b: i32[]) {\n  return a & b\n}\nprint(1)\n",
+    frag: "operator '&' is not defined",
+    line: 2,
+    col: 10,
+    endCol: 15,
+    underlines: "a & b",
+    first: true,
   },
   // ── the three findings raised on the CHECKER side with `stage: "type"` ────
   // Not on `T.diags` at all — each is its own side table that `cli.vl` turns into a
@@ -350,6 +368,16 @@ Deno.test({
         }
         // The numbers and the text must agree: a wrong column that still parses
         // as a plausible span is caught here and nowhere else.
+        if (row.first) {
+          const errs = diags.filter((x) => x.severity === "error");
+          if (errs.length === 0 || !errs[0].message.includes(row.frag)) {
+            bad.push(
+              `${row.name}: "${row.frag}" must be the FIRST error, got ` +
+                `"${errs.length ? errs[0].message.slice(0, 48) : "(none)"}"`,
+            );
+            continue;
+          }
+        }
         const srcLine = row.src.split("\n")[row.line - 1] ?? "";
         const under = srcLine.slice(row.col - 1, row.endCol - 1);
         if (under !== row.underlines) {
