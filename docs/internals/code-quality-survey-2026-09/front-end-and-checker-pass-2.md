@@ -33,7 +33,7 @@ per result, a live set copied whole at every function — where the first pass's
 
 | # | finding | evidence | size | risk | proof a landing owes |
 | --- | --- | --- | --- | --- | --- |
-| 1 | `srcIsUnannotatedObjBinding` (`typecheck.vl:14593`) resolves a name by first arena match, so an unrelated earlier binding disables D938's soundness refusal (§2) | witness: `vl check` rc 1 → **rc 0 + invalid wasm** when a decoy moves above the const; decoy below it, refusal holds | S | low | the two-arm ablation flipping back to rc 1; `regress.py` 0 `runs → not-runs`; an inventory row and a `tests/cases` fixture |
+| 1 | `srcIsUnannotatedObjBinding` (`typecheck.vl:14593`) resolves a name by first arena match, so an unrelated earlier binding disables D938's soundness refusal (§2) | witness: `vl check` rc 1 → **rc 0 + invalid wasm** when a decoy moves above the const; decoy below it, refusal holds | S | low | the two-arm ablation flipping back to rc 1; `regress.py` 0 `runs → not-runs`; an inventory row and a `tests/cases` fixture — **landed** (D1609) |
 | 2 | `symRefAt` re-runs `symOccAt` plus a second full `symOccTok` scan per `k`, and the LSP calls it once per result (§3) | same file, cursor moved only: 252 refs 0.5 ms, 2,002 refs **22.9 ms**; 1-ref control 0.0 ms at every size | S | low | the ladder flat in the reference count; `lsp_crossfile_refs_wasm_test.ts`, `lsp_rename_wasm_test.ts`, `lsp_document_highlight_wasm_test.ts` |
 | 3 | `daSnapshot`/`daClear`/`daRestore` copy the whole live set at every function body; the set holds every module binding until pass 2 reaches it (§4) | **2.75% of a self-compile**; `daSnapshot` 91.4% reached from `checkFuncDeclNode`; same file reordered **1.82 s → 0.19 s** at N=8,000 F=800 | M | low | the order control at ratio ≤ 1.5; `regress.py`; `deno task test` + `--prove-fixpoint` (the seed changes) |
 | 4 | `recordRedundantAnnot`'s `=`-token scan runs to the end of the token stream after it has the answer (`typecheck.vl:6140`–`:6156`) (§5) | **0.64% self**, 100% of its samples reached from `checkLetDeclNode`; the loop body is guarded by `if eqTok < 0` and the loop condition is not | XS | low | byte-identical seed; profile A/B |
@@ -139,9 +139,16 @@ Size S. Risk low. Proof: the two-arm ablation flipping to rc 1 on both, `regress
 
 Four functions in the scope loop over `P.nodes` comparing a declaration's name field to a
 string: `cwBoundOnce` (`:13914`), `cwProgramHasWrite` (`:14135`), `cwWrites` (`:14171`)
-and `srcIsUnannotatedObjBinding` (`:14593`). None contains a scope test. Three of the four
-are the covariant-write analysis, which is whole-program by design and conservative where
-it is ambiguous; the fourth is §2.1. The census is cheap and worth keeping as a lint
+and `srcIsUnannotatedObjBinding` (`:14593`). None contains a scope test. The fourth is §2.1.
+The other three are the covariant-write analysis, and "whole-program by design and conservative
+where it is ambiguous" is only half true — graded one decoy per site, `cwBoundOnce` loses D852's
+refusal to a second binding of the container's name anywhere in the program (D1610,
+check-clean invalid wasm), and `cwWrites` raises D793's refusal on a program whose list nothing
+writes through, because a `push` in another function shares the name (D1611, a running program
+refused). `cwProgramHasWrite` compares an intrinsic's literal name and resolves no binding. The
+two live ones are one mechanism, and one scope-keyed alias analysis closes them together; the
+cheap direction flip is refused by D852's own fixture header, which records that a
+field-name-only key reddened a running program. The census is cheap and worth keeping as a lint
 candidate: *a name compared against a declaration field inside an arena loop, in a function
 that never touches `T.scopes`.*
 
