@@ -8,7 +8,7 @@
 // It is presentation only. `vl check --severity info` is unchanged, because the
 // ratchet scripts read the CLI and its output is graded byte-for-byte elsewhere.
 
-import { readFileSync, statSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import type { VLDiagnostic } from "../../compiler/diagnostics.ts";
 
@@ -75,15 +75,18 @@ export const RATCHET_CODES: ReadonlyMap<string, RatchetScope> = new Map([
   }],
 ]);
 
-/** One workspace's loaded baselines, plus the stamp they were read at. */
+/** One workspace's loaded baselines, plus the text they were parsed from. */
 type Loaded = {
   /** `<workspace-relative file>` → `<code>` → count. */
   readonly counts: Map<string, Map<string, number>>;
   /** The codes whose baseline file was present and parsed. */
   readonly present: Set<string>;
-  /** `mtimeMs:size` per baseline file, joined — the freshness key. */
-  readonly stamp: string;
+  /** Each baseline file's exact text, `undefined` for one that was absent. */
+  readonly texts: BaselineTexts;
 };
+
+/** `<workspace-relative baseline path>` → its text, `undefined` when absent. */
+type BaselineTexts = Map<string, string | undefined>;
 
 const cache = new Map<string, Loaded>();
 
@@ -102,32 +105,52 @@ const baselineFiles = (): string[] =>
   [...new Set([...RATCHET_CODES.values()].map((s) => s.baseline))].sort();
 
 /**
- * `mtimeMs:size` for every baseline file. A file that is absent contributes `-`, so
- * one appearing or disappearing moves the stamp too.
+ * Every baseline file's text. `undefined` for one that is absent, so a file appearing or
+ * disappearing moves the answer too.
+ *
+ * THE CONTENT IS THE FRESHNESS KEY, not `mtimeMs:size`. `--write-baseline` typically
+ * rewrites one digit, which leaves the size unchanged — so a stat-based key moves only
+ * if the two writes land in different milliseconds, and under a saturated machine they
+ * do not. The cache then keeps answering with the previous baseline, which is a wrong
+ * answer that depends on how busy the box is. The five files are a few KB in total, so
+ * reading them per publish costs less than the stats it replaces.
  */
-const stampOf = (root: string): string =>
-  baselineFiles().map((rel) => {
+const readTexts = (root: string): BaselineTexts => {
+  const out: BaselineTexts = new Map();
+  for (const rel of baselineFiles()) {
     try {
-      const st = statSync(join(root, rel));
-      return `${rel}=${st.mtimeMs}:${st.size}`;
+      out.set(rel, readFileSync(join(root, rel), "utf8"));
     } catch {
-      return `${rel}=-`;
+      out.set(rel, undefined);
     }
-  }).join("|");
+  }
+  return out;
+};
+
+/** Whether two reads saw the same bytes in every baseline file. */
+const sameTexts = (a: BaselineTexts, b: BaselineTexts): boolean => {
+  if (a.size !== b.size) return false;
+  for (const [rel, text] of a) {
+    if (!b.has(rel) || b.get(rel) !== text) return false;
+  }
+  return true;
+};
 
 /**
- * Read the five baselines under `root`. A file that is absent or unparseable leaves
+ * Parse the five baselines out of `texts`. A file that is absent or unparseable leaves
  * its codes OUT of `present`, which means "not ratcheted here" — the diagnostics then
  * publish exactly as they did before this module existed, which is what a workspace
  * that is not this repo should see.
  */
-const load = (root: string): Loaded => {
+const load = (texts: BaselineTexts): Loaded => {
   const counts = new Map<string, Map<string, number>>();
   const present = new Set<string>();
   for (const [code, scope] of RATCHET_CODES) {
+    const raw = texts.get(scope.baseline);
+    if (raw === undefined) continue;
     let parsed: { files?: Record<string, Record<string, number>> };
     try {
-      parsed = JSON.parse(readFileSync(join(root, scope.baseline), "utf8"));
+      parsed = JSON.parse(raw);
     } catch {
       continue;
     }
@@ -144,13 +167,14 @@ const load = (root: string): Loaded => {
       row.set(code, n);
     }
   }
-  return { counts, present, stamp: stampOf(root) };
+  return { counts, present, texts };
 };
 
 const baselines = (root: string): Loaded => {
+  const texts = readTexts(root);
   const hit = cache.get(root);
-  if (hit !== undefined && hit.stamp === stampOf(root)) return hit;
-  const fresh = load(root);
+  if (hit !== undefined && sameTexts(hit.texts, texts)) return hit;
+  const fresh = load(texts);
   cache.set(root, fresh);
   return fresh;
 };
