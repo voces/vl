@@ -337,6 +337,43 @@ def p_block_bare_capture(t, face):
     return _in_block(t, face, "bare", True)
 
 
+# --- FUNCTION frames -------------------------------------------------------
+#
+# THE SCOPE NEITHER THE BLOCKS NOR THE DELIVERIES HAVE. `closure_capture` binds at module
+# scope; `argument` binds inside a frame but from a PARAMETER; the two RETURN positions put
+# SETUP inside a frame and the binding back outside it. So no position had the SETUP, the
+# delivery and the capture in ONE function body. D1633 lives exactly there: a frame's own
+# `let` is in neither the emit-time declared-locals table nor the globals registry, so a
+# classifier asking about it from another frame declines, and the identical program at
+# module scope runs. Capture/plain split for the block positions' reason.
+
+def _in_fn(t, face, capture):
+    """The SETUP, the delivery and the proof all inside one function body."""
+    if capture:
+        held = [t.bind("__c", t.value, face),
+                "const __f = () => {", ind("const v = __c\n" + t.proof, 2), "}", "__f()"]
+    else:
+        held = [t.bind("v", t.value, face), t.proof]
+    inner = [t.setup] if t.setup else []
+    if t.guard:
+        inner += ["if %s {" % t.guard, ind("\n".join(held), 2), "}"]
+    else:
+        inner += held
+    decls = ["function __frame() {", ind("\n".join(inner), 2), "}"]
+    out = ([t.prelude] if t.prelude else []) + decls + ["__frame()"]
+    return "\n".join(out) + "\n"
+
+
+@position("fn_body", "the binding inside the function")
+def p_fn_body(t, face):
+    return _in_fn(t, face, False)
+
+
+@position("fn_body_capture", "the captured binding inside the function")
+def p_fn_body_capture(t, face):
+    return _in_fn(t, face, True)
+
+
 # --- discrimination shapes -------------------------------------------------
 
 def _disc(t, face, shape):

@@ -2374,6 +2374,10 @@ export function exprNullableStruct(exprIx: i32, fnIx: i32) {
     // else `p != null` reads as struct equality. The struct index resolves through
     // `capturedStructIndex`.
     if capturedKindOf(fnIx, e.identName) == "nulstruct" { return true }
+    // The frame's own `let`, last for the reason the map arms take it last: every resolver
+    // above speaks for a storage class this one does not.
+    const fns = frameLetOf(fnIx, e.identName)
+    if fns >= 0 && letIsNulRef(fns, fnIx) { return true }
     return globalIsNulRefSid(fnIx, sidOfNode(exprIx))
   }
   // A nested-struct field read (code 15) is stored `(ref null $S)`: an `S | null` field
@@ -23741,7 +23745,17 @@ export function structIndexOfExpr(exprIx: i32, fnIx: i32) {
     if di >= 0 { return di }
     const gi = globalStructIndexSid(fnIx, sidOfNode(exprIx))
     if gi >= 0 { return gi }
-    return capturedStructIndex(fnIx, e.identName)
+    const ci = capturedStructIndex(fnIx, e.identName)
+    if ci >= 0 { return ci }
+    // The frame's own `let`, arm for arm with `exprNullableStruct`'s leg: a kind without its
+    // row is `ref valtype with no interned shape`, so the two land together (D21). Gated on
+    // the variant the way every other index resolver here is: an arm's values live at
+    // `uVarHeap`, so answering a struct row for one reaches a receiver that is not one.
+    const fli = frameLetOf(fnIx, e.identName)
+    if fli >= 0 && !letIsVariant(fli, fnIx) {
+      return structIndexOfLet(fli, fnIx)
+    }
+    -1
   }
   // `xs[i]` over a struct-element ref list yields that list's element struct. The
   // element struct table index comes from the receiver's per-element-type slot's name
@@ -29266,6 +29280,18 @@ export function exprNullableMap(exprIx: i32, fnIx: i32) {
   false
 }
 
+// The `LetDecl` binding `name` in frame `fnIx`, or -1 — the function-frame twin of
+// `globalLetOfIn`, asked only where the emit-time declared-locals table cannot speak. That
+// table holds the frame being emitted, so `fnIx == emitCurFnIx` already had its answer; the
+// env struct is typed in the type section, with no frame current at all (D1633).
+export function frameLetOf(fnIx: i32, name: string) {
+  if fnIx < 0 { return -1 }
+  if fnIx == emitCurFnIx { return -1 }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl { return parentLetOf(fn.fnBody, name) }
+  -1
+}
+
 // True if evaluating the expression at `exprIx` yields a string-keyed map: the
 // `Map()` constructor call, a map param/local reference, or a parenthesized map
 // expression.
@@ -29307,6 +29333,10 @@ export function exprMap(exprIx: i32, fnIx: i32) {
     // A captured map variable of a lifted lambda: classify it exactly as a param/local
     // receiver would, so it takes the map-arm boxing in a union-boxed result.
     if capturedKindOf(fnIx, e.identName) == "map" { return true }
+    // Last, after every resolver that can speak sooner: the frame's own `let`, read from the
+    // arena rather than the declared-locals table, so a cross-frame question answers.
+    const fmm = frameLetOf(fnIx, e.identName)
+    if fmm >= 0 && letIsMap(fmm, fnIx) { return true }
     // A nullable map binding is a map ref in the narrowed (`!= null`) branch — the checker
     // proved the map op guarded, and the receiver recovers non-null at the map-op site.
     return exprNullableMap(exprIx, fnIx)
@@ -29863,6 +29893,13 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
     // storage class the local/param resolvers can't reach (the binding lives in another frame).
     if capturedKindOf(fnIx, e.identName) == "nulmap" {
       return capturedNulMapShape(fnIx, e.identName)
+    }
+    // The frame's own `let`, arm for arm with the module-frame leg below it — a kind
+    // without its shape is a different reject, so the two land together.
+    const fms = frameLetOf(fnIx, e.identName)
+    if fms >= 0 {
+      if letIsMap(fms, fnIx) { return letMapShapeOf(fms, fnIx) }
+      if letIsNulMap(fms, fnIx) { return nulMapShapeOf(fms, fnIx) }
     }
     const gl = globalLetOfIn(fnIx, e.identName)
     if gl >= 0 {
