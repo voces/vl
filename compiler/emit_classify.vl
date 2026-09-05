@@ -16022,11 +16022,72 @@ function shapeElemDeclaredStructIdx(base: string) {
   si
 }
 
+// ── the ref-array ladder's per-call memo ─────────────────────────────────────
+// `nameIsRefArray` reaches itself twice per array level: `refArrShapeKind`'s nested-ref
+// arm asks it of `refArrElemName(name)`, which asked it of that same element already, so
+// one outermost call re-derives every level about 2^depth times where depth+1 would do.
+let rsmDepth = 0
+let rsmN = 0
+const rsmName: string[] = []
+const rsmRef: i32[] = []
+
+// This call's recorded answer for `name` — 1 yes, 0 no, -1 not asked yet. One outermost
+// call asks about the suffix-strips of a single spelling, so `rsmN` is a handful and the
+// scan is a length test per row.
+function rsmRefOf(name: string): i32 {
+  let i = 0
+  while i < rsmN {
+    if rsmName[i] == name { return rsmRef[i] }
+    i = i + 1
+  }
+  -1
+}
+
+// Record `v` as this call's answer for `name`, appending a row when the name is new.
+// Rows are reused across calls by resetting `rsmN` rather than the arrays, so the steady
+// state allocates nothing.
+function rsmPutRef(name: string, v: i32) {
+  let i = 0
+  while i < rsmN {
+    if rsmName[i] == name {
+      rsmRef[i] = v
+      return 0
+    }
+    i = i + 1
+  }
+  if rsmN < rsmName.length {
+    rsmName[rsmN] = name
+    rsmRef[rsmN] = v
+  } else {
+    rsmName.push(name)
+    rsmRef.push(v)
+  }
+  rsmN = rsmN + 1
+  0
+}
+
 // True if the array type-name `name` is a REF-element list — `S[]` over a declared
 // struct, `N[]` over the declared union alias (the box-ref element), or `{[string]:i32}[]`
 // (a map-struct element). Lowers to the `{ backing: (ref $raTypeIdx), len, cap }` wrapper
 // over a `(ref null $elem)` backing (G7-ref). A non-`[]` name or an `i32[]` is not a ref array.
 export function nameIsRefArray(name: string) {
+  // The memo lives for exactly one outermost call, which is what makes it sound with no
+  // generation stamp: no writer of `sNames`, `unNames` or `uVariants` is reachable from
+  // the ladder, so nothing it reads can move while a call is on the stack.
+  if rsmDepth == 0 { rsmN = 0 }
+  const memo = rsmRefOf(name)
+  if memo >= 0 { return memo == 1 }
+  rsmDepth = rsmDepth + 1
+  let v = 0
+  if nameIsRefArrayGo(name) { v = 1 }
+  rsmDepth = rsmDepth - 1
+  rsmPutRef(name, v)
+  v == 1
+}
+
+// The ladder itself, behind the memo above: every arm of "is this name a ref-element
+// list", in the order a cheaper refutation comes first.
+function nameIsRefArrayGo(name: string) {
   // A top-level arrow is a function type (`(i32) => S[]`), never a ref array, even though
   // it ends in `[]` — guarded first so a closure-returning-array is classified as the
   // closure fat-pointer. (The nested-arrow array-of-closures case reaches `nameIsClosureArray` below.)
