@@ -26,6 +26,42 @@ Notes, each of which cost something to learn:
 * **`VL_STD=<worktree>/std`** on every worktree probe — the host resolves `std:` from the
   BINARY's checkout, which is the main repo's.
 
+## The instruments under `scripts/perf/`
+
+One line per file, taken from its own header, plus the PR it names (blank where the header
+names none). Re-derive rather than trust this table going stale: every file's header is the
+source of truth, this is a copy of it.
+
+| file | what it measures | cites |
+| --- | --- | --- |
+| `check-scaling.sh` | Is `vl check` linear in file length across four doubling sizes; reads the ratio (2 = linear, 4 = quadratic). | |
+| `ci-history.sh` | The `ci-native` job's real duration on GitHub's runners per master push, with a per-step breakdown for the newest run. | |
+| `ci-native-time.sh` | Times the `ci-native` job exactly as `ci.yml` runs it, reporting CPU beside wall since the box is shared. | |
+| `ci-steps.sh` | Per-step seconds of a given `ci-native` job id (from `ci-trend.sh`), so growth attributes to the step that grew. | |
+| `ci-trend.sh` | The `ci-native` job's duration sampled one week apart, so "it used to be less" is a number rather than a memory. | |
+| `corpus-growth.sh` | What grew — corpus cases, ci-native test files, `Deno.test` count, compiler lines — sampled weekly off master. | |
+| `count-vl-spawns.sh` | Exact count + argv of every `vl` subprocess a ci-native step launches. | |
+| `deep-is-second-pass.sh` | What the deep-`is` second pass costs: A/B the same file with and without one deep `is`. | #2406 |
+| `deno-test-overhead.sh` | The fixed cost of a `Deno.test` case, and of a `deno test` process. | |
+| `guest-profile.sh` | Guest-profiles a compile and ranks by SELF time, building the `--names` seed once and reusing it. | |
+| `host-load-costs.sh` | What each host pays to get the seed executable, and the deep-`is` gate's own witness. | |
+| `lsp-keystroke.ts` | One LSP keystroke in two views (RAW push vs CHECKER incremental); read the ratios, not the wall times. | |
+| `module-graph-check.sh` | The cost of ONE module-graph check — what the LSP pays per keystroke (`check` then `lint`). | |
+| `oracle-abi-probe.ts` | Where the corpus oracle's seconds go, split by cost centre (intake, `checkSrc`, `lintSrc`, `compileSrc`, read-back, V8 run). | |
+| `oracle-shard-spike.sh` | Spikes sharding the corpus oracle's one test file across concurrent processes, to size what splitting it would buy. | |
+| `parallel-jit-storm.sh` | Whether the ci-native step pays N concurrent seed JITs at its start. | |
+| `parent-let-cache-probe.py` | How well `parentLetOf`'s single-entry block cache serves a self-compile, against an LRU ring or an unbounded cache. | |
+| `per-file-time.sh` | Per-FILE cost of the ci-native suites, one `deno test` process at a time (serial, so contention doesn't inflate it). | |
+| `per-program-cost.sh` | Per-PROGRAM cost of the compiler in lines and host phases, across three sizes and three std footprints. | |
+| `per-test-rank.py` | Ranks a `deno test` log by per-test and per-file duration. | |
+| `profile-parents.py` | Ranks the immediate PARENT frame of every sample whose leaf is a given function, to find whose loop it is. | |
+| `profile-phases.py` | Attributes a `VL_PROFILE_GUEST` profile to the module pipeline's PHASES rather than its functions. | |
+| `seed-jit-cost.sh` | COLD vs WARM: what a `vl` process pays to get the seed executable (Cranelift JIT vs `.cwasm` deserialize). | |
+| `seed-sections.sh` | Section sizes of the seed, and its growth over the last N days of master. | |
+| `string-build-bench.sh` | What `s = s + piece` in a loop costs today against std's code-point builder; doubling N reads the complexity class. | |
+| `string-concat-sites.py` | Counts the two O(n²) string-concatenation shapes in `compiler/*.vl` + `std/*.vl`. | |
+| `vl-fixed-cost.sh` | The FIXED cost of one `vl` process: argv-only, a warm `.cwasm` deserialize, and a cold JIT of the seed. | |
+
 ## Measured 2026-09-02 (#2419)
 
 Self-compile before the memo, 28,755 guest samples: `moduleHasUnionAs` 29.8% self time and
