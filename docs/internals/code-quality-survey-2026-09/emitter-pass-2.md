@@ -206,6 +206,16 @@ because at the SHIPPED 800 the term is only **8.24–10.20%** inclusive and the 
 inclusive** at 3,200) — the same per-arm scan of the top-level statements, one function over
 and looking for the `TypeDecl` rather than for its name.
 
+Three more followed, one commit each, each profiled first and each proved by byte identity
+against the commit before it. At 3,200 unions: `collectVariantFields` **23.63 → 0.19%**
+(the set becomes a NODE index, so one index answers both questions and the set is retired),
+`unionRowOf` **12.87 → 0.07%** (`unRowByMemberSid`, the `unRowBySid` twin for the member-set
+column, with `unMemberSetPush` made its only writer), `objVariantName` **22.46 → 0.21%**
+(buckets keyed on `variantSig`, which both variant-field paths already order canonically).
+The axis reads a median **1.14** against **1.46**, the bar stays at **3.5**, and its note now
+names `assignTags` — **16.10% inclusive**, an all-pairs signature RANK rather than a scan, so
+the next term on this axis is not another index.
+
 ---
 
 ## 3 · The four axes, profiled
