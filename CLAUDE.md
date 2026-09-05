@@ -395,10 +395,11 @@ the fall was a genuine merge (#2465): a check that is a strict subset of the rig
 result indistinguishable from the right one's, so say what was compared. And a ratchet's FALL
 is not self-explaining: "it went down" and "it went down because #2465 added the arm" are
 different confidence levels, and only the second rules out a detector that stopped seeing
-something — `--why` names the entries that left since the baseline's commit, and all four
+something — `--why` names the entries that left since the baseline's commit, and all five
 per-file ratchets now carry it (`comment-budget`, `ladder-budget`, `sentinel-budget`,
-`scan-budget`, sharing one `scripts/ratchet.py`; `seed-size` is a scalar and has no entries
-to name). A baseline recording no `commit` falls back to the commit that last CHANGED it.
+`scan-budget`, `export-budget`, sharing one `scripts/ratchet.py`; `seed-size` is a scalar and
+has no entries to name). A baseline recording no `commit` falls back to the commit that last
+CHANGED it.
 
 `vl fmt -w` takes **one path per run**; a multi-path call fails and formats nothing.
 
