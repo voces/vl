@@ -85,7 +85,9 @@ import {
   keywordCompletions,
   type LspRange,
   memberCompletionsFromWasm,
+  nestedDocumentSymbols,
   organizeImportEdits,
+  type OutlineNode,
   type OutlineSymbolKind,
   refCountLensTitle,
   scopeCompletionsFromBindings,
@@ -574,14 +576,15 @@ connection.onDocumentHighlight(
   },
 );
 
-// Document symbols (D9.3): the FLAT outline — Outline view, breadcrumbs,
-// Ctrl+Shift+O. Functions + module-level `let`/`const` come from the checker's
-// decl-flagged identifier tokens (`tokensAt`), `type` aliases from the host
-// line scan, the exported flag from `moduleSurface` — all assembled by
-// `flatDocumentSymbols`. Flat is the shipped grade: nesting needs a
-// declaration-body-extent export the seed doesn't have (survey §6/§7), so
-// `range` and `selectionRange` are both the NAME span rather than a guessed
-// body. No checker → null.
+// Document symbols (D9.3): the NESTED outline — Outline view, breadcrumbs,
+// Ctrl+Shift+O, and the model VS Code's sticky scroll reads by default
+// (`editor.stickyScroll.defaultModel` = `outlineModel`). Built from the seed's
+// declaration extents, so `range` is the whole declaration and `selectionRange`
+// the name; a declaration nested in another is its CHILD.
+//
+// The flat form below it is the degraded path, not a second grade: a seed without
+// the extent export reports no extents, and the outline falls back to name-span
+// entries off `tokensAt` rather than disappearing. No checker → null.
 const outlineKindMap: Record<OutlineSymbolKind, SymbolKind> = {
   function: SymbolKind.Function,
   variable: SymbolKind.Variable,
@@ -590,6 +593,19 @@ const outlineKindMap: Record<OutlineSymbolKind, SymbolKind> = {
   // completion's `type` items.
   type: SymbolKind.Struct,
 };
+const outlineNodeToSymbol = (n: OutlineNode): DocumentSymbol => {
+  const sym: DocumentSymbol = {
+    name: n.name,
+    kind: outlineKindMap[n.kind],
+    range: n.range,
+    selectionRange: n.selection,
+  };
+  if (n.exported) sym.detail = "export";
+  if (n.children.length > 0) {
+    sym.children = n.children.map(outlineNodeToSymbol);
+  }
+  return sym;
+};
 connection.onDocumentSymbol(
   async (params): Promise<DocumentSymbol[] | null> => {
     const doc = documents.get(params.textDocument.uri);
@@ -597,15 +613,23 @@ connection.onDocumentSymbol(
     if (wasmChecker?.tokensAt === undefined) return null;
     const text = doc.getText();
     const entryKey = entryKeyOf(params.textDocument.uri);
+    const exportedNames = new Set(
+      wasmChecker.moduleSurface(text, entryKey).exports.map((e) => e.name),
+    );
+    // No extents means either an older seed or a file with no declarations at
+    // all, and the two want the same answer — the flat path produces nothing for
+    // the second either, so the ambiguity costs nothing.
+    const extents = wasmChecker.declExtentsAt(text);
+    if (extents.length > 0) {
+      return nestedDocumentSymbols(extents, exportedNames)
+        .map(outlineNodeToSymbol);
+    }
     const idents = await wasmChecker
       .tokensAt(text, entryKey, workspaceReader)
       .catch((err) => {
         connection.console.log(`[wasm-symbols] tokensAt failed: ${err}`);
         return [] as WasmToken[];
       });
-    const exportedNames = new Set(
-      wasmChecker.moduleSurface(text, entryKey).exports.map((e) => e.name),
-    );
     return flatDocumentSymbols(idents, text, exportedNames).map((s) => {
       const range = {
         start: { line: s.line, character: s.char },
@@ -626,12 +650,14 @@ connection.onDocumentSymbol(
 // Folding ranges (D9.9): bracketed blocks, multi-line paren/bracket groups,
 // `//` comment runs and the leading import block — computed by `foldingRanges`
 // over the shared host tokenizer, so a brace inside a string or a comment never
-// opens a region.
+// opens a region — plus one region per declaration and block from the seed's
+// extents, which start at the HEADER line rather than at the brace.
 //
-// THE ONE HANDLER THAT WORKS WITH NO SEED. Folding is lexical end to end (the
-// survey's "syntactic: brace scan + comment spans"), so it neither reads
-// `wasmChecker` nor awaits anything — an editor with a missing or broken seed
-// still folds. Every other handler above returns null in that state.
+// STILL THE ONE HANDLER THAT WORKS WITH NO SEED. The extents are an argument, not
+// a requirement: with none the lexical scan alone folds every brace, so an editor
+// with a missing or broken seed keeps folding while every other handler above
+// returns null. That is also what `editor.stickyScroll.defaultModel` =
+// `foldingProviderModel` reads, which is how an `if` or a `for` gets to stick.
 const foldingKindMap: Record<VlFoldingKind, FoldingRangeKind> = {
   comment: FoldingRangeKind.Comment,
   imports: FoldingRangeKind.Imports,
@@ -639,7 +665,12 @@ const foldingKindMap: Record<VlFoldingKind, FoldingRangeKind> = {
 connection.onFoldingRanges((params): FoldingRange[] | null => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return null;
-  return foldingRanges(doc.getText()).map((r) => {
+  const text = doc.getText();
+  const extents = (wasmChecker?.declExtentsAt(text) ?? []).map((e) => ({
+    headerLine: e.header.line,
+    endLine: e.range.end.line,
+  }));
+  return foldingRanges(text, extents).map((r) => {
     const range: FoldingRange = { startLine: r.startLine, endLine: r.endLine };
     if (r.kind !== undefined) range.kind = foldingKindMap[r.kind];
     return range;

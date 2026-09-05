@@ -22,6 +22,7 @@
 // shapes.
 
 import type { BindingKind, Position } from "../../compiler/coreTypes.ts";
+import type { WasmExtent } from "./wasmChecker.ts";
 
 // ---- semantic tokens (D5) ---------------------------------------------------
 
@@ -645,6 +646,98 @@ export const flatDocumentSymbols = (
   }
   out.sort((a, b) => a.line - b.line || a.char - b.char);
   return out;
+};
+
+// ---- document symbols: the NESTED outline ------------------------------------
+//
+// The same surface as `flatDocumentSymbols` above, built instead from the seed's
+// declaration extents (`WasmChecker.declExtentsAt`). Two things the flat form could
+// not have: `range` is the whole declaration rather than its name, which is what
+// makes VS Code's sticky scroll (`editor.stickyScroll.defaultModel` = `outlineModel`,
+// the default) pin a function header while you scroll its body; and a declaration
+// nested inside another is a CHILD, so breadcrumbs read `outer > inner`.
+//
+// Which extents are symbols: declarations only. A control-flow block is not one —
+// TypeScript's outline does not list `if` bodies either — and a lambda bound
+// straight to a `const`/`let` is not one either, because the binding already names
+// it. Every other lambda is, so a callback body long enough to scroll shows in the
+// breadcrumb trail. The blocks are still folded; see `folding.ts`.
+
+/** One outline entry with its children — `server.ts` maps to `DocumentSymbol`. */
+export type OutlineNode = {
+  name: string;
+  kind: OutlineSymbolKind;
+  exported: boolean;
+  /** The name (a lambda: its `(`) — a `DocumentSymbol`'s `selectionRange`. */
+  selection: LspRange;
+  /** The whole declaration — a `DocumentSymbol`'s `range`. */
+  range: LspRange;
+  children: OutlineNode[];
+};
+
+/** The display name of a lambda that earns its own outline entry. */
+const LAMBDA_NAME = "(lambda)";
+
+// The outline kind an extent kind maps to, or undefined when the extent is not a
+// symbol at all (every block, and the lambda case `nestedDocumentSymbols` filters).
+const OUTLINE_OF_EXTENT: Partial<
+  Record<WasmExtent["kind"], OutlineSymbolKind>
+> = {
+  function: "function",
+  lambda: "function",
+  type: "type",
+  const: "constant",
+  let: "variable",
+};
+
+/**
+ * The nested outline for `extents` (in the pre-order `declExtentsAt` returns, so
+ * every parent precedes its children). `exportedNames` — `moduleSurface().exports`
+ * — sets the exported flag; an empty set leaves every flag false rather than
+ * dropping entries, exactly as the flat form degrades.
+ *
+ * An extent that is not a symbol contributes no node and its children re-parent to
+ * the nearest ancestor that is one, so a function declared inside an `if` body
+ * still lands under the enclosing function rather than at module level.
+ */
+export const nestedDocumentSymbols = (
+  extents: readonly WasmExtent[],
+  exportedNames: ReadonlySet<string>,
+): OutlineNode[] => {
+  const roots: OutlineNode[] = [];
+  // Native row index → the node it produced, or the nearest ancestor node.
+  const owner: (OutlineNode | undefined)[] = [];
+  for (const e of extents) {
+    const parent = e.parent >= 0 && e.parent < owner.length
+      ? owner[e.parent]
+      : undefined;
+    const kind = OUTLINE_OF_EXTENT[e.kind];
+    // A lambda whose binding is right there is the binding's value, not a second
+    // entry beside it: `const f = (x) => …` outlines as `f`, once.
+    const bound = e.kind === "lambda" &&
+      (parent?.kind === "constant" || parent?.kind === "variable");
+    if (kind === undefined || bound) {
+      owner.push(parent);
+      continue;
+    }
+    const name = e.name.length > 0 ? e.name : LAMBDA_NAME;
+    const width = e.name.length > 0 ? e.name.length : 1;
+    const node: OutlineNode = {
+      name,
+      kind,
+      exported: exportedNames.has(e.name),
+      selection: {
+        start: e.header,
+        end: { line: e.header.line, character: e.header.character + width },
+      },
+      range: e.range,
+      children: [],
+    };
+    owner.push(node);
+    if (parent === undefined) roots.push(node);
+    else parent.children.push(node);
+  }
+  return roots;
 };
 
 // ---- code lens: export reference counts (D9.4) -------------------------------

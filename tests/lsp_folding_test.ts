@@ -16,7 +16,11 @@
 //
 // Run: deno test -A --no-check tests/lsp_folding_test.ts
 
-import { foldingRanges, type VlFoldingRange } from "../lsp/src/folding.ts";
+import {
+  type FoldableExtent,
+  foldingRanges,
+  type VlFoldingRange,
+} from "../lsp/src/folding.ts";
 
 const eq = (got: unknown, want: unknown, what: string): void => {
   const g = JSON.stringify(got);
@@ -36,6 +40,18 @@ const compact = (
 
 const folds = (src: string): (number | string)[][] =>
   compact(foldingRanges(src));
+
+/** The same, with the seed's declaration/block extents supplied. */
+const foldsWith = (
+  src: string,
+  extents: readonly FoldableExtent[],
+): (number | string)[][] => compact(foldingRanges(src, extents));
+
+/** `[headerLine, closingBraceLine]` — the two lines an extent contributes. */
+const ext = (headerLine: number, endLine: number): FoldableExtent => ({
+  headerLine,
+  endLine,
+});
 
 // ---- bracketed blocks --------------------------------------------------------
 
@@ -339,6 +355,114 @@ Deno.test("folding: a CRLF comment token stops before the carriage return", () =
   // trivia, so a comment run on CRLF is still detected as own-line.
   const src = "// a\r\n// b\r\nlog(1)\r\n";
   eq(folds(src), [[0, 1, "comment"]], "the run survives CRLF");
+});
+
+// ---- declaration and block extents ------------------------------------------
+//
+// The seed's `declExtentsAt` reduced to two lines per construct. These are the
+// merge's own tests and so pass extents as data; the extents a real compiler
+// produces are graded seed-backed, in `lsp_document_symbols_wasm_test.ts`.
+
+Deno.test("folding(extents): a region starts at the HEADER line, not at the brace", () => {
+  const src = [
+    "function outer(", //  0
+    "  x: i32,", //        1
+    "): i32 {", //         2
+    "  body()", //         3
+    "}", //                4
+  ].join("\n");
+  // Lexically the body opens on line 2 and the parameter list on line 0.
+  eq(folds(src), [[0, 1], [2, 3]], "no extents: the brace lines");
+  eq(
+    foldsWith(src, [ext(0, 4)]),
+    [[0, 3], [2, 3]],
+    "the function folds from its name line",
+  );
+});
+
+Deno.test("folding(extents): an extent evicts the bracket region sharing its start", () => {
+  // VS Code keeps ONE region per start line, so a parameter-list region starting
+  // on the header line would swallow the whole function's.
+  const src = [
+    "function outer(", //  0
+    "  x: i32,", //        1
+    ") {", //              2
+    "  body()", //         3
+    "}", //                4
+  ].join("\n");
+  const got = foldsWith(src, [ext(0, 4)]);
+  if (got.some((r) => r[0] === 0 && r[1] === 1)) {
+    throw new Error(`the parameter region must not survive: ${JSON.stringify(got)}`);
+  }
+});
+
+Deno.test("folding(extents): a one-line construct folds nothing", () => {
+  const src = "function id(x: i32): i32 { x }";
+  eq(foldsWith(src, [ext(0, 0)]), [], "header and closer on one line");
+  // A two-line construct is a one-line body once its closer stays visible.
+  eq(foldsWith("if x {\n}", [ext(0, 1)]), [], "nothing between header and closer");
+});
+
+Deno.test("folding(extents): nested if / for blocks nest, outermost first", () => {
+  const src = [
+    "function f() {", //   0
+    "  if x {", //         1
+    "    for i in 0 to 2 {", // 2
+    "      g(i)", //       3
+    "    }", //            4
+    "  }", //              5
+    "}", //                6
+  ].join("\n");
+  eq(
+    foldsWith(src, [ext(0, 6), ext(1, 5), ext(2, 4)]),
+    [[0, 5], [1, 4], [2, 3]],
+    "three nested regions",
+  );
+});
+
+Deno.test("folding(extents): a match and its braced arm each fold", () => {
+  const src = [
+    "function f(n: i32) {", // 0
+    "  match n {", //          1
+    "    0 => {", //           2
+    "      g()", //            3
+    "    }", //                4
+    "    _ => h()", //         5
+    "  }", //                  6
+    "}", //                    7
+  ].join("\n");
+  eq(
+    foldsWith(src, [ext(0, 7), ext(1, 6), ext(2, 4)]),
+    [[0, 6], [1, 5], [2, 3]],
+    "function, match, arm",
+  );
+});
+
+Deno.test("folding(extents): the comment and import kinds are untouched", () => {
+  const src = [
+    "// one", //                  0
+    "// two", //                  1
+    'import { a } from "./a"', //  2
+    'import { b } from "./b"', //  3
+    "", //                        4
+    "function f() {", //          5
+    "  g()", //                   6
+    "}", //                       7
+  ].join("\n");
+  eq(
+    foldsWith(src, [ext(5, 7)]),
+    [[0, 1, "comment"], [2, 3, "imports"], [5, 6]],
+    "kinds survive the merge",
+  );
+});
+
+Deno.test("folding(extents): with no extents the lexical answer is unchanged", () => {
+  const src = [
+    "function f() {", // 0
+    "  g()", //          1
+    "}", //              2
+  ].join("\n");
+  eq(foldsWith(src, []), folds(src), "an empty extent list is the no-seed path");
 });
 
 // ---- language configuration --------------------------------------------------

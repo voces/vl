@@ -180,13 +180,72 @@ const importRange = (toks: readonly LexToken[]): VlFoldingRange | undefined => {
 };
 
 /**
+ * A construct's region as the seed's AST reports it: the HEADER line, not the line
+ * the brace happens to sit on. The two differ whenever a signature wraps —
+ * `function f(\n  a: i32,\n) {` opens its brace three lines below its name — and a
+ * region starting at the brace makes VS Code's folding-model sticky scroll pin `) {`
+ * instead of the function it belongs to.
+ *
+ * Same closing convention as a bracket region: the range ends one line ABOVE the
+ * closing brace, so collapsing leaves the `}` on screen.
+ */
+const extentRanges = (
+  extents: readonly FoldableExtent[],
+): VlFoldingRange[] => {
+  const out: VlFoldingRange[] = [];
+  for (const e of extents) {
+    const endLine = e.endLine - 1;
+    if (endLine > e.headerLine) {
+      out.push({ startLine: e.headerLine, endLine });
+    }
+  }
+  return out;
+};
+
+/**
+ * One construct the seed's `declExtentsAt` reported, reduced to the two lines
+ * folding needs: where its header starts and where its closing brace sits (both
+ * 0-based). `server.ts` maps `WasmExtent` onto this so folding depends on no seed
+ * type — it is still the one handler that answers with no seed at all.
+ */
+export type FoldableExtent = {
+  headerLine: number;
+  endLine: number;
+};
+
+/**
  * Every foldable region of `source`, sorted outermost-first by start line and
  * free of duplicate line pairs (a `({` opened and `})` closed on the same two
  * lines is one chevron, not two).
+ *
+ * `extents` is the seed's declaration and block walk, and is optional on purpose:
+ * with no seed loaded the lexical scan alone still folds every brace, which is why
+ * this handler keeps working when every other one goes silent.
+ *
+ * ONE REGION MAY START ON A LINE, and that is why an extent EVICTS the bracket
+ * regions sharing its start rather than joining them. VS Code keeps the first
+ * region it sees per start line and silently drops the rest, so a wrapped
+ * signature — `function f(` on one line, `) {` three lines down — would otherwise
+ * lose the whole function to its own parameter list. Extents are in pre-order, so
+ * the outermost construct claims a shared line first.
  */
-export const foldingRanges = (source: string): VlFoldingRange[] => {
+export const foldingRanges = (
+  source: string,
+  extents: readonly FoldableExtent[] = [],
+): VlFoldingRange[] => {
   const toks = tokenize(source, { comments: true });
-  const all = [...bracketRanges(toks), ...commentRanges(toks)];
+  const ast: VlFoldingRange[] = [];
+  const astStarts = new Set<number>();
+  for (const r of extentRanges(extents)) {
+    if (astStarts.has(r.startLine)) continue;
+    astStarts.add(r.startLine);
+    ast.push(r);
+  }
+  const all = [
+    ...ast,
+    ...bracketRanges(toks).filter((r) => !astStarts.has(r.startLine)),
+    ...commentRanges(toks),
+  ];
   const imports = importRange(toks);
   if (imports !== undefined) all.push(imports);
   all.sort((a, b) =>

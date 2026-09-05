@@ -52,9 +52,31 @@ self-hosted compiler wasm seed — selectable with the `vital.checker` setting
   by [`tests/vl_test_runner_test.ts`](../tests/vl_test_runner_test.ts).
 - **Folding** ([`src/folding.ts`](./src/folding.ts)) and test discovery share ONE host-side
   tokenizer, [`src/vlLex.ts`](./src/vlLex.ts) — VL's real lexical grammar (`//` and `///`
-  line comments, no block comment; `"…"`/`'…'` with the lexer's escape set). Folding is
-  therefore lexical end to end and reads no seed: it is the only server capability that
-  still works when the compiler wasm fails to load.
+  line comments, no block comment; `"…"`/`'…'` with the lexer's escape set). That lexical
+  half reads no seed, which is why folding is the only server capability that still works
+  when the compiler wasm fails to load. With a seed loaded it is joined by one region per
+  declaration and block from `declExtentsAt`, each starting at the construct's HEADER line
+  rather than at the line its brace happens to open on — the difference a wrapped signature
+  makes, and what a sticky header has to name.
+- **Outline and sticky scroll.** `textDocument/documentSymbol` is a NESTED tree built from
+  the same extents: a symbol's `range` is the whole declaration and its `selectionRange` the
+  name, so a declaration inside another is its child. Symbols are declarations only —
+  functions, types, module-level `const`/`let`, and a lambda that no binding already names;
+  a control-flow block is not one, exactly as TypeScript's outline does not list `if` bodies.
+  A seed without the extent export falls back to the older flat, name-span outline rather
+  than to nothing.
+
+  VS Code's sticky scroll picks its source with `editor.stickyScroll.defaultModel`:
+
+  | setting | what sticks in a `.vl` file |
+  | --- | --- |
+  | `outlineModel` (default) | functions, types and module-level bindings — the declaration you are inside, and nested declarations under it |
+  | `foldingProviderModel` | the above **plus** every braced block: `if` / `else` / `for` / `while` / `match` and its arms, lambda bodies, and multi-line comment and import runs |
+  | `indentationModel` | whitespace only; no VL knowledge |
+
+  Turn it on with `"editor.stickyScroll.enabled": true`; pick
+  `foldingProviderModel` to keep a loop or a `match` arm pinned while scrolling
+  a long body.
 - **Editor ergonomics that are not LSP at all** live in
   [`language-configuration.json`](./language-configuration.json) — brackets, auto-closing
   and surrounding pairs, `indentationRules`, and the `onEnterRules` that continue a `//` or

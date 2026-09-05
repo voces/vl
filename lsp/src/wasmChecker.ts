@@ -129,6 +129,48 @@ export type WasmLexicalToken = {
   tokenClass: number; // 0=keyword 1=operator 2=number 3=boolean 4=comment 5=string
 };
 
+/**
+ * What a {@link WasmExtent} describes. The order IS the wire encoding — the
+ * compiler's `extents.vl` pushes these indices — so entries may be appended but
+ * never reordered or removed.
+ */
+export const EXTENT_KINDS = [
+  "function",
+  "lambda",
+  "type",
+  "const",
+  "let",
+  "block-if",
+  "block-else",
+  "block-for",
+  "block-while",
+  "block-match",
+  "block-bare",
+] as const;
+
+export type WasmExtentKind = typeof EXTENT_KINDS[number];
+
+/**
+ * One declaration or block extent from the wasm AST walk (`extents.vl`), the
+ * source of both the NESTED document-symbol tree and body folding.
+ *
+ * Three positions, all 0-based LSP. `header` is the declared name, or the leading
+ * keyword for a block — a document symbol's `selectionRange` and a folding range's
+ * start line. `range` spans the whole construct, from its `export` keyword (or its
+ * own first token) to just past its closing brace.
+ *
+ * `parent` indexes the same array and is -1 at module level. A row always precedes
+ * the rows it encloses, so `parent < i` for every row: one forward pass builds the
+ * tree. `name` is empty for a block and for a lambda.
+ */
+export type WasmExtent = {
+  kind: WasmExtentKind;
+  name: string;
+  parent: number;
+  header: { line: number; character: number };
+  range: WasmRange;
+};
+
 /** {@link WasmLexicalToken.tokenClass} values, for the host's legend mapping. */
 export const WASM_LEX_KEYWORD = 0;
 export const WASM_LEX_OPERATOR = 1;
@@ -402,6 +444,16 @@ export type WasmChecker = {
    */
   lexicalTokensAt: (source: string) => WasmLexicalToken[];
   /**
+   * Declaration and block extents: every function, type, module-level binding,
+   * lambda and braced control-flow block, with the row that encloses each. Feeds
+   * the nested document-symbol tree and the body half of folding. Synchronous +
+   * single-file and PARSE-ONLY — no typecheck, no import resolution — so a file
+   * mid-edit still outlines, and a parse error yields the extents that closed.
+   * Empty when the seed predates the export; the host then keeps its flat outline
+   * and its purely lexical folding.
+   */
+  declExtentsAt: (source: string) => WasmExtent[];
+  /**
    * Builtin completions (kill-TS): the compiler's builtin surface — numeric/string
    * type names + builtin functions — the host folds into identifier completion,
    * replacing the TS `defaultScope`. A fixed set (no source / `prepare`); empty
@@ -545,6 +597,9 @@ export type WasmChecker = {
    */
   lint: (source: string) => VLDiagnostic[];
 };
+
+/** A native 1-based line as an LSP 0-based one; 0 means "no position". */
+const lspLineOf = (line: number): number => (line > 0 ? line - 1 : 0);
 
 /** One wasm call per code point — fine at editor scale (~0.2 ms/file). */
 const pushString = (push: (cp: number) => number, text: string) => {
@@ -1550,6 +1605,64 @@ export const createWasmChecker = (
     return out;
   };
 
+  // The extent exports ride the same seed as the Stage-1+ exports; an older seed
+  // lacks them, so this yields [] and the host keeps the flat outline and the
+  // lexical-only folding. Like `lexicalTokensAt`: single-file, no `prepare`.
+  const declExtentsAt = (source: string): WasmExtent[] => {
+    const exp = instantiate();
+    if (
+      exp === undefined ||
+      typeof exp.extentScan !== "function" ||
+      typeof exp.extentKindAt !== "function"
+    ) {
+      return [];
+    }
+    exp.srcReset();
+    pushString(exp.srcPush, source);
+    const n = exp.extentScan();
+    const out: WasmExtent[] = [];
+    // Native row index → its index in `out`, or the nearest ANCESTOR that survived.
+    // A seed one kind ahead of this extension emits rows this build cannot name;
+    // dropping one must re-parent its children rather than leave them pointing at a
+    // shifted index. Every parent precedes its children, so this is filled in time.
+    const mapped: number[] = [];
+    for (let i = 0; i < n; i++) {
+      const nativeParent = exp.extentParentAt(i);
+      const parent = nativeParent >= 0 && nativeParent < mapped.length
+        ? mapped[nativeParent]
+        : -1;
+      const kind = EXTENT_KINDS[exp.extentKindAt(i)];
+      if (kind === undefined) {
+        mapped.push(parent);
+        continue;
+      }
+      mapped.push(out.length);
+      const nameLen = exp.extentNameLen(i);
+      out.push({
+        kind,
+        name: nameLen <= 0
+          ? ""
+          : readString(nameLen, (j) => exp.extentNameCharAt(i, j)),
+        parent,
+        header: {
+          line: lspLineOf(exp.extentHdrLineAt(i)),
+          character: exp.extentHdrColAt(i),
+        },
+        range: {
+          start: {
+            line: lspLineOf(exp.extentStartLineAt(i)),
+            character: exp.extentStartColAt(i),
+          },
+          end: {
+            line: lspLineOf(exp.extentEndLineAt(i)),
+            character: exp.extentEndColAt(i),
+          },
+        },
+      });
+    }
+    return out;
+  };
+
   // The builtin-completion export rides the same seed as the Stage-2+ exports; an
   // older seed lacks it, so this yields [] and the host keeps its TS builtins.
   // Static (no source / `prepare`) — the builtin surface is fixed.
@@ -1586,6 +1699,7 @@ export const createWasmChecker = (
     tokensAt,
     memberTokensAt,
     lexicalTokensAt,
+    declExtentsAt,
     builtinCompletions,
     inlayHintsAt,
     scopeAt,
