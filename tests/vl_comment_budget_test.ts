@@ -11,18 +11,8 @@
 // GATING: env-gated (`SELFHOST_NATIVE_ALIGN=1`) AND requires the built binary +
 // seed wasm, like the other native `vl_*` suites.
 
-const exists = (p: string): boolean => {
-  try {
-    Deno.statSync(p);
-    return true;
-  } catch {
-    return false;
-  }
-};
+import { COMPILER, ROOT, VL, exists, nativeEnv } from "./support/tree.ts";
 
-const ROOT = new URL("../", import.meta.url).pathname.replace(/\/$/, "");
-const VL = `${ROOT}/scripts/vl-host/target/release/vl`;
-const COMPILER = `${ROOT}/build/vl-compiler.wasm`;
 const SCRIPT = `${ROOT}/scripts/comment-budget.py`;
 const TOO_LONG = "comment-block-too-long";
 const UNCITED = "comment-measurement-uncited";
@@ -176,7 +166,7 @@ const lint = async (path: string, file: string): Promise<Hits> => {
     args: ["check", path, "--severity", "info", "--json", "--compiler", COMPILER],
     stdout: "piped",
     stderr: "piped",
-    env: { RUST_BACKTRACE: "0", NO_COLOR: "1" },
+    env: nativeEnv({ NO_COLOR: "1" }),
   }).output();
   if (code > 1) {
     throw new Error(`vl check ${path} exited ${code}: ${new TextDecoder().decode(stderr)}`);
@@ -281,7 +271,7 @@ const lintIn = async (dir: string, rel: string): Promise<Record<string, number[]
     cwd: dir,
     stdout: "piped",
     stderr: "piped",
-    env: { RUST_BACKTRACE: "0", NO_COLOR: "1" },
+    env: nativeEnv({ NO_COLOR: "1" }),
   }).output();
   if (code > 1) {
     throw new Error(`vl check ${rel} exited ${code}: ${new TextDecoder().decode(stderr)}`);

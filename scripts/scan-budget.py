@@ -4,35 +4,31 @@
 Same rule as compiler/lint.vl's, over the same six whole-program tables and the
 same pass / allow lists, which are READ FROM that file so the two cannot drift.
 Per-file counts may only FALL: `--check` fails when a file exceeds its baseline,
-`--write-baseline` lowers it after a scan is banked. Sibling of
-scripts/comment-budget.py; see CLAUDE.md, "A COST REGRESSION SHOWS UP ONE
-BOOTSTRAP STEP LATE".
+`--write-baseline` lowers it after a scan is banked. The baseline schema, the
+`--check`/`--why` commands and the exit codes are scripts/ratchet.py, shared with
+the other four ratchets; this file is the census. See CLAUDE.md, "A COST
+REGRESSION SHOWS UP ONE BOOTSTRAP STEP LATE".
 
-Why a ratchet and not a gate at zero: 132 of these stand today (2026-09-03), and
+Why a ratchet and not a gate at zero: 132 of these stood when it landed, and
 every one is a loop somebody has to READ before deciding whether the answer can be
 banked, memoised on an arena prefix, or is genuinely once per program. The number
 that matters is that it never goes up.
 """
 
-import json
 import os
 import re
 import sys
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BASELINE = os.path.join(ROOT, "scripts", "scan-budget-baseline.json")
-LINT = os.path.join(ROOT, "compiler", "lint.vl")
-SECTIONS = os.path.join(ROOT, "compiler", "emit_sections.vl")
+import ratchet
+from ratchet import DIGIT, WORD, read_source
+
+BASELINE = os.path.join(ratchet.ROOT, "scripts", "scan-budget-baseline.json")
+LINT = os.path.join(ratchet.ROOT, "compiler", "lint.vl")
+SECTIONS = os.path.join(ratchet.ROOT, "compiler", "emit_sections.vl")
 CODE = "arena-scan-outside-pass"
-
-WORD = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
-DIGIT = set("0123456789")
-
-
-def read_source(path):
-    """Latin-1 so one index is one BYTE, matching the lint's `s[i]`."""
-    with open(path, "rb") as fh:
-        return fh.read().decode("latin-1")
+# `std/` counts here, unlike comment-budget: the rule is about a loop's COST, and a
+# std module's loop is compiled into the same programs.
+TREES = ("compiler", "std")
 
 
 def vl_list(src, name):
@@ -150,28 +146,29 @@ def grade(src, tables, ok):
     return hits
 
 
-def sources():
-    for d in ("compiler", "std"):
-        p = os.path.join(ROOT, d)
-        for name in sorted(os.listdir(p)):
-            if name.endswith(".vl"):
-                yield f"{d}/{name}", os.path.join(p, name)
+def sources(root=None):
+    return ratchet.sources(TREES, root)
+
+
+def rule_lists(root=None):
+    """(tables, allowed function names) as compiler/lint.vl declares them, in the
+    tree at `root` — so `--why` reads the OLD lint's lists against the old source
+    and a renamed pass is not read as a scan that entered."""
+    lint = read_source(os.path.join(root or ratchet.ROOT, "compiler", "lint.vl"))
+    return vl_list(lint, "asTables"), set(vl_list(lint, "asPasses")) | set(vl_list(lint, "asAllow"))
 
 
 def current():
-    lint = read_source(LINT)
-    tables = vl_list(lint, "asTables")
-    passes = vl_list(lint, "asPasses")
-    allow = vl_list(lint, "asAllow")
+    tables, ok = rule_lists()
     # The lint's copy of the pass table must still BE the pass table. `checkProgram` is
     # the checker's entry and has no row in `runEmitPass`, so it is the one addition.
-    missing = emit_pass_names() - set(passes)
+    passes = set(vl_list(read_source(LINT), "asPasses"))
+    missing = emit_pass_names() - passes
     if missing:
         raise SystemExit(
             "scan-budget: compiler/lint.vl's `asPasses` is missing pass(es) that "
             f"`runEmitPass` dispatches: {' '.join(sorted(missing))}"
         )
-    ok = set(passes) | set(allow)
     out = {}
     for rel, path in sources():
         hits = grade(read_source(path), tables, ok)
@@ -180,60 +177,40 @@ def current():
     return out
 
 
-def load_baseline():
-    with open(BASELINE, encoding="utf-8") as fh:
-        return json.load(fh)
+def named(root):
+    """{code: {`file:function`: hits}} for one tree — the NAMED entries.
+
+    HITS PER NAME, not a bare set: one function commonly carries several scans, so
+    a name that keeps its place while its count falls is a function that banked one
+    of two, which a set would show as no movement at all."""
+    tables, ok = rule_lists(root)
+    out = {CODE: {}}
+    for rel, path in sources(root):
+        for _line, fn in grade(read_source(path), tables, ok):
+            k = f"{rel}:{fn}"
+            out[CODE][k] = out[CODE].get(k, 0) + 1
+    return out
 
 
-def write_baseline(cur):
-    total = sum(v[CODE] for v in cur.values())
-    rows = [f'{json.dumps(k)}: {json.dumps(v)}' for k, v in sorted(cur.items())]
-    body = "\n".join([
-        "{",
-        f'"total": {json.dumps({CODE: total})},',
-        '"files": {',
-        ",\n".join(rows),
-        "}",
-        "}",
-    ])
-    with open(BASELINE, "w", encoding="utf-8") as fh:
-        fh.write(body + "\n")
-    print(f"wrote {BASELINE}: {total} scans outside a pass")
-
-
-def cmd_check(cur):
-    base = load_baseline()["files"]
-    bad = []
-    for rel, v in sorted(cur.items()):
-        was = base.get(rel, {}).get(CODE, 0)
-        if v[CODE] > was:
-            bad.append(f"  {rel}  {CODE}: {v[CODE]} (baseline {was})")
-    if bad:
-        print("arena-scan budget REGRESSED — a file may only go down or stay:")
-        print("\n".join(bad))
-        print(
-            "\nA loop bounded by a whole-program table belongs in a pass, or banks its\n"
-            "answer on an arena prefix the way `moduleHasUnionAs` does (#2419). After a\n"
-            "real fix, lower the baseline with\n"
-            "  python3 scripts/scan-budget.py --write-baseline"
-        )
-        return 1
-    print(f"arena-scan budget ok — {sum(v[CODE] for v in cur.values())} scans outside a "
-          "pass (baseline or below)")
-    return 0
-
-
-def cmd_exempt_codes():
-    """Whether scripts/lint-self.sh still tolerates the code: it does exactly while
-    the committed baseline still owes it. At zero this prints nothing and the gate bites."""
-    if load_baseline()["total"].get(CODE, 0) > 0:
-        print(CODE)
-    return 0
+R = ratchet.Ratchet(
+    script="scan-budget.py",
+    label="arena-scan",
+    baseline=BASELINE,
+    codes=(CODE,),
+    ok_line=lambda t: f"arena-scan budget ok — {t[CODE]} scans outside a "
+                      "pass (baseline or below)",
+    remedy="A loop bounded by a whole-program table belongs in a pass, or banks its\n"
+           "answer on an arena prefix the way `moduleHasUnionAs` does (#2419). After a\n"
+           "real fix, lower the baseline with",
+    wrote_line=lambda t: f"{t[CODE]} scans outside a pass",
+    extras=lambda: (("commit", ratchet.head_commit()),),
+    named=named,
+    tree_paths=TREES,
+)
 
 
 def cmd_list(cur, limit):
-    lint = read_source(LINT)
-    tables, ok = vl_list(lint, "asTables"), set(vl_list(lint, "asPasses")) | set(vl_list(lint, "asAllow"))
+    tables, ok = rule_lists()
     n = 0
     for rel, path in sources():
         if rel not in cur:
@@ -249,13 +226,14 @@ def cmd_list(cur, limit):
 def main():
     args = sys.argv[1:]
     if "--exempt-codes" in args:
-        return cmd_exempt_codes()
+        return R.exempt_codes()
+    if "--why" in args:
+        return R.why(ratchet.flag_value(args, "--why"))
     cur = current()
     if "--write-baseline" in args:
-        write_baseline(cur)
-        return 0
+        return R.write_baseline(cur)
     if "--check" in args:
-        return cmd_check(cur)
+        return R.check(cur)
     if "--list" in args:
         i = args.index("--list")
         return cmd_list(cur, int(args[i + 1]) if len(args) > i + 1 else 0)

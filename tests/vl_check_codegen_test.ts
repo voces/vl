@@ -53,18 +53,8 @@
 // The fault-injected tests take the SAME gate — they drive the same binary over the
 // same seed, so there is nothing extra for them to skip on.
 
-const exists = (p: string): boolean => {
-  try {
-    Deno.statSync(p);
-    return true;
-  } catch {
-    return false;
-  }
-};
+import { COMPILER, ROOT, VL, exists, nativeEnv } from "./support/tree.ts";
 
-const ROOT = new URL("../", import.meta.url).pathname.replace(/\/$/, "");
-const VL = `${ROOT}/scripts/vl-host/target/release/vl`;
-const COMPILER = `${ROOT}/build/vl-compiler.wasm`;
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER);
 if (GATED && !ENABLED) {
@@ -90,7 +80,7 @@ const check = async (
       args: ["check", file, "--concise", "--compiler", COMPILER, ...flags],
       stdout: "null",
       stderr: "piped",
-      env: { RUST_BACKTRACE: "0", NO_COLOR: "1", VL_FAULT_INJECT: "", ...env },
+      env: nativeEnv({ NO_COLOR: "1", VL_FAULT_INJECT: "", ...env }),
     }).output();
     return { code, err: new TextDecoder().decode(stderr) };
   } finally {
@@ -1324,7 +1314,7 @@ Deno.test({
         // `VL_FAULT_INJECT: ""` for the same reason `check` pins it: with the hook
         // armed in the surrounding shell, EVERY file in these directories would flag
         // `not valid wasm` and this gate would report the whole corpus as the class.
-        env: { RUST_BACKTRACE: "0", NO_COLOR: "1", VL_FAULT_INJECT: "" },
+        env: nativeEnv({ NO_COLOR: "1", VL_FAULT_INJECT: "" }),
       }).output();
       for (const line of (dec.decode(stdout) + dec.decode(stderr)).split("\n")) {
         if (!line.includes("not valid wasm")) continue;

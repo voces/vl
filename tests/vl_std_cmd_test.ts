@@ -22,19 +22,10 @@
 //
 // GATING: env-gated (`SELFHOST_NATIVE_ALIGN=1`) + needs the built binary.
 
+import { ROOT, VL, exists } from "./support/tree.ts";
+
 import { collectStdSources, stdHash } from "../scripts/gen-std.ts";
 
-const exists = (p: string): boolean => {
-  try {
-    Deno.statSync(p);
-    return true;
-  } catch {
-    return false;
-  }
-};
-
-const ROOT = new URL("../", import.meta.url).pathname.replace(/\/$/, "");
-const VL = `${ROOT}/scripts/vl-host/target/release/vl`;
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL);
 if (GATED && !ENABLED) console.warn("[vl-std-cmd] skipped — missing vl binary.");

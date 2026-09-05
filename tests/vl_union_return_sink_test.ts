@@ -49,18 +49,8 @@
 // so read the suite's IGNORED COUNT, not just its pass count — extra ignores here mean the
 // prerequisites broke, not that anything was proven.
 
-const exists = (p: string): boolean => {
-  try {
-    Deno.statSync(p);
-    return true;
-  } catch {
-    return false;
-  }
-};
+import { COMPILER, ROOT, VL, exists, nativeEnv } from "./support/tree.ts";
 
-const ROOT = new URL("../", import.meta.url).pathname.replace(/\/$/, "");
-const VL = `${ROOT}/scripts/vl-host/target/release/vl`;
-const COMPILER = `${ROOT}/build/vl-compiler.wasm`;
 const MELT = `${ROOT}/tests/fixtures/opt-melt`;
 
 const haveTool = async (bin: string): Promise<boolean> => {
@@ -110,6 +100,7 @@ const boxSitesAndOutput = async (
       args: ["build", src, "-o", wasm, "--compiler", COMPILER],
       stdout: "piped",
       stderr: "piped",
+      env: nativeEnv(),
     }).output();
     if (b.code !== 0) {
       throw new Error(
@@ -136,6 +127,7 @@ const boxSitesAndOutput = async (
       args: ["run", src, "--compiler", COMPILER],
       stdout: "piped",
       stderr: "piped",
+      env: nativeEnv(),
     }).output();
     if (r.code !== 0) {
       throw new Error(

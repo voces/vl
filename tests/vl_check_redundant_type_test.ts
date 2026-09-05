@@ -13,18 +13,8 @@
 //
 // GATING: env-gated (`SELFHOST_NATIVE_ALIGN=1`) + needs the built binary + seed.
 
-const exists = (p: string): boolean => {
-  try {
-    Deno.statSync(p);
-    return true;
-  } catch {
-    return false;
-  }
-};
+import { COMPILER, VL, exists, nativeEnv } from "./support/tree.ts";
 
-const ROOT = new URL("../", import.meta.url).pathname.replace(/\/$/, "");
-const VL = `${ROOT}/scripts/vl-host/target/release/vl`;
-const COMPILER = `${ROOT}/build/vl-compiler.wasm`;
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER);
 if (GATED && !ENABLED) {
@@ -41,7 +31,7 @@ const check = async (source: string): Promise<{ code: number; err: string }> => 
       args: ["check", file, "--concise", "--compiler", COMPILER],
       stdout: "null",
       stderr: "piped",
-      env: { RUST_BACKTRACE: "0", NO_COLOR: "1" },
+      env: nativeEnv({ NO_COLOR: "1" }),
     }).output();
     return { code, err: new TextDecoder().decode(stderr) };
   } finally {
@@ -59,7 +49,7 @@ const fix = async (source: string): Promise<{ after: string; err: string }> => {
       args: ["check", file, "--fix", "--compiler", COMPILER],
       stdout: "null",
       stderr: "piped",
-      env: { RUST_BACKTRACE: "0", NO_COLOR: "1" },
+      env: nativeEnv({ NO_COLOR: "1" }),
     }).output();
     return { after: await Deno.readTextFile(file), err: new TextDecoder().decode(stderr) };
   } finally {
@@ -174,7 +164,7 @@ Deno.test({
         args: ["check", `${dir}/entry.vl`, "--concise", "--compiler", COMPILER],
         stdout: "null",
         stderr: "piped",
-        env: { RUST_BACKTRACE: "0", NO_COLOR: "1" },
+        env: nativeEnv({ NO_COLOR: "1" }),
       }).output();
       const err = new TextDecoder().decode(rep.stderr);
       const hits = redundantLines(err);
@@ -187,7 +177,7 @@ Deno.test({
         args: ["check", `${dir}/entry.vl`, "--fix", "--compiler", COMPILER],
         stdout: "null",
         stderr: "null",
-        env: { RUST_BACKTRACE: "0", NO_COLOR: "1" },
+        env: nativeEnv({ NO_COLOR: "1" }),
       }).output();
       const entryAfter = await Deno.readTextFile(`${dir}/entry.vl`);
       const depAfter = await Deno.readTextFile(`${dir}/dep.vl`);
@@ -258,7 +248,7 @@ const checkProject = async (
       args: ["check", `${dir}/main.vl`, "--concise", "--compiler", COMPILER],
       stdout: "null",
       stderr: "piped",
-      env: { RUST_BACKTRACE: "0", NO_COLOR: "1" },
+      env: nativeEnv({ NO_COLOR: "1" }),
     }).output();
     return { code, err: new TextDecoder().decode(stderr) };
   } finally {

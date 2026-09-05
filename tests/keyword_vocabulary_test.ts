@@ -39,13 +39,14 @@
 //
 // PURE — no seed, no binary. It runs in the `ci` job.
 
+import { ROOT } from "./support/tree.ts";
+
 import { VL_HARD_KEYWORDS, VL_SOFT_KEYWORDS } from "../lsp/src/typeFeatures.ts";
 
 const assert = (cond: boolean, msg: string): void => {
   if (!cond) throw new Error(msg);
 };
 
-const ROOT = new URL("../", import.meta.url).pathname.replace(/\/$/, "");
 const read = (rel: string): string => Deno.readTextFileSync(`${ROOT}/${rel}`);
 
 const LEXER = "compiler/lexer.vl";

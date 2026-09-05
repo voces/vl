@@ -37,14 +37,7 @@
 // missing prerequisite self-ignores rather than fails, so read the suite's
 // IGNORED COUNT, not just its pass count.
 
-const exists = (p: string): boolean => {
-  try {
-    Deno.statSync(p);
-    return true;
-  } catch {
-    return false;
-  }
-};
+import { COMPILER, ROOT, VL, exists, nativeEnv } from "./support/tree.ts";
 
 const haveTool = async (name: string): Promise<boolean> => {
   try {
@@ -59,9 +52,6 @@ const haveTool = async (name: string): Promise<boolean> => {
   }
 };
 
-const ROOT = new URL("../", import.meta.url).pathname.replace(/\/$/, "");
-const VL = `${ROOT}/scripts/vl-host/target/release/vl`;
-const COMPILER = `${ROOT}/build/vl-compiler.wasm`;
 const WASM_OPT = `${ROOT}/node_modules/binaryen/bin/wasm-opt`;
 const SRC = `${ROOT}/bench/buffer-view-bounds`;
 
@@ -257,7 +247,7 @@ const buildAt = async (fixture: string, flag: string | null, out: string): Promi
     args,
     // Without this `-O3` finds no wasm-opt, prints a note and writes the
     // UNOPTIMIZED module with exit 0 — which reads as a total optimization win.
-    env: { VL_WASM_OPT: WASM_OPT },
+    env: nativeEnv({ VL_WASM_OPT: WASM_OPT }),
     stdout: "piped",
     stderr: "piped",
   }).output();

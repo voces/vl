@@ -16,17 +16,9 @@
 // makes it so, and every one is a name-keyed registry answering a lookup by linear scan
 // — the track `__str_eq__` has topped the self-compile profile since #2419 closed the
 // arena scans. Lower the bar when the registry it names stops being a list.
-const exists = (p: string): boolean => {
-  try {
-    Deno.statSync(p);
-    return true;
-  } catch {
-    return false;
-  }
-};
 
-const ROOT = new URL("../", import.meta.url).pathname.replace(/\/$/, "");
-const VL = `${ROOT}/scripts/vl-host/target/release/vl`;
+import { ROOT, VL, exists } from "./support/tree.ts";
+
 const COMPILER = Deno.env.get("VL_SCALING_COMPILER") ?? `${ROOT}/build/vl-compiler.wasm`;
 const ENABLED = exists(VL) && exists(COMPILER);
 if (!ENABLED) console.warn("[scaling-shape] skipped — missing vl binary or seed wasm.");

@@ -13,20 +13,10 @@
 // now the opposite control: the row it was filed against is closed, so an `array_push` cell
 // that stops grading RUNS is a regression rather than a blinded instrument.
 
-const exists = (p: string): boolean => {
-  try {
-    Deno.statSync(p);
-    return true;
-  } catch {
-    return false;
-  }
-};
+import { COMPILER, ROOT, VL, exists } from "./support/tree.ts";
 
-const ROOT = new URL("../", import.meta.url).pathname.replace(/\/$/, "");
 const MATRIX = `${ROOT}/scripts/capability-probes/matrix.py`;
 const TEMPLATES = `${ROOT}/scripts/capability-probes/matrix`;
-const VL = `${ROOT}/scripts/vl-host/target/release/vl`;
-const COMPILER = `${ROOT}/build/vl-compiler.wasm`;
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER) && exists(MATRIX);
 if (GATED && !ENABLED) {
