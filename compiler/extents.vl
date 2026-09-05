@@ -1,0 +1,294 @@
+// Declaration and block extents: one row per construct an editor outlines or folds —
+// a function, a type, a module-level binding, a lambda, and every braced control-flow
+// block — each carrying the row that encloses it. `extentScan` (driver.vl) stages the
+// source and parses; nothing here typechecks, so a file that does not check still
+// answers and a parse error yields the rows that closed rather than none.
+//
+// A row carries three positions: the header (the declared name, or the leading keyword
+// for a block), the whole extent's start, and its end at the construct's last token.
+// The host reads the header as a document symbol's `selectionRange`, the start/end pair
+// as its `range`, and the header and end LINES as a folding range.
+
+import {
+  Block,
+  ForIn,
+  ForRange,
+  FuncDecl,
+  IfStmt,
+  LetDecl,
+  MatchExpr,
+  P,
+  TypeDecl,
+  UnionDecl,
+  WhileStmt,
+  declHasExportKw,
+  declNameTokOf,
+  nodeChildren,
+  nodeToks,
+} from "./ast"
+import { nodePos, tokIndexAt } from "./fmt_util"
+
+// The kind of construct a row describes — a closed set decoded here and in the host's
+// `EXTENT_KINDS` table (lsp/src/wasmChecker.ts), which must list the same members:
+// 0 function, 1 lambda, 2 type, 3 const, 4 let, then the blocks — 5 if, 6 else,
+// 7 for, 8 while, 9 match, 10 bare.
+let extKind: i32[] = []
+let extName: string[] = []
+let extHdrLine: i32[] = []
+let extHdrCol: i32[] = []
+let extSLine: i32[] = []
+let extSCol: i32[] = []
+let extELine: i32[] = []
+let extECol: i32[] = []
+let extParent: i32[] = []
+
+// The walk's hard recursion bound. The arena a clean parse builds is a tree, so this
+// never fires; it exists because the editor calls this on every keystroke and a
+// malformed arena must cost a truncated answer rather than a hung server.
+const EXT_MAX_DEPTH = 512
+
+// The line the token's last character sits on: a token may span lines (a multi-line
+// template), so its own newlines decide rather than the line it opened on.
+function extTokEndLine(t: i32): i32 {
+  const s = P.toks[t].text
+  let n = P.toks[t].line
+  let i = 0
+  while i < s.length {
+    if s[i] == 10 { n = n + 1 }
+    i = i + 1
+  }
+  n
+}
+
+// The 0-based column just past the token's last character, on `extTokEndLine`'s line.
+// A token carrying newlines restarts at column 0, so only the text after the last one
+// counts; otherwise the span is the column it opened at plus its width.
+function extTokEndCol(t: i32): i32 {
+  const s = P.toks[t].text
+  let last = -1
+  let i = 0
+  while i < s.length {
+    if s[i] == 10 { last = i }
+    i = i + 1
+  }
+  if last >= 0 { return s.length - last - 1 }
+  P.toks[t].col + s.length
+}
+
+// Append a row headed at token `hdr`, spanning `from` .. `to`, nested under row
+// `parent` (-1 at module level). Returns the new row's index, or `parent` unchanged
+// when a token index is out of range: a construct with no source position, such as a
+// synthesized recovery block, contributes no row and its children keep the enclosing one.
+function extAdd(
+  kind: i32,
+  name: string,
+  hdr: i32,
+  from: i32,
+  to: i32,
+  parent: i32,
+): i32 {
+  if hdr < 0 || hdr >= P.toks.length { return parent }
+  if from < 0 || from >= P.toks.length { return parent }
+  if to < 0 || to >= P.toks.length { return parent }
+  extKind.push(kind)
+  extName.push(name)
+  extHdrLine.push(P.toks[hdr].line)
+  extHdrCol.push(P.toks[hdr].col)
+  extSLine.push(P.toks[from].line)
+  extSCol.push(P.toks[from].col)
+  extELine.push(extTokEndLine(to))
+  extECol.push(extTokEndCol(to))
+  extParent.push(parent)
+  extKind.length - 1
+}
+
+// The token index a node's extent ends at: `nodeToks` anchors every node at the last
+// token consumed while building it, which for a braced construct is its closing brace.
+function extEndTok(ix: i32): i32 {
+  if ix < 0 || ix >= nodeToks.length { return -1 }
+  nodeToks[ix]
+}
+
+// The token index a node's extent starts at, or -1 for a synthesized node.
+function extStartTok(ix: i32): i32 { tokIndexAt(nodePos(ix)) }
+
+// The start token a declaration's extent should use: the `export` keyword when the
+// parser dropped one, else the declaration's own first token.
+function extDeclStartTok(ix: i32, own: i32): i32 {
+  if declHasExportKw(ix) && own > 0 { return own - 1 }
+  own
+}
+
+// Whether the arena node at `ix` is a brace block, as opposed to the nested `if` an
+// `else if` chain puts in the same slot.
+function extIsBlock(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is Block { return true }
+  false
+}
+
+// The `else` keyword heading an else-block: its `{` is always the token after the
+// keyword, because a braceless `else` recovers into a synthesized block, which has no
+// source position and so reaches `extAdd` as -1.
+function extElseTok(blockTok: i32): i32 {
+  if blockTok > 0 { return blockTok - 1 }
+  blockTok
+}
+
+// Walk one child list under `parent`, adding no row for `ix` itself. This is how a
+// construct's body block is entered: the block's extent is already the construct's.
+function extKids(ix: i32, parent: i32, depth: i32): i32 {
+  const kids = nodeChildren(ix)
+  let i = 0
+  while i < kids.length {
+    extWalk(kids[i], parent, depth)
+    i = i + 1
+  }
+  0
+}
+
+// One braced block owned by `ix`: a row of `kind` headed at `hdr`, with the block's
+// statements nested inside it. `hdr` is the owning keyword, so a folding range and a
+// sticky-scroll header name the `if` / `for` / `while`, not the brace.
+function extBlock(ix: i32, kind: i32, hdr: i32, parent: i32, depth: i32): i32 {
+  const row = extAdd(kind, "", hdr, hdr, extEndTok(ix), parent)
+  extKids(ix, row, depth)
+  0
+}
+
+// Every extent at or below arena node `ix`, appended in pre-order so a row always
+// precedes the rows it encloses. A node kind with no extent of its own falls through
+// to `nodeChildren`, which owns the child list of every variant that has one.
+function extWalk(ix: i32, parent: i32, depth: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  if depth >= EXT_MAX_DEPTH { return 0 }
+  const d = depth + 1
+  const n = P.nodes[ix]
+  if n is FuncDecl {
+    const own = extStartTok(ix)
+    let hdr = declNameTokOf(ix)
+    if hdr < 0 { hdr = own }
+    let kind = 1
+    if n.fnName.length > 0 { kind = 0 }
+    const row = extAdd(
+      kind,
+      n.fnName,
+      hdr,
+      extDeclStartTok(ix, own),
+      extEndTok(ix),
+      parent,
+    )
+    let i = 0
+    while i < n.fnParams.length {
+      extWalk(n.fnParams[i], row, d)
+      i = i + 1
+    }
+    extKids(n.fnBody, row, d)
+  } else if n is TypeDecl {
+    const own = extStartTok(ix)
+    let hdr = declNameTokOf(ix)
+    if hdr < 0 { hdr = own }
+    const row = extAdd(
+      2,
+      n.tdName,
+      hdr,
+      extDeclStartTok(ix, own),
+      extEndTok(ix),
+      parent,
+    )
+    extKids(ix, row, d)
+  } else if n is UnionDecl {
+    const own = extStartTok(ix)
+    let hdr = declNameTokOf(ix)
+    if hdr < 0 { hdr = own }
+    extAdd(2, n.udName, hdr, extDeclStartTok(ix, own), extEndTok(ix), parent)
+  } else if n is LetDecl {
+    // Module-level only. Every local binding would be a row the outline has no use
+    // for and folding would never draw, on a table the editor rebuilds per keystroke.
+    if parent >= 0 { return extKids(ix, parent, d) }
+    const own = extStartTok(ix)
+    let hdr = declNameTokOf(ix)
+    if hdr < 0 { hdr = own }
+    let kind = 4
+    if n.letKw == "const" { kind = 3 }
+    const row = extAdd(
+      kind,
+      n.letName,
+      hdr,
+      extDeclStartTok(ix, own),
+      extEndTok(ix),
+      parent,
+    )
+    extKids(ix, row, d)
+  } else if n is IfStmt {
+    extWalk(n.ifCond, parent, d)
+    extBlock(n.ifThen, 5, extStartTok(ix), parent, d)
+    if extIsBlock(n.ifElse) {
+      extBlock(n.ifElse, 6, extElseTok(extStartTok(n.ifElse)), parent, d)
+    } else {
+      extWalk(n.ifElse, parent, d)
+    }
+  } else if n is WhileStmt {
+    extWalk(n.whileCond, parent, d)
+    extBlock(n.whileBody, 8, extStartTok(ix), parent, d)
+  } else if n is ForRange {
+    extWalk(n.frFrom, parent, d)
+    extWalk(n.frTo, parent, d)
+    extWalk(n.frStep, parent, d)
+    extBlock(n.frBody, 7, extStartTok(ix), parent, d)
+  } else if n is ForIn {
+    extWalk(n.fiIter, parent, d)
+    extBlock(n.fiBody, 7, extStartTok(ix), parent, d)
+  } else if n is MatchExpr {
+    extWalk(n.matchScrut, parent, d)
+    const kw = extStartTok(ix)
+    const row = extAdd(9, "", kw, kw, extEndTok(ix), parent)
+    let i = 0
+    while i < n.matchBodies.length {
+      const b = n.matchBodies[i]
+      if extIsBlock(b) {
+        extBlock(b, 10, extStartTok(b), row, d)
+      } else {
+        extWalk(b, row, d)
+      }
+      i = i + 1
+    }
+  } else if n is Block {
+    // A block reaching the walk is a bare statement block: every block that belongs to
+    // a construct is entered through `extBlock` / `extKids`, which never recurse on it.
+    extBlock(ix, 10, extStartTok(ix), parent, d)
+  } else {
+    extKids(ix, parent, d)
+  }
+  0
+}
+
+// Rebuild the extent table for the program rooted at `root`, returning its row count.
+// Called by `extentScan` (driver.vl) straight after `parseProgram`, before any pass
+// rewrites the arena — the rows describe the source as written.
+export function extCollect(root: i32): i32 {
+  extKind = []
+  extName = []
+  extHdrLine = []
+  extHdrCol = []
+  extSLine = []
+  extSCol = []
+  extELine = []
+  extECol = []
+  extParent = []
+  extWalk(root, -1, 0)
+  extKind.length
+}
+
+export function extentCount(): i32 { extKind.length }
+export function extentKindAt(i: i32): i32 { extKind[i] }
+export function extentParentAt(i: i32): i32 { extParent[i] }
+export function extentNameLen(i: i32): i32 { extName[i].length }
+export function extentNameCharAt(i: i32, j: i32): i32 { extName[i][j] }
+export function extentHdrLineAt(i: i32): i32 { extHdrLine[i] }
+export function extentHdrColAt(i: i32): i32 { extHdrCol[i] }
+export function extentStartLineAt(i: i32): i32 { extSLine[i] }
+export function extentStartColAt(i: i32): i32 { extSCol[i] }
+export function extentEndLineAt(i: i32): i32 { extELine[i] }
+export function extentEndColAt(i: i32): i32 { extECol[i] }
