@@ -126,22 +126,19 @@ Each now says so, in the shape the `concat`-vs-`+` bullet uses.
   call in this same module** — `filled(n, 0).mapIndexed(f)` builds a fresh object per
   slot, measured distinct at both a struct and a list element — and the doc comment names
   it, because a hazard whose answer is one call should carry the answer.
-  `tests/cases/std/array-filled-struct-element.vl` and `-nested-element.vl` pin both
-  halves and the remedy.
-- **The struct element and the list element cannot be instantiated in ONE module, and
-  that is why they are two fixtures.** A generic `T[]` constructor over `__array_new__`
-  pinned at a named struct AND at a nested list emits check-clean invalid wasm — but only
-  in that ORDER; nested-first runs, and so does either alone. Ablated over eight programs:
-  the ingredient is which ref-list row interned first, and not the annotation (both faces
-  fail). **The control that isolates it is a LOCAL generic wrapper, not the direct
-  spelling** — `function mk<T>(n: i32, v: T): T[] { return __array_new__(n, v) }` fails
-  the same pair the same way, which is what puts the mechanism at the generic monomorph
-  rather than at std; the direct `__array_new__(2, [1,2])` is a *different* cell (it is
-  silent ALONE, with a different message, and the wrapper FIXES it — so `filled` is a
-  small capability gain here as well as a rename). A `push`-loop constructor runs at all
-  28 element-type pairs where this one runs at 26.
-  `scripts/capability-probes/generic-array-new-struct-then-nested.vl` is the standing
-  witness.
+  `tests/cases/std/array-filled-elements.vl` pins both halves and the remedy.
+- **The struct element and the list element were two fixtures because they could not be
+  instantiated in ONE module; D1605 closed that and they are one file again.** A generic
+  `T[]` constructor over `__array_new__` pinned at a named struct AND at a nested list
+  emitted check-clean invalid wasm, and the order decided it — nested-first ran, and so
+  did either alone. The mechanism was not the order: `refListElemNameOfExpr` answered ""
+  for a fill whose type only the monomorphized instance knows, and `refListSlotOfExpr`
+  clamped that miss to slot 0, the first-interned ref row. The direct
+  `__array_new__(2, [1,2])` is still a *different* cell — silent ALONE, with a different
+  message, and the wrapper FIXES it, because through the wrapper the fill is an identifier
+  rather than an array literal, so `filled` is a small capability gain here as well as a
+  rename. `scripts/capability-probes/generic-array-new-struct-then-nested.vl` is the
+  standing witness, and it now runs.
 - **Three element types are outside the surface and every one of them is the raw
   intrinsic's, not this export's.** A value-union element (`(i32 | string)[]`) and a
   nullable-ref element (`(Node | null)[]`) are check-clean invalid wasm; a bare `null`
@@ -150,7 +147,11 @@ Each now says so, in the shape the `concat`-vs-`+` bullet uses.
   identically at the direct `__array_new__` spelling, so `filled` inherits them. The
   nullable-ref one is the sharpest, because "fill with a placeholder and write the slots
   later" is the shape a length-first constructor is FOR:
-  `scripts/capability-probes/array-new-nullable-ref-fill.vl`.
+  `scripts/capability-probes/array-new-nullable-ref-fill.vl`. D1605 did not move any of
+  them: their mechanism is `arrNewIntrKind`'s kind ladder falling through to the i32 list,
+  not the element-name channel that row closed. Through `filled` the same fall-through
+  also claims an `f64[]`, `i64[]` or `u8[]` element, each of which runs at the direct
+  spelling — so that one is a pin-only face, filed on D1605 as residue.
 - **Not done, deliberately:** no `sortUnstable`, no `sortBy`/`sortedBy`, no default
   ordering `xs.sort()` (`<` is defined for the scalars and `string` but not for a struct
   or a union, and VL has no overloading to express that), no `binarySearch`/`lowerBound`
