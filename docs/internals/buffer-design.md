@@ -2028,7 +2028,9 @@ shape, at which the count falls.
 
 The counts are module-wide within loops, so the `call` and `sget` columns at `none` also carry every
 loop-bearing function `std:buffer` defines, whether the kernel reaches it or not — `storeBytes` and
-`loadBytes` add 3 and 4 to every row there. The `trap` column above is unaffected, and so is every
+`loadBytes` add 3 to the `call` column of every row there, and nothing to `sget`: their copy loops
+call only a linear-memory intrinsic, which keeps the list-header hoist (`bulk-copy-design.md` §E4).
+The `trap` column above is unaffected, and so is every
 `-O`/`-O3` cell, because those rungs delete what nothing calls.
 
 The transition is worth knowing for reading a `-O` disassembly: at `-O` binaryen inlines the VOID

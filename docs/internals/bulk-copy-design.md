@@ -4,12 +4,13 @@ glean's R1 (`~/glean/docs/vl-requirements.md`, from VL-010) asks for a one-instr
 `u8[]` → linear memory and back, because `readFile` lands a file in a GC array while its parsers
 run over a `Buf`. This is the measurement and the design it settled.
 
-**§E1 AND §E2 ARE BOTH LANDED, as two independent changes.** `std:fs` gained `readFileInto` and
-`readFileRangeInto` over one host import, with the destination offset §E1 recommends and no
-destination length; the owner's decision 1 below was answered "take the `Buf`". `std:buffer`
-gained §E2's pair in pure VL, with one owner ruling on top of it recorded in §E3. §E3's emitter
-hoist is still unscheduled. The rows in §B and §D stand as measured; each landed export is
-re-measured in the PR that shipped it, §E1's in `std-notes.md` §`std:fs` and §E2's in §E2 below.
+**§E1, §E2 AND §E4 ARE ALL LANDED, as three independent changes.** `std:fs` gained
+`readFileInto` and `readFileRangeInto` over one host import, with the destination offset §E1
+recommends and no destination length; the owner's decision 1 below was answered "take the `Buf`".
+`std:buffer` gained §E2's pair in pure VL, with one owner ruling on top of it recorded in §E3.
+§E4 is the emitter half, and it closes the reload but not the guard. The rows in §B and §D stand
+as measured; each landed change is re-measured in the PR that shipped it, §E1's in
+`std-notes.md` §`std:fs`, §E2's in §E2 below and §E4's in §E4.
 
 **The short answer.** There is no such instruction and there will not be one; the copy is 75% of
 the cost of reading a 64 MiB file today, and the fastest thing available is not to make the copy
@@ -189,14 +190,15 @@ time, so each of the two range checks carries a print loop — which drags the s
 a module that has no strings. An unoptimized numeric kernel importing `std:buffer` grew 1,928 →
 4,509 bytes. At `-O3` the module is **byte-identical** to one built before the pair existed, since
 nothing calls them. The same reading moves the `none` column of `tests/support/viewBoundsShape.ts`
-by +3 call and +4 sget on all eighteen rows and neither optimized column at all.
+by +3 call on all eighteen rows and neither optimized column at all; the +4 sget it also carried is
+what §E4 gave back.
 
-The 2.1× → 2.4× gap to a hand-written loop is the per-element wrapper reload and the redundant
-`select` guard in §B. That is an **emitter** opportunity, not a reason to emit a runtime helper:
-hoisting a `u8[]`'s backing and length out of a loop whose index is the induction variable speeds
-up every byte loop in the language, including `find-refs`'s scan of a 2.3 GB dump, which is
-glean's actual hot loop. File it separately; do not spend a compiler-emitted helper on one std
-function.
+The 2.1× → 2.4× gap to a hand-written loop is the per-element wrapper reload and the `select`
+guard in §B. **The reload half is now closed in the EMITTER** — §E4 has the
+shape, the conditions and the measured win — and the guard half is not, for a reason worth
+stating: it is only redundant when the loop's own bound is the list's `len`, which is not what
+`select` is checking. A list carries spare capacity past `len`, so the guard is what stops a
+read in the slack; dropping it needs the bound proved equal to `len`, not merely present.
 
 ### E3. The rubric, applied
 
@@ -237,6 +239,50 @@ function.
   `array.copy` (GC → GC). No overlap.
 - **Speculative?** No: 46 call sites in the tree that motivated it.
 
+### E4. The emitter's list-header hoist reaches a loop that calls a memory intrinsic — LANDED
+
+**The hoist itself is not new, and neither is its coverage of `u8[]`.** `loopHoistOpen`
+(`compiler/wasmEmit.vl`) has cached a list's backing and `len` above a loop since the list-header
+change, and the packed byte list has a row kind of its own. What declined was any loop body
+carrying a **call** — a call may reallocate a list through a param, capture or global, so the
+whole loop's hoist was refused rather than one row. That is why §B's disassembly of the copy
+idiom shows a wrapper reload per element and §E2's `storeBytes` did too: the body's only call is
+`__store_i8__`.
+
+**The lifted condition, exactly.** A call is now hoist-safe when it lowers to LINEAR-MEMORY
+instructions and nothing else: the callee is a bare identifier, unshadowed in that function, in
+the load / store / bulk / memory-size families. Every operand of such a call is a number and the
+lowering is one instruction, so no GC object is reachable from it and no list's `backing`/`len`
+can move across it. Every other call still declines the whole loop, `.push` included — a member
+callee is not a bare identifier. The rebinding, nullable-receiver and reallocation conditions are
+unchanged, and the guard is not weakened: the cached `len` is the same value the per-access read
+would have found, so an out-of-range index traps on the same iteration.
+
+**Measured** in USER CPU SECONDS — the box these ran on is shared, and wall clock there could not
+resolve 10% while CPU seconds read the same value to ±1 tick across nine runs. 512 MiB per sample,
+prebuilt module, medians of 9 interleaved runs alternating which arm leads, net of a control
+differing by exactly the loop:
+
+| engine | `storeBytes` | `loadBytes` |
+| --- | --- | --- |
+| wasmtime (`vl run`) | 0.55 → 0.51 s, **1.08×** | 0.52 → 0.41 s, **1.27×** |
+| V8 (the corpus oracle's engine) | 1.57 → 1.54 s, **1.02×** | 1.16 → 1.17 s, **1.00×** |
+
+**The win is wasmtime's, not the language's.** V8 already folds the reloads — it can see that
+`i32.store8` cannot alias a GC struct field — so the emitter is buying back what one engine's
+optimizer does for free and the other's does not. Eight unaffected programs read 1.00 on both.
+
+Nothing else in §B moves: rows 4 and 5 call `store8` / `.push` and still decline, and rows 6 and 7
+were already hoisted or index nothing. **A call-free byte scan is therefore not what this buys**:
+`find-refs`'s walk of a 2.3 GB dump indexes a `u8[]` with no call in the body and has been hoisted
+all along.
+
+**What remains** is the `select` guard, and it is not redundant in general. A list's backing is
+allocated with spare capacity past `len`, so the guard is what maps an index in the slack onto a
+trapping one; dropping it needs the loop's own bound proved EQUAL to the cached `len`, which is a
+value-flow question the hoist does not ask. `storeBytes` is the shape where that proof is
+available (`const n = src.length`, `while i < n`).
+
 ---
 
 ## F. Risks, and what the owner decides
@@ -255,7 +301,7 @@ mean `readFileInto` is native-only, which is correct — so is `readFile`.
 caller allocated, and `std:buffer`'s LIFO contract already says a `Buf` allocated after a released
 mark dangles. Nothing new, but the header should not pretend the destination is checked.
 
-Three decisions are the owner's; the first two are ANSWERED:
+Three decisions are the owner's; all three are ANSWERED:
 
 1. **Does `readFileInto` take a `Buf` or a raw address?** ANSWERED 2026-09-05: the `Buf`. A `Buf`
    makes `std:fs` depend on `std:buffer` and re-export its type; an `i32` address avoids that and
@@ -265,9 +311,11 @@ Three decisions are the owner's; the first two are ANSWERED:
 2. **E2 alone, or both?** ANSWERED: both, independently. E2 is a pure std addition with no
    compiler and no host change and closes the shape complaint — the half glean says it is actually
    paying at its file sizes. E1 is where the 4×–20× is.
-3. **Is the emitter's `u8[]` loop hoist scheduled here or on its own?** It is worth 1.1×–1.4× on
-   E2 and on every byte loop in the language, and it is the only item here that touches the
-   compiler.
+3. **Is the emitter's `u8[]` loop hoist scheduled here or on its own?** ANSWERED: on its own, and
+   it landed as §E4. The clause "on every byte loop in the language" was wrong twice — a call-free
+   byte loop was already hoisted, so what the change reaches is the loop that calls a memory
+   intrinsic, which is `storeBytes` and `loadBytes` and not `find-refs`'s scan; and the 1.1×–1.4×
+   is wasmtime's alone (1.08× / 1.27×), since V8 folds the reload itself (1.02× / 1.00×).
 
 ---
 
