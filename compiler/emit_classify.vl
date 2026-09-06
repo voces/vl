@@ -9052,28 +9052,42 @@ function declRowFieldFits(vc: i32, sc: i32, valIx: i32, si: i32, mfi: i32) {
   const fn = sFieldElemNameAt(si, mfi)
   if fn == "" { return true }
   if sc == 16 { return unionMemberSetsCompat(vn, fn) }
-  elemRowsBoxCompat(vn, fn)
+  elemRowsCaptureCompat(vn, fn)
 }
 
-// Are two nested-struct element ROWS compatible for a capture? Only their union-BOX fields
-// are asked, and only where both rows name one: re-interning a literal at another row can
-// widen a field or drop one, but it cannot renumber a box's positional tags, so a box
-// disagreement is the one difference a capture may not paper over (D1694).
-function elemRowsBoxCompat(an: string, bn: string): boolean {
-  if an == bn { return true }
-  const ai = structIndexByName(an)
-  if ai < 0 { return true }
-  const bi = structIndexByName(bn)
-  if bi < 0 { return true }
+// May the value's element row `vn` be re-interned at the destination row `dn`? Two things a
+// re-intern cannot do: invent a field the source lacks, and renumber a box's positional tags.
+// It CAN drop a field the destination does not want and widen one it does, which is the
+// accepting side of the object-shape floor and stays lenient here (D1694, D1696).
+function elemRowsCaptureCompat(vn: string, dn: string): boolean {
+  elemRowsCaptureCompatAt(vn, dn, 8)
+}
+
+// The same question one nesting level at a time: a nested-struct field is asked of its own
+// two element rows, so a box or a missing field at ANY depth refutes. `depth` bounds a
+// self-recursive type, whose rows would otherwise walk each other forever; running out is
+// lenient, which is the same answer an unresolvable row gets.
+function elemRowsCaptureCompatAt(vn: string, dn: string, depth: i32): boolean {
+  if vn == dn { return true }
+  if depth <= 0 { return true }
+  const vi = structIndexByName(vn)
+  if vi < 0 { return true }
+  const di = structIndexByName(dn)
+  if di < 0 { return true }
   let k = 0
-  while k < sFieldCount[ai] {
-    if sFieldTypes[sFieldStart[ai] + k] == 16 {
-      const bj = sFieldIndex(bi, sFieldNames[sFieldStart[ai] + k])
-      if bj >= 0 && sFieldTypeAt(bi, bj) == 16 {
-        const av = sFieldElemName[sFieldStart[ai] + k]
-        const bv = sFieldElemNameAt(bi, bj)
-        if av != "" && bv != "" {
-          if !unionMemberSetsCompat(av, bv) { return false }
+  while k < sFieldCount[di] {
+    const at = sFieldStart[di] + k
+    const vj = sFieldIndex(vi, sFieldNames[at])
+    if vj < 0 { return false }
+    const dcode = sFieldTypes[at]
+    if dcode == sFieldTypeAt(vi, vj) {
+      const dv = sFieldElemName[at]
+      const vv = sFieldElemNameAt(vi, vj)
+      if dv != "" && vv != "" {
+        if dcode == 16 {
+          if !unionMemberSetsCompat(dv, vv) { return false }
+        } else if dcode == 15 {
+          if !elemRowsCaptureCompatAt(vv, dv, depth - 1) { return false }
         }
       }
     }
@@ -9227,7 +9241,7 @@ function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
               // own destination names a different row: a preference, not a refusal, since
               // delivery is what earns a declared box's widening and a declared element's
               // own spelling (D1690, D1694).
-              if ok && (sc == 16 || sc == 15) {
+              if ok && (sc == 16 || fieldCodeRefsElemHeapC(sc)) {
                 if !sIsAnonRow(si) {
                   if dstRow == 0 - 2 {
                     dstRow = repRowOfTyStruct(nodeRepTyIxOf(objIx), sLimA)
