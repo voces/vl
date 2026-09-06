@@ -17890,13 +17890,13 @@ function ufcsNotImportedData(prop: string, specs: string, objTy: i32) {
   out + diagDataField("recv", demangleMsg(tyToStr(objTy)))
 }
 
-// The merged spelling of plain `prop` that `fnDeclIx` is keyed on, or "". A merge renames
-// every declaration and the caller's alias maps back only a `self`-function — which the
-// `self`-NAME gate is by definition not — so that gate arrived unmangled and missed (D1654).
-// `lookup` is the visibility test: a same-named function this file cannot see is not claimed.
-function ufcsMergedDeclOf(prop: string) {
+// The merged spelling of plain `name` that `fnDeclIx` is keyed on, or "". A merge renames
+// every declaration, so any gate that asks the table by the name a SITE spells arrives
+// unmangled and misses — the UFCS `self`-name gate (D1654) and the operator dispatch, whose
+// site is `a + b` and has no name to rewrite at all. `lookup` is the visibility test.
+export function mergedDeclKeyOf(name: string) {
   for k in fnDeclIx.keys() {
-    if demangleName(k) == prop && lookup(k) >= 0 { return k }
+    if demangleName(k) == name && lookup(k) >= 0 { return k }
   }
   ""
 }
@@ -18057,7 +18057,7 @@ function noteUfcsNotMethod(
   argc: i32,
 ) {
   let nm = name
-  if (fnDeclIx[nm] ?? -1) < 0 { nm = ufcsMergedDeclOf(prop) }
+  if (fnDeclIx[nm] ?? -1) < 0 { nm = mergedDeclKeyOf(prop) }
   const kind = ufcsNotMethodKind(nm, recvTy, argc)
   if kind == 0 { return 0 }
   noteUfcsWhy(
@@ -20035,25 +20035,40 @@ function opIdxBindGen(
   }
 }
 
+// The `fnDeclIx` key an operator declaration is stored under: the plain spelling in a
+// single-file program, the merge's renamed one everywhere else. "" never reaches the table —
+// the plain name is returned unchanged when nothing merged claims it, so the miss is the
+// caller's own `lookup` miss and not a second refusal (A-OPMOD).
+function opDeclKeyOf(op: string) {
+  if lookup(op) >= 0 { return op }
+  const merged = mergedDeclKeyOf(op)
+  if merged == "" { return op }
+  merged
+}
+
 // Operator dispatch `a op b` over a struct left operand through the free `self`-function
 // named for the operator: the function must exist, take exactly `(self, right)`, with its
 // first parameter named `self`. Binds the operands into the function's holes like any call
 // and substitutes the return; -1 means no such function fits, and the caller falls through to the operator-field lookup or the native numeric paths.
 function opSelfFnTy(op: string, lt: i32, rt: i32, rightIx: i32, ix: i32) {
-  const fnTy = lookup(op)
+  // The operator's own site is `a + b`, which carries no name a merge could rewrite, so the
+  // declaration's key is the merged one and this ask is the plain one. Resolved through the
+  // shared key resolver, the same one the UFCS gate uses (A-OPMOD).
+  const opKey = opDeclKeyOf(op)
+  const fnTy = lookup(opKey)
   if fnTy < 0 { return -1 }
   const preFt = T.tys[fnTy]
   if preFt is TyFunc {
     if preFt.fnRet == -2 {
-      if !onInferStack(op) {
-        const dIx = fnDeclIx[op] ?? -1
+      if !onInferStack(opKey) {
+        const dIx = fnDeclIx[opKey] ?? -1
         if dIx >= 0 { checkNode(dIx) }
       }
     }
   } else {
     return -1
   }
-  const dIx2 = fnDeclIx[op] ?? -1
+  const dIx2 = fnDeclIx[opKey] ?? -1
   if dIx2 < 0 { return -1 }
   const d = P.nodes[dIx2]
   let selfOk = false
