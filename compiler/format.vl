@@ -368,6 +368,19 @@ function emitLeadingComments(indent: i32, line: i32) {
   0
 }
 
+// D1646 — `emitLeadingComments`' value-returning twin, for a printer that builds a string
+// rather than writing to the buffer. Same consumption, same indentation; the caller splits the
+// result into lines. A printer with no comment flush of its own leaves the comments pending,
+// and whatever renders next swallows them.
+function takeLeadingComments(indent: i32, line: i32) {
+  const saved = outBuf
+  outBuf = []
+  emitLeadingComments(indent, line)
+  const got = joinOut()
+  outBuf = saved
+  got
+}
+
 // How many pending comments start strictly before `line` (peek, no consume).
 function peekLeadingCount(line: i32) {
   let n = 0
@@ -1205,6 +1218,18 @@ function inlineBlockBody(blockIx: i32, indent: i32) {
   }
 }
 
+// Whether a comment sits before an `else`/`else if` clause opening on source `line`, and if so
+// close the previous clause and emit it. True means the caller writes the clause WITHOUT the
+// leading `}` — the brace is already out. `emitBlockBody` has flushed the previous body's own
+// comments by now, so anything still pending starts at or after that closing brace.
+function splitFusedClause(indent: i32, line: i32) {
+  if line < 1 { return false }
+  if peekLeadingCount(line) == 0 { return false }
+  emitLine(indent, "}")
+  emitLeadingComments(indent, line)
+  true
+}
+
 // Render an `if … else if … [else]` chain whose every branch is a brace block, in the
 // canonical multi-conditional layout (`if cond {` / `} else if cond {` / `} else {` / `}`).
 // A chain is a nested `IfStmt` in the `ifElse` slot, detected by `elseIsIf`. Returns false
@@ -1292,12 +1317,22 @@ function emitIfChain(ix: i32, node: IfStmt, indent: i32) {
   while m < condIxs.length {
     let prefix = "if "
     if m > 0 { prefix = "} else if " }
+    // D1646 — a formatter does not move a comment across a clause boundary, so the fused
+    // `} else if` splits into `}`, the comment, then the clause, giving the comment the line
+    // the source gave it. The fusion is kept whenever no comment sits there.
+    if m > 0 && splitFusedClause(indent, startLineOf(condIxs[m])) {
+      prefix = "else if "
+    }
     emitCondHead(indent, prefix, condIxs[m], " {")
     emitBlockBody(bodyIxs[m], indent)
     m = m + 1
   }
   if hasElse {
-    emitLine(indent, "} else {")
+    if splitFusedClause(indent, startLineOf(elseBodyIx)) {
+      emitLine(indent, "else {")
+    } else {
+      emitLine(indent, "} else {")
+    }
     emitBlockBody(elseBodyIx, indent)
   }
   closingBrace(indent, stopLineOf(ix))
@@ -1527,7 +1562,7 @@ function matchBindFmt(bindIx: i32) {
 // line — `<pat> [| <pat>]* => <body>` — at `indent + 1`, closed by `}` at `indent`. The arm body
 // renders through `expr` (a bare expression, an `if`-expr, or a `{ … }` block — `blockExpr` inlines
 // a short one). Mirrors `match`'s parse shape so it round-trips idempotently.
-function matchExprFmt(_ix: i32, n: MatchExpr, indent: i32) {
+function matchExprFmt(ix: i32, n: MatchExpr, indent: i32) {
   const scrut = expr(n.matchScrut, indent, 0)
   const pad = indentStr(indent + 1)
   const closePad = indentStr(indent)
@@ -1540,6 +1575,14 @@ function matchExprFmt(_ix: i32, n: MatchExpr, indent: i32) {
   while k < n.matchArmStart.length {
     const start = n.matchArmStart[k]
     const cnt = n.matchArmCount[k]
+    // D1646 — a comment between two arms is about the arm it precedes, so it is flushed at
+    // the arm's own indent before the arm renders. Left pending it is picked up by whatever
+    // prints next: the arm's body block, or — for a braceless arm — the statement after the
+    // whole `match`.
+    pushLines(
+      out,
+      takeLeadingComments(indent + 1, startLineOf(n.matchPats[start])),
+    )
     let pats = ""
     let p = 0
     while p < cnt {
@@ -1550,11 +1593,32 @@ function matchExprFmt(_ix: i32, n: MatchExpr, indent: i32) {
       p = p + 1
     }
     const body = expr(n.matchBodies[k], indent + 1, 0)
-    out.push(pad + pats + " => " + body)
+    // The arm's own trailing comment, taken before the next arm's leading flush: a trailing
+    // comment shares its arm's line, which is earlier than the next arm's, so an unconsumed
+    // one would be flushed as that arm's own-line lead.
+    out.push(
+      pad + pats + " => " + body + trailerSuffix(stopLineOf(n.matchBodies[k])),
+    )
     k = k + 1
   }
+  // A comment after the last arm belongs inside the `match`, for the same reason.
+  pushLines(out, takeLeadingComments(indent + 1, stopLineOf(ix)))
   out.push(closePad + "}")
   joinLines(out)
+}
+
+// Append `text`'s lines to `out`, or nothing when it is empty. The trailing newline
+// `emitLeadingComments` may leave is dropped; an interior blank line is a source blank and
+// is kept.
+function pushLines(out: string[], text: string) {
+  if text.length == 0 { return 0 }
+  const lines = splitLines(rstripNl(text))
+  let i = 0
+  while i < lines.length {
+    out.push(lines[i])
+    i = i + 1
+  }
+  0
 }
 
 // A literal: prefer the verbatim source lexeme; fall back to structural text.
@@ -2270,6 +2334,10 @@ function blockExpr(ix: i32, node: Block, indent: i32) {
   emitLeadingComments(indent + 1, stopLineOf(ix))
   const inner = joinOut()
   outBuf = saved
+  // D1647 — an empty body is `{}`, the spelling every other empty block in the language keeps
+  // (`inlineBlockBody`); the general path below renders the absent body as its own blank line.
+  // A body holding only comments is NOT empty: `inner` carries them and takes that path.
+  if node.blkStmts.length == 0 && rstripNl(inner).length == 0 { return "{}" }
   // Rejoin the body once — a running `result = result + line` accumulator here is
   // O(lines²) allocation under the non-freeing GC.
   const out: string[] = []
