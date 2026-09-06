@@ -4963,6 +4963,95 @@ function collectABankPrefix() {
   0
 }
 
+// The scalar list pair an array-intrinsic call of element kind `ank` needs. Flags only, each
+// set and never cleared, so a second ask can only add. Kind 3 is absent deliberately: a ref
+// fill mints a row, which moves slot numbering, and the arena walk is its one home (D1669).
+function collectArrNewScalarPair(ank: i32) {
+  if ank == 1 {
+    fa64Used = true
+  } else if ank == 4 {
+    ia64Used = true // D963 — the i64 list pair, interned like the f64 one
+  } else if ank == 5 {
+    ba8Used = true // D1470 — `__array_new_default__` over a `u8[]` destination
+  } else if ank == 6 {
+    fa32Used = true // D1470 — …and over an `f32[]` one
+  } else if ank == 2 {
+    // String fill → the string list (wrapper/backing shared with `string[]`).
+    slUsed = true
+    aUsed = true
+  } else if ank != 3 {
+    lUsed = true
+    aUsed = true
+  }
+  0
+}
+
+// Intern the pair the array-intrinsic call at `callIx` allocates, its element kind read
+// frameless. The ref arm is here and not in `collectArrNewScalarPair` because it mints a row.
+function collectArrNewIntr(callIx: i32) {
+  const ank = arrNewIntrKind(callIx, -1)
+  if ank == 3 {
+    // Ref fill → the ref list of the element (intern its slot).
+    rlUsed = true
+    raUsed = true
+    // D966 — the element kind is not always 1. Interning every ref fill as the struct
+    // element holds only while the arm runs for structs; over closures, nested lists,
+    // string lists and maps, a nested-list element gets a row repped as the raw backing
+    // where the annotated path carries the wrapper. `ensureRefElemTy` derives the kind.
+    const anFillTy = arrNewFillTyIx(callIx)
+    if anFillTy >= 0 {
+      ensureRefElemTy(refListElemNameOfExpr(callIx, -1), anFillTy)
+    } else {
+      rlInternName(refListElemNameOfExpr(callIx, -1), 1)
+    }
+    return 0
+  }
+  collectArrNewScalarPair(ank)
+}
+
+// Each array-intrinsic call's element kind, asked in its own function's frame, interned as the
+// scalar pair it names. The arena walk has no frame, so an instance's PARAMETER fill names no
+// kind to it and the i32 pair covers an i64 backing (D1669). A pass, and after `monomorphize`,
+// because `fnStmts` holds another program's indices until `collectFns` refills it.
+export function collectArrNewFrames() {
+  let fe = 0
+  while fe < fnStmts.length {
+    const fnIx = fnStmts[fe]
+    if fnIx >= 0 && fnIx < P.nodes.length {
+      const fn = P.nodes[fnIx]
+      if fn is FuncDecl { arrNewFrameWalk(fn.fnBody, fnIx) }
+    }
+    fe = fe + 1
+  }
+  0
+}
+
+// Every array-intrinsic call lexically inside one body, not descending into a nested
+// `FuncDecl` — that has its own `fnStmts` row and is walked as its own body.
+function arrNewFrameWalk(ix: i32, fnIx: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if n is FuncDecl { return 0 }
+  if n is Call {
+    const cf = P.nodes[n.callFn]
+    if cf is Ident {
+      if (
+        cf.identName == "__array_new__" ||
+        cf.identName == "__array_new_default__"
+      ) {
+        collectArrNewScalarPair(arrNewIntrKind(ix, fnIx))
+      }
+    }
+  }
+  const kids = nodeChildren(ix)
+  let k = 0
+  while k < kids.length {
+    arrNewFrameWalk(kids[k], fnIx)
+    k = k + 1
+  }
+  0
+}
+
 // Scan the arena for every use of a collection heap type, setting the presence flags and
 // minting the ref-list, map-value and annotation-node rows keyed against them; an unclaimed
 // array annotation fails loudly. Asked once per minted generic instance, so it resumes on an
@@ -5228,37 +5317,7 @@ export function collectA(_stmts: i32[]) {
           cf.identName == "__array_new__" ||
           cf.identName == "__array_new_default__"
         ) {
-          const ank = arrNewIntrKind(i, -1)
-          if ank == 1 {
-            fa64Used = true
-          } else if ank == 4 {
-            ia64Used = true // D963 — the i64 list pair, interned like the f64 one
-          } else if ank == 5 {
-            ba8Used = true // D1470 — `__array_new_default__` over a `u8[]` destination
-          } else if ank == 6 {
-            fa32Used = true // D1470 — …and over an `f32[]` one
-          } else if ank == 2 {
-            // String fill → the string list (wrapper/backing shared with `string[]`).
-            slUsed = true
-            aUsed = true
-          } else if ank == 3 {
-            // Ref fill → the ref list of the element (intern its slot).
-            rlUsed = true
-            raUsed = true
-            // D966 — the element kind is not always 1. Interning every ref fill as the struct
-            // element holds only while the arm runs for structs; over closures, nested lists,
-            // string lists and maps, a nested-list element gets a row repped as the raw backing
-            // where the annotated path carries the wrapper. `ensureRefElemTy` derives the kind.
-            const anFillTy = arrNewFillTyIx(i)
-            if anFillTy >= 0 {
-              ensureRefElemTy(refListElemNameOfExpr(i, -1), anFillTy)
-            } else {
-              rlInternName(refListElemNameOfExpr(i, -1), 1)
-            }
-          } else {
-            lUsed = true
-            aUsed = true
-          }
+          collectArrNewIntr(i)
         }
       }
     } else if nd is TypeRef {
