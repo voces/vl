@@ -39,3 +39,4 @@ D1600-D1619  vl-cb  2026-09-04  glean VL-046 (D1600), the comment sweep's residu
 D1628-D1639  vl-cb  2026-09-05  second-pass fix follow-ups
 D1657-D1669  vl-c3  2026-09-05  coordinator lanes 2026-09-05 evening (cw* per-query scans perf, UFCS merge residues, formatter follow-ups)
 D1670-D1679  vl-c3  2026-09-05  coordinator lanes 2026-09-05 night (D1667-D1669 clause-1 fixes, D1664/D1665 residues)
+D1680-D1689  vl-c3  2026-09-05  coordinator lanes 2026-09-06 (optchain residues D1676/D1677, covariant residues D1658/D1659, f32/field-arm residues)
