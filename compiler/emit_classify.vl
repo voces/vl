@@ -9068,13 +9068,13 @@ function declRowFieldFits(vc: i32, sc: i32, valIx: i32, si: i32, mfi: i32) {
 // It CAN drop a field the destination does not want and widen one it does, which is the
 // accepting side of the object-shape floor and stays lenient here (D1694, D1696).
 function elemRowsCaptureCompat(vn: string, dn: string): boolean {
-  elemRowsCaptureCompatAt(vn, dn, 24)
+  elemRowsCaptureCompatAt(vn, dn, 64)
 }
 
 // The same question one nesting level at a time: a nested-struct field is asked of its own
 // two element rows, so a box or a missing field at ANY depth refutes. `depth` bounds a
 // self-recursive type, whose rows would otherwise walk each other forever; running out is
-// lenient, which is the same answer an unresolvable row gets.
+// lenient, which is the same answer an unresolvable row gets (D1705).
 function elemRowsCaptureCompatAt(vn: string, dn: string, depth: i32): boolean {
   if vn == dn { return true }
   if depth <= 0 { return true }
@@ -19940,6 +19940,38 @@ function unionSetNamesAtom(set: string, atom: string): boolean {
 // `annShapeIndexOf`'s key. `rlInternNameTy`'s rule governs: the hint must compute the same
 // key, which the `sTyIx` leg does by construction here.
 export function internInlineShapeTy(nm: string, tyIx: i32) {
+  // A re-entrancy memo, live only while an outer intern is on the stack (D1700). Each field
+  // interns its nested shape TWICE — once through `internShapeDeepTy` and again to recover
+  // the row when `nameFieldCodeTy` declines — which is 2^depth walks of one spine. The second
+  // visit is a no-op that `annShapeIndexOf` would answer with the same row.
+  const iisSid = sidOf(nm)
+  if iisBusy > 0 {
+    if sidArrGet(iisMemoTy, iisSid) == tyIx + 2 {
+      const iisHit = sidArrGet(iisMemoRow, iisSid)
+      if iisHit >= 0 { return iisHit - 2 }
+    }
+  }
+  iisBusy = iisBusy + 1
+  const iisAns = internInlineShapeTyGo(nm, tyIx)
+  iisBusy = iisBusy - 1
+  if iisBusy > 0 {
+    sidArrPut(iisMemoTy, iisSid, tyIx + 2)
+    sidArrPut(iisMemoRow, iisSid, iisAns + 2)
+  } else {
+    iisMemoTy = []
+    iisMemoRow = []
+  }
+  iisAns
+}
+
+// The memo's three cells: a depth, so the tables drop when the outermost intern returns and
+// nothing survives into a later pass, and the sid-keyed answer beside the type hint it is
+// computed with. Both store their value `+ 2`, so the -1 a grown slot holds is not a row.
+let iisBusy: i32 = 0
+let iisMemoRow: i32[] = []
+let iisMemoTy: i32[] = []
+
+function internInlineShapeTyGo(nm: string, tyIx: i32) {
   if !nameIsShapeSpanEnds(nm) { return -1 }
   // Split `x:i32,y:string` into names + codes at depth 0 (`shapeInnerFieldSplit` —
   // the shape layer's ONE field scanner). `texts` keeps each field's type TEXT (a
