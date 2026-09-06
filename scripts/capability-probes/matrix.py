@@ -99,6 +99,18 @@ class Tpl:
         return ("const %s: %s = %s" % (name, ty or self.ty, expr)) if face == "ann" \
             else "const %s = %s" % (name, expr)
 
+    def proof_is_null_test(self):
+        """Does the template's own TEST already unwrap a nullable?
+
+        The two map positions read `m[k]`, which is `V | null` by construction, and add an
+        outer `!= null` to unwrap it. A template whose TEST is itself a null test needs no
+        second one: with the cell narrowed the inner test is `i32 != null`, which the checker
+        refuses — and a template whose VALUE *is* `null` can never pass the outer guard at
+        all, so its MISS branch is unreachable and the cell grades a permanent false WRONG.
+        Shared by both positions so the rule cannot drift between them.
+        """
+        return bool(self.test) and re.search(r"\bnull\b", self.test) is not None
+
     def over(self, place):
         """TEST/HIT/MISS rewritten to read `place` directly instead of the bound name `v`.
 
@@ -273,9 +285,18 @@ def p_global_assign(t, face):
 
 @position("map_value", "the map binding")
 def p_map_value(t, face):
+    """The value rebound out of a map, guarded only when the TEST is not itself a null test.
+
+    `map_value_place` states the rule this shares: a bare `m[k]` is `V | null`, so the outer
+    guard is what unwraps it, and a template whose TEST already IS a null test both needs no
+    second one and — when its VALUE is `null` — can never pass one.
+    """
     m = "const __m: { [string]: %s } = Map()" % t.ty if face == "ann" else "const __m = Map()"
-    read = ["const __mv = __m[\"k\"]", "if __mv != null {",
-            ind(t.bind("v", "__mv", face) + "\n" + t.proof, 2), "}"]
+    bound = t.bind("v", "__mv", face) + "\n" + t.proof
+    if t.proof_is_null_test():
+        read = ["const __mv = __m[\"k\"]", bound]
+    else:
+        read = ["const __mv = __m[\"k\"]", "if __mv != null {", ind(bound, 2), "}"]
     return assemble(t, pre=[m], body=["__m[\"k\"] = %s" % t.value] + read)
 
 
@@ -461,7 +482,7 @@ def p_map_value_place(t, face):
     m = "const __m: { [string]: %s } = Map()" % t.ty if face == "ann" else "const __m = Map()"
     proof = t.over("__m[\"k\"]")
     body = ["__m[\"k\"] = %s" % t.value]
-    if re.search(r"\bnull\b", t.test):
+    if t.proof_is_null_test():
         body.append(proof)
     else:
         body += ["if __m[\"k\"] != null {", ind(proof, 2), "}"]
