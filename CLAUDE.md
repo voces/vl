@@ -619,6 +619,13 @@ Ratchet: `python3 scripts/sentinel-budget.py --check` (386 + 0 when it landed, #
 `scripts/sentinel-census.py`, `--why` names what left since the baseline's commit.
 `docs/internals/sentinel-index-lint.md`.
 
+**A TRAP'S BACKTRACE IS FUNCTION INDICES UNTIL THE SEED IS BUILT WITH `--names`.** `vl build
+compiler/entry.vl --names -o <seed>` keeps the name section, and a `vl check --compiler <seed>`
+that traps then prints `vl!internInlineShapeTy` instead of `<wasm function 1783>`. D1700 sat
+undiagnosed as indices until that build; with names its two repeated frames read as the
+interner walking each nested field twice (2^depth), which the timing ladder then confirmed.
+Build the named seed FIRST when a banner shows only numbers.
+
 **The reader set is a CENSUS OUTPUT, not a filter, and that is measured.** 842 readers derive
 from the tree; only **29 of 386** hits have a producer among them, and filtering on the set
 drops two of the four controls — D1462's producer `checkNode` carries no `-1` of its own, it
